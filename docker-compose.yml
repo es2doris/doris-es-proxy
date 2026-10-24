@@ -1,0 +1,32 @@
+# Milestone 1 Verification Stack: Apache Doris + doris-es-proxy + OpenMetadata
+# Zero Elasticsearch / OpenSearch containers!
+services:
+  doris-fe-be:
+    image: apache/doris:doris-all-in-one-2.1.7
+    container_name: doris-fe-be
+    hostname: doris-fe-be
+    ports:
+      - "8030:8030"
+      - "8040:8040"
+      - "9030:9030"
+    environment:
+      - PREFER_HOST_MODE=ip
+    healthcheck:
+      test: ["CMD", "mysql", "-h", "127.0.0.1", "-P", "9030", "-u", "root", "-e", "SHOW BACKENDS"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  doris-es-proxy:
+    build: .
+    container_name: doris-es-proxy
+    depends_on:
+      doris-fe-be:
+        condition: service_healthy
+    ports:
+      - "9200:9200"
+    command:
+      - "--listen=:9200"
+      - "--doris-dsn=root:@tcp(doris-fe-be:9030)/?interpolateParams=true&multiStatements=true"
+      - "--doris-http=http://doris-fe-be:8030"
+      - "--doris-db=es_compat"

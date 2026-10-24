@@ -1,0 +1,139 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package proxy
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+)
+
+// StreamLoadConfig configures the Apache Doris HTTP Stream Load client.
+type StreamLoadConfig struct {
+	FEHTTPEndpoint string // e.g. "http://127.0.0.1:8030"
+	User           string // e.g. "root"
+	Password       string
+	Database       string // e.g. "es_compat"
+	Timeout        time.Duration
+}
+
+// StreamLoadClient streams NDJSON document batches into Apache Doris Unique Key Merge-on-Write
+// tables while preserving Basic Auth headers across FE :8030 -> BE :8040 HTTP 307 redirects.
+type StreamLoadClient struct {
+	cfg        StreamLoadConfig
+	httpClient *http.Client
+}
+
+func NewStreamLoadClient(cfg StreamLoadConfig) *StreamLoadClient {
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = 30 * time.Second
+	}
+	client := &http.Client{
+		Timeout: cfg.Timeout,
+		// Preserve Authorization header when Doris FE (8030) issues a 307 Temporary Redirect to Doris BE (8040).
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("stopped after 5 redirects")
+			}
+			if len(via) > 0 {
+				if auth := via[0].Header.Get("Authorization"); auth != "" {
+					req.Header.Set("Authorization", auth)
+				}
+			}
+			return nil
+		},
+	}
+	return &StreamLoadClient{
+		cfg:        cfg,
+		httpClient: client,
+	}
+}
+
+type streamLoadResponse struct {
+	Status             string `json:"Status"`
+	Message            string `json:"Message"`
+	NumberTotalRows    int64  `json:"NumberTotalRows"`
+	NumberLoadedRows   int64  `json:"NumberLoadedRows"`
+	NumberFilteredRows int64  `json:"NumberFilteredRows"`
+	ErrorURL           string `json:"ErrorURL"`
+}
+
+// LoadNDJSON sends a batch of shredded NDJSON rows to Doris via HTTP Stream Load.
+// When `syncRefresh` is true (`?refresh=true`), it uses synchronous commit (`sync_mode`)
+// so that subsequent `/_search` requests immediately see the written rows.
+func (c *StreamLoadClient) LoadNDJSON(
+	ctx context.Context,
+	table string,
+	ndjsonPayload []byte,
+	syncRefresh bool,
+) error {
+	if len(bytes.TrimSpace(ndjsonPayload)) == 0 {
+		return nil
+	}
+	endpoint := fmt.Sprintf(
+		"%s/api/%s/%s/_stream_load",
+		strings.TrimRight(c.cfg.FEHTTPEndpoint, "/"),
+		c.cfg.Database,
+		table,
+	)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(ndjsonPayload))
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth(c.cfg.User, c.cfg.Password)
+	req.Header.Set("Expect", "100-continue")
+	req.Header.Set("format", "json")
+	req.Header.Set("read_json_by_line", "true")
+	req.Header.Set("strip_outer_array", "false")
+	req.Header.Set("fuzzy_parse", "true")
+	req.Header.Set("merge_type", "MERGE")
+	req.Header.Set("delete", "__DORIS_DELETE_SIGN__ = 1")
+	req.Header.Set("function_column.sequence_col", "_version")
+
+	if syncRefresh {
+		req.Header.Set("group_commit", "sync_mode")
+	} else {
+		req.Header.Set("group_commit", "async_mode")
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("doris stream load HTTP error: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("reading stream load response: %w", err)
+	}
+
+	var slResp streamLoadResponse
+	if err := json.Unmarshal(bodyBytes, &slResp); err != nil {
+		return fmt.Errorf("unexpected stream load response (HTTP %d): %s", resp.StatusCode, string(bodyBytes))
+	}
+	if !strings.EqualFold(slResp.Status, "Success") && !strings.EqualFold(slResp.Status, "Publish Timeout") {
+		return fmt.Errorf("doris stream load failed (status=%s): %s (error_url=%s)", slResp.Status, slResp.Message, slResp.ErrorURL)
+	}
+	return nil
+}
