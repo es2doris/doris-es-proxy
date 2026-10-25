@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
 )
@@ -151,4 +152,128 @@ func TestShredDocument_PreservesSourceAndPopulatesPromotedAndNestedColumns(t *te
 	if !ok || len(nestedCols) != 2 {
 		t.Fatalf("expected 2 correlated nested elements in n__columns, got %+v", row["n__columns"])
 	}
+}
+
+func TestInferMergeAlterPromoteAndDateMath(t *testing.T) {
+	// 1. InferMappingFromSampleDocs across strings, long text, ISO dates, ints, floats, booleans, nested objects, and arrays
+	longText := strings.Repeat("word ", 30)
+	samples := []json.RawMessage{
+		json.RawMessage(`{"service":"checkout","msg":"` + longText + `","created_at":"2026-10-25T12:00:00Z","count":42,"latency":12.5,"ok":true,"meta":{"region":"us-east-1"},"tags":["a","b"],"items":[{"sku":"s1"}]}`),
+		json.RawMessage(`{"service":"payments","count":10.5,"meta":{"zone":"az1"}}`),
+	}
+	inferred := InferMappingFromSampleDocs(samples)
+	if inferred == nil {
+		t.Fatalf("expected non-nil inferred mapping")
+	}
+	if inferred.Properties["service"].Type != "keyword" ||
+		inferred.Properties["msg"].Type != "text" ||
+		inferred.Properties["created_at"].Type != "date" ||
+		inferred.Properties["count"].Type != "double" ||
+		inferred.Properties["ok"].Type != "boolean" ||
+		len(inferred.Properties["meta"].Properties) != 2 {
+		t.Fatalf("unexpected inferred mapping properties: %+v", inferred.Properties)
+	}
+
+	// 2. MergeMappingSpecs & DeepMergeMappingProperties
+	extraSpec := &esast.MappingSpec{
+		Dynamic: true,
+		Properties: map[string]esast.FieldProperty{
+			"embedding": {Type: "dense_vector", Dims: 3, Similarity: "cosine"},
+			"rank":      {Type: "integer"},
+			"chinese":   {Type: "text", Analyzer: "ik_max_word"},
+			"english":   {Type: "text", Analyzer: "english"},
+			"meta": {
+				Properties: map[string]esast.FieldProperty{
+					"env": {Type: "keyword"},
+				},
+			},
+		},
+	}
+	merged := MergeMappingSpecs(inferred, extraSpec)
+	if merged == nil || len(merged.Properties["meta"].Properties) != 3 {
+		t.Fatalf("expected merged meta to have 3 properties, got %+v", merged)
+	}
+	if MergeMappingSpecs(nil, nil) == nil || MergeMappingSpecs(nil, extraSpec) == nil || MergeMappingSpecs(extraSpec, nil) == nil {
+		t.Fatalf("expected nil-safe MergeMappingSpecs")
+	}
+
+	// 3. CompileIndexSchema, GenerateAlterTableDDL, GeneratePromoteVariantFieldDDL, ResolveField, ExpandFieldPattern
+	oldSchema := CompileIndexSchema("es_compat", "events", inferred)
+	newSchema := CompileIndexSchema("es_compat", "events", merged)
+	alterStmts := GenerateAlterTableDDL(oldSchema, newSchema)
+	if len(alterStmts) == 0 {
+		t.Fatalf("expected ALTER TABLE statements when adding embedding/rank/chinese/english/meta.env")
+	}
+	promoteStmts := GeneratePromoteVariantFieldDDL(newSchema, "unmapped_field.keyword", "keyword")
+	if len(promoteStmts) != 2 || !strings.Contains(promoteStmts[0], "ADD COLUMN `f__unmapped_field`") {
+		t.Fatalf("unexpected promote statements: %+v", promoteStmts)
+	}
+	promoteArrStmts := GeneratePromoteVariantFieldDDL(newSchema, "tags.tagFQN", "")
+	if len(promoteArrStmts) != 2 || !strings.Contains(promoteArrStmts[0], "ARRAY<STRING>") {
+		t.Fatalf("unexpected multi-valued promote statements: %+v", promoteArrStmts)
+	}
+
+	// Verify ResolveField for `.keyword` fallback and unmapped fields
+	if b := newSchema.ResolveField("service.keyword"); b.ColumnName != "f__service" {
+		t.Fatalf("expected service.keyword to fall back to f__service, got %+v", b)
+	}
+	if b := newSchema.ResolveField("unknown.keyword"); b.Kind != StorageDynamicVariant || len(b.SourceJSONPath) != 1 || b.SourceJSONPath[0] != "unknown" {
+		t.Fatalf("expected unknown.keyword to strip .keyword in SourceJSONPath, got %+v", b)
+	}
+	if expanded := newSchema.ExpandFieldPattern("meta.*^3.5"); len(expanded) != 3 || expanded[0].Boost != 3.5 {
+		t.Fatalf("expected 3 expanded meta.* fields with boost 3.5, got %+v", expanded)
+	}
+
+	// 4. SanitizeDorisIdentifier long name truncation and special characters
+	longIdent := SanitizeDorisIdentifier("very.long-index/name$with@special!chars_" + strings.Repeat("x", 60))
+	if len(longIdent) > 56 || SanitizeDorisIdentifier("") != "_unnamed" {
+		t.Fatalf("unexpected SanitizeDorisIdentifier: %q", longIdent)
+	}
+
+	// 5. ParseESDateToEpochMillis with date math (+/-/rounding across y, M, w, d, h, m, s)
+	dateExprs := []string{
+		"1729773296789",
+		"2026-10-25T12:00:00Z",
+		"2026-10-25",
+		"2026/10/25",
+		"now",
+		"now-7d/d",
+		"now+2h/h",
+		"now-1y/y",
+		"now-3M/M",
+		"now-2w/w",
+		"now-15m/m",
+		"now-30s/s",
+		"2026-10-25T12:00:00Z||+1d/d",
+	}
+	for _, expr := range dateExprs {
+		if _, ok := ParseESDateToEpochMillis(expr, mustNow()); !ok {
+			t.Fatalf("expected ParseESDateToEpochMillis(%q) to succeed", expr)
+		}
+	}
+	if _, ok := ParseESDateToEpochMillis("not-a-date", mustNow()); ok {
+		t.Fatalf("expected invalid date string to return false")
+	}
+
+	// 6. ShredDocument with vectors, numbers, strings, booleans, dates, and tombstone delete
+	shredded, err := ShredDocument(newSchema, "doc-1", 1, false, json.RawMessage(`{
+		"service": "checkout",
+		"created_at": "2026-10-25T12:00:00Z",
+		"count": "42.5",
+		"rank": "7",
+		"ok": "true",
+		"embedding": [0.1, 0.2, 0.3]
+	}`))
+	if err != nil || !strings.Contains(string(shredded), `"f__embedding":[0.1,0.2,0.3]`) {
+		t.Fatalf("unexpected ShredDocument result: %s (err=%v)", string(shredded), err)
+	}
+	tombstone, err := ShredDocument(newSchema, "doc-1", 2, true, nil)
+	if err != nil || !strings.Contains(string(tombstone), `"__DORIS_DELETE_SIGN__":1`) {
+		t.Fatalf("expected tombstone delete sign=1, got %s (err=%v)", string(tombstone), err)
+	}
+}
+
+func mustNow() (t time.Time) {
+	t, _ = time.Parse(time.RFC3339, "2026-10-25T12:00:00Z")
+	return t
 }

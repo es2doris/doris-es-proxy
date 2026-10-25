@@ -187,3 +187,175 @@ func TestTranspileOpenMetadataSearchAndFacetAggregations(t *testing.T) {
 		}
 	}
 }
+
+func TestTranspileAllClauses_KNN_Lucene_Aggs_Collapse_SearchAfter(t *testing.T) {
+	rawMapping := `{
+		"properties": {
+			"name": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+			"serviceType": {"type": "keyword"},
+			"deleted": {"type": "boolean"},
+			"updatedAt": {"type": "date"},
+			"latency": {"type": "double"},
+			"tags": {"properties": {"tagFQN": {"type": "keyword"}}},
+			"embedding": {"type": "dense_vector", "dims": 3, "similarity": "cosine"},
+			"l2_vec": {"type": "knn_vector", "dimension": 3, "similarity": "l2_norm"},
+			"columns": {
+				"type": "nested",
+				"properties": {
+					"name": {"type": "keyword"},
+					"dataType": {"type": "keyword"}
+				}
+			}
+		}
+	}`
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(rawMapping), &spec); err != nil {
+		t.Fatal(err)
+	}
+	idxSchema := schema.CompileIndexSchema("es_compat", "table_search_index", &spec)
+	tr := NewTranspiler(idxSchema, TranspilerOptions{})
+
+	payload := `{
+		"size": 10,
+		"query": {
+			"boosting": {
+				"positive": {
+					"dis_max": {
+						"tie_breaker": 0.3,
+						"queries": [
+							{
+								"bool": {
+									"should": [
+										{"exists": {"field": "serviceType"}},
+										{"exists": {"field": "tags.tagFQN"}},
+										{"exists": {"field": "columns.name"}},
+										{"prefix": {"serviceType": {"value": "Big", "case_insensitive": true}}},
+										{"wildcard": {"name.keyword": {"value": "cust_100%*", "case_insensitive": true}}},
+										{"regexp": {"serviceType": "Big.*"}},
+										{"regexp": {"tags.tagFQN": "PII.*"}},
+										{"ids": {"values": ["id-1", "id-2"]}},
+										{"range": {"updatedAt": {"gte": "now-7d/d", "lt": "now"}}},
+										{"match_phrase": {"name": {"query": "customer orders", "slop": 2}}},
+										{"match_phrase_prefix": {"name": "cust ord"}},
+										{"match_bool_prefix": {"name": "cust ord"}},
+										{"simple_query_string": {"query": "+orders -legacy serviceType:BigQuery updatedAt:[100 TO 200] \"exact phrase\" cust* (foo OR bar)"}},
+										{"constant_score": {"filter": {"term": {"deleted": false}}, "boost": 2.0}},
+										{"knn": {"field": "l2_vec", "query_vector": [1.0, 0.0, 0.0], "k": 3, "similarity": 0.5, "filter": {"term": {"deleted": false}}}}
+									],
+									"must_not": [
+										{"term": {"deleted": true}}
+									],
+									"minimum_should_match": "2"
+								}
+							}
+						]
+					}
+				},
+				"negative": {"term": {"unmapped_field": "bad"}},
+				"negative_boost": 0.2
+			}
+		},
+		"knn": [
+			{"field": "embedding", "query_vector": [0.9, 0.1, 0.0], "k": 5, "similarity": 0.8, "boost": 1.5},
+			{"field": "unmapped_vec", "query_vector": [0.1, 0.2, 0.3], "k": 2}
+		],
+		"post_filter": {"term": {"serviceType": "BigQuery"}},
+		"collapse": {"field": "serviceType"},
+		"search_after": [null, "2026-10-25T00:00:00Z"],
+		"sort": [{"serviceType": "asc"}, {"updatedAt": "desc"}],
+		"aggs": {
+			"by_date": {
+				"date_histogram": {"field": "updatedAt", "fixed_interval": "1h"},
+				"aggs": {"avg_lat": {"avg": {"field": "latency"}}}
+			},
+			"by_hist": {
+				"histogram": {"field": "latency", "interval": 10},
+				"aggs": {"max_lat": {"max": {"field": "latency"}}}
+			},
+			"by_range": {
+				"range": {"field": "latency", "ranges": [{"to": 50}, {"from": 50, "to": 100}, {"from": 100}]},
+				"aggs": {"min_lat": {"min": {"field": "latency"}}}
+			},
+			"by_date_range": {
+				"date_range": {"field": "updatedAt", "ranges": [{"to": "now-1d"}, {"from": "now-1d"}]}
+			},
+			"only_active": {
+				"filter": {"term": {"deleted": false}},
+				"aggs": {"sum_lat": {"sum": {"field": "latency"}}}
+			},
+			"named_filters": {
+				"filters": {
+					"filters": {
+						"bq": {"term": {"serviceType": "BigQuery"}},
+						"sf": {"term": {"serviceType": "Snowflake"}}
+					}
+				},
+				"aggs": {"cnt": {"value_count": {"field": "serviceType"}}}
+			},
+			"missing_svc": {
+				"missing": {"field": "serviceType"},
+				"aggs": {"top_missing": {"top_hits": {"size": 1}}}
+			},
+			"comp": {
+				"composite": {
+					"size": 5,
+					"after": {"svc": "BigQuery"},
+					"sources": [{"svc": {"terms": {"field": "serviceType"}}}]
+				}
+			},
+			"lat_stats": {"stats": {"field": "latency"}},
+			"lat_pct": {"percentiles": {"field": "latency", "percents": [50, 95]}},
+			"top_docs": {"top_hits": {"size": 2, "sort": [{"latency": "desc"}]}}
+		}
+	}`
+
+	var req esast.SearchRequest
+	if err := json.Unmarshal([]byte(payload), &req); err != nil {
+		t.Fatalf("failed to unmarshal complex search request: %v", err)
+	}
+	plan, err := tr.BuildSearchPlan(&req)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan failed: %v", err)
+	}
+	for _, want := range []string{
+		"COSINE_DISTANCE",
+		"L2_DISTANCE",
+		"CAST(`_doc`['unmapped_vec'] AS ARRAY<FLOAT>)",
+		"ROW_NUMBER() OVER (PARTITION BY `f__serviceType`",
+		"`f__serviceType` IS NULL",
+	} {
+		if !strings.Contains(plan.HitsSQL, want) {
+			t.Fatalf("expected HitsSQL to contain %q, got:\n%s", want, plan.HitsSQL)
+		}
+	}
+	if len(plan.UnindexedVariantFields) == 0 {
+		t.Fatalf("expected unindexed variant fields to be recorded")
+	}
+
+	// Also test Doris 4.0 SEARCH() function pushdown mode and all function_score modifiers
+	trDoris4 := NewTranspiler(idxSchema, TranspilerOptions{UseDoris4SearchFunc: true})
+	for _, mod := range []string{"none", "log", "log1p", "log2p", "ln", "ln1p", "ln2p", "square", "sqrt", "reciprocal"} {
+		for _, sm := range []string{"multiply", "sum", "avg", "max", "min", "first"} {
+			for _, bm := range []string{"multiply", "replace", "sum", "avg", "max", "min"} {
+				qJSON := `{
+					"query": {
+						"function_score": {
+							"query": {"query_string": {"query": "name:orders AND serviceType:BigQuery"}},
+							"functions": [{"field_value_factor": {"field": "latency", "modifier": "` + mod + `"}}],
+							"score_mode": "` + sm + `",
+							"boost_mode": "` + bm + `"
+						}
+					}
+				}`
+				var sr esast.SearchRequest
+				if err := json.Unmarshal([]byte(qJSON), &sr); err != nil {
+					t.Fatal(err)
+				}
+				p, err := trDoris4.BuildSearchPlan(&sr)
+				if err != nil || !strings.Contains(p.HitsSQL, "SEARCH(") {
+					t.Fatalf("expected SEARCH() in Doris4 mode (mod=%s sm=%s bm=%s): %v", mod, sm, bm, err)
+				}
+			}
+		}
+	}
+}

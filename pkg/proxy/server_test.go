@@ -21,12 +21,16 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/es2doris/doris-es-proxy/pkg/transpiler"
 )
@@ -232,5 +236,327 @@ func TestNormalizeDorisSQL_RewritesArrayExistsToBooleanScalar(t *testing.T) {
 	want := "SELECT * FROM `db`.`tbl` WHERE (array_contains(array_exists(_el -> (json_extract_string(_el, '$.name') = 'user_id') AND (json_extract_string(_el, '$.dataType') = 'INT'), IFNULL(`n__columns`, CAST([] AS ARRAY<STRING>))), true))"
 	if got != want {
 		t.Fatalf("normalizeDorisSQL mismatch:\ngot:  %s\nwant: %s", got, want)
+	}
+}
+
+func TestStreamLoadClient_RedirectAuthAndErrorHandling(t *testing.T) {
+	var beGotAuth string
+	var beStatus = "Success"
+	var beFiltered int64
+	var beServer *httptest.Server
+	beServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/_load_error_log" {
+			_, _ = w.Write([]byte("row 1: invalid column format"))
+			return
+		}
+		beGotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		resp := streamLoadResponse{
+			Status:             beStatus,
+			Message:            "load result",
+			NumberTotalRows:    1,
+			NumberLoadedRows:   1 - beFiltered,
+			NumberFilteredRows: beFiltered,
+			ErrorURL:           beServer.URL + "/api/_load_error_log",
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer beServer.Close()
+
+	feServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, beServer.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer feServer.Close()
+
+	sl := NewStreamLoadClient(StreamLoadConfig{
+		FEHTTPEndpoint: feServer.URL,
+		User:           "root",
+		Password:       "doris_pw",
+		Database:       "es_compat",
+		Timeout:        5 * time.Second,
+	})
+
+	// 1. Empty payload is a no-op
+	if err := sl.LoadNDJSON(context.Background(), "tbl", []byte("   "), true); err != nil {
+		t.Fatalf("expected nil error on empty NDJSON, got %v", err)
+	}
+
+	// 2. Successful 307 redirect preserving Basic Auth
+	if err := sl.LoadNDJSON(context.Background(), "tbl", []byte(`{"_id":"1"}`+"\n"), true); err != nil {
+		t.Fatalf("expected successful LoadNDJSON across 307 redirect, got %v", err)
+	}
+	if !strings.HasPrefix(beGotAuth, "Basic ") {
+		t.Fatalf("expected Basic Authorization header preserved on BE after 307 redirect, got %q", beGotAuth)
+	}
+
+	// 3. Filtered rows error with ErrorURL detail fetched
+	beFiltered = 1
+	err := sl.LoadNDJSON(context.Background(), "tbl", []byte(`{"_id":"1"}`+"\n"), true)
+	if err == nil || !strings.Contains(err.Error(), "row 1: invalid column format") {
+		t.Fatalf("expected filtered rows error with ErrorURL detail, got %v", err)
+	}
+
+	// 4. Status=Fail error with ErrorURL detail fetched
+	beFiltered = 0
+	beStatus = "Fail"
+	err = sl.LoadNDJSON(context.Background(), "tbl", []byte(`{"_id":"1"}`+"\n"), true)
+	if err == nil || !strings.Contains(err.Error(), "status=Fail") || !strings.Contains(err.Error(), "row 1: invalid column format") {
+		t.Fatalf("expected Fail error with ErrorURL detail, got %v", err)
+	}
+}
+
+type stubSQLDriver struct{}
+type stubSQLConn struct{}
+type stubSQLRows struct {
+	cols []string
+	data [][]driver.Value
+	idx  int
+}
+
+func (d *stubSQLDriver) Open(_ string) (driver.Conn, error) { return &stubSQLConn{}, nil }
+func (c *stubSQLConn) Prepare(_ string) (driver.Stmt, error) {
+	return nil, driver.ErrSkip
+}
+func (c *stubSQLConn) Close() error              { return nil }
+func (c *stubSQLConn) Begin() (driver.Tx, error) { return nil, driver.ErrSkip }
+func (c *stubSQLConn) ExecContext(_ context.Context, _ string, _ []driver.NamedValue) (driver.Result, error) {
+	return driver.RowsAffected(1), nil
+}
+func (c *stubSQLConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	switch {
+	case strings.Contains(query, "_es_catalog"):
+		return &stubSQLRows{
+			cols: []string{"entity_type", "entity_key", "payload_json", "updated_epoch_ms"},
+			data: [][]driver.Value{{"alias", "logs-read", `{"targets":{"logs-1":true}}`, int64(100)}},
+		}, nil
+	case strings.Contains(query, "WHERE `_id` = ?"):
+		if len(args) > 0 && args[0].Value == "missing" {
+			return &stubSQLRows{cols: []string{"_id", "_version", "_source"}}, nil
+		}
+		return &stubSQLRows{
+			cols: []string{"_id", "_version", "_source"},
+			data: [][]driver.Value{{"doc-1", int64(2), `{"name":"orders"}`}},
+		}, nil
+	case strings.Contains(query, "WHERE `_id` IN"):
+		return &stubSQLRows{
+			cols: []string{"_id", "_version", "_source"},
+			data: [][]driver.Value{{"doc-1", int64(2), `{"name":"orders"}`}},
+		}, nil
+	case strings.Contains(query, "_agg_name"):
+		return &stubSQLRows{
+			cols: []string{"_agg_name", "_bucket_key", "_doc_count"},
+			data: [][]driver.Value{{"__meta_total", "_count", float64(5)}},
+		}, nil
+	default:
+		return &stubSQLRows{
+			cols: []string{"_id", "_version", "_source", "_score", "_total_hits"},
+			data: [][]driver.Value{{"doc-1", int64(2), `{"name":"orders"}`, float64(4.5), int64(1)}},
+		}, nil
+	}
+}
+func (r *stubSQLRows) Columns() []string { return r.cols }
+func (r *stubSQLRows) Close() error      { return nil }
+func (r *stubSQLRows) Next(dest []driver.Value) error {
+	if r.idx >= len(r.data) {
+		return io.EOF
+	}
+	copy(dest, r.data[r.idx])
+	r.idx++
+	return nil
+}
+
+var registerStubOnce sync.Once
+
+func TestDorisSQLBackend_AllMethods(t *testing.T) {
+	registerStubOnce.Do(func() {
+		sql.Register("doris_stub", &stubSQLDriver{})
+	})
+	db, err := sql.Open("doris_stub", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	slServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(streamLoadResponse{Status: "Success", NumberTotalRows: 1, NumberLoadedRows: 1})
+	}))
+	defer slServer.Close()
+
+	sl := NewStreamLoadClient(StreamLoadConfig{FEHTTPEndpoint: slServer.URL, Database: "es_compat"})
+	b := NewDorisSQLBackend(db, sl)
+	b.SetLogSQL(true)
+	ctx := context.Background()
+
+	if err := b.Ping(ctx); err != nil {
+		t.Fatalf("Ping failed: %v", err)
+	}
+	if err := b.ExecDDL(ctx, "CREATE TABLE `es_compat`.`t` (`_id` VARCHAR(64))"); err != nil {
+		t.Fatalf("ExecDDL failed: %v", err)
+	}
+	hits, err := b.QueryHits(ctx, "SELECT `_id`, `_version`, `_source`, 1.0 AS `_score`, COUNT(*) OVER() AS `_total_hits` FROM `es_compat`.`t`")
+	if err != nil || len(hits) != 1 || hits[0].ID != "doc-1" {
+		t.Fatalf("QueryHits unexpected: hits=%+v err=%v", hits, err)
+	}
+	aggs, err := b.QueryAggs(ctx, "SELECT '__meta_total' AS `_agg_name`, '_count' AS `_bucket_key`, 5.0 AS `_doc_count`")
+	if err != nil || len(aggs) != 1 || aggs[0].DocCount != 5 {
+		t.Fatalf("QueryAggs unexpected: aggs=%+v err=%v", aggs, err)
+	}
+	doc, found, err := b.GetDocByID(ctx, "es_compat", "t", "doc-1")
+	if err != nil || !found || doc.ID != "doc-1" {
+		t.Fatalf("GetDocByID found unexpected: doc=%+v found=%v err=%v", doc, found, err)
+	}
+	if _, foundMissing, err := b.GetDocByID(ctx, "es_compat", "t", "missing"); err != nil || foundMissing {
+		t.Fatalf("GetDocByID missing unexpected: found=%v err=%v", foundMissing, err)
+	}
+	docsMap, err := b.GetDocsByIDs(ctx, "es_compat", "t", []string{"doc-1", "doc-2"})
+	if err != nil || len(docsMap) != 1 {
+		t.Fatalf("GetDocsByIDs unexpected: %+v err=%v", docsMap, err)
+	}
+	if err := b.StreamLoad(ctx, "t", []byte(`{"_id":"1"}`+"\n"), true); err != nil {
+		t.Fatalf("StreamLoad failed: %v", err)
+	}
+	if err := b.InitCatalog(ctx, "es_compat"); err != nil {
+		t.Fatalf("InitCatalog failed: %v", err)
+	}
+	if err := b.UpsertCatalogEntry(ctx, "es_compat", CatalogEntry{EntityType: "alias", EntityKey: "a1", PayloadJSON: "{}", UpdatedEpochMs: 1}); err != nil {
+		t.Fatalf("UpsertCatalogEntry failed: %v", err)
+	}
+	if err := b.DeleteCatalogEntry(ctx, "es_compat", "alias", "a1"); err != nil {
+		t.Fatalf("DeleteCatalogEntry failed: %v", err)
+	}
+	entries, err := b.LoadCatalogEntries(ctx, "es_compat")
+	if err != nil || len(entries) != 1 || entries[0].EntityKey != "logs-read" {
+		t.Fatalf("LoadCatalogEntries unexpected: %+v err=%v", entries, err)
+	}
+}
+
+func TestServerAllRESTEndpointsAndShadowVerification(t *testing.T) {
+	mem := NewMemoryBackend(true)
+	srv := NewServer("es_compat", mem, transpiler.TranspilerOptions{})
+
+	// Set up a mock shadow Elasticsearch server to test dual-read shadow verification
+	shadowES := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"hits":{"total":{"value":1},"hits":[{"_id":"doc-1","_score":1.0}]}}`))
+	}))
+	defer shadowES.Close()
+	srv.SetShadowESURL(shadowES.URL)
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	doReq := func(method, path, body string) (int, string) {
+		t.Helper()
+		var rdr io.Reader
+		if body != "" {
+			rdr = strings.NewReader(body)
+		}
+		req, err := http.NewRequest(method, ts.URL+path, rdr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return resp.StatusCode, string(b)
+	}
+
+	// 1. Cluster, Cat, Settings, Ingest Pipeline, Index Template
+	for _, ep := range []struct {
+		method string
+		path   string
+		body   string
+		status int
+	}{
+		{http.MethodGet, "/", "", http.StatusOK},
+		{http.MethodGet, "/_cluster/health?wait_for_status=green", "", http.StatusOK},
+		{http.MethodGet, "/_cluster/settings", "", http.StatusOK},
+		{http.MethodPut, "/_cluster/settings", `{"persistent":{}}`, http.StatusOK},
+		{http.MethodGet, "/_nodes", "", http.StatusOK},
+		{http.MethodGet, "/_stats", "", http.StatusOK},
+		{http.MethodGet, "/_cat/indices?v=true", "", http.StatusOK},
+		{http.MethodGet, "/_cat/aliases?v=true", "", http.StatusOK},
+		{http.MethodGet, "/_cat/nodes?v=true", "", http.StatusOK},
+		{http.MethodGet, "/_cat/shards?v=true", "", http.StatusOK},
+		{http.MethodGet, "/_cat/count?v=true", "", http.StatusOK},
+		{http.MethodPut, "/_ingest/pipeline/my-pipe", `{"description":"test pipe","processors":[]}`, http.StatusOK},
+		{http.MethodGet, "/_ingest/pipeline/my-pipe", "", http.StatusOK},
+		{http.MethodDelete, "/_ingest/pipeline/my-pipe", "", http.StatusOK},
+		{http.MethodPut, "/_index_template/logs-tpl", `{"index_patterns":["logs-*"],"template":{"mappings":{"properties":{"service":{"type":"keyword"},"latency_ms":{"type":"long"}}}}}`, http.StatusOK},
+		{http.MethodGet, "/_index_template/logs-tpl", "", http.StatusOK},
+	} {
+		code, body := doReq(ep.method, ep.path, ep.body)
+		if code != ep.status {
+			t.Fatalf("%s %s returned %d (want %d): %s", ep.method, ep.path, code, ep.status, body)
+		}
+	}
+
+	// 2. Index creation (matching template logs-*), GET/HEAD/settings/mapping/aliases
+	for _, ep := range []struct {
+		method string
+		path   string
+		body   string
+		status int
+	}{
+		{http.MethodPut, "/logs-2026", `{"aliases":{"logs-alias":{}}}`, http.StatusOK},
+		{http.MethodHead, "/logs-2026", "", http.StatusOK},
+		{http.MethodHead, "/nonexistent-idx", "", http.StatusNotFound},
+		{http.MethodGet, "/logs-2026", "", http.StatusOK},
+		{http.MethodGet, "/_mapping", "", http.StatusOK},
+		{http.MethodGet, "/logs-2026/_mapping", "", http.StatusOK},
+		{http.MethodPut, "/logs-2026/_mapping", `{"properties":{"env":{"type":"keyword"}}}`, http.StatusOK},
+		{http.MethodGet, "/logs-2026/_settings", "", http.StatusOK},
+		{http.MethodPut, "/logs-2026/_settings", `{"index":{"number_of_replicas":0}}`, http.StatusOK},
+		{http.MethodGet, "/_aliases", "", http.StatusOK},
+		{http.MethodGet, "/logs-2026/_alias", "", http.StatusOK},
+		{http.MethodPut, "/logs-2026/_alias/logs-alias-2", "", http.StatusOK},
+		{http.MethodDelete, "/logs-2026/_alias/logs-alias-2", "", http.StatusOK},
+		{http.MethodPost, "/_aliases", `{"actions":[{"add":{"index":"logs-2026","alias":"logs-alias-3"}},{"remove":{"index":"logs-2026","alias":"logs-alias-3"}}]}`, http.StatusOK},
+		{http.MethodPost, "/logs-2026/_refresh", "", http.StatusOK},
+		{http.MethodGet, "/logs-2026/_stats", "", http.StatusOK},
+		{http.MethodGet, "/_resolve/index/logs-*", "", http.StatusOK},
+		{http.MethodGet, "/logs-2026/_search_shards", "", http.StatusOK},
+	} {
+		code, body := doReq(ep.method, ep.path, ep.body)
+		if code != ep.status {
+			t.Fatalf("%s %s returned %d (want %d): %s", ep.method, ep.path, code, ep.status, body)
+		}
+	}
+
+	// 3. Single-doc PUT/POST/GET/HEAD/DELETE, _source, _mget, URI search (?q=...), scroll, _update_by_query, _delete_by_query, _reindex
+	for _, ep := range []struct {
+		method string
+		path   string
+		body   string
+		status int
+	}{
+		{http.MethodPut, "/logs-2026/_doc/doc-1?refresh=true", `{"service":"checkout","env":"prod","latency_ms":120}`, http.StatusCreated},
+		{http.MethodPost, "/logs-2026/_doc?refresh=true", `{"service":"payments","env":"staging","latency_ms":40}`, http.StatusCreated},
+		{http.MethodHead, "/logs-2026/_doc/doc-1", "", http.StatusOK},
+		{http.MethodHead, "/logs-2026/_doc/missing-doc", "", http.StatusNotFound},
+		{http.MethodGet, "/logs-2026/_source/doc-1", "", http.StatusOK},
+		{http.MethodPost, "/logs-2026/_mget", `{"ids":["doc-1","missing-doc"]}`, http.StatusOK},
+		{http.MethodGet, "/logs-2026/_search?q=service:checkout&default_operator=AND&size=5&from=0&sort=latency_ms:desc", "", http.StatusOK},
+		{http.MethodPost, "/logs-2026/_count", `{"query":{"term":{"service":"checkout"}}}`, http.StatusOK},
+		{http.MethodPost, "/logs-2026/_update_by_query", `{"query":{"term":{"service":"checkout"}},"script":{"source":"ctx._source.env = 'canary'"}}`, http.StatusOK},
+		{http.MethodPost, "/_reindex", `{"source":{"index":"logs-2026"},"dest":{"index":"logs-backup"}}`, http.StatusOK},
+		{http.MethodPost, "/logs-2026/_delete_by_query", `{"query":{"term":{"service":"payments"}}}`, http.StatusOK},
+		{http.MethodDelete, "/logs-2026/_doc/doc-1", "", http.StatusOK},
+		{http.MethodGet, "/_doris/ui", "", http.StatusOK},
+		{http.MethodGet, "/_doris/slowlog", "", http.StatusOK},
+		{http.MethodGet, "/_doris/shadow_stats", "", http.StatusOK},
+		{http.MethodDelete, "/_index_template/logs-tpl", "", http.StatusOK},
+		{http.MethodDelete, "/logs-2026", "", http.StatusOK},
+	} {
+		code, body := doReq(ep.method, ep.path, ep.body)
+		if code != ep.status {
+			t.Fatalf("%s %s returned %d (want %d): %s", ep.method, ep.path, code, ep.status, body)
+		}
 	}
 }
