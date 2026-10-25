@@ -93,6 +93,28 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 	if req.Query != nil {
 		mainQ = t.CompileQuery(req.Query, true, nil)
 	}
+	if len(req.KNN) > 0 {
+		var knnWheres, knnScores []string
+		for i := range req.KNN {
+			kc := t.compileKNN(&req.KNN[i], true, nil)
+			knnWheres = append(knnWheres, fmt.Sprintf("(%s)", kc.WhereSQL))
+			knnScores = append(knnScores, kc.ScoreSQL)
+		}
+		knnWhere := strings.Join(knnWheres, " OR ")
+		knnScore := strings.Join(knnScores, " + ")
+		if req.Query == nil {
+			mainQ = CompiledQuery{
+				WhereSQL: knnWhere,
+				ScoreSQL: knnScore,
+			}
+		} else {
+			mainQ = CompiledQuery{
+				WhereSQL:          fmt.Sprintf("((%s) OR (%s))", mainQ.WhereSQL, knnWhere),
+				ScoreSQL:          fmt.Sprintf("((%s) + (%s))", mainQ.ScoreSQL, knnScore),
+				UsesFulltextMatch: mainQ.UsesFulltextMatch,
+			}
+		}
+	}
 
 	postFilterSQL := "TRUE"
 	if req.PostFilter != nil {
@@ -106,6 +128,8 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 	size := 10
 	if req.Size != nil {
 		size = *req.Size
+	} else if len(req.KNN) > 0 && req.KNN[0].K > 0 {
+		size = req.KNN[0].K
 	}
 	if size < 0 {
 		size = 0
@@ -350,8 +374,76 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		}
 	case q.FunctionScore != nil:
 		return t.compileFunctionScore(q.FunctionScore, nctx)
+	case q.KNN != nil:
+		return t.compileKNN(q.KNN, scoring, nctx)
 	}
 	return CompiledQuery{WhereSQL: "TRUE", ScoreSQL: "1.0"}
+}
+
+func (t *Transpiler) compileKNN(kq *esast.KNNQuery, scoring bool, nctx *nestedCtx) CompiledQuery {
+	if kq == nil || kq.Field == "" || len(kq.QueryVector) == 0 {
+		return CompiledQuery{WhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
+	b := t.Schema.ResolveField(kq.Field)
+	var colExpr string
+	if b.ColumnName != "" {
+		colExpr = fmt.Sprintf("`%s`", b.ColumnName)
+	} else {
+		if t.unindexedFields != nil && kq.Field != "" {
+			t.unindexedFields[strings.TrimSuffix(kq.Field, ".keyword")] = true
+		}
+		var pathBuilder strings.Builder
+		for _, seg := range b.SourceJSONPath {
+			_, _ = fmt.Fprintf(&pathBuilder, "[%s]", quoteStr(seg))
+		}
+		colExpr = fmt.Sprintf("CAST(`_doc`%s AS ARRAY<FLOAT>)", pathBuilder.String())
+	}
+
+	vecParts := make([]string, len(kq.QueryVector))
+	for i, v := range kq.QueryVector {
+		vecParts[i] = strconv.FormatFloat(v, 'f', -1, 64)
+	}
+	vecLit := fmt.Sprintf("CAST([%s] AS ARRAY<FLOAT>)", strings.Join(vecParts, ", "))
+	dim := len(kq.QueryVector)
+
+	var conds []string
+	conds = append(conds, fmt.Sprintf("(%s IS NOT NULL AND array_size(%s) = %d)", colExpr, colExpr, dim))
+	for i := range kq.Filter {
+		fc := t.CompileQuery(&kq.Filter[i], false, nctx)
+		conds = append(conds, fmt.Sprintf("(%s)", fc.WhereSQL))
+	}
+
+	distFn := "COSINE_DISTANCE"
+	if strings.EqualFold(b.VectorMetric, "l2_norm") || strings.EqualFold(b.VectorMetric, "l2") {
+		distFn = "L2_DISTANCE"
+	}
+	safeColExpr := fmt.Sprintf("IF(array_size(%s) = %d, %s, %s)", colExpr, dim, colExpr, vecLit)
+	distExpr := fmt.Sprintf("%s(%s, %s)", distFn, safeColExpr, vecLit)
+	if kq.Similarity != nil {
+		if distFn == "L2_DISTANCE" {
+			simStr := strconv.FormatFloat(*kq.Similarity, 'f', -1, 64)
+			conds = append(conds, fmt.Sprintf("(%s <= %s)", distExpr, simStr))
+		} else {
+			maxDist := 1.0 - *kq.Similarity
+			maxDistStr := strconv.FormatFloat(maxDist, 'f', -1, 64)
+			conds = append(conds, fmt.Sprintf("(%s <= %s)", distExpr, maxDistStr))
+		}
+	}
+
+	whereSQL := strings.Join(conds, " AND ")
+	boost := 1.0
+	if kq.Boost != nil {
+		boost = *kq.Boost
+	}
+	scoreSQL := "1.0"
+	if scoring {
+		scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%.4f * (1.0 / (1.0 + COALESCE(%s, 2.0)))) ELSE 0.0 END)",
+			whereSQL, boost, distExpr)
+	}
+	return CompiledQuery{
+		WhereSQL: whereSQL,
+		ScoreSQL: scoreSQL,
+	}
 }
 
 func sortedMapKeys[V any](m map[string]V) []string {
@@ -1603,7 +1695,7 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 			return fmt.Sprintf("`%s`", b.KeywordCompanion)
 		}
 		return fmt.Sprintf("`%s`", b.ColumnName)
-	case schema.StoragePromotedArray:
+	case schema.StoragePromotedArray, schema.StoragePromotedVector:
 		return fmt.Sprintf("`%s`", b.ColumnName)
 	case schema.StorageNestedSubfield:
 		if nctx != nil && nctx.nestedPath == b.NestedPath {

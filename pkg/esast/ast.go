@@ -40,6 +40,7 @@ func NextAutoID() string {
 // SearchRequest models an Elasticsearch / OpenSearch `/_search` request payload.
 type SearchRequest struct {
 	Query          *Query             `json:"query,omitempty"`
+	KNN            KNNSlice           `json:"knn,omitempty"`
 	PostFilter     *Query             `json:"post_filter,omitempty"`
 	From           *int               `json:"from,omitempty"`
 	Size           *int               `json:"size,omitempty"`
@@ -52,6 +53,83 @@ type SearchRequest struct {
 	Highlight      *HighlightSpec     `json:"highlight,omitempty"`
 	Collapse       *CollapseSpec      `json:"collapse,omitempty"`
 	PIT            *PITSpec           `json:"pit,omitempty"`
+}
+
+// KNNQuery represents an Elasticsearch 8/9 or OpenSearch `knn` vector search clause.
+type KNNQuery struct {
+	Field         string     `json:"field,omitempty"`
+	QueryVector   []float64  `json:"query_vector,omitempty"`
+	K             int        `json:"k,omitempty"`
+	NumCandidates int        `json:"num_candidates,omitempty"`
+	Similarity    *float64   `json:"similarity,omitempty"`
+	Boost         *float64   `json:"boost,omitempty"`
+	Filter        QuerySlice `json:"filter,omitempty"`
+}
+
+func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	type knnAlias KNNQuery
+	var std knnAlias
+	if err := json.Unmarshal(trimmed, &std); err == nil && std.Field != "" {
+		*kq = KNNQuery(std)
+		return nil
+	}
+	// Support OpenSearch knn syntax: {"<field>": {"vector": [...], "k": 5, "filter": {...}}}
+	var byField map[string]struct {
+		Vector        []float64  `json:"vector"`
+		QueryVector   []float64  `json:"query_vector"`
+		K             int        `json:"k"`
+		NumCandidates int        `json:"num_candidates"`
+		Similarity    *float64   `json:"similarity"`
+		Boost         *float64   `json:"boost"`
+		Filter        QuerySlice `json:"filter"`
+	}
+	if err := json.Unmarshal(trimmed, &byField); err != nil {
+		return err
+	}
+	for field, spec := range byField {
+		vec := spec.Vector
+		if len(vec) == 0 {
+			vec = spec.QueryVector
+		}
+		kq.Field = field
+		kq.QueryVector = vec
+		kq.K = spec.K
+		kq.NumCandidates = spec.NumCandidates
+		kq.Similarity = spec.Similarity
+		kq.Boost = spec.Boost
+		kq.Filter = spec.Filter
+		break
+	}
+	return nil
+}
+
+// KNNSlice unmarshals either a single `KNNQuery` object `{...}` or an array `[{...}]`.
+type KNNSlice []KNNQuery
+
+func (ks *KNNSlice) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		*ks = nil
+		return nil
+	}
+	if trimmed[0] == '[' {
+		var list []KNNQuery
+		if err := json.Unmarshal(trimmed, &list); err != nil {
+			return err
+		}
+		*ks = list
+		return nil
+	}
+	var single KNNQuery
+	if err := json.Unmarshal(trimmed, &single); err != nil {
+		return err
+	}
+	*ks = []KNNQuery{single}
+	return nil
 }
 
 type PITSpec struct {
@@ -102,6 +180,7 @@ type Query struct {
 	Nested            *NestedQuery             `json:"nested,omitempty"`
 	ConstantScore     *ConstantScoreQuery      `json:"constant_score,omitempty"`
 	FunctionScore     *FunctionScoreQuery      `json:"function_score,omitempty"`
+	KNN               *KNNQuery                `json:"knn,omitempty"`
 }
 
 var knownQueryClauses = map[string]bool{
@@ -128,6 +207,7 @@ var knownQueryClauses = map[string]bool{
 	"nested":              true,
 	"constant_score":      true,
 	"function_score":      true,
+	"knn":                 true,
 }
 
 func (q *Query) UnmarshalJSON(data []byte) error {
@@ -834,8 +914,18 @@ type FieldProperty struct {
 	SearchAnalyzer string                   `json:"search_analyzer,omitempty"`
 	Normalizer     string                   `json:"normalizer,omitempty"`
 	Format         string                   `json:"format,omitempty"`
+	Dims           int                      `json:"dims,omitempty"`
+	Dimension      int                      `json:"dimension,omitempty"`
+	Similarity     string                   `json:"similarity,omitempty"`
 	Fields         map[string]FieldProperty `json:"fields,omitempty"`
 	Properties     map[string]FieldProperty `json:"properties,omitempty"`
+}
+
+func (fp FieldProperty) EffectiveDims() int {
+	if fp.Dims > 0 {
+		return fp.Dims
+	}
+	return fp.Dimension
 }
 
 // BulkOperation represents a single parsed action from an Elasticsearch `/_bulk` NDJSON stream.

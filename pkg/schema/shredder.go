@@ -103,6 +103,11 @@ func ShredDocument(
 			if len(vals) > 0 {
 				row[b.ColumnName] = vals
 			}
+		case StoragePromotedVector:
+			vec := extractFloatSliceValues(parsedDoc, b.SourceJSONPath)
+			if len(vec) > 0 {
+				row[b.ColumnName] = vec
+			}
 		}
 	}
 
@@ -490,4 +495,37 @@ func collectAllTextBuilder(node any, sb *strings.Builder) {
 			collectAllTextBuilder(child, sb)
 		}
 	}
+}
+
+func extractFloatSliceValues(node any, path []string) []float64 {
+	if node == nil {
+		return nil
+	}
+	if len(path) == 0 {
+		arr, ok := node.([]any)
+		if !ok {
+			return nil
+		}
+		out := make([]float64, 0, len(arr))
+		for _, elem := range arr {
+			switch v := elem.(type) {
+			case float64:
+				out = append(out, v)
+			case int:
+				out = append(out, float64(v))
+			case int64:
+				out = append(out, float64(v))
+			case json.Number:
+				if f, err := v.Float64(); err == nil {
+					out = append(out, f)
+				}
+			}
+		}
+		return out
+	}
+	m, ok := node.(map[string]any)
+	if !ok {
+		return nil
+	}
+	return extractFloatSliceValues(m[path[0]], path[1:])
 }

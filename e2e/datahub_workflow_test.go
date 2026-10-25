@@ -1025,3 +1025,188 @@ func TestSDKWireCompatDynamicMappingAutoPromoteAndPIT_E2E(t *testing.T) {
 		t.Fatalf("expected auto-promote daemon to promote `late_added_tag` to `f__late_added_tag` after 2 queries, got SQL: %s", afterExplainObj.HitsSQL)
 	}
 }
+
+func TestVectorKNNAndHybridSearch_E2E(t *testing.T) {
+	mem := NewMemDorisBackend()
+	srv := proxy.NewServer("es_compat", mem, transpiler.TranspilerOptions{})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. Create index with both Elasticsearch `dense_vector` (cosine) and OpenSearch `knn_vector` (l2_norm)
+	putReq, err := http.NewRequest(http.MethodPut, ts.URL+"/rag_knowledge_base", strings.NewReader(`{
+		"mappings": {
+			"properties": {
+				"title": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+				"category": {"type": "keyword"},
+				"embedding": {"type": "dense_vector", "dims": 3, "similarity": "cosine"},
+				"title_vec": {"type": "knn_vector", "dimension": 3, "similarity": "l2_norm"}
+			}
+		}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	putReq.Header.Set("Content-Type", "application/json")
+	putResp, err := http.DefaultClient.Do(putReq)
+	if err != nil || putResp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT /rag_knowledge_base failed: status=%v err=%v", putResp.StatusCode, err)
+	}
+	_ = putResp.Body.Close()
+
+	// Verify DDL promotes both vector fields to ARRAY<FLOAT>
+	ddlResp, err := http.Get(ts.URL + "/rag_knowledge_base/_doris/ddl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ddlObj struct {
+		CreateTableDDL string `json:"create_table_ddl"`
+	}
+	if err := json.NewDecoder(ddlResp.Body).Decode(&ddlObj); err != nil {
+		t.Fatal(err)
+	}
+	_ = ddlResp.Body.Close()
+	if !strings.Contains(ddlObj.CreateTableDDL, "`f__embedding` ARRAY<FLOAT> NULL") || !strings.Contains(ddlObj.CreateTableDDL, "`f__title_vec` ARRAY<FLOAT> NULL") {
+		t.Fatalf("expected ARRAY<FLOAT> columns in DDL, got:\n%s", ddlObj.CreateTableDDL)
+	}
+
+	// 2. Bulk index 3 documents with 3D embeddings
+	bulkNDJSON := strings.Join([]string{
+		`{"index":{"_index":"rag_knowledge_base","_id":"doc-1"}}`,
+		`{"title":"Apache Doris Vector Search","category":"database","embedding":[0.9,0.1,0.0],"title_vec":[1.0,0.0,0.0]}`,
+		`{"index":{"_index":"rag_knowledge_base","_id":"doc-2"}}`,
+		`{"title":"OpenMetadata Lineage Graph","category":"catalog","embedding":[0.1,0.9,0.0],"title_vec":[0.0,1.0,0.0]}`,
+		`{"index":{"_index":"rag_knowledge_base","_id":"doc-3"}}`,
+		`{"title":"Kubernetes Helm Deployment","category":"infra","embedding":[0.0,0.1,0.9],"title_vec":[0.0,0.0,1.0]}`,
+	}, "\n") + "\n"
+	bulkResp, err := http.Post(ts.URL+"/_bulk?refresh=true", "application/x-ndjson", strings.NewReader(bulkNDJSON))
+	if err != nil || bulkResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_bulk failed: status=%v err=%v", bulkResp.StatusCode, err)
+	}
+	_ = bulkResp.Body.Close()
+
+	// 3. Top-level ES 8.x/9.x `knn` search (cosine similarity -> COSINE_DISTANCE)
+	knnResp, err := http.Post(ts.URL+"/rag_knowledge_base/_search?doris_explain=true", "application/json", strings.NewReader(`{
+		"knn": {
+			"field": "embedding",
+			"query_vector": [0.95, 0.05, 0.0],
+			"k": 2,
+			"num_candidates": 10
+		}
+	}`))
+	if err != nil || knnResp.StatusCode != http.StatusOK {
+		t.Fatalf("top-level knn search failed: status=%v err=%v", knnResp.StatusCode, err)
+	}
+	var knnBody struct {
+		Hits struct {
+			Hits []struct {
+				ID    string  `json:"_id"`
+				Score float64 `json:"_score"`
+			} `json:"hits"`
+		} `json:"hits"`
+		DorisExplain struct {
+			HitsSQL string `json:"hits_sql"`
+		} `json:"_doris_explain"`
+	}
+	if err := json.NewDecoder(knnResp.Body).Decode(&knnBody); err != nil {
+		t.Fatal(err)
+	}
+	_ = knnResp.Body.Close()
+	if !strings.Contains(knnBody.DorisExplain.HitsSQL, "COSINE_DISTANCE") {
+		t.Fatalf("expected COSINE_DISTANCE in transpiled HitsSQL, got: %s", knnBody.DorisExplain.HitsSQL)
+	}
+	if len(knnBody.Hits.Hits) != 2 || knnBody.Hits.Hits[0].ID != "doc-1" {
+		t.Fatalf("expected k=2 hits with doc-1 ranked #1, got %+v", knnBody.Hits.Hits)
+	}
+
+	// 4. Top-level `knn` with `filter` subquery
+	filteredKNNResp, err := http.Post(ts.URL+"/rag_knowledge_base/_search", "application/json", strings.NewReader(`{
+		"knn": {
+			"field": "embedding",
+			"query_vector": [0.95, 0.05, 0.0],
+			"k": 2,
+			"filter": {"term": {"category": "catalog"}}
+		}
+	}`))
+	if err != nil || filteredKNNResp.StatusCode != http.StatusOK {
+		t.Fatalf("filtered knn search failed: status=%v err=%v", filteredKNNResp.StatusCode, err)
+	}
+	var filteredKNNBody struct {
+		Hits struct {
+			Hits []struct {
+				ID string `json:"_id"`
+			} `json:"hits"`
+		} `json:"hits"`
+	}
+	if err := json.NewDecoder(filteredKNNResp.Body).Decode(&filteredKNNBody); err != nil {
+		t.Fatal(err)
+	}
+	_ = filteredKNNResp.Body.Close()
+	if len(filteredKNNBody.Hits.Hits) != 1 || filteredKNNBody.Hits.Hits[0].ID != "doc-2" {
+		t.Fatalf("expected filtered knn search to return only doc-2, got %+v", filteredKNNBody.Hits.Hits)
+	}
+
+	// 5. OpenSearch-style `query.knn` (`{"title_vec": {"vector": [...], "k": 1}}` -> L2_DISTANCE)
+	osKNNResp, err := http.Post(ts.URL+"/rag_knowledge_base/_search?doris_explain=true", "application/json", strings.NewReader(`{
+		"query": {
+			"knn": {
+				"title_vec": {
+					"vector": [0.0, 0.0, 1.0],
+					"k": 1
+				}
+			}
+		}
+	}`))
+	if err != nil || osKNNResp.StatusCode != http.StatusOK {
+		t.Fatalf("OpenSearch query.knn failed: status=%v err=%v", osKNNResp.StatusCode, err)
+	}
+	var osKNNBody struct {
+		Hits struct {
+			Hits []struct {
+				ID string `json:"_id"`
+			} `json:"hits"`
+		} `json:"hits"`
+		DorisExplain struct {
+			HitsSQL string `json:"hits_sql"`
+		} `json:"_doris_explain"`
+	}
+	if err := json.NewDecoder(osKNNResp.Body).Decode(&osKNNBody); err != nil {
+		t.Fatal(err)
+	}
+	_ = osKNNResp.Body.Close()
+	if !strings.Contains(osKNNBody.DorisExplain.HitsSQL, "L2_DISTANCE") {
+		t.Fatalf("expected L2_DISTANCE in transpiled HitsSQL for l2_norm vector field, got: %s", osKNNBody.DorisExplain.HitsSQL)
+	}
+	if len(osKNNBody.Hits.Hits) == 0 || osKNNBody.Hits.Hits[0].ID != "doc-3" {
+		t.Fatalf("expected doc-3 ranked #1 for [0,0,1] L2 vector search, got %+v", osKNNBody.Hits.Hits)
+	}
+
+	// 6. Hybrid lexical `query` + semantic `knn` search
+	hybridResp, err := http.Post(ts.URL+"/rag_knowledge_base/_search", "application/json", strings.NewReader(`{
+		"size": 2,
+		"query": {"match": {"title": "Doris"}},
+		"knn": {
+			"field": "embedding",
+			"query_vector": [0.9, 0.1, 0.0],
+			"k": 2,
+			"boost": 2.0
+		}
+	}`))
+	if err != nil || hybridResp.StatusCode != http.StatusOK {
+		t.Fatalf("hybrid query+knn search failed: status=%v err=%v", hybridResp.StatusCode, err)
+	}
+	var hybridBody struct {
+		Hits struct {
+			Hits []struct {
+				ID    string  `json:"_id"`
+				Score float64 `json:"_score"`
+			} `json:"hits"`
+		} `json:"hits"`
+	}
+	if err := json.NewDecoder(hybridResp.Body).Decode(&hybridBody); err != nil {
+		t.Fatal(err)
+	}
+	_ = hybridResp.Body.Close()
+	if len(hybridBody.Hits.Hits) == 0 || hybridBody.Hits.Hits[0].ID != "doc-1" {
+		t.Fatalf("expected hybrid search to rank doc-1 #1, got %+v", hybridBody.Hits.Hits)
+	}
+}

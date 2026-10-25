@@ -76,13 +76,14 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	// 1. Explicit Mapping Creation (VARIANT + Promoted Scalar/Array + Correlated Nested Array + USING INVERTED)
+	// 1. Explicit Mapping Creation (VARIANT + Promoted Scalar/Array + Dense Vector + Correlated Nested Array + USING INVERTED)
 	createJSON := `{
 		"mappings": {
 			"properties": {
 				"name": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
 				"serviceType": {"type": "keyword"},
 				"deleted": {"type": "boolean"},
+				"embedding": {"type": "dense_vector", "dims": 3, "similarity": "cosine"},
 				"tags": {"properties": {"tagFQN": {"type": "keyword"}}},
 				"columns": {
 					"type": "nested",
@@ -122,9 +123,9 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	// 2. Bulk Indexing (2 docs via HTTP Stream Load :8030 -> :8040 redirect)
 	bulkPayload := strings.Join([]string{
 		`{"index":{"_index":"live_table_index","_id":"live-1"}}`,
-		`{"name":"customer_orders","serviceType":"BigQuery","deleted":false,"tags":[{"tagFQN":"PII.Sensitive"}],"columns":[{"name":"user_id","dataType":"INT"}]}`,
+		`{"name":"customer_orders","serviceType":"BigQuery","deleted":false,"embedding":[0.9,0.1,0.0],"tags":[{"tagFQN":"PII.Sensitive"}],"columns":[{"name":"user_id","dataType":"INT"}]}`,
 		`{"index":{"_index":"live_table_index","_id":"live-2"}}`,
-		`{"name":"ephemeral_staging","serviceType":"Snowflake","deleted":false,"tags":[],"columns":[{"name":"temp_id","dataType":"VARCHAR"}]}`,
+		`{"name":"ephemeral_staging","serviceType":"Snowflake","deleted":false,"embedding":[0.1,0.9,0.0],"tags":[],"columns":[{"name":"temp_id","dataType":"VARCHAR"}]}`,
 		"",
 	}, "\n")
 	resp, err := http.Post(ts.URL+"/_bulk?refresh=true", "application/x-ndjson", strings.NewReader(bulkPayload))
@@ -182,6 +183,31 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	hits := searchRes["hits"].(map[string]any)["hits"].([]any)
 	if len(hits) != 1 {
 		t.Fatalf("expected 1 hit from live Doris, got %d: %s", len(hits), string(searchBody))
+	}
+
+	// 3b. Vector / kNN Search Pushdown (COSINE_DISTANCE on ARRAY<FLOAT>) on live Doris 4.x
+	knnPayload := `{
+		"knn": {
+			"field": "embedding",
+			"query_vector": [0.95, 0.05, 0.0],
+			"k": 1,
+			"num_candidates": 10
+		}
+	}`
+	knnResp, err := http.Post(ts.URL+"/live_table_index/_search", "application/json", strings.NewReader(knnPayload))
+	if err != nil {
+		t.Fatalf("POST /_search (knn) transport error: %v", err)
+	}
+	knnBody, _ := io.ReadAll(knnResp.Body)
+	_ = knnResp.Body.Close()
+	if knnResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_search (knn) on live Doris failed: status=%d body=%s", knnResp.StatusCode, string(knnBody))
+	}
+	var knnRes map[string]any
+	_ = json.Unmarshal(knnBody, &knnRes)
+	knnHits := knnRes["hits"].(map[string]any)["hits"].([]any)
+	if len(knnHits) != 1 || knnHits[0].(map[string]any)["_id"] != "live-1" {
+		t.Fatalf("expected top-1 kNN hit to be live-1 on live Doris, got: %s", string(knnBody))
 	}
 
 	// 4. Painless Partial Update + Point Lookup (GET /_doc/live-1)

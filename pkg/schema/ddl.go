@@ -208,6 +208,10 @@ func buildColumnAndIndexDDL(b FieldBinding) (string, string) {
 	}
 
 	switch b.Kind {
+	case StoragePromotedVector:
+		colDef := fmt.Sprintf("`%s` ARRAY<FLOAT> NULL", b.ColumnName)
+		return colDef, ""
+
 	case StoragePromotedArray, StorageNestedSubfield:
 		colDef := fmt.Sprintf("`%s` ARRAY<STRING> NULL", b.ColumnName)
 		idxDef := fmt.Sprintf("INDEX `%s` (`%s`) USING INVERTED", idxName, b.ColumnName)
