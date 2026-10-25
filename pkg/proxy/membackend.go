@@ -45,13 +45,49 @@ type MemoryBackend struct {
 	hitsSQLs []string
 	aggsSQLs []string
 	tables   map[string]map[string]map[string]any // table -> _id -> shredded row map
+	catalog  map[string]CatalogEntry              // entityType+":"+entityKey -> CatalogEntry
 }
 
 func NewMemoryBackend(logSQL bool) *MemoryBackend {
 	return &MemoryBackend{
-		logSQL: logSQL,
-		tables: make(map[string]map[string]map[string]any),
+		logSQL:  logSQL,
+		tables:  make(map[string]map[string]map[string]any),
+		catalog: make(map[string]CatalogEntry),
 	}
+}
+
+func (m *MemoryBackend) InitCatalog(_ context.Context, _ string) error {
+	return nil
+}
+
+func (m *MemoryBackend) UpsertCatalogEntry(_ context.Context, _ string, entry CatalogEntry) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.catalog[entry.EntityType+":"+entry.EntityKey] = entry
+	return nil
+}
+
+func (m *MemoryBackend) DeleteCatalogEntry(_ context.Context, _, entityType, entityKey string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.catalog, entityType+":"+entityKey)
+	return nil
+}
+
+func (m *MemoryBackend) LoadCatalogEntries(_ context.Context, _ string) ([]CatalogEntry, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]CatalogEntry, 0, len(m.catalog))
+	for _, e := range m.catalog {
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].UpdatedEpochMs != out[j].UpdatedEpochMs {
+			return out[i].UpdatedEpochMs < out[j].UpdatedEpochMs
+		}
+		return out[i].EntityKey < out[j].EntityKey
+	})
+	return out, nil
 }
 
 func (m *MemoryBackend) ExecDDL(_ context.Context, ddl string) error {
@@ -132,8 +168,9 @@ func (m *MemoryBackend) GetDocByID(_ context.Context, _, table, id string) (*Hit
 }
 
 var (
-	reHitsSQL = regexp.MustCompile(`(?s)^SELECT ` + "`_id`, `_version`, `_source`, CAST\\((.+) AS DOUBLE\\) AS `_score`, COUNT\\(\\*\\) OVER\\(\\) AS `_total_hits` FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0 AND \\((.+)\\) AND \\((.+)\\) ORDER BY (.+) LIMIT (\\d+) OFFSET (\\d+)$")
-	reCTEBase = regexp.MustCompile(`(?s)^WITH ` + "`base_matched` AS \\(SELECT \\* FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0 AND \\((.+?)\\)\\)\n(.+)$")
+	reHitsSQL          = regexp.MustCompile(`(?s)^SELECT ` + "`_id`, `_version`, `_source`, CAST\\((.+) AS DOUBLE\\) AS `_score`, COUNT\\(\\*\\) OVER\\(\\) AS `_total_hits` FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0 AND \\((.+)\\) AND \\((.+)\\) ORDER BY (.+) LIMIT (\\d+) OFFSET (\\d+)$")
+	reCollapsedHitsSQL = regexp.MustCompile(`(?s)^SELECT ` + "`_id`, `_version`, `_source`, `_score`, COUNT\\(\\*\\) OVER\\(\\) AS `_total_hits` FROM \\(SELECT \\*, CAST\\((.+) AS DOUBLE\\) AS `_score`, ROW_NUMBER\\(\\) OVER \\(PARTITION BY (.+?) ORDER BY .+\\) AS `_collapse_rn` FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0 AND \\((.+)\\) AND \\((.+)\\)\\) `_collapsed` WHERE `_collapse_rn` = 1 ORDER BY (.+) LIMIT (\\d+) OFFSET (\\d+)$")
+	reCTEBase          = regexp.MustCompile(`(?s)^WITH ` + "`base_matched` AS \\(SELECT \\* FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0 AND \\((.+?)\\)\\)\n(.+)$")
 )
 
 func (m *MemoryBackend) QueryHits(_ context.Context, sqlStr string) ([]HitRow, error) {
@@ -149,17 +186,28 @@ func (m *MemoryBackend) QueryHits(_ context.Context, sqlStr string) ([]HitRow, e
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	sub := reHitsSQL.FindStringSubmatch(sqlStr)
-	if sub == nil {
+	var scoreExpr, collapseCol, tableName, mainWhere, postWhere, orderByClause string
+	var limit, offset int
+	if sub := reHitsSQL.FindStringSubmatch(sqlStr); sub != nil {
+		scoreExpr = sub[1]
+		tableName = sub[2]
+		mainWhere = sub[3]
+		postWhere = sub[4]
+		orderByClause = sub[5]
+		limit, _ = strconv.Atoi(sub[6])
+		offset, _ = strconv.Atoi(sub[7])
+	} else if csub := reCollapsedHitsSQL.FindStringSubmatch(sqlStr); csub != nil {
+		scoreExpr = csub[1]
+		collapseCol = csub[2]
+		tableName = csub[3]
+		mainWhere = csub[4]
+		postWhere = csub[5]
+		orderByClause = csub[6]
+		limit, _ = strconv.Atoi(csub[7])
+		offset, _ = strconv.Atoi(csub[8])
+	} else {
 		return nil, fmt.Errorf("unrecognized HitsSQL format: %s", sqlStr)
 	}
-	scoreExpr := sub[1]
-	tableName := sub[2]
-	mainWhere := sub[3]
-	postWhere := sub[4]
-	orderByClause := sub[5]
-	limit, _ := strconv.Atoi(sub[6])
-	offset, _ := strconv.Atoi(sub[7])
 
 	tbl := m.tables[tableName]
 	var matchedRows []map[string]any
@@ -221,8 +269,23 @@ func (m *MemoryBackend) QueryHits(_ context.Context, sqlStr string) ([]HitRow, e
 	})
 
 	sortedHits := make([]HitRow, 0, len(hits))
+	seenCollapse := make(map[string]bool)
 	for _, idx := range sortIdx {
+		if collapseCol != "" {
+			cVal := resolveColumnValue(matchedRows[idx], collapseCol)
+			cKey := fmt.Sprintf("%v", cVal)
+			if seenCollapse[cKey] {
+				continue
+			}
+			seenCollapse[cKey] = true
+		}
 		sortedHits = append(sortedHits, hits[idx])
+	}
+	if collapseCol != "" {
+		collapsedTotal := int64(len(sortedHits))
+		for i := range sortedHits {
+			sortedHits[i].TotalHits = collapsedTotal
+		}
 	}
 
 	if offset >= len(sortedHits) {
@@ -281,7 +344,10 @@ var (
 	reAggMissing      = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_missing' AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (?:\\((.+?)\\) AND )?NOT \\((.+)\\)$")
 	reAggCardArray    = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_metric' AS `_bucket_key`, CAST\\(COUNT\\(DISTINCT `_elem`\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_t` AS `_elem` WHERE (?:\\((.+?)\\) AND )?`_elem` IS NOT NULL$")
 	reAggCardScalar   = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_metric' AS `_bucket_key`, CAST\\(COUNT\\(DISTINCT (.+?)\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
-	reAggMetric       = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_metric' AS `_bucket_key`, CAST\\(COALESCE\\((AVG|SUM|MIN|MAX)\\((.+?)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
+	reAggMetric       = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_metric' AS `_bucket_key`, CAST\\(COALESCE\\((AVG|SUM|MIN|MAX|COUNT)\\((.+?)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
+	reAggDateHist     = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(CAST\\(FLOOR\\((.+?) / (\\d+)\\) \\* \\d+ AS BIGINT\\) AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (?:\\((.+?)\\) AND )?.+? IS NOT NULL GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS BIGINT\\) ASC")
+	reAggHist         = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(FLOOR\\(\\((.+?) - ([^)]+)\\) / ([^)]+)\\) \\* [^)]+ \\+ [^)]+ AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (?:\\((.+?)\\) AND )?.+? IS NOT NULL GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS DOUBLE\\) ASC")
+	reAggRange        = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (.+)$")
 )
 
 func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
@@ -450,9 +516,95 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 						res = v
 					}
 				}
+			case "COUNT":
+				res = float64(len(nums))
 			}
 		}
 		return []AggRow{{AggName: aggName, BucketKey: "_metric", DocCount: int64(res), Value: res}}
+	}
+
+	if m := reAggDateHist.FindStringSubmatch(branch); m != nil {
+		aggName, colExpr, intervalStr, extraWhere := m[1], m[2], m[3], m[4]
+		intervalMs, _ := strconv.ParseInt(intervalStr, 10, 64)
+		if intervalMs <= 0 {
+			intervalMs = 86400000
+		}
+		counts := make(map[int64]int64)
+		for _, row := range baseRows {
+			if extraWhere != "" && !evalWhereExpr(row, extraWhere) {
+				continue
+			}
+			if val := resolveColumnValue(row, colExpr); val != nil {
+				if ts, ok := toInt64(val); ok {
+					b := (ts / intervalMs) * intervalMs
+					counts[b]++
+				}
+			}
+		}
+		keys := make([]int64, 0, len(counts))
+		for k := range counts {
+			keys = append(keys, k)
+		}
+		sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+		rows := make([]AggRow, 0, len(keys))
+		for _, k := range keys {
+			rows = append(rows, AggRow{
+				AggName:   aggName,
+				BucketKey: strconv.FormatInt(k, 10),
+				DocCount:  counts[k],
+				Value:     float64(counts[k]),
+			})
+		}
+		return rows
+	}
+
+	if m := reAggHist.FindStringSubmatch(branch); m != nil {
+		aggName, colExpr, offsetStr, intervalStr, extraWhere := m[1], m[2], m[3], m[4], m[5]
+		offset, _ := strconv.ParseFloat(offsetStr, 64)
+		interval, _ := strconv.ParseFloat(intervalStr, 64)
+		if interval <= 0 {
+			interval = 1.0
+		}
+		counts := make(map[float64]int64)
+		for _, row := range baseRows {
+			if extraWhere != "" && !evalWhereExpr(row, extraWhere) {
+				continue
+			}
+			if val := resolveColumnValue(row, colExpr); val != nil {
+				if f, ok := toFloat(val); ok {
+					b := math.Floor((f-offset)/interval)*interval + offset
+					counts[b]++
+				}
+			}
+		}
+		keys := make([]float64, 0, len(counts))
+		for k := range counts {
+			keys = append(keys, k)
+		}
+		sort.Float64s(keys)
+		rows := make([]AggRow, 0, len(keys))
+		for _, k := range keys {
+			rows = append(rows, AggRow{
+				AggName:   aggName,
+				BucketKey: strconv.FormatFloat(k, 'f', -1, 64),
+				DocCount:  counts[k],
+				Value:     float64(counts[k]),
+			})
+		}
+		return rows
+	}
+
+	if m := reAggRange.FindStringSubmatch(branch); m != nil {
+		aggName, bkey, rangeWhere := m[1], m[2], m[3]
+		if bkey != "_filter" && bkey != "_missing" && bkey != "_metric" && bkey != "_count" {
+			var cnt int64
+			for _, row := range baseRows {
+				if evalWhereExpr(row, rangeWhere) {
+					cnt++
+				}
+			}
+			return []AggRow{{AggName: aggName, BucketKey: bkey, DocCount: cnt, Value: float64(cnt)}}
+		}
 	}
 
 	return nil
@@ -909,6 +1061,10 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			srcStr, _ := row["_source"].(string)
 			return extractJSONPathFromStr(srcStr, segs)
 		}
+	}
+	if strings.HasPrefix(colExpr, "CAST(") && strings.HasSuffix(colExpr, " AS DOUBLE)") && !strings.HasPrefix(colExpr, "CAST(`_doc`") {
+		inner := colExpr[len("CAST(") : len(colExpr)-len(" AS DOUBLE)")]
+		return evalNumericExpr(row, inner)
 	}
 	return nil
 }

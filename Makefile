@@ -20,6 +20,7 @@ test-e2e:
 	DORIS_E2E_DSN="$(DORIS_E2E_DSN)" DORIS_E2E_HTTP="$(DORIS_E2E_HTTP)" go test -race -count=1 -v ./e2e -run TestLiveApacheDoris_E2E
 
 lint:
+	gofmt -s -w .
 	go vet ./...
 	golangci-lint run ./...
 

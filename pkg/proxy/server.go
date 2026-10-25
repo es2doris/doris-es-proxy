@@ -21,6 +21,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -81,6 +82,24 @@ type DorisBackend interface {
 	StreamLoad(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error
 }
 
+// CatalogEntry represents a persisted index schema, alias, or index template in Doris `_es_catalog`.
+type CatalogEntry struct {
+	EntityType     string `json:"entity_type"`      // "index" | "alias" | "template"
+	EntityKey      string `json:"entity_key"`       // indexName, aliasName, or templateName
+	PayloadJSON    string `json:"payload_json"`     // serialized MappingSpec, []string alias targets, or IndexTemplateRequest
+	UpdatedEpochMs int64  `json:"updated_epoch_ms"` // monotonic epoch ms
+}
+
+// CatalogBackend is an optional extension of DorisBackend for persisting index mappings,
+// aliases, and templates in Apache Doris (`_es_catalog`) so proxy instances remain 100% stateless
+// across pod restarts and multi-replica horizontal scaling.
+type CatalogBackend interface {
+	InitCatalog(ctx context.Context, db string) error
+	UpsertCatalogEntry(ctx context.Context, db string, entry CatalogEntry) error
+	DeleteCatalogEntry(ctx context.Context, db, entityType, entityKey string) error
+	LoadCatalogEntries(ctx context.Context, db string) ([]CatalogEntry, error)
+}
+
 // Server implements the Elasticsearch / OpenSearch HTTP REST API adapter backed by Apache Doris.
 type Server struct {
 	dorisDB       string
@@ -104,6 +123,114 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		indices:       make(map[string]*schema.IndexSchema),
 		aliases:       make(map[string][]string),
 		templates:     make(map[string]esast.IndexTemplateRequest),
+	}
+}
+
+// BootstrapCatalog creates `_es_catalog` if supported by the backend and rehydrates
+// all persisted index mappings, aliases, and templates into memory.
+func (s *Server) BootstrapCatalog(ctx context.Context) error {
+	cb, ok := s.backend.(CatalogBackend)
+	if !ok {
+		return nil
+	}
+	if err := cb.InitCatalog(ctx, s.dorisDB); err != nil {
+		return err
+	}
+	return s.syncCatalogFromBackend(ctx)
+}
+
+func (s *Server) syncCatalogFromBackend(ctx context.Context) error {
+	cb, ok := s.backend.(CatalogBackend)
+	if !ok {
+		return nil
+	}
+	entries, err := cb.LoadCatalogEntries(ctx, s.dorisDB)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, e := range entries {
+		switch e.EntityType {
+		case "template":
+			var tpl esast.IndexTemplateRequest
+			if err := json.Unmarshal([]byte(e.PayloadJSON), &tpl); err == nil {
+				s.templates[e.EntityKey] = tpl
+			}
+		case "index":
+			var spec esast.MappingSpec
+			if len(strings.TrimSpace(e.PayloadJSON)) > 0 && e.PayloadJSON != "null" {
+				_ = json.Unmarshal([]byte(e.PayloadJSON), &spec)
+			}
+			var specPtr *esast.MappingSpec
+			if len(spec.Properties) > 0 {
+				specPtr = &spec
+			}
+			s.indices[e.EntityKey] = schema.CompileIndexSchema(s.dorisDB, e.EntityKey, specPtr)
+		case "alias":
+			var targets []string
+			if err := json.Unmarshal([]byte(e.PayloadJSON), &targets); err == nil {
+				if len(targets) > 0 {
+					s.aliases[e.EntityKey] = targets
+				} else {
+					delete(s.aliases, e.EntityKey)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Server) persistTemplate(ctx context.Context, name string, tpl esast.IndexTemplateRequest) {
+	if cb, ok := s.backend.(CatalogBackend); ok {
+		if raw, err := json.Marshal(tpl); err == nil {
+			_ = cb.UpsertCatalogEntry(ctx, s.dorisDB, CatalogEntry{
+				EntityType:     "template",
+				EntityKey:      name,
+				PayloadJSON:    string(raw),
+				UpdatedEpochMs: time.Now().UnixMilli(),
+			})
+		}
+	}
+}
+
+func (s *Server) persistIndex(ctx context.Context, indexName string, idxSchema *schema.IndexSchema) {
+	if cb, ok := s.backend.(CatalogBackend); ok {
+		payload := "{}"
+		if idxSchema != nil && idxSchema.RawMapping != nil {
+			if raw, err := json.Marshal(idxSchema.RawMapping); err == nil {
+				payload = string(raw)
+			}
+		}
+		_ = cb.UpsertCatalogEntry(ctx, s.dorisDB, CatalogEntry{
+			EntityType:     "index",
+			EntityKey:      indexName,
+			PayloadJSON:    payload,
+			UpdatedEpochMs: time.Now().UnixMilli(),
+		})
+	}
+}
+
+func (s *Server) persistAlias(ctx context.Context, aliasName string, targets []string) {
+	if cb, ok := s.backend.(CatalogBackend); ok {
+		if len(targets) == 0 {
+			_ = cb.DeleteCatalogEntry(ctx, s.dorisDB, "alias", aliasName)
+			return
+		}
+		if raw, err := json.Marshal(targets); err == nil {
+			_ = cb.UpsertCatalogEntry(ctx, s.dorisDB, CatalogEntry{
+				EntityType:     "alias",
+				EntityKey:      aliasName,
+				PayloadJSON:    string(raw),
+				UpdatedEpochMs: time.Now().UnixMilli(),
+			})
+		}
+	}
+}
+
+func (s *Server) deleteCatalogEntity(ctx context.Context, entityType, entityKey string) {
+	if cb, ok := s.backend.(CatalogBackend); ok {
+		_ = cb.DeleteCatalogEntry(ctx, s.dorisDB, entityType, entityKey)
 	}
 }
 
@@ -150,6 +277,8 @@ func (s *Server) Handler() http.Handler {
 				s.handleNodes(w, r)
 			case "_mapping", "_mappings":
 				s.handleGetAllMappings(w, r)
+			case "_field_caps":
+				s.handleFieldCaps(w, r)
 			default:
 				r.SetPathValue("index", segs[0])
 				switch r.Method {
@@ -180,6 +309,8 @@ func (s *Server) Handler() http.Handler {
 				s.handleClusterHealth(w, r)
 			case segs[0] == "_search" && segs[1] == "scroll":
 				s.handleScroll(w, r)
+			case segs[0] == "_doris" && segs[1] == "explain":
+				s.handleDorisExplain(w, r)
 			case segs[0] == "_alias":
 				r.SetPathValue("name", segs[1])
 				s.handleGetAliases(w, r)
@@ -215,6 +346,8 @@ func (s *Server) Handler() http.Handler {
 					s.handleUpdateByQuery(w, r)
 				case "_delete_by_query":
 					s.handleDeleteByQuery(w, r)
+				case "_field_caps":
+					s.handleFieldCaps(w, r)
 				case "_doc", "_create":
 					if r.Method == http.MethodPost {
 						r.SetPathValue("id", esast.NextAutoID())
@@ -237,6 +370,14 @@ func (s *Server) Handler() http.Handler {
 			if segs[1] == "_alias" || segs[1] == "_aliases" {
 				r.SetPathValue("name", segs[2])
 				s.handleIndexAliasByName(w, r)
+				return
+			}
+			if segs[1] == "_doris" && segs[2] == "explain" {
+				s.handleDorisExplain(w, r)
+				return
+			}
+			if segs[1] == "_doris" && segs[2] == "ddl" {
+				s.handleDorisDDL(w, r)
 				return
 			}
 			if segs[1] == "_mapping" || segs[1] == "_mappings" {
@@ -398,22 +539,97 @@ func (s *Server) handleRefresh(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+type scrollCursor struct {
+	Index    string              `json:"idx"`
+	Req      esast.SearchRequest `json:"req"`
+	LastSort []any               `json:"after,omitempty"`
+}
+
+func encodeScrollCursor(indexName string, req *esast.SearchRequest, lastSort []any) string {
+	c := scrollCursor{
+		Index:    indexName,
+		Req:      *req,
+		LastSort: lastSort,
+	}
+	raw, err := json.Marshal(c)
+	if err != nil {
+		return "doris-scroll-eof"
+	}
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func decodeScrollCursor(token string) (*scrollCursor, bool) {
+	if token == "" || token == "doris-scroll-eof" {
+		return nil, false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return nil, false
+	}
+	var c scrollCursor
+	if err := json.Unmarshal(raw, &c); err != nil {
+		return nil, false
+	}
+	return &c, true
+}
+
 func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodDelete {
 		writeJSON(w, http.StatusOK, map[string]any{"succeeded": true, "num_freed": 1})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"_scroll_id": "doris-scroll-eof",
-		"took":       1,
-		"timed_out":  false,
-		"_shards":    map[string]any{"total": 1, "successful": 1, "skipped": 0, "failed": 0},
-		"hits": map[string]any{
-			"total":     map[string]any{"value": 0, "relation": "eq"},
-			"max_score": nil,
-			"hits":      []any{},
-		},
-	})
+	scrollID := r.URL.Query().Get("scroll_id")
+	if r.Body != nil {
+		var body struct {
+			ScrollID any `json:"scroll_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+			switch v := body.ScrollID.(type) {
+			case string:
+				if v != "" {
+					scrollID = v
+				}
+			case []any:
+				if len(v) > 0 {
+					scrollID = fmt.Sprintf("%v", v[0])
+				}
+			}
+		}
+	}
+	cursor, ok := decodeScrollCursor(scrollID)
+	if !ok || len(cursor.LastSort) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"_scroll_id": "doris-scroll-eof",
+			"took":       1,
+			"timed_out":  false,
+			"_shards":    map[string]any{"total": 1, "successful": 1, "skipped": 0, "failed": 0},
+			"hits": map[string]any{
+				"total":     map[string]any{"value": 0, "relation": "eq"},
+				"max_score": nil,
+				"hits":      []any{},
+			},
+		})
+		return
+	}
+	req := cursor.Req
+	zero := 0
+	req.From = &zero
+	req.SearchAfter = cursor.LastSort
+	resp, status, errType, errReason := s.executeSearchRequest(r.Context(), cursor.Index, &req)
+	if errType != "" {
+		writeESError(w, status, errType, errReason)
+		return
+	}
+	nextScrollID := "doris-scroll-eof"
+	if hitsWrapper, ok := resp["hits"].(map[string]any); ok {
+		if hitList, ok := hitsWrapper["hits"].([]map[string]any); ok && len(hitList) > 0 {
+			if lastSort, ok := hitList[len(hitList)-1]["sort"].([]any); ok && len(lastSort) > 0 {
+				nextScrollID = encodeScrollCursor(cursor.Index, &req, lastSort)
+			}
+		}
+	}
+	resp["_scroll_id"] = nextScrollID
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
@@ -433,11 +649,18 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		s.templates[name] = tpl
 		s.mu.Unlock()
+		s.persistTemplate(r.Context(), name, tpl)
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 	case http.MethodHead:
 		s.mu.RLock()
 		_, ok := s.templates[name]
 		s.mu.RUnlock()
+		if !ok {
+			_ = s.syncCatalogFromBackend(r.Context())
+			s.mu.RLock()
+			_, ok = s.templates[name]
+			s.mu.RUnlock()
+		}
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -447,6 +670,12 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 		s.mu.RLock()
 		tpl, ok := s.templates[name]
 		s.mu.RUnlock()
+		if !ok {
+			_ = s.syncCatalogFromBackend(r.Context())
+			s.mu.RLock()
+			tpl, ok = s.templates[name]
+			s.mu.RUnlock()
+		}
 		if !ok {
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "index_template ["+name+"] missing")
 			return
@@ -460,6 +689,7 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		delete(s.templates, name)
 		s.mu.Unlock()
+		s.deleteCatalogEntity(r.Context(), "template", name)
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 	default:
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
@@ -512,12 +742,18 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	aliasesToPersist := make(map[string][]string)
 	s.mu.Lock()
 	s.indices[indexName] = compiled
 	for alias := range req.Aliases {
 		s.addAliasLocked(alias, indexName)
+		aliasesToPersist[alias] = append([]string(nil), s.aliases[alias]...)
 	}
 	s.mu.Unlock()
+	s.persistIndex(r.Context(), indexName, compiled)
+	for alias, targets := range aliasesToPersist {
+		s.persistAlias(r.Context(), alias, targets)
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"acknowledged":        true,
@@ -573,6 +809,13 @@ func (s *Server) handleHeadIndex(w http.ResponseWriter, r *http.Request) {
 	targets, isAlias := s.aliases[raw]
 	s.mu.RUnlock()
 	if !isIndex && (!isAlias || len(targets) == 0) {
+		_ = s.syncCatalogFromBackend(r.Context())
+		s.mu.RLock()
+		_, isIndex = s.indices[raw]
+		targets, isAlias = s.aliases[raw]
+		s.mu.RUnlock()
+	}
+	if !isIndex && (!isAlias || len(targets) == 0) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -581,13 +824,19 @@ func (s *Server) handleHeadIndex(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteIndex(w http.ResponseWriter, r *http.Request) {
 	indexName := s.resolveIndexName(r.PathValue("index"))
+	modifiedAliases := make(map[string][]string)
 	s.mu.Lock()
 	idx, ok := s.indices[indexName]
 	delete(s.indices, indexName)
 	for alias := range s.aliases {
 		s.removeAliasTargetLocked(alias, indexName)
+		modifiedAliases[alias] = append([]string(nil), s.aliases[alias]...)
 	}
 	s.mu.Unlock()
+	s.deleteCatalogEntity(r.Context(), "index", indexName)
+	for alias, targets := range modifiedAliases {
+		s.persistAlias(r.Context(), alias, targets)
+	}
 
 	if ok {
 		ddl := fmt.Sprintf("DROP TABLE IF EXISTS `%s`.`%s`;", idx.DorisDB, idx.DorisTable)
@@ -663,6 +912,7 @@ func (s *Server) handlePutMapping(w http.ResponseWriter, r *http.Request) {
 	newSchema := schema.CompileIndexSchema(s.dorisDB, indexName, mergedSpec)
 	s.indices[indexName] = newSchema
 	s.mu.Unlock()
+	s.persistIndex(r.Context(), indexName, newSchema)
 
 	if oldSchema == nil {
 		ddl := schema.GenerateCreateTableDDL(newSchema)
@@ -755,12 +1005,16 @@ func (s *Server) handleIndexAliasByName(w http.ResponseWriter, r *http.Request) 
 	case http.MethodPut, http.MethodPost:
 		s.mu.Lock()
 		s.addAliasLocked(aliasName, indexName)
+		targets := append([]string(nil), s.aliases[aliasName]...)
 		s.mu.Unlock()
+		s.persistAlias(r.Context(), aliasName, targets)
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 	case http.MethodDelete:
 		s.mu.Lock()
 		s.removeAliasTargetLocked(aliasName, indexName)
+		targets := append([]string(nil), s.aliases[aliasName]...)
 		s.mu.Unlock()
+		s.persistAlias(r.Context(), aliasName, targets)
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 	case http.MethodGet:
 		s.mu.RLock()
@@ -800,6 +1054,7 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
 		return
 	}
+	modifiedAliases := make(map[string][]string)
 	s.mu.Lock()
 	for _, action := range payload.Actions {
 		if add, ok := action["add"]; ok {
@@ -815,6 +1070,7 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 				for _, idx := range indices {
 					s.addAliasLocked(al, idx)
 				}
+				modifiedAliases[al] = append([]string(nil), s.aliases[al]...)
 			}
 		}
 		if rem, ok := action["remove"]; ok {
@@ -834,10 +1090,14 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 						s.removeAliasTargetLocked(al, idx)
 					}
 				}
+				modifiedAliases[al] = append([]string(nil), s.aliases[al]...)
 			}
 		}
 	}
 	s.mu.Unlock()
+	for al, targets := range modifiedAliases {
+		s.persistAlias(r.Context(), al, targets)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 }
 
@@ -1296,8 +1556,8 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			var upd painless.UpdateRequest
 			if err := json.Unmarshal(op.Source, &upd); err == nil {
 				var baseSrc json.RawMessage
-				_, found, _ := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, op.ID)
-				if existing, ok, _ := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, op.ID); ok {
+				existing, found, _ := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, op.ID)
+				if found && existing != nil {
 					baseSrc = existing.Source
 				}
 				if merged, opRes, err := painless.ApplyUpdateWithResult(baseSrc, &upd, found); err == nil {
@@ -1373,13 +1633,175 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	applyURISearchParams(r, &req)
+	if r.URL.Query().Get("scroll") != "" && len(req.Sort) == 0 {
+		req.Sort = esast.SortSlice{{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}}}
+	}
 
-	resp, status, errType, errReason := s.executeSearchRequest(r.Context(), r.PathValue("index"), &req)
+	rawIndex := r.PathValue("index")
+	resp, status, errType, errReason := s.executeSearchRequest(r.Context(), rawIndex, &req)
 	if errType != "" {
 		writeESError(w, status, errType, errReason)
 		return
 	}
+	if r.URL.Query().Get("scroll") != "" {
+		scrollID := "doris-scroll-eof"
+		if hitsWrapper, ok := resp["hits"].(map[string]any); ok {
+			if hitList, ok := hitsWrapper["hits"].([]map[string]any); ok && len(hitList) > 0 {
+				if lastSort, ok := hitList[len(hitList)-1]["sort"].([]any); ok && len(lastSort) > 0 {
+					scrollID = encodeScrollCursor(rawIndex, &req, lastSort)
+				}
+			}
+		}
+		resp["_scroll_id"] = scrollID
+	}
+	if r.URL.Query().Get("doris_explain") == "true" || r.URL.Query().Get("doris_explain") == "1" {
+		resp["_doris_explain"] = s.buildDorisExplainObject(r.Context(), rawIndex, &req)
+	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleDorisExplain(w http.ResponseWriter, r *http.Request) {
+	var req esast.SearchRequest
+	if r.Body != nil {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &req); err != nil {
+				writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+				return
+			}
+		}
+	}
+	applyURISearchParams(r, &req)
+	writeJSON(w, http.StatusOK, s.buildDorisExplainObject(r.Context(), r.PathValue("index"), &req))
+}
+
+func (s *Server) handleDorisDDL(w http.ResponseWriter, r *http.Request) {
+	indexName := s.resolveIndexName(r.PathValue("index"))
+	idxSchema := s.ensureIndexSchema(r.Context(), indexName)
+	ddl := schema.GenerateCreateTableDDL(idxSchema)
+	if r.URL.Query().Get("format") == "txt" || r.URL.Query().Get("format") == "sql" {
+		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(ddl + "\n"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"index":            indexName,
+		"doris_database":   idxSchema.DorisDB,
+		"doris_table":      idxSchema.DorisTable,
+		"create_table_ddl": ddl,
+	})
+}
+
+func (s *Server) buildDorisExplainObject(ctx context.Context, rawIndexPattern string, req *esast.SearchRequest) map[string]any {
+	targets := s.resolveTargetIndices(rawIndexPattern)
+	if len(targets) == 0 {
+		targets = []string{s.resolveIndexName(rawIndexPattern)}
+	}
+	var plans []map[string]any
+	for _, indexName := range targets {
+		idxSchema := s.ensureIndexSchema(ctx, indexName)
+		tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
+		plan, err := tr.BuildSearchPlan(req)
+		fieldBindings := make(map[string]any, len(idxSchema.Fields))
+		for esPath, fb := range idxSchema.Fields {
+			fieldBindings[esPath] = map[string]any{
+				"column":            fb.ColumnName,
+				"doris_type":        fb.DorisType,
+				"keyword_companion": fb.KeywordCompanion,
+				"prefilter_array":   fb.PrefilterArrayCol,
+				"nested_path":       fb.NestedPath,
+			}
+		}
+		entry := map[string]any{
+			"index":            indexName,
+			"doris_database":   idxSchema.DorisDB,
+			"doris_table":      idxSchema.DorisTable,
+			"create_table_ddl": schema.GenerateCreateTableDDL(idxSchema),
+			"hits_sql":         plan.HitsSQL,
+			"aggs_sql":         plan.AggsSQL,
+			"field_bindings":   fieldBindings,
+		}
+		if err != nil {
+			entry["error"] = err.Error()
+		}
+		plans = append(plans, entry)
+	}
+	out := map[string]any{
+		"resolved_indices": targets,
+		"doris_database":   s.dorisDB,
+		"plans":            plans,
+	}
+	if len(plans) == 1 {
+		out["hits_sql"] = plans[0]["hits_sql"]
+		out["aggs_sql"] = plans[0]["aggs_sql"]
+		out["create_table_ddl"] = plans[0]["create_table_ddl"]
+		out["doris_table"] = plans[0]["doris_table"]
+	}
+	return out
+}
+
+func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
+	targets := s.resolveTargetIndices(r.PathValue("index"))
+	fieldsFilter := r.URL.Query().Get("fields")
+	if fieldsFilter == "" {
+		fieldsFilter = "*"
+	}
+	filterPatterns := strings.Split(fieldsFilter, ",")
+
+	caps := make(map[string]map[string]map[string]any)
+	addCap := func(field, esType string, searchable, aggregatable bool) {
+		if !matchesAnyGlob(field, filterPatterns) {
+			return
+		}
+		if caps[field] == nil {
+			caps[field] = make(map[string]map[string]any)
+		}
+		caps[field][esType] = map[string]any{
+			"type":         esType,
+			"searchable":   searchable,
+			"aggregatable": aggregatable,
+		}
+	}
+
+	addCap("_id", "_id", true, true)
+	addCap("_index", "_index", true, true)
+	addCap("@timestamp", "date", true, true)
+
+	s.mu.RLock()
+	for _, idxName := range targets {
+		idxSchema, ok := s.indices[idxName]
+		if !ok {
+			continue
+		}
+		for esPath, fb := range idxSchema.Fields {
+			switch fb.DorisType {
+			case schema.DorisBigInt:
+				if strings.Contains(strings.ToLower(esPath), "time") || strings.Contains(strings.ToLower(esPath), "date") || strings.HasSuffix(esPath, "At") {
+					addCap(esPath, "date", true, true)
+				} else {
+					addCap(esPath, "long", true, true)
+				}
+			case schema.DorisDouble:
+				addCap(esPath, "double", true, true)
+			case schema.DorisBoolean:
+				addCap(esPath, "boolean", true, true)
+			case schema.DorisString:
+				addCap(esPath, "text", true, false)
+				if fb.KeywordCompanion != "" {
+					addCap(esPath+".keyword", "keyword", true, true)
+				}
+			default:
+				addCap(esPath, "keyword", true, true)
+			}
+		}
+	}
+	s.mu.RUnlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"indices": targets,
+		"fields":  caps,
+	})
 }
 
 func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
@@ -1702,6 +2124,9 @@ func buildESResponse(indexName string, req *esast.SearchRequest, hits []HitRow, 
 				hitMap["highlight"] = hl
 			}
 		}
+		if len(req.Sort) > 0 {
+			hitMap["sort"] = extractHitSortValues(h, req.Sort)
+		}
 		esHits = append(esHits, hitMap)
 	}
 
@@ -1796,7 +2221,7 @@ func buildAggsMap(
 				}
 			}
 			aggsOut[aggName] = filterObj
-		case spec.Cardinality != nil:
+		case spec.Cardinality != nil || spec.ValueCount != nil:
 			var cnt int64
 			if len(rows) > 0 {
 				cnt = rows[0].effectiveCount()
@@ -1808,9 +2233,92 @@ func buildAggsMap(
 				val = rows[0].effectiveValue()
 			}
 			aggsOut[aggName] = map[string]any{"value": val}
+		case spec.DateHistogram != nil:
+			b := make([]map[string]any, 0, len(rows))
+			for _, r := range rows {
+				epochMs, _ := strconv.ParseInt(r.BucketKey, 10, 64)
+				keyStr := time.UnixMilli(epochMs).UTC().Format("2006-01-02T15:04:05.000Z")
+				b = append(b, map[string]any{
+					"key_as_string": keyStr,
+					"key":           epochMs,
+					"doc_count":     r.effectiveCount(),
+				})
+			}
+			aggsOut[aggName] = map[string]any{"buckets": b}
+		case spec.Histogram != nil:
+			b := make([]map[string]any, 0, len(rows))
+			for _, r := range rows {
+				numKey, _ := strconv.ParseFloat(r.BucketKey, 64)
+				b = append(b, map[string]any{
+					"key":       numKey,
+					"doc_count": r.effectiveCount(),
+				})
+			}
+			aggsOut[aggName] = map[string]any{"buckets": b}
+		case spec.Range != nil:
+			byKey := make(map[string]int64, len(rows))
+			for _, r := range rows {
+				byKey[r.BucketKey] = r.effectiveCount()
+			}
+			b := make([]map[string]any, 0, len(spec.Range.Ranges))
+			for _, rng := range spec.Range.Ranges {
+				ek := rng.EffectiveKey()
+				entry := map[string]any{
+					"key":       ek,
+					"doc_count": byKey[ek],
+				}
+				if rng.From != nil {
+					entry["from"] = rng.From
+				}
+				if rng.To != nil {
+					entry["to"] = rng.To
+				}
+				b = append(b, entry)
+			}
+			aggsOut[aggName] = map[string]any{"buckets": b}
 		}
 	}
 	return aggsOut
+}
+
+func extractHitSortValues(h HitRow, sorts []esast.SortSpec) []any {
+	var doc map[string]any
+	if len(h.Source) > 0 {
+		dec := json.NewDecoder(bytes.NewReader(h.Source))
+		dec.UseNumber()
+		_ = dec.Decode(&doc)
+	}
+	out := make([]any, 0, len(sorts))
+	for _, s := range sorts {
+		switch s.Entry.Field {
+		case "_score":
+			out = append(out, h.Score)
+		case "_id", "_doc":
+			out = append(out, h.ID)
+		default:
+			cleanField := strings.TrimSuffix(strings.TrimSuffix(s.Entry.Field, ".keyword"), ".ngram")
+			val := lookupDocPath(doc, strings.Split(cleanField, "."))
+			if jsonNum, ok := val.(json.Number); ok {
+				if iv, err := jsonNum.Int64(); err == nil {
+					val = iv
+				} else if fv, err := jsonNum.Float64(); err == nil {
+					val = fv
+				}
+			}
+			out = append(out, val)
+		}
+	}
+	return out
+}
+
+func lookupDocPath(node any, path []string) any {
+	if node == nil || len(path) == 0 {
+		return node
+	}
+	if m, ok := node.(map[string]any); ok {
+		return lookupDocPath(m[path[0]], path[1:])
+	}
+	return nil
 }
 
 func filterSourceJSON(raw json.RawMessage, sf *esast.SourceFilter) json.RawMessage {
@@ -2127,6 +2635,16 @@ func (s *Server) ensureIndexSchema(ctx context.Context, indexName string) *schem
 		s.mu.RUnlock()
 		return idx
 	}
+	s.mu.RUnlock()
+
+	_ = s.syncCatalogFromBackend(ctx)
+
+	s.mu.RLock()
+	idx, ok = s.indices[indexName]
+	if ok {
+		s.mu.RUnlock()
+		return idx
+	}
 	tplMappings := s.matchingTemplateMappingsLocked(indexName)
 	s.mu.RUnlock()
 
@@ -2139,6 +2657,7 @@ func (s *Server) ensureIndexSchema(ctx context.Context, indexName string) *schem
 	}
 	s.indices[indexName] = compiled
 	s.mu.Unlock()
+	s.persistIndex(ctx, indexName, compiled)
 	return compiled
 }
 

@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -49,6 +50,11 @@ type SearchRequest struct {
 	Source         *SourceFilter      `json:"_source,omitempty"`
 	TrackTotalHits any                `json:"track_total_hits,omitempty"`
 	Highlight      *HighlightSpec     `json:"highlight,omitempty"`
+	Collapse       *CollapseSpec      `json:"collapse,omitempty"`
+}
+
+type CollapseSpec struct {
+	Field string `json:"field"`
 }
 
 type HighlightSpec struct {
@@ -405,17 +411,21 @@ type FieldValueFactorSpec struct {
 
 // AggSpec represents an Elasticsearch aggregation definition.
 type AggSpec struct {
-	Terms        *TermsAggSpec      `json:"terms,omitempty"`
-	Filter       *Query             `json:"filter,omitempty"`
-	Missing      *ExistsQuery       `json:"missing,omitempty"`
-	Nested       *NestedAggSpec     `json:"nested,omitempty"`
-	Cardinality  *MetricAggSpec     `json:"cardinality,omitempty"`
-	Avg          *MetricAggSpec     `json:"avg,omitempty"`
-	Sum          *MetricAggSpec     `json:"sum,omitempty"`
-	Min          *MetricAggSpec     `json:"min,omitempty"`
-	Max          *MetricAggSpec     `json:"max,omitempty"`
-	Aggs         map[string]AggSpec `json:"aggs,omitempty"`
-	Aggregations map[string]AggSpec `json:"aggregations,omitempty"`
+	Terms         *TermsAggSpec         `json:"terms,omitempty"`
+	DateHistogram *DateHistogramAggSpec `json:"date_histogram,omitempty"`
+	Histogram     *HistogramAggSpec     `json:"histogram,omitempty"`
+	Range         *RangeAggSpec         `json:"range,omitempty"`
+	Filter        *Query                `json:"filter,omitempty"`
+	Missing       *ExistsQuery          `json:"missing,omitempty"`
+	Nested        *NestedAggSpec        `json:"nested,omitempty"`
+	Cardinality   *MetricAggSpec        `json:"cardinality,omitempty"`
+	ValueCount    *MetricAggSpec        `json:"value_count,omitempty"`
+	Avg           *MetricAggSpec        `json:"avg,omitempty"`
+	Sum           *MetricAggSpec        `json:"sum,omitempty"`
+	Min           *MetricAggSpec        `json:"min,omitempty"`
+	Max           *MetricAggSpec        `json:"max,omitempty"`
+	Aggs          map[string]AggSpec    `json:"aggs,omitempty"`
+	Aggregations  map[string]AggSpec    `json:"aggregations,omitempty"`
 }
 
 func (a *AggSpec) SubAggs() map[string]AggSpec {
@@ -429,6 +439,104 @@ type TermsAggSpec struct {
 	Field   string `json:"field"`
 	Size    int    `json:"size,omitempty"`
 	Missing any    `json:"missing,omitempty"`
+}
+
+type DateHistogramAggSpec struct {
+	Field            string `json:"field"`
+	CalendarInterval string `json:"calendar_interval,omitempty"`
+	FixedInterval    string `json:"fixed_interval,omitempty"`
+	Interval         string `json:"interval,omitempty"`
+	TimeZone         string `json:"time_zone,omitempty"`
+	MinDocCount      *int   `json:"min_doc_count,omitempty"`
+}
+
+// EffectiveIntervalMs parses calendar_interval, fixed_interval, or interval into milliseconds.
+func (d *DateHistogramAggSpec) EffectiveIntervalMs() int64 {
+	raw := strings.TrimSpace(d.FixedInterval)
+	if raw == "" {
+		raw = strings.TrimSpace(d.CalendarInterval)
+	}
+	if raw == "" {
+		raw = strings.TrimSpace(d.Interval)
+	}
+	switch raw {
+	case "second", "1s":
+		return 1000
+	case "minute", "1m":
+		return 60 * 1000
+	case "hour", "1h":
+		return 3600 * 1000
+	case "day", "1d":
+		return 86400 * 1000
+	case "week", "1w":
+		return 7 * 86400 * 1000
+	case "month", "1M":
+		return 30 * 86400 * 1000
+	case "quarter", "1q":
+		return 90 * 86400 * 1000
+	case "year", "1y":
+		return 365 * 86400 * 1000
+	}
+	if strings.HasSuffix(raw, "ms") {
+		if n, err := strconv.ParseInt(strings.TrimSuffix(raw, "ms"), 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	if len(raw) >= 2 {
+		unit := raw[len(raw)-1]
+		if n, err := strconv.ParseInt(raw[:len(raw)-1], 10, 64); err == nil && n > 0 {
+			switch unit {
+			case 's':
+				return n * 1000
+			case 'm':
+				return n * 60 * 1000
+			case 'h':
+				return n * 3600 * 1000
+			case 'd':
+				return n * 86400 * 1000
+			case 'w':
+				return n * 7 * 86400 * 1000
+			case 'M':
+				return n * 30 * 86400 * 1000
+			case 'y':
+				return n * 365 * 86400 * 1000
+			}
+		}
+	}
+	return 86400 * 1000
+}
+
+type HistogramAggSpec struct {
+	Field       string  `json:"field"`
+	Interval    float64 `json:"interval"`
+	Offset      float64 `json:"offset,omitempty"`
+	MinDocCount *int    `json:"min_doc_count,omitempty"`
+}
+
+type RangeAggSpec struct {
+	Field  string           `json:"field"`
+	Ranges []RangeAggBucket `json:"ranges"`
+}
+
+type RangeAggBucket struct {
+	Key  string `json:"key,omitempty"`
+	From any    `json:"from,omitempty"`
+	To   any    `json:"to,omitempty"`
+}
+
+func (b RangeAggBucket) EffectiveKey() string {
+	if b.Key != "" {
+		return b.Key
+	}
+	fromStr := "*"
+	if b.From != nil {
+		fromStr = fmt.Sprintf("%v", b.From)
+	}
+	toStr := "*"
+	if b.To != nil {
+		toStr = fmt.Sprintf("%v", b.To)
+	}
+	return fromStr + "-" + toStr
 }
 
 type NestedAggSpec struct {
@@ -448,6 +556,14 @@ type SortFieldSpec struct {
 
 type SortSpec struct {
 	Entry SortFieldSpec
+}
+
+func (s SortSpec) MarshalJSON() ([]byte, error) {
+	order := s.Entry.Order
+	if order == "" {
+		order = "asc"
+	}
+	return json.Marshal(map[string]string{s.Entry.Field: order})
 }
 
 // SortSlice accepts either a single sort specification (`"_doc"` / `{"updatedAt": "desc"}`) or an array.

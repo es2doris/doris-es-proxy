@@ -150,3 +150,83 @@ func (b *DorisSQLBackend) StreamLoad(ctx context.Context, table string, ndjson [
 	}
 	return b.streamLoad.LoadNDJSON(ctx, table, ndjson, syncRefresh)
 }
+
+func (b *DorisSQLBackend) InitCatalog(ctx context.Context, dbName string) error {
+	if b.db == nil {
+		return nil
+	}
+	safeDB := schema.SanitizeDorisIdentifier(dbName)
+	ddl := fmt.Sprintf(
+		"CREATE TABLE IF NOT EXISTS `%s`.`_es_catalog` (\n"+
+			"  `entity_type` VARCHAR(32) NOT NULL COMMENT 'index | alias | template',\n"+
+			"  `entity_key` VARCHAR(512) NOT NULL COMMENT 'Index, alias, or template name',\n"+
+			"  `payload_json` STRING NOT NULL COMMENT 'Serialized metadata JSON',\n"+
+			"  `updated_epoch_ms` BIGINT NOT NULL COMMENT 'Monotonic sequence timestamp'\n"+
+			")\n"+
+			"ENGINE = OLAP\n"+
+			"UNIQUE KEY(`entity_type`, `entity_key`)\n"+
+			"DISTRIBUTED BY HASH(`entity_key`) BUCKETS 1\n"+
+			"PROPERTIES (\n"+
+			"  \"replication_num\" = \"1\",\n"+
+			"  \"enable_unique_key_merge_on_write\" = \"true\",\n"+
+			"  \"enable_light_schema_change\" = \"true\",\n"+
+			"  \"store_row_column\" = \"true\",\n"+
+			"  \"compression\" = \"zstd\",\n"+
+			"  \"function_column.sequence_col\" = \"updated_epoch_ms\"\n"+
+			");",
+		safeDB,
+	)
+	return b.ExecDDL(ctx, ddl)
+}
+
+func (b *DorisSQLBackend) UpsertCatalogEntry(ctx context.Context, dbName string, entry CatalogEntry) error {
+	if b.db == nil {
+		return nil
+	}
+	safeDB := schema.SanitizeDorisIdentifier(dbName)
+	q := fmt.Sprintf(
+		"INSERT INTO `%s`.`_es_catalog` (`entity_type`, `entity_key`, `payload_json`, `updated_epoch_ms`) VALUES (?, ?, ?, ?)",
+		safeDB,
+	)
+	_, err := b.db.ExecContext(ctx, q, entry.EntityType, entry.EntityKey, entry.PayloadJSON, entry.UpdatedEpochMs)
+	return err
+}
+
+func (b *DorisSQLBackend) DeleteCatalogEntry(ctx context.Context, dbName, entityType, entityKey string) error {
+	if b.db == nil {
+		return nil
+	}
+	safeDB := schema.SanitizeDorisIdentifier(dbName)
+	q := fmt.Sprintf(
+		"DELETE FROM `%s`.`_es_catalog` WHERE `entity_type` = ? AND `entity_key` = ?",
+		safeDB,
+	)
+	_, err := b.db.ExecContext(ctx, q, entityType, entityKey)
+	return err
+}
+
+func (b *DorisSQLBackend) LoadCatalogEntries(ctx context.Context, dbName string) ([]CatalogEntry, error) {
+	if b.db == nil {
+		return nil, nil
+	}
+	safeDB := schema.SanitizeDorisIdentifier(dbName)
+	q := fmt.Sprintf(
+		"SELECT `entity_type`, `entity_key`, `payload_json`, `updated_epoch_ms` FROM `%s`.`_es_catalog` ORDER BY `updated_epoch_ms` ASC",
+		safeDB,
+	)
+	rows, err := b.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []CatalogEntry
+	for rows.Next() {
+		var e CatalogEntry
+		if err := rows.Scan(&e.EntityType, &e.EntityKey, &e.PayloadJSON, &e.UpdatedEpochMs); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}

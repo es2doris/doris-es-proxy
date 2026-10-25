@@ -18,6 +18,7 @@
 package e2e_test
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -135,5 +136,201 @@ func TestDataHubFullWorkflow_IndexTemplates_MultiIndexSearch_Aggregations_E2E(t 
 	totalRows := aggsObj["total_rows"].(map[string]any)["value"].(float64)
 	if totalRows != 1500000 {
 		t.Errorf("expected total_rows sum = 1500000, got %v", totalRows)
+	}
+}
+
+func TestV02ExplainPaginationAggsAndStatelessCatalog_E2E(t *testing.T) {
+	backend := NewMemDorisBackend()
+	srv1 := proxy.NewServer("es_compat", backend, transpiler.TranspilerOptions{})
+	if err := srv1.BootstrapCatalog(context.Background()); err != nil {
+		t.Fatalf("BootstrapCatalog on srv1 failed: %v", err)
+	}
+	ts1 := httptest.NewServer(srv1.Handler())
+	defer ts1.Close()
+
+	// 1. Create index with timestamp (`date`), rowCount (`long`), and alias `usage_alias`
+	createJSON := `{
+		"aliases": {"usage_alias": {}},
+		"mappings": {
+			"properties": {
+				"eventId": {"type": "keyword"},
+				"platform": {"type": "keyword"},
+				"timestampMillis": {"type": "date"},
+				"latencyMs": {"type": "double"},
+				"rowCount": {"type": "long"}
+			}
+		}
+	}`
+	req, _ := http.NewRequest(http.MethodPut, ts1.URL+"/datahub_usage_event_v1", strings.NewReader(createJSON))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT /datahub_usage_event_v1 failed: status=%v err=%v", resp.StatusCode, err)
+	}
+	_ = resp.Body.Close()
+
+	// 2. Bulk ingest 4 events across 2 hours and 2 platforms
+	bulkPayload := strings.Join([]string{
+		`{"index":{"_index":"usage_alias","_id":"ev-1"}}`,
+		`{"eventId":"ev-1","platform":"snowflake","timestampMillis":1700000000000,"latencyMs":12.5,"rowCount":100}`,
+		`{"index":{"_index":"usage_alias","_id":"ev-2"}}`,
+		`{"eventId":"ev-2","platform":"snowflake","timestampMillis":1700000600000,"latencyMs":28.0,"rowCount":250}`,
+		`{"index":{"_index":"usage_alias","_id":"ev-3"}}`,
+		`{"eventId":"ev-3","platform":"bigquery","timestampMillis":1700003600000,"latencyMs":65.0,"rowCount":600}`,
+		`{"index":{"_index":"usage_alias","_id":"ev-4"}}`,
+		`{"eventId":"ev-4","platform":"doris","timestampMillis":1700003700000,"latencyMs":8.0,"rowCount":1200}`,
+		"",
+	}, "\n")
+	resp, err = http.Post(ts1.URL+"/_bulk?refresh=true", "application/x-ndjson", strings.NewReader(bulkPayload))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_bulk failed: status=%v err=%v", resp.StatusCode, err)
+	}
+	_ = resp.Body.Close()
+
+	// 3. Simulate stateless proxy pod restart: spin up a brand new Server instance (`srv2`) on the same backend
+	srv2 := proxy.NewServer("es_compat", backend, transpiler.TranspilerOptions{})
+	if err := srv2.BootstrapCatalog(context.Background()); err != nil {
+		t.Fatalf("BootstrapCatalog on srv2 failed: %v", err)
+	}
+	ts2 := httptest.NewServer(srv2.Handler())
+	defer ts2.Close()
+
+	// 4. Verify `/_field_caps` on the restarted server via the persisted alias `usage_alias`
+	resp, err = http.Get(ts2.URL + "/usage_alias/_field_caps?fields=*")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /usage_alias/_field_caps failed: status=%v err=%v", resp.StatusCode, err)
+	}
+	var capsRes map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&capsRes)
+	_ = resp.Body.Close()
+	fieldsMap, _ := capsRes["fields"].(map[string]any)
+	if _, ok := fieldsMap["timestampMillis"]; !ok {
+		t.Fatalf("expected timestampMillis in _field_caps after restart, got: %+v", capsRes)
+	}
+
+	// 5. Verify `POST /usage_alias/_doris/explain` and `?doris_explain=true` with `date_histogram`, `histogram`, `range`, and `value_count`
+	aggQuery := `{
+		"size": 2,
+		"sort": [{"timestampMillis": "asc"}, {"_id": "asc"}],
+		"aggs": {
+			"events_over_time": {
+				"date_histogram": {"field": "timestampMillis", "fixed_interval": "1h"}
+			},
+			"latency_hist": {
+				"histogram": {"field": "latencyMs", "interval": 25}
+			},
+			"row_ranges": {
+				"range": {
+					"field": "rowCount",
+					"ranges": [
+						{"key": "small", "to": 500},
+						{"key": "large", "from": 500}
+					]
+				}
+			},
+			"event_count": {
+				"value_count": {"field": "rowCount"}
+			}
+		}
+	}`
+	resp, err = http.Post(ts2.URL+"/usage_alias/_doris/explain", "application/json", strings.NewReader(aggQuery))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /usage_alias/_doris/explain failed: status=%v err=%v", resp.StatusCode, err)
+	}
+	var explainRes map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&explainRes)
+	_ = resp.Body.Close()
+	if !strings.Contains(explainRes["hits_sql"].(string), "f__timestampMillis") {
+		t.Fatalf("expected explain hits_sql to use promoted f__timestampMillis column after restart, got: %v", explainRes["hits_sql"])
+	}
+
+	// Execute the search with `?doris_explain=true`
+	resp, err = http.Post(ts2.URL+"/usage_alias/_search?doris_explain=true", "application/json", strings.NewReader(aggQuery))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /usage_alias/_search?doris_explain=true failed: status=%v err=%v", resp.StatusCode, err)
+	}
+	var page1 map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&page1)
+	_ = resp.Body.Close()
+	if _, ok := page1["_doris_explain"].(map[string]any); !ok {
+		t.Fatalf("expected _doris_explain block in search response")
+	}
+
+	aggs := page1["aggregations"].(map[string]any)
+	ehBuckets := aggs["events_over_time"].(map[string]any)["buckets"].([]any)
+	if len(ehBuckets) != 2 {
+		t.Fatalf("expected 2 hourly date_histogram buckets, got %d: %+v", len(ehBuckets), ehBuckets)
+	}
+	rrBuckets := aggs["row_ranges"].(map[string]any)["buckets"].([]any)
+	if len(rrBuckets) != 2 || int(rrBuckets[0].(map[string]any)["doc_count"].(float64)) != 2 || int(rrBuckets[1].(map[string]any)["doc_count"].(float64)) != 2 {
+		t.Fatalf("expected 2 docs in small (<500) and 2 docs in large (>=500) range buckets, got: %+v", rrBuckets)
+	}
+	if int(aggs["event_count"].(map[string]any)["value"].(float64)) != 4 {
+		t.Fatalf("expected event_count value_count = 4, got %v", aggs["event_count"])
+	}
+
+	// 6. Test `search_after` keyset pagination using `sort` values from page1's last hit
+	p1Hits := page1["hits"].(map[string]any)["hits"].([]any)
+	if len(p1Hits) != 2 {
+		t.Fatalf("expected 2 hits on page 1, got %d", len(p1Hits))
+	}
+	lastSort := p1Hits[1].(map[string]any)["sort"].([]any)
+	sortBytes, _ := json.Marshal(lastSort)
+	page2Query := `{
+		"size": 2,
+		"sort": [{"timestampMillis": "asc"}, {"_id": "asc"}],
+		"search_after": ` + string(sortBytes) + `
+	}`
+	resp, err = http.Post(ts2.URL+"/usage_alias/_search", "application/json", strings.NewReader(page2Query))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /usage_alias/_search (search_after) failed: status=%v err=%v", resp.StatusCode, err)
+	}
+	var page2 map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&page2)
+	_ = resp.Body.Close()
+	p2Hits := page2["hits"].(map[string]any)["hits"].([]any)
+	if len(p2Hits) != 2 || p2Hits[0].(map[string]any)["_id"] != "ev-3" || p2Hits[1].(map[string]any)["_id"] != "ev-4" {
+		t.Fatalf("expected page 2 via search_after to return [ev-3, ev-4], got: %+v", p2Hits)
+	}
+
+	// 7. Test stateless `scroll` pagination (`POST /usage_alias/_search?scroll=1m` -> `POST /_search/scroll`)
+	resp, err = http.Post(ts2.URL+"/usage_alias/_search?scroll=1m", "application/json", strings.NewReader(`{"size": 2}`))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /usage_alias/_search?scroll=1m failed: status=%v err=%v", resp.StatusCode, err)
+	}
+	var scrollPage1 map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&scrollPage1)
+	_ = resp.Body.Close()
+	scrollID, _ := scrollPage1["_scroll_id"].(string)
+	if scrollID == "" || scrollID == "doris-scroll-eof" {
+		t.Fatalf("expected valid _scroll_id on scroll page 1, got %q", scrollID)
+	}
+	resp, err = http.Post(ts2.URL+"/_search/scroll", "application/json", strings.NewReader(`{"scroll":"1m","scroll_id":"`+scrollID+`"}`))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_search/scroll failed: status=%v err=%v", resp.StatusCode, err)
+	}
+	var scrollPage2 map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&scrollPage2)
+	_ = resp.Body.Close()
+	sp2Hits := scrollPage2["hits"].(map[string]any)["hits"].([]any)
+	if len(sp2Hits) != 2 {
+		t.Fatalf("expected 2 hits on scroll page 2, got %d: %+v", len(sp2Hits), sp2Hits)
+	}
+
+	// 8. Test `collapse` (field collapsing on `platform` -> 3 distinct platforms out of 4 events)
+	collapseQuery := `{
+		"size": 10,
+		"collapse": {"field": "platform"},
+		"sort": [{"rowCount": "desc"}]
+	}`
+	resp, err = http.Post(ts2.URL+"/usage_alias/_search", "application/json", strings.NewReader(collapseQuery))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /usage_alias/_search (collapse) failed: status=%v err=%v", resp.StatusCode, err)
+	}
+	var collapseRes map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&collapseRes)
+	_ = resp.Body.Close()
+	cHits := collapseRes["hits"].(map[string]any)["hits"].([]any)
+	if len(cHits) != 3 {
+		t.Fatalf("expected 3 collapsed hits (1 per distinct platform), got %d: %+v", len(cHits), cHits)
 	}
 }

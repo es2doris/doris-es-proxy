@@ -98,22 +98,57 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 			scoreExpr = fmt.Sprintf("COALESCE(score(), 1.0) * (%s)", mainQ.ScoreSQL)
 		}
 		orderBy := t.compileOrderBy(req.Sort)
-		plan.HitsSQL = fmt.Sprintf(
-			"SELECT `_id`, `_version`, `_source`, CAST(%s AS DOUBLE) AS `_score`, "+
-				"COUNT(*) OVER() AS `_total_hits` "+
-				"FROM `%s`.`%s` "+
-				"WHERE `__DORIS_DELETE_SIGN__` = 0 AND (%s) AND (%s) "+
-				"ORDER BY %s "+
-				"LIMIT %d OFFSET %d",
-			scoreExpr,
-			t.Schema.DorisDB,
-			t.Schema.DorisTable,
-			mainQ.WhereSQL,
-			postFilterSQL,
-			orderBy,
-			size,
-			from,
-		)
+		if len(req.SearchAfter) > 0 {
+			from = 0
+			if saPred := t.compileSearchAfterPredicate(req.Sort, req.SearchAfter, scoreExpr); saPred != "" && saPred != "TRUE" {
+				if postFilterSQL == "TRUE" {
+					postFilterSQL = saPred
+				} else {
+					postFilterSQL = fmt.Sprintf("(%s) AND (%s)", postFilterSQL, saPred)
+				}
+			}
+		}
+		whereClause := fmt.Sprintf("`__DORIS_DELETE_SIGN__` = 0 AND (%s) AND (%s)", mainQ.WhereSQL, postFilterSQL)
+		if req.Collapse != nil && req.Collapse.Field != "" {
+			collapseCol := t.sqlColumnRef(req.Collapse.Field, true, nil)
+			plan.HitsSQL = fmt.Sprintf(
+				"SELECT `_id`, `_version`, `_source`, `_score`, COUNT(*) OVER() AS `_total_hits` "+
+					"FROM ("+
+					"SELECT *, CAST(%s AS DOUBLE) AS `_score`, "+
+					"ROW_NUMBER() OVER (PARTITION BY %s ORDER BY %s) AS `_collapse_rn` "+
+					"FROM `%s`.`%s` "+
+					"WHERE %s"+
+					") `_collapsed` "+
+					"WHERE `_collapse_rn` = 1 "+
+					"ORDER BY %s "+
+					"LIMIT %d OFFSET %d",
+				scoreExpr,
+				collapseCol,
+				orderBy,
+				t.Schema.DorisDB,
+				t.Schema.DorisTable,
+				whereClause,
+				orderBy,
+				size,
+				from,
+			)
+		} else {
+			plan.HitsSQL = fmt.Sprintf(
+				"SELECT `_id`, `_version`, `_source`, CAST(%s AS DOUBLE) AS `_score`, "+
+					"COUNT(*) OVER() AS `_total_hits` "+
+					"FROM `%s`.`%s` "+
+					"WHERE %s "+
+					"ORDER BY %s "+
+					"LIMIT %d OFFSET %d",
+				scoreExpr,
+				t.Schema.DorisDB,
+				t.Schema.DorisTable,
+				whereClause,
+				orderBy,
+				size,
+				from,
+			)
+		}
 	}
 
 	aggs := req.EffectiveAggs()
@@ -930,6 +965,62 @@ func (t *Transpiler) appendAggBranches(
 			t.appendMetricAggBranch(branches, fullAggName, "MIN", spec.Min.Field, extraWhere)
 		case spec.Max != nil:
 			t.appendMetricAggBranch(branches, fullAggName, "MAX", spec.Max.Field, extraWhere)
+		case spec.ValueCount != nil:
+			t.appendMetricAggBranch(branches, fullAggName, "COUNT", spec.ValueCount.Field, extraWhere)
+
+		case spec.DateHistogram != nil:
+			intervalMs := spec.DateHistogram.EffectiveIntervalMs()
+			col := t.sqlNumericColumnRef(spec.DateHistogram.Field, nil)
+			*subIdx++
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
+					"SELECT %s AS `_agg_name`, CAST(CAST(FLOOR(%s / %d) * %d AS BIGINT) AS STRING) AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+					"FROM `base_matched` "+
+					"WHERE %s%s IS NOT NULL "+
+					"GROUP BY `_bucket_key` ORDER BY CAST(`_bucket_key` AS BIGINT) ASC"+
+					") `_agg_sub_%d`",
+				quoteStr(fullAggName), col, intervalMs, intervalMs, wherePrefix, col, *subIdx,
+			))
+
+		case spec.Histogram != nil:
+			interval := spec.Histogram.Interval
+			if interval <= 0 {
+				interval = 1.0
+			}
+			offset := spec.Histogram.Offset
+			col := t.sqlNumericColumnRef(spec.Histogram.Field, nil)
+			*subIdx++
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
+					"SELECT %s AS `_agg_name`, CAST(FLOOR((%s - %v) / %v) * %v + %v AS STRING) AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+					"FROM `base_matched` "+
+					"WHERE %s%s IS NOT NULL "+
+					"GROUP BY `_bucket_key` ORDER BY CAST(`_bucket_key` AS DOUBLE) ASC"+
+					") `_agg_sub_%d`",
+				quoteStr(fullAggName), col, offset, interval, interval, offset, wherePrefix, col, *subIdx,
+			))
+
+		case spec.Range != nil:
+			col := t.sqlNumericColumnRef(spec.Range.Field, nil)
+			for _, rng := range spec.Range.Ranges {
+				var conds []string
+				conds = append(conds, fmt.Sprintf("%s IS NOT NULL", col))
+				if rng.From != nil {
+					conds = append(conds, fmt.Sprintf("%s >= %s", col, quoteValue(rng.From)))
+				}
+				if rng.To != nil {
+					conds = append(conds, fmt.Sprintf("%s < %s", col, quoteValue(rng.To)))
+				}
+				rWhere := strings.Join(conds, " AND ")
+				if extraWhere != "" {
+					rWhere = fmt.Sprintf("(%s) AND (%s)", extraWhere, rWhere)
+				}
+				*branches = append(*branches, fmt.Sprintf(
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+						"FROM `base_matched` WHERE %s",
+					quoteStr(fullAggName), quoteStr(rng.EffectiveKey()), rWhere,
+				))
+			}
 		}
 	}
 }
@@ -960,7 +1051,7 @@ func (t *Transpiler) compileOrderBy(sorts []esast.SortSpec) string {
 		switch s.Entry.Field {
 		case "_score":
 			parts = append(parts, "`_score` "+dir)
-		case "_id":
+		case "_id", "_doc":
 			parts = append(parts, "`_id` "+dir)
 		default:
 			col := t.sqlColumnRef(s.Entry.Field, true, nil)
@@ -968,6 +1059,65 @@ func (t *Transpiler) compileOrderBy(sorts []esast.SortSpec) string {
 		}
 	}
 	return strings.Join(parts, ", ")
+}
+
+func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after []any, scoreExpr string) string {
+	effectiveSorts := sorts
+	if len(effectiveSorts) == 0 {
+		effectiveSorts = []esast.SortSpec{
+			{Entry: esast.SortFieldSpec{Field: "_score", Order: "desc"}},
+			{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}},
+		}
+	}
+	n := len(effectiveSorts)
+	if len(after) < n {
+		n = len(after)
+	}
+	if n == 0 {
+		return "TRUE"
+	}
+
+	sortExpr := func(idx int) (string, any) {
+		field := effectiveSorts[idx].Entry.Field
+		val := after[idx]
+		switch field {
+		case "_score":
+			return fmt.Sprintf("CAST(%s AS DOUBLE)", scoreExpr), val
+		case "_id", "_doc":
+			return "`_id`", val
+		default:
+			b := t.Schema.ResolveField(field)
+			if b.DorisType == schema.DorisBigInt {
+				if strVal, ok := val.(string); ok {
+					if ms, ok := schema.ParseESDateToEpochMillis(strVal, time.Now().UTC()); ok {
+						val = ms
+					}
+				}
+			}
+			return t.sqlTypedColumnRef(field, val, true, nil), val
+		}
+	}
+
+	var disjuncts []string
+	for i := 0; i < n; i++ {
+		var conjuncts []string
+		for j := 0; j < i; j++ {
+			colJ, valJ := sortExpr(j)
+			conjuncts = append(conjuncts, fmt.Sprintf("%s = %s", colJ, quoteValue(valJ)))
+		}
+		colI, valI := sortExpr(i)
+		op := ">"
+		if strings.EqualFold(effectiveSorts[i].Entry.Order, "desc") {
+			op = "<"
+		}
+		conjuncts = append(conjuncts, fmt.Sprintf("%s %s %s", colI, op, quoteValue(valI)))
+		if len(conjuncts) == 1 {
+			disjuncts = append(disjuncts, conjuncts[0])
+		} else {
+			disjuncts = append(disjuncts, "("+strings.Join(conjuncts, " AND ")+")")
+		}
+	}
+	return strings.Join(disjuncts, " OR ")
 }
 
 func (t *Transpiler) sqlColumnRef(field string, preferKeyword bool, nctx *nestedCtx) string {

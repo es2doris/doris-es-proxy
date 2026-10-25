@@ -42,26 +42,169 @@ flowchart LR
     FE --> BE
 ```
 
+## Why `doris-es-proxy`? (TCO & Operational Footprint)
+
+Data platform teams running **OpenMetadata** or **DataHub** on top of Apache Doris are traditionally forced to operate a dedicated 3-node JVM Elasticsearch/OpenSearch cluster just to index metadata entities. `doris-es-proxy` eliminates the second cluster entirely:
+
+| Metric / Component | Traditional Stack (Doris + Elasticsearch Cluster) | Unified Stack (Doris + `doris-es-proxy`) |
+| :--- | :--- | :--- |
+| **Search JVM Heap / RAM** | **8 GB – 32+ GB RAM** (3x ES/OpenSearch JVM nodes) | **~25 MB RAM** (single stateless Go binary) |
+| **Storage Engine & Compaction** | Duplicate Lucene segments + JVM GC pauses | Native Doris MoW `UNIQUE KEY` + Inverted Index + ZSTD `_source` |
+| **Catalog & Alias State** | Dedicated ES Master quorum | Stored natively in Doris (`_es_catalog` MoW table) |
+| **Nested Array Correlation** | Hidden Lucene child documents (`_nested` join overhead) | Two-stage Doris Inverted Index `array_contains` + `array_exists` lambda |
+| **Multi-Facet Sidebar Aggs** | Per-shard global ordinals heap pressure | Single-scan Nereids Multi-Cast CTE (`WITH base_matched AS (...)`) |
+
+---
+
+## Side-by-Side: Elasticsearch Query DSL $\rightarrow$ Apache Doris SQL
+
+Given an OpenMetadata `/_search` request combining full-text `multi_match`, correlated `nested` column predicates (`columns.name = "user_id" AND columns.dataType = "INT"`), `function_score` tier/popularity boosting, and multi-faceted sidebar `aggs`, `doris-es-proxy` compiles:
+
+<table>
+<tr>
+<th>Elasticsearch HTTP Request (<code>POST /table_search_index/_search</code>)</th>
+<th>Transpiled Apache Doris SQL (Nereids)</th>
+</tr>
+<tr>
+<td>
+
+```json
+{
+  "size": 10,
+  "query": {
+    "function_score": {
+      "query": {
+        "bool": {
+          "must": [
+            {
+              "multi_match": {
+                "query": "orders",
+                "fields": ["name^10", "description^2"]
+              }
+            },
+            {
+              "nested": {
+                "path": "columns",
+                "query": {
+                  "bool": {
+                    "must": [
+                      {"term": {"columns.name": "user_id"}},
+                      {"term": {"columns.dataType": "INT"}}
+                    ]
+                  }
+                }
+              }
+            }
+          ],
+          "filter": [{"term": {"deleted": false}}]
+        }
+      },
+      "functions": [
+        {
+          "filter": {"term": {"tier.tagFQN": "Tier.Tier1"}},
+          "weight": 3.0
+        }
+      ]
+    }
+  },
+  "aggs": {
+    "serviceType": {"terms": {"field": "serviceType"}},
+    "tags": {"terms": {"field": "tags.tagFQN"}}
+  }
+}
+```
+
+</td>
+<td>
+
+```sql
+-- 1. HitsSQL (Stage-1 Inverted Index + Stage-2 Correlated Lambda)
+SELECT `_id`, `_version`, `_source`,
+       CAST(((CASE WHEN LOWER(CAST(`f__name` AS STRING)) LIKE LOWER('%orders%')
+                   THEN 10 ELSE 0 END) + ...)
+            * (CASE WHEN `f__tier__tagFQN` = 'Tier.Tier1' THEN 3 ELSE 1 END)
+            AS DOUBLE) AS `_score`,
+       COUNT(*) OVER() AS `_total_hits`
+FROM `es_compat`.`table_search_index`
+WHERE `__DORIS_DELETE_SIGN__` = 0
+  AND ((`f__name` MATCH_ANY 'orders' OR `f__description` MATCH_ANY 'orders')
+   AND (`n__columns` IS NOT NULL
+        AND array_contains(`n__columns__name`, 'user_id')
+        AND array_contains(`n__columns__dataType`, 'INT')
+        AND array_exists(_el -> (
+              json_extract_string(_el, '$.name') = 'user_id'
+              AND json_extract_string(_el, '$.dataType') = 'INT'
+            ), `n__columns`))
+   AND (`f__deleted` = FALSE))
+ORDER BY `_score` DESC
+LIMIT 10 OFFSET 0;
+
+-- 2. AggsSQL (Single-Scan Nereids Multi-Cast CTE)
+WITH `base_matched` AS (
+  SELECT * FROM `es_compat`.`table_search_index`
+  WHERE `__DORIS_DELETE_SIGN__` = 0 AND (...)
+)
+SELECT '__meta_total' AS `_agg_name`, '_count' AS `_bucket_key`,
+       CAST(COUNT(*) AS DOUBLE) AS `_doc_count` FROM `base_matched`
+UNION ALL
+SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM (
+  SELECT 'serviceType' AS `_agg_name`, CAST(`f__serviceType` AS STRING) AS `_bucket_key`,
+         CAST(COUNT(*) AS DOUBLE) AS `_doc_count`
+  FROM `base_matched` WHERE `f__serviceType` IS NOT NULL
+  GROUP BY `f__serviceType` ORDER BY `_doc_count` DESC LIMIT 10
+) `_agg_sub_1`
+UNION ALL
+SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM (
+  SELECT 'tags' AS `_agg_name`, CAST(`_elem` AS STRING) AS `_bucket_key`,
+         CAST(COUNT(*) AS DOUBLE) AS `_doc_count`
+  FROM `base_matched` LATERAL VIEW EXPLODE(`f__tags__tagFQN`) `_t` AS `_elem`
+  WHERE `_elem` IS NOT NULL
+  GROUP BY `_elem` ORDER BY `_doc_count` DESC LIMIT 10
+) `_agg_sub_2`;
+```
+
+</td>
+</tr>
+</table>
+
+---
+
 ## Key Capabilities
 
 1. **Hybrid Storage & Exact `_source` Fidelity (`pkg/schema`)**
    - Maps each Elasticsearch index to an Apache Doris `UNIQUE KEY(_id)` Merge-on-Write (`enable_unique_key_merge_on_write = "true"`, `store_row_column = "true"`) table.
+   - Persists index mappings, aliases, and index templates in `es_compat._es_catalog` so multiple `doris-es-proxy` replicas remain **100% stateless across restarts** with zero external Redis/etcd dependencies.
    - Preserves verbatim JSON in `_source` (`STRING` with ZSTD compression) alongside auto-shredded `_doc` (`VARIANT`) for dynamic fields and promoted `f__*` columns with dedicated `USING INVERTED` indexes (`parser = standard | unicode | ngram`, `support_phrase = true`, `lower_case = true`).
    - Preserves cross-field element correlation on Elasticsearch `nested` arrays of objects (`columns: [{"name": "id", "tags": ["PII"]}]`) via **Stage-1 Inverted-Index Bitmap Pre-Filters** (`array_contains(n__columns__name, ...)`) + **Stage-2 Vectorized Correlated Lambdas** (`array_exists(_el -> ..., n__columns)`).
 
-2. **Query DSL & Multi-Faceted Aggregation Transpiler (`pkg/transpiler`)**
-   - Compiles `bool` (`must`, `filter`, `should`, `must_not`, `minimum_should_match`), `term`, `terms`, `ids`, `range`, `exists`, `prefix`, `wildcard`, `regexp` (`MATCH_REGEXP`), `match`, `match_phrase` (with `~slop`), `match_phrase_prefix`, `multi_match` (with wildcard field boost expansion), `query_string` / `simple_query_string` (plus Apache Doris 4.0 `SEARCH()` pushdown), `nested`, `constant_score`, and `function_score` (`field_value_factor` with `log1p`/`ln1p`/`sqrt`/`reciprocal`, `filter` weights, `score_mode`, `boost_mode`).
-   - Compiles multi-faceted sidebar `aggs` (`terms` on scalar and `ARRAY<STRING>` columns, `nested` aggregations via `LATERAL VIEW EXPLODE`, `filter`, and `missing`) into a single-scan **Nereids Multi-Cast CTE (`WITH base_matched AS (...)`)** query.
+2. **Query DSL, Deep Pagination & Multi-Faceted Aggregation Transpiler (`pkg/transpiler`)**
+   - Compiles `bool` (`must`, `filter`, `should`, `must_not`, `minimum_should_match`), `term`, `terms`, `ids`, `range` (with ES date math `now-7d/d`), `exists`, `prefix`, `wildcard`, `regexp` (`MATCH_REGEXP`), `match`, `match_phrase` (with `~slop`), `match_phrase_prefix`, `multi_match` (with wildcard field boost expansion), `query_string` / `simple_query_string` (plus Apache Doris 4.0 `SEARCH()` pushdown), `nested`, `constant_score`, `function_score`, `collapse` (field collapsing via `ROW_NUMBER() OVER (PARTITION BY ...)`), `search_after` keyset pagination, and stateless `POST /_search/scroll` cursors.
+   - Compiles multi-faceted `aggs` (`terms` on scalar and `ARRAY<STRING>` columns, `nested` aggregations via `LATERAL VIEW EXPLODE`, `date_histogram`, `histogram`, `range`, `filter`, `missing`, `cardinality`, `value_count`, `avg`, `sum`, `min`, `max`) into a single-scan **Nereids Multi-Cast CTE (`WITH base_matched AS (...)`)** query.
 
 3. **High-Throughput `/_bulk` Stream Load & Embedded Painless Mutations (`pkg/painless`, `pkg/proxy`)**
-   - Streams `/_bulk` NDJSON (`index`, `create`, `update`, `delete` via `__DORIS_DELETE_SIGN__ = 1`) into Doris HTTP Stream Load (`merge_type: MERGE`) with `group_commit` (`sync_mode` when `?refresh=true`, `async_mode` by default) while preserving auth headers across FE `:8030` $\rightarrow$ BE `:8040` `307` redirects.
-   - Executes `POST /{index}/_update/{id}` and `POST /{index}/_update_by_query` using an embedded Painless script evaluator supporting OpenMetadata and DataHub's `ctx._source` property assignments, `.remove()`, `.add()`, and `.removeIf(x -> ...)` mutations.
+   - Streams `/_bulk` NDJSON (`index`, `create`, `update`, `delete` via `__DORIS_DELETE_SIGN__ = 1`) into Doris HTTP Stream Load (`merge_type: MERGE`, `function_column.sequence_col: _version`) while preserving auth headers across FE `:8030` $\rightarrow$ BE `:8040` `307` redirects.
+   - Executes `POST /{index}/_update/{id}` and `POST /{index}/_update_by_query` using an embedded Painless script evaluator supporting OpenMetadata and DataHub's `ctx._source` property assignments, `if/else`, `for` loops, `ctx.op = "noop" | "delete"`, `.remove()`, `.add()`, `.putAll()`, and `.removeIf(x -> ...)` mutations.
+
+---
+
+## Elasticsearch REST & Query DSL Compatibility Matrix
+
+| Category | Supported Endpoints & Features | Status |
+| :--- | :--- | :--- |
+| **Cluster & Index Admin** | `GET /`, `/_cluster/health`, `/_cluster/settings`, `/_nodes`, `/_cat/indices`, `/_cat/aliases`, `PUT/GET/HEAD/DELETE /{index}`, `/_mapping`, `/_settings`, `/_aliases`, `/_index_template`, `/_field_caps`, `/_refresh` | ✅ Supported |
+| **Ingestion & Mutations** | `POST /_bulk` (`index`, `create`, `update`, `delete`), `PUT/POST/GET/HEAD/DELETE /{index}/_doc/{id}`, `GET /{index}/_source/{id}`, `POST /_mget`, `POST /{index}/_update/{id}`, `POST /{index}/_update_by_query`, `POST /{index}/_delete_by_query` | ✅ Supported |
+| **Full-Text & Term DSL** | `bool`, `match`, `match_phrase` (+ `slop`), `match_phrase_prefix`, `multi_match`, `query_string`, `simple_query_string`, `term` (+ `case_insensitive`), `terms`, `ids`, `range` (+ date math), `exists`, `prefix`, `wildcard`, `regexp` | ✅ Supported |
+| **Advanced Search & Scoring** | Correlated `nested` queries, `function_score` (`field_value_factor`, `weight`, `score_mode`, `boost_mode`), `constant_score`, `post_filter`, `_source` filtering (`includes`/`excludes`), `highlight`, `collapse`, `search_after`, stateless `/_search/scroll`, `/_msearch`, `/_count` | ✅ Supported |
+| **Aggregations** | `terms` (scalar & array), `nested`, `date_histogram`, `histogram`, `range`, `filter`, `missing`, `cardinality`, `value_count`, `avg`, `sum`, `min`, `max` | ✅ Supported |
+| **Doris Introspection** | `POST /{index}/_doris/explain`, `GET /{index}/_doris/ddl`, `?doris_explain=true`, `doris-es-proxy transpile`, `doris-es-proxy ddl` | ✅ Supported |
+
+---
 
 ## Quick Start
 
 ### 1. Instant Interactive Demo (Zero Docker Required)
 
-Run the end-to-end OpenMetadata search, correlated `nested` column filter, sidebar `aggs`, and Painless mutation walkthrough in 2 seconds using the built-in `--in-memory --log-sql` mode:
+Run the end-to-end OpenMetadata search, correlated `nested` column filter, sidebar `aggs`, Painless mutation, and `/_doris/explain` walkthrough in 2 seconds using the built-in `--in-memory --log-sql` mode:
 
 ```bash
 nix develop -c make demo
@@ -69,16 +212,30 @@ nix develop -c make demo
 bash examples/quickstart.sh
 ```
 
-This starts `doris-es-proxy` locally, executes a full sequence of Elasticsearch REST requests (`PUT /table_search_index`, `POST /_bulk`, `POST /table_search_index/_search`, `POST /table_search_index/_update_by_query`, `POST /table_search_index/_mget`), and prints both the **transpiled Apache Doris SQL / DDL** and the **Elasticsearch JSON responses**.
+### 2. Inspect Transpiled Doris SQL Offline (`transpile` & `ddl` CLI or `?_doris/explain`)
 
-### 2. Run with a Live Apache Doris Cluster (Docker Compose)
+You can transpile any Elasticsearch `/_search` or mapping JSON directly from your terminal with zero server startup:
+
+```bash
+# Compile an Elasticsearch _search payload to Apache Doris HitsSQL + AggsSQL:
+echo '{"query":{"match":{"name":"orders"}},"aggs":{"by_svc":{"terms":{"field":"serviceType"}}}}' \
+  | ./bin/doris-es-proxy transpile --index table_search_index
+
+# Generate the Apache Doris UNIQUE KEY Merge-on-Write CREATE TABLE DDL from an ES mapping:
+echo '{"mappings":{"properties":{"name":{"type":"text"},"serviceType":{"type":"keyword"}}}}' \
+  | ./bin/doris-es-proxy ddl --index table_search_index
+```
+
+Or pass `?doris_explain=true` on any live `POST /{index}/_search` request (or call `POST /{index}/_doris/explain`) to inspect the compiled `hits_sql`, `aggs_sql`, `create_table_ddl`, and `field_bindings` directly in the JSON response.
+
+### 3. Run with a Live Apache Doris Cluster (Docker Compose)
 
 ```bash
 docker compose up -d --build
 ES_URL=http://127.0.0.1:9200 bash examples/quickstart.sh
 ```
 
-### 3. Build & Run Tests
+### 4. Build & Run Tests
 
 ```bash
 nix develop -c make check

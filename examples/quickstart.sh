@@ -211,4 +211,15 @@ curl -fsS -X POST "${ES_URL}/table_search_index/_mget" \
   -d '{"ids": ["tbl-orders", "tbl-clicks"]}' | pretty_json
 
 echo ""
+echo "================================================================================"
+echo " 7. Inspect Transpiled Apache Doris SQL via Explain API (POST /table_search_index/_doris/explain)"
+echo "================================================================================"
+curl -fsS -X POST "${ES_URL}/table_search_index/_doris/explain" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": {"match": {"description": "orders"}},
+    "aggs": {"by_service": {"terms": {"field": "serviceType"}}}
+  }' | pretty_json
+
+echo ""
 echo "==> Quickstart demo completed successfully!"
