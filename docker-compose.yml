@@ -19,7 +19,7 @@
 # Zero Elasticsearch / OpenSearch containers!
 services:
   doris-fe-be:
-    image: apache/doris:doris-all-in-one-2.1.7
+    image: apache/doris:all-in-one-4.1.3
     container_name: doris-fe-be
     hostname: doris-fe-be
     ports:

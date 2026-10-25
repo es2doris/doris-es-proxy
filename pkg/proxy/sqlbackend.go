@@ -76,7 +76,12 @@ func (b *DorisSQLBackend) ExecDDL(ctx context.Context, ddl string) error {
 	return err
 }
 
+func normalizeDorisSQL(q string) string {
+	return strings.ReplaceAll(q, "`__DORIS_DELETE_SIGN__` = 0 AND ", "")
+}
+
 func (b *DorisSQLBackend) QueryHits(ctx context.Context, querySQL string) ([]HitRow, error) {
+	querySQL = normalizeDorisSQL(querySQL)
 	if b.logSQL {
 		log.Printf("[Doris HitsSQL]\n%s", querySQL)
 	}
@@ -107,6 +112,7 @@ func (b *DorisSQLBackend) QueryHits(ctx context.Context, querySQL string) ([]Hit
 }
 
 func (b *DorisSQLBackend) QueryAggs(ctx context.Context, aggsSQL string) ([]AggRow, error) {
+	aggsSQL = normalizeDorisSQL(aggsSQL)
 	if b.logSQL {
 		log.Printf("[Doris AggsSQL (Nereids Multi-Cast CTE)]\n%s", aggsSQL)
 	}
@@ -145,7 +151,7 @@ func (b *DorisSQLBackend) GetDocByID(ctx context.Context, dbName, table, id stri
 	safeTable := schema.SanitizeDorisIdentifier(table)
 	// #nosec G201 -- identifiers are strictly sanitized via schema.SanitizeDorisIdentifier
 	q := fmt.Sprintf(
-		"SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` = ? AND `__DORIS_DELETE_SIGN__` = 0 LIMIT 1",
+		"SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` = ? LIMIT 1",
 		safeDB, safeTable,
 	)
 	var h HitRow
@@ -178,7 +184,7 @@ func (b *DorisSQLBackend) GetDocsByIDs(ctx context.Context, dbName, table string
 	}
 	// #nosec G201 -- identifiers are strictly sanitized and values are bound via ? placeholders
 	q := fmt.Sprintf(
-		"SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` IN (%s) AND `__DORIS_DELETE_SIGN__` = 0",
+		"SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` IN (%s)",
 		safeDB, safeTable, strings.Join(placeholders, ","),
 	)
 	// #nosec G701 -- parameterized IN query on strictly sanitized identifier
@@ -225,7 +231,6 @@ func (b *DorisSQLBackend) InitCatalog(ctx context.Context, dbName string) error 
 			"PROPERTIES (\n"+
 			"  \"replication_num\" = \"1\",\n"+
 			"  \"enable_unique_key_merge_on_write\" = \"true\",\n"+
-			"  \"enable_light_schema_change\" = \"true\",\n"+
 			"  \"store_row_column\" = \"true\",\n"+
 			"  \"compression\" = \"zstd\",\n"+
 			"  \"function_column.sequence_col\" = \"updated_epoch_ms\"\n"+

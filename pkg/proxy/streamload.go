@@ -129,8 +129,7 @@ func (c *StreamLoadClient) LoadNDJSON(
 	req.Header.Set("format", "json")
 	req.Header.Set("read_json_by_line", "true")
 	req.Header.Set("strip_outer_array", "false")
-	req.Header.Set("merge_type", "MERGE")
-	req.Header.Set("delete", "__DORIS_DELETE_SIGN__ = 1")
+	req.Header.Set("hidden_columns", "__DORIS_DELETE_SIGN__")
 	req.Header.Set("function_column.sequence_col", "_version")
 
 	// #nosec G704 -- operator-configured Doris FE/BE Stream Load HTTP request
@@ -150,11 +149,31 @@ func (c *StreamLoadClient) LoadNDJSON(
 		return fmt.Errorf("unexpected stream load response (HTTP %d): %s", resp.StatusCode, string(bodyBytes))
 	}
 	if !strings.EqualFold(slResp.Status, "Success") && !strings.EqualFold(slResp.Status, "Publish Timeout") {
-		return fmt.Errorf("doris stream load failed (status=%s): %s (error_url=%s)", slResp.Status, slResp.Message, slResp.ErrorURL)
+		detail := c.fetchErrorURLDetail(ctx, slResp.ErrorURL)
+		return fmt.Errorf("doris stream load failed (status=%s): %s (error_url=%s detail=%s)", slResp.Status, slResp.Message, slResp.ErrorURL, detail)
 	}
 	if slResp.NumberFilteredRows > 0 {
-		return fmt.Errorf("doris stream load filtered %d/%d rows: %s (error_url=%s)",
-			slResp.NumberFilteredRows, slResp.NumberTotalRows, slResp.Message, slResp.ErrorURL)
+		detail := c.fetchErrorURLDetail(ctx, slResp.ErrorURL)
+		return fmt.Errorf("doris stream load filtered %d/%d rows: %s (error_url=%s detail=%s)",
+			slResp.NumberFilteredRows, slResp.NumberTotalRows, slResp.Message, slResp.ErrorURL, detail)
 	}
 	return nil
+}
+
+func (c *StreamLoadClient) fetchErrorURLDetail(ctx context.Context, errURL string) string {
+	if strings.TrimSpace(errURL) == "" {
+		return ""
+	}
+	// #nosec G704 -- fetching diagnostic error summary from Doris BE ErrorURL on Stream Load failure
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, errURL, nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	return strings.TrimSpace(string(raw))
 }

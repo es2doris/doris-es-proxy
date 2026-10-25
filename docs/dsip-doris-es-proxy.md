@@ -45,7 +45,7 @@ Organizations already running Apache Doris are forced to operate a separate JVM-
 ## 2. Architecture Overview
 
 ### 2.1 Three-Tier Hybrid Document Storage (`pkg/schema`)
-Every Elasticsearch index maps to a Doris `UNIQUE KEY(_id)` Merge-on-Write table (`enable_light_schema_change = "true"`):
+Every Elasticsearch index maps to a Doris `UNIQUE KEY(_id)` Merge-on-Write table (`enable_unique_key_merge_on_write = "true"`):
 1. **Tier 1 (Document Fidelity & Metadata):** `_id`, `_version`, `__DORIS_DELETE_SIGN__`, verbatim `_source STRING` (stored in Doris row store for zero-CPU `_source` reconstruction), `_doc VARIANT` (with `USING INVERTED`), and `_all_text STRING` (for wildcard `query_string`).
 2. **Tier 2 (Promoted Scalar & Array Columns):** Explicit `_mapping` properties compile to typed physical columns (`f__<field>`) with `USING INVERTED` indexes (`unicode` parser for `ngram`/CJK analyzers, BKD for numeric/date columns).
 3. **Tier 3 (Two-Stage Correlated `nested` Array Columns):** Elasticsearch `nested` paths compile to `n__<nested_path> ARRAY<STRING>` (storing per-element JSON) plus `n__<nested_path>__<subfield> ARRAY<STRING> USING INVERTED` pre-filter columns.

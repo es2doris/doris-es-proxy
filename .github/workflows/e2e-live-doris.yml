@@ -39,23 +39,28 @@ jobs:
         with:
           go-version: stable
 
-      - name: Start Apache Doris FE+BE Container
+      - name: Build doris-es-proxy
+        run: make build
+
+      - name: Start Apache Doris 4.1.3 FE+BE Container
         run: |
           sudo sysctl -w vm.max_map_count=2000000
-          docker compose up -d doris-fe-be
+          docker run -d --name doris-fe-be --network host apache/doris:all-in-one-4.1.3
           echo "Waiting for Apache Doris FE & BE to become ready..."
-          for i in $(seq 1 60); do
-            if docker exec doris-fe-be mysql -h 127.0.0.1 -P 9030 -u root -e "SHOW BACKENDS\G" 2>/dev/null | grep -q "Alive: true"; then
-              echo "Apache Doris FE+BE is alive!"
+          for i in $(seq 1 90); do
+            OUT=$(mysql -h 127.0.0.1 -P 9030 -u root -e "SHOW BACKENDS\G" 2>/dev/null || true)
+            if echo "$OUT" | grep -q "Alive: true" && ! echo "$OUT" | grep -q "TotalCapacity: 0.000"; then
+              echo "Apache Doris FE+BE is alive and BE storage capacity is reported!"
               break
             fi
-            sleep 5
+            sleep 3
           done
-          docker exec doris-fe-be mysql -h 127.0.0.1 -P 9030 -u root -e "SHOW BACKENDS\G"
+          mysql -h 127.0.0.1 -P 9030 -u root -e "SHOW BACKENDS\G"
+          ./bin/doris-es-proxy doctor
 
       - name: Run Live Apache Doris E2E Test Suite
         run: make test-e2e
 
       - name: Dump Doris logs on failure
         if: failure()
-        run: docker compose logs doris-fe-be
+        run: docker logs doris-fe-be --tail 200

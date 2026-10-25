@@ -21,6 +21,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -65,6 +66,7 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 		Timeout:        30 * time.Second,
 	})
 	backend := proxy.NewDorisSQLBackend(db, slClient)
+	backend.SetLogSQL(true)
 	srv := proxy.NewServer(dorisDB, backend, transpiler.TranspilerOptions{})
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -86,23 +88,50 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 			}
 		}
 	}`
-	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/live_table_index", strings.NewReader(createJSON))
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		t.Fatalf("PUT /live_table_index on live Doris failed: status=%v err=%v", resp.StatusCode, err)
+	var createBody []byte
+	var createStatus int
+	for attempt := 1; attempt <= 15; attempt++ {
+		req, _ := http.NewRequest(http.MethodPut, ts.URL+"/live_table_index", strings.NewReader(createJSON))
+		resp, reqErr := http.DefaultClient.Do(req)
+		if reqErr != nil {
+			t.Fatalf("PUT /live_table_index transport error: %v", reqErr)
+		}
+		createBody, _ = io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		createStatus = resp.StatusCode
+		if createStatus == http.StatusOK {
+			break
+		}
+		if strings.Contains(string(createBody), "Failed to find enough backend") && attempt < 15 {
+			t.Logf("Waiting for Doris BE disk report before tablet creation (attempt %d/15)...", attempt)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		break
 	}
-	_ = resp.Body.Close()
+	if createStatus != http.StatusOK {
+		t.Fatalf("PUT /live_table_index on live Doris failed: status=%d body=%s", createStatus, string(createBody))
+	}
 
 	bulkPayload := strings.Join([]string{
 		`{"index":{"_index":"live_table_index","_id":"live-1"}}`,
 		`{"name":"customer_orders","serviceType":"BigQuery","deleted":false,"tags":[{"tagFQN":"PII.Sensitive"}],"columns":[{"name":"user_id","dataType":"INT"}]}`,
 		"",
 	}, "\n")
-	resp, err = http.Post(ts.URL+"/_bulk?refresh=true", "application/x-ndjson", strings.NewReader(bulkPayload))
-	if err != nil || resp.StatusCode != http.StatusOK {
-		t.Fatalf("POST /_bulk on live Doris failed: status=%v err=%v", resp.StatusCode, err)
+	resp, err := http.Post(ts.URL+"/_bulk?refresh=true", "application/x-ndjson", strings.NewReader(bulkPayload))
+	if err != nil {
+		t.Fatalf("POST /_bulk transport error: %v", err)
 	}
+	bulkBody, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_bulk on live Doris failed: status=%d body=%s", resp.StatusCode, string(bulkBody))
+	}
+	var bulkRes map[string]any
+	_ = json.Unmarshal(bulkBody, &bulkRes)
+	if bulkRes["errors"] == true {
+		t.Fatalf("POST /_bulk returned item errors: %s", string(bulkBody))
+	}
 
 	searchPayload := `{
 		"size": 10,
@@ -110,15 +139,19 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 		"aggs": {"serviceType": {"terms": {"field": "serviceType", "size": 10}}}
 	}`
 	resp, err = http.Post(ts.URL+"/live_table_index/_search", "application/json", strings.NewReader(searchPayload))
-	if err != nil || resp.StatusCode != http.StatusOK {
-		t.Fatalf("POST /_search on live Doris failed: status=%v err=%v", resp.StatusCode, err)
+	if err != nil {
+		t.Fatalf("POST /_search transport error: %v", err)
+	}
+	searchBody, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_search on live Doris failed: status=%d body=%s", resp.StatusCode, string(searchBody))
 	}
 	var searchRes map[string]any
-	_ = json.NewDecoder(resp.Body).Decode(&searchRes)
-	_ = resp.Body.Close()
+	_ = json.Unmarshal(searchBody, &searchRes)
 
 	hits := searchRes["hits"].(map[string]any)["hits"].([]any)
 	if len(hits) != 1 {
-		t.Fatalf("expected 1 hit from live Doris, got %d: %+v", len(hits), searchRes)
+		t.Fatalf("expected 1 hit from live Doris, got %d: %s", len(hits), string(searchBody))
 	}
 }
