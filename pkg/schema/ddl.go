@@ -94,7 +94,6 @@ func GenerateCreateTableDDL(s *IndexSchema) string {
 			"PROPERTIES (\n"+
 			"    \"replication_num\" = \"1\",\n"+
 			"    \"enable_unique_key_merge_on_write\" = \"true\",\n"+
-			"    \"enable_light_schema_change\" = \"true\",\n"+
 			"    \"store_row_column\" = \"true\",\n"+
 			"    \"compression\" = \"zstd\",\n"+
 			"    \"function_column.sequence_col\" = \"_version\"\n"+
