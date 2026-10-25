@@ -59,11 +59,34 @@ flowchart LR
 
 ## Quick Start
 
+### 1. Instant Interactive Demo (Zero Docker Required)
+
+Run the end-to-end OpenMetadata search, correlated `nested` column filter, sidebar `aggs`, and Painless mutation walkthrough in 2 seconds using the built-in `--in-memory --log-sql` mode:
+
 ```bash
-nix develop -c go test -race ./... -v
-nix develop -c go build -o doris-es-proxy ./cmd/doris-es-proxy
-./doris-es-proxy --listen :9200 --doris-http http://127.0.0.1:8030 --doris-db es_compat
+nix develop -c make demo
+# or directly:
+bash examples/quickstart.sh
 ```
+
+This starts `doris-es-proxy` locally, executes a full sequence of Elasticsearch REST requests (`PUT /table_search_index`, `POST /_bulk`, `POST /table_search_index/_search`, `POST /table_search_index/_update_by_query`, `POST /table_search_index/_mget`), and prints both the **transpiled Apache Doris SQL / DDL** and the **Elasticsearch JSON responses**.
+
+### 2. Run with a Live Apache Doris Cluster (Docker Compose)
+
+```bash
+docker compose up -d --build
+ES_URL=http://127.0.0.1:9200 bash examples/quickstart.sh
+```
+
+### 3. Build & Run Tests
+
+```bash
+nix develop -c make check
+nix develop -c make build
+./bin/doris-es-proxy --listen :9200 --doris-http http://127.0.0.1:8030 --doris-db es_compat --log-sql
+```
+
+See [`examples/README.md`](examples/README.md) for OpenMetadata and DataHub configuration snippets.
 
 ## License
 

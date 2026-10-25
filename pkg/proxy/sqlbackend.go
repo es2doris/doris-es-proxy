@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
 )
@@ -33,6 +34,7 @@ import (
 type DorisSQLBackend struct {
 	db         *sql.DB
 	streamLoad *StreamLoadClient
+	logSQL     bool
 }
 
 func NewDorisSQLBackend(db *sql.DB, streamLoad *StreamLoadClient) *DorisSQLBackend {
@@ -42,7 +44,14 @@ func NewDorisSQLBackend(db *sql.DB, streamLoad *StreamLoadClient) *DorisSQLBacke
 	}
 }
 
+func (b *DorisSQLBackend) SetLogSQL(enabled bool) {
+	b.logSQL = enabled
+}
+
 func (b *DorisSQLBackend) ExecDDL(ctx context.Context, ddl string) error {
+	if b.logSQL {
+		log.Printf("[Doris DDL]\n%s", ddl)
+	}
 	if b.db == nil {
 		return nil
 	}
@@ -51,6 +60,9 @@ func (b *DorisSQLBackend) ExecDDL(ctx context.Context, ddl string) error {
 }
 
 func (b *DorisSQLBackend) QueryHits(ctx context.Context, querySQL string) ([]HitRow, error) {
+	if b.logSQL {
+		log.Printf("[Doris HitsSQL]\n%s", querySQL)
+	}
 	if b.db == nil {
 		return nil, nil
 	}
@@ -78,6 +90,9 @@ func (b *DorisSQLBackend) QueryHits(ctx context.Context, querySQL string) ([]Hit
 }
 
 func (b *DorisSQLBackend) QueryAggs(ctx context.Context, aggsSQL string) ([]AggRow, error) {
+	if b.logSQL {
+		log.Printf("[Doris AggsSQL (Nereids Multi-Cast CTE)]\n%s", aggsSQL)
+	}
 	if b.db == nil {
 		return nil, nil
 	}

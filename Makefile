@@ -5,10 +5,13 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 DORIS_E2E_DSN ?= root:@tcp(127.0.0.1:9030)/?interpolateParams=true&multiStatements=true&timeout=5s&readTimeout=30s&writeTimeout=30s
 DORIS_E2E_HTTP ?= http://127.0.0.1:8030
 
-.PHONY: build test test-e2e lint check security scan-vuln scan-sast scan-secrets docker-build compose-up compose-down clean
+.PHONY: build test test-e2e demo lint check security scan-vuln scan-sast scan-secrets docker-build compose-up compose-down clean
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" -o bin/doris-es-proxy ./cmd/doris-es-proxy
+
+demo:
+	bash examples/quickstart.sh
 
 test:
 	go test -race -count=1 ./... -v
