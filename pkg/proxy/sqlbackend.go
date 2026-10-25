@@ -77,7 +77,71 @@ func (b *DorisSQLBackend) ExecDDL(ctx context.Context, ddl string) error {
 }
 
 func normalizeDorisSQL(q string) string {
-	return strings.ReplaceAll(q, "`__DORIS_DELETE_SIGN__` = 0 AND ", "")
+	q = strings.ReplaceAll(q, "`__DORIS_DELETE_SIGN__` = 0 AND ", "")
+	return rewriteDorisArrayExists(q)
+}
+
+func rewriteDorisArrayExists(q string) string {
+	const prefix = "array_exists("
+	if !strings.Contains(q, prefix) {
+		return q
+	}
+	var out strings.Builder
+	out.Grow(len(q) + 64)
+	i := 0
+	for i < len(q) {
+		idx := strings.Index(q[i:], prefix)
+		if idx < 0 {
+			out.WriteString(q[i:])
+			break
+		}
+		out.WriteString(q[i : i+idx])
+		start := i + idx + len(prefix)
+		depth := 1
+		inQuote := false
+		j := start
+		lastTopComma := -1
+		for j < len(q) && depth > 0 {
+			ch := q[j]
+			if inQuote {
+				if ch == '\\' && j+1 < len(q) {
+					j += 2
+					continue
+				}
+				if ch == '\'' {
+					inQuote = false
+				}
+			} else {
+				switch ch {
+				case '\'':
+					inQuote = true
+				case '(':
+					depth++
+				case ')':
+					depth--
+				case ',':
+					if depth == 1 {
+						lastTopComma = j
+					}
+				}
+			}
+			j++
+		}
+		if depth == 0 && lastTopComma > start {
+			lambdaPart := strings.TrimSpace(q[start:lastTopComma])
+			colPart := strings.TrimSpace(q[lastTopComma+1 : j-1])
+			out.WriteString("array_contains(array_exists(")
+			out.WriteString(lambdaPart)
+			out.WriteString(", IFNULL(")
+			out.WriteString(colPart)
+			out.WriteString(", CAST([] AS ARRAY<STRING>))), true)")
+			i = j
+		} else {
+			out.WriteString(prefix)
+			i = start
+		}
+	}
+	return out.String()
 }
 
 func (b *DorisSQLBackend) QueryHits(ctx context.Context, querySQL string) ([]HitRow, error) {

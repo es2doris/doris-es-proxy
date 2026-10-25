@@ -225,3 +225,12 @@ func TestEndToEnd_OpenMetadataLifecycle_CreateIndex_Bulk_Update_Search(t *testin
 		t.Fatalf("expected serviceType aggregation in search response, got: %+v", searchResp)
 	}
 }
+
+func TestNormalizeDorisSQL_RewritesArrayExistsToBooleanScalar(t *testing.T) {
+	in := "SELECT * FROM `db`.`tbl` WHERE `__DORIS_DELETE_SIGN__` = 0 AND (array_exists(_el -> (json_extract_string(_el, '$.name') = 'user_id') AND (json_extract_string(_el, '$.dataType') = 'INT'), `n__columns`))"
+	got := normalizeDorisSQL(in)
+	want := "SELECT * FROM `db`.`tbl` WHERE (array_contains(array_exists(_el -> (json_extract_string(_el, '$.name') = 'user_id') AND (json_extract_string(_el, '$.dataType') = 'INT'), IFNULL(`n__columns`, CAST([] AS ARRAY<STRING>))), true))"
+	if got != want {
+		t.Fatalf("normalizeDorisSQL mismatch:\ngot:  %s\nwant: %s", got, want)
+	}
+}
