@@ -120,6 +120,25 @@ func ApplyUpdateWithResult(rawSource json.RawMessage, req *UpdateRequest, docExi
 	return json.RawMessage(out), opResult, nil
 }
 
+const (
+	MaxPainlessSteps      = 10_000
+	MaxPainlessDepth      = 32
+	MaxPainlessSliceItems = 10_000
+)
+
+type evalBudget struct {
+	steps int
+	depth int
+}
+
+func (b *evalBudget) step() error {
+	b.steps++
+	if b.steps > MaxPainlessSteps {
+		return fmt.Errorf("painless script exceeded maximum step budget (%d)", MaxPainlessSteps)
+	}
+	return nil
+}
+
 // EvalPainless evaluates common Painless script statements used by OpenMetadata and DataHub
 // against `sourceMap` (`ctx._source`) with `params`.
 func EvalPainless(sourceMap map[string]any, scriptSource string, params map[string]any) error {
@@ -133,51 +152,61 @@ func EvalPainlessWithOp(sourceMap map[string]any, scriptSource string, params ma
 		params = make(map[string]any)
 	}
 	ctxOp := ""
-	err := execBlock(sourceMap, scriptSource, params, &ctxOp)
+	budget := &evalBudget{}
+	err := execBlock(sourceMap, scriptSource, params, &ctxOp, budget)
 	return ctxOp, err
 }
 
-func execBlock(sourceMap map[string]any, block string, params map[string]any, ctxOp *string) error {
+func execBlock(sourceMap map[string]any, block string, params map[string]any, ctxOp *string, budget *evalBudget) error {
+	budget.depth++
+	defer func() { budget.depth-- }()
+	if budget.depth > MaxPainlessDepth {
+		return fmt.Errorf("painless script exceeded maximum recursion depth (%d)", MaxPainlessDepth)
+	}
+
 	stmts := splitTopLevelStatements(block)
 	for _, stmt := range stmts {
 		stmt = strings.TrimSpace(stmt)
 		if stmt == "" {
 			continue
 		}
+		if err := budget.step(); err != nil {
+			return err
+		}
 		if strings.HasPrefix(stmt, "if") && (len(stmt) == 2 || stmt[2] == ' ' || stmt[2] == '(') {
-			if err := execIfStatement(sourceMap, stmt, params, ctxOp); err != nil {
+			if err := execIfStatement(sourceMap, stmt, params, ctxOp, budget); err != nil {
 				return err
 			}
 			continue
 		}
 		if strings.HasPrefix(stmt, "for") && (len(stmt) == 3 || stmt[3] == ' ' || stmt[3] == '(') {
-			if err := execForStatement(sourceMap, stmt, params, ctxOp); err != nil {
+			if err := execForStatement(sourceMap, stmt, params, ctxOp, budget); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := execSimpleStmt(sourceMap, stmt, params, ctxOp); err != nil {
+		if err := execSimpleStmt(sourceMap, stmt, params, ctxOp, budget); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func execIfStatement(sourceMap map[string]any, stmt string, params map[string]any, ctxOp *string) error {
+func execIfStatement(sourceMap map[string]any, stmt string, params map[string]any, ctxOp *string, budget *evalBudget) error {
 	cond, thenBody, elseBody, ok := parseIfBlocks(stmt)
 	if !ok {
 		return nil
 	}
 	if evalCondition(sourceMap, cond, params) {
-		return execBlock(sourceMap, thenBody, params, ctxOp)
+		return execBlock(sourceMap, thenBody, params, ctxOp, budget)
 	}
 	if strings.TrimSpace(elseBody) != "" {
-		return execBlock(sourceMap, elseBody, params, ctxOp)
+		return execBlock(sourceMap, elseBody, params, ctxOp, budget)
 	}
 	return nil
 }
 
-func execForStatement(sourceMap map[string]any, stmt string, params map[string]any, ctxOp *string) error {
+func execForStatement(sourceMap map[string]any, stmt string, params map[string]any, ctxOp *string, budget *evalBudget) error {
 	openParen := strings.IndexByte(stmt, '(')
 	closeParen := findMatchingDelimiter(stmt, openParen, '(', ')')
 	if openParen < 0 || closeParen < 0 {
@@ -213,21 +242,27 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 	if !ok {
 		return nil
 	}
+	// Copy slice header + elements so in-loop mutations do not mutate the iteration snapshot
+	snapshot := make([]any, len(slice))
+	copy(snapshot, slice)
 
 	loopParams := make(map[string]any, len(params)+1)
 	for k, v := range params {
 		loopParams[k] = v
 	}
-	for _, item := range slice {
+	for _, item := range snapshot {
+		if err := budget.step(); err != nil {
+			return err
+		}
 		loopParams[varName] = item
-		if err := execBlock(sourceMap, body, loopParams, ctxOp); err != nil {
+		if err := execBlock(sourceMap, body, loopParams, ctxOp, budget); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any, ctxOp *string) error {
+func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any, ctxOp *string, budget *evalBudget) error {
 	if m := reCtxOp.FindStringSubmatch(stmt); m != nil {
 		*ctxOp = m[1]
 		return nil
@@ -256,8 +291,16 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			return err
 		}
 		if items, ok := valToAdd.([]any); ok {
-			for _, item := range items {
-				appendToSlice(sourceMap, arrPath, item)
+			// Snapshot items before appending to prevent self-aliasing issues
+			itemsCopy := make([]any, len(items))
+			copy(itemsCopy, items)
+			for _, item := range itemsCopy {
+				if err := budget.step(); err != nil {
+					return err
+				}
+				if err := appendToSlice(sourceMap, arrPath, item); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -270,8 +313,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		if err != nil {
 			return err
 		}
-		appendToSlice(sourceMap, arrPath, valToAdd)
-		return nil
+		return appendToSlice(sourceMap, arrPath, valToAdd)
 	}
 
 	// 4. Check `.putAll(...)` on map
@@ -732,7 +774,7 @@ func removeKeyAtPath(root map[string]any, parentPath []string, key string) {
 	delete(curr, key)
 }
 
-func appendToSlice(root map[string]any, path []string, val any) {
+func appendToSlice(root map[string]any, path []string, val any) error {
 	curr := root
 	for i := 0; i < len(path)-1; i++ {
 		seg := path[i]
@@ -748,7 +790,11 @@ func appendToSlice(root map[string]any, path []string, val any) {
 	if !ok {
 		existing = []any{}
 	}
+	if len(existing) >= MaxPainlessSliceItems {
+		return fmt.Errorf("painless array at %q exceeded maximum size (%d)", strings.Join(path, "."), MaxPainlessSliceItems)
+	}
 	curr[lastKey] = append(existing, val)
+	return nil
 }
 
 func removeIfFromSlice(root map[string]any, arrPath []string, propPath []string, matchVal any) {

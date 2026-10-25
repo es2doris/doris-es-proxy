@@ -182,8 +182,13 @@ SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM (
    - Compiles multi-faceted `aggs` (`terms` on scalar and `ARRAY<STRING>` columns, `nested` aggregations via `LATERAL VIEW EXPLODE`, `date_histogram`, `histogram`, `range`, `filter`, `missing`, `cardinality`, `value_count`, `avg`, `sum`, `min`, `max`) into a single-scan **Nereids Multi-Cast CTE (`WITH base_matched AS (...)`)** query.
 
 3. **High-Throughput `/_bulk` Stream Load & Embedded Painless Mutations (`pkg/painless`, `pkg/proxy`)**
-   - Streams `/_bulk` NDJSON (`index`, `create`, `update`, `delete` via `__DORIS_DELETE_SIGN__ = 1`) into Doris HTTP Stream Load (`merge_type: MERGE`, `function_column.sequence_col: _version`) while preserving auth headers across FE `:8030` $\rightarrow$ BE `:8040` `307` redirects.
-   - Executes `POST /{index}/_update/{id}` and `POST /{index}/_update_by_query` using an embedded Painless script evaluator supporting OpenMetadata and DataHub's `ctx._source` property assignments, `if/else`, `for` loops, `ctx.op = "noop" | "delete"`, `.remove()`, `.add()`, `.putAll()`, and `.removeIf(x -> ...)` mutations.
+   - Streams `/_bulk` NDJSON (`index`, `create`, `update`, `delete` via `__DORIS_DELETE_SIGN__ = 1`) into Doris HTTP Stream Load (`merge_type: MERGE`, `function_column.sequence_col: _version`) while preserving auth headers across FE `:8030` $\rightarrow$ BE `:8040` `307` redirects, with transparent `Content-Encoding: gzip` request decompression and `Accept-Encoding: gzip` response compression.
+   - Executes `POST /{index}/_update/{id}` and `POST /{index}/_update_by_query` using an embedded, bounded Painless script evaluator supporting OpenMetadata and DataHub's `ctx._source` property assignments, `if/else`, `for` loops, `ctx.op = "noop" | "delete"`, `.remove()`, `.add()`, `.putAll()`, and `.removeIf(x -> ...)` mutations.
+
+4. **Enterprise FinOps, Shadow Verification & Auto-Indexing Advisor (`pkg/proxy`)**
+   - **Auto-Indexing Advisor (`GET /_doris/slowlog`)**: Tracks query execution latency and unindexed `_doc['...']` `VARIANT` sub-column scans, automatically emitting ready-to-run `ALTER TABLE ... ADD COLUMN ... ADD INDEX ... USING INVERTED` DDL recommendations.
+   - **Dual-Read Shadow Verification (`--shadow-es-url`, `GET /_doris/shadow_stats`)**: Replays `/_search` requests against an existing Elasticsearch/OpenSearch cluster and computes hit-count parity (`doris_total == es_total`), Top-K `_id` Jaccard overlap, and latency speedup factor.
+   - **Embedded Interactive Playground (`GET /_doris/ui`)**: Zero-dependency browser UI for side-by-side Elasticsearch Query DSL $\rightarrow$ Apache Doris SQL transpilation, live execution, and DDL inspection.
 
 ---
 
@@ -191,12 +196,12 @@ SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM (
 
 | Category | Supported Endpoints & Features | Status |
 | :--- | :--- | :--- |
-| **Cluster & Index Admin** | `GET /`, `/_cluster/health`, `/_cluster/settings`, `/_nodes`, `/_cat/indices`, `/_cat/aliases`, `PUT/GET/HEAD/DELETE /{index}`, `/_mapping`, `/_settings`, `/_aliases`, `/_index_template`, `/_field_caps`, `/_refresh` | ✅ Supported |
-| **Ingestion & Mutations** | `POST /_bulk` (`index`, `create`, `update`, `delete`), `PUT/POST/GET/HEAD/DELETE /{index}/_doc/{id}`, `GET /{index}/_source/{id}`, `POST /_mget`, `POST /{index}/_update/{id}`, `POST /{index}/_update_by_query`, `POST /{index}/_delete_by_query` | ✅ Supported |
+| **Cluster, Cat & GUI Admin** | `GET /`, `/_cluster/health`, `/_cluster/settings`, `/_nodes`, `/_stats`, `/{index}/_stats`, `/_resolve/index/{name}`, `/{index}/_search_shards`, `/_cat/indices`, `/_cat/aliases`, `/_cat/nodes`, `/_cat/shards`, `/_cat/count`, `PUT/GET/HEAD/DELETE /{index}`, `/_mapping`, `/_settings`, `/_aliases`, `/_index_template`, `/_ingest/pipeline/{id}`, `/_field_caps`, `/_refresh`, CORS (`OPTIONS` preflight), `Content-Encoding: gzip` | ✅ Supported |
+| **Ingestion & Mutations** | `POST /_bulk` (`index`, `create`, `update`, `delete`), `PUT/POST/GET/HEAD/DELETE /{index}/_doc/{id}`, `GET /{index}/_source/{id}`, `POST /_mget`, `POST /{index}/_update/{id}`, `POST /{index}/_update_by_query`, `POST /{index}/_delete_by_query`, `POST /_reindex` | ✅ Supported |
 | **Full-Text & Term DSL** | `bool`, `match`, `match_phrase` (+ `slop`), `match_phrase_prefix`, `multi_match`, `query_string`, `simple_query_string`, `term` (+ `case_insensitive`), `terms`, `ids`, `range` (+ date math), `exists`, `prefix`, `wildcard`, `regexp` | ✅ Supported |
 | **Advanced Search & Scoring** | Correlated `nested` queries, `function_score` (`field_value_factor`, `weight`, `score_mode`, `boost_mode`), `constant_score`, `post_filter`, `_source` filtering (`includes`/`excludes`), `highlight`, `collapse`, `search_after`, stateless `/_search/scroll`, `/_msearch`, `/_count` | ✅ Supported |
-| **Aggregations** | `terms` (scalar & array), `nested`, `date_histogram`, `histogram`, `range`, `filter`, `missing`, `cardinality`, `value_count`, `avg`, `sum`, `min`, `max` | ✅ Supported |
-| **Doris Introspection** | `POST /{index}/_doris/explain`, `GET /{index}/_doris/ddl`, `?doris_explain=true`, `doris-es-proxy transpile`, `doris-es-proxy ddl` | ✅ Supported |
+| **Aggregations & Sub-Aggs** | `terms` (scalar & array), `nested`, `date_histogram`, `histogram`, `range`, `filter`, `filters` (named multi-bucket), `missing`, `cardinality`, `value_count`, `stats`, `percentiles`, `avg`, `sum`, `min`, `max`, plus **1-level Sub-Aggregations** inside `terms` / `date_histogram` / `histogram` / `range` / `filters` buckets | ✅ Supported |
+| **Doris Introspection & FinOps** | `GET /_doris/ui` (Web Playground), `POST /{index}/_doris/explain`, `GET /{index}/_doris/ddl`, `GET /_doris/slowlog` (Auto-Indexing Advisor), `GET /_doris/shadow_stats` (`--shadow-es-url`), `?doris_explain=true`, `doris-es-proxy transpile`, `doris-es-proxy ddl` | ✅ Supported |
 
 ---
 
@@ -235,15 +240,21 @@ docker compose up -d --build
 ES_URL=http://127.0.0.1:9200 bash examples/quickstart.sh
 ```
 
-### 4. Build & Run Tests
+### 4. Build, Benchmark & Run Tests
 
 ```bash
 nix develop -c make check
+nix develop -c make security
+nix develop -c make bench
 nix develop -c make build
 ./bin/doris-es-proxy --listen :9200 --doris-http http://127.0.0.1:8030 --doris-db es_compat --log-sql
 ```
 
-See [`examples/README.md`](examples/README.md) for OpenMetadata and DataHub configuration snippets.
+### 5. Kubernetes & Apache Doris DSIP
+
+- **Kubernetes Sidecar & Standalone Manifests**: [`deploy/kubernetes/doris-es-proxy.yaml`](deploy/kubernetes/doris-es-proxy.yaml)
+- **Apache Doris Improvement Proposal (DSIP)**: [`docs/dsip-doris-es-proxy.md`](docs/dsip-doris-es-proxy.md)
+- **OpenMetadata & DataHub Configurations**: [`examples/README.md`](examples/README.md)
 
 ## License
 

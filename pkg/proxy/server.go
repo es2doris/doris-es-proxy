@@ -102,14 +102,18 @@ type CatalogBackend interface {
 
 // Server implements the Elasticsearch / OpenSearch HTTP REST API adapter backed by Apache Doris.
 type Server struct {
-	dorisDB       string
-	backend       DorisBackend
-	transpileOpts transpiler.TranspilerOptions
+	dorisDB        string
+	backend        DorisBackend
+	transpileOpts  transpiler.TranspilerOptions
+	maxBodyBytes   int64
+	slowTracker    *SlowQueryTracker
+	shadowVerifier *ShadowVerifier
 
 	mu        sync.RWMutex
 	indices   map[string]*schema.IndexSchema
 	aliases   map[string][]string // aliasName -> ordered target indexNames
 	templates map[string]esast.IndexTemplateRequest
+	pipelines map[string]map[string]any
 }
 
 func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerOptions) *Server {
@@ -117,12 +121,16 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		dorisDB = "es_compat"
 	}
 	return &Server{
-		dorisDB:       dorisDB,
-		backend:       backend,
-		transpileOpts: opts,
-		indices:       make(map[string]*schema.IndexSchema),
-		aliases:       make(map[string][]string),
-		templates:     make(map[string]esast.IndexTemplateRequest),
+		dorisDB:        dorisDB,
+		backend:        backend,
+		transpileOpts:  opts,
+		maxBodyBytes:   DefaultMaxRequestBodyBytes,
+		slowTracker:    newSlowQueryTracker(),
+		shadowVerifier: newShadowVerifier(""),
+		indices:        make(map[string]*schema.IndexSchema),
+		aliases:        make(map[string][]string),
+		templates:      make(map[string]esast.IndexTemplateRequest),
+		pipelines:      make(map[string]map[string]any),
 	}
 }
 
@@ -237,8 +245,7 @@ func (s *Server) deleteCatalogEntity(ctx context.Context, entityType, entityKey 
 // Handler returns an `http.Handler` that routes Elasticsearch / OpenSearch REST endpoints
 // without `http.ServeMux` wildcard ambiguity between `/_alias/{name}` and `/{index}/_search`.
 func (s *Server) Handler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		setESCompatHeaders(w, r)
+	return s.withWireMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		trimmed := strings.Trim(r.URL.Path, "/")
 		if trimmed == "" {
 			if r.Method == http.MethodHead {
@@ -263,6 +270,12 @@ func (s *Server) Handler() http.Handler {
 				s.handleMGet(w, r)
 			case "_count":
 				s.handleCount(w, r)
+			case "_stats":
+				s.handleIndexStats(w, r)
+			case "_search_shards":
+				s.handleSearchShards(w, r)
+			case "_reindex":
+				s.handleReindex(w, r)
 			case "_aliases":
 				if r.Method == http.MethodPost {
 					s.handleUpdateAliases(w, r)
@@ -305,12 +318,26 @@ func (s *Server) Handler() http.Handler {
 				s.handleCatIndices(w, r)
 			case segs[0] == "_cat" && segs[1] == "aliases":
 				s.handleCatAliases(w, r)
+			case segs[0] == "_cat" && segs[1] == "nodes":
+				s.handleCatNodes(w, r)
+			case segs[0] == "_cat" && segs[1] == "shards":
+				s.handleCatShards(w, r)
+			case segs[0] == "_cat" && segs[1] == "count":
+				s.handleCatCount(w, r)
 			case segs[0] == "_cat" && segs[1] == "health":
 				s.handleClusterHealth(w, r)
 			case segs[0] == "_search" && segs[1] == "scroll":
 				s.handleScroll(w, r)
 			case segs[0] == "_doris" && segs[1] == "explain":
 				s.handleDorisExplain(w, r)
+			case segs[0] == "_doris" && segs[1] == "ui":
+				s.handleDorisUI(w, r)
+			case segs[0] == "_doris" && segs[1] == "slowlog":
+				s.handleDorisSlowlog(w, r)
+			case segs[0] == "_doris" && segs[1] == "shadow_stats":
+				s.handleDorisShadowStats(w, r)
+			case segs[0] == "_ingest" && segs[1] == "pipeline":
+				s.handleIngestPipeline(w, r)
 			case segs[0] == "_alias":
 				r.SetPathValue("name", segs[1])
 				s.handleGetAliases(w, r)
@@ -338,6 +365,10 @@ func (s *Server) Handler() http.Handler {
 					s.handleMGet(w, r)
 				case "_count":
 					s.handleCount(w, r)
+				case "_stats":
+					s.handleIndexStats(w, r)
+				case "_search_shards":
+					s.handleSearchShards(w, r)
 				case "_bulk":
 					s.handleBulk(w, r)
 				case "_refresh", "_flush", "_forcemerge":
@@ -366,6 +397,34 @@ func (s *Server) Handler() http.Handler {
 				s.handleClusterHealth(w, r)
 				return
 			}
+			if segs[0] == "_resolve" && segs[1] == "index" {
+				r.SetPathValue("name", segs[2])
+				s.handleResolveIndex(w, r)
+				return
+			}
+			if segs[0] == "_ingest" && segs[1] == "pipeline" {
+				r.SetPathValue("id", segs[2])
+				s.handleIngestPipeline(w, r)
+				return
+			}
+			if segs[0] == "_cat" {
+				r.SetPathValue("index", segs[2])
+				r.SetPathValue("name", segs[2])
+				switch segs[1] {
+				case "indices":
+					s.handleCatIndices(w, r)
+					return
+				case "aliases":
+					s.handleCatAliases(w, r)
+					return
+				case "count":
+					s.handleCatCount(w, r)
+					return
+				case "shards":
+					s.handleCatShards(w, r)
+					return
+				}
+			}
 			r.SetPathValue("index", segs[0])
 			if segs[1] == "_alias" || segs[1] == "_aliases" {
 				r.SetPathValue("name", segs[2])
@@ -378,6 +437,10 @@ func (s *Server) Handler() http.Handler {
 			}
 			if segs[1] == "_doris" && segs[2] == "ddl" {
 				s.handleDorisDDL(w, r)
+				return
+			}
+			if segs[1] == "_doris" && segs[2] == "slowlog" {
+				s.handleDorisSlowlog(w, r)
 				return
 			}
 			if segs[1] == "_mapping" || segs[1] == "_mappings" {
@@ -414,7 +477,7 @@ func (s *Server) Handler() http.Handler {
 		default:
 			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
 		}
-	})
+	}))
 }
 
 func (s *Server) handleRootHandshake(w http.ResponseWriter, _ *http.Request) {
@@ -504,23 +567,27 @@ func (s *Server) handleNodes(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-func (s *Server) handleCatIndices(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleCatIndices(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	list := make([]map[string]any, 0, len(s.indices))
+	names := make([]string, 0, len(s.indices))
 	for name := range s.indices {
+		names = append(names, name)
+	}
+	s.mu.RUnlock()
+	sort.Strings(names)
+	list := make([]map[string]any, 0, len(names))
+	for _, name := range names {
 		list = append(list, map[string]any{
 			"health": "green",
 			"status": "open",
 			"index":  name,
 		})
 	}
-	writeJSON(w, http.StatusOK, list)
+	writeCatResponse(w, r, []string{"health", "status", "index"}, list)
 }
 
-func (s *Server) handleCatAliases(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleCatAliases(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	var list []map[string]any
 	for alias, targets := range s.aliases {
 		for _, idx := range targets {
@@ -530,7 +597,8 @@ func (s *Server) handleCatAliases(w http.ResponseWriter, _ *http.Request) {
 			})
 		}
 	}
-	writeJSON(w, http.StatusOK, list)
+	s.mu.RUnlock()
+	writeCatResponse(w, r, []string{"alias", "index"}, list)
 }
 
 func (s *Server) handleRefresh(w http.ResponseWriter, _ *http.Request) {
@@ -1643,6 +1711,10 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, status, errType, errReason)
 		return
 	}
+	tookMs, _ := toInt64(resp["took"])
+	syncShadow := r.URL.Query().Get("shadow_sync") == "true" || r.URL.Query().Get("shadow_sync") == "1"
+	s.maybeRunShadowSearch(rawIndex, &req, resp, tookMs, syncShadow)
+
 	if r.URL.Query().Get("scroll") != "" {
 		scrollID := "doris-scroll-eof"
 		if hitsWrapper, ok := resp["hits"].(map[string]any); ok {
@@ -1677,7 +1749,7 @@ func (s *Server) handleDorisExplain(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDorisDDL(w http.ResponseWriter, r *http.Request) {
 	indexName := s.resolveIndexName(r.PathValue("index"))
-	idxSchema := s.ensureIndexSchema(r.Context(), indexName)
+	idxSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
 	ddl := schema.GenerateCreateTableDDL(idxSchema)
 	if r.URL.Query().Get("format") == "txt" || r.URL.Query().Get("format") == "sql" {
 		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
@@ -1700,7 +1772,7 @@ func (s *Server) buildDorisExplainObject(ctx context.Context, rawIndexPattern st
 	}
 	var plans []map[string]any
 	for _, indexName := range targets {
-		idxSchema := s.ensureIndexSchema(ctx, indexName)
+		idxSchema := s.getOrCompileReadOnlySchema(ctx, indexName)
 		tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
 		plan, err := tr.BuildSearchPlan(req)
 		fieldBindings := make(map[string]any, len(idxSchema.Fields))
@@ -1714,13 +1786,14 @@ func (s *Server) buildDorisExplainObject(ctx context.Context, rawIndexPattern st
 			}
 		}
 		entry := map[string]any{
-			"index":            indexName,
-			"doris_database":   idxSchema.DorisDB,
-			"doris_table":      idxSchema.DorisTable,
-			"create_table_ddl": schema.GenerateCreateTableDDL(idxSchema),
-			"hits_sql":         plan.HitsSQL,
-			"aggs_sql":         plan.AggsSQL,
-			"field_bindings":   fieldBindings,
+			"index":                    indexName,
+			"doris_database":           idxSchema.DorisDB,
+			"doris_table":              idxSchema.DorisTable,
+			"create_table_ddl":         schema.GenerateCreateTableDDL(idxSchema),
+			"hits_sql":                 plan.HitsSQL,
+			"aggs_sql":                 plan.AggsSQL,
+			"field_bindings":           fieldBindings,
+			"unindexed_variant_fields": plan.UnindexedVariantFields,
 		}
 		if err != nil {
 			entry["error"] = err.Error()
@@ -1737,6 +1810,7 @@ func (s *Server) buildDorisExplainObject(ctx context.Context, rawIndexPattern st
 		out["aggs_sql"] = plans[0]["aggs_sql"]
 		out["create_table_ddl"] = plans[0]["create_table_ddl"]
 		out["doris_table"] = plans[0]["doris_table"]
+		out["unindexed_variant_fields"] = plans[0]["unindexed_variant_fields"]
 	}
 	return out
 }
@@ -1885,11 +1959,12 @@ func (s *Server) executeSearchRequest(
 	rawIndexPattern string,
 	req *esast.SearchRequest,
 ) (map[string]any, int, string, string) {
+	start := time.Now()
 	targets := s.resolveTargetIndices(rawIndexPattern)
 	if len(targets) == 0 {
 		// If wildcard pattern matched nothing, return empty 200 search response (like ES with allow_no_indices=true)
 		if strings.Contains(rawIndexPattern, "*") || rawIndexPattern == "_all" {
-			return buildESResponse(rawIndexPattern, req, nil, nil), http.StatusOK, "", ""
+			return buildESResponse(rawIndexPattern, nil, req, nil, nil, 1), http.StatusOK, "", ""
 		}
 		targets = []string{s.resolveIndexName(rawIndexPattern)}
 	}
@@ -1906,9 +1981,13 @@ func (s *Server) executeSearchRequest(
 	var allHits []HitRow
 	var allAggRows []AggRow
 	var totalHitsSum int64
+	var primarySchema *schema.IndexSchema
 
 	for _, indexName := range targets {
 		idxSchema := s.ensureIndexSchema(ctx, indexName)
+		if primarySchema == nil {
+			primarySchema = idxSchema
+		}
 		subReq := *req
 		if len(targets) > 1 && size > 0 {
 			zero := 0
@@ -1917,6 +1996,7 @@ func (s *Server) executeSearchRequest(
 			subReq.Size = &fetchSize
 		}
 
+		idxStart := time.Now()
 		tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
 		plan, err := tr.BuildSearchPlan(&subReq)
 		if err != nil {
@@ -1949,6 +2029,19 @@ func (s *Server) executeSearchRequest(
 			}
 			allAggRows = append(allAggRows, aggRows...)
 		}
+		idxTookMs := time.Since(idxStart).Milliseconds()
+		if idxTookMs <= 0 {
+			idxTookMs = 1
+		}
+		s.slowTracker.record(SlowQueryEntry{
+			Timestamp:              time.Now().UTC().Format(time.RFC3339),
+			Index:                  indexName,
+			TookMs:                 idxTookMs,
+			TotalHits:              idxTotal,
+			HitsSQL:                plan.HitsSQL,
+			AggsSQL:                plan.AggsSQL,
+			UnindexedVariantFields: plan.UnindexedVariantFields,
+		})
 		totalHitsSum += idxTotal
 	}
 
@@ -1974,8 +2067,12 @@ func (s *Server) executeSearchRequest(
 		allAggRows = mergeMultiIndexAggRows(allAggRows, totalHitsSum)
 	}
 
+	tookMs := time.Since(start).Milliseconds()
+	if tookMs <= 0 {
+		tookMs = 1
+	}
 	primaryIndex := targets[0]
-	return buildESResponse(primaryIndex, req, allHits, allAggRows), http.StatusOK, "", ""
+	return buildESResponse(primaryIndex, primarySchema, req, allHits, allAggRows, tookMs), http.StatusOK, "", ""
 }
 
 func mergeMultiIndexAggRows(rows []AggRow, totalHits int64) []AggRow {
@@ -2094,10 +2191,13 @@ func applyURISearchParams(r *http.Request, req *esast.SearchRequest) {
 	}
 }
 
-func buildESResponse(indexName string, req *esast.SearchRequest, hits []HitRow, aggRows []AggRow) map[string]any {
+func buildESResponse(indexName string, idxSchema *schema.IndexSchema, req *esast.SearchRequest, hits []HitRow, aggRows []AggRow, tookMs int64) map[string]any {
 	var totalHits int64
 	var maxScore float64
 	esHits := make([]map[string]any, 0, len(hits))
+	if tookMs <= 0 {
+		tookMs = 1
+	}
 
 	for _, h := range hits {
 		if h.TotalHits > totalHits {
@@ -2125,7 +2225,7 @@ func buildESResponse(indexName string, req *esast.SearchRequest, hits []HitRow, 
 			}
 		}
 		if len(req.Sort) > 0 {
-			hitMap["sort"] = extractHitSortValues(h, req.Sort)
+			hitMap["sort"] = extractHitSortValues(h, req.Sort, idxSchema)
 		}
 		esHits = append(esHits, hitMap)
 	}
@@ -2144,7 +2244,7 @@ func buildESResponse(indexName string, req *esast.SearchRequest, hits []HitRow, 
 	aggsOut := buildAggsMap("", req.EffectiveAggs(), bucketsByAgg, totalHits)
 
 	res := map[string]any{
-		"took":      3,
+		"took":      tookMs,
 		"timed_out": false,
 		"_shards":   map[string]any{"total": 1, "successful": 1, "skipped": 0, "failed": 0},
 		"hits": map[string]any{
@@ -2178,11 +2278,16 @@ func buildAggsMap(
 		switch {
 		case spec.Terms != nil:
 			b := make([]map[string]any, 0, len(rows))
+			subAggs := spec.SubAggs()
 			for _, r := range rows {
-				b = append(b, map[string]any{
+				bucketMap := map[string]any{
 					"key":       r.BucketKey,
 					"doc_count": r.effectiveCount(),
-				})
+				}
+				if len(subAggs) > 0 {
+					attachSubAggsToBucket(bucketMap, fullKey, r.BucketKey, subAggs, bucketsByAgg)
+				}
+				b = append(b, bucketMap)
 			}
 			aggsOut[aggName] = map[string]any{
 				"doc_count_error_upper_bound": 0,
@@ -2221,6 +2326,23 @@ func buildAggsMap(
 				}
 			}
 			aggsOut[aggName] = filterObj
+		case spec.Filters != nil:
+			byKey := make(map[string]int64, len(rows))
+			for _, r := range rows {
+				byKey[r.BucketKey] = r.effectiveCount()
+			}
+			bucketsMap := make(map[string]any, len(spec.Filters.Filters))
+			subAggs := spec.SubAggs()
+			for fk := range spec.Filters.Filters {
+				bMap := map[string]any{
+					"doc_count": byKey[fk],
+				}
+				if len(subAggs) > 0 {
+					attachSubAggsToBucket(bMap, fullKey, fk, subAggs, bucketsByAgg)
+				}
+				bucketsMap[fk] = bMap
+			}
+			aggsOut[aggName] = map[string]any{"buckets": bucketsMap}
 		case spec.Cardinality != nil || spec.ValueCount != nil:
 			var cnt int64
 			if len(rows) > 0 {
@@ -2233,26 +2355,65 @@ func buildAggsMap(
 				val = rows[0].effectiveValue()
 			}
 			aggsOut[aggName] = map[string]any{"value": val}
+		case spec.Stats != nil:
+			statsMap := map[string]any{
+				"count": int64(0),
+				"min":   0.0,
+				"max":   0.0,
+				"avg":   0.0,
+				"sum":   0.0,
+			}
+			for _, r := range rows {
+				switch r.BucketKey {
+				case "_stats_count":
+					statsMap["count"] = r.effectiveCount()
+				case "_stats_min":
+					statsMap["min"] = r.effectiveValue()
+				case "_stats_max":
+					statsMap["max"] = r.effectiveValue()
+				case "_stats_avg":
+					statsMap["avg"] = r.effectiveValue()
+				case "_stats_sum":
+					statsMap["sum"] = r.effectiveValue()
+				}
+			}
+			aggsOut[aggName] = statsMap
+		case spec.Percentiles != nil:
+			valuesMap := make(map[string]float64, len(rows))
+			for _, r := range rows {
+				valuesMap[r.BucketKey] = r.effectiveValue()
+			}
+			aggsOut[aggName] = map[string]any{"values": valuesMap}
 		case spec.DateHistogram != nil:
 			b := make([]map[string]any, 0, len(rows))
+			subAggs := spec.SubAggs()
 			for _, r := range rows {
 				epochMs, _ := strconv.ParseInt(r.BucketKey, 10, 64)
 				keyStr := time.UnixMilli(epochMs).UTC().Format("2006-01-02T15:04:05.000Z")
-				b = append(b, map[string]any{
+				bucketMap := map[string]any{
 					"key_as_string": keyStr,
 					"key":           epochMs,
 					"doc_count":     r.effectiveCount(),
-				})
+				}
+				if len(subAggs) > 0 {
+					attachSubAggsToBucket(bucketMap, fullKey, r.BucketKey, subAggs, bucketsByAgg)
+				}
+				b = append(b, bucketMap)
 			}
 			aggsOut[aggName] = map[string]any{"buckets": b}
 		case spec.Histogram != nil:
 			b := make([]map[string]any, 0, len(rows))
+			subAggs := spec.SubAggs()
 			for _, r := range rows {
 				numKey, _ := strconv.ParseFloat(r.BucketKey, 64)
-				b = append(b, map[string]any{
+				bucketMap := map[string]any{
 					"key":       numKey,
 					"doc_count": r.effectiveCount(),
-				})
+				}
+				if len(subAggs) > 0 {
+					attachSubAggsToBucket(bucketMap, fullKey, r.BucketKey, subAggs, bucketsByAgg)
+				}
+				b = append(b, bucketMap)
 			}
 			aggsOut[aggName] = map[string]any{"buckets": b}
 		case spec.Range != nil:
@@ -2261,6 +2422,7 @@ func buildAggsMap(
 				byKey[r.BucketKey] = r.effectiveCount()
 			}
 			b := make([]map[string]any, 0, len(spec.Range.Ranges))
+			subAggs := spec.SubAggs()
 			for _, rng := range spec.Range.Ranges {
 				ek := rng.EffectiveKey()
 				entry := map[string]any{
@@ -2273,6 +2435,9 @@ func buildAggsMap(
 				if rng.To != nil {
 					entry["to"] = rng.To
 				}
+				if len(subAggs) > 0 {
+					attachSubAggsToBucket(entry, fullKey, ek, subAggs, bucketsByAgg)
+				}
 				b = append(b, entry)
 			}
 			aggsOut[aggName] = map[string]any{"buckets": b}
@@ -2281,7 +2446,67 @@ func buildAggsMap(
 	return aggsOut
 }
 
-func extractHitSortValues(h HitRow, sorts []esast.SortSpec) []any {
+func attachSubAggsToBucket(
+	bucketMap map[string]any,
+	parentFullKey string,
+	parentBucketKey string,
+	subAggs map[string]esast.AggSpec,
+	bucketsByAgg map[string][]AggRow,
+) {
+	for subName, subSpec := range subAggs {
+		subFullKey := parentFullKey + "." + subName
+		subRows := bucketsByAgg[subFullKey]
+		switch {
+		case subSpec.Cardinality != nil || subSpec.ValueCount != nil:
+			var cnt int64
+			for _, r := range subRows {
+				if r.BucketKey == parentBucketKey {
+					cnt = r.effectiveCount()
+					break
+				}
+			}
+			bucketMap[subName] = map[string]any{"value": cnt}
+		case subSpec.Avg != nil || subSpec.Sum != nil || subSpec.Min != nil || subSpec.Max != nil:
+			var val float64
+			for _, r := range subRows {
+				if r.BucketKey == parentBucketKey {
+					val = r.effectiveValue()
+					break
+				}
+			}
+			bucketMap[subName] = map[string]any{"value": val}
+		case subSpec.Terms != nil:
+			prefix := parentBucketKey + "\x1f"
+			var childBuckets []map[string]any
+			limit := subSpec.Terms.Size
+			if limit <= 0 {
+				limit = 10
+			}
+			for _, r := range subRows {
+				if strings.HasPrefix(r.BucketKey, prefix) {
+					childKey := strings.TrimPrefix(r.BucketKey, prefix)
+					childBuckets = append(childBuckets, map[string]any{
+						"key":       childKey,
+						"doc_count": r.effectiveCount(),
+					})
+					if len(childBuckets) >= limit {
+						break
+					}
+				}
+			}
+			if childBuckets == nil {
+				childBuckets = []map[string]any{}
+			}
+			bucketMap[subName] = map[string]any{
+				"doc_count_error_upper_bound": 0,
+				"sum_other_doc_count":         0,
+				"buckets":                     childBuckets,
+			}
+		}
+	}
+}
+
+func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.IndexSchema) []any {
 	var doc map[string]any
 	if len(h.Source) > 0 {
 		dec := json.NewDecoder(bytes.NewReader(h.Source))
@@ -2303,6 +2528,18 @@ func extractHitSortValues(h HitRow, sorts []esast.SortSpec) []any {
 					val = iv
 				} else if fv, err := jsonNum.Float64(); err == nil {
 					val = fv
+				}
+			}
+			if idxSchema != nil {
+				b := idxSchema.ResolveField(s.Entry.Field)
+				if strVal, ok := val.(string); ok {
+					if b.LowercaseNormalizer {
+						val = strings.ToLower(strVal)
+					} else if b.DorisType == schema.DorisBigInt {
+						if ms, ok := schema.ParseESDateToEpochMillis(strVal, time.Now().UTC()); ok {
+							val = ms
+						}
+					}
 				}
 			}
 			out = append(out, val)
@@ -2406,6 +2643,19 @@ func buildHighlightMap(raw json.RawMessage, req *esast.SearchRequest) map[string
 	if len(terms) == 0 {
 		return nil
 	}
+	var compiledRegexes []*regexp.Regexp
+	for _, term := range terms {
+		term = strings.Trim(term, "*?\"")
+		if len(term) == 0 {
+			continue
+		}
+		if re, err := regexp.Compile("(?i)" + regexp.QuoteMeta(term)); err == nil {
+			compiledRegexes = append(compiledRegexes, re)
+		}
+	}
+	if len(compiledRegexes) == 0 {
+		return nil
+	}
 	var doc map[string]any
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil
@@ -2424,7 +2674,7 @@ func buildHighlightMap(raw json.RawMessage, req *esast.SearchRequest) map[string
 		cleanField := strings.TrimSuffix(strings.TrimSuffix(field, ".keyword"), ".ngram")
 		vals := collectStringValuesAtPath(doc, strings.Split(cleanField, "."))
 		for _, v := range vals {
-			highlighted, matched := highlightTermsInText(v, terms, preTag, postTag)
+			highlighted, matched := highlightWithRegexes(v, compiledRegexes, preTag, postTag)
 			if matched {
 				out[field] = append(out[field], highlighted)
 			}
@@ -2463,18 +2713,10 @@ func collectStringValuesAtPath(node any, path []string) []string {
 	return nil
 }
 
-func highlightTermsInText(text string, terms []string, preTag, postTag string) (string, bool) {
+func highlightWithRegexes(text string, regexes []*regexp.Regexp, preTag, postTag string) (string, bool) {
 	result := text
 	matched := false
-	for _, term := range terms {
-		term = strings.Trim(term, "*?\"")
-		if len(term) == 0 {
-			continue
-		}
-		re, err := regexp.Compile("(?i)" + regexp.QuoteMeta(term))
-		if err != nil {
-			continue
-		}
+	for _, re := range regexes {
 		if re.MatchString(result) {
 			matched = true
 			result = re.ReplaceAllStringFunc(result, func(m string) string {
@@ -2556,6 +2798,15 @@ func collectTermsFromQuery(q *esast.Query, out *[]string) {
 }
 
 func (s *Server) resolveTargetIndices(pattern string) []string {
+	out := s.resolveTargetIndicesOnce(pattern)
+	if len(out) == 0 {
+		_ = s.syncCatalogFromBackend(context.Background())
+		out = s.resolveTargetIndicesOnce(pattern)
+	}
+	return out
+}
+
+func (s *Server) resolveTargetIndicesOnce(pattern string) []string {
 	if pattern == "" || pattern == "_all" || pattern == "*" {
 		s.mu.RLock()
 		defer s.mu.RUnlock()
@@ -2570,10 +2821,9 @@ func (s *Server) resolveTargetIndices(pattern string) []string {
 	parts := strings.Split(pattern, ",")
 	seen := make(map[string]bool)
 	var out []string
+	var needsSync bool
 
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	addTarget := func(idx string) {
 		if idx != "" && !seen[idx] {
 			seen[idx] = true
@@ -2587,17 +2837,23 @@ func (s *Server) resolveTargetIndices(pattern string) []string {
 			continue
 		}
 		if strings.Contains(part, "*") {
+			matchedAny := false
 			for idxName := range s.indices {
 				if matchWildcardPattern(part, idxName) {
 					addTarget(idxName)
+					matchedAny = true
 				}
 			}
 			for alias, targets := range s.aliases {
 				if matchWildcardPattern(part, alias) {
 					for _, t := range targets {
 						addTarget(t)
+						matchedAny = true
 					}
 				}
+			}
+			if !matchedAny {
+				needsSync = true
 			}
 			continue
 		}
@@ -2607,8 +2863,49 @@ func (s *Server) resolveTargetIndices(pattern string) []string {
 			}
 			continue
 		}
+		if _, isKnownIndex := s.indices[part]; !isKnownIndex {
+			needsSync = true
+		}
 		addTarget(part)
 	}
+	s.mu.RUnlock()
+
+	if needsSync {
+		_ = s.syncCatalogFromBackend(context.Background())
+		seen = make(map[string]bool)
+		out = nil
+		s.mu.RLock()
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "" || strings.HasPrefix(part, "-") {
+				continue
+			}
+			if strings.Contains(part, "*") {
+				for idxName := range s.indices {
+					if matchWildcardPattern(part, idxName) {
+						addTarget(idxName)
+					}
+				}
+				for alias, targets := range s.aliases {
+					if matchWildcardPattern(part, alias) {
+						for _, t := range targets {
+							addTarget(t)
+						}
+					}
+				}
+				continue
+			}
+			if targets, ok := s.aliases[part]; ok && len(targets) > 0 {
+				for _, t := range targets {
+					addTarget(t)
+				}
+				continue
+			}
+			addTarget(part)
+		}
+		s.mu.RUnlock()
+	}
+
 	sort.Strings(out)
 	return out
 }
@@ -2621,6 +2918,18 @@ func (s *Server) resolveIndexName(nameOrAlias string) string {
 		nameOrAlias = nameOrAlias[:idx]
 	}
 	s.mu.RLock()
+	if targets, ok := s.aliases[nameOrAlias]; ok && len(targets) > 0 {
+		s.mu.RUnlock()
+		return targets[0]
+	}
+	if _, ok := s.indices[nameOrAlias]; ok {
+		s.mu.RUnlock()
+		return nameOrAlias
+	}
+	s.mu.RUnlock()
+
+	_ = s.syncCatalogFromBackend(context.Background())
+	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if targets, ok := s.aliases[nameOrAlias]; ok && len(targets) > 0 {
 		return targets[0]
@@ -2628,8 +2937,42 @@ func (s *Server) resolveIndexName(nameOrAlias string) string {
 	return nameOrAlias
 }
 
+func (s *Server) getOrCompileReadOnlySchema(ctx context.Context, indexName string) *schema.IndexSchema {
+	s.mu.RLock()
+	if targets, ok := s.aliases[indexName]; ok && len(targets) > 0 {
+		indexName = targets[0]
+	}
+	if idx, ok := s.indices[indexName]; ok {
+		s.mu.RUnlock()
+		return idx
+	}
+	s.mu.RUnlock()
+
+	_ = s.syncCatalogFromBackend(ctx)
+
+	s.mu.RLock()
+	if targets, ok := s.aliases[indexName]; ok && len(targets) > 0 {
+		indexName = targets[0]
+	}
+	if idx, ok := s.indices[indexName]; ok {
+		s.mu.RUnlock()
+		return idx
+	}
+	tplMappings := s.matchingTemplateMappingsLocked(indexName)
+	s.mu.RUnlock()
+
+	return schema.CompileIndexSchema(s.dorisDB, indexName, tplMappings)
+}
+
+func (s *Server) ensureWritableIndexSchema(ctx context.Context, indexName string) *schema.IndexSchema {
+	return s.ensureIndexSchema(ctx, indexName)
+}
+
 func (s *Server) ensureIndexSchema(ctx context.Context, indexName string) *schema.IndexSchema {
 	s.mu.RLock()
+	if targets, ok := s.aliases[indexName]; ok && len(targets) > 0 {
+		indexName = targets[0]
+	}
 	idx, ok := s.indices[indexName]
 	if ok {
 		s.mu.RUnlock()
@@ -2640,6 +2983,9 @@ func (s *Server) ensureIndexSchema(ctx context.Context, indexName string) *schem
 	_ = s.syncCatalogFromBackend(ctx)
 
 	s.mu.RLock()
+	if targets, ok := s.aliases[indexName]; ok && len(targets) > 0 {
+		indexName = targets[0]
+	}
 	idx, ok = s.indices[indexName]
 	if ok {
 		s.mu.RUnlock()
@@ -2668,16 +3014,35 @@ func matchWildcardPattern(pattern, target string) bool {
 	if !strings.Contains(pattern, "*") {
 		return pattern == target
 	}
-	reStr := "^" + strings.ReplaceAll(regexp.QuoteMeta(pattern), `\*`, ".*") + "$"
-	re, err := regexp.Compile(reStr)
-	if err != nil {
-		return false
+	pIdx, tIdx := 0, 0
+	starIdx, matchIdx := -1, 0
+	for tIdx < len(target) {
+		if pIdx < len(pattern) && pattern[pIdx] == target[tIdx] {
+			pIdx++
+			tIdx++
+		} else if pIdx < len(pattern) && pattern[pIdx] == '*' {
+			starIdx = pIdx
+			matchIdx = tIdx
+			pIdx++
+		} else if starIdx != -1 {
+			pIdx = starIdx + 1
+			matchIdx++
+			tIdx = matchIdx
+		} else {
+			return false
+		}
 	}
-	return re.MatchString(target)
+	for pIdx < len(pattern) && pattern[pIdx] == '*' {
+		pIdx++
+	}
+	return pIdx == len(pattern)
 }
 
 func setESCompatHeaders(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Elastic-Product", "Elasticsearch")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, HEAD, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, X-Opaque-Id, X-Elastic-Client-Meta, kbn-xsrf")
 	accept := r.Header.Get("Accept")
 	if strings.Contains(accept, "compatible-with=8") {
 		w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=8")

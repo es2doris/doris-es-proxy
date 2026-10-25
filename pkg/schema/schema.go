@@ -19,6 +19,7 @@ package schema
 
 import (
 	"fmt"
+	"hash/fnv"
 	"regexp"
 	"sort"
 	"strconv"
@@ -68,15 +69,24 @@ type FieldBinding struct {
 	IsMultiValued      bool
 }
 
+// NestedRootSpec holds pre-split path metadata for a correlated nested array root.
+type NestedRootSpec struct {
+	Path       string
+	ColumnName string
+	PathParts  []string
+}
+
 // IndexSchema holds the compiled schema registry for an Elasticsearch index.
 type IndexSchema struct {
-	IndexName   string
-	DorisDB     string
-	DorisTable  string
-	Buckets     int
-	Fields      map[string]FieldBinding
-	NestedRoots map[string]string // Maps ES nested path (e.g. "columns") -> Doris column ("n__columns")
-	RawMapping  *esast.MappingSpec
+	IndexName       string
+	DorisDB         string
+	DorisTable      string
+	Buckets         int
+	Fields          map[string]FieldBinding
+	OrderedFields   []FieldBinding
+	NestedRoots     map[string]string // Maps ES nested path (e.g. "columns") -> Doris column ("n__columns")
+	NestedRootSpecs []NestedRootSpec
+	RawMapping      *esast.MappingSpec
 }
 
 // DefaultMultiValuedPaths lists common OpenMetadata & DataHub paths that hold arrays of objects/strings
@@ -104,7 +114,7 @@ var DefaultMultiValuedPaths = map[string]bool{
 func CompileIndexSchema(dorisDB, indexName string, mapping *esast.MappingSpec) *IndexSchema {
 	s := &IndexSchema{
 		IndexName:   indexName,
-		DorisDB:     dorisDB,
+		DorisDB:     SanitizeDorisIdentifier(dorisDB),
 		DorisTable:  SanitizeDorisIdentifier(indexName),
 		Buckets:     8,
 		Fields:      make(map[string]FieldBinding),
@@ -112,9 +122,42 @@ func CompileIndexSchema(dorisDB, indexName string, mapping *esast.MappingSpec) *
 		RawMapping:  mapping,
 	}
 	if mapping != nil && len(mapping.Properties) > 0 {
-		s.compileProperties(nil, nil, "", mapping.Properties)
+		s.compileProperties(nil, nil, "", 0, mapping.Properties)
 	}
+	s.finalizeCompiledSlices()
 	return s
+}
+
+func (s *IndexSchema) finalizeCompiledSlices() {
+	fieldKeys := make([]string, 0, len(s.Fields))
+	for k := range s.Fields {
+		fieldKeys = append(fieldKeys, k)
+	}
+	sort.Strings(fieldKeys)
+	seenCols := make(map[string]bool, len(fieldKeys))
+	s.OrderedFields = make([]FieldBinding, 0, len(fieldKeys))
+	for _, k := range fieldKeys {
+		b := s.Fields[k]
+		if b.ColumnName == "" || seenCols[b.ColumnName] {
+			continue
+		}
+		seenCols[b.ColumnName] = true
+		s.OrderedFields = append(s.OrderedFields, b)
+	}
+
+	nestedKeys := make([]string, 0, len(s.NestedRoots))
+	for np := range s.NestedRoots {
+		nestedKeys = append(nestedKeys, np)
+	}
+	sort.Strings(nestedKeys)
+	s.NestedRootSpecs = make([]NestedRootSpec, 0, len(nestedKeys))
+	for _, np := range nestedKeys {
+		s.NestedRootSpecs = append(s.NestedRootSpecs, NestedRootSpec{
+			Path:       np,
+			ColumnName: s.NestedRoots[np],
+			PathParts:  strings.Split(np, "."),
+		})
+	}
 }
 
 // MergeMappingSpecs deep-merges two Elasticsearch MappingSpecs without losing existing properties or sub-fields.
@@ -202,6 +245,7 @@ func (s *IndexSchema) compileProperties(
 	esPathPrefix []string,
 	jsonPathPrefix []string,
 	activeNestedRoot string,
+	nestedRootDepth int,
 	props map[string]esast.FieldProperty,
 ) {
 	keys := make([]string, 0, len(props))
@@ -220,19 +264,19 @@ func (s *IndexSchema) compileProperties(
 			corrCol := "n__" + SanitizeDorisIdentifier(dotPath)
 			s.NestedRoots[dotPath] = corrCol
 			if len(prop.Properties) > 0 {
-				s.compileProperties(currESPath, currJSONPath, dotPath, prop.Properties)
+				s.compileProperties(currESPath, currJSONPath, dotPath, len(currJSONPath), prop.Properties)
 			}
 			continue
 		}
 
 		// Recurse into sub-object properties if present
 		if len(prop.Properties) > 0 {
-			s.compileProperties(currESPath, currJSONPath, activeNestedRoot, prop.Properties)
+			s.compileProperties(currESPath, currJSONPath, activeNestedRoot, nestedRootDepth, prop.Properties)
 		}
 
 		// If leaf type is declared, register the field binding
 		if prop.Type != "" && !strings.EqualFold(prop.Type, "object") {
-			s.registerLeafField(dotPath, currJSONPath, activeNestedRoot, prop)
+			s.registerLeafField(dotPath, currJSONPath, activeNestedRoot, nestedRootDepth, prop)
 		}
 
 		// Register multi-fields (e.g. `name.keyword`, `name.ngram`)
@@ -246,7 +290,7 @@ func (s *IndexSchema) compileProperties(
 				subProp := prop.Fields[subKey]
 				multiDotPath := dotPath + "." + subKey
 				// Multi-fields read from the same `currJSONPath` in `_source`!
-				s.registerLeafField(multiDotPath, currJSONPath, activeNestedRoot, subProp)
+				s.registerLeafField(multiDotPath, currJSONPath, activeNestedRoot, nestedRootDepth, subProp)
 				if subKey == "keyword" {
 					if baseBinding, ok := s.Fields[dotPath]; ok && baseBinding.Kind == StoragePromotedScalar {
 						baseBinding.KeywordCompanion = s.Fields[multiDotPath].ColumnName
@@ -262,6 +306,7 @@ func (s *IndexSchema) registerLeafField(
 	dotPath string,
 	sourceJSONPath []string,
 	activeNestedRoot string,
+	nestedRootDepth int,
 	prop esast.FieldProperty,
 ) {
 	dorisType := mapESTypeToDoris(prop.Type)
@@ -269,7 +314,10 @@ func (s *IndexSchema) registerLeafField(
 
 	if activeNestedRoot != "" {
 		corrCol := s.NestedRoots[activeNestedRoot]
-		relPrefixLen := len(strings.Split(activeNestedRoot, "."))
+		relPrefixLen := nestedRootDepth
+		if relPrefixLen > len(sourceJSONPath) {
+			relPrefixLen = len(sourceJSONPath)
+		}
 		relJSONPath := sourceJSONPath[relPrefixLen:]
 		prefilterCol := "n__" + SanitizeDorisIdentifier(dotPath)
 		s.Fields[dotPath] = FieldBinding{
@@ -409,5 +457,11 @@ func SanitizeDorisIdentifier(name string) string {
 			_, _ = fmt.Fprintf(&sb, "_%x_", r)
 		}
 	}
-	return sb.String()
+	res := sb.String()
+	if len(res) > 56 {
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(res))
+		res = fmt.Sprintf("%s_%08x", res[:47], h.Sum32())
+	}
+	return res
 }

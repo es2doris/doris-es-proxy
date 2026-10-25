@@ -416,6 +416,7 @@ type AggSpec struct {
 	Histogram     *HistogramAggSpec     `json:"histogram,omitempty"`
 	Range         *RangeAggSpec         `json:"range,omitempty"`
 	Filter        *Query                `json:"filter,omitempty"`
+	Filters       *FiltersAggSpec       `json:"filters,omitempty"`
 	Missing       *ExistsQuery          `json:"missing,omitempty"`
 	Nested        *NestedAggSpec        `json:"nested,omitempty"`
 	Cardinality   *MetricAggSpec        `json:"cardinality,omitempty"`
@@ -424,8 +425,33 @@ type AggSpec struct {
 	Sum           *MetricAggSpec        `json:"sum,omitempty"`
 	Min           *MetricAggSpec        `json:"min,omitempty"`
 	Max           *MetricAggSpec        `json:"max,omitempty"`
+	Stats         *MetricAggSpec        `json:"stats,omitempty"`
+	Percentiles   *PercentilesAggSpec   `json:"percentiles,omitempty"`
+	TopHits       *TopHitsAggSpec       `json:"top_hits,omitempty"`
 	Aggs          map[string]AggSpec    `json:"aggs,omitempty"`
 	Aggregations  map[string]AggSpec    `json:"aggregations,omitempty"`
+}
+
+type FiltersAggSpec struct {
+	Filters map[string]Query `json:"filters,omitempty"`
+}
+
+type PercentilesAggSpec struct {
+	Field    string    `json:"field"`
+	Percents []float64 `json:"percents,omitempty"`
+}
+
+func (p *PercentilesAggSpec) EffectivePercents() []float64 {
+	if len(p.Percents) > 0 {
+		return p.Percents
+	}
+	return []float64{1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0}
+}
+
+type TopHitsAggSpec struct {
+	Size   *int          `json:"size,omitempty"`
+	Sort   SortSlice     `json:"sort,omitempty"`
+	Source *SourceFilter `json:"_source,omitempty"`
 }
 
 func (a *AggSpec) SubAggs() map[string]AggSpec {
@@ -729,6 +755,18 @@ type BulkOperation struct {
 	Source json.RawMessage // Verbatim raw JSON line for `_source` (or update payload)
 }
 
+type bulkActionMeta struct {
+	Index string `json:"_index"`
+	ID    string `json:"_id"`
+}
+
+type bulkActionLine struct {
+	Index  *bulkActionMeta `json:"index,omitempty"`
+	Create *bulkActionMeta `json:"create,omitempty"`
+	Update *bulkActionMeta `json:"update,omitempty"`
+	Delete *bulkActionMeta `json:"delete,omitempty"`
+}
+
 // ParseBulkNDJSON parses an Elasticsearch `/_bulk` two-line NDJSON stream while preserving
 // the exact byte slice of each document line as `json.RawMessage` for zero-copy `_source` fidelity.
 func ParseBulkNDJSON(r io.Reader, defaultIndex string) ([]BulkOperation, error) {
@@ -742,25 +780,35 @@ func ParseBulkNDJSON(r io.Reader, defaultIndex string) ([]BulkOperation, error) 
 		if len(line) == 0 {
 			continue
 		}
-		var actionEnvelope map[string]struct {
-			Index string `json:"_index"`
-			ID    string `json:"_id"`
-		}
-		if err := json.Unmarshal(line, &actionEnvelope); err != nil {
+		var actionLine bulkActionLine
+		if err := json.Unmarshal(line, &actionLine); err != nil {
 			return nil, fmt.Errorf("invalid bulk action metadata line: %w", err)
 		}
 		var op BulkOperation
-		for act, meta := range actionEnvelope {
-			op.Action = act
-			op.Index = meta.Index
-			if op.Index == "" {
-				op.Index = defaultIndex
-			}
-			op.ID = meta.ID
-			if op.ID == "" && (act == "index" || act == "create") {
-				op.ID = NextAutoID()
-			}
-			break
+		var meta *bulkActionMeta
+		switch {
+		case actionLine.Index != nil:
+			op.Action = "index"
+			meta = actionLine.Index
+		case actionLine.Create != nil:
+			op.Action = "create"
+			meta = actionLine.Create
+		case actionLine.Update != nil:
+			op.Action = "update"
+			meta = actionLine.Update
+		case actionLine.Delete != nil:
+			op.Action = "delete"
+			meta = actionLine.Delete
+		default:
+			return nil, fmt.Errorf("invalid bulk action metadata line: missing index/create/update/delete action")
+		}
+		op.Index = meta.Index
+		if op.Index == "" {
+			op.Index = defaultIndex
+		}
+		op.ID = meta.ID
+		if op.ID == "" && (op.Action == "index" || op.Action == "create") {
+			op.ID = NextAutoID()
 		}
 		if op.Action != "delete" {
 			if !scanner.Scan() {

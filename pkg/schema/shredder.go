@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -56,7 +57,9 @@ func ShredDocument(
 	}
 
 	var parsedDoc map[string]any
-	if err := json.Unmarshal(trimmed, &parsedDoc); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.UseNumber()
+	if err := dec.Decode(&parsedDoc); err != nil {
 		return nil, fmt.Errorf("invalid document JSON for _id=%q: %w", id, err)
 	}
 
@@ -67,18 +70,31 @@ func ShredDocument(
 	row["_source"] = string(trimmed)
 	row["_doc"] = json.RawMessage(trimmed)
 
-	var allTextParts []string
-	collectAllTextStrings(parsedDoc, &allTextParts)
-	row["_all_text"] = strings.Join(allTextParts, " ")
+	var allTextBuilder strings.Builder
+	allTextBuilder.Grow(len(trimmed) / 2)
+	collectAllTextBuilder(parsedDoc, &allTextBuilder)
+	row["_all_text"] = allTextBuilder.String()
 
-	now := time.Now().UTC()
+	var now time.Time
+	getNow := func() time.Time {
+		if now.IsZero() {
+			now = time.Now().UTC()
+		}
+		return now
+	}
 
 	// Populate promoted scalar, multi-valued array, and nested pre-filter columns
-	for _, b := range s.Fields {
+	fieldsToVisit := s.OrderedFields
+	if len(fieldsToVisit) == 0 && len(s.Fields) > 0 {
+		for _, b := range s.Fields {
+			fieldsToVisit = append(fieldsToVisit, b)
+		}
+	}
+	for _, b := range fieldsToVisit {
 		switch b.Kind {
 		case StoragePromotedScalar:
 			val := extractScalarValue(parsedDoc, b.SourceJSONPath)
-			val = coerceScalarForDoris(val, b.DorisType, b.LowercaseNormalizer, now)
+			val = coerceScalarForDoris(val, b.DorisType, b.LowercaseNormalizer, getNow())
 			if val != nil {
 				row[b.ColumnName] = val
 			}
@@ -91,18 +107,34 @@ func ShredDocument(
 	}
 
 	// Populate correlated nested JSON element arrays (`n__<nested_path>`)
-	for nestedPath, corrCol := range s.NestedRoots {
-		pathParts := strings.Split(nestedPath, ".")
-		rawElements := extractNestedElementMaps(parsedDoc, pathParts)
-		if len(rawElements) > 0 {
-			serializedElems := make([]string, 0, len(rawElements))
-			for _, elemMap := range rawElements {
-				encoded, err := json.Marshal(elemMap)
-				if err == nil {
-					serializedElems = append(serializedElems, string(encoded))
+	if len(s.NestedRootSpecs) > 0 {
+		for _, nr := range s.NestedRootSpecs {
+			rawElements := extractNestedElementMaps(parsedDoc, nr.PathParts)
+			if len(rawElements) > 0 {
+				serializedElems := make([]string, 0, len(rawElements))
+				for _, elemMap := range rawElements {
+					encoded, err := json.Marshal(elemMap)
+					if err == nil {
+						serializedElems = append(serializedElems, string(encoded))
+					}
 				}
+				row[nr.ColumnName] = serializedElems
 			}
-			row[corrCol] = serializedElems
+		}
+	} else {
+		for nestedPath, corrCol := range s.NestedRoots {
+			pathParts := strings.Split(nestedPath, ".")
+			rawElements := extractNestedElementMaps(parsedDoc, pathParts)
+			if len(rawElements) > 0 {
+				serializedElems := make([]string, 0, len(rawElements))
+				for _, elemMap := range rawElements {
+					encoded, err := json.Marshal(elemMap)
+					if err == nil {
+						serializedElems = append(serializedElems, string(encoded))
+					}
+				}
+				row[corrCol] = serializedElems
+			}
 		}
 	}
 
@@ -435,19 +467,27 @@ func extractNestedElementMaps(node any, path []string) []map[string]any {
 	return extractNestedElementMaps(m[path[0]], path[1:])
 }
 
-func collectAllTextStrings(node any, out *[]string) {
+func collectAllTextBuilder(node any, sb *strings.Builder) {
 	switch v := node.(type) {
 	case string:
 		if v != "" {
-			*out = append(*out, v)
+			if sb.Len() > 0 {
+				sb.WriteByte(' ')
+			}
+			sb.WriteString(v)
 		}
 	case map[string]any:
-		for _, child := range v {
-			collectAllTextStrings(child, out)
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			collectAllTextBuilder(v[k], sb)
 		}
 	case []any:
 		for _, child := range v {
-			collectAllTextStrings(child, out)
+			collectAllTextBuilder(child, sb)
 		}
 	}
 }

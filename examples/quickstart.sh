@@ -222,4 +222,13 @@ curl -fsS -X POST "${ES_URL}/table_search_index/_doris/explain" \
   }' | pretty_json
 
 echo ""
+echo "================================================================================"
+echo " 8. Auto-Indexing Advisor & Unindexed Variant Detection (GET /_doris/slowlog)"
+echo "================================================================================"
+curl -fsS -X POST "${ES_URL}/table_search_index/_search" \
+  -H "Content-Type: application/json" \
+  -d '{"query": {"term": {"customGovernanceOwner": "data-platform"}}}' >/dev/null
+curl -fsS "${ES_URL}/_doris/slowlog" | pretty_json
+
+echo ""
 echo "==> Quickstart demo completed successfully!"

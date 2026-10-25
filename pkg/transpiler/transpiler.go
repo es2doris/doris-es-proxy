@@ -37,12 +37,20 @@ type CompiledQuery struct {
 	UsesFulltextMatch bool
 }
 
+const (
+	DefaultMaxResultWindow = 10_000
+	DefaultMaxAggBuckets   = 10_000
+)
+
 // ExecutionPlan represents the Doris SQL queries generated for an Elasticsearch `/_search` request.
 type ExecutionPlan struct {
 	// Query 1: Paginated Top-K hits + window total count (empty when `size == 0`)
 	HitsSQL string
 	// Query 2: Consolidated Nereids Multi-Cast CTE query for all aggregations (or total count if `size == 0`)
 	AggsSQL string
+	// UnindexedVariantFields lists dynamic `_doc[...]` fields accessed by this query that are not yet
+	// promoted to physical `f__*` columns with `USING INVERTED` indexes.
+	UnindexedVariantFields []string
 }
 
 // TranspilerOptions configures dialect features for the Doris SQL compiler.
@@ -51,15 +59,22 @@ type TranspilerOptions struct {
 	// Apache Doris 4.0's native `SEARCH('<dsl>', '<default_field>', '<default_op>')` function
 	// and `score()` projection.
 	UseDoris4SearchFunc bool
+	MaxResultWindow     int
+	MaxAggBuckets       int
 }
 
 type Transpiler struct {
-	Schema *schema.IndexSchema
-	Opts   TranspilerOptions
+	Schema          *schema.IndexSchema
+	Opts            TranspilerOptions
+	unindexedFields map[string]bool
 }
 
 func NewTranspiler(s *schema.IndexSchema, opts TranspilerOptions) *Transpiler {
-	return &Transpiler{Schema: s, Opts: opts}
+	return &Transpiler{
+		Schema:          s,
+		Opts:            opts,
+		unindexedFields: make(map[string]bool),
+	}
 }
 
 type nestedCtx struct {
@@ -69,6 +84,8 @@ type nestedCtx struct {
 
 // BuildSearchPlan compiles an Elasticsearch `SearchRequest` into a Doris `ExecutionPlan`.
 func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, error) {
+	t.unindexedFields = make(map[string]bool)
+
 	mainQ := CompiledQuery{
 		WhereSQL: "TRUE",
 		ScoreSQL: "1.0",
@@ -89,6 +106,22 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 	size := 10
 	if req.Size != nil {
 		size = *req.Size
+	}
+	if size < 0 {
+		size = 0
+	}
+
+	maxWin := t.Opts.MaxResultWindow
+	if maxWin <= 0 {
+		maxWin = DefaultMaxResultWindow
+	}
+	if len(req.SearchAfter) == 0 && from+size > maxWin {
+		if from >= maxWin {
+			from = maxWin
+			size = 0
+		} else {
+			size = maxWin - from
+		}
 	}
 
 	plan := &ExecutionPlan{}
@@ -154,6 +187,15 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 	aggs := req.EffectiveAggs()
 	if len(aggs) > 0 || size == 0 {
 		plan.AggsSQL = t.buildAggsCTESQL(mainQ.WhereSQL, aggs)
+	}
+
+	if len(t.unindexedFields) > 0 {
+		fields := make([]string, 0, len(t.unindexedFields))
+		for f := range t.unindexedFields {
+			fields = append(fields, f)
+		}
+		sort.Strings(fields)
+		plan.UnindexedVariantFields = fields
 	}
 
 	return plan, nil
@@ -674,7 +716,7 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 			if b.IsMultiValued {
 				return fmt.Sprintf("(%s LIKE %s)", nctx.elemVar, quoteStr("%"+fmt.Sprintf("%v", val)+"%"))
 			}
-			return fmt.Sprintf("json_extract_string(%s, '%s') = %s", nctx.elemVar, relPath, quoteStr(fmt.Sprintf("%v", val)))
+			return fmt.Sprintf("json_extract_string(%s, %s) = %s", nctx.elemVar, quoteStr(relPath), quoteStr(fmt.Sprintf("%v", val)))
 		}
 		if b.PrefilterArrayCol != "" {
 			return fmt.Sprintf("array_contains(`%s`, %s)", b.PrefilterArrayCol, quoteStr(fmt.Sprintf("%v", val)))
@@ -852,10 +894,7 @@ func (t *Transpiler) appendAggBranches(
 		spec := aggs[name]
 		switch {
 		case spec.Terms != nil:
-			size := spec.Terms.Size
-			if size <= 0 {
-				size = 10
-			}
+			size := t.capBucketSize(spec.Terms.Size)
 			b := t.Schema.ResolveField(spec.Terms.Field)
 			*subIdx++
 			if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
@@ -868,6 +907,11 @@ func (t *Transpiler) appendAggBranches(
 						") `_agg_sub_%d`",
 					quoteStr(fullAggName), b.ColumnName, wherePrefix, size, *subIdx,
 				))
+				if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+					t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, "CAST(`_elem` AS STRING)",
+						fmt.Sprintf("`base_matched` LATERAL VIEW EXPLODE(`%s`) `_t` AS `_elem`", b.ColumnName),
+						fmt.Sprintf("%s`_elem` IS NOT NULL", wherePrefix), subAggs)
+				}
 			} else {
 				col := t.sqlColumnRef(spec.Terms.Field, true, nil)
 				*branches = append(*branches, fmt.Sprintf(
@@ -879,6 +923,10 @@ func (t *Transpiler) appendAggBranches(
 						") `_agg_sub_%d`",
 					quoteStr(fullAggName), col, wherePrefix, col, col, size, *subIdx,
 				))
+				if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+					t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, fmt.Sprintf("CAST(%s AS STRING)", col),
+						"`base_matched`", fmt.Sprintf("%s%s IS NOT NULL", wherePrefix, col), subAggs)
+				}
 			}
 
 		case spec.Nested != nil:
@@ -895,20 +943,18 @@ func (t *Transpiler) appendAggBranches(
 			for _, subName := range subNames {
 				subSpec := subAggs[subName]
 				if subSpec.Terms != nil {
-					size := subSpec.Terms.Size
-					if size <= 0 {
-						size = 10
-					}
+					size := t.capBucketSize(subSpec.Terms.Size)
 					relKey := strings.TrimPrefix(subSpec.Terms.Field, spec.Nested.Path+".")
+					relJSONPath := quoteStr("$." + relKey)
 					*subIdx++
 					*branches = append(*branches, fmt.Sprintf(
 						"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
-							"SELECT %s AS `_agg_name`, json_extract_string(`_nel`, '$.%s') AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+							"SELECT %s AS `_agg_name`, json_extract_string(`_nel`, %s) AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
 							"FROM `base_matched` LATERAL VIEW EXPLODE(`%s`) `_nt` AS `_nel` "+
-							"WHERE %sjson_extract_string(`_nel`, '$.%s') IS NOT NULL "+
+							"WHERE %sjson_extract_string(`_nel`, %s) IS NOT NULL "+
 							"GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT %d"+
 							") `_agg_sub_%d`",
-						quoteStr(fullAggName+"."+subName), relKey, corrCol, wherePrefix, relKey, size, *subIdx,
+						quoteStr(fullAggName+"."+subName), relJSONPath, corrCol, wherePrefix, relJSONPath, size, *subIdx,
 					))
 				}
 			}
@@ -926,6 +972,29 @@ func (t *Transpiler) appendAggBranches(
 			))
 			if subAggs := spec.SubAggs(); len(subAggs) > 0 {
 				t.appendAggBranches(branches, subIdx, fullAggName, combinedWhere, subAggs)
+			}
+
+		case spec.Filters != nil && len(spec.Filters.Filters) > 0:
+			fKeys := make([]string, 0, len(spec.Filters.Filters))
+			for fk := range spec.Filters.Filters {
+				fKeys = append(fKeys, fk)
+			}
+			sort.Strings(fKeys)
+			for _, fk := range fKeys {
+				fq := spec.Filters.Filters[fk]
+				cond := t.CompileQuery(&fq, false, nil)
+				combinedWhere := cond.WhereSQL
+				if extraWhere != "" {
+					combinedWhere = fmt.Sprintf("(%s) AND (%s)", extraWhere, cond.WhereSQL)
+				}
+				*branches = append(*branches, fmt.Sprintf(
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+						"FROM `base_matched` WHERE %s",
+					quoteStr(fullAggName), quoteStr(fk), combinedWhere,
+				))
+				if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+					t.appendBucketScopedSubAggs(branches, subIdx, fullAggName, fk, combinedWhere, subAggs)
+				}
 			}
 
 		case spec.Missing != nil:
@@ -966,21 +1035,70 @@ func (t *Transpiler) appendAggBranches(
 		case spec.Max != nil:
 			t.appendMetricAggBranch(branches, fullAggName, "MAX", spec.Max.Field, extraWhere)
 		case spec.ValueCount != nil:
-			t.appendMetricAggBranch(branches, fullAggName, "COUNT", spec.ValueCount.Field, extraWhere)
+			t.appendValueCountAggBranch(branches, fullAggName, spec.ValueCount.Field, extraWhere)
+
+		case spec.Stats != nil:
+			col := t.sqlNumericColumnRef(spec.Stats.Field, nil)
+			wClause := ""
+			if extraWhere != "" {
+				wClause = " WHERE " + extraWhere
+			}
+			for _, statOp := range []struct{ key, fn string }{
+				{"_stats_count", "COUNT"},
+				{"_stats_min", "MIN"},
+				{"_stats_max", "MAX"},
+				{"_stats_avg", "AVG"},
+				{"_stats_sum", "SUM"},
+			} {
+				*branches = append(*branches, fmt.Sprintf(
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(%s(%s), 0) AS DOUBLE) AS `_doc_count` "+
+						"FROM `base_matched`%s",
+					quoteStr(fullAggName), quoteStr(statOp.key), statOp.fn, col, wClause,
+				))
+			}
+
+		case spec.Percentiles != nil:
+			col := t.sqlNumericColumnRef(spec.Percentiles.Field, nil)
+			wClause := ""
+			if extraWhere != "" {
+				wClause = " WHERE " + extraWhere
+			}
+			for _, pct := range spec.Percentiles.EffectivePercents() {
+				q := pct / 100.0
+				if q < 0 {
+					q = 0
+				} else if q > 1 {
+					q = 1
+				}
+				pctKey := strconv.FormatFloat(pct, 'f', -1, 64)
+				if !strings.Contains(pctKey, ".") {
+					pctKey += ".0"
+				}
+				*branches = append(*branches, fmt.Sprintf(
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(PERCENTILE_APPROX(%s, %.4f), 0) AS DOUBLE) AS `_doc_count` "+
+						"FROM `base_matched`%s",
+					quoteStr(fullAggName), quoteStr(pctKey), col, q, wClause,
+				))
+			}
 
 		case spec.DateHistogram != nil:
 			intervalMs := spec.DateHistogram.EffectiveIntervalMs()
 			col := t.sqlNumericColumnRef(spec.DateHistogram.Field, nil)
+			bucketExpr := fmt.Sprintf("CAST(CAST(FLOOR(%s / %d) * %d AS BIGINT) AS STRING)", col, intervalMs, intervalMs)
 			*subIdx++
 			*branches = append(*branches, fmt.Sprintf(
 				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
-					"SELECT %s AS `_agg_name`, CAST(CAST(FLOOR(%s / %d) * %d AS BIGINT) AS STRING) AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
 					"FROM `base_matched` "+
 					"WHERE %s%s IS NOT NULL "+
 					"GROUP BY `_bucket_key` ORDER BY CAST(`_bucket_key` AS BIGINT) ASC"+
 					") `_agg_sub_%d`",
-				quoteStr(fullAggName), col, intervalMs, intervalMs, wherePrefix, col, *subIdx,
+				quoteStr(fullAggName), bucketExpr, wherePrefix, col, *subIdx,
 			))
+			if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+				t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, bucketExpr,
+					"`base_matched`", fmt.Sprintf("%s%s IS NOT NULL", wherePrefix, col), subAggs)
+			}
 
 		case spec.Histogram != nil:
 			interval := spec.Histogram.Interval
@@ -989,16 +1107,21 @@ func (t *Transpiler) appendAggBranches(
 			}
 			offset := spec.Histogram.Offset
 			col := t.sqlNumericColumnRef(spec.Histogram.Field, nil)
+			bucketExpr := fmt.Sprintf("CAST(FLOOR((%s - %v) / %v) * %v + %v AS STRING)", col, offset, interval, interval, offset)
 			*subIdx++
 			*branches = append(*branches, fmt.Sprintf(
 				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
-					"SELECT %s AS `_agg_name`, CAST(FLOOR((%s - %v) / %v) * %v + %v AS STRING) AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
 					"FROM `base_matched` "+
 					"WHERE %s%s IS NOT NULL "+
 					"GROUP BY `_bucket_key` ORDER BY CAST(`_bucket_key` AS DOUBLE) ASC"+
 					") `_agg_sub_%d`",
-				quoteStr(fullAggName), col, offset, interval, interval, offset, wherePrefix, col, *subIdx,
+				quoteStr(fullAggName), bucketExpr, wherePrefix, col, *subIdx,
 			))
+			if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+				t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, bucketExpr,
+					"`base_matched`", fmt.Sprintf("%s%s IS NOT NULL", wherePrefix, col), subAggs)
+			}
 
 		case spec.Range != nil:
 			col := t.sqlNumericColumnRef(spec.Range.Field, nil)
@@ -1015,14 +1138,145 @@ func (t *Transpiler) appendAggBranches(
 				if extraWhere != "" {
 					rWhere = fmt.Sprintf("(%s) AND (%s)", extraWhere, rWhere)
 				}
+				bKey := rng.EffectiveKey()
 				*branches = append(*branches, fmt.Sprintf(
 					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
 						"FROM `base_matched` WHERE %s",
-					quoteStr(fullAggName), quoteStr(rng.EffectiveKey()), rWhere,
+					quoteStr(fullAggName), quoteStr(bKey), rWhere,
 				))
+				if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+					t.appendBucketScopedSubAggs(branches, subIdx, fullAggName, bKey, rWhere, subAggs)
+				}
 			}
 		}
 	}
+}
+
+func (t *Transpiler) capBucketSize(size int) int {
+	if size <= 0 {
+		return 10
+	}
+	maxBuckets := t.Opts.MaxAggBuckets
+	if maxBuckets <= 0 {
+		maxBuckets = DefaultMaxAggBuckets
+	}
+	if size > maxBuckets {
+		return maxBuckets
+	}
+	return size
+}
+
+func (t *Transpiler) appendValueCountAggBranch(branches *[]string, fullAggName, field, extraWhere string) {
+	b := t.Schema.ResolveField(field)
+	wherePrefix := ""
+	if extraWhere != "" {
+		wherePrefix = fmt.Sprintf("(%s) AND ", extraWhere)
+	}
+	if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
+		*branches = append(*branches, fmt.Sprintf(
+			"SELECT %s AS `_agg_name`, '_metric' AS `_bucket_key`, CAST(COUNT(`_elem`) AS DOUBLE) AS `_doc_count` "+
+				"FROM `base_matched` LATERAL VIEW EXPLODE(`%s`) `_t` AS `_elem` WHERE %s`_elem` IS NOT NULL",
+			quoteStr(fullAggName), b.ColumnName, wherePrefix,
+		))
+		return
+	}
+	col := t.sqlColumnRef(field, true, nil)
+	wClause := ""
+	if extraWhere != "" {
+		wClause = " WHERE " + extraWhere
+	}
+	*branches = append(*branches, fmt.Sprintf(
+		"SELECT %s AS `_agg_name`, '_metric' AS `_bucket_key`, CAST(COUNT(%s) AS DOUBLE) AS `_doc_count` "+
+			"FROM `base_matched`%s",
+		quoteStr(fullAggName), col, wClause,
+	))
+}
+
+func (t *Transpiler) appendGroupedBucketSubAggs(
+	branches *[]string,
+	subIdx *int,
+	parentAggName string,
+	parentBucketExpr string,
+	fromClause string,
+	whereClause string,
+	subAggs map[string]esast.AggSpec,
+) {
+	subNames := make([]string, 0, len(subAggs))
+	for k := range subAggs {
+		subNames = append(subNames, k)
+	}
+	sort.Strings(subNames)
+
+	for _, subName := range subNames {
+		subSpec := subAggs[subName]
+		subFull := parentAggName + "." + subName
+		switch {
+		case subSpec.Avg != nil:
+			col := t.sqlNumericColumnRef(subSpec.Avg.Field, nil)
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(AVG(%s), 0) AS DOUBLE) AS `_doc_count` "+
+					"FROM %s WHERE %s GROUP BY `_bucket_key`",
+				quoteStr(subFull), parentBucketExpr, col, fromClause, whereClause,
+			))
+		case subSpec.Sum != nil:
+			col := t.sqlNumericColumnRef(subSpec.Sum.Field, nil)
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(SUM(%s), 0) AS DOUBLE) AS `_doc_count` "+
+					"FROM %s WHERE %s GROUP BY `_bucket_key`",
+				quoteStr(subFull), parentBucketExpr, col, fromClause, whereClause,
+			))
+		case subSpec.Min != nil:
+			col := t.sqlNumericColumnRef(subSpec.Min.Field, nil)
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(MIN(%s), 0) AS DOUBLE) AS `_doc_count` "+
+					"FROM %s WHERE %s GROUP BY `_bucket_key`",
+				quoteStr(subFull), parentBucketExpr, col, fromClause, whereClause,
+			))
+		case subSpec.Max != nil:
+			col := t.sqlNumericColumnRef(subSpec.Max.Field, nil)
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(MAX(%s), 0) AS DOUBLE) AS `_doc_count` "+
+					"FROM %s WHERE %s GROUP BY `_bucket_key`",
+				quoteStr(subFull), parentBucketExpr, col, fromClause, whereClause,
+			))
+		case subSpec.ValueCount != nil:
+			col := t.sqlColumnRef(subSpec.ValueCount.Field, true, nil)
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(%s) AS DOUBLE) AS `_doc_count` "+
+					"FROM %s WHERE %s GROUP BY `_bucket_key`",
+				quoteStr(subFull), parentBucketExpr, col, fromClause, whereClause,
+			))
+		case subSpec.Cardinality != nil:
+			col := t.sqlColumnRef(subSpec.Cardinality.Field, true, nil)
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(DISTINCT %s) AS DOUBLE) AS `_doc_count` "+
+					"FROM %s WHERE %s GROUP BY `_bucket_key`",
+				quoteStr(subFull), parentBucketExpr, col, fromClause, whereClause,
+			))
+		case subSpec.Terms != nil:
+			col := t.sqlColumnRef(subSpec.Terms.Field, true, nil)
+			*subIdx++
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
+					"SELECT %s AS `_agg_name`, CONCAT(%s, '\\x1f', CAST(%s AS STRING)) AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+					"FROM %s WHERE (%s) AND %s IS NOT NULL "+
+					"GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC"+
+					") `_agg_sub_%d`",
+				quoteStr(subFull), parentBucketExpr, col, fromClause, whereClause, col, *subIdx,
+			))
+		}
+	}
+}
+
+func (t *Transpiler) appendBucketScopedSubAggs(
+	branches *[]string,
+	subIdx *int,
+	parentAggName string,
+	parentBucketKey string,
+	bucketWhere string,
+	subAggs map[string]esast.AggSpec,
+) {
+	t.appendGroupedBucketSubAggs(branches, subIdx, parentAggName, quoteStr(parentBucketKey), "`base_matched`", bucketWhere, subAggs)
 }
 
 func (t *Transpiler) appendMetricAggBranch(branches *[]string, fullAggName, sqlFunc, field, extraWhere string) {
@@ -1151,15 +1405,18 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 	case schema.StorageNestedSubfield:
 		if nctx != nil && nctx.nestedPath == b.NestedPath {
 			relPath := "$." + strings.Join(b.RelativeJSONPath, ".")
-			return fmt.Sprintf("json_extract_string(%s, '%s')", nctx.elemVar, relPath)
+			return fmt.Sprintf("json_extract_string(%s, %s)", nctx.elemVar, quoteStr(relPath))
 		}
 		if b.PrefilterArrayCol != "" {
 			return fmt.Sprintf("`%s`", b.PrefilterArrayCol)
 		}
 	}
+	if t.unindexedFields != nil && field != "" {
+		t.unindexedFields[strings.TrimSuffix(field, ".keyword")] = true
+	}
 	var pathBuilder strings.Builder
 	for _, seg := range b.SourceJSONPath {
-		_, _ = fmt.Fprintf(&pathBuilder, "['%s']", strings.ReplaceAll(seg, "'", "''"))
+		_, _ = fmt.Fprintf(&pathBuilder, "[%s]", quoteStr(seg))
 	}
 	castType := "STRING"
 	switch v := sampleVal.(type) {
@@ -1213,6 +1470,8 @@ func quoteStr(s string) string {
 
 func quoteValue(v any) string {
 	switch val := v.(type) {
+	case nil:
+		return "NULL"
 	case string:
 		return quoteStr(val)
 	case bool:

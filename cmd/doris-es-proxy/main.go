@@ -28,7 +28,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -38,6 +40,13 @@ import (
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
 	"github.com/es2doris/doris-es-proxy/pkg/transpiler"
 )
+
+func envOrDefault(key, fallback string) string {
+	if val := strings.TrimSpace(os.Getenv(key)); val != "" {
+		return val
+	}
+	return fallback
+}
 
 func main() {
 	if len(os.Args) > 1 {
@@ -52,12 +61,13 @@ func main() {
 	}
 
 	var (
-		listenAddr          = flag.String("listen", ":9200", "Elasticsearch HTTP REST listen address")
-		dorisDSN            = flag.String("doris-dsn", "root:@tcp(127.0.0.1:9030)/?interpolateParams=true&timeout=5s&readTimeout=30s&writeTimeout=30s", "Apache Doris FE MySQL wire protocol DSN")
-		dorisHTTP           = flag.String("doris-http", "http://127.0.0.1:8030", "Apache Doris FE HTTP endpoint for Stream Load")
-		dorisUser           = flag.String("doris-user", "root", "Apache Doris username")
-		dorisPassword       = flag.String("doris-password", "", "Apache Doris password")
-		dorisDB             = flag.String("doris-db", "es_compat", "Target Apache Doris database name")
+		listenAddr          = flag.String("listen", envOrDefault("LISTEN_ADDR", ":9200"), "Elasticsearch HTTP REST listen address (env: LISTEN_ADDR)")
+		dorisDSN            = flag.String("doris-dsn", envOrDefault("DORIS_DSN", "root:@tcp(127.0.0.1:9030)/?interpolateParams=true&timeout=5s&readTimeout=30s&writeTimeout=30s"), "Apache Doris FE MySQL wire protocol DSN (env: DORIS_DSN)")
+		dorisHTTP           = flag.String("doris-http", envOrDefault("DORIS_HTTP", "http://127.0.0.1:8030"), "Apache Doris FE HTTP endpoint for Stream Load (env: DORIS_HTTP)")
+		dorisUser           = flag.String("doris-user", envOrDefault("DORIS_USER", "root"), "Apache Doris username (env: DORIS_USER)")
+		dorisPassword       = flag.String("doris-password", envOrDefault("DORIS_PASSWORD", ""), "Apache Doris password (env: DORIS_PASSWORD)")
+		dorisDB             = flag.String("doris-db", envOrDefault("DORIS_DB", "es_compat"), "Target Apache Doris database name (env: DORIS_DB)")
+		shadowESURL         = flag.String("shadow-es-url", envOrDefault("SHADOW_ES_URL", ""), "Optional legacy Elasticsearch URL for dual-read shadow parity verification (env: SHADOW_ES_URL)")
 		useDoris4SearchFunc = flag.Bool("doris4-search-fn", false, "Push query_string down to Apache Doris 4.0 SEARCH() SQL function")
 		inMemoryMode        = flag.Bool("in-memory", false, "Run with in-memory shredded Doris emulator (zero external containers required)")
 		logSQL              = flag.Bool("log-sql", false, "Log transpiled Apache Doris DDL, Stream Load, HitsSQL, and AggsSQL")
@@ -107,6 +117,10 @@ func main() {
 	srv := proxy.NewServer(*dorisDB, backend, transpiler.TranspilerOptions{
 		UseDoris4SearchFunc: *useDoris4SearchFunc,
 	})
+	if *shadowESURL != "" {
+		srv.SetShadowESURL(*shadowESURL)
+		log.Printf("shadow dual-read verification enabled against %s (metrics at GET /_doris/shadow_stats)", *shadowESURL)
+	}
 	bootCtx, bootCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := srv.BootstrapCatalog(bootCtx); err != nil {
 		log.Printf("warning: initial _es_catalog bootstrap deferred: %v", err)
@@ -117,7 +131,22 @@ func main() {
 		Addr:              *listenAddr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
+
+	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		<-sigCtx.Done()
+		log.Printf("shutting down doris-es-proxy gracefully...")
+		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(shutCtx)
+	}()
 
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server exited: %v", err)

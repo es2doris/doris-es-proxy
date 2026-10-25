@@ -18,8 +18,11 @@
 package e2e_test
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -332,5 +335,243 @@ func TestV02ExplainPaginationAggsAndStatelessCatalog_E2E(t *testing.T) {
 	cHits := collapseRes["hits"].(map[string]any)["hits"].([]any)
 	if len(cHits) != 3 {
 		t.Fatalf("expected 3 collapsed hits (1 per distinct platform), got %d: %+v", len(cHits), cHits)
+	}
+}
+
+func TestV03SecurityGzipSubAggsShadowSlowlogAndEcosystem_E2E(t *testing.T) {
+	backend := NewMemDorisBackend()
+
+	// Spin up Replica 1 and Replica 2 sharing the same Doris backend (without calling BootstrapCatalog on Replica 2 after Replica 1 creates indices/aliases)
+	replica1 := proxy.NewServer("es_compat", backend, transpiler.TranspilerOptions{})
+	_ = replica1.BootstrapCatalog(context.Background())
+	ts1 := httptest.NewServer(replica1.Handler())
+	defer ts1.Close()
+
+	replica2 := proxy.NewServer("es_compat", backend, transpiler.TranspilerOptions{})
+	_ = replica2.BootstrapCatalog(context.Background())
+	// Configure Replica 2 to shadow-verify against Replica 1!
+	replica2.SetShadowESURL(ts1.URL)
+	ts2 := httptest.NewServer(replica2.Handler())
+	defer ts2.Close()
+
+	// 1. Verify OPTIONS preflight & CORS headers for browser GUIs (Elasticvue, Cerebro, Kibana)
+	optReq, _ := http.NewRequest(http.MethodOptions, ts2.URL+"/logs_alias/_search", nil)
+	optResp, err := http.DefaultClient.Do(optReq)
+	if err != nil || optResp.StatusCode != http.StatusOK {
+		t.Fatalf("OPTIONS preflight failed: status=%v err=%v", optResp.StatusCode, err)
+	}
+	if optResp.Header.Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatalf("expected Access-Control-Allow-Origin: *, got %q", optResp.Header.Get("Access-Control-Allow-Origin"))
+	}
+	_ = optResp.Body.Close()
+
+	// 2. Create `logs_v1` with alias `logs_alias` on Replica 1
+	createJSON := `{
+		"aliases": {"logs_alias": {}},
+		"mappings": {
+			"properties": {
+				"service": {"type": "keyword"},
+				"level": {"type": "keyword"},
+				"latencyMs": {"type": "double"},
+				"timestampMillis": {"type": "date"}
+			}
+		}
+	}`
+	putReq, _ := http.NewRequest(http.MethodPut, ts1.URL+"/logs_v1", strings.NewReader(createJSON))
+	putResp, err := http.DefaultClient.Do(putReq)
+	if err != nil || putResp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT /logs_v1 on Replica 1 failed: status=%v err=%v", putResp.StatusCode, err)
+	}
+	_ = putResp.Body.Close()
+
+	// 3. Send GZIP-compressed `/_bulk` (`Content-Encoding: gzip`) directly to Replica 2 targeting `logs_alias`
+	// Replica 2 must sync `_es_catalog` on alias miss and route to `logs_v1` (without creating an empty `logs_alias` table!)
+	bulkNDJSON := strings.Join([]string{
+		`{"index":{"_index":"logs_alias","_id":"log-1"}}`,
+		`{"service":"checkout","level":"ERROR","latencyMs":120.0,"timestampMillis":1700000000000,"unindexedEnv":"prod"}`,
+		`{"index":{"_index":"logs_alias","_id":"log-2"}}`,
+		`{"service":"checkout","level":"INFO","latencyMs":40.0,"timestampMillis":1700000600000,"unindexedEnv":"prod"}`,
+		`{"index":{"_index":"logs_alias","_id":"log-3"}}`,
+		`{"service":"payments","level":"ERROR","latencyMs":300.0,"timestampMillis":1700003600000,"unindexedEnv":"staging"}`,
+		"",
+	}, "\n")
+	var gzBuf bytes.Buffer
+	gzw := gzip.NewWriter(&gzBuf)
+	_, _ = gzw.Write([]byte(bulkNDJSON))
+	_ = gzw.Close()
+
+	bulkReq, _ := http.NewRequest(http.MethodPost, ts2.URL+"/_bulk?refresh=true", &gzBuf)
+	bulkReq.Header.Set("Content-Encoding", "gzip")
+	bulkReq.Header.Set("Accept-Encoding", "gzip")
+	bulkReq.Header.Set("Content-Type", "application/x-ndjson")
+	bulkResp, err := http.DefaultClient.Do(bulkReq)
+	if err != nil || bulkResp.StatusCode != http.StatusOK {
+		t.Fatalf("gzip POST /_bulk to Replica 2 failed: status=%v err=%v", bulkResp.StatusCode, err)
+	}
+	if bulkResp.Header.Get("Content-Encoding") != "gzip" {
+		t.Fatalf("expected gzip-compressed response when Accept-Encoding: gzip is set, got %q", bulkResp.Header.Get("Content-Encoding"))
+	}
+	gzr, err := gzip.NewReader(bulkResp.Body)
+	if err != nil {
+		t.Fatalf("gzip.NewReader failed: %v", err)
+	}
+	decompressedBulk, _ := io.ReadAll(gzr)
+	_ = gzr.Close()
+	_ = bulkResp.Body.Close()
+	if !bytes.Contains(decompressedBulk, []byte(`"errors":false`)) {
+		t.Fatalf("expected errors:false in decompressed bulk response, got: %s", string(decompressedBulk))
+	}
+
+	// 4. Query `logs_alias` on Replica 2 with:
+	// - dynamic VARIANT filter (`unindexedEnv: "prod"`) to trigger Auto-Indexing Advisor
+	// - string `value_count` aggregation on `service`
+	// - `stats` and `percentiles` on `latencyMs`
+	// - `filters` aggregation (`errors` vs `infos`)
+	// - Bucket Sub-Aggregations (`by_service` -> `avg_latency` + `by_level`)
+	// - `?shadow_sync=true` to verify dual-read parity against Replica 1
+	searchJSON := `{
+		"size": 10,
+		"query": {
+			"term": {"unindexedEnv": "prod"}
+		},
+		"aggs": {
+			"service_val_count": {
+				"value_count": {"field": "service"}
+			},
+			"latency_stats": {
+				"stats": {"field": "latencyMs"}
+			},
+			"latency_pcts": {
+				"percentiles": {"field": "latencyMs", "percents": [50, 99]}
+			},
+			"by_severity": {
+				"filters": {
+					"filters": {
+						"errors": {"term": {"level": "ERROR"}},
+						"infos": {"term": {"level": "INFO"}}
+					}
+				}
+			},
+			"by_service": {
+				"terms": {"field": "service", "size": 10},
+				"aggs": {
+					"avg_latency": {"avg": {"field": "latencyMs"}},
+					"by_level": {"terms": {"field": "level", "size": 10}}
+				}
+			}
+		}
+	}`
+	sResp, err := http.Post(ts2.URL+"/logs_alias/_search?shadow_sync=true", "application/json", strings.NewReader(searchJSON))
+	if err != nil || sResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /logs_alias/_search failed: status=%v err=%v", sResp.StatusCode, err)
+	}
+	var sRes map[string]any
+	_ = json.NewDecoder(sResp.Body).Decode(&sRes)
+	_ = sResp.Body.Close()
+
+	aggs := sRes["aggregations"].(map[string]any)
+	// Verify string value_count == 2
+	if int(aggs["service_val_count"].(map[string]any)["value"].(float64)) != 2 {
+		t.Fatalf("expected service_val_count == 2 on string field, got %v", aggs["service_val_count"])
+	}
+	// Verify stats (count=2, min=40, max=120, avg=80, sum=160)
+	statsObj := aggs["latency_stats"].(map[string]any)
+	if statsObj["avg"].(float64) != 80.0 || statsObj["sum"].(float64) != 160.0 {
+		t.Fatalf("unexpected latency_stats: %+v", statsObj)
+	}
+	// Verify percentiles
+	pctValues := aggs["latency_pcts"].(map[string]any)["values"].(map[string]any)
+	if pctValues["50.0"].(float64) != 80.0 {
+		t.Fatalf("expected p50 == 80.0, got %+v", pctValues)
+	}
+	// Verify filters aggregation
+	sevBuckets := aggs["by_severity"].(map[string]any)["buckets"].(map[string]any)
+	if int(sevBuckets["errors"].(map[string]any)["doc_count"].(float64)) != 1 {
+		t.Fatalf("expected 1 error in prod, got %+v", sevBuckets)
+	}
+	// Verify bucket sub-aggregations (`by_service` -> `avg_latency` & `by_level`)
+	svcBuckets := aggs["by_service"].(map[string]any)["buckets"].([]any)
+	if len(svcBuckets) != 1 {
+		t.Fatalf("expected 1 service bucket (checkout), got %+v", svcBuckets)
+	}
+	checkoutBucket := svcBuckets[0].(map[string]any)
+	if checkoutBucket["avg_latency"].(map[string]any)["value"].(float64) != 80.0 {
+		t.Fatalf("expected checkout avg_latency sub-agg == 80.0, got %+v", checkoutBucket)
+	}
+	levelBuckets := checkoutBucket["by_level"].(map[string]any)["buckets"].([]any)
+	if len(levelBuckets) != 2 {
+		t.Fatalf("expected 2 child level buckets under checkout, got %+v", levelBuckets)
+	}
+
+	// 5. Verify Shadow Verification metrics (`GET /_doris/shadow_stats`)
+	shResp, err := http.Get(ts2.URL + "/_doris/shadow_stats")
+	if err != nil || shResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /_doris/shadow_stats failed: status=%v err=%v", shResp.StatusCode, err)
+	}
+	var shStats map[string]any
+	_ = json.NewDecoder(shResp.Body).Decode(&shStats)
+	_ = shResp.Body.Close()
+	if shStats["hit_count_parity_rate"].(float64) != 1.0 || shStats["avg_topk_jaccard_similarity"].(float64) != 1.0 {
+		t.Fatalf("expected 100%% shadow parity and Jaccard=1.0, got: %+v", shStats)
+	}
+
+	// 6. Verify Slowlog & Auto-Indexing Advisor (`GET /_doris/slowlog`) recommends promoting `unindexedEnv`
+	slResp, err := http.Get(ts2.URL + "/_doris/slowlog")
+	if err != nil || slResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /_doris/slowlog failed: status=%v err=%v", slResp.StatusCode, err)
+	}
+	var slData map[string]any
+	_ = json.NewDecoder(slResp.Body).Decode(&slData)
+	_ = slResp.Body.Close()
+	recs, _ := slData["auto_index_recommendations"].([]any)
+	if len(recs) == 0 {
+		t.Fatalf("expected auto_index_recommendations for unindexedEnv in /_doris/slowlog, got: %+v", slData)
+	}
+	firstRec := recs[0].(map[string]any)
+	if firstRec["field"] != "unindexedEnv" {
+		t.Fatalf("expected recommendation for unindexedEnv, got: %+v", firstRec)
+	}
+
+	// 7. Verify `POST /_reindex` with Painless script transformation
+	reindexJSON := `{
+		"source": {
+			"index": "logs_alias",
+			"query": {"term": {"level": "ERROR"}}
+		},
+		"dest": {
+			"index": "error_logs_v1"
+		},
+		"script": {
+			"source": "ctx._source.reindexed = true"
+		}
+	}`
+	reResp, err := http.Post(ts2.URL+"/_reindex", "application/json", strings.NewReader(reindexJSON))
+	if err != nil || reResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_reindex failed: status=%v err=%v", reResp.StatusCode, err)
+	}
+	var reData map[string]any
+	_ = json.NewDecoder(reResp.Body).Decode(&reData)
+	_ = reResp.Body.Close()
+	if int(reData["created"].(float64)) != 2 {
+		t.Fatalf("expected 2 ERROR docs reindexed into error_logs_v1, got: %+v", reData)
+	}
+
+	// 8. Verify Kibana/Grafana/Elasticvue discovery & Web UI endpoints
+	for _, ep := range []string{
+		"/_resolve/index/logs*",
+		"/_stats",
+		"/logs_v1/_stats",
+		"/logs_v1/_search_shards",
+		"/_cat/indices?format=txt&v",
+		"/_cat/nodes",
+		"/_cat/shards",
+		"/_cat/count",
+		"/_doris/ui",
+	} {
+		r, err := http.Get(ts2.URL + ep)
+		if err != nil || r.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s failed: status=%v err=%v", ep, r.StatusCode, err)
+		}
+		_ = r.Body.Close()
 	}
 }

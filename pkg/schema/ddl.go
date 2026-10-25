@@ -76,7 +76,7 @@ func GenerateCreateTableDDL(s *IndexSchema) string {
 		corrCol := s.NestedRoots[np]
 		if !seenCols[corrCol] {
 			seenCols[corrCol] = true
-			cols = append(cols, fmt.Sprintf("    `%s` ARRAY<STRING> NULL COMMENT 'Correlated nested JSON elements for %s'", corrCol, np))
+			cols = append(cols, fmt.Sprintf("    `%s` ARRAY<STRING> NULL COMMENT 'Correlated nested JSON elements for %s'", corrCol, escapeDDLComment(np)))
 		}
 	}
 
@@ -158,11 +158,46 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 		existingCols[corrCol] = true
 		stmts = append(stmts, fmt.Sprintf(
 			"ALTER TABLE `%s`.`%s` ADD COLUMN `%s` ARRAY<STRING> NULL COMMENT 'Correlated nested JSON elements for %s';",
-			newSchema.DorisDB, newSchema.DorisTable, corrCol, np,
+			newSchema.DorisDB, newSchema.DorisTable, corrCol, escapeDDLComment(np),
 		))
 	}
 
 	return stmts
+}
+
+// GeneratePromoteVariantFieldDDL generates `ALTER TABLE` statements to promote a frequently
+// queried dynamic `_doc['...']` `VARIANT` field to a dedicated physical column with `USING INVERTED`.
+func GeneratePromoteVariantFieldDDL(s *IndexSchema, esFieldPath string, esType string) []string {
+	cleanPath := strings.TrimSuffix(esFieldPath, ".keyword")
+	colName := "f__" + SanitizeDorisIdentifier(cleanPath)
+	if esType == "" {
+		esType = "keyword"
+	}
+	binding := FieldBinding{
+		ESFieldPath: cleanPath,
+		ColumnName:  colName,
+		Kind:        StoragePromotedScalar,
+		DorisType:   mapESTypeToDoris(esType),
+	}
+	if DefaultMultiValuedPaths[cleanPath] {
+		binding.Kind = StoragePromotedArray
+		binding.DorisType = DorisString
+	}
+	colDef, idxDef := buildColumnAndIndexDDL(binding)
+	var stmts []string
+	if colDef != "" {
+		stmts = append(stmts, fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD COLUMN %s;", s.DorisDB, s.DorisTable, colDef))
+	}
+	if idxDef != "" {
+		stmts = append(stmts, fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD %s;", s.DorisDB, s.DorisTable, idxDef))
+	}
+	return stmts
+}
+
+func escapeDDLComment(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `'`, `''`)
+	return s
 }
 
 func buildColumnAndIndexDDL(b FieldBinding) (string, string) {

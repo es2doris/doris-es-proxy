@@ -61,7 +61,16 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 	return t.CompileQuery(&parsedAST, scoring, nctx)
 }
 
+const maxLuceneDepth = 32
+
 func parseSimpleLuceneToAST(expr, defaultField string, fields []string, defaultOp string) esast.Query {
+	return parseSimpleLuceneToASTWithDepth(expr, defaultField, fields, defaultOp, 0)
+}
+
+func parseSimpleLuceneToASTWithDepth(expr, defaultField string, fields []string, defaultOp string, depth int) esast.Query {
+	if depth > maxLuceneDepth {
+		return esast.Query{MatchAll: map[string]any{}}
+	}
 	tokens := tokenizeLucene(expr)
 	if len(tokens) == 0 {
 		return esast.Query{MatchAll: map[string]any{}}
@@ -104,9 +113,9 @@ func parseSimpleLuceneToAST(expr, defaultField string, fields []string, defaultO
 		var clause esast.Query
 		if strings.HasPrefix(tok, "(") && strings.HasSuffix(tok, ")") && len(tok) > 2 {
 			inner := tok[1 : len(tok)-1]
-			clause = parseSimpleLuceneToAST(inner, defaultField, fields, defaultOp)
+			clause = parseSimpleLuceneToASTWithDepth(inner, defaultField, fields, defaultOp, depth+1)
 		} else {
-			clause = buildLuceneAtomQuery(tok, defaultField, fields)
+			clause = buildLuceneAtomQueryWithDepth(tok, defaultField, fields, depth+1)
 		}
 
 		if negateNext {
@@ -121,13 +130,13 @@ func parseSimpleLuceneToAST(expr, defaultField string, fields []string, defaultO
 	return esast.Query{Bool: boolQ}
 }
 
-func buildLuceneAtomQuery(token, defaultField string, fields []string) esast.Query {
+func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, depth int) esast.Query {
 	token = strings.TrimSpace(token)
 	if idx := strings.IndexByte(token, ':'); idx > 0 {
 		field := token[:idx]
 		val := strings.TrimSpace(token[idx+1:])
 		if strings.HasPrefix(val, "(") && strings.HasSuffix(val, ")") && len(val) > 2 {
-			return parseSimpleLuceneToAST(val[1:len(val)-1], field, nil, "OR")
+			return parseSimpleLuceneToASTWithDepth(val[1:len(val)-1], field, nil, "OR", depth+1)
 		}
 		isQuoted := strings.HasPrefix(val, `"`) && strings.HasSuffix(val, `"`) && len(val) >= 2
 		val = strings.Trim(val, `"`)
@@ -205,9 +214,18 @@ func tokenizeLucene(s string) []string {
 	var out []string
 	var curr strings.Builder
 	inQuotes := false
+	escaped := false
 	parenDepth := 0
 	for _, r := range s {
+		if escaped {
+			curr.WriteRune(r)
+			escaped = false
+			continue
+		}
 		switch r {
+		case '\\':
+			escaped = true
+			curr.WriteRune(r)
 		case '"':
 			inQuotes = !inQuotes
 			curr.WriteRune(r)
