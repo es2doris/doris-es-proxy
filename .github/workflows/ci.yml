@@ -25,13 +25,16 @@ jobs:
           go-version-file: go.mod
 
       - name: Build
-        run: go build -o doris-es-proxy ./cmd/doris-es-proxy
+        run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o doris-es-proxy ./cmd/doris-es-proxy
 
       - name: Vet
         run: go vet ./...
 
-      - name: Test
-        run: go test -race ./... -v
+      - name: Test with race detector & coverage
+        run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./... -v
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1
 
   lint:
     name: Lint
@@ -52,9 +55,14 @@ jobs:
 
       - name: Check gofmt
         run: |
-          GOFMT_OUTPUT=$(gofmt -l .)
+          GOFMT_OUTPUT=$(gofmt -s -l .)
           if [ -n "$GOFMT_OUTPUT" ]; then
-            echo "The following files are not formatted:"
+            echo "The following files are not formatted with gofmt -s:"
             echo "$GOFMT_OUTPUT"
             exit 1
           fi
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: latest

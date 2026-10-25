@@ -19,6 +19,7 @@ package schema
 
 import (
 	"fmt"
+	"hash/fnv"
 	"sort"
 	"strings"
 )
@@ -91,6 +92,7 @@ func GenerateCreateTableDDL(s *IndexSchema) string {
 			"UNIQUE KEY(`_id`)\n"+
 			"DISTRIBUTED BY HASH(`_id`) BUCKETS %d\n"+
 			"PROPERTIES (\n"+
+			"    \"replication_num\" = \"1\",\n"+
 			"    \"enable_unique_key_merge_on_write\" = \"true\",\n"+
 			"    \"enable_light_schema_change\" = \"true\",\n"+
 			"    \"store_row_column\" = \"true\",\n"+
@@ -105,7 +107,7 @@ func GenerateCreateTableDDL(s *IndexSchema) string {
 }
 
 // GenerateAlterTableDDL computes non-blocking Light Schema Change `ALTER TABLE` statements
-// when new fields are added via `PUT /<index>/_mapping`.
+// when new fields or nested roots are added via `PUT /<index>/_mapping`.
 func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 	var stmts []string
 	newKeys := make([]string, 0, len(newSchema.Fields))
@@ -142,13 +144,33 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 			))
 		}
 	}
+
+	nestedPaths := make([]string, 0, len(newSchema.NestedRoots))
+	for np := range newSchema.NestedRoots {
+		nestedPaths = append(nestedPaths, np)
+	}
+	sort.Strings(nestedPaths)
+	for _, np := range nestedPaths {
+		corrCol := newSchema.NestedRoots[np]
+		if corrCol == "" || existingCols[corrCol] {
+			continue
+		}
+		existingCols[corrCol] = true
+		stmts = append(stmts, fmt.Sprintf(
+			"ALTER TABLE `%s`.`%s` ADD COLUMN `%s` ARRAY<STRING> NULL COMMENT 'Correlated nested JSON elements for %s';",
+			newSchema.DorisDB, newSchema.DorisTable, corrCol, np,
+		))
+	}
+
 	return stmts
 }
 
 func buildColumnAndIndexDDL(b FieldBinding) (string, string) {
 	idxName := "idx_" + b.ColumnName
 	if len(idxName) > 60 {
-		idxName = idxName[:60]
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(b.ColumnName))
+		idxName = fmt.Sprintf("%s_%08x", idxName[:51], h.Sum32())
 	}
 
 	switch b.Kind {
@@ -159,15 +181,12 @@ func buildColumnAndIndexDDL(b FieldBinding) (string, string) {
 
 	case StoragePromotedScalar:
 		colDef := fmt.Sprintf("`%s` %s NULL", b.ColumnName, b.DorisType)
+		if b.DorisType == DorisDouble {
+			// Apache Doris BKD inverted index does not support IEEE-754 floating-point columns.
+			return colDef, ""
+		}
 		if b.DorisType == DorisString {
 			parser := mapESAnalyzerToDorisParser(b.Analyzer)
-			if parser == "ngram" {
-				idxDef := fmt.Sprintf(
-					"INDEX `%s` (`%s`) USING INVERTED PROPERTIES(\"parser\" = \"ngram\", \"gram_size\" = \"3\", \"lower_case\" = \"true\")",
-					idxName, b.ColumnName,
-				)
-				return colDef, idxDef
-			}
 			idxDef := fmt.Sprintf(
 				"INDEX `%s` (`%s`) USING INVERTED PROPERTIES(\"parser\" = \"%s\", \"support_phrase\" = \"true\", \"lower_case\" = \"true\")",
 				idxName, b.ColumnName, parser,
@@ -184,12 +203,11 @@ func buildColumnAndIndexDDL(b FieldBinding) (string, string) {
 func mapESAnalyzerToDorisParser(analyzer string) string {
 	a := strings.ToLower(analyzer)
 	switch {
-	case strings.Contains(a, "ngram"):
-		return "ngram"
+	case strings.Contains(a, "ngram") || strings.Contains(a, "unicode") || strings.Contains(a, "icu"):
+		// Doris USING INVERTED supports unicode tokenization with phrase support for CJK/substring/ngram fields.
+		return "unicode"
 	case strings.Contains(a, "ik") || strings.Contains(a, "chinese") || strings.Contains(a, "smartcn"):
 		return "chinese"
-	case strings.Contains(a, "unicode") || strings.Contains(a, "icu"):
-		return "unicode"
 	case strings.Contains(a, "english"):
 		return "english"
 	default:

@@ -84,6 +84,7 @@ type IndexSchema struct {
 var DefaultMultiValuedPaths = map[string]bool{
 	"tags.tagFQN":               true,
 	"tags.name":                 true,
+	"owners":                    true,
 	"owners.id":                 true,
 	"owners.name":               true,
 	"owners.displayName":        true,
@@ -92,6 +93,11 @@ var DefaultMultiValuedPaths = map[string]bool{
 	"domains.id":                true,
 	"domains.name":              true,
 	"glossaryTerms":             true,
+	"customProperties":          true,
+	"upstreams":                 true,
+	"downstreams":               true,
+	"browsePaths":               true,
+	"browsePathsV2":             true,
 }
 
 // CompileIndexSchema translates an Elasticsearch `_mapping` specification into a Doris `IndexSchema`.
@@ -109,6 +115,87 @@ func CompileIndexSchema(dorisDB, indexName string, mapping *esast.MappingSpec) *
 		s.compileProperties(nil, nil, "", mapping.Properties)
 	}
 	return s
+}
+
+// MergeMappingSpecs deep-merges two Elasticsearch MappingSpecs without losing existing properties or sub-fields.
+func MergeMappingSpecs(oldSpec, newSpec *esast.MappingSpec) *esast.MappingSpec {
+	if oldSpec == nil && newSpec == nil {
+		return &esast.MappingSpec{Properties: make(map[string]esast.FieldProperty)}
+	}
+	if oldSpec == nil {
+		return &esast.MappingSpec{
+			Dynamic:    newSpec.Dynamic,
+			Properties: DeepMergeMappingProperties(nil, newSpec.Properties),
+		}
+	}
+	if newSpec == nil {
+		return &esast.MappingSpec{
+			Dynamic:    oldSpec.Dynamic,
+			Properties: DeepMergeMappingProperties(nil, oldSpec.Properties),
+		}
+	}
+	dyn := oldSpec.Dynamic
+	if newSpec.Dynamic != nil {
+		dyn = newSpec.Dynamic
+	}
+	return &esast.MappingSpec{
+		Dynamic:    dyn,
+		Properties: DeepMergeMappingProperties(oldSpec.Properties, newSpec.Properties),
+	}
+}
+
+// DeepMergeMappingProperties recursively merges `src` into a copy of `dst`.
+func DeepMergeMappingProperties(
+	dst, src map[string]esast.FieldProperty,
+) map[string]esast.FieldProperty {
+	out := make(map[string]esast.FieldProperty, len(dst)+len(src))
+	for k, v := range dst {
+		copied := v
+		if len(v.Properties) > 0 {
+			copied.Properties = DeepMergeMappingProperties(nil, v.Properties)
+		}
+		if len(v.Fields) > 0 {
+			copied.Fields = DeepMergeMappingProperties(nil, v.Fields)
+		}
+		out[k] = copied
+	}
+	for k, v := range src {
+		if existing, ok := out[k]; ok {
+			merged := existing
+			if v.Type != "" {
+				merged.Type = v.Type
+			}
+			if v.Analyzer != "" {
+				merged.Analyzer = v.Analyzer
+			}
+			if v.SearchAnalyzer != "" {
+				merged.SearchAnalyzer = v.SearchAnalyzer
+			}
+			if v.Normalizer != "" {
+				merged.Normalizer = v.Normalizer
+			}
+			if v.Format != "" {
+				merged.Format = v.Format
+			}
+			if len(v.Properties) > 0 {
+				merged.Properties = DeepMergeMappingProperties(existing.Properties, v.Properties)
+			}
+			if len(v.Fields) > 0 {
+				merged.Fields = DeepMergeMappingProperties(existing.Fields, v.Fields)
+			}
+			out[k] = merged
+		} else {
+			copied := v
+			if len(v.Properties) > 0 {
+				copied.Properties = DeepMergeMappingProperties(nil, v.Properties)
+			}
+			if len(v.Fields) > 0 {
+				copied.Fields = DeepMergeMappingProperties(nil, v.Fields)
+			}
+			out[k] = copied
+		}
+	}
+	return out
 }
 
 func (s *IndexSchema) compileProperties(
@@ -229,9 +316,23 @@ func (s *IndexSchema) registerLeafField(
 
 // ResolveField returns the physical Doris storage binding for an ES field path,
 // falling back to `_doc` (`VARIANT`) for dynamic/unmapped fields.
+// If `esFieldPath` ends with `.keyword` and has no explicit `.keyword` sub-field,
+// it checks the base field first and strips `.keyword` from the dynamic JSON path.
 func (s *IndexSchema) ResolveField(esFieldPath string) FieldBinding {
 	if b, ok := s.Fields[esFieldPath]; ok {
 		return b
+	}
+	if strings.HasSuffix(esFieldPath, ".keyword") {
+		basePath := strings.TrimSuffix(esFieldPath, ".keyword")
+		if b, ok := s.Fields[basePath]; ok {
+			return b
+		}
+		return FieldBinding{
+			ESFieldPath:    esFieldPath,
+			SourceJSONPath: strings.Split(basePath, "."),
+			Kind:           StorageDynamicVariant,
+			DorisType:      DorisString,
+		}
 	}
 	return FieldBinding{
 		ESFieldPath:    esFieldPath,
@@ -305,7 +406,7 @@ func SanitizeDorisIdentifier(name string) string {
 		} else if r == '.' || r == '-' {
 			sb.WriteString("__")
 		} else {
-			sb.WriteString(fmt.Sprintf("_%x_", r))
+			_, _ = fmt.Fprintf(&sb, "_%x_", r)
 		}
 	}
 	return sb.String()

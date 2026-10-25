@@ -78,14 +78,16 @@ type streamLoadResponse struct {
 	ErrorURL           string `json:"ErrorURL"`
 }
 
-// LoadNDJSON sends a batch of shredded NDJSON rows to Doris via HTTP Stream Load.
-// When `syncRefresh` is true (`?refresh=true`), it uses synchronous commit (`sync_mode`)
-// so that subsequent `/_search` requests immediately see the written rows.
+// LoadNDJSON sends a batch of shredded NDJSON rows to Doris via transactional HTTP Stream Load.
+// Note: Standard transactional Stream Load (without `group_commit` and without `fuzzy_parse: true`)
+// commits synchronously before returning `Status: "Success"`, supports `merge_type: MERGE` with
+// `delete: __DORIS_DELETE_SIGN__ = 1` and `function_column.sequence_col: _version`, and allows
+// heterogeneous optional fields across documents in the same `/_bulk` NDJSON batch.
 func (c *StreamLoadClient) LoadNDJSON(
 	ctx context.Context,
 	table string,
 	ndjsonPayload []byte,
-	syncRefresh bool,
+	_ bool,
 ) error {
 	if len(bytes.TrimSpace(ndjsonPayload)) == 0 {
 		return nil
@@ -106,16 +108,9 @@ func (c *StreamLoadClient) LoadNDJSON(
 	req.Header.Set("format", "json")
 	req.Header.Set("read_json_by_line", "true")
 	req.Header.Set("strip_outer_array", "false")
-	req.Header.Set("fuzzy_parse", "true")
 	req.Header.Set("merge_type", "MERGE")
 	req.Header.Set("delete", "__DORIS_DELETE_SIGN__ = 1")
 	req.Header.Set("function_column.sequence_col", "_version")
-
-	if syncRefresh {
-		req.Header.Set("group_commit", "sync_mode")
-	} else {
-		req.Header.Set("group_commit", "async_mode")
-	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -134,6 +129,10 @@ func (c *StreamLoadClient) LoadNDJSON(
 	}
 	if !strings.EqualFold(slResp.Status, "Success") && !strings.EqualFold(slResp.Status, "Publish Timeout") {
 		return fmt.Errorf("doris stream load failed (status=%s): %s (error_url=%s)", slResp.Status, slResp.Message, slResp.ErrorURL)
+	}
+	if slResp.NumberFilteredRows > 0 {
+		return fmt.Errorf("doris stream load filtered %d/%d rows: %s (error_url=%s)",
+			slResp.NumberFilteredRows, slResp.NumberTotalRows, slResp.Message, slResp.ErrorURL)
 	}
 	return nil
 }

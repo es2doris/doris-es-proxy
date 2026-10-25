@@ -26,8 +26,8 @@ import (
 
 // compileQueryString compiles an ES `query_string` or `simple_query_string` query.
 // When `Opts.UseDoris4SearchFunc` is enabled, it emits Apache Doris 4.0's native `SEARCH(...)`
-// function; otherwise, it parses common Lucene `field:value`, `AND`/`OR`/`NOT`, and wildcard
-// clauses into standard Doris `MATCH_ANY` / `LIKE` / `=` predicates.
+// function; otherwise, it parses Lucene `field:value`, `AND`/`OR`/`NOT`, `+`/`-`, parenthesized
+// groups, and wildcard clauses into standard Doris `MATCH_ANY` / `LIKE` / `=` predicates.
 func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring bool, nctx *nestedCtx) CompiledQuery {
 	raw := strings.TrimSpace(qsq.Query)
 	if raw == "" || raw == "*" || raw == "*:*" {
@@ -57,16 +57,30 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 		}
 	}
 
-	// Parse field:term tokens and boolean operators into a structured Query AST
 	parsedAST := parseSimpleLuceneToAST(raw, defaultField, qsq.Fields, defaultOp)
 	return t.CompileQuery(&parsedAST, scoring, nctx)
 }
 
 func parseSimpleLuceneToAST(expr, defaultField string, fields []string, defaultOp string) esast.Query {
 	tokens := tokenizeLucene(expr)
-	boolQ := &esast.BoolQuery{}
+	if len(tokens) == 0 {
+		return esast.Query{MatchAll: map[string]any{}}
+	}
 
+	// Determine effective boolean operator for this group if explicit AND / OR tokens exist
+	groupOp := defaultOp
+	for _, tok := range tokens {
+		switch strings.ToUpper(tok) {
+		case "AND":
+			groupOp = "AND"
+		case "OR":
+			groupOp = "OR"
+		}
+	}
+
+	boolQ := &esast.BoolQuery{}
 	negateNext := false
+
 	for i := 0; i < len(tokens); i++ {
 		tok := tokens[i]
 		upper := strings.ToUpper(tok)
@@ -77,18 +91,28 @@ func parseSimpleLuceneToAST(expr, defaultField string, fields []string, defaultO
 			negateNext = true
 			continue
 		}
+
+		mustClause := false
 		if strings.HasPrefix(tok, "-") && len(tok) > 1 {
 			negateNext = true
 			tok = tok[1:]
 		} else if strings.HasPrefix(tok, "+") && len(tok) > 1 {
+			mustClause = true
 			tok = tok[1:]
 		}
 
-		clause := buildLuceneAtomQuery(tok, defaultField, fields)
+		var clause esast.Query
+		if strings.HasPrefix(tok, "(") && strings.HasSuffix(tok, ")") && len(tok) > 2 {
+			inner := tok[1 : len(tok)-1]
+			clause = parseSimpleLuceneToAST(inner, defaultField, fields, defaultOp)
+		} else {
+			clause = buildLuceneAtomQuery(tok, defaultField, fields)
+		}
+
 		if negateNext {
 			boolQ.MustNot = append(boolQ.MustNot, clause)
 			negateNext = false
-		} else if defaultOp == "AND" {
+		} else if mustClause || groupOp == "AND" {
 			boolQ.Must = append(boolQ.Must, clause)
 		} else {
 			boolQ.Should = append(boolQ.Should, clause)
@@ -98,10 +122,15 @@ func parseSimpleLuceneToAST(expr, defaultField string, fields []string, defaultO
 }
 
 func buildLuceneAtomQuery(token, defaultField string, fields []string) esast.Query {
-	token = strings.Trim(token, "()")
+	token = strings.TrimSpace(token)
 	if idx := strings.IndexByte(token, ':'); idx > 0 {
 		field := token[:idx]
-		val := strings.Trim(token[idx+1:], `"`)
+		val := strings.TrimSpace(token[idx+1:])
+		if strings.HasPrefix(val, "(") && strings.HasSuffix(val, ")") && len(val) > 2 {
+			return parseSimpleLuceneToAST(val[1:len(val)-1], field, nil, "OR")
+		}
+		isQuoted := strings.HasPrefix(val, `"`) && strings.HasSuffix(val, `"`) && len(val) >= 2
+		val = strings.Trim(val, `"`)
 		if strings.EqualFold(val, "true") || strings.EqualFold(val, "false") {
 			boolVal := strings.EqualFold(val, "true")
 			return esast.Query{
@@ -110,10 +139,17 @@ func buildLuceneAtomQuery(token, defaultField string, fields []string) esast.Que
 				},
 			}
 		}
-		if strings.ContainsAny(val, "*?") {
+		if !isQuoted && strings.ContainsAny(val, "*?") {
 			return esast.Query{
 				Wildcard: map[string]esast.WildcardEntry{
 					field: {Value: val, CaseInsensitive: true},
+				},
+			}
+		}
+		if isQuoted && strings.Contains(val, " ") {
+			return esast.Query{
+				MatchPhrase: map[string]esast.PhraseEntry{
+					field: {Query: val, Boost: 1.0},
 				},
 			}
 		}
@@ -124,7 +160,32 @@ func buildLuceneAtomQuery(token, defaultField string, fields []string) esast.Que
 		}
 	}
 
+	isQuoted := strings.HasPrefix(token, `"`) && strings.HasSuffix(token, `"`) && len(token) >= 2
 	cleanVal := strings.Trim(token, `"`)
+	if !isQuoted && strings.ContainsAny(cleanVal, "*?") {
+		if len(fields) > 0 {
+			var shoulds []esast.Query
+			for _, fpat := range fields {
+				fname := strings.Split(fpat, "^")[0]
+				if !strings.Contains(fname, "*") {
+					shoulds = append(shoulds, esast.Query{
+						Wildcard: map[string]esast.WildcardEntry{
+							fname: {Value: cleanVal, CaseInsensitive: true},
+						},
+					})
+				}
+			}
+			if len(shoulds) > 0 {
+				return esast.Query{Bool: &esast.BoolQuery{Should: shoulds}}
+			}
+		}
+		return esast.Query{
+			Wildcard: map[string]esast.WildcardEntry{
+				defaultField: {Value: cleanVal, CaseInsensitive: true},
+			},
+		}
+	}
+
 	if len(fields) > 0 {
 		return esast.Query{
 			MultiMatch: &esast.MultiMatchQuery{
@@ -144,13 +205,24 @@ func tokenizeLucene(s string) []string {
 	var out []string
 	var curr strings.Builder
 	inQuotes := false
+	parenDepth := 0
 	for _, r := range s {
 		switch r {
 		case '"':
 			inQuotes = !inQuotes
 			curr.WriteRune(r)
+		case '(':
+			if !inQuotes {
+				parenDepth++
+			}
+			curr.WriteRune(r)
+		case ')':
+			if !inQuotes && parenDepth > 0 {
+				parenDepth--
+			}
+			curr.WriteRune(r)
 		case ' ', '\t', '\n':
-			if inQuotes {
+			if inQuotes || parenDepth > 0 {
 				curr.WriteRune(r)
 			} else if curr.Len() > 0 {
 				out = append(out, curr.String())

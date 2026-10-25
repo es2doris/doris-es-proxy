@@ -1,17 +1,51 @@
+# Lefthook: git hooks managed in-repo, auto-installed by flake.nix shellHook.
+# Refer to: https://github.com/evilmartians/lefthook
+
 pre-commit:
   parallel: true
   commands:
     gofmt:
       glob: "*.go"
-      run: gofmt -l -w {staged_files}
+      run: gofmt -s -l -w {staged_files}
+      stage_fixed: true
+
     go-vet:
       glob: "*.go"
       run: go vet ./...
+
     golangci-lint:
       glob: "*.go"
-      run: golangci-lint run
+      run: golangci-lint run ./...
+
+    go-mod-tidy:
+      glob: "*.{go,mod,sum}"
+      run: |
+        cp go.mod go.mod.bak && cp go.sum go.sum.bak
+        go mod tidy
+        if ! diff -q go.mod go.mod.bak > /dev/null 2>&1 || ! diff -q go.sum go.sum.bak > /dev/null 2>&1; then
+          echo "go.mod/go.sum not tidy — run 'go mod tidy' and stage the result"
+          mv go.mod.bak go.mod && mv go.sum.bak go.sum
+          exit 1
+        fi
+        rm -f go.mod.bak go.sum.bak
+
+commit-msg:
+  commands:
+    conventional-commit:
+      run: |
+        msg=$(head -1 {1})
+        if ! echo "$msg" | grep -qE '^(feat|fix|bugfix|docs|ci|test|refactor|chore|build|perf|style|revert)(\([a-z0-9/-]+\))?!?: .+'; then
+          echo "ERROR: commit message must follow Conventional Commits"
+          echo "  format:  type(scope)?: description"
+          echo "  types:   feat fix bugfix docs ci test refactor chore build perf style revert"
+          echo "  got:     $msg"
+          exit 1
+        fi
 
 pre-push:
+  parallel: true
   commands:
-    go-test:
-      run: go test ./...
+    test:
+      run: go test -race -count=1 ./...
+    build:
+      run: CGO_ENABLED=0 go build -o /dev/null ./cmd/doris-es-proxy

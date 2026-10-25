@@ -23,6 +23,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+
+	"github.com/es2doris/doris-es-proxy/pkg/schema"
 )
 
 // DorisSQLBackend implements `DorisBackend` over a pooled `*sql.DB` (MySQL wire protocol :9030)
@@ -62,8 +64,12 @@ func (b *DorisSQLBackend) QueryHits(ctx context.Context, querySQL string) ([]Hit
 	for rows.Next() {
 		var h HitRow
 		var srcStr string
-		if err := rows.Scan(&h.ID, &h.Version, &srcStr, &h.Score, &h.TotalHits); err != nil {
+		var nullScore sql.NullFloat64
+		if err := rows.Scan(&h.ID, &h.Version, &srcStr, &nullScore, &h.TotalHits); err != nil {
 			return nil, err
+		}
+		if nullScore.Valid {
+			h.Score = nullScore.Float64
 		}
 		h.Source = json.RawMessage(srcStr)
 		hits = append(hits, h)
@@ -84,9 +90,16 @@ func (b *DorisSQLBackend) QueryAggs(ctx context.Context, aggsSQL string) ([]AggR
 	var out []AggRow
 	for rows.Next() {
 		var r AggRow
-		if err := rows.Scan(&r.AggName, &r.BucketKey, &r.DocCount); err != nil {
+		var nullBucket sql.NullString
+		var val float64
+		if err := rows.Scan(&r.AggName, &nullBucket, &val); err != nil {
 			return nil, err
 		}
+		if nullBucket.Valid {
+			r.BucketKey = nullBucket.String
+		}
+		r.Value = val
+		r.DocCount = int64(val)
 		out = append(out, r)
 	}
 	return out, rows.Err()
@@ -96,9 +109,11 @@ func (b *DorisSQLBackend) GetDocByID(ctx context.Context, dbName, table, id stri
 	if b.db == nil {
 		return nil, false, nil
 	}
+	safeDB := schema.SanitizeDorisIdentifier(dbName)
+	safeTable := schema.SanitizeDorisIdentifier(table)
 	q := fmt.Sprintf(
 		"SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` = ? AND `__DORIS_DELETE_SIGN__` = 0 LIMIT 1",
-		dbName, table,
+		safeDB, safeTable,
 	)
 	var h HitRow
 	var srcStr string

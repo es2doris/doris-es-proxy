@@ -21,7 +21,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // ShredDocument transforms an Elasticsearch document (`rawSource`) into a flat Doris Stream Load
@@ -69,15 +71,15 @@ func ShredDocument(
 	collectAllTextStrings(parsedDoc, &allTextParts)
 	row["_all_text"] = strings.Join(allTextParts, " ")
 
+	now := time.Now().UTC()
+
 	// Populate promoted scalar, multi-valued array, and nested pre-filter columns
 	for _, b := range s.Fields {
 		switch b.Kind {
 		case StoragePromotedScalar:
 			val := extractScalarValue(parsedDoc, b.SourceJSONPath)
+			val = coerceScalarForDoris(val, b.DorisType, b.LowercaseNormalizer, now)
 			if val != nil {
-				if strVal, ok := val.(string); ok && b.LowercaseNormalizer {
-					val = strings.ToLower(strVal)
-				}
 				row[b.ColumnName] = val
 			}
 		case StoragePromotedArray, StorageNestedSubfield:
@@ -107,19 +109,244 @@ func ShredDocument(
 	return json.Marshal(row)
 }
 
+func coerceScalarForDoris(val any, dorisType DorisScalarType, lowercase bool, now time.Time) any {
+	if val == nil {
+		return nil
+	}
+	switch dorisType {
+	case DorisBigInt:
+		switch v := val.(type) {
+		case int64:
+			return v
+		case int:
+			return int64(v)
+		case float64:
+			return int64(v)
+		case json.Number:
+			if i, err := v.Int64(); err == nil {
+				return i
+			}
+			if f, err := v.Float64(); err == nil {
+				return int64(f)
+			}
+		case string:
+			if i, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
+				return i
+			}
+			if ms, ok := ParseESDateToEpochMillis(v, now); ok {
+				return ms
+			}
+			return nil
+		}
+	case DorisInt:
+		switch v := val.(type) {
+		case int:
+			return v
+		case int64:
+			return int(v)
+		case float64:
+			return int(v)
+		case json.Number:
+			if i, err := v.Int64(); err == nil {
+				return int(i)
+			}
+		case string:
+			if i, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+				return i
+			}
+			return nil
+		}
+	case DorisDouble:
+		switch v := val.(type) {
+		case float64:
+			return v
+		case int:
+			return float64(v)
+		case int64:
+			return float64(v)
+		case json.Number:
+			if f, err := v.Float64(); err == nil {
+				return f
+			}
+		case string:
+			if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+				return f
+			}
+			return nil
+		}
+	case DorisBoolean:
+		switch v := val.(type) {
+		case bool:
+			return v
+		case string:
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "true", "1":
+				return true
+			case "false", "0":
+				return false
+			}
+			return nil
+		}
+	default:
+		if strVal, ok := val.(string); ok {
+			if lowercase {
+				return strings.ToLower(strVal)
+			}
+			return strVal
+		}
+	}
+	return val
+}
+
+// ParseESDateToEpochMillis parses ISO-8601 / RFC3339 date strings, epoch strings,
+// and Elasticsearch date math expressions (`now`, `now-7d`, `now-1h/d`, `2024-01-01||+1d`)
+// into Unix epoch milliseconds.
+func ParseESDateToEpochMillis(input string, now time.Time) (int64, bool) {
+	s := strings.TrimSpace(input)
+	if s == "" {
+		return 0, false
+	}
+	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return i, true
+	}
+
+	var baseTime time.Time
+	var mathExpr string
+
+	if strings.HasPrefix(s, "now") {
+		baseTime = now.UTC()
+		mathExpr = s[3:]
+	} else if idx := strings.Index(s, "||"); idx >= 0 {
+		t, ok := parseISODateString(s[:idx])
+		if !ok {
+			return 0, false
+		}
+		baseTime = t
+		mathExpr = s[idx+2:]
+	} else {
+		t, ok := parseISODateString(s)
+		if !ok {
+			return 0, false
+		}
+		return t.UnixMilli(), true
+	}
+
+	t := applyESDateMath(baseTime, mathExpr)
+	return t.UnixMilli(), true
+}
+
+func parseISODateString(s string) (time.Time, bool) {
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02T15:04:05.000Z0700",
+		"2006-01-02T15:04:05Z0700",
+		"2006-01-02T15:04:05.999999999",
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05.999",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+		"2006/01/02",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC(), true
+		}
+	}
+	return time.Time{}, false
+}
+
+func applyESDateMath(base time.Time, expr string) time.Time {
+	t := base.UTC()
+	var roundUnit byte
+	if slashIdx := strings.IndexByte(expr, '/'); slashIdx >= 0 {
+		if slashIdx+1 < len(expr) {
+			roundUnit = expr[slashIdx+1]
+		}
+		expr = expr[:slashIdx]
+	}
+
+	i := 0
+	for i < len(expr) {
+		var sign int
+		switch expr[i] {
+		case '+':
+			sign = 1
+			i++
+		case '-':
+			sign = -1
+			i++
+		default:
+			i++
+			continue
+		}
+		numStart := i
+		for i < len(expr) && expr[i] >= '0' && expr[i] <= '9' {
+			i++
+		}
+		if numStart == i || i >= len(expr) {
+			break
+		}
+		n, _ := strconv.Atoi(expr[numStart:i])
+		unit := expr[i]
+		i++
+		val := sign * n
+		switch unit {
+		case 'y', 'Y':
+			t = t.AddDate(val, 0, 0)
+		case 'M':
+			t = t.AddDate(0, val, 0)
+		case 'w', 'W':
+			t = t.AddDate(0, 0, val*7)
+		case 'd', 'D':
+			t = t.AddDate(0, 0, val)
+		case 'h', 'H':
+			t = t.Add(time.Duration(val) * time.Hour)
+		case 'm':
+			t = t.Add(time.Duration(val) * time.Minute)
+		case 's':
+			t = t.Add(time.Duration(val) * time.Second)
+		}
+	}
+
+	switch roundUnit {
+	case 'y', 'Y':
+		t = time.Date(t.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
+	case 'M':
+		t = time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
+	case 'd', 'D':
+		t = time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+	case 'h', 'H':
+		t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, time.UTC)
+	case 'm':
+		t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), 0, 0, time.UTC)
+	case 's':
+		t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.UTC)
+	}
+	return t
+}
+
 func extractScalarValue(node any, path []string) any {
 	if len(path) == 0 || node == nil {
 		return normalizeScalar(node)
 	}
-	m, ok := node.(map[string]any)
-	if !ok {
+	switch curr := node.(type) {
+	case map[string]any:
+		next, exists := curr[path[0]]
+		if !exists {
+			return nil
+		}
+		return extractScalarValue(next, path[1:])
+	case []any:
+		for _, elem := range curr {
+			if v := extractScalarValue(elem, path); v != nil {
+				return v
+			}
+		}
+		return nil
+	default:
 		return nil
 	}
-	next, exists := m[path[0]]
-	if !exists {
-		return nil
-	}
-	return extractScalarValue(next, path[1:])
 }
 
 func normalizeScalar(v any) any {

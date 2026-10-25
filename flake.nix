@@ -16,8 +16,15 @@
           buildInputs = with pkgs; [
             go_1_25
             gh
+            git
+            gnumake
             gopls
             golangci-lint
+            govulncheck
+            gosec
+            gitleaks
+            actionlint
+            editorconfig-checker
             pre-commit
             lefthook
           ];
@@ -26,6 +33,7 @@
             export GOWORK=off
             echo "doris-es-proxy dev shell"
             echo "  go: $(go version)"
+            lefthook install >/dev/null 2>&1 || true
           '';
         };
       });

@@ -19,11 +19,12 @@ package painless
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
 func TestEvalPainless_OpenMetadataTagAndSoftDeleteMutations(t *testing.T) {
-	initial := `{"name":"orders","deleted":false,"tier":{"tagFQN":"Tier.Tier2"},"tags":[{"tagFQN":"PII.Sensitive"},{"tagFQN":"Legacy"}]}`
+	initial := `{"name":"orders","deleted":false,"updatedAt":1729773296789,"tier":{"tagFQN":"Tier.Tier2"},"tags":[{"tagFQN":"PII.Sensitive"},{"tagFQN":"Legacy"}],"followers":["u1","u2"]}`
 
 	req := &UpdateRequest{
 		Script: &ScriptSpec{
@@ -32,12 +33,16 @@ func TestEvalPainless_OpenMetadataTagAndSoftDeleteMutations(t *testing.T) {
 				ctx._source.remove('tier');
 				ctx._source.tags.removeIf(t -> t.tagFQN == params.removeTag);
 				if (ctx._source.tags == null) { ctx._source.tags = []; }
-				ctx._source.tags.add(params.newTag);
+				if (!ctx._source.tags.contains(params.newTag)) {
+					ctx._source.tags.add(params.newTag);
+				}
+				ctx._source.followers.removeIf(u -> u == params.removeFollower);
 			`,
 			Params: map[string]any{
-				"deleted":   true,
-				"removeTag": "Legacy",
-				"newTag":    map[string]any{"tagFQN": "Tier.Tier1"},
+				"deleted":        true,
+				"removeTag":      "Legacy",
+				"newTag":         map[string]any{"tagFQN": "Tier.Tier1"},
+				"removeFollower": "u1",
 			},
 		},
 	}
@@ -45,6 +50,10 @@ func TestEvalPainless_OpenMetadataTagAndSoftDeleteMutations(t *testing.T) {
 	updatedBytes, err := ApplyUpdate(json.RawMessage(initial), req)
 	if err != nil {
 		t.Fatalf("ApplyUpdate failed: %v", err)
+	}
+	// Verify 13-digit epoch timestamp was not corrupted into scientific notation
+	if !strings.Contains(string(updatedBytes), `"updatedAt":1729773296789`) {
+		t.Errorf("expected exact updatedAt integer in JSON, got %s", string(updatedBytes))
 	}
 
 	var out map[string]any
@@ -61,5 +70,9 @@ func TestEvalPainless_OpenMetadataTagAndSoftDeleteMutations(t *testing.T) {
 	tags, ok := out["tags"].([]any)
 	if !ok || len(tags) != 2 {
 		t.Fatalf("expected 2 tags after removeIf + add, got %+v", out["tags"])
+	}
+	followers, ok := out["followers"].([]any)
+	if !ok || len(followers) != 1 || followers[0] != "u2" {
+		t.Fatalf("expected followers [u2] after scalar removeIf, got %+v", out["followers"])
 	}
 }

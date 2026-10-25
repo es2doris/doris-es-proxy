@@ -1,8 +1,14 @@
 version: 2
 
+project_name: doris-es-proxy
+
 builds:
   - main: ./cmd/doris-es-proxy
     binary: doris-es-proxy
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
     env:
       - CGO_ENABLED=0
     goos:
@@ -29,4 +35,5 @@ changelog:
     exclude:
       - "^docs:"
       - "^test:"
+      - "^chore:"
       - "^ci:"

@@ -18,17 +18,22 @@
 package painless
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
 // UpdateRequest models an Elasticsearch `/_update/<id>` or `/_update_by_query` mutation spec.
 type UpdateRequest struct {
-	Doc         map[string]any `json:"doc,omitempty"`
-	DocAsUpsert bool           `json:"doc_as_upsert,omitempty"`
-	Script      *ScriptSpec    `json:"script,omitempty"`
+	Doc            map[string]any `json:"doc,omitempty"`
+	DocAsUpsert    bool           `json:"doc_as_upsert,omitempty"`
+	Upsert         map[string]any `json:"upsert,omitempty"`
+	ScriptedUpsert bool           `json:"scripted_upsert,omitempty"`
+	Script         *ScriptSpec    `json:"script,omitempty"`
 }
 
 type ScriptSpec struct {
@@ -38,104 +43,428 @@ type ScriptSpec struct {
 }
 
 var (
-	// Matches `ctx._source.<path> = params.<param>` or literal assignment
-	reAssignParam = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\s*=\s*(.+)$`)
-	// Matches `ctx._source.remove('field')` or `ctx._source.<path>.remove('field')`
-	reRemoveField = regexp.MustCompile(`^ctx\._source(?:\.([a-zA-Z0-9_.]+))?\.remove\(\s*['"]([^'"]+)['"]\s*\)$`)
-	// Matches `ctx._source.<path>.add(params.<param>)`
-	reArrayAdd = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\.add\(\s*params\.([a-zA-Z0-9_.]+)\s*\)$`)
-	// Matches `ctx._source.<path>.removeIf(x -> x.<prop> == params.<param>)`
-	reArrayRemoveIf = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\.removeIf\(\s*([a-zA-Z0-9_]+)\s*->\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_.]+)\s*==\s*params\.([a-zA-Z0-9_.]+)\s*\)$`)
+	reCtxOp          = regexp.MustCompile(`^ctx\.op\s*=\s*['"]([^'"]+)['"]$`)
+	reCompoundAssign = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\s*(\+=|-=)\s*(.+)$`)
+	reAssignParam    = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\s*=\s*(.+)$`)
+	reRemoveField    = regexp.MustCompile(`^ctx\._source(?:\.([a-zA-Z0-9_.]+))?\.remove\(\s*['"]([^'"]+)['"]\s*\)$`)
+	reArrayAdd       = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\.add\(\s*(.+?)\s*\)$`)
+	reArrayAddAll    = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\.addAll\(\s*(.+?)\s*\)$`)
+	reMapPut         = regexp.MustCompile(`^ctx\._source(?:\.([a-zA-Z0-9_.]+))?\.put\(\s*(.+?)\s*,\s*(.+?)\s*\)$`)
+	reMapPutAll      = regexp.MustCompile(`^ctx\._source(?:\.([a-zA-Z0-9_.]+))?\.putAll\(\s*(.+?)\s*\)$`)
+	reArrayRemoveIf  = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\.removeIf\(\s*([a-zA-Z0-9_]+)\s*->\s*([a-zA-Z0-9_]+)(?:\.([a-zA-Z0-9_.]+))?\s*==\s*(.+?)\s*\)$`)
 )
 
 // ApplyUpdate applies either a partial `doc` deep merge or an embedded Painless `script`
 // against a raw `_source` JSON payload and returns the mutated `_source` JSON bytes.
 func ApplyUpdate(rawSource json.RawMessage, req *UpdateRequest) (json.RawMessage, error) {
+	updated, _, err := ApplyUpdateWithResult(rawSource, req, len(bytes.TrimSpace(rawSource)) > 0)
+	return updated, err
+}
+
+// ApplyUpdateWithResult applies an `UpdateRequest` and returns `(updatedSource, opResult, error)`
+// where `opResult` is `"updated"`, `"created"`, `"noop"`, or `"deleted"`.
+func ApplyUpdateWithResult(rawSource json.RawMessage, req *UpdateRequest, docExisted bool) (json.RawMessage, string, error) {
 	var doc map[string]any
-	if len(rawSource) > 0 {
-		if err := json.Unmarshal(rawSource, &doc); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal _source for update: %w", err)
+	trimmed := bytes.TrimSpace(rawSource)
+	if len(trimmed) > 0 {
+		dec := json.NewDecoder(bytes.NewReader(trimmed))
+		dec.UseNumber()
+		if err := dec.Decode(&doc); err != nil {
+			return nil, "", fmt.Errorf("failed to unmarshal _source for update: %w", err)
 		}
 	}
 	if doc == nil {
 		doc = make(map[string]any)
 	}
 
+	if !docExisted {
+		if len(req.Upsert) > 0 {
+			deepMergeMap(doc, req.Upsert)
+			if !req.ScriptedUpsert {
+				out, err := json.Marshal(doc)
+				return json.RawMessage(out), "created", err
+			}
+		} else if req.DocAsUpsert && len(req.Doc) > 0 {
+			deepMergeMap(doc, req.Doc)
+			out, err := json.Marshal(doc)
+			return json.RawMessage(out), "created", err
+		}
+	}
+
 	if len(req.Doc) > 0 {
 		deepMergeMap(doc, req.Doc)
 	}
+
+	opResult := "updated"
+	if !docExisted {
+		opResult = "created"
+	}
+
 	if req.Script != nil && strings.TrimSpace(req.Script.Source) != "" {
-		if err := EvalPainless(doc, req.Script.Source, req.Script.Params); err != nil {
-			return nil, err
+		ctxOp, err := EvalPainlessWithOp(doc, req.Script.Source, req.Script.Params)
+		if err != nil {
+			return nil, "", err
+		}
+		switch strings.ToLower(ctxOp) {
+		case "noop", "none":
+			opResult = "noop"
+		case "delete":
+			opResult = "deleted"
 		}
 	}
 
 	out, err := json.Marshal(doc)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return json.RawMessage(out), nil
+	return json.RawMessage(out), opResult, nil
 }
 
 // EvalPainless evaluates common Painless script statements used by OpenMetadata and DataHub
 // against `sourceMap` (`ctx._source`) with `params`.
 func EvalPainless(sourceMap map[string]any, scriptSource string, params map[string]any) error {
-	// Strip simple null-initialization guards like `if (ctx._source.tags == null) { ctx._source.tags = []; }`
-	normalized := normalizeNullInitGuards(scriptSource)
-	stmts := splitStatements(normalized)
+	_, err := EvalPainlessWithOp(sourceMap, scriptSource, params)
+	return err
+}
 
+// EvalPainlessWithOp evaluates a Painless script and returns any `ctx.op` set by the script.
+func EvalPainlessWithOp(sourceMap map[string]any, scriptSource string, params map[string]any) (string, error) {
+	if params == nil {
+		params = make(map[string]any)
+	}
+	ctxOp := ""
+	err := execBlock(sourceMap, scriptSource, params, &ctxOp)
+	return ctxOp, err
+}
+
+func execBlock(sourceMap map[string]any, block string, params map[string]any, ctxOp *string) error {
+	stmts := splitTopLevelStatements(block)
 	for _, stmt := range stmts {
 		stmt = strings.TrimSpace(stmt)
 		if stmt == "" {
 			continue
 		}
-
-		// 1. Check `removeIf` on array of objects (`ctx._source.tags.removeIf(t -> t.tagFQN == params.tagFQN)`)
-		if m := reArrayRemoveIf.FindStringSubmatch(stmt); m != nil {
-			arrPath := strings.Split(m[1], ".")
-			propPath := strings.Split(m[4], ".")
-			targetVal := resolveParamPath(params, strings.Split(m[5], "."))
-			removeIfFromSlice(sourceMap, arrPath, propPath, targetVal)
-			continue
-		}
-
-		// 2. Check `.add(params.x)` on array (`ctx._source.tags.add(params.tag)`)
-		if m := reArrayAdd.FindStringSubmatch(stmt); m != nil {
-			arrPath := strings.Split(m[1], ".")
-			valToAdd := resolveParamPath(params, strings.Split(m[2], "."))
-			appendToSlice(sourceMap, arrPath, valToAdd)
-			continue
-		}
-
-		// 3. Check `.remove('field')` (`ctx._source.remove('tier')`)
-		if m := reRemoveField.FindStringSubmatch(stmt); m != nil {
-			var parentPath []string
-			if m[1] != "" {
-				parentPath = strings.Split(m[1], ".")
-			}
-			removeKeyAtPath(sourceMap, parentPath, m[2])
-			continue
-		}
-
-		// 4. Check field assignment (`ctx._source.deleted = params.deleted` or literal)
-		if m := reAssignParam.FindStringSubmatch(stmt); m != nil {
-			lhsPath := strings.Split(m[1], ".")
-			rhsExpr := strings.TrimSpace(m[2])
-			val, err := evalRHSExpr(rhsExpr, params)
-			if err != nil {
+		if strings.HasPrefix(stmt, "if") && (len(stmt) == 2 || stmt[2] == ' ' || stmt[2] == '(') {
+			if err := execIfStatement(sourceMap, stmt, params, ctxOp); err != nil {
 				return err
 			}
-			setValueAtPath(sourceMap, lhsPath, val)
 			continue
+		}
+		if strings.HasPrefix(stmt, "for") && (len(stmt) == 3 || stmt[3] == ' ' || stmt[3] == '(') {
+			if err := execForStatement(sourceMap, stmt, params, ctxOp); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := execSimpleStmt(sourceMap, stmt, params, ctxOp); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func evalRHSExpr(rhs string, params map[string]any) (any, error) {
+func execIfStatement(sourceMap map[string]any, stmt string, params map[string]any, ctxOp *string) error {
+	cond, thenBody, elseBody, ok := parseIfBlocks(stmt)
+	if !ok {
+		return nil
+	}
+	if evalCondition(sourceMap, cond, params) {
+		return execBlock(sourceMap, thenBody, params, ctxOp)
+	}
+	if strings.TrimSpace(elseBody) != "" {
+		return execBlock(sourceMap, elseBody, params, ctxOp)
+	}
+	return nil
+}
+
+func execForStatement(sourceMap map[string]any, stmt string, params map[string]any, ctxOp *string) error {
+	openParen := strings.IndexByte(stmt, '(')
+	closeParen := findMatchingDelimiter(stmt, openParen, '(', ')')
+	if openParen < 0 || closeParen < 0 {
+		return nil
+	}
+	header := strings.TrimSpace(stmt[openParen+1 : closeParen])
+	rest := strings.TrimSpace(stmt[closeParen+1:])
+	body := strings.TrimSpace(rest)
+	if strings.HasPrefix(body, "{") && strings.HasSuffix(body, "}") {
+		body = body[1 : len(body)-1]
+	}
+
+	var varName, iterExpr string
+	if idx := strings.Index(header, " in "); idx >= 0 {
+		varName = strings.TrimSpace(header[:idx])
+		iterExpr = strings.TrimSpace(header[idx+4:])
+	} else if idx := strings.IndexByte(header, ':'); idx >= 0 {
+		varName = strings.TrimSpace(header[:idx])
+		iterExpr = strings.TrimSpace(header[idx+1:])
+	} else {
+		return nil
+	}
+	fields := strings.Fields(varName)
+	if len(fields) > 0 {
+		varName = fields[len(fields)-1]
+	}
+
+	iterVal, err := evalRHSExpr(sourceMap, iterExpr, params)
+	if err != nil {
+		return err
+	}
+	slice, ok := iterVal.([]any)
+	if !ok {
+		return nil
+	}
+
+	loopParams := make(map[string]any, len(params)+1)
+	for k, v := range params {
+		loopParams[k] = v
+	}
+	for _, item := range slice {
+		loopParams[varName] = item
+		if err := execBlock(sourceMap, body, loopParams, ctxOp); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any, ctxOp *string) error {
+	if m := reCtxOp.FindStringSubmatch(stmt); m != nil {
+		*ctxOp = m[1]
+		return nil
+	}
+
+	// 1. Check `removeIf` on array of objects or scalars
+	if m := reArrayRemoveIf.FindStringSubmatch(stmt); m != nil {
+		arrPath := strings.Split(m[1], ".")
+		var propPath []string
+		if m[4] != "" {
+			propPath = strings.Split(m[4], ".")
+		}
+		targetVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[5]), params)
+		if err != nil {
+			return err
+		}
+		removeIfFromSlice(sourceMap, arrPath, propPath, targetVal)
+		return nil
+	}
+
+	// 2. Check `.addAll(...)` on array
+	if m := reArrayAddAll.FindStringSubmatch(stmt); m != nil {
+		arrPath := strings.Split(m[1], ".")
+		valToAdd, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[2]), params)
+		if err != nil {
+			return err
+		}
+		if items, ok := valToAdd.([]any); ok {
+			for _, item := range items {
+				appendToSlice(sourceMap, arrPath, item)
+			}
+		}
+		return nil
+	}
+
+	// 3. Check `.add(...)` on array
+	if m := reArrayAdd.FindStringSubmatch(stmt); m != nil {
+		arrPath := strings.Split(m[1], ".")
+		valToAdd, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[2]), params)
+		if err != nil {
+			return err
+		}
+		appendToSlice(sourceMap, arrPath, valToAdd)
+		return nil
+	}
+
+	// 4. Check `.putAll(...)` on map
+	if m := reMapPutAll.FindStringSubmatch(stmt); m != nil {
+		var targetPath []string
+		if m[1] != "" {
+			targetPath = strings.Split(m[1], ".")
+		}
+		mapVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[2]), params)
+		if err != nil {
+			return err
+		}
+		if subMap, ok := mapVal.(map[string]any); ok {
+			putAllAtPath(sourceMap, targetPath, subMap)
+		}
+		return nil
+	}
+
+	// 5. Check `.put(k, v)` on map
+	if m := reMapPut.FindStringSubmatch(stmt); m != nil {
+		var targetPath []string
+		if m[1] != "" {
+			targetPath = strings.Split(m[1], ".")
+		}
+		kVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[2]), params)
+		if err != nil {
+			return err
+		}
+		vVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[3]), params)
+		if err != nil {
+			return err
+		}
+		keyStr := fmt.Sprintf("%v", kVal)
+		setValueAtPath(sourceMap, append(targetPath, keyStr), vVal)
+		return nil
+	}
+
+	// 6. Check `.remove('field')`
+	if m := reRemoveField.FindStringSubmatch(stmt); m != nil {
+		var parentPath []string
+		if m[1] != "" {
+			parentPath = strings.Split(m[1], ".")
+		}
+		removeKeyAtPath(sourceMap, parentPath, m[2])
+		return nil
+	}
+
+	// 7. Check compound assignment `+=` / `-=`
+	if m := reCompoundAssign.FindStringSubmatch(stmt); m != nil {
+		lhsPath := strings.Split(m[1], ".")
+		op := m[2]
+		rhsVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[3]), params)
+		if err != nil {
+			return err
+		}
+		curVal := resolveParamPath(sourceMap, lhsPath)
+		setValueAtPath(sourceMap, lhsPath, applyArithmetic(curVal, rhsVal, op == "+="))
+		return nil
+	}
+
+	// 8. Check field assignment (`ctx._source.deleted = params.deleted`, arithmetic, or literal)
+	if m := reAssignParam.FindStringSubmatch(stmt); m != nil {
+		lhsPath := strings.Split(m[1], ".")
+		rhsExpr := strings.TrimSpace(m[2])
+		val, err := evalRHSExpr(sourceMap, rhsExpr, params)
+		if err != nil {
+			return err
+		}
+		setValueAtPath(sourceMap, lhsPath, val)
+		return nil
+	}
+
+	return nil
+}
+
+func evalCondition(sourceMap map[string]any, cond string, params map[string]any) bool {
+	cond = strings.TrimSpace(cond)
+	if cond == "" {
+		return false
+	}
+	if strings.Contains(cond, "&&") {
+		parts := strings.Split(cond, "&&")
+		for _, p := range parts {
+			if !evalCondition(sourceMap, p, params) {
+				return false
+			}
+		}
+		return true
+	}
+	if strings.Contains(cond, "||") {
+		parts := strings.Split(cond, "||")
+		for _, p := range parts {
+			if evalCondition(sourceMap, p, params) {
+				return true
+			}
+		}
+		return false
+	}
+	if strings.HasPrefix(cond, "!") {
+		return !evalCondition(sourceMap, cond[1:], params)
+	}
+
+	// Check `.contains(...)`
+	if idx := strings.Index(cond, ".contains("); idx > 0 && strings.HasSuffix(cond, ")") {
+		lhsExpr := strings.TrimSpace(cond[:idx])
+		argExpr := strings.TrimSpace(cond[idx+len(".contains(") : len(cond)-1])
+		lhsVal, _ := evalRHSExpr(sourceMap, lhsExpr, params)
+		argVal, _ := evalRHSExpr(sourceMap, argExpr, params)
+		if arr, ok := lhsVal.([]any); ok {
+			for _, item := range arr {
+				if valuesEqual(item, argVal) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	// Check `.containsKey(...)`
+	if idx := strings.Index(cond, ".containsKey("); idx > 0 && strings.HasSuffix(cond, ")") {
+		lhsExpr := strings.TrimSpace(cond[:idx])
+		argExpr := strings.TrimSpace(cond[idx+len(".containsKey(") : len(cond)-1])
+		lhsVal, _ := evalRHSExpr(sourceMap, lhsExpr, params)
+		argVal, _ := evalRHSExpr(sourceMap, argExpr, params)
+		if m, ok := lhsVal.(map[string]any); ok {
+			_, exists := m[fmt.Sprintf("%v", argVal)]
+			return exists
+		}
+		return false
+	}
+
+	if idx := strings.Index(cond, "!="); idx > 0 {
+		lhs, _ := evalRHSExpr(sourceMap, strings.TrimSpace(cond[:idx]), params)
+		rhs, _ := evalRHSExpr(sourceMap, strings.TrimSpace(cond[idx+2:]), params)
+		return !valuesEqual(lhs, rhs)
+	}
+	if idx := strings.Index(cond, "=="); idx > 0 {
+		lhs, _ := evalRHSExpr(sourceMap, strings.TrimSpace(cond[:idx]), params)
+		rhs, _ := evalRHSExpr(sourceMap, strings.TrimSpace(cond[idx+2:]), params)
+		return valuesEqual(lhs, rhs)
+	}
+
+	val, _ := evalRHSExpr(sourceMap, cond, params)
+	if b, ok := val.(bool); ok {
+		return b
+	}
+	return val != nil
+}
+
+func valuesEqual(a, b any) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	if reflect.DeepEqual(a, b) {
+		return true
+	}
+	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
+}
+
+func evalRHSExpr(sourceMap map[string]any, rhs string, params map[string]any) (any, error) {
+	rhs = strings.TrimSpace(rhs)
+	// Check binary `+` or `-` outside quotes
+	if opIdx, isAdd := findTopLevelAddSub(rhs); opIdx > 0 {
+		leftVal, err := evalRHSExpr(sourceMap, rhs[:opIdx], params)
+		if err != nil {
+			return nil, err
+		}
+		rightVal, err := evalRHSExpr(sourceMap, rhs[opIdx+1:], params)
+		if err != nil {
+			return nil, err
+		}
+		return applyArithmetic(leftVal, rightVal, isAdd), nil
+	}
+
+	if rhs == "ctx._source" {
+		return sourceMap, nil
+	}
+	if strings.HasPrefix(rhs, "ctx._source.") {
+		path := strings.Split(strings.TrimPrefix(rhs, "ctx._source."), ".")
+		return resolveParamPath(sourceMap, path), nil
+	}
+	if rhs == "params" {
+		return params, nil
+	}
 	if strings.HasPrefix(rhs, "params.") {
 		paramPath := strings.Split(strings.TrimPrefix(rhs, "params."), ".")
 		return resolveParamPath(params, paramPath), nil
+	}
+	if val, ok := params[rhs]; ok {
+		return val, nil
 	}
 	if rhs == "null" {
 		return nil, nil
@@ -146,14 +475,208 @@ func evalRHSExpr(rhs string, params map[string]any) (any, error) {
 	if rhs == "[:]" || rhs == "{}" {
 		return map[string]any{}, nil
 	}
-	if strings.HasPrefix(rhs, "'") && strings.HasSuffix(rhs, "'") && len(rhs) >= 2 {
-		return rhs[1 : len(rhs)-1], nil
+	if (strings.HasPrefix(rhs, "'") && strings.HasSuffix(rhs, "'")) ||
+		(strings.HasPrefix(rhs, `"`) && strings.HasSuffix(rhs, `"`)) {
+		if len(rhs) >= 2 {
+			return rhs[1 : len(rhs)-1], nil
+		}
 	}
+	dec := json.NewDecoder(strings.NewReader(rhs))
+	dec.UseNumber()
 	var parsed any
-	if err := json.Unmarshal([]byte(rhs), &parsed); err == nil {
+	if err := dec.Decode(&parsed); err == nil {
 		return parsed, nil
 	}
 	return rhs, nil
+}
+
+func findTopLevelAddSub(expr string) (int, bool) {
+	inQuotes := byte(0)
+	depth := 0
+	for i := 0; i < len(expr); i++ {
+		c := expr[i]
+		if inQuotes != 0 {
+			if c == inQuotes && (i == 0 || expr[i-1] != '\\') {
+				inQuotes = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			inQuotes = c
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		case '+', '-':
+			if depth == 0 && i > 0 {
+				return i, c == '+'
+			}
+		}
+	}
+	return -1, false
+}
+
+func applyArithmetic(a, b any, isAdd bool) any {
+	af, aOk := toFloat64(a)
+	bf, bOk := toFloat64(b)
+	if aOk && bOk {
+		res := af + bf
+		if !isAdd {
+			res = af - bf
+		}
+		if res == float64(int64(res)) {
+			return int64(res)
+		}
+		return res
+	}
+	if isAdd {
+		return fmt.Sprintf("%v%v", a, b)
+	}
+	return a
+}
+
+func toFloat64(v any) (float64, bool) {
+	switch val := v.(type) {
+	case nil:
+		return 0, true
+	case int:
+		return float64(val), true
+	case int64:
+		return float64(val), true
+	case float64:
+		return val, true
+	case json.Number:
+		f, err := val.Float64()
+		return f, err == nil
+	case string:
+		f, err := strconv.ParseFloat(val, 64)
+		return f, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func parseIfBlocks(stmt string) (cond, thenBody, elseBody string, ok bool) {
+	openParen := strings.IndexByte(stmt, '(')
+	closeParen := findMatchingDelimiter(stmt, openParen, '(', ')')
+	if openParen < 0 || closeParen < 0 {
+		return "", "", "", false
+	}
+	cond = strings.TrimSpace(stmt[openParen+1 : closeParen])
+	rest := strings.TrimSpace(stmt[closeParen+1:])
+	if strings.HasPrefix(rest, "{") {
+		closeBrace := findMatchingDelimiter(rest, 0, '{', '}')
+		if closeBrace < 0 {
+			return "", "", "", false
+		}
+		thenBody = rest[1:closeBrace]
+		afterThen := strings.TrimSpace(rest[closeBrace+1:])
+		if strings.HasPrefix(afterThen, "else") {
+			elseRest := strings.TrimSpace(afterThen[4:])
+			if strings.HasPrefix(elseRest, "{") && strings.HasSuffix(elseRest, "}") {
+				elseBody = elseRest[1 : len(elseRest)-1]
+			} else {
+				elseBody = elseRest
+			}
+		}
+		return cond, thenBody, elseBody, true
+	}
+	return cond, rest, "", true
+}
+
+func findMatchingDelimiter(s string, openIdx int, openChar, closeChar byte) int {
+	if openIdx < 0 || openIdx >= len(s) || s[openIdx] != openChar {
+		return -1
+	}
+	depth := 0
+	inQuotes := byte(0)
+	for i := openIdx; i < len(s); i++ {
+		c := s[i]
+		if inQuotes != 0 {
+			if c == inQuotes && (i == 0 || s[i-1] != '\\') {
+				inQuotes = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			inQuotes = c
+		case openChar:
+			depth++
+		case closeChar:
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func splitTopLevelStatements(s string) []string {
+	var out []string
+	var curr strings.Builder
+	braceDepth := 0
+	parenDepth := 0
+	inQuotes := byte(0)
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inQuotes != 0 {
+			curr.WriteByte(c)
+			if c == inQuotes && (i == 0 || s[i-1] != '\\') {
+				inQuotes = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			inQuotes = c
+			curr.WriteByte(c)
+		case '(':
+			parenDepth++
+			curr.WriteByte(c)
+		case ')':
+			if parenDepth > 0 {
+				parenDepth--
+			}
+			curr.WriteByte(c)
+		case '{':
+			braceDepth++
+			curr.WriteByte(c)
+		case '}':
+			if braceDepth > 0 {
+				braceDepth--
+			}
+			curr.WriteByte(c)
+			if braceDepth == 0 && parenDepth == 0 {
+				// Check if followed by `else`
+				rem := strings.TrimSpace(s[i+1:])
+				if !strings.HasPrefix(rem, "else") {
+					out = append(out, curr.String())
+					curr.Reset()
+				}
+			}
+		case ';', '\n':
+			if braceDepth == 0 && parenDepth == 0 {
+				if strings.TrimSpace(curr.String()) != "" {
+					out = append(out, curr.String())
+				}
+				curr.Reset()
+			} else {
+				curr.WriteByte(c)
+			}
+		default:
+			curr.WriteByte(c)
+		}
+	}
+	if strings.TrimSpace(curr.String()) != "" {
+		out = append(out, curr.String())
+	}
+	return out
 }
 
 func resolveParamPath(params map[string]any, path []string) any {
@@ -180,6 +703,21 @@ func setValueAtPath(root map[string]any, path []string, val any) {
 		curr = next
 	}
 	curr[path[len(path)-1]] = val
+}
+
+func putAllAtPath(root map[string]any, path []string, values map[string]any) {
+	curr := root
+	for _, seg := range path {
+		next, ok := curr[seg].(map[string]any)
+		if !ok {
+			next = make(map[string]any)
+			curr[seg] = next
+		}
+		curr = next
+	}
+	for k, v := range values {
+		curr[k] = v
+	}
 }
 
 func removeKeyAtPath(root map[string]any, parentPath []string, key string) {
@@ -229,8 +767,12 @@ func removeIfFromSlice(root map[string]any, arrPath []string, propPath []string,
 	}
 	filtered := make([]any, 0, len(existing))
 	for _, item := range existing {
-		if itemMap, ok := item.(map[string]any); ok {
-			if fmt.Sprintf("%v", resolveParamPath(itemMap, propPath)) == fmt.Sprintf("%v", matchVal) {
+		if len(propPath) == 0 {
+			if valuesEqual(item, matchVal) {
+				continue
+			}
+		} else if itemMap, ok := item.(map[string]any); ok {
+			if valuesEqual(resolveParamPath(itemMap, propPath), matchVal) {
 				continue
 			}
 		}
@@ -249,15 +791,4 @@ func deepMergeMap(dst, src map[string]any) {
 		}
 		dst[k] = v
 	}
-}
-
-func normalizeNullInitGuards(s string) string {
-	// Replaces `if (ctx._source.foo == null) { ctx._source.foo = []; }` with a no-op since `appendToSlice` auto-initializes.
-	reGuard := regexp.MustCompile(`if\s*\(\s*ctx\._source\.[a-zA-Z0-9_.]+\s*==\s*null\s*\)\s*\{\s*ctx\._source\.[a-zA-Z0-9_.]+\s*=\s*\[\s*\]\s*;?\s*\}`)
-	return reGuard.ReplaceAllString(s, "")
-}
-
-func splitStatements(s string) []string {
-	s = strings.ReplaceAll(s, "\n", ";")
-	return strings.Split(s, ";")
 }

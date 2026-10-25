@@ -24,20 +24,37 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync/atomic"
+	"time"
 )
+
+var autoIDCounter uint64
+
+// NextAutoID generates a unique time-ordered document ID when an ES client omits `_id`.
+func NextAutoID() string {
+	seq := atomic.AddUint64(&autoIDCounter, 1)
+	return fmt.Sprintf("auto-%d-%d", time.Now().UnixNano(), seq)
+}
 
 // SearchRequest models an Elasticsearch / OpenSearch `/_search` request payload.
 type SearchRequest struct {
-	Query          *Query                 `json:"query,omitempty"`
-	PostFilter     *Query                 `json:"post_filter,omitempty"`
-	From           *int                   `json:"from,omitempty"`
-	Size           *int                   `json:"size,omitempty"`
-	Aggs           map[string]AggSpec     `json:"aggs,omitempty"`
-	Aggregations   map[string]AggSpec     `json:"aggregations,omitempty"`
-	Sort           []SortSpec             `json:"sort,omitempty"`
-	Source         *SourceFilter          `json:"_source,omitempty"`
-	TrackTotalHits any                    `json:"track_total_hits,omitempty"`
-	Highlight      map[string]any         `json:"highlight,omitempty"`
+	Query          *Query             `json:"query,omitempty"`
+	PostFilter     *Query             `json:"post_filter,omitempty"`
+	From           *int               `json:"from,omitempty"`
+	Size           *int               `json:"size,omitempty"`
+	Aggs           map[string]AggSpec `json:"aggs,omitempty"`
+	Aggregations   map[string]AggSpec `json:"aggregations,omitempty"`
+	Sort           SortSlice          `json:"sort,omitempty"`
+	SearchAfter    []any              `json:"search_after,omitempty"`
+	Source         *SourceFilter      `json:"_source,omitempty"`
+	TrackTotalHits any                `json:"track_total_hits,omitempty"`
+	Highlight      *HighlightSpec     `json:"highlight,omitempty"`
+}
+
+type HighlightSpec struct {
+	PreTags  []string       `json:"pre_tags,omitempty"`
+	PostTags []string       `json:"post_tags,omitempty"`
+	Fields   map[string]any `json:"fields,omitempty"`
 }
 
 // EffectiveAggs returns whichever of `aggs` or `aggregations` was populated.
@@ -54,7 +71,7 @@ type Query struct {
 	MatchNone         map[string]any           `json:"match_none,omitempty"`
 	Bool              *BoolQuery               `json:"bool,omitempty"`
 	Term              map[string]TermEntry     `json:"term,omitempty"`
-	Terms             map[string][]any         `json:"terms,omitempty"`
+	Terms             *TermsQuery              `json:"terms,omitempty"`
 	Ids               *IdsQuery                `json:"ids,omitempty"`
 	Range             map[string]RangeCond     `json:"range,omitempty"`
 	Exists            *ExistsQuery             `json:"exists,omitempty"`
@@ -70,6 +87,33 @@ type Query struct {
 	Nested            *NestedQuery             `json:"nested,omitempty"`
 	ConstantScore     *ConstantScoreQuery      `json:"constant_score,omitempty"`
 	FunctionScore     *FunctionScoreQuery      `json:"function_score,omitempty"`
+}
+
+// TermsQuery handles `"terms": {"field": ["a", "b"], "boost": 1.0}` where Java clients
+// serialize `"boost"` as a sibling key alongside the field name.
+type TermsQuery struct {
+	Fields map[string][]any
+	Boost  float64
+}
+
+func (tq *TermsQuery) UnmarshalJSON(data []byte) error {
+	tq.Boost = 1.0
+	tq.Fields = make(map[string][]any)
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	for k, v := range raw {
+		if k == "boost" {
+			_ = json.Unmarshal(v, &tq.Boost)
+			continue
+		}
+		var arr []any
+		if err := json.Unmarshal(v, &arr); err == nil {
+			tq.Fields[k] = arr
+		}
+	}
+	return nil
 }
 
 // BoolQuery represents an ES `bool` compound query (`must`, `filter`, `should`, `must_not`).
@@ -144,13 +188,42 @@ type ExistsQuery struct {
 	Field string `json:"field"`
 }
 
+// RangeCond supports both standard `gt`/`gte`/`lt`/`lte` bounds and Java `RangeQueryBuilder`
+// `from`/`to`/`include_lower`/`include_upper` bounds.
 type RangeCond struct {
-	GT       any    `json:"gt,omitempty"`
-	GTE      any    `json:"gte,omitempty"`
-	LT       any    `json:"lt,omitempty"`
-	LTE      any    `json:"lte,omitempty"`
-	Format   string `json:"format,omitempty"`
-	TimeZone string `json:"time_zone,omitempty"`
+	GT           any      `json:"gt,omitempty"`
+	GTE          any      `json:"gte,omitempty"`
+	LT           any      `json:"lt,omitempty"`
+	LTE          any      `json:"lte,omitempty"`
+	From         any      `json:"from,omitempty"`
+	To           any      `json:"to,omitempty"`
+	IncludeLower *bool    `json:"include_lower,omitempty"`
+	IncludeUpper *bool    `json:"include_upper,omitempty"`
+	Boost        *float64 `json:"boost,omitempty"`
+	Format       string   `json:"format,omitempty"`
+	TimeZone     string   `json:"time_zone,omitempty"`
+}
+
+// NormalizedBounds returns the effective (gt, gte, lt, lte) bounds after normalizing `from`/`to`.
+func (rc RangeCond) NormalizedBounds() (gt, gte, lt, lte any) {
+	gt, gte, lt, lte = rc.GT, rc.GTE, rc.LT, rc.LTE
+	if rc.From != nil && gt == nil && gte == nil {
+		incLower := rc.IncludeLower == nil || *rc.IncludeLower
+		if incLower {
+			gte = rc.From
+		} else {
+			gt = rc.From
+		}
+	}
+	if rc.To != nil && lt == nil && lte == nil {
+		incUpper := rc.IncludeUpper == nil || *rc.IncludeUpper
+		if incUpper {
+			lte = rc.To
+		} else {
+			lt = rc.To
+		}
+	}
+	return gt, gte, lt, lte
 }
 
 type PrefixEntry struct {
@@ -285,6 +358,7 @@ type MultiMatchQuery struct {
 	Fields   []string `json:"fields,omitempty"`
 	Type     string   `json:"type,omitempty"`
 	Operator string   `json:"operator,omitempty"`
+	Slop     int      `json:"slop,omitempty"`
 	Boost    *float64 `json:"boost,omitempty"`
 }
 
@@ -296,10 +370,10 @@ type QueryStringQuery struct {
 }
 
 type NestedQuery struct {
-	Path       string `json:"path"`
-	Query      Query  `json:"query"`
-	ScoreMode  string `json:"score_mode,omitempty"`
-	IgnoreUnmapped bool `json:"ignore_unmapped,omitempty"`
+	Path           string `json:"path"`
+	Query          Query  `json:"query"`
+	ScoreMode      string `json:"score_mode,omitempty"`
+	IgnoreUnmapped bool   `json:"ignore_unmapped,omitempty"`
 }
 
 type ConstantScoreQuery struct {
@@ -331,17 +405,17 @@ type FieldValueFactorSpec struct {
 
 // AggSpec represents an Elasticsearch aggregation definition.
 type AggSpec struct {
-	Terms         *TermsAggSpec      `json:"terms,omitempty"`
-	Filter        *Query             `json:"filter,omitempty"`
-	Missing       *ExistsQuery       `json:"missing,omitempty"`
-	Nested        *NestedAggSpec     `json:"nested,omitempty"`
-	Cardinality   *MetricAggSpec     `json:"cardinality,omitempty"`
-	Avg           *MetricAggSpec     `json:"avg,omitempty"`
-	Sum           *MetricAggSpec     `json:"sum,omitempty"`
-	Min           *MetricAggSpec     `json:"min,omitempty"`
-	Max           *MetricAggSpec     `json:"max,omitempty"`
-	Aggs          map[string]AggSpec `json:"aggs,omitempty"`
-	Aggregations  map[string]AggSpec `json:"aggregations,omitempty"`
+	Terms        *TermsAggSpec      `json:"terms,omitempty"`
+	Filter       *Query             `json:"filter,omitempty"`
+	Missing      *ExistsQuery       `json:"missing,omitempty"`
+	Nested       *NestedAggSpec     `json:"nested,omitempty"`
+	Cardinality  *MetricAggSpec     `json:"cardinality,omitempty"`
+	Avg          *MetricAggSpec     `json:"avg,omitempty"`
+	Sum          *MetricAggSpec     `json:"sum,omitempty"`
+	Min          *MetricAggSpec     `json:"min,omitempty"`
+	Max          *MetricAggSpec     `json:"max,omitempty"`
+	Aggs         map[string]AggSpec `json:"aggs,omitempty"`
+	Aggregations map[string]AggSpec `json:"aggregations,omitempty"`
 }
 
 func (a *AggSpec) SubAggs() map[string]AggSpec {
@@ -365,6 +439,8 @@ type MetricAggSpec struct {
 	Field string `json:"field"`
 }
 
+type SortEntry = SortFieldSpec
+
 type SortFieldSpec struct {
 	Field string
 	Order string
@@ -372,6 +448,31 @@ type SortFieldSpec struct {
 
 type SortSpec struct {
 	Entry SortFieldSpec
+}
+
+// SortSlice accepts either a single sort specification (`"_doc"` / `{"updatedAt": "desc"}`) or an array.
+type SortSlice []SortSpec
+
+func (ss *SortSlice) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		*ss = nil
+		return nil
+	}
+	if trimmed[0] == '[' {
+		var list []SortSpec
+		if err := json.Unmarshal(trimmed, &list); err != nil {
+			return err
+		}
+		*ss = list
+		return nil
+	}
+	var single SortSpec
+	if err := json.Unmarshal(trimmed, &single); err != nil {
+		return err
+	}
+	*ss = []SortSpec{single}
+	return nil
 }
 
 func (s *SortSpec) UnmarshalJSON(data []byte) error {
@@ -414,18 +515,29 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 
 type SourceFilter struct {
 	Fetch    bool
+	Disabled bool
 	Includes []string
 	Excludes []string
 }
 
 func (sf *SourceFilter) UnmarshalJSON(data []byte) error {
 	sf.Fetch = true
+	sf.Disabled = false
 	trimmed := bytes.TrimSpace(data)
 	if bytes.Equal(trimmed, []byte("false")) {
 		sf.Fetch = false
+		sf.Disabled = true
 		return nil
 	}
 	if bytes.Equal(trimmed, []byte("true")) {
+		return nil
+	}
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		var single string
+		if err := json.Unmarshal(trimmed, &single); err != nil {
+			return err
+		}
+		sf.Includes = []string{single}
 		return nil
 	}
 	if len(trimmed) > 0 && trimmed[0] == '[' {
@@ -435,12 +547,14 @@ func (sf *SourceFilter) UnmarshalJSON(data []byte) error {
 		var obj struct {
 			Includes []string `json:"includes"`
 			Excludes []string `json:"excludes"`
+			Include  []string `json:"include"`
+			Exclude  []string `json:"exclude"`
 		}
 		if err := json.Unmarshal(trimmed, &obj); err != nil {
 			return err
 		}
-		sf.Includes = obj.Includes
-		sf.Excludes = obj.Excludes
+		sf.Includes = append(obj.Includes, obj.Include...)
+		sf.Excludes = append(obj.Excludes, obj.Exclude...)
 	}
 	return nil
 }
@@ -452,6 +566,29 @@ type IndexCreateRequest struct {
 	Aliases  map[string]map[string]any `json:"aliases,omitempty"`
 }
 
+// IndexTemplateRequest models `PUT /_index_template/<name>` and `PUT /_template/<name>`.
+type IndexTemplateRequest struct {
+	IndexPatterns []string            `json:"index_patterns,omitempty"`
+	Patterns      []string            `json:"patterns,omitempty"`
+	Template      *IndexCreateRequest `json:"template,omitempty"`
+	Mappings      *MappingSpec        `json:"mappings,omitempty"`
+	Settings      map[string]any      `json:"settings,omitempty"`
+}
+
+func (t *IndexTemplateRequest) EffectivePatterns() []string {
+	if len(t.IndexPatterns) > 0 {
+		return t.IndexPatterns
+	}
+	return t.Patterns
+}
+
+func (t *IndexTemplateRequest) EffectiveMappings() *MappingSpec {
+	if t.Template != nil && t.Template.Mappings != nil {
+		return t.Template.Mappings
+	}
+	return t.Mappings
+}
+
 // MappingSpec models an Elasticsearch `_mapping` payload.
 type MappingSpec struct {
 	Dynamic    any                      `json:"dynamic,omitempty"`
@@ -459,19 +596,21 @@ type MappingSpec struct {
 }
 
 type FieldProperty struct {
-	Type       string                   `json:"type,omitempty"`
-	Analyzer   string                   `json:"analyzer,omitempty"`
-	Normalizer string                   `json:"normalizer,omitempty"`
-	Fields     map[string]FieldProperty `json:"fields,omitempty"`
-	Properties map[string]FieldProperty `json:"properties,omitempty"`
+	Type           string                   `json:"type,omitempty"`
+	Analyzer       string                   `json:"analyzer,omitempty"`
+	SearchAnalyzer string                   `json:"search_analyzer,omitempty"`
+	Normalizer     string                   `json:"normalizer,omitempty"`
+	Format         string                   `json:"format,omitempty"`
+	Fields         map[string]FieldProperty `json:"fields,omitempty"`
+	Properties     map[string]FieldProperty `json:"properties,omitempty"`
 }
 
 // BulkOperation represents a single parsed action from an Elasticsearch `/_bulk` NDJSON stream.
 type BulkOperation struct {
-	Action  string          // "index", "create", "update", "delete"
-	Index   string          // Target index name
-	ID      string          // Document _id
-	Source  json.RawMessage // Verbatim raw JSON line for `_source` (or update payload)
+	Action string          // "index", "create", "update", "delete"
+	Index  string          // Target index name
+	ID     string          // Document _id
+	Source json.RawMessage // Verbatim raw JSON line for `_source` (or update payload)
 }
 
 // ParseBulkNDJSON parses an Elasticsearch `/_bulk` two-line NDJSON stream while preserving
@@ -502,6 +641,9 @@ func ParseBulkNDJSON(r io.Reader, defaultIndex string) ([]BulkOperation, error) 
 				op.Index = defaultIndex
 			}
 			op.ID = meta.ID
+			if op.ID == "" && (act == "index" || act == "create") {
+				op.ID = NextAutoID()
+			}
 			break
 		}
 		if op.Action != "delete" {

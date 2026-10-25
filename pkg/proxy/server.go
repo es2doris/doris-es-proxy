@@ -18,12 +18,16 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +40,7 @@ import (
 
 // HitRow represents a single matched document returned by Doris for Query 1 (HitsSQL).
 type HitRow struct {
+	Index     string
 	ID        string
 	Version   int64
 	Source    json.RawMessage
@@ -43,11 +48,26 @@ type HitRow struct {
 	TotalHits int64
 }
 
-// AggRow represents a single facet bucket row returned by Doris for Query 2 (AggsSQL).
+// AggRow represents a single facet bucket or metric row returned by Doris for Query 2 (AggsSQL).
 type AggRow struct {
 	AggName   string
 	BucketKey string
 	DocCount  int64
+	Value     float64
+}
+
+func (r AggRow) effectiveCount() int64 {
+	if r.DocCount != 0 {
+		return r.DocCount
+	}
+	return int64(r.Value)
+}
+
+func (r AggRow) effectiveValue() float64 {
+	if r.Value != 0 {
+		return r.Value
+	}
+	return float64(r.DocCount)
 }
 
 // DorisBackend abstracts the execution of DDL, SQL queries, point lookups, and Stream Loads
@@ -67,9 +87,10 @@ type Server struct {
 	backend       DorisBackend
 	transpileOpts transpiler.TranspilerOptions
 
-	mu      sync.RWMutex
-	indices map[string]*schema.IndexSchema
-	aliases map[string]string // aliasName -> indexName
+	mu        sync.RWMutex
+	indices   map[string]*schema.IndexSchema
+	aliases   map[string][]string // aliasName -> ordered target indexNames
+	templates map[string]esast.IndexTemplateRequest
 }
 
 func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerOptions) *Server {
@@ -81,7 +102,8 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		backend:       backend,
 		transpileOpts: opts,
 		indices:       make(map[string]*schema.IndexSchema),
-		aliases:       make(map[string]string),
+		aliases:       make(map[string][]string),
+		templates:     make(map[string]esast.IndexTemplateRequest),
 	}
 }
 
@@ -89,8 +111,13 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 // without `http.ServeMux` wildcard ambiguity between `/_alias/{name}` and `/{index}/_search`.
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setESCompatHeaders(w, r)
 		trimmed := strings.Trim(r.URL.Path, "/")
 		if trimmed == "" {
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
 			s.handleRootHandshake(w, r)
 			return
 		}
@@ -103,6 +130,12 @@ func (s *Server) Handler() http.Handler {
 				s.handleBulk(w, r)
 			case "_search":
 				s.handleSearch(w, r)
+			case "_msearch":
+				s.handleMSearch(w, r)
+			case "_mget":
+				s.handleMGet(w, r)
+			case "_count":
+				s.handleCount(w, r)
 			case "_aliases":
 				if r.Method == http.MethodPost {
 					s.handleUpdateAliases(w, r)
@@ -111,10 +144,12 @@ func (s *Server) Handler() http.Handler {
 				}
 			case "_alias":
 				s.handleGetAliases(w, r)
-			case "_refresh":
+			case "_refresh", "_flush":
 				s.handleRefresh(w, r)
 			case "_nodes":
 				s.handleNodes(w, r)
+			case "_mapping", "_mappings":
+				s.handleGetAllMappings(w, r)
 			default:
 				r.SetPathValue("index", segs[0])
 				switch r.Method {
@@ -135,30 +170,58 @@ func (s *Server) Handler() http.Handler {
 			switch {
 			case segs[0] == "_cluster" && segs[1] == "health":
 				s.handleClusterHealth(w, r)
+			case segs[0] == "_cluster" && segs[1] == "settings":
+				s.handleClusterSettings(w, r)
 			case segs[0] == "_cat" && segs[1] == "indices":
 				s.handleCatIndices(w, r)
+			case segs[0] == "_cat" && segs[1] == "aliases":
+				s.handleCatAliases(w, r)
+			case segs[0] == "_cat" && segs[1] == "health":
+				s.handleClusterHealth(w, r)
+			case segs[0] == "_search" && segs[1] == "scroll":
+				s.handleScroll(w, r)
 			case segs[0] == "_alias":
 				r.SetPathValue("name", segs[1])
 				s.handleGetAliases(w, r)
+			case segs[0] == "_index_template" || segs[0] == "_template" || segs[0] == "_component_template":
+				r.SetPathValue("name", segs[1])
+				s.handleIndexTemplate(w, r)
 			default:
 				r.SetPathValue("index", segs[0])
 				switch segs[1] {
-				case "_mapping":
+				case "_mapping", "_mappings":
 					if r.Method == http.MethodGet {
 						s.handleGetMapping(w, r)
 					} else {
 						s.handlePutMapping(w, r)
 					}
+				case "_settings":
+					s.handleIndexSettings(w, r)
+				case "_alias", "_aliases":
+					s.handleGetIndexAliases(w, r)
 				case "_search":
 					s.handleSearch(w, r)
+				case "_msearch":
+					s.handleMSearch(w, r)
+				case "_mget":
+					s.handleMGet(w, r)
 				case "_count":
 					s.handleCount(w, r)
 				case "_bulk":
 					s.handleBulk(w, r)
-				case "_refresh":
+				case "_refresh", "_flush", "_forcemerge":
 					s.handleRefresh(w, r)
 				case "_update_by_query":
 					s.handleUpdateByQuery(w, r)
+				case "_delete_by_query":
+					s.handleDeleteByQuery(w, r)
+				case "_doc", "_create":
+					if r.Method == http.MethodPost {
+						r.SetPathValue("id", esast.NextAutoID())
+						s.handlePutDoc(w, r)
+					} else {
+						writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
+					}
 				default:
 					writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
 				}
@@ -171,6 +234,19 @@ func (s *Server) Handler() http.Handler {
 				return
 			}
 			r.SetPathValue("index", segs[0])
+			if segs[1] == "_alias" || segs[1] == "_aliases" {
+				r.SetPathValue("name", segs[2])
+				s.handleIndexAliasByName(w, r)
+				return
+			}
+			if segs[1] == "_mapping" || segs[1] == "_mappings" {
+				if r.Method == http.MethodGet {
+					s.handleGetMapping(w, r)
+				} else {
+					s.handlePutMapping(w, r)
+				}
+				return
+			}
 			r.SetPathValue("id", segs[2])
 			switch segs[1] {
 			case "_doc", "_create":
@@ -179,6 +255,8 @@ func (s *Server) Handler() http.Handler {
 					s.handlePutDoc(w, r)
 				case http.MethodGet:
 					s.handleGetDoc(w, r)
+				case http.MethodHead:
+					s.handleHeadDoc(w, r)
 				case http.MethodDelete:
 					s.handleDeleteDoc(w, r)
 				default:
@@ -187,7 +265,7 @@ func (s *Server) Handler() http.Handler {
 			case "_update":
 				s.handleUpdateDoc(w, r)
 			case "_source":
-				s.handleGetDoc(w, r)
+				s.handleGetSource(w, r)
 			default:
 				writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
 			}
@@ -198,14 +276,14 @@ func (s *Server) Handler() http.Handler {
 	})
 }
 
-func (s *Server) handleRootHandshake(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRootHandshake(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name":         "doris-es-proxy",
 		"cluster_name": "apache-doris-search-cluster",
 		"cluster_uuid": "doris-es-0000-0000-0000-000000000001",
 		"version": map[string]any{
 			"number":                              "7.10.2",
-			"build_flavor":                        "oss",
+			"build_flavor":                        "default",
 			"build_type":                          "tar",
 			"build_hash":                          "doris4x",
 			"lucene_version":                      "9.10.0",
@@ -216,7 +294,7 @@ func (s *Server) handleRootHandshake(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleClusterHealth(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleClusterHealth(w http.ResponseWriter, _ *http.Request) {
 	s.mu.RLock()
 	numIndices := len(s.indices)
 	s.mu.RUnlock()
@@ -234,11 +312,44 @@ func (s *Server) handleClusterHealth(w http.ResponseWriter, r *http.Request) {
 		"unassigned_shards":               0,
 		"delayed_unassigned_shards":       0,
 		"number_of_pending_tasks":         0,
-		"Active_shards_percent_as_number": 100.0,
+		"active_shards_percent_as_number": 100.0,
 	})
 }
 
-func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleClusterSettings(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPut {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"acknowledged": true,
+			"persistent":   map[string]any{},
+			"transient":    map[string]any{},
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"persistent": map[string]any{},
+		"transient":  map[string]any{},
+	})
+}
+
+func (s *Server) handleIndexSettings(w http.ResponseWriter, r *http.Request) {
+	indexName := s.resolveIndexName(r.PathValue("index"))
+	if r.Method == http.MethodPut {
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		indexName: map[string]any{
+			"settings": map[string]any{
+				"index": map[string]any{
+					"number_of_shards":   "1",
+					"number_of_replicas": "0",
+				},
+			},
+		},
+	})
+}
+
+func (s *Server) handleNodes(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
 		"cluster_name": "apache-doris-search-cluster",
@@ -252,10 +363,10 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleCatIndices(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleCatIndices(w http.ResponseWriter, _ *http.Request) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	var list []map[string]any
+	list := make([]map[string]any, 0, len(s.indices))
 	for name := range s.indices {
 		list = append(list, map[string]any{
 			"health": "green",
@@ -266,10 +377,114 @@ func (s *Server) handleCatIndices(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, list)
 }
 
-func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleCatAliases(w http.ResponseWriter, _ *http.Request) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var list []map[string]any
+	for alias, targets := range s.aliases {
+		for _, idx := range targets {
+			list = append(list, map[string]any{
+				"alias": alias,
+				"index": idx,
+			})
+		}
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (s *Server) handleRefresh(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0},
 	})
+}
+
+func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodDelete {
+		writeJSON(w, http.StatusOK, map[string]any{"succeeded": true, "num_freed": 1})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"_scroll_id": "doris-scroll-eof",
+		"took":       1,
+		"timed_out":  false,
+		"_shards":    map[string]any{"total": 1, "successful": 1, "skipped": 0, "failed": 0},
+		"hits": map[string]any{
+			"total":     map[string]any{"value": 0, "relation": "eq"},
+			"max_score": nil,
+			"hits":      []any{},
+		},
+	})
+}
+
+func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	switch r.Method {
+	case http.MethodPut, http.MethodPost:
+		var tpl esast.IndexTemplateRequest
+		if r.Body != nil {
+			bodyBytes, _ := io.ReadAll(r.Body)
+			if len(bytes.TrimSpace(bodyBytes)) > 0 {
+				if err := json.Unmarshal(bodyBytes, &tpl); err != nil {
+					writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+					return
+				}
+			}
+		}
+		s.mu.Lock()
+		s.templates[name] = tpl
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+	case http.MethodHead:
+		s.mu.RLock()
+		_, ok := s.templates[name]
+		s.mu.RUnlock()
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	case http.MethodGet:
+		s.mu.RLock()
+		tpl, ok := s.templates[name]
+		s.mu.RUnlock()
+		if !ok {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "index_template ["+name+"] missing")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"index_templates": []map[string]any{
+				{"name": name, "index_template": tpl},
+			},
+		})
+	case http.MethodDelete:
+		s.mu.Lock()
+		delete(s.templates, name)
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+	default:
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
+	}
+}
+
+func (s *Server) matchingTemplateMappingsLocked(indexName string) *esast.MappingSpec {
+	var merged *esast.MappingSpec
+	tplNames := make([]string, 0, len(s.templates))
+	for k := range s.templates {
+		tplNames = append(tplNames, k)
+	}
+	sort.Strings(tplNames)
+	for _, name := range tplNames {
+		tpl := s.templates[name]
+		for _, pat := range tpl.EffectivePatterns() {
+			if matchWildcardPattern(pat, indexName) {
+				if m := tpl.EffectiveMappings(); m != nil {
+					merged = schema.MergeMappingSpecs(merged, m)
+				}
+				break
+			}
+		}
+	}
+	return merged
 }
 
 func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
@@ -285,7 +500,12 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	compiled := schema.CompileIndexSchema(s.dorisDB, indexName, req.Mappings)
+	s.mu.RLock()
+	tplMappings := s.matchingTemplateMappingsLocked(indexName)
+	s.mu.RUnlock()
+
+	effectiveMappings := schema.MergeMappingSpecs(tplMappings, req.Mappings)
+	compiled := schema.CompileIndexSchema(s.dorisDB, indexName, effectiveMappings)
 	ddl := schema.GenerateCreateTableDDL(compiled)
 	if err := s.backend.ExecDDL(r.Context(), ddl); err != nil {
 		writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", err.Error())
@@ -295,7 +515,7 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.indices[indexName] = compiled
 	for alias := range req.Aliases {
-		s.aliases[alias] = indexName
+		s.addAliasLocked(alias, indexName)
 	}
 	s.mu.Unlock()
 
@@ -307,33 +527,52 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetIndex(w http.ResponseWriter, r *http.Request) {
-	indexName := s.resolveIndexName(r.PathValue("index"))
-	s.mu.RLock()
-	idx, ok := s.indices[indexName]
-	s.mu.RUnlock()
-	if !ok {
-		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+indexName+"]")
+	targets := s.resolveTargetIndices(r.PathValue("index"))
+	if len(targets) == 0 {
+		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+r.PathValue("index")+"]")
 		return
 	}
-	mappings := map[string]any{}
-	if idx.RawMapping != nil {
-		mappings["properties"] = idx.RawMapping.Properties
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		indexName: map[string]any{
-			"aliases":  map[string]any{},
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	resp := make(map[string]any)
+	for _, indexName := range targets {
+		idx, ok := s.indices[indexName]
+		if !ok {
+			continue
+		}
+		mappings := map[string]any{}
+		if idx.RawMapping != nil {
+			mappings["properties"] = idx.RawMapping.Properties
+		}
+		idxAliases := make(map[string]any)
+		for alias, aliasTargets := range s.aliases {
+			for _, t := range aliasTargets {
+				if t == indexName {
+					idxAliases[alias] = map[string]any{}
+				}
+			}
+		}
+		resp[indexName] = map[string]any{
+			"aliases":  idxAliases,
 			"mappings": mappings,
 			"settings": map[string]any{"index": map[string]any{"number_of_shards": "1", "number_of_replicas": "0"}},
-		},
-	})
+		}
+	}
+	if len(resp) == 0 {
+		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+r.PathValue("index")+"]")
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleHeadIndex(w http.ResponseWriter, r *http.Request) {
-	indexName := s.resolveIndexName(r.PathValue("index"))
+	raw := r.PathValue("index")
 	s.mu.RLock()
-	_, ok := s.indices[indexName]
+	_, isIndex := s.indices[raw]
+	targets, isAlias := s.aliases[raw]
 	s.mu.RUnlock()
-	if !ok {
+	if !isIndex && (!isAlias || len(targets) == 0) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -345,10 +584,8 @@ func (s *Server) handleDeleteIndex(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	idx, ok := s.indices[indexName]
 	delete(s.indices, indexName)
-	for alias, target := range s.aliases {
-		if target == indexName {
-			delete(s.aliases, alias)
-		}
+	for alias := range s.aliases {
+		s.removeAliasTargetLocked(alias, indexName)
 	}
 	s.mu.Unlock()
 
@@ -357,6 +594,22 @@ func (s *Server) handleDeleteIndex(w http.ResponseWriter, r *http.Request) {
 		_ = s.backend.ExecDDL(r.Context(), ddl)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+}
+
+func (s *Server) handleGetAllMappings(w http.ResponseWriter, _ *http.Request) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]any, len(s.indices))
+	for indexName, idx := range s.indices {
+		props := map[string]esast.FieldProperty{}
+		if idx.RawMapping != nil {
+			props = idx.RawMapping.Properties
+		}
+		out[indexName] = map[string]any{
+			"mappings": map[string]any{"properties": props},
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleGetMapping(w http.ResponseWriter, r *http.Request) {
@@ -381,14 +634,33 @@ func (s *Server) handleGetMapping(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePutMapping(w http.ResponseWriter, r *http.Request) {
 	indexName := s.resolveIndexName(r.PathValue("index"))
-	var spec esast.MappingSpec
-	if err := json.NewDecoder(r.Body).Decode(&spec); err != nil {
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
 		writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 		return
 	}
+	var spec esast.MappingSpec
+	if err := json.Unmarshal(bodyBytes, &spec); err != nil {
+		writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+		return
+	}
+	if len(spec.Properties) == 0 {
+		var envelope struct {
+			Mappings *esast.MappingSpec `json:"mappings"`
+		}
+		if err := json.Unmarshal(bodyBytes, &envelope); err == nil && envelope.Mappings != nil {
+			spec = *envelope.Mappings
+		}
+	}
+
 	s.mu.Lock()
 	oldSchema := s.indices[indexName]
-	newSchema := schema.CompileIndexSchema(s.dorisDB, indexName, &spec)
+	var oldRaw *esast.MappingSpec
+	if oldSchema != nil {
+		oldRaw = oldSchema.RawMapping
+	}
+	mergedSpec := schema.MergeMappingSpecs(oldRaw, &spec)
+	newSchema := schema.CompileIndexSchema(s.dorisDB, indexName, mergedSpec)
 	s.indices[indexName] = newSchema
 	s.mu.Unlock()
 
@@ -410,14 +682,42 @@ func (s *Server) handlePutMapping(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetAliases(w http.ResponseWriter, r *http.Request) {
+	aliasFilter := r.PathValue("name")
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
+	if aliasFilter != "" && aliasFilter != "*" && aliasFilter != "_all" {
+		out := make(map[string]any)
+		for alias, targets := range s.aliases {
+			if matchWildcardPattern(aliasFilter, alias) {
+				for _, idxName := range targets {
+					if _, exists := s.indices[idxName]; exists {
+						entry, ok := out[idxName].(map[string]any)
+						if !ok {
+							entry = map[string]any{"aliases": map[string]any{}}
+							out[idxName] = entry
+						}
+						entry["aliases"].(map[string]any)[alias] = map[string]any{}
+					}
+				}
+			}
+		}
+		if len(out) == 0 {
+			writeESError(w, http.StatusNotFound, "alias_not_found_exception", "aliases ["+aliasFilter+"] missing")
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+
 	out := make(map[string]any)
 	for idxName := range s.indices {
 		idxAliases := make(map[string]any)
-		for alias, target := range s.aliases {
-			if target == idxName {
-				idxAliases[alias] = map[string]any{}
+		for alias, targets := range s.aliases {
+			for _, t := range targets {
+				if t == idxName {
+					idxAliases[alias] = map[string]any{}
+				}
 			}
 		}
 		out[idxName] = map[string]any{"aliases": idxAliases}
@@ -425,11 +725,75 @@ func (s *Server) handleGetAliases(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+func (s *Server) handleGetIndexAliases(w http.ResponseWriter, r *http.Request) {
+	indexName := s.resolveIndexName(r.PathValue("index"))
+	s.mu.RLock()
+	_, ok := s.indices[indexName]
+	if !ok {
+		s.mu.RUnlock()
+		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+indexName+"]")
+		return
+	}
+	idxAliases := make(map[string]any)
+	for alias, targets := range s.aliases {
+		for _, t := range targets {
+			if t == indexName {
+				idxAliases[alias] = map[string]any{}
+			}
+		}
+	}
+	s.mu.RUnlock()
+	writeJSON(w, http.StatusOK, map[string]any{
+		indexName: map[string]any{"aliases": idxAliases},
+	})
+}
+
+func (s *Server) handleIndexAliasByName(w http.ResponseWriter, r *http.Request) {
+	indexName := s.resolveIndexName(r.PathValue("index"))
+	aliasName := r.PathValue("name")
+	switch r.Method {
+	case http.MethodPut, http.MethodPost:
+		s.mu.Lock()
+		s.addAliasLocked(aliasName, indexName)
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+	case http.MethodDelete:
+		s.mu.Lock()
+		s.removeAliasTargetLocked(aliasName, indexName)
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+	case http.MethodGet:
+		s.mu.RLock()
+		targets := s.aliases[aliasName]
+		found := false
+		for _, t := range targets {
+			if t == indexName {
+				found = true
+				break
+			}
+		}
+		s.mu.RUnlock()
+		if !found {
+			writeESError(w, http.StatusNotFound, "alias_not_found_exception", "aliases ["+aliasName+"] missing")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			indexName: map[string]any{
+				"aliases": map[string]any{aliasName: map[string]any{}},
+			},
+		})
+	default:
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
+	}
+}
+
 func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 	var payload struct {
 		Actions []map[string]struct {
-			Index string `json:"index"`
-			Alias string `json:"alias"`
+			Index   string   `json:"index"`
+			Indices []string `json:"indices"`
+			Alias   string   `json:"alias"`
+			Aliases []string `json:"aliases"`
 		} `json:"actions"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
@@ -439,19 +803,78 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	for _, action := range payload.Actions {
 		if add, ok := action["add"]; ok {
-			s.aliases[add.Alias] = add.Index
+			indices := add.Indices
+			if add.Index != "" {
+				indices = append(indices, add.Index)
+			}
+			aliases := add.Aliases
+			if add.Alias != "" {
+				aliases = append(aliases, add.Alias)
+			}
+			for _, al := range aliases {
+				for _, idx := range indices {
+					s.addAliasLocked(al, idx)
+				}
+			}
 		}
 		if rem, ok := action["remove"]; ok {
-			delete(s.aliases, rem.Alias)
+			indices := rem.Indices
+			if rem.Index != "" {
+				indices = append(indices, rem.Index)
+			}
+			aliases := rem.Aliases
+			if rem.Alias != "" {
+				aliases = append(aliases, rem.Alias)
+			}
+			for _, al := range aliases {
+				for _, idx := range indices {
+					if idx == "*" || idx == "_all" {
+						delete(s.aliases, al)
+					} else {
+						s.removeAliasTargetLocked(al, idx)
+					}
+				}
+			}
 		}
 	}
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 }
 
+func (s *Server) addAliasLocked(alias, indexName string) {
+	existing := s.aliases[alias]
+	for _, t := range existing {
+		if t == indexName {
+			return
+		}
+	}
+	s.aliases[alias] = append(existing, indexName)
+}
+
+func (s *Server) removeAliasTargetLocked(alias, indexName string) {
+	existing := s.aliases[alias]
+	if len(existing) == 0 {
+		return
+	}
+	var filtered []string
+	for _, t := range existing {
+		if !matchWildcardPattern(indexName, t) {
+			filtered = append(filtered, t)
+		}
+	}
+	if len(filtered) == 0 {
+		delete(s.aliases, alias)
+	} else {
+		s.aliases[alias] = filtered
+	}
+}
+
 func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 	indexName := s.resolveIndexName(r.PathValue("index"))
 	docID := r.PathValue("id")
+	if docID == "" {
+		docID = esast.NextAutoID()
+	}
 	rawDoc, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
@@ -481,6 +904,46 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleHeadDoc(w http.ResponseWriter, r *http.Request) {
+	indexName := s.resolveIndexName(r.PathValue("index"))
+	docID := r.PathValue("id")
+	idxSchema := s.ensureIndexSchema(r.Context(), indexName)
+
+	_, found, err := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, docID)
+	if err != nil || !found {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request) {
+	indexName := s.resolveIndexName(r.PathValue("index"))
+	docID := r.PathValue("id")
+	idxSchema := s.ensureIndexSchema(r.Context(), indexName)
+
+	hit, found, err := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, docID)
+	if err != nil {
+		writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
+		return
+	}
+	if !found {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		writeESError(w, http.StatusNotFound, "resource_not_found_exception", "document missing")
+		return
+	}
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(hit.Source)
+}
+
 func (s *Server) handleGetDoc(w http.ResponseWriter, r *http.Request) {
 	indexName := s.resolveIndexName(r.PathValue("index"))
 	docID := r.PathValue("id")
@@ -500,14 +963,71 @@ func (s *Server) handleGetDoc(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"_index":   indexName,
 		"_type":    "_doc",
 		"_id":      hit.ID,
 		"_version": hit.Version,
 		"found":    true,
 		"_source":  hit.Source,
-	})
+	}
+	if r.URL.Query().Get("_source") == "false" {
+		delete(resp, "_source")
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
+	defaultIndex := s.resolveIndexName(r.PathValue("index"))
+	var body struct {
+		IDs  []string `json:"ids"`
+		Docs []struct {
+			Index  string              `json:"_index"`
+			ID     string              `json:"_id"`
+			Source *esast.SourceFilter `json:"_source,omitempty"`
+		} `json:"docs"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
+	for _, id := range body.IDs {
+		body.Docs = append(body.Docs, struct {
+			Index  string              `json:"_index"`
+			ID     string              `json:"_id"`
+			Source *esast.SourceFilter `json:"_source,omitempty"`
+		}{Index: defaultIndex, ID: id})
+	}
+
+	docsOut := make([]map[string]any, 0, len(body.Docs))
+	for _, spec := range body.Docs {
+		idxName := defaultIndex
+		if spec.Index != "" {
+			idxName = s.resolveIndexName(spec.Index)
+		}
+		idxSchema := s.ensureIndexSchema(r.Context(), idxName)
+		hit, found, err := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, spec.ID)
+		if err != nil || !found {
+			docsOut = append(docsOut, map[string]any{
+				"_index": idxName,
+				"_type":  "_doc",
+				"_id":    spec.ID,
+				"found":  false,
+			})
+			continue
+		}
+		docItem := map[string]any{
+			"_index":   idxName,
+			"_type":    "_doc",
+			"_id":      hit.ID,
+			"_version": hit.Version,
+			"found":    true,
+		}
+		if spec.Source == nil || !spec.Source.Disabled {
+			docItem["_source"] = filterSourceJSON(hit.Source, spec.Source)
+		}
+		docsOut = append(docsOut, docItem)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"docs": docsOut})
 }
 
 func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
@@ -550,7 +1070,7 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
 		return
 	}
-	if !found && !updReq.DocAsUpsert {
+	if !found && !updReq.DocAsUpsert && len(updReq.Upsert) == 0 && !updReq.ScriptedUpsert {
 		writeESError(w, http.StatusNotFound, "document_missing_exception", fmt.Sprintf("[%s]: document missing", docID))
 		return
 	}
@@ -562,21 +1082,24 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 		nextVersion = existingHit.Version + 1
 	}
 
-	mutatedSource, err := painless.ApplyUpdate(baseSource, &updReq)
+	mutatedSource, opResult, err := painless.ApplyUpdateWithResult(baseSource, &updReq, found)
 	if err != nil {
 		writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
 		return
 	}
 
-	shredded, err := schema.ShredDocument(idxSchema, docID, nextVersion, false, mutatedSource)
-	if err != nil {
-		writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
-		return
-	}
-	syncRefresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh") == "wait_for"
-	if err := s.backend.StreamLoad(r.Context(), idxSchema.DorisTable, append(shredded, '\n'), syncRefresh); err != nil {
-		writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
-		return
+	if opResult != "noop" {
+		isDelete := opResult == "deleted"
+		shredded, err := schema.ShredDocument(idxSchema, docID, nextVersion, isDelete, mutatedSource)
+		if err != nil {
+			writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+			return
+		}
+		syncRefresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh") == "wait_for"
+		if err := s.backend.StreamLoad(r.Context(), idxSchema.DorisTable, append(shredded, '\n'), syncRefresh); err != nil {
+			writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
+			return
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -584,72 +1107,164 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 		"_type":    "_doc",
 		"_id":      docID,
 		"_version": nextVersion,
-		"result":   "updated",
+		"result":   opResult,
 	})
 }
 
 func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
-	indexName := s.resolveIndexName(r.PathValue("index"))
-	idxSchema := s.ensureIndexSchema(r.Context(), indexName)
+	targets := s.resolveTargetIndices(r.PathValue("index"))
+	if len(targets) == 0 {
+		targets = []string{s.resolveIndexName(r.PathValue("index"))}
+	}
 
 	var body struct {
-		Query  *esast.Query        `json:"query,omitempty"`
+		Query  *esast.Query         `json:"query,omitempty"`
 		Script *painless.ScriptSpec `json:"script,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
-		return
+	if r.Body != nil {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &body); err != nil {
+				writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+				return
+			}
+		}
 	}
 
-	tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
-	size := 10000
-	plan, err := tr.BuildSearchPlan(&esast.SearchRequest{
-		Query: body.Query,
-		Size:  &size,
-	})
-	if err != nil {
-		writeESError(w, http.StatusBadRequest, "query_shard_exception", err.Error())
-		return
-	}
-
-	hits, err := s.backend.QueryHits(r.Context(), plan.HitsSQL)
-	if err != nil {
-		writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
-		return
-	}
-
-	var batchBuf bytes.Buffer
+	totalMatched := 0
+	totalUpdated := 0
+	totalDeleted := 0
 	updSpec := &painless.UpdateRequest{Script: body.Script}
-	for _, h := range hits {
-		mutated, err := painless.ApplyUpdate(h.Source, updSpec)
-		if err != nil {
-			writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
-			return
-		}
-		shredded, err := schema.ShredDocument(idxSchema, h.ID, h.Version+1, false, mutated)
-		if err != nil {
-			writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
-			return
-		}
-		batchBuf.Write(shredded)
-		batchBuf.WriteByte('\n')
-	}
 
-	if batchBuf.Len() > 0 {
-		if err := s.backend.StreamLoad(r.Context(), idxSchema.DorisTable, batchBuf.Bytes(), true); err != nil {
-			writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
+	for _, indexName := range targets {
+		idxSchema := s.ensureIndexSchema(r.Context(), indexName)
+		tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
+		size := 10000
+		plan, err := tr.BuildSearchPlan(&esast.SearchRequest{
+			Query: body.Query,
+			Size:  &size,
+		})
+		if err != nil {
+			writeESError(w, http.StatusBadRequest, "query_shard_exception", err.Error())
 			return
+		}
+
+		hits, err := s.backend.QueryHits(r.Context(), plan.HitsSQL)
+		if err != nil {
+			writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
+			return
+		}
+		totalMatched += len(hits)
+
+		var batchBuf bytes.Buffer
+		for _, h := range hits {
+			mutated, opRes, err := painless.ApplyUpdateWithResult(h.Source, updSpec, true)
+			if err != nil {
+				writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
+				return
+			}
+			if opRes == "noop" {
+				continue
+			}
+			isDel := opRes == "deleted"
+			shredded, err := schema.ShredDocument(idxSchema, h.ID, h.Version+1, isDel, mutated)
+			if err != nil {
+				writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+				return
+			}
+			batchBuf.Write(shredded)
+			batchBuf.WriteByte('\n')
+			if isDel {
+				totalDeleted++
+			} else {
+				totalUpdated++
+			}
+		}
+
+		if batchBuf.Len() > 0 {
+			if err := s.backend.StreamLoad(r.Context(), idxSchema.DorisTable, batchBuf.Bytes(), true); err != nil {
+				writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
+				return
+			}
 		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"took":    5,
+		"took":      5,
 		"timed_out": false,
-		"total":   len(hits),
-		"updated": len(hits),
-		"deleted": 0,
-		"batches": 1,
-		"failures": []any{},
+		"total":     totalMatched,
+		"updated":   totalUpdated,
+		"deleted":   totalDeleted,
+		"batches":   1,
+		"noops":     totalMatched - totalUpdated - totalDeleted,
+		"failures":  []any{},
+	})
+}
+
+func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
+	targets := s.resolveTargetIndices(r.PathValue("index"))
+	if len(targets) == 0 {
+		targets = []string{s.resolveIndexName(r.PathValue("index"))}
+	}
+
+	var body struct {
+		Query *esast.Query `json:"query,omitempty"`
+	}
+	if r.Body != nil {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &body); err != nil {
+				writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+				return
+			}
+		}
+	}
+
+	totalDeleted := 0
+	for _, indexName := range targets {
+		idxSchema := s.ensureIndexSchema(r.Context(), indexName)
+		tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
+		size := 10000
+		plan, err := tr.BuildSearchPlan(&esast.SearchRequest{
+			Query: body.Query,
+			Size:  &size,
+		})
+		if err != nil {
+			writeESError(w, http.StatusBadRequest, "query_shard_exception", err.Error())
+			return
+		}
+
+		hits, err := s.backend.QueryHits(r.Context(), plan.HitsSQL)
+		if err != nil {
+			writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
+			return
+		}
+
+		var batchBuf bytes.Buffer
+		for _, h := range hits {
+			tombstone, err := schema.ShredDocument(idxSchema, h.ID, h.Version+1, true, nil)
+			if err != nil {
+				continue
+			}
+			batchBuf.Write(tombstone)
+			batchBuf.WriteByte('\n')
+			totalDeleted++
+		}
+		if batchBuf.Len() > 0 {
+			if err := s.backend.StreamLoad(r.Context(), idxSchema.DorisTable, batchBuf.Bytes(), true); err != nil {
+				writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
+				return
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"took":      4,
+		"timed_out": false,
+		"total":     totalDeleted,
+		"deleted":   totalDeleted,
+		"batches":   1,
+		"failures":  []any{},
 	})
 }
 
@@ -663,6 +1278,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 
 	byIndex := make(map[string]*bytes.Buffer)
 	var items []map[string]any
+	hasErrors := false
 	seqBase := time.Now().UnixNano()
 
 	for i, op := range ops {
@@ -680,17 +1296,22 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			var upd painless.UpdateRequest
 			if err := json.Unmarshal(op.Source, &upd); err == nil {
 				var baseSrc json.RawMessage
-				if existing, found, _ := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, op.ID); found {
+				_, found, _ := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, op.ID)
+				if existing, ok, _ := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, op.ID); ok {
 					baseSrc = existing.Source
 				}
-				if merged, err := painless.ApplyUpdate(baseSrc, &upd); err == nil {
+				if merged, opRes, err := painless.ApplyUpdateWithResult(baseSrc, &upd, found); err == nil {
 					sourceToShred = merged
+					if opRes == "deleted" {
+						deleted = true
+					}
 				}
 			}
 		}
 
 		shredded, err := schema.ShredDocument(idxSchema, op.ID, seqBase+int64(i), deleted, sourceToShred)
 		if err != nil {
+			hasErrors = true
 			items = append(items, map[string]any{
 				op.Action: map[string]any{
 					"_index": targetIndex,
@@ -735,15 +1356,12 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"took":   4,
-		"errors": false,
+		"errors": hasErrors,
 		"items":  items,
 	})
 }
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
-	indexName := s.resolveIndexName(r.PathValue("index"))
-	idxSchema := s.ensureIndexSchema(r.Context(), indexName)
-
 	var req esast.SearchRequest
 	if r.Body != nil {
 		bodyBytes, _ := io.ReadAll(r.Body)
@@ -754,39 +1372,221 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	applyURISearchParams(r, &req)
 
-	tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
-	plan, err := tr.BuildSearchPlan(&req)
-	if err != nil {
-		writeESError(w, http.StatusBadRequest, "search_phase_execution_exception", err.Error())
+	resp, status, errType, errReason := s.executeSearchRequest(r.Context(), r.PathValue("index"), &req)
+	if errType != "" {
+		writeESError(w, status, errType, errReason)
 		return
 	}
-
-	var hits []HitRow
-	var aggRows []AggRow
-	if plan.HitsSQL != "" {
-		hits, err = s.backend.QueryHits(r.Context(), plan.HitsSQL)
-		if err != nil {
-			writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
-			return
-		}
-	}
-	if plan.AggsSQL != "" {
-		aggRows, err = s.backend.QueryAggs(r.Context(), plan.AggsSQL)
-		if err != nil {
-			writeESError(w, http.StatusInternalServerError, "doris_aggs_exception", err.Error())
-			return
-		}
-	}
-
-	resp := buildESResponse(indexName, &req, hits, aggRows)
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) handleCount(w http.ResponseWriter, r *http.Request) {
-	indexName := s.resolveIndexName(r.PathValue("index"))
-	idxSchema := s.ensureIndexSchema(r.Context(), indexName)
+func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
+	defaultIndex := r.PathValue("index")
+	if r.Body == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"took": 1, "responses": []any{}})
+		return
+	}
+	scanner := bufio.NewScanner(r.Body)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024)
 
+	var responses []map[string]any
+	for {
+		var headerLine []byte
+		for scanner.Scan() {
+			trimmed := bytes.TrimSpace(scanner.Bytes())
+			if len(trimmed) > 0 {
+				headerLine = append([]byte(nil), trimmed...)
+				break
+			}
+		}
+		if len(headerLine) == 0 {
+			break
+		}
+		var bodyLine []byte
+		if scanner.Scan() {
+			bodyLine = append([]byte(nil), bytes.TrimSpace(scanner.Bytes())...)
+		}
+
+		var hdr struct {
+			Index   any `json:"index"`
+			Indices any `json:"indices"`
+		}
+		_ = json.Unmarshal(headerLine, &hdr)
+		targetIdx := defaultIndex
+		switch v := hdr.Index.(type) {
+		case string:
+			if v != "" {
+				targetIdx = v
+			}
+		case []any:
+			var parts []string
+			for _, item := range v {
+				parts = append(parts, fmt.Sprintf("%v", item))
+			}
+			if len(parts) > 0 {
+				targetIdx = strings.Join(parts, ",")
+			}
+		}
+
+		var req esast.SearchRequest
+		if len(bodyLine) > 0 {
+			if err := json.Unmarshal(bodyLine, &req); err != nil {
+				responses = append(responses, map[string]any{
+					"status": http.StatusBadRequest,
+					"error":  map[string]any{"type": "parsing_exception", "reason": err.Error()},
+				})
+				continue
+			}
+		}
+
+		resp, status, errType, errReason := s.executeSearchRequest(r.Context(), targetIdx, &req)
+		if errType != "" {
+			responses = append(responses, map[string]any{
+				"status": status,
+				"error":  map[string]any{"type": errType, "reason": errReason},
+			})
+			continue
+		}
+		responses = append(responses, resp)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"took":      4,
+		"responses": responses,
+	})
+}
+
+func (s *Server) executeSearchRequest(
+	ctx context.Context,
+	rawIndexPattern string,
+	req *esast.SearchRequest,
+) (map[string]any, int, string, string) {
+	targets := s.resolveTargetIndices(rawIndexPattern)
+	if len(targets) == 0 {
+		// If wildcard pattern matched nothing, return empty 200 search response (like ES with allow_no_indices=true)
+		if strings.Contains(rawIndexPattern, "*") || rawIndexPattern == "_all" {
+			return buildESResponse(rawIndexPattern, req, nil, nil), http.StatusOK, "", ""
+		}
+		targets = []string{s.resolveIndexName(rawIndexPattern)}
+	}
+
+	from := 0
+	if req.From != nil && *req.From > 0 {
+		from = *req.From
+	}
+	size := 10
+	if req.Size != nil {
+		size = *req.Size
+	}
+
+	var allHits []HitRow
+	var allAggRows []AggRow
+	var totalHitsSum int64
+
+	for _, indexName := range targets {
+		idxSchema := s.ensureIndexSchema(ctx, indexName)
+		subReq := *req
+		if len(targets) > 1 && size > 0 {
+			zero := 0
+			fetchSize := from + size
+			subReq.From = &zero
+			subReq.Size = &fetchSize
+		}
+
+		tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
+		plan, err := tr.BuildSearchPlan(&subReq)
+		if err != nil {
+			return nil, http.StatusBadRequest, "search_phase_execution_exception", err.Error()
+		}
+
+		var idxTotal int64
+		if plan.HitsSQL != "" {
+			hits, err := s.backend.QueryHits(ctx, plan.HitsSQL)
+			if err != nil {
+				return nil, http.StatusInternalServerError, "doris_query_exception", err.Error()
+			}
+			for i := range hits {
+				hits[i].Index = indexName
+				if hits[i].TotalHits > idxTotal {
+					idxTotal = hits[i].TotalHits
+				}
+			}
+			allHits = append(allHits, hits...)
+		}
+		if plan.AggsSQL != "" {
+			aggRows, err := s.backend.QueryAggs(ctx, plan.AggsSQL)
+			if err != nil {
+				return nil, http.StatusInternalServerError, "doris_aggs_exception", err.Error()
+			}
+			for _, r := range aggRows {
+				if r.AggName == "__meta_total" && idxTotal == 0 {
+					idxTotal = r.effectiveCount()
+				}
+			}
+			allAggRows = append(allAggRows, aggRows...)
+		}
+		totalHitsSum += idxTotal
+	}
+
+	if len(targets) > 1 {
+		sort.SliceStable(allHits, func(i, j int) bool {
+			if allHits[i].Score != allHits[j].Score {
+				return allHits[i].Score > allHits[j].Score
+			}
+			return allHits[i].ID < allHits[j].ID
+		})
+		if from >= len(allHits) {
+			allHits = nil
+		} else {
+			end := from + size
+			if end > len(allHits) {
+				end = len(allHits)
+			}
+			allHits = allHits[from:end]
+		}
+		for i := range allHits {
+			allHits[i].TotalHits = totalHitsSum
+		}
+		allAggRows = mergeMultiIndexAggRows(allAggRows, totalHitsSum)
+	}
+
+	primaryIndex := targets[0]
+	return buildESResponse(primaryIndex, req, allHits, allAggRows), http.StatusOK, "", ""
+}
+
+func mergeMultiIndexAggRows(rows []AggRow, totalHits int64) []AggRow {
+	type key struct {
+		agg    string
+		bucket string
+	}
+	merged := make(map[key]*AggRow)
+	var order []key
+	for _, r := range rows {
+		if r.AggName == "__meta_total" {
+			continue
+		}
+		k := key{agg: r.AggName, bucket: r.BucketKey}
+		if existing, ok := merged[k]; ok {
+			existing.DocCount += r.effectiveCount()
+			existing.Value += r.effectiveValue()
+		} else {
+			cp := r
+			cp.DocCount = r.effectiveCount()
+			cp.Value = r.effectiveValue()
+			merged[k] = &cp
+			order = append(order, k)
+		}
+	}
+	out := []AggRow{{AggName: "__meta_total", BucketKey: "_count", DocCount: totalHits, Value: float64(totalHits)}}
+	for _, k := range order {
+		out = append(out, *merged[k])
+	}
+	return out
+}
+
+func (s *Server) handleCount(w http.ResponseWriter, r *http.Request) {
 	var req esast.SearchRequest
 	if r.Body != nil {
 		bodyBytes, _ := io.ReadAll(r.Body)
@@ -794,31 +1594,82 @@ func (s *Server) handleCount(w http.ResponseWriter, r *http.Request) {
 			_ = json.Unmarshal(bodyBytes, &req)
 		}
 	}
+	applyURISearchParams(r, &req)
 	zero := 0
 	req.Size = &zero
-	tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
-	plan, err := tr.BuildSearchPlan(&req)
-	if err != nil {
-		writeESError(w, http.StatusBadRequest, "search_phase_execution_exception", err.Error())
-		return
-	}
 
-	aggRows, err := s.backend.QueryAggs(r.Context(), plan.AggsSQL)
-	if err != nil {
-		writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
+	resp, status, errType, errReason := s.executeSearchRequest(r.Context(), r.PathValue("index"), &req)
+	if errType != "" {
+		writeESError(w, status, errType, errReason)
 		return
 	}
 	var count int64
-	for _, row := range aggRows {
-		if row.AggName == "__meta_total" {
-			count = row.DocCount
-			break
+	if hitsObj, ok := resp["hits"].(map[string]any); ok {
+		if totalObj, ok := hitsObj["total"].(map[string]any); ok {
+			if v, ok := totalObj["value"].(int64); ok {
+				count = v
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"count":   count,
 		"_shards": map[string]any{"total": 1, "successful": 1, "skipped": 0, "failed": 0},
 	})
+}
+
+func applyURISearchParams(r *http.Request, req *esast.SearchRequest) {
+	q := r.URL.Query()
+	if qStr := q.Get("q"); qStr != "" && req.Query == nil {
+		req.Query = &esast.Query{
+			QueryString: &esast.QueryStringQuery{
+				Query:           qStr,
+				DefaultField:    q.Get("df"),
+				DefaultOperator: q.Get("default_operator"),
+			},
+		}
+	}
+	if sizeStr := q.Get("size"); sizeStr != "" {
+		if sz, err := strconv.Atoi(sizeStr); err == nil {
+			req.Size = &sz
+		}
+	}
+	if fromStr := q.Get("from"); fromStr != "" {
+		if fr, err := strconv.Atoi(fromStr); err == nil {
+			req.From = &fr
+		}
+	}
+	if sortParam := q.Get("sort"); sortParam != "" && len(req.Sort) == 0 {
+		for _, part := range strings.Split(sortParam, ",") {
+			field := part
+			order := "asc"
+			if idx := strings.IndexByte(part, ':'); idx > 0 {
+				field = part[:idx]
+				order = part[idx+1:]
+			}
+			req.Sort = append(req.Sort, esast.SortSpec{
+				Entry: esast.SortEntry{Field: field, Order: order},
+			})
+		}
+	}
+	if srcParam := q.Get("_source"); srcParam != "" && req.Source == nil {
+		if srcParam == "false" {
+			req.Source = &esast.SourceFilter{Disabled: true}
+		} else if srcParam != "true" {
+			req.Source = &esast.SourceFilter{Includes: strings.Split(srcParam, ",")}
+		}
+	}
+	if inc := q.Get("_source_includes"); inc != "" {
+		if req.Source == nil {
+			req.Source = &esast.SourceFilter{}
+		}
+		req.Source.Includes = append(req.Source.Includes, strings.Split(inc, ",")...)
+	}
+	if exc := q.Get("_source_excludes"); exc != "" {
+		if req.Source == nil {
+			req.Source = &esast.SourceFilter{}
+		}
+		req.Source.Excludes = append(req.Source.Excludes, strings.Split(exc, ",")...)
+	}
 }
 
 func buildESResponse(indexName string, req *esast.SearchRequest, hits []HitRow, aggRows []AggRow) map[string]any {
@@ -833,66 +1684,39 @@ func buildESResponse(indexName string, req *esast.SearchRequest, hits []HitRow, 
 		if h.Score > maxScore {
 			maxScore = h.Score
 		}
-		esHits = append(esHits, map[string]any{
-			"_index":  indexName,
-			"_type":   "_doc",
-			"_id":     h.ID,
-			"_score":  h.Score,
-			"_source": h.Source,
-		})
+		hitIdx := h.Index
+		if hitIdx == "" {
+			hitIdx = indexName
+		}
+		hitMap := map[string]any{
+			"_index": hitIdx,
+			"_type":  "_doc",
+			"_id":    h.ID,
+			"_score": h.Score,
+		}
+		if req.Source == nil || !req.Source.Disabled {
+			hitMap["_source"] = filterSourceJSON(h.Source, req.Source)
+		}
+		if req.Highlight != nil && len(req.Highlight.Fields) > 0 {
+			if hl := buildHighlightMap(h.Source, req); len(hl) > 0 {
+				hitMap["highlight"] = hl
+			}
+		}
+		esHits = append(esHits, hitMap)
 	}
 
-	aggsOut := make(map[string]any)
-	bucketsByAgg := make(map[string][]map[string]any)
+	bucketsByAgg := make(map[string][]AggRow)
 	for _, row := range aggRows {
 		if row.AggName == "__meta_total" {
 			if totalHits == 0 {
-				totalHits = row.DocCount
+				totalHits = row.effectiveCount()
 			}
 			continue
 		}
-		bucketsByAgg[row.AggName] = append(bucketsByAgg[row.AggName], map[string]any{
-			"key":       row.BucketKey,
-			"doc_count": row.DocCount,
-		})
+		bucketsByAgg[row.AggName] = append(bucketsByAgg[row.AggName], row)
 	}
 
-	for aggName, spec := range req.EffectiveAggs() {
-		switch {
-		case spec.Terms != nil:
-			b := bucketsByAgg[aggName]
-			if b == nil {
-				b = []map[string]any{}
-			}
-			aggsOut[aggName] = map[string]any{
-				"doc_count_error_upper_bound": 0,
-				"sum_other_doc_count":         0,
-				"buckets":                     b,
-			}
-		case spec.Nested != nil:
-			nestedObj := map[string]any{"doc_count": totalHits}
-			for subName := range spec.SubAggs() {
-				b := bucketsByAgg[aggName+"."+subName]
-				if b == nil {
-					b = []map[string]any{}
-				}
-				nestedObj[subName] = map[string]any{
-					"doc_count_error_upper_bound": 0,
-					"sum_other_doc_count":         0,
-					"buckets":                     b,
-				}
-			}
-			aggsOut[aggName] = nestedObj
-		case spec.Filter != nil || spec.Missing != nil:
-			var cnt int64
-			if b := bucketsByAgg[aggName]; len(b) > 0 {
-				if c, ok := b[0]["doc_count"].(int64); ok {
-					cnt = c
-				}
-			}
-			aggsOut[aggName] = map[string]any{"doc_count": cnt}
-		}
-	}
+	aggsOut := buildAggsMap("", req.EffectiveAggs(), bucketsByAgg, totalHits)
 
 	res := map[string]any{
 		"took":      3,
@@ -913,18 +1737,385 @@ func buildESResponse(indexName string, req *esast.SearchRequest, hits []HitRow, 
 	return res
 }
 
+func buildAggsMap(
+	prefix string,
+	aggs map[string]esast.AggSpec,
+	bucketsByAgg map[string][]AggRow,
+	totalHits int64,
+) map[string]any {
+	aggsOut := make(map[string]any)
+	for aggName, spec := range aggs {
+		fullKey := aggName
+		if prefix != "" {
+			fullKey = prefix + "." + aggName
+		}
+		rows := bucketsByAgg[fullKey]
+		switch {
+		case spec.Terms != nil:
+			b := make([]map[string]any, 0, len(rows))
+			for _, r := range rows {
+				b = append(b, map[string]any{
+					"key":       r.BucketKey,
+					"doc_count": r.effectiveCount(),
+				})
+			}
+			aggsOut[aggName] = map[string]any{
+				"doc_count_error_upper_bound": 0,
+				"sum_other_doc_count":         0,
+				"buckets":                     b,
+			}
+		case spec.Nested != nil:
+			nestedObj := map[string]any{"doc_count": totalHits}
+			for subName, subSpec := range spec.SubAggs() {
+				subRows := bucketsByAgg[fullKey+"."+subName]
+				if subSpec.Terms != nil {
+					b := make([]map[string]any, 0, len(subRows))
+					for _, r := range subRows {
+						b = append(b, map[string]any{
+							"key":       r.BucketKey,
+							"doc_count": r.effectiveCount(),
+						})
+					}
+					nestedObj[subName] = map[string]any{
+						"doc_count_error_upper_bound": 0,
+						"sum_other_doc_count":         0,
+						"buckets":                     b,
+					}
+				}
+			}
+			aggsOut[aggName] = nestedObj
+		case spec.Filter != nil || spec.Missing != nil:
+			var cnt int64
+			if len(rows) > 0 {
+				cnt = rows[0].effectiveCount()
+			}
+			filterObj := map[string]any{"doc_count": cnt}
+			if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+				for sk, sv := range buildAggsMap(fullKey, subAggs, bucketsByAgg, cnt) {
+					filterObj[sk] = sv
+				}
+			}
+			aggsOut[aggName] = filterObj
+		case spec.Cardinality != nil:
+			var cnt int64
+			if len(rows) > 0 {
+				cnt = rows[0].effectiveCount()
+			}
+			aggsOut[aggName] = map[string]any{"value": cnt}
+		case spec.Avg != nil || spec.Sum != nil || spec.Min != nil || spec.Max != nil:
+			var val float64
+			if len(rows) > 0 {
+				val = rows[0].effectiveValue()
+			}
+			aggsOut[aggName] = map[string]any{"value": val}
+		}
+	}
+	return aggsOut
+}
+
+func filterSourceJSON(raw json.RawMessage, sf *esast.SourceFilter) json.RawMessage {
+	if sf == nil || (len(sf.Includes) == 0 && len(sf.Excludes) == 0) {
+		return raw
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var doc map[string]any
+	if err := dec.Decode(&doc); err != nil {
+		return raw
+	}
+	filtered := filterMapByPaths(doc, "", sf.Includes, sf.Excludes)
+	out, err := json.Marshal(filtered)
+	if err != nil {
+		return raw
+	}
+	return json.RawMessage(out)
+}
+
+func filterMapByPaths(m map[string]any, prefix string, includes, excludes []string) map[string]any {
+	out := make(map[string]any)
+	for k, v := range m {
+		fullPath := k
+		if prefix != "" {
+			fullPath = prefix + "." + k
+		}
+		if matchesAnyGlob(fullPath, excludes) {
+			continue
+		}
+		if len(includes) > 0 {
+			exactOrParentMatch := matchesAnyGlob(fullPath, includes)
+			hasChildInclude := false
+			for _, inc := range includes {
+				if strings.HasPrefix(inc, fullPath+".") {
+					hasChildInclude = true
+					break
+				}
+			}
+			if !exactOrParentMatch && !hasChildInclude {
+				continue
+			}
+			if !exactOrParentMatch && hasChildInclude {
+				if subMap, ok := v.(map[string]any); ok {
+					out[k] = filterMapByPaths(subMap, fullPath, includes, excludes)
+					continue
+				}
+				if subSlice, ok := v.([]any); ok {
+					var newSlice []any
+					for _, elem := range subSlice {
+						if elemMap, ok := elem.(map[string]any); ok {
+							newSlice = append(newSlice, filterMapByPaths(elemMap, fullPath, includes, excludes))
+						} else {
+							newSlice = append(newSlice, elem)
+						}
+					}
+					out[k] = newSlice
+					continue
+				}
+			}
+		}
+		if subMap, ok := v.(map[string]any); ok && len(excludes) > 0 {
+			out[k] = filterMapByPaths(subMap, fullPath, nil, excludes)
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+func matchesAnyGlob(path string, patterns []string) bool {
+	for _, pat := range patterns {
+		if matchWildcardPattern(pat, path) {
+			return true
+		}
+	}
+	return false
+}
+
+func buildHighlightMap(raw json.RawMessage, req *esast.SearchRequest) map[string][]string {
+	if req == nil || req.Highlight == nil || len(req.Highlight.Fields) == 0 {
+		return nil
+	}
+	terms := extractQueryTerms(req.Query)
+	if len(terms) == 0 {
+		return nil
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil
+	}
+	preTag := "<em>"
+	postTag := "</em>"
+	if len(req.Highlight.PreTags) > 0 && req.Highlight.PreTags[0] != "" {
+		preTag = req.Highlight.PreTags[0]
+	}
+	if len(req.Highlight.PostTags) > 0 && req.Highlight.PostTags[0] != "" {
+		postTag = req.Highlight.PostTags[0]
+	}
+
+	out := make(map[string][]string)
+	for field := range req.Highlight.Fields {
+		cleanField := strings.TrimSuffix(strings.TrimSuffix(field, ".keyword"), ".ngram")
+		vals := collectStringValuesAtPath(doc, strings.Split(cleanField, "."))
+		for _, v := range vals {
+			highlighted, matched := highlightTermsInText(v, terms, preTag, postTag)
+			if matched {
+				out[field] = append(out[field], highlighted)
+			}
+		}
+	}
+	return out
+}
+
+func collectStringValuesAtPath(node any, path []string) []string {
+	if node == nil {
+		return nil
+	}
+	if len(path) == 0 {
+		switch v := node.(type) {
+		case string:
+			return []string{v}
+		case []any:
+			var res []string
+			for _, item := range v {
+				res = append(res, collectStringValuesAtPath(item, nil)...)
+			}
+			return res
+		}
+		return nil
+	}
+	switch curr := node.(type) {
+	case map[string]any:
+		return collectStringValuesAtPath(curr[path[0]], path[1:])
+	case []any:
+		var res []string
+		for _, item := range curr {
+			res = append(res, collectStringValuesAtPath(item, path)...)
+		}
+		return res
+	}
+	return nil
+}
+
+func highlightTermsInText(text string, terms []string, preTag, postTag string) (string, bool) {
+	result := text
+	matched := false
+	for _, term := range terms {
+		term = strings.Trim(term, "*?\"")
+		if len(term) == 0 {
+			continue
+		}
+		re, err := regexp.Compile("(?i)" + regexp.QuoteMeta(term))
+		if err != nil {
+			continue
+		}
+		if re.MatchString(result) {
+			matched = true
+			result = re.ReplaceAllStringFunc(result, func(m string) string {
+				return preTag + m + postTag
+			})
+		}
+	}
+	return result, matched
+}
+
+func extractQueryTerms(q *esast.Query) []string {
+	var out []string
+	collectTermsFromQuery(q, &out)
+	return out
+}
+
+func collectTermsFromQuery(q *esast.Query, out *[]string) {
+	if q == nil {
+		return
+	}
+	for _, me := range q.Match {
+		*out = append(*out, strings.Fields(fmt.Sprintf("%v", me.Query))...)
+	}
+	for _, pe := range q.MatchPhrase {
+		if pe.Query != "" {
+			*out = append(*out, pe.Query)
+		}
+	}
+	for _, pe := range q.MatchPhrasePrefix {
+		if pe.Query != "" {
+			*out = append(*out, pe.Query)
+		}
+	}
+	if q.MultiMatch != nil && q.MultiMatch.Query != nil {
+		*out = append(*out, strings.Fields(fmt.Sprintf("%v", q.MultiMatch.Query))...)
+	}
+	if q.QueryString != nil && q.QueryString.Query != "" {
+		for _, tok := range strings.Fields(q.QueryString.Query) {
+			if idx := strings.IndexByte(tok, ':'); idx >= 0 {
+				tok = tok[idx+1:]
+			}
+			tok = strings.Trim(tok, "()*?\"+-")
+			upper := strings.ToUpper(tok)
+			if tok != "" && upper != "AND" && upper != "OR" && upper != "NOT" {
+				*out = append(*out, tok)
+			}
+		}
+	}
+	if q.SimpleQueryString != nil && q.SimpleQueryString.Query != "" {
+		*out = append(*out, strings.Fields(q.SimpleQueryString.Query)...)
+	}
+	for _, we := range q.Wildcard {
+		if cleaned := strings.Trim(we.Value, "*?"); cleaned != "" {
+			*out = append(*out, cleaned)
+		}
+	}
+	for _, pe := range q.Prefix {
+		if pe.Value != "" {
+			*out = append(*out, pe.Value)
+		}
+	}
+	if q.Bool != nil {
+		for i := range q.Bool.Must {
+			collectTermsFromQuery(&q.Bool.Must[i], out)
+		}
+		for i := range q.Bool.Should {
+			collectTermsFromQuery(&q.Bool.Should[i], out)
+		}
+		for i := range q.Bool.Filter {
+			collectTermsFromQuery(&q.Bool.Filter[i], out)
+		}
+	}
+	if q.FunctionScore != nil && q.FunctionScore.Query != nil {
+		collectTermsFromQuery(q.FunctionScore.Query, out)
+	}
+	if q.ConstantScore != nil {
+		collectTermsFromQuery(&q.ConstantScore.Filter, out)
+	}
+}
+
+func (s *Server) resolveTargetIndices(pattern string) []string {
+	if pattern == "" || pattern == "_all" || pattern == "*" {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		var all []string
+		for name := range s.indices {
+			all = append(all, name)
+		}
+		sort.Strings(all)
+		return all
+	}
+
+	parts := strings.Split(pattern, ",")
+	seen := make(map[string]bool)
+	var out []string
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	addTarget := func(idx string) {
+		if idx != "" && !seen[idx] {
+			seen[idx] = true
+			out = append(out, idx)
+		}
+	}
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || strings.HasPrefix(part, "-") {
+			continue
+		}
+		if strings.Contains(part, "*") {
+			for idxName := range s.indices {
+				if matchWildcardPattern(part, idxName) {
+					addTarget(idxName)
+				}
+			}
+			for alias, targets := range s.aliases {
+				if matchWildcardPattern(part, alias) {
+					for _, t := range targets {
+						addTarget(t)
+					}
+				}
+			}
+			continue
+		}
+		if targets, ok := s.aliases[part]; ok && len(targets) > 0 {
+			for _, t := range targets {
+				addTarget(t)
+			}
+			continue
+		}
+		addTarget(part)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (s *Server) resolveIndexName(nameOrAlias string) string {
 	if nameOrAlias == "" {
 		return "default_index"
 	}
-	// Strip comma-separated multi-index patterns to first index for MVP
 	if idx := strings.IndexByte(nameOrAlias, ','); idx > 0 {
 		nameOrAlias = nameOrAlias[:idx]
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if target, ok := s.aliases[nameOrAlias]; ok {
-		return target
+	if targets, ok := s.aliases[nameOrAlias]; ok && len(targets) > 0 {
+		return targets[0]
 	}
 	return nameOrAlias
 }
@@ -932,21 +2123,56 @@ func (s *Server) resolveIndexName(nameOrAlias string) string {
 func (s *Server) ensureIndexSchema(ctx context.Context, indexName string) *schema.IndexSchema {
 	s.mu.RLock()
 	idx, ok := s.indices[indexName]
-	s.mu.RUnlock()
 	if ok {
+		s.mu.RUnlock()
 		return idx
 	}
+	tplMappings := s.matchingTemplateMappingsLocked(indexName)
+	s.mu.RUnlock()
 
-	compiled := schema.CompileIndexSchema(s.dorisDB, indexName, nil)
+	compiled := schema.CompileIndexSchema(s.dorisDB, indexName, tplMappings)
 	_ = s.backend.ExecDDL(ctx, schema.GenerateCreateTableDDL(compiled))
 	s.mu.Lock()
+	if existing, exists := s.indices[indexName]; exists {
+		s.mu.Unlock()
+		return existing
+	}
 	s.indices[indexName] = compiled
 	s.mu.Unlock()
 	return compiled
 }
 
+func matchWildcardPattern(pattern, target string) bool {
+	if pattern == "*" || pattern == "_all" {
+		return true
+	}
+	if !strings.Contains(pattern, "*") {
+		return pattern == target
+	}
+	reStr := "^" + strings.ReplaceAll(regexp.QuoteMeta(pattern), `\*`, ".*") + "$"
+	re, err := regexp.Compile(reStr)
+	if err != nil {
+		return false
+	}
+	return re.MatchString(target)
+}
+
+func setESCompatHeaders(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("X-Elastic-Product", "Elasticsearch")
+	accept := r.Header.Get("Accept")
+	if strings.Contains(accept, "compatible-with=8") {
+		w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=8")
+	} else if strings.Contains(accept, "compatible-with=7") {
+		w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=7")
+	} else {
+		w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+	}
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+	if w.Header().Get("Content-Type") == "" {
+		w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+	}
 	w.Header().Set("X-Elastic-Product", "Elasticsearch")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)

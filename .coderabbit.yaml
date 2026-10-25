@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+
+reviews:
+  profile: assertive
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+  high_level_summary: true
+  poem: false
+  path_filters:
+    - "!go.sum"
+    - "!go.mod"
+    - "!*.lock"
+    - "!flake.lock"
+  path_instructions:
+    - path: "pkg/**"
+      instructions: |
+        Focus on Apache Doris SQL generation safety (identifier quoting, parameter binding, escaping),
+        Elasticsearch/OpenSearch wire-protocol fidelity, error handling, and context propagation.
+    - path: "**/*_test.go"
+      instructions: |
+        Verify table-driven tests, proper cleanup, and race condition safety.
+  tools:
+    golangci-lint:
+      enabled: true
+
+chat:
+  auto_reply: true

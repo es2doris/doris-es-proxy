@@ -99,7 +99,8 @@ func TestTranspileOpenMetadataSearchAndFacetAggregations(t *testing.T) {
 						],
 						"filter": [
 							{"term": {"deleted": false}},
-							{"term": {"tags.tagFQN": "PII.Sensitive"}}
+							{"term": {"tags.tagFQN": "PII.Sensitive"}},
+							{" terms ": {"serviceType": ["BigQuery", "Snowflake"], "boost": 1.0}}
 						]
 					}
 				},
@@ -124,6 +125,7 @@ func TestTranspileOpenMetadataSearchAndFacetAggregations(t *testing.T) {
 		"aggs": {
 			"serviceType": {"terms": {"field": "serviceType", "size": 10}},
 			"tags": {"terms": {"field": "tags.tagFQN", "size": 20}},
+			"distinct_services": {"cardinality": {"field": "serviceType"}},
 			"columns_by_type": {
 				"nested": {"path": "columns"},
 				"aggs": {
@@ -133,6 +135,7 @@ func TestTranspileOpenMetadataSearchAndFacetAggregations(t *testing.T) {
 		},
 		"sort": [{"_score": "desc"}, {"updatedAt": "desc"}]
 	}`
+	searchJSON = strings.ReplaceAll(searchJSON, `" terms "`, `"terms"`)
 
 	var req esast.SearchRequest
 	if err := json.Unmarshal([]byte(searchJSON), &req); err != nil {
@@ -144,14 +147,16 @@ func TestTranspileOpenMetadataSearchAndFacetAggregations(t *testing.T) {
 		t.Fatalf("BuildSearchPlan failed: %v", err)
 	}
 
-	// Verify HitsSQL contains fulltext MATCH_ALL, nested pre-filter + array_exists, array_contains on tags, and function_score
+	// Verify HitsSQL contains fulltext MATCH_ALL in WHERE, projection-safe LIKE in SELECT _score,
+	// nested pre-filter + array_exists, array_contains on tags, and function_score
 	expectedHitsSubstrings := []string{
-		"COALESCE(score(), 1.0)",
+		"CASE WHEN (lower(`f__name`) LIKE lower('%orders%')) THEN 10.0000 ELSE 0.0 END",
 		"`f__name` MATCH_ALL 'orders'",
 		"`f__displayName` MATCH_ALL 'orders'",
 		"array_contains(`n__columns__name`, 'user_id') AND array_contains(`n__columns__dataType`, 'INT')",
 		"array_exists(_el -> (json_extract_string(_el, '$.name') = 'user_id') AND (json_extract_string(_el, '$.dataType') = 'INT'), `n__columns`)",
 		"array_contains(`f__tags__tagFQN`, 'PII.Sensitive')",
+		"`f__serviceType` IN ('BigQuery', 'Snowflake')",
 		"LOG10(1.0 + GREATEST(0.0, (0.0500 * COALESCE(`f__usageSummary__weeklyStats__count`, 0.0000))))",
 		"ORDER BY `_score` DESC, `f__updatedAt` DESC",
 		"LIMIT 20 OFFSET 0",
@@ -162,12 +167,19 @@ func TestTranspileOpenMetadataSearchAndFacetAggregations(t *testing.T) {
 		}
 	}
 
-	// Verify AggsSQL uses Nereids Multi-Cast CTE (`WITH base_matched AS (...)`) + LATERAL VIEW EXPLODE for array/nested facets
+	// Verify MATCH_* never appears inside SELECT projection before FROM
+	fromIdx := strings.Index(plan.HitsSQL, " FROM ")
+	if fromIdx > 0 && strings.Contains(plan.HitsSQL[:fromIdx], "MATCH_") {
+		t.Errorf("SELECT projection must not contain MATCH_* predicate, got:\n%s", plan.HitsSQL[:fromIdx])
+	}
+
+	// Verify AggsSQL uses Nereids Multi-Cast CTE (`WITH base_matched AS (...)`) + LATERAL VIEW EXPLODE + subquery wrapping
 	expectedAggsSubstrings := []string{
 		"WITH `base_matched` AS (SELECT * FROM `es_compat`.`table_search_index`",
 		"FROM `base_matched` LATERAL VIEW EXPLODE(`f__tags__tagFQN`) `_t` AS `_elem`",
 		"FROM `base_matched` LATERAL VIEW EXPLODE(`n__columns`) `_nt` AS `_nel`",
 		"json_extract_string(`_nel`, '$.dataType') AS `_bucket_key`",
+		"COUNT(DISTINCT `f__serviceType`)",
 	}
 	for _, sub := range expectedAggsSubstrings {
 		if !strings.Contains(plan.AggsSQL, sub) {
