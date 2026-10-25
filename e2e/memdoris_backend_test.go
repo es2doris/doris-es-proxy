@@ -540,7 +540,7 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 		inner := expr[len("arrays_overlap(") : len(expr)-1]
 		brackIdx := strings.IndexByte(inner, '[')
 		if brackIdx > 0 {
-			colName := strings.Trim(strings.TrimSpace(inner[: strings.IndexByte(inner, ',')]), "`")
+			colName := strings.Trim(strings.TrimSpace(inner[:strings.IndexByte(inner, ',')]), "`")
 			listStr := strings.TrimSuffix(inner[brackIdx+1:], "]")
 			targets := make(map[string]bool)
 			for _, part := range strings.Split(listStr, ",") {

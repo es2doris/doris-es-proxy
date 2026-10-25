@@ -82,22 +82,22 @@ type IndexSchema struct {
 // DefaultMultiValuedPaths lists common OpenMetadata & DataHub paths that hold arrays of objects/strings
 // even when declared as `"type": "keyword"` or `"type": "object"` (not `"nested"`) in ES mappings.
 var DefaultMultiValuedPaths = map[string]bool{
-	"tags.tagFQN":               true,
-	"tags.name":                 true,
-	"owners":                    true,
-	"owners.id":                 true,
-	"owners.name":               true,
-	"owners.displayName":        true,
+	"tags.tagFQN":                true,
+	"tags.name":                  true,
+	"owners":                     true,
+	"owners.id":                  true,
+	"owners.name":                true,
+	"owners.displayName":         true,
 	"owners.displayName.keyword": true,
-	"followers":                 true,
-	"domains.id":                true,
-	"domains.name":              true,
-	"glossaryTerms":             true,
-	"customProperties":          true,
-	"upstreams":                 true,
-	"downstreams":               true,
-	"browsePaths":               true,
-	"browsePathsV2":             true,
+	"followers":                  true,
+	"domains.id":                 true,
+	"domains.name":               true,
+	"glossaryTerms":              true,
+	"customProperties":           true,
+	"upstreams":                  true,
+	"downstreams":                true,
+	"browsePaths":                true,
+	"browsePathsV2":              true,
 }
 
 // CompileIndexSchema translates an Elasticsearch `_mapping` specification into a Doris `IndexSchema`.
