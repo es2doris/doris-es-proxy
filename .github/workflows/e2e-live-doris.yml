@@ -26,7 +26,7 @@ permissions:
 jobs:
   live-doris-e2e:
     name: E2E against Live Apache Doris Container
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -47,7 +47,7 @@ jobs:
           sudo sysctl -w vm.max_map_count=2000000
           docker run -d --name doris-fe-be --network host apache/doris:all-in-one-4.1.3
           echo "Waiting for Apache Doris FE & BE to become ready..."
-          for i in $(seq 1 90); do
+          for _ in $(seq 1 90); do
             OUT=$(mysql -h 127.0.0.1 -P 9030 -u root -e "SHOW BACKENDS\G" 2>/dev/null || true)
             if echo "$OUT" | grep -q "Alive: true" && ! echo "$OUT" | grep -q "TotalCapacity: 0.000"; then
               echo "Apache Doris FE+BE is alive and BE storage capacity is reported!"

@@ -18,6 +18,7 @@
 package e2e_test
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -35,7 +36,8 @@ import (
 	"github.com/es2doris/doris-es-proxy/pkg/transpiler"
 )
 
-// TestLiveApacheDoris_E2E executes the full OpenMetadata DDL + Stream Load + Search + Aggregation
+// TestLiveApacheDoris_E2E executes the full OpenMetadata DDL + Stream Load + Search + Aggregation +
+// Painless Update + Soft-Delete + Dynamic Auto-Mapping + Stateless _es_catalog Rehydration
 // workflow against a live Apache Doris FE/BE cluster when `DORIS_E2E_DSN` and `DORIS_E2E_HTTP` are set.
 func TestLiveApacheDoris_E2E(t *testing.T) {
 	dsn := os.Getenv("DORIS_E2E_DSN")
@@ -68,9 +70,13 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	backend := proxy.NewDorisSQLBackend(db, slClient)
 	backend.SetLogSQL(true)
 	srv := proxy.NewServer(dorisDB, backend, transpiler.TranspilerOptions{})
+	if err := srv.BootstrapCatalog(context.Background()); err != nil {
+		t.Logf("initial BootstrapCatalog note: %v", err)
+	}
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
+	// 1. Explicit Mapping Creation (VARIANT + Promoted Scalar/Array + Correlated Nested Array + USING INVERTED)
 	createJSON := `{
 		"mappings": {
 			"properties": {
@@ -113,9 +119,12 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 		t.Fatalf("PUT /live_table_index on live Doris failed: status=%d body=%s", createStatus, string(createBody))
 	}
 
+	// 2. Bulk Indexing (2 docs via HTTP Stream Load :8030 -> :8040 redirect)
 	bulkPayload := strings.Join([]string{
 		`{"index":{"_index":"live_table_index","_id":"live-1"}}`,
 		`{"name":"customer_orders","serviceType":"BigQuery","deleted":false,"tags":[{"tagFQN":"PII.Sensitive"}],"columns":[{"name":"user_id","dataType":"INT"}]}`,
+		`{"index":{"_index":"live_table_index","_id":"live-2"}}`,
+		`{"name":"ephemeral_staging","serviceType":"Snowflake","deleted":false,"tags":[],"columns":[{"name":"temp_id","dataType":"VARCHAR"}]}`,
 		"",
 	}, "\n")
 	resp, err := http.Post(ts.URL+"/_bulk?refresh=true", "application/x-ndjson", strings.NewReader(bulkPayload))
@@ -133,9 +142,29 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 		t.Fatalf("POST /_bulk returned item errors: %s", string(bulkBody))
 	}
 
+	// 3. Full-Text Match + Correlated Nested Filter + Terms Aggregation
 	searchPayload := `{
 		"size": 10,
-		"query": {"match": {"name": "customer_orders"}},
+		"query": {
+			"bool": {
+				"must": [
+					{"match": {"name": "customer_orders"}},
+					{
+						"nested": {
+							"path": "columns",
+							"query": {
+								"bool": {
+									"must": [
+										{"term": {"columns.name": "user_id"}},
+										{"term": {"columns.dataType": "INT"}}
+									]
+								}
+							}
+						}
+					}
+				]
+			}
+		},
 		"aggs": {"serviceType": {"terms": {"field": "serviceType", "size": 10}}}
 	}`
 	resp, err = http.Post(ts.URL+"/live_table_index/_search", "application/json", strings.NewReader(searchPayload))
@@ -154,4 +183,63 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	if len(hits) != 1 {
 		t.Fatalf("expected 1 hit from live Doris, got %d: %s", len(hits), string(searchBody))
 	}
+
+	// 4. Painless Partial Update + Point Lookup (GET /_doc/live-1)
+	updatePayload := `{"doc":{"serviceType":"Databricks"}}`
+	resp, err = http.Post(ts.URL+"/live_table_index/_update/live-1?refresh=true", "application/json", strings.NewReader(updatePayload))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_update/live-1 failed: status=%v err=%v", resp.StatusCode, err)
+	}
+	_ = resp.Body.Close()
+
+	resp, err = http.Get(ts.URL + "/live_table_index/_doc/live-1")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /_doc/live-1 failed: status=%v err=%v", resp.StatusCode, err)
+	}
+	var getRes map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&getRes)
+	_ = resp.Body.Close()
+	if getRes["found"] != true || getRes["_source"].(map[string]any)["serviceType"] != "Databricks" {
+		t.Fatalf("expected updated serviceType=Databricks on live Doris, got: %+v", getRes)
+	}
+
+	// 5. Soft-Delete via __DORIS_DELETE_SIGN__ = 1 (DELETE /_doc/live-2)
+	delReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/live_table_index/_doc/live-2?refresh=true", nil)
+	delResp, err := http.DefaultClient.Do(delReq)
+	if err != nil || delResp.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE /_doc/live-2 failed: status=%v err=%v", delResp.StatusCode, err)
+	}
+	_ = delResp.Body.Close()
+
+	resp, err = http.Get(ts.URL + "/live_table_index/_doc/live-2")
+	if err != nil || resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 after DELETE /_doc/live-2 on live Doris, got status=%v err=%v", resp.StatusCode, err)
+	}
+	_ = resp.Body.Close()
+
+	// 6. Dynamic Auto-Mapping on First Bulk Write (no prior PUT /live_auto_index)
+	autoBulk := strings.Join([]string{
+		`{"index":{"_index":"live_auto_index","_id":"auto-1"}}`,
+		`{"service":"checkout-api","latency_ms":42,"ok":true}`,
+		"",
+	}, "\n")
+	resp, err = http.Post(ts.URL+"/_bulk?refresh=true", "application/x-ndjson", strings.NewReader(autoBulk))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_bulk on auto-created index failed: status=%v err=%v", resp.StatusCode, err)
+	}
+	_ = resp.Body.Close()
+
+	// 7. Stateless _es_catalog Rehydration across a fresh Server instance
+	srv2 := proxy.NewServer(dorisDB, backend, transpiler.TranspilerOptions{})
+	if err := srv2.BootstrapCatalog(context.Background()); err != nil {
+		t.Fatalf("srv2.BootstrapCatalog failed: %v", err)
+	}
+	ts2 := httptest.NewServer(srv2.Handler())
+	defer ts2.Close()
+
+	resp, err = http.Get(ts2.URL + "/live_auto_index/_mapping")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /live_auto_index/_mapping on rehydrated server failed: status=%v err=%v", resp.StatusCode, err)
+	}
+	_ = resp.Body.Close()
 }
