@@ -138,7 +138,9 @@ const dorisPlaygroundHTML = `<!DOCTYPE html>
     <div class="sub">Stateless Elasticsearch Query DSL &rarr; Apache Doris 4.x SQL &amp; Nereids Multi-Cast CTE Compiler</div>
   </div>
   <div class="controls">
+    <button class="secondary" onclick="seedDemoData()">Seed Demo Index &amp; Docs</button>
     <button class="secondary" onclick="loadSlowlog()">Auto-Indexing Advisor (/_doris/slowlog)</button>
+    <button class="secondary" onclick="promoteFirstRecommended()">Promote Recommended Field (/_doris/promote)</button>
     <button class="secondary" onclick="loadShadowStats()">Shadow Parity (/_doris/shadow_stats)</button>
   </div>
 </header>
@@ -149,10 +151,16 @@ const dorisPlaygroundHTML = `<!DOCTYPE html>
       <span class="badge">Input DSL</span>
     </h2>
     <div class="controls">
-      <label for="idxInput">Index / Alias:</label>
-      <input id="idxInput" value="table_search_index" />
-      <button class="primary" onclick="runExplain()">Transpile SQL (/_doris/explain)</button>
+      <label for="idxInput">Index:</label>
+      <input id="idxInput" value="table_search_index" style="width: 155px;" />
+      <select id="presetSelect" onchange="applyPreset()">
+        <option value="nested_subaggs">Preset: Nested Filter + Bucket Sub-Aggs + Top Hits</option>
+        <option value="dis_max">Preset: DisMax Multi-Field Tie-Breaker</option>
+        <option value="variant_advisor">Preset: Unindexed Dynamic VARIANT Field (Advisor)</option>
+      </select>
+      <button class="primary" onclick="runExplain()">Transpile SQL</button>
       <button class="secondary" onclick="runLiveSearch()">Execute /_search</button>
+      <button class="secondary" onclick="copyCurl()">Copy cURL</button>
     </div>
     <textarea id="dslInput">{
   "size": 10,
@@ -165,7 +173,7 @@ const dorisPlaygroundHTML = `<!DOCTYPE html>
         { "term": { "deleted": false } },
         { "nested": {
             "path": "columns",
-            "query": { "term": { "columns.dataType": "BIGINT" } }
+            "query": { "term": { "columns.dataType": "INT" } }
           }
         }
       ]
@@ -175,7 +183,8 @@ const dorisPlaygroundHTML = `<!DOCTYPE html>
     "by_service": {
       "terms": { "field": "serviceType", "size": 10 },
       "aggs": {
-        "avg_usage": { "avg": { "field": "usageSummary.weeklyStats.count" } }
+        "avg_usage": { "avg": { "field": "usageSummary.weeklyStats.count" } },
+        "sample_docs": { "top_hits": { "size": 1 } }
       }
     },
     "daily_updates": {
@@ -193,21 +202,113 @@ const dorisPlaygroundHTML = `<!DOCTYPE html>
   </section>
 </main>
 <script>
+const PRESETS = {
+  nested_subaggs: {
+    size: 10,
+    query: {
+      bool: {
+        must: [{ query_string: { query: "+orders -staging" } }],
+        filter: [
+          { term: { deleted: false } },
+          { nested: { path: "columns", query: { term: { "columns.dataType": "INT" } } } }
+        ]
+      }
+    },
+    aggs: {
+      by_service: {
+        terms: { field: "serviceType", size: 10 },
+        aggs: {
+          avg_usage: { avg: { field: "usageSummary.weeklyStats.count" } },
+          sample_docs: { top_hits: { size: 1 } }
+        }
+      }
+    }
+  },
+  dis_max: {
+    size: 10,
+    query: {
+      dis_max: {
+        tie_breaker: 0.3,
+        boost: 1.5,
+        queries: [
+          { match: { name: { query: "orders", boost: 5 } } },
+          { match: { description: { query: "revenue", boost: 2 } } }
+        ]
+      }
+    }
+  },
+  variant_advisor: {
+    size: 5,
+    query: {
+      term: { customGovernanceOwner: "data-platform" }
+    }
+  }
+};
+
+function applyPreset() {
+  const key = document.getElementById('presetSelect').value;
+  if (PRESETS[key]) {
+    document.getElementById('dslInput').value = JSON.stringify(PRESETS[key], null, 2);
+    runExplain();
+  }
+}
+
+async function seedDemoData() {
+  const idx = document.getElementById('idxInput').value || 'table_search_index';
+  await fetch('/' + encodeURIComponent(idx), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      mappings: {
+        properties: {
+          name: { type: 'text', fields: { keyword: { type: 'keyword' } } },
+          description: { type: 'text' },
+          serviceType: { type: 'keyword' },
+          deleted: { type: 'boolean' },
+          updatedAt: { type: 'long' },
+          usageSummary: { properties: { weeklyStats: { properties: { count: { type: 'long' } } } } },
+          columns: { type: 'nested', properties: { name: { type: 'keyword' }, dataType: { type: 'keyword' } } }
+        }
+      }
+    })
+  });
+  const ndjson = [
+    JSON.stringify({ index: { _index: idx, _id: 'tbl-orders' } }),
+    JSON.stringify({ name: 'Customer_Orders', description: 'Customer orders revenue table', serviceType: 'BigQuery', deleted: false, updatedAt: 1729773296001, usageSummary: { weeklyStats: { count: 250 } }, columns: [{ name: 'user_id', dataType: 'INT' }] }),
+    JSON.stringify({ index: { _index: idx, _id: 'tbl-payments' } }),
+    JSON.stringify({ name: 'Stripe_Payments', description: 'Payment transactions for orders', serviceType: 'Snowflake', deleted: false, updatedAt: 1729773296002, usageSummary: { weeklyStats: { count: 80 } }, columns: [{ name: 'user_id', dataType: 'VARCHAR' }] })
+  ].join('\n') + '\n';
+  await fetch('/_bulk?refresh=true', { method: 'POST', headers: { 'Content-Type': 'application/x-ndjson' }, body: ndjson });
+  document.getElementById('outBadge').textContent = 'Demo Seeded';
+  runLiveSearch();
+}
+
 async function runExplain() {
   const idx = document.getElementById('idxInput').value || 'table_search_index';
   const dsl = document.getElementById('dslInput').value;
   document.getElementById('outTitle').textContent = '2. Compiled Apache Doris SQL & DDL (/_doris/explain)';
-  const res = await fetch('/' + encodeURIComponent(idx) + '/_doris/explain', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: dsl
-  });
-  const data = await res.json();
-  let formatted = '-- [HitsSQL]\n' + (data.hits_sql || '(none)') + ';\n\n' +
-                  '-- [AggsSQL - Nereids Multi-Cast CTE]\n' + (data.aggs_sql || '(none)') + ';\n\n' +
-                  '-- [CREATE TABLE DDL]\n' + (data.create_table_ddl || '');
-  document.getElementById('sqlOutput').textContent = formatted;
+  try {
+    const res = await fetch('/' + encodeURIComponent(idx) + '/_doris/explain', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: dsl
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      document.getElementById('outBadge').textContent = 'HTTP ' + res.status;
+      document.getElementById('sqlOutput').textContent = JSON.stringify(data, null, 2);
+      return;
+    }
+    document.getElementById('outBadge').textContent = 'Nereids Ready';
+    let formatted = '-- [HitsSQL]\n' + (data.hits_sql || '(none)') + ';\n\n' +
+                    '-- [AggsSQL - Nereids Multi-Cast CTE]\n' + (data.aggs_sql || '(none)') + ';\n\n' +
+                    '-- [CREATE TABLE DDL]\n' + (data.create_table_ddl || '');
+    document.getElementById('sqlOutput').textContent = formatted;
+  } catch (e) {
+    document.getElementById('sqlOutput').textContent = 'Error: ' + e;
+  }
 }
+
 async function runLiveSearch() {
   const idx = document.getElementById('idxInput').value || 'table_search_index';
   const dsl = document.getElementById('dslInput').value;
@@ -218,19 +319,52 @@ async function runLiveSearch() {
     body: dsl
   });
   const data = await res.json();
+  document.getElementById('outBadge').textContent = 'HTTP ' + res.status;
   document.getElementById('sqlOutput').textContent = JSON.stringify(data, null, 2);
 }
+
 async function loadSlowlog() {
   document.getElementById('outTitle').textContent = 'Auto-Indexing Advisor & Slowlog (/_doris/slowlog)';
   const res = await fetch('/_doris/slowlog');
   const data = await res.json();
+  document.getElementById('outBadge').textContent = (data.auto_index_recommendations || []).length + ' Recommendations';
   document.getElementById('sqlOutput').textContent = JSON.stringify(data, null, 2);
 }
+
+async function promoteFirstRecommended() {
+  const res = await fetch('/_doris/slowlog');
+  const data = await res.json();
+  const recs = data.auto_index_recommendations || [];
+  if (recs.length === 0) {
+    document.getElementById('sqlOutput').textContent = 'No unindexed VARIANT field recommendations pending.';
+    return;
+  }
+  const r0 = recs[0];
+  const pRes = await fetch('/' + encodeURIComponent(r0.index) + '/_doris/promote', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ field: r0.field, type: 'keyword' })
+  });
+  const pData = await pRes.json();
+  document.getElementById('outTitle').textContent = 'Promoted Field to Inverted Index (/_doris/promote)';
+  document.getElementById('outBadge').textContent = 'Promoted: ' + r0.field;
+  document.getElementById('sqlOutput').textContent = JSON.stringify(pData, null, 2);
+}
+
 async function loadShadowStats() {
   document.getElementById('outTitle').textContent = 'Dual-Read Shadow Parity Stats (/_doris/shadow_stats)';
   const res = await fetch('/_doris/shadow_stats');
   const data = await res.json();
+  document.getElementById('outBadge').textContent = 'Shadow Parity';
   document.getElementById('sqlOutput').textContent = JSON.stringify(data, null, 2);
+}
+
+function copyCurl() {
+  const idx = document.getElementById('idxInput').value || 'table_search_index';
+  const dsl = document.getElementById('dslInput').value.replace(/'/g, "'\\''");
+  const cmd = "curl -sS -X POST '" + window.location.origin + "/" + idx + "/_search?doris_explain=true' -H 'Content-Type: application/json' -d '" + dsl + "'";
+  if (navigator.clipboard) navigator.clipboard.writeText(cmd);
+  document.getElementById('outBadge').textContent = 'Copied cURL';
 }
 runExplain();
 </script>

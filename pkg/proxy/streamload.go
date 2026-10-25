@@ -25,8 +25,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
+
+	"github.com/es2doris/doris-es-proxy/pkg/schema"
 )
 
 // StreamLoadConfig configures the Apache Doris HTTP Stream Load client.
@@ -69,8 +72,9 @@ func NewStreamLoadClient(cfg StreamLoadConfig) *StreamLoadClient {
 			if len(via) >= 5 {
 				return fmt.Errorf("stopped after 5 redirects")
 			}
-			if len(via) > 0 {
+			if len(via) > 0 && req.URL.Scheme == via[0].URL.Scheme {
 				if auth := via[0].Header.Get("Authorization"); auth != "" {
+					// #nosec G119 -- Doris FE (:8030) redirects Stream Load PUTs to Doris BE (:8040) on the same scheme
 					req.Header.Set("Authorization", auth)
 				}
 			}
@@ -106,13 +110,16 @@ func (c *StreamLoadClient) LoadNDJSON(
 	if len(bytes.TrimSpace(ndjsonPayload)) == 0 {
 		return nil
 	}
+	safeDB := url.PathEscape(schema.SanitizeDorisIdentifier(c.cfg.Database))
+	safeTable := url.PathEscape(schema.SanitizeDorisIdentifier(table))
 	endpoint := fmt.Sprintf(
 		"%s/api/%s/%s/_stream_load",
 		strings.TrimRight(c.cfg.FEHTTPEndpoint, "/"),
-		c.cfg.Database,
-		table,
+		safeDB,
+		safeTable,
 	)
 
+	// #nosec G704 -- endpoint is constructed from operator-configured FEHTTPEndpoint and sanitized Doris identifiers
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(ndjsonPayload))
 	if err != nil {
 		return err
@@ -126,6 +133,7 @@ func (c *StreamLoadClient) LoadNDJSON(
 	req.Header.Set("delete", "__DORIS_DELETE_SIGN__ = 1")
 	req.Header.Set("function_column.sequence_col", "_version")
 
+	// #nosec G704 -- operator-configured Doris FE/BE Stream Load HTTP request
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("doris stream load HTTP error: %w", err)

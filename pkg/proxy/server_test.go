@@ -45,6 +45,10 @@ func newMockDorisBackend() *mockDorisBackend {
 	}
 }
 
+func (m *mockDorisBackend) Ping(_ context.Context) error {
+	return nil
+}
+
 func (m *mockDorisBackend) ExecDDL(_ context.Context, ddl string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -83,6 +87,18 @@ func (m *mockDorisBackend) GetDocByID(_ context.Context, _, _, id string) (*HitR
 		return nil, false, nil
 	}
 	return &d, true, nil
+}
+
+func (m *mockDorisBackend) GetDocsByIDs(_ context.Context, _, _ string, ids []string) (map[string]HitRow, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]HitRow, len(ids))
+	for _, id := range ids {
+		if d, ok := m.docs[id]; ok {
+			out[id] = d
+		}
+	}
+	return out, nil
 }
 
 func (m *mockDorisBackend) StreamLoad(_ context.Context, _ string, ndjson []byte, _ bool) error {

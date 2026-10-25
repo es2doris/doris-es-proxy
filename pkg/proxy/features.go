@@ -20,13 +20,17 @@ package proxy
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
@@ -147,6 +151,7 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 			w = gzw
 		}
 
+		atomic.AddInt64(&s.totalHTTPRequests, 1)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -282,6 +287,7 @@ type ShadowVerifier struct {
 	mu               sync.RWMutex
 	targetURL        string
 	client           *http.Client
+	sem              chan struct{}
 	totalQueries     int64
 	hitParityMatches int64
 	jaccardSum       float64
@@ -294,48 +300,62 @@ func newShadowVerifier(targetURL string) *ShadowVerifier {
 	return &ShadowVerifier{
 		targetURL: strings.TrimRight(strings.TrimSpace(targetURL), "/"),
 		client:    &http.Client{Timeout: 10 * time.Second},
+		sem:       make(chan struct{}, 16),
 	}
 }
 
 // SetShadowESURL configures dual-read shadow verification against an existing Elasticsearch/OpenSearch endpoint.
-func (s *Server) SetShadowESURL(url string) {
+func (s *Server) SetShadowESURL(urlStr string) {
 	s.shadowVerifier.mu.Lock()
 	defer s.shadowVerifier.mu.Unlock()
-	s.shadowVerifier.targetURL = strings.TrimRight(strings.TrimSpace(url), "/")
+	s.shadowVerifier.targetURL = strings.TrimRight(strings.TrimSpace(urlStr), "/")
 }
 
-func (s *Server) maybeRunShadowSearch(rawIndex string, req *esast.SearchRequest, dorisResp map[string]any, dorisTookMs int64, syncMode bool) {
+func (s *Server) maybeRunShadowSearch(rawIndex string, rawReqBody []byte, dorisResp map[string]any, dorisTookMs int64, syncMode bool) {
 	s.shadowVerifier.mu.RLock()
 	targetURL := s.shadowVerifier.targetURL
 	s.shadowVerifier.mu.RUnlock()
 	if targetURL == "" {
 		return
 	}
+	bodyCopy := make([]byte, len(rawReqBody))
+	copy(bodyCopy, rawReqBody)
+	if len(bytes.TrimSpace(bodyCopy)) == 0 {
+		bodyCopy = []byte(`{}`)
+	}
 	run := func() {
-		s.executeShadowComparison(targetURL, rawIndex, req, dorisResp, dorisTookMs)
+		s.executeShadowComparison(targetURL, rawIndex, bodyCopy, dorisResp, dorisTookMs)
 	}
 	if syncMode {
 		run()
 	} else {
-		go run()
+		select {
+		case s.shadowVerifier.sem <- struct{}{}:
+			go func() {
+				defer func() { <-s.shadowVerifier.sem }()
+				run()
+			}()
+		default:
+			// Drop background shadow replay when all 16 shadow workers are saturated.
+		}
 	}
 }
 
-func (s *Server) executeShadowComparison(targetURL, rawIndex string, req *esast.SearchRequest, dorisResp map[string]any, dorisTookMs int64) {
-	bodyBytes, err := json.Marshal(req)
-	if err != nil {
-		return
-	}
+func (s *Server) executeShadowComparison(targetURL, rawIndex string, bodyBytes []byte, dorisResp map[string]any, dorisTookMs int64) {
 	endpoint := targetURL + "/_search"
 	if rawIndex != "" {
-		endpoint = targetURL + "/" + rawIndex + "/_search"
+		endpoint = targetURL + "/" + url.PathEscape(rawIndex) + "/_search"
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	start := time.Now()
-	httpReq, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
+	// #nosec G704 -- targetURL is operator-configured via --shadow-es-url and rawIndex is URL-path-escaped
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	// #nosec G704 -- operator-configured shadow Elasticsearch comparison client
 	resp, err := s.shadowVerifier.client.Do(httpReq)
 	if err != nil {
 		return
@@ -733,8 +753,10 @@ func writeCatResponse(w http.ResponseWriter, r *http.Request, headers []string, 
 	format := strings.ToLower(r.URL.Query().Get("format"))
 	if format == "text" || format == "txt" {
 		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.WriteHeader(http.StatusOK)
 		if r.URL.Query().Has("v") {
+			// #nosec G705 -- Content-Type is text/plain with X-Content-Type-Options: nosniff
 			_, _ = fmt.Fprintln(w, strings.Join(headers, "\t"))
 		}
 		for _, row := range rows {
@@ -742,6 +764,7 @@ func writeCatResponse(w http.ResponseWriter, r *http.Request, headers []string, 
 			for _, h := range headers {
 				vals = append(vals, fmt.Sprintf("%v", row[h]))
 			}
+			// #nosec G705 -- Content-Type is text/plain with X-Content-Type-Options: nosniff
 			_, _ = fmt.Fprintln(w, strings.Join(vals, "\t"))
 		}
 		return
@@ -753,7 +776,8 @@ func writeCatResponse(w http.ResponseWriter, r *http.Request, headers []string, 
 func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	var body struct {
-		Source struct {
+		MaxDocs *int `json:"max_docs,omitempty"`
+		Source  struct {
 			Index any          `json:"index"`
 			Query *esast.Query `json:"query,omitempty"`
 			Size  *int         `json:"size,omitempty"`
@@ -785,70 +809,100 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	maxDocs := 0
+	if body.MaxDocs != nil && *body.MaxDocs > 0 {
+		maxDocs = *body.MaxDocs
+	}
+	if qMax := r.URL.Query().Get("max_docs"); qMax != "" {
+		if parsed, err := strconv.Atoi(qMax); err == nil && parsed > 0 {
+			maxDocs = parsed
+		}
+	}
+
 	destSchema := s.ensureWritableIndexSchema(r.Context(), destIndex)
 	srcTargets := s.resolveTargetIndices(srcPattern)
 	if len(srcTargets) == 0 {
 		srcTargets = []string{s.resolveIndexName(srcPattern)}
 	}
 
-	var totalMatched, totalCreated, totalDeleted int
+	var totalMatched, totalCreated, totalDeleted, batches int
 	updSpec := &painless.UpdateRequest{Script: body.Script}
-	var batchBuf bytes.Buffer
 	seqBase := time.Now().UnixNano()
+	batchSize := 1000
+	if body.Source.Size != nil && *body.Source.Size > 0 && *body.Source.Size < batchSize {
+		batchSize = *body.Source.Size
+	}
 
 	for _, srcIdx := range srcTargets {
 		srcSchema := s.getOrCompileReadOnlySchema(r.Context(), srcIdx)
 		tr := transpiler.NewTranspiler(srcSchema, s.transpileOpts)
-		fetchSize := 10000
-		if body.Source.Size != nil && *body.Source.Size > 0 {
-			fetchSize = *body.Source.Size
-		}
-		plan, err := tr.BuildSearchPlan(&esast.SearchRequest{
-			Query: body.Source.Query,
-			Size:  &fetchSize,
-		})
-		if err != nil {
-			writeESError(w, http.StatusBadRequest, "search_phase_execution_exception", err.Error())
-			return
-		}
-		hits, err := s.backend.QueryHits(r.Context(), plan.HitsSQL)
-		if err != nil {
-			writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
-			return
-		}
-		for i, h := range hits {
-			totalMatched++
-			docSource := h.Source
-			if body.Script != nil {
-				mutated, opRes, err := painless.ApplyUpdateWithResult(h.Source, updSpec, true)
-				if err != nil {
-					writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
-					return
-				}
-				if opRes == "noop" {
-					continue
-				}
-				if opRes == "deleted" {
-					totalDeleted++
-					continue
-				}
-				docSource = mutated
+		var searchAfter []any
+
+		for {
+			fetchSize := batchSize
+			if maxDocs > 0 && totalMatched+fetchSize > maxDocs {
+				fetchSize = maxDocs - totalMatched
 			}
-			shredded, err := schema.ShredDocument(destSchema, h.ID, seqBase+int64(i), false, docSource)
+			if fetchSize <= 0 {
+				break
+			}
+			plan, err := tr.BuildSearchPlan(&esast.SearchRequest{
+				Query:       body.Source.Query,
+				Size:        &fetchSize,
+				Sort:        esast.SortSlice{{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}}},
+				SearchAfter: searchAfter,
+			})
 			if err != nil {
-				writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+				writeESError(w, http.StatusBadRequest, "search_phase_execution_exception", err.Error())
 				return
 			}
-			batchBuf.Write(shredded)
-			batchBuf.WriteByte('\n')
-			totalCreated++
-		}
-	}
-
-	if batchBuf.Len() > 0 {
-		if err := s.backend.StreamLoad(r.Context(), destSchema.DorisTable, batchBuf.Bytes(), true); err != nil {
-			writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
-			return
+			hits, err := s.backend.QueryHits(r.Context(), plan.HitsSQL)
+			if err != nil {
+				writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
+				return
+			}
+			if len(hits) == 0 {
+				break
+			}
+			batches++
+			var batchBuf bytes.Buffer
+			for i, h := range hits {
+				totalMatched++
+				docSource := h.Source
+				if body.Script != nil {
+					mutated, opRes, err := painless.ApplyUpdateWithResult(h.Source, updSpec, true)
+					if err != nil {
+						writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
+						return
+					}
+					if opRes == "noop" {
+						continue
+					}
+					if opRes == "deleted" {
+						totalDeleted++
+						continue
+					}
+					docSource = mutated
+				}
+				shredded, err := schema.ShredDocument(destSchema, h.ID, seqBase+int64(totalMatched)+int64(i), false, docSource)
+				if err != nil {
+					writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+					return
+				}
+				batchBuf.Write(shredded)
+				batchBuf.WriteByte('\n')
+				totalCreated++
+			}
+			if batchBuf.Len() > 0 {
+				if err := s.backend.StreamLoad(r.Context(), destSchema.DorisTable, batchBuf.Bytes(), true); err != nil {
+					writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
+					return
+				}
+			}
+			searchAfter = []any{hits[len(hits)-1].ID}
+			if len(hits) < fetchSize || (maxDocs > 0 && totalMatched >= maxDocs) {
+				break
+			}
 		}
 	}
 
@@ -857,14 +911,449 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		tookMs = 1
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"took":      tookMs,
-		"timed_out": false,
-		"total":     totalMatched,
-		"updated":   0,
-		"created":   totalCreated,
-		"deleted":   totalDeleted,
-		"batches":   1,
-		"noops":     totalMatched - totalCreated - totalDeleted,
-		"failures":  []any{},
+		"took":                   tookMs,
+		"timed_out":              false,
+		"total":                  totalMatched,
+		"updated":                0,
+		"created":                totalCreated,
+		"deleted":                totalDeleted,
+		"batches":                batches,
+		"version_conflicts":      0,
+		"noops":                  totalMatched - totalCreated - totalDeleted,
+		"retries":                map[string]any{"bulk": 0, "search": 0},
+		"throttled_millis":       0,
+		"requests_per_second":    -1.0,
+		"throttled_until_millis": 0,
+		"failures":               []any{},
 	})
+}
+
+// handleDorisPromoteField implements `POST /{index}/_doris/promote` to atomically promote an unindexed `_doc[...]`
+// VARIANT field into a dedicated `f__*` column with a `USING INVERTED` index and update the index mapping.
+func (s *Server) handleDorisPromoteField(w http.ResponseWriter, r *http.Request) {
+	idxName := s.resolveIndexName(r.PathValue("index"))
+	var req struct {
+		Field string `json:"field"`
+		Type  string `json:"type,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+		return
+	}
+	req.Field = strings.TrimSpace(req.Field)
+	if req.Field == "" {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "field is required")
+		return
+	}
+	if req.Type == "" {
+		req.Type = "keyword"
+	}
+
+	idxSchema := s.ensureWritableIndexSchema(r.Context(), idxName)
+	ddls := schema.GeneratePromoteVariantFieldDDL(idxSchema, req.Field, req.Type)
+	for _, ddl := range ddls {
+		if err := s.backend.ExecDDL(r.Context(), ddl); err != nil {
+			writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", err.Error())
+			return
+		}
+	}
+
+	// Merge the newly promoted field into the index mapping and recompile IndexSchema.
+	patchSpec := &esast.MappingSpec{
+		Properties: buildNestedMappingProps(strings.Split(req.Field, "."), esast.FieldProperty{Type: req.Type}),
+	}
+	s.mu.Lock()
+	var oldRaw *esast.MappingSpec
+	if cur := s.indices[idxName]; cur != nil {
+		oldRaw = cur.RawMapping
+	}
+	mergedSpec := schema.MergeMappingSpecs(oldRaw, patchSpec)
+	compiled := schema.CompileIndexSchema(s.dorisDB, idxName, mergedSpec)
+	s.indices[idxName] = compiled
+	s.mu.Unlock()
+	s.persistIndex(r.Context(), idxName, compiled)
+
+	s.slowTracker.mu.Lock()
+	if byField, ok := s.slowTracker.unindexedFreq[idxName]; ok {
+		delete(byField, req.Field)
+		if len(byField) == 0 {
+			delete(s.slowTracker.unindexedFreq, idxName)
+		}
+	}
+	s.slowTracker.mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"acknowledged":    true,
+		"index":           idxName,
+		"promoted_field":  req.Field,
+		"es_type":         req.Type,
+		"doris_column":    "f__" + schema.SanitizeDorisIdentifier(req.Field),
+		"promoted_column": "f__" + schema.SanitizeDorisIdentifier(req.Field),
+		"executed_ddls":   ddls,
+	})
+}
+
+func buildNestedMappingProps(segments []string, leaf esast.FieldProperty) map[string]esast.FieldProperty {
+	if len(segments) == 0 {
+		return nil
+	}
+	if len(segments) == 1 {
+		return map[string]esast.FieldProperty{segments[0]: leaf}
+	}
+	return map[string]esast.FieldProperty{
+		segments[0]: {
+			Properties: buildNestedMappingProps(segments[1:], leaf),
+		},
+	}
+}
+
+// handleValidateQuery implements `GET/POST /_validate/query` and `GET/POST /{index}/_validate/query`.
+func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
+	rawIndex := r.PathValue("index")
+	targets := s.resolveTargetIndices(rawIndex)
+	if len(targets) == 0 {
+		if rawIndex != "" {
+			targets = []string{s.resolveIndexName(rawIndex)}
+		} else {
+			targets = []string{"_all"}
+		}
+	}
+
+	var req esast.SearchRequest
+	if r.Body != nil && r.Body != http.NoBody {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"valid":   false,
+				"error":   err.Error(),
+				"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0},
+			})
+			return
+		}
+		if len(bytes.TrimSpace(raw)) > 0 {
+			if err := json.Unmarshal(raw, &req); err != nil {
+				writeJSON(w, http.StatusOK, map[string]any{
+					"valid":   false,
+					"error":   err.Error(),
+					"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0},
+				})
+				return
+			}
+		}
+	}
+	applyURISearchParams(r, &req)
+
+	var explanations []map[string]any
+	for _, idxName := range targets {
+		idxSchema := s.getOrCompileReadOnlySchema(r.Context(), idxName)
+		tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
+		plan, err := tr.BuildSearchPlan(&req)
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"valid":   false,
+				"error":   err.Error(),
+				"_shards": map[string]any{"total": len(targets), "successful": len(targets), "failed": 0},
+			})
+			return
+		}
+		expl := plan.HitsSQL
+		if plan.AggsSQL != "" {
+			expl += " ; " + plan.AggsSQL
+		}
+		explanations = append(explanations, map[string]any{
+			"index":       idxName,
+			"valid":       true,
+			"explanation": expl,
+		})
+	}
+
+	resp := map[string]any{
+		"valid":   true,
+		"_shards": map[string]any{"total": len(targets), "successful": len(targets), "failed": 0},
+	}
+	if r.URL.Query().Get("explain") == "true" || r.URL.Query().Has("explain") || r.URL.Query().Get("rewrite") == "true" {
+		resp["explanations"] = explanations
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleAnalyze implements `GET/POST /_analyze` and `GET/POST /{index}/_analyze`.
+func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Analyzer   string `json:"analyzer,omitempty"`
+		Tokenizer  string `json:"tokenizer,omitempty"`
+		Normalizer string `json:"normalizer,omitempty"`
+		Field      string `json:"field,omitempty"`
+		Text       any    `json:"text,omitempty"`
+	}
+	if r.Body != nil && r.Body != http.NoBody {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	if req.Analyzer == "" {
+		req.Analyzer = r.URL.Query().Get("analyzer")
+	}
+	if req.Field == "" {
+		req.Field = r.URL.Query().Get("field")
+	}
+	if req.Text == nil && r.URL.Query().Get("text") != "" {
+		req.Text = r.URL.Query().Get("text")
+	}
+
+	analyzer := strings.ToLower(strings.TrimSpace(req.Analyzer))
+	if analyzer == "" {
+		analyzer = strings.ToLower(strings.TrimSpace(req.Tokenizer))
+	}
+	dorisParser := "standard"
+	if rawIdx := r.PathValue("index"); rawIdx != "" && req.Field != "" {
+		idxSchema := s.getOrCompileReadOnlySchema(r.Context(), s.resolveIndexName(rawIdx))
+		b := idxSchema.ResolveField(req.Field)
+		if b.Analyzer != "" && analyzer == "" {
+			analyzer = strings.ToLower(b.Analyzer)
+		}
+		if b.DorisType == schema.DorisVarchar && b.Analyzer == "" && analyzer == "" {
+			analyzer = "keyword"
+			dorisParser = "none (keyword exact)"
+		}
+	}
+	switch {
+	case strings.Contains(analyzer, "keyword") || req.Normalizer != "":
+		dorisParser = "none (keyword)"
+	case strings.Contains(analyzer, "unicode") || strings.Contains(analyzer, "icu"):
+		dorisParser = "unicode"
+	case strings.Contains(analyzer, "ngram"):
+		dorisParser = "ngram"
+	}
+
+	var texts []string
+	switch tv := req.Text.(type) {
+	case string:
+		texts = []string{tv}
+	case []any:
+		for _, item := range tv {
+			texts = append(texts, fmt.Sprintf("%v", item))
+		}
+	}
+
+	var tokens []map[string]any
+	pos := 0
+	for _, txt := range texts {
+		if strings.Contains(analyzer, "keyword") || req.Normalizer != "" {
+			tok := txt
+			if strings.Contains(strings.ToLower(req.Normalizer), "lower") || strings.Contains(analyzer, "lower") {
+				tok = strings.ToLower(tok)
+			}
+			tokens = append(tokens, map[string]any{
+				"token":        tok,
+				"start_offset": 0,
+				"end_offset":   len(txt),
+				"type":         "word",
+				"position":     pos,
+			})
+			pos++
+			continue
+		}
+		startOff := -1
+		var cur strings.Builder
+		for i, ch := range txt {
+			isWord := (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch > 127
+			if strings.Contains(analyzer, "whitespace") {
+				isWord = ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r'
+			}
+			if isWord {
+				if startOff < 0 {
+					startOff = i
+				}
+				if strings.Contains(analyzer, "whitespace") && !strings.Contains(analyzer, "lower") {
+					cur.WriteRune(ch)
+				} else {
+					cur.WriteRune(unicodeToLower(ch))
+				}
+			} else if startOff >= 0 {
+				tokens = append(tokens, map[string]any{
+					"token":        cur.String(),
+					"start_offset": startOff,
+					"end_offset":   i,
+					"type":         "<ALPHANUM>",
+					"position":     pos,
+				})
+				pos++
+				cur.Reset()
+				startOff = -1
+			}
+		}
+		if startOff >= 0 {
+			tokens = append(tokens, map[string]any{
+				"token":        cur.String(),
+				"start_offset": startOff,
+				"end_offset":   len(txt),
+				"type":         "<ALPHANUM>",
+				"position":     pos,
+			})
+			pos++
+		}
+	}
+	if tokens == nil {
+		tokens = []map[string]any{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"tokens":        tokens,
+		"_doris_parser": dorisParser,
+	})
+}
+
+func unicodeToLower(r rune) rune {
+	if r >= 'A' && r <= 'Z' {
+		return r + ('a' - 'A')
+	}
+	return r
+}
+
+// handleRollover implements `POST /{alias}/_rollover` and `POST /{alias}/_rollover/{new_index}`.
+func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
+	alias := r.PathValue("alias")
+	newIdx := r.PathValue("new_index")
+
+	_ = s.syncCatalogFromBackend(r.Context())
+	s.mu.RLock()
+	targets := s.aliases[alias]
+	s.mu.RUnlock()
+
+	oldIdx := alias + "-000001"
+	if len(targets) > 0 {
+		oldIdx = targets[len(targets)-1]
+	}
+	if newIdx == "" {
+		newIdx = incrementRolloverIndexName(oldIdx)
+	}
+
+	var baseMapping *esast.MappingSpec
+	s.mu.RLock()
+	if oldSchema, ok := s.indices[oldIdx]; ok && oldSchema != nil {
+		baseMapping = oldSchema.RawMapping
+	} else {
+		baseMapping = s.matchingTemplateMappingsLocked(newIdx)
+	}
+	s.mu.RUnlock()
+
+	compiled := schema.CompileIndexSchema(s.dorisDB, newIdx, baseMapping)
+	if err := s.backend.ExecDDL(r.Context(), schema.GenerateCreateTableDDL(compiled)); err != nil {
+		writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", err.Error())
+		return
+	}
+
+	s.mu.Lock()
+	s.indices[newIdx] = compiled
+	s.aliases[alias] = []string{newIdx}
+	s.mu.Unlock()
+	s.persistIndex(r.Context(), newIdx, compiled)
+	s.persistAlias(r.Context(), alias, []string{newIdx})
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"acknowledged":        true,
+		"shards_acknowledged": true,
+		"old_index":           oldIdx,
+		"new_index":           newIdx,
+		"rolled_over":         true,
+		"dry_run":             false,
+		"conditions":          map[string]bool{},
+	})
+}
+
+func incrementRolloverIndexName(name string) string {
+	if idx := strings.LastIndexByte(name, '-'); idx > 0 && idx < len(name)-1 {
+		suffix := name[idx+1:]
+		if n, err := strconv.Atoi(suffix); err == nil {
+			return fmt.Sprintf("%s-%0*d", name[:idx], len(suffix), n+1)
+		}
+	}
+	return name + "-000002"
+}
+
+// handleHealthz implements `GET /healthz` process liveness probe.
+func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+// handleReadyz implements `GET /readyz` backend readiness probe.
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if err := s.backend.Ping(r.Context()); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"status": "not_ready",
+			"error":  err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":   "ready",
+		"doris_db": s.dorisDB,
+	})
+}
+
+// handleMetrics implements `GET /metrics` and `GET /_doris/metrics` in Prometheus text exposition format.
+func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	s.mu.RLock()
+	numIndices := len(s.indices)
+	numAliases := len(s.aliases)
+	numTemplates := len(s.templates)
+	s.mu.RUnlock()
+
+	s.slowTracker.mu.RLock()
+	numSlowQueries := len(s.slowTracker.entries)
+	var unindexedTotal int64
+	for _, fields := range s.slowTracker.unindexedFreq {
+		for _, c := range fields {
+			unindexedTotal += c
+		}
+	}
+	s.slowTracker.mu.RUnlock()
+
+	s.shadowVerifier.mu.RLock()
+	shadowTotal := s.shadowVerifier.totalQueries
+	shadowMatches := s.shadowVerifier.hitParityMatches
+	shadowJaccardSum := s.shadowVerifier.jaccardSum
+	s.shadowVerifier.mu.RUnlock()
+
+	totalReqs := atomic.LoadInt64(&s.totalHTTPRequests)
+
+	var sb strings.Builder
+	sb.WriteString("# HELP doris_es_proxy_http_requests_total Total HTTP requests handled by doris-es-proxy.\n")
+	sb.WriteString("# TYPE doris_es_proxy_http_requests_total counter\n")
+	_, _ = fmt.Fprintf(&sb, "doris_es_proxy_http_requests_total %d\n", totalReqs)
+
+	sb.WriteString("# HELP doris_es_proxy_catalog_indices_total Number of registered Elasticsearch indices.\n")
+	sb.WriteString("# TYPE doris_es_proxy_catalog_indices_total gauge\n")
+	_, _ = fmt.Fprintf(&sb, "doris_es_proxy_catalog_indices_total %d\n", numIndices)
+
+	sb.WriteString("# HELP doris_es_proxy_catalog_aliases_total Number of registered Elasticsearch aliases.\n")
+	sb.WriteString("# TYPE doris_es_proxy_catalog_aliases_total gauge\n")
+	_, _ = fmt.Fprintf(&sb, "doris_es_proxy_catalog_aliases_total %d\n", numAliases)
+
+	sb.WriteString("# HELP doris_es_proxy_catalog_templates_total Number of registered Elasticsearch index templates.\n")
+	sb.WriteString("# TYPE doris_es_proxy_catalog_templates_total gauge\n")
+	_, _ = fmt.Fprintf(&sb, "doris_es_proxy_catalog_templates_total %d\n", numTemplates)
+
+	sb.WriteString("# HELP doris_es_proxy_recorded_queries_total Queries recorded in slowlog ring buffer.\n")
+	sb.WriteString("# TYPE doris_es_proxy_recorded_queries_total gauge\n")
+	_, _ = fmt.Fprintf(&sb, "doris_es_proxy_recorded_queries_total %d\n", numSlowQueries)
+
+	sb.WriteString("# HELP doris_es_proxy_unindexed_variant_accesses_total Unindexed _doc VARIANT field accesses detected.\n")
+	sb.WriteString("# TYPE doris_es_proxy_unindexed_variant_accesses_total counter\n")
+	_, _ = fmt.Fprintf(&sb, "doris_es_proxy_unindexed_variant_accesses_total %d\n", unindexedTotal)
+
+	sb.WriteString("# HELP doris_es_proxy_shadow_queries_total Total dual-read shadow comparison queries executed.\n")
+	sb.WriteString("# TYPE doris_es_proxy_shadow_queries_total counter\n")
+	_, _ = fmt.Fprintf(&sb, "doris_es_proxy_shadow_queries_total %d\n", shadowTotal)
+
+	sb.WriteString("# HELP doris_es_proxy_shadow_parity_matches_total Shadow queries with exact hit-count parity.\n")
+	sb.WriteString("# TYPE doris_es_proxy_shadow_parity_matches_total counter\n")
+	_, _ = fmt.Fprintf(&sb, "doris_es_proxy_shadow_parity_matches_total %d\n", shadowMatches)
+
+	sb.WriteString("# HELP doris_es_proxy_shadow_jaccard_sum Cumulative Top-K Jaccard similarity across shadow queries.\n")
+	sb.WriteString("# TYPE doris_es_proxy_shadow_jaccard_sum counter\n")
+	_, _ = fmt.Fprintf(&sb, "doris_es_proxy_shadow_jaccard_sum %.4f\n", shadowJaccardSum)
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(sb.String()))
 }

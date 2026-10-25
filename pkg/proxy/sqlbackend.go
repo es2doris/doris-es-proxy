@@ -24,6 +24,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
+	"time"
 
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
 )
@@ -38,10 +40,25 @@ type DorisSQLBackend struct {
 }
 
 func NewDorisSQLBackend(db *sql.DB, streamLoad *StreamLoadClient) *DorisSQLBackend {
+	if db != nil {
+		db.SetMaxOpenConns(64)
+		db.SetMaxIdleConns(16)
+		db.SetConnMaxIdleTime(2 * time.Minute)
+		db.SetConnMaxLifetime(5 * time.Minute)
+	}
 	return &DorisSQLBackend{
 		db:         db,
 		streamLoad: streamLoad,
 	}
+}
+
+func (b *DorisSQLBackend) Ping(ctx context.Context) error {
+	if b.db == nil {
+		return nil
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	return b.db.PingContext(pingCtx)
 }
 
 func (b *DorisSQLBackend) SetLogSQL(enabled bool) {
@@ -126,12 +143,14 @@ func (b *DorisSQLBackend) GetDocByID(ctx context.Context, dbName, table, id stri
 	}
 	safeDB := schema.SanitizeDorisIdentifier(dbName)
 	safeTable := schema.SanitizeDorisIdentifier(table)
+	// #nosec G201 -- identifiers are strictly sanitized via schema.SanitizeDorisIdentifier
 	q := fmt.Sprintf(
 		"SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` = ? AND `__DORIS_DELETE_SIGN__` = 0 LIMIT 1",
 		safeDB, safeTable,
 	)
 	var h HitRow
 	var srcStr string
+	// #nosec G701 -- parameterized _id query on strictly sanitized identifier
 	err := b.db.QueryRowContext(ctx, q, id).Scan(&h.ID, &h.Version, &srcStr)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
@@ -142,6 +161,43 @@ func (b *DorisSQLBackend) GetDocByID(ctx context.Context, dbName, table, id stri
 	h.Source = json.RawMessage(srcStr)
 	h.Score = 1.0
 	return &h, true, nil
+}
+
+func (b *DorisSQLBackend) GetDocsByIDs(ctx context.Context, dbName, table string, ids []string) (map[string]HitRow, error) {
+	out := make(map[string]HitRow, len(ids))
+	if b.db == nil || len(ids) == 0 {
+		return out, nil
+	}
+	safeDB := schema.SanitizeDorisIdentifier(dbName)
+	safeTable := schema.SanitizeDorisIdentifier(table)
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	// #nosec G201 -- identifiers are strictly sanitized and values are bound via ? placeholders
+	q := fmt.Sprintf(
+		"SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` IN (%s) AND `__DORIS_DELETE_SIGN__` = 0",
+		safeDB, safeTable, strings.Join(placeholders, ","),
+	)
+	// #nosec G701 -- parameterized IN query on strictly sanitized identifier
+	rows, err := b.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var h HitRow
+		var srcStr string
+		if err := rows.Scan(&h.ID, &h.Version, &srcStr); err != nil {
+			return nil, err
+		}
+		h.Source = json.RawMessage(srcStr)
+		h.Score = 1.0
+		out[h.ID] = h
+	}
+	return out, rows.Err()
 }
 
 func (b *DorisSQLBackend) StreamLoad(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
@@ -184,6 +240,7 @@ func (b *DorisSQLBackend) UpsertCatalogEntry(ctx context.Context, dbName string,
 		return nil
 	}
 	safeDB := schema.SanitizeDorisIdentifier(dbName)
+	// #nosec G201 -- safeDB is strictly sanitized via schema.SanitizeDorisIdentifier
 	q := fmt.Sprintf(
 		"INSERT INTO `%s`.`_es_catalog` (`entity_type`, `entity_key`, `payload_json`, `updated_epoch_ms`) VALUES (?, ?, ?, ?)",
 		safeDB,
@@ -197,6 +254,7 @@ func (b *DorisSQLBackend) DeleteCatalogEntry(ctx context.Context, dbName, entity
 		return nil
 	}
 	safeDB := schema.SanitizeDorisIdentifier(dbName)
+	// #nosec G201 -- safeDB is strictly sanitized via schema.SanitizeDorisIdentifier
 	q := fmt.Sprintf(
 		"DELETE FROM `%s`.`_es_catalog` WHERE `entity_type` = ? AND `entity_key` = ?",
 		safeDB,
@@ -210,6 +268,7 @@ func (b *DorisSQLBackend) LoadCatalogEntries(ctx context.Context, dbName string)
 		return nil, nil
 	}
 	safeDB := schema.SanitizeDorisIdentifier(dbName)
+	// #nosec G201 -- safeDB is strictly sanitized via schema.SanitizeDorisIdentifier
 	q := fmt.Sprintf(
 		"SELECT `entity_type`, `entity_key`, `payload_json`, `updated_epoch_ms` FROM `%s`.`_es_catalog` ORDER BY `updated_epoch_ms` ASC",
 		safeDB,

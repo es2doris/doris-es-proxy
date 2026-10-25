@@ -27,8 +27,11 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -41,6 +44,8 @@ import (
 	"github.com/es2doris/doris-es-proxy/pkg/transpiler"
 )
 
+var version = "dev"
+
 func envOrDefault(key, fallback string) string {
 	if val := strings.TrimSpace(os.Getenv(key)); val != "" {
 		return val
@@ -48,14 +53,47 @@ func envOrDefault(key, fallback string) string {
 	return fallback
 }
 
+func envBoolOrDefault(key string, fallback bool) bool {
+	val := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	switch val {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+func redactDSN(dsn string) string {
+	atIdx := strings.Index(dsn, "@tcp(")
+	if atIdx <= 0 {
+		return dsn
+	}
+	colonIdx := strings.IndexByte(dsn[:atIdx], ':')
+	if colonIdx < 0 || colonIdx+1 == atIdx {
+		return dsn
+	}
+	return dsn[:colonIdx+1] + "***" + dsn[atIdx:]
+}
+
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case "version", "--version", "-v":
+			fmt.Printf("doris-es-proxy %s\n", version)
+			return
 		case "transpile":
 			runTranspileSubcommand(os.Args[2:])
 			return
 		case "ddl":
 			runDDLSubcommand(os.Args[2:])
+			return
+		case "doctor":
+			runDoctorSubcommand(os.Args[2:])
+			return
+		case "migrate-schema":
+			runMigrateSchemaSubcommand(os.Args[2:])
 			return
 		}
 	}
@@ -68,9 +106,9 @@ func main() {
 		dorisPassword       = flag.String("doris-password", envOrDefault("DORIS_PASSWORD", ""), "Apache Doris password (env: DORIS_PASSWORD)")
 		dorisDB             = flag.String("doris-db", envOrDefault("DORIS_DB", "es_compat"), "Target Apache Doris database name (env: DORIS_DB)")
 		shadowESURL         = flag.String("shadow-es-url", envOrDefault("SHADOW_ES_URL", ""), "Optional legacy Elasticsearch URL for dual-read shadow parity verification (env: SHADOW_ES_URL)")
-		useDoris4SearchFunc = flag.Bool("doris4-search-fn", false, "Push query_string down to Apache Doris 4.0 SEARCH() SQL function")
-		inMemoryMode        = flag.Bool("in-memory", false, "Run with in-memory shredded Doris emulator (zero external containers required)")
-		logSQL              = flag.Bool("log-sql", false, "Log transpiled Apache Doris DDL, Stream Load, HitsSQL, and AggsSQL")
+		useDoris4SearchFunc = flag.Bool("doris4-search-fn", envBoolOrDefault("DORIS4_SEARCH_FN", false), "Push query_string down to Apache Doris 4.0 SEARCH() SQL function (env: DORIS4_SEARCH_FN)")
+		inMemoryMode        = flag.Bool("in-memory", envBoolOrDefault("IN_MEMORY", false), "Run with in-memory shredded Doris emulator (env: IN_MEMORY)")
+		logSQL              = flag.Bool("log-sql", envBoolOrDefault("LOG_SQL", false), "Log transpiled Apache Doris DDL, Stream Load, HitsSQL, and AggsSQL (env: LOG_SQL)")
 	)
 	flag.Parse()
 
@@ -93,6 +131,7 @@ func main() {
 			defer func() { _ = sqlDB.Close() }()
 
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			// #nosec G201 -- identifier is strictly sanitized via schema.SanitizeDorisIdentifier
 			createDBSQL := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", schema.SanitizeDorisIdentifier(*dorisDB))
 			if _, err := sqlDB.ExecContext(ctx, createDBSQL); err != nil {
 				log.Printf("warning: initial Doris database bootstrap (%s) deferred until cluster is reachable: %v", createDBSQL, err)
@@ -111,7 +150,7 @@ func main() {
 		sqlBackend := proxy.NewDorisSQLBackend(sqlDB, slClient)
 		sqlBackend.SetLogSQL(*logSQL)
 		backend = sqlBackend
-		log.Printf("doris-es-proxy listening on %s (Doris DB=%q, MySQL DSN=%q, FE HTTP=%q, log-sql=%v)", *listenAddr, *dorisDB, *dorisDSN, *dorisHTTP, *logSQL)
+		log.Printf("doris-es-proxy listening on %s (Doris DB=%q, MySQL DSN=%q, FE HTTP=%q, log-sql=%v)", *listenAddr, *dorisDB, redactDSN(*dorisDSN), *dorisHTTP, *logSQL)
 	}
 
 	srv := proxy.NewServer(*dorisDB, backend, transpiler.TranspilerOptions{
@@ -165,7 +204,8 @@ func runTranspileSubcommand(args []string) {
 
 	var mappingSpec *esast.MappingSpec
 	if *mappingPath != "" {
-		raw, err := os.ReadFile(*mappingPath)
+		// #nosec G304 -- CLI subcommand explicitly reads user-specified local file path
+		raw, err := os.ReadFile(filepath.Clean(*mappingPath))
 		if err != nil {
 			log.Fatalf("failed to read --mapping %s: %v", *mappingPath, err)
 		}
@@ -178,7 +218,8 @@ func runTranspileSubcommand(args []string) {
 	var queryBytes []byte
 	var err error
 	if *queryPath != "" {
-		queryBytes, err = os.ReadFile(*queryPath)
+		// #nosec G304 -- CLI subcommand explicitly reads user-specified local file path
+		queryBytes, err = os.ReadFile(filepath.Clean(*queryPath))
 	} else {
 		queryBytes, err = io.ReadAll(os.Stdin)
 	}
@@ -237,7 +278,8 @@ func runDDLSubcommand(args []string) {
 	var raw []byte
 	var err error
 	if *mappingPath != "" {
-		raw, err = os.ReadFile(*mappingPath)
+		// #nosec G304 -- CLI subcommand explicitly reads user-specified local file path
+		raw, err = os.ReadFile(filepath.Clean(*mappingPath))
 	} else {
 		raw, err = io.ReadAll(os.Stdin)
 	}
@@ -254,6 +296,85 @@ func runDDLSubcommand(args []string) {
 	}
 	idxSchema := schema.CompileIndexSchema(*dorisDB, *indexName, spec)
 	fmt.Println(schema.GenerateCreateTableDDL(idxSchema))
+}
+
+func runDoctorSubcommand(args []string) {
+	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
+	dorisDSN := fs.String("doris-dsn", envOrDefault("DORIS_DSN", "root:@tcp(127.0.0.1:9030)/?interpolateParams=true&timeout=5s"), "Apache Doris FE MySQL DSN")
+	dorisHTTP := fs.String("doris-http", envOrDefault("DORIS_HTTP", "http://127.0.0.1:8030"), "Apache Doris FE HTTP endpoint")
+	_ = fs.Parse(args)
+
+	fmt.Printf("==> doris-es-proxy %s Connectivity Doctor\n", version)
+	fmt.Printf("  1. Checking Doris FE MySQL (%s)... ", redactDSN(*dorisDSN))
+	db, err := sql.Open("mysql", *dorisDSN)
+	if err != nil {
+		fmt.Printf("FAIL (%v)\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var verComment string
+	if err := db.QueryRowContext(ctx, "SELECT @@version_comment").Scan(&verComment); err != nil {
+		fmt.Printf("UNREACHABLE (%v)\n", err)
+	} else {
+		fmt.Printf("OK (%s)\n", verComment)
+	}
+
+	fmt.Printf("  2. Checking Doris FE HTTP (%s)... ", *dorisHTTP)
+	client := &http.Client{Timeout: 3 * time.Second}
+	// #nosec G704 -- operator-supplied --doris-http endpoint in CLI doctor subcommand
+	resp, err := client.Get(strings.TrimRight(*dorisHTTP, "/") + "/api/bootstrap")
+	if err != nil {
+		fmt.Printf("UNREACHABLE (%v)\n", err)
+	} else {
+		_ = resp.Body.Close()
+		fmt.Printf("OK (HTTP %d)\n", resp.StatusCode)
+	}
+}
+
+func runMigrateSchemaSubcommand(args []string) {
+	fs := flag.NewFlagSet("migrate-schema", flag.ExitOnError)
+	esURL := fs.String("es-url", "http://127.0.0.1:9200", "Source Elasticsearch / OpenSearch HTTP URL")
+	indexPattern := fs.String("index", "_all", "Index name or pattern to migrate")
+	dorisDB := fs.String("db", "es_compat", "Target Apache Doris database name")
+	_ = fs.Parse(args)
+
+	endpoint := strings.TrimRight(*esURL, "/") + "/" + url.PathEscape(*indexPattern) + "/_mapping"
+	client := &http.Client{Timeout: 10 * time.Second}
+	// #nosec G704 -- operator-supplied --es-url in CLI migrate-schema subcommand
+	resp, err := client.Get(endpoint)
+	if err != nil {
+		log.Fatalf("failed to fetch mappings from %s: %v", endpoint, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatalf("failed to read mapping response: %v", err)
+	}
+
+	var byIndex map[string]struct {
+		Mappings *esast.MappingSpec `json:"mappings"`
+	}
+	if err := json.Unmarshal(raw, &byIndex); err != nil {
+		log.Fatalf("invalid Elasticsearch _mapping response: %v", err)
+	}
+
+	idxNames := make([]string, 0, len(byIndex))
+	for k := range byIndex {
+		if !strings.HasPrefix(k, ".") {
+			idxNames = append(idxNames, k)
+		}
+	}
+	sort.Strings(idxNames)
+
+	fmt.Printf("-- Generated by doris-es-proxy %s migrate-schema from %s\n", version, *esURL)
+	fmt.Printf("CREATE DATABASE IF NOT EXISTS `%s`;\n\n", schema.SanitizeDorisIdentifier(*dorisDB))
+	for _, idxName := range idxNames {
+		entry := byIndex[idxName]
+		compiled := schema.CompileIndexSchema(*dorisDB, idxName, entry.Mappings)
+		fmt.Printf("-- Index: %s\n%s\n\n", idxName, schema.GenerateCreateTableDDL(compiled))
+	}
 }
 
 func parseMappingJSON(raw []byte) (*esast.MappingSpec, error) {

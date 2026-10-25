@@ -75,10 +75,12 @@ func (r AggRow) effectiveValue() float64 {
 // against Apache Doris so the proxy can run against either a live Doris FE+BE cluster or an
 // in-memory test harness.
 type DorisBackend interface {
+	Ping(ctx context.Context) error
 	ExecDDL(ctx context.Context, ddl string) error
 	QueryHits(ctx context.Context, sql string) ([]HitRow, error)
 	QueryAggs(ctx context.Context, sql string) ([]AggRow, error)
 	GetDocByID(ctx context.Context, db, table, id string) (*HitRow, bool, error)
+	GetDocsByIDs(ctx context.Context, db, table string, ids []string) (map[string]HitRow, error)
 	StreamLoad(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error
 }
 
@@ -102,12 +104,13 @@ type CatalogBackend interface {
 
 // Server implements the Elasticsearch / OpenSearch HTTP REST API adapter backed by Apache Doris.
 type Server struct {
-	dorisDB        string
-	backend        DorisBackend
-	transpileOpts  transpiler.TranspilerOptions
-	maxBodyBytes   int64
-	slowTracker    *SlowQueryTracker
-	shadowVerifier *ShadowVerifier
+	dorisDB           string
+	backend           DorisBackend
+	transpileOpts     transpiler.TranspilerOptions
+	maxBodyBytes      int64
+	slowTracker       *SlowQueryTracker
+	shadowVerifier    *ShadowVerifier
+	totalHTTPRequests int64
 
 	mu        sync.RWMutex
 	indices   map[string]*schema.IndexSchema
@@ -292,6 +295,14 @@ func (s *Server) Handler() http.Handler {
 				s.handleGetAllMappings(w, r)
 			case "_field_caps":
 				s.handleFieldCaps(w, r)
+			case "_analyze":
+				s.handleAnalyze(w, r)
+			case "metrics", "_prometheus":
+				s.handleMetrics(w, r)
+			case "healthz", "_healthz", "livez":
+				s.handleHealthz(w, r)
+			case "readyz", "_readyz":
+				s.handleReadyz(w, r)
 			default:
 				r.SetPathValue("index", segs[0])
 				switch r.Method {
@@ -336,6 +347,10 @@ func (s *Server) Handler() http.Handler {
 				s.handleDorisSlowlog(w, r)
 			case segs[0] == "_doris" && segs[1] == "shadow_stats":
 				s.handleDorisShadowStats(w, r)
+			case segs[0] == "_doris" && segs[1] == "metrics":
+				s.handleMetrics(w, r)
+			case segs[0] == "_validate" && segs[1] == "query":
+				s.handleValidateQuery(w, r)
 			case segs[0] == "_ingest" && segs[1] == "pipeline":
 				s.handleIngestPipeline(w, r)
 			case segs[0] == "_alias":
@@ -379,6 +394,11 @@ func (s *Server) Handler() http.Handler {
 					s.handleDeleteByQuery(w, r)
 				case "_field_caps":
 					s.handleFieldCaps(w, r)
+				case "_analyze":
+					s.handleAnalyze(w, r)
+				case "_rollover":
+					r.SetPathValue("alias", segs[0])
+					s.handleRollover(w, r)
 				case "_doc", "_create":
 					if r.Method == http.MethodPost {
 						r.SetPathValue("id", esast.NextAutoID())
@@ -443,6 +463,20 @@ func (s *Server) Handler() http.Handler {
 				s.handleDorisSlowlog(w, r)
 				return
 			}
+			if segs[1] == "_doris" && segs[2] == "promote" {
+				s.handleDorisPromoteField(w, r)
+				return
+			}
+			if segs[1] == "_validate" && segs[2] == "query" {
+				s.handleValidateQuery(w, r)
+				return
+			}
+			if segs[1] == "_rollover" {
+				r.SetPathValue("alias", segs[0])
+				r.SetPathValue("new_index", segs[2])
+				s.handleRollover(w, r)
+				return
+			}
 			if segs[1] == "_mapping" || segs[1] == "_mappings" {
 				if r.Method == http.MethodGet {
 					s.handleGetMapping(w, r)
@@ -498,14 +532,23 @@ func (s *Server) handleRootHandshake(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-func (s *Server) handleClusterHealth(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleClusterHealth(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	numIndices := len(s.indices)
 	s.mu.RUnlock()
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	status := "green"
+	httpCode := http.StatusOK
+	if err := s.backend.Ping(r.Context()); err != nil {
+		status = "red"
+		if r.URL.Query().Get("local") == "false" {
+			httpCode = http.StatusServiceUnavailable
+		}
+	}
+
+	writeJSON(w, httpCode, map[string]any{
 		"cluster_name":                    "apache-doris-search-cluster",
-		"status":                          "green",
+		"status":                          status,
 		"timed_out":                       false,
 		"number_of_nodes":                 1,
 		"number_of_data_nodes":            1,
@@ -1268,7 +1311,9 @@ func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
+	// #nosec G705 -- Content-Type is application/json with X-Content-Type-Options: nosniff
 	_, _ = w.Write(hit.Source)
 }
 
@@ -1326,15 +1371,31 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 		}{Index: defaultIndex, ID: id})
 	}
 
+	idsByIndex := make(map[string][]string)
+	for _, spec := range body.Docs {
+		idxName := defaultIndex
+		if spec.Index != "" {
+			idxName = s.resolveIndexName(spec.Index)
+		}
+		idsByIndex[idxName] = append(idsByIndex[idxName], spec.ID)
+	}
+
+	prefetched := make(map[string]map[string]HitRow, len(idsByIndex))
+	for idxName, ids := range idsByIndex {
+		idxSchema := s.ensureIndexSchema(r.Context(), idxName)
+		if m, err := s.backend.GetDocsByIDs(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, ids); err == nil {
+			prefetched[idxName] = m
+		}
+	}
+
 	docsOut := make([]map[string]any, 0, len(body.Docs))
 	for _, spec := range body.Docs {
 		idxName := defaultIndex
 		if spec.Index != "" {
 			idxName = s.resolveIndexName(spec.Index)
 		}
-		idxSchema := s.ensureIndexSchema(r.Context(), idxName)
-		hit, found, err := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, spec.ID)
-		if err != nil || !found {
+		hit, found := prefetched[idxName][spec.ID]
+		if !found {
 			docsOut = append(docsOut, map[string]any{
 				"_index": idxName,
 				"_type":  "_doc",
@@ -1440,14 +1501,16 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	targets := s.resolveTargetIndices(r.PathValue("index"))
 	if len(targets) == 0 {
 		targets = []string{s.resolveIndexName(r.PathValue("index"))}
 	}
 
 	var body struct {
-		Query  *esast.Query         `json:"query,omitempty"`
-		Script *painless.ScriptSpec `json:"script,omitempty"`
+		MaxDocs *int                 `json:"max_docs,omitempty"`
+		Query   *esast.Query         `json:"query,omitempty"`
+		Script  *painless.ScriptSpec `json:"script,omitempty"`
 	}
 	if r.Body != nil {
 		bodyBytes, _ := io.ReadAll(r.Body)
@@ -1456,87 +1519,125 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 				writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
 				return
 			}
+		}
+	}
+
+	maxDocs := 0
+	if body.MaxDocs != nil && *body.MaxDocs > 0 {
+		maxDocs = *body.MaxDocs
+	}
+	if qMax := r.URL.Query().Get("max_docs"); qMax != "" {
+		if parsed, err := strconv.Atoi(qMax); err == nil && parsed > 0 {
+			maxDocs = parsed
 		}
 	}
 
 	totalMatched := 0
 	totalUpdated := 0
 	totalDeleted := 0
+	batches := 0
 	updSpec := &painless.UpdateRequest{Script: body.Script}
 
 	for _, indexName := range targets {
 		idxSchema := s.ensureIndexSchema(r.Context(), indexName)
 		tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
-		size := 10000
-		plan, err := tr.BuildSearchPlan(&esast.SearchRequest{
-			Query: body.Query,
-			Size:  &size,
-		})
-		if err != nil {
-			writeESError(w, http.StatusBadRequest, "query_shard_exception", err.Error())
-			return
-		}
+		var searchAfter []any
 
-		hits, err := s.backend.QueryHits(r.Context(), plan.HitsSQL)
-		if err != nil {
-			writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
-			return
-		}
-		totalMatched += len(hits)
-
-		var batchBuf bytes.Buffer
-		for _, h := range hits {
-			mutated, opRes, err := painless.ApplyUpdateWithResult(h.Source, updSpec, true)
+		for {
+			fetchSize := 1000
+			if maxDocs > 0 && totalMatched+fetchSize > maxDocs {
+				fetchSize = maxDocs - totalMatched
+			}
+			if fetchSize <= 0 {
+				break
+			}
+			plan, err := tr.BuildSearchPlan(&esast.SearchRequest{
+				Query:       body.Query,
+				Size:        &fetchSize,
+				Sort:        esast.SortSlice{{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}}},
+				SearchAfter: searchAfter,
+			})
 			if err != nil {
-				writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
+				writeESError(w, http.StatusBadRequest, "query_shard_exception", err.Error())
 				return
 			}
-			if opRes == "noop" {
-				continue
-			}
-			isDel := opRes == "deleted"
-			shredded, err := schema.ShredDocument(idxSchema, h.ID, h.Version+1, isDel, mutated)
-			if err != nil {
-				writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
-				return
-			}
-			batchBuf.Write(shredded)
-			batchBuf.WriteByte('\n')
-			if isDel {
-				totalDeleted++
-			} else {
-				totalUpdated++
-			}
-		}
 
-		if batchBuf.Len() > 0 {
-			if err := s.backend.StreamLoad(r.Context(), idxSchema.DorisTable, batchBuf.Bytes(), true); err != nil {
-				writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
+			hits, err := s.backend.QueryHits(r.Context(), plan.HitsSQL)
+			if err != nil {
+				writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
 				return
+			}
+			if len(hits) == 0 {
+				break
+			}
+			batches++
+			totalMatched += len(hits)
+
+			var batchBuf bytes.Buffer
+			for _, h := range hits {
+				mutated, opRes, err := painless.ApplyUpdateWithResult(h.Source, updSpec, true)
+				if err != nil {
+					writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
+					return
+				}
+				if opRes == "noop" {
+					continue
+				}
+				isDel := opRes == "deleted"
+				shredded, err := schema.ShredDocument(idxSchema, h.ID, h.Version+1, isDel, mutated)
+				if err != nil {
+					writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+					return
+				}
+				batchBuf.Write(shredded)
+				batchBuf.WriteByte('\n')
+				if isDel {
+					totalDeleted++
+				} else {
+					totalUpdated++
+				}
+			}
+
+			if batchBuf.Len() > 0 {
+				if err := s.backend.StreamLoad(r.Context(), idxSchema.DorisTable, batchBuf.Bytes(), true); err != nil {
+					writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
+					return
+				}
+			}
+			searchAfter = []any{hits[len(hits)-1].ID}
+			if len(hits) < fetchSize || (maxDocs > 0 && totalMatched >= maxDocs) {
+				break
 			}
 		}
 	}
 
+	tookMs := time.Since(start).Milliseconds()
+	if tookMs <= 0 {
+		tookMs = 1
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"took":      5,
-		"timed_out": false,
-		"total":     totalMatched,
-		"updated":   totalUpdated,
-		"deleted":   totalDeleted,
-		"batches":   1,
-		"noops":     totalMatched - totalUpdated - totalDeleted,
-		"failures":  []any{},
+		"took":              tookMs,
+		"timed_out":         false,
+		"total":             totalMatched,
+		"updated":           totalUpdated,
+		"deleted":           totalDeleted,
+		"batches":           batches,
+		"version_conflicts": 0,
+		"noops":             totalMatched - totalUpdated - totalDeleted,
+		"failures":          []any{},
 	})
 }
 
 func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	targets := s.resolveTargetIndices(r.PathValue("index"))
 	if len(targets) == 0 {
 		targets = []string{s.resolveIndexName(r.PathValue("index"))}
 	}
 
 	var body struct {
-		Query *esast.Query `json:"query,omitempty"`
+		MaxDocs *int         `json:"max_docs,omitempty"`
+		Query   *esast.Query `json:"query,omitempty"`
 	}
 	if r.Body != nil {
 		bodyBytes, _ := io.ReadAll(r.Body)
@@ -1548,60 +1649,113 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	maxDocs := 0
+	if body.MaxDocs != nil && *body.MaxDocs > 0 {
+		maxDocs = *body.MaxDocs
+	}
+	if qMax := r.URL.Query().Get("max_docs"); qMax != "" {
+		if parsed, err := strconv.Atoi(qMax); err == nil && parsed > 0 {
+			maxDocs = parsed
+		}
+	}
+
 	totalDeleted := 0
+	batches := 0
 	for _, indexName := range targets {
 		idxSchema := s.ensureIndexSchema(r.Context(), indexName)
 		tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
-		size := 10000
-		plan, err := tr.BuildSearchPlan(&esast.SearchRequest{
-			Query: body.Query,
-			Size:  &size,
-		})
-		if err != nil {
-			writeESError(w, http.StatusBadRequest, "query_shard_exception", err.Error())
-			return
-		}
+		var searchAfter []any
 
-		hits, err := s.backend.QueryHits(r.Context(), plan.HitsSQL)
-		if err != nil {
-			writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
-			return
-		}
-
-		var batchBuf bytes.Buffer
-		for _, h := range hits {
-			tombstone, err := schema.ShredDocument(idxSchema, h.ID, h.Version+1, true, nil)
-			if err != nil {
-				continue
+		for {
+			fetchSize := 1000
+			if maxDocs > 0 && totalDeleted+fetchSize > maxDocs {
+				fetchSize = maxDocs - totalDeleted
 			}
-			batchBuf.Write(tombstone)
-			batchBuf.WriteByte('\n')
-			totalDeleted++
-		}
-		if batchBuf.Len() > 0 {
-			if err := s.backend.StreamLoad(r.Context(), idxSchema.DorisTable, batchBuf.Bytes(), true); err != nil {
-				writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
+			if fetchSize <= 0 {
+				break
+			}
+			plan, err := tr.BuildSearchPlan(&esast.SearchRequest{
+				Query:       body.Query,
+				Size:        &fetchSize,
+				Sort:        esast.SortSlice{{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}}},
+				SearchAfter: searchAfter,
+			})
+			if err != nil {
+				writeESError(w, http.StatusBadRequest, "query_shard_exception", err.Error())
 				return
+			}
+
+			hits, err := s.backend.QueryHits(r.Context(), plan.HitsSQL)
+			if err != nil {
+				writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
+				return
+			}
+			if len(hits) == 0 {
+				break
+			}
+			batches++
+
+			var batchBuf bytes.Buffer
+			for _, h := range hits {
+				tombstone, err := schema.ShredDocument(idxSchema, h.ID, h.Version+1, true, nil)
+				if err != nil {
+					continue
+				}
+				batchBuf.Write(tombstone)
+				batchBuf.WriteByte('\n')
+				totalDeleted++
+			}
+			if batchBuf.Len() > 0 {
+				if err := s.backend.StreamLoad(r.Context(), idxSchema.DorisTable, batchBuf.Bytes(), true); err != nil {
+					writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
+					return
+				}
+			}
+			searchAfter = []any{hits[len(hits)-1].ID}
+			if len(hits) < fetchSize || (maxDocs > 0 && totalDeleted >= maxDocs) {
+				break
 			}
 		}
 	}
 
+	tookMs := time.Since(start).Milliseconds()
+	if tookMs <= 0 {
+		tookMs = 1
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"took":      4,
-		"timed_out": false,
-		"total":     totalDeleted,
-		"deleted":   totalDeleted,
-		"batches":   1,
-		"failures":  []any{},
+		"took":              tookMs,
+		"timed_out":         false,
+		"total":             totalDeleted,
+		"deleted":           totalDeleted,
+		"batches":           batches,
+		"version_conflicts": 0,
+		"failures":          []any{},
 	})
 }
 
 func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	defaultIndex := s.resolveIndexName(r.PathValue("index"))
 	ops, err := esast.ParseBulkNDJSON(r.Body, defaultIndex)
 	if err != nil {
 		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", err.Error())
 		return
+	}
+
+	// Pre-fetch existing documents for "update" and "create" operations in 1 batch SQL query per index.
+	idsToFetchByIndex := make(map[string][]string)
+	for _, op := range ops {
+		if op.ParseErr == "" && (op.Action == "update" || op.Action == "create") && op.ID != "" {
+			idxName := s.resolveIndexName(op.Index)
+			idsToFetchByIndex[idxName] = append(idsToFetchByIndex[idxName], op.ID)
+		}
+	}
+	existingByIndex := make(map[string]map[string]HitRow, len(idsToFetchByIndex))
+	for idxName, ids := range idsToFetchByIndex {
+		idxSchema := s.ensureIndexSchema(r.Context(), idxName)
+		if m, err := s.backend.GetDocsByIDs(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, ids); err == nil {
+			existingByIndex[idxName] = m
+		}
 	}
 
 	byIndex := make(map[string]*bytes.Buffer)
@@ -1611,6 +1765,19 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 
 	for i, op := range ops {
 		targetIndex := s.resolveIndexName(op.Index)
+		if op.ParseErr != "" {
+			hasErrors = true
+			items = append(items, map[string]any{
+				op.Action: map[string]any{
+					"_index": targetIndex,
+					"_id":    op.ID,
+					"status": http.StatusBadRequest,
+					"error":  map[string]any{"type": "mapper_parsing_exception", "reason": op.ParseErr},
+				},
+			})
+			continue
+		}
+
 		idxSchema := s.ensureIndexSchema(r.Context(), targetIndex)
 		buf, ok := byIndex[idxSchema.DorisTable]
 		if !ok {
@@ -1618,26 +1785,92 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			byIndex[idxSchema.DorisTable] = buf
 		}
 
-		deleted := op.Action == "delete"
-		sourceToShred := op.Source
-		if op.Action == "update" {
-			var upd painless.UpdateRequest
-			if err := json.Unmarshal(op.Source, &upd); err == nil {
-				var baseSrc json.RawMessage
-				existing, found, _ := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, op.ID)
-				if found && existing != nil {
-					baseSrc = existing.Source
-				}
-				if merged, opRes, err := painless.ApplyUpdateWithResult(baseSrc, &upd, found); err == nil {
-					sourceToShred = merged
-					if opRes == "deleted" {
-						deleted = true
-					}
-				}
+		if op.Action == "create" {
+			if _, exists := existingByIndex[targetIndex][op.ID]; exists {
+				hasErrors = true
+				items = append(items, map[string]any{
+					op.Action: map[string]any{
+						"_index": targetIndex,
+						"_id":    op.ID,
+						"status": http.StatusConflict,
+						"error":  map[string]any{"type": "version_conflict_engine_exception", "reason": fmt.Sprintf("[%s]: version conflict, document already exists", op.ID)},
+					},
+				})
+				continue
 			}
 		}
 
-		shredded, err := schema.ShredDocument(idxSchema, op.ID, seqBase+int64(i), deleted, sourceToShred)
+		deleted := op.Action == "delete"
+		sourceToShred := op.Source
+		nextVer := seqBase + int64(i)
+
+		if op.Action == "update" {
+			var upd painless.UpdateRequest
+			if err := json.Unmarshal(op.Source, &upd); err != nil {
+				hasErrors = true
+				items = append(items, map[string]any{
+					op.Action: map[string]any{
+						"_index": targetIndex,
+						"_id":    op.ID,
+						"status": http.StatusBadRequest,
+						"error":  map[string]any{"type": "mapper_parsing_exception", "reason": err.Error()},
+					},
+				})
+				continue
+			}
+			existingHit, found := existingByIndex[targetIndex][op.ID]
+			if !found && !upd.DocAsUpsert && len(upd.Upsert) == 0 && !upd.ScriptedUpsert {
+				hasErrors = true
+				items = append(items, map[string]any{
+					op.Action: map[string]any{
+						"_index": targetIndex,
+						"_id":    op.ID,
+						"status": http.StatusNotFound,
+						"error":  map[string]any{"type": "document_missing_exception", "reason": fmt.Sprintf("[%s]: document missing", op.ID)},
+					},
+				})
+				continue
+			}
+			var baseSrc json.RawMessage
+			if found {
+				baseSrc = existingHit.Source
+				if existingHit.Version+1 > nextVer {
+					nextVer = existingHit.Version + 1
+				}
+			}
+			merged, opRes, err := painless.ApplyUpdateWithResult(baseSrc, &upd, found)
+			if err != nil {
+				hasErrors = true
+				items = append(items, map[string]any{
+					op.Action: map[string]any{
+						"_index": targetIndex,
+						"_id":    op.ID,
+						"status": http.StatusBadRequest,
+						"error":  map[string]any{"type": "script_exception", "reason": err.Error()},
+					},
+				})
+				continue
+			}
+			if opRes == "noop" {
+				items = append(items, map[string]any{
+					op.Action: map[string]any{
+						"_index":   targetIndex,
+						"_type":    "_doc",
+						"_id":      op.ID,
+						"_version": existingHit.Version,
+						"result":   "noop",
+						"status":   http.StatusOK,
+					},
+				})
+				continue
+			}
+			sourceToShred = merged
+			if opRes == "deleted" {
+				deleted = true
+			}
+		}
+
+		shredded, err := schema.ShredDocument(idxSchema, op.ID, nextVer, deleted, sourceToShred)
 		if err != nil {
 			hasErrors = true
 			items = append(items, map[string]any{
@@ -1652,6 +1885,15 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		}
 		buf.Write(shredded)
 		buf.WriteByte('\n')
+
+		if existingByIndex[targetIndex] == nil {
+			existingByIndex[targetIndex] = make(map[string]HitRow)
+		}
+		if deleted {
+			delete(existingByIndex[targetIndex], op.ID)
+		} else {
+			existingByIndex[targetIndex][op.ID] = HitRow{ID: op.ID, Version: nextVer, Source: sourceToShred}
+		}
 
 		status := http.StatusCreated
 		result := "created"
@@ -1676,14 +1918,21 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 
 	syncRefresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh") == "wait_for"
 	for dorisTable, buf := range byIndex {
+		if buf.Len() == 0 {
+			continue
+		}
 		if err := s.backend.StreamLoad(r.Context(), dorisTable, buf.Bytes(), syncRefresh); err != nil {
 			writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
 			return
 		}
 	}
 
+	tookMs := time.Since(start).Milliseconds()
+	if tookMs <= 0 {
+		tookMs = 1
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"took":   4,
+		"took":   tookMs,
 		"errors": hasErrors,
 		"items":  items,
 	})
@@ -1691,8 +1940,9 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	var req esast.SearchRequest
+	var bodyBytes []byte
 	if r.Body != nil {
-		bodyBytes, _ := io.ReadAll(r.Body)
+		bodyBytes, _ = io.ReadAll(r.Body)
 		if len(bytes.TrimSpace(bodyBytes)) > 0 {
 			if err := json.Unmarshal(bodyBytes, &req); err != nil {
 				writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
@@ -1701,8 +1951,17 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	applyURISearchParams(r, &req)
-	if r.URL.Query().Get("scroll") != "" && len(req.Sort) == 0 {
-		req.Sort = esast.SortSlice{{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}}}
+	if r.URL.Query().Get("scroll") != "" {
+		hasIDSort := false
+		for _, sp := range req.Sort {
+			if sp.Entry.Field == "_id" || sp.Entry.Field == "_doc" {
+				hasIDSort = true
+				break
+			}
+		}
+		if !hasIDSort {
+			req.Sort = append(req.Sort, esast.SortSpec{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}})
+		}
 	}
 
 	rawIndex := r.PathValue("index")
@@ -1713,7 +1972,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	tookMs, _ := toInt64(resp["took"])
 	syncShadow := r.URL.Query().Get("shadow_sync") == "true" || r.URL.Query().Get("shadow_sync") == "1"
-	s.maybeRunShadowSearch(rawIndex, &req, resp, tookMs, syncShadow)
+	s.maybeRunShadowSearch(rawIndex, bodyBytes, resp, tookMs, syncShadow)
 
 	if r.URL.Query().Get("scroll") != "" {
 		scrollID := "doris-scroll-eof"
@@ -1753,7 +2012,9 @@ func (s *Server) handleDorisDDL(w http.ResponseWriter, r *http.Request) {
 	ddl := schema.GenerateCreateTableDDL(idxSchema)
 	if r.URL.Query().Get("format") == "txt" || r.URL.Query().Get("format") == "sql" {
 		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.WriteHeader(http.StatusOK)
+		// #nosec G705 -- Content-Type is text/plain with X-Content-Type-Options: nosniff
 		_, _ = w.Write([]byte(ddl + "\n"))
 		return
 	}
@@ -1964,7 +2225,7 @@ func (s *Server) executeSearchRequest(
 	if len(targets) == 0 {
 		// If wildcard pattern matched nothing, return empty 200 search response (like ES with allow_no_indices=true)
 		if strings.Contains(rawIndexPattern, "*") || rawIndexPattern == "_all" {
-			return buildESResponse(rawIndexPattern, nil, req, nil, nil, 1), http.StatusOK, "", ""
+			return buildESResponse(rawIndexPattern, nil, req, nil, nil, 1, nil), http.StatusOK, "", ""
 		}
 		targets = []string{s.resolveIndexName(rawIndexPattern)}
 	}
@@ -2003,32 +2264,53 @@ func (s *Server) executeSearchRequest(
 			return nil, http.StatusBadRequest, "search_phase_execution_exception", err.Error()
 		}
 
+		var (
+			hits    []HitRow
+			aggRows []AggRow
+			hitsErr error
+			aggsErr error
+		)
+		if plan.HitsSQL != "" && plan.AggsSQL != "" {
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				hits, hitsErr = s.backend.QueryHits(ctx, plan.HitsSQL)
+			}()
+			go func() {
+				defer wg.Done()
+				aggRows, aggsErr = s.backend.QueryAggs(ctx, plan.AggsSQL)
+			}()
+			wg.Wait()
+		} else if plan.HitsSQL != "" {
+			hits, hitsErr = s.backend.QueryHits(ctx, plan.HitsSQL)
+		} else if plan.AggsSQL != "" {
+			aggRows, aggsErr = s.backend.QueryAggs(ctx, plan.AggsSQL)
+		}
+
+		if hitsErr != nil {
+			return nil, http.StatusInternalServerError, "doris_query_exception", hitsErr.Error()
+		}
+		if aggsErr != nil {
+			return nil, http.StatusInternalServerError, "doris_aggs_exception", aggsErr.Error()
+		}
+
 		var idxTotal int64
-		if plan.HitsSQL != "" {
-			hits, err := s.backend.QueryHits(ctx, plan.HitsSQL)
-			if err != nil {
-				return nil, http.StatusInternalServerError, "doris_query_exception", err.Error()
+		for i := range hits {
+			hits[i].Index = indexName
+			if hits[i].TotalHits > idxTotal {
+				idxTotal = hits[i].TotalHits
 			}
-			for i := range hits {
-				hits[i].Index = indexName
-				if hits[i].TotalHits > idxTotal {
-					idxTotal = hits[i].TotalHits
-				}
-			}
-			allHits = append(allHits, hits...)
 		}
-		if plan.AggsSQL != "" {
-			aggRows, err := s.backend.QueryAggs(ctx, plan.AggsSQL)
-			if err != nil {
-				return nil, http.StatusInternalServerError, "doris_aggs_exception", err.Error()
+		allHits = append(allHits, hits...)
+
+		for _, r := range aggRows {
+			if r.AggName == "__meta_total" && idxTotal == 0 {
+				idxTotal = r.effectiveCount()
 			}
-			for _, r := range aggRows {
-				if r.AggName == "__meta_total" && idxTotal == 0 {
-					idxTotal = r.effectiveCount()
-				}
-			}
-			allAggRows = append(allAggRows, aggRows...)
 		}
+		allAggRows = append(allAggRows, aggRows...)
+
 		idxTookMs := time.Since(idxStart).Milliseconds()
 		if idxTookMs <= 0 {
 			idxTookMs = 1
@@ -2064,7 +2346,7 @@ func (s *Server) executeSearchRequest(
 		for i := range allHits {
 			allHits[i].TotalHits = totalHitsSum
 		}
-		allAggRows = mergeMultiIndexAggRows(allAggRows, totalHitsSum)
+		allAggRows = mergeMultiIndexAggRows(allAggRows, totalHitsSum, req.EffectiveAggs())
 	}
 
 	tookMs := time.Since(start).Milliseconds()
@@ -2072,15 +2354,32 @@ func (s *Server) executeSearchRequest(
 		tookMs = 1
 	}
 	primaryIndex := targets[0]
-	return buildESResponse(primaryIndex, primarySchema, req, allHits, allAggRows, tookMs), http.StatusOK, "", ""
+	docLookup := func(id string) *HitRow {
+		for i := range allHits {
+			if allHits[i].ID == id {
+				return &allHits[i]
+			}
+		}
+		if primarySchema != nil {
+			if h, found, err := s.backend.GetDocByID(ctx, primarySchema.DorisDB, primarySchema.DorisTable, id); err == nil && found {
+				return h
+			}
+		}
+		return nil
+	}
+	return buildESResponse(primaryIndex, primarySchema, req, allHits, allAggRows, tookMs, docLookup), http.StatusOK, "", ""
 }
 
-func mergeMultiIndexAggRows(rows []AggRow, totalHits int64) []AggRow {
+func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, aggs map[string]esast.AggSpec) []AggRow {
 	type key struct {
 		agg    string
 		bucket string
 	}
-	merged := make(map[key]*AggRow)
+	type mergeAcc struct {
+		row   AggRow
+		count int
+	}
+	merged := make(map[key]*mergeAcc)
 	var order []key
 	for _, r := range rows {
 		if r.AggName == "__meta_total" {
@@ -2088,19 +2387,41 @@ func mergeMultiIndexAggRows(rows []AggRow, totalHits int64) []AggRow {
 		}
 		k := key{agg: r.AggName, bucket: r.BucketKey}
 		if existing, ok := merged[k]; ok {
-			existing.DocCount += r.effectiveCount()
-			existing.Value += r.effectiveValue()
+			existing.count++
+			spec := aggs[r.AggName]
+			val := r.effectiveValue()
+			switch {
+			case r.BucketKey == "_stats_min" || spec.Min != nil:
+				if val < existing.row.Value {
+					existing.row.Value = val
+					existing.row.DocCount = int64(val)
+				}
+			case r.BucketKey == "_stats_max" || spec.Max != nil:
+				if val > existing.row.Value {
+					existing.row.Value = val
+					existing.row.DocCount = int64(val)
+				}
+			default:
+				existing.row.DocCount += r.effectiveCount()
+				existing.row.Value += val
+			}
 		} else {
 			cp := r
 			cp.DocCount = r.effectiveCount()
 			cp.Value = r.effectiveValue()
-			merged[k] = &cp
+			merged[k] = &mergeAcc{row: cp, count: 1}
 			order = append(order, k)
 		}
 	}
 	out := []AggRow{{AggName: "__meta_total", BucketKey: "_count", DocCount: totalHits, Value: float64(totalHits)}}
 	for _, k := range order {
-		out = append(out, *merged[k])
+		acc := merged[k]
+		spec := aggs[k.agg]
+		if (k.bucket == "_stats_avg" || spec.Avg != nil) && acc.count > 1 {
+			acc.row.Value /= float64(acc.count)
+			acc.row.DocCount = int64(acc.row.Value)
+		}
+		out = append(out, acc.row)
 	}
 	return out
 }
@@ -2191,7 +2512,7 @@ func applyURISearchParams(r *http.Request, req *esast.SearchRequest) {
 	}
 }
 
-func buildESResponse(indexName string, idxSchema *schema.IndexSchema, req *esast.SearchRequest, hits []HitRow, aggRows []AggRow, tookMs int64) map[string]any {
+func buildESResponse(indexName string, idxSchema *schema.IndexSchema, req *esast.SearchRequest, hits []HitRow, aggRows []AggRow, tookMs int64, docLookup func(string) *HitRow) map[string]any {
 	var totalHits int64
 	var maxScore float64
 	esHits := make([]map[string]any, 0, len(hits))
@@ -2241,7 +2562,7 @@ func buildESResponse(indexName string, idxSchema *schema.IndexSchema, req *esast
 		bucketsByAgg[row.AggName] = append(bucketsByAgg[row.AggName], row)
 	}
 
-	aggsOut := buildAggsMap("", req.EffectiveAggs(), bucketsByAgg, totalHits)
+	aggsOut := buildAggsMap(indexName, "", req.EffectiveAggs(), bucketsByAgg, totalHits, docLookup)
 
 	res := map[string]any{
 		"took":      tookMs,
@@ -2263,10 +2584,12 @@ func buildESResponse(indexName string, idxSchema *schema.IndexSchema, req *esast
 }
 
 func buildAggsMap(
+	indexName string,
 	prefix string,
 	aggs map[string]esast.AggSpec,
 	bucketsByAgg map[string][]AggRow,
 	totalHits int64,
+	docLookup func(string) *HitRow,
 ) map[string]any {
 	aggsOut := make(map[string]any)
 	for aggName, spec := range aggs {
@@ -2285,7 +2608,7 @@ func buildAggsMap(
 					"doc_count": r.effectiveCount(),
 				}
 				if len(subAggs) > 0 {
-					attachSubAggsToBucket(bucketMap, fullKey, r.BucketKey, subAggs, bucketsByAgg)
+					attachSubAggsToBucket(indexName, bucketMap, fullKey, r.BucketKey, subAggs, bucketsByAgg, docLookup)
 				}
 				b = append(b, bucketMap)
 			}
@@ -2321,7 +2644,7 @@ func buildAggsMap(
 			}
 			filterObj := map[string]any{"doc_count": cnt}
 			if subAggs := spec.SubAggs(); len(subAggs) > 0 {
-				for sk, sv := range buildAggsMap(fullKey, subAggs, bucketsByAgg, cnt) {
+				for sk, sv := range buildAggsMap(indexName, fullKey, subAggs, bucketsByAgg, cnt, docLookup) {
 					filterObj[sk] = sv
 				}
 			}
@@ -2338,7 +2661,7 @@ func buildAggsMap(
 					"doc_count": byKey[fk],
 				}
 				if len(subAggs) > 0 {
-					attachSubAggsToBucket(bMap, fullKey, fk, subAggs, bucketsByAgg)
+					attachSubAggsToBucket(indexName, bMap, fullKey, fk, subAggs, bucketsByAgg, docLookup)
 				}
 				bucketsMap[fk] = bMap
 			}
@@ -2396,7 +2719,7 @@ func buildAggsMap(
 					"doc_count":     r.effectiveCount(),
 				}
 				if len(subAggs) > 0 {
-					attachSubAggsToBucket(bucketMap, fullKey, r.BucketKey, subAggs, bucketsByAgg)
+					attachSubAggsToBucket(indexName, bucketMap, fullKey, r.BucketKey, subAggs, bucketsByAgg, docLookup)
 				}
 				b = append(b, bucketMap)
 			}
@@ -2411,19 +2734,23 @@ func buildAggsMap(
 					"doc_count": r.effectiveCount(),
 				}
 				if len(subAggs) > 0 {
-					attachSubAggsToBucket(bucketMap, fullKey, r.BucketKey, subAggs, bucketsByAgg)
+					attachSubAggsToBucket(indexName, bucketMap, fullKey, r.BucketKey, subAggs, bucketsByAgg, docLookup)
 				}
 				b = append(b, bucketMap)
 			}
 			aggsOut[aggName] = map[string]any{"buckets": b}
-		case spec.Range != nil:
+		case spec.Range != nil || spec.DateRange != nil:
+			rngSpec := spec.Range
+			if rngSpec == nil {
+				rngSpec = spec.DateRange
+			}
 			byKey := make(map[string]int64, len(rows))
 			for _, r := range rows {
 				byKey[r.BucketKey] = r.effectiveCount()
 			}
-			b := make([]map[string]any, 0, len(spec.Range.Ranges))
+			b := make([]map[string]any, 0, len(rngSpec.Ranges))
 			subAggs := spec.SubAggs()
-			for _, rng := range spec.Range.Ranges {
+			for _, rng := range rngSpec.Ranges {
 				ek := rng.EffectiveKey()
 				entry := map[string]any{
 					"key":       ek,
@@ -2436,22 +2763,81 @@ func buildAggsMap(
 					entry["to"] = rng.To
 				}
 				if len(subAggs) > 0 {
-					attachSubAggsToBucket(entry, fullKey, ek, subAggs, bucketsByAgg)
+					attachSubAggsToBucket(indexName, entry, fullKey, ek, subAggs, bucketsByAgg, docLookup)
 				}
 				b = append(b, entry)
 			}
 			aggsOut[aggName] = map[string]any{"buckets": b}
+		case spec.TopHits != nil:
+			topHitsList := make([]map[string]any, 0, len(rows))
+			for _, r := range rows {
+				docID := r.BucketKey
+				hitMap := map[string]any{
+					"_index": indexName,
+					"_type":  "_doc",
+					"_id":    docID,
+					"_score": 1.0,
+				}
+				if docLookup != nil {
+					if h := docLookup(docID); h != nil {
+						if spec.TopHits.Source == nil || !spec.TopHits.Source.Disabled {
+							hitMap["_source"] = filterSourceJSON(h.Source, spec.TopHits.Source)
+						}
+					}
+				}
+				topHitsList = append(topHitsList, hitMap)
+			}
+			aggsOut[aggName] = map[string]any{
+				"hits": map[string]any{
+					"total":     map[string]any{"value": len(topHitsList), "relation": "eq"},
+					"max_score": 1.0,
+					"hits":      topHitsList,
+				},
+			}
+		case spec.Composite != nil:
+			var srcNames []string
+			for _, srcMap := range spec.Composite.Sources {
+				var ks []string
+				for k := range srcMap {
+					ks = append(ks, k)
+				}
+				sort.Strings(ks)
+				srcNames = append(srcNames, ks...)
+			}
+			buckets := make([]map[string]any, 0, len(rows))
+			var afterKey map[string]any
+			for _, r := range rows {
+				parts := strings.Split(r.BucketKey, "\x1f")
+				keyObj := make(map[string]any, len(srcNames))
+				for i, sn := range srcNames {
+					if i < len(parts) {
+						keyObj[sn] = parts[i]
+					}
+				}
+				afterKey = keyObj
+				buckets = append(buckets, map[string]any{
+					"key":       keyObj,
+					"doc_count": r.effectiveCount(),
+				})
+			}
+			compObj := map[string]any{"buckets": buckets}
+			if afterKey != nil {
+				compObj["after_key"] = afterKey
+			}
+			aggsOut[aggName] = compObj
 		}
 	}
 	return aggsOut
 }
 
 func attachSubAggsToBucket(
+	indexName string,
 	bucketMap map[string]any,
 	parentFullKey string,
 	parentBucketKey string,
 	subAggs map[string]esast.AggSpec,
 	bucketsByAgg map[string][]AggRow,
+	docLookup func(string) *HitRow,
 ) {
 	for subName, subSpec := range subAggs {
 		subFullKey := parentFullKey + "." + subName
@@ -2502,6 +2888,42 @@ func attachSubAggsToBucket(
 				"sum_other_doc_count":         0,
 				"buckets":                     childBuckets,
 			}
+		case subSpec.TopHits != nil:
+			prefix := parentBucketKey + "\x1f"
+			var topHitsList []map[string]any
+			limit := subSpec.TopHits.EffectiveSize()
+			for _, r := range subRows {
+				if strings.HasPrefix(r.BucketKey, prefix) {
+					docID := strings.TrimPrefix(r.BucketKey, prefix)
+					hitMap := map[string]any{
+						"_index": indexName,
+						"_type":  "_doc",
+						"_id":    docID,
+						"_score": 1.0,
+					}
+					if docLookup != nil {
+						if h := docLookup(docID); h != nil {
+							if subSpec.TopHits.Source == nil || !subSpec.TopHits.Source.Disabled {
+								hitMap["_source"] = filterSourceJSON(h.Source, subSpec.TopHits.Source)
+							}
+						}
+					}
+					topHitsList = append(topHitsList, hitMap)
+					if len(topHitsList) >= limit {
+						break
+					}
+				}
+			}
+			if topHitsList == nil {
+				topHitsList = []map[string]any{}
+			}
+			bucketMap[subName] = map[string]any{
+				"hits": map[string]any{
+					"total":     map[string]any{"value": len(topHitsList), "relation": "eq"},
+					"max_score": 1.0,
+					"hits":      topHitsList,
+				},
+			}
 		}
 	}
 }
@@ -2522,7 +2944,14 @@ func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.In
 			out = append(out, h.ID)
 		default:
 			cleanField := strings.TrimSuffix(strings.TrimSuffix(s.Entry.Field, ".keyword"), ".ngram")
-			val := lookupDocPath(doc, strings.Split(cleanField, "."))
+			pathSegs := strings.Split(cleanField, ".")
+			if idxSchema != nil {
+				b := idxSchema.ResolveField(s.Entry.Field)
+				if len(b.SourceJSONPath) > 0 {
+					pathSegs = b.SourceJSONPath
+				}
+			}
+			val := lookupDocPath(doc, pathSegs)
 			if jsonNum, ok := val.(json.Number); ok {
 				if iv, err := jsonNum.Int64(); err == nil {
 					val = iv
@@ -2552,8 +2981,15 @@ func lookupDocPath(node any, path []string) any {
 	if node == nil || len(path) == 0 {
 		return node
 	}
-	if m, ok := node.(map[string]any); ok {
-		return lookupDocPath(m[path[0]], path[1:])
+	switch typed := node.(type) {
+	case map[string]any:
+		return lookupDocPath(typed[path[0]], path[1:])
+	case []any:
+		for _, elem := range typed {
+			if v := lookupDocPath(elem, path); v != nil {
+				return v
+			}
+		}
 	}
 	return nil
 }

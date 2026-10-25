@@ -1,4 +1,5 @@
 # The nix dev shell (flake.nix) provides go, golangci-lint, and security scanners.
+export GOWORK := off
 VERSION ?= dev
 LDFLAGS := -s -w -X main.version=$(VERSION)
 

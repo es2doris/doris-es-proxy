@@ -76,6 +76,8 @@ type Query struct {
 	MatchAll          map[string]any           `json:"match_all,omitempty"`
 	MatchNone         map[string]any           `json:"match_none,omitempty"`
 	Bool              *BoolQuery               `json:"bool,omitempty"`
+	DisMax            *DisMaxQuery             `json:"dis_max,omitempty"`
+	Boosting          *BoostingQuery           `json:"boosting,omitempty"`
 	Term              map[string]TermEntry     `json:"term,omitempty"`
 	Terms             *TermsQuery              `json:"terms,omitempty"`
 	Ids               *IdsQuery                `json:"ids,omitempty"`
@@ -87,12 +89,77 @@ type Query struct {
 	Match             map[string]MatchEntry    `json:"match,omitempty"`
 	MatchPhrase       map[string]PhraseEntry   `json:"match_phrase,omitempty"`
 	MatchPhrasePrefix map[string]PhraseEntry   `json:"match_phrase_prefix,omitempty"`
+	MatchBoolPrefix   map[string]PhraseEntry   `json:"match_bool_prefix,omitempty"`
 	MultiMatch        *MultiMatchQuery         `json:"multi_match,omitempty"`
 	QueryString       *QueryStringQuery        `json:"query_string,omitempty"`
 	SimpleQueryString *QueryStringQuery        `json:"simple_query_string,omitempty"`
 	Nested            *NestedQuery             `json:"nested,omitempty"`
 	ConstantScore     *ConstantScoreQuery      `json:"constant_score,omitempty"`
 	FunctionScore     *FunctionScoreQuery      `json:"function_score,omitempty"`
+}
+
+var knownQueryClauses = map[string]bool{
+	"match_all":           true,
+	"match_none":          true,
+	"bool":                true,
+	"dis_max":             true,
+	"boosting":            true,
+	"term":                true,
+	"terms":               true,
+	"ids":                 true,
+	"range":               true,
+	"exists":              true,
+	"prefix":              true,
+	"wildcard":            true,
+	"regexp":              true,
+	"match":               true,
+	"match_phrase":        true,
+	"match_phrase_prefix": true,
+	"match_bool_prefix":   true,
+	"multi_match":         true,
+	"query_string":        true,
+	"simple_query_string": true,
+	"nested":              true,
+	"constant_score":      true,
+	"function_score":      true,
+}
+
+func (q *Query) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	for k := range raw {
+		if !knownQueryClauses[k] {
+			return fmt.Errorf("parsing_exception: unknown query clause [%s]", k)
+		}
+	}
+	type queryAlias Query
+	var alias queryAlias
+	if err := json.Unmarshal(trimmed, &alias); err != nil {
+		return err
+	}
+	*q = Query(alias)
+	return nil
+}
+
+// DisMaxQuery represents an ES `dis_max` query (`queries`, `tie_breaker`, `boost`).
+type DisMaxQuery struct {
+	Queries    QuerySlice `json:"queries,omitempty"`
+	TieBreaker float64    `json:"tie_breaker,omitempty"`
+	Boost      *float64   `json:"boost,omitempty"`
+}
+
+// BoostingQuery represents an ES `boosting` query (`positive`, `negative`, `negative_boost`).
+type BoostingQuery struct {
+	Positive      Query    `json:"positive"`
+	Negative      Query    `json:"negative"`
+	NegativeBoost float64  `json:"negative_boost,omitempty"`
+	Boost         *float64 `json:"boost,omitempty"`
 }
 
 // TermsQuery handles `"terms": {"field": ["a", "b"], "boost": 1.0}` where Java clients
@@ -415,6 +482,8 @@ type AggSpec struct {
 	DateHistogram *DateHistogramAggSpec `json:"date_histogram,omitempty"`
 	Histogram     *HistogramAggSpec     `json:"histogram,omitempty"`
 	Range         *RangeAggSpec         `json:"range,omitempty"`
+	DateRange     *RangeAggSpec         `json:"date_range,omitempty"`
+	Composite     *CompositeAggSpec     `json:"composite,omitempty"`
 	Filter        *Query                `json:"filter,omitempty"`
 	Filters       *FiltersAggSpec       `json:"filters,omitempty"`
 	Missing       *ExistsQuery          `json:"missing,omitempty"`
@@ -430,6 +499,12 @@ type AggSpec struct {
 	TopHits       *TopHitsAggSpec       `json:"top_hits,omitempty"`
 	Aggs          map[string]AggSpec    `json:"aggs,omitempty"`
 	Aggregations  map[string]AggSpec    `json:"aggregations,omitempty"`
+}
+
+type CompositeAggSpec struct {
+	Size    int                  `json:"size,omitempty"`
+	Sources []map[string]AggSpec `json:"sources,omitempty"`
+	After   map[string]any       `json:"after,omitempty"`
 }
 
 type FiltersAggSpec struct {
@@ -452,6 +527,16 @@ type TopHitsAggSpec struct {
 	Size   *int          `json:"size,omitempty"`
 	Sort   SortSlice     `json:"sort,omitempty"`
 	Source *SourceFilter `json:"_source,omitempty"`
+}
+
+func (th *TopHitsAggSpec) EffectiveSize() int {
+	if th == nil || th.Size == nil || *th.Size <= 0 {
+		return 3
+	}
+	if *th.Size > 100 {
+		return 100
+	}
+	return *th.Size
 }
 
 func (a *AggSpec) SubAggs() map[string]AggSpec {
@@ -749,10 +834,11 @@ type FieldProperty struct {
 
 // BulkOperation represents a single parsed action from an Elasticsearch `/_bulk` NDJSON stream.
 type BulkOperation struct {
-	Action string          // "index", "create", "update", "delete"
-	Index  string          // Target index name
-	ID     string          // Document _id
-	Source json.RawMessage // Verbatim raw JSON line for `_source` (or update payload)
+	Action   string          // "index", "create", "update", "delete"
+	Index    string          // Target index name
+	ID       string          // Document _id
+	Source   json.RawMessage // Verbatim raw JSON line for `_source` (or update payload)
+	ParseErr string          // Per-item validation or JSON error (isolated to this bulk item)
 }
 
 type bulkActionMeta struct {
@@ -807,14 +893,21 @@ func ParseBulkNDJSON(r io.Reader, defaultIndex string) ([]BulkOperation, error) 
 			op.Index = defaultIndex
 		}
 		op.ID = meta.ID
-		if op.ID == "" && (op.Action == "index" || op.Action == "create") {
-			op.ID = NextAutoID()
+		if op.ID == "" {
+			if op.Action == "index" || op.Action == "create" {
+				op.ID = NextAutoID()
+			} else {
+				op.ParseErr = fmt.Sprintf("missing _id for bulk %s action", op.Action)
+			}
 		}
 		if op.Action != "delete" {
 			if !scanner.Scan() {
 				return nil, fmt.Errorf("unexpected EOF waiting for bulk source line after %q action", op.Action)
 			}
 			srcLine := bytes.TrimSpace(scanner.Bytes())
+			if !json.Valid(srcLine) {
+				op.ParseErr = "failed to parse bulk document source: invalid JSON"
+			}
 			rawCopy := make([]byte, len(srcLine))
 			copy(rawCopy, srcLine)
 			op.Source = json.RawMessage(rawCopy)

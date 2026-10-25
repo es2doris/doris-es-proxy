@@ -50,13 +50,13 @@ spec:
               value: "http://doris-fe-service:8030"
           readinessProbe:
             httpGet:
-              path: /_cluster/health
+              path: /readyz
               port: http-es
             initialDelaySeconds: 2
             periodSeconds: 5
           livenessProbe:
             httpGet:
-              path: /
+              path: /healthz
               port: http-es
             initialDelaySeconds: 5
             periodSeconds: 10

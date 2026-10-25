@@ -18,7 +18,6 @@
 package schema
 
 import (
-	"fmt"
 	"hash/fnv"
 	"regexp"
 	"sort"
@@ -454,14 +453,19 @@ func SanitizeDorisIdentifier(name string) string {
 		} else if r == '.' || r == '-' {
 			sb.WriteString("__")
 		} else {
-			_, _ = fmt.Fprintf(&sb, "_%x_", r)
+			sb.WriteByte('_')
+			sb.WriteString(strconv.FormatInt(int64(r), 16))
+			sb.WriteByte('_')
 		}
 	}
 	res := sb.String()
+	if res == "" {
+		return "_unnamed"
+	}
 	if len(res) > 56 {
 		h := fnv.New32a()
 		_, _ = h.Write([]byte(res))
-		res = fmt.Sprintf("%s_%08x", res[:47], h.Sum32())
+		res = res[:47] + "_" + strconv.FormatUint(uint64(h.Sum32()), 16)
 	}
 	return res
 }

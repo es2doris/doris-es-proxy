@@ -141,9 +141,14 @@ func (m *MemoryBackend) StreamLoad(_ context.Context, table string, ndjson []byt
 		rowsLoaded++
 	}
 	if m.logSQL {
+		// #nosec G706 -- table name is sanitized and only logged when --log-sql is enabled
 		log.Printf("[Doris Stream Load] table=%s rows=%d merge_type=MERGE", table, rowsLoaded)
 	}
 	return scanner.Err()
+}
+
+func (m *MemoryBackend) Ping(_ context.Context) error {
+	return nil
 }
 
 func (m *MemoryBackend) GetDocByID(_ context.Context, _, table, id string) (*HitRow, bool, error) {
@@ -165,6 +170,29 @@ func (m *MemoryBackend) GetDocByID(_ context.Context, _, table, id string) (*Hit
 		Source:  json.RawMessage(srcStr),
 		Score:   1.0,
 	}, true, nil
+}
+
+func (m *MemoryBackend) GetDocsByIDs(_ context.Context, _, table string, ids []string) (map[string]HitRow, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[string]HitRow, len(ids))
+	tbl := m.tables[table]
+	if tbl == nil {
+		return out, nil
+	}
+	for _, id := range ids {
+		if row, ok := tbl[id]; ok {
+			ver, _ := toInt64(row["_version"])
+			srcStr, _ := row["_source"].(string)
+			out[id] = HitRow{
+				ID:      id,
+				Version: ver,
+				Source:  json.RawMessage(srcStr),
+				Score:   1.0,
+			}
+		}
+	}
+	return out, nil
 }
 
 var (
@@ -353,6 +381,9 @@ var (
 	reAggRange            = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (.+)$")
 	reAggSubMetric        = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\((?:COALESCE\\((AVG|SUM|MIN|MAX)\\((.+?)\\), 0\\)|(COUNT)\\((DISTINCT )?(.+?)\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+?) WHERE (.+) GROUP BY `_bucket_key`$")
 	reAggSubTerms         = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CONCAT\\((.+?), '\\\\x1f', CAST\\((.+?) AS STRING\\)\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM (.+?) WHERE \\((.+)\\) AND .+? IS NOT NULL GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC")
+	reAggTopHits          = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, `_id` AS `_bucket_key`, CAST\\(1 AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+?))? ORDER BY (.+?) LIMIT (\\d+)")
+	reAggSubTopHits       = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CONCAT\\((.+?), '\\\\x1f', `_id`\\) AS `_bucket_key`, CAST\\(ROW_NUMBER\\(\\) OVER \\(PARTITION BY .+? ORDER BY (.+?)\\) AS DOUBLE\\) AS `_doc_count` FROM (.+?) WHERE (.+)\\) `_agg_sub_\\d+` WHERE `_doc_count` <= (\\d+)")
+	reAggComposite        = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (.+?) GROUP BY `_bucket_key` ORDER BY `_bucket_key` ASC LIMIT (\\d+)")
 )
 
 func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
@@ -659,6 +690,101 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		return rows
 	}
 
+	if m := reAggTopHits.FindStringSubmatch(branch); m != nil {
+		aggName, extraWhere, orderByClause, limitStr := m[1], m[2], m[3], m[4]
+		limit, _ := strconv.Atoi(limitStr)
+		var rows []map[string]any
+		for _, r := range baseRows {
+			if extraWhere != "" && !evalWhereExpr(r, extraWhere) {
+				continue
+			}
+			rows = append(rows, r)
+		}
+		sortRowsByOrderClause(rows, orderByClause)
+		if limit > 0 && len(rows) > limit {
+			rows = rows[:limit]
+		}
+		var out []AggRow
+		for i, r := range rows {
+			out = append(out, AggRow{
+				AggName:   aggName,
+				BucketKey: fmt.Sprintf("%v", r["_id"]),
+				DocCount:  int64(i + 1),
+				Value:     float64(i + 1),
+			})
+		}
+		return out
+	}
+
+	if m := reAggSubTopHits.FindStringSubmatch(branch); m != nil {
+		aggName, parentBucketExpr, orderByClause, fromClause, whereClause, limitStr := m[1], m[2], m[3], m[4], m[5], m[6]
+		limit, _ := strconv.Atoi(limitStr)
+		expanded := expandFromClauseRows(baseRows, fromClause, whereClause)
+		byBucket := make(map[string][]map[string]any)
+		var bucketOrder []string
+		for _, row := range expanded {
+			bKey := evalBucketKeyExpr(row, parentBucketExpr)
+			if bKey == "" {
+				continue
+			}
+			if _, exists := byBucket[bKey]; !exists {
+				bucketOrder = append(bucketOrder, bKey)
+			}
+			byBucket[bKey] = append(byBucket[bKey], row)
+		}
+		sort.Strings(bucketOrder)
+		var out []AggRow
+		for _, bKey := range bucketOrder {
+			rows := byBucket[bKey]
+			sortRowsByOrderClause(rows, orderByClause)
+			if limit > 0 && len(rows) > limit {
+				rows = rows[:limit]
+			}
+			for i, r := range rows {
+				out = append(out, AggRow{
+					AggName:   aggName,
+					BucketKey: bKey + "\x1f" + fmt.Sprintf("%v", r["_id"]),
+					DocCount:  int64(i + 1),
+					Value:     float64(i + 1),
+				})
+			}
+		}
+		return out
+	}
+
+	if m := reAggComposite.FindStringSubmatch(branch); m != nil {
+		aggName, bucketKeyExpr, whereClause, limitStr := m[1], m[2], m[3], m[4]
+		limit, _ := strconv.Atoi(limitStr)
+		counts := make(map[string]int64)
+		for _, row := range baseRows {
+			if whereClause != "" && !evalWhereExpr(row, whereClause) {
+				continue
+			}
+			bKey := evalCompositeKeyExpr(row, bucketKeyExpr)
+			if bKey != "" {
+				counts[bKey]++
+			}
+		}
+		keys := make([]string, 0, len(counts))
+		for k := range counts {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		if limit > 0 && len(keys) > limit {
+			keys = keys[:limit]
+		}
+		var out []AggRow
+		for _, k := range keys {
+			out = append(out, AggRow{
+				AggName:   aggName,
+				BucketKey: k,
+				DocCount:  counts[k],
+				Value:     float64(counts[k]),
+			})
+		}
+		return out
+	}
+
 	if m := reAggSubTerms.FindStringSubmatch(branch); m != nil {
 		aggName, parentBucketExpr, childColExpr, fromClause, whereClause := m[1], m[2], m[3], m[4], m[5]
 		expanded := expandFromClauseRows(baseRows, fromClause, whereClause)
@@ -788,6 +914,53 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 	}
 
 	return nil
+}
+
+func sortRowsByOrderClause(rows []map[string]any, orderByClause string) {
+	orderSpecs := strings.Split(orderByClause, ",")
+	sort.SliceStable(rows, func(i, j int) bool {
+		for _, spec := range orderSpecs {
+			fields := strings.Fields(strings.TrimSpace(spec))
+			if len(fields) == 0 {
+				continue
+			}
+			colExpr := fields[0]
+			desc := len(fields) > 1 && strings.EqualFold(fields[1], "DESC")
+			var cmp int
+			if colExpr == "`_id`" || colExpr == "`_score`" {
+				cmp = strings.Compare(fmt.Sprintf("%v", rows[i]["_id"]), fmt.Sprintf("%v", rows[j]["_id"]))
+			} else {
+				va := resolveColumnValue(rows[i], colExpr)
+				vb := resolveColumnValue(rows[j], colExpr)
+				cmp = compareAny(va, vb)
+			}
+			if cmp != 0 {
+				if desc {
+					return cmp > 0
+				}
+				return cmp < 0
+			}
+		}
+		return false
+	})
+}
+
+func evalCompositeKeyExpr(row map[string]any, expr string) string {
+	expr = strings.TrimSpace(expr)
+	if strings.HasPrefix(expr, "CONCAT_WS('\\x1f', ") && strings.HasSuffix(expr, ")") {
+		inner := expr[len("CONCAT_WS('\\x1f', ") : len(expr)-1]
+		args := splitTopLevelArgs(inner)
+		parts := make([]string, 0, len(args))
+		for _, a := range args {
+			p := evalBucketKeyExpr(row, a)
+			if p == "" {
+				return ""
+			}
+			parts = append(parts, p)
+		}
+		return strings.Join(parts, "\x1f")
+	}
+	return evalBucketKeyExpr(row, expr)
 }
 
 func expandFromClauseRows(baseRows []map[string]any, fromClause, whereClause string) []map[string]any {

@@ -575,3 +575,291 @@ func TestV03SecurityGzipSubAggsShadowSlowlogAndEcosystem_E2E(t *testing.T) {
 		_ = r.Body.Close()
 	}
 }
+
+func TestV04DisMaxTopHitsCompositePromoteValidateAnalyzeRolloverMetrics_E2E(t *testing.T) {
+	mem := NewMemDorisBackend()
+	srv := proxy.NewServer("es_compat", mem, transpiler.TranspilerOptions{})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. Create rollover alias + initial index logs-000001
+	putReq, err := http.NewRequest(http.MethodPut, ts.URL+"/logs-000001", strings.NewReader(`{
+		"aliases": {"logs-write": {"is_write_index": true}},
+		"mappings": {
+			"properties": {
+				"title": {"type": "text"},
+				"service": {"type": "keyword"},
+				"env": {"type": "keyword"},
+				"latency_ms": {"type": "double"},
+				"created_at": {"type": "date"}
+			}
+		}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	putResp, err := http.DefaultClient.Do(putReq)
+	if err != nil || putResp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT /logs-000001 failed: status=%v err=%v", putResp.StatusCode, err)
+	}
+	_ = putResp.Body.Close()
+
+	// 2. Test /_bulk partial failure isolation (valid docs + duplicate create + missing update + noop update + invalid JSON)
+	bulkPayload := strings.Join([]string{
+		`{"create":{"_index":"logs-000001","_id":"1"}}`,
+		`{"title":"checkout timeout error","service":"checkout","env":"prod","latency_ms":250,"created_at":"2026-10-20T12:00:00Z","unmapped_region":"us-east-1"}`,
+		`{"create":{"_index":"logs-000001","_id":"2"}}`,
+		`{"title":"payment gateway retry","service":"payments","env":"prod","latency_ms":120,"created_at":"2026-10-22T12:00:00Z","unmapped_region":"us-west-2"}`,
+		`{"create":{"_index":"logs-000001","_id":"3"}}`,
+		`{"title":"legacy batch deprecated","service":"checkout","env":"staging","latency_ms":45,"created_at":"2026-09-01T12:00:00Z","unmapped_region":"eu-west-1"}`,
+		`{"create":{"_index":"logs-000001","_id":"1"}}`, // conflict 409
+		`{"title":"duplicate create should conflict"}`,
+		`{"update":{"_index":"logs-000001","_id":"999"}}`, // missing 404 without doc_as_upsert
+		`{"doc":{"latency_ms":999}}`,
+		`{"update":{"_index":"logs-000001","_id":"2"}}`, // noop script
+		`{"script":{"source":"ctx.op = 'noop'"}}`,
+		`{"index":{"_index":"logs-000001","_id":"4"}}`, // invalid JSON 400
+		`{"title":invalid_json}`,
+	}, "\n") + "\n"
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/_bulk", strings.NewReader(bulkPayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-ndjson")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bulkRes struct {
+		Errors bool             `json:"errors"`
+		Items  []map[string]any `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&bulkRes); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if !bulkRes.Errors || len(bulkRes.Items) != 7 {
+		t.Fatalf("expected errors=true and 7 items in bulk response, got errors=%v len=%d", bulkRes.Errors, len(bulkRes.Items))
+	}
+	if createConflict, ok := bulkRes.Items[3]["create"].(map[string]any); !ok || int(createConflict["status"].(float64)) != 409 {
+		t.Fatalf("expected item[3] create status 409, got %+v", bulkRes.Items[3])
+	}
+	if missingUpdate, ok := bulkRes.Items[4]["update"].(map[string]any); !ok || int(missingUpdate["status"].(float64)) != 404 {
+		t.Fatalf("expected item[4] update status 404, got %+v", bulkRes.Items[4])
+	}
+	if noopUpdate, ok := bulkRes.Items[5]["update"].(map[string]any); !ok || noopUpdate["result"] != "noop" {
+		t.Fatalf("expected item[5] update result=noop, got %+v", bulkRes.Items[5])
+	}
+	if badJSON, ok := bulkRes.Items[6]["index"].(map[string]any); !ok || int(badJSON["status"].(float64)) != 400 {
+		t.Fatalf("expected item[6] index status 400, got %+v", bulkRes.Items[6])
+	}
+
+	// 3. Unknown query clause returns 400 parsing_exception instead of silently matching all rows
+	badSearchReq, err := http.NewRequest(http.MethodPost, ts.URL+"/logs-000001/_search", strings.NewReader(`{"query":{"bogus_clause":{"title":"timeout"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	badSearchReq.Header.Set("Content-Type", "application/json")
+	badSearchResp, err := http.DefaultClient.Do(badSearchReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = badSearchResp.Body.Close()
+	if badSearchResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unknown query clause, got %d", badSearchResp.StatusCode)
+	}
+
+	// 4. Test dis_max, boosting, match_bool_prefix, top_hits (top-level + sub-agg), date_range, and composite aggs
+	v04SearchResp, err := http.Post(ts.URL+"/logs-000001/_search", "application/json", strings.NewReader(`{
+		"query": {
+			"boosting": {
+				"positive": {
+					"dis_max": {
+						"tie_breaker": 0.3,
+						"queries": [
+							{"match": {"title": "checkout"}},
+							{"match_bool_prefix": {"title": "pay"}},
+							{"term": {"service": "checkout"}}
+						]
+					}
+				},
+				"negative": {"term": {"env": "staging"}},
+				"negative_boost": 0.2
+			}
+		},
+		"aggs": {
+			"latest_hit": {
+				"top_hits": {
+					"size": 1,
+					"sort": [{"latency_ms": {"order": "desc"}}]
+				}
+			},
+			"by_service": {
+				"terms": {"field": "service"},
+				"aggs": {
+					"top_service_doc": {
+						"top_hits": {
+							"size": 1,
+							"sort": [{"latency_ms": {"order": "desc"}}]
+						}
+					}
+				}
+			},
+			"by_date_window": {
+				"date_range": {
+					"field": "created_at",
+					"ranges": [
+						{"key": "older", "to": "2026-10-01T00:00:00Z"},
+						{"key": "recent", "from": "2026-10-01T00:00:00Z"}
+					]
+				}
+			},
+			"paged_composite": {
+				"composite": {
+					"size": 10,
+					"sources": [
+						{"service": {"terms": {"field": "service"}}},
+						{"env": {"terms": {"field": "env"}}}
+					]
+				}
+			}
+		}
+	}`))
+	if err != nil || v04SearchResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /logs-000001/_search failed: status=%v err=%v", v04SearchResp.StatusCode, err)
+	}
+	var v04Search struct {
+		Hits struct {
+			Total struct {
+				Value int `json:"value"`
+			} `json:"total"`
+		} `json:"hits"`
+		Aggregations map[string]map[string]any `json:"aggregations"`
+	}
+	if err := json.NewDecoder(v04SearchResp.Body).Decode(&v04Search); err != nil {
+		t.Fatal(err)
+	}
+	_ = v04SearchResp.Body.Close()
+	if v04Search.Hits.Total.Value != 3 {
+		t.Fatalf("expected 3 total hits from boosting+dis_max query, got %d", v04Search.Hits.Total.Value)
+	}
+	latestHitAgg := v04Search.Aggregations["latest_hit"]
+	topHitsWrapper, ok := latestHitAgg["hits"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected top_hits hits wrapper, got %+v", latestHitAgg)
+	}
+	topHitsArr, _ := topHitsWrapper["hits"].([]any)
+	if len(topHitsArr) != 1 {
+		t.Fatalf("expected 1 top_hit in latest_hit, got %d", len(topHitsArr))
+	}
+	compBuckets, _ := v04Search.Aggregations["paged_composite"]["buckets"].([]any)
+	if len(compBuckets) != 3 {
+		t.Fatalf("expected 3 composite buckets, got %d (%+v)", len(compBuckets), compBuckets)
+	}
+
+	// 5. Query unmapped_region (triggers unindexed _doc['unmapped_region'] tracking) then promote via POST /{index}/_doris/promote
+	unmappedResp, err := http.Post(ts.URL+"/logs-000001/_search", "application/json", strings.NewReader(`{"query":{"term":{"unmapped_region":"us-east-1"}}}`))
+	if err != nil || unmappedResp.StatusCode != http.StatusOK {
+		t.Fatalf("unmapped search failed: status=%v err=%v", unmappedResp.StatusCode, err)
+	}
+	_ = unmappedResp.Body.Close()
+	promoteReq, err := http.NewRequest(http.MethodPost, ts.URL+"/logs-000001/_doris/promote", strings.NewReader(`{"field":"unmapped_region","type":"keyword"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	promoteReq.Header.Set("Content-Type", "application/json")
+	promoteResp, err := http.DefaultClient.Do(promoteReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var promoteResult struct {
+		Acknowledged   bool   `json:"acknowledged"`
+		PromotedColumn string `json:"promoted_column"`
+	}
+	if err := json.NewDecoder(promoteResp.Body).Decode(&promoteResult); err != nil {
+		t.Fatal(err)
+	}
+	_ = promoteResp.Body.Close()
+	if !promoteResult.Acknowledged || promoteResult.PromotedColumn != "f__unmapped_region" {
+		t.Fatalf("expected promoted_column=f__unmapped_region, got %+v", promoteResult)
+	}
+
+	// Verify /_validate/query?explain=true now binds unmapped_region to promoted column `f__unmapped_region`
+	valReq, err := http.NewRequest(http.MethodPost, ts.URL+"/logs-000001/_validate/query?explain=true", strings.NewReader(`{"query":{"term":{"unmapped_region":"us-east-1"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	valReq.Header.Set("Content-Type", "application/json")
+	valResp, err := http.DefaultClient.Do(valReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var valBody struct {
+		Valid        bool `json:"valid"`
+		Explanations []struct {
+			Explanation string `json:"explanation"`
+		} `json:"explanations"`
+	}
+	if err := json.NewDecoder(valResp.Body).Decode(&valBody); err != nil {
+		t.Fatal(err)
+	}
+	_ = valResp.Body.Close()
+	if !valBody.Valid || len(valBody.Explanations) == 0 || !strings.Contains(valBody.Explanations[0].Explanation, "`f__unmapped_region`") {
+		t.Fatalf("expected validate/query explanation to reference promoted `f__unmapped_region`, got %+v", valBody)
+	}
+
+	// 6. Test /_analyze, /{alias}/_rollover, /metrics, /healthz, /readyz
+	anReq, err := http.NewRequest(http.MethodPost, ts.URL+"/_analyze", strings.NewReader(`{"analyzer":"standard","text":"Apache Doris 4.0 Search"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	anReq.Header.Set("Content-Type", "application/json")
+	anResp, err := http.DefaultClient.Do(anReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var anBody struct {
+		Tokens []map[string]any `json:"tokens"`
+	}
+	if err := json.NewDecoder(anResp.Body).Decode(&anBody); err != nil {
+		t.Fatal(err)
+	}
+	_ = anResp.Body.Close()
+	if len(anBody.Tokens) != 5 {
+		t.Fatalf("expected 5 tokens from /_analyze, got %d", len(anBody.Tokens))
+	}
+
+	rollReq, err := http.NewRequest(http.MethodPost, ts.URL+"/logs-write/_rollover", strings.NewReader(`{"conditions":{"max_docs":2}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rollReq.Header.Set("Content-Type", "application/json")
+	rollResp, err := http.DefaultClient.Do(rollReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rollBody struct {
+		RolledOver bool   `json:"rolled_over"`
+		OldIndex   string `json:"old_index"`
+		NewIndex   string `json:"new_index"`
+	}
+	if err := json.NewDecoder(rollResp.Body).Decode(&rollBody); err != nil {
+		t.Fatal(err)
+	}
+	_ = rollResp.Body.Close()
+	if !rollBody.RolledOver || rollBody.NewIndex != "logs-000002" {
+		t.Fatalf("expected rollover to logs-000002, got %+v", rollBody)
+	}
+
+	for _, path := range []string{"/metrics", "/healthz", "/readyz"} {
+		r, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = r.Body.Close()
+		if r.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK on %s, got %d", path, r.StatusCode)
+		}
+	}
+}
