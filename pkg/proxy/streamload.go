@@ -129,8 +129,7 @@ func (c *StreamLoadClient) LoadNDJSON(
 	req.Header.Set("format", "json")
 	req.Header.Set("read_json_by_line", "true")
 	req.Header.Set("strip_outer_array", "false")
-	req.Header.Set("merge_type", "MERGE")
-	req.Header.Set("delete", "__DORIS_DELETE_SIGN__ = 1")
+	req.Header.Set("hidden_columns", "__DORIS_DELETE_SIGN__")
 	req.Header.Set("function_column.sequence_col", "_version")
 
 	// #nosec G704 -- operator-configured Doris FE/BE Stream Load HTTP request
