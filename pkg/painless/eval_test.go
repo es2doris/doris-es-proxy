@@ -76,3 +76,89 @@ func TestEvalPainless_OpenMetadataTagAndSoftDeleteMutations(t *testing.T) {
 		t.Fatalf("expected followers [u2] after scalar removeIf, got %+v", out["followers"])
 	}
 }
+
+func TestEvalPainless_PutAll_AddAll_CompoundAssign_Loops_And_Upserts(t *testing.T) {
+	initial := `{"count":10,"score":2.5,"nested":{"a":1,"b":2},"items":["x"]}`
+	req := &UpdateRequest{
+		Doc: map[string]any{
+			"nested": map[string]any{"b": 20, "c": 30},
+		},
+		Script: &ScriptSpec{
+			Source: `
+				ctx._source.count += 5;
+				ctx._source.score -= 0.5;
+				ctx._source.nested.put('d', 40);
+				ctx._source.extra.putAll(params.extraMap);
+				ctx._source.items.addAll(params.moreItems);
+				for (tag in params.loopTags) {
+					if (tag != 'skip') {
+						ctx._source.items.add(tag);
+					} else {
+						ctx._source.skipped = true;
+					}
+				}
+			`,
+			Params: map[string]any{
+				"extraMap":  map[string]any{"k1": "v1", "k2": 99},
+				"moreItems": []any{"y", "z"},
+				"loopTags":  []any{"t1", "skip", "t2"},
+			},
+		},
+	}
+
+	updated, opRes, err := ApplyUpdateWithResult(json.RawMessage(initial), req, true)
+	if err != nil || opRes != "updated" {
+		t.Fatalf("ApplyUpdateWithResult failed: opRes=%q err=%v", opRes, err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(updated, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc["count"] != float64(15) || doc["score"] != float64(2) || doc["skipped"] != true {
+		t.Fatalf("unexpected arithmetic/loop state: %+v", doc)
+	}
+	nestedMap := doc["nested"].(map[string]any)
+	if nestedMap["a"] != float64(1) || nestedMap["b"] != float64(20) || nestedMap["c"] != float64(30) || nestedMap["d"] != float64(40) {
+		t.Fatalf("unexpected deepMergeMap + put result: %+v", nestedMap)
+	}
+	extraMap := doc["extra"].(map[string]any)
+	if extraMap["k1"] != "v1" || extraMap["k2"] != float64(99) {
+		t.Fatalf("unexpected putAll result: %+v", extraMap)
+	}
+	items := doc["items"].([]any)
+	if len(items) != 5 {
+		t.Fatalf("expected 5 items after addAll + for loop, got %+v", items)
+	}
+
+	// Test doc_as_upsert when document does not exist
+	upsertBytes, opRes2, err := ApplyUpdateWithResult(nil, &UpdateRequest{
+		Doc:         map[string]any{"title": "upserted"},
+		DocAsUpsert: true,
+	}, false)
+	if err != nil || opRes2 != "created" || !strings.Contains(string(upsertBytes), `"title":"upserted"`) {
+		t.Fatalf("unexpected doc_as_upsert result: op=%q body=%s err=%v", opRes2, string(upsertBytes), err)
+	}
+
+	// Test explicit upsert without scripted_upsert
+	upsertBytes2, opRes3, err := ApplyUpdateWithResult(nil, &UpdateRequest{
+		Upsert: map[string]any{"status": "seeded"},
+		Script: &ScriptSpec{Source: "ctx._source.status = 'mutated'"},
+	}, false)
+	if err != nil || opRes3 != "created" || !strings.Contains(string(upsertBytes2), `"status":"seeded"`) {
+		t.Fatalf("unexpected upsert result: op=%q body=%s err=%v", opRes3, string(upsertBytes2), err)
+	}
+
+	// Test ctx.op = 'noop' and ctx.op = 'delete'
+	_, noopRes, err := ApplyUpdateWithResult(json.RawMessage(`{"a":1}`), &UpdateRequest{
+		Script: &ScriptSpec{Source: "ctx.op = 'noop'"},
+	}, true)
+	if err != nil || noopRes != "noop" {
+		t.Fatalf("expected noop, got %q (err=%v)", noopRes, err)
+	}
+	_, delRes, err := ApplyUpdateWithResult(json.RawMessage(`{"a":1}`), &UpdateRequest{
+		Script: &ScriptSpec{Source: "ctx.op = 'delete'"},
+	}, true)
+	if err != nil || delRes != "deleted" {
+		t.Fatalf("expected deleted, got %q (err=%v)", delRes, err)
+	}
+}
