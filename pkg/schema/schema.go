@@ -37,6 +37,7 @@ const (
 	StoragePromotedArray
 	StorageNestedSubfield
 	StorageDynamicVariant
+	StoragePromotedVector
 )
 
 type DorisScalarType string
@@ -49,6 +50,7 @@ const (
 	DorisDouble     DorisScalarType = "DOUBLE"
 	DorisBoolean    DorisScalarType = "BOOLEAN"
 	DorisDateTimeV2 DorisScalarType = "DATETIMEV2(3)"
+	DorisFloatArray DorisScalarType = "ARRAY<FLOAT>"
 )
 
 // FieldBinding describes how an Elasticsearch field path (e.g. `name.keyword`,
@@ -62,6 +64,8 @@ type FieldBinding struct {
 	Analyzer            string
 	LowercaseNormalizer bool
 	KeywordCompanion    string // Optional untokenized `.keyword` column for `text` fields
+	VectorDims          int
+	VectorMetric        string
 
 	// For `StorageNestedSubfield` (`nested` arrays of objects):
 	NestedPath         string   // Root nested path, e.g. "columns"
@@ -222,6 +226,15 @@ func DeepMergeMappingProperties(
 			if v.Format != "" {
 				merged.Format = v.Format
 			}
+			if v.Dims > 0 {
+				merged.Dims = v.Dims
+			}
+			if v.Dimension > 0 {
+				merged.Dimension = v.Dimension
+			}
+			if v.Similarity != "" {
+				merged.Similarity = v.Similarity
+			}
 			if len(v.Properties) > 0 {
 				merged.Properties = DeepMergeMappingProperties(existing.Properties, v.Properties)
 			}
@@ -340,6 +353,22 @@ func (s *IndexSchema) registerLeafField(
 	}
 
 	colName := "f__" + SanitizeDorisIdentifier(dotPath)
+	if strings.EqualFold(prop.Type, "dense_vector") || strings.EqualFold(prop.Type, "knn_vector") {
+		metric := prop.Similarity
+		if metric == "" {
+			metric = "cosine"
+		}
+		s.Fields[dotPath] = FieldBinding{
+			ESFieldPath:    dotPath,
+			SourceJSONPath: sourceJSONPath,
+			Kind:           StoragePromotedVector,
+			ColumnName:     colName,
+			DorisType:      DorisFloatArray,
+			VectorDims:     prop.EffectiveDims(),
+			VectorMetric:   metric,
+		}
+		return
+	}
 	if DefaultMultiValuedPaths[dotPath] {
 		s.Fields[dotPath] = FieldBinding{
 			ESFieldPath:         dotPath,

@@ -1501,6 +1501,34 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			return extractJSONPathFromStr(srcStr, segs)
 		}
 	}
+	if strings.HasPrefix(colExpr, "array_size(") && strings.HasSuffix(colExpr, ")") {
+		inner := colExpr[len("array_size(") : len(colExpr)-1]
+		val := resolveColumnValue(row, inner)
+		if val == nil {
+			return int64(0)
+		}
+		return int64(len(toStringSlice(val)))
+	}
+	if (strings.HasPrefix(colExpr, "COSINE_DISTANCE(") || strings.HasPrefix(colExpr, "L2_DISTANCE(")) && strings.HasSuffix(colExpr, ")") {
+		isL2 := strings.HasPrefix(colExpr, "L2_DISTANCE(")
+		fnLen := len("COSINE_DISTANCE(")
+		if isL2 {
+			fnLen = len("L2_DISTANCE(")
+		}
+		inner := colExpr[fnLen : len(colExpr)-1]
+		args := splitTopLevelArgs(inner)
+		if len(args) == 2 {
+			docVec := resolveVectorValue(row, args[0])
+			qVec := parseVectorLiteral(args[1])
+			if len(docVec) > 0 && len(docVec) == len(qVec) {
+				if isL2 {
+					return computeL2Distance(docVec, qVec)
+				}
+				return computeCosineDistance(docVec, qVec)
+			}
+		}
+		return nil
+	}
 	if strings.HasPrefix(colExpr, "CAST(") && strings.HasSuffix(colExpr, " AS DOUBLE)") && !strings.HasPrefix(colExpr, "CAST(`_doc`") {
 		inner := colExpr[len("CAST(") : len(colExpr)-len(" AS DOUBLE)")]
 		return evalNumericExpr(row, inner)
@@ -1780,6 +1808,12 @@ func toStringSlice(v any) []string {
 	switch s := v.(type) {
 	case []string:
 		return s
+	case []float64:
+		out := make([]string, 0, len(s))
+		for _, item := range s {
+			out = append(out, strconv.FormatFloat(item, 'f', -1, 64))
+		}
+		return out
 	case []any:
 		out := make([]string, 0, len(s))
 		for _, item := range s {
@@ -1789,6 +1823,70 @@ func toStringSlice(v any) []string {
 	default:
 		return nil
 	}
+}
+
+func resolveVectorValue(row map[string]any, expr string) []float64 {
+	expr = strings.TrimSpace(expr)
+	if strings.HasPrefix(expr, "IF(") && strings.HasSuffix(expr, ")") {
+		args := splitTopLevelArgs(expr[3 : len(expr)-1])
+		if len(args) == 3 {
+			expr = strings.TrimSpace(args[1])
+		}
+	}
+	val := resolveColumnValue(row, expr)
+	switch s := val.(type) {
+	case []float64:
+		return s
+	case []any:
+		out := make([]float64, 0, len(s))
+		for _, item := range s {
+			if f, ok := toFloat(item); ok {
+				out = append(out, f)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func parseVectorLiteral(expr string) []float64 {
+	expr = strings.TrimSpace(expr)
+	if strings.HasPrefix(expr, "CAST([") && strings.HasSuffix(expr, "] AS ARRAY<FLOAT>)") {
+		expr = expr[len("CAST([") : len(expr)-len("] AS ARRAY<FLOAT>)")]
+	} else if strings.HasPrefix(expr, "[") && strings.HasSuffix(expr, "]") {
+		expr = expr[1 : len(expr)-1]
+	}
+	var out []float64
+	for _, part := range strings.Split(expr, ",") {
+		if f, err := strconv.ParseFloat(strings.TrimSpace(part), 64); err == nil {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func computeCosineDistance(a, b []float64) float64 {
+	var dot, normA, normB float64
+	for i := range a {
+		dot += a[i] * b[i]
+		normA += a[i] * a[i]
+		normB += b[i] * b[i]
+	}
+	if normA == 0 || normB == 0 {
+		return 1.0
+	}
+	sim := dot / (math.Sqrt(normA) * math.Sqrt(normB))
+	return 1.0 - sim
+}
+
+func computeL2Distance(a, b []float64) float64 {
+	var sumSq float64
+	for i := range a {
+		d := a[i] - b[i]
+		sumSq += d * d
+	}
+	return math.Sqrt(sumSq)
 }
 
 func toInt64(v any) (int64, bool) {
