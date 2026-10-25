@@ -48,8 +48,9 @@ jobs:
           docker run -d --name doris-fe-be --network host apache/doris:all-in-one-4.1.3
           echo "Waiting for Apache Doris FE & BE to become ready..."
           for i in $(seq 1 90); do
-            if mysql -h 127.0.0.1 -P 9030 -u root -e "SHOW BACKENDS\G" 2>/dev/null | grep -q "Alive: true"; then
-              echo "Apache Doris FE+BE is alive!"
+            OUT=$(mysql -h 127.0.0.1 -P 9030 -u root -e "SHOW BACKENDS\G" 2>/dev/null || true)
+            if echo "$OUT" | grep -q "Alive: true" && ! echo "$OUT" | grep -q "TotalCapacity: 0.000"; then
+              echo "Apache Doris FE+BE is alive and BE storage capacity is reported!"
               break
             fi
             sleep 3
