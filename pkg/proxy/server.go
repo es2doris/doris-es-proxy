@@ -104,13 +104,14 @@ type CatalogBackend interface {
 
 // Server implements the Elasticsearch / OpenSearch HTTP REST API adapter backed by Apache Doris.
 type Server struct {
-	dorisDB           string
-	backend           DorisBackend
-	transpileOpts     transpiler.TranspilerOptions
-	maxBodyBytes      int64
-	slowTracker       *SlowQueryTracker
-	shadowVerifier    *ShadowVerifier
-	totalHTTPRequests int64
+	dorisDB              string
+	backend              DorisBackend
+	transpileOpts        transpiler.TranspilerOptions
+	maxBodyBytes         int64
+	slowTracker          *SlowQueryTracker
+	shadowVerifier       *ShadowVerifier
+	totalHTTPRequests    int64
+	autoPromoteThreshold int64
 
 	mu        sync.RWMutex
 	indices   map[string]*schema.IndexSchema
@@ -297,6 +298,8 @@ func (s *Server) Handler() http.Handler {
 				s.handleFieldCaps(w, r)
 			case "_analyze":
 				s.handleAnalyze(w, r)
+			case "_pit":
+				s.handlePIT(w, r)
 			case "metrics", "_prometheus":
 				s.handleMetrics(w, r)
 			case "healthz", "_healthz", "livez":
@@ -396,6 +399,8 @@ func (s *Server) Handler() http.Handler {
 					s.handleFieldCaps(w, r)
 				case "_analyze":
 					s.handleAnalyze(w, r)
+				case "_pit":
+					s.handlePIT(w, r)
 				case "_rollover":
 					r.SetPathValue("alias", segs[0])
 					s.handleRollover(w, r)
@@ -1252,8 +1257,9 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idxSchema := s.ensureIndexSchema(r.Context(), indexName)
-	shredded, err := schema.ShredDocument(idxSchema, docID, time.Now().UnixNano(), false, json.RawMessage(rawDoc))
+	idxSchema := s.ensureWritableIndexSchemaWithDocs(r.Context(), indexName, []json.RawMessage{json.RawMessage(rawDoc)})
+	nextVer := time.Now().UnixNano()
+	shredded, err := schema.ShredDocument(idxSchema, docID, nextVer, false, json.RawMessage(rawDoc))
 	if err != nil {
 		writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 		return
@@ -1266,12 +1272,14 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"_index":   indexName,
-		"_type":    "_doc",
-		"_id":      docID,
-		"_version": 1,
-		"result":   "created",
-		"_shards":  map[string]any{"total": 1, "successful": 1, "failed": 0},
+		"_index":        indexName,
+		"_type":         "_doc",
+		"_id":           docID,
+		"_version":      1,
+		"result":        "created",
+		"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+		"_seq_no":       nextVer,
+		"_primary_term": 1,
 	})
 }
 
@@ -1435,11 +1443,14 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"_index":   indexName,
-		"_type":    "_doc",
-		"_id":      docID,
-		"_version": 2,
-		"result":   "deleted",
+		"_index":        indexName,
+		"_type":         "_doc",
+		"_id":           docID,
+		"_version":      2,
+		"result":        "deleted",
+		"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+		"_seq_no":       2,
+		"_primary_term": 1,
 	})
 }
 
@@ -1492,11 +1503,14 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"_index":   indexName,
-		"_type":    "_doc",
-		"_id":      docID,
-		"_version": nextVersion,
-		"result":   opResult,
+		"_index":        indexName,
+		"_type":         "_doc",
+		"_id":           docID,
+		"_version":      nextVersion,
+		"result":        opResult,
+		"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+		"_seq_no":       nextVersion,
+		"_primary_term": 1,
 	})
 }
 
@@ -1742,13 +1756,23 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Pre-fetch existing documents for "update" and "create" operations in 1 batch SQL query per index.
+	// Collect sample docs per target index for dynamic mapping inference on auto-created indices.
+	sampleDocsByIndex := make(map[string][]json.RawMessage)
 	idsToFetchByIndex := make(map[string][]string)
 	for _, op := range ops {
-		if op.ParseErr == "" && (op.Action == "update" || op.Action == "create") && op.ID != "" {
-			idxName := s.resolveIndexName(op.Index)
+		if op.ParseErr != "" {
+			continue
+		}
+		idxName := s.resolveIndexName(op.Index)
+		if (op.Action == "index" || op.Action == "create") && len(op.Source) > 0 && len(sampleDocsByIndex[idxName]) < 16 {
+			sampleDocsByIndex[idxName] = append(sampleDocsByIndex[idxName], op.Source)
+		}
+		if (op.Action == "update" || op.Action == "create") && op.ID != "" {
 			idsToFetchByIndex[idxName] = append(idsToFetchByIndex[idxName], op.ID)
 		}
+	}
+	for idxName, samples := range sampleDocsByIndex {
+		_ = s.ensureWritableIndexSchemaWithDocs(r.Context(), idxName, samples)
 	}
 	existingByIndex := make(map[string]map[string]HitRow, len(idsToFetchByIndex))
 	for idxName, ids := range idsToFetchByIndex {
@@ -1906,12 +1930,15 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		}
 		items = append(items, map[string]any{
 			op.Action: map[string]any{
-				"_index":   targetIndex,
-				"_type":    "_doc",
-				"_id":      op.ID,
-				"_version": 1,
-				"result":   result,
-				"status":   status,
+				"_index":        targetIndex,
+				"_type":         "_doc",
+				"_id":           op.ID,
+				"_version":      1,
+				"result":        result,
+				"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+				"_seq_no":       nextVer,
+				"_primary_term": 1,
+				"status":        status,
 			},
 		})
 	}
@@ -1965,10 +1992,18 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rawIndex := r.PathValue("index")
+	if rawIndex == "" && req.PIT != nil && req.PIT.ID != "" {
+		if pitIdx, ok := decodePITIndex(req.PIT.ID); ok {
+			rawIndex = pitIdx
+		}
+	}
 	resp, status, errType, errReason := s.executeSearchRequest(r.Context(), rawIndex, &req)
 	if errType != "" {
 		writeESError(w, status, errType, errReason)
 		return
+	}
+	if req.PIT != nil && req.PIT.ID != "" {
+		resp["pit_id"] = req.PIT.ID
 	}
 	tookMs, _ := toInt64(resp["took"])
 	syncShadow := r.URL.Query().Get("shadow_sync") == "true" || r.URL.Query().Get("shadow_sync") == "1"
@@ -2315,7 +2350,8 @@ func (s *Server) executeSearchRequest(
 		if idxTookMs <= 0 {
 			idxTookMs = 1
 		}
-		s.slowTracker.record(SlowQueryEntry{
+		threshold := s.getAutoPromoteThreshold()
+		toPromote := s.slowTracker.recordWithThreshold(SlowQueryEntry{
 			Timestamp:              time.Now().UTC().Format(time.RFC3339),
 			Index:                  indexName,
 			TookMs:                 idxTookMs,
@@ -2323,7 +2359,10 @@ func (s *Server) executeSearchRequest(
 			HitsSQL:                plan.HitsSQL,
 			AggsSQL:                plan.AggsSQL,
 			UnindexedVariantFields: plan.UnindexedVariantFields,
-		})
+		}, threshold)
+		for _, fieldToPromote := range toPromote {
+			_, _ = s.promoteFieldInternal(ctx, indexName, fieldToPromote, "keyword")
+		}
 		totalHitsSum += idxTotal
 	}
 
@@ -3401,10 +3440,14 @@ func (s *Server) getOrCompileReadOnlySchema(ctx context.Context, indexName strin
 }
 
 func (s *Server) ensureWritableIndexSchema(ctx context.Context, indexName string) *schema.IndexSchema {
-	return s.ensureIndexSchema(ctx, indexName)
+	return s.ensureWritableIndexSchemaWithDocs(ctx, indexName, nil)
 }
 
 func (s *Server) ensureIndexSchema(ctx context.Context, indexName string) *schema.IndexSchema {
+	return s.ensureWritableIndexSchemaWithDocs(ctx, indexName, nil)
+}
+
+func (s *Server) ensureWritableIndexSchemaWithDocs(ctx context.Context, indexName string, sampleDocs []json.RawMessage) *schema.IndexSchema {
 	s.mu.RLock()
 	if targets, ok := s.aliases[indexName]; ok && len(targets) > 0 {
 		indexName = targets[0]
@@ -3430,7 +3473,13 @@ func (s *Server) ensureIndexSchema(ctx context.Context, indexName string) *schem
 	tplMappings := s.matchingTemplateMappingsLocked(indexName)
 	s.mu.RUnlock()
 
-	compiled := schema.CompileIndexSchema(s.dorisDB, indexName, tplMappings)
+	effectiveMappings := tplMappings
+	if len(sampleDocs) > 0 && (tplMappings == nil || tplMappings.Dynamic == nil || tplMappings.Dynamic == true || tplMappings.Dynamic == "true") {
+		inferred := schema.InferMappingFromSampleDocs(sampleDocs)
+		effectiveMappings = schema.MergeMappingSpecs(inferred, tplMappings)
+	}
+
+	compiled := schema.CompileIndexSchema(s.dorisDB, indexName, effectiveMappings)
 	_ = s.backend.ExecDDL(ctx, schema.GenerateCreateTableDDL(compiled))
 	s.mu.Lock()
 	if existing, exists := s.indices[indexName]; exists {
@@ -3441,6 +3490,33 @@ func (s *Server) ensureIndexSchema(ctx context.Context, indexName string) *schem
 	s.mu.Unlock()
 	s.persistIndex(ctx, indexName, compiled)
 	return compiled
+}
+
+func (s *Server) handlePIT(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodDelete {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"succeeded": true,
+			"num_freed": 1,
+		})
+		return
+	}
+	rawIndex := r.PathValue("index")
+	pitID := base64.RawURLEncoding.EncodeToString([]byte("pit:" + rawIndex))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": pitID,
+	})
+}
+
+func decodePITIndex(pitID string) (string, bool) {
+	raw, err := base64.RawURLEncoding.DecodeString(pitID)
+	if err != nil {
+		return "", false
+	}
+	s := string(raw)
+	if strings.HasPrefix(s, "pit:") {
+		return strings.TrimPrefix(s, "pit:"), true
+	}
+	return "", false
 }
 
 func matchWildcardPattern(pattern, target string) bool {
@@ -3479,12 +3555,20 @@ func setESCompatHeaders(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, HEAD, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, X-Opaque-Id, X-Elastic-Client-Meta, kbn-xsrf")
+	w.Header().Set("Access-Control-Expose-Headers", "X-Elastic-Product, Warning, X-Opaque-Id")
+	if opaqueID := r.Header.Get("X-Opaque-Id"); opaqueID != "" {
+		w.Header().Set("X-Opaque-Id", opaqueID)
+	}
 	accept := r.Header.Get("Accept")
-	if strings.Contains(accept, "compatible-with=8") {
+	reqCT := r.Header.Get("Content-Type")
+	switch {
+	case strings.Contains(accept, "compatible-with=9") || strings.Contains(reqCT, "compatible-with=9"):
+		w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=9")
+	case strings.Contains(accept, "compatible-with=8") || strings.Contains(reqCT, "compatible-with=8"):
 		w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=8")
-	} else if strings.Contains(accept, "compatible-with=7") {
+	case strings.Contains(accept, "compatible-with=7") || strings.Contains(reqCT, "compatible-with=7"):
 		w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=7")
-	} else {
+	default:
 		w.Header().Set("Content-Type", "application/json; charset=UTF-8")
 	}
 }

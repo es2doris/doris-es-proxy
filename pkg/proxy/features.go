@@ -189,7 +189,7 @@ func newSlowQueryTracker() *SlowQueryTracker {
 	}
 }
 
-func (t *SlowQueryTracker) record(entry SlowQueryEntry) {
+func (t *SlowQueryTracker) recordWithThreshold(entry SlowQueryEntry, threshold int64) []string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if len(t.entries) >= slowLogRingCapacity {
@@ -198,6 +198,7 @@ func (t *SlowQueryTracker) record(entry SlowQueryEntry) {
 	} else {
 		t.entries = append(t.entries, entry)
 	}
+	var promoteFields []string
 	if len(entry.UnindexedVariantFields) > 0 {
 		byField, ok := t.unindexedFreq[entry.Index]
 		if !ok {
@@ -206,8 +207,22 @@ func (t *SlowQueryTracker) record(entry SlowQueryEntry) {
 		}
 		for _, f := range entry.UnindexedVariantFields {
 			byField[f]++
+			if threshold > 0 && byField[f] >= threshold {
+				promoteFields = append(promoteFields, f)
+			}
 		}
 	}
+	return promoteFields
+}
+
+// SetAutoPromoteThreshold configures automatic promotion of hot unindexed `_doc[...]` fields
+// once they are queried at least `threshold` times (0 disables automatic promotion).
+func (s *Server) SetAutoPromoteThreshold(threshold int64) {
+	atomic.StoreInt64(&s.autoPromoteThreshold, threshold)
+}
+
+func (s *Server) getAutoPromoteThreshold() int64 {
+	return atomic.LoadInt64(&s.autoPromoteThreshold)
 }
 
 func (s *Server) handleDorisSlowlog(w http.ResponseWriter, r *http.Request) {
@@ -949,38 +964,11 @@ func (s *Server) handleDorisPromoteField(w http.ResponseWriter, r *http.Request)
 		req.Type = "keyword"
 	}
 
-	idxSchema := s.ensureWritableIndexSchema(r.Context(), idxName)
-	ddls := schema.GeneratePromoteVariantFieldDDL(idxSchema, req.Field, req.Type)
-	for _, ddl := range ddls {
-		if err := s.backend.ExecDDL(r.Context(), ddl); err != nil {
-			writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", err.Error())
-			return
-		}
+	ddls, err := s.promoteFieldInternal(r.Context(), idxName, req.Field, req.Type)
+	if err != nil {
+		writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", err.Error())
+		return
 	}
-
-	// Merge the newly promoted field into the index mapping and recompile IndexSchema.
-	patchSpec := &esast.MappingSpec{
-		Properties: buildNestedMappingProps(strings.Split(req.Field, "."), esast.FieldProperty{Type: req.Type}),
-	}
-	s.mu.Lock()
-	var oldRaw *esast.MappingSpec
-	if cur := s.indices[idxName]; cur != nil {
-		oldRaw = cur.RawMapping
-	}
-	mergedSpec := schema.MergeMappingSpecs(oldRaw, patchSpec)
-	compiled := schema.CompileIndexSchema(s.dorisDB, idxName, mergedSpec)
-	s.indices[idxName] = compiled
-	s.mu.Unlock()
-	s.persistIndex(r.Context(), idxName, compiled)
-
-	s.slowTracker.mu.Lock()
-	if byField, ok := s.slowTracker.unindexedFreq[idxName]; ok {
-		delete(byField, req.Field)
-		if len(byField) == 0 {
-			delete(s.slowTracker.unindexedFreq, idxName)
-		}
-	}
-	s.slowTracker.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"acknowledged":    true,
@@ -991,6 +979,43 @@ func (s *Server) handleDorisPromoteField(w http.ResponseWriter, r *http.Request)
 		"promoted_column": "f__" + schema.SanitizeDorisIdentifier(req.Field),
 		"executed_ddls":   ddls,
 	})
+}
+
+func (s *Server) promoteFieldInternal(ctx context.Context, idxName, field, esType string) ([]string, error) {
+	if esType == "" {
+		esType = "keyword"
+	}
+	idxSchema := s.ensureWritableIndexSchema(ctx, idxName)
+	ddls := schema.GeneratePromoteVariantFieldDDL(idxSchema, field, esType)
+	for _, ddl := range ddls {
+		if err := s.backend.ExecDDL(ctx, ddl); err != nil {
+			return nil, err
+		}
+	}
+
+	patchSpec := &esast.MappingSpec{
+		Properties: buildNestedMappingProps(strings.Split(field, "."), esast.FieldProperty{Type: esType}),
+	}
+	s.mu.Lock()
+	var oldRaw *esast.MappingSpec
+	if cur := s.indices[idxName]; cur != nil {
+		oldRaw = cur.RawMapping
+	}
+	mergedSpec := schema.MergeMappingSpecs(oldRaw, patchSpec)
+	compiled := schema.CompileIndexSchema(s.dorisDB, idxName, mergedSpec)
+	s.indices[idxName] = compiled
+	s.mu.Unlock()
+	s.persistIndex(ctx, idxName, compiled)
+
+	s.slowTracker.mu.Lock()
+	if byField, ok := s.slowTracker.unindexedFreq[idxName]; ok {
+		delete(byField, field)
+		if len(byField) == 0 {
+			delete(s.slowTracker.unindexedFreq, idxName)
+		}
+	}
+	s.slowTracker.mu.Unlock()
+	return ddls, nil
 }
 
 func buildNestedMappingProps(segments []string, leaf esast.FieldProperty) map[string]esast.FieldProperty {

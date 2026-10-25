@@ -863,3 +863,165 @@ func TestV04DisMaxTopHitsCompositePromoteValidateAnalyzeRolloverMetrics_E2E(t *t
 		}
 	}
 }
+
+func TestSDKWireCompatDynamicMappingAutoPromoteAndPIT_E2E(t *testing.T) {
+	mem := NewMemDorisBackend()
+	srv := proxy.NewServer("es_compat", mem, transpiler.TranspilerOptions{})
+	srv.SetAutoPromoteThreshold(2)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. Official ES 8.x/9.x SDK media-type negotiation (Content-Type + Accept + X-Opaque-Id)
+	// and Dynamic Mapping Inference on first /_bulk ingest into a brand-new schemaless index (`schemaless_events`).
+	bulkNDJSON := strings.Join([]string{
+		`{"index":{"_index":"schemaless_events","_id":"ev-1"}}`,
+		`{"service":"checkout","message":"order processed successfully","status_code":200,"latency_ms":14.5,"ok":true,"created_at":"2026-10-25T10:00:00Z","meta":{"region":"us-east-1"}}`,
+		`{"index":{"_index":"schemaless_events","_id":"ev-2"}}`,
+		`{"service":"payments","message":"card declined error","status_code":402,"latency_ms":88.2,"ok":false,"created_at":"2026-10-25T11:00:00Z","meta":{"region":"eu-west-1"}}`,
+	}, "\n") + "\n"
+
+	bulkReq, err := http.NewRequest(http.MethodPost, ts.URL+"/_bulk?refresh=true", strings.NewReader(bulkNDJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bulkReq.Header.Set("Content-Type", "application/vnd.elasticsearch+ndjson; compatible-with=8")
+	bulkReq.Header.Set("X-Opaque-Id", "sdk-req-42")
+	bulkResp, err := http.DefaultClient.Do(bulkReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ct := bulkResp.Header.Get("Content-Type"); !strings.Contains(ct, "application/vnd.elasticsearch+json; compatible-with=8") {
+		t.Fatalf("expected compatible-with=8 response Content-Type when request Content-Type specifies compatible-with=8, got %q", ct)
+	}
+	if bulkResp.Header.Get("X-Opaque-Id") != "sdk-req-42" {
+		t.Fatalf("expected X-Opaque-Id echoed on response, got %q", bulkResp.Header.Get("X-Opaque-Id"))
+	}
+	var bulkRes struct {
+		Errors bool             `json:"errors"`
+		Items  []map[string]any `json:"items"`
+	}
+	if err := json.NewDecoder(bulkResp.Body).Decode(&bulkRes); err != nil {
+		t.Fatal(err)
+	}
+	_ = bulkResp.Body.Close()
+	if bulkRes.Errors || len(bulkRes.Items) != 2 {
+		t.Fatalf("expected 2 successful bulk items, got %+v", bulkRes)
+	}
+	firstItem := bulkRes.Items[0]["index"].(map[string]any)
+	if firstItem["_shards"] == nil || firstItem["_seq_no"] == nil || firstItem["_primary_term"] == nil {
+		t.Fatalf("expected _shards, _seq_no, and _primary_term in bulk item for typed SDK compatibility, got %+v", firstItem)
+	}
+
+	// 2. Verify Dynamic Mapping Inference promoted `service` (keyword), `message` (text + .keyword), `status_code` (long),
+	// `latency_ms` (double), `ok` (boolean), `created_at` (date), and `meta.region` (keyword) to `f__*` columns!
+	explainResp, err := http.Post(ts.URL+"/schemaless_events/_doris/explain", "application/json", strings.NewReader(`{
+		"query": {
+			"bool": {
+				"must": [
+					{"match": {"message": "order"}},
+					{"term": {"service": "checkout"}},
+					{"term": {"meta.region": "us-east-1"}},
+					{"range": {"latency_ms": {"gte": 10.0}}}
+				]
+			}
+		}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var explainObj struct {
+		HitsSQL          string   `json:"hits_sql"`
+		UnindexedVariant []string `json:"unindexed_variant_fields"`
+	}
+	if err := json.NewDecoder(explainResp.Body).Decode(&explainObj); err != nil {
+		t.Fatal(err)
+	}
+	_ = explainResp.Body.Close()
+	if len(explainObj.UnindexedVariant) != 0 {
+		t.Fatalf("expected 0 unindexed variant fields after dynamic mapping inference, got %v (SQL: %s)", explainObj.UnindexedVariant, explainObj.HitsSQL)
+	}
+	if !strings.Contains(explainObj.HitsSQL, "`f__service`") || !strings.Contains(explainObj.HitsSQL, "`f__meta__region`") {
+		t.Fatalf("expected hits_sql to use dynamically inferred promoted columns `f__service` and `f__meta__region`, got %s", explainObj.HitsSQL)
+	}
+
+	// 3. Test Point-in-Time (`POST /{index}/_pit`, `/_search` with `pit`, `DELETE /_pit`)
+	pitReq, err := http.NewRequest(http.MethodPost, ts.URL+"/schemaless_events/_pit?keep_alive=1m", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pitResp, err := http.DefaultClient.Do(pitReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pitCreate struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(pitResp.Body).Decode(&pitCreate); err != nil {
+		t.Fatal(err)
+	}
+	_ = pitResp.Body.Close()
+	if pitCreate.ID == "" {
+		t.Fatalf("expected non-empty PIT ID from POST /schemaless_events/_pit")
+	}
+
+	pitSearchResp, err := http.Post(ts.URL+"/_search", "application/json", strings.NewReader(`{
+		"pit": {"id": "`+pitCreate.ID+`", "keep_alive": "1m"},
+		"query": {"term": {"ok": true}},
+		"sort": [{"_id": "asc"}]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pitSearchBody struct {
+		PITID string `json:"pit_id"`
+		Hits  struct {
+			Total struct {
+				Value int `json:"value"`
+			} `json:"total"`
+		} `json:"hits"`
+	}
+	if err := json.NewDecoder(pitSearchResp.Body).Decode(&pitSearchBody); err != nil {
+		t.Fatal(err)
+	}
+	_ = pitSearchResp.Body.Close()
+	if pitSearchBody.PITID != pitCreate.ID || pitSearchBody.Hits.Total.Value != 1 {
+		t.Fatalf("expected PIT search to return pit_id=%q and 1 hit, got %+v", pitCreate.ID, pitSearchBody)
+	}
+
+	delPitReq, err := http.NewRequest(http.MethodDelete, ts.URL+"/_pit", strings.NewReader(`{"id":"`+pitCreate.ID+`"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	delPitResp, err := http.DefaultClient.Do(delPitReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = delPitResp.Body.Close()
+	if delPitResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK on DELETE /_pit, got %d", delPitResp.StatusCode)
+	}
+
+	// 4. Test Auto-Promote Threshold (`srv.SetAutoPromoteThreshold(2)`):
+	// Querying a brand-new field `late_added_tag` twice automatically promotes it to `f__late_added_tag`!
+	for i := 0; i < 2; i++ {
+		r, err := http.Post(ts.URL+"/schemaless_events/_search", "application/json", strings.NewReader(`{"query":{"term":{"late_added_tag":"hot"}}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = r.Body.Close()
+	}
+	afterPromoteExplain, err := http.Post(ts.URL+"/schemaless_events/_doris/explain", "application/json", strings.NewReader(`{"query":{"term":{"late_added_tag":"hot"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var afterExplainObj struct {
+		HitsSQL string `json:"hits_sql"`
+	}
+	if err := json.NewDecoder(afterPromoteExplain.Body).Decode(&afterExplainObj); err != nil {
+		t.Fatal(err)
+	}
+	_ = afterPromoteExplain.Body.Close()
+	if !strings.Contains(afterExplainObj.HitsSQL, "`f__late_added_tag`") {
+		t.Fatalf("expected auto-promote daemon to promote `late_added_tag` to `f__late_added_tag` after 2 queries, got SQL: %s", afterExplainObj.HitsSQL)
+	}
+}

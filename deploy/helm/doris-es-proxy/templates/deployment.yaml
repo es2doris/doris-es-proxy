@@ -1,0 +1,83 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "doris-es-proxy.fullname" . }}
+  labels:
+    {{- include "doris-es-proxy.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "doris-es-proxy.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "doris-es-proxy.selectorLabels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: doris-es-proxy
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http-es
+              containerPort: 9200
+              protocol: TCP
+          env:
+            - name: LISTEN_ADDR
+              value: ":9200"
+            - name: DORIS_DB
+              value: {{ .Values.doris.database | quote }}
+            - name: DORIS_HTTP
+              value: {{ .Values.doris.httpEndpoint | quote }}
+            - name: DORIS_USER
+              value: {{ .Values.doris.user | quote }}
+            - name: DORIS4_SEARCH_FN
+              value: {{ .Values.doris.doris4SearchFn | quote }}
+            - name: AUTO_PROMOTE
+              value: {{ .Values.doris.autoPromote | quote }}
+            - name: LOG_SQL
+              value: {{ .Values.doris.logSql | quote }}
+            - name: SHADOW_ES_URL
+              value: {{ .Values.doris.shadowEsUrl | quote }}
+            - name: DORIS_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default (include "doris-es-proxy.fullname" .) .Values.doris.existingSecret }}
+                  key: {{ .Values.doris.existingSecretDsnKey }}
+            - name: DORIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default (include "doris-es-proxy.fullname" .) .Values.doris.existingSecret }}
+                  key: DORIS_PASSWORD
+                  optional: true
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http-es
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http-es
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

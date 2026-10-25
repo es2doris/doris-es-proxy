@@ -107,6 +107,7 @@ func main() {
 		dorisDB             = flag.String("doris-db", envOrDefault("DORIS_DB", "es_compat"), "Target Apache Doris database name (env: DORIS_DB)")
 		shadowESURL         = flag.String("shadow-es-url", envOrDefault("SHADOW_ES_URL", ""), "Optional legacy Elasticsearch URL for dual-read shadow parity verification (env: SHADOW_ES_URL)")
 		useDoris4SearchFunc = flag.Bool("doris4-search-fn", envBoolOrDefault("DORIS4_SEARCH_FN", false), "Push query_string down to Apache Doris 4.0 SEARCH() SQL function (env: DORIS4_SEARCH_FN)")
+		autoPromote         = flag.Bool("auto-promote", envBoolOrDefault("AUTO_PROMOTE", false), "Automatically promote hot unindexed _doc[...] VARIANT fields to f__* inverted index columns (env: AUTO_PROMOTE)")
 		inMemoryMode        = flag.Bool("in-memory", envBoolOrDefault("IN_MEMORY", false), "Run with in-memory shredded Doris emulator (env: IN_MEMORY)")
 		logSQL              = flag.Bool("log-sql", envBoolOrDefault("LOG_SQL", false), "Log transpiled Apache Doris DDL, Stream Load, HitsSQL, and AggsSQL (env: LOG_SQL)")
 	)
@@ -159,6 +160,10 @@ func main() {
 	if *shadowESURL != "" {
 		srv.SetShadowESURL(*shadowESURL)
 		log.Printf("shadow dual-read verification enabled against %s (metrics at GET /_doris/shadow_stats)", *shadowESURL)
+	}
+	if *autoPromote {
+		srv.SetAutoPromoteThreshold(3)
+		log.Printf("auto-promote enabled: unindexed _doc[...] fields queried >= 3 times will be promoted to f__* columns")
 	}
 	bootCtx, bootCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := srv.BootstrapCatalog(bootCtx); err != nil {

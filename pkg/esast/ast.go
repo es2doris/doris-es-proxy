@@ -51,6 +51,12 @@ type SearchRequest struct {
 	TrackTotalHits any                `json:"track_total_hits,omitempty"`
 	Highlight      *HighlightSpec     `json:"highlight,omitempty"`
 	Collapse       *CollapseSpec      `json:"collapse,omitempty"`
+	PIT            *PITSpec           `json:"pit,omitempty"`
+}
+
+type PITSpec struct {
+	ID        string `json:"id"`
+	KeepAlive string `json:"keep_alive,omitempty"`
 }
 
 type CollapseSpec struct {
