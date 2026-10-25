@@ -18,11 +18,14 @@
 package schema
 
 import (
+	"bytes"
+	"encoding/json"
 	"hash/fnv"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
 )
@@ -468,4 +471,177 @@ func SanitizeDorisIdentifier(name string) string {
 		res = res[:47] + "_" + strconv.FormatUint(uint64(h.Sum32()), 16)
 	}
 	return res
+}
+
+const (
+	maxInferredSampleDocs = 16
+	maxInferredProperties = 64
+	maxInferredDepth      = 4
+)
+
+// InferMappingFromSampleDocs inspects up to 16 sample JSON documents on first write to an
+// auto-created schemaless index (`dynamic: true`) and infers Elasticsearch field mappings
+// (`keyword`, `text` + `.keyword`, `long`, `double`, `boolean`, `date`, and nested object properties).
+func InferMappingFromSampleDocs(docs []json.RawMessage) *esast.MappingSpec {
+	if len(docs) == 0 {
+		return nil
+	}
+	props := make(map[string]esast.FieldProperty)
+	totalFields := 0
+	limit := len(docs)
+	if limit > maxInferredSampleDocs {
+		limit = maxInferredSampleDocs
+	}
+	for i := 0; i < limit; i++ {
+		raw := bytes.TrimSpace(docs[i])
+		if len(raw) == 0 {
+			continue
+		}
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		var obj map[string]any
+		if err := dec.Decode(&obj); err != nil {
+			continue
+		}
+		inferObjectProperties(obj, props, 0, &totalFields)
+	}
+	if len(props) == 0 {
+		return nil
+	}
+	return &esast.MappingSpec{
+		Properties: props,
+	}
+}
+
+func inferObjectProperties(obj map[string]any, dst map[string]esast.FieldProperty, depth int, totalFields *int) {
+	if depth >= maxInferredDepth || *totalFields >= maxInferredProperties {
+		return
+	}
+	keys := make([]string, 0, len(obj))
+	for k := range obj {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if *totalFields >= maxInferredProperties {
+			return
+		}
+		if k == "" || strings.HasPrefix(k, "_") {
+			continue
+		}
+		val := obj[k]
+		if val == nil {
+			continue
+		}
+		inferred, ok := inferValueProperty(val, depth, totalFields)
+		if !ok {
+			continue
+		}
+		if existing, exists := dst[k]; exists {
+			dst[k] = mergeFieldProperty(existing, inferred)
+		} else {
+			*totalFields++
+			dst[k] = inferred
+		}
+	}
+}
+
+func inferValueProperty(val any, depth int, totalFields *int) (esast.FieldProperty, bool) {
+	switch v := val.(type) {
+	case bool:
+		return esast.FieldProperty{Type: "boolean"}, true
+	case json.Number:
+		s := v.String()
+		if strings.ContainsAny(s, ".eE") {
+			return esast.FieldProperty{Type: "double"}, true
+		}
+		return esast.FieldProperty{Type: "long"}, true
+	case float64:
+		return esast.FieldProperty{Type: "double"}, true
+	case string:
+		if looksLikeISODateString(v) {
+			if _, ok := ParseESDateToEpochMillis(v, time.Time{}); ok {
+				return esast.FieldProperty{Type: "date"}, true
+			}
+		}
+		if strings.ContainsAny(v, " \t\n") || len(v) > 128 {
+			return esast.FieldProperty{
+				Type: "text",
+				Fields: map[string]esast.FieldProperty{
+					"keyword": {Type: "keyword"},
+				},
+			}, true
+		}
+		return esast.FieldProperty{Type: "keyword"}, true
+	case map[string]any:
+		if depth+1 >= maxInferredDepth {
+			return esast.FieldProperty{}, false
+		}
+		childProps := make(map[string]esast.FieldProperty)
+		inferObjectProperties(v, childProps, depth+1, totalFields)
+		if len(childProps) == 0 {
+			return esast.FieldProperty{}, false
+		}
+		return esast.FieldProperty{Properties: childProps}, true
+	case []any:
+		var merged esast.FieldProperty
+		hasElem := false
+		for _, elem := range v {
+			if elem == nil {
+				continue
+			}
+			elemProp, ok := inferValueProperty(elem, depth, totalFields)
+			if !ok {
+				continue
+			}
+			if !hasElem {
+				merged = elemProp
+				hasElem = true
+			} else {
+				merged = mergeFieldProperty(merged, elemProp)
+			}
+		}
+		return merged, hasElem
+	default:
+		return esast.FieldProperty{}, false
+	}
+}
+
+func mergeFieldProperty(existing, incoming esast.FieldProperty) esast.FieldProperty {
+	if len(existing.Properties) > 0 || len(incoming.Properties) > 0 {
+		if existing.Properties == nil {
+			existing.Properties = make(map[string]esast.FieldProperty)
+		}
+		for k, v := range incoming.Properties {
+			if prev, ok := existing.Properties[k]; ok {
+				existing.Properties[k] = mergeFieldProperty(prev, v)
+			} else {
+				existing.Properties[k] = v
+			}
+		}
+		return existing
+	}
+	if existing.Type == incoming.Type {
+		return existing
+	}
+	// Widening rules: long + double -> double; keyword + text -> text (with .keyword); date + string -> keyword/text
+	if (existing.Type == "long" && incoming.Type == "double") || (existing.Type == "double" && incoming.Type == "long") {
+		return esast.FieldProperty{Type: "double"}
+	}
+	if (existing.Type == "keyword" && incoming.Type == "text") || (existing.Type == "text" && incoming.Type == "keyword") {
+		return esast.FieldProperty{
+			Type: "text",
+			Fields: map[string]esast.FieldProperty{
+				"keyword": {Type: "keyword"},
+			},
+		}
+	}
+	return existing
+}
+
+func looksLikeISODateString(s string) bool {
+	if len(s) < 10 || len(s) > 40 {
+		return false
+	}
+	return s[4] == '-' && s[7] == '-' && (len(s) == 10 || s[10] == 'T' || s[10] == ' ')
 }
