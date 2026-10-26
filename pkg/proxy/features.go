@@ -102,6 +102,14 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		if tp, opq, reqID := r.Header.Get("traceparent"), r.Header.Get("X-Opaque-Id"), r.Header.Get("X-Request-ID"); tp != "" || opq != "" || reqID != "" {
+			r = r.WithContext(WithTraceMeta(r.Context(), TraceMeta{
+				Traceparent: tp,
+				OpaqueID:    opq,
+				RequestID:   reqID,
+			}))
+		}
+
 		maxBytes := s.maxBodyBytes
 		if maxBytes <= 0 {
 			maxBytes = DefaultMaxRequestBodyBytes

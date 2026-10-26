@@ -1,32 +1,20 @@
-# Licensed to the Apache Software Foundation (ASF) under one
-# or more contributor license agreements.  See the NOTICE file
-# distributed with this work for additional information
-# regarding copyright ownership.  The ASF licenses this file
-# to you under the Apache License, Version 2.0 (the
-# "License"); you may not use this file except in compliance
-# with the License.  You may obtain a copy of the License at
-#
-#   http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an
-# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-# KIND, either express or implied.  See the License for the
-# specific language governing permissions and limitations
-# under the License.
-
 apiVersion: v2
 name: doris-es-proxy
-description: Stateless Elasticsearch / OpenSearch HTTP REST & Query DSL adapter backed 100% by Apache Doris
+description: Stateless, wire-compatible Elasticsearch / OpenSearch REST & Query DSL proxy backed by Apache Doris
 type: application
-version: 0.5.0
-appVersion: "v0.5.0"
+version: 0.10.0
+appVersion: "0.10.0"
 keywords:
   - apache-doris
   - elasticsearch
   - opensearch
-  - openmetadata
-  - datahub
+  - search
+  - olap
+  - vector-search
+  - bm25
 home: https://github.com/es2doris/doris-es-proxy
 sources:
   - https://github.com/es2doris/doris-es-proxy
+maintainers:
+  - name: es2doris
+    url: https://github.com/es2doris

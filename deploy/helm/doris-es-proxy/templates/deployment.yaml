@@ -1,20 +1,3 @@
-# Licensed to the Apache Software Foundation (ASF) under one
-# or more contributor license agreements.  See the NOTICE file
-# distributed with this work for additional information
-# regarding copyright ownership.  The ASF licenses this file
-# to you under the Apache License, Version 2.0 (the
-# "License"); you may not use this file except in compliance
-# with the License.  You may obtain a copy of the License at
-#
-#   http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an
-# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-# KIND, either express or implied.  See the License for the
-# specific language governing permissions and limitations
-# under the License.
-
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -22,62 +5,95 @@ metadata:
   labels:
     {{- include "doris-es-proxy.labels" . | nindent 4 }}
 spec:
+  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "doris-es-proxy.selectorLabels" . | nindent 6 }}
   template:
     metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       labels:
         {{- include "doris-es-proxy.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
-        - name: doris-es-proxy
+        - name: {{ .Chart.Name }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          ports:
-            - name: http-es
-              containerPort: 9200
-              protocol: TCP
+          args:
+            - "--listen=:{{ .Values.service.port }}"
+            - "--doris-mysql={{ .Values.doris.user }}:$(DORIS_PASSWORD)@tcp({{ .Values.doris.feHost }}:{{ .Values.doris.mysqlPort }})/{{ .Values.doris.database }}"
+            - "--doris-http=http://{{ .Values.doris.feHost }}:{{ .Values.doris.httpPort }}"
+            - "--doris-db={{ .Values.doris.database }}"
+            - "--doris-user={{ .Values.doris.user }}"
+            - "--doris-password=$(DORIS_PASSWORD)"
+            {{- if .Values.doris.useDoris4SearchFunc }}
+            - "--doris4-search=true"
+            {{- end }}
+            {{- if gt (int .Values.doris.autoPromoteThreshold) 0 }}
+            - "--auto-promote-threshold={{ int .Values.doris.autoPromoteThreshold }}"
+            {{- end }}
+            {{- if .Values.doris.logSQL }}
+            - "--log-sql=true"
+            {{- end }}
+            {{- if .Values.shadow.esURL }}
+            - "--shadow-es-url={{ .Values.shadow.esURL }}"
+            {{- end }}
           env:
-            - name: LISTEN_ADDR
-              value: ":9200"
-            - name: DORIS_DB
-              value: {{ .Values.doris.database | quote }}
-            - name: DORIS_HTTP
-              value: {{ .Values.doris.httpEndpoint | quote }}
-            - name: DORIS_USER
-              value: {{ .Values.doris.user | quote }}
-            - name: DORIS4_SEARCH_FN
-              value: {{ .Values.doris.doris4SearchFn | quote }}
-            - name: AUTO_PROMOTE
-              value: {{ .Values.doris.autoPromote | quote }}
-            - name: LOG_SQL
-              value: {{ .Values.doris.logSql | quote }}
-            - name: SHADOW_ES_URL
-              value: {{ .Values.doris.shadowEsUrl | quote }}
-            - name: DORIS_DSN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ default (include "doris-es-proxy.fullname" .) .Values.doris.existingSecret }}
-                  key: {{ .Values.doris.existingSecretDsnKey }}
             - name: DORIS_PASSWORD
+              {{- if .Values.doris.existingSecret }}
               valueFrom:
                 secretKeyRef:
-                  name: {{ default (include "doris-es-proxy.fullname" .) .Values.doris.existingSecret }}
-                  key: DORIS_PASSWORD
-                  optional: true
-          readinessProbe:
-            httpGet:
-              path: /readyz
-              port: http-es
-            initialDelaySeconds: 2
-            periodSeconds: 5
+                  name: {{ .Values.doris.existingSecret }}
+                  key: {{ .Values.doris.existingSecretPasswordKey }}
+              {{- else }}
+              value: {{ .Values.doris.password | quote }}
+              {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
           livenessProbe:
             httpGet:
-              path: /healthz
-              port: http-es
+              path: /_cluster/health
+              port: http
             initialDelaySeconds: 5
             periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /_cluster/health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

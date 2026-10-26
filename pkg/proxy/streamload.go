@@ -119,45 +119,86 @@ func (c *StreamLoadClient) LoadNDJSON(
 		safeTable,
 	)
 
-	// #nosec G704 -- endpoint is constructed from operator-configured FEHTTPEndpoint and sanitized Doris identifiers
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(ndjsonPayload))
-	if err != nil {
-		return err
-	}
-	req.SetBasicAuth(c.cfg.User, c.cfg.Password)
-	req.Header.Set("Expect", "100-continue")
-	req.Header.Set("format", "json")
-	req.Header.Set("read_json_by_line", "true")
-	req.Header.Set("strip_outer_array", "false")
-	req.Header.Set("hidden_columns", "__DORIS_DELETE_SIGN__")
-	req.Header.Set("function_column.sequence_col", "_version")
+	const maxAttempts = 3
+	backoff := 25 * time.Millisecond
+	var lastErr error
 
-	// #nosec G704 -- operator-configured Doris FE/BE Stream Load HTTP request
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("doris stream load HTTP error: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+				backoff *= 2
+			}
+		}
 
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("reading stream load response: %w", err)
-	}
+		// #nosec G704 -- endpoint is constructed from operator-configured FEHTTPEndpoint and sanitized Doris identifiers
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(ndjsonPayload))
+		if err != nil {
+			return err
+		}
+		req.SetBasicAuth(c.cfg.User, c.cfg.Password)
+		req.Header.Set("Expect", "100-continue")
+		req.Header.Set("format", "json")
+		req.Header.Set("read_json_by_line", "true")
+		req.Header.Set("strip_outer_array", "false")
+		req.Header.Set("hidden_columns", "__DORIS_DELETE_SIGN__")
+		req.Header.Set("function_column.sequence_col", "_version")
 
-	var slResp streamLoadResponse
-	if err := json.Unmarshal(bodyBytes, &slResp); err != nil {
-		return fmt.Errorf("unexpected stream load response (HTTP %d): %s", resp.StatusCode, string(bodyBytes))
+		// #nosec G704 -- operator-configured Doris FE/BE Stream Load HTTP request
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("doris stream load HTTP error: %w", err)
+			if ctx.Err() != nil {
+				return lastErr
+			}
+			continue
+		}
+
+		bodyBytes, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			lastErr = fmt.Errorf("reading stream load response: %w", readErr)
+			continue
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests ||
+			resp.StatusCode == http.StatusBadGateway ||
+			resp.StatusCode == http.StatusServiceUnavailable ||
+			resp.StatusCode == http.StatusGatewayTimeout {
+			lastErr = fmt.Errorf("transient stream load HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+			continue
+		}
+
+		var slResp streamLoadResponse
+		if err := json.Unmarshal(bodyBytes, &slResp); err != nil {
+			return fmt.Errorf("unexpected stream load response (HTTP %d): %s", resp.StatusCode, string(bodyBytes))
+		}
+		if !strings.EqualFold(slResp.Status, "Success") && !strings.EqualFold(slResp.Status, "Publish Timeout") {
+			if isTransientStreamLoadError(slResp.Status, slResp.Message) && attempt < maxAttempts {
+				lastErr = fmt.Errorf("doris stream load transient failure (status=%s): %s", slResp.Status, slResp.Message)
+				continue
+			}
+			detail := c.fetchErrorURLDetail(ctx, slResp.ErrorURL)
+			return fmt.Errorf("doris stream load failed (status=%s): %s (error_url=%s detail=%s)", slResp.Status, slResp.Message, slResp.ErrorURL, detail)
+		}
+		if slResp.NumberFilteredRows > 0 {
+			detail := c.fetchErrorURLDetail(ctx, slResp.ErrorURL)
+			return fmt.Errorf("doris stream load filtered %d/%d rows: %s (error_url=%s detail=%s)",
+				slResp.NumberFilteredRows, slResp.NumberTotalRows, slResp.Message, slResp.ErrorURL, detail)
+		}
+		return nil
 	}
-	if !strings.EqualFold(slResp.Status, "Success") && !strings.EqualFold(slResp.Status, "Publish Timeout") {
-		detail := c.fetchErrorURLDetail(ctx, slResp.ErrorURL)
-		return fmt.Errorf("doris stream load failed (status=%s): %s (error_url=%s detail=%s)", slResp.Status, slResp.Message, slResp.ErrorURL, detail)
-	}
-	if slResp.NumberFilteredRows > 0 {
-		detail := c.fetchErrorURLDetail(ctx, slResp.ErrorURL)
-		return fmt.Errorf("doris stream load filtered %d/%d rows: %s (error_url=%s detail=%s)",
-			slResp.NumberFilteredRows, slResp.NumberTotalRows, slResp.Message, slResp.ErrorURL, detail)
-	}
-	return nil
+	return lastErr
+}
+
+func isTransientStreamLoadError(status, msg string) bool {
+	combined := strings.ToUpper(status + " " + msg)
+	return strings.Contains(combined, "TOO_MANY_VERSIONS") ||
+		strings.Contains(combined, "MEM_LIMIT_EXCEEDED") ||
+		strings.Contains(combined, "SERVICE_UNAVAILABLE") ||
+		strings.Contains(combined, "TRY AGAIN")
 }
 
 func (c *StreamLoadClient) fetchErrorURLDetail(ctx context.Context, errURL string) string {

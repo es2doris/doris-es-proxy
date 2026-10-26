@@ -27,8 +27,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -912,5 +914,90 @@ func TestServer_DeepEvalProtocolAndMultiIndexFixes(t *testing.T) {
 
 	if code, body := doReq(http.MethodDelete, "/m_idx_*", ""); code != http.StatusOK {
 		t.Fatalf("expected wildcard DELETE /m_idx_* to succeed, got %d %s", code, body)
+	}
+}
+
+func TestObservabilityTracePropagationStreamLoadRetryAndHelmChart(t *testing.T) {
+	// 1. SQL Trace comment propagation & sanitization
+	ctx := WithTraceMeta(context.Background(), TraceMeta{
+		Traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+		OpaqueID:    "kibana-dash-1*/;DROP",
+		RequestID:   "req-99",
+	})
+	commented := prependSQLTraceComment(ctx, "SELECT * FROM `t`")
+	if !strings.HasPrefix(commented, "/* traceparent=00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01, opaque_id=kibana-dash-1DROP, request_id=req-99 */ SELECT * FROM `t`") {
+		t.Fatalf("unexpected prependSQLTraceComment output: %q", commented)
+	}
+
+	// 2. HTTP middleware header propagation & echoing
+	srv := NewServer("logs_db", NewMemoryBackend(true), transpiler.TranspilerOptions{})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/_cluster/health", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Opaque-Id", "opq-123")
+	req.Header.Set("X-Request-ID", "req-456")
+	req.Header.Set("traceparent", "00-11111111111111111111111111111111-2222222222222222-01")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.Header.Get("X-Opaque-Id") != "opq-123" ||
+		resp.Header.Get("X-Request-ID") != "req-456" ||
+		resp.Header.Get("traceparent") != "00-11111111111111111111111111111111-2222222222222222-01" {
+		t.Fatalf("expected X-Opaque-Id, X-Request-ID, and traceparent headers to be echoed, got %+v", resp.Header)
+	}
+
+	// 3. StreamLoadClient transient retry backoff (503 -> TOO_MANY_VERSIONS -> Success)
+	var attempts int32
+	slServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := atomic.AddInt32(&attempts, 1)
+		switch n {
+		case 1:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("BE overloaded"))
+		case 2:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Status":"Fail","Message":"TOO_MANY_VERSIONS on tablet 1001"}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Status":"Success","NumberTotalRows":1,"NumberLoadedRows":1,"NumberFilteredRows":0}`))
+		}
+	}))
+	defer slServer.Close()
+
+	slClient := NewStreamLoadClient(StreamLoadConfig{
+		FEHTTPEndpoint: slServer.URL,
+		User:           "root",
+		Database:       "logs_db",
+		Timeout:        5 * time.Second,
+	})
+	if err := slClient.LoadNDJSON(context.Background(), "app_logs", []byte(`{"_id":"1"}`+"\n"), true); err != nil {
+		t.Fatalf("expected StreamLoadClient to succeed after transient retries, got: %v", err)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 3 {
+		t.Fatalf("expected 3 StreamLoad attempts, got %d", got)
+	}
+
+	// 4. Verify Helm chart files exist and contain required K8s manifests
+	helmFiles := []string{
+		"../../deploy/helm/doris-es-proxy/Chart.yaml",
+		"../../deploy/helm/doris-es-proxy/values.yaml",
+		"../../deploy/helm/doris-es-proxy/templates/_helpers.tpl",
+		"../../deploy/helm/doris-es-proxy/templates/deployment.yaml",
+		"../../deploy/helm/doris-es-proxy/templates/service.yaml",
+		"../../deploy/helm/doris-es-proxy/templates/hpa.yaml",
+		"../../deploy/helm/doris-es-proxy/templates/pdb.yaml",
+		"../../deploy/helm/doris-es-proxy/templates/servicemonitor.yaml",
+	}
+	for _, hf := range helmFiles {
+		raw, err := os.ReadFile(hf)
+		if err != nil || len(raw) == 0 {
+			t.Fatalf("expected Helm chart file %q to exist and be non-empty: %v", hf, err)
+		}
 	}
 }
