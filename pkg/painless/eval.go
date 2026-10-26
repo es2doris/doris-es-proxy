@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -46,7 +47,7 @@ var (
 	reCtxOp          = regexp.MustCompile(`^ctx\.op\s*=\s*['"]([^'"]+)['"]$`)
 	reCompoundAssign = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\s*(\+=|-=)\s*(.+)$`)
 	reAssignParam    = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\s*=\s*(.+)$`)
-	reRemoveField    = regexp.MustCompile(`^ctx\._source(?:\.([a-zA-Z0-9_.]+))?\.remove\(\s*['"]([^'"]+)['"]\s*\)$`)
+	reRemoveField    = regexp.MustCompile(`^ctx\._source(?:\.([a-zA-Z0-9_.]+))?\.remove\(\s*(.+?)\s*\)$`)
 	reArrayAdd       = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\.add\(\s*(.+?)\s*\)$`)
 	reArrayAddAll    = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\.addAll\(\s*(.+?)\s*\)$`)
 	reMapPut         = regexp.MustCompile(`^ctx\._source(?:\.([a-zA-Z0-9_.]+))?\.put\(\s*(.+?)\s*,\s*(.+?)\s*\)$`)
@@ -78,7 +79,7 @@ func ApplyUpdateWithResult(rawSource json.RawMessage, req *UpdateRequest, docExi
 	}
 
 	if !docExisted {
-		if len(req.Upsert) > 0 {
+		if req.Upsert != nil {
 			deepMergeMap(doc, req.Upsert)
 			if !req.ScriptedUpsert {
 				out, err := json.Marshal(doc)
@@ -351,13 +352,17 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		return nil
 	}
 
-	// 6. Check `.remove('field')`
+	// 6. Check `.remove('field')` or `.remove(params.key)` or `.remove(0)`
 	if m := reRemoveField.FindStringSubmatch(stmt); m != nil {
 		var parentPath []string
 		if m[1] != "" {
 			parentPath = strings.Split(m[1], ".")
 		}
-		removeKeyAtPath(sourceMap, parentPath, m[2])
+		argVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[2]), params)
+		if err != nil {
+			return err
+		}
+		removeKeyOrIndexAtPath(sourceMap, parentPath, argVal)
 		return nil
 	}
 
@@ -389,13 +394,60 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 	return nil
 }
 
+func trimBalancedParens(s string) string {
+	s = strings.TrimSpace(s)
+	for len(s) >= 2 && s[0] == '(' && s[len(s)-1] == ')' {
+		if findMatchingDelimiter(s, 0, '(', ')') == len(s)-1 {
+			s = strings.TrimSpace(s[1 : len(s)-1])
+		} else {
+			break
+		}
+	}
+	return s
+}
+
+func splitTopLevelCondOp(s, op string) []string {
+	var parts []string
+	depth := 0
+	inQuotes := byte(0)
+	lastStart := 0
+	for i := 0; i <= len(s)-len(op); i++ {
+		c := s[i]
+		if inQuotes != 0 {
+			if c == inQuotes && (i == 0 || s[i-1] != '\\') {
+				inQuotes = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			inQuotes = c
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 && s[i:i+len(op)] == op {
+				parts = append(parts, s[lastStart:i])
+				lastStart = i + len(op)
+				i += len(op) - 1
+			}
+		}
+	}
+	if len(parts) > 0 {
+		parts = append(parts, s[lastStart:])
+	}
+	return parts
+}
+
 func evalCondition(sourceMap map[string]any, cond string, params map[string]any) bool {
-	cond = strings.TrimSpace(cond)
+	cond = trimBalancedParens(cond)
 	if cond == "" {
 		return false
 	}
-	if strings.Contains(cond, "||") {
-		parts := strings.Split(cond, "||")
+	if parts := splitTopLevelCondOp(cond, "||"); len(parts) > 1 {
 		for _, p := range parts {
 			if evalCondition(sourceMap, p, params) {
 				return true
@@ -403,8 +455,7 @@ func evalCondition(sourceMap map[string]any, cond string, params map[string]any)
 		}
 		return false
 	}
-	if strings.Contains(cond, "&&") {
-		parts := strings.Split(cond, "&&")
+	if parts := splitTopLevelCondOp(cond, "&&"); len(parts) > 1 {
 		for _, p := range parts {
 			if !evalCondition(sourceMap, p, params) {
 				return false
@@ -574,6 +625,8 @@ func evalRHSExpr(sourceMap map[string]any, rhs string, params map[string]any) (a
 func findTopLevelAddSub(expr string) (int, bool) {
 	inQuotes := byte(0)
 	depth := 0
+	lastIdx := -1
+	lastIsAdd := false
 	for i := 0; i < len(expr); i++ {
 		c := expr[i]
 		if inQuotes != 0 {
@@ -593,14 +646,28 @@ func findTopLevelAddSub(expr string) (int, bool) {
 			}
 		case '+', '-':
 			if depth == 0 && i > 0 {
-				return i, c == '+'
+				prev := strings.TrimSpace(expr[:i])
+				if len(prev) > 0 {
+					lastChar := prev[len(prev)-1]
+					if lastChar != '+' && lastChar != '-' && lastChar != '*' && lastChar != '/' && lastChar != '(' {
+						lastIdx = i
+						lastIsAdd = c == '+'
+					}
+				}
 			}
 		}
 	}
-	return -1, false
+	return lastIdx, lastIsAdd
 }
 
 func applyArithmetic(a, b any, isAdd bool) any {
+	if isAdd {
+		_, aIsStr := a.(string)
+		_, bIsStr := b.(string)
+		if aIsStr || bIsStr {
+			return fmt.Sprintf("%v%v", a, b)
+		}
+	}
 	af, aOk := toFloat64(a)
 	bf, bOk := toFloat64(b)
 	if aOk && bOk {
@@ -608,7 +675,7 @@ func applyArithmetic(a, b any, isAdd bool) any {
 		if !isAdd {
 			res = af - bf
 		}
-		if res == float64(int64(res)) {
+		if !math.IsNaN(res) && !math.IsInf(res, 0) && res >= float64(math.MinInt64) && res < float64(math.MaxInt64) && res == float64(int64(res)) {
 			return int64(res)
 		}
 		return res
@@ -620,24 +687,30 @@ func applyArithmetic(a, b any, isAdd bool) any {
 }
 
 func toFloat64(v any) (float64, bool) {
+	var f float64
+	var ok bool
 	switch val := v.(type) {
 	case nil:
 		return 0, true
 	case int:
-		return float64(val), true
+		f, ok = float64(val), true
 	case int64:
-		return float64(val), true
+		f, ok = float64(val), true
 	case float64:
-		return val, true
+		f, ok = val, true
 	case json.Number:
-		f, err := val.Float64()
-		return f, err == nil
+		parsed, err := val.Float64()
+		f, ok = parsed, err == nil
 	case string:
-		f, err := strconv.ParseFloat(val, 64)
-		return f, err == nil
+		parsed, err := strconv.ParseFloat(val, 64)
+		f, ok = parsed, err == nil
 	default:
 		return 0, false
 	}
+	if !ok || math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, false
+	}
+	return f, true
 }
 
 func parseIfBlocks(stmt string) (cond, thenBody, elseBody string, ok bool) {
@@ -801,16 +874,31 @@ func putAllAtPath(root map[string]any, path []string, values map[string]any) {
 	}
 }
 
-func removeKeyAtPath(root map[string]any, parentPath []string, key string) {
+func removeKeyOrIndexAtPath(root map[string]any, parentPath []string, keyOrIdx any) {
+	if len(parentPath) == 0 {
+		delete(root, fmt.Sprintf("%v", keyOrIdx))
+		return
+	}
 	curr := root
-	for _, seg := range parentPath {
-		next, ok := curr[seg].(map[string]any)
+	for i := 0; i < len(parentPath)-1; i++ {
+		next, ok := curr[parentPath[i]].(map[string]any)
 		if !ok {
 			return
 		}
 		curr = next
 	}
-	delete(curr, key)
+	lastSeg := parentPath[len(parentPath)-1]
+	switch target := curr[lastSeg].(type) {
+	case map[string]any:
+		delete(target, fmt.Sprintf("%v", keyOrIdx))
+	case []any:
+		if f, ok := toFloat64(keyOrIdx); ok {
+			idx := int(f)
+			if idx >= 0 && idx < len(target) {
+				curr[lastSeg] = append(target[:idx], target[idx+1:]...)
+			}
+		}
+	}
 }
 
 func appendToSlice(root map[string]any, path []string, val any) error {

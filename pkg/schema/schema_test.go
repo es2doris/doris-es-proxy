@@ -271,6 +271,51 @@ func TestInferMergeAlterPromoteAndDateMath(t *testing.T) {
 	if err != nil || !strings.Contains(string(tombstone), `"__DORIS_DELETE_SIGN__":1`) {
 		t.Fatalf("expected tombstone delete sign=1, got %s (err=%v)", string(tombstone), err)
 	}
+
+	// 7. EffectiveLowercase with .keyword normalizer, ParseESDateBoundToEpochMillis (roundUp + /w), and nested []any shredding
+	kwNormMapping := &esast.MappingSpec{
+		Properties: map[string]esast.FieldProperty{
+			"host": {
+				Type: "text",
+				Fields: map[string]esast.FieldProperty{
+					"keyword": {Type: "keyword", Normalizer: "lowercase"},
+				},
+			},
+			"items": {
+				Type: "nested",
+				Properties: map[string]esast.FieldProperty{
+					"sku": {Type: "keyword"},
+				},
+			},
+			"vec": {Type: "dense_vector", Dims: 3},
+		},
+	}
+	kwSchema := CompileIndexSchema("logs_db", "kw_idx", kwNormMapping)
+	hostBind := kwSchema.ResolveField("host")
+	if !hostBind.EffectiveLowercase(true) {
+		t.Fatalf("expected EffectiveLowercase(true) to honor .keyword companion lowercase normalizer")
+	}
+	expanded := kwSchema.ExpandFieldPattern("*")
+	for _, f := range expanded {
+		if f.Field == "vec" {
+			t.Fatalf("expected ExpandFieldPattern(\"*\") to skip dense_vector field 'vec', got %v", expanded)
+		}
+	}
+	lowerDay, ok1 := ParseESDateBoundToEpochMillis("2026-10-25T12:00:00Z||/d", mustNow(), false)
+	upperDay, ok2 := ParseESDateBoundToEpochMillis("2026-10-25T12:00:00Z||/d", mustNow(), true)
+	if !ok1 || !ok2 || upperDay-lowerDay != 86400*1000-1 {
+		t.Fatalf("expected inclusive /d upper bound to be end-of-day (+86399999ms), got lower=%d upper=%d", lowerDay, upperDay)
+	}
+	if _, ok := ParseESDateBoundToEpochMillis("1729773296789||/w", mustNow(), true); !ok {
+		t.Fatalf("expected epoch_millis||/w date math to succeed")
+	}
+	if _, err := ShredDocument(kwSchema, "bad", 1, false, json.RawMessage(`null`)); err == nil {
+		t.Fatalf("expected ShredDocument to reject JSON null document")
+	}
+	nestedShred, err := ShredDocument(kwSchema, "n1", 1, false, json.RawMessage(`{"items":[{"sku":"A1"},{"sku":"B2"}]}`))
+	if err != nil || !strings.Contains(string(nestedShred), `"n__items__sku":["A1","B2"]`) {
+		t.Fatalf("expected nested []any array to populate prefilter array column, got %s (err=%v)", string(nestedShred), err)
+	}
 }
 
 func mustNow() (t time.Time) {

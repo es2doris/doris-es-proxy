@@ -454,9 +454,11 @@ func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
 }
 
 type MatchEntry struct {
-	Query    any
-	Operator string
-	Boost    float64
+	Query              any
+	Operator           string
+	Boost              float64
+	ZeroTermsQuery     string
+	MinimumShouldMatch any
 }
 
 func (m *MatchEntry) UnmarshalJSON(data []byte) error {
@@ -465,9 +467,11 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		var full struct {
-			Query    any      `json:"query"`
-			Operator string   `json:"operator"`
-			Boost    *float64 `json:"boost"`
+			Query              any      `json:"query"`
+			Operator           string   `json:"operator"`
+			Boost              *float64 `json:"boost"`
+			ZeroTermsQuery     string   `json:"zero_terms_query"`
+			MinimumShouldMatch any      `json:"minimum_should_match"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
@@ -479,6 +483,8 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 		if full.Boost != nil {
 			m.Boost = *full.Boost
 		}
+		m.ZeroTermsQuery = full.ZeroTermsQuery
+		m.MinimumShouldMatch = full.MinimumShouldMatch
 		return nil
 	}
 	return json.Unmarshal(trimmed, &m.Query)
@@ -541,12 +547,14 @@ type ConstantScoreQuery struct {
 }
 
 type FunctionScoreQuery struct {
-	Query     *Query              `json:"query,omitempty"`
-	Functions []ScoreFunctionSpec `json:"functions,omitempty"`
-	ScoreMode string              `json:"score_mode,omitempty"`
-	BoostMode string              `json:"boost_mode,omitempty"`
-	MaxBoost  *float64            `json:"max_boost,omitempty"`
-	Boost     *float64            `json:"boost,omitempty"`
+	Query            *Query                `json:"query,omitempty"`
+	Functions        []ScoreFunctionSpec   `json:"functions,omitempty"`
+	ScoreMode        string                `json:"score_mode,omitempty"`
+	BoostMode        string                `json:"boost_mode,omitempty"`
+	MaxBoost         *float64              `json:"max_boost,omitempty"`
+	Boost            *float64              `json:"boost,omitempty"`
+	Weight           *float64              `json:"weight,omitempty"`
+	FieldValueFactor *FieldValueFactorSpec `json:"field_value_factor,omitempty"`
 }
 
 type ScoreFunctionSpec struct {

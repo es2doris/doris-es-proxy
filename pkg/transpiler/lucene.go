@@ -35,10 +35,32 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 		return CompiledQuery{WhereSQL: "TRUE", ScoreSQL: "1.0"}
 	}
 
+	var expandedFields []string
+	for _, fpat := range qsq.Fields {
+		if strings.Contains(fpat, "*") && t.Schema != nil {
+			for _, bf := range t.Schema.ExpandFieldPattern(fpat) {
+				if bf.Boost != 1.0 {
+					expandedFields = append(expandedFields, fmt.Sprintf("%s^%g", bf.Field, bf.Boost))
+				} else {
+					expandedFields = append(expandedFields, bf.Field)
+				}
+			}
+		} else {
+			expandedFields = append(expandedFields, fpat)
+		}
+	}
+
 	defaultField := qsq.DefaultField
 	if defaultField == "" {
-		if len(qsq.Fields) > 0 {
-			defaultField = strings.Split(qsq.Fields[0], "^")[0]
+		if len(expandedFields) > 0 {
+			defaultField = strings.Split(expandedFields[0], "^")[0]
+		} else {
+			defaultField = "_all_text"
+		}
+	}
+	if strings.Contains(defaultField, "*") && t.Schema != nil {
+		if exp := t.Schema.ExpandFieldPattern(defaultField); len(exp) > 0 {
+			defaultField = exp[0].Field
 		} else {
 			defaultField = "_all_text"
 		}
@@ -48,9 +70,9 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 		defaultOp = "OR"
 	}
 
-	parsedAST := parseSimpleLuceneToAST(raw, defaultField, qsq.Fields, defaultOp)
+	parsedAST := parseSimpleLuceneToAST(raw, defaultField, expandedFields, defaultOp)
 	compiled := t.CompileQuery(&parsedAST, scoring, nctx)
-	if t.Opts.UseDoris4SearchFunc {
+	if t.Opts.UseDoris4SearchFunc && nctx == nil {
 		col := strings.Trim(t.sqlColumnRef(defaultField, false, nctx), "`")
 		pred := fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(raw), quoteStr(col), quoteStr(defaultOp))
 		return CompiledQuery{
@@ -176,10 +198,37 @@ func splitLuceneBoost(s string) (string, float64) {
 	return s, 1.0
 }
 
+func findLuceneFieldColon(s string) int {
+	if len(s) == 0 || s[0] == '"' || s[0] == '(' || s[0] == '[' || s[0] == '{' {
+		return -1
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\\' {
+			i++
+			continue
+		}
+		if c == '"' || c == '(' || c == '[' || c == '{' {
+			return -1
+		}
+		if c == ':' && i > 0 {
+			return i
+		}
+	}
+	return -1
+}
+
 func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, depth int) esast.Query {
 	token = strings.TrimSpace(token)
 	token, boost := splitLuceneBoost(token)
-	if idx := strings.IndexByte(token, ':'); idx > 0 {
+	if strings.HasPrefix(token, "(") && strings.HasSuffix(token, ")") && len(token) > 2 {
+		inner := parseSimpleLuceneToASTWithDepth(token[1:len(token)-1], defaultField, fields, "OR", depth+1)
+		if boost != 1.0 && inner.Bool != nil {
+			inner.Bool.Boost = &boost
+		}
+		return inner
+	}
+	if idx := findLuceneFieldColon(token); idx > 0 {
 		field := token[:idx]
 		val := strings.TrimSpace(token[idx+1:])
 		if field == "_exists_" && val != "" {
@@ -281,11 +330,30 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 		}
 	}
 
+	if isQuoted && strings.Contains(cleanVal, " ") {
+		if len(fields) > 0 {
+			return esast.Query{
+				MultiMatch: &esast.MultiMatchQuery{
+					Query:  cleanVal,
+					Fields: fields,
+					Type:   "phrase",
+					Boost:  &boost,
+				},
+			}
+		}
+		return esast.Query{
+			MatchPhrase: map[string]esast.PhraseEntry{
+				defaultField: {Query: cleanVal, Boost: boost},
+			},
+		}
+	}
+
 	if len(fields) > 0 {
 		return esast.Query{
 			MultiMatch: &esast.MultiMatchQuery{
 				Query:  cleanVal,
 				Fields: fields,
+				Boost:  &boost,
 			},
 		}
 	}
