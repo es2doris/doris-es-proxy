@@ -3984,10 +3984,16 @@ func setESCompatHeaders(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Elastic-Product", "Elasticsearch")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, HEAD, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, X-Opaque-Id, X-Elastic-Client-Meta, kbn-xsrf")
-	w.Header().Set("Access-Control-Expose-Headers", "X-Elastic-Product, Warning, X-Opaque-Id")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, X-Opaque-Id, X-Request-ID, traceparent, tracestate, X-Elastic-Client-Meta, kbn-xsrf")
+	w.Header().Set("Access-Control-Expose-Headers", "X-Elastic-Product, Warning, X-Opaque-Id, X-Request-ID, traceparent")
 	if opaqueID := r.Header.Get("X-Opaque-Id"); opaqueID != "" {
 		w.Header().Set("X-Opaque-Id", opaqueID)
+	}
+	if reqID := r.Header.Get("X-Request-ID"); reqID != "" {
+		w.Header().Set("X-Request-ID", reqID)
+	}
+	if tp := r.Header.Get("traceparent"); tp != "" {
+		w.Header().Set("traceparent", tp)
 	}
 	accept := r.Header.Get("Accept")
 	reqCT := r.Header.Get("Content-Type")

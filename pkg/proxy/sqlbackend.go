@@ -146,8 +146,70 @@ func rewriteDorisArrayExists(q string) string {
 	return out.String()
 }
 
+type traceMetaContextKey struct{}
+
+// TraceMeta holds W3C TraceContext (`traceparent`), Elasticsearch `X-Opaque-Id`, and `X-Request-ID`
+// values propagated as leading SQL comments into Doris FE `fe.audit.log`.
+type TraceMeta struct {
+	Traceparent string
+	OpaqueID    string
+	RequestID   string
+}
+
+// WithTraceMeta attaches TraceMeta to ctx.
+func WithTraceMeta(ctx context.Context, meta TraceMeta) context.Context {
+	return context.WithValue(ctx, traceMetaContextKey{}, meta)
+}
+
+// TraceMetaFromContext extracts TraceMeta from ctx if present.
+func TraceMetaFromContext(ctx context.Context) (TraceMeta, bool) {
+	if ctx == nil {
+		return TraceMeta{}, false
+	}
+	m, ok := ctx.Value(traceMetaContextKey{}).(TraceMeta)
+	return m, ok
+}
+
+func sanitizeSQLCommentToken(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > 128 {
+		s = s[:128]
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch < 0x20 || ch > 0x7e || ch == '*' || ch == '/' || ch == '\'' || ch == '"' || ch == ';' {
+			continue
+		}
+		b.WriteByte(ch)
+	}
+	return b.String()
+}
+
+func prependSQLTraceComment(ctx context.Context, q string) string {
+	meta, ok := TraceMetaFromContext(ctx)
+	if !ok {
+		return q
+	}
+	var parts []string
+	if tp := sanitizeSQLCommentToken(meta.Traceparent); tp != "" {
+		parts = append(parts, "traceparent="+tp)
+	}
+	if opq := sanitizeSQLCommentToken(meta.OpaqueID); opq != "" {
+		parts = append(parts, "opaque_id="+opq)
+	}
+	if reqID := sanitizeSQLCommentToken(meta.RequestID); reqID != "" {
+		parts = append(parts, "request_id="+reqID)
+	}
+	if len(parts) == 0 {
+		return q
+	}
+	return "/* " + strings.Join(parts, ", ") + " */ " + q
+}
+
 func (b *DorisSQLBackend) QueryHits(ctx context.Context, querySQL string) ([]HitRow, error) {
-	querySQL = normalizeDorisSQL(querySQL)
+	querySQL = prependSQLTraceComment(ctx, normalizeDorisSQL(querySQL))
 	if b.logSQL {
 		log.Printf("[Doris HitsSQL]\n%s", querySQL)
 	}
@@ -178,7 +240,7 @@ func (b *DorisSQLBackend) QueryHits(ctx context.Context, querySQL string) ([]Hit
 }
 
 func (b *DorisSQLBackend) QueryAggs(ctx context.Context, aggsSQL string) ([]AggRow, error) {
-	aggsSQL = normalizeDorisSQL(aggsSQL)
+	aggsSQL = prependSQLTraceComment(ctx, normalizeDorisSQL(aggsSQL))
 	if b.logSQL {
 		log.Printf("[Doris AggsSQL (Nereids Multi-Cast CTE)]\n%s", aggsSQL)
 	}
