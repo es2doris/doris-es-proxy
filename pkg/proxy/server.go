@@ -2483,6 +2483,29 @@ func compareHitRowsBySort(a, b HitRow, sorts []esast.SortSpec, idxSchema *schema
 	return 0
 }
 
+func resolveAggSpecByPath(aggs map[string]esast.AggSpec, fullAggName string) esast.AggSpec {
+	if len(aggs) == 0 || fullAggName == "" {
+		return esast.AggSpec{}
+	}
+	if spec, ok := aggs[fullAggName]; ok {
+		return spec
+	}
+	parts := strings.Split(fullAggName, ".")
+	currMap := aggs
+	var spec esast.AggSpec
+	for i, part := range parts {
+		s, ok := currMap[part]
+		if !ok {
+			return esast.AggSpec{}
+		}
+		spec = s
+		if i < len(parts)-1 {
+			currMap = spec.SubAggs()
+		}
+	}
+	return spec
+}
+
 func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, aggs map[string]esast.AggSpec) []AggRow {
 	type key struct {
 		agg    string
@@ -2501,7 +2524,7 @@ func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, aggs map[string]esas
 		k := key{agg: r.AggName, bucket: r.BucketKey}
 		if existing, ok := merged[k]; ok {
 			existing.count++
-			spec := aggs[r.AggName]
+			spec := resolveAggSpecByPath(aggs, r.AggName)
 			val := r.effectiveValue()
 			switch {
 			case r.BucketKey == "_stats_min" || spec.Min != nil:
@@ -2529,7 +2552,7 @@ func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, aggs map[string]esas
 	out := []AggRow{{AggName: "__meta_total", BucketKey: "_count", DocCount: totalHits, Value: float64(totalHits)}}
 	for _, k := range order {
 		acc := merged[k]
-		spec := aggs[k.agg]
+		spec := resolveAggSpecByPath(aggs, k.agg)
 		if (k.bucket == "_stats_avg" || spec.Avg != nil) && acc.count > 1 {
 			acc.row.Value /= float64(acc.count)
 			acc.row.DocCount = int64(acc.row.Value)
@@ -2905,6 +2928,10 @@ func buildAggsMap(
 			}
 			aggsOut[aggName] = map[string]any{"buckets": b}
 		case spec.TopHits != nil:
+			limit := spec.TopHits.EffectiveSize()
+			if len(rows) > limit {
+				rows = rows[:limit]
+			}
 			topHitsList := make([]map[string]any, 0, len(rows))
 			for _, r := range rows {
 				docID := r.BucketKey

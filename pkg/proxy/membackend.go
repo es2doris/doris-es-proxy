@@ -388,7 +388,17 @@ var (
 
 func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 	if strings.Contains(branch, "'__meta_total'") {
-		cnt := int64(len(baseRows))
+		var cnt int64
+		if idx := strings.Index(branch, " FROM `base_matched` WHERE "); idx >= 0 {
+			extraWhere := strings.TrimSpace(branch[idx+len(" FROM `base_matched` WHERE "):])
+			for _, row := range baseRows {
+				if evalWhereExpr(row, extraWhere) {
+					cnt++
+				}
+			}
+		} else {
+			cnt = int64(len(baseRows))
+		}
 		return []AggRow{{AggName: "__meta_total", BucketKey: "_count", DocCount: cnt, Value: float64(cnt)}}
 	}
 
@@ -963,28 +973,29 @@ func evalCompositeKeyExpr(row map[string]any, expr string) string {
 	return evalBucketKeyExpr(row, expr)
 }
 
+var reLateralViewExplode = regexp.MustCompile("LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `[^`]+` AS `([^`]+)`")
+
 func expandFromClauseRows(baseRows []map[string]any, fromClause, whereClause string) []map[string]any {
-	var explodeCol string
-	if idx := strings.Index(fromClause, "LATERAL VIEW EXPLODE(`"); idx >= 0 {
-		rest := fromClause[idx+len("LATERAL VIEW EXPLODE(`"):]
-		if endIdx := strings.IndexByte(rest, '`'); endIdx > 0 {
-			explodeCol = rest[:endIdx]
-		}
-	}
-	var out []map[string]any
-	for _, row := range baseRows {
-		if explodeCol != "" {
+	explodes := reLateralViewExplode.FindAllStringSubmatch(fromClause, -1)
+	currRows := baseRows
+	for _, m := range explodes {
+		explodeCol, aliasName := m[1], m[2]
+		var nextRows []map[string]any
+		for _, row := range currRows {
 			for _, elem := range toStringSlice(row[explodeCol]) {
 				cp := make(map[string]any, len(row)+1)
 				for k, v := range row {
 					cp[k] = v
 				}
-				cp["_elem"] = elem
-				if evalWhereExpr(cp, whereClause) {
-					out = append(out, cp)
-				}
+				cp[aliasName] = elem
+				nextRows = append(nextRows, cp)
 			}
-		} else if evalWhereExpr(row, whereClause) {
+		}
+		currRows = nextRows
+	}
+	var out []map[string]any
+	for _, row := range currRows {
+		if evalWhereExpr(row, whereClause) {
 			out = append(out, row)
 		}
 	}
@@ -1298,7 +1309,7 @@ func evalLambdaBody(elemStr, varName, bodyExpr string) bool {
 func evalFulltextMatch(row map[string]any, colExpr, matchOp, queryStr string) bool {
 	colName := strings.Trim(colExpr, "`")
 	rawVal, ok := row[colName]
-	if !ok && strings.HasPrefix(colExpr, "CAST(`_doc`") {
+	if !ok {
 		rawVal = resolveColumnValue(row, colExpr)
 	}
 	if rawVal == nil {
@@ -1379,8 +1390,8 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 
 	if strings.HasPrefix(expr, "CASE WHEN ") && strings.HasSuffix(expr, " END") {
 		inner := expr[len("CASE WHEN ") : len(expr)-len(" END")]
-		thenIdx := strings.LastIndex(inner, " THEN ")
-		elseIdx := strings.LastIndex(inner, " ELSE ")
+		thenIdx := findTopLevelOp(inner, " THEN ")
+		elseIdx := findTopLevelOp(inner, " ELSE ")
 		if thenIdx > 0 && elseIdx > thenIdx {
 			cond := inner[:thenIdx]
 			thenExpr := inner[thenIdx+6 : elseIdx]
@@ -1535,9 +1546,37 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 		return nil
 	}
-	if strings.HasPrefix(colExpr, "CAST(") && strings.HasSuffix(colExpr, " AS DOUBLE)") && !strings.HasPrefix(colExpr, "CAST(`_doc`") {
-		inner := colExpr[len("CAST(") : len(colExpr)-len(" AS DOUBLE)")]
-		return evalNumericExpr(row, inner)
+	if strings.HasPrefix(colExpr, "lower(") && strings.HasSuffix(colExpr, ")") {
+		inner := colExpr[len("lower(") : len(colExpr)-1]
+		if v := resolveColumnValue(row, inner); v != nil {
+			return strings.ToLower(fmt.Sprintf("%v", v))
+		}
+		return nil
+	}
+	if strings.HasPrefix(colExpr, "CAST(") && !strings.HasPrefix(colExpr, "CAST(`_doc`") {
+		if strings.HasSuffix(colExpr, " AS DOUBLE)") {
+			inner := colExpr[len("CAST(") : len(colExpr)-len(" AS DOUBLE)")]
+			return evalNumericExpr(row, inner)
+		}
+		if strings.HasSuffix(colExpr, " AS BIGINT)") {
+			inner := colExpr[len("CAST(") : len(colExpr)-len(" AS BIGINT)")]
+			return int64(evalNumericExpr(row, inner))
+		}
+		if strings.HasSuffix(colExpr, " AS STRING)") {
+			inner := colExpr[len("CAST(") : len(colExpr)-len(" AS STRING)")]
+			if v := resolveColumnValue(row, inner); v != nil {
+				return fmt.Sprintf("%v", v)
+			}
+			return nil
+		}
+		if strings.HasSuffix(colExpr, " AS BOOLEAN)") {
+			inner := colExpr[len("CAST(") : len(colExpr)-len(" AS BOOLEAN)")]
+			if v := resolveColumnValue(row, inner); v != nil {
+				s := fmt.Sprintf("%v", v)
+				return strings.EqualFold(s, "true") || s == "1"
+			}
+			return nil
+		}
 	}
 	return nil
 }

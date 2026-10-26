@@ -677,4 +677,139 @@ func TestCriticalBugs_FieldPromoteBackfill_MultiIndexSortAndAggs_IngestPipeline_
 		strings.Contains(body, `"secret"`) {
 		t.Fatalf("unexpected document after ingest pipeline: %d %s", code, body)
 	}
+
+	// 5. Deep-dive end-to-end regressions in MemoryBackend:
+	//    a) Dynamic non-string arrays ("ports": [80, 443]) + idempotent array promotion
+	_, _ = doReq(http.MethodPost, "/dyn_arr_idx/_doc/d1?refresh=true", `{"ports":[80,443],"tags":["alpha","beta"],"group":"g1"}`)
+	_, _ = doReq(http.MethodPost, "/dyn_arr_idx/_doc/d2?refresh=true", `{"ports":[8080],"tags":["beta","gamma"],"group":"g1"}`)
+	code, portSearchBody := doReq(http.MethodPost, "/dyn_arr_idx/_search", `{"query":{"term":{"ports":443}}}`)
+	if code != http.StatusOK || !strings.Contains(portSearchBody, `"_id":"d1"`) {
+		t.Fatalf("expected dynamic integer array element 443 at index 1 to match d1, got: %d %s", code, portSearchBody)
+	}
+	// Promote multi-valued field "tags" twice (idempotent + preserves array elements)
+	if code, body := doReq(http.MethodPost, "/dyn_arr_idx/_doris/promote", `{"field":"tags","type":"keyword"}`); code != http.StatusOK {
+		t.Fatalf("first promote on multi-valued tags failed: %d %s", code, body)
+	}
+	if code, body := doReq(http.MethodPost, "/dyn_arr_idx/_doris/promote", `{"field":"tags","type":"keyword"}`); code != http.StatusOK {
+		t.Fatalf("second idempotent promote on tags failed: %d %s", code, body)
+	}
+	// Sub-aggregations on multi-valued array column "tags"
+	code, subAggBody := doReq(http.MethodPost, "/dyn_arr_idx/_search", `{
+		"size": 0,
+		"aggs": {
+			"by_group": {
+				"terms": {"field": "group"},
+				"aggs": {
+					"tag_terms": {"terms": {"field": "tags"}},
+					"tag_card": {"cardinality": {"field": "tags"}},
+					"tag_vc": {"value_count": {"field": "tags"}}
+				}
+			}
+		}
+	}`)
+	if code != http.StatusOK || !strings.Contains(subAggBody, `"key":"beta"`) || !strings.Contains(subAggBody, `"value":3`) || !strings.Contains(subAggBody, `"value":4`) {
+		t.Fatalf("expected multi-valued sub-aggregations on tags to return beta bucket, cardinality=3, value_count=4, got: %d %s", code, subAggBody)
+	}
+
+	//    b) Multi-index sub-aggregation min/max/avg + top_hits size cap
+	_, _ = doReq(http.MethodPut, "/multi-b/_doc/b2?refresh=true", `{"latency":300,"svc":"api"}`)
+	code, multiSubBody := doReq(http.MethodPost, "/multi-a,multi-b/_search", `{
+		"size": 0,
+		"aggs": {
+			"by_svc": {
+				"terms": {"field": "svc"},
+				"aggs": {
+					"min_lat": {"min": {"field": "latency"}},
+					"max_lat": {"max": {"field": "latency"}},
+					"avg_lat": {"avg": {"field": "latency"}}
+				}
+			},
+			"sample_docs": {
+				"top_hits": {"size": 1, "sort": [{"latency": "desc"}]}
+			}
+		}
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("multi-index sub-agg search failed: %d %s", code, multiSubBody)
+	}
+	var multiSubResp map[string]any
+	if err := json.Unmarshal([]byte(multiSubBody), &multiSubResp); err != nil {
+		t.Fatal(err)
+	}
+	topHitsArr := multiSubResp["aggregations"].(map[string]any)["sample_docs"].(map[string]any)["hits"].(map[string]any)["hits"].([]any)
+	if len(topHitsArr) != 1 {
+		t.Fatalf("expected multi-index top_hits size:1 to cap hits at 1, got: %+v", topHitsArr)
+	}
+	bySvcBuckets := multiSubResp["aggregations"].(map[string]any)["by_svc"].(map[string]any)["buckets"].([]any)
+	var foundAPI bool
+	for _, bRaw := range bySvcBuckets {
+		bMap := bRaw.(map[string]any)
+		if bMap["key"] == "api" {
+			foundAPI = true
+			minV := bMap["min_lat"].(map[string]any)["value"]
+			maxV := bMap["max_lat"].(map[string]any)["value"]
+			avgV := bMap["avg_lat"].(map[string]any)["value"]
+			if minV != float64(100) || maxV != float64(300) || avgV != float64(200) {
+				t.Fatalf("expected multi-index sub-agg on 'api' to have min=100, max=300, avg=200, got min=%v max=%v avg=%v", minV, maxV, avgV)
+			}
+		}
+	}
+	if !foundAPI {
+		t.Fatalf("expected 'api' bucket in multi-index sub-agg response: %s", multiSubBody)
+	}
+
+	//    c) Nested numeric range (15 >= 10 matches, 2 >= 10 does NOT match lexicographically) & dotted ingest pipeline paths
+	_, _ = doReq(http.MethodPut, "/nested_num_idx", `{
+		"mappings": {
+			"properties": {
+				"comments": {
+					"type": "nested",
+					"properties": {
+						"author": {"type": "keyword"},
+						"likes": {"type": "integer"}
+					}
+				}
+			}
+		}
+	}`)
+	_, _ = doReq(http.MethodPost, "/nested_num_idx/_doc/n1?refresh=true", `{"comments":[{"author":"Alice","likes":2}]}`)
+	_, _ = doReq(http.MethodPost, "/nested_num_idx/_doc/n2?refresh=true", `{"comments":[{"author":"Bob","likes":15}]}`)
+	code, nestedRangeBody := doReq(http.MethodPost, "/nested_num_idx/_search", `{
+		"query": {
+			"nested": {
+				"path": "comments",
+				"query": {
+					"bool": {
+						"must": [
+							{"range": {"comments.likes": {"gte": 10}}},
+							{"term": {"comments.author": {"value": "bob", "case_insensitive": true}}}
+						]
+					}
+				}
+			}
+		}
+	}`)
+	if code != http.StatusOK || !strings.Contains(nestedRangeBody, `"_id":"n2"`) || strings.Contains(nestedRangeBody, `"_id":"n1"`) {
+		t.Fatalf("expected nested numeric range likes>=10 to match only n2 (15) and not n1 (2), got: %d %s", code, nestedRangeBody)
+	}
+
+	// Dotted nested ingest pipeline paths
+	_, _ = doReq(http.MethodPut, "/_ingest/pipeline/dotted-pipe", `{
+		"processors": [
+			{"set": {"field": "service.env", "value": "staging"}},
+			{"lowercase": {"field": "service.name"}},
+			{"rename": {"field": "service.old", "target_field": "service.new"}},
+			{"remove": {"field": "service.secret"}}
+		]
+	}`)
+	if code, body := doReq(http.MethodPut, "/ingest_idx/_doc/p2?pipeline=dotted-pipe&refresh=true", `{"service":{"name":"BILLING","old":"v1","secret":"tok"}}`); code != http.StatusCreated {
+		t.Fatalf("PUT with dotted ingest pipeline failed: %d %s", code, body)
+	}
+	if code, body := doReq(http.MethodGet, "/ingest_idx/_doc/p2", ""); code != http.StatusOK ||
+		!strings.Contains(body, `"env":"staging"`) ||
+		!strings.Contains(body, `"name":"billing"`) ||
+		!strings.Contains(body, `"new":"v1"`) ||
+		strings.Contains(body, `"secret"`) {
+		t.Fatalf("unexpected document after dotted ingest pipeline: %d %s", code, body)
+	}
 }
