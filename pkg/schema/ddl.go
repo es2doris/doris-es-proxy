@@ -108,6 +108,9 @@ func GenerateCreateTableDDL(s *IndexSchema) string {
 // GenerateAlterTableDDL computes non-blocking Light Schema Change `ALTER TABLE` statements
 // when new fields or nested roots are added via `PUT /<index>/_mapping`.
 func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
+	if newSchema == nil {
+		return nil
+	}
 	var stmts []string
 	newKeys := make([]string, 0, len(newSchema.Fields))
 	for k := range newSchema.Fields {
@@ -167,11 +170,12 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 // GeneratePromoteVariantFieldDDL generates `ALTER TABLE` statements to promote a frequently
 // queried dynamic `_doc['...']` `VARIANT` field to a dedicated physical column with `USING INVERTED`.
 func GeneratePromoteVariantFieldDDL(s *IndexSchema, esFieldPath string, esType string) []string {
+	if s == nil {
+		return nil
+	}
 	cleanPath := strings.TrimSuffix(esFieldPath, ".keyword")
-	if s != nil {
-		if existing, ok := s.Fields[cleanPath]; ok && existing.Kind != StorageDynamicVariant {
-			return nil
-		}
+	if existing, ok := s.Fields[cleanPath]; ok && existing.Kind != StorageDynamicVariant {
+		return nil
 	}
 	colName := "f__" + SanitizeDorisIdentifier(cleanPath)
 	if esType == "" {

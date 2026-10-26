@@ -59,7 +59,10 @@ func ShredDocument(
 	var parsedDoc map[string]any
 	dec := json.NewDecoder(bytes.NewReader(trimmed))
 	dec.UseNumber()
-	if err := dec.Decode(&parsedDoc); err != nil {
+	if err := dec.Decode(&parsedDoc); err != nil || parsedDoc == nil {
+		if err == nil {
+			err = fmt.Errorf("expected JSON object")
+		}
 		return nil, fmt.Errorf("invalid document JSON for _id=%q: %w", id, err)
 	}
 
@@ -239,6 +242,14 @@ func coerceScalarForDoris(val any, dorisType DorisScalarType, lowercase bool, no
 // and Elasticsearch date math expressions (`now`, `now-7d`, `now-1h/d`, `2024-01-01||+1d`)
 // into Unix epoch milliseconds.
 func ParseESDateToEpochMillis(input string, now time.Time) (int64, bool) {
+	return ParseESDateBoundToEpochMillis(input, now, false)
+}
+
+// ParseESDateBoundToEpochMillis parses ISO-8601 / RFC3339 date strings, epoch strings,
+// and Elasticsearch date math expressions into Unix epoch milliseconds.
+// When `roundUp` is true (used for inclusive upper bounds like `lte`), rounding units (`/d`, `/h`, etc.)
+// round to the end of the interval (`23:59:59.999` for `/d`).
+func ParseESDateBoundToEpochMillis(input string, now time.Time, roundUp bool) (int64, bool) {
 	s := strings.TrimSpace(input)
 	if s == "" {
 		return 0, false
@@ -254,11 +265,14 @@ func ParseESDateToEpochMillis(input string, now time.Time) (int64, bool) {
 		baseTime = now.UTC()
 		mathExpr = s[3:]
 	} else if idx := strings.Index(s, "||"); idx >= 0 {
-		t, ok := parseISODateString(s[:idx])
-		if !ok {
+		prefix := strings.TrimSpace(s[:idx])
+		if ms, err := strconv.ParseInt(prefix, 10, 64); err == nil {
+			baseTime = time.UnixMilli(ms).UTC()
+		} else if t, ok := parseISODateString(prefix); ok {
+			baseTime = t
+		} else {
 			return 0, false
 		}
-		baseTime = t
 		mathExpr = s[idx+2:]
 	} else {
 		t, ok := parseISODateString(s)
@@ -268,7 +282,7 @@ func ParseESDateToEpochMillis(input string, now time.Time) (int64, bool) {
 		return t.UnixMilli(), true
 	}
 
-	t := applyESDateMath(baseTime, mathExpr)
+	t := applyESDateMathWithRound(baseTime, mathExpr, roundUp)
 	return t.UnixMilli(), true
 }
 
@@ -294,6 +308,10 @@ func parseISODateString(s string) (time.Time, bool) {
 }
 
 func applyESDateMath(base time.Time, expr string) time.Time {
+	return applyESDateMathWithRound(base, expr, false)
+}
+
+func applyESDateMathWithRound(base time.Time, expr string, roundUp bool) time.Time {
 	t := base.UTC()
 	var roundUnit byte
 	if slashIdx := strings.IndexByte(expr, '/'); slashIdx >= 0 {
@@ -349,16 +367,43 @@ func applyESDateMath(base time.Time, expr string) time.Time {
 	switch roundUnit {
 	case 'y', 'Y':
 		t = time.Date(t.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
+		if roundUp {
+			t = t.AddDate(1, 0, 0).Add(-time.Millisecond)
+		}
 	case 'M':
 		t = time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
+		if roundUp {
+			t = t.AddDate(0, 1, 0).Add(-time.Millisecond)
+		}
+	case 'w', 'W':
+		weekday := int(t.Weekday())
+		if weekday == 0 {
+			weekday = 7
+		}
+		t = time.Date(t.Year(), t.Month(), t.Day()-(weekday-1), 0, 0, 0, 0, time.UTC)
+		if roundUp {
+			t = t.AddDate(0, 0, 7).Add(-time.Millisecond)
+		}
 	case 'd', 'D':
 		t = time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+		if roundUp {
+			t = t.AddDate(0, 0, 1).Add(-time.Millisecond)
+		}
 	case 'h', 'H':
 		t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, time.UTC)
+		if roundUp {
+			t = t.Add(time.Hour - time.Millisecond)
+		}
 	case 'm':
 		t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), 0, 0, time.UTC)
+		if roundUp {
+			t = t.Add(time.Minute - time.Millisecond)
+		}
 	case 's':
 		t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.UTC)
+		if roundUp {
+			t = t.Add(time.Second - time.Millisecond)
+		}
 	}
 	return t
 }
@@ -465,11 +510,27 @@ func extractNestedElementMaps(node any, path []string) []map[string]any {
 		}
 		return nil
 	}
-	m, ok := node.(map[string]any)
-	if !ok {
+	switch curr := node.(type) {
+	case map[string]any:
+		if next, exists := curr[path[0]]; exists {
+			return extractNestedElementMaps(next, path[1:])
+		}
+		if len(path) > 1 {
+			dotted := strings.Join(path, ".")
+			if next, exists := curr[dotted]; exists {
+				return extractNestedElementMaps(next, nil)
+			}
+		}
+		return nil
+	case []any:
+		var res []map[string]any
+		for _, elem := range curr {
+			res = append(res, extractNestedElementMaps(elem, path)...)
+		}
+		return res
+	default:
 		return nil
 	}
-	return extractNestedElementMaps(m[path[0]], path[1:])
 }
 
 func collectAllTextBuilder(node any, sb *strings.Builder) {

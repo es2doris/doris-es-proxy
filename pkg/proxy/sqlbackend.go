@@ -78,6 +78,8 @@ func (b *DorisSQLBackend) ExecDDL(ctx context.Context, ddl string) error {
 
 func normalizeDorisSQL(q string) string {
 	q = strings.ReplaceAll(q, "`__DORIS_DELETE_SIGN__` = 0 AND ", "")
+	q = strings.ReplaceAll(q, `'\x1f'`, "CHAR(31)")
+	q = strings.ReplaceAll(q, "'\x1f'", "CHAR(31)")
 	return rewriteDorisArrayExists(q)
 }
 

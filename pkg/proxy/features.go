@@ -885,12 +885,17 @@ func (s *Server) handleCatNodes(w http.ResponseWriter, r *http.Request) {
 
 // handleCatShards implements `GET /_cat/shards` for Elasticvue & Cerebro.
 func (s *Server) handleCatShards(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	names := make([]string, 0, len(s.indices))
-	for name := range s.indices {
-		names = append(names, name)
+	var names []string
+	if pat := r.PathValue("index"); pat != "" {
+		names = s.resolveTargetIndices(pat)
+	} else {
+		s.mu.RLock()
+		names = make([]string, 0, len(s.indices))
+		for name := range s.indices {
+			names = append(names, name)
+		}
+		s.mu.RUnlock()
 	}
-	s.mu.RUnlock()
 	sort.Strings(names)
 	rows := make([]map[string]any, 0, len(names))
 	for _, name := range names {
@@ -991,7 +996,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	destSchema := s.ensureWritableIndexSchema(r.Context(), destIndex)
+	var destSchema *schema.IndexSchema
 	srcTargets := s.resolveTargetIndices(srcPattern)
 	if len(srcTargets) == 0 {
 		srcTargets = []string{s.resolveIndexName(srcPattern)}
@@ -1037,8 +1042,13 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			batches++
-			var batchBuf bytes.Buffer
-			for i, h := range hits {
+			type preparedDoc struct {
+				id     string
+				source json.RawMessage
+			}
+			var prepared []preparedDoc
+			var sampleDocs []json.RawMessage
+			for _, h := range hits {
 				totalMatched++
 				docSource := h.Source
 				if body.Script != nil {
@@ -1056,7 +1066,17 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					}
 					docSource = mutated
 				}
-				shredded, err := schema.ShredDocument(destSchema, h.ID, seqBase+int64(totalMatched)+int64(i), false, docSource)
+				prepared = append(prepared, preparedDoc{id: h.ID, source: docSource})
+				if destSchema == nil && len(sampleDocs) < 16 {
+					sampleDocs = append(sampleDocs, docSource)
+				}
+			}
+			if destSchema == nil {
+				destSchema = s.ensureWritableIndexSchemaWithDocs(r.Context(), destIndex, sampleDocs)
+			}
+			var batchBuf bytes.Buffer
+			for i, pd := range prepared {
+				shredded, err := schema.ShredDocument(destSchema, pd.id, seqBase+int64(totalMatched)+int64(i), false, pd.source)
 				if err != nil {
 					writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 					return
@@ -1076,6 +1096,9 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
+	}
+	if destSchema == nil {
+		_ = s.ensureWritableIndexSchema(r.Context(), destIndex)
 	}
 
 	tookMs := time.Since(start).Milliseconds()

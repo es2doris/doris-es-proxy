@@ -64,6 +64,7 @@ type FieldBinding struct {
 	Analyzer            string
 	LowercaseNormalizer bool
 	KeywordCompanion    string // Optional untokenized `.keyword` column for `text` fields
+	KeywordNormalizer   bool   // Whether `KeywordCompanion` has a lowercase normalizer
 	VectorDims          int
 	VectorMetric        string
 
@@ -73,6 +74,18 @@ type FieldBinding struct {
 	RelativeJSONPath   []string // Path inside each nested element, e.g. ["tags", "tagFQN"]
 	PrefilterArrayCol  string   // e.g. "n__columns__tags__tagFQN" (`ARRAY<STRING>` with `USING INVERTED`)
 	IsMultiValued      bool
+}
+
+// EffectiveLowercase returns true if this field (or its `.keyword` companion when `preferKeyword` is true)
+// uses a lowercase normalizer.
+func (b FieldBinding) EffectiveLowercase(preferKeyword bool) bool {
+	if b.LowercaseNormalizer {
+		return true
+	}
+	if preferKeyword && b.KeywordCompanion != "" && b.KeywordNormalizer {
+		return true
+	}
+	return false
 }
 
 // NestedRootSpec holds pre-split path metadata for a correlated nested array root.
@@ -91,6 +104,7 @@ type IndexSchema struct {
 	Fields          map[string]FieldBinding
 	OrderedFields   []FieldBinding
 	NestedRoots     map[string]string // Maps ES nested path (e.g. "columns") -> Doris column ("n__columns")
+	nestedRootPaths map[string][]string
 	NestedRootSpecs []NestedRootSpec
 	RawMapping      *esast.MappingSpec
 }
@@ -119,13 +133,14 @@ var DefaultMultiValuedPaths = map[string]bool{
 // CompileIndexSchema translates an Elasticsearch `_mapping` specification into a Doris `IndexSchema`.
 func CompileIndexSchema(dorisDB, indexName string, mapping *esast.MappingSpec) *IndexSchema {
 	s := &IndexSchema{
-		IndexName:   indexName,
-		DorisDB:     SanitizeDorisIdentifier(dorisDB),
-		DorisTable:  SanitizeDorisIdentifier(indexName),
-		Buckets:     8,
-		Fields:      make(map[string]FieldBinding),
-		NestedRoots: make(map[string]string),
-		RawMapping:  mapping,
+		IndexName:       indexName,
+		DorisDB:         SanitizeDorisIdentifier(dorisDB),
+		DorisTable:      SanitizeDorisIdentifier(indexName),
+		Buckets:         8,
+		Fields:          make(map[string]FieldBinding),
+		NestedRoots:     make(map[string]string),
+		nestedRootPaths: make(map[string][]string),
+		RawMapping:      mapping,
 	}
 	if mapping != nil && len(mapping.Properties) > 0 {
 		s.compileProperties(nil, nil, "", 0, mapping.Properties)
@@ -158,10 +173,14 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 	sort.Strings(nestedKeys)
 	s.NestedRootSpecs = make([]NestedRootSpec, 0, len(nestedKeys))
 	for _, np := range nestedKeys {
+		parts := s.nestedRootPaths[np]
+		if len(parts) == 0 {
+			parts = strings.Split(np, ".")
+		}
 		s.NestedRootSpecs = append(s.NestedRootSpecs, NestedRootSpec{
 			Path:       np,
 			ColumnName: s.NestedRoots[np],
-			PathParts:  strings.Split(np, "."),
+			PathParts:  parts,
 		})
 	}
 }
@@ -281,6 +300,10 @@ func (s *IndexSchema) compileProperties(
 		if strings.EqualFold(prop.Type, "nested") {
 			corrCol := "n__" + SanitizeDorisIdentifier(dotPath)
 			s.NestedRoots[dotPath] = corrCol
+			if s.nestedRootPaths == nil {
+				s.nestedRootPaths = make(map[string][]string)
+			}
+			s.nestedRootPaths[dotPath] = currJSONPath
 			if len(prop.Properties) > 0 {
 				s.compileProperties(currESPath, currJSONPath, dotPath, len(currJSONPath), prop.Properties)
 			}
@@ -312,6 +335,7 @@ func (s *IndexSchema) compileProperties(
 				if subKey == "keyword" {
 					if baseBinding, ok := s.Fields[dotPath]; ok && baseBinding.Kind == StoragePromotedScalar {
 						baseBinding.KeywordCompanion = s.Fields[multiDotPath].ColumnName
+						baseBinding.KeywordNormalizer = s.Fields[multiDotPath].LowercaseNormalizer
 						s.Fields[dotPath] = baseBinding
 					}
 				}
@@ -350,7 +374,7 @@ func (s *IndexSchema) registerLeafField(
 			CorrelatedArrayCol:  corrCol,
 			RelativeJSONPath:    relJSONPath,
 			PrefilterArrayCol:   prefilterCol,
-			IsMultiValued:       len(relJSONPath) > 1 || DefaultMultiValuedPaths[dotPath],
+			IsMultiValued:       prop.MultiValued || len(relJSONPath) > 1 || DefaultMultiValuedPaths[dotPath],
 		}
 		return
 	}
@@ -448,10 +472,16 @@ func (s *IndexSchema) ExpandFieldPattern(patternWithBoost string) []BoostedField
 		return nil
 	}
 	var matched []BoostedField
-	for k := range s.Fields {
+	for k, b := range s.Fields {
+		if b.Kind == StoragePromotedVector {
+			continue
+		}
 		if re.MatchString(k) {
 			matched = append(matched, BoostedField{Field: k, Boost: boost})
 		}
+	}
+	if len(matched) == 0 && (pattern == "*" || pattern == "*.keyword") {
+		return []BoostedField{{Field: "_all_text", Boost: boost}}
 	}
 	sort.Slice(matched, func(i, j int) bool {
 		return matched[i].Field < matched[j].Field

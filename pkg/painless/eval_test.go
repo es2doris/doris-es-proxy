@@ -192,3 +192,67 @@ func TestEvalCondition_PrecedenceAndRelationalOperators(t *testing.T) {
 		t.Fatalf("expected relational operators (>=, <=, >, <) to evaluate to true, got: %+v", doc)
 	}
 }
+
+func TestEval_LeftAssociativeSubStringConcatParensUpsertAndRemove(t *testing.T) {
+	initial := `{"a":1,"b":0,"c":0,"tags":["x","y","z"],"temp":"drop_me"}`
+	req := &UpdateRequest{
+		Script: &ScriptSpec{
+			Source: `
+				ctx._source.sub_chain = 10 - 3 - 2;
+				ctx._source.sub_add = 10 - 3 + 2;
+				ctx._source.str_concat = '10' + '20';
+				if ((ctx._source.a == 1 || ctx._source.b == 1) && ctx._source.c == 1) {
+					ctx._source.paren_cond = true;
+				} else {
+					ctx._source.paren_cond = false;
+				}
+				if (!(ctx._source.c == 1)) {
+					ctx._source.neg_cond = true;
+				}
+				ctx._source.remove(params.rm_field);
+				ctx._source.tags.remove(1);
+			`,
+			Params: map[string]any{"rm_field": "temp"},
+		},
+	}
+	updated, opRes, err := ApplyUpdateWithResult(json.RawMessage(initial), req, true)
+	if err != nil || opRes != "updated" {
+		t.Fatalf("ApplyUpdateWithResult failed: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(updated, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc["sub_chain"] != float64(5) {
+		t.Fatalf("expected 10 - 3 - 2 == 5, got %v", doc["sub_chain"])
+	}
+	if doc["sub_add"] != float64(9) {
+		t.Fatalf("expected 10 - 3 + 2 == 9, got %v", doc["sub_add"])
+	}
+	if doc["str_concat"] != "1020" {
+		t.Fatalf("expected '10' + '20' == \"1020\", got %v", doc["str_concat"])
+	}
+	if doc["paren_cond"] != false {
+		t.Fatalf("expected ((1 || 0) && 0) == false, got %v", doc["paren_cond"])
+	}
+	if doc["neg_cond"] != true {
+		t.Fatalf("expected !(0 == 1) == true, got %v", doc["neg_cond"])
+	}
+	if _, exists := doc["temp"]; exists {
+		t.Fatalf("expected params.rm_field ('temp') to be removed, got %+v", doc)
+	}
+	tags, _ := doc["tags"].([]any)
+	if len(tags) != 2 || tags[0] != "x" || tags[1] != "z" {
+		t.Fatalf("expected tags.remove(1) to leave [x, z], got %+v", tags)
+	}
+
+	// Verify empty upsert: {} with scripted_upsert: true creates document
+	upserted, upRes, err := ApplyUpdateWithResult(nil, &UpdateRequest{
+		ScriptedUpsert: true,
+		Upsert:         map[string]any{},
+		Script:         &ScriptSpec{Source: "ctx._source.created = 'yes'"},
+	}, false)
+	if err != nil || upRes != "created" || string(upserted) != `{"created":"yes"}` {
+		t.Fatalf("expected empty upsert: {} with scripted_upsert to create doc, got %s (%s, err=%v)", string(upserted), upRes, err)
+	}
+}

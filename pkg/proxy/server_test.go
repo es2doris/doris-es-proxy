@@ -813,3 +813,104 @@ func TestCriticalBugs_FieldPromoteBackfill_MultiIndexSortAndAggs_IngestPipeline_
 		t.Fatalf("unexpected document after dotted ingest pipeline: %d %s", code, body)
 	}
 }
+
+func TestServer_DeepEvalProtocolAndMultiIndexFixes(t *testing.T) {
+	srv := NewServer("logs_db", NewMemoryBackend(true), transpiler.TranspilerOptions{})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	doReq := func(method, path, body string) (int, string) {
+		req, err := http.NewRequest(method, ts.URL+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(b)
+	}
+
+	// 1. normalizeDorisSQL replaces '\x1f' with CHAR(31)
+	normSQL := normalizeDorisSQL("SELECT CONCAT(a, '\x1f', b) FROM t")
+	if !strings.Contains(normSQL, "CHAR(31)") {
+		t.Fatalf("expected normalizeDorisSQL to replace '\\x1f' with CHAR(31), got %q", normSQL)
+	}
+
+	// 2. PUT /{index}/_create/{id} and ?op_type=create return 409 Conflict on duplicate
+	if code, body := doReq(http.MethodPut, "/create_idx/_create/c1?refresh=true", `{"msg":"first"}`); code != http.StatusCreated {
+		t.Fatalf("expected 201 Created on first _create, got %d %s", code, body)
+	}
+	if code, body := doReq(http.MethodPut, "/create_idx/_create/c1?refresh=true", `{"msg":"second"}`); code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on duplicate _create, got %d %s", code, body)
+	}
+	if code, body := doReq(http.MethodPut, "/create_idx/_doc/c1?op_type=create&refresh=true", `{"msg":"third"}`); code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on duplicate ?op_type=create, got %d %s", code, body)
+	}
+
+	// 3. POST /{index}/_doc/_search and /{index}/_doc/_count route to search/count instead of indexing _id="_search"
+	if code, body := doReq(http.MethodPost, "/create_idx/_doc/_search", `{"query":{"match_all":{}}}`); code != http.StatusOK || !strings.Contains(body, `"hits"`) {
+		t.Fatalf("expected POST /{index}/_doc/_search to execute search, got %d %s", code, body)
+	}
+	if code, body := doReq(http.MethodPost, "/create_idx/_doc/_count", `{"query":{"match_all":{}}}`); code != http.StatusOK || !strings.Contains(body, `"count":1`) {
+		t.Fatalf("expected POST /{index}/_doc/_count to return count:1, got %d %s", code, body)
+	}
+
+	// 4. Pagination past end (from >= total_hits) preserves true hits.total.value
+	if code, body := doReq(http.MethodPost, "/create_idx/_search", `{"from":50,"size":10,"query":{"match_all":{}}}`); code != http.StatusOK || !strings.Contains(body, `"value":1`) {
+		t.Fatalf("expected from>=total_hits to preserve total.value=1, got %d %s", code, body)
+	}
+
+	// 5. Wildcard highlight ("*") + no <em> tag corruption when query contains "em"
+	_, _ = doReq(http.MethodPut, "/hl_idx/_doc/h1?refresh=true", `{"title":"system emerald gem"}`)
+	if code, body := doReq(http.MethodPost, "/hl_idx/_search", `{
+		"query": {"match": {"title": "system em"}},
+		"highlight": {"fields": {"*": {}}}
+	}`); code != http.StatusOK || !strings.Contains(body, `\u003cem\u003esystem\u003c/em\u003e \u003cem\u003eem\u003c/em\u003eerald g\u003cem\u003eem\u003c/em\u003e`) {
+		t.Fatalf("expected wildcard highlight without <em> tag corruption, got %d %s", code, body)
+	}
+
+	// 6. Multi-index stats weighted average, post_filter preserving aggs, _msearch indices array, and wildcard _mapping/_delete
+	_, _ = doReq(http.MethodPut, "/m_idx_1/_doc/1?refresh=true", `{"env":"prod","latency":10}`)
+	_, _ = doReq(http.MethodPut, "/m_idx_2/_doc/2?refresh=true", `{"env":"prod","latency":20}`)
+	_, _ = doReq(http.MethodPut, "/m_idx_2/_doc/3?refresh=true", `{"env":"staging","latency":30}`)
+
+	if code, body := doReq(http.MethodPost, "/m_idx_*/_search", `{
+		"post_filter": {"term": {"env": "staging"}},
+		"aggs": {
+			"by_env": {"terms": {"field": "env"}},
+			"lat_stats": {"stats": {"field": "latency"}}
+		}
+	}`); code != http.StatusOK || !strings.Contains(body, `"avg":20`) || !strings.Contains(body, `"doc_count":2,"key":"prod"`) {
+		t.Fatalf("expected multi-index post_filter to preserve aggs across all indices and compute weighted stats avg=20, got %d %s", code, body)
+	}
+
+	if code, body := doReq(http.MethodPost, "/_msearch", `{"indices":["m_idx_1","m_idx_2"]}`+"\n"+`{"query":{"match_all":{}}}`+"\n"); code != http.StatusOK || !strings.Contains(body, `"value":3`) {
+		t.Fatalf("expected _msearch with indices array to query both indices (total=3), got %d %s", code, body)
+	}
+
+	if code, body := doReq(http.MethodGet, "/m_idx_*/_mapping", ""); code != http.StatusOK || !strings.Contains(body, `"m_idx_1"`) || !strings.Contains(body, `"m_idx_2"`) {
+		t.Fatalf("expected wildcard _mapping to return both m_idx_1 and m_idx_2, got %d %s", code, body)
+	}
+	if code, body := doReq(http.MethodGet, "/_cat/indices/m_idx_*", ""); code != http.StatusOK || !strings.Contains(body, `"m_idx_1"`) || strings.Contains(body, `"create_idx"`) {
+		t.Fatalf("expected /_cat/indices/m_idx_* to filter indices, got %d %s", code, body)
+	}
+
+	// 7. Auto-created destination index on _update (doc_as_upsert) and _reindex infers schema
+	if code, body := doReq(http.MethodPost, "/up_auto_idx/_update/u1?refresh=true", `{"doc":{"score":42,"tag":"alpha"},"doc_as_upsert":true}`); code != http.StatusOK {
+		t.Fatalf("expected _update doc_as_upsert to succeed, got %d %s", code, body)
+	}
+	if code, body := doReq(http.MethodPost, "/_reindex", `{"source":{"index":"up_auto_idx"},"dest":{"index":"reindexed_auto_idx"}}`); code != http.StatusOK {
+		t.Fatalf("expected _reindex to succeed, got %d %s", code, body)
+	}
+	if code, body := doReq(http.MethodGet, "/reindexed_auto_idx/_mapping", ""); code != http.StatusOK || !strings.Contains(body, `"score"`) {
+		t.Fatalf("expected _reindex into new index to infer dynamic mapping for 'score', got %d %s", code, body)
+	}
+
+	if code, body := doReq(http.MethodDelete, "/m_idx_*", ""); code != http.StatusOK {
+		t.Fatalf("expected wildcard DELETE /m_idx_* to succeed, got %d %s", code, body)
+	}
+}

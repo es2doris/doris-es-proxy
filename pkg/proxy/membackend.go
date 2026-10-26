@@ -284,6 +284,15 @@ func (m *MemoryBackend) QueryHits(_ context.Context, sqlStr string) ([]HitRow, e
 			default:
 				va := resolveColumnValue(matchedRows[ia], colExpr)
 				vb := resolveColumnValue(matchedRows[ib], colExpr)
+				if va == nil && vb == nil {
+					continue
+				}
+				if va == nil {
+					return false
+				}
+				if vb == nil {
+					return true
+				}
 				cmp = compareAny(va, vb)
 			}
 			if cmp != 0 {
@@ -942,6 +951,15 @@ func sortRowsByOrderClause(rows []map[string]any, orderByClause string) {
 			} else {
 				va := resolveColumnValue(rows[i], colExpr)
 				vb := resolveColumnValue(rows[j], colExpr)
+				if va == nil && vb == nil {
+					continue
+				}
+				if va == nil {
+					return false
+				}
+				if vb == nil {
+					return true
+				}
 				cmp = compareAny(va, vb)
 			}
 			if cmp != 0 {
@@ -1175,6 +1193,11 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 		colExpr := strings.TrimSpace(expr[:len(expr)-len(" IS NOT NULL")])
 		val := resolveColumnValue(row, colExpr)
 		return val != nil
+	}
+	if strings.HasSuffix(expr, " IS NULL") {
+		colExpr := strings.TrimSpace(expr[:len(expr)-len(" IS NULL")])
+		val := resolveColumnValue(row, colExpr)
+		return val == nil
 	}
 
 	for _, matchOp := range []string{" MATCH_PHRASE_PREFIX ", " MATCH_PHRASE ", " MATCH_REGEXP ", " MATCH_ALL ", " MATCH_ANY "} {
@@ -1411,7 +1434,7 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 		return 0
 	}
 
-	for _, fn := range []string{"GREATEST", "COALESCE", "LOG10", "LN", "SQRT"} {
+	for _, fn := range []string{"GREATEST", "LEAST", "COALESCE", "LOG10", "LN", "SQRT"} {
 		if strings.HasPrefix(expr, fn+"(") && strings.HasSuffix(expr, ")") {
 			inner := expr[len(fn)+1 : len(expr)-1]
 			args := splitTopLevelArgs(inner)
@@ -1425,6 +1448,15 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 					}
 				}
 				return maxVal
+			case "LEAST":
+				minVal := 0.0
+				for i, a := range args {
+					v := evalNumericExpr(row, a)
+					if i == 0 || v < minVal {
+						minVal = v
+					}
+				}
+				return minVal
 			case "COALESCE":
 				if len(args) == 2 {
 					colVal := resolveColumnValue(row, strings.TrimSpace(args[0]))

@@ -505,6 +505,14 @@ func (s *Server) Handler() http.Handler {
 				}
 				return
 			}
+			if segs[1] == "_doc" && segs[2] == "_search" {
+				s.handleSearch(w, r)
+				return
+			}
+			if segs[1] == "_doc" && segs[2] == "_count" {
+				s.handleCount(w, r)
+				return
+			}
 			r.SetPathValue("id", segs[2])
 			switch segs[1] {
 			case "_doc", "_create":
@@ -631,12 +639,17 @@ func (s *Server) handleNodes(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleCatIndices(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	names := make([]string, 0, len(s.indices))
-	for name := range s.indices {
-		names = append(names, name)
+	var names []string
+	if pat := r.PathValue("index"); pat != "" {
+		names = s.resolveTargetIndices(pat)
+	} else {
+		s.mu.RLock()
+		names = make([]string, 0, len(s.indices))
+		for name := range s.indices {
+			names = append(names, name)
+		}
+		s.mu.RUnlock()
 	}
-	s.mu.RUnlock()
 	sort.Strings(names)
 	list := make([]map[string]any, 0, len(names))
 	for _, name := range names {
@@ -650,9 +663,13 @@ func (s *Server) handleCatIndices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCatAliases(w http.ResponseWriter, r *http.Request) {
+	namePattern := r.PathValue("name")
 	s.mu.RLock()
 	var list []map[string]any
 	for alias, targets := range s.aliases {
+		if namePattern != "" && namePattern != "*" && namePattern != "_all" && !matchWildcardPattern(namePattern, alias) {
+			continue
+		}
 		for _, idx := range targets {
 			list = append(list, map[string]any{
 				"alias": alias,
@@ -961,22 +978,36 @@ func (s *Server) handleHeadIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteIndex(w http.ResponseWriter, r *http.Request) {
-	indexName := s.resolveIndexName(r.PathValue("index"))
-	modifiedAliases := make(map[string][]string)
-	s.mu.Lock()
-	idx, ok := s.indices[indexName]
-	delete(s.indices, indexName)
-	for alias := range s.aliases {
-		s.removeAliasTargetLocked(alias, indexName)
-		modifiedAliases[alias] = append([]string(nil), s.aliases[alias]...)
-	}
-	s.mu.Unlock()
-	s.deleteCatalogEntity(r.Context(), "index", indexName)
-	for alias, targets := range modifiedAliases {
-		s.persistAlias(r.Context(), alias, targets)
+	rawIndex := r.PathValue("index")
+	var targets []string
+	if strings.ContainsAny(rawIndex, "*,") || rawIndex == "_all" {
+		targets = s.resolveTargetIndices(rawIndex)
+	} else {
+		targets = []string{s.resolveIndexName(rawIndex)}
 	}
 
-	if ok {
+	modifiedAliases := make(map[string][]string)
+	var tablesToDrop []*schema.IndexSchema
+	s.mu.Lock()
+	for _, indexName := range targets {
+		if idx, ok := s.indices[indexName]; ok {
+			tablesToDrop = append(tablesToDrop, idx)
+		}
+		delete(s.indices, indexName)
+		for alias := range s.aliases {
+			s.removeAliasTargetLocked(alias, indexName)
+			modifiedAliases[alias] = append([]string(nil), s.aliases[alias]...)
+		}
+	}
+	s.mu.Unlock()
+	for _, indexName := range targets {
+		s.deleteCatalogEntity(r.Context(), "index", indexName)
+	}
+	for alias, aliasTargets := range modifiedAliases {
+		s.persistAlias(r.Context(), alias, aliasTargets)
+	}
+
+	for _, idx := range tablesToDrop {
 		ddl := fmt.Sprintf("DROP TABLE IF EXISTS `%s`.`%s`;", idx.DorisDB, idx.DorisTable)
 		_ = s.backend.ExecDDL(r.Context(), ddl)
 	}
@@ -1000,7 +1031,27 @@ func (s *Server) handleGetAllMappings(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleGetMapping(w http.ResponseWriter, r *http.Request) {
-	indexName := s.resolveIndexName(r.PathValue("index"))
+	rawIndex := r.PathValue("index")
+	if strings.ContainsAny(rawIndex, "*,") || rawIndex == "_all" {
+		targets := s.resolveTargetIndices(rawIndex)
+		s.mu.RLock()
+		out := make(map[string]any, len(targets))
+		for _, indexName := range targets {
+			if idx, ok := s.indices[indexName]; ok {
+				props := map[string]esast.FieldProperty{}
+				if idx.RawMapping != nil {
+					props = idx.RawMapping.Properties
+				}
+				out[indexName] = map[string]any{
+					"mappings": map[string]any{"properties": props},
+				}
+			}
+		}
+		s.mu.RUnlock()
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	indexName := s.resolveIndexName(rawIndex)
 	s.mu.RLock()
 	idx, ok := s.indices[indexName]
 	s.mu.RUnlock()
@@ -1271,6 +1322,7 @@ func (s *Server) removeAliasTargetLocked(alias, indexName string) {
 func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 	indexName := s.resolveIndexName(r.PathValue("index"))
 	docID := r.PathValue("id")
+	isCreate := strings.Contains(r.URL.Path, "/_create/") || strings.EqualFold(r.URL.Query().Get("op_type"), "create")
 	if docID == "" {
 		docID = esast.NextAutoID()
 	}
@@ -1282,6 +1334,12 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 	docPayload := s.applyIngestPipelineIfPresent(r.URL.Query().Get("pipeline"), json.RawMessage(rawDoc))
 
 	idxSchema := s.ensureWritableIndexSchemaWithDocs(r.Context(), indexName, []json.RawMessage{docPayload})
+	if isCreate {
+		if _, found, err := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, docID); err == nil && found {
+			writeESError(w, http.StatusConflict, "version_conflict_engine_exception", fmt.Sprintf("[%s]: version conflict, document already exists", docID))
+			return
+		}
+	}
 	nextVer := time.Now().UnixNano()
 	shredded, err := schema.ShredDocument(idxSchema, docID, nextVer, false, docPayload)
 	if err != nil {
@@ -1481,7 +1539,6 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	indexName := s.resolveIndexName(r.PathValue("index"))
 	docID := r.PathValue("id")
-	idxSchema := s.ensureIndexSchema(r.Context(), indexName)
 
 	var updReq painless.UpdateRequest
 	if err := json.NewDecoder(r.Body).Decode(&updReq); err != nil {
@@ -1489,12 +1546,13 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	existingHit, found, err := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, docID)
+	roSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
+	existingHit, found, err := s.backend.GetDocByID(r.Context(), roSchema.DorisDB, roSchema.DorisTable, docID)
 	if err != nil {
 		writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
 		return
 	}
-	if !found && !updReq.DocAsUpsert && len(updReq.Upsert) == 0 && !updReq.ScriptedUpsert {
+	if !found && !updReq.DocAsUpsert && updReq.Upsert == nil && !updReq.ScriptedUpsert {
 		writeESError(w, http.StatusNotFound, "document_missing_exception", fmt.Sprintf("[%s]: document missing", docID))
 		return
 	}
@@ -1514,6 +1572,11 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 
 	if opResult != "noop" {
 		isDelete := opResult == "deleted"
+		var sampleDocs []json.RawMessage
+		if !isDelete && len(mutatedSource) > 0 {
+			sampleDocs = []json.RawMessage{mutatedSource}
+		}
+		idxSchema := s.ensureWritableIndexSchemaWithDocs(r.Context(), indexName, sampleDocs)
 		shredded, err := schema.ShredDocument(idxSchema, docID, nextVersion, isDelete, mutatedSource)
 		if err != nil {
 			writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
@@ -1795,6 +1858,20 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		idxName := s.resolveIndexName(op.Index)
 		if (op.Action == "index" || op.Action == "create") && len(op.Source) > 0 && len(sampleDocsByIndex[idxName]) < 16 {
 			sampleDocsByIndex[idxName] = append(sampleDocsByIndex[idxName], op.Source)
+		} else if op.Action == "update" && len(op.Source) > 0 && len(sampleDocsByIndex[idxName]) < 16 {
+			var u painless.UpdateRequest
+			if err := json.Unmarshal(op.Source, &u); err == nil {
+				if len(u.Doc) > 0 {
+					if rawDoc, err := json.Marshal(u.Doc); err == nil {
+						sampleDocsByIndex[idxName] = append(sampleDocsByIndex[idxName], rawDoc)
+					}
+				}
+				if len(u.Upsert) > 0 {
+					if rawUpsert, err := json.Marshal(u.Upsert); err == nil {
+						sampleDocsByIndex[idxName] = append(sampleDocsByIndex[idxName], rawUpsert)
+					}
+				}
+			}
 		}
 		if (op.Action == "update" || op.Action == "create") && op.ID != "" {
 			idsToFetchByIndex[idxName] = append(idsToFetchByIndex[idxName], op.ID)
@@ -2212,7 +2289,7 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 	scanner := bufio.NewScanner(r.Body)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024)
 
-	var responses []map[string]any
+	responses := make([]map[string]any, 0)
 	for {
 		var headerLine []byte
 		for scanner.Scan() {
@@ -2236,7 +2313,11 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.Unmarshal(headerLine, &hdr)
 		targetIdx := defaultIndex
-		switch v := hdr.Index.(type) {
+		idxField := hdr.Index
+		if idxField == nil {
+			idxField = hdr.Indices
+		}
+		switch v := idxField.(type) {
 		case string:
 			if v != "" {
 				targetIdx = v
@@ -2366,6 +2447,21 @@ func (s *Server) executeSearchRequest(
 				idxTotal = hits[i].TotalHits
 			}
 		}
+		if len(hits) == 0 && from > 0 && plan.AggsSQL == "" {
+			zero := 0
+			cntReq := subReq
+			cntReq.From = &zero
+			cntReq.Size = &zero
+			if cntPlan, err := tr.BuildSearchPlan(&cntReq); err == nil && cntPlan.AggsSQL != "" {
+				if cntRows, err := s.backend.QueryAggs(ctx, cntPlan.AggsSQL); err == nil {
+					for _, cr := range cntRows {
+						if cr.AggName == "__meta_total" {
+							idxTotal = cr.effectiveCount()
+						}
+					}
+				}
+			}
+		}
 		allHits = append(allHits, hits...)
 
 		for _, r := range aggRows {
@@ -2373,7 +2469,7 @@ func (s *Server) executeSearchRequest(
 				idxTotal = r.effectiveCount()
 			}
 		}
-		if len(targets) > 1 && idxTotal == 0 {
+		if len(targets) > 1 && idxTotal == 0 && req.PostFilter == nil {
 			for _, r := range aggRows {
 				if r.AggName == "__meta_total" {
 					allAggRows = append(allAggRows, r)
@@ -2430,6 +2526,24 @@ func (s *Server) executeSearchRequest(
 		allAggRows = mergeMultiIndexAggRows(allAggRows, totalHitsSum, req.EffectiveAggs())
 	}
 
+	if len(allHits) == 0 && totalHitsSum > 0 {
+		hasMeta := false
+		for _, r := range allAggRows {
+			if r.AggName == "__meta_total" {
+				hasMeta = true
+				break
+			}
+		}
+		if !hasMeta {
+			allAggRows = append(allAggRows, AggRow{
+				AggName:   "__meta_total",
+				BucketKey: "_count",
+				DocCount:  totalHitsSum,
+				Value:     float64(totalHitsSum),
+			})
+		}
+	}
+
 	tookMs := time.Since(start).Milliseconds()
 	if tookMs <= 0 {
 		tookMs = 1
@@ -2445,6 +2559,7 @@ func (s *Server) executeSearchRequest(
 			tSchema := s.getOrCompileReadOnlySchema(ctx, tName)
 			if tSchema != nil {
 				if h, found, err := s.backend.GetDocByID(ctx, tSchema.DorisDB, tSchema.DorisTable, id); err == nil && found {
+					h.Index = tName
 					return h
 				}
 			}
@@ -2553,7 +2668,7 @@ func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, aggs map[string]esas
 	for _, k := range order {
 		acc := merged[k]
 		spec := resolveAggSpecByPath(aggs, k.agg)
-		if (k.bucket == "_stats_avg" || spec.Avg != nil) && acc.count > 1 {
+		if (k.bucket == "_stats_avg" || spec.Avg != nil || spec.Percentiles != nil) && acc.count > 1 {
 			acc.row.Value /= float64(acc.count)
 			acc.row.DocCount = int64(acc.row.Value)
 		}
@@ -2567,7 +2682,10 @@ func (s *Server) handleCount(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil {
 		bodyBytes, _ := io.ReadAll(r.Body)
 		if len(bytes.TrimSpace(bodyBytes)) > 0 {
-			_ = json.Unmarshal(bodyBytes, &req)
+			if err := json.Unmarshal(bodyBytes, &req); err != nil {
+				writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+				return
+			}
 		}
 	}
 	applyURISearchParams(r, &req)
@@ -2772,8 +2890,24 @@ func buildAggsMap(
 		case spec.Nested != nil:
 			nestedObj := map[string]any{"doc_count": totalHits}
 			for subName, subSpec := range spec.SubAggs() {
-				subRows := bucketsByAgg[fullKey+"."+subName]
+				subRows := append([]AggRow(nil), bucketsByAgg[fullKey+"."+subName]...)
 				if subSpec.Terms != nil {
+					if len(subRows) > 1 {
+						sort.SliceStable(subRows, func(i, j int) bool {
+							ci, cj := subRows[i].effectiveCount(), subRows[j].effectiveCount()
+							if ci != cj {
+								return ci > cj
+							}
+							return subRows[i].BucketKey < subRows[j].BucketKey
+						})
+					}
+					limit := subSpec.Terms.Size
+					if limit <= 0 {
+						limit = 10
+					}
+					if len(subRows) > limit {
+						subRows = subRows[:limit]
+					}
 					b := make([]map[string]any, 0, len(subRows))
 					for _, r := range subRows {
 						b = append(b, map[string]any{
@@ -2838,10 +2972,14 @@ func buildAggsMap(
 				"avg":   0.0,
 				"sum":   0.0,
 			}
+			var cntVal int64
+			var sumVal float64
+			var hasSum bool
 			for _, r := range rows {
 				switch r.BucketKey {
 				case "_stats_count":
-					statsMap["count"] = r.effectiveCount()
+					cntVal = r.effectiveCount()
+					statsMap["count"] = cntVal
 				case "_stats_min":
 					statsMap["min"] = r.effectiveValue()
 				case "_stats_max":
@@ -2849,8 +2987,13 @@ func buildAggsMap(
 				case "_stats_avg":
 					statsMap["avg"] = r.effectiveValue()
 				case "_stats_sum":
-					statsMap["sum"] = r.effectiveValue()
+					sumVal = r.effectiveValue()
+					hasSum = true
+					statsMap["sum"] = sumVal
 				}
+			}
+			if cntVal > 0 && hasSum {
+				statsMap["avg"] = sumVal / float64(cntVal)
 			}
 			aggsOut[aggName] = statsMap
 		case spec.Percentiles != nil:
@@ -2884,6 +3027,13 @@ func buildAggsMap(
 			}
 			aggsOut[aggName] = map[string]any{"buckets": b}
 		case spec.Histogram != nil:
+			if len(rows) > 1 {
+				sort.SliceStable(rows, func(i, j int) bool {
+					ki, _ := strconv.ParseFloat(rows[i].BucketKey, 64)
+					kj, _ := strconv.ParseFloat(rows[j].BucketKey, 64)
+					return ki < kj
+				})
+			}
 			b := make([]map[string]any, 0, len(rows))
 			subAggs := spec.SubAggs()
 			for _, r := range rows {
@@ -2928,28 +3078,7 @@ func buildAggsMap(
 			}
 			aggsOut[aggName] = map[string]any{"buckets": b}
 		case spec.TopHits != nil:
-			limit := spec.TopHits.EffectiveSize()
-			if len(rows) > limit {
-				rows = rows[:limit]
-			}
-			topHitsList := make([]map[string]any, 0, len(rows))
-			for _, r := range rows {
-				docID := r.BucketKey
-				hitMap := map[string]any{
-					"_index": indexName,
-					"_type":  "_doc",
-					"_id":    docID,
-					"_score": 1.0,
-				}
-				if docLookup != nil {
-					if h := docLookup(docID); h != nil {
-						if spec.TopHits.Source == nil || !spec.TopHits.Source.Disabled {
-							hitMap["_source"] = filterSourceJSON(h.Source, spec.TopHits.Source)
-						}
-					}
-				}
-				topHitsList = append(topHitsList, hitMap)
-			}
+			topHitsList := buildTopHitsList(indexName, rows, spec.TopHits, docLookup)
 			aggsOut[aggName] = map[string]any{
 				"hits": map[string]any{
 					"total":     map[string]any{"value": len(topHitsList), "relation": "eq"},
@@ -2958,6 +3087,18 @@ func buildAggsMap(
 				},
 			}
 		case spec.Composite != nil:
+			if len(rows) > 1 {
+				sort.SliceStable(rows, func(i, j int) bool {
+					return rows[i].BucketKey < rows[j].BucketKey
+				})
+			}
+			compLimit := spec.Composite.Size
+			if compLimit <= 0 {
+				compLimit = 10
+			}
+			if len(rows) > compLimit {
+				rows = rows[:compLimit]
+			}
 			var srcNames []string
 			for _, srcMap := range spec.Composite.Sources {
 				var ks []string
@@ -2970,7 +3111,7 @@ func buildAggsMap(
 			buckets := make([]map[string]any, 0, len(rows))
 			var afterKey map[string]any
 			for _, r := range rows {
-				parts := strings.Split(r.BucketKey, "\x1f")
+				parts := splitCompositeBucketKey(r.BucketKey)
 				keyObj := make(map[string]any, len(srcNames))
 				for i, sn := range srcNames {
 					if i < len(parts) {
@@ -2991,6 +3132,90 @@ func buildAggsMap(
 		}
 	}
 	return aggsOut
+}
+
+func splitCompositeBucketKey(s string) []string {
+	if strings.Contains(s, "\x1f") {
+		return strings.Split(s, "\x1f")
+	}
+	if strings.Contains(s, "\\x1f") {
+		return strings.Split(s, "\\x1f")
+	}
+	if strings.Contains(s, "x1f") {
+		return strings.Split(s, "x1f")
+	}
+	return []string{s}
+}
+
+func trimSubAggBucketPrefix(bucketKey, parentBucketKey string) (string, bool) {
+	for _, sep := range []string{"\x1f", "\\x1f", "x1f"} {
+		prefix := parentBucketKey + sep
+		if strings.HasPrefix(bucketKey, prefix) {
+			return strings.TrimPrefix(bucketKey, prefix), true
+		}
+	}
+	return "", false
+}
+
+func buildTopHitsList(
+	defaultIndex string,
+	rows []AggRow,
+	spec *esast.TopHitsAggSpec,
+	docLookup func(string) *HitRow,
+) []map[string]any {
+	limit := spec.EffectiveSize()
+	type candidate struct {
+		docID string
+		hit   *HitRow
+	}
+	candidates := make([]candidate, 0, len(rows))
+	for _, r := range rows {
+		var h *HitRow
+		if docLookup != nil {
+			h = docLookup(r.BucketKey)
+		}
+		candidates = append(candidates, candidate{docID: r.BucketKey, hit: h})
+	}
+	if len(candidates) > 1 && len(spec.Sort) > 0 {
+		sort.SliceStable(candidates, func(i, j int) bool {
+			var ha, hb HitRow
+			ha.ID = candidates[i].docID
+			hb.ID = candidates[j].docID
+			if candidates[i].hit != nil {
+				ha = *candidates[i].hit
+			}
+			if candidates[j].hit != nil {
+				hb = *candidates[j].hit
+			}
+			if cmp := compareHitRowsBySort(ha, hb, spec.Sort, nil); cmp != 0 {
+				return cmp < 0
+			}
+			return ha.ID < hb.ID
+		})
+	}
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	topHitsList := make([]map[string]any, 0, len(candidates))
+	for _, c := range candidates {
+		hitIdx := defaultIndex
+		if c.hit != nil && c.hit.Index != "" {
+			hitIdx = c.hit.Index
+		}
+		hitMap := map[string]any{
+			"_index": hitIdx,
+			"_type":  "_doc",
+			"_id":    c.docID,
+			"_score": 1.0,
+		}
+		if c.hit != nil {
+			if spec.Source == nil || !spec.Source.Disabled {
+				hitMap["_source"] = filterSourceJSON(c.hit.Source, spec.Source)
+			}
+		}
+		topHitsList = append(topHitsList, hitMap)
+	}
+	return topHitsList
 }
 
 func attachSubAggsToBucket(
@@ -3025,26 +3250,36 @@ func attachSubAggsToBucket(
 			}
 			bucketMap[subName] = map[string]any{"value": val}
 		case subSpec.Terms != nil:
-			prefix := parentBucketKey + "\x1f"
-			var childBuckets []map[string]any
+			var matchingRows []AggRow
+			for _, r := range subRows {
+				if childKey, ok := trimSubAggBucketPrefix(r.BucketKey, parentBucketKey); ok {
+					cp := r
+					cp.BucketKey = childKey
+					matchingRows = append(matchingRows, cp)
+				}
+			}
+			if len(matchingRows) > 1 {
+				sort.SliceStable(matchingRows, func(i, j int) bool {
+					ci, cj := matchingRows[i].effectiveCount(), matchingRows[j].effectiveCount()
+					if ci != cj {
+						return ci > cj
+					}
+					return matchingRows[i].BucketKey < matchingRows[j].BucketKey
+				})
+			}
 			limit := subSpec.Terms.Size
 			if limit <= 0 {
 				limit = 10
 			}
-			for _, r := range subRows {
-				if strings.HasPrefix(r.BucketKey, prefix) {
-					childKey := strings.TrimPrefix(r.BucketKey, prefix)
-					childBuckets = append(childBuckets, map[string]any{
-						"key":       childKey,
-						"doc_count": r.effectiveCount(),
-					})
-					if len(childBuckets) >= limit {
-						break
-					}
-				}
+			if len(matchingRows) > limit {
+				matchingRows = matchingRows[:limit]
 			}
-			if childBuckets == nil {
-				childBuckets = []map[string]any{}
+			childBuckets := make([]map[string]any, 0, len(matchingRows))
+			for _, r := range matchingRows {
+				childBuckets = append(childBuckets, map[string]any{
+					"key":       r.BucketKey,
+					"doc_count": r.effectiveCount(),
+				})
 			}
 			bucketMap[subName] = map[string]any{
 				"doc_count_error_upper_bound": 0,
@@ -3052,34 +3287,15 @@ func attachSubAggsToBucket(
 				"buckets":                     childBuckets,
 			}
 		case subSpec.TopHits != nil:
-			prefix := parentBucketKey + "\x1f"
-			var topHitsList []map[string]any
-			limit := subSpec.TopHits.EffectiveSize()
+			var matchingRows []AggRow
 			for _, r := range subRows {
-				if strings.HasPrefix(r.BucketKey, prefix) {
-					docID := strings.TrimPrefix(r.BucketKey, prefix)
-					hitMap := map[string]any{
-						"_index": indexName,
-						"_type":  "_doc",
-						"_id":    docID,
-						"_score": 1.0,
-					}
-					if docLookup != nil {
-						if h := docLookup(docID); h != nil {
-							if subSpec.TopHits.Source == nil || !subSpec.TopHits.Source.Disabled {
-								hitMap["_source"] = filterSourceJSON(h.Source, subSpec.TopHits.Source)
-							}
-						}
-					}
-					topHitsList = append(topHitsList, hitMap)
-					if len(topHitsList) >= limit {
-						break
-					}
+				if docID, ok := trimSubAggBucketPrefix(r.BucketKey, parentBucketKey); ok {
+					cp := r
+					cp.BucketKey = docID
+					matchingRows = append(matchingRows, cp)
 				}
 			}
-			if topHitsList == nil {
-				topHitsList = []map[string]any{}
-			}
+			topHitsList := buildTopHitsList(indexName, matchingRows, subSpec.TopHits, docLookup)
 			bucketMap[subName] = map[string]any{
 				"hits": map[string]any{
 					"total":     map[string]any{"value": len(topHitsList), "relation": "eq"},
@@ -3242,17 +3458,28 @@ func buildHighlightMap(raw json.RawMessage, req *esast.SearchRequest) map[string
 	if len(terms) == 0 {
 		return nil
 	}
-	var compiledRegexes []*regexp.Regexp
+	var quotedTerms []string
+	seenTerms := make(map[string]struct{}, len(terms))
 	for _, term := range terms {
 		term = strings.Trim(term, "*?\"")
 		if len(term) == 0 {
 			continue
 		}
-		if re, err := regexp.Compile("(?i)" + regexp.QuoteMeta(term)); err == nil {
-			compiledRegexes = append(compiledRegexes, re)
+		lc := strings.ToLower(term)
+		if _, exists := seenTerms[lc]; exists {
+			continue
 		}
+		seenTerms[lc] = struct{}{}
+		quotedTerms = append(quotedTerms, regexp.QuoteMeta(term))
 	}
-	if len(compiledRegexes) == 0 {
+	if len(quotedTerms) == 0 {
+		return nil
+	}
+	sort.SliceStable(quotedTerms, func(i, j int) bool {
+		return len(quotedTerms[i]) > len(quotedTerms[j])
+	})
+	combinedRegex, err := regexp.Compile("(?i)(" + strings.Join(quotedTerms, "|") + ")")
+	if err != nil {
 		return nil
 	}
 	var doc map[string]any
@@ -3269,17 +3496,56 @@ func buildHighlightMap(raw json.RawMessage, req *esast.SearchRequest) map[string
 	}
 
 	out := make(map[string][]string)
+	var allLeafPaths map[string][]string
 	for field := range req.Highlight.Fields {
 		cleanField := strings.TrimSuffix(strings.TrimSuffix(field, ".keyword"), ".ngram")
+		if strings.Contains(cleanField, "*") {
+			if allLeafPaths == nil {
+				allLeafPaths = make(map[string][]string)
+				collectAllLeafStringPaths(doc, "", allLeafPaths)
+			}
+			for leafPath, vals := range allLeafPaths {
+				if matchWildcardPattern(cleanField, leafPath) {
+					for _, v := range vals {
+						highlighted, matched := highlightWithCombinedRegex(v, combinedRegex, preTag, postTag)
+						if matched {
+							out[leafPath] = append(out[leafPath], highlighted)
+						}
+					}
+				}
+			}
+			continue
+		}
 		vals := collectStringValuesAtPath(doc, strings.Split(cleanField, "."))
 		for _, v := range vals {
-			highlighted, matched := highlightWithRegexes(v, compiledRegexes, preTag, postTag)
+			highlighted, matched := highlightWithCombinedRegex(v, combinedRegex, preTag, postTag)
 			if matched {
 				out[field] = append(out[field], highlighted)
 			}
 		}
 	}
 	return out
+}
+
+func collectAllLeafStringPaths(node any, prefix string, out map[string][]string) {
+	switch curr := node.(type) {
+	case map[string]any:
+		for k, v := range curr {
+			full := k
+			if prefix != "" {
+				full = prefix + "." + k
+			}
+			collectAllLeafStringPaths(v, full, out)
+		}
+	case []any:
+		for _, item := range curr {
+			collectAllLeafStringPaths(item, prefix, out)
+		}
+	case string:
+		if prefix != "" {
+			out[prefix] = append(out[prefix], curr)
+		}
+	}
 }
 
 func collectStringValuesAtPath(node any, path []string) []string {
@@ -3312,18 +3578,14 @@ func collectStringValuesAtPath(node any, path []string) []string {
 	return nil
 }
 
-func highlightWithRegexes(text string, regexes []*regexp.Regexp, preTag, postTag string) (string, bool) {
-	result := text
-	matched := false
-	for _, re := range regexes {
-		if re.MatchString(result) {
-			matched = true
-			result = re.ReplaceAllStringFunc(result, func(m string) string {
-				return preTag + m + postTag
-			})
-		}
+func highlightWithCombinedRegex(text string, re *regexp.Regexp, preTag, postTag string) (string, bool) {
+	if re == nil || !re.MatchString(text) {
+		return text, false
 	}
-	return result, matched
+	result := re.ReplaceAllStringFunc(text, func(m string) string {
+		return preTag + m + postTag
+	})
+	return result, true
 }
 
 func extractQueryTerms(q *esast.Query) []string {
@@ -3336,6 +3598,20 @@ func collectTermsFromQuery(q *esast.Query, out *[]string) {
 	if q == nil {
 		return
 	}
+	for _, te := range q.Term {
+		if s := strings.TrimSpace(fmt.Sprintf("%v", te.Value)); s != "" {
+			*out = append(*out, s)
+		}
+	}
+	if q.Terms != nil {
+		for _, vals := range q.Terms.Fields {
+			for _, v := range vals {
+				if s := strings.TrimSpace(fmt.Sprintf("%v", v)); s != "" {
+					*out = append(*out, s)
+				}
+			}
+		}
+	}
 	for _, me := range q.Match {
 		*out = append(*out, strings.Fields(fmt.Sprintf("%v", me.Query))...)
 	}
@@ -3347,6 +3623,11 @@ func collectTermsFromQuery(q *esast.Query, out *[]string) {
 	for _, pe := range q.MatchPhrasePrefix {
 		if pe.Query != "" {
 			*out = append(*out, pe.Query)
+		}
+	}
+	for _, pe := range q.MatchBoolPrefix {
+		if pe.Query != "" {
+			*out = append(*out, strings.Fields(pe.Query)...)
 		}
 	}
 	if q.MultiMatch != nil && q.MultiMatch.Query != nil {
@@ -3387,6 +3668,17 @@ func collectTermsFromQuery(q *esast.Query, out *[]string) {
 		for i := range q.Bool.Filter {
 			collectTermsFromQuery(&q.Bool.Filter[i], out)
 		}
+	}
+	if q.DisMax != nil {
+		for i := range q.DisMax.Queries {
+			collectTermsFromQuery(&q.DisMax.Queries[i], out)
+		}
+	}
+	if q.Boosting != nil {
+		collectTermsFromQuery(&q.Boosting.Positive, out)
+	}
+	if q.Nested != nil {
+		collectTermsFromQuery(&q.Nested.Query, out)
 	}
 	if q.FunctionScore != nil && q.FunctionScore.Query != nil {
 		collectTermsFromQuery(q.FunctionScore.Query, out)

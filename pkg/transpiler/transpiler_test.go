@@ -609,3 +609,140 @@ func TestCriticalBug2_FulltextInSelect_MinimumShouldMatch_LuceneRangeAndExists_D
 		t.Fatalf("expected Lucene mixed AND/OR + ^boost to strip boost suffix and preserve OR branch, got:\n%s", luceneMixedPlan.HitsSQL)
 	}
 }
+
+func TestTranspiler_DeepEvalCorrectnessFixes(t *testing.T) {
+	mappingJSON := `{
+		"properties": {
+			"host": {
+				"type": "text",
+				"fields": {
+					"keyword": {"type": "keyword", "normalizer": "lowercase"}
+				}
+			},
+			"tags": {"type": "keyword", "multi_valued": true},
+			"created_at": {"type": "date"},
+			"views": {"type": "integer"},
+			"comments": {
+				"type": "nested",
+				"properties": {
+					"author": {"type": "keyword", "normalizer": "lowercase"},
+					"labels": {"type": "keyword", "multi_valued": true}
+				}
+			}
+		}
+	}`
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(mappingJSON), &spec); err != nil {
+		t.Fatal(err)
+	}
+	idxSchema := schema.CompileIndexSchema("logs_db", "deep_eval_idx", &spec)
+	tr := NewTranspiler(idxSchema, TranspilerOptions{})
+
+	// 1. preferKeyword queries (term, terms, prefix, wildcard, search_after) on text field with .keyword lowercase normalizer
+	req1JSON := `{
+		"query": {
+			"bool": {
+				"must": [
+					{"term": {"host": "Web-01"}},
+					{"terms": {"host": ["Web-01", "API-02"]}},
+					{"prefix": {"host": "Web-"}},
+					{"wildcard": {"host": "Web*"}},
+					{"range": {"tags": {"gte": "b", "lte": "z"}}},
+					{"range": {"created_at": {"gte": 1700000000, "format": "epoch_second"}}}
+				],
+				"should": [
+					{"match": {"host": "web"}},
+					{"match": {"host": "api"}}
+				],
+				"minimum_should_match": "75%"
+			}
+		},
+		"sort": [{"host": "asc"}],
+		"search_after": ["Web-01"],
+		"aggs": {
+			"missing_host": {
+				"missing": {"field": "host"},
+				"aggs": {
+					"avg_views": {"avg": {"field": "views"}}
+				}
+			}
+		}
+	}`
+	var req1 esast.SearchRequest
+	if err := json.Unmarshal([]byte(req1JSON), &req1); err != nil {
+		t.Fatal(err)
+	}
+	plan1, err := tr.BuildSearchPlan(&req1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"`f__host__keyword` = 'web-01'",
+		"`f__host__keyword` IN ('web-01', 'api-02')",
+		"`f__host__keyword` LIKE 'web-%'",
+		"array_exists(_x -> _x >= 'b' AND _x <= 'z', `f__tags`)",
+		"`f__created_at` >= 1700000000000",
+		"`f__host__keyword` > 'web-01'",
+	} {
+		if !strings.Contains(plan1.HitsSQL, want) {
+			t.Fatalf("expected plan1.HitsSQL to contain %q, got:\n%s", want, plan1.HitsSQL)
+		}
+	}
+	if !strings.Contains(plan1.AggsSQL, "missing_host.avg_views") {
+		t.Fatalf("expected missing aggregation to compile sub-aggregations, got:\n%s", plan1.AggsSQL)
+	}
+
+	// 2. function_score multi-function multiply & empty match query
+	req2JSON := `{
+		"query": {
+			"function_score": {
+				"query": {"match": {"host": ""}},
+				"score_mode": "multiply",
+				"functions": [
+					{"weight": 2},
+					{"weight": 3}
+				]
+			}
+		}
+	}`
+	var req2 esast.SearchRequest
+	if err := json.Unmarshal([]byte(req2JSON), &req2); err != nil {
+		t.Fatal(err)
+	}
+	plan2, err := tr.BuildSearchPlan(&req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan2.HitsSQL, "WHERE `__DORIS_DELETE_SIGN__` = 0 AND (FALSE)") || !strings.Contains(plan2.HitsSQL, "2.0000 * 3.0000") || strings.Contains(plan2.HitsSQL, "1.0 + (2") {
+		t.Fatalf("expected empty match to emit FALSE and function_score multiply to emit 2.0000 * 3.0000, got:\n%s", plan2.HitsSQL)
+	}
+
+	// 3. Nested terms on multi-valued & normalizer fields + single-quote prefilter escaping
+	req3JSON := `{
+		"query": {
+			"nested": {
+				"path": "comments",
+				"query": {
+					"bool": {
+						"must": [
+							{"term": {"comments.author": "O'Brien"}},
+							{"terms": {"comments.labels": ["Urgent", "Bug"]}}
+						]
+					}
+				}
+			}
+		}
+	}`
+	var req3 esast.SearchRequest
+	if err := json.Unmarshal([]byte(req3JSON), &req3); err != nil {
+		t.Fatal(err)
+	}
+	plan3, err := tr.BuildSearchPlan(&req3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan3.HitsSQL, "array_contains(`n__comments__author`, 'o''brien')") ||
+		!strings.Contains(plan3.HitsSQL, "arrays_overlap(`n__comments__labels`, ['Urgent', 'Bug'])") {
+		t.Fatalf("expected plan3.HitsSQL to contain nested prefilter and arrays_overlap, got:\n%s", plan3.HitsSQL)
+	}
+}
