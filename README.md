@@ -1,6 +1,8 @@
 # doris-es-proxy
 
 [![CI](https://github.com/es2doris/doris-es-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/es2doris/doris-es-proxy/actions/workflows/ci.yml)
+[![Live Apache Doris E2E](https://github.com/es2doris/doris-es-proxy/actions/workflows/e2e-live-doris.yml/badge.svg)](https://github.com/es2doris/doris-es-proxy/actions/workflows/e2e-live-doris.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/es2doris/doris-es-proxy)](https://goreportcard.com/report/github.com/es2doris/doris-es-proxy)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 **`doris-es-proxy`** is a stateless, wire-compatible **Elasticsearch / OpenSearch HTTP REST & Query DSL adapter** backed 100% by **Apache Doris** (3.x / 4.x+).
@@ -196,12 +198,32 @@ SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM (
 
 | Category | Supported Endpoints & Features | Status |
 | :--- | :--- | :--- |
-| **Cluster, Cat & GUI Admin** | `GET /`, `/_cluster/health`, `/_cluster/settings`, `/_nodes`, `/_stats`, `/{index}/_stats`, `/_resolve/index/{name}`, `/{index}/_search_shards`, `/_cat/indices`, `/_cat/aliases`, `/_cat/nodes`, `/_cat/shards`, `/_cat/count`, `PUT/GET/HEAD/DELETE /{index}`, `/_mapping`, `/_settings`, `/_aliases`, `/{alias}/_rollover`, `/_index_template`, `/_ingest/pipeline/{id}`, `/_field_caps`, `/_validate/query`, `/_analyze`, `/_refresh`, `/healthz`, `/readyz`, `/metrics`, CORS (`OPTIONS` preflight), `Content-Encoding: gzip`, `vnd.elasticsearch+json; compatible-with=7\|8\|9` | ✅ Supported |
-| **Ingestion & Mutations** | `POST /_bulk` (`index`, `create`, `update`, `delete` with per-item failure isolation, batched lookups & **Dynamic Mapping Inference**), `PUT/POST/GET/HEAD/DELETE /{index}/_doc/{id}`, `GET /{index}/_source/{id}`, `POST /_mget`, `POST /{index}/_update/{id}`, `POST /{index}/_update_by_query`, `POST /{index}/_delete_by_query`, `POST /_reindex` | ✅ Supported |
-| **Full-Text & Term DSL** | `bool`, `dis_max`, `boosting`, `match`, `match_phrase` (+ `slop`), `match_phrase_prefix`, `match_bool_prefix`, `multi_match`, `query_string`, `simple_query_string`, `term` (+ `case_insensitive`), `terms`, `ids`, `range` (+ date math), `exists`, `prefix`, `wildcard`, `regexp` | ✅ Supported |
-| **Advanced Search & Scoring** | Vector / kNN search (`dense_vector`, `knn_vector` $\rightarrow$ Doris `ARRAY<FLOAT>` + `COSINE_DISTANCE` / `L2_DISTANCE`, top-level `knn`, `query.knn`, hybrid `query` + `knn`), correlated `nested` queries, `function_score` (`field_value_factor`, `weight`, `score_mode`, `boost_mode`), `constant_score`, `post_filter`, `_source` filtering (`includes`/`excludes`), `highlight`, `collapse`, `search_after` (null-safe), Point-in-Time (`POST /{index}/_pit`, `DELETE /_pit`), stateless `/_search/scroll`, `/_msearch`, `/_count` | ✅ Supported |
+| **Cluster, Cat & GUI Admin** | `GET /`, `/_cluster/health`, `/_cluster/settings`, `/_nodes`, `/_stats`, `/{index}/_stats`, `/_resolve/index/{name}`, `/{index}/_search_shards`, `/_cat/indices`, `/_cat/aliases`, `/_cat/nodes`, `/_cat/shards`, `/_cat/count`, `/_security/_authenticate`, `/_xpack`, `PUT/GET/HEAD/DELETE /{index}`, `/_mapping`, `/_settings`, `/_aliases`, `/{alias}/_rollover`, `/_index_template`, `/_ingest/pipeline/{id}`, `/_field_caps`, `/_validate/query`, `/_analyze`, `/_refresh`, `/healthz`, `/readyz`, `/metrics`, CORS (`OPTIONS` preflight), `Content-Encoding: gzip`, `vnd.elasticsearch+json; compatible-with=7\|8\|9` | ✅ Supported |
+| **Ingestion & Mutations** | `POST /_bulk` (`index`, `create`, `update`, `delete` with per-item failure isolation, batched lookups, `?pipeline=<id>` execution & **Dynamic Mapping Inference**), `PUT/POST/GET/HEAD/DELETE /{index}/_doc/{id}`, `GET /{index}/_source/{id}`, `POST /_mget`, `POST /{index}/_update/{id}`, `POST /{index}/_update_by_query`, `POST /{index}/_delete_by_query`, `POST /_reindex` | ✅ Supported |
+| **Full-Text & Term DSL** | `bool`, `dis_max`, `boosting`, `match`, `match_phrase` (+ `slop`), `match_phrase_prefix`, `match_bool_prefix`, `multi_match`, `query_string` (+ `[min TO max]` & `_exists_:field`), `simple_query_string`, `term` (+ `case_insensitive`), `terms`, `ids`, `range` (+ date math), `exists`, `prefix`, `wildcard`, `regexp` | ✅ Supported |
+| **Advanced Search & Scoring** | Vector / kNN search (`dense_vector`, `knn_vector` $\rightarrow$ Doris `ARRAY<FLOAT>` + `COSINE_DISTANCE` / `L2_DISTANCE` / `INNER_PRODUCT`, top-level `knn`, `query.knn`, hybrid `query` + `knn`), correlated `nested` queries, `function_score` (`field_value_factor`, `weight`, `score_mode`, `boost_mode`), `constant_score`, `post_filter`, `_source` filtering (`includes`/`excludes`), `highlight`, `collapse`, `search_after` (null-safe), Point-in-Time (`POST /{index}/_pit`, `DELETE /_pit`), stateless `/_search/scroll`, `/_msearch`, `/_count` | ✅ Supported |
 | **Aggregations & Sub-Aggs** | `terms` (scalar & array), `nested`, `date_histogram`, `histogram`, `range`, `date_range` (+ date math), `filter`, `filters` (named multi-bucket), `missing`, `composite` (multi-column keyset pagination), `top_hits`, `cardinality`, `value_count`, `stats`, `percentiles`, `avg`, `sum`, `min`, `max`, plus **1-level Sub-Aggregations** (including `top_hits` inside buckets) | ✅ Supported |
-| **Doris Introspection & FinOps** | `GET /_doris/ui` (Interactive Workbench + 1-Click Demo Seed + 1-Click Auto-Promote), `POST /{index}/_doris/explain`, `GET /{index}/_doris/ddl`, `GET /_doris/slowlog` (Auto-Indexing Advisor), `POST /{index}/_doris/promote` (Live Column + Inverted Index Promotion + `--auto-promote`), `GET /_doris/shadow_stats` (`--shadow-es-url`), `?doris_explain=true`, `doris-es-proxy transpile`, `doris-es-proxy ddl`, `doris-es-proxy doctor`, `doris-es-proxy migrate-schema` | ✅ Supported |
+| **Doris Introspection & FinOps** | `GET /_doris/ui` (Interactive Workbench + 1-Click Demo Seed + 1-Click Auto-Promote), `POST /{index}/_doris/explain`, `GET /{index}/_doris/ddl`, `GET /_doris/slowlog` (Auto-Indexing Advisor), `POST /{index}/_doris/promote` (Live Column + Inverted Index Promotion + existing document backfill + `--auto-promote`), `GET /_doris/shadow_stats` (`--shadow-es-url`), `?doris_explain=true`, `doris-es-proxy transpile`, `doris-es-proxy ddl`, `doris-es-proxy doctor`, `doris-es-proxy migrate-schema` | ✅ Supported |
+
+---
+
+## Transpiler & Shredder Micro-Benchmarks
+
+Run `nix develop -c make bench` (`go test -bench=. -benchmem ./...`) to reproduce:
+
+| Benchmark | Latency (`ns/op`) | Throughput | Memory (`B/op`) | Allocations (`allocs/op`) |
+| :--- | :--- | :--- | :--- | :--- |
+| `BenchmarkBuildSearchPlan_OpenMetadataComplex` (Full-Text + Correlated `nested` + `function_score` + 3 Multi-Facet CTE `aggs`) | **~20.5 µs** | **~48,700 plans/sec/core** | 19.6 KB | 290 |
+| `BenchmarkShredDocument_OpenMetadataTable` (Promoted scalars + `ARRAY<STRING>` + correlated `nested` arrays + `_doc` `VARIANT`) | **~9.7 µs** | **~103,000 docs/sec/core** | 11.4 KB | 124 |
+
+## Architectural Scope & Known Trade-offs
+
+| Area | `doris-es-proxy` + Apache Doris Behavior | When to Keep Dedicated Elasticsearch |
+| :--- | :--- | :--- |
+| **Primary Workload Fit** | Metadata catalogs (**OpenMetadata**, **DataHub**), observability/log search, and hybrid analytical + full-text + vector workloads already running Apache Doris. | Applications relying on custom Java Elasticsearch plugins or custom TokenFilters. |
+| **Relevance Scoring** | Combines Doris Inverted Index predicates (`MATCH_ANY` / `MATCH_ALL` / `MATCH_PHRASE`) with deterministic field-weighted SQL scoring, `function_score`, and vector distance (`COSINE_DISTANCE` / `L2_DISTANCE` / `INNER_PRODUCT`). | Workloads requiring custom Lucene `Similarity` classes or custom `script_score` Java plugins. |
+| **Aggregation Depth** | Supports top-level and 1-level nested sub-aggregations (`date_histogram` / `terms` / `range` / `filters` $\rightarrow$ metric or `top_hits`) in a single Nereids Multi-Cast CTE scan. | Arbitrary $N$-level deep recursive bucket trees or `moving_avg` pipeline aggregations. |
+| **Painless Scripting** | Embedded bounded AST interpreter supporting document mutations (`ctx._source.*`, `if/else`, `for`, `putAll`, `addAll`, `removeIf`, `ctx.op`) for `_update` and `_update_by_query`. | Full JVM Painless bytecode compilation or arbitrary `java.time.*` / regex class reflection. |
 
 ---
 

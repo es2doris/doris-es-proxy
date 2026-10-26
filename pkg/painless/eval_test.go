@@ -162,3 +162,33 @@ func TestEvalPainless_PutAll_AddAll_CompoundAssign_Loops_And_Upserts(t *testing.
 		t.Fatalf("expected deleted, got %q (err=%v)", delRes, err)
 	}
 }
+
+func TestEvalCondition_PrecedenceAndRelationalOperators(t *testing.T) {
+	initial := `{"a":true,"b":true,"c":false,"count":15}`
+	req := &UpdateRequest{
+		Script: &ScriptSpec{
+			Source: `
+				if (ctx._source.a == true || ctx._source.b == true && ctx._source.c == true) {
+					ctx._source.precedence_ok = true;
+				}
+				if (ctx._source.count >= 15 && ctx._source.count < 20 && ctx._source.count > 10 && ctx._source.count <= 15) {
+					ctx._source.range_ok = true;
+				}
+			`,
+		},
+	}
+	updated, opRes, err := ApplyUpdateWithResult(json.RawMessage(initial), req, true)
+	if err != nil || opRes != "updated" {
+		t.Fatalf("ApplyUpdateWithResult failed: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(updated, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc["precedence_ok"] != true {
+		t.Fatalf("expected true || true && false to evaluate to true (`&&` binds tighter than `||`), got: %+v", doc)
+	}
+	if doc["range_ok"] != true {
+		t.Fatalf("expected relational operators (>=, <=, >, <) to evaluate to true, got: %+v", doc)
+	}
+}

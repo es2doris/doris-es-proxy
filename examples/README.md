@@ -16,7 +16,7 @@ Every Elasticsearch REST call (`PUT /table_search_index`, `POST /_bulk`, `POST /
 
 ## Option 2: Live Apache Doris Cluster via Docker Compose
 
-Start a real Apache Doris FE + BE all-in-one container (`apache/doris:doris-all-in-one-2.1.7`) plus `doris-es-proxy` on `:9200`:
+Start a real Apache Doris FE + BE all-in-one container (`apache/doris:all-in-one-4.1.3`) plus `doris-es-proxy` on `:9200`:
 
 ```bash
 docker compose up -d --build

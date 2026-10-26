@@ -19,6 +19,8 @@ name: Live Apache Doris E2E
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
 
 permissions:
   contents: read

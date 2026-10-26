@@ -560,3 +560,121 @@ func TestServerAllRESTEndpointsAndShadowVerification(t *testing.T) {
 		}
 	}
 }
+
+func TestCriticalBugs_FieldPromoteBackfill_MultiIndexSortAndAggs_IngestPipeline_DynamicMultiValued(t *testing.T) {
+	srv := NewServer("es_compat", NewMemoryBackend(false), transpiler.TranspilerOptions{})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	doReq := func(method, path, body string) (int, string) {
+		var rdr io.Reader
+		if body != "" {
+			rdr = strings.NewReader(body)
+		}
+		req, err := http.NewRequest(method, ts.URL+path, rdr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return resp.StatusCode, string(b)
+	}
+
+	// 1. Security & X-Pack discovery endpoints
+	if code, body := doReq(http.MethodGet, "/_security/_authenticate", ""); code != http.StatusOK || !strings.Contains(body, `"username"`) {
+		t.Fatalf("unexpected /_security/_authenticate: %d %s", code, body)
+	}
+	if code, body := doReq(http.MethodGet, "/_xpack", ""); code != http.StatusOK || !strings.Contains(body, `"build"`) {
+		t.Fatalf("unexpected /_xpack: %d %s", code, body)
+	}
+
+	// 2. Critical Bug #1: Read-before-create (GET missing doc before PUT /{index}) + Field Promotion Backfill
+	_, _ = doReq(http.MethodGet, "/promo_idx/_doc/nonexistent", "")
+	if code, body := doReq(http.MethodPut, "/promo_idx", `{"mappings":{"properties":{"service":{"type":"keyword"}}}}`); code != http.StatusOK {
+		t.Fatalf("PUT /promo_idx failed: %d %s", code, body)
+	}
+	// Index a document with both mapped `service` and unmapped `region` + multi-valued `custom_tags`
+	if code, body := doReq(http.MethodPut, "/promo_idx/_doc/1?refresh=true", `{"service":"checkout","region":"us-east-1","custom_tags":["alpha","beta"]}`); code != http.StatusCreated {
+		t.Fatalf("PUT doc failed: %d %s", code, body)
+	}
+	// Promote `region` via POST /promo_idx/_doris/promote and verify existing doc 1 is backfilled and searchable!
+	if code, body := doReq(http.MethodPost, "/promo_idx/_doris/promote", `{"field":"region","type":"keyword"}`); code != http.StatusOK {
+		t.Fatalf("POST /promo_idx/_doris/promote failed: %d %s", code, body)
+	}
+	if code, body := doReq(http.MethodPost, "/promo_idx/_search", `{"query":{"term":{"region":"us-east-1"}}}`); code != http.StatusOK || !strings.Contains(body, `"_id":"1"`) {
+		t.Fatalf("expected promoted field `region` to backfill existing doc 1, got: %d %s", code, body)
+	}
+	// Test dynamic multi-valued array inference on a dynamically created index
+	if code, body := doReq(http.MethodPut, "/dyn_array_idx/_doc/d1?refresh=true", `{"custom_tags":["alpha","beta"],"vec":[0.9,0.1,0.0]}`); code != http.StatusCreated {
+		t.Fatalf("PUT /dyn_array_idx/_doc/d1 failed: %d %s", code, body)
+	}
+	if code, body := doReq(http.MethodPost, "/dyn_array_idx/_search", `{"query":{"term":{"custom_tags":"beta"}}}`); code != http.StatusOK || !strings.Contains(body, `"_id":"d1"`) {
+		t.Fatalf("expected dynamically inferred multi-valued array `custom_tags` to match second element 'beta', got: %d %s", code, body)
+	}
+
+	// 3. Critical Bug #3: Multi-index search sort + 0-doc index stats.min preservation
+	_, _ = doReq(http.MethodPut, "/multi-a", `{"mappings":{"properties":{"latency":{"type":"long"},"svc":{"type":"keyword"}}}}`)
+	_, _ = doReq(http.MethodPut, "/multi-b", `{"mappings":{"properties":{"latency":{"type":"long"},"svc":{"type":"keyword"}}}}`)
+	_, _ = doReq(http.MethodPut, "/multi-empty", `{"mappings":{"properties":{"latency":{"type":"long"},"svc":{"type":"keyword"}}}}`)
+	_, _ = doReq(http.MethodPut, "/multi-a/_doc/a1?refresh=true", `{"latency":100,"svc":"api"}`)
+	_, _ = doReq(http.MethodPut, "/multi-b/_doc/b1?refresh=true", `{"latency":500,"svc":"web"}`)
+
+	code, multiBody := doReq(http.MethodPost, "/multi-*/_search", `{
+		"sort": [{"latency": "desc"}],
+		"aggs": {
+			"lat_stats": {"stats": {"field": "latency"}},
+			"by_svc": {"terms": {"field": "svc", "size": 1}}
+		}
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("multi-index search failed: %d %s", code, multiBody)
+	}
+	var multiResp map[string]any
+	if err := json.Unmarshal([]byte(multiBody), &multiResp); err != nil {
+		t.Fatal(err)
+	}
+	hitsObj := multiResp["hits"].(map[string]any)
+	hitsArr := hitsObj["hits"].([]any)
+	if len(hitsArr) != 2 || hitsArr[0].(map[string]any)["_id"] != "b1" {
+		t.Fatalf("expected multi-index sort by latency desc to return b1 (500) before a1 (100), got: %s", multiBody)
+	}
+	aggsObj := multiResp["aggregations"].(map[string]any)
+	latStats := aggsObj["lat_stats"].(map[string]any)
+	if latStats["min"] != float64(100) || latStats["max"] != float64(500) || latStats["avg"] != float64(300) {
+		t.Fatalf("expected multi-index stats with empty index to have min=100, max=500, avg=300, got: %+v", latStats)
+	}
+	bySvc := aggsObj["by_svc"].(map[string]any)["buckets"].([]any)
+	if len(bySvc) != 1 {
+		t.Fatalf("expected multi-index terms size:1 to cap merged buckets to 1, got: %+v", bySvc)
+	}
+
+	// 4. Ingest pipeline execution on PUT /_doc?pipeline=... and POST /_bulk?pipeline=...
+	_, _ = doReq(http.MethodPut, "/_ingest/pipeline/enrich", `{
+		"description": "normalize and enrich",
+		"processors": [
+			{"set": {"field": "env", "value": "production"}},
+			{"lowercase": {"field": "host"}},
+			{"trim": {"field": "msg"}},
+			{"rename": {"field": "old_key", "target_field": "new_key"}},
+			{"remove": {"field": "secret"}}
+		]
+	}`)
+	if code, body := doReq(http.MethodPut, "/ingest_idx/_doc/p1?pipeline=enrich&refresh=true", `{"host":"WEB-01","msg":"  hello  ","old_key":"val","secret":"dropme"}`); code != http.StatusCreated {
+		t.Fatalf("PUT with pipeline failed: %d %s", code, body)
+	}
+	if code, body := doReq(http.MethodGet, "/ingest_idx/_doc/p1", ""); code != http.StatusOK ||
+		!strings.Contains(body, `"env":"production"`) ||
+		!strings.Contains(body, `"host":"web-01"`) ||
+		!strings.Contains(body, `"msg":"hello"`) ||
+		!strings.Contains(body, `"new_key":"val"`) ||
+		strings.Contains(body, `"secret"`) {
+		t.Fatalf("unexpected document after ingest pipeline: %d %s", code, body)
+	}
+}

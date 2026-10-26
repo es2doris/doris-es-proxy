@@ -710,6 +710,99 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) applyIngestPipelineIfPresent(pipelineID string, raw json.RawMessage) json.RawMessage {
+	pipelineID = strings.TrimSpace(pipelineID)
+	if pipelineID == "" || len(bytes.TrimSpace(raw)) == 0 {
+		return raw
+	}
+	s.mu.RLock()
+	pipe, ok := s.pipelines[pipelineID]
+	s.mu.RUnlock()
+	if !ok || pipe == nil {
+		return raw
+	}
+	procs, _ := pipe["processors"].([]any)
+	if len(procs) == 0 {
+		return raw
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var doc map[string]any
+	if err := dec.Decode(&doc); err != nil || doc == nil {
+		return raw
+	}
+	mutated := false
+	for _, p := range procs {
+		pMap, ok := p.(map[string]any)
+		if !ok {
+			continue
+		}
+		if setSpec, ok := pMap["set"].(map[string]any); ok {
+			if field, _ := setSpec["field"].(string); field != "" {
+				doc[field] = setSpec["value"]
+				mutated = true
+			}
+		}
+		if renSpec, ok := pMap["rename"].(map[string]any); ok {
+			srcField, _ := renSpec["field"].(string)
+			dstField, _ := renSpec["target_field"].(string)
+			if srcField != "" && dstField != "" {
+				if val, exists := doc[srcField]; exists {
+					doc[dstField] = val
+					delete(doc, srcField)
+					mutated = true
+				}
+			}
+		}
+		if remSpec, ok := pMap["remove"].(map[string]any); ok {
+			switch f := remSpec["field"].(type) {
+			case string:
+				delete(doc, f)
+				mutated = true
+			case []any:
+				for _, item := range f {
+					if ks, ok := item.(string); ok {
+						delete(doc, ks)
+						mutated = true
+					}
+				}
+			}
+		}
+		if lcSpec, ok := pMap["lowercase"].(map[string]any); ok {
+			if field, _ := lcSpec["field"].(string); field != "" {
+				if strVal, ok := doc[field].(string); ok {
+					doc[field] = strings.ToLower(strVal)
+					mutated = true
+				}
+			}
+		}
+		if ucSpec, ok := pMap["uppercase"].(map[string]any); ok {
+			if field, _ := ucSpec["field"].(string); field != "" {
+				if strVal, ok := doc[field].(string); ok {
+					doc[field] = strings.ToUpper(strVal)
+					mutated = true
+				}
+			}
+		}
+		if trimSpec, ok := pMap["trim"].(map[string]any); ok {
+			if field, _ := trimSpec["field"].(string); field != "" {
+				if strVal, ok := doc[field].(string); ok {
+					doc[field] = strings.TrimSpace(strVal)
+					mutated = true
+				}
+			}
+		}
+	}
+	if !mutated {
+		return raw
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return raw
+	}
+	return json.RawMessage(out)
+}
+
 // handleCatNodes implements `GET /_cat/nodes` for Elasticvue & Cerebro.
 func (s *Server) handleCatNodes(w http.ResponseWriter, r *http.Request) {
 	rows := []map[string]any{
@@ -1006,6 +1099,7 @@ func (s *Server) promoteFieldInternal(ctx context.Context, idxName, field, esTyp
 	s.indices[idxName] = compiled
 	s.mu.Unlock()
 	s.persistIndex(ctx, idxName, compiled)
+	s.backfillIndexSchema(ctx, compiled)
 
 	s.slowTracker.mu.Lock()
 	if byField, ok := s.slowTracker.unindexedFreq[idxName]; ok {
@@ -1016,6 +1110,45 @@ func (s *Server) promoteFieldInternal(ctx context.Context, idxName, field, esTyp
 	}
 	s.slowTracker.mu.Unlock()
 	return ddls, nil
+}
+
+func (s *Server) backfillIndexSchema(ctx context.Context, newSchema *schema.IndexSchema) {
+	if newSchema == nil || s.backend == nil {
+		return
+	}
+	tr := transpiler.NewTranspiler(newSchema, s.transpileOpts)
+	batchSize := 1000
+	var searchAfter []any
+	for {
+		plan, err := tr.BuildSearchPlan(&esast.SearchRequest{
+			Size:        &batchSize,
+			Sort:        esast.SortSlice{{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}}},
+			SearchAfter: searchAfter,
+		})
+		if err != nil {
+			return
+		}
+		hits, err := s.backend.QueryHits(ctx, plan.HitsSQL)
+		if err != nil || len(hits) == 0 {
+			return
+		}
+		var buf bytes.Buffer
+		for _, h := range hits {
+			shredded, err := schema.ShredDocument(newSchema, h.ID, h.Version+1, false, h.Source)
+			if err != nil {
+				continue
+			}
+			buf.Write(shredded)
+			buf.WriteByte('\n')
+		}
+		if buf.Len() > 0 {
+			_ = s.backend.StreamLoad(ctx, newSchema.DorisTable, buf.Bytes(), true)
+		}
+		searchAfter = []any{hits[len(hits)-1].ID}
+		if len(hits) < batchSize {
+			break
+		}
+	}
 }
 
 func buildNestedMappingProps(segments []string, leaf esast.FieldProperty) map[string]esast.FieldProperty {
