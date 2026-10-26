@@ -32,6 +32,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -63,6 +64,24 @@ func envBoolOrDefault(key string, fallback bool) bool {
 	default:
 		return fallback
 	}
+}
+
+func envIntOrDefault(key string, fallback int) int {
+	if val := strings.TrimSpace(os.Getenv(key)); val != "" {
+		if parsed, err := strconv.Atoi(val); err == nil {
+			return parsed
+		}
+	}
+	return fallback
+}
+
+func envDurationOrDefault(key string, fallback time.Duration) time.Duration {
+	if val := strings.TrimSpace(os.Getenv(key)); val != "" {
+		if parsed, err := time.ParseDuration(val); err == nil {
+			return parsed
+		}
+	}
+	return fallback
 }
 
 func redactDSN(dsn string) string {
@@ -108,6 +127,9 @@ func main() {
 		shadowESURL         = flag.String("shadow-es-url", envOrDefault("SHADOW_ES_URL", ""), "Optional legacy Elasticsearch URL for dual-read shadow parity verification (env: SHADOW_ES_URL)")
 		useDoris4SearchFunc = flag.Bool("doris4-search-fn", envBoolOrDefault("DORIS4_SEARCH_FN", false), "Push query_string down to Apache Doris 4.0 SEARCH() SQL function (env: DORIS4_SEARCH_FN)")
 		autoPromote         = flag.Bool("auto-promote", envBoolOrDefault("AUTO_PROMOTE", false), "Automatically promote hot unindexed _doc[...] VARIANT fields to f__* inverted index columns (env: AUTO_PROMOTE)")
+		bulkCoalesceMs      = flag.Int("bulk-coalesce-ms", envIntOrDefault("BULK_COALESCE_MS", 0), "Group-commit Stream Load micro-batch window in milliseconds across concurrent writes (0 disables, env: BULK_COALESCE_MS)")
+		bulkCoalesceBytes   = flag.Int("bulk-coalesce-bytes", envIntOrDefault("BULK_COALESCE_BYTES", proxy.DefaultBulkCoalesceMaxBytes), "Maximum byte size of a coalesced Stream Load batch before immediate flush (env: BULK_COALESCE_BYTES)")
+		queryCacheTTL       = flag.Duration("query-cache-ttl", envDurationOrDefault("QUERY_CACHE_TTL", 0), "Optional TTL for caching search responses with automatic write invalidation (e.g. 5s, 0s disables, env: QUERY_CACHE_TTL)")
 		inMemoryMode        = flag.Bool("in-memory", envBoolOrDefault("IN_MEMORY", false), "Run with in-memory shredded Doris emulator (env: IN_MEMORY)")
 		logSQL              = flag.Bool("log-sql", envBoolOrDefault("LOG_SQL", false), "Log transpiled Apache Doris DDL, Stream Load, HitsSQL, and AggsSQL (env: LOG_SQL)")
 	)
@@ -164,6 +186,14 @@ func main() {
 	if *autoPromote {
 		srv.SetAutoPromoteThreshold(3)
 		log.Printf("auto-promote enabled: unindexed _doc[...] fields queried >= 3 times will be promoted to f__* columns")
+	}
+	if *bulkCoalesceMs > 0 {
+		srv.SetBulkCoalesce(time.Duration(*bulkCoalesceMs)*time.Millisecond, *bulkCoalesceBytes)
+		log.Printf("group-commit Stream Load coalescer enabled (window=%dms, max-bytes=%d)", *bulkCoalesceMs, *bulkCoalesceBytes)
+	}
+	if *queryCacheTTL > 0 {
+		srv.SetQueryCacheTTL(*queryCacheTTL, proxy.DefaultQueryCacheMaxEntries)
+		log.Printf("search query result cache enabled (ttl=%s, max-entries=%d)", *queryCacheTTL, proxy.DefaultQueryCacheMaxEntries)
 	}
 	bootCtx, bootCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := srv.BootstrapCatalog(bootCtx); err != nil {

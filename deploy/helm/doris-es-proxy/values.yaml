@@ -18,7 +18,10 @@ doris:
   existingSecret: ""
   existingSecretPasswordKey: "doris-password"
   useDoris4SearchFunc: false
-  autoPromoteThreshold: 0
+  autoPromote: false
+  bulkCoalesceMs: 0
+  bulkCoalesceBytes: 8388608
+  queryCacheTTL: "0s"
   logSQL: false
 
 auth:

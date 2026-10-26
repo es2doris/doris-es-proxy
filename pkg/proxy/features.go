@@ -1094,7 +1094,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				totalCreated++
 			}
 			if batchBuf.Len() > 0 {
-				if err := s.backend.StreamLoad(r.Context(), destSchema.DorisTable, batchBuf.Bytes(), true); err != nil {
+				if err := s.streamLoad(r.Context(), destSchema.DorisTable, batchBuf.Bytes(), true); err != nil {
 					writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
 					return
 				}
@@ -1280,7 +1280,7 @@ func (s *Server) backfillIndexSchema(ctx context.Context, newSchema *schema.Inde
 			buf.WriteByte('\n')
 		}
 		if buf.Len() > 0 {
-			_ = s.backend.StreamLoad(ctx, newSchema.DorisTable, buf.Bytes(), true)
+			_ = s.streamLoad(ctx, newSchema.DorisTable, buf.Bytes(), true)
 		}
 		searchAfter = []any{hits[len(hits)-1].ID}
 		if len(hits) < batchSize {
@@ -1647,6 +1647,24 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	sb.WriteString("# HELP doris_es_proxy_shadow_jaccard_sum Cumulative Top-K Jaccard similarity across shadow queries.\n")
 	sb.WriteString("# TYPE doris_es_proxy_shadow_jaccard_sum counter\n")
 	_, _ = fmt.Fprintf(&sb, "doris_es_proxy_shadow_jaccard_sum %.4f\n", shadowJaccardSum)
+
+	coalescedReqs, coalescedFlushes := s.coalescer.Stats()
+	sb.WriteString("# HELP doris_es_proxy_bulk_coalesced_requests_total Write requests submitted through the Stream Load micro-batch coalescer.\n")
+	sb.WriteString("# TYPE doris_es_proxy_bulk_coalesced_requests_total counter\n")
+	_, _ = fmt.Fprintf(&sb, "doris_es_proxy_bulk_coalesced_requests_total %d\n", coalescedReqs)
+
+	sb.WriteString("# HELP doris_es_proxy_bulk_coalesced_flushes_total Batched Stream Load flushes executed by the coalescer.\n")
+	sb.WriteString("# TYPE doris_es_proxy_bulk_coalesced_flushes_total counter\n")
+	_, _ = fmt.Fprintf(&sb, "doris_es_proxy_bulk_coalesced_flushes_total %d\n", coalescedFlushes)
+
+	cacheHits, cacheMisses := s.queryCache.Stats()
+	sb.WriteString("# HELP doris_es_proxy_query_cache_hits_total Search requests served from the TTL query cache.\n")
+	sb.WriteString("# TYPE doris_es_proxy_query_cache_hits_total counter\n")
+	_, _ = fmt.Fprintf(&sb, "doris_es_proxy_query_cache_hits_total %d\n", cacheHits)
+
+	sb.WriteString("# HELP doris_es_proxy_query_cache_misses_total Search requests that missed the TTL query cache.\n")
+	sb.WriteString("# TYPE doris_es_proxy_query_cache_misses_total counter\n")
+	_, _ = fmt.Fprintf(&sb, "doris_es_proxy_query_cache_misses_total %d\n", cacheMisses)
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")

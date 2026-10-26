@@ -34,16 +34,23 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - "--listen=:{{ .Values.service.port }}"
-            - "--doris-mysql={{ .Values.doris.user }}:$(DORIS_PASSWORD)@tcp({{ .Values.doris.feHost }}:{{ .Values.doris.mysqlPort }})/{{ .Values.doris.database }}"
+            - "--doris-dsn={{ .Values.doris.user }}:$(DORIS_PASSWORD)@tcp({{ .Values.doris.feHost }}:{{ .Values.doris.mysqlPort }})/{{ .Values.doris.database }}?interpolateParams=true&timeout=5s&readTimeout=30s&writeTimeout=30s"
             - "--doris-http=http://{{ .Values.doris.feHost }}:{{ .Values.doris.httpPort }}"
             - "--doris-db={{ .Values.doris.database }}"
             - "--doris-user={{ .Values.doris.user }}"
             - "--doris-password=$(DORIS_PASSWORD)"
             {{- if .Values.doris.useDoris4SearchFunc }}
-            - "--doris4-search=true"
+            - "--doris4-search-fn=true"
             {{- end }}
-            {{- if gt (int .Values.doris.autoPromoteThreshold) 0 }}
-            - "--auto-promote-threshold={{ int .Values.doris.autoPromoteThreshold }}"
+            {{- if .Values.doris.autoPromote }}
+            - "--auto-promote=true"
+            {{- end }}
+            {{- if gt (int .Values.doris.bulkCoalesceMs) 0 }}
+            - "--bulk-coalesce-ms={{ int .Values.doris.bulkCoalesceMs }}"
+            - "--bulk-coalesce-bytes={{ int .Values.doris.bulkCoalesceBytes }}"
+            {{- end }}
+            {{- if and .Values.doris.queryCacheTTL (ne .Values.doris.queryCacheTTL "0s") }}
+            - "--query-cache-ttl={{ .Values.doris.queryCacheTTL }}"
             {{- end }}
             {{- if .Values.doris.logSQL }}
             - "--log-sql=true"
