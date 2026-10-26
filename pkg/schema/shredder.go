@@ -307,10 +307,6 @@ func parseISODateString(s string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func applyESDateMath(base time.Time, expr string) time.Time {
-	return applyESDateMathWithRound(base, expr, false)
-}
-
 func applyESDateMathWithRound(base time.Time, expr string, roundUp bool) time.Time {
 	t := base.UTC()
 	var roundUnit byte
