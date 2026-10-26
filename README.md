@@ -184,11 +184,12 @@ SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM (
    - Compiles multi-faceted `aggs` (`terms` on scalar and `ARRAY<STRING>` columns, `nested` aggregations via `LATERAL VIEW EXPLODE`, `date_histogram`, `histogram`, `range`, `filter`, `missing`, `cardinality`, `value_count`, `avg`, `sum`, `min`, `max`) into a single-scan **Nereids Multi-Cast CTE (`WITH base_matched AS (...)`)** query.
 
 3. **High-Throughput `/_bulk` Stream Load & Embedded Painless Mutations (`pkg/painless`, `pkg/proxy`)**
-   - Streams `/_bulk` NDJSON (`index`, `create`, `update`, `delete` via `__DORIS_DELETE_SIGN__ = 1`) into Doris HTTP Stream Load (`merge_type: MERGE`, `function_column.sequence_col: _version`) while preserving auth headers across FE `:8030` $\rightarrow$ BE `:8040` `307` redirects, with transparent `Content-Encoding: gzip` request decompression and `Accept-Encoding: gzip` response compression.
+   - Streams `/_bulk` NDJSON (`index`, `create`, `update`, `delete` via `__DORIS_DELETE_SIGN__ = 1`) into Doris HTTP Stream Load (`merge_type: MERGE`, `function_column.sequence_col: _version`) while preserving auth headers across FE `:8030` $\rightarrow$ BE `:8040` `307` redirects, with automatic transient retry backoff (`502`/`503`/`504`, `TOO_MANY_VERSIONS`, `MEM_LIMIT_EXCEEDED`), transparent `Content-Encoding: gzip` request decompression, and `Accept-Encoding: gzip` response compression.
    - Executes `POST /{index}/_update/{id}` and `POST /{index}/_update_by_query` using an embedded, bounded Painless script evaluator supporting OpenMetadata and DataHub's `ctx._source` property assignments, `if/else`, `for` loops, `ctx.op = "noop" | "delete"`, `.remove()`, `.add()`, `.putAll()`, and `.removeIf(x -> ...)` mutations.
 
-4. **Enterprise FinOps, Shadow Verification & Auto-Indexing Advisor (`pkg/proxy`)**
+4. **Enterprise FinOps, End-to-End Trace Correlation, Shadow Verification & Auto-Indexing Advisor (`pkg/proxy`)**
    - **Auto-Indexing Advisor (`GET /_doris/slowlog`)**: Tracks query execution latency and unindexed `_doc['...']` `VARIANT` sub-column scans, automatically emitting ready-to-run `ALTER TABLE ... ADD COLUMN ... ADD INDEX ... USING INVERTED` DDL recommendations.
+   - **W3C `traceparent` & `X-Opaque-Id` SQL Audit Correlation**: Echoes `traceparent`, `X-Opaque-Id`, and `X-Request-ID` HTTP headers and prepends sanitized `/* traceparent=..., opaque_id=..., request_id=... */` comments to every Doris SQL statement so slow queries in Doris FE `fe.audit.log` correlate directly back to Kibana, Grafana, or application spans.
    - **Dual-Read Shadow Verification (`--shadow-es-url`, `GET /_doris/shadow_stats`)**: Replays `/_search` requests against an existing Elasticsearch/OpenSearch cluster and computes hit-count parity (`doris_total == es_total`), Top-K `_id` Jaccard overlap, and latency speedup factor.
    - **Embedded Interactive Playground (`GET /_doris/ui`)**: Zero-dependency browser UI for side-by-side Elasticsearch Query DSL $\rightarrow$ Apache Doris SQL transpilation, live execution, and DDL inspection.
 
@@ -198,11 +199,11 @@ SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM (
 
 | Category | Supported Endpoints & Features | Status |
 | :--- | :--- | :--- |
-| **Cluster, Cat & GUI Admin** | `GET /`, `/_cluster/health`, `/_cluster/settings`, `/_nodes`, `/_stats`, `/{index}/_stats`, `/_resolve/index/{name}`, `/{index}/_search_shards`, `/_cat/indices`, `/_cat/aliases`, `/_cat/nodes`, `/_cat/shards`, `/_cat/count`, `/_security/_authenticate`, `/_xpack`, `PUT/GET/HEAD/DELETE /{index}`, `/_mapping`, `/_settings`, `/_aliases`, `/{alias}/_rollover`, `/_index_template`, `/_ingest/pipeline/{id}`, `/_field_caps`, `/_validate/query`, `/_analyze`, `/_refresh`, `/healthz`, `/readyz`, `/metrics`, CORS (`OPTIONS` preflight), `Content-Encoding: gzip`, `vnd.elasticsearch+json; compatible-with=7\|8\|9` | ✅ Supported |
-| **Ingestion & Mutations** | `POST /_bulk` (`index`, `create`, `update`, `delete` with per-item failure isolation, batched lookups, `?pipeline=<id>` execution & **Dynamic Mapping Inference**), `PUT/POST/GET/HEAD/DELETE /{index}/_doc/{id}`, `GET /{index}/_source/{id}`, `POST /_mget`, `POST /{index}/_update/{id}`, `POST /{index}/_update_by_query`, `POST /{index}/_delete_by_query`, `POST /_reindex` | ✅ Supported |
+| **Cluster, Cat & GUI Admin** | `GET /`, `/_cluster/health`, `/_cluster/settings`, `/_nodes`, `/_stats`, `/{index}/_stats`, `/_resolve/index/{name}`, `/{index}/_search_shards`, `/_cat/indices`, `/_cat/aliases`, `/_cat/nodes`, `/_cat/shards`, `/_cat/count`, `/_security/_authenticate`, `/_xpack`, `PUT/GET/HEAD/DELETE /{index}`, `/_mapping`, `GET /{index}/_mapping/field/{fields}`, `/_settings`, `/_aliases`, `/{alias}/_rollover`, `/_index_template`, `/_ingest/pipeline/{id}`, `GET/POST /_field_caps`, `/_validate/query`, `/_analyze`, `/_refresh`, `/healthz`, `/readyz`, `/metrics`, CORS (`OPTIONS` preflight), `Content-Encoding: gzip`, `vnd.elasticsearch+json; compatible-with=7\|8\|9` | ✅ Supported |
+| **Ingestion & Mutations** | `POST /_bulk` (`index`, `create`, `update`, `delete` with per-item failure isolation, batched lookups, `?pipeline=<id>` execution, transient Stream Load retry backoff & **Dynamic Mapping Inference**), `PUT/POST/GET/HEAD/DELETE /{index}/_doc/{id}`, `PUT/POST /{index}/_create/{id}`, `GET /{index}/_source/{id}`, `POST /_mget`, `POST /{index}/_update/{id}`, `POST /{index}/_update_by_query`, `POST /{index}/_delete_by_query`, `POST /_reindex` | ✅ Supported |
 | **Full-Text & Term DSL** | `bool`, `dis_max`, `boosting`, `match`, `match_phrase` (+ `slop`), `match_phrase_prefix`, `match_bool_prefix`, `multi_match`, `query_string` (+ `[min TO max]` & `_exists_:field`), `simple_query_string`, `term` (+ `case_insensitive`), `terms`, `ids`, `range` (+ date math), `exists`, `prefix`, `wildcard`, `regexp` | ✅ Supported |
-| **Advanced Search & Scoring** | Vector / kNN search (`dense_vector`, `knn_vector` $\rightarrow$ Doris `ARRAY<FLOAT>` + `COSINE_DISTANCE` / `L2_DISTANCE` / `INNER_PRODUCT`, top-level `knn`, `query.knn`, hybrid `query` + `knn`), correlated `nested` queries, `function_score` (`field_value_factor`, `weight`, `score_mode`, `boost_mode`), `constant_score`, `post_filter`, `_source` filtering (`includes`/`excludes`), `highlight`, `collapse`, `search_after` (null-safe), Point-in-Time (`POST /{index}/_pit`, `DELETE /_pit`), stateless `/_search/scroll`, `/_msearch`, `/_count` | ✅ Supported |
-| **Aggregations & Sub-Aggs** | `terms` (scalar & array), `nested`, `date_histogram`, `histogram`, `range`, `date_range` (+ date math), `filter`, `filters` (named multi-bucket), `missing`, `composite` (multi-column keyset pagination), `top_hits`, `cardinality`, `value_count`, `stats`, `percentiles`, `avg`, `sum`, `min`, `max`, plus **1-level Sub-Aggregations** (including `top_hits` inside buckets) | ✅ Supported |
+| **Advanced Search & Scoring** | Vector / kNN search (`dense_vector`, `knn_vector` $\rightarrow$ Doris `ARRAY<FLOAT>` + `COSINE_DISTANCE` / `L2_DISTANCE` / `INNER_PRODUCT`, top-level `knn`, `query.knn`, hybrid `query` + `knn`), correlated `nested` queries, `function_score` (`field_value_factor`, `weight`, `score_mode`, `boost_mode`), `constant_score`, `post_filter`, `_source` filtering (`includes`/`excludes`), `fields` & `docvalue_fields` (`epoch_millis`), `highlight` (including `"*"` wildcard), `collapse`, `sort` (including `_doc` tie-breaker), `search_after` (null-safe), Point-in-Time (`POST /{index}/_pit`, `DELETE /_pit`), stateless `/_search/scroll`, `/_msearch`, `/_count` | ✅ Supported |
+| **Aggregations & Sub-Aggs** | `terms` (scalar & array), `nested`, `date_histogram` (with `extended_bounds` & `min_doc_count: 0` zero-filling), `histogram`, `range`, `date_range` (+ date math), `filter`, `filters` (named multi-bucket), `missing`, `composite` (multi-column keyset pagination), `top_hits`, `cardinality`, `value_count`, `stats`, `percentiles`, `avg`, `sum`, `min`, `max`, plus **1-level Sub-Aggregations** (including `top_hits` inside buckets) | ✅ Supported |
 | **Doris Introspection & FinOps** | `GET /_doris/ui` (Interactive Workbench + 1-Click Demo Seed + 1-Click Auto-Promote), `POST /{index}/_doris/explain`, `GET /{index}/_doris/ddl`, `GET /_doris/slowlog` (Auto-Indexing Advisor), `POST /{index}/_doris/promote` (Live Column + Inverted Index Promotion + existing document backfill + `--auto-promote`), `GET /_doris/shadow_stats` (`--shadow-es-url`), `?doris_explain=true`, `doris-es-proxy transpile`, `doris-es-proxy ddl`, `doris-es-proxy doctor`, `doris-es-proxy migrate-schema` | ✅ Supported |
 
 ---
@@ -262,17 +263,27 @@ docker compose up -d --build
 ES_URL=http://127.0.0.1:9200 bash examples/quickstart.sh
 ```
 
-### 4. Build, Benchmark & Run Tests
+### 4. Build, Benchmark, Fuzz & Run Tests
 
 ```bash
 nix develop -c make check
 nix develop -c make security
 nix develop -c make bench
+nix develop -c go test -fuzz=FuzzTranspilerBuildSearchPlan -fuzztime=5s ./pkg/transpiler
 nix develop -c make build
 ./bin/doris-es-proxy --listen :9200 --doris-http http://127.0.0.1:8030 --doris-db es_compat --log-sql
 ```
 
-### 5. Kubernetes, Helm Chart, Observability & Apache Doris DSIP
+### 5. Deploy on Kubernetes with Helm
+
+```bash
+helm upgrade --install doris-es-proxy ./deploy/helm/doris-es-proxy \
+  --namespace doris-search --create-namespace \
+  --set doris.httpEndpoint="http://doris-fe.doris.svc:8030" \
+  --set doris.mysqlDSN="root:@tcp(doris-fe.doris.svc:9030)/es_compat"
+```
+
+### 6. Kubernetes, Helm Chart, Observability & Apache Doris DSIP
 
 - **Helm Chart (HPA, PDB, Secret DSN, Prometheus `ServiceMonitor`)**: [`deploy/helm/doris-es-proxy`](deploy/helm/doris-es-proxy)
 - **Grafana Dashboard & Prometheus `PrometheusRule` Alerts**: [`deploy/grafana/doris-es-proxy-dashboard.json`](deploy/grafana/doris-es-proxy-dashboard.json) & [`deploy/grafana/prometheus-alerts.yaml`](deploy/grafana/prometheus-alerts.yaml)

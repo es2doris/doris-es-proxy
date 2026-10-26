@@ -465,6 +465,11 @@ func (s *Server) Handler() http.Handler {
 					return
 				}
 			}
+			if (segs[0] == "_mapping" || segs[0] == "_mappings") && segs[1] == "field" {
+				r.SetPathValue("fields", segs[2])
+				s.handleGetFieldMapping(w, r)
+				return
+			}
 			r.SetPathValue("index", segs[0])
 			if segs[1] == "_alias" || segs[1] == "_aliases" {
 				r.SetPathValue("name", segs[2])
@@ -535,6 +540,15 @@ func (s *Server) Handler() http.Handler {
 			default:
 				writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
 			}
+
+		case 4:
+			if (segs[1] == "_mapping" || segs[1] == "_mappings") && segs[2] == "field" {
+				r.SetPathValue("index", segs[0])
+				r.SetPathValue("fields", segs[3])
+				s.handleGetFieldMapping(w, r)
+				return
+			}
+			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
 
 		default:
 			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
@@ -1070,6 +1084,67 @@ func (s *Server) handleGetMapping(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleGetFieldMapping(w http.ResponseWriter, r *http.Request) {
+	targets := s.resolveTargetIndices(r.PathValue("index"))
+	rawFields := r.PathValue("fields")
+	if rawFields == "" {
+		rawFields = "*"
+	}
+	fieldPatterns := strings.Split(rawFields, ",")
+
+	s.mu.RLock()
+	out := make(map[string]any, len(targets))
+	for _, idxName := range targets {
+		idxSchema, ok := s.indices[idxName]
+		if !ok {
+			continue
+		}
+		mappingsOut := make(map[string]any)
+		for esPath, fb := range idxSchema.Fields {
+			if !matchesAnyGlob(esPath, fieldPatterns) {
+				continue
+			}
+			esType := "keyword"
+			switch fb.DorisType {
+			case schema.DorisBigInt:
+				if strings.Contains(strings.ToLower(esPath), "time") || strings.Contains(strings.ToLower(esPath), "date") || strings.HasSuffix(esPath, "At") {
+					esType = "date"
+				} else {
+					esType = "long"
+				}
+			case schema.DorisDouble:
+				esType = "double"
+			case schema.DorisBoolean:
+				esType = "boolean"
+			case schema.DorisString:
+				esType = "text"
+			}
+			lastSeg := esPath
+			if dot := strings.LastIndexByte(esPath, '.'); dot >= 0 {
+				lastSeg = esPath[dot+1:]
+			}
+			mappingsOut[esPath] = map[string]any{
+				"full_name": esPath,
+				"mapping": map[string]any{
+					lastSeg: map[string]any{"type": esType},
+				},
+			}
+		}
+		if matchesAnyGlob("@timestamp", fieldPatterns) && mappingsOut["@timestamp"] == nil {
+			mappingsOut["@timestamp"] = map[string]any{
+				"full_name": "@timestamp",
+				"mapping": map[string]any{
+					"@timestamp": map[string]any{"type": "date"},
+				},
+			}
+		}
+		out[idxName] = map[string]any{"mappings": mappingsOut}
+	}
+	s.mu.RUnlock()
+
+	writeJSON(w, http.StatusOK, out)
+}
+
 func (s *Server) handlePutMapping(w http.ResponseWriter, r *http.Request) {
 	indexName := s.resolveIndexName(r.PathValue("index"))
 	bodyBytes, err := io.ReadAll(r.Body)
@@ -1400,7 +1475,9 @@ func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+	if !strings.HasPrefix(w.Header().Get("Content-Type"), "application/vnd.elasticsearch+json") {
+		w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+	}
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
 	// #nosec G705 -- Content-Type is application/json with X-Content-Type-Options: nosniff
@@ -2219,11 +2296,28 @@ func (s *Server) buildDorisExplainObject(ctx context.Context, rawIndexPattern st
 
 func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 	targets := s.resolveTargetIndices(r.PathValue("index"))
-	fieldsFilter := r.URL.Query().Get("fields")
-	if fieldsFilter == "" {
-		fieldsFilter = "*"
+	var filterPatterns []string
+	if fieldsFilter := r.URL.Query().Get("fields"); fieldsFilter != "" {
+		filterPatterns = append(filterPatterns, strings.Split(fieldsFilter, ",")...)
 	}
-	filterPatterns := strings.Split(fieldsFilter, ",")
+	if r.Body != nil {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			var body struct {
+				Fields []string `json:"fields"`
+			}
+			if err := json.Unmarshal(bodyBytes, &body); err == nil && len(body.Fields) > 0 {
+				if len(filterPatterns) == 1 && filterPatterns[0] == "*" {
+					filterPatterns = body.Fields
+				} else {
+					filterPatterns = append(filterPatterns, body.Fields...)
+				}
+			}
+		}
+	}
+	if len(filterPatterns) == 0 {
+		filterPatterns = []string{"*"}
+	}
 
 	caps := make(map[string]map[string]map[string]any)
 	addCap := func(field, esType string, searchable, aggregatable bool) {
@@ -2802,6 +2896,11 @@ func buildESResponse(indexName string, idxSchema *schema.IndexSchema, req *esast
 		if len(req.Sort) > 0 {
 			hitMap["sort"] = extractHitSortValues(h, req.Sort, idxSchema)
 		}
+		if len(req.Fields) > 0 || len(req.DocvalueFields) > 0 {
+			if fm := extractHitFieldsMap(h, hitIdx, req, idxSchema); len(fm) > 0 {
+				hitMap["fields"] = fm
+			}
+		}
 		esHits = append(esHits, hitMap)
 	}
 
@@ -3305,6 +3404,139 @@ func attachSubAggsToBucket(
 			}
 		}
 	}
+}
+
+func extractHitFieldsMap(h HitRow, hitIdx string, req *esast.SearchRequest, idxSchema *schema.IndexSchema) map[string][]any {
+	specs := req.EffectiveFieldSpecs()
+	if len(specs) == 0 {
+		return nil
+	}
+	var doc map[string]any
+	if len(h.Source) > 0 {
+		dec := json.NewDecoder(bytes.NewReader(h.Source))
+		dec.UseNumber()
+		_ = dec.Decode(&doc)
+	}
+	out := make(map[string][]any)
+	var allLeafScalars map[string][]any
+	for _, spec := range specs {
+		if spec.Field == "" {
+			continue
+		}
+		switch spec.Field {
+		case "_id":
+			out["_id"] = []any{h.ID}
+			continue
+		case "_index":
+			out["_index"] = []any{hitIdx}
+			continue
+		}
+		cleanField := strings.TrimSuffix(strings.TrimSuffix(spec.Field, ".keyword"), ".ngram")
+		if strings.Contains(cleanField, "*") {
+			if allLeafScalars == nil {
+				allLeafScalars = make(map[string][]any)
+				collectAllLeafScalarPaths(doc, "", allLeafScalars)
+			}
+			for leafPath, vals := range allLeafScalars {
+				if matchWildcardPattern(cleanField, leafPath) && len(vals) > 0 {
+					out[leafPath] = formatFieldValues(leafPath, vals, spec.Format, idxSchema)
+				}
+			}
+			continue
+		}
+		pathSegs := strings.Split(cleanField, ".")
+		if idxSchema != nil {
+			b := idxSchema.ResolveField(spec.Field)
+			if len(b.SourceJSONPath) > 0 {
+				pathSegs = b.SourceJSONPath
+			}
+		}
+		vals := collectScalarValuesAtPath(doc, pathSegs)
+		if len(vals) > 0 {
+			out[spec.Field] = formatFieldValues(cleanField, vals, spec.Format, idxSchema)
+		}
+	}
+	return out
+}
+
+func formatFieldValues(field string, vals []any, format string, idxSchema *schema.IndexSchema) []any {
+	formatted := make([]any, 0, len(vals))
+	for _, v := range vals {
+		if jsonNum, ok := v.(json.Number); ok {
+			if iv, err := jsonNum.Int64(); err == nil {
+				v = iv
+			} else if fv, err := jsonNum.Float64(); err == nil {
+				v = fv
+			}
+		}
+		if strVal, ok := v.(string); ok {
+			if strings.EqualFold(format, "epoch_millis") {
+				if ms, ok := schema.ParseESDateToEpochMillis(strVal, time.Now().UTC()); ok {
+					v = ms
+				}
+			} else if idxSchema != nil {
+				b := idxSchema.ResolveField(field)
+				if b.LowercaseNormalizer {
+					v = strings.ToLower(strVal)
+				}
+			}
+		}
+		formatted = append(formatted, v)
+	}
+	return formatted
+}
+
+func collectAllLeafScalarPaths(node any, prefix string, out map[string][]any) {
+	switch curr := node.(type) {
+	case map[string]any:
+		for k, v := range curr {
+			full := k
+			if prefix != "" {
+				full = prefix + "." + k
+			}
+			collectAllLeafScalarPaths(v, full, out)
+		}
+	case []any:
+		for _, item := range curr {
+			collectAllLeafScalarPaths(item, prefix, out)
+		}
+	case nil:
+	default:
+		if prefix != "" {
+			out[prefix] = append(out[prefix], curr)
+		}
+	}
+}
+
+func collectScalarValuesAtPath(node any, path []string) []any {
+	if node == nil {
+		return nil
+	}
+	if len(path) == 0 {
+		switch v := node.(type) {
+		case map[string]any:
+			return nil
+		case []any:
+			var res []any
+			for _, item := range v {
+				res = append(res, collectScalarValuesAtPath(item, nil)...)
+			}
+			return res
+		default:
+			return []any{v}
+		}
+	}
+	switch curr := node.(type) {
+	case map[string]any:
+		return collectScalarValuesAtPath(curr[path[0]], path[1:])
+	case []any:
+		var res []any
+		for _, item := range curr {
+			res = append(res, collectScalarValuesAtPath(item, path)...)
+		}
+		return res
+	}
+	return nil
 }
 
 func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.IndexSchema) []any {
