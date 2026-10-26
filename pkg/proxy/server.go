@@ -110,6 +110,8 @@ type Server struct {
 	maxBodyBytes         int64
 	slowTracker          *SlowQueryTracker
 	shadowVerifier       *ShadowVerifier
+	coalescer            *StreamLoadCoalescer
+	queryCache           *QueryResultCache
 	totalHTTPRequests    int64
 	autoPromoteThreshold int64
 
@@ -124,18 +126,39 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 	if dorisDB == "" {
 		dorisDB = "es_compat"
 	}
-	return &Server{
+	s := &Server{
 		dorisDB:        dorisDB,
 		backend:        backend,
 		transpileOpts:  opts,
 		maxBodyBytes:   DefaultMaxRequestBodyBytes,
 		slowTracker:    newSlowQueryTracker(),
 		shadowVerifier: newShadowVerifier(""),
+		queryCache:     newQueryResultCache(),
 		indices:        make(map[string]*schema.IndexSchema),
 		aliases:        make(map[string][]string),
 		templates:      make(map[string]esast.IndexTemplateRequest),
 		pipelines:      make(map[string]map[string]any),
 	}
+	s.coalescer = newStreamLoadCoalescer(func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
+		return s.backend.StreamLoad(ctx, table, ndjson, syncRefresh)
+	})
+	return s
+}
+
+// SetBulkCoalesce configures group-commit Stream Load micro-batching across concurrent write requests.
+func (s *Server) SetBulkCoalesce(window time.Duration, maxBytes int) {
+	s.coalescer.Configure(window, maxBytes)
+}
+
+// SetQueryCacheTTL configures the bounded search response cache TTL (`<= 0` disables caching).
+func (s *Server) SetQueryCacheTTL(ttl time.Duration, maxEntries int) {
+	s.queryCache.Configure(ttl, maxEntries)
+}
+
+func (s *Server) streamLoad(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
+	err := s.coalescer.Submit(ctx, table, ndjson, syncRefresh)
+	s.queryCache.InvalidateAll()
+	return err
 }
 
 // BootstrapCatalog creates `_es_catalog` if supported by the backend and rehydrates
@@ -1025,6 +1048,7 @@ func (s *Server) handleDeleteIndex(w http.ResponseWriter, r *http.Request) {
 		ddl := fmt.Sprintf("DROP TABLE IF EXISTS `%s`.`%s`;", idx.DorisDB, idx.DorisTable)
 		_ = s.backend.ExecDDL(r.Context(), ddl)
 	}
+	s.queryCache.InvalidateAll()
 	writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 }
 
@@ -1423,7 +1447,7 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 	}
 
 	syncRefresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh") == "wait_for"
-	if err := s.backend.StreamLoad(r.Context(), idxSchema.DorisTable, append(shredded, '\n'), syncRefresh); err != nil {
+	if err := s.streamLoad(r.Context(), idxSchema.DorisTable, append(shredded, '\n'), syncRefresh); err != nil {
 		writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
 		return
 	}
@@ -1597,7 +1621,7 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	syncRefresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh") == "wait_for"
-	if err := s.backend.StreamLoad(r.Context(), idxSchema.DorisTable, append(tombstone, '\n'), syncRefresh); err != nil {
+	if err := s.streamLoad(r.Context(), idxSchema.DorisTable, append(tombstone, '\n'), syncRefresh); err != nil {
 		writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
 		return
 	}
@@ -1660,7 +1684,7 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		syncRefresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh") == "wait_for"
-		if err := s.backend.StreamLoad(r.Context(), idxSchema.DorisTable, append(shredded, '\n'), syncRefresh); err != nil {
+		if err := s.streamLoad(r.Context(), idxSchema.DorisTable, append(shredded, '\n'), syncRefresh); err != nil {
 			writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
 			return
 		}
@@ -1777,7 +1801,7 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if batchBuf.Len() > 0 {
-				if err := s.backend.StreamLoad(r.Context(), idxSchema.DorisTable, batchBuf.Bytes(), true); err != nil {
+				if err := s.streamLoad(r.Context(), idxSchema.DorisTable, batchBuf.Bytes(), true); err != nil {
 					writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
 					return
 				}
@@ -1884,7 +1908,7 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 				totalDeleted++
 			}
 			if batchBuf.Len() > 0 {
-				if err := s.backend.StreamLoad(r.Context(), idxSchema.DorisTable, batchBuf.Bytes(), true); err != nil {
+				if err := s.streamLoad(r.Context(), idxSchema.DorisTable, batchBuf.Bytes(), true); err != nil {
 					writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
 					return
 				}
@@ -2131,7 +2155,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		if buf.Len() == 0 {
 			continue
 		}
-		if err := s.backend.StreamLoad(r.Context(), dorisTable, buf.Bytes(), syncRefresh); err != nil {
+		if err := s.streamLoad(r.Context(), dorisTable, buf.Bytes(), syncRefresh); err != nil {
 			writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
 			return
 		}
@@ -2469,6 +2493,10 @@ func (s *Server) executeSearchRequest(
 		targets = []string{s.resolveIndexName(rawIndexPattern)}
 	}
 
+	if cachedResp, hit := s.queryCache.Get(targets, req); hit {
+		return cachedResp, http.StatusOK, "", ""
+	}
+
 	from := 0
 	if req.From != nil && *req.From > 0 {
 		from = *req.From
@@ -2660,7 +2688,9 @@ func (s *Server) executeSearchRequest(
 		}
 		return nil
 	}
-	return buildESResponse(primaryIndex, primarySchema, req, allHits, allAggRows, tookMs, docLookup), http.StatusOK, "", ""
+	resp := buildESResponse(primaryIndex, primarySchema, req, allHits, allAggRows, tookMs, docLookup)
+	s.queryCache.Put(targets, req, resp)
+	return resp, http.StatusOK, "", ""
 }
 
 func compareHitRowsBySort(a, b HitRow, sorts []esast.SortSpec, idxSchema *schema.IndexSchema) int {

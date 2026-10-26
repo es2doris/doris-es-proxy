@@ -24,6 +24,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1135,5 +1136,104 @@ func TestClientSDKKibanaDiscoverAndGrafanaLogsCompat(t *testing.T) {
 		!strings.Contains(body, `"service":["checkout"]`) ||
 		!strings.Contains(body, `"_id":["doc-1"]`) {
 		t.Fatalf("Kibana Discover fields extraction failed: %d %s", resp.StatusCode, body)
+	}
+}
+
+func TestBulkCoalescerAndQueryResultCache(t *testing.T) {
+	srv := NewServer("logs_db", NewMemoryBackend(true), transpiler.TranspilerOptions{})
+	srv.SetBulkCoalesce(80*time.Millisecond, 64*1024)
+	srv.SetQueryCacheTTL(5*time.Second, 8)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	doReq := func(method, path, body string) (int, string) {
+		t.Helper()
+		var rdr io.Reader
+		if body != "" {
+			rdr = strings.NewReader(body)
+		}
+		req, err := http.NewRequest(method, ts.URL+path, rdr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return resp.StatusCode, string(raw)
+	}
+
+	// Pre-create index so all 8 concurrent goroutines hit StreamLoadCoalescer simultaneously
+	if code, body := doReq(http.MethodPut, "/coalesce_idx", `{"mappings":{"properties":{"service":{"type":"keyword"},"seq":{"type":"integer"}}}}`); code != http.StatusOK {
+		t.Fatalf("create coalesce_idx failed: %d %s", code, body)
+	}
+
+	const workers = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		idx := i
+		go func() {
+			defer wg.Done()
+			code, body := doReq(
+				http.MethodPut,
+				fmt.Sprintf("/coalesce_idx/_doc/doc-%d", idx),
+				fmt.Sprintf(`{"service":"ingest","seq":%d}`, idx),
+			)
+			if code != http.StatusCreated {
+				errs <- fmt.Errorf("worker %d got HTTP %d: %s", idx, code, body)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+
+	coalescedReqs, coalescedFlushes := srv.coalescer.Stats()
+	if coalescedReqs != workers || coalescedFlushes < 1 || coalescedFlushes >= workers {
+		t.Fatalf("expected %d concurrent writes to coalesce into < %d flushes, got reqs=%d flushes=%d",
+			workers, workers, coalescedReqs, coalescedFlushes)
+	}
+
+	// Verify QueryResultCache miss -> hit -> automatic write invalidation
+	searchPayload := `{"query":{"term":{"service":"ingest"}},"aggs":{"max_seq":{"max":{"field":"seq"}}}}`
+	if code, body := doReq(http.MethodPost, "/coalesce_idx/_search", searchPayload); code != http.StatusOK || !strings.Contains(body, `"value":8`) {
+		t.Fatalf("expected 8 hits on first search, got %d %s", code, body)
+	}
+	hits1, misses1 := srv.queryCache.Stats()
+	if hits1 != 0 || misses1 != 1 {
+		t.Fatalf("expected 0 hits / 1 miss after first query, got hits=%d misses=%d", hits1, misses1)
+	}
+
+	if code, body := doReq(http.MethodPost, "/coalesce_idx/_search", searchPayload); code != http.StatusOK || !strings.Contains(body, `"value":8`) {
+		t.Fatalf("expected 8 hits on cached search, got %d %s", code, body)
+	}
+	hits2, misses2 := srv.queryCache.Stats()
+	if hits2 != 1 || misses2 != 1 {
+		t.Fatalf("expected 1 hit / 1 miss after second query, got hits=%d misses=%d", hits2, misses2)
+	}
+
+	// Write a 9th document with ?refresh=true (immediate flush + cache invalidation)
+	if code, body := doReq(http.MethodPut, "/coalesce_idx/_doc/doc-8?refresh=true", `{"service":"ingest","seq":8}`); code != http.StatusCreated {
+		t.Fatalf("expected 201 Created on doc-8, got %d %s", code, body)
+	}
+
+	// Next search must see 9 documents immediately (cache invalidated by write)
+	if code, body := doReq(http.MethodPost, "/coalesce_idx/_search", searchPayload); code != http.StatusOK || !strings.Contains(body, `"value":9`) {
+		t.Fatalf("expected 9 hits after write invalidation, got %d %s", code, body)
+	}
+
+	// Verify Prometheus /metrics exports coalescer & query cache counters
+	if code, body := doReq(http.MethodGet, "/metrics", ""); code != http.StatusOK ||
+		!strings.Contains(body, "doris_es_proxy_bulk_coalesced_requests_total 9") ||
+		!strings.Contains(body, "doris_es_proxy_query_cache_hits_total 1") ||
+		!strings.Contains(body, "doris_es_proxy_query_cache_misses_total 2") {
+		t.Fatalf("expected /metrics to report coalescer and query cache counters, got %d:\n%s", code, body)
 	}
 }
