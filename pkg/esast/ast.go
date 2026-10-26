@@ -53,6 +53,50 @@ type SearchRequest struct {
 	Highlight      *HighlightSpec     `json:"highlight,omitempty"`
 	Collapse       *CollapseSpec      `json:"collapse,omitempty"`
 	PIT            *PITSpec           `json:"pit,omitempty"`
+	Fields         []FieldRequestSpec `json:"fields,omitempty"`
+	DocvalueFields []FieldRequestSpec `json:"docvalue_fields,omitempty"`
+}
+
+// FieldRequestSpec represents an entry in `fields` or `docvalue_fields` in a search request,
+// which in Elasticsearch/OpenSearch can be either a plain string `"@timestamp"` or an object
+// `{"field": "@timestamp", "format": "strict_date_optional_time"}`.
+type FieldRequestSpec struct {
+	Field           string `json:"field"`
+	Format          string `json:"format,omitempty"`
+	IncludeUnmapped any    `json:"include_unmapped,omitempty"`
+}
+
+func (frs *FieldRequestSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	if trimmed[0] == '"' {
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err != nil {
+			return err
+		}
+		frs.Field = s
+		return nil
+	}
+	type alias FieldRequestSpec
+	var obj alias
+	if err := json.Unmarshal(trimmed, &obj); err != nil {
+		return err
+	}
+	*frs = FieldRequestSpec(obj)
+	return nil
+}
+
+// EffectiveFieldSpecs returns the combined `fields` and `docvalue_fields` specifications.
+func (r *SearchRequest) EffectiveFieldSpecs() []FieldRequestSpec {
+	if r == nil || (len(r.Fields) == 0 && len(r.DocvalueFields) == 0) {
+		return nil
+	}
+	out := make([]FieldRequestSpec, 0, len(r.Fields)+len(r.DocvalueFields))
+	out = append(out, r.Fields...)
+	out = append(out, r.DocvalueFields...)
+	return out
 }
 
 // KNNQuery represents an Elasticsearch 8/9 or OpenSearch `knn` vector search clause.

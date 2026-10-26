@@ -1001,3 +1001,139 @@ func TestObservabilityTracePropagationStreamLoadRetryAndHelmChart(t *testing.T) 
 		}
 	}
 }
+
+func TestClientSDKKibanaDiscoverAndGrafanaLogsCompat(t *testing.T) {
+	srv := NewServer("logs_db", NewMemoryBackend(true), transpiler.TranspilerOptions{})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	doSDKReq := func(method, path, body string) (*http.Response, string) {
+		t.Helper()
+		var rdr io.Reader
+		if body != "" {
+			rdr = strings.NewReader(body)
+		}
+		req, err := http.NewRequest(method, ts.URL+path, rdr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Accept", "application/vnd.elasticsearch+json; compatible-with=8")
+		req.Header.Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=8")
+		req.Header.Set("X-Elastic-Client-Meta", "es=8.15.0p,go=1.25.0")
+		req.Header.Set("X-Opaque-Id", "grafana-kibana-sdk-e2e")
+		req.Header.Set("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return resp, string(raw)
+	}
+
+	// 1. Official go-elasticsearch v8 / elasticsearch-py v8 preflight & product check
+	resp, body := doSDKReq(http.MethodGet, "/", "")
+	if resp.StatusCode != http.StatusOK ||
+		resp.Header.Get("X-Elastic-Product") != "Elasticsearch" ||
+		resp.Header.Get("Content-Type") != "application/vnd.elasticsearch+json; compatible-with=8" ||
+		resp.Header.Get("X-Opaque-Id") != "grafana-kibana-sdk-e2e" {
+		t.Fatalf("unexpected SDK root handshake headers/status: status=%d headers=%+v body=%s", resp.StatusCode, resp.Header, body)
+	}
+
+	// 2. Create index & ingest structured log documents via _bulk
+	resp, body = doSDKReq(http.MethodPut, "/logs-k8s-2026.10", `{
+		"mappings": {
+			"properties": {
+				"@timestamp": {"type": "date"},
+				"service": {"type": "keyword"},
+				"status": {"type": "integer"},
+				"message": {"type": "text"}
+			}
+		}
+	}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("create index failed: %d %s", resp.StatusCode, body)
+	}
+
+	bulkPayload := strings.Join([]string{
+		`{"index":{"_id":"doc-1"}}`,
+		`{"@timestamp":"2026-10-25T10:15:00Z","service":"checkout","status":500,"message":"database connection timeout","host":{"name":"node-a"}}`,
+		`{"index":{"_id":"doc-2"}}`,
+		`{"@timestamp":"2026-10-25T10:15:00Z","service":"payments","status":200,"message":"payment processed timeout retry","host":{"name":"node-b"}}`,
+		"",
+	}, "\n")
+	resp, body = doSDKReq(http.MethodPost, "/logs-k8s-2026.10/_bulk?refresh=true", bulkPayload)
+	if resp.StatusCode != http.StatusOK || strings.Contains(body, `"errors":true`) {
+		t.Fatalf("bulk ingest failed: %d %s", resp.StatusCode, body)
+	}
+
+	// Verify GET /{index}/_source/{id} preserves compatible-with=8 media type
+	resp, body = doSDKReq(http.MethodGet, "/logs-k8s-2026.10/_source/doc-1", "")
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "application/vnd.elasticsearch+json; compatible-with=8" || !strings.Contains(body, `"checkout"`) {
+		t.Fatalf("expected _source to preserve compatible-with=8 Content-Type, got status=%d ct=%q body=%s", resp.StatusCode, resp.Header.Get("Content-Type"), body)
+	}
+
+	// 3. Grafana Elasticsearch Data Source & Logs Panel _msearch workflow:
+	//    - sort by @timestamp desc and _doc desc (must map _doc -> _id, not VARIANT _doc)
+	//    - docvalue_fields with epoch_millis format
+	//    - wildcard highlight with custom @HIGHLIGHT@ tags
+	//    - date_histogram with extended_bounds & min_doc_count: 0
+	msearchBody := strings.Join([]string{
+		`{"index":"logs-k8s-*","search_type":"query_then_fetch","ignore_unavailable":true}`,
+		`{"size":500,"query":{"query_string":{"query":"timeout"}},"sort":[{"@timestamp":{"order":"desc","unmapped_type":"boolean"}},{"_doc":{"order":"desc"}}],"docvalue_fields":[{"field":"@timestamp","format":"epoch_millis"}],"highlight":{"pre_tags":["@HIGHLIGHT@"],"post_tags":["@/HIGHLIGHT@"],"fields":{"*":{}}}}`,
+		`{"index":"logs-k8s-*","search_type":"query_then_fetch","ignore_unavailable":true}`,
+		`{"size":0,"query":{"query_string":{"query":"timeout"}},"aggs":{"2":{"date_histogram":{"field":"@timestamp","fixed_interval":"1h","min_doc_count":0,"extended_bounds":{"min":"2026-10-25T10:00:00Z","max":"2026-10-25T12:00:00Z"}}}}}`,
+		"",
+	}, "\n")
+	resp, body = doSDKReq(http.MethodPost, "/_msearch?max_concurrent_shard_requests=5", msearchBody)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Grafana _msearch failed: %d %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, `"sort":[1792923300000,"doc-2"]`) ||
+		!strings.Contains(body, `"fields":{"@timestamp":[1792923300000]}`) ||
+		!strings.Contains(body, `@HIGHLIGHT@timeout@/HIGHLIGHT@`) {
+		t.Fatalf("expected Grafana Logs _doc tie-breaker sort, epoch_millis docvalue_fields, and @HIGHLIGHT@ tags, got: %s", body)
+	}
+
+	// 4. Kibana / OpenSearch Dashboards Discover workflow:
+	//    - GET /_resolve/index/logs-k8s-*
+	//    - POST /logs-k8s-*/_field_caps?fields=* with JSON body {"fields":["@timestamp","service"]}
+	//    - GET /logs-k8s-2026.10/_mapping/field/@timestamp,service and GET /_mapping/field/@timestamp
+	//    - POST /logs-k8s-*/_search with "fields": [{"field":"*","include_unmapped":"true"},{"field":"@timestamp"}]
+	resp, body = doSDKReq(http.MethodGet, "/_resolve/index/logs-k8s-*", "")
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, `"logs-k8s-2026.10"`) {
+		t.Fatalf("Kibana _resolve/index failed: %d %s", resp.StatusCode, body)
+	}
+
+	resp, body = doSDKReq(http.MethodPost, "/logs-k8s-*/_field_caps?fields=*", `{"fields":["@timestamp","service"]}`)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, `"@timestamp"`) || !strings.Contains(body, `"service"`) || strings.Contains(body, `"status"`) {
+		t.Fatalf("Kibana POST _field_caps body filter failed: %d %s", resp.StatusCode, body)
+	}
+
+	resp, body = doSDKReq(http.MethodGet, "/logs-k8s-2026.10/_mapping/field/@timestamp,service", "")
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, `"full_name":"@timestamp"`) || !strings.Contains(body, `"full_name":"service"`) {
+		t.Fatalf("Kibana GET /{index}/_mapping/field/{fields} failed: %d %s", resp.StatusCode, body)
+	}
+
+	resp, body = doSDKReq(http.MethodGet, "/_mapping/field/@timestamp", "")
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, `"full_name":"@timestamp"`) {
+		t.Fatalf("Kibana GET /_mapping/field/{fields} failed: %d %s", resp.StatusCode, body)
+	}
+
+	resp, body = doSDKReq(http.MethodPost, "/logs-k8s-*/_search", `{
+		"size": 10,
+		"_source": false,
+		"fields": [
+			{"field": "*", "include_unmapped": "true"},
+			{"field": "@timestamp", "format": "strict_date_optional_time"},
+			"_id"
+		],
+		"sort": [{"@timestamp": "desc"}, "_doc"]
+	}`)
+	if resp.StatusCode != http.StatusOK ||
+		!strings.Contains(body, `"host.name":["node-a"]`) ||
+		!strings.Contains(body, `"service":["checkout"]`) ||
+		!strings.Contains(body, `"_id":["doc-1"]`) {
+		t.Fatalf("Kibana Discover fields extraction failed: %d %s", resp.StatusCode, body)
+	}
+}

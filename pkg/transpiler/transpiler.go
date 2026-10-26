@@ -2124,7 +2124,7 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 	if field == "_all_text" || field == "*" {
 		return "`_all_text`"
 	}
-	if field == "_id" {
+	if field == "_id" || field == "_doc" {
 		return "`_id`"
 	}
 	castType := "STRING"
