@@ -394,15 +394,6 @@ func evalCondition(sourceMap map[string]any, cond string, params map[string]any)
 	if cond == "" {
 		return false
 	}
-	if strings.Contains(cond, "&&") {
-		parts := strings.Split(cond, "&&")
-		for _, p := range parts {
-			if !evalCondition(sourceMap, p, params) {
-				return false
-			}
-		}
-		return true
-	}
 	if strings.Contains(cond, "||") {
 		parts := strings.Split(cond, "||")
 		for _, p := range parts {
@@ -411,6 +402,15 @@ func evalCondition(sourceMap map[string]any, cond string, params map[string]any)
 			}
 		}
 		return false
+	}
+	if strings.Contains(cond, "&&") {
+		parts := strings.Split(cond, "&&")
+		for _, p := range parts {
+			if !evalCondition(sourceMap, p, params) {
+				return false
+			}
+		}
+		return true
 	}
 	if strings.HasPrefix(cond, "!") {
 		return !evalCondition(sourceMap, cond[1:], params)
@@ -455,12 +455,51 @@ func evalCondition(sourceMap map[string]any, cond string, params map[string]any)
 		rhs, _ := evalRHSExpr(sourceMap, strings.TrimSpace(cond[idx+2:]), params)
 		return valuesEqual(lhs, rhs)
 	}
+	for _, op := range []string{">=", "<=", ">", "<"} {
+		if idx := strings.Index(cond, op); idx > 0 {
+			lhs, _ := evalRHSExpr(sourceMap, strings.TrimSpace(cond[:idx]), params)
+			rhs, _ := evalRHSExpr(sourceMap, strings.TrimSpace(cond[idx+len(op):]), params)
+			return compareOrderedValues(lhs, rhs, op)
+		}
+	}
 
 	val, _ := evalRHSExpr(sourceMap, cond, params)
 	if b, ok := val.(bool); ok {
 		return b
 	}
 	return val != nil
+}
+
+func compareOrderedValues(a, b any, op string) bool {
+	fa, oka := toFloat64(a)
+	fb, okb := toFloat64(b)
+	if oka && okb {
+		switch op {
+		case ">=":
+			return fa >= fb
+		case "<=":
+			return fa <= fb
+		case ">":
+			return fa > fb
+		case "<":
+			return fa < fb
+		}
+	}
+	sa, soka := a.(string)
+	sb, sokb := b.(string)
+	if soka && sokb {
+		switch op {
+		case ">=":
+			return sa >= sb
+		case "<=":
+			return sa <= sb
+		case ">":
+			return sa > sb
+		case "<":
+			return sa < sb
+		}
+	}
+	return false
 }
 
 func valuesEqual(a, b any) bool {

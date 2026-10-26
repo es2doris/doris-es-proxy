@@ -235,6 +235,9 @@ func DeepMergeMappingProperties(
 			if v.Similarity != "" {
 				merged.Similarity = v.Similarity
 			}
+			if v.MultiValued {
+				merged.MultiValued = true
+			}
 			if len(v.Properties) > 0 {
 				merged.Properties = DeepMergeMappingProperties(existing.Properties, v.Properties)
 			}
@@ -369,7 +372,7 @@ func (s *IndexSchema) registerLeafField(
 		}
 		return
 	}
-	if DefaultMultiValuedPaths[dotPath] {
+	if prop.MultiValued || DefaultMultiValuedPaths[dotPath] {
 		s.Fields[dotPath] = FieldBinding{
 			ESFieldPath:         dotPath,
 			SourceJSONPath:      sourceJSONPath,
@@ -615,9 +618,22 @@ func inferValueProperty(val any, depth int, totalFields *int) (esast.FieldProper
 	case []any:
 		var merged esast.FieldProperty
 		hasElem := false
+		allNumeric := len(v) >= 2
+		hasFloat := false
 		for _, elem := range v {
 			if elem == nil {
+				allNumeric = false
 				continue
+			}
+			switch n := elem.(type) {
+			case float64:
+				hasFloat = true
+			case json.Number:
+				if strings.ContainsAny(n.String(), ".eE") {
+					hasFloat = true
+				}
+			default:
+				allNumeric = false
 			}
 			elemProp, ok := inferValueProperty(elem, depth, totalFields)
 			if !ok {
@@ -630,13 +646,39 @@ func inferValueProperty(val any, depth int, totalFields *int) (esast.FieldProper
 				merged = mergeFieldProperty(merged, elemProp)
 			}
 		}
-		return merged, hasElem
+		if !hasElem {
+			return esast.FieldProperty{}, false
+		}
+		if allNumeric && hasFloat {
+			return esast.FieldProperty{
+				Type:       "dense_vector",
+				Dims:       len(v),
+				Similarity: "cosine",
+			}, true
+		}
+		markPropertyMultiValued(&merged)
+		return merged, true
 	default:
 		return esast.FieldProperty{}, false
 	}
 }
 
+func markPropertyMultiValued(fp *esast.FieldProperty) {
+	if len(fp.Properties) > 0 {
+		for k, sub := range fp.Properties {
+			markPropertyMultiValued(&sub)
+			fp.Properties[k] = sub
+		}
+		return
+	}
+	if fp.Type == "keyword" || fp.Type == "text" {
+		fp.MultiValued = true
+		fp.Fields = nil
+	}
+}
+
 func mergeFieldProperty(existing, incoming esast.FieldProperty) esast.FieldProperty {
+	mv := existing.MultiValued || incoming.MultiValued
 	if len(existing.Properties) > 0 || len(incoming.Properties) > 0 {
 		if existing.Properties == nil {
 			existing.Properties = make(map[string]esast.FieldProperty)
@@ -648,16 +690,24 @@ func mergeFieldProperty(existing, incoming esast.FieldProperty) esast.FieldPrope
 				existing.Properties[k] = v
 			}
 		}
+		existing.MultiValued = mv
 		return existing
 	}
 	if existing.Type == incoming.Type {
+		existing.MultiValued = mv
+		if mv {
+			existing.Fields = nil
+		}
 		return existing
 	}
 	// Widening rules: long + double -> double; keyword + text -> text (with .keyword); date + string -> keyword/text
 	if (existing.Type == "long" && incoming.Type == "double") || (existing.Type == "double" && incoming.Type == "long") {
-		return esast.FieldProperty{Type: "double"}
+		return esast.FieldProperty{Type: "double", MultiValued: mv}
 	}
 	if (existing.Type == "keyword" && incoming.Type == "text") || (existing.Type == "text" && incoming.Type == "keyword") {
+		if mv {
+			return esast.FieldProperty{Type: "keyword", MultiValued: true}
+		}
 		return esast.FieldProperty{
 			Type: "text",
 			Fields: map[string]esast.FieldProperty{
@@ -665,6 +715,7 @@ func mergeFieldProperty(existing, incoming esast.FieldProperty) esast.FieldPrope
 			},
 		}
 	}
+	existing.MultiValued = mv
 	return existing
 }
 

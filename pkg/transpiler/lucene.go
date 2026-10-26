@@ -19,6 +19,7 @@ package transpiler
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
@@ -47,18 +48,18 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 		defaultOp = "OR"
 	}
 
+	parsedAST := parseSimpleLuceneToAST(raw, defaultField, qsq.Fields, defaultOp)
+	compiled := t.CompileQuery(&parsedAST, scoring, nctx)
 	if t.Opts.UseDoris4SearchFunc {
 		col := strings.Trim(t.sqlColumnRef(defaultField, false, nctx), "`")
 		pred := fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(raw), quoteStr(col), quoteStr(defaultOp))
 		return CompiledQuery{
 			WhereSQL:          pred,
-			ScoreSQL:          "1.0",
+			ScoreSQL:          compiled.ScoreSQL,
 			UsesFulltextMatch: true,
 		}
 	}
-
-	parsedAST := parseSimpleLuceneToAST(raw, defaultField, qsq.Fields, defaultOp)
-	return t.CompileQuery(&parsedAST, scoring, nctx)
+	return compiled
 }
 
 const maxLuceneDepth = 32
@@ -135,6 +136,45 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 	if idx := strings.IndexByte(token, ':'); idx > 0 {
 		field := token[:idx]
 		val := strings.TrimSpace(token[idx+1:])
+		if field == "_exists_" && val != "" {
+			return esast.Query{
+				Exists: &esast.ExistsQuery{Field: strings.Trim(val, `"`)},
+			}
+		}
+		if (strings.HasPrefix(val, "[") || strings.HasPrefix(val, "{")) &&
+			(strings.HasSuffix(val, "]") || strings.HasSuffix(val, "}")) && len(val) > 2 {
+			incLower := strings.HasPrefix(val, "[")
+			incUpper := strings.HasSuffix(val, "]")
+			inner := strings.TrimSpace(val[1 : len(val)-1])
+			parts := strings.Split(inner, " TO ")
+			if len(parts) != 2 {
+				parts = strings.Split(inner, " to ")
+			}
+			if len(parts) == 2 {
+				lowerStr := strings.Trim(strings.TrimSpace(parts[0]), `"`)
+				upperStr := strings.Trim(strings.TrimSpace(parts[1]), `"`)
+				var rc esast.RangeCond
+				if lowerStr != "" && lowerStr != "*" {
+					bound := parseLuceneRangeBound(lowerStr)
+					if incLower {
+						rc.GTE = bound
+					} else {
+						rc.GT = bound
+					}
+				}
+				if upperStr != "" && upperStr != "*" {
+					bound := parseLuceneRangeBound(upperStr)
+					if incUpper {
+						rc.LTE = bound
+					} else {
+						rc.LT = bound
+					}
+				}
+				return esast.Query{
+					Range: map[string]esast.RangeCond{field: rc},
+				}
+			}
+		}
 		if strings.HasPrefix(val, "(") && strings.HasSuffix(val, ")") && len(val) > 2 {
 			return parseSimpleLuceneToASTWithDepth(val[1:len(val)-1], field, nil, "OR", depth+1)
 		}
@@ -210,12 +250,23 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 	}
 }
 
+func parseLuceneRangeBound(s string) any {
+	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return i
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return f
+	}
+	return s
+}
+
 func tokenizeLucene(s string) []string {
 	var out []string
 	var curr strings.Builder
 	inQuotes := false
 	escaped := false
 	parenDepth := 0
+	bracketDepth := 0
 	for _, r := range s {
 		if escaped {
 			curr.WriteRune(r)
@@ -239,8 +290,18 @@ func tokenizeLucene(s string) []string {
 				parenDepth--
 			}
 			curr.WriteRune(r)
+		case '[', '{':
+			if !inQuotes {
+				bracketDepth++
+			}
+			curr.WriteRune(r)
+		case ']', '}':
+			if !inQuotes && bracketDepth > 0 {
+				bracketDepth--
+			}
+			curr.WriteRune(r)
 		case ' ', '\t', '\n':
-			if inQuotes || parenDepth > 0 {
+			if inQuotes || parenDepth > 0 || bracketDepth > 0 {
 				curr.WriteRune(r)
 			} else if curr.Len() > 0 {
 				out = append(out, curr.String())

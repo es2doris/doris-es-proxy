@@ -313,15 +313,20 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 	case len(q.Regexp) > 0:
 		keys := sortedMapKeys(q.Regexp)
 		var preds []string
+		var safePreds []string
 		usesFT := false
 		for _, field := range keys {
 			re := q.Regexp[field]
 			b := t.Schema.ResolveField(field)
 			if nctx == nil && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
-				preds = append(preds, fmt.Sprintf("array_exists(_x -> _x REGEXP %s, `%s`)", quoteStr(re.Value), b.ColumnName))
+				arrPred := fmt.Sprintf("array_exists(_x -> _x REGEXP %s, `%s`)", quoteStr(re.Value), b.ColumnName)
+				preds = append(preds, arrPred)
+				safePreds = append(safePreds, arrPred)
 				continue
 			}
 			col := t.sqlColumnRef(field, false, nctx)
+			safePred := fmt.Sprintf("(%s IS NOT NULL AND %s REGEXP %s)", col, col, quoteStr(re.Value))
+			safePreds = append(safePreds, safePred)
 			if nctx != nil {
 				preds = append(preds, fmt.Sprintf("%s REGEXP %s", col, quoteStr(re.Value)))
 			} else {
@@ -329,7 +334,11 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 				usesFT = true
 			}
 		}
-		return CompiledQuery{WhereSQL: strings.Join(preds, " AND "), ScoreSQL: "1.0", UsesFulltextMatch: usesFT}
+		scoreSQL := "1.0"
+		if scoring && len(safePreds) > 0 {
+			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN 1.0000 ELSE 0.0 END)", strings.Join(safePreds, " AND "))
+		}
+		return CompiledQuery{WhereSQL: strings.Join(preds, " AND "), ScoreSQL: scoreSQL, UsesFulltextMatch: usesFT}
 	case len(q.Match) > 0:
 		keys := sortedMapKeys(q.Match)
 		if len(keys) == 1 {
@@ -362,14 +371,22 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 	case q.Nested != nil:
 		return t.compileNested(q.Nested)
 	case q.ConstantScore != nil:
-		inner := t.CompileQuery(&q.ConstantScore.Filter, false, nctx)
+		inner := t.CompileQuery(&q.ConstantScore.Filter, scoring, nctx)
 		boost := 1.0
 		if q.ConstantScore.Boost != nil {
 			boost = *q.ConstantScore.Boost
 		}
+		scoreSQL := fmt.Sprintf("%.4f", boost)
+		if scoring {
+			if inner.UsesFulltextMatch {
+				scoreSQL = fmt.Sprintf("(CASE WHEN (%s) > 0 THEN %.4f ELSE 0.0 END)", inner.ScoreSQL, boost)
+			} else {
+				scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", inner.WhereSQL, boost)
+			}
+		}
 		return CompiledQuery{
 			WhereSQL:          inner.WhereSQL,
-			ScoreSQL:          fmt.Sprintf("%.4f", boost),
+			ScoreSQL:          scoreSQL,
 			UsesFulltextMatch: inner.UsesFulltextMatch,
 		}
 	case q.FunctionScore != nil:
@@ -407,42 +424,68 @@ func (t *Transpiler) compileKNN(kq *esast.KNNQuery, scoring bool, nctx *nestedCt
 	dim := len(kq.QueryVector)
 
 	var conds []string
-	conds = append(conds, fmt.Sprintf("(%s IS NOT NULL AND array_size(%s) = %d)", colExpr, colExpr, dim))
+	var safeConds []string
+	usesFT := false
+	baseCond := fmt.Sprintf("(%s IS NOT NULL AND array_size(%s) = %d)", colExpr, colExpr, dim)
+	conds = append(conds, baseCond)
+	safeConds = append(safeConds, baseCond)
 	for i := range kq.Filter {
-		fc := t.CompileQuery(&kq.Filter[i], false, nctx)
+		fc := t.CompileQuery(&kq.Filter[i], true, nctx)
 		conds = append(conds, fmt.Sprintf("(%s)", fc.WhereSQL))
+		if fc.UsesFulltextMatch {
+			safeConds = append(safeConds, fmt.Sprintf("((%s) > 0)", fc.ScoreSQL))
+			usesFT = true
+		} else {
+			safeConds = append(safeConds, fmt.Sprintf("(%s)", fc.WhereSQL))
+		}
 	}
 
 	distFn := "COSINE_DISTANCE"
 	if strings.EqualFold(b.VectorMetric, "l2_norm") || strings.EqualFold(b.VectorMetric, "l2") {
 		distFn = "L2_DISTANCE"
+	} else if strings.EqualFold(b.VectorMetric, "dot_product") || strings.EqualFold(b.VectorMetric, "max_inner_product") {
+		distFn = "INNER_PRODUCT"
 	}
 	safeColExpr := fmt.Sprintf("IF(array_size(%s) = %d, %s, %s)", colExpr, dim, colExpr, vecLit)
 	distExpr := fmt.Sprintf("%s(%s, %s)", distFn, safeColExpr, vecLit)
 	if kq.Similarity != nil {
-		if distFn == "L2_DISTANCE" {
+		var simCond string
+		switch distFn {
+		case "L2_DISTANCE":
 			simStr := strconv.FormatFloat(*kq.Similarity, 'f', -1, 64)
-			conds = append(conds, fmt.Sprintf("(%s <= %s)", distExpr, simStr))
-		} else {
+			simCond = fmt.Sprintf("(%s <= %s)", distExpr, simStr)
+		case "INNER_PRODUCT":
+			simStr := strconv.FormatFloat(*kq.Similarity, 'f', -1, 64)
+			simCond = fmt.Sprintf("(%s >= %s)", distExpr, simStr)
+		default:
 			maxDist := 1.0 - *kq.Similarity
 			maxDistStr := strconv.FormatFloat(maxDist, 'f', -1, 64)
-			conds = append(conds, fmt.Sprintf("(%s <= %s)", distExpr, maxDistStr))
+			simCond = fmt.Sprintf("(%s <= %s)", distExpr, maxDistStr)
 		}
+		conds = append(conds, simCond)
+		safeConds = append(safeConds, simCond)
 	}
 
 	whereSQL := strings.Join(conds, " AND ")
+	safeWhereSQL := strings.Join(safeConds, " AND ")
 	boost := 1.0
 	if kq.Boost != nil {
 		boost = *kq.Boost
 	}
 	scoreSQL := "1.0"
 	if scoring {
-		scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%.4f * (1.0 / (1.0 + COALESCE(%s, 2.0)))) ELSE 0.0 END)",
-			whereSQL, boost, distExpr)
+		if distFn == "INNER_PRODUCT" {
+			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%.4f * ((1.0 + COALESCE(%s, 0.0)) / 2.0)) ELSE 0.0 END)",
+				safeWhereSQL, boost, distExpr)
+		} else {
+			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%.4f * (1.0 / (1.0 + COALESCE(%s, 2.0)))) ELSE 0.0 END)",
+				safeWhereSQL, boost, distExpr)
+		}
 	}
 	return CompiledQuery{
-		WhereSQL: whereSQL,
-		ScoreSQL: scoreSQL,
+		WhereSQL:          whereSQL,
+		ScoreSQL:          scoreSQL,
+		UsesFulltextMatch: usesFT,
 	}
 }
 
@@ -505,7 +548,7 @@ func (t *Transpiler) compileBoosting(bq *esast.BoostingQuery, scoring bool, nctx
 		return CompiledQuery{WhereSQL: "TRUE", ScoreSQL: "1.0"}
 	}
 	pos := t.CompileQuery(&bq.Positive, scoring, nctx)
-	neg := t.CompileQuery(&bq.Negative, false, nctx)
+	neg := t.CompileQuery(&bq.Negative, true, nctx)
 	negBoost := bq.NegativeBoost
 	if negBoost <= 0 {
 		negBoost = 0.5
@@ -516,13 +559,17 @@ func (t *Transpiler) compileBoosting(bq *esast.BoostingQuery, scoring bool, nctx
 	}
 	scoreSQL := "1.0"
 	if scoring {
+		negCond := neg.WhereSQL
+		if neg.UsesFulltextMatch {
+			negCond = fmt.Sprintf("(%s) > 0", neg.ScoreSQL)
+		}
 		scoreSQL = fmt.Sprintf("(%.4f * (%s) * (CASE WHEN %s THEN %.4f ELSE 1.0 END))",
-			boost, pos.ScoreSQL, neg.WhereSQL, negBoost)
+			boost, pos.ScoreSQL, negCond, negBoost)
 	}
 	return CompiledQuery{
 		WhereSQL:          pos.WhereSQL,
 		ScoreSQL:          scoreSQL,
-		UsesFulltextMatch: pos.UsesFulltextMatch || neg.UsesFulltextMatch,
+		UsesFulltextMatch: pos.UsesFulltextMatch,
 	}
 }
 

@@ -359,3 +359,119 @@ func TestTranspileAllClauses_KNN_Lucene_Aggs_Collapse_SearchAfter(t *testing.T) 
 		}
 	}
 }
+
+func TestCriticalBug2_FulltextInSelect_MinimumShouldMatch_LuceneRangeAndExists_DotProduct(t *testing.T) {
+	mappingJSON := `{
+		"properties": {
+			"title": {"type": "text"},
+			"serviceType": {"type": "keyword"},
+			"latency": {"type": "long"},
+			"embedding": {"type": "dense_vector", "dims": 3, "similarity": "dot_product"}
+		}
+	}`
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(mappingJSON), &spec); err != nil {
+		t.Fatal(err)
+	}
+	idxSchema := schema.CompileIndexSchema("es_compat", "test_idx", &spec)
+	tr := NewTranspiler(idxSchema, TranspilerOptions{})
+
+	// 1. Boosting with fulltext negative clause must NOT leak MATCH_ into SELECT ... AS _score
+	boostJSON := `{
+		"query": {
+			"boosting": {
+				"positive": {"match": {"title": "orders"}},
+				"negative": {"match": {"title": "deprecated"}},
+				"negative_boost": 0.2
+			}
+		}
+	}`
+	var boostReq esast.SearchRequest
+	if err := json.Unmarshal([]byte(boostJSON), &boostReq); err != nil {
+		t.Fatal(err)
+	}
+	boostPlan, err := tr.BuildSearchPlan(&boostReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectPart := strings.Split(boostPlan.HitsSQL, " FROM ")[0]
+	if strings.Contains(selectPart, "MATCH_") {
+		t.Fatalf("SELECT projection must never contain MATCH_ predicate, got:\n%s", boostPlan.HitsSQL)
+	}
+
+	// 2. kNN with fulltext filter and dot_product similarity must NOT leak MATCH_ into SELECT and must use INNER_PRODUCT
+	knnJSON := `{
+		"knn": {
+			"field": "embedding",
+			"query_vector": [0.5, 0.5, 0.0],
+			"k": 5,
+			"filter": {"match": {"title": "orders"}}
+		}
+	}`
+	var knnReq esast.SearchRequest
+	if err := json.Unmarshal([]byte(knnJSON), &knnReq); err != nil {
+		t.Fatal(err)
+	}
+	knnPlan, err := tr.BuildSearchPlan(&knnReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	knnSelect := strings.Split(knnPlan.HitsSQL, " FROM ")[0]
+	if strings.Contains(knnSelect, "MATCH_") {
+		t.Fatalf("kNN SELECT projection must never contain MATCH_ predicate, got:\n%s", knnPlan.HitsSQL)
+	}
+	if !strings.Contains(knnPlan.HitsSQL, "INNER_PRODUCT") {
+		t.Fatalf("expected dot_product vector field to use INNER_PRODUCT, got:\n%s", knnPlan.HitsSQL)
+	}
+
+	// 3. Regexp and constant_score inside bool.should with minimum_should_match must not emit unconditional (1.0) > 0
+	msmJSON := `{
+		"query": {
+			"bool": {
+				"should": [
+					{"regexp": {"serviceType": "Big.*"}},
+					{"constant_score": {"filter": {"term": {"serviceType": "Snowflake"}}, "boost": 2.0}}
+				],
+				"minimum_should_match": 2
+			}
+		}
+	}`
+	var msmReq esast.SearchRequest
+	if err := json.Unmarshal([]byte(msmJSON), &msmReq); err != nil {
+		t.Fatal(err)
+	}
+	msmPlan, err := tr.BuildSearchPlan(&msmReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(msmPlan.HitsSQL, "WHEN (1.0) > 0") || strings.Contains(msmPlan.HitsSQL, "WHEN (2.0000) > 0") {
+		t.Fatalf("expected row-conditional ScoreSQL in minimum_should_match, got:\n%s", msmPlan.HitsSQL)
+	}
+
+	// 4. Lucene query_string with [min TO max] range and _exists_:field
+	qsJSON := `{
+		"query": {
+			"query_string": {
+				"query": "latency:[100 TO 500] AND _exists_:serviceType AND latency:{10 TO *}"
+			}
+		}
+	}`
+	var qsReq esast.SearchRequest
+	if err := json.Unmarshal([]byte(qsJSON), &qsReq); err != nil {
+		t.Fatal(err)
+	}
+	qsPlan, err := tr.BuildSearchPlan(&qsReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"`f__latency` >= 100",
+		"`f__latency` <= 500",
+		"`f__serviceType` IS NOT NULL",
+		"`f__latency` > 10",
+	} {
+		if !strings.Contains(qsPlan.HitsSQL, want) {
+			t.Fatalf("expected Lucene range/exists SQL to contain %q, got:\n%s", want, qsPlan.HitsSQL)
+		}
+	}
+}

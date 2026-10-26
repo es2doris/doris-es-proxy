@@ -1509,11 +1509,14 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 		return int64(len(toStringSlice(val)))
 	}
-	if (strings.HasPrefix(colExpr, "COSINE_DISTANCE(") || strings.HasPrefix(colExpr, "L2_DISTANCE(")) && strings.HasSuffix(colExpr, ")") {
+	if (strings.HasPrefix(colExpr, "COSINE_DISTANCE(") || strings.HasPrefix(colExpr, "L2_DISTANCE(") || strings.HasPrefix(colExpr, "INNER_PRODUCT(")) && strings.HasSuffix(colExpr, ")") {
 		isL2 := strings.HasPrefix(colExpr, "L2_DISTANCE(")
+		isIP := strings.HasPrefix(colExpr, "INNER_PRODUCT(")
 		fnLen := len("COSINE_DISTANCE(")
 		if isL2 {
 			fnLen = len("L2_DISTANCE(")
+		} else if isIP {
+			fnLen = len("INNER_PRODUCT(")
 		}
 		inner := colExpr[fnLen : len(colExpr)-1]
 		args := splitTopLevelArgs(inner)
@@ -1523,6 +1526,9 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			if len(docVec) > 0 && len(docVec) == len(qVec) {
 				if isL2 {
 					return computeL2Distance(docVec, qVec)
+				}
+				if isIP {
+					return computeInnerProduct(docVec, qVec)
 				}
 				return computeCosineDistance(docVec, qVec)
 			}
@@ -1887,6 +1893,14 @@ func computeL2Distance(a, b []float64) float64 {
 		sumSq += d * d
 	}
 	return math.Sqrt(sumSq)
+}
+
+func computeInnerProduct(a, b []float64) float64 {
+	var dot float64
+	for i := range a {
+		dot += a[i] * b[i]
+	}
+	return dot
 }
 
 func toInt64(v any) (int64, bool) {

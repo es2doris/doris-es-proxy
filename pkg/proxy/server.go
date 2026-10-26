@@ -175,7 +175,7 @@ func (s *Server) syncCatalogFromBackend(ctx context.Context) error {
 				_ = json.Unmarshal([]byte(e.PayloadJSON), &spec)
 			}
 			var specPtr *esast.MappingSpec
-			if len(spec.Properties) > 0 {
+			if len(spec.Properties) > 0 || spec.Dynamic != nil {
 				specPtr = &spec
 			}
 			s.indices[e.EntityKey] = schema.CompileIndexSchema(s.dorisDB, e.EntityKey, specPtr)
@@ -306,6 +306,12 @@ func (s *Server) Handler() http.Handler {
 				s.handleHealthz(w, r)
 			case "readyz", "_readyz":
 				s.handleReadyz(w, r)
+			case "_xpack":
+				writeJSON(w, http.StatusOK, map[string]any{
+					"build":    map[string]any{"hash": "doris-es-proxy", "date": "2026-10-25T00:00:00Z"},
+					"license":  map[string]any{"type": "basic", "mode": "basic", "status": "active"},
+					"features": map[string]any{"security": map[string]any{"available": true, "enabled": true}},
+				})
 			default:
 				r.SetPathValue("index", segs[0])
 				switch r.Method {
@@ -356,6 +362,15 @@ func (s *Server) Handler() http.Handler {
 				s.handleValidateQuery(w, r)
 			case segs[0] == "_ingest" && segs[1] == "pipeline":
 				s.handleIngestPipeline(w, r)
+			case segs[0] == "_security" && segs[1] == "_authenticate":
+				writeJSON(w, http.StatusOK, map[string]any{
+					"username":  "elastic",
+					"roles":     []string{"superuser"},
+					"full_name": "doris-es-proxy",
+					"email":     "",
+					"metadata":  map[string]any{},
+					"enabled":   true,
+				})
 			case segs[0] == "_alias":
 				r.SetPathValue("name", segs[1])
 				s.handleGetAliases(w, r)
@@ -847,6 +862,7 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.RLock()
+	oldSchema := s.indices[indexName]
 	tplMappings := s.matchingTemplateMappingsLocked(indexName)
 	s.mu.RUnlock()
 
@@ -856,6 +872,12 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 	if err := s.backend.ExecDDL(r.Context(), ddl); err != nil {
 		writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", err.Error())
 		return
+	}
+	if oldSchema != nil {
+		for _, stmt := range schema.GenerateAlterTableDDL(oldSchema, compiled) {
+			_ = s.backend.ExecDDL(r.Context(), stmt)
+		}
+		s.backfillIndexSchema(r.Context(), compiled)
 	}
 
 	aliasesToPersist := make(map[string][]string)
@@ -1043,6 +1065,7 @@ func (s *Server) handlePutMapping(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		s.backfillIndexSchema(r.Context(), newSchema)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 }
@@ -1256,10 +1279,11 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
 		return
 	}
+	docPayload := s.applyIngestPipelineIfPresent(r.URL.Query().Get("pipeline"), json.RawMessage(rawDoc))
 
-	idxSchema := s.ensureWritableIndexSchemaWithDocs(r.Context(), indexName, []json.RawMessage{json.RawMessage(rawDoc)})
+	idxSchema := s.ensureWritableIndexSchemaWithDocs(r.Context(), indexName, []json.RawMessage{docPayload})
 	nextVer := time.Now().UnixNano()
-	shredded, err := schema.ShredDocument(idxSchema, docID, nextVer, false, json.RawMessage(rawDoc))
+	shredded, err := schema.ShredDocument(idxSchema, docID, nextVer, false, docPayload)
 	if err != nil {
 		writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 		return
@@ -1756,12 +1780,17 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	defaultPipeline := r.URL.Query().Get("pipeline")
 	// Collect sample docs per target index for dynamic mapping inference on auto-created indices.
 	sampleDocsByIndex := make(map[string][]json.RawMessage)
 	idsToFetchByIndex := make(map[string][]string)
-	for _, op := range ops {
+	for idx := range ops {
+		op := &ops[idx]
 		if op.ParseErr != "" {
 			continue
+		}
+		if (op.Action == "index" || op.Action == "create") && len(op.Source) > 0 && defaultPipeline != "" {
+			op.Source = s.applyIngestPipelineIfPresent(defaultPipeline, op.Source)
 		}
 		idxName := s.resolveIndexName(op.Index)
 		if (op.Action == "index" || op.Action == "create") && len(op.Source) > 0 && len(sampleDocsByIndex[idxName]) < 16 {
@@ -2344,7 +2373,15 @@ func (s *Server) executeSearchRequest(
 				idxTotal = r.effectiveCount()
 			}
 		}
-		allAggRows = append(allAggRows, aggRows...)
+		if len(targets) > 1 && idxTotal == 0 {
+			for _, r := range aggRows {
+				if r.AggName == "__meta_total" {
+					allAggRows = append(allAggRows, r)
+				}
+			}
+		} else {
+			allAggRows = append(allAggRows, aggRows...)
+		}
 
 		idxTookMs := time.Since(idxStart).Milliseconds()
 		if idxTookMs <= 0 {
@@ -2368,6 +2405,11 @@ func (s *Server) executeSearchRequest(
 
 	if len(targets) > 1 {
 		sort.SliceStable(allHits, func(i, j int) bool {
+			if len(req.Sort) > 0 {
+				if cmp := compareHitRowsBySort(allHits[i], allHits[j], req.Sort, primarySchema); cmp != 0 {
+					return cmp < 0
+				}
+			}
 			if allHits[i].Score != allHits[j].Score {
 				return allHits[i].Score > allHits[j].Score
 			}
@@ -2399,14 +2441,46 @@ func (s *Server) executeSearchRequest(
 				return &allHits[i]
 			}
 		}
-		if primarySchema != nil {
-			if h, found, err := s.backend.GetDocByID(ctx, primarySchema.DorisDB, primarySchema.DorisTable, id); err == nil && found {
-				return h
+		for _, tName := range targets {
+			tSchema := s.getOrCompileReadOnlySchema(ctx, tName)
+			if tSchema != nil {
+				if h, found, err := s.backend.GetDocByID(ctx, tSchema.DorisDB, tSchema.DorisTable, id); err == nil && found {
+					return h
+				}
 			}
 		}
 		return nil
 	}
 	return buildESResponse(primaryIndex, primarySchema, req, allHits, allAggRows, tookMs, docLookup), http.StatusOK, "", ""
+}
+
+func compareHitRowsBySort(a, b HitRow, sorts []esast.SortSpec, idxSchema *schema.IndexSchema) int {
+	valsA := extractHitSortValues(a, sorts, idxSchema)
+	valsB := extractHitSortValues(b, sorts, idxSchema)
+	for idx, s := range sorts {
+		if idx >= len(valsA) || idx >= len(valsB) {
+			break
+		}
+		va, vb := valsA[idx], valsB[idx]
+		if va == nil && vb == nil {
+			continue
+		}
+		if va == nil {
+			return 1
+		}
+		if vb == nil {
+			return -1
+		}
+		cmp := compareAny(va, vb)
+		if cmp == 0 {
+			continue
+		}
+		if strings.EqualFold(s.Entry.Order, "desc") {
+			return -cmp
+		}
+		return cmp
+	}
+	return 0
 }
 
 func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, aggs map[string]esast.AggSpec) []AggRow {
@@ -2639,6 +2713,22 @@ func buildAggsMap(
 		rows := bucketsByAgg[fullKey]
 		switch {
 		case spec.Terms != nil:
+			if len(rows) > 1 {
+				sort.SliceStable(rows, func(i, j int) bool {
+					ci, cj := rows[i].effectiveCount(), rows[j].effectiveCount()
+					if ci != cj {
+						return ci > cj
+					}
+					return rows[i].BucketKey < rows[j].BucketKey
+				})
+			}
+			limit := spec.Terms.Size
+			if limit <= 0 {
+				limit = 10
+			}
+			if len(rows) > limit {
+				rows = rows[:limit]
+			}
 			b := make([]map[string]any, 0, len(rows))
 			subAggs := spec.SubAggs()
 			for _, r := range rows {
@@ -2747,6 +2837,13 @@ func buildAggsMap(
 			}
 			aggsOut[aggName] = map[string]any{"values": valuesMap}
 		case spec.DateHistogram != nil:
+			if len(rows) > 1 {
+				sort.SliceStable(rows, func(i, j int) bool {
+					ki, _ := strconv.ParseInt(rows[i].BucketKey, 10, 64)
+					kj, _ := strconv.ParseInt(rows[j].BucketKey, 10, 64)
+					return ki < kj
+				})
+			}
 			b := make([]map[string]any, 0, len(rows))
 			subAggs := spec.SubAggs()
 			for _, r := range rows {
@@ -3454,8 +3551,10 @@ func (s *Server) ensureWritableIndexSchemaWithDocs(ctx context.Context, indexNam
 	}
 	idx, ok := s.indices[indexName]
 	if ok {
-		s.mu.RUnlock()
-		return idx
+		if len(idx.Fields) > 0 || len(idx.NestedRoots) > 0 || len(sampleDocs) == 0 {
+			s.mu.RUnlock()
+			return idx
+		}
 	}
 	s.mu.RUnlock()
 
@@ -3466,11 +3565,18 @@ func (s *Server) ensureWritableIndexSchemaWithDocs(ctx context.Context, indexNam
 		indexName = targets[0]
 	}
 	idx, ok = s.indices[indexName]
-	if ok {
+	if ok && (len(idx.Fields) > 0 || len(idx.NestedRoots) > 0 || len(sampleDocs) == 0) {
 		s.mu.RUnlock()
 		return idx
 	}
+	var existingEmptySchema *schema.IndexSchema
+	if ok {
+		existingEmptySchema = idx
+	}
 	tplMappings := s.matchingTemplateMappingsLocked(indexName)
+	if existingEmptySchema != nil && existingEmptySchema.RawMapping != nil {
+		tplMappings = schema.MergeMappingSpecs(tplMappings, existingEmptySchema.RawMapping)
+	}
 	s.mu.RUnlock()
 
 	effectiveMappings := tplMappings
@@ -3481,8 +3587,13 @@ func (s *Server) ensureWritableIndexSchemaWithDocs(ctx context.Context, indexNam
 
 	compiled := schema.CompileIndexSchema(s.dorisDB, indexName, effectiveMappings)
 	_ = s.backend.ExecDDL(ctx, schema.GenerateCreateTableDDL(compiled))
+	if existingEmptySchema != nil {
+		for _, stmt := range schema.GenerateAlterTableDDL(existingEmptySchema, compiled) {
+			_ = s.backend.ExecDDL(ctx, stmt)
+		}
+	}
 	s.mu.Lock()
-	if existing, exists := s.indices[indexName]; exists {
+	if existing, exists := s.indices[indexName]; exists && (len(existing.Fields) > 0 || len(existing.NestedRoots) > 0) {
 		s.mu.Unlock()
 		return existing
 	}

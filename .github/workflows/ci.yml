@@ -51,11 +51,19 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Test with race detector & coverage
-        run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./... -v
+      - name: Test with race detector
+        run: go test -race -count=1 ./... -v
 
-      - name: Coverage summary
-        run: go tool cover -func=coverage.out | tail -1
+      - name: Merged coverage gate (>= 80.0%)
+        run: |
+          rm -rf /tmp/covdata
+          mkdir -p /tmp/covdata
+          go test -cover -coverpkg=./... ./... -args -test.gocoverdir=/tmp/covdata
+          go tool covdata textfmt -i=/tmp/covdata -o=coverage.out
+          TOTAL_LINE=$(go tool cover -func=coverage.out | tail -1)
+          echo "$TOTAL_LINE"
+          PCT=$(echo "$TOTAL_LINE" | awk '{gsub("%","",$3); print $3}')
+          awk -v pct="$PCT" 'BEGIN { if (pct + 0 < 80.0) { printf "Coverage %.1f%% is below 80.0%% threshold\n", pct; exit 1 } }'
 
   lint:
     name: Lint

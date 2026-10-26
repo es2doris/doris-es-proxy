@@ -917,6 +917,7 @@ type FieldProperty struct {
 	Dims           int                      `json:"dims,omitempty"`
 	Dimension      int                      `json:"dimension,omitempty"`
 	Similarity     string                   `json:"similarity,omitempty"`
+	MultiValued    bool                     `json:"multi_valued,omitempty"`
 	Fields         map[string]FieldProperty `json:"fields,omitempty"`
 	Properties     map[string]FieldProperty `json:"properties,omitempty"`
 }
