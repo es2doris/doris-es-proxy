@@ -474,4 +474,138 @@ func TestCriticalBug2_FulltextInSelect_MinimumShouldMatch_LuceneRangeAndExists_D
 			t.Fatalf("expected Lucene range/exists SQL to contain %q, got:\n%s", want, qsPlan.HitsSQL)
 		}
 	}
+
+	// 5. Deep-dive regressions:
+	//    - minimum_should_match with ids/range/exists/prefix/wildcard/bool(filter+must_not)
+	//    - array sub-aggregations (LATERAL VIEW EXPLODE(`...`) `_sub_t` AS `_sub_elem`)
+	//    - dynamic search_after type alignment & post_filter in __meta_total
+	//    - nested query numeric range cast, dynamic subfield, and case_insensitive
+	//    - Lucene mixed AND/OR precedence and ^boost
+	var deepSpec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"group": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+			"tags": {"type": "keyword"},
+			"title": {"type": "text"},
+			"emb": {"type": "dense_vector", "dims": 2},
+			"comments": {
+				"type": "nested",
+				"properties": {
+					"author": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+					"likes": {"type": "integer"}
+				}
+			}
+		}
+	}`), &deepSpec); err != nil {
+		t.Fatal(err)
+	}
+	tagsProp := deepSpec.Properties["tags"]
+	tagsProp.MultiValued = true
+	deepSpec.Properties["tags"] = tagsProp
+	deepSchema := schema.CompileIndexSchema("es_compat", "deep_idx", &deepSpec)
+	deepTr := NewTranspiler(deepSchema, TranspilerOptions{})
+
+	deepJSON := `{
+		"size": 0,
+		"knn": {"field": "emb", "query_vector": [1.0, 0.0], "k": 5},
+		"query": {
+			"bool": {
+				"must": [{"match": {"title": "hello"}}],
+				"should": [
+					{"ids": {"values": ["id-1"]}},
+					{"range": {"comments.likes": {"gte": 10}}},
+					{"exists": {"field": "group"}},
+					{"prefix": {"group": "adm"}},
+					{"wildcard": {"group": "adm*"}},
+					{"bool": {"filter": [{"term": {"group": "admin"}}], "must_not": [{"term": {"group": "banned"}}]}},
+					{"nested": {
+						"path": "comments",
+						"query": {
+							"bool": {
+								"must": [
+									{"range": {"comments.likes": {"gte": 10}}},
+									{"term": {"comments.author": {"value": "ALICE", "case_insensitive": true}}},
+									{"term": {"comments.dyn_flag": "yes"}}
+								]
+							}
+						}
+					}}
+				],
+				"minimum_should_match": 2
+			}
+		},
+		"post_filter": {"term": {"group": "Admin"}},
+		"sort": [{"group": "asc"}, {"dyn_num": "asc"}],
+		"search_after": ["Admin", 42],
+		"aggs": {
+			"by_group": {
+				"terms": {"field": "group"},
+				"aggs": {
+					"top_tags": {"terms": {"field": "tags"}},
+					"uniq_tags": {"cardinality": {"field": "tags"}},
+					"cnt_tags": {"value_count": {"field": "tags"}}
+				}
+			}
+		}
+	}`
+	var deepReq esast.SearchRequest
+	if err := json.Unmarshal([]byte(deepJSON), &deepReq); err != nil {
+		t.Fatal(err)
+	}
+	deepPlan, err := deepTr.BuildSearchPlan(&deepReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(deepPlan.AggsSQL, "WHEN (1.0) > 0") {
+		t.Fatalf("expected no constant WHEN (1.0) > 0 in minimum_should_match SQL, got:\n%s", deepPlan.AggsSQL)
+	}
+	for _, want := range []string{
+		"LATERAL VIEW EXPLODE(`f__tags`) `_sub_t` AS `_sub_elem`",
+		"SELECT '__meta_total' AS `_agg_name`, '_count' AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` FROM `base_matched` WHERE `f__group` = 'admin'",
+		"CAST(json_extract_string(_el, '$.likes') AS BIGINT) >= 10",
+		"lower(json_extract_string(_el, '$.author')) = lower('alice')",
+		"json_extract_string(_el, '$.dyn_flag') = 'yes'",
+	} {
+		if !strings.Contains(deepPlan.AggsSQL, want) {
+			t.Fatalf("expected deepPlan.AggsSQL to contain %q, got:\n%s", want, deepPlan.AggsSQL)
+		}
+	}
+
+	// Verify dynamic search_after cast & lowercase normalizer when size > 0
+	one := 1
+	deepReq.Size = &one
+	deepReq.KNN = nil
+	deepPlanHits, err := deepTr.BuildSearchPlan(&deepReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"`f__group` > 'admin'",
+		"CAST(`_doc`['dyn_num'] AS BIGINT) > 42",
+		"CAST(`_doc`['dyn_num'] AS BIGINT) ASC",
+	} {
+		if !strings.Contains(deepPlanHits.HitsSQL, want) {
+			t.Fatalf("expected deepPlanHits.HitsSQL to contain %q, got:\n%s", want, deepPlanHits.HitsSQL)
+		}
+	}
+
+	// Verify Lucene mixed AND/OR precedence and ^boost suffix
+	luceneMixedJSON := `{
+		"query": {
+			"query_string": {
+				"query": "group:admin^2.5 AND tags:go OR group:ops^1.5"
+			}
+		}
+	}`
+	var luceneMixedReq esast.SearchRequest
+	if err := json.Unmarshal([]byte(luceneMixedJSON), &luceneMixedReq); err != nil {
+		t.Fatal(err)
+	}
+	luceneMixedPlan, err := deepTr.BuildSearchPlan(&luceneMixedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(luceneMixedPlan.HitsSQL, "admin^2.5") || !strings.Contains(luceneMixedPlan.HitsSQL, " OR ") {
+		t.Fatalf("expected Lucene mixed AND/OR + ^boost to strip boost suffix and preserve OR branch, got:\n%s", luceneMixedPlan.HitsSQL)
+	}
 }

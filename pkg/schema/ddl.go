@@ -168,6 +168,11 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 // queried dynamic `_doc['...']` `VARIANT` field to a dedicated physical column with `USING INVERTED`.
 func GeneratePromoteVariantFieldDDL(s *IndexSchema, esFieldPath string, esType string) []string {
 	cleanPath := strings.TrimSuffix(esFieldPath, ".keyword")
+	if s != nil {
+		if existing, ok := s.Fields[cleanPath]; ok && existing.Kind != StorageDynamicVariant {
+			return nil
+		}
+	}
 	colName := "f__" + SanitizeDorisIdentifier(cleanPath)
 	if esType == "" {
 		esType = "keyword"
@@ -178,7 +183,7 @@ func GeneratePromoteVariantFieldDDL(s *IndexSchema, esFieldPath string, esType s
 		Kind:        StoragePromotedScalar,
 		DorisType:   mapESTypeToDoris(esType),
 	}
-	if DefaultMultiValuedPaths[cleanPath] {
+	if DefaultMultiValuedPaths[cleanPath] || strings.EqualFold(esType, "array") {
 		binding.Kind = StoragePromotedArray
 		binding.DorisType = DorisString
 	}

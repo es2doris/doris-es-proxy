@@ -55,6 +55,7 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 		pred := fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(raw), quoteStr(col), quoteStr(defaultOp))
 		return CompiledQuery{
 			WhereSQL:          pred,
+			SafeWhereSQL:      compiled.EffectiveSafeWhere(),
 			ScoreSQL:          compiled.ScoreSQL,
 			UsesFulltextMatch: true,
 		}
@@ -77,17 +78,52 @@ func parseSimpleLuceneToASTWithDepth(expr, defaultField string, fields []string,
 		return esast.Query{MatchAll: map[string]any{}}
 	}
 
-	// Determine effective boolean operator for this group if explicit AND / OR tokens exist
-	groupOp := defaultOp
+	hasAND, hasOR := false, false
 	for _, tok := range tokens {
 		switch strings.ToUpper(tok) {
 		case "AND":
-			groupOp = "AND"
+			hasAND = true
 		case "OR":
-			groupOp = "OR"
+			hasOR = true
 		}
 	}
 
+	// In Lucene grammar, `AND` binds tighter than `OR` (e.g., `a:1 AND b:2 OR c:3` -> `(a:1 AND b:2) OR c:3`).
+	if hasAND && hasOR {
+		var orGroups [][]string
+		var curGroup []string
+		for _, tok := range tokens {
+			if strings.EqualFold(tok, "OR") {
+				if len(curGroup) > 0 {
+					orGroups = append(orGroups, curGroup)
+					curGroup = nil
+				}
+			} else {
+				curGroup = append(curGroup, tok)
+			}
+		}
+		if len(curGroup) > 0 {
+			orGroups = append(orGroups, curGroup)
+		}
+		if len(orGroups) > 1 {
+			var shoulds []esast.Query
+			for _, grp := range orGroups {
+				shoulds = append(shoulds, parseLuceneTokenSlice(grp, defaultField, fields, "AND", depth+1))
+			}
+			return esast.Query{Bool: &esast.BoolQuery{Should: shoulds}}
+		}
+	}
+
+	groupOp := defaultOp
+	if hasAND {
+		groupOp = "AND"
+	} else if hasOR {
+		groupOp = "OR"
+	}
+	return parseLuceneTokenSlice(tokens, defaultField, fields, groupOp, depth)
+}
+
+func parseLuceneTokenSlice(tokens []string, defaultField string, fields []string, groupOp string, depth int) esast.Query {
 	boolQ := &esast.BoolQuery{}
 	negateNext := false
 
@@ -114,7 +150,7 @@ func parseSimpleLuceneToASTWithDepth(expr, defaultField string, fields []string,
 		var clause esast.Query
 		if strings.HasPrefix(tok, "(") && strings.HasSuffix(tok, ")") && len(tok) > 2 {
 			inner := tok[1 : len(tok)-1]
-			clause = parseSimpleLuceneToASTWithDepth(inner, defaultField, fields, defaultOp, depth+1)
+			clause = parseSimpleLuceneToASTWithDepth(inner, defaultField, fields, groupOp, depth+1)
 		} else {
 			clause = buildLuceneAtomQueryWithDepth(tok, defaultField, fields, depth+1)
 		}
@@ -131,8 +167,18 @@ func parseSimpleLuceneToASTWithDepth(expr, defaultField string, fields []string,
 	return esast.Query{Bool: boolQ}
 }
 
+func splitLuceneBoost(s string) (string, float64) {
+	if idx := strings.LastIndexByte(s, '^'); idx > 0 && idx < len(s)-1 {
+		if b, err := strconv.ParseFloat(s[idx+1:], 64); err == nil && b > 0 {
+			return s[:idx], b
+		}
+	}
+	return s, 1.0
+}
+
 func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, depth int) esast.Query {
 	token = strings.TrimSpace(token)
+	token, boost := splitLuceneBoost(token)
 	if idx := strings.IndexByte(token, ':'); idx > 0 {
 		field := token[:idx]
 		val := strings.TrimSpace(token[idx+1:])
@@ -184,7 +230,7 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 			boolVal := strings.EqualFold(val, "true")
 			return esast.Query{
 				Term: map[string]esast.TermEntry{
-					field: {Value: boolVal, Boost: 1.0},
+					field: {Value: boolVal, Boost: boost},
 				},
 			}
 		}
@@ -198,13 +244,13 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 		if isQuoted && strings.Contains(val, " ") {
 			return esast.Query{
 				MatchPhrase: map[string]esast.PhraseEntry{
-					field: {Query: val, Boost: 1.0},
+					field: {Query: val, Boost: boost},
 				},
 			}
 		}
 		return esast.Query{
 			Match: map[string]esast.MatchEntry{
-				field: {Query: val, Operator: "or", Boost: 1.0},
+				field: {Query: val, Operator: "or", Boost: boost},
 			},
 		}
 	}
@@ -245,7 +291,7 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 	}
 	return esast.Query{
 		Match: map[string]esast.MatchEntry{
-			defaultField: {Query: cleanVal, Operator: "or", Boost: 1.0},
+			defaultField: {Query: cleanVal, Operator: "or", Boost: boost},
 		},
 	}
 }

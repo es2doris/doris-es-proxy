@@ -739,7 +739,7 @@ func (s *Server) applyIngestPipelineIfPresent(pipelineID string, raw json.RawMes
 		}
 		if setSpec, ok := pMap["set"].(map[string]any); ok {
 			if field, _ := setSpec["field"].(string); field != "" {
-				doc[field] = setSpec["value"]
+				setIngestPath(doc, field, setSpec["value"])
 				mutated = true
 			}
 		}
@@ -747,9 +747,9 @@ func (s *Server) applyIngestPipelineIfPresent(pipelineID string, raw json.RawMes
 			srcField, _ := renSpec["field"].(string)
 			dstField, _ := renSpec["target_field"].(string)
 			if srcField != "" && dstField != "" {
-				if val, exists := doc[srcField]; exists {
-					doc[dstField] = val
-					delete(doc, srcField)
+				if val, exists := getIngestPath(doc, srcField); exists {
+					setIngestPath(doc, dstField, val)
+					deleteIngestPath(doc, srcField)
 					mutated = true
 				}
 			}
@@ -757,12 +757,12 @@ func (s *Server) applyIngestPipelineIfPresent(pipelineID string, raw json.RawMes
 		if remSpec, ok := pMap["remove"].(map[string]any); ok {
 			switch f := remSpec["field"].(type) {
 			case string:
-				delete(doc, f)
+				deleteIngestPath(doc, f)
 				mutated = true
 			case []any:
 				for _, item := range f {
 					if ks, ok := item.(string); ok {
-						delete(doc, ks)
+						deleteIngestPath(doc, ks)
 						mutated = true
 					}
 				}
@@ -770,25 +770,31 @@ func (s *Server) applyIngestPipelineIfPresent(pipelineID string, raw json.RawMes
 		}
 		if lcSpec, ok := pMap["lowercase"].(map[string]any); ok {
 			if field, _ := lcSpec["field"].(string); field != "" {
-				if strVal, ok := doc[field].(string); ok {
-					doc[field] = strings.ToLower(strVal)
-					mutated = true
+				if val, ok := getIngestPath(doc, field); ok {
+					if strVal, ok := val.(string); ok {
+						setIngestPath(doc, field, strings.ToLower(strVal))
+						mutated = true
+					}
 				}
 			}
 		}
 		if ucSpec, ok := pMap["uppercase"].(map[string]any); ok {
 			if field, _ := ucSpec["field"].(string); field != "" {
-				if strVal, ok := doc[field].(string); ok {
-					doc[field] = strings.ToUpper(strVal)
-					mutated = true
+				if val, ok := getIngestPath(doc, field); ok {
+					if strVal, ok := val.(string); ok {
+						setIngestPath(doc, field, strings.ToUpper(strVal))
+						mutated = true
+					}
 				}
 			}
 		}
 		if trimSpec, ok := pMap["trim"].(map[string]any); ok {
 			if field, _ := trimSpec["field"].(string); field != "" {
-				if strVal, ok := doc[field].(string); ok {
-					doc[field] = strings.TrimSpace(strVal)
-					mutated = true
+				if val, ok := getIngestPath(doc, field); ok {
+					if strVal, ok := val.(string); ok {
+						setIngestPath(doc, field, strings.TrimSpace(strVal))
+						mutated = true
+					}
 				}
 			}
 		}
@@ -801,6 +807,64 @@ func (s *Server) applyIngestPipelineIfPresent(pipelineID string, raw json.RawMes
 		return raw
 	}
 	return json.RawMessage(out)
+}
+
+func getIngestPath(doc map[string]any, path string) (any, bool) {
+	if val, ok := doc[path]; ok {
+		return val, true
+	}
+	segs := strings.Split(path, ".")
+	if len(segs) <= 1 {
+		return nil, false
+	}
+	curr := doc
+	for i := 0; i < len(segs)-1; i++ {
+		next, ok := curr[segs[i]].(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		curr = next
+	}
+	val, ok := curr[segs[len(segs)-1]]
+	return val, ok
+}
+
+func setIngestPath(doc map[string]any, path string, val any) {
+	segs := strings.Split(path, ".")
+	if len(segs) <= 1 {
+		doc[path] = val
+		return
+	}
+	curr := doc
+	for i := 0; i < len(segs)-1; i++ {
+		next, ok := curr[segs[i]].(map[string]any)
+		if !ok {
+			next = make(map[string]any)
+			curr[segs[i]] = next
+		}
+		curr = next
+	}
+	curr[segs[len(segs)-1]] = val
+}
+
+func deleteIngestPath(doc map[string]any, path string) {
+	if _, ok := doc[path]; ok {
+		delete(doc, path)
+		return
+	}
+	segs := strings.Split(path, ".")
+	if len(segs) <= 1 {
+		return
+	}
+	curr := doc
+	for i := 0; i < len(segs)-1; i++ {
+		next, ok := curr[segs[i]].(map[string]any)
+		if !ok {
+			return
+		}
+		curr = next
+	}
+	delete(curr, segs[len(segs)-1])
 }
 
 // handleCatNodes implements `GET /_cat/nodes` for Elasticvue & Cerebro.
@@ -1078,8 +1142,36 @@ func (s *Server) promoteFieldInternal(ctx context.Context, idxName, field, esTyp
 	if esType == "" {
 		esType = "keyword"
 	}
+	cleanField := strings.TrimSuffix(field, ".keyword")
 	idxSchema := s.ensureWritableIndexSchema(ctx, idxName)
-	ddls := schema.GeneratePromoteVariantFieldDDL(idxSchema, field, esType)
+	if existing, ok := idxSchema.Fields[cleanField]; ok && existing.Kind != schema.StorageDynamicVariant {
+		return []string{}, nil
+	}
+
+	isMultiValued := schema.DefaultMultiValuedPaths[cleanField]
+	if !isMultiValued && s.backend != nil {
+		tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
+		sampleSize := 16
+		if plan, err := tr.BuildSearchPlan(&esast.SearchRequest{Size: &sampleSize}); err == nil {
+			if hits, err := s.backend.QueryHits(ctx, plan.HitsSQL); err == nil && len(hits) > 0 {
+				var sampleDocs []json.RawMessage
+				for _, h := range hits {
+					sampleDocs = append(sampleDocs, h.Source)
+				}
+				if inferred := schema.InferMappingFromSampleDocs(sampleDocs); inferred != nil {
+					if fp, found := lookupFieldPropertyByPath(inferred.Properties, strings.Split(cleanField, ".")); found && fp.MultiValued {
+						isMultiValued = true
+					}
+				}
+			}
+		}
+	}
+
+	ddlType := esType
+	if isMultiValued {
+		ddlType = "array"
+	}
+	ddls := schema.GeneratePromoteVariantFieldDDL(idxSchema, cleanField, ddlType)
 	for _, ddl := range ddls {
 		if err := s.backend.ExecDDL(ctx, ddl); err != nil {
 			return nil, err
@@ -1087,7 +1179,7 @@ func (s *Server) promoteFieldInternal(ctx context.Context, idxName, field, esTyp
 	}
 
 	patchSpec := &esast.MappingSpec{
-		Properties: buildNestedMappingProps(strings.Split(field, "."), esast.FieldProperty{Type: esType}),
+		Properties: buildNestedMappingProps(strings.Split(cleanField, "."), esast.FieldProperty{Type: esType, MultiValued: isMultiValued}),
 	}
 	s.mu.Lock()
 	var oldRaw *esast.MappingSpec
@@ -1104,12 +1196,27 @@ func (s *Server) promoteFieldInternal(ctx context.Context, idxName, field, esTyp
 	s.slowTracker.mu.Lock()
 	if byField, ok := s.slowTracker.unindexedFreq[idxName]; ok {
 		delete(byField, field)
+		delete(byField, cleanField)
 		if len(byField) == 0 {
 			delete(s.slowTracker.unindexedFreq, idxName)
 		}
 	}
 	s.slowTracker.mu.Unlock()
 	return ddls, nil
+}
+
+func lookupFieldPropertyByPath(props map[string]esast.FieldProperty, segs []string) (esast.FieldProperty, bool) {
+	if len(segs) == 0 || len(props) == 0 {
+		return esast.FieldProperty{}, false
+	}
+	fp, ok := props[segs[0]]
+	if !ok {
+		return esast.FieldProperty{}, false
+	}
+	if len(segs) == 1 {
+		return fp, true
+	}
+	return lookupFieldPropertyByPath(fp.Properties, segs[1:])
 }
 
 func (s *Server) backfillIndexSchema(ctx context.Context, newSchema *schema.IndexSchema) {

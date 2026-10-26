@@ -255,6 +255,55 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 
+	// 6b. Live Doris Field Promotion + Backfill, Lucene [min TO max] + _exists_:, and Ingest Pipeline
+	promoteResp, err := http.Post(ts.URL+"/live_auto_index/_doris/promote", "application/json",
+		strings.NewReader(`{"field":"service","type":"keyword"}`))
+	if err != nil || promoteResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_doris/promote failed: status=%v err=%v", promoteResp.StatusCode, err)
+	}
+	_ = promoteResp.Body.Close()
+
+	luceneResp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json",
+		strings.NewReader(`{"query":{"query_string":{"query":"latency_ms:[10 TO 100] AND _exists_:service AND service:checkout-api"}}}`))
+	if err != nil || luceneResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search after promote failed: status=%v err=%v", luceneResp.StatusCode, err)
+	}
+	var luceneRes map[string]any
+	_ = json.NewDecoder(luceneResp.Body).Decode(&luceneRes)
+	_ = luceneResp.Body.Close()
+	if luceneRes["hits"].(map[string]any)["total"].(map[string]any)["value"] != float64(1) {
+		t.Fatalf("expected 1 hit after live Doris field promotion + Lucene range/_exists_ query, got: %+v", luceneRes)
+	}
+
+	pipePutReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/_ingest/pipeline/live-pipe",
+		strings.NewReader(`{"processors":[{"set":{"field":"env","value":"prod"}}]}`))
+	pipePutReq.Header.Set("Content-Type", "application/json")
+	pipePutResp, err := http.DefaultClient.Do(pipePutReq)
+	if err != nil || pipePutResp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT /_ingest/pipeline/live-pipe failed: status=%v err=%v", pipePutResp.StatusCode, err)
+	}
+	_ = pipePutResp.Body.Close()
+
+	pipeDocReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/live_auto_index/_doc/auto-2?pipeline=live-pipe&refresh=true",
+		strings.NewReader(`{"service":"billing-api","latency_ms":15}`))
+	pipeDocReq.Header.Set("Content-Type", "application/json")
+	pipeDocResp, err := http.DefaultClient.Do(pipeDocReq)
+	if err != nil || (pipeDocResp.StatusCode != http.StatusOK && pipeDocResp.StatusCode != http.StatusCreated) {
+		t.Fatalf("PUT /live_auto_index/_doc/auto-2?pipeline=live-pipe failed: status=%v err=%v", pipeDocResp.StatusCode, err)
+	}
+	_ = pipeDocResp.Body.Close()
+
+	getAuto2Resp, err := http.Get(ts.URL + "/live_auto_index/_doc/auto-2")
+	if err != nil || getAuto2Resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /live_auto_index/_doc/auto-2 failed: status=%v err=%v", getAuto2Resp.StatusCode, err)
+	}
+	var auto2Doc map[string]any
+	_ = json.NewDecoder(getAuto2Resp.Body).Decode(&auto2Doc)
+	_ = getAuto2Resp.Body.Close()
+	if auto2Doc["_source"].(map[string]any)["env"] != "prod" {
+		t.Fatalf("expected ingest pipeline to set env=prod on live Doris, got: %+v", auto2Doc)
+	}
+
 	// 7. Stateless _es_catalog Rehydration across a fresh Server instance
 	srv2 := proxy.NewServer(dorisDB, backend, transpiler.TranspilerOptions{})
 	if err := srv2.BootstrapCatalog(context.Background()); err != nil {

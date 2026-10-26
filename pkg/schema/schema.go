@@ -343,7 +343,7 @@ func (s *IndexSchema) registerLeafField(
 			SourceJSONPath:      sourceJSONPath,
 			Kind:                StorageNestedSubfield,
 			ColumnName:          prefilterCol,
-			DorisType:           DorisString,
+			DorisType:           dorisType,
 			Analyzer:            prop.Analyzer,
 			LowercaseNormalizer: lowerNorm,
 			NestedPath:          activeNestedRoot,
@@ -671,7 +671,7 @@ func markPropertyMultiValued(fp *esast.FieldProperty) {
 		}
 		return
 	}
-	if fp.Type == "keyword" || fp.Type == "text" {
+	if fp.Type != "" && fp.Type != "dense_vector" && fp.Type != "knn_vector" {
 		fp.MultiValued = true
 		fp.Fields = nil
 	}
