@@ -16,11 +16,12 @@
 # under the License.
 
 FROM golang:1.26-alpine AS builder
+ARG VERSION=v0.15.0
 WORKDIR /src
 COPY go.mod go.sum ./
 COPY cmd ./cmd
 COPY pkg ./pkg
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/doris-es-proxy ./cmd/doris-es-proxy
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/doris-es-proxy ./cmd/doris-es-proxy
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /out/doris-es-proxy /doris-es-proxy

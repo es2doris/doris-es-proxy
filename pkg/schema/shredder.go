@@ -309,8 +309,11 @@ func ParseESDateBoundToEpochMillis(input string, now time.Time, roundUp bool) (i
 	var mathExpr string
 
 	if strings.HasPrefix(s, "now") {
-		baseTime = now.UTC()
 		mathExpr = s[3:]
+		if mathExpr != "" && mathExpr[0] != '+' && mathExpr[0] != '-' && mathExpr[0] != '/' {
+			return 0, false
+		}
+		baseTime = now.UTC()
 	} else if idx := strings.Index(s, "||"); idx >= 0 {
 		prefix := strings.TrimSpace(s[:idx])
 		mathExpr = strings.TrimSpace(s[idx+2:])
@@ -335,7 +338,10 @@ func ParseESDateBoundToEpochMillis(input string, now time.Time, roundUp bool) (i
 		return t.UnixMilli(), true
 	}
 
-	t := applyESDateMathWithRound(baseTime, mathExpr, roundUp)
+	t, ok := applyESDateMathWithRound(baseTime, mathExpr, roundUp)
+	if !ok {
+		return 0, false
+	}
 	return t.UnixMilli(), true
 }
 
@@ -364,15 +370,21 @@ func parseISODateString(s string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func applyESDateMathWithRound(base time.Time, expr string, roundUp bool) time.Time {
+func applyESDateMathWithRound(base time.Time, expr string, roundUp bool) (time.Time, bool) {
 	t := base.UTC()
 	i := 0
 	for i < len(expr) {
 		if expr[i] == '/' {
 			i++
-			if i < len(expr) {
+			if i >= len(expr) {
+				return time.Time{}, false
+			}
+			switch expr[i] {
+			case 'y', 'Y', 'M', 'w', 'W', 'd', 'D', 'h', 'H', 'm', 's':
 				t = roundTimeToUnit(t, expr[i], roundUp)
 				i++
+			default:
+				return time.Time{}, false
 			}
 			continue
 		}
@@ -385,17 +397,19 @@ func applyESDateMathWithRound(base time.Time, expr string, roundUp bool) time.Ti
 			sign = -1
 			i++
 		default:
-			i++
-			continue
+			return time.Time{}, false
 		}
 		numStart := i
 		for i < len(expr) && expr[i] >= '0' && expr[i] <= '9' {
 			i++
 		}
 		if numStart == i || i >= len(expr) {
-			break
+			return time.Time{}, false
 		}
-		n, _ := strconv.Atoi(expr[numStart:i])
+		n, err := strconv.Atoi(expr[numStart:i])
+		if err != nil || n > 100000 {
+			return time.Time{}, false
+		}
 		unit := expr[i]
 		i++
 		val := sign * n
@@ -414,9 +428,11 @@ func applyESDateMathWithRound(base time.Time, expr string, roundUp bool) time.Ti
 			t = t.Add(time.Duration(val) * time.Minute)
 		case 's':
 			t = t.Add(time.Duration(val) * time.Second)
+		default:
+			return time.Time{}, false
 		}
 	}
-	return t
+	return t, true
 }
 
 func roundTimeToUnit(t time.Time, roundUnit byte, roundUp bool) time.Time {

@@ -390,6 +390,15 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	}
 	_ = fcResp.Body.Close()
 
+	// Verify /readyz, /metrics, and /_doris/slowlog against live Doris
+	for _, ep := range []string{"/readyz", "/metrics", "/_doris/slowlog"} {
+		epResp, err := http.Get(ts.URL + ep)
+		if err != nil || epResp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s on live Doris failed: status=%v err=%v", ep, epResp.StatusCode, err)
+		}
+		_ = epResp.Body.Close()
+	}
+
 	// 7. Stateless _es_catalog Rehydration across a fresh Server instance
 	srv2 := proxy.NewServer(dorisDB, backend, transpiler.TranspilerOptions{})
 	if err := srv2.BootstrapCatalog(context.Background()); err != nil {

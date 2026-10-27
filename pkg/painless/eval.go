@@ -721,10 +721,14 @@ func findTopLevelAddSub(expr string) (int, bool) {
 			}
 		case '+', '-':
 			if depth == 0 && i > 0 {
+				if (expr[i-1] == 'e' || expr[i-1] == 'E') && i >= 2 && ((expr[i-2] >= '0' && expr[i-2] <= '9') || expr[i-2] == '.') {
+					continue
+				}
 				prev := strings.TrimSpace(expr[:i])
 				if len(prev) > 0 {
 					lastChar := prev[len(prev)-1]
-					if lastChar != '+' && lastChar != '-' && lastChar != '*' && lastChar != '/' && lastChar != '(' {
+					if lastChar != '+' && lastChar != '-' && lastChar != '*' && lastChar != '/' && lastChar != '(' &&
+						lastChar != ',' && lastChar != '?' && lastChar != ':' && lastChar != '=' && lastChar != '<' && lastChar != '>' && lastChar != '!' {
 						lastIdx = i
 						lastIsAdd = c == '+'
 					}
@@ -777,7 +781,10 @@ func applyMulDiv(a, b any, isMul bool) any {
 		} else if bf != 0 {
 			res = af / bf
 		}
-		if !math.IsNaN(res) && !math.IsInf(res, 0) && res >= float64(math.MinInt64) && res < float64(math.MaxInt64) && res == float64(int64(res)) {
+		if math.IsNaN(res) || math.IsInf(res, 0) {
+			return float64(0)
+		}
+		if res >= float64(math.MinInt64) && res < float64(math.MaxInt64) && res == float64(int64(res)) {
 			return int64(res)
 		}
 		return res
@@ -800,7 +807,10 @@ func applyArithmetic(a, b any, isAdd bool) any {
 		if !isAdd {
 			res = af - bf
 		}
-		if !math.IsNaN(res) && !math.IsInf(res, 0) && res >= float64(math.MinInt64) && res < float64(math.MaxInt64) && res == float64(int64(res)) {
+		if math.IsNaN(res) || math.IsInf(res, 0) {
+			return float64(0)
+		}
+		if res >= float64(math.MinInt64) && res < float64(math.MaxInt64) && res == float64(int64(res)) {
 			return int64(res)
 		}
 		return res

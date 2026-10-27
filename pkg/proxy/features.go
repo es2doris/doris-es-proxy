@@ -336,7 +336,7 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 			}))
 		}
 
-		maxBytes := s.maxBodyBytes
+		maxBytes := atomic.LoadInt64(&s.maxBodyBytes)
 		if maxBytes <= 0 {
 			maxBytes = DefaultMaxRequestBodyBytes
 		}
@@ -520,12 +520,28 @@ func (t *SlowQueryTracker) recordWithThreshold(entry SlowQueryEntry, threshold i
 	}
 	var promoteFields []string
 	if len(entry.UnindexedVariantFields) > 0 {
+		const (
+			maxTrackedIndices        = 256
+			maxTrackedFieldsPerIndex = 1024
+		)
 		byField, ok := t.unindexedFreq[entry.Index]
 		if !ok {
+			if len(t.unindexedFreq) >= maxTrackedIndices {
+				for k := range t.unindexedFreq {
+					delete(t.unindexedFreq, k)
+					break
+				}
+			}
 			byField = make(map[string]int64)
 			t.unindexedFreq[entry.Index] = byField
 		}
 		for _, f := range entry.UnindexedVariantFields {
+			if _, exists := byField[f]; !exists && len(byField) >= maxTrackedFieldsPerIndex {
+				for k := range byField {
+					delete(byField, k)
+					break
+				}
+			}
 			byField[f]++
 			if threshold > 0 && byField[f] >= threshold {
 				promoteFields = append(promoteFields, f)
