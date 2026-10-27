@@ -394,10 +394,10 @@ func (tq *TermsQuery) UnmarshalJSON(data []byte) error {
 
 // TermsSetEntry models a `terms_set` query on a field.
 type TermsSetEntry struct {
-	Terms                   []any          `json:"terms"`
-	MinimumShouldMatchField string         `json:"minimum_should_match_field,omitempty"`
+	Terms                    []any          `json:"terms"`
+	MinimumShouldMatchField  string         `json:"minimum_should_match_field,omitempty"`
 	MinimumShouldMatchScript map[string]any `json:"minimum_should_match_script,omitempty"`
-	Boost                   *float64       `json:"boost,omitempty"`
+	Boost                    *float64       `json:"boost,omitempty"`
 }
 
 // FuzzyEntry models a `fuzzy` query (`{"fuzzy": {"name": "alice"}}` or `{"fuzzy": {"name": {"value": "alice", "fuzziness": "AUTO"}}}`).

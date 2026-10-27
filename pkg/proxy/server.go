@@ -748,8 +748,8 @@ func (s *Server) handleNodes(w http.ResponseWriter, _ *http.Request) {
 				"version":           "7.10.2",
 				"roles":             []string{"master", "data", "ingest"},
 				"http": map[string]any{
-					"bound_address":             []string{"0.0.0.0:9200"},
-					"publish_address":           "127.0.0.1:9200",
+					"bound_address":               []string{"0.0.0.0:9200"},
+					"publish_address":             "127.0.0.1:9200",
 					"max_content_length_in_bytes": DefaultMaxRequestBodyBytes,
 				},
 			},
