@@ -171,6 +171,7 @@ func (c *StreamLoadCoalescer) FlushTable(ctx context.Context, table string) erro
 			defer c.inflight.Done()
 			c.executeBatch(ctx, table, b, true)
 		}()
+		c.inflight.Wait()
 		return b.err
 	}
 	c.inflight.Wait()
@@ -182,6 +183,7 @@ func (c *StreamLoadCoalescer) FlushAll(ctx context.Context) error {
 	c.mu.Lock()
 	if len(c.batches) == 0 {
 		c.mu.Unlock()
+		c.inflight.Wait()
 		return nil
 	}
 	pending := make(map[string]*coalesceBatch, len(c.batches))
@@ -203,6 +205,7 @@ func (c *StreamLoadCoalescer) FlushAll(ctx context.Context) error {
 			firstErr = b.err
 		}
 	}
+	c.inflight.Wait()
 	return firstErr
 }
 
@@ -300,11 +303,24 @@ func (qc *QueryResultCache) InvalidateAll() {
 }
 
 func containsNowDateMath(req *esast.SearchRequest, reqBytes []byte) bool {
-	if bytes.Contains(reqBytes, []byte(`"now`)) {
+	if bytes.Contains(reqBytes, []byte(`"now`)) ||
+		bytes.Contains(reqBytes, []byte("now-")) ||
+		bytes.Contains(reqBytes, []byte("now+")) ||
+		bytes.Contains(reqBytes, []byte("now/")) ||
+		bytes.Contains(reqBytes, []byte("TO now")) {
 		return true
 	}
-	if req != nil && (queryContainsNow(req.Query) || queryContainsNow(req.PostFilter)) {
-		return true
+	if req != nil {
+		if queryContainsNow(req.Query) || queryContainsNow(req.PostFilter) {
+			return true
+		}
+		for i := range req.KNN {
+			for j := range req.KNN[i].Filter {
+				if queryContainsNow(&req.KNN[i].Filter[j]) {
+					return true
+				}
+			}
+		}
 	}
 	return false
 }
@@ -318,6 +334,42 @@ func queryContainsNow(q *esast.Query) bool {
 	}
 	if q.SimpleQueryString != nil && strings.Contains(q.SimpleQueryString.Query, "now") {
 		return true
+	}
+	if q.ConstantScore != nil && queryContainsNow(&q.ConstantScore.Filter) {
+		return true
+	}
+	if q.DisMax != nil {
+		for i := range q.DisMax.Queries {
+			if queryContainsNow(&q.DisMax.Queries[i]) {
+				return true
+			}
+		}
+	}
+	if q.Boosting != nil && (queryContainsNow(&q.Boosting.Positive) || queryContainsNow(&q.Boosting.Negative)) {
+		return true
+	}
+	if q.Nested != nil && queryContainsNow(&q.Nested.Query) {
+		return true
+	}
+	if q.FunctionScore != nil {
+		if queryContainsNow(q.FunctionScore.Query) {
+			return true
+		}
+		for i := range q.FunctionScore.Functions {
+			if queryContainsNow(q.FunctionScore.Functions[i].Filter) {
+				return true
+			}
+		}
+	}
+	if q.ScriptScore != nil && queryContainsNow(q.ScriptScore.Query) {
+		return true
+	}
+	if q.KNN != nil {
+		for i := range q.KNN.Filter {
+			if queryContainsNow(&q.KNN.Filter[i]) {
+				return true
+			}
+		}
 	}
 	if q.Bool != nil {
 		for i := range q.Bool.Must {

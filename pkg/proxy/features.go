@@ -102,6 +102,9 @@ type esFormatResponseWriter struct {
 }
 
 func extractESResponseFormatOptions(w http.ResponseWriter) (esResponseFormatOptions, bool) {
+	if gw, ok := w.(*gzipResponseWriter); ok {
+		w = gw.ResponseWriter
+	}
 	if fw, ok := w.(*esFormatResponseWriter); ok {
 		return fw.opts, true
 	}
@@ -174,6 +177,7 @@ func applyESFilterPath(v any, filterPaths []string) any {
 
 func advanceFilterPatterns(patterns [][]string, key string) [][]string {
 	var next [][]string
+	hasDot := strings.Contains(key, ".")
 	for _, p := range patterns {
 		if len(p) == 0 {
 			next = append(next, []string{})
@@ -185,11 +189,23 @@ func advanceFilterPatterns(patterns [][]string, key string) [][]string {
 				next = append(next, []string{})
 			} else if matchWildcardPattern(p[1], key) {
 				next = append(next, p[2:])
+			} else if hasDot && len(p) >= 3 {
+				for k := 3; k <= len(p); k++ {
+					if matchWildcardPattern(strings.Join(p[1:k], "."), key) {
+						next = append(next, p[k:])
+					}
+				}
 			}
 			continue
 		}
 		if matchWildcardPattern(p[0], key) {
 			next = append(next, p[1:])
+		} else if hasDot && len(p) >= 2 {
+			for k := 2; k <= len(p); k++ {
+				if matchWildcardPattern(strings.Join(p[:k], "."), key) {
+					next = append(next, p[k:])
+				}
+			}
 		}
 	}
 	return next
@@ -281,6 +297,10 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		if fmtOpts, ok := parseESResponseFormatOptions(r); ok {
+			w = &esFormatResponseWriter{ResponseWriter: w, opts: fmtOpts}
+		}
+
 		if !s.checkInboundAuth(w, r) {
 			return
 		}
@@ -340,10 +360,6 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 			gzw := &gzipResponseWriter{ResponseWriter: w, gz: gz}
 			defer gzw.Close()
 			w = gzw
-		}
-
-		if fmtOpts, ok := parseESResponseFormatOptions(r); ok {
-			w = &esFormatResponseWriter{ResponseWriter: w, opts: fmtOpts}
 		}
 
 		atomic.AddInt64(&s.totalHTTPRequests, 1)
@@ -1296,8 +1312,10 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		batchSize = *body.Source.Size
 	}
 
+	s.resolveTermsLookupsInQuery(r.Context(), body.Source.Query)
 	for _, srcIdx := range srcTargets {
 		srcSchema := s.getOrCompileReadOnlySchema(r.Context(), srcIdx)
+		_ = s.coalescer.FlushTable(r.Context(), srcSchema.DorisTable)
 		tr := transpiler.NewTranspiler(srcSchema, s.transpileOpts)
 		var searchAfter []any
 
@@ -1472,6 +1490,7 @@ func (s *Server) promoteFieldInternal(ctx context.Context, idxName, field, esTyp
 
 	isMultiValued := schema.DefaultMultiValuedPaths[cleanField]
 	if !isMultiValued && s.backend != nil {
+		_ = s.coalescer.FlushTable(ctx, idxSchema.DorisTable)
 		tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
 		sampleSize := 16
 		if plan, err := tr.BuildSearchPlan(&esast.SearchRequest{Size: &sampleSize, TrackTotalHits: false}); err == nil {
@@ -1537,6 +1556,7 @@ func (s *Server) backfillIndexSchema(ctx context.Context, newSchema *schema.Inde
 	if newSchema == nil || s.backend == nil {
 		return
 	}
+	_ = s.coalescer.FlushTable(ctx, newSchema.DorisTable)
 	tr := transpiler.NewTranspiler(newSchema, s.transpileOpts)
 	batchSize := 1000
 	var searchAfter []any
@@ -1622,6 +1642,7 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	applyURISearchParams(r, &req)
+	_ = s.resolveTermsLookupsInSearchRequest(r.Context(), &req)
 
 	var explanations []map[string]any
 	for _, idxName := range targets {

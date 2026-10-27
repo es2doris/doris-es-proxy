@@ -1174,16 +1174,31 @@ func evalCompositeKeyExpr(row map[string]any, expr string) string {
 	return evalBucketKeyExpr(row, expr)
 }
 
-var reLateralViewExplode = regexp.MustCompile("LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `[^`]+` AS `([^`]+)`")
+var reLateralViewExplode = regexp.MustCompile("LATERAL VIEW EXPLODE\\((?:(CASE WHEN )`([^`]+)` IS NULL.+?END|`([^`]+)`)\\) `[^`]+` AS `([^`]+)`")
 
 func expandFromClauseRows(baseRows []map[string]any, fromClause, whereClause string) []map[string]any {
 	explodes := reLateralViewExplode.FindAllStringSubmatch(fromClause, -1)
 	currRows := baseRows
 	for _, m := range explodes {
-		explodeCol, aliasName := m[1], m[2]
+		isCaseNull := m[1] != ""
+		explodeCol := m[2]
+		if explodeCol == "" {
+			explodeCol = m[3]
+		}
+		aliasName := m[4]
 		var nextRows []map[string]any
 		for _, row := range currRows {
-			for _, elem := range toStringSlice(row[explodeCol]) {
+			elems := toStringSlice(row[explodeCol])
+			if len(elems) == 0 && isCaseNull {
+				cp := make(map[string]any, len(row)+1)
+				for k, v := range row {
+					cp[k] = v
+				}
+				cp[aliasName] = nil
+				nextRows = append(nextRows, cp)
+				continue
+			}
+			for _, elem := range elems {
 				cp := make(map[string]any, len(row)+1)
 				for k, v := range row {
 					cp[k] = v
@@ -1346,11 +1361,12 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 
 	if strings.HasPrefix(expr, "array_contains(") && strings.HasSuffix(expr, ")") {
 		inner := expr[len("array_contains(") : len(expr)-1]
-		commaIdx := strings.IndexByte(inner, ',')
+		commaIdx := strings.LastIndexByte(inner, ',')
 		if commaIdx > 0 {
-			colName := strings.Trim(strings.TrimSpace(inner[:commaIdx]), "`")
+			colExpr := strings.TrimSpace(inner[:commaIdx])
 			target := unquoteSQLLiteral(strings.TrimSpace(inner[commaIdx+1:]))
-			for _, item := range toStringSlice(row[colName]) {
+			val := resolveColumnValue(row, colExpr)
+			for _, item := range toStringSlice(val) {
 				if item == target {
 					return true
 				}
@@ -1363,13 +1379,14 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 		inner := expr[len("arrays_overlap(") : len(expr)-1]
 		brackIdx := strings.IndexByte(inner, '[')
 		if brackIdx > 0 {
-			colName := strings.Trim(strings.TrimSpace(inner[:strings.IndexByte(inner, ',')]), "`")
+			colExpr := strings.TrimSpace(inner[:strings.IndexByte(inner, ',')])
 			listStr := strings.TrimSuffix(inner[brackIdx+1:], "]")
 			targets := make(map[string]bool)
 			for _, part := range strings.Split(listStr, ",") {
 				targets[unquoteSQLLiteral(strings.TrimSpace(part))] = true
 			}
-			for _, item := range toStringSlice(row[colName]) {
+			val := resolveColumnValue(row, colExpr)
+			for _, item := range toStringSlice(val) {
 				if targets[item] {
 					return true
 				}
@@ -1379,8 +1396,8 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 	}
 
 	if strings.HasPrefix(expr, "array_size(") && strings.HasSuffix(expr, ") > 0") {
-		colName := strings.Trim(strings.TrimSpace(expr[len("array_size("):len(expr)-len(") > 0")]), "`")
-		return len(toStringSlice(row[colName])) > 0
+		colExpr := strings.TrimSpace(expr[len("array_size(") : len(expr)-len(") > 0")])
+		return len(toStringSlice(resolveColumnValue(row, colExpr))) > 0
 	}
 
 	if strings.HasSuffix(expr, " IS NOT NULL") {
@@ -1467,7 +1484,10 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 			}
 			if op == ">=" && strings.Contains(lhs, " + ") {
 				lhsNum := evalNumericExpr(row, lhs)
-				rhsNum, _ := strconv.ParseFloat(rhs, 64)
+				rhsNum, err := strconv.ParseFloat(rhs, 64)
+				if err != nil {
+					rhsNum = evalNumericExpr(row, rhs)
+				}
 				return lhsNum >= rhsNum
 			}
 			val := resolveColumnValue(row, lhs)
@@ -1686,6 +1706,30 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 		return f
 	}
 
+	if parts := splitTopLevelBinaryMath(expr, '+'); len(parts) > 1 {
+		sum := 0.0
+		for _, p := range parts {
+			sum += evalNumericExpr(row, p)
+		}
+		return sum
+	}
+
+	if parts := splitTopLevelBinaryMath(expr, '*'); len(parts) > 1 {
+		prod := 1.0
+		for _, p := range parts {
+			prod *= evalNumericExpr(row, p)
+		}
+		return prod
+	}
+
+	if parts := splitTopLevelBinaryMath(expr, '/'); len(parts) == 2 {
+		denom := evalNumericExpr(row, parts[1])
+		if denom == 0 {
+			return 0
+		}
+		return evalNumericExpr(row, parts[0]) / denom
+	}
+
 	if strings.HasPrefix(expr, "CASE WHEN ") && strings.HasSuffix(expr, " END") {
 		inner := expr[len("CASE WHEN ") : len(expr)-len(" END")]
 		elseIdx := findTopLevelOp(inner, " ELSE ")
@@ -1769,30 +1813,6 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 		}
 	}
 
-	if parts := splitTopLevelBinaryMath(expr, '+'); len(parts) > 1 {
-		sum := 0.0
-		for _, p := range parts {
-			sum += evalNumericExpr(row, p)
-		}
-		return sum
-	}
-
-	if parts := splitTopLevelBinaryMath(expr, '*'); len(parts) > 1 {
-		prod := 1.0
-		for _, p := range parts {
-			prod *= evalNumericExpr(row, p)
-		}
-		return prod
-	}
-
-	if parts := splitTopLevelBinaryMath(expr, '/'); len(parts) == 2 {
-		denom := evalNumericExpr(row, parts[1])
-		if denom == 0 {
-			return 0
-		}
-		return evalNumericExpr(row, parts[0]) / denom
-	}
-
 	val := resolveColumnValue(row, expr)
 	if f, ok := toFloat(val); ok {
 		return f
@@ -1819,7 +1839,14 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			varName := strings.Trim(strings.TrimSpace(inner[:commaIdx]), "`")
 			jsonPath := strings.TrimPrefix(unquoteSQLLiteral(strings.TrimSpace(inner[commaIdx+1:])), "$.")
 			elemJSON, _ := row[varName].(string)
-			return extractJSONPathFromStr(elemJSON, strings.Split(jsonPath, "."))
+			res := extractJSONPathFromStr(elemJSON, strings.Split(jsonPath, "."))
+			switch rv := res.(type) {
+			case []any, map[string]any:
+				if b, err := json.Marshal(rv); err == nil {
+					return string(b)
+				}
+			}
+			return res
 		}
 	}
 	if strings.HasPrefix(colExpr, "CAST(`_doc`") {
@@ -1962,11 +1989,22 @@ func trimOuterParens(s string) string {
 		matchedAtEnd := false
 		for i := 0; i < len(s); i++ {
 			c := s[i]
-			if c == '\'' && (i == 0 || s[i-1] != '\\') {
-				inQuotes = !inQuotes
+			if inQuotes {
+				if c == '\\' && i+1 < len(s) {
+					i++
+					continue
+				}
+				if c == '\'' {
+					if i+1 < len(s) && s[i+1] == '\'' {
+						i++
+						continue
+					}
+					inQuotes = false
+				}
 				continue
 			}
-			if inQuotes {
+			if c == '\'' {
+				inQuotes = true
 				continue
 			}
 			if c == '(' {
@@ -1997,11 +2035,22 @@ func splitTopLevelLogicalOp(s, op string) []string {
 	lastStart := 0
 	for i := 0; i <= len(s)-len(op); i++ {
 		c := s[i]
-		if c == '\'' && (i == 0 || s[i-1] != '\\') {
-			inQuotes = !inQuotes
+		if inQuotes {
+			if c == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				inQuotes = false
+			}
 			continue
 		}
-		if inQuotes {
+		if c == '\'' {
+			inQuotes = true
 			continue
 		}
 		switch c {
@@ -2031,11 +2080,22 @@ func splitTopLevelBinaryMath(s string, op byte) []string {
 	lastStart := 0
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if c == '\'' && (i == 0 || s[i-1] != '\\') {
-			inQuotes = !inQuotes
+		if inQuotes {
+			if c == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				inQuotes = false
+			}
 			continue
 		}
-		if inQuotes {
+		if c == '\'' {
+			inQuotes = true
 			continue
 		}
 		switch c {
@@ -2065,11 +2125,22 @@ func splitTopLevelArgs(s string) []string {
 	lastStart := 0
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if c == '\'' && (i == 0 || s[i-1] != '\\') {
-			inQuotes = !inQuotes
+		if inQuotes {
+			if c == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				inQuotes = false
+			}
 			continue
 		}
-		if inQuotes {
+		if c == '\'' {
+			inQuotes = true
 			continue
 		}
 		switch c {
@@ -2095,11 +2166,22 @@ func findTopLevelOp(s, op string) int {
 	inQuotes := false
 	for i := 0; i <= len(s)-len(op); i++ {
 		c := s[i]
-		if c == '\'' && (i == 0 || s[i-1] != '\\') {
-			inQuotes = !inQuotes
+		if inQuotes {
+			if c == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				inQuotes = false
+			}
 			continue
 		}
-		if inQuotes {
+		if c == '\'' {
+			inQuotes = true
 			continue
 		}
 		switch c {

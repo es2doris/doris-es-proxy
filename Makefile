@@ -38,10 +38,12 @@ bench:
 	go test -bench=. -benchmem -run=^$$ ./pkg/...
 
 fuzz:
-	go test -fuzz=FuzzBuildSearchPlan -fuzztime=5s ./pkg/transpiler
-	go test -fuzz=FuzzEvalPainless -fuzztime=5s ./pkg/painless
-	go test -fuzz=FuzzShredDocument -fuzztime=5s ./pkg/schema
-	go test -fuzz=FuzzParseBulkNDJSON -fuzztime=5s ./pkg/esast
+	go test -fuzz='^FuzzBuildSearchPlan$$' -fuzztime=5s ./pkg/transpiler
+	go test -fuzz='^FuzzBuildSearchPlanWithDoris4SearchFn$$' -fuzztime=5s ./pkg/transpiler
+	go test -fuzz='^FuzzEvalPainless$$' -fuzztime=5s ./pkg/painless
+	go test -fuzz='^FuzzPainlessEval$$' -fuzztime=5s ./pkg/painless
+	go test -fuzz='^FuzzShredDocument$$' -fuzztime=5s ./pkg/schema
+	go test -fuzz='^FuzzParseBulkNDJSON$$' -fuzztime=5s ./pkg/esast
 
 test-e2e:
 	DORIS_E2E_DSN="$(DORIS_E2E_DSN)" DORIS_E2E_HTTP="$(DORIS_E2E_HTTP)" go test -race -count=1 -v ./e2e -run TestLiveApacheDoris_E2E

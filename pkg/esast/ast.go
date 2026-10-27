@@ -335,9 +335,10 @@ type TermsLookupSpec struct {
 // TermsQuery handles `"terms": {"field": ["a", "b"], "boost": 1.0}` as well as
 // Terms Lookup queries `"terms": {"field": {"index": "users", "id": "u1", "path": "roles"}}`.
 type TermsQuery struct {
-	Fields  map[string][]any
-	Lookups map[string]TermsLookupSpec
-	Boost   float64
+	Fields   map[string][]any
+	Lookups  map[string]TermsLookupSpec
+	Boost    float64
+	HasBoost bool
 }
 
 func (tq TermsQuery) MarshalJSON() ([]byte, error) {
@@ -348,7 +349,7 @@ func (tq TermsQuery) MarshalJSON() ([]byte, error) {
 	for k, v := range tq.Lookups {
 		m[k] = v
 	}
-	if tq.Boost != 0 && tq.Boost != 1.0 {
+	if tq.HasBoost || (tq.Boost != 0 && tq.Boost != 1.0) {
 		m["boost"] = tq.Boost
 	}
 	return json.Marshal(m)
@@ -356,6 +357,7 @@ func (tq TermsQuery) MarshalJSON() ([]byte, error) {
 
 func (tq *TermsQuery) UnmarshalJSON(data []byte) error {
 	tq.Boost = 1.0
+	tq.HasBoost = false
 	tq.Fields = make(map[string][]any)
 	tq.Lookups = make(map[string]TermsLookupSpec)
 	var raw map[string]json.RawMessage
@@ -365,6 +367,10 @@ func (tq *TermsQuery) UnmarshalJSON(data []byte) error {
 	for k, v := range raw {
 		if k == "boost" {
 			_ = json.Unmarshal(v, &tq.Boost)
+			tq.HasBoost = true
+			continue
+		}
+		if k == "_name" {
 			continue
 		}
 		trimmed := bytes.TrimSpace(v)
@@ -402,9 +408,9 @@ type TermsSetEntry struct {
 
 // FuzzyEntry models a `fuzzy` query (`{"fuzzy": {"name": "alice"}}` or `{"fuzzy": {"name": {"value": "alice", "fuzziness": "AUTO"}}}`).
 type FuzzyEntry struct {
-	Value     any
-	Fuzziness any
-	Boost     float64
+	Value     any     `json:"value"`
+	Fuzziness any     `json:"fuzziness,omitempty"`
+	Boost     float64 `json:"boost,omitempty"`
 }
 
 func (f *FuzzyEntry) UnmarshalJSON(data []byte) error {
@@ -481,9 +487,9 @@ func (qs *QuerySlice) UnmarshalJSON(data []byte) error {
 
 // TermEntry supports both `"term": {"field": "val"}` and `"term": {"field": {"value": "val", "boost": 2.0}}`.
 type TermEntry struct {
-	Value           any
-	Boost           float64
-	CaseInsensitive bool
+	Value           any     `json:"value"`
+	Boost           float64 `json:"boost,omitempty"`
+	CaseInsensitive bool    `json:"case_insensitive,omitempty"`
 }
 
 func (t *TermEntry) UnmarshalJSON(data []byte) error {
@@ -555,8 +561,8 @@ func (rc RangeCond) NormalizedBounds() (gt, gte, lt, lte any) {
 }
 
 type PrefixEntry struct {
-	Value           string
-	CaseInsensitive bool
+	Value           string `json:"value"`
+	CaseInsensitive bool   `json:"case_insensitive,omitempty"`
 }
 
 func (p *PrefixEntry) UnmarshalJSON(data []byte) error {
@@ -577,8 +583,8 @@ func (p *PrefixEntry) UnmarshalJSON(data []byte) error {
 }
 
 type WildcardEntry struct {
-	Value           string
-	CaseInsensitive bool
+	Value           string `json:"value"`
+	CaseInsensitive bool   `json:"case_insensitive,omitempty"`
 }
 
 func (w *WildcardEntry) UnmarshalJSON(data []byte) error {
@@ -604,7 +610,7 @@ func (w *WildcardEntry) UnmarshalJSON(data []byte) error {
 }
 
 type RegexpEntry struct {
-	Value string
+	Value string `json:"value"`
 }
 
 func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
@@ -623,11 +629,11 @@ func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
 }
 
 type MatchEntry struct {
-	Query              any
-	Operator           string
-	Boost              float64
-	ZeroTermsQuery     string
-	MinimumShouldMatch any
+	Query              any     `json:"query"`
+	Operator           string  `json:"operator,omitempty"`
+	Boost              float64 `json:"boost,omitempty"`
+	ZeroTermsQuery     string  `json:"zero_terms_query,omitempty"`
+	MinimumShouldMatch any     `json:"minimum_should_match,omitempty"`
 }
 
 func (m *MatchEntry) UnmarshalJSON(data []byte) error {
@@ -660,9 +666,11 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 }
 
 type PhraseEntry struct {
-	Query string
-	Slop  int
-	Boost float64
+	Query              string  `json:"query"`
+	Slop               int     `json:"slop,omitempty"`
+	Operator           string  `json:"operator,omitempty"`
+	MinimumShouldMatch any     `json:"minimum_should_match,omitempty"`
+	Boost              float64 `json:"boost,omitempty"`
 }
 
 func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
@@ -670,9 +678,11 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		var full struct {
-			Query any      `json:"query"`
-			Slop  int      `json:"slop"`
-			Boost *float64 `json:"boost"`
+			Query              any      `json:"query"`
+			Slop               int      `json:"slop"`
+			Operator           string   `json:"operator"`
+			MinimumShouldMatch any      `json:"minimum_should_match"`
+			Boost              *float64 `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
@@ -681,6 +691,8 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 			p.Query = fmt.Sprintf("%v", full.Query)
 		}
 		p.Slop = full.Slop
+		p.Operator = strings.ToLower(full.Operator)
+		p.MinimumShouldMatch = full.MinimumShouldMatch
 		if full.Boost != nil {
 			p.Boost = *full.Boost
 		}
@@ -1069,10 +1081,26 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 }
 
 type SourceFilter struct {
-	Fetch    bool
-	Disabled bool
-	Includes []string
-	Excludes []string
+	Fetch    bool     `json:"-"`
+	Disabled bool     `json:"-"`
+	Includes []string `json:"includes,omitempty"`
+	Excludes []string `json:"excludes,omitempty"`
+}
+
+func (sf SourceFilter) MarshalJSON() ([]byte, error) {
+	if sf.Disabled {
+		return []byte("false"), nil
+	}
+	if len(sf.Includes) == 0 && len(sf.Excludes) == 0 {
+		return []byte("true"), nil
+	}
+	return json.Marshal(struct {
+		Includes []string `json:"includes,omitempty"`
+		Excludes []string `json:"excludes,omitempty"`
+	}{
+		Includes: sf.Includes,
+		Excludes: sf.Excludes,
+	})
 }
 
 func (sf *SourceFilter) UnmarshalJSON(data []byte) error {

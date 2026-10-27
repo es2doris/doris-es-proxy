@@ -30,6 +30,12 @@ auth:
   apiKey: ""
   existingSecret: ""
 
+tls:
+  enabled: false
+  existingSecret: ""
+  certFile: "/etc/doris-es-proxy/tls/tls.crt"
+  keyFile: "/etc/doris-es-proxy/tls/tls.key"
+
 shadow:
   esURL: ""
 
