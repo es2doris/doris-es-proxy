@@ -394,6 +394,12 @@ func aggsContainNow(aggs map[string]esast.AggSpec) bool {
 					return true
 				}
 			}
+			for i := range agg.Filters.AnonymousFilters {
+				fq := agg.Filters.AnonymousFilters[i]
+				if queryContainsNow(&fq) {
+					return true
+				}
+			}
 		}
 		if agg.DateHistogram != nil {
 			if boundsContainNow(agg.DateHistogram.ExtendedBounds) || boundsContainNow(agg.DateHistogram.HardBounds) {

@@ -41,6 +41,7 @@ func NextAutoID() string {
 // SearchRequest models an Elasticsearch / OpenSearch `/_search` request payload.
 type SearchRequest struct {
 	Query          *Query             `json:"query,omitempty"`
+	AliasFilter    *Query             `json:"-"`
 	KNN            KNNSlice           `json:"knn,omitempty"`
 	PostFilter     *Query             `json:"post_filter,omitempty"`
 	From           *int               `json:"from,omitempty"`
@@ -934,6 +935,20 @@ func (tm *TopMetricsAggSpec) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func (tm TopMetricsAggSpec) MarshalJSON() ([]byte, error) {
+	out := make(map[string]any, 3)
+	if len(tm.Metrics) > 0 {
+		out["metrics"] = tm.Metrics
+	}
+	if tm.Size != nil {
+		out["size"] = *tm.Size
+	}
+	if len(tm.Sort) > 0 {
+		out["sort"] = tm.Sort
+	}
+	return json.Marshal(out)
+}
+
 func (tm *TopMetricsAggSpec) EffectiveSize() int {
 	if tm == nil || tm.Size == nil || *tm.Size <= 0 {
 		return 1
@@ -971,7 +986,7 @@ type MovingAvgAggSpec struct {
 	Model       string `json:"model,omitempty"`
 	Script      any    `json:"script,omitempty"`
 	GapPolicy   string `json:"gap_policy,omitempty"`
-	Shift       int    `json:"shift,omitempty"`
+	Shift       *int   `json:"shift,omitempty"`
 }
 
 func (m *MovingAvgAggSpec) EffectivePath() string {
@@ -1149,6 +1164,25 @@ func (f *FiltersAggSpec) UnmarshalJSON(data []byte) error {
 		f.Filters = m
 	}
 	return nil
+}
+
+func (f FiltersAggSpec) MarshalJSON() ([]byte, error) {
+	out := make(map[string]any, 4)
+	if f.IsAnonymous {
+		out["filters"] = f.AnonymousFilters
+	} else if f.Filters != nil {
+		out["filters"] = f.Filters
+	}
+	if f.OtherBucket {
+		out["other_bucket"] = true
+	}
+	if f.OtherBucketKey != "" {
+		out["other_bucket_key"] = f.OtherBucketKey
+	}
+	if f.Keyed != nil {
+		out["keyed"] = *f.Keyed
+	}
+	return json.Marshal(out)
 }
 
 func (f *FiltersAggSpec) EffectiveOtherBucketKey() string {
@@ -1472,6 +1506,16 @@ func (s SortSpec) MarshalJSON() ([]byte, error) {
 	order := s.Entry.Order
 	if order == "" {
 		order = "asc"
+	}
+	if s.Entry.Mode != "" || s.Entry.Missing != "" {
+		inner := map[string]any{"order": order}
+		if s.Entry.Mode != "" {
+			inner["mode"] = s.Entry.Mode
+		}
+		if s.Entry.Missing != "" {
+			inner["missing"] = s.Entry.Missing
+		}
+		return json.Marshal(map[string]any{s.Entry.Field: inner})
 	}
 	return json.Marshal(map[string]string{s.Entry.Field: order})
 }

@@ -74,7 +74,7 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 
 	parsedAST := parseSimpleLuceneToAST(raw, defaultField, expandedFields, defaultOp)
 	compiled := t.CompileQuery(&parsedAST, scoring, nctx)
-	if t.Opts.UseDoris4SearchFunc && nctx == nil && !strings.Contains(raw, "_exists_:") && !strings.ContainsAny(raw, "[{") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.WhereSQL, "`n__") {
+	if t.Opts.UseDoris4SearchFunc && nctx == nil && !strings.Contains(raw, "_exists_:") && !strings.ContainsAny(raw, "[{><~/^") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.WhereSQL, "`n__") {
 		if len(expandedFields) > 1 {
 			var searchPreds []string
 			allSupported := true
@@ -642,7 +642,8 @@ func tokenizeLucene(s string) []string {
 				if parenDepth == 0 && bracketDepth == 0 && (i+1 >= len(s) || s[i+1] != '^') {
 					tokStr := curr.String()
 					trimmedTok := strings.TrimPrefix(strings.TrimPrefix(tokStr, "+"), "-")
-					if hasMatchingOuterParens(trimmedTok) {
+					colonIdx := findLuceneFieldColon(trimmedTok)
+					if hasMatchingOuterParens(trimmedTok) || (colonIdx > 0 && hasMatchingOuterParens(trimmedTok[colonIdx+1:])) {
 						out = append(out, tokStr)
 						curr.Reset()
 					}

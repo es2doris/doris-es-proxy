@@ -106,6 +106,7 @@ func NormalizeDorisSQL(q string) string {
 
 func normalizeDorisSQL(q string) string {
 	q = strings.ReplaceAll(q, "`__DORIS_DELETE_SIGN__` = 0 AND ", "")
+	q = strings.ReplaceAll(q, "`__DORIS_DELETE_SIGN__` = 0", "1=1")
 	q = strings.ReplaceAll(q, `'\x1f'`, "CHAR(31)")
 	q = strings.ReplaceAll(q, "'\x1f'", "CHAR(31)")
 	return rewriteDorisArrayExists(q)

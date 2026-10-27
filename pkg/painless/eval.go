@@ -503,15 +503,40 @@ func evalCondition(sourceMap map[string]any, cond string, params map[string]any)
 	return evalConditionDepth(sourceMap, cond, params, 0)
 }
 
+func isEscapedAt(s string, idx int) bool {
+	bs := 0
+	for j := idx - 1; j >= 0 && s[j] == '\\'; j-- {
+		bs++
+	}
+	return bs%2 == 1
+}
+
+func isRegexSlashAt(s string, idx int) bool {
+	if idx < 0 || idx >= len(s) || s[idx] != '/' {
+		return false
+	}
+	for j := idx - 1; j >= 0; j-- {
+		if s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r' {
+			continue
+		}
+		return s[j] == '~'
+	}
+	return false
+}
+
 func findTopLevelOpPainless(s, op string) int {
 	depth := 0
 	inQuotes := byte(0)
 	for i := 0; i <= len(s)-len(op); i++ {
 		c := s[i]
 		if inQuotes != 0 {
-			if c == inQuotes && (i == 0 || s[i-1] != '\\') {
+			if c == inQuotes && !isEscapedAt(s, i) {
 				inQuotes = 0
 			}
+			continue
+		}
+		if c == '/' && isRegexSlashAt(s, i) {
+			inQuotes = '/'
 			continue
 		}
 		switch c {
@@ -548,9 +573,13 @@ func findMatchingTernaryColonPainless(s string) int {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if inQuotes != 0 {
-			if c == inQuotes && (i == 0 || s[i-1] != '\\') {
+			if c == inQuotes && !isEscapedAt(s, i) {
 				inQuotes = 0
 			}
+			continue
+		}
+		if c == '/' && isRegexSlashAt(s, i) {
+			inQuotes = '/'
 			continue
 		}
 		switch c {
@@ -585,7 +614,7 @@ func evalRegexMatchPainless(lhsVal, rhsVal any, fullMatch bool) bool {
 	lhsStr := fmt.Sprintf("%v", lhsVal)
 	pat := strings.TrimSpace(fmt.Sprintf("%v", rhsVal))
 	if len(pat) >= 2 && pat[0] == '/' && pat[len(pat)-1] == '/' {
-		pat = pat[1 : len(pat)-1]
+		pat = strings.ReplaceAll(pat[1:len(pat)-1], `\/`, `/`)
 	}
 	if fullMatch {
 		pat = "^(?:" + pat + ")$"
@@ -630,7 +659,7 @@ func evalConditionDepth(sourceMap map[string]any, cond string, params map[string
 
 	// Check `.contains(...)`
 	if idx := findTopLevelOpPainless(cond, ".contains("); idx > 0 && strings.HasSuffix(cond, ")") {
-		lhsExpr := strings.TrimSpace(cond[:idx])
+		lhsExpr := strings.TrimSpace(strings.TrimSuffix(cond[:idx], "?"))
 		argExpr := strings.TrimSpace(cond[idx+len(".contains(") : len(cond)-1])
 		lhsVal, _ := evalRHSExprDepth(sourceMap, lhsExpr, params, depth+1)
 		argVal, _ := evalRHSExprDepth(sourceMap, argExpr, params, depth+1)
@@ -658,7 +687,7 @@ func evalConditionDepth(sourceMap map[string]any, cond string, params map[string
 		{".endsWith(", false},
 	} {
 		if idx := findTopLevelOpPainless(cond, mSpec.name); idx > 0 && strings.HasSuffix(cond, ")") {
-			lhsExpr := strings.TrimSpace(cond[:idx])
+			lhsExpr := strings.TrimSpace(strings.TrimSuffix(cond[:idx], "?"))
 			argExpr := strings.TrimSpace(cond[idx+len(mSpec.name) : len(cond)-1])
 			lhsVal, _ := evalRHSExprDepth(sourceMap, lhsExpr, params, depth+1)
 			argVal, _ := evalRHSExprDepth(sourceMap, argExpr, params, depth+1)
@@ -675,7 +704,7 @@ func evalConditionDepth(sourceMap map[string]any, cond string, params map[string
 
 	// Check `.isEmpty()`
 	if strings.HasSuffix(cond, ".isEmpty()") {
-		lhsExpr := strings.TrimSpace(cond[:len(cond)-len(".isEmpty()")])
+		lhsExpr := strings.TrimSpace(strings.TrimSuffix(cond[:len(cond)-len(".isEmpty()")], "?"))
 		lhsVal, _ := evalRHSExprDepth(sourceMap, lhsExpr, params, depth+1)
 		switch tv := lhsVal.(type) {
 		case string:
@@ -690,7 +719,7 @@ func evalConditionDepth(sourceMap map[string]any, cond string, params map[string
 
 	// Check `.containsKey(...)`
 	if idx := findTopLevelOpPainless(cond, ".containsKey("); idx > 0 && strings.HasSuffix(cond, ")") {
-		lhsExpr := strings.TrimSpace(cond[:idx])
+		lhsExpr := strings.TrimSpace(strings.TrimSuffix(cond[:idx], "?"))
 		argExpr := strings.TrimSpace(cond[idx+len(".containsKey(") : len(cond)-1])
 		lhsVal, _ := evalRHSExprDepth(sourceMap, lhsExpr, params, depth+1)
 		argVal, _ := evalRHSExprDepth(sourceMap, argExpr, params, depth+1)
@@ -703,12 +732,20 @@ func evalConditionDepth(sourceMap map[string]any, cond string, params map[string
 
 	if idx := findTopLevelOpPainless(cond, "==~"); idx > 0 {
 		lhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
-		rhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+3:]), params, depth+1)
+		rhsRaw := strings.TrimSpace(cond[idx+3:])
+		var rhs any = rhsRaw
+		if len(rhsRaw) < 2 || rhsRaw[0] != '/' || rhsRaw[len(rhsRaw)-1] != '/' {
+			rhs, _ = evalRHSExprDepth(sourceMap, rhsRaw, params, depth+1)
+		}
 		return evalRegexMatchPainless(lhs, rhs, true)
 	}
 	if idx := findTopLevelOpPainless(cond, "=~"); idx > 0 {
 		lhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
-		rhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+2:]), params, depth+1)
+		rhsRaw := strings.TrimSpace(cond[idx+2:])
+		var rhs any = rhsRaw
+		if len(rhsRaw) < 2 || rhsRaw[0] != '/' || rhsRaw[len(rhsRaw)-1] != '/' {
+			rhs, _ = evalRHSExprDepth(sourceMap, rhsRaw, params, depth+1)
+		}
 		return evalRegexMatchPainless(lhs, rhs, false)
 	}
 	if idx := findTopLevelOpPainless(cond, "!="); idx > 0 {
@@ -849,7 +886,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 	// Check trailing zero-arg methods `.toLowerCase()`, `.toUpperCase()`, `.trim()`, `.length()`, `.size()`
 	for _, mSuffix := range []string{".toLowerCase()", ".toUpperCase()", ".trim()", ".length()", ".size()"} {
 		if strings.HasSuffix(rhs, mSuffix) {
-			recExpr := strings.TrimSpace(rhs[:len(rhs)-len(mSuffix)])
+			recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:len(rhs)-len(mSuffix)], "?"))
 			recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1)
 			if err != nil || recVal == nil {
 				return nil, err
@@ -870,6 +907,61 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				case map[string]any:
 					return int64(len(tv)), nil
 				}
+			}
+		}
+	}
+
+	if strings.HasSuffix(rhs, ".isEmpty()") {
+		recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:len(rhs)-len(".isEmpty()")], "?"))
+		recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1)
+		if err != nil || recVal == nil {
+			return nil, err
+		}
+		switch tv := recVal.(type) {
+		case string:
+			return len(tv) == 0, nil
+		case []any:
+			return len(tv) == 0, nil
+		case map[string]any:
+			return len(tv) == 0, nil
+		}
+		return false, nil
+	}
+
+	for _, mName := range []string{".startsWith(", ".endsWith(", ".contains("} {
+		if idx := findTopLevelOpPainless(rhs, mName); idx > 0 && strings.HasSuffix(rhs, ")") {
+			recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:idx], "?"))
+			argExpr := strings.TrimSpace(rhs[idx+len(mName) : len(rhs)-1])
+			recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1)
+			if err != nil || recVal == nil {
+				return nil, err
+			}
+			argVal, _ := evalRHSExprDepth(sourceMap, argExpr, params, depth+1)
+			switch mName {
+			case ".startsWith(":
+				if s, ok := recVal.(string); ok && argVal != nil {
+					return strings.HasPrefix(s, fmt.Sprintf("%v", argVal)), nil
+				}
+				return false, nil
+			case ".endsWith(":
+				if s, ok := recVal.(string); ok && argVal != nil {
+					return strings.HasSuffix(s, fmt.Sprintf("%v", argVal)), nil
+				}
+				return false, nil
+			case ".contains(":
+				switch tv := recVal.(type) {
+				case []any:
+					for _, item := range tv {
+						if valuesEqual(item, argVal) {
+							return true, nil
+						}
+					}
+				case string:
+					if argVal != nil {
+						return strings.Contains(tv, fmt.Sprintf("%v", argVal)), nil
+					}
+				}
+				return false, nil
 			}
 		}
 	}
@@ -1114,9 +1206,13 @@ func findMatchingDelimiter(s string, openIdx int, openChar, closeChar byte) int 
 	for i := openIdx; i < len(s); i++ {
 		c := s[i]
 		if inQuotes != 0 {
-			if c == inQuotes && (i == 0 || s[i-1] != '\\') {
+			if c == inQuotes && !isEscapedAt(s, i) {
 				inQuotes = 0
 			}
+			continue
+		}
+		if c == '/' && isRegexSlashAt(s, i) {
+			inQuotes = '/'
 			continue
 		}
 		switch c {
@@ -1145,9 +1241,14 @@ func splitTopLevelStatements(s string) []string {
 		c := s[i]
 		if inQuotes != 0 {
 			curr.WriteByte(c)
-			if c == inQuotes && (i == 0 || s[i-1] != '\\') {
+			if c == inQuotes && !isEscapedAt(s, i) {
 				inQuotes = 0
 			}
+			continue
+		}
+		if c == '/' && isRegexSlashAt(s, i) {
+			inQuotes = '/'
+			curr.WriteByte(c)
 			continue
 		}
 		switch c {

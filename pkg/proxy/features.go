@@ -1028,13 +1028,21 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 			s.pipelines[id] = body
 		}
 		s.mu.Unlock()
+		if id != "" {
+			s.persistIngestPipeline(r.Context(), id, body)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 	case http.MethodDelete:
+		_ = s.syncCatalogFromBackend(r.Context())
 		s.mu.Lock()
 		delete(s.pipelines, id)
 		s.mu.Unlock()
+		if id != "" {
+			s.deleteIngestPipelineCatalog(r.Context(), id)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 	case http.MethodGet:
+		_ = s.syncCatalogFromBackend(r.Context())
 		s.mu.RLock()
 		defer s.mu.RUnlock()
 		if id != "" {
@@ -1065,6 +1073,12 @@ func (s *Server) applyIngestPipelineIfPresent(pipelineID string, raw json.RawMes
 	s.mu.RLock()
 	pipe, ok := s.pipelines[pipelineID]
 	s.mu.RUnlock()
+	if !ok {
+		_ = s.syncCatalogFromBackend(context.Background())
+		s.mu.RLock()
+		pipe, ok = s.pipelines[pipelineID]
+		s.mu.RUnlock()
+	}
 	if !ok || pipe == nil {
 		return raw
 	}
@@ -1368,6 +1382,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 
 	s.resolveTermsLookupsInQuery(r.Context(), body.Source.Query)
 	effPipeline := s.resolveEffectivePipeline(destIndex, body.Dest.Pipeline, "")
+	finalPipeline := s.resolveFinalPipeline(destIndex)
 	for _, srcIdx := range srcTargets {
 		srcSchema := s.getOrCompileReadOnlySchema(r.Context(), srcIdx)
 		_ = s.coalescer.FlushTable(r.Context(), srcSchema.DorisTable)
@@ -1429,6 +1444,9 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				}
 				if effPipeline != "" {
 					docSource = s.applyIngestPipelineIfPresent(effPipeline, docSource)
+				}
+				if finalPipeline != "" {
+					docSource = s.applyIngestPipelineIfPresent(finalPipeline, docSource)
 				}
 				prepared = append(prepared, preparedDoc{id: h.ID, source: docSource})
 				if destSchema == nil && len(sampleDocs) < 16 {
@@ -1908,10 +1926,41 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	s.indices[newIdx] = compiled
-	s.aliases[alias] = []string{newIdx}
+	var updatedTargets []string
+	if metaByIdx := s.aliasMeta[alias]; metaByIdx != nil {
+		if oldMeta, hasOld := metaByIdx[oldIdx]; hasOld && oldMeta.IsWriteIndex != nil && *oldMeta.IsWriteIndex {
+			fVal := false
+			tVal := true
+			oldMeta.IsWriteIndex = &fVal
+			metaByIdx[oldIdx] = oldMeta
+			newMeta := oldMeta
+			newMeta.IsWriteIndex = &tVal
+			metaByIdx[newIdx] = newMeta
+			foundNew := false
+			for _, t := range s.aliases[alias] {
+				if t == newIdx {
+					foundNew = true
+				}
+			}
+			if !foundNew {
+				s.aliases[alias] = append(s.aliases[alias], newIdx)
+			}
+			updatedTargets = append([]string(nil), s.aliases[alias]...)
+		} else {
+			if oldMeta, hasOld := metaByIdx[oldIdx]; hasOld {
+				delete(metaByIdx, oldIdx)
+				metaByIdx[newIdx] = oldMeta
+			}
+			s.aliases[alias] = []string{newIdx}
+			updatedTargets = []string{newIdx}
+		}
+	} else {
+		s.aliases[alias] = []string{newIdx}
+		updatedTargets = []string{newIdx}
+	}
 	s.mu.Unlock()
 	s.persistIndex(r.Context(), newIdx, compiled)
-	s.persistAlias(r.Context(), alias, []string{newIdx})
+	s.persistAlias(r.Context(), alias, updatedTargets)
 	s.queryCache.InvalidateAll()
 
 	writeJSON(w, http.StatusOK, map[string]any{
