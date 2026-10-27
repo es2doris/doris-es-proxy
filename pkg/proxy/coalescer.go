@@ -89,6 +89,9 @@ func (c *StreamLoadCoalescer) Submit(ctx context.Context, table string, ndjson [
 	if len(bytes.TrimSpace(ndjson)) == 0 {
 		return nil
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	window := c.window
 	maxBytes := c.maxBytes
@@ -122,7 +125,9 @@ func (c *StreamLoadCoalescer) Submit(ctx context.Context, table string, ndjson [
 		}
 		delete(c.batches, table)
 		c.mu.Unlock()
-		c.executeBatch(ctx, table, b, syncRefresh)
+		flushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		c.executeBatch(flushCtx, table, b, syncRefresh)
 		return b.err
 	}
 	doneCh := b.done
@@ -134,6 +139,33 @@ func (c *StreamLoadCoalescer) Submit(ctx context.Context, table string, ndjson [
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// FlushAll stops any pending group-commit timers and synchronously flushes all buffered batches.
+func (c *StreamLoadCoalescer) FlushAll(ctx context.Context) error {
+	c.mu.Lock()
+	if len(c.batches) == 0 {
+		c.mu.Unlock()
+		return nil
+	}
+	pending := make(map[string]*coalesceBatch, len(c.batches))
+	for tbl, b := range c.batches {
+		if b.timer != nil {
+			b.timer.Stop()
+		}
+		pending[tbl] = b
+	}
+	c.batches = make(map[string]*coalesceBatch)
+	c.mu.Unlock()
+
+	var firstErr error
+	for tbl, b := range pending {
+		c.executeBatch(ctx, tbl, b, true)
+		if b.err != nil && firstErr == nil {
+			firstErr = b.err
+		}
+	}
+	return firstErr
 }
 
 func (c *StreamLoadCoalescer) onTimerFlush(table string, target *coalesceBatch) {

@@ -61,6 +61,8 @@ type FieldBinding struct {
 	Kind                StorageKind
 	ColumnName          string
 	DorisType           DorisScalarType
+	ESType              string // Declared Elasticsearch field type (e.g. "date", "long", "keyword")
+	Format              string // Optional ES date/number format
 	Analyzer            string
 	LowercaseNormalizer bool
 	KeywordCompanion    string // Optional untokenized `.keyword` column for `text` fields
@@ -329,6 +331,9 @@ func (s *IndexSchema) compileProperties(
 			sort.Strings(subKeys)
 			for _, subKey := range subKeys {
 				subProp := prop.Fields[subKey]
+				if prop.MultiValued || DefaultMultiValuedPaths[dotPath] {
+					subProp.MultiValued = true
+				}
 				multiDotPath := dotPath + "." + subKey
 				// Multi-fields read from the same `currJSONPath` in `_source`!
 				s.registerLeafField(multiDotPath, currJSONPath, activeNestedRoot, nestedRootDepth, subProp)
@@ -352,6 +357,7 @@ func (s *IndexSchema) registerLeafField(
 	prop esast.FieldProperty,
 ) {
 	dorisType := mapESTypeToDoris(prop.Type)
+	esType := strings.ToLower(strings.TrimSpace(prop.Type))
 	lowerNorm := strings.Contains(strings.ToLower(prop.Normalizer), "lower")
 
 	if activeNestedRoot != "" {
@@ -368,6 +374,8 @@ func (s *IndexSchema) registerLeafField(
 			Kind:                StorageNestedSubfield,
 			ColumnName:          prefilterCol,
 			DorisType:           dorisType,
+			ESType:              esType,
+			Format:              prop.Format,
 			Analyzer:            prop.Analyzer,
 			LowercaseNormalizer: lowerNorm,
 			NestedPath:          activeNestedRoot,
@@ -391,6 +399,7 @@ func (s *IndexSchema) registerLeafField(
 			Kind:           StoragePromotedVector,
 			ColumnName:     colName,
 			DorisType:      DorisFloatArray,
+			ESType:         esType,
 			VectorDims:     prop.EffectiveDims(),
 			VectorMetric:   metric,
 		}
@@ -403,6 +412,8 @@ func (s *IndexSchema) registerLeafField(
 			Kind:                StoragePromotedArray,
 			ColumnName:          colName,
 			DorisType:           DorisString,
+			ESType:              esType,
+			Format:              prop.Format,
 			LowercaseNormalizer: lowerNorm,
 			IsMultiValued:       true,
 		}
@@ -415,6 +426,8 @@ func (s *IndexSchema) registerLeafField(
 		Kind:                StoragePromotedScalar,
 		ColumnName:          colName,
 		DorisType:           dorisType,
+		ESType:              esType,
+		Format:              prop.Format,
 		Analyzer:            prop.Analyzer,
 		LowercaseNormalizer: lowerNorm,
 	}

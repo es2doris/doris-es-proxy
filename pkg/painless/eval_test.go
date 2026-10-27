@@ -256,3 +256,39 @@ func TestEval_LeftAssociativeSubStringConcatParensUpsertAndRemove(t *testing.T) 
 		t.Fatalf("expected empty upsert: {} with scripted_upsert to create doc, got %s (%s, err=%v)", string(upserted), upRes, err)
 	}
 }
+
+func TestEval_BracketAccessParenthesizedRHSAndMultilineElse(t *testing.T) {
+	initial := `{"count":4,"status":"pending"}`
+	req := &UpdateRequest{
+		Script: &ScriptSpec{
+			Source: `
+				ctx._source['computed'] = (ctx._source['count'] + 1) * 2;
+				ctx._source["from_param"] = params['label'];
+				if (ctx._source['count'] > 10) {
+					ctx._source['branch'] = 'high';
+				}
+				else {
+					ctx._source['branch'] = 'low';
+				}
+			`,
+			Params: map[string]any{"label": "ok-bracket"},
+		},
+	}
+	updated, opRes, err := ApplyUpdateWithResult(json.RawMessage(initial), req, true)
+	if err != nil || opRes != "updated" {
+		t.Fatalf("ApplyUpdateWithResult failed: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(updated, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc["computed"] != float64(10) {
+		t.Fatalf("expected (4 + 1) * 2 == 10, got %v", doc["computed"])
+	}
+	if doc["from_param"] != "ok-bracket" {
+		t.Fatalf("expected params['label'] == \"ok-bracket\", got %v", doc["from_param"])
+	}
+	if doc["branch"] != "low" {
+		t.Fatalf("expected multiline }\\nelse { to execute else branch ('low'), got %v", doc["branch"])
+	}
+}

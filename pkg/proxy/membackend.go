@@ -197,7 +197,7 @@ func (m *MemoryBackend) GetDocsByIDs(_ context.Context, _, table string, ids []s
 
 var (
 	reHitsSQL          = regexp.MustCompile(`(?s)^SELECT ` + "`_id`, `_version`, `_source`, CAST\\((.+) AS DOUBLE\\) AS `_score`, COUNT\\(\\*\\) OVER\\(\\) AS `_total_hits` FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0 AND \\((.+)\\) AND \\((.+)\\) ORDER BY (.+) LIMIT (\\d+) OFFSET (\\d+)$")
-	reCollapsedHitsSQL = regexp.MustCompile(`(?s)^SELECT ` + "`_id`, `_version`, `_source`, `_score`, COUNT\\(\\*\\) OVER\\(\\) AS `_total_hits` FROM \\(SELECT \\*, CAST\\((.+) AS DOUBLE\\) AS `_score`, ROW_NUMBER\\(\\) OVER \\(PARTITION BY (.+?) ORDER BY .+\\) AS `_collapse_rn` FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0 AND \\((.+)\\) AND \\((.+)\\)\\) `_collapsed` WHERE `_collapse_rn` = 1 ORDER BY (.+) LIMIT (\\d+) OFFSET (\\d+)$")
+	reCollapsedHitsSQL = regexp.MustCompile(`(?s)^SELECT ` + "`_id`, `_version`, `_source`, `_score`, `_total_hits` FROM \\(SELECT \\*, ROW_NUMBER\\(\\) OVER \\(PARTITION BY (.+?) ORDER BY .+\\) AS `_collapse_rn` FROM \\(SELECT \\*, CAST\\((.+) AS DOUBLE\\) AS `_score`, COUNT\\(\\*\\) OVER\\(\\) AS `_total_hits` FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0 AND \\((.+)\\) AND \\((.+)\\)\\) `_scored`\\) `_collapsed` WHERE `_collapse_rn` = 1 ORDER BY (.+) LIMIT (\\d+) OFFSET (\\d+)$")
 	reCTEBase          = regexp.MustCompile(`(?s)^WITH ` + "`base_matched` AS \\(SELECT \\* FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0 AND \\((.+?)\\)\\)\n(.+)$")
 )
 
@@ -225,8 +225,8 @@ func (m *MemoryBackend) QueryHits(_ context.Context, sqlStr string) ([]HitRow, e
 		limit, _ = strconv.Atoi(sub[6])
 		offset, _ = strconv.Atoi(sub[7])
 	} else if csub := reCollapsedHitsSQL.FindStringSubmatch(sqlStr); csub != nil {
-		scoreExpr = csub[1]
-		collapseCol = csub[2]
+		collapseCol = csub[1]
+		scoreExpr = csub[2]
 		tableName = csub[3]
 		mainWhere = csub[4]
 		postWhere = csub[5]
@@ -318,12 +318,6 @@ func (m *MemoryBackend) QueryHits(_ context.Context, sqlStr string) ([]HitRow, e
 		}
 		sortedHits = append(sortedHits, hits[idx])
 	}
-	if collapseCol != "" {
-		collapsedTotal := int64(len(sortedHits))
-		for i := range sortedHits {
-			sortedHits[i].TotalHits = collapsedTotal
-		}
-	}
 
 	if offset >= len(sortedHits) {
 		return nil, nil
@@ -374,25 +368,26 @@ func (m *MemoryBackend) QueryAggs(_ context.Context, sqlStr string) ([]AggRow, e
 }
 
 var (
-	reAggArrayExplode     = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(`_elem` AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_t` AS `_elem` WHERE (?:\\((.+?)\\) AND )?`_elem` IS NOT NULL GROUP BY `_elem` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
-	reAggScalarTerms      = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\((.+?) AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (?:\\((.+?)\\) AND )?.+? IS NOT NULL GROUP BY .+? ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
-	reAggNestedTerms      = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, json_extract_string\\(`_nel`, '\\$\\.([^']+)'\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_nt` AS `_nel` WHERE (?:\\((.+?)\\) AND )?json_extract_string\\(`_nel`, '\\$\\.[^']+'\\) IS NOT NULL GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
-	reAggFilter           = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_filter' AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (.+)$")
-	reAggMissing          = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_missing' AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (?:\\((.+?)\\) AND )?NOT \\((.+)\\)$")
-	reAggCardArray        = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_metric' AS `_bucket_key`, CAST\\(COUNT\\(DISTINCT `_elem`\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_t` AS `_elem` WHERE (?:\\((.+?)\\) AND )?`_elem` IS NOT NULL$")
-	reAggCardScalar       = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_metric' AS `_bucket_key`, CAST\\(COUNT\\(DISTINCT (.+?)\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
-	reAggValueCountArray  = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_metric' AS `_bucket_key`, CAST\\(COUNT\\(`_elem`\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_t` AS `_elem` WHERE (?:\\((.+?)\\) AND )?`_elem` IS NOT NULL$")
-	reAggValueCountScalar = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_metric' AS `_bucket_key`, CAST\\(COUNT\\((.+?)\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
-	reAggMetric           = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_metric|_stats_[a-z]+)' AS `_bucket_key`, CAST\\(COALESCE\\((AVG|SUM|MIN|MAX|COUNT)\\((.+?)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
-	reAggPercentile       = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(PERCENTILE_APPROX\\((.+?), ([0-9.]+)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
-	reAggDateHist         = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(CAST\\(FLOOR\\((.+?) / (\\d+)\\) \\* \\d+ AS BIGINT\\) AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (?:\\((.+?)\\) AND )?.+? IS NOT NULL GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS BIGINT\\) ASC")
-	reAggHist             = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(FLOOR\\(\\((.+?) - ([^)]+)\\) / ([^)]+)\\) \\* [^)]+ \\+ [^)]+ AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (?:\\((.+?)\\) AND )?.+? IS NOT NULL GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS DOUBLE\\) ASC")
-	reAggRange            = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (.+)$")
-	reAggSubMetric        = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\((?:COALESCE\\((AVG|SUM|MIN|MAX)\\((.+?)\\), 0\\)|(COUNT)\\((DISTINCT )?(.+?)\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+?) WHERE (.+) GROUP BY `_bucket_key`$")
-	reAggSubTerms         = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CONCAT\\((.+?), '\\\\x1f', CAST\\((.+?) AS STRING\\)\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM (.+?) WHERE \\((.+)\\) AND .+? IS NOT NULL GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC")
-	reAggTopHits          = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, `_id` AS `_bucket_key`, CAST\\(1 AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+?))? ORDER BY (.+?) LIMIT (\\d+)")
-	reAggSubTopHits       = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CONCAT\\((.+?), '\\\\x1f', `_id`\\) AS `_bucket_key`, CAST\\(ROW_NUMBER\\(\\) OVER \\(PARTITION BY .+? ORDER BY (.+?)\\) AS DOUBLE\\) AS `_doc_count` FROM (.+?) WHERE (.+)\\) `_agg_sub_\\d+` WHERE `_doc_count` <= (\\d+)")
-	reAggComposite        = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (.+?) GROUP BY `_bucket_key` ORDER BY `_bucket_key` ASC LIMIT (\\d+)")
+	reAggArrayExplode       = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(`_elem` AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_t` AS `_elem` WHERE (?:\\((.+?)\\) AND )?`_elem` IS NOT NULL GROUP BY `_elem` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
+	reAggScalarTerms        = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\((.+?) AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (?:\\((.+?)\\) AND )?.+? IS NOT NULL GROUP BY .+? ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
+	reAggScalarTermsMissing = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\(CAST\\((.+?) AS STRING\\), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
+	reAggNestedTerms        = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, json_extract_string\\(`_nel`, '\\$\\.([^']+)'\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_nt` AS `_nel` WHERE (?:\\((.+?)\\) AND )?json_extract_string\\(`_nel`, '\\$\\.[^']+'\\) IS NOT NULL GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
+	reAggFilter             = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_filter' AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (.+)$")
+	reAggMissing            = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_missing' AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (?:\\((.+?)\\) AND )?NOT \\((.+)\\)$")
+	reAggCardArray          = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_metric' AS `_bucket_key`, CAST\\(COUNT\\(DISTINCT `_elem`\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_t` AS `_elem` WHERE (?:\\((.+?)\\) AND )?`_elem` IS NOT NULL$")
+	reAggCardScalar         = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_metric' AS `_bucket_key`, CAST\\(COUNT\\(DISTINCT (.+?)\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
+	reAggValueCountArray    = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_metric' AS `_bucket_key`, CAST\\(COUNT\\(`_elem`\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_t` AS `_elem` WHERE (?:\\((.+?)\\) AND )?`_elem` IS NOT NULL$")
+	reAggValueCountScalar   = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_metric' AS `_bucket_key`, CAST\\(COUNT\\((.+?)\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
+	reAggMetric             = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_metric|_stats_[a-z]+)' AS `_bucket_key`, CAST\\(COALESCE\\((AVG|SUM|MIN|MAX|COUNT)\\((.+?)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
+	reAggPercentile         = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(PERCENTILE_APPROX\\((.+?), ([0-9.]+)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
+	reAggDateHist           = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(CAST\\(FLOOR\\((.+?) / (\\d+)\\) \\* \\d+ AS BIGINT\\) AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (?:\\((.+?)\\) AND )?.+? IS NOT NULL GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS BIGINT\\) ASC")
+	reAggHist               = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(FLOOR\\(\\((.+?) - ([^)]+)\\) / ([^)]+)\\) \\* [^)]+ \\+ [^)]+ AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (?:\\((.+?)\\) AND )?.+? IS NOT NULL GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS DOUBLE\\) ASC")
+	reAggRange              = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (.+)$")
+	reAggSubMetric          = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\((?:COALESCE\\((AVG|SUM|MIN|MAX)\\((.+?)\\), 0\\)|(COUNT)\\((DISTINCT )?(.+?)\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+?) WHERE (.+) GROUP BY `_bucket_key`$")
+	reAggSubTerms           = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CONCAT\\((.+?), '\\\\x1f', CAST\\((.+?) AS STRING\\)\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM (.+?) WHERE \\((.+)\\) AND .+? IS NOT NULL GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC")
+	reAggTopHits            = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, `_id` AS `_bucket_key`, CAST\\(1 AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+?))? ORDER BY (.+?) LIMIT (\\d+)")
+	reAggSubTopHits         = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CONCAT\\((.+?), '\\\\x1f', `_id`\\) AS `_bucket_key`, CAST\\(ROW_NUMBER\\(\\) OVER \\(PARTITION BY .+? ORDER BY (.+?)\\) AS DOUBLE\\) AS `_doc_count` FROM (.+?) WHERE (.+)\\) `_agg_sub_\\d+` WHERE `_doc_count` <= (\\d+)")
+	reAggComposite          = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (.+?) GROUP BY `_bucket_key` ORDER BY `_bucket_key` ASC LIMIT (\\d+)")
 )
 
 func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
@@ -451,6 +446,30 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 						}
 					}
 				}
+			}
+		}
+		return topBuckets(aggName, counts, limit)
+	}
+
+	if m := reAggScalarTermsMissing.FindStringSubmatch(branch); m != nil {
+		aggName, colExpr, missingLit, extraWhere := m[1], m[2], m[3], m[4]
+		missingVal := unquoteSQLLiteral(missingLit)
+		limit, _ := strconv.Atoi(m[5])
+		counts := make(map[string]int64)
+		for _, row := range baseRows {
+			if extraWhere != "" && !evalWhereExpr(row, extraWhere) {
+				continue
+			}
+			val := resolveColumnValue(row, colExpr)
+			s := ""
+			if val != nil {
+				s = fmt.Sprintf("%v", val)
+			}
+			if s == "" {
+				s = missingVal
+			}
+			if s != "" {
+				counts[s]++
 			}
 		}
 		return topBuckets(aggName, counts, limit)
@@ -1058,6 +1077,17 @@ func evalBucketKeyExpr(row map[string]any, expr string) string {
 		}
 		return ""
 	}
+	if strings.HasPrefix(expr, "COALESCE(CAST(") && strings.HasSuffix(expr, ")") {
+		inner := expr[len("COALESCE(") : len(expr)-1]
+		args := splitTopLevelArgs(inner)
+		if len(args) == 2 {
+			v := evalBucketKeyExpr(row, args[0])
+			if v != "" {
+				return v
+			}
+			return unquoteSQLLiteral(strings.TrimSpace(args[1]))
+		}
+	}
 	if strings.HasPrefix(expr, "CAST(") && strings.HasSuffix(expr, " AS STRING)") {
 		inner := expr[len("CAST:") : len(expr)-len(" AS STRING)")]
 		if strings.HasPrefix(expr, "CAST(") {
@@ -1413,14 +1443,31 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 
 	if strings.HasPrefix(expr, "CASE WHEN ") && strings.HasSuffix(expr, " END") {
 		inner := expr[len("CASE WHEN ") : len(expr)-len(" END")]
-		thenIdx := findTopLevelOp(inner, " THEN ")
 		elseIdx := findTopLevelOp(inner, " ELSE ")
-		if thenIdx > 0 && elseIdx > thenIdx {
-			cond := inner[:thenIdx]
-			thenExpr := inner[thenIdx+6 : elseIdx]
+		if elseIdx > 0 {
 			elseExpr := inner[elseIdx+6:]
-			if evalWhereExpr(row, cond) {
-				return evalNumericExpr(row, thenExpr)
+			whenChain := inner[:elseIdx]
+			for {
+				thenIdx := findTopLevelOp(whenChain, " THEN ")
+				if thenIdx <= 0 {
+					break
+				}
+				cond := whenChain[:thenIdx]
+				rest := whenChain[thenIdx+6:]
+				nextWhenIdx := findTopLevelOp(rest, " WHEN ")
+				var thenExpr string
+				if nextWhenIdx > 0 {
+					thenExpr = rest[:nextWhenIdx]
+				} else {
+					thenExpr = rest
+				}
+				if evalWhereExpr(row, cond) {
+					return evalNumericExpr(row, thenExpr)
+				}
+				if nextWhenIdx <= 0 {
+					break
+				}
+				whenChain = rest[nextWhenIdx+6:]
 			}
 			return evalNumericExpr(row, elseExpr)
 		}
@@ -1510,6 +1557,9 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 
 func resolveColumnValue(row map[string]any, colExpr string) any {
 	colExpr = strings.TrimSpace(colExpr)
+	if strings.HasPrefix(colExpr, "CONCAT_WS('\\x1f', ") && strings.HasSuffix(colExpr, ")") {
+		return evalCompositeKeyExpr(row, colExpr)
+	}
 	if strings.HasPrefix(colExpr, "`") && strings.HasSuffix(colExpr, "`") {
 		colName := strings.Trim(colExpr, "`")
 		return row[colName]

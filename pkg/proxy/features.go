@@ -21,6 +21,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -102,6 +104,10 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		if !s.checkInboundAuth(w, r) {
+			return
+		}
+
 		if tp, opq, reqID := r.Header.Get("traceparent"), r.Header.Get("X-Opaque-Id"), r.Header.Get("X-Request-ID"); tp != "" || opq != "" || reqID != "" {
 			r = r.WithContext(WithTraceMeta(r.Context(), TraceMeta{
 				Traceparent: tp,
@@ -162,6 +168,92 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 		atomic.AddInt64(&s.totalHTTPRequests, 1)
 		next.ServeHTTP(w, r)
 	})
+}
+
+func isPublicHealthProbePath(urlPath string) bool {
+	switch strings.Trim(urlPath, "/") {
+	case "healthz", "_healthz", "livez", "readyz", "_readyz":
+		return true
+	default:
+		return false
+	}
+}
+
+func constantTimeEquals(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func matchConfiguredAPIKey(provided, expected string) bool {
+	if provided == "" || expected == "" {
+		return false
+	}
+	if constantTimeEquals(provided, expected) {
+		return true
+	}
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding} {
+		if decoded, err := enc.DecodeString(provided); err == nil && len(decoded) > 0 {
+			decStr := string(decoded)
+			if constantTimeEquals(decStr, expected) {
+				return true
+			}
+			if idx := strings.IndexByte(decStr, ':'); idx >= 0 {
+				if constantTimeEquals(decStr[idx+1:], expected) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (s *Server) checkInboundAuth(w http.ResponseWriter, r *http.Request) bool {
+	s.authMu.RLock()
+	basicUser := s.basicAuthUser
+	basicPass := s.basicAuthPass
+	apiKey := s.apiKey
+	s.authMu.RUnlock()
+
+	hasBasic := basicUser != "" || basicPass != ""
+	hasAPIKey := apiKey != ""
+	if !hasBasic && !hasAPIKey {
+		return true
+	}
+	if isPublicHealthProbePath(r.URL.Path) {
+		return true
+	}
+
+	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+	if authHeader != "" {
+		if hasBasic && strings.HasPrefix(strings.ToLower(authHeader), "basic ") {
+			if u, p, ok := r.BasicAuth(); ok && constantTimeEquals(u, basicUser) && constantTimeEquals(p, basicPass) {
+				return true
+			}
+		}
+		if hasAPIKey {
+			lower := strings.ToLower(authHeader)
+			var token string
+			switch {
+			case strings.HasPrefix(lower, "apikey "):
+				token = strings.TrimSpace(authHeader[len("apikey "):])
+			case strings.HasPrefix(lower, "bearer "):
+				token = strings.TrimSpace(authHeader[len("bearer "):])
+			}
+			if token != "" && matchConfiguredAPIKey(token, apiKey) {
+				return true
+			}
+		}
+	}
+
+	w.Header().Set("WWW-Authenticate", `Basic realm="security" charset="UTF-8", ApiKey`)
+	reason := "missing authentication credentials for REST request [" + r.URL.Path + "]"
+	if authHeader != "" {
+		reason = "unable to authenticate credentials for REST request [" + r.URL.Path + "]"
+	}
+	writeESError(w, http.StatusUnauthorized, "security_exception", reason)
+	return false
 }
 
 // SlowQueryEntry records a search execution and any unpromoted `_doc[...]` VARIANT fields it touched.
@@ -1223,6 +1315,7 @@ func (s *Server) promoteFieldInternal(ctx context.Context, idxName, field, esTyp
 	s.mu.Unlock()
 	s.persistIndex(ctx, idxName, compiled)
 	s.backfillIndexSchema(ctx, compiled)
+	s.queryCache.InvalidateAll()
 
 	s.slowTracker.mu.Lock()
 	if byField, ok := s.slowTracker.unindexedFreq[idxName]; ok {
@@ -1543,6 +1636,7 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	s.persistIndex(r.Context(), newIdx, compiled)
 	s.persistAlias(r.Context(), alias, []string{newIdx})
+	s.queryCache.InvalidateAll()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"acknowledged":        true,

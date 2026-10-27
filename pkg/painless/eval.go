@@ -263,7 +263,55 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 	return nil
 }
 
+func isIdentByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// normalizeBracketAccess rewrites bracket property accesses like `ctx._source['field']`
+// or `params["key"]` into dot notation (`ctx._source.field`, `params.key`) outside string literals.
+func normalizeBracketAccess(s string) string {
+	if strings.IndexByte(s, '[') < 0 {
+		return s
+	}
+	var out strings.Builder
+	out.Grow(len(s))
+	inQuotes := byte(0)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inQuotes != 0 {
+			out.WriteByte(c)
+			if c == inQuotes && (i == 0 || s[i-1] != '\\') {
+				inQuotes = 0
+			}
+			continue
+		}
+		if c == '\'' || c == '"' {
+			inQuotes = c
+			out.WriteByte(c)
+			continue
+		}
+		if c == '[' && i > 0 && (isIdentByte(s[i-1]) || s[i-1] == ']') && i+3 < len(s) && (s[i+1] == '\'' || s[i+1] == '"') {
+			q := s[i+1]
+			j := i + 2
+			valid := false
+			for j < len(s) && isIdentByte(s[j]) {
+				j++
+				valid = true
+			}
+			if valid && j+1 < len(s) && s[j] == q && s[j+1] == ']' {
+				out.WriteByte('.')
+				out.WriteString(s[i+2 : j])
+				i = j + 1
+				continue
+			}
+		}
+		out.WriteByte(c)
+	}
+	return out.String()
+}
+
 func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any, ctxOp *string, budget *evalBudget) error {
+	stmt = normalizeBracketAccess(stmt)
 	if m := reCtxOp.FindStringSubmatch(stmt); m != nil {
 		*ctxOp = m[1]
 		return nil
@@ -567,7 +615,7 @@ func valuesEqual(a, b any) bool {
 }
 
 func evalRHSExpr(sourceMap map[string]any, rhs string, params map[string]any) (any, error) {
-	rhs = strings.TrimSpace(rhs)
+	rhs = trimBalancedParens(normalizeBracketAccess(rhs))
 	// Check binary `+` or `-` outside quotes
 	if opIdx, isAdd := findTopLevelAddSub(rhs); opIdx > 0 {
 		leftVal, err := evalRHSExpr(sourceMap, rhs[:opIdx], params)
@@ -579,6 +627,27 @@ func evalRHSExpr(sourceMap map[string]any, rhs string, params map[string]any) (a
 			return nil, err
 		}
 		return applyArithmetic(leftVal, rightVal, isAdd), nil
+	}
+	if opIdx, isMul := findTopLevelMulDiv(rhs); opIdx > 0 {
+		leftVal, err := evalRHSExpr(sourceMap, rhs[:opIdx], params)
+		if err != nil {
+			return nil, err
+		}
+		rightVal, err := evalRHSExpr(sourceMap, rhs[opIdx+1:], params)
+		if err != nil {
+			return nil, err
+		}
+		fa, oka := toFloat64(leftVal)
+		fb, okb := toFloat64(rightVal)
+		if oka && okb {
+			if isMul {
+				return fa * fb, nil
+			}
+			if fb != 0 {
+				return fa / fb, nil
+			}
+		}
+		return float64(0), nil
 	}
 
 	if rhs == "ctx._source" {
@@ -658,6 +727,38 @@ func findTopLevelAddSub(expr string) (int, bool) {
 		}
 	}
 	return lastIdx, lastIsAdd
+}
+
+func findTopLevelMulDiv(expr string) (int, bool) {
+	inQuotes := byte(0)
+	depth := 0
+	lastIdx := -1
+	lastIsMul := false
+	for i := 0; i < len(expr); i++ {
+		c := expr[i]
+		if inQuotes != 0 {
+			if c == inQuotes && (i == 0 || expr[i-1] != '\\') {
+				inQuotes = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			inQuotes = c
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		case '*', '/':
+			if depth == 0 && i > 0 {
+				lastIdx = i
+				lastIsMul = c == '*'
+			}
+		}
+	}
+	return lastIdx, lastIsMul
 }
 
 func applyArithmetic(a, b any, isAdd bool) any {
@@ -816,6 +917,10 @@ func splitTopLevelStatements(s string) []string {
 			}
 		case ';', '\n':
 			if braceDepth == 0 && parenDepth == 0 {
+				if c == '\n' && strings.HasPrefix(strings.TrimSpace(s[i+1:]), "else") {
+					curr.WriteByte(c)
+					continue
+				}
 				if strings.TrimSpace(curr.String()) != "" {
 					out = append(out, curr.String())
 				}

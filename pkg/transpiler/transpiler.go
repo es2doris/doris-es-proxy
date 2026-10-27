@@ -193,19 +193,22 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 		if req.Collapse != nil && req.Collapse.Field != "" {
 			collapseCol := t.sqlColumnRef(req.Collapse.Field, true, nil)
 			plan.HitsSQL = fmt.Sprintf(
-				"SELECT `_id`, `_version`, `_source`, `_score`, COUNT(*) OVER() AS `_total_hits` "+
+				"SELECT `_id`, `_version`, `_source`, `_score`, `_total_hits` "+
 					"FROM ("+
-					"SELECT *, CAST(%s AS DOUBLE) AS `_score`, "+
+					"SELECT *, "+
 					"ROW_NUMBER() OVER (PARTITION BY %s ORDER BY %s) AS `_collapse_rn` "+
+					"FROM ("+
+					"SELECT *, CAST(%s AS DOUBLE) AS `_score`, COUNT(*) OVER() AS `_total_hits` "+
 					"FROM `%s`.`%s` "+
 					"WHERE %s"+
+					") `_scored`"+
 					") `_collapsed` "+
 					"WHERE `_collapse_rn` = 1 "+
 					"ORDER BY %s "+
 					"LIMIT %d OFFSET %d",
-				scoreExpr,
 				collapseCol,
 				orderBy,
+				scoreExpr,
 				t.Schema.DorisDB,
 				t.Schema.DorisTable,
 				whereClause,
@@ -700,6 +703,7 @@ func (t *Transpiler) compileBool(b *esast.BoolQuery, scoring bool, nctx *nestedC
 	if len(b.Should) > 0 {
 		var disjuncts []string
 		var safeDisjuncts []string
+		shouldUsesFT := false
 		for i := range b.Should {
 			c := t.CompileQuery(&b.Should[i], scoring, nctx)
 			disjuncts = append(disjuncts, fmt.Sprintf("(%s)", c.WhereSQL))
@@ -707,16 +711,21 @@ func (t *Transpiler) compileBool(b *esast.BoolQuery, scoring bool, nctx *nestedC
 			if scoring {
 				scoreTerms = append(scoreTerms, c.ScoreSQL)
 			}
-			usesFT = usesFT || c.UsesFulltextMatch
+			shouldUsesFT = shouldUsesFT || c.UsesFulltextMatch
 		}
 		minShould = parseMinShouldMatch(b.MinimumShouldMatch, len(b.Should), len(b.Must) == 0 && len(b.Filter) == 0)
-		if minShould == 1 {
+		if minShould > len(disjuncts) {
+			conjuncts = append(conjuncts, "FALSE")
+			safeConjuncts = append(safeConjuncts, "FALSE")
+		} else if minShould == 1 {
 			conjuncts = append(conjuncts, fmt.Sprintf("(%s)", strings.Join(disjuncts, " OR ")))
 			safeConjuncts = append(safeConjuncts, fmt.Sprintf("(%s)", strings.Join(safeDisjuncts, " OR ")))
+			usesFT = usesFT || shouldUsesFT
 		} else if minShould > 1 {
-			if minShould >= len(disjuncts) {
+			if minShould == len(disjuncts) {
 				conjuncts = append(conjuncts, fmt.Sprintf("(%s)", strings.Join(disjuncts, " AND ")))
 				safeConjuncts = append(safeConjuncts, fmt.Sprintf("(%s)", strings.Join(safeDisjuncts, " AND ")))
+				usesFT = usesFT || shouldUsesFT
 			} else {
 				var intCasts []string
 				for _, sd := range safeDisjuncts {
@@ -833,7 +842,7 @@ func (t *Transpiler) compileMatchField(
 		matchOp = "MATCH_ALL"
 	}
 	col := t.sqlColumnRef(field, false, nil)
-	lit := quoteValue(queryVal)
+	lit := quoteStr(queryStr)
 	pred := fmt.Sprintf("%s %s %s", col, matchOp, lit)
 	return CompiledQuery{WhereSQL: pred, SafeWhereSQL: scorePred, ScoreSQL: score, UsesFulltextMatch: true}
 }
@@ -1079,6 +1088,8 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 	scoreMode := strings.ToLower(fs.ScoreMode)
 	isMultiplyMode := scoreMode == "" || scoreMode == "multiply"
 	var funcExprs []string
+	var rawValExprs []string
+	var filterCondExprs []string
 	for _, fn := range funcs {
 		weight := 1.0
 		if fn.Weight != nil {
@@ -1122,15 +1133,18 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 			}
 			valExpr = fmt.Sprintf("(%.4f * %s)", weight, modExpr)
 		}
+		rawValExprs = append(rawValExprs, valExpr)
 		if fn.Filter != nil {
 			cond := t.CompileQuery(fn.Filter, true, nctx)
 			condExpr := cond.EffectiveSafeWhere()
+			filterCondExprs = append(filterCondExprs, condExpr)
 			elseVal := "0.0"
-			if isMultiplyMode && len(funcs) > 1 {
+			if isMultiplyMode {
 				elseVal = "1.0"
 			}
 			funcExprs = append(funcExprs, fmt.Sprintf("(CASE WHEN %s THEN %s ELSE %s END)", condExpr, valExpr, elseVal))
 		} else {
+			filterCondExprs = append(filterCondExprs, "")
 			funcExprs = append(funcExprs, valExpr)
 		}
 	}
@@ -1158,7 +1172,29 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 			combinedFuncs = fmt.Sprintf("LEAST(%s)", strings.Join(funcExprs, ", "))
 		}
 	case "first":
-		combinedFuncs = funcExprs[0]
+		if len(funcExprs) == 1 {
+			combinedFuncs = funcExprs[0]
+		} else {
+			var caseParts []string
+			elseFallback := "1.0"
+			hasUnfiltered := false
+			for i := range funcs {
+				if filterCondExprs[i] == "" {
+					elseFallback = rawValExprs[i]
+					hasUnfiltered = true
+					break
+				}
+				caseParts = append(caseParts, fmt.Sprintf("WHEN %s THEN %s", filterCondExprs[i], rawValExprs[i]))
+			}
+			if len(caseParts) == 0 {
+				combinedFuncs = elseFallback
+			} else {
+				if !hasUnfiltered && strings.ToLower(fs.BoostMode) == "replace" {
+					elseFallback = base.ScoreSQL
+				}
+				combinedFuncs = fmt.Sprintf("(CASE %s ELSE %s END)", strings.Join(caseParts, " "), elseFallback)
+			}
+		}
 	default:
 		combinedFuncs = strings.Join(funcExprs, " * ")
 	}
@@ -1179,7 +1215,7 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 	case "replace":
 		finalScore = combinedFuncs
 	default:
-		finalScore = fmt.Sprintf("((%s) * GREATEST(1.0, %s))", base.ScoreSQL, combinedFuncs)
+		finalScore = fmt.Sprintf("((%s) * (%s))", base.ScoreSQL, combinedFuncs)
 	}
 	if fs.Boost != nil && *fs.Boost != 1.0 {
 		finalScore = fmt.Sprintf("(%.4f * %s)", *fs.Boost, finalScore)
@@ -1198,7 +1234,7 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 	if strVal, ok := val.(string); ok {
 		if effLower {
 			val = strings.ToLower(strVal)
-		} else if b.DorisType == schema.DorisBigInt {
+		} else if b.DorisType == schema.DorisBigInt && b.Kind != schema.StorageNestedSubfield {
 			if ms, ok := schema.ParseESDateToEpochMillis(strVal, time.Now().UTC()); ok {
 				val = ms
 			}
@@ -1262,7 +1298,7 @@ func (t *Transpiler) compileTermsPredicate(field string, vals []any, nctx *neste
 		if strVal, ok := v.(string); ok {
 			if effLower {
 				v = strings.ToLower(strVal)
-			} else if b.DorisType == schema.DorisBigInt {
+			} else if b.DorisType == schema.DorisBigInt && b.Kind != schema.StorageNestedSubfield {
 				if ms, ok := schema.ParseESDateToEpochMillis(strVal, now); ok {
 					v = ms
 				}
@@ -1334,7 +1370,7 @@ func (t *Transpiler) compileRangePredicate(field string, rc esast.RangeCond, nct
 		if v == nil {
 			return nil
 		}
-		if b.DorisType == schema.DorisBigInt {
+		if b.DorisType == schema.DorisBigInt && b.Kind != schema.StorageNestedSubfield {
 			if strVal, ok := v.(string); ok {
 				if ms, ok := schema.ParseESDateBoundToEpochMillis(strVal, now, roundUp); ok {
 					if isEpochSecond && ms > 0 && ms < 100_000_000_000 {
@@ -1508,18 +1544,44 @@ func (t *Transpiler) appendAggBranches(
 				}
 			} else {
 				col := t.sqlColumnRef(spec.Terms.Field, true, nil)
-				*branches = append(*branches, fmt.Sprintf(
-					"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
-						"SELECT %s AS `_agg_name`, CAST(%s AS STRING) AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
-						"FROM `base_matched` "+
-						"WHERE %s%s IS NOT NULL "+
-						"GROUP BY %s ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT %d"+
-						") `_agg_sub_%d`",
-					quoteStr(fullAggName), col, wherePrefix, col, col, size, *subIdx,
-				))
-				if subAggs := spec.SubAggs(); len(subAggs) > 0 {
-					t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, fmt.Sprintf("CAST(%s AS STRING)", col),
-						"`base_matched`", fmt.Sprintf("%s%s IS NOT NULL", wherePrefix, col), subAggs)
+				if spec.Terms.Missing != nil {
+					missingLit := quoteStr(fmt.Sprintf("%v", spec.Terms.Missing))
+					coalescedCol := fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", col, missingLit)
+					wCond := ""
+					if extraWhere != "" {
+						wCond = "WHERE " + extraWhere + " "
+					}
+					*branches = append(*branches, fmt.Sprintf(
+						"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
+							"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+							"FROM `base_matched` "+
+							"%s"+
+							"GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT %d"+
+							") `_agg_sub_%d`",
+						quoteStr(fullAggName), coalescedCol, wCond, size, *subIdx,
+					))
+					if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+						subWhere := "TRUE"
+						if extraWhere != "" {
+							subWhere = extraWhere
+						}
+						t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, coalescedCol,
+							"`base_matched`", subWhere, subAggs)
+					}
+				} else {
+					*branches = append(*branches, fmt.Sprintf(
+						"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
+							"SELECT %s AS `_agg_name`, CAST(%s AS STRING) AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+							"FROM `base_matched` "+
+							"WHERE %s%s IS NOT NULL "+
+							"GROUP BY %s ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT %d"+
+							") `_agg_sub_%d`",
+						quoteStr(fullAggName), col, wherePrefix, col, col, size, *subIdx,
+					))
+					if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+						t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, fmt.Sprintf("CAST(%s AS STRING)", col),
+							"`base_matched`", fmt.Sprintf("%s%s IS NOT NULL", wherePrefix, col), subAggs)
+					}
 				}
 			}
 
@@ -1538,7 +1600,10 @@ func (t *Transpiler) appendAggBranches(
 				subSpec := subAggs[subName]
 				if subSpec.Terms != nil {
 					size := t.capBucketSize(subSpec.Terms.Size)
-					relKey := strings.TrimPrefix(subSpec.Terms.Field, spec.Nested.Path+".")
+					relKey := strings.TrimSuffix(strings.TrimPrefix(subSpec.Terms.Field, spec.Nested.Path+"."), ".keyword")
+					if b := t.Schema.ResolveField(subSpec.Terms.Field); len(b.RelativeJSONPath) > 0 {
+						relKey = strings.Join(b.RelativeJSONPath, ".")
+					}
 					relJSONPath := quoteStr("$." + relKey)
 					*subIdx++
 					*branches = append(*branches, fmt.Sprintf(
@@ -1775,6 +1840,7 @@ func (t *Transpiler) appendAggBranches(
 			size := t.capBucketSize(spec.Composite.Size)
 			var colExprs []string
 			var notNullConds []string
+			var srcNames []string
 			for _, srcMap := range spec.Composite.Sources {
 				srcKeys := sortedMapKeys(srcMap)
 				for _, sk := range srcKeys {
@@ -1783,6 +1849,7 @@ func (t *Transpiler) appendAggBranches(
 						col := t.sqlColumnRef(srcSpec.Terms.Field, true, nil)
 						colExprs = append(colExprs, fmt.Sprintf("CAST(%s AS STRING)", col))
 						notNullConds = append(notNullConds, fmt.Sprintf("%s IS NOT NULL", col))
+						srcNames = append(srcNames, sk)
 					}
 				}
 			}
@@ -1792,6 +1859,18 @@ func (t *Transpiler) appendAggBranches(
 					bucketKeyExpr = fmt.Sprintf("CONCAT_WS('\\x1f', %s)", strings.Join(colExprs, ", "))
 				}
 				wCond := strings.Join(notNullConds, " AND ")
+				if len(spec.Composite.After) > 0 {
+					var afterParts []string
+					for _, sn := range srcNames {
+						if av, ok := spec.Composite.After[sn]; ok && av != nil {
+							afterParts = append(afterParts, fmt.Sprintf("%v", av))
+						} else {
+							afterParts = append(afterParts, "")
+						}
+					}
+					afterCursor := strings.Join(afterParts, "\x1f")
+					wCond = fmt.Sprintf("(%s) AND (%s > %s)", wCond, bucketKeyExpr, quoteStr(afterCursor))
+				}
 				if extraWhere != "" {
 					wCond = fmt.Sprintf("(%s) AND (%s)", extraWhere, wCond)
 				}
@@ -2149,7 +2228,7 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 
 	b := t.Schema.ResolveField(field)
 	if nctx != nil && ((b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath) || strings.HasPrefix(field, nctx.nestedPath+".")) {
-		relPath := "$." + strings.TrimPrefix(field, nctx.nestedPath+".")
+		relPath := "$." + strings.TrimSuffix(strings.TrimPrefix(field, nctx.nestedPath+"."), ".keyword")
 		if len(b.RelativeJSONPath) > 0 {
 			relPath = "$." + strings.Join(b.RelativeJSONPath, ".")
 		}
@@ -2288,7 +2367,16 @@ func wildcardToLike(w string) string {
 	escaped := false
 	for _, r := range w {
 		if escaped {
-			sb.WriteRune(r)
+			switch r {
+			case '%':
+				sb.WriteString(`\%`)
+			case '_':
+				sb.WriteString(`\_`)
+			case '\\':
+				sb.WriteString(`\\`)
+			default:
+				sb.WriteRune(r)
+			}
 			escaped = false
 			continue
 		}
@@ -2306,6 +2394,9 @@ func wildcardToLike(w string) string {
 		default:
 			sb.WriteRune(r)
 		}
+	}
+	if escaped {
+		sb.WriteString(`\\`)
 	}
 	return sb.String()
 }

@@ -130,6 +130,9 @@ func main() {
 		bulkCoalesceMs      = flag.Int("bulk-coalesce-ms", envIntOrDefault("BULK_COALESCE_MS", 0), "Group-commit Stream Load micro-batch window in milliseconds across concurrent writes (0 disables, env: BULK_COALESCE_MS)")
 		bulkCoalesceBytes   = flag.Int("bulk-coalesce-bytes", envIntOrDefault("BULK_COALESCE_BYTES", proxy.DefaultBulkCoalesceMaxBytes), "Maximum byte size of a coalesced Stream Load batch before immediate flush (env: BULK_COALESCE_BYTES)")
 		queryCacheTTL       = flag.Duration("query-cache-ttl", envDurationOrDefault("QUERY_CACHE_TTL", 0), "Optional TTL for caching search responses with automatic write invalidation (e.g. 5s, 0s disables, env: QUERY_CACHE_TTL)")
+		basicAuthUser       = flag.String("basic-auth-user", envOrDefault("BASIC_AUTH_USER", ""), "Optional inbound HTTP Basic Auth username (env: BASIC_AUTH_USER)")
+		basicAuthPass       = flag.String("basic-auth-pass", envOrDefault("BASIC_AUTH_PASS", ""), "Optional inbound HTTP Basic Auth password (env: BASIC_AUTH_PASS)")
+		apiKey              = flag.String("api-key", envOrDefault("API_KEY", ""), "Optional inbound Elasticsearch ApiKey / Bearer token (env: API_KEY)")
 		inMemoryMode        = flag.Bool("in-memory", envBoolOrDefault("IN_MEMORY", false), "Run with in-memory shredded Doris emulator (env: IN_MEMORY)")
 		logSQL              = flag.Bool("log-sql", envBoolOrDefault("LOG_SQL", false), "Log transpiled Apache Doris DDL, Stream Load, HitsSQL, and AggsSQL (env: LOG_SQL)")
 	)
@@ -195,6 +198,10 @@ func main() {
 		srv.SetQueryCacheTTL(*queryCacheTTL, proxy.DefaultQueryCacheMaxEntries)
 		log.Printf("search query result cache enabled (ttl=%s, max-entries=%d)", *queryCacheTTL, proxy.DefaultQueryCacheMaxEntries)
 	}
+	if *basicAuthUser != "" || *basicAuthPass != "" || *apiKey != "" {
+		srv.SetAuth(*basicAuthUser, *basicAuthPass, *apiKey)
+		log.Printf("inbound HTTP authentication enabled (basic_auth=%v, api_key=%v)", *basicAuthUser != "" || *basicAuthPass != "", *apiKey != "")
+	}
 	bootCtx, bootCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := srv.BootstrapCatalog(bootCtx); err != nil {
 		log.Printf("warning: initial _es_catalog bootstrap deferred: %v", err)
@@ -220,6 +227,7 @@ func main() {
 		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(shutCtx)
+		_ = srv.Close(shutCtx)
 	}()
 
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {

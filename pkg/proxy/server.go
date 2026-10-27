@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"regexp"
 	"sort"
@@ -115,6 +116,11 @@ type Server struct {
 	totalHTTPRequests    int64
 	autoPromoteThreshold int64
 
+	authMu        sync.RWMutex
+	basicAuthUser string
+	basicAuthPass string
+	apiKey        string
+
 	mu        sync.RWMutex
 	indices   map[string]*schema.IndexSchema
 	aliases   map[string][]string // aliasName -> ordered target indexNames
@@ -140,9 +146,26 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		pipelines:      make(map[string]map[string]any),
 	}
 	s.coalescer = newStreamLoadCoalescer(func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
-		return s.backend.StreamLoad(ctx, table, ndjson, syncRefresh)
+		err := s.backend.StreamLoad(ctx, table, ndjson, syncRefresh)
+		s.queryCache.InvalidateAll()
+		return err
 	})
 	return s
+}
+
+// SetAuth configures optional inbound HTTP Basic Auth (`basicUser` / `basicPass`) and/or
+// Elasticsearch `ApiKey` / `Bearer` token authentication.
+func (s *Server) SetAuth(basicUser, basicPass, apiKey string) {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	s.basicAuthUser = strings.TrimSpace(basicUser)
+	s.basicAuthPass = basicPass
+	s.apiKey = strings.TrimSpace(apiKey)
+}
+
+// Close flushes any buffered group-commit Stream Load batches prior to server shutdown.
+func (s *Server) Close(ctx context.Context) error {
+	return s.coalescer.FlushAll(ctx)
 }
 
 // SetBulkCoalesce configures group-commit Stream Load micro-batching across concurrent write requests.
@@ -213,6 +236,7 @@ func (s *Server) syncCatalogFromBackend(ctx context.Context) error {
 			}
 		}
 	}
+	s.queryCache.InvalidateAll()
 	return nil
 }
 
@@ -386,8 +410,18 @@ func (s *Server) Handler() http.Handler {
 			case segs[0] == "_ingest" && segs[1] == "pipeline":
 				s.handleIngestPipeline(w, r)
 			case segs[0] == "_security" && segs[1] == "_authenticate":
+				username := "elastic"
+				if u, _, ok := r.BasicAuth(); ok && u != "" {
+					username = u
+				} else {
+					s.authMu.RLock()
+					if s.basicAuthUser != "" {
+						username = s.basicAuthUser
+					}
+					s.authMu.RUnlock()
+				}
 				writeJSON(w, http.StatusOK, map[string]any{
-					"username":  "elastic",
+					"username":  username,
 					"roles":     []string{"superuser"},
 					"full_name": "doris-es-proxy",
 					"email":     "",
@@ -718,7 +752,9 @@ func (s *Server) handleCatAliases(w http.ResponseWriter, r *http.Request) {
 	writeCatResponse(w, r, []string{"alias", "index"}, list)
 }
 
-func (s *Server) handleRefresh(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
+	_ = s.coalescer.FlushAll(r.Context())
+	s.queryCache.InvalidateAll()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0},
 	})
@@ -806,15 +842,35 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	nextScrollID := "doris-scroll-eof"
-	if hitsWrapper, ok := resp["hits"].(map[string]any); ok {
-		if hitList, ok := hitsWrapper["hits"].([]map[string]any); ok && len(hitList) > 0 {
-			if lastSort, ok := hitList[len(hitList)-1]["sort"].([]any); ok && len(lastSort) > 0 {
-				nextScrollID = encodeScrollCursor(cursor.Index, &req, lastSort)
-			}
-		}
+	if lastSort := extractLastHitSort(resp); len(lastSort) > 0 {
+		nextScrollID = encodeScrollCursor(cursor.Index, &req, lastSort)
 	}
 	resp["_scroll_id"] = nextScrollID
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func extractLastHitSort(resp map[string]any) []any {
+	hitsWrapper, ok := resp["hits"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	switch hitList := hitsWrapper["hits"].(type) {
+	case []map[string]any:
+		if len(hitList) > 0 {
+			if lastSort, ok := hitList[len(hitList)-1]["sort"].([]any); ok {
+				return lastSort
+			}
+		}
+	case []any:
+		if len(hitList) > 0 {
+			if lastHit, ok := hitList[len(hitList)-1].(map[string]any); ok {
+				if lastSort, ok := lastHit["sort"].([]any); ok {
+					return lastSort
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
@@ -835,6 +891,7 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 		s.templates[name] = tpl
 		s.mu.Unlock()
 		s.persistTemplate(r.Context(), name, tpl)
+		s.queryCache.InvalidateAll()
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 	case http.MethodHead:
 		s.mu.RLock()
@@ -875,6 +932,7 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 		delete(s.templates, name)
 		s.mu.Unlock()
 		s.deleteCatalogEntity(r.Context(), "template", name)
+		s.queryCache.InvalidateAll()
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 	default:
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
@@ -946,6 +1004,7 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 	for alias, targets := range aliasesToPersist {
 		s.persistAlias(r.Context(), alias, targets)
 	}
+	s.queryCache.InvalidateAll()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"acknowledged":        true,
@@ -1070,42 +1129,26 @@ func (s *Server) handleGetAllMappings(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleGetMapping(w http.ResponseWriter, r *http.Request) {
 	rawIndex := r.PathValue("index")
-	if strings.ContainsAny(rawIndex, "*,") || rawIndex == "_all" {
-		targets := s.resolveTargetIndices(rawIndex)
-		s.mu.RLock()
-		out := make(map[string]any, len(targets))
-		for _, indexName := range targets {
-			if idx, ok := s.indices[indexName]; ok {
-				props := map[string]esast.FieldProperty{}
-				if idx.RawMapping != nil {
-					props = idx.RawMapping.Properties
-				}
-				out[indexName] = map[string]any{
-					"mappings": map[string]any{"properties": props},
-				}
+	targets := s.resolveTargetIndices(rawIndex)
+	s.mu.RLock()
+	out := make(map[string]any, len(targets))
+	for _, indexName := range targets {
+		if idx, ok := s.indices[indexName]; ok {
+			props := map[string]esast.FieldProperty{}
+			if idx.RawMapping != nil {
+				props = idx.RawMapping.Properties
+			}
+			out[indexName] = map[string]any{
+				"mappings": map[string]any{"properties": props},
 			}
 		}
-		s.mu.RUnlock()
-		writeJSON(w, http.StatusOK, out)
-		return
 	}
-	indexName := s.resolveIndexName(rawIndex)
-	s.mu.RLock()
-	idx, ok := s.indices[indexName]
 	s.mu.RUnlock()
-	if !ok {
-		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+indexName+"]")
+	if len(out) == 0 && !strings.ContainsAny(rawIndex, "*,") && rawIndex != "_all" {
+		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
 		return
 	}
-	props := map[string]esast.FieldProperty{}
-	if idx.RawMapping != nil {
-		props = idx.RawMapping.Properties
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		indexName: map[string]any{
-			"mappings": map[string]any{"properties": props},
-		},
-	})
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleGetFieldMapping(w http.ResponseWriter, r *http.Request) {
@@ -1128,20 +1171,23 @@ func (s *Server) handleGetFieldMapping(w http.ResponseWriter, r *http.Request) {
 			if !matchesAnyGlob(esPath, fieldPatterns) {
 				continue
 			}
-			esType := "keyword"
-			switch fb.DorisType {
-			case schema.DorisBigInt:
-				if strings.Contains(strings.ToLower(esPath), "time") || strings.Contains(strings.ToLower(esPath), "date") || strings.HasSuffix(esPath, "At") {
-					esType = "date"
-				} else {
-					esType = "long"
+			esType := fb.ESType
+			if esType == "" {
+				esType = "keyword"
+				switch fb.DorisType {
+				case schema.DorisBigInt:
+					if strings.Contains(strings.ToLower(esPath), "time") || strings.Contains(strings.ToLower(esPath), "date") || strings.HasSuffix(esPath, "At") {
+						esType = "date"
+					} else {
+						esType = "long"
+					}
+				case schema.DorisDouble:
+					esType = "double"
+				case schema.DorisBoolean:
+					esType = "boolean"
+				case schema.DorisString:
+					esType = "text"
 				}
-			case schema.DorisDouble:
-				esType = "double"
-			case schema.DorisBoolean:
-				esType = "boolean"
-			case schema.DorisString:
-				esType = "text"
 			}
 			lastSeg := esPath
 			if dot := strings.LastIndexByte(esPath, '.'); dot >= 0 {
@@ -1217,6 +1263,7 @@ func (s *Server) handlePutMapping(w http.ResponseWriter, r *http.Request) {
 		}
 		s.backfillIndexSchema(r.Context(), newSchema)
 	}
+	s.queryCache.InvalidateAll()
 	writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 }
 
@@ -1297,6 +1344,7 @@ func (s *Server) handleIndexAliasByName(w http.ResponseWriter, r *http.Request) 
 		targets := append([]string(nil), s.aliases[aliasName]...)
 		s.mu.Unlock()
 		s.persistAlias(r.Context(), aliasName, targets)
+		s.queryCache.InvalidateAll()
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 	case http.MethodDelete:
 		s.mu.Lock()
@@ -1304,6 +1352,7 @@ func (s *Server) handleIndexAliasByName(w http.ResponseWriter, r *http.Request) 
 		targets := append([]string(nil), s.aliases[aliasName]...)
 		s.mu.Unlock()
 		s.persistAlias(r.Context(), aliasName, targets)
+		s.queryCache.InvalidateAll()
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 	case http.MethodGet:
 		s.mu.RLock()
@@ -1387,6 +1436,7 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 	for al, targets := range modifiedAliases {
 		s.persistAlias(r.Context(), al, targets)
 	}
+	s.queryCache.InvalidateAll()
 	writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 }
 
@@ -2218,12 +2268,8 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 
 	if r.URL.Query().Get("scroll") != "" {
 		scrollID := "doris-scroll-eof"
-		if hitsWrapper, ok := resp["hits"].(map[string]any); ok {
-			if hitList, ok := hitsWrapper["hits"].([]map[string]any); ok && len(hitList) > 0 {
-				if lastSort, ok := hitList[len(hitList)-1]["sort"].([]any); ok && len(lastSort) > 0 {
-					scrollID = encodeScrollCursor(rawIndex, &req, lastSort)
-				}
-			}
+		if lastSort := extractLastHitSort(resp); len(lastSort) > 0 {
+			scrollID = encodeScrollCursor(rawIndex, &req, lastSort)
 		}
 		resp["_scroll_id"] = scrollID
 	}
@@ -2369,18 +2415,23 @@ func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		for esPath, fb := range idxSchema.Fields {
-			switch fb.DorisType {
-			case schema.DorisBigInt:
+			switch {
+			case fb.ESType != "":
+				addCap(esPath, fb.ESType, true, fb.ESType != "text")
+				if fb.KeywordCompanion != "" {
+					addCap(esPath+".keyword", "keyword", true, true)
+				}
+			case fb.DorisType == schema.DorisBigInt:
 				if strings.Contains(strings.ToLower(esPath), "time") || strings.Contains(strings.ToLower(esPath), "date") || strings.HasSuffix(esPath, "At") {
 					addCap(esPath, "date", true, true)
 				} else {
 					addCap(esPath, "long", true, true)
 				}
-			case schema.DorisDouble:
+			case fb.DorisType == schema.DorisDouble:
 				addCap(esPath, "double", true, true)
-			case schema.DorisBoolean:
+			case fb.DorisType == schema.DorisBoolean:
 				addCap(esPath, "boolean", true, true)
-			case schema.DorisString:
+			case fb.DorisType == schema.DorisString:
 				addCap(esPath, "text", true, false)
 				if fb.KeywordCompanion != "" {
 					addCap(esPath+".keyword", "keyword", true, true)
@@ -2596,6 +2647,19 @@ func (s *Server) executeSearchRequest(
 				if r.AggName == "__meta_total" {
 					allAggRows = append(allAggRows, r)
 				}
+			}
+		} else if len(targets) > 1 {
+			emptyStatsAggs := make(map[string]bool)
+			for _, r := range aggRows {
+				if r.BucketKey == "_stats_count" && r.effectiveCount() == 0 {
+					emptyStatsAggs[r.AggName] = true
+				}
+			}
+			for _, r := range aggRows {
+				if emptyStatsAggs[r.AggName] && r.BucketKey != "_stats_count" {
+					continue
+				}
+				allAggRows = append(allAggRows, r)
 			}
 		} else {
 			allAggRows = append(allAggRows, aggRows...)
@@ -3132,6 +3196,7 @@ func buildAggsMap(
 			}
 			aggsOut[aggName] = map[string]any{"values": valuesMap}
 		case spec.DateHistogram != nil:
+			rows = synthesizeDateHistogramBuckets(rows, spec.DateHistogram)
 			if len(rows) > 1 {
 				sort.SliceStable(rows, func(i, j int) bool {
 					ki, _ := strconv.ParseInt(rows[i].BucketKey, 10, 64)
@@ -3156,6 +3221,7 @@ func buildAggsMap(
 			}
 			aggsOut[aggName] = map[string]any{"buckets": b}
 		case spec.Histogram != nil:
+			rows = synthesizeHistogramBuckets(rows, spec.Histogram)
 			if len(rows) > 1 {
 				sort.SliceStable(rows, func(i, j int) bool {
 					ki, _ := strconv.ParseFloat(rows[i].BucketKey, 64)
@@ -3261,6 +3327,212 @@ func buildAggsMap(
 		}
 	}
 	return aggsOut
+}
+
+func synthesizeDateHistogramBuckets(rows []AggRow, spec *esast.DateHistogramAggSpec) []AggRow {
+	if spec == nil {
+		return rows
+	}
+	intervalMs := spec.EffectiveIntervalMs()
+	if intervalMs <= 0 {
+		intervalMs = 86400000
+	}
+	nowUTC := time.Now().UTC()
+	var hardMin, hardMax int64
+	hasHardMin, hasHardMax := false, false
+	if spec.HardBounds != nil {
+		if spec.HardBounds.Min != nil {
+			if ms, ok := schema.ParseESDateBoundToEpochMillis(fmt.Sprintf("%v", spec.HardBounds.Min), nowUTC, false); ok {
+				hardMin = (ms / intervalMs) * intervalMs
+				hasHardMin = true
+			}
+		}
+		if spec.HardBounds.Max != nil {
+			if ms, ok := schema.ParseESDateBoundToEpochMillis(fmt.Sprintf("%v", spec.HardBounds.Max), nowUTC, true); ok {
+				hardMax = (ms / intervalMs) * intervalMs
+				hasHardMax = true
+			}
+		}
+	}
+	if hasHardMin || hasHardMax {
+		filtered := rows[:0]
+		for _, r := range rows {
+			k, err := strconv.ParseInt(r.BucketKey, 10, 64)
+			if err != nil {
+				continue
+			}
+			if (hasHardMin && k < hardMin) || (hasHardMax && k > hardMax) {
+				continue
+			}
+			filtered = append(filtered, r)
+		}
+		rows = filtered
+	}
+	if spec.MinDocCount == nil || *spec.MinDocCount > 0 {
+		return rows
+	}
+
+	byKey := make(map[int64]AggRow, len(rows))
+	var minKey, maxKey int64
+	hasObserved := false
+	for _, r := range rows {
+		if k, err := strconv.ParseInt(r.BucketKey, 10, 64); err == nil {
+			byKey[k] = r
+			if !hasObserved || k < minKey {
+				minKey = k
+			}
+			if !hasObserved || k > maxKey {
+				maxKey = k
+			}
+			hasObserved = true
+		}
+	}
+	if spec.ExtendedBounds != nil {
+		if spec.ExtendedBounds.Min != nil {
+			if ms, ok := schema.ParseESDateBoundToEpochMillis(fmt.Sprintf("%v", spec.ExtendedBounds.Min), nowUTC, false); ok {
+				extMin := (ms / intervalMs) * intervalMs
+				if !hasObserved || extMin < minKey {
+					minKey = extMin
+				}
+			}
+		}
+		if spec.ExtendedBounds.Max != nil {
+			if ms, ok := schema.ParseESDateBoundToEpochMillis(fmt.Sprintf("%v", spec.ExtendedBounds.Max), nowUTC, true); ok {
+				extMax := (ms / intervalMs) * intervalMs
+				if !hasObserved || extMax > maxKey {
+					maxKey = extMax
+					hasObserved = true
+				}
+			}
+		}
+	}
+	if hasHardMin && (!hasObserved || minKey < hardMin) {
+		minKey = hardMin
+	}
+	if hasHardMax && (!hasObserved || maxKey > hardMax) {
+		maxKey = hardMax
+	}
+	if !hasObserved || maxKey < minKey {
+		return rows
+	}
+
+	var out []AggRow
+	for k := minKey; k <= maxKey && len(out) < transpiler.DefaultMaxAggBuckets; k += intervalMs {
+		if existing, ok := byKey[k]; ok {
+			out = append(out, existing)
+		} else {
+			out = append(out, AggRow{
+				BucketKey: strconv.FormatInt(k, 10),
+				DocCount:  0,
+				Value:     0,
+			})
+		}
+	}
+	return out
+}
+
+func synthesizeHistogramBuckets(rows []AggRow, spec *esast.HistogramAggSpec) []AggRow {
+	if spec == nil {
+		return rows
+	}
+	interval := spec.Interval
+	if interval <= 0 {
+		interval = 1.0
+	}
+	offset := spec.Offset
+	var hardMin, hardMax float64
+	hasHardMin, hasHardMax := false, false
+	if spec.HardBounds != nil {
+		if spec.HardBounds.Min != nil {
+			if f, err := strconv.ParseFloat(fmt.Sprintf("%v", spec.HardBounds.Min), 64); err == nil {
+				hardMin = math.Floor((f-offset)/interval)*interval + offset
+				hasHardMin = true
+			}
+		}
+		if spec.HardBounds.Max != nil {
+			if f, err := strconv.ParseFloat(fmt.Sprintf("%v", spec.HardBounds.Max), 64); err == nil {
+				hardMax = math.Floor((f-offset)/interval)*interval + offset
+				hasHardMax = true
+			}
+		}
+	}
+	if hasHardMin || hasHardMax {
+		filtered := rows[:0]
+		for _, r := range rows {
+			k, err := strconv.ParseFloat(r.BucketKey, 64)
+			if err != nil {
+				continue
+			}
+			if (hasHardMin && k < hardMin) || (hasHardMax && k > hardMax) {
+				continue
+			}
+			filtered = append(filtered, r)
+		}
+		rows = filtered
+	}
+	if spec.MinDocCount == nil || *spec.MinDocCount > 0 {
+		return rows
+	}
+
+	byKey := make(map[string]AggRow, len(rows))
+	var minKey, maxKey float64
+	hasObserved := false
+	for _, r := range rows {
+		if k, err := strconv.ParseFloat(r.BucketKey, 64); err == nil {
+			normKey := strconv.FormatFloat(k, 'f', -1, 64)
+			byKey[normKey] = r
+			if !hasObserved || k < minKey {
+				minKey = k
+			}
+			if !hasObserved || k > maxKey {
+				maxKey = k
+			}
+			hasObserved = true
+		}
+	}
+	if spec.ExtendedBounds != nil {
+		if spec.ExtendedBounds.Min != nil {
+			if f, err := strconv.ParseFloat(fmt.Sprintf("%v", spec.ExtendedBounds.Min), 64); err == nil {
+				extMin := math.Floor((f-offset)/interval)*interval + offset
+				if !hasObserved || extMin < minKey {
+					minKey = extMin
+				}
+			}
+		}
+		if spec.ExtendedBounds.Max != nil {
+			if f, err := strconv.ParseFloat(fmt.Sprintf("%v", spec.ExtendedBounds.Max), 64); err == nil {
+				extMax := math.Floor((f-offset)/interval)*interval + offset
+				if !hasObserved || extMax > maxKey {
+					maxKey = extMax
+					hasObserved = true
+				}
+			}
+		}
+	}
+	if hasHardMin && (!hasObserved || minKey < hardMin) {
+		minKey = hardMin
+	}
+	if hasHardMax && (!hasObserved || maxKey > hardMax) {
+		maxKey = hardMax
+	}
+	if !hasObserved || maxKey < minKey {
+		return rows
+	}
+
+	var out []AggRow
+	for k := minKey; k <= maxKey+interval*1e-9 && len(out) < transpiler.DefaultMaxAggBuckets; k += interval {
+		normKey := strconv.FormatFloat(k, 'f', -1, 64)
+		if existing, ok := byKey[normKey]; ok {
+			out = append(out, existing)
+		} else {
+			out = append(out, AggRow{
+				BucketKey: normKey,
+				DocCount:  0,
+				Value:     0,
+			})
+		}
+	}
+	return out
 }
 
 func splitCompositeBucketKey(s string) []string {
@@ -3469,7 +3741,9 @@ func extractHitFieldsMap(h HitRow, hitIdx string, req *esast.SearchRequest, idxS
 			}
 			for leafPath, vals := range allLeafScalars {
 				if matchWildcardPattern(cleanField, leafPath) && len(vals) > 0 {
-					out[leafPath] = formatFieldValues(leafPath, vals, spec.Format, idxSchema)
+					if _, alreadyExplicit := out[leafPath]; !alreadyExplicit {
+						out[leafPath] = formatFieldValues(leafPath, vals, spec.Format, idxSchema)
+					}
 				}
 			}
 			continue
@@ -3490,6 +3764,13 @@ func extractHitFieldsMap(h HitRow, hitIdx string, req *esast.SearchRequest, idxS
 }
 
 func formatFieldValues(field string, vals []any, format string, idxSchema *schema.IndexSchema) []any {
+	isDateField := field == "@timestamp"
+	if idxSchema != nil {
+		b := idxSchema.ResolveField(field)
+		if b.ESType == "date" || b.ESType == "date_nanos" {
+			isDateField = true
+		}
+	}
 	formatted := make([]any, 0, len(vals))
 	for _, v := range vals {
 		if jsonNum, ok := v.(json.Number); ok {
@@ -3499,15 +3780,41 @@ func formatFieldValues(field string, vals []any, format string, idxSchema *schem
 				v = fv
 			}
 		}
-		if strVal, ok := v.(string); ok {
+		switch typed := v.(type) {
+		case string:
 			if strings.EqualFold(format, "epoch_millis") {
-				if ms, ok := schema.ParseESDateToEpochMillis(strVal, time.Now().UTC()); ok {
+				if ms, ok := schema.ParseESDateToEpochMillis(typed, time.Now().UTC()); ok {
 					v = ms
+				}
+			} else if strings.EqualFold(format, "epoch_second") {
+				if ms, ok := schema.ParseESDateToEpochMillis(typed, time.Now().UTC()); ok {
+					v = ms / 1000
 				}
 			} else if idxSchema != nil {
 				b := idxSchema.ResolveField(field)
 				if b.LowercaseNormalizer {
-					v = strings.ToLower(strVal)
+					v = strings.ToLower(typed)
+				}
+			}
+		case int64:
+			if isDateField {
+				if strings.EqualFold(format, "epoch_millis") {
+					v = typed
+				} else if strings.EqualFold(format, "epoch_second") {
+					v = typed / 1000
+				} else {
+					v = time.UnixMilli(typed).UTC().Format("2006-01-02T15:04:05.000Z")
+				}
+			}
+		case float64:
+			if isDateField {
+				ms := int64(typed)
+				if strings.EqualFold(format, "epoch_millis") {
+					v = ms
+				} else if strings.EqualFold(format, "epoch_second") {
+					v = ms / 1000
+				} else {
+					v = time.UnixMilli(ms).UTC().Format("2006-01-02T15:04:05.000Z")
 				}
 			}
 		}
@@ -4181,6 +4488,7 @@ func (s *Server) ensureWritableIndexSchemaWithDocs(ctx context.Context, indexNam
 	s.indices[indexName] = compiled
 	s.mu.Unlock()
 	s.persistIndex(ctx, indexName, compiled)
+	s.queryCache.InvalidateAll()
 	return compiled
 }
 
