@@ -50,16 +50,17 @@ Every Elasticsearch index maps to a Doris `UNIQUE KEY(_id)` Merge-on-Write table
 2. **Tier 2 (Promoted Scalar & Array Columns):** Explicit `_mapping` properties compile to typed physical columns (`f__<field>`) with `USING INVERTED` indexes (`unicode` parser for `ngram`/CJK analyzers, BKD for numeric/date columns).
 3. **Tier 3 (Two-Stage Correlated `nested` Array Columns):** Elasticsearch `nested` paths compile to `n__<nested_path> ARRAY<STRING>` (storing per-element JSON) plus `n__<nested_path>__<subfield> ARRAY<STRING> USING INVERTED` pre-filter columns.
 
-### 2.2 Two-Query Nereids Execution Plan (`pkg/transpiler`)
+### 2.2 Two-Query Nereids Execution Plan & Pipeline Aggregations (`pkg/transpiler`, `pkg/proxy`)
 Each `/_search` request compiles into at most two Doris SQL queries:
-- **`HitsSQL`:** Pushes `MATCH_*` predicates strictly into the `WHERE` scan filter (never inside `SELECT` projections or `COALESCE`, respecting Doris BE `VMatchPredicate` execution rules), computes `CAST(<score_expr> AS DOUBLE) AS _score` and `COUNT(*) OVER() AS _total_hits`, and supports `search_after` keyset pagination and `collapse` (`ROW_NUMBER() OVER (PARTITION BY ...)`).
-- **`AggsSQL` (Nereids Multi-Cast CTE):** Consolidates all facet aggregations (`terms`, `nested`, `date_histogram`, `histogram`, `range`, `filter`, `filters`, `missing`, `cardinality`, `value_count`, `avg`, `sum`, `min`, `max`, `stats`, `percentiles`, and 1-level bucket sub-aggregations) into a single `WITH base_matched AS (...) UNION ALL` query.
+- **`HitsSQL`:** Pushes `MATCH_*` predicates strictly into the `WHERE` scan filter (never inside `SELECT` projections or `COALESCE`, respecting Doris BE `VMatchPredicate` execution rules), computes `CAST(<score_expr> AS DOUBLE) AS _score` and `COUNT(*) OVER() AS _total_hits` (or `CAST(-1 AS BIGINT) AS _total_hits` when `track_total_hits: false`), and supports `search_after` keyset pagination, cross-index `terms` lookup resolution, `terms_set` (`minimum_should_match_field` / `minimum_should_match_script`), and `collapse` (`ROW_NUMBER() OVER (PARTITION BY ...)`).
+- **`AggsSQL` (Nereids Multi-Cast CTE):** Consolidates all facet aggregations (`terms`, `nested`, `date_histogram`, `histogram`, `range`, `date_range`, `filter`, `filters`, `missing`, `composite`, `top_hits`, `cardinality`, `value_count`, `avg`, `sum`, `min`, `max`, `stats`, `percentiles`, and 1-level bucket sub-aggregations) into a single `WITH base_matched AS (...) UNION ALL` query, followed by in-memory evaluation of sibling and child pipeline aggregations (`avg_bucket`, `sum_bucket`, `min_bucket`, `max_bucket`, `stats_bucket`, `derivative`, `cumulative_sum`, `bucket_selector`, `bucket_sort`).
 
 ### 2.3 Stateless Catalog Persistence (`_es_catalog`)
 Index mappings, aliases, and index templates are persisted in `es_compat._es_catalog` (`UNIQUE KEY(entity_type, entity_key)`), enabling horizontal multi-replica scaling and zero-state pod restarts.
 
-### 2.4 Enterprise Migration & FinOps Tooling (`/_doris/*`)
-- **`GET /{index}/_doris/explain` & `?doris_explain=true`:** Inspect generated Doris SQL and `CREATE TABLE` DDL for any Elasticsearch query.
-- **`GET /_doris/slowlog` (Auto-Indexing Advisor):** Tracks queries touching unpromoted `_doc['...']` `VARIANT` fields and auto-generates `ALTER TABLE ... ADD COLUMN ... ADD INDEX ... USING INVERTED` Light Schema Change DDL recommendations.
+### 2.4 Enterprise Security, Migration & FinOps Tooling (`/_doris/*`)
+- **Native HTTPS/TLS & Inbound Auth:** Supports `--tls-cert` / `--tls-key` (TLS 1.2+), HTTP Basic Auth (`--basic-auth-user` / `--basic-auth-pass`), and Elasticsearch `ApiKey` / `Bearer` token authentication (`--api-key`), plus global `?filter_path=...`, `?pretty=true`, and `?error_trace=true` wire formatting.
+- **`GET /{index}/_doris/explain` & `?doris_explain=true`:** Inspect generated Doris SQL (`hits_sql`, `aggs_sql`), normalized SQL fingerprints (`hits_sql_normalized`, `aggs_sql_normalized`), and `CREATE TABLE` DDL for any Elasticsearch query.
+- **`GET /_doris/slowlog` (Auto-Indexing Advisor):** Tracks queries touching unpromoted `_doc['...']` `VARIANT` fields and auto-generates `ALTER TABLE ... ADD COLUMN ... ADD INDEX ... USING INVERTED` Light Schema Change DDL recommendations (with optional live auto-promotion via `--auto-promote`).
 - **`--shadow-es-url` & `GET /_doris/shadow_stats`:** Zero-risk dual-read shadow verification measuring hit-count parity (`doris_total == es_total`), Top-K `_id` Jaccard overlap, and latency speedup against a legacy Elasticsearch cluster.
-- **`GET /_doris/ui`:** Embedded zero-dependency interactive Web Playground.
+- **`GET /_doris/ui` & CLI Subcommands:** Embedded zero-dependency interactive Web Playground plus offline `transpile`, `ddl`, `doctor`, and `migrate-schema` CLI subcommands.

@@ -59,6 +59,21 @@ spec:
               value: "root:@tcp(doris-fe-service:9030)/?interpolateParams=true&timeout=5s&readTimeout=30s&writeTimeout=30s"
             - name: DORIS_HTTP
               value: "http://doris-fe-service:8030"
+            - name: BULK_COALESCE_MS
+              value: "0"
+            - name: QUERY_CACHE_TTL
+              value: "0s"
+            # Optional inbound authentication and TLS (set via Kubernetes Secret in production):
+            # - name: BASIC_AUTH_USER
+            #   valueFrom: { secretKeyRef: { name: doris-es-proxy-auth, key: BASIC_AUTH_USER } }
+            # - name: BASIC_AUTH_PASS
+            #   valueFrom: { secretKeyRef: { name: doris-es-proxy-auth, key: BASIC_AUTH_PASS } }
+            # - name: API_KEY
+            #   valueFrom: { secretKeyRef: { name: doris-es-proxy-auth, key: API_KEY } }
+            # - name: TLS_CERT_FILE
+            #   value: "/etc/doris-es-proxy/tls/tls.crt"
+            # - name: TLS_KEY_FILE
+            #   value: "/etc/doris-es-proxy/tls/tls.key"
           readinessProbe:
             httpGet:
               path: /readyz

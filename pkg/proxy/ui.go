@@ -301,7 +301,9 @@ async function runExplain() {
     }
     document.getElementById('outBadge').textContent = 'Nereids Ready';
     let formatted = '-- [HitsSQL]\n' + (data.hits_sql || '(none)') + ';\n\n' +
+                    '-- [HitsSQL (Normalized Fingerprint)]\n' + (data.hits_sql_normalized || '(none)') + ';\n\n' +
                     '-- [AggsSQL - Nereids Multi-Cast CTE]\n' + (data.aggs_sql || '(none)') + ';\n\n' +
+                    '-- [AggsSQL (Normalized Fingerprint)]\n' + (data.aggs_sql_normalized || '(none)') + ';\n\n' +
                     '-- [CREATE TABLE DDL]\n' + (data.create_table_ddl || '');
     document.getElementById('sqlOutput').textContent = formatted;
   } catch (e) {

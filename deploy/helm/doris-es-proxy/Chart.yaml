@@ -2,8 +2,8 @@ apiVersion: v2
 name: doris-es-proxy
 description: Stateless, wire-compatible Elasticsearch / OpenSearch REST & Query DSL proxy backed by Apache Doris
 type: application
-version: 0.13.0
-appVersion: "v0.13.0"
+version: 0.14.0
+appVersion: "v0.14.0"
 keywords:
   - apache-doris
   - elasticsearch

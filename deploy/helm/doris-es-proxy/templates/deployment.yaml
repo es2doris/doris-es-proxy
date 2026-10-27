@@ -59,6 +59,10 @@ spec:
             {{- if .Values.shadow.esURL }}
             - "--shadow-es-url={{ .Values.shadow.esURL }}"
             {{- end }}
+            {{- if .Values.tls.enabled }}
+            - "--tls-cert={{ .Values.tls.certFile }}"
+            - "--tls-key={{ .Values.tls.keyFile }}"
+            {{- end }}
           env:
             - name: DORIS_PASSWORD
               valueFrom:
@@ -93,14 +97,26 @@ spec:
             httpGet:
               path: /healthz
               port: http
+              {{- if .Values.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
             initialDelaySeconds: 5
             periodSeconds: 10
           readinessProbe:
             httpGet:
               path: /readyz
               port: http
+              {{- if .Values.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
             initialDelaySeconds: 3
             periodSeconds: 5
+          {{- if .Values.tls.enabled }}
+          volumeMounts:
+            - name: tls-certs
+              mountPath: /etc/doris-es-proxy/tls
+              readOnly: true
+          {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -109,6 +125,12 @@ spec:
                 - ALL
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+      {{- if .Values.tls.enabled }}
+      volumes:
+        - name: tls-certs
+          secret:
+            secretName: {{ .Values.tls.existingSecret | default (printf "%s-tls" (include "doris-es-proxy.fullname" .)) }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -115,7 +115,7 @@ func parseSimpleLuceneToASTWithDepth(expr, defaultField string, fields []string,
 	}
 
 	// In Lucene grammar, `AND` binds tighter than `OR` (e.g., `a:1 AND b:2 OR c:3` -> `(a:1 AND b:2) OR c:3`).
-	if hasAND && hasOR {
+	if (hasAND || defaultOp == "AND") && hasOR {
 		var orGroups [][]string
 		var curGroup []string
 		for _, tok := range tokens {
@@ -237,6 +237,68 @@ func findLuceneFieldColon(s string) int {
 	return -1
 }
 
+func parseLuceneRangeToken(val string, boost float64) *esast.RangeCond {
+	for _, op := range []string{">=", "<=", ">", "<"} {
+		if strings.HasPrefix(val, op) && len(val) > len(op) {
+			boundStr := unescapeLuceneToken(strings.Trim(strings.TrimSpace(val[len(op):]), `"`))
+			bound := parseLuceneRangeBound(boundStr)
+			rc := &esast.RangeCond{}
+			if boost != 1.0 {
+				b := boost
+				rc.Boost = &b
+			}
+			switch op {
+			case ">=":
+				rc.GTE = bound
+			case "<=":
+				rc.LTE = bound
+			case ">":
+				rc.GT = bound
+			case "<":
+				rc.LT = bound
+			}
+			return rc
+		}
+	}
+	if (strings.HasPrefix(val, "[") || strings.HasPrefix(val, "{")) &&
+		(strings.HasSuffix(val, "]") || strings.HasSuffix(val, "}")) && len(val) > 2 {
+		incLower := strings.HasPrefix(val, "[")
+		incUpper := strings.HasSuffix(val, "]")
+		inner := strings.TrimSpace(val[1 : len(val)-1])
+		parts := strings.Split(inner, " TO ")
+		if len(parts) != 2 {
+			parts = strings.Split(inner, " to ")
+		}
+		if len(parts) == 2 {
+			lowerStr := strings.Trim(strings.TrimSpace(parts[0]), `"`)
+			upperStr := strings.Trim(strings.TrimSpace(parts[1]), `"`)
+			rc := &esast.RangeCond{}
+			if boost != 1.0 {
+				b := boost
+				rc.Boost = &b
+			}
+			if lowerStr != "" && lowerStr != "*" {
+				bound := parseLuceneRangeBound(lowerStr)
+				if incLower {
+					rc.GTE = bound
+				} else {
+					rc.GT = bound
+				}
+			}
+			if upperStr != "" && upperStr != "*" {
+				bound := parseLuceneRangeBound(upperStr)
+				if incUpper {
+					rc.LTE = bound
+				} else {
+					rc.LT = bound
+				}
+			}
+			return rc
+		}
+	}
+	return nil
+}
+
 func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, defaultOp string, depth int) esast.Query {
 	token = strings.TrimSpace(token)
 	token, boost := splitLuceneBoost(token)
@@ -255,24 +317,9 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 				Exists: &esast.ExistsQuery{Field: unescapeLuceneToken(strings.Trim(val, `"`))},
 			}
 		}
-		for _, op := range []string{">=", "<=", ">", "<"} {
-			if strings.HasPrefix(val, op) && len(val) > len(op) {
-				boundStr := unescapeLuceneToken(strings.Trim(strings.TrimSpace(val[len(op):]), `"`))
-				bound := parseLuceneRangeBound(boundStr)
-				var rc esast.RangeCond
-				switch op {
-				case ">=":
-					rc.GTE = bound
-				case "<=":
-					rc.LTE = bound
-				case ">":
-					rc.GT = bound
-				case "<":
-					rc.LT = bound
-				}
-				return esast.Query{
-					Range: map[string]esast.RangeCond{field: rc},
-				}
+		if rc := parseLuceneRangeToken(val, boost); rc != nil {
+			return esast.Query{
+				Range: map[string]esast.RangeCond{field: *rc},
 			}
 		}
 		if strings.HasPrefix(val, "/") && strings.HasSuffix(val, "/") && len(val) > 2 {
@@ -282,42 +329,13 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 				},
 			}
 		}
-		if (strings.HasPrefix(val, "[") || strings.HasPrefix(val, "{")) &&
-			(strings.HasSuffix(val, "]") || strings.HasSuffix(val, "}")) && len(val) > 2 {
-			incLower := strings.HasPrefix(val, "[")
-			incUpper := strings.HasSuffix(val, "]")
-			inner := strings.TrimSpace(val[1 : len(val)-1])
-			parts := strings.Split(inner, " TO ")
-			if len(parts) != 2 {
-				parts = strings.Split(inner, " to ")
-			}
-			if len(parts) == 2 {
-				lowerStr := strings.Trim(strings.TrimSpace(parts[0]), `"`)
-				upperStr := strings.Trim(strings.TrimSpace(parts[1]), `"`)
-				var rc esast.RangeCond
-				if lowerStr != "" && lowerStr != "*" {
-					bound := parseLuceneRangeBound(lowerStr)
-					if incLower {
-						rc.GTE = bound
-					} else {
-						rc.GT = bound
-					}
-				}
-				if upperStr != "" && upperStr != "*" {
-					bound := parseLuceneRangeBound(upperStr)
-					if incUpper {
-						rc.LTE = bound
-					} else {
-						rc.LT = bound
-					}
-				}
-				return esast.Query{
-					Range: map[string]esast.RangeCond{field: rc},
-				}
-			}
-		}
 		if strings.HasPrefix(val, "(") && strings.HasSuffix(val, ")") && len(val) > 2 {
-			return parseSimpleLuceneToASTWithDepth(val[1:len(val)-1], field, nil, defaultOp, depth+1)
+			inner := parseSimpleLuceneToASTWithDepth(val[1:len(val)-1], field, nil, defaultOp, depth+1)
+			if boost != 1.0 && inner.Bool != nil {
+				b := boost
+				inner.Bool.Boost = &b
+			}
+			return inner
 		}
 		isQuoted := strings.HasPrefix(val, `"`) && strings.HasSuffix(val, `"`) && len(val) >= 2
 		val = unescapeLuceneToken(strings.Trim(val, `"`))
@@ -345,11 +363,16 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 		}
 		return esast.Query{
 			Match: map[string]esast.MatchEntry{
-				field: {Query: val, Operator: "or", Boost: boost},
+				field: {Query: val, Operator: strings.ToLower(defaultOp), Boost: boost},
 			},
 		}
 	}
 
+	if rc := parseLuceneRangeToken(token, boost); rc != nil {
+		return esast.Query{
+			Range: map[string]esast.RangeCond{defaultField: *rc},
+		}
+	}
 	if strings.HasPrefix(token, "/") && strings.HasSuffix(token, "/") && len(token) > 2 {
 		return esast.Query{
 			Regexp: map[string]esast.RegexpEntry{
@@ -404,15 +427,16 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 	if len(fields) > 0 {
 		return esast.Query{
 			MultiMatch: &esast.MultiMatchQuery{
-				Query:  cleanVal,
-				Fields: fields,
-				Boost:  &boost,
+				Query:    cleanVal,
+				Fields:   fields,
+				Operator: strings.ToLower(defaultOp),
+				Boost:    &boost,
 			},
 		}
 	}
 	return esast.Query{
 		Match: map[string]esast.MatchEntry{
-			defaultField: {Query: cleanVal, Operator: "or", Boost: boost},
+			defaultField: {Query: cleanVal, Operator: strings.ToLower(defaultOp), Boost: boost},
 		},
 	}
 }
@@ -431,10 +455,11 @@ func tokenizeLucene(s string) []string {
 	var out []string
 	var curr strings.Builder
 	inQuotes := false
+	inRegex := false
 	escaped := false
 	parenDepth := 0
 	bracketDepth := 0
-	for _, r := range s {
+	for i, r := range s {
 		if escaped {
 			curr.WriteRune(r)
 			escaped = false
@@ -445,30 +470,41 @@ func tokenizeLucene(s string) []string {
 			escaped = true
 			curr.WriteRune(r)
 		case '"':
-			inQuotes = !inQuotes
+			if !inRegex {
+				inQuotes = !inQuotes
+			}
+			curr.WriteRune(r)
+		case '/':
+			if !inQuotes && bracketDepth == 0 {
+				if inRegex {
+					inRegex = false
+				} else if (curr.Len() == 0 || strings.HasSuffix(curr.String(), ":")) && strings.ContainsRune(s[i+1:], '/') {
+					inRegex = true
+				}
+			}
 			curr.WriteRune(r)
 		case '(':
-			if !inQuotes {
+			if !inQuotes && !inRegex {
 				parenDepth++
 			}
 			curr.WriteRune(r)
 		case ')':
-			if !inQuotes && parenDepth > 0 {
+			if !inQuotes && !inRegex && parenDepth > 0 {
 				parenDepth--
 			}
 			curr.WriteRune(r)
 		case '[', '{':
-			if !inQuotes {
+			if !inQuotes && !inRegex {
 				bracketDepth++
 			}
 			curr.WriteRune(r)
 		case ']', '}':
-			if !inQuotes && bracketDepth > 0 {
+			if !inQuotes && !inRegex && bracketDepth > 0 {
 				bracketDepth--
 			}
 			curr.WriteRune(r)
 		case ' ', '\t', '\n':
-			if inQuotes || parenDepth > 0 || bracketDepth > 0 {
+			if inQuotes || inRegex || parenDepth > 0 || bracketDepth > 0 {
 				curr.WriteRune(r)
 			} else if curr.Len() > 0 {
 				out = append(out, curr.String())
