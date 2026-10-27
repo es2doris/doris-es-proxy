@@ -99,6 +99,30 @@ func (r *SearchRequest) EffectiveFieldSpecs() []FieldRequestSpec {
 	return out
 }
 
+// ShouldTrackTotalHits returns false only when TrackTotalHits is explicitly disabled (`false` or `0`).
+func (r *SearchRequest) ShouldTrackTotalHits() bool {
+	if r == nil || r.TrackTotalHits == nil {
+		return true
+	}
+	switch v := r.TrackTotalHits.(type) {
+	case bool:
+		return v
+	case string:
+		return !strings.EqualFold(strings.TrimSpace(v), "false") && strings.TrimSpace(v) != "0"
+	case int:
+		return v > 0
+	case int64:
+		return v > 0
+	case float64:
+		return v > 0
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			return n > 0
+		}
+	}
+	return true
+}
+
 // KNNQuery represents an Elasticsearch 8/9 or OpenSearch `knn` vector search clause.
 type KNNQuery struct {
 	Field         string     `json:"field,omitempty"`
@@ -208,22 +232,26 @@ type Query struct {
 	Boosting          *BoostingQuery           `json:"boosting,omitempty"`
 	Term              map[string]TermEntry     `json:"term,omitempty"`
 	Terms             *TermsQuery              `json:"terms,omitempty"`
+	TermsSet          map[string]TermsSetEntry `json:"terms_set,omitempty"`
 	Ids               *IdsQuery                `json:"ids,omitempty"`
 	Range             map[string]RangeCond     `json:"range,omitempty"`
 	Exists            *ExistsQuery             `json:"exists,omitempty"`
 	Prefix            map[string]PrefixEntry   `json:"prefix,omitempty"`
 	Wildcard          map[string]WildcardEntry `json:"wildcard,omitempty"`
 	Regexp            map[string]RegexpEntry   `json:"regexp,omitempty"`
+	Fuzzy             map[string]FuzzyEntry    `json:"fuzzy,omitempty"`
 	Match             map[string]MatchEntry    `json:"match,omitempty"`
 	MatchPhrase       map[string]PhraseEntry   `json:"match_phrase,omitempty"`
 	MatchPhrasePrefix map[string]PhraseEntry   `json:"match_phrase_prefix,omitempty"`
 	MatchBoolPrefix   map[string]PhraseEntry   `json:"match_bool_prefix,omitempty"`
 	MultiMatch        *MultiMatchQuery         `json:"multi_match,omitempty"`
+	CombinedFields    *CombinedFieldsQuery     `json:"combined_fields,omitempty"`
 	QueryString       *QueryStringQuery        `json:"query_string,omitempty"`
 	SimpleQueryString *QueryStringQuery        `json:"simple_query_string,omitempty"`
 	Nested            *NestedQuery             `json:"nested,omitempty"`
 	ConstantScore     *ConstantScoreQuery      `json:"constant_score,omitempty"`
 	FunctionScore     *FunctionScoreQuery      `json:"function_score,omitempty"`
+	ScriptScore       *ScriptScoreQuery        `json:"script_score,omitempty"`
 	KNN               *KNNQuery                `json:"knn,omitempty"`
 }
 
@@ -235,22 +263,26 @@ var knownQueryClauses = map[string]bool{
 	"boosting":            true,
 	"term":                true,
 	"terms":               true,
+	"terms_set":           true,
 	"ids":                 true,
 	"range":               true,
 	"exists":              true,
 	"prefix":              true,
 	"wildcard":            true,
 	"regexp":              true,
+	"fuzzy":               true,
 	"match":               true,
 	"match_phrase":        true,
 	"match_phrase_prefix": true,
 	"match_bool_prefix":   true,
 	"multi_match":         true,
+	"combined_fields":     true,
 	"query_string":        true,
 	"simple_query_string": true,
 	"nested":              true,
 	"constant_score":      true,
 	"function_score":      true,
+	"script_score":        true,
 	"knn":                 true,
 }
 
@@ -292,16 +324,40 @@ type BoostingQuery struct {
 	Boost         *float64 `json:"boost,omitempty"`
 }
 
-// TermsQuery handles `"terms": {"field": ["a", "b"], "boost": 1.0}` where Java clients
-// serialize `"boost"` as a sibling key alongside the field name.
+// TermsLookupSpec models an external document lookup in a `terms` query (`{"index": "...", "id": "...", "path": "..."}`).
+type TermsLookupSpec struct {
+	Index   string `json:"index"`
+	ID      string `json:"id"`
+	Path    string `json:"path"`
+	Routing string `json:"routing,omitempty"`
+}
+
+// TermsQuery handles `"terms": {"field": ["a", "b"], "boost": 1.0}` as well as
+// Terms Lookup queries `"terms": {"field": {"index": "users", "id": "u1", "path": "roles"}}`.
 type TermsQuery struct {
-	Fields map[string][]any
-	Boost  float64
+	Fields  map[string][]any
+	Lookups map[string]TermsLookupSpec
+	Boost   float64
+}
+
+func (tq TermsQuery) MarshalJSON() ([]byte, error) {
+	m := make(map[string]any, len(tq.Fields)+len(tq.Lookups)+1)
+	for k, v := range tq.Fields {
+		m[k] = v
+	}
+	for k, v := range tq.Lookups {
+		m[k] = v
+	}
+	if tq.Boost != 0 && tq.Boost != 1.0 {
+		m["boost"] = tq.Boost
+	}
+	return json.Marshal(m)
 }
 
 func (tq *TermsQuery) UnmarshalJSON(data []byte) error {
 	tq.Boost = 1.0
 	tq.Fields = make(map[string][]any)
+	tq.Lookups = make(map[string]TermsLookupSpec)
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -311,12 +367,81 @@ func (tq *TermsQuery) UnmarshalJSON(data []byte) error {
 			_ = json.Unmarshal(v, &tq.Boost)
 			continue
 		}
-		var arr []any
-		if err := json.Unmarshal(v, &arr); err == nil {
+		trimmed := bytes.TrimSpace(v)
+		if len(trimmed) > 0 && trimmed[0] == '[' {
+			var arr []any
+			if err := json.Unmarshal(trimmed, &arr); err != nil {
+				return fmt.Errorf("parsing_exception: [terms] invalid terms array for [%s]: %w", k, err)
+			}
 			tq.Fields[k] = arr
+			continue
 		}
+		if len(trimmed) > 0 && trimmed[0] == '{' {
+			var lookup TermsLookupSpec
+			if err := json.Unmarshal(trimmed, &lookup); err != nil {
+				return fmt.Errorf("parsing_exception: [terms] invalid lookup spec for [%s]: %w", k, err)
+			}
+			if lookup.Index == "" || lookup.ID == "" || lookup.Path == "" {
+				return fmt.Errorf("parsing_exception: [terms] lookup for [%s] requires index, id, and path", k)
+			}
+			tq.Lookups[k] = lookup
+			continue
+		}
+		return fmt.Errorf("parsing_exception: [terms] query does not support scalar value for [%s]", k)
 	}
 	return nil
+}
+
+// TermsSetEntry models a `terms_set` query on a field.
+type TermsSetEntry struct {
+	Terms                   []any          `json:"terms"`
+	MinimumShouldMatchField string         `json:"minimum_should_match_field,omitempty"`
+	MinimumShouldMatchScript map[string]any `json:"minimum_should_match_script,omitempty"`
+	Boost                   *float64       `json:"boost,omitempty"`
+}
+
+// FuzzyEntry models a `fuzzy` query (`{"fuzzy": {"name": "alice"}}` or `{"fuzzy": {"name": {"value": "alice", "fuzziness": "AUTO"}}}`).
+type FuzzyEntry struct {
+	Value     any
+	Fuzziness any
+	Boost     float64
+}
+
+func (f *FuzzyEntry) UnmarshalJSON(data []byte) error {
+	f.Boost = 1.0
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var full struct {
+			Value     any      `json:"value"`
+			Fuzziness any      `json:"fuzziness"`
+			Boost     *float64 `json:"boost"`
+		}
+		if err := json.Unmarshal(trimmed, &full); err != nil {
+			return err
+		}
+		f.Value = full.Value
+		f.Fuzziness = full.Fuzziness
+		if full.Boost != nil {
+			f.Boost = *full.Boost
+		}
+		return nil
+	}
+	return json.Unmarshal(trimmed, &f.Value)
+}
+
+// CombinedFieldsQuery models an ES 8+ `combined_fields` query.
+type CombinedFieldsQuery struct {
+	Query    any      `json:"query"`
+	Fields   []string `json:"fields,omitempty"`
+	Operator string   `json:"operator,omitempty"`
+	Boost    *float64 `json:"boost,omitempty"`
+}
+
+// ScriptScoreQuery models an ES `script_score` query (`{"script_score": {"query": {...}, "script": {...}}}`).
+type ScriptScoreQuery struct {
+	Query  *Query         `json:"query,omitempty"`
+	Script map[string]any `json:"script,omitempty"`
+	Boost  *float64       `json:"boost,omitempty"`
 }
 
 // BoolQuery represents an ES `bool` compound query (`must`, `filter`, `should`, `must_not`).
@@ -625,27 +750,67 @@ type FieldValueFactorSpec struct {
 
 // AggSpec represents an Elasticsearch aggregation definition.
 type AggSpec struct {
-	Terms         *TermsAggSpec         `json:"terms,omitempty"`
-	DateHistogram *DateHistogramAggSpec `json:"date_histogram,omitempty"`
-	Histogram     *HistogramAggSpec     `json:"histogram,omitempty"`
-	Range         *RangeAggSpec         `json:"range,omitempty"`
-	DateRange     *RangeAggSpec         `json:"date_range,omitempty"`
-	Composite     *CompositeAggSpec     `json:"composite,omitempty"`
-	Filter        *Query                `json:"filter,omitempty"`
-	Filters       *FiltersAggSpec       `json:"filters,omitempty"`
-	Missing       *ExistsQuery          `json:"missing,omitempty"`
-	Nested        *NestedAggSpec        `json:"nested,omitempty"`
-	Cardinality   *MetricAggSpec        `json:"cardinality,omitempty"`
-	ValueCount    *MetricAggSpec        `json:"value_count,omitempty"`
-	Avg           *MetricAggSpec        `json:"avg,omitempty"`
-	Sum           *MetricAggSpec        `json:"sum,omitempty"`
-	Min           *MetricAggSpec        `json:"min,omitempty"`
-	Max           *MetricAggSpec        `json:"max,omitempty"`
-	Stats         *MetricAggSpec        `json:"stats,omitempty"`
-	Percentiles   *PercentilesAggSpec   `json:"percentiles,omitempty"`
-	TopHits       *TopHitsAggSpec       `json:"top_hits,omitempty"`
-	Aggs          map[string]AggSpec    `json:"aggs,omitempty"`
-	Aggregations  map[string]AggSpec    `json:"aggregations,omitempty"`
+	Terms          *TermsAggSpec          `json:"terms,omitempty"`
+	DateHistogram  *DateHistogramAggSpec  `json:"date_histogram,omitempty"`
+	Histogram      *HistogramAggSpec      `json:"histogram,omitempty"`
+	Range          *RangeAggSpec          `json:"range,omitempty"`
+	DateRange      *RangeAggSpec          `json:"date_range,omitempty"`
+	Composite      *CompositeAggSpec      `json:"composite,omitempty"`
+	Filter         *Query                 `json:"filter,omitempty"`
+	Filters        *FiltersAggSpec        `json:"filters,omitempty"`
+	Missing        *ExistsQuery           `json:"missing,omitempty"`
+	Nested         *NestedAggSpec         `json:"nested,omitempty"`
+	Cardinality    *MetricAggSpec         `json:"cardinality,omitempty"`
+	ValueCount     *MetricAggSpec         `json:"value_count,omitempty"`
+	Avg            *MetricAggSpec         `json:"avg,omitempty"`
+	Sum            *MetricAggSpec         `json:"sum,omitempty"`
+	Min            *MetricAggSpec         `json:"min,omitempty"`
+	Max            *MetricAggSpec         `json:"max,omitempty"`
+	Stats          *MetricAggSpec         `json:"stats,omitempty"`
+	Percentiles    *PercentilesAggSpec    `json:"percentiles,omitempty"`
+	TopHits        *TopHitsAggSpec        `json:"top_hits,omitempty"`
+	BucketSort     *BucketSortAggSpec     `json:"bucket_sort,omitempty"`
+	CumulativeSum  *PipelineAggSpec       `json:"cumulative_sum,omitempty"`
+	Derivative     *PipelineAggSpec       `json:"derivative,omitempty"`
+	AvgBucket      *PipelineAggSpec       `json:"avg_bucket,omitempty"`
+	SumBucket      *PipelineAggSpec       `json:"sum_bucket,omitempty"`
+	MinBucket      *PipelineAggSpec       `json:"min_bucket,omitempty"`
+	MaxBucket      *PipelineAggSpec       `json:"max_bucket,omitempty"`
+	StatsBucket    *PipelineAggSpec       `json:"stats_bucket,omitempty"`
+	BucketSelector *BucketSelectorAggSpec `json:"bucket_selector,omitempty"`
+	Aggs           map[string]AggSpec     `json:"aggs,omitempty"`
+	Aggregations   map[string]AggSpec     `json:"aggregations,omitempty"`
+}
+
+// BucketSortAggSpec models a `bucket_sort` pipeline aggregation (`sort`, `from`, `size`).
+type BucketSortAggSpec struct {
+	Sort SortSlice `json:"sort,omitempty"`
+	From *int      `json:"from,omitempty"`
+	Size *int      `json:"size,omitempty"`
+}
+
+// PipelineAggSpec models a single-path pipeline aggregation (`cumulative_sum`, `derivative`, `avg_bucket`, `sum_bucket`, `min_bucket`, `max_bucket`, `stats_bucket`).
+type PipelineAggSpec struct {
+	BucketsPath any    `json:"buckets_path,omitempty"`
+	GapPolicy   string `json:"gap_policy,omitempty"`
+	Format      string `json:"format,omitempty"`
+}
+
+// EffectivePath returns the primary buckets_path string.
+func (p *PipelineAggSpec) EffectivePath() string {
+	if p == nil || p.BucketsPath == nil {
+		return ""
+	}
+	if s, ok := p.BucketsPath.(string); ok {
+		return strings.TrimSpace(s)
+	}
+	return fmt.Sprintf("%v", p.BucketsPath)
+}
+
+// BucketSelectorAggSpec models a `bucket_selector` pipeline aggregation.
+type BucketSelectorAggSpec struct {
+	BucketsPath map[string]string `json:"buckets_path,omitempty"`
+	Script      any               `json:"script,omitempty"`
 }
 
 type CompositeAggSpec struct {
@@ -694,9 +859,13 @@ func (a *AggSpec) SubAggs() map[string]AggSpec {
 }
 
 type TermsAggSpec struct {
-	Field   string `json:"field"`
-	Size    int    `json:"size,omitempty"`
-	Missing any    `json:"missing,omitempty"`
+	Field       string `json:"field"`
+	Size        int    `json:"size,omitempty"`
+	Missing     any    `json:"missing,omitempty"`
+	Order       any    `json:"order,omitempty"`
+	MinDocCount *int   `json:"min_doc_count,omitempty"`
+	Include     any    `json:"include,omitempty"`
+	Exclude     any    `json:"exclude,omitempty"`
 }
 
 type HistogramBoundsSpec struct {

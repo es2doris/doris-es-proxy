@@ -45,7 +45,7 @@ type ScriptSpec struct {
 
 var (
 	reCtxOp          = regexp.MustCompile(`^ctx\.op\s*=\s*['"]([^'"]+)['"]$`)
-	reCompoundAssign = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\s*(\+=|-=)\s*(.+)$`)
+	reCompoundAssign = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\s*(\+=|-=|\*=|/=)\s*(.+)$`)
 	reAssignParam    = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\s*=\s*(.+)$`)
 	reRemoveField    = regexp.MustCompile(`^ctx\._source(?:\.([a-zA-Z0-9_.]+))?\.remove\(\s*(.+?)\s*\)$`)
 	reArrayAdd       = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\.add\(\s*(.+?)\s*\)$`)
@@ -414,7 +414,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		return nil
 	}
 
-	// 7. Check compound assignment `+=` / `-=`
+	// 7. Check compound assignment `+=` / `-=` / `*=` / `/=`
 	if m := reCompoundAssign.FindStringSubmatch(stmt); m != nil {
 		lhsPath := strings.Split(m[1], ".")
 		op := m[2]
@@ -423,7 +423,16 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			return err
 		}
 		curVal := resolveParamPath(sourceMap, lhsPath)
-		setValueAtPath(sourceMap, lhsPath, applyArithmetic(curVal, rhsVal, op == "+="))
+		switch op {
+		case "+=":
+			setValueAtPath(sourceMap, lhsPath, applyArithmetic(curVal, rhsVal, true))
+		case "-=":
+			setValueAtPath(sourceMap, lhsPath, applyArithmetic(curVal, rhsVal, false))
+		case "*=":
+			setValueAtPath(sourceMap, lhsPath, applyMulDiv(curVal, rhsVal, true))
+		case "/=":
+			setValueAtPath(sourceMap, lhsPath, applyMulDiv(curVal, rhsVal, false))
+		}
 		return nil
 	}
 
@@ -637,17 +646,14 @@ func evalRHSExpr(sourceMap map[string]any, rhs string, params map[string]any) (a
 		if err != nil {
 			return nil, err
 		}
-		fa, oka := toFloat64(leftVal)
-		fb, okb := toFloat64(rightVal)
-		if oka && okb {
-			if isMul {
-				return fa * fb, nil
-			}
-			if fb != 0 {
-				return fa / fb, nil
-			}
+		return applyMulDiv(leftVal, rightVal, isMul), nil
+	}
+	if strings.HasPrefix(rhs, "-") && len(rhs) > 1 && (rhs[1] < '0' || rhs[1] > '9') {
+		innerVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(rhs[1:]), params)
+		if err != nil {
+			return nil, err
 		}
-		return float64(0), nil
+		return applyArithmetic(int64(0), innerVal, false), nil
 	}
 
 	if rhs == "ctx._source" {
@@ -759,6 +765,24 @@ func findTopLevelMulDiv(expr string) (int, bool) {
 		}
 	}
 	return lastIdx, lastIsMul
+}
+
+func applyMulDiv(a, b any, isMul bool) any {
+	af, aOk := toFloat64(a)
+	bf, bOk := toFloat64(b)
+	if aOk && bOk {
+		var res float64
+		if isMul {
+			res = af * bf
+		} else if bf != 0 {
+			res = af / bf
+		}
+		if !math.IsNaN(res) && !math.IsInf(res, 0) && res >= float64(math.MinInt64) && res < float64(math.MaxInt64) && res == float64(int64(res)) {
+			return int64(res)
+		}
+		return res
+	}
+	return float64(0)
 }
 
 func applyArithmetic(a, b any, isAdd bool) any {

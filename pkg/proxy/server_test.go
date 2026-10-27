@@ -904,8 +904,8 @@ func TestServer_DeepEvalProtocolAndMultiIndexFixes(t *testing.T) {
 	}
 
 	// 7. Auto-created destination index on _update (doc_as_upsert) and _reindex infers schema
-	if code, body := doReq(http.MethodPost, "/up_auto_idx/_update/u1?refresh=true", `{"doc":{"score":42,"tag":"alpha"},"doc_as_upsert":true}`); code != http.StatusOK {
-		t.Fatalf("expected _update doc_as_upsert to succeed, got %d %s", code, body)
+	if code, body := doReq(http.MethodPost, "/up_auto_idx/_update/u1?refresh=true", `{"doc":{"score":42,"tag":"alpha"},"doc_as_upsert":true}`); code != http.StatusCreated || !strings.Contains(body, `"result":"created"`) {
+		t.Fatalf("expected _update doc_as_upsert to return 201 created, got %d %s", code, body)
 	}
 	if code, body := doReq(http.MethodPost, "/_reindex", `{"source":{"index":"up_auto_idx"},"dest":{"index":"reindexed_auto_idx"}}`); code != http.StatusOK {
 		t.Fatalf("expected _reindex to succeed, got %d %s", code, body)

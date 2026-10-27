@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
@@ -36,7 +37,7 @@ import (
 type DorisSQLBackend struct {
 	db         *sql.DB
 	streamLoad *StreamLoadClient
-	logSQL     bool
+	logSQL     atomic.Bool
 }
 
 func NewDorisSQLBackend(db *sql.DB, streamLoad *StreamLoadClient) *DorisSQLBackend {
@@ -62,11 +63,11 @@ func (b *DorisSQLBackend) Ping(ctx context.Context) error {
 }
 
 func (b *DorisSQLBackend) SetLogSQL(enabled bool) {
-	b.logSQL = enabled
+	b.logSQL.Store(enabled)
 }
 
 func (b *DorisSQLBackend) ExecDDL(ctx context.Context, ddl string) error {
-	if b.logSQL {
+	if b.logSQL.Load() {
 		log.Printf("[Doris DDL]\n%s", ddl)
 	}
 	if b.db == nil {
@@ -74,6 +75,12 @@ func (b *DorisSQLBackend) ExecDDL(ctx context.Context, ddl string) error {
 	}
 	_, err := b.db.ExecContext(ctx, ddl)
 	return err
+}
+
+// NormalizeDorisSQL rewrites internal transpiler markers (`__DORIS_DELETE_SIGN__`, `'\x1f'`, and
+// two-argument `array_exists(lambda, col)`) into Apache Doris 2.1/3.x/4.x FE-executable SQL.
+func NormalizeDorisSQL(q string) string {
+	return normalizeDorisSQL(q)
 }
 
 func normalizeDorisSQL(q string) string {
@@ -210,7 +217,7 @@ func prependSQLTraceComment(ctx context.Context, q string) string {
 
 func (b *DorisSQLBackend) QueryHits(ctx context.Context, querySQL string) ([]HitRow, error) {
 	querySQL = prependSQLTraceComment(ctx, normalizeDorisSQL(querySQL))
-	if b.logSQL {
+	if b.logSQL.Load() {
 		log.Printf("[Doris HitsSQL]\n%s", querySQL)
 	}
 	if b.db == nil {
@@ -241,7 +248,7 @@ func (b *DorisSQLBackend) QueryHits(ctx context.Context, querySQL string) ([]Hit
 
 func (b *DorisSQLBackend) QueryAggs(ctx context.Context, aggsSQL string) ([]AggRow, error) {
 	aggsSQL = prependSQLTraceComment(ctx, normalizeDorisSQL(aggsSQL))
-	if b.logSQL {
+	if b.logSQL.Load() {
 		log.Printf("[Doris AggsSQL (Nereids Multi-Cast CTE)]\n%s", aggsSQL)
 	}
 	if b.db == nil {

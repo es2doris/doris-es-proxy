@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"hash/fnv"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -472,7 +473,7 @@ func (s *IndexSchema) ExpandFieldPattern(patternWithBoost string) []BoostedField
 	boost := 1.0
 	if idx := strings.IndexByte(patternWithBoost, '^'); idx >= 0 {
 		pattern = patternWithBoost[:idx]
-		if parsed, err := strconv.ParseFloat(patternWithBoost[idx+1:], 64); err == nil {
+		if parsed, err := strconv.ParseFloat(patternWithBoost[idx+1:], 64); err == nil && !math.IsNaN(parsed) && !math.IsInf(parsed, 0) {
 			boost = parsed
 		}
 	}

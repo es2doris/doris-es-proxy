@@ -32,9 +32,20 @@ spec:
       labels:
         app.kubernetes.io/name: doris-es-proxy
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: doris-es-proxy
           image: ghcr.io/es2doris/doris-es-proxy:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           ports:
             - name: http-es
               containerPort: 9200

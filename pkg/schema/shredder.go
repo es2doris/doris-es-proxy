@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // ShredDocument transforms an Elasticsearch document (`rawSource`) into a flat Doris Stream Load
@@ -262,12 +263,26 @@ func coerceScalarForDoris(val any, dorisType DorisScalarType, lowercase bool, no
 	default:
 		if strVal, ok := val.(string); ok {
 			if lowercase {
-				return strings.ToLower(strVal)
+				strVal = strings.ToLower(strVal)
+			}
+			if dorisType == DorisVarchar && len(strVal) > 1024 {
+				strVal = truncateUTF8Bytes(strVal, 1024)
 			}
 			return strVal
 		}
 	}
 	return val
+}
+
+func truncateUTF8Bytes(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	b := s[:maxBytes]
+	for len(b) > 0 && !utf8.ValidString(b) {
+		b = b[:len(b)-1]
+	}
+	return b
 }
 
 // ParseESDateToEpochMillis parses ISO-8601 / RFC3339 date strings, epoch strings,

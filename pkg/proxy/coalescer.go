@@ -35,6 +35,8 @@ const (
 	DefaultBulkCoalesceMaxBytes = 8 * 1024 * 1024
 	// DefaultQueryCacheMaxEntries bounds the number of cached search responses when --query-cache-ttl > 0.
 	DefaultQueryCacheMaxEntries = 512
+	// DefaultQueryCacheMaxEntryBytes bounds the serialized size (1 MiB) of a single cached search response.
+	DefaultQueryCacheMaxEntryBytes = 1 * 1024 * 1024
 )
 
 type coalesceBatch struct {
@@ -51,7 +53,9 @@ type StreamLoadCoalescer struct {
 	mu                sync.Mutex
 	window            time.Duration
 	maxBytes          int
+	closed            bool
 	batches           map[string]*coalesceBatch
+	inflight          sync.WaitGroup
 	loadFn            func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error
 	coalescedRequests int64
 	coalescedFlushes  int64
@@ -95,7 +99,7 @@ func (c *StreamLoadCoalescer) Submit(ctx context.Context, table string, ndjson [
 	c.mu.Lock()
 	window := c.window
 	maxBytes := c.maxBytes
-	if window <= 0 {
+	if window <= 0 || c.closed {
 		c.mu.Unlock()
 		return c.loadFn(ctx, table, ndjson, syncRefresh)
 	}
@@ -124,7 +128,9 @@ func (c *StreamLoadCoalescer) Submit(ctx context.Context, table string, ndjson [
 			b.timer.Stop()
 		}
 		delete(c.batches, table)
+		c.inflight.Add(1)
 		c.mu.Unlock()
+		defer c.inflight.Done()
 		flushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		c.executeBatch(flushCtx, table, b, syncRefresh)
@@ -139,6 +145,36 @@ func (c *StreamLoadCoalescer) Submit(ctx context.Context, table string, ndjson [
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// FlushTable stops any pending group-commit timer for `table`, synchronously flushes its buffered
+// batch, and waits for any in-flight flush to complete so subsequent point-lookups observe all
+// previously submitted writes.
+func (c *StreamLoadCoalescer) FlushTable(ctx context.Context, table string) error {
+	c.mu.Lock()
+	if c.window <= 0 {
+		c.mu.Unlock()
+		return nil
+	}
+	b, exists := c.batches[table]
+	if exists {
+		if b.timer != nil {
+			b.timer.Stop()
+		}
+		delete(c.batches, table)
+		c.inflight.Add(1)
+	}
+	c.mu.Unlock()
+
+	if exists {
+		func() {
+			defer c.inflight.Done()
+			c.executeBatch(ctx, table, b, true)
+		}()
+		return b.err
+	}
+	c.inflight.Wait()
+	return nil
 }
 
 // FlushAll stops any pending group-commit timers and synchronously flushes all buffered batches.
@@ -156,16 +192,29 @@ func (c *StreamLoadCoalescer) FlushAll(ctx context.Context) error {
 		pending[tbl] = b
 	}
 	c.batches = make(map[string]*coalesceBatch)
+	c.inflight.Add(len(pending))
 	c.mu.Unlock()
 
 	var firstErr error
 	for tbl, b := range pending {
 		c.executeBatch(ctx, tbl, b, true)
+		c.inflight.Done()
 		if b.err != nil && firstErr == nil {
 			firstErr = b.err
 		}
 	}
 	return firstErr
+}
+
+// Close marks the coalescer as closed, flushes all pending batches, and waits for any in-flight
+// timer or byte-threshold flushes to finish before returning.
+func (c *StreamLoadCoalescer) Close(ctx context.Context) error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	err := c.FlushAll(ctx)
+	c.inflight.Wait()
+	return err
 }
 
 func (c *StreamLoadCoalescer) onTimerFlush(table string, target *coalesceBatch) {
@@ -176,7 +225,9 @@ func (c *StreamLoadCoalescer) onTimerFlush(table string, target *coalesceBatch) 
 		return
 	}
 	delete(c.batches, table)
+	c.inflight.Add(1)
 	c.mu.Unlock()
+	defer c.inflight.Done()
 
 	flushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -190,8 +241,9 @@ func (c *StreamLoadCoalescer) executeBatch(ctx context.Context, table string, b 
 }
 
 type queryCacheEntry struct {
-	raw       []byte
-	expiresAt time.Time
+	raw             []byte
+	unindexedFields []string
+	expiresAt       time.Time
 }
 
 // QueryResultCache caches compiled Elasticsearch `/_search` responses for a configurable TTL
@@ -247,12 +299,60 @@ func (qc *QueryResultCache) InvalidateAll() {
 	qc.mu.Unlock()
 }
 
+func containsNowDateMath(req *esast.SearchRequest, reqBytes []byte) bool {
+	if bytes.Contains(reqBytes, []byte(`"now`)) {
+		return true
+	}
+	if req != nil && (queryContainsNow(req.Query) || queryContainsNow(req.PostFilter)) {
+		return true
+	}
+	return false
+}
+
+func queryContainsNow(q *esast.Query) bool {
+	if q == nil {
+		return false
+	}
+	if q.QueryString != nil && strings.Contains(q.QueryString.Query, "now") {
+		return true
+	}
+	if q.SimpleQueryString != nil && strings.Contains(q.SimpleQueryString.Query, "now") {
+		return true
+	}
+	if q.Bool != nil {
+		for i := range q.Bool.Must {
+			if queryContainsNow(&q.Bool.Must[i]) {
+				return true
+			}
+		}
+		for i := range q.Bool.Filter {
+			if queryContainsNow(&q.Bool.Filter[i]) {
+				return true
+			}
+		}
+		for i := range q.Bool.Should {
+			if queryContainsNow(&q.Bool.Should[i]) {
+				return true
+			}
+		}
+		for i := range q.Bool.MustNot {
+			if queryContainsNow(&q.Bool.MustNot[i]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func buildQueryCacheKey(targets []string, req *esast.SearchRequest) (string, bool) {
-	if req == nil {
+	if req == nil || req.PIT != nil {
 		return "", false
 	}
 	reqBytes, err := json.Marshal(req)
 	if err != nil {
+		return "", false
+	}
+	if containsNowDateMath(req, reqBytes) {
 		return "", false
 	}
 	return strings.Join(targets, ",") + "\x00" + string(reqBytes), true
@@ -260,41 +360,51 @@ func buildQueryCacheKey(targets []string, req *esast.SearchRequest) (string, boo
 
 // Get looks up a cached search response for `(targets, req)` and returns a fresh unmarshaled copy.
 func (qc *QueryResultCache) Get(targets []string, req *esast.SearchRequest) (map[string]any, bool) {
-	qc.mu.RLock()
-	ttl := qc.ttl
-	if ttl <= 0 {
-		qc.mu.RUnlock()
-		return nil, false
+	resp, _, ok := qc.GetWithMeta(targets, req)
+	return resp, ok
+}
+
+// GetWithMeta looks up a cached search response and its associated unindexed fields for `(targets, req)`.
+func (qc *QueryResultCache) GetWithMeta(targets []string, req *esast.SearchRequest) (map[string]any, []string, bool) {
+	if !qc.Enabled() {
+		return nil, nil, false
 	}
 	key, ok := buildQueryCacheKey(targets, req)
 	if !ok {
+		return nil, nil, false
+	}
+	qc.mu.RLock()
+	if qc.ttl <= 0 {
 		qc.mu.RUnlock()
-		return nil, false
+		return nil, nil, false
 	}
 	entry, found := qc.entries[key]
 	qc.mu.RUnlock()
 
 	if !found || time.Now().After(entry.expiresAt) {
 		atomic.AddInt64(&qc.misses, 1)
-		return nil, false
+		return nil, nil, false
 	}
 	dec := json.NewDecoder(bytes.NewReader(entry.raw))
 	dec.UseNumber()
 	var decoded map[string]any
 	if err := dec.Decode(&decoded); err != nil {
 		atomic.AddInt64(&qc.misses, 1)
-		return nil, false
+		return nil, nil, false
 	}
 	normalized, _ := normalizeCacheJSONValue(decoded).(map[string]any)
 	atomic.AddInt64(&qc.hits, 1)
-	return normalized, true
+	return normalized, append([]string(nil), entry.unindexedFields...), true
 }
 
 // Put stores a serialized snapshot of `resp` in the cache for `(targets, req)`.
 func (qc *QueryResultCache) Put(targets []string, req *esast.SearchRequest, resp map[string]any) {
-	qc.mu.Lock()
-	defer qc.mu.Unlock()
-	if qc.ttl <= 0 || resp == nil {
+	qc.PutWithMeta(targets, req, resp, nil)
+}
+
+// PutWithMeta stores a serialized snapshot of `resp` and its unindexed fields in the cache for `(targets, req)`.
+func (qc *QueryResultCache) PutWithMeta(targets []string, req *esast.SearchRequest, resp map[string]any, unindexedFields []string) {
+	if resp == nil || !qc.Enabled() {
 		return
 	}
 	key, ok := buildQueryCacheKey(targets, req)
@@ -302,7 +412,14 @@ func (qc *QueryResultCache) Put(targets []string, req *esast.SearchRequest, resp
 		return
 	}
 	raw, err := json.Marshal(resp)
-	if err != nil {
+	if err != nil || len(raw) > DefaultQueryCacheMaxEntryBytes {
+		return
+	}
+	unindexedCopy := append([]string(nil), unindexedFields...)
+
+	qc.mu.Lock()
+	defer qc.mu.Unlock()
+	if qc.ttl <= 0 {
 		return
 	}
 	now := time.Now()
@@ -320,8 +437,9 @@ func (qc *QueryResultCache) Put(targets []string, req *esast.SearchRequest, resp
 		}
 	}
 	qc.entries[key] = queryCacheEntry{
-		raw:       raw,
-		expiresAt: now.Add(qc.ttl),
+		raw:             raw,
+		unindexedFields: unindexedCopy,
+		expiresAt:       now.Add(qc.ttl),
 	}
 }
 
