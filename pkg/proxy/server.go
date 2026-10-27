@@ -186,7 +186,7 @@ func (s *Server) SetQueryCacheTTL(ttl time.Duration, maxEntries int) {
 
 // SetMaxRequestBodyBytes configures the maximum HTTP request body size in bytes (`<= 0` uses DefaultMaxRequestBodyBytes).
 func (s *Server) SetMaxRequestBodyBytes(maxBytes int64) {
-	s.maxBodyBytes = maxBytes
+	atomic.StoreInt64(&s.maxBodyBytes, maxBytes)
 }
 
 func (s *Server) streamLoad(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
@@ -3676,7 +3676,7 @@ func (s *Server) handleCount(w http.ResponseWriter, r *http.Request) {
 	var count int64
 	if hitsObj, ok := resp["hits"].(map[string]any); ok {
 		if totalObj, ok := hitsObj["total"].(map[string]any); ok {
-			if v, ok := totalObj["value"].(int64); ok {
+			if v, ok := toInt64(totalObj["value"]); ok {
 				count = v
 			}
 		}
@@ -3878,7 +3878,13 @@ func buildAggsMap(
 			rows = filterAndSortTermsRows(rows, termsSpec, fullKey, "", bucketsByAgg)
 			b := make([]map[string]any, 0, len(rows))
 			subAggs := spec.SubAggs()
-			bgDenom := float64(totalHits)
+			sigTotal := totalHits
+			for _, r := range rows {
+				if dc := r.effectiveCount(); dc > sigTotal {
+					sigTotal = dc
+				}
+			}
+			bgDenom := float64(sigTotal)
 			if bgDenom < 1 {
 				bgDenom = 1
 			}
@@ -3891,6 +3897,9 @@ func buildAggsMap(
 				if isSig {
 					fgProb := float64(docCnt) / bgDenom
 					score := math.Round(fgProb*float64(docCnt)*10000) / 10000
+					if math.IsNaN(score) || math.IsInf(score, 0) {
+						score = 0
+					}
 					bucketMap["score"] = score
 					bucketMap["bg_count"] = docCnt
 				}
@@ -3904,8 +3913,8 @@ func buildAggsMap(
 			}
 			if isSig {
 				aggsOut[aggName] = map[string]any{
-					"doc_count": totalHits,
-					"bg_count":  totalHits,
+					"doc_count": sigTotal,
+					"bg_count":  sigTotal,
 					"buckets":   b,
 				}
 			} else {
@@ -3950,6 +3959,28 @@ func buildAggsMap(
 					attachSubAggsToBucket(indexName, bMap, fullKey, fk, subAggs, bucketsByAgg, docLookup)
 				}
 				bucketsMap[fk] = bMap
+			}
+			if len(subAggs) > 0 {
+				keys := make([]string, 0, len(bucketsMap))
+				for fk := range bucketsMap {
+					keys = append(keys, fk)
+				}
+				sort.Strings(keys)
+				ordered := make([]map[string]any, 0, len(keys))
+				for _, fk := range keys {
+					if bm, ok := bucketsMap[fk].(map[string]any); ok {
+						bm["__filter_key"] = fk
+						ordered = append(ordered, bm)
+					}
+				}
+				ordered = evaluateChildPipelineAggs(ordered, subAggs)
+				newBucketsMap := make(map[string]any, len(ordered))
+				for _, bm := range ordered {
+					fk, _ := bm["__filter_key"].(string)
+					delete(bm, "__filter_key")
+					newBucketsMap[fk] = bm
+				}
+				bucketsMap = newBucketsMap
 			}
 			aggsOut[aggName] = map[string]any{"buckets": bucketsMap}
 		case spec.Cardinality != nil || spec.ValueCount != nil:
@@ -4365,6 +4396,31 @@ func matchesTermsFilterPrecompiled(key string, filter any, precompiled *regexp.R
 	return false
 }
 
+func isBucketAggSpec(spec esast.AggSpec) bool {
+	return spec.EffectiveTerms() != nil || spec.Histogram != nil || spec.DateHistogram != nil ||
+		spec.Filters != nil || spec.Range != nil || spec.DateRange != nil || spec.Composite != nil ||
+		spec.Filter != nil || spec.Missing != nil || spec.Nested != nil
+}
+
+func validateChildBucketMetricDep(parentAggName, childAggName, pathStr string, subAggs map[string]esast.AggSpec) string {
+	pathStr = strings.TrimSpace(pathStr)
+	if pathStr == "" {
+		return fmt.Sprintf("buckets_path must be provided for pipeline aggregation [%s] under [%s]", childAggName, parentAggName)
+	}
+	if pathStr == "_count" || pathStr == "doc_count" {
+		return ""
+	}
+	rootName := strings.Split(strings.Split(pathStr, ">")[0], ".")[0]
+	targetSpec, exists := subAggs[rootName]
+	if !exists {
+		return fmt.Sprintf("buckets_path [%s] for pipeline aggregation [%s] references non-existent sibling aggregation [%s]", pathStr, childAggName, rootName)
+	}
+	if !strings.Contains(pathStr, ">") && !strings.Contains(pathStr, ".") && isBucketAggSpec(targetSpec) {
+		return fmt.Sprintf("buckets_path [%s] for pipeline aggregation [%s] must reference a numeric metric or _count, not a bucket aggregation directly", pathStr, childAggName)
+	}
+	return ""
+}
+
 func validatePipelineAggs(aggs map[string]esast.AggSpec) string {
 	for aggName, spec := range aggs {
 		var pSpec *esast.PipelineAggSpec
@@ -4381,22 +4437,111 @@ func validatePipelineAggs(aggs map[string]esast.AggSpec) string {
 			pSpec = spec.StatsBucket
 		}
 		if pSpec != nil {
-			pathStr := pSpec.EffectivePath()
+			pathStr := strings.TrimSpace(pSpec.EffectivePath())
 			if pathStr == "" {
 				return fmt.Sprintf("buckets_path must be provided for pipeline aggregation [%s]", aggName)
 			}
-			firstSeg := strings.Split(strings.Split(pathStr, ">")[0], ".")[0]
-			targetSpec, exists := aggs[firstSeg]
-			if !exists {
-				return fmt.Sprintf("buckets_path [%s] for pipeline aggregation [%s] references non-existent sibling aggregation [%s]", pathStr, aggName, firstSeg)
+			var containerPath []string
+			metricPath := ""
+			if strings.Contains(pathStr, ">") {
+				segs := strings.Split(pathStr, ">")
+				containerPath = segs[:len(segs)-1]
+				metricPath = segs[len(segs)-1]
+			} else if strings.Contains(pathStr, ".") {
+				parts := strings.SplitN(pathStr, ".", 2)
+				containerPath = []string{parts[0]}
+				metricPath = parts[1]
+			} else {
+				containerPath = []string{pathStr}
 			}
-			if !strings.Contains(pathStr, ">") && !strings.Contains(pathStr, ".") {
-				if targetSpec.EffectiveTerms() != nil || targetSpec.Histogram != nil || targetSpec.DateHistogram != nil || targetSpec.Filters != nil || targetSpec.Range != nil || targetSpec.DateRange != nil || targetSpec.Composite != nil {
+			currMap := aggs
+			var lastTargetSpec esast.AggSpec
+			for _, seg := range containerPath {
+				targetSpec, exists := currMap[seg]
+				if !exists {
+					return fmt.Sprintf("buckets_path [%s] for pipeline aggregation [%s] references non-existent aggregation [%s]", pathStr, aggName, seg)
+				}
+				lastTargetSpec = targetSpec
+				currMap = targetSpec.SubAggs()
+			}
+			if metricPath == "" {
+				if isBucketAggSpec(lastTargetSpec) {
+					return fmt.Sprintf("buckets_path [%s] for pipeline aggregation [%s] must reference a numeric metric or _count, not a bucket aggregation directly", pathStr, aggName)
+				}
+			} else if metricPath != "_count" && metricPath != "doc_count" {
+				metricAggName := strings.Split(metricPath, ".")[0]
+				metricSpec, exists := currMap[metricAggName]
+				if !exists {
+					return fmt.Sprintf("buckets_path [%s] for pipeline aggregation [%s] references non-existent metric aggregation [%s]", pathStr, aggName, metricAggName)
+				}
+				if isBucketAggSpec(metricSpec) {
 					return fmt.Sprintf("buckets_path [%s] for pipeline aggregation [%s] must reference a numeric metric or _count, not a bucket aggregation directly", pathStr, aggName)
 				}
 			}
 		}
 		if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+			childDeps := make(map[string][]string)
+			for subName, subSpec := range subAggs {
+				switch {
+				case subSpec.CumulativeSum != nil:
+					p := subSpec.CumulativeSum.EffectivePath()
+					if errMsg := validateChildBucketMetricDep(aggName, subName, p, subAggs); errMsg != "" {
+						return errMsg
+					}
+					childDeps[subName] = []string{strings.Split(p, ".")[0]}
+				case subSpec.Derivative != nil:
+					p := subSpec.Derivative.EffectivePath()
+					if errMsg := validateChildBucketMetricDep(aggName, subName, p, subAggs); errMsg != "" {
+						return errMsg
+					}
+					childDeps[subName] = []string{strings.Split(p, ".")[0]}
+				case subSpec.BucketScript != nil:
+					if len(subSpec.BucketScript.BucketsPath) == 0 {
+						return fmt.Sprintf("buckets_path must be provided for pipeline aggregation [%s] under [%s]", subName, aggName)
+					}
+					var deps []string
+					for _, p := range subSpec.BucketScript.BucketsPath {
+						if errMsg := validateChildBucketMetricDep(aggName, subName, p, subAggs); errMsg != "" {
+							return errMsg
+						}
+						deps = append(deps, strings.Split(p, ".")[0])
+					}
+					childDeps[subName] = deps
+				case subSpec.BucketSelector != nil:
+					if len(subSpec.BucketSelector.BucketsPath) == 0 {
+						return fmt.Sprintf("buckets_path must be provided for pipeline aggregation [%s] under [%s]", subName, aggName)
+					}
+					for _, p := range subSpec.BucketSelector.BucketsPath {
+						if errMsg := validateChildBucketMetricDep(aggName, subName, p, subAggs); errMsg != "" {
+							return errMsg
+						}
+					}
+				}
+			}
+			for startNode := range childDeps {
+				visiting := make(map[string]bool)
+				var hasCycle func(string) bool
+				hasCycle = func(curr string) bool {
+					if visiting[curr] {
+						return true
+					}
+					deps, ok := childDeps[curr]
+					if !ok {
+						return false
+					}
+					visiting[curr] = true
+					for _, d := range deps {
+						if hasCycle(d) {
+							return true
+						}
+					}
+					visiting[curr] = false
+					return false
+				}
+				if hasCycle(startNode) {
+					return fmt.Sprintf("cyclic pipeline aggregation dependency detected involving [%s] under [%s]", startNode, aggName)
+				}
+			}
 			if errMsg := validatePipelineAggs(subAggs); errMsg != "" {
 				return errMsg
 			}
@@ -4916,7 +5061,7 @@ func evalBucketArithmeticExpr(expr string, vars map[string]float64) (float64, bo
 			}
 			sum += v
 		}
-		return sum, true
+		return sum, !math.IsNaN(sum) && !math.IsInf(sum, 0)
 	}
 	if parts := splitTopLevelBinaryMath(expr, '-'); len(parts) > 1 {
 		res, ok := evalBucketArithmeticExpr(parts[0], vars)
@@ -4930,7 +5075,7 @@ func evalBucketArithmeticExpr(expr string, vars map[string]float64) (float64, bo
 			}
 			res -= v
 		}
-		return res, true
+		return res, !math.IsNaN(res) && !math.IsInf(res, 0)
 	}
 	if parts := splitTopLevelBinaryMath(expr, '*'); len(parts) > 1 {
 		prod := 1.0
@@ -4941,7 +5086,7 @@ func evalBucketArithmeticExpr(expr string, vars map[string]float64) (float64, bo
 			}
 			prod *= v
 		}
-		return prod, true
+		return prod, !math.IsNaN(prod) && !math.IsInf(prod, 0)
 	}
 	if parts := splitTopLevelBinaryMath(expr, '/'); len(parts) >= 2 {
 		res, ok := evalBucketArithmeticExpr(parts[0], vars)
@@ -5366,6 +5511,7 @@ func attachSubAggsToBucket(
 			bucketMap[subName] = map[string]any{"value": val}
 		case subSpec.EffectiveTerms() != nil:
 			tSpec := subSpec.EffectiveTerms()
+			isSig := subSpec.IsSignificantTerms()
 			var matchingRows []AggRow
 			for _, r := range subRows {
 				if childKey, ok := trimSubAggBucketPrefix(r.BucketKey, parentBucketKey); ok {
@@ -5375,17 +5521,46 @@ func attachSubAggsToBucket(
 				}
 			}
 			matchingRows = filterAndSortTermsRows(matchingRows, tSpec, subFullKey, parentBucketKey, bucketsByAgg)
+			parentCount, _ := toInt64(bucketMap["doc_count"])
+			for _, r := range matchingRows {
+				if dc := r.effectiveCount(); dc > parentCount {
+					parentCount = dc
+				}
+			}
+			bgDenom := float64(parentCount)
+			if bgDenom < 1 {
+				bgDenom = 1
+			}
 			childBuckets := make([]map[string]any, 0, len(matchingRows))
 			for _, r := range matchingRows {
-				childBuckets = append(childBuckets, map[string]any{
+				docCnt := r.effectiveCount()
+				cb := map[string]any{
 					"key":       r.BucketKey,
-					"doc_count": r.effectiveCount(),
-				})
+					"doc_count": docCnt,
+				}
+				if isSig {
+					fgProb := float64(docCnt) / bgDenom
+					score := math.Round(fgProb*float64(docCnt)*10000) / 10000
+					if math.IsNaN(score) || math.IsInf(score, 0) {
+						score = 0
+					}
+					cb["score"] = score
+					cb["bg_count"] = docCnt
+				}
+				childBuckets = append(childBuckets, cb)
 			}
-			bucketMap[subName] = map[string]any{
-				"doc_count_error_upper_bound": 0,
-				"sum_other_doc_count":         0,
-				"buckets":                     childBuckets,
+			if isSig {
+				bucketMap[subName] = map[string]any{
+					"doc_count": parentCount,
+					"bg_count":  parentCount,
+					"buckets":   childBuckets,
+				}
+			} else {
+				bucketMap[subName] = map[string]any{
+					"doc_count_error_upper_bound": 0,
+					"sum_other_doc_count":         0,
+					"buckets":                     childBuckets,
+				}
 			}
 		case subSpec.TopHits != nil:
 			var matchingRows []AggRow
@@ -5744,8 +5919,11 @@ func hasWildcardChildInclude(fullPath string, includes []string) bool {
 				matchedPrefix = false
 				break
 			}
-			if strings.Contains(incSegs[i], "*") {
-				return true
+			if starIdx := strings.IndexByte(incSegs[i], '*'); starIdx >= 0 {
+				litPrefix := incSegs[i][:starIdx]
+				if strings.HasPrefix(ps, litPrefix) {
+					return true
+				}
 			}
 			if !matchWildcardPattern(incSegs[i], ps) {
 				matchedPrefix = false

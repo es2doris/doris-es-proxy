@@ -12,6 +12,13 @@ nix develop -c go test -race -count=1 ./... -v
 
 # Run linters
 nix develop -c golangci-lint run ./...
+
+# Run full verification suite (gofmt, vet, race tests, SAST)
+nix develop -c make check
+
+# Run live Apache Doris 4.x E2E test suite (requires Docker + DORIS_DSN / DORIS_HTTP)
+DORIS_DSN="root:@tcp(127.0.0.1:9030)/?interpolateParams=true" DORIS_HTTP="http://127.0.0.1:8030" \
+  nix develop -c go test -v -race ./e2e/...
 ```
 
 ## Commit & License Conventions

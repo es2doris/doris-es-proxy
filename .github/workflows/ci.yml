@@ -144,7 +144,8 @@ jobs:
           echo '{"mappings":{"properties":{"name":{"type":"text"},"serviceType":{"type":"keyword"}}}}' \
             | ./bin/doris-es-proxy ddl --index table_search_index
 
-      - name: Build & verify distroless Docker image
+      - name: Build & verify distroless Docker image and deployment assets
         run: |
+          jq empty deploy/grafana/doris-es-proxy-dashboard.json
           docker build -t es2doris/doris-es-proxy:ci .
-          docker run --rm es2doris/doris-es-proxy:ci version
+          docker run --rm es2doris/doris-es-proxy:ci version | grep -q "v0.15.0"

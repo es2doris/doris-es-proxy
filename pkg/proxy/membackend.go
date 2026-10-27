@@ -90,10 +90,19 @@ func (m *MemoryBackend) LoadCatalogEntries(_ context.Context, _ string) ([]Catal
 	return out, nil
 }
 
+func appendBoundedSQL(slice []string, sqlStr string) []string {
+	const maxSQLHistory = 256
+	slice = append(slice, sqlStr)
+	if len(slice) > maxSQLHistory {
+		slice = append([]string(nil), slice[len(slice)-maxSQLHistory:]...)
+	}
+	return slice
+}
+
 func (m *MemoryBackend) ExecDDL(_ context.Context, ddl string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.ddls = append(m.ddls, ddl)
+	m.ddls = appendBoundedSQL(m.ddls, ddl)
 	if m.logSQL {
 		log.Printf("[Doris DDL]\n%s", ddl)
 	}
@@ -239,7 +248,7 @@ func splitHitsWhereBody(whereBody string) (mainWhere, postWhere string) {
 
 func (m *MemoryBackend) QueryHits(_ context.Context, sqlStr string) ([]HitRow, error) {
 	m.mu.Lock()
-	m.hitsSQLs = append(m.hitsSQLs, sqlStr)
+	m.hitsSQLs = appendBoundedSQL(m.hitsSQLs, sqlStr)
 	logSQL := m.logSQL
 	m.mu.Unlock()
 
@@ -368,7 +377,7 @@ func (m *MemoryBackend) QueryHits(_ context.Context, sqlStr string) ([]HitRow, e
 
 func (m *MemoryBackend) QueryAggs(_ context.Context, sqlStr string) ([]AggRow, error) {
 	m.mu.Lock()
-	m.aggsSQLs = append(m.aggsSQLs, sqlStr)
+	m.aggsSQLs = appendBoundedSQL(m.aggsSQLs, sqlStr)
 	logSQL := m.logSQL
 	m.mu.Unlock()
 
@@ -2137,6 +2146,20 @@ func splitTopLevelBinaryMath(s string, op byte) []string {
 			}
 		case op:
 			if depth == 0 && i > 0 {
+				if (op == '+' || op == '-') && (s[i-1] == 'e' || s[i-1] == 'E') && i >= 2 && ((s[i-2] >= '0' && s[i-2] <= '9') || s[i-2] == '.') {
+					continue
+				}
+				prev := strings.TrimSpace(s[lastStart:i])
+				if prev == "" {
+					continue
+				}
+				if op == '+' || op == '-' {
+					lastChar := prev[len(prev)-1]
+					if lastChar == '+' || lastChar == '-' || lastChar == '*' || lastChar == '/' || lastChar == '(' ||
+						lastChar == ',' || lastChar == '?' || lastChar == ':' || lastChar == '=' || lastChar == '<' || lastChar == '>' || lastChar == '!' {
+						continue
+					}
+				}
 				parts = append(parts, s[lastStart:i])
 				lastStart = i + 1
 			}

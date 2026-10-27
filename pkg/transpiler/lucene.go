@@ -39,7 +39,7 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 
 	var expandedFields []string
 	for _, fpat := range qsq.Fields {
-		if strings.Contains(fpat, "*") && t.Schema != nil {
+		if strings.ContainsAny(fpat, "*?") && t.Schema != nil {
 			for _, bf := range t.Schema.ExpandFieldPattern(fpat) {
 				if bf.Boost != 1.0 {
 					expandedFields = append(expandedFields, fmt.Sprintf("%s^%g", bf.Field, bf.Boost))
@@ -60,7 +60,7 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 			defaultField = "_all_text"
 		}
 	}
-	if strings.Contains(defaultField, "*") && t.Schema != nil {
+	if strings.ContainsAny(defaultField, "*?") && t.Schema != nil {
 		if exp := t.Schema.ExpandFieldPattern(defaultField); len(exp) > 0 {
 			defaultField = exp[0].Field
 		} else {
@@ -74,17 +74,21 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 
 	parsedAST := parseSimpleLuceneToAST(raw, defaultField, expandedFields, defaultOp)
 	compiled := t.CompileQuery(&parsedAST, scoring, nctx)
-	if t.Opts.UseDoris4SearchFunc && nctx == nil {
+	if t.Opts.UseDoris4SearchFunc && nctx == nil && !strings.Contains(raw, "_exists_:") && !strings.ContainsAny(raw, "[{") && !strings.Contains(compiled.WhereSQL, "`_doc`[") {
 		if len(expandedFields) > 1 {
 			var searchPreds []string
+			allSupported := true
 			for _, ef := range expandedFields {
 				fname := strings.Split(ef, "^")[0]
 				if fname == "_all_text" || (t.Schema != nil && t.Schema.ResolveField(fname).Kind != schema.StorageDynamicVariant) {
 					col := strings.Trim(t.sqlColumnRef(fname, false, nctx), "`")
 					searchPreds = append(searchPreds, fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(raw), quoteStr(col), quoteStr(defaultOp)))
+				} else {
+					allSupported = false
+					break
 				}
 			}
-			if len(searchPreds) > 0 {
+			if allSupported && len(searchPreds) > 0 {
 				pred := strings.Join(searchPreds, " OR ")
 				if len(searchPreds) > 1 {
 					pred = "(" + pred + ")"
@@ -195,7 +199,7 @@ func parseLuceneTokenSlice(tokens []string, defaultField string, fields []string
 		}
 
 		var clause esast.Query
-		if strings.HasPrefix(tok, "(") && strings.HasSuffix(tok, ")") && len(tok) > 2 {
+		if hasMatchingOuterParens(tok) {
 			inner := tok[1 : len(tok)-1]
 			clause = parseSimpleLuceneToASTWithDepth(inner, defaultField, fields, groupOp, depth+1)
 		} else {
@@ -214,8 +218,48 @@ func parseLuceneTokenSlice(tokens []string, defaultField string, fields []string
 	return esast.Query{Bool: boolQ}
 }
 
+func hasMatchingOuterParens(s string) bool {
+	if len(s) <= 2 || s[0] != '(' || s[len(s)-1] != ')' {
+		return false
+	}
+	depth := 0
+	inQuotes := false
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		if escaped {
+			escaped = false
+			continue
+		}
+		ch := s[i]
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			inQuotes = !inQuotes
+			continue
+		}
+		if inQuotes {
+			continue
+		}
+		switch ch {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 && i < len(s)-1 {
+				return false
+			}
+			if depth < 0 {
+				return false
+			}
+		}
+	}
+	return depth == 0 && !inQuotes
+}
+
 func splitLuceneBoost(s string) (string, float64) {
-	if idx := strings.LastIndexByte(s, '^'); idx > 0 && idx < len(s)-1 {
+	if idx := strings.LastIndexByte(s, '^'); idx > 0 && idx < len(s)-1 && s[idx-1] != '\\' {
 		if b, err := strconv.ParseFloat(s[idx+1:], 64); err == nil && !math.IsNaN(b) && !math.IsInf(b, 0) && b > 0 {
 			return s[:idx], b
 		}
@@ -290,7 +334,7 @@ func findLuceneFieldColon(s string) int {
 		if c == '"' || c == '(' || c == '[' || c == '{' {
 			return -1
 		}
-		if c == ':' && i > 0 {
+		if c == ':' && i > 0 && i < len(s)-1 {
 			return i
 		}
 	}
@@ -362,7 +406,7 @@ func parseLuceneRangeToken(val string, boost float64) *esast.RangeCond {
 func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, defaultOp string, depth int) esast.Query {
 	token = strings.TrimSpace(token)
 	token, boost := splitLuceneBoost(token)
-	if strings.HasPrefix(token, "(") && strings.HasSuffix(token, ")") && len(token) > 2 {
+	if hasMatchingOuterParens(token) {
 		inner := parseSimpleLuceneToASTWithDepth(token[1:len(token)-1], defaultField, fields, defaultOp, depth+1)
 		if boost != 1.0 && inner.Bool != nil {
 			inner.Bool.Boost = &boost
@@ -389,7 +433,7 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 				},
 			}
 		}
-		if strings.HasPrefix(val, "(") && strings.HasSuffix(val, ")") && len(val) > 2 {
+		if hasMatchingOuterParens(val) {
 			inner := parseSimpleLuceneToASTWithDepth(val[1:len(val)-1], field, nil, defaultOp, depth+1)
 			if boost != 1.0 && inner.Bool != nil {
 				b := boost
@@ -410,6 +454,23 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 			return esast.Query{
 				Wildcard: map[string]esast.WildcardEntry{
 					field: {Value: rawWild, CaseInsensitive: true, Boost: boost},
+				},
+			}
+		}
+		if strings.ContainsAny(field, "*?") {
+			b := boost
+			qType := "best_fields"
+			if isQuoted && (strings.Contains(val, " ") || slop > 0) {
+				qType = "phrase"
+			}
+			return esast.Query{
+				MultiMatch: &esast.MultiMatchQuery{
+					Query:    val,
+					Fields:   []string{field},
+					Type:     qType,
+					Operator: strings.ToLower(defaultOp),
+					Slop:     slop,
+					Boost:    &b,
 				},
 			}
 		}
@@ -445,7 +506,7 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 			var shoulds []esast.Query
 			for _, fpat := range fields {
 				fname := strings.Split(fpat, "^")[0]
-				if !strings.Contains(fname, "*") {
+				if !strings.ContainsAny(fname, "*?") {
 					shoulds = append(shoulds, esast.Query{
 						Wildcard: map[string]esast.WildcardEntry{
 							fname: {Value: rawWild, CaseInsensitive: true, Boost: boost},
@@ -544,12 +605,29 @@ func tokenizeLucene(s string) []string {
 			curr.WriteRune(r)
 		case '(':
 			if !inQuotes && !inRegex {
+				if parenDepth == 0 && bracketDepth == 0 && curr.Len() > 0 {
+					prefix := curr.String()
+					if prefix != "+" && prefix != "-" && !strings.HasSuffix(prefix, ":") {
+						out = append(out, prefix)
+						curr.Reset()
+					}
+				}
 				parenDepth++
 			}
 			curr.WriteRune(r)
 		case ')':
 			if !inQuotes && !inRegex && parenDepth > 0 {
 				parenDepth--
+				curr.WriteRune(r)
+				if parenDepth == 0 && bracketDepth == 0 && (i+1 >= len(s) || s[i+1] != '^') {
+					tokStr := curr.String()
+					trimmedTok := strings.TrimPrefix(strings.TrimPrefix(tokStr, "+"), "-")
+					if hasMatchingOuterParens(trimmedTok) {
+						out = append(out, tokStr)
+						curr.Reset()
+					}
+				}
+				continue
 			}
 			curr.WriteRune(r)
 		case '[', '{':

@@ -72,8 +72,8 @@ CREATE TABLE IF NOT EXISTS `es_compat`.`table_search_index` (
     `n__columns` ARRAY<STRING> NULL,
     `n__columns__name` ARRAY<STRING> NULL,
     `n__columns__dataType` ARRAY<STRING> NULL,
-    INDEX `idx__doc` (`_doc`) USING INVERTED,
-    INDEX `idx__all_text` (`_all_text`) USING INVERTED PROPERTIES("parser" = "unicode", "support_phrase" = "true"),
+    INDEX `idx__doc` (`_doc`) USING INVERTED PROPERTIES("parser" = "unicode"),
+    INDEX `idx__all_text` (`_all_text`) USING INVERTED PROPERTIES("parser" = "unicode"),
     INDEX `idx_f__name` (`f__name`) USING INVERTED PROPERTIES("parser" = "unicode", "support_phrase" = "true"),
     INDEX `idx_f__serviceType` (`f__serviceType`) USING INVERTED,
     INDEX `idx_f__tags__tagFQN` (`f__tags__tagFQN`) USING INVERTED,
@@ -132,9 +132,10 @@ Each `/_search` request compiles into at most two Doris SQL queries:
 **Generated `HitsSQL` & `AggsSQL`:**
 ```sql
 -- HitsSQL
-SELECT `_id`, `_source`, CAST(1.0 AS DOUBLE) AS `_score`, COUNT(*) OVER() AS `_total_hits`
+SELECT `_id`, `_version`, `_source`, CAST(1.0 AS DOUBLE) AS `_score`, COUNT(*) OVER() AS `_total_hits`
 FROM `es_compat`.`table_search_index`
-WHERE ((`f__name` MATCH_ANY 'customer' AND `f__name` MATCH_PHRASE_PREFIX 'ord')
+WHERE `__DORIS_DELETE_SIGN__` = 0
+  AND ((`f__name` MATCH_ANY 'customer' AND `f__name` MATCH_PHRASE_PREFIX 'ord')
   AND (array_contains(`n__columns__name`, 'user_id')
    AND array_contains(`n__columns__dataType`, 'INT')
    AND array_exists(x -> (json_extract_string(x, '$.name') = 'user_id')
@@ -143,18 +144,25 @@ ORDER BY `_score` DESC, `_id` ASC
 LIMIT 10 OFFSET 0;
 
 -- AggsSQL (Single-Pass Nereids Multi-Cast CTE)
-WITH base_matched AS (
+WITH `base_matched` AS (
     SELECT * FROM `es_compat`.`table_search_index`
-    WHERE ((`f__name` MATCH_ANY 'customer' AND `f__name` MATCH_PHRASE_PREFIX 'ord')
+    WHERE `__DORIS_DELETE_SIGN__` = 0
+      AND ((`f__name` MATCH_ANY 'customer' AND `f__name` MATCH_PHRASE_PREFIX 'ord')
       AND (array_contains(`n__columns__name`, 'user_id')
        AND array_contains(`n__columns__dataType`, 'INT')
        AND array_exists(x -> (json_extract_string(x, '$.name') = 'user_id')
                          AND (json_extract_string(x, '$.dataType') = 'INT'), `n__columns`)))
 )
-SELECT 'serviceType' AS _agg_name, CAST(k AS STRING) AS _bucket_key,
-       COUNT(*) AS _doc_count, CAST(NULL AS DOUBLE) AS _metric_val, CAST(NULL AS STRING) AS _extra_json
-FROM (SELECT `f__serviceType` AS k FROM base_matched WHERE `f__serviceType` IS NOT NULL) t
-GROUP BY k ORDER BY _doc_count DESC, k ASC LIMIT 10;
+SELECT '__meta_total' AS `_agg_name`, '' AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count`
+FROM `base_matched`
+UNION ALL
+SELECT 'serviceType' AS `_agg_name`, CAST(`f__serviceType` AS STRING) AS `_bucket_key`,
+       CAST(COUNT(*) AS DOUBLE) AS `_doc_count`
+FROM `base_matched`
+WHERE `f__serviceType` IS NOT NULL
+GROUP BY `f__serviceType`
+ORDER BY `_doc_count` DESC, `_bucket_key` ASC
+LIMIT 10;
 ```
 
 ---
@@ -170,7 +178,7 @@ All Elasticsearch write APIs (`POST /_bulk`, `PUT /{index}/_doc/{id}`, `POST /{i
 
 ### 2.4 Stateless Catalog Persistence (`_es_catalog`) & Enterprise FinOps Tooling (`/_doris/*`)
 - **Stateless Catalog (`es_compat._es_catalog`):** Persists index mappings, aliases, ingest pipelines, and index/component templates in Doris (`UNIQUE KEY(entity_type, entity_key)`), enabling zero-state pod restarts and horizontal multi-replica scaling.
-- **Native HTTPS/TLS, Inbound Auth & Multi-Tenant Access Control:** Supports `--tls-cert-file` / `--tls-key-file` (TLS 1.2+), HTTP Basic Auth, `ApiKey` / `Bearer` tokens, index-level RBAC, Field-Level Security (`AllowedFields`), and Row-Level Security (`RowFilter`).
+- **Native HTTPS/TLS, Inbound Auth & Multi-Tenant Access Control:** Supports `--tls-cert` / `--tls-key` (TLS 1.2+), HTTP Basic Auth, `ApiKey` / `Bearer` tokens, index-level RBAC, Field-Level Security (`AllowedFields`), and Row-Level Security (`RowFilter`).
 - **`GET /{index}/_doris/explain` & `?doris_explain=true`:** Inspect generated Doris SQL (`hits_sql`, `aggs_sql`), normalized SQL fingerprints (`hits_sql_normalized`, `aggs_sql_normalized`), and `CREATE TABLE` DDL for any Elasticsearch query.
 - **`GET /_doris/slowlog` (Auto-Indexing Advisor):** Tracks queries touching unpromoted `_doc['...']` `VARIANT` fields and auto-generates `ALTER TABLE ... ADD COLUMN ... ADD INDEX ... USING INVERTED` Light Schema Change DDL recommendations (with optional live auto-promotion via `--auto-promote`).
 - **`--shadow-es-url` & `GET /_doris/shadow_stats`:** Zero-risk dual-read shadow verification measuring hit-count parity (`doris_total == es_total`), Top-K `_id` Jaccard overlap, and latency speedup against a legacy Elasticsearch cluster.

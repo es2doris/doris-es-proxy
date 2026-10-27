@@ -155,6 +155,8 @@ const dorisPlaygroundHTML = `<!DOCTYPE html>
       <input id="idxInput" value="table_search_index" style="width: 155px;" />
       <select id="presetSelect" onchange="applyPreset()">
         <option value="nested_subaggs">Preset: Nested Filter + Bucket Sub-Aggs + Top Hits</option>
+        <option value="hybrid_knn">Preset: Hybrid BM25 + HNSW kNN Vector Search</option>
+        <option value="pipeline_aggs">Preset: Pipeline Aggregations (bucket_script + avg_bucket)</option>
         <option value="dis_max">Preset: DisMax Multi-Field Tie-Breaker</option>
         <option value="variant_advisor">Preset: Unindexed Dynamic VARIANT Field (Advisor)</option>
       </select>
@@ -221,6 +223,43 @@ const PRESETS = {
           avg_usage: { avg: { field: "usageSummary.weeklyStats.count" } },
           sample_docs: { top_hits: { size: 1 } }
         }
+      },
+      daily_updates: {
+        date_histogram: { field: "updatedAt", fixed_interval: "1d" }
+      }
+    }
+  },
+  hybrid_knn: {
+    size: 5,
+    query: {
+      match: { description: "orders" }
+    },
+    knn: {
+      field: "embedding",
+      query_vector: [0.9, 0.1, 0.0],
+      k: 5,
+      num_candidates: 20,
+      boost: 2.0,
+      filter: { term: { deleted: false } }
+    }
+  },
+  pipeline_aggs: {
+    size: 0,
+    aggs: {
+      by_service: {
+        terms: { field: "serviceType", size: 10 },
+        aggs: {
+          total_usage: { sum: { field: "usageSummary.weeklyStats.count" } },
+          scaled_usage: {
+            bucket_script: {
+              buckets_path: { u: "total_usage" },
+              script: "params.u * 2"
+            }
+          }
+        }
+      },
+      avg_service_usage: {
+        avg_bucket: { buckets_path: "by_service>total_usage" }
       }
     }
   },
@@ -266,6 +305,7 @@ async function seedDemoData() {
           serviceType: { type: 'keyword' },
           deleted: { type: 'boolean' },
           updatedAt: { type: 'long' },
+          embedding: { type: 'dense_vector', dims: 3 },
           usageSummary: { properties: { weeklyStats: { properties: { count: { type: 'long' } } } } },
           columns: { type: 'nested', properties: { name: { type: 'keyword' }, dataType: { type: 'keyword' } } }
         }
@@ -274,9 +314,9 @@ async function seedDemoData() {
   });
   const ndjson = [
     JSON.stringify({ index: { _index: idx, _id: 'tbl-orders' } }),
-    JSON.stringify({ name: 'Customer_Orders', description: 'Customer orders revenue table', serviceType: 'BigQuery', deleted: false, updatedAt: 1729773296001, usageSummary: { weeklyStats: { count: 250 } }, columns: [{ name: 'user_id', dataType: 'INT' }] }),
+    JSON.stringify({ name: 'Customer_Orders', description: 'Customer orders revenue table', serviceType: 'BigQuery', deleted: false, updatedAt: 1729773296001, embedding: [0.9, 0.1, 0.0], usageSummary: { weeklyStats: { count: 250 } }, columns: [{ name: 'user_id', dataType: 'INT' }] }),
     JSON.stringify({ index: { _index: idx, _id: 'tbl-payments' } }),
-    JSON.stringify({ name: 'Stripe_Payments', description: 'Payment transactions for orders', serviceType: 'Snowflake', deleted: false, updatedAt: 1729773296002, usageSummary: { weeklyStats: { count: 80 } }, columns: [{ name: 'user_id', dataType: 'VARCHAR' }] })
+    JSON.stringify({ name: 'Stripe_Payments', description: 'Payment transactions for orders', serviceType: 'Snowflake', deleted: false, updatedAt: 1729773296002, embedding: [0.2, 0.8, 0.1], usageSummary: { weeklyStats: { count: 80 } }, columns: [{ name: 'user_id', dataType: 'VARCHAR' }] })
   ].join('\n') + '\n';
   await fetch('/_bulk?refresh=true', { method: 'POST', headers: { 'Content-Type': 'application/x-ndjson' }, body: ndjson });
   document.getElementById('outBadge').textContent = 'Demo Seeded';

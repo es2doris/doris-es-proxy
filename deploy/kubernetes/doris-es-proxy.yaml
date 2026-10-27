@@ -59,8 +59,14 @@ spec:
               value: "root:@tcp(doris-fe-service:9030)/?interpolateParams=true&timeout=5s&readTimeout=30s&writeTimeout=30s"
             - name: DORIS_HTTP
               value: "http://doris-fe-service:8030"
+            - name: DORIS4_SEARCH_FN
+              value: "false"
+            - name: AUTO_PROMOTE
+              value: "false"
             - name: BULK_COALESCE_MS
               value: "0"
+            - name: BULK_COALESCE_BYTES
+              value: "8388608"
             - name: QUERY_CACHE_TTL
               value: "0s"
             # Optional inbound authentication and TLS (set via Kubernetes Secret in production):

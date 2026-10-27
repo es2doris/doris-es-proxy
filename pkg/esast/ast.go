@@ -976,16 +976,16 @@ func ParseTimeZoneOffsetMs(tz string) int64 {
 		if parts := strings.Split(rest, ":"); len(parts) == 2 {
 			h, err1 := strconv.ParseInt(parts[0], 10, 64)
 			m, err2 := strconv.ParseInt(parts[1], 10, 64)
-			if err1 == nil && err2 == nil {
+			if err1 == nil && err2 == nil && h >= 0 && h <= 24 && m >= 0 && m < 60 {
 				return sign * (h*3600 + m*60) * 1000
 			}
 		} else if len(rest) == 4 {
 			h, err1 := strconv.ParseInt(rest[:2], 10, 64)
 			m, err2 := strconv.ParseInt(rest[2:], 10, 64)
-			if err1 == nil && err2 == nil {
+			if err1 == nil && err2 == nil && h >= 0 && h <= 24 && m >= 0 && m < 60 {
 				return sign * (h*3600 + m*60) * 1000
 			}
-		} else if h, err := strconv.ParseInt(rest, 10, 64); err == nil {
+		} else if h, err := strconv.ParseInt(rest, 10, 64); err == nil && h >= 0 && h <= 24 {
 			return sign * h * 3600 * 1000
 		}
 	}
@@ -1007,14 +1007,15 @@ func parseSignedDurationMs(raw string) int64 {
 		sign = -1
 		raw = raw[1:]
 	}
+	const maxDurMs = int64(36500) * 86400 * 1000
 	if strings.HasSuffix(raw, "ms") {
-		if n, err := strconv.ParseInt(strings.TrimSuffix(raw, "ms"), 10, 64); err == nil {
+		if n, err := strconv.ParseInt(strings.TrimSuffix(raw, "ms"), 10, 64); err == nil && n >= 0 && n <= maxDurMs {
 			return sign * n
 		}
 	}
 	if len(raw) >= 2 {
 		unit := raw[len(raw)-1]
-		if n, err := strconv.ParseInt(raw[:len(raw)-1], 10, 64); err == nil {
+		if n, err := strconv.ParseInt(raw[:len(raw)-1], 10, 64); err == nil && n >= 0 && n <= 36500*86400 {
 			switch unit {
 			case 's':
 				return sign * n * 1000

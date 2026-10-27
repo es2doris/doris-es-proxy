@@ -86,7 +86,7 @@ func envDurationOrDefault(key string, fallback time.Duration) time.Duration {
 }
 
 func redactDSN(dsn string) string {
-	atIdx := strings.Index(dsn, "@tcp(")
+	atIdx := strings.LastIndexByte(dsn, '@')
 	if atIdx <= 0 {
 		return dsn
 	}
@@ -230,6 +230,9 @@ func main() {
 		WriteTimeout:      120 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
+		TLSConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
 	}
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -401,7 +404,11 @@ func runDoctorSubcommand(args []string) {
 		fmt.Printf("UNREACHABLE (%v)\n", err)
 	} else {
 		_ = resp.Body.Close()
-		fmt.Printf("OK (HTTP %d)\n", resp.StatusCode)
+		if resp.StatusCode >= 400 {
+			fmt.Printf("FAIL (HTTP %d)\n", resp.StatusCode)
+		} else {
+			fmt.Printf("OK (HTTP %d)\n", resp.StatusCode)
+		}
 	}
 }
 

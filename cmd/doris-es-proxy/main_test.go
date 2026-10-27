@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func captureStdout(t *testing.T, fn func()) string {
@@ -80,11 +81,32 @@ func TestEnvHelpersAndRedactDSN(t *testing.T) {
 	if got := redactDSN("root:s3cr3t@tcp(127.0.0.1:9030)/es_compat"); got != "root:***@tcp(127.0.0.1:9030)/es_compat" {
 		t.Fatalf("expected redacted password, got %q", got)
 	}
+	if got := redactDSN("root:s3cr3t@unix(/tmp/mysql.sock)/es_compat"); got != "root:***@unix(/tmp/mysql.sock)/es_compat" {
+		t.Fatalf("expected redacted password for unix socket DSN, got %q", got)
+	}
 	if got := redactDSN("root:@tcp(127.0.0.1:9030)/es_compat"); got != "root:@tcp(127.0.0.1:9030)/es_compat" {
 		t.Fatalf("expected empty password DSN unchanged, got %q", got)
 	}
 	if got := redactDSN("invalid-dsn"); got != "invalid-dsn" {
 		t.Fatalf("expected non-tcp DSN unchanged, got %q", got)
+	}
+
+	t.Setenv("TEST_INT_KEY", "42")
+	if got := envIntOrDefault("TEST_INT_KEY", 7); got != 42 {
+		t.Fatalf("expected 42, got %d", got)
+	}
+	t.Setenv("TEST_INT_KEY", "not-an-int")
+	if got := envIntOrDefault("TEST_INT_KEY", 7); got != 7 {
+		t.Fatalf("expected fallback 7, got %d", got)
+	}
+
+	t.Setenv("TEST_DUR_KEY", "250ms")
+	if got := envDurationOrDefault("TEST_DUR_KEY", 5*time.Second); got != 250*time.Millisecond {
+		t.Fatalf("expected 250ms, got %v", got)
+	}
+	t.Setenv("TEST_DUR_KEY", "invalid-dur")
+	if got := envDurationOrDefault("TEST_DUR_KEY", 5*time.Second); got != 5*time.Second {
+		t.Fatalf("expected fallback 5s, got %v", got)
 	}
 }
 

@@ -477,10 +477,10 @@ func (s *IndexSchema) ExpandFieldPattern(patternWithBoost string) []BoostedField
 			boost = parsed
 		}
 	}
-	if !strings.Contains(pattern, "*") {
+	if s == nil || !strings.ContainsAny(pattern, "*?") {
 		return []BoostedField{{Field: pattern, Boost: boost}}
 	}
-	reStr := "^" + strings.ReplaceAll(regexp.QuoteMeta(pattern), `\*`, ".*") + "$"
+	reStr := "^" + strings.ReplaceAll(strings.ReplaceAll(regexp.QuoteMeta(pattern), `\*`, ".*"), `\?`, ".") + "$"
 	re, err := regexp.Compile(reStr)
 	if err != nil {
 		return nil

@@ -55,7 +55,7 @@ type StreamLoadCoalescer struct {
 	maxBytes          int
 	closed            bool
 	batches           map[string]*coalesceBatch
-	inflight          sync.WaitGroup
+	inflight          map[*coalesceBatch]string
 	loadFn            func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error
 	coalescedRequests int64
 	coalescedFlushes  int64
@@ -65,6 +65,7 @@ func newStreamLoadCoalescer(loadFn func(ctx context.Context, table string, ndjso
 	return &StreamLoadCoalescer{
 		maxBytes: DefaultBulkCoalesceMaxBytes,
 		batches:  make(map[string]*coalesceBatch),
+		inflight: make(map[*coalesceBatch]string),
 		loadFn:   loadFn,
 	}
 }
@@ -128,9 +129,13 @@ func (c *StreamLoadCoalescer) Submit(ctx context.Context, table string, ndjson [
 			b.timer.Stop()
 		}
 		delete(c.batches, table)
-		c.inflight.Add(1)
+		c.inflight[b] = table
 		c.mu.Unlock()
-		defer c.inflight.Done()
+		defer func() {
+			c.mu.Lock()
+			delete(c.inflight, b)
+			c.mu.Unlock()
+		}()
 		flushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		c.executeBatch(flushCtx, table, b, syncRefresh)
@@ -156,34 +161,61 @@ func (c *StreamLoadCoalescer) FlushTable(ctx context.Context, table string) erro
 		c.mu.Unlock()
 		return nil
 	}
+	var waitChs []chan struct{}
+	for ib, tbl := range c.inflight {
+		if tbl == table {
+			waitChs = append(waitChs, ib.done)
+		}
+	}
 	b, exists := c.batches[table]
 	if exists {
 		if b.timer != nil {
 			b.timer.Stop()
 		}
 		delete(c.batches, table)
-		c.inflight.Add(1)
+		c.inflight[b] = table
 	}
 	c.mu.Unlock()
 
 	if exists {
 		func() {
-			defer c.inflight.Done()
+			defer func() {
+				c.mu.Lock()
+				delete(c.inflight, b)
+				c.mu.Unlock()
+			}()
 			c.executeBatch(ctx, table, b, true)
 		}()
-		c.inflight.Wait()
+	}
+	for _, ch := range waitChs {
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if exists {
 		return b.err
 	}
-	c.inflight.Wait()
 	return nil
 }
 
 // FlushAll stops any pending group-commit timers and synchronously flushes all buffered batches.
 func (c *StreamLoadCoalescer) FlushAll(ctx context.Context) error {
 	c.mu.Lock()
+	var waitChs []chan struct{}
+	for ib := range c.inflight {
+		waitChs = append(waitChs, ib.done)
+	}
 	if len(c.batches) == 0 {
 		c.mu.Unlock()
-		c.inflight.Wait()
+		for _, ch := range waitChs {
+			select {
+			case <-ch:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 		return nil
 	}
 	pending := make(map[string]*coalesceBatch, len(c.batches))
@@ -192,20 +224,30 @@ func (c *StreamLoadCoalescer) FlushAll(ctx context.Context) error {
 			b.timer.Stop()
 		}
 		pending[tbl] = b
+		c.inflight[b] = tbl
 	}
 	c.batches = make(map[string]*coalesceBatch)
-	c.inflight.Add(len(pending))
 	c.mu.Unlock()
 
 	var firstErr error
 	for tbl, b := range pending {
 		c.executeBatch(ctx, tbl, b, true)
-		c.inflight.Done()
+		c.mu.Lock()
+		delete(c.inflight, b)
+		c.mu.Unlock()
 		if b.err != nil && firstErr == nil {
 			firstErr = b.err
 		}
 	}
-	c.inflight.Wait()
+	for _, ch := range waitChs {
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			if firstErr == nil {
+				firstErr = ctx.Err()
+			}
+		}
+	}
 	return firstErr
 }
 
@@ -215,9 +257,7 @@ func (c *StreamLoadCoalescer) Close(ctx context.Context) error {
 	c.mu.Lock()
 	c.closed = true
 	c.mu.Unlock()
-	err := c.FlushAll(ctx)
-	c.inflight.Wait()
-	return err
+	return c.FlushAll(ctx)
 }
 
 func (c *StreamLoadCoalescer) onTimerFlush(table string, target *coalesceBatch) {
@@ -228,9 +268,13 @@ func (c *StreamLoadCoalescer) onTimerFlush(table string, target *coalesceBatch) 
 		return
 	}
 	delete(c.batches, table)
-	c.inflight.Add(1)
+	c.inflight[target] = table
 	c.mu.Unlock()
-	defer c.inflight.Done()
+	defer func() {
+		c.mu.Lock()
+		delete(c.inflight, target)
+		c.mu.Unlock()
+	}()
 
 	flushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -575,10 +619,12 @@ func normalizeCacheJSONValue(v any) any {
 		if iv, err := typed.Int64(); err == nil {
 			return iv
 		}
-		if fv, err := typed.Float64(); err == nil {
-			return fv
+		if strings.ContainsAny(typed.String(), ".eE") {
+			if fv, err := typed.Float64(); err == nil {
+				return fv
+			}
 		}
-		return typed.String()
+		return typed
 	default:
 		return v
 	}
