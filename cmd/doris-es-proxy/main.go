@@ -157,9 +157,10 @@ func main() {
 		backend = proxy.NewMemoryBackend(*logSQL)
 		log.Printf("doris-es-proxy starting in --in-memory emulator mode on %s (Doris DB=%q, log-sql=%v)", *listenAddr, *dorisDB, *logSQL)
 	} else {
+		effectiveDSN := proxy.ApplyDSNAuth(*dorisDSN, *dorisUser, *dorisPassword)
 		var sqlDB *sql.DB
-		if *dorisDSN != "" {
-			db, err := sql.Open("mysql", *dorisDSN)
+		if effectiveDSN != "" {
+			db, err := sql.Open("mysql", effectiveDSN)
 			if err != nil {
 				log.Fatalf("failed to configure Doris MySQL driver: %v", err)
 			}
@@ -190,7 +191,7 @@ func main() {
 		sqlBackend := proxy.NewDorisSQLBackend(sqlDB, slClient)
 		sqlBackend.SetLogSQL(*logSQL)
 		backend = sqlBackend
-		log.Printf("doris-es-proxy listening on %s (Doris DB=%q, MySQL DSN=%q, FE HTTP=%q, log-sql=%v)", *listenAddr, *dorisDB, redactDSN(*dorisDSN), *dorisHTTP, *logSQL)
+		log.Printf("doris-es-proxy listening on %s (Doris DB=%q, MySQL DSN=%q, FE HTTP=%q, log-sql=%v)", *listenAddr, *dorisDB, redactDSN(effectiveDSN), *dorisHTTP, *logSQL)
 	}
 
 	srv := proxy.NewServer(*dorisDB, backend, transpiler.TranspilerOptions{
@@ -377,11 +378,14 @@ func runDoctorSubcommand(args []string) {
 	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
 	dorisDSN := fs.String("doris-dsn", envOrDefault("DORIS_DSN", "root:@tcp(127.0.0.1:9030)/?interpolateParams=true&timeout=5s"), "Apache Doris FE MySQL DSN")
 	dorisHTTP := fs.String("doris-http", envOrDefault("DORIS_HTTP", "http://127.0.0.1:8030"), "Apache Doris FE HTTP endpoint")
+	dorisUser := fs.String("doris-user", envOrDefault("DORIS_USER", "root"), "Apache Doris username")
+	dorisPassword := fs.String("doris-password", envOrDefault("DORIS_PASSWORD", ""), "Apache Doris password")
 	_ = fs.Parse(args)
 
+	effectiveDSN := proxy.ApplyDSNAuth(*dorisDSN, *dorisUser, *dorisPassword)
 	fmt.Printf("==> doris-es-proxy %s Connectivity Doctor\n", version)
-	fmt.Printf("  1. Checking Doris FE MySQL (%s)... ", redactDSN(*dorisDSN))
-	db, err := sql.Open("mysql", *dorisDSN)
+	fmt.Printf("  1. Checking Doris FE MySQL (%s)... ", redactDSN(effectiveDSN))
+	db, err := sql.Open("mysql", effectiveDSN)
 	if err != nil {
 		fmt.Printf("FAIL (%v)\n", err)
 		os.Exit(1)

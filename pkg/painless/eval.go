@@ -500,13 +500,117 @@ func splitTopLevelCondOp(s, op string) []string {
 }
 
 func evalCondition(sourceMap map[string]any, cond string, params map[string]any) bool {
-	cond = trimBalancedParens(cond)
-	if cond == "" {
+	return evalConditionDepth(sourceMap, cond, params, 0)
+}
+
+func findTopLevelOpPainless(s, op string) int {
+	depth := 0
+	inQuotes := byte(0)
+	for i := 0; i <= len(s)-len(op); i++ {
+		c := s[i]
+		if inQuotes != 0 {
+			if c == inQuotes && (i == 0 || s[i-1] != '\\') {
+				inQuotes = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			inQuotes = c
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 && s[i:i+len(op)] == op {
+				if op == "==" && i+2 < len(s) && s[i+2] == '~' {
+					continue
+				}
+				if op == "?" && i+1 < len(s) && (s[i+1] == '.' || s[i+1] == ':') {
+					continue
+				}
+				if op == ":" && i > 0 && s[i-1] == '?' {
+					continue
+				}
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func findMatchingTernaryColonPainless(s string) int {
+	depth := 0
+	ternaryDepth := 0
+	inQuotes := byte(0)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inQuotes != 0 {
+			if c == inQuotes && (i == 0 || s[i-1] != '\\') {
+				inQuotes = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			inQuotes = c
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		case '?':
+			if depth == 0 && (i+1 >= len(s) || (s[i+1] != '.' && s[i+1] != ':')) {
+				ternaryDepth++
+			}
+		case ':':
+			if depth == 0 && (i == 0 || s[i-1] != '?') {
+				if ternaryDepth == 0 {
+					return i
+				}
+				ternaryDepth--
+			}
+		}
+	}
+	return -1
+}
+
+func evalRegexMatchPainless(lhsVal, rhsVal any, fullMatch bool) bool {
+	if lhsVal == nil || rhsVal == nil {
 		return false
+	}
+	lhsStr := fmt.Sprintf("%v", lhsVal)
+	pat := strings.TrimSpace(fmt.Sprintf("%v", rhsVal))
+	if len(pat) >= 2 && pat[0] == '/' && pat[len(pat)-1] == '/' {
+		pat = pat[1 : len(pat)-1]
+	}
+	if fullMatch {
+		pat = "^(?:" + pat + ")$"
+	}
+	re, err := regexp.Compile(pat)
+	if err != nil {
+		return false
+	}
+	return re.MatchString(lhsStr)
+}
+
+func evalConditionDepth(sourceMap map[string]any, cond string, params map[string]any, depth int) bool {
+	if depth > 64 {
+		return false
+	}
+	cond = trimBalancedParens(cond)
+	if cond == "" || cond == "false" {
+		return false
+	}
+	if cond == "true" {
+		return true
 	}
 	if parts := splitTopLevelCondOp(cond, "||"); len(parts) > 1 {
 		for _, p := range parts {
-			if evalCondition(sourceMap, p, params) {
+			if evalConditionDepth(sourceMap, p, params, depth+1) {
 				return true
 			}
 		}
@@ -514,38 +618,82 @@ func evalCondition(sourceMap map[string]any, cond string, params map[string]any)
 	}
 	if parts := splitTopLevelCondOp(cond, "&&"); len(parts) > 1 {
 		for _, p := range parts {
-			if !evalCondition(sourceMap, p, params) {
+			if !evalConditionDepth(sourceMap, p, params, depth+1) {
 				return false
 			}
 		}
 		return true
 	}
-	if strings.HasPrefix(cond, "!") {
-		return !evalCondition(sourceMap, cond[1:], params)
+	if strings.HasPrefix(cond, "!") && !strings.HasPrefix(cond, "!=") {
+		return !evalConditionDepth(sourceMap, cond[1:], params, depth+1)
 	}
 
 	// Check `.contains(...)`
-	if idx := strings.Index(cond, ".contains("); idx > 0 && strings.HasSuffix(cond, ")") {
+	if idx := findTopLevelOpPainless(cond, ".contains("); idx > 0 && strings.HasSuffix(cond, ")") {
 		lhsExpr := strings.TrimSpace(cond[:idx])
 		argExpr := strings.TrimSpace(cond[idx+len(".contains(") : len(cond)-1])
-		lhsVal, _ := evalRHSExpr(sourceMap, lhsExpr, params)
-		argVal, _ := evalRHSExpr(sourceMap, argExpr, params)
-		if arr, ok := lhsVal.([]any); ok {
-			for _, item := range arr {
+		lhsVal, _ := evalRHSExprDepth(sourceMap, lhsExpr, params, depth+1)
+		argVal, _ := evalRHSExprDepth(sourceMap, argExpr, params, depth+1)
+		switch tv := lhsVal.(type) {
+		case []any:
+			for _, item := range tv {
 				if valuesEqual(item, argVal) {
 					return true
 				}
+			}
+		case string:
+			if argVal != nil {
+				return strings.Contains(tv, fmt.Sprintf("%v", argVal))
 			}
 		}
 		return false
 	}
 
+	// Check `.startsWith(...)` and `.endsWith(...)`
+	for _, mSpec := range []struct {
+		name   string
+		prefix bool
+	}{
+		{".startsWith(", true},
+		{".endsWith(", false},
+	} {
+		if idx := findTopLevelOpPainless(cond, mSpec.name); idx > 0 && strings.HasSuffix(cond, ")") {
+			lhsExpr := strings.TrimSpace(cond[:idx])
+			argExpr := strings.TrimSpace(cond[idx+len(mSpec.name) : len(cond)-1])
+			lhsVal, _ := evalRHSExprDepth(sourceMap, lhsExpr, params, depth+1)
+			argVal, _ := evalRHSExprDepth(sourceMap, argExpr, params, depth+1)
+			if s, ok := lhsVal.(string); ok && argVal != nil {
+				sub := fmt.Sprintf("%v", argVal)
+				if mSpec.prefix {
+					return strings.HasPrefix(s, sub)
+				}
+				return strings.HasSuffix(s, sub)
+			}
+			return false
+		}
+	}
+
+	// Check `.isEmpty()`
+	if strings.HasSuffix(cond, ".isEmpty()") {
+		lhsExpr := strings.TrimSpace(cond[:len(cond)-len(".isEmpty()")])
+		lhsVal, _ := evalRHSExprDepth(sourceMap, lhsExpr, params, depth+1)
+		switch tv := lhsVal.(type) {
+		case string:
+			return len(tv) == 0
+		case []any:
+			return len(tv) == 0
+		case map[string]any:
+			return len(tv) == 0
+		}
+		return false
+	}
+
 	// Check `.containsKey(...)`
-	if idx := strings.Index(cond, ".containsKey("); idx > 0 && strings.HasSuffix(cond, ")") {
+	if idx := findTopLevelOpPainless(cond, ".containsKey("); idx > 0 && strings.HasSuffix(cond, ")") {
 		lhsExpr := strings.TrimSpace(cond[:idx])
 		argExpr := strings.TrimSpace(cond[idx+len(".containsKey(") : len(cond)-1])
-		lhsVal, _ := evalRHSExpr(sourceMap, lhsExpr, params)
-		argVal, _ := evalRHSExpr(sourceMap, argExpr, params)
+		lhsVal, _ := evalRHSExprDepth(sourceMap, lhsExpr, params, depth+1)
+		argVal, _ := evalRHSExprDepth(sourceMap, argExpr, params, depth+1)
 		if m, ok := lhsVal.(map[string]any); ok {
 			_, exists := m[fmt.Sprintf("%v", argVal)]
 			return exists
@@ -553,25 +701,35 @@ func evalCondition(sourceMap map[string]any, cond string, params map[string]any)
 		return false
 	}
 
-	if idx := strings.Index(cond, "!="); idx > 0 {
-		lhs, _ := evalRHSExpr(sourceMap, strings.TrimSpace(cond[:idx]), params)
-		rhs, _ := evalRHSExpr(sourceMap, strings.TrimSpace(cond[idx+2:]), params)
+	if idx := findTopLevelOpPainless(cond, "==~"); idx > 0 {
+		lhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
+		rhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+3:]), params, depth+1)
+		return evalRegexMatchPainless(lhs, rhs, true)
+	}
+	if idx := findTopLevelOpPainless(cond, "=~"); idx > 0 {
+		lhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
+		rhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+2:]), params, depth+1)
+		return evalRegexMatchPainless(lhs, rhs, false)
+	}
+	if idx := findTopLevelOpPainless(cond, "!="); idx > 0 {
+		lhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
+		rhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+2:]), params, depth+1)
 		return !valuesEqual(lhs, rhs)
 	}
-	if idx := strings.Index(cond, "=="); idx > 0 {
-		lhs, _ := evalRHSExpr(sourceMap, strings.TrimSpace(cond[:idx]), params)
-		rhs, _ := evalRHSExpr(sourceMap, strings.TrimSpace(cond[idx+2:]), params)
+	if idx := findTopLevelOpPainless(cond, "=="); idx > 0 {
+		lhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
+		rhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+2:]), params, depth+1)
 		return valuesEqual(lhs, rhs)
 	}
 	for _, op := range []string{">=", "<=", ">", "<"} {
-		if idx := strings.Index(cond, op); idx > 0 {
-			lhs, _ := evalRHSExpr(sourceMap, strings.TrimSpace(cond[:idx]), params)
-			rhs, _ := evalRHSExpr(sourceMap, strings.TrimSpace(cond[idx+len(op):]), params)
+		if idx := findTopLevelOpPainless(cond, op); idx > 0 {
+			lhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
+			rhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+len(op):]), params, depth+1)
 			return compareOrderedValues(lhs, rhs, op)
 		}
 	}
 
-	val, _ := evalRHSExpr(sourceMap, cond, params)
+	val, _ := evalRHSExprDepth(sourceMap, cond, params, depth+1)
 	if b, ok := val.(bool); ok {
 		return b
 	}
@@ -624,54 +782,125 @@ func valuesEqual(a, b any) bool {
 }
 
 func evalRHSExpr(sourceMap map[string]any, rhs string, params map[string]any) (any, error) {
+	return evalRHSExprDepth(sourceMap, rhs, params, 0)
+}
+
+func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]any, depth int) (any, error) {
+	if depth > 64 {
+		return nil, fmt.Errorf("painless expression exceeded maximum recursion depth (64)")
+	}
 	rhs = trimBalancedParens(normalizeBracketAccess(rhs))
-	// Check binary `+` or `-` outside quotes
-	if opIdx, isAdd := findTopLevelAddSub(rhs); opIdx > 0 {
-		leftVal, err := evalRHSExpr(sourceMap, rhs[:opIdx], params)
+
+	// Check Elvis operator `?:`
+	if elvisIdx := findTopLevelOpPainless(rhs, "?:"); elvisIdx > 0 {
+		leftVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(rhs[:elvisIdx]), params, depth+1)
 		if err != nil {
 			return nil, err
 		}
-		rightVal, err := evalRHSExpr(sourceMap, rhs[opIdx+1:], params)
+		if leftVal != nil && leftVal != false && leftVal != "" {
+			return leftVal, nil
+		}
+		return evalRHSExprDepth(sourceMap, strings.TrimSpace(rhs[elvisIdx+2:]), params, depth+1)
+	}
+
+	// Check ternary `cond ? trueExpr : falseExpr`
+	if qIdx := findTopLevelOpPainless(rhs, "?"); qIdx > 0 {
+		rest := rhs[qIdx+1:]
+		if cIdx := findMatchingTernaryColonPainless(rest); cIdx >= 0 {
+			condStr := strings.TrimSpace(rhs[:qIdx])
+			if evalConditionDepth(sourceMap, condStr, params, depth+1) {
+				return evalRHSExprDepth(sourceMap, strings.TrimSpace(rest[:cIdx]), params, depth+1)
+			}
+			return evalRHSExprDepth(sourceMap, strings.TrimSpace(rest[cIdx+1:]), params, depth+1)
+		}
+	}
+
+	// Check binary `+` or `-` outside quotes
+	if opIdx, isAdd := findTopLevelAddSub(rhs); opIdx > 0 {
+		leftVal, err := evalRHSExprDepth(sourceMap, rhs[:opIdx], params, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		rightVal, err := evalRHSExprDepth(sourceMap, rhs[opIdx+1:], params, depth+1)
 		if err != nil {
 			return nil, err
 		}
 		return applyArithmetic(leftVal, rightVal, isAdd), nil
 	}
 	if opIdx, isMul := findTopLevelMulDiv(rhs); opIdx > 0 {
-		leftVal, err := evalRHSExpr(sourceMap, rhs[:opIdx], params)
+		leftVal, err := evalRHSExprDepth(sourceMap, rhs[:opIdx], params, depth+1)
 		if err != nil {
 			return nil, err
 		}
-		rightVal, err := evalRHSExpr(sourceMap, rhs[opIdx+1:], params)
+		rightVal, err := evalRHSExprDepth(sourceMap, rhs[opIdx+1:], params, depth+1)
 		if err != nil {
 			return nil, err
 		}
 		return applyMulDiv(leftVal, rightVal, isMul), nil
 	}
 	if strings.HasPrefix(rhs, "-") && len(rhs) > 1 && (rhs[1] < '0' || rhs[1] > '9') {
-		innerVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(rhs[1:]), params)
+		innerVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(rhs[1:]), params, depth+1)
 		if err != nil {
 			return nil, err
 		}
 		return applyArithmetic(int64(0), innerVal, false), nil
 	}
 
+	// Check trailing zero-arg methods `.toLowerCase()`, `.toUpperCase()`, `.trim()`, `.length()`, `.size()`
+	for _, mSuffix := range []string{".toLowerCase()", ".toUpperCase()", ".trim()", ".length()", ".size()"} {
+		if strings.HasSuffix(rhs, mSuffix) {
+			recExpr := strings.TrimSpace(rhs[:len(rhs)-len(mSuffix)])
+			recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1)
+			if err != nil || recVal == nil {
+				return nil, err
+			}
+			switch mSuffix {
+			case ".toLowerCase()":
+				return strings.ToLower(fmt.Sprintf("%v", recVal)), nil
+			case ".toUpperCase()":
+				return strings.ToUpper(fmt.Sprintf("%v", recVal)), nil
+			case ".trim()":
+				return strings.TrimSpace(fmt.Sprintf("%v", recVal)), nil
+			case ".length()", ".size()":
+				switch tv := recVal.(type) {
+				case string:
+					return int64(len(tv)), nil
+				case []any:
+					return int64(len(tv)), nil
+				case map[string]any:
+					return int64(len(tv)), nil
+				}
+			}
+		}
+	}
+
 	if rhs == "ctx._source" {
 		return sourceMap, nil
 	}
-	if strings.HasPrefix(rhs, "ctx._source.") {
-		path := strings.Split(strings.TrimPrefix(rhs, "ctx._source."), ".")
+	if strings.HasPrefix(rhs, "ctx._source.") || strings.HasPrefix(rhs, "ctx._source?.") {
+		trimmed := strings.TrimPrefix(strings.TrimPrefix(rhs, "ctx._source?."), "ctx._source.")
+		path := strings.Split(trimmed, ".")
 		return resolveParamPath(sourceMap, path), nil
 	}
 	if rhs == "params" {
 		return params, nil
 	}
-	if strings.HasPrefix(rhs, "params.") {
-		paramPath := strings.Split(strings.TrimPrefix(rhs, "params."), ".")
+	if strings.HasPrefix(rhs, "params.") || strings.HasPrefix(rhs, "params?.") {
+		trimmed := strings.TrimPrefix(strings.TrimPrefix(rhs, "params?."), "params.")
+		paramPath := strings.Split(trimmed, ".")
 		return resolveParamPath(params, paramPath), nil
 	}
-	if val, ok := params[rhs]; ok {
+	if val, ok := params[strings.TrimSuffix(rhs, "?")]; ok {
 		return val, nil
+	}
+	if dotIdx := strings.IndexByte(rhs, '.'); dotIdx > 0 {
+		firstSeg := strings.TrimSuffix(rhs[:dotIdx], "?")
+		if baseVal, ok := params[firstSeg]; ok {
+			if baseMap, isMap := baseVal.(map[string]any); isMap {
+				return resolveParamPath(baseMap, strings.Split(rhs[dotIdx+1:], ".")), nil
+			}
+			return nil, nil
+		}
 	}
 	if rhs == "null" {
 		return nil, nil
@@ -975,6 +1204,7 @@ func splitTopLevelStatements(s string) []string {
 func resolveParamPath(params map[string]any, path []string) any {
 	var curr any = params
 	for _, seg := range path {
+		seg = strings.TrimSuffix(seg, "?")
 		m, ok := curr.(map[string]any)
 		if !ok {
 			return nil

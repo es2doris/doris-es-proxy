@@ -307,6 +307,7 @@ func ParseESDateBoundToEpochMillis(input string, now time.Time, roundUp bool) (i
 
 	var baseTime time.Time
 	var mathExpr string
+	dateOnlyPrefix := false
 
 	if strings.HasPrefix(s, "now") {
 		mathExpr = s[3:]
@@ -320,7 +321,8 @@ func ParseESDateBoundToEpochMillis(input string, now time.Time, roundUp bool) (i
 		if ms, err := strconv.ParseInt(prefix, 10, 64); err == nil {
 			baseTime = time.UnixMilli(ms).UTC()
 		} else if t, ok := parseISODateString(prefix); ok {
-			if roundUp && mathExpr == "" && isDateOnlyString(prefix) {
+			dateOnlyPrefix = isDateOnlyString(prefix)
+			if roundUp && mathExpr == "" && dateOnlyPrefix {
 				t = t.AddDate(0, 0, 1).Add(-time.Millisecond)
 			}
 			baseTime = t
@@ -342,7 +344,25 @@ func ParseESDateBoundToEpochMillis(input string, now time.Time, roundUp bool) (i
 	if !ok {
 		return 0, false
 	}
+	if roundUp && dateOnlyPrefix && mathExpr != "" && !strings.Contains(mathExpr, "/") && hasOnlyCalendarDayOrLargerOffsets(mathExpr) {
+		t = t.AddDate(0, 0, 1).Add(-time.Millisecond)
+	}
 	return t.UnixMilli(), true
+}
+
+func hasOnlyCalendarDayOrLargerOffsets(expr string) bool {
+	for i := 0; i < len(expr); i++ {
+		c := expr[i]
+		if c == '+' || c == '-' || (c >= '0' && c <= '9') {
+			continue
+		}
+		switch c {
+		case 'y', 'Y', 'M', 'w', 'W', 'd', 'D':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func isDateOnlyString(s string) bool {
@@ -381,8 +401,9 @@ func applyESDateMathWithRound(base time.Time, expr string, roundUp bool) (time.T
 			}
 			switch expr[i] {
 			case 'y', 'Y', 'M', 'w', 'W', 'd', 'D', 'h', 'H', 'm', 's':
-				t = roundTimeToUnit(t, expr[i], roundUp)
+				unit := expr[i]
 				i++
+				t = roundTimeToUnit(t, unit, roundUp && i == len(expr))
 			default:
 				return time.Time{}, false
 			}

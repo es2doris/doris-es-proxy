@@ -24,12 +24,33 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
+	"github.com/go-sql-driver/mysql"
 )
+
+// ApplyDSNAuth injects `user` and `password` into a go-sql-driver/mysql DSN when the DSN does
+// not already specify an explicit password (or contains an unexpanded `$(DORIS_PASSWORD)` placeholder).
+func ApplyDSNAuth(dsn, user, password string) string {
+	if strings.TrimSpace(dsn) == "" {
+		return dsn
+	}
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return dsn
+	}
+	if user != "" && (cfg.User == "" || cfg.User == "root") {
+		cfg.User = user
+	}
+	if password != "" && (cfg.Passwd == "" || cfg.Passwd == "$(DORIS_PASSWORD)") {
+		cfg.Passwd = password
+	}
+	return cfg.FormatDSN()
+}
 
 // DorisSQLBackend implements `DorisBackend` over a pooled `*sql.DB` (MySQL wire protocol :9030)
 // for DDL, point queries, and search/aggregation SQL, paired with `StreamLoadClient` (:8030/:8040)
@@ -97,31 +118,60 @@ func rewriteDorisArrayExists(q string) string {
 	}
 	var out strings.Builder
 	out.Grow(len(q) + 64)
+	inOuterQuote := false
 	i := 0
 	for i < len(q) {
-		idx := strings.Index(q[i:], prefix)
-		if idx < 0 {
-			out.WriteString(q[i:])
-			break
+		ch := q[i]
+		if inOuterQuote {
+			if ch == '\\' && i+1 < len(q) {
+				out.WriteString(q[i : i+2])
+				i += 2
+				continue
+			}
+			if ch == '\'' {
+				if i+1 < len(q) && q[i+1] == '\'' {
+					out.WriteString("''")
+					i += 2
+					continue
+				}
+				inOuterQuote = false
+			}
+			out.WriteByte(ch)
+			i++
+			continue
 		}
-		out.WriteString(q[i : i+idx])
-		start := i + idx + len(prefix)
+		if ch == '\'' {
+			inOuterQuote = true
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+		if !strings.HasPrefix(q[i:], prefix) {
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+		start := i + len(prefix)
 		depth := 1
 		inQuote := false
 		j := start
 		lastTopComma := -1
 		for j < len(q) && depth > 0 {
-			ch := q[j]
+			c := q[j]
 			if inQuote {
-				if ch == '\\' && j+1 < len(q) {
+				if c == '\\' && j+1 < len(q) {
 					j += 2
 					continue
 				}
-				if ch == '\'' {
+				if c == '\'' {
+					if j+1 < len(q) && q[j+1] == '\'' {
+						j += 2
+						continue
+					}
 					inQuote = false
 				}
 			} else {
-				switch ch {
+				switch c {
 				case '\'':
 					inQuote = true
 				case '(':
@@ -237,7 +287,7 @@ func (b *DorisSQLBackend) QueryHits(ctx context.Context, querySQL string) ([]Hit
 		if err := rows.Scan(&h.ID, &h.Version, &srcStr, &nullScore, &h.TotalHits); err != nil {
 			return nil, err
 		}
-		if nullScore.Valid {
+		if nullScore.Valid && !math.IsNaN(nullScore.Float64) && !math.IsInf(nullScore.Float64, 0) {
 			h.Score = nullScore.Float64
 		}
 		h.Source = json.RawMessage(srcStr)
@@ -264,15 +314,17 @@ func (b *DorisSQLBackend) QueryAggs(ctx context.Context, aggsSQL string) ([]AggR
 	for rows.Next() {
 		var r AggRow
 		var nullBucket sql.NullString
-		var val float64
-		if err := rows.Scan(&r.AggName, &nullBucket, &val); err != nil {
+		var nullVal sql.NullFloat64
+		if err := rows.Scan(&r.AggName, &nullBucket, &nullVal); err != nil {
 			return nil, err
 		}
 		if nullBucket.Valid {
 			r.BucketKey = nullBucket.String
 		}
-		r.Value = val
-		r.DocCount = int64(val)
+		if nullVal.Valid && !math.IsNaN(nullVal.Float64) && !math.IsInf(nullVal.Float64, 0) {
+			r.Value = nullVal.Float64
+			r.DocCount = int64(nullVal.Float64)
+		}
 		out = append(out, r)
 	}
 	return out, rows.Err()

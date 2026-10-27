@@ -74,13 +74,13 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 
 	parsedAST := parseSimpleLuceneToAST(raw, defaultField, expandedFields, defaultOp)
 	compiled := t.CompileQuery(&parsedAST, scoring, nctx)
-	if t.Opts.UseDoris4SearchFunc && nctx == nil && !strings.Contains(raw, "_exists_:") && !strings.ContainsAny(raw, "[{") && !strings.Contains(compiled.WhereSQL, "`_doc`[") {
+	if t.Opts.UseDoris4SearchFunc && nctx == nil && !strings.Contains(raw, "_exists_:") && !strings.ContainsAny(raw, "[{") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.WhereSQL, "`n__") {
 		if len(expandedFields) > 1 {
 			var searchPreds []string
 			allSupported := true
 			for _, ef := range expandedFields {
 				fname := strings.Split(ef, "^")[0]
-				if fname == "_all_text" || (t.Schema != nil && t.Schema.ResolveField(fname).Kind != schema.StorageDynamicVariant) {
+				if t.isDoris4SearchableField(fname) {
 					col := strings.Trim(t.sqlColumnRef(fname, false, nctx), "`")
 					searchPreds = append(searchPreds, fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(raw), quoteStr(col), quoteStr(defaultOp)))
 				} else {
@@ -100,7 +100,7 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 					UsesFulltextMatch: true,
 				}
 			}
-		} else if defaultField == "_all_text" || (t.Schema != nil && t.Schema.ResolveField(defaultField).Kind != schema.StorageDynamicVariant) {
+		} else if t.isDoris4SearchableField(defaultField) {
 			col := strings.Trim(t.sqlColumnRef(defaultField, false, nctx), "`")
 			pred := fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(raw), quoteStr(col), quoteStr(defaultOp))
 			return CompiledQuery{
@@ -112,6 +112,17 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 		}
 	}
 	return compiled
+}
+
+func (t *Transpiler) isDoris4SearchableField(fname string) bool {
+	if fname == "_all_text" {
+		return true
+	}
+	if t.Schema == nil {
+		return false
+	}
+	b := t.Schema.ResolveField(fname)
+	return b.Kind != schema.StorageDynamicVariant && b.Kind != schema.StoragePromotedVector && b.Kind != schema.StorageNestedSubfield
 }
 
 const maxLuceneDepth = 32
@@ -188,6 +199,9 @@ func parseLuceneTokenSlice(tokens []string, defaultField string, fields []string
 			negateNext = true
 			continue
 		}
+		if tok == "+" || tok == "-" {
+			continue
+		}
 
 		mustClause := false
 		if strings.HasPrefix(tok, "-") && len(tok) > 1 {
@@ -196,6 +210,9 @@ func parseLuceneTokenSlice(tokens []string, defaultField string, fields []string
 		} else if strings.HasPrefix(tok, "+") && len(tok) > 1 {
 			mustClause = true
 			tok = tok[1:]
+		}
+		if strings.TrimSpace(tok) == "" {
+			continue
 		}
 
 		var clause esast.Query
@@ -214,6 +231,9 @@ func parseLuceneTokenSlice(tokens []string, defaultField string, fields []string
 		} else {
 			boolQ.Should = append(boolQ.Should, clause)
 		}
+	}
+	if len(boolQ.Must) == 0 && len(boolQ.Should) == 0 && len(boolQ.Filter) == 0 && len(boolQ.MustNot) == 0 {
+		return esast.Query{MatchAll: map[string]any{}}
 	}
 	return esast.Query{Bool: boolQ}
 }
@@ -429,7 +449,7 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 		if strings.HasPrefix(val, "/") && strings.HasSuffix(val, "/") && len(val) > 2 {
 			return esast.Query{
 				Regexp: map[string]esast.RegexpEntry{
-					field: {Value: val[1 : len(val)-1]},
+					field: {Value: strings.ReplaceAll(val[1:len(val)-1], `\/`, `/`), Boost: boost},
 				},
 			}
 		}
@@ -496,7 +516,7 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 	if strings.HasPrefix(token, "/") && strings.HasSuffix(token, "/") && len(token) > 2 {
 		return esast.Query{
 			Regexp: map[string]esast.RegexpEntry{
-				defaultField: {Value: token[1 : len(token)-1], Boost: boost},
+				defaultField: {Value: strings.ReplaceAll(token[1:len(token)-1], `\/`, `/`), Boost: boost},
 			},
 		}
 	}

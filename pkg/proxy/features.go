@@ -1006,9 +1006,16 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	switch r.Method {
 	case http.MethodPut, http.MethodPost:
+		bodyBytes, ok := readRequestBody(w, r)
+		if !ok {
+			return
+		}
 		var body map[string]any
-		if r.Body != nil {
-			_ = json.NewDecoder(r.Body).Decode(&body)
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &body); err != nil {
+				writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+				return
+			}
 		}
 		if body == nil {
 			body = map[string]any{"description": "doris-es-proxy compatibility pipeline", "processors": []any{}}
@@ -1292,6 +1299,10 @@ func writeCatResponse(w http.ResponseWriter, r *http.Request, headers []string, 
 // handleReindex implements `POST /_reindex` to copy documents between indices with optional query filtering and Painless script mutation.
 func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	bodyBytes, ok := readRequestBody(w, r)
+	if !ok {
+		return
+	}
 	var body struct {
 		MaxDocs *int `json:"max_docs,omitempty"`
 		Source  struct {
@@ -1300,11 +1311,12 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 			Size  *int         `json:"size,omitempty"`
 		} `json:"source"`
 		Dest struct {
-			Index string `json:"index"`
+			Index    string `json:"index"`
+			Pipeline string `json:"pipeline,omitempty"`
 		} `json:"dest"`
 		Script *painless.ScriptSpec `json:"script,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(bodyBytes, &body); err != nil {
 		writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
 		return
 	}
@@ -1320,9 +1332,13 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		}
 		srcPattern = strings.Join(parts, ",")
 	}
-	destIndex := s.resolveIndexName(body.Dest.Index)
-	if srcPattern == "" || destIndex == "" {
+	if srcPattern == "" || strings.TrimSpace(body.Dest.Index) == "" {
 		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "source.index and dest.index are required")
+		return
+	}
+	destIndex, writeErr := s.resolveWriteIndex(body.Dest.Index)
+	if writeErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", writeErr.Error())
 		return
 	}
 
@@ -1337,7 +1353,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var destSchema *schema.IndexSchema
-	srcTargets := s.resolveTargetIndices(srcPattern)
+	srcTargets, aliasFilters := s.resolveTargetIndicesWithFilters(srcPattern)
 	if len(srcTargets) == 0 {
 		srcTargets = []string{s.resolveIndexName(srcPattern)}
 	}
@@ -1351,11 +1367,13 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.resolveTermsLookupsInQuery(r.Context(), body.Source.Query)
+	effPipeline := s.resolveEffectivePipeline(destIndex, body.Dest.Pipeline, "")
 	for _, srcIdx := range srcTargets {
 		srcSchema := s.getOrCompileReadOnlySchema(r.Context(), srcIdx)
 		_ = s.coalescer.FlushTable(r.Context(), srcSchema.DorisTable)
 		tr := transpiler.NewTranspiler(srcSchema, s.transpileOpts)
 		var searchAfter []any
+		effQuery := combineQueryWithAliasFilter(body.Source.Query, aliasFilters[srcIdx])
 
 		for {
 			fetchSize := batchSize
@@ -1366,7 +1384,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			plan, err := tr.BuildSearchPlan(&esast.SearchRequest{
-				Query:          body.Source.Query,
+				Query:          effQuery,
 				Size:           &fetchSize,
 				TrackTotalHits: false,
 				Sort:           esast.SortSlice{{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}}},
@@ -1408,6 +1426,9 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 						continue
 					}
 					docSource = mutated
+				}
+				if effPipeline != "" {
+					docSource = s.applyIngestPipelineIfPresent(effPipeline, docSource)
 				}
 				prepared = append(prepared, preparedDoc{id: h.ID, source: docSource})
 				if destSchema == nil && len(sampleDocs) < 16 {
@@ -1470,11 +1491,15 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 // VARIANT field into a dedicated `f__*` column with a `USING INVERTED` index and update the index mapping.
 func (s *Server) handleDorisPromoteField(w http.ResponseWriter, r *http.Request) {
 	idxName := s.resolveIndexName(r.PathValue("index"))
+	bodyBytes, ok := readRequestBody(w, r)
+	if !ok {
+		return
+	}
 	var req struct {
 		Field string `json:"field"`
 		Type  string `json:"type,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
 		return
 	}
@@ -1648,7 +1673,7 @@ func buildNestedMappingProps(segments []string, leaf esast.FieldProperty) map[st
 // handleValidateQuery implements `GET/POST /_validate/query` and `GET/POST /{index}/_validate/query`.
 func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 	rawIndex := r.PathValue("index")
-	targets := s.resolveTargetIndices(rawIndex)
+	targets, aliasFilters := s.resolveTargetIndicesWithFilters(rawIndex)
 	if len(targets) == 0 {
 		if rawIndex != "" {
 			targets = []string{s.resolveIndexName(rawIndex)}
@@ -1657,26 +1682,19 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	raw, ok := readRequestBody(w, r)
+	if !ok {
+		return
+	}
 	var req esast.SearchRequest
-	if r.Body != nil && r.Body != http.NoBody {
-		raw, err := io.ReadAll(r.Body)
-		if err != nil {
+	if len(bytes.TrimSpace(raw)) > 0 {
+		if err := json.Unmarshal(raw, &req); err != nil {
 			writeJSON(w, http.StatusOK, map[string]any{
 				"valid":   false,
 				"error":   err.Error(),
 				"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0},
 			})
 			return
-		}
-		if len(bytes.TrimSpace(raw)) > 0 {
-			if err := json.Unmarshal(raw, &req); err != nil {
-				writeJSON(w, http.StatusOK, map[string]any{
-					"valid":   false,
-					"error":   err.Error(),
-					"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0},
-				})
-				return
-			}
 		}
 	}
 	applyURISearchParams(r, &req)
@@ -1686,7 +1704,8 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 	for _, idxName := range targets {
 		idxSchema := s.getOrCompileReadOnlySchema(r.Context(), idxName)
 		tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
-		plan, err := tr.BuildSearchPlan(&req)
+		subReq := applyIndexAliasFilter(&req, aliasFilters[idxName])
+		plan, err := tr.BuildSearchPlan(subReq)
 		if err != nil {
 			writeJSON(w, http.StatusOK, map[string]any{
 				"valid":   false,
@@ -1718,6 +1737,10 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 
 // handleAnalyze implements `GET/POST /_analyze` and `GET/POST /{index}/_analyze`.
 func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
+	bodyBytes, ok := readRequestBody(w, r)
+	if !ok {
+		return
+	}
 	var req struct {
 		Analyzer   string `json:"analyzer,omitempty"`
 		Tokenizer  string `json:"tokenizer,omitempty"`
@@ -1725,8 +1748,8 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 		Field      string `json:"field,omitempty"`
 		Text       any    `json:"text,omitempty"`
 	}
-	if r.Body != nil && r.Body != http.NoBody {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		_ = json.Unmarshal(bodyBytes, &req)
 	}
 	if req.Analyzer == "" {
 		req.Analyzer = r.URL.Query().Get("analyzer")
@@ -1849,6 +1872,9 @@ func unicodeToLower(r rune) rune {
 
 // handleRollover implements `POST /{alias}/_rollover` and `POST /{alias}/_rollover/{new_index}`.
 func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
+	if _, ok := readRequestBody(w, r); !ok {
+		return
+	}
 	alias := r.PathValue("alias")
 	newIdx := r.PathValue("new_index")
 

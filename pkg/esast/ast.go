@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -789,39 +790,256 @@ type FieldValueFactorSpec struct {
 
 // AggSpec represents an Elasticsearch aggregation definition.
 type AggSpec struct {
-	Terms            *TermsAggSpec          `json:"terms,omitempty"`
-	SignificantTerms *TermsAggSpec          `json:"significant_terms,omitempty"`
-	SignificantText  *TermsAggSpec          `json:"significant_text,omitempty"`
-	DateHistogram    *DateHistogramAggSpec  `json:"date_histogram,omitempty"`
-	Histogram        *HistogramAggSpec      `json:"histogram,omitempty"`
-	Range            *RangeAggSpec          `json:"range,omitempty"`
-	DateRange        *RangeAggSpec          `json:"date_range,omitempty"`
-	Composite        *CompositeAggSpec      `json:"composite,omitempty"`
-	Filter           *Query                 `json:"filter,omitempty"`
-	Filters          *FiltersAggSpec        `json:"filters,omitempty"`
-	Missing          *ExistsQuery           `json:"missing,omitempty"`
-	Nested           *NestedAggSpec         `json:"nested,omitempty"`
-	Cardinality      *MetricAggSpec         `json:"cardinality,omitempty"`
-	ValueCount       *MetricAggSpec         `json:"value_count,omitempty"`
-	Avg              *MetricAggSpec         `json:"avg,omitempty"`
-	Sum              *MetricAggSpec         `json:"sum,omitempty"`
-	Min              *MetricAggSpec         `json:"min,omitempty"`
-	Max              *MetricAggSpec         `json:"max,omitempty"`
-	Stats            *MetricAggSpec         `json:"stats,omitempty"`
-	Percentiles      *PercentilesAggSpec    `json:"percentiles,omitempty"`
-	TopHits          *TopHitsAggSpec        `json:"top_hits,omitempty"`
-	BucketSort       *BucketSortAggSpec     `json:"bucket_sort,omitempty"`
-	CumulativeSum    *PipelineAggSpec       `json:"cumulative_sum,omitempty"`
-	Derivative       *PipelineAggSpec       `json:"derivative,omitempty"`
-	AvgBucket        *PipelineAggSpec       `json:"avg_bucket,omitempty"`
-	SumBucket        *PipelineAggSpec       `json:"sum_bucket,omitempty"`
-	MinBucket        *PipelineAggSpec       `json:"min_bucket,omitempty"`
-	MaxBucket        *PipelineAggSpec       `json:"max_bucket,omitempty"`
-	StatsBucket      *PipelineAggSpec       `json:"stats_bucket,omitempty"`
-	BucketSelector   *BucketSelectorAggSpec `json:"bucket_selector,omitempty"`
-	BucketScript     *BucketSelectorAggSpec `json:"bucket_script,omitempty"`
-	Aggs             map[string]AggSpec     `json:"aggs,omitempty"`
-	Aggregations     map[string]AggSpec     `json:"aggregations,omitempty"`
+	Terms               *TermsAggSpec             `json:"terms,omitempty"`
+	SignificantTerms    *TermsAggSpec             `json:"significant_terms,omitempty"`
+	SignificantText     *TermsAggSpec             `json:"significant_text,omitempty"`
+	DateHistogram       *DateHistogramAggSpec     `json:"date_histogram,omitempty"`
+	Histogram           *HistogramAggSpec         `json:"histogram,omitempty"`
+	Range               *RangeAggSpec             `json:"range,omitempty"`
+	DateRange           *RangeAggSpec             `json:"date_range,omitempty"`
+	IPRange             *RangeAggSpec             `json:"ip_range,omitempty"`
+	Composite           *CompositeAggSpec         `json:"composite,omitempty"`
+	Filter              *Query                    `json:"filter,omitempty"`
+	Filters             *FiltersAggSpec           `json:"filters,omitempty"`
+	Missing             *ExistsQuery              `json:"missing,omitempty"`
+	Nested              *NestedAggSpec            `json:"nested,omitempty"`
+	ReverseNested       map[string]any            `json:"reverse_nested,omitempty"`
+	Global              map[string]any            `json:"global,omitempty"`
+	Sampler             *SamplerAggSpec           `json:"sampler,omitempty"`
+	DiversifiedSampler  *SamplerAggSpec           `json:"diversified_sampler,omitempty"`
+	Cardinality         *MetricAggSpec            `json:"cardinality,omitempty"`
+	ValueCount          *MetricAggSpec            `json:"value_count,omitempty"`
+	Avg                 *MetricAggSpec            `json:"avg,omitempty"`
+	Sum                 *MetricAggSpec            `json:"sum,omitempty"`
+	Min                 *MetricAggSpec            `json:"min,omitempty"`
+	Max                 *MetricAggSpec            `json:"max,omitempty"`
+	Stats               *MetricAggSpec            `json:"stats,omitempty"`
+	ExtendedStats       *MetricAggSpec            `json:"extended_stats,omitempty"`
+	StringStats         *MetricAggSpec            `json:"string_stats,omitempty"`
+	Boxplot             *MetricAggSpec            `json:"boxplot,omitempty"`
+	Percentiles         *PercentilesAggSpec       `json:"percentiles,omitempty"`
+	PercentileRanks     *PercentileRanksAggSpec   `json:"percentile_ranks,omitempty"`
+	TopHits             *TopHitsAggSpec           `json:"top_hits,omitempty"`
+	TopMetrics          *TopMetricsAggSpec        `json:"top_metrics,omitempty"`
+	Rate                *RateAggSpec              `json:"rate,omitempty"`
+	BucketSort          *BucketSortAggSpec        `json:"bucket_sort,omitempty"`
+	CumulativeSum       *PipelineAggSpec          `json:"cumulative_sum,omitempty"`
+	Derivative          *PipelineAggSpec          `json:"derivative,omitempty"`
+	MovingAvg           *MovingAvgAggSpec         `json:"moving_avg,omitempty"`
+	MovingFn            *MovingAvgAggSpec         `json:"moving_fn,omitempty"`
+	SerialDiff          *SerialDiffAggSpec        `json:"serial_diff,omitempty"`
+	AvgBucket           *PipelineAggSpec          `json:"avg_bucket,omitempty"`
+	SumBucket           *PipelineAggSpec          `json:"sum_bucket,omitempty"`
+	MinBucket           *PipelineAggSpec          `json:"min_bucket,omitempty"`
+	MaxBucket           *PipelineAggSpec          `json:"max_bucket,omitempty"`
+	StatsBucket         *PipelineAggSpec          `json:"stats_bucket,omitempty"`
+	ExtendedStatsBucket *PipelineAggSpec          `json:"extended_stats_bucket,omitempty"`
+	PercentilesBucket   *PercentilesBucketAggSpec `json:"percentiles_bucket,omitempty"`
+	BucketSelector      *BucketSelectorAggSpec    `json:"bucket_selector,omitempty"`
+	BucketScript        *BucketSelectorAggSpec    `json:"bucket_script,omitempty"`
+	Aggs                map[string]AggSpec        `json:"aggs,omitempty"`
+	Aggregations        map[string]AggSpec        `json:"aggregations,omitempty"`
+}
+
+// EffectiveRange returns the range specification for `range`, `date_range`, or `ip_range`.
+func (a *AggSpec) EffectiveRange() *RangeAggSpec {
+	if a.Range != nil {
+		return a.Range
+	}
+	if a.DateRange != nil {
+		return a.DateRange
+	}
+	return a.IPRange
+}
+
+// EffectiveStats returns the metric specification for `stats` or `extended_stats`.
+func (a *AggSpec) EffectiveStats() *MetricAggSpec {
+	if a.Stats != nil {
+		return a.Stats
+	}
+	return a.ExtendedStats
+}
+
+// EffectiveSampler returns the sampler specification for `sampler` or `diversified_sampler`.
+func (a *AggSpec) EffectiveSampler() *SamplerAggSpec {
+	if a.Sampler != nil {
+		return a.Sampler
+	}
+	return a.DiversifiedSampler
+}
+
+// EffectiveMovingAvg returns the moving average specification for `moving_avg` or `moving_fn`.
+func (a *AggSpec) EffectiveMovingAvg() *MovingAvgAggSpec {
+	if a.MovingAvg != nil {
+		return a.MovingAvg
+	}
+	return a.MovingFn
+}
+
+// SamplerAggSpec models a `sampler` or `diversified_sampler` aggregation.
+type SamplerAggSpec struct {
+	ShardSize int    `json:"shard_size,omitempty"`
+	Field     string `json:"field,omitempty"`
+}
+
+// PercentileRanksAggSpec models a `percentile_ranks` metric aggregation.
+type PercentileRanksAggSpec struct {
+	Field  string    `json:"field"`
+	Values []float64 `json:"values"`
+	Keyed  *bool     `json:"keyed,omitempty"`
+}
+
+// TopMetricsValSpec models a single metric field in `top_metrics`.
+type TopMetricsValSpec struct {
+	Field string `json:"field"`
+}
+
+// TopMetricsAggSpec models a `top_metrics` aggregation.
+type TopMetricsAggSpec struct {
+	Metrics []TopMetricsValSpec `json:"-"`
+	Size    *int                `json:"size,omitempty"`
+	Sort    SortSlice           `json:"sort,omitempty"`
+}
+
+func (tm *TopMetricsAggSpec) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Metrics json.RawMessage `json:"metrics"`
+		Metric  json.RawMessage `json:"metric"`
+		Size    *int            `json:"size"`
+		Sort    SortSlice       `json:"sort"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	tm.Size = raw.Size
+	tm.Sort = raw.Sort
+	mRaw := bytes.TrimSpace(raw.Metrics)
+	if len(mRaw) == 0 {
+		mRaw = bytes.TrimSpace(raw.Metric)
+	}
+	if len(mRaw) > 0 {
+		switch mRaw[0] {
+		case '[':
+			if err := json.Unmarshal(mRaw, &tm.Metrics); err != nil {
+				return err
+			}
+		case '{':
+			var single TopMetricsValSpec
+			if err := json.Unmarshal(mRaw, &single); err != nil {
+				return err
+			}
+			tm.Metrics = []TopMetricsValSpec{single}
+		}
+	}
+	return nil
+}
+
+func (tm *TopMetricsAggSpec) EffectiveSize() int {
+	if tm == nil || tm.Size == nil || *tm.Size <= 0 {
+		return 1
+	}
+	if *tm.Size > 100 {
+		return 100
+	}
+	return *tm.Size
+}
+
+func (tm *TopMetricsAggSpec) EffectiveMetricFields() []string {
+	if tm == nil {
+		return nil
+	}
+	out := make([]string, 0, len(tm.Metrics))
+	for _, m := range tm.Metrics {
+		if m.Field != "" {
+			out = append(out, m.Field)
+		}
+	}
+	return out
+}
+
+// RateAggSpec models a `rate` metric aggregation.
+type RateAggSpec struct {
+	Field string `json:"field,omitempty"`
+	Unit  string `json:"unit,omitempty"`
+	Mode  string `json:"mode,omitempty"`
+}
+
+// MovingAvgAggSpec models a `moving_avg` or `moving_fn` pipeline aggregation.
+type MovingAvgAggSpec struct {
+	BucketsPath any    `json:"buckets_path,omitempty"`
+	Window      int    `json:"window,omitempty"`
+	Model       string `json:"model,omitempty"`
+	Script      any    `json:"script,omitempty"`
+	GapPolicy   string `json:"gap_policy,omitempty"`
+	Shift       int    `json:"shift,omitempty"`
+}
+
+func (m *MovingAvgAggSpec) EffectivePath() string {
+	if m == nil || m.BucketsPath == nil {
+		return ""
+	}
+	if s, ok := m.BucketsPath.(string); ok {
+		return strings.TrimSpace(s)
+	}
+	return fmt.Sprintf("%v", m.BucketsPath)
+}
+
+func (m *MovingAvgAggSpec) EffectiveWindow() int {
+	if m == nil || m.Window <= 0 {
+		return 5
+	}
+	return m.Window
+}
+
+// SerialDiffAggSpec models a `serial_diff` pipeline aggregation.
+type SerialDiffAggSpec struct {
+	BucketsPath any    `json:"buckets_path,omitempty"`
+	Lag         int    `json:"lag,omitempty"`
+	GapPolicy   string `json:"gap_policy,omitempty"`
+	Format      string `json:"format,omitempty"`
+}
+
+func (s *SerialDiffAggSpec) EffectivePath() string {
+	if s == nil || s.BucketsPath == nil {
+		return ""
+	}
+	if str, ok := s.BucketsPath.(string); ok {
+		return strings.TrimSpace(str)
+	}
+	return fmt.Sprintf("%v", s.BucketsPath)
+}
+
+func (s *SerialDiffAggSpec) EffectiveLag() int {
+	if s == nil || s.Lag <= 0 {
+		return 1
+	}
+	return s.Lag
+}
+
+// PercentilesBucketAggSpec models a `percentiles_bucket` sibling pipeline aggregation.
+type PercentilesBucketAggSpec struct {
+	BucketsPath any       `json:"buckets_path,omitempty"`
+	Percents    []float64 `json:"percents,omitempty"`
+	Keyed       *bool     `json:"keyed,omitempty"`
+	GapPolicy   string    `json:"gap_policy,omitempty"`
+	Format      string    `json:"format,omitempty"`
+}
+
+func (p *PercentilesBucketAggSpec) EffectivePath() string {
+	if p == nil || p.BucketsPath == nil {
+		return ""
+	}
+	if s, ok := p.BucketsPath.(string); ok {
+		return strings.TrimSpace(s)
+	}
+	return fmt.Sprintf("%v", p.BucketsPath)
+}
+
+func (p *PercentilesBucketAggSpec) EffectivePercents() []float64 {
+	if p != nil && len(p.Percents) > 0 {
+		return p.Percents
+	}
+	return []float64{1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0}
 }
 
 // EffectiveTerms returns the terms specification for `terms`, `significant_terms`, or `significant_text`.
@@ -847,11 +1065,19 @@ type BucketSortAggSpec struct {
 	Size *int      `json:"size,omitempty"`
 }
 
-// PipelineAggSpec models a single-path pipeline aggregation (`cumulative_sum`, `derivative`, `avg_bucket`, `sum_bucket`, `min_bucket`, `max_bucket`, `stats_bucket`).
+// PipelineAggSpec models a single-path pipeline aggregation (`cumulative_sum`, `derivative`, `avg_bucket`, `sum_bucket`, `min_bucket`, `max_bucket`, `stats_bucket`, `extended_stats_bucket`).
 type PipelineAggSpec struct {
-	BucketsPath any    `json:"buckets_path,omitempty"`
-	GapPolicy   string `json:"gap_policy,omitempty"`
-	Format      string `json:"format,omitempty"`
+	BucketsPath any      `json:"buckets_path,omitempty"`
+	GapPolicy   string   `json:"gap_policy,omitempty"`
+	Format      string   `json:"format,omitempty"`
+	Sigma       *float64 `json:"sigma,omitempty"`
+}
+
+func (p *PipelineAggSpec) EffectiveSigma() float64 {
+	if p != nil && p.Sigma != nil && *p.Sigma >= 0 {
+		return *p.Sigma
+	}
+	return 2.0
 }
 
 // EffectivePath returns the primary buckets_path string.
@@ -880,12 +1106,72 @@ type CompositeAggSpec struct {
 }
 
 type FiltersAggSpec struct {
-	Filters map[string]Query `json:"filters,omitempty"`
+	Filters          map[string]Query `json:"-"`
+	AnonymousFilters []Query          `json:"-"`
+	IsAnonymous      bool             `json:"-"`
+	OtherBucket      bool             `json:"other_bucket,omitempty"`
+	OtherBucketKey   string           `json:"other_bucket_key,omitempty"`
+	Keyed            *bool            `json:"keyed,omitempty"`
+}
+
+func (f *FiltersAggSpec) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Filters        json.RawMessage `json:"filters"`
+		OtherBucket    bool            `json:"other_bucket"`
+		OtherBucketKey string          `json:"other_bucket_key"`
+		Keyed          *bool           `json:"keyed"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	f.OtherBucket = raw.OtherBucket || raw.OtherBucketKey != ""
+	f.OtherBucketKey = raw.OtherBucketKey
+	f.Keyed = raw.Keyed
+	trimmed := bytes.TrimSpace(raw.Filters)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var list []Query
+		if err := json.Unmarshal(trimmed, &list); err != nil {
+			return err
+		}
+		f.IsAnonymous = true
+		f.AnonymousFilters = list
+		f.Filters = make(map[string]Query, len(list))
+		for i, q := range list {
+			f.Filters[strconv.Itoa(i)] = q
+		}
+		return nil
+	}
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var m map[string]Query
+		if err := json.Unmarshal(trimmed, &m); err != nil {
+			return err
+		}
+		f.Filters = m
+	}
+	return nil
+}
+
+func (f *FiltersAggSpec) EffectiveOtherBucketKey() string {
+	if f != nil && f.OtherBucketKey != "" {
+		return f.OtherBucketKey
+	}
+	return "_other_"
+}
+
+func (f *FiltersAggSpec) EffectiveKeyed() bool {
+	if f == nil {
+		return true
+	}
+	if f.Keyed != nil {
+		return *f.Keyed
+	}
+	return !f.IsAnonymous
 }
 
 type PercentilesAggSpec struct {
 	Field    string    `json:"field"`
 	Percents []float64 `json:"percents,omitempty"`
+	Keyed    *bool     `json:"keyed,omitempty"`
 }
 
 func (p *PercentilesAggSpec) EffectivePercents() []float64 {
@@ -896,19 +1182,41 @@ func (p *PercentilesAggSpec) EffectivePercents() []float64 {
 }
 
 type TopHitsAggSpec struct {
+	From   int           `json:"from,omitempty"`
 	Size   *int          `json:"size,omitempty"`
 	Sort   SortSlice     `json:"sort,omitempty"`
 	Source *SourceFilter `json:"_source,omitempty"`
 }
 
+func (th *TopHitsAggSpec) EffectiveFrom() int {
+	if th == nil || th.From <= 0 {
+		return 0
+	}
+	if th.From > 100 {
+		return 100
+	}
+	return th.From
+}
+
 func (th *TopHitsAggSpec) EffectiveSize() int {
-	if th == nil || th.Size == nil || *th.Size <= 0 {
+	if th == nil || th.Size == nil {
 		return 3
+	}
+	if *th.Size <= 0 {
+		return 0
 	}
 	if *th.Size > 100 {
 		return 100
 	}
 	return *th.Size
+}
+
+func (th *TopHitsAggSpec) EffectiveFetchLimit() int {
+	limit := th.EffectiveFrom() + th.EffectiveSize()
+	if limit > 200 {
+		return 200
+	}
+	return limit
 }
 
 func (a *AggSpec) SubAggs() map[string]AggSpec {
@@ -944,6 +1252,7 @@ type DateHistogramAggSpec struct {
 	MinDocCount      *int                 `json:"min_doc_count,omitempty"`
 	ExtendedBounds   *HistogramBoundsSpec `json:"extended_bounds,omitempty"`
 	HardBounds       *HistogramBoundsSpec `json:"hard_bounds,omitempty"`
+	Keyed            bool                 `json:"keyed,omitempty"`
 }
 
 // EffectiveOffsetMs parses `offset` (e.g., "+6h", "-30m") into milliseconds.
@@ -1096,22 +1405,28 @@ type HistogramAggSpec struct {
 	MinDocCount    *int                 `json:"min_doc_count,omitempty"`
 	ExtendedBounds *HistogramBoundsSpec `json:"extended_bounds,omitempty"`
 	HardBounds     *HistogramBoundsSpec `json:"hard_bounds,omitempty"`
+	Keyed          bool                 `json:"keyed,omitempty"`
 }
 
 type RangeAggSpec struct {
 	Field  string           `json:"field"`
 	Ranges []RangeAggBucket `json:"ranges"`
+	Keyed  bool             `json:"keyed,omitempty"`
 }
 
 type RangeAggBucket struct {
 	Key  string `json:"key,omitempty"`
 	From any    `json:"from,omitempty"`
 	To   any    `json:"to,omitempty"`
+	Mask string `json:"mask,omitempty"`
 }
 
 func (b RangeAggBucket) EffectiveKey() string {
 	if b.Key != "" {
 		return b.Key
+	}
+	if b.Mask != "" {
+		return b.Mask
 	}
 	fromStr := "*"
 	if b.From != nil {
@@ -1129,14 +1444,24 @@ type NestedAggSpec struct {
 }
 
 type MetricAggSpec struct {
-	Field string `json:"field"`
+	Field string   `json:"field"`
+	Sigma *float64 `json:"sigma,omitempty"`
+}
+
+func (m *MetricAggSpec) EffectiveSigma() float64 {
+	if m != nil && m.Sigma != nil && *m.Sigma >= 0 {
+		return *m.Sigma
+	}
+	return 2.0
 }
 
 type SortEntry = SortFieldSpec
 
 type SortFieldSpec struct {
-	Field string
-	Order string
+	Field   string
+	Order   string
+	Mode    string
+	Missing string
 }
 
 type SortSpec struct {
@@ -1194,25 +1519,80 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(trimmed, &m); err != nil {
 		return err
 	}
-	for field, rawVal := range m {
+	if rawVal, ok := m["_script"]; ok {
+		order := "asc"
+		var obj struct {
+			Order  string `json:"order"`
+			Script any    `json:"script"`
+		}
+		_ = json.Unmarshal(rawVal, &obj)
+		if obj.Order != "" {
+			order = strings.ToLower(obj.Order)
+		}
+		s.Entry = SortFieldSpec{Field: "_script", Order: order}
+		return nil
+	}
+	if rawVal, ok := m["_geo_distance"]; ok {
+		order := "asc"
+		var obj struct {
+			Order string `json:"order"`
+		}
+		_ = json.Unmarshal(rawVal, &obj)
+		if obj.Order != "" {
+			order = strings.ToLower(obj.Order)
+		} else if ordRaw, hasOrd := m["order"]; hasOrd {
+			var ordStr string
+			if json.Unmarshal(ordRaw, &ordStr) == nil && ordStr != "" {
+				order = strings.ToLower(ordStr)
+			}
+		}
+		s.Entry = SortFieldSpec{Field: "_geo_distance", Order: order}
+		return nil
+	}
+
+	reservedOpts := map[string]bool{
+		"order": true, "mode": true, "missing": true, "unmapped_type": true,
+		"numeric_type": true, "format": true, "nested": true, "unit": true,
+		"distance_type": true, "validation_method": true, "ignore_unmapped": true,
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		if len(m) > 1 && reservedOpts[k] {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if len(keys) > 0 {
+		field := keys[0]
+		rawVal := m[field]
 		order := "asc"
 		if field == "_score" {
 			order = "desc"
 		}
+		missing := ""
+		mode := ""
 		valTrimmed := bytes.TrimSpace(rawVal)
 		if len(valTrimmed) > 0 && valTrimmed[0] == '"' {
 			_ = json.Unmarshal(valTrimmed, &order)
 		} else if len(valTrimmed) > 0 && valTrimmed[0] == '{' {
 			var obj struct {
-				Order string `json:"order"`
+				Order   string `json:"order"`
+				Mode    string `json:"mode"`
+				Missing any    `json:"missing"`
 			}
 			_ = json.Unmarshal(valTrimmed, &obj)
 			if obj.Order != "" {
 				order = obj.Order
 			}
+			if obj.Mode != "" {
+				mode = obj.Mode
+			}
+			if obj.Missing != nil {
+				missing = fmt.Sprintf("%v", obj.Missing)
+			}
 		}
-		s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order)}
-		break
+		s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing}
 	}
 	return nil
 }
@@ -1341,13 +1721,15 @@ type BulkOperation struct {
 	Action   string          // "index", "create", "update", "delete"
 	Index    string          // Target index name
 	ID       string          // Document _id
+	Pipeline string          // Optional per-item ingest pipeline override
 	Source   json.RawMessage // Verbatim raw JSON line for `_source` (or update payload)
 	ParseErr string          // Per-item validation or JSON error (isolated to this bulk item)
 }
 
 type bulkActionMeta struct {
-	Index string `json:"_index"`
-	ID    string `json:"_id"`
+	Index    string `json:"_index"`
+	ID       string `json:"_id"`
+	Pipeline string `json:"pipeline,omitempty"`
 }
 
 type bulkActionLine struct {
@@ -1397,6 +1779,7 @@ func ParseBulkNDJSON(r io.Reader, defaultIndex string) ([]BulkOperation, error) 
 			op.Index = defaultIndex
 		}
 		op.ID = meta.ID
+		op.Pipeline = meta.Pipeline
 		if op.ID == "" {
 			if op.Action == "index" || op.Action == "create" {
 				op.ID = NextAutoID()

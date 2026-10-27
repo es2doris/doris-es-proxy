@@ -112,12 +112,6 @@ func (c *StreamLoadCoalescer) Submit(ctx context.Context, table string, ndjson [
 			done: make(chan struct{}),
 		}
 		c.batches[table] = b
-		if !syncRefresh {
-			batchRef := b
-			b.timer = time.AfterFunc(window, func() {
-				c.onTimerFlush(table, batchRef)
-			})
-		}
 	}
 	b.buf.Write(ndjson)
 	if ndjson[len(ndjson)-1] != '\n' {
@@ -141,6 +135,12 @@ func (c *StreamLoadCoalescer) Submit(ctx context.Context, table string, ndjson [
 		c.executeBatch(flushCtx, table, b, syncRefresh)
 		return b.err
 	}
+	if b.timer == nil {
+		batchRef := b
+		b.timer = time.AfterFunc(window, func() {
+			c.onTimerFlush(table, batchRef)
+		})
+	}
 	doneCh := b.done
 	c.mu.Unlock()
 
@@ -157,10 +157,6 @@ func (c *StreamLoadCoalescer) Submit(ctx context.Context, table string, ndjson [
 // previously submitted writes.
 func (c *StreamLoadCoalescer) FlushTable(ctx context.Context, table string) error {
 	c.mu.Lock()
-	if c.window <= 0 {
-		c.mu.Unlock()
-		return nil
-	}
 	var waitChs []chan struct{}
 	for ib, tbl := range c.inflight {
 		if tbl == table {
@@ -184,7 +180,9 @@ func (c *StreamLoadCoalescer) FlushTable(ctx context.Context, table string) erro
 				delete(c.inflight, b)
 				c.mu.Unlock()
 			}()
-			c.executeBatch(ctx, table, b, true)
+			flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer cancel()
+			c.executeBatch(flushCtx, table, b, true)
 		}()
 	}
 	for _, ch := range waitChs {
@@ -231,7 +229,9 @@ func (c *StreamLoadCoalescer) FlushAll(ctx context.Context) error {
 
 	var firstErr error
 	for tbl, b := range pending {
-		c.executeBatch(ctx, tbl, b, true)
+		flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		c.executeBatch(flushCtx, tbl, b, true)
+		cancel()
 		c.mu.Lock()
 		delete(c.inflight, b)
 		c.mu.Unlock()
