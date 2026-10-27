@@ -20,8 +20,8 @@ spec:
       tlsConfig:
         insecureSkipVerify: true
       {{- end }}
-      {{- $authSecretName := default (printf "%s-auth" (include "doris-es-proxy.fullname" .)) .Values.auth.existingSecret }}
-      {{- if or .Values.auth.existingSecret (and .Values.auth.basicUser .Values.auth.basicPassword) }}
+      {{- $authSecretName := default (include "doris-es-proxy.fullname" .) .Values.auth.existingSecret }}
+      {{- if or .Values.auth.existingSecret (and .Values.auth.basicAuthUser .Values.auth.basicAuthPass) }}
       basicAuth:
         username:
           name: {{ $authSecretName }}

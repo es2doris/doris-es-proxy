@@ -412,4 +412,96 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 		t.Fatalf("GET /live_auto_index/_mapping on rehydrated server failed: status=%v err=%v", resp.StatusCode, err)
 	}
 	_ = resp.Body.Close()
+
+	// 8. Round-8 Live Doris Verification: extended_stats, string_stats, boxplot, percentile_ranks,
+	// top_metrics, global, sampler, anonymous filters + other_bucket, moving_avg, serial_diff,
+	// extended_stats_bucket, percentiles_bucket, and filtered write-alias rehydration
+	r8AliasReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/_aliases", strings.NewReader(`{
+		"actions": [
+			{
+				"add": {
+					"index": "live_auto_index",
+					"alias": "live_checkout_alias",
+					"is_write_index": true,
+					"filter": {"term": {"service": "checkout-api"}}
+				}
+			}
+		]
+	}`))
+	r8AliasReq.Header.Set("Content-Type", "application/json")
+	r8AliasResp, err := http.DefaultClient.Do(r8AliasReq)
+	if err != nil || r8AliasResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_aliases (filtered alias) on live Doris failed: status=%v err=%v", r8AliasResp.StatusCode, err)
+	}
+	_ = r8AliasResp.Body.Close()
+
+	// Index a second checkout-api document through the filtered write alias (total 3 docs in live_auto_index, 2 matching live_checkout_alias)
+	aliasWriteReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/live_checkout_alias/_doc/auto-3?refresh=true",
+		strings.NewReader(`{"service":"checkout-api","latency_ms":85,"ok":true}`))
+	aliasWriteReq.Header.Set("Content-Type", "application/json")
+	aliasWriteResp, err := http.DefaultClient.Do(aliasWriteReq)
+	if err != nil || (aliasWriteResp.StatusCode != http.StatusOK && aliasWriteResp.StatusCode != http.StatusCreated) {
+		t.Fatalf("PUT /live_checkout_alias/_doc/auto-3 via write alias failed: status=%v err=%v", aliasWriteResp.StatusCode, err)
+	}
+	_ = aliasWriteResp.Body.Close()
+
+	r8SearchBody := `{
+		"size": 0,
+		"aggs": {
+			"all_global": {
+				"global": {},
+				"aggs": {
+					"ext_lat": {"extended_stats": {"field": "latency_ms", "sigma": 2.0}}
+				}
+			},
+			"str_svc": {"string_stats": {"field": "service"}},
+			"lat_box": {"boxplot": {"field": "latency_ms"}},
+			"lat_ranks": {"percentile_ranks": {"field": "latency_ms", "values": [25, 100]}},
+			"latest_lat": {
+				"top_metrics": {
+					"metrics": {"field": "latency_ms"},
+					"sort": [{"latency_ms": "desc"}],
+					"size": 1
+				}
+			},
+			"anon_filters": {
+				"filters": {
+					"other_bucket": true,
+					"filters": [
+						{"term": {"service": "checkout-api"}}
+					]
+				}
+			},
+			"by_lat": {
+				"histogram": {"field": "latency_ms", "interval": 20},
+				"aggs": {
+					"sum_lat": {"sum": {"field": "latency_ms"}},
+					"mov_lat": {"moving_avg": {"buckets_path": "sum_lat", "window": 2}},
+					"diff_lat": {"serial_diff": {"buckets_path": "sum_lat", "lag": 1}}
+				}
+			},
+			"ext_bucket": {"extended_stats_bucket": {"buckets_path": "by_lat>sum_lat"}},
+			"pct_bucket": {"percentiles_bucket": {"buckets_path": "by_lat>sum_lat", "percents": [50, 95]}}
+		}
+	}`
+	r8Resp, err := http.Post(ts.URL+"/live_checkout_alias/_search", "application/json", strings.NewReader(r8SearchBody))
+	if err != nil || r8Resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(r8Resp.Body)
+		t.Fatalf("POST /live_checkout_alias/_search (Round-8 aggs) failed: status=%v err=%v body=%s", r8Resp.StatusCode, err, string(b))
+	}
+	var r8Res map[string]any
+	_ = json.NewDecoder(r8Resp.Body).Decode(&r8Res)
+	_ = r8Resp.Body.Close()
+
+	if r8Res["hits"].(map[string]any)["total"].(map[string]any)["value"] != float64(2) {
+		t.Fatalf("expected filtered alias live_checkout_alias to match 2 checkout docs on live Doris, got: %+v", r8Res["hits"])
+	}
+	r8Aggs := r8Res["aggregations"].(map[string]any)
+	allGlobal := r8Aggs["all_global"].(map[string]any)
+	if allGlobal["doc_count"] != float64(3) {
+		t.Fatalf("expected global agg on live Doris to see all 3 docs in live_auto_index, got: %+v", allGlobal)
+	}
+	if r8Aggs["str_svc"] == nil || r8Aggs["lat_box"] == nil || r8Aggs["lat_ranks"] == nil || r8Aggs["latest_lat"] == nil || r8Aggs["ext_bucket"] == nil || r8Aggs["pct_bucket"] == nil {
+		t.Fatalf("missing Round-8 aggregations in live Doris response: %+v", r8Aggs)
+	}
 }

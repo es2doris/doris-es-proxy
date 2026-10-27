@@ -72,7 +72,8 @@ func NewStreamLoadClient(cfg StreamLoadConfig) *StreamLoadClient {
 			if len(via) >= 5 {
 				return fmt.Errorf("stopped after 5 redirects")
 			}
-			if len(via) > 0 && req.URL.Scheme == via[0].URL.Scheme {
+			if len(via) > 0 && req.URL.Scheme == via[0].URL.Scheme &&
+				(req.URL.Hostname() == via[0].URL.Hostname() || strings.Contains(req.URL.Path, "_stream_load")) {
 				if auth := via[0].Header.Get("Authorization"); auth != "" {
 					// #nosec G119 -- Doris FE (:8030) redirects Stream Load PUTs to Doris BE (:8040) on the same scheme
 					req.Header.Set("Authorization", auth)
@@ -156,7 +157,7 @@ func (c *StreamLoadClient) LoadNDJSON(
 			continue
 		}
 
-		bodyBytes, readErr := io.ReadAll(resp.Body)
+		bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024))
 		_ = resp.Body.Close()
 		if readErr != nil {
 			lastErr = fmt.Errorf("reading stream load response: %w", readErr)
