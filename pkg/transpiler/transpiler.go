@@ -355,7 +355,7 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 					if ts.MinimumShouldMatchField != "" {
 						threshExpr = fmt.Sprintf("COALESCE(%s, 1)", t.sqlNumericColumnRef(ts.MinimumShouldMatchField, nctx))
 					} else if len(ts.MinimumShouldMatchScript) > 0 {
-						threshExpr = t.compileTermsSetScriptThreshold(ts.MinimumShouldMatchScript, nctx)
+						threshExpr = t.compileTermsSetScriptThreshold(ts.MinimumShouldMatchScript, len(ts.Terms), nctx)
 					}
 					preds = append(preds, fmt.Sprintf("((%s) >= %s)", strings.Join(termSums, " + "), threshExpr))
 				}
@@ -383,10 +383,13 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		return t.compileBool(&esast.BoolQuery{Must: subs}, scoring, nctx)
 	case q.CombinedFields != nil:
 		return t.compileMultiMatch(&esast.MultiMatchQuery{
-			Query:    q.CombinedFields.Query,
-			Fields:   q.CombinedFields.Fields,
-			Operator: q.CombinedFields.Operator,
-			Boost:    q.CombinedFields.Boost,
+			Query:              q.CombinedFields.Query,
+			Fields:             q.CombinedFields.Fields,
+			Type:               "cross_fields",
+			Operator:           q.CombinedFields.Operator,
+			MinimumShouldMatch: q.CombinedFields.MinimumShouldMatch,
+			ZeroTermsQuery:     q.CombinedFields.ZeroTermsQuery,
+			Boost:              q.CombinedFields.Boost,
 		}, scoring, nctx)
 	case q.ScriptScore != nil:
 		base := CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: "1.0"}
@@ -400,13 +403,18 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 	case len(q.Range) > 0:
 		keys := sortedMapKeys(q.Range)
 		var preds []string
+		boost := 1.0
 		for _, field := range keys {
-			preds = append(preds, t.compileRangePredicate(field, q.Range[field], nctx))
+			rc := q.Range[field]
+			if rc.Boost != nil {
+				boost = *rc.Boost
+			}
+			preds = append(preds, t.compileRangePredicate(field, rc, nctx))
 		}
 		pred := strings.Join(preds, " AND ")
 		score := "1.0"
 		if scoring {
-			score = fmt.Sprintf("(CASE WHEN %s THEN 1.0000 ELSE 0.0 END)", pred)
+			score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", pred, boost)
 		}
 		return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: score}
 	case q.Exists != nil:
@@ -419,27 +427,35 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 	case len(q.Prefix) > 0:
 		keys := sortedMapKeys(q.Prefix)
 		var preds []string
+		boost := 1.0
 		for _, field := range keys {
 			pe := q.Prefix[field]
+			if pe.Boost != 0 {
+				boost = pe.Boost
+			}
 			preds = append(preds, t.compilePrefixPredicate(field, pe.Value, pe.CaseInsensitive, nctx))
 		}
 		pred := strings.Join(preds, " AND ")
 		score := "1.0"
 		if scoring {
-			score = fmt.Sprintf("(CASE WHEN %s THEN 1.0000 ELSE 0.0 END)", pred)
+			score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", pred, boost)
 		}
 		return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: score}
 	case len(q.Wildcard) > 0:
 		keys := sortedMapKeys(q.Wildcard)
 		var preds []string
+		boost := 1.0
 		for _, field := range keys {
 			we := q.Wildcard[field]
+			if we.Boost != 0 {
+				boost = we.Boost
+			}
 			preds = append(preds, t.compileWildcardPredicate(field, we.Value, we.CaseInsensitive, nctx))
 		}
 		pred := strings.Join(preds, " AND ")
 		score := "1.0"
 		if scoring {
-			score = fmt.Sprintf("(CASE WHEN %s THEN 1.0000 ELSE 0.0 END)", pred)
+			score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", pred, boost)
 		}
 		return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: score}
 	case len(q.Regexp) > 0:
@@ -447,29 +463,37 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		var preds []string
 		var safePreds []string
 		usesFT := false
+		boost := 1.0
 		for _, field := range keys {
 			re := q.Regexp[field]
+			if re.Boost != 0 {
+				boost = re.Boost
+			}
+			pat := re.Value
+			if re.CaseInsensitive && !strings.HasPrefix(pat, "(?i)") {
+				pat = "(?i)" + pat
+			}
 			b := t.Schema.ResolveField(field)
 			if nctx == nil && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
-				arrPred := fmt.Sprintf("array_exists(_x -> _x REGEXP %s, `%s`)", quoteStr(re.Value), b.ColumnName)
+				arrPred := fmt.Sprintf("array_exists(_x -> _x REGEXP %s, `%s`)", quoteStr(pat), b.ColumnName)
 				preds = append(preds, arrPred)
 				safePreds = append(safePreds, arrPred)
 				continue
 			}
 			col := t.sqlColumnRef(field, false, nctx)
-			safePred := fmt.Sprintf("(%s IS NOT NULL AND %s REGEXP %s)", col, col, quoteStr(re.Value))
+			safePred := fmt.Sprintf("(%s IS NOT NULL AND %s REGEXP %s)", col, col, quoteStr(pat))
 			safePreds = append(safePreds, safePred)
-			if nctx != nil {
-				preds = append(preds, fmt.Sprintf("%s REGEXP %s", col, quoteStr(re.Value)))
+			if nctx != nil || re.CaseInsensitive {
+				preds = append(preds, fmt.Sprintf("%s REGEXP %s", col, quoteStr(pat)))
 			} else {
-				preds = append(preds, fmt.Sprintf("%s MATCH_REGEXP %s", col, quoteStr(re.Value)))
+				preds = append(preds, fmt.Sprintf("%s MATCH_REGEXP %s", col, quoteStr(pat)))
 				usesFT = true
 			}
 		}
 		safeWhere := strings.Join(safePreds, " AND ")
 		scoreSQL := "1.0"
 		if scoring && len(safePreds) > 0 {
-			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN 1.0000 ELSE 0.0 END)", safeWhere)
+			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", safeWhere, boost)
 		}
 		return CompiledQuery{WhereSQL: strings.Join(preds, " AND "), SafeWhereSQL: safeWhere, ScoreSQL: scoreSQL, UsesFulltextMatch: usesFT}
 	case len(q.Match) > 0:
@@ -1049,6 +1073,44 @@ func (t *Transpiler) compileMultiMatch(mm *esast.MultiMatchQuery, scoring bool, 
 	if op == "" {
 		op = "or"
 	}
+	qStr := strings.TrimSpace(fmt.Sprintf("%v", mm.Query))
+	if qStr == "" && strings.EqualFold(mm.ZeroTermsQuery, "all") {
+		boost := 1.0
+		if mm.Boost != nil {
+			boost = *mm.Boost
+		}
+		return CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: fmt.Sprintf("%.4f", boost)}
+	}
+	mmType := strings.ToLower(mm.Type)
+
+	// Term-centric cross_fields (and combined_fields) or minimum_should_match token splitting
+	if mmType == "cross_fields" || (mm.MinimumShouldMatch != nil && !strings.EqualFold(op, "and") && mmType != "phrase" && mmType != "phrase_prefix" && mmType != "bool_prefix") {
+		tokens := strings.Fields(qStr)
+		if len(tokens) > 1 && (strings.EqualFold(op, "and") || mm.MinimumShouldMatch != nil) {
+			var tokenQueries []esast.Query
+			for _, tok := range tokens {
+				tokenQueries = append(tokenQueries, esast.Query{
+					MultiMatch: &esast.MultiMatchQuery{
+						Query:    tok,
+						Fields:   fields,
+						Type:     "best_fields",
+						Operator: "or",
+					},
+				})
+			}
+			if strings.EqualFold(op, "and") {
+				return t.compileBool(&esast.BoolQuery{
+					Must:  tokenQueries,
+					Boost: mm.Boost,
+				}, scoring, nctx)
+			}
+			return t.compileBool(&esast.BoolQuery{
+				Should:             tokenQueries,
+				MinimumShouldMatch: mm.MinimumShouldMatch,
+				Boost:              mm.Boost,
+			}, scoring, nctx)
+		}
+	}
 
 	var disjuncts []string
 	var safeDisjuncts []string
@@ -1059,12 +1121,22 @@ func (t *Transpiler) compileMultiMatch(mm *esast.MultiMatchQuery, scoring bool, 
 		expanded := t.Schema.ExpandFieldPattern(fpat)
 		for _, bf := range expanded {
 			var c CompiledQuery
-			qStr := fmt.Sprintf("%v", mm.Query)
-			switch strings.ToLower(mm.Type) {
+			switch mmType {
 			case "phrase":
 				c = t.compileMatchPhraseField(bf.Field, qStr, mm.Slop, bf.Boost, false, scoring, nctx)
-			case "phrase_prefix", "bool_prefix":
+			case "phrase_prefix":
 				c = t.compileMatchPhraseField(bf.Field, qStr, mm.Slop, bf.Boost, true, scoring, nctx)
+			case "bool_prefix":
+				c = t.CompileQuery(&esast.Query{
+					MatchBoolPrefix: map[string]esast.PhraseEntry{
+						bf.Field: {
+							Query:              qStr,
+							Operator:           op,
+							MinimumShouldMatch: mm.MinimumShouldMatch,
+							Boost:              bf.Boost,
+						},
+					},
+				}, scoring, nctx)
 			default:
 				c = t.compileMatchField(bf.Field, mm.Query, op, bf.Boost, scoring, nctx)
 			}
@@ -1085,8 +1157,14 @@ func (t *Transpiler) compileMultiMatch(mm *esast.MultiMatchQuery, scoring bool, 
 	}
 	scoreExpr := "1.0"
 	if scoring && len(scores) > 0 {
-		if strings.EqualFold(mm.Type, "best_fields") && len(scores) > 1 {
-			scoreExpr = fmt.Sprintf("GREATEST(%s)", strings.Join(scores, ", "))
+		if (mmType == "best_fields" || mmType == "bool_prefix" || mmType == "phrase" || mmType == "phrase_prefix") && len(scores) > 1 {
+			maxExpr := fmt.Sprintf("GREATEST(%s)", strings.Join(scores, ", "))
+			if mm.TieBreaker != nil && *mm.TieBreaker > 0 {
+				sumExpr := fmt.Sprintf("(%s)", strings.Join(scores, " + "))
+				scoreExpr = fmt.Sprintf("(%s + %.4f * (%s - %s))", maxExpr, *mm.TieBreaker, sumExpr, maxExpr)
+			} else {
+				scoreExpr = maxExpr
+			}
 		} else {
 			scoreExpr = fmt.Sprintf("(%s)", strings.Join(scores, " + "))
 		}
@@ -1207,6 +1285,8 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 	var funcExprs []string
 	var rawValExprs []string
 	var filterCondExprs []string
+	var activeFilterConds []string
+	hasUnfilteredFunc := false
 	for _, fn := range funcs {
 		weight := 1.0
 		if fn.Weight != nil {
@@ -1255,12 +1335,16 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 			cond := t.CompileQuery(fn.Filter, true, nctx)
 			condExpr := cond.EffectiveSafeWhere()
 			filterCondExprs = append(filterCondExprs, condExpr)
+			activeFilterConds = append(activeFilterConds, fmt.Sprintf("(%s)", condExpr))
 			elseVal := "0.0"
 			if isMultiplyMode {
 				elseVal = "1.0"
+			} else if scoreMode == "min" {
+				elseVal = "999999999.0"
 			}
 			funcExprs = append(funcExprs, fmt.Sprintf("(CASE WHEN %s THEN %s ELSE %s END)", condExpr, valExpr, elseVal))
 		} else {
+			hasUnfilteredFunc = true
 			filterCondExprs = append(filterCondExprs, "")
 			funcExprs = append(funcExprs, valExpr)
 		}
@@ -1273,6 +1357,16 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 	case "avg":
 		if len(funcExprs) == 1 {
 			combinedFuncs = funcExprs[0]
+		} else if len(activeFilterConds) > 0 {
+			var countTerms []string
+			for _, fc := range filterCondExprs {
+				if fc == "" {
+					countTerms = append(countTerms, "1.0")
+				} else {
+					countTerms = append(countTerms, fmt.Sprintf("(CASE WHEN %s THEN 1.0 ELSE 0.0 END)", fc))
+				}
+			}
+			combinedFuncs = fmt.Sprintf("((%s) / GREATEST(1.0, %s))", strings.Join(funcExprs, " + "), strings.Join(countTerms, " + "))
 		} else {
 			combinedFuncs = fmt.Sprintf("((%s) / %d.0)", strings.Join(funcExprs, " + "), len(funcExprs))
 		}
@@ -1334,12 +1428,30 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 	default:
 		finalScore = fmt.Sprintf("((%s) * (%s))", base.ScoreSQL, combinedFuncs)
 	}
+	if !hasUnfilteredFunc && len(activeFilterConds) > 0 {
+		finalScore = fmt.Sprintf("(CASE WHEN (%s) THEN %s ELSE %s END)", strings.Join(activeFilterConds, " OR "), finalScore, base.ScoreSQL)
+	}
 	if fs.Boost != nil && *fs.Boost != 1.0 {
 		finalScore = fmt.Sprintf("(%.4f * %s)", *fs.Boost, finalScore)
 	}
+	whereSQL := base.WhereSQL
+	safeWhereSQL := base.EffectiveSafeWhere()
+	if fs.MinScore != nil {
+		minScoreCond := fmt.Sprintf("(%s >= %.4f)", finalScore, *fs.MinScore)
+		if whereSQL == "" || whereSQL == "TRUE" {
+			whereSQL = minScoreCond
+		} else {
+			whereSQL = fmt.Sprintf("(%s AND %s)", whereSQL, minScoreCond)
+		}
+		if safeWhereSQL == "" || safeWhereSQL == "TRUE" {
+			safeWhereSQL = minScoreCond
+		} else {
+			safeWhereSQL = fmt.Sprintf("(%s AND %s)", safeWhereSQL, minScoreCond)
+		}
+	}
 	return CompiledQuery{
-		WhereSQL:          base.WhereSQL,
-		SafeWhereSQL:      base.EffectiveSafeWhere(),
+		WhereSQL:          whereSQL,
+		SafeWhereSQL:      safeWhereSQL,
 		ScoreSQL:          finalScore,
 		UsesFulltextMatch: base.UsesFulltextMatch,
 	}
@@ -1361,10 +1473,7 @@ func (t *Transpiler) compileTermsSetTermPredicate(field string, val any, nctx *n
 		_, _ = fmt.Fprintf(&pathBuilder, "[%s]", quoteStr(seg))
 	}
 	arrExpr := fmt.Sprintf("array_contains(CAST(`_doc`%s AS ARRAY<STRING>), %s)", pathBuilder.String(), quoteStr(strVal))
-	if b.Kind == schema.StoragePromotedScalar {
-		return fmt.Sprintf("(%s OR %s)", basePred, arrExpr)
-	}
-	return arrExpr
+	return fmt.Sprintf("(%s OR %s)", basePred, arrExpr)
 }
 
 func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive bool, nctx *nestedCtx) string {
@@ -1510,31 +1619,54 @@ func (t *Transpiler) compileRangePredicate(field string, rc esast.RangeCond, nct
 	b := t.Schema.ResolveField(field)
 	now := time.Now().UTC()
 	isEpochSecond := strings.EqualFold(rc.Format, "epoch_second")
+	tzOffsetMs := esast.ParseTimeZoneOffsetMs(strings.TrimSpace(rc.TimeZone))
 
 	coerceBound := func(v any, roundUp bool) any {
 		if v == nil {
 			return nil
 		}
-		if b.DorisType == schema.DorisBigInt && b.Kind != schema.StorageNestedSubfield {
-			if strVal, ok := v.(string); ok {
-				if ms, ok := schema.ParseESDateBoundToEpochMillis(strVal, now, roundUp); ok {
-					if isEpochSecond && ms > 0 && ms < 100_000_000_000 {
-						ms *= 1000
+		if b.Kind != schema.StorageNestedSubfield {
+			switch b.DorisType {
+			case schema.DorisBigInt:
+				if strVal, ok := v.(string); ok {
+					trimmed := strings.TrimSpace(strVal)
+					if rawSec, err := strconv.ParseFloat(trimmed, 64); err == nil {
+						if isEpochSecond {
+							return int64(rawSec * 1000)
+						}
+						return int64(rawSec)
 					}
-					return ms
+					if ms, ok := schema.ParseESDateBoundToEpochMillis(strVal, now, roundUp); ok {
+						if tzOffsetMs != 0 && !strings.HasSuffix(trimmed, "Z") && !strings.HasSuffix(trimmed, "z") && !strings.Contains(trimmed[min(10, len(trimmed)):], "+") && !strings.Contains(trimmed[min(10, len(trimmed)):], "-") {
+							ms -= tzOffsetMs
+						}
+						return ms
+					}
 				}
-			}
-			if isEpochSecond {
-				switch nv := v.(type) {
-				case int:
-					return int64(nv) * 1000
-				case int64:
-					return nv * 1000
-				case float64:
-					return int64(nv * 1000)
-				case json.Number:
-					if i, err := nv.Int64(); err == nil {
-						return i * 1000
+				if isEpochSecond {
+					switch nv := v.(type) {
+					case int:
+						return int64(nv) * 1000
+					case int64:
+						return nv * 1000
+					case float64:
+						return int64(nv * 1000)
+					case json.Number:
+						if i, err := nv.Int64(); err == nil {
+							return i * 1000
+						}
+					}
+				}
+			case schema.DorisInt:
+				if strVal, ok := v.(string); ok {
+					if i, err := strconv.ParseInt(strings.TrimSpace(strVal), 10, 64); err == nil {
+						return i
+					}
+				}
+			case schema.DorisDouble:
+				if strVal, ok := v.(string); ok {
+					if f, err := strconv.ParseFloat(strings.TrimSpace(strVal), 64); err == nil {
+						return f
 					}
 				}
 			}
@@ -1549,9 +1681,21 @@ func (t *Transpiler) compileRangePredicate(field string, rc esast.RangeCond, nct
 
 	var sampleBound any
 	for _, cand := range []any{gt, gte, lt, lte} {
-		if cand != nil {
+		if cand == nil {
+			continue
+		}
+		if sampleBound == nil {
 			sampleBound = cand
-			break
+		}
+		switch fv := cand.(type) {
+		case float64:
+			if fv != math.Trunc(fv) {
+				sampleBound = cand
+			}
+		case json.Number:
+			if _, err := fv.Int64(); err != nil {
+				sampleBound = cand
+			}
 		}
 	}
 
@@ -1668,16 +1812,17 @@ func (t *Transpiler) appendAggBranches(
 		}
 		spec := aggs[name]
 		switch {
-		case spec.Terms != nil:
-			size := t.capBucketSize(spec.Terms.Size)
-			if spec.Terms.Order != nil || spec.Terms.Include != nil || spec.Terms.Exclude != nil {
-				size = t.capBucketSize(t.Opts.MaxAggBuckets)
+		case spec.EffectiveTerms() != nil:
+			termsSpec := spec.EffectiveTerms()
+			size := t.capBucketSize(termsSpec.Size)
+			if termsSpec.Order != nil || termsSpec.Include != nil || termsSpec.Exclude != nil {
+				size = t.maxAggBuckets()
 			}
-			b := t.Schema.ResolveField(spec.Terms.Field)
+			b := t.Schema.ResolveField(termsSpec.Field)
 			*subIdx++
 			if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
-				if spec.Terms.Missing != nil {
-					missingLit := quoteStr(fmt.Sprintf("%v", spec.Terms.Missing))
+				if termsSpec.Missing != nil {
+					missingLit := quoteStr(fmt.Sprintf("%v", termsSpec.Missing))
 					coalescedElem := fmt.Sprintf("COALESCE(CAST(`_elem` AS STRING), %s)", missingLit)
 					explodeFrom := fmt.Sprintf("`base_matched` LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) `_t` AS `_elem`", b.ColumnName, b.ColumnName, b.ColumnName)
 					wCond := ""
@@ -1716,9 +1861,9 @@ func (t *Transpiler) appendAggBranches(
 					}
 				}
 			} else {
-				col := t.sqlColumnRef(spec.Terms.Field, true, nil)
-				if spec.Terms.Missing != nil {
-					missingLit := quoteStr(fmt.Sprintf("%v", spec.Terms.Missing))
+				col := t.sqlColumnRef(termsSpec.Field, true, nil)
+				if termsSpec.Missing != nil {
+					missingLit := quoteStr(fmt.Sprintf("%v", termsSpec.Missing))
 					coalescedCol := fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", col, missingLit)
 					wCond := ""
 					if extraWhere != "" {
@@ -1780,15 +1925,16 @@ func (t *Transpiler) appendAggBranches(
 				subSpec := subAggs[subName]
 				subFull := fullAggName + "." + subName
 				switch {
-				case subSpec.Terms != nil:
-					size := t.capBucketSize(subSpec.Terms.Size)
-					if subSpec.Terms.Order != nil || subSpec.Terms.Include != nil || subSpec.Terms.Exclude != nil {
-						size = t.capBucketSize(t.Opts.MaxAggBuckets)
+				case subSpec.EffectiveTerms() != nil:
+					subTerms := subSpec.EffectiveTerms()
+					size := t.capBucketSize(subTerms.Size)
+					if subTerms.Order != nil || subTerms.Include != nil || subTerms.Exclude != nil {
+						size = t.maxAggBuckets()
 					}
-					relJSONPath := nestedRelJSON(subSpec.Terms.Field)
+					relJSONPath := nestedRelJSON(subTerms.Field)
 					*subIdx++
-					if subSpec.Terms.Missing != nil {
-						missingLit := quoteStr(fmt.Sprintf("%v", subSpec.Terms.Missing))
+					if subTerms.Missing != nil {
+						missingLit := quoteStr(fmt.Sprintf("%v", subTerms.Missing))
 						wCond := ""
 						if extraWhere != "" {
 							wCond = "WHERE " + extraWhere + " "
@@ -2010,8 +2156,12 @@ func (t *Transpiler) appendAggBranches(
 
 		case spec.DateHistogram != nil:
 			intervalMs := spec.DateHistogram.EffectiveIntervalMs()
+			tzShiftMs := spec.DateHistogram.EffectiveTimeZoneOffsetMs() - spec.DateHistogram.EffectiveOffsetMs()
 			col := t.sqlNumericColumnRef(spec.DateHistogram.Field, nil)
 			bucketExpr := fmt.Sprintf("CAST(CAST(FLOOR(%s / %d) * %d AS BIGINT) AS STRING)", col, intervalMs, intervalMs)
+			if tzShiftMs != 0 {
+				bucketExpr = fmt.Sprintf("CAST(CAST(FLOOR((%s + %d) / %d) * %d - %d AS BIGINT) AS STRING)", col, tzShiftMs, intervalMs, intervalMs, tzShiftMs)
+			}
 			*subIdx++
 			*branches = append(*branches, fmt.Sprintf(
 				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
@@ -2117,9 +2267,15 @@ func (t *Transpiler) appendAggBranches(
 						notNullConds = append(notNullConds, fmt.Sprintf("%s IS NOT NULL", col))
 						srcNames = append(srcNames, sk)
 					case srcSpec.DateHistogram != nil:
+						hasHistogramSrc = true
 						intervalMs := srcSpec.DateHistogram.EffectiveIntervalMs()
+						tzShiftMs := srcSpec.DateHistogram.EffectiveTimeZoneOffsetMs() - srcSpec.DateHistogram.EffectiveOffsetMs()
 						col := t.sqlNumericColumnRef(srcSpec.DateHistogram.Field, nil)
-						colExprs = append(colExprs, fmt.Sprintf("CAST(CAST(FLOOR(%s / %d) * %d AS BIGINT) AS STRING)", col, intervalMs, intervalMs))
+						if tzShiftMs != 0 {
+							colExprs = append(colExprs, fmt.Sprintf("CAST(CAST(FLOOR((%s + %d) / %d) * %d - %d AS BIGINT) AS STRING)", col, tzShiftMs, intervalMs, intervalMs, tzShiftMs))
+						} else {
+							colExprs = append(colExprs, fmt.Sprintf("CAST(CAST(FLOOR(%s / %d) * %d AS BIGINT) AS STRING)", col, intervalMs, intervalMs))
+						}
 						notNullConds = append(notNullConds, fmt.Sprintf("%s IS NOT NULL", col))
 						srcNames = append(srcNames, sk)
 					case srcSpec.Histogram != nil:
@@ -2148,7 +2304,11 @@ func (t *Transpiler) appendAggBranches(
 					var afterParts []string
 					for _, sn := range srcNames {
 						if av, ok := spec.Composite.After[sn]; ok && av != nil {
-							afterParts = append(afterParts, fmt.Sprintf("%v", av))
+							if fv, ok := av.(float64); ok && fv == math.Trunc(fv) {
+								afterParts = append(afterParts, strconv.FormatInt(int64(fv), 10))
+							} else {
+								afterParts = append(afterParts, fmt.Sprintf("%v", av))
+							}
 						} else {
 							afterParts = append(afterParts, "")
 						}
@@ -2177,14 +2337,18 @@ func (t *Transpiler) appendAggBranches(
 	}
 }
 
+func (t *Transpiler) maxAggBuckets() int {
+	if t.Opts.MaxAggBuckets > 0 {
+		return t.Opts.MaxAggBuckets
+	}
+	return DefaultMaxAggBuckets
+}
+
 func (t *Transpiler) capBucketSize(size int) int {
 	if size <= 0 {
 		return 10
 	}
-	maxBuckets := t.Opts.MaxAggBuckets
-	if maxBuckets <= 0 {
-		maxBuckets = DefaultMaxAggBuckets
-	}
+	maxBuckets := t.maxAggBuckets()
 	if size > maxBuckets {
 		return maxBuckets
 	}
@@ -2300,9 +2464,13 @@ func (t *Transpiler) appendGroupedBucketSubAggs(
 					quoteStr(subFull), parentBucketExpr, col, fromClause, whereClause,
 				))
 			}
-		case subSpec.Terms != nil:
-			b := t.Schema.ResolveField(subSpec.Terms.Field)
-			effSubSize := t.capBucketSize(subSpec.Terms.Size)
+		case subSpec.EffectiveTerms() != nil:
+			subTerms := subSpec.EffectiveTerms()
+			b := t.Schema.ResolveField(subTerms.Field)
+			effSubSize := t.capBucketSize(subTerms.Size)
+			if subTerms.Order != nil || subTerms.Include != nil || subTerms.Exclude != nil {
+				effSubSize = t.maxAggBuckets()
+			}
 			subLimit := t.capBucketSize(effSubSize * 100)
 			*subIdx++
 			if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
@@ -2316,7 +2484,7 @@ func (t *Transpiler) appendGroupedBucketSubAggs(
 					quoteStr(subFull), parentBucketExpr, subFrom, whereClause, subLimit, *subIdx,
 				))
 			} else {
-				col := t.sqlColumnRef(subSpec.Terms.Field, true, nil)
+				col := t.sqlColumnRef(subTerms.Field, true, nil)
 				*branches = append(*branches, fmt.Sprintf(
 					"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
 						"SELECT %s AS `_agg_name`, CONCAT(%s, '\\x1f', CAST(%s AS STRING)) AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
@@ -2391,7 +2559,7 @@ func (t *Transpiler) appendMetricAggBranch(branches *[]string, fullAggName, sqlF
 	))
 }
 
-func (t *Transpiler) compileTermsSetScriptThreshold(script map[string]any, nctx *nestedCtx) string {
+func (t *Transpiler) compileTermsSetScriptThreshold(script map[string]any, numTerms int, nctx *nestedCtx) string {
 	src, _ := script["source"].(string)
 	if src == "" {
 		src, _ = script["inline"].(string)
@@ -2401,14 +2569,30 @@ func (t *Transpiler) compileTermsSetScriptThreshold(script map[string]any, nctx 
 			src = strings.ReplaceAll(src, "params."+pk, fmt.Sprintf("%v", pv))
 		}
 	}
-	if idx := strings.Index(src, "doc['"); idx >= 0 {
-		rest := src[idx+len("doc['"):]
-		if end := strings.Index(rest, "']"); end > 0 {
-			f := rest[:end]
-			return fmt.Sprintf("COALESCE(%s, 1)", t.sqlNumericColumnRef(f, nctx))
+	if numTerms > 0 {
+		src = strings.ReplaceAll(src, "params.num_terms", strconv.Itoa(numTerms))
+	}
+	for {
+		idx := strings.Index(src, "doc['")
+		if idx < 0 {
+			break
 		}
+		rest := src[idx+len("doc['"):]
+		end := strings.Index(rest, "']")
+		if end <= 0 {
+			break
+		}
+		f := rest[:end]
+		colExpr := fmt.Sprintf("COALESCE(%s, 1)", t.sqlNumericColumnRef(f, nctx))
+		afterDoc := strings.TrimPrefix(rest[end+len("']"):], ".value")
+		src = src[:idx] + colExpr + afterDoc
 	}
 	cleaned := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(src), "return")), ";"))
+	cleaned = strings.ReplaceAll(cleaned, "Math.min(", "LEAST(")
+	cleaned = strings.ReplaceAll(cleaned, "Math.max(", "GREATEST(")
+	if strings.HasPrefix(cleaned, "LEAST(") || strings.HasPrefix(cleaned, "GREATEST(") || strings.HasPrefix(cleaned, "COALESCE(") {
+		return cleaned
+	}
 	if n, err := strconv.Atoi(cleaned); err == nil && n > 0 {
 		return strconv.Itoa(n)
 	}

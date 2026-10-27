@@ -66,9 +66,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/checksums.txt \
-            --title "${GITHUB_REF_NAME}" \
-            --generate-notes
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" dist/*.tar.gz dist/checksums.txt --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/checksums.txt \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi
 
       - name: Build & Push GHCR Container Image (on tag push)
         if: startsWith(github.ref, 'refs/tags/v')

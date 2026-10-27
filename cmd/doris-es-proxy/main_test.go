@@ -212,4 +212,29 @@ func TestSubcommands_Transpile_DDL_Doctor_MigrateSchema(t *testing.T) {
 		!strings.Contains(migOut, "CREATE TABLE IF NOT EXISTS `es_migrated`.`orders_idx`") {
 		t.Fatalf("unexpected migrate-schema output:\n%s", migOut)
 	}
+
+	// 5b. migrate-schema with --out-dir, --es-api-key, --es-user/--es-password, and --es-insecure-skip-verify
+	outDir := filepath.Join(tmpDir, "ddl_out")
+	runMigrateSchemaSubcommand([]string{
+		"--es-url", esServer.URL,
+		"--index", "_all",
+		"--db", "es_migrated",
+		"--out-dir", outDir,
+		"--es-api-key", "test-api-key",
+		"--es-insecure-skip-verify",
+	})
+	if _, err := os.Stat(filepath.Join(outDir, "00_create_database.sql")); err != nil {
+		t.Fatalf("expected 00_create_database.sql in --out-dir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outDir, "orders_idx.sql")); err != nil {
+		t.Fatalf("expected orders_idx.sql in --out-dir: %v", err)
+	}
+	runMigrateSchemaSubcommand([]string{
+		"--es-url", esServer.URL,
+		"--index", "_all",
+		"--db", "es_migrated",
+		"--out-dir", outDir,
+		"--es-user", "elastic",
+		"--es-password", "changeme",
+	})
 }

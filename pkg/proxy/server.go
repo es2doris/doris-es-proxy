@@ -23,6 +23,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -181,6 +182,11 @@ func (s *Server) SetBulkCoalesce(window time.Duration, maxBytes int) {
 // SetQueryCacheTTL configures the bounded search response cache TTL (`<= 0` disables caching).
 func (s *Server) SetQueryCacheTTL(ttl time.Duration, maxEntries int) {
 	s.queryCache.Configure(ttl, maxEntries)
+}
+
+// SetMaxRequestBodyBytes configures the maximum HTTP request body size in bytes (`<= 0` uses DefaultMaxRequestBodyBytes).
+func (s *Server) SetMaxRequestBodyBytes(maxBytes int64) {
+	s.maxBodyBytes = maxBytes
 }
 
 func (s *Server) streamLoad(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
@@ -772,12 +778,16 @@ func (s *Server) handleSecurityAuthenticate(w http.ResponseWriter, r *http.Reque
 	s.authMu.RUnlock()
 
 	username := "elastic"
-	if basicUser != "" && basicPass != "" {
-		if u, p, ok := r.BasicAuth(); ok && constantTimeEquals(u, basicUser) && constantTimeEquals(p, basicPass) {
-			username = basicUser
-		} else {
-			username = basicUser
+	if u, _, ok := r.BasicAuth(); ok && u != "" {
+		username = u
+	} else if authHdr := strings.TrimSpace(r.Header.Get("Authorization")); len(authHdr) > 7 && strings.EqualFold(authHdr[:7], "ApiKey ") {
+		if decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(authHdr[7:])); err == nil {
+			if parts := strings.SplitN(string(decoded), ":", 2); len(parts) == 2 && parts[0] != "" {
+				username = parts[0]
+			}
 		}
+	} else if basicUser != "" && basicPass != "" {
+		username = basicUser
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"username":  username,
@@ -787,6 +797,23 @@ func (s *Server) handleSecurityAuthenticate(w http.ResponseWriter, r *http.Reque
 		"metadata":  map[string]any{},
 		"enabled":   true,
 	})
+}
+
+func readRequestBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	if r == nil || r.Body == nil || r.Body == http.NoBody {
+		return nil, true
+	}
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeESError(w, http.StatusRequestEntityTooLarge, "circuit_breaking_exception", "request body exceeded max allowed size: "+err.Error())
+			return nil, false
+		}
+		writeESError(w, http.StatusBadRequest, "parsing_exception", "failed to read request body: "+err.Error())
+		return nil, false
+	}
+	return bodyBytes, true
 }
 
 func (s *Server) handleClusterState(w http.ResponseWriter, r *http.Request) {
@@ -1065,13 +1092,14 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPut, http.MethodPost:
 			var comp map[string]any
-			if r.Body != nil {
-				bodyBytes, _ := io.ReadAll(r.Body)
-				if len(bytes.TrimSpace(bodyBytes)) > 0 {
-					if err := json.Unmarshal(bodyBytes, &comp); err != nil {
-						writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
-						return
-					}
+			bodyBytes, ok := readRequestBody(w, r)
+			if !ok {
+				return
+			}
+			if len(bytes.TrimSpace(bodyBytes)) > 0 {
+				if err := json.Unmarshal(bodyBytes, &comp); err != nil {
+					writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+					return
 				}
 			}
 			if comp == nil {
@@ -1117,13 +1145,14 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPut, http.MethodPost:
 		var tpl esast.IndexTemplateRequest
-		if r.Body != nil {
-			bodyBytes, _ := io.ReadAll(r.Body)
-			if len(bytes.TrimSpace(bodyBytes)) > 0 {
-				if err := json.Unmarshal(bodyBytes, &tpl); err != nil {
-					writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
-					return
-				}
+		bodyBytes, ok := readRequestBody(w, r)
+		if !ok {
+			return
+		}
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &tpl); err != nil {
+				writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+				return
 			}
 		}
 		s.mu.Lock()
@@ -1209,13 +1238,14 @@ func (s *Server) matchingTemplateMappingsLocked(indexName string) *esast.Mapping
 func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 	indexName := r.PathValue("index")
 	var req esast.IndexCreateRequest
-	if r.Body != nil {
-		bodyBytes, _ := io.ReadAll(r.Body)
-		if len(bytes.TrimSpace(bodyBytes)) > 0 {
-			if err := json.Unmarshal(bodyBytes, &req); err != nil {
-				writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
-				return
-			}
+	bodyBytes, ok := readRequestBody(w, r)
+	if !ok {
+		return
+	}
+	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		if err := json.Unmarshal(bodyBytes, &req); err != nil {
+			writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+			return
 		}
 	}
 
@@ -1837,8 +1867,10 @@ func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request) {
 	}
 	filteredSrc := filterSourceJSON(hit.Source, urlSF)
 	if opts, ok := extractESResponseFormatOptions(w); ok && (opts.pretty || len(opts.filterPaths) > 0) {
+		dec := json.NewDecoder(bytes.NewReader(filteredSrc))
+		dec.UseNumber()
 		var doc any
-		if err := json.Unmarshal(filteredSrc, &doc); err == nil {
+		if err := dec.Decode(&doc); err == nil {
 			writeJSON(w, http.StatusOK, doc)
 			return
 		}
@@ -2072,13 +2104,14 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 		Query   *esast.Query         `json:"query,omitempty"`
 		Script  *painless.ScriptSpec `json:"script,omitempty"`
 	}
-	if r.Body != nil {
-		bodyBytes, _ := io.ReadAll(r.Body)
-		if len(bytes.TrimSpace(bodyBytes)) > 0 {
-			if err := json.Unmarshal(bodyBytes, &body); err != nil {
-				writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
-				return
-			}
+	bodyBytes, ok := readRequestBody(w, r)
+	if !ok {
+		return
+	}
+	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+			return
 		}
 	}
 
@@ -2205,13 +2238,14 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 		MaxDocs *int         `json:"max_docs,omitempty"`
 		Query   *esast.Query `json:"query,omitempty"`
 	}
-	if r.Body != nil {
-		bodyBytes, _ := io.ReadAll(r.Body)
-		if len(bytes.TrimSpace(bodyBytes)) > 0 {
-			if err := json.Unmarshal(bodyBytes, &body); err != nil {
-				writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
-				return
-			}
+	bodyBytes, ok := readRequestBody(w, r)
+	if !ok {
+		return
+	}
+	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+			return
 		}
 	}
 
@@ -2310,6 +2344,11 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 	defaultIndex := s.resolveIndexName(r.PathValue("index"))
 	ops, err := esast.ParseBulkNDJSON(r.Body, defaultIndex)
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeESError(w, http.StatusRequestEntityTooLarge, "circuit_breaking_exception", "bulk request body exceeded max allowed size: "+err.Error())
+			return
+		}
 		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", err.Error())
 		return
 	}
@@ -2552,14 +2591,14 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	var req esast.SearchRequest
-	var bodyBytes []byte
-	if r.Body != nil {
-		bodyBytes, _ = io.ReadAll(r.Body)
-		if len(bytes.TrimSpace(bodyBytes)) > 0 {
-			if err := json.Unmarshal(bodyBytes, &req); err != nil {
-				writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
-				return
-			}
+	bodyBytes, ok := readRequestBody(w, r)
+	if !ok {
+		return
+	}
+	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		if err := json.Unmarshal(bodyBytes, &req); err != nil {
+			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+			return
 		}
 	}
 	applyURISearchParams(r, &req)
@@ -2618,13 +2657,14 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDorisExplain(w http.ResponseWriter, r *http.Request) {
 	var req esast.SearchRequest
-	if r.Body != nil {
-		bodyBytes, _ := io.ReadAll(r.Body)
-		if len(bytes.TrimSpace(bodyBytes)) > 0 {
-			if err := json.Unmarshal(bodyBytes, &req); err != nil {
-				writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
-				return
-			}
+	bodyBytes, ok := readRequestBody(w, r)
+	if !ok {
+		return
+	}
+	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		if err := json.Unmarshal(bodyBytes, &req); err != nil {
+			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+			return
 		}
 	}
 	applyURISearchParams(r, &req)
@@ -2714,18 +2754,19 @@ func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 	if fieldsFilter := r.URL.Query().Get("fields"); fieldsFilter != "" {
 		filterPatterns = append(filterPatterns, strings.Split(fieldsFilter, ",")...)
 	}
-	if r.Body != nil {
-		bodyBytes, _ := io.ReadAll(r.Body)
-		if len(bytes.TrimSpace(bodyBytes)) > 0 {
-			var body struct {
-				Fields []string `json:"fields"`
-			}
-			if err := json.Unmarshal(bodyBytes, &body); err == nil && len(body.Fields) > 0 {
-				if len(filterPatterns) == 1 && filterPatterns[0] == "*" {
-					filterPatterns = body.Fields
-				} else {
-					filterPatterns = append(filterPatterns, body.Fields...)
-				}
+	bodyBytes, ok := readRequestBody(w, r)
+	if !ok {
+		return
+	}
+	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		var body struct {
+			Fields []string `json:"fields"`
+		}
+		if err := json.Unmarshal(bodyBytes, &body); err == nil && len(body.Fields) > 0 {
+			if len(filterPatterns) == 1 && filterPatterns[0] == "*" {
+				filterPatterns = body.Fields
+			} else {
+				filterPatterns = append(filterPatterns, body.Fields...)
 			}
 		}
 	}
@@ -2821,8 +2862,9 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var hdr struct {
-			Index   any `json:"index"`
-			Indices any `json:"indices"`
+			Index      any    `json:"index"`
+			Indices    any    `json:"indices"`
+			FilterPath string `json:"filter_path"`
 		}
 		_ = json.Unmarshal(headerLine, &hdr)
 		targetIdx := defaultIndex
@@ -2864,7 +2906,27 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 			})
 			continue
 		}
+		if fp := strings.TrimSpace(hdr.FilterPath); fp != "" {
+			var subPaths []string
+			for _, p := range strings.Split(fp, ",") {
+				if p = strings.TrimSpace(p); p != "" {
+					subPaths = append(subPaths, p)
+				}
+			}
+			if filtered, ok := applyESFilterPath(resp, subPaths).(map[string]any); ok {
+				resp = filtered
+			}
+		}
 		responses = append(responses, resp)
+	}
+	if err := scanner.Err(); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeESError(w, http.StatusRequestEntityTooLarge, "circuit_breaking_exception", "msearch request body exceeded max allowed size: "+err.Error())
+			return
+		}
+		writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -2888,8 +2950,13 @@ func (s *Server) executeSearchRequest(
 		targets = []string{s.resolveIndexName(rawIndexPattern)}
 	}
 
-	if req != nil && hasTermsLookupInSearchRequest(req) {
-		req = s.resolveTermsLookupsInSearchRequest(ctx, req)
+	if req != nil {
+		if errMsg := validatePipelineAggs(req.EffectiveAggs()); errMsg != "" {
+			return nil, http.StatusBadRequest, "illegal_argument_exception", errMsg
+		}
+		if hasTermsLookupInSearchRequest(req) {
+			req = s.resolveTermsLookupsInSearchRequest(ctx, req)
+		}
 	}
 
 	if cachedResp, cachedUnindexed, hit := s.queryCache.GetWithMeta(targets, req); hit {
@@ -3297,6 +3364,12 @@ func (s *Server) resolveTermsLookupsInSearchRequest(ctx context.Context, req *es
 	if req == nil {
 		return nil
 	}
+	if raw, err := json.Marshal(req); err == nil {
+		var cloned esast.SearchRequest
+		if err := json.Unmarshal(raw, &cloned); err == nil {
+			req = &cloned
+		}
+	}
 	s.resolveTermsLookupsInQuery(ctx, req.Query)
 	s.resolveTermsLookupsInQuery(ctx, req.PostFilter)
 	for i := range req.KNN {
@@ -3580,13 +3653,14 @@ func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, aggs map[string]esas
 
 func (s *Server) handleCount(w http.ResponseWriter, r *http.Request) {
 	var req esast.SearchRequest
-	if r.Body != nil {
-		bodyBytes, _ := io.ReadAll(r.Body)
-		if len(bytes.TrimSpace(bodyBytes)) > 0 {
-			if err := json.Unmarshal(bodyBytes, &req); err != nil {
-				writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
-				return
-			}
+	bodyBytes, ok := readRequestBody(w, r)
+	if !ok {
+		return
+	}
+	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		if err := json.Unmarshal(bodyBytes, &req); err != nil {
+			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+			return
 		}
 	}
 	applyURISearchParams(r, &req)
@@ -3798,14 +3872,27 @@ func buildAggsMap(
 		}
 		rows := bucketsByAgg[fullKey]
 		switch {
-		case spec.Terms != nil:
-			rows = filterAndSortTermsRows(rows, spec.Terms, fullKey, "", bucketsByAgg)
+		case spec.EffectiveTerms() != nil:
+			termsSpec := spec.EffectiveTerms()
+			isSig := spec.IsSignificantTerms()
+			rows = filterAndSortTermsRows(rows, termsSpec, fullKey, "", bucketsByAgg)
 			b := make([]map[string]any, 0, len(rows))
 			subAggs := spec.SubAggs()
+			bgDenom := float64(totalHits)
+			if bgDenom < 1 {
+				bgDenom = 1
+			}
 			for _, r := range rows {
+				docCnt := r.effectiveCount()
 				bucketMap := map[string]any{
 					"key":       r.BucketKey,
-					"doc_count": r.effectiveCount(),
+					"doc_count": docCnt,
+				}
+				if isSig {
+					fgProb := float64(docCnt) / bgDenom
+					score := math.Round(fgProb*float64(docCnt)*10000) / 10000
+					bucketMap["score"] = score
+					bucketMap["bg_count"] = docCnt
 				}
 				if len(subAggs) > 0 {
 					attachSubAggsToBucket(indexName, bucketMap, fullKey, r.BucketKey, subAggs, bucketsByAgg, docLookup)
@@ -3815,10 +3902,18 @@ func buildAggsMap(
 			if len(subAggs) > 0 {
 				b = evaluateChildPipelineAggs(b, subAggs)
 			}
-			aggsOut[aggName] = map[string]any{
-				"doc_count_error_upper_bound": 0,
-				"sum_other_doc_count":         0,
-				"buckets":                     b,
+			if isSig {
+				aggsOut[aggName] = map[string]any{
+					"doc_count": totalHits,
+					"bg_count":  totalHits,
+					"buckets":   b,
+				}
+			} else {
+				aggsOut[aggName] = map[string]any{
+					"doc_count_error_upper_bound": 0,
+					"sum_other_doc_count":         0,
+					"buckets":                     b,
+				}
 			}
 		case spec.Nested != nil:
 			nestedObj := map[string]any{"doc_count": totalHits}
@@ -4148,32 +4243,17 @@ func filterAndSortTermsRows(
 		}
 		cpRows = filtered
 	}
-	orderField := "_count"
-	orderDesc := true
-	if spec.Order != nil {
-		switch ov := spec.Order.(type) {
-		case map[string]any:
-			for k, v := range ov {
-				orderField = k
-				orderDesc = !strings.EqualFold(fmt.Sprintf("%v", v), "asc")
-				break
-			}
-		case []any:
-			if len(ov) > 0 {
-				if m, ok := ov[0].(map[string]any); ok {
-					for k, v := range m {
-						orderField = k
-						orderDesc = !strings.EqualFold(fmt.Sprintf("%v", v), "asc")
-						break
-					}
-				}
-			}
-		}
+	type termsOrderCriterion struct {
+		field       string
+		desc        bool
+		metricByKey map[string]float64
 	}
-	if len(cpRows) > 1 {
+	var criteria []termsOrderCriterion
+	addCriterion := func(field string, v any) {
+		desc := !strings.EqualFold(fmt.Sprintf("%v", v), "asc")
 		var metricByKey map[string]float64
-		if orderField != "_count" && orderField != "_key" && orderField != "_term" {
-			subName := orderField
+		if field != "_count" && field != "_key" && field != "_term" {
+			subName := field
 			if dot := strings.IndexByte(subName, '.'); dot > 0 {
 				subName = subName[:dot]
 			}
@@ -4189,35 +4269,59 @@ func filterAndSortTermsRows(
 				metricByKey[k] = sr.effectiveValue()
 			}
 		}
-		sort.SliceStable(cpRows, func(i, j int) bool {
-			switch orderField {
-			case "_key", "_term":
-				if cpRows[i].BucketKey != cpRows[j].BucketKey {
-					if orderDesc {
-						return cpRows[i].BucketKey > cpRows[j].BucketKey
-					}
-					return cpRows[i].BucketKey < cpRows[j].BucketKey
-				}
-				return cpRows[i].effectiveCount() > cpRows[j].effectiveCount()
-			case "_count":
-				ci, cj := cpRows[i].effectiveCount(), cpRows[j].effectiveCount()
-				if ci != cj {
-					if orderDesc {
-						return ci > cj
-					}
-					return ci < cj
-				}
-				return cpRows[i].BucketKey < cpRows[j].BucketKey
-			default:
-				vi, vj := metricByKey[cpRows[i].BucketKey], metricByKey[cpRows[j].BucketKey]
-				if vi != vj {
-					if orderDesc {
-						return vi > vj
-					}
-					return vi < vj
-				}
-				return cpRows[i].BucketKey < cpRows[j].BucketKey
+		criteria = append(criteria, termsOrderCriterion{field: field, desc: desc, metricByKey: metricByKey})
+	}
+	if spec.Order != nil {
+		switch ov := spec.Order.(type) {
+		case map[string]any:
+			for k, v := range ov {
+				addCriterion(k, v)
+				break
 			}
+		case []any:
+			for _, elem := range ov {
+				if m, ok := elem.(map[string]any); ok {
+					for k, v := range m {
+						addCriterion(k, v)
+						break
+					}
+				}
+			}
+		}
+	}
+	if len(criteria) == 0 {
+		criteria = []termsOrderCriterion{{field: "_count", desc: true}}
+	}
+	if len(cpRows) > 1 {
+		sort.SliceStable(cpRows, func(i, j int) bool {
+			for _, c := range criteria {
+				switch c.field {
+				case "_key", "_term":
+					if cpRows[i].BucketKey != cpRows[j].BucketKey {
+						if c.desc {
+							return cpRows[i].BucketKey > cpRows[j].BucketKey
+						}
+						return cpRows[i].BucketKey < cpRows[j].BucketKey
+					}
+				case "_count":
+					ci, cj := cpRows[i].effectiveCount(), cpRows[j].effectiveCount()
+					if ci != cj {
+						if c.desc {
+							return ci > cj
+						}
+						return ci < cj
+					}
+				default:
+					vi, vj := c.metricByKey[cpRows[i].BucketKey], c.metricByKey[cpRows[j].BucketKey]
+					if vi != vj {
+						if c.desc {
+							return vi > vj
+						}
+						return vi < vj
+					}
+				}
+			}
+			return cpRows[i].BucketKey < cpRows[j].BucketKey
 		})
 	}
 	limit := spec.Size
@@ -4261,35 +4365,149 @@ func matchesTermsFilterPrecompiled(key string, filter any, precompiled *regexp.R
 	return false
 }
 
+func validatePipelineAggs(aggs map[string]esast.AggSpec) string {
+	for aggName, spec := range aggs {
+		var pSpec *esast.PipelineAggSpec
+		switch {
+		case spec.AvgBucket != nil:
+			pSpec = spec.AvgBucket
+		case spec.SumBucket != nil:
+			pSpec = spec.SumBucket
+		case spec.MinBucket != nil:
+			pSpec = spec.MinBucket
+		case spec.MaxBucket != nil:
+			pSpec = spec.MaxBucket
+		case spec.StatsBucket != nil:
+			pSpec = spec.StatsBucket
+		}
+		if pSpec != nil {
+			pathStr := pSpec.EffectivePath()
+			if pathStr == "" {
+				return fmt.Sprintf("buckets_path must be provided for pipeline aggregation [%s]", aggName)
+			}
+			firstSeg := strings.Split(strings.Split(pathStr, ">")[0], ".")[0]
+			targetSpec, exists := aggs[firstSeg]
+			if !exists {
+				return fmt.Sprintf("buckets_path [%s] for pipeline aggregation [%s] references non-existent sibling aggregation [%s]", pathStr, aggName, firstSeg)
+			}
+			if !strings.Contains(pathStr, ">") && !strings.Contains(pathStr, ".") {
+				if targetSpec.EffectiveTerms() != nil || targetSpec.Histogram != nil || targetSpec.DateHistogram != nil || targetSpec.Filters != nil || targetSpec.Range != nil || targetSpec.DateRange != nil || targetSpec.Composite != nil {
+					return fmt.Sprintf("buckets_path [%s] for pipeline aggregation [%s] must reference a numeric metric or _count, not a bucket aggregation directly", pathStr, aggName)
+				}
+			}
+		}
+		if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+			if errMsg := validatePipelineAggs(subAggs); errMsg != "" {
+				return errMsg
+			}
+		}
+	}
+	return ""
+}
+
 func evaluateChildPipelineAggs(buckets []map[string]any, subAggs map[string]esast.AggSpec) []map[string]any {
 	if len(buckets) == 0 || len(subAggs) == 0 {
 		return buckets
 	}
-	for subName, spec := range subAggs {
-		if spec.CumulativeSum != nil {
-			pathStr := fmt.Sprintf("%v", spec.CumulativeSum.BucketsPath)
-			var running float64
-			for _, b := range buckets {
-				v, _ := extractBucketMetricByPath(b, pathStr)
-				running += v
-				b[subName] = map[string]any{"value": running}
-			}
-		}
+	subNames := make([]string, 0, len(subAggs))
+	for k := range subAggs {
+		subNames = append(subNames, k)
 	}
-	for subName, spec := range subAggs {
-		if spec.Derivative != nil {
-			pathStr := fmt.Sprintf("%v", spec.Derivative.BucketsPath)
-			var prev float64
-			for idx, b := range buckets {
-				curr, _ := extractBucketMetricByPath(b, pathStr)
-				if idx > 0 {
-					b[subName] = map[string]any{"value": curr - prev}
+	sort.Strings(subNames)
+
+	isChildMetricPipeline := func(spec esast.AggSpec) bool {
+		return spec.CumulativeSum != nil || spec.Derivative != nil || spec.BucketScript != nil
+	}
+	depsForSpec := func(spec esast.AggSpec) []string {
+		switch {
+		case spec.CumulativeSum != nil:
+			return []string{strings.Split(spec.CumulativeSum.EffectivePath(), ".")[0]}
+		case spec.Derivative != nil:
+			return []string{strings.Split(spec.Derivative.EffectivePath(), ".")[0]}
+		case spec.BucketScript != nil:
+			var deps []string
+			for _, p := range spec.BucketScript.BucketsPath {
+				deps = append(deps, strings.Split(p, ".")[0])
+			}
+			return deps
+		}
+		return nil
+	}
+
+	evaluated := make(map[string]bool, len(subNames))
+	for pass := 0; pass <= len(subNames); pass++ {
+		progressed := false
+		for _, subName := range subNames {
+			if evaluated[subName] {
+				continue
+			}
+			spec := subAggs[subName]
+			if !isChildMetricPipeline(spec) {
+				evaluated[subName] = true
+				continue
+			}
+			if pass < len(subNames) {
+				ready := true
+				for _, dep := range depsForSpec(spec) {
+					if depSpec, exists := subAggs[dep]; exists && isChildMetricPipeline(depSpec) && !evaluated[dep] {
+						ready = false
+						break
+					}
 				}
-				prev = curr
+				if !ready {
+					continue
+				}
 			}
+			switch {
+			case spec.CumulativeSum != nil:
+				pathStr := spec.CumulativeSum.EffectivePath()
+				insertZeros := strings.EqualFold(spec.CumulativeSum.GapPolicy, "insert_zeros")
+				var running float64
+				for _, b := range buckets {
+					v, ok := extractBucketMetricByPath(b, pathStr)
+					if !ok && !insertZeros {
+						continue
+					}
+					running += v
+					b[subName] = map[string]any{"value": running}
+				}
+			case spec.Derivative != nil:
+				pathStr := spec.Derivative.EffectivePath()
+				insertZeros := strings.EqualFold(spec.Derivative.GapPolicy, "insert_zeros")
+				var prev float64
+				hasPrev := false
+				for _, b := range buckets {
+					curr, ok := extractBucketMetricByPath(b, pathStr)
+					if !ok {
+						if insertZeros {
+							curr = 0
+						} else {
+							continue
+						}
+					}
+					if hasPrev {
+						b[subName] = map[string]any{"value": curr - prev}
+					}
+					prev = curr
+					hasPrev = true
+				}
+			case spec.BucketScript != nil:
+				for _, b := range buckets {
+					if val, ok := evalBucketScript(b, spec.BucketScript); ok && !math.IsNaN(val) && !math.IsInf(val, 0) {
+						b[subName] = map[string]any{"value": val}
+					}
+				}
+			}
+			evaluated[subName] = true
+			progressed = true
+		}
+		if !progressed {
+			break
 		}
 	}
-	for _, spec := range subAggs {
+
+	for _, subName := range subNames {
+		spec := subAggs[subName]
 		if spec.BucketSelector != nil {
 			filtered := make([]map[string]any, 0, len(buckets))
 			for _, b := range buckets {
@@ -4300,7 +4518,8 @@ func evaluateChildPipelineAggs(buckets []map[string]any, subAggs map[string]esas
 			buckets = filtered
 		}
 	}
-	for _, spec := range subAggs {
+	for _, subName := range subNames {
+		spec := subAggs[subName]
 		if spec.BucketSort != nil {
 			bs := spec.BucketSort
 			if len(bs.Sort) > 0 && len(buckets) > 1 {
@@ -4360,6 +4579,13 @@ func evaluateChildPipelineAggs(buckets []map[string]any, subAggs map[string]esas
 }
 
 func evaluateSiblingPipelineAggs(aggs map[string]esast.AggSpec, aggsOut map[string]any) {
+	// First evaluate any root-level cumulative_sum, derivative, or bucket_script over a sibling bucket agg if present,
+	// then evaluate avg_bucket / sum_bucket / min_bucket / max_bucket / stats_bucket.
+	for aggName, spec := range aggs {
+		if subMap, ok := aggsOut[aggName].(map[string]any); ok && len(spec.SubAggs()) > 0 {
+			evaluateSiblingPipelineAggs(spec.SubAggs(), subMap)
+		}
+	}
 	for aggName, spec := range aggs {
 		var pSpec *esast.PipelineAggSpec
 		var mode string
@@ -4378,8 +4604,8 @@ func evaluateSiblingPipelineAggs(aggs map[string]esast.AggSpec, aggsOut map[stri
 		if pSpec == nil {
 			continue
 		}
-		pathStr := fmt.Sprintf("%v", pSpec.BucketsPath)
-		vals := collectSiblingBucketValues(aggsOut, pathStr)
+		pathStr := pSpec.EffectivePath()
+		vals := collectSiblingBucketValuesWithPolicy(aggsOut, pathStr, pSpec.GapPolicy)
 		var sumVal, minVal, maxVal, avgVal float64
 		for i, v := range vals {
 			sumVal += v
@@ -4414,27 +4640,87 @@ func evaluateSiblingPipelineAggs(aggs map[string]esast.AggSpec, aggsOut map[stri
 	}
 }
 
-func collectSiblingBucketValues(aggsOut map[string]any, bucketsPath string) []float64 {
-	sep := ">"
-	if !strings.Contains(bucketsPath, ">") && strings.Contains(bucketsPath, ".") {
-		sep = "."
+func collectSiblingBucketValuesWithPolicy(aggsOut map[string]any, bucketsPath, gapPolicy string) []float64 {
+	insertZeros := strings.EqualFold(gapPolicy, "insert_zeros")
+	var containerPath []string
+	metricPath := "_count"
+	if strings.Contains(bucketsPath, ">") {
+		segs := strings.Split(bucketsPath, ">")
+		containerPath = segs[:len(segs)-1]
+		if segs[len(segs)-1] != "" {
+			metricPath = segs[len(segs)-1]
+		}
+	} else if strings.Contains(bucketsPath, ".") {
+		parts := strings.SplitN(bucketsPath, ".", 2)
+		containerPath = []string{parts[0]}
+		if len(parts) == 2 && parts[1] != "" {
+			metricPath = parts[1]
+		}
+	} else {
+		containerPath = []string{bucketsPath}
 	}
-	parts := strings.SplitN(bucketsPath, sep, 2)
-	targetAgg, ok := aggsOut[parts[0]].(map[string]any)
+	if len(containerPath) == 0 {
+		return nil
+	}
+	targetAgg, ok := aggsOut[containerPath[0]].(map[string]any)
 	if !ok {
 		return nil
 	}
-	metricPath := "_count"
-	if len(parts) == 2 && parts[1] != "" {
-		metricPath = parts[1]
-	}
 	var out []float64
-	switch rawBuckets := targetAgg["buckets"].(type) {
+	collectValuesFromAggContainer(targetAgg, containerPath[1:], metricPath, insertZeros, &out)
+	return out
+}
+
+func collectValuesFromAggContainer(container map[string]any, remainingPath []string, metricPath string, insertZeros bool, out *[]float64) {
+	if container == nil {
+		return
+	}
+	if len(remainingPath) > 0 {
+		nextSeg := remainingPath[0]
+		rest := remainingPath[1:]
+		if sub, ok := container[nextSeg].(map[string]any); ok {
+			collectValuesFromAggContainer(sub, rest, metricPath, insertZeros, out)
+			return
+		}
+		switch rawBuckets := container["buckets"].(type) {
+		case []map[string]any:
+			for _, b := range rawBuckets {
+				if sub, ok := b[nextSeg].(map[string]any); ok {
+					collectValuesFromAggContainer(sub, rest, metricPath, insertZeros, out)
+				}
+			}
+		case map[string]any:
+			var ks []string
+			for k := range rawBuckets {
+				ks = append(ks, k)
+			}
+			sort.Strings(ks)
+			for _, k := range ks {
+				if b, ok := rawBuckets[k].(map[string]any); ok {
+					if sub, ok := b[nextSeg].(map[string]any); ok {
+						collectValuesFromAggContainer(sub, rest, metricPath, insertZeros, out)
+					}
+				}
+			}
+		}
+		return
+	}
+
+	extractFromBucket := func(b map[string]any) {
+		if dc, hasDC := toFloat64(b["doc_count"]); hasDC && dc == 0 && !insertZeros && metricPath != "_count" && metricPath != "doc_count" {
+			return
+		}
+		if v, ok := extractBucketMetricByPath(b, metricPath); ok {
+			*out = append(*out, v)
+		} else if insertZeros {
+			*out = append(*out, 0)
+		}
+	}
+
+	switch rawBuckets := container["buckets"].(type) {
 	case []map[string]any:
 		for _, b := range rawBuckets {
-			if v, ok := extractBucketMetricByPath(b, metricPath); ok {
-				out = append(out, v)
-			}
+			extractFromBucket(b)
 		}
 	case map[string]any:
 		var ks []string
@@ -4444,13 +4730,12 @@ func collectSiblingBucketValues(aggsOut map[string]any, bucketsPath string) []fl
 		sort.Strings(ks)
 		for _, k := range ks {
 			if b, ok := rawBuckets[k].(map[string]any); ok {
-				if v, ok := extractBucketMetricByPath(b, metricPath); ok {
-					out = append(out, v)
-				}
+				extractFromBucket(b)
 			}
 		}
+	default:
+		extractFromBucket(container)
 	}
-	return out
 }
 
 func extractBucketMetricByPath(b map[string]any, metricPath string) (float64, bool) {
@@ -4491,12 +4776,33 @@ func toFloat64(v any) (float64, bool) {
 	return 0, false
 }
 
-func evalBucketSelector(b map[string]any, spec *esast.BucketSelectorAggSpec) bool {
+func evalBucketScript(b map[string]any, spec *esast.BucketSelectorAggSpec) (float64, bool) {
 	if spec == nil {
-		return true
+		return 0, false
 	}
+	src := extractScriptSourceString(spec.Script)
+	if src == "" {
+		return 0, false
+	}
+	insertZeros := strings.EqualFold(spec.GapPolicy, "insert_zeros")
+	vars := make(map[string]float64, len(spec.BucketsPath))
+	for k, v := range spec.BucketsPath {
+		val, ok := extractBucketMetricByPath(b, v)
+		if !ok {
+			if insertZeros {
+				val = 0
+			} else {
+				return 0, false
+			}
+		}
+		vars[k] = val
+	}
+	return evalBucketArithmeticExpr(src, vars)
+}
+
+func extractScriptSourceString(script any) string {
 	var src string
-	switch sv := spec.Script.(type) {
+	switch sv := script.(type) {
 	case string:
 		src = sv
 	case map[string]any:
@@ -4506,15 +4812,27 @@ func evalBucketSelector(b map[string]any, spec *esast.BucketSelectorAggSpec) boo
 			src = s
 		}
 	}
-	src = strings.TrimSpace(src)
+	return strings.TrimSpace(src)
+}
+
+func evalBucketSelector(b map[string]any, spec *esast.BucketSelectorAggSpec) bool {
+	if spec == nil {
+		return true
+	}
+	src := extractScriptSourceString(spec.Script)
 	if src == "" {
 		return true
 	}
+	insertZeros := strings.EqualFold(spec.GapPolicy, "insert_zeros")
 	vars := make(map[string]float64, len(spec.BucketsPath))
 	for k, v := range spec.BucketsPath {
 		val, ok := extractBucketMetricByPath(b, v)
 		if !ok {
-			return false
+			if insertZeros {
+				val = 0
+			} else {
+				return false
+			}
 		}
 		vars[k] = val
 	}
@@ -4546,12 +4864,10 @@ func evalBucketSelectorExpr(expr string, vars map[string]float64) bool {
 	}
 	for _, op := range []string{">=", "<=", "!=", "==", ">", "<"} {
 		if idx := strings.Index(expr, op); idx > 0 {
-			lhs := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(expr[:idx]), "params."))
-			rhsStr := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(expr[idx+len(op):]), "params."))
-			lVal := vars[lhs]
-			rVal, ok := parseFiniteFloat(rhsStr)
-			if !ok {
-				rVal = vars[rhsStr]
+			lVal, okL := evalBucketArithmeticExpr(expr[:idx], vars)
+			rVal, okR := evalBucketArithmeticExpr(expr[idx+len(op):], vars)
+			if !okL || !okR {
+				return false
 			}
 			switch op {
 			case ">=":
@@ -4572,6 +4888,141 @@ func evalBucketSelectorExpr(expr string, vars map[string]float64) bool {
 	return true
 }
 
+func evalBucketArithmeticExpr(expr string, vars map[string]float64) (float64, bool) {
+	expr = strings.TrimSpace(expr)
+	if strings.HasPrefix(expr, "return ") || strings.HasPrefix(expr, "return\t") || strings.HasPrefix(expr, "return(") {
+		expr = strings.TrimSpace(strings.TrimPrefix(expr, "return"))
+	}
+	expr = strings.TrimSpace(strings.TrimSuffix(expr, ";"))
+	expr = trimOuterParens(expr)
+	if expr == "" {
+		return 0, false
+	}
+	if qIdx := findTopLevelOp(expr, "?"); qIdx > 0 {
+		rest := expr[qIdx+1:]
+		if cIdx := findTopLevelOp(rest, ":"); cIdx > 0 {
+			if evalBucketSelectorExpr(expr[:qIdx], vars) {
+				return evalBucketArithmeticExpr(rest[:cIdx], vars)
+			}
+			return evalBucketArithmeticExpr(rest[cIdx+1:], vars)
+		}
+	}
+	if parts := splitTopLevelBinaryMath(expr, '+'); len(parts) > 1 {
+		sum := 0.0
+		for _, p := range parts {
+			v, ok := evalBucketArithmeticExpr(p, vars)
+			if !ok {
+				return 0, false
+			}
+			sum += v
+		}
+		return sum, true
+	}
+	if parts := splitTopLevelBinaryMath(expr, '-'); len(parts) > 1 {
+		res, ok := evalBucketArithmeticExpr(parts[0], vars)
+		if !ok {
+			return 0, false
+		}
+		for _, p := range parts[1:] {
+			v, okP := evalBucketArithmeticExpr(p, vars)
+			if !okP {
+				return 0, false
+			}
+			res -= v
+		}
+		return res, true
+	}
+	if parts := splitTopLevelBinaryMath(expr, '*'); len(parts) > 1 {
+		prod := 1.0
+		for _, p := range parts {
+			v, ok := evalBucketArithmeticExpr(p, vars)
+			if !ok {
+				return 0, false
+			}
+			prod *= v
+		}
+		return prod, true
+	}
+	if parts := splitTopLevelBinaryMath(expr, '/'); len(parts) >= 2 {
+		res, ok := evalBucketArithmeticExpr(parts[0], vars)
+		if !ok {
+			return 0, false
+		}
+		for _, p := range parts[1:] {
+			denom, okD := evalBucketArithmeticExpr(p, vars)
+			if !okD || denom == 0 {
+				return 0, false
+			}
+			res /= denom
+		}
+		return res, !math.IsNaN(res) && !math.IsInf(res, 0)
+	}
+	for _, fn := range []struct {
+		prefix string
+		name   string
+	}{
+		{"Math.min(", "min"},
+		{"Math.max(", "max"},
+		{"Math.abs(", "abs"},
+		{"Math.round(", "round"},
+		{"Math.floor(", "floor"},
+		{"Math.ceil(", "ceil"},
+	} {
+		if strings.HasPrefix(expr, fn.prefix) && strings.HasSuffix(expr, ")") {
+			inner := expr[len(fn.prefix) : len(expr)-1]
+			args := splitTopLevelArgs(inner)
+			switch fn.name {
+			case "min":
+				if len(args) == 2 {
+					a, okA := evalBucketArithmeticExpr(args[0], vars)
+					b, okB := evalBucketArithmeticExpr(args[1], vars)
+					if okA && okB {
+						return math.Min(a, b), true
+					}
+				}
+			case "max":
+				if len(args) == 2 {
+					a, okA := evalBucketArithmeticExpr(args[0], vars)
+					b, okB := evalBucketArithmeticExpr(args[1], vars)
+					if okA && okB {
+						return math.Max(a, b), true
+					}
+				}
+			case "abs":
+				if v, ok := evalBucketArithmeticExpr(inner, vars); ok {
+					return math.Abs(v), true
+				}
+			case "round":
+				if v, ok := evalBucketArithmeticExpr(inner, vars); ok {
+					return math.Round(v), true
+				}
+			case "floor":
+				if v, ok := evalBucketArithmeticExpr(inner, vars); ok {
+					return math.Floor(v), true
+				}
+			case "ceil":
+				if v, ok := evalBucketArithmeticExpr(inner, vars); ok {
+					return math.Ceil(v), true
+				}
+			}
+			return 0, false
+		}
+	}
+	if strings.HasPrefix(expr, "-") {
+		if v, ok := evalBucketArithmeticExpr(expr[1:], vars); ok {
+			return -v, true
+		}
+	}
+	if f, ok := parseFiniteFloat(expr); ok {
+		return f, true
+	}
+	varKey := strings.TrimPrefix(expr, "params.")
+	if v, exists := vars[varKey]; exists {
+		return v, true
+	}
+	return 0, false
+}
+
 func parseFiniteFloat(s string) (float64, bool) {
 	f, err := strconv.ParseFloat(s, 64)
 	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
@@ -4589,18 +5040,22 @@ func synthesizeDateHistogramBuckets(rows []AggRow, spec *esast.DateHistogramAggS
 		intervalMs = 86400000
 	}
 	nowUTC := time.Now().UTC()
+	tzShiftMs := spec.EffectiveTimeZoneOffsetMs() - spec.EffectiveOffsetMs()
+	floorDateBucket := func(ms int64) int64 {
+		return int64(math.Floor(float64(ms+tzShiftMs)/float64(intervalMs)))*intervalMs - tzShiftMs
+	}
 	var hardMin, hardMax int64
 	hasHardMin, hasHardMax := false, false
 	if spec.HardBounds != nil {
 		if spec.HardBounds.Min != nil {
 			if ms, ok := schema.ParseESDateBoundToEpochMillis(fmt.Sprintf("%v", spec.HardBounds.Min), nowUTC, false); ok {
-				hardMin = (ms / intervalMs) * intervalMs
+				hardMin = floorDateBucket(ms)
 				hasHardMin = true
 			}
 		}
 		if spec.HardBounds.Max != nil {
 			if ms, ok := schema.ParseESDateBoundToEpochMillis(fmt.Sprintf("%v", spec.HardBounds.Max), nowUTC, true); ok {
-				hardMax = (ms / intervalMs) * intervalMs
+				hardMax = floorDateBucket(ms)
 				hasHardMax = true
 			}
 		}
@@ -4641,7 +5096,7 @@ func synthesizeDateHistogramBuckets(rows []AggRow, spec *esast.DateHistogramAggS
 	if spec.ExtendedBounds != nil {
 		if spec.ExtendedBounds.Min != nil {
 			if ms, ok := schema.ParseESDateBoundToEpochMillis(fmt.Sprintf("%v", spec.ExtendedBounds.Min), nowUTC, false); ok {
-				extMin := (ms / intervalMs) * intervalMs
+				extMin := floorDateBucket(ms)
 				if !hasObserved || extMin < minKey {
 					minKey = extMin
 				}
@@ -4649,7 +5104,7 @@ func synthesizeDateHistogramBuckets(rows []AggRow, spec *esast.DateHistogramAggS
 		}
 		if spec.ExtendedBounds.Max != nil {
 			if ms, ok := schema.ParseESDateBoundToEpochMillis(fmt.Sprintf("%v", spec.ExtendedBounds.Max), nowUTC, true); ok {
-				extMax := (ms / intervalMs) * intervalMs
+				extMax := floorDateBucket(ms)
 				if !hasObserved || extMax > maxKey {
 					maxKey = extMax
 					hasObserved = true
@@ -4894,14 +5349,23 @@ func attachSubAggsToBucket(
 			bucketMap[subName] = map[string]any{"value": cnt}
 		case subSpec.Avg != nil || subSpec.Sum != nil || subSpec.Min != nil || subSpec.Max != nil:
 			var val float64
+			found := false
 			for _, r := range subRows {
 				if r.BucketKey == parentBucketKey {
 					val = r.effectiveValue()
+					found = true
 					break
 				}
 			}
+			if !found && (subSpec.Avg != nil || subSpec.Min != nil || subSpec.Max != nil) {
+				if dc, ok := bucketMap["doc_count"].(int64); ok && dc == 0 {
+					bucketMap[subName] = map[string]any{"value": nil}
+					continue
+				}
+			}
 			bucketMap[subName] = map[string]any{"value": val}
-		case subSpec.Terms != nil:
+		case subSpec.EffectiveTerms() != nil:
+			tSpec := subSpec.EffectiveTerms()
 			var matchingRows []AggRow
 			for _, r := range subRows {
 				if childKey, ok := trimSubAggBucketPrefix(r.BucketKey, parentBucketKey); ok {
@@ -4910,7 +5374,7 @@ func attachSubAggsToBucket(
 					matchingRows = append(matchingRows, cp)
 				}
 			}
-			matchingRows = filterAndSortTermsRows(matchingRows, subSpec.Terms, subFullKey, parentBucketKey, bucketsByAgg)
+			matchingRows = filterAndSortTermsRows(matchingRows, tSpec, subFullKey, parentBucketKey, bucketsByAgg)
 			childBuckets := make([]map[string]any, 0, len(matchingRows))
 			for _, r := range matchingRows {
 				childBuckets = append(childBuckets, map[string]any{
@@ -4970,7 +5434,7 @@ func extractHitFieldsMap(h HitRow, hitIdx string, req *esast.SearchRequest, idxS
 			continue
 		}
 		cleanField := strings.TrimSuffix(strings.TrimSuffix(spec.Field, ".keyword"), ".ngram")
-		if strings.Contains(cleanField, "*") {
+		if strings.ContainsAny(cleanField, "*?") {
 			if allLeafScalars == nil {
 				allLeafScalars = make(map[string][]any)
 				collectAllLeafScalarPaths(doc, "", allLeafScalars)
@@ -5274,17 +5738,22 @@ func hasWildcardChildInclude(fullPath string, includes []string) bool {
 			return true
 		}
 		incSegs := strings.Split(inc, ".")
-		if len(incSegs) > len(pathSegs) {
-			matchedPrefix := true
-			for i, ps := range pathSegs {
-				if !matchWildcardPattern(incSegs[i], ps) {
-					matchedPrefix = false
-					break
-				}
+		matchedPrefix := true
+		for i, ps := range pathSegs {
+			if i >= len(incSegs) {
+				matchedPrefix = false
+				break
 			}
-			if matchedPrefix {
+			if strings.Contains(incSegs[i], "*") {
 				return true
 			}
+			if !matchWildcardPattern(incSegs[i], ps) {
+				matchedPrefix = false
+				break
+			}
+		}
+		if matchedPrefix && len(incSegs) > len(pathSegs) {
+			return true
 		}
 	}
 	return false
@@ -5803,13 +6272,13 @@ func matchWildcardPattern(pattern, target string) bool {
 	if pattern == "*" || pattern == "_all" {
 		return true
 	}
-	if !strings.Contains(pattern, "*") {
+	if !strings.ContainsAny(pattern, "*?") {
 		return pattern == target
 	}
 	pIdx, tIdx := 0, 0
 	starIdx, matchIdx := -1, 0
 	for tIdx < len(target) {
-		if pIdx < len(pattern) && pattern[pIdx] == target[tIdx] {
+		if pIdx < len(pattern) && (pattern[pIdx] == target[tIdx] || pattern[pIdx] == '?') {
 			pIdx++
 			tIdx++
 		} else if pIdx < len(pattern) && pattern[pIdx] == '*' {

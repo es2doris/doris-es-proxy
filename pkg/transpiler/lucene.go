@@ -75,7 +75,28 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 	parsedAST := parseSimpleLuceneToAST(raw, defaultField, expandedFields, defaultOp)
 	compiled := t.CompileQuery(&parsedAST, scoring, nctx)
 	if t.Opts.UseDoris4SearchFunc && nctx == nil {
-		if defaultField == "_all_text" || (t.Schema != nil && t.Schema.ResolveField(defaultField).Kind != schema.StorageDynamicVariant) {
+		if len(expandedFields) > 1 {
+			var searchPreds []string
+			for _, ef := range expandedFields {
+				fname := strings.Split(ef, "^")[0]
+				if fname == "_all_text" || (t.Schema != nil && t.Schema.ResolveField(fname).Kind != schema.StorageDynamicVariant) {
+					col := strings.Trim(t.sqlColumnRef(fname, false, nctx), "`")
+					searchPreds = append(searchPreds, fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(raw), quoteStr(col), quoteStr(defaultOp)))
+				}
+			}
+			if len(searchPreds) > 0 {
+				pred := strings.Join(searchPreds, " OR ")
+				if len(searchPreds) > 1 {
+					pred = "(" + pred + ")"
+				}
+				return CompiledQuery{
+					WhereSQL:          pred,
+					SafeWhereSQL:      compiled.EffectiveSafeWhere(),
+					ScoreSQL:          compiled.ScoreSQL,
+					UsesFulltextMatch: true,
+				}
+			}
+		} else if defaultField == "_all_text" || (t.Schema != nil && t.Schema.ResolveField(defaultField).Kind != schema.StorageDynamicVariant) {
 			col := strings.Trim(t.sqlColumnRef(defaultField, false, nctx), "`")
 			pred := fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(raw), quoteStr(col), quoteStr(defaultOp))
 			return CompiledQuery{
@@ -217,6 +238,45 @@ func unescapeLuceneToken(s string) string {
 	return sb.String()
 }
 
+func hasUnescapedLuceneWildcard(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' {
+			i++
+			continue
+		}
+		if s[i] == '*' || s[i] == '?' {
+			return true
+		}
+	}
+	return false
+}
+
+func parseLuceneQuotedOrFuzzy(raw string) (clean string, rawWildcard string, isQuoted bool, slop int) {
+	s := strings.TrimSpace(raw)
+	if strings.HasPrefix(s, `"`) && len(s) >= 2 {
+		if strings.HasSuffix(s, `"`) {
+			inner := s[1 : len(s)-1]
+			return unescapeLuceneToken(inner), inner, true, 0
+		}
+		if tildeIdx := strings.LastIndex(s, `"~`); tildeIdx > 0 {
+			slopStr := s[tildeIdx+2:]
+			if n, err := strconv.Atoi(slopStr); err == nil && n >= 0 {
+				inner := s[1:tildeIdx]
+				return unescapeLuceneToken(inner), inner, true, n
+			}
+		}
+	}
+	if tildeIdx := strings.LastIndexByte(s, '~'); tildeIdx > 0 && s[tildeIdx-1] != '\\' {
+		suffix := s[tildeIdx+1:]
+		if suffix == "" || strings.EqualFold(suffix, "auto") {
+			s = s[:tildeIdx]
+		} else if _, err := strconv.Atoi(suffix); err == nil {
+			s = s[:tildeIdx]
+		}
+	}
+	return unescapeLuceneToken(s), s, false, 0
+}
+
 func findLuceneFieldColon(s string) int {
 	if len(s) == 0 || s[0] == '"' || s[0] == '(' || s[0] == '[' || s[0] == '{' || s[0] == '/' {
 		return -1
@@ -337,9 +397,8 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 			}
 			return inner
 		}
-		isQuoted := strings.HasPrefix(val, `"`) && strings.HasSuffix(val, `"`) && len(val) >= 2
-		val = unescapeLuceneToken(strings.Trim(val, `"`))
-		if strings.EqualFold(val, "true") || strings.EqualFold(val, "false") {
+		val, rawWild, isQuoted, slop := parseLuceneQuotedOrFuzzy(val)
+		if !isQuoted && (strings.EqualFold(val, "true") || strings.EqualFold(val, "false")) {
 			boolVal := strings.EqualFold(val, "true")
 			return esast.Query{
 				Term: map[string]esast.TermEntry{
@@ -347,17 +406,17 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 				},
 			}
 		}
-		if !isQuoted && strings.ContainsAny(val, "*?") {
+		if !isQuoted && hasUnescapedLuceneWildcard(rawWild) {
 			return esast.Query{
 				Wildcard: map[string]esast.WildcardEntry{
-					field: {Value: val, CaseInsensitive: true},
+					field: {Value: rawWild, CaseInsensitive: true, Boost: boost},
 				},
 			}
 		}
-		if isQuoted && strings.Contains(val, " ") {
+		if isQuoted && (strings.Contains(val, " ") || slop > 0) {
 			return esast.Query{
 				MatchPhrase: map[string]esast.PhraseEntry{
-					field: {Query: val, Boost: boost},
+					field: {Query: val, Slop: slop, Boost: boost},
 				},
 			}
 		}
@@ -376,13 +435,12 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 	if strings.HasPrefix(token, "/") && strings.HasSuffix(token, "/") && len(token) > 2 {
 		return esast.Query{
 			Regexp: map[string]esast.RegexpEntry{
-				defaultField: {Value: token[1 : len(token)-1]},
+				defaultField: {Value: token[1 : len(token)-1], Boost: boost},
 			},
 		}
 	}
-	isQuoted := strings.HasPrefix(token, `"`) && strings.HasSuffix(token, `"`) && len(token) >= 2
-	cleanVal := unescapeLuceneToken(strings.Trim(token, `"`))
-	if !isQuoted && strings.ContainsAny(cleanVal, "*?") {
+	cleanVal, rawWild, isQuoted, slop := parseLuceneQuotedOrFuzzy(token)
+	if !isQuoted && hasUnescapedLuceneWildcard(rawWild) {
 		if len(fields) > 0 {
 			var shoulds []esast.Query
 			for _, fpat := range fields {
@@ -390,7 +448,7 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 				if !strings.Contains(fname, "*") {
 					shoulds = append(shoulds, esast.Query{
 						Wildcard: map[string]esast.WildcardEntry{
-							fname: {Value: cleanVal, CaseInsensitive: true},
+							fname: {Value: rawWild, CaseInsensitive: true, Boost: boost},
 						},
 					})
 				}
@@ -401,25 +459,26 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 		}
 		return esast.Query{
 			Wildcard: map[string]esast.WildcardEntry{
-				defaultField: {Value: cleanVal, CaseInsensitive: true},
+				defaultField: {Value: rawWild, CaseInsensitive: true, Boost: boost},
 			},
 		}
 	}
 
-	if isQuoted && strings.Contains(cleanVal, " ") {
+	if isQuoted && (strings.Contains(cleanVal, " ") || slop > 0) {
 		if len(fields) > 0 {
 			return esast.Query{
 				MultiMatch: &esast.MultiMatchQuery{
 					Query:  cleanVal,
 					Fields: fields,
 					Type:   "phrase",
+					Slop:   slop,
 					Boost:  &boost,
 				},
 			}
 		}
 		return esast.Query{
 			MatchPhrase: map[string]esast.PhraseEntry{
-				defaultField: {Query: cleanVal, Boost: boost},
+				defaultField: {Query: cleanVal, Slop: slop, Boost: boost},
 			},
 		}
 	}

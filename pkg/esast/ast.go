@@ -437,10 +437,12 @@ func (f *FuzzyEntry) UnmarshalJSON(data []byte) error {
 
 // CombinedFieldsQuery models an ES 8+ `combined_fields` query.
 type CombinedFieldsQuery struct {
-	Query    any      `json:"query"`
-	Fields   []string `json:"fields,omitempty"`
-	Operator string   `json:"operator,omitempty"`
-	Boost    *float64 `json:"boost,omitempty"`
+	Query              any      `json:"query"`
+	Fields             []string `json:"fields,omitempty"`
+	Operator           string   `json:"operator,omitempty"`
+	MinimumShouldMatch any      `json:"minimum_should_match,omitempty"`
+	ZeroTermsQuery     string   `json:"zero_terms_query,omitempty"`
+	Boost              *float64 `json:"boost,omitempty"`
 }
 
 // ScriptScoreQuery models an ES `script_score` query (`{"script_score": {"query": {...}, "script": {...}}}`).
@@ -561,39 +563,48 @@ func (rc RangeCond) NormalizedBounds() (gt, gte, lt, lte any) {
 }
 
 type PrefixEntry struct {
-	Value           string `json:"value"`
-	CaseInsensitive bool   `json:"case_insensitive,omitempty"`
+	Value           string  `json:"value"`
+	CaseInsensitive bool    `json:"case_insensitive,omitempty"`
+	Boost           float64 `json:"boost,omitempty"`
 }
 
 func (p *PrefixEntry) UnmarshalJSON(data []byte) error {
+	p.Boost = 1.0
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		var full struct {
-			Value           string `json:"value"`
-			CaseInsensitive bool   `json:"case_insensitive"`
+			Value           string   `json:"value"`
+			CaseInsensitive bool     `json:"case_insensitive"`
+			Boost           *float64 `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
 		}
 		p.Value = full.Value
 		p.CaseInsensitive = full.CaseInsensitive
+		if full.Boost != nil {
+			p.Boost = *full.Boost
+		}
 		return nil
 	}
 	return json.Unmarshal(trimmed, &p.Value)
 }
 
 type WildcardEntry struct {
-	Value           string `json:"value"`
-	CaseInsensitive bool   `json:"case_insensitive,omitempty"`
+	Value           string  `json:"value"`
+	CaseInsensitive bool    `json:"case_insensitive,omitempty"`
+	Boost           float64 `json:"boost,omitempty"`
 }
 
 func (w *WildcardEntry) UnmarshalJSON(data []byte) error {
+	w.Boost = 1.0
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		var full struct {
-			Value           string `json:"value"`
-			Wildcard        string `json:"wildcard"`
-			CaseInsensitive bool   `json:"case_insensitive"`
+			Value           string   `json:"value"`
+			Wildcard        string   `json:"wildcard"`
+			CaseInsensitive bool     `json:"case_insensitive"`
+			Boost           *float64 `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
@@ -604,25 +615,37 @@ func (w *WildcardEntry) UnmarshalJSON(data []byte) error {
 			w.Value = full.Wildcard
 		}
 		w.CaseInsensitive = full.CaseInsensitive
+		if full.Boost != nil {
+			w.Boost = *full.Boost
+		}
 		return nil
 	}
 	return json.Unmarshal(trimmed, &w.Value)
 }
 
 type RegexpEntry struct {
-	Value string `json:"value"`
+	Value           string  `json:"value"`
+	CaseInsensitive bool    `json:"case_insensitive,omitempty"`
+	Boost           float64 `json:"boost,omitempty"`
 }
 
 func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
+	r.Boost = 1.0
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		var full struct {
-			Value string `json:"value"`
+			Value           string   `json:"value"`
+			CaseInsensitive bool     `json:"case_insensitive"`
+			Boost           *float64 `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
 		}
 		r.Value = full.Value
+		r.CaseInsensitive = full.CaseInsensitive
+		if full.Boost != nil {
+			r.Boost = *full.Boost
+		}
 		return nil
 	}
 	return json.Unmarshal(trimmed, &r.Value)
@@ -709,12 +732,15 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 }
 
 type MultiMatchQuery struct {
-	Query    any      `json:"query"`
-	Fields   []string `json:"fields,omitempty"`
-	Type     string   `json:"type,omitempty"`
-	Operator string   `json:"operator,omitempty"`
-	Slop     int      `json:"slop,omitempty"`
-	Boost    *float64 `json:"boost,omitempty"`
+	Query              any      `json:"query"`
+	Fields             []string `json:"fields,omitempty"`
+	Type               string   `json:"type,omitempty"`
+	Operator           string   `json:"operator,omitempty"`
+	Slop               int      `json:"slop,omitempty"`
+	MinimumShouldMatch any      `json:"minimum_should_match,omitempty"`
+	TieBreaker         *float64 `json:"tie_breaker,omitempty"`
+	ZeroTermsQuery     string   `json:"zero_terms_query,omitempty"`
+	Boost              *float64 `json:"boost,omitempty"`
 }
 
 type QueryStringQuery struct {
@@ -742,6 +768,7 @@ type FunctionScoreQuery struct {
 	ScoreMode        string                `json:"score_mode,omitempty"`
 	BoostMode        string                `json:"boost_mode,omitempty"`
 	MaxBoost         *float64              `json:"max_boost,omitempty"`
+	MinScore         *float64              `json:"min_score,omitempty"`
 	Boost            *float64              `json:"boost,omitempty"`
 	Weight           *float64              `json:"weight,omitempty"`
 	FieldValueFactor *FieldValueFactorSpec `json:"field_value_factor,omitempty"`
@@ -762,36 +789,55 @@ type FieldValueFactorSpec struct {
 
 // AggSpec represents an Elasticsearch aggregation definition.
 type AggSpec struct {
-	Terms          *TermsAggSpec          `json:"terms,omitempty"`
-	DateHistogram  *DateHistogramAggSpec  `json:"date_histogram,omitempty"`
-	Histogram      *HistogramAggSpec      `json:"histogram,omitempty"`
-	Range          *RangeAggSpec          `json:"range,omitempty"`
-	DateRange      *RangeAggSpec          `json:"date_range,omitempty"`
-	Composite      *CompositeAggSpec      `json:"composite,omitempty"`
-	Filter         *Query                 `json:"filter,omitempty"`
-	Filters        *FiltersAggSpec        `json:"filters,omitempty"`
-	Missing        *ExistsQuery           `json:"missing,omitempty"`
-	Nested         *NestedAggSpec         `json:"nested,omitempty"`
-	Cardinality    *MetricAggSpec         `json:"cardinality,omitempty"`
-	ValueCount     *MetricAggSpec         `json:"value_count,omitempty"`
-	Avg            *MetricAggSpec         `json:"avg,omitempty"`
-	Sum            *MetricAggSpec         `json:"sum,omitempty"`
-	Min            *MetricAggSpec         `json:"min,omitempty"`
-	Max            *MetricAggSpec         `json:"max,omitempty"`
-	Stats          *MetricAggSpec         `json:"stats,omitempty"`
-	Percentiles    *PercentilesAggSpec    `json:"percentiles,omitempty"`
-	TopHits        *TopHitsAggSpec        `json:"top_hits,omitempty"`
-	BucketSort     *BucketSortAggSpec     `json:"bucket_sort,omitempty"`
-	CumulativeSum  *PipelineAggSpec       `json:"cumulative_sum,omitempty"`
-	Derivative     *PipelineAggSpec       `json:"derivative,omitempty"`
-	AvgBucket      *PipelineAggSpec       `json:"avg_bucket,omitempty"`
-	SumBucket      *PipelineAggSpec       `json:"sum_bucket,omitempty"`
-	MinBucket      *PipelineAggSpec       `json:"min_bucket,omitempty"`
-	MaxBucket      *PipelineAggSpec       `json:"max_bucket,omitempty"`
-	StatsBucket    *PipelineAggSpec       `json:"stats_bucket,omitempty"`
-	BucketSelector *BucketSelectorAggSpec `json:"bucket_selector,omitempty"`
-	Aggs           map[string]AggSpec     `json:"aggs,omitempty"`
-	Aggregations   map[string]AggSpec     `json:"aggregations,omitempty"`
+	Terms            *TermsAggSpec          `json:"terms,omitempty"`
+	SignificantTerms *TermsAggSpec          `json:"significant_terms,omitempty"`
+	SignificantText  *TermsAggSpec          `json:"significant_text,omitempty"`
+	DateHistogram    *DateHistogramAggSpec  `json:"date_histogram,omitempty"`
+	Histogram        *HistogramAggSpec      `json:"histogram,omitempty"`
+	Range            *RangeAggSpec          `json:"range,omitempty"`
+	DateRange        *RangeAggSpec          `json:"date_range,omitempty"`
+	Composite        *CompositeAggSpec      `json:"composite,omitempty"`
+	Filter           *Query                 `json:"filter,omitempty"`
+	Filters          *FiltersAggSpec        `json:"filters,omitempty"`
+	Missing          *ExistsQuery           `json:"missing,omitempty"`
+	Nested           *NestedAggSpec         `json:"nested,omitempty"`
+	Cardinality      *MetricAggSpec         `json:"cardinality,omitempty"`
+	ValueCount       *MetricAggSpec         `json:"value_count,omitempty"`
+	Avg              *MetricAggSpec         `json:"avg,omitempty"`
+	Sum              *MetricAggSpec         `json:"sum,omitempty"`
+	Min              *MetricAggSpec         `json:"min,omitempty"`
+	Max              *MetricAggSpec         `json:"max,omitempty"`
+	Stats            *MetricAggSpec         `json:"stats,omitempty"`
+	Percentiles      *PercentilesAggSpec    `json:"percentiles,omitempty"`
+	TopHits          *TopHitsAggSpec        `json:"top_hits,omitempty"`
+	BucketSort       *BucketSortAggSpec     `json:"bucket_sort,omitempty"`
+	CumulativeSum    *PipelineAggSpec       `json:"cumulative_sum,omitempty"`
+	Derivative       *PipelineAggSpec       `json:"derivative,omitempty"`
+	AvgBucket        *PipelineAggSpec       `json:"avg_bucket,omitempty"`
+	SumBucket        *PipelineAggSpec       `json:"sum_bucket,omitempty"`
+	MinBucket        *PipelineAggSpec       `json:"min_bucket,omitempty"`
+	MaxBucket        *PipelineAggSpec       `json:"max_bucket,omitempty"`
+	StatsBucket      *PipelineAggSpec       `json:"stats_bucket,omitempty"`
+	BucketSelector   *BucketSelectorAggSpec `json:"bucket_selector,omitempty"`
+	BucketScript     *BucketSelectorAggSpec `json:"bucket_script,omitempty"`
+	Aggs             map[string]AggSpec     `json:"aggs,omitempty"`
+	Aggregations     map[string]AggSpec     `json:"aggregations,omitempty"`
+}
+
+// EffectiveTerms returns the terms specification for `terms`, `significant_terms`, or `significant_text`.
+func (a *AggSpec) EffectiveTerms() *TermsAggSpec {
+	if a.Terms != nil {
+		return a.Terms
+	}
+	if a.SignificantTerms != nil {
+		return a.SignificantTerms
+	}
+	return a.SignificantText
+}
+
+// IsSignificantTerms reports whether this aggregation is `significant_terms` or `significant_text`.
+func (a *AggSpec) IsSignificantTerms() bool {
+	return a.SignificantTerms != nil || a.SignificantText != nil
 }
 
 // BucketSortAggSpec models a `bucket_sort` pipeline aggregation (`sort`, `from`, `size`).
@@ -819,10 +865,12 @@ func (p *PipelineAggSpec) EffectivePath() string {
 	return fmt.Sprintf("%v", p.BucketsPath)
 }
 
-// BucketSelectorAggSpec models a `bucket_selector` pipeline aggregation.
+// BucketSelectorAggSpec models a `bucket_selector` or `bucket_script` pipeline aggregation.
 type BucketSelectorAggSpec struct {
 	BucketsPath map[string]string `json:"buckets_path,omitempty"`
 	Script      any               `json:"script,omitempty"`
+	GapPolicy   string            `json:"gap_policy,omitempty"`
+	Format      string            `json:"format,omitempty"`
 }
 
 type CompositeAggSpec struct {
@@ -891,9 +939,97 @@ type DateHistogramAggSpec struct {
 	FixedInterval    string               `json:"fixed_interval,omitempty"`
 	Interval         string               `json:"interval,omitempty"`
 	TimeZone         string               `json:"time_zone,omitempty"`
+	Offset           string               `json:"offset,omitempty"`
+	Format           string               `json:"format,omitempty"`
 	MinDocCount      *int                 `json:"min_doc_count,omitempty"`
 	ExtendedBounds   *HistogramBoundsSpec `json:"extended_bounds,omitempty"`
 	HardBounds       *HistogramBoundsSpec `json:"hard_bounds,omitempty"`
+}
+
+// EffectiveOffsetMs parses `offset` (e.g., "+6h", "-30m") into milliseconds.
+func (d *DateHistogramAggSpec) EffectiveOffsetMs() int64 {
+	if d == nil {
+		return 0
+	}
+	return parseSignedDurationMs(strings.TrimSpace(d.Offset))
+}
+
+// EffectiveTimeZoneOffsetMs parses `time_zone` (e.g., "+08:00", "-05:00", "UTC", or IANA zone) into milliseconds.
+func (d *DateHistogramAggSpec) EffectiveTimeZoneOffsetMs() int64 {
+	if d == nil {
+		return 0
+	}
+	return ParseTimeZoneOffsetMs(strings.TrimSpace(d.TimeZone))
+}
+
+// ParseTimeZoneOffsetMs parses an ES time_zone string ("+08:00", "-05:00", "Z", "UTC", or IANA tz) into milliseconds.
+func ParseTimeZoneOffsetMs(tz string) int64 {
+	if tz == "" || tz == "Z" || strings.EqualFold(tz, "UTC") {
+		return 0
+	}
+	if strings.HasPrefix(tz, "+") || strings.HasPrefix(tz, "-") {
+		sign := int64(1)
+		if tz[0] == '-' {
+			sign = -1
+		}
+		rest := tz[1:]
+		if parts := strings.Split(rest, ":"); len(parts) == 2 {
+			h, err1 := strconv.ParseInt(parts[0], 10, 64)
+			m, err2 := strconv.ParseInt(parts[1], 10, 64)
+			if err1 == nil && err2 == nil {
+				return sign * (h*3600 + m*60) * 1000
+			}
+		} else if len(rest) == 4 {
+			h, err1 := strconv.ParseInt(rest[:2], 10, 64)
+			m, err2 := strconv.ParseInt(rest[2:], 10, 64)
+			if err1 == nil && err2 == nil {
+				return sign * (h*3600 + m*60) * 1000
+			}
+		} else if h, err := strconv.ParseInt(rest, 10, 64); err == nil {
+			return sign * h * 3600 * 1000
+		}
+	}
+	if loc, err := time.LoadLocation(tz); err == nil {
+		_, offsetSec := time.Date(2024, 1, 15, 0, 0, 0, 0, loc).Zone()
+		return int64(offsetSec) * 1000
+	}
+	return 0
+}
+
+func parseSignedDurationMs(raw string) int64 {
+	if raw == "" {
+		return 0
+	}
+	sign := int64(1)
+	if strings.HasPrefix(raw, "+") {
+		raw = raw[1:]
+	} else if strings.HasPrefix(raw, "-") {
+		sign = -1
+		raw = raw[1:]
+	}
+	if strings.HasSuffix(raw, "ms") {
+		if n, err := strconv.ParseInt(strings.TrimSuffix(raw, "ms"), 10, 64); err == nil {
+			return sign * n
+		}
+	}
+	if len(raw) >= 2 {
+		unit := raw[len(raw)-1]
+		if n, err := strconv.ParseInt(raw[:len(raw)-1], 10, 64); err == nil {
+			switch unit {
+			case 's':
+				return sign * n * 1000
+			case 'm':
+				return sign * n * 60 * 1000
+			case 'h':
+				return sign * n * 3600 * 1000
+			case 'd':
+				return sign * n * 86400 * 1000
+			case 'w':
+				return sign * n * 7 * 86400 * 1000
+			}
+		}
+	}
+	return 0
 }
 
 // EffectiveIntervalMs parses calendar_interval, fixed_interval, or interval into milliseconds.

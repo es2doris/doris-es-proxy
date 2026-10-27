@@ -420,7 +420,7 @@ var (
 	reAggValueCountScalar    = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_metric' AS `_bucket_key`, CAST\\(COUNT\\((.+?)\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
 	reAggMetric              = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_metric|_stats_[a-z]+)' AS `_bucket_key`, CAST\\(COALESCE\\((AVG|SUM|MIN|MAX|COUNT)\\((.+?)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
 	reAggPercentile          = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(PERCENTILE_APPROX\\((.+?), ([0-9.]+)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
-	reAggDateHist            = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(CAST\\(FLOOR\\((.+?) / (\\d+)\\) \\* \\d+ AS BIGINT\\) AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (?:\\((.+?)\\) AND )?.+? IS NOT NULL GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS BIGINT\\) ASC")
+	reAggDateHist            = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(CAST\\(FLOOR\\((?:\\((.+?) \\+ (-?\\d+)\\)|(.+?)) / (\\d+)\\) \\* \\d+(?: - -?\\d+)? AS BIGINT\\) AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (?:\\((.+?)\\) AND )?.+? IS NOT NULL GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS BIGINT\\) ASC")
 	reAggHist                = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(FLOOR\\(\\((.+?) - ([^)]+)\\) / ([^)]+)\\) \\* [^)]+ \\+ [^)]+ AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (?:\\((.+?)\\) AND )?.+? IS NOT NULL GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS DOUBLE\\) ASC")
 	reAggRange               = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (.+)$")
 	reAggSubMetric           = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\((?:COALESCE\\((AVG|SUM|MIN|MAX)\\((.+?)\\), 0\\)|(COUNT)\\((DISTINCT )?(.+?)\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+?) WHERE (.+) GROUP BY `_bucket_key`$")
@@ -824,7 +824,14 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 	}
 
 	if m := reAggDateHist.FindStringSubmatch(branch); m != nil {
-		aggName, colExpr, intervalStr, extraWhere := m[1], m[2], m[3], m[4]
+		aggName := m[1]
+		colExpr := m[4]
+		var tzShiftMs int64
+		if m[2] != "" {
+			colExpr = m[2]
+			tzShiftMs, _ = strconv.ParseInt(m[3], 10, 64)
+		}
+		intervalStr, extraWhere := m[5], m[6]
 		intervalMs, _ := strconv.ParseInt(intervalStr, 10, 64)
 		if intervalMs <= 0 {
 			intervalMs = 86400000
@@ -836,7 +843,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 			}
 			if val := resolveColumnValue(row, colExpr); val != nil {
 				if ts, ok := toInt64(val); ok {
-					b := (ts / intervalMs) * intervalMs
+					b := int64(math.Floor(float64(ts+tzShiftMs)/float64(intervalMs)))*intervalMs - tzShiftMs
 					counts[b]++
 				}
 			}
@@ -1219,7 +1226,7 @@ func expandFromClauseRows(baseRows []map[string]any, fromClause, whereClause str
 }
 
 var (
-	reBucketDateHist = regexp.MustCompile(`^CAST\(CAST\(FLOOR\((.+?) / (\d+)\) \* \d+ AS BIGINT\) AS STRING\)$`)
+	reBucketDateHist = regexp.MustCompile(`^CAST\(CAST\(FLOOR\((?:\((.+?) \+ (-?\d+)\)|(.+?)) / (\d+)\) \* \d+(?: - -?\d+)? AS BIGINT\) AS STRING\)$`)
 	reBucketHist     = regexp.MustCompile(`^CAST\(FLOOR\(\((.+?) - ([^)]+)\) / ([^)]+)\) \* [^)]+ \+ [^)]+ AS STRING\)$`)
 )
 
@@ -1229,14 +1236,21 @@ func evalBucketKeyExpr(row map[string]any, expr string) string {
 		return unquoteSQLLiteral(expr)
 	}
 	if m := reBucketDateHist.FindStringSubmatch(expr); m != nil {
-		colExpr, intervalStr := m[1], m[2]
+		colExpr := m[3]
+		var tzShiftMs int64
+		if m[1] != "" {
+			colExpr = m[1]
+			tzShiftMs, _ = strconv.ParseInt(m[2], 10, 64)
+		}
+		intervalStr := m[4]
 		intervalMs, _ := strconv.ParseInt(intervalStr, 10, 64)
 		if intervalMs <= 0 {
 			intervalMs = 86400000
 		}
 		if val := resolveColumnValue(row, colExpr); val != nil {
 			if ts, ok := toInt64(val); ok {
-				return strconv.FormatInt((ts/intervalMs)*intervalMs, 10)
+				b := int64(math.Floor(float64(ts+tzShiftMs)/float64(intervalMs)))*intervalMs - tzShiftMs
+				return strconv.FormatInt(b, 10)
 			}
 		}
 		return ""
@@ -1482,7 +1496,7 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 				ci = true
 				rhs = rhs[6 : len(rhs)-1]
 			}
-			if op == ">=" && strings.Contains(lhs, " + ") {
+			if op == ">=" && (strings.Contains(lhs, " + ") || strings.Contains(lhs, "AS INT")) {
 				lhsNum := evalNumericExpr(row, lhs)
 				rhsNum, err := strconv.ParseFloat(rhs, 64)
 				if err != nil {
@@ -1595,12 +1609,12 @@ func evalFulltextMatch(row map[string]any, colExpr, matchOp, queryStr string) bo
 		return false
 	case "MATCH_PHRASE_PREFIX":
 		cleanPhrase := strings.ToLower(strings.TrimSpace(strings.Split(queryStr, "~")[0]))
-		if strings.Contains(combined, cleanPhrase) {
-			return true
-		}
 		phraseTokens := tokenizeWords(cleanPhrase)
 		docTokens := tokenizeWords(combined)
-		if len(phraseTokens) == 0 || len(docTokens) < len(phraseTokens) {
+		if len(phraseTokens) == 0 {
+			return cleanPhrase != "" && strings.Contains(combined, cleanPhrase)
+		}
+		if len(docTokens) < len(phraseTokens) {
 			return false
 		}
 		for i := 0; i <= len(docTokens)-len(phraseTokens); i++ {
@@ -1714,6 +1728,14 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 		return sum
 	}
 
+	if parts := splitTopLevelBinaryMath(expr, '-'); len(parts) > 1 {
+		res := evalNumericExpr(row, parts[0])
+		for _, p := range parts[1:] {
+			res -= evalNumericExpr(row, p)
+		}
+		return res
+	}
+
 	if parts := splitTopLevelBinaryMath(expr, '*'); len(parts) > 1 {
 		prod := 1.0
 		for _, p := range parts {
@@ -1770,7 +1792,7 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 		return 0
 	}
 
-	for _, fn := range []string{"GREATEST", "LEAST", "COALESCE", "LOG10", "LN", "SQRT"} {
+	for _, fn := range []string{"GREATEST", "LEAST", "COALESCE", "LOG10", "LN", "SQRT", "FLOOR", "CEIL", "ROUND", "ABS"} {
 		if strings.HasPrefix(expr, fn+"(") && strings.HasSuffix(expr, ")") {
 			inner := expr[len(fn)+1 : len(expr)-1]
 			args := splitTopLevelArgs(inner)
@@ -1809,6 +1831,14 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 				return math.Log(evalNumericExpr(row, inner))
 			case "SQRT":
 				return math.Sqrt(evalNumericExpr(row, inner))
+			case "FLOOR":
+				return math.Floor(evalNumericExpr(row, inner))
+			case "CEIL":
+				return math.Ceil(evalNumericExpr(row, inner))
+			case "ROUND":
+				return math.Round(evalNumericExpr(row, inner))
+			case "ABS":
+				return math.Abs(evalNumericExpr(row, inner))
 			}
 		}
 	}
@@ -2267,6 +2297,11 @@ func evalLikePattern(val, pat string, caseInsensitive bool) bool {
 
 func toStringSlice(v any) []string {
 	switch s := v.(type) {
+	case string:
+		if s != "" {
+			return []string{s}
+		}
+		return nil
 	case []string:
 		return s
 	case []float64:
