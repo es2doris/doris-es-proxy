@@ -184,6 +184,11 @@ func (s *Server) SetQueryCacheTTL(ttl time.Duration, maxEntries int) {
 	s.queryCache.Configure(ttl, maxEntries)
 }
 
+// SetMaxRequestBodyBytes configures the maximum HTTP request body size in bytes (`<= 0` uses DefaultMaxRequestBodyBytes).
+func (s *Server) SetMaxRequestBodyBytes(maxBytes int64) {
+	s.maxBodyBytes = maxBytes
+}
+
 func (s *Server) streamLoad(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
 	err := s.coalescer.Submit(ctx, table, ndjson, syncRefresh)
 	s.queryCache.InvalidateAll()

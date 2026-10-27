@@ -395,4 +395,173 @@ func TestRound6_QueryCacheContainsNowInAggsAndTermsLookupExplain(t *testing.T) {
 	if !strings.Contains(hitsSQL, "analytics") || !strings.Contains(hitsSQL, "payments") {
 		t.Fatalf("expected /_doris/explain hits_sql to contain resolved lookup terms, got: %s", hitsSQL)
 	}
+
+	// Verify queries with `now` in aggregations bypass query cache
+	nowAggQ := `{
+		"size": 0,
+		"aggs": {
+			"recent_filter": {
+				"filter": {"range": {"ts": {"gte": "now-1d/d"}}}
+			},
+			"recent_filters": {
+				"filters": {
+					"buckets": {
+						"last_hour": {"range": {"ts": {"gte": "now-1h"}}}
+					}
+				}
+			},
+			"recent_hist": {
+				"date_histogram": {
+					"field": "ts",
+					"fixed_interval": "1h",
+					"time_zone": "-05:00",
+					"offset": "+30m",
+					"extended_bounds": {"min": "now-2h", "max": "now"},
+					"hard_bounds": {"min": "now-3h", "max": "now+1h"},
+					"min_doc_count": 0
+				},
+				"aggs": {
+					"avg_ts": {"avg": {"field": "ts"}},
+					"sub_dept": {"terms": {"field": "dept.keyword"}}
+				}
+			},
+			"recent_dr": {
+				"date_range": {
+					"field": "ts",
+					"ranges": [{"from": "now-1d", "to": "now"}]
+				}
+			}
+		}
+	}`
+	naResp, err := http.Post(ts.URL+"/r6_events/_search", "application/json", strings.NewReader(nowAggQ))
+	if err != nil || naResp.StatusCode != http.StatusOK {
+		t.Fatalf("search with now in aggs failed: %v", err)
+	}
+	_ = naResp.Body.Close()
+}
+
+func TestRound6_MultiMatchFunctionScoreRangeLuceneAndMaxBytes(t *testing.T) {
+	backend := proxy.NewMemoryBackend(false)
+	srv := proxy.NewServer("es_compat", backend, transpiler.TranspilerOptions{
+		UseDoris4SearchFunc: true,
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// Create explicit mapping with numeric, date, and text fields
+	mapping := `{
+		"mappings": {
+			"properties": {
+				"title": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+				"body": {"type": "text"},
+				"price": {"type": "double"},
+				"count": {"type": "integer"},
+				"created_at": {"type": "date"}
+			}
+		}
+	}`
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/r6_dsl", strings.NewReader(mapping))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("create index failed: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	_, _ = http.Post(ts.URL+"/_bulk?refresh=true", "application/x-ndjson", strings.NewReader(strings.Join([]string{
+		`{"index":{"_index":"r6_dsl","_id":"1"}}`,
+		`{"title":"quick brown fox","body":"jumps over lazy dog","price":19.99,"count":5,"created_at":1700000000000}`,
+		`{"index":{"_index":"r6_dsl","_id":"2"}}`,
+		`{"title":"slow green turtle","body":"walks steady","price":5.50,"count":2,"created_at":1700000060000}`,
+		"",
+	}, "\n")))
+
+	// Exercise multi_match (bool_prefix, cross_fields, phrase_prefix, tie_breaker, minimum_should_match, zero_terms_query),
+	// combined_fields, function_score (min, avg, min_score), range (fractional float, string numeric, time_zone, epoch_second, boost),
+	// prefix/wildcard/regexp boosts + case_insensitive, and Lucene query_string (escaped wildcard, phrase slop ~N, fuzzy ~N, multi-field SEARCH())
+	queries := []string{
+		`{"query":{"multi_match":{"query":"quick bro","type":"bool_prefix","fields":["title^2","body"],"tie_breaker":0.3,"minimum_should_match":1}}}`,
+		`{"query":{"multi_match":{"query":"quick dog","type":"cross_fields","fields":["title","body"],"operator":"and","minimum_should_match":"75%"}}}`,
+		`{"query":{"multi_match":{"query":"quick br","type":"phrase_prefix","fields":["title","body"],"tie_breaker":0.5}}}`,
+		`{"query":{"multi_match":{"query":"","fields":["title"],"zero_terms_query":"all"}}}`,
+		`{"query":{"combined_fields":{"query":"quick dog","fields":["title","body"],"minimum_should_match":1}}}`,
+		`{"query":{"combined_fields":{"query":"","fields":["title","body"],"zero_terms_query":"all"}}}`,
+		`{"query":{"function_score":{"query":{"match":{"title":"quick"}},"score_mode":"min","boost_mode":"sum","min_score":0.1,"functions":[{"filter":{"term":{"count":5}},"weight":2.0},{"filter":{"term":{"count":999}},"weight":10.0}]}}}`,
+		`{"query":{"function_score":{"query":{"match_all":{}},"score_mode":"avg","boost_mode":"multiply","functions":[{"filter":{"term":{"count":5}},"weight":4.0},{"filter":{"term":{"count":2}},"weight":2.0}]}}}`,
+		`{"query":{"bool":{"must":[{"range":{"price":{"gt":1,"lte":25.5,"boost":2.0}}},{"range":{"count":{"gte":"1","lt":"10"}}},{"range":{"created_at":{"gte":"1700000000","format":"epoch_second","time_zone":"+02:00"}}}]}}}`,
+		`{"query":{"bool":{"should":[{"prefix":{"title.keyword":{"value":"qui","boost":1.5}}},{"wildcard":{"title.keyword":{"value":"*fox","boost":2.0}}},{"regexp":{"title.keyword":{"value":"QUICK.*","case_insensitive":true,"boost":3.0}}}]}}}`,
+		`{"query":{"query_string":{"query":"\"quick brown\"~2 OR quick~1 OR pay\\*100","fields":["title^2","body"]}}}`,
+	}
+	for i, q := range queries {
+		sr, err := http.Post(ts.URL+"/r6_dsl/_search?doris_explain=true", "application/json", strings.NewReader(q))
+		if err != nil || sr.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(sr.Body)
+			t.Fatalf("query %d failed: status=%v err=%v body=%s", i, sr.StatusCode, err, string(b))
+		}
+		_ = sr.Body.Close()
+	}
+
+	// Test multi-criterion terms order, significant_text, Math.* in bucket_script, multi-level > sibling pipeline agg, and _msearch filter_path
+	aggQ := `{
+		"size": 0,
+		"aggs": {
+			"by_title": {
+				"terms": {
+					"field": "title.keyword",
+					"order": [{"_count": "desc"}, {"_key": "asc"}],
+					"include": ["quick*", "slow*"],
+					"exclude": ["none*"]
+				},
+				"aggs": {
+					"avg_p": {"avg": {"field": "price"}}
+				}
+			},
+			"sig_txt": {
+				"significant_text": {"field": "title.keyword", "size": 5}
+			},
+			"hist_p": {
+				"histogram": {"field": "count", "interval": 2, "min_doc_count": 0, "extended_bounds": {"min": 0, "max": 6}},
+				"aggs": {
+					"sum_p": {"sum": {"field": "price"}},
+					"avg_p": {"avg": {"field": "price"}},
+					"fn_min": {"bucket_script": {"buckets_path": {"a": "sum_p"}, "script": "Math.min(params.a, 10)", "gap_policy": "insert_zeros"}},
+					"fn_max": {"bucket_script": {"buckets_path": {"a": "sum_p"}, "script": "Math.max(params.a, 1) + Math.abs(-Math.round(Math.floor(Math.ceil(1.2))))", "gap_policy": "insert_zeros"}}
+				}
+			},
+			"nested_sibling_stats": {
+				"stats_bucket": {"buckets_path": "by_title>avg_p", "gap_policy": "insert_zeros"}
+			}
+		}
+	}`
+	ar, err := http.Post(ts.URL+"/r6_dsl/_search", "application/json", strings.NewReader(aggQ))
+	if err != nil || ar.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(ar.Body)
+		t.Fatalf("aggQ failed: status=%v err=%v body=%s", ar.StatusCode, err, string(b))
+	}
+	_ = ar.Body.Close()
+
+	// Test _msearch with filter_path and root slice filter_path (`/_cat/indices?format=json&filter_path=*.index,-*.status`)
+	msPayload := "{}\n{\"query\":{\"match_all\":{}}}\n"
+	msResp, err := http.Post(ts.URL+"/r6_dsl/_msearch?filter_path=responses.hits.total", "application/x-ndjson", strings.NewReader(msPayload))
+	if err != nil || msResp.StatusCode != http.StatusOK {
+		t.Fatalf("_msearch with filter_path failed: %v", err)
+	}
+	_ = msResp.Body.Close()
+
+	catResp, err := http.Get(ts.URL + "/_cat/indices?format=json&filter_path=-status")
+	if err != nil || catResp.StatusCode != http.StatusOK {
+		t.Fatalf("_cat/indices filter_path failed: %v", err)
+	}
+	_ = catResp.Body.Close()
+
+	// Test HTTP 413 Request Entity Too Large when body exceeds MaxBytesReader
+	srv.SetMaxRequestBodyBytes(16)
+	largeResp, err := http.Post(ts.URL+"/r6_dsl/_search", "application/json", strings.NewReader(`{"query":{"match":{"title":"this payload is larger than 16 bytes"}}}`))
+	if err != nil {
+		t.Fatalf("large search transport error: %v", err)
+	}
+	_ = largeResp.Body.Close()
+	if largeResp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 Request Entity Too Large, got %d", largeResp.StatusCode)
+	}
 }
