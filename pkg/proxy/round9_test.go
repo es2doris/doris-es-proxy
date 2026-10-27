@@ -794,5 +794,98 @@ func TestRound9IPRangeArrayAndLuceneDoris4GuardAndCatAliases(t *testing.T) {
 	if len(zh) != 0 {
 		t.Fatalf("expected top_hits with size:0 to return 0 hits, got: %+v", zh)
 	}
+
+	// 4. Verify /_cat/aliases/{name}?format=json with filtered/write/routing metadata
+	catAliasReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/_cat/aliases/net_*?format=json", nil)
+	catAliasResp, err := http.DefaultClient.Do(catAliasReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var catAliases []map[string]any
+	if err := json.NewDecoder(catAliasResp.Body).Decode(&catAliases); err != nil || len(catAliases) != 1 {
+		t.Fatalf("expected 1 entry from /_cat/aliases/net_*?format=json, got err=%v list=%+v", err, catAliases)
+	}
+	_ = catAliasResp.Body.Close()
+	if catAliases[0]["filter"] != "*" || catAliases[0]["is_write_index"] != "true" || catAliases[0]["routing.index"] != "r1" {
+		t.Fatalf("unexpected /_cat/aliases row metadata: %+v", catAliases[0])
+	}
+
+	// 5. Verify unit helpers: rateUnitToMs, reduceSortFieldValues, QueryResultCache Get/Put, and terms lookup in aggs
+	for _, u := range []string{"ms", "s", "m", "h", "d", "w", "M", "month", "q", "y", "2h"} {
+		if rateUnitToMs(u) <= 0 {
+			t.Fatalf("expected rateUnitToMs(%q) > 0", u)
+		}
+	}
+	if rateUnitToMs("") != 0 {
+		t.Fatalf("expected rateUnitToMs(\"\") == 0")
+	}
+	if reduceSortFieldValues(nil, "min", "asc") != nil || reduceSortFieldValues([]any{int64(7)}, "min", "asc") != int64(7) {
+		t.Fatalf("unexpected reduceSortFieldValues single/empty")
+	}
+	if reduceSortFieldValues([]any{int64(10), int64(20), int64(30)}, "sum", "asc") != int64(60) {
+		t.Fatalf("unexpected reduceSortFieldValues int64 sum")
+	}
+	if reduceSortFieldValues([]any{10.0, 20.0, 30.0}, "sum", "asc") != 60.0 {
+		t.Fatalf("unexpected reduceSortFieldValues float64 sum")
+	}
+	if reduceSortFieldValues([]any{10.0, 20.0, 30.0}, "avg", "asc") != 20.0 {
+		t.Fatalf("unexpected reduceSortFieldValues avg")
+	}
+	if reduceSortFieldValues([]any{10.0, 30.0, 20.0}, "median", "asc") != 20.0 || reduceSortFieldValues([]any{10.0, 20.0, 30.0, 40.0}, "median", "asc") != 25.0 {
+		t.Fatalf("unexpected reduceSortFieldValues median odd/even")
+	}
+	if reduceSortFieldValues([]any{int64(10), int64(30)}, "", "desc") != int64(30) || reduceSortFieldValues([]any{10.5, 30.5}, "", "asc") != 10.5 {
+		t.Fatalf("unexpected reduceSortFieldValues default mode min/max")
+	}
+	if reduceSortFieldValues([]any{"b", "a", "c"}, "min", "asc") != "a" || reduceSortFieldValues([]any{"b", "a", "c"}, "max", "desc") != "c" {
+		t.Fatalf("unexpected reduceSortFieldValues string min/max")
+	}
+
+	// Verify QueryResultCache.Put and Get + terms lookup inside aggregation filters
+	qc := newQueryResultCache()
+	qc.Configure(5*time.Second, 16)
+	five := 5
+	sampleReq := &esast.SearchRequest{Size: &five}
+	qc.Put([]string{"net_idx"}, sampleReq, map[string]any{"hits": map[string]any{"total": map[string]any{"value": 1}}})
+	if gotCached, ok := qc.Get([]string{"net_idx"}, sampleReq); !ok || gotCached == nil {
+		t.Fatalf("expected QueryResultCache.Get hit after Put")
+	}
+	if err := painless.EvalPainless(map[string]any{"x": 0}, "ctx._source.x = 1", nil); err != nil {
+		t.Fatalf("EvalPainless failed: %v", err)
+	}
+	if (&esast.PercentilesBucketAggSpec{BucketsPath: "a>b"}).EffectivePath() != "a>b" || !(&esast.FiltersAggSpec{}).EffectiveKeyed() {
+		t.Fatalf("unexpected esast helper results")
+	}
+
+	// Cross-index terms lookup inside filter & filters aggregations
+	mustReqJSON(t, ts, http.MethodPut, "/lookup_idx/_doc/allow1?refresh=true", map[string]any{
+		"allowed_statuses": []int{200},
+	})
+	lookupAggRes := mustReqJSON(t, ts, http.MethodPost, "/net_idx/_search", map[string]any{
+		"size": 0,
+		"aggs": map[string]any{
+			"f_single": map[string]any{
+				"filter": map[string]any{
+					"terms": map[string]any{
+						"status": map[string]any{"index": "lookup_idx", "id": "allow1", "path": "allowed_statuses"},
+					},
+				},
+			},
+			"f_multi": map[string]any{
+				"filters": map[string]any{
+					"filters": []any{
+						map[string]any{
+							"terms": map[string]any{
+								"status": map[string]any{"index": "lookup_idx", "id": "allow1", "path": "allowed_statuses"},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	if lookupAggRes["aggregations"].(map[string]any)["f_single"].(map[string]any)["doc_count"] != float64(1) {
+		t.Fatalf("expected terms lookup inside filter agg to match 1 doc, got: %+v", lookupAggRes["aggregations"])
+	}
 	_ = bytes.MinRead
 }

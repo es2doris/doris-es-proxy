@@ -459,7 +459,7 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 
 	r8SearchBody := `{
 		"size": 0,
-		"query": {"term": {"latency_ms": 12}},
+		"query": {"term": {"latency_ms": 42}},
 		"aggs": {
 			"all_global": {
 				"global": {},
@@ -511,7 +511,7 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	_ = r8Resp.Body.Close()
 
 	if r8Res["hits"].(map[string]any)["total"].(map[string]any)["value"] != float64(1) {
-		t.Fatalf("expected filtered alias live_checkout_alias with latency_ms=12 query to match 1 doc on live Doris, got: %+v", r8Res["hits"])
+		t.Fatalf("expected filtered alias live_checkout_alias with latency_ms=42 query to match 1 doc on live Doris, got: %+v", r8Res["hits"])
 	}
 	r8Aggs := r8Res["aggregations"].(map[string]any)
 	allGlobal := r8Aggs["all_global"].(map[string]any)
