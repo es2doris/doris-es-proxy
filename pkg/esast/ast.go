@@ -545,21 +545,30 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		var full struct {
-			Query string   `json:"query"`
+			Query any      `json:"query"`
 			Slop  int      `json:"slop"`
 			Boost *float64 `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
 		}
-		p.Query = full.Query
+		if full.Query != nil {
+			p.Query = fmt.Sprintf("%v", full.Query)
+		}
 		p.Slop = full.Slop
 		if full.Boost != nil {
 			p.Boost = *full.Boost
 		}
 		return nil
 	}
-	return json.Unmarshal(trimmed, &p.Query)
+	var raw any
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if raw != nil {
+		p.Query = fmt.Sprintf("%v", raw)
+	}
+	return nil
 }
 
 type MultiMatchQuery struct {
@@ -690,13 +699,20 @@ type TermsAggSpec struct {
 	Missing any    `json:"missing,omitempty"`
 }
 
+type HistogramBoundsSpec struct {
+	Min any `json:"min,omitempty"`
+	Max any `json:"max,omitempty"`
+}
+
 type DateHistogramAggSpec struct {
-	Field            string `json:"field"`
-	CalendarInterval string `json:"calendar_interval,omitempty"`
-	FixedInterval    string `json:"fixed_interval,omitempty"`
-	Interval         string `json:"interval,omitempty"`
-	TimeZone         string `json:"time_zone,omitempty"`
-	MinDocCount      *int   `json:"min_doc_count,omitempty"`
+	Field            string               `json:"field"`
+	CalendarInterval string               `json:"calendar_interval,omitempty"`
+	FixedInterval    string               `json:"fixed_interval,omitempty"`
+	Interval         string               `json:"interval,omitempty"`
+	TimeZone         string               `json:"time_zone,omitempty"`
+	MinDocCount      *int                 `json:"min_doc_count,omitempty"`
+	ExtendedBounds   *HistogramBoundsSpec `json:"extended_bounds,omitempty"`
+	HardBounds       *HistogramBoundsSpec `json:"hard_bounds,omitempty"`
 }
 
 // EffectiveIntervalMs parses calendar_interval, fixed_interval, or interval into milliseconds.
@@ -756,10 +772,12 @@ func (d *DateHistogramAggSpec) EffectiveIntervalMs() int64 {
 }
 
 type HistogramAggSpec struct {
-	Field       string  `json:"field"`
-	Interval    float64 `json:"interval"`
-	Offset      float64 `json:"offset,omitempty"`
-	MinDocCount *int    `json:"min_doc_count,omitempty"`
+	Field          string               `json:"field"`
+	Interval       float64              `json:"interval"`
+	Offset         float64              `json:"offset,omitempty"`
+	MinDocCount    *int                 `json:"min_doc_count,omitempty"`
+	ExtendedBounds *HistogramBoundsSpec `json:"extended_bounds,omitempty"`
+	HardBounds     *HistogramBoundsSpec `json:"hard_bounds,omitempty"`
 }
 
 type RangeAggSpec struct {
@@ -860,6 +878,9 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 	}
 	for field, rawVal := range m {
 		order := "asc"
+		if field == "_score" {
+			order = "desc"
+		}
 		valTrimmed := bytes.TrimSpace(rawVal)
 		if len(valTrimmed) > 0 && valTrimmed[0] == '"' {
 			_ = json.Unmarshal(valTrimmed, &order)

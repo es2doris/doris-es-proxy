@@ -746,3 +746,148 @@ func TestTranspiler_DeepEvalCorrectnessFixes(t *testing.T) {
 		t.Fatalf("expected plan3.HitsSQL to contain nested prefilter and arrays_overlap, got:\n%s", plan3.HitsSQL)
 	}
 }
+
+func TestTranspiler_Round3DeepEvalFixes(t *testing.T) {
+	rawMapping := `{
+		"properties": {
+			"title": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+			"tags": {"type": "text", "multi_valued": true, "fields": {"keyword": {"type": "keyword"}}},
+			"service": {"type": "keyword"},
+			"env": {"type": "keyword"},
+			"events": {
+				"type": "nested",
+				"properties": {
+					"ts": {"type": "date"},
+					"kind": {"type": "keyword"}
+				}
+			}
+		}
+	}`
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(rawMapping), &spec); err != nil {
+		t.Fatal(err)
+	}
+	idxSchema := schema.CompileIndexSchema("db", "idx", &spec)
+
+	// 1. Multi-field `tags.keyword` inherits `MultiValued = true` (`StoragePromotedArray`) from parent `tags`
+	tagsKw := idxSchema.ResolveField("tags.keyword")
+	if tagsKw.Kind != schema.StoragePromotedArray {
+		t.Fatalf("expected tags.keyword to inherit StoragePromotedArray, got %+v", tagsKw)
+	}
+
+	tr := NewTranspiler(idxSchema, TranspilerOptions{})
+
+	// 2. bool with minimum_should_match > len(should) compiles to FALSE;
+	//    MATCH_ANY quotes single quotes ('O''Brien');
+	//    wildcard escapes literal %, _, \, and trailing \
+	req1JSON := `{
+		"query": {
+			"bool": {
+				"must": [
+					{"match": {"title": "O'Brien"}},
+					{"wildcard": {"service": "pay_100%\\"}}
+				],
+				"should": [
+					{"term": {"env": "prod"}}
+				],
+				"minimum_should_match": 2
+			}
+		}
+	}`
+	var req1 esast.SearchRequest
+	if err := json.Unmarshal([]byte(req1JSON), &req1); err != nil {
+		t.Fatal(err)
+	}
+	plan1, err := tr.BuildSearchPlan(&req1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan1.HitsSQL, "MATCH_ANY 'O''Brien'") {
+		t.Fatalf("expected MATCH_ANY to quote single quote ('O''Brien'), got:\n%s", plan1.HitsSQL)
+	}
+	if !strings.Contains(plan1.HitsSQL, `LIKE 'pay\\_100\\%\\\\'`) {
+		t.Fatalf("expected wildcard to escape _, %%, and trailing \\, got:\n%s", plan1.HitsSQL)
+	}
+	if !strings.Contains(plan1.HitsSQL, "AND FALSE)") {
+		t.Fatalf("expected minimum_should_match=2 with 1 should clause to emit FALSE, got:\n%s", plan1.HitsSQL)
+	}
+
+	// 3. function_score: score_mode="first", boost_mode="multiply" (else 1.0), and weight < 1.0 demotion
+	req2JSON := `{
+		"query": {
+			"function_score": {
+				"query": {"term": {"service": "checkout"}},
+				"score_mode": "first",
+				"boost_mode": "multiply",
+				"functions": [
+					{"filter": {"term": {"env": "prod"}}, "weight": 0.25},
+					{"filter": {"term": {"env": "staging"}}, "weight": 2.0}
+				]
+			}
+		}
+	}`
+	var req2 esast.SearchRequest
+	if err := json.Unmarshal([]byte(req2JSON), &req2); err != nil {
+		t.Fatal(err)
+	}
+	plan2, err := tr.BuildSearchPlan(&req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan2.HitsSQL, "CASE WHEN `f__env` = 'prod' THEN 0.2500 WHEN `f__env` = 'staging' THEN 2.0000 ELSE 1.0 END") {
+		t.Fatalf("expected score_mode=first multi-branch CASE WHEN with 0.2500 demotion and ELSE 1.0, got:\n%s", plan2.HitsSQL)
+	}
+
+	// 4. Nested date field preserves ISO string inside json_extract_string; nested agg strips .keyword;
+	//    terms missing uses COALESCE; composite after adds > cursor filter
+	req3JSON := `{
+		"query": {
+			"nested": {
+				"path": "events",
+				"query": {
+					"range": {"events.ts": {"gte": "2026-10-01T00:00:00Z"}}
+				}
+			}
+		},
+		"aggs": {
+			"by_env": {
+				"terms": {"field": "env", "missing": "N/A"}
+			},
+			"nested_kinds": {
+				"nested": {"path": "events"},
+				"aggs": {
+					"kinds": {"terms": {"field": "events.kind.keyword"}}
+				}
+			},
+			"comp": {
+				"composite": {
+					"sources": [
+						{"service": {"terms": {"field": "service"}}},
+						{"env": {"terms": {"field": "env"}}}
+					],
+					"after": {"service": "checkout", "env": "prod"}
+				}
+			}
+		}
+	}`
+	var req3 esast.SearchRequest
+	if err := json.Unmarshal([]byte(req3JSON), &req3); err != nil {
+		t.Fatal(err)
+	}
+	plan3, err := tr.BuildSearchPlan(&req3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan3.HitsSQL, "json_extract_string(_el, '$.ts') >= '2026-10-01T00:00:00Z'") {
+		t.Fatalf("expected nested date range to preserve ISO string in json_extract_string, got:\n%s", plan3.HitsSQL)
+	}
+	if !strings.Contains(plan3.AggsSQL, "COALESCE(CAST(`f__env` AS STRING), 'N/A')") {
+		t.Fatalf("expected terms missing to emit COALESCE(CAST(`f__env` AS STRING), 'N/A'), got:\n%s", plan3.AggsSQL)
+	}
+	if !strings.Contains(plan3.AggsSQL, "json_extract_string(`_nel`, '$.kind')") {
+		t.Fatalf("expected nested terms agg to strip .keyword suffix ('$.kind'), got:\n%s", plan3.AggsSQL)
+	}
+	if !strings.Contains(plan3.AggsSQL, "> 'checkout\x1fprod'") {
+		t.Fatalf("expected composite after cursor filter > 'checkout\\x1fprod', got:\n%s", plan3.AggsSQL)
+	}
+}

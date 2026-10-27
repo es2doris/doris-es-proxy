@@ -23,6 +23,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1235,5 +1236,179 @@ func TestBulkCoalescerAndQueryResultCache(t *testing.T) {
 		!strings.Contains(body, "doris_es_proxy_query_cache_hits_total 1") ||
 		!strings.Contains(body, "doris_es_proxy_query_cache_misses_total 2") {
 		t.Fatalf("expected /metrics to report coalescer and query cache counters, got %d:\n%s", code, body)
+	}
+}
+
+func TestInboundAuthMiddlewareAndRound3DeepEvalFixes(t *testing.T) {
+	srv := NewServer("logs_db", NewMemoryBackend(false), transpiler.TranspilerOptions{})
+	srv.SetAuth("elastic", "s3cr3t!", "my-raw-api-key")
+	srv.SetQueryCacheTTL(10*time.Second, 32)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	doAuthReq := func(method, path, authHeader, body string) (*http.Response, string) {
+		t.Helper()
+		var rdr io.Reader
+		if body != "" {
+			rdr = strings.NewReader(body)
+		}
+		req, err := http.NewRequest(method, ts.URL+path, rdr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if authHeader != "" {
+			req.Header.Set("Authorization", authHeader)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return resp, string(raw)
+	}
+
+	// 1. Public Kubernetes probes (/healthz, /readyz) and OPTIONS preflight bypass auth
+	if resp, _ := doAuthReq(http.MethodGet, "/healthz", "", ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected /healthz to bypass auth and return 200, got %d", resp.StatusCode)
+	}
+	if resp, _ := doAuthReq(http.MethodGet, "/readyz", "", ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected /readyz to bypass auth and return 200, got %d", resp.StatusCode)
+	}
+	if resp, _ := doAuthReq(http.MethodOptions, "/_search", "", ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected OPTIONS preflight to bypass auth and return 200, got %d", resp.StatusCode)
+	}
+
+	// 2. Unauthenticated or invalid credentials return 401 security_exception with WWW-Authenticate
+	if resp, body := doAuthReq(http.MethodGet, "/", "", ""); resp.StatusCode != http.StatusUnauthorized ||
+		!strings.Contains(body, `"security_exception"`) ||
+		!strings.Contains(resp.Header.Get("WWW-Authenticate"), "Basic") {
+		t.Fatalf("expected 401 security_exception for unauthenticated GET /, got %d %s", resp.StatusCode, body)
+	}
+	badBasic := "Basic " + base64.StdEncoding.EncodeToString([]byte("elastic:wrong"))
+	if resp, _ := doAuthReq(http.MethodGet, "/", badBasic, ""); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for wrong Basic Auth password, got %d", resp.StatusCode)
+	}
+	if resp, _ := doAuthReq(http.MethodGet, "/", "ApiKey wrong-key", ""); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for wrong ApiKey, got %d", resp.StatusCode)
+	}
+
+	// 3. Valid Basic Auth, raw ApiKey, base64(id:apiKey) ApiKey, and Bearer token all succeed
+	goodBasic := "Basic " + base64.StdEncoding.EncodeToString([]byte("elastic:s3cr3t!"))
+	if resp, body := doAuthReq(http.MethodGet, "/_security/_authenticate", goodBasic, ""); resp.StatusCode != http.StatusOK ||
+		!strings.Contains(body, `"username":"elastic"`) {
+		t.Fatalf("expected 200 from /_security/_authenticate with Basic Auth, got %d %s", resp.StatusCode, body)
+	}
+	if resp, _ := doAuthReq(http.MethodGet, "/", "ApiKey my-raw-api-key", ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 with raw ApiKey, got %d", resp.StatusCode)
+	}
+	b64IDKey := base64.StdEncoding.EncodeToString([]byte("key-id-1:my-raw-api-key"))
+	if resp, _ := doAuthReq(http.MethodGet, "/", "ApiKey "+b64IDKey, ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 with base64(id:apiKey), got %d", resp.StatusCode)
+	}
+	if resp, _ := doAuthReq(http.MethodGet, "/", "Bearer my-raw-api-key", ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 with Bearer token, got %d", resp.StatusCode)
+	}
+
+	// 4. Create two indices behind a shared alias (`logs_all`) with `updatedAt: long` and `created_at: date`
+	mappingJSON := `{
+		"aliases": {"logs_all": {}},
+		"mappings": {
+			"properties": {
+				"service": {"type": "keyword"},
+				"env": {"type": "keyword"},
+				"updatedAt": {"type": "long"},
+				"created_at": {"type": "date"},
+				"latency": {"type": "double"}
+			}
+		}
+	}`
+	if resp, body := doAuthReq(http.MethodPut, "/logs_p1", goodBasic, mappingJSON); resp.StatusCode != http.StatusOK {
+		t.Fatalf("create logs_p1 failed: %d %s", resp.StatusCode, body)
+	}
+	if resp, body := doAuthReq(http.MethodPut, "/logs_p2", goodBasic, mappingJSON); resp.StatusCode != http.StatusOK {
+		t.Fatalf("create logs_p2 failed: %d %s", resp.StatusCode, body)
+	}
+
+	// Verify GET /logs_all/_mapping returns both indices (`logs_p1` and `logs_p2`)
+	if resp, body := doAuthReq(http.MethodGet, "/logs_all/_mapping", goodBasic, ""); resp.StatusCode != http.StatusOK ||
+		!strings.Contains(body, `"logs_p1"`) || !strings.Contains(body, `"logs_p2"`) {
+		t.Fatalf("expected GET /logs_all/_mapping to return both target indices, got %d %s", resp.StatusCode, body)
+	}
+
+	// Verify _field_caps and _mapping/field preserve `updatedAt` as `long` (not `date`)
+	if resp, body := doAuthReq(http.MethodGet, "/logs_p1/_mapping/field/updatedAt,created_at", goodBasic, ""); resp.StatusCode != http.StatusOK ||
+		!strings.Contains(body, `"updatedAt":{"type":"long"}`) || !strings.Contains(body, `"created_at":{"type":"date"}`) {
+		t.Fatalf("expected updatedAt=long and created_at=date in field mapping, got %d %s", resp.StatusCode, body)
+	}
+
+	// 5. Index documents into logs_p1 ( leaving logs_p2 empty) to test:
+	//    - collapse preserving pre-collapse total hits
+	//    - scroll pagination on QueryResultCache hit
+	//    - terms missing, composite after, histogram extended_bounds + min_doc_count: 0
+	//    - fields wildcard + explicit format override + numeric epoch-millis date formatting
+	bulkDocs := strings.Join([]string{
+		`{"index":{"_index":"logs_p1","_id":"1"}}`,
+		`{"service":"checkout","env":"prod","updatedAt":100,"created_at":1700000000000,"latency":10}`,
+		`{"index":{"_index":"logs_p1","_id":"2"}}`,
+		`{"service":"checkout","env":"staging","updatedAt":200,"created_at":1700003600000,"latency":30}`,
+		`{"index":{"_index":"logs_p1","_id":"3"}}`,
+		`{"service":"payments","updatedAt":300,"created_at":1700007200000,"latency":50}`,
+	}, "\n") + "\n"
+	if resp, body := doAuthReq(http.MethodPost, "/_bulk?refresh=true", goodBasic, bulkDocs); resp.StatusCode != http.StatusOK {
+		t.Fatalf("bulk failed: %d %s", resp.StatusCode, body)
+	}
+
+	// Collapse on `service` (3 total matching docs collapsed into 2 distinct services): hits.total.value must be 3
+	collapseReq := `{"size":10,"collapse":{"field":"service"},"sort":[{"updatedAt":"desc"}]}`
+	if resp, body := doAuthReq(http.MethodPost, "/logs_p1/_search", goodBasic, collapseReq); resp.StatusCode != http.StatusOK ||
+		!strings.Contains(body, `"value":3`) {
+		t.Fatalf("expected collapse to preserve pre-collapse total.value=3, got %d %s", resp.StatusCode, body)
+	}
+
+	// Scroll on QueryResultCache hit: prime cache first, then call ?scroll=1m with same request
+	scrollInitReq := `{"size":2,"sort":[{"_id":"asc"}]}`
+	_, _ = doAuthReq(http.MethodPost, "/logs_p1/_search", goodBasic, scrollInitReq)
+	resp, scrollBody := doAuthReq(http.MethodPost, "/logs_p1/_search?scroll=1m", goodBasic, scrollInitReq)
+	if resp.StatusCode != http.StatusOK || strings.Contains(scrollBody, `"_scroll_id":"doris-scroll-eof"`) {
+		t.Fatalf("expected valid _scroll_id on cached scroll search, got %d %s", resp.StatusCode, scrollBody)
+	}
+
+	// Terms `missing`, Composite `after`, Histogram `min_doc_count: 0` + `extended_bounds`, and `fields` formatting
+	aggsAndFieldsReq := `{
+		"size": 1,
+		"sort": [{"_id": "asc"}],
+		"fields": [
+			"*",
+			{"field": "created_at", "format": "epoch_second"}
+		],
+		"aggs": {
+			"env_with_missing": {
+				"terms": {"field": "env", "missing": "MISSING_ENV"}
+			},
+			"comp_after": {
+				"composite": {
+					"sources": [{"service": {"terms": {"field": "service"}}}],
+					"after": {"service": "checkout"}
+				}
+			},
+			"lat_hist": {
+				"histogram": {
+					"field": "latency",
+					"interval": 20,
+					"min_doc_count": 0,
+					"extended_bounds": {"min": 0, "max": 60}
+				}
+			}
+		}
+	}`
+	resp, aggBody := doAuthReq(http.MethodPost, "/logs_all/_search", goodBasic, aggsAndFieldsReq)
+	if resp.StatusCode != http.StatusOK ||
+		!strings.Contains(aggBody, `"key":"MISSING_ENV"`) ||
+		!strings.Contains(aggBody, `"service":"payments"`) ||
+		!strings.Contains(aggBody, `"created_at":[1700000000]`) ||
+		!strings.Contains(aggBody, `"doc_count":0,"key":60`) {
+		t.Fatalf("expected missing bucket, composite after, epoch_second field override, and zero-count histogram bucket, got %d %s", resp.StatusCode, aggBody)
 	}
 }

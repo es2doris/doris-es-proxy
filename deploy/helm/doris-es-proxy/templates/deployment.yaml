@@ -60,27 +60,43 @@ spec:
             {{- end }}
           env:
             - name: DORIS_PASSWORD
-              {{- if .Values.doris.existingSecret }}
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.doris.existingSecret }}
-                  key: {{ .Values.doris.existingSecretPasswordKey }}
-              {{- else }}
-              value: {{ .Values.doris.password | quote }}
-              {{- end }}
+                  name: {{ .Values.doris.existingSecret | default (include "doris-es-proxy.fullname" .) }}
+                  key: {{ if .Values.doris.existingSecret }}{{ .Values.doris.existingSecretPasswordKey }}{{ else }}DORIS_PASSWORD{{ end }}
+            {{- if or .Values.auth.basicAuthUser .Values.auth.basicAuthPass .Values.auth.apiKey .Values.auth.existingSecret }}
+            - name: BASIC_AUTH_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret | default (include "doris-es-proxy.fullname" .) }}
+                  key: BASIC_AUTH_USER
+                  optional: true
+            - name: BASIC_AUTH_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret | default (include "doris-es-proxy.fullname" .) }}
+                  key: BASIC_AUTH_PASS
+                  optional: true
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret | default (include "doris-es-proxy.fullname" .) }}
+                  key: API_KEY
+                  optional: true
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}
               protocol: TCP
           livenessProbe:
             httpGet:
-              path: /_cluster/health
+              path: /healthz
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
           readinessProbe:
             httpGet:
-              path: /_cluster/health
+              path: /readyz
               port: http
             initialDelaySeconds: 3
             periodSeconds: 5

@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -161,14 +162,18 @@ func coerceScalarForDoris(val any, dorisType DorisScalarType, lowercase bool, no
 		case int:
 			return int64(v)
 		case float64:
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				return nil
+			}
 			return int64(v)
 		case json.Number:
 			if i, err := v.Int64(); err == nil {
 				return i
 			}
-			if f, err := v.Float64(); err == nil {
+			if f, err := v.Float64(); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
 				return int64(f)
 			}
+			return nil
 		case string:
 			if i, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
 				return i
@@ -176,6 +181,8 @@ func coerceScalarForDoris(val any, dorisType DorisScalarType, lowercase bool, no
 			if ms, ok := ParseESDateToEpochMillis(v, now); ok {
 				return ms
 			}
+			return nil
+		default:
 			return nil
 		}
 	case DorisInt:
@@ -185,39 +192,62 @@ func coerceScalarForDoris(val any, dorisType DorisScalarType, lowercase bool, no
 		case int64:
 			return int(v)
 		case float64:
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				return nil
+			}
 			return int(v)
 		case json.Number:
 			if i, err := v.Int64(); err == nil {
 				return int(i)
 			}
+			if f, err := v.Float64(); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+				return int(f)
+			}
+			return nil
 		case string:
 			if i, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
 				return i
 			}
 			return nil
+		default:
+			return nil
 		}
 	case DorisDouble:
 		switch v := val.(type) {
 		case float64:
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				return nil
+			}
 			return v
 		case int:
 			return float64(v)
 		case int64:
 			return float64(v)
 		case json.Number:
-			if f, err := v.Float64(); err == nil {
+			if f, err := v.Float64(); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
 				return f
 			}
+			return nil
 		case string:
-			if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+			if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
 				return f
 			}
+			return nil
+		default:
 			return nil
 		}
 	case DorisBoolean:
 		switch v := val.(type) {
 		case bool:
 			return v
+		case int:
+			return v != 0
+		case int64:
+			return v != 0
+		case float64:
+			return v != 0 && !math.IsNaN(v)
+		case json.Number:
+			return v.String() != "0"
 		case string:
 			switch strings.ToLower(strings.TrimSpace(v)) {
 			case "true", "1":
@@ -225,6 +255,8 @@ func coerceScalarForDoris(val any, dorisType DorisScalarType, lowercase bool, no
 			case "false", "0":
 				return false
 			}
+			return nil
+		default:
 			return nil
 		}
 	default:
@@ -248,7 +280,7 @@ func ParseESDateToEpochMillis(input string, now time.Time) (int64, bool) {
 // ParseESDateBoundToEpochMillis parses ISO-8601 / RFC3339 date strings, epoch strings,
 // and Elasticsearch date math expressions into Unix epoch milliseconds.
 // When `roundUp` is true (used for inclusive upper bounds like `lte`), rounding units (`/d`, `/h`, etc.)
-// round to the end of the interval (`23:59:59.999` for `/d`).
+// and date-only strings (`"2024-01-15"`) round to the end of the interval (`23:59:59.999` for `/d`).
 func ParseESDateBoundToEpochMillis(input string, now time.Time, roundUp bool) (int64, bool) {
 	s := strings.TrimSpace(input)
 	if s == "" {
@@ -266,24 +298,34 @@ func ParseESDateBoundToEpochMillis(input string, now time.Time, roundUp bool) (i
 		mathExpr = s[3:]
 	} else if idx := strings.Index(s, "||"); idx >= 0 {
 		prefix := strings.TrimSpace(s[:idx])
+		mathExpr = strings.TrimSpace(s[idx+2:])
 		if ms, err := strconv.ParseInt(prefix, 10, 64); err == nil {
 			baseTime = time.UnixMilli(ms).UTC()
 		} else if t, ok := parseISODateString(prefix); ok {
+			if roundUp && mathExpr == "" && isDateOnlyString(prefix) {
+				t = t.AddDate(0, 0, 1).Add(-time.Millisecond)
+			}
 			baseTime = t
 		} else {
 			return 0, false
 		}
-		mathExpr = s[idx+2:]
 	} else {
 		t, ok := parseISODateString(s)
 		if !ok {
 			return 0, false
+		}
+		if roundUp && isDateOnlyString(s) {
+			t = t.AddDate(0, 0, 1).Add(-time.Millisecond)
 		}
 		return t.UnixMilli(), true
 	}
 
 	t := applyESDateMathWithRound(baseTime, mathExpr, roundUp)
 	return t.UnixMilli(), true
+}
+
+func isDateOnlyString(s string) bool {
+	return len(s) == 10 && (s[4] == '-' || s[4] == '/') && (s[7] == '-' || s[7] == '/')
 }
 
 func parseISODateString(s string) (time.Time, bool) {
@@ -309,16 +351,16 @@ func parseISODateString(s string) (time.Time, bool) {
 
 func applyESDateMathWithRound(base time.Time, expr string, roundUp bool) time.Time {
 	t := base.UTC()
-	var roundUnit byte
-	if slashIdx := strings.IndexByte(expr, '/'); slashIdx >= 0 {
-		if slashIdx+1 < len(expr) {
-			roundUnit = expr[slashIdx+1]
-		}
-		expr = expr[:slashIdx]
-	}
-
 	i := 0
 	for i < len(expr) {
+		if expr[i] == '/' {
+			i++
+			if i < len(expr) {
+				t = roundTimeToUnit(t, expr[i], roundUp)
+				i++
+			}
+			continue
+		}
 		var sign int
 		switch expr[i] {
 		case '+':
@@ -359,7 +401,10 @@ func applyESDateMathWithRound(base time.Time, expr string, roundUp bool) time.Ti
 			t = t.Add(time.Duration(val) * time.Second)
 		}
 	}
+	return t
+}
 
+func roundTimeToUnit(t time.Time, roundUnit byte, roundUp bool) time.Time {
 	switch roundUnit {
 	case 'y', 'Y':
 		t = time.Date(t.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
