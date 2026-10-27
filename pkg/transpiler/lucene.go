@@ -19,10 +19,12 @@ package transpiler
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
+	"github.com/es2doris/doris-es-proxy/pkg/schema"
 )
 
 // compileQueryString compiles an ES `query_string` or `simple_query_string` query.
@@ -73,13 +75,15 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 	parsedAST := parseSimpleLuceneToAST(raw, defaultField, expandedFields, defaultOp)
 	compiled := t.CompileQuery(&parsedAST, scoring, nctx)
 	if t.Opts.UseDoris4SearchFunc && nctx == nil {
-		col := strings.Trim(t.sqlColumnRef(defaultField, false, nctx), "`")
-		pred := fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(raw), quoteStr(col), quoteStr(defaultOp))
-		return CompiledQuery{
-			WhereSQL:          pred,
-			SafeWhereSQL:      compiled.EffectiveSafeWhere(),
-			ScoreSQL:          compiled.ScoreSQL,
-			UsesFulltextMatch: true,
+		if defaultField == "_all_text" || (t.Schema != nil && t.Schema.ResolveField(defaultField).Kind != schema.StorageDynamicVariant) {
+			col := strings.Trim(t.sqlColumnRef(defaultField, false, nctx), "`")
+			pred := fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(raw), quoteStr(col), quoteStr(defaultOp))
+			return CompiledQuery{
+				WhereSQL:          pred,
+				SafeWhereSQL:      compiled.EffectiveSafeWhere(),
+				ScoreSQL:          compiled.ScoreSQL,
+				UsesFulltextMatch: true,
+			}
 		}
 	}
 	return compiled
@@ -174,7 +178,7 @@ func parseLuceneTokenSlice(tokens []string, defaultField string, fields []string
 			inner := tok[1 : len(tok)-1]
 			clause = parseSimpleLuceneToASTWithDepth(inner, defaultField, fields, groupOp, depth+1)
 		} else {
-			clause = buildLuceneAtomQueryWithDepth(tok, defaultField, fields, depth+1)
+			clause = buildLuceneAtomQueryWithDepth(tok, defaultField, fields, groupOp, depth+1)
 		}
 
 		if negateNext {
@@ -191,15 +195,30 @@ func parseLuceneTokenSlice(tokens []string, defaultField string, fields []string
 
 func splitLuceneBoost(s string) (string, float64) {
 	if idx := strings.LastIndexByte(s, '^'); idx > 0 && idx < len(s)-1 {
-		if b, err := strconv.ParseFloat(s[idx+1:], 64); err == nil && b > 0 {
+		if b, err := strconv.ParseFloat(s[idx+1:], 64); err == nil && !math.IsNaN(b) && !math.IsInf(b, 0) && b > 0 {
 			return s[:idx], b
 		}
 	}
 	return s, 1.0
 }
 
+func unescapeLuceneToken(s string) string {
+	if !strings.ContainsRune(s, '\\') {
+		return s
+	}
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+		}
+		sb.WriteByte(s[i])
+	}
+	return sb.String()
+}
+
 func findLuceneFieldColon(s string) int {
-	if len(s) == 0 || s[0] == '"' || s[0] == '(' || s[0] == '[' || s[0] == '{' {
+	if len(s) == 0 || s[0] == '"' || s[0] == '(' || s[0] == '[' || s[0] == '{' || s[0] == '/' {
 		return -1
 	}
 	for i := 0; i < len(s); i++ {
@@ -218,22 +237,49 @@ func findLuceneFieldColon(s string) int {
 	return -1
 }
 
-func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, depth int) esast.Query {
+func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, defaultOp string, depth int) esast.Query {
 	token = strings.TrimSpace(token)
 	token, boost := splitLuceneBoost(token)
 	if strings.HasPrefix(token, "(") && strings.HasSuffix(token, ")") && len(token) > 2 {
-		inner := parseSimpleLuceneToASTWithDepth(token[1:len(token)-1], defaultField, fields, "OR", depth+1)
+		inner := parseSimpleLuceneToASTWithDepth(token[1:len(token)-1], defaultField, fields, defaultOp, depth+1)
 		if boost != 1.0 && inner.Bool != nil {
 			inner.Bool.Boost = &boost
 		}
 		return inner
 	}
 	if idx := findLuceneFieldColon(token); idx > 0 {
-		field := token[:idx]
+		field := unescapeLuceneToken(token[:idx])
 		val := strings.TrimSpace(token[idx+1:])
 		if field == "_exists_" && val != "" {
 			return esast.Query{
-				Exists: &esast.ExistsQuery{Field: strings.Trim(val, `"`)},
+				Exists: &esast.ExistsQuery{Field: unescapeLuceneToken(strings.Trim(val, `"`))},
+			}
+		}
+		for _, op := range []string{">=", "<=", ">", "<"} {
+			if strings.HasPrefix(val, op) && len(val) > len(op) {
+				boundStr := unescapeLuceneToken(strings.Trim(strings.TrimSpace(val[len(op):]), `"`))
+				bound := parseLuceneRangeBound(boundStr)
+				var rc esast.RangeCond
+				switch op {
+				case ">=":
+					rc.GTE = bound
+				case "<=":
+					rc.LTE = bound
+				case ">":
+					rc.GT = bound
+				case "<":
+					rc.LT = bound
+				}
+				return esast.Query{
+					Range: map[string]esast.RangeCond{field: rc},
+				}
+			}
+		}
+		if strings.HasPrefix(val, "/") && strings.HasSuffix(val, "/") && len(val) > 2 {
+			return esast.Query{
+				Regexp: map[string]esast.RegexpEntry{
+					field: {Value: val[1 : len(val)-1]},
+				},
 			}
 		}
 		if (strings.HasPrefix(val, "[") || strings.HasPrefix(val, "{")) &&
@@ -271,10 +317,10 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 			}
 		}
 		if strings.HasPrefix(val, "(") && strings.HasSuffix(val, ")") && len(val) > 2 {
-			return parseSimpleLuceneToASTWithDepth(val[1:len(val)-1], field, nil, "OR", depth+1)
+			return parseSimpleLuceneToASTWithDepth(val[1:len(val)-1], field, nil, defaultOp, depth+1)
 		}
 		isQuoted := strings.HasPrefix(val, `"`) && strings.HasSuffix(val, `"`) && len(val) >= 2
-		val = strings.Trim(val, `"`)
+		val = unescapeLuceneToken(strings.Trim(val, `"`))
 		if strings.EqualFold(val, "true") || strings.EqualFold(val, "false") {
 			boolVal := strings.EqualFold(val, "true")
 			return esast.Query{
@@ -304,8 +350,15 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 		}
 	}
 
+	if strings.HasPrefix(token, "/") && strings.HasSuffix(token, "/") && len(token) > 2 {
+		return esast.Query{
+			Regexp: map[string]esast.RegexpEntry{
+				defaultField: {Value: token[1 : len(token)-1]},
+			},
+		}
+	}
 	isQuoted := strings.HasPrefix(token, `"`) && strings.HasSuffix(token, `"`) && len(token) >= 2
-	cleanVal := strings.Trim(token, `"`)
+	cleanVal := unescapeLuceneToken(strings.Trim(token, `"`))
 	if !isQuoted && strings.ContainsAny(cleanVal, "*?") {
 		if len(fields) > 0 {
 			var shoulds []esast.Query
@@ -368,7 +421,7 @@ func parseLuceneRangeBound(s string) any {
 	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
 		return i
 	}
-	if f, err := strconv.ParseFloat(s, 64); err == nil {
+	if f, err := strconv.ParseFloat(s, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
 		return f
 	}
 	return s

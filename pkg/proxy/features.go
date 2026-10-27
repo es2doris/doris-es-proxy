@@ -90,6 +90,183 @@ func (w *gzipResponseWriter) Close() {
 	}
 }
 
+type esResponseFormatOptions struct {
+	pretty      bool
+	errorTrace  bool
+	filterPaths []string
+}
+
+type esFormatResponseWriter struct {
+	http.ResponseWriter
+	opts esResponseFormatOptions
+}
+
+func extractESResponseFormatOptions(w http.ResponseWriter) (esResponseFormatOptions, bool) {
+	if fw, ok := w.(*esFormatResponseWriter); ok {
+		return fw.opts, true
+	}
+	return esResponseFormatOptions{}, false
+}
+
+func parseESResponseFormatOptions(r *http.Request) (esResponseFormatOptions, bool) {
+	if r == nil || r.URL == nil || r.URL.RawQuery == "" {
+		return esResponseFormatOptions{}, false
+	}
+	q := r.URL.Query()
+	var opts esResponseFormatOptions
+	if q.Has("pretty") && strings.ToLower(q.Get("pretty")) != "false" {
+		opts.pretty = true
+	}
+	if q.Has("error_trace") && strings.ToLower(q.Get("error_trace")) != "false" {
+		opts.errorTrace = true
+	}
+	if fp := strings.TrimSpace(q.Get("filter_path")); fp != "" {
+		for _, p := range strings.Split(fp, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				opts.filterPaths = append(opts.filterPaths, p)
+			}
+		}
+	}
+	if !opts.pretty && !opts.errorTrace && len(opts.filterPaths) == 0 {
+		return esResponseFormatOptions{}, false
+	}
+	return opts, true
+}
+
+func applyESFilterPath(v any, filterPaths []string) any {
+	if len(filterPaths) == 0 || v == nil {
+		return v
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return v
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var generic any
+	if err := dec.Decode(&generic); err != nil {
+		return v
+	}
+	var posPatterns, negPatterns [][]string
+	for _, fp := range filterPaths {
+		if strings.HasPrefix(fp, "-") {
+			trimmed := strings.TrimPrefix(fp, "-")
+			if trimmed != "" {
+				negPatterns = append(negPatterns, strings.Split(trimmed, "."))
+			}
+		} else {
+			posPatterns = append(posPatterns, strings.Split(fp, "."))
+		}
+	}
+	out := generic
+	if len(posPatterns) > 0 {
+		filtered, ok := filterIncludeNode(out, posPatterns)
+		if !ok {
+			return map[string]any{}
+		}
+		out = filtered
+	}
+	if len(negPatterns) > 0 {
+		out = filterExcludeNode(out, negPatterns)
+	}
+	return out
+}
+
+func advanceFilterPatterns(patterns [][]string, key string) [][]string {
+	var next [][]string
+	for _, p := range patterns {
+		if len(p) == 0 {
+			next = append(next, []string{})
+			continue
+		}
+		if p[0] == "**" {
+			next = append(next, p)
+			if len(p) == 1 {
+				next = append(next, []string{})
+			} else if matchWildcardPattern(p[1], key) {
+				next = append(next, p[2:])
+			}
+			continue
+		}
+		if matchWildcardPattern(p[0], key) {
+			next = append(next, p[1:])
+		}
+	}
+	return next
+}
+
+func filterIncludeNode(node any, patterns [][]string) (any, bool) {
+	for _, p := range patterns {
+		if len(p) == 0 || (len(p) == 1 && p[0] == "**") {
+			return node, true
+		}
+	}
+	switch typed := node.(type) {
+	case map[string]any:
+		out := make(map[string]any)
+		for k, val := range typed {
+			next := advanceFilterPatterns(patterns, k)
+			if len(next) == 0 {
+				continue
+			}
+			if child, ok := filterIncludeNode(val, next); ok {
+				out[k] = child
+			}
+		}
+		if len(out) == 0 {
+			return nil, false
+		}
+		return out, true
+	case []any:
+		var out []any
+		for _, elem := range typed {
+			if child, ok := filterIncludeNode(elem, patterns); ok {
+				out = append(out, child)
+			}
+		}
+		if len(out) == 0 {
+			return nil, false
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func filterExcludeNode(node any, negPatterns [][]string) any {
+	switch typed := node.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for k, val := range typed {
+			next := advanceFilterPatterns(negPatterns, k)
+			excluded := false
+			for _, np := range next {
+				if len(np) == 0 || (len(np) == 1 && np[0] == "**") {
+					excluded = true
+					break
+				}
+			}
+			if excluded {
+				continue
+			}
+			if len(next) > 0 {
+				out[k] = filterExcludeNode(val, next)
+			} else {
+				out[k] = val
+			}
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, elem := range typed {
+			out[i] = filterExcludeNode(elem, negPatterns)
+		}
+		return out
+	default:
+		return node
+	}
+}
+
 // withWireMiddleware wraps the proxy router with:
 // 1. CORS headers & global OPTIONS preflight handling for browser GUIs (Elasticvue, Cerebro, Kibana)
 // 2. Bounded request body size (`http.MaxBytesReader`)
@@ -165,6 +342,10 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 			w = gzw
 		}
 
+		if fmtOpts, ok := parseESResponseFormatOptions(r); ok {
+			w = &esFormatResponseWriter{ResponseWriter: w, opts: fmtOpts}
+		}
+
 		atomic.AddInt64(&s.totalHTTPRequests, 1)
 		next.ServeHTTP(w, r)
 	})
@@ -180,9 +361,6 @@ func isPublicHealthProbePath(urlPath string) bool {
 }
 
 func constantTimeEquals(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
@@ -216,7 +394,7 @@ func (s *Server) checkInboundAuth(w http.ResponseWriter, r *http.Request) bool {
 	apiKey := s.apiKey
 	s.authMu.RUnlock()
 
-	hasBasic := basicUser != "" || basicPass != ""
+	hasBasic := basicUser != "" && basicPass != ""
 	hasAPIKey := apiKey != ""
 	if !hasBasic && !hasAPIKey {
 		return true
@@ -228,8 +406,12 @@ func (s *Server) checkInboundAuth(w http.ResponseWriter, r *http.Request) bool {
 	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
 	if authHeader != "" {
 		if hasBasic && strings.HasPrefix(strings.ToLower(authHeader), "basic ") {
-			if u, p, ok := r.BasicAuth(); ok && constantTimeEquals(u, basicUser) && constantTimeEquals(p, basicPass) {
-				return true
+			if u, p, ok := r.BasicAuth(); ok {
+				uMatch := subtle.ConstantTimeCompare([]byte(u), []byte(basicUser))
+				pMatch := subtle.ConstantTimeCompare([]byte(p), []byte(basicPass))
+				if (uMatch & pMatch) == 1 {
+					return true
+				}
 			}
 		}
 		if hasAPIKey {
@@ -309,7 +491,11 @@ func (t *SlowQueryTracker) recordWithThreshold(entry SlowQueryEntry, threshold i
 			byField[f]++
 			if threshold > 0 && byField[f] >= threshold {
 				promoteFields = append(promoteFields, f)
+				delete(byField, f)
 			}
+		}
+		if len(byField) == 0 {
+			delete(t.unindexedFreq, entry.Index)
 		}
 	}
 	return promoteFields
@@ -433,13 +619,14 @@ func (s *Server) maybeRunShadowSearch(rawIndex string, rawReqBody []byte, dorisR
 	if targetURL == "" {
 		return
 	}
+	dorisTotal, dorisIDs := extractTotalAndHitIDs(dorisResp)
 	bodyCopy := make([]byte, len(rawReqBody))
 	copy(bodyCopy, rawReqBody)
 	if len(bytes.TrimSpace(bodyCopy)) == 0 {
 		bodyCopy = []byte(`{}`)
 	}
 	run := func() {
-		s.executeShadowComparison(targetURL, rawIndex, bodyCopy, dorisResp, dorisTookMs)
+		s.executeShadowComparison(targetURL, rawIndex, bodyCopy, dorisTotal, dorisIDs, dorisTookMs)
 	}
 	if syncMode {
 		run()
@@ -456,7 +643,7 @@ func (s *Server) maybeRunShadowSearch(rawIndex string, rawReqBody []byte, dorisR
 	}
 }
 
-func (s *Server) executeShadowComparison(targetURL, rawIndex string, bodyBytes []byte, dorisResp map[string]any, dorisTookMs int64) {
+func (s *Server) executeShadowComparison(targetURL, rawIndex string, bodyBytes []byte, dorisTotal int64, dorisIDs []string, dorisTookMs int64) {
 	endpoint := targetURL + "/_search"
 	if rawIndex != "" {
 		endpoint = targetURL + "/" + url.PathEscape(rawIndex) + "/_search"
@@ -482,11 +669,10 @@ func (s *Server) executeShadowComparison(targetURL, rawIndex string, bodyBytes [
 	}
 
 	var esPayload map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&esPayload); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 50*1024*1024)).Decode(&esPayload); err != nil {
 		return
 	}
 
-	dorisTotal, dorisIDs := extractTotalAndHitIDs(dorisResp)
 	esTotal, esIDs := extractTotalAndHitIDs(esPayload)
 	if t, ok := toInt64(esPayload["took"]); ok && t > 0 {
 		esTookMs = t
@@ -659,7 +845,7 @@ func (s *Server) handleResolveIndex(w http.ResponseWriter, r *http.Request) {
 		if matchWildcardPattern(pattern, al) {
 			aliasesOut = append(aliasesOut, map[string]any{
 				"name":    al,
-				"indices": s.aliases[al],
+				"indices": append([]string(nil), s.aliases[al]...),
 			})
 		}
 	}
@@ -1124,10 +1310,11 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			plan, err := tr.BuildSearchPlan(&esast.SearchRequest{
-				Query:       body.Source.Query,
-				Size:        &fetchSize,
-				Sort:        esast.SortSlice{{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}}},
-				SearchAfter: searchAfter,
+				Query:          body.Source.Query,
+				Size:           &fetchSize,
+				TrackTotalHits: false,
+				Sort:           esast.SortSlice{{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}}},
+				SearchAfter:    searchAfter,
 			})
 			if err != nil {
 				writeESError(w, http.StatusBadRequest, "search_phase_execution_exception", err.Error())
@@ -1266,8 +1453,20 @@ func (s *Server) promoteFieldInternal(ctx context.Context, idxName, field, esTyp
 		esType = "keyword"
 	}
 	cleanField := strings.TrimSuffix(field, ".keyword")
+	clearTrackerFreq := func() {
+		s.slowTracker.mu.Lock()
+		if byField, ok := s.slowTracker.unindexedFreq[idxName]; ok {
+			delete(byField, field)
+			delete(byField, cleanField)
+			if len(byField) == 0 {
+				delete(s.slowTracker.unindexedFreq, idxName)
+			}
+		}
+		s.slowTracker.mu.Unlock()
+	}
 	idxSchema := s.ensureWritableIndexSchema(ctx, idxName)
 	if existing, ok := idxSchema.Fields[cleanField]; ok && existing.Kind != schema.StorageDynamicVariant {
+		clearTrackerFreq()
 		return []string{}, nil
 	}
 
@@ -1275,7 +1474,7 @@ func (s *Server) promoteFieldInternal(ctx context.Context, idxName, field, esTyp
 	if !isMultiValued && s.backend != nil {
 		tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
 		sampleSize := 16
-		if plan, err := tr.BuildSearchPlan(&esast.SearchRequest{Size: &sampleSize}); err == nil {
+		if plan, err := tr.BuildSearchPlan(&esast.SearchRequest{Size: &sampleSize, TrackTotalHits: false}); err == nil {
 			if hits, err := s.backend.QueryHits(ctx, plan.HitsSQL); err == nil && len(hits) > 0 {
 				var sampleDocs []json.RawMessage
 				for _, h := range hits {
@@ -1316,16 +1515,7 @@ func (s *Server) promoteFieldInternal(ctx context.Context, idxName, field, esTyp
 	s.persistIndex(ctx, idxName, compiled)
 	s.backfillIndexSchema(ctx, compiled)
 	s.queryCache.InvalidateAll()
-
-	s.slowTracker.mu.Lock()
-	if byField, ok := s.slowTracker.unindexedFreq[idxName]; ok {
-		delete(byField, field)
-		delete(byField, cleanField)
-		if len(byField) == 0 {
-			delete(s.slowTracker.unindexedFreq, idxName)
-		}
-	}
-	s.slowTracker.mu.Unlock()
+	clearTrackerFreq()
 	return ddls, nil
 }
 
@@ -1352,9 +1542,10 @@ func (s *Server) backfillIndexSchema(ctx context.Context, newSchema *schema.Inde
 	var searchAfter []any
 	for {
 		plan, err := tr.BuildSearchPlan(&esast.SearchRequest{
-			Size:        &batchSize,
-			Sort:        esast.SortSlice{{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}}},
-			SearchAfter: searchAfter,
+			Size:           &batchSize,
+			TrackTotalHits: false,
+			Sort:           esast.SortSlice{{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}}},
+			SearchAfter:    searchAfter,
 		})
 		if err != nil {
 			return

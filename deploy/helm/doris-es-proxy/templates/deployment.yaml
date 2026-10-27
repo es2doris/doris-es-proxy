@@ -13,10 +13,11 @@ spec:
       {{- include "doris-es-proxy.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-      {{- with .Values.podAnnotations }}
       annotations:
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
       labels:
         {{- include "doris-es-proxy.selectorLabels" . | nindent 8 }}
         {{- with .Values.podLabels }}
@@ -34,7 +35,7 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - "--listen=:{{ .Values.service.port }}"
-            - "--doris-dsn={{ .Values.doris.user }}:$(DORIS_PASSWORD)@tcp({{ .Values.doris.feHost }}:{{ .Values.doris.mysqlPort }})/{{ .Values.doris.database }}?interpolateParams=true&timeout=5s&readTimeout=30s&writeTimeout=30s"
+            - "--doris-dsn={{ .Values.doris.user }}:$(DORIS_PASSWORD)@tcp({{ .Values.doris.feHost }}:{{ .Values.doris.mysqlPort }})/?interpolateParams=true&timeout=5s&readTimeout=30s&writeTimeout=30s"
             - "--doris-http=http://{{ .Values.doris.feHost }}:{{ .Values.doris.httpPort }}"
             - "--doris-db={{ .Values.doris.database }}"
             - "--doris-user={{ .Values.doris.user }}"
