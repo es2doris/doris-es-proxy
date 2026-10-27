@@ -415,7 +415,7 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 
 	// 8. Round-8 Live Doris Verification: extended_stats, string_stats, boxplot, percentile_ranks,
 	// top_metrics, global, sampler, anonymous filters + other_bucket, moving_avg, serial_diff,
-	// extended_stats_bucket, percentiles_bucket, and filtered alias rehydration
+	// extended_stats_bucket, percentiles_bucket, and filtered write-alias rehydration
 	r8AliasReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/_aliases", strings.NewReader(`{
 		"actions": [
 			{
@@ -423,7 +423,7 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 					"index": "live_auto_index",
 					"alias": "live_checkout_alias",
 					"is_write_index": true,
-					"filter": {"term": {"service": "checkout"}}
+					"filter": {"term": {"service": "checkout-api"}}
 				}
 			}
 		]
@@ -434,6 +434,16 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 		t.Fatalf("POST /_aliases (filtered alias) on live Doris failed: status=%v err=%v", r8AliasResp.StatusCode, err)
 	}
 	_ = r8AliasResp.Body.Close()
+
+	// Index a second checkout-api document through the filtered write alias (total 3 docs in live_auto_index, 2 matching live_checkout_alias)
+	aliasWriteReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/live_checkout_alias/_doc/auto-3?refresh=true",
+		strings.NewReader(`{"service":"checkout-api","latency_ms":85,"ok":true}`))
+	aliasWriteReq.Header.Set("Content-Type", "application/json")
+	aliasWriteResp, err := http.DefaultClient.Do(aliasWriteReq)
+	if err != nil || (aliasWriteResp.StatusCode != http.StatusOK && aliasWriteResp.StatusCode != http.StatusCreated) {
+		t.Fatalf("PUT /live_checkout_alias/_doc/auto-3 via write alias failed: status=%v err=%v", aliasWriteResp.StatusCode, err)
+	}
+	_ = aliasWriteResp.Body.Close()
 
 	r8SearchBody := `{
 		"size": 0,
@@ -458,7 +468,7 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 				"filters": {
 					"other_bucket": true,
 					"filters": [
-						{"term": {"service": "checkout"}}
+						{"term": {"service": "checkout-api"}}
 					]
 				}
 			},
