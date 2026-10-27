@@ -1,4 +1,4 @@
-# Running `doris-es-proxy` Examples
+# Running `doris-es-proxy` Examples & Ecosystem Integrations
 
 ## Option 1: Instant Local Demo (Zero Docker Required)
 
@@ -36,22 +36,67 @@ make test-e2e
 
 ---
 
-## Option 3: Connecting OpenMetadata or DataHub to `doris-es-proxy`
+## Option 3: Ecosystem Integration Configurations
 
-Point OpenMetadata (`openmetadata.yaml` or environment variables) directly at `doris-es-proxy:9200`:
+### 1. OpenMetadata (`openmetadata.yaml`)
+
+Point OpenMetadata directly at `doris-es-proxy:9200`:
 
 ```yaml
 elasticsearch:
   searchType: elasticsearch
-  host: localhost # or doris-es-proxy in Docker network
+  host: localhost # or doris-es-proxy in Docker/K8s network
   port: 9200
   scheme: http
 ```
 
-Or for DataHub (`mae-consumer` / `gms`):
+### 2. DataHub (`mae-consumer` / `gms`)
 
 ```bash
 ELASTICSEARCH_HOST=doris-es-proxy
 ELASTICSEARCH_PORT=9200
 ELASTICSEARCH_USE_SSL=false
+```
+
+### 3. Grafana Elasticsearch Data Source (`provisioning/datasources/doris-es.yaml`)
+
+```yaml
+apiVersion: 1
+datasources:
+  - name: Apache Doris (via doris-es-proxy)
+    type: elasticsearch
+    access: proxy
+    url: http://doris-es-proxy:9200
+    jsonData:
+      index: "logs-*"
+      timeField: "@timestamp"
+      esVersion: "8.11.0"
+      logMessageField: "message"
+      logLevelField: "level"
+```
+
+### 4. Vector / Fluent Bit Log Shipping (`vector.toml`)
+
+```toml
+[sinks.doris_es]
+type = "elasticsearch"
+inputs = ["app_logs"]
+endpoints = ["http://doris-es-proxy:9200"]
+mode = "bulk"
+bulk.index = "logs-%Y.%m.%d"
+compression = "gzip"
+```
+
+### 5. LangChain / LlamaIndex Hybrid Vector + Full-Text Search
+
+```python
+from langchain_elasticsearch import ElasticsearchStore
+
+vector_store = ElasticsearchStore(
+    es_url="http://localhost:9200",
+    index_name="rag_chunks",
+    embedding=embeddings,
+    strategy=ElasticsearchStore.ApproxRetrievalStrategy(hybrid=True),
+)
+docs = vector_store.similarity_search("Apache Doris inverted index", k=5)
 ```

@@ -304,6 +304,92 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 		t.Fatalf("expected ingest pipeline to set env=prod on live Doris, got: %+v", auto2Doc)
 	}
 
+	// 6c. Round-5 & Round-6 Advanced DSL + Aggregations + Pipeline Aggs + filter_path + _field_caps on Live Doris 4.x
+	advSearchPayload := `{
+		"size": 10,
+		"query": {
+			"bool": {
+				"must": [
+					{"match_bool_prefix": {"service": "checkout"}},
+					{"terms_set": {
+						"service": {
+							"terms": ["checkout-api", "billing-api"],
+							"minimum_should_match_script": {"source": "Math.min(params.num_terms, 1)"}
+						}
+					}}
+				]
+			}
+		},
+		"aggs": {
+			"sig_services": {
+				"significant_terms": {"field": "service", "size": 5}
+			},
+			"comp_hist": {
+				"composite": {
+					"size": 1,
+					"sources": [
+						{"lat_bucket": {"histogram": {"field": "latency_ms", "interval": 20}}}
+					]
+				}
+			},
+			"lat_hist": {
+				"histogram": {"field": "latency_ms", "interval": 20},
+				"aggs": {
+					"avg_lat": {"avg": {"field": "latency_ms"}},
+					"cum_lat": {"cumulative_sum": {"buckets_path": "avg_lat"}},
+					"deriv_lat": {"derivative": {"buckets_path": "avg_lat"}},
+					"double_lat": {"bucket_script": {"buckets_path": {"v": "avg_lat"}, "script": "params.v * 2"}}
+				}
+			},
+			"overall_lat_stats": {
+				"stats_bucket": {"buckets_path": "lat_hist>avg_lat"}
+			}
+		}
+	}`
+	advResp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(advSearchPayload))
+	if err != nil || advResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(advResp.Body)
+		t.Fatalf("POST /live_auto_index/_search (advanced DSL + aggs) failed: status=%v err=%v body=%s", advResp.StatusCode, err, string(b))
+	}
+	var advRes map[string]any
+	_ = json.NewDecoder(advResp.Body).Decode(&advRes)
+	_ = advResp.Body.Close()
+	if advRes["hits"].(map[string]any)["total"].(map[string]any)["value"] != float64(1) {
+		t.Fatalf("expected 1 hit for match_bool_prefix + terms_set on live Doris, got: %+v", advRes)
+	}
+	aggsMap, _ := advRes["aggregations"].(map[string]any)
+	compHist, _ := aggsMap["comp_hist"].(map[string]any)
+	afterKey, _ := compHist["after_key"].(map[string]any)
+	if afterKey == nil || afterKey["lat_bucket"] == nil {
+		t.Fatalf("expected composite after_key.lat_bucket on live Doris, got: %+v", compHist)
+	}
+	// Verify composite `after` pagination works with numeric histogram key on live Doris
+	afterSearch := fmt.Sprintf(`{"size":0,"aggs":{"comp_hist":{"composite":{"size":5,"after":{"lat_bucket":%v},"sources":[{"lat_bucket":{"histogram":{"field":"latency_ms","interval":20}}}]}}}}`, afterKey["lat_bucket"])
+	afterResp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(afterSearch))
+	if err != nil || afterResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(afterResp.Body)
+		t.Fatalf("POST /live_auto_index/_search (composite after) failed: status=%v err=%v body=%s", afterResp.StatusCode, err, string(b))
+	}
+	_ = afterResp.Body.Close()
+
+	// Verify ?filter_path=hits.hits._id and _field_caps on live Doris
+	fpResp, err := http.Post(ts.URL+"/live_auto_index/_search?filter_path=hits.hits._id", "application/json", strings.NewReader(`{"query":{"match_all":{}}}`))
+	if err != nil || fpResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search?filter_path failed: status=%v err=%v", fpResp.StatusCode, err)
+	}
+	var fpRes map[string]any
+	_ = json.NewDecoder(fpResp.Body).Decode(&fpRes)
+	_ = fpResp.Body.Close()
+	if _, hasTook := fpRes["took"]; hasTook || fpRes["hits"] == nil {
+		t.Fatalf("expected filter_path=hits.hits._id to strip took and retain hits, got: %+v", fpRes)
+	}
+
+	fcResp, err := http.Get(ts.URL + "/live_table_index/_field_caps?fields=*")
+	if err != nil || fcResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /live_table_index/_field_caps failed: status=%v err=%v", fcResp.StatusCode, err)
+	}
+	_ = fcResp.Body.Close()
+
 	// 7. Stateless _es_catalog Rehydration across a fresh Server instance
 	srv2 := proxy.NewServer(dorisDB, backend, transpiler.TranspilerOptions{})
 	if err := srv2.BootstrapCatalog(context.Background()); err != nil {

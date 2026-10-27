@@ -60,16 +60,21 @@ var (
 
 type gzipResponseWriter struct {
 	http.ResponseWriter
-	gz          *gzip.Writer
-	wroteHeader bool
+	gz            *gzip.Writer
+	wroteHeader   bool
+	gzInitialized bool
 }
 
 func (w *gzipResponseWriter) WriteHeader(status int) {
 	if !w.wroteHeader {
 		w.wroteHeader = true
-		w.ResponseWriter.Header().Del("Content-Length")
-		w.ResponseWriter.Header().Set("Content-Encoding", "gzip")
-		w.ResponseWriter.Header().Add("Vary", "Accept-Encoding")
+		if status >= 200 && status != http.StatusNoContent && status != http.StatusNotModified {
+			w.ResponseWriter.Header().Del("Content-Length")
+			w.ResponseWriter.Header().Set("Content-Encoding", "gzip")
+			w.ResponseWriter.Header().Add("Vary", "Accept-Encoding")
+			w.gz.Reset(w.ResponseWriter)
+			w.gzInitialized = true
+		}
 		w.ResponseWriter.WriteHeader(status)
 	}
 }
@@ -78,12 +83,17 @@ func (w *gzipResponseWriter) Write(b []byte) (int, error) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
+	if !w.gzInitialized {
+		return w.ResponseWriter.Write(b)
+	}
 	return w.gz.Write(b)
 }
 
 func (w *gzipResponseWriter) Close() {
 	if w.gz != nil {
-		_ = w.gz.Close()
+		if w.gzInitialized {
+			_ = w.gz.Close()
+		}
 		w.gz.Reset(io.Discard)
 		gzipWriterPool.Put(w.gz)
 		w.gz = nil
@@ -165,6 +175,9 @@ func applyESFilterPath(v any, filterPaths []string) any {
 	if len(posPatterns) > 0 {
 		filtered, ok := filterIncludeNode(out, posPatterns)
 		if !ok {
+			if _, isSlice := out.([]any); isSlice {
+				return []any{}
+			}
 			return map[string]any{}
 		}
 		out = filtered
@@ -187,12 +200,15 @@ func advanceFilterPatterns(patterns [][]string, key string) [][]string {
 			next = append(next, p)
 			if len(p) == 1 {
 				next = append(next, []string{})
-			} else if matchWildcardPattern(p[1], key) {
-				next = append(next, p[2:])
-			} else if hasDot && len(p) >= 3 {
-				for k := 3; k <= len(p); k++ {
-					if matchWildcardPattern(strings.Join(p[1:k], "."), key) {
-						next = append(next, p[k:])
+			} else {
+				if matchWildcardPattern(p[1], key) {
+					next = append(next, p[2:])
+				}
+				if hasDot && len(p) >= 3 {
+					for k := 3; k <= len(p); k++ {
+						if matchWildcardPattern(strings.Join(p[1:k], "."), key) {
+							next = append(next, p[k:])
+						}
 					}
 				}
 			}
@@ -200,7 +216,8 @@ func advanceFilterPatterns(patterns [][]string, key string) [][]string {
 		}
 		if matchWildcardPattern(p[0], key) {
 			next = append(next, p[1:])
-		} else if hasDot && len(p) >= 2 {
+		}
+		if hasDot && len(p) >= 2 {
 			for k := 2; k <= len(p); k++ {
 				if matchWildcardPattern(strings.Join(p[:k], "."), key) {
 					next = append(next, p[k:])
@@ -266,7 +283,13 @@ func filterExcludeNode(node any, negPatterns [][]string) any {
 				continue
 			}
 			if len(next) > 0 {
-				out[k] = filterExcludeNode(val, next)
+				child := filterExcludeNode(val, next)
+				if valMap, wasMap := val.(map[string]any); wasMap && len(valMap) > 0 {
+					if childMap, isMap := child.(map[string]any); isMap && len(childMap) == 0 {
+						continue
+					}
+				}
+				out[k] = child
 			} else {
 				out[k] = val
 			}
@@ -356,7 +379,6 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 
 		if r.Method != http.MethodHead && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 			gz := gzipWriterPool.Get().(*gzip.Writer)
-			gz.Reset(w)
 			gzw := &gzipResponseWriter{ResponseWriter: w, gz: gz}
 			defer gzw.Close()
 			w = gzw

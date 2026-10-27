@@ -303,12 +303,22 @@ func (qc *QueryResultCache) InvalidateAll() {
 }
 
 func containsNowDateMath(req *esast.SearchRequest, reqBytes []byte) bool {
-	if bytes.Contains(reqBytes, []byte(`"now`)) ||
-		bytes.Contains(reqBytes, []byte("now-")) ||
-		bytes.Contains(reqBytes, []byte("now+")) ||
-		bytes.Contains(reqBytes, []byte("now/")) ||
-		bytes.Contains(reqBytes, []byte("TO now")) {
-		return true
+	lowerBytes := bytes.ToLower(reqBytes)
+	for _, pat := range [][]byte{
+		[]byte(`"now`),
+		[]byte("now-"),
+		[]byte("now+"),
+		[]byte("now/"),
+		[]byte("to now"),
+		[]byte(":now"),
+		[]byte(">now"),
+		[]byte("<now"),
+		[]byte("=now"),
+		[]byte("(now"),
+	} {
+		if bytes.Contains(lowerBytes, pat) {
+			return true
+		}
 	}
 	if req != nil {
 		if queryContainsNow(req.Query) || queryContainsNow(req.PostFilter) {
@@ -321,6 +331,55 @@ func containsNowDateMath(req *esast.SearchRequest, reqBytes []byte) bool {
 				}
 			}
 		}
+		if aggsContainNow(req.EffectiveAggs()) {
+			return true
+		}
+	}
+	return false
+}
+
+func aggsContainNow(aggs map[string]esast.AggSpec) bool {
+	for _, agg := range aggs {
+		if queryContainsNow(agg.Filter) {
+			return true
+		}
+		if agg.Filters != nil {
+			for k := range agg.Filters.Filters {
+				fq := agg.Filters.Filters[k]
+				if queryContainsNow(&fq) {
+					return true
+				}
+			}
+		}
+		if agg.DateHistogram != nil {
+			if boundsContainNow(agg.DateHistogram.ExtendedBounds) || boundsContainNow(agg.DateHistogram.HardBounds) {
+				return true
+			}
+		}
+		if agg.DateRange != nil {
+			for _, r := range agg.DateRange.Ranges {
+				if boundValContainsNow(r.From) || boundValContainsNow(r.To) {
+					return true
+				}
+			}
+		}
+		if aggsContainNow(agg.SubAggs()) {
+			return true
+		}
+	}
+	return false
+}
+
+func boundsContainNow(b *esast.HistogramBoundsSpec) bool {
+	if b == nil {
+		return false
+	}
+	return boundValContainsNow(b.Min) || boundValContainsNow(b.Max)
+}
+
+func boundValContainsNow(v any) bool {
+	if s, ok := v.(string); ok {
+		return strings.Contains(strings.ToLower(s), "now")
 	}
 	return false
 }
@@ -329,11 +388,16 @@ func queryContainsNow(q *esast.Query) bool {
 	if q == nil {
 		return false
 	}
-	if q.QueryString != nil && strings.Contains(q.QueryString.Query, "now") {
+	if q.QueryString != nil && strings.Contains(strings.ToLower(q.QueryString.Query), "now") {
 		return true
 	}
-	if q.SimpleQueryString != nil && strings.Contains(q.SimpleQueryString.Query, "now") {
+	if q.SimpleQueryString != nil && strings.Contains(strings.ToLower(q.SimpleQueryString.Query), "now") {
 		return true
+	}
+	for _, rc := range q.Range {
+		if boundValContainsNow(rc.GT) || boundValContainsNow(rc.GTE) || boundValContainsNow(rc.LT) || boundValContainsNow(rc.LTE) || boundValContainsNow(rc.From) || boundValContainsNow(rc.To) {
+			return true
+		}
 	}
 	if q.ConstantScore != nil && queryContainsNow(&q.ConstantScore.Filter) {
 		return true
