@@ -445,8 +445,21 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	}
 	_ = aliasWriteResp.Body.Close()
 
+	// Verify filtered alias single-doc GET enforces the alias filter on live Doris (auto-2 is payment-api -> 404; auto-3 is checkout-api -> 200)
+	filteredMissResp, err := http.Get(ts.URL + "/live_checkout_alias/_doc/auto-2")
+	if err != nil || filteredMissResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected GET /live_checkout_alias/_doc/auto-2 (payment-api) to return 404, got status=%v err=%v", filteredMissResp.StatusCode, err)
+	}
+	_ = filteredMissResp.Body.Close()
+	filteredHitResp, err := http.Get(ts.URL + "/live_checkout_alias/_doc/auto-3")
+	if err != nil || filteredHitResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected GET /live_checkout_alias/_doc/auto-3 (checkout-api) to return 200, got status=%v err=%v", filteredHitResp.StatusCode, err)
+	}
+	_ = filteredHitResp.Body.Close()
+
 	r8SearchBody := `{
 		"size": 0,
+		"query": {"term": {"latency_ms": 42}},
 		"aggs": {
 			"all_global": {
 				"global": {},
@@ -476,7 +489,11 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 				"histogram": {"field": "latency_ms", "interval": 20},
 				"aggs": {
 					"sum_lat": {"sum": {"field": "latency_ms"}},
+					"sub_box": {"boxplot": {"field": "latency_ms"}},
+					"sub_ranks": {"percentile_ranks": {"field": "latency_ms", "values": [50]}},
+					"sub_str": {"string_stats": {"field": "service"}},
 					"mov_lat": {"moving_avg": {"buckets_path": "sum_lat", "window": 2}},
+					"mov_max": {"moving_fn": {"buckets_path": "sum_lat", "window": 2, "script": "MovingFunctions.max(values)"}},
 					"diff_lat": {"serial_diff": {"buckets_path": "sum_lat", "lag": 1}}
 				}
 			},
@@ -487,21 +504,25 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	r8Resp, err := http.Post(ts.URL+"/live_checkout_alias/_search", "application/json", strings.NewReader(r8SearchBody))
 	if err != nil || r8Resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(r8Resp.Body)
-		t.Fatalf("POST /live_checkout_alias/_search (Round-8 aggs) failed: status=%v err=%v body=%s", r8Resp.StatusCode, err, string(b))
+		t.Fatalf("POST /live_checkout_alias/_search (Round-8/9 aggs) failed: status=%v err=%v body=%s", r8Resp.StatusCode, err, string(b))
 	}
 	var r8Res map[string]any
 	_ = json.NewDecoder(r8Resp.Body).Decode(&r8Res)
 	_ = r8Resp.Body.Close()
 
-	if r8Res["hits"].(map[string]any)["total"].(map[string]any)["value"] != float64(2) {
-		t.Fatalf("expected filtered alias live_checkout_alias to match 2 checkout docs on live Doris, got: %+v", r8Res["hits"])
+	if r8Res["hits"].(map[string]any)["total"].(map[string]any)["value"] != float64(1) {
+		t.Fatalf("expected filtered alias live_checkout_alias with latency_ms=42 query to match 1 doc on live Doris, got: %+v", r8Res["hits"])
 	}
 	r8Aggs := r8Res["aggregations"].(map[string]any)
 	allGlobal := r8Aggs["all_global"].(map[string]any)
-	if allGlobal["doc_count"] != float64(3) {
-		t.Fatalf("expected global agg on live Doris to see all 3 docs in live_auto_index, got: %+v", allGlobal)
+	if allGlobal["doc_count"] != float64(2) {
+		t.Fatalf("expected global agg on live_checkout_alias to escape query (1->2) while respecting alias filter (excluding payment-api doc), got: %+v", allGlobal)
+	}
+	extLat := allGlobal["ext_lat"].(map[string]any)
+	if extLat["sum_of_squares"] == nil || extLat["sum_of_squares"].(float64) <= 0 {
+		t.Fatalf("expected extended_stats sum_of_squares > 0 on live Doris, got: %+v", extLat)
 	}
 	if r8Aggs["str_svc"] == nil || r8Aggs["lat_box"] == nil || r8Aggs["lat_ranks"] == nil || r8Aggs["latest_lat"] == nil || r8Aggs["ext_bucket"] == nil || r8Aggs["pct_bucket"] == nil {
-		t.Fatalf("missing Round-8 aggregations in live Doris response: %+v", r8Aggs)
+		t.Fatalf("missing Round-8/9 aggregations in live Doris response: %+v", r8Aggs)
 	}
 }
