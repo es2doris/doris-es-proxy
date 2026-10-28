@@ -533,15 +533,18 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 		t.Fatalf("missing Round-8/9/10 aggregations in live Doris response: %+v", r8Aggs)
 	}
 
-	// 12. Verify Round-10 DELETE /{alias} guard (400), _terms_enum, and _explain on live Doris
-	delAliasReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/live_checkout_alias", nil)
-	delAliasResp, err := http.DefaultClient.Do(delAliasReq)
-	if err != nil || delAliasResp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("expected DELETE /live_checkout_alias to return 400 Bad Request, got status=%v err=%v", delAliasResp.StatusCode, err)
+	// 12. Verify Round-10 & Round-11 DELETE /{alias} guards (single, comma-separated, wildcard -> 400),
+	// _terms_enum (including case_insensitive=true), _explain, _ingest/pipeline/_simulate, and composite order="desc" on live Doris
+	for _, aliasTarget := range []string{"live_checkout_alias", "live_checkout_alias,live_checkout_alias", "live_checkout_*"} {
+		delAliasReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/"+aliasTarget, nil)
+		delAliasResp, err := http.DefaultClient.Do(delAliasReq)
+		if err != nil || delAliasResp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("expected DELETE /%s to return 400 Bad Request, got status=%v err=%v", aliasTarget, delAliasResp.StatusCode, err)
+		}
+		_ = delAliasResp.Body.Close()
 	}
-	_ = delAliasResp.Body.Close()
 
-	teResp, err := http.Post(ts.URL+"/live_checkout_alias/_terms_enum", "application/json", strings.NewReader(`{"field":"service","string":"check"}`))
+	teResp, err := http.Post(ts.URL+"/live_checkout_alias/_terms_enum", "application/json", strings.NewReader(`{"field":"service","string":"CHECK","case_insensitive":true}`))
 	if err != nil || teResp.StatusCode != http.StatusOK {
 		t.Fatalf("POST /live_checkout_alias/_terms_enum failed: status=%v err=%v", teResp.StatusCode, err)
 	}
@@ -552,4 +555,62 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 		t.Fatalf("POST /live_checkout_alias/_explain/auto-3 failed: status=%v err=%v", explDocResp.StatusCode, err)
 	}
 	_ = explDocResp.Body.Close()
+
+	simResp, err := http.Post(ts.URL+"/_ingest/pipeline/_simulate", "application/json", strings.NewReader(`{
+		"pipeline": {"processors": [{"set": {"field": "env", "value": "prod"}}]},
+		"docs": [{"_index": "live_auto_index", "_id": "sim-1", "_source": {"service": "checkout-api"}}]
+	}`))
+	if err != nil || simResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_ingest/pipeline/_simulate failed: status=%v err=%v", simResp.StatusCode, err)
+	}
+	_ = simResp.Body.Close()
+
+	compDescResp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
+		"size": 0,
+		"aggs": {
+			"comp_desc": {
+				"composite": {
+					"size": 1,
+					"sources": [
+						{"svc": {"terms": {"field": "service", "order": "desc"}}}
+					]
+				}
+			}
+		}
+	}`))
+	if err != nil || compDescResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search (composite desc) failed: status=%v err=%v", compDescResp.StatusCode, err)
+	}
+	var compDescRes map[string]any
+	_ = json.NewDecoder(compDescResp.Body).Decode(&compDescRes)
+	_ = compDescResp.Body.Close()
+	compDescAgg := compDescRes["aggregations"].(map[string]any)["comp_desc"].(map[string]any)
+	compBuckets := compDescAgg["buckets"].([]any)
+	if len(compBuckets) != 1 || compBuckets[0].(map[string]any)["key"].(map[string]any)["svc"] != "checkout-api" {
+		t.Fatalf("expected first descending composite bucket on live Doris to be checkout-api (checkout-api > billing-api), got: %+v", compBuckets)
+	}
+	compPage2Resp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
+		"size": 0,
+		"aggs": {
+			"comp_desc": {
+				"composite": {
+					"size": 1,
+					"after": {"svc": "checkout-api"},
+					"sources": [
+						{"svc": {"terms": {"field": "service", "order": "desc"}}}
+					]
+				}
+			}
+		}
+	}`))
+	if err != nil || compPage2Resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search (composite desc page 2) failed: status=%v err=%v", compPage2Resp.StatusCode, err)
+	}
+	var compPage2Res map[string]any
+	_ = json.NewDecoder(compPage2Resp.Body).Decode(&compPage2Res)
+	_ = compPage2Resp.Body.Close()
+	compPage2Buckets := compPage2Res["aggregations"].(map[string]any)["comp_desc"].(map[string]any)["buckets"].([]any)
+	if len(compPage2Buckets) != 1 || compPage2Buckets[0].(map[string]any)["key"].(map[string]any)["svc"] != "billing-api" {
+		t.Fatalf("expected second descending composite bucket on live Doris to be billing-api, got: %+v", compPage2Buckets)
+	}
 }

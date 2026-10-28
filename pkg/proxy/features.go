@@ -28,6 +28,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1085,15 +1086,86 @@ func (s *Server) applyIngestPipelineIfPresent(pipelineID string, raw json.RawMes
 	if !ok || pipe == nil {
 		return raw
 	}
+	out, _, _ := applyIngestPipelineSpec(pipe, raw)
+	return out
+}
+
+var reIngestCtxField = regexp.MustCompile(`\bctx(\??)\.([a-zA-Z0-9_@-]+)`)
+var reIngestCtxBracket = regexp.MustCompile(`\bctx(\??)\[`)
+
+func evalIngestIfCondition(cond string, doc map[string]any) bool {
+	cond = strings.TrimSpace(cond)
+	if cond == "" {
+		return true
+	}
+	normCond := reIngestCtxField.ReplaceAllStringFunc(cond, func(m string) string {
+		if strings.HasPrefix(m, "ctx._source") || strings.HasPrefix(m, "ctx?._source") || strings.HasPrefix(m, "ctx.op") {
+			return m
+		}
+		if strings.HasPrefix(m, "ctx?.") {
+			return "ctx?._source." + m[5:]
+		}
+		return "ctx._source." + m[4:]
+	})
+	normCond = reIngestCtxBracket.ReplaceAllString(normCond, "ctx$1._source[")
+	script := "if (" + normCond + ") { ctx.op = 'index' } else { ctx.op = 'noop' }"
+	opRes, err := painless.EvalPainlessWithOp(doc, script, nil)
+	if err != nil {
+		return false
+	}
+	return opRes == "index"
+}
+
+func expandIngestTemplate(val any, doc map[string]any) any {
+	s, ok := val.(string)
+	if !ok || !strings.Contains(s, "{{") {
+		return val
+	}
+	var out strings.Builder
+	i := 0
+	for i < len(s) {
+		start := strings.Index(s[i:], "{{")
+		if start < 0 {
+			out.WriteString(s[i:])
+			break
+		}
+		out.WriteString(s[i : i+start])
+		i += start
+		triple := strings.HasPrefix(s[i:], "{{{")
+		openLen := 2
+		closeSeq := "}}"
+		if triple {
+			openLen = 3
+			closeSeq = "}}}"
+		}
+		end := strings.Index(s[i+openLen:], closeSeq)
+		if end < 0 {
+			out.WriteString(s[i:])
+			break
+		}
+		key := strings.TrimSpace(s[i+openLen : i+openLen+end])
+		key = strings.TrimPrefix(key, "_source.")
+		if v, exists := getIngestPath(doc, key); exists && v != nil {
+			_, _ = fmt.Fprintf(&out, "%v", v)
+		}
+		i += openLen + end + len(closeSeq)
+	}
+	return out.String()
+}
+
+func applyIngestPipelineSpec(pipe map[string]any, raw json.RawMessage) (json.RawMessage, bool, error) {
+	if pipe == nil || len(bytes.TrimSpace(raw)) == 0 {
+		return raw, false, nil
+	}
 	procs, _ := pipe["processors"].([]any)
 	if len(procs) == 0 {
-		return raw
+		return raw, false, nil
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	var doc map[string]any
 	if err := dec.Decode(&doc); err != nil || doc == nil {
-		return raw
+		return raw, false, err
 	}
 	mutated := false
 	for _, p := range procs {
@@ -1101,13 +1173,47 @@ func (s *Server) applyIngestPipelineIfPresent(pipelineID string, raw json.RawMes
 		if !ok {
 			continue
 		}
-		if setSpec, ok := pMap["set"].(map[string]any); ok {
-			if field, _ := setSpec["field"].(string); field != "" {
-				setIngestPath(doc, field, setSpec["value"])
-				mutated = true
+		if topIf, ok := pMap["if"].(string); ok && !evalIngestIfCondition(topIf, doc) {
+			continue
+		}
+		checkSpecIf := func(spec map[string]any) bool {
+			if cond, ok := spec["if"].(string); ok {
+				return evalIngestIfCondition(cond, doc)
+			}
+			return true
+		}
+		if dropSpec, ok := pMap["drop"].(map[string]any); ok {
+			if checkSpecIf(dropSpec) {
+				return json.RawMessage(`{}`), true, nil
 			}
 		}
-		if renSpec, ok := pMap["rename"].(map[string]any); ok {
+		if setSpec, ok := pMap["set"].(map[string]any); ok && checkSpecIf(setSpec) {
+			if field, _ := setSpec["field"].(string); field != "" {
+				if override, hasOverride := setSpec["override"].(bool); hasOverride && !override {
+					if existing, exists := getIngestPath(doc, field); exists && existing != nil {
+						continue
+					}
+				}
+				if copyFrom, _ := setSpec["copy_from"].(string); copyFrom != "" {
+					if val, exists := getIngestPath(doc, copyFrom); exists {
+						setIngestPath(doc, field, val)
+						mutated = true
+					}
+				} else if val, hasVal := setSpec["value"]; hasVal {
+					setIngestPath(doc, field, expandIngestTemplate(val, doc))
+					mutated = true
+				}
+			}
+		}
+		if defSpec, ok := pMap["default"].(map[string]any); ok && checkSpecIf(defSpec) {
+			if field, _ := defSpec["field"].(string); field != "" {
+				if existing, exists := getIngestPath(doc, field); !exists || existing == nil {
+					setIngestPath(doc, field, expandIngestTemplate(defSpec["value"], doc))
+					mutated = true
+				}
+			}
+		}
+		if renSpec, ok := pMap["rename"].(map[string]any); ok && checkSpecIf(renSpec) {
 			srcField, _ := renSpec["field"].(string)
 			dstField, _ := renSpec["target_field"].(string)
 			if srcField != "" && dstField != "" {
@@ -1118,7 +1224,7 @@ func (s *Server) applyIngestPipelineIfPresent(pipelineID string, raw json.RawMes
 				}
 			}
 		}
-		if remSpec, ok := pMap["remove"].(map[string]any); ok {
+		if remSpec, ok := pMap["remove"].(map[string]any); ok && checkSpecIf(remSpec) {
 			switch f := remSpec["field"].(type) {
 			case string:
 				deleteIngestPath(doc, f)
@@ -1132,45 +1238,397 @@ func (s *Server) applyIngestPipelineIfPresent(pipelineID string, raw json.RawMes
 				}
 			}
 		}
-		if lcSpec, ok := pMap["lowercase"].(map[string]any); ok {
+		if lcSpec, ok := pMap["lowercase"].(map[string]any); ok && checkSpecIf(lcSpec) {
 			if field, _ := lcSpec["field"].(string); field != "" {
+				target := field
+				if tf, _ := lcSpec["target_field"].(string); tf != "" {
+					target = tf
+				}
 				if val, ok := getIngestPath(doc, field); ok {
-					if strVal, ok := val.(string); ok {
-						setIngestPath(doc, field, strings.ToLower(strVal))
+					switch v := val.(type) {
+					case string:
+						setIngestPath(doc, target, strings.ToLower(v))
+						mutated = true
+					case []any:
+						out := make([]any, len(v))
+						for i, el := range v {
+							if s, ok := el.(string); ok {
+								out[i] = strings.ToLower(s)
+							} else {
+								out[i] = el
+							}
+						}
+						setIngestPath(doc, target, out)
 						mutated = true
 					}
 				}
 			}
 		}
-		if ucSpec, ok := pMap["uppercase"].(map[string]any); ok {
+		if ucSpec, ok := pMap["uppercase"].(map[string]any); ok && checkSpecIf(ucSpec) {
 			if field, _ := ucSpec["field"].(string); field != "" {
+				target := field
+				if tf, _ := ucSpec["target_field"].(string); tf != "" {
+					target = tf
+				}
 				if val, ok := getIngestPath(doc, field); ok {
-					if strVal, ok := val.(string); ok {
-						setIngestPath(doc, field, strings.ToUpper(strVal))
+					switch v := val.(type) {
+					case string:
+						setIngestPath(doc, target, strings.ToUpper(v))
+						mutated = true
+					case []any:
+						out := make([]any, len(v))
+						for i, el := range v {
+							if s, ok := el.(string); ok {
+								out[i] = strings.ToUpper(s)
+							} else {
+								out[i] = el
+							}
+						}
+						setIngestPath(doc, target, out)
 						mutated = true
 					}
 				}
 			}
 		}
-		if trimSpec, ok := pMap["trim"].(map[string]any); ok {
+		if trimSpec, ok := pMap["trim"].(map[string]any); ok && checkSpecIf(trimSpec) {
 			if field, _ := trimSpec["field"].(string); field != "" {
+				target := field
+				if tf, _ := trimSpec["target_field"].(string); tf != "" {
+					target = tf
+				}
+				if val, ok := getIngestPath(doc, field); ok {
+					switch v := val.(type) {
+					case string:
+						setIngestPath(doc, target, strings.TrimSpace(v))
+						mutated = true
+					case []any:
+						out := make([]any, len(v))
+						for i, el := range v {
+							if s, ok := el.(string); ok {
+								out[i] = strings.TrimSpace(s)
+							} else {
+								out[i] = el
+							}
+						}
+						setIngestPath(doc, target, out)
+						mutated = true
+					}
+				}
+			}
+		}
+		if splitSpec, ok := pMap["split"].(map[string]any); ok && checkSpecIf(splitSpec) {
+			field, _ := splitSpec["field"].(string)
+			sep, _ := splitSpec["separator"].(string)
+			target := field
+			if tf, _ := splitSpec["target_field"].(string); tf != "" {
+				target = tf
+			}
+			if field != "" && sep != "" {
 				if val, ok := getIngestPath(doc, field); ok {
 					if strVal, ok := val.(string); ok {
-						setIngestPath(doc, field, strings.TrimSpace(strVal))
+						var parts []string
+						if re, err := regexp.Compile(sep); err == nil {
+							parts = re.Split(strVal, -1)
+						} else {
+							parts = strings.Split(strVal, sep)
+						}
+						out := make([]any, len(parts))
+						for i, pt := range parts {
+							out[i] = pt
+						}
+						setIngestPath(doc, target, out)
 						mutated = true
+					}
+				}
+			}
+		}
+		if joinSpec, ok := pMap["join"].(map[string]any); ok && checkSpecIf(joinSpec) {
+			field, _ := joinSpec["field"].(string)
+			sep, _ := joinSpec["separator"].(string)
+			target := field
+			if tf, _ := joinSpec["target_field"].(string); tf != "" {
+				target = tf
+			}
+			if field != "" {
+				if val, ok := getIngestPath(doc, field); ok {
+					if arr, ok := val.([]any); ok {
+						strs := make([]string, len(arr))
+						for i, el := range arr {
+							strs[i] = fmt.Sprintf("%v", el)
+						}
+						setIngestPath(doc, target, strings.Join(strs, sep))
+						mutated = true
+					}
+				}
+			}
+		}
+		if appendSpec, ok := pMap["append"].(map[string]any); ok && checkSpecIf(appendSpec) {
+			if field, _ := appendSpec["field"].(string); field != "" {
+				allowDups := true
+				if ad, hasAD := appendSpec["allow_duplicates"].(bool); hasAD {
+					allowDups = ad
+				}
+				var curSlice []any
+				if existing, exists := getIngestPath(doc, field); exists && existing != nil {
+					if arr, ok := existing.([]any); ok {
+						curSlice = append(curSlice, arr...)
+					} else {
+						curSlice = append(curSlice, existing)
+					}
+				}
+				var toAdd []any
+				if arr, ok := appendSpec["value"].([]any); ok {
+					toAdd = arr
+				} else if v, hasV := appendSpec["value"]; hasV {
+					toAdd = []any{v}
+				}
+				for _, item := range toAdd {
+					expanded := expandIngestTemplate(item, doc)
+					if !allowDups {
+						dup := false
+						for _, ex := range curSlice {
+							if fmt.Sprintf("%v", ex) == fmt.Sprintf("%v", expanded) {
+								dup = true
+								break
+							}
+						}
+						if dup {
+							continue
+						}
+					}
+					curSlice = append(curSlice, expanded)
+				}
+				setIngestPath(doc, field, curSlice)
+				mutated = true
+			}
+		}
+		if convSpec, ok := pMap["convert"].(map[string]any); ok && checkSpecIf(convSpec) {
+			field, _ := convSpec["field"].(string)
+			convType, _ := convSpec["type"].(string)
+			target := field
+			if tf, _ := convSpec["target_field"].(string); tf != "" {
+				target = tf
+			}
+			if field != "" && convType != "" {
+				if val, exists := getIngestPath(doc, field); exists && val != nil {
+					str := strings.TrimSpace(fmt.Sprintf("%v", val))
+					switch strings.ToLower(convType) {
+					case "integer", "int", "long":
+						if iv, err := strconv.ParseInt(str, 10, 64); err == nil {
+							setIngestPath(doc, target, iv)
+							mutated = true
+						} else if fv, err := strconv.ParseFloat(str, 64); err == nil {
+							setIngestPath(doc, target, int64(fv))
+							mutated = true
+						}
+					case "float", "double":
+						if fv, err := strconv.ParseFloat(str, 64); err == nil {
+							setIngestPath(doc, target, fv)
+							mutated = true
+						}
+					case "string":
+						setIngestPath(doc, target, fmt.Sprintf("%v", val))
+						mutated = true
+					case "boolean", "bool":
+						if bv, err := strconv.ParseBool(str); err == nil {
+							setIngestPath(doc, target, bv)
+							mutated = true
+						}
+					case "auto":
+						if iv, err := strconv.ParseInt(str, 10, 64); err == nil {
+							setIngestPath(doc, target, iv)
+						} else if fv, err := strconv.ParseFloat(str, 64); err == nil {
+							setIngestPath(doc, target, fv)
+						} else if bv, err := strconv.ParseBool(str); err == nil {
+							setIngestPath(doc, target, bv)
+						} else {
+							setIngestPath(doc, target, str)
+						}
+						mutated = true
+					}
+				}
+			}
+		}
+		if gsubSpec, ok := pMap["gsub"].(map[string]any); ok && checkSpecIf(gsubSpec) {
+			field, _ := gsubSpec["field"].(string)
+			pat, _ := gsubSpec["pattern"].(string)
+			repl, _ := gsubSpec["replacement"].(string)
+			target := field
+			if tf, _ := gsubSpec["target_field"].(string); tf != "" {
+				target = tf
+			}
+			if field != "" && pat != "" {
+				if val, exists := getIngestPath(doc, field); exists {
+					if strVal, ok := val.(string); ok {
+						if re, err := regexp.Compile(pat); err == nil {
+							setIngestPath(doc, target, re.ReplaceAllString(strVal, repl))
+							mutated = true
+						}
+					}
+				}
+			}
+		}
+		if jsonSpec, ok := pMap["json"].(map[string]any); ok && checkSpecIf(jsonSpec) {
+			field, _ := jsonSpec["field"].(string)
+			target := field
+			if tf, _ := jsonSpec["target_field"].(string); tf != "" {
+				target = tf
+			}
+			addToRoot, _ := jsonSpec["add_to_root"].(bool)
+			if field != "" {
+				if val, exists := getIngestPath(doc, field); exists {
+					if strVal, ok := val.(string); ok {
+						var parsed any
+						if err := json.Unmarshal([]byte(strVal), &parsed); err == nil {
+							if addToRoot {
+								if m, ok := parsed.(map[string]any); ok {
+									for k, v := range m {
+										doc[k] = v
+									}
+									mutated = true
+								}
+							} else {
+								setIngestPath(doc, target, parsed)
+								mutated = true
+							}
+						}
+					}
+				}
+			}
+		}
+		if scriptSpec, ok := pMap["script"].(map[string]any); ok && checkSpecIf(scriptSpec) {
+			src, _ := scriptSpec["source"].(string)
+			if src == "" {
+				src, _ = scriptSpec["inline"].(string)
+			}
+			params, _ := scriptSpec["params"].(map[string]any)
+			if src != "" {
+				normSrc := reIngestCtxField.ReplaceAllStringFunc(src, func(m string) string {
+					if strings.HasPrefix(m, "ctx._source") || strings.HasPrefix(m, "ctx?._source") || strings.HasPrefix(m, "ctx.op") {
+						return m
+					}
+					if strings.HasPrefix(m, "ctx?.") {
+						return "ctx?._source." + m[5:]
+					}
+					return "ctx._source." + m[4:]
+				})
+				normSrc = reIngestCtxBracket.ReplaceAllString(normSrc, "ctx$1._source[")
+				docBytes, err := json.Marshal(doc)
+				if err == nil {
+					upd := &painless.UpdateRequest{
+						Script: &painless.ScriptSpec{
+							Source: normSrc,
+							Params: params,
+						},
+					}
+					if mutatedBytes, opRes, err := painless.ApplyUpdateWithResult(docBytes, upd, true); err == nil && opRes != "noop" {
+						if opRes == "deleted" {
+							return json.RawMessage(`{}`), true, nil
+						}
+						var nextDoc map[string]any
+						dec2 := json.NewDecoder(bytes.NewReader(mutatedBytes))
+						dec2.UseNumber()
+						if err := dec2.Decode(&nextDoc); err == nil && nextDoc != nil {
+							doc = nextDoc
+							mutated = true
+						}
 					}
 				}
 			}
 		}
 	}
 	if !mutated {
-		return raw
+		return raw, false, nil
 	}
 	out, err := json.Marshal(doc)
 	if err != nil {
-		return raw
+		return raw, false, err
 	}
-	return json.RawMessage(out)
+	return json.RawMessage(out), false, nil
+}
+
+// handleSimulateIngestPipeline implements `POST /_ingest/pipeline/_simulate` and `POST /_ingest/pipeline/{id}/_simulate`.
+func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Request) {
+	bodyBytes, ok := readRequestBody(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Pipeline map[string]any   `json:"pipeline,omitempty"`
+		Docs     []map[string]any `json:"docs"`
+	}
+	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		if err := json.Unmarshal(bodyBytes, &req); err != nil {
+			writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+			return
+		}
+	}
+	pipe := req.Pipeline
+	if pipe == nil {
+		if id := r.PathValue("id"); id != "" {
+			_ = s.syncCatalogFromBackend(r.Context())
+			s.mu.RLock()
+			pipe = s.pipelines[id]
+			s.mu.RUnlock()
+			if pipe == nil {
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "pipeline ["+id+"] is missing")
+				return
+			}
+		}
+	}
+	if pipe == nil {
+		writeESError(w, http.StatusBadRequest, "parse_exception", "[pipeline] required property is missing")
+		return
+	}
+
+	docsOut := make([]map[string]any, 0, len(req.Docs))
+	nowISO := time.Now().UTC().Format(time.RFC3339Nano)
+	for i, item := range req.Docs {
+		docObj := item
+		if nested, ok := item["doc"].(map[string]any); ok {
+			docObj = nested
+		}
+		idx, _ := docObj["_index"].(string)
+		if idx == "" {
+			idx = "_index"
+		}
+		id, _ := docObj["_id"].(string)
+		if id == "" {
+			id = fmt.Sprintf("%d", i)
+		}
+		srcAny, hasSrc := docObj["_source"]
+		if !hasSrc {
+			srcAny = docObj
+		}
+		rawSrc, err := json.Marshal(srcAny)
+		if err != nil {
+			rawSrc = []byte(`{}`)
+		}
+		outBytes, dropped, _ := applyIngestPipelineSpec(pipe, rawSrc)
+		if dropped {
+			docsOut = append(docsOut, map[string]any{"doc": nil})
+			continue
+		}
+		var outSrc map[string]any
+		dec := json.NewDecoder(bytes.NewReader(outBytes))
+		dec.UseNumber()
+		_ = dec.Decode(&outSrc)
+		if outSrc == nil {
+			outSrc = map[string]any{}
+		}
+		docsOut = append(docsOut, map[string]any{
+			"doc": map[string]any{
+				"_index":   idx,
+				"_version": "-3",
+				"_id":      id,
+				"_source":  outSrc,
+				"_ingest": map[string]any{
+					"timestamp": nowISO,
+				},
+			},
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"docs": docsOut})
 }
 
 func getIngestPath(doc map[string]any, path string) (any, bool) {
@@ -1321,8 +1779,9 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		MaxDocs *int `json:"max_docs,omitempty"`
-		Source  struct {
+		MaxDocs   *int   `json:"max_docs,omitempty"`
+		Conflicts string `json:"conflicts,omitempty"`
+		Source    struct {
 			Index any          `json:"index"`
 			Query *esast.Query `json:"query,omitempty"`
 			Size  *int         `json:"size,omitempty"`
@@ -1330,12 +1789,16 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		Dest struct {
 			Index    string `json:"index"`
 			Pipeline string `json:"pipeline,omitempty"`
+			OpType   string `json:"op_type,omitempty"`
 		} `json:"dest"`
 		Script *painless.ScriptSpec `json:"script,omitempty"`
 	}
 	if err := json.Unmarshal(bodyBytes, &body); err != nil {
 		writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
 		return
+	}
+	if body.Conflicts == "" {
+		body.Conflicts = r.URL.Query().Get("conflicts")
 	}
 
 	var srcPattern string
@@ -1376,9 +1839,8 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	}
 	s.resolveTermsLookupsInAliasFilters(r.Context(), aliasFilters)
 
-	var totalMatched, totalCreated, totalDeleted, batches int
+	var totalMatched, totalCreated, totalUpdated, totalDeleted, versionConflicts, batches int
 	updSpec := &painless.UpdateRequest{Script: body.Script}
-	seqBase := time.Now().UnixNano()
 	batchSize := 1000
 	if body.Source.Size != nil && *body.Source.Size > 0 && *body.Source.Size < batchSize {
 		batchSize = *body.Source.Size
@@ -1425,9 +1887,11 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 			type preparedDoc struct {
 				id     string
 				source json.RawMessage
+				srcVer int64
 			}
 			var prepared []preparedDoc
 			var sampleDocs []json.RawMessage
+			var candIDs []string
 			for _, h := range hits {
 				totalMatched++
 				docSource := h.Source
@@ -1456,7 +1920,8 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "document does not match destination alias filter")
 					return
 				}
-				prepared = append(prepared, preparedDoc{id: h.ID, source: docSource})
+				prepared = append(prepared, preparedDoc{id: h.ID, source: docSource, srcVer: h.Version})
+				candIDs = append(candIDs, h.ID)
 				if destSchema == nil && len(sampleDocs) < 16 {
 					sampleDocs = append(sampleDocs, docSource)
 				}
@@ -1464,16 +1929,49 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 			if destSchema == nil {
 				destSchema = s.ensureWritableIndexSchemaWithDocs(r.Context(), destIndex, sampleDocs)
 			}
+			_ = s.coalescer.FlushTable(r.Context(), destSchema.DorisTable)
+			var existingDocs map[string]HitRow
+			if len(candIDs) > 0 {
+				existingDocs, _ = s.backend.GetDocsByIDs(r.Context(), destSchema.DorisDB, destSchema.DorisTable, candIDs)
+			}
+			isCreate := strings.EqualFold(strings.TrimSpace(body.Dest.OpType), "create")
+			proceedOnConflict := strings.EqualFold(strings.TrimSpace(body.Conflicts), "proceed")
+
 			var batchBuf bytes.Buffer
-			for i, pd := range prepared {
-				shredded, err := schema.ShredDocument(destSchema, pd.id, seqBase+int64(totalMatched)+int64(i), false, pd.source)
+			for _, pd := range prepared {
+				var minVer int64
+				if pd.srcVer > 0 {
+					minVer = pd.srcVer + 1
+				}
+				existing, exists := existingDocs[pd.id]
+				if exists {
+					conflict := isCreate || (destAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), destIndex, pd.id, existing.Source, destAliasFilter))
+					if conflict {
+						if proceedOnConflict {
+							versionConflicts++
+							continue
+						}
+						writeESError(w, http.StatusConflict, "version_conflict_engine_exception",
+							fmt.Sprintf("[%s]: version conflict, document already exists or belongs to another alias partition", pd.id))
+						return
+					}
+					if existing.Version+1 > minVer {
+						minVer = existing.Version + 1
+					}
+				}
+				nextVer := s.allocVersion(minVer)
+				shredded, err := schema.ShredDocument(destSchema, pd.id, nextVer, false, pd.source)
 				if err != nil {
 					writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 					return
 				}
 				batchBuf.Write(shredded)
 				batchBuf.WriteByte('\n')
-				totalCreated++
+				if exists {
+					totalUpdated++
+				} else {
+					totalCreated++
+				}
 			}
 			if batchBuf.Len() > 0 {
 				if err := s.streamLoad(r.Context(), destSchema.DorisTable, batchBuf.Bytes(), true); err != nil {
@@ -1499,12 +1997,12 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		"took":                   tookMs,
 		"timed_out":              false,
 		"total":                  totalMatched,
-		"updated":                0,
+		"updated":                totalUpdated,
 		"created":                totalCreated,
 		"deleted":                totalDeleted,
 		"batches":                batches,
-		"version_conflicts":      0,
-		"noops":                  totalMatched - totalCreated - totalDeleted,
+		"version_conflicts":      versionConflicts,
+		"noops":                  totalMatched - totalCreated - totalUpdated - totalDeleted - versionConflicts,
 		"retries":                map[string]any{"bulk": 0, "search": 0},
 		"throttled_millis":       0,
 		"requests_per_second":    -1.0,
@@ -2155,10 +2653,30 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 	if aggsMap, ok := resp["aggregations"].(map[string]any); ok {
 		if teObj, ok := aggsMap["_terms_enum"].(map[string]any); ok {
 			if buckets, ok := teObj["buckets"].([]map[string]any); ok {
+				allKeys := make([]string, 0, len(buckets))
 				for _, b := range buckets {
-					k := fmt.Sprintf("%v", b["key"])
-					if req.SearchAfter != "" && k <= req.SearchAfter {
-						continue
+					allKeys = append(allKeys, fmt.Sprintf("%v", b["key"]))
+				}
+				if req.CaseInsensitive {
+					sort.Slice(allKeys, func(i, j int) bool {
+						li, lj := strings.ToLower(allKeys[i]), strings.ToLower(allKeys[j])
+						if li != lj {
+							return li < lj
+						}
+						return allKeys[i] < allKeys[j]
+					})
+				}
+				saLower := strings.ToLower(req.SearchAfter)
+				for _, k := range allKeys {
+					if req.SearchAfter != "" {
+						if req.CaseInsensitive {
+							kLower := strings.ToLower(k)
+							if kLower < saLower || (kLower == saLower && k <= req.SearchAfter) {
+								continue
+							}
+						} else if k <= req.SearchAfter {
+							continue
+						}
 					}
 					if prefix != "" {
 						if req.CaseInsensitive {
@@ -2207,6 +2725,11 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 	applyURISearchParams(r, &req)
 
 	idxSchema := s.ensureIndexSchema(r.Context(), indexName)
+	tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
+	if _, err := tr.BuildSearchPlan(&esast.SearchRequest{Query: req.Query}); err != nil {
+		writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+		return
+	}
 	_ = s.coalescer.FlushTable(r.Context(), idxSchema.DorisTable)
 	hit, found, err := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, docID)
 	if err != nil {
@@ -2229,7 +2752,6 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 	}
 
 	matched := s.docMatchesAliasFilter(r.Context(), indexName, docID, hit.Source, req.Query)
-	tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
 	cq := tr.CompileQuery(req.Query, true, nil)
 	scoreVal := 0.0
 	desc := "no match on required clause (" + cq.WhereSQL + ")"
