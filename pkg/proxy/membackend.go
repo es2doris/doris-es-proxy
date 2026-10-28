@@ -434,8 +434,8 @@ func (m *MemoryBackend) QueryAggs(_ context.Context, sqlStr string) ([]AggRow, e
 }
 
 var (
-	reAggArrayExplode        = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(`_elem` AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_t` AS `_elem` WHERE (?:\\((.+)\\) AND )?`_elem` IS NOT NULL GROUP BY `_elem` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
-	reAggArrayExplodeMissing = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\(CAST\\(`_elem` AS STRING\\), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(CASE WHEN `([^`]+)` IS NULL.+?\\) `_t` AS `_elem`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
+	reAggArrayExplode        = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\((.+?) AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_t` AS `_elem` WHERE (?:\\((.+)\\) AND )?`_elem` IS NOT NULL GROUP BY (?:`_elem`|`_bucket_key`) ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
+	reAggArrayExplodeMissing = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\(CAST\\((.+?) AS STRING\\), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(CASE WHEN `([^`]+)` IS NULL.+?\\) `_t` AS `_elem`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggScalarTerms         = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\((.+?) AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (?:\\((.+)\\) AND )?(?:`[^`]+`|CAST\\([^)]+\\)|`_doc`\\[[^\\]]+\\]|'[^']*') IS NOT NULL GROUP BY .+? ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggScalarTermsMissing  = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\(CAST\\((.+?) AS STRING\\), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggNestedTerms         = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, json_extract_string\\(`_nel`, '\\$\\.([^']+)'\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_nt` AS `_nel` WHERE (?:\\((.+)\\) AND )?json_extract_string\\(`_nel`, '\\$\\.[^']+'\\) IS NOT NULL GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
@@ -496,16 +496,32 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 	}
 
 	if m := reAggArrayExplode.FindStringSubmatch(branch); m != nil {
-		aggName, arrCol, extraWhere := m[1], m[2], m[3]
-		limit, _ := strconv.Atoi(m[4])
+		aggName, elemExpr, arrCol, extraWhere := m[1], m[2], m[3], m[4]
+		limit, _ := strconv.Atoi(m[5])
 		counts := make(map[string]int64)
 		for _, row := range baseRows {
 			if extraWhere != "" && !evalWhereExpr(row, extraWhere) {
 				continue
 			}
 			for _, elem := range toStringSlice(row[arrCol]) {
-				if elem != "" {
-					counts[elem]++
+				if elem == "" {
+					continue
+				}
+				valStr := elem
+				if elemExpr != "`_elem`" {
+					cp := make(map[string]any, len(row)+1)
+					for k, v := range row {
+						cp[k] = v
+					}
+					cp["_elem"] = elem
+					if v := resolveColumnValue(cp, elemExpr); v != nil {
+						valStr = fmt.Sprintf("%v", v)
+					} else {
+						valStr = ""
+					}
+				}
+				if valStr != "" {
+					counts[valStr]++
 				}
 			}
 		}
@@ -513,9 +529,9 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 	}
 
 	if m := reAggArrayExplodeMissing.FindStringSubmatch(branch); m != nil {
-		aggName, missingLit, arrCol, extraWhere := m[1], m[2], m[3], m[4]
+		aggName, elemExpr, missingLit, arrCol, extraWhere := m[1], m[2], m[3], m[4], m[5]
 		missingVal := unquoteSQLLiteral(missingLit)
-		limit, _ := strconv.Atoi(m[5])
+		limit, _ := strconv.Atoi(m[6])
 		counts := make(map[string]int64)
 		for _, row := range baseRows {
 			if extraWhere != "" && !evalWhereExpr(row, extraWhere) {
@@ -524,8 +540,24 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 			elems := toStringSlice(row[arrCol])
 			added := false
 			for _, elem := range elems {
-				if elem != "" {
-					counts[elem]++
+				if elem == "" {
+					continue
+				}
+				valStr := elem
+				if elemExpr != "`_elem`" {
+					cp := make(map[string]any, len(row)+1)
+					for k, v := range row {
+						cp[k] = v
+					}
+					cp["_elem"] = elem
+					if v := resolveColumnValue(cp, elemExpr); v != nil {
+						valStr = fmt.Sprintf("%v", v)
+					} else {
+						valStr = ""
+					}
+				}
+				if valStr != "" {
+					counts[valStr]++
 					added = true
 				}
 			}
@@ -2303,6 +2335,13 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			return elems[0]
 		}
 		return nil
+	}
+	if (strings.HasPrefix(colExpr, "array_map(_x -> CAST(_x AS DOUBLE), ") || strings.HasPrefix(colExpr, "array_map(_x -> CAST(_x AS BIGINT), ")) && strings.HasSuffix(colExpr, ")") {
+		commaIdx := strings.LastIndexByte(colExpr, ',')
+		if commaIdx > 0 {
+			inner := strings.TrimSpace(colExpr[commaIdx+1 : len(colExpr)-1])
+			return resolveColumnValue(row, inner)
+		}
 	}
 	if strings.HasPrefix(colExpr, "array_map(_x -> IPV4_STRING_TO_NUM_OR_NULL(_x), ") && strings.HasSuffix(colExpr, ")") {
 		inner := strings.TrimSpace(colExpr[len("array_map(_x -> IPV4_STRING_TO_NUM_OR_NULL(_x), ") : len(colExpr)-1])

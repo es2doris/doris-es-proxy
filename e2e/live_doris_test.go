@@ -914,4 +914,45 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	if len(r17SearchRes["hits"].(map[string]any)["hits"].([]any)) == 0 {
 		t.Fatalf("expected R17 hits on live_auto_index, got 0")
 	}
+
+	// 19. Round-18: Polymorphic script cardinality/value_count + histogram.script + _update detect_noop & _source retrieval
+	r18SearchResp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
+		"size": 0,
+		"aggs": {
+			"svc_card": {
+				"cardinality": {
+					"script": "doc['service'].value"
+				}
+			},
+			"lat_hist_script": {
+				"histogram": {
+					"script": "doc['latency_ms'].value * 2",
+					"interval": 20
+				}
+			}
+		}
+	}`))
+	if err != nil || r18SearchResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search (R18 polymorphic script cardinality + histogram.script) failed: status=%v err=%v", r18SearchResp.StatusCode, err)
+	}
+	var r18SearchRes map[string]any
+	_ = json.NewDecoder(r18SearchResp.Body).Decode(&r18SearchRes)
+	_ = r18SearchResp.Body.Close()
+	r18Aggs, _ := r18SearchRes["aggregations"].(map[string]any)
+	if r18Aggs == nil || r18Aggs["svc_card"].(map[string]any)["value"] == float64(0) {
+		t.Fatalf("expected non-zero R18 svc_card on live_auto_index, got %+v", r18Aggs)
+	}
+
+	r18UpdResp, err := http.Post(ts.URL+"/live_auto_index/_update/auto-1?refresh=true&_source=true", "application/json", strings.NewReader(`{
+		"doc": {"service": "checkout"}
+	}`))
+	if err != nil || r18UpdResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_update/auto-1 (R18 detect_noop + _source) failed: status=%v err=%v", r18UpdResp.StatusCode, err)
+	}
+	var r18UpdRes map[string]any
+	_ = json.NewDecoder(r18UpdResp.Body).Decode(&r18UpdRes)
+	_ = r18UpdResp.Body.Close()
+	if r18UpdRes["get"] == nil {
+		t.Fatalf("expected R18 _update?_source=true to include get._source, got %+v", r18UpdRes)
+	}
 }

@@ -1081,9 +1081,10 @@ func (tm *TopMetricsAggSpec) EffectiveMetricFields() []string {
 
 // RateAggSpec models a `rate` metric aggregation.
 type RateAggSpec struct {
-	Field string `json:"field,omitempty"`
-	Unit  string `json:"unit,omitempty"`
-	Mode  string `json:"mode,omitempty"`
+	Field  string `json:"field,omitempty"`
+	Script any    `json:"script,omitempty"`
+	Unit   string `json:"unit,omitempty"`
+	Mode   string `json:"mode,omitempty"`
 }
 
 // MovingAvgAggSpec models a `moving_avg` or `moving_fn` pipeline aggregation.
@@ -1421,6 +1422,7 @@ type HistogramBoundsSpec struct {
 
 type DateHistogramAggSpec struct {
 	Field            string               `json:"field"`
+	Script           any                  `json:"script,omitempty"`
 	CalendarInterval string               `json:"calendar_interval,omitempty"`
 	FixedInterval    string               `json:"fixed_interval,omitempty"`
 	Interval         string               `json:"interval,omitempty"`
@@ -1582,6 +1584,7 @@ func (d *DateHistogramAggSpec) EffectiveIntervalMs() int64 {
 
 type HistogramAggSpec struct {
 	Field          string               `json:"field"`
+	Script         any                  `json:"script,omitempty"`
 	Interval       float64              `json:"interval"`
 	Offset         float64              `json:"offset,omitempty"`
 	Missing        any                  `json:"missing,omitempty"`
@@ -1595,9 +1598,12 @@ type HistogramAggSpec struct {
 }
 
 type RangeAggSpec struct {
-	Field  string           `json:"field"`
-	Ranges []RangeAggBucket `json:"ranges"`
-	Keyed  bool             `json:"keyed,omitempty"`
+	Field   string           `json:"field"`
+	Script  any              `json:"script,omitempty"`
+	Missing any              `json:"missing,omitempty"`
+	Format  string           `json:"format,omitempty"`
+	Ranges  []RangeAggBucket `json:"ranges"`
+	Keyed   bool             `json:"keyed,omitempty"`
 }
 
 type RangeAggBucket struct {
