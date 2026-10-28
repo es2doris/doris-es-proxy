@@ -47,6 +47,7 @@ type SearchRequest struct {
 	PostFilter     *Query             `json:"post_filter,omitempty"`
 	From           *int               `json:"from,omitempty"`
 	Size           *int               `json:"size,omitempty"`
+	MinScore       *float64           `json:"min_score,omitempty"`
 	Aggs           map[string]AggSpec `json:"aggs,omitempty"`
 	Aggregations   map[string]AggSpec `json:"aggregations,omitempty"`
 	Sort           SortSlice          `json:"sort,omitempty"`
@@ -993,6 +994,7 @@ type PercentileRanksAggSpec struct {
 	Values  []float64 `json:"values"`
 	Keyed   *bool     `json:"keyed,omitempty"`
 	Missing any       `json:"missing,omitempty"`
+	Script  any       `json:"script,omitempty"`
 }
 
 // TopMetricsValSpec models a single metric field in `top_metrics`.
@@ -1330,6 +1332,7 @@ type PercentilesAggSpec struct {
 	Percents []float64 `json:"percents,omitempty"`
 	Keyed    *bool     `json:"keyed,omitempty"`
 	Missing  any       `json:"missing,omitempty"`
+	Script   any       `json:"script,omitempty"`
 }
 
 func (p *PercentilesAggSpec) EffectivePercents() []float64 {
@@ -1719,15 +1722,24 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 	if rawVal, ok := m["_script"]; ok {
 		order := "asc"
 		var obj struct {
-			Order  string `json:"order"`
-			Script any    `json:"script"`
-			Type   string `json:"type"`
+			Order   string `json:"order"`
+			Script  any    `json:"script"`
+			Type    string `json:"type"`
+			Missing any    `json:"missing"`
 		}
 		_ = json.Unmarshal(rawVal, &obj)
 		if obj.Order != "" {
 			order = strings.ToLower(obj.Order)
 		}
-		s.Entry = SortFieldSpec{Field: "_script", Order: order, Script: obj.Script, Type: obj.Type}
+		missing := ""
+		if obj.Missing != nil {
+			if fv, ok := obj.Missing.(float64); ok && fv == math.Trunc(fv) && !math.IsInf(fv, 0) && !math.IsNaN(fv) {
+				missing = strconv.FormatInt(int64(fv), 10)
+			} else {
+				missing = fmt.Sprintf("%v", obj.Missing)
+			}
+		}
+		s.Entry = SortFieldSpec{Field: "_script", Order: order, Script: obj.Script, Type: obj.Type, Missing: missing}
 		return nil
 	}
 	if rawVal, ok := m["_geo_distance"]; ok {
@@ -1783,9 +1795,11 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 			_ = json.Unmarshal(valTrimmed, &order)
 		} else if len(valTrimmed) > 0 && valTrimmed[0] == '{' {
 			var obj struct {
-				Order   string `json:"order"`
-				Mode    string `json:"mode"`
-				Missing any    `json:"missing"`
+				Order        string `json:"order"`
+				Mode         string `json:"mode"`
+				Missing      any    `json:"missing"`
+				UnmappedType string `json:"unmapped_type"`
+				NumericType  string `json:"numeric_type"`
 			}
 			_ = json.Unmarshal(valTrimmed, &obj)
 			if obj.Order != "" {
@@ -1801,6 +1815,12 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 					missing = fmt.Sprintf("%v", obj.Missing)
 				}
 			}
+			sortType := obj.UnmappedType
+			if sortType == "" {
+				sortType = obj.NumericType
+			}
+			s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Type: strings.ToLower(sortType)}
+			return nil
 		}
 		s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing}
 	}

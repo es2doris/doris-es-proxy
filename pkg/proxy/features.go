@@ -30,6 +30,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -1118,6 +1120,16 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithMeta(indexName, docID, reqPi
 		}
 	}
 	finalPipeline := s.resolveFinalPipeline(curIndex)
+	if finalPipeline == "" && s != nil {
+		if resolved, _, wErr := s.resolveWriteIndexWithFilter(curIndex); wErr == nil && resolved != "" && resolved != curIndex {
+			finalPipeline = s.resolveFinalPipeline(resolved)
+		}
+		if finalPipeline == "" {
+			if resolved := s.resolveIndexName(curIndex); resolved != "" && resolved != curIndex {
+				finalPipeline = s.resolveFinalPipeline(resolved)
+			}
+		}
+	}
 	if finalPipeline != "" {
 		next, nextIdx, nextID, dropped, err := s.applyIngestPipelineForWriteWithMeta(finalPipeline, curIndex, curID, cur)
 		if err != nil || dropped {
@@ -1161,7 +1173,7 @@ func rewriteIngestCtxReferences(s string) string {
 			out.WriteByte(c)
 			continue
 		}
-		if (i == 0 || !isIngestIdentByte(s[i-1])) && strings.HasPrefix(s[i:], "ctx") {
+		if (i == 0 || (!isIngestIdentByte(s[i-1]) && s[i-1] != '.')) && strings.HasPrefix(s[i:], "ctx") {
 			rest := s[i+3:]
 			if strings.HasPrefix(rest, "?.") {
 				after := rest[2:]
@@ -1180,13 +1192,21 @@ func rewriteIngestCtxReferences(s string) string {
 					continue
 				}
 			} else if strings.HasPrefix(rest, "?[") {
-				out.WriteString("ctx?._source[")
-				i += 4
-				continue
+				after := strings.TrimSpace(rest[2:])
+				if !strings.HasPrefix(after, "'_source'") && !strings.HasPrefix(after, `"_source"`) &&
+					!strings.HasPrefix(after, "'op'") && !strings.HasPrefix(after, `"op"`) {
+					out.WriteString("ctx?._source[")
+					i += 4
+					continue
+				}
 			} else if strings.HasPrefix(rest, "[") {
-				out.WriteString("ctx._source[")
-				i += 3
-				continue
+				after := strings.TrimSpace(rest[1:])
+				if !strings.HasPrefix(after, "'_source'") && !strings.HasPrefix(after, `"_source"`) &&
+					!strings.HasPrefix(after, "'op'") && !strings.HasPrefix(after, `"op"`) {
+					out.WriteString("ctx._source[")
+					i += 3
+					continue
+				}
 			}
 		}
 		out.WriteByte(c)
@@ -1306,7 +1326,15 @@ var defaultGrokPatterns = map[string]string{
 	"EMAILADDRESS":      `[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+`,
 }
 
-var reGrokToken = regexp.MustCompile(`%\{([A-Za-z0-9_]+)(?::([A-Za-z0-9_.-]+))?(?::(int|long|float|double|boolean|string))?\}`)
+var reGrokToken = regexp.MustCompile(`%\{([A-Za-z0-9_]+)(?::([A-Za-z0-9_.\-\[\]@]+))?(?::(int|integer|long|float|double|boolean|bool|string))?\}`)
+
+func normalizeGrokFieldName(fieldName string) string {
+	if strings.HasPrefix(fieldName, "[") && strings.HasSuffix(fieldName, "]") {
+		trimmed := strings.TrimPrefix(strings.TrimSuffix(fieldName, "]"), "[")
+		return strings.ReplaceAll(trimmed, "][", ".")
+	}
+	return fieldName
+}
 
 func compileGrokRegex(pat string, customDefs map[string]any) (*regexp.Regexp, map[string]string, map[string]string, error) {
 	groupKeyMap := make(map[string]string)
@@ -1324,7 +1352,7 @@ func compileGrokRegex(pat string, customDefs map[string]any) (*regexp.Regexp, ma
 				return m
 			}
 			patName := sub[1]
-			fieldName := sub[2]
+			fieldName := normalizeGrokFieldName(sub[2])
 			fieldType := sub[3]
 			var rawRegex string
 			if customDefs != nil {
@@ -1367,6 +1395,8 @@ func convertESDateFormatToGoLayouts(esFmt string) []string {
 		return []string{
 			time.RFC3339Nano,
 			time.RFC3339,
+			"2006-01-02T15:04:05.999999999Z0700",
+			"2006-01-02T15:04:05Z0700",
 			"2006-01-02T15:04:05.000Z0700",
 			"2006-01-02T15:04:05.000Z07:00",
 			"2006-01-02T15:04:05.000",
@@ -1409,6 +1439,16 @@ func parseIngestDateValue(raw string, formats []any, tzName string) (time.Time, 
 		} else if len(tzName) == 6 && (tzName[0] == '+' || tzName[0] == '-') && tzName[3] == ':' {
 			h, err1 := strconv.Atoi(tzName[1:3])
 			m, err2 := strconv.Atoi(tzName[4:6])
+			if err1 == nil && err2 == nil {
+				offset := (h*3600 + m*60)
+				if tzName[0] == '-' {
+					offset = -offset
+				}
+				loc = time.FixedZone(tzName, offset)
+			}
+		} else if len(tzName) == 5 && (tzName[0] == '+' || tzName[0] == '-') {
+			h, err1 := strconv.Atoi(tzName[1:3])
+			m, err2 := strconv.Atoi(tzName[3:5])
 			if err1 == nil && err2 == nil {
 				offset := (h*3600 + m*60)
 				if tzName[0] == '-' {
@@ -1609,6 +1649,19 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 		val   string
 	}
 	appendsByKey := make(map[string][]appendPiece)
+	hasAppendKey := make(map[string]bool)
+	for _, tok := range tokens {
+		if tok.skip || tok.rawKey == "" || !tok.append {
+			continue
+		}
+		targetKey := tok.rawKey
+		if tok.indirect {
+			targetKey = refValues[tok.rawKey]
+		}
+		if targetKey != "" {
+			hasAppendKey[targetKey] = true
+		}
+	}
 
 	for i, tok := range tokens {
 		if tok.skip || tok.rawKey == "" {
@@ -1622,7 +1675,7 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 			}
 		}
 		val := captured[i]
-		if tok.append {
+		if tok.append || hasAppendKey[targetKey] {
 			appendsByKey[targetKey] = append(appendsByKey[targetKey], appendPiece{
 				order: tok.appendOrder,
 				seq:   i,
@@ -1740,9 +1793,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					return subMut, true, procType, procTag, specMap, nil
 				}
 				if fErr == nil {
-					delete(ingestMeta, "on_failure_message")
-					delete(ingestMeta, "on_failure_processor_type")
-					delete(ingestMeta, "on_failure_processor_tag")
+					if curIngest, ok := doc["_ingest"].(map[string]any); ok {
+						delete(curIngest, "on_failure_message")
+						delete(curIngest, "on_failure_processor_type")
+						delete(curIngest, "on_failure_processor_tag")
+					}
 				}
 				subErr = fErr
 			}
@@ -1954,7 +2009,9 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			if val, ok := getIngestPath(doc, field); ok {
 				if strVal, ok := val.(string); ok {
 					var parts []string
-					if re, err := regexp.Compile(sep); err == nil {
+					if sep == "|" || sep == "." {
+						parts = strings.Split(strVal, sep)
+					} else if re, err := regexp.Compile(sep); err == nil {
 						parts = re.Split(strVal, -1)
 					} else {
 						parts = strings.Split(strVal, sep)
@@ -2137,7 +2194,9 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			if val, exists := getIngestPath(doc, field); exists {
 				if strVal, ok := val.(string); ok {
 					var pairs []string
-					if re, err := regexp.Compile(fieldSplit); err == nil {
+					if fieldSplit == "|" || fieldSplit == "." {
+						pairs = strings.Split(strVal, fieldSplit)
+					} else if re, err := regexp.Compile(fieldSplit); err == nil {
 						pairs = re.Split(strVal, -1)
 					} else {
 						pairs = strings.Split(strVal, fieldSplit)
@@ -2311,7 +2370,14 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				var formatted string
 				if outFmt != "" {
 					layouts := convertESDateFormatToGoLayouts(outFmt)
-					formatted = parsedTime.Format(layouts[0])
+					switch layouts[0] {
+					case "UNIX_MS":
+						formatted = strconv.FormatInt(parsedTime.UnixMilli(), 10)
+					case "UNIX":
+						formatted = strconv.FormatInt(parsedTime.Unix(), 10)
+					default:
+						formatted = parsedTime.Format(layouts[0])
+					}
 				} else {
 					formatted = parsedTime.Format(time.RFC3339Nano)
 				}
@@ -2399,13 +2465,14 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					return false, false, procType, procTag, specMap, err
 				}
 				m := re.FindStringSubmatch(strVal)
-				if m == nil {
+				loc := re.FindStringSubmatchIndex(strVal)
+				if m == nil || loc == nil {
 					continue
 				}
 				matched = true
 				names := re.SubexpNames()
 				for i, grpID := range names {
-					if i == 0 || grpID == "" || i >= len(m) {
+					if i == 0 || grpID == "" || i >= len(m) || 2*i >= len(loc) || loc[2*i] < 0 {
 						continue
 					}
 					fieldName := grpMap[grpID]
@@ -2861,7 +2928,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						}
 						ingestMeta["_value"] = elem
 						doc["_ingest"] = ingestMeta
-						_, subDropped, subErr := runIngestProcessorList(s, doc, subProcs, depth+1, trace)
+						subMut, subDropped, subErr := runIngestProcessorList(s, doc, subProcs, depth+1, trace)
+						if subMut {
+							mutated = true
+						}
 						if subErr != nil {
 							restoreIngestVal()
 							return mutated, false, procType, procTag, specMap, subErr
@@ -3036,9 +3106,11 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 				if subErr != nil {
 					return mutated, false, subErr
 				}
-				delete(ingestMeta, "on_failure_message")
-				delete(ingestMeta, "on_failure_processor_type")
-				delete(ingestMeta, "on_failure_processor_tag")
+				if curIngest, ok := doc["_ingest"].(map[string]any); ok {
+					delete(curIngest, "on_failure_message")
+					delete(curIngest, "on_failure_processor_type")
+					delete(curIngest, "on_failure_processor_tag")
+				}
 				continue
 			}
 			ingestMeta, _ := doc["_ingest"].(map[string]any)
@@ -3086,6 +3158,9 @@ func applyIngestPipelineSpecVerboseWithMeta(s *Server, pipe map[string]any, inde
 	if ingestMeta == nil {
 		ingestMeta = make(map[string]any)
 	}
+	if _, hasTS := ingestMeta["timestamp"]; !hasTS {
+		ingestMeta["timestamp"] = time.Now().UTC().Format(time.RFC3339Nano)
+	}
 	ingestMeta["_had_orig_index"] = hadOrigIndex
 	ingestMeta["_had_orig_id"] = hadOrigID
 	doc["_ingest"] = ingestMeta
@@ -3119,9 +3194,11 @@ func applyIngestPipelineSpecVerboseWithMeta(s *Server, pipe map[string]any, inde
 				return json.RawMessage(`{}`), indexName, docID, true, trace, nil
 			}
 			if subErr == nil {
-				delete(ingestMeta, "on_failure_message")
-				delete(ingestMeta, "on_failure_processor_type")
-				delete(ingestMeta, "on_failure_processor_tag")
+				if curIngest, ok := doc["_ingest"].(map[string]any); ok {
+					delete(curIngest, "on_failure_message")
+					delete(curIngest, "on_failure_processor_type")
+					delete(curIngest, "on_failure_processor_tag")
+				}
 			}
 			procErr = subErr
 		}
@@ -3280,31 +3357,42 @@ func convertSingleIngestValue(val any, convType string) (any, error) {
 		if iv, err := strconv.ParseInt(str, 10, 64); err == nil {
 			return iv, nil
 		}
-		if fv, err := strconv.ParseFloat(str, 64); err == nil {
+		if fv, err := strconv.ParseFloat(str, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
 			return int64(fv), nil
 		}
 		return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
 	case "float", "double":
-		if fv, err := strconv.ParseFloat(str, 64); err == nil {
+		if fv, err := strconv.ParseFloat(str, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
 			return fv, nil
 		}
 		return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
 	case "string":
 		return fmt.Sprintf("%v", val), nil
 	case "boolean", "bool":
-		if bv, err := strconv.ParseBool(str); err == nil {
-			return bv, nil
+		switch strings.ToLower(str) {
+		case "true", "1":
+			return true, nil
+		case "false", "0":
+			return false, nil
 		}
 		return nil, fmt.Errorf("unable to convert [%v] to boolean", val)
+	case "ip":
+		if net.ParseIP(str) != nil {
+			return str, nil
+		}
+		return nil, fmt.Errorf("unable to convert [%v] to ip", val)
 	case "auto":
 		if iv, err := strconv.ParseInt(str, 10, 64); err == nil {
 			return iv, nil
 		}
-		if fv, err := strconv.ParseFloat(str, 64); err == nil {
+		if fv, err := strconv.ParseFloat(str, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
 			return fv, nil
 		}
-		if bv, err := strconv.ParseBool(str); err == nil {
-			return bv, nil
+		switch strings.ToLower(str) {
+		case "true":
+			return true, nil
+		case "false":
+			return false, nil
 		}
 		return str, nil
 	default:
@@ -4771,6 +4859,22 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 	desc := "no match on required clause (" + cq.WhereSQL + ")"
 	if matched {
 		scoreVal = 1.0
+		if shreddedBytes, err := schema.ShredDocument(idxSchema, docID, hit.Version, false, hit.Source); err == nil {
+			var row map[string]any
+			dec := json.NewDecoder(bytes.NewReader(shreddedBytes))
+			dec.UseNumber()
+			if err := dec.Decode(&row); err == nil && row != nil {
+				var docMap map[string]any
+				docDec := json.NewDecoder(bytes.NewReader(hit.Source))
+				docDec.UseNumber()
+				if err := docDec.Decode(&docMap); err == nil {
+					row["_doc"] = docMap
+				}
+				if evalScore := evalNumericExpr(row, cq.ScoreSQL); evalScore > 0 || cq.ScoreSQL == "0.0" {
+					scoreVal = evalScore
+				}
+			}
+		}
 		if queryHasRuntimeScript(effQuery) {
 			var docMap map[string]any
 			dec := json.NewDecoder(bytes.NewReader(hit.Source))
@@ -4781,7 +4885,21 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 			}
 			scoreVal = evalQueryScriptScoreOnDocWithSchema(idxSchema, docMap, effQuery, scoreVal)
 		}
-		desc = "weight(" + cq.WhereSQL + ") [DorisInvertedIndex], result of: " + cq.ScoreSQL
+		if resolvedReq.MinScore != nil && scoreVal < *resolvedReq.MinScore {
+			matched = false
+			scoreVal = 0.0
+			desc = fmt.Sprintf("score (< %.4f) is less than min_score", *resolvedReq.MinScore)
+		} else if effQuery != nil && effQuery.ScriptScore != nil && effQuery.ScriptScore.MinScore != nil && scoreVal < *effQuery.ScriptScore.MinScore {
+			matched = false
+			scoreVal = 0.0
+			desc = fmt.Sprintf("score (< %.4f) is less than min_score", *effQuery.ScriptScore.MinScore)
+		} else if effQuery != nil && effQuery.FunctionScore != nil && effQuery.FunctionScore.MinScore != nil && scoreVal < *effQuery.FunctionScore.MinScore {
+			matched = false
+			scoreVal = 0.0
+			desc = fmt.Sprintf("score (< %.4f) is less than min_score", *effQuery.FunctionScore.MinScore)
+		} else {
+			desc = "weight(" + cq.WhereSQL + ") [DorisInvertedIndex], result of: " + cq.ScoreSQL
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"_index":  indexName,

@@ -74,7 +74,7 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 
 	parsedAST := parseSimpleLuceneToAST(raw, defaultField, expandedFields, defaultOp)
 	compiled := t.CompileQuery(&parsedAST, scoring, nctx)
-	if t.Opts.UseDoris4SearchFunc && nctx == nil && !strings.Contains(raw, "_exists_:") && !strings.ContainsAny(raw, "[{><~/^") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, "`n__") {
+	if rewrittenRaw, ok := t.rewriteDoris4SearchQuery(raw); ok && t.Opts.UseDoris4SearchFunc && nctx == nil && !strings.ContainsAny(raw, "[{><~/^") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, "`n__") {
 		if len(expandedFields) > 1 {
 			var searchPreds []string
 			allSupported := true
@@ -82,7 +82,7 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 				fname := strings.Split(ef, "^")[0]
 				if t.isDoris4SearchableField(fname) {
 					col := strings.Trim(t.sqlColumnRef(fname, false, nctx), "`")
-					searchPreds = append(searchPreds, fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(raw), quoteStr(col), quoteStr(defaultOp)))
+					searchPreds = append(searchPreds, fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(rewrittenRaw), quoteStr(col), quoteStr(defaultOp)))
 				} else {
 					allSupported = false
 					break
@@ -102,7 +102,7 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 			}
 		} else if t.isDoris4SearchableField(defaultField) {
 			col := strings.Trim(t.sqlColumnRef(defaultField, false, nctx), "`")
-			pred := fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(raw), quoteStr(col), quoteStr(defaultOp))
+			pred := fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(rewrittenRaw), quoteStr(col), quoteStr(defaultOp))
 			return CompiledQuery{
 				WhereSQL:          pred,
 				SafeWhereSQL:      compiled.EffectiveSafeWhere(),
@@ -112,6 +112,40 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 		}
 	}
 	return compiled
+}
+
+func (t *Transpiler) rewriteDoris4SearchQuery(raw string) (string, bool) {
+	if strings.Contains(raw, "_exists_:") {
+		return "", false
+	}
+	if !strings.Contains(raw, ":") {
+		return raw, true
+	}
+	tokens := tokenizeLucene(raw)
+	if len(tokens) == 0 {
+		return raw, true
+	}
+	var out []string
+	for _, tok := range tokens {
+		prefix := ""
+		rest := tok
+		if strings.HasPrefix(rest, "+") || strings.HasPrefix(rest, "-") {
+			prefix = rest[:1]
+			rest = rest[1:]
+		}
+		if idx := findLuceneFieldColon(rest); idx > 0 {
+			field := unescapeLuceneToken(rest[:idx])
+			val := rest[idx+1:]
+			if !t.isDoris4SearchableField(field) {
+				return "", false
+			}
+			col := strings.Trim(t.sqlColumnRef(field, false, nil), "`")
+			out = append(out, prefix+col+":"+val)
+		} else {
+			out = append(out, tok)
+		}
+	}
+	return strings.Join(out, " "), true
 }
 
 func (t *Transpiler) isDoris4SearchableField(fname string) bool {
@@ -141,14 +175,29 @@ func parseSimpleLuceneToASTWithDepth(expr, defaultField string, fields []string,
 	}
 
 	hasAND, hasOR := false, false
+	var normalizedTokens []string
+	prevWasClause := false
 	for _, tok := range tokens {
-		switch strings.ToUpper(tok) {
+		upper := strings.ToUpper(tok)
+		switch upper {
 		case "AND":
 			hasAND = true
+			prevWasClause = false
 		case "OR":
 			hasOR = true
+			prevWasClause = false
+		case "NOT", "+", "-":
+			prevWasClause = false
+		default:
+			if prevWasClause && defaultOp == "OR" && !strings.HasPrefix(tok, "+") && !strings.HasPrefix(tok, "-") {
+				normalizedTokens = append(normalizedTokens, "OR")
+				hasOR = true
+			}
+			prevWasClause = true
 		}
+		normalizedTokens = append(normalizedTokens, tok)
 	}
+	tokens = normalizedTokens
 
 	// In Lucene grammar, `AND` binds tighter than `OR` (e.g., `a:1 AND b:2 OR c:3` -> `(a:1 AND b:2) OR c:3`).
 	if (hasAND || defaultOp == "AND") && hasOR {
@@ -170,7 +219,7 @@ func parseSimpleLuceneToASTWithDepth(expr, defaultField string, fields []string,
 		if len(orGroups) > 1 {
 			var shoulds []esast.Query
 			for _, grp := range orGroups {
-				shoulds = append(shoulds, parseLuceneTokenSlice(grp, defaultField, fields, "AND", depth+1))
+				shoulds = append(shoulds, parseLuceneTokenSlice(grp, defaultField, fields, "AND", defaultOp, depth+1))
 			}
 			return esast.Query{Bool: &esast.BoolQuery{Should: shoulds}}
 		}
@@ -182,10 +231,10 @@ func parseSimpleLuceneToASTWithDepth(expr, defaultField string, fields []string,
 	} else if hasOR {
 		groupOp = "OR"
 	}
-	return parseLuceneTokenSlice(tokens, defaultField, fields, groupOp, depth)
+	return parseLuceneTokenSlice(tokens, defaultField, fields, groupOp, defaultOp, depth)
 }
 
-func parseLuceneTokenSlice(tokens []string, defaultField string, fields []string, groupOp string, depth int) esast.Query {
+func parseLuceneTokenSlice(tokens []string, defaultField string, fields []string, groupOp string, defaultOp string, depth int) esast.Query {
 	boolQ := &esast.BoolQuery{}
 	negateNext := false
 
@@ -218,9 +267,9 @@ func parseLuceneTokenSlice(tokens []string, defaultField string, fields []string
 		var clause esast.Query
 		if hasMatchingOuterParens(tok) {
 			inner := tok[1 : len(tok)-1]
-			clause = parseSimpleLuceneToASTWithDepth(inner, defaultField, fields, groupOp, depth+1)
+			clause = parseSimpleLuceneToASTWithDepth(inner, defaultField, fields, defaultOp, depth+1)
 		} else {
-			clause = buildLuceneAtomQueryWithDepth(tok, defaultField, fields, groupOp, depth+1)
+			clause = buildLuceneAtomQueryWithDepth(tok, defaultField, fields, defaultOp, depth+1)
 		}
 
 		if negateNext {

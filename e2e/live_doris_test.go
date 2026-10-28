@@ -883,4 +883,35 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 		t.Fatalf("POST /_ingest/pipeline/_simulate (R16 processors) failed: status=%v err=%v", simR16Resp.StatusCode, err)
 	}
 	_ = simR16Resp.Body.Close()
+
+	// 18. Round-17: Top-level min_score + runtime metric script aggs + /_explain parity + Painless casts/regex
+	r17SearchResp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
+		"min_score": 1.0,
+		"query": {
+			"script_score": {
+				"query": {"match_all": {}},
+				"script": {
+					"source": "doc['latency_ms'].value * 2.0"
+				}
+			}
+		},
+		"aggs": {
+			"complex_avg": {
+				"avg": {
+					"script": {
+						"source": "int base = (int) doc['latency_ms'].value; return base * 2;"
+					}
+				}
+			}
+		}
+	}`))
+	if err != nil || r17SearchResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search (R17 min_score + runtime avg script) failed: status=%v err=%v", r17SearchResp.StatusCode, err)
+	}
+	var r17SearchRes map[string]any
+	_ = json.NewDecoder(r17SearchResp.Body).Decode(&r17SearchRes)
+	_ = r17SearchResp.Body.Close()
+	if len(r17SearchRes["hits"].(map[string]any)["hits"].([]any)) == 0 {
+		t.Fatalf("expected R17 hits on live_auto_index, got 0")
+	}
 }

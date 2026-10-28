@@ -358,10 +358,17 @@ func (s *IndexSchema) compileProperties(
 				// Multi-fields read from the same `currJSONPath` in `_source`!
 				s.registerLeafField(multiDotPath, currJSONPath, activeNestedRoot, nestedRootDepth, subProp)
 				if subKey == "keyword" {
-					if baseBinding, ok := s.Fields[dotPath]; ok && (baseBinding.Kind == StoragePromotedScalar || baseBinding.Kind == StoragePromotedArray || baseBinding.Kind == StorageNestedSubfield) {
-						baseBinding.KeywordCompanion = s.Fields[multiDotPath].ColumnName
-						baseBinding.KeywordNormalizer = s.Fields[multiDotPath].LowercaseNormalizer
-						s.Fields[dotPath] = baseBinding
+					subBinding := s.Fields[multiDotPath]
+					if baseBinding, ok := s.Fields[dotPath]; ok && baseBinding.Kind == subBinding.Kind && (baseBinding.Kind == StoragePromotedScalar || baseBinding.Kind == StoragePromotedArray || baseBinding.Kind == StorageNestedSubfield) {
+						companionCol := subBinding.ColumnName
+						if baseBinding.Kind == StorageNestedSubfield && subBinding.PrefilterArrayCol != "" {
+							companionCol = subBinding.PrefilterArrayCol
+						}
+						if companionCol != "" {
+							baseBinding.KeywordCompanion = companionCol
+							baseBinding.KeywordNormalizer = subBinding.LowercaseNormalizer
+							s.Fields[dotPath] = baseBinding
+						}
 					}
 				}
 			}

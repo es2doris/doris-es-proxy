@@ -148,6 +148,21 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 	}
 
 	userWhere := mainQ.WhereSQL
+	if req.MinScore != nil && !queryContainsScript(req.Query) {
+		minScoreExpr := mainQ.ScoreSQL
+		if len(req.KNN) == 0 && mainQ.UsesFulltextMatch && t.Opts.UseDoris4SearchFunc {
+			minScoreExpr = fmt.Sprintf("COALESCE(score(), 1.0) * (%s)", mainQ.ScoreSQL)
+		}
+		minCond := fmt.Sprintf("(CAST(%s AS DOUBLE) >= %s)", minScoreExpr, strconv.FormatFloat(*req.MinScore, 'f', -1, 64))
+		if mainQ.WhereSQL == "" || mainQ.WhereSQL == "TRUE" {
+			mainQ.WhereSQL = minCond
+			mainQ.SafeWhereSQL = minCond
+		} else {
+			mainQ.WhereSQL = fmt.Sprintf("((%s) AND %s)", mainQ.WhereSQL, minCond)
+			mainQ.SafeWhereSQL = fmt.Sprintf("((%s) AND %s)", mainQ.EffectiveSafeWhere(), minCond)
+		}
+		userWhere = mainQ.WhereSQL
+	}
 	aliasWhere := ""
 	if req.AliasFilter != nil {
 		afQ := esast.Query(*req.AliasFilter)
@@ -511,7 +526,7 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 			col := t.sqlColumnRef(field, false, nctx)
 			safePred := fmt.Sprintf("(%s IS NOT NULL AND %s REGEXP %s)", col, col, quoteStr(pat))
 			safePreds = append(safePreds, safePred)
-			if nctx != nil || effCI || strings.HasPrefix(pat, "(?i)") {
+			if nctx != nil || b.Kind == schema.StorageDynamicVariant || effCI || strings.HasPrefix(pat, "(?i)") {
 				preds = append(preds, fmt.Sprintf("%s REGEXP %s", col, quoteStr(pat)))
 			} else {
 				preds = append(preds, fmt.Sprintf("%s MATCH_REGEXP %s", col, quoteStr(pat)))
@@ -832,9 +847,13 @@ func (t *Transpiler) compileBoosting(bq *esast.BoostingQuery, scoring bool, nctx
 	}
 	scoreSQL := "1.0"
 	if scoring {
-		negCond := neg.EffectiveSafeWhere()
-		scoreSQL = fmt.Sprintf("(%.4f * (%s) * (CASE WHEN %s THEN %.4f ELSE 1.0 END))",
-			boost, pos.ScoreSQL, negCond, negBoost)
+		if queryContainsScript(&bq.Negative) || queryContainsScript(&bq.Positive) {
+			scoreSQL = pos.ScoreSQL
+		} else {
+			negCond := neg.EffectiveSafeWhere()
+			scoreSQL = fmt.Sprintf("(%.4f * (%s) * (CASE WHEN %s THEN %.4f ELSE 1.0 END))",
+				boost, pos.ScoreSQL, negCond, negBoost)
+		}
 	}
 	return CompiledQuery{
 		WhereSQL:          pos.WhereSQL,
@@ -1110,8 +1129,8 @@ func (t *Transpiler) compileMatchField(
 		score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", scorePred, boost)
 	}
 
-	// Inside nested `array_exists(_el -> ...)` lambdas, Doris BE does not allow `MATCH_*`.
-	if nctx != nil {
+	// Inside nested `array_exists(_el -> ...)` lambdas or on untokenized array columns, use projection-safe LIKE matching.
+	if nctx != nil || b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
 		return CompiledQuery{WhereSQL: scorePred, SafeWhereSQL: scorePred, ScoreSQL: score, UsesFulltextMatch: false}
 	}
 
@@ -1171,7 +1190,7 @@ func (t *Transpiler) compileMatchPhraseField(
 	if scoring {
 		score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", scorePred, boost)
 	}
-	if nctx != nil {
+	if nctx != nil || b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield || b.Kind == schema.StorageDynamicVariant {
 		return CompiledQuery{WhereSQL: scorePred, SafeWhereSQL: scorePred, ScoreSQL: score, UsesFulltextMatch: false}
 	}
 	col := t.sqlColumnRef(field, false, nil)
@@ -1376,15 +1395,9 @@ func (t *Transpiler) compileScriptScore(ss *esast.ScriptScoreQuery, scoring bool
 	if ss != nil && ss.Query != nil {
 		base = t.CompileQuery(ss.Query, true, nctx)
 	}
-	boost := 1.0
-	if ss != nil && ss.Boost != nil {
-		boost = *ss.Boost
-	}
-	scoreSQL := base.ScoreSQL
+	scoreSQL := "1.0"
 	if scoring {
-		if boost != 1.0 {
-			scoreSQL = fmt.Sprintf("(%.4f * (%s))", boost, base.ScoreSQL)
-		}
+		scoreSQL = base.ScoreSQL
 	}
 	return CompiledQuery{
 		WhereSQL:          base.WhereSQL,
@@ -1445,6 +1458,7 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 						}
 					}
 				}
+				val = normalizeDateNanosValue(b.ESType, val)
 				parts = append(parts, fmt.Sprintf("array_contains(`%s`, %s)", arrCol, quoteStr(fmt.Sprintf("%v", val))))
 			}
 		}
@@ -1486,6 +1500,7 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 							}
 						}
 					}
+					v = normalizeDateNanosValue(b.ESType, v)
 					quoted = append(quoted, quoteStr(fmt.Sprintf("%v", v)))
 				}
 				parts = append(parts, fmt.Sprintf("arrays_overlap(`%s`, [%s])", arrCol, strings.Join(quoted, ", ")))
@@ -1514,6 +1529,16 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 	base := CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: "1.0"}
 	if fs.Query != nil {
 		base = t.CompileQuery(fs.Query, true, nctx)
+	}
+	hasScriptFn := fs.ScriptScore != nil
+	for i := range fs.Functions {
+		if fs.Functions[i].ScriptScore != nil || queryContainsScript(fs.Functions[i].Filter) {
+			hasScriptFn = true
+			break
+		}
+	}
+	if hasScriptFn {
+		return base
 	}
 	funcs := fs.Functions
 	if len(funcs) == 0 && (fs.FieldValueFactor != nil || fs.Weight != nil) {
@@ -1776,6 +1801,7 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 			}
 		}
 	}
+	val = normalizeDateNanosValue(b.ESType, val)
 	lit := quoteValue(val)
 
 	switch b.Kind {
@@ -1885,6 +1911,7 @@ func (t *Transpiler) compileTermsPredicate(field string, vals []any, nctx *neste
 				}
 			}
 		}
+		v = normalizeDateNanosValue(b.ESType, v)
 		normalizedVals = append(normalizedVals, v)
 		if isArrayCol {
 			quoted = append(quoted, quoteStr(fmt.Sprintf("%v", v)))
@@ -2076,8 +2103,8 @@ func (t *Transpiler) compileRangePredicate(field string, rc esast.RangeCond, nct
 						return int64(rawSec * 1000)
 					}
 					iv := int64(rawSec)
-					if b.ESType == "date_nanos" && iv > 1_000_000_000_000_000 {
-						iv /= 1_000_000
+					if norm, ok := normalizeDateNanosValue(b.ESType, iv).(int64); ok {
+						iv = norm
 					}
 					return iv
 				}
@@ -2093,24 +2120,11 @@ func (t *Transpiler) compileRangePredicate(field string, rc esast.RangeCond, nct
 						!strings.Contains(datePart[min(10, len(datePart)):], "-") {
 						ms -= tzOffsetMs
 					}
-					return ms
+					return normalizeDateNanosValue(b.ESType, ms)
 				}
 			}
 			if b.ESType == "date_nanos" && !isEpochSecond {
-				switch nv := v.(type) {
-				case int64:
-					if nv > 1_000_000_000_000_000 {
-						return nv / 1_000_000
-					}
-				case float64:
-					if nv > 1e15 {
-						return int64(nv) / 1_000_000
-					}
-				case json.Number:
-					if i, err := nv.Int64(); err == nil && i > 1_000_000_000_000_000 {
-						return i / 1_000_000
-					}
-				}
+				return normalizeDateNanosValue(b.ESType, v)
 			}
 			if isEpochSecond {
 				switch nv := v.(type) {
@@ -2556,16 +2570,28 @@ func (t *Transpiler) appendAggBranches(
 					}
 				case subSpec.Avg != nil, subSpec.Sum != nil, subSpec.Min != nil, subSpec.Max != nil:
 					var fn, field string
-					var miss any
+					var miss, script any
 					switch {
 					case subSpec.Avg != nil:
-						fn, field, miss = "AVG", subSpec.Avg.Field, subSpec.Avg.Missing
+						fn, field, miss, script = "AVG", subSpec.Avg.Field, subSpec.Avg.Missing, subSpec.Avg.Script
 					case subSpec.Sum != nil:
-						fn, field, miss = "SUM", subSpec.Sum.Field, subSpec.Sum.Missing
+						fn, field, miss, script = "SUM", subSpec.Sum.Field, subSpec.Sum.Missing, subSpec.Sum.Script
 					case subSpec.Min != nil:
-						fn, field, miss = "MIN", subSpec.Min.Field, subSpec.Min.Missing
+						fn, field, miss, script = "MIN", subSpec.Min.Field, subSpec.Min.Missing, subSpec.Min.Script
 					case subSpec.Max != nil:
-						fn, field, miss = "MAX", subSpec.Max.Field, subSpec.Max.Missing
+						fn, field, miss, script = "MAX", subSpec.Max.Field, subSpec.Max.Missing, subSpec.Max.Script
+					}
+					nestedElemCtx := &nestedCtx{nestedPath: spec.Nested.Path, elemVar: "`_nel`"}
+					if script != nil {
+						if scriptExpr, ok := t.compileMetricScriptExpr(script, field, nestedElemCtx); ok {
+							nWhere := fmt.Sprintf("%s`_nel` IS NOT NULL", wherePrefix)
+							*branches = append(*branches, fmt.Sprintf(
+								"SELECT %s AS `_agg_name`, '_metric' AS `_bucket_key`, CAST(COALESCE(%s(%s), 0) AS DOUBLE) AS `_doc_count` "+
+									"FROM `base_matched` LATERAL VIEW EXPLODE(`%s`) `_nt` AS `_nel` WHERE %s",
+								quoteStr(subFull), fn, scriptExpr, corrCol, nWhere,
+							))
+							break
+						}
 					}
 					relJSONPath := nestedRelJSON(field)
 					numExpr := fmt.Sprintf("CAST(json_extract_string(`_nel`, %s) AS DOUBLE)", relJSONPath)
@@ -2583,9 +2609,16 @@ func (t *Transpiler) appendAggBranches(
 					))
 				case subSpec.EffectiveStats() != nil:
 					statsSpec := subSpec.EffectiveStats()
+					nestedElemCtx := &nestedCtx{nestedPath: spec.Nested.Path, elemVar: "`_nel`"}
 					relJSONPath := nestedRelJSON(statsSpec.Field)
 					numExpr := fmt.Sprintf("CAST(json_extract_string(`_nel`, %s) AS DOUBLE)", relJSONPath)
 					nWhere := fmt.Sprintf("%sjson_extract_string(`_nel`, %s) IS NOT NULL", wherePrefix, relJSONPath)
+					if statsSpec.Script != nil {
+						if scriptExpr, ok := t.compileMetricScriptExpr(statsSpec.Script, statsSpec.Field, nestedElemCtx); ok {
+							numExpr = scriptExpr
+							nWhere = fmt.Sprintf("%s`_nel` IS NOT NULL", wherePrefix)
+						}
+					}
 					if statsSpec.Missing != nil {
 						if mf, ok := resolveHistogramMissingFloat(statsSpec.Missing); ok {
 							numExpr = fmt.Sprintf("COALESCE(%s, %s)", numExpr, strconv.FormatFloat(mf, 'f', -1, 64))
@@ -2610,9 +2643,16 @@ func (t *Transpiler) appendAggBranches(
 						))
 					}
 				case subSpec.Percentiles != nil:
+					nestedElemCtx := &nestedCtx{nestedPath: spec.Nested.Path, elemVar: "`_nel`"}
 					relJSONPath := nestedRelJSON(subSpec.Percentiles.Field)
 					numExpr := fmt.Sprintf("CAST(json_extract_string(`_nel`, %s) AS DOUBLE)", relJSONPath)
 					nWhere := fmt.Sprintf("%sjson_extract_string(`_nel`, %s) IS NOT NULL", wherePrefix, relJSONPath)
+					if subSpec.Percentiles.Script != nil {
+						if scriptExpr, ok := t.compileMetricScriptExpr(subSpec.Percentiles.Script, subSpec.Percentiles.Field, nestedElemCtx); ok {
+							numExpr = scriptExpr
+							nWhere = fmt.Sprintf("%s`_nel` IS NOT NULL", wherePrefix)
+						}
+					}
 					if subSpec.Percentiles.Missing != nil {
 						if mf, ok := resolveHistogramMissingFloat(subSpec.Percentiles.Missing); ok {
 							numExpr = fmt.Sprintf("COALESCE(%s, %s)", numExpr, strconv.FormatFloat(mf, 'f', -1, 64))
@@ -2637,9 +2677,16 @@ func (t *Transpiler) appendAggBranches(
 						))
 					}
 				case subSpec.PercentileRanks != nil:
+					nestedElemCtx := &nestedCtx{nestedPath: spec.Nested.Path, elemVar: "`_nel`"}
 					relJSONPath := nestedRelJSON(subSpec.PercentileRanks.Field)
 					numExpr := fmt.Sprintf("CAST(json_extract_string(`_nel`, %s) AS DOUBLE)", relJSONPath)
 					nWhere := fmt.Sprintf("%sjson_extract_string(`_nel`, %s) IS NOT NULL", wherePrefix, relJSONPath)
+					if subSpec.PercentileRanks.Script != nil {
+						if scriptExpr, ok := t.compileMetricScriptExpr(subSpec.PercentileRanks.Script, subSpec.PercentileRanks.Field, nestedElemCtx); ok {
+							numExpr = scriptExpr
+							nWhere = fmt.Sprintf("%s(%s) IS NOT NULL", wherePrefix, scriptExpr)
+						}
+					}
 					if subSpec.PercentileRanks.Missing != nil {
 						if mf, ok := resolveHistogramMissingFloat(subSpec.PercentileRanks.Missing); ok {
 							numExpr = fmt.Sprintf("COALESCE(%s, %s)", numExpr, strconv.FormatFloat(mf, 'f', -1, 64))
@@ -2659,9 +2706,16 @@ func (t *Transpiler) appendAggBranches(
 						))
 					}
 				case subSpec.Boxplot != nil:
+					nestedElemCtx := &nestedCtx{nestedPath: spec.Nested.Path, elemVar: "`_nel`"}
 					relJSONPath := nestedRelJSON(subSpec.Boxplot.Field)
 					numExpr := fmt.Sprintf("CAST(json_extract_string(`_nel`, %s) AS DOUBLE)", relJSONPath)
 					nWhere := fmt.Sprintf("%sjson_extract_string(`_nel`, %s) IS NOT NULL", wherePrefix, relJSONPath)
+					if subSpec.Boxplot.Script != nil {
+						if scriptExpr, ok := t.compileMetricScriptExpr(subSpec.Boxplot.Script, subSpec.Boxplot.Field, nestedElemCtx); ok {
+							numExpr = scriptExpr
+							nWhere = fmt.Sprintf("%s`_nel` IS NOT NULL", wherePrefix)
+						}
+					}
 					if subSpec.Boxplot.Missing != nil {
 						if mf, ok := resolveHistogramMissingFloat(subSpec.Boxplot.Missing); ok {
 							numExpr = fmt.Sprintf("COALESCE(%s, %s)", numExpr, strconv.FormatFloat(mf, 'f', -1, 64))
@@ -2693,11 +2747,18 @@ func (t *Transpiler) appendAggBranches(
 						))
 					}
 				case subSpec.Cardinality != nil:
+					nestedElemCtx := &nestedCtx{nestedPath: spec.Nested.Path, elemVar: "`_nel`"}
 					relJSONPath := nestedRelJSON(subSpec.Cardinality.Field)
 					valExpr := fmt.Sprintf("json_extract_string(`_nel`, %s)", relJSONPath)
 					nWhere := fmt.Sprintf("%s%s IS NOT NULL", wherePrefix, valExpr)
+					if subSpec.Cardinality.Script != nil {
+						if scriptExpr, ok := t.compileMetricScriptExpr(subSpec.Cardinality.Script, subSpec.Cardinality.Field, nestedElemCtx); ok {
+							valExpr = scriptExpr
+							nWhere = fmt.Sprintf("%s`_nel` IS NOT NULL", wherePrefix)
+						}
+					}
 					if subSpec.Cardinality.Missing != nil {
-						valExpr = fmt.Sprintf("COALESCE(%s, %s)", valExpr, quoteStr(formatMissingScalar(subSpec.Cardinality.Missing)))
+						valExpr = fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", valExpr, quoteStr(formatMissingScalar(subSpec.Cardinality.Missing)))
 						nWhere = fmt.Sprintf("%s`_nel` IS NOT NULL", wherePrefix)
 					}
 					*branches = append(*branches, fmt.Sprintf(
@@ -2706,11 +2767,18 @@ func (t *Transpiler) appendAggBranches(
 						quoteStr(subFull), valExpr, corrCol, nWhere,
 					))
 				case subSpec.ValueCount != nil:
+					nestedElemCtx := &nestedCtx{nestedPath: spec.Nested.Path, elemVar: "`_nel`"}
 					relJSONPath := nestedRelJSON(subSpec.ValueCount.Field)
 					valExpr := fmt.Sprintf("json_extract_string(`_nel`, %s)", relJSONPath)
 					nWhere := fmt.Sprintf("%s%s IS NOT NULL", wherePrefix, valExpr)
+					if subSpec.ValueCount.Script != nil {
+						if scriptExpr, ok := t.compileMetricScriptExpr(subSpec.ValueCount.Script, subSpec.ValueCount.Field, nestedElemCtx); ok {
+							valExpr = scriptExpr
+							nWhere = fmt.Sprintf("%s`_nel` IS NOT NULL", wherePrefix)
+						}
+					}
 					if subSpec.ValueCount.Missing != nil {
-						valExpr = fmt.Sprintf("COALESCE(%s, %s)", valExpr, quoteStr(formatMissingScalar(subSpec.ValueCount.Missing)))
+						valExpr = fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", valExpr, quoteStr(formatMissingScalar(subSpec.ValueCount.Missing)))
 						nWhere = fmt.Sprintf("%s`_nel` IS NOT NULL", wherePrefix)
 					}
 					*branches = append(*branches, fmt.Sprintf(
@@ -2828,6 +2896,11 @@ func (t *Transpiler) appendAggBranches(
 				}
 			} else {
 				col := t.sqlColumnRef(spec.Cardinality.Field, true, nil)
+				if spec.Cardinality.Script != nil {
+					if scriptExpr, ok := t.compileMetricScriptExpr(spec.Cardinality.Script, spec.Cardinality.Field, nil); ok {
+						col = scriptExpr
+					}
+				}
 				if spec.Cardinality.Missing != nil {
 					col = fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", col, quoteStr(formatMissingScalar(spec.Cardinality.Missing)))
 				}
@@ -2851,7 +2924,7 @@ func (t *Transpiler) appendAggBranches(
 		case spec.Max != nil:
 			t.appendMetricAggBranchWithMissingAndScript(branches, fullAggName, "MAX", spec.Max.Field, extraWhere, spec.Max.Missing, spec.Max.Script)
 		case spec.ValueCount != nil:
-			t.appendValueCountAggBranchWithMissing(branches, fullAggName, spec.ValueCount.Field, extraWhere, spec.ValueCount.Missing)
+			t.appendValueCountAggBranchWithMissingAndScript(branches, fullAggName, spec.ValueCount.Field, extraWhere, spec.ValueCount.Missing, spec.ValueCount.Script)
 
 		case spec.Rate != nil:
 			if spec.Rate.Field == "" {
@@ -2906,8 +2979,8 @@ func (t *Transpiler) appendAggBranches(
 				}
 			} else {
 				col := t.sqlNumericColumnRef(statsSpec.Field, nil)
-				if statsSpec.Field == "" && statsSpec.Script != nil {
-					if scriptExpr, ok := t.compileMetricScriptExpr(statsSpec.Script, nil); ok {
+				if statsSpec.Script != nil {
+					if scriptExpr, ok := t.compileMetricScriptExpr(statsSpec.Script, statsSpec.Field, nil); ok {
 						col = scriptExpr
 					}
 				}
@@ -2993,6 +3066,11 @@ func (t *Transpiler) appendAggBranches(
 					))
 				} else {
 					col := t.sqlNumericColumnRef(spec.Boxplot.Field, nil)
+					if spec.Boxplot.Script != nil {
+						if scriptExpr, ok := t.compileMetricScriptExpr(spec.Boxplot.Script, spec.Boxplot.Field, nil); ok {
+							col = scriptExpr
+						}
+					}
 					if spec.Boxplot.Missing != nil {
 						if mf, ok := resolveHistogramMissingFloat(spec.Boxplot.Missing); ok {
 							col = fmt.Sprintf("COALESCE(%s, %s)", col, strconv.FormatFloat(mf, 'f', -1, 64))
@@ -3045,6 +3123,11 @@ func (t *Transpiler) appendAggBranches(
 					))
 				} else {
 					col := t.sqlNumericColumnRef(spec.Percentiles.Field, nil)
+					if spec.Percentiles.Script != nil {
+						if scriptExpr, ok := t.compileMetricScriptExpr(spec.Percentiles.Script, spec.Percentiles.Field, nil); ok {
+							col = scriptExpr
+						}
+					}
 					if spec.Percentiles.Missing != nil {
 						if mf, ok := resolveHistogramMissingFloat(spec.Percentiles.Missing); ok {
 							col = fmt.Sprintf("COALESCE(%s, %s)", col, strconv.FormatFloat(mf, 'f', -1, 64))
@@ -3092,6 +3175,11 @@ func (t *Transpiler) appendAggBranches(
 					))
 				} else {
 					col := t.sqlNumericColumnRef(spec.PercentileRanks.Field, nil)
+					if spec.PercentileRanks.Script != nil {
+						if scriptExpr, ok := t.compileMetricScriptExpr(spec.PercentileRanks.Script, spec.PercentileRanks.Field, nil); ok {
+							col = scriptExpr
+						}
+					}
 					wCond := fmt.Sprintf(" WHERE %s%s IS NOT NULL", wherePrefix, col)
 					if spec.PercentileRanks.Missing != nil {
 						if mf, ok := resolveHistogramMissingFloat(spec.PercentileRanks.Missing); ok {
@@ -3391,6 +3479,9 @@ func (t *Transpiler) appendAggBranches(
 						hasMiss := srcSpec.Terms.Missing != nil || srcSpec.Terms.MissingBucket
 						col := resolveCompSourceCol(srcSpec.Terms.Field, false, hasMiss)
 						expr := fmt.Sprintf("CAST(%s AS STRING)", col)
+						if effDT == schema.DorisBoolean {
+							expr = fmt.Sprintf("CASE WHEN %s IS NULL THEN NULL WHEN CAST(%s AS STRING) IN ('true', '1') THEN 'true' ELSE 'false' END", col, col)
+						}
 						if srcSpec.Terms.Missing != nil {
 							hasHistogramSrc = true
 							expr = fmt.Sprintf("COALESCE(%s, %s)", expr, quoteStr(formatMissingScalar(srcSpec.Terms.Missing)))
@@ -3526,10 +3617,29 @@ func (t *Transpiler) capBucketSize(size int) int {
 }
 
 func (t *Transpiler) appendValueCountAggBranch(branches *[]string, fullAggName, field, extraWhere string) {
-	t.appendValueCountAggBranchWithMissing(branches, fullAggName, field, extraWhere, nil)
+	t.appendValueCountAggBranchWithMissingAndScript(branches, fullAggName, field, extraWhere, nil, nil)
 }
 
-func (t *Transpiler) appendValueCountAggBranchWithMissing(branches *[]string, fullAggName, field, extraWhere string, missing any) {
+func (t *Transpiler) appendValueCountAggBranchWithMissingAndScript(branches *[]string, fullAggName, field, extraWhere string, missing any, script any) {
+	if script != nil {
+		if scriptExpr, ok := t.compileMetricScriptExpr(script, field, nil); ok {
+			if missing != nil {
+				if mf, ok := resolveHistogramMissingFloat(missing); ok {
+					scriptExpr = fmt.Sprintf("COALESCE(%s, %s)", scriptExpr, strconv.FormatFloat(mf, 'f', -1, 64))
+				}
+			}
+			wClause := ""
+			if extraWhere != "" {
+				wClause = " WHERE " + extraWhere
+			}
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT %s AS `_agg_name`, '_metric' AS `_bucket_key`, CAST(COUNT(%s) AS DOUBLE) AS `_doc_count` "+
+					"FROM `base_matched`%s",
+				quoteStr(fullAggName), scriptExpr, wClause,
+			))
+			return
+		}
+	}
 	b := t.Schema.ResolveField(field)
 	arrCol := b.EffectiveArrayColumn(true)
 	wherePrefix := ""
@@ -3613,8 +3723,13 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 	}
 
 	appendSubNumericMetric := func(subFull, fn, field string, missing any, script any) {
-		if field == "" && script != nil {
-			if scriptExpr, ok := t.compileMetricScriptExpr(script, nctx); ok {
+		if script != nil {
+			if scriptExpr, ok := t.compileMetricScriptExpr(script, field, nctx); ok {
+				if missing != nil {
+					if mf, ok := resolveHistogramMissingFloat(missing); ok {
+						scriptExpr = fmt.Sprintf("COALESCE(%s, %s)", scriptExpr, strconv.FormatFloat(mf, 'f', -1, 64))
+					}
+				}
 				*branches = append(*branches, fmt.Sprintf(
 					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(%s(%s), 0) AS DOUBLE) AS `_doc_count` "+
 						"FROM %s WHERE %s GROUP BY `_bucket_key`",
@@ -3732,6 +3847,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 		case subSpec.Percentiles != nil:
 			b := t.Schema.ResolveField(subSpec.Percentiles.Field)
 			arrCol := b.EffectiveArrayColumn(true)
+			scriptExpr, hasScript := t.compileMetricScriptExpr(subSpec.Percentiles.Script, subSpec.Percentiles.Field, nctx)
 			for _, pct := range subSpec.Percentiles.EffectivePercents() {
 				q := pct / 100.0
 				if q < 0 {
@@ -3743,7 +3859,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 				if !strings.Contains(pctKey, ".") {
 					pctKey += ".0"
 				}
-				if !isExplodedNested(b, subSpec.Percentiles.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
+				if !hasScript && !isExplodedNested(b, subSpec.Percentiles.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 					valExpr := fmt.Sprintf("CAST(%s AS DOUBLE)", subElemAlias)
 					subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
 					subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, subElemAlias)
@@ -3760,10 +3876,13 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 						quoteStr(subFull+"."+pctKey), parentBucketExpr, valExpr, q, subFrom, subWhere,
 					))
 				} else {
-					col := t.sqlNumericColumnRef(subSpec.Percentiles.Field, nctx)
+					col := scriptExpr
 					subWhere := whereClause
-					if isExplodedNested(b, subSpec.Percentiles.Field) {
-						subWhere = fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, t.sqlColumnRef(subSpec.Percentiles.Field, true, nctx))
+					if !hasScript {
+						col = t.sqlNumericColumnRef(subSpec.Percentiles.Field, nctx)
+						if isExplodedNested(b, subSpec.Percentiles.Field) {
+							subWhere = fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, t.sqlColumnRef(subSpec.Percentiles.Field, true, nctx))
+						}
 					}
 					if subSpec.Percentiles.Missing != nil {
 						if mf, ok := resolveHistogramMissingFloat(subSpec.Percentiles.Missing); ok {
@@ -3781,10 +3900,11 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 		case subSpec.Boxplot != nil:
 			b := t.Schema.ResolveField(subSpec.Boxplot.Field)
 			arrCol := b.EffectiveArrayColumn(true)
+			scriptExpr, hasScript := t.compileMetricScriptExpr(subSpec.Boxplot.Script, subSpec.Boxplot.Field, nctx)
 			for _, pct := range []float64{0.0, 25.0, 50.0, 75.0, 100.0} {
 				q := pct / 100.0
 				pctKey := fmt.Sprintf("%.1f", pct)
-				if !isExplodedNested(b, subSpec.Boxplot.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
+				if !hasScript && !isExplodedNested(b, subSpec.Boxplot.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 					valExpr := fmt.Sprintf("CAST(%s AS DOUBLE)", subElemAlias)
 					subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
 					subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, subElemAlias)
@@ -3801,10 +3921,13 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 						quoteStr(subFull+"."+pctKey), parentBucketExpr, valExpr, q, subFrom, subWhere,
 					))
 				} else {
-					col := t.sqlNumericColumnRef(subSpec.Boxplot.Field, nctx)
+					col := scriptExpr
 					subWhere := whereClause
-					if isExplodedNested(b, subSpec.Boxplot.Field) {
-						subWhere = fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, t.sqlColumnRef(subSpec.Boxplot.Field, true, nctx))
+					if !hasScript {
+						col = t.sqlNumericColumnRef(subSpec.Boxplot.Field, nctx)
+						if isExplodedNested(b, subSpec.Boxplot.Field) {
+							subWhere = fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, t.sqlColumnRef(subSpec.Boxplot.Field, true, nctx))
+						}
 					}
 					if subSpec.Boxplot.Missing != nil {
 						if mf, ok := resolveHistogramMissingFloat(subSpec.Boxplot.Missing); ok {
@@ -3822,13 +3945,14 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 		case subSpec.PercentileRanks != nil:
 			b := t.Schema.ResolveField(subSpec.PercentileRanks.Field)
 			arrCol := b.EffectiveArrayColumn(true)
+			scriptExpr, hasScript := t.compileMetricScriptExpr(subSpec.PercentileRanks.Script, subSpec.PercentileRanks.Field, nctx)
 			for _, v := range subSpec.PercentileRanks.Values {
 				valKey := strconv.FormatFloat(v, 'f', -1, 64)
 				if !strings.Contains(valKey, ".") {
 					valKey += ".0"
 				}
 				valLit := strconv.FormatFloat(v, 'f', -1, 64)
-				if !isExplodedNested(b, subSpec.PercentileRanks.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
+				if !hasScript && !isExplodedNested(b, subSpec.PercentileRanks.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 					valExpr := fmt.Sprintf("CAST(%s AS DOUBLE)", subElemAlias)
 					subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
 					subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, subElemAlias)
@@ -3845,10 +3969,14 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 						quoteStr(subFull+"."+valKey), parentBucketExpr, valExpr, valLit, subFrom, subWhere,
 					))
 				} else {
-					col := t.sqlNumericColumnRef(subSpec.PercentileRanks.Field, nctx)
-					notNullRef := col
-					if isExplodedNested(b, subSpec.PercentileRanks.Field) {
-						notNullRef = t.sqlColumnRef(subSpec.PercentileRanks.Field, true, nctx)
+					col := scriptExpr
+					notNullRef := scriptExpr
+					if !hasScript {
+						col = t.sqlNumericColumnRef(subSpec.PercentileRanks.Field, nctx)
+						notNullRef = col
+						if isExplodedNested(b, subSpec.PercentileRanks.Field) {
+							notNullRef = t.sqlColumnRef(subSpec.PercentileRanks.Field, true, nctx)
+						}
 					}
 					subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, notNullRef)
 					if subSpec.PercentileRanks.Missing != nil {
@@ -3941,7 +4069,8 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 		case subSpec.ValueCount != nil:
 			b := t.Schema.ResolveField(subSpec.ValueCount.Field)
 			arrCol := b.EffectiveArrayColumn(true)
-			if !isExplodedNested(b, subSpec.ValueCount.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
+			scriptExpr, hasScript := t.compileMetricScriptExpr(subSpec.ValueCount.Script, subSpec.ValueCount.Field, nctx)
+			if !hasScript && !isExplodedNested(b, subSpec.ValueCount.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 				valExpr := subElemAlias
 				subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
 				subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, subElemAlias)
@@ -3956,10 +4085,13 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					quoteStr(subFull), parentBucketExpr, valExpr, subFrom, subWhere,
 				))
 			} else {
-				col := t.sqlColumnRef(subSpec.ValueCount.Field, true, nctx)
+				col := scriptExpr
 				subWhere := whereClause
-				if isExplodedNested(b, subSpec.ValueCount.Field) {
-					subWhere = fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, col)
+				if !hasScript {
+					col = t.sqlColumnRef(subSpec.ValueCount.Field, true, nctx)
+					if isExplodedNested(b, subSpec.ValueCount.Field) {
+						subWhere = fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, col)
+					}
 				}
 				if subSpec.ValueCount.Missing != nil {
 					col = fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", col, quoteStr(formatMissingScalar(subSpec.ValueCount.Missing)))
@@ -3973,7 +4105,8 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 			}
 		case subSpec.Cardinality != nil:
 			b := t.Schema.ResolveField(subSpec.Cardinality.Field)
-			if !isExplodedNested(b, subSpec.Cardinality.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
+			scriptExpr, hasScript := t.compileMetricScriptExpr(subSpec.Cardinality.Script, subSpec.Cardinality.Field, nctx)
+			if !hasScript && !isExplodedNested(b, subSpec.Cardinality.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 				arrCol := b.EffectiveArrayColumn(true)
 				valExpr := subElemAlias
 				subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
@@ -3989,10 +4122,13 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					quoteStr(subFull), parentBucketExpr, valExpr, subFrom, subWhere,
 				))
 			} else {
-				col := t.sqlColumnRef(subSpec.Cardinality.Field, true, nctx)
+				col := scriptExpr
 				subWhere := whereClause
-				if isExplodedNested(b, subSpec.Cardinality.Field) {
-					subWhere = fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, col)
+				if !hasScript {
+					col = t.sqlColumnRef(subSpec.Cardinality.Field, true, nctx)
+					if isExplodedNested(b, subSpec.Cardinality.Field) {
+						subWhere = fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, col)
+					}
 				}
 				if subSpec.Cardinality.Missing != nil {
 					col = fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", col, quoteStr(formatMissingScalar(subSpec.Cardinality.Missing)))
@@ -4502,10 +4638,48 @@ func (t *Transpiler) compileTopHitsOrderBy(sorts []esast.SortSpec) string {
 	return t.compileOrderBy(filtered)
 }
 
-func (t *Transpiler) coerceRangeAggBoundWithNow(_ string, v any, now time.Time) any {
+func (t *Transpiler) coerceRangeAggBoundWithNow(field string, v any, now time.Time) any {
+	b := t.Schema.ResolveField(field)
 	if strVal, ok := v.(string); ok {
 		if ms, ok := schema.ParseESDateToEpochMillis(strVal, now); ok {
 			return ms
+		}
+		if b.ESType == "date_nanos" {
+			if iv, err := strconv.ParseInt(strings.TrimSpace(strVal), 10, 64); err == nil {
+				return normalizeDateNanosValue(b.ESType, iv)
+			}
+		}
+	}
+	return normalizeDateNanosValue(b.ESType, v)
+}
+
+func normalizeDateNanosValue(esType string, v any) any {
+	if esType != "date_nanos" || v == nil {
+		return v
+	}
+	switch nv := v.(type) {
+	case int:
+		if int64(nv) > 1_000_000_000_000_000 || int64(nv) < -1_000_000_000_000_000 {
+			return int64(nv) / 1_000_000
+		}
+	case int64:
+		if nv > 1_000_000_000_000_000 || nv < -1_000_000_000_000_000 {
+			return nv / 1_000_000
+		}
+	case float64:
+		if nv > 1e15 || nv < -1e15 {
+			return int64(nv) / 1_000_000
+		}
+	case json.Number:
+		if i, err := nv.Int64(); err == nil && (i > 1_000_000_000_000_000 || i < -1_000_000_000_000_000) {
+			return i / 1_000_000
+		}
+		if f, err := nv.Float64(); err == nil && (f > 1e15 || f < -1e15) {
+			return int64(f) / 1_000_000
+		}
+	case string:
+		if i, err := strconv.ParseInt(strings.TrimSpace(nv), 10, 64); err == nil && (i > 1_000_000_000_000_000 || i < -1_000_000_000_000_000) {
+			return i / 1_000_000
 		}
 	}
 	return v
@@ -4542,7 +4716,7 @@ func (t *Transpiler) appendMetricAggBranch(branches *[]string, fullAggName, sqlF
 	t.appendMetricAggBranchWithMissingAndScript(branches, fullAggName, sqlFunc, field, extraWhere, nil, nil)
 }
 
-func (t *Transpiler) compileMetricScriptExpr(script any, nctx *nestedCtx) (string, bool) {
+func (t *Transpiler) compileMetricScriptExpr(script any, defaultField string, nctx *nestedCtx) (string, bool) {
 	if script == nil {
 		return "", false
 	}
@@ -4576,16 +4750,170 @@ func (t *Transpiler) compileMetricScriptExpr(script any, nctx *nestedCtx) (strin
 		return "", false
 	}
 	params, _ := scriptMap["params"].(map[string]any)
-	compiled, ok := t.parseSafeThresholdExpr(s, params, 0, nctx, 0)
+	compiled, ok := t.parseMetricScriptExpr(s, params, defaultField, nctx, 0)
 	if !ok || compiled == "" {
 		return "", false
 	}
 	return fmt.Sprintf("CAST(%s AS DOUBLE)", compiled), true
 }
 
+func (t *Transpiler) parseMetricScriptExpr(s string, params map[string]any, defaultField string, nctx *nestedCtx, depth int) (string, bool) {
+	if depth > 16 {
+		return "", false
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false
+	}
+	if hasMatchingThresholdParens(s) {
+		inner, ok := t.parseMetricScriptExpr(s[1:len(s)-1], params, defaultField, nctx, depth+1)
+		if !ok {
+			return "", false
+		}
+		return "(" + inner + ")", true
+	}
+	for _, ops := range []string{"+-", "*/"} {
+		parenDepth := 0
+		inSingleQuote := false
+		for i := len(s) - 1; i > 0; i-- {
+			ch := s[i]
+			if ch == '\'' {
+				inSingleQuote = !inSingleQuote
+				continue
+			}
+			if inSingleQuote {
+				continue
+			}
+			switch ch {
+			case ')', ']':
+				parenDepth++
+			case '(', '[':
+				parenDepth--
+			default:
+				if parenDepth == 0 && strings.IndexByte(ops, ch) >= 0 {
+					lhs, ok1 := t.parseMetricScriptExpr(s[:i], params, defaultField, nctx, depth+1)
+					rhs, ok2 := t.parseMetricScriptExpr(s[i+1:], params, defaultField, nctx, depth+1)
+					if ok1 && ok2 {
+						return fmt.Sprintf("(%s %c %s)", lhs, ch, rhs), true
+					}
+				}
+			}
+		}
+	}
+	if strings.HasPrefix(s, "+") {
+		return t.parseMetricScriptExpr(s[1:], params, defaultField, nctx, depth+1)
+	}
+	if strings.HasPrefix(s, "-") {
+		inner, ok := t.parseMetricScriptExpr(s[1:], params, defaultField, nctx, depth+1)
+		if ok {
+			return "(-" + inner + ")", true
+		}
+	}
+	for _, fnSpec := range []struct{ prefix, sqlFn string }{
+		{"Math.min(", "LEAST"},
+		{"Math.max(", "GREATEST"},
+		{"LEAST(", "LEAST"},
+		{"GREATEST(", "GREATEST"},
+	} {
+		if strings.HasPrefix(s, fnSpec.prefix) && strings.HasSuffix(s, ")") {
+			inner := s[len(fnSpec.prefix) : len(s)-1]
+			a1, a2, ok := splitTwoThresholdArgs(inner)
+			if !ok {
+				return "", false
+			}
+			c1, ok1 := t.parseMetricScriptExpr(a1, params, defaultField, nctx, depth+1)
+			c2, ok2 := t.parseMetricScriptExpr(a2, params, defaultField, nctx, depth+1)
+			if !ok1 || !ok2 {
+				return "", false
+			}
+			return fmt.Sprintf("%s(%s, %s)", fnSpec.sqlFn, c1, c2), true
+		}
+	}
+	for _, fnSpec := range []struct{ prefix, sqlFn string }{
+		{"Math.floor(", "FLOOR"},
+		{"Math.ceil(", "CEIL"},
+		{"Math.abs(", "ABS"},
+		{"Math.round(", "ROUND"},
+	} {
+		if strings.HasPrefix(s, fnSpec.prefix) && strings.HasSuffix(s, ")") {
+			inner := s[len(fnSpec.prefix) : len(s)-1]
+			c1, ok1 := t.parseMetricScriptExpr(inner, params, defaultField, nctx, depth+1)
+			if !ok1 {
+				return "", false
+			}
+			return fmt.Sprintf("%s(%s)", fnSpec.sqlFn, c1), true
+		}
+	}
+	if strings.HasPrefix(s, "doc['") {
+		rest := s[len("doc['"):]
+		end := strings.Index(rest, "']")
+		if end <= 0 {
+			return "", false
+		}
+		field := rest[:end]
+		tail := strings.TrimSpace(rest[end+len("']"):])
+		if tail != "" && tail != ".value" && tail != ".size()" && tail != ".length" {
+			return "", false
+		}
+		b := t.Schema.ResolveField(field)
+		if tail == ".size()" || tail == ".length" {
+			if b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath)) {
+				colName := b.EffectiveArrayColumn(true)
+				if colName != "" {
+					return fmt.Sprintf("COALESCE(array_size(`%s`), 0)", colName), true
+				}
+			}
+			colRef := t.sqlColumnRef(field, true, nctx)
+			return fmt.Sprintf("(CASE WHEN %s IS NOT NULL THEN 1 ELSE 0 END)", colRef), true
+		}
+		return t.sqlNumericColumnRef(field, nctx), true
+	}
+	if (s == "_value" || s == "params._value") && defaultField != "" {
+		return t.sqlNumericColumnRef(defaultField, nctx), true
+	}
+	if strings.HasPrefix(s, "params.") {
+		key := s[len("params."):]
+		if pv, ok := params[key]; ok {
+			switch v := pv.(type) {
+			case int:
+				return strconv.Itoa(v), true
+			case int64:
+				return strconv.FormatInt(v, 10), true
+			case float64:
+				if !math.IsNaN(v) && !math.IsInf(v, 0) {
+					if v == math.Trunc(v) {
+						return strconv.FormatInt(int64(v), 10), true
+					}
+					return strconv.FormatFloat(v, 'f', -1, 64), true
+				}
+			case json.Number:
+				if i, err := v.Int64(); err == nil {
+					return strconv.FormatInt(i, 10), true
+				}
+				if f, err := v.Float64(); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+					return strconv.FormatFloat(f, 'f', -1, 64), true
+				}
+			}
+		}
+		return "", false
+	}
+	if n, err := strconv.Atoi(s); err == nil {
+		return strconv.Itoa(n), true
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+		return strconv.FormatFloat(f, 'f', -1, 64), true
+	}
+	return "", false
+}
+
 func (t *Transpiler) appendMetricAggBranchWithMissingAndScript(branches *[]string, fullAggName, sqlFunc, field, extraWhere string, missing any, script any) {
-	if field == "" && script != nil {
-		if scriptExpr, ok := t.compileMetricScriptExpr(script, nil); ok {
+	if script != nil {
+		if scriptExpr, ok := t.compileMetricScriptExpr(script, field, nil); ok {
+			if missing != nil {
+				if mf, ok := resolveHistogramMissingFloat(missing); ok {
+					scriptExpr = fmt.Sprintf("COALESCE(%s, %s)", scriptExpr, strconv.FormatFloat(mf, 'f', -1, 64))
+				}
+			}
 			wClause := ""
 			if extraWhere != "" {
 				wClause = " WHERE " + extraWhere
@@ -4887,6 +5215,20 @@ func splitTwoThresholdArgs(s string) (string, string, bool) {
 	return s[:commaIdx], s[commaIdx+1:], true
 }
 
+func sampleValForSortType(sortType string) any {
+	switch strings.ToLower(strings.TrimSpace(sortType)) {
+	case "long", "integer", "short", "byte", "date", "date_nanos":
+		return int64(1)
+	case "double", "float", "half_float", "scaled_float", "number":
+		return float64(0.5)
+	case "boolean":
+		return true
+	case "keyword", "text", "string":
+		return ""
+	}
+	return nil
+}
+
 func (t *Transpiler) compileOrderBy(sorts []esast.SortSpec) string {
 	return t.compileOrderByWithAfter(sorts, nil)
 }
@@ -4907,6 +5249,10 @@ func (t *Transpiler) resolveSortMissing(s esast.SortSpec, b schema.FieldBinding)
 		}
 	}
 	if iv, err := strconv.ParseInt(mStr, 10, 64); err == nil {
+		norm := normalizeDateNanosValue(b.ESType, iv)
+		if niv, ok := norm.(int64); ok {
+			return niv, strconv.FormatInt(niv, 10)
+		}
 		return iv, strconv.FormatInt(iv, 10)
 	}
 	if fv, err := strconv.ParseFloat(mStr, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
@@ -4944,6 +5290,9 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 		default:
 			b := t.Schema.ResolveField(s.Entry.Field)
 			sampleVal, missingSQL := t.resolveSortMissing(s, b)
+			if sampleVal == nil && s.Entry.Type != "" {
+				sampleVal = sampleValForSortType(s.Entry.Type)
+			}
 			if afterIdx < len(after) && after[afterIdx] != nil {
 				sampleVal = after[afterIdx]
 				if strVal, ok := sampleVal.(string); ok {
@@ -4953,6 +5302,7 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 						}
 					}
 				}
+				sampleVal = normalizeDateNanosValue(b.ESType, sampleVal)
 			}
 			col := t.sqlSortColumnRef(s.Entry.Field, sampleVal, dir == "DESC", s.Entry.Mode)
 			if missingSQL != "" {
@@ -4998,15 +5348,15 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 		return "TRUE"
 	}
 
-	sortExpr := func(idx int) (string, any, bool) {
+	sortExpr := func(idx int) (string, any, bool, any) {
 		field := effectiveSorts[idx].Entry.Field
 		val := after[idx]
 		desc := strings.EqualFold(effectiveSorts[idx].Entry.Order, "desc")
 		switch field {
 		case "_score":
-			return fmt.Sprintf("CAST(%s AS DOUBLE)", scoreExpr), val, true
+			return fmt.Sprintf("CAST(%s AS DOUBLE)", scoreExpr), val, true, nil
 		case "_id", "_doc":
-			return "`_id`", val, true
+			return "`_id`", val, true, nil
 		default:
 			b := t.Schema.ResolveField(field)
 			missSample, missingSQL := t.resolveSortMissing(effectiveSorts[idx], b)
@@ -5022,31 +5372,20 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 						val = ms
 					}
 				}
-			} else if b.ESType == "date_nanos" {
-				switch nv := val.(type) {
-				case int64:
-					if nv > 1_000_000_000_000_000 {
-						val = nv / 1_000_000
-					}
-				case float64:
-					if nv > 1e15 {
-						val = int64(nv) / 1_000_000
-					}
-				case json.Number:
-					if i, err := nv.Int64(); err == nil && i > 1_000_000_000_000_000 {
-						val = i / 1_000_000
-					}
-				}
 			}
+			val = normalizeDateNanosValue(b.ESType, val)
 			sampleForCol := val
 			if sampleForCol == nil {
 				sampleForCol = missSample
+			}
+			if sampleForCol == nil && effectiveSorts[idx].Entry.Type != "" {
+				sampleForCol = sampleValForSortType(effectiveSorts[idx].Entry.Type)
 			}
 			col := t.sqlSortColumnRef(field, sampleForCol, desc, effectiveSorts[idx].Entry.Mode)
 			if missingSQL != "" {
 				col = fmt.Sprintf("COALESCE(%s, %s)", col, missingSQL)
 			}
-			return col, val, missingSQL != ""
+			return col, val, missingSQL != "", missSample
 		}
 	}
 
@@ -5054,14 +5393,18 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 	for i := 0; i < n; i++ {
 		var conjuncts []string
 		for j := 0; j < i; j++ {
-			colJ, valJ, _ := sortExpr(j)
+			colJ, valJ, hasCoalesceJ, missSampleJ := sortExpr(j)
 			if valJ == nil {
-				conjuncts = append(conjuncts, fmt.Sprintf("%s IS NULL", colJ))
+				if hasCoalesceJ && missSampleJ != nil {
+					conjuncts = append(conjuncts, fmt.Sprintf("%s = %s", colJ, quoteValue(missSampleJ)))
+				} else {
+					conjuncts = append(conjuncts, fmt.Sprintf("%s IS NULL", colJ))
+				}
 			} else {
 				conjuncts = append(conjuncts, fmt.Sprintf("%s = %s", colJ, quoteValue(valJ)))
 			}
 		}
-		colI, valI, hasCoalesce := sortExpr(i)
+		colI, valI, hasCoalesce, _ := sortExpr(i)
 		missingFirst := strings.EqualFold(effectiveSorts[i].Entry.Missing, "_first")
 		if valI == nil {
 			if !missingFirst {
