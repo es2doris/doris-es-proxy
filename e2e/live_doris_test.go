@@ -584,8 +584,33 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	var compDescRes map[string]any
 	_ = json.NewDecoder(compDescResp.Body).Decode(&compDescRes)
 	_ = compDescResp.Body.Close()
-	compBuckets := compDescRes["aggregations"].(map[string]any)["comp_desc"].(map[string]any)["buckets"].([]any)
-	if len(compBuckets) != 1 || compBuckets[0].(map[string]any)["key"].(map[string]any)["svc"] != "payment-api" {
-		t.Fatalf("expected first descending composite bucket on live Doris to be payment-api, got: %+v", compBuckets)
+	compDescAgg := compDescRes["aggregations"].(map[string]any)["comp_desc"].(map[string]any)
+	compBuckets := compDescAgg["buckets"].([]any)
+	if len(compBuckets) != 1 || compBuckets[0].(map[string]any)["key"].(map[string]any)["svc"] != "checkout-api" {
+		t.Fatalf("expected first descending composite bucket on live Doris to be checkout-api (checkout-api > billing-api), got: %+v", compBuckets)
+	}
+	compPage2Resp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
+		"size": 0,
+		"aggs": {
+			"comp_desc": {
+				"composite": {
+					"size": 1,
+					"after": {"svc": "checkout-api"},
+					"sources": [
+						{"svc": {"terms": {"field": "service", "order": "desc"}}}
+					]
+				}
+			}
+		}
+	}`))
+	if err != nil || compPage2Resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search (composite desc page 2) failed: status=%v err=%v", compPage2Resp.StatusCode, err)
+	}
+	var compPage2Res map[string]any
+	_ = json.NewDecoder(compPage2Resp.Body).Decode(&compPage2Res)
+	_ = compPage2Resp.Body.Close()
+	compPage2Buckets := compPage2Res["aggregations"].(map[string]any)["comp_desc"].(map[string]any)["buckets"].([]any)
+	if len(compPage2Buckets) != 1 || compPage2Buckets[0].(map[string]any)["key"].(map[string]any)["svc"] != "billing-api" {
+		t.Fatalf("expected second descending composite bucket on live Doris to be billing-api, got: %+v", compPage2Buckets)
 	}
 }
