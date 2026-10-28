@@ -31,6 +31,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/es2doris/doris-es-proxy/pkg/schema"
 )
 
 // MemoryBackend is a stateful in-process Apache Doris storage & SQL execution emulator
@@ -217,19 +220,27 @@ var (
 	reCTEBase          = regexp.MustCompile(`(?s)^WITH ` + "`base_matched` AS \\(SELECT \\* FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0(?: AND \\((.+?)\\))?\\)\n(.+)$")
 )
 
-func parseOrderSpec(spec string) (colExpr string, desc bool) {
+func parseOrderSpec(spec string) (colExpr string, desc bool, nullsFirst bool) {
 	s := strings.TrimSpace(spec)
 	if s == "" {
-		return "", false
+		return "", false, false
 	}
 	upper := strings.ToUpper(s)
+	if strings.HasSuffix(upper, " NULLS FIRST") {
+		nullsFirst = true
+		s = strings.TrimSpace(s[:len(s)-len(" NULLS FIRST")])
+		upper = strings.ToUpper(s)
+	} else if strings.HasSuffix(upper, " NULLS LAST") {
+		s = strings.TrimSpace(s[:len(s)-len(" NULLS LAST")])
+		upper = strings.ToUpper(s)
+	}
 	switch {
 	case strings.HasSuffix(upper, " DESC"):
-		return strings.TrimSpace(s[:len(s)-5]), true
+		return strings.TrimSpace(s[:len(s)-5]), true, nullsFirst
 	case strings.HasSuffix(upper, " ASC"):
-		return strings.TrimSpace(s[:len(s)-4]), false
+		return strings.TrimSpace(s[:len(s)-4]), false, nullsFirst
 	default:
-		return s, false
+		return s, false, nullsFirst
 	}
 }
 
@@ -319,7 +330,7 @@ func (m *MemoryBackend) QueryHits(_ context.Context, sqlStr string) ([]HitRow, e
 	sort.SliceStable(sortIdx, func(a, b int) bool {
 		ia, ib := sortIdx[a], sortIdx[b]
 		for _, spec := range orderSpecs {
-			colExpr, desc := parseOrderSpec(spec)
+			colExpr, desc, nullsFirst := parseOrderSpec(spec)
 			if colExpr == "" {
 				continue
 			}
@@ -336,10 +347,10 @@ func (m *MemoryBackend) QueryHits(_ context.Context, sqlStr string) ([]HitRow, e
 					continue
 				}
 				if va == nil {
-					return false
+					return nullsFirst
 				}
 				if vb == nil {
-					return true
+					return !nullsFirst
 				}
 				cmp = compareAny(va, vb)
 			}
@@ -1319,7 +1330,7 @@ func sortRowsByOrderClause(rows []map[string]any, orderByClause string) {
 	orderSpecs := splitTopLevelArgs(orderByClause)
 	sort.SliceStable(rows, func(i, j int) bool {
 		for _, spec := range orderSpecs {
-			colExpr, desc := parseOrderSpec(spec)
+			colExpr, desc, nullsFirst := parseOrderSpec(spec)
 			if colExpr == "" {
 				continue
 			}
@@ -1333,10 +1344,10 @@ func sortRowsByOrderClause(rows []map[string]any, orderByClause string) {
 					continue
 				}
 				if va == nil {
-					return false
+					return nullsFirst
 				}
 				if vb == nil {
-					return true
+					return !nullsFirst
 				}
 				cmp = compareAny(va, vb)
 			}
@@ -1724,7 +1735,7 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 			bodyExpr := strings.TrimSpace(inner[arrowIdx+2 : lastComma])
 			colName := strings.Trim(strings.TrimSpace(inner[lastComma+1:]), "`")
 			for _, elemStr := range toStringSlice(row[colName]) {
-				if evalLambdaBody(elemStr, varName, bodyExpr) {
+				if evalLambdaBody(row, elemStr, varName, bodyExpr) {
 					return true
 				}
 			}
@@ -1782,6 +1793,20 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 		colExpr := strings.TrimSpace(expr[:len(expr)-len(" IS NULL")])
 		val := resolveColumnValue(row, colExpr)
 		return val == nil
+	}
+
+	if strings.HasPrefix(expr, "SEARCH(") && strings.HasSuffix(expr, ")") {
+		args := splitTopLevelArgs(expr[len("SEARCH(") : len(expr)-1])
+		if len(args) >= 3 {
+			dsl := unquoteSQLLiteral(strings.TrimSpace(args[0]))
+			col := unquoteSQLLiteral(strings.TrimSpace(args[1]))
+			op := strings.ToUpper(unquoteSQLLiteral(strings.TrimSpace(args[2])))
+			matchOp := "MATCH_ANY"
+			if op == "AND" {
+				matchOp = "MATCH_ALL"
+			}
+			return evalFulltextMatch(row, "`"+col+"`", matchOp, dsl)
+		}
 	}
 
 	for _, matchOp := range []string{" MATCH_PHRASE_PREFIX ", " MATCH_PHRASE ", " MATCH_REGEXP ", " MATCH_ALL ", " MATCH_ANY "} {
@@ -1936,11 +1961,11 @@ func asSliceOrSingle(val any) []any {
 	}
 }
 
-func evalLambdaBody(elemStr, varName, bodyExpr string) bool {
+func evalLambdaBody(outerRow map[string]any, elemStr, varName, bodyExpr string) bool {
 	bodyExpr = trimOuterParens(strings.TrimSpace(bodyExpr))
 	if parts := splitTopLevelLogicalOp(bodyExpr, " OR "); len(parts) > 1 {
 		for _, p := range parts {
-			if evalLambdaBody(elemStr, varName, p) {
+			if evalLambdaBody(outerRow, elemStr, varName, p) {
 				return true
 			}
 		}
@@ -1948,14 +1973,18 @@ func evalLambdaBody(elemStr, varName, bodyExpr string) bool {
 	}
 	if parts := splitTopLevelLogicalOp(bodyExpr, " AND "); len(parts) > 1 {
 		for _, p := range parts {
-			if !evalLambdaBody(elemStr, varName, p) {
+			if !evalLambdaBody(outerRow, elemStr, varName, p) {
 				return false
 			}
 		}
 		return true
 	}
 
-	syntheticRow := map[string]any{varName: elemStr}
+	syntheticRow := make(map[string]any, len(outerRow)+1)
+	for k, v := range outerRow {
+		syntheticRow[k] = v
+	}
+	syntheticRow[varName] = elemStr
 	return evalWhereExpr(syntheticRow, bodyExpr)
 }
 
@@ -2489,6 +2518,11 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 				if f, ok := toFloat(v); ok {
 					return int64(f)
 				}
+				if s, ok := v.(string); ok {
+					if ms, ok := schema.ParseESDateToEpochMillis(s, time.Now().UTC()); ok {
+						return ms
+					}
+				}
 			}
 			if isArithmeticSQLExpr(inner) {
 				return int64(evalNumericExpr(row, inner))
@@ -3017,6 +3051,19 @@ func compareAny(a, b any) int {
 	fb, bNum := toFloat(b)
 	if aNum && bNum {
 		return compareFloats(fa, fb)
+	}
+	if aNum && !bNum {
+		if sb, ok := b.(string); ok {
+			if ms, ok := schema.ParseESDateToEpochMillis(sb, time.Now().UTC()); ok {
+				return compareFloats(fa, float64(ms))
+			}
+		}
+	} else if !aNum && bNum {
+		if sa, ok := a.(string); ok {
+			if ms, ok := schema.ParseESDateToEpochMillis(sa, time.Now().UTC()); ok {
+				return compareFloats(float64(ms), fb)
+			}
+		}
 	}
 	return strings.Compare(fmt.Sprintf("%v", a), fmt.Sprintf("%v", b))
 }

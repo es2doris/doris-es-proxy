@@ -760,4 +760,67 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 		t.Fatalf("POST /_ingest/pipeline/_simulate (R14 dissect+array convert) failed: status=%v err=%v", simR14Resp.StatusCode, err)
 	}
 	_ = simR14Resp.Body.Close()
+
+	// 16. Verify Round-15 features on live Doris:
+	//   - `script_fields` + `_script` sort + `search_after` with `track_total_hits: true`
+	//   - `composite` agg with `order: "desc"`
+	//   - New ingest processors (`grok`, `csv`, `uri_parts`, `registered_domain`, `fingerprint`, `redact`)
+	r15SearchResp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
+		"size": 1,
+		"track_total_hits": true,
+		"script_fields": {
+			"double_lat": {
+				"script": {"source": "doc['latency_ms'].value * 2"}
+			}
+		},
+		"sort": [{"latency_ms": {"order": "desc", "missing": "_last"}}],
+		"search_after": [999999],
+		"aggs": {
+			"comp_svc_desc": {
+				"composite": {
+					"size": 5,
+					"sources": [
+						{"svc": {"terms": {"field": "service", "order": "desc"}}}
+					]
+				}
+			}
+		}
+	}`))
+	if err != nil || r15SearchResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search (R15 script_fields + search_after + composite desc) failed: status=%v err=%v", r15SearchResp.StatusCode, err)
+	}
+	var r15SearchRes map[string]any
+	_ = json.NewDecoder(r15SearchResp.Body).Decode(&r15SearchRes)
+	_ = r15SearchResp.Body.Close()
+	if len(r15SearchRes["hits"].(map[string]any)["hits"].([]any)) == 0 {
+		t.Fatalf("expected R15 hits on live_auto_index, got 0")
+	}
+
+	simR15Resp, err := http.Post(ts.URL+"/_ingest/pipeline/_simulate", "application/json", strings.NewReader(`{
+		"pipeline": {
+			"processors": [
+				{"grok": {"field": "log", "patterns": ["%{IP:client_ip} %{WORD:method} %{URIPATHPARAM:uri}"]}},
+				{"csv": {"field": "csv_row", "target_fields": ["col_a", "col_b"]}},
+				{"uri_parts": {"field": "full_url", "target_field": "url_parsed"}},
+				{"registered_domain": {"field": "fqdn", "target_field": "reg_dom"}},
+				{"redact": {"field": "msg", "patterns": ["%{EMAILADDRESS:EMAIL}"]}},
+				{"fingerprint": {"fields": ["client_ip", "method"], "target_field": "fp"}}
+			]
+		},
+		"docs": [{
+			"_index": "live_auto_index",
+			"_id": "sim-r15",
+			"_source": {
+				"log": "10.0.0.1 GET /api/v1/items?limit=10",
+				"csv_row": "alpha,beta",
+				"full_url": "https://sub.example.co.uk:8443/path?x=1#frag",
+				"fqdn": "api.sub.example.co.uk",
+				"msg": "contact ops@example.com now"
+			}
+		}]
+	}`))
+	if err != nil || simR15Resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_ingest/pipeline/_simulate (R15 processors) failed: status=%v err=%v", simR15Resp.StatusCode, err)
+	}
+	_ = simR15Resp.Body.Close()
 }

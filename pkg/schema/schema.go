@@ -91,6 +91,19 @@ func (b FieldBinding) EffectiveLowercase(preferKeyword bool) bool {
 	return false
 }
 
+// EffectiveArrayColumn returns the physical array column name for StoragePromotedArray
+// or StorageNestedSubfield, preferring KeywordCompanion when preferKeyword is true (or
+// when KeywordNormalizer is active).
+func (b FieldBinding) EffectiveArrayColumn(preferKeyword bool) string {
+	if b.KeywordCompanion != "" && (preferKeyword || b.KeywordNormalizer) {
+		return b.KeywordCompanion
+	}
+	if b.Kind == StorageNestedSubfield && b.PrefilterArrayCol != "" {
+		return b.PrefilterArrayCol
+	}
+	return b.ColumnName
+}
+
 // NestedRootSpec holds pre-split path metadata for a correlated nested array root.
 type NestedRootSpec struct {
 	Path       string
@@ -345,7 +358,7 @@ func (s *IndexSchema) compileProperties(
 				// Multi-fields read from the same `currJSONPath` in `_source`!
 				s.registerLeafField(multiDotPath, currJSONPath, activeNestedRoot, nestedRootDepth, subProp)
 				if subKey == "keyword" {
-					if baseBinding, ok := s.Fields[dotPath]; ok && (baseBinding.Kind == StoragePromotedScalar || baseBinding.Kind == StoragePromotedArray) {
+					if baseBinding, ok := s.Fields[dotPath]; ok && (baseBinding.Kind == StoragePromotedScalar || baseBinding.Kind == StoragePromotedArray || baseBinding.Kind == StorageNestedSubfield) {
 						baseBinding.KeywordCompanion = s.Fields[multiDotPath].ColumnName
 						baseBinding.KeywordNormalizer = s.Fields[multiDotPath].LowercaseNormalizer
 						s.Fields[dotPath] = baseBinding

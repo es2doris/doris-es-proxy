@@ -214,7 +214,11 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 			saPred = t.compileSearchAfterPredicate(req.Sort, req.SearchAfter, scoreExpr)
 		}
 		if req.Collapse != nil && req.Collapse.Field != "" {
+			bCollapse := t.Schema.ResolveField(req.Collapse.Field)
 			collapseCol := t.sqlColumnRef(req.Collapse.Field, true, nil)
+			if bCollapse.Kind == schema.StoragePromotedArray || bCollapse.Kind == schema.StorageNestedSubfield {
+				collapseCol = fmt.Sprintf("element_at(`%s`, 1)", bCollapse.EffectiveArrayColumn(true))
+			}
 			preCollapseWhere := fmt.Sprintf("`__DORIS_DELETE_SIGN__` = 0 AND (%s) AND (%s)", mainQ.WhereSQL, postFilterSQL)
 			outerCollapseWhere := fmt.Sprintf("`_collapse_rn` = 1 OR %s IS NULL", collapseCol)
 			if saPred != "" && saPred != "TRUE" {
@@ -508,7 +512,7 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 				pat = "(?i)" + pat
 			}
 			if (nctx == nil || nctx.nestedPath != b.NestedPath) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
-				arrPred := fmt.Sprintf("array_exists(_x -> _x REGEXP %s, `%s`)", quoteStr(pat), b.ColumnName)
+				arrPred := fmt.Sprintf("array_exists(_x -> _x REGEXP %s, `%s`)", quoteStr(pat), b.EffectiveArrayColumn(false))
 				preds = append(preds, arrPred)
 				safePreds = append(safePreds, arrPred)
 				continue
@@ -516,7 +520,7 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 			col := t.sqlColumnRef(field, false, nctx)
 			safePred := fmt.Sprintf("(%s IS NOT NULL AND %s REGEXP %s)", col, col, quoteStr(pat))
 			safePreds = append(safePreds, safePred)
-			if nctx != nil || effCI {
+			if nctx != nil || effCI || strings.HasPrefix(pat, "(?i)") {
 				preds = append(preds, fmt.Sprintf("%s REGEXP %s", col, quoteStr(pat)))
 			} else {
 				preds = append(preds, fmt.Sprintf("%s MATCH_REGEXP %s", col, quoteStr(pat)))
@@ -644,7 +648,7 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 	case q.SimpleQueryString != nil:
 		return t.compileQueryString(q.SimpleQueryString, scoring, nctx)
 	case q.Nested != nil:
-		return t.compileNested(q.Nested, scoring)
+		return t.compileNestedWithParent(q.Nested, scoring, nctx)
 	case q.ConstantScore != nil:
 		inner := t.CompileQuery(&q.ConstantScore.Filter, scoring, nctx)
 		boost := 1.0
@@ -664,6 +668,10 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		}
 	case q.FunctionScore != nil:
 		return t.compileFunctionScore(q.FunctionScore, nctx)
+	case q.ScriptScore != nil:
+		return t.compileScriptScore(q.ScriptScore, scoring, nctx)
+	case q.Script != nil:
+		return t.compileScriptQuery(q.Script, scoring, nctx)
 	case q.KNN != nil:
 		return t.compileKNN(q.KNN, scoring, nctx)
 	}
@@ -867,6 +875,9 @@ func (t *Transpiler) compileBool(b *esast.BoolQuery, scoring bool, nctx *nestedC
 		usesFT = usesFT || c.UsesFulltextMatch
 	}
 	for i := range b.MustNot {
+		if b.MustNot[i].Script != nil {
+			continue
+		}
 		c := t.CompileQuery(&b.MustNot[i], false, nctx)
 		if c.UsesFulltextMatch {
 			// Doris BE does not allow MATCH_* inside COALESCE(...)
@@ -1275,17 +1286,21 @@ func (t *Transpiler) compileMultiMatch(mm *esast.MultiMatchQuery, scoring bool, 
 	}
 }
 
-func (t *Transpiler) compileNested(nq *esast.NestedQuery, scoring bool) CompiledQuery {
+func (t *Transpiler) compileNestedWithParent(nq *esast.NestedQuery, scoring bool, parentNctx *nestedCtx) CompiledQuery {
 	corrCol, ok := t.Schema.NestedRoots[nq.Path]
 	if !ok {
 		corrCol = "n__" + schema.SanitizeDorisIdentifier(nq.Path)
 	}
+	elemVar := "_el"
+	if parentNctx != nil && strings.HasPrefix(parentNctx.elemVar, "_el") {
+		elemVar = parentNctx.elemVar + "2"
+	}
 	inner := t.CompileQuery(&nq.Query, false, &nestedCtx{
 		nestedPath: nq.Path,
-		elemVar:    "_el",
+		elemVar:    elemVar,
 	})
 	prefilter := t.extractNestedPrefilter(nq.Path, &nq.Query)
-	whereSQL := fmt.Sprintf("array_exists(_el -> %s, `%s`)", inner.WhereSQL, corrCol)
+	whereSQL := fmt.Sprintf("array_exists(%s -> %s, `%s`)", elemVar, inner.WhereSQL, corrCol)
 	if prefilter != "" {
 		whereSQL = fmt.Sprintf("(%s AND %s)", prefilter, whereSQL)
 	}
@@ -1301,6 +1316,45 @@ func (t *Transpiler) compileNested(nq *esast.NestedQuery, scoring bool) Compiled
 	}
 }
 
+func (t *Transpiler) compileScriptScore(ss *esast.ScriptScoreQuery, scoring bool, nctx *nestedCtx) CompiledQuery {
+	base := CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: "1.0"}
+	if ss != nil && ss.Query != nil {
+		base = t.CompileQuery(ss.Query, true, nctx)
+	}
+	boost := 1.0
+	if ss != nil && ss.Boost != nil {
+		boost = *ss.Boost
+	}
+	scoreSQL := base.ScoreSQL
+	if scoring {
+		if boost != 1.0 {
+			scoreSQL = fmt.Sprintf("(%.4f * (%s))", boost, base.ScoreSQL)
+		}
+	}
+	return CompiledQuery{
+		WhereSQL:          base.WhereSQL,
+		SafeWhereSQL:      base.EffectiveSafeWhere(),
+		ScoreSQL:          scoreSQL,
+		UsesFulltextMatch: base.UsesFulltextMatch,
+	}
+}
+
+func (t *Transpiler) compileScriptQuery(sq *esast.ScriptQuery, scoring bool, _ *nestedCtx) CompiledQuery {
+	boost := 1.0
+	if sq != nil && sq.Boost != nil {
+		boost = *sq.Boost
+	}
+	scoreSQL := "1.0"
+	if scoring {
+		scoreSQL = fmt.Sprintf("%.4f", boost)
+	}
+	return CompiledQuery{
+		WhereSQL:     "TRUE",
+		SafeWhereSQL: "TRUE",
+		ScoreSQL:     scoreSQL,
+	}
+}
+
 func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) string {
 	if q == nil {
 		return ""
@@ -1311,20 +1365,32 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 			entry := q.Term[field]
 			b := t.Schema.ResolveField(field)
 			if b.Kind == schema.StorageNestedSubfield && b.NestedPath == nestedPath && b.PrefilterArrayCol != "" {
-				if entry.CaseInsensitive && !b.LowercaseNormalizer {
+				effLower := b.EffectiveLowercase(true)
+				arrCol := b.EffectiveArrayColumn(true)
+				if entry.CaseInsensitive && !effLower {
 					continue
 				}
 				if b.ESType == "ip" {
 					if startNum, endNum, isCIDR := parseCIDRBounds(fmt.Sprintf("%v", entry.Value)); isCIDR {
-						parts = append(parts, fmt.Sprintf("array_exists(_x -> IPV4_STRING_TO_NUM_OR_NULL(_x) >= %d AND IPV4_STRING_TO_NUM_OR_NULL(_x) <= %d, `%s`)", startNum, endNum, b.PrefilterArrayCol))
+						parts = append(parts, fmt.Sprintf("array_exists(_x -> IPV4_STRING_TO_NUM_OR_NULL(_x) >= %d AND IPV4_STRING_TO_NUM_OR_NULL(_x) <= %d, `%s`)", startNum, endNum, arrCol))
 						continue
 					}
 				}
 				val := entry.Value
-				if strVal, ok := val.(string); ok && b.LowercaseNormalizer {
-					val = strings.ToLower(strVal)
+				if b.ESType == "boolean" || b.DorisType == schema.DorisBoolean {
+					if bv, ok := normalizeBooleanQueryValue(val); ok {
+						val = bv
+					}
+				} else if strVal, ok := val.(string); ok {
+					if effLower {
+						val = strings.ToLower(strVal)
+					} else if b.ESType == "date" || b.ESType == "date_nanos" {
+						if ms, ok := schema.ParseESDateToEpochMillis(strVal, time.Now().UTC()); ok {
+							val = ms
+						}
+					}
 				}
-				parts = append(parts, fmt.Sprintf("array_contains(`%s`, %s)", b.PrefilterArrayCol, quoteStr(fmt.Sprintf("%v", val))))
+				parts = append(parts, fmt.Sprintf("array_contains(`%s`, %s)", arrCol, quoteStr(fmt.Sprintf("%v", val))))
 			}
 		}
 		return strings.Join(parts, " AND ")
@@ -1335,6 +1401,8 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 			vals := q.Terms.Fields[field]
 			b := t.Schema.ResolveField(field)
 			if b.Kind == schema.StorageNestedSubfield && b.NestedPath == nestedPath && b.PrefilterArrayCol != "" && len(vals) > 0 {
+				effLower := b.EffectiveLowercase(true)
+				arrCol := b.EffectiveArrayColumn(true)
 				if b.ESType == "ip" {
 					hasCIDR := false
 					for _, v := range vals {
@@ -1347,14 +1415,25 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 						continue
 					}
 				}
+				now := time.Now().UTC()
 				var quoted []string
 				for _, v := range vals {
-					if strVal, ok := v.(string); ok && b.LowercaseNormalizer {
-						v = strings.ToLower(strVal)
+					if b.ESType == "boolean" || b.DorisType == schema.DorisBoolean {
+						if bv, ok := normalizeBooleanQueryValue(v); ok {
+							v = bv
+						}
+					} else if strVal, ok := v.(string); ok {
+						if effLower {
+							v = strings.ToLower(strVal)
+						} else if b.ESType == "date" || b.ESType == "date_nanos" {
+							if ms, ok := schema.ParseESDateToEpochMillis(strVal, now); ok {
+								v = ms
+							}
+						}
 					}
 					quoted = append(quoted, quoteStr(fmt.Sprintf("%v", v)))
 				}
-				parts = append(parts, fmt.Sprintf("arrays_overlap(`%s`, [%s])", b.PrefilterArrayCol, strings.Join(quoted, ", ")))
+				parts = append(parts, fmt.Sprintf("arrays_overlap(`%s`, [%s])", arrCol, strings.Join(quoted, ", ")))
 			}
 		}
 		return strings.Join(parts, " AND ")
@@ -1620,12 +1699,27 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 			}
 		}
 	}
+	if b.ESType == "text" && b.KeywordCompanion == "" && !strings.HasSuffix(field, ".keyword") {
+		if _, isBool := val.(bool); isBool {
+			return t.compileMatchField(field, fmt.Sprintf("%v", val), "or", 1.0, false, nctx).WhereSQL
+		}
+	}
 	effLower := b.EffectiveLowercase(true)
-	if strVal, ok := val.(string); ok {
+	if effectiveDorisScalarType(b) == schema.DorisBoolean {
+		if bv, ok := normalizeBooleanQueryValue(val); ok {
+			val = bv
+		}
+	} else if strVal, ok := val.(string); ok {
 		if effLower {
 			val = strings.ToLower(strVal)
-		} else if (b.DorisType == schema.DorisBigInt || b.ESType == "date") && b.Kind != schema.StorageNestedSubfield {
-			if ms, ok := schema.ParseESDateToEpochMillis(strVal, time.Now().UTC()); ok {
+		} else if effectiveDorisScalarType(b) == schema.DorisBigInt || b.ESType == "date" || b.ESType == "date_nanos" {
+			if b.Kind == schema.StorageNestedSubfield && nctx != nil && nctx.nestedPath == b.NestedPath {
+				if strings.HasPrefix(strings.TrimSpace(strVal), "now") || strings.Contains(strVal, "||") {
+					if ms, ok := schema.ParseESDateToEpochMillis(strVal, time.Now().UTC()); ok {
+						val = time.UnixMilli(ms).UTC().Format(time.RFC3339)
+					}
+				}
+			} else if ms, ok := schema.ParseESDateToEpochMillis(strVal, time.Now().UTC()); ok {
 				val = ms
 			}
 		}
@@ -1636,10 +1730,7 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 	case schema.StoragePromotedVector:
 		return "FALSE"
 	case schema.StoragePromotedArray:
-		colName := b.ColumnName
-		if b.KeywordCompanion != "" && b.KeywordNormalizer {
-			colName = b.KeywordCompanion
-		}
+		colName := b.EffectiveArrayColumn(true)
 		if caseInsensitive && !effLower {
 			return fmt.Sprintf("array_exists(_x -> lower(_x) = lower(%s), `%s`)", quoteStr(fmt.Sprintf("%v", val)), colName)
 		}
@@ -1666,10 +1757,11 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 			return fmt.Sprintf("json_extract_string(%s, %s) = %s", nctx.elemVar, quoteStr(relPath), quoteStr(fmt.Sprintf("%v", val)))
 		}
 		if b.PrefilterArrayCol != "" {
+			arrCol := b.EffectiveArrayColumn(true)
 			if caseInsensitive && !effLower {
-				return fmt.Sprintf("array_exists(_x -> lower(_x) = lower(%s), `%s`)", quoteStr(fmt.Sprintf("%v", val)), b.PrefilterArrayCol)
+				return fmt.Sprintf("array_exists(_x -> lower(_x) = lower(%s), `%s`)", quoteStr(fmt.Sprintf("%v", val)), arrCol)
 			}
-			return fmt.Sprintf("array_contains(`%s`, %s)", b.PrefilterArrayCol, quoteStr(fmt.Sprintf("%v", val)))
+			return fmt.Sprintf("array_contains(`%s`, %s)", arrCol, quoteStr(fmt.Sprintf("%v", val)))
 		}
 	}
 
@@ -1720,16 +1812,28 @@ func (t *Transpiler) compileTermsPredicate(field string, vals []any, nctx *neste
 	}
 	now := time.Now().UTC()
 	quoted := make([]string, 0, len(vals))
+	normalizedVals := make([]any, 0, len(vals))
 	for _, v := range vals {
-		if strVal, ok := v.(string); ok {
+		if effectiveDorisScalarType(b) == schema.DorisBoolean {
+			if bv, ok := normalizeBooleanQueryValue(v); ok {
+				v = bv
+			}
+		} else if strVal, ok := v.(string); ok {
 			if effLower {
 				v = strings.ToLower(strVal)
-			} else if (b.DorisType == schema.DorisBigInt || b.ESType == "date") && b.Kind != schema.StorageNestedSubfield {
-				if ms, ok := schema.ParseESDateToEpochMillis(strVal, now); ok {
+			} else if effectiveDorisScalarType(b) == schema.DorisBigInt || b.ESType == "date" || b.ESType == "date_nanos" {
+				if b.Kind == schema.StorageNestedSubfield && nctx != nil && nctx.nestedPath == b.NestedPath {
+					if strings.HasPrefix(strings.TrimSpace(strVal), "now") || strings.Contains(strVal, "||") {
+						if ms, ok := schema.ParseESDateToEpochMillis(strVal, now); ok {
+							v = time.UnixMilli(ms).UTC().Format(time.RFC3339)
+						}
+					}
+				} else if ms, ok := schema.ParseESDateToEpochMillis(strVal, now); ok {
 					v = ms
 				}
 			}
 		}
+		normalizedVals = append(normalizedVals, v)
 		if isArrayCol {
 			quoted = append(quoted, quoteStr(fmt.Sprintf("%v", v)))
 		} else {
@@ -1737,13 +1841,10 @@ func (t *Transpiler) compileTermsPredicate(field string, vals []any, nctx *neste
 		}
 	}
 	if isArrayCol {
-		colName := b.ColumnName
-		if b.Kind == schema.StoragePromotedArray && b.KeywordCompanion != "" && b.KeywordNormalizer {
-			colName = b.KeywordCompanion
-		}
+		colName := b.EffectiveArrayColumn(true)
 		return fmt.Sprintf("arrays_overlap(`%s`, [%s])", colName, strings.Join(quoted, ", "))
 	}
-	col := t.sqlTypedColumnRef(field, vals[0], true, nctx)
+	col := t.sqlTypedColumnRef(field, normalizedVals[0], true, nctx)
 	if nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && effLower {
 		col = fmt.Sprintf("lower(%s)", col)
 	}
@@ -1761,10 +1862,7 @@ func (t *Transpiler) compilePrefixPredicate(field, val string, caseInsensitive b
 	}
 	likePat := quoteStr(escapeLikeLiteral(val) + "%")
 	if (nctx == nil || nctx.nestedPath != b.NestedPath) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
-		colName := b.ColumnName
-		if b.Kind == schema.StoragePromotedArray && b.KeywordCompanion != "" && b.KeywordNormalizer {
-			colName = b.KeywordCompanion
-		}
+		colName := b.EffectiveArrayColumn(true)
 		if caseInsensitive {
 			return fmt.Sprintf("array_exists(_x -> lower(_x) LIKE lower(%s), `%s`)", likePat, colName)
 		}
@@ -1806,10 +1904,7 @@ func (t *Transpiler) compileWildcardSingleField(field, val string, caseInsensiti
 	}
 	likePat := quoteStr(wildcardToLike(val))
 	if (nctx == nil || nctx.nestedPath != b.NestedPath) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
-		colName := b.ColumnName
-		if b.Kind == schema.StoragePromotedArray && b.KeywordCompanion != "" && b.KeywordNormalizer {
-			colName = b.KeywordCompanion
-		}
+		colName := b.EffectiveArrayColumn(true)
 		if caseInsensitive {
 			return fmt.Sprintf("array_exists(_x -> lower(_x) LIKE lower(%s), `%s`)", likePat, colName)
 		}
@@ -1910,59 +2005,70 @@ func (t *Transpiler) compileRangePredicate(field string, rc esast.RangeCond, nct
 		if v == nil {
 			return nil
 		}
-		if b.Kind != schema.StorageNestedSubfield {
-			switch effectiveDorisScalarType(b) {
-			case schema.DorisBigInt:
+		if b.Kind == schema.StorageNestedSubfield && nctx != nil && nctx.nestedPath == b.NestedPath {
+			if b.ESType == "date" || b.ESType == "date_nanos" {
 				if strVal, ok := v.(string); ok {
 					trimmed := strings.TrimSpace(strVal)
-					if rawSec, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(rawSec) && !math.IsInf(rawSec, 0) {
-						if isEpochSecond {
-							return int64(rawSec * 1000)
-						}
-						return int64(rawSec)
-					}
-					if ms, ok := schema.ParseESDateBoundToEpochMillis(strVal, now, roundUp); ok {
-						datePart := trimmed
-						if idx := strings.Index(datePart, "||"); idx >= 0 {
-							datePart = strings.TrimSpace(datePart[:idx])
-						}
-						if _, intErr := strconv.ParseInt(datePart, 10, 64); intErr != nil &&
-							tzOffsetMs != 0 && !strings.HasPrefix(datePart, "now") &&
-							!strings.HasSuffix(datePart, "Z") && !strings.HasSuffix(datePart, "z") &&
-							!strings.Contains(datePart[min(10, len(datePart)):], "+") &&
-							!strings.Contains(datePart[min(10, len(datePart)):], "-") {
-							ms -= tzOffsetMs
-						}
-						return ms
-					}
-				}
-				if isEpochSecond {
-					switch nv := v.(type) {
-					case int:
-						return int64(nv) * 1000
-					case int64:
-						return nv * 1000
-					case float64:
-						return int64(nv * 1000)
-					case json.Number:
-						if i, err := nv.Int64(); err == nil {
-							return i * 1000
-						} else if f, err := nv.Float64(); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
-							return int64(f * 1000)
+					if strings.HasPrefix(trimmed, "now") || strings.Contains(trimmed, "||") {
+						if ms, ok := schema.ParseESDateBoundToEpochMillis(strVal, now, roundUp); ok {
+							return time.UnixMilli(ms).UTC().Format(time.RFC3339)
 						}
 					}
 				}
-			case schema.DorisInt:
-				if strVal, ok := v.(string); ok {
-					if i, err := strconv.ParseInt(strings.TrimSpace(strVal), 10, 64); err == nil {
-						return i
+			}
+			return v
+		}
+		switch effectiveDorisScalarType(b) {
+		case schema.DorisBigInt:
+			if strVal, ok := v.(string); ok {
+				trimmed := strings.TrimSpace(strVal)
+				if rawSec, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(rawSec) && !math.IsInf(rawSec, 0) {
+					if isEpochSecond {
+						return int64(rawSec * 1000)
+					}
+					return int64(rawSec)
+				}
+				if ms, ok := schema.ParseESDateBoundToEpochMillis(strVal, now, roundUp); ok {
+					datePart := trimmed
+					if idx := strings.Index(datePart, "||"); idx >= 0 {
+						datePart = strings.TrimSpace(datePart[:idx])
+					}
+					if _, intErr := strconv.ParseInt(datePart, 10, 64); intErr != nil &&
+						tzOffsetMs != 0 && !strings.HasPrefix(datePart, "now") &&
+						!strings.HasSuffix(datePart, "Z") && !strings.HasSuffix(datePart, "z") &&
+						!strings.Contains(datePart[min(10, len(datePart)):], "+") &&
+						!strings.Contains(datePart[min(10, len(datePart)):], "-") {
+						ms -= tzOffsetMs
+					}
+					return ms
+				}
+			}
+			if isEpochSecond {
+				switch nv := v.(type) {
+				case int:
+					return int64(nv) * 1000
+				case int64:
+					return nv * 1000
+				case float64:
+					return int64(nv * 1000)
+				case json.Number:
+					if i, err := nv.Int64(); err == nil {
+						return i * 1000
+					} else if f, err := nv.Float64(); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+						return int64(f * 1000)
 					}
 				}
-			case schema.DorisDouble:
-				if strVal, ok := v.(string); ok {
-					if f, err := strconv.ParseFloat(strings.TrimSpace(strVal), 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
-						return f
-					}
+			}
+		case schema.DorisInt:
+			if strVal, ok := v.(string); ok {
+				if i, err := strconv.ParseInt(strings.TrimSpace(strVal), 10, 64); err == nil {
+					return i
+				}
+			}
+		case schema.DorisDouble:
+			if strVal, ok := v.(string); ok {
+				if f, err := strconv.ParseFloat(strings.TrimSpace(strVal), 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+					return f
 				}
 			}
 		}
@@ -2201,10 +2307,11 @@ func (t *Transpiler) appendAggBranches(
 			b := t.Schema.ResolveField(termsSpec.Field)
 			*subIdx++
 			if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
+				arrCol := b.EffectiveArrayColumn(true)
 				if termsSpec.Missing != nil {
 					missingLit := quoteStr(formatMissingScalar(termsSpec.Missing))
 					coalescedElem := fmt.Sprintf("COALESCE(CAST(`_elem` AS STRING), %s)", missingLit)
-					explodeFrom := fmt.Sprintf("`base_matched` LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) `_t` AS `_elem`", b.ColumnName, b.ColumnName, b.ColumnName)
+					explodeFrom := fmt.Sprintf("`base_matched` LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) `_t` AS `_elem`", arrCol, arrCol, arrCol)
 					wCond := ""
 					if extraWhere != "" {
 						wCond = "WHERE " + extraWhere + " "
@@ -2232,11 +2339,11 @@ func (t *Transpiler) appendAggBranches(
 							"WHERE %s`_elem` IS NOT NULL "+
 							"GROUP BY `_elem` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT %d"+
 							") `_agg_sub_%d`",
-						quoteStr(fullAggName), b.ColumnName, wherePrefix, size, *subIdx,
+						quoteStr(fullAggName), arrCol, wherePrefix, size, *subIdx,
 					))
 					if subAggs := spec.SubAggs(); len(subAggs) > 0 {
 						t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, "CAST(`_elem` AS STRING)",
-							fmt.Sprintf("`base_matched` LATERAL VIEW EXPLODE(`%s`) `_t` AS `_elem`", b.ColumnName),
+							fmt.Sprintf("`base_matched` LATERAL VIEW EXPLODE(`%s`) `_t` AS `_elem`", arrCol),
 							fmt.Sprintf("%s`_elem` IS NOT NULL", wherePrefix), subAggs)
 					}
 				}
@@ -2630,6 +2737,7 @@ func (t *Transpiler) appendAggBranches(
 		case spec.Cardinality != nil:
 			b := t.Schema.ResolveField(spec.Cardinality.Field)
 			if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
+				arrCol := b.EffectiveArrayColumn(true)
 				if spec.Cardinality.Missing != nil {
 					missLit := quoteStr(formatMissingScalar(spec.Cardinality.Missing))
 					wClause := ""
@@ -2639,13 +2747,13 @@ func (t *Transpiler) appendAggBranches(
 					*branches = append(*branches, fmt.Sprintf(
 						"SELECT %s AS `_agg_name`, '_metric' AS `_bucket_key`, CAST(COUNT(DISTINCT COALESCE(`_elem`, %s)) AS DOUBLE) AS `_doc_count` "+
 							"FROM `base_matched` LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) `_t` AS `_elem`%s",
-						quoteStr(fullAggName), missLit, b.ColumnName, b.ColumnName, b.ColumnName, wClause,
+						quoteStr(fullAggName), missLit, arrCol, arrCol, arrCol, wClause,
 					))
 				} else {
 					*branches = append(*branches, fmt.Sprintf(
 						"SELECT %s AS `_agg_name`, '_metric' AS `_bucket_key`, CAST(COUNT(DISTINCT `_elem`) AS DOUBLE) AS `_doc_count` "+
 							"FROM `base_matched` LATERAL VIEW EXPLODE(`%s`) `_t` AS `_elem` WHERE %s`_elem` IS NOT NULL",
-						quoteStr(fullAggName), b.ColumnName, wherePrefix,
+						quoteStr(fullAggName), arrCol, wherePrefix,
 					))
 				}
 			} else {
@@ -3164,13 +3272,14 @@ func (t *Transpiler) appendAggBranches(
 			resolveCompSourceCol := func(field string, isNumeric bool, hasMissing bool) string {
 				b := t.Schema.ResolveField(field)
 				if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
+					arrCol := b.EffectiveArrayColumn(true)
 					compExplodeIdx++
 					tblAlias := fmt.Sprintf("`_comp_t_%d`", compExplodeIdx)
 					elemAlias := fmt.Sprintf("`_comp_el_%d`", compExplodeIdx)
 					if hasMissing {
-						compFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", compFrom, b.ColumnName, b.ColumnName, b.ColumnName, tblAlias, elemAlias)
+						compFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", compFrom, arrCol, arrCol, arrCol, tblAlias, elemAlias)
 					} else {
-						compFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", compFrom, b.ColumnName, tblAlias, elemAlias)
+						compFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", compFrom, arrCol, tblAlias, elemAlias)
 					}
 					if isNumeric {
 						return fmt.Sprintf("CAST(%s AS DOUBLE)", elemAlias)
@@ -3189,7 +3298,8 @@ func (t *Transpiler) appendAggBranches(
 					switch {
 					case srcSpec.Terms != nil:
 						b := t.Schema.ResolveField(srcSpec.Terms.Field)
-						if b.DorisType == schema.DorisBigInt || b.DorisType == schema.DorisInt || b.DorisType == schema.DorisDouble || b.ESType == "ip" || srcSpec.Terms.Order != nil {
+						effDT := effectiveDorisScalarType(b)
+						if effDT == schema.DorisBigInt || effDT == schema.DorisInt || effDT == schema.DorisDouble || b.ESType == "ip" || srcSpec.Terms.Order != nil {
 							hasHistogramSrc = true
 						}
 						hasMiss := srcSpec.Terms.Missing != nil || srcSpec.Terms.MissingBucket
@@ -3273,7 +3383,7 @@ func (t *Transpiler) appendAggBranches(
 					wCond = strings.Join(notNullConds, " AND ")
 				}
 				if hasHistogramSrc {
-					size = t.capBucketSize(size * 100)
+					size = t.maxAggBuckets()
 				} else if len(spec.Composite.After) > 0 {
 					var afterParts []string
 					for _, sn := range srcNames {
@@ -3760,12 +3870,13 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 		case subSpec.Cardinality != nil:
 			b := t.Schema.ResolveField(subSpec.Cardinality.Field)
 			if !isExplodedNested(b, subSpec.Cardinality.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
+				arrCol := b.EffectiveArrayColumn(true)
 				valExpr := subElemAlias
-				subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, b.ColumnName, subTableAlias, subElemAlias)
+				subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
 				subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, subElemAlias)
 				if subSpec.Cardinality.Missing != nil {
 					valExpr = fmt.Sprintf("COALESCE(%s, %s)", subElemAlias, quoteStr(formatMissingScalar(subSpec.Cardinality.Missing)))
-					subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", fromClause, b.ColumnName, b.ColumnName, b.ColumnName, subTableAlias, subElemAlias)
+					subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", fromClause, arrCol, arrCol, arrCol, subTableAlias, subElemAlias)
 					subWhere = whereClause
 				}
 				*branches = append(*branches, fmt.Sprintf(
@@ -3799,12 +3910,13 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 			subLimit := t.capBucketSize(effSubSize * 100)
 			*subIdx++
 			if !isExplodedNested(b, subTerms.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
-				subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, b.ColumnName, subTableAlias, subElemAlias)
+				arrCol := b.EffectiveArrayColumn(true)
+				subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
 				childKeyExpr := fmt.Sprintf("CONCAT(%s, '\\x1f', CAST(%s AS STRING))", parentBucketExpr, subElemAlias)
 				subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, subElemAlias)
 				if subTerms.Missing != nil {
 					missingLit := quoteStr(formatMissingScalar(subTerms.Missing))
-					subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", fromClause, b.ColumnName, b.ColumnName, b.ColumnName, subTableAlias, subElemAlias)
+					subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", fromClause, arrCol, arrCol, arrCol, subTableAlias, subElemAlias)
 					childKeyExpr = fmt.Sprintf("CONCAT(%s, '\\x1f', COALESCE(CAST(%s AS STRING), %s))", parentBucketExpr, subElemAlias, missingLit)
 					subWhere = whereClause
 				}
@@ -4610,7 +4722,7 @@ func (t *Transpiler) resolveSortMissing(s esast.SortSpec, b schema.FieldBinding)
 	if fv, err := strconv.ParseFloat(mStr, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
 		return fv, strconv.FormatFloat(fv, 'f', -1, 64)
 	}
-	if b.EffectiveLowercase(strings.HasSuffix(s.Entry.Field, ".keyword")) {
+	if b.EffectiveLowercase(true) {
 		mStr = strings.ToLower(mStr)
 	}
 	return mStr, quoteStr(mStr)
@@ -4623,7 +4735,11 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 	var parts []string
 	afterIdx := 0
 	for _, s := range sorts {
-		if s.Entry.Field == "" || s.Entry.Field == "_script" || s.Entry.Field == "_geo_distance" {
+		if s.Entry.Field == "" {
+			continue
+		}
+		if s.Entry.Field == "_script" || s.Entry.Field == "_geo_distance" {
+			afterIdx++
 			continue
 		}
 		dir := "ASC"
@@ -4652,7 +4768,11 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 			if missingSQL != "" {
 				col = fmt.Sprintf("COALESCE(%s, %s)", col, missingSQL)
 			}
-			parts = append(parts, col+" "+dir)
+			orderPart := col + " " + dir
+			if strings.EqualFold(s.Entry.Missing, "_first") {
+				orderPart += " NULLS FIRST"
+			}
+			parts = append(parts, orderPart)
 		}
 		afterIdx++
 	}
@@ -4665,11 +4785,14 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after []any, scoreExpr string) string {
 	var effectiveSorts []esast.SortSpec
 	for _, s := range sorts {
-		if s.Entry.Field != "" && s.Entry.Field != "_script" && s.Entry.Field != "_geo_distance" {
+		if s.Entry.Field == "_script" || s.Entry.Field == "_geo_distance" {
+			break
+		}
+		if s.Entry.Field != "" {
 			effectiveSorts = append(effectiveSorts, s)
 		}
 	}
-	if len(effectiveSorts) == 0 {
+	if len(sorts) == 0 {
 		effectiveSorts = []esast.SortSpec{
 			{Entry: esast.SortFieldSpec{Field: "_score", Order: "desc"}},
 			{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}},
@@ -4683,15 +4806,15 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 		return "TRUE"
 	}
 
-	sortExpr := func(idx int) (string, any) {
+	sortExpr := func(idx int) (string, any, bool) {
 		field := effectiveSorts[idx].Entry.Field
 		val := after[idx]
 		desc := strings.EqualFold(effectiveSorts[idx].Entry.Order, "desc")
 		switch field {
 		case "_score":
-			return fmt.Sprintf("CAST(%s AS DOUBLE)", scoreExpr), val
+			return fmt.Sprintf("CAST(%s AS DOUBLE)", scoreExpr), val, true
 		case "_id", "_doc":
-			return "`_id`", val
+			return "`_id`", val, true
 		default:
 			b := t.Schema.ResolveField(field)
 			missSample, missingSQL := t.resolveSortMissing(effectiveSorts[idx], b)
@@ -4716,7 +4839,7 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 			if missingSQL != "" {
 				col = fmt.Sprintf("COALESCE(%s, %s)", col, missingSQL)
 			}
-			return col, val
+			return col, val, missingSQL != ""
 		}
 	}
 
@@ -4724,16 +4847,17 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 	for i := 0; i < n; i++ {
 		var conjuncts []string
 		for j := 0; j < i; j++ {
-			colJ, valJ := sortExpr(j)
+			colJ, valJ, _ := sortExpr(j)
 			if valJ == nil {
 				conjuncts = append(conjuncts, fmt.Sprintf("%s IS NULL", colJ))
 			} else {
 				conjuncts = append(conjuncts, fmt.Sprintf("%s = %s", colJ, quoteValue(valJ)))
 			}
 		}
-		colI, valI := sortExpr(i)
+		colI, valI, hasCoalesce := sortExpr(i)
+		missingFirst := strings.EqualFold(effectiveSorts[i].Entry.Missing, "_first")
 		if valI == nil {
-			if strings.EqualFold(effectiveSorts[i].Entry.Order, "desc") {
+			if !missingFirst && (strings.EqualFold(effectiveSorts[i].Entry.Missing, "_last") || strings.EqualFold(effectiveSorts[i].Entry.Order, "desc")) {
 				conjuncts = append(conjuncts, "FALSE")
 			} else {
 				conjuncts = append(conjuncts, fmt.Sprintf("%s IS NOT NULL", colI))
@@ -4743,7 +4867,11 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 			if strings.EqualFold(effectiveSorts[i].Entry.Order, "desc") {
 				op = "<"
 			}
-			conjuncts = append(conjuncts, fmt.Sprintf("%s %s %s", colI, op, quoteValue(valI)))
+			if !missingFirst && !hasCoalesce && effectiveSorts[i].Entry.Field != "_score" && effectiveSorts[i].Entry.Field != "_id" && effectiveSorts[i].Entry.Field != "_doc" {
+				conjuncts = append(conjuncts, fmt.Sprintf("(%s %s %s OR %s IS NULL)", colI, op, quoteValue(valI), colI))
+			} else {
+				conjuncts = append(conjuncts, fmt.Sprintf("%s %s %s", colI, op, quoteValue(valI)))
+			}
 		}
 		if len(conjuncts) == 1 {
 			disjuncts = append(disjuncts, conjuncts[0])
@@ -4882,11 +5010,13 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 			return fmt.Sprintf("`%s`", b.KeywordCompanion)
 		}
 		return fmt.Sprintf("`%s`", b.ColumnName)
-	case schema.StoragePromotedArray, schema.StoragePromotedVector:
+	case schema.StoragePromotedArray:
+		return fmt.Sprintf("`%s`", b.EffectiveArrayColumn(preferKeyword))
+	case schema.StoragePromotedVector:
 		return fmt.Sprintf("`%s`", b.ColumnName)
 	case schema.StorageNestedSubfield:
 		if b.PrefilterArrayCol != "" {
-			return fmt.Sprintf("`%s`", b.PrefilterArrayCol)
+			return fmt.Sprintf("`%s`", b.EffectiveArrayColumn(preferKeyword))
 		}
 	}
 	if t.unindexedFields != nil && field != "" && !strings.HasPrefix(field, "_") && !strings.ContainsAny(field, "*?") {
@@ -5039,4 +5169,27 @@ func wildcardToLike(w string) string {
 		sb.WriteString(`\\`)
 	}
 	return sb.String()
+}
+
+func normalizeBooleanQueryValue(val any) (bool, bool) {
+	switch v := val.(type) {
+	case bool:
+		return v, true
+	case int:
+		return v != 0, true
+	case int64:
+		return v != 0, true
+	case float64:
+		return v != 0 && !math.IsNaN(v), true
+	case json.Number:
+		return v.String() != "0", true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "true", "1":
+			return true, true
+		case "false", "0":
+			return false, true
+		}
+	}
+	return false, false
 }

@@ -27,6 +27,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var (
@@ -158,6 +159,76 @@ func (b *evalBudget) step() error {
 	return nil
 }
 
+// Eval evaluates a Painless script expression or multi-statement block and returns its result value.
+func Eval(sourceMap map[string]any, scriptSource string, params map[string]any) (any, error) {
+	evalParams := make(map[string]any, len(params)+2)
+	for k, v := range params {
+		evalParams[k] = v
+	}
+	if sourceMap != nil && evalParams["_source"] == nil {
+		evalParams["_source"] = sourceMap
+	}
+	cleaned := strings.TrimSpace(stripPainlessComments(scriptSource))
+	if cleaned == "" {
+		return nil, nil
+	}
+	ctxOp := ""
+	budget := &evalBudget{}
+	stmts := splitTopLevelStatements(cleaned)
+	err := execBlock(sourceMap, cleaned, evalParams, &ctxOp, budget)
+	if err != nil && !errors.Is(err, errPainlessReturn) {
+		return nil, err
+	}
+	if retVal, hasRet := evalParams["_return_val"]; hasRet {
+		return retVal, nil
+	}
+	if len(stmts) > 0 {
+		lastStmt := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(stmts[len(stmts)-1]), ";"))
+		if strings.HasPrefix(lastStmt, "return ") || strings.HasPrefix(lastStmt, "return(") {
+			lastStmt = strings.TrimSpace(strings.TrimPrefix(lastStmt, "return"))
+		}
+		if lastStmt != "" && lastStmt != "return" && !strings.HasPrefix(lastStmt, "if ") && !strings.HasPrefix(lastStmt, "if(") && !strings.HasPrefix(lastStmt, "for ") && !strings.HasPrefix(lastStmt, "for(") && !strings.Contains(lastStmt, " = ") {
+			val, evalErr := evalRHSExpr(sourceMap, lastStmt, evalParams)
+			if evalErr == nil && val != nil {
+				return val, nil
+			}
+			if strings.ContainsAny(lastStmt, "><=!&|") || strings.Contains(lastStmt, ".empty") || strings.Contains(lastStmt, ".contains(") || strings.Contains(lastStmt, ".startsWith(") || strings.Contains(lastStmt, ".endsWith(") || strings.Contains(lastStmt, ".isEmpty()") {
+				return evalCondition(sourceMap, lastStmt, evalParams), nil
+			}
+		}
+	}
+	return nil, nil
+}
+
+// EvalNumber evaluates a Painless script and coerces the result to float64.
+func EvalNumber(sourceMap map[string]any, scriptSource string, params map[string]any) (float64, bool, error) {
+	val, err := Eval(sourceMap, scriptSource, params)
+	if err != nil || val == nil {
+		return 0, false, err
+	}
+	f, ok := toFloat64(val)
+	return f, ok, nil
+}
+
+// EvalFilter evaluates a boolean Painless filter script (`script` query or `bucket_selector`).
+func EvalFilter(sourceMap map[string]any, scriptSource string, params map[string]any) (bool, error) {
+	val, err := Eval(sourceMap, scriptSource, params)
+	if err != nil {
+		return false, err
+	}
+	switch v := val.(type) {
+	case bool:
+		return v, nil
+	case nil:
+		return false, nil
+	default:
+		if f, ok := toFloat64(v); ok {
+			return f != 0, nil
+		}
+		return fmt.Sprintf("%v", v) == "true", nil
+	}
+}
+
 // EvalPainless evaluates common Painless script statements used by OpenMetadata and DataHub
 // against `sourceMap` (`ctx._source`) with `params`.
 func EvalPainless(sourceMap map[string]any, scriptSource string, params map[string]any) error {
@@ -170,10 +241,26 @@ func EvalPainlessWithOp(sourceMap map[string]any, scriptSource string, params ma
 	if params == nil {
 		params = make(map[string]any)
 	}
+	hadSource := false
+	if sourceMap != nil {
+		if _, exists := params["_source"]; exists {
+			hadSource = true
+		} else {
+			params["_source"] = sourceMap
+		}
+	}
 	ctxOp := ""
 	budget := &evalBudget{}
 	cleaned := stripPainlessComments(scriptSource)
 	err := execBlock(sourceMap, cleaned, params, &ctxOp, budget)
+	if !hadSource {
+		delete(params, "_source")
+	}
+	for k := range params {
+		if strings.HasPrefix(k, "__alias_") {
+			delete(params, k)
+		}
+	}
 	if errors.Is(err, errPainlessReturn) {
 		err = nil
 	}
@@ -289,7 +376,13 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 		for k, v := range params {
 			loopParams[k] = v
 		}
+		var initVarName string
 		if initStmt := strings.TrimSpace(clauses[0]); initStmt != "" {
+			if m := reLocalVarAssign.FindStringSubmatch(initStmt); m != nil {
+				if _, existed := params[m[1]]; !existed {
+					initVarName = m[1]
+				}
+			}
 			if err := execSimpleStmt(sourceMap, initStmt, loopParams, ctxOp, budget); err != nil {
 				return err
 			}
@@ -321,8 +414,10 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 				}
 			}
 		}
-		for k := range params {
-			params[k] = loopParams[k]
+		for k, v := range loopParams {
+			if k != initVarName {
+				params[k] = v
+			}
 		}
 		return loopErr
 	} else {
@@ -434,7 +529,7 @@ func decodeBracketSeg(seg string) string {
 }
 
 func expandDynamicBrackets(s string, sourceMap map[string]any, params map[string]any, depth int) string {
-	if strings.IndexByte(s, '[') < 0 || depth > 64 {
+	if (strings.IndexByte(s, '[') < 0 && !strings.Contains(s, ".get(")) || depth > 64 {
 		return s
 	}
 	var out strings.Builder
@@ -490,12 +585,57 @@ func expandDynamicBrackets(s string, sourceMap map[string]any, params map[string
 		}
 		out.WriteByte(c)
 	}
-	return out.String()
+	res := out.String()
+	for strings.Contains(res, ".get(") {
+		getIdx := strings.Index(res, ".get(")
+		openParen := getIdx + 4
+		closeParen := findMatchingDelimiter(res, openParen, '(', ')')
+		if closeParen <= openParen {
+			break
+		}
+		after := strings.TrimSpace(res[closeParen+1:])
+		if after == "" || (after[0] != '.' && after[0] != '=' && after[0] != '+' && after[0] != '-' && after[0] != '*' && after[0] != '/') {
+			break
+		}
+		inner := strings.TrimSpace(res[openParen+1 : closeParen])
+		idxVal, err := evalRHSExprDepth(sourceMap, inner, params, depth+1)
+		if err != nil || idxVal == nil {
+			break
+		}
+		var keyStr string
+		if strVal, isStr := idxVal.(string); isStr {
+			keyStr = strVal
+		} else if f, ok := toFloat64(idxVal); ok && f == float64(int64(f)) {
+			keyStr = strconv.FormatInt(int64(f), 10)
+		} else {
+			keyStr = fmt.Sprintf("%v", idxVal)
+		}
+		if keyStr == "" {
+			break
+		}
+		res = res[:getIdx] + "." + encodeBracketKey(keyStr) + res[closeParen+1:]
+	}
+	return res
+}
+
+func syncLocalVarAlias(sourceMap map[string]any, params map[string]any, varName string) {
+	if sourceMap == nil || params == nil || varName == "" {
+		return
+	}
+	if aliasPath, ok := params["__alias_"+varName].(string); ok && aliasPath != "" {
+		setValueAtPath(sourceMap, strings.Split(aliasPath, "."), params[varName])
+	}
 }
 
 func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any, ctxOp *string, budget *evalBudget) error {
 	stmt = strings.TrimSpace(expandDynamicBrackets(stmt, sourceMap, params, 0))
-	if stmt == "return" || strings.HasPrefix(stmt, "return ") || strings.HasPrefix(stmt, "return;") {
+	if stmt == "return" || strings.HasPrefix(stmt, "return ") || strings.HasPrefix(stmt, "return;") || strings.HasPrefix(stmt, "return(") {
+		retExpr := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(stmt, "return")), ";"))
+		if retExpr != "" {
+			if val, err := evalRHSExpr(sourceMap, retExpr, params); err == nil {
+				params["_return_val"] = val
+			}
+		}
 		return errPainlessReturn
 	}
 	if stmt == "break" {
@@ -634,7 +774,8 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 	// 6b. Check `.removeIf`, `.addAll`, `.add`, `.putAll`, `.put`, `.remove` on local/loop variables
 	if m := reLocalArrayRemoveIf.FindStringSubmatch(stmt); m != nil {
 		arrPath := strings.Split(m[1], ".")
-		if _, ok := params[decodeBracketSeg(arrPath[0])]; ok {
+		rootVar := decodeBracketSeg(arrPath[0])
+		if _, ok := params[rootVar]; ok {
 			var propPath []string
 			if m[4] != "" {
 				propPath = strings.Split(m[4], ".")
@@ -644,12 +785,14 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 				return err
 			}
 			removeIfFromSlice(params, arrPath, propPath, targetVal)
+			syncLocalVarAlias(sourceMap, params, rootVar)
 			return nil
 		}
 	}
 	if m := reLocalArrayAddAll.FindStringSubmatch(stmt); m != nil {
 		arrPath := strings.Split(m[1], ".")
-		if _, ok := params[decodeBracketSeg(arrPath[0])]; ok {
+		rootVar := decodeBracketSeg(arrPath[0])
+		if _, ok := params[rootVar]; ok {
 			valToAdd, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[2]), params)
 			if err != nil {
 				return err
@@ -666,35 +809,44 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 					}
 				}
 			}
+			syncLocalVarAlias(sourceMap, params, rootVar)
 			return nil
 		}
 	}
 	if m := reLocalArrayAdd.FindStringSubmatch(stmt); m != nil {
 		arrPath := strings.Split(m[1], ".")
-		if _, ok := params[decodeBracketSeg(arrPath[0])]; ok {
+		rootVar := decodeBracketSeg(arrPath[0])
+		if _, ok := params[rootVar]; ok {
 			valToAdd, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[2]), params)
 			if err != nil {
 				return err
 			}
-			return appendToSlice(params, arrPath, valToAdd)
+			if err := appendToSlice(params, arrPath, valToAdd); err != nil {
+				return err
+			}
+			syncLocalVarAlias(sourceMap, params, rootVar)
+			return nil
 		}
 	}
 	if m := reLocalMapPutAll.FindStringSubmatch(stmt); m != nil {
 		targetPath := strings.Split(m[1], ".")
-		if _, ok := params[decodeBracketSeg(targetPath[0])]; ok {
+		rootVar := decodeBracketSeg(targetPath[0])
+		if _, ok := params[rootVar]; ok {
 			mapVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[2]), params)
 			if err != nil {
 				return err
 			}
 			if subMap, ok := mapVal.(map[string]any); ok {
 				putAllAtPath(params, targetPath, subMap)
+				syncLocalVarAlias(sourceMap, params, rootVar)
 			}
 			return nil
 		}
 	}
 	if m := reLocalMapPut.FindStringSubmatch(stmt); m != nil {
 		targetPath := strings.Split(m[1], ".")
-		if _, ok := params[decodeBracketSeg(targetPath[0])]; ok {
+		rootVar := decodeBracketSeg(targetPath[0])
+		if _, ok := params[rootVar]; ok {
 			kVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[2]), params)
 			if err != nil {
 				return err
@@ -704,17 +856,20 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 				return err
 			}
 			setValueAtPath(params, append(targetPath, fmt.Sprintf("%v", kVal)), vVal)
+			syncLocalVarAlias(sourceMap, params, rootVar)
 			return nil
 		}
 	}
 	if m := reLocalRemoveField.FindStringSubmatch(stmt); m != nil {
 		parentPath := strings.Split(m[1], ".")
-		if _, ok := params[decodeBracketSeg(parentPath[0])]; ok {
+		rootVar := decodeBracketSeg(parentPath[0])
+		if _, ok := params[rootVar]; ok {
 			argVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[2]), params)
 			if err != nil {
 				return err
 			}
 			removeKeyOrIndexAtPath(params, parentPath, argVal)
+			syncLocalVarAlias(sourceMap, params, rootVar)
 			return nil
 		}
 	}
@@ -775,6 +930,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			nextVal = applyMulDiv(curVal, rhsVal, '/')
 		}
 		setValueAtPath(params, path, nextVal)
+		syncLocalVarAlias(sourceMap, params, decodeBracketSeg(path[0]))
 		return nil
 	}
 
@@ -788,6 +944,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			return err
 		}
 		setValueAtPath(params, append([]string{varName}, propPath...), val)
+		syncLocalVarAlias(sourceMap, params, decodeBracketSeg(varName))
 		return nil
 	}
 
@@ -800,6 +957,12 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			return err
 		}
 		params[varName] = val
+		for _, pfx := range []string{"ctx?._source?.", "ctx?._source.", "ctx._source?.", "ctx._source."} {
+			if strings.HasPrefix(rhsExpr, pfx) {
+				params["__alias_"+varName] = strings.TrimPrefix(rhsExpr, pfx)
+				break
+			}
+		}
 		return nil
 	}
 
@@ -1279,6 +1442,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 	for _, mSuffix := range []string{".toLowerCase()", ".toUpperCase()", ".trim()", ".length()", ".size()"} {
 		if strings.HasSuffix(rhs, mSuffix) {
 			recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:len(rhs)-len(mSuffix)], "?"))
+			if (mSuffix == ".length()" || mSuffix == ".size()") && (strings.HasPrefix(recExpr, "doc.") || strings.HasPrefix(recExpr, "doc?.")) {
+				docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(recExpr, "doc?."), "doc."), ".values")
+				return int64(len(resolveDocValuesSlice(sourceMap, docPath))), nil
+			}
 			recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1)
 			if err != nil || recVal == nil {
 				return nil, err
@@ -1305,6 +1472,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 
 	if strings.HasSuffix(rhs, ".isEmpty()") {
 		recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:len(rhs)-len(".isEmpty()")], "?"))
+		if strings.HasPrefix(recExpr, "doc.") || strings.HasPrefix(recExpr, "doc?.") {
+			docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(recExpr, "doc?."), "doc."), ".values")
+			return len(resolveDocValuesSlice(sourceMap, docPath)) == 0, nil
+		}
 		recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1)
 		if err != nil || recVal == nil {
 			return nil, err
@@ -1320,13 +1491,40 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		return false, nil
 	}
 
-	for _, mName := range []string{".startsWith(", ".endsWith(", ".contains(", ".containsKey(", ".get(", ".indexOf(", ".split(", ".replace(", ".substring("} {
+	for _, mName := range []string{".startsWith(", ".endsWith(", ".contains(", ".containsKey(", ".get(", ".indexOf(", ".split(", ".replace(", ".substring(", ".subList("} {
 		if recExpr, argExpr, ok := matchTrailingMethodCallPainless(rhs, mName); ok {
 			recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1)
 			if err != nil || recVal == nil {
 				return nil, err
 			}
 			switch mName {
+			case ".subList(":
+				args := splitTopLevelCommaPainless(argExpr)
+				if tv, ok := recVal.([]any); ok && len(args) >= 2 {
+					sVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+					eVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+					sf, sOk := toFloat64(sVal)
+					ef, eOk := toFloat64(eVal)
+					if sOk && eOk {
+						start, end := int(sf), int(ef)
+						if start < 0 {
+							start = 0
+						}
+						if start > len(tv) {
+							start = len(tv)
+						}
+						if end < start {
+							end = start
+						}
+						if end > len(tv) {
+							end = len(tv)
+						}
+						sub := make([]any, end-start)
+						copy(sub, tv[start:end])
+						return sub, nil
+					}
+				}
+				return []any{}, nil
 			case ".replace(":
 				args := splitTopLevelCommaPainless(argExpr)
 				if len(args) == 2 {
@@ -1474,17 +1672,48 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 	}
 	if strings.HasPrefix(rhs, "doc.") || strings.HasPrefix(rhs, "doc?.") {
 		trimmed := strings.TrimPrefix(strings.TrimPrefix(rhs, "doc?."), "doc.")
-		trimmed = strings.TrimSuffix(trimmed, ".value")
-		path := strings.Split(trimmed, ".")
-		val := resolveParamPath(sourceMap, path)
-		if val == nil && (strings.HasSuffix(trimmed, ".keyword") || strings.HasSuffix(trimmed, "\x00keyword")) {
-			kwTrimmed := strings.TrimSuffix(strings.TrimSuffix(trimmed, ".keyword"), "\x00keyword")
-			val = resolveParamPath(sourceMap, strings.Split(kwTrimmed, "."))
+		if strings.HasSuffix(trimmed, ".empty") {
+			dv := resolveDocValuesSlice(sourceMap, strings.TrimSuffix(trimmed, ".empty"))
+			return len(dv) == 0, nil
 		}
-		return val, nil
+		if strings.HasSuffix(trimmed, ".length") {
+			dv := resolveDocValuesSlice(sourceMap, strings.TrimSuffix(trimmed, ".length"))
+			return int64(len(dv)), nil
+		}
+		if strings.HasSuffix(trimmed, ".values") {
+			return resolveDocValuesSlice(sourceMap, strings.TrimSuffix(trimmed, ".values")), nil
+		}
+		// Check `.values.<idx>` after bracket expansion (`doc['tags'].values[0]`)
+		if idx := strings.LastIndex(trimmed, ".values."); idx > 0 {
+			dv := resolveDocValuesSlice(sourceMap, trimmed[:idx])
+			tailSeg := decodeBracketSeg(trimmed[idx+len(".values."):])
+			if sIdx, ok := parseSliceIndex(tailSeg, len(dv)); ok {
+				return dv[sIdx], nil
+			}
+			return nil, nil
+		}
+		dv := resolveDocValuesSlice(sourceMap, strings.TrimSuffix(trimmed, ".value"))
+		if len(dv) == 0 {
+			return nil, nil
+		}
+		return dv[0], nil
 	}
 	if rhs == "params" {
 		return params, nil
+	}
+	if rhs == "params._source" || rhs == "params?._source" {
+		return sourceMap, nil
+	}
+	if strings.HasPrefix(rhs, "params._source.") || strings.HasPrefix(rhs, "params?._source.") ||
+		strings.HasPrefix(rhs, "params._source?.") || strings.HasPrefix(rhs, "params?._source?.") {
+		trimmed := rhs
+		for _, pfx := range []string{"params?._source?.", "params?._source.", "params._source?.", "params._source."} {
+			if strings.HasPrefix(trimmed, pfx) {
+				trimmed = strings.TrimPrefix(trimmed, pfx)
+				break
+			}
+		}
+		return resolveParamPath(sourceMap, strings.Split(trimmed, ".")), nil
 	}
 	if strings.HasPrefix(rhs, "params.") || strings.HasPrefix(rhs, "params?.") {
 		trimmed := strings.TrimPrefix(strings.TrimPrefix(rhs, "params?."), "params.")
@@ -1829,7 +2058,16 @@ func toFloat64(v any) (float64, bool) {
 		f, ok = parsed, err == nil
 	case string:
 		parsed, err := strconv.ParseFloat(val, 64)
-		f, ok = parsed, err == nil
+		if err == nil {
+			f, ok = parsed, true
+		} else if len(val) >= 10 && val[4] == '-' && val[7] == '-' {
+			for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05", "2006-01-02 15:04:05", "2006-01-02"} {
+				if t, tErr := time.Parse(layout, strings.TrimSpace(val)); tErr == nil {
+					f, ok = float64(t.UTC().UnixMilli()), true
+					break
+				}
+			}
+		}
 	default:
 		return 0, false
 	}
@@ -1968,17 +2206,55 @@ func parseSliceIndex(seg string, length int) (int, bool) {
 	return idx, true
 }
 
+func resolveDocValuesSlice(sourceMap map[string]any, fieldPath string) []any {
+	if sourceMap == nil || fieldPath == "" {
+		return nil
+	}
+	val := resolveParamPath(sourceMap, strings.Split(fieldPath, "."))
+	if val == nil && (strings.HasSuffix(fieldPath, ".keyword") || strings.HasSuffix(fieldPath, "\x00keyword")) {
+		kwTrimmed := strings.TrimSuffix(strings.TrimSuffix(fieldPath, ".keyword"), "\x00keyword")
+		val = resolveParamPath(sourceMap, strings.Split(kwTrimmed, "."))
+	}
+	if val == nil {
+		return nil
+	}
+	if slice, ok := val.([]any); ok {
+		out := make([]any, 0, len(slice))
+		for _, item := range slice {
+			if item != nil {
+				out = append(out, item)
+			}
+		}
+		return out
+	}
+	return []any{val}
+}
+
 func resolveParamPath(params map[string]any, path []string) any {
 	var curr any = params
 	for i, rawSeg := range path {
 		seg := decodeBracketSeg(rawSeg)
 		if slice, isSlice := curr.([]any); isSlice {
-			idx, ok := parseSliceIndex(seg, len(slice))
-			if !ok {
+			if idx, ok := parseSliceIndex(seg, len(slice)); ok {
+				curr = slice[idx]
+				continue
+			}
+			var projected []any
+			for _, elem := range slice {
+				if em, ok := elem.(map[string]any); ok {
+					if v := resolveParamPath(em, path[i:]); v != nil {
+						if subSlice, isSub := v.([]any); isSub {
+							projected = append(projected, subSlice...)
+						} else {
+							projected = append(projected, v)
+						}
+					}
+				}
+			}
+			if len(projected) == 0 {
 				return nil
 			}
-			curr = slice[idx]
-			continue
+			return projected
 		}
 		m, ok := curr.(map[string]any)
 		if !ok {
@@ -2217,15 +2493,21 @@ func removeKeyOrIndexAtPath(root map[string]any, parentPath []string, keyOrIdx a
 	case map[string]any:
 		delete(target, fmt.Sprintf("%v", keyOrIdx))
 	case []any:
+		removeAt := func(idx int) {
+			next := make([]any, 0, len(target)-1)
+			next = append(next, target[:idx]...)
+			next = append(next, target[idx+1:]...)
+			setValueAtPath(root, parentPath, next)
+		}
 		if _, isStr := keyOrIdx.(string); !isStr {
 			if idx, ok := parseSliceIndex(fmt.Sprintf("%v", keyOrIdx), len(target)); ok {
-				setValueAtPath(root, parentPath, append(target[:idx], target[idx+1:]...))
+				removeAt(idx)
 				return
 			}
 		}
 		for idx, elem := range target {
 			if valuesEqual(elem, keyOrIdx) {
-				setValueAtPath(root, parentPath, append(target[:idx], target[idx+1:]...))
+				removeAt(idx)
 				break
 			}
 		}

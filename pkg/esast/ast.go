@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -57,6 +58,7 @@ type SearchRequest struct {
 	PIT            *PITSpec           `json:"pit,omitempty"`
 	Fields         []FieldRequestSpec `json:"fields,omitempty"`
 	DocvalueFields []FieldRequestSpec `json:"docvalue_fields,omitempty"`
+	ScriptFields   map[string]any     `json:"script_fields,omitempty"`
 }
 
 // FieldRequestSpec represents an entry in `fields` or `docvalue_fields` in a search request,
@@ -215,6 +217,7 @@ type InnerHitsSpec struct {
 	Source         *SourceFilter      `json:"_source,omitempty"`
 	Fields         []FieldRequestSpec `json:"fields,omitempty"`
 	DocvalueFields []FieldRequestSpec `json:"docvalue_fields,omitempty"`
+	ScriptFields   map[string]any     `json:"script_fields,omitempty"`
 	Highlight      *HighlightSpec     `json:"highlight,omitempty"`
 }
 
@@ -310,6 +313,7 @@ type Query struct {
 	ConstantScore     *ConstantScoreQuery      `json:"constant_score,omitempty"`
 	FunctionScore     *FunctionScoreQuery      `json:"function_score,omitempty"`
 	ScriptScore       *ScriptScoreQuery        `json:"script_score,omitempty"`
+	Script            *ScriptQuery             `json:"script,omitempty"`
 	KNN               *KNNQuery                `json:"knn,omitempty"`
 }
 
@@ -341,6 +345,7 @@ var knownQueryClauses = map[string]bool{
 	"constant_score":      true,
 	"function_score":      true,
 	"script_score":        true,
+	"script":              true,
 	"knn":                 true,
 }
 
@@ -508,6 +513,40 @@ type ScriptScoreQuery struct {
 	Query  *Query         `json:"query,omitempty"`
 	Script map[string]any `json:"script,omitempty"`
 	Boost  *float64       `json:"boost,omitempty"`
+}
+
+// ScriptQuery models an ES `script` filter query (`{"script": {"script": {...}}}`).
+type ScriptQuery struct {
+	Script any      `json:"script,omitempty"`
+	Boost  *float64 `json:"boost,omitempty"`
+}
+
+func (sq *ScriptQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	if trimmed[0] == '"' {
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err != nil {
+			return err
+		}
+		sq.Script = s
+		return nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(trimmed, &m); err != nil {
+		return err
+	}
+	if b, ok := m["boost"].(float64); ok {
+		sq.Boost = &b
+	}
+	if inner, ok := m["script"]; ok {
+		sq.Script = inner
+	} else {
+		sq.Script = m
+	}
+	return nil
 }
 
 // BoolQuery represents an ES `bool` compound query (`must`, `filter`, `should`, `must_not`).
@@ -822,21 +861,27 @@ type ConstantScoreQuery struct {
 }
 
 type FunctionScoreQuery struct {
-	Query            *Query                `json:"query,omitempty"`
-	Functions        []ScoreFunctionSpec   `json:"functions,omitempty"`
-	ScoreMode        string                `json:"score_mode,omitempty"`
-	BoostMode        string                `json:"boost_mode,omitempty"`
-	MaxBoost         *float64              `json:"max_boost,omitempty"`
-	MinScore         *float64              `json:"min_score,omitempty"`
-	Boost            *float64              `json:"boost,omitempty"`
-	Weight           *float64              `json:"weight,omitempty"`
-	FieldValueFactor *FieldValueFactorSpec `json:"field_value_factor,omitempty"`
+	Query            *Query                   `json:"query,omitempty"`
+	Functions        []ScoreFunctionSpec      `json:"functions,omitempty"`
+	ScoreMode        string                   `json:"score_mode,omitempty"`
+	BoostMode        string                   `json:"boost_mode,omitempty"`
+	MaxBoost         *float64                 `json:"max_boost,omitempty"`
+	MinScore         *float64                 `json:"min_score,omitempty"`
+	Boost            *float64                 `json:"boost,omitempty"`
+	Weight           *float64                 `json:"weight,omitempty"`
+	FieldValueFactor *FieldValueFactorSpec    `json:"field_value_factor,omitempty"`
+	ScriptScore      *ScriptScoreFunctionSpec `json:"script_score,omitempty"`
 }
 
 type ScoreFunctionSpec struct {
-	Filter           *Query                `json:"filter,omitempty"`
-	Weight           *float64              `json:"weight,omitempty"`
-	FieldValueFactor *FieldValueFactorSpec `json:"field_value_factor,omitempty"`
+	Filter           *Query                   `json:"filter,omitempty"`
+	Weight           *float64                 `json:"weight,omitempty"`
+	FieldValueFactor *FieldValueFactorSpec    `json:"field_value_factor,omitempty"`
+	ScriptScore      *ScriptScoreFunctionSpec `json:"script_score,omitempty"`
+}
+
+type ScriptScoreFunctionSpec struct {
+	Script any `json:"script,omitempty"`
 }
 
 type FieldValueFactorSpec struct {
@@ -1340,6 +1385,7 @@ func (a *AggSpec) SubAggs() map[string]AggSpec {
 
 type TermsAggSpec struct {
 	Field         string `json:"field"`
+	Script        any    `json:"script,omitempty"`
 	Size          int    `json:"size,omitempty"`
 	Missing       any    `json:"missing,omitempty"`
 	MissingBucket bool   `json:"missing_bucket,omitempty"`
@@ -1585,6 +1631,8 @@ type SortFieldSpec struct {
 	Order   string
 	Mode    string
 	Missing string
+	Script  any
+	Type    string
 }
 
 type SortSpec struct {
@@ -1657,12 +1705,13 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 		var obj struct {
 			Order  string `json:"order"`
 			Script any    `json:"script"`
+			Type   string `json:"type"`
 		}
 		_ = json.Unmarshal(rawVal, &obj)
 		if obj.Order != "" {
 			order = strings.ToLower(obj.Order)
 		}
-		s.Entry = SortFieldSpec{Field: "_script", Order: order}
+		s.Entry = SortFieldSpec{Field: "_script", Order: order, Script: obj.Script, Type: obj.Type}
 		return nil
 	}
 	if rawVal, ok := m["_geo_distance"]; ok {
@@ -1722,7 +1771,11 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 				mode = obj.Mode
 			}
 			if obj.Missing != nil {
-				missing = fmt.Sprintf("%v", obj.Missing)
+				if fv, ok := obj.Missing.(float64); ok && fv == math.Trunc(fv) && !math.IsInf(fv, 0) && !math.IsNaN(fv) {
+					missing = strconv.FormatInt(int64(fv), 10)
+				} else {
+					missing = fmt.Sprintf("%v", obj.Missing)
+				}
 			}
 		}
 		s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing}

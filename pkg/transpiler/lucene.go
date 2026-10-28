@@ -74,7 +74,7 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 
 	parsedAST := parseSimpleLuceneToAST(raw, defaultField, expandedFields, defaultOp)
 	compiled := t.CompileQuery(&parsedAST, scoring, nctx)
-	if t.Opts.UseDoris4SearchFunc && nctx == nil && !strings.Contains(raw, "_exists_:") && !strings.ContainsAny(raw, "[{><~/^") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.WhereSQL, "`n__") {
+	if t.Opts.UseDoris4SearchFunc && nctx == nil && !strings.Contains(raw, "_exists_:") && !strings.ContainsAny(raw, "[{><~/^") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, "`n__") {
 		if len(expandedFields) > 1 {
 			var searchPreds []string
 			allSupported := true
@@ -122,7 +122,7 @@ func (t *Transpiler) isDoris4SearchableField(fname string) bool {
 		return false
 	}
 	b := t.Schema.ResolveField(fname)
-	return b.Kind != schema.StorageDynamicVariant && b.Kind != schema.StoragePromotedVector && b.Kind != schema.StorageNestedSubfield
+	return b.Kind == schema.StoragePromotedScalar && (b.DorisType == schema.DorisString || b.DorisType == schema.DorisVarchar)
 }
 
 const maxLuceneDepth = 32
