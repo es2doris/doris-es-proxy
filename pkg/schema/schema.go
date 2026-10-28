@@ -468,6 +468,10 @@ func (s *IndexSchema) ResolveField(esFieldPath string) FieldBinding {
 	if strings.HasSuffix(esFieldPath, ".keyword") {
 		basePath := strings.TrimSuffix(esFieldPath, ".keyword")
 		if b, ok := s.Fields[basePath]; ok {
+			b.ESFieldPath = esFieldPath
+			if b.ESType == "text" {
+				b.ESType = "keyword"
+			}
 			return b
 		}
 		return FieldBinding{

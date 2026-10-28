@@ -422,15 +422,6 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 			ZeroTermsQuery:     q.CombinedFields.ZeroTermsQuery,
 			Boost:              q.CombinedFields.Boost,
 		}, scoring, nctx)
-	case q.ScriptScore != nil:
-		base := CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: "1.0"}
-		if q.ScriptScore.Query != nil {
-			base = t.CompileQuery(q.ScriptScore.Query, true, nctx)
-		}
-		if q.ScriptScore.Boost != nil && *q.ScriptScore.Boost != 1.0 {
-			base.ScoreSQL = fmt.Sprintf("(%.4f * (%s))", *q.ScriptScore.Boost, base.ScoreSQL)
-		}
-		return base
 	case len(q.Range) > 0:
 		keys := sortedMapKeys(q.Range)
 		var preds []string
@@ -853,6 +844,69 @@ func (t *Transpiler) compileBoosting(bq *esast.BoostingQuery, scoring bool, nctx
 	}
 }
 
+func queryContainsScript(q *esast.Query) bool {
+	if q == nil {
+		return false
+	}
+	if q.Script != nil || q.ScriptScore != nil {
+		return true
+	}
+	if q.FunctionScore != nil {
+		if q.FunctionScore.ScriptScore != nil {
+			return true
+		}
+		for _, fn := range q.FunctionScore.Functions {
+			if fn.ScriptScore != nil || queryContainsScript(fn.Filter) {
+				return true
+			}
+		}
+		if queryContainsScript(q.FunctionScore.Query) {
+			return true
+		}
+	}
+	if q.ConstantScore != nil && queryContainsScript(&q.ConstantScore.Filter) {
+		return true
+	}
+	if q.Nested != nil && queryContainsScript(&q.Nested.Query) {
+		return true
+	}
+	if q.DisMax != nil {
+		for i := range q.DisMax.Queries {
+			if queryContainsScript(&q.DisMax.Queries[i]) {
+				return true
+			}
+		}
+	}
+	if q.Boosting != nil {
+		if queryContainsScript(&q.Boosting.Positive) || queryContainsScript(&q.Boosting.Negative) {
+			return true
+		}
+	}
+	if q.Bool != nil {
+		for i := range q.Bool.Must {
+			if queryContainsScript(&q.Bool.Must[i]) {
+				return true
+			}
+		}
+		for i := range q.Bool.Filter {
+			if queryContainsScript(&q.Bool.Filter[i]) {
+				return true
+			}
+		}
+		for i := range q.Bool.Should {
+			if queryContainsScript(&q.Bool.Should[i]) {
+				return true
+			}
+		}
+		for i := range q.Bool.MustNot {
+			if queryContainsScript(&q.Bool.MustNot[i]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (t *Transpiler) compileBool(b *esast.BoolQuery, scoring bool, nctx *nestedCtx) CompiledQuery {
 	var conjuncts []string
 	var safeConjuncts []string
@@ -875,7 +929,7 @@ func (t *Transpiler) compileBool(b *esast.BoolQuery, scoring bool, nctx *nestedC
 		usesFT = usesFT || c.UsesFulltextMatch
 	}
 	for i := range b.MustNot {
-		if b.MustNot[i].Script != nil {
+		if queryContainsScript(&b.MustNot[i]) {
 			continue
 		}
 		c := t.CompileQuery(&b.MustNot[i], false, nctx)
@@ -1146,11 +1200,12 @@ func (t *Transpiler) projectionSafeTextMatchSQL(field, queryStr, operator string
 		joinOp = " AND "
 	}
 
-	if nctx == nil && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
+	if (nctx == nil || nctx.nestedPath != b.NestedPath) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
+		arrCol := b.EffectiveArrayColumn(false)
 		var parts []string
 		for _, tok := range tokens {
 			likeLit := quoteStr("%" + escapeLikeLiteral(tok) + "%")
-			parts = append(parts, fmt.Sprintf("array_exists(_x -> lower(_x) LIKE lower(%s), `%s`)", likeLit, b.ColumnName))
+			parts = append(parts, fmt.Sprintf("array_exists(_x -> lower(_x) LIKE lower(%s), `%s`)", likeLit, arrCol))
 		}
 		return "(" + strings.Join(parts, joinOp) + ")"
 	}
@@ -1473,7 +1528,7 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 		if fs.Boost != nil && *fs.Boost != 1.0 {
 			base.ScoreSQL = fmt.Sprintf("(%.4f * (%s))", *fs.Boost, base.ScoreSQL)
 		}
-		if fs.MinScore != nil {
+		if fs.MinScore != nil && !queryContainsScript(&esast.Query{FunctionScore: fs}) {
 			minCond := fmt.Sprintf("(%s >= %.4f)", base.ScoreSQL, *fs.MinScore)
 			base.WhereSQL = fmt.Sprintf("(%s) AND %s", base.WhereSQL, minCond)
 			base.SafeWhereSQL = fmt.Sprintf("(%s) AND %s", base.EffectiveSafeWhere(), minCond)
@@ -1636,7 +1691,7 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 	}
 	whereSQL := base.WhereSQL
 	safeWhereSQL := base.EffectiveSafeWhere()
-	if fs.MinScore != nil {
+	if fs.MinScore != nil && !queryContainsScript(&esast.Query{FunctionScore: fs}) {
 		minScoreCond := fmt.Sprintf("(%s >= %.4f)", finalScore, *fs.MinScore)
 		if whereSQL == "" || whereSQL == "TRUE" {
 			whereSQL = minScoreCond
@@ -1687,10 +1742,7 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 		if strVal, ok := val.(string); ok {
 			if startNum, endNum, isCIDR := parseCIDRBounds(strVal); isCIDR {
 				if b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath)) {
-					colName := b.ColumnName
-					if colName == "" {
-						colName = b.PrefilterArrayCol
-					}
+					colName := b.EffectiveArrayColumn(true)
 					return fmt.Sprintf("array_exists(_x -> IPV4_STRING_TO_NUM_OR_NULL(_x) >= %d AND IPV4_STRING_TO_NUM_OR_NULL(_x) <= %d, `%s`)", startNum, endNum, colName)
 				}
 				rawCol := t.sqlColumnRef(field, true, nctx)
@@ -1922,10 +1974,7 @@ func (t *Transpiler) compileRangePredicate(field string, rc esast.RangeCond, nct
 	b := t.Schema.ResolveField(field)
 	if b.ESType == "ip" {
 		if b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath)) {
-			colName := b.ColumnName
-			if colName == "" {
-				colName = b.PrefilterArrayCol
-			}
+			colName := b.EffectiveArrayColumn(true)
 			numElem := "IPV4_STRING_TO_NUM_OR_NULL(_x)"
 			var elemParts []string
 			if gt != nil {
@@ -2026,7 +2075,11 @@ func (t *Transpiler) compileRangePredicate(field string, rc esast.RangeCond, nct
 					if isEpochSecond {
 						return int64(rawSec * 1000)
 					}
-					return int64(rawSec)
+					iv := int64(rawSec)
+					if b.ESType == "date_nanos" && iv > 1_000_000_000_000_000 {
+						iv /= 1_000_000
+					}
+					return iv
 				}
 				if ms, ok := schema.ParseESDateBoundToEpochMillis(strVal, now, roundUp); ok {
 					datePart := trimmed
@@ -2041,6 +2094,22 @@ func (t *Transpiler) compileRangePredicate(field string, rc esast.RangeCond, nct
 						ms -= tzOffsetMs
 					}
 					return ms
+				}
+			}
+			if b.ESType == "date_nanos" && !isEpochSecond {
+				switch nv := v.(type) {
+				case int64:
+					if nv > 1_000_000_000_000_000 {
+						return nv / 1_000_000
+					}
+				case float64:
+					if nv > 1e15 {
+						return int64(nv) / 1_000_000
+					}
+				case json.Number:
+					if i, err := nv.Int64(); err == nil && i > 1_000_000_000_000_000 {
+						return i / 1_000_000
+					}
 				}
 			}
 			if isEpochSecond {
@@ -2134,7 +2203,7 @@ func (t *Transpiler) compileRangePredicate(field string, rc esast.RangeCond, nct
 		if len(elemParts) == 0 {
 			return "TRUE"
 		}
-		return fmt.Sprintf("array_exists(_x -> %s, `%s`)", strings.Join(elemParts, " AND "), b.ColumnName)
+		return fmt.Sprintf("array_exists(_x -> %s, `%s`)", strings.Join(elemParts, " AND "), b.EffectiveArrayColumn(true))
 	}
 
 	col := t.sqlTypedColumnRef(field, sampleBound, true, nctx)
@@ -2160,8 +2229,9 @@ func (t *Transpiler) compileRangePredicate(field string, rc esast.RangeCond, nct
 
 func (t *Transpiler) compileExistsPredicate(field string, nctx *nestedCtx) string {
 	b := t.Schema.ResolveField(field)
-	if b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && nctx == nil) {
-		return fmt.Sprintf("(`%s` IS NOT NULL AND array_size(`%s`) > 0)", b.ColumnName, b.ColumnName)
+	if b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath)) {
+		arrCol := b.EffectiveArrayColumn(true)
+		return fmt.Sprintf("(`%s` IS NOT NULL AND array_size(`%s`) > 0)", arrCol, arrCol)
 	}
 	col := t.sqlColumnRef(field, true, nctx)
 	return fmt.Sprintf("%s IS NOT NULL", col)
@@ -2773,13 +2843,13 @@ func (t *Transpiler) appendAggBranches(
 			}
 
 		case spec.Avg != nil:
-			t.appendMetricAggBranchWithMissing(branches, fullAggName, "AVG", spec.Avg.Field, extraWhere, spec.Avg.Missing)
+			t.appendMetricAggBranchWithMissingAndScript(branches, fullAggName, "AVG", spec.Avg.Field, extraWhere, spec.Avg.Missing, spec.Avg.Script)
 		case spec.Sum != nil:
-			t.appendMetricAggBranchWithMissing(branches, fullAggName, "SUM", spec.Sum.Field, extraWhere, spec.Sum.Missing)
+			t.appendMetricAggBranchWithMissingAndScript(branches, fullAggName, "SUM", spec.Sum.Field, extraWhere, spec.Sum.Missing, spec.Sum.Script)
 		case spec.Min != nil:
-			t.appendMetricAggBranchWithMissing(branches, fullAggName, "MIN", spec.Min.Field, extraWhere, spec.Min.Missing)
+			t.appendMetricAggBranchWithMissingAndScript(branches, fullAggName, "MIN", spec.Min.Field, extraWhere, spec.Min.Missing, spec.Min.Script)
 		case spec.Max != nil:
-			t.appendMetricAggBranchWithMissing(branches, fullAggName, "MAX", spec.Max.Field, extraWhere, spec.Max.Missing)
+			t.appendMetricAggBranchWithMissingAndScript(branches, fullAggName, "MAX", spec.Max.Field, extraWhere, spec.Max.Missing, spec.Max.Script)
 		case spec.ValueCount != nil:
 			t.appendValueCountAggBranchWithMissing(branches, fullAggName, spec.ValueCount.Field, extraWhere, spec.ValueCount.Missing)
 
@@ -2813,13 +2883,14 @@ func (t *Transpiler) appendAggBranches(
 				statOps = append(statOps, struct{ key, fn string }{"_stats_std", "STDDEV_POP"})
 			}
 			if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
+				arrCol := b.EffectiveArrayColumn(true)
 				valExpr := "CAST(`_nel` AS DOUBLE)"
-				explodeExpr := fmt.Sprintf("`%s`", b.ColumnName)
+				explodeExpr := fmt.Sprintf("`%s`", arrCol)
 				wCond := fmt.Sprintf(" WHERE %s`_nel` IS NOT NULL", wherePrefix)
 				if statsSpec.Missing != nil {
 					if mf, ok := resolveHistogramMissingFloat(statsSpec.Missing); ok {
 						valExpr = fmt.Sprintf("COALESCE(CAST(`_nel` AS DOUBLE), %s)", strconv.FormatFloat(mf, 'f', -1, 64))
-						explodeExpr = fmt.Sprintf("CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END", b.ColumnName, b.ColumnName, b.ColumnName)
+						explodeExpr = fmt.Sprintf("CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END", arrCol, arrCol, arrCol)
 						wCond = ""
 						if extraWhere != "" {
 							wCond = " WHERE " + extraWhere
@@ -2835,6 +2906,11 @@ func (t *Transpiler) appendAggBranches(
 				}
 			} else {
 				col := t.sqlNumericColumnRef(statsSpec.Field, nil)
+				if statsSpec.Field == "" && statsSpec.Script != nil {
+					if scriptExpr, ok := t.compileMetricScriptExpr(statsSpec.Script, nil); ok {
+						col = scriptExpr
+					}
+				}
 				if statsSpec.Missing != nil {
 					if mf, ok := resolveHistogramMissingFloat(statsSpec.Missing); ok {
 						col = fmt.Sprintf("COALESCE(%s, %s)", col, strconv.FormatFloat(mf, 'f', -1, 64))
@@ -2862,12 +2938,13 @@ func (t *Transpiler) appendAggBranches(
 				{"_stats_avg", "AVG"},
 			}
 			if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
+				arrCol := b.EffectiveArrayColumn(true)
 				lenExpr := "CAST(CHAR_LENGTH(CAST(`_nel` AS STRING)) AS DOUBLE)"
 				for _, statOp := range statOps {
 					*branches = append(*branches, fmt.Sprintf(
 						"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(%s(%s), 0) AS DOUBLE) AS `_doc_count` "+
 							"FROM `base_matched` LATERAL VIEW EXPLODE(`%s`) `_nt` AS `_nel` WHERE %s`_nel` IS NOT NULL",
-						quoteStr(fullAggName), quoteStr(statOp.key), statOp.fn, lenExpr, b.ColumnName, wherePrefix,
+						quoteStr(fullAggName), quoteStr(statOp.key), statOp.fn, lenExpr, arrCol, wherePrefix,
 					))
 				}
 			} else {
@@ -2884,6 +2961,7 @@ func (t *Transpiler) appendAggBranches(
 
 		case spec.Boxplot != nil:
 			b := t.Schema.ResolveField(spec.Boxplot.Field)
+			arrCol := b.EffectiveArrayColumn(true)
 			for _, bp := range []struct {
 				key string
 				q   float64
@@ -2896,12 +2974,12 @@ func (t *Transpiler) appendAggBranches(
 			} {
 				if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
 					valExpr := "CAST(`_nel` AS DOUBLE)"
-					explodeExpr := fmt.Sprintf("`%s`", b.ColumnName)
+					explodeExpr := fmt.Sprintf("`%s`", arrCol)
 					wCond := fmt.Sprintf(" WHERE %s`_nel` IS NOT NULL", wherePrefix)
 					if spec.Boxplot.Missing != nil {
 						if mf, ok := resolveHistogramMissingFloat(spec.Boxplot.Missing); ok {
 							valExpr = fmt.Sprintf("COALESCE(CAST(`_nel` AS DOUBLE), %s)", strconv.FormatFloat(mf, 'f', -1, 64))
-							explodeExpr = fmt.Sprintf("CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END", b.ColumnName, b.ColumnName, b.ColumnName)
+							explodeExpr = fmt.Sprintf("CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END", arrCol, arrCol, arrCol)
 							wCond = ""
 							if extraWhere != "" {
 								wCond = " WHERE " + extraWhere
@@ -2934,6 +3012,7 @@ func (t *Transpiler) appendAggBranches(
 
 		case spec.Percentiles != nil:
 			b := t.Schema.ResolveField(spec.Percentiles.Field)
+			arrCol := b.EffectiveArrayColumn(true)
 			for _, pct := range spec.Percentiles.EffectivePercents() {
 				q := pct / 100.0
 				if q < 0 {
@@ -2947,12 +3026,12 @@ func (t *Transpiler) appendAggBranches(
 				}
 				if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
 					valExpr := "CAST(`_nel` AS DOUBLE)"
-					explodeExpr := fmt.Sprintf("`%s`", b.ColumnName)
+					explodeExpr := fmt.Sprintf("`%s`", arrCol)
 					wCond := fmt.Sprintf(" WHERE %s`_nel` IS NOT NULL", wherePrefix)
 					if spec.Percentiles.Missing != nil {
 						if mf, ok := resolveHistogramMissingFloat(spec.Percentiles.Missing); ok {
 							valExpr = fmt.Sprintf("COALESCE(CAST(`_nel` AS DOUBLE), %s)", strconv.FormatFloat(mf, 'f', -1, 64))
-							explodeExpr = fmt.Sprintf("CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END", b.ColumnName, b.ColumnName, b.ColumnName)
+							explodeExpr = fmt.Sprintf("CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END", arrCol, arrCol, arrCol)
 							wCond = ""
 							if extraWhere != "" {
 								wCond = " WHERE " + extraWhere
@@ -2985,6 +3064,7 @@ func (t *Transpiler) appendAggBranches(
 
 		case spec.PercentileRanks != nil:
 			b := t.Schema.ResolveField(spec.PercentileRanks.Field)
+			arrCol := b.EffectiveArrayColumn(true)
 			for _, val := range spec.PercentileRanks.Values {
 				valKey := strconv.FormatFloat(val, 'f', -1, 64)
 				if !strings.Contains(valKey, ".") {
@@ -2993,12 +3073,12 @@ func (t *Transpiler) appendAggBranches(
 				valLit := strconv.FormatFloat(val, 'f', -1, 64)
 				if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
 					valExpr := "CAST(`_nel` AS DOUBLE)"
-					explodeExpr := fmt.Sprintf("`%s`", b.ColumnName)
+					explodeExpr := fmt.Sprintf("`%s`", arrCol)
 					wCond := fmt.Sprintf(" WHERE %s`_nel` IS NOT NULL", wherePrefix)
 					if spec.PercentileRanks.Missing != nil {
 						if mf, ok := resolveHistogramMissingFloat(spec.PercentileRanks.Missing); ok {
 							valExpr = fmt.Sprintf("COALESCE(CAST(`_nel` AS DOUBLE), %s)", strconv.FormatFloat(mf, 'f', -1, 64))
-							explodeExpr = fmt.Sprintf("CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END", b.ColumnName, b.ColumnName, b.ColumnName)
+							explodeExpr = fmt.Sprintf("CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END", arrCol, arrCol, arrCol)
 							wCond = ""
 							if extraWhere != "" {
 								wCond = " WHERE " + extraWhere
@@ -3034,16 +3114,17 @@ func (t *Transpiler) appendAggBranches(
 			intervalMs := spec.DateHistogram.EffectiveIntervalMs()
 			tzShiftMs := spec.DateHistogram.EffectiveTimeZoneOffsetMs() - spec.DateHistogram.EffectiveOffsetMs()
 			b := t.Schema.ResolveField(spec.DateHistogram.Field)
+			arrCol := b.EffectiveArrayColumn(true)
 			col := t.sqlNumericColumnRef(spec.DateHistogram.Field, nil)
 			fromClause := "`base_matched`"
 			notNullCond := fmt.Sprintf("%s%s IS NOT NULL", wherePrefix, col)
 			if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
 				col = "CAST(`_elem` AS DOUBLE)"
-				fromClause = fmt.Sprintf("`base_matched` LATERAL VIEW EXPLODE(`%s`) `_t` AS `_elem`", b.ColumnName)
+				fromClause = fmt.Sprintf("`base_matched` LATERAL VIEW EXPLODE(`%s`) `_t` AS `_elem`", arrCol)
 				notNullCond = fmt.Sprintf("%s`_elem` IS NOT NULL", wherePrefix)
 				if spec.DateHistogram.Missing != nil {
 					if missMs, ok := t.resolveDateHistogramMissingMs(spec.DateHistogram.Missing); ok {
-						fromClause = fmt.Sprintf("`base_matched` LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) `_t` AS `_elem`", b.ColumnName, b.ColumnName, b.ColumnName)
+						fromClause = fmt.Sprintf("`base_matched` LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) `_t` AS `_elem`", arrCol, arrCol, arrCol)
 						col = fmt.Sprintf("COALESCE(CAST(`_elem` AS DOUBLE), %d)", missMs)
 						notNullCond = "1=1"
 						if extraWhere != "" {
@@ -3086,16 +3167,17 @@ func (t *Transpiler) appendAggBranches(
 			}
 			offset := spec.Histogram.Offset
 			b := t.Schema.ResolveField(spec.Histogram.Field)
+			arrCol := b.EffectiveArrayColumn(true)
 			col := t.sqlNumericColumnRef(spec.Histogram.Field, nil)
 			fromClause := "`base_matched`"
 			notNullCond := fmt.Sprintf("%s%s IS NOT NULL", wherePrefix, col)
 			if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
 				col = "CAST(`_elem` AS DOUBLE)"
-				fromClause = fmt.Sprintf("`base_matched` LATERAL VIEW EXPLODE(`%s`) `_t` AS `_elem`", b.ColumnName)
+				fromClause = fmt.Sprintf("`base_matched` LATERAL VIEW EXPLODE(`%s`) `_t` AS `_elem`", arrCol)
 				notNullCond = fmt.Sprintf("%s`_elem` IS NOT NULL", wherePrefix)
 				if spec.Histogram.Missing != nil {
 					if missVal, ok := resolveHistogramMissingFloat(spec.Histogram.Missing); ok {
-						fromClause = fmt.Sprintf("`base_matched` LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) `_t` AS `_elem`", b.ColumnName, b.ColumnName, b.ColumnName)
+						fromClause = fmt.Sprintf("`base_matched` LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) `_t` AS `_elem`", arrCol, arrCol, arrCol)
 						col = fmt.Sprintf("COALESCE(CAST(`_elem` AS DOUBLE), %s)", strconv.FormatFloat(missVal, 'f', -1, 64))
 						notNullCond = "1=1"
 						if extraWhere != "" {
@@ -3132,6 +3214,7 @@ func (t *Transpiler) appendAggBranches(
 			rngSpec := spec.EffectiveRange()
 			now := time.Now().UTC()
 			b := t.Schema.ResolveField(rngSpec.Field)
+			arrCol := b.EffectiveArrayColumn(true)
 			isArray := b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield
 			for _, rng := range rngSpec.Ranges {
 				var rWhere string
@@ -3181,9 +3264,9 @@ func (t *Transpiler) appendAggBranches(
 					}
 					if isArray {
 						if len(conds) == 0 {
-							rWhere = fmt.Sprintf("(`%s` IS NOT NULL AND array_size(`%s`) > 0)", b.ColumnName, b.ColumnName)
+							rWhere = fmt.Sprintf("(`%s` IS NOT NULL AND array_size(`%s`) > 0)", arrCol, arrCol)
 						} else {
-							rWhere = fmt.Sprintf("array_exists(_x -> %s, `%s`)", strings.Join(conds, " AND "), b.ColumnName)
+							rWhere = fmt.Sprintf("array_exists(_x -> %s, `%s`)", strings.Join(conds, " AND "), arrCol)
 						}
 					} else {
 						rWhere = strings.Join(conds, " AND ")
@@ -3197,9 +3280,9 @@ func (t *Transpiler) appendAggBranches(
 						elemConds = append(elemConds, fmt.Sprintf("CAST(_x AS DOUBLE) < %s", quoteValue(t.coerceRangeAggBoundWithNow(rngSpec.Field, rng.To, now))))
 					}
 					if len(elemConds) == 0 {
-						rWhere = fmt.Sprintf("(`%s` IS NOT NULL AND array_size(`%s`) > 0)", b.ColumnName, b.ColumnName)
+						rWhere = fmt.Sprintf("(`%s` IS NOT NULL AND array_size(`%s`) > 0)", arrCol, arrCol)
 					} else {
-						rWhere = fmt.Sprintf("array_exists(_x -> %s, `%s`)", strings.Join(elemConds, " AND "), b.ColumnName)
+						rWhere = fmt.Sprintf("array_exists(_x -> %s, `%s`)", strings.Join(elemConds, " AND "), arrCol)
 					}
 				} else {
 					col := t.sqlNumericColumnRef(rngSpec.Field, nil)
@@ -3229,6 +3312,9 @@ func (t *Transpiler) appendAggBranches(
 
 		case spec.TopHits != nil:
 			size := spec.TopHits.EffectiveFetchLimit()
+			if topHitsNeedsRuntimeSort(spec.TopHits.Sort) && size < 100 {
+				size = 100
+			}
 			orderBy := t.compileTopHitsOrderBy(spec.TopHits.Sort)
 			wClause := ""
 			if extraWhere != "" {
@@ -3445,6 +3531,7 @@ func (t *Transpiler) appendValueCountAggBranch(branches *[]string, fullAggName, 
 
 func (t *Transpiler) appendValueCountAggBranchWithMissing(branches *[]string, fullAggName, field, extraWhere string, missing any) {
 	b := t.Schema.ResolveField(field)
+	arrCol := b.EffectiveArrayColumn(true)
 	wherePrefix := ""
 	if extraWhere != "" {
 		wherePrefix = fmt.Sprintf("(%s) AND ", extraWhere)
@@ -3459,14 +3546,14 @@ func (t *Transpiler) appendValueCountAggBranchWithMissing(branches *[]string, fu
 			*branches = append(*branches, fmt.Sprintf(
 				"SELECT %s AS `_agg_name`, '_metric' AS `_bucket_key`, CAST(COUNT(COALESCE(`_elem`, %s)) AS DOUBLE) AS `_doc_count` "+
 					"FROM `base_matched` LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) `_t` AS `_elem`%s",
-				quoteStr(fullAggName), missLit, b.ColumnName, b.ColumnName, b.ColumnName, wClause,
+				quoteStr(fullAggName), missLit, arrCol, arrCol, arrCol, wClause,
 			))
 			return
 		}
 		*branches = append(*branches, fmt.Sprintf(
 			"SELECT %s AS `_agg_name`, '_metric' AS `_bucket_key`, CAST(COUNT(`_elem`) AS DOUBLE) AS `_doc_count` "+
 				"FROM `base_matched` LATERAL VIEW EXPLODE(`%s`) `_t` AS `_elem` WHERE %s`_elem` IS NOT NULL",
-			quoteStr(fullAggName), b.ColumnName, wherePrefix,
+			quoteStr(fullAggName), arrCol, wherePrefix,
 		))
 		return
 	}
@@ -3525,8 +3612,19 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 		subElemAlias = fmt.Sprintf("`_sub_elem_%d`", explodeDepth)
 	}
 
-	appendSubNumericMetric := func(subFull, fn, field string, missing any) {
+	appendSubNumericMetric := func(subFull, fn, field string, missing any, script any) {
+		if field == "" && script != nil {
+			if scriptExpr, ok := t.compileMetricScriptExpr(script, nctx); ok {
+				*branches = append(*branches, fmt.Sprintf(
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(%s(%s), 0) AS DOUBLE) AS `_doc_count` "+
+						"FROM %s WHERE %s GROUP BY `_bucket_key`",
+					quoteStr(subFull), parentBucketExpr, fn, scriptExpr, fromClause, whereClause,
+				))
+				return
+			}
+		}
 		b := t.Schema.ResolveField(field)
+		arrCol := b.EffectiveArrayColumn(true)
 		if isExplodedNested(b, field) {
 			col := t.sqlNumericColumnRef(field, nctx)
 			rawCol := t.sqlColumnRef(field, true, nctx)
@@ -3546,12 +3644,12 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 		}
 		if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
 			valExpr := fmt.Sprintf("CAST(%s AS DOUBLE)", subElemAlias)
-			subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, b.ColumnName, subTableAlias, subElemAlias)
+			subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
 			subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, subElemAlias)
 			if missing != nil {
 				if mf, ok := resolveHistogramMissingFloat(missing); ok {
 					valExpr = fmt.Sprintf("COALESCE(CAST(%s AS DOUBLE), %s)", subElemAlias, strconv.FormatFloat(mf, 'f', -1, 64))
-					subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", fromClause, b.ColumnName, b.ColumnName, b.ColumnName, subTableAlias, subElemAlias)
+					subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", fromClause, arrCol, arrCol, arrCol, subTableAlias, subElemAlias)
 					subWhere = whereClause
 				}
 			}
@@ -3580,13 +3678,13 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 		subFull := parentAggName + "." + subName
 		switch {
 		case subSpec.Avg != nil:
-			appendSubNumericMetric(subFull, "AVG", subSpec.Avg.Field, subSpec.Avg.Missing)
+			appendSubNumericMetric(subFull, "AVG", subSpec.Avg.Field, subSpec.Avg.Missing, subSpec.Avg.Script)
 		case subSpec.Sum != nil:
-			appendSubNumericMetric(subFull, "SUM", subSpec.Sum.Field, subSpec.Sum.Missing)
+			appendSubNumericMetric(subFull, "SUM", subSpec.Sum.Field, subSpec.Sum.Missing, subSpec.Sum.Script)
 		case subSpec.Min != nil:
-			appendSubNumericMetric(subFull, "MIN", subSpec.Min.Field, subSpec.Min.Missing)
+			appendSubNumericMetric(subFull, "MIN", subSpec.Min.Field, subSpec.Min.Missing, subSpec.Min.Script)
 		case subSpec.Max != nil:
-			appendSubNumericMetric(subFull, "MAX", subSpec.Max.Field, subSpec.Max.Missing)
+			appendSubNumericMetric(subFull, "MAX", subSpec.Max.Field, subSpec.Max.Missing, subSpec.Max.Script)
 		case subSpec.Rate != nil:
 			if subSpec.Rate.Field == "" {
 				*branches = append(*branches, fmt.Sprintf(
@@ -3596,8 +3694,9 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 				))
 			} else if strings.EqualFold(subSpec.Rate.Mode, "value_count") {
 				b := t.Schema.ResolveField(subSpec.Rate.Field)
+				arrCol := b.EffectiveArrayColumn(true)
 				if !isExplodedNested(b, subSpec.Rate.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
-					subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, b.ColumnName, subTableAlias, subElemAlias)
+					subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
 					subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, subElemAlias)
 					*branches = append(*branches, fmt.Sprintf(
 						"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(%s) AS DOUBLE) AS `_doc_count` "+
@@ -3613,7 +3712,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					))
 				}
 			} else {
-				appendSubNumericMetric(subFull, "SUM", subSpec.Rate.Field, nil)
+				appendSubNumericMetric(subFull, "SUM", subSpec.Rate.Field, nil, nil)
 			}
 		case subSpec.EffectiveStats() != nil:
 			statsSpec := subSpec.EffectiveStats()
@@ -3628,10 +3727,11 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 				statOps = append(statOps, struct{ key, fn string }{"_stats_std", "STDDEV_POP"})
 			}
 			for _, statOp := range statOps {
-				appendSubNumericMetric(subFull+"."+statOp.key, statOp.fn, statsSpec.Field, statsSpec.Missing)
+				appendSubNumericMetric(subFull+"."+statOp.key, statOp.fn, statsSpec.Field, statsSpec.Missing, statsSpec.Script)
 			}
 		case subSpec.Percentiles != nil:
 			b := t.Schema.ResolveField(subSpec.Percentiles.Field)
+			arrCol := b.EffectiveArrayColumn(true)
 			for _, pct := range subSpec.Percentiles.EffectivePercents() {
 				q := pct / 100.0
 				if q < 0 {
@@ -3645,12 +3745,12 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 				}
 				if !isExplodedNested(b, subSpec.Percentiles.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 					valExpr := fmt.Sprintf("CAST(%s AS DOUBLE)", subElemAlias)
-					subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, b.ColumnName, subTableAlias, subElemAlias)
+					subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
 					subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, subElemAlias)
 					if subSpec.Percentiles.Missing != nil {
 						if mf, ok := resolveHistogramMissingFloat(subSpec.Percentiles.Missing); ok {
 							valExpr = fmt.Sprintf("COALESCE(CAST(%s AS DOUBLE), %s)", subElemAlias, strconv.FormatFloat(mf, 'f', -1, 64))
-							subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", fromClause, b.ColumnName, b.ColumnName, b.ColumnName, subTableAlias, subElemAlias)
+							subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", fromClause, arrCol, arrCol, arrCol, subTableAlias, subElemAlias)
 							subWhere = whereClause
 						}
 					}
@@ -3680,17 +3780,18 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 			}
 		case subSpec.Boxplot != nil:
 			b := t.Schema.ResolveField(subSpec.Boxplot.Field)
+			arrCol := b.EffectiveArrayColumn(true)
 			for _, pct := range []float64{0.0, 25.0, 50.0, 75.0, 100.0} {
 				q := pct / 100.0
 				pctKey := fmt.Sprintf("%.1f", pct)
 				if !isExplodedNested(b, subSpec.Boxplot.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 					valExpr := fmt.Sprintf("CAST(%s AS DOUBLE)", subElemAlias)
-					subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, b.ColumnName, subTableAlias, subElemAlias)
+					subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
 					subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, subElemAlias)
 					if subSpec.Boxplot.Missing != nil {
 						if mf, ok := resolveHistogramMissingFloat(subSpec.Boxplot.Missing); ok {
 							valExpr = fmt.Sprintf("COALESCE(CAST(%s AS DOUBLE), %s)", subElemAlias, strconv.FormatFloat(mf, 'f', -1, 64))
-							subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", fromClause, b.ColumnName, b.ColumnName, b.ColumnName, subTableAlias, subElemAlias)
+							subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", fromClause, arrCol, arrCol, arrCol, subTableAlias, subElemAlias)
 							subWhere = whereClause
 						}
 					}
@@ -3720,6 +3821,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 			}
 		case subSpec.PercentileRanks != nil:
 			b := t.Schema.ResolveField(subSpec.PercentileRanks.Field)
+			arrCol := b.EffectiveArrayColumn(true)
 			for _, v := range subSpec.PercentileRanks.Values {
 				valKey := strconv.FormatFloat(v, 'f', -1, 64)
 				if !strings.Contains(valKey, ".") {
@@ -3728,12 +3830,12 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 				valLit := strconv.FormatFloat(v, 'f', -1, 64)
 				if !isExplodedNested(b, subSpec.PercentileRanks.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 					valExpr := fmt.Sprintf("CAST(%s AS DOUBLE)", subElemAlias)
-					subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, b.ColumnName, subTableAlias, subElemAlias)
+					subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
 					subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, subElemAlias)
 					if subSpec.PercentileRanks.Missing != nil {
 						if mf, ok := resolveHistogramMissingFloat(subSpec.PercentileRanks.Missing); ok {
 							valExpr = fmt.Sprintf("COALESCE(CAST(%s AS DOUBLE), %s)", subElemAlias, strconv.FormatFloat(mf, 'f', -1, 64))
-							subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", fromClause, b.ColumnName, b.ColumnName, b.ColumnName, subTableAlias, subElemAlias)
+							subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", fromClause, arrCol, arrCol, arrCol, subTableAlias, subElemAlias)
 							subWhere = whereClause
 						}
 					}
@@ -3764,10 +3866,11 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 			}
 		case subSpec.StringStats != nil:
 			b := t.Schema.ResolveField(subSpec.StringStats.Field)
+			arrCol := b.EffectiveArrayColumn(true)
 			var lenExpr, subFrom, subWhere string
 			if !isExplodedNested(b, subSpec.StringStats.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 				lenExpr = fmt.Sprintf("CAST(CHAR_LENGTH(CAST(%s AS STRING)) AS DOUBLE)", subElemAlias)
-				subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, b.ColumnName, subTableAlias, subElemAlias)
+				subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
 				subWhere = fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, subElemAlias)
 			} else {
 				col := t.sqlColumnRef(subSpec.StringStats.Field, true, nctx)
@@ -3837,13 +3940,14 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 			}
 		case subSpec.ValueCount != nil:
 			b := t.Schema.ResolveField(subSpec.ValueCount.Field)
+			arrCol := b.EffectiveArrayColumn(true)
 			if !isExplodedNested(b, subSpec.ValueCount.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 				valExpr := subElemAlias
-				subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, b.ColumnName, subTableAlias, subElemAlias)
+				subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
 				subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, subElemAlias)
 				if subSpec.ValueCount.Missing != nil {
 					valExpr = fmt.Sprintf("COALESCE(%s, %s)", subElemAlias, quoteStr(formatMissingScalar(subSpec.ValueCount.Missing)))
-					subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", fromClause, b.ColumnName, b.ColumnName, b.ColumnName, subTableAlias, subElemAlias)
+					subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", fromClause, arrCol, arrCol, arrCol, subTableAlias, subElemAlias)
 					subWhere = whereClause
 				}
 				*branches = append(*branches, fmt.Sprintf(
@@ -3956,6 +4060,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 			intervalMs := subSpec.DateHistogram.EffectiveIntervalMs()
 			tzShiftMs := subSpec.DateHistogram.EffectiveTimeZoneOffsetMs() - subSpec.DateHistogram.EffectiveOffsetMs()
 			b := t.Schema.ResolveField(subSpec.DateHistogram.Field)
+			arrCol := b.EffectiveArrayColumn(true)
 			subFrom := fromClause
 			var col, notNullExpr string
 			hasMissing := false
@@ -3965,10 +4070,10 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 			} else if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
 				col = fmt.Sprintf("CAST(%s AS DOUBLE)", subElemAlias)
 				notNullExpr = subElemAlias
-				subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, b.ColumnName, subTableAlias, subElemAlias)
+				subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
 				if subSpec.DateHistogram.Missing != nil {
 					if missMs, ok := t.resolveDateHistogramMissingMs(subSpec.DateHistogram.Missing); ok {
-						subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", fromClause, b.ColumnName, b.ColumnName, b.ColumnName, subTableAlias, subElemAlias)
+						subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", fromClause, arrCol, arrCol, arrCol, subTableAlias, subElemAlias)
 						col = fmt.Sprintf("COALESCE(CAST(%s AS DOUBLE), %d)", subElemAlias, missMs)
 						hasMissing = true
 					}
@@ -4007,6 +4112,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 			}
 			offset := subSpec.Histogram.Offset
 			b := t.Schema.ResolveField(subSpec.Histogram.Field)
+			arrCol := b.EffectiveArrayColumn(true)
 			subFrom := fromClause
 			var col, notNullExpr string
 			hasMissing := false
@@ -4016,10 +4122,10 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 			} else if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
 				col = fmt.Sprintf("CAST(%s AS DOUBLE)", subElemAlias)
 				notNullExpr = subElemAlias
-				subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, b.ColumnName, subTableAlias, subElemAlias)
+				subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
 				if subSpec.Histogram.Missing != nil {
 					if missVal, ok := resolveHistogramMissingFloat(subSpec.Histogram.Missing); ok {
-						subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", fromClause, b.ColumnName, b.ColumnName, b.ColumnName, subTableAlias, subElemAlias)
+						subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", fromClause, arrCol, arrCol, arrCol, subTableAlias, subElemAlias)
 						col = fmt.Sprintf("COALESCE(CAST(%s AS DOUBLE), %s)", subElemAlias, strconv.FormatFloat(missVal, 'f', -1, 64))
 						hasMissing = true
 					}
@@ -4052,6 +4158,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 			rngSpec := subSpec.EffectiveRange()
 			now := time.Now().UTC()
 			b := t.Schema.ResolveField(rngSpec.Field)
+			arrCol := b.EffectiveArrayColumn(true)
 			isArray := !isExplodedNested(b, rngSpec.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield)
 			for _, rng := range rngSpec.Ranges {
 				var rWhere string
@@ -4101,9 +4208,9 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					}
 					if isArray {
 						if len(conds) == 0 {
-							rWhere = fmt.Sprintf("(`%s` IS NOT NULL AND array_size(`%s`) > 0)", b.ColumnName, b.ColumnName)
+							rWhere = fmt.Sprintf("(`%s` IS NOT NULL AND array_size(`%s`) > 0)", arrCol, arrCol)
 						} else {
-							rWhere = fmt.Sprintf("array_exists(_x -> %s, `%s`)", strings.Join(conds, " AND "), b.ColumnName)
+							rWhere = fmt.Sprintf("array_exists(_x -> %s, `%s`)", strings.Join(conds, " AND "), arrCol)
 						}
 					} else {
 						rWhere = strings.Join(conds, " AND ")
@@ -4117,9 +4224,9 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 						elemConds = append(elemConds, fmt.Sprintf("CAST(_x AS DOUBLE) < %s", quoteValue(t.coerceRangeAggBoundWithNow(rngSpec.Field, rng.To, now))))
 					}
 					if len(elemConds) == 0 {
-						rWhere = fmt.Sprintf("(`%s` IS NOT NULL AND array_size(`%s`) > 0)", b.ColumnName, b.ColumnName)
+						rWhere = fmt.Sprintf("(`%s` IS NOT NULL AND array_size(`%s`) > 0)", arrCol, arrCol)
 					} else {
-						rWhere = fmt.Sprintf("array_exists(_x -> %s, `%s`)", strings.Join(elemConds, " AND "), b.ColumnName)
+						rWhere = fmt.Sprintf("array_exists(_x -> %s, `%s`)", strings.Join(elemConds, " AND "), arrCol)
 					}
 				} else {
 					col := t.sqlNumericColumnRef(rngSpec.Field, nctx)
@@ -4243,6 +4350,9 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 			}
 		case subSpec.TopHits != nil:
 			size := subSpec.TopHits.EffectiveFetchLimit()
+			if topHitsNeedsRuntimeSort(subSpec.TopHits.Sort) && size < 100 {
+				size = 100
+			}
 			orderBy := t.compileTopHitsOrderBy(subSpec.TopHits.Sort)
 			*subIdx++
 			*branches = append(*branches, fmt.Sprintf(
@@ -4366,6 +4476,18 @@ func parseCIDRBounds(s string) (int64, int64, bool) {
 	return int64(startNum), int64(endNum), true
 }
 
+func topHitsNeedsRuntimeSort(sorts []esast.SortSpec) bool {
+	if len(sorts) == 0 {
+		return true
+	}
+	for _, s := range sorts {
+		if s.Entry.Field == "_score" || s.Entry.Field == "_script" || s.Entry.Field == "_geo_distance" {
+			return true
+		}
+	}
+	return false
+}
+
 func (t *Transpiler) compileTopHitsOrderBy(sorts []esast.SortSpec) string {
 	var filtered []esast.SortSpec
 	for _, s := range sorts {
@@ -4417,12 +4539,68 @@ func (t *Transpiler) appendBucketScopedSubAggs(
 }
 
 func (t *Transpiler) appendMetricAggBranch(branches *[]string, fullAggName, sqlFunc, field, extraWhere string) {
-	t.appendMetricAggBranchWithMissing(branches, fullAggName, sqlFunc, field, extraWhere, nil)
+	t.appendMetricAggBranchWithMissingAndScript(branches, fullAggName, sqlFunc, field, extraWhere, nil, nil)
 }
 
-func (t *Transpiler) appendMetricAggBranchWithMissing(branches *[]string, fullAggName, sqlFunc, field, extraWhere string, missing any) {
+func (t *Transpiler) compileMetricScriptExpr(script any, nctx *nestedCtx) (string, bool) {
+	if script == nil {
+		return "", false
+	}
+	var scriptMap map[string]any
+	switch sc := script.(type) {
+	case string:
+		scriptMap = map[string]any{"source": sc}
+	case map[string]any:
+		scriptMap = sc
+	default:
+		return "", false
+	}
+	src, _ := scriptMap["source"].(string)
+	if src == "" {
+		src, _ = scriptMap["inline"].(string)
+	}
+	s := strings.TrimSpace(src)
+	for strings.HasPrefix(s, "{") && strings.HasSuffix(s, "}") {
+		s = strings.TrimSpace(s[1 : len(s)-1])
+	}
+	for strings.HasSuffix(s, ";") {
+		s = strings.TrimSpace(strings.TrimSuffix(s, ";"))
+	}
+	if strings.HasPrefix(s, "return") && (len(s) == 6 || s[6] == ' ' || s[6] == '\t' || s[6] == '(') {
+		s = strings.TrimSpace(s[6:])
+	}
+	for strings.HasSuffix(s, ";") {
+		s = strings.TrimSpace(strings.TrimSuffix(s, ";"))
+	}
+	if s == "" {
+		return "", false
+	}
+	params, _ := scriptMap["params"].(map[string]any)
+	compiled, ok := t.parseSafeThresholdExpr(s, params, 0, nctx, 0)
+	if !ok || compiled == "" {
+		return "", false
+	}
+	return fmt.Sprintf("CAST(%s AS DOUBLE)", compiled), true
+}
+
+func (t *Transpiler) appendMetricAggBranchWithMissingAndScript(branches *[]string, fullAggName, sqlFunc, field, extraWhere string, missing any, script any) {
+	if field == "" && script != nil {
+		if scriptExpr, ok := t.compileMetricScriptExpr(script, nil); ok {
+			wClause := ""
+			if extraWhere != "" {
+				wClause = " WHERE " + extraWhere
+			}
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT %s AS `_agg_name`, '_metric' AS `_bucket_key`, CAST(COALESCE(%s(%s), 0) AS DOUBLE) AS `_doc_count` "+
+					"FROM `base_matched`%s",
+				quoteStr(fullAggName), sqlFunc, scriptExpr, wClause,
+			))
+			return
+		}
+	}
 	b := t.Schema.ResolveField(field)
 	if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
+		arrCol := b.EffectiveArrayColumn(true)
 		wherePrefix := ""
 		if extraWhere != "" {
 			wherePrefix = fmt.Sprintf("(%s) AND ", extraWhere)
@@ -4436,7 +4614,7 @@ func (t *Transpiler) appendMetricAggBranchWithMissing(branches *[]string, fullAg
 				*branches = append(*branches, fmt.Sprintf(
 					"SELECT %s AS `_agg_name`, '_metric' AS `_bucket_key`, CAST(COALESCE(%s(COALESCE(CAST(`_nel` AS DOUBLE), %s)), 0) AS DOUBLE) AS `_doc_count` "+
 						"FROM `base_matched` LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) `_nt` AS `_nel`%s",
-					quoteStr(fullAggName), sqlFunc, strconv.FormatFloat(mf, 'f', -1, 64), b.ColumnName, b.ColumnName, b.ColumnName, wClause,
+					quoteStr(fullAggName), sqlFunc, strconv.FormatFloat(mf, 'f', -1, 64), arrCol, arrCol, arrCol, wClause,
 				))
 				return
 			}
@@ -4444,7 +4622,7 @@ func (t *Transpiler) appendMetricAggBranchWithMissing(branches *[]string, fullAg
 		*branches = append(*branches, fmt.Sprintf(
 			"SELECT %s AS `_agg_name`, '_metric' AS `_bucket_key`, CAST(COALESCE(%s(CAST(`_nel` AS DOUBLE)), 0) AS DOUBLE) AS `_doc_count` "+
 				"FROM `base_matched` LATERAL VIEW EXPLODE(`%s`) `_nt` AS `_nel` WHERE %s`_nel` IS NOT NULL",
-			quoteStr(fullAggName), sqlFunc, b.ColumnName, wherePrefix,
+			quoteStr(fullAggName), sqlFunc, arrCol, wherePrefix,
 		))
 		return
 	}
@@ -4597,6 +4775,21 @@ func (t *Transpiler) parseSafeThresholdExpr(s string, params map[string]any, num
 			return fmt.Sprintf("%s(%s, %s)", fnSpec.sqlFn, c1, c2), true
 		}
 	}
+	for _, fnSpec := range []struct{ prefix, sqlFn string }{
+		{"Math.floor(", "FLOOR"},
+		{"Math.ceil(", "CEIL"},
+		{"Math.abs(", "ABS"},
+		{"Math.round(", "ROUND"},
+	} {
+		if strings.HasPrefix(s, fnSpec.prefix) && strings.HasSuffix(s, ")") {
+			inner := s[len(fnSpec.prefix) : len(s)-1]
+			c1, ok1 := t.parseSafeThresholdExpr(inner, params, numTerms, nctx, depth+1)
+			if !ok1 {
+				return "", false
+			}
+			return fmt.Sprintf("%s(%s)", fnSpec.sqlFn, c1), true
+		}
+	}
 	if strings.HasPrefix(s, "doc['") {
 		rest := s[len("doc['"):]
 		end := strings.Index(rest, "']")
@@ -4610,10 +4803,7 @@ func (t *Transpiler) parseSafeThresholdExpr(s string, params map[string]any, num
 		}
 		b := t.Schema.ResolveField(field)
 		if (tail == ".size()" || tail == ".length") && (b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && nctx == nil)) {
-			colName := b.ColumnName
-			if colName == "" {
-				colName = b.PrefilterArrayCol
-			}
+			colName := b.EffectiveArrayColumn(true)
 			if colName != "" {
 				return fmt.Sprintf("COALESCE(array_size(`%s`), 0)", colName), true
 			}
@@ -4771,6 +4961,8 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 			orderPart := col + " " + dir
 			if strings.EqualFold(s.Entry.Missing, "_first") {
 				orderPart += " NULLS FIRST"
+			} else if missingSQL == "" && (strings.EqualFold(s.Entry.Missing, "_last") || dir == "ASC") {
+				orderPart += " NULLS LAST"
 			}
 			parts = append(parts, orderPart)
 		}
@@ -4830,6 +5022,21 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 						val = ms
 					}
 				}
+			} else if b.ESType == "date_nanos" {
+				switch nv := val.(type) {
+				case int64:
+					if nv > 1_000_000_000_000_000 {
+						val = nv / 1_000_000
+					}
+				case float64:
+					if nv > 1e15 {
+						val = int64(nv) / 1_000_000
+					}
+				case json.Number:
+					if i, err := nv.Int64(); err == nil && i > 1_000_000_000_000_000 {
+						val = i / 1_000_000
+					}
+				}
 			}
 			sampleForCol := val
 			if sampleForCol == nil {
@@ -4857,7 +5064,7 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 		colI, valI, hasCoalesce := sortExpr(i)
 		missingFirst := strings.EqualFold(effectiveSorts[i].Entry.Missing, "_first")
 		if valI == nil {
-			if !missingFirst && (strings.EqualFold(effectiveSorts[i].Entry.Missing, "_last") || strings.EqualFold(effectiveSorts[i].Entry.Order, "desc")) {
+			if !missingFirst {
 				conjuncts = append(conjuncts, "FALSE")
 			} else {
 				conjuncts = append(conjuncts, fmt.Sprintf("%s IS NOT NULL", colI))
@@ -4903,20 +5110,18 @@ func (t *Transpiler) sqlSortColumnRef(field string, sampleVal any, desc bool, mo
 	}
 	switch b.Kind {
 	case schema.StoragePromotedArray:
-		colName := b.ColumnName
-		if b.KeywordCompanion != "" && b.KeywordNormalizer {
-			colName = b.KeywordCompanion
-		}
+		colName := b.EffectiveArrayColumn(true)
 		if b.ESType == "ip" {
 			return fmt.Sprintf("%s(array_map(_x -> IPV4_STRING_TO_NUM_OR_NULL(_x), `%s`))", resolveArraySortFn(), colName)
 		}
 		return fmt.Sprintf("%s(`%s`)", resolveArraySortFn(), colName)
 	case schema.StorageNestedSubfield:
-		if b.PrefilterArrayCol != "" {
+		colName := b.EffectiveArrayColumn(true)
+		if colName != "" {
 			if b.ESType == "ip" {
-				return fmt.Sprintf("%s(array_map(_x -> IPV4_STRING_TO_NUM_OR_NULL(_x), `%s`))", resolveArraySortFn(), b.PrefilterArrayCol)
+				return fmt.Sprintf("%s(array_map(_x -> IPV4_STRING_TO_NUM_OR_NULL(_x), `%s`))", resolveArraySortFn(), colName)
 			}
-			return fmt.Sprintf("%s(`%s`)", resolveArraySortFn(), b.PrefilterArrayCol)
+			return fmt.Sprintf("%s(`%s`)", resolveArraySortFn(), colName)
 		}
 	case schema.StoragePromotedVector:
 		return fmt.Sprintf("element_at(`%s`, 1)", b.ColumnName)
@@ -4940,10 +5145,10 @@ func (t *Transpiler) sqlNumericColumnRef(field string, nctx *nestedCtx) string {
 		}
 		return fmt.Sprintf("CAST(`%s` AS DOUBLE)", b.ColumnName)
 	case schema.StoragePromotedArray, schema.StoragePromotedVector:
-		return fmt.Sprintf("CAST(element_at(`%s`, 1) AS DOUBLE)", b.ColumnName)
+		return fmt.Sprintf("CAST(element_at(`%s`, 1) AS DOUBLE)", b.EffectiveArrayColumn(true))
 	case schema.StorageNestedSubfield:
-		if nctx == nil && b.PrefilterArrayCol != "" {
-			return fmt.Sprintf("CAST(element_at(`%s`, 1) AS DOUBLE)", b.PrefilterArrayCol)
+		if (nctx == nil || nctx.nestedPath != b.NestedPath) && b.EffectiveArrayColumn(true) != "" {
+			return fmt.Sprintf("CAST(element_at(`%s`, 1) AS DOUBLE)", b.EffectiveArrayColumn(true))
 		}
 	}
 	return t.sqlTypedColumnRef(field, float64(0.5), false, nctx)

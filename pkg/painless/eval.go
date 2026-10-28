@@ -25,6 +25,7 @@ import (
 	"math"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -57,6 +58,7 @@ var (
 	reCompoundAssign      = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x04-]+)\s*(\+=|-=|\*=|/=)\s*(.+)$`)
 	reAssignParam         = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x04-]+)\s*=\s*(.+)$`)
 	reRemoveField         = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_.@/:?\x00-\x04-]+))?\.remove\(\s*(.+?)\s*\)$`)
+	reClearField          = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_.@/:?\x00-\x04-]+))?\.clear\(\s*\)$`)
 	reArrayAdd            = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x04-]+)\.add\(\s*(.+?)\s*\)$`)
 	reArrayAddAll         = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x04-]+)\.addAll\(\s*(.+?)\s*\)$`)
 	reMapPut              = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_.@/:?\x00-\x04-]+))?\.put\(\s*(.+?)\s*,\s*(.+?)\s*\)$`)
@@ -64,6 +66,7 @@ var (
 	reArrayRemoveIf       = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x04-]+)\.removeIf\(\s*([a-zA-Z0-9_]+)\s*->\s*([a-zA-Z0-9_]+)(?:\.([a-zA-Z0-9_.@/:?\x00-\x04-]+))?\s*==\s*(.+?)\s*\)$`)
 	reLocalIncDec         = regexp.MustCompile(`^(?:(\+\+|--)\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x04-]+)*)|([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x04-]+)*)\s*(\+\+|--))$`)
 	reLocalRemoveField    = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x04-]+)*)\.remove\(\s*(.+?)\s*\)$`)
+	reLocalClearField     = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x04-]+)*)\.clear\(\s*\)$`)
 	reLocalArrayAdd       = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x04-]+)*)\.add\(\s*(.+?)\s*\)$`)
 	reLocalArrayAddAll    = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x04-]+)*)\.addAll\(\s*(.+?)\s*\)$`)
 	reLocalMapPut         = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x04-]+)*)\.put\(\s*(.+?)\s*,\s*(.+?)\s*\)$`)
@@ -187,17 +190,49 @@ func Eval(sourceMap map[string]any, scriptSource string, params map[string]any) 
 		if strings.HasPrefix(lastStmt, "return ") || strings.HasPrefix(lastStmt, "return(") {
 			lastStmt = strings.TrimSpace(strings.TrimPrefix(lastStmt, "return"))
 		}
-		if lastStmt != "" && lastStmt != "return" && !strings.HasPrefix(lastStmt, "if ") && !strings.HasPrefix(lastStmt, "if(") && !strings.HasPrefix(lastStmt, "for ") && !strings.HasPrefix(lastStmt, "for(") && !strings.Contains(lastStmt, " = ") {
+		if lastStmt != "" && lastStmt != "return" && !strings.HasPrefix(lastStmt, "if ") && !strings.HasPrefix(lastStmt, "if(") && !strings.HasPrefix(lastStmt, "for ") && !strings.HasPrefix(lastStmt, "for(") && !strings.HasPrefix(lastStmt, "while ") && !strings.HasPrefix(lastStmt, "while(") && !isTopLevelAssignmentStmt(lastStmt) {
 			val, evalErr := evalRHSExpr(sourceMap, lastStmt, evalParams)
 			if evalErr == nil && val != nil {
 				return val, nil
 			}
-			if strings.ContainsAny(lastStmt, "><=!&|") || strings.Contains(lastStmt, ".empty") || strings.Contains(lastStmt, ".contains(") || strings.Contains(lastStmt, ".startsWith(") || strings.Contains(lastStmt, ".endsWith(") || strings.Contains(lastStmt, ".isEmpty()") {
+			if strings.ContainsAny(lastStmt, "><=!&|") || strings.Contains(lastStmt, ".empty") || strings.Contains(lastStmt, ".contains(") || strings.Contains(lastStmt, ".startsWith(") || strings.Contains(lastStmt, ".endsWith(") || strings.Contains(lastStmt, ".isEmpty()") || strings.Contains(lastStmt, ".matches(") || strings.Contains(lastStmt, ".containsKey(") {
 				return evalCondition(sourceMap, lastStmt, evalParams), nil
 			}
 		}
 	}
 	return nil, nil
+}
+
+func isTopLevelAssignmentStmt(s string) bool {
+	depth := 0
+	inQuotes := byte(0)
+	inRegexClass := false
+	for i := 0; i < len(s); i++ {
+		if stepQuoteState(s, i, &inQuotes, &inRegexClass) {
+			continue
+		}
+		c := s[i]
+		switch c {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		case '=':
+			if depth == 0 {
+				if i+1 < len(s) && (s[i+1] == '=' || s[i+1] == '~') {
+					i++
+					continue
+				}
+				if i > 0 && (s[i-1] == '=' || s[i-1] == '!' || s[i-1] == '<' || s[i-1] == '>') {
+					continue
+				}
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // EvalNumber evaluates a Painless script and coerces the result to float64.
@@ -330,7 +365,44 @@ func execBlock(sourceMap map[string]any, block string, params map[string]any, ct
 			}
 			continue
 		}
+		if strings.HasPrefix(stmt, "while") && (len(stmt) == 5 || stmt[5] == ' ' || stmt[5] == '(') {
+			if err := execWhileStatement(sourceMap, stmt, params, ctxOp, budget); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := execSimpleStmt(sourceMap, stmt, params, ctxOp, budget); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func execWhileStatement(sourceMap map[string]any, stmt string, params map[string]any, ctxOp *string, budget *evalBudget) error {
+	openParen := strings.IndexByte(stmt, '(')
+	closeParen := findMatchingDelimiter(stmt, openParen, '(', ')')
+	if openParen < 0 || closeParen < 0 {
+		return nil
+	}
+	cond := strings.TrimSpace(stmt[openParen+1 : closeParen])
+	body := strings.TrimSpace(stmt[closeParen+1:])
+	if strings.HasPrefix(body, "{") && strings.HasSuffix(body, "}") {
+		body = body[1 : len(body)-1]
+	}
+	for {
+		if err := budget.step(); err != nil {
+			return err
+		}
+		if cond != "" && !evalCondition(sourceMap, cond, params) {
+			break
+		}
+		if err := execBlock(sourceMap, body, params, ctxOp, budget); err != nil {
+			if errors.Is(err, errPainlessBreak) {
+				break
+			}
+			if errors.Is(err, errPainlessContinue) {
+				continue
+			}
 			return err
 		}
 	}
@@ -428,9 +500,18 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 		varName = fields[len(fields)-1]
 	}
 
-	iterVal, err := evalRHSExpr(sourceMap, iterExpr, params)
-	if err != nil {
-		return err
+	var iterVal any
+	expIter := strings.TrimSpace(expandDynamicBrackets(iterExpr, sourceMap, params, 0))
+	if (strings.HasPrefix(expIter, "doc.") || strings.HasPrefix(expIter, "doc?.")) &&
+		!strings.HasSuffix(expIter, ".value") && !strings.Contains(expIter, ".values.") {
+		docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(expIter, "doc?."), "doc."), ".values")
+		iterVal = resolveDocValuesSlice(sourceMap, docPath)
+	} else {
+		var err error
+		iterVal, err = evalRHSExpr(sourceMap, iterExpr, params)
+		if err != nil {
+			return err
+		}
 	}
 	slice, ok := iterVal.([]any)
 	if !ok {
@@ -757,7 +838,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		return nil
 	}
 
-	// 6. Check `.remove('field')` or `.remove(params.key)` or `.remove(0)`
+	// 6. Check `.remove('field')` or `.remove(params.key)` or `.remove(0)` or `.clear()`
 	if m := reRemoveField.FindStringSubmatch(stmt); m != nil {
 		var parentPath []string
 		if m[1] != "" {
@@ -770,8 +851,16 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		removeKeyOrIndexAtPath(sourceMap, parentPath, argVal)
 		return nil
 	}
+	if m := reClearField.FindStringSubmatch(stmt); m != nil {
+		var targetPath []string
+		if m[1] != "" {
+			targetPath = strings.Split(m[1], ".")
+		}
+		clearAtPath(sourceMap, targetPath)
+		return nil
+	}
 
-	// 6b. Check `.removeIf`, `.addAll`, `.add`, `.putAll`, `.put`, `.remove` on local/loop variables
+	// 6b. Check `.removeIf`, `.addAll`, `.add`, `.putAll`, `.put`, `.remove`, `.clear` on local/loop variables
 	if m := reLocalArrayRemoveIf.FindStringSubmatch(stmt); m != nil {
 		arrPath := strings.Split(m[1], ".")
 		rootVar := decodeBracketSeg(arrPath[0])
@@ -873,6 +962,15 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			return nil
 		}
 	}
+	if m := reLocalClearField.FindStringSubmatch(stmt); m != nil {
+		targetPath := strings.Split(m[1], ".")
+		rootVar := decodeBracketSeg(targetPath[0])
+		if _, ok := params[rootVar]; ok {
+			clearAtPath(params, targetPath)
+			syncLocalVarAlias(sourceMap, params, rootVar)
+			return nil
+		}
+	}
 
 	// 7. Check compound assignment `+=` / `-=` / `*=` / `/=`
 	if m := reCompoundAssign.FindStringSubmatch(stmt); m != nil {
@@ -897,7 +995,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 	}
 
 	// 8. Check field assignment (`ctx._source.deleted = params.deleted`, arithmetic, or literal)
-	if m := reAssignParam.FindStringSubmatch(stmt); m != nil {
+	if m := reAssignParam.FindStringSubmatch(stmt); m != nil && !strings.HasPrefix(strings.TrimSpace(m[2]), "=") && !strings.HasPrefix(strings.TrimSpace(m[2]), "~") {
 		lhsPath := strings.Split(m[1], ".")
 		rhsExpr := strings.TrimSpace(m[2])
 		val, err := evalRHSExpr(sourceMap, rhsExpr, params)
@@ -935,7 +1033,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 	}
 
 	// 10. Check local/loop variable property/index assignment (`tag.status = 'active'`, `items[0] = 'x'`)
-	if m := reLocalPropAssign.FindStringSubmatch(stmt); m != nil {
+	if m := reLocalPropAssign.FindStringSubmatch(stmt); m != nil && m[1] != "doc" && !strings.HasPrefix(strings.TrimSpace(m[3]), "=") && !strings.HasPrefix(strings.TrimSpace(m[3]), "~") {
 		varName := m[1]
 		propPath := strings.Split(m[2], ".")
 		rhsExpr := strings.TrimSpace(m[3])
@@ -949,7 +1047,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 	}
 
 	// 11. Check local variable declaration/assignment (`def x = ...`, `boolean ok = ...`, `x = ...`)
-	if m := reLocalVarAssign.FindStringSubmatch(stmt); m != nil {
+	if m := reLocalVarAssign.FindStringSubmatch(stmt); m != nil && !strings.HasPrefix(strings.TrimSpace(m[2]), "=") && !strings.HasPrefix(strings.TrimSpace(m[2]), "~") {
 		varName := m[1]
 		rhsExpr := strings.TrimSpace(m[2])
 		val, err := evalRHSExpr(sourceMap, rhsExpr, params)
@@ -1249,69 +1347,13 @@ func evalConditionDepth(sourceMap map[string]any, cond string, params map[string
 		return evalInstanceOfPainless(lhs, typeName)
 	}
 
-	// Check `.contains(...)`
-	if recExpr, argExpr, ok := matchTrailingMethodCallPainless(cond, ".contains("); ok {
-		lhsVal, _ := evalRHSExprDepth(sourceMap, recExpr, params, depth+1)
-		argVal, _ := evalRHSExprDepth(sourceMap, argExpr, params, depth+1)
-		switch tv := lhsVal.(type) {
-		case []any:
-			for _, item := range tv {
-				if valuesEqual(item, argVal) {
-					return true
-				}
-			}
-		case string:
-			if argVal != nil {
-				return strings.Contains(tv, fmt.Sprintf("%v", argVal))
-			}
-		}
-		return false
-	}
-
-	// Check `.startsWith(...)` and `.endsWith(...)`
-	for _, mSpec := range []struct {
-		name   string
-		prefix bool
-	}{
-		{".startsWith(", true},
-		{".endsWith(", false},
-	} {
-		if recExpr, argExpr, ok := matchTrailingMethodCallPainless(cond, mSpec.name); ok {
-			lhsVal, _ := evalRHSExprDepth(sourceMap, recExpr, params, depth+1)
-			argVal, _ := evalRHSExprDepth(sourceMap, argExpr, params, depth+1)
-			if s, ok := lhsVal.(string); ok && argVal != nil {
-				sub := fmt.Sprintf("%v", argVal)
-				if mSpec.prefix {
-					return strings.HasPrefix(s, sub)
-				}
-				return strings.HasSuffix(s, sub)
-			}
-			return false
-		}
-	}
-
 	// Check `.isEmpty()`
 	if strings.HasSuffix(cond, ".isEmpty()") {
-		lhsExpr := strings.TrimSpace(strings.TrimSuffix(cond[:len(cond)-len(".isEmpty()")], "?"))
-		lhsVal, _ := evalRHSExprDepth(sourceMap, lhsExpr, params, depth+1)
-		switch tv := lhsVal.(type) {
-		case string:
-			return len(tv) == 0
-		case []any:
-			return len(tv) == 0
-		case map[string]any:
-			return len(tv) == 0
-		}
-		return false
-	}
-
-	// Check `.containsKey(...)`
-	if recExpr, argExpr, ok := matchTrailingMethodCallPainless(cond, ".containsKey("); ok {
-		lhsVal, _ := evalRHSExprDepth(sourceMap, recExpr, params, depth+1)
-		argVal, _ := evalRHSExprDepth(sourceMap, argExpr, params, depth+1)
-		if m, ok := lhsVal.(map[string]any); ok {
-			_, exists := m[fmt.Sprintf("%v", argVal)]
-			return exists
+		val, err := evalRHSExprDepth(sourceMap, cond, params, depth+1)
+		if err == nil {
+			if b, ok := val.(bool); ok {
+				return b
+			}
 		}
 		return false
 	}
@@ -1438,11 +1480,12 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		return applyArithmetic(int64(0), innerVal, false), nil
 	}
 
-	// Check trailing zero-arg methods `.toLowerCase()`, `.toUpperCase()`, `.trim()`, `.length()`, `.size()`
-	for _, mSuffix := range []string{".toLowerCase()", ".toUpperCase()", ".trim()", ".length()", ".size()"} {
+	// Check trailing zero-arg methods `.toLowerCase()`, `.toUpperCase()`, `.trim()`, `.length()`, `.size()`, `.keySet()`, `.values()`, `.toString()`
+	for _, mSuffix := range []string{".toLowerCase()", ".toUpperCase()", ".trim()", ".length()", ".size()", ".keySet()", ".values()", ".toString()"} {
 		if strings.HasSuffix(rhs, mSuffix) {
 			recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:len(rhs)-len(mSuffix)], "?"))
-			if (mSuffix == ".length()" || mSuffix == ".size()") && (strings.HasPrefix(recExpr, "doc.") || strings.HasPrefix(recExpr, "doc?.")) {
+			if (mSuffix == ".length()" || mSuffix == ".size()") && (strings.HasPrefix(recExpr, "doc.") || strings.HasPrefix(recExpr, "doc?.")) &&
+				!strings.HasSuffix(recExpr, ".value") && !strings.Contains(recExpr, ".values.") {
 				docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(recExpr, "doc?."), "doc."), ".values")
 				return int64(len(resolveDocValuesSlice(sourceMap, docPath))), nil
 			}
@@ -1457,6 +1500,39 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				return strings.ToUpper(fmt.Sprintf("%v", recVal)), nil
 			case ".trim()":
 				return strings.TrimSpace(fmt.Sprintf("%v", recVal)), nil
+			case ".toString()":
+				return fmt.Sprintf("%v", recVal), nil
+			case ".keySet()":
+				if tv, ok := recVal.(map[string]any); ok {
+					keys := make([]string, 0, len(tv))
+					for k := range tv {
+						keys = append(keys, k)
+					}
+					sort.Strings(keys)
+					out := make([]any, len(keys))
+					for i, k := range keys {
+						out[i] = k
+					}
+					return out, nil
+				}
+				return []any{}, nil
+			case ".values()":
+				if tv, ok := recVal.(map[string]any); ok {
+					keys := make([]string, 0, len(tv))
+					for k := range tv {
+						keys = append(keys, k)
+					}
+					sort.Strings(keys)
+					out := make([]any, len(keys))
+					for i, k := range keys {
+						out[i] = tv[k]
+					}
+					return out, nil
+				}
+				if tv, ok := recVal.([]any); ok {
+					return tv, nil
+				}
+				return []any{}, nil
 			case ".length()", ".size()":
 				switch tv := recVal.(type) {
 				case string:
@@ -1472,13 +1548,14 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 
 	if strings.HasSuffix(rhs, ".isEmpty()") {
 		recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:len(rhs)-len(".isEmpty()")], "?"))
-		if strings.HasPrefix(recExpr, "doc.") || strings.HasPrefix(recExpr, "doc?.") {
+		if (strings.HasPrefix(recExpr, "doc.") || strings.HasPrefix(recExpr, "doc?.")) &&
+			!strings.HasSuffix(recExpr, ".value") && !strings.Contains(recExpr, ".values.") {
 			docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(recExpr, "doc?."), "doc."), ".values")
 			return len(resolveDocValuesSlice(sourceMap, docPath)) == 0, nil
 		}
 		recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1)
 		if err != nil || recVal == nil {
-			return nil, err
+			return false, err
 		}
 		switch tv := recVal.(type) {
 		case string:
@@ -1491,10 +1568,38 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		return false, nil
 	}
 
-	for _, mName := range []string{".startsWith(", ".endsWith(", ".contains(", ".containsKey(", ".get(", ".indexOf(", ".split(", ".replace(", ".substring(", ".subList("} {
+	for _, mName := range []string{
+		".startsWith(", ".endsWith(", ".contains(", ".containsKey(", ".getOrDefault(", ".get(",
+		".indexOf(", ".lastIndexOf(", ".charAt(", ".matches(", ".replaceAll(", ".replaceFirst(",
+		".split(", ".replace(", ".substring(", ".subList(", ".join(",
+	} {
 		if recExpr, argExpr, ok := matchTrailingMethodCallPainless(rhs, mName); ok {
-			recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1)
+			if mName == ".containsKey(" && (recExpr == "doc" || recExpr == "doc?") {
+				argVal, _ := evalRHSExprDepth(sourceMap, argExpr, params, depth+1)
+				if argVal == nil {
+					return false, nil
+				}
+				fieldPath := fmt.Sprintf("%v", argVal)
+				if len(resolveDocValuesSlice(sourceMap, fieldPath)) > 0 {
+					return true, nil
+				}
+				cleanPath := strings.TrimSuffix(fieldPath, ".keyword")
+				return resolveParamPath(sourceMap, strings.Split(cleanPath, ".")) != nil, nil
+			}
+			var recVal any
+			var err error
+			if (mName == ".contains(" || mName == ".indexOf(" || mName == ".lastIndexOf(" || mName == ".get(" || mName == ".subList(" || mName == ".join(") &&
+				(strings.HasPrefix(recExpr, "doc.") || strings.HasPrefix(recExpr, "doc?.")) &&
+				!strings.HasSuffix(recExpr, ".value") && !strings.Contains(recExpr, ".values.") {
+				docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(recExpr, "doc?."), "doc."), ".values")
+				recVal = resolveDocValuesSlice(sourceMap, docPath)
+			} else {
+				recVal, err = evalRHSExprDepth(sourceMap, recExpr, params, depth+1)
+			}
 			if err != nil || recVal == nil {
+				if mName == ".startsWith(" || mName == ".endsWith(" || mName == ".contains(" || mName == ".containsKey(" || mName == ".matches(" {
+					return false, err
+				}
 				return nil, err
 			}
 			switch mName {
@@ -1525,6 +1630,19 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					}
 				}
 				return []any{}, nil
+			case ".getOrDefault(":
+				args := splitTopLevelCommaPainless(argExpr)
+				if tv, ok := recVal.(map[string]any); ok && len(args) == 2 {
+					kVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+					defVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+					if kVal != nil {
+						if v, exists := tv[fmt.Sprintf("%v", kVal)]; exists && v != nil {
+							return v, nil
+						}
+					}
+					return defVal, nil
+				}
+				return nil, nil
 			case ".replace(":
 				args := splitTopLevelCommaPainless(argExpr)
 				if len(args) == 2 {
@@ -1532,6 +1650,33 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					newVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
 					if s, ok := recVal.(string); ok && oldVal != nil && newVal != nil {
 						return strings.ReplaceAll(s, fmt.Sprintf("%v", oldVal), fmt.Sprintf("%v", newVal)), nil
+					}
+				}
+				return recVal, nil
+			case ".replaceAll(", ".replaceFirst(":
+				args := splitTopLevelCommaPainless(argExpr)
+				if len(args) == 2 {
+					patVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+					replVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+					if s, ok := recVal.(string); ok && patVal != nil && replVal != nil {
+						patStr := fmt.Sprintf("%v", patVal)
+						if len(patStr) >= 2 && patStr[0] == '/' && patStr[len(patStr)-1] == '/' {
+							patStr = strings.ReplaceAll(patStr[1:len(patStr)-1], `\/`, `/`)
+						}
+						replStr := fmt.Sprintf("%v", replVal)
+						if re, err := regexp.Compile(patStr); err == nil {
+							if mName == ".replaceFirst(" {
+								if loc := re.FindStringIndex(s); loc != nil {
+									return s[:loc[0]] + re.ReplaceAllString(s[loc[0]:loc[1]], replStr) + s[loc[1]:], nil
+								}
+								return s, nil
+							}
+							return re.ReplaceAllString(s, replStr), nil
+						}
+						if mName == ".replaceFirst(" {
+							return strings.Replace(s, patStr, replStr, 1), nil
+						}
+						return strings.ReplaceAll(s, patStr, replStr), nil
 					}
 				}
 				return recVal, nil
@@ -1579,6 +1724,31 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					return strings.HasSuffix(s, fmt.Sprintf("%v", argVal)), nil
 				}
 				return false, nil
+			case ".matches(":
+				return evalRegexMatchPainless(recVal, argVal, true), nil
+			case ".charAt(":
+				if s, ok := recVal.(string); ok && argVal != nil {
+					if f, ok := toFloat64(argVal); ok {
+						idx := int(f)
+						if idx >= 0 && idx < len(s) {
+							return string(s[idx]), nil
+						}
+					}
+				}
+				return nil, nil
+			case ".join(":
+				if tv, ok := recVal.([]any); ok {
+					sep := ""
+					if argVal != nil {
+						sep = fmt.Sprintf("%v", argVal)
+					}
+					parts := make([]string, len(tv))
+					for i, item := range tv {
+						parts[i] = fmt.Sprintf("%v", item)
+					}
+					return strings.Join(parts, sep), nil
+				}
+				return fmt.Sprintf("%v", recVal), nil
 			case ".contains(":
 				switch tv := recVal.(type) {
 				case []any:
@@ -1627,6 +1797,20 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					}
 				}
 				return int64(-1), nil
+			case ".lastIndexOf(":
+				switch tv := recVal.(type) {
+				case string:
+					if argVal != nil {
+						return int64(strings.LastIndex(tv, fmt.Sprintf("%v", argVal))), nil
+					}
+				case []any:
+					for idx := len(tv) - 1; idx >= 0; idx-- {
+						if valuesEqual(tv[idx], argVal) {
+							return int64(idx), nil
+						}
+					}
+				}
+				return int64(-1), nil
 			case ".split(":
 				if s, ok := recVal.(string); ok && argVal != nil {
 					sepStr := fmt.Sprintf("%v", argVal)
@@ -1645,6 +1829,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				return []any{}, nil
 			}
 		}
+	}
+
+	if staticVal, handled, err := evalStaticCallPainless(sourceMap, rhs, params, depth+1); handled {
+		return staticVal, err
 	}
 
 	if callExpr, tailPath, ok := splitPostCallPropertyAccess(rhs); ok {
@@ -1673,17 +1861,33 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 	if strings.HasPrefix(rhs, "doc.") || strings.HasPrefix(rhs, "doc?.") {
 		trimmed := strings.TrimPrefix(strings.TrimPrefix(rhs, "doc?."), "doc.")
 		if strings.HasSuffix(trimmed, ".empty") {
-			dv := resolveDocValuesSlice(sourceMap, strings.TrimSuffix(trimmed, ".empty"))
+			base := strings.TrimSuffix(trimmed, ".empty")
+			if strings.HasSuffix(base, ".value") {
+				val, err := evalRHSExprDepth(sourceMap, "doc."+base, params, depth+1)
+				if err != nil || val == nil {
+					return true, err
+				}
+				return fmt.Sprintf("%v", val) == "", nil
+			}
+			dv := resolveDocValuesSlice(sourceMap, strings.TrimSuffix(base, ".values"))
 			return len(dv) == 0, nil
 		}
 		if strings.HasSuffix(trimmed, ".length") {
-			dv := resolveDocValuesSlice(sourceMap, strings.TrimSuffix(trimmed, ".length"))
+			base := strings.TrimSuffix(trimmed, ".length")
+			if strings.HasSuffix(base, ".value") {
+				val, err := evalRHSExprDepth(sourceMap, "doc."+base, params, depth+1)
+				if err != nil || val == nil {
+					return int64(0), err
+				}
+				return int64(len(fmt.Sprintf("%v", val))), nil
+			}
+			dv := resolveDocValuesSlice(sourceMap, strings.TrimSuffix(base, ".values"))
 			return int64(len(dv)), nil
 		}
 		if strings.HasSuffix(trimmed, ".values") {
 			return resolveDocValuesSlice(sourceMap, strings.TrimSuffix(trimmed, ".values")), nil
 		}
-		// Check `.values.<idx>` after bracket expansion (`doc['tags'].values[0]`)
+		// Check `.values.<idx>` or `.<idx>` after bracket expansion (`doc['tags'].values[0]` or `doc['tags'][0]`)
 		if idx := strings.LastIndex(trimmed, ".values."); idx > 0 {
 			dv := resolveDocValuesSlice(sourceMap, trimmed[:idx])
 			tailSeg := decodeBracketSeg(trimmed[idx+len(".values."):])
@@ -1692,11 +1896,50 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			}
 			return nil, nil
 		}
+		if lastDot := strings.LastIndexByte(trimmed, '.'); lastDot > 0 {
+			tailSeg := decodeBracketSeg(trimmed[lastDot+1:])
+			if isIntegerLiteral(tailSeg) {
+				dv := resolveDocValuesSlice(sourceMap, strings.TrimSuffix(trimmed[:lastDot], ".values"))
+				if sIdx, ok := parseSliceIndex(tailSeg, len(dv)); ok {
+					return dv[sIdx], nil
+				}
+				return nil, nil
+			}
+		}
 		dv := resolveDocValuesSlice(sourceMap, strings.TrimSuffix(trimmed, ".value"))
 		if len(dv) == 0 {
 			return nil, nil
 		}
 		return dv[0], nil
+	}
+	if strings.HasSuffix(rhs, ".empty") || strings.HasSuffix(rhs, ".length") {
+		isLen := strings.HasSuffix(rhs, ".length")
+		suf := ".empty"
+		if isLen {
+			suf = ".length"
+		}
+		recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:len(rhs)-len(suf)], "?"))
+		if recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1); err == nil && recVal != nil {
+			switch tv := recVal.(type) {
+			case string:
+				if isLen {
+					return int64(len(tv)), nil
+				}
+				return len(tv) == 0, nil
+			case []any:
+				if isLen {
+					return int64(len(tv)), nil
+				}
+				return len(tv) == 0, nil
+			case map[string]any:
+				if _, hasProp := tv[strings.TrimPrefix(suf, ".")]; !hasProp {
+					if isLen {
+						return int64(len(tv)), nil
+					}
+					return len(tv) == 0, nil
+				}
+			}
+		}
 	}
 	if rhs == "params" {
 		return params, nil
@@ -2208,7 +2451,7 @@ func parseSliceIndex(seg string, length int) (int, bool) {
 
 func resolveDocValuesSlice(sourceMap map[string]any, fieldPath string) []any {
 	if sourceMap == nil || fieldPath == "" {
-		return nil
+		return []any{}
 	}
 	val := resolveParamPath(sourceMap, strings.Split(fieldPath, "."))
 	if val == nil && (strings.HasSuffix(fieldPath, ".keyword") || strings.HasSuffix(fieldPath, "\x00keyword")) {
@@ -2216,7 +2459,7 @@ func resolveDocValuesSlice(sourceMap map[string]any, fieldPath string) []any {
 		val = resolveParamPath(sourceMap, strings.Split(kwTrimmed, "."))
 	}
 	if val == nil {
-		return nil
+		return []any{}
 	}
 	if slice, ok := val.([]any); ok {
 		out := make([]any, 0, len(slice))
@@ -2263,16 +2506,7 @@ func resolveParamPath(params map[string]any, path []string) any {
 		val, exists := m[seg]
 		if !exists {
 			if strings.Contains(seg, ".") {
-				subCurr := any(m)
-				for _, subSeg := range strings.Split(seg, ".") {
-					sm, sok := subCurr.(map[string]any)
-					if !sok {
-						subCurr = nil
-						break
-					}
-					subCurr = sm[subSeg]
-				}
-				val = subCurr
+				return resolveParamPath(m, append(strings.Split(seg, "."), path[i+1:]...))
 			} else if i < len(path)-1 {
 				decodedRest := make([]string, len(path)-i)
 				for j := i; j < len(path); j++ {
@@ -2557,4 +2791,180 @@ func deepMergeMap(dst, src map[string]any) {
 		}
 		dst[k] = v
 	}
+}
+
+func clearAtPath(root map[string]any, path []string) {
+	if len(path) == 0 {
+		for k := range root {
+			delete(root, k)
+		}
+		return
+	}
+	switch target := resolveParamPath(root, path).(type) {
+	case map[string]any:
+		for k := range target {
+			delete(target, k)
+		}
+	case []any:
+		setValueAtPath(root, path, []any{})
+	}
+}
+
+func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[string]any, depth int) (any, bool, error) {
+	openParen := strings.IndexByte(rhs, '(')
+	if openParen <= 0 || !strings.HasSuffix(rhs, ")") || findMatchingDelimiter(rhs, openParen, '(', ')') != len(rhs)-1 {
+		return nil, false, nil
+	}
+	fnName := strings.TrimSpace(rhs[:openParen])
+	argStr := strings.TrimSpace(rhs[openParen+1 : len(rhs)-1])
+	args := splitTopLevelCommaPainless(argStr)
+
+	evalNumArg := func(idx int) (float64, bool) {
+		if idx >= len(args) {
+			return 0, false
+		}
+		v, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[idx]), params, depth+1)
+		if err != nil || v == nil {
+			return 0, false
+		}
+		return toFloat64(v)
+	}
+	formatMathResult := func(res float64) any {
+		if math.IsNaN(res) || math.IsInf(res, 0) {
+			return float64(0)
+		}
+		if res >= float64(math.MinInt64) && res < float64(math.MaxInt64) && res == float64(int64(res)) {
+			return int64(res)
+		}
+		return res
+	}
+
+	switch fnName {
+	case "Math.abs":
+		if f, ok := evalNumArg(0); ok {
+			return formatMathResult(math.Abs(f)), true, nil
+		}
+		return int64(0), true, nil
+	case "Math.min":
+		f1, ok1 := evalNumArg(0)
+		f2, ok2 := evalNumArg(1)
+		if ok1 && ok2 {
+			return formatMathResult(math.Min(f1, f2)), true, nil
+		}
+		return int64(0), true, nil
+	case "Math.max":
+		f1, ok1 := evalNumArg(0)
+		f2, ok2 := evalNumArg(1)
+		if ok1 && ok2 {
+			return formatMathResult(math.Max(f1, f2)), true, nil
+		}
+		return int64(0), true, nil
+	case "Math.round":
+		if f, ok := evalNumArg(0); ok {
+			return int64(math.Floor(f + 0.5)), true, nil
+		}
+		return int64(0), true, nil
+	case "Math.floor":
+		if f, ok := evalNumArg(0); ok {
+			return math.Floor(f), true, nil
+		}
+		return float64(0), true, nil
+	case "Math.ceil":
+		if f, ok := evalNumArg(0); ok {
+			return math.Ceil(f), true, nil
+		}
+		return float64(0), true, nil
+	case "Math.pow":
+		f1, ok1 := evalNumArg(0)
+		f2, ok2 := evalNumArg(1)
+		if ok1 && ok2 {
+			return formatMathResult(math.Pow(f1, f2)), true, nil
+		}
+		return float64(0), true, nil
+	case "Math.sqrt":
+		if f, ok := evalNumArg(0); ok && f >= 0 {
+			return formatMathResult(math.Sqrt(f)), true, nil
+		}
+		return float64(0), true, nil
+	case "Math.log":
+		if f, ok := evalNumArg(0); ok && f > 0 {
+			return formatMathResult(math.Log(f)), true, nil
+		}
+		return float64(0), true, nil
+	case "Math.log10":
+		if f, ok := evalNumArg(0); ok && f > 0 {
+			return formatMathResult(math.Log10(f)), true, nil
+		}
+		return float64(0), true, nil
+	case "Math.exp":
+		if f, ok := evalNumArg(0); ok {
+			return formatMathResult(math.Exp(f)), true, nil
+		}
+		return float64(0), true, nil
+	case "Math.signum":
+		if f, ok := evalNumArg(0); ok {
+			if f > 0 {
+				return float64(1), true, nil
+			}
+			if f < 0 {
+				return float64(-1), true, nil
+			}
+		}
+		return float64(0), true, nil
+	case "Math.clamp":
+		v, ok1 := evalNumArg(0)
+		lo, ok2 := evalNumArg(1)
+		hi, ok3 := evalNumArg(2)
+		if ok1 && ok2 && ok3 {
+			return formatMathResult(math.Min(math.Max(v, lo), hi)), true, nil
+		}
+		return int64(0), true, nil
+	case "Integer.parseInt", "Long.parseLong":
+		if len(args) >= 1 {
+			v, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			base := 10
+			if len(args) >= 2 {
+				if bf, ok := evalNumArg(1); ok && int(bf) >= 2 && int(bf) <= 36 {
+					base = int(bf)
+				}
+			}
+			if iv, err := strconv.ParseInt(strings.TrimSpace(fmt.Sprintf("%v", v)), base, 64); err == nil {
+				return iv, true, nil
+			}
+		}
+		return int64(0), true, nil
+	case "Double.parseDouble", "Float.parseFloat":
+		if f, ok := evalNumArg(0); ok {
+			return f, true, nil
+		}
+		return float64(0), true, nil
+	case "String.valueOf":
+		if len(args) >= 1 {
+			v, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			return fmt.Sprintf("%v", v), true, nil
+		}
+		return "", true, nil
+	case "String.join":
+		if len(args) == 2 {
+			sepVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			colExpr := strings.TrimSpace(args[1])
+			var colVal any
+			if (strings.HasPrefix(colExpr, "doc.") || strings.HasPrefix(colExpr, "doc?.")) &&
+				!strings.HasSuffix(colExpr, ".value") && !strings.Contains(colExpr, ".values.") {
+				docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(colExpr, "doc?."), "doc."), ".values")
+				colVal = resolveDocValuesSlice(sourceMap, docPath)
+			} else {
+				colVal, _ = evalRHSExprDepth(sourceMap, colExpr, params, depth+1)
+			}
+			if tv, ok := colVal.([]any); ok {
+				parts := make([]string, len(tv))
+				for i, item := range tv {
+					parts[i] = fmt.Sprintf("%v", item)
+				}
+				return strings.Join(parts, fmt.Sprintf("%v", sepVal)), true, nil
+			}
+		}
+		return "", true, nil
+	}
+	return nil, false, nil
 }

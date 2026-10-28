@@ -510,9 +510,10 @@ type CombinedFieldsQuery struct {
 
 // ScriptScoreQuery models an ES `script_score` query (`{"script_score": {"query": {...}, "script": {...}}}`).
 type ScriptScoreQuery struct {
-	Query  *Query         `json:"query,omitempty"`
-	Script map[string]any `json:"script,omitempty"`
-	Boost  *float64       `json:"boost,omitempty"`
+	Query    *Query         `json:"query,omitempty"`
+	Script   map[string]any `json:"script,omitempty"`
+	MinScore *float64       `json:"min_score,omitempty"`
+	Boost    *float64       `json:"boost,omitempty"`
 }
 
 // ScriptQuery models an ES `script` filter query (`{"script": {"script": {...}}}`).
@@ -1339,10 +1340,24 @@ func (p *PercentilesAggSpec) EffectivePercents() []float64 {
 }
 
 type TopHitsAggSpec struct {
-	From   int           `json:"from,omitempty"`
-	Size   *int          `json:"size,omitempty"`
-	Sort   SortSlice     `json:"sort,omitempty"`
-	Source *SourceFilter `json:"_source,omitempty"`
+	From           int                `json:"from,omitempty"`
+	Size           *int               `json:"size,omitempty"`
+	Sort           SortSlice          `json:"sort,omitempty"`
+	Source         *SourceFilter      `json:"_source,omitempty"`
+	Fields         []FieldRequestSpec `json:"fields,omitempty"`
+	DocvalueFields []FieldRequestSpec `json:"docvalue_fields,omitempty"`
+	ScriptFields   map[string]any     `json:"script_fields,omitempty"`
+	Highlight      *HighlightSpec     `json:"highlight,omitempty"`
+}
+
+func (th *TopHitsAggSpec) EffectiveFieldSpecs() []FieldRequestSpec {
+	if th == nil || (len(th.Fields) == 0 && len(th.DocvalueFields) == 0) {
+		return nil
+	}
+	out := make([]FieldRequestSpec, 0, len(th.Fields)+len(th.DocvalueFields))
+	out = append(out, th.Fields...)
+	out = append(out, th.DocvalueFields...)
+	return out
 }
 
 func (th *TopHitsAggSpec) EffectiveFrom() int {
@@ -1615,6 +1630,7 @@ type MetricAggSpec struct {
 	Field   string   `json:"field"`
 	Sigma   *float64 `json:"sigma,omitempty"`
 	Missing any      `json:"missing,omitempty"`
+	Script  any      `json:"script,omitempty"`
 }
 
 func (m *MetricAggSpec) EffectiveSigma() float64 {
@@ -1717,7 +1733,9 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 	if rawVal, ok := m["_geo_distance"]; ok {
 		order := "asc"
 		var obj struct {
-			Order string `json:"order"`
+			Order   string `json:"order"`
+			Mode    string `json:"mode"`
+			Missing any    `json:"missing"`
 		}
 		_ = json.Unmarshal(rawVal, &obj)
 		if obj.Order != "" {
@@ -1728,7 +1746,13 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 				order = strings.ToLower(ordStr)
 			}
 		}
-		s.Entry = SortFieldSpec{Field: "_geo_distance", Order: order}
+		var geoMap map[string]any
+		_ = json.Unmarshal(rawVal, &geoMap)
+		missing := ""
+		if obj.Missing != nil {
+			missing = fmt.Sprintf("%v", obj.Missing)
+		}
+		s.Entry = SortFieldSpec{Field: "_geo_distance", Order: order, Mode: strings.ToLower(obj.Mode), Missing: missing, Script: geoMap}
 		return nil
 	}
 
