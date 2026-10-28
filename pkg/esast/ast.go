@@ -1307,6 +1307,7 @@ type DateHistogramAggSpec struct {
 	Missing          any                  `json:"missing,omitempty"`
 	MissingBucket    bool                 `json:"missing_bucket,omitempty"`
 	MissingOrder     string               `json:"missing_order,omitempty"`
+	Order            any                  `json:"order,omitempty"`
 	MinDocCount      *int                 `json:"min_doc_count,omitempty"`
 	ExtendedBounds   *HistogramBoundsSpec `json:"extended_bounds,omitempty"`
 	HardBounds       *HistogramBoundsSpec `json:"hard_bounds,omitempty"`
@@ -1463,6 +1464,7 @@ type HistogramAggSpec struct {
 	Missing        any                  `json:"missing,omitempty"`
 	MissingBucket  bool                 `json:"missing_bucket,omitempty"`
 	MissingOrder   string               `json:"missing_order,omitempty"`
+	Order          any                  `json:"order,omitempty"`
 	MinDocCount    *int                 `json:"min_doc_count,omitempty"`
 	ExtendedBounds *HistogramBoundsSpec `json:"extended_bounds,omitempty"`
 	HardBounds     *HistogramBoundsSpec `json:"hard_bounds,omitempty"`

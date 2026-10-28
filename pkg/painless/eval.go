@@ -44,16 +44,18 @@ type ScriptSpec struct {
 }
 
 var (
-	reCtxOp          = regexp.MustCompile(`^ctx\.op\s*=\s*['"]([^'"]+)['"]$`)
-	reCompoundAssign = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\s*(\+=|-=|\*=|/=)\s*(.+)$`)
-	reAssignParam    = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\s*=\s*(.+)$`)
-	reRemoveField    = regexp.MustCompile(`^ctx\._source(?:\.([a-zA-Z0-9_.]+))?\.remove\(\s*(.+?)\s*\)$`)
-	reArrayAdd       = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\.add\(\s*(.+?)\s*\)$`)
-	reArrayAddAll    = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\.addAll\(\s*(.+?)\s*\)$`)
-	reMapPut         = regexp.MustCompile(`^ctx\._source(?:\.([a-zA-Z0-9_.]+))?\.put\(\s*(.+?)\s*,\s*(.+?)\s*\)$`)
-	reMapPutAll      = regexp.MustCompile(`^ctx\._source(?:\.([a-zA-Z0-9_.]+))?\.putAll\(\s*(.+?)\s*\)$`)
-	reArrayRemoveIf  = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\.removeIf\(\s*([a-zA-Z0-9_]+)\s*->\s*([a-zA-Z0-9_]+)(?:\.([a-zA-Z0-9_.]+))?\s*==\s*(.+?)\s*\)$`)
-	reLocalVarAssign = regexp.MustCompile(`^(?:(?:def|boolean|int|long|double|float|String|Object|Map|List)\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$`)
+	reCtxOp               = regexp.MustCompile(`^ctx\.op\s*=\s*['"]([^'"]+)['"]$`)
+	reCompoundAssign      = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.@-]+)\s*(\+=|-=|\*=|/=)\s*(.+)$`)
+	reAssignParam         = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.@-]+)\s*=\s*(.+)$`)
+	reRemoveField         = regexp.MustCompile(`^ctx\._source(?:\.([a-zA-Z0-9_.@-]+))?\.remove\(\s*(.+?)\s*\)$`)
+	reArrayAdd            = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.@-]+)\.add\(\s*(.+?)\s*\)$`)
+	reArrayAddAll         = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.@-]+)\.addAll\(\s*(.+?)\s*\)$`)
+	reMapPut              = regexp.MustCompile(`^ctx\._source(?:\.([a-zA-Z0-9_.@-]+))?\.put\(\s*(.+?)\s*,\s*(.+?)\s*\)$`)
+	reMapPutAll           = regexp.MustCompile(`^ctx\._source(?:\.([a-zA-Z0-9_.@-]+))?\.putAll\(\s*(.+?)\s*\)$`)
+	reArrayRemoveIf       = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.@-]+)\.removeIf\(\s*([a-zA-Z0-9_]+)\s*->\s*([a-zA-Z0-9_]+)(?:\.([a-zA-Z0-9_.@-]+))?\s*==\s*(.+?)\s*\)$`)
+	reLocalCompoundAssign = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@-]+)*)\s*(\+=|-=|\*=|/=)\s*(.+)$`)
+	reLocalPropAssign     = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z0-9_.@-]+)\s*=\s*(.+)$`)
+	reLocalVarAssign      = regexp.MustCompile(`^(?:(?:def|boolean|int|long|double|float|String|Object|Map|List)\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$`)
 )
 
 // ApplyUpdate applies either a partial `doc` deep merge or an embedded Painless `script`
@@ -297,11 +299,20 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 			return err
 		}
 	}
+	for k, v := range loopParams {
+		if k != varName {
+			params[k] = v
+		}
+	}
 	return nil
 }
 
 func isIdentByte(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+func isBracketKeyByte(c byte) bool {
+	return isIdentByte(c) || c == '@' || c == '-' || c == '.'
 }
 
 // normalizeBracketAccess rewrites bracket property accesses like `ctx._source['field']`
@@ -320,11 +331,11 @@ func normalizeBracketAccess(s string) string {
 			out.WriteByte(c)
 			continue
 		}
-		if c == '[' && i > 0 && (isIdentByte(s[i-1]) || s[i-1] == ']') && i+3 < len(s) && (s[i+1] == '\'' || s[i+1] == '"') {
+		if c == '[' && i > 0 && (isBracketKeyByte(s[i-1]) || s[i-1] == ']') && i+3 < len(s) && (s[i+1] == '\'' || s[i+1] == '"') {
 			q := s[i+1]
 			j := i + 2
 			valid := false
-			for j < len(s) && isIdentByte(s[j]) {
+			for j < len(s) && isBracketKeyByte(s[j]) {
 				j++
 				valid = true
 			}
@@ -459,9 +470,9 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		case "-=":
 			setValueAtPath(sourceMap, lhsPath, applyArithmetic(curVal, rhsVal, false))
 		case "*=":
-			setValueAtPath(sourceMap, lhsPath, applyMulDiv(curVal, rhsVal, true))
+			setValueAtPath(sourceMap, lhsPath, applyMulDiv(curVal, rhsVal, '*'))
 		case "/=":
-			setValueAtPath(sourceMap, lhsPath, applyMulDiv(curVal, rhsVal, false))
+			setValueAtPath(sourceMap, lhsPath, applyMulDiv(curVal, rhsVal, '/'))
 		}
 		return nil
 	}
@@ -478,7 +489,51 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		return nil
 	}
 
-	// 9. Check local variable declaration/assignment (`def x = ...`, `boolean ok = ...`, `x = ...`)
+	// 9. Check local/loop variable compound assignment (`sum += x`, `item.count += 1`)
+	if m := reLocalCompoundAssign.FindStringSubmatch(stmt); m != nil {
+		lhs := m[1]
+		op := m[2]
+		rhsVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[3]), params)
+		if err != nil {
+			return err
+		}
+		path := strings.Split(lhs, ".")
+		curVal := resolveParamPath(params, path)
+		var nextVal any
+		switch op {
+		case "+=":
+			nextVal = applyArithmetic(curVal, rhsVal, true)
+		case "-=":
+			nextVal = applyArithmetic(curVal, rhsVal, false)
+		case "*=":
+			nextVal = applyMulDiv(curVal, rhsVal, '*')
+		case "/=":
+			nextVal = applyMulDiv(curVal, rhsVal, '/')
+		}
+		if len(path) == 1 {
+			params[path[0]] = nextVal
+		} else if targetMap, ok := params[path[0]].(map[string]any); ok {
+			setValueAtPath(targetMap, path[1:], nextVal)
+		}
+		return nil
+	}
+
+	// 10. Check local/loop variable property assignment (`tag.status = 'active'`)
+	if m := reLocalPropAssign.FindStringSubmatch(stmt); m != nil {
+		varName := m[1]
+		propPath := strings.Split(m[2], ".")
+		rhsExpr := strings.TrimSpace(m[3])
+		val, err := evalRHSExpr(sourceMap, rhsExpr, params)
+		if err != nil {
+			return err
+		}
+		if targetMap, ok := params[varName].(map[string]any); ok {
+			setValueAtPath(targetMap, propPath, val)
+		}
+		return nil
+	}
+
+	// 11. Check local variable declaration/assignment (`def x = ...`, `boolean ok = ...`, `x = ...`)
 	if m := reLocalVarAssign.FindStringSubmatch(stmt); m != nil {
 		varName := m[1]
 		rhsExpr := strings.TrimSpace(m[2])
@@ -931,7 +986,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		}
 		return applyArithmetic(leftVal, rightVal, isAdd), nil
 	}
-	if opIdx, isMul := findTopLevelMulDiv(rhs); opIdx > 0 {
+	if opIdx, opCh := findTopLevelMulDiv(rhs); opIdx > 0 {
 		leftVal, err := evalRHSExprDepth(sourceMap, rhs[:opIdx], params, depth+1)
 		if err != nil {
 			return nil, err
@@ -940,7 +995,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		if err != nil {
 			return nil, err
 		}
-		return applyMulDiv(leftVal, rightVal, isMul), nil
+		return applyMulDiv(leftVal, rightVal, opCh), nil
 	}
 	if strings.HasPrefix(rhs, "-") && len(rhs) > 1 && (rhs[1] < '0' || rhs[1] > '9') {
 		innerVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(rhs[1:]), params, depth+1)
@@ -1045,7 +1100,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		trimmed := strings.TrimPrefix(strings.TrimPrefix(rhs, "doc?."), "doc.")
 		trimmed = strings.TrimSuffix(trimmed, ".value")
 		path := strings.Split(trimmed, ".")
-		return resolveParamPath(sourceMap, path), nil
+		val := resolveParamPath(sourceMap, path)
+		if val == nil && strings.HasSuffix(trimmed, ".keyword") {
+			val = resolveParamPath(sourceMap, strings.Split(strings.TrimSuffix(trimmed, ".keyword"), "."))
+		}
+		return val, nil
 	}
 	if rhs == "params" {
 		return params, nil
@@ -1076,10 +1135,44 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 	if rhs == "[:]" || rhs == "{}" {
 		return map[string]any{}, nil
 	}
+	if strings.HasPrefix(rhs, "[") && strings.HasSuffix(rhs, "]") && findMatchingDelimiter(rhs, 0, '[', ']') == len(rhs)-1 {
+		inner := strings.TrimSpace(rhs[1 : len(rhs)-1])
+		if inner != "" {
+			items := splitTopLevelCommaPainless(inner)
+			if len(items) > 0 && findTopLevelOpPainless(items[0], ":") > 0 {
+				mOut := make(map[string]any, len(items))
+				for _, entry := range items {
+					cIdx := findTopLevelOpPainless(entry, ":")
+					if cIdx <= 0 {
+						continue
+					}
+					kVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(entry[:cIdx]), params, depth+1)
+					if err != nil {
+						return nil, err
+					}
+					vVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(entry[cIdx+1:]), params, depth+1)
+					if err != nil {
+						return nil, err
+					}
+					mOut[fmt.Sprintf("%v", kVal)] = vVal
+				}
+				return mOut, nil
+			}
+			listOut := make([]any, 0, len(items))
+			for _, itemExpr := range items {
+				vVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(itemExpr), params, depth+1)
+				if err != nil {
+					return nil, err
+				}
+				listOut = append(listOut, vVal)
+			}
+			return listOut, nil
+		}
+	}
 	if (strings.HasPrefix(rhs, "'") && strings.HasSuffix(rhs, "'")) ||
 		(strings.HasPrefix(rhs, `"`) && strings.HasSuffix(rhs, `"`)) {
 		if len(rhs) >= 2 {
-			return rhs[1 : len(rhs)-1], nil
+			return unescapePainlessString(rhs[1 : len(rhs)-1]), nil
 		}
 	}
 	dec := json.NewDecoder(strings.NewReader(rhs))
@@ -1089,6 +1182,69 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		return parsed, nil
 	}
 	return rhs, nil
+}
+
+func splitTopLevelCommaPainless(s string) []string {
+	var parts []string
+	depth := 0
+	inQuotes := byte(0)
+	inRegexClass := false
+	lastStart := 0
+	for i := 0; i < len(s); i++ {
+		if stepQuoteState(s, i, &inQuotes, &inRegexClass) {
+			continue
+		}
+		switch s[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				parts = append(parts, s[lastStart:i])
+				lastStart = i + 1
+			}
+		}
+	}
+	if strings.TrimSpace(s[lastStart:]) != "" {
+		parts = append(parts, s[lastStart:])
+	}
+	return parts
+}
+
+func unescapePainlessString(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+			switch s[i] {
+			case 'n':
+				sb.WriteByte('\n')
+			case 'r':
+				sb.WriteByte('\r')
+			case 't':
+				sb.WriteByte('\t')
+			case '\'':
+				sb.WriteByte('\'')
+			case '"':
+				sb.WriteByte('"')
+			case '\\':
+				sb.WriteByte('\\')
+			default:
+				sb.WriteByte('\\')
+				sb.WriteByte(s[i])
+			}
+			continue
+		}
+		sb.WriteByte(s[i])
+	}
+	return sb.String()
 }
 
 func hasTopLevelBooleanOrRegexOp(s string) bool {
@@ -1144,12 +1300,12 @@ func findTopLevelAddSub(expr string) (int, bool) {
 	return lastIdx, lastIsAdd
 }
 
-func findTopLevelMulDiv(expr string) (int, bool) {
+func findTopLevelMulDiv(expr string) (int, byte) {
 	inQuotes := byte(0)
 	inRegexClass := false
 	depth := 0
 	lastIdx := -1
-	lastIsMul := false
+	lastOp := byte(0)
 	for i := 0; i < len(expr); i++ {
 		if stepQuoteState(expr, i, &inQuotes, &inRegexClass) {
 			continue
@@ -1162,25 +1318,32 @@ func findTopLevelMulDiv(expr string) (int, bool) {
 			if depth > 0 {
 				depth--
 			}
-		case '*', '/':
+		case '*', '/', '%':
 			if depth == 0 && i > 0 {
 				lastIdx = i
-				lastIsMul = c == '*'
+				lastOp = c
 			}
 		}
 	}
-	return lastIdx, lastIsMul
+	return lastIdx, lastOp
 }
 
-func applyMulDiv(a, b any, isMul bool) any {
+func applyMulDiv(a, b any, op byte) any {
 	af, aOk := toFloat64(a)
 	bf, bOk := toFloat64(b)
 	if aOk && bOk {
 		var res float64
-		if isMul {
+		switch op {
+		case '*':
 			res = af * bf
-		} else if bf != 0 {
-			res = af / bf
+		case '/':
+			if bf != 0 {
+				res = af / bf
+			}
+		case '%':
+			if bf != 0 {
+				res = math.Mod(af, bf)
+			}
 		}
 		if math.IsNaN(res) || math.IsInf(res, 0) {
 			return float64(0)
@@ -1428,6 +1591,13 @@ func removeKeyOrIndexAtPath(root map[string]any, parentPath []string, keyOrIdx a
 			idx := int(f)
 			if idx >= 0 && idx < len(target) {
 				curr[lastSeg] = append(target[:idx], target[idx+1:]...)
+			}
+		} else {
+			for idx, elem := range target {
+				if valuesEqual(elem, keyOrIdx) {
+					curr[lastSeg] = append(target[:idx], target[idx+1:]...)
+					break
+				}
 			}
 		}
 	}
