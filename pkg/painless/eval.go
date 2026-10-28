@@ -61,7 +61,7 @@ var (
 	reClearField          = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_.@/:?\x00-\x04-]+))?\.clear\(\s*\)$`)
 	reArrayAdd            = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x04-]+)\.add\(\s*(.+?)\s*\)$`)
 	reArrayAddAll         = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x04-]+)\.addAll\(\s*(.+?)\s*\)$`)
-	reMapPut              = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_.@/:?\x00-\x04-]+))?\.put\(\s*(.+?)\s*,\s*(.+?)\s*\)$`)
+	reMapPut              = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_.@/:?\x00-\x04-]+))?\.put\(\s*(.+)\s*\)$`)
 	reMapPutAll           = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_.@/:?\x00-\x04-]+))?\.putAll\(\s*(.+?)\s*\)$`)
 	reArrayRemoveIf       = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x04-]+)\.removeIf\(\s*([a-zA-Z0-9_]+)\s*->\s*([a-zA-Z0-9_]+)(?:\.([a-zA-Z0-9_.@/:?\x00-\x04-]+))?\s*==\s*(.+?)\s*\)$`)
 	reLocalIncDec         = regexp.MustCompile(`^(?:(\+\+|--)\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x04-]+)*)|([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x04-]+)*)\s*(\+\+|--))$`)
@@ -69,7 +69,7 @@ var (
 	reLocalClearField     = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x04-]+)*)\.clear\(\s*\)$`)
 	reLocalArrayAdd       = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x04-]+)*)\.add\(\s*(.+?)\s*\)$`)
 	reLocalArrayAddAll    = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x04-]+)*)\.addAll\(\s*(.+?)\s*\)$`)
-	reLocalMapPut         = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x04-]+)*)\.put\(\s*(.+?)\s*,\s*(.+?)\s*\)$`)
+	reLocalMapPut         = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x04-]+)*)\.put\(\s*(.+)\s*\)$`)
 	reLocalMapPutAll      = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x04-]+)*)\.putAll\(\s*(.+?)\s*\)$`)
 	reLocalArrayRemoveIf  = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x04-]+)*)\.removeIf\(\s*([a-zA-Z0-9_]+)\s*->\s*([a-zA-Z0-9_]+)(?:\.([a-zA-Z0-9_.@/:?\x00-\x04-]+))?\s*==\s*(.+?)\s*\)$`)
 	reLocalCompoundAssign = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x04-]+)*)\s*(\+=|-=|\*=|/=)\s*(.+)$`)
@@ -291,6 +291,7 @@ func EvalPainlessWithOp(sourceMap map[string]any, scriptSource string, params ma
 	if !hadSource {
 		delete(params, "_source")
 	}
+	delete(params, "_return_val")
 	for k := range params {
 		if strings.HasPrefix(k, "__alias_") {
 			delete(params, k)
@@ -437,26 +438,26 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 	}
 
 	var varName, iterExpr string
-	if idx := strings.Index(header, " in "); idx >= 0 {
-		varName = strings.TrimSpace(header[:idx])
-		iterExpr = strings.TrimSpace(header[idx+4:])
-	} else if idx := strings.IndexByte(header, ':'); idx >= 0 {
-		varName = strings.TrimSpace(header[:idx])
-		iterExpr = strings.TrimSpace(header[idx+1:])
-	} else if clauses := splitTopLevelSemicolonPainless(header); len(clauses) == 3 {
+	if clauses := splitTopLevelSemicolonPainless(header); len(clauses) == 3 {
 		loopParams := make(map[string]any, len(params)+2)
 		for k, v := range params {
 			loopParams[k] = v
 		}
-		var initVarName string
+		initVars := make(map[string]bool)
 		if initStmt := strings.TrimSpace(clauses[0]); initStmt != "" {
-			if m := reLocalVarAssign.FindStringSubmatch(initStmt); m != nil {
-				if _, existed := params[m[1]]; !existed {
-					initVarName = m[1]
+			for _, subInit := range splitTopLevelCommaPainless(initStmt) {
+				subInit = strings.TrimSpace(subInit)
+				if subInit == "" {
+					continue
 				}
-			}
-			if err := execSimpleStmt(sourceMap, initStmt, loopParams, ctxOp, budget); err != nil {
-				return err
+				if m := reLocalVarAssign.FindStringSubmatch(subInit); m != nil {
+					if _, existed := params[m[1]]; !existed {
+						initVars[m[1]] = true
+					}
+				}
+				if err := execSimpleStmt(sourceMap, subInit, loopParams, ctxOp, budget); err != nil {
+					return err
+				}
 			}
 		}
 		condExpr := strings.TrimSpace(clauses[1])
@@ -480,18 +481,33 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 				}
 			}
 			if postStmt != "" {
-				if err := execSimpleStmt(sourceMap, postStmt, loopParams, ctxOp, budget); err != nil {
-					loopErr = err
+				for _, subPost := range splitTopLevelCommaPainless(postStmt) {
+					subPost = strings.TrimSpace(subPost)
+					if subPost == "" {
+						continue
+					}
+					if err := execSimpleStmt(sourceMap, subPost, loopParams, ctxOp, budget); err != nil {
+						loopErr = err
+						break
+					}
+				}
+				if loopErr != nil {
 					break
 				}
 			}
 		}
 		for k, v := range loopParams {
-			if k != initVarName {
+			if !initVars[k] {
 				params[k] = v
 			}
 		}
 		return loopErr
+	} else if idx := strings.Index(header, " in "); idx >= 0 {
+		varName = strings.TrimSpace(header[:idx])
+		iterExpr = strings.TrimSpace(header[idx+4:])
+	} else if idx := strings.IndexByte(header, ':'); idx >= 0 {
+		varName = strings.TrimSpace(header[:idx])
+		iterExpr = strings.TrimSpace(header[idx+1:])
 	} else {
 		return nil
 	}
@@ -712,11 +728,15 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 	stmt = strings.TrimSpace(expandDynamicBrackets(stmt, sourceMap, params, 0))
 	if stmt == "return" || strings.HasPrefix(stmt, "return ") || strings.HasPrefix(stmt, "return;") || strings.HasPrefix(stmt, "return(") {
 		retExpr := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(stmt, "return")), ";"))
-		if retExpr != "" {
-			if val, err := evalRHSExpr(sourceMap, retExpr, params); err == nil {
-				params["_return_val"] = val
-			}
+		if retExpr == "" {
+			params["_return_val"] = nil
+			return errPainlessReturn
 		}
+		val, err := evalRHSExpr(sourceMap, retExpr, params)
+		if err != nil {
+			return err
+		}
+		params["_return_val"] = val
 		return errPainlessReturn
 	}
 	if stmt == "break" {
@@ -752,6 +772,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		curVal := resolveParamPath(params, path)
 		nextVal := applyArithmetic(curVal, int64(1), op == "++")
 		setValueAtPath(params, path, nextVal)
+		syncLocalVarAlias(sourceMap, params, decodeBracketSeg(path[0]))
 		return nil
 	}
 
@@ -821,21 +842,23 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 
 	// 5. Check `.put(k, v)` on map
 	if m := reMapPut.FindStringSubmatch(stmt); m != nil {
-		var targetPath []string
-		if m[1] != "" {
-			targetPath = strings.Split(m[1], ".")
+		if putArgs := splitTopLevelCommaPainless(m[2]); len(putArgs) == 2 {
+			var targetPath []string
+			if m[1] != "" {
+				targetPath = strings.Split(m[1], ".")
+			}
+			kVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(putArgs[0]), params)
+			if err != nil {
+				return err
+			}
+			vVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(putArgs[1]), params)
+			if err != nil {
+				return err
+			}
+			keyStr := fmt.Sprintf("%v", kVal)
+			setValueAtPath(sourceMap, append(targetPath, keyStr), vVal)
+			return nil
 		}
-		kVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[2]), params)
-		if err != nil {
-			return err
-		}
-		vVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[3]), params)
-		if err != nil {
-			return err
-		}
-		keyStr := fmt.Sprintf("%v", kVal)
-		setValueAtPath(sourceMap, append(targetPath, keyStr), vVal)
-		return nil
 	}
 
 	// 6. Check `.remove('field')` or `.remove(params.key)` or `.remove(0)` or `.clear()`
@@ -933,20 +956,22 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		}
 	}
 	if m := reLocalMapPut.FindStringSubmatch(stmt); m != nil {
-		targetPath := strings.Split(m[1], ".")
-		rootVar := decodeBracketSeg(targetPath[0])
-		if _, ok := params[rootVar]; ok {
-			kVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[2]), params)
-			if err != nil {
-				return err
+		if putArgs := splitTopLevelCommaPainless(m[2]); len(putArgs) == 2 {
+			targetPath := strings.Split(m[1], ".")
+			rootVar := decodeBracketSeg(targetPath[0])
+			if _, ok := params[rootVar]; ok {
+				kVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(putArgs[0]), params)
+				if err != nil {
+					return err
+				}
+				vVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(putArgs[1]), params)
+				if err != nil {
+					return err
+				}
+				setValueAtPath(params, append(targetPath, fmt.Sprintf("%v", kVal)), vVal)
+				syncLocalVarAlias(sourceMap, params, rootVar)
+				return nil
 			}
-			vVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[3]), params)
-			if err != nil {
-				return err
-			}
-			setValueAtPath(params, append(targetPath, fmt.Sprintf("%v", kVal)), vVal)
-			syncLocalVarAlias(sourceMap, params, rootVar)
-			return nil
 		}
 	}
 	if m := reLocalRemoveField.FindStringSubmatch(stmt); m != nil {
@@ -1123,17 +1148,52 @@ func isEscapedAt(s string, idx int) bool {
 	return bs%2 == 1
 }
 
+func findMatchingRegexSlash(s string, openIdx int) int {
+	if openIdx < 0 || openIdx >= len(s)-1 || s[openIdx] != '/' || s[openIdx+1] == '/' || s[openIdx+1] == '*' {
+		return -1
+	}
+	inClass := false
+	for k := openIdx + 1; k < len(s); k++ {
+		if s[k] == '\n' || s[k] == '\r' {
+			return -1
+		}
+		if isEscapedAt(s, k) {
+			continue
+		}
+		if s[k] == '[' && !inClass {
+			inClass = true
+			continue
+		}
+		if s[k] == ']' && inClass {
+			inClass = false
+			continue
+		}
+		if s[k] == '/' && !inClass {
+			if k > openIdx+1 {
+				return k
+			}
+			return -1
+		}
+	}
+	return -1
+}
+
 func isRegexSlashAt(s string, idx int) bool {
-	if idx < 0 || idx >= len(s) || s[idx] != '/' {
+	if findMatchingRegexSlash(s, idx) <= idx+1 {
 		return false
 	}
 	for j := idx - 1; j >= 0; j-- {
 		if s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r' {
 			continue
 		}
-		return s[j] == '~'
+		switch s[j] {
+		case '~', '(', ',', '=', ':', '?', '!', '&', '|', '[', '{', ';':
+			return true
+		default:
+			return false
+		}
 	}
-	return false
+	return true
 }
 
 func stepQuoteState(s string, i int, inQuotes *byte, inRegexClass *bool) bool {
@@ -1419,6 +1479,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		return nil, fmt.Errorf("painless expression exceeded maximum recursion depth (64)")
 	}
 	rhs = trimBalancedParens(expandDynamicBrackets(rhs, sourceMap, params, depth+1))
+	if len(rhs) >= 3 && rhs[0] == '/' && findMatchingRegexSlash(rhs, 0) == len(rhs)-1 {
+		return rhs, nil
+	}
 
 	// Check Elvis operator `?:`
 	if elvisIdx := findTopLevelOpPainless(rhs, "?:"); elvisIdx > 0 {
@@ -1471,6 +1534,34 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			return nil, err
 		}
 		return applyMulDiv(leftVal, rightVal, opCh), nil
+	}
+	if castType, castRest, ok := splitLeadingTypeCastPainless(rhs); ok {
+		innerVal, err := evalRHSExprDepth(sourceMap, castRest, params, depth+1)
+		if err != nil || innerVal == nil {
+			return nil, err
+		}
+		switch castType {
+		case "int", "long", "Integer", "Long":
+			if f, fOk := toFloat64(innerVal); fOk {
+				return int64(f), nil
+			}
+			return int64(0), nil
+		case "double", "float", "Double", "Float":
+			if f, fOk := toFloat64(innerVal); fOk {
+				return f, nil
+			}
+			return float64(0), nil
+		case "String":
+			return fmt.Sprintf("%v", innerVal), nil
+		case "boolean", "Boolean":
+			if b, bOk := innerVal.(bool); bOk {
+				return b, nil
+			}
+			if f, fOk := toFloat64(innerVal); fOk {
+				return f != 0, nil
+			}
+			return strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", innerVal)), "true"), nil
+		}
 	}
 	if strings.HasPrefix(rhs, "-") && len(rhs) > 1 && (rhs[1] < '0' || rhs[1] > '9') {
 		innerVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(rhs[1:]), params, depth+1)
@@ -1737,6 +1828,29 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				}
 				return nil, nil
 			case ".join(":
+				if recExpr == "String" {
+					args := splitTopLevelCommaPainless(argExpr)
+					if len(args) >= 2 {
+						delimVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+						delim := fmt.Sprintf("%v", delimVal)
+						if len(args) == 2 {
+							secondVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+							if arr, ok := secondVal.([]any); ok {
+								parts := make([]string, len(arr))
+								for i, item := range arr {
+									parts[i] = fmt.Sprintf("%v", item)
+								}
+								return strings.Join(parts, delim), nil
+							}
+						}
+						parts := make([]string, 0, len(args)-1)
+						for _, a := range args[1:] {
+							v, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(a), params, depth+1)
+							parts = append(parts, fmt.Sprintf("%v", v))
+						}
+						return strings.Join(parts, delim), nil
+					}
+				}
 				if tv, ok := recVal.([]any); ok {
 					sep := ""
 					if argVal != nil {
@@ -1784,9 +1898,30 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				}
 				return nil, nil
 			case ".indexOf(":
+				args := splitTopLevelCommaPainless(argExpr)
 				switch tv := recVal.(type) {
 				case string:
-					if argVal != nil {
+					if len(args) >= 2 {
+						subVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+						fromVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+						if subVal != nil {
+							fromIdx := 0
+							if ff, ok := toFloat64(fromVal); ok {
+								fromIdx = int(ff)
+							}
+							if fromIdx < 0 {
+								fromIdx = 0
+							}
+							if fromIdx > len(tv) {
+								return int64(-1), nil
+							}
+							idx := strings.Index(tv[fromIdx:], fmt.Sprintf("%v", subVal))
+							if idx < 0 {
+								return int64(-1), nil
+							}
+							return int64(fromIdx + idx), nil
+						}
+					} else if argVal != nil {
 						return int64(strings.Index(tv, fmt.Sprintf("%v", argVal))), nil
 					}
 				case []any:
@@ -1798,9 +1933,28 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				}
 				return int64(-1), nil
 			case ".lastIndexOf(":
+				args := splitTopLevelCommaPainless(argExpr)
 				switch tv := recVal.(type) {
 				case string:
-					if argVal != nil {
+					if len(args) >= 2 {
+						subVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+						fromVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+						if subVal != nil {
+							fromIdx := len(tv)
+							if ff, ok := toFloat64(fromVal); ok {
+								fromIdx = int(ff)
+							}
+							if fromIdx < 0 {
+								return int64(-1), nil
+							}
+							subStr := fmt.Sprintf("%v", subVal)
+							maxEnd := fromIdx + len(subStr)
+							if maxEnd > len(tv) {
+								maxEnd = len(tv)
+							}
+							return int64(strings.LastIndex(tv[:maxEnd], subStr)), nil
+						}
+					} else if argVal != nil {
 						return int64(strings.LastIndex(tv, fmt.Sprintf("%v", argVal))), nil
 					}
 				case []any:
@@ -1812,19 +1966,38 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				}
 				return int64(-1), nil
 			case ".split(":
-				if s, ok := recVal.(string); ok && argVal != nil {
-					sepStr := fmt.Sprintf("%v", argVal)
-					var parts []string
-					if re, err := regexp.Compile(sepStr); err == nil && sepStr != "." && sepStr != "" {
-						parts = re.Split(s, -1)
-					} else {
-						parts = strings.Split(s, sepStr)
+				if s, ok := recVal.(string); ok {
+					args := splitTopLevelCommaPainless(argExpr)
+					sepVal := argVal
+					limit := -1
+					if len(args) >= 2 {
+						sepVal, _ = evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+						limVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+						if lf, lOk := toFloat64(limVal); lOk && int(lf) > 0 {
+							limit = int(lf)
+						}
 					}
-					out := make([]any, len(parts))
-					for i, p := range parts {
-						out[i] = p
+					if sepVal != nil {
+						sepStr := fmt.Sprintf("%v", sepVal)
+						isRegexLit := false
+						if len(sepStr) >= 3 && sepStr[0] == '/' && sepStr[len(sepStr)-1] == '/' {
+							sepStr = strings.ReplaceAll(sepStr[1:len(sepStr)-1], `\/`, `/`)
+							isRegexLit = true
+						}
+						var parts []string
+						if re, err := regexp.Compile(sepStr); err == nil && (isRegexLit || (sepStr != "." && sepStr != "|" && sepStr != "" && sepStr != "$" && sepStr != "^")) {
+							parts = re.Split(s, limit)
+						} else if limit > 0 {
+							parts = strings.SplitN(s, sepStr, limit)
+						} else {
+							parts = strings.Split(s, sepStr)
+						}
+						out := make([]any, len(parts))
+						for i, p := range parts {
+							out[i] = p
+						}
+						return out, nil
 					}
-					return out, nil
 				}
 				return []any{}, nil
 			}
@@ -2036,23 +2209,13 @@ func matchTrailingMethodCallPainless(s, mName string) (recExpr, argExpr string, 
 	}
 	openParenIdx := -1
 	depth := 0
-	var quote byte
+	inQuotes := byte(0)
+	inRegexClass := false
 	for i := 0; i < len(s); i++ {
+		if stepQuoteState(s, i, &inQuotes, &inRegexClass) {
+			continue
+		}
 		ch := s[i]
-		if quote != 0 {
-			if ch == '\\' && i+1 < len(s) {
-				i++
-				continue
-			}
-			if ch == quote {
-				quote = 0
-			}
-			continue
-		}
-		if ch == '\'' || ch == '"' {
-			quote = ch
-			continue
-		}
 		if ch == '(' || ch == '[' {
 			if depth == 0 && ch == '(' {
 				openParenIdx = i
@@ -2161,6 +2324,43 @@ func hasTopLevelBooleanOrRegexOp(s string) bool {
 	return false
 }
 
+func isPrimitiveTypeCastKeyword(s string) bool {
+	switch s {
+	case "int", "long", "double", "float", "String", "boolean", "Integer", "Long", "Double", "Float", "Boolean":
+		return true
+	}
+	return false
+}
+
+func splitLeadingTypeCastPainless(s string) (castType, rest string, ok bool) {
+	if !strings.HasPrefix(s, "(") {
+		return "", "", false
+	}
+	closeP := findMatchingDelimiter(s, 0, '(', ')')
+	if closeP <= 1 || closeP >= len(s)-1 {
+		return "", "", false
+	}
+	cand := strings.TrimSpace(s[1:closeP])
+	if !isPrimitiveTypeCastKeyword(cand) {
+		return "", "", false
+	}
+	tail := strings.TrimSpace(s[closeP+1:])
+	if tail == "" {
+		return "", "", false
+	}
+	return cand, tail, true
+}
+
+func isCastPrefixOnly(prev string) bool {
+	if !strings.HasPrefix(prev, "(") || !strings.HasSuffix(prev, ")") {
+		return false
+	}
+	if findMatchingDelimiter(prev, 0, '(', ')') != len(prev)-1 {
+		return false
+	}
+	return isPrimitiveTypeCastKeyword(strings.TrimSpace(prev[1 : len(prev)-1]))
+}
+
 func findTopLevelAddSub(expr string) (int, bool) {
 	inQuotes := byte(0)
 	inRegexClass := false
@@ -2185,7 +2385,7 @@ func findTopLevelAddSub(expr string) (int, bool) {
 					continue
 				}
 				prev := strings.TrimSpace(expr[:i])
-				if len(prev) > 0 {
+				if len(prev) > 0 && !isCastPrefixOnly(prev) {
 					lastChar := prev[len(prev)-1]
 					if lastChar != '+' && lastChar != '-' && lastChar != '*' && lastChar != '/' && lastChar != '(' &&
 						lastChar != ',' && lastChar != '?' && lastChar != ':' && lastChar != '=' && lastChar != '<' && lastChar != '>' && lastChar != '!' && lastChar != '~' {
@@ -2320,6 +2520,52 @@ func toFloat64(v any) (float64, bool) {
 	return f, true
 }
 
+func hasElseKeywordPrefix(s string) bool {
+	return strings.HasPrefix(s, "else") && (len(s) == 4 || !isIdentByte(s[4]))
+}
+
+func isControlBlockStmt(s string) bool {
+	t := strings.TrimSpace(s)
+	if strings.HasPrefix(t, "{") {
+		return true
+	}
+	for _, kw := range []string{"if", "for", "while"} {
+		if strings.HasPrefix(t, kw) && (len(t) == len(kw) || t[len(kw)] == ' ' || t[len(kw)] == '\t' || t[len(kw)] == '(') {
+			return true
+		}
+	}
+	return false
+}
+
+func isIncompleteControlHeader(s string) bool {
+	t := strings.TrimSpace(s)
+	if t == "" || !isControlBlockStmt(t) || strings.HasPrefix(t, "{") {
+		return false
+	}
+	openP := strings.IndexByte(t, '(')
+	closeP := findMatchingDelimiter(t, openP, '(', ')')
+	if openP > 0 && closeP == len(t)-1 {
+		return true
+	}
+	if strings.HasSuffix(t, "else") && len(t) > 4 && !isIdentByte(t[len(t)-5]) {
+		return true
+	}
+	if strings.HasSuffix(t, ")") {
+		// Check trailing `else if (...)`
+		if idx := strings.LastIndex(t, "else"); idx > 0 && !isIdentByte(t[idx-1]) {
+			tail := strings.TrimSpace(t[idx+4:])
+			if strings.HasPrefix(tail, "if") && (len(tail) == 2 || tail[2] == ' ' || tail[2] == '\t' || tail[2] == '(') {
+				op := strings.IndexByte(tail, '(')
+				cp := findMatchingDelimiter(tail, op, '(', ')')
+				if op > 0 && cp == len(tail)-1 {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func parseIfBlocks(stmt string) (cond, thenBody, elseBody string, ok bool) {
 	openParen := strings.IndexByte(stmt, '(')
 	closeParen := findMatchingDelimiter(stmt, openParen, '(', ')')
@@ -2335,15 +2581,53 @@ func parseIfBlocks(stmt string) (cond, thenBody, elseBody string, ok bool) {
 		}
 		thenBody = rest[1:closeBrace]
 		afterThen := strings.TrimSpace(rest[closeBrace+1:])
-		if strings.HasPrefix(afterThen, "else") {
+		if hasElseKeywordPrefix(afterThen) {
 			elseRest := strings.TrimSpace(afterThen[4:])
-			if strings.HasPrefix(elseRest, "{") && strings.HasSuffix(elseRest, "}") {
+			if strings.HasPrefix(elseRest, "{") && findMatchingDelimiter(elseRest, 0, '{', '}') == len(elseRest)-1 {
 				elseBody = elseRest[1 : len(elseRest)-1]
 			} else {
 				elseBody = elseRest
 			}
 		}
 		return cond, thenBody, elseBody, true
+	}
+	// Braceless `if (cond) thenStmt; else elseStmt`
+	braceDepth := 0
+	parenDepth := 0
+	inQuotes := byte(0)
+	inRegexClass := false
+	for i := 0; i < len(rest); i++ {
+		if stepQuoteState(rest, i, &inQuotes, &inRegexClass) {
+			continue
+		}
+		switch rest[i] {
+		case '(', '[':
+			parenDepth++
+		case ')', ']':
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		case '{':
+			braceDepth++
+		case '}':
+			if braceDepth > 0 {
+				braceDepth--
+			}
+		case ';', '\n':
+			if braceDepth == 0 && parenDepth == 0 {
+				after := strings.TrimSpace(rest[i+1:])
+				if hasElseKeywordPrefix(after) {
+					thenBody = strings.TrimSpace(rest[:i])
+					elseRest := strings.TrimSpace(after[4:])
+					if strings.HasPrefix(elseRest, "{") && findMatchingDelimiter(elseRest, 0, '{', '}') == len(elseRest)-1 {
+						elseBody = elseRest[1 : len(elseRest)-1]
+					} else {
+						elseBody = elseRest
+					}
+					return cond, thenBody, elseBody, true
+				}
+			}
+		}
 	}
 	return cond, rest, "", true
 }
@@ -2404,17 +2688,21 @@ func splitTopLevelStatements(s string) []string {
 				braceDepth--
 			}
 			curr.WriteByte(c)
-			if braceDepth == 0 && parenDepth == 0 {
-				// Check if followed by `else`
+			if braceDepth == 0 && parenDepth == 0 && isControlBlockStmt(curr.String()) {
 				rem := strings.TrimSpace(s[i+1:])
-				if !strings.HasPrefix(rem, "else") {
+				if !hasElseKeywordPrefix(rem) {
 					out = append(out, curr.String())
 					curr.Reset()
 				}
 			}
 		case ';', '\n':
 			if braceDepth == 0 && parenDepth == 0 {
-				if c == '\n' && strings.HasPrefix(strings.TrimSpace(s[i+1:]), "else") {
+				rem := strings.TrimSpace(s[i+1:])
+				if c == '\n' && (hasElseKeywordPrefix(rem) || isIncompleteControlHeader(curr.String())) {
+					curr.WriteByte(c)
+					continue
+				}
+				if c == ';' && isControlBlockStmt(curr.String()) && hasElseKeywordPrefix(rem) {
 					curr.WriteByte(c)
 					continue
 				}
@@ -2583,25 +2871,14 @@ func setValueAtPath(root map[string]any, path []string, val any) {
 func splitTopLevelSemicolonPainless(s string) []string {
 	var parts []string
 	depth := 0
-	var quote byte
+	inQuotes := byte(0)
+	inRegexClass := false
 	last := 0
 	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		if quote != 0 {
-			if ch == '\\' && i+1 < len(s) {
-				i++
-				continue
-			}
-			if ch == quote {
-				quote = 0
-			}
+		if stepQuoteState(s, i, &inQuotes, &inRegexClass) {
 			continue
 		}
-		if ch == '\'' || ch == '"' {
-			quote = ch
-			continue
-		}
-		switch ch {
+		switch s[i] {
 		case '(', '[', '{':
 			depth++
 		case ')', ']', '}':
@@ -2652,24 +2929,14 @@ func evalInstanceOfPainless(val any, typeName string) bool {
 
 func splitPostCallPropertyAccess(s string) (callExpr, tailPath string, ok bool) {
 	depth := 0
-	var quote byte
+	inQuotes := byte(0)
+	inRegexClass := false
 	lastCallEnd := -1
 	for i := 0; i < len(s); i++ {
+		if stepQuoteState(s, i, &inQuotes, &inRegexClass) {
+			continue
+		}
 		ch := s[i]
-		if quote != 0 {
-			if ch == '\\' && i+1 < len(s) {
-				i++
-				continue
-			}
-			if ch == quote {
-				quote = 0
-			}
-			continue
-		}
-		if ch == '\'' || ch == '"' {
-			quote = ch
-			continue
-		}
 		if ch == '(' || ch == '[' {
 			depth++
 			continue
@@ -2945,24 +3212,37 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 		}
 		return "", true, nil
 	case "String.join":
-		if len(args) == 2 {
+		if len(args) >= 2 {
 			sepVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
-			colExpr := strings.TrimSpace(args[1])
-			var colVal any
-			if (strings.HasPrefix(colExpr, "doc.") || strings.HasPrefix(colExpr, "doc?.")) &&
-				!strings.HasSuffix(colExpr, ".value") && !strings.Contains(colExpr, ".values.") {
-				docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(colExpr, "doc?."), "doc."), ".values")
-				colVal = resolveDocValuesSlice(sourceMap, docPath)
-			} else {
-				colVal, _ = evalRHSExprDepth(sourceMap, colExpr, params, depth+1)
-			}
-			if tv, ok := colVal.([]any); ok {
-				parts := make([]string, len(tv))
-				for i, item := range tv {
-					parts[i] = fmt.Sprintf("%v", item)
+			sepStr := fmt.Sprintf("%v", sepVal)
+			if len(args) == 2 {
+				colExpr := strings.TrimSpace(args[1])
+				var colVal any
+				if (strings.HasPrefix(colExpr, "doc.") || strings.HasPrefix(colExpr, "doc?.")) &&
+					!strings.HasSuffix(colExpr, ".value") && !strings.Contains(colExpr, ".values.") {
+					docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(colExpr, "doc?."), "doc."), ".values")
+					colVal = resolveDocValuesSlice(sourceMap, docPath)
+				} else {
+					colVal, _ = evalRHSExprDepth(sourceMap, colExpr, params, depth+1)
 				}
-				return strings.Join(parts, fmt.Sprintf("%v", sepVal)), true, nil
+				if tv, ok := colVal.([]any); ok {
+					parts := make([]string, len(tv))
+					for i, item := range tv {
+						parts[i] = fmt.Sprintf("%v", item)
+					}
+					return strings.Join(parts, sepStr), true, nil
+				}
+				if colVal != nil {
+					return fmt.Sprintf("%v", colVal), true, nil
+				}
+				return "", true, nil
 			}
+			parts := make([]string, len(args)-1)
+			for i := 1; i < len(args); i++ {
+				itemVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[i]), params, depth+1)
+				parts[i-1] = fmt.Sprintf("%v", itemVal)
+			}
+			return strings.Join(parts, sepStr), true, nil
 		}
 		return "", true, nil
 	}

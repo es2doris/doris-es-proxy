@@ -345,7 +345,7 @@ func TestRound7_TopHitsScoreSortDoris4SearchGuardAndLuceneEdgeCases(t *testing.T
 	planPromoted, err := trDoris4.BuildSearchPlan(&esast.SearchRequest{
 		Query: &esast.Query{QueryString: &esast.QueryStringQuery{Query: "title:orders"}},
 	})
-	if err != nil || !strings.Contains(planPromoted.HitsSQL, "SEARCH('title:orders'") {
+	if err != nil || !strings.Contains(planPromoted.HitsSQL, "SEARCH('f__title:orders'") {
 		t.Fatalf("expected SEARCH() for promoted field, got: %v / %s", err, planPromoted.HitsSQL)
 	}
 	// Dynamic VARIANT field -> falls back to Lucene compiler
