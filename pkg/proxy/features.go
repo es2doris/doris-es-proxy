@@ -1258,12 +1258,13 @@ func parseIngestByteSize(s string) (int64, error) {
 
 func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error) {
 	type dissectToken struct {
-		rawKey   string
-		nextLit  string
-		padRight bool
-		skip     bool
-		append   bool
-		indirect bool
+		rawKey      string
+		nextLit     string
+		padRight    bool
+		skip        bool
+		append      bool
+		appendOrder int
+		indirect    bool
 	}
 	var prefixLit string
 	var tokens []dissectToken
@@ -1305,10 +1306,16 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 		case inner == "" || strings.HasPrefix(inner, "?"):
 			tok.skip = true
 			tok.rawKey = strings.TrimPrefix(inner, "?")
+		case strings.HasPrefix(inner, "*"):
+			tok.skip = true
+			tok.rawKey = strings.TrimPrefix(inner, "*")
 		case strings.HasPrefix(inner, "+"):
 			tok.append = true
 			inner = strings.TrimPrefix(inner, "+")
 			if slashIdx := strings.IndexByte(inner, '/'); slashIdx > 0 {
+				if ord, err := strconv.Atoi(inner[slashIdx+1:]); err == nil && ord > 0 {
+					tok.appendOrder = ord
+				}
 				inner = inner[:slashIdx]
 			}
 			tok.rawKey = inner
@@ -1327,6 +1334,7 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 	cur := input[len(prefixLit):]
 	out := make(map[string]any)
 	refValues := make(map[string]string)
+	captured := make([]string, len(tokens))
 
 	for i, tok := range tokens {
 		var val string
@@ -1348,10 +1356,24 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 					cur = cur[len(tok.nextLit):]
 				}
 			}
+			if isLast && cur != "" {
+				return nil, fmt.Errorf("unable to dissect [%s] with pattern [%s]: trailing characters [%s]", input, pattern, cur)
+			}
 		}
+		captured[i] = val
 		if !tok.indirect && tok.rawKey != "" {
 			refValues[tok.rawKey] = val
 		}
+	}
+
+	type appendPiece struct {
+		order int
+		seq   int
+		val   string
+	}
+	appendsByKey := make(map[string][]appendPiece)
+
+	for i, tok := range tokens {
 		if tok.skip || tok.rawKey == "" {
 			continue
 		}
@@ -1362,15 +1384,35 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 				continue
 			}
 		}
+		val := captured[i]
 		if tok.append {
-			if existing, exists := out[targetKey]; exists {
-				out[targetKey] = fmt.Sprintf("%v%s%s", existing, appendSep, val)
-			} else {
-				out[targetKey] = val
-			}
+			appendsByKey[targetKey] = append(appendsByKey[targetKey], appendPiece{
+				order: tok.appendOrder,
+				seq:   i,
+				val:   val,
+			})
 		} else {
 			out[targetKey] = val
 		}
+	}
+	for targetKey, pieces := range appendsByKey {
+		sort.SliceStable(pieces, func(a, b int) bool {
+			if pieces[a].order != pieces[b].order {
+				if pieces[a].order == 0 {
+					return false
+				}
+				if pieces[b].order == 0 {
+					return true
+				}
+				return pieces[a].order < pieces[b].order
+			}
+			return pieces[a].seq < pieces[b].seq
+		})
+		vals := make([]string, len(pieces))
+		for idx, p := range pieces {
+			vals[idx] = p.val
+		}
+		out[targetKey] = strings.Join(vals, appendSep)
 	}
 	return out, nil
 }
@@ -1487,7 +1529,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			}
 			targetField, _ := specMap["target_field"].(string)
 			if targetField != "" {
-				setIngestPath(doc, targetField, extracted)
+				setIngestPath(doc, targetField, map[string]any{})
+				for k, v := range extracted {
+					setIngestPath(doc, targetField+"."+k, v)
+				}
 			} else {
 				for k, v := range extracted {
 					setIngestPath(doc, k, v)
@@ -1733,48 +1778,24 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				if im, hasIM := specMap["ignore_missing"].(bool); hasIM && !im && !exists {
 					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing and cannot be converted to [%s]", field, convType)
 				}
-			} else {
-				str := strings.TrimSpace(fmt.Sprintf("%v", val))
-				switch strings.ToLower(convType) {
-				case "integer", "int", "long":
-					if iv, err := strconv.ParseInt(str, 10, 64); err == nil {
-						setIngestPath(doc, target, iv)
-						mutated = true
-					} else if fv, err := strconv.ParseFloat(str, 64); err == nil {
-						setIngestPath(doc, target, int64(fv))
-						mutated = true
-					} else {
-						return false, false, procType, procTag, specMap, fmt.Errorf("unable to convert [%v] to %s", val, convType)
+			} else if arr, isArr := val.([]any); isArr {
+				outArr := make([]any, len(arr))
+				for idx, elem := range arr {
+					cv, err := convertSingleIngestValue(elem, convType)
+					if err != nil {
+						return false, false, procType, procTag, specMap, err
 					}
-				case "float", "double":
-					if fv, err := strconv.ParseFloat(str, 64); err == nil {
-						setIngestPath(doc, target, fv)
-						mutated = true
-					} else {
-						return false, false, procType, procTag, specMap, fmt.Errorf("unable to convert [%v] to %s", val, convType)
-					}
-				case "string":
-					setIngestPath(doc, target, fmt.Sprintf("%v", val))
-					mutated = true
-				case "boolean", "bool":
-					if bv, err := strconv.ParseBool(str); err == nil {
-						setIngestPath(doc, target, bv)
-						mutated = true
-					} else {
-						return false, false, procType, procTag, specMap, fmt.Errorf("unable to convert [%v] to boolean", val)
-					}
-				case "auto":
-					if iv, err := strconv.ParseInt(str, 10, 64); err == nil {
-						setIngestPath(doc, target, iv)
-					} else if fv, err := strconv.ParseFloat(str, 64); err == nil {
-						setIngestPath(doc, target, fv)
-					} else if bv, err := strconv.ParseBool(str); err == nil {
-						setIngestPath(doc, target, bv)
-					} else {
-						setIngestPath(doc, target, str)
-					}
-					mutated = true
+					outArr[idx] = cv
 				}
+				setIngestPath(doc, target, outArr)
+				mutated = true
+			} else {
+				cv, err := convertSingleIngestValue(val, convType)
+				if err != nil {
+					return false, false, procType, procTag, specMap, err
+				}
+				setIngestPath(doc, target, cv)
+				mutated = true
 			}
 		}
 	case "gsub":
@@ -1793,6 +1814,17 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			if val, exists := getIngestPath(doc, field); exists {
 				if strVal, ok := val.(string); ok {
 					setIngestPath(doc, target, re.ReplaceAllString(strVal, repl))
+					mutated = true
+				} else if arr, isArr := val.([]any); isArr {
+					outArr := make([]any, len(arr))
+					for idx, elem := range arr {
+						if sElem, ok := elem.(string); ok {
+							outArr[idx] = re.ReplaceAllString(sElem, repl)
+						} else {
+							outArr[idx] = elem
+						}
+					}
+					setIngestPath(doc, target, outArr)
 					mutated = true
 				}
 			} else if isExplicitIgnoreMissingFalse(specMap) {
@@ -1859,7 +1891,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						kvMap[k] = v
 					}
 					if targetField != "" {
-						setIngestPath(doc, targetField, kvMap)
+						setIngestPath(doc, targetField, map[string]any{})
+						for k, v := range kvMap {
+							setIngestPath(doc, targetField+"."+k, v)
+						}
 					} else {
 						for k, v := range kvMap {
 							setIngestPath(doc, k, v)
@@ -1960,6 +1995,20 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		if field != "" && len(subProcs) > 0 {
 			if val, exists := getIngestPath(doc, field); exists {
 				if arr, ok := val.([]any); ok {
+					var prevVal any
+					var hadPrev bool
+					if origIngest, ok := doc["_ingest"].(map[string]any); ok && origIngest != nil {
+						prevVal, hadPrev = origIngest["_value"]
+					}
+					restoreIngestVal := func() {
+						if curIngest, ok := doc["_ingest"].(map[string]any); ok && curIngest != nil {
+							if hadPrev {
+								curIngest["_value"] = prevVal
+							} else {
+								delete(curIngest, "_value")
+							}
+						}
+					}
 					outArr := make([]any, len(arr))
 					for idx, elem := range arr {
 						ingestMeta, _ := doc["_ingest"].(map[string]any)
@@ -1970,9 +2019,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						doc["_ingest"] = ingestMeta
 						_, subDropped, subErr := runIngestProcessorList(s, doc, subProcs, depth+1, trace)
 						if subErr != nil {
+							restoreIngestVal()
 							return mutated, false, procType, procTag, specMap, subErr
 						}
 						if subDropped {
+							restoreIngestVal()
 							return mutated, true, procType, procTag, specMap, nil
 						}
 						if curIngest, ok := doc["_ingest"].(map[string]any); ok {
@@ -1981,6 +2032,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 							outArr[idx] = elem
 						}
 					}
+					restoreIngestVal()
 					setIngestPath(doc, field, outArr)
 					mutated = true
 				}
@@ -2121,6 +2173,18 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 				}
 				continue
 			}
+			ingestMeta, _ := doc["_ingest"].(map[string]any)
+			if ingestMeta == nil {
+				ingestMeta = make(map[string]any)
+			}
+			ingestMeta["on_failure_message"] = procErr.Error()
+			if _, hasType := ingestMeta["on_failure_processor_type"]; !hasType && procType != "" {
+				ingestMeta["on_failure_processor_type"] = procType
+			}
+			if _, hasTag := ingestMeta["on_failure_processor_tag"]; !hasTag && procTag != "" {
+				ingestMeta["on_failure_processor_tag"] = procTag
+			}
+			doc["_ingest"] = ingestMeta
 			return mutated, false, procErr
 		}
 	}
@@ -2295,6 +2359,62 @@ func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, map[string]any{"docs": docsOut})
 }
 
+func convertSingleIngestValue(val any, convType string) (any, error) {
+	str := strings.TrimSpace(fmt.Sprintf("%v", val))
+	switch strings.ToLower(convType) {
+	case "integer", "int", "long":
+		if iv, err := strconv.ParseInt(str, 10, 64); err == nil {
+			return iv, nil
+		}
+		if fv, err := strconv.ParseFloat(str, 64); err == nil {
+			return int64(fv), nil
+		}
+		return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
+	case "float", "double":
+		if fv, err := strconv.ParseFloat(str, 64); err == nil {
+			return fv, nil
+		}
+		return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
+	case "string":
+		return fmt.Sprintf("%v", val), nil
+	case "boolean", "bool":
+		if bv, err := strconv.ParseBool(str); err == nil {
+			return bv, nil
+		}
+		return nil, fmt.Errorf("unable to convert [%v] to boolean", val)
+	case "auto":
+		if iv, err := strconv.ParseInt(str, 10, 64); err == nil {
+			return iv, nil
+		}
+		if fv, err := strconv.ParseFloat(str, 64); err == nil {
+			return fv, nil
+		}
+		if bv, err := strconv.ParseBool(str); err == nil {
+			return bv, nil
+		}
+		return str, nil
+	default:
+		return val, nil
+	}
+}
+
+func parseIngestSliceIndex(seg string, length int) (int, bool) {
+	if seg == "" || length <= 0 {
+		return 0, false
+	}
+	idx, err := strconv.Atoi(seg)
+	if err != nil {
+		return 0, false
+	}
+	if idx < 0 {
+		idx = length + idx
+	}
+	if idx < 0 || idx >= length {
+		return 0, false
+	}
+	return idx, true
+}
+
 func getIngestPath(doc map[string]any, path string) (any, bool) {
 	if val, ok := doc[path]; ok {
 		return val, true
@@ -2303,19 +2423,42 @@ func getIngestPath(doc map[string]any, path string) (any, bool) {
 	if len(segs) <= 1 {
 		return nil, false
 	}
-	curr := doc
+	var curr any = doc
 	for i := 0; i < len(segs)-1; i++ {
-		if flatVal, flatOk := curr[strings.Join(segs[i:], ".")]; flatOk {
-			return flatVal, true
+		switch node := curr.(type) {
+		case map[string]any:
+			if flatVal, flatOk := node[strings.Join(segs[i:], ".")]; flatOk {
+				return flatVal, true
+			}
+			next, exists := node[segs[i]]
+			if !exists {
+				return nil, false
+			}
+			curr = next
+		case []any:
+			idx, ok := parseIngestSliceIndex(segs[i], len(node))
+			if !ok {
+				return nil, false
+			}
+			curr = node[idx]
+		default:
+			return nil, false
 		}
-		next, ok := curr[segs[i]].(map[string]any)
+	}
+	lastSeg := segs[len(segs)-1]
+	switch node := curr.(type) {
+	case map[string]any:
+		val, ok := node[lastSeg]
+		return val, ok
+	case []any:
+		idx, ok := parseIngestSliceIndex(lastSeg, len(node))
 		if !ok {
 			return nil, false
 		}
-		curr = next
+		return node[idx], true
+	default:
+		return nil, false
 	}
-	val, ok := curr[segs[len(segs)-1]]
-	return val, ok
 }
 
 func setIngestPath(doc map[string]any, path string, val any) {
@@ -2325,17 +2468,52 @@ func setIngestPath(doc map[string]any, path string, val any) {
 		return
 	}
 	delete(doc, path)
-	curr := doc
+	var curr any = doc
 	for i := 0; i < len(segs)-1; i++ {
-		delete(curr, strings.Join(segs[i:], "."))
-		next, ok := curr[segs[i]].(map[string]any)
-		if !ok {
-			next = make(map[string]any)
-			curr[segs[i]] = next
+		seg := segs[i]
+		switch node := curr.(type) {
+		case map[string]any:
+			delete(node, strings.Join(segs[i:], "."))
+			next, exists := node[seg]
+			if !exists || next == nil {
+				nextMap := make(map[string]any)
+				node[seg] = nextMap
+				curr = nextMap
+				continue
+			}
+			if _, isMap := next.(map[string]any); isMap {
+				curr = next
+				continue
+			}
+			if _, isSlice := next.([]any); isSlice {
+				curr = next
+				continue
+			}
+			nextMap := make(map[string]any)
+			node[seg] = nextMap
+			curr = nextMap
+		case []any:
+			idx, ok := parseIngestSliceIndex(seg, len(node))
+			if !ok {
+				return
+			}
+			if node[idx] == nil {
+				node[idx] = make(map[string]any)
+			}
+			curr = node[idx]
+		default:
+			return
 		}
-		curr = next
 	}
-	curr[segs[len(segs)-1]] = val
+	lastSeg := segs[len(segs)-1]
+	switch node := curr.(type) {
+	case map[string]any:
+		node[lastSeg] = val
+	case []any:
+		if idx, ok := parseIngestSliceIndex(lastSeg, len(node)); ok {
+			node[idx] = val
+		}
+	}
 }
 
 func deleteIngestPath(doc map[string]any, path string) {
@@ -2344,19 +2522,32 @@ func deleteIngestPath(doc map[string]any, path string) {
 	if len(segs) <= 1 {
 		return
 	}
-	curr := doc
+	var curr any = doc
 	for i := 0; i < len(segs)-1; i++ {
-		if _, flatOk := curr[strings.Join(segs[i:], ".")]; flatOk {
-			delete(curr, strings.Join(segs[i:], "."))
+		switch node := curr.(type) {
+		case map[string]any:
+			if _, flatOk := node[strings.Join(segs[i:], ".")]; flatOk {
+				delete(node, strings.Join(segs[i:], "."))
+				return
+			}
+			next, exists := node[segs[i]]
+			if !exists {
+				return
+			}
+			curr = next
+		case []any:
+			idx, ok := parseIngestSliceIndex(segs[i], len(node))
+			if !ok {
+				return
+			}
+			curr = node[idx]
+		default:
 			return
 		}
-		next, ok := curr[segs[i]].(map[string]any)
-		if !ok {
-			return
-		}
-		curr = next
 	}
-	delete(curr, segs[len(segs)-1])
+	if node, ok := curr.(map[string]any); ok {
+		delete(node, segs[len(segs)-1])
+	}
 }
 
 // handleCatNodes implements `GET /_cat/nodes` for Elasticvue & Cerebro.
@@ -2603,9 +2794,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				}
 				prepared = append(prepared, preparedDoc{id: h.ID, source: docSource, srcVer: h.Version})
 				candIDs = append(candIDs, h.ID)
-				if destSchema == nil && len(sampleDocs) < 16 {
-					sampleDocs = append(sampleDocs, docSource)
-				}
+				sampleDocs = append(sampleDocs, docSource)
 			}
 			if len(prepared) == 0 {
 				searchAfter = []any{hits[len(hits)-1].ID}
@@ -2614,9 +2803,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				}
 				continue
 			}
-			if destSchema == nil {
-				destSchema = s.ensureWritableIndexSchemaWithDocs(r.Context(), destIndex, sampleDocs)
-			}
+			destSchema = s.ensureWritableIndexSchemaWithDocs(r.Context(), destIndex, sampleDocs)
 			_ = s.coalescer.FlushTable(r.Context(), destSchema.DorisTable)
 			var existingDocs map[string]HitRow
 			if len(candIDs) > 0 {

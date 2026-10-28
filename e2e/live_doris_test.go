@@ -720,4 +720,44 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	if _, hasProcResults := simR13Docs[0].(map[string]any)["processor_results"].([]any); !hasProcResults {
 		t.Fatalf("expected processor_results in verbose _simulate response, got: %+v", simR13Docs[0])
 	}
+
+	// 15. Verify Round-14 features on live Doris:
+	//   - `collapse` + `search_after` keyset pagination on outer `_collapsed` subquery
+	//   - `dissect` `/N` append ordering & reference-only keys (`%{*r1}=%{&r1}`) + array `convert`/`gsub`
+	collapsePage2Resp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
+		"size": 1,
+		"sort": [{"latency_ms": "desc"}],
+		"search_after": [999999],
+		"collapse": {
+			"field": "service",
+			"inner_hits": {
+				"name": "by_svc",
+				"size": 3,
+				"sort": [{"latency_ms": "asc"}]
+			}
+		}
+	}`))
+	if err != nil || collapsePage2Resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search (collapse + search_after) failed: status=%v err=%v", collapsePage2Resp.StatusCode, err)
+	}
+	var collapsePage2Res map[string]any
+	_ = json.NewDecoder(collapsePage2Resp.Body).Decode(&collapsePage2Res)
+	_ = collapsePage2Resp.Body.Close()
+	if len(collapsePage2Res["hits"].(map[string]any)["hits"].([]any)) == 0 {
+		t.Fatalf("expected collapsed hits with search_after on live_auto_index, got 0")
+	}
+
+	simR14Resp, err := http.Post(ts.URL+"/_ingest/pipeline/_simulate", "application/json", strings.NewReader(`{
+		"pipeline": {
+			"processors": [
+				{"dissect": {"field": "raw", "pattern": "%{*k}=%{&k} %{+name/2} %{+name/1}", "append_separator": " "}},
+				{"convert": {"field": "nums", "type": "integer"}}
+			]
+		},
+		"docs": [{"_index": "live_auto_index", "_id": "sim-r14", "_source": {"raw": "env=prod Doe Jane", "nums": ["1", "2"]}}]
+	}`))
+	if err != nil || simR14Resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_ingest/pipeline/_simulate (R14 dissect+array convert) failed: status=%v err=%v", simR14Resp.StatusCode, err)
+	}
+	_ = simR14Resp.Body.Close()
 }
