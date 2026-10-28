@@ -3231,9 +3231,9 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			}
 			op.Source = piped
 		}
-		if (op.Action == "index" || op.Action == "create") && len(op.Source) > 0 && len(sampleDocsByIndex[idxName]) < 16 {
+		if (op.Action == "index" || op.Action == "create") && len(op.Source) > 0 {
 			sampleDocsByIndex[idxName] = append(sampleDocsByIndex[idxName], op.Source)
-		} else if op.Action == "update" && len(op.Source) > 0 && len(sampleDocsByIndex[idxName]) < 16 {
+		} else if op.Action == "update" && len(op.Source) > 0 {
 			var u painless.UpdateRequest
 			if err := json.Unmarshal(op.Source, &u); err == nil {
 				if len(u.Doc) > 0 {
@@ -3264,7 +3264,14 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	type pendingBulkRow struct {
+		id      string
+		ver     int64
+		deleted bool
+		source  json.RawMessage
+	}
 	byIndex := make(map[string]*bytes.Buffer)
+	pendingRowsByTable := make(map[string][]pendingBulkRow)
 	var items []map[string]any
 	hasErrors := false
 
@@ -3514,7 +3521,17 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				if len(sourceToShred) > 0 {
+					prevSchema := idxSchema
 					idxSchema = s.ensureWritableIndexSchemaWithDocs(r.Context(), targetIndex, []json.RawMessage{sourceToShred})
+					if idxSchema != prevSchema && len(pendingRowsByTable[idxSchema.DorisTable]) > 0 {
+						buf.Reset()
+						for _, prevRow := range pendingRowsByTable[idxSchema.DorisTable] {
+							if reShredded, reErr := schema.ShredDocument(idxSchema, prevRow.id, prevRow.ver, prevRow.deleted, prevRow.source); reErr == nil {
+								buf.Write(reShredded)
+								buf.WriteByte('\n')
+							}
+						}
+					}
 				}
 			}
 		}
@@ -3535,6 +3552,12 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		}
 		buf.Write(shredded)
 		buf.WriteByte('\n')
+		pendingRowsByTable[idxSchema.DorisTable] = append(pendingRowsByTable[idxSchema.DorisTable], pendingBulkRow{
+			id:      op.ID,
+			ver:     nextVer,
+			deleted: deleted,
+			source:  sourceToShred,
+		})
 
 		if existingByIndex[targetIndex] == nil {
 			existingByIndex[targetIndex] = make(map[string]HitRow)
@@ -4064,6 +4087,7 @@ func (s *Server) executeSearchRequest(
 			fetchSize := from + size
 			if req.Collapse != nil && req.Collapse.Field != "" {
 				fetchSize = from + size + 100
+				subReq.SearchAfter = nil
 			}
 			subReq.From = &zero
 			subReq.Size = &fetchSize
@@ -4214,7 +4238,7 @@ func (s *Server) executeSearchRequest(
 				if r.AggName != "__meta_total" {
 					spec := resolveAggSpecByPath(effAggs, r.AggName)
 					if metricField := singleValueMetricField(spec); metricField != "" {
-						if r.effectiveValue() == 0 && !indexSchemaHasField(idxSchema, metricField) {
+						if r.effectiveValue() == 0 && !metricAggHasMissing(spec) && !indexSchemaHasField(idxSchema, metricField) {
 							continue
 						}
 						parent := parentBucketAggPath(effAggs, r.AggName)
@@ -4289,7 +4313,7 @@ func (s *Server) executeSearchRequest(
 			}
 			return allHits[i].ID < allHits[j].ID
 		})
-		if req.Collapse != nil && req.Collapse.Field != "" && len(allHits) > 1 {
+		if req.Collapse != nil && req.Collapse.Field != "" && len(allHits) > 0 {
 			seenCollapse := make(map[string]struct{}, len(allHits))
 			deduped := make([]HitRow, 0, len(allHits))
 			collapseSort := []esast.SortSpec{{Entry: esast.SortEntry{Field: req.Collapse.Field}}}
@@ -4300,11 +4324,14 @@ func (s *Server) executeSearchRequest(
 				}
 				vals := extractHitSortValues(h, collapseSort, hSchema)
 				if len(vals) > 0 && vals[0] != nil {
-					ck := fmt.Sprintf("%v", vals[0])
+					ck := normalizeCollapseGroupKey(vals[0], req.Collapse.Field, primarySchema, hSchema)
 					if _, exists := seenCollapse[ck]; exists {
 						continue
 					}
 					seenCollapse[ck] = struct{}{}
+				}
+				if len(req.SearchAfter) > 0 && !hitIsAfterSearchAfter(h, req.Sort, req.SearchAfter, hSchema) {
+					continue
 				}
 				deduped = append(deduped, h)
 			}
@@ -4708,6 +4735,33 @@ func singleValueMetricField(spec esast.AggSpec) string {
 	}
 }
 
+func metricAggHasMissing(spec esast.AggSpec) bool {
+	switch {
+	case spec.Min != nil:
+		return spec.Min.Missing != nil
+	case spec.Max != nil:
+		return spec.Max.Missing != nil
+	case spec.Avg != nil:
+		return spec.Avg.Missing != nil
+	case spec.Sum != nil:
+		return spec.Sum.Missing != nil
+	case spec.ValueCount != nil:
+		return spec.ValueCount.Missing != nil
+	case spec.Cardinality != nil:
+		return spec.Cardinality.Missing != nil
+	case spec.Percentiles != nil:
+		return spec.Percentiles.Missing != nil
+	case spec.PercentileRanks != nil:
+		return spec.PercentileRanks.Missing != nil
+	case spec.Boxplot != nil:
+		return spec.Boxplot.Missing != nil
+	case spec.EffectiveStats() != nil:
+		return spec.EffectiveStats().Missing != nil
+	default:
+		return false
+	}
+}
+
 func isUnderGlobalAgg(aggs map[string]esast.AggSpec, fullAggName string) bool {
 	if len(aggs) == 0 || fullAggName == "" {
 		return false
@@ -4777,6 +4831,79 @@ func parseIPv4SortUint32(v any) (uint32, bool) {
 
 func compareHitRowsBySort(a, b HitRow, sorts []esast.SortSpec, idxSchema *schema.IndexSchema) int {
 	return compareHitRowsBySortWithSchemas(a, b, sorts, idxSchema, idxSchema)
+}
+
+func hitIsAfterSearchAfter(h HitRow, sorts []esast.SortSpec, searchAfter []any, idxSchema *schema.IndexSchema) bool {
+	if len(searchAfter) == 0 {
+		return true
+	}
+	effSorts := sorts
+	if len(effSorts) == 0 {
+		effSorts = []esast.SortSpec{{Entry: esast.SortEntry{Field: "_score", Order: "desc"}}}
+	}
+	valsA := extractHitSortValues(h, effSorts, idxSchema)
+	for idx, s := range effSorts {
+		if idx >= len(valsA) || idx >= len(searchAfter) {
+			break
+		}
+		va := valsA[idx]
+		vb := searchAfter[idx]
+		if jsonNum, ok := vb.(json.Number); ok {
+			if iv, err := jsonNum.Int64(); err == nil {
+				vb = iv
+			} else if fv, err := jsonNum.Float64(); err == nil {
+				vb = fv
+			}
+		}
+		if strVal, ok := vb.(string); ok && idxSchema != nil {
+			b := idxSchema.ResolveField(s.Entry.Field)
+			if b.EffectiveLowercase(strings.HasSuffix(s.Entry.Field, ".keyword")) {
+				vb = strings.ToLower(strVal)
+			} else if b.ESType == "date" || b.DorisType == schema.DorisBigInt {
+				if ms, ok := schema.ParseESDateToEpochMillis(strVal, time.Now().UTC()); ok {
+					vb = ms
+				}
+			}
+		}
+		if va == nil && vb == nil {
+			continue
+		}
+		missingFirst := s.Entry.Missing != "" && strings.EqualFold(s.Entry.Missing, "_first")
+		var cmp int
+		if va == nil {
+			if missingFirst {
+				cmp = -1
+			} else {
+				cmp = 1
+			}
+		} else if vb == nil {
+			if missingFirst {
+				cmp = 1
+			} else {
+				cmp = -1
+			}
+		} else if ipA, okA := parseIPv4SortUint32(va); okA {
+			if ipB, okB := parseIPv4SortUint32(vb); okB {
+				if ipA < ipB {
+					cmp = -1
+				} else if ipA > ipB {
+					cmp = 1
+				}
+			} else {
+				cmp = compareAny(va, vb)
+			}
+		} else {
+			cmp = compareAny(va, vb)
+		}
+		if cmp == 0 {
+			continue
+		}
+		if strings.EqualFold(s.Entry.Order, "desc") {
+			cmp = -cmp
+		}
+		return cmp > 0
+	}
+	return false
 }
 
 func compareHitRowsBySortWithSchemas(a, b HitRow, sorts []esast.SortSpec, schemaA, schemaB *schema.IndexSchema) int {
@@ -5233,8 +5360,13 @@ func collectNestedQueriesWithInnerHits(q *esast.Query, out *[]*esast.NestedQuery
 	if q.ConstantScore != nil {
 		collectNestedQueriesWithInnerHits(&q.ConstantScore.Filter, out)
 	}
-	if q.FunctionScore != nil && q.FunctionScore.Query != nil {
-		collectNestedQueriesWithInnerHits(q.FunctionScore.Query, out)
+	if q.FunctionScore != nil {
+		if q.FunctionScore.Query != nil {
+			collectNestedQueriesWithInnerHits(q.FunctionScore.Query, out)
+		}
+		for i := range q.FunctionScore.Functions {
+			collectNestedQueriesWithInnerHits(q.FunctionScore.Functions[i].Filter, out)
+		}
 	}
 	if q.ScriptScore != nil && q.ScriptScore.Query != nil {
 		collectNestedQueriesWithInnerHits(q.ScriptScore.Query, out)
@@ -5317,6 +5449,72 @@ func normalizeInnerHitsSourceFilter(sf *esast.SourceFilter, nestedPath string) *
 	return &cp
 }
 
+func deriveNestedEvalSchema(base *schema.IndexSchema, nestedPath string) *schema.IndexSchema {
+	if base == nil || nestedPath == "" {
+		return base
+	}
+	cp := *base
+	cp.Fields = make(map[string]schema.FieldBinding, len(base.Fields)*2)
+	for k, b := range base.Fields {
+		cp.Fields[k] = b
+	}
+	prefix := nestedPath + "."
+	for k, b := range base.Fields {
+		if strings.HasPrefix(k, prefix) {
+			relKey := strings.TrimPrefix(k, prefix)
+			if _, exists := cp.Fields[relKey]; !exists {
+				relB := b
+				if len(b.RelativeJSONPath) > 0 {
+					relB.SourceJSONPath = b.RelativeJSONPath
+				}
+				cp.Fields[relKey] = relB
+			}
+		}
+	}
+	return &cp
+}
+
+func sortSpecsUseScore(sorts []esast.SortSpec) bool {
+	for _, s := range sorts {
+		if s.Entry.Field == "_score" {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeCollapseGroupKey(val any, field string, primarySchema, hitSchema *schema.IndexSchema) string {
+	if val == nil {
+		return ""
+	}
+	if strVal, ok := val.(string); ok {
+		isDate := false
+		isLower := false
+		for _, sc := range []*schema.IndexSchema{hitSchema, primarySchema} {
+			if sc == nil {
+				continue
+			}
+			b := sc.ResolveField(field)
+			if b.ESType == "date" || b.ESType == "date_nanos" || b.DorisType == schema.DorisBigInt {
+				isDate = true
+			}
+			if b.EffectiveLowercase(true) {
+				isLower = true
+			}
+		}
+		if isDate {
+			if ms, ok := schema.ParseESDateToEpochMillis(strVal, time.Now().UTC()); ok {
+				return strconv.FormatInt(ms, 10)
+			}
+		}
+		if isLower {
+			return strings.ToLower(strVal)
+		}
+		return strVal
+	}
+	return fmt.Sprintf("%v", val)
+}
+
 func buildNestedInnerHitsForHit(h HitRow, hitIdx string, hitSchema *schema.IndexSchema, nq *esast.NestedQuery) map[string]any {
 	emptyEnvelope := func() map[string]any {
 		return map[string]any{
@@ -5370,8 +5568,9 @@ func buildNestedInnerHitsForHit(h HitRow, hitIdx string, hitSchema *schema.Index
 		}
 		evalSchema = schema.CompileIndexSchema("es_compat", hitIdx, schema.MergeMappingSpecs(baseRaw, nestedSpec))
 	}
+	nestedEvalSchema := deriveNestedEvalSchema(evalSchema, nq.Path)
 
-	tr := transpiler.NewTranspiler(evalSchema, transpiler.TranspilerOptions{})
+	tr := transpiler.NewTranspiler(nestedEvalSchema, transpiler.TranspilerOptions{})
 	cq := tr.CompileQuery(&esast.Query{Nested: nq}, true, nil)
 
 	type matchedNestedElem struct {
@@ -5422,7 +5621,7 @@ func buildNestedInnerHitsForHit(h HitRow, hitIdx string, hitSchema *schema.Index
 	ih := nq.InnerHits
 	if len(ih.Sort) > 0 && len(matched) > 1 {
 		sort.SliceStable(matched, func(i, j int) bool {
-			if cmp := compareHitRowsBySort(matched[i].hit, matched[j].hit, ih.Sort, evalSchema); cmp != 0 {
+			if cmp := compareHitRowsBySort(matched[i].hit, matched[j].hit, ih.Sort, nestedEvalSchema); cmp != 0 {
 				return cmp < 0
 			}
 			return matched[i].offset < matched[j].offset
@@ -5460,11 +5659,21 @@ func buildNestedInnerHitsForHit(h HitRow, hitIdx string, hitSchema *schema.Index
 
 	normSF := normalizeInnerHitsSourceFilter(ih.Source, nq.Path)
 	ihFieldSpecs := ih.EffectiveFieldSpecs()
-	ihSyntheticReq := &esast.SearchRequest{
-		Fields: ihFieldSpecs,
+	var explicitFieldSpecs, bareWildcardFieldSpecs []esast.FieldRequestSpec
+	for _, fs := range ihFieldSpecs {
+		clean := strings.TrimSuffix(strings.TrimSuffix(fs.Field, ".keyword"), ".ngram")
+		if strings.ContainsAny(clean, "*?") && !strings.HasPrefix(clean, nq.Path+".") {
+			bareWildcardFieldSpecs = append(bareWildcardFieldSpecs, fs)
+		} else {
+			explicitFieldSpecs = append(explicitFieldSpecs, fs)
+		}
 	}
 	outHits := make([]map[string]any, 0, len(matched))
 	for _, m := range matched {
+		var hitScore any = m.hit.Score
+		if len(ih.Sort) > 0 && !sortSpecsUseScore(ih.Sort) {
+			hitScore = nil
+		}
 		ihHitMap := map[string]any{
 			"_index": hitIdx,
 			"_id":    h.ID,
@@ -5472,7 +5681,7 @@ func buildNestedInnerHitsForHit(h HitRow, hitIdx string, hitSchema *schema.Index
 				"field":  nq.Path,
 				"offset": m.offset,
 			},
-			"_score": m.hit.Score,
+			"_score": hitScore,
 		}
 		if normSF == nil || !normSF.Disabled {
 			var srcObj any
@@ -5485,18 +5694,43 @@ func buildNestedInnerHitsForHit(h HitRow, hitIdx string, hitSchema *schema.Index
 			}
 		}
 		if len(ih.Sort) > 0 {
-			ihHitMap["sort"] = extractHitSortValues(m.hit, ih.Sort, evalSchema)
+			ihHitMap["sort"] = extractHitSortValues(m.hit, ih.Sort, nestedEvalSchema)
 		}
 		if len(ihFieldSpecs) > 0 {
-			if fm := extractHitFieldsMap(m.hit, hitIdx, ihSyntheticReq, evalSchema); len(fm) > 0 {
+			fm := make(map[string][]any)
+			if len(bareWildcardFieldSpecs) > 0 {
+				elemOnlyHit := m.hit
+				elemOnlyHit.RawSource = nil
+				for fk, fv := range extractHitFieldsMap(elemOnlyHit, hitIdx, &esast.SearchRequest{Fields: bareWildcardFieldSpecs}, nestedEvalSchema) {
+					fm[fk] = fv
+				}
+			}
+			if len(explicitFieldSpecs) > 0 {
+				for fk, fv := range extractHitFieldsMap(m.hit, hitIdx, &esast.SearchRequest{Fields: explicitFieldSpecs}, nestedEvalSchema) {
+					fm[fk] = fv
+				}
+			}
+			if len(fm) > 0 {
 				ihHitMap["fields"] = fm
+			}
+		}
+		if ih.Highlight != nil && len(ih.Highlight.Fields) > 0 {
+			hlSrc := m.hit.RawSource
+			for hf := range ih.Highlight.Fields {
+				if strings.Contains(hf, "*") && !strings.HasPrefix(hf, nq.Path+".") {
+					hlSrc = m.hit.Source
+					break
+				}
+			}
+			if hl := buildHighlightMap(hlSrc, &esast.SearchRequest{Query: &nq.Query, Highlight: ih.Highlight}); len(hl) > 0 {
+				ihHitMap["highlight"] = hl
 			}
 		}
 		outHits = append(outHits, ihHitMap)
 	}
 
 	var maxScoreAny any = maxElemScore
-	if len(ih.Sort) > 0 {
+	if len(ih.Sort) > 0 && !sortSpecsUseScore(ih.Sort) {
 		maxScoreAny = nil
 	}
 	return map[string]any{
@@ -5539,6 +5773,7 @@ func (s *Server) populateCollapseInnerHits(
 		subReq.Collapse = nil
 		subReq.Aggs = nil
 		subReq.Aggregations = nil
+		subReq.SearchAfter = nil
 		subReq.From = &zero
 		subReq.Size = &fetchLimit
 		subReqPtr := applyIndexAliasFilter(&subReq, aliasFilters[indexName])
@@ -5566,7 +5801,7 @@ func (s *Server) populateCollapseInnerHits(
 		}
 		cVals := extractHitSortValues(cand, collapseSort, cSchema)
 		if len(cVals) > 0 && cVals[0] != nil {
-			gk := fmt.Sprintf("%v", cVals[0])
+			gk := normalizeCollapseGroupKey(cVals[0], req.Collapse.Field, primarySchema, cSchema)
 			byGroup[gk] = append(byGroup[gk], cand)
 		}
 	}
@@ -5582,7 +5817,8 @@ func (s *Server) populateCollapseInnerHits(
 		cVals := extractHitSortValues(h, collapseSort, hSchema)
 		var groupCands []HitRow
 		if len(cVals) > 0 && cVals[0] != nil {
-			groupCands = byGroup[fmt.Sprintf("%v", cVals[0])]
+			gk := normalizeCollapseGroupKey(cVals[0], req.Collapse.Field, primarySchema, hSchema)
+			groupCands = byGroup[gk]
 		}
 		ihMap, _ := esHits[hitPos]["inner_hits"].(map[string]any)
 		if ihMap == nil {
@@ -5643,6 +5879,7 @@ func (s *Server) populateCollapseInnerHits(
 			ihFieldSpecs := ihSpec.EffectiveFieldSpecs()
 			ihSyntheticReq := &esast.SearchRequest{Fields: ihFieldSpecs}
 			formattedHits := make([]map[string]any, 0, len(sortedGroup))
+			nullifyScore := len(activeSort) > 0 && !sortSpecsUseScore(activeSort)
 			for _, gh := range sortedGroup {
 				gIdx := gh.Index
 				if gIdx == "" {
@@ -5652,11 +5889,15 @@ func (s *Server) populateCollapseInnerHits(
 				if gSchema == nil {
 					gSchema = primarySchema
 				}
+				var ghScore any = gh.Score
+				if nullifyScore {
+					ghScore = nil
+				}
 				ghMap := map[string]any{
 					"_index": gIdx,
 					"_type":  "_doc",
 					"_id":    gh.ID,
-					"_score": gh.Score,
+					"_score": ghScore,
 				}
 				if ihSpec.Source == nil || !ihSpec.Source.Disabled {
 					ghMap["_source"] = filterSourceJSON(gh.EffectiveSource(), ihSpec.Source)
@@ -5669,12 +5910,21 @@ func (s *Server) populateCollapseInnerHits(
 						ghMap["fields"] = fm
 					}
 				}
+				if ihSpec.Highlight != nil && len(ihSpec.Highlight.Fields) > 0 {
+					if hl := buildHighlightMap(gh.EffectiveSource(), &esast.SearchRequest{Query: req.Query, Highlight: ihSpec.Highlight}); len(hl) > 0 {
+						ghMap["highlight"] = hl
+					}
+				}
 				formattedHits = append(formattedHits, ghMap)
+			}
+			var maxGroupScoreAny any = maxGroupScore
+			if nullifyScore || totalGroup == 0 {
+				maxGroupScoreAny = nil
 			}
 			ihMap[ihName] = map[string]any{
 				"hits": map[string]any{
 					"total":     map[string]any{"value": totalGroup, "relation": "eq"},
-					"max_score": maxGroupScore,
+					"max_score": maxGroupScoreAny,
 					"hits":      formattedHits,
 				},
 			}
@@ -5788,7 +6038,7 @@ func buildAggsMap(
 					case ss.EffectiveTerms() != nil, ss.Cardinality != nil, ss.ValueCount != nil,
 						ss.Avg != nil, ss.Sum != nil, ss.Min != nil, ss.Max != nil,
 						ss.EffectiveStats() != nil, ss.StringStats != nil, ss.Percentiles != nil,
-						ss.Boxplot != nil, ss.ReverseNested != nil:
+						ss.PercentileRanks != nil, ss.Boxplot != nil, ss.ReverseNested != nil:
 						directSubAggs[sn] = ss
 					default:
 						groupedSubAggs[sn] = ss
@@ -6721,6 +6971,7 @@ func filterAndSortTermsRows(
 		var metricByKey map[string]float64
 		if field != "_count" && field != "_key" && field != "_term" {
 			normField := strings.ReplaceAll(strings.TrimSpace(field), ">", ".")
+			var keyedBucketKey string
 			for {
 				openIdx := strings.IndexByte(normField, '[')
 				if openIdx < 0 {
@@ -6732,7 +6983,13 @@ func filterAndSortTermsRows(
 				}
 				closeIdx += openIdx
 				inner := strings.Trim(normField[openIdx+1:closeIdx], "'\"")
-				normField = normField[:openIdx] + "." + inner + normField[closeIdx+1:]
+				rem := normField[closeIdx+1:]
+				if strings.HasPrefix(rem, ".") && keyedBucketKey == "" {
+					keyedBucketKey = inner
+					normField = normField[:openIdx] + rem
+				} else {
+					normField = normField[:openIdx] + "." + inner + rem
+				}
 			}
 			subName := normField
 			prop := "value"
@@ -6742,9 +6999,27 @@ func filterAndSortTermsRows(
 			} else if _, ok := bucketsByAgg[fullKey+"."+normField+".0"]; ok {
 				rowKey = fullKey + "." + normField + ".0"
 			} else {
-				if dot := strings.LastIndexByte(normField, '.'); dot > 0 {
+				if strings.HasSuffix(normField, ".std_deviation_bounds.upper") || strings.HasSuffix(normField, ".std_deviation_bounds.upper_population") {
+					subName = strings.TrimSuffix(strings.TrimSuffix(normField, ".std_deviation_bounds.upper_population"), ".std_deviation_bounds.upper")
+					prop = "std_deviation_bounds.upper"
+				} else if strings.HasSuffix(normField, ".std_deviation_bounds.lower") || strings.HasSuffix(normField, ".std_deviation_bounds.lower_population") {
+					subName = strings.TrimSuffix(strings.TrimSuffix(normField, ".std_deviation_bounds.lower_population"), ".std_deviation_bounds.lower")
+					prop = "std_deviation_bounds.lower"
+				} else if dot := strings.LastIndexByte(normField, '.'); dot > 0 {
 					subName = normField[:dot]
 					prop = normField[dot+1:]
+				}
+				if keyedBucketKey == "" && strings.IndexByte(subName, '.') >= 0 {
+					if _, exists := bucketsByAgg[fullKey+"."+subName+"."+prop]; !exists {
+						if firstDot := strings.IndexByte(subName, '.'); firstDot > 0 {
+							candAgg := subName[:firstDot]
+							candKey := subName[firstDot+1:]
+							if _, existsKeyed := bucketsByAgg[fullKey+"."+candAgg+"."+prop]; existsKeyed || (prop == "_count" || prop == "doc_count") {
+								subName = candAgg
+								keyedBucketKey = candKey
+							}
+						}
+					}
 				}
 				rowKey = fullKey + "." + subName
 				switch prop {
@@ -6769,14 +7044,18 @@ func filterAndSortTermsRows(
 					rowKey = fullKey + "." + subName + "._stats_sum"
 				case "sum_of_squares":
 					rowKey = fullKey + "." + subName + "._stats_sum_sq"
-				case "std_deviation", "std_deviation_population":
+				case "std_deviation", "std_deviation_population", "variance", "variance_population", "variance_sampling", "std_deviation_sampling", "std_deviation_bounds.upper", "std_deviation_bounds.lower":
 					rowKey = fullKey + "." + subName + "._stats_std"
 				case "q1":
 					rowKey = fullKey + "." + subName + ".25.0"
-				case "q2":
+				case "q2", "median":
 					rowKey = fullKey + "." + subName + ".50.0"
 				case "q3":
 					rowKey = fullKey + "." + subName + ".75.0"
+				case "lower":
+					rowKey = fullKey + "." + subName + ".0.0"
+				case "upper":
+					rowKey = fullKey + "." + subName + ".100.0"
 				default:
 					if _, ok := bucketsByAgg[fullKey+"."+subName+"."+prop]; ok {
 						rowKey = fullKey + "." + subName + "." + prop
@@ -6787,22 +7066,104 @@ func filterAndSortTermsRows(
 					}
 				}
 			}
-			subRows := bucketsByAgg[rowKey]
-			metricByKey = make(map[string]float64, len(subRows))
-			for _, sr := range subRows {
-				k := sr.BucketKey
+			trimRowKey := func(raw string) (string, bool) {
+				k := raw
 				if parentBucketKey != "" {
 					trimmed, ok := trimSubAggBucketPrefix(k, parentBucketKey)
 					if !ok {
-						continue
+						return "", false
 					}
 					k = trimmed
 				}
-				if prop == "_count" || prop == "doc_count" || prop == "count" {
-					metricByKey[k] = float64(sr.effectiveCount())
-				} else {
-					metricByKey[k] = sr.effectiveValue()
+				if keyedBucketKey != "" {
+					suffix := "\x1f" + keyedBucketKey
+					if !strings.HasSuffix(k, suffix) {
+						return "", false
+					}
+					k = strings.TrimSuffix(k, suffix)
 				}
+				return k, true
+			}
+			readSubSeries := func(rk string, asCount bool) map[string]float64 {
+				rows := bucketsByAgg[rk]
+				m := make(map[string]float64, len(rows))
+				for _, sr := range rows {
+					k, ok := trimRowKey(sr.BucketKey)
+					if !ok {
+						continue
+					}
+					if asCount {
+						m[k] = float64(sr.effectiveCount())
+					} else {
+						m[k] = sr.effectiveValue()
+					}
+				}
+				return m
+			}
+			basePath := fullKey + "." + subName
+			switch prop {
+			case "variance", "variance_population":
+				stds := readSubSeries(basePath+"._stats_std", false)
+				metricByKey = make(map[string]float64, len(stds))
+				for k, std := range stds {
+					metricByKey[k] = std * std
+				}
+			case "variance_sampling", "std_deviation_sampling":
+				stds := readSubSeries(basePath+"._stats_std", false)
+				cnts := readSubSeries(basePath+"._stats_count", true)
+				metricByKey = make(map[string]float64, len(stds))
+				for k, std := range stds {
+					if cnt := cnts[k]; cnt > 1 {
+						vs := (std * std * cnt) / (cnt - 1.0)
+						if prop == "std_deviation_sampling" {
+							metricByKey[k] = math.Sqrt(vs)
+						} else {
+							metricByKey[k] = vs
+						}
+					}
+				}
+			case "std_deviation_bounds.upper", "std_deviation_bounds.lower":
+				stds := readSubSeries(basePath+"._stats_std", false)
+				avgs := readSubSeries(basePath+"._stats_avg", false)
+				metricByKey = make(map[string]float64, len(avgs))
+				for k, avg := range avgs {
+					std := stds[k]
+					if prop == "std_deviation_bounds.upper" {
+						metricByKey[k] = avg + 2.0*std
+					} else {
+						metricByKey[k] = avg - 2.0*std
+					}
+				}
+			case "sum_of_squares":
+				metricByKey = readSubSeries(rowKey, false)
+				if len(metricByKey) == 0 {
+					stds := readSubSeries(basePath+"._stats_std", false)
+					avgs := readSubSeries(basePath+"._stats_avg", false)
+					cnts := readSubSeries(basePath+"._stats_count", true)
+					metricByKey = make(map[string]float64, len(cnts))
+					for k, cnt := range cnts {
+						avg := avgs[k]
+						std := stds[k]
+						metricByKey[k] = cnt * (std*std + avg*avg)
+					}
+				}
+			case "lower", "upper":
+				mins := readSubSeries(basePath+".0.0", false)
+				maxs := readSubSeries(basePath+".100.0", false)
+				q1s := readSubSeries(basePath+".25.0", false)
+				q3s := readSubSeries(basePath+".75.0", false)
+				metricByKey = make(map[string]float64, len(q1s))
+				for k, q1 := range q1s {
+					q3 := q3s[k]
+					iqr := q3 - q1
+					if prop == "lower" {
+						metricByKey[k] = math.Max(mins[k], q1-1.5*iqr)
+					} else {
+						metricByKey[k] = math.Min(maxs[k], q3+1.5*iqr)
+					}
+				}
+			default:
+				metricByKey = readSubSeries(rowKey, prop == "_count" || prop == "doc_count" || prop == "count")
 			}
 		}
 		criteria = append(criteria, termsOrderCriterion{field: field, desc: desc, metricByKey: metricByKey})
@@ -7136,6 +7497,17 @@ func validatePipelineAggs(aggs map[string]esast.AggSpec) string {
 				}
 				if isBucketAggSpec(targetSpec) {
 					hasBucket = true
+				}
+				if i > 0 && isMultiBucketAggSpec(targetSpec) && isKeyedBucketAggSpec(targetSpec) {
+					if i+1 < len(segs) {
+						nextSeg := segs[i+1]
+						if _, nextIsSubAgg := targetSpec.SubAggs()[nextSeg]; !nextIsSubAgg || i+2 < len(segs) {
+							i++ // consume keyed bucket key segment
+							if i == len(segs)-1 {
+								return fmt.Sprintf("buckets_path [%s] for pipeline aggregation [%s] must reference a numeric metric or _count, not a bucket aggregation directly", pathStr, aggName)
+							}
+						}
+					}
 				}
 				lastSpec = targetSpec
 				currMap = targetSpec.SubAggs()
@@ -7944,6 +8316,17 @@ func extractBucketMetricBySegs(b map[string]any, segs []string) (float64, bool) 
 	}
 
 	prop := strings.Join(tail, ".")
+	if cnt, hasCnt := toFloat64(subMap["count"]); hasCnt && cnt == 0 && prop != "count" && prop != "sum" {
+		return 0, false
+	}
+	if dc, hasDC := toFloat64(b["doc_count"]); hasDC && dc == 0 && prop != "_count" && prop != "doc_count" && prop != "count" {
+		if _, hasVals := subMap["values"]; hasVals {
+			return 0, false
+		}
+		if _, hasQ1 := subMap["q1"]; hasQ1 {
+			return 0, false
+		}
+	}
 	if len(tail) == 1 {
 		if prop == "_count" || prop == "doc_count" {
 			if v, okV := toFloat64(subMap["doc_count"]); okV {
@@ -10648,6 +11031,9 @@ func detectArrayPromotions(idx *schema.IndexSchema, sampleDocs []json.RawMessage
 				continue
 			}
 			dotPath := strings.Join(fb.SourceJSONPath, ".")
+			if fb.ESFieldPath != dotPath {
+				continue
+			}
 			if _, already := promotedPaths[dotPath]; already {
 				continue
 			}
@@ -10718,6 +11104,20 @@ func setFieldPropertyAtPath(props map[string]esast.FieldProperty, path []string,
 		return
 	}
 	if len(path) == 1 {
+		if existing, ok := props[path[0]]; ok {
+			if prop.Fields == nil && len(existing.Fields) > 0 {
+				prop.Fields = existing.Fields
+			}
+			if prop.Normalizer == "" && existing.Normalizer != "" {
+				prop.Normalizer = existing.Normalizer
+			}
+			if prop.Analyzer == "" && existing.Analyzer != "" {
+				prop.Analyzer = existing.Analyzer
+			}
+			if prop.Format == "" && existing.Format != "" {
+				prop.Format = existing.Format
+			}
+		}
 		props[path[0]] = prop
 		return
 	}
