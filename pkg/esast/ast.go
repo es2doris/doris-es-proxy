@@ -829,6 +829,7 @@ type AggSpec struct {
 	MovingAvg           *MovingAvgAggSpec         `json:"moving_avg,omitempty"`
 	MovingFn            *MovingAvgAggSpec         `json:"moving_fn,omitempty"`
 	SerialDiff          *SerialDiffAggSpec        `json:"serial_diff,omitempty"`
+	Normalize           *NormalizeAggSpec         `json:"normalize,omitempty"`
 	AvgBucket           *PipelineAggSpec          `json:"avg_bucket,omitempty"`
 	SumBucket           *PipelineAggSpec          `json:"sum_bucket,omitempty"`
 	MinBucket           *PipelineAggSpec          `json:"min_bucket,omitempty"`
@@ -1029,6 +1030,24 @@ func (s *SerialDiffAggSpec) EffectiveLag() int {
 		return 1
 	}
 	return s.Lag
+}
+
+// NormalizeAggSpec models a `normalize` pipeline aggregation.
+type NormalizeAggSpec struct {
+	BucketsPath any    `json:"buckets_path,omitempty"`
+	Method      string `json:"method,omitempty"`
+	Format      string `json:"format,omitempty"`
+	GapPolicy   string `json:"gap_policy,omitempty"`
+}
+
+func (n *NormalizeAggSpec) EffectivePath() string {
+	if n == nil || n.BucketsPath == nil {
+		return ""
+	}
+	if str, ok := n.BucketsPath.(string); ok {
+		return strings.TrimSpace(str)
+	}
+	return fmt.Sprintf("%v", n.BucketsPath)
 }
 
 // PercentilesBucketAggSpec models a `percentiles_bucket` sibling pipeline aggregation.
@@ -1261,13 +1280,15 @@ func (a *AggSpec) SubAggs() map[string]AggSpec {
 }
 
 type TermsAggSpec struct {
-	Field       string `json:"field"`
-	Size        int    `json:"size,omitempty"`
-	Missing     any    `json:"missing,omitempty"`
-	Order       any    `json:"order,omitempty"`
-	MinDocCount *int   `json:"min_doc_count,omitempty"`
-	Include     any    `json:"include,omitempty"`
-	Exclude     any    `json:"exclude,omitempty"`
+	Field         string `json:"field"`
+	Size          int    `json:"size,omitempty"`
+	Missing       any    `json:"missing,omitempty"`
+	MissingBucket bool   `json:"missing_bucket,omitempty"`
+	MissingOrder  string `json:"missing_order,omitempty"`
+	Order         any    `json:"order,omitempty"`
+	MinDocCount   *int   `json:"min_doc_count,omitempty"`
+	Include       any    `json:"include,omitempty"`
+	Exclude       any    `json:"exclude,omitempty"`
 }
 
 type HistogramBoundsSpec struct {
@@ -1283,6 +1304,9 @@ type DateHistogramAggSpec struct {
 	TimeZone         string               `json:"time_zone,omitempty"`
 	Offset           string               `json:"offset,omitempty"`
 	Format           string               `json:"format,omitempty"`
+	Missing          any                  `json:"missing,omitempty"`
+	MissingBucket    bool                 `json:"missing_bucket,omitempty"`
+	MissingOrder     string               `json:"missing_order,omitempty"`
 	MinDocCount      *int                 `json:"min_doc_count,omitempty"`
 	ExtendedBounds   *HistogramBoundsSpec `json:"extended_bounds,omitempty"`
 	HardBounds       *HistogramBoundsSpec `json:"hard_bounds,omitempty"`
@@ -1436,6 +1460,9 @@ type HistogramAggSpec struct {
 	Field          string               `json:"field"`
 	Interval       float64              `json:"interval"`
 	Offset         float64              `json:"offset,omitempty"`
+	Missing        any                  `json:"missing,omitempty"`
+	MissingBucket  bool                 `json:"missing_bucket,omitempty"`
+	MissingOrder   string               `json:"missing_order,omitempty"`
 	MinDocCount    *int                 `json:"min_doc_count,omitempty"`
 	ExtendedBounds *HistogramBoundsSpec `json:"extended_bounds,omitempty"`
 	HardBounds     *HistogramBoundsSpec `json:"hard_bounds,omitempty"`

@@ -922,14 +922,17 @@ func (s *Server) handleResolveIndex(w http.ResponseWriter, r *http.Request) {
 // handleIndexStats implements `GET /_stats` and `GET /{index}/_stats` for Elasticvue, Cerebro, and monitoring clients.
 func (s *Server) handleIndexStats(w http.ResponseWriter, r *http.Request) {
 	rawIndex := r.PathValue("index")
-	targets := s.resolveTargetIndices(rawIndex)
+	targets, aliasFilters := s.resolveTargetIndicesWithFilters(rawIndex)
 
 	indicesMap := make(map[string]any, len(targets))
 	var totalDocs int64
 
 	for _, idxName := range targets {
 		zero := 0
-		resp, _, errType, _ := s.executeSearchRequest(r.Context(), idxName, &esast.SearchRequest{Size: &zero})
+		resp, _, errType, _ := s.executeSearchRequest(r.Context(), idxName, &esast.SearchRequest{
+			Size:        &zero,
+			AliasFilter: aliasFilters[idxName],
+		})
 		var docCount int64
 		if errType == "" {
 			docCount, _ = extractTotalAndHitIDs(resp)
@@ -1350,7 +1353,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "source.index and dest.index are required")
 		return
 	}
-	destIndex, writeErr := s.resolveWriteIndex(body.Dest.Index)
+	destIndex, destAliasFilter, writeErr := s.resolveWriteIndexWithFilter(body.Dest.Index)
 	if writeErr != nil {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", writeErr.Error())
 		return
@@ -1371,6 +1374,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	if len(srcTargets) == 0 {
 		srcTargets = []string{s.resolveIndexName(srcPattern)}
 	}
+	s.resolveTermsLookupsInAliasFilters(r.Context(), aliasFilters)
 
 	var totalMatched, totalCreated, totalDeleted, batches int
 	updSpec := &painless.UpdateRequest{Script: body.Script}
@@ -1447,6 +1451,10 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				}
 				if finalPipeline != "" {
 					docSource = s.applyIngestPipelineIfPresent(finalPipeline, docSource)
+				}
+				if destAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), destIndex, h.ID, docSource, destAliasFilter) {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "document does not match destination alias filter")
+					return
 				}
 				prepared = append(prepared, preparedDoc{id: h.ID, source: docSource})
 				if destSchema == nil && len(sampleDocs) < 16 {
@@ -1691,14 +1699,6 @@ func buildNestedMappingProps(segments []string, leaf esast.FieldProperty) map[st
 // handleValidateQuery implements `GET/POST /_validate/query` and `GET/POST /{index}/_validate/query`.
 func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 	rawIndex := r.PathValue("index")
-	targets, aliasFilters := s.resolveTargetIndicesWithFilters(rawIndex)
-	if len(targets) == 0 {
-		if rawIndex != "" {
-			targets = []string{s.resolveIndexName(rawIndex)}
-		} else {
-			targets = []string{"_all"}
-		}
-	}
 
 	raw, ok := readRequestBody(w, r)
 	if !ok {
@@ -1716,6 +1716,16 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	applyURISearchParams(r, &req)
+	rawIndex = extractPITIndex(rawIndex, req.PIT)
+	targets, aliasFilters := s.resolveTargetIndicesWithFilters(rawIndex)
+	if len(targets) == 0 {
+		if rawIndex != "" {
+			targets = []string{s.resolveIndexName(rawIndex)}
+		} else {
+			targets = []string{"_all"}
+		}
+	}
+	s.resolveTermsLookupsInAliasFilters(r.Context(), aliasFilters)
 	_ = s.resolveTermsLookupsInSearchRequest(r.Context(), &req)
 
 	var explanations []map[string]any
@@ -2089,4 +2099,153 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(sb.String()))
+}
+
+// handleTermsEnum implements `POST /{index}/_terms_enum` for Kibana / Grafana autocomplete.
+func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
+	bodyBytes, ok := readRequestBody(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Field           string       `json:"field"`
+		String          string       `json:"string,omitempty"`
+		Size            int          `json:"size,omitempty"`
+		CaseInsensitive bool         `json:"case_insensitive,omitempty"`
+		SearchAfter     string       `json:"search_after,omitempty"`
+		IndexFilter     *esast.Query `json:"index_filter,omitempty"`
+	}
+	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		if err := json.Unmarshal(bodyBytes, &req); err != nil {
+			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+			return
+		}
+	}
+	if strings.TrimSpace(req.Field) == "" {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "field must be specified for _terms_enum")
+		return
+	}
+	limit := req.Size
+	if limit <= 0 {
+		limit = 10
+	}
+	zero := 0
+	searchReq := esast.SearchRequest{
+		Size:  &zero,
+		Query: req.IndexFilter,
+		Aggs: map[string]esast.AggSpec{
+			"_terms_enum": {
+				Terms: &esast.TermsAggSpec{
+					Field: req.Field,
+					Size:  1000,
+					Order: map[string]any{"_key": "asc"},
+				},
+			},
+		},
+	}
+	resp, status, errType, errReason := s.executeSearchRequest(r.Context(), r.PathValue("index"), &searchReq)
+	if errType != "" {
+		writeESError(w, status, errType, errReason)
+		return
+	}
+	termsOut := make([]string, 0, limit)
+	complete := true
+	prefix := req.String
+	prefixLower := strings.ToLower(prefix)
+	if aggsMap, ok := resp["aggregations"].(map[string]any); ok {
+		if teObj, ok := aggsMap["_terms_enum"].(map[string]any); ok {
+			if buckets, ok := teObj["buckets"].([]map[string]any); ok {
+				for _, b := range buckets {
+					k := fmt.Sprintf("%v", b["key"])
+					if req.SearchAfter != "" && k <= req.SearchAfter {
+						continue
+					}
+					if prefix != "" {
+						if req.CaseInsensitive {
+							if !strings.HasPrefix(strings.ToLower(k), prefixLower) {
+								continue
+							}
+						} else if !strings.HasPrefix(k, prefix) {
+							continue
+						}
+					}
+					if len(termsOut) >= limit {
+						complete = false
+						break
+					}
+					termsOut = append(termsOut, k)
+				}
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"_shards":  map[string]any{"total": 1, "successful": 1, "skipped": 0, "failed": 0},
+		"terms":    termsOut,
+		"complete": complete,
+	})
+}
+
+// handleExplainDoc implements `GET/POST /{index}/_explain/{id}` and `GET/POST /{index}/_doc/{id}/_explain`.
+func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
+	indexName, aliasFilter, readErr := s.resolveReadDocIndexWithFilter(r.PathValue("index"))
+	if readErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", readErr.Error())
+		return
+	}
+	docID := r.PathValue("id")
+	bodyBytes, ok := readRequestBody(w, r)
+	if !ok {
+		return
+	}
+	var req esast.SearchRequest
+	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		if err := json.Unmarshal(bodyBytes, &req); err != nil {
+			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+			return
+		}
+	}
+	applyURISearchParams(r, &req)
+
+	idxSchema := s.ensureIndexSchema(r.Context(), indexName)
+	_ = s.coalescer.FlushTable(r.Context(), idxSchema.DorisTable)
+	hit, found, err := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, docID)
+	if err != nil {
+		writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
+		return
+	}
+	if !found || hit == nil || (aliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), indexName, docID, hit.Source, aliasFilter)) {
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"_index":  indexName,
+			"_type":   "_doc",
+			"_id":     docID,
+			"matched": false,
+			"explanation": map[string]any{
+				"value":       0.0,
+				"description": "Failure to meet condition(s) of document/etti: no such document [" + docID + "]",
+				"details":     []any{},
+			},
+		})
+		return
+	}
+
+	matched := s.docMatchesAliasFilter(r.Context(), indexName, docID, hit.Source, req.Query)
+	tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
+	cq := tr.CompileQuery(req.Query, true, nil)
+	scoreVal := 0.0
+	desc := "no match on required clause (" + cq.WhereSQL + ")"
+	if matched {
+		scoreVal = 1.0
+		desc = "weight(" + cq.WhereSQL + ") [DorisInvertedIndex], result of: " + cq.ScoreSQL
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"_index":  indexName,
+		"_type":   "_doc",
+		"_id":     docID,
+		"matched": matched,
+		"explanation": map[string]any{
+			"value":       scoreVal,
+			"description": desc,
+			"details":     []any{},
+		},
+	})
 }

@@ -494,7 +494,14 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 					"sub_str": {"string_stats": {"field": "service"}},
 					"mov_lat": {"moving_avg": {"buckets_path": "sum_lat", "window": 2}},
 					"mov_max": {"moving_fn": {"buckets_path": "sum_lat", "window": 2, "script": "MovingFunctions.max(values)"}},
-					"diff_lat": {"serial_diff": {"buckets_path": "sum_lat", "lag": 1}}
+					"diff_lat": {"serial_diff": {"buckets_path": "sum_lat", "lag": 1}},
+					"norm_lat": {"normalize": {"buckets_path": "sum_lat", "method": "percent_of_sum"}},
+					"sub_range": {
+						"range": {
+							"field": "latency_ms",
+							"ranges": [{"key": "fast", "to": 50}, {"key": "slow", "from": 50}]
+						}
+					}
 				}
 			},
 			"ext_bucket": {"extended_stats_bucket": {"buckets_path": "by_lat>sum_lat"}},
@@ -504,7 +511,7 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	r8Resp, err := http.Post(ts.URL+"/live_checkout_alias/_search", "application/json", strings.NewReader(r8SearchBody))
 	if err != nil || r8Resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(r8Resp.Body)
-		t.Fatalf("POST /live_checkout_alias/_search (Round-8/9 aggs) failed: status=%v err=%v body=%s", r8Resp.StatusCode, err, string(b))
+		t.Fatalf("POST /live_checkout_alias/_search (Round-8/9/10 aggs) failed: status=%v err=%v body=%s", r8Resp.StatusCode, err, string(b))
 	}
 	var r8Res map[string]any
 	_ = json.NewDecoder(r8Resp.Body).Decode(&r8Res)
@@ -523,6 +530,26 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 		t.Fatalf("expected extended_stats sum_of_squares > 0 on live Doris, got: %+v", extLat)
 	}
 	if r8Aggs["str_svc"] == nil || r8Aggs["lat_box"] == nil || r8Aggs["lat_ranks"] == nil || r8Aggs["latest_lat"] == nil || r8Aggs["ext_bucket"] == nil || r8Aggs["pct_bucket"] == nil {
-		t.Fatalf("missing Round-8/9 aggregations in live Doris response: %+v", r8Aggs)
+		t.Fatalf("missing Round-8/9/10 aggregations in live Doris response: %+v", r8Aggs)
 	}
+
+	// 12. Verify Round-10 DELETE /{alias} guard (400), _terms_enum, and _explain on live Doris
+	delAliasReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/live_checkout_alias", nil)
+	delAliasResp, err := http.DefaultClient.Do(delAliasReq)
+	if err != nil || delAliasResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected DELETE /live_checkout_alias to return 400 Bad Request, got status=%v err=%v", delAliasResp.StatusCode, err)
+	}
+	_ = delAliasResp.Body.Close()
+
+	teResp, err := http.Post(ts.URL+"/live_checkout_alias/_terms_enum", "application/json", strings.NewReader(`{"field":"service","string":"check"}`))
+	if err != nil || teResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_checkout_alias/_terms_enum failed: status=%v err=%v", teResp.StatusCode, err)
+	}
+	_ = teResp.Body.Close()
+
+	explDocResp, err := http.Post(ts.URL+"/live_checkout_alias/_explain/auto-3", "application/json", strings.NewReader(`{"query":{"term":{"service":"checkout-api"}}}`))
+	if err != nil || explDocResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_checkout_alias/_explain/auto-3 failed: status=%v err=%v", explDocResp.StatusCode, err)
+	}
+	_ = explDocResp.Body.Close()
 }

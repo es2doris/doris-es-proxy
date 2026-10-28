@@ -365,7 +365,7 @@ func containsNowDateMath(req *esast.SearchRequest, reqBytes []byte) bool {
 		}
 	}
 	if req != nil {
-		if queryContainsNow(req.Query) || queryContainsNow(req.PostFilter) {
+		if queryContainsNow(req.Query) || queryContainsNow(req.PostFilter) || queryContainsNow(req.AliasFilter) {
 			return true
 		}
 		for i := range req.KNN {
@@ -518,10 +518,20 @@ func buildQueryCacheKey(targets []string, req *esast.SearchRequest) (string, boo
 	if err != nil {
 		return "", false
 	}
-	if containsNowDateMath(req, reqBytes) {
+	var afSuffix string
+	checkBytes := reqBytes
+	if req.AliasFilter != nil {
+		afBytes, err := json.Marshal(req.AliasFilter)
+		if err != nil {
+			return "", false
+		}
+		afSuffix = "\x00af:" + string(afBytes)
+		checkBytes = append(append([]byte(nil), reqBytes...), afBytes...)
+	}
+	if containsNowDateMath(req, checkBytes) {
 		return "", false
 	}
-	return strings.Join(targets, ",") + "\x00" + string(reqBytes), true
+	return strings.Join(targets, ",") + "\x00" + string(reqBytes) + afSuffix, true
 }
 
 // Get looks up a cached search response for `(targets, req)` and returns a fresh unmarshaled copy.
