@@ -558,14 +558,14 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 
 	simResp, err := http.Post(ts.URL+"/_ingest/pipeline/_simulate", "application/json", strings.NewReader(`{
 		"pipeline": {"processors": [{"set": {"field": "env", "value": "prod"}}]},
-		"docs": [{"_index": "live_auto_logs", "_id": "sim-1", "_source": {"service": "checkout-api"}}]
+		"docs": [{"_index": "live_auto_index", "_id": "sim-1", "_source": {"service": "checkout-api"}}]
 	}`))
 	if err != nil || simResp.StatusCode != http.StatusOK {
 		t.Fatalf("POST /_ingest/pipeline/_simulate failed: status=%v err=%v", simResp.StatusCode, err)
 	}
 	_ = simResp.Body.Close()
 
-	compDescResp, err := http.Post(ts.URL+"/live_auto_logs/_search", "application/json", strings.NewReader(`{
+	compDescResp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
 		"size": 0,
 		"aggs": {
 			"comp_desc": {
@@ -579,7 +579,7 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 		}
 	}`))
 	if err != nil || compDescResp.StatusCode != http.StatusOK {
-		t.Fatalf("POST /live_auto_logs/_search (composite desc) failed: status=%v err=%v", compDescResp.StatusCode, err)
+		t.Fatalf("POST /live_auto_index/_search (composite desc) failed: status=%v err=%v", compDescResp.StatusCode, err)
 	}
 	var compDescRes map[string]any
 	_ = json.NewDecoder(compDescResp.Body).Decode(&compDescRes)
