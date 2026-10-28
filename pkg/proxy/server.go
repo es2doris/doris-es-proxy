@@ -1771,46 +1771,37 @@ func (s *Server) handleDeleteIndex(w http.ResponseWriter, r *http.Request) {
 	_ = s.syncCatalogFromBackend(r.Context())
 
 	parts := strings.Split(rawIndex, ",")
+	var exclusions []string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "-") {
+			if excl := strings.TrimSpace(strings.TrimPrefix(part, "-")); excl != "" {
+				exclusions = append(exclusions, excl)
+			}
+		}
+	}
+	isExcluded := func(idx string) bool {
+		for _, excl := range exclusions {
+			if excl == "_all" || excl == "*" || matchWildcardPattern(excl, idx) {
+				return true
+			}
+		}
+		return false
+	}
 	seen := make(map[string]bool)
 	var targets []string
 
 	addDeleteTarget := func(idx string) {
-		if idx != "" && !seen[idx] {
+		if idx != "" && !seen[idx] && !isExcluded(idx) {
 			seen[idx] = true
 			targets = append(targets, idx)
 		}
-	}
-	removeDeleteTarget := func(idx string) {
-		if !seen[idx] {
-			return
-		}
-		delete(seen, idx)
-		filtered := targets[:0]
-		for _, existing := range targets {
-			if existing != idx {
-				filtered = append(filtered, existing)
-			}
-		}
-		targets = filtered
 	}
 
 	s.mu.RLock()
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		if strings.HasPrefix(part, "-") {
-			excl := strings.TrimSpace(strings.TrimPrefix(part, "-"))
-			if excl == "" {
-				continue
-			}
-			snapshot := append([]string(nil), targets...)
-			for _, idxName := range snapshot {
-				if matchWildcardPattern(excl, idxName) {
-					removeDeleteTarget(idxName)
-				}
-			}
+		if part == "" || strings.HasPrefix(part, "-") {
 			continue
 		}
 		if part == "_all" || part == "*" {
@@ -2402,10 +2393,23 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	effPipeline := s.resolveEffectivePipeline(indexName, r.URL.Query().Get("pipeline"), "")
-	docPayload := s.applyIngestPipelineIfPresent(effPipeline, json.RawMessage(rawDoc))
-	if finPipeline := s.resolveFinalPipeline(indexName); finPipeline != "" {
-		docPayload = s.applyIngestPipelineIfPresent(finPipeline, docPayload)
+	docPayload, dropped, pipeErr := s.applyEffectiveAndFinalPipelines(indexName, r.URL.Query().Get("pipeline"), "", json.RawMessage(rawDoc))
+	if pipeErr != nil {
+		writeESError(w, http.StatusBadRequest, "ingest_processor_exception", pipeErr.Error())
+		return
+	}
+	if dropped {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"_index":        indexName,
+			"_type":         "_doc",
+			"_id":           docID,
+			"_version":      -1,
+			"result":        "noop",
+			"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+			"_seq_no":       -1,
+			"_primary_term": 1,
+		})
+		return
 	}
 	if aliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), indexName, docID, docPayload, aliasFilter) {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
@@ -2475,7 +2479,7 @@ func (s *Server) handleHeadDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	docID := r.PathValue("id")
-	idxSchema := s.ensureIndexSchema(r.Context(), indexName)
+	idxSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
 	_ = s.coalescer.FlushTable(r.Context(), idxSchema.DorisTable)
 
 	hit, found, err := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, docID)
@@ -2497,7 +2501,7 @@ func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	docID := r.PathValue("id")
-	idxSchema := s.ensureIndexSchema(r.Context(), indexName)
+	idxSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
 	_ = s.coalescer.FlushTable(r.Context(), idxSchema.DorisTable)
 
 	hit, found, err := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, docID)
@@ -2551,7 +2555,7 @@ func (s *Server) handleGetDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	docID := r.PathValue("id")
-	idxSchema := s.ensureIndexSchema(r.Context(), indexName)
+	idxSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
 	_ = s.coalescer.FlushTable(r.Context(), idxSchema.DorisTable)
 
 	hit, found, err := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, docID)
@@ -2636,7 +2640,7 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 
 	prefetched := make(map[string]map[string]HitRow, len(idsByIndex))
 	for idxName, ids := range idsByIndex {
-		idxSchema := s.ensureIndexSchema(r.Context(), idxName)
+		idxSchema := s.getOrCompileReadOnlySchema(r.Context(), idxName)
 		_ = s.coalescer.FlushTable(r.Context(), idxSchema.DorisTable)
 		if m, err := s.backend.GetDocsByIDs(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, ids); err == nil {
 			prefetched[idxName] = m
@@ -2787,12 +2791,25 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	if opResult != "noop" {
 		isDelete := opResult == "deleted"
 		if !isDelete && len(mutatedSource) > 0 {
-			if effPipeline := s.resolveEffectivePipeline(indexName, r.URL.Query().Get("pipeline"), ""); effPipeline != "" {
-				mutatedSource = s.applyIngestPipelineIfPresent(effPipeline, mutatedSource)
+			pipedDoc, dropped, pipeErr := s.applyEffectiveAndFinalPipelines(indexName, r.URL.Query().Get("pipeline"), "", mutatedSource)
+			if pipeErr != nil {
+				writeESError(w, http.StatusBadRequest, "ingest_processor_exception", pipeErr.Error())
+				return
 			}
-			if finPipeline := s.resolveFinalPipeline(indexName); finPipeline != "" {
-				mutatedSource = s.applyIngestPipelineIfPresent(finPipeline, mutatedSource)
+			if dropped {
+				writeJSON(w, http.StatusOK, map[string]any{
+					"_index":        indexName,
+					"_type":         "_doc",
+					"_id":           docID,
+					"_version":      nextVersion,
+					"result":        "noop",
+					"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+					"_seq_no":       nextVersion,
+					"_primary_term": 1,
+				})
+				return
 			}
+			mutatedSource = pipedDoc
 		}
 		if !isDelete && aliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), indexName, docID, mutatedSource, aliasFilter) {
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
@@ -2834,15 +2851,25 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	targets, aliasFilters := s.resolveTargetIndicesWithFilters(r.PathValue("index"))
-	if len(targets) == 0 {
-		targets = []string{s.resolveIndexName(r.PathValue("index"))}
+	rawIndex := r.PathValue("index")
+	targets, aliasFilters := s.resolveTargetIndicesWithFilters(rawIndex)
+	if len(targets) == 0 && !hasExclusionOrWildcard(rawIndex) {
+		target, f := s.resolveIndexNameWithFilter(rawIndex)
+		targets = []string{target}
+		if f != nil {
+			if aliasFilters == nil {
+				aliasFilters = make(map[string]*esast.Query)
+			}
+			aliasFilters[target] = f
+		}
 	}
 
 	var body struct {
-		MaxDocs *int                 `json:"max_docs,omitempty"`
-		Query   *esast.Query         `json:"query,omitempty"`
-		Script  *painless.ScriptSpec `json:"script,omitempty"`
+		MaxDocs   *int                 `json:"max_docs,omitempty"`
+		Conflicts string               `json:"conflicts,omitempty"`
+		Pipeline  string               `json:"pipeline,omitempty"`
+		Query     *esast.Query         `json:"query,omitempty"`
+		Script    *painless.ScriptSpec `json:"script,omitempty"`
 	}
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
@@ -2913,7 +2940,14 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 			batches++
 			totalMatched += len(hits)
 
-			var batchBuf bytes.Buffer
+			type pendingUpdate struct {
+				id      string
+				version int64
+				isDel   bool
+				source  json.RawMessage
+			}
+			var pending []pendingUpdate
+			var sampleDocs []json.RawMessage
 			for _, h := range hits {
 				mutated, opRes, err := painless.ApplyUpdateWithResult(h.Source, updSpec, true)
 				if err != nil {
@@ -2924,20 +2958,43 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				isDel := opRes == "deleted"
+				if !isDel && len(mutated) > 0 {
+					piped, dropped, pipeErr := s.applyEffectiveAndFinalPipelines(indexName, r.URL.Query().Get("pipeline"), body.Pipeline, mutated)
+					if pipeErr != nil {
+						writeESError(w, http.StatusBadRequest, "ingest_processor_exception", pipeErr.Error())
+						return
+					}
+					if dropped {
+						continue
+					}
+					mutated = piped
+				}
 				if !isDel && aliasFilters[indexName] != nil && !s.docMatchesAliasFilter(r.Context(), indexName, h.ID, mutated, aliasFilters[indexName]) {
 					writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
 						fmt.Sprintf("updated document [%s] does not match alias filter for [%s]", h.ID, r.PathValue("index")))
 					return
 				}
-				nextVer := s.allocVersion(h.Version + 1)
-				shredded, err := schema.ShredDocument(idxSchema, h.ID, nextVer, isDel, mutated)
+				if !isDel && len(mutated) > 0 && len(sampleDocs) < 16 {
+					sampleDocs = append(sampleDocs, mutated)
+				}
+				pending = append(pending, pendingUpdate{id: h.ID, version: h.Version, isDel: isDel, source: mutated})
+			}
+
+			if len(sampleDocs) > 0 {
+				idxSchema = s.ensureWritableIndexSchemaWithDocs(r.Context(), indexName, sampleDocs)
+			}
+
+			var batchBuf bytes.Buffer
+			for _, pu := range pending {
+				nextVer := s.allocVersion(pu.version + 1)
+				shredded, err := schema.ShredDocument(idxSchema, pu.id, nextVer, pu.isDel, pu.source)
 				if err != nil {
 					writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 					return
 				}
 				batchBuf.Write(shredded)
 				batchBuf.WriteByte('\n')
-				if isDel {
+				if pu.isDel {
 					totalDeleted++
 				} else {
 					totalUpdated++
@@ -2976,9 +3033,17 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	targets, aliasFilters := s.resolveTargetIndicesWithFilters(r.PathValue("index"))
-	if len(targets) == 0 {
-		targets = []string{s.resolveIndexName(r.PathValue("index"))}
+	rawIndex := r.PathValue("index")
+	targets, aliasFilters := s.resolveTargetIndicesWithFilters(rawIndex)
+	if len(targets) == 0 && !hasExclusionOrWildcard(rawIndex) {
+		target, f := s.resolveIndexNameWithFilter(rawIndex)
+		targets = []string{target}
+		if f != nil {
+			if aliasFilters == nil {
+				aliasFilters = make(map[string]*esast.Query)
+			}
+			aliasFilters[target] = f
+		}
 	}
 
 	var body struct {
@@ -3113,6 +3178,8 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	defaultPipeline := r.URL.Query().Get("pipeline")
+	droppedOps := make([]bool, len(ops))
+	pipeErrs := make([]string, len(ops))
 	// Collect sample docs per target index for dynamic mapping inference on auto-created indices.
 	sampleDocsByIndex := make(map[string][]json.RawMessage)
 	idsToFetchByIndex := make(map[string][]string)
@@ -3126,14 +3193,17 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			op.ParseErr = writeErr.Error()
 			continue
 		}
-		effPipeline := s.resolveEffectivePipeline(idxName, defaultPipeline, op.Pipeline)
 		if (op.Action == "index" || op.Action == "create") && len(op.Source) > 0 {
-			if effPipeline != "" {
-				op.Source = s.applyIngestPipelineIfPresent(effPipeline, op.Source)
+			piped, dropped, pipeErr := s.applyEffectiveAndFinalPipelines(idxName, defaultPipeline, op.Pipeline, op.Source)
+			if pipeErr != nil {
+				pipeErrs[idx] = pipeErr.Error()
+				continue
 			}
-			if finPipeline := s.resolveFinalPipeline(idxName); finPipeline != "" {
-				op.Source = s.applyIngestPipelineIfPresent(finPipeline, op.Source)
+			if dropped {
+				droppedOps[idx] = true
+				continue
 			}
+			op.Source = piped
 		}
 		if (op.Action == "index" || op.Action == "create") && len(op.Source) > 0 && len(sampleDocsByIndex[idxName]) < 16 {
 			sampleDocsByIndex[idxName] = append(sampleDocsByIndex[idxName], op.Source)
@@ -3172,10 +3242,38 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 	var items []map[string]any
 	hasErrors := false
 
-	for _, op := range ops {
+	for opIdx, op := range ops {
 		targetIndex, opAliasFilter, writeErr := s.resolveWriteIndexWithFilter(op.Index)
 		if writeErr != nil {
 			targetIndex = op.Index
+		}
+		if pipeErrs[opIdx] != "" {
+			hasErrors = true
+			items = append(items, map[string]any{
+				op.Action: map[string]any{
+					"_index": targetIndex,
+					"_id":    op.ID,
+					"status": http.StatusBadRequest,
+					"error":  map[string]any{"type": "ingest_processor_exception", "reason": pipeErrs[opIdx]},
+				},
+			})
+			continue
+		}
+		if droppedOps[opIdx] {
+			items = append(items, map[string]any{
+				op.Action: map[string]any{
+					"_index":        targetIndex,
+					"_type":         "_doc",
+					"_id":           op.ID,
+					"_version":      -1,
+					"result":        "noop",
+					"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+					"_seq_no":       -1,
+					"_primary_term": 1,
+					"status":        http.StatusOK,
+				},
+			})
+			continue
 		}
 		if op.ParseErr != "" {
 			hasErrors = true
@@ -3343,20 +3441,55 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			updateResult = opRes
-			sourceToShred = merged
 			if opRes == "deleted" {
 				deleted = true
-			} else if opAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), targetIndex, op.ID, merged, opAliasFilter) {
-				hasErrors = true
-				items = append(items, map[string]any{
-					op.Action: map[string]any{
-						"_index": targetIndex,
-						"_id":    op.ID,
-						"status": http.StatusBadRequest,
-						"error":  map[string]any{"type": "illegal_argument_exception", "reason": fmt.Sprintf("updated document [%s] does not match alias filter for [%s]", op.ID, op.Index)},
-					},
-				})
-				continue
+				sourceToShred = merged
+			} else {
+				if len(merged) > 0 {
+					piped, dropped, pipeErr := s.applyEffectiveAndFinalPipelines(targetIndex, defaultPipeline, op.Pipeline, merged)
+					if pipeErr != nil {
+						hasErrors = true
+						items = append(items, map[string]any{
+							op.Action: map[string]any{
+								"_index": targetIndex,
+								"_id":    op.ID,
+								"status": http.StatusBadRequest,
+								"error":  map[string]any{"type": "ingest_processor_exception", "reason": pipeErr.Error()},
+							},
+						})
+						continue
+					}
+					if dropped {
+						items = append(items, map[string]any{
+							op.Action: map[string]any{
+								"_index":   targetIndex,
+								"_type":    "_doc",
+								"_id":      op.ID,
+								"_version": existingHit.Version,
+								"result":   "noop",
+								"status":   http.StatusOK,
+							},
+						})
+						continue
+					}
+					merged = piped
+				}
+				sourceToShred = merged
+				if opAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), targetIndex, op.ID, merged, opAliasFilter) {
+					hasErrors = true
+					items = append(items, map[string]any{
+						op.Action: map[string]any{
+							"_index": targetIndex,
+							"_id":    op.ID,
+							"status": http.StatusBadRequest,
+							"error":  map[string]any{"type": "illegal_argument_exception", "reason": fmt.Sprintf("updated document [%s] does not match alias filter for [%s]", op.ID, op.Index)},
+						},
+					})
+					continue
+				}
+				if len(sourceToShred) > 0 {
+					idxSchema = s.ensureWritableIndexSchemaWithDocs(r.Context(), targetIndex, []json.RawMessage{sourceToShred})
+				}
 			}
 		}
 
@@ -3548,8 +3681,15 @@ func (s *Server) buildDorisExplainObject(ctx context.Context, rawIndexPattern st
 		rawIndexPattern = extractPITIndex(rawIndexPattern, req.PIT)
 	}
 	targets, aliasFilters := s.resolveTargetIndicesWithFilters(rawIndexPattern)
-	if len(targets) == 0 {
-		targets = []string{s.resolveIndexName(rawIndexPattern)}
+	if len(targets) == 0 && !hasExclusionOrWildcard(rawIndexPattern) {
+		target, f := s.resolveIndexNameWithFilter(rawIndexPattern)
+		targets = []string{target}
+		if f != nil {
+			if aliasFilters == nil {
+				aliasFilters = make(map[string]*esast.Query)
+			}
+			aliasFilters[target] = f
+		}
 	}
 	if req != nil && hasTermsLookupInSearchRequest(req) {
 		req = s.resolveTermsLookupsInSearchRequest(ctx, req)
@@ -3803,11 +3943,18 @@ func (s *Server) executeSearchRequest(
 	}
 	targets, aliasFilters := s.resolveTargetIndicesWithFilters(rawIndexPattern)
 	if len(targets) == 0 {
-		// If wildcard pattern matched nothing, return empty 200 search response (like ES with allow_no_indices=true)
-		if strings.Contains(rawIndexPattern, "*") || rawIndexPattern == "_all" {
+		// If wildcard or exclusion pattern matched nothing, return empty 200 search response (like ES with allow_no_indices=true)
+		if hasExclusionOrWildcard(rawIndexPattern) {
 			return buildESResponse(rawIndexPattern, nil, req, nil, nil, 1, nil), http.StatusOK, "", ""
 		}
-		targets = []string{s.resolveIndexName(rawIndexPattern)}
+		target, f := s.resolveIndexNameWithFilter(rawIndexPattern)
+		targets = []string{target}
+		if f != nil {
+			if aliasFilters == nil {
+				aliasFilters = make(map[string]*esast.Query)
+			}
+			aliasFilters[target] = f
+		}
 	}
 
 	if req != nil {
@@ -3875,11 +4022,13 @@ func (s *Server) executeSearchRequest(
 	var allAggRows []AggRow
 	var totalHitsSum int64
 	var primarySchema *schema.IndexSchema
+	schemasByIndex := make(map[string]*schema.IndexSchema, len(targets))
 	var allUnindexedFields []string
 	seenUnindexed := make(map[string]struct{})
 
 	for _, indexName := range targets {
 		idxSchema := s.ensureIndexSchema(ctx, indexName)
+		schemasByIndex[indexName] = idxSchema
 		if primarySchema == nil {
 			primarySchema = idxSchema
 		}
@@ -4060,7 +4209,7 @@ func (s *Server) executeSearchRequest(
 						} else if idxTotal > 0 {
 							w = idxTotal
 						}
-						if w > 0 && (spec.Avg != nil || spec.Percentiles != nil || spec.PercentileRanks != nil || spec.Boxplot != nil) {
+						if w > 0 && r.Weight == 0 && (spec.Avg != nil || spec.Percentiles != nil || spec.PercentileRanks != nil || spec.Boxplot != nil) {
 							r.Weight = w
 						}
 					}
@@ -4094,7 +4243,15 @@ func (s *Server) executeSearchRequest(
 	if len(targets) > 1 {
 		sort.SliceStable(allHits, func(i, j int) bool {
 			if len(req.Sort) > 0 {
-				if cmp := compareHitRowsBySort(allHits[i], allHits[j], req.Sort, primarySchema); cmp != 0 {
+				sI := schemasByIndex[allHits[i].Index]
+				if sI == nil {
+					sI = primarySchema
+				}
+				sJ := schemasByIndex[allHits[j].Index]
+				if sJ == nil {
+					sJ = primarySchema
+				}
+				if cmp := compareHitRowsBySortWithSchemas(allHits[i], allHits[j], req.Sort, sI, sJ); cmp != 0 {
 					return cmp < 0
 				}
 			}
@@ -4108,7 +4265,11 @@ func (s *Server) executeSearchRequest(
 			deduped := make([]HitRow, 0, len(allHits))
 			collapseSort := []esast.SortSpec{{Entry: esast.SortEntry{Field: req.Collapse.Field}}}
 			for _, h := range allHits {
-				vals := extractHitSortValues(h, collapseSort, primarySchema)
+				hSchema := schemasByIndex[h.Index]
+				if hSchema == nil {
+					hSchema = primarySchema
+				}
+				vals := extractHitSortValues(h, collapseSort, hSchema)
 				if len(vals) > 0 && vals[0] != nil {
 					ck := fmt.Sprintf("%v", vals[0])
 					if _, exists := seenCollapse[ck]; exists {
@@ -4178,7 +4339,7 @@ func (s *Server) executeSearchRequest(
 		}
 		return nil
 	}
-	resp := buildESResponse(primaryIndex, primarySchema, req, allHits, allAggRows, tookMs, docLookup)
+	resp := buildESResponseWithSchemas(primaryIndex, primarySchema, schemasByIndex, req, allHits, allAggRows, tookMs, docLookup)
 	if !aliasHasNow {
 		s.queryCache.PutWithMeta(cacheTargets, req, resp, allUnindexedFields)
 	}
@@ -4566,9 +4727,29 @@ func indexSchemaHasField(idxSchema *schema.IndexSchema, field string) bool {
 	return false
 }
 
+func parseIPv4SortUint32(v any) (uint32, bool) {
+	s, ok := v.(string)
+	if !ok {
+		return 0, false
+	}
+	ip := net.ParseIP(strings.TrimSpace(s))
+	if ip == nil {
+		return 0, false
+	}
+	ip4 := ip.To4()
+	if ip4 == nil || strings.Contains(s, ":") {
+		return 0, false
+	}
+	return uint32(ip4[0])<<24 | uint32(ip4[1])<<16 | uint32(ip4[2])<<8 | uint32(ip4[3]), true
+}
+
 func compareHitRowsBySort(a, b HitRow, sorts []esast.SortSpec, idxSchema *schema.IndexSchema) int {
-	valsA := extractHitSortValues(a, sorts, idxSchema)
-	valsB := extractHitSortValues(b, sorts, idxSchema)
+	return compareHitRowsBySortWithSchemas(a, b, sorts, idxSchema, idxSchema)
+}
+
+func compareHitRowsBySortWithSchemas(a, b HitRow, sorts []esast.SortSpec, schemaA, schemaB *schema.IndexSchema) int {
+	valsA := extractHitSortValues(a, sorts, schemaA)
+	valsB := extractHitSortValues(b, sorts, schemaB)
 	for idx, s := range sorts {
 		if idx >= len(valsA) || idx >= len(valsB) {
 			break
@@ -4590,7 +4771,20 @@ func compareHitRowsBySort(a, b HitRow, sorts []esast.SortSpec, idxSchema *schema
 			}
 			return -1
 		}
-		cmp := compareAny(va, vb)
+		var cmp int
+		if ipA, okA := parseIPv4SortUint32(va); okA {
+			if ipB, okB := parseIPv4SortUint32(vb); okB {
+				if ipA < ipB {
+					cmp = -1
+				} else if ipA > ipB {
+					cmp = 1
+				}
+			} else {
+				cmp = compareAny(va, vb)
+			}
+		} else {
+			cmp = compareAny(va, vb)
+		}
 		if cmp == 0 {
 			continue
 		}
@@ -4842,6 +5036,10 @@ func applyURISearchParams(r *http.Request, req *esast.SearchRequest) {
 }
 
 func buildESResponse(indexName string, idxSchema *schema.IndexSchema, req *esast.SearchRequest, hits []HitRow, aggRows []AggRow, tookMs int64, docLookup func(string) *HitRow) map[string]any {
+	return buildESResponseWithSchemas(indexName, idxSchema, nil, req, hits, aggRows, tookMs, docLookup)
+}
+
+func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema, schemasByIndex map[string]*schema.IndexSchema, req *esast.SearchRequest, hits []HitRow, aggRows []AggRow, tookMs int64, docLookup func(string) *HitRow) map[string]any {
 	var totalHits int64
 	var maxScore float64
 	esHits := make([]map[string]any, 0, len(hits))
@@ -4860,6 +5058,12 @@ func buildESResponse(indexName string, idxSchema *schema.IndexSchema, req *esast
 		if hitIdx == "" {
 			hitIdx = indexName
 		}
+		hitSchema := idxSchema
+		if schemasByIndex != nil {
+			if s, ok := schemasByIndex[hitIdx]; ok && s != nil {
+				hitSchema = s
+			}
+		}
 		hitMap := map[string]any{
 			"_index": hitIdx,
 			"_type":  "_doc",
@@ -4875,10 +5079,10 @@ func buildESResponse(indexName string, idxSchema *schema.IndexSchema, req *esast
 			}
 		}
 		if len(req.Sort) > 0 {
-			hitMap["sort"] = extractHitSortValues(h, req.Sort, idxSchema)
+			hitMap["sort"] = extractHitSortValues(h, req.Sort, hitSchema)
 		}
 		if len(req.Fields) > 0 || len(req.DocvalueFields) > 0 {
-			if fm := extractHitFieldsMap(h, hitIdx, req, idxSchema); len(fm) > 0 {
+			if fm := extractHitFieldsMap(h, hitIdx, req, hitSchema); len(fm) > 0 {
 				hitMap["fields"] = fm
 			}
 		}
@@ -5046,6 +5250,7 @@ func buildAggsMap(
 				if len(groupedSubAggs) > 0 {
 					attachSubAggsToBucket(indexName, nestedObj, fullKey, "_nested_doc_count", groupedSubAggs, bucketsByAgg, docLookup)
 				}
+				_ = evaluateChildPipelineAggs([]map[string]any{nestedObj}, subAggs)
 				evaluateSiblingPipelineAggs(subAggs, nestedObj)
 			}
 			aggsOut[aggName] = nestedObj
@@ -5059,6 +5264,8 @@ func buildAggsMap(
 				for sk, sv := range buildAggsMap(indexName, fullKey, subAggs, bucketsByAgg, cnt, docLookup) {
 					containerObj[sk] = sv
 				}
+				_ = evaluateChildPipelineAggs([]map[string]any{containerObj}, subAggs)
+				evaluateSiblingPipelineAggs(subAggs, containerObj)
 			}
 			aggsOut[aggName] = containerObj
 		case spec.Filter != nil || spec.Missing != nil:
@@ -5071,6 +5278,8 @@ func buildAggsMap(
 				for sk, sv := range buildAggsMap(indexName, fullKey, subAggs, bucketsByAgg, cnt, docLookup) {
 					filterObj[sk] = sv
 				}
+				_ = evaluateChildPipelineAggs([]map[string]any{filterObj}, subAggs)
+				evaluateSiblingPipelineAggs(subAggs, filterObj)
 			}
 			aggsOut[aggName] = filterObj
 		case spec.Filters != nil:
@@ -8005,6 +8214,7 @@ func attachSubAggsToBucket(
 			filterObj := map[string]any{"doc_count": cnt}
 			if grandSubAggs := subSpec.SubAggs(); len(grandSubAggs) > 0 {
 				attachSubAggsToBucket(indexName, filterObj, subFullKey, parentBucketKey, grandSubAggs, bucketsByAgg, docLookup)
+				_ = evaluateChildPipelineAggs([]map[string]any{filterObj}, grandSubAggs)
 				evaluateSiblingPipelineAggs(grandSubAggs, filterObj)
 			}
 			bucketMap[subName] = filterObj
@@ -8666,10 +8876,22 @@ func reduceSortFieldValues(vals []any, mode, order string) any {
 		}
 	}
 	strs := make([]string, len(vals))
+	allIPv4 := true
 	for i, v := range vals {
 		strs[i] = fmt.Sprintf("%v", v)
+		if _, ok := parseIPv4SortUint32(strs[i]); !ok {
+			allIPv4 = false
+		}
 	}
-	sort.Strings(strs)
+	if allIPv4 {
+		sort.Slice(strs, func(i, j int) bool {
+			ipI, _ := parseIPv4SortUint32(strs[i])
+			ipJ, _ := parseIPv4SortUint32(strs[j])
+			return ipI < ipJ
+		})
+	} else {
+		sort.Strings(strs)
+	}
 	if effMode == "max" {
 		return strs[len(strs)-1]
 	}
@@ -9453,6 +9675,56 @@ func (s *Server) docMatchesAliasFilter(ctx context.Context, indexName, docID str
 		return true
 	}
 	return evalWhereExpr(row, whereExpr)
+}
+
+func hasExclusionOrWildcard(rawIndex string) bool {
+	if strings.Contains(rawIndex, "*") {
+		return true
+	}
+	for _, part := range strings.Split(rawIndex, ",") {
+		p := strings.TrimSpace(part)
+		if strings.HasPrefix(p, "-") || p == "_all" {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) resolveIndexNameWithFilter(nameOrAlias string) (string, *esast.Query) {
+	if nameOrAlias == "" {
+		return "default_index", nil
+	}
+	if idx := strings.IndexByte(nameOrAlias, ','); idx > 0 {
+		nameOrAlias = nameOrAlias[:idx]
+	}
+	lookupLocked := func() (string, *esast.Query, bool) {
+		if targets, ok := s.aliases[nameOrAlias]; ok && len(targets) > 0 {
+			var f *esast.Query
+			if metaByIdx := s.aliasMeta[nameOrAlias]; metaByIdx != nil && metaByIdx[targets[0]].Filter != nil {
+				cp := *metaByIdx[targets[0]].Filter
+				f = &cp
+			}
+			return targets[0], f, true
+		}
+		if _, ok := s.indices[nameOrAlias]; ok {
+			return nameOrAlias, nil, true
+		}
+		return "", nil, false
+	}
+	s.mu.RLock()
+	if resolved, f, ok := lookupLocked(); ok {
+		s.mu.RUnlock()
+		return resolved, f
+	}
+	s.mu.RUnlock()
+
+	_ = s.syncCatalogFromBackend(context.Background())
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if resolved, f, ok := lookupLocked(); ok {
+		return resolved, f
+	}
+	return nameOrAlias, nil
 }
 
 func (s *Server) resolveIndexName(nameOrAlias string) string {

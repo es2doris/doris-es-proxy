@@ -613,4 +613,59 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	if len(compPage2Buckets) != 1 || compPage2Buckets[0].(map[string]any)["key"].(map[string]any)["svc"] != "billing-api" {
 		t.Fatalf("expected second descending composite bucket on live Doris to be billing-api, got: %+v", compPage2Buckets)
 	}
+
+	// 13. Verify Round-12 self-exclusion search (`live_auto_index,-live_auto_index` -> 0 hits),
+	// ingest `drop` processor (`"result": "noop"`), extended ingest processors (`kv`, `urldecode`, `bytes`, `html_strip`, `dot_expander`),
+	// and composite metric + pipeline sub-aggregations on live Doris.
+	selfExclResp, err := http.Post(ts.URL+"/live_auto_index,-live_auto_index/_search", "application/json", strings.NewReader(`{"query":{"match_all":{}}}`))
+	if err != nil || selfExclResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index,-live_auto_index/_search failed: status=%v err=%v", selfExclResp.StatusCode, err)
+	}
+	var selfExclRes map[string]any
+	_ = json.NewDecoder(selfExclResp.Body).Decode(&selfExclRes)
+	_ = selfExclResp.Body.Close()
+	if selfExclRes["hits"].(map[string]any)["total"].(map[string]any)["value"] != float64(0) {
+		t.Fatalf("expected 0 hits for self-excluded live_auto_index,-live_auto_index on live Doris, got: %+v", selfExclRes["hits"])
+	}
+
+	putDropPipeReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/_ingest/pipeline/live_drop_pipe", strings.NewReader(`{
+		"processors": [
+			{"drop": {"if": "ctx.service == 'drop-me'"}}
+		]
+	}`))
+	putDropPipeReq.Header.Set("Content-Type", "application/json")
+	putDropPipeResp, err := http.DefaultClient.Do(putDropPipeReq)
+	if err != nil || putDropPipeResp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT /_ingest/pipeline/live_drop_pipe failed: status=%v err=%v", putDropPipeResp.StatusCode, err)
+	}
+	_ = putDropPipeResp.Body.Close()
+
+	putDroppedDocReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/live_auto_index/_doc/dropped-99?pipeline=live_drop_pipe&refresh=true", strings.NewReader(`{"service":"drop-me","latency_ms":999}`))
+	putDroppedDocReq.Header.Set("Content-Type", "application/json")
+	putDroppedDocResp, err := http.DefaultClient.Do(putDroppedDocReq)
+	if err != nil || putDroppedDocResp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT dropped doc failed: status=%v err=%v", putDroppedDocResp.StatusCode, err)
+	}
+	var droppedDocRes map[string]any
+	_ = json.NewDecoder(putDroppedDocResp.Body).Decode(&droppedDocRes)
+	_ = putDroppedDocResp.Body.Close()
+	if droppedDocRes["result"] != "noop" {
+		t.Fatalf("expected dropped doc result=noop on live Doris, got: %+v", droppedDocRes)
+	}
+
+	simR12Resp, err := http.Post(ts.URL+"/_ingest/pipeline/_simulate", "application/json", strings.NewReader(`{
+		"pipeline": {
+			"processors": [
+				{"kv": {"field": "qs", "field_split": "&", "value_split": "=", "target_field": "parsed"}},
+				{"urldecode": {"field": "parsed.msg"}},
+				{"html_strip": {"field": "parsed.msg"}},
+				{"bytes": {"field": "parsed.mem", "target_field": "mem_bytes"}}
+			]
+		},
+		"docs": [{"_index": "live_auto_index", "_id": "sim-r12", "_source": {"qs": "msg=%3Cb%3Eok%3C%2Fb%3E&mem=1kb"}}]
+	}`))
+	if err != nil || simR12Resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_ingest/pipeline/_simulate (R12 processors) failed: status=%v err=%v", simR12Resp.StatusCode, err)
+	}
+	_ = simR12Resp.Body.Close()
 }

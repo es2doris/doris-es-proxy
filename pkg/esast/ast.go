@@ -1507,8 +1507,9 @@ type NestedAggSpec struct {
 }
 
 type MetricAggSpec struct {
-	Field string   `json:"field"`
-	Sigma *float64 `json:"sigma,omitempty"`
+	Field   string   `json:"field"`
+	Sigma   *float64 `json:"sigma,omitempty"`
+	Missing any      `json:"missing,omitempty"`
 }
 
 func (m *MetricAggSpec) EffectiveSigma() float64 {

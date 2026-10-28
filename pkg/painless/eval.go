@@ -20,12 +20,19 @@ package painless
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
+)
+
+var (
+	errPainlessReturn   = errors.New("painless_return")
+	errPainlessBreak    = errors.New("painless_break")
+	errPainlessContinue = errors.New("painless_continue")
 )
 
 // UpdateRequest models an Elasticsearch `/_update/<id>` or `/_update_by_query` mutation spec.
@@ -45,16 +52,18 @@ type ScriptSpec struct {
 
 var (
 	reCtxOp               = regexp.MustCompile(`^ctx\.op\s*=\s*['"]([^'"]+)['"]$`)
-	reCompoundAssign      = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.@-]+)\s*(\+=|-=|\*=|/=)\s*(.+)$`)
-	reAssignParam         = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.@-]+)\s*=\s*(.+)$`)
-	reRemoveField         = regexp.MustCompile(`^ctx\._source(?:\.([a-zA-Z0-9_.@-]+))?\.remove\(\s*(.+?)\s*\)$`)
-	reArrayAdd            = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.@-]+)\.add\(\s*(.+?)\s*\)$`)
-	reArrayAddAll         = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.@-]+)\.addAll\(\s*(.+?)\s*\)$`)
-	reMapPut              = regexp.MustCompile(`^ctx\._source(?:\.([a-zA-Z0-9_.@-]+))?\.put\(\s*(.+?)\s*,\s*(.+?)\s*\)$`)
-	reMapPutAll           = regexp.MustCompile(`^ctx\._source(?:\.([a-zA-Z0-9_.@-]+))?\.putAll\(\s*(.+?)\s*\)$`)
-	reArrayRemoveIf       = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.@-]+)\.removeIf\(\s*([a-zA-Z0-9_]+)\s*->\s*([a-zA-Z0-9_]+)(?:\.([a-zA-Z0-9_.@-]+))?\s*==\s*(.+?)\s*\)$`)
-	reLocalCompoundAssign = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@-]+)*)\s*(\+=|-=|\*=|/=)\s*(.+)$`)
-	reLocalPropAssign     = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z0-9_.@-]+)\s*=\s*(.+)$`)
+	reCtxIncDec           = regexp.MustCompile(`^(?:(\+\+|--)\s*ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x04-]+)|ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x04-]+)\s*(\+\+|--))$`)
+	reCompoundAssign      = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x04-]+)\s*(\+=|-=|\*=|/=)\s*(.+)$`)
+	reAssignParam         = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x04-]+)\s*=\s*(.+)$`)
+	reRemoveField         = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_.@/:?\x00-\x04-]+))?\.remove\(\s*(.+?)\s*\)$`)
+	reArrayAdd            = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x04-]+)\.add\(\s*(.+?)\s*\)$`)
+	reArrayAddAll         = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x04-]+)\.addAll\(\s*(.+?)\s*\)$`)
+	reMapPut              = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_.@/:?\x00-\x04-]+))?\.put\(\s*(.+?)\s*,\s*(.+?)\s*\)$`)
+	reMapPutAll           = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_.@/:?\x00-\x04-]+))?\.putAll\(\s*(.+?)\s*\)$`)
+	reArrayRemoveIf       = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x04-]+)\.removeIf\(\s*([a-zA-Z0-9_]+)\s*->\s*([a-zA-Z0-9_]+)(?:\.([a-zA-Z0-9_.@/:?\x00-\x04-]+))?\s*==\s*(.+?)\s*\)$`)
+	reLocalIncDec         = regexp.MustCompile(`^(?:(\+\+|--)\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x04-]+)*)|([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x04-]+)*)\s*(\+\+|--))$`)
+	reLocalCompoundAssign = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x04-]+)*)\s*(\+=|-=|\*=|/=)\s*(.+)$`)
+	reLocalPropAssign     = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z0-9_.@/:?\x00-\x04-]+)\s*=\s*(.+)$`)
 	reLocalVarAssign      = regexp.MustCompile(`^(?:(?:def|boolean|int|long|double|float|String|Object|Map|List)\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$`)
 )
 
@@ -112,7 +121,7 @@ func ApplyUpdateWithResult(rawSource json.RawMessage, req *UpdateRequest, docExi
 		switch strings.ToLower(ctxOp) {
 		case "noop", "none":
 			opResult = "noop"
-		case "delete":
+		case "delete", "drop":
 			opResult = "deleted"
 		}
 	}
@@ -159,6 +168,9 @@ func EvalPainlessWithOp(sourceMap map[string]any, scriptSource string, params ma
 	budget := &evalBudget{}
 	cleaned := stripPainlessComments(scriptSource)
 	err := execBlock(sourceMap, cleaned, params, &ctxOp, budget)
+	if errors.Is(err, errPainlessReturn) {
+		err = nil
+	}
 	return ctxOp, err
 }
 
@@ -290,13 +302,22 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 	for k, v := range params {
 		loopParams[k] = v
 	}
+	var loopErr error
 	for _, item := range snapshot {
 		if err := budget.step(); err != nil {
-			return err
+			loopErr = err
+			break
 		}
 		loopParams[varName] = item
 		if err := execBlock(sourceMap, body, loopParams, ctxOp, budget); err != nil {
-			return err
+			if errors.Is(err, errPainlessBreak) {
+				break
+			}
+			if errors.Is(err, errPainlessContinue) {
+				continue
+			}
+			loopErr = err
+			break
 		}
 	}
 	for k, v := range loopParams {
@@ -304,7 +325,7 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 			params[k] = v
 		}
 	}
-	return nil
+	return loopErr
 }
 
 func isIdentByte(c byte) bool {
@@ -312,11 +333,23 @@ func isIdentByte(c byte) bool {
 }
 
 func isBracketKeyByte(c byte) bool {
-	return isIdentByte(c) || c == '@' || c == '-' || c == '.'
+	return isIdentByte(c) || c == '@' || c == '-' || c == '.' || c == '/' || c == ':' || c == ' '
+}
+
+func decodeBracketSeg(seg string) string {
+	seg = strings.TrimSuffix(seg, "?")
+	seg = strings.ReplaceAll(seg, "\x00", ".")
+	seg = strings.ReplaceAll(seg, "\x01", " ")
+	seg = strings.ReplaceAll(seg, "\x02", "/")
+	seg = strings.ReplaceAll(seg, "\x03", ":")
+	seg = strings.ReplaceAll(seg, "\x04", "-")
+	return seg
 }
 
 // normalizeBracketAccess rewrites bracket property accesses like `ctx._source['field']`
 // or `params["key"]` into dot notation (`ctx._source.field`, `params.key`) outside string literals.
+// Special characters inside bracketed keys (`.`, ` `, `/`, `:`, `-`) are encoded as `\x00`..`\x04`
+// so path splitting on `.` and operator scanners preserve literal keys intact.
 func normalizeBracketAccess(s string) string {
 	if strings.IndexByte(s, '[') < 0 {
 		return s
@@ -331,19 +364,46 @@ func normalizeBracketAccess(s string) string {
 			out.WriteByte(c)
 			continue
 		}
-		if c == '[' && i > 0 && (isBracketKeyByte(s[i-1]) || s[i-1] == ']') && i+3 < len(s) && (s[i+1] == '\'' || s[i+1] == '"') {
-			q := s[i+1]
-			j := i + 2
-			valid := false
-			for j < len(s) && isBracketKeyByte(s[j]) {
-				j++
-				valid = true
+		if c == '[' && i > 0 && (isBracketKeyByte(s[i-1]) || s[i-1] == ']' || s[i-1] == '?') {
+			k := i + 1
+			for k < len(s) && (s[k] == ' ' || s[k] == '\t') {
+				k++
 			}
-			if valid && j+1 < len(s) && s[j] == q && s[j+1] == ']' {
-				out.WriteByte('.')
-				out.WriteString(s[i+2 : j])
-				i = j + 1
-				continue
+			if k < len(s) && (s[k] == '\'' || s[k] == '"') {
+				q := s[k]
+				j := k + 1
+				valid := false
+				for j < len(s) && s[j] != q && isBracketKeyByte(s[j]) {
+					j++
+					valid = true
+				}
+				if valid && j < len(s) && s[j] == q {
+					endIdx := j + 1
+					for endIdx < len(s) && (s[endIdx] == ' ' || s[endIdx] == '\t') {
+						endIdx++
+					}
+					if endIdx < len(s) && s[endIdx] == ']' {
+						out.WriteByte('.')
+						for p := k + 1; p < j; p++ {
+							switch s[p] {
+							case '.':
+								out.WriteByte('\x00')
+							case ' ':
+								out.WriteByte('\x01')
+							case '/':
+								out.WriteByte('\x02')
+							case ':':
+								out.WriteByte('\x03')
+							case '-':
+								out.WriteByte('\x04')
+							default:
+								out.WriteByte(s[p])
+							}
+						}
+						i = endIdx
+						continue
+					}
+				}
 			}
 		}
 		out.WriteByte(c)
@@ -352,9 +412,48 @@ func normalizeBracketAccess(s string) string {
 }
 
 func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any, ctxOp *string, budget *evalBudget) error {
-	stmt = normalizeBracketAccess(stmt)
+	stmt = strings.TrimSpace(normalizeBracketAccess(stmt))
+	if stmt == "return" || strings.HasPrefix(stmt, "return ") || strings.HasPrefix(stmt, "return;") {
+		return errPainlessReturn
+	}
+	if stmt == "break" {
+		return errPainlessBreak
+	}
+	if stmt == "continue" {
+		return errPainlessContinue
+	}
 	if m := reCtxOp.FindStringSubmatch(stmt); m != nil {
 		*ctxOp = m[1]
+		return nil
+	}
+	if m := reCtxIncDec.FindStringSubmatch(stmt); m != nil {
+		op := m[1]
+		pathStr := m[2]
+		if op == "" {
+			pathStr = m[3]
+			op = m[4]
+		}
+		lhsPath := strings.Split(pathStr, ".")
+		curVal := resolveParamPath(sourceMap, lhsPath)
+		setValueAtPath(sourceMap, lhsPath, applyArithmetic(curVal, int64(1), op == "++"))
+		return nil
+	}
+	if m := reLocalIncDec.FindStringSubmatch(stmt); m != nil {
+		op := m[1]
+		lhs := m[2]
+		if op == "" {
+			lhs = m[3]
+			op = m[4]
+		}
+		path := strings.Split(lhs, ".")
+		curVal := resolveParamPath(params, path)
+		nextVal := applyArithmetic(curVal, int64(1), op == "++")
+		firstKey := decodeBracketSeg(path[0])
+		if len(path) == 1 {
+			params[firstKey] = nextVal
+		} else if targetMap, ok := params[firstKey].(map[string]any); ok {
+			setValueAtPath(targetMap, path[1:], nextVal)
+		}
 		return nil
 	}
 
@@ -747,7 +846,7 @@ func evalConditionDepth(sourceMap map[string]any, cond string, params map[string
 	if depth > 64 {
 		return false
 	}
-	cond = trimBalancedParens(cond)
+	cond = trimBalancedParens(normalizeBracketAccess(cond))
 	if cond == "" || cond == "false" {
 		return false
 	}
@@ -1088,11 +1187,18 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		}
 	}
 
-	if rhs == "ctx._source" {
+	if rhs == "ctx._source" || rhs == "ctx?._source" {
 		return sourceMap, nil
 	}
-	if strings.HasPrefix(rhs, "ctx._source.") || strings.HasPrefix(rhs, "ctx._source?.") {
-		trimmed := strings.TrimPrefix(strings.TrimPrefix(rhs, "ctx._source?."), "ctx._source.")
+	if strings.HasPrefix(rhs, "ctx._source.") || strings.HasPrefix(rhs, "ctx._source?.") ||
+		strings.HasPrefix(rhs, "ctx?._source.") || strings.HasPrefix(rhs, "ctx?._source?.") {
+		trimmed := rhs
+		for _, pfx := range []string{"ctx?._source?.", "ctx?._source.", "ctx._source?.", "ctx._source."} {
+			if strings.HasPrefix(trimmed, pfx) {
+				trimmed = strings.TrimPrefix(trimmed, pfx)
+				break
+			}
+		}
 		path := strings.Split(trimmed, ".")
 		return resolveParamPath(sourceMap, path), nil
 	}
@@ -1101,8 +1207,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		trimmed = strings.TrimSuffix(trimmed, ".value")
 		path := strings.Split(trimmed, ".")
 		val := resolveParamPath(sourceMap, path)
-		if val == nil && strings.HasSuffix(trimmed, ".keyword") {
-			val = resolveParamPath(sourceMap, strings.Split(strings.TrimSuffix(trimmed, ".keyword"), "."))
+		if val == nil && (strings.HasSuffix(trimmed, ".keyword") || strings.HasSuffix(trimmed, "\x00keyword")) {
+			kwTrimmed := strings.TrimSuffix(strings.TrimSuffix(trimmed, ".keyword"), "\x00keyword")
+			val = resolveParamPath(sourceMap, strings.Split(kwTrimmed, "."))
 		}
 		return val, nil
 	}
@@ -1114,11 +1221,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		paramPath := strings.Split(trimmed, ".")
 		return resolveParamPath(params, paramPath), nil
 	}
-	if val, ok := params[strings.TrimSuffix(rhs, "?")]; ok {
+	if val, ok := params[decodeBracketSeg(rhs)]; ok {
 		return val, nil
 	}
 	if dotIdx := strings.IndexByte(rhs, '.'); dotIdx > 0 {
-		firstSeg := strings.TrimSuffix(rhs[:dotIdx], "?")
+		firstSeg := decodeBracketSeg(rhs[:dotIdx])
 		if baseVal, ok := params[firstSeg]; ok {
 			if baseMap, isMap := baseVal.(map[string]any); isMap {
 				return resolveParamPath(baseMap, strings.Split(rhs[dotIdx+1:], ".")), nil
@@ -1529,21 +1636,51 @@ func splitTopLevelStatements(s string) []string {
 
 func resolveParamPath(params map[string]any, path []string) any {
 	var curr any = params
-	for _, seg := range path {
-		seg = strings.TrimSuffix(seg, "?")
+	for i, rawSeg := range path {
+		seg := decodeBracketSeg(rawSeg)
 		m, ok := curr.(map[string]any)
 		if !ok {
 			return nil
 		}
-		curr = m[seg]
+		val, exists := m[seg]
+		if !exists {
+			if strings.Contains(seg, ".") {
+				subCurr := any(m)
+				for _, subSeg := range strings.Split(seg, ".") {
+					sm, sok := subCurr.(map[string]any)
+					if !sok {
+						subCurr = nil
+						break
+					}
+					subCurr = sm[subSeg]
+				}
+				val = subCurr
+			} else if i < len(path)-1 {
+				decodedRest := make([]string, len(path)-i)
+				for j := i; j < len(path); j++ {
+					decodedRest[j-i] = decodeBracketSeg(path[j])
+				}
+				if flatVal, flatOk := m[strings.Join(decodedRest, ".")]; flatOk {
+					return flatVal
+				}
+			}
+		}
+		curr = val
 	}
 	return curr
 }
 
 func setValueAtPath(root map[string]any, path []string, val any) {
+	if len(path) > 1 {
+		decoded := make([]string, len(path))
+		for i, p := range path {
+			decoded[i] = decodeBracketSeg(p)
+		}
+		delete(root, strings.Join(decoded, "."))
+	}
 	curr := root
 	for i := 0; i < len(path)-1; i++ {
-		seg := path[i]
+		seg := decodeBracketSeg(path[i])
 		next, ok := curr[seg].(map[string]any)
 		if !ok {
 			next = make(map[string]any)
@@ -1551,12 +1688,13 @@ func setValueAtPath(root map[string]any, path []string, val any) {
 		}
 		curr = next
 	}
-	curr[path[len(path)-1]] = val
+	curr[decodeBracketSeg(path[len(path)-1])] = val
 }
 
 func putAllAtPath(root map[string]any, path []string, values map[string]any) {
 	curr := root
-	for _, seg := range path {
+	for _, rawSeg := range path {
+		seg := decodeBracketSeg(rawSeg)
 		next, ok := curr[seg].(map[string]any)
 		if !ok {
 			next = make(map[string]any)
@@ -1576,13 +1714,14 @@ func removeKeyOrIndexAtPath(root map[string]any, parentPath []string, keyOrIdx a
 	}
 	curr := root
 	for i := 0; i < len(parentPath)-1; i++ {
-		next, ok := curr[parentPath[i]].(map[string]any)
+		seg := decodeBracketSeg(parentPath[i])
+		next, ok := curr[seg].(map[string]any)
 		if !ok {
 			return
 		}
 		curr = next
 	}
-	lastSeg := parentPath[len(parentPath)-1]
+	lastSeg := decodeBracketSeg(parentPath[len(parentPath)-1])
 	switch target := curr[lastSeg].(type) {
 	case map[string]any:
 		delete(target, fmt.Sprintf("%v", keyOrIdx))
@@ -1606,7 +1745,7 @@ func removeKeyOrIndexAtPath(root map[string]any, parentPath []string, keyOrIdx a
 func appendToSlice(root map[string]any, path []string, val any) error {
 	curr := root
 	for i := 0; i < len(path)-1; i++ {
-		seg := path[i]
+		seg := decodeBracketSeg(path[i])
 		next, ok := curr[seg].(map[string]any)
 		if !ok {
 			next = make(map[string]any)
@@ -1614,7 +1753,7 @@ func appendToSlice(root map[string]any, path []string, val any) error {
 		}
 		curr = next
 	}
-	lastKey := path[len(path)-1]
+	lastKey := decodeBracketSeg(path[len(path)-1])
 	existing, ok := curr[lastKey].([]any)
 	if !ok {
 		existing = []any{}
@@ -1629,13 +1768,14 @@ func appendToSlice(root map[string]any, path []string, val any) error {
 func removeIfFromSlice(root map[string]any, arrPath []string, propPath []string, matchVal any) {
 	curr := root
 	for i := 0; i < len(arrPath)-1; i++ {
-		next, ok := curr[arrPath[i]].(map[string]any)
+		seg := decodeBracketSeg(arrPath[i])
+		next, ok := curr[seg].(map[string]any)
 		if !ok {
 			return
 		}
 		curr = next
 	}
-	lastKey := arrPath[len(arrPath)-1]
+	lastKey := decodeBracketSeg(arrPath[len(arrPath)-1])
 	existing, ok := curr[lastKey].([]any)
 	if !ok {
 		return
