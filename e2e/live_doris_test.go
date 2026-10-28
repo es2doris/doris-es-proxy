@@ -823,4 +823,64 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 		t.Fatalf("POST /_ingest/pipeline/_simulate (R15 processors) failed: status=%v err=%v", simR15Resp.StatusCode, err)
 	}
 	_ = simR15Resp.Body.Close()
+
+	// 17. Verify Round-16 features on live Doris:
+	//   - `script_score` with `boost` & `min_score`, Painless `while` loop + `Math.*` in `script_fields`, and `sum.script` SQL pushdown
+	//   - `COMBINEDAPACHELOG` grok, per-group `redact` tokens, `csv` `trim: true`, and `bytes` IEC `mib`
+	r16SearchResp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
+		"query": {
+			"script_score": {
+				"query": {"match_all": {}},
+				"script": {"source": "doc['latency_ms'].value * 2"},
+				"min_score": 10,
+				"boost": 1.5
+			}
+		},
+		"script_fields": {
+			"loop_check": {
+				"script": "def i = 1; def acc = 0; while (i <= 3) { acc += i; i++; } return acc + Math.abs(-4);"
+			}
+		},
+		"aggs": {
+			"floor_lat_sum": {
+				"sum": {
+					"script": {"source": "Math.floor(doc['latency_ms'].value)"}
+				}
+			}
+		}
+	}`))
+	if err != nil || r16SearchResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search (R16 script_score + while + sum.script) failed: status=%v err=%v", r16SearchResp.StatusCode, err)
+	}
+	var r16SearchRes map[string]any
+	_ = json.NewDecoder(r16SearchResp.Body).Decode(&r16SearchRes)
+	_ = r16SearchResp.Body.Close()
+	if len(r16SearchRes["hits"].(map[string]any)["hits"].([]any)) == 0 {
+		t.Fatalf("expected R16 hits on live_auto_index, got 0")
+	}
+
+	simR16Resp, err := http.Post(ts.URL+"/_ingest/pipeline/_simulate", "application/json", strings.NewReader(`{
+		"pipeline": {
+			"processors": [
+				{"grok": {"field": "apache_log", "patterns": ["%{COMBINEDAPACHELOG}"]}},
+				{"redact": {"field": "pii", "patterns": ["%{EMAILADDRESS:EMAIL}", "%{IPV4:IP}"]}},
+				{"csv": {"field": "csv_line", "target_fields": ["c1", "c2"], "trim": true}},
+				{"bytes": {"field": "mem", "target_field": "mem_b"}}
+			]
+		},
+		"docs": [{
+			"_index": "live_auto_index",
+			"_id": "sim-r16",
+			"_source": {
+				"apache_log": "127.0.0.1 - frank [10/Oct/2000:13:55:36 -0700] \"GET /apache_pb.gif HTTP/1.0\" 200 2326 \"http://www.example.com/start.html\" \"Mozilla/4.08\"",
+				"pii": "user bob@example.com from 192.168.1.10",
+				"csv_line": "  hello , \"world\" ",
+				"mem": "4mib"
+			}
+		}]
+	}`))
+	if err != nil || simR16Resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_ingest/pipeline/_simulate (R16 processors) failed: status=%v err=%v", simR16Resp.StatusCode, err)
+	}
+	_ = simR16Resp.Body.Close()
 }

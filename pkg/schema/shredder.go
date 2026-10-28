@@ -100,6 +100,11 @@ func ShredDocument(
 		case StoragePromotedScalar:
 			val := extractScalarValue(parsedDoc, b.SourceJSONPath)
 			val = coerceScalarForDoris(val, b.DorisType, b.LowercaseNormalizer, getNow())
+			if b.ESType == "date_nanos" {
+				if iv, ok := val.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
+					val = iv / 1_000_000
+				}
+			}
 			if val != nil {
 				row[b.ColumnName] = val
 			}
@@ -107,7 +112,11 @@ func ShredDocument(
 			vals := extractStringSliceValues(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer)
 			if b.ESType == "date" || b.ESType == "date_nanos" {
 				for i, v := range vals {
-					if _, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err != nil {
+					if iv, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
+						if b.ESType == "date_nanos" && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
+							vals[i] = strconv.FormatInt(iv/1_000_000, 10)
+						}
+					} else {
 						if ms, ok := ParseESDateToEpochMillis(v, getNow()); ok {
 							vals[i] = strconv.FormatInt(ms, 10)
 						}

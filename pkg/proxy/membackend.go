@@ -2545,6 +2545,9 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			return nil
 		}
 	}
+	if isArithmeticSQLExpr(colExpr) {
+		return evalNumericExpr(row, colExpr)
+	}
 	return nil
 }
 
