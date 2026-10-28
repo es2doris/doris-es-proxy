@@ -105,12 +105,21 @@ func ShredDocument(
 			}
 		case StoragePromotedArray, StorageNestedSubfield:
 			vals := extractStringSliceValues(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer)
-			if b.Kind == StoragePromotedArray && b.ESType == "date" {
+			if b.ESType == "date" || b.ESType == "date_nanos" {
 				for i, v := range vals {
 					if _, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err != nil {
 						if ms, ok := ParseESDateToEpochMillis(v, getNow()); ok {
 							vals[i] = strconv.FormatInt(ms, 10)
 						}
+					}
+				}
+			} else if b.ESType == "boolean" || b.DorisType == DorisBoolean {
+				for i, v := range vals {
+					switch strings.ToLower(strings.TrimSpace(v)) {
+					case "true", "1":
+						vals[i] = "true"
+					case "false", "0":
+						vals[i] = "false"
 					}
 				}
 			}
