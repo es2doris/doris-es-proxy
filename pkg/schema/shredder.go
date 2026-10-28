@@ -346,6 +346,9 @@ func ParseESDateBoundToEpochMillis(input string, now time.Time, roundUp bool) (i
 		prefix := strings.TrimSpace(s[:idx])
 		mathExpr = strings.TrimSpace(s[idx+2:])
 		if ms, err := strconv.ParseInt(prefix, 10, 64); err == nil {
+			if ms > 1_000_000_000_000_000 || ms < -1_000_000_000_000_000 {
+				ms /= 1_000_000
+			}
 			baseTime = time.UnixMilli(ms).UTC()
 		} else if t, ok := parseISODateString(prefix); ok {
 			dateOnlyPrefix = isDateOnlyString(prefix)
@@ -400,10 +403,14 @@ func parseISODateString(s string) (time.Time, bool) {
 	layouts := []string{
 		time.RFC3339Nano,
 		time.RFC3339,
+		"2006-01-02T15:04:05.999999999Z0700",
 		"2006-01-02T15:04:05.000Z0700",
 		"2006-01-02T15:04:05Z0700",
 		"2006-01-02T15:04:05.999999999",
 		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05.999999999Z0700",
+		"2006-01-02 15:04:05.999999999Z07:00",
+		"2006-01-02 15:04:05.999999999",
 		"2006-01-02 15:04:05.999",
 		"2006-01-02 15:04:05",
 		"2006-01-02",

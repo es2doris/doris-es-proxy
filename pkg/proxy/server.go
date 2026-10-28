@@ -2387,7 +2387,9 @@ func extractURLSourceFilter(r *http.Request) *esast.SourceFilter {
 		if srcParam == "false" {
 			return &esast.SourceFilter{Disabled: true}
 		}
-		if srcParam != "true" {
+		if srcParam == "true" {
+			sf = &esast.SourceFilter{}
+		} else {
 			sf = &esast.SourceFilter{Includes: strings.Split(srcParam, ",")}
 		}
 	}
@@ -2797,6 +2799,14 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
 		return
 	}
+	var updBodyMeta struct {
+		Source *esast.SourceFilter `json:"_source,omitempty"`
+	}
+	_ = json.Unmarshal(bodyBytes, &updBodyMeta)
+	effUpdateSF := updBodyMeta.Source
+	if effUpdateSF == nil {
+		effUpdateSF = extractURLSourceFilter(r)
+	}
 
 	roSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
 	_ = s.coalescer.FlushTable(r.Context(), roSchema.DorisTable)
@@ -2877,16 +2887,27 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	if opResult == "created" {
 		status = http.StatusCreated
 	}
-	writeJSON(w, status, map[string]any{
+	reportedVer := nextVersion
+	if opResult == "noop" && found && existingHit.Version > 0 {
+		reportedVer = existingHit.Version
+	}
+	respPayload := map[string]any{
 		"_index":        indexName,
 		"_type":         "_doc",
 		"_id":           docID,
-		"_version":      nextVersion,
+		"_version":      reportedVer,
 		"result":        opResult,
 		"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
-		"_seq_no":       nextVersion,
+		"_seq_no":       reportedVer,
 		"_primary_term": 1,
-	})
+	}
+	if effUpdateSF != nil && !effUpdateSF.Disabled && opResult != "deleted" && len(mutatedSource) > 0 {
+		respPayload["get"] = map[string]any{
+			"found":   true,
+			"_source": filterSourceJSON(mutatedSource, effUpdateSF),
+		}
+	}
+	writeJSON(w, status, respPayload)
 }
 
 func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
@@ -3484,6 +3505,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			minFloor = lastVer + 1
 		}
 		updateResult := ""
+		var bulkUpdateSF *esast.SourceFilter
 
 		if op.Action == "update" {
 			var upd painless.UpdateRequest
@@ -3498,6 +3520,14 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 					},
 				})
 				continue
+			}
+			var updMeta struct {
+				Source *esast.SourceFilter `json:"_source,omitempty"`
+			}
+			_ = json.Unmarshal(op.Source, &updMeta)
+			bulkUpdateSF = updMeta.Source
+			if bulkUpdateSF == nil {
+				bulkUpdateSF = extractURLSourceFilter(r)
 			}
 			existingHit, found := existingByIndex[targetIndex][op.ID]
 			if found && opAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), targetIndex, op.ID, existingHit.Source, opAliasFilter) {
@@ -3541,16 +3571,27 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 				})
 				continue
 			}
+			noopVer := existingHit.Version
+			if noopVer <= 0 {
+				noopVer = 1
+			}
 			if opRes == "noop" {
+				noopEntry := map[string]any{
+					"_index":   targetIndex,
+					"_type":    "_doc",
+					"_id":      op.ID,
+					"_version": noopVer,
+					"result":   "noop",
+					"status":   http.StatusOK,
+				}
+				if bulkUpdateSF != nil && !bulkUpdateSF.Disabled && len(merged) > 0 {
+					noopEntry["get"] = map[string]any{
+						"found":   true,
+						"_source": filterSourceJSON(merged, bulkUpdateSF),
+					}
+				}
 				items = append(items, map[string]any{
-					op.Action: map[string]any{
-						"_index":   targetIndex,
-						"_type":    "_doc",
-						"_id":      op.ID,
-						"_version": existingHit.Version,
-						"result":   "noop",
-						"status":   http.StatusOK,
-					},
+					op.Action: noopEntry,
 				})
 				continue
 			}
@@ -3579,7 +3620,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 								"_index":   targetIndex,
 								"_type":    "_doc",
 								"_id":      op.ID,
-								"_version": existingHit.Version,
+								"_version": noopVer,
 								"result":   "noop",
 								"status":   http.StatusOK,
 							},
@@ -3676,18 +3717,25 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			result = "updated"
 			reportedVer = nextVer
 		}
+		itemMap := map[string]any{
+			"_index":        targetIndex,
+			"_type":         "_doc",
+			"_id":           op.ID,
+			"_version":      reportedVer,
+			"result":        result,
+			"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+			"_seq_no":       nextVer,
+			"_primary_term": 1,
+			"status":        status,
+		}
+		if op.Action == "update" && bulkUpdateSF != nil && !bulkUpdateSF.Disabled && !deleted && len(sourceToShred) > 0 {
+			itemMap["get"] = map[string]any{
+				"found":   true,
+				"_source": filterSourceJSON(sourceToShred, bulkUpdateSF),
+			}
+		}
 		items = append(items, map[string]any{
-			op.Action: map[string]any{
-				"_index":        targetIndex,
-				"_type":         "_doc",
-				"_id":           op.ID,
-				"_version":      reportedVer,
-				"result":        result,
-				"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
-				"_seq_no":       nextVer,
-				"_primary_term": 1,
-				"status":        status,
-			},
+			op.Action: itemMap,
 		})
 	}
 
@@ -4257,8 +4305,43 @@ func (s *Server) executeSearchRequest(
 		}
 		if needsRuntimeScriptEval {
 			var matchedQueryHits []HitRow
+			var globalHits []HitRow
+			if req.Query != nil && globalAggsHaveRuntimeScript(req.EffectiveAggs()) {
+				zero := 0
+				fetchAll := 10000
+				gReq := esast.SearchRequest{
+					From:  &zero,
+					Size:  &fetchAll,
+					Query: aliasFilters[indexName],
+				}
+				if gPlan, gErr := tr.BuildSearchPlan(&gReq); gErr == nil && gPlan.HitsSQL != "" {
+					if gRows, qErr := s.backend.QueryHits(ctx, gPlan.HitsSQL); qErr == nil {
+						for i := range gRows {
+							gRows[i].Index = indexName
+						}
+						if queryHasRuntimeScript(aliasFilters[indexName]) {
+							for _, gh := range gRows {
+								var gDoc map[string]any
+								if len(gh.EffectiveSource()) > 0 {
+									dec := json.NewDecoder(bytes.NewReader(gh.EffectiveSource()))
+									dec.UseNumber()
+									_ = dec.Decode(&gDoc)
+								}
+								if gDoc == nil {
+									gDoc = make(map[string]any)
+								}
+								if evalQueryScriptFilterOnDocWithSchema(idxSchema, gDoc, aliasFilters[indexName]) {
+									globalHits = append(globalHits, gh)
+								}
+							}
+						} else {
+							globalHits = gRows
+						}
+					}
+				}
+			}
 			evalReq := applyIndexAliasFilter(req, aliasFilters[indexName])
-			hits, aggRows, idxTotal, matchedQueryHits = applyRuntimeSearchScriptsWithMatched(hits, aggRows, idxTotal, evalReq, idxSchema, len(targets) > 1)
+			hits, aggRows, idxTotal, matchedQueryHits = applyRuntimeSearchScriptsWithMatchedAndGlobal(hits, globalHits, aggRows, idxTotal, evalReq, idxSchema, len(targets) > 1)
 			allFetchedHits = append(allFetchedHits, matchedQueryHits...)
 			hasQueryLevelFilter := queryHasRuntimeScript(req.Query) || queryHasRuntimeScript(aliasFilters[indexName]) || req.MinScore != nil || (req.Query != nil && req.Query.FunctionScore != nil && req.Query.FunctionScore.MinScore != nil) || (req.Query != nil && req.Query.ScriptScore != nil && req.Query.ScriptScore.MinScore != nil)
 			if hasQueryLevelFilter && plan.AggsSQL != "" && len(req.EffectiveAggs()) > 0 {
@@ -4274,7 +4357,7 @@ func (s *Server) executeSearchRequest(
 				aggSubReq.Query = combineQueryWithAliasFilter(&esast.Query{Ids: &esast.IdsQuery{Values: matchedIDs}}, aliasFilters[indexName])
 				if aggPlan, aErr := tr.BuildSearchPlan(&aggSubReq); aErr == nil && aggPlan.AggsSQL != "" {
 					if reAggRows, rErr := s.backend.QueryAggs(ctx, aggPlan.AggsSQL); rErr == nil {
-						aggRows = applyRuntimeScriptAggsOnly(matchedQueryHits, reAggRows, idxTotal, evalReq, idxSchema)
+						aggRows = applyRuntimeScriptAggsOnlyWithGlobal(matchedQueryHits, globalHits, reAggRows, idxTotal, evalReq, idxSchema)
 					}
 				}
 			}
@@ -4357,9 +4440,13 @@ func (s *Server) executeSearchRequest(
 					}
 				}
 				if r.AggName != "__meta_total" {
+					if r.Weight < 0 {
+						continue
+					}
 					spec := resolveAggSpecByPath(effAggs, r.AggName)
-					if metricField := singleValueMetricField(spec); metricField != "" {
-						if r.effectiveValue() == 0 && !metricAggHasMissing(spec) && !indexSchemaHasField(idxSchema, metricField) {
+					metricField := singleValueMetricField(spec)
+					if metricField != "" || aggSpecHasDirectRuntimeScript(spec) {
+						if metricField != "" && r.effectiveValue() == 0 && !metricAggHasMissing(spec) && !indexSchemaHasField(idxSchema, metricField) {
 							continue
 						}
 						parent := parentBucketAggPath(effAggs, r.AggName)
@@ -4377,7 +4464,7 @@ func (s *Server) executeSearchRequest(
 									}
 								}
 							}
-							if w == 0 && (spec.Min != nil || spec.Max != nil || spec.Avg != nil || spec.Percentiles != nil || spec.PercentileRanks != nil || spec.Boxplot != nil) {
+							if w == 0 && r.Weight == 0 && (spec.Min != nil || spec.Max != nil || spec.Avg != nil || spec.Percentiles != nil || spec.PercentileRanks != nil || spec.Boxplot != nil) {
 								continue
 							}
 						} else if idxTotal > 0 {
@@ -6097,7 +6184,7 @@ func (s *Server) populateCollapseInnerHits(
 		for i := range rows {
 			rows[i].Index = indexName
 		}
-		if queryHasRuntimeScript(subReqPtr.Query) || queryHasRuntimeScript(subReqPtr.PostFilter) || (subReqPtr.Query != nil && subReqPtr.Query.FunctionScore != nil && subReqPtr.Query.FunctionScore.MinScore != nil) {
+		if queryHasRuntimeScript(subReqPtr.Query) || queryHasRuntimeScript(subReqPtr.PostFilter) || (subReqPtr.AliasFilter != nil && queryHasRuntimeScript((*esast.Query)(subReqPtr.AliasFilter))) || (subReqPtr.Query != nil && subReqPtr.Query.FunctionScore != nil && subReqPtr.Query.FunctionScore.MinScore != nil) {
 			rows, _, _ = applyRuntimeSearchScripts(rows, nil, int64(len(rows)), subReqPtr, idxSchema, true)
 		}
 		uncollapsed = append(uncollapsed, rows...)
@@ -9817,7 +9904,7 @@ func attachSubAggsToBucket(
 					matchingRows = append(matchingRows, cp)
 				}
 			}
-			for _, statKey := range []string{"_stats_count", "_stats_min", "_stats_max", "_stats_avg"} {
+			for _, statKey := range []string{"_stats_count", "_stats_min", "_stats_max", "_stats_avg", "_stats_entropy", "_sstats_count", "_sstats_min", "_sstats_max", "_sstats_avg", "_sstats_entropy"} {
 				for _, r := range bucketsByAgg[subFullKey+"."+statKey] {
 					if r.BucketKey == parentBucketKey {
 						cp := r
@@ -9827,17 +9914,19 @@ func attachSubAggsToBucket(
 				}
 			}
 			var cntVal int64
-			var minVal, maxVal, avgVal float64
+			var minVal, maxVal, avgVal, entropyVal float64
 			for _, r := range matchingRows {
 				switch r.BucketKey {
-				case "_stats_count":
+				case "_stats_count", "_sstats_count":
 					cntVal = r.effectiveCount()
-				case "_stats_min":
+				case "_stats_min", "_sstats_min":
 					minVal = r.effectiveValue()
-				case "_stats_max":
+				case "_stats_max", "_sstats_max":
 					maxVal = r.effectiveValue()
-				case "_stats_avg":
+				case "_stats_avg", "_sstats_avg":
 					avgVal = r.effectiveValue()
+				case "_stats_entropy", "_sstats_entropy":
+					entropyVal = r.effectiveValue()
 				}
 			}
 			bucketMap[subName] = map[string]any{
@@ -9845,7 +9934,7 @@ func attachSubAggsToBucket(
 				"min_length": int64(minVal),
 				"max_length": int64(maxVal),
 				"avg_length": avgVal,
-				"entropy":    0.0,
+				"entropy":    entropyVal,
 			}
 		case subSpec.Filter != nil || subSpec.Missing != nil || subSpec.EffectiveSampler() != nil || subSpec.ReverseNested != nil || subSpec.Nested != nil:
 			var cnt int64
@@ -11677,6 +11766,33 @@ func detectArrayPromotions(idx *schema.IndexSchema, sampleDocs []json.RawMessage
 	return delta
 }
 
+func hasJSONNonNilAtPath(node any, path []string) bool {
+	if node == nil {
+		return false
+	}
+	if len(path) == 0 {
+		return true
+	}
+	switch curr := node.(type) {
+	case map[string]any:
+		if next, ok := curr[path[0]]; ok && hasJSONNonNilAtPath(next, path[1:]) {
+			return true
+		}
+		if len(path) > 1 {
+			if flat, ok := curr[strings.Join(path, ".")]; ok && flat != nil {
+				return true
+			}
+		}
+	case []any:
+		for _, elem := range curr {
+			if hasJSONNonNilAtPath(elem, path) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func hasJSONArrayAtPath(node any, path []string) bool {
 	if node == nil {
 		return false
@@ -11697,7 +11813,7 @@ func hasJSONArrayAtPath(node any, path []string) bool {
 		}
 	case []any:
 		for _, elem := range curr {
-			if hasJSONArrayAtPath(elem, path) {
+			if hasJSONNonNilAtPath(elem, path) {
 				return true
 			}
 		}
@@ -12104,6 +12220,15 @@ func aggSpecHasDirectRuntimeScript(spec esast.AggSpec) bool {
 	if t := spec.EffectiveTerms(); t != nil && t.Script != nil {
 		return true
 	}
+	if spec.Histogram != nil && spec.Histogram.Script != nil {
+		return true
+	}
+	if spec.DateHistogram != nil && spec.DateHistogram.Script != nil {
+		return true
+	}
+	if r := spec.EffectiveRange(); r != nil && r.Script != nil {
+		return true
+	}
 	if spec.Filter != nil && queryHasRuntimeScript(spec.Filter) {
 		return true
 	}
@@ -12129,6 +12254,12 @@ func aggSpecHasDirectRuntimeScript(spec esast.AggSpec) bool {
 	if spec.PercentileRanks != nil && spec.PercentileRanks.Script != nil {
 		return true
 	}
+	if spec.StringStats != nil && spec.StringStats.Script != nil {
+		return true
+	}
+	if spec.Rate != nil && spec.Rate.Script != nil {
+		return true
+	}
 	return false
 }
 
@@ -12138,6 +12269,18 @@ func aggsHaveRuntimeScript(aggs map[string]esast.AggSpec) bool {
 			return true
 		}
 		if aggsHaveRuntimeScript(spec.SubAggs()) {
+			return true
+		}
+	}
+	return false
+}
+
+func globalAggsHaveRuntimeScript(aggs map[string]esast.AggSpec) bool {
+	for _, spec := range aggs {
+		if spec.Global != nil && aggsHaveRuntimeScript(spec.SubAggs()) {
+			return true
+		}
+		if globalAggsHaveRuntimeScript(spec.SubAggs()) {
 			return true
 		}
 	}
@@ -12409,21 +12552,24 @@ func evalFieldValueFactorOnDoc(doc map[string]any, fvf *esast.FieldValueFactorSp
 	case "log":
 		v = math.Log10(math.Max(0, v))
 	case "log1p":
-		v = math.Log10(1.0 + math.Max(0, v))
+		v = math.Log10(math.Max(0, 1.0+v))
 	case "log2p":
-		v = math.Log10(2.0 + math.Max(0, v))
+		v = math.Log10(math.Max(0, 2.0+v))
 	case "ln":
 		v = math.Log(math.Max(0, v))
 	case "ln1p":
-		v = math.Log(1.0 + math.Max(0, v))
+		v = math.Log(math.Max(0, 1.0+v))
 	case "ln2p":
-		v = math.Log(2.0 + math.Max(0, v))
+		v = math.Log(math.Max(0, 2.0+v))
 	case "square":
 		v = v * v
 	case "sqrt":
 		v = math.Sqrt(math.Max(0, v))
 	case "reciprocal":
-		v = 1.0 / (1.0 + math.Max(0, v))
+		if 1.0+v == 0 {
+			return 0, false
+		}
+		v = 1.0 / (1.0 + v)
 	}
 	if math.IsNaN(v) || math.IsInf(v, 0) {
 		return 0, false
@@ -12532,6 +12678,9 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 				}
 				cp["_score"] = baseScore
 				if fv, ok, err := painless.EvalNumber(doc, src, cp); err == nil && ok {
+					if q.FunctionScore.Weight != nil {
+						fv *= *q.FunctionScore.Weight
+					}
 					fnScores = append(fnScores, fv)
 				}
 			}
@@ -12543,7 +12692,7 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 				}
 				fnScores = append(fnScores, fv)
 			}
-		} else if len(q.FunctionScore.Functions) == 0 && q.FunctionScore.Weight != nil {
+		} else if q.FunctionScore.ScriptScore == nil && len(q.FunctionScore.Functions) == 0 && q.FunctionScore.Weight != nil {
 			fnScores = append(fnScores, *q.FunctionScore.Weight)
 		}
 		for _, fn := range q.FunctionScore.Functions {
@@ -12689,15 +12838,18 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 		var total float64
 		hasScored := false
 		for i := range q.Bool.Must {
-			if queryHasRuntimeScript(&q.Bool.Must[i]) {
-				total += evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, &q.Bool.Must[i], baseScore)
+			if queryHasRuntimeScript(&q.Bool.Must[i]) || q.Bool.Must[i].FunctionScore != nil {
+				total += evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, &q.Bool.Must[i], 1.0)
+				hasScored = true
+			} else {
+				total += 1.0
 				hasScored = true
 			}
 		}
 		for i := range q.Bool.Should {
 			if evalBranchMatchesDoc(idxSchema, doc, &q.Bool.Should[i]) {
-				if queryHasRuntimeScript(&q.Bool.Should[i]) {
-					total += evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, &q.Bool.Should[i], baseScore)
+				if queryHasRuntimeScript(&q.Bool.Should[i]) || q.Bool.Should[i].FunctionScore != nil {
+					total += evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, &q.Bool.Should[i], 1.0)
 				} else {
 					total += 1.0
 				}
@@ -12705,6 +12857,9 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 			}
 		}
 		if hasScored {
+			if q.Bool.Boost != nil {
+				total *= *q.Bool.Boost
+			}
 			return total
 		}
 	}
@@ -12712,11 +12867,13 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 }
 
 type runtimeMatchedDoc struct {
-	hit HitRow
-	doc map[string]any
+	hit        HitRow
+	doc        map[string]any
+	rootDoc    map[string]any
+	rootSchema *schema.IndexSchema
 }
 
-func computeRuntimeTermsScriptBucketDocs(docs []runtimeMatchedDoc, tSpec *esast.TermsAggSpec) (map[string][]runtimeMatchedDoc, []string) {
+func computeRuntimeTermsScriptBucketDocsWithSchema(idxSchema *schema.IndexSchema, docs []runtimeMatchedDoc, tSpec *esast.TermsAggSpec) (map[string][]runtimeMatchedDoc, []string) {
 	byBucket := make(map[string][]runtimeMatchedDoc)
 	var keys []string
 	seenKey := make(map[string]bool)
@@ -12734,6 +12891,12 @@ func computeRuntimeTermsScriptBucketDocs(docs []runtimeMatchedDoc, tSpec *esast.
 	missingStr := ""
 	if tSpec.Missing != nil {
 		missingStr = fmt.Sprintf("%v", tSpec.Missing)
+	}
+	var fieldBinding schema.FieldBinding
+	hasFieldBinding := false
+	if idxSchema != nil && tSpec.Field != "" {
+		fieldBinding = idxSchema.ResolveField(tSpec.Field)
+		hasFieldBinding = true
 	}
 	for _, md := range docs {
 		var vals []string
@@ -12761,6 +12924,19 @@ func computeRuntimeTermsScriptBucketDocs(docs []runtimeMatchedDoc, tSpec *esast.
 				if rv != nil {
 					s := fmt.Sprintf("%v", rv)
 					if s != "" {
+						if hasFieldBinding {
+							if fieldBinding.ESType == "boolean" {
+								switch strings.ToLower(strings.TrimSpace(s)) {
+								case "1", "true":
+									s = "true"
+								case "0", "false":
+									s = "false"
+								}
+							}
+							if fieldBinding.EffectiveLowercase(!strings.HasSuffix(tSpec.Field, ".keyword")) {
+								s = strings.ToLower(s)
+							}
+						}
 						vals = append(vals, s)
 					}
 				}
@@ -13045,7 +13221,6 @@ func emitRuntimeMetricAggRows(
 			)
 			if subSpec.ExtendedStats != nil {
 				*out = append(*out,
-					AggRow{AggName: fullAggName, BucketKey: "_stats_sum_sq", DocCount: int64(sSumSq), Value: sSumSq},
 					AggRow{AggName: fullAggName, BucketKey: "_stats_std", DocCount: int64(sStd), Value: sStd, Weight: sCnt},
 				)
 			}
@@ -13059,7 +13234,6 @@ func emitRuntimeMetricAggRows(
 			)
 			if subSpec.ExtendedStats != nil {
 				*out = append(*out,
-					AggRow{AggName: fullAggName + "._stats_sum_sq", BucketKey: parentBucketKey, DocCount: int64(sSumSq), Value: sSumSq},
 					AggRow{AggName: fullAggName + "._stats_std", BucketKey: parentBucketKey, DocCount: int64(sStd), Value: sStd, Weight: sCnt},
 				)
 			}
@@ -13075,6 +13249,10 @@ func emitRuntimeMetricAggRows(
 			vals = append(vals, extractDocNumericValuesForMetric(d, mSpec)...)
 		}
 		sort.Float64s(vals)
+		w := int64(len(vals))
+		if len(vals) == 0 {
+			w = -1
+		}
 		for _, pct := range subSpec.Percentiles.EffectivePercents() {
 			res := computeRuntimeInterpolatedPercentile(vals, pct)
 			pctKey := strconv.FormatFloat(pct, 'f', -1, 64)
@@ -13082,9 +13260,9 @@ func emitRuntimeMetricAggRows(
 				pctKey += ".0"
 			}
 			if parentBucketKey == "" {
-				*out = append(*out, AggRow{AggName: fullAggName, BucketKey: pctKey, DocCount: int64(res), Value: res})
+				*out = append(*out, AggRow{AggName: fullAggName, BucketKey: pctKey, DocCount: int64(res), Value: res, Weight: w})
 			} else {
-				*out = append(*out, AggRow{AggName: fullAggName + "." + pctKey, BucketKey: parentBucketKey, DocCount: int64(res), Value: res})
+				*out = append(*out, AggRow{AggName: fullAggName + "." + pctKey, BucketKey: parentBucketKey, DocCount: int64(res), Value: res, Weight: w})
 			}
 		}
 	case subSpec.Boxplot != nil:
@@ -13093,13 +13271,17 @@ func emitRuntimeMetricAggRows(
 			vals = append(vals, extractDocNumericValuesForMetric(d, subSpec.Boxplot)...)
 		}
 		sort.Float64s(vals)
+		w := int64(len(vals))
+		if len(vals) == 0 {
+			w = -1
+		}
 		for _, pct := range []float64{0.0, 25.0, 50.0, 75.0, 100.0} {
 			res := computeRuntimeInterpolatedPercentile(vals, pct)
 			pctKey := fmt.Sprintf("%.1f", pct)
 			if parentBucketKey == "" {
-				*out = append(*out, AggRow{AggName: fullAggName, BucketKey: pctKey, DocCount: int64(res), Value: res})
+				*out = append(*out, AggRow{AggName: fullAggName, BucketKey: pctKey, DocCount: int64(res), Value: res, Weight: w})
 			} else {
-				*out = append(*out, AggRow{AggName: fullAggName + "." + pctKey, BucketKey: parentBucketKey, DocCount: int64(res), Value: res})
+				*out = append(*out, AggRow{AggName: fullAggName + "." + pctKey, BucketKey: parentBucketKey, DocCount: int64(res), Value: res, Weight: w})
 			}
 		}
 	case subSpec.PercentileRanks != nil:
@@ -13111,6 +13293,10 @@ func emitRuntimeMetricAggRows(
 		var vals []float64
 		for _, d := range bDocs {
 			vals = append(vals, extractDocNumericValuesForMetric(d, mSpec)...)
+		}
+		w := int64(len(vals))
+		if len(vals) == 0 {
+			w = -1
 		}
 		for _, thresh := range subSpec.PercentileRanks.Values {
 			var leCount int64
@@ -13128,12 +13314,98 @@ func emitRuntimeMetricAggRows(
 				valKey += ".0"
 			}
 			if parentBucketKey == "" {
-				*out = append(*out, AggRow{AggName: fullAggName, BucketKey: valKey, DocCount: int64(res), Value: res})
+				*out = append(*out, AggRow{AggName: fullAggName, BucketKey: valKey, DocCount: int64(res), Value: res, Weight: w})
 			} else {
-				*out = append(*out, AggRow{AggName: fullAggName + "." + valKey, BucketKey: parentBucketKey, DocCount: int64(res), Value: res})
+				*out = append(*out, AggRow{AggName: fullAggName + "." + valKey, BucketKey: parentBucketKey, DocCount: int64(res), Value: res, Weight: w})
 			}
 		}
-	case subSpec.TopHits != nil:
+	case subSpec.StringStats != nil:
+		mSpec := &esast.MetricAggSpec{
+			Field:   subSpec.StringStats.Field,
+			Missing: subSpec.StringStats.Missing,
+			Script:  subSpec.StringStats.Script,
+		}
+		var strs []string
+		for _, d := range bDocs {
+			for _, rv := range extractDocRawValuesForMetric(d, mSpec) {
+				if rv != nil {
+					strs = append(strs, fmt.Sprintf("%v", rv))
+				}
+			}
+		}
+		sCnt := int64(len(strs))
+		var minLen, maxLen, avgLen, entropy float64
+		if sCnt > 0 {
+			firstLen := float64(len([]rune(strs[0])))
+			minLen, maxLen = firstLen, firstLen
+			var sumLen float64
+			charCounts := make(map[rune]int64)
+			var totalChars int64
+			for _, s := range strs {
+				runes := []rune(s)
+				l := float64(len(runes))
+				if l < minLen {
+					minLen = l
+				}
+				if l > maxLen {
+					maxLen = l
+				}
+				sumLen += l
+				for _, ch := range runes {
+					charCounts[ch]++
+					totalChars++
+				}
+			}
+			avgLen = sumLen / float64(sCnt)
+			if totalChars > 0 {
+				for _, c := range charCounts {
+					p := float64(c) / float64(totalChars)
+					if p > 0 {
+						entropy -= p * math.Log2(p)
+					}
+				}
+			}
+		}
+		if parentBucketKey == "" {
+			*out = append(*out,
+				AggRow{AggName: fullAggName, BucketKey: "_stats_count", DocCount: sCnt, Value: float64(sCnt)},
+				AggRow{AggName: fullAggName, BucketKey: "_stats_min", DocCount: int64(minLen), Value: minLen},
+				AggRow{AggName: fullAggName, BucketKey: "_stats_max", DocCount: int64(maxLen), Value: maxLen},
+				AggRow{AggName: fullAggName, BucketKey: "_stats_avg", DocCount: int64(avgLen), Value: avgLen, Weight: sCnt},
+				AggRow{AggName: fullAggName, BucketKey: "_stats_entropy", DocCount: int64(entropy), Value: entropy, Weight: sCnt},
+			)
+		} else {
+			*out = append(*out,
+				AggRow{AggName: fullAggName + "._stats_count", BucketKey: parentBucketKey, DocCount: sCnt, Value: float64(sCnt)},
+				AggRow{AggName: fullAggName + "._stats_min", BucketKey: parentBucketKey, DocCount: int64(minLen), Value: minLen},
+				AggRow{AggName: fullAggName + "._stats_max", BucketKey: parentBucketKey, DocCount: int64(maxLen), Value: maxLen},
+				AggRow{AggName: fullAggName + "._stats_avg", BucketKey: parentBucketKey, DocCount: int64(avgLen), Value: avgLen, Weight: sCnt},
+				AggRow{AggName: fullAggName + "._stats_entropy", BucketKey: parentBucketKey, DocCount: int64(entropy), Value: entropy, Weight: sCnt},
+			)
+		}
+	case subSpec.Rate != nil:
+		var res float64
+		if subSpec.Rate.Field != "" || subSpec.Rate.Script != nil {
+			mSpec := &esast.MetricAggSpec{
+				Field:  subSpec.Rate.Field,
+				Script: subSpec.Rate.Script,
+			}
+			for _, d := range bDocs {
+				for _, v := range extractDocNumericValuesForMetric(d, mSpec) {
+					res += v
+				}
+			}
+		} else {
+			res = float64(len(bDocs))
+		}
+		*out = append(*out, AggRow{
+			AggName:   fullAggName,
+			BucketKey: metricBucketKey,
+			DocCount:  int64(res),
+			Value:     res,
+			Weight:    int64(len(bDocs)),
+		})
+	case subSpec.TopHits != nil || subSpec.TopMetrics != nil:
 		for _, d := range bDocs {
 			bKey := d.hit.ID
 			if parentBucketKey != "" {
@@ -13149,6 +13421,349 @@ func emitRuntimeMetricAggRows(
 	}
 }
 
+func extractDocNumericValuesForBucket(md runtimeMatchedDoc, field string, missing any, script any) []float64 {
+	return extractDocNumericValuesForMetric(md, &esast.MetricAggSpec{
+		Field:   field,
+		Missing: missing,
+		Script:  script,
+	})
+}
+
+func extractDocDateMillisForBucket(idxSchema *schema.IndexSchema, md runtimeMatchedDoc, field string, missing any, script any, nowUTC time.Time) []int64 {
+	isDateNanos := false
+	if idxSchema != nil && field != "" {
+		if b := idxSchema.ResolveField(field); b.ESType == "date_nanos" {
+			isDateNanos = true
+		}
+	}
+	rawVals := extractDocRawValuesForMetric(md, &esast.MetricAggSpec{
+		Field:   field,
+		Missing: missing,
+		Script:  script,
+	})
+	var out []int64
+	for _, rv := range rawVals {
+		if s, ok := rv.(string); ok {
+			if ts, hasTS := schema.ParseESDateToEpochMillis(s, nowUTC); hasTS {
+				out = append(out, ts)
+			}
+		} else if f, ok := toFloat64(rv); ok {
+			ts := int64(f)
+			if (isDateNanos && script == nil) || math.Abs(f) >= 1e15 {
+				ts /= 1_000_000
+			}
+			out = append(out, ts)
+		}
+	}
+	return out
+}
+
+func emitRuntimeHistogramAggRows(
+	fullAggName string,
+	parentBucketKey string,
+	aggSpec esast.AggSpec,
+	docs []runtimeMatchedDoc,
+	out *[]AggRow,
+	idxSchema *schema.IndexSchema,
+) {
+	hSpec := aggSpec.Histogram
+	if hSpec == nil {
+		return
+	}
+	interval := hSpec.Interval
+	if interval <= 0 {
+		interval = 1.0
+	}
+	offset := hSpec.Offset
+	byBucket := make(map[string][]runtimeMatchedDoc)
+	bucketNum := make(map[string]float64)
+	for _, md := range docs {
+		vals := extractDocNumericValuesForBucket(md, hSpec.Field, hSpec.Missing, hSpec.Script)
+		seenDocB := make(map[string]bool, len(vals))
+		for _, f := range vals {
+			b := math.Floor((f-offset)/interval)*interval + offset
+			k := strconv.FormatFloat(b, 'f', -1, 64)
+			if !seenDocB[k] {
+				seenDocB[k] = true
+				bucketNum[k] = b
+				byBucket[k] = append(byBucket[k], md)
+			}
+		}
+	}
+	keys := make([]string, 0, len(byBucket))
+	for k := range byBucket {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return bucketNum[keys[i]] < bucketNum[keys[j]]
+	})
+	subAggs := aggSpec.SubAggs()
+	for _, k := range keys {
+		bDocs := byBucket[k]
+		if hSpec.MinDocCount != nil && len(bDocs) < *hSpec.MinDocCount {
+			continue
+		}
+		rowKey := k
+		if parentBucketKey != "" {
+			rowKey = parentBucketKey + "\x1f" + k
+		}
+		cnt := int64(len(bDocs))
+		*out = append(*out, AggRow{
+			AggName:   fullAggName,
+			BucketKey: rowKey,
+			DocCount:  cnt,
+			Value:     float64(cnt),
+		})
+		if len(subAggs) > 0 {
+			emitRuntimeAllSubAggRows(fullAggName, rowKey, subAggs, bDocs, out, idxSchema)
+		}
+	}
+}
+
+func emitRuntimeDateHistogramAggRows(
+	fullAggName string,
+	parentBucketKey string,
+	aggSpec esast.AggSpec,
+	docs []runtimeMatchedDoc,
+	out *[]AggRow,
+	idxSchema *schema.IndexSchema,
+) {
+	dh := aggSpec.DateHistogram
+	if dh == nil {
+		return
+	}
+	intervalMs := dh.EffectiveIntervalMs()
+	if intervalMs <= 0 {
+		intervalMs = 86400000
+	}
+	tzShiftMs := dh.EffectiveTimeZoneOffsetMs() - dh.EffectiveOffsetMs()
+	nowUTC := time.Now().UTC()
+	byBucket := make(map[string][]runtimeMatchedDoc)
+	bucketTS := make(map[string]int64)
+	for _, md := range docs {
+		tsList := extractDocDateMillisForBucket(idxSchema, md, dh.Field, dh.Missing, dh.Script, nowUTC)
+		seenDocB := make(map[string]bool, len(tsList))
+		for _, ts := range tsList {
+			b := int64(math.Floor(float64(ts+tzShiftMs)/float64(intervalMs)))*intervalMs - tzShiftMs
+			k := strconv.FormatInt(b, 10)
+			if !seenDocB[k] {
+				seenDocB[k] = true
+				bucketTS[k] = b
+				byBucket[k] = append(byBucket[k], md)
+			}
+		}
+	}
+	keys := make([]string, 0, len(byBucket))
+	for k := range byBucket {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return bucketTS[keys[i]] < bucketTS[keys[j]]
+	})
+	subAggs := aggSpec.SubAggs()
+	for _, k := range keys {
+		bDocs := byBucket[k]
+		if dh.MinDocCount != nil && len(bDocs) < *dh.MinDocCount {
+			continue
+		}
+		rowKey := k
+		if parentBucketKey != "" {
+			rowKey = parentBucketKey + "\x1f" + k
+		}
+		cnt := int64(len(bDocs))
+		*out = append(*out, AggRow{
+			AggName:   fullAggName,
+			BucketKey: rowKey,
+			DocCount:  cnt,
+			Value:     float64(cnt),
+		})
+		if len(subAggs) > 0 {
+			emitRuntimeAllSubAggRows(fullAggName, rowKey, subAggs, bDocs, out, idxSchema)
+		}
+	}
+}
+
+func filterDocsMatchingRangeEntry(
+	idxSchema *schema.IndexSchema,
+	docs []runtimeMatchedDoc,
+	aggSpec esast.AggSpec,
+	rngSpec *esast.RangeAggSpec,
+	rng esast.RangeAggBucket,
+	nowUTC time.Time,
+) []runtimeMatchedDoc {
+	var out []runtimeMatchedDoc
+	if aggSpec.IPRange != nil {
+		clean := strings.TrimSuffix(strings.TrimSuffix(rngSpec.Field, ".keyword"), ".ngram")
+		var fromIP, toIP uint32
+		hasFrom, hasTo := false, false
+		isCIDR := false
+		if rng.Mask != "" {
+			if _, ipNet, err := net.ParseCIDR(strings.TrimSpace(rng.Mask)); err == nil && ipNet != nil {
+				startIP := ipNet.IP.To4()
+				mask := ipNet.Mask
+				if len(startIP) == 4 && len(mask) == 4 {
+					fromIP = uint32(startIP[0])<<24 | uint32(startIP[1])<<16 | uint32(startIP[2])<<8 | uint32(startIP[3])
+					endIP := net.IPv4(
+						startIP[0]|^mask[0],
+						startIP[1]|^mask[1],
+						startIP[2]|^mask[2],
+						startIP[3]|^mask[3],
+					).To4()
+					toIP = uint32(endIP[0])<<24 | uint32(endIP[1])<<16 | uint32(endIP[2])<<8 | uint32(endIP[3])
+					hasFrom, hasTo, isCIDR = true, true, true
+				}
+			}
+		} else {
+			if s, ok := rng.From.(string); ok && s != "" {
+				fromIP, hasFrom = parseIPv4SortUint32(s)
+			}
+			if s, ok := rng.To.(string); ok && s != "" {
+				toIP, hasTo = parseIPv4SortUint32(s)
+			}
+		}
+		for _, md := range docs {
+			for _, rv := range collectScalarValuesAtPath(md.doc, strings.Split(clean, ".")) {
+				if ipUint, ok := parseIPv4SortUint32(fmt.Sprintf("%v", rv)); ok {
+					matchTo := !hasTo || ipUint < toIP
+					if isCIDR && hasTo {
+						matchTo = ipUint <= toIP
+					}
+					if (!hasFrom || ipUint >= fromIP) && matchTo {
+						out = append(out, md)
+						break
+					}
+				}
+			}
+		}
+		return out
+	}
+	if aggSpec.DateRange != nil {
+		var fromMs, toMs int64
+		hasFrom, hasTo := false, false
+		if rng.From != nil {
+			if s, ok := rng.From.(string); ok {
+				fromMs, hasFrom = schema.ParseESDateBoundToEpochMillis(s, nowUTC, false)
+			} else if f, ok := toFloat64(rng.From); ok {
+				fromMs, hasFrom = int64(f), true
+			}
+		}
+		if rng.To != nil {
+			if s, ok := rng.To.(string); ok {
+				toMs, hasTo = schema.ParseESDateBoundToEpochMillis(s, nowUTC, false)
+			} else if f, ok := toFloat64(rng.To); ok {
+				toMs, hasTo = int64(f), true
+			}
+		}
+		for _, md := range docs {
+			for _, ts := range extractDocDateMillisForBucket(idxSchema, md, rngSpec.Field, rngSpec.Missing, rngSpec.Script, nowUTC) {
+				if (!hasFrom || ts >= fromMs) && (!hasTo || ts < toMs) {
+					out = append(out, md)
+					break
+				}
+			}
+		}
+		return out
+	}
+	fromVal, hasFrom := toFloat64(rng.From)
+	toVal, hasTo := toFloat64(rng.To)
+	for _, md := range docs {
+		for _, f := range extractDocNumericValuesForBucket(md, rngSpec.Field, rngSpec.Missing, rngSpec.Script) {
+			if (!hasFrom || f >= fromVal) && (!hasTo || f < toVal) {
+				out = append(out, md)
+				break
+			}
+		}
+	}
+	return out
+}
+
+func emitRuntimeRangeAggRows(
+	fullAggName string,
+	parentBucketKey string,
+	aggSpec esast.AggSpec,
+	docs []runtimeMatchedDoc,
+	out *[]AggRow,
+	idxSchema *schema.IndexSchema,
+) {
+	rngSpec := aggSpec.EffectiveRange()
+	if rngSpec == nil {
+		return
+	}
+	nowUTC := time.Now().UTC()
+	subAggs := aggSpec.SubAggs()
+	for _, rng := range rngSpec.Ranges {
+		rk := rng.EffectiveKey()
+		bDocs := filterDocsMatchingRangeEntry(idxSchema, docs, aggSpec, rngSpec, rng, nowUTC)
+		rowKey := rk
+		if parentBucketKey != "" {
+			rowKey = parentBucketKey + "\x1f" + rk
+		}
+		cnt := int64(len(bDocs))
+		*out = append(*out, AggRow{
+			AggName:   fullAggName,
+			BucketKey: rowKey,
+			DocCount:  cnt,
+			Value:     float64(cnt),
+		})
+		if len(subAggs) > 0 {
+			emitRuntimeAllSubAggRows(fullAggName, rowKey, subAggs, bDocs, out, idxSchema)
+		}
+	}
+}
+
+func isDirectUnprefixedNestedSubAgg(ss esast.AggSpec) bool {
+	return ss.EffectiveTerms() != nil || ss.Cardinality != nil || ss.ValueCount != nil ||
+		ss.Avg != nil || ss.Sum != nil || ss.Min != nil || ss.Max != nil ||
+		ss.EffectiveStats() != nil || ss.StringStats != nil || ss.Percentiles != nil ||
+		ss.PercentileRanks != nil || ss.Boxplot != nil || ss.ReverseNested != nil
+}
+
+func splitNestedSubAggsByBucketKeyMode(subAggs map[string]esast.AggSpec) (map[string]esast.AggSpec, map[string]esast.AggSpec) {
+	var direct, grouped map[string]esast.AggSpec
+	for k, v := range subAggs {
+		if isDirectUnprefixedNestedSubAgg(v) {
+			if direct == nil {
+				direct = make(map[string]esast.AggSpec)
+			}
+			direct[k] = v
+		} else {
+			if grouped == nil {
+				grouped = make(map[string]esast.AggSpec)
+			}
+			grouped[k] = v
+		}
+	}
+	return direct, grouped
+}
+
+func restoreRootDocsForReverseNested(docs []runtimeMatchedDoc, fallbackSchema *schema.IndexSchema) ([]runtimeMatchedDoc, *schema.IndexSchema) {
+	seenID := make(map[string]bool, len(docs))
+	out := make([]runtimeMatchedDoc, 0, len(docs))
+	outSchema := fallbackSchema
+	for _, md := range docs {
+		if md.hit.ID != "" {
+			if seenID[md.hit.ID] {
+				continue
+			}
+			seenID[md.hit.ID] = true
+		}
+		rDoc := md.rootDoc
+		if rDoc == nil {
+			rDoc = md.doc
+		}
+		if md.rootSchema != nil {
+			outSchema = md.rootSchema
+		}
+		out = append(out, runtimeMatchedDoc{
+			hit:        md.hit,
+			doc:        rDoc,
+			rootDoc:    rDoc,
+			rootSchema: outSchema,
+		})
+	}
+	return out, outSchema
+}
+
 func emitRuntimeAllSubAggRows(
 	parentFullKey string,
 	parentBucketKey string,
@@ -13162,6 +13777,12 @@ func emitRuntimeAllSubAggRows(
 		switch {
 		case subSpec.EffectiveTerms() != nil:
 			emitRuntimeTermsScriptAggRowsWithSchema(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
+		case subSpec.Histogram != nil:
+			emitRuntimeHistogramAggRows(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
+		case subSpec.DateHistogram != nil:
+			emitRuntimeDateHistogramAggRows(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
+		case subSpec.EffectiveRange() != nil:
+			emitRuntimeRangeAggRows(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
 		case subSpec.Filter != nil:
 			var fDocs []runtimeMatchedDoc
 			for _, md := range bDocs {
@@ -13184,6 +13805,102 @@ func emitRuntimeAllSubAggRows(
 			}
 		case subSpec.Filters != nil:
 			emitRuntimeFiltersAggRows(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
+		case subSpec.Missing != nil:
+			clean := strings.TrimSuffix(strings.TrimSuffix(subSpec.Missing.Field, ".keyword"), ".ngram")
+			var mDocs []runtimeMatchedDoc
+			for _, md := range bDocs {
+				if len(collectScalarValuesAtPath(md.doc, strings.Split(clean, "."))) == 0 {
+					mDocs = append(mDocs, md)
+				}
+			}
+			mBucketKey := "_missing"
+			if parentBucketKey != "" {
+				mBucketKey = parentBucketKey
+			}
+			*out = append(*out, AggRow{
+				AggName:   subFullKey,
+				BucketKey: mBucketKey,
+				DocCount:  int64(len(mDocs)),
+				Value:     float64(len(mDocs)),
+			})
+			if len(subSpec.SubAggs()) > 0 {
+				emitRuntimeAllSubAggRows(subFullKey, parentBucketKey, subSpec.SubAggs(), mDocs, out, idxSchema)
+			}
+		case subSpec.Nested != nil:
+			pathSegs := strings.Split(subSpec.Nested.Path, ".")
+			var nDocs []runtimeMatchedDoc
+			for _, md := range bDocs {
+				rDoc := md.rootDoc
+				if rDoc == nil {
+					rDoc = md.doc
+				}
+				rSchema := md.rootSchema
+				if rSchema == nil {
+					rSchema = idxSchema
+				}
+				for _, cand := range extractNestedElementsAtPath(md.doc, pathSegs) {
+					elemDoc := buildSingleNestedElementDoc(pathSegs, cand.obj)
+					nDocs = append(nDocs, runtimeMatchedDoc{
+						hit:        md.hit,
+						doc:        elemDoc,
+						rootDoc:    rDoc,
+						rootSchema: rSchema,
+					})
+				}
+			}
+			nBucketKey := "_nested_doc_count"
+			if parentBucketKey != "" {
+				nBucketKey = parentBucketKey
+			}
+			*out = append(*out, AggRow{
+				AggName:   subFullKey,
+				BucketKey: nBucketKey,
+				DocCount:  int64(len(nDocs)),
+				Value:     float64(len(nDocs)),
+			})
+			if len(subSpec.SubAggs()) > 0 {
+				nSchema := deriveNestedEvalSchema(idxSchema, subSpec.Nested.Path)
+				if parentBucketKey == "" {
+					directSub, groupedSub := splitNestedSubAggsByBucketKeyMode(subSpec.SubAggs())
+					if len(directSub) > 0 {
+						emitRuntimeAllSubAggRows(subFullKey, "", directSub, nDocs, out, nSchema)
+					}
+					if len(groupedSub) > 0 {
+						emitRuntimeAllSubAggRows(subFullKey, "_nested_doc_count", groupedSub, nDocs, out, nSchema)
+					}
+				} else {
+					emitRuntimeAllSubAggRows(subFullKey, parentBucketKey, subSpec.SubAggs(), nDocs, out, nSchema)
+				}
+			}
+		case subSpec.ReverseNested != nil:
+			rnDocs, rnSchema := restoreRootDocsForReverseNested(bDocs, idxSchema)
+			rnBucketKey := "_reverse_nested_doc_count"
+			if parentBucketKey != "" {
+				rnBucketKey = parentBucketKey
+			}
+			*out = append(*out, AggRow{
+				AggName:   subFullKey,
+				BucketKey: rnBucketKey,
+				DocCount:  int64(len(rnDocs)),
+				Value:     float64(len(rnDocs)),
+			})
+			if len(subSpec.SubAggs()) > 0 {
+				emitRuntimeAllSubAggRows(subFullKey, parentBucketKey, subSpec.SubAggs(), rnDocs, out, rnSchema)
+			}
+		case subSpec.EffectiveSampler() != nil:
+			sBucketKey := "_sampler_doc_count"
+			if parentBucketKey != "" {
+				sBucketKey = parentBucketKey
+			}
+			*out = append(*out, AggRow{
+				AggName:   subFullKey,
+				BucketKey: sBucketKey,
+				DocCount:  int64(len(bDocs)),
+				Value:     float64(len(bDocs)),
+			})
+			if len(subSpec.SubAggs()) > 0 {
+				emitRuntimeAllSubAggRows(subFullKey, parentBucketKey, subSpec.SubAggs(), bDocs, out, idxSchema)
+			}
 		default:
 			emitRuntimeMetricAggRows(subFullKey, parentBucketKey, subSpec, bDocs, out)
 		}
@@ -13266,7 +13983,7 @@ func emitRuntimeTermsScriptAggRowsWithSchema(
 	if tSpec == nil {
 		return
 	}
-	byBucket, keys := computeRuntimeTermsScriptBucketDocs(docs, tSpec)
+	byBucket, keys := computeRuntimeTermsScriptBucketDocsWithSchema(idxSchema, docs, tSpec)
 	subAggs := aggSpec.SubAggs()
 	for _, k := range keys {
 		bDocs := byBucket[k]
@@ -13308,7 +14025,7 @@ func partitionDocsByParentBucket(idxSchema *schema.IndexSchema, docs []runtimeMa
 	}
 	switch {
 	case spec.EffectiveTerms() != nil:
-		byB, _ := computeRuntimeTermsScriptBucketDocs(docs, spec.EffectiveTerms())
+		byB, _ := computeRuntimeTermsScriptBucketDocsWithSchema(idxSchema, docs, spec.EffectiveTerms())
 		return byB[leafKey]
 	case spec.Histogram != nil:
 		hSpec := spec.Histogram
@@ -13317,20 +14034,14 @@ func partitionDocsByParentBucket(idxSchema *schema.IndexSchema, docs []runtimeMa
 			interval = 1.0
 		}
 		offset := hSpec.Offset
-		clean := strings.TrimSuffix(strings.TrimSuffix(hSpec.Field, ".keyword"), ".ngram")
 		var out []runtimeMatchedDoc
 		for _, md := range docs {
-			vals := collectScalarValuesAtPath(md.doc, strings.Split(clean, "."))
-			if len(vals) == 0 && hSpec.Missing != nil {
-				vals = []any{hSpec.Missing}
-			}
-			for _, rv := range vals {
-				if f, ok := toFloat64(rv); ok {
-					b := math.Floor((f-offset)/interval)*interval + offset
-					if strconv.FormatFloat(b, 'f', -1, 64) == leafKey {
-						out = append(out, md)
-						break
-					}
+			vals := extractDocNumericValuesForBucket(md, hSpec.Field, hSpec.Missing, hSpec.Script)
+			for _, f := range vals {
+				b := math.Floor((f-offset)/interval)*interval + offset
+				if strconv.FormatFloat(b, 'f', -1, 64) == leafKey {
+					out = append(out, md)
+					break
 				}
 			}
 		}
@@ -13342,54 +14053,52 @@ func partitionDocsByParentBucket(idxSchema *schema.IndexSchema, docs []runtimeMa
 			intervalMs = 86400000
 		}
 		tzShiftMs := dh.EffectiveTimeZoneOffsetMs() - dh.EffectiveOffsetMs()
-		clean := strings.TrimSuffix(strings.TrimSuffix(dh.Field, ".keyword"), ".ngram")
 		nowUTC := time.Now().UTC()
 		var out []runtimeMatchedDoc
 		for _, md := range docs {
-			vals := collectScalarValuesAtPath(md.doc, strings.Split(clean, "."))
-			if len(vals) == 0 && dh.Missing != nil {
-				vals = []any{dh.Missing}
-			}
-			for _, rv := range vals {
-				var ts int64
-				hasTS := false
-				if s, ok := rv.(string); ok {
-					ts, hasTS = schema.ParseESDateToEpochMillis(s, nowUTC)
-				} else if f, ok := toFloat64(rv); ok {
-					ts, hasTS = int64(f), true
-				}
-				if hasTS {
-					b := int64(math.Floor(float64(ts+tzShiftMs)/float64(intervalMs)))*intervalMs - tzShiftMs
-					if strconv.FormatInt(b, 10) == leafKey {
-						out = append(out, md)
-						break
-					}
+			tsList := extractDocDateMillisForBucket(idxSchema, md, dh.Field, dh.Missing, dh.Script, nowUTC)
+			for _, ts := range tsList {
+				b := int64(math.Floor(float64(ts+tzShiftMs)/float64(intervalMs)))*intervalMs - tzShiftMs
+				if strconv.FormatInt(b, 10) == leafKey {
+					out = append(out, md)
+					break
 				}
 			}
 		}
 		return out
 	case spec.EffectiveRange() != nil:
 		rngSpec := spec.EffectiveRange()
-		clean := strings.TrimSuffix(strings.TrimSuffix(rngSpec.Field, ".keyword"), ".ngram")
+		nowUTC := time.Now().UTC()
 		for _, rng := range rngSpec.Ranges {
 			if rng.EffectiveKey() != leafKey {
 				continue
 			}
-			fromVal, hasFrom := toFloat64(rng.From)
-			toVal, hasTo := toFloat64(rng.To)
-			var out []runtimeMatchedDoc
-			for _, md := range docs {
-				for _, rv := range collectScalarValuesAtPath(md.doc, strings.Split(clean, ".")) {
-					if f, ok := toFloat64(rv); ok {
-						if (!hasFrom || f >= fromVal) && (!hasTo || f < toVal) {
-							out = append(out, md)
-							break
-						}
-					}
-				}
-			}
-			return out
+			return filterDocsMatchingRangeEntry(idxSchema, docs, spec, rngSpec, rng, nowUTC)
 		}
+	case spec.Composite != nil:
+		allParts := strings.Split(pbKey, "\x1f")
+		nSrc := len(spec.Composite.Sources)
+		if len(allParts) < nSrc {
+			return docs
+		}
+		compParts := allParts[len(allParts)-nSrc:]
+		cur := docs
+		for i, srcMap := range spec.Composite.Sources {
+			partKey := compParts[i]
+			for _, srcSpec := range srcMap {
+				var subSpec esast.AggSpec
+				if srcSpec.Terms != nil {
+					subSpec.Terms = srcSpec.Terms
+				} else if srcSpec.Histogram != nil {
+					subSpec.Histogram = srcSpec.Histogram
+				} else if srcSpec.DateHistogram != nil {
+					subSpec.DateHistogram = srcSpec.DateHistogram
+				}
+				cur = partitionDocsByParentBucket(idxSchema, cur, subSpec, partKey)
+				break
+			}
+		}
+		return cur
 	}
 	return docs
 }
@@ -13399,6 +14108,7 @@ func applyRuntimeScriptAggsForMap(
 	parentBucketKey string,
 	aggs map[string]esast.AggSpec,
 	docs []runtimeMatchedDoc,
+	globalDocs []runtimeMatchedDoc,
 	aggRows []AggRow,
 	idxSchema *schema.IndexSchema,
 ) []AggRow {
@@ -13411,6 +14121,15 @@ func applyRuntimeScriptAggsForMap(
 		case spec.EffectiveTerms() != nil && spec.EffectiveTerms().Script != nil:
 			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
 			emitRuntimeTermsScriptAggRowsWithSchema(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
+		case spec.Histogram != nil && spec.Histogram.Script != nil:
+			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
+			emitRuntimeHistogramAggRows(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
+		case spec.DateHistogram != nil && spec.DateHistogram.Script != nil:
+			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
+			emitRuntimeDateHistogramAggRows(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
+		case spec.EffectiveRange() != nil && spec.EffectiveRange().Script != nil:
+			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
+			emitRuntimeRangeAggRows(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
 		case spec.Filter != nil && (queryHasRuntimeScript(spec.Filter) || aggsHaveRuntimeScript(spec.SubAggs())):
 			var fDocs []runtimeMatchedDoc
 			for _, md := range docs {
@@ -13434,7 +14153,7 @@ func applyRuntimeScriptAggsForMap(
 					emitRuntimeAllSubAggRows(fullKey, parentBucketKey, spec.SubAggs(), fDocs, &aggRows, idxSchema)
 				}
 			} else {
-				aggRows = applyRuntimeScriptAggsForMap(fullKey, parentBucketKey, spec.SubAggs(), fDocs, aggRows, idxSchema)
+				aggRows = applyRuntimeScriptAggsForMap(fullKey, parentBucketKey, spec.SubAggs(), fDocs, globalDocs, aggRows, idxSchema)
 			}
 		case spec.Filters != nil && (aggSpecHasDirectRuntimeScript(spec) || aggsHaveRuntimeScript(spec.SubAggs())):
 			if aggSpecHasDirectRuntimeScript(spec) {
@@ -13455,7 +14174,7 @@ func applyRuntimeScriptAggsForMap(
 					if parentBucketKey != "" {
 						rowKey = parentBucketKey + "\x1f" + fk
 					}
-					aggRows = applyRuntimeScriptAggsForMap(fullKey, rowKey, spec.SubAggs(), fDocs, aggRows, idxSchema)
+					aggRows = applyRuntimeScriptAggsForMap(fullKey, rowKey, spec.SubAggs(), fDocs, globalDocs, aggRows, idxSchema)
 				}
 				if spec.Filters.OtherBucket {
 					otherKey := spec.Filters.EffectiveOtherBucketKey()
@@ -13469,7 +14188,7 @@ func applyRuntimeScriptAggsForMap(
 					if parentBucketKey != "" {
 						rowKey = parentBucketKey + "\x1f" + otherKey
 					}
-					aggRows = applyRuntimeScriptAggsForMap(fullKey, rowKey, spec.SubAggs(), otherDocs, aggRows, idxSchema)
+					aggRows = applyRuntimeScriptAggsForMap(fullKey, rowKey, spec.SubAggs(), otherDocs, globalDocs, aggRows, idxSchema)
 				}
 			}
 		case aggSpecHasDirectRuntimeScript(spec):
@@ -13477,8 +14196,17 @@ func applyRuntimeScriptAggsForMap(
 			emitRuntimeMetricAggRows(fullKey, parentBucketKey, spec, docs, &aggRows)
 		case aggsHaveRuntimeScript(spec.SubAggs()):
 			switch {
-			case spec.Global != nil || spec.ReverseNested != nil || spec.EffectiveSampler() != nil:
-				aggRows = applyRuntimeScriptAggsForMap(fullKey, parentBucketKey, spec.SubAggs(), docs, aggRows, idxSchema)
+			case spec.Global != nil:
+				gDocs := globalDocs
+				if len(gDocs) == 0 {
+					gDocs = docs
+				}
+				aggRows = applyRuntimeScriptAggsForMap(fullKey, parentBucketKey, spec.SubAggs(), gDocs, globalDocs, aggRows, idxSchema)
+			case spec.ReverseNested != nil:
+				rnDocs, rnSchema := restoreRootDocsForReverseNested(docs, idxSchema)
+				aggRows = applyRuntimeScriptAggsForMap(fullKey, parentBucketKey, spec.SubAggs(), rnDocs, globalDocs, aggRows, rnSchema)
+			case spec.EffectiveSampler() != nil:
+				aggRows = applyRuntimeScriptAggsForMap(fullKey, parentBucketKey, spec.SubAggs(), docs, globalDocs, aggRows, idxSchema)
 			case spec.Missing != nil:
 				clean := strings.TrimSuffix(strings.TrimSuffix(spec.Missing.Field, ".keyword"), ".ngram")
 				var mDocs []runtimeMatchedDoc
@@ -13487,18 +14215,41 @@ func applyRuntimeScriptAggsForMap(
 						mDocs = append(mDocs, md)
 					}
 				}
-				aggRows = applyRuntimeScriptAggsForMap(fullKey, parentBucketKey, spec.SubAggs(), mDocs, aggRows, idxSchema)
+				aggRows = applyRuntimeScriptAggsForMap(fullKey, parentBucketKey, spec.SubAggs(), mDocs, globalDocs, aggRows, idxSchema)
 			case spec.Nested != nil:
 				pathSegs := strings.Split(spec.Nested.Path, ".")
 				var nDocs []runtimeMatchedDoc
 				for _, md := range docs {
+					rDoc := md.rootDoc
+					if rDoc == nil {
+						rDoc = md.doc
+					}
+					rSchema := md.rootSchema
+					if rSchema == nil {
+						rSchema = idxSchema
+					}
 					for _, cand := range extractNestedElementsAtPath(md.doc, pathSegs) {
 						elemDoc := buildSingleNestedElementDoc(pathSegs, cand.obj)
-						nDocs = append(nDocs, runtimeMatchedDoc{hit: md.hit, doc: elemDoc})
+						nDocs = append(nDocs, runtimeMatchedDoc{
+							hit:        md.hit,
+							doc:        elemDoc,
+							rootDoc:    rDoc,
+							rootSchema: rSchema,
+						})
 					}
 				}
 				nSchema := deriveNestedEvalSchema(idxSchema, spec.Nested.Path)
-				aggRows = applyRuntimeScriptAggsForMap(fullKey, parentBucketKey, spec.SubAggs(), nDocs, aggRows, nSchema)
+				if parentBucketKey == "" {
+					directSub, groupedSub := splitNestedSubAggsByBucketKeyMode(spec.SubAggs())
+					if len(directSub) > 0 {
+						aggRows = applyRuntimeScriptAggsForMap(fullKey, "", directSub, nDocs, globalDocs, aggRows, nSchema)
+					}
+					if len(groupedSub) > 0 {
+						aggRows = applyRuntimeScriptAggsForMap(fullKey, "_nested_doc_count", groupedSub, nDocs, globalDocs, aggRows, nSchema)
+					}
+				} else {
+					aggRows = applyRuntimeScriptAggsForMap(fullKey, parentBucketKey, spec.SubAggs(), nDocs, globalDocs, aggRows, nSchema)
+				}
 			default:
 				var parentBuckets []string
 				seenPB := make(map[string]bool)
@@ -13512,7 +14263,7 @@ func applyRuntimeScriptAggsForMap(
 				}
 				for _, pbKey := range parentBuckets {
 					pbDocs := partitionDocsByParentBucket(idxSchema, docs, spec, pbKey)
-					aggRows = applyRuntimeScriptAggsForMap(fullKey, pbKey, spec.SubAggs(), pbDocs, aggRows, idxSchema)
+					aggRows = applyRuntimeScriptAggsForMap(fullKey, pbKey, spec.SubAggs(), pbDocs, globalDocs, aggRows, idxSchema)
 				}
 			}
 		}
@@ -13520,19 +14271,9 @@ func applyRuntimeScriptAggsForMap(
 	return aggRows
 }
 
-func applyRuntimeScriptAggsOnly(matchedQueryHits []HitRow, aggRows []AggRow, idxTotal int64, req *esast.SearchRequest, idxSchema *schema.IndexSchema) []AggRow {
-	for i := range aggRows {
-		if aggRows[i].AggName == "__meta_total" {
-			aggRows[i].DocCount = idxTotal
-			aggRows[i].Value = float64(idxTotal)
-		}
-	}
-	effAggs := req.EffectiveAggs()
-	if !aggsHaveRuntimeScript(effAggs) {
-		return aggRows
-	}
-	matchedDocs := make([]runtimeMatchedDoc, 0, len(matchedQueryHits))
-	for _, h := range matchedQueryHits {
+func hitsToRuntimeMatchedDocs(hits []HitRow, idxSchema *schema.IndexSchema) []runtimeMatchedDoc {
+	out := make([]runtimeMatchedDoc, 0, len(hits))
+	for _, h := range hits {
 		var doc map[string]any
 		src := h.EffectiveSource()
 		if len(src) > 0 {
@@ -13543,9 +14284,33 @@ func applyRuntimeScriptAggsOnly(matchedQueryHits []HitRow, aggRows []AggRow, idx
 		if doc == nil {
 			doc = make(map[string]any)
 		}
-		matchedDocs = append(matchedDocs, runtimeMatchedDoc{hit: h, doc: doc})
+		out = append(out, runtimeMatchedDoc{
+			hit:        h,
+			doc:        doc,
+			rootDoc:    doc,
+			rootSchema: idxSchema,
+		})
 	}
-	return applyRuntimeScriptAggsForMap("", "", effAggs, matchedDocs, aggRows, idxSchema)
+	return out
+}
+
+func applyRuntimeScriptAggsOnlyWithGlobal(matchedQueryHits []HitRow, globalHits []HitRow, aggRows []AggRow, idxTotal int64, req *esast.SearchRequest, idxSchema *schema.IndexSchema) []AggRow {
+	for i := range aggRows {
+		if aggRows[i].AggName == "__meta_total" {
+			aggRows[i].DocCount = idxTotal
+			aggRows[i].Value = float64(idxTotal)
+		}
+	}
+	effAggs := req.EffectiveAggs()
+	if !aggsHaveRuntimeScript(effAggs) {
+		return aggRows
+	}
+	matchedDocs := hitsToRuntimeMatchedDocs(matchedQueryHits, idxSchema)
+	var globalDocs []runtimeMatchedDoc
+	if len(globalHits) > 0 {
+		globalDocs = hitsToRuntimeMatchedDocs(globalHits, idxSchema)
+	}
+	return applyRuntimeScriptAggsForMap("", "", effAggs, matchedDocs, globalDocs, aggRows, idxSchema)
 }
 
 func applyRuntimeSearchScripts(hits []HitRow, aggRows []AggRow, idxTotal int64, req *esast.SearchRequest, idxSchema *schema.IndexSchema, isMultiIndex bool) ([]HitRow, []AggRow, int64) {
@@ -13554,6 +14319,10 @@ func applyRuntimeSearchScripts(hits []HitRow, aggRows []AggRow, idxTotal int64, 
 }
 
 func applyRuntimeSearchScriptsWithMatched(hits []HitRow, aggRows []AggRow, idxTotal int64, req *esast.SearchRequest, idxSchema *schema.IndexSchema, isMultiIndex bool) ([]HitRow, []AggRow, int64, []HitRow) {
+	return applyRuntimeSearchScriptsWithMatchedAndGlobal(hits, nil, aggRows, idxTotal, req, idxSchema, isMultiIndex)
+}
+
+func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []HitRow, aggRows []AggRow, idxTotal int64, req *esast.SearchRequest, idxSchema *schema.IndexSchema, isMultiIndex bool) ([]HitRow, []AggRow, int64, []HitRow) {
 	if req == nil {
 		return hits, aggRows, idxTotal, hits
 	}
@@ -13605,10 +14374,32 @@ func applyRuntimeSearchScriptsWithMatched(hits []HitRow, aggRows []AggRow, idxTo
 		postFilteredHits = append(postFilteredHits, h)
 	}
 
+	var filteredGlobalHits []HitRow
+	if len(globalHits) > 0 {
+		for _, gh := range globalHits {
+			if hasAliasScript {
+				var gdoc map[string]any
+				src := gh.EffectiveSource()
+				if len(src) > 0 {
+					dec := json.NewDecoder(bytes.NewReader(src))
+					dec.UseNumber()
+					_ = dec.Decode(&gdoc)
+				}
+				if gdoc == nil {
+					gdoc = make(map[string]any)
+				}
+				if !evalQueryScriptFilterOnDocWithSchema(idxSchema, gdoc, aliasFilterQ) {
+					continue
+				}
+			}
+			filteredGlobalHits = append(filteredGlobalHits, gh)
+		}
+	}
+
 	if hasQueryScript || hasAliasScript || hasMinScore {
 		idxTotal = int64(len(filteredQueryHits))
 	}
-	aggRows = applyRuntimeScriptAggsOnly(filteredQueryHits, aggRows, idxTotal, req, idxSchema)
+	aggRows = applyRuntimeScriptAggsOnlyWithGlobal(filteredQueryHits, filteredGlobalHits, aggRows, idxTotal, req, idxSchema)
 
 	outHits := postFilteredHits
 	if len(outHits) > 1 && (sortsHaveScript(req.Sort) || hasQueryScript) {
