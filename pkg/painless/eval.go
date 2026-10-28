@@ -53,6 +53,7 @@ var (
 	reMapPut         = regexp.MustCompile(`^ctx\._source(?:\.([a-zA-Z0-9_.]+))?\.put\(\s*(.+?)\s*,\s*(.+?)\s*\)$`)
 	reMapPutAll      = regexp.MustCompile(`^ctx\._source(?:\.([a-zA-Z0-9_.]+))?\.putAll\(\s*(.+?)\s*\)$`)
 	reArrayRemoveIf  = regexp.MustCompile(`^ctx\._source\.([a-zA-Z0-9_.]+)\.removeIf\(\s*([a-zA-Z0-9_]+)\s*->\s*([a-zA-Z0-9_]+)(?:\.([a-zA-Z0-9_.]+))?\s*==\s*(.+?)\s*\)$`)
+	reLocalVarAssign = regexp.MustCompile(`^(?:(?:def|boolean|int|long|double|float|String|Object|Map|List)\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$`)
 )
 
 // ApplyUpdate applies either a partial `doc` deep merge or an embedded Painless `script`
@@ -154,8 +155,44 @@ func EvalPainlessWithOp(sourceMap map[string]any, scriptSource string, params ma
 	}
 	ctxOp := ""
 	budget := &evalBudget{}
-	err := execBlock(sourceMap, scriptSource, params, &ctxOp, budget)
+	cleaned := stripPainlessComments(scriptSource)
+	err := execBlock(sourceMap, cleaned, params, &ctxOp, budget)
 	return ctxOp, err
+}
+
+func stripPainlessComments(s string) string {
+	if !strings.Contains(s, "//") && !strings.Contains(s, "/*") {
+		return s
+	}
+	var out strings.Builder
+	out.Grow(len(s))
+	inQuotes := byte(0)
+	inRegexClass := false
+	for i := 0; i < len(s); i++ {
+		if inQuotes == 0 && s[i] == '/' && i+1 < len(s) {
+			if s[i+1] == '/' {
+				i += 2
+				for i < len(s) && s[i] != '\n' {
+					i++
+				}
+				if i < len(s) {
+					out.WriteByte('\n')
+				}
+				continue
+			}
+			if s[i+1] == '*' {
+				i += 2
+				for i+1 < len(s) && (s[i] != '*' || s[i+1] != '/') {
+					i++
+				}
+				i++
+				continue
+			}
+		}
+		_ = stepQuoteState(s, i, &inQuotes, &inRegexClass)
+		out.WriteByte(s[i])
+	}
+	return out.String()
 }
 
 func execBlock(sourceMap map[string]any, block string, params map[string]any, ctxOp *string, budget *evalBudget) error {
@@ -276,17 +313,10 @@ func normalizeBracketAccess(s string) string {
 	var out strings.Builder
 	out.Grow(len(s))
 	inQuotes := byte(0)
+	inRegexClass := false
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if inQuotes != 0 {
-			out.WriteByte(c)
-			if c == inQuotes && (i == 0 || s[i-1] != '\\') {
-				inQuotes = 0
-			}
-			continue
-		}
-		if c == '\'' || c == '"' {
-			inQuotes = c
+		if stepQuoteState(s, i, &inQuotes, &inRegexClass) {
 			out.WriteByte(c)
 			continue
 		}
@@ -448,6 +478,18 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		return nil
 	}
 
+	// 9. Check local variable declaration/assignment (`def x = ...`, `boolean ok = ...`, `x = ...`)
+	if m := reLocalVarAssign.FindStringSubmatch(stmt); m != nil {
+		varName := m[1]
+		rhsExpr := strings.TrimSpace(m[2])
+		val, err := evalRHSExpr(sourceMap, rhsExpr, params)
+		if err != nil {
+			return err
+		}
+		params[varName] = val
+		return nil
+	}
+
 	return nil
 }
 
@@ -467,18 +509,14 @@ func splitTopLevelCondOp(s, op string) []string {
 	var parts []string
 	depth := 0
 	inQuotes := byte(0)
+	inRegexClass := false
 	lastStart := 0
 	for i := 0; i <= len(s)-len(op); i++ {
-		c := s[i]
-		if inQuotes != 0 {
-			if c == inQuotes && (i == 0 || s[i-1] != '\\') {
-				inQuotes = 0
-			}
+		if stepQuoteState(s, i, &inQuotes, &inRegexClass) {
 			continue
 		}
+		c := s[i]
 		switch c {
-		case '\'', '"':
-			inQuotes = c
 		case '(', '[', '{':
 			depth++
 		case ')', ']', '}':
@@ -524,24 +562,50 @@ func isRegexSlashAt(s string, idx int) bool {
 	return false
 }
 
+func stepQuoteState(s string, i int, inQuotes *byte, inRegexClass *bool) bool {
+	c := s[i]
+	if *inQuotes != 0 {
+		if *inQuotes == '/' && !isEscapedAt(s, i) {
+			if c == '[' && !*inRegexClass {
+				*inRegexClass = true
+				return true
+			}
+			if c == ']' && *inRegexClass {
+				*inRegexClass = false
+				return true
+			}
+			if *inRegexClass {
+				return true
+			}
+		}
+		if c == *inQuotes && !isEscapedAt(s, i) {
+			*inQuotes = 0
+			*inRegexClass = false
+		}
+		return true
+	}
+	if c == '/' && isRegexSlashAt(s, i) {
+		*inQuotes = '/'
+		*inRegexClass = false
+		return true
+	}
+	if c == '\'' || c == '"' {
+		*inQuotes = c
+		return true
+	}
+	return false
+}
+
 func findTopLevelOpPainless(s, op string) int {
 	depth := 0
 	inQuotes := byte(0)
+	inRegexClass := false
 	for i := 0; i <= len(s)-len(op); i++ {
+		if stepQuoteState(s, i, &inQuotes, &inRegexClass) {
+			continue
+		}
 		c := s[i]
-		if inQuotes != 0 {
-			if c == inQuotes && !isEscapedAt(s, i) {
-				inQuotes = 0
-			}
-			continue
-		}
-		if c == '/' && isRegexSlashAt(s, i) {
-			inQuotes = '/'
-			continue
-		}
 		switch c {
-		case '\'', '"':
-			inQuotes = c
 		case '(', '[', '{':
 			depth++
 		case ')', ']', '}':
@@ -551,6 +615,12 @@ func findTopLevelOpPainless(s, op string) int {
 		default:
 			if depth == 0 && s[i:i+len(op)] == op {
 				if op == "==" && i+2 < len(s) && s[i+2] == '~' {
+					continue
+				}
+				if op == ">" && i+1 < len(s) && s[i+1] == '=' {
+					continue
+				}
+				if op == "<" && i+1 < len(s) && s[i+1] == '=' {
 					continue
 				}
 				if op == "?" && i+1 < len(s) && (s[i+1] == '.' || s[i+1] == ':') {
@@ -570,21 +640,13 @@ func findMatchingTernaryColonPainless(s string) int {
 	depth := 0
 	ternaryDepth := 0
 	inQuotes := byte(0)
+	inRegexClass := false
 	for i := 0; i < len(s); i++ {
+		if stepQuoteState(s, i, &inQuotes, &inRegexClass) {
+			continue
+		}
 		c := s[i]
-		if inQuotes != 0 {
-			if c == inQuotes && !isEscapedAt(s, i) {
-				inQuotes = 0
-			}
-			continue
-		}
-		if c == '/' && isRegexSlashAt(s, i) {
-			inQuotes = '/'
-			continue
-		}
 		switch c {
-		case '\'', '"':
-			inQuotes = c
 		case '(', '[', '{':
 			depth++
 		case ')', ']', '}':
@@ -852,6 +914,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		}
 	}
 
+	// Check boolean logical, relational, or regex operators on RHS (`||`, `&&`, `=~`, `==~`, `==`, `!=`, `>=`, `<=`, `>`, `<`, `!`)
+	if hasTopLevelBooleanOrRegexOp(rhs) {
+		return evalConditionDepth(sourceMap, rhs, params, depth+1), nil
+	}
+
 	// Check binary `+` or `-` outside quotes
 	if opIdx, isAdd := findTopLevelAddSub(rhs); opIdx > 0 {
 		leftVal, err := evalRHSExprDepth(sourceMap, rhs[:opIdx], params, depth+1)
@@ -974,6 +1041,12 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		path := strings.Split(trimmed, ".")
 		return resolveParamPath(sourceMap, path), nil
 	}
+	if strings.HasPrefix(rhs, "doc.") || strings.HasPrefix(rhs, "doc?.") {
+		trimmed := strings.TrimPrefix(strings.TrimPrefix(rhs, "doc?."), "doc.")
+		trimmed = strings.TrimSuffix(trimmed, ".value")
+		path := strings.Split(trimmed, ".")
+		return resolveParamPath(sourceMap, path), nil
+	}
 	if rhs == "params" {
 		return params, nil
 	}
@@ -1018,22 +1091,33 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 	return rhs, nil
 }
 
+func hasTopLevelBooleanOrRegexOp(s string) bool {
+	if strings.HasPrefix(s, "!") && !strings.HasPrefix(s, "!=") {
+		return true
+	}
+	if len(splitTopLevelCondOp(s, "||")) > 1 || len(splitTopLevelCondOp(s, "&&")) > 1 {
+		return true
+	}
+	for _, op := range []string{"==~", "=~", "===", "!==", "==", "!=", ">=", "<=", ">", "<", " instanceof "} {
+		if findTopLevelOpPainless(s, op) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func findTopLevelAddSub(expr string) (int, bool) {
 	inQuotes := byte(0)
+	inRegexClass := false
 	depth := 0
 	lastIdx := -1
 	lastIsAdd := false
 	for i := 0; i < len(expr); i++ {
-		c := expr[i]
-		if inQuotes != 0 {
-			if c == inQuotes && (i == 0 || expr[i-1] != '\\') {
-				inQuotes = 0
-			}
+		if stepQuoteState(expr, i, &inQuotes, &inRegexClass) {
 			continue
 		}
+		c := expr[i]
 		switch c {
-		case '\'', '"':
-			inQuotes = c
 		case '(', '[', '{':
 			depth++
 		case ')', ']', '}':
@@ -1049,7 +1133,7 @@ func findTopLevelAddSub(expr string) (int, bool) {
 				if len(prev) > 0 {
 					lastChar := prev[len(prev)-1]
 					if lastChar != '+' && lastChar != '-' && lastChar != '*' && lastChar != '/' && lastChar != '(' &&
-						lastChar != ',' && lastChar != '?' && lastChar != ':' && lastChar != '=' && lastChar != '<' && lastChar != '>' && lastChar != '!' {
+						lastChar != ',' && lastChar != '?' && lastChar != ':' && lastChar != '=' && lastChar != '<' && lastChar != '>' && lastChar != '!' && lastChar != '~' {
 						lastIdx = i
 						lastIsAdd = c == '+'
 					}
@@ -1062,20 +1146,16 @@ func findTopLevelAddSub(expr string) (int, bool) {
 
 func findTopLevelMulDiv(expr string) (int, bool) {
 	inQuotes := byte(0)
+	inRegexClass := false
 	depth := 0
 	lastIdx := -1
 	lastIsMul := false
 	for i := 0; i < len(expr); i++ {
-		c := expr[i]
-		if inQuotes != 0 {
-			if c == inQuotes && (i == 0 || expr[i-1] != '\\') {
-				inQuotes = 0
-			}
+		if stepQuoteState(expr, i, &inQuotes, &inRegexClass) {
 			continue
 		}
+		c := expr[i]
 		switch c {
-		case '\'', '"':
-			inQuotes = c
 		case '(', '[', '{':
 			depth++
 		case ')', ']', '}':
@@ -1203,21 +1283,13 @@ func findMatchingDelimiter(s string, openIdx int, openChar, closeChar byte) int 
 	}
 	depth := 0
 	inQuotes := byte(0)
+	inRegexClass := false
 	for i := openIdx; i < len(s); i++ {
+		if stepQuoteState(s, i, &inQuotes, &inRegexClass) {
+			continue
+		}
 		c := s[i]
-		if inQuotes != 0 {
-			if c == inQuotes && !isEscapedAt(s, i) {
-				inQuotes = 0
-			}
-			continue
-		}
-		if c == '/' && isRegexSlashAt(s, i) {
-			inQuotes = '/'
-			continue
-		}
 		switch c {
-		case '\'', '"':
-			inQuotes = c
 		case openChar:
 			depth++
 		case closeChar:
@@ -1236,25 +1308,15 @@ func splitTopLevelStatements(s string) []string {
 	braceDepth := 0
 	parenDepth := 0
 	inQuotes := byte(0)
+	inRegexClass := false
 
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if inQuotes != 0 {
-			curr.WriteByte(c)
-			if c == inQuotes && !isEscapedAt(s, i) {
-				inQuotes = 0
-			}
-			continue
-		}
-		if c == '/' && isRegexSlashAt(s, i) {
-			inQuotes = '/'
+		if stepQuoteState(s, i, &inQuotes, &inRegexClass) {
 			curr.WriteByte(c)
 			continue
 		}
 		switch c {
-		case '\'', '"':
-			inQuotes = c
-			curr.WriteByte(c)
 		case '(':
 			parenDepth++
 			curr.WriteByte(c)
