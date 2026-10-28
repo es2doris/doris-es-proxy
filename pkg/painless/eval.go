@@ -332,8 +332,48 @@ func isIdentByte(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
 }
 
-func isBracketKeyByte(c byte) bool {
-	return isIdentByte(c) || c == '@' || c == '-' || c == '.' || c == '/' || c == ':' || c == ' '
+func isBracketReceiverByte(c byte) bool {
+	return isIdentByte(c) || c == ']' || c == ')' || c == '?' || (c >= '\x00' && c <= '\x04')
+}
+
+func encodeBracketKey(key string) string {
+	var out strings.Builder
+	out.Grow(len(key))
+	for i := 0; i < len(key); i++ {
+		switch key[i] {
+		case '.':
+			out.WriteByte('\x00')
+		case ' ':
+			out.WriteByte('\x01')
+		case '/':
+			out.WriteByte('\x02')
+		case ':':
+			out.WriteByte('\x03')
+		case '-':
+			out.WriteByte('\x04')
+		default:
+			out.WriteByte(key[i])
+		}
+	}
+	return out.String()
+}
+
+func isIntegerLiteral(s string) bool {
+	if s == "" {
+		return false
+	}
+	if s[0] == '-' || s[0] == '+' {
+		s = s[1:]
+		if s == "" {
+			return false
+		}
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func decodeBracketSeg(seg string) string {
@@ -346,12 +386,8 @@ func decodeBracketSeg(seg string) string {
 	return seg
 }
 
-// normalizeBracketAccess rewrites bracket property accesses like `ctx._source['field']`
-// or `params["key"]` into dot notation (`ctx._source.field`, `params.key`) outside string literals.
-// Special characters inside bracketed keys (`.`, ` `, `/`, `:`, `-`) are encoded as `\x00`..`\x04`
-// so path splitting on `.` and operator scanners preserve literal keys intact.
-func normalizeBracketAccess(s string) string {
-	if strings.IndexByte(s, '[') < 0 {
+func expandDynamicBrackets(s string, sourceMap map[string]any, params map[string]any, depth int) string {
+	if strings.IndexByte(s, '[') < 0 || depth > 64 {
 		return s
 	}
 	var out strings.Builder
@@ -364,44 +400,43 @@ func normalizeBracketAccess(s string) string {
 			out.WriteByte(c)
 			continue
 		}
-		if c == '[' && i > 0 && (isBracketKeyByte(s[i-1]) || s[i-1] == ']' || s[i-1] == '?') {
-			k := i + 1
-			for k < len(s) && (s[k] == ' ' || s[k] == '\t') {
-				k++
-			}
-			if k < len(s) && (s[k] == '\'' || s[k] == '"') {
-				q := s[k]
-				j := k + 1
-				valid := false
-				for j < len(s) && s[j] != q && isBracketKeyByte(s[j]) {
-					j++
-					valid = true
-				}
-				if valid && j < len(s) && s[j] == q {
-					endIdx := j + 1
-					for endIdx < len(s) && (s[endIdx] == ' ' || s[endIdx] == '\t') {
-						endIdx++
-					}
-					if endIdx < len(s) && s[endIdx] == ']' {
+		if c == '[' && i > 0 && isBracketReceiverByte(s[i-1]) {
+			closeIdx := findMatchingDelimiter(s, i, '[', ']')
+			if closeIdx > i+1 {
+				inner := strings.TrimSpace(s[i+1 : closeIdx])
+				if len(inner) >= 2 && (inner[0] == '\'' || inner[0] == '"') && inner[len(inner)-1] == inner[0] {
+					q := inner[0]
+					rawKey := inner[1 : len(inner)-1]
+					validLiteral := !strings.ContainsRune(rawKey, rune(q))
+					if validLiteral {
 						out.WriteByte('.')
-						for p := k + 1; p < j; p++ {
-							switch s[p] {
-							case '.':
-								out.WriteByte('\x00')
-							case ' ':
-								out.WriteByte('\x01')
-							case '/':
-								out.WriteByte('\x02')
-							case ':':
-								out.WriteByte('\x03')
-							case '-':
-								out.WriteByte('\x04')
-							default:
-								out.WriteByte(s[p])
-							}
-						}
-						i = endIdx
+						out.WriteString(encodeBracketKey(rawKey))
+						i = closeIdx
 						continue
+					}
+				}
+				if isIntegerLiteral(inner) {
+					out.WriteByte('.')
+					out.WriteString(encodeBracketKey(inner))
+					i = closeIdx
+					continue
+				}
+				if sourceMap != nil || params != nil {
+					if idxVal, err := evalRHSExprDepth(sourceMap, inner, params, depth+1); err == nil && idxVal != nil {
+						var keyStr string
+						if strVal, isStr := idxVal.(string); isStr {
+							keyStr = strVal
+						} else if f, ok := toFloat64(idxVal); ok && f == float64(int64(f)) {
+							keyStr = strconv.FormatInt(int64(f), 10)
+						} else {
+							keyStr = fmt.Sprintf("%v", idxVal)
+						}
+						if keyStr != "" {
+							out.WriteByte('.')
+							out.WriteString(encodeBracketKey(keyStr))
+							i = closeIdx
+							continue
+						}
 					}
 				}
 			}
@@ -412,7 +447,7 @@ func normalizeBracketAccess(s string) string {
 }
 
 func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any, ctxOp *string, budget *evalBudget) error {
-	stmt = strings.TrimSpace(normalizeBracketAccess(stmt))
+	stmt = strings.TrimSpace(expandDynamicBrackets(stmt, sourceMap, params, 0))
 	if stmt == "return" || strings.HasPrefix(stmt, "return ") || strings.HasPrefix(stmt, "return;") {
 		return errPainlessReturn
 	}
@@ -448,12 +483,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		path := strings.Split(lhs, ".")
 		curVal := resolveParamPath(params, path)
 		nextVal := applyArithmetic(curVal, int64(1), op == "++")
-		firstKey := decodeBracketSeg(path[0])
-		if len(path) == 1 {
-			params[firstKey] = nextVal
-		} else if targetMap, ok := params[firstKey].(map[string]any); ok {
-			setValueAtPath(targetMap, path[1:], nextVal)
-		}
+		setValueAtPath(params, path, nextVal)
 		return nil
 	}
 
@@ -588,7 +618,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		return nil
 	}
 
-	// 9. Check local/loop variable compound assignment (`sum += x`, `item.count += 1`)
+	// 9. Check local/loop variable compound assignment (`sum += x`, `item.count += 1`, `items[0].qty += 2`)
 	if m := reLocalCompoundAssign.FindStringSubmatch(stmt); m != nil {
 		lhs := m[1]
 		op := m[2]
@@ -609,15 +639,11 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		case "/=":
 			nextVal = applyMulDiv(curVal, rhsVal, '/')
 		}
-		if len(path) == 1 {
-			params[path[0]] = nextVal
-		} else if targetMap, ok := params[path[0]].(map[string]any); ok {
-			setValueAtPath(targetMap, path[1:], nextVal)
-		}
+		setValueAtPath(params, path, nextVal)
 		return nil
 	}
 
-	// 10. Check local/loop variable property assignment (`tag.status = 'active'`)
+	// 10. Check local/loop variable property/index assignment (`tag.status = 'active'`, `items[0] = 'x'`)
 	if m := reLocalPropAssign.FindStringSubmatch(stmt); m != nil {
 		varName := m[1]
 		propPath := strings.Split(m[2], ".")
@@ -626,9 +652,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		if err != nil {
 			return err
 		}
-		if targetMap, ok := params[varName].(map[string]any); ok {
-			setValueAtPath(targetMap, propPath, val)
-		}
+		setValueAtPath(params, append([]string{varName}, propPath...), val)
 		return nil
 	}
 
@@ -846,7 +870,7 @@ func evalConditionDepth(sourceMap map[string]any, cond string, params map[string
 	if depth > 64 {
 		return false
 	}
-	cond = trimBalancedParens(normalizeBracketAccess(cond))
+	cond = trimBalancedParens(expandDynamicBrackets(cond, sourceMap, params, depth+1))
 	if cond == "" || cond == "false" {
 		return false
 	}
@@ -1042,7 +1066,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 	if depth > 64 {
 		return nil, fmt.Errorf("painless expression exceeded maximum recursion depth (64)")
 	}
-	rhs = trimBalancedParens(normalizeBracketAccess(rhs))
+	rhs = trimBalancedParens(expandDynamicBrackets(rhs, sourceMap, params, depth+1))
 
 	// Check Elvis operator `?:`
 	if elvisIdx := findTopLevelOpPainless(rhs, "?:"); elvisIdx > 0 {
@@ -1149,13 +1173,54 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		return false, nil
 	}
 
-	for _, mName := range []string{".startsWith(", ".endsWith(", ".contains("} {
-		if idx := findTopLevelOpPainless(rhs, mName); idx > 0 && strings.HasSuffix(rhs, ")") {
-			recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:idx], "?"))
-			argExpr := strings.TrimSpace(rhs[idx+len(mName) : len(rhs)-1])
+	for _, mName := range []string{".startsWith(", ".endsWith(", ".contains(", ".containsKey(", ".get(", ".indexOf(", ".split(", ".replace(", ".substring("} {
+		if recExpr, argExpr, ok := matchTrailingMethodCallPainless(rhs, mName); ok {
 			recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1)
 			if err != nil || recVal == nil {
 				return nil, err
+			}
+			switch mName {
+			case ".replace(":
+				args := splitTopLevelCommaPainless(argExpr)
+				if len(args) == 2 {
+					oldVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+					newVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+					if s, ok := recVal.(string); ok && oldVal != nil && newVal != nil {
+						return strings.ReplaceAll(s, fmt.Sprintf("%v", oldVal), fmt.Sprintf("%v", newVal)), nil
+					}
+				}
+				return recVal, nil
+			case ".substring(":
+				args := splitTopLevelCommaPainless(argExpr)
+				if s, ok := recVal.(string); ok && len(args) >= 1 {
+					startVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+					sf, sOk := toFloat64(startVal)
+					if !sOk {
+						return s, nil
+					}
+					start := int(sf)
+					if start < 0 {
+						start = 0
+					}
+					if start > len(s) {
+						start = len(s)
+					}
+					end := len(s)
+					if len(args) >= 2 {
+						endVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+						if ef, eOk := toFloat64(endVal); eOk {
+							end = int(ef)
+							if end < start {
+								end = start
+							}
+							if end > len(s) {
+								end = len(s)
+							}
+						}
+					}
+					return s[start:end], nil
+				}
+				return recVal, nil
 			}
 			argVal, _ := evalRHSExprDepth(sourceMap, argExpr, params, depth+1)
 			switch mName {
@@ -1183,6 +1248,56 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					}
 				}
 				return false, nil
+			case ".containsKey(":
+				if m, ok := recVal.(map[string]any); ok && argVal != nil {
+					_, exists := m[fmt.Sprintf("%v", argVal)]
+					return exists, nil
+				}
+				return false, nil
+			case ".get(":
+				switch tv := recVal.(type) {
+				case map[string]any:
+					if argVal != nil {
+						return tv[fmt.Sprintf("%v", argVal)], nil
+					}
+				case []any:
+					if f, ok := toFloat64(argVal); ok {
+						if idx, okIdx := parseSliceIndex(strconv.Itoa(int(f)), len(tv)); okIdx {
+							return tv[idx], nil
+						}
+					}
+				}
+				return nil, nil
+			case ".indexOf(":
+				switch tv := recVal.(type) {
+				case string:
+					if argVal != nil {
+						return int64(strings.Index(tv, fmt.Sprintf("%v", argVal))), nil
+					}
+				case []any:
+					for idx, item := range tv {
+						if valuesEqual(item, argVal) {
+							return int64(idx), nil
+						}
+					}
+				}
+				return int64(-1), nil
+			case ".split(":
+				if s, ok := recVal.(string); ok && argVal != nil {
+					sepStr := fmt.Sprintf("%v", argVal)
+					var parts []string
+					if re, err := regexp.Compile(sepStr); err == nil && sepStr != "." && sepStr != "" {
+						parts = re.Split(s, -1)
+					} else {
+						parts = strings.Split(s, sepStr)
+					}
+					out := make([]any, len(parts))
+					for i, p := range parts {
+						out[i] = p
+					}
+					return out, nil
+				}
+				return []any{}, nil
 			}
 		}
 	}
@@ -1226,11 +1341,8 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 	}
 	if dotIdx := strings.IndexByte(rhs, '.'); dotIdx > 0 {
 		firstSeg := decodeBracketSeg(rhs[:dotIdx])
-		if baseVal, ok := params[firstSeg]; ok {
-			if baseMap, isMap := baseVal.(map[string]any); isMap {
-				return resolveParamPath(baseMap, strings.Split(rhs[dotIdx+1:], ".")), nil
-			}
-			return nil, nil
+		if _, ok := params[firstSeg]; ok {
+			return resolveParamPath(params, strings.Split(rhs, ".")), nil
 		}
 	}
 	if rhs == "null" {
@@ -1289,6 +1401,59 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		return parsed, nil
 	}
 	return rhs, nil
+}
+
+func matchTrailingMethodCallPainless(s, mName string) (recExpr, argExpr string, ok bool) {
+	if !strings.HasSuffix(s, ")") || len(s) <= len(mName) {
+		return "", "", false
+	}
+	openParenIdx := -1
+	depth := 0
+	var quote byte
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if quote != 0 {
+			if ch == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' {
+			quote = ch
+			continue
+		}
+		if ch == '(' || ch == '[' {
+			if depth == 0 && ch == '(' {
+				openParenIdx = i
+			}
+			depth++
+			continue
+		}
+		if ch == ')' || ch == ']' {
+			depth--
+			if depth == 0 && i < len(s)-1 {
+				openParenIdx = -1
+			}
+		}
+	}
+	if depth != 0 || openParenIdx <= 0 {
+		return "", "", false
+	}
+	prefix := s[:openParenIdx+1]
+	if !strings.HasSuffix(prefix, mName) {
+		return "", "", false
+	}
+	idx := len(prefix) - len(mName)
+	if idx <= 0 {
+		return "", "", false
+	}
+	recExpr = strings.TrimSpace(strings.TrimSuffix(s[:idx], "?"))
+	argExpr = strings.TrimSpace(s[openParenIdx+1 : len(s)-1])
+	return recExpr, argExpr, recExpr != ""
 }
 
 func splitTopLevelCommaPainless(s string) []string {
@@ -1634,10 +1799,32 @@ func splitTopLevelStatements(s string) []string {
 	return out
 }
 
+func parseSliceIndex(seg string, length int) (int, bool) {
+	idx, err := strconv.Atoi(seg)
+	if err != nil {
+		return 0, false
+	}
+	if idx < 0 {
+		idx = length + idx
+	}
+	if idx < 0 || idx >= length {
+		return 0, false
+	}
+	return idx, true
+}
+
 func resolveParamPath(params map[string]any, path []string) any {
 	var curr any = params
 	for i, rawSeg := range path {
 		seg := decodeBracketSeg(rawSeg)
+		if slice, isSlice := curr.([]any); isSlice {
+			idx, ok := parseSliceIndex(seg, len(slice))
+			if !ok {
+				return nil
+			}
+			curr = slice[idx]
+			continue
+		}
 		m, ok := curr.(map[string]any)
 		if !ok {
 			return nil
@@ -1671,6 +1858,9 @@ func resolveParamPath(params map[string]any, path []string) any {
 }
 
 func setValueAtPath(root map[string]any, path []string, val any) {
+	if len(path) == 0 {
+		return
+	}
 	if len(path) > 1 {
 		decoded := make([]string, len(path))
 		for i, p := range path {
@@ -1678,17 +1868,51 @@ func setValueAtPath(root map[string]any, path []string, val any) {
 		}
 		delete(root, strings.Join(decoded, "."))
 	}
-	curr := root
+	var curr any = root
 	for i := 0; i < len(path)-1; i++ {
 		seg := decodeBracketSeg(path[i])
-		next, ok := curr[seg].(map[string]any)
-		if !ok {
-			next = make(map[string]any)
-			curr[seg] = next
+		switch node := curr.(type) {
+		case map[string]any:
+			next, exists := node[seg]
+			if !exists || next == nil {
+				nextMap := make(map[string]any)
+				node[seg] = nextMap
+				curr = nextMap
+				continue
+			}
+			if _, isMap := next.(map[string]any); isMap {
+				curr = next
+				continue
+			}
+			if _, isSlice := next.([]any); isSlice {
+				curr = next
+				continue
+			}
+			nextMap := make(map[string]any)
+			node[seg] = nextMap
+			curr = nextMap
+		case []any:
+			idx, ok := parseSliceIndex(seg, len(node))
+			if !ok {
+				return
+			}
+			if node[idx] == nil {
+				node[idx] = make(map[string]any)
+			}
+			curr = node[idx]
+		default:
+			return
 		}
-		curr = next
 	}
-	curr[decodeBracketSeg(path[len(path)-1])] = val
+	lastSeg := decodeBracketSeg(path[len(path)-1])
+	switch node := curr.(type) {
+	case map[string]any:
+		node[lastSeg] = val
+	case []any:
+		if idx, ok := parseSliceIndex(lastSeg, len(node)); ok {
+			node[idx] = val
+		}
+	}
 }
 
 func putAllAtPath(root map[string]any, path []string, values map[string]any) {

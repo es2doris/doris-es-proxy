@@ -668,4 +668,56 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 		t.Fatalf("POST /_ingest/pipeline/_simulate (R12 processors) failed: status=%v err=%v", simR12Resp.StatusCode, err)
 	}
 	_ = simR12Resp.Body.Close()
+
+	// 14. Verify Round-13 features on live Doris:
+	//   - `collapse.inner_hits` + `collapse.fields`
+	//   - `dissect` ingest processor + `_simulate?verbose=true`
+	//   - zero-downtime scalar-to-array promotion (`f__arr__<name>`) in live Doris
+	collapseR13Resp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
+		"sort": [{"latency_ms": "desc"}],
+		"collapse": {
+			"field": "service",
+			"inner_hits": {
+				"name": "by_svc",
+				"size": 3,
+				"sort": [{"latency_ms": "asc"}]
+			}
+		}
+	}`))
+	if err != nil || collapseR13Resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search (collapse inner_hits) failed: status=%v err=%v", collapseR13Resp.StatusCode, err)
+	}
+	var collapseR13Res map[string]any
+	_ = json.NewDecoder(collapseR13Resp.Body).Decode(&collapseR13Res)
+	_ = collapseR13Resp.Body.Close()
+	cHits := collapseR13Res["hits"].(map[string]any)["hits"].([]any)
+	if len(cHits) == 0 {
+		t.Fatalf("expected collapsed hits on live_auto_index, got 0")
+	}
+	firstCollapsed := cHits[0].(map[string]any)
+	if _, hasFields := firstCollapsed["fields"].(map[string]any); !hasFields {
+		t.Fatalf("expected collapse hit on live Doris to include fields map, got: %+v", firstCollapsed)
+	}
+	if _, hasIH := firstCollapsed["inner_hits"].(map[string]any); !hasIH {
+		t.Fatalf("expected collapse hit on live Doris to include inner_hits, got: %+v", firstCollapsed)
+	}
+
+	simR13Resp, err := http.Post(ts.URL+"/_ingest/pipeline/_simulate?verbose=true", "application/json", strings.NewReader(`{
+		"pipeline": {
+			"processors": [
+				{"dissect": {"field": "raw", "pattern": "%{ip} %{method} %{path}"}}
+			]
+		},
+		"docs": [{"_index": "live_auto_index", "_id": "sim-r13", "_source": {"raw": "10.0.0.1 GET /health"}}]
+	}`))
+	if err != nil || simR13Resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_ingest/pipeline/_simulate?verbose=true (R13 dissect) failed: status=%v err=%v", simR13Resp.StatusCode, err)
+	}
+	var simR13Res map[string]any
+	_ = json.NewDecoder(simR13Resp.Body).Decode(&simR13Res)
+	_ = simR13Resp.Body.Close()
+	simR13Docs := simR13Res["docs"].([]any)
+	if _, hasProcResults := simR13Docs[0].(map[string]any)["processor_results"].([]any); !hasProcResults {
+		t.Fatalf("expected processor_results in verbose _simulate response, got: %+v", simR13Docs[0])
+	}
 }

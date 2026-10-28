@@ -105,6 +105,15 @@ func ShredDocument(
 			}
 		case StoragePromotedArray, StorageNestedSubfield:
 			vals := extractStringSliceValues(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer)
+			if b.Kind == StoragePromotedArray && b.ESType == "date" {
+				for i, v := range vals {
+					if _, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err != nil {
+						if ms, ok := ParseESDateToEpochMillis(v, getNow()); ok {
+							vals[i] = strconv.FormatInt(ms, 10)
+						}
+					}
+				}
+			}
 			if len(vals) > 0 {
 				row[b.ColumnName] = vals
 			}

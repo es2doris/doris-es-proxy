@@ -207,8 +207,64 @@ type PITSpec struct {
 	KeepAlive string `json:"keep_alive,omitempty"`
 }
 
+type InnerHitsSpec struct {
+	Name           string             `json:"name,omitempty"`
+	From           int                `json:"from,omitempty"`
+	Size           *int               `json:"size,omitempty"`
+	Sort           SortSlice          `json:"sort,omitempty"`
+	Source         *SourceFilter      `json:"_source,omitempty"`
+	Fields         []FieldRequestSpec `json:"fields,omitempty"`
+	DocvalueFields []FieldRequestSpec `json:"docvalue_fields,omitempty"`
+	Highlight      *HighlightSpec     `json:"highlight,omitempty"`
+}
+
+func (ih *InnerHitsSpec) EffectiveFieldSpecs() []FieldRequestSpec {
+	if ih == nil || (len(ih.Fields) == 0 && len(ih.DocvalueFields) == 0) {
+		return nil
+	}
+	out := make([]FieldRequestSpec, 0, len(ih.Fields)+len(ih.DocvalueFields))
+	out = append(out, ih.Fields...)
+	out = append(out, ih.DocvalueFields...)
+	return out
+}
+
+func (ih *InnerHitsSpec) EffectiveSize() int {
+	if ih == nil || ih.Size == nil {
+		return 3
+	}
+	if *ih.Size < 0 {
+		return 0
+	}
+	return *ih.Size
+}
+
+type CollapseInnerHits []InnerHitsSpec
+
+func (ci *CollapseInnerHits) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		*ci = nil
+		return nil
+	}
+	if trimmed[0] == '[' {
+		var list []InnerHitsSpec
+		if err := json.Unmarshal(trimmed, &list); err != nil {
+			return err
+		}
+		*ci = list
+		return nil
+	}
+	var single InnerHitsSpec
+	if err := json.Unmarshal(trimmed, &single); err != nil {
+		return err
+	}
+	*ci = []InnerHitsSpec{single}
+	return nil
+}
+
 type CollapseSpec struct {
-	Field string `json:"field"`
+	Field     string            `json:"field"`
+	InnerHits CollapseInnerHits `json:"inner_hits,omitempty"`
 }
 
 type HighlightSpec struct {
@@ -753,10 +809,11 @@ type QueryStringQuery struct {
 }
 
 type NestedQuery struct {
-	Path           string `json:"path"`
-	Query          Query  `json:"query"`
-	ScoreMode      string `json:"score_mode,omitempty"`
-	IgnoreUnmapped bool   `json:"ignore_unmapped,omitempty"`
+	Path           string         `json:"path"`
+	Query          Query          `json:"query"`
+	ScoreMode      string         `json:"score_mode,omitempty"`
+	IgnoreUnmapped bool           `json:"ignore_unmapped,omitempty"`
+	InnerHits      *InnerHitsSpec `json:"inner_hits,omitempty"`
 }
 
 type ConstantScoreQuery struct {
@@ -886,9 +943,10 @@ type SamplerAggSpec struct {
 
 // PercentileRanksAggSpec models a `percentile_ranks` metric aggregation.
 type PercentileRanksAggSpec struct {
-	Field  string    `json:"field"`
-	Values []float64 `json:"values"`
-	Keyed  *bool     `json:"keyed,omitempty"`
+	Field   string    `json:"field"`
+	Values  []float64 `json:"values"`
+	Keyed   *bool     `json:"keyed,omitempty"`
+	Missing any       `json:"missing,omitempty"`
 }
 
 // TopMetricsValSpec models a single metric field in `top_metrics`.
@@ -1225,6 +1283,7 @@ type PercentilesAggSpec struct {
 	Field    string    `json:"field"`
 	Percents []float64 `json:"percents,omitempty"`
 	Keyed    *bool     `json:"keyed,omitempty"`
+	Missing  any       `json:"missing,omitempty"`
 }
 
 func (p *PercentilesAggSpec) EffectivePercents() []float64 {
@@ -1779,6 +1838,7 @@ type FieldProperty struct {
 	Dimension      int                      `json:"dimension,omitempty"`
 	Similarity     string                   `json:"similarity,omitempty"`
 	MultiValued    bool                     `json:"multi_valued,omitempty"`
+	UpgradedArray  bool                     `json:"upgraded_array,omitempty"`
 	Fields         map[string]FieldProperty `json:"fields,omitempty"`
 	Properties     map[string]FieldProperty `json:"properties,omitempty"`
 }

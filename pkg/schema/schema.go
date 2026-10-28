@@ -260,6 +260,9 @@ func DeepMergeMappingProperties(
 			if v.MultiValued {
 				merged.MultiValued = true
 			}
+			if v.UpgradedArray {
+				merged.UpgradedArray = true
+			}
 			if len(v.Properties) > 0 {
 				merged.Properties = DeepMergeMappingProperties(existing.Properties, v.Properties)
 			}
@@ -334,6 +337,9 @@ func (s *IndexSchema) compileProperties(
 				subProp := prop.Fields[subKey]
 				if prop.MultiValued || DefaultMultiValuedPaths[dotPath] {
 					subProp.MultiValued = true
+					if prop.UpgradedArray {
+						subProp.UpgradedArray = true
+					}
 				}
 				multiDotPath := dotPath + "." + subKey
 				// Multi-fields read from the same `currJSONPath` in `_source`!
@@ -407,11 +413,15 @@ func (s *IndexSchema) registerLeafField(
 		return
 	}
 	if prop.MultiValued || DefaultMultiValuedPaths[dotPath] {
+		arrColName := colName
+		if prop.UpgradedArray {
+			arrColName = "f__arr__" + SanitizeDorisIdentifier(dotPath)
+		}
 		s.Fields[dotPath] = FieldBinding{
 			ESFieldPath:         dotPath,
 			SourceJSONPath:      sourceJSONPath,
 			Kind:                StoragePromotedArray,
-			ColumnName:          colName,
+			ColumnName:          arrColName,
 			DorisType:           DorisString,
 			ESType:              esType,
 			Format:              prop.Format,
