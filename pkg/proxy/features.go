@@ -1086,7 +1086,7 @@ func (s *Server) applyIngestPipelineForWrite(pipelineID string, raw json.RawMess
 	if !ok || pipe == nil {
 		return raw, false, nil
 	}
-	return applyIngestPipelineSpec(pipe, raw)
+	return applyIngestPipelineSpecWithServer(s, pipe, raw)
 }
 
 func (s *Server) applyEffectiveAndFinalPipelines(indexName, reqPipeline, defaultPipeline string, raw json.RawMessage) (json.RawMessage, bool, error) {
@@ -1256,7 +1256,133 @@ func parseIngestByteSize(s string) (int64, error) {
 	return int64(fv * mult), nil
 }
 
-func executeSingleIngestProcessor(doc map[string]any, pMap map[string]any) (mutated bool, dropped bool, procType string, procTag string, specMap map[string]any, procErr error) {
+func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error) {
+	type dissectToken struct {
+		rawKey   string
+		nextLit  string
+		padRight bool
+		skip     bool
+		append   bool
+		indirect bool
+	}
+	var prefixLit string
+	var tokens []dissectToken
+
+	rem := pattern
+	firstIdx := strings.Index(rem, "%{")
+	if firstIdx < 0 {
+		if input != pattern {
+			return nil, fmt.Errorf("unable to dissect [%s] with pattern [%s]", input, pattern)
+		}
+		return map[string]any{}, nil
+	}
+	prefixLit = rem[:firstIdx]
+	rem = rem[firstIdx:]
+
+	for strings.HasPrefix(rem, "%{") {
+		endBrace := strings.IndexByte(rem, '}')
+		if endBrace < 0 {
+			return nil, fmt.Errorf("invalid dissect pattern [%s]: unclosed token", pattern)
+		}
+		inner := rem[2:endBrace]
+		rem = rem[endBrace+1:]
+
+		var nextLit string
+		if nextStart := strings.Index(rem, "%{"); nextStart >= 0 {
+			nextLit = rem[:nextStart]
+			rem = rem[nextStart:]
+		} else {
+			nextLit = rem
+			rem = ""
+		}
+
+		tok := dissectToken{nextLit: nextLit}
+		if strings.HasSuffix(inner, "->") {
+			tok.padRight = true
+			inner = strings.TrimSuffix(inner, "->")
+		}
+		switch {
+		case inner == "" || strings.HasPrefix(inner, "?"):
+			tok.skip = true
+			tok.rawKey = strings.TrimPrefix(inner, "?")
+		case strings.HasPrefix(inner, "+"):
+			tok.append = true
+			inner = strings.TrimPrefix(inner, "+")
+			if slashIdx := strings.IndexByte(inner, '/'); slashIdx > 0 {
+				inner = inner[:slashIdx]
+			}
+			tok.rawKey = inner
+		case strings.HasPrefix(inner, "&"):
+			tok.indirect = true
+			tok.rawKey = strings.TrimPrefix(inner, "&")
+		default:
+			tok.rawKey = inner
+		}
+		tokens = append(tokens, tok)
+	}
+
+	if !strings.HasPrefix(input, prefixLit) {
+		return nil, fmt.Errorf("unable to dissect [%s] with pattern [%s]", input, pattern)
+	}
+	cur := input[len(prefixLit):]
+	out := make(map[string]any)
+	refValues := make(map[string]string)
+
+	for i, tok := range tokens {
+		var val string
+		isLast := i == len(tokens)-1
+		if isLast && tok.nextLit == "" {
+			val = cur
+			cur = ""
+		} else if tok.nextLit == "" {
+			val = ""
+		} else {
+			idx := strings.Index(cur, tok.nextLit)
+			if idx < 0 {
+				return nil, fmt.Errorf("unable to dissect [%s] with pattern [%s]: missing delimiter [%s]", input, pattern, tok.nextLit)
+			}
+			val = cur[:idx]
+			cur = cur[idx+len(tok.nextLit):]
+			if tok.padRight && tok.nextLit != "" {
+				for strings.HasPrefix(cur, tok.nextLit) {
+					cur = cur[len(tok.nextLit):]
+				}
+			}
+		}
+		if !tok.indirect && tok.rawKey != "" {
+			refValues[tok.rawKey] = val
+		}
+		if tok.skip || tok.rawKey == "" {
+			continue
+		}
+		targetKey := tok.rawKey
+		if tok.indirect {
+			targetKey = refValues[tok.rawKey]
+			if targetKey == "" {
+				continue
+			}
+		}
+		if tok.append {
+			if existing, exists := out[targetKey]; exists {
+				out[targetKey] = fmt.Sprintf("%v%s%s", existing, appendSep, val)
+			} else {
+				out[targetKey] = val
+			}
+		} else {
+			out[targetKey] = val
+		}
+	}
+	return out, nil
+}
+
+func isExplicitIgnoreMissingFalse(specMap map[string]any) bool {
+	if im, hasIM := specMap["ignore_missing"].(bool); hasIM && !im {
+		return true
+	}
+	return false
+}
+
+func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string]any, depth int, trace *[]map[string]any) (mutated bool, dropped bool, procType string, procTag string, specMap map[string]any, procErr error) {
 	if topIf, ok := pMap["if"].(string); ok && !evalIngestIfCondition(topIf, doc) {
 		return false, false, "", "", nil, nil
 	}
@@ -1279,7 +1405,7 @@ func executeSingleIngestProcessor(doc map[string]any, pMap map[string]any) (muta
 		procTag, _ = pMap["tag"].(string)
 	}
 	if cond, ok := specMap["if"].(string); ok && !evalIngestIfCondition(cond, doc) {
-		return false, false, procType, procTag, specMap, nil
+		return false, false, "", procTag, specMap, nil
 	}
 
 	switch procType {
@@ -1292,6 +1418,83 @@ func executeSingleIngestProcessor(doc map[string]any, pMap map[string]any) (muta
 			expanded = "fail processor triggered"
 		}
 		return false, false, procType, procTag, specMap, fmt.Errorf("%s", expanded)
+	case "pipeline":
+		if depth > 16 {
+			return false, false, procType, procTag, specMap, fmt.Errorf("ingest pipeline max depth (16) exceeded")
+		}
+		subName, _ := specMap["name"].(string)
+		subName = strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(subName, doc)))
+		var subPipe map[string]any
+		if s != nil && subName != "" {
+			s.mu.RLock()
+			subPipe = s.pipelines[subName]
+			s.mu.RUnlock()
+			if subPipe == nil {
+				_ = s.syncCatalogFromBackend(context.Background())
+				s.mu.RLock()
+				subPipe = s.pipelines[subName]
+				s.mu.RUnlock()
+			}
+		}
+		if subPipe == nil {
+			if ignoreMissing, _ := specMap["ignore_missing_pipeline"].(bool); ignoreMissing {
+				return false, false, procType, procTag, specMap, nil
+			}
+			return false, false, procType, procTag, specMap, fmt.Errorf("pipeline [%s] is missing", subName)
+		}
+		subProcs, _ := subPipe["processors"].([]any)
+		subMut, subDropped, subErr := runIngestProcessorList(s, doc, subProcs, depth+1, trace)
+		if subErr != nil {
+			if pipeOnFail, ok := subPipe["on_failure"].([]any); ok && len(pipeOnFail) > 0 {
+				ingestMeta, _ := doc["_ingest"].(map[string]any)
+				if ingestMeta == nil {
+					ingestMeta = make(map[string]any)
+				}
+				ingestMeta["on_failure_message"] = subErr.Error()
+				doc["_ingest"] = ingestMeta
+				subMut = true
+				fMut, fDrop, fErr := runIngestProcessorList(s, doc, pipeOnFail, depth+1, trace)
+				if fMut {
+					subMut = true
+				}
+				if fDrop {
+					return subMut, true, procType, procTag, specMap, nil
+				}
+				subErr = fErr
+			}
+		}
+		return subMut, subDropped, procType, procTag, specMap, subErr
+	case "dissect":
+		field, _ := specMap["field"].(string)
+		pattern, _ := specMap["pattern"].(string)
+		appendSep, _ := specMap["append_separator"].(string)
+		if field != "" && pattern != "" {
+			val, exists := getIngestPath(doc, field)
+			if !exists || val == nil {
+				ignoreMissing, _ := specMap["ignore_missing"].(bool)
+				if !ignoreMissing {
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+				}
+				return false, false, procType, procTag, specMap, nil
+			}
+			strVal, ok := val.(string)
+			if !ok {
+				strVal = fmt.Sprintf("%v", val)
+			}
+			extracted, err := evalDissectPattern(pattern, strVal, appendSep)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
+			targetField, _ := specMap["target_field"].(string)
+			if targetField != "" {
+				setIngestPath(doc, targetField, extracted)
+			} else {
+				for k, v := range extracted {
+					setIngestPath(doc, k, v)
+				}
+			}
+			mutated = true
+		}
 	case "set":
 		if field, _ := specMap["field"].(string); field != "" {
 			if override, hasOverride := specMap["override"].(bool); hasOverride && !override {
@@ -1303,6 +1506,8 @@ func executeSingleIngestProcessor(doc map[string]any, pMap map[string]any) (muta
 				if val, exists := getIngestPath(doc, copyFrom); exists {
 					setIngestPath(doc, field, val)
 					mutated = true
+				} else if isExplicitIgnoreMissingFalse(specMap) {
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", copyFrom)
 				}
 			} else if val, hasVal := specMap["value"]; hasVal {
 				setIngestPath(doc, field, expandIngestTemplate(val, doc))
@@ -1324,16 +1529,24 @@ func executeSingleIngestProcessor(doc map[string]any, pMap map[string]any) (muta
 				setIngestPath(doc, dstField, val)
 				deleteIngestPath(doc, srcField)
 				mutated = true
+			} else if isExplicitIgnoreMissingFalse(specMap) {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", srcField)
 			}
 		}
 	case "remove":
 		switch f := specMap["field"].(type) {
 		case string:
+			if _, exists := getIngestPath(doc, f); !exists && isExplicitIgnoreMissingFalse(specMap) {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", f)
+			}
 			deleteIngestPath(doc, f)
 			mutated = true
 		case []any:
 			for _, item := range f {
 				if ks, ok := item.(string); ok {
+					if _, exists := getIngestPath(doc, ks); !exists && isExplicitIgnoreMissingFalse(specMap) {
+						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", ks)
+					}
 					deleteIngestPath(doc, ks)
 					mutated = true
 				}
@@ -1362,6 +1575,8 @@ func executeSingleIngestProcessor(doc map[string]any, pMap map[string]any) (muta
 					setIngestPath(doc, target, out)
 					mutated = true
 				}
+			} else if isExplicitIgnoreMissingFalse(specMap) {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
 		}
 	case "uppercase":
@@ -1387,6 +1602,8 @@ func executeSingleIngestProcessor(doc map[string]any, pMap map[string]any) (muta
 					setIngestPath(doc, target, out)
 					mutated = true
 				}
+			} else if isExplicitIgnoreMissingFalse(specMap) {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
 		}
 	case "trim":
@@ -1412,6 +1629,8 @@ func executeSingleIngestProcessor(doc map[string]any, pMap map[string]any) (muta
 					setIngestPath(doc, target, out)
 					mutated = true
 				}
+			} else if isExplicitIgnoreMissingFalse(specMap) {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
 		}
 	case "split":
@@ -1437,6 +1656,8 @@ func executeSingleIngestProcessor(doc map[string]any, pMap map[string]any) (muta
 					setIngestPath(doc, target, out)
 					mutated = true
 				}
+			} else if isExplicitIgnoreMissingFalse(specMap) {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
 		}
 	case "join":
@@ -1456,6 +1677,8 @@ func executeSingleIngestProcessor(doc map[string]any, pMap map[string]any) (muta
 					setIngestPath(doc, target, strings.Join(strs, sep))
 					mutated = true
 				}
+			} else if isExplicitIgnoreMissingFalse(specMap) {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
 		}
 	case "append":
@@ -1572,6 +1795,8 @@ func executeSingleIngestProcessor(doc map[string]any, pMap map[string]any) (muta
 					setIngestPath(doc, target, re.ReplaceAllString(strVal, repl))
 					mutated = true
 				}
+			} else if isExplicitIgnoreMissingFalse(specMap) {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
 		}
 	case "json":
@@ -1602,6 +1827,8 @@ func executeSingleIngestProcessor(doc map[string]any, pMap map[string]any) (muta
 						mutated = true
 					}
 				}
+			} else if isExplicitIgnoreMissingFalse(specMap) {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
 		}
 	case "kv":
@@ -1640,15 +1867,32 @@ func executeSingleIngestProcessor(doc map[string]any, pMap map[string]any) (muta
 					}
 					mutated = true
 				}
+			} else if isExplicitIgnoreMissingFalse(specMap) {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
 		}
 	case "dot_expander":
 		field, _ := specMap["field"].(string)
+		subPath, _ := specMap["path"].(string)
 		if field != "" {
-			if val, exists := doc[field]; exists {
-				delete(doc, field)
-				setIngestPath(doc, field, val)
-				mutated = true
+			targetMap := doc
+			if subPath != "" {
+				if subAny, exists := getIngestPath(doc, subPath); exists {
+					if sm, ok := subAny.(map[string]any); ok {
+						targetMap = sm
+					} else {
+						targetMap = nil
+					}
+				} else {
+					targetMap = nil
+				}
+			}
+			if targetMap != nil {
+				if val, exists := targetMap[field]; exists {
+					delete(targetMap, field)
+					setIngestPath(targetMap, field, val)
+					mutated = true
+				}
 			}
 		}
 	case "urldecode":
@@ -1667,6 +1911,8 @@ func executeSingleIngestProcessor(doc map[string]any, pMap map[string]any) (muta
 					setIngestPath(doc, target, decoded)
 					mutated = true
 				}
+			} else if isExplicitIgnoreMissingFalse(specMap) {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
 		}
 	case "bytes":
@@ -1683,6 +1929,8 @@ func executeSingleIngestProcessor(doc map[string]any, pMap map[string]any) (muta
 				}
 				setIngestPath(doc, target, bVal)
 				mutated = true
+			} else if isExplicitIgnoreMissingFalse(specMap) {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
 		}
 	case "html_strip":
@@ -1697,12 +1945,19 @@ func executeSingleIngestProcessor(doc map[string]any, pMap map[string]any) (muta
 					setIngestPath(doc, target, reHTMLTags.ReplaceAllString(strVal, ""))
 					mutated = true
 				}
+			} else if isExplicitIgnoreMissingFalse(specMap) {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
 		}
 	case "foreach":
 		field, _ := specMap["field"].(string)
-		subProc, _ := specMap["processor"].(map[string]any)
-		if field != "" && subProc != nil {
+		var subProcs []any
+		if subProc, ok := specMap["processor"].(map[string]any); ok && subProc != nil {
+			subProcs = []any{subProc}
+		} else if sps, ok := specMap["processors"].([]any); ok {
+			subProcs = sps
+		}
+		if field != "" && len(subProcs) > 0 {
 			if val, exists := getIngestPath(doc, field); exists {
 				if arr, ok := val.([]any); ok {
 					outArr := make([]any, len(arr))
@@ -1713,18 +1968,24 @@ func executeSingleIngestProcessor(doc map[string]any, pMap map[string]any) (muta
 						}
 						ingestMeta["_value"] = elem
 						doc["_ingest"] = ingestMeta
-						_, subDropped, _, _, _, subErr := executeSingleIngestProcessor(doc, subProc)
+						_, subDropped, subErr := runIngestProcessorList(s, doc, subProcs, depth+1, trace)
 						if subErr != nil {
 							return mutated, false, procType, procTag, specMap, subErr
 						}
 						if subDropped {
 							return mutated, true, procType, procTag, specMap, nil
 						}
-						outArr[idx] = ingestMeta["_value"]
+						if curIngest, ok := doc["_ingest"].(map[string]any); ok {
+							outArr[idx] = curIngest["_value"]
+						} else {
+							outArr[idx] = elem
+						}
 					}
 					setIngestPath(doc, field, outArr)
 					mutated = true
 				}
+			} else if isExplicitIgnoreMissingFalse(specMap) {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
 		}
 	case "script":
@@ -1770,16 +2031,58 @@ func executeSingleIngestProcessor(doc map[string]any, pMap map[string]any) (muta
 	return mutated, false, procType, procTag, specMap, nil
 }
 
-func runIngestProcessorList(doc map[string]any, procs []any) (bool, bool, error) {
+func snapshotIngestDoc(doc map[string]any) map[string]any {
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		return map[string]any{}
+	}
+	var cp map[string]any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	_ = dec.Decode(&cp)
+	delete(cp, "_ingest")
+	if cp == nil {
+		cp = map[string]any{}
+	}
+	return cp
+}
+
+func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth int, trace *[]map[string]any) (bool, bool, error) {
 	mutated := false
 	for _, p := range procs {
 		pMap, ok := p.(map[string]any)
 		if !ok {
 			continue
 		}
-		m, dropped, procType, procTag, specMap, procErr := executeSingleIngestProcessor(doc, pMap)
+		m, dropped, procType, procTag, specMap, procErr := executeSingleIngestProcessor(s, doc, pMap, depth, trace)
 		if m {
 			mutated = true
+		}
+		if trace != nil && procType != "" && procType != "pipeline" {
+			entry := map[string]any{
+				"processor_type": procType,
+			}
+			if procTag != "" {
+				entry["tag"] = procTag
+			}
+			if procErr != nil {
+				entry["status"] = "error"
+				entry["error"] = map[string]any{
+					"type":   "illegal_argument_exception",
+					"reason": procErr.Error(),
+				}
+			} else if dropped {
+				entry["status"] = "dropped"
+			} else {
+				entry["status"] = "success"
+				entry["doc"] = map[string]any{
+					"_index":   "_index",
+					"_version": "-3",
+					"_id":      "0",
+					"_source":  snapshotIngestDoc(doc),
+				}
+			}
+			*trace = append(*trace, entry)
 		}
 		if dropped {
 			return mutated, true, nil
@@ -1806,7 +2109,7 @@ func runIngestProcessorList(doc map[string]any, procs []any) (bool, bool, error)
 				ingestMeta["on_failure_processor_tag"] = procTag
 				doc["_ingest"] = ingestMeta
 				mutated = true
-				subMut, subDropped, subErr := runIngestProcessorList(doc, onFail)
+				subMut, subDropped, subErr := runIngestProcessorList(s, doc, onFail, depth+1, trace)
 				if subMut {
 					mutated = true
 				}
@@ -1824,23 +2127,34 @@ func runIngestProcessorList(doc map[string]any, procs []any) (bool, bool, error)
 	return mutated, false, nil
 }
 
-func applyIngestPipelineSpec(pipe map[string]any, raw json.RawMessage) (json.RawMessage, bool, error) {
+func applyIngestPipelineSpecWithServer(s *Server, pipe map[string]any, raw json.RawMessage) (json.RawMessage, bool, error) {
+	out, dropped, _, err := applyIngestPipelineSpecVerbose(s, pipe, raw, false)
+	return out, dropped, err
+}
+
+func applyIngestPipelineSpecVerbose(s *Server, pipe map[string]any, raw json.RawMessage, verbose bool) (json.RawMessage, bool, []map[string]any, error) {
 	if pipe == nil || len(bytes.TrimSpace(raw)) == 0 {
-		return raw, false, nil
+		return raw, false, nil, nil
 	}
 	procs, _ := pipe["processors"].([]any)
 	if len(procs) == 0 {
-		return raw, false, nil
+		return raw, false, nil, nil
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	var doc map[string]any
 	if err := dec.Decode(&doc); err != nil || doc == nil {
-		return raw, false, err
+		return raw, false, nil, err
 	}
-	mutated, dropped, procErr := runIngestProcessorList(doc, procs)
+	var trace []map[string]any
+	var tracePtr *[]map[string]any
+	if verbose {
+		trace = make([]map[string]any, 0)
+		tracePtr = &trace
+	}
+	mutated, dropped, procErr := runIngestProcessorList(s, doc, procs, 0, tracePtr)
 	if dropped {
-		return json.RawMessage(`{}`), true, nil
+		return json.RawMessage(`{}`), true, trace, nil
 	}
 	if procErr != nil {
 		if pipeOnFail, ok := pipe["on_failure"].([]any); ok && len(pipeOnFail) > 0 {
@@ -1851,28 +2165,28 @@ func applyIngestPipelineSpec(pipe map[string]any, raw json.RawMessage) (json.Raw
 			ingestMeta["on_failure_message"] = procErr.Error()
 			doc["_ingest"] = ingestMeta
 			mutated = true
-			subMut, subDropped, subErr := runIngestProcessorList(doc, pipeOnFail)
+			subMut, subDropped, subErr := runIngestProcessorList(s, doc, pipeOnFail, 1, tracePtr)
 			if subMut {
 				mutated = true
 			}
 			if subDropped {
-				return json.RawMessage(`{}`), true, nil
+				return json.RawMessage(`{}`), true, trace, nil
 			}
 			procErr = subErr
 		}
 		if procErr != nil {
-			return raw, false, procErr
+			return raw, false, trace, procErr
 		}
 	}
 	delete(doc, "_ingest")
 	if !mutated {
-		return raw, false, nil
+		return raw, false, trace, nil
 	}
 	out, err := json.Marshal(doc)
 	if err != nil {
-		return raw, false, err
+		return raw, false, trace, err
 	}
-	return json.RawMessage(out), false, nil
+	return json.RawMessage(out), false, trace, nil
 }
 
 // handleSimulateIngestPipeline implements `POST /_ingest/pipeline/_simulate` and `POST /_ingest/pipeline/{id}/_simulate`.
@@ -1909,6 +2223,8 @@ func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	vParam := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("verbose")))
+	verbose := vParam == "true" || vParam == "1"
 	docsOut := make([]map[string]any, 0, len(req.Docs))
 	nowISO := time.Now().UTC().Format(time.RFC3339Nano)
 	for i, item := range req.Docs {
@@ -1932,7 +2248,18 @@ func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Req
 		if err != nil {
 			rawSrc = []byte(`{}`)
 		}
-		outBytes, dropped, procErr := applyIngestPipelineSpec(pipe, rawSrc)
+		outBytes, dropped, trace, procErr := applyIngestPipelineSpecVerbose(s, pipe, rawSrc, verbose)
+		if verbose {
+			for _, te := range trace {
+				if dMap, ok := te["doc"].(map[string]any); ok {
+					dMap["_index"] = idx
+					dMap["_id"] = id
+					dMap["_ingest"] = map[string]any{"timestamp": nowISO}
+				}
+			}
+			docsOut = append(docsOut, map[string]any{"processor_results": trace})
+			continue
+		}
 		if procErr != nil {
 			docsOut = append(docsOut, map[string]any{
 				"error": map[string]any{
@@ -1978,6 +2305,9 @@ func getIngestPath(doc map[string]any, path string) (any, bool) {
 	}
 	curr := doc
 	for i := 0; i < len(segs)-1; i++ {
+		if flatVal, flatOk := curr[strings.Join(segs[i:], ".")]; flatOk {
+			return flatVal, true
+		}
 		next, ok := curr[segs[i]].(map[string]any)
 		if !ok {
 			return nil, false
@@ -1997,6 +2327,7 @@ func setIngestPath(doc map[string]any, path string, val any) {
 	delete(doc, path)
 	curr := doc
 	for i := 0; i < len(segs)-1; i++ {
+		delete(curr, strings.Join(segs[i:], "."))
 		next, ok := curr[segs[i]].(map[string]any)
 		if !ok {
 			next = make(map[string]any)
@@ -2015,6 +2346,10 @@ func deleteIngestPath(doc map[string]any, path string) {
 	}
 	curr := doc
 	for i := 0; i < len(segs)-1; i++ {
+		if _, flatOk := curr[strings.Join(segs[i:], ".")]; flatOk {
+			delete(curr, strings.Join(segs[i:], "."))
+			return
+		}
 		next, ok := curr[segs[i]].(map[string]any)
 		if !ok {
 			return
@@ -2134,6 +2469,9 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Conflicts == "" {
 		body.Conflicts = r.URL.Query().Get("conflicts")
+	}
+	if body.Dest.Pipeline == "" {
+		body.Dest.Pipeline = r.URL.Query().Get("pipeline")
 	}
 
 	var srcPattern string
@@ -2268,6 +2606,13 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				if destSchema == nil && len(sampleDocs) < 16 {
 					sampleDocs = append(sampleDocs, docSource)
 				}
+			}
+			if len(prepared) == 0 {
+				searchAfter = []any{hits[len(hits)-1].ID}
+				if len(hits) < fetchSize || (maxDocs > 0 && totalMatched >= maxDocs) {
+					break
+				}
+				continue
 			}
 			if destSchema == nil {
 				destSchema = s.ensureWritableIndexSchemaWithDocs(r.Context(), destIndex, sampleDocs)
