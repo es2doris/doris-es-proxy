@@ -831,12 +831,18 @@ func (t *Transpiler) compileDisMax(dm *esast.DisMaxQuery, scoring bool, nctx *ne
 	usesFT := false
 	for i := range dm.Queries {
 		c := t.CompileQuery(&dm.Queries[i], scoring, nctx)
+		if c.WhereSQL == "FALSE" && len(dm.Queries) > 1 {
+			continue
+		}
 		disjuncts = append(disjuncts, fmt.Sprintf("(%s)", c.WhereSQL))
 		safeDisjuncts = append(safeDisjuncts, fmt.Sprintf("(%s)", c.EffectiveSafeWhere()))
 		if scoring {
 			scores = append(scores, c.ScoreSQL)
 		}
 		usesFT = usesFT || c.UsesFulltextMatch
+	}
+	if len(disjuncts) == 0 {
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
 	boost := 1.0
 	if dm.Boost != nil {
@@ -1628,6 +1634,13 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 		}
 		return strings.Join(parts, " AND ")
 	}
+	if q.Exists != nil && q.Exists.Field != "" {
+		b := t.Schema.ResolveEffectiveField(q.Exists.Field, true)
+		if b.Kind == schema.StorageNestedSubfield && b.NestedPath == nestedPath && b.PrefilterArrayCol != "" {
+			arrCol := b.EffectiveArrayColumn(true)
+			return fmt.Sprintf("(`%s` IS NOT NULL AND array_size(`%s`) > 0)", arrCol, arrCol)
+		}
+	}
 	if q.Bool != nil {
 		var parts []string
 		for i := range q.Bool.Must {
@@ -1949,17 +1962,24 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 		if nctx != nil && nctx.nestedPath == b.NestedPath {
 			relPath := "$." + strings.Join(b.RelativeJSONPath, ".")
 			if b.IsMultiValued {
-				strVal := fmt.Sprintf("%v", val)
-				if _, isStr := val.(string); isStr {
-					strVal = `"` + strVal + `"`
-				}
-				likePat := quoteStr("%" + escapeLikeLiteral(strVal) + "%")
 				extracted := fmt.Sprintf("json_extract_string(%s, %s)", nctx.elemVar, quoteStr(relPath))
 				rawLit := quoteStr(fmt.Sprintf("%v", val))
-				if caseInsensitive || effLower {
-					return fmt.Sprintf("(lower(%s) = lower(%s) OR lower(%s) LIKE lower(%s))", extracted, rawLit, extracted, likePat)
+				_, isStr := val.(string)
+				if isStr || b.DorisType == schema.DorisString {
+					strVal := `"` + fmt.Sprintf("%v", val) + `"`
+					likePat := quoteStr("%" + escapeLikeLiteral(strVal) + "%")
+					if caseInsensitive || effLower {
+						return fmt.Sprintf("(lower(%s) = lower(%s) OR lower(%s) LIKE lower(%s))", extracted, rawLit, extracted, likePat)
+					}
+					return fmt.Sprintf("(%s = %s OR %s LIKE %s)", extracted, rawLit, extracted, likePat)
 				}
-				return fmt.Sprintf("(%s = %s OR %s LIKE %s)", extracted, rawLit, extracted, likePat)
+				escVal := escapeLikeLiteral(fmt.Sprintf("%v", val))
+				p1 := quoteStr("[" + escVal + "]")
+				p2 := quoteStr("[" + escVal + ",%")
+				p3 := quoteStr("%," + escVal + ",%")
+				p4 := quoteStr("%," + escVal + "]")
+				return fmt.Sprintf("(%s = %s OR %s LIKE %s OR %s LIKE %s OR %s LIKE %s OR %s LIKE %s)",
+					extracted, rawLit, extracted, p1, extracted, p2, extracted, p3, extracted, p4)
 			}
 			if caseInsensitive || effLower {
 				return fmt.Sprintf("lower(json_extract_string(%s, %s)) = lower(%s)", nctx.elemVar, quoteStr(relPath), quoteStr(fmt.Sprintf("%v", val)))
@@ -2837,10 +2857,14 @@ func (t *Transpiler) appendAggBranches(
 							nWhere = fmt.Sprintf("%s`_nel` IS NOT NULL", wherePrefix)
 						}
 					}
+					havingClause := ""
+					if fn == "AVG" || fn == "MIN" || fn == "MAX" {
+						havingClause = fmt.Sprintf(" HAVING COUNT(%s) > 0", numExpr)
+					}
 					*branches = append(*branches, fmt.Sprintf(
 						"SELECT %s AS `_agg_name`, '_metric' AS `_bucket_key`, CAST(COALESCE(%s(%s), 0) AS DOUBLE) AS `_doc_count` "+
-							"FROM `base_matched` LATERAL VIEW EXPLODE(`%s`) `_nt` AS `_nel` WHERE %s",
-						quoteStr(subFull), fn, numExpr, corrCol, nWhere,
+							"FROM `base_matched` LATERAL VIEW EXPLODE(`%s`) `_nt` AS `_nel` WHERE %s%s",
+						quoteStr(subFull), fn, numExpr, corrCol, nWhere, havingClause,
 					))
 				case subSpec.EffectiveStats() != nil:
 					statsSpec := subSpec.EffectiveStats()
@@ -6185,10 +6209,14 @@ func (t *Transpiler) appendMetricAggBranchWithMissingAndScript(branches *[]strin
 				valExpr = scriptExpr
 			}
 		}
+		havingClause := ""
+		if sqlFunc == "AVG" || sqlFunc == "MIN" || sqlFunc == "MAX" {
+			havingClause = fmt.Sprintf(" HAVING COUNT(%s) > 0", valExpr)
+		}
 		*branches = append(*branches, fmt.Sprintf(
 			"SELECT %s AS `_agg_name`, '_metric' AS `_bucket_key`, CAST(COALESCE(%s(%s), 0) AS DOUBLE) AS `_doc_count` "+
-				"FROM `base_matched` LATERAL VIEW EXPLODE(%s) `_nt` AS `_nel`%s",
-			quoteStr(fullAggName), sqlFunc, valExpr, explodeExpr, wClause,
+				"FROM `base_matched` LATERAL VIEW EXPLODE(%s) `_nt` AS `_nel`%s%s",
+			quoteStr(fullAggName), sqlFunc, valExpr, explodeExpr, wClause, havingClause,
 		))
 		return
 	}
@@ -6216,10 +6244,14 @@ func (t *Transpiler) appendMetricAggBranchWithMissingAndScript(branches *[]strin
 	if extraWhere != "" {
 		wClause = " WHERE " + extraWhere
 	}
+	havingClause := ""
+	if sqlFunc == "AVG" || sqlFunc == "MIN" || sqlFunc == "MAX" {
+		havingClause = fmt.Sprintf(" HAVING COUNT(%s) > 0", col)
+	}
 	*branches = append(*branches, fmt.Sprintf(
 		"SELECT %s AS `_agg_name`, '_metric' AS `_bucket_key`, CAST(COALESCE(%s(%s), 0) AS DOUBLE) AS `_doc_count` "+
-			"FROM `base_matched`%s",
-		quoteStr(fullAggName), sqlFunc, col, wClause,
+			"FROM `base_matched`%s%s",
+		quoteStr(fullAggName), sqlFunc, col, wClause, havingClause,
 	))
 }
 

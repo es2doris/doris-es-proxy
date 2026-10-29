@@ -206,10 +206,16 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 				tb.IsMultiValued = true
 				s.Fields[target] = tb
 			} else if tb.ESType == "text" && tb.KeywordCompanion != "" {
-				if kwB, hasKw := s.Fields[target+".keyword"]; hasKw && kwB.Kind == StoragePromotedScalar {
-					kwB.Kind = StoragePromotedArray
-					kwB.IsMultiValued = true
-					s.Fields[target+".keyword"] = kwB
+				if kwB, hasKw := s.Fields[target+".keyword"]; hasKw {
+					switch kwB.Kind {
+					case StoragePromotedScalar:
+						kwB.Kind = StoragePromotedArray
+						kwB.IsMultiValued = true
+						s.Fields[target+".keyword"] = kwB
+					case StorageNestedSubfield:
+						kwB.IsMultiValued = true
+						s.Fields[target+".keyword"] = kwB
+					}
 				}
 			}
 		}

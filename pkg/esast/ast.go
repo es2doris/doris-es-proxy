@@ -1032,6 +1032,7 @@ type AggSpec struct {
 	PercentilesBucket     *PercentilesBucketAggSpec `json:"percentiles_bucket,omitempty"`
 	BucketSelector        *BucketSelectorAggSpec    `json:"bucket_selector,omitempty"`
 	BucketScript          *BucketSelectorAggSpec    `json:"bucket_script,omitempty"`
+	ScriptedMetric        *ScriptedMetricAggSpec    `json:"scripted_metric,omitempty"`
 	Aggs                  map[string]AggSpec        `json:"aggs,omitempty"`
 	Aggregations          map[string]AggSpec        `json:"aggregations,omitempty"`
 }
@@ -1186,13 +1187,23 @@ type RateAggSpec struct {
 
 // MovingAvgAggSpec models a `moving_avg` or `moving_fn` pipeline aggregation.
 type MovingAvgAggSpec struct {
-	BucketsPath any    `json:"buckets_path,omitempty"`
-	Window      int    `json:"window,omitempty"`
-	Model       string `json:"model,omitempty"`
-	Script      any    `json:"script,omitempty"`
-	GapPolicy   string `json:"gap_policy,omitempty"`
-	Format      string `json:"format,omitempty"`
-	Shift       *int   `json:"shift,omitempty"`
+	BucketsPath any            `json:"buckets_path,omitempty"`
+	Window      int            `json:"window,omitempty"`
+	Model       string         `json:"model,omitempty"`
+	Script      any            `json:"script,omitempty"`
+	GapPolicy   string         `json:"gap_policy,omitempty"`
+	Format      string         `json:"format,omitempty"`
+	Shift       *int           `json:"shift,omitempty"`
+	Settings    map[string]any `json:"settings,omitempty"`
+}
+
+// ScriptedMetricAggSpec models a `scripted_metric` aggregation.
+type ScriptedMetricAggSpec struct {
+	InitScript    any            `json:"init_script,omitempty"`
+	MapScript     any            `json:"map_script,omitempty"`
+	CombineScript any            `json:"combine_script,omitempty"`
+	ReduceScript  any            `json:"reduce_script,omitempty"`
+	Params        map[string]any `json:"params,omitempty"`
 }
 
 func (m *MovingAvgAggSpec) EffectivePath() string {
