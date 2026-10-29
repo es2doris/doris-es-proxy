@@ -541,7 +541,19 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 	}
 	slice, ok := iterVal.([]any)
 	if !ok {
-		return nil
+		if mVal, isMap := iterVal.(map[string]any); isMap {
+			keys := make([]string, 0, len(mVal))
+			for k := range mVal {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			slice = make([]any, len(keys))
+			for i, k := range keys {
+				slice[i] = map[string]any{"key": k, "value": mVal[k]}
+			}
+		} else {
+			return nil
+		}
 	}
 	// Copy slice header + elements so in-loop mutations do not mutate the iteration snapshot
 	snapshot := make([]any, len(slice))
@@ -932,6 +944,17 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 	// 3. Check `.add(...)` / `.set(idx, val)` on array
 	if m := reArrayAdd.FindStringSubmatch(stmt); m != nil {
 		arrPath := strings.Split(m[1], ".")
+		if addArgs := splitTopLevelCommaPainless(m[2]); len(addArgs) == 2 {
+			idxVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(addArgs[0]), params)
+			if err != nil {
+				return err
+			}
+			valToAdd, err := evalRHSExpr(sourceMap, strings.TrimSpace(addArgs[1]), params)
+			if err != nil {
+				return err
+			}
+			return insertIntoSliceAtPath(sourceMap, arrPath, idxVal, valToAdd)
+		}
 		valToAdd, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[2]), params)
 		if err != nil {
 			return err
@@ -1059,6 +1082,21 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		arrPath := strings.Split(m[1], ".")
 		rootVar := decodeBracketSeg(arrPath[0])
 		if _, ok := params[rootVar]; ok {
+			if addArgs := splitTopLevelCommaPainless(m[2]); len(addArgs) == 2 {
+				idxVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(addArgs[0]), params)
+				if err != nil {
+					return err
+				}
+				valToAdd, err := evalRHSExpr(sourceMap, strings.TrimSpace(addArgs[1]), params)
+				if err != nil {
+					return err
+				}
+				if err := insertIntoSliceAtPath(params, arrPath, idxVal, valToAdd); err != nil {
+					return err
+				}
+				syncLocalVarAlias(sourceMap, params, rootVar)
+				return nil
+			}
 			valToAdd, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[2]), params)
 			if err != nil {
 				return err
@@ -1645,7 +1683,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		if err != nil {
 			return nil, err
 		}
-		if leftVal != nil && leftVal != false && leftVal != "" {
+		if leftVal != nil {
 			return leftVal, nil
 		}
 		return evalRHSExprDepth(sourceMap, strings.TrimSpace(rhs[elvisIdx+2:]), params, depth+1)
@@ -1727,8 +1765,8 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		return applyArithmetic(int64(0), innerVal, false), nil
 	}
 
-	// Check trailing zero-arg methods `.toLowerCase()`, `.toUpperCase()`, `.trim()`, `.length()`, `.size()`, `.keySet()`, `.values()`, `.toString()`
-	for _, mSuffix := range []string{".toLowerCase()", ".toUpperCase()", ".trim()", ".length()", ".size()", ".keySet()", ".values()", ".toString()"} {
+	// Check trailing zero-arg methods `.toLowerCase()`, `.toUpperCase()`, `.trim()`, `.length()`, `.size()`, `.keySet()`, `.values()`, `.entrySet()`, `.getKey()`, `.getValue()`, `.toString()`
+	for _, mSuffix := range []string{".toLowerCase()", ".toUpperCase()", ".trim()", ".length()", ".size()", ".keySet()", ".values()", ".entrySet()", ".getKey()", ".getValue()", ".toString()"} {
 		if strings.HasSuffix(rhs, mSuffix) {
 			recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:len(rhs)-len(mSuffix)], "?"))
 			if (mSuffix == ".length()" || mSuffix == ".size()") && (strings.HasPrefix(recExpr, "doc.") || strings.HasPrefix(recExpr, "doc?.")) &&
@@ -1780,6 +1818,30 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					return tv, nil
 				}
 				return []any{}, nil
+			case ".entrySet()":
+				if tv, ok := recVal.(map[string]any); ok {
+					keys := make([]string, 0, len(tv))
+					for k := range tv {
+						keys = append(keys, k)
+					}
+					sort.Strings(keys)
+					out := make([]any, len(keys))
+					for i, k := range keys {
+						out[i] = map[string]any{"key": k, "value": tv[k]}
+					}
+					return out, nil
+				}
+				return []any{}, nil
+			case ".getKey()":
+				if tv, ok := recVal.(map[string]any); ok {
+					return tv["key"], nil
+				}
+				return nil, nil
+			case ".getValue()":
+				if tv, ok := recVal.(map[string]any); ok {
+					return tv["value"], nil
+				}
+				return nil, nil
 			case ".length()", ".size()":
 				switch tv := recVal.(type) {
 				case string:
@@ -2721,6 +2783,30 @@ func applyMulDiv(a, b any, op byte) any {
 
 func applyArithmetic(a, b any, isAdd bool) any {
 	if isAdd {
+		if aSlice, ok := a.([]any); ok {
+			if bSlice, ok2 := b.([]any); ok2 {
+				out := make([]any, 0, len(aSlice)+len(bSlice))
+				out = append(out, aSlice...)
+				out = append(out, bSlice...)
+				return out
+			}
+			out := make([]any, 0, len(aSlice)+1)
+			out = append(out, aSlice...)
+			out = append(out, b)
+			return out
+		}
+		if aMap, ok := a.(map[string]any); ok {
+			if bMap, ok2 := b.(map[string]any); ok2 {
+				out := make(map[string]any, len(aMap)+len(bMap))
+				for k, v := range aMap {
+					out[k] = v
+				}
+				for k, v := range bMap {
+					out[k] = v
+				}
+				return out
+			}
+		}
 		_, aIsStr := a.(string)
 		_, bIsStr := b.(string)
 		if aIsStr || bIsStr {
@@ -3311,6 +3397,32 @@ func setSliceElementAtPath(root map[string]any, arrPath []string, idxVal any, ne
 	next[idx] = newVal
 	setValueAtPath(root, arrPath, next)
 	return prev
+}
+
+func insertIntoSliceAtPath(root map[string]any, path []string, idxVal any, val any) error {
+	existing, ok := resolveParamPath(root, path).([]any)
+	if !ok {
+		existing = []any{}
+	}
+	if len(existing) >= MaxPainlessSliceItems {
+		return fmt.Errorf("painless array at %q exceeded maximum size (%d)", strings.Join(path, "."), MaxPainlessSliceItems)
+	}
+	f, fOk := toFloat64(idxVal)
+	idx := len(existing)
+	if fOk {
+		idx = int(f)
+		if idx < 0 {
+			idx = 0
+		} else if idx > len(existing) {
+			idx = len(existing)
+		}
+	}
+	next := make([]any, 0, len(existing)+1)
+	next = append(next, existing[:idx]...)
+	next = append(next, val)
+	next = append(next, existing[idx:]...)
+	setValueAtPath(root, path, next)
+	return nil
 }
 
 func appendToSlice(root map[string]any, path []string, val any) error {

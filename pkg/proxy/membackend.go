@@ -436,9 +436,9 @@ func (m *MemoryBackend) QueryAggs(_ context.Context, sqlStr string) ([]AggRow, e
 var (
 	reAggArrayExplode        = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\((.+?) AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_t` AS `_elem` WHERE (?:\\((.+)\\) AND )?`_elem` IS NOT NULL GROUP BY (?:`_elem`|`_bucket_key`) ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggArrayExplodeMissing = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\(CAST\\((.+?) AS STRING\\), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(CASE WHEN `([^`]+)` IS NULL.+?\\) `_t` AS `_elem`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
-	reAggScalarTerms         = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\((.+?) AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (?:\\((.+)\\) AND )?(?:`[^`]+`|CAST\\([^)]+\\)|`_doc`\\[[^\\]]+\\]|'[^']*') IS NOT NULL GROUP BY .+? ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
+	reAggScalarTerms         = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\((.+?) AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (?:\\((.+)\\) AND )?(?:(?:LOWER|UPPER|TRIM|CONCAT)\\(.+\\)|`[^`]+`|CAST\\([^)]+\\)|`_doc`\\[[^\\]]+\\]|'[^']*') IS NOT NULL GROUP BY .+? ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggScalarTermsMissing  = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\(CAST\\((.+?) AS STRING\\), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
-	reAggNestedTerms         = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, json_extract_string\\(`_nel`, '\\$\\.([^']+)'\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_nt` AS `_nel` WHERE (?:\\((.+)\\) AND )?json_extract_string\\(`_nel`, '\\$\\.[^']+'\\) IS NOT NULL GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
+	reAggNestedTerms         = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (?:json_extract_string\\(`_nel`, '\\$\\.([^']+)'\\)|CAST\\((.+?) AS STRING\\)) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_nt` AS `_nel` WHERE (?:\\((.+)\\) AND )?(?:json_extract_string\\(`_nel`, '\\$\\.[^']+'\\)|CAST\\(.+? AS STRING\\)) IS NOT NULL GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggNestedTermsMissing  = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\(json_extract_string\\(`_nel`, '\\$\\.([^']+)'\\), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\((?:CASE WHEN )?`([^`]+)`(?: IS NULL.+?)?\\) `_nt` AS `_nel`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggNestedMetric        = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_metric|_nested_doc_count|_stats_[a-z_]+)' AS `_bucket_key`, CAST\\((?:COALESCE\\((AVG|SUM|MIN|MAX|COUNT|STDDEV_POP)\\((.+?)\\), 0\\)|(COUNT)\\((DISTINCT )?(.+?)\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched` LATERAL VIEW EXPLODE\\(.+?\\) `_(?:nt|t)` AS `_(?:nel|elem)`)(?: WHERE (.+))?$")
 	reAggFilter              = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_filter|_global|_reverse_nested|_sampler)' AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
@@ -569,15 +569,25 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 	}
 
 	if m := reAggNestedTerms.FindStringSubmatch(branch); m != nil {
-		aggName, relPath, corrCol, extraWhere := m[1], m[2], m[3], m[4]
-		limit, _ := strconv.Atoi(m[5])
+		aggName, relPath, scriptExpr, corrCol, extraWhere := m[1], m[2], m[3], m[4], m[5]
+		limit, _ := strconv.Atoi(m[6])
 		counts := make(map[string]int64)
 		for _, row := range baseRows {
 			if extraWhere != "" && !evalWhereExpr(row, extraWhere) {
 				continue
 			}
 			for _, elemJSON := range toStringSlice(row[corrCol]) {
-				val := extractJSONPathFromStr(elemJSON, strings.Split(relPath, "."))
+				var val any
+				if scriptExpr != "" {
+					cp := make(map[string]any, len(row)+1)
+					for k, v := range row {
+						cp[k] = v
+					}
+					cp["_nel"] = elemJSON
+					val = resolveColumnValue(cp, scriptExpr)
+				} else {
+					val = extractJSONPathFromStr(elemJSON, strings.Split(relPath, "."))
+				}
 				if val != nil {
 					switch v := val.(type) {
 					case []any:
@@ -2336,11 +2346,50 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 		return nil
 	}
-	if (strings.HasPrefix(colExpr, "array_map(_x -> CAST(_x AS DOUBLE), ") || strings.HasPrefix(colExpr, "array_map(_x -> CAST(_x AS BIGINT), ")) && strings.HasSuffix(colExpr, ")") {
-		commaIdx := strings.LastIndexByte(colExpr, ',')
-		if commaIdx > 0 {
-			inner := strings.TrimSpace(colExpr[commaIdx+1 : len(colExpr)-1])
-			return resolveColumnValue(row, inner)
+	if strings.HasPrefix(colExpr, "array_map(_x -> CAST(_x AS DOUBLE), ") && strings.HasSuffix(colExpr, ")") {
+		inner := strings.TrimSpace(colExpr[len("array_map(_x -> CAST(_x AS DOUBLE), ") : len(colExpr)-1])
+		return resolveColumnValue(row, inner)
+	}
+	if strings.HasPrefix(colExpr, "array_map(_x -> CAST(_x AS BIGINT), ") && strings.HasSuffix(colExpr, ")") {
+		inner := strings.TrimSpace(colExpr[len("array_map(_x -> CAST(_x AS BIGINT), ") : len(colExpr)-1])
+		return resolveColumnValue(row, inner)
+	}
+	if strings.HasPrefix(colExpr, "array_map(_el -> json_extract_string(_el, ") && strings.HasSuffix(colExpr, ")") {
+		args := splitTopLevelArgs(colExpr[len("array_map(") : len(colExpr)-1])
+		if len(args) == 2 {
+			lambda := strings.TrimSpace(args[0])
+			if strings.HasPrefix(lambda, "_el -> json_extract_string(_el,") && strings.HasSuffix(lambda, ")") {
+				pathLit := strings.TrimSpace(lambda[len("_el -> json_extract_string(_el,") : len(lambda)-1])
+				relPath := strings.TrimPrefix(unquoteSQLLiteral(pathLit), "$.")
+				var out []any
+				for _, elemJSON := range toStringSlice(resolveColumnValue(row, strings.TrimSpace(args[1]))) {
+					if v := extractJSONPathFromStr(elemJSON, strings.Split(relPath, ".")); v != nil {
+						out = append(out, v)
+					}
+				}
+				if len(out) == 0 {
+					return nil
+				}
+				return out
+			}
+		}
+	}
+	if strings.HasPrefix(colExpr, "array_filter(_el -> ") && strings.HasSuffix(colExpr, ")") {
+		args := splitTopLevelArgs(colExpr[len("array_filter(") : len(colExpr)-1])
+		if len(args) == 2 {
+			condSQL := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(args[0]), "_el ->"))
+			var out []string
+			for _, elemJSON := range toStringSlice(resolveColumnValue(row, strings.TrimSpace(args[1]))) {
+				cp := make(map[string]any, len(row)+1)
+				for k, v := range row {
+					cp[k] = v
+				}
+				cp["_el"] = elemJSON
+				if evalWhereExpr(cp, condSQL) {
+					out = append(out, elemJSON)
+				}
+			}
+			return out
 		}
 	}
 	if strings.HasPrefix(colExpr, "array_map(_x -> IPV4_STRING_TO_NUM_OR_NULL(_x), ") && strings.HasSuffix(colExpr, ")") {
@@ -2355,6 +2404,25 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			return nil
 		}
 		return out
+	}
+	if strings.HasPrefix(colExpr, "array_median(") && strings.HasSuffix(colExpr, ")") {
+		inner := strings.TrimSpace(colExpr[len("array_median(") : len(colExpr)-1])
+		elems := toStringSlice(resolveColumnValue(row, inner))
+		var nums []float64
+		for _, e := range elems {
+			if f, ok := toFloat(e); ok {
+				nums = append(nums, f)
+			}
+		}
+		if len(nums) == 0 {
+			return nil
+		}
+		sort.Float64s(nums)
+		mid := len(nums) / 2
+		if len(nums)%2 == 1 {
+			return nums[mid]
+		}
+		return (nums[mid-1] + nums[mid]) / 2.0
 	}
 	if (strings.HasPrefix(colExpr, "array_min(") || strings.HasPrefix(colExpr, "array_max(") || strings.HasPrefix(colExpr, "array_avg(") || strings.HasPrefix(colExpr, "array_sum(")) && strings.HasSuffix(colExpr, ")") {
 		fn := colExpr[:len("array_min")]
@@ -2406,12 +2474,20 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 	if strings.HasPrefix(colExpr, "COALESCE(") && strings.HasSuffix(colExpr, ")") {
 		inner := colExpr[len("COALESCE(") : len(colExpr)-1]
 		args := splitTopLevelArgs(inner)
-		if len(args) == 2 {
-			if v := resolveColumnValue(row, args[0]); v != nil && fmt.Sprintf("%v", v) != "" {
+		for i, rawArg := range args {
+			arg := strings.TrimSpace(rawArg)
+			if v := resolveColumnValue(row, arg); v != nil && fmt.Sprintf("%v", v) != "" {
 				return v
 			}
-			return parseSQLLiteralValue(strings.TrimSpace(args[1]))
+			if i == len(args)-1 || strings.HasPrefix(arg, "'") {
+				if lit := parseSQLLiteralValue(arg); lit != nil && fmt.Sprintf("%v", lit) != "" {
+					return lit
+				}
+			} else if f, err := strconv.ParseFloat(arg, 64); err == nil {
+				return f
+			}
 		}
+		return nil
 	}
 	if strings.HasPrefix(colExpr, "IPV4_STRING_TO_NUM_OR_NULL(") && strings.HasSuffix(colExpr, ")") {
 		inner := colExpr[len("IPV4_STRING_TO_NUM_OR_NULL(") : len(colExpr)-1]
@@ -2592,6 +2668,9 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 				}
 			}
 			if isArithmeticSQLExpr(inner) {
+				if hasUnwrappedNullColumnRef(row, inner) {
+					return nil
+				}
 				return evalNumericExpr(row, inner)
 			}
 			return nil
@@ -2609,6 +2688,9 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 				}
 			}
 			if isArithmeticSQLExpr(inner) {
+				if hasUnwrappedNullColumnRef(row, inner) {
+					return nil
+				}
 				return int64(evalNumericExpr(row, inner))
 			}
 			return nil
@@ -2630,9 +2712,73 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 	}
 	if isArithmeticSQLExpr(colExpr) {
+		if hasUnwrappedNullColumnRef(row, colExpr) {
+			return nil
+		}
 		return evalNumericExpr(row, colExpr)
 	}
 	return nil
+}
+
+var (
+	reUnwrappedBacktickCol = regexp.MustCompile("`([a-zA-Z0-9_]+)`")
+	reUnwrappedJSONExtract = regexp.MustCompile(`json_extract_string\([^)]+\)`)
+	reUnwrappedDocExtract  = regexp.MustCompile("CAST\\(`_doc`(?:\\['[^']+'\\])+ AS [A-Z]+\\)")
+)
+
+func stripCoalesceSubexprs(expr string) string {
+	for {
+		idx := strings.Index(expr, "COALESCE(")
+		if idx < 0 {
+			return expr
+		}
+		depth := 0
+		end := -1
+		for i := idx + len("COALESCE"); i < len(expr); i++ {
+			if expr[i] == '(' {
+				depth++
+			} else if expr[i] == ')' {
+				depth--
+				if depth == 0 {
+					end = i
+					break
+				}
+			}
+		}
+		if end < 0 {
+			return expr
+		}
+		expr = expr[:idx] + "1" + expr[end+1:]
+	}
+}
+
+func hasUnwrappedNullColumnRef(row map[string]any, expr string) bool {
+	if strings.Contains(expr, "CASE ") {
+		return false
+	}
+	stripped := stripCoalesceSubexprs(expr)
+	for _, m := range reUnwrappedDocExtract.FindAllString(stripped, -1) {
+		if v := resolveColumnValue(row, m); v == nil || fmt.Sprintf("%v", v) == "" {
+			return true
+		}
+	}
+	stripped = reUnwrappedDocExtract.ReplaceAllString(stripped, "1")
+	for _, m := range reUnwrappedJSONExtract.FindAllString(stripped, -1) {
+		if v := resolveColumnValue(row, m); v == nil || fmt.Sprintf("%v", v) == "" {
+			return true
+		}
+	}
+	stripped = reUnwrappedJSONExtract.ReplaceAllString(stripped, "1")
+	for _, m := range reUnwrappedBacktickCol.FindAllStringSubmatch(stripped, -1) {
+		col := m[1]
+		if col == "_doc" {
+			continue
+		}
+		if v, ok := row[col]; !ok || v == nil || fmt.Sprintf("%v", v) == "" {
+			return true
+		}
+	}
+	return false
 }
 
 func isArithmeticSQLExpr(expr string) bool {

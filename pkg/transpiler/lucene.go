@@ -95,6 +95,9 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 
 	parsedAST := parseSimpleLuceneToAST(raw, defaultField, expandedFields, defaultOp)
 	compiled := t.CompileQuery(&parsedAST, scoring, nctx)
+	if scoring && qsq.Boost != nil && *qsq.Boost != 1.0 && compiled.ScoreSQL != "" && compiled.ScoreSQL != "0.0" {
+		compiled.ScoreSQL = fmt.Sprintf("((%s) * %.4f)", compiled.ScoreSQL, *qsq.Boost)
+	}
 	if rewrittenRaw, ok := t.rewriteDoris4SearchQuery(raw); ok && t.Opts.UseDoris4SearchFunc && nctx == nil && defaultField != "__unmatched_wildcard__" && !strings.ContainsAny(raw, "[{><~/^") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, "`n__") {
 		if len(expandedFields) > 1 {
 			if canEmitMultiFieldDoris4SearchDisjunction(rewrittenRaw, defaultOp) {
@@ -253,11 +256,12 @@ func parseSimpleLuceneToASTWithDepth(expr, defaultField string, fields []string,
 		case "NOT", "+", "-", "!":
 			prevWasClause = false
 		default:
-			if prevWasClause && defaultOp == "OR" && !strings.HasPrefix(tok, "+") && !strings.HasPrefix(tok, "-") && !strings.HasPrefix(tok, "!") {
+			isUnaryPrefix := strings.HasPrefix(tok, "+") || strings.HasPrefix(tok, "-") || strings.HasPrefix(tok, "!")
+			if prevWasClause && defaultOp == "OR" && !isUnaryPrefix {
 				normalizedTokens = append(normalizedTokens, "OR")
 				hasOR = true
 			}
-			prevWasClause = true
+			prevWasClause = !isUnaryPrefix
 		}
 		normalizedTokens = append(normalizedTokens, tok)
 	}
@@ -265,9 +269,21 @@ func parseSimpleLuceneToASTWithDepth(expr, defaultField string, fields []string,
 
 	// In Lucene grammar, `AND` binds tighter than `OR` (e.g., `a:1 AND b:2 OR c:3` -> `(a:1 AND b:2) OR c:3`).
 	if (hasAND || defaultOp == "AND") && hasOR {
+		var unaryTokens []string
+		var binaryTokens []string
+		for i, tok := range tokens {
+			isUnary := (strings.HasPrefix(tok, "+") || strings.HasPrefix(tok, "-") || strings.HasPrefix(tok, "!")) && len(tok) > 1
+			prevIsOp := i > 0 && (strings.EqualFold(tokens[i-1], "AND") || strings.EqualFold(tokens[i-1], "OR") || strings.EqualFold(tokens[i-1], "NOT"))
+			nextIsOp := i+1 < len(tokens) && (strings.EqualFold(tokens[i+1], "AND") || strings.EqualFold(tokens[i+1], "OR"))
+			if isUnary && !prevIsOp && !nextIsOp {
+				unaryTokens = append(unaryTokens, tok)
+			} else {
+				binaryTokens = append(binaryTokens, tok)
+			}
+		}
 		var orGroups [][]string
 		var curGroup []string
-		for _, tok := range tokens {
+		for _, tok := range binaryTokens {
 			if strings.EqualFold(tok, "OR") {
 				if len(curGroup) > 0 {
 					orGroups = append(orGroups, curGroup)
@@ -285,7 +301,17 @@ func parseSimpleLuceneToASTWithDepth(expr, defaultField string, fields []string,
 			for _, grp := range orGroups {
 				shoulds = append(shoulds, parseLuceneTokenSlice(grp, defaultField, fields, "AND", defaultOp, depth+1))
 			}
-			return esast.Query{Bool: &esast.BoolQuery{Should: shoulds}}
+			outBool := &esast.BoolQuery{Should: shoulds}
+			if len(unaryTokens) > 0 {
+				uQ := parseLuceneTokenSlice(unaryTokens, defaultField, fields, defaultOp, defaultOp, depth+1)
+				if uQ.Bool != nil {
+					outBool.Must = append(outBool.Must, uQ.Bool.Must...)
+					outBool.MustNot = append(outBool.MustNot, uQ.Bool.MustNot...)
+				}
+				minShould := 1
+				outBool.MinimumShouldMatch = minShould
+			}
+			return esast.Query{Bool: outBool}
 		}
 	}
 
