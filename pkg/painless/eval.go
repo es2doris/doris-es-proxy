@@ -56,7 +56,7 @@ type ScriptSpec struct {
 var (
 	reCtxOp               = regexp.MustCompile(`^ctx\??\.op\s*=\s*(.+)$`)
 	reCtxIncDec           = regexp.MustCompile(`^(?:(\+\+|--)\s*ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)|ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)\s*(\+\+|--))$`)
-	reCompoundAssign      = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)\s*(\+=|-=|\*=|/=)\s*(.+)$`)
+	reCompoundAssign      = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)\s*(\+=|-=|\*=|/=|%=)\s*(.+)$`)
 	reAssignParam         = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)\s*=\s*(.+)$`)
 	reRemoveField         = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+))?\.remove\(\s*(.+?)\s*\)$`)
 	reClearField          = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+))?\.clear\(\s*\)$`)
@@ -75,7 +75,7 @@ var (
 	reLocalMapPut         = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)*)\.put\(\s*(.+)\s*\)$`)
 	reLocalMapPutAll      = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)*)\.putAll\(\s*(.+?)\s*\)$`)
 	reLocalArrayRemoveIf  = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)*)\.removeIf\(\s*([a-zA-Z0-9_]+)\s*->\s*([a-zA-Z0-9_]+)(?:\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+))?\s*==\s*(.+?)\s*\)$`)
-	reLocalCompoundAssign = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)*)\s*(\+=|-=|\*=|/=)\s*(.+)$`)
+	reLocalCompoundAssign = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)*)\s*(\+=|-=|\*=|/=|%=)\s*(.+)$`)
 	reLocalPropAssign     = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)\s*=\s*(.+)$`)
 	reLocalVarAssign      = regexp.MustCompile(`^(?:(?:def|boolean|int|long|double|float|String|Object|Map|List)\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$`)
 )
@@ -123,7 +123,7 @@ func ApplyUpdateWithResult(rawSource json.RawMessage, req *UpdateRequest, docExi
 		preMergeSnapshot, _ = json.Marshal(doc)
 	}
 
-	if len(req.Doc) > 0 {
+	if len(req.Doc) > 0 && (docExisted || !req.ScriptedUpsert) {
 		deepMergeMap(doc, req.Doc)
 	}
 
@@ -798,7 +798,7 @@ func expandDynamicBrackets(s string, sourceMap map[string]any, params map[string
 		if after != "" {
 			if after[0] == '.' || strings.HasPrefix(after, "?.") ||
 				strings.HasPrefix(after, "+=") || strings.HasPrefix(after, "-=") ||
-				strings.HasPrefix(after, "*=") || strings.HasPrefix(after, "/=") ||
+				strings.HasPrefix(after, "*=") || strings.HasPrefix(after, "/=") || strings.HasPrefix(after, "%=") ||
 				strings.HasPrefix(after, "++") || strings.HasPrefix(after, "--") ||
 				(after[0] == '=' && !strings.HasPrefix(after, "==") && !strings.HasPrefix(after, "=~")) {
 				isChainedOrAssign = true
@@ -1202,6 +1202,8 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			setValueAtPath(sourceMap, lhsPath, applyMulDiv(curVal, rhsVal, '*'))
 		case "/=":
 			setValueAtPath(sourceMap, lhsPath, applyMulDiv(curVal, rhsVal, '/'))
+		case "%=":
+			setValueAtPath(sourceMap, lhsPath, applyMulDiv(curVal, rhsVal, '%'))
 		}
 		return nil
 	}
@@ -1238,6 +1240,8 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			nextVal = applyMulDiv(curVal, rhsVal, '*')
 		case "/=":
 			nextVal = applyMulDiv(curVal, rhsVal, '/')
+		case "%=":
+			nextVal = applyMulDiv(curVal, rhsVal, '%')
 		}
 		setValueAtPath(params, path, nextVal)
 		syncLocalVarAlias(sourceMap, params, decodeBracketSeg(path[0]))
@@ -1267,11 +1271,16 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			return err
 		}
 		params[varName] = val
+		matchedAlias := false
 		for _, pfx := range []string{"ctx?._source?.", "ctx?._source.", "ctx._source?.", "ctx._source."} {
 			if strings.HasPrefix(rhsExpr, pfx) {
 				params["__alias_"+varName] = strings.TrimPrefix(rhsExpr, pfx)
+				matchedAlias = true
 				break
 			}
+		}
+		if !matchedAlias {
+			delete(params, "__alias_"+varName)
 		}
 		return nil
 	}
@@ -1620,6 +1629,9 @@ func evalConditionDepth(sourceMap map[string]any, cond string, params map[string
 }
 
 func compareOrderedValues(a, b any, op string) bool {
+	if a == nil || b == nil {
+		return false
+	}
 	fa, oka := toFloat64(a)
 	fb, okb := toFloat64(b)
 	if oka && okb {
@@ -2151,9 +2163,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						return tv[fmt.Sprintf("%v", argVal)], nil
 					}
 				case []any:
-					if f, ok := toFloat64(argVal); ok {
-						if idx, okIdx := parseSliceIndex(strconv.Itoa(int(f)), len(tv)); okIdx {
-							return tv[idx], nil
+					if argVal != nil {
+						if f, ok := toFloat64(argVal); ok {
+							if idx, okIdx := parseSliceIndex(strconv.Itoa(int(f)), len(tv)); okIdx {
+								return tv[idx], nil
+							}
 						}
 					}
 				}
@@ -2713,7 +2727,7 @@ func findTopLevelAddSub(expr string) (int, bool) {
 				prev := strings.TrimSpace(expr[:i])
 				if len(prev) > 0 && !isCastPrefixOnly(prev) {
 					lastChar := prev[len(prev)-1]
-					if lastChar != '+' && lastChar != '-' && lastChar != '*' && lastChar != '/' && lastChar != '(' &&
+					if lastChar != '+' && lastChar != '-' && lastChar != '*' && lastChar != '/' && lastChar != '%' && lastChar != '(' &&
 						lastChar != ',' && lastChar != '?' && lastChar != ':' && lastChar != '=' && lastChar != '<' && lastChar != '>' && lastChar != '!' && lastChar != '~' {
 						lastIdx = i
 						lastIsAdd = c == '+'
@@ -3379,6 +3393,9 @@ func removeKeyOrIndexAtPath(root map[string]any, parentPath []string, keyOrIdx a
 }
 
 func setSliceElementAtPath(root map[string]any, arrPath []string, idxVal any, newVal any) any {
+	if idxVal == nil {
+		return nil
+	}
 	existing, ok := resolveParamPath(root, arrPath).([]any)
 	if !ok {
 		return nil

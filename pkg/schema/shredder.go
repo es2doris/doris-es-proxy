@@ -103,6 +103,11 @@ func ShredDocument(
 				val = b.NullValue
 			}
 			val = coerceScalarForDoris(val, b.DorisType, b.LowercaseNormalizer, getNow())
+			if b.IgnoreAbove > 0 {
+				if str, ok := val.(string); ok && len([]rune(str)) > b.IgnoreAbove {
+					val = nil
+				}
+			}
 			if b.ESType == "date_nanos" {
 				if iv, ok := val.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
 					val = iv / 1_000_000
@@ -113,6 +118,15 @@ func ShredDocument(
 			}
 		case StoragePromotedArray, StorageNestedSubfield:
 			vals := extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer, b.NullValue)
+			if b.IgnoreAbove > 0 && len(vals) > 0 {
+				filtered := vals[:0]
+				for _, v := range vals {
+					if len([]rune(v)) <= b.IgnoreAbove {
+						filtered = append(filtered, v)
+					}
+				}
+				vals = filtered
+			}
 			if b.ESType == "date" || b.ESType == "date_nanos" {
 				for i, v := range vals {
 					if iv, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
@@ -146,59 +160,122 @@ func ShredDocument(
 		}
 	}
 
-	// Propagate `copy_to` field values to target bindings
+	// Propagate `copy_to` field values to target bindings (supporting transitive A -> B -> C chains)
+	copiedRawVals := make(map[string][]string)
 	for _, b := range fieldsToVisit {
-		if len(b.CopyTo) == 0 {
-			continue
+		if len(b.CopyTo) > 0 {
+			vals := extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, false, b.NullValue)
+			if len(vals) > 0 {
+				copiedRawVals[b.ESFieldPath] = append(copiedRawVals[b.ESFieldPath], vals...)
+			}
 		}
-		srcVals := extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, false, b.NullValue)
-		if len(srcVals) == 0 {
-			continue
-		}
-		for _, targetField := range b.CopyTo {
-			tb, ok := s.Fields[targetField]
-			if !ok {
+	}
+	forwardedCount := make(map[string]int)
+	for pass := 0; pass < 4; pass++ {
+		progressed := false
+		for _, b := range fieldsToVisit {
+			if len(b.CopyTo) == 0 {
 				continue
 			}
-			switch tb.Kind {
-			case StoragePromotedScalar:
-				joined := strings.Join(srcVals, " ")
-				coerced := coerceScalarForDoris(joined, tb.DorisType, tb.LowercaseNormalizer, getNow())
-				if coerced != nil {
-					if existing, exists := row[tb.ColumnName]; exists && existing != nil {
-						if tb.DorisType == DorisString || tb.DorisType == DorisVarchar {
-							row[tb.ColumnName] = fmt.Sprintf("%v %v", existing, coerced)
+			allSrc := copiedRawVals[b.ESFieldPath]
+			if len(allSrc) == 0 {
+				continue
+			}
+			for _, targetField := range b.CopyTo {
+				edgeKey := b.ESFieldPath + "\x00" + targetField
+				already := forwardedCount[edgeKey]
+				if already >= len(allSrc) {
+					continue
+				}
+				srcVals := allSrc[already:]
+				forwardedCount[edgeKey] = len(allSrc)
+				progressed = true
+				copiedRawVals[targetField] = append(copiedRawVals[targetField], srcVals...)
+
+				tb, ok := s.Fields[targetField]
+				if !ok {
+					continue
+				}
+				switch tb.Kind {
+				case StoragePromotedScalar:
+					joined := strings.Join(srcVals, " ")
+					coerced := coerceScalarForDoris(joined, tb.DorisType, tb.LowercaseNormalizer, getNow())
+					if coerced != nil {
+						if existing, exists := row[tb.ColumnName]; exists && existing != nil {
+							if tb.DorisType == DorisString || tb.DorisType == DorisVarchar {
+								row[tb.ColumnName] = fmt.Sprintf("%v %v", existing, coerced)
+							}
+						} else {
+							row[tb.ColumnName] = coerced
 						}
-					} else {
-						row[tb.ColumnName] = coerced
 					}
-				}
-				if tb.KeywordCompanion != "" {
-					kwVal := joined
-					if tb.KeywordNormalizer {
-						kwVal = strings.ToLower(kwVal)
+					if tb.KeywordCompanion != "" {
+						if kwB, hasKw := s.Fields[targetField+".keyword"]; hasKw && kwB.Kind == StoragePromotedArray {
+							var curKw []string
+							if existing, ok := row[tb.KeywordCompanion].([]string); ok {
+								curKw = append(curKw, existing...)
+							}
+							for _, sv := range srcVals {
+								if kwB.IgnoreAbove > 0 && len([]rune(sv)) > kwB.IgnoreAbove {
+									continue
+								}
+								if tb.KeywordNormalizer || kwB.LowercaseNormalizer {
+									sv = strings.ToLower(sv)
+								}
+								curKw = append(curKw, sv)
+							}
+							if len(curKw) > 0 {
+								row[tb.KeywordCompanion] = curKw
+							}
+						} else {
+							kwVal := joined
+							if tb.KeywordNormalizer {
+								kwVal = strings.ToLower(kwVal)
+							}
+							if existing, exists := row[tb.KeywordCompanion]; exists && existing != nil {
+								row[tb.KeywordCompanion] = fmt.Sprintf("%v %s", existing, kwVal)
+							} else {
+								row[tb.KeywordCompanion] = kwVal
+							}
+						}
 					}
-					if existing, exists := row[tb.KeywordCompanion]; exists && existing != nil {
-						row[tb.KeywordCompanion] = fmt.Sprintf("%v %s", existing, kwVal)
-					} else {
-						row[tb.KeywordCompanion] = kwVal
+				case StoragePromotedArray, StorageNestedSubfield:
+					var cur []string
+					if existing, ok := row[tb.ColumnName].([]string); ok {
+						cur = append(cur, existing...)
 					}
-				}
-			case StoragePromotedArray, StorageNestedSubfield:
-				var cur []string
-				if existing, ok := row[tb.ColumnName].([]string); ok {
-					cur = append(cur, existing...)
-				}
-				for _, sv := range srcVals {
-					if tb.LowercaseNormalizer {
-						sv = strings.ToLower(sv)
+					for _, sv := range srcVals {
+						if tb.IgnoreAbove > 0 && len([]rune(sv)) > tb.IgnoreAbove {
+							continue
+						}
+						if tb.ESType == "date" || tb.ESType == "date_nanos" {
+							if iv, err := strconv.ParseInt(strings.TrimSpace(sv), 10, 64); err == nil {
+								if tb.ESType == "date_nanos" && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
+									sv = strconv.FormatInt(iv/1_000_000, 10)
+								}
+							} else if ms, ok := ParseESDateToEpochMillis(sv, getNow()); ok {
+								sv = strconv.FormatInt(ms, 10)
+							}
+						} else if tb.ESType == "boolean" || tb.DorisType == DorisBoolean {
+							switch strings.ToLower(strings.TrimSpace(sv)) {
+							case "true", "1":
+								sv = "true"
+							case "false", "0":
+								sv = "false"
+							}
+						} else if tb.LowercaseNormalizer {
+							sv = strings.ToLower(sv)
+						}
+						cur = append(cur, sv)
 					}
-					cur = append(cur, sv)
-				}
-				if len(cur) > 0 {
-					row[tb.ColumnName] = cur
+					if len(cur) > 0 {
+						row[tb.ColumnName] = cur
+					}
 				}
 			}
+		}
+		if !progressed {
+			break
 		}
 	}
 
@@ -209,7 +286,8 @@ func ShredDocument(
 			if len(rawElements) > 0 {
 				serializedElems := make([]string, 0, len(rawElements))
 				for _, elemMap := range rawElements {
-					encoded, err := json.Marshal(elemMap)
+					normMap := normalizeNestedElementForStorage(s, nr.Path, nr.PathParts, elemMap, getNow)
+					encoded, err := json.Marshal(normMap)
 					if err == nil {
 						serializedElems = append(serializedElems, string(encoded))
 					}
@@ -224,7 +302,8 @@ func ShredDocument(
 			if len(rawElements) > 0 {
 				serializedElems := make([]string, 0, len(rawElements))
 				for _, elemMap := range rawElements {
-					encoded, err := json.Marshal(elemMap)
+					normMap := normalizeNestedElementForStorage(s, nestedPath, pathParts, elemMap, getNow)
+					encoded, err := json.Marshal(normMap)
 					if err == nil {
 						serializedElems = append(serializedElems, string(encoded))
 					}
@@ -869,4 +948,127 @@ func extractFloatSliceValues(node any, path []string) []float64 {
 		return nil
 	}
 	return extractFloatSliceValues(m[path[0]], path[1:])
+}
+
+func cloneNestedMap(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		switch tv := v.(type) {
+		case map[string]any:
+			out[k] = cloneNestedMap(tv)
+		case []any:
+			s := make([]any, len(tv))
+			for i, item := range tv {
+				if subM, ok := item.(map[string]any); ok {
+					s[i] = cloneNestedMap(subM)
+				} else {
+					s[i] = item
+				}
+			}
+			out[k] = s
+		default:
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootParts []string, elemMap map[string]any, getNow func() time.Time) map[string]any {
+	if s == nil || len(elemMap) == 0 {
+		return elemMap
+	}
+	cloned := cloneNestedMap(elemMap)
+	fields := s.OrderedFields
+	if len(fields) == 0 {
+		for _, b := range s.Fields {
+			fields = append(fields, b)
+		}
+	}
+	for _, b := range fields {
+		if b.Kind != StorageNestedSubfield || b.NestedPath != nestedPath {
+			continue
+		}
+		if len(b.SourceJSONPath) <= len(rootParts) {
+			continue
+		}
+		relPath := b.SourceJSONPath[len(rootParts):]
+		applyNestedBindingNormalizationAtPath(cloned, relPath, b, getNow)
+	}
+	return cloned
+}
+
+func applyNestedBindingNormalizationAtPath(curr map[string]any, relPath []string, b FieldBinding, getNow func() time.Time) {
+	if len(relPath) == 0 || curr == nil {
+		return
+	}
+	key := relPath[0]
+	val, exists := curr[key]
+	if !exists {
+		return
+	}
+	if len(relPath) > 1 {
+		switch tv := val.(type) {
+		case map[string]any:
+			applyNestedBindingNormalizationAtPath(tv, relPath[1:], b, getNow)
+		case []any:
+			for _, item := range tv {
+				if subM, ok := item.(map[string]any); ok {
+					applyNestedBindingNormalizationAtPath(subM, relPath[1:], b, getNow)
+				}
+			}
+		}
+		return
+	}
+	curr[key] = normalizeNestedLeafValue(val, b, getNow)
+}
+
+func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) any {
+	if val == nil {
+		if b.NullValue != nil {
+			return normalizeNestedLeafValue(b.NullValue, b, getNow)
+		}
+		return nil
+	}
+	if arr, ok := val.([]any); ok {
+		var out []any
+		for _, item := range arr {
+			norm := normalizeNestedLeafValue(item, b, getNow)
+			if norm != nil {
+				out = append(out, norm)
+			}
+		}
+		return out
+	}
+	if b.IgnoreAbove > 0 {
+		if str, ok := val.(string); ok && len([]rune(str)) > b.IgnoreAbove {
+			return nil
+		}
+	}
+	if b.ESType == "date" || b.ESType == "date_nanos" {
+		str := strings.TrimSpace(fmt.Sprintf("%v", val))
+		if iv, err := strconv.ParseInt(str, 10, 64); err == nil {
+			if b.ESType == "date_nanos" && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
+				return iv / 1_000_000
+			}
+			return iv
+		}
+		if ms, ok := ParseESDateToEpochMillis(str, getNow()); ok {
+			return ms
+		}
+	} else if b.ESType == "boolean" || b.DorisType == DorisBoolean {
+		switch strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", val))) {
+		case "true", "1":
+			return true
+		case "false", "0":
+			return false
+		}
+	} else if b.LowercaseNormalizer {
+		if str, ok := val.(string); ok {
+			return strings.ToLower(str)
+		}
+	}
+	return val
 }

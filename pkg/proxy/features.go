@@ -2803,8 +2803,19 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				if len(sepStr) > 0 {
 					comma = rune(sepStr[0])
 				}
+				customQuote := rune(0)
 				if len(quoteStr) > 0 && quoteStr[0] != '"' {
-					strVal = strings.ReplaceAll(strVal, string(quoteStr[0]), `"`)
+					customQuote = rune(quoteStr[0])
+					strVal = strings.Map(func(r rune) rune {
+						switch r {
+						case customQuote:
+							return '"'
+						case '"':
+							return customQuote
+						default:
+							return r
+						}
+					}, strVal)
 				}
 				if trimFlag {
 					reTrailingQuoteSpace := regexp.MustCompile(`"\s*(` + regexp.QuoteMeta(string(comma)) + `|$)`)
@@ -2817,6 +2828,20 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				record, err := cr.Read()
 				if err != nil {
 					return false, false, procType, procTag, specMap, err
+				}
+				if customQuote != 0 {
+					for i, c := range record {
+						record[i] = strings.Map(func(r rune) rune {
+							switch r {
+							case customQuote:
+								return '"'
+							case '"':
+								return customQuote
+							default:
+								return r
+							}
+						}, c)
+					}
 				}
 				for idx, tfAny := range targetFields {
 					tfName, ok := tfAny.(string)
@@ -3225,6 +3250,9 @@ func applyIngestPipelineSpecVerboseWithMeta(s *Server, pipe map[string]any, inde
 	}
 	procs, _ := pipe["processors"].([]any)
 	if len(procs) == 0 {
+		if verbose {
+			return raw, indexName, docID, false, []map[string]any{}, nil
+		}
 		return raw, indexName, docID, false, nil, nil
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
@@ -3932,6 +3960,11 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	batchSize := 1000
 	if body.Source.Size != nil && *body.Source.Size > 0 && *body.Source.Size < batchSize {
 		batchSize = *body.Source.Size
+	}
+	if qScrollSize := r.URL.Query().Get("scroll_size"); qScrollSize != "" {
+		if parsed, err := strconv.Atoi(qScrollSize); err == nil && parsed > 0 {
+			batchSize = parsed
+		}
 	}
 
 	s.resolveTermsLookupsInQuery(r.Context(), body.Source.Query)

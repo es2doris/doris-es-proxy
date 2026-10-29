@@ -222,11 +222,16 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 		if !req.ShouldTrackTotalHits() {
 			totalHitsExpr = "CAST(-1 AS BIGINT) AS `_total_hits`"
 		}
-		orderBy := t.compileOrderByWithAfter(req.Sort, req.SearchAfter)
+		effSorts := EffectiveSortsForRequest(req)
+		orderBy := t.compileOrderByWithAfter(effSorts, req.SearchAfter)
 		var saPred string
 		if len(req.SearchAfter) > 0 {
 			from = 0
-			saPred = t.compileSearchAfterPredicate(req.Sort, req.SearchAfter, scoreExpr)
+			saScoreExpr := scoreExpr
+			if req.Collapse != nil && req.Collapse.Field != "" {
+				saScoreExpr = "`_score`"
+			}
+			saPred = t.compileSearchAfterPredicate(effSorts, req.SearchAfter, saScoreExpr)
 		}
 		if req.Collapse != nil && req.Collapse.Field != "" {
 			bCollapse := t.Schema.ResolveField(req.Collapse.Field)
@@ -1393,7 +1398,7 @@ func (t *Transpiler) compileMultiMatch(mm *esast.MultiMatchQuery, scoring bool, 
 	}
 	scoreExpr := "1.0"
 	if scoring && len(scores) > 0 {
-		if (mmType == "best_fields" || mmType == "bool_prefix" || mmType == "phrase" || mmType == "phrase_prefix" || (mmType == "" && mm.TieBreaker != nil)) && len(scores) > 1 {
+		if (mmType == "" || mmType == "best_fields" || mmType == "bool_prefix" || mmType == "phrase" || mmType == "phrase_prefix") && len(scores) > 1 {
 			maxExpr := fmt.Sprintf("GREATEST(%s)", strings.Join(scores, ", "))
 			if mm.TieBreaker != nil && *mm.TieBreaker > 0 {
 				sumExpr := fmt.Sprintf("(%s)", strings.Join(scores, " + "))
@@ -2376,6 +2381,8 @@ func (t *Transpiler) buildAggsCTESQL(baseWhere, userWhere, aliasWhere, postFilte
 		metaWhere := ""
 		if postFilterSQL != "" && postFilterSQL != "TRUE" {
 			metaWhere = " WHERE " + postFilterSQL
+			branches = append(branches,
+				"SELECT '__meta_query_total' AS `_agg_name`, '_count' AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` FROM `base_matched`")
 		}
 		branches = append(branches,
 			"SELECT '__meta_total' AS `_agg_name`, '_count' AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` FROM `base_matched`"+metaWhere)
@@ -2399,11 +2406,19 @@ func (t *Transpiler) buildAggsCTESQL(baseWhere, userWhere, aliasWhere, postFilte
 
 	var branches []string
 	var metaConds []string
+	var queryMetaConds []string
 	if effectiveUserWhere != "" && effectiveUserWhere != "TRUE" {
 		metaConds = append(metaConds, fmt.Sprintf("(%s)", effectiveUserWhere))
+		queryMetaConds = append(queryMetaConds, fmt.Sprintf("(%s)", effectiveUserWhere))
 	}
 	if postFilterSQL != "" && postFilterSQL != "TRUE" {
 		metaConds = append(metaConds, fmt.Sprintf("(%s)", postFilterSQL))
+		queryMetaWhere := ""
+		if len(queryMetaConds) > 0 {
+			queryMetaWhere = " WHERE " + strings.Join(queryMetaConds, " AND ")
+		}
+		branches = append(branches,
+			"SELECT '__meta_query_total' AS `_agg_name`, '_count' AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` FROM `base_matched`"+queryMetaWhere)
 	}
 	metaWhere := ""
 	if len(metaConds) > 0 {
@@ -2524,7 +2539,7 @@ func (t *Transpiler) appendAggBranches(
 					}
 					*branches = append(*branches, fmt.Sprintf(
 						"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
-							"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+							"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(DISTINCT `_id`) AS DOUBLE) AS `_doc_count` "+
 							"FROM %s %s"+
 							"GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT %d"+
 							") `_agg_sub_%d`",
@@ -2535,13 +2550,14 @@ func (t *Transpiler) appendAggBranches(
 						if extraWhere != "" {
 							subWhere = extraWhere
 						}
-						t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, coalescedElem, explodeFrom, subWhere, subAggs)
+						dedupFrom := fmt.Sprintf("`base_matched` INNER JOIN (SELECT DISTINCT `_id` AS `_rn_id`, %s AS `_rn_bkey` FROM %s WHERE %s) `_rn_dedup` ON `base_matched`.`_id` = `_rn_dedup`.`_rn_id`", coalescedElem, explodeFrom, subWhere)
+						t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, "`_rn_bkey`", dedupFrom, "1=1", subAggs)
 					}
 				} else {
 					bucketKeyExpr := fmt.Sprintf("CAST(%s AS STRING)", elemValExpr)
 					*branches = append(*branches, fmt.Sprintf(
 						"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
-							"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+							"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(DISTINCT `_id`) AS DOUBLE) AS `_doc_count` "+
 							"FROM `base_matched` LATERAL VIEW EXPLODE(`%s`) `_t` AS `_elem` "+
 							"WHERE %s`_elem` IS NOT NULL "+
 							"GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT %d"+
@@ -2549,9 +2565,11 @@ func (t *Transpiler) appendAggBranches(
 						quoteStr(fullAggName), bucketKeyExpr, arrCol, wherePrefix, size, *subIdx,
 					))
 					if subAggs := spec.SubAggs(); len(subAggs) > 0 {
-						t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, bucketKeyExpr,
-							fmt.Sprintf("`base_matched` LATERAL VIEW EXPLODE(`%s`) `_t` AS `_elem`", arrCol),
-							fmt.Sprintf("%s`_elem` IS NOT NULL", wherePrefix), subAggs)
+						explodeFrom := fmt.Sprintf("`base_matched` LATERAL VIEW EXPLODE(`%s`) `_t` AS `_elem`", arrCol)
+						explodeWhere := fmt.Sprintf("%s`_elem` IS NOT NULL", wherePrefix)
+						dedupFrom := fmt.Sprintf("`base_matched` INNER JOIN (SELECT DISTINCT `_id` AS `_rn_id`, %s AS `_rn_bkey` FROM %s WHERE %s) `_rn_dedup` ON `base_matched`.`_id` = `_rn_dedup`.`_rn_id`", bucketKeyExpr, explodeFrom, explodeWhere)
+						t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, "`_rn_bkey`",
+							dedupFrom, "1=1", subAggs)
 					}
 				}
 			} else {
@@ -3608,19 +3626,31 @@ func (t *Transpiler) appendAggBranches(
 			if tzShiftMs != 0 {
 				bucketExpr = fmt.Sprintf("CAST(CAST(FLOOR((%s + %d) / %d) * %d - %d AS BIGINT) AS STRING)", col, tzShiftMs, intervalMs, intervalMs, tzShiftMs)
 			}
+			dhCountExpr := "COUNT(*)"
+			if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
+				dhCountExpr = "COUNT(DISTINCT `_id`)"
+			}
 			*subIdx++
 			*branches = append(*branches, fmt.Sprintf(
 				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
-					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(%s AS DOUBLE) AS `_doc_count` "+
 					"FROM %s "+
 					"WHERE %s "+
 					"GROUP BY `_bucket_key` ORDER BY CAST(`_bucket_key` AS BIGINT) ASC"+
 					") `_agg_sub_%d`",
-				quoteStr(fullAggName), bucketExpr, fromClause, notNullCond, *subIdx,
+				quoteStr(fullAggName), bucketExpr, dhCountExpr, fromClause, notNullCond, *subIdx,
 			))
 			if subAggs := spec.SubAggs(); len(subAggs) > 0 {
-				t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, bucketExpr,
-					fromClause, notNullCond, subAggs)
+				subBucketExpr := bucketExpr
+				subFromClause := fromClause
+				subWhereCond := notNullCond
+				if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
+					subFromClause = fmt.Sprintf("`base_matched` INNER JOIN (SELECT DISTINCT `_id` AS `_rn_id`, %s AS `_rn_bkey` FROM %s WHERE %s) `_rn_dedup` ON `base_matched`.`_id` = `_rn_dedup`.`_rn_id`", bucketExpr, fromClause, notNullCond)
+					subBucketExpr = "`_rn_bkey`"
+					subWhereCond = "1=1"
+				}
+				t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, subBucketExpr,
+					subFromClause, subWhereCond, subAggs)
 			}
 
 		case spec.Histogram != nil:
@@ -3692,19 +3722,31 @@ func (t *Transpiler) appendAggBranches(
 				}
 			}
 			bucketExpr := fmt.Sprintf("CAST(FLOOR((%s - %v) / %v) * %v + %v AS STRING)", col, offset, interval, interval, offset)
+			hCountExpr := "COUNT(*)"
+			if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
+				hCountExpr = "COUNT(DISTINCT `_id`)"
+			}
 			*subIdx++
 			*branches = append(*branches, fmt.Sprintf(
 				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
-					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(%s AS DOUBLE) AS `_doc_count` "+
 					"FROM %s "+
 					"WHERE %s "+
 					"GROUP BY `_bucket_key` ORDER BY CAST(`_bucket_key` AS DOUBLE) ASC"+
 					") `_agg_sub_%d`",
-				quoteStr(fullAggName), bucketExpr, fromClause, notNullCond, *subIdx,
+				quoteStr(fullAggName), bucketExpr, hCountExpr, fromClause, notNullCond, *subIdx,
 			))
 			if subAggs := spec.SubAggs(); len(subAggs) > 0 {
-				t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, bucketExpr,
-					fromClause, notNullCond, subAggs)
+				subBucketExpr := bucketExpr
+				subFromClause := fromClause
+				subWhereCond := notNullCond
+				if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
+					subFromClause = fmt.Sprintf("`base_matched` INNER JOIN (SELECT DISTINCT `_id` AS `_rn_id`, %s AS `_rn_bkey` FROM %s WHERE %s) `_rn_dedup` ON `base_matched`.`_id` = `_rn_dedup`.`_rn_id`", bucketExpr, fromClause, notNullCond)
+					subBucketExpr = "`_rn_bkey`"
+					subWhereCond = "1=1"
+				}
+				t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, subBucketExpr,
+					subFromClause, subWhereCond, subAggs)
 			}
 
 		case spec.EffectiveRange() != nil:
@@ -6345,6 +6387,32 @@ func (t *Transpiler) compileScriptSortExpr(s esast.SortSpec) (string, schema.Fie
 	return "", schema.FieldBinding{}, false
 }
 
+// EffectiveSortsForRequest returns the effective sort specifications for a search request,
+// automatically appending an `_id` tiebreaker sort when `pit` (Point-In-Time) is active.
+func EffectiveSortsForRequest(req *esast.SearchRequest) []esast.SortSpec {
+	if req == nil {
+		return nil
+	}
+	if req.PIT == nil {
+		return req.Sort
+	}
+	if len(req.Sort) == 0 {
+		return []esast.SortSpec{
+			{Entry: esast.SortFieldSpec{Field: "_score", Order: "desc"}},
+			{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}},
+		}
+	}
+	for _, s := range req.Sort {
+		if s.Entry.Field == "_id" || s.Entry.Field == "_doc" {
+			return req.Sort
+		}
+	}
+	out := make([]esast.SortSpec, len(req.Sort), len(req.Sort)+1)
+	copy(out, req.Sort)
+	out = append(out, esast.SortSpec{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}})
+	return out
+}
+
 func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any) string {
 	if len(sorts) == 0 {
 		return "`_score` DESC, `_id` ASC"
@@ -6571,13 +6639,19 @@ func (t *Transpiler) sqlSortColumnRef(field string, sampleVal any, desc bool, mo
 			return fmt.Sprintf("%s(array_map(_x -> IPV4_STRING_TO_NUM_OR_NULL(_x), %s))", fn, arrRef)
 		}
 		effDT := effectiveDorisScalarType(b)
-		if fn == "array_min" || fn == "array_max" {
+		switch fn {
+		case "array_min", "array_max":
 			if effDT == schema.DorisBigInt || effDT == schema.DorisInt {
 				return fmt.Sprintf("%s(array_map(_x -> CAST(_x AS BIGINT), %s))", fn, arrRef)
 			}
 			if effDT == schema.DorisDouble {
 				return fmt.Sprintf("%s(array_map(_x -> CAST(_x AS DOUBLE), %s))", fn, arrRef)
 			}
+		case "array_avg", "array_sum", "array_median":
+			if effDT == schema.DorisBigInt || effDT == schema.DorisInt {
+				return fmt.Sprintf("%s(array_map(_x -> CAST(_x AS BIGINT), %s))", fn, arrRef)
+			}
+			return fmt.Sprintf("%s(array_map(_x -> CAST(_x AS DOUBLE), %s))", fn, arrRef)
 		}
 		return fmt.Sprintf("%s(%s)", fn, arrRef)
 	}

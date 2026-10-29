@@ -58,6 +58,7 @@ type SearchRequest struct {
 	TrackScores    *bool              `json:"track_scores,omitempty"`
 	Highlight      *HighlightSpec     `json:"highlight,omitempty"`
 	Collapse       *CollapseSpec      `json:"collapse,omitempty"`
+	Rescore        RescoreSlice       `json:"rescore,omitempty"`
 	PIT            *PITSpec           `json:"pit,omitempty"`
 	Fields         []FieldRequestSpec `json:"fields,omitempty"`
 	DocvalueFields []FieldRequestSpec `json:"docvalue_fields,omitempty"`
@@ -274,10 +275,88 @@ type CollapseSpec struct {
 	InnerHits CollapseInnerHits `json:"inner_hits,omitempty"`
 }
 
+// RescoreQuerySpec models the `query` object inside a `rescore` block.
+type RescoreQuerySpec struct {
+	RescoreQuery       *Query   `json:"rescore_query,omitempty"`
+	QueryWeight        *float64 `json:"query_weight,omitempty"`
+	RescoreQueryWeight *float64 `json:"rescore_query_weight,omitempty"`
+	ScoreMode          string   `json:"score_mode,omitempty"`
+}
+
+// RescoreSpec models a single `rescore` entry in a search request.
+type RescoreSpec struct {
+	WindowSize *int              `json:"window_size,omitempty"`
+	Query      *RescoreQuerySpec `json:"query,omitempty"`
+}
+
+// RescoreSlice unmarshals either a single `RescoreSpec` object `{...}` or an array `[{...}]`.
+type RescoreSlice []RescoreSpec
+
+func (rs *RescoreSlice) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		*rs = nil
+		return nil
+	}
+	if trimmed[0] == '[' {
+		var list []RescoreSpec
+		if err := json.Unmarshal(trimmed, &list); err != nil {
+			return err
+		}
+		*rs = list
+		return nil
+	}
+	var single RescoreSpec
+	if err := json.Unmarshal(trimmed, &single); err != nil {
+		return err
+	}
+	*rs = []RescoreSpec{single}
+	return nil
+}
+
+// HighlightFieldSpec models per-field highlight configuration inside `highlight.fields.<field>`.
+type HighlightFieldSpec struct {
+	PreTags           []string `json:"pre_tags,omitempty"`
+	PostTags          []string `json:"post_tags,omitempty"`
+	TagSchema         string   `json:"tag_schema,omitempty"`
+	Encoder           string   `json:"encoder,omitempty"`
+	HighlightQuery    *Query   `json:"highlight_query,omitempty"`
+	RequireFieldMatch *bool    `json:"require_field_match,omitempty"`
+	MatchedFields     []string `json:"matched_fields,omitempty"`
+	FragmentSize      *int     `json:"fragment_size,omitempty"`
+	NumberOfFragments *int     `json:"number_of_fragments,omitempty"`
+	NoMatchSize       *int     `json:"no_match_size,omitempty"`
+	Type              string   `json:"type,omitempty"`
+}
+
 type HighlightSpec struct {
-	PreTags  []string       `json:"pre_tags,omitempty"`
-	PostTags []string       `json:"post_tags,omitempty"`
-	Fields   map[string]any `json:"fields,omitempty"`
+	PreTags           []string       `json:"pre_tags,omitempty"`
+	PostTags          []string       `json:"post_tags,omitempty"`
+	TagSchema         string         `json:"tag_schema,omitempty"`
+	Encoder           string         `json:"encoder,omitempty"`
+	HighlightQuery    *Query         `json:"highlight_query,omitempty"`
+	RequireFieldMatch *bool          `json:"require_field_match,omitempty"`
+	FragmentSize      *int           `json:"fragment_size,omitempty"`
+	NumberOfFragments *int           `json:"number_of_fragments,omitempty"`
+	NoMatchSize       *int           `json:"no_match_size,omitempty"`
+	Type              string         `json:"type,omitempty"`
+	Fields            map[string]any `json:"fields,omitempty"`
+}
+
+// FieldSpec decodes the per-field highlight configuration for field into HighlightFieldSpec.
+func (h *HighlightSpec) FieldSpec(field string) HighlightFieldSpec {
+	if h == nil || h.Fields == nil {
+		return HighlightFieldSpec{}
+	}
+	raw, ok := h.Fields[field]
+	if !ok || raw == nil {
+		return HighlightFieldSpec{}
+	}
+	var spec HighlightFieldSpec
+	if b, err := json.Marshal(raw); err == nil {
+		_ = json.Unmarshal(b, &spec)
+	}
+	return spec
 }
 
 // EffectiveAggs returns whichever of `aggs` or `aggregations` was populated.
@@ -846,11 +925,12 @@ type MultiMatchQuery struct {
 }
 
 type QueryStringQuery struct {
-	Query           string   `json:"query"`
-	DefaultField    string   `json:"default_field,omitempty"`
-	Fields          []string `json:"fields,omitempty"`
-	DefaultOperator string   `json:"default_operator,omitempty"`
-	Boost           *float64 `json:"boost,omitempty"`
+	Query              string   `json:"query"`
+	DefaultField       string   `json:"default_field,omitempty"`
+	Fields             []string `json:"fields,omitempty"`
+	DefaultOperator    string   `json:"default_operator,omitempty"`
+	MinimumShouldMatch any      `json:"minimum_should_match,omitempty"`
+	Boost              *float64 `json:"boost,omitempty"`
 }
 
 type NestedQuery struct {
@@ -899,56 +979,57 @@ type FieldValueFactorSpec struct {
 
 // AggSpec represents an Elasticsearch aggregation definition.
 type AggSpec struct {
-	Terms               *TermsAggSpec             `json:"terms,omitempty"`
-	SignificantTerms    *TermsAggSpec             `json:"significant_terms,omitempty"`
-	SignificantText     *TermsAggSpec             `json:"significant_text,omitempty"`
-	DateHistogram       *DateHistogramAggSpec     `json:"date_histogram,omitempty"`
-	Histogram           *HistogramAggSpec         `json:"histogram,omitempty"`
-	Range               *RangeAggSpec             `json:"range,omitempty"`
-	DateRange           *RangeAggSpec             `json:"date_range,omitempty"`
-	IPRange             *RangeAggSpec             `json:"ip_range,omitempty"`
-	Composite           *CompositeAggSpec         `json:"composite,omitempty"`
-	Filter              *Query                    `json:"filter,omitempty"`
-	Filters             *FiltersAggSpec           `json:"filters,omitempty"`
-	Missing             *ExistsQuery              `json:"missing,omitempty"`
-	Nested              *NestedAggSpec            `json:"nested,omitempty"`
-	ReverseNested       map[string]any            `json:"reverse_nested,omitempty"`
-	Global              map[string]any            `json:"global,omitempty"`
-	Sampler             *SamplerAggSpec           `json:"sampler,omitempty"`
-	DiversifiedSampler  *SamplerAggSpec           `json:"diversified_sampler,omitempty"`
-	Cardinality         *MetricAggSpec            `json:"cardinality,omitempty"`
-	ValueCount          *MetricAggSpec            `json:"value_count,omitempty"`
-	Avg                 *MetricAggSpec            `json:"avg,omitempty"`
-	Sum                 *MetricAggSpec            `json:"sum,omitempty"`
-	Min                 *MetricAggSpec            `json:"min,omitempty"`
-	Max                 *MetricAggSpec            `json:"max,omitempty"`
-	Stats               *MetricAggSpec            `json:"stats,omitempty"`
-	ExtendedStats       *MetricAggSpec            `json:"extended_stats,omitempty"`
-	StringStats         *MetricAggSpec            `json:"string_stats,omitempty"`
-	Boxplot             *MetricAggSpec            `json:"boxplot,omitempty"`
-	Percentiles         *PercentilesAggSpec       `json:"percentiles,omitempty"`
-	PercentileRanks     *PercentileRanksAggSpec   `json:"percentile_ranks,omitempty"`
-	TopHits             *TopHitsAggSpec           `json:"top_hits,omitempty"`
-	TopMetrics          *TopMetricsAggSpec        `json:"top_metrics,omitempty"`
-	Rate                *RateAggSpec              `json:"rate,omitempty"`
-	BucketSort          *BucketSortAggSpec        `json:"bucket_sort,omitempty"`
-	CumulativeSum       *PipelineAggSpec          `json:"cumulative_sum,omitempty"`
-	Derivative          *PipelineAggSpec          `json:"derivative,omitempty"`
-	MovingAvg           *MovingAvgAggSpec         `json:"moving_avg,omitempty"`
-	MovingFn            *MovingAvgAggSpec         `json:"moving_fn,omitempty"`
-	SerialDiff          *SerialDiffAggSpec        `json:"serial_diff,omitempty"`
-	Normalize           *NormalizeAggSpec         `json:"normalize,omitempty"`
-	AvgBucket           *PipelineAggSpec          `json:"avg_bucket,omitempty"`
-	SumBucket           *PipelineAggSpec          `json:"sum_bucket,omitempty"`
-	MinBucket           *PipelineAggSpec          `json:"min_bucket,omitempty"`
-	MaxBucket           *PipelineAggSpec          `json:"max_bucket,omitempty"`
-	StatsBucket         *PipelineAggSpec          `json:"stats_bucket,omitempty"`
-	ExtendedStatsBucket *PipelineAggSpec          `json:"extended_stats_bucket,omitempty"`
-	PercentilesBucket   *PercentilesBucketAggSpec `json:"percentiles_bucket,omitempty"`
-	BucketSelector      *BucketSelectorAggSpec    `json:"bucket_selector,omitempty"`
-	BucketScript        *BucketSelectorAggSpec    `json:"bucket_script,omitempty"`
-	Aggs                map[string]AggSpec        `json:"aggs,omitempty"`
-	Aggregations        map[string]AggSpec        `json:"aggregations,omitempty"`
+	Terms                 *TermsAggSpec             `json:"terms,omitempty"`
+	SignificantTerms      *TermsAggSpec             `json:"significant_terms,omitempty"`
+	SignificantText       *TermsAggSpec             `json:"significant_text,omitempty"`
+	DateHistogram         *DateHistogramAggSpec     `json:"date_histogram,omitempty"`
+	Histogram             *HistogramAggSpec         `json:"histogram,omitempty"`
+	Range                 *RangeAggSpec             `json:"range,omitempty"`
+	DateRange             *RangeAggSpec             `json:"date_range,omitempty"`
+	IPRange               *RangeAggSpec             `json:"ip_range,omitempty"`
+	Composite             *CompositeAggSpec         `json:"composite,omitempty"`
+	Filter                *Query                    `json:"filter,omitempty"`
+	Filters               *FiltersAggSpec           `json:"filters,omitempty"`
+	Missing               *ExistsQuery              `json:"missing,omitempty"`
+	Nested                *NestedAggSpec            `json:"nested,omitempty"`
+	ReverseNested         map[string]any            `json:"reverse_nested,omitempty"`
+	Global                map[string]any            `json:"global,omitempty"`
+	Sampler               *SamplerAggSpec           `json:"sampler,omitempty"`
+	DiversifiedSampler    *SamplerAggSpec           `json:"diversified_sampler,omitempty"`
+	Cardinality           *MetricAggSpec            `json:"cardinality,omitempty"`
+	ValueCount            *MetricAggSpec            `json:"value_count,omitempty"`
+	Avg                   *MetricAggSpec            `json:"avg,omitempty"`
+	Sum                   *MetricAggSpec            `json:"sum,omitempty"`
+	Min                   *MetricAggSpec            `json:"min,omitempty"`
+	Max                   *MetricAggSpec            `json:"max,omitempty"`
+	Stats                 *MetricAggSpec            `json:"stats,omitempty"`
+	ExtendedStats         *MetricAggSpec            `json:"extended_stats,omitempty"`
+	StringStats           *MetricAggSpec            `json:"string_stats,omitempty"`
+	Boxplot               *MetricAggSpec            `json:"boxplot,omitempty"`
+	Percentiles           *PercentilesAggSpec       `json:"percentiles,omitempty"`
+	PercentileRanks       *PercentileRanksAggSpec   `json:"percentile_ranks,omitempty"`
+	TopHits               *TopHitsAggSpec           `json:"top_hits,omitempty"`
+	TopMetrics            *TopMetricsAggSpec        `json:"top_metrics,omitempty"`
+	Rate                  *RateAggSpec              `json:"rate,omitempty"`
+	BucketSort            *BucketSortAggSpec        `json:"bucket_sort,omitempty"`
+	CumulativeSum         *PipelineAggSpec          `json:"cumulative_sum,omitempty"`
+	CumulativeCardinality *PipelineAggSpec          `json:"cumulative_cardinality,omitempty"`
+	Derivative            *PipelineAggSpec          `json:"derivative,omitempty"`
+	MovingAvg             *MovingAvgAggSpec         `json:"moving_avg,omitempty"`
+	MovingFn              *MovingAvgAggSpec         `json:"moving_fn,omitempty"`
+	SerialDiff            *SerialDiffAggSpec        `json:"serial_diff,omitempty"`
+	Normalize             *NormalizeAggSpec         `json:"normalize,omitempty"`
+	AvgBucket             *PipelineAggSpec          `json:"avg_bucket,omitempty"`
+	SumBucket             *PipelineAggSpec          `json:"sum_bucket,omitempty"`
+	MinBucket             *PipelineAggSpec          `json:"min_bucket,omitempty"`
+	MaxBucket             *PipelineAggSpec          `json:"max_bucket,omitempty"`
+	StatsBucket           *PipelineAggSpec          `json:"stats_bucket,omitempty"`
+	ExtendedStatsBucket   *PipelineAggSpec          `json:"extended_stats_bucket,omitempty"`
+	PercentilesBucket     *PercentilesBucketAggSpec `json:"percentiles_bucket,omitempty"`
+	BucketSelector        *BucketSelectorAggSpec    `json:"bucket_selector,omitempty"`
+	BucketScript          *BucketSelectorAggSpec    `json:"bucket_script,omitempty"`
+	Aggs                  map[string]AggSpec        `json:"aggs,omitempty"`
+	Aggregations          map[string]AggSpec        `json:"aggregations,omitempty"`
 }
 
 // EffectiveRange returns the range specification for `range`, `date_range`, or `ip_range`.
@@ -984,6 +1065,14 @@ func (a *AggSpec) EffectiveMovingAvg() *MovingAvgAggSpec {
 		return a.MovingAvg
 	}
 	return a.MovingFn
+}
+
+// EffectiveCumulative returns the pipeline specification for `cumulative_sum` or `cumulative_cardinality`.
+func (a *AggSpec) EffectiveCumulative() *PipelineAggSpec {
+	if a.CumulativeSum != nil {
+		return a.CumulativeSum
+	}
+	return a.CumulativeCardinality
 }
 
 // SamplerAggSpec models a `sampler` or `diversified_sampler` aggregation.
@@ -1204,11 +1293,12 @@ func (a *AggSpec) IsSignificantTerms() bool {
 	return a.SignificantTerms != nil || a.SignificantText != nil
 }
 
-// BucketSortAggSpec models a `bucket_sort` pipeline aggregation (`sort`, `from`, `size`).
+// BucketSortAggSpec models a `bucket_sort` pipeline aggregation (`sort`, `from`, `size`, `gap_policy`).
 type BucketSortAggSpec struct {
-	Sort SortSlice `json:"sort,omitempty"`
-	From *int      `json:"from,omitempty"`
-	Size *int      `json:"size,omitempty"`
+	Sort      SortSlice `json:"sort,omitempty"`
+	From      *int      `json:"from,omitempty"`
+	Size      *int      `json:"size,omitempty"`
+	GapPolicy string    `json:"gap_policy,omitempty"`
 }
 
 // PipelineAggSpec models a single-path pipeline aggregation (`cumulative_sum`, `derivative`, `avg_bucket`, `sum_bucket`, `min_bucket`, `max_bucket`, `stats_bucket`, `extended_stats_bucket`).
@@ -1978,6 +2068,7 @@ type MappingSpec struct {
 
 type FieldProperty struct {
 	Type           string                   `json:"type,omitempty"`
+	Path           string                   `json:"path,omitempty"`
 	Analyzer       string                   `json:"analyzer,omitempty"`
 	SearchAnalyzer string                   `json:"search_analyzer,omitempty"`
 	Normalizer     string                   `json:"normalizer,omitempty"`
@@ -1989,6 +2080,7 @@ type FieldProperty struct {
 	UpgradedArray  bool                     `json:"upgraded_array,omitempty"`
 	CopyTo         any                      `json:"copy_to,omitempty"`
 	NullValue      any                      `json:"null_value,omitempty"`
+	IgnoreAbove    int                      `json:"ignore_above,omitempty"`
 	Fields         map[string]FieldProperty `json:"fields,omitempty"`
 	Properties     map[string]FieldProperty `json:"properties,omitempty"`
 }
@@ -2000,20 +2092,53 @@ func (fp FieldProperty) EffectiveDims() int {
 	return fp.Dimension
 }
 
+// CopyToSlice normalizes FieldProperty.CopyTo (string, []string, or []any) into a string slice.
+func (fp FieldProperty) CopyToSlice() []string {
+	switch v := fp.CopyTo.(type) {
+	case string:
+		if v != "" {
+			return []string{v}
+		}
+	case []string:
+		return v
+	case []any:
+		var out []string
+		for _, elem := range v {
+			if s, ok := elem.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
 // BulkOperation represents a single parsed action from an Elasticsearch `/_bulk` NDJSON stream.
 type BulkOperation struct {
-	Action   string          // "index", "create", "update", "delete"
-	Index    string          // Target index name
-	ID       string          // Document _id
-	Pipeline string          // Optional per-item ingest pipeline override
-	Source   json.RawMessage // Verbatim raw JSON line for `_source` (or update payload)
-	ParseErr string          // Per-item validation or JSON error (isolated to this bulk item)
+	Action          string          // "index", "create", "update", "delete"
+	Index           string          // Target index name
+	ID              string          // Document _id
+	Pipeline        string          // Optional per-item ingest pipeline override
+	Routing         string          // Optional per-item routing value
+	IfSeqNo         *int64          // Optional optimistic concurrency _seq_no
+	IfPrimaryTerm   *int64          // Optional optimistic concurrency _primary_term
+	Version         *int64          // Optional external/internal version check
+	VersionType     string          // Optional version_type ("internal", "external", "external_gte")
+	RetryOnConflict *int            // Optional retry_on_conflict count
+	Source          json.RawMessage // Verbatim raw JSON line for `_source` (or update payload)
+	ParseErr        string          // Per-item validation or JSON error (isolated to this bulk item)
 }
 
 type bulkActionMeta struct {
-	Index    string `json:"_index"`
-	ID       string `json:"_id"`
-	Pipeline string `json:"pipeline,omitempty"`
+	Index           string `json:"_index"`
+	ID              string `json:"_id"`
+	Pipeline        string `json:"pipeline,omitempty"`
+	Routing         string `json:"routing,omitempty"`
+	IfSeqNo         *int64 `json:"if_seq_no,omitempty"`
+	IfPrimaryTerm   *int64 `json:"if_primary_term,omitempty"`
+	Version         *int64 `json:"version,omitempty"`
+	VersionType     string `json:"version_type,omitempty"`
+	RetryOnConflict *int   `json:"retry_on_conflict,omitempty"`
 }
 
 type bulkActionLine struct {
@@ -2064,6 +2189,12 @@ func ParseBulkNDJSON(r io.Reader, defaultIndex string) ([]BulkOperation, error) 
 		}
 		op.ID = meta.ID
 		op.Pipeline = meta.Pipeline
+		op.Routing = meta.Routing
+		op.IfSeqNo = meta.IfSeqNo
+		op.IfPrimaryTerm = meta.IfPrimaryTerm
+		op.Version = meta.Version
+		op.VersionType = meta.VersionType
+		op.RetryOnConflict = meta.RetryOnConflict
 		if op.ID == "" {
 			if op.Action == "index" || op.Action == "create" {
 				op.ID = NextAutoID()

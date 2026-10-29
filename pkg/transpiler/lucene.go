@@ -94,11 +94,14 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 	}
 
 	parsedAST := parseSimpleLuceneToAST(raw, defaultField, expandedFields, defaultOp)
+	if qsq.MinimumShouldMatch != nil && parsedAST.Bool != nil && len(parsedAST.Bool.Should) > 0 {
+		parsedAST.Bool.MinimumShouldMatch = qsq.MinimumShouldMatch
+	}
 	compiled := t.CompileQuery(&parsedAST, scoring, nctx)
 	if scoring && qsq.Boost != nil && *qsq.Boost != 1.0 && compiled.ScoreSQL != "" && compiled.ScoreSQL != "0.0" {
 		compiled.ScoreSQL = fmt.Sprintf("((%s) * %.4f)", compiled.ScoreSQL, *qsq.Boost)
 	}
-	if rewrittenRaw, ok := t.rewriteDoris4SearchQuery(raw); ok && t.Opts.UseDoris4SearchFunc && nctx == nil && defaultField != "__unmatched_wildcard__" && !strings.ContainsAny(raw, "[{><~/^") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, "`n__") {
+	if rewrittenRaw, ok := t.rewriteDoris4SearchQuery(raw); ok && t.Opts.UseDoris4SearchFunc && nctx == nil && qsq.MinimumShouldMatch == nil && defaultField != "__unmatched_wildcard__" && !strings.ContainsAny(raw, "[{><~/^") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, "`n__") {
 		if len(expandedFields) > 1 {
 			if canEmitMultiFieldDoris4SearchDisjunction(rewrittenRaw, defaultOp) {
 				var searchPreds []string
@@ -253,8 +256,15 @@ func parseSimpleLuceneToASTWithDepth(expr, defaultField string, fields []string,
 			hasOR = true
 			prevWasClause = false
 			tok = "OR"
-		case "NOT", "+", "-", "!":
+		case "+":
+			if prevWasClause {
+				hasAND = true
+				tok = "AND"
+			}
 			prevWasClause = false
+		case "NOT", "-", "!":
+			prevWasClause = false
+			tok = "NOT"
 		default:
 			isUnaryPrefix := strings.HasPrefix(tok, "+") || strings.HasPrefix(tok, "-") || strings.HasPrefix(tok, "!")
 			if prevWasClause && defaultOp == "OR" && !isUnaryPrefix {
@@ -327,6 +337,7 @@ func parseSimpleLuceneToASTWithDepth(expr, defaultField string, fields []string,
 func parseLuceneTokenSlice(tokens []string, defaultField string, fields []string, groupOp string, defaultOp string, depth int) esast.Query {
 	boolQ := &esast.BoolQuery{}
 	negateNext := false
+	forceMustNext := false
 
 	for i := 0; i < len(tokens); i++ {
 		tok := tokens[i]
@@ -334,15 +345,17 @@ func parseLuceneTokenSlice(tokens []string, defaultField string, fields []string
 		if upper == "AND" || upper == "&&" || upper == "OR" || upper == "||" || upper == "|" {
 			continue
 		}
-		if upper == "NOT" || tok == "!" {
+		if upper == "NOT" || tok == "!" || tok == "-" {
 			negateNext = true
 			continue
 		}
-		if tok == "+" || tok == "-" {
+		if tok == "+" {
+			forceMustNext = true
 			continue
 		}
 
-		mustClause := false
+		mustClause := forceMustNext
+		forceMustNext = false
 		if (strings.HasPrefix(tok, "-") || strings.HasPrefix(tok, "!")) && len(tok) > 1 {
 			negateNext = true
 			tok = tok[1:]

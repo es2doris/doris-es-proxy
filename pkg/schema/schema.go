@@ -79,6 +79,8 @@ type FieldBinding struct {
 	IsMultiValued      bool
 	CopyTo             []string
 	NullValue          any
+	IgnoreAbove        int
+	AliasTarget        string
 }
 
 // EffectiveLowercase returns true if this field (or its `.keyword` companion when `preferKeyword` is true)
@@ -175,10 +177,36 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 		}
 	}
 	for target := range copyToTargets {
-		if tb, ok := s.Fields[target]; ok && tb.Kind == StoragePromotedScalar && tb.ESType != "text" {
-			tb.Kind = StoragePromotedArray
-			tb.IsMultiValued = true
-			s.Fields[target] = tb
+		if tb, ok := s.Fields[target]; ok {
+			if tb.Kind == StoragePromotedScalar && tb.ESType != "text" {
+				tb.Kind = StoragePromotedArray
+				tb.IsMultiValued = true
+				s.Fields[target] = tb
+			} else if tb.ESType == "text" && tb.KeywordCompanion != "" {
+				if kwB, hasKw := s.Fields[target+".keyword"]; hasKw && kwB.Kind == StoragePromotedScalar {
+					kwB.Kind = StoragePromotedArray
+					kwB.IsMultiValued = true
+					s.Fields[target+".keyword"] = kwB
+				}
+			}
+		}
+	}
+
+	for pass := 0; pass < 4; pass++ {
+		changed := false
+		for k, b := range s.Fields {
+			if b.AliasTarget != "" && b.ColumnName == "" {
+				if tb, ok := s.Fields[b.AliasTarget]; ok && tb.ColumnName != "" {
+					aliased := tb
+					aliased.ESFieldPath = k
+					aliased.AliasTarget = b.AliasTarget
+					s.Fields[k] = aliased
+					changed = true
+				}
+			}
+		}
+		if !changed {
+			break
 		}
 	}
 
@@ -191,7 +219,7 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 	s.OrderedFields = make([]FieldBinding, 0, len(fieldKeys))
 	for _, k := range fieldKeys {
 		b := s.Fields[k]
-		if b.ColumnName == "" || seenCols[b.ColumnName] {
+		if b.AliasTarget != "" || b.ColumnName == "" || seenCols[b.ColumnName] {
 			continue
 		}
 		seenCols[b.ColumnName] = true
@@ -265,6 +293,9 @@ func DeepMergeMappingProperties(
 			if v.Type != "" {
 				merged.Type = v.Type
 			}
+			if v.Path != "" {
+				merged.Path = v.Path
+			}
 			if v.Analyzer != "" {
 				merged.Analyzer = v.Analyzer
 			}
@@ -297,6 +328,9 @@ func DeepMergeMappingProperties(
 			}
 			if v.NullValue != nil {
 				merged.NullValue = v.NullValue
+			}
+			if v.IgnoreAbove > 0 {
+				merged.IgnoreAbove = v.IgnoreAbove
 			}
 			if len(v.Properties) > 0 {
 				merged.Properties = DeepMergeMappingProperties(existing.Properties, v.Properties)
@@ -435,6 +469,14 @@ func (s *IndexSchema) registerLeafField(
 ) {
 	dorisType := mapESTypeToDoris(prop.Type)
 	esType := strings.ToLower(strings.TrimSpace(prop.Type))
+	if esType == "alias" && prop.Path != "" {
+		s.Fields[dotPath] = FieldBinding{
+			ESFieldPath: dotPath,
+			ESType:      "alias",
+			AliasTarget: prop.Path,
+		}
+		return
+	}
 	lowerNorm := prop.Normalizer != "" && !strings.EqualFold(prop.Normalizer, "none")
 	copyTo := parseCopyToTargets(prop.CopyTo)
 
@@ -463,6 +505,7 @@ func (s *IndexSchema) registerLeafField(
 			IsMultiValued:       prop.MultiValued || len(relJSONPath) > 1 || DefaultMultiValuedPaths[dotPath],
 			CopyTo:              copyTo,
 			NullValue:           prop.NullValue,
+			IgnoreAbove:         prop.IgnoreAbove,
 		}
 		return
 	}
@@ -502,6 +545,7 @@ func (s *IndexSchema) registerLeafField(
 			IsMultiValued:       true,
 			CopyTo:              copyTo,
 			NullValue:           prop.NullValue,
+			IgnoreAbove:         prop.IgnoreAbove,
 		}
 		return
 	}
@@ -518,6 +562,7 @@ func (s *IndexSchema) registerLeafField(
 		LowercaseNormalizer: lowerNorm,
 		CopyTo:              copyTo,
 		NullValue:           prop.NullValue,
+		IgnoreAbove:         prop.IgnoreAbove,
 	}
 }
 
