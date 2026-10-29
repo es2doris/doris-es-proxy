@@ -77,6 +77,8 @@ type FieldBinding struct {
 	RelativeJSONPath   []string // Path inside each nested element, e.g. ["tags", "tagFQN"]
 	PrefilterArrayCol  string   // e.g. "n__columns__tags__tagFQN" (`ARRAY<STRING>` with `USING INVERTED`)
 	IsMultiValued      bool
+	CopyTo             []string
+	NullValue          any
 }
 
 // EffectiveLowercase returns true if this field (or its `.keyword` companion when `preferKeyword` is true)
@@ -166,6 +168,20 @@ func CompileIndexSchema(dorisDB, indexName string, mapping *esast.MappingSpec) *
 }
 
 func (s *IndexSchema) finalizeCompiledSlices() {
+	copyToTargets := make(map[string]bool)
+	for _, b := range s.Fields {
+		for _, target := range b.CopyTo {
+			copyToTargets[target] = true
+		}
+	}
+	for target := range copyToTargets {
+		if tb, ok := s.Fields[target]; ok && tb.Kind == StoragePromotedScalar && tb.ESType != "text" {
+			tb.Kind = StoragePromotedArray
+			tb.IsMultiValued = true
+			s.Fields[target] = tb
+		}
+	}
+
 	fieldKeys := make([]string, 0, len(s.Fields))
 	for k := range s.Fields {
 		fieldKeys = append(fieldKeys, k)
@@ -276,6 +292,12 @@ func DeepMergeMappingProperties(
 			if v.UpgradedArray {
 				merged.UpgradedArray = true
 			}
+			if v.CopyTo != nil {
+				merged.CopyTo = v.CopyTo
+			}
+			if v.NullValue != nil {
+				merged.NullValue = v.NullValue
+			}
 			if len(v.Properties) > 0 {
 				merged.Properties = DeepMergeMappingProperties(existing.Properties, v.Properties)
 			}
@@ -376,6 +398,34 @@ func (s *IndexSchema) compileProperties(
 	}
 }
 
+func parseCopyToTargets(raw any) []string {
+	switch v := raw.(type) {
+	case string:
+		if s := strings.TrimSpace(v); s != "" {
+			return []string{s}
+		}
+	case []string:
+		var out []string
+		for _, item := range v {
+			if s := strings.TrimSpace(item); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []any:
+		var out []string
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				if s = strings.TrimSpace(s); s != "" {
+					out = append(out, s)
+				}
+			}
+		}
+		return out
+	}
+	return nil
+}
+
 func (s *IndexSchema) registerLeafField(
 	dotPath string,
 	sourceJSONPath []string,
@@ -386,6 +436,7 @@ func (s *IndexSchema) registerLeafField(
 	dorisType := mapESTypeToDoris(prop.Type)
 	esType := strings.ToLower(strings.TrimSpace(prop.Type))
 	lowerNorm := prop.Normalizer != "" && !strings.EqualFold(prop.Normalizer, "none")
+	copyTo := parseCopyToTargets(prop.CopyTo)
 
 	if activeNestedRoot != "" {
 		corrCol := s.NestedRoots[activeNestedRoot]
@@ -410,6 +461,8 @@ func (s *IndexSchema) registerLeafField(
 			RelativeJSONPath:    relJSONPath,
 			PrefilterArrayCol:   prefilterCol,
 			IsMultiValued:       prop.MultiValued || len(relJSONPath) > 1 || DefaultMultiValuedPaths[dotPath],
+			CopyTo:              copyTo,
+			NullValue:           prop.NullValue,
 		}
 		return
 	}
@@ -447,6 +500,8 @@ func (s *IndexSchema) registerLeafField(
 			Format:              prop.Format,
 			LowercaseNormalizer: lowerNorm,
 			IsMultiValued:       true,
+			CopyTo:              copyTo,
+			NullValue:           prop.NullValue,
 		}
 		return
 	}
@@ -461,6 +516,8 @@ func (s *IndexSchema) registerLeafField(
 		Format:              prop.Format,
 		Analyzer:            prop.Analyzer,
 		LowercaseNormalizer: lowerNorm,
+		CopyTo:              copyTo,
+		NullValue:           prop.NullValue,
 	}
 }
 

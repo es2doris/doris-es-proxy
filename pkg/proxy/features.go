@@ -1872,9 +1872,17 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		if srcField != "" && dstField != "" {
 			srcField = fmt.Sprintf("%v", expandIngestTemplate(srcField, doc))
 			dstField = fmt.Sprintf("%v", expandIngestTemplate(dstField, doc))
+			if srcField == dstField {
+				return false, false, procType, procTag, specMap, fmt.Errorf("source and target_field are the same: [%s]", srcField)
+			}
+			if override, hasOverride := specMap["override"].(bool); hasOverride && !override {
+				if existing, exists := getIngestPath(doc, dstField); exists && existing != nil {
+					return false, false, procType, procTag, specMap, nil
+				}
+			}
 			if val, exists := getIngestPath(doc, srcField); exists {
-				setIngestPath(doc, dstField, val)
 				deleteIngestPath(doc, srcField)
+				setIngestPath(doc, dstField, val)
 				mutated = true
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", srcField)
@@ -2005,6 +2013,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		if tf, _ := specMap["target_field"].(string); tf != "" {
 			target = tf
 		}
+		preserveTrailing, _ := specMap["preserve_trailing"].(bool)
 		if field != "" && sep != "" {
 			if val, ok := getIngestPath(doc, field); ok {
 				if strVal, ok := val.(string); ok {
@@ -2015,6 +2024,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						parts = re.Split(strVal, -1)
 					} else {
 						parts = strings.Split(strVal, sep)
+					}
+					if !preserveTrailing && strVal != "" {
+						for len(parts) > 0 && parts[len(parts)-1] == "" {
+							parts = parts[:len(parts)-1]
+						}
 					}
 					out := make([]any, len(parts))
 					for i, pt := range parts {
@@ -2190,9 +2204,32 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		fieldSplit, _ := specMap["field_split"].(string)
 		valueSplit, _ := specMap["value_split"].(string)
 		targetField, _ := specMap["target_field"].(string)
+		prefix, _ := specMap["prefix"].(string)
+		trimKey, _ := specMap["trim_key"].(string)
+		trimVal, _ := specMap["trim_value"].(string)
+		stripBrackets, _ := specMap["strip_brackets"].(bool)
+		var includeSet, excludeSet map[string]bool
+		if incArr, ok := specMap["include_keys"].([]any); ok && len(incArr) > 0 {
+			includeSet = make(map[string]bool, len(incArr))
+			for _, item := range incArr {
+				includeSet[fmt.Sprintf("%v", item)] = true
+			}
+		}
+		if excArr, ok := specMap["exclude_keys"].([]any); ok && len(excArr) > 0 {
+			excludeSet = make(map[string]bool, len(excArr))
+			for _, item := range excArr {
+				excludeSet[fmt.Sprintf("%v", item)] = true
+			}
+		}
 		if field != "" && fieldSplit != "" && valueSplit != "" {
 			if val, exists := getIngestPath(doc, field); exists {
 				if strVal, ok := val.(string); ok {
+					if stripBrackets && len(strVal) >= 2 {
+						first, last := strVal[0], strVal[len(strVal)-1]
+						if (first == '[' && last == ']') || (first == '(' && last == ')') || (first == '<' && last == '>') {
+							strVal = strVal[1 : len(strVal)-1]
+						}
+					}
 					var pairs []string
 					if fieldSplit == "|" || fieldSplit == "." {
 						pairs = strings.Split(strVal, fieldSplit)
@@ -2201,21 +2238,57 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					} else {
 						pairs = strings.Split(strVal, fieldSplit)
 					}
+					var valSplitRe *regexp.Regexp
+					if valueSplit != "=" && valueSplit != ":" && valueSplit != "|" && valueSplit != "." {
+						valSplitRe, _ = regexp.Compile(valueSplit)
+					}
 					kvMap := make(map[string]any)
 					for _, pair := range pairs {
 						if pair == "" {
 							continue
 						}
-						idx := strings.Index(pair, valueSplit)
-						if idx <= 0 {
+						var k, v string
+						if valSplitRe != nil {
+							loc := valSplitRe.FindStringIndex(pair)
+							if loc == nil || loc[0] <= 0 {
+								continue
+							}
+							k = pair[:loc[0]]
+							v = pair[loc[1]:]
+						} else {
+							idx := strings.Index(pair, valueSplit)
+							if idx <= 0 {
+								continue
+							}
+							k = pair[:idx]
+							v = pair[idx+len(valueSplit):]
+						}
+						k = strings.TrimSpace(k)
+						if trimKey != "" {
+							k = strings.Trim(k, trimKey)
+						}
+						if includeSet != nil && !includeSet[k] {
 							continue
 						}
-						k := strings.TrimSpace(pair[:idx])
-						v := strings.TrimSpace(pair[idx+len(valueSplit):])
-						kvMap[k] = v
+						if excludeSet != nil && excludeSet[k] {
+							continue
+						}
+						v = strings.TrimSpace(v)
+						if stripBrackets && len(v) >= 2 {
+							first, last := v[0], v[len(v)-1]
+							if (first == '(' && last == ')') || (first == '[' && last == ']') || (first == '<' && last == '>') || (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+								v = v[1 : len(v)-1]
+							}
+						}
+						if trimVal != "" {
+							v = strings.Trim(v, trimVal)
+						}
+						kvMap[prefix+k] = v
 					}
 					if targetField != "" {
-						setIngestPath(doc, targetField, map[string]any{})
+						if existing, ok := getIngestPath(doc, targetField); !ok || existing == nil {
+							setIngestPath(doc, targetField, map[string]any{})
+						}
 						for k, v := range kvMap {
 							setIngestPath(doc, targetField+"."+k, v)
 						}

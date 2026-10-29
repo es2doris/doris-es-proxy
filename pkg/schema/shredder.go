@@ -99,6 +99,9 @@ func ShredDocument(
 		switch b.Kind {
 		case StoragePromotedScalar:
 			val := extractScalarValue(parsedDoc, b.SourceJSONPath)
+			if val == nil && b.NullValue != nil && hasExplicitNullAtPath(parsedDoc, b.SourceJSONPath) {
+				val = b.NullValue
+			}
 			val = coerceScalarForDoris(val, b.DorisType, b.LowercaseNormalizer, getNow())
 			if b.ESType == "date_nanos" {
 				if iv, ok := val.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
@@ -109,7 +112,7 @@ func ShredDocument(
 				row[b.ColumnName] = val
 			}
 		case StoragePromotedArray, StorageNestedSubfield:
-			vals := extractStringSliceValues(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer)
+			vals := extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer, b.NullValue)
 			if b.ESType == "date" || b.ESType == "date_nanos" {
 				for i, v := range vals {
 					if iv, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
@@ -139,6 +142,62 @@ func ShredDocument(
 			vec := extractFloatSliceValues(parsedDoc, b.SourceJSONPath)
 			if len(vec) > 0 {
 				row[b.ColumnName] = vec
+			}
+		}
+	}
+
+	// Propagate `copy_to` field values to target bindings
+	for _, b := range fieldsToVisit {
+		if len(b.CopyTo) == 0 {
+			continue
+		}
+		srcVals := extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, false, b.NullValue)
+		if len(srcVals) == 0 {
+			continue
+		}
+		for _, targetField := range b.CopyTo {
+			tb, ok := s.Fields[targetField]
+			if !ok {
+				continue
+			}
+			switch tb.Kind {
+			case StoragePromotedScalar:
+				joined := strings.Join(srcVals, " ")
+				coerced := coerceScalarForDoris(joined, tb.DorisType, tb.LowercaseNormalizer, getNow())
+				if coerced != nil {
+					if existing, exists := row[tb.ColumnName]; exists && existing != nil {
+						if tb.DorisType == DorisString || tb.DorisType == DorisVarchar {
+							row[tb.ColumnName] = fmt.Sprintf("%v %v", existing, coerced)
+						}
+					} else {
+						row[tb.ColumnName] = coerced
+					}
+				}
+				if tb.KeywordCompanion != "" {
+					kwVal := joined
+					if tb.KeywordNormalizer {
+						kwVal = strings.ToLower(kwVal)
+					}
+					if existing, exists := row[tb.KeywordCompanion]; exists && existing != nil {
+						row[tb.KeywordCompanion] = fmt.Sprintf("%v %s", existing, kwVal)
+					} else {
+						row[tb.KeywordCompanion] = kwVal
+					}
+				}
+			case StoragePromotedArray, StorageNestedSubfield:
+				var cur []string
+				if existing, ok := row[tb.ColumnName].([]string); ok {
+					cur = append(cur, existing...)
+				}
+				for _, sv := range srcVals {
+					if tb.LowercaseNormalizer {
+						sv = strings.ToLower(sv)
+					}
+					cur = append(cur, sv)
+				}
+				if len(cur) > 0 {
+					row[tb.ColumnName] = cur
+				}
 			}
 		}
 	}
@@ -583,6 +642,42 @@ func roundTimeToUnit(t time.Time, roundUnit byte, roundUp bool) time.Time {
 	return t
 }
 
+func hasExplicitNullAtPath(node any, path []string) bool {
+	if len(path) == 0 {
+		if node == nil {
+			return true
+		}
+		if arr, ok := node.([]any); ok {
+			for _, elem := range arr {
+				if elem == nil {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if node == nil {
+		return false
+	}
+	switch curr := node.(type) {
+	case map[string]any:
+		next, exists := curr[path[0]]
+		if !exists {
+			return false
+		}
+		return hasExplicitNullAtPath(next, path[1:])
+	case []any:
+		for _, elem := range curr {
+			if hasExplicitNullAtPath(elem, path) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
 func extractScalarValue(node any, path []string) any {
 	if len(path) == 0 || node == nil {
 		return normalizeScalar(node)
@@ -623,17 +718,24 @@ func normalizeScalar(v any) any {
 	}
 }
 
-func extractStringSliceValues(node any, path []string, lowercase bool) []string {
+func extractStringSliceValuesWithNull(node any, path []string, lowercase bool, nullVal any) []string {
 	var out []string
-	collectStringsAtPath(node, path, lowercase, &out)
+	collectStringsAtPathWithNull(node, path, lowercase, nullVal, &out)
 	return out
 }
 
-func collectStringsAtPath(node any, path []string, lowercase bool, out *[]string) {
-	if node == nil {
-		return
-	}
+func collectStringsAtPathWithNull(node any, path []string, lowercase bool, nullVal any, out *[]string) {
 	if len(path) == 0 {
+		if node == nil {
+			if nullVal != nil {
+				s := fmt.Sprintf("%v", nullVal)
+				if lowercase {
+					s = strings.ToLower(s)
+				}
+				*out = append(*out, s)
+			}
+			return
+		}
 		switch v := node.(type) {
 		case string:
 			if lowercase {
@@ -642,7 +744,7 @@ func collectStringsAtPath(node any, path []string, lowercase bool, out *[]string
 			*out = append(*out, v)
 		case []any:
 			for _, item := range v {
-				collectStringsAtPath(item, nil, lowercase, out)
+				collectStringsAtPathWithNull(item, nil, lowercase, nullVal, out)
 			}
 		default:
 			s := fmt.Sprintf("%v", v)
@@ -653,15 +755,18 @@ func collectStringsAtPath(node any, path []string, lowercase bool, out *[]string
 		}
 		return
 	}
+	if node == nil {
+		return
+	}
 
 	switch curr := node.(type) {
 	case map[string]any:
 		if next, ok := curr[path[0]]; ok {
-			collectStringsAtPath(next, path[1:], lowercase, out)
+			collectStringsAtPathWithNull(next, path[1:], lowercase, nullVal, out)
 		}
 	case []any:
 		for _, elem := range curr {
-			collectStringsAtPath(elem, path, lowercase, out)
+			collectStringsAtPathWithNull(elem, path, lowercase, nullVal, out)
 		}
 	}
 }

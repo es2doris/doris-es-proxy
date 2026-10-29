@@ -981,4 +981,45 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	if r19Aggs == nil || len(r19Aggs["svc_norm"].(map[string]any)["buckets"].([]any)) == 0 {
 		t.Fatalf("expected non-empty R19 svc_norm buckets on live_auto_index, got %+v", r19Aggs)
 	}
+
+	// 21. Round-20: _script sort SQL pushdown, track_scores: true, unary +/-/! query_string with boost, and top-level anonymous filters agg
+	r20SearchResp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
+		"track_scores": true,
+		"query": {
+			"query_string": {
+				"query": "+service:checkout -service:nonexistent",
+				"boost": 2.5
+			}
+		},
+		"sort": [
+			{"_script": {"type": "number", "script": "doc['latency_ms'].value * 3", "order": "desc"}}
+		],
+		"aggs": {
+			"anon_f": {
+				"filters": {
+					"filters": [
+						{"term": {"service": "checkout"}},
+						{"term": {"service": "missing"}}
+					]
+				}
+			}
+		}
+	}`))
+	if err != nil || r20SearchResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search (R20 track_scores + query_string + anonymous filters) failed: status=%v err=%v", r20SearchResp.StatusCode, err)
+	}
+	var r20SearchRes map[string]any
+	_ = json.NewDecoder(r20SearchResp.Body).Decode(&r20SearchRes)
+	_ = r20SearchResp.Body.Close()
+	r20Hits := r20SearchRes["hits"].(map[string]any)["hits"].([]any)
+	if len(r20Hits) == 0 || r20Hits[0].(map[string]any)["_score"] == nil {
+		t.Fatalf("expected non-empty R20 hits with non-null _score when track_scores=true, got %+v", r20Hits)
+	}
+	r20Aggs, _ := r20SearchRes["aggregations"].(map[string]any)
+	if r20Aggs == nil {
+		t.Fatalf("expected R20 aggregations, got nil")
+	}
+	if _, ok := r20Aggs["anon_f"].(map[string]any)["buckets"].([]any); !ok {
+		t.Fatalf("expected R20 anon_f.buckets array, got %T %+v", r20Aggs["anon_f"], r20Aggs["anon_f"])
+	}
 }

@@ -55,6 +55,7 @@ type SearchRequest struct {
 	SearchAfter    []any              `json:"search_after,omitempty"`
 	Source         *SourceFilter      `json:"_source,omitempty"`
 	TrackTotalHits any                `json:"track_total_hits,omitempty"`
+	TrackScores    *bool              `json:"track_scores,omitempty"`
 	Highlight      *HighlightSpec     `json:"highlight,omitempty"`
 	Collapse       *CollapseSpec      `json:"collapse,omitempty"`
 	PIT            *PITSpec           `json:"pit,omitempty"`
@@ -216,6 +217,7 @@ type InnerHitsSpec struct {
 	From           int                `json:"from,omitempty"`
 	Size           *int               `json:"size,omitempty"`
 	Sort           SortSlice          `json:"sort,omitempty"`
+	TrackScores    *bool              `json:"track_scores,omitempty"`
 	Source         *SourceFilter      `json:"_source,omitempty"`
 	Fields         []FieldRequestSpec `json:"fields,omitempty"`
 	DocvalueFields []FieldRequestSpec `json:"docvalue_fields,omitempty"`
@@ -848,6 +850,7 @@ type QueryStringQuery struct {
 	DefaultField    string   `json:"default_field,omitempty"`
 	Fields          []string `json:"fields,omitempty"`
 	DefaultOperator string   `json:"default_operator,omitempty"`
+	Boost           *float64 `json:"boost,omitempty"`
 }
 
 type NestedQuery struct {
@@ -1095,6 +1098,7 @@ type MovingAvgAggSpec struct {
 	Model       string `json:"model,omitempty"`
 	Script      any    `json:"script,omitempty"`
 	GapPolicy   string `json:"gap_policy,omitempty"`
+	Format      string `json:"format,omitempty"`
 	Shift       *int   `json:"shift,omitempty"`
 }
 
@@ -1348,6 +1352,7 @@ type TopHitsAggSpec struct {
 	From           int                `json:"from,omitempty"`
 	Size           *int               `json:"size,omitempty"`
 	Sort           SortSlice          `json:"sort,omitempty"`
+	TrackScores    *bool              `json:"track_scores,omitempty"`
 	Source         *SourceFilter      `json:"_source,omitempty"`
 	Fields         []FieldRequestSpec `json:"fields,omitempty"`
 	DocvalueFields []FieldRequestSpec `json:"docvalue_fields,omitempty"`
@@ -1651,6 +1656,11 @@ func (m *MetricAggSpec) EffectiveSigma() float64 {
 	return 2.0
 }
 
+type NestedSortSpec struct {
+	Path   string `json:"path,omitempty"`
+	Filter *Query `json:"filter,omitempty"`
+}
+
 type SortEntry = SortFieldSpec
 
 type SortFieldSpec struct {
@@ -1660,6 +1670,7 @@ type SortFieldSpec struct {
 	Missing string
 	Script  any
 	Type    string
+	Nested  *NestedSortSpec
 }
 
 type SortSpec struct {
@@ -1778,8 +1789,9 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 
 	reservedOpts := map[string]bool{
 		"order": true, "mode": true, "missing": true, "unmapped_type": true,
-		"numeric_type": true, "format": true, "nested": true, "unit": true,
-		"distance_type": true, "validation_method": true, "ignore_unmapped": true,
+		"numeric_type": true, "format": true, "nested": true, "nested_path": true,
+		"nested_filter": true, "unit": true, "distance_type": true,
+		"validation_method": true, "ignore_unmapped": true,
 	}
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -1798,16 +1810,42 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 		}
 		missing := ""
 		mode := ""
+		var nestedSpec *NestedSortSpec
+		if rawNested, hasNested := m["nested"]; hasNested {
+			var ns NestedSortSpec
+			if json.Unmarshal(rawNested, &ns) == nil && (ns.Path != "" || ns.Filter != nil) {
+				nestedSpec = &ns
+			}
+		}
+		if nestedSpec == nil {
+			var np string
+			var nf *Query
+			if rawNP, ok := m["nested_path"]; ok {
+				_ = json.Unmarshal(rawNP, &np)
+			}
+			if rawNF, ok := m["nested_filter"]; ok {
+				var q Query
+				if json.Unmarshal(rawNF, &q) == nil {
+					nf = &q
+				}
+			}
+			if np != "" || nf != nil {
+				nestedSpec = &NestedSortSpec{Path: np, Filter: nf}
+			}
+		}
 		valTrimmed := bytes.TrimSpace(rawVal)
 		if len(valTrimmed) > 0 && valTrimmed[0] == '"' {
 			_ = json.Unmarshal(valTrimmed, &order)
 		} else if len(valTrimmed) > 0 && valTrimmed[0] == '{' {
 			var obj struct {
-				Order        string `json:"order"`
-				Mode         string `json:"mode"`
-				Missing      any    `json:"missing"`
-				UnmappedType string `json:"unmapped_type"`
-				NumericType  string `json:"numeric_type"`
+				Order        string          `json:"order"`
+				Mode         string          `json:"mode"`
+				Missing      any             `json:"missing"`
+				UnmappedType string          `json:"unmapped_type"`
+				NumericType  string          `json:"numeric_type"`
+				Nested       *NestedSortSpec `json:"nested"`
+				NestedPath   string          `json:"nested_path"`
+				NestedFilter *Query          `json:"nested_filter"`
 			}
 			_ = json.Unmarshal(valTrimmed, &obj)
 			if obj.Order != "" {
@@ -1823,14 +1861,19 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 					missing = fmt.Sprintf("%v", obj.Missing)
 				}
 			}
+			if obj.Nested != nil && (obj.Nested.Path != "" || obj.Nested.Filter != nil) {
+				nestedSpec = obj.Nested
+			} else if obj.NestedPath != "" || obj.NestedFilter != nil {
+				nestedSpec = &NestedSortSpec{Path: obj.NestedPath, Filter: obj.NestedFilter}
+			}
 			sortType := obj.UnmappedType
 			if sortType == "" {
 				sortType = obj.NumericType
 			}
-			s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Type: strings.ToLower(sortType)}
+			s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Type: strings.ToLower(sortType), Nested: nestedSpec}
 			return nil
 		}
-		s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing}
+		s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Nested: nestedSpec}
 	}
 	return nil
 }
@@ -1944,6 +1987,8 @@ type FieldProperty struct {
 	Similarity     string                   `json:"similarity,omitempty"`
 	MultiValued    bool                     `json:"multi_valued,omitempty"`
 	UpgradedArray  bool                     `json:"upgraded_array,omitempty"`
+	CopyTo         any                      `json:"copy_to,omitempty"`
+	NullValue      any                      `json:"null_value,omitempty"`
 	Fields         map[string]FieldProperty `json:"fields,omitempty"`
 	Properties     map[string]FieldProperty `json:"properties,omitempty"`
 }
