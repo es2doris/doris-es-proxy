@@ -3268,14 +3268,17 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 			batches++
 
 			type pendingUpdate struct {
-				id      string
-				oldID   string
-				version int64
-				isDel   bool
-				source  json.RawMessage
+				id          string
+				oldID       string
+				oldIndex    string
+				targetIndex string
+				version     int64
+				isDel       bool
+				source      json.RawMessage
 			}
 			var pending []pendingUpdate
-			var sampleDocs []json.RawMessage
+			sampleDocsByIdx := make(map[string][]json.RawMessage)
+			candIDsByIdx := make(map[string][]string)
 			for _, h := range hits {
 				if maxDocs > 0 && totalMatched >= maxDocs {
 					break
@@ -3303,8 +3306,10 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 				}
 				isDel := opRes == "deleted"
 				targetDocID := h.ID
+				targetIdx := indexName
+				targetAliasFilter := aliasFilters[indexName]
 				if !isDel && len(mutated) > 0 {
-					piped, _, nextID, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithMeta(indexName, h.ID, r.URL.Query().Get("pipeline"), body.Pipeline, mutated)
+					piped, nextIdx, nextID, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithMeta(indexName, h.ID, r.URL.Query().Get("pipeline"), body.Pipeline, mutated)
 					if pipeErr != nil {
 						writeESError(w, http.StatusBadRequest, "ingest_processor_exception", pipeErr.Error())
 						return
@@ -3315,9 +3320,18 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 					if nextID != "" {
 						targetDocID = nextID
 					}
+					if nextIdx != "" && nextIdx != indexName {
+						resolvedIdx, resolvedFilter, rErr := s.resolveWriteIndexWithFilter(nextIdx)
+						if rErr != nil {
+							writeESError(w, http.StatusBadRequest, "illegal_argument_exception", rErr.Error())
+							return
+						}
+						targetIdx = resolvedIdx
+						targetAliasFilter = resolvedFilter
+					}
 					mutated = piped
 				}
-				if !isDel && aliasFilters[indexName] != nil && !s.docMatchesAliasFilter(r.Context(), indexName, targetDocID, mutated, aliasFilters[indexName]) {
+				if !isDel && targetAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), targetIdx, targetDocID, mutated, targetAliasFilter) {
 					if conflictsProceed {
 						versionConflicts++
 						continue
@@ -3327,39 +3341,96 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				if !isDel && len(mutated) > 0 {
-					sampleDocs = append(sampleDocs, mutated)
+					sampleDocsByIdx[targetIdx] = append(sampleDocsByIdx[targetIdx], mutated)
 				}
 				oldID := ""
-				if !isDel && targetDocID != h.ID {
+				oldIndex := ""
+				if !isDel && (targetDocID != h.ID || targetIdx != indexName) {
 					oldID = h.ID
+					oldIndex = indexName
+					candIDsByIdx[targetIdx] = append(candIDsByIdx[targetIdx], targetDocID)
 				}
-				pending = append(pending, pendingUpdate{id: targetDocID, oldID: oldID, version: h.Version, isDel: isDel, source: mutated})
+				pending = append(pending, pendingUpdate{
+					id:          targetDocID,
+					oldID:       oldID,
+					oldIndex:    oldIndex,
+					targetIndex: targetIdx,
+					version:     h.Version,
+					isDel:       isDel,
+					source:      mutated,
+				})
 			}
 
-			if len(sampleDocs) > 0 {
-				idxSchema = s.ensureWritableIndexSchemaWithDocs(r.Context(), indexName, sampleDocs)
+			schemasByIdx := map[string]*schema.IndexSchema{indexName: idxSchema}
+			for tIdx, sDocs := range sampleDocsByIdx {
+				sch := s.ensureWritableIndexSchemaWithDocs(r.Context(), tIdx, sDocs)
+				schemasByIdx[tIdx] = sch
+				if tIdx == indexName {
+					idxSchema = sch
+				}
+			}
+			existingByIdx := make(map[string]map[string]HitRow, len(candIDsByIdx))
+			for tIdx, ids := range candIDsByIdx {
+				if len(ids) == 0 {
+					continue
+				}
+				sch := schemasByIdx[tIdx]
+				if sch == nil {
+					sch = s.ensureIndexSchema(r.Context(), tIdx)
+					schemasByIdx[tIdx] = sch
+				}
+				_ = s.coalescer.FlushTable(r.Context(), sch.DorisTable)
+				ex, _ := s.backend.GetDocsByIDs(r.Context(), sch.DorisDB, sch.DorisTable, ids)
+				existingByIdx[tIdx] = ex
 			}
 
-			var batchBuf bytes.Buffer
+			batchBufByTable := make(map[string]*bytes.Buffer)
+			var tableOrder []string
+			getTableBuf := func(table string) *bytes.Buffer {
+				buf, ok := batchBufByTable[table]
+				if !ok {
+					buf = &bytes.Buffer{}
+					batchBufByTable[table] = buf
+					tableOrder = append(tableOrder, table)
+				}
+				return buf
+			}
 			for _, pu := range pending {
 				if pu.oldID != "" {
+					oldSch := schemasByIdx[pu.oldIndex]
+					if oldSch == nil {
+						oldSch = idxSchema
+					}
 					tombVer := s.allocVersion(pu.version + 1)
-					tombShredded, err := schema.ShredDocument(idxSchema, pu.oldID, tombVer, true, nil)
+					tombShredded, err := schema.ShredDocument(oldSch, pu.oldID, tombVer, true, nil)
 					if err != nil {
 						writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 						return
 					}
-					batchBuf.Write(tombShredded)
-					batchBuf.WriteByte('\n')
+					tBuf := getTableBuf(oldSch.DorisTable)
+					tBuf.Write(tombShredded)
+					tBuf.WriteByte('\n')
 				}
-				nextVer := s.allocVersion(pu.version + 1)
-				shredded, err := schema.ShredDocument(idxSchema, pu.id, nextVer, pu.isDel, pu.source)
+				tSch := schemasByIdx[pu.targetIndex]
+				if tSch == nil {
+					tSch = s.ensureIndexSchema(r.Context(), pu.targetIndex)
+					schemasByIdx[pu.targetIndex] = tSch
+				}
+				minVer := pu.version + 1
+				if exMap := existingByIdx[pu.targetIndex]; exMap != nil {
+					if exDoc, exists := exMap[pu.id]; exists && exDoc.Version+1 > minVer {
+						minVer = exDoc.Version + 1
+					}
+				}
+				nextVer := s.allocVersion(minVer)
+				shredded, err := schema.ShredDocument(tSch, pu.id, nextVer, pu.isDel, pu.source)
 				if err != nil {
 					writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 					return
 				}
-				batchBuf.Write(shredded)
-				batchBuf.WriteByte('\n')
+				buf := getTableBuf(tSch.DorisTable)
+				buf.Write(shredded)
+				buf.WriteByte('\n')
 				if pu.isDel {
 					totalDeleted++
 				} else {
@@ -3367,10 +3438,13 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			if batchBuf.Len() > 0 {
-				if err := s.streamLoad(r.Context(), idxSchema.DorisTable, batchBuf.Bytes(), true); err != nil {
-					writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
-					return
+			for _, tbl := range tableOrder {
+				buf := batchBufByTable[tbl]
+				if buf != nil && buf.Len() > 0 {
+					if err := s.streamLoad(r.Context(), tbl, buf.Bytes(), true); err != nil {
+						writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
+						return
+					}
 				}
 			}
 			searchAfter = []any{hits[len(hits)-1].ID}
@@ -6216,6 +6290,16 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 				if ihMap == nil {
 					ihMap = make(map[string]any, len(nestedWithIH))
 				}
+				ihNameCounts := make(map[string]int, len(nestedWithIH))
+				ihSpecByName := make(map[string]*esast.InnerHitsSpec, len(nestedWithIH))
+				ihPathByName := make(map[string]string, len(nestedWithIH))
+				for _, nq := range nestedWithIH {
+					ihName := nq.Path
+					if nq.InnerHits.Name != "" {
+						ihName = nq.InnerHits.Name
+					}
+					ihNameCounts[ihName]++
+				}
 				for _, nq := range nestedWithIH {
 					ihName := nq.Path
 					if nq.InnerHits.Name != "" {
@@ -6227,7 +6311,10 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 						ihCopy.TrackScores = req.TrackScores
 						nqCopy.InnerHits = &ihCopy
 					}
-					nextIH := buildNestedInnerHitsForHit(h, hitIdx, hitSchema, &nqCopy)
+					ihSpecByName[ihName] = nqCopy.InnerHits
+					ihPathByName[ihName] = nqCopy.Path
+					skipPaging := ihNameCounts[ihName] > 1
+					nextIH := buildNestedInnerHitsForHitWithOpts(h, hitIdx, hitSchema, &nqCopy, skipPaging)
 					if prevIH, exists := ihMap[ihName].(map[string]any); exists {
 						prevCnt := innerHitsTotalCount(prevIH)
 						nextCnt := innerHitsTotalCount(nextIH)
@@ -6240,6 +6327,13 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 						}
 					}
 					ihMap[ihName] = nextIH
+				}
+				for ihName, count := range ihNameCounts {
+					if count > 1 {
+						if curIH, ok := ihMap[ihName].(map[string]any); ok {
+							ihMap[ihName] = finalizeMergedNestedInnerHits(curIH, ihSpecByName[ihName], hitSchema, ihPathByName[ihName])
+						}
+					}
 				}
 				hitMap["inner_hits"] = ihMap
 			}
@@ -6431,13 +6525,6 @@ func mergeNestedInnerHitsEnvelopes(prevIH, nextIH map[string]any, ihSpec *esast.
 	if hasScore {
 		maxScoreAny = maxScore
 	}
-	size := 3
-	if ihSpec != nil {
-		size = ihSpec.EffectiveSize()
-	}
-	if len(merged) > size {
-		merged = merged[:size]
-	}
 	return map[string]any{
 		"hits": map[string]any{
 			"total":     map[string]any{"value": totalVal, "relation": "eq"},
@@ -6445,6 +6532,79 @@ func mergeNestedInnerHitsEnvelopes(prevIH, nextIH map[string]any, ihSpec *esast.
 			"hits":      merged,
 		},
 	}
+}
+
+func finalizeMergedNestedInnerHits(ihEnv map[string]any, ihSpec *esast.InnerHitsSpec, idxSchema *schema.IndexSchema, nestedPath string) map[string]any {
+	hitsEnv, _ := ihEnv["hits"].(map[string]any)
+	if hitsEnv == nil {
+		return ihEnv
+	}
+	hitList, _ := hitsEnv["hits"].([]map[string]any)
+	extractOffset := func(hm map[string]any) int {
+		if nm, ok := hm["_nested"].(map[string]any); ok {
+			if off, okO := nm["offset"].(int); okO {
+				return off
+			}
+			if f, okF := toFloat64(nm["offset"]); okF {
+				return int(f)
+			}
+		}
+		return 0
+	}
+	nestedSchema := deriveNestedEvalSchema(idxSchema, nestedPath)
+	var elemSorts []esast.SortSpec
+	if ihSpec != nil && len(ihSpec.Sort) > 0 {
+		elemSorts = make([]esast.SortSpec, len(ihSpec.Sort))
+		for i, s := range ihSpec.Sort {
+			sc := s
+			sc.Entry.Field = strings.TrimPrefix(sc.Entry.Field, nestedPath+".")
+			elemSorts[i] = sc
+		}
+	}
+	if len(hitList) > 1 {
+		sort.SliceStable(hitList, func(i, j int) bool {
+			if len(elemSorts) > 0 {
+				ri, okI := hitList[i]["__raw_elem"].(HitRow)
+				rj, okJ := hitList[j]["__raw_elem"].(HitRow)
+				if okI && okJ {
+					if cmp := compareHitRowsBySort(ri, rj, elemSorts, nestedSchema); cmp != 0 {
+						return cmp < 0
+					}
+				}
+			} else {
+				s1, ok1 := toFloat64(hitList[i]["_score"])
+				s2, ok2 := toFloat64(hitList[j]["_score"])
+				if ok1 && ok2 && s1 != s2 {
+					return s1 > s2
+				}
+			}
+			return extractOffset(hitList[i]) < extractOffset(hitList[j])
+		})
+	}
+	for _, hm := range hitList {
+		delete(hm, "__raw_elem")
+	}
+	totalVal := int64(len(hitList))
+	from := 0
+	size := 3
+	if ihSpec != nil {
+		if ihSpec.From > 0 {
+			from = ihSpec.From
+		}
+		size = ihSpec.EffectiveSize()
+	}
+	if from >= len(hitList) {
+		hitList = []map[string]any{}
+	} else {
+		end := from + size
+		if end > len(hitList) {
+			end = len(hitList)
+		}
+		hitList = hitList[from:end]
+	}
+	hitsEnv["total"] = map[string]any{"value": totalVal, "relation": "eq"}
+	hitsEnv["hits"] = hitList
+	return ihEnv
 }
 
 func extractNestedElementsAtPath(node any, path []string) []nestedElemCandidate {
@@ -6678,7 +6838,7 @@ func normalizeCollapseGroupKey(val any, field string, primarySchema, hitSchema *
 	return fmt.Sprintf("%v", val)
 }
 
-func buildNestedInnerHitsForHit(h HitRow, hitIdx string, hitSchema *schema.IndexSchema, nq *esast.NestedQuery) map[string]any {
+func buildNestedInnerHitsForHitWithOpts(h HitRow, hitIdx string, hitSchema *schema.IndexSchema, nq *esast.NestedQuery, skipPaging bool) map[string]any {
 	emptyEnvelope := func() map[string]any {
 		return map[string]any{
 			"hits": map[string]any{
@@ -6814,19 +6974,21 @@ func buildNestedInnerHitsForHit(h HitRow, hitIdx string, hitSchema *schema.Index
 		}
 	}
 	totalMatched := int64(len(matched))
-	from := ih.From
-	if from < 0 {
-		from = 0
-	}
-	size := ih.EffectiveSize()
-	if from >= len(matched) {
-		matched = nil
-	} else {
-		end := from + size
-		if end > len(matched) {
-			end = len(matched)
+	if !skipPaging {
+		from := ih.From
+		if from < 0 {
+			from = 0
 		}
-		matched = matched[from:end]
+		size := ih.EffectiveSize()
+		if from >= len(matched) {
+			matched = nil
+		} else {
+			end := from + size
+			if end > len(matched) {
+				end = len(matched)
+			}
+			matched = matched[from:end]
+		}
 	}
 
 	normSF := normalizeInnerHitsSourceFilter(ih.Source, nq.Path)
@@ -6855,6 +7017,9 @@ func buildNestedInnerHitsForHit(h HitRow, hitIdx string, hitSchema *schema.Index
 				"offset": m.offset,
 			},
 			"_score": hitScore,
+		}
+		if skipPaging {
+			ihHitMap["__raw_elem"] = m.hit
 		}
 		if normSF == nil || !normSF.Disabled {
 			var srcObj any
@@ -6962,6 +7127,17 @@ func (s *Server) populateCollapseInnerHits(
 		subReq.From = &zero
 		subReq.Size = &fetchLimit
 		subReqPtr := applyIndexAliasFilter(&subReq, aliasFilters[indexName])
+		needsScript := queryHasRuntimeScript(subReqPtr.Query) ||
+			queryHasRuntimeScript(subReqPtr.PostFilter) ||
+			(subReqPtr.AliasFilter != nil && queryHasRuntimeScript((*esast.Query)(subReqPtr.AliasFilter))) ||
+			(subReqPtr.Query != nil && subReqPtr.Query.FunctionScore != nil && subReqPtr.Query.FunctionScore.MinScore != nil) ||
+			(subReqPtr.Query != nil && subReqPtr.Query.ScriptScore != nil && subReqPtr.Query.ScriptScore.MinScore != nil) ||
+			req.MinScore != nil ||
+			sortsHaveScript(subReqPtr.Sort)
+		if needsScript {
+			subReqPtr.PostFilter = nil
+			subReqPtr.MinScore = nil
+		}
 		tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
 		plan, err := tr.BuildSearchPlan(subReqPtr)
 		if err != nil || plan.HitsSQL == "" {
@@ -6974,13 +7150,44 @@ func (s *Server) populateCollapseInnerHits(
 		for i := range rows {
 			rows[i].Index = indexName
 		}
-		if queryHasRuntimeScript(subReqPtr.Query) || queryHasRuntimeScript(subReqPtr.PostFilter) || (subReqPtr.AliasFilter != nil && queryHasRuntimeScript((*esast.Query)(subReqPtr.AliasFilter))) || (subReqPtr.Query != nil && subReqPtr.Query.FunctionScore != nil && subReqPtr.Query.FunctionScore.MinScore != nil) || sortsHaveScript(subReqPtr.Sort) {
-			rows, _, _ = applyRuntimeSearchScripts(rows, nil, int64(len(rows)), subReqPtr, idxSchema, true)
+		if needsScript {
+			evalReq := applyIndexAliasFilter(req, aliasFilters[indexName])
+			rows, _, _ = applyRuntimeSearchScripts(rows, nil, int64(len(rows)), evalReq, idxSchema, true)
 		}
 		uncollapsed = append(uncollapsed, rows...)
 	}
+	if len(targets) > 1 && len(uncollapsed) > 1 {
+		effSorts := transpiler.EffectiveSortsForRequest(req)
+		sort.SliceStable(uncollapsed, func(i, j int) bool {
+			if len(effSorts) > 0 {
+				sI := schemasByIndex[uncollapsed[i].Index]
+				if sI == nil {
+					sI = primarySchema
+				}
+				sJ := schemasByIndex[uncollapsed[j].Index]
+				if sJ == nil {
+					sJ = primarySchema
+				}
+				if cmp := compareHitRowsBySortWithSchemas(uncollapsed[i], uncollapsed[j], effSorts, sI, sJ); cmp != 0 {
+					return cmp < 0
+				}
+			}
+			if uncollapsed[i].Score != uncollapsed[j].Score {
+				return uncollapsed[i].Score > uncollapsed[j].Score
+			}
+			return uncollapsed[i].ID < uncollapsed[j].ID
+		})
+	}
 	if len(req.Rescore) > 0 && len(uncollapsed) > 0 {
-		uncollapsed = s.applyRescoreToHits(req, uncollapsed, schemasByIndex, primarySchema, len(uncollapsed))
+		defaultWin := 10
+		if req.Size != nil {
+			from := 0
+			if req.From != nil && *req.From > 0 {
+				from = *req.From
+			}
+			defaultWin = from + *req.Size
+		}
+		uncollapsed = s.applyRescoreToHits(req, uncollapsed, schemasByIndex, primarySchema, defaultWin)
 	}
 
 	collapseSort := []esast.SortSpec{{Entry: esast.SortEntry{Field: req.Collapse.Field}}}
@@ -7250,7 +7457,8 @@ func buildAggsMap(
 					case ss.EffectiveTerms() != nil, ss.Cardinality != nil, ss.ValueCount != nil,
 						ss.Avg != nil, ss.Sum != nil, ss.Min != nil, ss.Max != nil,
 						ss.EffectiveStats() != nil, ss.StringStats != nil, ss.Percentiles != nil,
-						ss.PercentileRanks != nil, ss.Boxplot != nil, ss.ReverseNested != nil:
+						ss.PercentileRanks != nil, ss.Boxplot != nil, ss.ReverseNested != nil,
+						ss.ScriptedMetric != nil:
 						directSubAggs[sn] = ss
 					default:
 						groupedSubAggs[sn] = ss
@@ -7264,8 +7472,8 @@ func buildAggsMap(
 				if len(groupedSubAggs) > 0 {
 					attachSubAggsToBucket(indexName, nestedObj, fullKey, "_nested_doc_count", groupedSubAggs, bucketsByAgg, docLookup)
 				}
-				_ = evaluateChildPipelineAggs([]map[string]any{nestedObj}, subAggs)
 				evaluateSiblingPipelineAggs(subAggs, nestedObj)
+				_ = evaluateChildPipelineAggs([]map[string]any{nestedObj}, subAggs)
 			}
 			aggsOut[aggName] = nestedObj
 		case spec.Global != nil || spec.ReverseNested != nil || spec.EffectiveSampler() != nil:
@@ -7278,8 +7486,8 @@ func buildAggsMap(
 				for sk, sv := range buildAggsMap(indexName, fullKey, subAggs, bucketsByAgg, cnt, docLookup) {
 					containerObj[sk] = sv
 				}
-				_ = evaluateChildPipelineAggs([]map[string]any{containerObj}, subAggs)
 				evaluateSiblingPipelineAggs(subAggs, containerObj)
+				_ = evaluateChildPipelineAggs([]map[string]any{containerObj}, subAggs)
 			}
 			aggsOut[aggName] = containerObj
 		case spec.Filter != nil || spec.Missing != nil:
@@ -7292,8 +7500,8 @@ func buildAggsMap(
 				for sk, sv := range buildAggsMap(indexName, fullKey, subAggs, bucketsByAgg, cnt, docLookup) {
 					filterObj[sk] = sv
 				}
-				_ = evaluateChildPipelineAggs([]map[string]any{filterObj}, subAggs)
 				evaluateSiblingPipelineAggs(subAggs, filterObj)
+				_ = evaluateChildPipelineAggs([]map[string]any{filterObj}, subAggs)
 			}
 			aggsOut[aggName] = filterObj
 		case spec.Filters != nil:
@@ -7404,11 +7612,23 @@ func buildAggsMap(
 			}
 			aggsOut[aggName] = map[string]any{"value": cnt}
 		case spec.Avg != nil || spec.Sum != nil || spec.Min != nil || spec.Max != nil:
+			if len(rows) == 0 && (spec.Avg != nil || spec.Min != nil || spec.Max != nil) {
+				aggsOut[aggName] = map[string]any{"value": nil}
+				continue
+			}
 			var val float64
 			if len(rows) > 0 {
 				val = rows[0].effectiveValue()
 			}
 			aggsOut[aggName] = map[string]any{"value": val}
+		case spec.ScriptedMetric != nil:
+			var smVal any
+			if len(rows) > 0 {
+				if idx := strings.IndexByte(rows[0].BucketKey, '\x00'); idx >= 0 {
+					_ = json.Unmarshal([]byte(rows[0].BucketKey[idx+1:]), &smVal)
+				}
+			}
+			aggsOut[aggName] = map[string]any{"value": smVal}
 		case spec.Rate != nil:
 			var val float64
 			if len(rows) > 0 {
@@ -7745,6 +7965,7 @@ func buildAggsMap(
 		}
 	}
 	evaluateSiblingPipelineAggs(aggs, aggsOut)
+	_ = evaluateChildPipelineAggs([]map[string]any{aggsOut}, aggs)
 	return aggsOut
 }
 
@@ -9128,7 +9349,13 @@ func evalMovingWindow(slice []float64, maSpec *esast.MovingAvgAggSpec) float64 {
 		return 0
 	}
 	if maSpec != nil {
-		src := extractScriptSourceString(maSpec.Script)
+		alpha := 0.3
+		if maSpec.Settings != nil {
+			if aVal, ok := toFloat64(maSpec.Settings["alpha"]); ok && aVal > 0 && aVal <= 1 {
+				alpha = aVal
+			}
+		}
+		src, params := extractScriptSourceAndParams(maSpec.Script)
 		switch {
 		case strings.Contains(src, "MovingFunctions.max"):
 			res := slice[0]
@@ -9173,12 +9400,48 @@ func evalMovingWindow(slice []float64, maSpec *esast.MovingAvgAggSpec) float64 {
 			}
 			return wSum / wTotal
 		case strings.Contains(src, "MovingFunctions.ewma"):
-			alpha := 0.3
+			if idx := strings.Index(src, "MovingFunctions.ewma("); idx >= 0 {
+				rest := src[idx+len("MovingFunctions.ewma("):]
+				if closeIdx := strings.IndexByte(rest, ')'); closeIdx >= 0 {
+					args := strings.Split(rest[:closeIdx], ",")
+					if len(args) >= 2 {
+						argStr := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(args[1]), "f"))
+						argStr = strings.TrimSuffix(argStr, "d")
+						if aVal, err := strconv.ParseFloat(argStr, 64); err == nil && aVal > 0 && aVal <= 1 {
+							alpha = aVal
+						} else if params != nil {
+							pKey := strings.TrimPrefix(strings.TrimSpace(args[1]), "params.")
+							if aVal, ok := toFloat64(params[pKey]); ok && aVal > 0 && aVal <= 1 {
+								alpha = aVal
+							}
+						}
+					}
+				}
+			}
 			ewma := slice[0]
 			for idx := 1; idx < len(slice); idx++ {
 				ewma = alpha*slice[idx] + (1-alpha)*ewma
 			}
 			return ewma
+		case strings.Contains(src, "MovingFunctions.unweightedAvg"):
+			var sum float64
+			for _, v := range slice {
+				sum += v
+			}
+			return sum / float64(len(slice))
+		case src != "":
+			evalParams := make(map[string]any, len(params)+1)
+			for k, v := range params {
+				evalParams[k] = v
+			}
+			valsAny := make([]any, len(slice))
+			for i, v := range slice {
+				valsAny[i] = v
+			}
+			evalParams["values"] = valsAny
+			if fv, ok, err := painless.EvalNumber(map[string]any{}, src, evalParams); err == nil && ok {
+				return fv
+			}
 		}
 		switch strings.ToLower(strings.TrimSpace(maSpec.Model)) {
 		case "linear":
@@ -9190,7 +9453,6 @@ func evalMovingWindow(slice []float64, maSpec *esast.MovingAvgAggSpec) float64 {
 			}
 			return wSum / wTotal
 		case "ewma":
-			alpha := 0.3
 			ewma := slice[0]
 			for idx := 1; idx < len(slice); idx++ {
 				ewma = alpha*slice[idx] + (1-alpha)*ewma
@@ -10006,11 +10268,6 @@ func evalBucketScript(b map[string]any, spec *esast.BucketSelectorAggSpec) (floa
 		return toFloat64(res)
 	}
 	return 0, false
-}
-
-func extractScriptSourceString(script any) string {
-	src, _ := extractScriptSourceAndParams(script)
-	return src
 }
 
 func extractScriptSourceAndParams(script any) (string, map[string]any) {
@@ -10863,6 +11120,16 @@ func attachSubAggsToBucket(
 				continue
 			}
 			bucketMap[subName] = map[string]any{"value": val}
+		case subSpec.ScriptedMetric != nil:
+			var smVal any
+			prefix := parentBucketKey + "\x00"
+			for _, r := range subRows {
+				if strings.HasPrefix(r.BucketKey, prefix) {
+					_ = json.Unmarshal([]byte(r.BucketKey[len(prefix):]), &smVal)
+					break
+				}
+			}
+			bucketMap[subName] = map[string]any{"value": smVal}
 		case subSpec.EffectiveStats() != nil:
 			var matchingRows []AggRow
 			for _, r := range subRows {
@@ -11066,8 +11333,8 @@ func attachSubAggsToBucket(
 			filterObj := map[string]any{"doc_count": cnt}
 			if grandSubAggs := subSpec.SubAggs(); len(grandSubAggs) > 0 {
 				attachSubAggsToBucket(indexName, filterObj, subFullKey, parentBucketKey, grandSubAggs, bucketsByAgg, docLookup)
-				_ = evaluateChildPipelineAggs([]map[string]any{filterObj}, grandSubAggs)
 				evaluateSiblingPipelineAggs(grandSubAggs, filterObj)
+				_ = evaluateChildPipelineAggs([]map[string]any{filterObj}, grandSubAggs)
 			}
 			bucketMap[subName] = filterObj
 		case subSpec.DateHistogram != nil:
@@ -12483,6 +12750,9 @@ func buildAllowedHighlightQueryFields(targetFields []string, hitSchema *schema.I
 				if fb.AliasTarget == tf || fb.AliasTarget == clean || strings.TrimSuffix(fb.AliasTarget, ".keyword") == clean {
 					addField(fn)
 				}
+				if len(fb.SourceJSONPath) > 0 && strings.Join(fb.SourceJSONPath, ".") == clean {
+					addField(fn)
+				}
 			}
 			for nestedRoot := range hitSchema.NestedRoots {
 				if strings.HasPrefix(clean, nestedRoot+".") {
@@ -12703,6 +12973,29 @@ func collectTermsFromQueryForFields(q *esast.Query, allowed map[string]bool, out
 	for field, pe := range q.Prefix {
 		if fieldMatchesAllowedHighlightSet(field, allowed) && pe.Value != "" {
 			*out = append(*out, pe.Value)
+		}
+	}
+	for field, ts := range q.TermsSet {
+		if fieldMatchesAllowedHighlightSet(field, allowed) {
+			for _, v := range ts.Terms {
+				if s := strings.TrimSpace(fmt.Sprintf("%v", v)); s != "" {
+					*out = append(*out, s)
+				}
+			}
+		}
+	}
+	for field, fe := range q.Fuzzy {
+		if fieldMatchesAllowedHighlightSet(field, allowed) {
+			if s := strings.TrimSpace(fmt.Sprintf("%v", fe.Value)); s != "" {
+				*out = append(*out, s)
+			}
+		}
+	}
+	for field, re := range q.Regexp {
+		if fieldMatchesAllowedHighlightSet(field, allowed) {
+			if cleaned := strings.Trim(re.Value, ".*+?^$()[]{}|\\"); cleaned != "" {
+				*out = append(*out, cleaned)
+			}
 		}
 	}
 	if q.Bool != nil {
@@ -12926,97 +13219,7 @@ func extractQueryTerms(q *esast.Query) []string {
 }
 
 func collectTermsFromQuery(q *esast.Query, out *[]string) {
-	if q == nil {
-		return
-	}
-	for _, te := range q.Term {
-		if s := strings.TrimSpace(fmt.Sprintf("%v", te.Value)); s != "" {
-			*out = append(*out, s)
-		}
-	}
-	if q.Terms != nil {
-		for _, vals := range q.Terms.Fields {
-			for _, v := range vals {
-				if s := strings.TrimSpace(fmt.Sprintf("%v", v)); s != "" {
-					*out = append(*out, s)
-				}
-			}
-		}
-	}
-	for _, me := range q.Match {
-		*out = append(*out, strings.Fields(fmt.Sprintf("%v", me.Query))...)
-	}
-	for _, pe := range q.MatchPhrase {
-		if pe.Query != "" {
-			*out = append(*out, pe.Query)
-		}
-	}
-	for _, pe := range q.MatchPhrasePrefix {
-		if pe.Query != "" {
-			*out = append(*out, pe.Query)
-		}
-	}
-	for _, pe := range q.MatchBoolPrefix {
-		if pe.Query != "" {
-			*out = append(*out, strings.Fields(pe.Query)...)
-		}
-	}
-	if q.MultiMatch != nil && q.MultiMatch.Query != nil {
-		*out = append(*out, strings.Fields(fmt.Sprintf("%v", q.MultiMatch.Query))...)
-	}
-	if q.QueryString != nil && q.QueryString.Query != "" {
-		for _, tok := range strings.Fields(q.QueryString.Query) {
-			if idx := strings.IndexByte(tok, ':'); idx >= 0 {
-				tok = tok[idx+1:]
-			}
-			tok = strings.Trim(tok, "()*?\"+-")
-			upper := strings.ToUpper(tok)
-			if tok != "" && upper != "AND" && upper != "OR" && upper != "NOT" {
-				*out = append(*out, tok)
-			}
-		}
-	}
-	if q.SimpleQueryString != nil && q.SimpleQueryString.Query != "" {
-		*out = append(*out, strings.Fields(q.SimpleQueryString.Query)...)
-	}
-	for _, we := range q.Wildcard {
-		if cleaned := strings.Trim(we.Value, "*?"); cleaned != "" {
-			*out = append(*out, cleaned)
-		}
-	}
-	for _, pe := range q.Prefix {
-		if pe.Value != "" {
-			*out = append(*out, pe.Value)
-		}
-	}
-	if q.Bool != nil {
-		for i := range q.Bool.Must {
-			collectTermsFromQuery(&q.Bool.Must[i], out)
-		}
-		for i := range q.Bool.Should {
-			collectTermsFromQuery(&q.Bool.Should[i], out)
-		}
-		for i := range q.Bool.Filter {
-			collectTermsFromQuery(&q.Bool.Filter[i], out)
-		}
-	}
-	if q.DisMax != nil {
-		for i := range q.DisMax.Queries {
-			collectTermsFromQuery(&q.DisMax.Queries[i], out)
-		}
-	}
-	if q.Boosting != nil {
-		collectTermsFromQuery(&q.Boosting.Positive, out)
-	}
-	if q.Nested != nil {
-		collectTermsFromQuery(&q.Nested.Query, out)
-	}
-	if q.FunctionScore != nil && q.FunctionScore.Query != nil {
-		collectTermsFromQuery(q.FunctionScore.Query, out)
-	}
-	if q.ConstantScore != nil {
-		collectTermsFromQuery(&q.ConstantScore.Filter, out)
-	}
+	collectTermsFromQueryForFields(q, nil, out)
 }
 
 func (s *Server) resolveTargetIndices(pattern string) []string {
@@ -14226,6 +14429,9 @@ func aggSpecHasDirectRuntimeScript(spec esast.AggSpec) bool {
 	if spec.TopMetrics != nil && sortsHaveScript(spec.TopMetrics.Sort) {
 		return true
 	}
+	if spec.ScriptedMetric != nil {
+		return true
+	}
 	return false
 }
 
@@ -14611,13 +14817,52 @@ func applyFunctionScoreBoostMode(baseScore, funcScore float64, boostMode string)
 	}
 }
 
+func scoreNonScriptClauseOnDoc(idxSchema *schema.IndexSchema, doc map[string]any, q *esast.Query) float64 {
+	if q == nil {
+		return 1.0
+	}
+	evalSchema := idxSchema
+	if evalSchema == nil {
+		evalSchema = schema.CompileIndexSchema("es_compat", "default", nil)
+	}
+	rawBytes, err := json.Marshal(doc)
+	if err != nil {
+		return 1.0
+	}
+	shredBytes, err := schema.ShredDocument(evalSchema, "0", 1, false, rawBytes)
+	if err != nil {
+		return 1.0
+	}
+	var row map[string]any
+	rDec := json.NewDecoder(bytes.NewReader(shredBytes))
+	rDec.UseNumber()
+	if err := rDec.Decode(&row); err != nil {
+		return 1.0
+	}
+	row["_doc"] = doc
+	tr := transpiler.NewTranspiler(evalSchema, transpiler.TranspilerOptions{})
+	cq := tr.CompileQuery(q, true, nil)
+	if cq.ScoreSQL != "" {
+		sc := evalNumericExpr(row, cq.ScoreSQL)
+		if sc == 0 && cq.ScoreSQL == "1.0" {
+			return 1.0
+		}
+		return sc
+	}
+	return 1.0
+}
+
 func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[string]any, q *esast.Query, baseScore float64) float64 {
 	if q == nil {
 		return baseScore
 	}
 	if q.ScriptScore != nil && q.ScriptScore.Script != nil {
-		if q.ScriptScore.Query != nil && queryHasRuntimeScript(q.ScriptScore.Query) {
-			baseScore = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q.ScriptScore.Query, baseScore)
+		if q.ScriptScore.Query != nil {
+			if queryHasRuntimeScript(q.ScriptScore.Query) {
+				baseScore = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q.ScriptScore.Query, baseScore)
+			} else if baseScore == 1.0 {
+				baseScore = scoreNonScriptClauseOnDoc(idxSchema, doc, q.ScriptScore.Query)
+			}
 		}
 		src, params := extractScriptSourceAndParams(q.ScriptScore.Script)
 		if src != "" {
@@ -14639,8 +14884,12 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 		}
 	}
 	if q.FunctionScore != nil {
-		if q.FunctionScore.Query != nil && queryHasRuntimeScript(q.FunctionScore.Query) {
-			baseScore = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q.FunctionScore.Query, baseScore)
+		if q.FunctionScore.Query != nil {
+			if queryHasRuntimeScript(q.FunctionScore.Query) {
+				baseScore = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q.FunctionScore.Query, baseScore)
+			} else if baseScore == 1.0 {
+				baseScore = scoreNonScriptClauseOnDoc(idxSchema, doc, q.FunctionScore.Query)
+			}
 		}
 		evalDoc := prepareDocForRuntimeScript(idxSchema, doc)
 		var fnScores []float64
@@ -14728,9 +14977,11 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 		for i := range q.DisMax.Queries {
 			sub := &q.DisMax.Queries[i]
 			if evalBranchMatchesDoc(idxSchema, doc, sub) {
-				sc := 1.0
+				var sc float64
 				if queryHasRuntimeScript(sub) {
 					sc = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, sub, 1.0)
+				} else {
+					sc = scoreNonScriptClauseOnDoc(idxSchema, doc, sub)
 				}
 				scores = append(scores, sc)
 			}
@@ -14750,9 +15001,11 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 		}
 	}
 	if q.Boosting != nil {
-		posScore := baseScore
+		var posScore float64
 		if queryHasRuntimeScript(&q.Boosting.Positive) {
 			posScore = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, &q.Boosting.Positive, baseScore)
+		} else {
+			posScore = scoreNonScriptClauseOnDoc(idxSchema, doc, &q.Boosting.Positive)
 		}
 		if evalBranchMatchesDoc(idxSchema, doc, &q.Boosting.Negative) {
 			negBoost := q.Boosting.NegativeBoost
@@ -14817,7 +15070,7 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 				total += evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, &q.Bool.Must[i], 1.0)
 				hasScored = true
 			} else {
-				total += 1.0
+				total += scoreNonScriptClauseOnDoc(idxSchema, doc, &q.Bool.Must[i])
 				hasScored = true
 			}
 		}
@@ -14826,7 +15079,7 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 				if queryHasRuntimeScript(&q.Bool.Should[i]) || q.Bool.Should[i].FunctionScore != nil {
 					total += evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, &q.Bool.Should[i], 1.0)
 				} else {
-					total += 1.0
+					total += scoreNonScriptClauseOnDoc(idxSchema, doc, &q.Bool.Should[i])
 				}
 				hasScored = true
 			}
@@ -15421,7 +15674,74 @@ func emitRuntimeMetricAggRows(
 				Value:     1,
 			})
 		}
+	case subSpec.ScriptedMetric != nil:
+		smRes := evalScriptedMetricAgg(subSpec.ScriptedMetric, bDocs)
+		rawJSON, _ := json.Marshal(smRes)
+		*out = append(*out, AggRow{
+			AggName:   fullAggName,
+			BucketKey: metricBucketKey + "\x00" + string(rawJSON),
+		})
 	}
+}
+
+func evalScriptedMetricAgg(sm *esast.ScriptedMetricAggSpec, bDocs []runtimeMatchedDoc) any {
+	if sm == nil {
+		return nil
+	}
+	state := make(map[string]any)
+	baseParams := make(map[string]any)
+	for k, v := range sm.Params {
+		baseParams[k] = v
+	}
+	buildParams := func(extra map[string]any) map[string]any {
+		cp := make(map[string]any, len(baseParams)+len(extra)+2)
+		for k, v := range baseParams {
+			cp[k] = v
+		}
+		for k, v := range extra {
+			cp[k] = v
+		}
+		cp["state"] = state
+		return cp
+	}
+	if sm.InitScript != nil {
+		initSrc, initP := extractScriptSourceAndParams(sm.InitScript)
+		if initSrc != "" {
+			_, _ = painless.Eval(map[string]any{}, initSrc, buildParams(initP))
+		}
+	}
+	if sm.MapScript != nil {
+		mapSrc, mapP := extractScriptSourceAndParams(sm.MapScript)
+		if mapSrc != "" {
+			for _, md := range bDocs {
+				effSchema := md.EffectiveSchema(nil)
+				evalDoc := prepareDocForRuntimeScript(effSchema, md.doc)
+				p := buildParams(mapP)
+				p["_score"] = md.hit.Score
+				_, _ = painless.Eval(evalDoc, mapSrc, p)
+			}
+		}
+	}
+	var combined any = state
+	if sm.CombineScript != nil {
+		combSrc, combP := extractScriptSourceAndParams(sm.CombineScript)
+		if combSrc != "" {
+			if v, err := painless.Eval(map[string]any{}, combSrc, buildParams(combP)); err == nil {
+				combined = v
+			}
+		}
+	}
+	if sm.ReduceScript != nil {
+		redSrc, redP := extractScriptSourceAndParams(sm.ReduceScript)
+		if redSrc != "" {
+			p := buildParams(redP)
+			p["states"] = []any{combined}
+			if v, err := painless.Eval(map[string]any{}, redSrc, p); err == nil {
+				return v
+			}
+		}
+	}
+	return combined
 }
 
 func extractDocNumericValuesForBucket(md runtimeMatchedDoc, field string, missing any, script any) []float64 {
@@ -15772,7 +16092,8 @@ func isDirectUnprefixedNestedSubAgg(ss esast.AggSpec) bool {
 	return ss.EffectiveTerms() != nil || ss.Cardinality != nil || ss.ValueCount != nil ||
 		ss.Avg != nil || ss.Sum != nil || ss.Min != nil || ss.Max != nil ||
 		ss.EffectiveStats() != nil || ss.StringStats != nil || ss.Percentiles != nil ||
-		ss.PercentileRanks != nil || ss.Boxplot != nil || ss.ReverseNested != nil
+		ss.PercentileRanks != nil || ss.Boxplot != nil || ss.ReverseNested != nil ||
+		ss.ScriptedMetric != nil
 }
 
 func splitNestedSubAggsByBucketKeyMode(subAggs map[string]esast.AggSpec) (map[string]esast.AggSpec, map[string]esast.AggSpec) {

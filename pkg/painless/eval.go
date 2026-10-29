@@ -209,6 +209,9 @@ func Eval(sourceMap map[string]any, scriptSource string, params map[string]any) 
 			lastStmt = strings.TrimSpace(strings.TrimPrefix(lastStmt, "return"))
 		}
 		if lastStmt != "" && lastStmt != "return" && !strings.HasPrefix(lastStmt, "if ") && !strings.HasPrefix(lastStmt, "if(") && !strings.HasPrefix(lastStmt, "for ") && !strings.HasPrefix(lastStmt, "for(") && !strings.HasPrefix(lastStmt, "while ") && !strings.HasPrefix(lastStmt, "while(") && !isTopLevelAssignmentStmt(lastStmt) {
+			if lastVal, hasLast := evalParams["_last_expr_val"]; hasLast {
+				return lastVal, nil
+			}
 			val, evalErr := evalRHSExpr(sourceMap, lastStmt, evalParams)
 			if evalErr == nil && (val != nil || findTopLevelOpPainless(lastStmt, "?") > 0 || findTopLevelOpPainless(lastStmt, "?:") > 0) {
 				return val, nil
@@ -291,31 +294,19 @@ func EvalPainless(sourceMap map[string]any, scriptSource string, params map[stri
 
 // EvalPainlessWithOp evaluates a Painless script and returns any `ctx.op` set by the script.
 func EvalPainlessWithOp(sourceMap map[string]any, scriptSource string, params map[string]any) (string, error) {
-	if params == nil {
-		params = make(map[string]any)
+	evalParams := make(map[string]any, len(params)+4)
+	for k, v := range params {
+		evalParams[k] = v
 	}
-	hadSource := false
 	if sourceMap != nil {
-		if _, exists := params["_source"]; exists {
-			hadSource = true
-		} else {
-			params["_source"] = sourceMap
+		if _, exists := evalParams["_source"]; !exists {
+			evalParams["_source"] = sourceMap
 		}
 	}
 	ctxOp := ""
 	budget := &evalBudget{}
 	cleaned := stripPainlessComments(scriptSource)
-	err := execBlock(sourceMap, cleaned, params, &ctxOp, budget)
-	if !hadSource {
-		delete(params, "_source")
-	}
-	delete(params, "_return_val")
-	delete(params, "_ctx_op")
-	for k := range params {
-		if strings.HasPrefix(k, "__alias_") {
-			delete(params, k)
-		}
-	}
+	err := execBlock(sourceMap, cleaned, evalParams, &ctxOp, budget)
 	if errors.Is(err, errPainlessReturn) {
 		err = nil
 	}
@@ -859,6 +850,7 @@ func syncLocalVarAlias(sourceMap map[string]any, params map[string]any, varName 
 }
 
 func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any, ctxOp *string, budget *evalBudget) error {
+	delete(params, "_last_expr_val")
 	stmt = strings.TrimSpace(expandDynamicBrackets(stmt, sourceMap, params, 0))
 	if stmt == "return" || strings.HasPrefix(stmt, "return ") || strings.HasPrefix(stmt, "return;") || strings.HasPrefix(stmt, "return(") {
 		retExpr := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(stmt, "return")), ";"))
@@ -957,7 +949,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		if err != nil {
 			return err
 		}
-		mutateSliceRemoveOrRetainAtPath(sourceMap, arrPath, argVal, false)
+		params["_last_expr_val"] = mutateSliceRemoveOrRetainAtPath(sourceMap, arrPath, argVal, false)
 		return nil
 	}
 	if m := reArrayRetainAll.FindStringSubmatch(stmt); m != nil {
@@ -966,7 +958,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		if err != nil {
 			return err
 		}
-		mutateSliceRemoveOrRetainAtPath(sourceMap, arrPath, argVal, true)
+		params["_last_expr_val"] = mutateSliceRemoveOrRetainAtPath(sourceMap, arrPath, argVal, true)
 		return nil
 	}
 
@@ -988,7 +980,11 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		if err != nil {
 			return err
 		}
-		return appendToSlice(sourceMap, arrPath, valToAdd)
+		if err := appendToSlice(sourceMap, arrPath, valToAdd); err != nil {
+			return err
+		}
+		params["_last_expr_val"] = true
+		return nil
 	}
 	if m := reArraySet.FindStringSubmatch(stmt); m != nil {
 		if setArgs := splitTopLevelCommaPainless(m[2]); len(setArgs) == 2 {
@@ -1001,7 +997,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			if err != nil {
 				return err
 			}
-			setSliceElementAtPath(sourceMap, arrPath, idxVal, newVal)
+			params["_last_expr_val"] = setSliceElementAtPath(sourceMap, arrPath, idxVal, newVal)
 			return nil
 		}
 	}
@@ -1053,7 +1049,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		if err != nil {
 			return err
 		}
-		removeKeyOrIndexAtPath(sourceMap, parentPath, argVal)
+		params["_last_expr_val"] = removeKeyOrIndexAtPath(sourceMap, parentPath, argVal)
 		return nil
 	}
 	if m := reClearField.FindStringSubmatch(stmt); m != nil {
@@ -1107,7 +1103,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			if err != nil {
 				return err
 			}
-			mutateSliceRemoveOrRetainAtPath(params, arrPath, argVal, false)
+			params["_last_expr_val"] = mutateSliceRemoveOrRetainAtPath(params, arrPath, argVal, false)
 			syncLocalVarAlias(sourceMap, params, rootVar)
 			return nil
 		}
@@ -1120,7 +1116,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			if err != nil {
 				return err
 			}
-			mutateSliceRemoveOrRetainAtPath(params, arrPath, argVal, true)
+			params["_last_expr_val"] = mutateSliceRemoveOrRetainAtPath(params, arrPath, argVal, true)
 			syncLocalVarAlias(sourceMap, params, rootVar)
 			return nil
 		}
@@ -1151,6 +1147,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			if err := appendToSlice(params, arrPath, valToAdd); err != nil {
 				return err
 			}
+			params["_last_expr_val"] = true
 			syncLocalVarAlias(sourceMap, params, rootVar)
 			return nil
 		}
@@ -1168,7 +1165,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 				if err != nil {
 					return err
 				}
-				setSliceElementAtPath(params, arrPath, idxVal, newVal)
+				params["_last_expr_val"] = setSliceElementAtPath(params, arrPath, idxVal, newVal)
 				syncLocalVarAlias(sourceMap, params, rootVar)
 				return nil
 			}
@@ -1216,7 +1213,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			if err != nil {
 				return err
 			}
-			removeKeyOrIndexAtPath(params, parentPath, argVal)
+			params["_last_expr_val"] = removeKeyOrIndexAtPath(params, parentPath, argVal)
 			syncLocalVarAlias(sourceMap, params, rootVar)
 			return nil
 		}
@@ -1819,20 +1816,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		return rhs, nil
 	}
 
-	// Check Elvis operator `?:`
-	if elvisIdx := findTopLevelOpPainless(rhs, "?:"); elvisIdx > 0 {
-		leftVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(rhs[:elvisIdx]), params, depth+1)
-		if err != nil {
-			return nil, err
-		}
-		if leftVal != nil {
-			return leftVal, nil
-		}
-		return evalRHSExprDepth(sourceMap, strings.TrimSpace(rhs[elvisIdx+2:]), params, depth+1)
-	}
-
-	// Check ternary `cond ? trueExpr : falseExpr`
-	if qIdx := findTopLevelOpPainless(rhs, "?"); qIdx > 0 {
+	// Check Elvis operator `?:` and ternary `cond ? trueExpr : falseExpr` in left-to-right order
+	elvisIdx := findTopLevelOpPainless(rhs, "?:")
+	qIdx := findTopLevelOpPainless(rhs, "?")
+	if qIdx > 0 && (elvisIdx < 0 || qIdx < elvisIdx) {
 		rest := rhs[qIdx+1:]
 		if cIdx := findMatchingTernaryColonPainless(rest); cIdx >= 0 {
 			condStr := strings.TrimSpace(rhs[:qIdx])
@@ -1841,6 +1828,16 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			}
 			return evalRHSExprDepth(sourceMap, strings.TrimSpace(rest[cIdx+1:]), params, depth+1)
 		}
+	}
+	if elvisIdx > 0 {
+		leftVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(rhs[:elvisIdx]), params, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		if leftVal != nil {
+			return leftVal, nil
+		}
+		return evalRHSExprDepth(sourceMap, strings.TrimSpace(rhs[elvisIdx+2:]), params, depth+1)
 	}
 
 	// Check boolean logical, relational, or regex operators on RHS (`||`, `&&`, `=~`, `==~`, `==`, `!=`, `>=`, `<=`, `>`, `<`, `!`)
@@ -2759,7 +2756,13 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		inner := strings.TrimSpace(rhs[1 : len(rhs)-1])
 		if inner != "" {
 			items := splitTopLevelCommaPainless(inner)
-			if len(items) > 0 && findTopLevelOpPainless(items[0], ":") > 0 {
+			firstColon := -1
+			firstQ := -1
+			if len(items) > 0 {
+				firstColon = findTopLevelOpPainless(items[0], ":")
+				firstQ = findTopLevelOpPainless(items[0], "?")
+			}
+			if firstColon > 0 && (firstQ < 0 || firstQ > firstColon) {
 				mOut := make(map[string]any, len(items))
 				for _, entry := range items {
 					cIdx := findTopLevelOpPainless(entry, ":")

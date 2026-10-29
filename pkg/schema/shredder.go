@@ -1015,18 +1015,37 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 		if b.Kind != StorageNestedSubfield || b.NestedPath != nestedPath {
 			continue
 		}
-		if strings.HasSuffix(b.ESFieldPath, ".keyword") {
-			if _, hasBase := s.Fields[strings.TrimSuffix(b.ESFieldPath, ".keyword")]; hasBase {
-				continue
-			}
-		}
 		if len(b.SourceJSONPath) <= len(rootParts) {
 			continue
 		}
 		relPath := b.SourceJSONPath[len(rootParts):]
-		applyNestedBindingNormalizationAtPath(cloned, relPath, b, getNow)
+		isKwCompanion := false
+		if strings.HasSuffix(b.ESFieldPath, ".keyword") {
+			if _, hasBase := s.Fields[strings.TrimSuffix(b.ESFieldPath, ".keyword")]; hasBase {
+				isKwCompanion = true
+			}
+		}
+		if isKwCompanion {
+			if b.NullValue != nil {
+				bNorm := b
+				bNorm.IgnoreAbove = 0
+				bNorm.LowercaseNormalizer = false
+				if b.IgnoreAbove == 0 || len([]rune(fmt.Sprintf("%v", b.NullValue))) <= b.IgnoreAbove {
+					applyNestedBindingNormalizationAtPath(cloned, relPath, bNorm, getNow)
+				}
+			}
+		} else {
+			applyNestedBindingNormalizationAtPath(cloned, relPath, b, getNow)
+		}
 		if len(b.CopyTo) > 0 {
-			srcVals := extractStringSliceValuesWithNull(cloned, relPath, false, b.NullValue)
+			rawSrcVals := extractStringSliceValuesWithNull(cloned, relPath, b.LowercaseNormalizer, b.NullValue)
+			var srcVals []string
+			for _, sv := range rawSrcVals {
+				if b.IgnoreAbove > 0 && len([]rune(sv)) > b.IgnoreAbove {
+					continue
+				}
+				srcVals = append(srcVals, sv)
+			}
 			if len(srcVals) > 0 {
 				for _, targetField := range b.CopyTo {
 					tb, ok := s.Fields[targetField]
@@ -1050,6 +1069,9 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 								}
 							}
 							for _, sv := range srcVals {
+								if tb.IgnoreAbove > 0 && len([]rune(sv)) > tb.IgnoreAbove {
+									continue
+								}
 								if tb.LowercaseNormalizer {
 									sv = strings.ToLower(sv)
 								}

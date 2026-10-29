@@ -34,6 +34,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -3135,6 +3136,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						}
 					}
 					outArr := make([]any, len(arr))
+					elemChanged := false
 					for idx, elem := range arr {
 						ingestMeta, _ := doc["_ingest"].(map[string]any)
 						if ingestMeta == nil {
@@ -3159,10 +3161,17 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						} else {
 							outArr[idx] = elem
 						}
+						if !reflect.DeepEqual(outArr[idx], elem) {
+							elemChanged = true
+						}
 					}
 					restoreIngestVal()
-					setIngestPath(doc, field, outArr)
-					mutated = true
+					if elemChanged {
+						if _, stillExists := getIngestPath(doc, field); stillExists {
+							setIngestPath(doc, field, outArr)
+							mutated = true
+						}
+					}
 				} else {
 					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not an array", field)
 				}
@@ -3304,9 +3313,11 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 				if ingestMeta == nil {
 					ingestMeta = make(map[string]any)
 				}
+				prevMsg, hadPrevMsg := ingestMeta["on_failure_message"]
+				prevType, hadPrevType := ingestMeta["on_failure_processor_type"]
+				prevTag, hadPrevTag := ingestMeta["on_failure_processor_tag"]
 				ingestMeta["on_failure_message"] = procErr.Error()
-				_, hasInnerType := ingestMeta["on_failure_processor_type"]
-				if (procType != "pipeline" && procType != "foreach") || !hasInnerType {
+				if (procType != "pipeline" && procType != "foreach") || !hadPrevType {
 					ingestMeta["on_failure_processor_type"] = procType
 					ingestMeta["on_failure_processor_tag"] = procTag
 				}
@@ -3323,9 +3334,21 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 					return mutated, false, subErr
 				}
 				if curIngest, ok := doc["_ingest"].(map[string]any); ok {
-					delete(curIngest, "on_failure_message")
-					delete(curIngest, "on_failure_processor_type")
-					delete(curIngest, "on_failure_processor_tag")
+					if hadPrevMsg {
+						curIngest["on_failure_message"] = prevMsg
+					} else {
+						delete(curIngest, "on_failure_message")
+					}
+					if hadPrevType {
+						curIngest["on_failure_processor_type"] = prevType
+					} else {
+						delete(curIngest, "on_failure_processor_type")
+					}
+					if hadPrevTag {
+						curIngest["on_failure_processor_tag"] = prevTag
+					} else {
+						delete(curIngest, "on_failure_processor_tag")
+					}
 				}
 				continue
 			}
@@ -4115,11 +4138,12 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 			}
 			batches++
 			type preparedDoc struct {
-				id        string
-				destIndex string
-				source    json.RawMessage
-				srcVer    int64
-				isDelete  bool
+				id          string
+				destIndex   string
+				aliasFilter *esast.Query
+				source      json.RawMessage
+				srcVer      int64
+				isDelete    bool
 			}
 			var prepared []preparedDoc
 			sampleDocsByIdx := make(map[string][]json.RawMessage)
@@ -4143,6 +4167,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				totalMatched++
 				docID := h.ID
 				docDestIdx := destIndex
+				docDestAliasFilter := destAliasFilter
 				docSource := h.Source
 				docSrcVer := h.Version
 				if body.Source.Source != nil {
@@ -4187,13 +4212,14 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 								docID = fmt.Sprintf("%v", v)
 							}
 							if v, ok := tmpMap["__reindex_index"]; ok && v != nil {
-								if sIdx := strings.TrimSpace(fmt.Sprintf("%v", v)); sIdx != "" {
-									resolvedIdx, _, rErr := s.resolveWriteIndexWithFilter(sIdx)
+								if sIdx := strings.TrimSpace(fmt.Sprintf("%v", v)); sIdx != "" && sIdx != docDestIdx {
+									resolvedIdx, resolvedFilter, rErr := s.resolveWriteIndexWithFilter(sIdx)
 									if rErr != nil {
 										writeESError(w, http.StatusBadRequest, "illegal_argument_exception", rErr.Error())
 										return
 									}
 									docDestIdx = resolvedIdx
+									docDestAliasFilter = resolvedFilter
 								}
 							}
 							if v, ok := tmpMap["__reindex_version"]; ok {
@@ -4212,7 +4238,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 					if opRes == "deleted" {
-						prepared = append(prepared, preparedDoc{id: docID, destIndex: docDestIdx, srcVer: docSrcVer, isDelete: true})
+						prepared = append(prepared, preparedDoc{id: docID, destIndex: docDestIdx, aliasFilter: docDestAliasFilter, srcVer: docSrcVer, isDelete: true})
 						candIDsByIdx[docDestIdx] = append(candIDsByIdx[docDestIdx], docID)
 						if _, hasKey := sampleDocsByIdx[docDestIdx]; !hasKey {
 							sampleDocsByIdx[docDestIdx] = nil
@@ -4233,19 +4259,20 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					docID = nextDocID
 				}
 				if nextDestIdx != "" && nextDestIdx != docDestIdx {
-					resolvedIdx, _, rErr := s.resolveWriteIndexWithFilter(nextDestIdx)
+					resolvedIdx, resolvedFilter, rErr := s.resolveWriteIndexWithFilter(nextDestIdx)
 					if rErr != nil {
 						writeESError(w, http.StatusBadRequest, "illegal_argument_exception", rErr.Error())
 						return
 					}
 					docDestIdx = resolvedIdx
+					docDestAliasFilter = resolvedFilter
 				}
 				docSource = pipedDoc
-				if docDestIdx == destIndex && destAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), destIndex, docID, docSource, destAliasFilter) {
+				if docDestAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), docDestIdx, docID, docSource, docDestAliasFilter) {
 					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "document does not match destination alias filter")
 					return
 				}
-				prepared = append(prepared, preparedDoc{id: docID, destIndex: docDestIdx, source: docSource, srcVer: docSrcVer})
+				prepared = append(prepared, preparedDoc{id: docID, destIndex: docDestIdx, aliasFilter: docDestAliasFilter, source: docSource, srcVer: docSrcVer})
 				candIDsByIdx[docDestIdx] = append(candIDsByIdx[docDestIdx], docID)
 				sampleDocsByIdx[docDestIdx] = append(sampleDocsByIdx[docDestIdx], docSource)
 			}
@@ -4320,7 +4347,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 							extConflict = existing.Version > pd.srcVer
 						}
 					}
-					conflict := isCreate || extConflict || (pd.destIndex == destIndex && destAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), destIndex, pd.id, existing.Source, destAliasFilter))
+					conflict := isCreate || extConflict || (pd.aliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), pd.destIndex, pd.id, existing.Source, pd.aliasFilter))
 					if conflict {
 						if proceedOnConflict {
 							versionConflicts++

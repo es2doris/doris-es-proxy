@@ -481,6 +481,9 @@ func computePopStdDev(nums []float64) float64 {
 }
 
 func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
+	if hIdx := strings.LastIndex(branch, " HAVING COUNT("); hIdx > 0 && strings.HasSuffix(branch, ") > 0") {
+		branch = branch[:hIdx]
+	}
 	if strings.Contains(branch, "'__meta_total'") || strings.Contains(branch, "'__meta_query_total'") {
 		metaName := "__meta_total"
 		if strings.Contains(branch, "'__meta_query_total'") {
@@ -691,10 +694,15 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				if val == nil {
 					continue
 				}
-				cnt++
-				seen[fmt.Sprintf("%v", val)] = true
-				if f, ok := toFloat(val); ok {
-					nums = append(nums, f)
+				for _, elem := range asSliceOrSingle(val) {
+					if elem == nil {
+						continue
+					}
+					cnt++
+					seen[fmt.Sprintf("%v", elem)] = true
+					if f, ok := toFloat(elem); ok {
+						nums = append(nums, f)
+					}
 				}
 			}
 			if len(nums) == 0 && bKey == "_metric" && (fn == "AVG" || fn == "MIN" || fn == "MAX") {
@@ -882,8 +890,10 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				continue
 			}
 			if val := resolveColumnValue(row, colExpr); val != nil {
-				if f, ok := toFloat(val); ok {
-					nums = append(nums, f)
+				for _, elem := range asSliceOrSingle(val) {
+					if f, ok := toFloat(elem); ok {
+						nums = append(nums, f)
+					}
 				}
 			}
 		}
@@ -940,8 +950,10 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 					bucketOrder = append(bucketOrder, bKey)
 				}
 				if val := resolveColumnValue(row, colExpr); val != nil {
-					if f, ok := toFloat(val); ok {
-						byBucket[bKey] = append(byBucket[bKey], f)
+					for _, elem := range asSliceOrSingle(val) {
+						if f, ok := toFloat(elem); ok {
+							byBucket[bKey] = append(byBucket[bKey], f)
+						}
 					}
 				}
 			}
@@ -995,10 +1007,12 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 					bucketOrder = append(bucketOrder, bKey)
 				}
 				if val := resolveColumnValue(row, colExpr); val != nil {
-					if f, ok := toFloat(val); ok {
-						acc.total++
-						if f <= thresh {
-							acc.leCount++
+					for _, elem := range asSliceOrSingle(val) {
+						if f, ok := toFloat(elem); ok {
+							acc.total++
+							if f <= thresh {
+								acc.leCount++
+							}
 						}
 					}
 				}
@@ -1029,8 +1043,10 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		var nums []float64
 		for _, row := range expanded {
 			if val := resolveColumnValue(row, colExpr); val != nil {
-				if f, ok := toFloat(val); ok {
-					nums = append(nums, f)
+				for _, elem := range asSliceOrSingle(val) {
+					if f, ok := toFloat(elem); ok {
+						nums = append(nums, f)
+					}
 				}
 			}
 		}
@@ -1057,10 +1073,12 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		var total, leCount int64
 		for _, row := range expanded {
 			if val := resolveColumnValue(row, colExpr); val != nil {
-				if f, ok := toFloat(val); ok {
-					total++
-					if f <= thresh {
-						leCount++
+				for _, elem := range asSliceOrSingle(val) {
+					if f, ok := toFloat(elem); ok {
+						total++
+						if f <= thresh {
+							leCount++
+						}
 					}
 				}
 			}
@@ -1336,10 +1354,15 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				if val == nil {
 					continue
 				}
-				acc.cnt++
-				acc.seen[fmt.Sprintf("%v", val)] = true
-				if f, ok := toFloat(val); ok {
-					acc.nums = append(acc.nums, f)
+				for _, elem := range asSliceOrSingle(val) {
+					if elem == nil {
+						continue
+					}
+					acc.cnt++
+					acc.seen[fmt.Sprintf("%v", elem)] = true
+					if f, ok := toFloat(elem); ok {
+						acc.nums = append(acc.nums, f)
+					}
 				}
 			}
 		}
@@ -1959,11 +1982,23 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 	if strings.HasSuffix(expr, " IS NOT NULL") {
 		colExpr := strings.TrimSpace(expr[:len(expr)-len(" IS NOT NULL")])
 		val := resolveColumnValue(row, colExpr)
+		if arr, ok := val.([]any); ok {
+			return len(arr) > 0
+		}
+		if arr, ok := val.([]string); ok {
+			return len(arr) > 0
+		}
 		return val != nil
 	}
 	if strings.HasSuffix(expr, " IS NULL") {
 		colExpr := strings.TrimSpace(expr[:len(expr)-len(" IS NULL")])
 		val := resolveColumnValue(row, colExpr)
+		if arr, ok := val.([]any); ok {
+			return len(arr) == 0
+		}
+		if arr, ok := val.([]string); ok {
+			return len(arr) == 0
+		}
 		return val == nil
 	}
 
@@ -2494,7 +2529,11 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 				var out []any
 				for _, elemJSON := range toStringSlice(resolveColumnValue(row, strings.TrimSpace(args[1]))) {
 					if v := extractJSONPathFromStr(elemJSON, strings.Split(relPath, ".")); v != nil {
-						out = append(out, v)
+						for _, sub := range asSliceOrSingle(v) {
+							if sub != nil {
+								out = append(out, sub)
+							}
+						}
 					}
 				}
 				if len(out) == 0 {
@@ -2661,8 +2700,7 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			jsonPath := strings.TrimPrefix(unquoteSQLLiteral(strings.TrimSpace(inner[commaIdx+1:])), "$.")
 			elemJSON, _ := row[varName].(string)
 			res := extractJSONPathFromStr(elemJSON, strings.Split(jsonPath, "."))
-			switch rv := res.(type) {
-			case []any, map[string]any:
+			if rv, ok := res.(map[string]any); ok {
 				if b, err := json.Marshal(rv); err == nil {
 					return string(b)
 				}
@@ -2793,8 +2831,22 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		if strings.HasSuffix(colExpr, " AS DOUBLE)") {
 			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS DOUBLE)")])
 			if v := resolveColumnValue(row, inner); v != nil {
-				if f, ok := toFloat(v); ok {
-					return f
+				switch v.(type) {
+				case []any, []string:
+					var out []any
+					for _, elem := range asSliceOrSingle(v) {
+						if f, ok := toFloat(elem); ok {
+							out = append(out, f)
+						}
+					}
+					if len(out) == 0 {
+						return nil
+					}
+					return out
+				default:
+					if f, ok := toFloat(v); ok {
+						return f
+					}
 				}
 			}
 			if isArithmeticSQLExpr(inner) {
@@ -2808,12 +2860,30 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		if strings.HasSuffix(colExpr, " AS BIGINT)") {
 			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS BIGINT)")])
 			if v := resolveColumnValue(row, inner); v != nil {
-				if f, ok := toFloat(v); ok {
-					return int64(f)
-				}
-				if s, ok := v.(string); ok {
-					if ms, ok := schema.ParseESDateToEpochMillis(s, time.Now().UTC()); ok {
-						return ms
+				switch v.(type) {
+				case []any, []string:
+					var out []any
+					for _, elem := range asSliceOrSingle(v) {
+						if f, ok := toFloat(elem); ok {
+							out = append(out, int64(f))
+						} else if s, ok := elem.(string); ok {
+							if ms, ok := schema.ParseESDateToEpochMillis(s, time.Now().UTC()); ok {
+								out = append(out, ms)
+							}
+						}
+					}
+					if len(out) == 0 {
+						return nil
+					}
+					return out
+				default:
+					if f, ok := toFloat(v); ok {
+						return int64(f)
+					}
+					if s, ok := v.(string); ok {
+						if ms, ok := schema.ParseESDateToEpochMillis(s, time.Now().UTC()); ok {
+							return ms
+						}
 					}
 				}
 			}
@@ -2828,15 +2898,44 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		if strings.HasSuffix(colExpr, " AS STRING)") {
 			inner := colExpr[len("CAST(") : len(colExpr)-len(" AS STRING)")]
 			if v := resolveColumnValue(row, inner); v != nil {
-				return fmt.Sprintf("%v", v)
+				switch v.(type) {
+				case []any, []string:
+					var out []any
+					for _, elem := range asSliceOrSingle(v) {
+						if elem != nil {
+							out = append(out, fmt.Sprintf("%v", elem))
+						}
+					}
+					if len(out) == 0 {
+						return nil
+					}
+					return out
+				default:
+					return fmt.Sprintf("%v", v)
+				}
 			}
 			return nil
 		}
 		if strings.HasSuffix(colExpr, " AS BOOLEAN)") {
 			inner := colExpr[len("CAST(") : len(colExpr)-len(" AS BOOLEAN)")]
 			if v := resolveColumnValue(row, inner); v != nil {
-				s := fmt.Sprintf("%v", v)
-				return strings.EqualFold(s, "true") || s == "1"
+				switch v.(type) {
+				case []any, []string:
+					var out []any
+					for _, elem := range asSliceOrSingle(v) {
+						if elem != nil {
+							s := fmt.Sprintf("%v", elem)
+							out = append(out, strings.EqualFold(s, "true") || s == "1")
+						}
+					}
+					if len(out) == 0 {
+						return nil
+					}
+					return out
+				default:
+					s := fmt.Sprintf("%v", v)
+					return strings.EqualFold(s, "true") || s == "1"
+				}
 			}
 			return nil
 		}

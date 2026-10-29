@@ -410,10 +410,17 @@ func parseLuceneTokensToASTWithFlags(tokens []string, defaultField string, field
 			outBool.MustNot = append(outBool.MustNot, uQ.Bool.MustNot...)
 		}
 		if remQ.Bool != nil {
-			outBool.Must = append(outBool.Must, remQ.Bool.Must...)
-			outBool.MustNot = append(outBool.MustNot, remQ.Bool.MustNot...)
-			outBool.Should = append(outBool.Should, remQ.Bool.Should...)
-			outBool.Filter = append(outBool.Filter, remQ.Bool.Filter...)
+			if defaultOp == "AND" && len(remQ.Bool.Must) == 0 && len(remQ.Bool.Filter) == 0 && len(remQ.Bool.MustNot) == 0 && len(remQ.Bool.Should) > 0 {
+				remQ.Bool.MinimumShouldMatch = 1
+				outBool.Must = append(outBool.Must, remQ)
+			} else if defaultOp == "OR" && len(outBool.Must) > 0 && (len(remQ.Bool.Must) > 0 || len(remQ.Bool.MustNot) > 0 || len(remQ.Bool.Filter) > 0) {
+				outBool.Should = append(outBool.Should, remQ)
+			} else {
+				outBool.Must = append(outBool.Must, remQ.Bool.Must...)
+				outBool.MustNot = append(outBool.MustNot, remQ.Bool.MustNot...)
+				outBool.Should = append(outBool.Should, remQ.Bool.Should...)
+				outBool.Filter = append(outBool.Filter, remQ.Bool.Filter...)
+			}
 		}
 		if len(outBool.Should) > 0 && len(outBool.Must) == 0 && len(outBool.Filter) == 0 {
 			outBool.MinimumShouldMatch = 1
@@ -422,7 +429,7 @@ func parseLuceneTokensToASTWithFlags(tokens []string, defaultField string, field
 	}
 
 	tokens = merged
-	hasAND, hasOR := false, false
+	hasAND, hasOR, hasExplicitOR, hasUnary := false, false, false, false
 	var normalizedTokens []string
 	prevWasClause = false
 	for _, tok := range tokens {
@@ -432,25 +439,30 @@ func parseLuceneTokensToASTWithFlags(tokens []string, defaultField string, field
 			tok = "\x00AND"
 		} else if isLuceneBinaryOr(tok, isSimple, flags) {
 			hasOR = true
+			hasExplicitOR = true
 			prevWasClause = false
 			tok = "\x00OR"
 		} else if isLuceneStandaloneNot(tok, isSimple, flags) {
+			hasUnary = true
 			prevWasClause = false
 			tok = "\x00NOT"
 		} else {
 			isUnaryPrefix := isLuceneUnaryPrefixed(tok, isSimple, flags)
+			if isUnaryPrefix {
+				hasUnary = true
+			}
 			if prevWasClause && defaultOp == "OR" && !isUnaryPrefix {
 				normalizedTokens = append(normalizedTokens, "\x00OR")
 				hasOR = true
 			}
-			prevWasClause = !isUnaryPrefix
+			prevWasClause = true
 		}
 		normalizedTokens = append(normalizedTokens, tok)
 	}
 	tokens = normalizedTokens
 
-	// In Lucene grammar, `AND` binds tighter than `OR` (e.g., `a:1 AND b:2 OR c:3` -> `(a:1 AND b:2) OR c:3`).
-	if (hasAND || defaultOp == "AND") && hasOR {
+	// In Lucene grammar, `AND` (and unary `NOT`/`+`/`-`) binds tighter than `OR` (e.g., `a:1 AND b:2 OR c:3` -> `(a:1 AND b:2) OR c:3`).
+	if (hasAND || defaultOp == "AND" || (hasExplicitOR && hasUnary)) && hasOR {
 		var orGroups [][]string
 		var curGroup []string
 		for _, tok := range tokens {
@@ -471,7 +483,7 @@ func parseLuceneTokensToASTWithFlags(tokens []string, defaultField string, field
 			for _, grp := range orGroups {
 				shoulds = append(shoulds, parseLuceneTokenSliceWithFlags(grp, defaultField, fields, "AND", defaultOp, depth+1, isSimple, flags))
 			}
-			outBool := &esast.BoolQuery{Should: shoulds}
+			outBool := &esast.BoolQuery{Should: shoulds, MinimumShouldMatch: 1}
 			return esast.Query{Bool: outBool}
 		}
 	}
