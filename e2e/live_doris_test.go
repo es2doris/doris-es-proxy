@@ -1022,4 +1022,48 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	if _, ok := r20Aggs["anon_f"].(map[string]any)["buckets"].([]any); !ok {
 		t.Fatalf("expected R20 anon_f.buckets array, got %T %+v", r20Aggs["anon_f"], r20Aggs["anon_f"])
 	}
+
+	// 22. Round-21: rescore, post_filter aggregation isolation, cumulative_cardinality, and GET _seq_no/_primary_term
+	r21SearchResp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
+		"query": {"match_all": {}},
+		"post_filter": {"term": {"service": "checkout"}},
+		"rescore": {
+			"window_size": 10,
+			"query": {
+				"rescore_query": {"term": {"service": "checkout"}},
+				"query_weight": 1.0,
+				"rescore_query_weight": 3.0,
+				"score_mode": "total"
+			}
+		},
+		"aggs": {
+			"by_lat": {
+				"histogram": {"field": "latency_ms", "interval": 50},
+				"aggs": {
+					"svc_card": {"cardinality": {"field": "service"}},
+					"cum_svc": {"cumulative_cardinality": {"buckets_path": "svc_card"}}
+				}
+			}
+		}
+	}`))
+	if err != nil || r21SearchResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search (R21 rescore + post_filter + cumulative_cardinality) failed: status=%v err=%v", r21SearchResp.StatusCode, err)
+	}
+	var r21SearchRes map[string]any
+	_ = json.NewDecoder(r21SearchResp.Body).Decode(&r21SearchRes)
+	_ = r21SearchResp.Body.Close()
+	r21Hits := r21SearchRes["hits"].(map[string]any)["hits"].([]any)
+	if len(r21Hits) == 0 || r21Hits[0].(map[string]any)["_score"].(float64) <= 1.0 {
+		t.Fatalf("expected R21 rescored hits with _score > 1.0, got %+v", r21Hits)
+	}
+	r21GetResp, err := http.Get(ts.URL + "/live_auto_index/_doc/auto-1")
+	if err != nil || r21GetResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /live_auto_index/_doc/auto-1 failed: status=%v err=%v", r21GetResp.StatusCode, err)
+	}
+	var r21GetRes map[string]any
+	_ = json.NewDecoder(r21GetResp.Body).Decode(&r21GetRes)
+	_ = r21GetResp.Body.Close()
+	if r21GetRes["_seq_no"] == nil || r21GetRes["_primary_term"] != float64(1) {
+		t.Fatalf("expected R21 GET response to include _seq_no and _primary_term=1, got %+v", r21GetRes)
+	}
 }

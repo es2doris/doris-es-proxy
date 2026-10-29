@@ -786,7 +786,7 @@ func TestRound8_MultiValueSortModeAndDeterministicSortSpec(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected BuildSearchPlan error: %v", err)
 	}
-	if !strings.Contains(plan.HitsSQL, "array_avg(`f__scores`) DESC") || !strings.Contains(plan.HitsSQL, "array_sum(`f__scores`) ASC") || !strings.Contains(plan.HitsSQL, "array_min(`f__tags`) ASC") {
+	if !strings.Contains(plan.HitsSQL, "array_avg(array_map(_x -> CAST(_x AS DOUBLE), `f__scores`)) DESC") || !strings.Contains(plan.HitsSQL, "array_sum(array_map(_x -> CAST(_x AS DOUBLE), `f__scores`)) ASC") || !strings.Contains(plan.HitsSQL, "array_min(`f__tags`) ASC") {
 		t.Fatalf("expected array_avg, array_sum, and array_min in ORDER BY for multi-valued columns, got:\n%s", plan.HitsSQL)
 	}
 }

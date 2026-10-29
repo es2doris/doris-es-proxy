@@ -55,7 +55,7 @@ func GenerateCreateTableDDL(s *IndexSchema) string {
 	seenCols := make(map[string]bool)
 	for _, fp := range fieldPaths {
 		b := s.Fields[fp]
-		if b.ColumnName == "" || seenCols[b.ColumnName] {
+		if b.AliasTarget != "" || b.ColumnName == "" || seenCols[b.ColumnName] {
 			continue
 		}
 		seenCols[b.ColumnName] = true
@@ -130,7 +130,7 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 
 	for _, k := range newKeys {
 		b := newSchema.Fields[k]
-		if b.ColumnName == "" || existingCols[b.ColumnName] {
+		if b.AliasTarget != "" || b.ColumnName == "" || existingCols[b.ColumnName] {
 			continue
 		}
 		existingCols[b.ColumnName] = true
