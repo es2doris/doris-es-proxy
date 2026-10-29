@@ -955,4 +955,30 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	if r18UpdRes["get"] == nil {
 		t.Fatalf("expected R18 _update?_source=true to include get._source, got %+v", r18UpdRes)
 	}
+
+	// 20. Round-19: Polymorphic string script pushdown (.toLowerCase/.trim/CONCAT), _script sort search_after & missing, and terminate_after
+	r19SearchResp, err := http.Post(ts.URL+"/live_auto_index/_search?terminate_after=2", "application/json", strings.NewReader(`{
+		"size": 1,
+		"sort": [
+			{"_script": {"type": "number", "script": "doc['latency_ms'].value * 2", "order": "asc", "missing": -1}},
+			{"_id": "asc"}
+		],
+		"aggs": {
+			"svc_norm": {
+				"terms": {
+					"script": "doc['service'].value.trim().toLowerCase()"
+				}
+			}
+		}
+	}`))
+	if err != nil || r19SearchResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search (R19 string script pushdown + _script sort + terminate_after) failed: status=%v err=%v", r19SearchResp.StatusCode, err)
+	}
+	var r19SearchRes map[string]any
+	_ = json.NewDecoder(r19SearchResp.Body).Decode(&r19SearchRes)
+	_ = r19SearchResp.Body.Close()
+	r19Aggs, _ := r19SearchRes["aggregations"].(map[string]any)
+	if r19Aggs == nil || len(r19Aggs["svc_norm"].(map[string]any)["buckets"].([]any)) == 0 {
+		t.Fatalf("expected non-empty R19 svc_norm buckets on live_auto_index, got %+v", r19Aggs)
+	}
 }

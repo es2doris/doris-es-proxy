@@ -2247,9 +2247,23 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				}
 			}
 			if targetMap != nil {
-				if val, exists := targetMap[field]; exists {
+				if field == "*" {
+					var dottedKeys []string
+					for k := range targetMap {
+						if strings.Contains(k, ".") {
+							dottedKeys = append(dottedKeys, k)
+						}
+					}
+					sort.Strings(dottedKeys)
+					for _, k := range dottedKeys {
+						val := targetMap[k]
+						delete(targetMap, k)
+						setIngestPathMerge(targetMap, k, expandDottedIngestValue(val))
+						mutated = true
+					}
+				} else if val, exists := targetMap[field]; exists {
 					delete(targetMap, field)
-					setIngestPathMerge(targetMap, field, val)
+					setIngestPathMerge(targetMap, field, expandDottedIngestValue(val))
 					mutated = true
 				}
 			}
@@ -3463,6 +3477,34 @@ func getIngestPath(doc map[string]any, path string) (any, bool) {
 	}
 }
 
+func expandDottedIngestValue(val any) any {
+	m, ok := val.(map[string]any)
+	if !ok {
+		return val
+	}
+	out := make(map[string]any, len(m))
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		expandedV := expandDottedIngestValue(m[k])
+		if strings.Contains(k, ".") {
+			setIngestPathMerge(out, k, expandedV)
+		} else if existing, ok := out[k].(map[string]any); ok {
+			if subM, ok2 := expandedV.(map[string]any); ok2 {
+				deepMergeIngestMap(existing, subM)
+				continue
+			}
+			out[k] = expandedV
+		} else {
+			out[k] = expandedV
+		}
+	}
+	return out
+}
+
 func deepMergeIngestMap(dst, src map[string]any) {
 	for k, v := range src {
 		if vMap, ok := v.(map[string]any); ok {
@@ -3802,16 +3844,16 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	var totalMatched, totalCreated, totalUpdated, totalDeleted, versionConflicts, batches int
 	updSpec := &painless.UpdateRequest{Script: body.Script}
 	hasReindexMetaScript := false
-	if body.Script != nil && (strings.Contains(body.Script.Source, "ctx._id") || strings.Contains(body.Script.Source, "ctx._index")) {
-		hasReindexMetaScript = true
-		rewrittenSrc := strings.ReplaceAll(body.Script.Source, "ctx._id", "ctx._source.__reindex_id")
-		rewrittenSrc = strings.ReplaceAll(rewrittenSrc, "ctx._index", "ctx._source.__reindex_index")
-		updSpec = &painless.UpdateRequest{
-			Script: &painless.ScriptSpec{
-				Source: rewrittenSrc,
-				Lang:   body.Script.Lang,
-				Params: body.Script.Params,
-			},
+	if body.Script != nil {
+		if rewrittenSrc, changed := rewriteReindexMetaScript(body.Script.Source); changed {
+			hasReindexMetaScript = true
+			updSpec = &painless.UpdateRequest{
+				Script: &painless.ScriptSpec{
+					Source: rewrittenSrc,
+					Lang:   body.Script.Lang,
+					Params: body.Script.Params,
+				},
+			}
 		}
 	}
 	batchSize := 1000
@@ -4090,6 +4132,17 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		"throttled_until_millis": 0,
 		"failures":               []any{},
 	})
+}
+
+func rewriteReindexMetaScript(src string) (string, bool) {
+	rewritten := src
+	for _, pat := range []string{"ctx?._id", "ctx._id", "ctx?.['_id']", "ctx['_id']", `ctx?.["_id"]`, `ctx["_id"]`} {
+		rewritten = strings.ReplaceAll(rewritten, pat, "ctx._source.__reindex_id")
+	}
+	for _, pat := range []string{"ctx?._index", "ctx._index", "ctx?.['_index']", "ctx['_index']", `ctx?.["_index"]`, `ctx["_index"]`} {
+		rewritten = strings.ReplaceAll(rewritten, pat, "ctx._source.__reindex_index")
+	}
+	return rewritten, rewritten != src
 }
 
 // handleDorisPromoteField implements `POST /{index}/_doris/promote` to atomically promote an unindexed `_doc[...]`

@@ -2560,9 +2560,9 @@ func (t *Transpiler) appendAggBranches(
 							"SELECT %s AS `_agg_name`, CAST(%s AS STRING) AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
 							"FROM `base_matched` "+
 							"WHERE %s%s IS NOT NULL "+
-							"GROUP BY %s ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT %d"+
+							"GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT %d"+
 							") `_agg_sub_%d`",
-						quoteStr(fullAggName), col, wherePrefix, col, col, size, *subIdx,
+						quoteStr(fullAggName), col, wherePrefix, col, size, *subIdx,
 					))
 					if subAggs := spec.SubAggs(); len(subAggs) > 0 {
 						t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, fmt.Sprintf("CAST(%s AS STRING)", col),
@@ -3722,20 +3722,26 @@ func (t *Transpiler) appendAggBranches(
 					}
 					var elemConds []string
 					if rng.From != nil {
-						elemConds = append(elemConds, fmt.Sprintf("%s >= %s", elemExpr, quoteValue(t.coerceRangeAggBoundWithNow(effRField, rng.From, now))))
+						elemConds = append(elemConds, fmt.Sprintf("%s >= %s", elemExpr, quoteValue(t.coerceRangeAggBoundWithNow(effRField, rngSpec, rng.From, now))))
 					}
 					if rng.To != nil {
-						elemConds = append(elemConds, fmt.Sprintf("%s < %s", elemExpr, quoteValue(t.coerceRangeAggBoundWithNow(effRField, rng.To, now))))
+						elemConds = append(elemConds, fmt.Sprintf("%s < %s", elemExpr, quoteValue(t.coerceRangeAggBoundWithNow(effRField, rngSpec, rng.To, now))))
+					}
+					arrExpr := fmt.Sprintf("`%s`", arrCol)
+					if rngSpec.Missing != nil {
+						if mf, ok := t.resolveRangeAggMissingFloat(effRField, rngSpec, now); ok {
+							arrExpr = fmt.Sprintf("CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [%s] ELSE `%s` END", arrCol, arrCol, strconv.FormatFloat(mf, 'f', -1, 64), arrCol)
+						}
 					}
 					if len(elemConds) == 0 {
-						rWhere = fmt.Sprintf("(`%s` IS NOT NULL AND array_size(`%s`) > 0)", arrCol, arrCol)
+						rWhere = fmt.Sprintf("(%s IS NOT NULL AND array_size(%s) > 0)", arrExpr, arrExpr)
 					} else {
-						rWhere = fmt.Sprintf("array_exists(_x -> %s, `%s`)", strings.Join(elemConds, " AND "), arrCol)
+						rWhere = fmt.Sprintf("array_exists(_x -> %s, %s)", strings.Join(elemConds, " AND "), arrExpr)
 					}
 				} else {
 					col := t.sqlNumericColumnRef(effRField, nil)
 					if rngSpec.Missing != nil && effRField != "" {
-						if mf, ok := resolveHistogramMissingFloat(rngSpec.Missing); ok {
+						if mf, ok := t.resolveRangeAggMissingFloat(effRField, rngSpec, now); ok {
 							col = fmt.Sprintf("COALESCE(%s, %s)", col, strconv.FormatFloat(mf, 'f', -1, 64))
 						}
 					}
@@ -3749,17 +3755,17 @@ func (t *Transpiler) appendAggBranches(
 						}
 					}
 					if rngSpec.Missing != nil && effRField == "" {
-						if mf, ok := resolveHistogramMissingFloat(rngSpec.Missing); ok {
+						if mf, ok := t.resolveRangeAggMissingFloat(effRField, rngSpec, now); ok {
 							col = fmt.Sprintf("COALESCE(%s, %s)", col, strconv.FormatFloat(mf, 'f', -1, 64))
 						}
 					}
 					var conds []string
 					conds = append(conds, fmt.Sprintf("%s IS NOT NULL", col))
 					if rng.From != nil {
-						conds = append(conds, fmt.Sprintf("%s >= %s", col, quoteValue(t.coerceRangeAggBoundWithNow(effRField, rng.From, now))))
+						conds = append(conds, fmt.Sprintf("%s >= %s", col, quoteValue(t.coerceRangeAggBoundWithNow(effRField, rngSpec, rng.From, now))))
 					}
 					if rng.To != nil {
-						conds = append(conds, fmt.Sprintf("%s < %s", col, quoteValue(t.coerceRangeAggBoundWithNow(effRField, rng.To, now))))
+						conds = append(conds, fmt.Sprintf("%s < %s", col, quoteValue(t.coerceRangeAggBoundWithNow(effRField, rngSpec, rng.To, now))))
 					}
 					rWhere = strings.Join(conds, " AND ")
 				}
@@ -3799,6 +3805,9 @@ func (t *Transpiler) appendAggBranches(
 
 		case spec.TopMetrics != nil:
 			size := spec.TopMetrics.EffectiveSize()
+			if topHitsNeedsRuntimeSort(spec.TopMetrics.Sort) && size < 100 {
+				size = 100
+			}
 			orderBy := t.compileTopHitsOrderBy(spec.TopMetrics.Sort)
 			wClause := ""
 			if extraWhere != "" {
@@ -3850,15 +3859,30 @@ func (t *Transpiler) appendAggBranches(
 					srcSpec := srcMap[sk]
 					switch {
 					case srcSpec.Terms != nil:
-						b := t.Schema.ResolveField(srcSpec.Terms.Field)
+						effField := srcSpec.Terms.Field
+						if effField == "" && srcSpec.Terms.Script != nil {
+							if docF, ok := extractSimpleDocFieldFromScript(srcSpec.Terms.Script); ok {
+								effField = docF
+							}
+						}
+						b := t.Schema.ResolveField(effField)
 						effDT := effectiveDorisScalarType(b)
-						if effDT == schema.DorisBigInt || effDT == schema.DorisInt || effDT == schema.DorisDouble || b.ESType == "ip" || srcSpec.Terms.Order != nil {
+						if effDT == schema.DorisBigInt || effDT == schema.DorisInt || effDT == schema.DorisDouble || b.ESType == "ip" || srcSpec.Terms.Order != nil || srcSpec.Terms.Script != nil {
 							hasHistogramSrc = true
 						}
 						hasMiss := srcSpec.Terms.Missing != nil || srcSpec.Terms.MissingBucket
-						col := resolveCompSourceCol(srcSpec.Terms.Field, false, hasMiss)
+						col := resolveCompSourceCol(effField, false, hasMiss)
+						if srcSpec.Terms.Script != nil {
+							overrideExpr := ""
+							if effField != "" {
+								overrideExpr = col
+							}
+							if scriptExpr, ok := t.compilePolymorphicScriptExpr(srcSpec.Terms.Script, effField, overrideExpr, nil); ok {
+								col = scriptExpr
+							}
+						}
 						expr := fmt.Sprintf("CAST(%s AS STRING)", col)
-						if effDT == schema.DorisBoolean {
+						if effDT == schema.DorisBoolean && srcSpec.Terms.Script == nil {
 							expr = fmt.Sprintf("CASE WHEN %s IS NULL THEN NULL WHEN CAST(%s AS STRING) IN ('true', '1') THEN 'true' ELSE 'false' END", col, col)
 						}
 						if srcSpec.Terms.Missing != nil {
@@ -3877,8 +3901,23 @@ func (t *Transpiler) appendAggBranches(
 						intervalMs := srcSpec.DateHistogram.EffectiveIntervalMs()
 						tzShiftMs := srcSpec.DateHistogram.EffectiveTimeZoneOffsetMs() - srcSpec.DateHistogram.EffectiveOffsetMs()
 						hasMiss := srcSpec.DateHistogram.Missing != nil || srcSpec.DateHistogram.MissingBucket
-						dhB := t.Schema.ResolveField(srcSpec.DateHistogram.Field)
-						col := resolveCompSourceCol(srcSpec.DateHistogram.Field, true, hasMiss)
+						effDHField := srcSpec.DateHistogram.Field
+						if effDHField == "" && srcSpec.DateHistogram.Script != nil {
+							if docF, ok := extractSimpleDocFieldFromScript(srcSpec.DateHistogram.Script); ok {
+								effDHField = docF
+							}
+						}
+						dhB := t.Schema.ResolveField(effDHField)
+						col := resolveCompSourceCol(effDHField, true, hasMiss)
+						if srcSpec.DateHistogram.Script != nil {
+							overrideExpr := ""
+							if effDHField != "" {
+								overrideExpr = col
+							}
+							if scriptExpr, ok := t.compileMetricScriptExprWithOverride(srcSpec.DateHistogram.Script, effDHField, overrideExpr, nil); ok {
+								col = scriptExpr
+							}
+						}
 						if srcSpec.DateHistogram.Missing != nil {
 							if missMs, ok := t.resolveDateHistogramMissingMs(dhB.ESType, srcSpec.DateHistogram.Missing); ok {
 								col = fmt.Sprintf("COALESCE(%s, %d)", col, missMs)
@@ -3909,7 +3948,22 @@ func (t *Transpiler) appendAggBranches(
 						}
 						offset := srcSpec.Histogram.Offset
 						hasMiss := srcSpec.Histogram.Missing != nil || srcSpec.Histogram.MissingBucket
-						col := resolveCompSourceCol(srcSpec.Histogram.Field, true, hasMiss)
+						effHField := srcSpec.Histogram.Field
+						if effHField == "" && srcSpec.Histogram.Script != nil {
+							if docF, ok := extractSimpleDocFieldFromScript(srcSpec.Histogram.Script); ok {
+								effHField = docF
+							}
+						}
+						col := resolveCompSourceCol(effHField, true, hasMiss)
+						if srcSpec.Histogram.Script != nil {
+							overrideExpr := ""
+							if effHField != "" {
+								overrideExpr = col
+							}
+							if scriptExpr, ok := t.compileMetricScriptExprWithOverride(srcSpec.Histogram.Script, effHField, overrideExpr, nil); ok {
+								col = scriptExpr
+							}
+						}
 						if srcSpec.Histogram.Missing != nil {
 							if missVal, ok := resolveHistogramMissingFloat(srcSpec.Histogram.Missing); ok {
 								col = fmt.Sprintf("COALESCE(%s, %s)", col, strconv.FormatFloat(missVal, 'f', -1, 64))
@@ -4961,20 +5015,26 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					}
 					var elemConds []string
 					if rng.From != nil {
-						elemConds = append(elemConds, fmt.Sprintf("%s >= %s", elemExpr, quoteValue(t.coerceRangeAggBoundWithNow(effRField, rng.From, now))))
+						elemConds = append(elemConds, fmt.Sprintf("%s >= %s", elemExpr, quoteValue(t.coerceRangeAggBoundWithNow(effRField, rngSpec, rng.From, now))))
 					}
 					if rng.To != nil {
-						elemConds = append(elemConds, fmt.Sprintf("%s < %s", elemExpr, quoteValue(t.coerceRangeAggBoundWithNow(effRField, rng.To, now))))
+						elemConds = append(elemConds, fmt.Sprintf("%s < %s", elemExpr, quoteValue(t.coerceRangeAggBoundWithNow(effRField, rngSpec, rng.To, now))))
+					}
+					arrExpr := fmt.Sprintf("`%s`", arrCol)
+					if rngSpec.Missing != nil {
+						if mf, ok := t.resolveRangeAggMissingFloat(effRField, rngSpec, now); ok {
+							arrExpr = fmt.Sprintf("CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [%s] ELSE `%s` END", arrCol, arrCol, strconv.FormatFloat(mf, 'f', -1, 64), arrCol)
+						}
 					}
 					if len(elemConds) == 0 {
-						rWhere = fmt.Sprintf("(`%s` IS NOT NULL AND array_size(`%s`) > 0)", arrCol, arrCol)
+						rWhere = fmt.Sprintf("(%s IS NOT NULL AND array_size(%s) > 0)", arrExpr, arrExpr)
 					} else {
-						rWhere = fmt.Sprintf("array_exists(_x -> %s, `%s`)", strings.Join(elemConds, " AND "), arrCol)
+						rWhere = fmt.Sprintf("array_exists(_x -> %s, %s)", strings.Join(elemConds, " AND "), arrExpr)
 					}
 				} else {
 					col := t.sqlNumericColumnRef(effRField, nctx)
 					if rngSpec.Missing != nil && effRField != "" {
-						if mf, ok := resolveHistogramMissingFloat(rngSpec.Missing); ok {
+						if mf, ok := t.resolveRangeAggMissingFloat(effRField, rngSpec, now); ok {
 							col = fmt.Sprintf("COALESCE(%s, %s)", col, strconv.FormatFloat(mf, 'f', -1, 64))
 						}
 					}
@@ -4988,17 +5048,17 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 						}
 					}
 					if rngSpec.Missing != nil && effRField == "" {
-						if mf, ok := resolveHistogramMissingFloat(rngSpec.Missing); ok {
+						if mf, ok := t.resolveRangeAggMissingFloat(effRField, rngSpec, now); ok {
 							col = fmt.Sprintf("COALESCE(%s, %s)", col, strconv.FormatFloat(mf, 'f', -1, 64))
 						}
 					}
 					var conds []string
 					conds = append(conds, fmt.Sprintf("%s IS NOT NULL", col))
 					if rng.From != nil {
-						conds = append(conds, fmt.Sprintf("%s >= %s", col, quoteValue(t.coerceRangeAggBoundWithNow(effRField, rng.From, now))))
+						conds = append(conds, fmt.Sprintf("%s >= %s", col, quoteValue(t.coerceRangeAggBoundWithNow(effRField, rngSpec, rng.From, now))))
 					}
 					if rng.To != nil {
-						conds = append(conds, fmt.Sprintf("%s < %s", col, quoteValue(t.coerceRangeAggBoundWithNow(effRField, rng.To, now))))
+						conds = append(conds, fmt.Sprintf("%s < %s", col, quoteValue(t.coerceRangeAggBoundWithNow(effRField, rngSpec, rng.To, now))))
 					}
 					rWhere = strings.Join(conds, " AND ")
 				}
@@ -5127,6 +5187,9 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 			))
 		case subSpec.TopMetrics != nil:
 			size := subSpec.TopMetrics.EffectiveSize()
+			if topHitsNeedsRuntimeSort(subSpec.TopMetrics.Sort) && size < 100 {
+				size = 100
+			}
 			orderBy := t.compileTopHitsOrderBy(subSpec.TopMetrics.Sort)
 			*subIdx++
 			*branches = append(*branches, fmt.Sprintf(
@@ -5275,15 +5338,61 @@ func (t *Transpiler) compileTopHitsOrderBy(sorts []esast.SortSpec) string {
 	return t.compileOrderBy(filtered)
 }
 
-func (t *Transpiler) coerceRangeAggBoundWithNow(field string, v any, now time.Time) any {
+func (t *Transpiler) resolveRangeAggMissingFloat(field string, rngSpec *esast.RangeAggSpec, now time.Time) (float64, bool) {
+	if rngSpec == nil || rngSpec.Missing == nil {
+		return 0, false
+	}
+	coerced := t.coerceRangeAggBoundWithNow(field, rngSpec, rngSpec.Missing, now)
+	return resolveHistogramMissingFloat(coerced)
+}
+
+func (t *Transpiler) coerceRangeAggBoundWithNow(field string, rngSpec *esast.RangeAggSpec, v any, now time.Time) any {
 	b := t.Schema.ResolveField(field)
+	isEpochSecond := rngSpec != nil && strings.EqualFold(rngSpec.Format, "epoch_second")
+	var tzOffsetMs int64
+	if rngSpec != nil {
+		tzOffsetMs = esast.ParseTimeZoneOffsetMs(strings.TrimSpace(rngSpec.TimeZone))
+	}
 	if strVal, ok := v.(string); ok {
+		trimmed := strings.TrimSpace(strVal)
+		if isEpochSecond {
+			if rawSec, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(rawSec) && !math.IsInf(rawSec, 0) {
+				return int64(rawSec * 1000)
+			}
+		}
 		if ms, ok := schema.ParseESDateToEpochMillis(strVal, now); ok {
+			datePart := trimmed
+			if idx := strings.Index(datePart, "||"); idx >= 0 {
+				datePart = strings.TrimSpace(datePart[:idx])
+			}
+			if _, intErr := strconv.ParseInt(datePart, 10, 64); intErr != nil &&
+				tzOffsetMs != 0 && !strings.HasPrefix(datePart, "now") &&
+				!strings.HasSuffix(datePart, "Z") && !strings.HasSuffix(datePart, "z") &&
+				!strings.Contains(datePart[min(10, len(datePart)):], "+") &&
+				!strings.Contains(datePart[min(10, len(datePart)):], "-") {
+				ms -= tzOffsetMs
+			}
 			return normalizeDateNanosValue(b.ESType, ms)
 		}
 		if b.ESType == "date_nanos" {
-			if iv, err := strconv.ParseInt(strings.TrimSpace(strVal), 10, 64); err == nil {
+			if iv, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
 				return normalizeDateNanosValue(b.ESType, iv)
+			}
+		}
+	}
+	if isEpochSecond {
+		switch nv := v.(type) {
+		case int:
+			return int64(nv) * 1000
+		case int64:
+			return nv * 1000
+		case float64:
+			return int64(nv * 1000)
+		case json.Number:
+			if i, err := nv.Int64(); err == nil {
+				return i * 1000
+			} else if f, err := nv.Float64(); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+				return int64(f * 1000)
 			}
 		}
 	}
@@ -5406,7 +5515,7 @@ func extractSimpleDocFieldFromScript(script any) (string, bool) {
 }
 
 func (t *Transpiler) compilePolymorphicScriptExpr(script any, defaultField string, fieldOverrideExpr string, nctx *nestedCtx) (string, bool) {
-	s, _, ok := normalizeScriptSourceAndParams(script)
+	s, params, ok := normalizeScriptSourceAndParams(script)
 	if !ok {
 		return "", false
 	}
@@ -5426,7 +5535,127 @@ func (t *Transpiler) compilePolymorphicScriptExpr(script any, defaultField strin
 		}
 		return t.sqlColumnRef(field, true, nctx), true
 	}
+	if strExpr, isStr, ok := t.parseStringScriptExpr(sClean, params, defaultField, fieldOverrideExpr, nctx, 0); ok && isStr {
+		return strExpr, true
+	}
 	return t.compileMetricScriptExprWithOverride(script, defaultField, fieldOverrideExpr, nctx)
+}
+
+func (t *Transpiler) parseStringScriptExpr(s string, params map[string]any, defaultField string, fieldOverrideExpr string, nctx *nestedCtx, depth int) (string, bool, bool) {
+	if depth > 16 {
+		return "", false, false
+	}
+	s = stripLeadingScriptCast(s)
+	for hasMatchingThresholdParens(s) {
+		s = strings.TrimSpace(s[1 : len(s)-1])
+	}
+	if s == "" {
+		return "", false, false
+	}
+	// Check top-level '+' concatenation outside quotes/parens/brackets
+	parenDepth := 0
+	var inQuote byte
+	var plusParts []string
+	lastSplit := 0
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if inQuote != 0 {
+			if ch == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if ch == inQuote {
+				inQuote = 0
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' {
+			inQuote = ch
+			continue
+		}
+		switch ch {
+		case '(', '[':
+			parenDepth++
+		case ')', ']':
+			parenDepth--
+		case '+':
+			if parenDepth == 0 && i > lastSplit && i < len(s)-1 {
+				plusParts = append(plusParts, strings.TrimSpace(s[lastSplit:i]))
+				lastSplit = i + 1
+			}
+		}
+	}
+	if len(plusParts) > 0 {
+		plusParts = append(plusParts, strings.TrimSpace(s[lastSplit:]))
+		compiledParts := make([]string, 0, len(plusParts))
+		hasStringOperand := false
+		allOK := true
+		for _, part := range plusParts {
+			cp, isStr, ok := t.parseStringScriptExpr(part, params, defaultField, fieldOverrideExpr, nctx, depth+1)
+			if !ok {
+				allOK = false
+				break
+			}
+			if isStr {
+				hasStringOperand = true
+			}
+			compiledParts = append(compiledParts, fmt.Sprintf("CAST(%s AS STRING)", cp))
+		}
+		if allOK && hasStringOperand {
+			return fmt.Sprintf("CONCAT(%s)", strings.Join(compiledParts, ", ")), true, true
+		}
+	}
+	for _, mSpec := range []struct{ suffix, sqlFn string }{
+		{".toLowerCase()", "LOWER"},
+		{".toUpperCase()", "UPPER"},
+		{".trim()", "TRIM"},
+	} {
+		if strings.HasSuffix(s, mSpec.suffix) {
+			recv := strings.TrimSpace(s[:len(s)-len(mSpec.suffix)])
+			inner, _, ok := t.parseStringScriptExpr(recv, params, defaultField, fieldOverrideExpr, nctx, depth+1)
+			if ok {
+				return fmt.Sprintf("%s(CAST(%s AS STRING))", mSpec.sqlFn, inner), true, true
+			}
+		}
+	}
+	if len(s) >= 2 && ((s[0] == '\'' && s[len(s)-1] == '\'') || (s[0] == '"' && s[len(s)-1] == '"')) {
+		qChar := s[0]
+		innerLit := s[1 : len(s)-1]
+		if !strings.ContainsRune(innerLit, rune(qChar)) {
+			return quoteStr(innerLit), true, true
+		}
+	}
+	if (s == "_value" || s == "params._value") && defaultField != "" {
+		b := t.Schema.ResolveField(defaultField)
+		effDT := effectiveDorisScalarType(b)
+		isStr := effDT == schema.DorisString || effDT == schema.DorisVarchar
+		if fieldOverrideExpr != "" {
+			return fieldOverrideExpr, isStr, true
+		}
+		return t.sqlColumnRef(defaultField, true, nctx), isStr, true
+	}
+	if field, tail, ok := parseDocFieldAccess(s); ok && (tail == "" || tail == ".value") {
+		b := t.Schema.ResolveField(field)
+		effDT := effectiveDorisScalarType(b)
+		isStr := effDT == schema.DorisString || effDT == schema.DorisVarchar
+		if fieldOverrideExpr != "" && (defaultField == "" || field == defaultField) {
+			return fieldOverrideExpr, isStr, true
+		}
+		return t.sqlColumnRef(field, true, nctx), isStr, true
+	}
+	if paramKey, ok := parseScriptParamKey(s); ok {
+		if params != nil {
+			if rawVal, exists := params[paramKey]; exists {
+				if strVal, ok := rawVal.(string); ok {
+					return quoteStr(strVal), true, true
+				}
+				if fv, ok := resolveHistogramMissingFloat(rawVal); ok {
+					return strconv.FormatFloat(fv, 'f', -1, 64), false, true
+				}
+			}
+		}
+	}
+	return "", false, false
 }
 
 func (t *Transpiler) compileMetricScriptExpr(script any, defaultField string, nctx *nestedCtx) (string, bool) {
@@ -6062,10 +6291,14 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 		}
 		if s.Entry.Field == "_script" {
 			if scriptExpr, ok := t.compileMetricScriptExpr(s.Entry.Script, "", nil); ok {
+				_, missingSQL := t.resolveSortMissing(s, schema.FieldBinding{DorisType: schema.DorisDouble})
+				if missingSQL != "" {
+					scriptExpr = fmt.Sprintf("COALESCE(%s, %s)", scriptExpr, missingSQL)
+				}
 				orderPart := scriptExpr + " " + dir
 				if strings.EqualFold(s.Entry.Missing, "_first") {
 					orderPart += " NULLS FIRST"
-				} else if strings.EqualFold(s.Entry.Missing, "_last") || dir == "ASC" {
+				} else if missingSQL == "" && (strings.EqualFold(s.Entry.Missing, "_last") || dir == "ASC") {
 					orderPart += " NULLS LAST"
 				}
 				parts = append(parts, orderPart)
@@ -6119,8 +6352,13 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after []any, scoreExpr string) string {
 	var effectiveSorts []esast.SortSpec
 	for _, s := range sorts {
-		if s.Entry.Field == "_script" || s.Entry.Field == "_geo_distance" {
+		if s.Entry.Field == "_geo_distance" {
 			break
+		}
+		if s.Entry.Field == "_script" {
+			if _, ok := t.compileMetricScriptExpr(s.Entry.Script, "", nil); !ok {
+				break
+			}
 		}
 		if s.Entry.Field != "" {
 			effectiveSorts = append(effectiveSorts, s)
@@ -6149,6 +6387,13 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 			return fmt.Sprintf("CAST(%s AS DOUBLE)", scoreExpr), val, true, nil
 		case "_id", "_doc":
 			return "`_id`", val, true, nil
+		case "_script":
+			scriptExpr, _ := t.compileMetricScriptExpr(effectiveSorts[idx].Entry.Script, "", nil)
+			missSample, missingSQL := t.resolveSortMissing(effectiveSorts[idx], schema.FieldBinding{DorisType: schema.DorisDouble})
+			if missingSQL != "" {
+				scriptExpr = fmt.Sprintf("COALESCE(%s, %s)", scriptExpr, missingSQL)
+			}
+			return scriptExpr, val, missingSQL != "", missSample
 		default:
 			b := t.Schema.ResolveField(field)
 			effType := effectiveSortESType(b, effectiveSorts[idx].Entry.Type)

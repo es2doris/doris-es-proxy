@@ -187,27 +187,66 @@ func coerceScalarForDoris(val any, dorisType DorisScalarType, lowercase bool, no
 		switch v := val.(type) {
 		case int64:
 			return v
+		case uint64:
+			if v > uint64(math.MaxInt64) {
+				return int64(math.MaxInt64)
+			}
+			return int64(v)
 		case int:
 			return int64(v)
 		case float64:
 			if math.IsNaN(v) || math.IsInf(v, 0) {
 				return nil
 			}
+			if v >= float64(math.MaxInt64) {
+				return int64(math.MaxInt64)
+			}
+			if v <= float64(math.MinInt64) {
+				return int64(math.MinInt64)
+			}
 			return int64(v)
 		case json.Number:
 			if i, err := v.Int64(); err == nil {
 				return i
 			}
+			if u, err := strconv.ParseUint(v.String(), 10, 64); err == nil {
+				if u > uint64(math.MaxInt64) {
+					return int64(math.MaxInt64)
+				}
+				return int64(u)
+			}
 			if f, err := v.Float64(); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+				if f >= float64(math.MaxInt64) {
+					return int64(math.MaxInt64)
+				}
+				if f <= float64(math.MinInt64) {
+					return int64(math.MinInt64)
+				}
 				return int64(f)
 			}
 			return nil
 		case string:
-			if i, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
+			trimmed := strings.TrimSpace(v)
+			if i, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
 				return i
+			}
+			if u, err := strconv.ParseUint(trimmed, 10, 64); err == nil {
+				if u > uint64(math.MaxInt64) {
+					return int64(math.MaxInt64)
+				}
+				return int64(u)
 			}
 			if ms, ok := ParseESDateToEpochMillis(v, now); ok {
 				return ms
+			}
+			if f, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+				if f >= float64(math.MaxInt64) {
+					return int64(math.MaxInt64)
+				}
+				if f <= float64(math.MinInt64) {
+					return int64(math.MinInt64)
+				}
+				return int64(f)
 			}
 			return nil
 		default:
@@ -218,6 +257,11 @@ func coerceScalarForDoris(val any, dorisType DorisScalarType, lowercase bool, no
 		case int:
 			return v
 		case int64:
+			return int(v)
+		case uint64:
+			if v > uint64(math.MaxInt32) {
+				return int(math.MaxInt32)
+			}
 			return int(v)
 		case float64:
 			if math.IsNaN(v) || math.IsInf(v, 0) {
@@ -233,8 +277,12 @@ func coerceScalarForDoris(val any, dorisType DorisScalarType, lowercase bool, no
 			}
 			return nil
 		case string:
-			if i, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			trimmed := strings.TrimSpace(v)
+			if i, err := strconv.Atoi(trimmed); err == nil {
 				return i
+			}
+			if f, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+				return int(f)
 			}
 			return nil
 		default:

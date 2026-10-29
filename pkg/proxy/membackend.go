@@ -2515,7 +2515,7 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 		return nil
 	}
-	if strings.HasPrefix(colExpr, "lower(") && strings.HasSuffix(colExpr, ")") {
+	if (strings.HasPrefix(colExpr, "lower(") || strings.HasPrefix(colExpr, "LOWER(")) && strings.HasSuffix(colExpr, ")") {
 		inner := colExpr[len("lower(") : len(colExpr)-1]
 		if v := resolveColumnValue(row, inner); v != nil {
 			switch sliceVal := v.(type) {
@@ -2530,6 +2530,51 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			}
 		}
 		return nil
+	}
+	if (strings.HasPrefix(colExpr, "upper(") || strings.HasPrefix(colExpr, "UPPER(")) && strings.HasSuffix(colExpr, ")") {
+		inner := colExpr[len("upper(") : len(colExpr)-1]
+		if v := resolveColumnValue(row, inner); v != nil {
+			switch sliceVal := v.(type) {
+			case []any, []string:
+				var out []any
+				for _, elem := range asSliceOrSingle(sliceVal) {
+					out = append(out, strings.ToUpper(fmt.Sprintf("%v", elem)))
+				}
+				return out
+			default:
+				return strings.ToUpper(fmt.Sprintf("%v", v))
+			}
+		}
+		return nil
+	}
+	if (strings.HasPrefix(colExpr, "trim(") || strings.HasPrefix(colExpr, "TRIM(")) && strings.HasSuffix(colExpr, ")") {
+		inner := colExpr[len("trim(") : len(colExpr)-1]
+		if v := resolveColumnValue(row, inner); v != nil {
+			switch sliceVal := v.(type) {
+			case []any, []string:
+				var out []any
+				for _, elem := range asSliceOrSingle(sliceVal) {
+					out = append(out, strings.TrimSpace(fmt.Sprintf("%v", elem)))
+				}
+				return out
+			default:
+				return strings.TrimSpace(fmt.Sprintf("%v", v))
+			}
+		}
+		return nil
+	}
+	if (strings.HasPrefix(colExpr, "CONCAT(") || strings.HasPrefix(colExpr, "concat(")) && strings.HasSuffix(colExpr, ")") && !strings.Contains(colExpr, "'\\x1f'") {
+		inner := colExpr[len("CONCAT(") : len(colExpr)-1]
+		args := splitTopLevelArgs(inner)
+		var sb strings.Builder
+		for _, a := range args {
+			v := resolveColumnValue(row, strings.TrimSpace(a))
+			if v == nil {
+				return nil
+			}
+			_, _ = fmt.Fprintf(&sb, "%v", v)
+		}
+		return sb.String()
 	}
 	if strings.HasPrefix(colExpr, "LENGTH(") && strings.HasSuffix(colExpr, ")") {
 		inner := colExpr[len("LENGTH(") : len(colExpr)-1]
