@@ -47,6 +47,7 @@ type SearchRequest struct {
 	PostFilter     *Query             `json:"post_filter,omitempty"`
 	From           *int               `json:"from,omitempty"`
 	Size           *int               `json:"size,omitempty"`
+	TerminateAfter *int               `json:"terminate_after,omitempty"`
 	MinScore       *float64           `json:"min_score,omitempty"`
 	Aggs           map[string]AggSpec `json:"aggs,omitempty"`
 	Aggregations   map[string]AggSpec `json:"aggregations,omitempty"`
@@ -1598,12 +1599,13 @@ type HistogramAggSpec struct {
 }
 
 type RangeAggSpec struct {
-	Field   string           `json:"field"`
-	Script  any              `json:"script,omitempty"`
-	Missing any              `json:"missing,omitempty"`
-	Format  string           `json:"format,omitempty"`
-	Ranges  []RangeAggBucket `json:"ranges"`
-	Keyed   bool             `json:"keyed,omitempty"`
+	Field    string           `json:"field"`
+	Script   any              `json:"script,omitempty"`
+	Missing  any              `json:"missing,omitempty"`
+	Format   string           `json:"format,omitempty"`
+	TimeZone string           `json:"time_zone,omitempty"`
+	Ranges   []RangeAggBucket `json:"ranges"`
+	Keyed    bool             `json:"keyed,omitempty"`
 }
 
 type RangeAggBucket struct {

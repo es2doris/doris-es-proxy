@@ -38,9 +38,17 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 	}
 
 	var expandedFields []string
+	hadExplicitWildcardFields := false
 	for _, fpat := range qsq.Fields {
-		if strings.ContainsAny(fpat, "*?") && t.Schema != nil {
-			for _, bf := range t.Schema.ExpandFieldPattern(fpat) {
+		basePat := strings.Split(fpat, "^")[0]
+		if strings.ContainsAny(basePat, "*?") && t.Schema != nil {
+			exp := t.Schema.ExpandFieldPattern(fpat)
+			if len(exp) == 0 && basePat == "*" {
+				expandedFields = append(expandedFields, "_all_text")
+				continue
+			}
+			hadExplicitWildcardFields = true
+			for _, bf := range exp {
 				if bf.Boost != 1.0 {
 					expandedFields = append(expandedFields, fmt.Sprintf("%s^%g", bf.Field, bf.Boost))
 				} else {
@@ -56,15 +64,28 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 	if defaultField == "" {
 		if len(expandedFields) > 0 {
 			defaultField = strings.Split(expandedFields[0], "^")[0]
+		} else if hadExplicitWildcardFields {
+			defaultField = "__unmatched_wildcard__"
 		} else {
 			defaultField = "_all_text"
 		}
-	}
-	if strings.ContainsAny(defaultField, "*?") && t.Schema != nil {
+	} else if strings.ContainsAny(defaultField, "*?") && t.Schema != nil {
+		baseDef := strings.Split(defaultField, "^")[0]
 		if exp := t.Schema.ExpandFieldPattern(defaultField); len(exp) > 0 {
 			defaultField = exp[0].Field
-		} else {
+			if len(expandedFields) == 0 {
+				for _, bf := range exp {
+					if bf.Boost != 1.0 {
+						expandedFields = append(expandedFields, fmt.Sprintf("%s^%g", bf.Field, bf.Boost))
+					} else {
+						expandedFields = append(expandedFields, bf.Field)
+					}
+				}
+			}
+		} else if baseDef == "*" {
 			defaultField = "_all_text"
+		} else {
+			defaultField = "__unmatched_wildcard__"
 		}
 	}
 	defaultOp := strings.ToUpper(qsq.DefaultOperator)
@@ -74,30 +95,32 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 
 	parsedAST := parseSimpleLuceneToAST(raw, defaultField, expandedFields, defaultOp)
 	compiled := t.CompileQuery(&parsedAST, scoring, nctx)
-	if rewrittenRaw, ok := t.rewriteDoris4SearchQuery(raw); ok && t.Opts.UseDoris4SearchFunc && nctx == nil && !strings.ContainsAny(raw, "[{><~/^") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, "`n__") {
+	if rewrittenRaw, ok := t.rewriteDoris4SearchQuery(raw); ok && t.Opts.UseDoris4SearchFunc && nctx == nil && defaultField != "__unmatched_wildcard__" && !strings.ContainsAny(raw, "[{><~/^") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, "`n__") {
 		if len(expandedFields) > 1 {
-			var searchPreds []string
-			allSupported := true
-			for _, ef := range expandedFields {
-				fname := strings.Split(ef, "^")[0]
-				if t.isDoris4SearchableField(fname) {
-					col := strings.Trim(t.sqlColumnRef(fname, false, nctx), "`")
-					searchPreds = append(searchPreds, fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(rewrittenRaw), quoteStr(col), quoteStr(defaultOp)))
-				} else {
-					allSupported = false
-					break
+			if canEmitMultiFieldDoris4SearchDisjunction(rewrittenRaw, defaultOp) {
+				var searchPreds []string
+				allSupported := true
+				for _, ef := range expandedFields {
+					fname := strings.Split(ef, "^")[0]
+					if t.isDoris4SearchableField(fname) {
+						col := strings.Trim(t.sqlColumnRef(fname, false, nctx), "`")
+						searchPreds = append(searchPreds, fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(rewrittenRaw), quoteStr(col), quoteStr(defaultOp)))
+					} else {
+						allSupported = false
+						break
+					}
 				}
-			}
-			if allSupported && len(searchPreds) > 0 {
-				pred := strings.Join(searchPreds, " OR ")
-				if len(searchPreds) > 1 {
-					pred = "(" + pred + ")"
-				}
-				return CompiledQuery{
-					WhereSQL:          pred,
-					SafeWhereSQL:      compiled.EffectiveSafeWhere(),
-					ScoreSQL:          compiled.ScoreSQL,
-					UsesFulltextMatch: true,
+				if allSupported && len(searchPreds) > 0 {
+					pred := strings.Join(searchPreds, " OR ")
+					if len(searchPreds) > 1 {
+						pred = "(" + pred + ")"
+					}
+					return CompiledQuery{
+						WhereSQL:          pred,
+						SafeWhereSQL:      compiled.EffectiveSafeWhere(),
+						ScoreSQL:          compiled.ScoreSQL,
+						UsesFulltextMatch: true,
+					}
 				}
 			}
 		} else if t.isDoris4SearchableField(defaultField) {
@@ -157,6 +180,31 @@ func (t *Transpiler) rewriteDoris4SearchQuery(raw string) (string, bool) {
 		}
 	}
 	return strings.Join(out, " "), true
+}
+
+func canEmitMultiFieldDoris4SearchDisjunction(rewrittenRaw string, defaultOp string) bool {
+	tokens := tokenizeLucene(rewrittenRaw)
+	clauseCount := 0
+	for _, tok := range tokens {
+		upper := strings.ToUpper(tok)
+		if upper == "AND" || tok == "&&" || upper == "NOT" || tok == "!" || tok == "+" || tok == "-" {
+			return false
+		}
+		if upper == "OR" || tok == "||" || tok == "|" {
+			continue
+		}
+		if strings.HasPrefix(tok, "+") || strings.HasPrefix(tok, "-") || strings.HasPrefix(tok, "!") {
+			return false
+		}
+		if hasMatchingOuterParens(tok) && !canEmitMultiFieldDoris4SearchDisjunction(tok[1:len(tok)-1], defaultOp) {
+			return false
+		}
+		clauseCount++
+	}
+	if defaultOp == "AND" && clauseCount > 1 {
+		return false
+	}
+	return true
 }
 
 func (t *Transpiler) isDoris4SearchableField(fname string) bool {
@@ -579,13 +627,22 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 		}
 	}
 
+	if len(fields) == 0 && defaultField == "__unmatched_wildcard__" {
+		return esast.Query{MatchNone: map[string]any{}}
+	}
+
 	if rc := parseLuceneRangeToken(token, boost); rc != nil {
 		if len(fields) > 0 {
 			var shoulds []esast.Query
 			for _, fpat := range fields {
-				fname := strings.Split(fpat, "^")[0]
+				fname, fBoost := splitLuceneBoost(fpat)
+				rcCopy := *rc
+				effBoost := boost * fBoost
+				if effBoost != 1.0 {
+					rcCopy.Boost = &effBoost
+				}
 				shoulds = append(shoulds, esast.Query{
-					Range: map[string]esast.RangeCond{fname: *rc},
+					Range: map[string]esast.RangeCond{fname: rcCopy},
 				})
 			}
 			if len(shoulds) == 1 {
@@ -604,10 +661,10 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 		if len(fields) > 0 {
 			var shoulds []esast.Query
 			for _, fpat := range fields {
-				fname := strings.Split(fpat, "^")[0]
+				fname, fBoost := splitLuceneBoost(fpat)
 				shoulds = append(shoulds, esast.Query{
 					Regexp: map[string]esast.RegexpEntry{
-						fname: {Value: pat, Boost: boost},
+						fname: {Value: pat, Boost: boost * fBoost},
 					},
 				})
 			}
@@ -629,10 +686,10 @@ func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, 
 		if len(fields) > 0 {
 			var shoulds []esast.Query
 			for _, fpat := range fields {
-				fname := strings.Split(fpat, "^")[0]
+				fname, fBoost := splitLuceneBoost(fpat)
 				shoulds = append(shoulds, esast.Query{
 					Wildcard: map[string]esast.WildcardEntry{
-						fname: {Value: rawWild, CaseInsensitive: true, Boost: boost},
+						fname: {Value: rawWild, CaseInsensitive: true, Boost: boost * fBoost},
 					},
 				})
 			}
