@@ -170,9 +170,29 @@ func CompileIndexSchema(dorisDB, indexName string, mapping *esast.MappingSpec) *
 }
 
 func (s *IndexSchema) finalizeCompiledSlices() {
+	// First resolve alias chains (e.g. a1 -> a2 -> target) so copy_to targeting an alias resolves to the underlying field.
+	for pass := 0; pass < 4; pass++ {
+		changed := false
+		for k, b := range s.Fields {
+			if b.AliasTarget != "" {
+				if tb, ok := s.Fields[b.AliasTarget]; ok && tb.AliasTarget != "" && tb.AliasTarget != b.AliasTarget {
+					b.AliasTarget = tb.AliasTarget
+					s.Fields[k] = b
+					changed = true
+				}
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+
 	copyToTargets := make(map[string]bool)
 	for _, b := range s.Fields {
 		for _, target := range b.CopyTo {
+			if tb, ok := s.Fields[target]; ok && tb.AliasTarget != "" {
+				target = tb.AliasTarget
+			}
 			copyToTargets[target] = true
 		}
 	}
@@ -207,6 +227,17 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 		}
 		if !changed {
 			break
+		}
+	}
+
+	// Any remaining unresolved alias (pointing to a dynamic/unmapped field) falls back to StorageDynamicVariant on AliasTarget.
+	for k, b := range s.Fields {
+		if b.AliasTarget != "" && b.ColumnName == "" {
+			b.Kind = StorageDynamicVariant
+			b.DorisType = DorisString
+			b.ESType = "keyword"
+			b.SourceJSONPath = strings.Split(b.AliasTarget, ".")
+			s.Fields[k] = b
 		}
 	}
 
@@ -577,6 +608,13 @@ func (s *IndexSchema) ResolveField(esFieldPath string) FieldBinding {
 	if strings.HasSuffix(esFieldPath, ".keyword") {
 		basePath := strings.TrimSuffix(esFieldPath, ".keyword")
 		if b, ok := s.Fields[basePath]; ok {
+			if b.AliasTarget != "" {
+				if kwB, hasKw := s.Fields[b.AliasTarget+".keyword"]; hasKw {
+					kwB.ESFieldPath = esFieldPath
+					kwB.AliasTarget = b.AliasTarget
+					return kwB
+				}
+			}
 			b.ESFieldPath = esFieldPath
 			if b.ESType == "text" {
 				b.ESType = "keyword"
@@ -596,6 +634,26 @@ func (s *IndexSchema) ResolveField(esFieldPath string) FieldBinding {
 		Kind:           StorageDynamicVariant,
 		DorisType:      DorisString,
 	}
+}
+
+// ResolveEffectiveField returns the FieldBinding for esFieldPath, promoting to the
+// `.keyword` companion binding when preferKeyword is true and a `.keyword` companion exists.
+func (s *IndexSchema) ResolveEffectiveField(esFieldPath string, preferKeyword bool) FieldBinding {
+	b := s.ResolveField(esFieldPath)
+	if preferKeyword && b.KeywordCompanion != "" && !strings.HasSuffix(esFieldPath, ".keyword") {
+		lookupBase := esFieldPath
+		if b.AliasTarget != "" {
+			lookupBase = b.AliasTarget
+		}
+		if kwB, ok := s.Fields[lookupBase+".keyword"]; ok {
+			kwB.ESFieldPath = esFieldPath
+			if b.AliasTarget != "" {
+				kwB.AliasTarget = b.AliasTarget
+			}
+			return kwB
+		}
+	}
+	return b
 }
 
 type BoostedField struct {

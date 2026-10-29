@@ -1066,4 +1066,52 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	if r21GetRes["_seq_no"] == nil || r21GetRes["_primary_term"] != float64(1) {
 		t.Fatalf("expected R21 GET response to include _seq_no and _primary_term=1, got %+v", r21GetRes)
 	}
+
+	// 23. Round-22: simple_query_string colon & unspaced operator handling, rescore before collapse, and pipeline agg over keyed filters
+	r22SearchResp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
+		"query": {
+			"simple_query_string": {
+				"fields": ["service"],
+				"query": "checkout|payments"
+			}
+		},
+		"collapse": {"field": "service"},
+		"rescore": {
+			"window_size": 10,
+			"query": {
+				"rescore_query": {"term": {"service": "checkout"}},
+				"query_weight": 1.0,
+				"rescore_query_weight": 2.0
+			}
+		},
+		"aggs": {
+			"by_svc_filters": {
+				"filters": {
+					"filters": {
+						"co": {"term": {"service": "checkout"}}
+					}
+				},
+				"aggs": {
+					"lat_stats": {"stats": {"field": "latency_ms"}}
+				}
+			},
+			"max_filter_lat": {
+				"max_bucket": {"buckets_path": "by_svc_filters>lat_stats.max"}
+			}
+		}
+	}`))
+	if err != nil || r22SearchResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search (R22 simple_query_string + rescore+collapse + keyed filters pipeline agg) failed: status=%v err=%v", r22SearchResp.StatusCode, err)
+	}
+	var r22SearchRes map[string]any
+	_ = json.NewDecoder(r22SearchResp.Body).Decode(&r22SearchRes)
+	_ = r22SearchResp.Body.Close()
+	r22Hits := r22SearchRes["hits"].(map[string]any)["hits"].([]any)
+	if len(r22Hits) == 0 {
+		t.Fatalf("expected R22 collapsed hits on live_auto_index, got 0")
+	}
+	r22Aggs, _ := r22SearchRes["aggregations"].(map[string]any)
+	if r22Aggs == nil || r22Aggs["max_filter_lat"] == nil {
+		t.Fatalf("expected R22 max_filter_lat pipeline agg result, got %+v", r22Aggs)
+	}
 }

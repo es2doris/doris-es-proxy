@@ -456,7 +456,7 @@ var (
 	reAggSubMetric           = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\((?:COALESCE\\((AVG|SUM|MIN|MAX|COUNT|STDDEV_POP)\\((.+?)\\), 0\\)|(COUNT)\\((DISTINCT )?(.+?)\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key`$")
 	reAggSubPercentile       = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\(COALESCE\\(PERCENTILE_APPROX\\((.+?), ([0-9.]+)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key`$")
 	reAggSubPercentileRank   = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\(COALESCE\\(AVG\\(CASE WHEN (.+?) <= ([0-9.eE+-]+) THEN 100\\.0 ELSE 0\\.0 END\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key`$")
-	reAggSubTerms            = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (CONCAT\\(.+?\\)) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC")
+	reAggSubTerms            = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (CONCAT\\(.+?\\)) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC")
 	reAggTopHits             = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, `_id` AS `_bucket_key`, CAST\\(1 AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+?))? ORDER BY (.+?) LIMIT (\\d+)")
 	reAggSubTopHits          = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CONCAT\\((.+?), '\\\\x1f', `_id`\\) AS `_bucket_key`, CAST\\(ROW_NUMBER\\(\\) OVER \\(PARTITION BY .+? ORDER BY (.+?)\\) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?)\\) `_agg_sub_\\d+` WHERE `_doc_count` <= (\\d+)")
 	reAggComposite           = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM (.+?)(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_bucket_key` ASC LIMIT (\\d+)")
@@ -1140,7 +1140,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		for _, row := range expanded {
 			if val := resolveColumnValue(row, colExpr); val != nil {
 				if f, ok := toFloat(val); ok {
-					b := math.Floor((f-offset)/interval)*interval + offset
+					b := math.Round((math.Floor((f-offset)/interval+1e-9)*interval+offset)*1e12) / 1e12
 					if isDistinctDoc {
 						dk := fmt.Sprintf("%v\x00%g", row["_id"], b)
 						if seenDocBucket[dk] {
@@ -1272,9 +1272,18 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		aggName, bucketKeyExpr, fromClause, whereClause := m[1], m[2], m[3], m[4]
 		expanded := expandFromClauseRows(baseRows, fromClause, whereClause)
 		counts := make(map[string]int64)
+		seenDocBucket := make(map[string]bool)
+		isDistinctDoc := strings.Contains(branch, "COUNT(DISTINCT `_id`)")
 		for _, row := range expanded {
 			for _, bKey := range evalBucketKeyExprs(row, bucketKeyExpr) {
 				if bKey != "" {
+					if isDistinctDoc {
+						dk := fmt.Sprintf("%v\x00%s", row["_id"], bKey)
+						if seenDocBucket[dk] {
+							continue
+						}
+						seenDocBucket[dk] = true
+					}
 					counts[bKey]++
 				}
 			}
@@ -1452,13 +1461,93 @@ func evalCompositeKeyExpr(row map[string]any, expr string) string {
 
 var (
 	reLateralViewExplode = regexp.MustCompile("LATERAL VIEW EXPLODE\\((?:(CASE WHEN )`([^`]+)` IS NULL.+?END|`([^`]+)`)\\) `[^`]+` AS `([^`]+)`")
-	reReverseNestedDedup = regexp.MustCompile("^`base_matched` INNER JOIN \\(SELECT DISTINCT `_id` AS `_rn_id`, (.+?) AS `_rn_bkey` FROM (.+?) WHERE (.+)\\) `_rn_dedup` ON `base_matched`\\.`_id` = `_rn_dedup`\\.`_rn_id`(.*)$")
+	reDedupSelectInner   = regexp.MustCompile("^SELECT DISTINCT `_id` AS `_rn_id(?:_\\d+)?`, (.+?) AS `(_rn_bkey(?:_\\d+)?)` FROM (.+)$")
+	reDedupJoinTail      = regexp.MustCompile("^\\s*`_rn_dedup(?:_\\d+)?` ON `base_matched`\\.`_id` = `_rn_dedup(?:_\\d+)?`\\.`_rn_id(?:_\\d+)?`(.*)$")
 )
+
+func parseLeadingDedupJoin(fromClause string) (innerBucketExpr, bkeyAlias, innerFrom, innerWhere, tailFrom string, ok bool) {
+	const prefix = "`base_matched` INNER JOIN ("
+	trimmed := strings.TrimSpace(fromClause)
+	if !strings.HasPrefix(trimmed, prefix) {
+		return "", "", "", "", "", false
+	}
+	openIdx := len(prefix) - 1
+	depth := 0
+	inSingleQuote := false
+	closeIdx := -1
+	for i := openIdx; i < len(trimmed); i++ {
+		ch := trimmed[i]
+		if ch == '\'' {
+			inSingleQuote = !inSingleQuote
+			continue
+		}
+		if inSingleQuote {
+			continue
+		}
+		if ch == '(' {
+			depth++
+		} else if ch == ')' {
+			depth--
+			if depth == 0 {
+				closeIdx = i
+				break
+			}
+		}
+	}
+	if closeIdx <= openIdx {
+		return "", "", "", "", "", false
+	}
+	subquery := trimmed[openIdx+1 : closeIdx]
+	afterParen := trimmed[closeIdx+1:]
+	tm := reDedupJoinTail.FindStringSubmatch(afterParen)
+	if tm == nil {
+		return "", "", "", "", "", false
+	}
+	tailFrom = tm[1]
+	sm := reDedupSelectInner.FindStringSubmatch(subquery)
+	if sm == nil {
+		return "", "", "", "", "", false
+	}
+	innerBucketExpr = sm[1]
+	bkeyAlias = sm[2]
+	fromAndWhere := sm[3]
+	// Find top-level " WHERE " in fromAndWhere
+	wDepth := 0
+	wQuote := false
+	wherePos := -1
+	for i := 0; i <= len(fromAndWhere)-7; i++ {
+		ch := fromAndWhere[i]
+		if ch == '\'' {
+			wQuote = !wQuote
+			continue
+		}
+		if wQuote {
+			continue
+		}
+		switch ch {
+		case '(':
+			wDepth++
+		case ')':
+			if wDepth > 0 {
+				wDepth--
+			}
+		default:
+			if wDepth == 0 && fromAndWhere[i:i+7] == " WHERE " {
+				wherePos = i
+			}
+		}
+	}
+	if wherePos < 0 {
+		return "", "", "", "", "", false
+	}
+	innerFrom = strings.TrimSpace(fromAndWhere[:wherePos])
+	innerWhere = strings.TrimSpace(fromAndWhere[wherePos+7:])
+	return innerBucketExpr, bkeyAlias, innerFrom, innerWhere, tailFrom, true
+}
 
 func expandFromClauseRows(baseRows []map[string]any, fromClause, whereClause string) []map[string]any {
 	currRows := baseRows
-	if m := reReverseNestedDedup.FindStringSubmatch(strings.TrimSpace(fromClause)); m != nil {
-		innerBucketExpr, innerFrom, innerWhere, tailFrom := m[1], m[2], m[3], m[4]
+	if innerBucketExpr, bkeyAlias, innerFrom, innerWhere, tailFrom, ok := parseLeadingDedupJoin(fromClause); ok {
 		innerRows := expandFromClauseRows(baseRows, innerFrom, innerWhere)
 		baseByID := make(map[string]map[string]any, len(baseRows))
 		for _, r := range baseRows {
@@ -1478,10 +1567,11 @@ func expandFromClauseRows(baseRows []map[string]any, fromClause, whereClause str
 			}
 			seen[pairKey] = true
 			if orig, ok := baseByID[idStr]; ok {
-				cp := make(map[string]any, len(orig)+1)
+				cp := make(map[string]any, len(orig)+2)
 				for k, v := range orig {
 					cp[k] = v
 				}
+				cp[bkeyAlias] = bKey
 				cp["_rn_bkey"] = bKey
 				deduped = append(deduped, cp)
 			}
@@ -1704,7 +1794,7 @@ func evalBucketKeyExpr(row map[string]any, expr string) string {
 		}
 		if val := resolveColumnValue(row, colExpr); val != nil {
 			if f, ok := toFloat(val); ok {
-				b := math.Floor((f-offset)/interval)*interval + offset
+				b := math.Round((math.Floor((f-offset)/interval+1e-9)*interval+offset)*1e12) / 1e12
 				return strconv.FormatFloat(b, 'f', -1, 64)
 			}
 		}

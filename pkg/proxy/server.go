@@ -812,7 +812,7 @@ func (s *Server) Handler() http.Handler {
 			}
 			r.SetPathValue("id", segs[2])
 			switch segs[1] {
-			case "_doc", "_create":
+			case "_doc":
 				switch r.Method {
 				case http.MethodPut, http.MethodPost:
 					s.handlePutDoc(w, r)
@@ -822,6 +822,13 @@ func (s *Server) Handler() http.Handler {
 					s.handleHeadDoc(w, r)
 				case http.MethodDelete:
 					s.handleDeleteDoc(w, r)
+				default:
+					writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
+				}
+			case "_create":
+				switch r.Method {
+				case http.MethodPut, http.MethodPost:
+					s.handlePutDoc(w, r)
 				default:
 					writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
 				}
@@ -2598,7 +2605,7 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 
 	status := http.StatusCreated
 	result := "created"
-	reportedVer := int64(1)
+	reportedVer := nextVer
 	if assignedVer > 0 {
 		reportedVer = assignedVer
 	}
@@ -3009,6 +3016,8 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	if opResult != "noop" {
 		isDelete := opResult == "deleted"
 		if !isDelete && len(mutatedSource) > 0 {
+			origIndex := indexName
+			origDocID := docID
 			pipedDoc, nextIndex, nextDocID, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithMeta(indexName, docID, r.URL.Query().Get("pipeline"), "", mutatedSource)
 			if pipeErr != nil {
 				writeESError(w, http.StatusBadRequest, "ingest_processor_exception", pipeErr.Error())
@@ -3025,6 +3034,18 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 				}
 				indexName = resolvedIdx
 				aliasFilter = resolvedFilter
+			}
+			if docID != origDocID || indexName != origIndex {
+				destSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
+				_ = s.coalescer.FlushTable(r.Context(), destSchema.DorisTable)
+				if destHit, destFound, dErr := s.backend.GetDocByID(r.Context(), destSchema.DorisDB, destSchema.DorisTable, docID); dErr == nil && destFound && destHit != nil {
+					if destHit.Version+1 > minFloor {
+						minFloor = destHit.Version + 1
+					}
+					if assignedVer == 0 {
+						nextVersion = s.allocVersion(minFloor)
+					}
+				}
 			}
 			if dropped {
 				dropVer := nextVersion
@@ -3166,7 +3187,9 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 	totalMatched := 0
 	totalUpdated := 0
 	totalDeleted := 0
+	versionConflicts := 0
 	batches := 0
+	conflictsProceed := strings.EqualFold(r.URL.Query().Get("conflicts"), "proceed") || strings.EqualFold(body.Conflicts, "proceed")
 	updSpec := &painless.UpdateRequest{Script: body.Script}
 	if body.Query != nil && hasTermsLookupInQuery(body.Query) {
 		s.resolveTermsLookupsInQuery(r.Context(), body.Query)
@@ -3264,6 +3287,10 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 					mutated = piped
 				}
 				if !isDel && aliasFilters[indexName] != nil && !s.docMatchesAliasFilter(r.Context(), indexName, h.ID, mutated, aliasFilters[indexName]) {
+					if conflictsProceed {
+						versionConflicts++
+						continue
+					}
 					writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
 						fmt.Sprintf("updated document [%s] does not match alias filter for [%s]", h.ID, r.PathValue("index")))
 					return
@@ -3313,15 +3340,19 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 		tookMs = 1
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"took":              tookMs,
-		"timed_out":         false,
-		"total":             totalMatched,
-		"updated":           totalUpdated,
-		"deleted":           totalDeleted,
-		"batches":           batches,
-		"version_conflicts": 0,
-		"noops":             totalMatched - totalUpdated - totalDeleted,
-		"failures":          []any{},
+		"took":                   tookMs,
+		"timed_out":              false,
+		"total":                  totalMatched,
+		"updated":                totalUpdated,
+		"deleted":                totalDeleted,
+		"batches":                batches,
+		"version_conflicts":      versionConflicts,
+		"noops":                  totalMatched - totalUpdated - totalDeleted - versionConflicts,
+		"retries":                map[string]any{"bulk": 0, "search": 0},
+		"throttled_millis":       0,
+		"requests_per_second":    -1,
+		"throttled_until_millis": 0,
+		"failures":               []any{},
 	})
 }
 
@@ -3341,9 +3372,10 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		MaxDocs *int         `json:"max_docs,omitempty"`
-		Size    *int         `json:"size,omitempty"`
-		Query   *esast.Query `json:"query,omitempty"`
+		MaxDocs   *int         `json:"max_docs,omitempty"`
+		Size      *int         `json:"size,omitempty"`
+		Conflicts string       `json:"conflicts,omitempty"`
+		Query     *esast.Query `json:"query,omitempty"`
 	}
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
@@ -3467,13 +3499,18 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 		tookMs = 1
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"took":              tookMs,
-		"timed_out":         false,
-		"total":             totalDeleted,
-		"deleted":           totalDeleted,
-		"batches":           batches,
-		"version_conflicts": 0,
-		"failures":          []any{},
+		"took":                   tookMs,
+		"timed_out":              false,
+		"total":                  totalDeleted,
+		"deleted":                totalDeleted,
+		"batches":                batches,
+		"version_conflicts":      0,
+		"noops":                  0,
+		"retries":                map[string]any{"bulk": 0, "search": 0},
+		"throttled_millis":       0,
+		"requests_per_second":    -1,
+		"throttled_until_millis": 0,
+		"failures":               []any{},
 	})
 }
 
@@ -3849,6 +3886,8 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 				sourceToShred = merged
 			} else {
 				if len(merged) > 0 {
+					origTargetIndex := targetIndex
+					origOpID := op.ID
 					piped, nextIdx, nextID, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithMeta(targetIndex, op.ID, defaultPipeline, op.Pipeline, merged)
 					if pipeErr != nil {
 						hasErrors = true
@@ -3887,6 +3926,16 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 						if !okBuf {
 							buf = &bytes.Buffer{}
 							byIndex[idxSchema.DorisTable] = buf
+						}
+					}
+					if op.ID != origOpID || targetIndex != origTargetIndex {
+						if destExisting, destOK := existingByIndex[targetIndex][op.ID]; destOK && destExisting.Version+1 > minFloor {
+							minFloor = destExisting.Version + 1
+						} else if destHit, destFound, dErr := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, op.ID); dErr == nil && destFound && destHit != nil && destHit.Version+1 > minFloor {
+							minFloor = destHit.Version + 1
+						}
+						if lastVer, okLV := lastVerByIndex[targetIndex][op.ID]; okLV && lastVer+1 > minFloor {
+							minFloor = lastVer + 1
 						}
 					}
 					if dropped {
@@ -3988,15 +4037,15 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 
 		status := http.StatusCreated
 		result := "created"
-		reportedVer := int64(1)
+		reportedVer := nextVer
 		if assignedVer > 0 {
 			reportedVer = assignedVer
 		}
 		if deleted {
 			status = http.StatusOK
 			result = "deleted"
-			if wasExistingBeforeOp {
-				reportedVer = nextVer
+			if !wasExistingBeforeOp {
+				reportedVer = 1
 			}
 		} else if op.Action == "update" {
 			if updateResult == "created" {
@@ -4274,10 +4323,13 @@ func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		for esPath, fb := range idxSchema.Fields {
+			if fb.ESType == "alias" && fb.AliasTarget == "" {
+				continue
+			}
 			switch {
 			case fb.ESType != "":
-				addCap(esPath, fb.ESType, true, fb.ESType != "text")
-				if fb.KeywordCompanion != "" {
+				addCap(esPath, fb.ESType, true, fb.ESType != "text" && fb.ESType != "match_only_text")
+				if fb.KeywordCompanion != "" && fb.AliasTarget == "" {
 					addCap(esPath+".keyword", "keyword", true, true)
 				}
 			case fb.DorisType == schema.DorisBigInt:
@@ -4292,7 +4344,7 @@ func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 				addCap(esPath, "boolean", true, true)
 			case fb.DorisType == schema.DorisString:
 				addCap(esPath, "text", true, false)
-				if fb.KeywordCompanion != "" {
+				if fb.KeywordCompanion != "" && fb.AliasTarget == "" {
 					addCap(esPath+".keyword", "keyword", true, true)
 				}
 			default:
@@ -4540,6 +4592,9 @@ func (s *Server) executeSearchRequest(
 			if rescoreWin > fetchSize {
 				fetchSize = rescoreWin
 			}
+			if rescoreWin > 0 {
+				subReq.SearchAfter = nil
+			}
 			if req.Collapse != nil && req.Collapse.Field != "" {
 				if fetchSize < from+size+100 {
 					fetchSize = from + size + 100
@@ -4554,6 +4609,13 @@ func (s *Server) executeSearchRequest(
 			if rescoreWin > fetchSize {
 				fetchSize = rescoreWin
 			}
+			if req.Collapse != nil && req.Collapse.Field != "" {
+				if fetchSize < from+size+100 {
+					fetchSize = from + size + 100
+				}
+				subReq.Collapse = nil
+			}
+			subReq.SearchAfter = nil
 			subReq.From = &zero
 			subReq.Size = &fetchSize
 		}
@@ -4889,6 +4951,9 @@ func (s *Server) executeSearchRequest(
 			}
 			return allHits[i].ID < allHits[j].ID
 		})
+		if rescoreWin > 0 && len(allHits) > 0 {
+			allHits = s.applyRescoreToHits(req, allHits, schemasByIndex, primarySchema, from+size)
+		}
 		if req.Collapse != nil && req.Collapse.Field != "" && len(allHits) > 0 {
 			seenCollapse := make(map[string]struct{}, len(allHits))
 			deduped := make([]HitRow, 0, len(allHits))
@@ -4912,7 +4977,7 @@ func (s *Server) executeSearchRequest(
 				deduped = append(deduped, h)
 			}
 			allHits = deduped
-		} else if len(req.SearchAfter) > 0 && needsRuntimeScriptEval && len(allHits) > 0 {
+		} else if len(req.SearchAfter) > 0 && (needsRuntimeScriptEval || rescoreWin > 0) && len(allHits) > 0 {
 			afterFiltered := make([]HitRow, 0, len(allHits))
 			for _, h := range allHits {
 				hSchema := schemasByIndex[h.Index]
@@ -4924,9 +4989,6 @@ func (s *Server) executeSearchRequest(
 				}
 			}
 			allHits = afterFiltered
-		}
-		if rescoreWin > 0 && len(allHits) > 0 {
-			allHits = s.applyRescoreToHits(req, allHits, schemasByIndex, primarySchema, from+size)
 		}
 		if from >= len(allHits) {
 			allHits = nil
@@ -4943,6 +5005,34 @@ func (s *Server) executeSearchRequest(
 		allAggRows = mergeMultiIndexAggRows(allAggRows, totalHitsSum, totalQueryHitsSum, req.EffectiveAggs())
 	} else if rescoreWin > 0 && len(allHits) > 0 {
 		allHits = s.applyRescoreToHits(req, allHits, schemasByIndex, primarySchema, from+size)
+		if req.Collapse != nil && req.Collapse.Field != "" && len(allHits) > 0 {
+			seenCollapse := make(map[string]struct{}, len(allHits))
+			deduped := make([]HitRow, 0, len(allHits))
+			collapseSort := []esast.SortSpec{{Entry: esast.SortEntry{Field: req.Collapse.Field}}}
+			for _, h := range allHits {
+				vals := extractHitSortValues(h, collapseSort, primarySchema)
+				if len(vals) > 0 && vals[0] != nil {
+					ck := normalizeCollapseGroupKey(vals[0], req.Collapse.Field, primarySchema, primarySchema)
+					if _, exists := seenCollapse[ck]; exists {
+						continue
+					}
+					seenCollapse[ck] = struct{}{}
+				}
+				if len(req.SearchAfter) > 0 && !hitIsAfterSearchAfter(h, effSorts, req.SearchAfter, primarySchema) {
+					continue
+				}
+				deduped = append(deduped, h)
+			}
+			allHits = deduped
+		} else if len(req.SearchAfter) > 0 && len(allHits) > 0 {
+			afterFiltered := make([]HitRow, 0, len(allHits))
+			for _, h := range allHits {
+				if hitIsAfterSearchAfter(h, effSorts, req.SearchAfter, primarySchema) {
+					afterFiltered = append(afterFiltered, h)
+				}
+			}
+			allHits = afterFiltered
+		}
 		if from >= len(allHits) {
 			allHits = nil
 		} else {
@@ -5537,14 +5627,36 @@ func hitIsAfterSearchAfter(h HitRow, sorts []esast.SortSpec, searchAfter []any, 
 				vb = fv
 			}
 		}
-		if strVal, ok := vb.(string); ok && idxSchema != nil {
-			b := idxSchema.ResolveField(s.Entry.Field)
-			if b.EffectiveLowercase(true) {
-				vb = strings.ToLower(strVal)
-			} else if b.ESType == "date" || b.ESType == "date_nanos" || b.DorisType == schema.DorisBigInt {
-				if ms, ok := schema.ParseESDateToEpochMillis(strVal, time.Now().UTC()); ok {
-					vb = ms
+		if strVal, ok := vb.(string); ok {
+			if strings.EqualFold(s.Entry.Type, "boolean") {
+				switch strings.ToLower(strings.TrimSpace(strVal)) {
+				case "true", "1":
+					vb = true
+				case "false", "0":
+					vb = false
 				}
+			}
+			if idxSchema != nil {
+				b := idxSchema.ResolveField(s.Entry.Field)
+				if b.ESType == "boolean" || b.DorisType == schema.DorisBoolean {
+					switch strings.ToLower(strings.TrimSpace(strVal)) {
+					case "true", "1":
+						vb = true
+					case "false", "0":
+						vb = false
+					}
+				} else if b.EffectiveLowercase(true) {
+					vb = strings.ToLower(strVal)
+				} else if b.ESType == "date" || b.ESType == "date_nanos" || b.DorisType == schema.DorisBigInt {
+					if ms, ok := schema.ParseESDateToEpochMillis(strVal, time.Now().UTC()); ok {
+						vb = ms
+					}
+				}
+			}
+		} else if iv, ok := vb.(int64); ok && idxSchema != nil {
+			b := idxSchema.ResolveField(s.Entry.Field)
+			if b.ESType == "boolean" || b.DorisType == schema.DorisBoolean || strings.EqualFold(s.Entry.Type, "boolean") {
+				vb = iv != 0
 			}
 		}
 		if idxSchema != nil {
@@ -6690,7 +6802,7 @@ func buildNestedInnerHitsForHit(h HitRow, hitIdx string, hitSchema *schema.Index
 					break
 				}
 			}
-			if hl := buildHighlightMap(hlSrc, &esast.SearchRequest{Query: &nq.Query, Highlight: ih.Highlight}); len(hl) > 0 {
+			if hl := buildHighlightMapWithSchema(hlSrc, &esast.SearchRequest{Query: &nq.Query, Highlight: ih.Highlight}, nestedEvalSchema); len(hl) > 0 {
 				ihHitMap["highlight"] = hl
 			}
 		}
@@ -6903,7 +7015,7 @@ func (s *Server) populateCollapseInnerHits(
 					}
 				}
 				if ihSpec.Highlight != nil && len(ihSpec.Highlight.Fields) > 0 {
-					if hl := buildHighlightMap(gh.EffectiveSource(), &esast.SearchRequest{Query: req.Query, Highlight: ihSpec.Highlight}); len(hl) > 0 {
+					if hl := buildHighlightMapWithSchema(gh.EffectiveSource(), &esast.SearchRequest{Query: req.Query, Highlight: ihSpec.Highlight}, gSchema); len(hl) > 0 {
 						ghMap["highlight"] = hl
 					}
 				}
@@ -8078,11 +8190,11 @@ func filterAndSortTermsRows(
 					k = trimmed
 				}
 				if keyedBucketKey != "" {
-					suffix := "\x1f" + keyedBucketKey
-					if !strings.HasSuffix(k, suffix) {
+					sepIdx := strings.LastIndex(k, "\x1f")
+					if sepIdx < 0 || !bucketKeysEquivalent(k[sepIdx+1:], keyedBucketKey) {
 						return "", false
 					}
-					k = strings.TrimSuffix(k, suffix)
+					k = k[:sepIdx]
 				}
 				return k, true
 			}
@@ -8279,7 +8391,7 @@ func isMultiBucketAggSpec(spec esast.AggSpec) bool {
 
 func isKeyedBucketAggSpec(spec esast.AggSpec) bool {
 	if spec.Filters != nil {
-		return spec.Filters.Keyed == nil || *spec.Filters.Keyed
+		return spec.Filters.EffectiveKeyed()
 	}
 	if spec.Range != nil {
 		return spec.Range.Keyed
@@ -8510,7 +8622,14 @@ func validatePipelineAggs(aggs map[string]esast.AggSpec) string {
 				if isMultiBucketAggSpec(targetSpec) && isKeyedBucketAggSpec(targetSpec) {
 					if i+1 < len(segs) {
 						nextSeg := segs[i+1]
-						if _, nextIsSubAgg := targetSpec.SubAggs()[nextSeg]; !nextIsSubAgg || i+2 < len(segs) {
+						_, nextIsSubAgg := targetSpec.SubAggs()[nextSeg]
+						nextIsKeyCollision := false
+						if nextIsSubAgg && i+2 < len(segs) {
+							if _, afterIsSub := targetSpec.SubAggs()[segs[i+2]]; afterIsSub || segs[i+2] == "_count" || segs[i+2] == "doc_count" {
+								nextIsKeyCollision = true
+							}
+						}
+						if (!nextIsSubAgg && nextSeg != "_count" && nextSeg != "doc_count") || nextIsKeyCollision {
 							i++ // consume keyed bucket key segment
 							for i+1 < len(segs) {
 								candNext := segs[i+1]
@@ -9350,6 +9469,24 @@ func isChildPipelineTargetInAggs(aggs map[string]esast.AggSpec, bucketsPath stri
 	return false
 }
 
+func bucketKeysEquivalent(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if fa, okA := parseFiniteFloat(a); okA {
+		if fb, okB := parseFiniteFloat(b); okB && math.Abs(fa-fb) < 1e-9 {
+			return true
+		}
+	}
+	nowUTC := time.Now().UTC()
+	if msA, okA := schema.ParseESDateToEpochMillis(a, nowUTC); okA {
+		if msB, okB := schema.ParseESDateToEpochMillis(b, nowUTC); okB && msA == msB {
+			return true
+		}
+	}
+	return false
+}
+
 func lookupKeyedBucketMap(rawBuckets map[string]any, candKey string) (map[string]any, bool) {
 	if rawBuckets == nil {
 		return nil, false
@@ -9363,6 +9500,21 @@ func lookupKeyedBucketMap(rawBuckets map[string]any, candKey string) (map[string
 		}
 	} else if !strings.Contains(candKey, ".") {
 		if b, ok := rawBuckets[candKey+".0"].(map[string]any); ok {
+			return b, true
+		}
+	}
+	for k, v := range rawBuckets {
+		b, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		if bucketKeysEquivalent(k, candKey) {
+			return b, true
+		}
+		if keyVal, hasK := b["key"]; hasK && keyVal != nil && bucketKeysEquivalent(fmt.Sprintf("%v", keyVal), candKey) {
+			return b, true
+		}
+		if kas, okS := b["key_as_string"].(string); okS && kas != "" && bucketKeysEquivalent(kas, candKey) {
 			return b, true
 		}
 	}
@@ -10161,56 +10313,60 @@ func synthesizeHistogramBuckets(rows []AggRow, spec *esast.HistogramAggSpec) []A
 
 	byKey := make(map[string]AggRow, len(rows))
 	var minKey, maxKey float64
-	hasObserved := false
+	hasMin, hasMax := false, false
 	for _, r := range rows {
 		if k, ok := parseFiniteFloat(r.BucketKey); ok {
+			k = math.Round(k*1e12) / 1e12
 			normKey := strconv.FormatFloat(k, 'f', -1, 64)
+			r.BucketKey = normKey
 			byKey[normKey] = r
-			if !hasObserved || k < minKey {
+			if !hasMin || k < minKey {
 				minKey = k
+				hasMin = true
 			}
-			if !hasObserved || k > maxKey {
+			if !hasMax || k > maxKey {
 				maxKey = k
+				hasMax = true
 			}
-			hasObserved = true
 		}
 	}
 	if spec.ExtendedBounds != nil {
 		if spec.ExtendedBounds.Min != nil {
 			if f, ok := parseFiniteFloat(fmt.Sprintf("%v", spec.ExtendedBounds.Min)); ok {
-				extMin := math.Floor((f-offset)/interval)*interval + offset
-				if !hasObserved || extMin < minKey {
+				extMin := math.Round((math.Floor((f-offset)/interval+1e-9)*interval+offset)*1e12) / 1e12
+				if !hasMin || extMin < minKey {
 					minKey = extMin
+					hasMin = true
 				}
 			}
 		}
 		if spec.ExtendedBounds.Max != nil {
 			if f, ok := parseFiniteFloat(fmt.Sprintf("%v", spec.ExtendedBounds.Max)); ok {
-				extMax := math.Floor((f-offset)/interval)*interval + offset
-				if !hasObserved || extMax > maxKey {
+				extMax := math.Round((math.Floor((f-offset)/interval+1e-9)*interval+offset)*1e12) / 1e12
+				if !hasMax || extMax > maxKey {
 					maxKey = extMax
-					hasObserved = true
+					hasMax = true
 				}
 			}
 		}
 	}
-	if !hasObserved && hasHardMin && hasHardMax {
+	if hasHardMin && (!hasMin || minKey < hardMin) {
 		minKey = hardMin
+		hasMin = true
+	}
+	if hasHardMax && (!hasMax || maxKey > hardMax) {
 		maxKey = hardMax
-		hasObserved = true
+		hasMax = true
 	}
-	if hasHardMin && (!hasObserved || minKey < hardMin) {
-		minKey = hardMin
-	}
-	if hasHardMax && (!hasObserved || maxKey > hardMax) {
-		maxKey = hardMax
-	}
-	if !hasObserved || maxKey < minKey {
+	if !hasMin || !hasMax || maxKey < minKey {
 		return rows
 	}
 
+	startStep := int64(math.Round((minKey - offset) / interval))
+	endStep := int64(math.Round((maxKey - offset) / interval))
 	var out []AggRow
-	for k := minKey; k <= maxKey+interval*1e-9 && len(out) < transpiler.DefaultMaxAggBuckets; k += interval {
+	for step := startStep; step <= endStep && len(out) < transpiler.DefaultMaxAggBuckets; step++ {
+		k := math.Round((float64(step)*interval+offset)*1e12) / 1e12
 		normKey := strconv.FormatFloat(k, 'f', -1, 64)
 		if existing, ok := byKey[normKey]; ok {
 			out = append(out, existing)
@@ -11064,7 +11220,7 @@ func extractHitFieldsMap(h HitRow, hitIdx string, req *esast.SearchRequest, idxS
 				pathSegs = b.SourceJSONPath
 			}
 		}
-		vals := collectScalarValuesAtPath(doc, pathSegs)
+		vals := collectSchemaAwareScalarValues(doc, spec.Field, pathSegs, idxSchema)
 		if len(vals) > 0 {
 			out[spec.Field] = formatFieldValues(spec.Field, vals, spec.Format, idxSchema)
 		}
@@ -11156,7 +11312,14 @@ func collectAllLeafScalarPaths(node any, prefix string, out map[string][]any) {
 }
 
 func collectScalarValuesAtPath(node any, path []string) []any {
+	return collectScalarValuesAtPathWithNull(node, path, nil)
+}
+
+func collectScalarValuesAtPathWithNull(node any, path []string, nullValue any) []any {
 	if node == nil {
+		if len(path) == 0 && nullValue != nil {
+			return []any{nullValue}
+		}
 		return nil
 	}
 	if len(path) == 0 {
@@ -11166,7 +11329,7 @@ func collectScalarValuesAtPath(node any, path []string) []any {
 		case []any:
 			var res []any
 			for _, item := range v {
-				res = append(res, collectScalarValuesAtPath(item, nil)...)
+				res = append(res, collectScalarValuesAtPathWithNull(item, nil, nullValue)...)
 			}
 			return res
 		default:
@@ -11176,22 +11339,62 @@ func collectScalarValuesAtPath(node any, path []string) []any {
 	switch curr := node.(type) {
 	case map[string]any:
 		if next, exists := curr[path[0]]; exists {
-			return collectScalarValuesAtPath(next, path[1:])
+			return collectScalarValuesAtPathWithNull(next, path[1:], nullValue)
 		}
 		if len(path) > 1 {
 			if flat, exists := curr[strings.Join(path, ".")]; exists {
-				return collectScalarValuesAtPath(flat, nil)
+				return collectScalarValuesAtPathWithNull(flat, nil, nullValue)
 			}
 		}
 		return nil
 	case []any:
 		var res []any
 		for _, item := range curr {
-			res = append(res, collectScalarValuesAtPath(item, path)...)
+			res = append(res, collectScalarValuesAtPathWithNull(item, path, nullValue)...)
 		}
 		return res
 	}
 	return nil
+}
+
+func collectSchemaAwareScalarValues(doc map[string]any, field string, pathSegs []string, idxSchema *schema.IndexSchema) []any {
+	var nullVal any
+	cleanTarget := strings.TrimSuffix(strings.TrimSuffix(field, ".keyword"), ".ngram")
+	if idxSchema != nil {
+		b := idxSchema.ResolveField(field)
+		nullVal = b.NullValue
+		if b.AliasTarget != "" {
+			cleanTarget = strings.TrimSuffix(strings.TrimSuffix(b.AliasTarget, ".keyword"), ".ngram")
+		} else if len(b.SourceJSONPath) > 0 {
+			cleanTarget = strings.Join(b.SourceJSONPath, ".")
+		}
+	}
+	vals := collectScalarValuesAtPathWithNull(doc, pathSegs, nullVal)
+	if len(vals) == 0 && idxSchema != nil && idxSchema.RawMapping != nil {
+		visited := map[string]bool{cleanTarget: true}
+		frontier := []string{cleanTarget}
+		for hop := 0; hop < 4 && len(frontier) > 0; hop++ {
+			var nextFrontier []string
+			for _, target := range frontier {
+				for _, srcPath := range collectCopyToSourcePaths(idxSchema.RawMapping.Properties, "", target) {
+					var srcNull any
+					if sb, ok := idxSchema.Fields[srcPath]; ok {
+						srcNull = sb.NullValue
+					}
+					srcVals := collectScalarValuesAtPathWithNull(doc, strings.Split(srcPath, "."), srcNull)
+					if len(srcVals) > 0 {
+						vals = append(vals, srcVals...)
+					}
+					if !visited[srcPath] {
+						visited[srcPath] = true
+						nextFrontier = append(nextFrontier, srcPath)
+					}
+				}
+			}
+			frontier = nextFrontier
+		}
+	}
+	return vals
 }
 
 func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.IndexSchema) []any {
@@ -11267,10 +11470,10 @@ func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.In
 						}
 					}
 				} else {
-					rawVals = collectScalarValuesAtPath(doc, pathSegs)
+					rawVals = collectSchemaAwareScalarValues(doc, s.Entry.Field, pathSegs, idxSchema)
 				}
 			} else {
-				rawVals = collectScalarValuesAtPath(doc, pathSegs)
+				rawVals = collectSchemaAwareScalarValues(doc, s.Entry.Field, pathSegs, idxSchema)
 			}
 			normVals := make([]any, 0, len(rawVals))
 			for _, v := range rawVals {
@@ -11284,7 +11487,14 @@ func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.In
 				if idxSchema != nil {
 					b := idxSchema.ResolveField(s.Entry.Field)
 					if strVal, ok := v.(string); ok {
-						if b.EffectiveLowercase(true) {
+						if b.ESType == "boolean" || b.DorisType == schema.DorisBoolean {
+							switch strings.ToLower(strings.TrimSpace(strVal)) {
+							case "true", "1":
+								v = true
+							case "false", "0":
+								v = false
+							}
+						} else if b.EffectiveLowercase(true) {
 							v = strings.ToLower(strVal)
 						} else if b.ESType == "date" || b.ESType == "date_nanos" || b.DorisType == schema.DorisBigInt {
 							if ms, ok := schema.ParseESDateToEpochMillis(strVal, time.Now().UTC()); ok {
@@ -11307,9 +11517,24 @@ func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.In
 			} else if s.Entry.Missing != "" {
 				mStr := s.Entry.Missing
 				if !strings.EqualFold(mStr, "_last") && !strings.EqualFold(mStr, "_first") {
-					if idxSchema != nil {
+					if strings.EqualFold(s.Entry.Type, "boolean") {
+						switch strings.ToLower(strings.TrimSpace(mStr)) {
+						case "true", "1":
+							val = true
+						case "false", "0":
+							val = false
+						}
+					}
+					if idxSchema != nil && val == nil {
 						b := idxSchema.ResolveField(s.Entry.Field)
-						if b.ESType == "date" || b.ESType == "date_nanos" || b.DorisType == schema.DorisBigInt {
+						if b.ESType == "boolean" || b.DorisType == schema.DorisBoolean {
+							switch strings.ToLower(strings.TrimSpace(mStr)) {
+							case "true", "1":
+								val = true
+							case "false", "0":
+								val = false
+							}
+						} else if b.ESType == "date" || b.ESType == "date_nanos" || b.DorisType == schema.DorisBigInt {
 							if ms, ok := schema.ParseESDateToEpochMillis(mStr, time.Now().UTC()); ok {
 								val = ms
 							}
@@ -11719,10 +11944,6 @@ func sortHistogramBuckets(buckets []map[string]any, order any) []map[string]any 
 	return buckets
 }
 
-func buildHighlightMap(raw json.RawMessage, req *esast.SearchRequest) map[string][]string {
-	return buildHighlightMapWithSchema(raw, req, nil)
-}
-
 func buildHighlightMapWithSchema(raw json.RawMessage, req *esast.SearchRequest, hitSchema *schema.IndexSchema) map[string][]string {
 	if req == nil || req.Highlight == nil || len(req.Highlight.Fields) == 0 {
 		return nil
@@ -11934,8 +12155,18 @@ func buildAllowedHighlightQueryFields(targetFields []string, hitSchema *schema.I
 			if len(b.SourceJSONPath) > 0 {
 				addField(strings.Join(b.SourceJSONPath, "."))
 			}
+			if b.AliasTarget != "" {
+				addField(b.AliasTarget)
+			}
+			clean := strings.TrimSuffix(strings.TrimSuffix(tf, ".keyword"), ".ngram")
+			for nestedRoot := range hitSchema.NestedRoots {
+				if strings.HasPrefix(clean, nestedRoot+".") {
+					addField(strings.TrimPrefix(clean, nestedRoot+"."))
+				} else {
+					addField(nestedRoot + "." + clean)
+				}
+			}
 			if hitSchema.RawMapping != nil {
-				clean := strings.TrimSuffix(strings.TrimSuffix(tf, ".keyword"), ".ngram")
 				for _, src := range collectCopyToSourcePaths(hitSchema.RawMapping.Properties, "", clean) {
 					addField(src)
 				}
@@ -16076,7 +16307,7 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 			return outHits[i].ID < outHits[j].ID
 		})
 	}
-	if !isMultiIndex && req.Collapse != nil && req.Collapse.Field != "" && len(outHits) > 0 {
+	if !isMultiIndex && len(req.Rescore) == 0 && req.Collapse != nil && req.Collapse.Field != "" && len(outHits) > 0 {
 		seenCollapse := make(map[string]struct{}, len(outHits))
 		deduped := make([]HitRow, 0, len(outHits))
 		collapseSort := []esast.SortSpec{{Entry: esast.SortEntry{Field: req.Collapse.Field}}}
@@ -16095,7 +16326,7 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 			deduped = append(deduped, h)
 		}
 		outHits = deduped
-	} else if !isMultiIndex && len(req.SearchAfter) > 0 {
+	} else if !isMultiIndex && len(req.Rescore) == 0 && len(req.SearchAfter) > 0 {
 		afterFiltered := make([]HitRow, 0, len(outHits))
 		for _, h := range outHits {
 			if hitIsAfterSearchAfter(h, effSorts, req.SearchAfter, idxSchema) {
@@ -16279,12 +16510,29 @@ func (s *Server) evalHitRescoreQuery(h HitRow, rq *esast.Query, hSchema *schema.
 			rScore = 1.0
 		}
 	}
-	if queryHasRuntimeScript(rq) || rq.FunctionScore != nil || rq.ScriptScore != nil || rq.Boosting != nil || rq.DisMax != nil {
+	if queryHasRuntimeScript(rq) {
 		baseScore := rScore
-		if (rq.ScriptScore != nil && rq.ScriptScore.Query == nil) || (rq.FunctionScore != nil && rq.FunctionScore.Query == nil) {
+		if rq.ScriptScore != nil && rq.ScriptScore.Query == nil {
 			baseScore = h.Score
+		} else if rq.FunctionScore != nil {
+			if rq.FunctionScore.Query == nil {
+				baseScore = h.Score
+			} else {
+				subCQ := tr.CompileQuery(rq.FunctionScore.Query, true, nil)
+				if subCQ.ScoreSQL != "" {
+					baseScore = evalNumericExpr(row, subCQ.ScoreSQL)
+				} else {
+					baseScore = 1.0
+				}
+			}
 		}
 		rScore = evalQueryScriptScoreOnDocWithSchema(hSchema, doc, rq, baseScore)
+	}
+	if rq.FunctionScore != nil && rq.FunctionScore.MinScore != nil && rScore < *rq.FunctionScore.MinScore {
+		return 0, false
+	}
+	if rq.ScriptScore != nil && rq.ScriptScore.MinScore != nil && rScore < *rq.ScriptScore.MinScore {
+		return 0, false
 	}
 	return rScore, true
 }

@@ -32,6 +32,10 @@ import (
 // function; otherwise, it parses Lucene `field:value`, `AND`/`OR`/`NOT`, `+`/`-`, parenthesized
 // groups, and wildcard clauses into standard Doris `MATCH_ANY` / `LIKE` / `=` predicates.
 func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring bool, nctx *nestedCtx) CompiledQuery {
+	return t.compileQueryStringWithMode(qsq, scoring, nctx, false)
+}
+
+func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, scoring bool, nctx *nestedCtx, isSimple bool) CompiledQuery {
 	raw := strings.TrimSpace(qsq.Query)
 	if raw == "" || raw == "*" || raw == "*:*" {
 		return CompiledQuery{WhereSQL: "TRUE", ScoreSQL: "1.0"}
@@ -93,7 +97,7 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 		defaultOp = "OR"
 	}
 
-	parsedAST := parseSimpleLuceneToAST(raw, defaultField, expandedFields, defaultOp)
+	parsedAST := parseSimpleLuceneToASTWithMode(raw, defaultField, expandedFields, defaultOp, 0, isSimple)
 	if qsq.MinimumShouldMatch != nil && parsedAST.Bool != nil && len(parsedAST.Bool.Should) > 0 {
 		parsedAST.Bool.MinimumShouldMatch = qsq.MinimumShouldMatch
 	}
@@ -101,42 +105,44 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 	if scoring && qsq.Boost != nil && *qsq.Boost != 1.0 && compiled.ScoreSQL != "" && compiled.ScoreSQL != "0.0" {
 		compiled.ScoreSQL = fmt.Sprintf("((%s) * %.4f)", compiled.ScoreSQL, *qsq.Boost)
 	}
-	if rewrittenRaw, ok := t.rewriteDoris4SearchQuery(raw); ok && t.Opts.UseDoris4SearchFunc && nctx == nil && qsq.MinimumShouldMatch == nil && defaultField != "__unmatched_wildcard__" && !strings.ContainsAny(raw, "[{><~/^") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, "`n__") {
-		if len(expandedFields) > 1 {
-			if canEmitMultiFieldDoris4SearchDisjunction(rewrittenRaw, defaultOp) {
-				var searchPreds []string
-				allSupported := true
-				for _, ef := range expandedFields {
-					fname := strings.Split(ef, "^")[0]
-					if t.isDoris4SearchableField(fname) {
-						col := strings.Trim(t.sqlColumnRef(fname, false, nctx), "`")
-						searchPreds = append(searchPreds, fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(rewrittenRaw), quoteStr(col), quoteStr(defaultOp)))
-					} else {
-						allSupported = false
-						break
+	if !isSimple {
+		if rewrittenRaw, ok := t.rewriteDoris4SearchQuery(raw); ok && t.Opts.UseDoris4SearchFunc && nctx == nil && qsq.MinimumShouldMatch == nil && defaultField != "__unmatched_wildcard__" && !strings.ContainsAny(raw, "[{><~/^") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, "`n__") {
+			if len(expandedFields) > 1 {
+				if canEmitMultiFieldDoris4SearchDisjunction(rewrittenRaw, defaultOp) {
+					var searchPreds []string
+					allSupported := true
+					for _, ef := range expandedFields {
+						fname := strings.Split(ef, "^")[0]
+						if t.isDoris4SearchableField(fname) {
+							col := strings.Trim(t.sqlColumnRef(fname, false, nctx), "`")
+							searchPreds = append(searchPreds, fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(rewrittenRaw), quoteStr(col), quoteStr(defaultOp)))
+						} else {
+							allSupported = false
+							break
+						}
+					}
+					if allSupported && len(searchPreds) > 0 {
+						pred := strings.Join(searchPreds, " OR ")
+						if len(searchPreds) > 1 {
+							pred = "(" + pred + ")"
+						}
+						return CompiledQuery{
+							WhereSQL:          pred,
+							SafeWhereSQL:      compiled.EffectiveSafeWhere(),
+							ScoreSQL:          compiled.ScoreSQL,
+							UsesFulltextMatch: true,
+						}
 					}
 				}
-				if allSupported && len(searchPreds) > 0 {
-					pred := strings.Join(searchPreds, " OR ")
-					if len(searchPreds) > 1 {
-						pred = "(" + pred + ")"
-					}
-					return CompiledQuery{
-						WhereSQL:          pred,
-						SafeWhereSQL:      compiled.EffectiveSafeWhere(),
-						ScoreSQL:          compiled.ScoreSQL,
-						UsesFulltextMatch: true,
-					}
+			} else if t.isDoris4SearchableField(defaultField) {
+				col := strings.Trim(t.sqlColumnRef(defaultField, false, nctx), "`")
+				pred := fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(rewrittenRaw), quoteStr(col), quoteStr(defaultOp))
+				return CompiledQuery{
+					WhereSQL:          pred,
+					SafeWhereSQL:      compiled.EffectiveSafeWhere(),
+					ScoreSQL:          compiled.ScoreSQL,
+					UsesFulltextMatch: true,
 				}
-			}
-		} else if t.isDoris4SearchableField(defaultField) {
-			col := strings.Trim(t.sqlColumnRef(defaultField, false, nctx), "`")
-			pred := fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(rewrittenRaw), quoteStr(col), quoteStr(defaultOp))
-			return CompiledQuery{
-				WhereSQL:          pred,
-				SafeWhereSQL:      compiled.EffectiveSafeWhere(),
-				ScoreSQL:          compiled.ScoreSQL,
-				UsesFulltextMatch: true,
 			}
 		}
 	}
@@ -229,11 +235,11 @@ func (t *Transpiler) isDoris4SearchableField(fname string) bool {
 
 const maxLuceneDepth = 32
 
-func parseSimpleLuceneToAST(expr, defaultField string, fields []string, defaultOp string) esast.Query {
-	return parseSimpleLuceneToASTWithDepth(expr, defaultField, fields, defaultOp, 0)
+func parseSimpleLuceneToASTWithDepth(expr, defaultField string, fields []string, defaultOp string, depth int) esast.Query {
+	return parseSimpleLuceneToASTWithMode(expr, defaultField, fields, defaultOp, depth, false)
 }
 
-func parseSimpleLuceneToASTWithDepth(expr, defaultField string, fields []string, defaultOp string, depth int) esast.Query {
+func parseSimpleLuceneToASTWithMode(expr, defaultField string, fields []string, defaultOp string, depth int, isSimple bool) esast.Query {
 	if depth > maxLuceneDepth {
 		return esast.Query{MatchAll: map[string]any{}}
 	}
@@ -266,19 +272,31 @@ func parseSimpleLuceneToASTWithDepth(expr, defaultField string, fields []string,
 			prevWasClause = false
 			tok = "NOT"
 		default:
-			isUnaryPrefix := strings.HasPrefix(tok, "+") || strings.HasPrefix(tok, "-") || strings.HasPrefix(tok, "!")
+			isUnaryPrefix := (strings.HasPrefix(tok, "+") || strings.HasPrefix(tok, "-") || strings.HasPrefix(tok, "!")) && len(tok) > 1
 			if prevWasClause && defaultOp == "OR" && !isUnaryPrefix {
 				normalizedTokens = append(normalizedTokens, "OR")
 				hasOR = true
 			}
-			prevWasClause = !isUnaryPrefix
+			prevWasClause = true
 		}
 		normalizedTokens = append(normalizedTokens, tok)
 	}
 	tokens = normalizedTokens
 
+	hasExplicitORWithUnary := false
+	for i, tok := range tokens {
+		if strings.HasPrefix(tok, "+") && len(tok) > 1 {
+			prevOR := i > 0 && strings.EqualFold(tokens[i-1], "OR")
+			nextOR := i+1 < len(tokens) && strings.EqualFold(tokens[i+1], "OR")
+			if prevOR || nextOR {
+				hasExplicitORWithUnary = true
+				break
+			}
+		}
+	}
+
 	// In Lucene grammar, `AND` binds tighter than `OR` (e.g., `a:1 AND b:2 OR c:3` -> `(a:1 AND b:2) OR c:3`).
-	if (hasAND || defaultOp == "AND") && hasOR {
+	if (hasAND || hasExplicitORWithUnary || defaultOp == "AND") && hasOR {
 		var unaryTokens []string
 		var binaryTokens []string
 		for i, tok := range tokens {
@@ -309,11 +327,11 @@ func parseSimpleLuceneToASTWithDepth(expr, defaultField string, fields []string,
 		if len(orGroups) > 1 {
 			var shoulds []esast.Query
 			for _, grp := range orGroups {
-				shoulds = append(shoulds, parseLuceneTokenSlice(grp, defaultField, fields, "AND", defaultOp, depth+1))
+				shoulds = append(shoulds, parseLuceneTokenSliceWithMode(grp, defaultField, fields, "AND", defaultOp, depth+1, isSimple))
 			}
 			outBool := &esast.BoolQuery{Should: shoulds}
 			if len(unaryTokens) > 0 {
-				uQ := parseLuceneTokenSlice(unaryTokens, defaultField, fields, defaultOp, defaultOp, depth+1)
+				uQ := parseLuceneTokenSliceWithMode(unaryTokens, defaultField, fields, defaultOp, defaultOp, depth+1, isSimple)
 				if uQ.Bool != nil {
 					outBool.Must = append(outBool.Must, uQ.Bool.Must...)
 					outBool.MustNot = append(outBool.MustNot, uQ.Bool.MustNot...)
@@ -331,10 +349,10 @@ func parseSimpleLuceneToASTWithDepth(expr, defaultField string, fields []string,
 	} else if hasOR {
 		groupOp = "OR"
 	}
-	return parseLuceneTokenSlice(tokens, defaultField, fields, groupOp, defaultOp, depth)
+	return parseLuceneTokenSliceWithMode(tokens, defaultField, fields, groupOp, defaultOp, depth, isSimple)
 }
 
-func parseLuceneTokenSlice(tokens []string, defaultField string, fields []string, groupOp string, defaultOp string, depth int) esast.Query {
+func parseLuceneTokenSliceWithMode(tokens []string, defaultField string, fields []string, groupOp string, defaultOp string, depth int, isSimple bool) esast.Query {
 	boolQ := &esast.BoolQuery{}
 	negateNext := false
 	forceMustNext := false
@@ -370,9 +388,9 @@ func parseLuceneTokenSlice(tokens []string, defaultField string, fields []string
 		var clause esast.Query
 		if hasMatchingOuterParens(tok) {
 			inner := tok[1 : len(tok)-1]
-			clause = parseSimpleLuceneToASTWithDepth(inner, defaultField, fields, defaultOp, depth+1)
+			clause = parseSimpleLuceneToASTWithMode(inner, defaultField, fields, defaultOp, depth+1, isSimple)
 		} else {
-			clause = buildLuceneAtomQueryWithDepth(tok, defaultField, fields, defaultOp, depth+1)
+			clause = buildLuceneAtomQueryWithDepthAndMode(tok, defaultField, fields, defaultOp, depth+1, isSimple)
 		}
 
 		if negateNext {
@@ -575,17 +593,21 @@ func parseLuceneRangeToken(val string, boost float64) *esast.RangeCond {
 	return nil
 }
 
-func buildLuceneAtomQueryWithDepth(token, defaultField string, fields []string, defaultOp string, depth int) esast.Query {
+func buildLuceneAtomQueryWithDepthAndMode(token, defaultField string, fields []string, defaultOp string, depth int, isSimple bool) esast.Query {
 	token = strings.TrimSpace(token)
 	token, boost := splitLuceneBoost(token)
 	if hasMatchingOuterParens(token) {
-		inner := parseSimpleLuceneToASTWithDepth(token[1:len(token)-1], defaultField, fields, defaultOp, depth+1)
+		inner := parseSimpleLuceneToASTWithMode(token[1:len(token)-1], defaultField, fields, defaultOp, depth+1, isSimple)
 		if boost != 1.0 && inner.Bool != nil {
 			inner.Bool.Boost = &boost
 		}
 		return inner
 	}
-	if idx := findLuceneFieldColon(token); idx > 0 {
+	idx := -1
+	if !isSimple {
+		idx = findLuceneFieldColon(token)
+	}
+	if idx > 0 {
 		field := unescapeLuceneToken(token[:idx])
 		val := strings.TrimSpace(token[idx+1:])
 		if field == "_exists_" && val != "" {
@@ -868,6 +890,40 @@ func tokenizeLucene(s string) []string {
 			} else if curr.Len() > 0 {
 				out = append(out, curr.String())
 				curr.Reset()
+			}
+		case '|':
+			if inQuotes || inRegex || parenDepth > 0 || bracketDepth > 0 {
+				curr.WriteRune(r)
+			} else {
+				if curr.String() == "|" {
+					out = append(out, "||")
+					curr.Reset()
+				} else {
+					if curr.Len() > 0 {
+						out = append(out, curr.String())
+						curr.Reset()
+					}
+					if i+1 < len(s) && s[i+1] == '|' {
+						curr.WriteRune('|')
+					} else {
+						out = append(out, "|")
+					}
+				}
+			}
+		case '&':
+			if inQuotes || inRegex || parenDepth > 0 || bracketDepth > 0 {
+				curr.WriteRune(r)
+			} else if curr.String() == "&" {
+				out = append(out, "&&")
+				curr.Reset()
+			} else if i+1 < len(s) && s[i+1] == '&' {
+				if curr.Len() > 0 {
+					out = append(out, curr.String())
+					curr.Reset()
+				}
+				curr.WriteRune('&')
+			} else {
+				curr.WriteRune(r)
 			}
 		default:
 			curr.WriteRune(r)

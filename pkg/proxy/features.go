@@ -4009,6 +4009,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				destIndex string
 				source    json.RawMessage
 				srcVer    int64
+				isDelete  bool
 			}
 			var prepared []preparedDoc
 			sampleDocsByIdx := make(map[string][]json.RawMessage)
@@ -4065,10 +4066,6 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					if opRes == "noop" {
 						continue
 					}
-					if opRes == "deleted" {
-						totalDeleted++
-						continue
-					}
 					if hasReindexMetaScript {
 						var tmpMap map[string]any
 						dec := json.NewDecoder(bytes.NewReader(mutated))
@@ -4093,6 +4090,14 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 								mutated = b
 							}
 						}
+					}
+					if opRes == "deleted" {
+						prepared = append(prepared, preparedDoc{id: docID, destIndex: docDestIdx, srcVer: h.Version, isDelete: true})
+						candIDsByIdx[docDestIdx] = append(candIDsByIdx[docDestIdx], docID)
+						if _, hasKey := sampleDocsByIdx[docDestIdx]; !hasKey {
+							sampleDocsByIdx[docDestIdx] = nil
+						}
+						continue
 					}
 					docSource = mutated
 				}
@@ -4163,6 +4168,28 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					minVer = pd.srcVer + 1
 				}
 				existing, exists := existingDocs[pd.id]
+				if pd.isDelete {
+					if exists && existing.Version+1 > minVer {
+						minVer = existing.Version + 1
+					}
+					nextVer := s.allocVersion(minVer)
+					shredded, err := schema.ShredDocument(sch, pd.id, nextVer, true, nil)
+					if err != nil {
+						writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+						return
+					}
+					buf, hasBuf := batchBufByTable[sch.DorisTable]
+					if !hasBuf {
+						buf = &bytes.Buffer{}
+						batchBufByTable[sch.DorisTable] = buf
+						tableOrder = append(tableOrder, sch.DorisTable)
+					}
+					buf.Write(shredded)
+					buf.WriteByte('\n')
+					delete(existingDocs, pd.id)
+					totalDeleted++
+					continue
+				}
 				if exists {
 					conflict := isCreate || (pd.destIndex == destIndex && destAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), destIndex, pd.id, existing.Source, destAliasFilter))
 					if conflict {

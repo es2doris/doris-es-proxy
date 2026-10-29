@@ -102,11 +102,13 @@ func ShredDocument(
 			if val == nil && b.NullValue != nil && hasExplicitNullAtPath(parsedDoc, b.SourceJSONPath) {
 				val = b.NullValue
 			}
-			val = coerceScalarForDoris(val, b.DorisType, b.LowercaseNormalizer, getNow())
 			if b.IgnoreAbove > 0 {
 				if str, ok := val.(string); ok && len([]rune(str)) > b.IgnoreAbove {
 					val = nil
 				}
+			}
+			if val != nil {
+				val = coerceScalarForDoris(val, b.DorisType, b.LowercaseNormalizer, getNow())
 			}
 			if b.ESType == "date_nanos" {
 				if iv, ok := val.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
@@ -196,17 +198,34 @@ func ShredDocument(
 				if !ok {
 					continue
 				}
+				if tb.AliasTarget != "" {
+					if resolvedTB, rOK := s.Fields[tb.AliasTarget]; rOK {
+						targetField = tb.AliasTarget
+						tb = resolvedTB
+					}
+				}
 				switch tb.Kind {
 				case StoragePromotedScalar:
-					joined := strings.Join(srcVals, " ")
-					coerced := coerceScalarForDoris(joined, tb.DorisType, tb.LowercaseNormalizer, getNow())
-					if coerced != nil {
-						if existing, exists := row[tb.ColumnName]; exists && existing != nil {
-							if tb.DorisType == DorisString || tb.DorisType == DorisVarchar {
-								row[tb.ColumnName] = fmt.Sprintf("%v %v", existing, coerced)
+					filteredSrc := srcVals
+					if tb.IgnoreAbove > 0 {
+						filteredSrc = make([]string, 0, len(srcVals))
+						for _, sv := range srcVals {
+							if len([]rune(sv)) <= tb.IgnoreAbove {
+								filteredSrc = append(filteredSrc, sv)
 							}
-						} else {
-							row[tb.ColumnName] = coerced
+						}
+					}
+					if len(filteredSrc) > 0 {
+						joined := strings.Join(filteredSrc, " ")
+						coerced := coerceScalarForDoris(joined, tb.DorisType, tb.LowercaseNormalizer, getNow())
+						if coerced != nil {
+							if existing, exists := row[tb.ColumnName]; exists && existing != nil {
+								if tb.DorisType == DorisString || tb.DorisType == DorisVarchar {
+									row[tb.ColumnName] = fmt.Sprintf("%v %v", existing, coerced)
+								}
+							} else {
+								row[tb.ColumnName] = coerced
+							}
 						}
 					}
 					if tb.KeywordCompanion != "" {
@@ -228,7 +247,7 @@ func ShredDocument(
 								row[tb.KeywordCompanion] = curKw
 							}
 						} else {
-							kwVal := joined
+							kwVal := strings.Join(srcVals, " ")
 							if tb.KeywordNormalizer {
 								kwVal = strings.ToLower(kwVal)
 							}
@@ -990,6 +1009,11 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 	for _, b := range fields {
 		if b.Kind != StorageNestedSubfield || b.NestedPath != nestedPath {
 			continue
+		}
+		if strings.HasSuffix(b.ESFieldPath, ".keyword") {
+			if _, hasBase := s.Fields[strings.TrimSuffix(b.ESFieldPath, ".keyword")]; hasBase {
+				continue
+			}
 		}
 		if len(b.SourceJSONPath) <= len(rootParts) {
 			continue
