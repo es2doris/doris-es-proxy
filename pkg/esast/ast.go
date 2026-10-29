@@ -874,6 +874,7 @@ type PhraseEntry struct {
 	Slop               int     `json:"slop,omitempty"`
 	Operator           string  `json:"operator,omitempty"`
 	MinimumShouldMatch any     `json:"minimum_should_match,omitempty"`
+	ZeroTermsQuery     string  `json:"zero_terms_query,omitempty"`
 	Boost              float64 `json:"boost,omitempty"`
 }
 
@@ -886,6 +887,7 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 			Slop               int      `json:"slop"`
 			Operator           string   `json:"operator"`
 			MinimumShouldMatch any      `json:"minimum_should_match"`
+			ZeroTermsQuery     string   `json:"zero_terms_query"`
 			Boost              *float64 `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
@@ -897,6 +899,7 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 		p.Slop = full.Slop
 		p.Operator = strings.ToLower(full.Operator)
 		p.MinimumShouldMatch = full.MinimumShouldMatch
+		p.ZeroTermsQuery = full.ZeroTermsQuery
 		if full.Boost != nil {
 			p.Boost = *full.Boost
 		}
@@ -930,6 +933,7 @@ type QueryStringQuery struct {
 	Fields             []string `json:"fields,omitempty"`
 	DefaultOperator    string   `json:"default_operator,omitempty"`
 	MinimumShouldMatch any      `json:"minimum_should_match,omitempty"`
+	Flags              string   `json:"flags,omitempty"`
 	Boost              *float64 `json:"boost,omitempty"`
 }
 

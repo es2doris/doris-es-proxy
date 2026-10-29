@@ -1114,4 +1114,53 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	if r22Aggs == nil || r22Aggs["max_filter_lat"] == nil {
 		t.Fatalf("expected R22 max_filter_lat pipeline agg result, got %+v", r22Aggs)
 	}
+
+	// 24. Round-23: simple_query_string AND+OR+negation, Painless bitwise/Java11 script_fields, UTF-8 highlight, and statement-block bucket_script
+	r23SearchResp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
+		"query": {
+			"simple_query_string": {
+				"fields": ["service"],
+				"query": "checkout | payments -forbidden",
+				"default_operator": "AND"
+			}
+		},
+		"highlight": {
+			"number_of_fragments": 1,
+			"fields": {
+				"service": {}
+			}
+		},
+		"script_fields": {
+			"bw_shift": {"script": "64 >> 2 >> 1"},
+			"j11_str":  {"script": "'  ok  '.strip().repeat(2)"}
+		},
+		"aggs": {
+			"by_svc": {
+				"terms": {"field": "service"},
+				"aggs": {
+					"lat_sum": {"sum": {"field": "latency_ms"}},
+					"lat_sqrt": {
+						"bucket_script": {
+							"buckets_path": {"s": "lat_sum"},
+							"script": "double v = params.s; return Math.round(Math.sqrt(v));"
+						}
+					}
+				}
+			}
+		}
+	}`))
+	if err != nil || r23SearchResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search (R23 simple_query_string + script_fields + highlight + bucket_script) failed: status=%v err=%v", r23SearchResp.StatusCode, err)
+	}
+	var r23SearchRes map[string]any
+	_ = json.NewDecoder(r23SearchResp.Body).Decode(&r23SearchRes)
+	_ = r23SearchResp.Body.Close()
+	r23Hits := r23SearchRes["hits"].(map[string]any)["hits"].([]any)
+	if len(r23Hits) == 0 {
+		t.Fatalf("expected R23 hits on live_auto_index, got 0")
+	}
+	r23Fields, _ := r23Hits[0].(map[string]any)["fields"].(map[string]any)
+	if r23Fields == nil || r23Fields["bw_shift"].([]any)[0] != float64(8) || r23Fields["j11_str"].([]any)[0] != "okok" {
+		t.Fatalf("unexpected R23 script_fields on live_auto_index: %+v", r23Fields)
+	}
 }

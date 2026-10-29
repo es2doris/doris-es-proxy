@@ -97,7 +97,7 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 		defaultOp = "OR"
 	}
 
-	parsedAST := parseSimpleLuceneToASTWithMode(raw, defaultField, expandedFields, defaultOp, 0, isSimple)
+	parsedAST := parseSimpleLuceneToASTWithFlags(raw, defaultField, expandedFields, defaultOp, 0, isSimple, parseSimpleQueryFlags(qsq.Flags, isSimple))
 	if qsq.MinimumShouldMatch != nil && parsedAST.Bool != nil && len(parsedAST.Bool.Should) > 0 {
 		parsedAST.Bool.MinimumShouldMatch = qsq.MinimumShouldMatch
 	}
@@ -235,84 +235,226 @@ func (t *Transpiler) isDoris4SearchableField(fname string) bool {
 
 const maxLuceneDepth = 32
 
-func parseSimpleLuceneToASTWithDepth(expr, defaultField string, fields []string, defaultOp string, depth int) esast.Query {
-	return parseSimpleLuceneToASTWithMode(expr, defaultField, fields, defaultOp, depth, false)
+type simpleQueryFlags struct {
+	and        bool
+	or         bool
+	not        bool
+	phrase     bool
+	prefix     bool
+	precedence bool
+	fuzzy      bool
+	slop       bool
 }
 
-func parseSimpleLuceneToASTWithMode(expr, defaultField string, fields []string, defaultOp string, depth int, isSimple bool) esast.Query {
+func allSimpleQueryFlags() simpleQueryFlags {
+	return simpleQueryFlags{
+		and:        true,
+		or:         true,
+		not:        true,
+		phrase:     true,
+		prefix:     true,
+		precedence: true,
+		fuzzy:      true,
+		slop:       true,
+	}
+}
+
+func parseSimpleQueryFlags(raw string, isSimple bool) simpleQueryFlags {
+	if !isSimple {
+		return allSimpleQueryFlags()
+	}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || strings.EqualFold(trimmed, "ALL") {
+		return allSimpleQueryFlags()
+	}
+	if strings.EqualFold(trimmed, "NONE") {
+		return simpleQueryFlags{}
+	}
+	var f simpleQueryFlags
+	for _, part := range strings.Split(trimmed, "|") {
+		switch strings.ToUpper(strings.TrimSpace(part)) {
+		case "AND":
+			f.and = true
+		case "OR":
+			f.or = true
+		case "NOT":
+			f.not = true
+		case "PHRASE":
+			f.phrase = true
+		case "PREFIX":
+			f.prefix = true
+		case "PRECEDENCE":
+			f.precedence = true
+		case "FUZZY":
+			f.fuzzy = true
+		case "SLOP", "NEAR":
+			f.slop = true
+		case "ALL":
+			return allSimpleQueryFlags()
+		}
+	}
+	return f
+}
+
+func isLuceneBinaryAnd(tok string, prevWasClause bool, isSimple bool, flags simpleQueryFlags) bool {
+	if isSimple {
+		if !flags.and {
+			return false
+		}
+		return tok == "&&" || (tok == "+" && prevWasClause)
+	}
+	return strings.EqualFold(tok, "AND") || tok == "&&" || (tok == "+" && prevWasClause)
+}
+
+func isLuceneBinaryOr(tok string, isSimple bool, flags simpleQueryFlags) bool {
+	if isSimple {
+		if !flags.or {
+			return false
+		}
+		return tok == "|" || tok == "||"
+	}
+	return strings.EqualFold(tok, "OR") || tok == "||" || tok == "|"
+}
+
+func isLuceneStandaloneNot(tok string, isSimple bool, flags simpleQueryFlags) bool {
+	if isSimple {
+		return flags.not && tok == "-"
+	}
+	return strings.EqualFold(tok, "NOT") || tok == "!" || tok == "-"
+}
+
+func isLuceneUnaryPrefixed(tok string, isSimple bool, flags simpleQueryFlags) bool {
+	if len(tok) <= 1 {
+		return false
+	}
+	if strings.HasPrefix(tok, "+") {
+		return !isSimple || flags.and
+	}
+	if strings.HasPrefix(tok, "-") {
+		return !isSimple || flags.not
+	}
+	if strings.HasPrefix(tok, "!") {
+		return !isSimple
+	}
+	return false
+}
+
+func parseSimpleLuceneToASTWithDepth(expr, defaultField string, fields []string, defaultOp string, depth int) esast.Query {
+	return parseSimpleLuceneToASTWithFlags(expr, defaultField, fields, defaultOp, depth, false, allSimpleQueryFlags())
+}
+
+func parseSimpleLuceneToASTWithFlags(expr, defaultField string, fields []string, defaultOp string, depth int, isSimple bool, flags simpleQueryFlags) esast.Query {
 	if depth > maxLuceneDepth {
 		return esast.Query{MatchAll: map[string]any{}}
 	}
-	tokens := tokenizeLucene(expr)
+	tokens := tokenizeLuceneWithFlags(expr, isSimple, flags)
 	if len(tokens) == 0 {
 		return esast.Query{MatchAll: map[string]any{}}
 	}
+	return parseLuceneTokensToASTWithFlags(tokens, defaultField, fields, defaultOp, depth, isSimple, flags)
+}
 
+func parseLuceneTokensToASTWithFlags(tokens []string, defaultField string, fields []string, defaultOp string, depth int, isSimple bool, flags simpleQueryFlags) esast.Query {
+	if depth > maxLuceneDepth || len(tokens) == 0 {
+		return esast.Query{MatchAll: map[string]any{}}
+	}
+
+	// Pre-merge standalone unary prefix tokens ('+', '-', '!', 'NOT') with their operand token
+	// before inserting synthetic 'OR' tokens so unattached unary clauses can be cleanly separated.
+	var merged []string
+	prevWasClause := false
+	for i := 0; i < len(tokens); i++ {
+		tok := tokens[i]
+		if isLuceneBinaryAnd(tok, prevWasClause, isSimple, flags) || isLuceneBinaryOr(tok, isSimple, flags) {
+			merged = append(merged, tok)
+			prevWasClause = false
+			continue
+		}
+		if tok == "+" && !prevWasClause && (!isSimple || flags.and) && i+1 < len(tokens) {
+			merged = append(merged, "+"+tokens[i+1])
+			i++
+			prevWasClause = true
+			continue
+		}
+		if isLuceneStandaloneNot(tok, isSimple, flags) && i+1 < len(tokens) {
+			merged = append(merged, "-"+tokens[i+1])
+			i++
+			prevWasClause = true
+			continue
+		}
+		merged = append(merged, tok)
+		prevWasClause = true
+	}
+
+	// Separate unattached unary tokens (+term, -term, !term not adjacent to explicit binary AND/OR)
+	// from the remaining tokens BEFORE inserting synthetic ORs.
+	var unattachedUnary []string
+	var remaining []string
+	for i, tok := range merged {
+		isUnary := isLuceneUnaryPrefixed(tok, isSimple, flags)
+		prevIsBin := i > 0 && (isLuceneBinaryAnd(merged[i-1], true, isSimple, flags) || isLuceneBinaryOr(merged[i-1], isSimple, flags))
+		nextIsBin := i+1 < len(merged) && (isLuceneBinaryAnd(merged[i+1], true, isSimple, flags) || isLuceneBinaryOr(merged[i+1], isSimple, flags))
+		if isUnary && !prevIsBin && !nextIsBin {
+			unattachedUnary = append(unattachedUnary, tok)
+		} else {
+			remaining = append(remaining, tok)
+		}
+	}
+
+	if len(unattachedUnary) > 0 && len(remaining) > 0 {
+		uQ := parseLuceneTokenSliceWithFlags(unattachedUnary, defaultField, fields, defaultOp, defaultOp, depth+1, isSimple, flags)
+		remQ := parseLuceneTokensToASTWithFlags(remaining, defaultField, fields, defaultOp, depth+1, isSimple, flags)
+		outBool := &esast.BoolQuery{}
+		if uQ.Bool != nil {
+			outBool.Must = append(outBool.Must, uQ.Bool.Must...)
+			outBool.MustNot = append(outBool.MustNot, uQ.Bool.MustNot...)
+		}
+		if remQ.Bool != nil {
+			outBool.Must = append(outBool.Must, remQ.Bool.Must...)
+			outBool.MustNot = append(outBool.MustNot, remQ.Bool.MustNot...)
+			outBool.Should = append(outBool.Should, remQ.Bool.Should...)
+			outBool.Filter = append(outBool.Filter, remQ.Bool.Filter...)
+		}
+		if len(outBool.Should) > 0 && len(outBool.Must) == 0 && len(outBool.Filter) == 0 {
+			outBool.MinimumShouldMatch = 1
+		}
+		return esast.Query{Bool: outBool}
+	}
+
+	tokens = merged
 	hasAND, hasOR := false, false
 	var normalizedTokens []string
-	prevWasClause := false
+	prevWasClause = false
 	for _, tok := range tokens {
-		upper := strings.ToUpper(tok)
-		switch upper {
-		case "AND", "&&":
+		if isLuceneBinaryAnd(tok, prevWasClause, isSimple, flags) {
 			hasAND = true
 			prevWasClause = false
-			tok = "AND"
-		case "OR", "||", "|":
+			tok = "\x00AND"
+		} else if isLuceneBinaryOr(tok, isSimple, flags) {
 			hasOR = true
 			prevWasClause = false
-			tok = "OR"
-		case "+":
-			if prevWasClause {
-				hasAND = true
-				tok = "AND"
-			}
+			tok = "\x00OR"
+		} else if isLuceneStandaloneNot(tok, isSimple, flags) {
 			prevWasClause = false
-		case "NOT", "-", "!":
-			prevWasClause = false
-			tok = "NOT"
-		default:
-			isUnaryPrefix := (strings.HasPrefix(tok, "+") || strings.HasPrefix(tok, "-") || strings.HasPrefix(tok, "!")) && len(tok) > 1
+			tok = "\x00NOT"
+		} else {
+			isUnaryPrefix := isLuceneUnaryPrefixed(tok, isSimple, flags)
 			if prevWasClause && defaultOp == "OR" && !isUnaryPrefix {
-				normalizedTokens = append(normalizedTokens, "OR")
+				normalizedTokens = append(normalizedTokens, "\x00OR")
 				hasOR = true
 			}
-			prevWasClause = true
+			prevWasClause = !isUnaryPrefix
 		}
 		normalizedTokens = append(normalizedTokens, tok)
 	}
 	tokens = normalizedTokens
 
-	hasExplicitORWithUnary := false
-	for i, tok := range tokens {
-		if strings.HasPrefix(tok, "+") && len(tok) > 1 {
-			prevOR := i > 0 && strings.EqualFold(tokens[i-1], "OR")
-			nextOR := i+1 < len(tokens) && strings.EqualFold(tokens[i+1], "OR")
-			if prevOR || nextOR {
-				hasExplicitORWithUnary = true
-				break
-			}
-		}
-	}
-
 	// In Lucene grammar, `AND` binds tighter than `OR` (e.g., `a:1 AND b:2 OR c:3` -> `(a:1 AND b:2) OR c:3`).
-	if (hasAND || hasExplicitORWithUnary || defaultOp == "AND") && hasOR {
-		var unaryTokens []string
-		var binaryTokens []string
-		for i, tok := range tokens {
-			isUnary := (strings.HasPrefix(tok, "+") || strings.HasPrefix(tok, "-") || strings.HasPrefix(tok, "!")) && len(tok) > 1
-			prevIsOp := i > 0 && (strings.EqualFold(tokens[i-1], "AND") || strings.EqualFold(tokens[i-1], "OR") || strings.EqualFold(tokens[i-1], "NOT"))
-			nextIsOp := i+1 < len(tokens) && (strings.EqualFold(tokens[i+1], "AND") || strings.EqualFold(tokens[i+1], "OR"))
-			if isUnary && !prevIsOp && !nextIsOp {
-				unaryTokens = append(unaryTokens, tok)
-			} else {
-				binaryTokens = append(binaryTokens, tok)
-			}
-		}
+	if (hasAND || defaultOp == "AND") && hasOR {
 		var orGroups [][]string
 		var curGroup []string
-		for _, tok := range binaryTokens {
-			if strings.EqualFold(tok, "OR") {
+		for _, tok := range tokens {
+			if tok == "\x00OR" {
 				if len(curGroup) > 0 {
 					orGroups = append(orGroups, curGroup)
 					curGroup = nil
@@ -327,18 +469,9 @@ func parseSimpleLuceneToASTWithMode(expr, defaultField string, fields []string, 
 		if len(orGroups) > 1 {
 			var shoulds []esast.Query
 			for _, grp := range orGroups {
-				shoulds = append(shoulds, parseLuceneTokenSliceWithMode(grp, defaultField, fields, "AND", defaultOp, depth+1, isSimple))
+				shoulds = append(shoulds, parseLuceneTokenSliceWithFlags(grp, defaultField, fields, "AND", defaultOp, depth+1, isSimple, flags))
 			}
 			outBool := &esast.BoolQuery{Should: shoulds}
-			if len(unaryTokens) > 0 {
-				uQ := parseLuceneTokenSliceWithMode(unaryTokens, defaultField, fields, defaultOp, defaultOp, depth+1, isSimple)
-				if uQ.Bool != nil {
-					outBool.Must = append(outBool.Must, uQ.Bool.Must...)
-					outBool.MustNot = append(outBool.MustNot, uQ.Bool.MustNot...)
-				}
-				minShould := 1
-				outBool.MinimumShouldMatch = minShould
-			}
 			return esast.Query{Bool: outBool}
 		}
 	}
@@ -349,35 +482,34 @@ func parseSimpleLuceneToASTWithMode(expr, defaultField string, fields []string, 
 	} else if hasOR {
 		groupOp = "OR"
 	}
-	return parseLuceneTokenSliceWithMode(tokens, defaultField, fields, groupOp, defaultOp, depth, isSimple)
+	return parseLuceneTokenSliceWithFlags(tokens, defaultField, fields, groupOp, defaultOp, depth, isSimple, flags)
 }
 
-func parseLuceneTokenSliceWithMode(tokens []string, defaultField string, fields []string, groupOp string, defaultOp string, depth int, isSimple bool) esast.Query {
+func parseLuceneTokenSliceWithFlags(tokens []string, defaultField string, fields []string, groupOp string, defaultOp string, depth int, isSimple bool, flags simpleQueryFlags) esast.Query {
 	boolQ := &esast.BoolQuery{}
 	negateNext := false
 	forceMustNext := false
 
 	for i := 0; i < len(tokens); i++ {
 		tok := tokens[i]
-		upper := strings.ToUpper(tok)
-		if upper == "AND" || upper == "&&" || upper == "OR" || upper == "||" || upper == "|" {
+		if tok == "\x00AND" || tok == "\x00OR" || isLuceneBinaryAnd(tok, true, isSimple, flags) || isLuceneBinaryOr(tok, isSimple, flags) {
 			continue
 		}
-		if upper == "NOT" || tok == "!" || tok == "-" {
+		if tok == "\x00NOT" || isLuceneStandaloneNot(tok, isSimple, flags) {
 			negateNext = true
 			continue
 		}
-		if tok == "+" {
+		if tok == "+" && (!isSimple || flags.and) {
 			forceMustNext = true
 			continue
 		}
 
 		mustClause := forceMustNext
 		forceMustNext = false
-		if (strings.HasPrefix(tok, "-") || strings.HasPrefix(tok, "!")) && len(tok) > 1 {
+		if ((strings.HasPrefix(tok, "-") && (!isSimple || flags.not)) || (strings.HasPrefix(tok, "!") && !isSimple)) && len(tok) > 1 {
 			negateNext = true
 			tok = tok[1:]
-		} else if strings.HasPrefix(tok, "+") && len(tok) > 1 {
+		} else if strings.HasPrefix(tok, "+") && (!isSimple || flags.and) && len(tok) > 1 {
 			mustClause = true
 			tok = tok[1:]
 		}
@@ -386,11 +518,11 @@ func parseLuceneTokenSliceWithMode(tokens []string, defaultField string, fields 
 		}
 
 		var clause esast.Query
-		if hasMatchingOuterParens(tok) {
+		if (!isSimple || flags.precedence) && hasMatchingOuterParens(tok) {
 			inner := tok[1 : len(tok)-1]
-			clause = parseSimpleLuceneToASTWithMode(inner, defaultField, fields, defaultOp, depth+1, isSimple)
+			clause = parseSimpleLuceneToASTWithFlags(inner, defaultField, fields, defaultOp, depth+1, isSimple, flags)
 		} else {
-			clause = buildLuceneAtomQueryWithDepthAndMode(tok, defaultField, fields, defaultOp, depth+1, isSimple)
+			clause = buildLuceneAtomQueryWithFlags(tok, defaultField, fields, defaultOp, depth+1, isSimple, flags)
 		}
 
 		if negateNext {
@@ -404,6 +536,9 @@ func parseLuceneTokenSliceWithMode(tokens []string, defaultField string, fields 
 	}
 	if len(boolQ.Must) == 0 && len(boolQ.Should) == 0 && len(boolQ.Filter) == 0 && len(boolQ.MustNot) == 0 {
 		return esast.Query{MatchAll: map[string]any{}}
+	}
+	if len(boolQ.Should) > 0 && len(boolQ.Must) == 0 && len(boolQ.Filter) == 0 && len(boolQ.MustNot) > 0 {
+		boolQ.MinimumShouldMatch = 1
 	}
 	return esast.Query{Bool: boolQ}
 }
@@ -593,11 +728,11 @@ func parseLuceneRangeToken(val string, boost float64) *esast.RangeCond {
 	return nil
 }
 
-func buildLuceneAtomQueryWithDepthAndMode(token, defaultField string, fields []string, defaultOp string, depth int, isSimple bool) esast.Query {
+func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, defaultOp string, depth int, isSimple bool, flags simpleQueryFlags) esast.Query {
 	token = strings.TrimSpace(token)
 	token, boost := splitLuceneBoost(token)
-	if hasMatchingOuterParens(token) {
-		inner := parseSimpleLuceneToASTWithMode(token[1:len(token)-1], defaultField, fields, defaultOp, depth+1, isSimple)
+	if (!isSimple || flags.precedence) && hasMatchingOuterParens(token) {
+		inner := parseSimpleLuceneToASTWithFlags(token[1:len(token)-1], defaultField, fields, defaultOp, depth+1, isSimple, flags)
 		if boost != 1.0 && inner.Bool != nil {
 			inner.Bool.Boost = &boost
 		}
@@ -692,58 +827,72 @@ func buildLuceneAtomQueryWithDepthAndMode(token, defaultField string, fields []s
 		return esast.Query{MatchNone: map[string]any{}}
 	}
 
-	if rc := parseLuceneRangeToken(token, boost); rc != nil {
-		if len(fields) > 0 {
-			var shoulds []esast.Query
-			for _, fpat := range fields {
-				fname, fBoost := splitLuceneBoost(fpat)
-				rcCopy := *rc
-				effBoost := boost * fBoost
-				if effBoost != 1.0 {
-					rcCopy.Boost = &effBoost
+	if !isSimple {
+		if rc := parseLuceneRangeToken(token, boost); rc != nil {
+			if len(fields) > 0 {
+				var shoulds []esast.Query
+				for _, fpat := range fields {
+					fname, fBoost := splitLuceneBoost(fpat)
+					rcCopy := *rc
+					effBoost := boost * fBoost
+					if effBoost != 1.0 {
+						rcCopy.Boost = &effBoost
+					}
+					shoulds = append(shoulds, esast.Query{
+						Range: map[string]esast.RangeCond{fname: rcCopy},
+					})
 				}
-				shoulds = append(shoulds, esast.Query{
-					Range: map[string]esast.RangeCond{fname: rcCopy},
-				})
+				if len(shoulds) == 1 {
+					return shoulds[0]
+				}
+				if len(shoulds) > 1 {
+					return esast.Query{Bool: &esast.BoolQuery{Should: shoulds}}
+				}
 			}
-			if len(shoulds) == 1 {
-				return shoulds[0]
-			}
-			if len(shoulds) > 1 {
-				return esast.Query{Bool: &esast.BoolQuery{Should: shoulds}}
-			}
-		}
-		return esast.Query{
-			Range: map[string]esast.RangeCond{defaultField: *rc},
-		}
-	}
-	if strings.HasPrefix(token, "/") && strings.HasSuffix(token, "/") && len(token) > 2 {
-		pat := strings.ReplaceAll(token[1:len(token)-1], `\/`, `/`)
-		if len(fields) > 0 {
-			var shoulds []esast.Query
-			for _, fpat := range fields {
-				fname, fBoost := splitLuceneBoost(fpat)
-				shoulds = append(shoulds, esast.Query{
-					Regexp: map[string]esast.RegexpEntry{
-						fname: {Value: pat, Boost: boost * fBoost},
-					},
-				})
-			}
-			if len(shoulds) == 1 {
-				return shoulds[0]
-			}
-			if len(shoulds) > 1 {
-				return esast.Query{Bool: &esast.BoolQuery{Should: shoulds}}
+			return esast.Query{
+				Range: map[string]esast.RangeCond{defaultField: *rc},
 			}
 		}
-		return esast.Query{
-			Regexp: map[string]esast.RegexpEntry{
-				defaultField: {Value: pat, Boost: boost},
-			},
+		if strings.HasPrefix(token, "/") && strings.HasSuffix(token, "/") && len(token) > 2 {
+			pat := strings.ReplaceAll(token[1:len(token)-1], `\/`, `/`)
+			if len(fields) > 0 {
+				var shoulds []esast.Query
+				for _, fpat := range fields {
+					fname, fBoost := splitLuceneBoost(fpat)
+					shoulds = append(shoulds, esast.Query{
+						Regexp: map[string]esast.RegexpEntry{
+							fname: {Value: pat, Boost: boost * fBoost},
+						},
+					})
+				}
+				if len(shoulds) == 1 {
+					return shoulds[0]
+				}
+				if len(shoulds) > 1 {
+					return esast.Query{Bool: &esast.BoolQuery{Should: shoulds}}
+				}
+			}
+			return esast.Query{
+				Regexp: map[string]esast.RegexpEntry{
+					defaultField: {Value: pat, Boost: boost},
+				},
+			}
 		}
 	}
 	cleanVal, rawWild, isQuoted, slop := parseLuceneQuotedOrFuzzy(token)
-	if !isQuoted && hasUnescapedLuceneWildcard(rawWild) {
+	if isSimple {
+		if !flags.phrase {
+			isQuoted = false
+			slop = 0
+		} else if !flags.slop {
+			slop = 0
+		}
+		if !flags.fuzzy && !isQuoted {
+			cleanVal = unescapeLuceneToken(strings.TrimSpace(token))
+			rawWild = strings.TrimSpace(token)
+		}
+	}
+	if !isQuoted && (!isSimple || flags.prefix) && hasUnescapedLuceneWildcard(rawWild) {
 		if len(fields) > 0 {
 			var shoulds []esast.Query
 			for _, fpat := range fields {
@@ -814,7 +963,98 @@ func parseLuceneRangeBound(s string) any {
 	return s
 }
 
+// sanitizeSimpleQueryInput strips unmatched quotes and unmatched parentheses in
+// fault-tolerant `simple_query_string` mode so stray '"' or '(' never swallow tokens to EOF.
+func sanitizeSimpleQueryInput(s string, flags simpleQueryFlags) string {
+	var quoteIndices []int
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if s[i] == '\\' {
+			escaped = true
+			continue
+		}
+		if s[i] == '"' {
+			quoteIndices = append(quoteIndices, i)
+		}
+	}
+	dropIdx := make(map[int]bool)
+	if !flags.phrase {
+		for _, idx := range quoteIndices {
+			dropIdx[idx] = true
+		}
+	} else if len(quoteIndices)%2 == 1 {
+		dropIdx[quoteIndices[len(quoteIndices)-1]] = true
+	}
+
+	var openParens []int
+	inQuotes := false
+	escaped = false
+	for i := 0; i < len(s); i++ {
+		if dropIdx[i] {
+			continue
+		}
+		if escaped {
+			escaped = false
+			continue
+		}
+		if s[i] == '\\' {
+			escaped = true
+			continue
+		}
+		if s[i] == '"' {
+			inQuotes = !inQuotes
+			continue
+		}
+		if inQuotes {
+			continue
+		}
+		switch s[i] {
+		case '(':
+			if !flags.precedence {
+				dropIdx[i] = true
+			} else {
+				openParens = append(openParens, i)
+			}
+		case ')':
+			if !flags.precedence || len(openParens) == 0 {
+				dropIdx[i] = true
+			} else {
+				openParens = openParens[:len(openParens)-1]
+			}
+		}
+	}
+	for _, idx := range openParens {
+		dropIdx[idx] = true
+	}
+	if len(dropIdx) == 0 {
+		return s
+	}
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if dropIdx[i] {
+			if s[i] == '(' || s[i] == ')' {
+				sb.WriteByte(' ')
+			}
+			continue
+		}
+		sb.WriteByte(s[i])
+	}
+	return sb.String()
+}
+
 func tokenizeLucene(s string) []string {
+	return tokenizeLuceneWithFlags(s, false, allSimpleQueryFlags())
+}
+
+func tokenizeLuceneWithFlags(s string, isSimple bool, flags simpleQueryFlags) []string {
+	if isSimple {
+		s = sanitizeSimpleQueryInput(s, flags)
+	}
 	var out []string
 	var curr strings.Builder
 	inQuotes := false
@@ -833,12 +1073,12 @@ func tokenizeLucene(s string) []string {
 			escaped = true
 			curr.WriteRune(r)
 		case '"':
-			if !inRegex {
+			if !inRegex && (!isSimple || flags.phrase) {
 				inQuotes = !inQuotes
 			}
 			curr.WriteRune(r)
 		case '/':
-			if !inQuotes && bracketDepth == 0 {
+			if !isSimple && !inQuotes && bracketDepth == 0 {
 				if inRegex {
 					inRegex = false
 				} else if (curr.Len() == 0 || strings.HasSuffix(curr.String(), ":")) && strings.ContainsRune(s[i+1:], '/') {
@@ -847,7 +1087,7 @@ func tokenizeLucene(s string) []string {
 			}
 			curr.WriteRune(r)
 		case '(':
-			if !inQuotes && !inRegex {
+			if !inQuotes && !inRegex && (!isSimple || flags.precedence) {
 				if parenDepth == 0 && bracketDepth == 0 && curr.Len() > 0 {
 					prefix := curr.String()
 					if prefix != "+" && prefix != "-" && prefix != "!" && !strings.HasSuffix(prefix, ":") {
@@ -859,7 +1099,7 @@ func tokenizeLucene(s string) []string {
 			}
 			curr.WriteRune(r)
 		case ')':
-			if !inQuotes && !inRegex && parenDepth > 0 {
+			if !inQuotes && !inRegex && (!isSimple || flags.precedence) && parenDepth > 0 {
 				parenDepth--
 				curr.WriteRune(r)
 				if parenDepth == 0 && bracketDepth == 0 && (i+1 >= len(s) || s[i+1] != '^') {
@@ -875,12 +1115,12 @@ func tokenizeLucene(s string) []string {
 			}
 			curr.WriteRune(r)
 		case '[', '{':
-			if !inQuotes && !inRegex {
+			if !isSimple && !inQuotes && !inRegex {
 				bracketDepth++
 			}
 			curr.WriteRune(r)
 		case ']', '}':
-			if !inQuotes && !inRegex && bracketDepth > 0 {
+			if !isSimple && !inQuotes && !inRegex && bracketDepth > 0 {
 				bracketDepth--
 			}
 			curr.WriteRune(r)
@@ -892,7 +1132,7 @@ func tokenizeLucene(s string) []string {
 				curr.Reset()
 			}
 		case '|':
-			if inQuotes || inRegex || parenDepth > 0 || bracketDepth > 0 {
+			if inQuotes || inRegex || parenDepth > 0 || bracketDepth > 0 || (isSimple && !flags.or) {
 				curr.WriteRune(r)
 			} else {
 				if curr.String() == "|" {
@@ -911,7 +1151,7 @@ func tokenizeLucene(s string) []string {
 				}
 			}
 		case '&':
-			if inQuotes || inRegex || parenDepth > 0 || bracketDepth > 0 {
+			if inQuotes || inRegex || parenDepth > 0 || bracketDepth > 0 || (isSimple && !flags.and) {
 				curr.WriteRune(r)
 			} else if curr.String() == "&" {
 				out = append(out, "&&")
