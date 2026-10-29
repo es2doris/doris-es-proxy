@@ -1096,11 +1096,6 @@ func (s *Server) applyIngestPipelineForWriteWithMeta(pipelineID, indexName, docI
 	return out, outIdx, outID, dropped, err
 }
 
-func (s *Server) applyEffectiveAndFinalPipelines(indexName, reqPipeline, defaultPipeline string, raw json.RawMessage) (json.RawMessage, bool, error) {
-	out, _, _, dropped, err := s.applyEffectiveAndFinalPipelinesWithMeta(indexName, "", reqPipeline, defaultPipeline, raw)
-	return out, dropped, err
-}
-
 func (s *Server) applyEffectiveAndFinalPipelinesWithMeta(indexName, docID, reqPipeline, defaultPipeline string, raw json.RawMessage) (json.RawMessage, string, string, bool, error) {
 	effPipeline := s.resolveEffectivePipeline(indexName, reqPipeline, defaultPipeline)
 	cur := raw
@@ -1907,22 +1902,72 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			}
 		}
 	case "remove":
-		switch f := specMap["field"].(type) {
-		case string:
-			if _, exists := getIngestPath(doc, f); !exists && isExplicitIgnoreMissingFalse(specMap) {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", f)
-			}
-			deleteIngestPath(doc, f)
-			mutated = true
-		case []any:
-			for _, item := range f {
-				if ks, ok := item.(string); ok {
-					if _, exists := getIngestPath(doc, ks); !exists && isExplicitIgnoreMissingFalse(specMap) {
-						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", ks)
-					}
-					deleteIngestPath(doc, ks)
-					mutated = true
+		extractRemoveStrings := func(raw any) []string {
+			var res []string
+			switch tv := raw.(type) {
+			case string:
+				s := strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(tv, doc)))
+				if s != "" {
+					res = append(res, s)
 				}
+			case []any:
+				for _, item := range tv {
+					if ks, ok := item.(string); ok {
+						s := strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(ks, doc)))
+						if s != "" {
+							res = append(res, s)
+						}
+					}
+				}
+			}
+			return res
+		}
+		fieldsToRemove := extractRemoveStrings(specMap["field"])
+		fieldsToKeep := extractRemoveStrings(specMap["keep"])
+		if len(fieldsToRemove) == 0 && len(fieldsToKeep) == 0 {
+			return false, false, procType, procTag, specMap, fmt.Errorf("either [field] or [keep] must be specified")
+		}
+		if len(fieldsToRemove) > 0 && len(fieldsToKeep) > 0 {
+			keepSet := make(map[string]bool, len(fieldsToKeep))
+			for _, kp := range fieldsToKeep {
+				keepSet[kp] = true
+			}
+			for _, rm := range fieldsToRemove {
+				if keepSet[rm] {
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] cannot be present in both [field] and [keep]", rm)
+				}
+			}
+		}
+		if len(fieldsToKeep) > 0 {
+			kept := make(map[string]any)
+			for _, metaKey := range []string{"_ingest", "_index", "_id", "_version", "_routing"} {
+				if mv, ok := doc[metaKey]; ok {
+					kept[metaKey] = mv
+				}
+			}
+			for _, kp := range fieldsToKeep {
+				if val, exists := getIngestPath(doc, kp); exists {
+					setIngestPath(kept, kp, val)
+				} else if isExplicitIgnoreMissingFalse(specMap) {
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", kp)
+				}
+			}
+			for k := range doc {
+				delete(doc, k)
+			}
+			for k, v := range kept {
+				doc[k] = v
+			}
+			mutated = true
+		}
+		for _, f := range fieldsToRemove {
+			if _, exists := getIngestPath(doc, f); !exists {
+				if isExplicitIgnoreMissingFalse(specMap) {
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", f)
+				}
+			} else {
+				deleteIngestPath(doc, f)
+				mutated = true
 			}
 		}
 	case "lowercase":
@@ -1931,7 +1976,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			if tf, _ := specMap["target_field"].(string); tf != "" {
 				target = tf
 			}
-			if val, ok := getIngestPath(doc, field); ok {
+			if val, ok := getIngestPath(doc, field); ok && val != nil {
 				switch v := val.(type) {
 				case string:
 					setIngestPath(doc, target, strings.ToLower(v))
@@ -1942,11 +1987,13 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						if s, ok := el.(string); ok {
 							out[i] = strings.ToLower(s)
 						} else {
-							out[i] = el
+							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
 						}
 					}
 					setIngestPath(doc, target, out)
 					mutated = true
+				default:
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 				}
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
@@ -1958,7 +2005,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			if tf, _ := specMap["target_field"].(string); tf != "" {
 				target = tf
 			}
-			if val, ok := getIngestPath(doc, field); ok {
+			if val, ok := getIngestPath(doc, field); ok && val != nil {
 				switch v := val.(type) {
 				case string:
 					setIngestPath(doc, target, strings.ToUpper(v))
@@ -1969,11 +2016,13 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						if s, ok := el.(string); ok {
 							out[i] = strings.ToUpper(s)
 						} else {
-							out[i] = el
+							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
 						}
 					}
 					setIngestPath(doc, target, out)
 					mutated = true
+				default:
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 				}
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
@@ -1985,7 +2034,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			if tf, _ := specMap["target_field"].(string); tf != "" {
 				target = tf
 			}
-			if val, ok := getIngestPath(doc, field); ok {
+			if val, ok := getIngestPath(doc, field); ok && val != nil {
 				switch v := val.(type) {
 				case string:
 					setIngestPath(doc, target, strings.TrimSpace(v))
@@ -1996,11 +2045,13 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						if s, ok := el.(string); ok {
 							out[i] = strings.TrimSpace(s)
 						} else {
-							out[i] = el
+							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
 						}
 					}
 					setIngestPath(doc, target, out)
 					mutated = true
+				default:
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 				}
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
@@ -2015,7 +2066,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 		preserveTrailing, _ := specMap["preserve_trailing"].(bool)
 		if field != "" && sep != "" {
-			if val, ok := getIngestPath(doc, field); ok {
+			if val, ok := getIngestPath(doc, field); ok && val != nil {
 				if strVal, ok := val.(string); ok {
 					var parts []string
 					if sep == "|" || sep == "." {
@@ -2036,6 +2087,8 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					}
 					setIngestPath(doc, target, out)
 					mutated = true
+				} else {
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 				}
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
@@ -2049,7 +2102,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			target = tf
 		}
 		if field != "" {
-			if val, ok := getIngestPath(doc, field); ok {
+			if val, ok := getIngestPath(doc, field); ok && val != nil {
 				if arr, ok := val.([]any); ok {
 					strs := make([]string, len(arr))
 					for i, el := range arr {
@@ -2057,6 +2110,8 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					}
 					setIngestPath(doc, target, strings.Join(strs, sep))
 					mutated = true
+				} else {
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not an array", field)
 				}
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
@@ -2111,7 +2166,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		if field != "" && convType != "" {
 			val, exists := getIngestPath(doc, field)
 			if !exists || val == nil {
-				if im, hasIM := specMap["ignore_missing"].(bool); hasIM && !im && !exists {
+				if isExplicitIgnoreMissingFalse(specMap) {
 					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing and cannot be converted to [%s]", field, convType)
 				}
 			} else if arr, isArr := val.([]any); isArr {
@@ -2147,7 +2202,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			if err != nil {
 				return false, false, procType, procTag, specMap, err
 			}
-			if val, exists := getIngestPath(doc, field); exists {
+			if val, exists := getIngestPath(doc, field); exists && val != nil {
 				if strVal, ok := val.(string); ok {
 					setIngestPath(doc, target, re.ReplaceAllString(strVal, repl))
 					mutated = true
@@ -2157,11 +2212,13 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						if sElem, ok := elem.(string); ok {
 							outArr[idx] = re.ReplaceAllString(sElem, repl)
 						} else {
-							outArr[idx] = elem
+							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
 						}
 					}
 					setIngestPath(doc, target, outArr)
 					mutated = true
+				} else {
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 				}
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
@@ -2174,26 +2231,56 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			target = tf
 		}
 		addToRoot, _ := specMap["add_to_root"].(bool)
+		conflictStrategy, _ := specMap["add_to_root_conflict_strategy"].(string)
 		if field != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				if strVal, ok := val.(string); ok {
-					dec := json.NewDecoder(strings.NewReader(strVal))
+				switch v := val.(type) {
+				case string:
+					dec := json.NewDecoder(strings.NewReader(v))
 					dec.UseNumber()
 					var parsed any
 					if err := dec.Decode(&parsed); err != nil {
 						return false, false, procType, procTag, specMap, err
 					}
 					if addToRoot {
-						if m, ok := parsed.(map[string]any); ok {
-							for k, v := range m {
-								doc[k] = v
-							}
-							mutated = true
+						m, ok := parsed.(map[string]any)
+						if !ok {
+							return false, false, procType, procTag, specMap, fmt.Errorf("json must be an object when [add_to_root] is true")
 						}
+						if strings.EqualFold(strings.TrimSpace(conflictStrategy), "merge") {
+							deepMergeIngestMap(doc, m)
+						} else {
+							for k, mv := range m {
+								doc[k] = mv
+							}
+						}
+						mutated = true
 					} else {
 						setIngestPath(doc, target, parsed)
 						mutated = true
 					}
+				case []any:
+					if addToRoot {
+						return false, false, procType, procTag, specMap, fmt.Errorf("cannot use [add_to_root] when field [%s] is an array", field)
+					}
+					outArr := make([]any, len(v))
+					for i, elem := range v {
+						sElem, ok := elem.(string)
+						if !ok {
+							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
+						}
+						dec := json.NewDecoder(strings.NewReader(sElem))
+						dec.UseNumber()
+						var parsed any
+						if err := dec.Decode(&parsed); err != nil {
+							return false, false, procType, procTag, specMap, err
+						}
+						outArr[i] = parsed
+					}
+					setIngestPath(doc, target, outArr)
+					mutated = true
+				default:
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 				}
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
@@ -2222,7 +2309,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			}
 		}
 		if field != "" && fieldSplit != "" && valueSplit != "" {
-			if val, exists := getIngestPath(doc, field); exists {
+			if val, exists := getIngestPath(doc, field); exists && val != nil {
 				if strVal, ok := val.(string); ok {
 					if stripBrackets && len(strVal) >= 2 {
 						first, last := strVal[0], strVal[len(strVal)-1]
@@ -2283,7 +2370,16 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						if trimVal != "" {
 							v = strings.Trim(v, trimVal)
 						}
-						kvMap[prefix+k] = v
+						fullKey := prefix + k
+						if prev, hasPrev := kvMap[fullKey]; hasPrev {
+							if prevArr, isArr := prev.([]any); isArr {
+								kvMap[fullKey] = append(prevArr, v)
+							} else {
+								kvMap[fullKey] = []any{prev, v}
+							}
+						} else {
+							kvMap[fullKey] = v
+						}
 					}
 					if targetField != "" {
 						if existing, ok := getIngestPath(doc, targetField); !ok || existing == nil {
@@ -2298,6 +2394,8 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						}
 					}
 					mutated = true
+				} else {
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 				}
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
@@ -2348,7 +2446,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			target = tf
 		}
 		if field != "" {
-			if val, exists := getIngestPath(doc, field); exists {
+			if val, exists := getIngestPath(doc, field); exists && val != nil {
 				switch v := val.(type) {
 				case string:
 					decoded, err := url.QueryUnescape(v)
@@ -2367,11 +2465,13 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 							}
 							outArr[idx] = decoded
 						} else {
-							outArr[idx] = el
+							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
 						}
 					}
 					setIngestPath(doc, target, outArr)
 					mutated = true
+				default:
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 				}
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
@@ -2415,7 +2515,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			target = tf
 		}
 		if field != "" {
-			if val, exists := getIngestPath(doc, field); exists {
+			if val, exists := getIngestPath(doc, field); exists && val != nil {
 				switch v := val.(type) {
 				case string:
 					setIngestPath(doc, target, reHTMLTags.ReplaceAllString(v, ""))
@@ -2426,11 +2526,13 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						if sEl, ok := el.(string); ok {
 							outArr[idx] = reHTMLTags.ReplaceAllString(sEl, "")
 						} else {
-							outArr[idx] = el
+							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
 						}
 					}
 					setIngestPath(doc, target, outArr)
 					mutated = true
+				default:
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 				}
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
@@ -3016,7 +3118,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			subProcs = sps
 		}
 		if field != "" && len(subProcs) > 0 {
-			if val, exists := getIngestPath(doc, field); exists {
+			if val, exists := getIngestPath(doc, field); exists && val != nil {
 				if arr, ok := val.([]any); ok {
 					var prevVal any
 					var hadPrev bool
@@ -3061,6 +3163,8 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					restoreIngestVal()
 					setIngestPath(doc, field, outArr)
 					mutated = true
+				} else {
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not an array", field)
 				}
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
@@ -3874,9 +3978,10 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 			Source *esast.SourceFilter `json:"_source,omitempty"`
 		} `json:"source"`
 		Dest struct {
-			Index    string `json:"index"`
-			Pipeline string `json:"pipeline,omitempty"`
-			OpType   string `json:"op_type,omitempty"`
+			Index       string `json:"index"`
+			Pipeline    string `json:"pipeline,omitempty"`
+			OpType      string `json:"op_type,omitempty"`
+			VersionType string `json:"version_type,omitempty"`
 		} `json:"dest"`
 		Script *painless.ScriptSpec `json:"script,omitempty"`
 	}
@@ -3889,6 +3994,11 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Dest.Pipeline == "" {
 		body.Dest.Pipeline = r.URL.Query().Get("pipeline")
+	}
+	destVerType := strings.ToLower(strings.TrimSpace(body.Dest.VersionType))
+	if destVerType != "" && destVerType != "internal" && destVerType != "external" && destVerType != "external_gt" && destVerType != "external_gte" {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("unknown version_type [%s] for reindex dest", body.Dest.VersionType))
+		return
 	}
 
 	var srcPattern string
@@ -4034,6 +4144,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				docID := h.ID
 				docDestIdx := destIndex
 				docSource := h.Source
+				docSrcVer := h.Version
 				if body.Source.Source != nil {
 					filtered := filterSourceJSON(docSource, body.Source.Source)
 					if filtered == nil {
@@ -4054,6 +4165,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 						}
 						tmpMap["__reindex_id"] = docID
 						tmpMap["__reindex_index"] = docDestIdx
+						tmpMap["__reindex_version"] = docSrcVer
 						if b, err := json.Marshal(tmpMap); err == nil {
 							scriptInput = b
 						}
@@ -4084,15 +4196,23 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 									docDestIdx = resolvedIdx
 								}
 							}
+							if v, ok := tmpMap["__reindex_version"]; ok {
+								if v == nil {
+									docSrcVer = 0
+								} else if parsedVer, perr := strconv.ParseInt(fmt.Sprintf("%v", v), 10, 64); perr == nil {
+									docSrcVer = parsedVer
+								}
+							}
 							delete(tmpMap, "__reindex_id")
 							delete(tmpMap, "__reindex_index")
+							delete(tmpMap, "__reindex_version")
 							if b, err := json.Marshal(tmpMap); err == nil {
 								mutated = b
 							}
 						}
 					}
 					if opRes == "deleted" {
-						prepared = append(prepared, preparedDoc{id: docID, destIndex: docDestIdx, srcVer: h.Version, isDelete: true})
+						prepared = append(prepared, preparedDoc{id: docID, destIndex: docDestIdx, srcVer: docSrcVer, isDelete: true})
 						candIDsByIdx[docDestIdx] = append(candIDsByIdx[docDestIdx], docID)
 						if _, hasKey := sampleDocsByIdx[docDestIdx]; !hasKey {
 							sampleDocsByIdx[docDestIdx] = nil
@@ -4125,7 +4245,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "document does not match destination alias filter")
 					return
 				}
-				prepared = append(prepared, preparedDoc{id: docID, destIndex: docDestIdx, source: docSource, srcVer: h.Version})
+				prepared = append(prepared, preparedDoc{id: docID, destIndex: docDestIdx, source: docSource, srcVer: docSrcVer})
 				candIDsByIdx[docDestIdx] = append(candIDsByIdx[docDestIdx], docID)
 				sampleDocsByIdx[docDestIdx] = append(sampleDocsByIdx[docDestIdx], docSource)
 			}
@@ -4191,7 +4311,16 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				if exists {
-					conflict := isCreate || (pd.destIndex == destIndex && destAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), destIndex, pd.id, existing.Source, destAliasFilter))
+					extConflict := false
+					if pd.srcVer > 0 {
+						switch destVerType {
+						case "external", "external_gt":
+							extConflict = existing.Version >= pd.srcVer
+						case "external_gte":
+							extConflict = existing.Version > pd.srcVer
+						}
+					}
+					conflict := isCreate || extConflict || (pd.destIndex == destIndex && destAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), destIndex, pd.id, existing.Source, destAliasFilter))
 					if conflict {
 						if proceedOnConflict {
 							versionConflicts++
@@ -4205,7 +4334,12 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 						minVer = existing.Version + 1
 					}
 				}
-				nextVer := s.allocVersion(minVer)
+				var nextVer int64
+				if (destVerType == "external" || destVerType == "external_gt" || destVerType == "external_gte") && pd.srcVer > 0 {
+					nextVer = pd.srcVer
+				} else {
+					nextVer = s.allocVersion(minVer)
+				}
 				shredded, err := schema.ShredDocument(sch, pd.id, nextVer, false, pd.source)
 				if err != nil {
 					writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
@@ -4274,6 +4408,9 @@ func rewriteReindexMetaScript(src string) (string, bool) {
 	}
 	for _, pat := range []string{"ctx?._index", "ctx._index", "ctx?.['_index']", "ctx['_index']", `ctx?.["_index"]`, `ctx["_index"]`} {
 		rewritten = strings.ReplaceAll(rewritten, pat, "ctx._source.__reindex_index")
+	}
+	for _, pat := range []string{"ctx?._version", "ctx._version", "ctx?.['_version']", "ctx['_version']", `ctx?.["_version"]`, `ctx["_version"]`} {
+		rewritten = strings.ReplaceAll(rewritten, pat, "ctx._source.__reindex_version")
 	}
 	return rewritten, rewritten != src
 }

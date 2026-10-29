@@ -234,7 +234,7 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 			saPred = t.compileSearchAfterPredicate(effSorts, req.SearchAfter, saScoreExpr)
 		}
 		if req.Collapse != nil && req.Collapse.Field != "" {
-			bCollapse := t.Schema.ResolveField(req.Collapse.Field)
+			bCollapse := t.Schema.ResolveEffectiveField(req.Collapse.Field, true)
 			collapseCol := t.sqlColumnRef(req.Collapse.Field, true, nil)
 			if bCollapse.Kind == schema.StoragePromotedArray || bCollapse.Kind == schema.StorageNestedSubfield {
 				collapseCol = fmt.Sprintf("element_at(`%s`, 1)", bCollapse.EffectiveArrayColumn(true))
@@ -613,6 +613,9 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		keys := sortedMapKeys(q.MatchPhrase)
 		if len(keys) == 1 {
 			pe := q.MatchPhrase[keys[0]]
+			if strings.TrimSpace(pe.Query) == "" && strings.EqualFold(pe.ZeroTermsQuery, "all") {
+				return CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: fmt.Sprintf("%.4f", pe.Boost)}
+			}
 			return t.compileMatchPhraseField(keys[0], pe.Query, pe.Slop, pe.Boost, false, scoring, nctx)
 		}
 		var subs []esast.Query
@@ -624,6 +627,9 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		keys := sortedMapKeys(q.MatchPhrasePrefix)
 		if len(keys) == 1 {
 			pe := q.MatchPhrasePrefix[keys[0]]
+			if strings.TrimSpace(pe.Query) == "" && strings.EqualFold(pe.ZeroTermsQuery, "all") {
+				return CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: fmt.Sprintf("%.4f", pe.Boost)}
+			}
 			return t.compileMatchPhraseField(keys[0], pe.Query, pe.Slop, pe.Boost, true, scoring, nctx)
 		}
 		var subs []esast.Query
@@ -635,6 +641,9 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		keys := sortedMapKeys(q.MatchBoolPrefix)
 		if len(keys) == 1 {
 			pe := q.MatchBoolPrefix[keys[0]]
+			if strings.TrimSpace(pe.Query) == "" && strings.EqualFold(pe.ZeroTermsQuery, "all") {
+				return CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: fmt.Sprintf("%.4f", pe.Boost)}
+			}
 			tokens := strings.Fields(strings.TrimSpace(pe.Query))
 			if len(tokens) == 1 && pe.MinimumShouldMatch != nil && parseMinShouldMatch(pe.MinimumShouldMatch, 1, true) > 1 {
 				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
@@ -998,6 +1007,9 @@ func (t *Transpiler) compileBool(b *esast.BoolQuery, scoring bool, nctx *nestedC
 		shouldUsesFT := false
 		for i := range b.Should {
 			c := t.CompileQuery(&b.Should[i], scoring, nctx)
+			if c.WhereSQL == "FALSE" && len(b.Should) > 1 {
+				continue
+			}
 			disjuncts = append(disjuncts, fmt.Sprintf("(%s)", c.WhereSQL))
 			safeDisjuncts = append(safeDisjuncts, fmt.Sprintf("(%s)", c.EffectiveSafeWhere()))
 			if scoring {
@@ -1006,9 +1018,11 @@ func (t *Transpiler) compileBool(b *esast.BoolQuery, scoring bool, nctx *nestedC
 			shouldUsesFT = shouldUsesFT || c.UsesFulltextMatch
 		}
 		minShould = parseMinShouldMatch(b.MinimumShouldMatch, len(b.Should), len(b.Must) == 0 && len(b.Filter) == 0)
-		if minShould > len(disjuncts) {
-			conjuncts = append(conjuncts, "FALSE")
-			safeConjuncts = append(safeConjuncts, "FALSE")
+		if len(disjuncts) == 0 || minShould > len(disjuncts) {
+			if minShould > 0 {
+				conjuncts = append(conjuncts, "FALSE")
+				safeConjuncts = append(safeConjuncts, "FALSE")
+			}
 		} else if minShould == 1 {
 			conjuncts = append(conjuncts, fmt.Sprintf("(%s)", strings.Join(disjuncts, " OR ")))
 			safeConjuncts = append(safeConjuncts, fmt.Sprintf("(%s)", strings.Join(safeDisjuncts, " OR ")))
@@ -1028,6 +1042,19 @@ func (t *Transpiler) compileBool(b *esast.BoolQuery, scoring bool, nctx *nestedC
 				safeConjuncts = append(safeConjuncts, msmCond)
 				usesFT = usesFT || shouldUsesFT
 			}
+		}
+	}
+
+	if len(conjuncts) > 0 && len(b.MustNot) == 0 {
+		allFalse := true
+		for _, cj := range conjuncts {
+			if cj != "FALSE" && cj != "(FALSE)" {
+				allFalse = false
+				break
+			}
+		}
+		if allFalse {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 		}
 	}
 
@@ -1339,15 +1366,16 @@ func (t *Transpiler) compileMultiMatch(mm *esast.MultiMatchQuery, scoring bool, 
 		if len(tokens) == 1 && mm.MinimumShouldMatch != nil && parseMinShouldMatch(mm.MinimumShouldMatch, 1, true) > 1 {
 			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 		}
-		if len(tokens) > 1 && (strings.EqualFold(op, "and") || mm.MinimumShouldMatch != nil) {
+		if len(tokens) > 1 {
 			var tokenQueries []esast.Query
 			for _, tok := range tokens {
 				tokenQueries = append(tokenQueries, esast.Query{
 					MultiMatch: &esast.MultiMatchQuery{
-						Query:    tok,
-						Fields:   fields,
-						Type:     "best_fields",
-						Operator: "or",
+						Query:      tok,
+						Fields:     fields,
+						Type:       "best_fields",
+						Operator:   "or",
+						TieBreaker: mm.TieBreaker,
 					},
 				})
 			}
@@ -1357,9 +1385,13 @@ func (t *Transpiler) compileMultiMatch(mm *esast.MultiMatchQuery, scoring bool, 
 					Boost: mm.Boost,
 				}, scoring, nctx)
 			}
+			msm := mm.MinimumShouldMatch
+			if msm == nil {
+				msm = 1
+			}
 			return t.compileBool(&esast.BoolQuery{
 				Should:             tokenQueries,
-				MinimumShouldMatch: mm.MinimumShouldMatch,
+				MinimumShouldMatch: msm,
 				Boost:              mm.Boost,
 			}, scoring, nctx)
 		}
@@ -1425,7 +1457,7 @@ func (t *Transpiler) compileMultiMatch(mm *esast.MultiMatchQuery, scoring bool, 
 	}
 	scoreExpr := "1.0"
 	if scoring && len(scores) > 0 {
-		if (mmType == "" || mmType == "best_fields" || mmType == "bool_prefix" || mmType == "phrase" || mmType == "phrase_prefix") && len(scores) > 1 {
+		if (mmType == "" || mmType == "best_fields" || mmType == "bool_prefix" || mmType == "phrase" || mmType == "phrase_prefix" || mmType == "cross_fields") && len(scores) > 1 {
 			maxExpr := fmt.Sprintf("GREATEST(%s)", strings.Join(scores, ", "))
 			if mm.TieBreaker != nil && *mm.TieBreaker > 0 {
 				sumExpr := fmt.Sprintf("(%s)", strings.Join(scores, " + "))
@@ -1519,7 +1551,7 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 		var parts []string
 		for _, field := range sortedMapKeys(q.Term) {
 			entry := q.Term[field]
-			b := t.Schema.ResolveField(field)
+			b := t.Schema.ResolveEffectiveField(field, true)
 			if b.Kind == schema.StorageNestedSubfield && b.NestedPath == nestedPath && b.PrefilterArrayCol != "" {
 				effLower := b.EffectiveLowercase(true)
 				arrCol := b.EffectiveArrayColumn(true)
@@ -1556,7 +1588,7 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 		var parts []string
 		for _, field := range sortedMapKeys(q.Terms.Fields) {
 			vals := q.Terms.Fields[field]
-			b := t.Schema.ResolveField(field)
+			b := t.Schema.ResolveEffectiveField(field, true)
 			if b.Kind == schema.StorageNestedSubfield && b.NestedPath == nestedPath && b.PrefilterArrayCol != "" && len(vals) > 0 {
 				effLower := b.EffectiveLowercase(true)
 				arrCol := b.EffectiveArrayColumn(true)
@@ -2666,8 +2698,13 @@ func (t *Transpiler) appendAggBranches(
 			}
 			sort.Strings(subNames)
 			nestedRelJSON := func(f string) string {
-				relKey := strings.TrimSuffix(strings.TrimPrefix(f, spec.Nested.Path+"."), ".keyword")
-				if b := t.Schema.ResolveField(f); len(b.RelativeJSONPath) > 0 {
+				b := t.Schema.ResolveEffectiveField(f, true)
+				effF := f
+				if b.AliasTarget != "" {
+					effF = b.AliasTarget
+				}
+				relKey := strings.TrimSuffix(strings.TrimPrefix(effF, spec.Nested.Path+"."), ".keyword")
+				if len(b.RelativeJSONPath) > 0 {
 					relKey = strings.Join(b.RelativeJSONPath, ".")
 				}
 				return quoteStr("$." + relKey)
@@ -3789,7 +3826,7 @@ func (t *Transpiler) appendAggBranches(
 					effRField = docF
 				}
 			}
-			b := t.Schema.ResolveField(effRField)
+			b := t.Schema.ResolveEffectiveField(effRField, true)
 			arrCol := b.EffectiveArrayColumn(true)
 			isArray := b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield
 			for _, rng := range rngSpec.Ranges {
@@ -3966,7 +4003,7 @@ func (t *Transpiler) appendAggBranches(
 			compFrom := "`base_matched`"
 			compExplodeIdx := 0
 			resolveCompSourceCol := func(field string, isNumeric bool, hasMissing bool) string {
-				b := t.Schema.ResolveField(field)
+				b := t.Schema.ResolveEffectiveField(field, true)
 				if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
 					arrCol := b.EffectiveArrayColumn(true)
 					compExplodeIdx++
@@ -3999,7 +4036,7 @@ func (t *Transpiler) appendAggBranches(
 								effField = docF
 							}
 						}
-						b := t.Schema.ResolveField(effField)
+						b := t.Schema.ResolveEffectiveField(effField, true)
 						effDT := effectiveDorisScalarType(b)
 						if effDT == schema.DorisBigInt || effDT == schema.DorisInt || effDT == schema.DorisDouble || b.ESType == "ip" || srcSpec.Terms.Order != nil || srcSpec.Terms.Script != nil {
 							hasHistogramSrc = true
@@ -4041,7 +4078,7 @@ func (t *Transpiler) appendAggBranches(
 								effDHField = docF
 							}
 						}
-						dhB := t.Schema.ResolveField(effDHField)
+						dhB := t.Schema.ResolveEffectiveField(effDHField, true)
 						col := resolveCompSourceCol(effDHField, true, hasMiss)
 						if srcSpec.DateHistogram.Script != nil {
 							overrideExpr := ""
@@ -4148,18 +4185,31 @@ func (t *Transpiler) appendAggBranches(
 				if extraWhere != "" {
 					wCond = fmt.Sprintf("(%s) AND (%s)", extraWhere, wCond)
 				}
+				compCountExpr := "COUNT(*)"
+				if compExplodeIdx > 0 {
+					compCountExpr = "COUNT(DISTINCT `_id`)"
+				}
 				*subIdx++
 				*branches = append(*branches, fmt.Sprintf(
 					"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
-						"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+						"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(%s AS DOUBLE) AS `_doc_count` "+
 						"FROM %s WHERE %s "+
 						"GROUP BY `_bucket_key` ORDER BY `_bucket_key` ASC LIMIT %d"+
 						") `_agg_sub_%d`",
-					quoteStr(fullAggName), bucketKeyExpr, compFrom, wCond, size, *subIdx,
+					quoteStr(fullAggName), bucketKeyExpr, compCountExpr, compFrom, wCond, size, *subIdx,
 				))
 				if subAggs := spec.SubAggs(); len(subAggs) > 0 {
-					t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, bucketKeyExpr,
-						compFrom, wCond, subAggs)
+					subBucketExpr := bucketKeyExpr
+					subFromClause := compFrom
+					subWhereCond := wCond
+					if compExplodeIdx > 0 {
+						dedupIdx := *subIdx
+						subFromClause = fmt.Sprintf("`base_matched` INNER JOIN (SELECT DISTINCT `_id` AS `_rn_id_%d`, %s AS `_rn_bkey_%d` FROM %s WHERE %s) `_rn_dedup_%d` ON `base_matched`.`_id` = `_rn_dedup_%d`.`_rn_id_%d`", dedupIdx, bucketKeyExpr, dedupIdx, compFrom, wCond, dedupIdx, dedupIdx, dedupIdx)
+						subBucketExpr = fmt.Sprintf("`_rn_bkey_%d`", dedupIdx)
+						subWhereCond = "1=1"
+					}
+					t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, subBucketExpr,
+						subFromClause, subWhereCond, subAggs)
 				}
 			}
 		}
@@ -4278,7 +4328,11 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 	sort.Strings(subNames)
 
 	isExplodedNested := func(b schema.FieldBinding, field string) bool {
-		return nctx != nil && ((b.Kind == schema.StorageNestedSubfield && b.NestedPath == nctx.nestedPath) || strings.HasPrefix(field, nctx.nestedPath+"."))
+		effField := field
+		if b.AliasTarget != "" {
+			effField = b.AliasTarget
+		}
+		return nctx != nil && ((b.Kind == schema.StorageNestedSubfield && b.NestedPath == nctx.nestedPath) || strings.HasPrefix(effField, nctx.nestedPath+"."))
 	}
 
 	explodeDepth := strings.Count(fromClause, "LATERAL VIEW EXPLODE")
@@ -5127,7 +5181,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					effRField = docF
 				}
 			}
-			b := t.Schema.ResolveField(effRField)
+			b := t.Schema.ResolveEffectiveField(effRField, true)
 			arrCol := b.EffectiveArrayColumn(true)
 			isArray := !isExplodedNested(b, effRField) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield)
 			for _, rng := range rngSpec.Ranges {
@@ -5686,11 +5740,57 @@ func extractSimpleDocFieldFromScript(script any) (string, bool) {
 	for hasMatchingThresholdParens(s) {
 		s = strings.TrimSpace(s[1 : len(s)-1])
 	}
-	field, tail, ok := parseDocFieldAccess(s)
-	if !ok || (tail != "" && tail != ".value") {
+	if field, tail, ok := parseDocFieldAccess(s); ok && (tail == "" || tail == ".value") {
+		return field, true
+	}
+	if strings.Contains(s, ".size()") || strings.Contains(s, ".length") {
 		return "", false
 	}
-	return field, true
+	var uniqueField string
+	for i := 0; i < len(s); i++ {
+		if strings.HasPrefix(s[i:], "doc[") {
+			rest := s[i:]
+			for _, quote := range []string{"'", `"`} {
+				prefix := "doc[" + quote
+				suffix := quote + "]"
+				if strings.HasPrefix(rest, prefix) {
+					afterPrefix := rest[len(prefix):]
+					if end := strings.Index(afterPrefix, suffix); end > 0 {
+						f := afterPrefix[:end]
+						if uniqueField == "" {
+							uniqueField = f
+						} else if uniqueField != f {
+							return "", false
+						}
+						i += len(prefix) + end + len(suffix) - 1
+						break
+					}
+				}
+			}
+		}
+	}
+	if uniqueField != "" {
+		return uniqueField, true
+	}
+	return "", false
+}
+
+func (t *Transpiler) sqlStringScalarColumnRef(field string, preferKeyword bool, nctx *nestedCtx) string {
+	b := t.Schema.ResolveEffectiveField(field, preferKeyword)
+	effField := field
+	if b.AliasTarget != "" {
+		effField = b.AliasTarget
+	}
+	if nctx != nil && ((b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath) || strings.HasPrefix(effField, nctx.nestedPath+".")) {
+		return t.sqlColumnRef(field, preferKeyword, nctx)
+	}
+	if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
+		arrCol := b.EffectiveArrayColumn(preferKeyword)
+		if arrCol != "" {
+			return fmt.Sprintf("element_at(`%s`, 1)", arrCol)
+		}
+	}
+	return t.sqlColumnRef(field, preferKeyword, nctx)
 }
 
 func (t *Transpiler) compilePolymorphicScriptExpr(script any, defaultField string, fieldOverrideExpr string, nctx *nestedCtx) (string, bool) {
@@ -5706,13 +5806,13 @@ func (t *Transpiler) compilePolymorphicScriptExpr(script any, defaultField strin
 		if fieldOverrideExpr != "" {
 			return fieldOverrideExpr, true
 		}
-		return t.sqlColumnRef(defaultField, true, nctx), true
+		return t.sqlStringScalarColumnRef(defaultField, true, nctx), true
 	}
 	if field, tail, ok := parseDocFieldAccess(sClean); ok && (tail == "" || tail == ".value") {
 		if fieldOverrideExpr != "" && defaultField != "" && field == defaultField {
 			return fieldOverrideExpr, true
 		}
-		return t.sqlColumnRef(field, true, nctx), true
+		return t.sqlStringScalarColumnRef(field, true, nctx), true
 	}
 	if strExpr, isStr, ok := t.parseStringScriptExpr(sClean, params, defaultField, fieldOverrideExpr, nctx, 0); ok && isStr {
 		return strExpr, true
@@ -5805,22 +5905,22 @@ func (t *Transpiler) parseStringScriptExpr(s string, params map[string]any, defa
 		}
 	}
 	if (s == "_value" || s == "params._value") && defaultField != "" {
-		b := t.Schema.ResolveField(defaultField)
+		b := t.Schema.ResolveEffectiveField(defaultField, true)
 		effDT := effectiveDorisScalarType(b)
 		isStr := effDT == schema.DorisString || effDT == schema.DorisVarchar
 		if fieldOverrideExpr != "" {
 			return fieldOverrideExpr, isStr, true
 		}
-		return t.sqlColumnRef(defaultField, true, nctx), isStr, true
+		return t.sqlStringScalarColumnRef(defaultField, true, nctx), isStr, true
 	}
 	if field, tail, ok := parseDocFieldAccess(s); ok && (tail == "" || tail == ".value") {
-		b := t.Schema.ResolveField(field)
+		b := t.Schema.ResolveEffectiveField(field, true)
 		effDT := effectiveDorisScalarType(b)
 		isStr := effDT == schema.DorisString || effDT == schema.DorisVarchar || b.Kind == schema.StorageDynamicVariant || fieldOverrideExpr == "`_elem`"
 		if fieldOverrideExpr != "" && defaultField != "" && field == defaultField {
 			return fieldOverrideExpr, isStr, true
 		}
-		return t.sqlColumnRef(field, true, nctx), isStr, true
+		return t.sqlStringScalarColumnRef(field, true, nctx), isStr, true
 	}
 	if paramKey, ok := parseScriptParamKey(s); ok {
 		if params != nil {
@@ -5997,7 +6097,7 @@ func (t *Transpiler) parseMetricScriptExpr(s string, params map[string]any, defa
 		if tail != "" && tail != ".value" && tail != ".size()" && tail != ".length" {
 			return "", false
 		}
-		b := t.Schema.ResolveField(field)
+		b := t.Schema.ResolveEffectiveField(field, true)
 		if tail == ".size()" || tail == ".length" {
 			if b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath)) {
 				colName := b.EffectiveArrayColumn(true)
@@ -6286,7 +6386,7 @@ func (t *Transpiler) parseSafeThresholdExpr(s string, params map[string]any, num
 		if tail != "" && tail != ".value" && tail != ".size()" && tail != ".length" {
 			return "", false
 		}
-		b := t.Schema.ResolveField(field)
+		b := t.Schema.ResolveEffectiveField(field, true)
 		if (tail == ".size()" || tail == ".length") && (b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && nctx == nil)) {
 			colName := b.EffectiveArrayColumn(true)
 			if colName != "" {
@@ -6764,7 +6864,11 @@ func (t *Transpiler) sqlSortColumnRefWithType(field string, sampleVal any, desc 
 				corrCol = "n__" + schema.SanitizeDorisIdentifier(nestedPath)
 			}
 			fCompiled := t.CompileQuery(nested.Filter, false, &nestedCtx{nestedPath: nestedPath, elemVar: "_el"})
-			relPath := "$." + strings.TrimSuffix(strings.TrimPrefix(field, nestedPath+"."), ".keyword")
+			effField := field
+			if b.AliasTarget != "" {
+				effField = b.AliasTarget
+			}
+			relPath := "$." + strings.TrimSuffix(strings.TrimPrefix(effField, nestedPath+"."), ".keyword")
 			if len(b.RelativeJSONPath) > 0 {
 				relPath = "$." + strings.Join(b.RelativeJSONPath, ".")
 			}
@@ -6789,7 +6893,7 @@ func (t *Transpiler) sqlColumnRef(field string, preferKeyword bool, nctx *nested
 }
 
 func (t *Transpiler) sqlNumericColumnRef(field string, nctx *nestedCtx) string {
-	b := t.Schema.ResolveField(field)
+	b := t.Schema.ResolveEffectiveField(field, true)
 	switch b.Kind {
 	case schema.StoragePromotedScalar:
 		if b.DorisType == schema.DorisBigInt || b.DorisType == schema.DorisInt || b.DorisType == schema.DorisDouble {
@@ -6848,9 +6952,13 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 		castType = "BOOLEAN"
 	}
 
-	b := t.Schema.ResolveField(field)
-	if nctx != nil && ((b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath) || strings.HasPrefix(field, nctx.nestedPath+".")) {
-		relPath := "$." + strings.TrimSuffix(strings.TrimPrefix(field, nctx.nestedPath+"."), ".keyword")
+	b := t.Schema.ResolveEffectiveField(field, preferKeyword)
+	effField := field
+	if b.AliasTarget != "" {
+		effField = b.AliasTarget
+	}
+	if nctx != nil && ((b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath) || strings.HasPrefix(effField, nctx.nestedPath+".")) {
+		relPath := "$." + strings.TrimSuffix(strings.TrimPrefix(effField, nctx.nestedPath+"."), ".keyword")
 		if len(b.RelativeJSONPath) > 0 {
 			relPath = "$." + strings.Join(b.RelativeJSONPath, ".")
 		}

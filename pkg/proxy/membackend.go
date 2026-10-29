@@ -32,6 +32,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
 )
@@ -459,7 +460,7 @@ var (
 	reAggSubTerms            = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (CONCAT\\(.+?\\)) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC")
 	reAggTopHits             = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, `_id` AS `_bucket_key`, CAST\\(1 AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+?))? ORDER BY (.+?) LIMIT (\\d+)")
 	reAggSubTopHits          = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CONCAT\\((.+?), '\\\\x1f', `_id`\\) AS `_bucket_key`, CAST\\(ROW_NUMBER\\(\\) OVER \\(PARTITION BY .+? ORDER BY (.+?)\\) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?)\\) `_agg_sub_\\d+` WHERE `_doc_count` <= (\\d+)")
-	reAggComposite           = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM (.+?)(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_bucket_key` ASC LIMIT (\\d+)")
+	reAggComposite           = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+?)(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_bucket_key` ASC LIMIT (\\d+)")
 )
 
 func computePopStdDev(nums []float64) float64 {
@@ -1241,9 +1242,18 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		limit, _ := strconv.Atoi(limitStr)
 		expanded := expandFromClauseRows(baseRows, fromClause, whereClause)
 		counts := make(map[string]int64)
+		seenDocBucket := make(map[string]bool)
+		isDistinctDoc := strings.Contains(branch, "COUNT(DISTINCT `_id`)")
 		for _, row := range expanded {
 			for _, bKey := range evalBucketKeyExprs(row, bucketKeyExpr) {
 				if bKey != "" {
+					if isDistinctDoc {
+						dk := fmt.Sprintf("%v\x00%s", row["_id"], bKey)
+						if seenDocBucket[dk] {
+							continue
+						}
+						seenDocBucket[dk] = true
+					}
 					counts[bKey]++
 				}
 			}
@@ -1538,10 +1548,12 @@ func parseLeadingDedupJoin(fromClause string) (innerBucketExpr, bkeyAlias, inner
 		}
 	}
 	if wherePos < 0 {
-		return "", "", "", "", "", false
+		innerFrom = strings.TrimSpace(fromAndWhere)
+		innerWhere = ""
+	} else {
+		innerFrom = strings.TrimSpace(fromAndWhere[:wherePos])
+		innerWhere = strings.TrimSpace(fromAndWhere[wherePos+7:])
 	}
-	innerFrom = strings.TrimSpace(fromAndWhere[:wherePos])
-	innerWhere = strings.TrimSpace(fromAndWhere[wherePos+7:])
 	return innerBucketExpr, bkeyAlias, innerFrom, innerWhere, tailFrom, true
 }
 
@@ -1557,7 +1569,7 @@ func expandFromClauseRows(baseRows []map[string]any, fromClause, whereClause str
 		var deduped []map[string]any
 		for _, r := range innerRows {
 			idStr := fmt.Sprintf("%v", r["_id"])
-			bKey := evalBucketKeyExpr(r, innerBucketExpr)
+			bKey := evalCompositeKeyExpr(r, innerBucketExpr)
 			if bKey == "" {
 				continue
 			}
@@ -2244,7 +2256,7 @@ func tokenizeWords(s string) []string {
 	var out []string
 	var cur strings.Builder
 	for _, r := range strings.ToLower(s) {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
 			cur.WriteRune(r)
 		} else if cur.Len() > 0 {
 			out = append(out, cur.String())

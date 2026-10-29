@@ -89,7 +89,7 @@ func (b FieldBinding) EffectiveLowercase(preferKeyword bool) bool {
 	if b.LowercaseNormalizer {
 		return true
 	}
-	if preferKeyword && b.KeywordCompanion != "" && b.KeywordNormalizer {
+	if b.KeywordCompanion != "" && b.KeywordNormalizer && (preferKeyword || b.Kind == StoragePromotedArray || b.Kind == StorageNestedSubfield) {
 		return true
 	}
 	return false
@@ -200,6 +200,9 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 		if tb, ok := s.Fields[target]; ok {
 			if tb.Kind == StoragePromotedScalar && tb.ESType != "text" {
 				tb.Kind = StoragePromotedArray
+				tb.IsMultiValued = true
+				s.Fields[target] = tb
+			} else if tb.Kind == StorageNestedSubfield && tb.ESType != "text" {
 				tb.IsMultiValued = true
 				s.Fields[target] = tb
 			} else if tb.ESType == "text" && tb.KeywordCompanion != "" {

@@ -99,6 +99,11 @@ func ShredDocument(
 		switch b.Kind {
 		case StoragePromotedScalar:
 			val := extractScalarValue(parsedDoc, b.SourceJSONPath)
+			if (b.ESType == "text" || b.ESType == "match_only_text") && b.DorisType == DorisString {
+				if strs := extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer, b.NullValue); len(strs) > 1 {
+					val = strings.Join(strs, " ")
+				}
+			}
 			if val == nil && b.NullValue != nil && hasExplicitNullAtPath(parsedDoc, b.SourceJSONPath) {
 				val = b.NullValue
 			}
@@ -192,17 +197,17 @@ func ShredDocument(
 				srcVals := allSrc[already:]
 				forwardedCount[edgeKey] = len(allSrc)
 				progressed = true
-				copiedRawVals[targetField] = append(copiedRawVals[targetField], srcVals...)
 
 				tb, ok := s.Fields[targetField]
-				if !ok {
-					continue
-				}
-				if tb.AliasTarget != "" {
+				if ok && tb.AliasTarget != "" {
 					if resolvedTB, rOK := s.Fields[tb.AliasTarget]; rOK {
 						targetField = tb.AliasTarget
 						tb = resolvedTB
 					}
+				}
+				copiedRawVals[targetField] = append(copiedRawVals[targetField], srcVals...)
+				if !ok {
+					continue
 				}
 				switch tb.Kind {
 				case StoragePromotedScalar:
@@ -1020,6 +1025,56 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 		}
 		relPath := b.SourceJSONPath[len(rootParts):]
 		applyNestedBindingNormalizationAtPath(cloned, relPath, b, getNow)
+		if len(b.CopyTo) > 0 {
+			srcVals := extractStringSliceValuesWithNull(cloned, relPath, false, b.NullValue)
+			if len(srcVals) > 0 {
+				for _, targetField := range b.CopyTo {
+					tb, ok := s.Fields[targetField]
+					if ok && tb.AliasTarget != "" {
+						if rtb, rOK := s.Fields[tb.AliasTarget]; rOK {
+							tb = rtb
+						}
+					}
+					if !ok || tb.NestedPath != nestedPath || len(tb.SourceJSONPath) <= len(rootParts) {
+						continue
+					}
+					tRelPath := tb.SourceJSONPath[len(rootParts):]
+					if len(tRelPath) == 1 {
+						if tb.ESType != "text" && tb.ESType != "match_only_text" {
+							var arr []any
+							if existing, exists := cloned[tRelPath[0]]; exists && existing != nil {
+								if exSlice, okS := existing.([]any); okS {
+									arr = append(arr, exSlice...)
+								} else {
+									arr = append(arr, existing)
+								}
+							}
+							for _, sv := range srcVals {
+								if tb.LowercaseNormalizer {
+									sv = strings.ToLower(sv)
+								}
+								arr = append(arr, sv)
+							}
+							if len(arr) == 1 {
+								cloned[tRelPath[0]] = arr[0]
+							} else if len(arr) > 1 {
+								cloned[tRelPath[0]] = arr
+							}
+						} else {
+							joined := strings.Join(srcVals, " ")
+							if tb.LowercaseNormalizer {
+								joined = strings.ToLower(joined)
+							}
+							if existing, exists := cloned[tRelPath[0]]; exists && existing != nil {
+								cloned[tRelPath[0]] = fmt.Sprintf("%v %s", existing, joined)
+							} else {
+								cloned[tRelPath[0]] = joined
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 	return cloned
 }
