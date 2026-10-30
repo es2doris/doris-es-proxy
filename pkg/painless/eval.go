@@ -549,7 +549,7 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 			sort.Strings(keys)
 			slice = make([]any, len(keys))
 			for i, k := range keys {
-				slice[i] = map[string]any{"key": k, "value": mVal[k]}
+				slice[i] = map[string]any{"key": k, "value": mVal[k], "__parent_map": mVal}
 			}
 		} else {
 			return nil
@@ -1111,6 +1111,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			targetPath = strings.Split(m[1], ".")
 		}
 		clearAtPath(sourceMap, targetPath)
+		params["_last_expr_val"] = nil
 		return nil
 	}
 
@@ -1332,8 +1333,28 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			if rootVar != "" {
 				syncLocalVarAlias(sourceMap, params, rootVar)
 			}
+			params["_last_expr_val"] = nil
 			return nil
 		}
+	}
+	if recExpr, argExpr, ok := matchTrailingMethodCallPainless(stmt, ".setValue("); ok {
+		recVal, err := evalRHSExpr(sourceMap, recExpr, params)
+		if err != nil {
+			return err
+		}
+		argVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(argExpr), params)
+		if err != nil {
+			return err
+		}
+		if m, ok := recVal.(map[string]any); ok {
+			oldVal := m["value"]
+			m["value"] = argVal
+			if pm, ok := m["__parent_map"].(map[string]any); ok {
+				pm[fmt.Sprintf("%v", m["key"])] = argVal
+			}
+			params["_last_expr_val"] = oldVal
+		}
+		return nil
 	}
 
 	// 7. Check compound assignment `+=` / `-=` / `*=` / `/=` / `%=` / `&=` / `|=` / `^=` / `<<=` / `>>=` / `>>>=`
@@ -1427,6 +1448,13 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		fullPath := normalizeLocalLHSPath(append([]string{varName}, propPath...), params)
 		if len(fullPath) > 0 {
 			setValueAtPath(params, fullPath, val)
+			if len(propPath) == 1 && propPath[0] == "value" {
+				if entryMap, ok := params[varName].(map[string]any); ok {
+					if pm, ok := entryMap["__parent_map"].(map[string]any); ok {
+						pm[fmt.Sprintf("%v", entryMap["key"])] = val
+					}
+				}
+			}
 			syncLocalVarAlias(sourceMap, params, decodeBracketSeg(fullPath[0]))
 		}
 		return nil
@@ -2176,12 +2204,15 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				if tv, ok := recVal.(map[string]any); ok {
 					keys := make([]string, 0, len(tv))
 					for k := range tv {
+						if k == "__parent_map" {
+							continue
+						}
 						keys = append(keys, k)
 					}
 					sort.Strings(keys)
 					out := make([]any, len(keys))
 					for i, k := range keys {
-						out[i] = map[string]any{"key": k, "value": tv[k]}
+						out[i] = map[string]any{"key": k, "value": tv[k], "__parent_map": tv}
 					}
 					return out, nil
 				}
@@ -2256,7 +2287,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		".startsWith(", ".endsWith(", ".containsAll(", ".removeAll(", ".retainAll(", ".contains(", ".containsKey(", ".containsValue(", ".getOrDefault(", ".get(",
 		".indexOf(", ".lastIndexOf(", ".charAt(", ".repeat(", ".matches(", ".replaceAll(", ".replaceFirst(",
 		".splitOnToken(", ".split(", ".replace(", ".substring(", ".subList(", ".join(",
-		".equals(", ".equalsIgnoreCase(", ".compareTo(", ".concat(", ".remove(", ".set(", ".addAll(", ".add(", ".putAll(", ".put(",
+		".equals(", ".equalsIgnoreCase(", ".compareTo(", ".concat(", ".remove(", ".setValue(", ".set(", ".addAll(", ".add(", ".putAll(", ".put(",
 	} {
 		if recExpr, argExpr, ok := matchTrailingMethodCallPainless(rhs, mName); ok {
 			if mName == ".removeAll(" || mName == ".retainAll(" {
@@ -2632,6 +2663,16 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					return strings.HasPrefix(s, fmt.Sprintf("%v", argVal)), nil
 				}
 				return false, nil
+			case ".setValue(":
+				if m, ok := recVal.(map[string]any); ok {
+					oldVal := m["value"]
+					m["value"] = argVal
+					if pm, ok := m["__parent_map"].(map[string]any); ok {
+						pm[fmt.Sprintf("%v", m["key"])] = argVal
+					}
+					return oldVal, nil
+				}
+				return nil, nil
 			case ".endsWith(":
 				if s, ok := recVal.(string); ok && argVal != nil {
 					return strings.HasSuffix(s, fmt.Sprintf("%v", argVal)), nil

@@ -46,8 +46,8 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 	for _, fpat := range qsq.Fields {
 		basePat := strings.Split(fpat, "^")[0]
 		if strings.ContainsAny(basePat, "*?") && t.Schema != nil {
-			exp := t.Schema.ExpandFieldPattern(fpat)
-			if len(exp) == 0 && basePat == "*" {
+			exp := t.expandFieldPatternForContext(fpat, nctx)
+			if len(exp) == 0 && basePat == "*" && nctx == nil {
 				expandedFields = append(expandedFields, "_all_text")
 				continue
 			}
@@ -70,12 +70,25 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 			defaultField = strings.Split(expandedFields[0], "^")[0]
 		} else if hadExplicitWildcardFields {
 			defaultField = "__unmatched_wildcard__"
+		} else if nctx != nil && t.Schema != nil {
+			if exp := t.expandFieldPatternForContext("*", nctx); len(exp) > 0 {
+				defaultField = exp[0].Field
+				for _, bf := range exp {
+					if bf.Boost != 1.0 {
+						expandedFields = append(expandedFields, fmt.Sprintf("%s^%g", bf.Field, bf.Boost))
+					} else {
+						expandedFields = append(expandedFields, bf.Field)
+					}
+				}
+			} else {
+				defaultField = "_all_text"
+			}
 		} else {
 			defaultField = "_all_text"
 		}
 	} else if strings.ContainsAny(defaultField, "*?") && t.Schema != nil {
 		baseDef := strings.Split(defaultField, "^")[0]
-		if exp := t.Schema.ExpandFieldPattern(defaultField); len(exp) > 0 {
+		if exp := t.expandFieldPatternForContext(defaultField, nctx); len(exp) > 0 {
 			defaultField = exp[0].Field
 			if len(expandedFields) == 0 {
 				for _, bf := range exp {
@@ -86,7 +99,7 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 					}
 				}
 			}
-		} else if baseDef == "*" {
+		} else if baseDef == "*" && nctx == nil {
 			defaultField = "_all_text"
 		} else {
 			defaultField = "__unmatched_wildcard__"
@@ -639,18 +652,18 @@ func hasUnescapedLuceneWildcard(s string) bool {
 	return false
 }
 
-func parseLuceneQuotedOrFuzzy(raw string) (clean string, rawWildcard string, isQuoted bool, slop int) {
+func parseLuceneQuotedOrFuzzyEx(raw string) (clean string, rawWildcard string, isQuoted bool, slop int, isFuzzy bool) {
 	s := strings.TrimSpace(raw)
 	if strings.HasPrefix(s, `"`) && len(s) >= 2 {
 		if strings.HasSuffix(s, `"`) {
 			inner := s[1 : len(s)-1]
-			return unescapeLuceneToken(inner), inner, true, 0
+			return unescapeLuceneToken(inner), inner, true, 0, false
 		}
 		if tildeIdx := strings.LastIndex(s, `"~`); tildeIdx > 0 {
 			slopStr := s[tildeIdx+2:]
 			if n, err := strconv.Atoi(slopStr); err == nil && n >= 0 {
 				inner := s[1:tildeIdx]
-				return unescapeLuceneToken(inner), inner, true, n
+				return unescapeLuceneToken(inner), inner, true, n, false
 			}
 		}
 	}
@@ -658,11 +671,16 @@ func parseLuceneQuotedOrFuzzy(raw string) (clean string, rawWildcard string, isQ
 		suffix := s[tildeIdx+1:]
 		if suffix == "" || strings.EqualFold(suffix, "auto") {
 			s = s[:tildeIdx]
-		} else if _, err := strconv.Atoi(suffix); err == nil {
+			isFuzzy = true
+		} else if n, err := strconv.Atoi(suffix); err == nil && n >= 0 {
 			s = s[:tildeIdx]
+			isFuzzy = n > 0
+		} else if f, err := strconv.ParseFloat(suffix, 64); err == nil && f >= 0 && f <= 2.0 {
+			s = s[:tildeIdx]
+			isFuzzy = f > 0
 		}
 	}
-	return unescapeLuceneToken(s), s, false, 0
+	return unescapeLuceneToken(s), s, false, 0, isFuzzy
 }
 
 func findLuceneFieldColon(s string) int {
@@ -781,21 +799,42 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 				},
 			}
 		}
-		if hasMatchingOuterParens(val) {
+		valUnary := byte(0)
+		valRest := val
+		if len(val) > 2 && (val[0] == '+' || val[0] == '-' || val[0] == '!') {
+			trimmedAfterOp := strings.TrimSpace(val[1:])
+			if hasMatchingOuterParens(trimmedAfterOp) {
+				valUnary = val[0]
+				valRest = trimmedAfterOp
+			}
+		}
+		if hasMatchingOuterParens(valRest) {
 			var subFields []string
 			subDefault := field
 			if strings.ContainsAny(field, "*?") {
 				subFields = []string{field}
 				subDefault = defaultField
 			}
-			inner := parseSimpleLuceneToASTWithDepth(val[1:len(val)-1], subDefault, subFields, defaultOp, depth+1)
+			inner := parseSimpleLuceneToASTWithDepth(valRest[1:len(valRest)-1], subDefault, subFields, defaultOp, depth+1)
+			if valUnary == '-' || valUnary == '!' {
+				neg := esast.Query{Bool: &esast.BoolQuery{MustNot: []esast.Query{inner}}}
+				if boost != 1.0 {
+					b := boost
+					neg.Bool.Boost = &b
+				}
+				return neg
+			}
 			if boost != 1.0 && inner.Bool != nil {
 				b := boost
 				inner.Bool.Boost = &b
 			}
 			return inner
 		}
-		val, rawWild, isQuoted, slop := parseLuceneQuotedOrFuzzy(val)
+		val, rawWild, isQuoted, slop, isFuzzy := parseLuceneQuotedOrFuzzyEx(val)
+		var fuzzAny any
+		if isFuzzy && !isQuoted {
+			fuzzAny = "AUTO"
+		}
 		if !isQuoted && (strings.EqualFold(val, "true") || strings.EqualFold(val, "false")) {
 			boolVal := strings.EqualFold(val, "true")
 			return esast.Query{
@@ -819,12 +858,13 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			}
 			return esast.Query{
 				MultiMatch: &esast.MultiMatchQuery{
-					Query:    val,
-					Fields:   []string{field},
-					Type:     qType,
-					Operator: strings.ToLower(defaultOp),
-					Slop:     slop,
-					Boost:    &b,
+					Query:     val,
+					Fields:    []string{field},
+					Type:      qType,
+					Operator:  strings.ToLower(defaultOp),
+					Slop:      slop,
+					Fuzziness: fuzzAny,
+					Boost:     &b,
 				},
 			}
 		}
@@ -837,7 +877,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 		}
 		return esast.Query{
 			Match: map[string]esast.MatchEntry{
-				field: {Query: val, Operator: strings.ToLower(defaultOp), Boost: boost},
+				field: {Query: val, Operator: strings.ToLower(defaultOp), Fuzziness: fuzzAny, Boost: boost},
 			},
 		}
 	}
@@ -898,7 +938,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			}
 		}
 	}
-	cleanVal, rawWild, isQuoted, slop := parseLuceneQuotedOrFuzzy(token)
+	cleanVal, rawWild, isQuoted, slop, isFuzzy := parseLuceneQuotedOrFuzzyEx(token)
 	if isSimple {
 		if !flags.phrase {
 			isQuoted = false
@@ -909,7 +949,12 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 		if !flags.fuzzy && !isQuoted {
 			cleanVal = unescapeLuceneToken(strings.TrimSpace(token))
 			rawWild = strings.TrimSpace(token)
+			isFuzzy = false
 		}
+	}
+	var fuzzAny any
+	if isFuzzy && !isQuoted {
+		fuzzAny = "AUTO"
 	}
 	if !isQuoted && (!isSimple || flags.prefix) && hasUnescapedLuceneWildcard(rawWild) {
 		if len(fields) > 0 {
@@ -958,16 +1003,17 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 	if len(fields) > 0 {
 		return esast.Query{
 			MultiMatch: &esast.MultiMatchQuery{
-				Query:    cleanVal,
-				Fields:   fields,
-				Operator: strings.ToLower(defaultOp),
-				Boost:    &boost,
+				Query:     cleanVal,
+				Fields:    fields,
+				Operator:  strings.ToLower(defaultOp),
+				Fuzziness: fuzzAny,
+				Boost:     &boost,
 			},
 		}
 	}
 	return esast.Query{
 		Match: map[string]esast.MatchEntry{
-			defaultField: {Query: cleanVal, Operator: strings.ToLower(defaultOp), Boost: boost},
+			defaultField: {Query: cleanVal, Operator: strings.ToLower(defaultOp), Fuzziness: fuzzAny, Boost: boost},
 		},
 	}
 }
@@ -1109,7 +1155,8 @@ func tokenizeLuceneWithFlags(s string, isSimple bool, flags simpleQueryFlags) []
 			if !inQuotes && !inRegex && (!isSimple || flags.precedence) {
 				if parenDepth == 0 && bracketDepth == 0 && curr.Len() > 0 {
 					prefix := curr.String()
-					if prefix != "+" && prefix != "-" && prefix != "!" && !strings.HasSuffix(prefix, ":") {
+					isFieldUnaryPrefix := strings.HasSuffix(prefix, ":+") || strings.HasSuffix(prefix, ":-") || strings.HasSuffix(prefix, ":!")
+					if prefix != "+" && prefix != "-" && prefix != "!" && !strings.HasSuffix(prefix, ":") && !isFieldUnaryPrefix {
 						out = append(out, prefix)
 						curr.Reset()
 					}
@@ -1125,7 +1172,11 @@ func tokenizeLuceneWithFlags(s string, isSimple bool, flags simpleQueryFlags) []
 					tokStr := curr.String()
 					trimmedTok := strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(tokStr, "+"), "-"), "!")
 					colonIdx := findLuceneFieldColon(trimmedTok)
-					if hasMatchingOuterParens(trimmedTok) || (colonIdx > 0 && hasMatchingOuterParens(trimmedTok[colonIdx+1:])) {
+					afterColon := ""
+					if colonIdx > 0 {
+						afterColon = strings.TrimLeft(trimmedTok[colonIdx+1:], "+-!")
+					}
+					if hasMatchingOuterParens(trimmedTok) || (colonIdx > 0 && hasMatchingOuterParens(afterColon)) {
 						out = append(out, tokStr)
 						curr.Reset()
 					}

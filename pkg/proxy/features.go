@@ -1099,6 +1099,11 @@ func (s *Server) applyIngestPipelineForWriteWithMeta(pipelineID, indexName, docI
 
 func (s *Server) applyEffectiveAndFinalPipelinesWithMeta(indexName, docID, reqPipeline, defaultPipeline string, raw json.RawMessage) (json.RawMessage, string, string, bool, error) {
 	effPipeline := s.resolveEffectivePipeline(indexName, reqPipeline, defaultPipeline)
+	if effPipeline == "" && s != nil {
+		if resolved, _, wErr := s.resolveWriteIndexWithFilter(indexName); wErr == nil && resolved != "" && resolved != indexName {
+			effPipeline = s.resolveEffectivePipeline(resolved, reqPipeline, defaultPipeline)
+		}
+	}
 	cur := raw
 	curIndex := indexName
 	curID := docID
@@ -1146,6 +1151,43 @@ func isIngestIdentByte(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '@' || c == '-'
 }
 
+func isRegexStartContext(s string, slashIdx int) bool {
+	j := slashIdx - 1
+	for j >= 0 && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r') {
+		j--
+	}
+	if j < 0 {
+		return true
+	}
+	switch s[j] {
+	case '~', '=', '(', ',', '!', '&', '|', '?', ':', '[', '{', ';':
+		return true
+	}
+	return false
+}
+
+func scanRegexLiteralEnd(s string, slashIdx int) int {
+	inClass := false
+	for i := slashIdx + 1; i < len(s); i++ {
+		c := s[i]
+		if c == '\\' && i+1 < len(s) {
+			i++
+			continue
+		}
+		if c == '\n' || c == '\r' {
+			return -1
+		}
+		if c == '[' {
+			inClass = true
+		} else if c == ']' {
+			inClass = false
+		} else if c == '/' && !inClass {
+			return i
+		}
+	}
+	return -1
+}
+
 func rewriteIngestCtxReferences(s string) string {
 	var out strings.Builder
 	out.Grow(len(s) + 16)
@@ -1168,6 +1210,35 @@ func rewriteIngestCtxReferences(s string) string {
 			inQuotes = c
 			out.WriteByte(c)
 			continue
+		}
+		if c == '/' && i+1 < len(s) {
+			if s[i+1] == '/' {
+				nl := strings.IndexByte(s[i+2:], '\n')
+				if nl < 0 {
+					out.WriteString(s[i:])
+					break
+				}
+				out.WriteString(s[i : i+2+nl+1])
+				i += 2 + nl
+				continue
+			}
+			if s[i+1] == '*' {
+				end := strings.Index(s[i+2:], "*/")
+				if end < 0 {
+					out.WriteString(s[i:])
+					break
+				}
+				out.WriteString(s[i : i+2+end+2])
+				i += 2 + end + 1
+				continue
+			}
+			if isRegexStartContext(s, i) {
+				if endSlash := scanRegexLiteralEnd(s, i); endSlash > i {
+					out.WriteString(s[i : endSlash+1])
+					i = endSlash
+					continue
+				}
+			}
 		}
 		if (i == 0 || (!isIngestIdentByte(s[i-1]) && s[i-1] != '.')) && strings.HasPrefix(s[i:], "ctx") {
 			rest := s[i+3:]
@@ -1210,16 +1281,85 @@ func rewriteIngestCtxReferences(s string) string {
 	return out.String()
 }
 
+func hasTopLevelSemicolonOrReturn(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	if strings.HasPrefix(trimmed, "return ") || strings.HasPrefix(trimmed, "return(") || strings.HasPrefix(trimmed, "return;") {
+		return true
+	}
+	inQuotes := byte(0)
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inQuotes != 0 {
+			if c == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == inQuotes {
+				inQuotes = 0
+			}
+			continue
+		}
+		if c == '\'' || c == '"' {
+			inQuotes = c
+			continue
+		}
+		if c == '/' && i+1 < len(s) {
+			if s[i+1] == '/' {
+				nl := strings.IndexByte(s[i+2:], '\n')
+				if nl < 0 {
+					break
+				}
+				i += 2 + nl
+				continue
+			}
+			if s[i+1] == '*' {
+				end := strings.Index(s[i+2:], "*/")
+				if end < 0 {
+					break
+				}
+				i += 2 + end + 1
+				continue
+			}
+			if isRegexStartContext(s, i) {
+				if endSlash := scanRegexLiteralEnd(s, i); endSlash > i {
+					i = endSlash
+					continue
+				}
+			}
+		}
+		switch c {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		case ';':
+			if depth == 0 && strings.TrimSpace(s[i+1:]) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func evalIngestIfCondition(cond string, doc map[string]any) bool {
 	cond = strings.TrimSpace(cond)
 	if cond == "" {
 		return true
 	}
-	normCond := rewriteIngestCtxReferences(cond)
-	script := "if (" + normCond + ") { ctx.op = 'index' } else { ctx.op = 'noop' }"
+	normCond := strings.TrimSpace(rewriteIngestCtxReferences(cond))
+	if hasTopLevelSemicolonOrReturn(normCond) {
+		ok, err := painless.EvalFilter(doc, normCond, nil)
+		return err == nil && ok
+	}
+	normCond = strings.TrimSuffix(normCond, ";")
+	script := "if (" + normCond + "\n) { ctx.op = 'index' } else { ctx.op = 'noop' }"
 	opRes, err := painless.EvalPainlessWithOp(doc, script, nil)
 	if err != nil {
-		return false
+		ok, fErr := painless.EvalFilter(doc, normCond, nil)
+		return fErr == nil && ok
 	}
 	return opRes == "index"
 }
@@ -3328,11 +3468,19 @@ func snapshotIngestDoc(doc map[string]any) map[string]any {
 	dec.UseNumber()
 	_ = dec.Decode(&cp)
 	if im, ok := doc["_ingest"].(map[string]any); ok {
-		if b, ok := im["_had_orig_index"].(bool); ok && !b {
-			delete(cp, "_index")
+		if b, ok := im["_had_orig_index"].(bool); ok {
+			if b {
+				cp["_index"] = im["_orig_index_val"]
+			} else {
+				delete(cp, "_index")
+			}
 		}
-		if b, ok := im["_had_orig_id"].(bool); ok && !b {
-			delete(cp, "_id")
+		if b, ok := im["_had_orig_id"].(bool); ok {
+			if b {
+				cp["_id"] = im["_orig_id_val"]
+			} else {
+				delete(cp, "_id")
+			}
 		}
 	}
 	delete(cp, "_ingest")
@@ -3348,6 +3496,13 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 		pMap, ok := p.(map[string]any)
 		if !ok {
 			continue
+		}
+		var prevMsg, prevType, prevTag any
+		var hadPrevMsg, hadPrevType, hadPrevTag bool
+		if preIngest, ok := doc["_ingest"].(map[string]any); ok && preIngest != nil {
+			prevMsg, hadPrevMsg = preIngest["on_failure_message"]
+			prevType, hadPrevType = preIngest["on_failure_processor_type"]
+			prevTag, hadPrevTag = preIngest["on_failure_processor_tag"]
 		}
 		m, dropped, procType, procTag, specMap, procErr := executeSingleIngestProcessor(s, doc, pMap, depth, trace)
 		if m {
@@ -3409,11 +3564,11 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 				if ingestMeta == nil {
 					ingestMeta = make(map[string]any)
 				}
-				prevMsg, hadPrevMsg := ingestMeta["on_failure_message"]
-				prevType, hadPrevType := ingestMeta["on_failure_processor_type"]
-				prevTag, hadPrevTag := ingestMeta["on_failure_processor_tag"]
+				curType, hasCurType := ingestMeta["on_failure_processor_type"]
+				curTag := ingestMeta["on_failure_processor_tag"]
+				innerUpdated := hasCurType && (!hadPrevType || curType != prevType || curTag != prevTag)
 				ingestMeta["on_failure_message"] = procErr.Error()
-				if (procType != "pipeline" && procType != "foreach") || !hadPrevType {
+				if (procType != "pipeline" && procType != "foreach") || !innerUpdated {
 					ingestMeta["on_failure_processor_type"] = procType
 					ingestMeta["on_failure_processor_tag"] = procTag
 				}
@@ -3452,9 +3607,11 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 			if ingestMeta == nil {
 				ingestMeta = make(map[string]any)
 			}
+			curType, hasCurType := ingestMeta["on_failure_processor_type"]
+			curTag := ingestMeta["on_failure_processor_tag"]
+			innerUpdated := hasCurType && (!hadPrevType || curType != prevType || curTag != prevTag)
 			ingestMeta["on_failure_message"] = procErr.Error()
-			_, hasInnerType := ingestMeta["on_failure_processor_type"]
-			if (procType != "pipeline" && procType != "foreach") || !hasInnerType {
+			if (procType != "pipeline" && procType != "foreach") || !innerUpdated {
 				if procType != "" {
 					ingestMeta["on_failure_processor_type"] = procType
 				}
@@ -3484,13 +3641,17 @@ func applyIngestPipelineSpecVerboseWithMeta(s *Server, pipe map[string]any, inde
 	if err := dec.Decode(&doc); err != nil || doc == nil {
 		return raw, indexName, docID, false, nil, err
 	}
-	_, hadOrigIndex := doc["_index"]
-	_, hadOrigID := doc["_id"]
-	if !hadOrigIndex && indexName != "" {
+	origIndexVal, hadOrigIndex := doc["_index"]
+	origIDVal, hadOrigID := doc["_id"]
+	if indexName != "" {
 		doc["_index"] = indexName
+	} else {
+		delete(doc, "_index")
 	}
-	if !hadOrigID && docID != "" {
+	if docID != "" {
 		doc["_id"] = docID
+	} else {
+		delete(doc, "_id")
 	}
 	ingestMeta, _ := doc["_ingest"].(map[string]any)
 	if ingestMeta == nil {
@@ -3500,7 +3661,9 @@ func applyIngestPipelineSpecVerboseWithMeta(s *Server, pipe map[string]any, inde
 		ingestMeta["timestamp"] = time.Now().UTC().Format(time.RFC3339Nano)
 	}
 	ingestMeta["_had_orig_index"] = hadOrigIndex
+	ingestMeta["_orig_index_val"] = origIndexVal
 	ingestMeta["_had_orig_id"] = hadOrigID
+	ingestMeta["_orig_id_val"] = origIDVal
 	doc["_ingest"] = ingestMeta
 
 	var trace []map[string]any
@@ -3521,7 +3684,9 @@ func applyIngestPipelineSpecVerboseWithMeta(s *Server, pipe map[string]any, inde
 			}
 			ingestMeta["on_failure_message"] = procErr.Error()
 			ingestMeta["_had_orig_index"] = hadOrigIndex
+			ingestMeta["_orig_index_val"] = origIndexVal
 			ingestMeta["_had_orig_id"] = hadOrigID
+			ingestMeta["_orig_id_val"] = origIDVal
 			doc["_ingest"] = ingestMeta
 			mutated = true
 			subMut, subDropped, subErr := runIngestProcessorList(s, doc, pipeOnFail, 1, tracePtr)
@@ -3554,10 +3719,14 @@ func applyIngestPipelineSpecVerboseWithMeta(s *Server, pipe map[string]any, inde
 			outID = sv
 		}
 	}
-	if !hadOrigIndex {
+	if hadOrigIndex {
+		doc["_index"] = origIndexVal
+	} else {
 		delete(doc, "_index")
 	}
-	if !hadOrigID {
+	if hadOrigID {
+		doc["_id"] = origIDVal
+	} else {
 		delete(doc, "_id")
 	}
 	delete(doc, "_ingest")
@@ -4323,6 +4492,8 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 									docSrcVer = 0
 								} else if parsedVer, perr := strconv.ParseInt(fmt.Sprintf("%v", v), 10, 64); perr == nil {
 									docSrcVer = parsedVer
+								} else if fv, ferr := strconv.ParseFloat(fmt.Sprintf("%v", v), 64); ferr == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && math.Trunc(fv) == fv && fv >= 0 {
+									docSrcVer = int64(fv)
 								}
 							}
 							delete(tmpMap, "__reindex_id")
@@ -4524,15 +4695,23 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+var (
+	reReindexMetaID      = regexp.MustCompile(`(^|[^a-zA-Z0-9_.])(?:ctx\?\._id|ctx\._id)\b`)
+	reReindexMetaIndex   = regexp.MustCompile(`(^|[^a-zA-Z0-9_.])(?:ctx\?\._index|ctx\._index)\b`)
+	reReindexMetaVersion = regexp.MustCompile(`(^|[^a-zA-Z0-9_.])(?:ctx\?\._version|ctx\._version)\b`)
+)
+
 func rewriteReindexMetaScript(src string) (string, bool) {
-	rewritten := src
-	for _, pat := range []string{"ctx?._id", "ctx._id", "ctx?.['_id']", "ctx['_id']", `ctx?.["_id"]`, `ctx["_id"]`} {
+	rewritten := reReindexMetaID.ReplaceAllString(src, "${1}ctx._source.__reindex_id")
+	for _, pat := range []string{"ctx?.['_id']", "ctx['_id']", `ctx?.["_id"]`, `ctx["_id"]`} {
 		rewritten = strings.ReplaceAll(rewritten, pat, "ctx._source.__reindex_id")
 	}
-	for _, pat := range []string{"ctx?._index", "ctx._index", "ctx?.['_index']", "ctx['_index']", `ctx?.["_index"]`, `ctx["_index"]`} {
+	rewritten = reReindexMetaIndex.ReplaceAllString(rewritten, "${1}ctx._source.__reindex_index")
+	for _, pat := range []string{"ctx?.['_index']", "ctx['_index']", `ctx?.["_index"]`, `ctx["_index"]`} {
 		rewritten = strings.ReplaceAll(rewritten, pat, "ctx._source.__reindex_index")
 	}
-	for _, pat := range []string{"ctx?._version", "ctx._version", "ctx?.['_version']", "ctx['_version']", `ctx?.["_version"]`, `ctx["_version"]`} {
+	rewritten = reReindexMetaVersion.ReplaceAllString(rewritten, "${1}ctx._source.__reindex_version")
+	for _, pat := range []string{"ctx?.['_version']", "ctx['_version']", `ctx?.["_version"]`, `ctx["_version"]`} {
 		rewritten = strings.ReplaceAll(rewritten, pat, "ctx._source.__reindex_version")
 	}
 	return rewritten, rewritten != src

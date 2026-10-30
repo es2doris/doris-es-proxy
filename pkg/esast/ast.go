@@ -838,6 +838,7 @@ type MatchEntry struct {
 	Boost              float64 `json:"boost,omitempty"`
 	ZeroTermsQuery     string  `json:"zero_terms_query,omitempty"`
 	MinimumShouldMatch any     `json:"minimum_should_match,omitempty"`
+	Fuzziness          any     `json:"fuzziness,omitempty"`
 }
 
 func (m *MatchEntry) UnmarshalJSON(data []byte) error {
@@ -851,6 +852,7 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 			Boost              *float64 `json:"boost"`
 			ZeroTermsQuery     string   `json:"zero_terms_query"`
 			MinimumShouldMatch any      `json:"minimum_should_match"`
+			Fuzziness          any      `json:"fuzziness"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
@@ -864,6 +866,7 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 		}
 		m.ZeroTermsQuery = full.ZeroTermsQuery
 		m.MinimumShouldMatch = full.MinimumShouldMatch
+		m.Fuzziness = full.Fuzziness
 		return nil
 	}
 	return json.Unmarshal(trimmed, &m.Query)
@@ -924,6 +927,7 @@ type MultiMatchQuery struct {
 	MinimumShouldMatch any      `json:"minimum_should_match,omitempty"`
 	TieBreaker         *float64 `json:"tie_breaker,omitempty"`
 	ZeroTermsQuery     string   `json:"zero_terms_query,omitempty"`
+	Fuzziness          any      `json:"fuzziness,omitempty"`
 	Boost              *float64 `json:"boost,omitempty"`
 }
 
@@ -942,6 +946,7 @@ type NestedQuery struct {
 	Query          Query          `json:"query"`
 	ScoreMode      string         `json:"score_mode,omitempty"`
 	IgnoreUnmapped bool           `json:"ignore_unmapped,omitempty"`
+	Boost          *float64       `json:"boost,omitempty"`
 	InnerHits      *InnerHitsSpec `json:"inner_hits,omitempty"`
 }
 
@@ -1787,13 +1792,37 @@ func (s SortSpec) MarshalJSON() ([]byte, error) {
 	if order == "" {
 		order = "asc"
 	}
-	if s.Entry.Mode != "" || s.Entry.Missing != "" {
+	if s.Entry.Field == "_script" {
+		inner := map[string]any{"order": order}
+		if s.Entry.Script != nil {
+			inner["script"] = s.Entry.Script
+		}
+		if s.Entry.Type != "" {
+			inner["type"] = s.Entry.Type
+		}
+		if s.Entry.Missing != "" {
+			inner["missing"] = s.Entry.Missing
+		}
+		return json.Marshal(map[string]any{"_script": inner})
+	}
+	if s.Entry.Field == "_geo_distance" {
+		if geoMap, ok := s.Entry.Script.(map[string]any); ok {
+			return json.Marshal(map[string]any{"_geo_distance": geoMap})
+		}
+	}
+	if s.Entry.Mode != "" || s.Entry.Missing != "" || s.Entry.Nested != nil || s.Entry.Type != "" {
 		inner := map[string]any{"order": order}
 		if s.Entry.Mode != "" {
 			inner["mode"] = s.Entry.Mode
 		}
 		if s.Entry.Missing != "" {
 			inner["missing"] = s.Entry.Missing
+		}
+		if s.Entry.Type != "" {
+			inner["type"] = s.Entry.Type
+		}
+		if s.Entry.Nested != nil {
+			inner["nested"] = s.Entry.Nested
 		}
 		return json.Marshal(map[string]any{s.Entry.Field: inner})
 	}
