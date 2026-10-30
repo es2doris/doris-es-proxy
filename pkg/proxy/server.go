@@ -3352,7 +3352,11 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 				targetIdx := indexName
 				targetAliasFilter := aliasFilters[indexName]
 				if !isDel && len(mutated) > 0 {
-					piped, nextIdx, nextID, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithMeta(indexName, h.ID, r.URL.Query().Get("pipeline"), body.Pipeline, mutated)
+					pipeInputIdx := indexName
+					if len(targets) == 1 && rawIndex != "" && !hasExclusionOrWildcard(rawIndex) {
+						pipeInputIdx = rawIndex
+					}
+					piped, nextIdx, nextID, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithMeta(pipeInputIdx, h.ID, r.URL.Query().Get("pipeline"), body.Pipeline, mutated)
 					if pipeErr != nil {
 						writeESError(w, http.StatusBadRequest, "ingest_processor_exception", pipeErr.Error())
 						return
@@ -3363,7 +3367,7 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 					if nextID != "" {
 						targetDocID = nextID
 					}
-					if nextIdx != "" && nextIdx != indexName {
+					if nextIdx != "" && nextIdx != pipeInputIdx {
 						resolvedIdx, resolvedFilter, rErr := s.resolveWriteIndexWithFilter(nextIdx)
 						if rErr != nil {
 							writeESError(w, http.StatusBadRequest, "illegal_argument_exception", rErr.Error())

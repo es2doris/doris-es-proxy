@@ -1337,24 +1337,26 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			return nil
 		}
 	}
-	if recExpr, argExpr, ok := matchTrailingMethodCallPainless(stmt, ".setValue("); ok {
-		recVal, err := evalRHSExpr(sourceMap, recExpr, params)
-		if err != nil {
-			return err
-		}
-		argVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(argExpr), params)
-		if err != nil {
-			return err
-		}
-		if m, ok := recVal.(map[string]any); ok {
-			oldVal := m["value"]
-			m["value"] = argVal
-			if pm, ok := m["__parent_map"].(map[string]any); ok {
-				pm[fmt.Sprintf("%v", m["key"])] = argVal
+	if !isTopLevelAssignmentStmt(stmt) && !strings.HasPrefix(stmt, "return ") && !strings.HasPrefix(stmt, "return(") {
+		if recExpr, argExpr, ok := matchTrailingMethodCallPainless(stmt, ".setValue("); ok {
+			recVal, err := evalRHSExpr(sourceMap, recExpr, params)
+			if err != nil {
+				return err
 			}
-			params["_last_expr_val"] = oldVal
+			argVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(argExpr), params)
+			if err != nil {
+				return err
+			}
+			if m, ok := recVal.(map[string]any); ok {
+				oldVal := m["value"]
+				m["value"] = argVal
+				if pm, ok := m["__parent_map"].(map[string]any); ok {
+					pm[fmt.Sprintf("%v", m["key"])] = argVal
+				}
+				params["_last_expr_val"] = oldVal
+			}
+			return nil
 		}
-		return nil
 	}
 
 	// 7. Check compound assignment `+=` / `-=` / `*=` / `/=` / `%=` / `&=` / `|=` / `^=` / `<<=` / `>>=` / `>>>=`
