@@ -1322,7 +1322,34 @@ var defaultGrokPatterns = map[string]string{
 	"EMAILADDRESS":      `[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+`,
 }
 
-var reGrokToken = regexp.MustCompile(`%\{([A-Za-z0-9_]+)(?::([A-Za-z0-9_.\-\[\]@]+))?(?::(int|integer|long|float|double|boolean|bool|string))?\}`)
+var (
+	reGrokToken        = regexp.MustCompile(`%\{([A-Za-z0-9_]+)(?::([A-Za-z0-9_.\-\[\]@]+))?(?::(int|integer|long|float|double|boolean|bool|string))?\}`)
+	reGrokNamedCapture = regexp.MustCompile(`\(\?P?<([A-Za-z0-9_.\-\[\]@]+)(?::(int|integer|long|float|double|boolean|bool|string))?>`)
+	rePositionalGroup  = regexp.MustCompile(`\$([0-9]+)`)
+)
+
+func normalizeGsubReplacement(repl string) string {
+	return rePositionalGroup.ReplaceAllString(repl, "${$1}")
+}
+
+func deepCloneIngestValue(val any) any {
+	switch tv := val.(type) {
+	case map[string]any:
+		cp := make(map[string]any, len(tv))
+		for k, v := range tv {
+			cp[k] = deepCloneIngestValue(v)
+		}
+		return cp
+	case []any:
+		cp := make([]any, len(tv))
+		for i, v := range tv {
+			cp[i] = deepCloneIngestValue(v)
+		}
+		return cp
+	default:
+		return val
+	}
+}
 
 func normalizeGrokFieldName(fieldName string) string {
 	if strings.HasPrefix(fieldName, "[") && strings.HasSuffix(fieldName, "]") {
@@ -1378,6 +1405,22 @@ func compileGrokRegex(pat string, customDefs map[string]any) (*regexp.Regexp, ma
 			return nil, nil, nil, resolveErr
 		}
 	}
+	expanded = reGrokNamedCapture.ReplaceAllStringFunc(expanded, func(m string) string {
+		sub := reGrokNamedCapture.FindStringSubmatch(m)
+		if len(sub) < 2 {
+			return m
+		}
+		if _, exists := groupKeyMap[sub[1]]; exists && sub[2] == "" && strings.HasPrefix(m, "(?P<") {
+			return m
+		}
+		groupSeq++
+		grpID := fmt.Sprintf("g%d", groupSeq)
+		groupKeyMap[grpID] = normalizeGrokFieldName(sub[1])
+		if len(sub) >= 3 && sub[2] != "" {
+			groupTypes[grpID] = sub[2]
+		}
+		return fmt.Sprintf("(?P<%s>", grpID)
+	})
 	re, err := regexp.Compile(expanded)
 	if err != nil {
 		return nil, nil, nil, err
@@ -1844,7 +1887,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			if copyFrom, _ := specMap["copy_from"].(string); copyFrom != "" {
 				copyFrom = fmt.Sprintf("%v", expandIngestTemplate(copyFrom, doc))
 				if val, exists := getIngestPath(doc, copyFrom); exists {
-					setIngestPath(doc, field, val)
+					setIngestPath(doc, field, deepCloneIngestValue(val))
 					mutated = true
 				} else if isExplicitIgnoreMissingFalse(specMap) {
 					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", copyFrom)
@@ -1896,7 +1939,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				}
 			}
 			if val, exists := getIngestPath(doc, srcField); exists {
-				setIngestPath(doc, dstField, val)
+				setIngestPath(doc, dstField, deepCloneIngestValue(val))
 				mutated = true
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", srcField)
@@ -2204,14 +2247,15 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				return false, false, procType, procTag, specMap, err
 			}
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
+				normRepl := normalizeGsubReplacement(repl)
 				if strVal, ok := val.(string); ok {
-					setIngestPath(doc, target, re.ReplaceAllString(strVal, repl))
+					setIngestPath(doc, target, re.ReplaceAllString(strVal, normRepl))
 					mutated = true
 				} else if arr, isArr := val.([]any); isArr {
 					outArr := make([]any, len(arr))
 					for idx, elem := range arr {
 						if sElem, ok := elem.(string); ok {
-							outArr[idx] = re.ReplaceAllString(sElem, repl)
+							outArr[idx] = re.ReplaceAllString(sElem, normRepl)
 						} else {
 							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
 						}
@@ -2580,6 +2624,9 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 	case "date_index_name":
 		field, _ := specMap["field"].(string)
 		prefix, _ := specMap["index_name_prefix"].(string)
+		if prefix != "" {
+			prefix = fmt.Sprintf("%v", expandIngestTemplate(prefix, doc))
+		}
 		dateRounding, _ := specMap["date_rounding"].(string)
 		idxFmt, _ := specMap["index_name_format"].(string)
 		if idxFmt == "" {
@@ -2592,7 +2639,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			}
 		}
 		tzName, _ := specMap["timezone"].(string)
+		if tzName != "" {
+			tzName = fmt.Sprintf("%v", expandIngestTemplate(tzName, doc))
+		}
 		if field != "" {
+			field = fmt.Sprintf("%v", expandIngestTemplate(field, doc))
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
 				parsedTime, err := parseIngestDateValue(fmt.Sprintf("%v", val), formats, tzName)
 				if err != nil {
@@ -2884,6 +2935,51 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					strVal = b.String()
 				}
 				setIngestPath(doc, field, strVal)
+				mutated = true
+			} else if isExplicitIgnoreMissingFalse(specMap) {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+			}
+		}
+	case "attachment":
+		field, _ := specMap["field"].(string)
+		target := "attachment"
+		if tf, _ := specMap["target_field"].(string); tf != "" {
+			target = tf
+		}
+		removeBinary, _ := specMap["remove_binary"].(bool)
+		indexedChars := -1
+		if ic, ok := toInt64(specMap["indexed_chars"]); ok {
+			indexedChars = int(ic)
+		}
+		if field != "" {
+			if val, exists := getIngestPath(doc, field); exists && val != nil {
+				rawB64 := strings.TrimSpace(fmt.Sprintf("%v", val))
+				decoded, err := base64.StdEncoding.DecodeString(rawB64)
+				if err != nil {
+					decoded, err = base64.RawStdEncoding.DecodeString(rawB64)
+				}
+				if err != nil {
+					decoded, err = base64.URLEncoding.DecodeString(rawB64)
+				}
+				if err != nil {
+					decoded, err = base64.RawURLEncoding.DecodeString(rawB64)
+				}
+				if err != nil {
+					return false, false, procType, procTag, specMap, fmt.Errorf("failed to base64-decode attachment field [%s]: %w", field, err)
+				}
+				content := string(decoded)
+				if indexedChars >= 0 && len(content) > indexedChars {
+					content = content[:indexedChars]
+				}
+				attMap := map[string]any{
+					"content":        content,
+					"content_length": len(content),
+					"content_type":   http.DetectContentType(decoded),
+				}
+				setIngestPath(doc, target, attMap)
+				if removeBinary && field != target {
+					deleteIngestPath(doc, field)
+				}
 				mutated = true
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)

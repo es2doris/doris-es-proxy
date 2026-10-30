@@ -99,7 +99,11 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 
 	parsedAST := parseSimpleLuceneToASTWithFlags(raw, defaultField, expandedFields, defaultOp, 0, isSimple, parseSimpleQueryFlags(qsq.Flags, isSimple))
 	if qsq.MinimumShouldMatch != nil && parsedAST.Bool != nil && len(parsedAST.Bool.Should) > 0 {
-		parsedAST.Bool.MinimumShouldMatch = qsq.MinimumShouldMatch
+		if len(parsedAST.Bool.Should) == 1 && parsedAST.Bool.Should[0].Bool != nil && len(parsedAST.Bool.Should[0].Bool.Should) > 0 && len(parsedAST.Bool.Must) == 0 && len(parsedAST.Bool.Filter) == 0 {
+			parsedAST.Bool.Should[0].Bool.MinimumShouldMatch = qsq.MinimumShouldMatch
+		} else {
+			parsedAST.Bool.MinimumShouldMatch = qsq.MinimumShouldMatch
+		}
 	}
 	compiled := t.CompileQuery(&parsedAST, scoring, nctx)
 	if scoring && qsq.Boost != nil && *qsq.Boost != 1.0 && compiled.ScoreSQL != "" && compiled.ScoreSQL != "0.0" {
@@ -195,6 +199,9 @@ func (t *Transpiler) rewriteDoris4SearchQuery(raw string) (string, bool) {
 }
 
 func canEmitMultiFieldDoris4SearchDisjunction(rewrittenRaw string, defaultOp string) bool {
+	if strings.Contains(rewrittenRaw, ":") {
+		return false
+	}
 	tokens := tokenizeLucene(rewrittenRaw)
 	clauseCount := 0
 	for _, tok := range tokens {

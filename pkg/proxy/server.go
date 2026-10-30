@@ -2802,8 +2802,7 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 		}
 		idxName, _, readErr := s.resolveReadDocIndexWithFilter(rawIdx)
 		if readErr != nil {
-			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", readErr.Error())
-			return
+			continue
 		}
 		idsByIndex[idxName] = append(idsByIndex[idxName], spec.ID)
 	}
@@ -2823,7 +2822,22 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 		if spec.Index != "" {
 			rawIdx = spec.Index
 		}
-		idxName, aliasFilter, _ := s.resolveReadDocIndexWithFilter(rawIdx)
+		idxName, aliasFilter, readErr := s.resolveReadDocIndexWithFilter(rawIdx)
+		if readErr != nil {
+			docsOut = append(docsOut, map[string]any{
+				"_index": rawIdx,
+				"_type":  "_doc",
+				"_id":    spec.ID,
+				"error": map[string]any{
+					"root_cause": []map[string]any{
+						{"type": "illegal_argument_exception", "reason": readErr.Error()},
+					},
+					"type":   "illegal_argument_exception",
+					"reason": readErr.Error(),
+				},
+			})
+			continue
+		}
 		s.mu.RLock()
 		_, indexKnown := s.indices[idxName]
 		s.mu.RUnlock()
@@ -3041,9 +3055,9 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 
 	if opResult != "noop" {
 		isDelete := opResult == "deleted"
+		origIndex := indexName
+		origDocID := docID
 		if !isDelete && len(mutatedSource) > 0 {
-			origIndex := indexName
-			origDocID := docID
 			pipedDoc, nextIndex, nextDocID, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithMeta(indexName, docID, r.URL.Query().Get("pipeline"), "", mutatedSource)
 			if pipeErr != nil {
 				writeESError(w, http.StatusBadRequest, "ingest_processor_exception", pipeErr.Error())
@@ -3121,7 +3135,20 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		syncRefresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh") == "wait_for"
-		if err := s.streamLoad(r.Context(), idxSchema.DorisTable, append(shredded, '\n'), syncRefresh); err != nil {
+		payload := append(shredded, '\n')
+		if found && !isDelete && (docID != origDocID || indexName != origIndex) {
+			origSchema := s.ensureIndexSchema(r.Context(), origIndex)
+			tombVer := s.allocVersion(existingHit.Version + 1)
+			if tombShredded, tErr := schema.ShredDocument(origSchema, origDocID, tombVer, true, nil); tErr == nil {
+				if origSchema.DorisTable == idxSchema.DorisTable {
+					payload = append(append(tombShredded, '\n'), payload...)
+				} else if err := s.streamLoad(r.Context(), origSchema.DorisTable, append(tombShredded, '\n'), syncRefresh); err != nil {
+					writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
+					return
+				}
+			}
+		}
+		if err := s.streamLoad(r.Context(), idxSchema.DorisTable, payload, syncRefresh); err != nil {
 			writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
 			return
 		}
@@ -4015,13 +4042,13 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			updateResult = opRes
+			origTargetIndex := targetIndex
+			origOpID := op.ID
 			if opRes == "deleted" {
 				deleted = true
 				sourceToShred = merged
 			} else {
 				if len(merged) > 0 {
-					origTargetIndex := targetIndex
-					origOpID := op.ID
 					piped, nextIdx, nextID, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithMeta(targetIndex, op.ID, defaultPipeline, op.Pipeline, merged)
 					if pipeErr != nil {
 						hasErrors = true
@@ -4112,6 +4139,29 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 						},
 					})
 					continue
+				}
+				if found && (op.ID != origOpID || targetIndex != origTargetIndex) {
+					origSchema := s.ensureIndexSchema(r.Context(), origTargetIndex)
+					origBuf, okOrig := byIndex[origSchema.DorisTable]
+					if !okOrig {
+						origBuf = &bytes.Buffer{}
+						byIndex[origSchema.DorisTable] = origBuf
+					}
+					tombVer := s.allocVersion(existingHit.Version + 1)
+					if tombShredded, tErr := schema.ShredDocument(origSchema, origOpID, tombVer, true, nil); tErr == nil {
+						origBuf.Write(tombShredded)
+						origBuf.WriteByte('\n')
+						pendingRowsByTable[origSchema.DorisTable] = append(pendingRowsByTable[origSchema.DorisTable], pendingBulkRow{
+							id:      origOpID,
+							ver:     tombVer,
+							deleted: true,
+						})
+					}
+					delete(existingByIndex[origTargetIndex], origOpID)
+					if lastVerByIndex[origTargetIndex] == nil {
+						lastVerByIndex[origTargetIndex] = make(map[string]int64)
+					}
+					lastVerByIndex[origTargetIndex][origOpID] = tombVer
 				}
 				if len(sourceToShred) > 0 {
 					prevSchema := idxSchema
@@ -4584,6 +4634,14 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 			})
 			continue
 		}
+		resp["status"] = http.StatusOK
+		if r.URL.Query().Get("rest_total_hits_as_int") == "true" {
+			if hitsMap, ok := resp["hits"].(map[string]any); ok {
+				if totalObj, ok := hitsMap["total"].(map[string]any); ok {
+					hitsMap["total"] = totalObj["value"]
+				}
+			}
+		}
 		if fp := strings.TrimSpace(hdr.FilterPath); fp != "" {
 			var subPaths []string
 			for _, p := range strings.Split(fp, ",") {
@@ -4914,7 +4972,7 @@ func (s *Server) executeSearchRequest(
 				idxQueryTotal = r.effectiveCount()
 				continue
 			}
-			if r.effectiveCount() != 0 || r.effectiveValue() != 0 {
+			if r.effectiveCount() != 0 || r.effectiveValue() != 0 || strings.Contains(r.BucketKey, "\x00") {
 				hasNonZeroAggRow = true
 			}
 			bucketCounts[r.AggName+"\x00"+r.BucketKey] = r.effectiveCount()
@@ -5965,10 +6023,11 @@ func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, totalQueryHits int64
 		bucket string
 	}
 	type mergeAcc struct {
-		row         AggRow
-		count       int
-		weightSum   int64
-		weightedVal float64
+		row            AggRow
+		count          int
+		weightSum      int64
+		weightedVal    float64
+		combinedStates []any
 	}
 	merged := make(map[key]*mergeAcc)
 	var order []key
@@ -5976,6 +6035,13 @@ func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, totalQueryHits int64
 	lastStatSum := make(map[key]float64)
 	accumulateRow := func(r AggRow) {
 		k := key{agg: r.AggName, bucket: r.BucketKey}
+		var hasSM bool
+		var smCombVal any
+		if lb, _, combVal, ok := parseScriptedMetricBucketKey(r.BucketKey); ok {
+			k.bucket = lb
+			hasSM = true
+			smCombVal = combVal
+		}
 		spec := resolveAggSpecByPath(aggs, r.AggName)
 		val := r.effectiveValue()
 		w := r.Weight
@@ -5990,6 +6056,9 @@ func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, totalQueryHits int64
 			existing.count++
 			existing.weightSum += w
 			existing.weightedVal += val * float64(w)
+			if hasSM {
+				existing.combinedStates = append(existing.combinedStates, smCombVal)
+			}
 			switch {
 			case isMin:
 				if val < existing.row.Value {
@@ -6009,12 +6078,16 @@ func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, totalQueryHits int64
 			cp := r
 			cp.DocCount = r.effectiveCount()
 			cp.Value = val
-			merged[k] = &mergeAcc{
+			acc := &mergeAcc{
 				row:         cp,
 				count:       1,
 				weightSum:   w,
 				weightedVal: val * float64(w),
 			}
+			if hasSM {
+				acc.combinedStates = []any{smCombVal}
+			}
+			merged[k] = acc
 			order = append(order, k)
 		}
 	}
@@ -6058,6 +6131,17 @@ func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, totalQueryHits int64
 	for _, k := range order {
 		acc := merged[k]
 		spec := resolveAggSpecByPath(aggs, k.agg)
+		if spec.ScriptedMetric != nil && len(acc.combinedStates) > 0 {
+			smRes := evalScriptedMetricReduce(spec.ScriptedMetric, acc.combinedStates)
+			rawReduced, _ := json.Marshal(smRes)
+			acc.row.BucketKey = k.bucket + "\x00" + string(rawReduced)
+			if fv, ok := toFloat64(smRes); ok {
+				acc.row.Value = fv
+				acc.row.DocCount = int64(fv)
+			}
+			out = append(out, acc.row)
+			continue
+		}
 		isBoxplotQuartile := spec.Boxplot != nil && k.bucket != "0.0" && k.bucket != "100.0" &&
 			!strings.HasSuffix(k.agg, ".0.0") && !strings.HasSuffix(k.agg, ".100.0")
 		isAvgLike := k.bucket == "_stats_avg" || k.bucket == "_stats_std" || k.bucket == "_stats_entropy" ||
@@ -6311,7 +6395,40 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 						ihCopy.TrackScores = req.TrackScores
 						nqCopy.InnerHits = &ihCopy
 					}
-					ihSpecByName[ihName] = nqCopy.InnerHits
+					if prevSpec := ihSpecByName[ihName]; prevSpec != nil && nqCopy.InnerHits != nil {
+						mergedSpec := *prevSpec
+						nextSpec := nqCopy.InnerHits
+						if len(mergedSpec.Sort) == 0 && len(nextSpec.Sort) > 0 {
+							mergedSpec.Sort = nextSpec.Sort
+						}
+						if mergedSpec.Size == nil && nextSpec.Size != nil {
+							mergedSpec.Size = nextSpec.Size
+						}
+						if mergedSpec.From == 0 && nextSpec.From > 0 {
+							mergedSpec.From = nextSpec.From
+						}
+						if mergedSpec.Source == nil && nextSpec.Source != nil {
+							mergedSpec.Source = nextSpec.Source
+						}
+						if len(mergedSpec.Fields) == 0 && len(nextSpec.Fields) > 0 {
+							mergedSpec.Fields = nextSpec.Fields
+						}
+						if len(mergedSpec.DocvalueFields) == 0 && len(nextSpec.DocvalueFields) > 0 {
+							mergedSpec.DocvalueFields = nextSpec.DocvalueFields
+						}
+						if len(mergedSpec.ScriptFields) == 0 && len(nextSpec.ScriptFields) > 0 {
+							mergedSpec.ScriptFields = nextSpec.ScriptFields
+						}
+						if mergedSpec.Highlight == nil && nextSpec.Highlight != nil {
+							mergedSpec.Highlight = nextSpec.Highlight
+						}
+						if mergedSpec.TrackScores == nil && nextSpec.TrackScores != nil {
+							mergedSpec.TrackScores = nextSpec.TrackScores
+						}
+						ihSpecByName[ihName] = &mergedSpec
+					} else {
+						ihSpecByName[ihName] = nqCopy.InnerHits
+					}
 					ihPathByName[ihName] = nqCopy.Path
 					skipPaging := ihNameCounts[ihName] > 1
 					nextIH := buildNestedInnerHitsForHitWithOpts(h, hitIdx, hitSchema, &nqCopy, skipPaging)
@@ -6408,17 +6525,29 @@ func collectMatchingNestedQueriesWithInnerHits(idxSchema *schema.IndexSchema, ge
 	}
 	if q.Bool != nil {
 		for i := range q.Bool.Must {
-			if q.Bool.Must[i].Nested == nil && !evalBranchMatchesDoc(idxSchema, getDoc(), &q.Bool.Must[i]) {
+			if !evalBranchMatchesDoc(idxSchema, getDoc(), &q.Bool.Must[i]) {
 				return
 			}
 		}
 		for i := range q.Bool.Filter {
-			if q.Bool.Filter[i].Nested == nil && !evalBranchMatchesDoc(idxSchema, getDoc(), &q.Bool.Filter[i]) {
+			if !evalBranchMatchesDoc(idxSchema, getDoc(), &q.Bool.Filter[i]) {
 				return
 			}
 		}
 		for i := range q.Bool.MustNot {
 			if evalBranchMatchesDoc(idxSchema, getDoc(), &q.Bool.MustNot[i]) {
+				return
+			}
+		}
+		var matchedShouldIdx []int
+		if len(q.Bool.Should) > 0 {
+			for i := range q.Bool.Should {
+				if evalBranchMatchesDoc(idxSchema, getDoc(), &q.Bool.Should[i]) {
+					matchedShouldIdx = append(matchedShouldIdx, i)
+				}
+			}
+			reqMin := resolveMinimumShouldMatch(q.Bool.MinimumShouldMatch, len(q.Bool.Should), len(q.Bool.Must) == 0 && len(q.Bool.Filter) == 0)
+			if len(matchedShouldIdx) < reqMin {
 				return
 			}
 		}
@@ -6428,10 +6557,8 @@ func collectMatchingNestedQueriesWithInnerHits(idxSchema *schema.IndexSchema, ge
 		for i := range q.Bool.Filter {
 			collectMatchingNestedQueriesWithInnerHits(idxSchema, getDoc, &q.Bool.Filter[i], out)
 		}
-		for i := range q.Bool.Should {
-			if evalBranchMatchesDoc(idxSchema, getDoc(), &q.Bool.Should[i]) {
-				collectMatchingNestedQueriesWithInnerHits(idxSchema, getDoc, &q.Bool.Should[i], out)
-			}
+		for _, i := range matchedShouldIdx {
+			collectMatchingNestedQueriesWithInnerHits(idxSchema, getDoc, &q.Bool.Should[i], out)
 		}
 	}
 	if q.DisMax != nil {
@@ -6499,10 +6626,43 @@ func mergeNestedInnerHitsEnvelopes(prevIH, nextIH map[string]any, ihSpec *esast.
 	for _, hm := range nextList {
 		if off, ok := extractOffset(hm); ok {
 			if idx, dup := seenOffset[off]; dup {
+				hl1, _ := merged[idx]["highlight"].(map[string][]string)
+				hl2, _ := hm["highlight"].(map[string][]string)
+				var mergedHL map[string][]string
+				if len(hl1) > 0 || len(hl2) > 0 {
+					mergedHL = make(map[string][]string, len(hl1)+len(hl2))
+					appendUniqueSnippets := func(f string, snips []string) {
+						existing := mergedHL[f]
+						for _, sn := range snips {
+							found := false
+							for _, ex := range existing {
+								if ex == sn {
+									found = true
+									break
+								}
+							}
+							if !found {
+								existing = append(existing, sn)
+							}
+						}
+						if len(existing) > 0 {
+							mergedHL[f] = existing
+						}
+					}
+					for f, snips := range hl1 {
+						appendUniqueSnippets(f, snips)
+					}
+					for f, snips := range hl2 {
+						appendUniqueSnippets(f, snips)
+					}
+				}
 				s1, ok1 := toFloat64(merged[idx]["_score"])
 				s2, ok2 := toFloat64(hm["_score"])
 				if ok2 && (!ok1 || s2 > s1) {
 					merged[idx] = hm
+				}
+				if len(mergedHL) > 0 {
+					merged[idx]["highlight"] = mergedHL
 				}
 				continue
 			}
@@ -6689,10 +6849,13 @@ func deriveNestedEvalSchema(base *schema.IndexSchema, nestedPath string) *schema
 	}
 	cp := *base
 	cp.Fields = make(map[string]schema.FieldBinding, len(base.Fields)*2)
+	prefix := nestedPath + "."
 	for k, b := range base.Fields {
+		if b.NestedPath != nestedPath && !strings.HasPrefix(k, prefix) {
+			b.NullValue = nil
+		}
 		cp.Fields[k] = b
 	}
-	prefix := nestedPath + "."
 	for k, b := range base.Fields {
 		if strings.HasPrefix(k, prefix) {
 			relKey := strings.TrimPrefix(k, prefix)
@@ -7624,9 +7787,11 @@ func buildAggsMap(
 		case spec.ScriptedMetric != nil:
 			var smVal any
 			if len(rows) > 0 {
-				if idx := strings.IndexByte(rows[0].BucketKey, '\x00'); idx >= 0 {
-					_ = json.Unmarshal([]byte(rows[0].BucketKey[idx+1:]), &smVal)
+				if _, rv, _, ok := parseScriptedMetricBucketKey(rows[0].BucketKey); ok {
+					smVal = rv
 				}
+			} else {
+				smVal = evalScriptedMetricAgg(spec.ScriptedMetric, nil)
 			}
 			aggsOut[aggName] = map[string]any{"value": smVal}
 		case spec.Rate != nil:
@@ -7856,117 +8021,133 @@ func buildAggsMap(
 		case spec.TopMetrics != nil:
 			aggsOut[aggName] = buildTopMetricsObject(rows, spec.TopMetrics, docLookup)
 		case spec.Composite != nil:
-			type compSrcMeta struct {
-				name  string
-				entry esast.AggSpec
-			}
-			var srcMetas []compSrcMeta
-			for _, srcMap := range spec.Composite.Sources {
-				var ks []string
-				for k := range srcMap {
-					ks = append(ks, k)
-				}
-				sort.Strings(ks)
-				for _, k := range ks {
-					srcMetas = append(srcMetas, compSrcMeta{name: k, entry: srcMap[k]})
-				}
-			}
-			type decodedCompRow struct {
-				row    AggRow
-				keyObj map[string]any
-			}
-			decoded := make([]decodedCompRow, 0, len(rows))
-			for _, r := range rows {
-				parts := splitCompositeBucketKey(r.BucketKey)
-				keyObj := make(map[string]any, len(srcMetas))
-				for i, sm := range srcMetas {
-					if i < len(parts) {
-						if parts[i] == "__ES_MISSING_BUCKET__" {
-							keyObj[sm.name] = nil
-							continue
-						}
-						partVal := any(parts[i])
-						if sm.entry.DateHistogram != nil {
-							if iv, err := strconv.ParseInt(parts[i], 10, 64); err == nil {
-								partVal = iv
-							}
-						} else if sm.entry.Histogram != nil {
-							if iv, err := strconv.ParseInt(parts[i], 10, 64); err == nil {
-								partVal = iv
-							} else if fv, ok := parseFiniteFloat(parts[i]); ok {
-								partVal = fv
-							}
-						}
-						keyObj[sm.name] = partVal
-					}
-				}
-				if len(spec.Composite.After) > 0 {
-					cmpAfter := 0
-					for _, sm := range srcMetas {
-						afterVal, ok := spec.Composite.After[sm.name]
-						if !ok {
-							continue
-						}
-						cmpAfter = compareCompositeSourceVal(keyObj[sm.name], afterVal, sm.entry)
-						if cmpAfter != 0 {
-							break
-						}
-					}
-					if cmpAfter <= 0 {
-						continue
-					}
-				}
-				decoded = append(decoded, decodedCompRow{row: r, keyObj: keyObj})
-			}
-			if len(decoded) > 1 {
-				sort.SliceStable(decoded, func(i, j int) bool {
-					for _, sm := range srcMetas {
-						cmp := compareCompositeSourceVal(decoded[i].keyObj[sm.name], decoded[j].keyObj[sm.name], sm.entry)
-						if cmp != 0 {
-							return cmp < 0
-						}
-					}
-					return decoded[i].row.BucketKey < decoded[j].row.BucketKey
-				})
-			}
-			compLimit := spec.Composite.Size
-			if compLimit <= 0 {
-				compLimit = 10
-			}
-			if compLimit > transpiler.DefaultMaxAggBuckets {
-				compLimit = transpiler.DefaultMaxAggBuckets
-			}
-			if len(decoded) > compLimit {
-				decoded = decoded[:compLimit]
-			}
-			buckets := make([]map[string]any, 0, len(decoded))
-			var afterKey map[string]any
-			subAggs := spec.SubAggs()
-			for _, d := range decoded {
-				afterKey = d.keyObj
-				bucketMap := map[string]any{
-					"key":       d.keyObj,
-					"doc_count": d.row.effectiveCount(),
-				}
-				if len(subAggs) > 0 {
-					attachSubAggsToBucket(indexName, bucketMap, fullKey, d.row.BucketKey, subAggs, bucketsByAgg, docLookup)
-					evaluateSiblingPipelineAggs(subAggs, bucketMap)
-				}
-				buckets = append(buckets, bucketMap)
-			}
-			if len(subAggs) > 0 {
-				buckets = evaluateChildPipelineAggs(buckets, subAggs)
-			}
-			compObj := map[string]any{"buckets": buckets}
-			if afterKey != nil {
-				compObj["after_key"] = afterKey
-			}
-			aggsOut[aggName] = compObj
+			aggsOut[aggName] = buildCompositeAggObject(indexName, fullKey, "", spec.Composite, spec.SubAggs(), rows, bucketsByAgg, docLookup)
 		}
 	}
 	evaluateSiblingPipelineAggs(aggs, aggsOut)
 	_ = evaluateChildPipelineAggs([]map[string]any{aggsOut}, aggs)
 	return aggsOut
+}
+
+func buildCompositeAggObject(
+	indexName string,
+	fullKey string,
+	parentBucketKey string,
+	comp *esast.CompositeAggSpec,
+	subAggs map[string]esast.AggSpec,
+	rows []AggRow,
+	bucketsByAgg map[string][]AggRow,
+	docLookup func(string) *HitRow,
+) map[string]any {
+	type compSrcMeta struct {
+		name  string
+		entry esast.AggSpec
+	}
+	var srcMetas []compSrcMeta
+	for _, srcMap := range comp.Sources {
+		var ks []string
+		for k := range srcMap {
+			ks = append(ks, k)
+		}
+		sort.Strings(ks)
+		for _, k := range ks {
+			srcMetas = append(srcMetas, compSrcMeta{name: k, entry: srcMap[k]})
+		}
+	}
+	type decodedCompRow struct {
+		row    AggRow
+		keyObj map[string]any
+	}
+	decoded := make([]decodedCompRow, 0, len(rows))
+	for _, r := range rows {
+		parts := splitCompositeBucketKey(r.BucketKey)
+		keyObj := make(map[string]any, len(srcMetas))
+		for i, sm := range srcMetas {
+			if i < len(parts) {
+				if parts[i] == "__ES_MISSING_BUCKET__" {
+					keyObj[sm.name] = nil
+					continue
+				}
+				partVal := any(parts[i])
+				if sm.entry.DateHistogram != nil {
+					if iv, err := strconv.ParseInt(parts[i], 10, 64); err == nil {
+						partVal = iv
+					}
+				} else if sm.entry.Histogram != nil {
+					if iv, err := strconv.ParseInt(parts[i], 10, 64); err == nil {
+						partVal = iv
+					} else if fv, ok := parseFiniteFloat(parts[i]); ok {
+						partVal = fv
+					}
+				}
+				keyObj[sm.name] = partVal
+			}
+		}
+		if len(comp.After) > 0 {
+			cmpAfter := 0
+			for _, sm := range srcMetas {
+				afterVal, ok := comp.After[sm.name]
+				if !ok {
+					continue
+				}
+				cmpAfter = compareCompositeSourceVal(keyObj[sm.name], afterVal, sm.entry)
+				if cmpAfter != 0 {
+					break
+				}
+			}
+			if cmpAfter <= 0 {
+				continue
+			}
+		}
+		decoded = append(decoded, decodedCompRow{row: r, keyObj: keyObj})
+	}
+	if len(decoded) > 1 {
+		sort.SliceStable(decoded, func(i, j int) bool {
+			for _, sm := range srcMetas {
+				cmp := compareCompositeSourceVal(decoded[i].keyObj[sm.name], decoded[j].keyObj[sm.name], sm.entry)
+				if cmp != 0 {
+					return cmp < 0
+				}
+			}
+			return decoded[i].row.BucketKey < decoded[j].row.BucketKey
+		})
+	}
+	compLimit := comp.Size
+	if compLimit <= 0 {
+		compLimit = 10
+	}
+	if compLimit > transpiler.DefaultMaxAggBuckets {
+		compLimit = transpiler.DefaultMaxAggBuckets
+	}
+	if len(decoded) > compLimit {
+		decoded = decoded[:compLimit]
+	}
+	buckets := make([]map[string]any, 0, len(decoded))
+	var afterKey map[string]any
+	for _, d := range decoded {
+		afterKey = d.keyObj
+		bucketMap := map[string]any{
+			"key":       d.keyObj,
+			"doc_count": d.row.effectiveCount(),
+		}
+		if len(subAggs) > 0 {
+			childParentKey := d.row.BucketKey
+			if parentBucketKey != "" {
+				childParentKey = parentBucketKey + "\x1f" + d.row.BucketKey
+			}
+			attachSubAggsToBucket(indexName, bucketMap, fullKey, childParentKey, subAggs, bucketsByAgg, docLookup)
+			evaluateSiblingPipelineAggs(subAggs, bucketMap)
+		}
+		buckets = append(buckets, bucketMap)
+	}
+	if len(subAggs) > 0 {
+		buckets = evaluateChildPipelineAggs(buckets, subAggs)
+	}
+	compObj := map[string]any{"buckets": buckets}
+	if afterKey != nil {
+		compObj["after_key"] = afterKey
+	}
+	return compObj
 }
 
 func extractCompositeSourceOrder(order any) string {
@@ -8139,15 +8320,20 @@ func scaleBucketRates(bucketMap map[string]any, subAggs map[string]esast.AggSpec
 			if childBuckets, okB := subMap["buckets"].([]map[string]any); okB {
 				for _, cb := range childBuckets {
 					scaleBucketRates(cb, grandSubAggs, histSpec)
+					evaluateSiblingPipelineAggs(grandSubAggs, cb)
 				}
+				subMap["buckets"] = evaluateChildPipelineAggs(childBuckets, grandSubAggs)
 			} else if keyedBuckets, okK := subMap["buckets"].(map[string]any); okK {
 				for _, v := range keyedBuckets {
 					if cb, okCB := v.(map[string]any); okCB {
 						scaleBucketRates(cb, grandSubAggs, histSpec)
+						evaluateSiblingPipelineAggs(grandSubAggs, cb)
 					}
 				}
 			} else {
 				scaleBucketRates(subMap, grandSubAggs, histSpec)
+				evaluateSiblingPipelineAggs(grandSubAggs, subMap)
+				_ = evaluateChildPipelineAggs([]map[string]any{subMap}, grandSubAggs)
 			}
 		}
 	}
@@ -8542,12 +8728,26 @@ func filterAndSortTermsRows(
 				rows := bucketsByAgg[rk]
 				m := make(map[string]float64, len(rows))
 				for _, sr := range rows {
-					k, ok := trimRowKey(sr.BucketKey)
+					rawBK := sr.BucketKey
+					if nulIdx := strings.IndexByte(rawBK, '\x00'); nulIdx >= 0 {
+						rawBK = rawBK[:nulIdx]
+					}
+					k, ok := trimRowKey(rawBK)
 					if !ok {
 						continue
 					}
 					if asCount {
 						m[k] = float64(sr.effectiveCount())
+					} else if prop != "" && prop != "value" && prop != "_count" && prop != "doc_count" {
+						if _, rv, _, okSM := parseScriptedMetricBucketKey(sr.BucketKey); okSM {
+							if rvMap, okM := rv.(map[string]any); okM {
+								if fv, okF := extractBucketMetricBySegs(rvMap, strings.Split(prop, ".")); okF {
+									m[k] = fv
+									continue
+								}
+							}
+						}
+						m[k] = sr.effectiveValue()
 					} else {
 						m[k] = sr.effectiveValue()
 					}
@@ -8838,14 +9038,7 @@ func isRuntimeBucketContainer(m map[string]any) bool {
 		return true
 	}
 	if _, hasDocCount := m["doc_count"]; hasDocCount {
-		_, hasValue := m["value"]
-		_, hasValues := m["values"]
-		_, hasCount := m["count"]
-		_, hasHits := m["hits"]
-		_, hasTop := m["top"]
-		if !hasValue && !hasValues && !hasCount && !hasHits && !hasTop {
-			return true
-		}
+		return true
 	}
 	return false
 }
@@ -9284,18 +9477,42 @@ func evaluateChildPipelineAggs(buckets []map[string]any, subAggs map[string]esas
 					for _, sSpec := range bs.Sort {
 						field := sSpec.Entry.Field
 						desc := strings.EqualFold(sSpec.Entry.Order, "desc")
-						if field == "_key" || field == "key" {
-							ki, okStrI := buckets[i]["key"].(string)
-							kj, okStrJ := buckets[j]["key"].(string)
-							if okStrI && okStrJ {
-								if ki != kj {
-									if desc {
-										return ki > kj
-									}
-									return ki < kj
+						if field == "_key" || field == "key" || strings.HasPrefix(field, "_key.") || strings.HasPrefix(field, "key.") {
+							rawKI := buckets[i]["key"]
+							rawKJ := buckets[j]["key"]
+							if strings.HasPrefix(field, "_key.") || strings.HasPrefix(field, "key.") {
+								subKey := strings.TrimPrefix(strings.TrimPrefix(field, "_key."), "key.")
+								if kmI, okMI := rawKI.(map[string]any); okMI {
+									rawKI = kmI[subKey]
 								}
-								continue
+								if kmJ, okMJ := rawKJ.(map[string]any); okMJ {
+									rawKJ = kmJ[subKey]
+								}
+							} else if kmI, okMI := rawKI.(map[string]any); okMI {
+								if kmJ, okMJ := rawKJ.(map[string]any); okMJ {
+									ks := make([]string, 0, len(kmI))
+									for k := range kmI {
+										ks = append(ks, k)
+									}
+									sort.Strings(ks)
+									for _, k := range ks {
+										if cmp := compareAny(kmI[k], kmJ[k]); cmp != 0 {
+											if desc {
+												return cmp > 0
+											}
+											return cmp < 0
+										}
+									}
+									continue
+								}
 							}
+							if cmp := compareAny(rawKI, rawKJ); cmp != 0 {
+								if desc {
+									return cmp > 0
+								}
+								return cmp < 0
+							}
+							continue
 						}
 						vi, okI := extractBucketMetricByPath(buckets[i], field)
 						vj, okJ := extractBucketMetricByPath(buckets[j], field)
@@ -10164,6 +10381,15 @@ func extractBucketMetricBySegs(b map[string]any, segs []string) (float64, bool) 
 			return v, true
 		}
 	}
+	if valMap, okVM := subMap["value"].(map[string]any); okVM {
+		valTail := tail
+		if len(valTail) > 1 && valTail[0] == "value" {
+			valTail = valTail[1:]
+		}
+		if v, okV := extractBucketMetricBySegs(valMap, valTail); okV {
+			return v, true
+		}
+	}
 	if valsMap, okVals := subMap["values"].(map[string]float64); okVals {
 		if v, exists := valsMap[prop]; exists {
 			return v, true
@@ -10198,6 +10424,13 @@ func extractBucketMetricBySegs(b map[string]any, segs []string) (float64, bool) 
 						return v, true
 					}
 				}
+			}
+		}
+	}
+	if len(tail) > 1 {
+		if nextMap, okNM := subMap[tail[0]].(map[string]any); okNM {
+			if v, okV := extractBucketMetricBySegs(nextMap, tail[1:]); okV {
+				return v, true
 			}
 		}
 	}
@@ -11122,12 +11355,16 @@ func attachSubAggsToBucket(
 			bucketMap[subName] = map[string]any{"value": val}
 		case subSpec.ScriptedMetric != nil:
 			var smVal any
-			prefix := parentBucketKey + "\x00"
+			foundSM := false
 			for _, r := range subRows {
-				if strings.HasPrefix(r.BucketKey, prefix) {
-					_ = json.Unmarshal([]byte(r.BucketKey[len(prefix):]), &smVal)
+				if lb, rv, _, ok := parseScriptedMetricBucketKey(r.BucketKey); ok && lb == parentBucketKey {
+					smVal = rv
+					foundSM = true
 					break
 				}
+			}
+			if !foundSM {
+				smVal = evalScriptedMetricAgg(subSpec.ScriptedMetric, nil)
 			}
 			bucketMap[subName] = map[string]any{"value": smVal}
 		case subSpec.EffectiveStats() != nil:
@@ -11661,6 +11898,16 @@ func attachSubAggsToBucket(
 				}
 			}
 			bucketMap[subName] = buildTopMetricsObject(matchingRows, subSpec.TopMetrics, docLookup)
+		case subSpec.Composite != nil:
+			var matchingRows []AggRow
+			for _, r := range subRows {
+				if childKey, ok := trimSubAggBucketPrefix(r.BucketKey, parentBucketKey); ok {
+					cp := r
+					cp.BucketKey = childKey
+					matchingRows = append(matchingRows, cp)
+				}
+			}
+			bucketMap[subName] = buildCompositeAggObject(indexName, subFullKey, parentBucketKey, subSpec.Composite, subSpec.SubAggs(), matchingRows, bucketsByAgg, docLookup)
 		}
 	}
 }
@@ -11746,10 +11993,14 @@ func extractHitFieldsMap(h HitRow, hitIdx string, req *esast.SearchRequest, idxS
 func formatFieldValues(field string, vals []any, format string, idxSchema *schema.IndexSchema) []any {
 	cleanField := strings.TrimSuffix(strings.TrimSuffix(field, ".keyword"), ".ngram")
 	isDateField := cleanField == "@timestamp"
+	isBoolField := false
 	if idxSchema != nil {
 		b := idxSchema.ResolveField(field)
 		if b.ESType == "date" || b.ESType == "date_nanos" {
 			isDateField = true
+		}
+		if b.ESType == "boolean" || b.DorisType == schema.DorisBoolean {
+			isBoolField = true
 		}
 	}
 	formatted := make([]any, 0, len(vals))
@@ -11763,13 +12014,24 @@ func formatFieldValues(field string, vals []any, format string, idxSchema *schem
 		}
 		switch typed := v.(type) {
 		case string:
-			if strings.EqualFold(format, "epoch_millis") {
+			if isBoolField {
+				switch strings.ToLower(strings.TrimSpace(typed)) {
+				case "true", "1":
+					v = true
+				case "false", "0":
+					v = false
+				}
+			} else if strings.EqualFold(format, "epoch_millis") {
 				if ms, ok := schema.ParseESDateToEpochMillis(typed, time.Now().UTC()); ok {
 					v = ms
 				}
 			} else if strings.EqualFold(format, "epoch_second") {
 				if ms, ok := schema.ParseESDateToEpochMillis(typed, time.Now().UTC()); ok {
 					v = ms / 1000
+				}
+			} else if isDateField && format != "" {
+				if ms, ok := schema.ParseESDateToEpochMillis(typed, time.Now().UTC()); ok {
+					v = formatDateHistogramKeyAsString(ms, &esast.DateHistogramAggSpec{Format: format})
 				}
 			} else if idxSchema != nil {
 				b := idxSchema.ResolveField(field)
@@ -11778,24 +12040,38 @@ func formatFieldValues(field string, vals []any, format string, idxSchema *schem
 				}
 			}
 		case int64:
-			if isDateField {
+			if isBoolField {
+				switch typed {
+				case 1:
+					v = true
+				case 0:
+					v = false
+				}
+			} else if isDateField {
 				if strings.EqualFold(format, "epoch_millis") {
 					v = typed
 				} else if strings.EqualFold(format, "epoch_second") {
 					v = typed / 1000
 				} else {
-					v = time.UnixMilli(typed).UTC().Format("2006-01-02T15:04:05.000Z")
+					v = formatDateHistogramKeyAsString(typed, &esast.DateHistogramAggSpec{Format: format})
 				}
 			}
 		case float64:
-			if isDateField {
+			if isBoolField {
+				switch typed {
+				case 1:
+					v = true
+				case 0:
+					v = false
+				}
+			} else if isDateField {
 				ms := int64(typed)
 				if strings.EqualFold(format, "epoch_millis") {
 					v = ms
 				} else if strings.EqualFold(format, "epoch_second") {
 					v = ms / 1000
 				} else {
-					v = time.UnixMilli(ms).UTC().Format("2006-01-02T15:04:05.000Z")
+					v = formatDateHistogramKeyAsString(ms, &esast.DateHistogramAggSpec{Format: format})
 				}
 			}
 		}
@@ -11909,6 +12185,18 @@ func collectSchemaAwareScalarValues(doc map[string]any, field string, pathSegs [
 			frontier = nextFrontier
 		}
 	}
+	if idxSchema != nil && len(vals) > 0 {
+		if b := idxSchema.ResolveField(field); b.IgnoreAbove > 0 {
+			filtered := make([]any, 0, len(vals))
+			for _, v := range vals {
+				if s, ok := v.(string); ok && utf8.RuneCountInString(s) > b.IgnoreAbove {
+					continue
+				}
+				filtered = append(filtered, v)
+			}
+			vals = filtered
+		}
+	}
 	return vals
 }
 
@@ -11938,7 +12226,34 @@ func prepareDocForRuntimeScript(idxSchema *schema.IndexSchema, doc map[string]an
 			continue
 		}
 		rawSegs := strings.Split(cleanField, ".")
-		if len(collectScalarValuesAtPath(doc, rawSegs)) > 0 {
+		rawVals := collectScalarValuesAtPath(doc, rawSegs)
+		if len(rawVals) > 0 {
+			if fb.IgnoreAbove > 0 {
+				exceeded := false
+				for _, rv := range rawVals {
+					if s, ok := rv.(string); ok && utf8.RuneCountInString(s) > fb.IgnoreAbove {
+						exceeded = true
+						break
+					}
+				}
+				if exceeded {
+					if cp == nil {
+						cp = deepCloneDocMap(doc)
+						if cp == nil {
+							cp = make(map[string]any)
+						}
+					}
+					vals := collectSchemaAwareScalarValues(doc, fieldName, rawSegs, idxSchema)
+					switch len(vals) {
+					case 0:
+						setIngestPath(cp, cleanField, nil)
+					case 1:
+						setIngestPath(cp, cleanField, vals[0])
+					default:
+						setIngestPath(cp, cleanField, vals)
+					}
+				}
+			}
 			continue
 		}
 		pathSegs := rawSegs
@@ -12263,7 +12578,13 @@ func reduceSortFieldValues(vals []any, mode, order string) any {
 }
 
 func filterSourceJSON(raw json.RawMessage, sf *esast.SourceFilter) json.RawMessage {
-	if sf == nil || (len(sf.Includes) == 0 && len(sf.Excludes) == 0) {
+	if sf == nil {
+		return raw
+	}
+	if sf.Disabled {
+		return nil
+	}
+	if len(sf.Includes) == 0 && len(sf.Excludes) == 0 {
 		return raw
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
@@ -12511,7 +12832,19 @@ func buildHighlightMapWithSchema(raw json.RawMessage, req *esast.SearchRequest, 
 	}
 	out := make(map[string][]string)
 	var allLeafPaths map[string][]string
+	fieldNames := make([]string, 0, len(req.Highlight.Fields))
 	for field := range req.Highlight.Fields {
+		fieldNames = append(fieldNames, field)
+	}
+	sort.Slice(fieldNames, func(i, j int) bool {
+		wi := strings.Contains(fieldNames[i], "*")
+		wj := strings.Contains(fieldNames[j], "*")
+		if wi != wj {
+			return !wi
+		}
+		return fieldNames[i] < fieldNames[j]
+	})
+	for _, field := range fieldNames {
 		fSpec := req.Highlight.FieldSpec(field)
 		effTagSchema := req.Highlight.TagSchema
 		if fSpec.TagSchema != "" {
@@ -12592,6 +12925,9 @@ func buildHighlightMapWithSchema(raw json.RawMessage, req *esast.SearchRequest, 
 				collectAllLeafStringPaths(doc, "", allLeafPaths)
 			}
 			for leafPath, vals := range allLeafPaths {
+				if _, alreadyExplicit := out[leafPath]; alreadyExplicit {
+					continue
+				}
 				if matchWildcardPattern(cleanField, leafPath) {
 					targetFields := []string{leafPath}
 					if len(fSpec.MatchedFields) > 0 {
@@ -12600,7 +12936,7 @@ func buildHighlightMapWithSchema(raw json.RawMessage, req *esast.SearchRequest, 
 					re := compileHighlightRegexForFields(effQuery, targetFields, requireFieldMatch, hitSchema)
 					frags := buildHighlightedFieldSnippets(vals, re, preTag, postTag, htmlEscape, effFragSize, effNumFrags, effNoMatchSize)
 					if len(frags) > 0 {
-						out[leafPath] = append(out[leafPath], frags...)
+						out[leafPath] = frags
 					}
 				}
 			}
@@ -12696,8 +13032,8 @@ func compileHighlightRegexForFields(q *esast.Query, targetFields []string, requi
 	var quotedTerms []string
 	seenTerms := make(map[string]struct{}, len(terms))
 	for _, term := range terms {
-		term = strings.Trim(term, "*?\"")
-		if len(term) == 0 {
+		term = strings.Trim(term, "\"")
+		if len(strings.Trim(term, "*?")) == 0 {
 			continue
 		}
 		lc := strings.ToLower(term)
@@ -12705,7 +13041,22 @@ func compileHighlightRegexForFields(q *esast.Query, targetFields []string, requi
 			continue
 		}
 		seenTerms[lc] = struct{}{}
-		quotedTerms = append(quotedTerms, regexp.QuoteMeta(term))
+		if strings.ContainsAny(term, "*?") {
+			var sb strings.Builder
+			for i := 0; i < len(term); i++ {
+				switch term[i] {
+				case '*':
+					sb.WriteString(`\w*`)
+				case '?':
+					sb.WriteString(`\w`)
+				default:
+					sb.WriteString(regexp.QuoteMeta(string(term[i])))
+				}
+			}
+			quotedTerms = append(quotedTerms, sb.String())
+		} else {
+			quotedTerms = append(quotedTerms, regexp.QuoteMeta(term))
+		}
 	}
 	if len(quotedTerms) == 0 {
 		return nil
@@ -12875,17 +13226,29 @@ func collectTermsFromQueryForFields(q *esast.Query, allowed map[string]bool, out
 	}
 	for field, pe := range q.MatchPhrase {
 		if fieldMatchesAllowedHighlightSet(field, allowed) && pe.Query != "" {
-			*out = append(*out, pe.Query)
+			if pe.Slop > 0 {
+				*out = append(*out, strings.Fields(pe.Query)...)
+			} else {
+				*out = append(*out, pe.Query)
+			}
 		}
 	}
 	for field, pe := range q.MatchPhrasePrefix {
 		if fieldMatchesAllowedHighlightSet(field, allowed) && pe.Query != "" {
-			*out = append(*out, pe.Query)
+			words := strings.Fields(pe.Query)
+			if len(words) > 0 {
+				*out = append(*out, words[:len(words)-1]...)
+				*out = append(*out, words[len(words)-1]+"*")
+			}
 		}
 	}
 	for field, pe := range q.MatchBoolPrefix {
 		if fieldMatchesAllowedHighlightSet(field, allowed) && pe.Query != "" {
-			*out = append(*out, strings.Fields(pe.Query)...)
+			words := strings.Fields(pe.Query)
+			if len(words) > 0 {
+				*out = append(*out, words[:len(words)-1]...)
+				*out = append(*out, words[len(words)-1]+"*")
+			}
 		}
 	}
 	if q.CombinedFields != nil && q.CombinedFields.Query != nil {
@@ -12909,10 +13272,21 @@ func collectTermsFromQueryForFields(q *esast.Query, allowed map[string]bool, out
 			}
 		}
 		if matched {
-			if strings.EqualFold(q.MultiMatch.Type, "phrase") || strings.EqualFold(q.MultiMatch.Type, "phrase_prefix") {
-				*out = append(*out, fmt.Sprintf("%v", q.MultiMatch.Query))
+			qStr := fmt.Sprintf("%v", q.MultiMatch.Query)
+			if strings.EqualFold(q.MultiMatch.Type, "phrase") {
+				if q.MultiMatch.Slop > 0 {
+					*out = append(*out, strings.Fields(qStr)...)
+				} else {
+					*out = append(*out, qStr)
+				}
+			} else if strings.EqualFold(q.MultiMatch.Type, "phrase_prefix") || strings.EqualFold(q.MultiMatch.Type, "bool_prefix") {
+				words := strings.Fields(qStr)
+				if len(words) > 0 {
+					*out = append(*out, words[:len(words)-1]...)
+					*out = append(*out, words[len(words)-1]+"*")
+				}
 			} else {
-				*out = append(*out, strings.Fields(fmt.Sprintf("%v", q.MultiMatch.Query))...)
+				*out = append(*out, strings.Fields(qStr)...)
 			}
 		}
 	}
@@ -12939,9 +13313,9 @@ func collectTermsFromQueryForFields(q *esast.Query, allowed map[string]bool, out
 			if tokField == "" && !defaultMatched {
 				continue
 			}
-			tok = strings.Trim(tok, "()*?\"+-")
+			tok = strings.Trim(tok, "()\"+-")
 			upper := strings.ToUpper(tok)
-			if tok != "" && upper != "AND" && upper != "OR" && upper != "NOT" {
+			if strings.Trim(tok, "*?") != "" && upper != "AND" && upper != "OR" && upper != "NOT" {
 				*out = append(*out, tok)
 			}
 		}
@@ -12956,8 +13330,8 @@ func collectTermsFromQueryForFields(q *esast.Query, allowed map[string]bool, out
 		}
 		if matched {
 			for _, tok := range strings.Fields(q.SimpleQueryString.Query) {
-				tok = strings.Trim(tok, "()*?\"+-|")
-				if tok != "" {
+				tok = strings.Trim(tok, "()\"+-|")
+				if strings.Trim(tok, "*?") != "" {
 					*out = append(*out, tok)
 				}
 			}
@@ -12965,14 +13339,14 @@ func collectTermsFromQueryForFields(q *esast.Query, allowed map[string]bool, out
 	}
 	for field, we := range q.Wildcard {
 		if fieldMatchesAllowedHighlightSet(field, allowed) {
-			if cleaned := strings.Trim(we.Value, "*?"); cleaned != "" {
-				*out = append(*out, cleaned)
+			if strings.Trim(we.Value, "*?") != "" {
+				*out = append(*out, we.Value)
 			}
 		}
 	}
 	for field, pe := range q.Prefix {
 		if fieldMatchesAllowedHighlightSet(field, allowed) && pe.Value != "" {
-			*out = append(*out, pe.Value)
+			*out = append(*out, pe.Value+"*")
 		}
 	}
 	for field, ts := range q.TermsSet {
@@ -14459,6 +14833,95 @@ func globalAggsHaveRuntimeScript(aggs map[string]esast.AggSpec) bool {
 	return false
 }
 
+func collectNestedPathsFromQuery(q *esast.Query, out map[string]bool) {
+	if q == nil {
+		return
+	}
+	if q.Nested != nil && q.Nested.Path != "" {
+		out[q.Nested.Path] = true
+		collectNestedPathsFromQuery(&q.Nested.Query, out)
+	}
+	if q.Bool != nil {
+		for i := range q.Bool.Must {
+			collectNestedPathsFromQuery(&q.Bool.Must[i], out)
+		}
+		for i := range q.Bool.Filter {
+			collectNestedPathsFromQuery(&q.Bool.Filter[i], out)
+		}
+		for i := range q.Bool.Should {
+			collectNestedPathsFromQuery(&q.Bool.Should[i], out)
+		}
+		for i := range q.Bool.MustNot {
+			collectNestedPathsFromQuery(&q.Bool.MustNot[i], out)
+		}
+	}
+	if q.ConstantScore != nil {
+		collectNestedPathsFromQuery(&q.ConstantScore.Filter, out)
+	}
+	if q.DisMax != nil {
+		for i := range q.DisMax.Queries {
+			collectNestedPathsFromQuery(&q.DisMax.Queries[i], out)
+		}
+	}
+	if q.Boosting != nil {
+		collectNestedPathsFromQuery(&q.Boosting.Positive, out)
+		collectNestedPathsFromQuery(&q.Boosting.Negative, out)
+	}
+	if q.FunctionScore != nil && q.FunctionScore.Query != nil {
+		collectNestedPathsFromQuery(q.FunctionScore.Query, out)
+	}
+	if q.ScriptScore != nil && q.ScriptScore.Query != nil {
+		collectNestedPathsFromQuery(q.ScriptScore.Query, out)
+	}
+}
+
+func resetNestedScalarMultiValued(props map[string]esast.FieldProperty, elems []nestedElemCandidate) map[string]esast.FieldProperty {
+	if len(props) == 0 {
+		return props
+	}
+	cp := make(map[string]esast.FieldProperty, len(props))
+	for k, v := range props {
+		isElemArray := false
+		for _, el := range elems {
+			if el.obj != nil {
+				if _, ok := el.obj[k].([]any); ok {
+					isElemArray = true
+					break
+				}
+			}
+		}
+		if !isElemArray {
+			v.MultiValued = false
+		}
+		cp[k] = v
+	}
+	return cp
+}
+
+func promoteMappingPropsToNested(props map[string]esast.FieldProperty, segs []string, elems []nestedElemCandidate) map[string]esast.FieldProperty {
+	if len(segs) == 0 {
+		return props
+	}
+	if props == nil {
+		props = make(map[string]esast.FieldProperty)
+	}
+	cp := make(map[string]esast.FieldProperty, len(props))
+	for k, v := range props {
+		cp[k] = v
+	}
+	head := segs[0]
+	prop := cp[head]
+	if len(segs) == 1 {
+		prop.Type = "nested"
+		prop.MultiValued = false
+		prop.Properties = resetNestedScalarMultiValued(prop.Properties, elems)
+	} else {
+		prop.Properties = promoteMappingPropsToNested(prop.Properties, segs[1:], elems)
+	}
+	cp[head] = prop
+	return cp
+}
+
 func docMatchesNonScriptClause(idxSchema *schema.IndexSchema, doc map[string]any, q *esast.Query) bool {
 	if q == nil {
 		return true
@@ -14468,7 +14931,21 @@ func docMatchesNonScriptClause(idxSchema *schema.IndexSchema, doc map[string]any
 		return false
 	}
 	effSchema := idxSchema
-	if effSchema == nil || effSchema.RawMapping == nil || effSchema.RawMapping.Dynamic == nil || effSchema.RawMapping.Dynamic == true || effSchema.RawMapping.Dynamic == "true" {
+	nestedPaths := make(map[string]bool)
+	if effSchema != nil {
+		for np := range effSchema.NestedRoots {
+			nestedPaths[np] = true
+		}
+	}
+	collectNestedPathsFromQuery(q, nestedPaths)
+	missingNestedRoot := false
+	for np := range nestedPaths {
+		if effSchema == nil || effSchema.NestedRoots[np] == "" {
+			missingNestedRoot = true
+			break
+		}
+	}
+	if effSchema == nil || effSchema.RawMapping == nil || effSchema.RawMapping.Dynamic == nil || effSchema.RawMapping.Dynamic == true || effSchema.RawMapping.Dynamic == "true" || missingNestedRoot {
 		inferred := schema.InferMappingFromSampleDocs([]json.RawMessage{rawSource})
 		var baseMapping *esast.MappingSpec
 		dbName, idxName := "default", "eval_idx"
@@ -14478,6 +14955,19 @@ func docMatchesNonScriptClause(idxSchema *schema.IndexSchema, doc map[string]any
 			idxName = effSchema.IndexName
 		}
 		merged := schema.MergeMappingSpecs(inferred, baseMapping)
+		if len(nestedPaths) > 0 {
+			if merged == nil {
+				merged = &esast.MappingSpec{Properties: make(map[string]esast.FieldProperty)}
+			} else {
+				cp := *merged
+				merged = &cp
+			}
+			for np := range nestedPaths {
+				segs := strings.Split(np, ".")
+				elems := extractNestedElementsAtPath(doc, segs)
+				merged.Properties = promoteMappingPropsToNested(merged.Properties, segs, elems)
+			}
+		}
 		effSchema = schema.CompileIndexSchema(dbName, idxName, merged)
 	}
 	shreddedBytes, err := schema.ShredDocument(effSchema, "_eval", 1, false, rawSource)
@@ -14855,6 +15345,18 @@ func scoreNonScriptClauseOnDoc(idxSchema *schema.IndexSchema, doc map[string]any
 func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[string]any, q *esast.Query, baseScore float64) float64 {
 	if q == nil {
 		return baseScore
+	}
+	if q.ConstantScore != nil {
+		if q.ConstantScore.Boost != nil {
+			return *q.ConstantScore.Boost
+		}
+		return 1.0
+	}
+	if q.Script != nil {
+		if q.Script.Boost != nil {
+			return *q.Script.Boost
+		}
+		return 1.0
 	}
 	if q.ScriptScore != nil && q.ScriptScore.Script != nil {
 		if q.ScriptScore.Query != nil {
@@ -15675,18 +16177,44 @@ func emitRuntimeMetricAggRows(
 			})
 		}
 	case subSpec.ScriptedMetric != nil:
-		smRes := evalScriptedMetricAgg(subSpec.ScriptedMetric, bDocs)
+		smRes, smCombined := evalScriptedMetricCombineAndReduce(subSpec.ScriptedMetric, bDocs)
 		rawJSON, _ := json.Marshal(smRes)
+		rawCombJSON, _ := json.Marshal(smCombined)
+		numVal, _ := toFloat64(smRes)
 		*out = append(*out, AggRow{
 			AggName:   fullAggName,
-			BucketKey: metricBucketKey + "\x00" + string(rawJSON),
+			BucketKey: metricBucketKey + "\x00" + string(rawJSON) + "\x00" + string(rawCombJSON),
+			DocCount:  int64(numVal),
+			Value:     numVal,
 		})
 	}
 }
 
+func parseScriptedMetricBucketKey(bk string) (logicalBucket string, reducedVal any, combinedVal any, ok bool) {
+	idx1 := strings.IndexByte(bk, '\x00')
+	if idx1 < 0 {
+		return bk, nil, nil, false
+	}
+	logicalBucket = bk[:idx1]
+	rest := bk[idx1+1:]
+	idx2 := strings.IndexByte(rest, '\x00')
+	if idx2 < 0 {
+		_ = json.Unmarshal([]byte(rest), &reducedVal)
+		return logicalBucket, reducedVal, reducedVal, true
+	}
+	_ = json.Unmarshal([]byte(rest[:idx2]), &reducedVal)
+	_ = json.Unmarshal([]byte(rest[idx2+1:]), &combinedVal)
+	return logicalBucket, reducedVal, combinedVal, true
+}
+
 func evalScriptedMetricAgg(sm *esast.ScriptedMetricAggSpec, bDocs []runtimeMatchedDoc) any {
+	reduced, _ := evalScriptedMetricCombineAndReduce(sm, bDocs)
+	return reduced
+}
+
+func evalScriptedMetricCombineAndReduce(sm *esast.ScriptedMetricAggSpec, bDocs []runtimeMatchedDoc) (any, any) {
 	if sm == nil {
-		return nil
+		return nil, nil
 	}
 	state := make(map[string]any)
 	baseParams := make(map[string]any)
@@ -15694,7 +16222,7 @@ func evalScriptedMetricAgg(sm *esast.ScriptedMetricAggSpec, bDocs []runtimeMatch
 		baseParams[k] = v
 	}
 	buildParams := func(extra map[string]any) map[string]any {
-		cp := make(map[string]any, len(baseParams)+len(extra)+2)
+		cp := make(map[string]any, len(baseParams)+len(extra)+3)
 		for k, v := range baseParams {
 			cp[k] = v
 		}
@@ -15702,6 +16230,7 @@ func evalScriptedMetricAgg(sm *esast.ScriptedMetricAggSpec, bDocs []runtimeMatch
 			cp[k] = v
 		}
 		cp["state"] = state
+		cp["_agg"] = state
 		return cp
 	}
 	if sm.InitScript != nil {
@@ -15726,22 +16255,40 @@ func evalScriptedMetricAgg(sm *esast.ScriptedMetricAggSpec, bDocs []runtimeMatch
 	if sm.CombineScript != nil {
 		combSrc, combP := extractScriptSourceAndParams(sm.CombineScript)
 		if combSrc != "" {
-			if v, err := painless.Eval(map[string]any{}, combSrc, buildParams(combP)); err == nil {
+			if v, err := painless.Eval(map[string]any{}, combSrc, buildParams(combP)); err == nil && v != nil {
 				combined = v
 			}
 		}
 	}
+	reduced := evalScriptedMetricReduce(sm, []any{combined})
+	return reduced, combined
+}
+
+func evalScriptedMetricReduce(sm *esast.ScriptedMetricAggSpec, states []any) any {
+	if sm == nil {
+		return nil
+	}
 	if sm.ReduceScript != nil {
 		redSrc, redP := extractScriptSourceAndParams(sm.ReduceScript)
 		if redSrc != "" {
-			p := buildParams(redP)
-			p["states"] = []any{combined}
+			p := make(map[string]any, len(sm.Params)+len(redP)+2)
+			for k, v := range sm.Params {
+				p[k] = v
+			}
+			for k, v := range redP {
+				p[k] = v
+			}
+			p["states"] = states
+			p["_aggs"] = states
 			if v, err := painless.Eval(map[string]any{}, redSrc, p); err == nil {
 				return v
 			}
 		}
 	}
-	return combined
+	if len(states) == 1 {
+		return states[0]
+	}
+	return states
 }
 
 func extractDocNumericValuesForBucket(md runtimeMatchedDoc, field string, missing any, script any) []float64 {
@@ -16132,8 +16679,10 @@ func restoreRootDocsForReverseNested(docs []runtimeMatchedDoc, fallbackSchema *s
 		if md.rootSchema != nil {
 			outSchema = md.rootSchema
 		}
+		hitCopy := md.hit
+		hitCopy.Schema = outSchema
 		out = append(out, runtimeMatchedDoc{
-			hit:        md.hit,
+			hit:        hitCopy,
 			doc:        rDoc,
 			rootDoc:    rDoc,
 			rootSchema: outSchema,
@@ -16215,6 +16764,7 @@ func emitRuntimeAllSubAggRows(
 			}
 		case subSpec.Nested != nil:
 			pathSegs := strings.Split(subSpec.Nested.Path, ".")
+			nSchema := deriveNestedEvalSchema(idxSchema, subSpec.Nested.Path)
 			var nDocs []runtimeMatchedDoc
 			for _, md := range bDocs {
 				rDoc := md.rootDoc
@@ -16223,12 +16773,14 @@ func emitRuntimeAllSubAggRows(
 				}
 				rSchema := md.rootSchema
 				if rSchema == nil {
-					rSchema = idxSchema
+					rSchema = md.EffectiveSchema(idxSchema)
 				}
 				for _, cand := range extractNestedElementsAtPath(md.doc, pathSegs) {
 					elemDoc := buildSingleNestedElementDoc(pathSegs, cand.obj)
+					hitCopy := md.hit
+					hitCopy.Schema = nSchema
 					nDocs = append(nDocs, runtimeMatchedDoc{
-						hit:        md.hit,
+						hit:        hitCopy,
 						doc:        elemDoc,
 						rootDoc:    rDoc,
 						rootSchema: rSchema,
@@ -16246,7 +16798,6 @@ func emitRuntimeAllSubAggRows(
 				Value:     float64(len(nDocs)),
 			})
 			if len(subSpec.SubAggs()) > 0 {
-				nSchema := deriveNestedEvalSchema(idxSchema, subSpec.Nested.Path)
 				if parentBucketKey == "" {
 					directSub, groupedSub := splitNestedSubAggsByBucketKeyMode(subSpec.SubAggs())
 					if len(directSub) > 0 {
@@ -16424,6 +16975,18 @@ func emitRuntimeCompositeAggRows(
 			}
 			var keys []string
 			seen := make(map[string]bool, len(rawVals))
+			effSchema := md.EffectiveSchema(idxSchema)
+			isBool := false
+			isLower := false
+			if effSchema != nil && tSpec.Field != "" && tSpec.Script == nil {
+				b := effSchema.ResolveField(tSpec.Field)
+				if b.ESType == "boolean" || b.DorisType == schema.DorisBoolean {
+					isBool = true
+				}
+				if b.EffectiveLowercase(true) {
+					isLower = true
+				}
+			}
 			for _, rv := range rawVals {
 				if rv == nil {
 					if tSpec.MissingBucket {
@@ -16435,6 +16998,16 @@ func emitRuntimeCompositeAggRows(
 					continue
 				}
 				ks := fmt.Sprintf("%v", rv)
+				if isBool {
+					switch strings.ToLower(strings.TrimSpace(ks)) {
+					case "true", "1":
+						ks = "true"
+					case "false", "0":
+						ks = "false"
+					}
+				} else if isLower {
+					ks = strings.ToLower(ks)
+				}
 				if !seen[ks] {
 					seen[ks] = true
 					keys = append(keys, ks)
@@ -16585,7 +17158,7 @@ func dropRuntimeAggRows(aggRows []AggRow, fullKey, parentBucketKey string) []Agg
 	prefix := fullKey + "."
 	for _, r := range aggRows {
 		if r.AggName == fullKey || strings.HasPrefix(r.AggName, prefix) {
-			if parentBucketKey == "" || r.BucketKey == parentBucketKey || strings.HasPrefix(r.BucketKey, parentBucketKey+"\x1f") {
+			if parentBucketKey == "" || r.BucketKey == parentBucketKey || strings.HasPrefix(r.BucketKey, parentBucketKey+"\x1f") || strings.HasPrefix(r.BucketKey, parentBucketKey+"\x00") {
 				continue
 			}
 		}
@@ -16664,7 +17237,7 @@ func partitionDocsByParentBucket(idxSchema *schema.IndexSchema, docs []runtimeMa
 			return filterDocsMatchingRangeEntry(idxSchema, docs, spec, rngSpec, rng, nowUTC)
 		}
 	case spec.Composite != nil:
-		allParts := strings.Split(pbKey, "\x1f")
+		allParts := splitCompositeBucketKey(pbKey)
 		nSrc := len(spec.Composite.Sources)
 		if len(allParts) < nSrc {
 			return docs
@@ -16835,6 +17408,7 @@ func applyRuntimeScriptAggsForMap(
 				aggRows = applyRuntimeScriptAggsForMap(fullKey, parentBucketKey, spec.SubAggs(), mDocs, globalDocs, aggRows, idxSchema)
 			case spec.Nested != nil:
 				pathSegs := strings.Split(spec.Nested.Path, ".")
+				nSchema := deriveNestedEvalSchema(idxSchema, spec.Nested.Path)
 				var nDocs []runtimeMatchedDoc
 				for _, md := range docs {
 					rDoc := md.rootDoc
@@ -16843,19 +17417,20 @@ func applyRuntimeScriptAggsForMap(
 					}
 					rSchema := md.rootSchema
 					if rSchema == nil {
-						rSchema = idxSchema
+						rSchema = md.EffectiveSchema(idxSchema)
 					}
 					for _, cand := range extractNestedElementsAtPath(md.doc, pathSegs) {
 						elemDoc := buildSingleNestedElementDoc(pathSegs, cand.obj)
+						hitCopy := md.hit
+						hitCopy.Schema = nSchema
 						nDocs = append(nDocs, runtimeMatchedDoc{
-							hit:        md.hit,
+							hit:        hitCopy,
 							doc:        elemDoc,
 							rootDoc:    rDoc,
 							rootSchema: rSchema,
 						})
 					}
 				}
-				nSchema := deriveNestedEvalSchema(idxSchema, spec.Nested.Path)
 				if parentBucketKey == "" {
 					directSub, groupedSub := splitNestedSubAggsByBucketKeyMode(spec.SubAggs())
 					if len(directSub) > 0 {
