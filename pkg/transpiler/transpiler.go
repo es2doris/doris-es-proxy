@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -421,12 +422,12 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		keys := sortedMapKeys(q.Fuzzy)
 		if len(keys) == 1 {
 			fe := q.Fuzzy[keys[0]]
-			return t.compileMatchField(keys[0], fe.Value, "or", fe.Boost, scoring, nctx)
+			return t.compileFuzzyField(keys[0], fe.Value, "or", fe.Fuzziness, fe.Boost, scoring, nctx)
 		}
 		var subs []esast.Query
 		for _, k := range keys {
 			fe := q.Fuzzy[k]
-			subs = append(subs, esast.Query{Match: map[string]esast.MatchEntry{k: {Query: fe.Value, Operator: "or", Boost: fe.Boost}}})
+			subs = append(subs, esast.Query{Fuzzy: map[string]esast.FuzzyEntry{k: fe}})
 		}
 		return t.compileBool(&esast.BoolQuery{Must: subs}, scoring, nctx)
 	case q.CombinedFields != nil:
@@ -534,8 +535,13 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 				boost = re.Boost
 			}
 			if strings.ContainsAny(field, "*?") && t.Schema != nil {
-				exp := t.Schema.ExpandFieldPattern(field)
+				exp := t.expandFieldPatternForContext(field, nctx)
 				if len(exp) == 0 {
+					if nctx != nil {
+						preds = append(preds, "FALSE")
+						safePreds = append(safePreds, "FALSE")
+						continue
+					}
 					w, sw, ft := compileSingleRegexp("_all_text", re)
 					preds = append(preds, w)
 					safePreds = append(safePreds, sw)
@@ -594,7 +600,7 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 					for _, tok := range tokens {
 						shoulds = append(shoulds, esast.Query{
 							Match: map[string]esast.MatchEntry{
-								keys[0]: {Query: tok, Operator: "or", Boost: 1.0},
+								keys[0]: {Query: tok, Operator: "or", Fuzziness: me.Fuzziness, Boost: 1.0},
 							},
 						})
 					}
@@ -605,6 +611,9 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 						Boost:              &boost,
 					}, scoring, nctx)
 				}
+			}
+			if me.Fuzziness != nil {
+				return t.compileFuzzyField(keys[0], me.Query, me.Operator, me.Fuzziness, me.Boost, scoring, nctx)
 			}
 			return t.compileMatchField(keys[0], me.Query, me.Operator, me.Boost, scoring, nctx)
 		}
@@ -1148,6 +1157,179 @@ func isExactKeywordField(field string, b schema.FieldBinding) bool {
 	return strings.HasSuffix(field, ".keyword") || b.ESType == "keyword" || b.ESType == "constant_keyword"
 }
 
+func isZeroFuzziness(fuzz any) bool {
+	if fuzz == nil {
+		return false
+	}
+	switch v := fuzz.(type) {
+	case int:
+		return v <= 0
+	case int64:
+		return v <= 0
+	case float64:
+		return v <= 0
+	case json.Number:
+		if f, err := v.Float64(); err == nil {
+			return f <= 0
+		}
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "0" || s == "0.0" {
+			return true
+		}
+	}
+	return false
+}
+
+func buildOneEditDistanceRegex(word string) string {
+	runes := []rune(word)
+	n := len(runes)
+	if n == 0 {
+		return ""
+	}
+	if n > 32 {
+		return regexp.QuoteMeta(word)
+	}
+	esc := make([]string, n)
+	for i, r := range runes {
+		esc[i] = regexp.QuoteMeta(string(r))
+	}
+	seen := make(map[string]bool)
+	var alts []string
+	addAlt := func(p string) {
+		if p != "" && !seen[p] {
+			seen[p] = true
+			alts = append(alts, p)
+		}
+	}
+	addAlt(strings.Join(esc, ""))
+	for i := 0; i < n; i++ {
+		prefix := strings.Join(esc[:i], "")
+		suffix := strings.Join(esc[i+1:], "")
+		addAlt(prefix + ".?" + suffix)
+	}
+	for i := 0; i <= n; i++ {
+		prefix := strings.Join(esc[:i], "")
+		suffix := strings.Join(esc[i:], "")
+		addAlt(prefix + "." + suffix)
+	}
+	for i := 0; i < n-1; i++ {
+		prefix := strings.Join(esc[:i], "")
+		suffix := strings.Join(esc[i+2:], "")
+		addAlt(prefix + esc[i+1] + esc[i] + suffix)
+	}
+	return strings.Join(alts, "|")
+}
+
+func (t *Transpiler) expandFieldPatternForContext(pattern string, nctx *nestedCtx) []schema.BoostedField {
+	if t.Schema == nil {
+		return nil
+	}
+	if nctx == nil || nctx.nestedPath == "" {
+		return t.Schema.ExpandFieldPattern(pattern)
+	}
+	prefix := nctx.nestedPath + "."
+	filterNested := func(in []schema.BoostedField) []schema.BoostedField {
+		var out []schema.BoostedField
+		for _, bf := range in {
+			b := t.Schema.ResolveField(bf.Field)
+			if b.NestedPath == nctx.nestedPath || strings.HasPrefix(bf.Field, prefix) {
+				out = append(out, bf)
+			}
+		}
+		return out
+	}
+	exp := filterNested(t.Schema.ExpandFieldPattern(pattern))
+	if len(exp) == 0 && !strings.HasPrefix(pattern, prefix) {
+		exp = filterNested(t.Schema.ExpandFieldPattern(prefix + pattern))
+	}
+	return exp
+}
+
+func (t *Transpiler) compileFuzzyField(
+	field string,
+	queryVal any,
+	operator string,
+	fuzziness any,
+	boost float64,
+	scoring bool,
+	nctx *nestedCtx,
+) CompiledQuery {
+	if isZeroFuzziness(fuzziness) {
+		return t.compileMatchField(field, queryVal, operator, boost, scoring, nctx)
+	}
+	if strings.ContainsAny(field, "*?") && t.Schema != nil {
+		exp := t.expandFieldPatternForContext(field, nctx)
+		if len(exp) == 0 {
+			if nctx != nil {
+				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+			}
+			return t.compileFuzzyField("_all_text", queryVal, operator, fuzziness, boost, scoring, nctx)
+		}
+		var shoulds []esast.Query
+		for _, bf := range exp {
+			shoulds = append(shoulds, esast.Query{
+				Match: map[string]esast.MatchEntry{
+					bf.Field: {Query: queryVal, Operator: operator, Fuzziness: fuzziness, Boost: bf.Boost},
+				},
+			})
+		}
+		b := boost
+		return t.compileBool(&esast.BoolQuery{Should: shoulds, MinimumShouldMatch: 1, Boost: &b}, scoring, nctx)
+	}
+	resolvedField, b := t.resolveFieldInNestedCtx(field, false, nctx)
+	if b.Kind == schema.StoragePromotedVector {
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
+	if effDT := effectiveDorisScalarType(b); (b.Kind == schema.StoragePromotedScalar || b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) && effDT != schema.DorisString && effDT != schema.DorisVarchar {
+		return t.compileMatchField(field, queryVal, operator, boost, scoring, nctx)
+	}
+	if b.ESType == "ip" {
+		return t.compileMatchField(field, queryVal, operator, boost, scoring, nctx)
+	}
+	queryStr := ""
+	if queryVal != nil {
+		queryStr = strings.TrimSpace(fmt.Sprintf("%v", queryVal))
+	}
+	if queryVal == nil || queryStr == "" {
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
+	if isExactKeywordField(resolvedField, b) {
+		pat := "^(" + buildOneEditDistanceRegex(queryStr) + ")$"
+		return t.CompileQuery(&esast.Query{
+			Regexp: map[string]esast.RegexpEntry{
+				resolvedField: {Value: pat, CaseInsensitive: b.EffectiveLowercase(true), Boost: boost},
+			},
+		}, scoring, nctx)
+	}
+	tokens := strings.Fields(queryStr)
+	if len(tokens) == 0 {
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
+	if len(tokens) == 1 {
+		pat := "(?i)(^|[^a-zA-Z0-9_])(" + buildOneEditDistanceRegex(tokens[0]) + ")($|[^a-zA-Z0-9_])"
+		return t.CompileQuery(&esast.Query{
+			Regexp: map[string]esast.RegexpEntry{
+				resolvedField: {Value: pat, CaseInsensitive: true, Boost: boost},
+			},
+		}, scoring, nctx)
+	}
+	var subQueries []esast.Query
+	for _, tok := range tokens {
+		pat := "(?i)(^|[^a-zA-Z0-9_])(" + buildOneEditDistanceRegex(tok) + ")($|[^a-zA-Z0-9_])"
+		subQueries = append(subQueries, esast.Query{
+			Regexp: map[string]esast.RegexpEntry{
+				resolvedField: {Value: pat, CaseInsensitive: true, Boost: 1.0},
+			},
+		})
+	}
+	bBoost := boost
+	if strings.EqualFold(operator, "and") {
+		return t.compileBool(&esast.BoolQuery{Must: subQueries, Boost: &bBoost}, scoring, nctx)
+	}
+	return t.compileBool(&esast.BoolQuery{Should: subQueries, MinimumShouldMatch: 1, Boost: &bBoost}, scoring, nctx)
+}
+
 func (t *Transpiler) compileMatchField(
 	field string,
 	queryVal any,
@@ -1385,6 +1567,7 @@ func (t *Transpiler) compileMultiMatch(mm *esast.MultiMatchQuery, scoring bool, 
 						Fields:     fields,
 						Type:       "best_fields",
 						Operator:   "or",
+						Fuzziness:  mm.Fuzziness,
 						TieBreaker: mm.TieBreaker,
 					},
 				})
@@ -1409,7 +1592,13 @@ func (t *Transpiler) compileMultiMatch(mm *esast.MultiMatchQuery, scoring bool, 
 
 	var allExpanded []schema.BoostedField
 	for _, fpat := range fields {
-		allExpanded = append(allExpanded, t.Schema.ExpandFieldPattern(fpat)...)
+		if fpat == "_all_text" && nctx != nil {
+			if exp := t.expandFieldPatternForContext("*", nctx); len(exp) > 0 {
+				allExpanded = append(allExpanded, exp...)
+				continue
+			}
+		}
+		allExpanded = append(allExpanded, t.expandFieldPatternForContext(fpat, nctx)...)
 	}
 
 	var disjuncts []string
@@ -1443,10 +1632,13 @@ func (t *Transpiler) compileMultiMatch(mm *esast.MultiMatchQuery, scoring bool, 
 							Query:              mm.Query,
 							Operator:           op,
 							MinimumShouldMatch: mm.MinimumShouldMatch,
+							Fuzziness:          mm.Fuzziness,
 							Boost:              bf.Boost,
 						},
 					},
 				}, scoring, nctx)
+			} else if mm.Fuzziness != nil {
+				c = t.compileFuzzyField(bf.Field, mm.Query, op, mm.Fuzziness, bf.Boost, scoring, nctx)
 			} else {
 				c = t.compileMatchField(bf.Field, mm.Query, op, bf.Boost, scoring, nctx)
 			}
@@ -1491,8 +1683,16 @@ func (t *Transpiler) compileMultiMatch(mm *esast.MultiMatchQuery, scoring bool, 
 }
 
 func (t *Transpiler) compileNestedWithParent(nq *esast.NestedQuery, scoring bool, parentNctx *nestedCtx) CompiledQuery {
+	if nq.Path == "" {
+		if nq.IgnoreUnmapped {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+	}
 	corrCol, ok := t.Schema.NestedRoots[nq.Path]
 	if !ok {
+		if nq.IgnoreUnmapped {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
 		corrCol = "n__" + schema.SanitizeDorisIdentifier(nq.Path)
 	}
 	elemVar := "_el"
@@ -1509,8 +1709,14 @@ func (t *Transpiler) compileNestedWithParent(nq *esast.NestedQuery, scoring bool
 		whereSQL = fmt.Sprintf("(%s AND %s)", prefilter, whereSQL)
 	}
 	scoreSQL := "1.0"
-	if scoring {
-		scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN 1.0000 ELSE 0.0 END)", whereSQL)
+	if strings.EqualFold(nq.ScoreMode, "none") {
+		scoreSQL = "0.0"
+	} else if scoring {
+		outerBoost := 1.0
+		if nq.Boost != nil {
+			outerBoost = *nq.Boost
+		}
+		scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", whereSQL, outerBoost)
 	}
 	return CompiledQuery{
 		WhereSQL:          whereSQL,
@@ -1902,7 +2108,7 @@ func (t *Transpiler) compileTermsSetTermPredicate(field string, val any, nctx *n
 
 func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive bool, nctx *nestedCtx) string {
 	if strings.ContainsAny(field, "*?") && t.Schema != nil {
-		exp := t.Schema.ExpandFieldPattern(field)
+		exp := t.expandFieldPatternForContext(field, nctx)
 		if len(exp) > 0 {
 			var disjuncts []string
 			for _, bf := range exp {
@@ -2023,6 +2229,19 @@ func (t *Transpiler) compileTermsPredicate(field string, vals []any, nctx *neste
 	if len(vals) == 0 {
 		return "FALSE"
 	}
+	if strings.ContainsAny(field, "*?") && t.Schema != nil {
+		exp := t.expandFieldPatternForContext(field, nctx)
+		if len(exp) > 0 {
+			var disjuncts []string
+			for _, bf := range exp {
+				disjuncts = append(disjuncts, t.compileTermsPredicate(bf.Field, vals, nctx))
+			}
+			if len(disjuncts) == 1 {
+				return disjuncts[0]
+			}
+			return "(" + strings.Join(disjuncts, " OR ") + ")"
+		}
+	}
 	field, b := t.resolveFieldInNestedCtx(field, true, nctx)
 	if b.Kind == schema.StoragePromotedVector {
 		return "FALSE"
@@ -2108,8 +2327,11 @@ func (t *Transpiler) compileTermsPredicate(field string, vals []any, nctx *neste
 
 func (t *Transpiler) compilePrefixPredicate(field, val string, caseInsensitive bool, nctx *nestedCtx) string {
 	if strings.ContainsAny(field, "*?") && t.Schema != nil {
-		exp := t.Schema.ExpandFieldPattern(field)
+		exp := t.expandFieldPatternForContext(field, nctx)
 		if len(exp) == 0 {
+			if nctx != nil {
+				return "FALSE"
+			}
 			return t.compilePrefixSingleField("_all_text", val, caseInsensitive, nctx)
 		}
 		var disjuncts []string
@@ -2156,8 +2378,11 @@ func (t *Transpiler) compilePrefixSingleField(field, val string, caseInsensitive
 
 func (t *Transpiler) compileWildcardPredicate(field, val string, caseInsensitive bool, nctx *nestedCtx) string {
 	if strings.ContainsAny(field, "*?") && t.Schema != nil {
-		exp := t.Schema.ExpandFieldPattern(field)
+		exp := t.expandFieldPatternForContext(field, nctx)
 		if len(exp) == 0 {
+			if nctx != nil {
+				return "FALSE"
+			}
 			return t.compileWildcardSingleField("_all_text", val, caseInsensitive, nctx)
 		}
 		var disjuncts []string
@@ -2204,7 +2429,7 @@ func (t *Transpiler) compileWildcardSingleField(field, val string, caseInsensiti
 
 func (t *Transpiler) compileRangePredicate(field string, rc esast.RangeCond, nctx *nestedCtx) string {
 	if strings.ContainsAny(field, "*?") && t.Schema != nil {
-		exp := t.Schema.ExpandFieldPattern(field)
+		exp := t.expandFieldPatternForContext(field, nctx)
 		if len(exp) > 0 {
 			var disjuncts []string
 			for _, bf := range exp {
@@ -2472,7 +2697,7 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 
 func (t *Transpiler) compileExistsPredicate(field string, nctx *nestedCtx) string {
 	if strings.ContainsAny(field, "*?") && t.Schema != nil {
-		exp := t.Schema.ExpandFieldPattern(field)
+		exp := t.expandFieldPatternForContext(field, nctx)
 		if len(exp) > 0 {
 			var disjuncts []string
 			for _, bf := range exp {
@@ -2826,6 +3051,13 @@ func (t *Transpiler) appendAggBranches(
 						}
 						if scriptExpr, ok := t.compilePolymorphicScriptExpr(subTerms.Script, effField, overrideExpr, nestedElemCtx); ok {
 							rawElemExpr = fmt.Sprintf("CAST(%s AS STRING)", scriptExpr)
+						}
+					} else if effField != "" && t.Schema != nil {
+						_, nb := t.resolveFieldInNestedCtx(effField, true, nestedElemCtx)
+						if effectiveDorisScalarType(nb) == schema.DorisBoolean {
+							rawElemExpr = fmt.Sprintf("CAST(CASE WHEN %s IS NULL THEN NULL WHEN LOWER(%s) IN ('true', '1') THEN 'true' ELSE 'false' END AS STRING)", rawElemExpr, rawElemExpr)
+						} else if nb.EffectiveLowercase(!strings.HasSuffix(effField, ".keyword")) {
+							rawElemExpr = fmt.Sprintf("CAST(LOWER(%s) AS STRING)", rawElemExpr)
 						}
 					}
 					*subIdx++
@@ -4136,8 +4368,10 @@ func (t *Transpiler) appendAggBranches(
 						}
 						expr := fmt.Sprintf("CAST(%s AS STRING)", col)
 						if effDT == schema.DorisBoolean && srcSpec.Terms.Script == nil {
+							hasHistogramSrc = true
 							expr = fmt.Sprintf("CASE WHEN %s IS NULL THEN NULL WHEN CAST(%s AS STRING) IN ('true', '1') THEN 'true' ELSE 'false' END", col, col)
 						} else if b.EffectiveLowercase(!strings.HasSuffix(effField, ".keyword")) && srcSpec.Terms.Script == nil && !strings.HasPrefix(expr, "LOWER(") {
+							hasHistogramSrc = true
 							expr = fmt.Sprintf("LOWER(%s)", expr)
 						}
 						if srcSpec.Terms.Missing != nil {
@@ -4251,6 +4485,7 @@ func (t *Transpiler) appendAggBranches(
 				if hasHistogramSrc {
 					size = t.maxAggBuckets()
 				} else if len(spec.Composite.After) > 0 {
+					size = t.maxAggBuckets()
 					var afterParts []string
 					for _, sn := range srcNames {
 						if av, ok := spec.Composite.After[sn]; ok && av != nil {
@@ -4451,10 +4686,14 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					col = scriptExpr
 				}
 			}
+			havingClause := ""
+			if fn == "AVG" || fn == "MIN" || fn == "MAX" {
+				havingClause = fmt.Sprintf(" HAVING COUNT(%s) > 0", col)
+			}
 			*branches = append(*branches, fmt.Sprintf(
 				"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(%s(%s), 0) AS DOUBLE) AS `_doc_count` "+
-					"FROM %s WHERE %s GROUP BY `_bucket_key`",
-				quoteStr(subFull), parentBucketExpr, fn, col, fromClause, subWhere,
+					"FROM %s WHERE %s GROUP BY `_bucket_key`%s",
+				quoteStr(subFull), parentBucketExpr, fn, col, fromClause, subWhere, havingClause,
 			))
 			return
 		}
@@ -4474,10 +4713,14 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					valExpr = scriptExpr
 				}
 			}
+			havingClause := ""
+			if fn == "AVG" || fn == "MIN" || fn == "MAX" {
+				havingClause = fmt.Sprintf(" HAVING COUNT(%s) > 0", valExpr)
+			}
 			*branches = append(*branches, fmt.Sprintf(
 				"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(%s(%s), 0) AS DOUBLE) AS `_doc_count` "+
-					"FROM %s WHERE %s GROUP BY `_bucket_key`",
-				quoteStr(subFull), parentBucketExpr, fn, valExpr, subFrom, subWhere,
+					"FROM %s WHERE %s GROUP BY `_bucket_key`%s",
+				quoteStr(subFull), parentBucketExpr, fn, valExpr, subFrom, subWhere, havingClause,
 			))
 			return
 		}
@@ -4501,10 +4744,14 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 				col = fmt.Sprintf("COALESCE(%s, %s)", col, strconv.FormatFloat(mf, 'f', -1, 64))
 			}
 		}
+		havingClause := ""
+		if fn == "AVG" || fn == "MIN" || fn == "MAX" {
+			havingClause = fmt.Sprintf(" HAVING COUNT(%s) > 0", col)
+		}
 		*branches = append(*branches, fmt.Sprintf(
 			"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(%s(%s), 0) AS DOUBLE) AS `_doc_count` "+
-				"FROM %s WHERE %s GROUP BY `_bucket_key`",
-			quoteStr(subFull), parentBucketExpr, fn, col, fromClause, whereClause,
+				"FROM %s WHERE %s GROUP BY `_bucket_key`%s",
+			quoteStr(subFull), parentBucketExpr, fn, col, fromClause, whereClause, havingClause,
 		))
 	}
 
@@ -5040,6 +5287,13 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 				}
 			} else {
 				col := t.sqlColumnRef(effSubField, true, nctx)
+				if subTerms.Script == nil && effSubField != "" {
+					if effectiveDorisScalarType(b) == schema.DorisBoolean {
+						col = fmt.Sprintf("CASE WHEN %s IS NULL THEN NULL WHEN LOWER(CAST(%s AS STRING)) IN ('true', '1') THEN 'true' ELSE 'false' END", col, col)
+					} else if b.EffectiveLowercase(!strings.HasSuffix(effSubField, ".keyword")) {
+						col = fmt.Sprintf("LOWER(CAST(%s AS STRING))", col)
+					}
+				}
 				if subTerms.Missing != nil && effSubField != "" {
 					col = fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", col, quoteStr(formatMissingScalar(subTerms.Missing)))
 				}

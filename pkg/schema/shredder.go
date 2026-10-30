@@ -172,6 +172,15 @@ func ShredDocument(
 	for _, b := range fieldsToVisit {
 		if len(b.CopyTo) > 0 {
 			vals := extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, false, b.NullValue)
+			if b.IgnoreAbove > 0 && len(vals) > 0 {
+				filtered := make([]string, 0, len(vals))
+				for _, v := range vals {
+					if len([]rune(v)) <= b.IgnoreAbove {
+						filtered = append(filtered, v)
+					}
+				}
+				vals = filtered
+			}
 			if len(vals) > 0 {
 				copiedRawVals[b.ESFieldPath] = append(copiedRawVals[b.ESFieldPath], vals...)
 			}
@@ -205,7 +214,18 @@ func ShredDocument(
 						tb = resolvedTB
 					}
 				}
-				copiedRawVals[targetField] = append(copiedRawVals[targetField], srcVals...)
+				chainSrcVals := srcVals
+				if ok && tb.IgnoreAbove > 0 {
+					chainSrcVals = make([]string, 0, len(srcVals))
+					for _, sv := range srcVals {
+						if len([]rune(sv)) <= tb.IgnoreAbove {
+							chainSrcVals = append(chainSrcVals, sv)
+						}
+					}
+				}
+				if len(chainSrcVals) > 0 {
+					copiedRawVals[targetField] = append(copiedRawVals[targetField], chainSrcVals...)
+				}
 				if !ok {
 					continue
 				}
@@ -1040,68 +1060,134 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 		} else {
 			applyNestedBindingNormalizationAtPath(cloned, relPath, b, getNow)
 		}
-		if len(b.CopyTo) > 0 {
-			rawSrcVals := extractStringSliceValuesWithNull(cloned, relPath, b.LowercaseNormalizer, b.NullValue)
-			var srcVals []string
-			for _, sv := range rawSrcVals {
-				if b.IgnoreAbove > 0 && len([]rune(sv)) > b.IgnoreAbove {
+	}
+
+	copiedNestedVals := make(map[string][]string)
+	for _, b := range fields {
+		if b.Kind != StorageNestedSubfield || b.NestedPath != nestedPath || len(b.CopyTo) == 0 {
+			continue
+		}
+		if len(b.SourceJSONPath) <= len(rootParts) {
+			continue
+		}
+		relPath := b.SourceJSONPath[len(rootParts):]
+		rawSrcVals := extractStringSliceValuesWithNull(cloned, relPath, b.LowercaseNormalizer, b.NullValue)
+		for _, sv := range rawSrcVals {
+			if b.IgnoreAbove > 0 && len([]rune(sv)) > b.IgnoreAbove {
+				continue
+			}
+			copiedNestedVals[b.ESFieldPath] = append(copiedNestedVals[b.ESFieldPath], sv)
+		}
+	}
+	if len(copiedNestedVals) > 0 {
+		forwardedNested := make(map[string]int)
+		for pass := 0; pass < 4; pass++ {
+			progressed := false
+			for _, b := range fields {
+				if b.Kind != StorageNestedSubfield || b.NestedPath != nestedPath || len(b.CopyTo) == 0 {
 					continue
 				}
-				srcVals = append(srcVals, sv)
-			}
-			if len(srcVals) > 0 {
+				allSrc := copiedNestedVals[b.ESFieldPath]
+				if len(allSrc) == 0 {
+					continue
+				}
 				for _, targetField := range b.CopyTo {
+					edgeKey := b.ESFieldPath + "\x00" + targetField
+					already := forwardedNested[edgeKey]
+					if already >= len(allSrc) {
+						continue
+					}
+					srcVals := allSrc[already:]
+					forwardedNested[edgeKey] = len(allSrc)
+					progressed = true
+
 					tb, ok := s.Fields[targetField]
 					if ok && tb.AliasTarget != "" {
 						if rtb, rOK := s.Fields[tb.AliasTarget]; rOK {
+							targetField = tb.AliasTarget
 							tb = rtb
 						}
 					}
-					if !ok || tb.NestedPath != nestedPath || len(tb.SourceJSONPath) <= len(rootParts) {
+					var filteredSrc []string
+					for _, sv := range srcVals {
+						if ok && tb.IgnoreAbove > 0 && len([]rune(sv)) > tb.IgnoreAbove {
+							continue
+						}
+						if ok && tb.LowercaseNormalizer {
+							sv = strings.ToLower(sv)
+						}
+						filteredSrc = append(filteredSrc, sv)
+					}
+					if len(filteredSrc) > 0 {
+						copiedNestedVals[targetField] = append(copiedNestedVals[targetField], filteredSrc...)
+					}
+					if !ok || tb.NestedPath != nestedPath || len(tb.SourceJSONPath) <= len(rootParts) || len(filteredSrc) == 0 {
 						continue
 					}
 					tRelPath := tb.SourceJSONPath[len(rootParts):]
-					if len(tRelPath) == 1 {
-						if tb.ESType != "text" && tb.ESType != "match_only_text" {
-							var arr []any
-							if existing, exists := cloned[tRelPath[0]]; exists && existing != nil {
-								if exSlice, okS := existing.([]any); okS {
-									arr = append(arr, exSlice...)
-								} else {
-									arr = append(arr, existing)
-								}
-							}
-							for _, sv := range srcVals {
-								if tb.IgnoreAbove > 0 && len([]rune(sv)) > tb.IgnoreAbove {
-									continue
-								}
-								if tb.LowercaseNormalizer {
-									sv = strings.ToLower(sv)
-								}
-								arr = append(arr, sv)
-							}
-							if len(arr) == 1 {
-								cloned[tRelPath[0]] = arr[0]
-							} else if len(arr) > 1 {
-								cloned[tRelPath[0]] = arr
-							}
-						} else {
-							joined := strings.Join(srcVals, " ")
-							if tb.LowercaseNormalizer {
-								joined = strings.ToLower(joined)
-							}
-							if existing, exists := cloned[tRelPath[0]]; exists && existing != nil {
-								cloned[tRelPath[0]] = fmt.Sprintf("%v %s", existing, joined)
-							} else {
-								cloned[tRelPath[0]] = joined
-							}
-						}
+					if len(tRelPath) >= 1 {
+						appendNestedCopyToAtPath(cloned, tRelPath, filteredSrc, tb)
 					}
 				}
+			}
+			if !progressed {
+				break
 			}
 		}
 	}
 	return cloned
+}
+
+func appendNestedCopyToAtPath(curr map[string]any, relPath []string, srcVals []string, tb FieldBinding) {
+	if len(relPath) == 0 || curr == nil || len(srcVals) == 0 {
+		return
+	}
+	key := relPath[0]
+	if len(relPath) > 1 {
+		nextVal, exists := curr[key]
+		if !exists || nextVal == nil {
+			nextMap := make(map[string]any)
+			curr[key] = nextMap
+			appendNestedCopyToAtPath(nextMap, relPath[1:], srcVals, tb)
+			return
+		}
+		switch tv := nextVal.(type) {
+		case map[string]any:
+			appendNestedCopyToAtPath(tv, relPath[1:], srcVals, tb)
+		case []any:
+			for _, elem := range tv {
+				if em, ok := elem.(map[string]any); ok {
+					appendNestedCopyToAtPath(em, relPath[1:], srcVals, tb)
+				}
+			}
+		}
+		return
+	}
+	if tb.ESType != "text" && tb.ESType != "match_only_text" {
+		var arr []any
+		if existing, exists := curr[key]; exists && existing != nil {
+			if exSlice, okS := existing.([]any); okS {
+				arr = append(arr, exSlice...)
+			} else {
+				arr = append(arr, existing)
+			}
+		}
+		for _, sv := range srcVals {
+			arr = append(arr, sv)
+		}
+		if len(arr) == 1 {
+			curr[key] = arr[0]
+		} else if len(arr) > 1 {
+			curr[key] = arr
+		}
+	} else {
+		joined := strings.Join(srcVals, " ")
+		if existing, exists := curr[key]; exists && existing != nil {
+			curr[key] = fmt.Sprintf("%v %s", existing, joined)
+		} else {
+			curr[key] = joined
+		}
+	}
 }
 
 func applyNestedKwCompanionNormalizationAtPath(curr map[string]any, relPath []string, b FieldBinding, getNow func() time.Time) {
