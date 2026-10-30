@@ -1923,18 +1923,25 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 
 	if strings.HasPrefix(expr, "array_exists(") && strings.HasSuffix(expr, ")") {
 		inner := expr[len("array_exists(") : len(expr)-1]
-		arrowIdx := strings.Index(inner, "->")
-		lastComma := strings.LastIndexByte(inner, ',')
-		if arrowIdx > 0 && lastComma > arrowIdx {
-			varName := strings.TrimSpace(inner[:arrowIdx])
-			bodyExpr := strings.TrimSpace(inner[arrowIdx+2 : lastComma])
-			colName := strings.Trim(strings.TrimSpace(inner[lastComma+1:]), "`")
-			for _, elemStr := range toStringSlice(row[colName]) {
-				if evalLambdaBody(row, elemStr, varName, bodyExpr) {
-					return true
+		args := splitTopLevelArgs(inner)
+		if len(args) == 2 {
+			arrowIdx := strings.Index(args[0], "->")
+			if arrowIdx > 0 {
+				varName := strings.TrimSpace(args[0][:arrowIdx])
+				bodyExpr := strings.TrimSpace(args[0][arrowIdx+2:])
+				colArg := strings.TrimSpace(args[1])
+				colName := strings.Trim(colArg, "`")
+				arrVal := row[colName]
+				if arrVal == nil {
+					arrVal = resolveColumnValue(row, colArg)
 				}
+				for _, elemStr := range toStringSlice(arrVal) {
+					if evalLambdaBody(row, elemStr, varName, bodyExpr) {
+						return true
+					}
+				}
+				return false
 			}
-			return false
 		}
 	}
 
@@ -2008,6 +2015,10 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 			dsl := unquoteSQLLiteral(strings.TrimSpace(args[0]))
 			col := unquoteSQLLiteral(strings.TrimSpace(args[1]))
 			op := strings.ToUpper(unquoteSQLLiteral(strings.TrimSpace(args[2])))
+			if idx := strings.IndexByte(dsl, ':'); idx > 0 && !strings.ContainsAny(dsl, " \t()") {
+				col = dsl[:idx]
+				dsl = dsl[idx+1:]
+			}
 			matchOp := "MATCH_ANY"
 			if op == "AND" {
 				matchOp = "MATCH_ALL"
@@ -2032,12 +2043,23 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 			return false
 		}
 		targets := make(map[string]bool)
+		var parsedTargets []any
 		for _, item := range strings.Split(listStr, ",") {
-			targets[unquoteSQLLiteral(strings.TrimSpace(item))] = true
+			unq := unquoteSQLLiteral(strings.TrimSpace(item))
+			targets[unq] = true
+			parsedTargets = append(parsedTargets, parseSQLLiteralValue(item))
 		}
 		for _, elem := range asSliceOrSingle(val) {
-			if elem != nil && targets[fmt.Sprintf("%v", elem)] {
+			if elem == nil {
+				continue
+			}
+			if targets[fmt.Sprintf("%v", elem)] {
 				return true
+			}
+			for _, pt := range parsedTargets {
+				if compareAny(elem, pt) == 0 {
+					return true
+				}
 			}
 		}
 		return false
@@ -2495,7 +2517,13 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 	}
 	if strings.HasPrefix(colExpr, "`") && strings.HasSuffix(colExpr, "`") {
 		colName := strings.Trim(colExpr, "`")
-		return row[colName]
+		if val := row[colName]; val != nil {
+			return val
+		}
+		if strings.HasPrefix(colName, "n__") {
+			return extractDynamicNestedJSONElementsFromRow(row, strings.TrimPrefix(colName, "n__"))
+		}
+		return nil
 	}
 	if strings.HasPrefix(colExpr, "'") && strings.HasSuffix(colExpr, "'") {
 		return unquoteSQLLiteral(colExpr)
@@ -2638,6 +2666,16 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 				best = e
 			}
 		}
+		if strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS BIGINT), ") {
+			if iv, ok := toInt64(best); ok {
+				return iv
+			}
+		}
+		if strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS DOUBLE), ") {
+			if fv, ok := toFloat(best); ok {
+				return fv
+			}
+		}
 		return best
 	}
 	if strings.HasPrefix(colExpr, "COALESCE(") && strings.HasSuffix(colExpr, ")") {
@@ -2722,7 +2760,24 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 				}
 			}
 			srcStr, _ := row["_source"].(string)
-			return extractJSONPathFromStr(srcStr, segs)
+			res := extractJSONPathFromStr(srcStr, segs)
+			if res != nil {
+				if strings.HasSuffix(colExpr, " AS BIGINT)") {
+					if iv, ok := toInt64(res); ok {
+						return iv
+					}
+					if s, ok := res.(string); ok {
+						if ms, ok := schema.ParseESDateToEpochMillis(s, time.Now().UTC()); ok {
+							return ms
+						}
+					}
+				} else if strings.HasSuffix(colExpr, " AS DOUBLE)") {
+					if fv, ok := toFloat(res); ok {
+						return fv
+					}
+				}
+			}
+			return res
 		}
 	}
 	if strings.HasPrefix(colExpr, "array_size(") && strings.HasSuffix(colExpr, ")") {
@@ -2916,6 +2971,10 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			}
 			return nil
 		}
+		if strings.HasSuffix(colExpr, " AS ARRAY<STRING>)") {
+			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS ARRAY<STRING>)")])
+			return toStringSlice(resolveColumnValue(row, inner))
+		}
 		if strings.HasSuffix(colExpr, " AS BOOLEAN)") {
 			inner := colExpr[len("CAST(") : len(colExpr)-len(" AS BOOLEAN)")]
 			if v := resolveColumnValue(row, inner); v != nil {
@@ -2940,6 +2999,9 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			return nil
 		}
 	}
+	if trimmedCase := trimOuterParens(colExpr); strings.HasPrefix(trimmedCase, "CASE WHEN ") && strings.HasSuffix(trimmedCase, " END") {
+		return evalCaseWhenValue(row, trimmedCase)
+	}
 	if isArithmeticSQLExpr(colExpr) {
 		if hasUnwrappedNullColumnRef(row, colExpr) {
 			return nil
@@ -2947,6 +3009,53 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		return evalNumericExpr(row, colExpr)
 	}
 	return nil
+}
+
+func evalCaseWhenBranchVal(row map[string]any, branchExpr string) any {
+	branchExpr = strings.TrimSpace(branchExpr)
+	if strings.EqualFold(branchExpr, "NULL") {
+		return nil
+	}
+	if strings.HasPrefix(branchExpr, "'") && strings.HasSuffix(branchExpr, "'") {
+		return unquoteSQLLiteral(branchExpr)
+	}
+	if f, err := strconv.ParseFloat(branchExpr, 64); err == nil {
+		return f
+	}
+	return resolveColumnValue(row, branchExpr)
+}
+
+func evalCaseWhenValue(row map[string]any, expr string) any {
+	inner := expr[len("CASE WHEN ") : len(expr)-len(" END")]
+	elseIdx := findTopLevelOp(inner, " ELSE ")
+	if elseIdx <= 0 {
+		return nil
+	}
+	elseExpr := inner[elseIdx+6:]
+	whenChain := inner[:elseIdx]
+	for {
+		thenIdx := findTopLevelOp(whenChain, " THEN ")
+		if thenIdx <= 0 {
+			break
+		}
+		cond := whenChain[:thenIdx]
+		rest := whenChain[thenIdx+6:]
+		nextWhenIdx := findTopLevelOp(rest, " WHEN ")
+		var thenExpr string
+		if nextWhenIdx > 0 {
+			thenExpr = rest[:nextWhenIdx]
+		} else {
+			thenExpr = rest
+		}
+		if evalWhereExpr(row, cond) {
+			return evalCaseWhenBranchVal(row, thenExpr)
+		}
+		if nextWhenIdx <= 0 {
+			break
+		}
+		whenChain = rest[nextWhenIdx+6:]
+	}
+	return evalCaseWhenBranchVal(row, elseExpr)
 }
 
 var (
@@ -3528,4 +3637,50 @@ func compareAny(a, b any) int {
 		}
 	}
 	return strings.Compare(fmt.Sprintf("%v", a), fmt.Sprintf("%v", b))
+}
+
+func extractDynamicNestedJSONElementsFromRow(row map[string]any, rawNestedPath string) []string {
+	srcStr, ok := row["_source"].(string)
+	if !ok || srcStr == "" {
+		return nil
+	}
+	var docMap map[string]any
+	dec := json.NewDecoder(strings.NewReader(srcStr))
+	dec.UseNumber()
+	if err := dec.Decode(&docMap); err != nil || docMap == nil {
+		return nil
+	}
+	segs := strings.Split(rawNestedPath, "__")
+	var out []string
+	var walk func(curr any, idx int)
+	walk = func(curr any, idx int) {
+		if curr == nil {
+			return
+		}
+		if idx >= len(segs) {
+			switch tv := curr.(type) {
+			case map[string]any:
+				if b, err := json.Marshal(tv); err == nil {
+					out = append(out, string(b))
+				}
+			case []any:
+				for _, el := range tv {
+					walk(el, idx)
+				}
+			}
+			return
+		}
+		switch tv := curr.(type) {
+		case map[string]any:
+			if next, exists := tv[segs[idx]]; exists {
+				walk(next, idx+1)
+			}
+		case []any:
+			for _, el := range tv {
+				walk(el, idx)
+			}
+		}
+	}
+	walk(docMap, 0)
+	return out
 }

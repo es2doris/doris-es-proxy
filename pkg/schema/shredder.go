@@ -1026,6 +1026,9 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 			}
 		}
 		if isKwCompanion {
+			if b.IgnoreAbove > 0 || b.LowercaseNormalizer {
+				applyNestedKwCompanionNormalizationAtPath(cloned, relPath, b, getNow)
+			}
 			if b.NullValue != nil {
 				bNorm := b
 				bNorm.IgnoreAbove = 0
@@ -1099,6 +1102,31 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 		}
 	}
 	return cloned
+}
+
+func applyNestedKwCompanionNormalizationAtPath(curr map[string]any, relPath []string, b FieldBinding, getNow func() time.Time) {
+	if len(relPath) == 0 || curr == nil {
+		return
+	}
+	key := relPath[0]
+	val, exists := curr[key]
+	if !exists {
+		return
+	}
+	if len(relPath) > 1 {
+		switch tv := val.(type) {
+		case map[string]any:
+			applyNestedKwCompanionNormalizationAtPath(tv, relPath[1:], b, getNow)
+		case []any:
+			for _, item := range tv {
+				if subM, ok := item.(map[string]any); ok {
+					applyNestedKwCompanionNormalizationAtPath(subM, relPath[1:], b, getNow)
+				}
+			}
+		}
+		return
+	}
+	curr[key+"__keyword"] = normalizeNestedLeafValue(val, b, getNow)
 }
 
 func applyNestedBindingNormalizationAtPath(curr map[string]any, relPath []string, b FieldBinding, getNow func() time.Time) {
