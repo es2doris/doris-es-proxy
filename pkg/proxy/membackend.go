@@ -2003,7 +2003,24 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 				if arrVal == nil {
 					arrVal = resolveColumnValue(row, colArg)
 				}
+				var parentNestedID string
+				if strings.HasPrefix(varName, "_el") && len(varName) > 3 {
+					parentVar := varName[:len(varName)-1]
+					if parentJSON, ok := row[parentVar].(string); ok && parentJSON != "" {
+						if pid := extractJSONPathFromStr(parentJSON, []string{"_nested_id"}); pid != nil {
+							parentNestedID = fmt.Sprintf("%v", pid)
+						}
+					}
+				}
 				for _, elemStr := range toStringSlice(arrVal) {
+					if parentNestedID != "" {
+						if elemParent := extractJSONPathFromStr(elemStr, []string{"_parent_id"}); elemParent != nil {
+							epStr := fmt.Sprintf("%v", elemParent)
+							if epStr != parentNestedID && !strings.HasPrefix(epStr, parentNestedID+".") {
+								continue
+							}
+						}
+					}
 					if evalLambdaBody(row, elemStr, varName, bodyExpr) {
 						return true
 					}

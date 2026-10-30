@@ -315,6 +315,25 @@ func ShredDocument(
 					if len(cur) > 0 {
 						row[tb.ColumnName] = cur
 					}
+					if tb.KeywordCompanion != "" {
+						kwB := s.Fields[targetField+".keyword"]
+						var curKw []string
+						if existing, ok := row[tb.KeywordCompanion].([]string); ok {
+							curKw = append(curKw, existing...)
+						}
+						for _, sv := range srcVals {
+							if kwB.IgnoreAbove > 0 && len([]rune(sv)) > kwB.IgnoreAbove {
+								continue
+							}
+							if tb.KeywordNormalizer || kwB.LowercaseNormalizer {
+								sv = strings.ToLower(sv)
+							}
+							curKw = append(curKw, sv)
+						}
+						if len(curKw) > 0 {
+							row[tb.KeywordCompanion] = curKw
+						}
+					}
 				}
 			}
 		}
@@ -326,11 +345,17 @@ func ShredDocument(
 	// Populate correlated nested JSON element arrays (`n__<nested_path>`)
 	if len(s.NestedRootSpecs) > 0 {
 		for _, nr := range s.NestedRootSpecs {
-			rawElements := extractNestedElementMaps(parsedDoc, nr.PathParts)
+			rawElements := extractNestedElementMapsWithIDs(parsedDoc, nr.PathParts, "")
 			if len(rawElements) > 0 {
 				serializedElems := make([]string, 0, len(rawElements))
-				for _, elemMap := range rawElements {
-					normMap := normalizeNestedElementForStorage(s, nr.Path, nr.PathParts, elemMap, getNow)
+				for _, elem := range rawElements {
+					normMap := normalizeNestedElementForStorage(s, nr.Path, nr.PathParts, elem.m, getNow)
+					if normMap != nil {
+						normMap["_nested_id"] = elem.nestedID
+						if elem.parentID != "" {
+							normMap["_parent_id"] = elem.parentID
+						}
+					}
 					encoded, err := json.Marshal(normMap)
 					if err == nil {
 						serializedElems = append(serializedElems, string(encoded))
@@ -342,11 +367,17 @@ func ShredDocument(
 	} else {
 		for nestedPath, corrCol := range s.NestedRoots {
 			pathParts := strings.Split(nestedPath, ".")
-			rawElements := extractNestedElementMaps(parsedDoc, pathParts)
+			rawElements := extractNestedElementMapsWithIDs(parsedDoc, pathParts, "")
 			if len(rawElements) > 0 {
 				serializedElems := make([]string, 0, len(rawElements))
-				for _, elemMap := range rawElements {
-					normMap := normalizeNestedElementForStorage(s, nestedPath, pathParts, elemMap, getNow)
+				for _, elem := range rawElements {
+					normMap := normalizeNestedElementForStorage(s, nestedPath, pathParts, elem.m, getNow)
+					if normMap != nil {
+						normMap["_nested_id"] = elem.nestedID
+						if elem.parentID != "" {
+							normMap["_parent_id"] = elem.parentID
+						}
+					}
 					encoded, err := json.Marshal(normMap)
 					if err == nil {
 						serializedElems = append(serializedElems, string(encoded))
@@ -894,41 +925,73 @@ func collectStringsAtPathWithNull(node any, path []string, lowercase bool, nullV
 	}
 }
 
-func extractNestedElementMaps(node any, path []string) []map[string]any {
+type nestedExtractedElem struct {
+	m        map[string]any
+	nestedID string
+	parentID string
+}
+
+func joinNestedElemID(prefix string, idx int) string {
+	s := strconv.Itoa(idx)
+	if prefix == "" {
+		return s
+	}
+	return prefix + "." + s
+}
+
+func splitNestedParentID(nestedID string) string {
+	if dot := strings.LastIndexByte(nestedID, '.'); dot > 0 {
+		return nestedID[:dot]
+	}
+	return ""
+}
+
+func extractNestedElementMapsWithIDs(node any, path []string, curPrefix string) []nestedExtractedElem {
 	if node == nil {
 		return nil
 	}
 	if len(path) == 0 {
 		switch v := node.(type) {
 		case []any:
-			var res []map[string]any
-			for _, item := range v {
+			var res []nestedExtractedElem
+			for idx, item := range v {
 				if m, ok := item.(map[string]any); ok {
-					res = append(res, m)
+					nid := joinNestedElemID(curPrefix, idx)
+					res = append(res, nestedExtractedElem{
+						m:        m,
+						nestedID: nid,
+						parentID: splitNestedParentID(nid),
+					})
 				}
 			}
 			return res
 		case map[string]any:
-			return []map[string]any{v}
+			nid := joinNestedElemID(curPrefix, 0)
+			return []nestedExtractedElem{{
+				m:        v,
+				nestedID: nid,
+				parentID: splitNestedParentID(nid),
+			}}
 		}
 		return nil
 	}
 	switch curr := node.(type) {
 	case map[string]any:
 		if next, exists := curr[path[0]]; exists {
-			return extractNestedElementMaps(next, path[1:])
+			return extractNestedElementMapsWithIDs(next, path[1:], curPrefix)
 		}
 		if len(path) > 1 {
 			dotted := strings.Join(path, ".")
 			if next, exists := curr[dotted]; exists {
-				return extractNestedElementMaps(next, nil)
+				return extractNestedElementMapsWithIDs(next, nil, curPrefix)
 			}
 		}
 		return nil
 	case []any:
-		var res []map[string]any
-		for _, elem := range curr {
-			res = append(res, extractNestedElementMaps(elem, path)...)
+		var res []nestedExtractedElem
+		for idx, elem := range curr {
+			nextPrefix := joinNestedElemID(curPrefix, idx)
+			res = append(res, extractNestedElementMapsWithIDs(elem, path, nextPrefix)...)
 		}
 		return res
 	default:
@@ -1031,36 +1094,6 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 			fields = append(fields, b)
 		}
 	}
-	for _, b := range fields {
-		if b.Kind != StorageNestedSubfield || b.NestedPath != nestedPath {
-			continue
-		}
-		if len(b.SourceJSONPath) <= len(rootParts) {
-			continue
-		}
-		relPath := b.SourceJSONPath[len(rootParts):]
-		isKwCompanion := false
-		if strings.HasSuffix(b.ESFieldPath, ".keyword") {
-			if _, hasBase := s.Fields[strings.TrimSuffix(b.ESFieldPath, ".keyword")]; hasBase {
-				isKwCompanion = true
-			}
-		}
-		if isKwCompanion {
-			if b.IgnoreAbove > 0 || b.LowercaseNormalizer {
-				applyNestedKwCompanionNormalizationAtPath(cloned, relPath, b, getNow)
-			}
-			if b.NullValue != nil {
-				bNorm := b
-				bNorm.IgnoreAbove = 0
-				bNorm.LowercaseNormalizer = false
-				if b.IgnoreAbove == 0 || len([]rune(fmt.Sprintf("%v", b.NullValue))) <= b.IgnoreAbove {
-					applyNestedBindingNormalizationAtPath(cloned, relPath, bNorm, getNow)
-				}
-			}
-		} else {
-			applyNestedBindingNormalizationAtPath(cloned, relPath, b, getNow)
-		}
-	}
 
 	copiedNestedVals := make(map[string][]string)
 	for _, b := range fields {
@@ -1133,6 +1166,37 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 			if !progressed {
 				break
 			}
+		}
+	}
+
+	for _, b := range fields {
+		if b.Kind != StorageNestedSubfield || b.NestedPath != nestedPath {
+			continue
+		}
+		if len(b.SourceJSONPath) <= len(rootParts) {
+			continue
+		}
+		relPath := b.SourceJSONPath[len(rootParts):]
+		isKwCompanion := false
+		if strings.HasSuffix(b.ESFieldPath, ".keyword") {
+			if _, hasBase := s.Fields[strings.TrimSuffix(b.ESFieldPath, ".keyword")]; hasBase {
+				isKwCompanion = true
+			}
+		}
+		if isKwCompanion {
+			if b.IgnoreAbove > 0 || b.LowercaseNormalizer {
+				applyNestedKwCompanionNormalizationAtPath(cloned, relPath, b, getNow)
+			}
+			if b.NullValue != nil {
+				bNorm := b
+				bNorm.IgnoreAbove = 0
+				bNorm.LowercaseNormalizer = false
+				if b.IgnoreAbove == 0 || len([]rune(fmt.Sprintf("%v", b.NullValue))) <= b.IgnoreAbove {
+					applyNestedBindingNormalizationAtPath(cloned, relPath, bNorm, getNow)
+				}
+			}
+		} else {
+			applyNestedBindingNormalizationAtPath(cloned, relPath, b, getNow)
 		}
 	}
 	return cloned
