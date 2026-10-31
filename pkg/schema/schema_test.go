@@ -559,3 +559,83 @@ func TestRound29SchemaPromoteVariantNestedRootGuardNilResolveAndShredIgnoreAbove
 		t.Fatalf("expected GeneratePromoteVariantFieldDDL for text to include companion .keyword, got %v", promoteDDLs)
 	}
 }
+
+func TestRound30CopyToKeywordCompanionAndNestedTextKeywordArray(t *testing.T) {
+	// 1. Non-text copy_to target with .keyword companion AND nested text copy_to target with .keyword companion
+	rawMap := `{
+		"properties": {
+			"src_a": {"type": "keyword", "copy_to": "combined_kw"},
+			"src_b": {"type": "keyword", "copy_to": "combined_kw"},
+			"combined_kw": {
+				"type": "keyword",
+				"fields": {
+					"keyword": {"type": "keyword"}
+				}
+			},
+			"items": {
+				"type": "nested",
+				"properties": {
+					"brand": {"type": "keyword", "copy_to": "items.all_text"},
+					"category": {"type": "keyword", "copy_to": "items.all_text"},
+					"all_text": {
+						"type": "text",
+						"fields": {
+							"keyword": {"type": "keyword", "ignore_above": 10, "normalizer": "lowercase"}
+						}
+					}
+				}
+			}
+		}
+	}`
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(rawMap), &spec); err != nil {
+		t.Fatalf("unmarshal mapping failed: %v", err)
+	}
+	sch := CompileIndexSchema("db", "r30_idx", &spec)
+
+	// Verify combined_kw.keyword was promoted to StoragePromotedArray
+	kwBinding := sch.ResolveEffectiveField("combined_kw.keyword", true)
+	if kwBinding.Kind != StoragePromotedArray || !kwBinding.IsMultiValued {
+		t.Fatalf("expected combined_kw.keyword to be StoragePromotedArray / IsMultiValued=true, got %+v", kwBinding)
+	}
+	// Verify items.all_text.keyword has IsMultiValued=true
+	nestedKwBinding := sch.ResolveEffectiveField("items.all_text.keyword", true)
+	if !nestedKwBinding.IsMultiValued {
+		t.Fatalf("expected items.all_text.keyword to have IsMultiValued=true, got %+v", nestedKwBinding)
+	}
+
+	shredBytes, err := ShredDocument(sch, "doc1", 1, false, json.RawMessage(`{
+		"src_a": "alpha",
+		"src_b": "beta",
+		"items": [
+			{"brand": "ACME", "category": "WIDGETS_LONG_IGNORED"}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("ShredDocument failed: %v", err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(shredBytes, &row); err != nil {
+		t.Fatalf("unmarshal shredded row failed: %v", err)
+	}
+	nItems, ok := row["n__items"].([]any)
+	if !ok || len(nItems) != 1 {
+		t.Fatalf("expected 1 nested item in n__items, got %v", row["n__items"])
+	}
+	var elem map[string]any
+	if s, isStr := nItems[0].(string); isStr {
+		_ = json.Unmarshal([]byte(s), &elem)
+	} else if m, isMap := nItems[0].(map[string]any); isMap {
+		elem = m
+	}
+	kwArr, ok := elem["all_text__keyword"].([]any)
+	if !ok || len(kwArr) != 1 || kwArr[0] != "acme" {
+		t.Fatalf("expected all_text__keyword=['acme'] (lowercased, 'WIDGETS_LONG_IGNORED' filtered by ignore_above=10), got %v", elem["all_text__keyword"])
+	}
+
+	// 2. truncateUTF8Bytes multi-byte rune boundary safety
+	trunc := truncateUTF8Bytes("a€b", 3) // 'a' (1 byte) + '€' (3 bytes) = 4 bytes -> should truncate before '€'
+	if trunc != "a" {
+		t.Fatalf("expected truncateUTF8Bytes('a€b', 3) == 'a', got %q", trunc)
+	}
+}

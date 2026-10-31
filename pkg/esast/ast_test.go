@@ -599,3 +599,91 @@ func TestRound29ASTIdsQueryNumericScalarBoostPhraseFuzzinessAndAggSpecs(t *testi
 		t.Fatalf("expected RangeCond NormalizedBounds GTE=10, LT=20, got %+v", rc)
 	}
 }
+
+func TestRound30PrefixWildcardRegexpFuzzySortAndPipelineHelpers(t *testing.T) {
+	// 1. PrefixEntry: "prefix" key, scalar number/bool, and explicit "boost": 0
+	var pfxKey, pfxNum, pfxBool PrefixEntry
+	if err := json.Unmarshal([]byte(`{"prefix":"err_","case_insensitive":true,"boost":0}`), &pfxKey); err != nil {
+		t.Fatalf("PrefixEntry 'prefix' key unmarshal failed: %v", err)
+	}
+	if pfxKey.Value != "err_" || !pfxKey.CaseInsensitive || !pfxKey.HasBoost || pfxKey.Boost != 0 {
+		t.Fatalf("unexpected PrefixEntry from 'prefix' key: %+v", pfxKey)
+	}
+	if err := json.Unmarshal([]byte(`123`), &pfxNum); err != nil || pfxNum.Value != "123" || pfxNum.HasBoost {
+		t.Fatalf("PrefixEntry scalar number unmarshal failed: %+v (%v)", pfxNum, err)
+	}
+	if err := json.Unmarshal([]byte(`{"value":true,"boost":2.0}`), &pfxBool); err != nil || pfxBool.Value != "true" || !pfxBool.HasBoost || pfxBool.Boost != 2.0 {
+		t.Fatalf("PrefixEntry scalar bool unmarshal failed: %+v (%v)", pfxBool, err)
+	}
+
+	// 2. WildcardEntry: scalar number/bool and explicit "boost": 0
+	var wcObj, wcScalar WildcardEntry
+	if err := json.Unmarshal([]byte(`{"wildcard":"*warn*","case_insensitive":true,"boost":0}`), &wcObj); err != nil {
+		t.Fatalf("WildcardEntry unmarshal failed: %v", err)
+	}
+	if wcObj.Value != "*warn*" || !wcObj.CaseInsensitive || !wcObj.HasBoost || wcObj.Boost != 0 {
+		t.Fatalf("unexpected WildcardEntry: %+v", wcObj)
+	}
+	if err := json.Unmarshal([]byte(`404`), &wcScalar); err != nil || wcScalar.Value != "404" || wcScalar.HasBoost {
+		t.Fatalf("WildcardEntry scalar unmarshal failed: %+v (%v)", wcScalar, err)
+	}
+
+	// 3. RegexpEntry: "regexp" key, scalar number, and explicit "boost": 0
+	var reObj, reScalar RegexpEntry
+	if err := json.Unmarshal([]byte(`{"regexp":"err-[0-9]+","case_insensitive":true,"flags":"ALL","boost":0}`), &reObj); err != nil {
+		t.Fatalf("RegexpEntry 'regexp' key unmarshal failed: %v", err)
+	}
+	if reObj.Value != "err-[0-9]+" || !reObj.CaseInsensitive || !reObj.HasBoost || reObj.Boost != 0 {
+		t.Fatalf("unexpected RegexpEntry: %+v", reObj)
+	}
+	if err := json.Unmarshal([]byte(`500`), &reScalar); err != nil || reScalar.Value != "500" || reScalar.HasBoost {
+		t.Fatalf("RegexpEntry scalar unmarshal failed: %+v (%v)", reScalar, err)
+	}
+
+	// 4. FuzzyEntry: CaseInsensitive
+	var fz FuzzyEntry
+	if err := json.Unmarshal([]byte(`{"value":"Quick","fuzziness":1,"case_insensitive":true,"boost":1.5}`), &fz); err != nil {
+		t.Fatalf("FuzzyEntry unmarshal failed: %v", err)
+	}
+	if fz.Value != "Quick" || !fz.CaseInsensitive || fz.Boost != 1.5 {
+		t.Fatalf("unexpected FuzzyEntry: %+v", fz)
+	}
+
+	// 5. DateHistogramAggSpec signed offsets and intervals
+	for _, tc := range []struct {
+		offset string
+		wantMs int64
+	}{
+		{"-30s", -30000},
+		{"+500ms", 500},
+		{"-2h", -7200000},
+		{"+3d", 259200000},
+		{"+1w", 604800000},
+	} {
+		dh := DateHistogramAggSpec{Offset: tc.offset}
+		if got := dh.EffectiveOffsetMs(); got != tc.wantMs {
+			t.Fatalf("EffectiveOffsetMs(%q) = %d, want %d", tc.offset, got, tc.wantMs)
+		}
+	}
+
+	// 6. SortSpec unmarshal/marshal round-trip (_geo_distance, flat options, nested_path/nested_filter)
+	var geoSort, nestedSort SortSpec
+	if err := json.Unmarshal([]byte(`{"_geo_distance":{"pin.location":{"lat":40.7,"lon":-74.0},"order":"asc","unit":"km"}}`), &geoSort); err != nil {
+		t.Fatalf("SortSpec _geo_distance unmarshal failed: %v", err)
+	}
+	if geoSort.Entry.Field != "_geo_distance" || geoSort.Entry.Script == nil || geoSort.Entry.Order != "asc" {
+		t.Fatalf("unexpected geoSort: %+v", geoSort)
+	}
+	if b, err := json.Marshal(geoSort); err != nil || len(b) == 0 {
+		t.Fatalf("SortSpec _geo_distance marshal failed: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"items.price":{"order":"desc","mode":"max","numeric_type":"double","nested_path":"items","nested_filter":{"term":{"items.active":true}}}}`), &nestedSort); err != nil {
+		t.Fatalf("SortSpec nested_path/nested_filter unmarshal failed: %v", err)
+	}
+	if nestedSort.Entry.Nested == nil || nestedSort.Entry.Nested.Path != "items" || nestedSort.Entry.Nested.Filter == nil || nestedSort.Entry.Type != "double" {
+		t.Fatalf("unexpected nestedSort: %+v", nestedSort)
+	}
+	if b, err := json.Marshal(nestedSort); err != nil || len(b) == 0 {
+		t.Fatalf("SortSpec nested marshal failed: %v", err)
+	}
+}
