@@ -303,6 +303,18 @@ func (s *Server) syncCatalogFromBackend(ctx context.Context) error {
 			if err := json.Unmarshal([]byte(e.PayloadJSON), &tpl); err == nil {
 				s.templates[e.EntityKey] = tpl
 			}
+		case "component_template":
+			if isDeleted {
+				delete(s.componentTemplates, e.EntityKey)
+				continue
+			}
+			var comp map[string]any
+			if err := json.Unmarshal([]byte(e.PayloadJSON), &comp); err == nil && comp != nil {
+				if s.componentTemplates == nil {
+					s.componentTemplates = make(map[string]map[string]any)
+				}
+				s.componentTemplates[e.EntityKey] = comp
+			}
 		case "index":
 			if isDeleted {
 				delete(s.indices, e.EntityKey)
@@ -403,6 +415,19 @@ func (s *Server) persistTemplate(ctx context.Context, name string, tpl esast.Ind
 		if raw, err := json.Marshal(tpl); err == nil {
 			_ = cb.UpsertCatalogEntry(ctx, s.dorisDB, CatalogEntry{
 				EntityType:     "template",
+				EntityKey:      name,
+				PayloadJSON:    string(raw),
+				UpdatedEpochMs: s.allocVersion(0),
+			})
+		}
+	}
+}
+
+func (s *Server) persistComponentTemplate(ctx context.Context, name string, comp map[string]any) {
+	if cb, ok := s.backend.(CatalogBackend); ok {
+		if raw, err := json.Marshal(comp); err == nil {
+			_ = cb.UpsertCatalogEntry(ctx, s.dorisDB, CatalogEntry{
+				EntityType:     "component_template",
 				EntityKey:      name,
 				PayloadJSON:    string(raw),
 				UpdatedEpochMs: s.allocVersion(0),
@@ -1050,7 +1075,14 @@ func (s *Server) resolveEffectivePipeline(indexName, reqPipeline, itemPipeline s
 	if !hasPipe && !hasIdx {
 		_ = s.syncCatalogFromBackend(context.Background())
 		s.mu.RLock()
-		defPipe = s.indexDefaultPipelines[indexName]
+		defPipe, hasPipe = s.indexDefaultPipelines[indexName]
+		_, hasIdx = s.indices[indexName]
+		if !hasPipe && !hasIdx {
+			_, tplDef, hasTplDef, _, _, _ := s.matchingTemplateConfigLocked(indexName)
+			if hasTplDef {
+				defPipe = tplDef
+			}
+		}
 		s.mu.RUnlock()
 	}
 	if defPipe == "_none" {
@@ -1067,7 +1099,14 @@ func (s *Server) resolveFinalPipeline(indexName string) string {
 	if !hasPipe && !hasIdx {
 		_ = s.syncCatalogFromBackend(context.Background())
 		s.mu.RLock()
-		finPipe = s.indexFinalPipelines[indexName]
+		finPipe, hasPipe = s.indexFinalPipelines[indexName]
+		_, hasIdx = s.indices[indexName]
+		if !hasPipe && !hasIdx {
+			_, _, _, tplFin, hasTplFin, _ := s.matchingTemplateConfigLocked(indexName)
+			if hasTplFin {
+				finPipe = tplFin
+			}
+		}
 		s.mu.RUnlock()
 	}
 	if finPipe == "_none" {
@@ -1569,17 +1608,26 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 			s.mu.Lock()
 			s.componentTemplates[name] = comp
 			s.mu.Unlock()
+			s.persistComponentTemplate(r.Context(), name, comp)
+			s.queryCache.InvalidateAll()
 			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 		case http.MethodHead:
 			s.mu.RLock()
 			_, ok := s.componentTemplates[name]
 			s.mu.RUnlock()
 			if !ok {
+				_ = s.syncCatalogFromBackend(r.Context())
+				s.mu.RLock()
+				_, ok = s.componentTemplates[name]
+				s.mu.RUnlock()
+			}
+			if !ok {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
 			w.WriteHeader(http.StatusOK)
 		case http.MethodGet:
+			_ = s.syncCatalogFromBackend(r.Context())
 			s.mu.RLock()
 			list := make([]map[string]any, 0, len(s.componentTemplates))
 			for k, v := range s.componentTemplates {
@@ -1594,9 +1642,17 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"component_templates": list})
 		case http.MethodDelete:
+			_ = s.syncCatalogFromBackend(r.Context())
 			s.mu.Lock()
+			_, existed := s.componentTemplates[name]
 			delete(s.componentTemplates, name)
 			s.mu.Unlock()
+			if !existed {
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "component_template ["+name+"] missing")
+				return
+			}
+			s.deleteCatalogEntity(r.Context(), "component_template", name)
+			s.queryCache.InvalidateAll()
 			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 		default:
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
@@ -1699,24 +1755,75 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) matchingTemplateMappingsLocked(indexName string) *esast.MappingSpec {
+	merged, _, _, _, _, _ := s.matchingTemplateConfigLocked(indexName)
+	return merged
+}
+
+func (s *Server) matchingTemplateConfigLocked(indexName string) (*esast.MappingSpec, string, bool, string, bool, map[string]map[string]any) {
 	var merged *esast.MappingSpec
-	tplNames := make([]string, 0, len(s.templates))
-	for k := range s.templates {
-		tplNames = append(tplNames, k)
-	}
-	sort.Strings(tplNames)
-	for _, name := range tplNames {
-		tpl := s.templates[name]
+	var defaultPipeline string
+	var hasDefaultPipeline bool
+	var finalPipeline string
+	var hasFinalPipeline bool
+	var mergedAliases map[string]map[string]any
+
+	var matchedNames []string
+	for k, tpl := range s.templates {
 		for _, pat := range tpl.EffectivePatterns() {
 			if matchWildcardPattern(pat, indexName) {
-				if m := tpl.EffectiveMappings(); m != nil {
-					merged = schema.MergeMappingSpecs(merged, m)
-				}
+				matchedNames = append(matchedNames, k)
 				break
 			}
 		}
 	}
-	return merged
+	sort.Slice(matchedNames, func(i, j int) bool {
+		pi := s.templates[matchedNames[i]].EffectivePriority()
+		pj := s.templates[matchedNames[j]].EffectivePriority()
+		if pi != pj {
+			return pi < pj
+		}
+		return matchedNames[i] < matchedNames[j]
+	})
+
+	applyTemplateSpec := func(t esast.IndexTemplateRequest) {
+		if m := t.EffectiveMappings(); m != nil {
+			merged = schema.MergeMappingSpecs(merged, m)
+		}
+		if ts := t.EffectiveSettings(); len(ts) > 0 {
+			if p, found := extractDefaultPipelineFromSettings(ts); found {
+				defaultPipeline = p
+				hasDefaultPipeline = true
+			}
+			if fp, found := extractFinalPipelineFromSettings(ts); found {
+				finalPipeline = fp
+				hasFinalPipeline = true
+			}
+		}
+		if ta := t.EffectiveAliases(); len(ta) > 0 {
+			if mergedAliases == nil {
+				mergedAliases = make(map[string]map[string]any, len(ta))
+			}
+			for al, meta := range ta {
+				mergedAliases[al] = meta
+			}
+		}
+	}
+
+	for _, name := range matchedNames {
+		tpl := s.templates[name]
+		for _, compName := range tpl.ComposedOf {
+			if compRaw, ok := s.componentTemplates[compName]; ok && len(compRaw) > 0 {
+				if rawBytes, err := json.Marshal(compRaw); err == nil {
+					var compTpl esast.IndexTemplateRequest
+					if err := json.Unmarshal(rawBytes, &compTpl); err == nil {
+						applyTemplateSpec(compTpl)
+					}
+				}
+			}
+		}
+		applyTemplateSpec(tpl)
+	}
+	return merged, defaultPipeline, hasDefaultPipeline, finalPipeline, hasFinalPipeline, mergedAliases
 }
 
 func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
@@ -1736,7 +1843,7 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 	_ = s.syncCatalogFromBackend(r.Context())
 	s.mu.RLock()
 	oldSchema := s.indices[indexName]
-	tplMappings := s.matchingTemplateMappingsLocked(indexName)
+	tplMappings, tplDefPipe, hasTplDefPipe, tplFinPipe, hasTplFinPipe, tplAliases := s.matchingTemplateConfigLocked(indexName)
 	s.mu.RUnlock()
 
 	effectiveMappings := schema.MergeMappingSpecs(tplMappings, req.Mappings)
@@ -1756,6 +1863,20 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 	aliasesToPersist := make(map[string][]string)
 	s.mu.Lock()
 	s.indices[indexName] = compiled
+	if hasTplDefPipe {
+		if tplDefPipe == "" {
+			delete(s.indexDefaultPipelines, indexName)
+		} else {
+			s.indexDefaultPipelines[indexName] = tplDefPipe
+		}
+	}
+	if hasTplFinPipe {
+		if tplFinPipe == "" {
+			delete(s.indexFinalPipelines, indexName)
+		} else {
+			s.indexFinalPipelines[indexName] = tplFinPipe
+		}
+	}
 	if p, found := extractDefaultPipelineFromSettings(req.Settings); found {
 		if p == "" {
 			delete(s.indexDefaultPipelines, indexName)
@@ -1769,6 +1890,11 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 		} else {
 			s.indexFinalPipelines[indexName] = fp
 		}
+	}
+	for alias, rawMeta := range tplAliases {
+		meta := parseAliasMetadata(rawMeta)
+		s.addAliasWithMetaLocked(alias, indexName, meta)
+		aliasesToPersist[alias] = append([]string(nil), s.aliases[alias]...)
 	}
 	for alias, rawMeta := range req.Aliases {
 		meta := parseAliasMetadata(rawMeta)
@@ -3172,6 +3298,13 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 		_ = s.allocVersion(assignedVer)
 	}
 
+	updReq.MetaID = docID
+	updReq.MetaIndex = indexName
+	if found && existingHit != nil {
+		updReq.MetaVersion = existingHit.Version
+	} else {
+		updReq.MetaVersion = 1
+	}
 	mutatedSource, opResult, err := painless.ApplyUpdateWithResult(baseSource, &updReq, found)
 	if err != nil {
 		writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
@@ -3373,7 +3506,6 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 	versionConflicts := 0
 	batches := 0
 	conflictsProceed := strings.EqualFold(r.URL.Query().Get("conflicts"), "proceed") || strings.EqualFold(body.Conflicts, "proceed")
-	updSpec := &painless.UpdateRequest{Script: body.Script}
 	if body.Query != nil && hasTermsLookupInQuery(body.Query) {
 		s.resolveTermsLookupsInQuery(r.Context(), body.Query)
 	}
@@ -3454,7 +3586,13 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 				totalMatched++
-				mutated, opRes, err := painless.ApplyUpdateWithResult(h.Source, updSpec, true)
+				updItem := &painless.UpdateRequest{
+					Script:      body.Script,
+					MetaID:      h.ID,
+					MetaIndex:   indexName,
+					MetaVersion: h.Version,
+				}
+				mutated, opRes, err := painless.ApplyUpdateWithResult(h.Source, updItem, true)
 				if err != nil {
 					writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
 					return
@@ -4156,8 +4294,13 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			var baseSrc json.RawMessage
+			upd.MetaID = op.ID
+			upd.MetaIndex = targetIndex
 			if found {
 				baseSrc = existingHit.Source
+				upd.MetaVersion = existingHit.Version
+			} else {
+				upd.MetaVersion = 1
 			}
 			merged, opRes, err := painless.ApplyUpdateWithResult(baseSrc, &upd, found)
 			if err != nil {
@@ -4530,6 +4673,11 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		r.URL.Query().Get("_doris_explain") == "true" || r.URL.Query().Get("_doris_explain") == "1" {
 		resp["_doris_explain"] = s.buildDorisExplainObject(r.Context(), rawIndex, &req)
 	}
+	if r.URL.Query().Get("typed_keys") == "true" || (r.URL.Query().Has("typed_keys") && r.URL.Query().Get("typed_keys") != "false") {
+		if aggsMap, ok := resp["aggregations"].(map[string]any); ok {
+			applyTypedKeysToAggregations(aggsMap, req.EffectiveAggs())
+		}
+	}
 	if r.URL.Query().Get("rest_total_hits_as_int") == "true" {
 		if hitsObj, ok := resp["hits"].(map[string]any); ok {
 			if totalObj, ok := hitsObj["total"].(map[string]any); ok {
@@ -4643,6 +4791,7 @@ func (s *Server) buildDorisExplainObject(ctx context.Context, rawIndexPattern st
 }
 
 func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
+	_ = s.syncCatalogFromBackend(r.Context())
 	targets := s.resolveTargetIndices(r.PathValue("index"))
 	var filterPatterns []string
 	if fieldsFilter := r.URL.Query().Get("fields"); fieldsFilter != "" {
@@ -4694,8 +4843,16 @@ func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		for esPath, fb := range idxSchema.Fields {
-			if fb.ESType == "alias" && fb.AliasTarget == "" {
-				continue
+			if fb.ESType == "alias" {
+				if fb.AliasTarget == "" {
+					continue
+				}
+				if tb, ok := idxSchema.Fields[fb.AliasTarget]; ok && tb.ESType != "alias" {
+					fb.ESType = tb.ESType
+					fb.DorisType = tb.DorisType
+				} else {
+					continue
+				}
 			}
 			switch {
 			case fb.ESType != "":
@@ -4759,10 +4916,14 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var hdr struct {
-			Index          any    `json:"index"`
-			Indices        any    `json:"indices"`
-			FilterPath     string `json:"filter_path"`
-			TerminateAfter *int   `json:"terminate_after"`
+			Index              any    `json:"index"`
+			Indices            any    `json:"indices"`
+			SearchType         string `json:"search_type"`
+			Routing            any    `json:"routing"`
+			RestTotalHitsAsInt *bool  `json:"rest_total_hits_as_int"`
+			TypedKeys          *bool  `json:"typed_keys"`
+			FilterPath         string `json:"filter_path"`
+			TerminateAfter     *int   `json:"terminate_after"`
 		}
 		_ = json.Unmarshal(headerLine, &hdr)
 		targetIdx := defaultIndex
@@ -4795,6 +4956,13 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
+		if strings.EqualFold(hdr.SearchType, "count") || (hdr.SearchType == "" && strings.EqualFold(r.URL.Query().Get("search_type"), "count")) {
+			zero := 0
+			req.Size = &zero
+			if req.TrackTotalHits == nil {
+				req.TrackTotalHits = true
+			}
+		}
 		if req.TerminateAfter == nil && hdr.TerminateAfter != nil {
 			req.TerminateAfter = hdr.TerminateAfter
 		}
@@ -4819,7 +4987,12 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 			resp["pit_id"] = req.PIT.ID
 		}
 		resp["status"] = http.StatusOK
-		if r.URL.Query().Get("rest_total_hits_as_int") == "true" {
+		if (hdr.TypedKeys != nil && *hdr.TypedKeys) || (hdr.TypedKeys == nil && (r.URL.Query().Get("typed_keys") == "true" || (r.URL.Query().Has("typed_keys") && r.URL.Query().Get("typed_keys") != "false"))) {
+			if aggsMap, ok := resp["aggregations"].(map[string]any); ok {
+				applyTypedKeysToAggregations(aggsMap, req.EffectiveAggs())
+			}
+		}
+		if (hdr.RestTotalHitsAsInt != nil && *hdr.RestTotalHitsAsInt) || (hdr.RestTotalHitsAsInt == nil && r.URL.Query().Get("rest_total_hits_as_int") == "true") {
 			if hitsMap, ok := resp["hits"].(map[string]any); ok {
 				if totalObj, ok := hitsMap["total"].(map[string]any); ok {
 					hitsMap["total"] = totalObj["value"]
@@ -5283,10 +5456,7 @@ func (s *Server) executeSearchRequest(
 						r.Weight = cnt
 					}
 				}
-				if r.AggName != "__meta_total" && r.AggName != "__meta_query_total" {
-					if r.Weight < 0 {
-						continue
-					}
+				if r.AggName != "__meta_total" && r.AggName != "__meta_query_total" && r.Weight >= 0 {
 					spec := resolveAggSpecByPath(effAggs, r.AggName)
 					metricField := singleValueMetricField(spec)
 					if metricField != "" || aggSpecHasDirectRuntimeScript(spec) {
@@ -6328,8 +6498,10 @@ func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, totalQueryHits int64
 			}
 			return
 		}
+		wasPlaceholder := false
 		if existing, ok := merged[k]; ok && existing.row.Weight < 0 {
 			delete(merged, k)
+			wasPlaceholder = true
 		}
 		w := r.Weight
 		if w <= 0 {
@@ -6377,7 +6549,9 @@ func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, totalQueryHits int64
 				acc.combinedStates = []any{smCombVal}
 			}
 			merged[k] = acc
-			order = append(order, k)
+			if !wasPlaceholder {
+				order = append(order, k)
+			}
 		}
 	}
 	for _, r := range rows {
@@ -6614,6 +6788,148 @@ func applyURISearchParams(r *http.Request, req *esast.SearchRequest) {
 	}
 	if sfParam := q.Get("stored_fields"); sfParam != "" && req.StoredFields == nil {
 		req.StoredFields = sfParam
+	}
+	if strings.EqualFold(q.Get("search_type"), "count") {
+		zero := 0
+		req.Size = &zero
+		if req.TrackTotalHits == nil {
+			req.TrackTotalHits = true
+		}
+	}
+}
+
+func aggTypePrefix(spec esast.AggSpec) string {
+	switch {
+	case spec.IsSignificantTerms():
+		return "sterms"
+	case spec.EffectiveTerms() != nil:
+		return "sterms"
+	case spec.DateHistogram != nil:
+		return "date_histogram"
+	case spec.Histogram != nil:
+		return "histogram"
+	case spec.DateRange != nil:
+		return "date_range"
+	case spec.IPRange != nil:
+		return "ip_range"
+	case spec.Range != nil:
+		return "range"
+	case spec.Filters != nil:
+		return "filters"
+	case spec.Filter != nil:
+		return "filter"
+	case spec.Missing != nil:
+		return "missing"
+	case spec.Nested != nil:
+		return "nested"
+	case spec.ReverseNested != nil:
+		return "reverse_nested"
+	case spec.Global != nil:
+		return "global"
+	case spec.DiversifiedSampler != nil:
+		return "diversified_sampler"
+	case spec.Sampler != nil:
+		return "sampler"
+	case spec.Composite != nil:
+		return "composite"
+	case spec.Avg != nil:
+		return "avg"
+	case spec.Sum != nil:
+		return "sum"
+	case spec.Min != nil:
+		return "min"
+	case spec.Max != nil:
+		return "max"
+	case spec.ValueCount != nil:
+		return "value_count"
+	case spec.Cardinality != nil:
+		return "cardinality"
+	case spec.ExtendedStats != nil:
+		return "extended_stats"
+	case spec.Stats != nil:
+		return "stats"
+	case spec.StringStats != nil:
+		return "string_stats"
+	case spec.Percentiles != nil:
+		return "tdigest_percentiles"
+	case spec.PercentileRanks != nil:
+		return "tdigest_percentile_ranks"
+	case spec.Boxplot != nil:
+		return "boxplot"
+	case spec.TopHits != nil:
+		return "top_hits"
+	case spec.TopMetrics != nil:
+		return "top_metrics"
+	case spec.ScriptedMetric != nil:
+		return "scripted_metric"
+	case spec.Rate != nil:
+		return "rate"
+	case spec.AvgBucket != nil:
+		return "avg_bucket"
+	case spec.SumBucket != nil:
+		return "sum_bucket"
+	case spec.MinBucket != nil:
+		return "min_bucket"
+	case spec.MaxBucket != nil:
+		return "max_bucket"
+	case spec.StatsBucket != nil:
+		return "stats_bucket"
+	case spec.ExtendedStatsBucket != nil:
+		return "extended_stats_bucket"
+	case spec.PercentilesBucket != nil:
+		return "percentiles_bucket"
+	case spec.Derivative != nil:
+		return "derivative"
+	case spec.EffectiveCumulative() != nil:
+		return "cumulative_sum"
+	case spec.EffectiveMovingAvg() != nil:
+		return "moving_fn"
+	case spec.SerialDiff != nil:
+		return "serial_diff"
+	case spec.Normalize != nil:
+		return "normalize"
+	case spec.BucketScript != nil:
+		return "bucket_script"
+	default:
+		return "agg"
+	}
+}
+
+func applyTypedKeysToAggregations(aggsOut map[string]any, aggs map[string]esast.AggSpec) {
+	if len(aggsOut) == 0 || len(aggs) == 0 {
+		return
+	}
+	for aggName, spec := range aggs {
+		val, exists := aggsOut[aggName]
+		if !exists {
+			continue
+		}
+		if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+			if aggObj, ok := val.(map[string]any); ok {
+				if buckets, ok := aggObj["buckets"].([]map[string]any); ok {
+					for _, b := range buckets {
+						applyTypedKeysToAggregations(b, subAggs)
+					}
+				} else if bucketsAny, ok := aggObj["buckets"].([]any); ok {
+					for _, item := range bucketsAny {
+						if b, ok := item.(map[string]any); ok {
+							applyTypedKeysToAggregations(b, subAggs)
+						}
+					}
+				} else if bucketsMap, ok := aggObj["buckets"].(map[string]any); ok {
+					for _, bv := range bucketsMap {
+						if bm, ok := bv.(map[string]any); ok {
+							applyTypedKeysToAggregations(bm, subAggs)
+						}
+					}
+				} else {
+					applyTypedKeysToAggregations(aggObj, subAggs)
+				}
+			}
+		}
+		prefix := aggTypePrefix(spec)
+		delete(aggsOut, aggName)
+		aggsOut[prefix+"#"+aggName] = val
 	}
 }
 
@@ -8380,11 +8696,14 @@ func buildAggsMap(
 				}
 				b = append(b, bucketMap)
 			}
+			if len(subAggs) > 0 {
+				b = evaluateChildPipelineAggsWithoutBucketSort(b, subAggs)
+			}
 			if spec.DateHistogram.Order != nil && len(b) > 1 {
 				b = sortHistogramBuckets(b, spec.DateHistogram.Order)
 			}
 			if len(subAggs) > 0 {
-				b = evaluateChildPipelineAggs(b, subAggs)
+				b = evaluateBucketSortPipelineAggs(b, subAggs)
 			}
 			aggsOut[aggName] = formatKeyedBuckets(b, spec.DateHistogram.Keyed, "key_as_string")
 		case spec.Histogram != nil:
@@ -8410,11 +8729,14 @@ func buildAggsMap(
 				}
 				b = append(b, bucketMap)
 			}
+			if len(subAggs) > 0 {
+				b = evaluateChildPipelineAggsWithoutBucketSort(b, subAggs)
+			}
 			if spec.Histogram.Order != nil && len(b) > 1 {
 				b = sortHistogramBuckets(b, spec.Histogram.Order)
 			}
 			if len(subAggs) > 0 {
-				b = evaluateChildPipelineAggs(b, subAggs)
+				b = evaluateBucketSortPipelineAggs(b, subAggs)
 			}
 			aggsOut[aggName] = formatKeyedBuckets(b, spec.Histogram.Keyed, "key")
 		case spec.EffectiveRange() != nil:
@@ -9629,6 +9951,44 @@ func validatePipelineAggs(aggs map[string]esast.AggSpec) string {
 				GapPolicy:   spec.PercentilesBucket.GapPolicy,
 				Format:      spec.PercentilesBucket.Format,
 			}
+		case spec.EffectiveCumulative() != nil:
+			if errMsg := validateChildBucketMetricDep("root", aggName, spec.EffectiveCumulative().EffectivePath(), aggs); errMsg != "" {
+				return errMsg
+			}
+		case spec.Derivative != nil:
+			if errMsg := validateChildBucketMetricDep("root", aggName, spec.Derivative.EffectivePath(), aggs); errMsg != "" {
+				return errMsg
+			}
+		case spec.EffectiveMovingAvg() != nil:
+			if errMsg := validateChildBucketMetricDep("root", aggName, spec.EffectiveMovingAvg().EffectivePath(), aggs); errMsg != "" {
+				return errMsg
+			}
+		case spec.SerialDiff != nil:
+			if errMsg := validateChildBucketMetricDep("root", aggName, spec.SerialDiff.EffectivePath(), aggs); errMsg != "" {
+				return errMsg
+			}
+		case spec.Normalize != nil:
+			if errMsg := validateChildBucketMetricDep("root", aggName, spec.Normalize.EffectivePath(), aggs); errMsg != "" {
+				return errMsg
+			}
+		case spec.BucketScript != nil:
+			if len(spec.BucketScript.BucketsPath) == 0 {
+				return fmt.Sprintf("buckets_path must be provided for pipeline aggregation [%s]", aggName)
+			}
+			for _, p := range spec.BucketScript.BucketsPath {
+				if errMsg := validateChildBucketMetricDep("root", aggName, p, aggs); errMsg != "" {
+					return errMsg
+				}
+			}
+		case spec.BucketSelector != nil:
+			if len(spec.BucketSelector.BucketsPath) == 0 {
+				return fmt.Sprintf("buckets_path must be provided for pipeline aggregation [%s]", aggName)
+			}
+			for _, p := range spec.BucketSelector.BucketsPath {
+				if errMsg := validateChildBucketMetricDep("root", aggName, p, aggs); errMsg != "" {
+					return errMsg
+				}
+			}
 		}
 		if pSpec != nil {
 			pathStr := strings.TrimSpace(pSpec.EffectivePath())
@@ -9793,6 +10153,10 @@ func validatePipelineAggs(aggs map[string]esast.AggSpec) string {
 }
 
 func evaluateChildPipelineAggs(buckets []map[string]any, subAggs map[string]esast.AggSpec) []map[string]any {
+	return evaluateBucketSortPipelineAggs(evaluateChildPipelineAggsWithoutBucketSort(buckets, subAggs), subAggs)
+}
+
+func evaluateChildPipelineAggsWithoutBucketSort(buckets []map[string]any, subAggs map[string]esast.AggSpec) []map[string]any {
 	if len(buckets) == 0 || len(subAggs) == 0 {
 		return buckets
 	}
@@ -9979,6 +10343,18 @@ func evaluateChildPipelineAggs(buckets []map[string]any, subAggs map[string]esas
 			}
 		}
 	}
+	return buckets
+}
+
+func evaluateBucketSortPipelineAggs(buckets []map[string]any, subAggs map[string]esast.AggSpec) []map[string]any {
+	if len(buckets) == 0 || len(subAggs) == 0 {
+		return buckets
+	}
+	subNames := make([]string, 0, len(subAggs))
+	for k := range subAggs {
+		subNames = append(subNames, k)
+	}
+	sort.Strings(subNames)
 	for _, subName := range subNames {
 		spec := subAggs[subName]
 		if spec.BucketSort != nil {
@@ -12210,11 +12586,14 @@ func attachSubAggsToBucket(
 				}
 				childBuckets = append(childBuckets, cb)
 			}
+			if len(grandSubAggs) > 0 {
+				childBuckets = evaluateChildPipelineAggsWithoutBucketSort(childBuckets, grandSubAggs)
+			}
 			if subSpec.DateHistogram.Order != nil && len(childBuckets) > 1 {
 				childBuckets = sortHistogramBuckets(childBuckets, subSpec.DateHistogram.Order)
 			}
 			if len(grandSubAggs) > 0 {
-				childBuckets = evaluateChildPipelineAggs(childBuckets, grandSubAggs)
+				childBuckets = evaluateBucketSortPipelineAggs(childBuckets, grandSubAggs)
 			}
 			bucketMap[subName] = formatKeyedBuckets(childBuckets, subSpec.DateHistogram.Keyed, "key_as_string")
 		case subSpec.Histogram != nil:
@@ -12248,11 +12627,14 @@ func attachSubAggsToBucket(
 				}
 				childBuckets = append(childBuckets, cb)
 			}
+			if len(grandSubAggs) > 0 {
+				childBuckets = evaluateChildPipelineAggsWithoutBucketSort(childBuckets, grandSubAggs)
+			}
 			if subSpec.Histogram.Order != nil && len(childBuckets) > 1 {
 				childBuckets = sortHistogramBuckets(childBuckets, subSpec.Histogram.Order)
 			}
 			if len(grandSubAggs) > 0 {
-				childBuckets = evaluateChildPipelineAggs(childBuckets, grandSubAggs)
+				childBuckets = evaluateBucketSortPipelineAggs(childBuckets, grandSubAggs)
 			}
 			bucketMap[subName] = formatKeyedBuckets(childBuckets, subSpec.Histogram.Keyed, "key")
 		case subSpec.EffectiveRange() != nil:
@@ -14877,7 +15259,7 @@ func (s *Server) ensureWritableIndexSchemaWithDocs(ctx context.Context, indexNam
 	if ok {
 		existingEmptySchema = idx
 	}
-	tplMappings := s.matchingTemplateMappingsLocked(indexName)
+	tplMappings, tplDefPipe, hasTplDefPipe, tplFinPipe, hasTplFinPipe, tplAliases := s.matchingTemplateConfigLocked(indexName)
 	if existingEmptySchema != nil && existingEmptySchema.RawMapping != nil {
 		tplMappings = schema.MergeMappingSpecs(tplMappings, existingEmptySchema.RawMapping)
 	}
@@ -14902,14 +15284,35 @@ func (s *Server) ensureWritableIndexSchemaWithDocs(ctx context.Context, indexNam
 			_ = s.backend.ExecDDL(ctx, stmt)
 		}
 	}
+	aliasesToPersist := make(map[string][]string)
 	s.mu.Lock()
 	if existing, exists := s.indices[indexName]; exists && (len(existing.Fields) > 0 || len(existing.NestedRoots) > 0) {
 		s.mu.Unlock()
 		return existing
 	}
 	s.indices[indexName] = compiled
+	if existingEmptySchema == nil {
+		if hasTplDefPipe && tplDefPipe != "" {
+			if _, hasCur := s.indexDefaultPipelines[indexName]; !hasCur {
+				s.indexDefaultPipelines[indexName] = tplDefPipe
+			}
+		}
+		if hasTplFinPipe && tplFinPipe != "" {
+			if _, hasCur := s.indexFinalPipelines[indexName]; !hasCur {
+				s.indexFinalPipelines[indexName] = tplFinPipe
+			}
+		}
+		for alias, rawMeta := range tplAliases {
+			meta := parseAliasMetadata(rawMeta)
+			s.addAliasWithMetaLocked(alias, indexName, meta)
+			aliasesToPersist[alias] = append([]string(nil), s.aliases[alias]...)
+		}
+	}
 	s.mu.Unlock()
 	s.persistIndex(ctx, indexName, compiled)
+	for alias, targets := range aliasesToPersist {
+		s.persistAlias(ctx, alias, targets)
+	}
 	s.queryCache.InvalidateAll()
 	return compiled
 }
@@ -18545,7 +18948,11 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 			continue
 		}
 		if hasQueryScript || hasNestedScoring {
-			h.Score = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, req.Query, h.Score)
+			baseScore := h.Score
+			if req.Query != nil && ((req.Query.ScriptScore != nil && req.Query.ScriptScore.Query == nil) || (req.Query.FunctionScore != nil && req.Query.FunctionScore.Query == nil)) {
+				baseScore = 1.0
+			}
+			h.Score = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, req.Query, baseScore)
 		}
 		if req.MinScore != nil && h.Score < *req.MinScore {
 			continue

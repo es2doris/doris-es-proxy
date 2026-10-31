@@ -720,3 +720,105 @@ func TestRound30PainlessUnaryNotPrecedenceAliasDollarAndPrefixGet(t *testing.T) 
 		t.Fatalf("expected $schema set and count=11, got %+v", doc3)
 	}
 }
+
+func TestRound31PainlessFixes(t *testing.T) {
+	// Fix 17: Lambda parameters inside Collections.sort / removeIf with bracket indexing (e.g. a['k'], x[0])
+	updated17, op17, err := ApplyUpdateWithResult(
+		json.RawMessage(`{
+			"items": [{"k": 30, "name": "c"}, {"k": 10, "name": "a"}, {"k": 20, "name": "b"}],
+			"pairs": [[1, "drop"], [2, "keep"], [3, "drop"]]
+		}`),
+		&UpdateRequest{
+			Script: &ScriptSpec{
+				Source: `
+					Collections.sort(ctx._source.items, (a, b) -> a['k'] - b['k']);
+					ctx._source.pairs.removeIf(x -> x[1] == 'drop');
+				`,
+			},
+		},
+		true,
+	)
+	if err != nil || op17 != "updated" {
+		t.Fatalf("Fix 17 update failed: op=%s err=%v", op17, err)
+	}
+	var doc17 map[string]any
+	_ = json.Unmarshal(updated17, &doc17)
+	items17, _ := doc17["items"].([]any)
+	if len(items17) != 3 || items17[0].(map[string]any)["name"] != "a" || items17[1].(map[string]any)["name"] != "b" || items17[2].(map[string]any)["name"] != "c" {
+		t.Fatalf("expected items sorted by a['k'] - b['k'] -> a, b, c; got %v", items17)
+	}
+	pairs17, _ := doc17["pairs"].([]any)
+	if len(pairs17) != 1 || pairs17[0].([]any)[0] != float64(2) {
+		t.Fatalf("expected pairs filtered by x[1] == 'drop' -> [[2,'keep']], got %v", pairs17)
+	}
+
+	// Fix 18: Ternary operator ?: inside if (...) and EvalFilter
+	ok18a, err := EvalFilter(map[string]any{"flag": true, "a": 10, "b": 2}, `doc['flag'].value ? doc['a'].value > 5 : doc['b'].value > 5`, nil)
+	if err != nil || !ok18a {
+		t.Fatalf("expected ternary condition in EvalFilter (true branch) to be true, got %v (err=%v)", ok18a, err)
+	}
+	ok18b, err := EvalFilter(map[string]any{"flag": false, "a": 10, "b": 2}, `doc['flag'].value ? doc['a'].value > 5 : doc['b'].value > 5`, nil)
+	if err != nil || ok18b {
+		t.Fatalf("expected ternary condition in EvalFilter (false branch) to be false, got %v (err=%v)", ok18b, err)
+	}
+	val18, err := Eval(map[string]any{"flag": true}, `int r = 0; if (doc['flag'].value ? true : false) { r = 42; } return r;`, nil)
+	if err != nil || val18 != int64(42) {
+		t.Fatalf("expected if (ternary) to execute true branch (42), got %v (err=%v)", val18, err)
+	}
+
+	// Fix 19: Eval single-evaluation of side-effecting bracket expressions (a[i++]) and compound assignments (x += 5)
+	val19a, err := Eval(nil, `def a = [10, 20, 30]; int i = 0; a[i++]`, nil)
+	if err != nil || val19a != int64(10) {
+		t.Fatalf("expected a[i++] to evaluate once and return 10, got %v (err=%v)", val19a, err)
+	}
+	val19b, err := Eval(nil, `int x = 10; x += 5`, nil)
+	if err != nil || (val19b != int64(15) && val19b != float64(15)) {
+		t.Fatalf("expected trailing compound assignment x += 5 to return 15, got %v (err=%v)", val19b, err)
+	}
+
+	// Fix 20: Safe-navigation bracket indexing ?.[...], keyword return['a','b'], and ternary cond ?['a']:['b']
+	val20a, err := Eval(map[string]any{"nested": map[string]any{"k": "val_ok"}}, `params._source?.['nested']?.['k']`, nil)
+	if err != nil || val20a != "val_ok" {
+		t.Fatalf("expected params._source?.['nested']?.['k'] == 'val_ok', got %v (err=%v)", val20a, err)
+	}
+	val20b, err := Eval(map[string]any{}, `params._source?.['missing']?.['k']`, nil)
+	if err != nil || val20b != nil {
+		t.Fatalf("expected safe-navigation ?.[missing] to return nil, got %v (err=%v)", val20b, err)
+	}
+	val20c, err := Eval(nil, `return['a', 'b']`, nil)
+	if err != nil {
+		t.Fatalf("expected return['a', 'b'] to succeed, got err=%v", err)
+	}
+	if arr, ok := val20c.([]any); !ok || len(arr) != 2 || arr[0] != "a" || arr[1] != "b" {
+		t.Fatalf("expected return['a', 'b'] == ['a', 'b'], got %v", val20c)
+	}
+	val20d, err := Eval(nil, `true ?['x']:['y']`, nil)
+	if err != nil {
+		t.Fatalf("expected true ?['x']:['y'] to succeed, got err=%v", err)
+	}
+	if arr, ok := val20d.([]any); !ok || len(arr) != 1 || arr[0] != "x" {
+		t.Fatalf("expected true ?['x']:['y'] == ['x'], got %v", val20d)
+	}
+
+	// Fix 21: Read-only metadata access ctx._id, ctx._index, and ctx._version in ApplyUpdateWithResult
+	updated21, op21, err := ApplyUpdateWithResult(
+		json.RawMessage(`{"msg":"hello"}`),
+		&UpdateRequest{
+			MetaID:      "doc-42",
+			MetaIndex:   "orders-2026",
+			MetaVersion: 7,
+			Script: &ScriptSpec{
+				Source: `ctx._source.meta = ctx._index + ':' + ctx._id + ':v' + ctx._version`,
+			},
+		},
+		true,
+	)
+	if err != nil || op21 != "updated" {
+		t.Fatalf("Fix 21 update failed: op=%s err=%v", op21, err)
+	}
+	var doc21 map[string]any
+	_ = json.Unmarshal(updated21, &doc21)
+	if doc21["meta"] != "orders-2026:doc-42:v7" {
+		t.Fatalf("expected meta == 'orders-2026:doc-42:v7', got %v", doc21["meta"])
+	}
+}

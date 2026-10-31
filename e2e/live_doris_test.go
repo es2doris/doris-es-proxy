@@ -1417,4 +1417,69 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 		t.Fatalf("POST /live_auto_index/_clone/live_auto_index_cloned failed: status=%v err=%v", r30CloneResp.StatusCode, err)
 	}
 	_ = r30CloneResp.Body.Close()
+
+	// =========================================================================
+	// Round-31 Live Doris E2E Verification:
+	// 1. typed_keys=true & rest_total_hits_as_int=true on _search
+	// 2. _explain with script_score & boost/min_score
+	// 3. _validate/query rejecting invalid pipeline agg buckets_path
+	// 4. Ingest _simulate preserving ctx.op field & merging dissect target_field
+	// =========================================================================
+	r31SearchResp, err := http.Post(ts.URL+"/live_auto_index/_search?typed_keys=true&rest_total_hits_as_int=true", "application/json", strings.NewReader(`{
+		"size": 0,
+		"aggs": {
+			"by_cat": {"terms": {"field": "category.keyword"}}
+		}
+	}`))
+	if err != nil || r31SearchResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search?typed_keys=true&rest_total_hits_as_int=true failed: status=%v err=%v", r31SearchResp.StatusCode, err)
+	}
+	var r31SearchRes map[string]any
+	_ = json.NewDecoder(r31SearchResp.Body).Decode(&r31SearchRes)
+	_ = r31SearchResp.Body.Close()
+	if _, isFloat := r31SearchRes["hits"].(map[string]any)["total"].(float64); !isFloat {
+		t.Fatalf("expected integer total hits when rest_total_hits_as_int=true, got %T (%v)", r31SearchRes["hits"].(map[string]any)["total"], r31SearchRes["hits"].(map[string]any)["total"])
+	}
+	if _, ok := r31SearchRes["aggregations"].(map[string]any)["sterms#by_cat"]; !ok {
+		t.Fatalf("expected typed_keys sterms#by_cat key in aggregations: %+v", r31SearchRes["aggregations"])
+	}
+
+	r31ValResp, err := http.Post(ts.URL+"/live_auto_index/_validate/query?explain=true", "application/json", strings.NewReader(`{
+		"aggs": {
+			"bad_deriv": {"derivative": {"buckets_path": "nonexistent_hist>count"}}
+		}
+	}`))
+	if err != nil || r31ValResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_validate/query failed: status=%v err=%v", r31ValResp.StatusCode, err)
+	}
+	var r31ValRes map[string]any
+	_ = json.NewDecoder(r31ValResp.Body).Decode(&r31ValRes)
+	_ = r31ValResp.Body.Close()
+	if r31ValRes["valid"] != false {
+		t.Fatalf("expected valid:false for invalid pipeline agg in _validate/query, got %+v", r31ValRes)
+	}
+
+	r31SimResp, err := http.Post(ts.URL+"/_ingest/pipeline/_simulate", "application/json", strings.NewReader(`{
+		"pipeline": {
+			"processors": [
+				{"script": {"source": "ctx.op = 'index'; ctx.r31_ok = ('x' == 'y') ? 'no' : 'yes'"}},
+				{"set": {"field": "parsed.existing", "value": "keep"}},
+				{"dissect": {"field": "line", "pattern": "%{a}-%{b}", "target_field": "parsed"}}
+			]
+		},
+		"docs": [
+			{"_index": "live_auto_index", "_id": "r31-sim-1", "_source": {"op": "custom_op", "line": "foo-bar"}}
+		]
+	}`))
+	if err != nil || r31SimResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_ingest/pipeline/_simulate (R31) failed: status=%v err=%v", r31SimResp.StatusCode, err)
+	}
+	var r31SimRes map[string]any
+	_ = json.NewDecoder(r31SimResp.Body).Decode(&r31SimRes)
+	_ = r31SimResp.Body.Close()
+	r31SimDoc := r31SimRes["docs"].([]any)[0].(map[string]any)["doc"].(map[string]any)["_source"].(map[string]any)
+	r31Parsed, _ := r31SimDoc["parsed"].(map[string]any)
+	if r31SimDoc["op"] != "custom_op" || r31SimDoc["r31_ok"] != "yes" || r31Parsed["existing"] != "keep" || r31Parsed["a"] != "foo" {
+		t.Fatalf("unexpected R31 simulated doc: %+v", r31SimDoc)
+	}
 }

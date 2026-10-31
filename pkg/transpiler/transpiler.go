@@ -362,10 +362,11 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		var preds, scores []string
 		for _, field := range keys {
 			entry := q.Term[field]
-			pred := t.compileTermPredicate(field, entry.Value, entry.CaseInsensitive, nctx)
+			cleanField, fBoost := parseFieldBoost(field, 1.0)
+			pred := t.compileTermPredicate(cleanField, entry.Value, entry.CaseInsensitive, nctx)
 			preds = append(preds, pred)
 			if scoring {
-				scores = append(scores, fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", pred, entry.Boost))
+				scores = append(scores, fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", pred, entry.Boost*fBoost))
 			}
 		}
 		where := strings.Join(preds, " AND ")
@@ -446,19 +447,24 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		}, scoring, nctx)
 	case len(q.Range) > 0:
 		keys := sortedMapKeys(q.Range)
-		var preds []string
-		boost := 1.0
+		var preds, scores []string
 		for _, field := range keys {
 			rc := q.Range[field]
+			cleanField, fBoost := parseFieldBoost(field, 1.0)
+			boost := fBoost
 			if rc.Boost != nil {
-				boost = *rc.Boost
+				boost = *rc.Boost * fBoost
 			}
-			preds = append(preds, t.compileRangePredicate(field, rc, nctx))
+			p := t.compileRangePredicate(cleanField, rc, nctx)
+			preds = append(preds, p)
+			if scoring {
+				scores = append(scores, fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", p, boost))
+			}
 		}
 		pred := strings.Join(preds, " AND ")
 		score := "1.0"
-		if scoring {
-			score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", pred, boost)
+		if scoring && len(scores) > 0 {
+			score = strings.Join(scores, " + ")
 		}
 		return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: score}
 	case q.Exists != nil:
@@ -470,44 +476,54 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: score}
 	case len(q.Prefix) > 0:
 		keys := sortedMapKeys(q.Prefix)
-		var preds []string
-		boost := 1.0
+		var preds, scores []string
 		for _, field := range keys {
 			pe := q.Prefix[field]
+			cleanField, fBoost := parseFieldBoost(field, 1.0)
+			boost := fBoost
 			if pe.HasBoost || pe.Boost != 0 {
-				boost = pe.Boost
+				boost = pe.Boost * fBoost
 			}
-			preds = append(preds, t.compilePrefixPredicate(field, pe.Value, pe.CaseInsensitive, nctx))
+			p := t.compilePrefixPredicate(cleanField, pe.Value, pe.CaseInsensitive, nctx)
+			preds = append(preds, p)
+			if scoring {
+				scores = append(scores, fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", p, boost))
+			}
 		}
 		pred := strings.Join(preds, " AND ")
 		score := "1.0"
-		if scoring {
-			score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", pred, boost)
+		if scoring && len(scores) > 0 {
+			score = strings.Join(scores, " + ")
 		}
 		return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: score}
 	case len(q.Wildcard) > 0:
 		keys := sortedMapKeys(q.Wildcard)
-		var preds []string
-		boost := 1.0
+		var preds, scores []string
 		for _, field := range keys {
 			we := q.Wildcard[field]
+			cleanField, fBoost := parseFieldBoost(field, 1.0)
+			boost := fBoost
 			if we.HasBoost || we.Boost != 0 {
-				boost = we.Boost
+				boost = we.Boost * fBoost
 			}
-			preds = append(preds, t.compileWildcardPredicate(field, we.Value, we.CaseInsensitive, nctx))
+			p := t.compileWildcardPredicate(cleanField, we.Value, we.CaseInsensitive, nctx)
+			preds = append(preds, p)
+			if scoring {
+				scores = append(scores, fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", p, boost))
+			}
 		}
 		pred := strings.Join(preds, " AND ")
 		score := "1.0"
-		if scoring {
-			score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", pred, boost)
+		if scoring && len(scores) > 0 {
+			score = strings.Join(scores, " + ")
 		}
 		return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: score}
 	case len(q.Regexp) > 0:
 		keys := sortedMapKeys(q.Regexp)
 		var preds []string
 		var safePreds []string
+		var scores []string
 		usesFT := false
-		boost := 1.0
 		compileSingleRegexp := func(field string, re esast.RegexpEntry) (string, string, bool) {
 			field, b := t.resolveFieldInNestedCtx(field, true, nctx)
 			if b.Kind == schema.StoragePromotedVector {
@@ -535,20 +551,28 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		}
 		for _, field := range keys {
 			re := q.Regexp[field]
+			cleanField, fBoost := parseFieldBoost(field, 1.0)
+			fieldBoost := fBoost
 			if re.HasBoost || re.Boost != 0 {
-				boost = re.Boost
+				fieldBoost = re.Boost * fBoost
 			}
-			if strings.ContainsAny(field, "*?") && t.Schema != nil {
-				exp := t.expandFieldPatternForContext(field, nctx)
+			if strings.ContainsAny(cleanField, "*?") && t.Schema != nil {
+				exp := t.expandFieldPatternForContext(cleanField, nctx)
 				if len(exp) == 0 {
 					if nctx != nil {
 						preds = append(preds, "FALSE")
 						safePreds = append(safePreds, "FALSE")
+						if scoring {
+							scores = append(scores, "(CASE WHEN FALSE THEN 0.0000 ELSE 0.0 END)")
+						}
 						continue
 					}
 					w, sw, ft := compileSingleRegexp("_all_text", re)
 					preds = append(preds, w)
 					safePreds = append(safePreds, sw)
+					if scoring {
+						scores = append(scores, fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", sw, fieldBoost))
+					}
 					usesFT = usesFT || ft
 					continue
 				}
@@ -559,41 +583,52 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 					swDisj = append(swDisj, sw)
 					usesFT = usesFT || ft
 				}
+				var wCombined, swCombined string
 				if len(wDisj) == 1 {
-					preds = append(preds, wDisj[0])
-					safePreds = append(safePreds, swDisj[0])
+					wCombined = wDisj[0]
+					swCombined = swDisj[0]
 				} else {
-					preds = append(preds, "("+strings.Join(wDisj, " OR ")+")")
-					safePreds = append(safePreds, "("+strings.Join(swDisj, " OR ")+")")
+					wCombined = "(" + strings.Join(wDisj, " OR ") + ")"
+					swCombined = "(" + strings.Join(swDisj, " OR ") + ")"
+				}
+				preds = append(preds, wCombined)
+				safePreds = append(safePreds, swCombined)
+				if scoring {
+					scores = append(scores, fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", swCombined, fieldBoost))
 				}
 				continue
 			}
-			w, sw, ft := compileSingleRegexp(field, re)
+			w, sw, ft := compileSingleRegexp(cleanField, re)
 			preds = append(preds, w)
 			safePreds = append(safePreds, sw)
+			if scoring {
+				scores = append(scores, fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", sw, fieldBoost))
+			}
 			usesFT = usesFT || ft
 		}
 		safeWhere := strings.Join(safePreds, " AND ")
 		scoreSQL := "1.0"
-		if scoring && len(safePreds) > 0 {
-			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", safeWhere, boost)
+		if scoring && len(scores) > 0 {
+			scoreSQL = strings.Join(scores, " + ")
 		}
 		return CompiledQuery{WhereSQL: strings.Join(preds, " AND "), SafeWhereSQL: safeWhere, ScoreSQL: scoreSQL, UsesFulltextMatch: usesFT}
 	case len(q.Match) > 0:
 		keys := sortedMapKeys(q.Match)
 		if len(keys) == 1 {
 			me := q.Match[keys[0]]
+			cleanKey0, fBoost := parseFieldBoost(keys[0], 1.0)
+			effBoost := me.Boost * fBoost
 			qStr := ""
 			if me.Query != nil {
 				qStr = strings.TrimSpace(fmt.Sprintf("%v", me.Query))
 			}
 			if qStr == "" && strings.EqualFold(me.ZeroTermsQuery, "all") {
-				return CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: fmt.Sprintf("%.4f", me.Boost)}
+				return CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: fmt.Sprintf("%.4f", effBoost)}
 			}
-			if me.MinimumShouldMatch != nil {
-				b := t.Schema.ResolveField(keys[0])
+			if me.MinimumShouldMatch != nil && !strings.ContainsAny(cleanKey0, "*?") {
+				b := t.Schema.ResolveField(cleanKey0)
 				tokens := strings.Fields(qStr)
-				if isExactKeywordField(keys[0], b) && qStr != "" {
+				if isExactKeywordField(cleanKey0, b) && qStr != "" {
 					tokens = []string{qStr}
 				}
 				if len(tokens) == 1 && parseMinShouldMatch(me.MinimumShouldMatch, 1, true) > 1 {
@@ -604,11 +639,11 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 					for _, tok := range tokens {
 						shoulds = append(shoulds, esast.Query{
 							Match: map[string]esast.MatchEntry{
-								keys[0]: {Query: tok, Operator: "or", Fuzziness: me.Fuzziness, Boost: 1.0},
+								cleanKey0: {Query: tok, Operator: "or", Fuzziness: me.Fuzziness, Boost: 1.0},
 							},
 						})
 					}
-					boost := me.Boost
+					boost := effBoost
 					return t.compileBool(&esast.BoolQuery{
 						Should:             shoulds,
 						MinimumShouldMatch: me.MinimumShouldMatch,
@@ -1250,6 +1285,17 @@ func (t *Transpiler) expandFieldPatternForContext(pattern string, nctx *nestedCt
 	return exp
 }
 
+func parseFieldBoost(fieldWithBoost string, baseBoost float64) (string, float64) {
+	if idx := strings.IndexByte(fieldWithBoost, '^'); idx >= 0 {
+		cleanField := fieldWithBoost[:idx]
+		if parsed, err := strconv.ParseFloat(fieldWithBoost[idx+1:], 64); err == nil && !math.IsNaN(parsed) && !math.IsInf(parsed, 0) {
+			return cleanField, baseBoost * parsed
+		}
+		return cleanField, baseBoost
+	}
+	return fieldWithBoost, baseBoost
+}
+
 func (t *Transpiler) compileFuzzyField(
 	field string,
 	queryVal any,
@@ -1272,6 +1318,7 @@ func (t *Transpiler) compileFuzzyFieldWithCI(
 	scoring bool,
 	nctx *nestedCtx,
 ) CompiledQuery {
+	field, boost = parseFieldBoost(field, boost)
 	if isZeroFuzziness(fuzziness) {
 		if caseInsensitive {
 			resolvedField, b := t.resolveFieldInNestedCtx(field, false, nctx)
@@ -1373,6 +1420,48 @@ func (t *Transpiler) compileMatchField(
 	scoring bool,
 	nctx *nestedCtx,
 ) CompiledQuery {
+	field, boost = parseFieldBoost(field, boost)
+	if strings.ContainsAny(field, "*?") && t.Schema != nil {
+		exp := t.expandFieldPatternForContext(field, nctx)
+		if len(exp) == 0 {
+			if nctx != nil {
+				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+			}
+			return t.compileMatchField("_all_text", queryVal, operator, boost, scoring, nctx)
+		}
+		var disjuncts, safeDisjuncts, scores []string
+		usesFT := false
+		for _, bf := range exp {
+			c := t.compileMatchField(bf.Field, queryVal, operator, boost*bf.Boost, scoring, nctx)
+			if c.WhereSQL == "FALSE" && len(exp) > 1 {
+				continue
+			}
+			disjuncts = append(disjuncts, fmt.Sprintf("(%s)", c.WhereSQL))
+			safeDisjuncts = append(safeDisjuncts, fmt.Sprintf("(%s)", c.EffectiveSafeWhere()))
+			if scoring {
+				scores = append(scores, c.ScoreSQL)
+			}
+			usesFT = usesFT || c.UsesFulltextMatch
+		}
+		if len(disjuncts) == 0 {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+		whereSQL := disjuncts[0]
+		safeWhereSQL := safeDisjuncts[0]
+		if len(disjuncts) > 1 {
+			whereSQL = "(" + strings.Join(disjuncts, " OR ") + ")"
+			safeWhereSQL = "(" + strings.Join(safeDisjuncts, " OR ") + ")"
+		}
+		scoreExpr := "0.0"
+		if scoring && len(scores) > 0 {
+			if len(scores) == 1 {
+				scoreExpr = scores[0]
+			} else {
+				scoreExpr = fmt.Sprintf("GREATEST(%s)", strings.Join(scores, ", "))
+			}
+		}
+		return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: safeWhereSQL, ScoreSQL: scoreExpr, UsesFulltextMatch: usesFT}
+	}
 	field, b := t.resolveFieldInNestedCtx(field, false, nctx)
 	if b.Kind == schema.StoragePromotedVector {
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
@@ -1452,6 +1541,48 @@ func (t *Transpiler) compileMatchPhraseField(
 	scoring bool,
 	nctx *nestedCtx,
 ) CompiledQuery {
+	field, boost = parseFieldBoost(field, boost)
+	if strings.ContainsAny(field, "*?") && t.Schema != nil {
+		exp := t.expandFieldPatternForContext(field, nctx)
+		if len(exp) == 0 {
+			if nctx != nil {
+				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+			}
+			return t.compileMatchPhraseField("_all_text", queryStr, slop, boost, isPrefix, scoring, nctx)
+		}
+		var disjuncts, safeDisjuncts, scores []string
+		usesFT := false
+		for _, bf := range exp {
+			c := t.compileMatchPhraseField(bf.Field, queryStr, slop, boost*bf.Boost, isPrefix, scoring, nctx)
+			if c.WhereSQL == "FALSE" && len(exp) > 1 {
+				continue
+			}
+			disjuncts = append(disjuncts, fmt.Sprintf("(%s)", c.WhereSQL))
+			safeDisjuncts = append(safeDisjuncts, fmt.Sprintf("(%s)", c.EffectiveSafeWhere()))
+			if scoring {
+				scores = append(scores, c.ScoreSQL)
+			}
+			usesFT = usesFT || c.UsesFulltextMatch
+		}
+		if len(disjuncts) == 0 {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+		whereSQL := disjuncts[0]
+		safeWhereSQL := safeDisjuncts[0]
+		if len(disjuncts) > 1 {
+			whereSQL = "(" + strings.Join(disjuncts, " OR ") + ")"
+			safeWhereSQL = "(" + strings.Join(safeDisjuncts, " OR ") + ")"
+		}
+		scoreExpr := "0.0"
+		if scoring && len(scores) > 0 {
+			if len(scores) == 1 {
+				scoreExpr = scores[0]
+			} else {
+				scoreExpr = fmt.Sprintf("GREATEST(%s)", strings.Join(scores, ", "))
+			}
+		}
+		return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: safeWhereSQL, ScoreSQL: scoreExpr, UsesFulltextMatch: usesFT}
+	}
 	field, b := t.resolveFieldInNestedCtx(field, false, nctx)
 	if b.Kind == schema.StoragePromotedVector || strings.TrimSpace(queryStr) == "" {
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
@@ -1767,13 +1898,41 @@ func (t *Transpiler) compileScriptScore(ss *esast.ScriptScoreQuery, scoring bool
 	if ss != nil && ss.Query != nil {
 		base = t.CompileQuery(ss.Query, true, nctx)
 	}
-	scoreSQL := "1.0"
-	if scoring {
-		scoreSQL = base.ScoreSQL
+	if ss == nil {
+		return base
+	}
+	scoreSQL := base.ScoreSQL
+	scriptCompiled := false
+	if ss.Script != nil {
+		if expr, ok := t.compileMetricScriptExprWithOverride(ss.Script, "_score", base.ScoreSQL, nctx); ok {
+			scoreSQL = expr
+			scriptCompiled = true
+		}
+	}
+	if ss.Boost != nil && *ss.Boost != 1.0 {
+		scoreSQL = fmt.Sprintf("(%.4f * (%s))", *ss.Boost, scoreSQL)
+	}
+	whereSQL := base.WhereSQL
+	safeWhereSQL := base.EffectiveSafeWhere()
+	if ss.MinScore != nil && (ss.Script == nil || scriptCompiled) && !queryContainsScript(ss.Query) {
+		minScoreCond := fmt.Sprintf("(%s >= %.4f)", scoreSQL, *ss.MinScore)
+		if whereSQL == "" || whereSQL == "TRUE" {
+			whereSQL = minScoreCond
+		} else {
+			whereSQL = fmt.Sprintf("(%s AND %s)", whereSQL, minScoreCond)
+		}
+		if safeWhereSQL == "" || safeWhereSQL == "TRUE" {
+			safeWhereSQL = minScoreCond
+		} else {
+			safeWhereSQL = fmt.Sprintf("(%s AND %s)", safeWhereSQL, minScoreCond)
+		}
+	}
+	if !scoring {
+		scoreSQL = "1.0"
 	}
 	return CompiledQuery{
-		WhereSQL:          base.WhereSQL,
-		SafeWhereSQL:      base.EffectiveSafeWhere(),
+		WhereSQL:          whereSQL,
+		SafeWhereSQL:      safeWhereSQL,
 		ScoreSQL:          scoreSQL,
 		UsesFulltextMatch: base.UsesFulltextMatch,
 	}
@@ -1799,11 +1958,13 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 	if q == nil {
 		return ""
 	}
+	nctx := &nestedCtx{nestedPath: nestedPath}
 	if len(q.Term) > 0 {
 		var parts []string
 		for _, field := range sortedMapKeys(q.Term) {
 			entry := q.Term[field]
-			b := t.Schema.ResolveEffectiveField(field, true)
+			cleanField, _ := parseFieldBoost(field, 1.0)
+			_, b := t.resolveFieldInNestedCtx(cleanField, true, nctx)
 			if b.Kind == schema.StorageNestedSubfield && b.NestedPath == nestedPath && b.PrefilterArrayCol != "" {
 				effLower := b.EffectiveLowercase(true)
 				arrCol := b.EffectiveArrayColumn(true)
@@ -1840,7 +2001,8 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 		var parts []string
 		for _, field := range sortedMapKeys(q.Terms.Fields) {
 			vals := q.Terms.Fields[field]
-			b := t.Schema.ResolveEffectiveField(field, true)
+			cleanField, _ := parseFieldBoost(field, 1.0)
+			_, b := t.resolveFieldInNestedCtx(cleanField, true, nctx)
 			if b.Kind == schema.StorageNestedSubfield && b.NestedPath == nestedPath && b.PrefilterArrayCol != "" && len(vals) > 0 {
 				effLower := b.EffectiveLowercase(true)
 				arrCol := b.EffectiveArrayColumn(true)
@@ -1882,7 +2044,7 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 	}
 	if q.Exists != nil && q.Exists.Field != "" {
 		preferKw := strings.HasSuffix(q.Exists.Field, ".keyword")
-		b := t.Schema.ResolveEffectiveField(q.Exists.Field, preferKw)
+		_, b := t.resolveFieldInNestedCtx(q.Exists.Field, preferKw, nctx)
 		if strings.HasSuffix(b.AliasTarget, ".keyword") {
 			preferKw = true
 		}
@@ -1913,22 +2075,37 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 	if fs.Query != nil {
 		base = t.CompileQuery(fs.Query, true, nctx)
 	}
-	hasScriptFn := fs.ScriptScore != nil
-	for i := range fs.Functions {
-		if fs.Functions[i].ScriptScore != nil || queryContainsScript(fs.Functions[i].Filter) {
-			hasScriptFn = true
-			break
+	hasUncompilableScriptFn := false
+	if fs.ScriptScore != nil {
+		if _, ok := t.compileMetricScriptExprWithOverride(fs.ScriptScore.Script, "_score", base.ScoreSQL, nctx); !ok {
+			hasUncompilableScriptFn = true
 		}
 	}
-	if hasScriptFn {
+	for i := range fs.Functions {
+		if queryContainsScript(fs.Functions[i].Filter) {
+			hasUncompilableScriptFn = true
+			break
+		}
+		if fs.Functions[i].ScriptScore != nil {
+			if _, ok := t.compileMetricScriptExprWithOverride(fs.Functions[i].ScriptScore.Script, "_score", base.ScoreSQL, nctx); !ok {
+				hasUncompilableScriptFn = true
+				break
+			}
+		}
+	}
+	if hasUncompilableScriptFn {
+		if fs.Boost != nil && *fs.Boost != 1.0 {
+			base.ScoreSQL = fmt.Sprintf("(%.4f * (%s))", *fs.Boost, base.ScoreSQL)
+		}
 		return base
 	}
 	funcs := fs.Functions
-	if len(funcs) == 0 && (fs.FieldValueFactor != nil || fs.Weight != nil) {
+	if len(funcs) == 0 && (fs.FieldValueFactor != nil || fs.ScriptScore != nil || fs.Weight != nil) {
 		funcs = []esast.ScoreFunctionSpec{
 			{
 				Weight:           fs.Weight,
 				FieldValueFactor: fs.FieldValueFactor,
+				ScriptScore:      fs.ScriptScore,
 			},
 		}
 	}
@@ -1936,7 +2113,7 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 		if fs.Boost != nil && *fs.Boost != 1.0 {
 			base.ScoreSQL = fmt.Sprintf("(%.4f * (%s))", *fs.Boost, base.ScoreSQL)
 		}
-		if fs.MinScore != nil && !queryContainsScript(&esast.Query{FunctionScore: fs}) {
+		if fs.MinScore != nil && !queryContainsScript(fs.Query) {
 			minCond := fmt.Sprintf("(%s >= %.4f)", base.ScoreSQL, *fs.MinScore)
 			base.WhereSQL = fmt.Sprintf("(%s) AND %s", base.WhereSQL, minCond)
 			base.SafeWhereSQL = fmt.Sprintf("(%s) AND %s", base.EffectiveSafeWhere(), minCond)
@@ -1956,7 +2133,15 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 			weight = *fn.Weight
 		}
 		valExpr := fmt.Sprintf("%.4f", weight)
-		if fn.FieldValueFactor != nil {
+		if fn.ScriptScore != nil && fn.ScriptScore.Script != nil {
+			if scriptExpr, ok := t.compileMetricScriptExprWithOverride(fn.ScriptScore.Script, "_score", base.ScoreSQL, nctx); ok {
+				if fn.Weight != nil {
+					valExpr = fmt.Sprintf("(%.4f * (%s))", weight, scriptExpr)
+				} else {
+					valExpr = scriptExpr
+				}
+			}
+		} else if fn.FieldValueFactor != nil {
 			fvf := fn.FieldValueFactor
 			col := t.sqlNumericColumnRef(fvf.Field, nctx)
 			factor := 1.0
@@ -2099,7 +2284,7 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 	}
 	whereSQL := base.WhereSQL
 	safeWhereSQL := base.EffectiveSafeWhere()
-	if fs.MinScore != nil && !queryContainsScript(&esast.Query{FunctionScore: fs}) {
+	if fs.MinScore != nil && !hasUncompilableScriptFn && !queryContainsScript(fs.Query) {
 		minScoreCond := fmt.Sprintf("(%s >= %.4f)", finalScore, *fs.MinScore)
 		if whereSQL == "" || whereSQL == "TRUE" {
 			whereSQL = minScoreCond
@@ -2741,16 +2926,17 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 func (t *Transpiler) compileExistsPredicate(field string, nctx *nestedCtx) string {
 	if strings.ContainsAny(field, "*?") && t.Schema != nil {
 		exp := t.expandFieldPatternForContext(field, nctx)
-		if len(exp) > 0 {
-			var disjuncts []string
-			for _, bf := range exp {
-				disjuncts = append(disjuncts, t.compileExistsPredicate(bf.Field, nctx))
-			}
-			if len(disjuncts) == 1 {
-				return disjuncts[0]
-			}
-			return "(" + strings.Join(disjuncts, " OR ") + ")"
+		if len(exp) == 0 {
+			return "FALSE"
 		}
+		var disjuncts []string
+		for _, bf := range exp {
+			disjuncts = append(disjuncts, t.compileExistsPredicate(bf.Field, nctx))
+		}
+		if len(disjuncts) == 1 {
+			return disjuncts[0]
+		}
+		return "(" + strings.Join(disjuncts, " OR ") + ")"
 	}
 	if t.Schema != nil && nctx == nil {
 		if corrCol, ok := t.Schema.NestedRoots[field]; ok && corrCol != "" {
@@ -6728,6 +6914,12 @@ func (t *Transpiler) parseMetricScriptExpr(s string, params map[string]any, defa
 			return fieldOverrideExpr, true
 		}
 		return t.sqlNumericColumnRef(field, nctx), true
+	}
+	if s == "_score" {
+		if defaultField == "_score" && fieldOverrideExpr != "" {
+			return "(" + fieldOverrideExpr + ")", true
+		}
+		return "1.0", true
 	}
 	if (s == "_value" || s == "params._value") && defaultField != "" {
 		if fieldOverrideExpr != "" {

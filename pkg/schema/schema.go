@@ -187,12 +187,23 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 	}
 
 	copyToTargets := make(map[string]bool)
-	for _, b := range s.Fields {
-		for _, target := range b.CopyTo {
+	for k, b := range s.Fields {
+		updatedCopyTo := false
+		for i, target := range b.CopyTo {
+			if _, ok := s.Fields[target]; !ok && b.NestedPath != "" {
+				if _, rOK := s.Fields[b.NestedPath+"."+target]; rOK {
+					target = b.NestedPath + "." + target
+					b.CopyTo[i] = target
+					updatedCopyTo = true
+				}
+			}
 			if tb, ok := s.Fields[target]; ok && tb.AliasTarget != "" {
 				target = tb.AliasTarget
 			}
 			copyToTargets[target] = true
+		}
+		if updatedCopyTo {
+			s.Fields[k] = b
 		}
 	}
 	for target := range copyToTargets {
@@ -960,7 +971,15 @@ func mergeFieldProperty(existing, incoming esast.FieldProperty) esast.FieldPrope
 		}
 		return existing
 	}
-	// Widening rules: long + double -> double; keyword + text -> text (with .keyword); date/numeric/boolean + string -> keyword/text
+	if existing.Type == "" {
+		incoming.MultiValued = mv
+		return incoming
+	}
+	if incoming.Type == "" {
+		existing.MultiValued = mv
+		return existing
+	}
+	// Widening rules: long + double -> double; keyword + text -> text (with .keyword); incompatible scalars -> keyword/text
 	if (existing.Type == "long" && incoming.Type == "double") || (existing.Type == "double" && incoming.Type == "long") {
 		return esast.FieldProperty{Type: "double", MultiValued: mv}
 	}
@@ -979,8 +998,7 @@ func mergeFieldProperty(existing, incoming esast.FieldProperty) esast.FieldPrope
 			},
 		}
 	}
-	existing.MultiValued = mv
-	return existing
+	return esast.FieldProperty{Type: "keyword", MultiValued: mv}
 }
 
 func looksLikeISODateString(s string) bool {

@@ -1255,24 +1255,21 @@ func rewriteIngestCtxReferences(s string) string {
 			} else if strings.HasPrefix(rest, ".") {
 				after := rest[1:]
 				isSource := strings.HasPrefix(after, "_source") && (len(after) == 7 || !isIngestIdentByte(after[7]))
-				isOp := strings.HasPrefix(after, "op") && (len(after) == 2 || !isIngestIdentByte(after[2]))
-				if !isSource && !isOp {
+				if !isSource {
 					out.WriteString("ctx._source.")
 					i += 3
 					continue
 				}
 			} else if strings.HasPrefix(rest, "?[") {
 				after := strings.TrimSpace(rest[2:])
-				if !strings.HasPrefix(after, "'_source'") && !strings.HasPrefix(after, `"_source"`) &&
-					!strings.HasPrefix(after, "'op'") && !strings.HasPrefix(after, `"op"`) {
+				if !strings.HasPrefix(after, "'_source'") && !strings.HasPrefix(after, `"_source"`) {
 					out.WriteString("ctx?._source[")
 					i += 4
 					continue
 				}
 			} else if strings.HasPrefix(rest, "[") {
 				after := strings.TrimSpace(rest[1:])
-				if !strings.HasPrefix(after, "'_source'") && !strings.HasPrefix(after, `"_source"`) &&
-					!strings.HasPrefix(after, "'op'") && !strings.HasPrefix(after, `"op"`) {
+				if !strings.HasPrefix(after, "'_source'") && !strings.HasPrefix(after, `"_source"`) {
 					out.WriteString("ctx._source[")
 					i += 3
 					continue
@@ -2027,7 +2024,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			}
 			targetField, _ := specMap["target_field"].(string)
 			if targetField != "" {
-				setIngestPath(doc, targetField, map[string]any{})
+				if existing, ok := getIngestPath(doc, targetField); !ok || existing == nil {
+					setIngestPath(doc, targetField, map[string]any{})
+				} else if _, isMap := existing.(map[string]any); !isMap {
+					setIngestPath(doc, targetField, map[string]any{})
+				}
 				for k, v := range extracted {
 					setIngestPath(doc, targetField+"."+k, v)
 				}
@@ -3280,11 +3281,18 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		sepStr, _ := specMap["separator"].(string)
 		quoteStr, _ := specMap["quote"].(string)
 		trimFlag, _ := specMap["trim"].(bool)
+		ignoreMissing, _ := specMap["ignore_missing"].(bool)
 		emptyVal, hasEmptyVal := specMap["empty_value"]
 		if field != "" && len(targetFields) > 0 {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				strVal := fmt.Sprintf("%v", val)
+				strVal, isStr := val.(string)
+				if !isStr {
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
+				}
 				if strings.TrimSpace(strVal) == "" {
+					if !ignoreMissing && strVal == "" && !hasEmptyVal {
+						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is empty", field)
+					}
 					return false, false, procType, procTag, specMap, nil
 				}
 				comma := ','
@@ -3352,7 +3360,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					setIngestPath(doc, tfName, cell)
 				}
 				mutated = true
-			} else if isExplicitIgnoreMissingFalse(specMap) {
+			} else if !ignoreMissing {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
 		}
@@ -3603,6 +3611,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 		params, _ := specMap["params"].(map[string]any)
 		if src != "" {
+			_, hadOpField := doc["op"]
 			normSrc := rewriteIngestCtxReferences(src)
 			docBytes, err := json.Marshal(doc)
 			if err == nil {
@@ -3624,6 +3633,16 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					dec2 := json.NewDecoder(bytes.NewReader(mutatedBytes))
 					dec2.UseNumber()
 					if err := dec2.Decode(&nextDoc); err == nil && nextDoc != nil {
+						if !hadOpField {
+							if opStr, isStr := nextDoc["op"].(string); isStr {
+								switch strings.ToLower(strings.TrimSpace(opStr)) {
+								case "delete", "drop":
+									return false, true, procType, procTag, specMap, nil
+								case "noop", "none":
+									return false, false, procType, procTag, specMap, nil
+								}
+							}
+						}
 						for k := range doc {
 							delete(doc, k)
 						}
@@ -5137,6 +5156,25 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	applyURISearchParams(r, &req)
+	if req.PIT != nil && req.PIT.ID != "" {
+		pitIdx, ok := decodePITIndex(req.PIT.ID)
+		if !ok || pitIdx == "" {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"valid":   false,
+				"error":   "invalid pit id [" + req.PIT.ID + "]",
+				"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0},
+			})
+			return
+		}
+	}
+	if errMsg := validatePipelineAggs(req.EffectiveAggs()); errMsg != "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"valid":   false,
+			"error":   errMsg,
+			"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0},
+		})
+		return
+	}
 	rawIndex = extractPITIndex(rawIndex, req.PIT)
 	targets, aliasFilters := s.resolveTargetIndicesWithFilters(rawIndex)
 	if len(targets) == 0 {
@@ -5435,10 +5473,11 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 	if rolledOver {
 		var baseMapping *esast.MappingSpec
 		s.mu.RLock()
+		tplMapping, tplDefPipe, hasTplDefPipe, tplFinPipe, hasTplFinPipe, tplAliases := s.matchingTemplateConfigLocked(newIdx)
 		if oldSchema, ok := s.indices[oldIdx]; ok && oldSchema != nil {
-			baseMapping = oldSchema.RawMapping
+			baseMapping = schema.MergeMappingSpecs(tplMapping, oldSchema.RawMapping)
 		} else {
-			baseMapping = s.matchingTemplateMappingsLocked(newIdx)
+			baseMapping = tplMapping
 		}
 		s.mu.RUnlock()
 		if req.Mappings != nil {
@@ -5453,13 +5492,31 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 
 		s.mu.Lock()
 		s.indices[newIdx] = compiled
-		if p, found := extractDefaultPipelineFromSettings(req.Settings); found && p != "" {
-			s.indexDefaultPipelines[newIdx] = p
+		if hasTplDefPipe && tplDefPipe != "" {
+			s.indexDefaultPipelines[newIdx] = tplDefPipe
 		}
-		if fp, found := extractFinalPipelineFromSettings(req.Settings); found && fp != "" {
-			s.indexFinalPipelines[newIdx] = fp
+		if hasTplFinPipe && tplFinPipe != "" {
+			s.indexFinalPipelines[newIdx] = tplFinPipe
 		}
-		extraAliasTargets := make(map[string][]string, len(req.Aliases))
+		if p, found := extractDefaultPipelineFromSettings(req.Settings); found {
+			if p == "" {
+				delete(s.indexDefaultPipelines, newIdx)
+			} else {
+				s.indexDefaultPipelines[newIdx] = p
+			}
+		}
+		if fp, found := extractFinalPipelineFromSettings(req.Settings); found {
+			if fp == "" {
+				delete(s.indexFinalPipelines, newIdx)
+			} else {
+				s.indexFinalPipelines[newIdx] = fp
+			}
+		}
+		extraAliasTargets := make(map[string][]string, len(tplAliases)+len(req.Aliases))
+		for tplAlias, rawMeta := range tplAliases {
+			s.addAliasWithMetaLocked(tplAlias, newIdx, parseAliasMetadata(rawMeta))
+			extraAliasTargets[tplAlias] = append([]string(nil), s.aliases[tplAlias]...)
+		}
 		for extraAlias, rawMeta := range req.Aliases {
 			s.addAliasWithMetaLocked(extraAlias, newIdx, parseAliasMetadata(rawMeta))
 			extraAliasTargets[extraAlias] = append([]string(nil), s.aliases[extraAlias]...)
@@ -5831,12 +5888,12 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 				if err := docDec.Decode(&docMap); err == nil {
 					row["_doc"] = docMap
 				}
-				if evalScore := evalNumericExpr(row, cq.ScoreSQL); evalScore > 0 || cq.ScoreSQL == "0.0" {
-					scoreVal = evalScore
+				if cq.ScoreSQL != "" {
+					scoreVal = evalNumericExpr(row, cq.ScoreSQL)
 				}
 			}
 		}
-		if queryHasRuntimeScript(effQuery) || queryHasNestedScoring(effQuery) {
+		if queryHasRuntimeScript(effQuery) || queryHasNestedScoring(effQuery) || (effQuery != nil && (effQuery.FunctionScore != nil || effQuery.ScriptScore != nil)) {
 			var docMap map[string]any
 			dec := json.NewDecoder(bytes.NewReader(hit.Source))
 			dec.UseNumber()
@@ -5844,9 +5901,17 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 			if docMap == nil {
 				docMap = make(map[string]any)
 			}
-			scoreVal = evalQueryScriptScoreOnDocWithSchema(idxSchema, docMap, effQuery, scoreVal)
+			baseScore := scoreVal
+			if effQuery != nil && ((effQuery.ScriptScore != nil && effQuery.ScriptScore.Query == nil) || (effQuery.FunctionScore != nil && effQuery.FunctionScore.Query == nil)) {
+				baseScore = 1.0
+			}
+			scoreVal = evalQueryScriptScoreOnDocWithSchema(idxSchema, docMap, effQuery, baseScore)
 		}
-		if resolvedReq.MinScore != nil && scoreVal < *resolvedReq.MinScore {
+		if resolvedReq.PostFilter != nil && !s.docMatchesAliasFilter(r.Context(), indexName, docID, hit.Source, resolvedReq.PostFilter) {
+			matched = false
+			scoreVal = 0.0
+			desc = "no match on post_filter"
+		} else if resolvedReq.MinScore != nil && scoreVal < *resolvedReq.MinScore {
 			matched = false
 			scoreVal = 0.0
 			desc = fmt.Sprintf("score (< %.4f) is less than min_score", *resolvedReq.MinScore)

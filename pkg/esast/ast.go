@@ -2253,11 +2253,15 @@ type IndexCreateRequest struct {
 
 // IndexTemplateRequest models `PUT /_index_template/<name>` and `PUT /_template/<name>`.
 type IndexTemplateRequest struct {
-	IndexPatterns []string            `json:"index_patterns,omitempty"`
-	Patterns      []string            `json:"patterns,omitempty"`
-	Template      *IndexCreateRequest `json:"template,omitempty"`
-	Mappings      *MappingSpec        `json:"mappings,omitempty"`
-	Settings      map[string]any      `json:"settings,omitempty"`
+	IndexPatterns []string                  `json:"index_patterns,omitempty"`
+	Patterns      []string                  `json:"patterns,omitempty"`
+	Priority      *int                      `json:"priority,omitempty"`
+	Order         *int                      `json:"order,omitempty"`
+	ComposedOf    []string                  `json:"composed_of,omitempty"`
+	Template      *IndexCreateRequest       `json:"template,omitempty"`
+	Mappings      *MappingSpec              `json:"mappings,omitempty"`
+	Settings      map[string]any            `json:"settings,omitempty"`
+	Aliases       map[string]map[string]any `json:"aliases,omitempty"`
 }
 
 func (t *IndexTemplateRequest) EffectivePatterns() []string {
@@ -2267,11 +2271,35 @@ func (t *IndexTemplateRequest) EffectivePatterns() []string {
 	return t.Patterns
 }
 
+func (t IndexTemplateRequest) EffectivePriority() int {
+	if t.Priority != nil {
+		return *t.Priority
+	}
+	if t.Order != nil {
+		return *t.Order
+	}
+	return 0
+}
+
 func (t *IndexTemplateRequest) EffectiveMappings() *MappingSpec {
 	if t.Template != nil && t.Template.Mappings != nil {
 		return t.Template.Mappings
 	}
 	return t.Mappings
+}
+
+func (t *IndexTemplateRequest) EffectiveSettings() map[string]any {
+	if t.Template != nil && len(t.Template.Settings) > 0 {
+		return t.Template.Settings
+	}
+	return t.Settings
+}
+
+func (t *IndexTemplateRequest) EffectiveAliases() map[string]map[string]any {
+	if t.Template != nil && len(t.Template.Aliases) > 0 {
+		return t.Template.Aliases
+	}
+	return t.Aliases
 }
 
 // MappingSpec models an Elasticsearch `_mapping` payload.

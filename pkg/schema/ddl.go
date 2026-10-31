@@ -173,11 +173,22 @@ func GeneratePromoteVariantFieldDDL(s *IndexSchema, esFieldPath string, esType s
 	if s == nil {
 		return nil
 	}
+	hasKeywordSuffix := strings.HasSuffix(esFieldPath, ".keyword")
 	cleanPath := strings.TrimSuffix(esFieldPath, ".keyword")
 	if cleanPath == "" {
 		return nil
 	}
-	if existing, ok := s.Fields[cleanPath]; ok && existing.Kind != StorageDynamicVariant {
+	isExplicitKeyword := false
+	if hasKeywordSuffix {
+		if existingBase, ok := s.Fields[cleanPath]; ok && existingBase.Kind != StorageDynamicVariant {
+			isExplicitKeyword = true
+		}
+	}
+	checkPath := cleanPath
+	if isExplicitKeyword {
+		checkPath = esFieldPath
+	}
+	if existing, ok := s.Fields[checkPath]; ok && existing.Kind != StorageDynamicVariant {
 		return nil
 	}
 	for root := range s.NestedRoots {
@@ -190,14 +201,18 @@ func GeneratePromoteVariantFieldDDL(s *IndexSchema, esFieldPath string, esType s
 		return nil
 	}
 	colName := "f__" + SanitizeDorisIdentifier(cleanPath)
-	if esType == "" {
+	if isExplicitKeyword {
+		colName += "__keyword"
+		esType = "keyword"
+	} else if esType == "" {
 		esType = "keyword"
 	}
 	binding := FieldBinding{
-		ESFieldPath: cleanPath,
+		ESFieldPath: checkPath,
 		ColumnName:  colName,
 		Kind:        StoragePromotedScalar,
 		DorisType:   mapESTypeToDoris(esType),
+		ESType:      strings.ToLower(strings.TrimSpace(esType)),
 	}
 	if DefaultMultiValuedPaths[cleanPath] || strings.EqualFold(esType, "array") {
 		binding.Kind = StoragePromotedArray
@@ -210,6 +225,28 @@ func GeneratePromoteVariantFieldDDL(s *IndexSchema, esFieldPath string, esType s
 	}
 	if idxDef != "" {
 		stmts = append(stmts, fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD %s;", s.DorisDB, s.DorisTable, idxDef))
+	}
+	if !isExplicitKeyword && strings.EqualFold(esType, "text") {
+		kwPath := cleanPath + ".keyword"
+		if existingKw, ok := s.Fields[kwPath]; !ok || existingKw.Kind == StorageDynamicVariant {
+			kwBinding := FieldBinding{
+				ESFieldPath: kwPath,
+				ColumnName:  colName + "__keyword",
+				Kind:        binding.Kind,
+				DorisType:   DorisVarchar,
+				ESType:      "keyword",
+			}
+			if kwBinding.Kind == StoragePromotedArray {
+				kwBinding.DorisType = DorisString
+			}
+			kwColDef, kwIdxDef := buildColumnAndIndexDDL(kwBinding)
+			if kwColDef != "" {
+				stmts = append(stmts, fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD COLUMN %s;", s.DorisDB, s.DorisTable, kwColDef))
+			}
+			if kwIdxDef != "" {
+				stmts = append(stmts, fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD %s;", s.DorisDB, s.DorisTable, kwIdxDef))
+			}
+		}
 	}
 	return stmts
 }

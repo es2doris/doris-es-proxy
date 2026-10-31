@@ -795,13 +795,11 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 					}
 					return esast.Query{MatchAll: map[string]any{}}
 				}
-				if !strings.ContainsAny(field, "*?") {
-					if boost != 1.0 {
-						b := boost
-						return esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: esast.Query{Exists: &esast.ExistsQuery{Field: field}}, Boost: &b}}
-					}
-					return esast.Query{Exists: &esast.ExistsQuery{Field: field}}
+				if boost != 1.0 {
+					b := boost
+					return esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: esast.Query{Exists: &esast.ExistsQuery{Field: field}}, Boost: &b}}
 				}
+				return esast.Query{Exists: &esast.ExistsQuery{Field: field}}
 			}
 			return esast.Query{
 				Range: map[string]esast.RangeCond{field: *rc},
@@ -870,13 +868,11 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 					}
 					return esast.Query{MatchAll: map[string]any{}}
 				}
-				if !strings.ContainsAny(field, "*?") {
-					if boost != 1.0 {
-						b := boost
-						return esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: esast.Query{Exists: &esast.ExistsQuery{Field: field}}, Boost: &b}}
-					}
-					return esast.Query{Exists: &esast.ExistsQuery{Field: field}}
+				if boost != 1.0 {
+					b := boost
+					return esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: esast.Query{Exists: &esast.ExistsQuery{Field: field}}, Boost: &b}}
 				}
+				return esast.Query{Exists: &esast.ExistsQuery{Field: field}}
 			}
 			return esast.Query{
 				Wildcard: map[string]esast.WildcardEntry{
