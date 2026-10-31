@@ -516,6 +516,7 @@ func TestPainlessRound28ComprehensiveCoverage(t *testing.T) {
 			'dateCmp': dateCmp,
 			'kv': kv.get('x') == 10 && kv.get('z') == 30 && defV == 77 && mapChecks && kSet.size() == 3 && vSet.size() == 3,
 			'docChecks': docChecks,
+			'epochSec': Instant.ofEpochMilli(1700000000000L).getEpochSecond() == 1700000000,
 			'casts': (int) 3.9 == 3 && (double) 3 == 3.0 && (boolean) 1 == true && String.valueOf(42) == '42'
 		];
 	`, nil)

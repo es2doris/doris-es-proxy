@@ -2130,7 +2130,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		".toLowerCase()", ".toUpperCase()", ".trim()", ".strip()", ".stripLeading()", ".stripTrailing()", ".isBlank()",
 		".length()", ".size()", ".keySet()", ".values()", ".entrySet()", ".getKey()", ".getValue()", ".toString()",
 		".getYear()", ".getMonthValue()", ".getDayOfMonth()", ".getDate()", ".getHour()", ".getMinute()", ".getSecond()",
-		".getDayOfWeek()", ".getDayOfWeekEnum()", ".getMillis()", ".toEpochMilli()", ".toInstant()",
+		".getDayOfWeek()", ".getDayOfWeekEnum()", ".getMillis()", ".toEpochMilli()", ".getEpochSecond()", ".toInstant()",
 	} {
 		if strings.HasSuffix(rhs, mSuffix) {
 			recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:len(rhs)-len(mSuffix)], "?"))
@@ -2160,7 +2160,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				return fmt.Sprintf("%v", recVal), nil
 			case ".toInstant()":
 				return recVal, nil
-			case ".getYear()", ".getMonthValue()", ".getDayOfMonth()", ".getDate()", ".getHour()", ".getMinute()", ".getSecond()", ".getDayOfWeek()", ".getDayOfWeekEnum()", ".getMillis()", ".toEpochMilli()":
+			case ".getYear()", ".getMonthValue()", ".getDayOfMonth()", ".getDate()", ".getHour()", ".getMinute()", ".getSecond()", ".getDayOfWeek()", ".getDayOfWeekEnum()", ".getMillis()", ".toEpochMilli()", ".getEpochSecond()":
 				if tm, ok := parsePainlessDateTime(recVal); ok {
 					switch mSuffix {
 					case ".getYear()":
@@ -2185,6 +2185,8 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						return strings.ToUpper(tm.Weekday().String()), nil
 					case ".getMillis()", ".toEpochMilli()":
 						return tm.UnixMilli(), nil
+					case ".getEpochSecond()":
+						return tm.Unix(), nil
 					}
 				}
 				return nil, nil
