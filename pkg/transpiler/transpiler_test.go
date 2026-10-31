@@ -1336,6 +1336,468 @@ func TestRound30BoostZeroFuzzyCaseInsensitiveTermsSetAndRelativeNestedSubAggs(t 
 	}
 }
 
+func TestRound31BugFixesAndUntestedSubsystems(t *testing.T) {
+	rawMap := `{
+		"properties": {
+			"svc_name":   {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+			"svc_region": {"type": "keyword", "normalizer": "lowercase"},
+			"status":     {"type": "keyword"},
+			"req_count":  {"type": "long"},
+			"latency":    {"type": "double"},
+			"active":     {"type": "boolean"},
+			"client_ip":  {"type": "ip"},
+			"ip_list":    {"type": "ip", "multi_valued": true},
+			"ts":         {"type": "date"},
+			"ts_nanos":   {"type": "date_nanos"},
+			"tags":       {"type": "keyword", "multi_valued": true},
+			"scores":     {"type": "double", "multi_valued": true},
+			"vec_cos":    {"type": "dense_vector", "dims": 2, "similarity": "cosine"},
+			"vec_l2":     {"type": "dense_vector", "dims": 2, "similarity": "l2_norm"},
+			"vec_dot":    {"type": "dense_vector", "dims": 2, "similarity": "dot_product"},
+			"events": {
+				"type": "nested",
+				"properties": {
+					"code": {"type": "keyword", "normalizer": "lowercase"},
+					"msg":  {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+					"ms":   {"type": "long"},
+					"flag": {"type": "boolean"},
+					"ts":   {"type": "date"},
+					"tags": {"type": "keyword", "multi_valued": true}
+				}
+			}
+		}
+	}`
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(rawMap), &spec); err != nil {
+		t.Fatalf("unmarshal mapping failed: %v", err)
+	}
+	sc := schema.CompileIndexSchema("logs_db", "r31_idx", &spec)
+	tr := NewTranspiler(sc, TranspilerOptions{})
+
+	// Fix 1: Wildcard & caret-boost on match, match_phrase, match_phrase_prefix, match_bool_prefix, and fuzzy
+	var reqFix1 esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"bool": {
+				"should": [
+					{"match": {"svc*^2.5": {"query": "payment api", "boost": 2.0}}},
+					{"match_phrase": {"svc*^1.5": {"query": "payment api", "slop": 2}}},
+					{"match_phrase_prefix": {"svc*^2.0": {"query": "pay"}}},
+					{"match_bool_prefix": {"svc_name^3.0": {"query": "payment gateway", "operator": "and"}}},
+					{"fuzzy": {"svc*^2.0": {"value": "payment", "fuzziness": 1}}}
+				]
+			}
+		}
+	}`), &reqFix1); err != nil {
+		t.Fatalf("unmarshal reqFix1 failed: %v", err)
+	}
+	planFix1, err := tr.BuildSearchPlan(&reqFix1)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan(reqFix1) failed: %v", err)
+	}
+	if strings.Contains(planFix1.HitsSQL, "`_doc`['svc*") {
+		t.Fatalf("expected wildcard field svc* to expand to mapped fields instead of literal _doc['svc*'], got:\n%s", planFix1.HitsSQL)
+	}
+	if !strings.Contains(planFix1.HitsSQL, "5.0000") {
+		t.Fatalf("expected svc*^2.5 with boost:2.0 to combine to 5.0000, got:\n%s", planFix1.HitsSQL)
+	}
+
+	// Fix 2: script_score (Script, Boost, MinScore, _score) and function_score (ScriptScore, Functions.ScriptScore, Boost, MinScore)
+	var reqFix2 esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"bool": {
+				"must": [
+					{
+						"script_score": {
+							"query": {"term": {"status": "ok"}},
+							"script": {"source": "_score * 2 + doc['req_count'].value * params.factor", "params": {"factor": 3}},
+							"boost": 1.5,
+							"min_score": 10.0
+						}
+					},
+					{
+						"function_score": {
+							"query": {"term": {"status": "ok"}},
+							"functions": [
+								{
+									"filter": {"term": {"active": true}},
+									"script_score": {"script": {"source": "doc['latency'].value + 5"}}
+								},
+								{
+									"field_value_factor": {"field": "req_count", "factor": 1.2, "modifier": "log1p", "missing": 1.0}
+								}
+							],
+							"score_mode": "sum",
+							"boost_mode": "replace",
+							"max_boost": 100.0,
+							"boost": 2.0,
+							"min_score": 5.0
+						}
+					}
+				]
+			}
+		}
+	}`), &reqFix2); err != nil {
+		t.Fatalf("unmarshal reqFix2 failed: %v", err)
+	}
+	planFix2, err := tr.BuildSearchPlan(&reqFix2)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan(reqFix2) failed: %v", err)
+	}
+	if !strings.Contains(planFix2.HitsSQL, ">= 10") || !strings.Contains(planFix2.HitsSQL, ">= 5") {
+		t.Fatalf("expected script_score and function_score min_score predicates in WHERE, got:\n%s", planFix2.HitsSQL)
+	}
+	if !strings.Contains(planFix2.HitsSQL, "1.5000") || !strings.Contains(planFix2.HitsSQL, "2.0000") {
+		t.Fatalf("expected script_score and function_score boost multipliers in ScoreSQL, got:\n%s", planFix2.HitsSQL)
+	}
+
+	// Fix 3: Nested prefilter with relative field names
+	var reqFix3 esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"nested": {
+				"path": "events",
+				"score_mode": "sum",
+				"query": {
+					"bool": {
+						"must": [
+							{"term": {"code": "ERR_TIMEOUT"}},
+							{"terms": {"tags": ["net", "db"]}},
+							{"exists": {"field": "msg"}},
+							{"prefix": {"code": "ERR"}},
+							{"wildcard": {"code": "ERR*"}},
+							{"regexp": {"code": "ERR.*"}},
+							{"match": {"msg": "timeout"}}
+						]
+					}
+				}
+			}
+		}
+	}`), &reqFix3); err != nil {
+		t.Fatalf("unmarshal reqFix3 failed: %v", err)
+	}
+	planFix3, err := tr.BuildSearchPlan(&reqFix3)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan(reqFix3) failed: %v", err)
+	}
+	if !strings.Contains(planFix3.HitsSQL, "n__events__code") {
+		t.Fatalf("expected relative nested field 'code' to use prefilter array column n__events__code, got:\n%s", planFix3.HitsSQL)
+	}
+
+	// Fix 4: Multi-field term, range, prefix, wildcard, and regexp additive scoring & caret boosts
+	var reqFix4 esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"bool": {
+				"must": [
+					{"term": {"status^2.0": {"value": "ok"}, "svc_region^3.0": {"value": "US-EAST"}}},
+					{"range": {"req_count^1.5": {"gte": 10}, "latency^2.5": {"lte": 500}}},
+					{"prefix": {"status^2.0": {"value": "o"}, "svc_region^3.0": {"value": "us"}}},
+					{"wildcard": {"status^2.0": {"value": "o*"}, "svc_region^3.0": {"value": "us*"}}},
+					{"regexp": {"status^2.0": {"value": "o.*"}, "svc_region^3.0": {"value": "us.*"}}}
+				]
+			}
+		}
+	}`), &reqFix4); err != nil {
+		t.Fatalf("unmarshal reqFix4 failed: %v", err)
+	}
+	planFix4, err := tr.BuildSearchPlan(&reqFix4)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan(reqFix4) failed: %v", err)
+	}
+	if !strings.Contains(planFix4.HitsSQL, "2.0000") || !strings.Contains(planFix4.HitsSQL, "3.0000") || !strings.Contains(planFix4.HitsSQL, " + ") {
+		t.Fatalf("expected multi-field leaf queries to accumulate per-field caret-boosted scores with '+', got:\n%s", planFix4.HitsSQL)
+	}
+
+	// Fix 5: Wildcard field exists in Lucene query_string (svc*:[* TO *], svc*:{* TO *}, svc*:*) and non-matching wildcard exists -> FALSE
+	var reqFix5 esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"bool": {
+				"must": [
+					{"query_string": {"query": "svc*:[* TO *] AND svc*:{* TO *} AND svc*:*"}},
+					{"exists": {"field": "nonexistent_prefix_*"}}
+				]
+			}
+		}
+	}`), &reqFix5); err != nil {
+		t.Fatalf("unmarshal reqFix5 failed: %v", err)
+	}
+	planFix5, err := tr.BuildSearchPlan(&reqFix5)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan(reqFix5) failed: %v", err)
+	}
+	if !strings.Contains(planFix5.HitsSQL, "IS NOT NULL") {
+		t.Fatalf("expected svc*:[* TO *] and svc*:* to compile to IS NOT NULL exists checks, got:\n%s", planFix5.HitsSQL)
+	}
+	if !strings.Contains(planFix5.HitsSQL, "FALSE") {
+		t.Fatalf("expected exists on unmatched wildcard pattern nonexistent_prefix_* to compile to FALSE, got:\n%s", planFix5.HitsSQL)
+	}
+
+	// Coverage expansion: KNN (cosine, l2, dot_product, dynamic vector), Script query, IP CIDR term/terms, Collapse, PIT Sorts, Array Sort Modes, SearchAfter, and Comprehensive Aggregations
+	var reqCov1 esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"pit": {"id": "r31_idx", "keep_alive": "1m"},
+		"query": {
+			"bool": {
+				"must": [
+					{"knn": {"field": "vec_cos", "query_vector": [0.1, 0.2], "k": 5, "similarity": 0.8, "filter": [{"term": {"status": "ok"}}], "boost": 1.5}},
+					{"knn": {"field": "vec_l2", "query_vector": [0.3, 0.4], "k": 5, "similarity": 1.5}},
+					{"knn": {"field": "vec_dot", "query_vector": [0.5, 0.6], "k": 5, "similarity": 0.5}},
+					{"knn": {"field": "unmapped_vec", "query_vector": [0.7, 0.8], "k": 5}},
+					{"term": {"client_ip": "10.0.0.0/8"}},
+					{"term": {"ip_list": "192.168.1.0/24"}},
+					{"terms": {"client_ip": ["10.0.0.0/8", "172.16.0.1"]}},
+					{"script": {"script": {"source": "doc['req_count'].value + params.inc >= 10 && !doc['status'].empty && doc['tags'].size() > 0", "params": {"inc": 2}}}}
+				]
+			}
+		},
+		"collapse": {
+			"field": "status",
+			"inner_hits": {"name": "top_by_lat", "size": 3, "sort": [{"latency": "desc"}]}
+		},
+		"sort": [
+			{"_script": {"type": "number", "script": {"source": "doc['req_count'].value * 2"}, "order": "desc", "missing": 0}},
+			{"_script": {"type": "string", "script": {"source": "doc['status'].value + '_x'"}, "order": "asc", "missing": "_first"}},
+			{"scores": {"order": "desc", "mode": "avg"}},
+			{"scores": {"order": "asc", "mode": "median"}},
+			{"scores": {"order": "desc", "mode": "sum"}},
+			{"client_ip": {"order": "asc", "missing": "127.0.0.1"}},
+			{"ts_nanos": {"order": "desc", "missing": "2026-01-01T00:00:00Z"}},
+			{"events.ms": {"order": "desc", "mode": "max", "nested": {"path": "events", "filter": {"term": {"events.flag": true}}}}}
+		],
+		"search_after": [100, "ok_x", 50.5, 25.0, 150.0, "10.0.0.1", "2026-01-02T00:00:00Z", 200, "doc_1"]
+	}`), &reqCov1); err != nil {
+		t.Fatalf("unmarshal reqCov1 failed: %v", err)
+	}
+	planCov1, err := tr.BuildSearchPlan(&reqCov1)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan(reqCov1) failed: %v", err)
+	}
+	if !strings.Contains(planCov1.HitsSQL, "COSINE_DISTANCE") || !strings.Contains(planCov1.HitsSQL, "L2_DISTANCE") || !strings.Contains(planCov1.HitsSQL, "INNER_PRODUCT") {
+		t.Fatalf("expected KNN distance functions in HitsSQL, got:\n%s", planCov1.HitsSQL)
+	}
+	if !strings.Contains(planCov1.HitsSQL, "IPV4_STRING_TO_NUM_OR_NULL") {
+		t.Fatalf("expected IPv4 CIDR conversion in HitsSQL, got:\n%s", planCov1.HitsSQL)
+	}
+	if !strings.Contains(planCov1.HitsSQL, "array_avg") || !strings.Contains(planCov1.HitsSQL, "array_median") || !strings.Contains(planCov1.HitsSQL, "array_sum") {
+		t.Fatalf("expected array sort functions in HitsSQL, got:\n%s", planCov1.HitsSQL)
+	}
+
+	// Coverage expansion: Top-level and nested/bucket sub-aggregations
+	var reqCov2 esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"size": 0,
+		"aggs": {
+			"global_all": {
+				"global": {},
+				"aggs": {
+					"avg_lat": {"avg": {"field": "latency", "missing": 0, "script": {"source": "_value * 2"}}}
+				}
+			},
+			"sampled": {
+				"sampler": {"shard_size": 100},
+				"aggs": {
+					"by_status": {
+						"terms": {"field": "status", "missing": "N/A"},
+						"aggs": {
+							"sub_sampler": {"diversified_sampler": {"shard_size": 50, "field": "svc_region"}},
+							"sub_missing": {"missing": {"field": "latency"}},
+							"sub_filter": {"filter": {"term": {"active": true}}},
+							"sub_filters_anon": {"filters": {"other_bucket": true, "filters": [{"term": {"active": true}}, {"term": {"active": false}}]}},
+							"sub_filters_named": {"filters": {"other_bucket": true, "other_bucket_key": "rest", "filters": {"on": {"term": {"active": true}}}}},
+							"sub_ip_range": {"ip_range": {"field": "client_ip", "ranges": [{"mask": "10.0.0.0/8"}, {"from": "192.168.0.1", "to": "192.168.255.255"}]}},
+							"sub_ip_arr_range": {"ip_range": {"field": "ip_list", "ranges": [{"mask": "10.0.0.0/8"}, {"from": "192.168.0.1", "to": "192.168.255.255"}]}},
+							"sub_arr_range": {"range": {"field": "scores", "missing": 0, "script": {"source": "_value + 1"}, "ranges": [{"from": 0, "to": 50}, {"from": 50}]}},
+							"sub_dh_arr": {"date_histogram": {"field": "ts", "fixed_interval": "1h", "time_zone": "+02:00", "offset": "+15m", "missing": "2026-01-01T00:00:00Z", "script": {"source": "_value + 1000"}}},
+							"sub_hist_arr": {"histogram": {"field": "scores", "interval": 10, "offset": 2, "missing": 0, "script": {"source": "_value * 1.5"}}},
+							"sub_pct_arr": {"percentiles": {"field": "scores", "percents": [50, 95], "missing": 0, "script": {"source": "_value + 1"}}},
+							"sub_pr_arr": {"percentile_ranks": {"field": "scores", "values": [25, 75], "missing": 0, "script": {"source": "_value + 1"}}},
+							"sub_str_stats_arr": {"string_stats": {"field": "tags"}},
+							"sub_str_stats_scalar": {"string_stats": {"field": "status"}},
+							"sub_vc_arr": {"value_count": {"field": "tags", "missing": "none", "script": {"source": "doc['tags'].value + '_v'"}}},
+							"sub_card_arr": {"cardinality": {"field": "tags", "missing": "none", "script": {"source": "doc['tags'].value + '_c'"}}},
+							"sub_terms_arr": {"terms": {"field": "tags", "missing": "none", "script": {"source": "doc['tags'].value.toUpperCase()"}}},
+							"sub_top_hits": {"top_hits": {"size": 2, "sort": [{"latency": "desc"}]}},
+							"sub_top_metrics": {"top_metrics": {"metrics": {"field": "latency"}, "size": 1, "sort": [{"req_count": "desc"}]}}
+						}
+					}
+				}
+			},
+			"top_ip_range": {"ip_range": {"field": "client_ip", "ranges": [{"mask": "10.0.0.0/8"}, {"from": "172.16.0.1", "to": "172.16.255.255"}]}},
+			"top_ip_arr_range": {"ip_range": {"field": "ip_list", "ranges": [{"mask": "10.0.0.0/8"}, {"from": "172.16.0.1", "to": "172.16.255.255"}]}},
+			"top_arr_range": {"range": {"field": "scores", "missing": 0, "script": {"source": "_value + 1"}, "ranges": [{"from": 0, "to": 100}]}},
+			"top_date_range": {"date_range": {"field": "ts", "format": "epoch_second", "time_zone": "+01:00", "missing": "1700000000", "ranges": [{"from": "1700000000", "to": "1800000000"}]}},
+			"top_dh": {"date_histogram": {"field": "ts", "fixed_interval": "1h", "time_zone": "+01:00", "offset": "+10m", "missing": "2026-01-01T00:00:00Z", "script": {"source": "_value + 500"}}},
+			"top_hist_arr": {"histogram": {"field": "scores", "interval": 10, "missing": 0, "script": {"source": "_value * 2"}}},
+			"top_pct_arr": {"percentiles": {"field": "scores", "percents": [50, 90], "missing": 0, "script": {"source": "_value * 2"}}},
+			"top_pr_arr": {"percentile_ranks": {"field": "scores", "values": [10, 50], "missing": 0, "script": {"source": "_value * 2"}}},
+			"top_box_arr": {"boxplot": {"field": "scores", "missing": 0, "script": {"source": "_value * 2"}}},
+			"top_box_scalar": {"boxplot": {"field": "latency", "missing": 0, "script": {"source": "_value * 2"}}},
+			"top_ext_stats_arr": {"extended_stats": {"field": "scores", "missing": 0, "script": {"source": "_value * 2"}}},
+			"top_str_stats_arr": {"string_stats": {"field": "tags"}},
+			"top_str_stats_scalar": {"string_stats": {"field": "status"}},
+			"top_card_arr": {"cardinality": {"field": "tags", "missing": "none", "script": {"source": "doc['tags'].value.toLowerCase()"}}},
+			"top_rate_count": {"rate": {"unit": "second"}},
+			"top_rate_vc": {"rate": {"field": "req_count", "mode": "value_count", "unit": "minute"}},
+			"top_rate_sum": {"rate": {"field": "req_count", "mode": "sum", "unit": "hour"}},
+			"top_filters_anon": {"filters": {"other_bucket": true, "filters": [{"term": {"active": true}}, {"term": {"active": false}}]}},
+			"top_comp": {
+				"composite": {
+					"size": 10,
+					"after": {"s_tag": "a", "s_ts": 1700000000000, "s_hist": 10},
+					"sources": [
+						{"s_tag": {"terms": {"field": "tags", "missing_bucket": true}}},
+						{"s_ts": {"date_histogram": {"field": "ts", "fixed_interval": "1h", "time_zone": "+01:00", "missing_bucket": true}}},
+						{"s_hist": {"histogram": {"field": "latency", "interval": 10, "missing_bucket": true}}}
+					]
+				},
+				"aggs": {
+					"avg_req": {"avg": {"field": "req_count"}}
+				}
+			},
+			"nested_ev": {
+				"nested": {"path": "events"},
+				"aggs": {
+					"n_pct": {"percentiles": {"field": "events.ms", "missing": 0, "script": {"source": "doc['events.ms'].value * 2"}}},
+					"n_pr": {"percentile_ranks": {"field": "events.ms", "values": [10, 100], "missing": 0, "script": {"source": "doc['events.ms'].value * 2"}}},
+					"n_box": {"boxplot": {"field": "events.ms", "missing": 0, "script": {"source": "doc['events.ms'].value * 2"}}},
+					"n_str": {"string_stats": {"field": "events.code"}},
+					"n_card": {"cardinality": {"field": "events.code", "missing": "none", "script": {"source": "doc['events.code'].value.trim()"}}},
+					"n_vc": {"value_count": {"field": "events.code", "missing": "none", "script": {"source": "doc['events.code'].value"}}},
+					"n_rev": {
+						"reverse_nested": {},
+						"aggs": {
+							"root_ statuses": {"terms": {"field": "status"}}
+						}
+					}
+				}
+			}
+		}
+	}`), &reqCov2); err != nil {
+		t.Fatalf("unmarshal reqCov2 failed: %v", err)
+	}
+	planCov2, err := tr.BuildSearchPlan(&reqCov2)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan(reqCov2) failed: %v", err)
+	}
+	if !strings.Contains(planCov2.AggsSQL, "PERCENTILE_APPROX") || !strings.Contains(planCov2.AggsSQL, "STDDEV_POP") || !strings.Contains(planCov2.AggsSQL, "CHAR_LENGTH") {
+		t.Fatalf("expected PERCENTILE_APPROX, STDDEV_POP, and CHAR_LENGTH in AggsSQL, got:\n%s", planCov2.AggsSQL)
+	}
+
+	// Additional coverage for sub-agg scalar/array variants, function_score modes & modifiers, multi_match types, simple_query_string, combined_fields, post_filter, and script math functions
+	var reqCov3 esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"bool": {
+				"must": [
+					{"multi_match": {"query": "payment gateway", "fields": ["svc_name^2", "svc_region"], "type": "best_fields", "tie_breaker": 0.3}},
+					{"multi_match": {"query": "payment gateway", "fields": ["svc_name", "svc_region"], "type": "most_fields"}},
+					{"multi_match": {"query": "payment gateway", "fields": ["svc_name", "svc_region"], "type": "cross_fields", "operator": "and"}},
+					{"multi_match": {"query": "payment gateway", "fields": ["svc_name", "svc_region"], "type": "phrase", "slop": 1}},
+					{"multi_match": {"query": "payment gateway", "fields": ["svc_name", "svc_region"], "type": "phrase_prefix"}},
+					{"multi_match": {"query": "payment gateway", "fields": ["svc_name", "svc_region"], "type": "bool_prefix"}},
+					{"combined_fields": {"query": "payment api", "fields": ["svc_name", "svc_region"], "operator": "or"}},
+					{"simple_query_string": {"query": "\"payment api\" +gateway -legacy | status:(ok|warn) pay* ~2", "fields": ["svc_name^2", "status"]}},
+					{"constant_score": {"filter": {"term": {"status": "ok"}}, "boost": 2.5}},
+					{
+						"function_score": {
+							"query": {"term": {"status": "ok"}},
+							"score_mode": "avg",
+							"boost_mode": "sum",
+							"functions": [
+								{"filter": {"term": {"active": true}}, "field_value_factor": {"field": "req_count", "modifier": "log"}},
+								{"filter": {"term": {"active": false}}, "field_value_factor": {"field": "req_count", "modifier": "log2p"}},
+								{"field_value_factor": {"field": "req_count", "modifier": "ln"}},
+								{"field_value_factor": {"field": "req_count", "modifier": "ln1p"}},
+								{"field_value_factor": {"field": "req_count", "modifier": "ln2p"}},
+								{"field_value_factor": {"field": "req_count", "modifier": "square"}},
+								{"field_value_factor": {"field": "req_count", "modifier": "sqrt"}},
+								{"field_value_factor": {"field": "req_count", "modifier": "reciprocal"}}
+							]
+						}
+					},
+					{
+						"function_score": {
+							"query": {"term": {"status": "ok"}},
+							"score_mode": "first",
+							"boost_mode": "max",
+							"functions": [
+								{"filter": {"term": {"active": true}}, "weight": 3.0},
+								{"weight": 1.5}
+							]
+						}
+					},
+					{
+						"function_score": {
+							"query": {"term": {"status": "ok"}},
+							"score_mode": "min",
+							"boost_mode": "min",
+							"functions": [
+								{"filter": {"term": {"active": true}}, "weight": 3.0},
+								{"filter": {"term": {"active": false}}, "weight": 1.5}
+							]
+						}
+					}
+				]
+			}
+		},
+		"post_filter": {"term": {"active": true}},
+		"aggs": {
+			"by_status": {
+				"terms": {"field": "status"},
+				"aggs": {
+					"avg_arr": {"avg": {"field": "scores", "missing": 0, "script": {"source": "Math.min(Math.max(Math.abs(_value), 1), 100) + Math.floor(Math.ceil(Math.round(Math.sqrt(Math.log(Math.log10(Math.exp(1)))))))"}}},
+					"ext_arr": {"extended_stats": {"field": "scores", "missing": 0, "script": {"source": "_value + 1"}}},
+					"ext_scalar": {"extended_stats": {"field": "latency", "missing": 0, "script": {"source": "_value + 1"}}},
+					"pct_scalar": {"percentiles": {"field": "latency", "percents": [50, 99], "missing": 0, "script": {"source": "_value + 1"}}},
+					"pr_scalar": {"percentile_ranks": {"field": "latency", "values": [10, 100], "missing": 0, "script": {"source": "_value + 1"}}},
+					"box_arr": {"boxplot": {"field": "scores", "missing": 0, "script": {"source": "_value + 1"}}},
+					"box_scalar": {"boxplot": {"field": "latency", "missing": 0, "script": {"source": "_value + 1"}}},
+					"rate_cnt": {"rate": {"unit": "second"}},
+					"rate_vc_arr": {"rate": {"field": "tags", "mode": "value_count", "unit": "minute"}},
+					"rate_vc_scalar": {"rate": {"field": "status", "mode": "value_count", "unit": "minute"}},
+					"rate_sum": {"rate": {"field": "req_count", "mode": "sum", "unit": "hour"}},
+					"vc_scalar": {"value_count": {"field": "status", "missing": "none", "script": {"source": "doc['status'].value"}}},
+					"card_scalar": {"cardinality": {"field": "status", "missing": "none", "script": {"source": "doc['status'].value"}}},
+					"dh_scalar": {"date_histogram": {"field": "ts", "fixed_interval": "1h", "missing": "2026-01-01T00:00:00Z", "script": {"source": "_value + 1000"}}},
+					"hist_scalar": {"histogram": {"field": "latency", "interval": 10, "missing": 0, "script": {"source": "_value + 5"}}},
+					"rng_scalar": {"range": {"field": "latency", "missing": 0, "script": {"source": "_value + 1"}, "ranges": [{"from": 0, "to": 50}, {"from": 50}]}}
+				}
+			},
+			"nested_ev": {
+				"nested": {"path": "events"},
+				"aggs": {
+					"n_avg": {"avg": {"field": "events.ms", "missing": 0, "script": {"source": "doc['events.ms'].value + 1"}}},
+					"n_ext": {"extended_stats": {"field": "events.ms", "missing": 0, "script": {"source": "doc['events.ms'].value + 1"}}},
+					"n_terms": {
+						"terms": {"field": "events.code", "missing": "none", "script": {"source": "doc['events.code'].value"}},
+						"aggs": {
+							"inner_avg": {"avg": {"field": "events.ms", "missing": 0, "script": {"source": "doc['events.ms'].value + 1"}}},
+							"inner_pct": {"percentiles": {"field": "events.ms", "missing": 0, "script": {"source": "doc['events.ms'].value + 1"}}},
+							"inner_pr": {"percentile_ranks": {"field": "events.ms", "values": [10], "missing": 0, "script": {"source": "doc['events.ms'].value + 1"}}},
+							"inner_box": {"boxplot": {"field": "events.ms", "missing": 0, "script": {"source": "doc['events.ms'].value + 1"}}},
+							"inner_dh": {"date_histogram": {"field": "events.ts", "fixed_interval": "1h"}},
+							"inner_hist": {"histogram": {"field": "events.ms", "interval": 10}},
+							"inner_rev": {"reverse_nested": {}, "aggs": {"root_c": {"value_count": {"field": "status"}}}}
+						}
+					}
+				}
+			}
+		}
+	}`), &reqCov3); err != nil {
+		t.Fatalf("unmarshal reqCov3 failed: %v", err)
+	}
+	planCov3, err := tr.BuildSearchPlan(&reqCov3)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan(reqCov3) failed: %v", err)
+	}
+	if !strings.Contains(planCov3.HitsSQL, "GREATEST") || !strings.Contains(planCov3.AggsSQL, "LEAST") {
+		t.Fatalf("expected GREATEST and LEAST in planCov3 SQL, got:\n%s", planCov3.HitsSQL)
+	}
+}
+
 func mustJSONString(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)

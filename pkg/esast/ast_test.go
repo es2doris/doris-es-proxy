@@ -687,3 +687,41 @@ func TestRound30PrefixWildcardRegexpFuzzySortAndPipelineHelpers(t *testing.T) {
 		t.Fatalf("SortSpec nested marshal failed: %v", err)
 	}
 }
+
+func TestRound31IndexTemplatePriorityAndEffectiveHelpers(t *testing.T) {
+	// 1. Legacy template using "order" and top-level "aliases"
+	var legacyTpl IndexTemplateRequest
+	if err := json.Unmarshal([]byte(`{
+		"index_patterns": ["logs-*"],
+		"order": 15,
+		"settings": {"number_of_shards": 2},
+		"mappings": {"properties": {"host": {"type": "keyword"}}},
+		"aliases": {"logs-read": {}}
+	}`), &legacyTpl); err != nil {
+		t.Fatalf("unmarshal legacyTpl failed: %v", err)
+	}
+	if legacyTpl.EffectivePriority() != 15 {
+		t.Fatalf("expected EffectivePriority() == 15 from legacy order, got %d", legacyTpl.EffectivePriority())
+	}
+	if len(legacyTpl.EffectiveAliases()) != 1 || legacyTpl.EffectiveSettings()["number_of_shards"] == nil {
+		t.Fatalf("unexpected EffectiveAliases/EffectiveSettings on legacyTpl: %+v", legacyTpl)
+	}
+
+	// 2. Composable _index_template using "priority", "composed_of", and "template.aliases"
+	var compTpl IndexTemplateRequest
+	if err := json.Unmarshal([]byte(`{
+		"index_patterns": ["logs-prod-*"],
+		"priority": 100,
+		"composed_of": ["ct-base", "ct-mappings"],
+		"template": {
+			"settings": {"index.refresh_interval": "5s"},
+			"mappings": {"properties": {"service": {"type": "keyword"}}},
+			"aliases": {"logs-prod-all": {"is_write_index": true}}
+		}
+	}`), &compTpl); err != nil {
+		t.Fatalf("unmarshal compTpl failed: %v", err)
+	}
+	if compTpl.EffectivePriority() != 100 || len(compTpl.ComposedOf) != 2 || len(compTpl.EffectiveAliases()) != 1 {
+		t.Fatalf("unexpected composable template fields: %+v", compTpl)
+	}
+}

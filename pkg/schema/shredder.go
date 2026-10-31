@@ -213,6 +213,13 @@ func ShredDocument(
 				progressed = true
 
 				tb, ok := s.Fields[targetField]
+				if !ok && b.NestedPath != "" {
+					if rtb, rOK := s.Fields[b.NestedPath+"."+targetField]; rOK {
+						targetField = b.NestedPath + "." + targetField
+						tb = rtb
+						ok = true
+					}
+				}
 				if ok && tb.AliasTarget != "" {
 					if resolvedTB, rOK := s.Fields[tb.AliasTarget]; rOK {
 						targetField = tb.AliasTarget
@@ -1152,7 +1159,7 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 			continue
 		}
 		relPath := b.SourceJSONPath[len(rootParts):]
-		rawSrcVals := extractStringSliceValuesWithNull(cloned, relPath, b.LowercaseNormalizer, b.NullValue)
+		rawSrcVals := extractStringSliceValuesWithNull(cloned, relPath, false, b.NullValue)
 		for _, sv := range rawSrcVals {
 			if b.IgnoreAbove > 0 && len([]rune(sv)) > b.IgnoreAbove {
 				continue
@@ -1183,6 +1190,13 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 					progressed = true
 
 					tb, ok := s.Fields[targetField]
+					if !ok && b.NestedPath != "" {
+						if rtb, rOK := s.Fields[b.NestedPath+"."+targetField]; rOK {
+							targetField = b.NestedPath + "." + targetField
+							tb = rtb
+							ok = true
+						}
+					}
 					if ok && tb.AliasTarget != "" {
 						if rtb, rOK := s.Fields[tb.AliasTarget]; rOK {
 							targetField = tb.AliasTarget

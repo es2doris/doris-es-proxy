@@ -639,3 +639,85 @@ func TestRound30CopyToKeywordCompanionAndNestedTextKeywordArray(t *testing.T) {
 		t.Fatalf("expected truncateUTF8Bytes('a€b', 3) == 'a', got %q", trunc)
 	}
 }
+
+func TestRound31PromoteTextVariantNestedCopyToNormalizerAndTypeWidening(t *testing.T) {
+	// Fix 6: GeneratePromoteVariantFieldDDL for "text" creates companion f__<field>__keyword column + inverted index,
+	// and promoting "<field>.keyword" when <field> is already promoted creates f__<field>__keyword
+	sch := CompileIndexSchema("db", "r31_promote_idx", &esast.MappingSpec{})
+	ddls := GeneratePromoteVariantFieldDDL(sch, "dyn_msg", "text")
+	if len(ddls) != 4 {
+		t.Fatalf("expected 4 DDL statements (text col + text idx + keyword col + keyword idx), got %d: %v", len(ddls), ddls)
+	}
+	joined := strings.Join(ddls, "\n")
+	if !strings.Contains(joined, "ADD COLUMN `f__dyn_msg` STRING NULL") || !strings.Contains(joined, "ADD COLUMN `f__dyn_msg__keyword` VARCHAR(1024) NULL") {
+		t.Fatalf("expected both f__dyn_msg and f__dyn_msg__keyword in DDL, got:\n%s", joined)
+	}
+
+	// Also test promoting <field>.keyword on an existing scalar field that initially lacked a .keyword companion
+	sch2 := CompileIndexSchema("db", "r31_promote_idx2", &esast.MappingSpec{
+		Properties: map[string]esast.FieldProperty{
+			"plain_text": {Type: "text"},
+		},
+	})
+	ddls2 := GeneratePromoteVariantFieldDDL(sch2, "plain_text.keyword", "keyword")
+	if len(ddls2) != 2 || !strings.Contains(ddls2[0], "ADD COLUMN `f__plain_text__keyword` VARCHAR(1024) NULL") {
+		t.Fatalf("expected promoting plain_text.keyword on existing text field to add f__plain_text__keyword, got %v", ddls2)
+	}
+
+	// Fix 7: Nested copy_to from a source field with LowercaseNormalizer to a case-sensitive target field preserves original casing
+	var nestedSpec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"items": {
+				"type": "nested",
+				"properties": {
+					"code": {"type": "keyword", "normalizer": "lowercase", "copy_to": "raw_code"},
+					"raw_code": {"type": "keyword"}
+				}
+			}
+		}
+	}`), &nestedSpec); err != nil {
+		t.Fatalf("unmarshal nestedSpec failed: %v", err)
+	}
+	nestedSch := CompileIndexSchema("db", "r31_nested_copy", &nestedSpec)
+	shredBytes, err := ShredDocument(nestedSch, "1", 1, false, json.RawMessage(`{"items":[{"code":"AbC_123"}]}`))
+	if err != nil {
+		t.Fatalf("ShredDocument failed: %v", err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(shredBytes, &row); err != nil {
+		t.Fatalf("unmarshal shredded row failed: %v", err)
+	}
+	nItems, _ := row["n__items"].([]any)
+	if len(nItems) != 1 {
+		t.Fatalf("expected 1 nested item, got %v", row["n__items"])
+	}
+	var elem map[string]any
+	if s, ok := nItems[0].(string); ok {
+		_ = json.Unmarshal([]byte(s), &elem)
+	}
+	if elem["code"] != "abc_123" {
+		t.Fatalf("expected normalized source field 'code' == 'abc_123', got %v", elem["code"])
+	}
+	if elem["raw_code"] != "AbC_123" {
+		t.Fatalf("expected un-normalized copy_to target 'raw_code' == 'AbC_123', got %v", elem["raw_code"])
+	}
+	rawPre, _ := row["n__items__raw_code"].([]any)
+	if len(rawPre) != 1 || rawPre[0] != "AbC_123" {
+		t.Fatalf("expected prefilter array n__items__raw_code == ['AbC_123'], got %v", row["n__items__raw_code"])
+	}
+
+	// Fix 8: InferMappingFromSampleDocs widens incompatible scalar types (boolean + long, date + long, boolean + date) to keyword
+	inferred := InferMappingFromSampleDocs([]json.RawMessage{
+		json.RawMessage(`{"bool_num": true, "date_num": "2026-03-15T10:00:00Z", "bool_date": false}`),
+		json.RawMessage(`{"bool_num": 42, "date_num": 99, "bool_date": "2026-03-15T10:00:00Z"}`),
+	})
+	if inferred == nil {
+		t.Fatalf("expected non-nil inferred mapping")
+	}
+	for _, f := range []string{"bool_num", "date_num", "bool_date"} {
+		if got := inferred.Properties[f].Type; got != "keyword" {
+			t.Fatalf("expected heterogeneous field %q to widen to 'keyword', got %q", f, got)
+		}
+	}
+}

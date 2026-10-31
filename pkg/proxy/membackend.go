@@ -1473,9 +1473,18 @@ func sortRowsByOrderClause(rows []map[string]any, orderByClause string) {
 				continue
 			}
 			var cmp int
-			if colExpr == "`_id`" || colExpr == "`_score`" {
+			switch colExpr {
+			case "`_id`":
 				cmp = strings.Compare(fmt.Sprintf("%v", rows[i]["_id"]), fmt.Sprintf("%v", rows[j]["_id"]))
-			} else {
+			case "`_score`":
+				sa, _ := toFloat(rows[i]["_score"])
+				sb, _ := toFloat(rows[j]["_score"])
+				if sa < sb {
+					cmp = -1
+				} else if sa > sb {
+					cmp = 1
+				}
+			default:
 				va := resolveColumnValue(rows[i], colExpr)
 				vb := resolveColumnValue(rows[j], colExpr)
 				if va == nil && vb == nil {
@@ -2063,7 +2072,7 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 			colExpr := strings.TrimSpace(inner[:strings.IndexByte(inner, ',')])
 			listStr := strings.TrimSuffix(inner[brackIdx+1:], "]")
 			targets := make(map[string]bool)
-			for _, part := range strings.Split(listStr, ",") {
+			for _, part := range splitTopLevelArgs(listStr) {
 				targets[unquoteSQLLiteral(strings.TrimSpace(part))] = true
 			}
 			val := resolveColumnValue(row, colExpr)
@@ -2139,7 +2148,7 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 		}
 		targets := make(map[string]bool)
 		var parsedTargets []any
-		for _, item := range strings.Split(listStr, ",") {
+		for _, item := range splitTopLevelArgs(listStr) {
 			unq := unquoteSQLLiteral(strings.TrimSpace(item))
 			targets[unq] = true
 			parsedTargets = append(parsedTargets, parseSQLLiteralValue(item))
@@ -2217,7 +2226,7 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 				ci = true
 				rhs = rhs[6 : len(rhs)-1]
 			}
-			if op == ">=" && (strings.Contains(lhs, " + ") || strings.Contains(lhs, "AS INT")) {
+			if op == ">=" && (strings.Contains(lhs, " + ") || strings.Contains(lhs, " * ") || strings.Contains(lhs, " - ") || strings.Contains(lhs, " / ") || strings.Contains(lhs, "AS INT") || strings.Contains(lhs, "AS DOUBLE") || strings.Contains(lhs, "CASE WHEN") || strings.Contains(lhs, "GREATEST(") || strings.Contains(lhs, "LEAST(")) {
 				lhsNum := evalNumericExpr(row, lhs)
 				rhsNum, err := strconv.ParseFloat(rhs, 64)
 				if err != nil {
