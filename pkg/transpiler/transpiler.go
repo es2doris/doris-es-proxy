@@ -1845,9 +1845,13 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 		return strings.Join(parts, " AND ")
 	}
 	if q.Exists != nil && q.Exists.Field != "" {
-		b := t.Schema.ResolveEffectiveField(q.Exists.Field, true)
+		preferKw := strings.HasSuffix(q.Exists.Field, ".keyword")
+		b := t.Schema.ResolveEffectiveField(q.Exists.Field, preferKw)
+		if strings.HasSuffix(b.AliasTarget, ".keyword") {
+			preferKw = true
+		}
 		if b.Kind == schema.StorageNestedSubfield && b.NestedPath == nestedPath && b.PrefilterArrayCol != "" {
-			arrCol := b.EffectiveArrayColumn(true)
+			arrCol := b.EffectiveArrayColumn(preferKw)
 			return fmt.Sprintf("(`%s` IS NOT NULL AND array_size(`%s`) > 0)", arrCol, arrCol)
 		}
 	}
@@ -2714,12 +2718,16 @@ func (t *Transpiler) compileExistsPredicate(field string, nctx *nestedCtx) strin
 			return fmt.Sprintf("(`%s` IS NOT NULL AND array_size(`%s`) > 0)", corrCol, corrCol)
 		}
 	}
-	field, b := t.resolveFieldInNestedCtx(field, true, nctx)
+	preferKw := strings.HasSuffix(field, ".keyword")
+	field, b := t.resolveFieldInNestedCtx(field, preferKw, nctx)
+	if strings.HasSuffix(b.AliasTarget, ".keyword") {
+		preferKw = true
+	}
 	if b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath)) {
-		arrCol := b.EffectiveArrayColumn(true)
+		arrCol := b.EffectiveArrayColumn(preferKw)
 		return fmt.Sprintf("(`%s` IS NOT NULL AND array_size(`%s`) > 0)", arrCol, arrCol)
 	}
-	col := t.sqlColumnRef(field, true, nctx)
+	col := t.sqlColumnRef(field, preferKw, nctx)
 	basePred := fmt.Sprintf("%s IS NOT NULL", col)
 	if b.Kind == schema.StorageDynamicVariant && t.Schema != nil && nctx == nil && !strings.ContainsAny(field, "*?") {
 		prefix := field + "."
@@ -6014,7 +6022,7 @@ func (t *Transpiler) resolveDateHistogramMissingMs(esType string, missing any) (
 		if i, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
 			return norm(i), true
 		}
-		if ms, ok := schema.ParseESDateToEpochMillis(v, time.Now().UTC()); ok {
+		if ms, ok := schema.ParseESDateBoundToEpochMillis(v, time.Now().UTC(), false); ok {
 			return norm(ms), true
 		}
 	}
@@ -6039,7 +6047,7 @@ func resolveHistogramMissingFloat(missing any) (float64, bool) {
 		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
 			return f, true
 		}
-		if ms, ok := schema.ParseESDateToEpochMillis(v, time.Now().UTC()); ok {
+		if ms, ok := schema.ParseESDateBoundToEpochMillis(v, time.Now().UTC(), false); ok {
 			return float64(ms), true
 		}
 	}
@@ -7448,14 +7456,21 @@ func (t *Transpiler) nestedRelativeJSONPath(field string, preferKeyword bool, ne
 	effField := field
 	if b.AliasTarget != "" {
 		effField = b.AliasTarget
+		if strings.HasSuffix(field, ".keyword") && !strings.HasSuffix(effField, ".keyword") {
+			effField += ".keyword"
+		}
 	}
 	relKey := strings.TrimSuffix(strings.TrimPrefix(effField, nestedPath+"."), ".keyword")
 	if len(b.RelativeJSONPath) > 0 {
 		relKey = strings.Join(b.RelativeJSONPath, ".")
 	}
-	if preferKeyword && strings.HasSuffix(b.ESFieldPath, ".keyword") && (b.IgnoreAbove > 0 || b.LowercaseNormalizer) && t.Schema != nil {
-		if _, hasBase := t.Schema.Fields[strings.TrimSuffix(b.ESFieldPath, ".keyword")]; hasBase {
-			relKey += "__keyword"
+	if t.Schema != nil && (b.IgnoreAbove > 0 || b.LowercaseNormalizer) {
+		basePath := strings.TrimSuffix(effField, ".keyword")
+		isKw := strings.HasSuffix(effField, ".keyword") || (preferKeyword && b.ESType == "keyword")
+		if isKw {
+			if baseB, hasBase := t.Schema.Fields[basePath]; hasBase && baseB.ESType == "text" {
+				relKey += "__keyword"
+			}
 		}
 	}
 	return "$." + relKey
@@ -7581,12 +7596,25 @@ func parseMinShouldMatch(v any, numClauses int, defaultOne bool) int {
 		}
 	case string:
 		s := strings.TrimSpace(val)
-		if idx := strings.IndexByte(s, '<'); idx > 0 {
-			if thresh, err := strconv.Atoi(strings.TrimSpace(s[:idx])); err == nil {
-				if numClauses <= thresh {
-					return numClauses
+		if strings.Contains(s, "<") {
+			parts := strings.Fields(s)
+			activeSpec := ""
+			first := true
+			for _, part := range parts {
+				if idx := strings.IndexByte(part, '<'); idx > 0 {
+					if thresh, err := strconv.Atoi(strings.TrimSpace(part[:idx])); err == nil {
+						if first && numClauses <= thresh {
+							return numClauses
+						}
+						first = false
+						if numClauses > thresh {
+							activeSpec = strings.TrimSpace(part[idx+1:])
+						}
+					}
 				}
-				s = strings.TrimSpace(s[idx+1:])
+			}
+			if activeSpec != "" {
+				s = activeSpec
 			}
 		}
 		if strings.HasSuffix(s, "%") {

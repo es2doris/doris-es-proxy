@@ -96,10 +96,9 @@ func (b FieldBinding) EffectiveLowercase(preferKeyword bool) bool {
 }
 
 // EffectiveArrayColumn returns the physical array column name for StoragePromotedArray
-// or StorageNestedSubfield, preferring KeywordCompanion when preferKeyword is true (or
-// when KeywordNormalizer is active).
+// or StorageNestedSubfield, preferring KeywordCompanion when preferKeyword is true.
 func (b FieldBinding) EffectiveArrayColumn(preferKeyword bool) string {
-	if b.KeywordCompanion != "" && (preferKeyword || b.KeywordNormalizer) {
+	if b.KeywordCompanion != "" && preferKeyword {
 		return b.KeywordCompanion
 	}
 	if b.Kind == StorageNestedSubfield && b.PrefilterArrayCol != "" {
@@ -947,13 +946,17 @@ func mergeFieldProperty(existing, incoming esast.FieldProperty) esast.FieldPrope
 		}
 		return existing
 	}
-	// Widening rules: long + double -> double; keyword + text -> text (with .keyword); date + string -> keyword/text
+	// Widening rules: long + double -> double; keyword + text -> text (with .keyword); date/numeric/boolean + string -> keyword/text
 	if (existing.Type == "long" && incoming.Type == "double") || (existing.Type == "double" && incoming.Type == "long") {
 		return esast.FieldProperty{Type: "double", MultiValued: mv}
 	}
-	if (existing.Type == "keyword" && incoming.Type == "text") || (existing.Type == "text" && incoming.Type == "keyword") {
-		if mv {
-			return esast.FieldProperty{Type: "keyword", MultiValued: true}
+	isStringType := func(t string) bool {
+		return t == "keyword" || t == "text"
+	}
+	if isStringType(existing.Type) || isStringType(incoming.Type) {
+		hasText := existing.Type == "text" || incoming.Type == "text"
+		if mv || !hasText {
+			return esast.FieldProperty{Type: "keyword", MultiValued: mv}
 		}
 		return esast.FieldProperty{
 			Type: "text",

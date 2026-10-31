@@ -62,7 +62,49 @@ type SearchRequest struct {
 	PIT            *PITSpec           `json:"pit,omitempty"`
 	Fields         []FieldRequestSpec `json:"fields,omitempty"`
 	DocvalueFields []FieldRequestSpec `json:"docvalue_fields,omitempty"`
+	StoredFields   any                `json:"stored_fields,omitempty"`
 	ScriptFields   map[string]any     `json:"script_fields,omitempty"`
+}
+
+// StoredFieldsSlice normalizes a `stored_fields` value (string or []string) into a slice of field names.
+func StoredFieldsSlice(raw any) []string {
+	if raw == nil {
+		return nil
+	}
+	switch v := raw.(type) {
+	case string:
+		var out []string
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				out = append(out, p)
+			}
+		}
+		return out
+	case []string:
+		return v
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, el := range v {
+			if s, ok := el.(string); ok && strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// HasStoredFieldsNone reports whether `stored_fields` is set to `_none_`.
+func (r *SearchRequest) HasStoredFieldsNone() bool {
+	if r == nil {
+		return false
+	}
+	for _, f := range StoredFieldsSlice(r.StoredFields) {
+		if f == "_none_" {
+			return true
+		}
+	}
+	return false
 }
 
 // FieldRequestSpec represents an entry in `fields` or `docvalue_fields` in a search request,
@@ -96,14 +138,23 @@ func (frs *FieldRequestSpec) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// EffectiveFieldSpecs returns the combined `fields` and `docvalue_fields` specifications.
+// EffectiveFieldSpecs returns the combined `fields`, `docvalue_fields`, and `stored_fields` specifications.
 func (r *SearchRequest) EffectiveFieldSpecs() []FieldRequestSpec {
-	if r == nil || (len(r.Fields) == 0 && len(r.DocvalueFields) == 0) {
+	if r == nil {
 		return nil
 	}
-	out := make([]FieldRequestSpec, 0, len(r.Fields)+len(r.DocvalueFields))
+	sfList := StoredFieldsSlice(r.StoredFields)
+	if len(r.Fields) == 0 && len(r.DocvalueFields) == 0 && len(sfList) == 0 {
+		return nil
+	}
+	out := make([]FieldRequestSpec, 0, len(r.Fields)+len(r.DocvalueFields)+len(sfList))
 	out = append(out, r.Fields...)
 	out = append(out, r.DocvalueFields...)
+	for _, sf := range sfList {
+		if sf != "_none_" {
+			out = append(out, FieldRequestSpec{Field: sf})
+		}
+	}
 	return out
 }
 
@@ -937,6 +988,7 @@ type QueryStringQuery struct {
 	Fields             []string `json:"fields,omitempty"`
 	DefaultOperator    string   `json:"default_operator,omitempty"`
 	MinimumShouldMatch any      `json:"minimum_should_match,omitempty"`
+	QuoteFieldSuffix   string   `json:"quote_field_suffix,omitempty"`
 	Flags              string   `json:"flags,omitempty"`
 	Boost              *float64 `json:"boost,omitempty"`
 }

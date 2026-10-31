@@ -2751,6 +2751,16 @@ func (s *Server) handleGetDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	urlSF := extractURLSourceFilter(r)
+	urlStoredFields := esast.StoredFieldsSlice(r.URL.Query().Get("stored_fields"))
+	hasStoredNone := false
+	var sfSpecs []esast.FieldRequestSpec
+	for _, sf := range urlStoredFields {
+		if sf == "_none_" {
+			hasStoredNone = true
+		} else {
+			sfSpecs = append(sfSpecs, esast.FieldRequestSpec{Field: sf})
+		}
+	}
 	resp := map[string]any{
 		"_index":        indexName,
 		"_type":         "_doc",
@@ -2760,10 +2770,30 @@ func (s *Server) handleGetDoc(w http.ResponseWriter, r *http.Request) {
 		"_primary_term": 1,
 		"found":         true,
 	}
-	if urlSF == nil || !urlSF.Disabled {
+	if (urlSF == nil || !urlSF.Disabled) && (!hasStoredNone || urlSF != nil) {
 		resp["_source"] = filterSourceJSON(hit.Source, urlSF)
 	}
+	if len(sfSpecs) > 0 {
+		if fm := extractHitFieldsMap(*hit, indexName, &esast.SearchRequest{Fields: sfSpecs}, idxSchema); len(fm) > 0 {
+			resp["fields"] = fm
+		}
+	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func mergeMGetSourceFilter(base *esast.SourceFilter, incRaw, excRaw any) *esast.SourceFilter {
+	inc := esast.StoredFieldsSlice(incRaw)
+	exc := esast.StoredFieldsSlice(excRaw)
+	if len(inc) == 0 && len(exc) == 0 {
+		return base
+	}
+	var out esast.SourceFilter
+	if base != nil {
+		out = *base
+	}
+	out.Includes = append(append([]string(nil), out.Includes...), inc...)
+	out.Excludes = append(append([]string(nil), out.Excludes...), exc...)
+	return &out
 }
 
 func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
@@ -2775,17 +2805,26 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	urlSF := extractURLSourceFilter(r)
+	urlStoredFields := esast.StoredFieldsSlice(r.URL.Query().Get("stored_fields"))
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
 		return
 	}
+	type mgetDocSpec struct {
+		Index          string              `json:"_index"`
+		ID             string              `json:"_id"`
+		Source         *esast.SourceFilter `json:"_source,omitempty"`
+		SourceIncludes any                 `json:"_source_includes,omitempty"`
+		SourceExcludes any                 `json:"_source_excludes,omitempty"`
+		StoredFields   any                 `json:"stored_fields,omitempty"`
+	}
 	var body struct {
-		IDs  []string `json:"ids"`
-		Docs []struct {
-			Index  string              `json:"_index"`
-			ID     string              `json:"_id"`
-			Source *esast.SourceFilter `json:"_source,omitempty"`
-		} `json:"docs"`
+		IDs            []string            `json:"ids"`
+		Docs           []mgetDocSpec       `json:"docs"`
+		Source         *esast.SourceFilter `json:"_source,omitempty"`
+		SourceIncludes any                 `json:"_source_includes,omitempty"`
+		SourceExcludes any                 `json:"_source_excludes,omitempty"`
+		StoredFields   any                 `json:"stored_fields,omitempty"`
 	}
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
 		if err := json.Unmarshal(bodyBytes, &body); err != nil {
@@ -2793,12 +2832,17 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	defaultSF := body.Source
+	if defaultSF == nil {
+		defaultSF = urlSF
+	}
+	defaultSF = mergeMGetSourceFilter(defaultSF, body.SourceIncludes, body.SourceExcludes)
+	defaultStoredFields := esast.StoredFieldsSlice(body.StoredFields)
+	if len(defaultStoredFields) == 0 {
+		defaultStoredFields = urlStoredFields
+	}
 	for _, id := range body.IDs {
-		body.Docs = append(body.Docs, struct {
-			Index  string              `json:"_index"`
-			ID     string              `json:"_id"`
-			Source *esast.SourceFilter `json:"_source,omitempty"`
-		}{Index: rawDefaultIndex, ID: id})
+		body.Docs = append(body.Docs, mgetDocSpec{Index: rawDefaultIndex, ID: id})
 	}
 
 	idsByIndex := make(map[string][]string)
@@ -2889,10 +2933,30 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 		}
 		effSF := spec.Source
 		if effSF == nil {
-			effSF = urlSF
+			effSF = defaultSF
 		}
-		if effSF == nil || !effSF.Disabled {
+		effSF = mergeMGetSourceFilter(effSF, spec.SourceIncludes, spec.SourceExcludes)
+		effStored := esast.StoredFieldsSlice(spec.StoredFields)
+		if len(effStored) == 0 {
+			effStored = defaultStoredFields
+		}
+		hasStoredNone := false
+		var sfSpecs []esast.FieldRequestSpec
+		for _, sf := range effStored {
+			if sf == "_none_" {
+				hasStoredNone = true
+			} else {
+				sfSpecs = append(sfSpecs, esast.FieldRequestSpec{Field: sf})
+			}
+		}
+		if (effSF == nil || !effSF.Disabled) && (!hasStoredNone || effSF != nil) {
 			docItem["_source"] = filterSourceJSON(hit.Source, effSF)
+		}
+		if len(sfSpecs) > 0 {
+			idxSchema := s.getOrCompileReadOnlySchema(r.Context(), idxName)
+			if fm := extractHitFieldsMap(hit, idxName, &esast.SearchRequest{Fields: sfSpecs}, idxSchema); len(fm) > 0 {
+				docItem["fields"] = fm
+			}
 		}
 		docsOut = append(docsOut, docItem)
 	}
@@ -4671,6 +4735,7 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		targetIdx = extractPITIndex(targetIdx, req.PIT)
 		resp, status, errType, errReason := s.executeSearchRequest(r.Context(), targetIdx, &req)
 		if errType != "" {
 			responses = append(responses, map[string]any{
@@ -4678,6 +4743,9 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 				"error":  map[string]any{"type": errType, "reason": errReason},
 			})
 			continue
+		}
+		if req.PIT != nil && req.PIT.ID != "" {
+			resp["pit_id"] = req.PIT.ID
 		}
 		resp["status"] = http.StatusOK
 		if r.URL.Query().Get("rest_total_hits_as_int") == "true" {
@@ -4801,7 +4869,7 @@ func (s *Server) executeSearchRequest(
 	} else if len(req.KNN) > 0 && req.KNN[0].K > 0 {
 		size = req.KNN[0].K
 	}
-	needsRuntimeScriptEval := queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasRuntimeScript(req.PostFilter) || sortsHaveScript(req.Sort) || aggsHaveRuntimeScript(req.EffectiveAggs()) || (req.Query != nil && req.Query.FunctionScore != nil && req.Query.FunctionScore.MinScore != nil) || (req.Query != nil && req.Query.ScriptScore != nil && req.Query.ScriptScore.MinScore != nil) || (req.MinScore != nil && (queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters)))
+	needsRuntimeScriptEval := queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasRuntimeScript(req.PostFilter) || sortsHaveScript(req.Sort) || aggsHaveRuntimeScript(req.EffectiveAggs()) || (req.Query != nil && req.Query.FunctionScore != nil && req.Query.FunctionScore.MinScore != nil) || (req.Query != nil && req.Query.ScriptScore != nil && req.Query.ScriptScore.MinScore != nil) || (req.MinScore != nil && (queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasNestedScoring(req.Query))) || (queryHasNestedScoring(req.Query) && (req.Collapse != nil || len(req.SearchAfter) > 0))
 
 	var allHits []HitRow
 	var allFetchedHits []HitRow
@@ -4830,6 +4898,7 @@ func (s *Server) executeSearchRequest(
 			subReq.SearchAfter = nil
 			subReq.Collapse = nil
 			subReq.PostFilter = nil
+			subReq.MinScore = nil
 		} else if len(targets) > 1 && size > 0 {
 			zero := 0
 			fetchSize := from + size
@@ -6390,6 +6459,9 @@ func applyURISearchParams(r *http.Request, req *esast.SearchRequest) {
 		}
 		req.Source.Excludes = append(req.Source.Excludes, strings.Split(exc, ",")...)
 	}
+	if sfParam := q.Get("stored_fields"); sfParam != "" && req.StoredFields == nil {
+		req.StoredFields = sfParam
+	}
 }
 
 func buildESResponse(indexName string, idxSchema *schema.IndexSchema, req *esast.SearchRequest, hits []HitRow, aggRows []AggRow, tookMs int64, docLookup func(string) *HitRow) map[string]any {
@@ -6427,7 +6499,7 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 			"_id":    h.ID,
 			"_score": h.Score,
 		}
-		if req.Source == nil || !req.Source.Disabled {
+		if (req.Source == nil || !req.Source.Disabled) && (!req.HasStoredFieldsNone() || req.Source != nil) {
 			hitMap["_source"] = filterSourceJSON(h.Source, req.Source)
 		}
 		if req.Highlight != nil && len(req.Highlight.Fields) > 0 {
@@ -6438,7 +6510,7 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 		if effSorts := transpiler.EffectiveSortsForRequest(req); len(effSorts) > 0 {
 			hitMap["sort"] = extractHitSortValues(h, effSorts, hitSchema)
 		}
-		if len(req.Fields) > 0 || len(req.DocvalueFields) > 0 {
+		if len(req.EffectiveFieldSpecs()) > 0 {
 			if fm := extractHitFieldsMap(h, hitIdx, req, hitSchema); len(fm) > 0 {
 				hitMap["fields"] = fm
 			}
@@ -7452,6 +7524,7 @@ func (s *Server) populateCollapseInnerHits(
 		subReq.Size = &fetchLimit
 		subReqPtr := applyIndexAliasFilter(&subReq, aliasFilters[indexName])
 		needsScript := queryHasRuntimeScript(subReqPtr.Query) ||
+			queryHasNestedScoring(subReqPtr.Query) ||
 			queryHasRuntimeScript(subReqPtr.PostFilter) ||
 			(subReqPtr.AliasFilter != nil && queryHasRuntimeScript((*esast.Query)(subReqPtr.AliasFilter))) ||
 			(subReqPtr.Query != nil && subReqPtr.Query.FunctionScore != nil && subReqPtr.Query.FunctionScore.MinScore != nil) ||
@@ -8267,7 +8340,11 @@ func buildCompositeAggObject(
 				partVal := any(parts[i])
 				if sm.entry.DateHistogram != nil {
 					if iv, err := strconv.ParseInt(parts[i], 10, 64); err == nil {
-						partVal = iv
+						if strings.TrimSpace(sm.entry.DateHistogram.Format) != "" {
+							partVal = formatDateHistogramKeyAsString(iv, sm.entry.DateHistogram)
+						} else {
+							partVal = iv
+						}
 					}
 				} else if sm.entry.Histogram != nil {
 					if iv, err := strconv.ParseInt(parts[i], 10, 64); err == nil {
@@ -8399,6 +8476,19 @@ func compareCompositeSourceVal(a, b any, entry esast.AggSpec) int {
 			return 1
 		}
 		return -1
+	}
+	if entry.DateHistogram != nil {
+		rngSpec := &esast.RangeAggSpec{
+			Format:   entry.DateHistogram.Format,
+			TimeZone: entry.DateHistogram.TimeZone,
+		}
+		nowUTC := time.Now().UTC()
+		if msA, okA := parseRuntimeDateRangeBoundMillis(a, rngSpec, nowUTC); okA {
+			if msB, okB := parseRuntimeDateRangeBoundMillis(b, rngSpec, nowUTC); okB {
+				a = msA
+				b = msB
+			}
+		}
 	}
 	if bv, isBool := b.(bool); isBool {
 		if bv {
@@ -10142,7 +10232,19 @@ func evaluateSiblingPipelineAggs(aggs map[string]esast.AggSpec, aggsOut map[stri
 			stdPop := math.Sqrt(variancePop)
 			stdSampling := math.Sqrt(varianceSampling)
 			sigma := pSpec.EffectiveSigma()
-			aggsOut[aggName] = map[string]any{
+			upperPop := avgVal + sigma*stdPop
+			lowerPop := avgVal - sigma*stdPop
+			upperSamp := avgVal + sigma*stdSampling
+			lowerSamp := avgVal - sigma*stdSampling
+			boundsObj := map[string]any{
+				"upper":            upperPop,
+				"lower":            lowerPop,
+				"upper_population": upperPop,
+				"lower_population": lowerPop,
+				"upper_sampling":   upperSamp,
+				"lower_sampling":   lowerSamp,
+			}
+			extObj := map[string]any{
 				"count":                    int64(cnt),
 				"min":                      minVal,
 				"max":                      maxVal,
@@ -10155,15 +10257,28 @@ func evaluateSiblingPipelineAggs(aggs map[string]esast.AggSpec, aggsOut map[stri
 				"std_deviation":            stdPop,
 				"std_deviation_population": stdPop,
 				"std_deviation_sampling":   stdSampling,
-				"std_deviation_bounds": map[string]any{
-					"upper":            avgVal + sigma*stdPop,
-					"lower":            avgVal - sigma*stdPop,
-					"upper_population": avgVal + sigma*stdPop,
-					"lower_population": avgVal - sigma*stdPop,
-					"upper_sampling":   avgVal + sigma*stdSampling,
-					"lower_sampling":   avgVal - sigma*stdSampling,
-				},
+				"std_deviation_bounds":     boundsObj,
 			}
+			if pSpec.Format != "" {
+				extObj["min_as_string"] = formatPipelineMetricValue(minVal, pSpec.Format)
+				extObj["max_as_string"] = formatPipelineMetricValue(maxVal, pSpec.Format)
+				extObj["avg_as_string"] = formatPipelineMetricValue(avgVal, pSpec.Format)
+				extObj["sum_as_string"] = formatPipelineMetricValue(sumVal, pSpec.Format)
+				extObj["sum_of_squares_as_string"] = formatPipelineMetricValue(sumSqVal, pSpec.Format)
+				extObj["variance_as_string"] = formatPipelineMetricValue(variancePop, pSpec.Format)
+				extObj["variance_population_as_string"] = formatPipelineMetricValue(variancePop, pSpec.Format)
+				extObj["variance_sampling_as_string"] = formatPipelineMetricValue(varianceSampling, pSpec.Format)
+				extObj["std_deviation_as_string"] = formatPipelineMetricValue(stdPop, pSpec.Format)
+				extObj["std_deviation_population_as_string"] = formatPipelineMetricValue(stdPop, pSpec.Format)
+				extObj["std_deviation_sampling_as_string"] = formatPipelineMetricValue(stdSampling, pSpec.Format)
+				boundsObj["upper_as_string"] = formatPipelineMetricValue(upperPop, pSpec.Format)
+				boundsObj["lower_as_string"] = formatPipelineMetricValue(lowerPop, pSpec.Format)
+				boundsObj["upper_population_as_string"] = formatPipelineMetricValue(upperPop, pSpec.Format)
+				boundsObj["lower_population_as_string"] = formatPipelineMetricValue(lowerPop, pSpec.Format)
+				boundsObj["upper_sampling_as_string"] = formatPipelineMetricValue(upperSamp, pSpec.Format)
+				boundsObj["lower_sampling_as_string"] = formatPipelineMetricValue(lowerSamp, pSpec.Format)
+			}
+			aggsOut[aggName] = extObj
 		case "percentiles":
 			sortedVals := append([]float64(nil), vals...)
 			sort.Float64s(sortedVals)
@@ -10190,22 +10305,39 @@ func evaluateSiblingPipelineAggs(aggs map[string]esast.AggSpec, aggsOut map[stri
 			if spec.PercentilesBucket.Keyed != nil && !*spec.PercentilesBucket.Keyed {
 				arr := make([]map[string]any, 0, len(percents))
 				for _, p := range percents {
-					arr = append(arr, map[string]any{
+					pctVal := computePct(p)
+					item := map[string]any{
 						"key":   p,
-						"value": computePct(p),
-					})
+						"value": pctVal,
+					}
+					if spec.PercentilesBucket.Format != "" {
+						item["value_as_string"] = formatPipelineMetricValue(pctVal, spec.PercentilesBucket.Format)
+					}
+					arr = append(arr, item)
 				}
 				aggsOut[aggName] = map[string]any{"values": arr}
 			} else {
 				vMap := make(map[string]float64, len(percents))
+				var vStrMap map[string]string
+				if spec.PercentilesBucket.Format != "" {
+					vStrMap = make(map[string]string, len(percents))
+				}
 				for _, p := range percents {
 					kStr := strconv.FormatFloat(p, 'f', -1, 64)
 					if !strings.Contains(kStr, ".") {
 						kStr += ".0"
 					}
-					vMap[kStr] = computePct(p)
+					pctVal := computePct(p)
+					vMap[kStr] = pctVal
+					if vStrMap != nil {
+						vStrMap[kStr] = formatPipelineMetricValue(pctVal, spec.PercentilesBucket.Format)
+					}
 				}
-				aggsOut[aggName] = map[string]any{"values": vMap}
+				pctObj := map[string]any{"values": vMap}
+				if vStrMap != nil {
+					pctObj["values_as_string"] = vStrMap
+				}
+				aggsOut[aggName] = pctObj
 			}
 		}
 	}
@@ -12578,7 +12710,12 @@ func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.In
 			if srcStr != "" {
 				evalDoc := prepareDocForRuntimeScript(idxSchema, doc)
 				if _, isMissing := scriptHasMissingDocValueRef(evalDoc, srcStr); !isMissing {
-					if v, err := painless.Eval(evalDoc, srcStr, params); err == nil && v != nil {
+					cp := make(map[string]any, len(params)+1)
+					for k, v := range params {
+						cp[k] = v
+					}
+					cp["_score"] = h.Score
+					if v, err := painless.Eval(evalDoc, srcStr, cp); err == nil && v != nil {
 						if !strings.EqualFold(s.Entry.Type, "string") {
 							if fv, ok := toFloat64(v); ok {
 								val = fv
@@ -14262,6 +14399,9 @@ func (s *Server) resolveWriteIndexWithFilter(nameOrAlias string) (string, *esast
 		if targets, ok := s.aliases[nameOrAlias]; ok && len(targets) > 0 {
 			metaByIdx := s.aliasMeta[nameOrAlias]
 			if len(targets) == 1 {
+				if metaByIdx != nil && metaByIdx[targets[0]].IsWriteIndex != nil && !*metaByIdx[targets[0]].IsWriteIndex {
+					return "", nil, true, fmt.Errorf("no write index is defined for alias [%s]. The write index may be explicitly disabled using is_write_index=false or the alias points to multiple indices without one being designated as a write index", nameOrAlias)
+				}
 				var f *esast.Query
 				if metaByIdx != nil && metaByIdx[targets[0]].Filter != nil {
 					cp := *metaByIdx[targets[0]].Filter
@@ -14901,7 +15041,7 @@ func queryHasRuntimeScript(q *esast.Query) bool {
 		return true
 	}
 	if q.FunctionScore != nil {
-		if q.FunctionScore.ScriptScore != nil {
+		if q.FunctionScore.ScriptScore != nil || q.FunctionScore.MinScore != nil {
 			return true
 		}
 		for _, fn := range q.FunctionScore.Functions {
@@ -14938,7 +15078,7 @@ func queryHasRuntimeScript(q *esast.Query) bool {
 	if q.ConstantScore != nil && queryHasRuntimeScript(&q.ConstantScore.Filter) {
 		return true
 	}
-	if q.Nested != nil && queryHasRuntimeScript(&q.Nested.Query) {
+	if q.Nested != nil && (queryHasRuntimeScript(&q.Nested.Query) || queryContainsNested(&q.Nested.Query)) {
 		return true
 	}
 	if q.DisMax != nil {
@@ -15311,14 +15451,16 @@ func promoteMappingPropsToNested(props map[string]esast.FieldProperty, segs []st
 	return cp
 }
 
-func docMatchesNonScriptClause(idxSchema *schema.IndexSchema, doc map[string]any, q *esast.Query) bool {
+func queryContainsNested(q *esast.Query) bool {
 	if q == nil {
-		return true
-	}
-	rawSource, err := json.Marshal(doc)
-	if err != nil {
 		return false
 	}
+	out := make(map[string]bool)
+	collectNestedPathsFromQuery(q, out)
+	return len(out) > 0
+}
+
+func resolveRuntimeEvalSchema(idxSchema *schema.IndexSchema, doc map[string]any, q *esast.Query, rawSource []byte) *schema.IndexSchema {
 	effSchema := idxSchema
 	nestedPaths := make(map[string]bool)
 	if effSchema != nil {
@@ -15359,6 +15501,18 @@ func docMatchesNonScriptClause(idxSchema *schema.IndexSchema, doc map[string]any
 		}
 		effSchema = schema.CompileIndexSchema(dbName, idxName, merged)
 	}
+	return effSchema
+}
+
+func docMatchesNonScriptClause(idxSchema *schema.IndexSchema, doc map[string]any, q *esast.Query) bool {
+	if q == nil {
+		return true
+	}
+	rawSource, err := json.Marshal(doc)
+	if err != nil {
+		return false
+	}
+	effSchema := resolveRuntimeEvalSchema(idxSchema, doc, q, rawSource)
 	shreddedBytes, err := schema.ShredDocument(effSchema, "_eval", 1, false, rawSource)
 	if err != nil {
 		return false
@@ -15428,18 +15582,43 @@ func resolveMinimumShouldMatch(msm any, totalShould int, noMustOrFilter bool) in
 		}
 	case string:
 		s := strings.TrimSpace(v)
+		if strings.Contains(s, "<") {
+			parts := strings.Fields(s)
+			activeSpec := ""
+			first := true
+			for _, part := range parts {
+				if idx := strings.IndexByte(part, '<'); idx > 0 {
+					if thresh, err := strconv.Atoi(strings.TrimSpace(part[:idx])); err == nil {
+						if first && totalShould <= thresh {
+							return totalShould
+						}
+						first = false
+						if totalShould > thresh {
+							activeSpec = strings.TrimSpace(part[idx+1:])
+						}
+					}
+				}
+			}
+			if activeSpec != "" {
+				s = activeSpec
+			}
+		}
 		if strings.HasSuffix(s, "%") {
 			if pct, err := strconv.ParseFloat(strings.TrimSuffix(s, "%"), 64); err == nil {
 				if pct < 0 {
 					req := totalShould - int(math.Floor(float64(totalShould)*math.Abs(pct)/100.0))
-					return max(0, req)
+					return max(1, req)
 				}
-				return int(math.Floor(float64(totalShould) * pct / 100.0))
+				req := int(math.Floor(float64(totalShould) * pct / 100.0))
+				if req < 1 && pct > 0 {
+					req = 1
+				}
+				return req
 			}
 		}
 		if iv, err := strconv.Atoi(s); err == nil {
 			if iv < 0 {
-				return max(0, totalShould+iv)
+				return max(1, totalShould+iv)
 			}
 			return iv
 		}
@@ -15505,7 +15684,7 @@ func evalQueryScriptFilterOnDocWithSchema(idxSchema *schema.IndexSchema, doc map
 	if q.ConstantScore != nil && !evalQueryScriptFilterOnDocWithSchema(idxSchema, doc, &q.ConstantScore.Filter) {
 		return false
 	}
-	if q.Nested != nil && queryHasRuntimeScript(&q.Nested.Query) {
+	if q.Nested != nil && (queryHasRuntimeScript(&q.Nested.Query) || queryContainsNested(&q.Nested.Query)) {
 		pathSegs := strings.Split(q.Nested.Path, ".")
 		cands := extractNestedElementsAtPath(doc, pathSegs)
 		nestedSchema := deriveNestedEvalSchema(idxSchema, q.Nested.Path)
@@ -15741,14 +15920,11 @@ func scoreNonScriptClauseOnDoc(idxSchema *schema.IndexSchema, doc map[string]any
 	if queryHasNestedScoring(q) {
 		return evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q, 1.0)
 	}
-	evalSchema := idxSchema
-	if evalSchema == nil {
-		evalSchema = schema.CompileIndexSchema("es_compat", "default", nil)
-	}
 	rawBytes, err := json.Marshal(doc)
 	if err != nil {
 		return 1.0
 	}
+	evalSchema := resolveRuntimeEvalSchema(idxSchema, doc, q, rawBytes)
 	shredBytes, err := schema.ShredDocument(evalSchema, "0", 1, false, rawBytes)
 	if err != nil {
 		return 1.0
@@ -15777,12 +15953,18 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 		return baseScore
 	}
 	if q.ConstantScore != nil {
+		if !evalBranchMatchesDoc(idxSchema, doc, &q.ConstantScore.Filter) {
+			return 0.0
+		}
 		if q.ConstantScore.Boost != nil {
 			return *q.ConstantScore.Boost
 		}
 		return 1.0
 	}
 	if q.Script != nil {
+		if !evalQueryScriptFilterOnDocWithSchema(idxSchema, doc, q) {
+			return 0.0
+		}
 		if q.Script.Boost != nil {
 			return *q.Script.Boost
 		}
@@ -15790,9 +15972,12 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 	}
 	if q.ScriptScore != nil && q.ScriptScore.Script != nil {
 		if q.ScriptScore.Query != nil {
-			if queryHasRuntimeScript(q.ScriptScore.Query) {
-				baseScore = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q.ScriptScore.Query, baseScore)
-			} else if baseScore == 1.0 {
+			if !evalBranchMatchesDoc(idxSchema, doc, q.ScriptScore.Query) {
+				return 0.0
+			}
+			if queryHasRuntimeScript(q.ScriptScore.Query) || queryHasNestedScoring(q.ScriptScore.Query) || q.ScriptScore.Query.FunctionScore != nil {
+				baseScore = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q.ScriptScore.Query, 1.0)
+			} else {
 				baseScore = scoreNonScriptClauseOnDoc(idxSchema, doc, q.ScriptScore.Query)
 			}
 		}
@@ -15817,9 +16002,12 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 	}
 	if q.FunctionScore != nil {
 		if q.FunctionScore.Query != nil {
-			if queryHasRuntimeScript(q.FunctionScore.Query) {
-				baseScore = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q.FunctionScore.Query, baseScore)
-			} else if baseScore == 1.0 {
+			if !evalBranchMatchesDoc(idxSchema, doc, q.FunctionScore.Query) {
+				return 0.0
+			}
+			if queryHasRuntimeScript(q.FunctionScore.Query) || queryHasNestedScoring(q.FunctionScore.Query) || q.FunctionScore.Query.FunctionScore != nil {
+				baseScore = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q.FunctionScore.Query, 1.0)
+			} else {
 				baseScore = scoreNonScriptClauseOnDoc(idxSchema, doc, q.FunctionScore.Query)
 			}
 		}
@@ -15902,6 +16090,9 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 			}
 			return res
 		}
+		if q.FunctionScore.Boost != nil {
+			return baseScore * *q.FunctionScore.Boost
+		}
 		return baseScore
 	}
 	if q.DisMax != nil {
@@ -15910,7 +16101,7 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 			sub := &q.DisMax.Queries[i]
 			if evalBranchMatchesDoc(idxSchema, doc, sub) {
 				var sc float64
-				if queryHasRuntimeScript(sub) {
+				if queryHasRuntimeScript(sub) || queryHasNestedScoring(sub) || sub.FunctionScore != nil {
 					sc = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, sub, 1.0)
 				} else {
 					sc = scoreNonScriptClauseOnDoc(idxSchema, doc, sub)
@@ -15931,22 +16122,30 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 			}
 			return res
 		}
+		return 0.0
 	}
 	if q.Boosting != nil {
+		if !evalBranchMatchesDoc(idxSchema, doc, &q.Boosting.Positive) {
+			return 0.0
+		}
 		var posScore float64
-		if queryHasRuntimeScript(&q.Boosting.Positive) {
-			posScore = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, &q.Boosting.Positive, baseScore)
+		if queryHasRuntimeScript(&q.Boosting.Positive) || queryHasNestedScoring(&q.Boosting.Positive) || q.Boosting.Positive.FunctionScore != nil {
+			posScore = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, &q.Boosting.Positive, 1.0)
 		} else {
 			posScore = scoreNonScriptClauseOnDoc(idxSchema, doc, &q.Boosting.Positive)
 		}
+		res := posScore
 		if evalBranchMatchesDoc(idxSchema, doc, &q.Boosting.Negative) {
 			negBoost := q.Boosting.NegativeBoost
 			if negBoost <= 0 {
 				negBoost = 0.5
 			}
-			return posScore * negBoost
+			res *= negBoost
 		}
-		return posScore
+		if q.Boosting.Boost != nil {
+			res *= *q.Boosting.Boost
+		}
+		return res
 	}
 	if q.Nested != nil {
 		if strings.EqualFold(strings.TrimSpace(q.Nested.ScoreMode), "none") {
@@ -15960,7 +16159,7 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 			elemDoc := buildSingleNestedElementDoc(pathSegs, cand.obj)
 			if evalBranchMatchesDoc(nestedSchema, elemDoc, &q.Nested.Query) {
 				var sc float64
-				if queryHasRuntimeScript(&q.Nested.Query) {
+				if queryHasRuntimeScript(&q.Nested.Query) || queryHasNestedScoring(&q.Nested.Query) || q.Nested.Query.FunctionScore != nil {
 					sc = evalQueryScriptScoreOnDocWithSchema(nestedSchema, elemDoc, &q.Nested.Query, 1.0)
 				} else {
 					sc = scoreNonScriptClauseOnDoc(nestedSchema, elemDoc, &q.Nested.Query)
@@ -16005,10 +16204,13 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 		return 0.0
 	}
 	if q.Bool != nil {
+		if !evalBranchMatchesDoc(idxSchema, doc, q) {
+			return 0.0
+		}
 		var total float64
 		hasScored := false
 		for i := range q.Bool.Must {
-			if queryHasRuntimeScript(&q.Bool.Must[i]) || q.Bool.Must[i].FunctionScore != nil {
+			if queryHasRuntimeScript(&q.Bool.Must[i]) || queryHasNestedScoring(&q.Bool.Must[i]) || q.Bool.Must[i].FunctionScore != nil {
 				total += evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, &q.Bool.Must[i], 1.0)
 				hasScored = true
 			} else {
@@ -16018,7 +16220,7 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 		}
 		for i := range q.Bool.Should {
 			if evalBranchMatchesDoc(idxSchema, doc, &q.Bool.Should[i]) {
-				if queryHasRuntimeScript(&q.Bool.Should[i]) || q.Bool.Should[i].FunctionScore != nil {
+				if queryHasRuntimeScript(&q.Bool.Should[i]) || queryHasNestedScoring(&q.Bool.Should[i]) || q.Bool.Should[i].FunctionScore != nil {
 					total += evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, &q.Bool.Should[i], 1.0)
 				} else {
 					total += scoreNonScriptClauseOnDoc(idxSchema, doc, &q.Bool.Should[i])
@@ -16032,6 +16234,10 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 			}
 			return total
 		}
+		if q.Bool.Boost != nil {
+			return *q.Bool.Boost
+		}
+		return 1.0
 	}
 	return baseScore
 }
@@ -17969,6 +18175,7 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 		return hits, aggRows, idxTotal, hits
 	}
 	hasQueryScript := queryHasRuntimeScript(req.Query)
+	hasNestedScoring := queryHasNestedScoring(req.Query)
 	var aliasFilterQ *esast.Query
 	if req.AliasFilter != nil {
 		q := esast.Query(*req.AliasFilter)
@@ -17997,7 +18204,7 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 		if hasQueryScript && !evalQueryScriptFilterOnDocWithSchema(idxSchema, doc, req.Query) {
 			continue
 		}
-		if hasQueryScript {
+		if hasQueryScript || hasNestedScoring {
 			h.Score = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, req.Query, h.Score)
 		}
 		if req.MinScore != nil && h.Score < *req.MinScore {
@@ -18078,7 +18285,7 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 
 	effSorts := transpiler.EffectiveSortsForRequest(req)
 	outHits := postFilteredHits
-	if len(outHits) > 1 && (sortsHaveScript(effSorts) || hasQueryScript) {
+	if len(outHits) > 1 && (sortsHaveScript(effSorts) || hasQueryScript || hasNestedScoring) {
 		sort.SliceStable(outHits, func(i, j int) bool {
 			if len(effSorts) > 0 {
 				if cmp := compareHitRowsBySort(outHits[i], outHits[j], effSorts, idxSchema); cmp != 0 {
@@ -18255,9 +18462,6 @@ func (s *Server) evalHitRescoreQuery(h HitRow, rq *esast.Query, hSchema *schema.
 	if rq == nil {
 		return 0, false
 	}
-	if hSchema == nil {
-		hSchema = schema.CompileIndexSchema("es_compat", "default", nil)
-	}
 	var doc map[string]any
 	src := h.EffectiveSource()
 	if len(src) > 0 {
@@ -18268,6 +18472,7 @@ func (s *Server) evalHitRescoreQuery(h HitRow, rq *esast.Query, hSchema *schema.
 	if doc == nil {
 		doc = make(map[string]any)
 	}
+	hSchema = resolveRuntimeEvalSchema(hSchema, doc, rq, src)
 	shredBytes, err := schema.ShredDocument(hSchema, h.ID, 1, false, src)
 	if err != nil {
 		return 0, false
@@ -18294,7 +18499,7 @@ func (s *Server) evalHitRescoreQuery(h HitRow, rq *esast.Query, hSchema *schema.
 			rScore = 1.0
 		}
 	}
-	if queryHasRuntimeScript(rq) {
+	if queryHasRuntimeScript(rq) || queryHasNestedScoring(rq) || (rq.FunctionScore != nil && rq.FunctionScore.Query == nil) {
 		baseScore := rScore
 		if rq.ScriptScore != nil && rq.ScriptScore.Query == nil {
 			baseScore = h.Score
@@ -18345,7 +18550,12 @@ func evalHitScriptFields(h HitRow, scriptFields map[string]any, idxSchema *schem
 		if srcStr == "" {
 			continue
 		}
-		val, err := painless.Eval(evalDoc, srcStr, params)
+		cp := make(map[string]any, len(params)+1)
+		for k, v := range params {
+			cp[k] = v
+		}
+		cp["_score"] = h.Score
+		val, err := painless.Eval(evalDoc, srcStr, cp)
 		if err != nil || val == nil {
 			continue
 		}

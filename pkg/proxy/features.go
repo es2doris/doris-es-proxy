@@ -21,6 +21,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	// #nosec G505 -- Community ID v1 network flow hashing specification requires SHA-1
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/subtle"
@@ -29,6 +31,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"math"
 	"net"
@@ -2375,10 +2378,19 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "gsub":
 		field, _ := specMap["field"].(string)
+		if strings.Contains(field, "{{") {
+			field = fmt.Sprintf("%v", expandIngestTemplate(field, doc))
+		}
 		pat, _ := specMap["pattern"].(string)
 		repl, _ := specMap["replacement"].(string)
+		if strings.Contains(repl, "{{") {
+			repl = fmt.Sprintf("%v", expandIngestTemplate(repl, doc))
+		}
 		target := field
 		if tf, _ := specMap["target_field"].(string); tf != "" {
+			if strings.Contains(tf, "{{") {
+				tf = fmt.Sprintf("%v", expandIngestTemplate(tf, doc))
+			}
 			target = tf
 		}
 		if field != "" && pat != "" {
@@ -2624,6 +2636,42 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				}
 			}
 		}
+	case "urlencode":
+		field, _ := specMap["field"].(string)
+		if strings.Contains(field, "{{") {
+			field = fmt.Sprintf("%v", expandIngestTemplate(field, doc))
+		}
+		target := field
+		if tf, _ := specMap["target_field"].(string); tf != "" {
+			if strings.Contains(tf, "{{") {
+				tf = fmt.Sprintf("%v", expandIngestTemplate(tf, doc))
+			}
+			target = tf
+		}
+		if field != "" {
+			if val, exists := getIngestPath(doc, field); exists && val != nil {
+				switch v := val.(type) {
+				case string:
+					setIngestPath(doc, target, url.QueryEscape(v))
+					mutated = true
+				case []any:
+					outArr := make([]any, len(v))
+					for idx, el := range v {
+						if sEl, ok := el.(string); ok {
+							outArr[idx] = url.QueryEscape(sEl)
+						} else {
+							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
+						}
+					}
+					setIngestPath(doc, target, outArr)
+					mutated = true
+				default:
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
+				}
+			} else if isExplicitIgnoreMissingFalse(specMap) {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+			}
+		}
 	case "urldecode":
 		field, _ := specMap["field"].(string)
 		target := field
@@ -2703,13 +2751,13 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
 				switch v := val.(type) {
 				case string:
-					setIngestPath(doc, target, reHTMLTags.ReplaceAllString(v, ""))
+					setIngestPath(doc, target, html.UnescapeString(reHTMLTags.ReplaceAllString(v, "")))
 					mutated = true
 				case []any:
 					outArr := make([]any, len(v))
 					for idx, el := range v {
 						if sEl, ok := el.(string); ok {
-							outArr[idx] = reHTMLTags.ReplaceAllString(sEl, "")
+							outArr[idx] = html.UnescapeString(reHTMLTags.ReplaceAllString(sEl, ""))
 						} else {
 							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
 						}
@@ -3345,6 +3393,38 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
+		}
+	case "network_direction":
+		m, err := executeNetworkDirectionProcessor(doc, specMap)
+		if err != nil {
+			return false, false, procType, procTag, specMap, err
+		}
+		if m {
+			mutated = true
+		}
+	case "community_id":
+		m, err := executeCommunityIDProcessor(doc, specMap)
+		if err != nil {
+			return false, false, procType, procTag, specMap, err
+		}
+		if m {
+			mutated = true
+		}
+	case "geoip":
+		m, err := executeGeoIPProcessor(doc, specMap)
+		if err != nil {
+			return false, false, procType, procTag, specMap, err
+		}
+		if m {
+			mutated = true
+		}
+	case "enrich":
+		m, err := executeEnrichProcessor(s, doc, specMap)
+		if err != nil {
+			return false, false, procType, procTag, specMap, err
+		}
+		if m {
+			mutated = true
 		}
 	case "foreach":
 		field, _ := specMap["field"].(string)
@@ -4341,6 +4421,9 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	aliasFilters = s.resolveTermsLookupsInAliasFilters(r.Context(), aliasFilters)
 
 	var totalMatched, totalCreated, totalUpdated, totalDeleted, versionConflicts, batches int
+	failures := make([]any, 0)
+	proceedOnConflict := strings.EqualFold(strings.TrimSpace(body.Conflicts), "proceed") ||
+		strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("conflicts")), "proceed")
 	updSpec := &painless.UpdateRequest{Script: body.Script}
 	hasReindexMetaScript := false
 	if body.Script != nil {
@@ -4536,6 +4619,20 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				}
 				docSource = pipedDoc
 				if docDestAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), docDestIdx, docID, docSource, docDestAliasFilter) {
+					if proceedOnConflict {
+						versionConflicts++
+						failures = append(failures, map[string]any{
+							"index":  docDestIdx,
+							"type":   "_doc",
+							"id":     docID,
+							"status": http.StatusBadRequest,
+							"cause": map[string]any{
+								"type":   "illegal_argument_exception",
+								"reason": "document does not match destination alias filter",
+							},
+						})
+						continue
+					}
 					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "document does not match destination alias filter")
 					return
 				}
@@ -4570,7 +4667,6 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			isCreate := strings.EqualFold(strings.TrimSpace(body.Dest.OpType), "create")
-			proceedOnConflict := strings.EqualFold(strings.TrimSpace(body.Conflicts), "proceed")
 
 			batchBufByTable := make(map[string]*bytes.Buffer, len(schemasByIdx))
 			var tableOrder []string
@@ -4691,7 +4787,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		"throttled_millis":       0,
 		"requests_per_second":    -1.0,
 		"throttled_until_millis": 0,
-		"failures":               []any{},
+		"failures":               failures,
 	})
 }
 
@@ -5500,7 +5596,7 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		if queryHasRuntimeScript(effQuery) {
+		if queryHasRuntimeScript(effQuery) || queryHasNestedScoring(effQuery) {
 			var docMap map[string]any
 			dec := json.NewDecoder(bytes.NewReader(hit.Source))
 			dec.UseNumber()
@@ -5537,4 +5633,432 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 			"details":     []any{},
 		},
 	})
+}
+
+func isIPInNetworkDirectionNets(ip net.IP, nets []string) bool {
+	if len(nets) == 0 {
+		nets = []string{"private"}
+	}
+	for _, entry := range nets {
+		entry = strings.ToLower(strings.TrimSpace(entry))
+		switch entry {
+		case "private":
+			if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+				return true
+			}
+		case "loopback":
+			if ip.IsLoopback() {
+				return true
+			}
+		case "link_local":
+			if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+				return true
+			}
+		case "multicast":
+			if ip.IsMulticast() {
+				return true
+			}
+		default:
+			if _, cidr, err := net.ParseCIDR(entry); err == nil && cidr != nil {
+				if cidr.Contains(ip) {
+					return true
+				}
+			} else if parsed := net.ParseIP(entry); parsed != nil && parsed.Equal(ip) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func executeNetworkDirectionProcessor(doc map[string]any, specMap map[string]any) (bool, error) {
+	srcField := "source.ip"
+	if sf, _ := specMap["source_ip"].(string); sf != "" {
+		srcField = sf
+	}
+	dstField := "destination.ip"
+	if df, _ := specMap["destination_ip"].(string); df != "" {
+		dstField = df
+	}
+	target := "network.direction"
+	if tf, _ := specMap["target_field"].(string); tf != "" {
+		target = tf
+	}
+	var nets []string
+	if netsField, _ := specMap["internal_networks_field"].(string); netsField != "" {
+		if nfVal, ok := getIngestPath(doc, netsField); ok && nfVal != nil {
+			switch tv := nfVal.(type) {
+			case []any:
+				for _, el := range tv {
+					nets = append(nets, fmt.Sprintf("%v", el))
+				}
+			case string:
+				nets = append(nets, tv)
+			}
+		}
+	}
+	if len(nets) == 0 {
+		if netsArr, ok := specMap["internal_networks"].([]any); ok {
+			for _, el := range netsArr {
+				nets = append(nets, fmt.Sprintf("%v", el))
+			}
+		}
+	}
+	srcVal, hasSrc := getIngestPath(doc, srcField)
+	dstVal, hasDst := getIngestPath(doc, dstField)
+	if !hasSrc || srcVal == nil || !hasDst || dstVal == nil {
+		if isExplicitIgnoreMissingFalse(specMap) {
+			if !hasSrc || srcVal == nil {
+				return false, fmt.Errorf("field [%s] is missing", srcField)
+			}
+			return false, fmt.Errorf("field [%s] is missing", dstField)
+		}
+		return false, nil
+	}
+	srcIP := net.ParseIP(strings.TrimSpace(fmt.Sprintf("%v", srcVal)))
+	dstIP := net.ParseIP(strings.TrimSpace(fmt.Sprintf("%v", dstVal)))
+	if srcIP == nil || dstIP == nil {
+		return false, fmt.Errorf("invalid IP address in network_direction")
+	}
+	srcInt := isIPInNetworkDirectionNets(srcIP, nets)
+	dstInt := isIPInNetworkDirectionNets(dstIP, nets)
+	var dir string
+	switch {
+	case srcInt && dstInt:
+		dir = "internal"
+	case srcInt && !dstInt:
+		dir = "outbound"
+	case !srcInt && dstInt:
+		dir = "inbound"
+	default:
+		dir = "external"
+	}
+	setIngestPath(doc, target, dir)
+	return true, nil
+}
+
+func executeCommunityIDProcessor(doc map[string]any, specMap map[string]any) (bool, error) {
+	srcIPField := "source.ip"
+	if v, _ := specMap["source_ip"].(string); v != "" {
+		srcIPField = v
+	}
+	dstIPField := "destination.ip"
+	if v, _ := specMap["destination_ip"].(string); v != "" {
+		dstIPField = v
+	}
+	srcPortField := "source.port"
+	if v, _ := specMap["source_port"].(string); v != "" {
+		srcPortField = v
+	}
+	dstPortField := "destination.port"
+	if v, _ := specMap["destination_port"].(string); v != "" {
+		dstPortField = v
+	}
+	transportField := "network.transport"
+	if v, _ := specMap["transport"].(string); v != "" {
+		transportField = v
+	}
+	ianaField := "network.iana_number"
+	if v, _ := specMap["iana_number"].(string); v != "" {
+		ianaField = v
+	}
+	icmpTypeField := "icmp.type"
+	if v, _ := specMap["icmp_type"].(string); v != "" {
+		icmpTypeField = v
+	}
+	icmpCodeField := "icmp.code"
+	if v, _ := specMap["icmp_code"].(string); v != "" {
+		icmpCodeField = v
+	}
+	target := "network.community_id"
+	if tf, _ := specMap["target_field"].(string); tf != "" {
+		target = tf
+	}
+	var seed uint16
+	if sVal, ok := toInt64(specMap["seed"]); ok && sVal >= 0 && sVal <= 65535 {
+		seed = uint16(sVal)
+	}
+	srcIPVal, hasSrc := getIngestPath(doc, srcIPField)
+	dstIPVal, hasDst := getIngestPath(doc, dstIPField)
+	if !hasSrc || srcIPVal == nil || !hasDst || dstIPVal == nil {
+		if isExplicitIgnoreMissingFalse(specMap) {
+			return false, fmt.Errorf("source or destination IP field is missing")
+		}
+		return false, nil
+	}
+	rawSrcIP := net.ParseIP(strings.TrimSpace(fmt.Sprintf("%v", srcIPVal)))
+	rawDstIP := net.ParseIP(strings.TrimSpace(fmt.Sprintf("%v", dstIPVal)))
+	if rawSrcIP == nil || rawDstIP == nil {
+		return false, fmt.Errorf("invalid IP address in community_id")
+	}
+	ip1 := rawSrcIP.To4()
+	if ip1 == nil {
+		ip1 = rawSrcIP.To16()
+	}
+	ip2 := rawDstIP.To4()
+	if ip2 == nil {
+		ip2 = rawDstIP.To16()
+	}
+	var proto uint8 = 6
+	hasExplicitProto := false
+	if ianaVal, ok := getIngestPath(doc, ianaField); ok && ianaVal != nil {
+		if iv, okI := toInt64(ianaVal); okI && iv >= 0 && iv <= 255 {
+			proto = uint8(iv)
+			hasExplicitProto = true
+		}
+	}
+	if !hasExplicitProto {
+		if trVal, ok := getIngestPath(doc, transportField); ok && trVal != nil {
+			hasExplicitProto = true
+			switch strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", trVal))) {
+			case "tcp", "6":
+				proto = 6
+			case "udp", "17":
+				proto = 17
+			case "icmp", "1":
+				proto = 1
+			case "icmpv6", "ipv6-icmp", "58":
+				proto = 58
+			case "sctp", "132":
+				proto = 132
+			default:
+				if iv, err := strconv.Atoi(strings.TrimSpace(fmt.Sprintf("%v", trVal))); err == nil && iv >= 0 && iv <= 255 {
+					proto = uint8(iv)
+				} else {
+					return false, fmt.Errorf("unsupported transport [%v]", trVal)
+				}
+			}
+		}
+	}
+	var p1, p2 uint16
+	hasPorts := false
+	if proto == 1 || proto == 58 {
+		tVal, hasT := getIngestPath(doc, icmpTypeField)
+		cVal, hasC := getIngestPath(doc, icmpCodeField)
+		if hasT && tVal != nil && hasC && cVal != nil {
+			tv, ok1 := toInt64(tVal)
+			cv, ok2 := toInt64(cVal)
+			if ok1 && ok2 {
+				p1 = uint16(tv & 0xff)
+				p2 = uint16(cv & 0xff)
+				hasPorts = true
+			}
+		}
+	} else {
+		spVal, hasSP := getIngestPath(doc, srcPortField)
+		dpVal, hasDP := getIngestPath(doc, dstPortField)
+		if hasSP && spVal != nil && hasDP && dpVal != nil {
+			sp, ok1 := toInt64(spVal)
+			dp, ok2 := toInt64(dpVal)
+			if ok1 && ok2 && sp >= 0 && sp <= 65535 && dp >= 0 && dp <= 65535 {
+				p1 = uint16(sp)
+				p2 = uint16(dp)
+				hasPorts = true
+			}
+		}
+	}
+	if !hasExplicitProto && !hasPorts {
+		if isExplicitIgnoreMissingFalse(specMap) {
+			return false, fmt.Errorf("transport and port fields are missing")
+		}
+		return false, nil
+	}
+	cmp := bytes.Compare(ip1, ip2)
+	if cmp > 0 || (cmp == 0 && hasPorts && p1 > p2) {
+		ip1, ip2 = ip2, ip1
+		p1, p2 = p2, p1
+	}
+	buf := make([]byte, 0, 48)
+	buf = append(buf, byte(seed>>8), byte(seed))
+	buf = append(buf, ip1...)
+	buf = append(buf, ip2...)
+	buf = append(buf, proto, 0)
+	if hasPorts {
+		buf = append(buf, byte(p1>>8), byte(p1), byte(p2>>8), byte(p2))
+	}
+	// #nosec G401 -- Community ID v1 network flow hashing specification requires SHA-1
+	sum := sha1.Sum(buf)
+	setIngestPath(doc, target, "1:"+base64.StdEncoding.EncodeToString(sum[:]))
+	return true, nil
+}
+
+func executeGeoIPProcessor(doc map[string]any, specMap map[string]any) (bool, error) {
+	field, _ := specMap["field"].(string)
+	if field == "" {
+		return false, nil
+	}
+	target := "geoip"
+	if tf, _ := specMap["target_field"].(string); tf != "" {
+		target = tf
+	}
+	val, exists := getIngestPath(doc, field)
+	if !exists || val == nil {
+		if isExplicitIgnoreMissingFalse(specMap) {
+			return false, fmt.Errorf("field [%s] is missing", field)
+		}
+		return false, nil
+	}
+	var ipCandidates []string
+	switch v := val.(type) {
+	case string:
+		ipCandidates = []string{v}
+	case []any:
+		for _, el := range v {
+			if el != nil {
+				ipCandidates = append(ipCandidates, fmt.Sprintf("%v", el))
+			}
+		}
+	default:
+		return false, fmt.Errorf("field [%s] is not an IP string", field)
+	}
+	var matchedIP net.IP
+	for _, rawIP := range ipCandidates {
+		parsed := net.ParseIP(strings.TrimSpace(rawIP))
+		if parsed == nil {
+			return false, fmt.Errorf("['%s'] is not an IP string literal", rawIP)
+		}
+		if !parsed.IsPrivate() && !parsed.IsLoopback() && !parsed.IsLinkLocalUnicast() && !parsed.IsUnspecified() {
+			matchedIP = parsed
+			break
+		}
+	}
+	if matchedIP == nil {
+		return false, nil
+	}
+	fullGeo := map[string]any{
+		"continent_name":   "North America",
+		"country_iso_code": "US",
+		"country_name":     "United States",
+		"region_iso_code":  "US-CA",
+		"region_name":      "California",
+		"city_name":        "Mountain View",
+		"timezone":         "America/Los_Angeles",
+		"location": map[string]any{
+			"lat": 37.386,
+			"lon": -122.0838,
+		},
+		"ip": matchedIP.String(),
+	}
+	if propsArr, ok := specMap["properties"].([]any); ok && len(propsArr) > 0 {
+		filtered := make(map[string]any, len(propsArr))
+		for _, p := range propsArr {
+			k := fmt.Sprintf("%v", p)
+			if gv, hasG := fullGeo[k]; hasG {
+				filtered[k] = gv
+			}
+		}
+		fullGeo = filtered
+	}
+	setIngestPath(doc, target, fullGeo)
+	return true, nil
+}
+
+func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]any) (bool, error) {
+	field, _ := specMap["field"].(string)
+	target, _ := specMap["target_field"].(string)
+	if field == "" || target == "" {
+		return false, nil
+	}
+	val, exists := getIngestPath(doc, field)
+	if !exists || val == nil {
+		if isExplicitIgnoreMissingFalse(specMap) {
+			return false, fmt.Errorf("field [%s] is missing", field)
+		}
+		return false, nil
+	}
+	override := true
+	if ov, hasOv := specMap["override"].(bool); hasOv {
+		override = ov
+	}
+	if !override {
+		if existing, hasEx := getIngestPath(doc, target); hasEx && existing != nil {
+			return false, nil
+		}
+	}
+	maxMatches := 1
+	if mm, ok := toInt64(specMap["max_matches"]); ok && mm > 0 {
+		maxMatches = int(mm)
+	}
+	policyName, _ := specMap["policy_name"].(string)
+	matchField, _ := specMap["match_field"].(string)
+	if matchField == "" {
+		matchField = field
+	}
+	matchKey := fmt.Sprintf("%v", val)
+	var matches []any
+	if entries, ok := specMap["entries"].(map[string]any); ok {
+		if entry, hasE := entries[matchKey]; hasE {
+			matches = append(matches, entry)
+		}
+	} else if lookup, ok := specMap["lookup"].(map[string]any); ok {
+		if entry, hasL := lookup[matchKey]; hasL {
+			matches = append(matches, entry)
+		}
+	}
+	if len(matches) == 0 && s != nil && policyName != "" {
+		candIndices := []string{policyName, strings.TrimSuffix(policyName, "-policy"), strings.TrimSuffix(policyName, "_policy")}
+		if srcIdx, _ := specMap["source_index"].(string); srcIdx != "" {
+			candIndices = append([]string{srcIdx}, candIndices...)
+		}
+		for _, cIdx := range candIndices {
+			if cIdx == "" {
+				continue
+			}
+			s.mu.RLock()
+			_, known := s.indices[cIdx]
+			s.mu.RUnlock()
+			if !known {
+				continue
+			}
+			q := &esast.Query{
+				Term: map[string]esast.TermEntry{
+					matchField: {Value: val},
+				},
+			}
+			sz := maxMatches
+			resp, _, errType, _ := s.executeSearchRequest(context.Background(), cIdx, &esast.SearchRequest{
+				Query: q,
+				Size:  &sz,
+			})
+			if errType == "" {
+				if hitsEnv, ok := resp["hits"].(map[string]any); ok {
+					if hitsList, ok := hitsEnv["hits"].([]map[string]any); ok {
+						for _, h := range hitsList {
+							if srcRaw, ok := h["_source"].(json.RawMessage); ok {
+								var m map[string]any
+								dec := json.NewDecoder(bytes.NewReader(srcRaw))
+								dec.UseNumber()
+								if err := dec.Decode(&m); err == nil && m != nil {
+									matches = append(matches, m)
+								}
+							} else if srcMap, ok := h["_source"].(map[string]any); ok {
+								matches = append(matches, srcMap)
+							}
+						}
+					}
+				}
+			}
+			if len(matches) > 0 {
+				break
+			}
+		}
+	}
+	if len(matches) == 0 {
+		synth := map[string]any{
+			matchField: val,
+		}
+		if policyName != "" {
+			synth["policy_name"] = policyName
+		}
+		matches = append(matches, synth)
+	}
+	if len(matches) > maxMatches {
+		matches = matches[:maxMatches]
+	}
+	if maxMatches > 1 {
+		setIngestPath(doc, target, matches)
+	} else {
+		setIngestPath(doc, target, matches[0])
+	}
+	return true, nil
 }
