@@ -3540,7 +3540,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						if ingestMeta == nil {
 							ingestMeta = make(map[string]any)
 						}
-						ingestMeta["_value"] = elem
+						ingestMeta["_value"] = deepCloneIngestValue(elem)
 						doc["_ingest"] = ingestMeta
 						subMut, subDropped, subErr := runIngestProcessorList(s, doc, subProcs, depth+1, trace)
 						if subMut {
@@ -4761,6 +4761,15 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				}
 				existing, exists := existingDocs[pd.id]
 				if pd.isDelete {
+					if exists && pd.aliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), pd.destIndex, pd.id, existing.Source, pd.aliasFilter) {
+						if proceedOnConflict {
+							versionConflicts++
+							continue
+						}
+						writeESError(w, http.StatusConflict, "version_conflict_engine_exception",
+							fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", pd.id))
+						return
+					}
 					if exists && existing.Version+1 > minVer {
 						minVer = existing.Version + 1
 					}
@@ -5323,11 +5332,28 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 
 	_ = s.syncCatalogFromBackend(r.Context())
 	s.mu.RLock()
-	targets := s.aliases[alias]
+	targets := append([]string(nil), s.aliases[alias]...)
+	metaByIdx := s.aliasMeta[alias]
+	writeIdx := ""
+	for _, t := range targets {
+		if metaByIdx != nil {
+			if m, ok := metaByIdx[t]; ok && m.IsWriteIndex != nil && *m.IsWriteIndex {
+				writeIdx = t
+				break
+			}
+		}
+	}
 	s.mu.RUnlock()
 
+	if len(targets) > 1 && writeIdx == "" {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+			fmt.Sprintf("Alias [%s] has more than one write index or no write index is specified", alias))
+		return
+	}
 	oldIdx := alias + "-000001"
-	if len(targets) > 0 {
+	if writeIdx != "" {
+		oldIdx = writeIdx
+	} else if len(targets) > 0 {
 		oldIdx = targets[len(targets)-1]
 	}
 	if newIdx == "" {
@@ -5410,8 +5436,10 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 		if fp, found := extractFinalPipelineFromSettings(req.Settings); found && fp != "" {
 			s.indexFinalPipelines[newIdx] = fp
 		}
+		extraAliasTargets := make(map[string][]string, len(req.Aliases))
 		for extraAlias, rawMeta := range req.Aliases {
 			s.addAliasWithMetaLocked(extraAlias, newIdx, parseAliasMetadata(rawMeta))
+			extraAliasTargets[extraAlias] = append([]string(nil), s.aliases[extraAlias]...)
 		}
 		var updatedTargets []string
 		if metaByIdx := s.aliasMeta[alias]; metaByIdx != nil {
@@ -5448,6 +5476,9 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		s.persistIndex(r.Context(), newIdx, compiled)
 		s.persistAlias(r.Context(), alias, updatedTargets)
+		for extraAlias, extraTargets := range extraAliasTargets {
+			s.persistAlias(r.Context(), extraAlias, extraTargets)
+		}
 		s.queryCache.InvalidateAll()
 	}
 

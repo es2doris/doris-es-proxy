@@ -968,7 +968,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 			var res float64
 			var w int64 = -1
 			if len(nums) > 0 {
-				w = 0
+				w = int64(len(nums))
 				pos := q * float64(len(nums)-1)
 				lower := int(math.Floor(pos))
 				upper := int(math.Ceil(pos))
@@ -1028,7 +1028,9 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		for _, bKey := range bucketOrder {
 			acc := byBucket[bKey]
 			var res float64
+			var w int64 = -1
 			if acc.total > 0 {
+				w = acc.total
 				res = float64(acc.leCount) * 100.0 / float64(acc.total)
 			}
 			out = append(out, AggRow{
@@ -1036,6 +1038,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				BucketKey: bKey,
 				DocCount:  int64(res),
 				Value:     res,
+				Weight:    w,
 			})
 		}
 		return out
@@ -1059,7 +1062,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		var res float64
 		var w int64 = -1
 		if len(nums) > 0 {
-			w = 0
+			w = int64(len(nums))
 			pos := q * float64(len(nums)-1)
 			lower := int(math.Floor(pos))
 			upper := int(math.Ceil(pos))
@@ -1091,10 +1094,12 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 			}
 		}
 		var res float64
+		var w int64 = -1
 		if total > 0 {
+			w = total
 			res = float64(leCount) * 100.0 / float64(total)
 		}
-		return []AggRow{{AggName: aggName, BucketKey: valKey, DocCount: int64(res), Value: res}}
+		return []AggRow{{AggName: aggName, BucketKey: valKey, DocCount: int64(res), Value: res, Weight: w}}
 	}
 
 	if m := reAggDateHist.FindStringSubmatch(branch); m != nil {
@@ -2224,7 +2229,15 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 			if val == nil {
 				return false
 			}
-			rhsVal := parseSQLLiteralValue(rhs)
+			var rhsVal any
+			if strings.HasPrefix(rhs, "json_extract_string(") || (strings.HasPrefix(rhs, "`") && strings.HasSuffix(rhs, "`")) {
+				rhsVal = resolveColumnValue(row, rhs)
+				if rhsVal == nil {
+					return false
+				}
+			} else {
+				rhsVal = parseSQLLiteralValue(rhs)
+			}
 			if ci {
 				rhsVal = strings.ToLower(fmt.Sprintf("%v", rhsVal))
 			}

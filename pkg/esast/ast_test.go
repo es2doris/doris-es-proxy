@@ -531,3 +531,71 @@ func TestASTRound28ComprehensiveCoverage(t *testing.T) {
 	_, _ = json.Marshal(sfBoolTrue)
 	_, _ = json.Marshal(sfObj)
 }
+
+func TestRound29ASTIdsQueryNumericScalarBoostPhraseFuzzinessAndAggSpecs(t *testing.T) {
+	// 1. IdsQuery with numeric array, scalar value, and boost
+	var iqArr, iqScalar IdsQuery
+	if err := json.Unmarshal([]byte(`{"values":[101, 202, "303"],"boost":2.5}`), &iqArr); err != nil {
+		t.Fatalf("IdsQuery numeric array unmarshal failed: %v", err)
+	}
+	if len(iqArr.Values) != 3 || iqArr.Values[0] != "101" || iqArr.Values[1] != "202" || iqArr.Values[2] != "303" || iqArr.Boost == nil || *iqArr.Boost != 2.5 {
+		t.Fatalf("unexpected IdsQuery numeric array: %+v", iqArr)
+	}
+	if err := json.Unmarshal([]byte(`{"values":42}`), &iqScalar); err != nil || len(iqScalar.Values) != 1 || iqScalar.Values[0] != "42" {
+		t.Fatalf("IdsQuery scalar unmarshal failed: %+v (%v)", iqScalar, err)
+	}
+
+	// 2. PhraseEntry with Fuzziness
+	var pe PhraseEntry
+	if err := json.Unmarshal([]byte(`{"query":"quick brown","fuzziness":"AUTO","operator":"AND","boost":1.5}`), &pe); err != nil {
+		t.Fatalf("PhraseEntry unmarshal failed: %v", err)
+	}
+	if pe.Query != "quick brown" || pe.Fuzziness != "AUTO" || pe.Operator != "and" || pe.Boost != 1.5 {
+		t.Fatalf("unexpected PhraseEntry: %+v", pe)
+	}
+
+	// 3. KNNSlice, IndexTemplateRequest, FieldProperty helpers
+	var ksSingle, ksArr KNNSlice
+	if err := json.Unmarshal([]byte(`{"field":"vec","query_vector":[1.0,2.0],"k":5}`), &ksSingle); err != nil || len(ksSingle) != 1 {
+		t.Fatalf("KNNSlice single unmarshal failed: %+v (%v)", ksSingle, err)
+	}
+	if err := json.Unmarshal([]byte(`[{"field":"vec","query_vector":[1.0,2.0],"k":5}]`), &ksArr); err != nil || len(ksArr) != 1 {
+		t.Fatalf("KNNSlice array unmarshal failed: %+v (%v)", ksArr, err)
+	}
+	var tmpl IndexTemplateRequest
+	if err := json.Unmarshal([]byte(`{"patterns":["logs-*"],"mappings":{"properties":{"vec":{"type":"dense_vector","dimension":128,"copy_to":["all_vecs"]}}}}`), &tmpl); err != nil {
+		t.Fatalf("IndexTemplateRequest unmarshal failed: %v", err)
+	}
+	if len(tmpl.EffectivePatterns()) != 1 || tmpl.EffectiveMappings() == nil || tmpl.EffectiveMappings().Properties["vec"].EffectiveDims() != 128 || len(tmpl.EffectiveMappings().Properties["vec"].CopyToSlice()) != 1 {
+		t.Fatalf("unexpected IndexTemplateRequest helpers: %+v", tmpl)
+	}
+
+	// 4. FieldRequestSpec, StoredFieldsSlice, RescoreSlice, CollapseInnerHits
+	var frs []FieldRequestSpec
+	if err := json.Unmarshal([]byte(`["f1", {"field":"f2","format":"epoch_millis"}]`), &frs); err != nil || len(frs) != 2 || frs[1].Format != "epoch_millis" {
+		t.Fatalf("[]FieldRequestSpec unmarshal failed: %+v (%v)", frs, err)
+	}
+	sfsSingle := StoredFieldsSlice("_none_")
+	sfsArr := StoredFieldsSlice([]any{"a", "b"})
+	if len(sfsSingle) != 1 || len(sfsArr) != 2 {
+		t.Fatalf("StoredFieldsSlice failed: %v / %v", sfsSingle, sfsArr)
+	}
+	var rSlice RescoreSlice
+	if err := json.Unmarshal([]byte(`{"window_size":50,"query":{"rescore_query":{"match_all":{}}}}`), &rSlice); err != nil || len(rSlice) != 1 || *rSlice[0].WindowSize != 50 {
+		t.Fatalf("RescoreSlice single unmarshal failed: %+v (%v)", rSlice, err)
+	}
+	var cihSlice CollapseInnerHits
+	if err := json.Unmarshal([]byte(`{"name":"top_1","size":1}`), &cihSlice); err != nil || len(cihSlice) != 1 || cihSlice[0].Name != "top_1" {
+		t.Fatalf("CollapseInnerHits single unmarshal failed: %+v (%v)", cihSlice, err)
+	}
+
+	// 5. RangeCond Java from/to/include_lower/include_upper
+	var rc RangeCond
+	if err := json.Unmarshal([]byte(`{"from":10,"to":20,"include_lower":true,"include_upper":false}`), &rc); err != nil {
+		t.Fatalf("RangeCond from/to unmarshal failed: %v", err)
+	}
+	_, gte, lt, _ := rc.NormalizedBounds()
+	if gte == nil || lt == nil {
+		t.Fatalf("expected RangeCond NormalizedBounds GTE=10, LT=20, got %+v", rc)
+	}
+}

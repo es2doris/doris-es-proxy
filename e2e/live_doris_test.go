@@ -1274,4 +1274,86 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	if r28SmVal == nil || r28SmVal["count"].(float64) < 1 {
 		t.Fatalf("unexpected R28 scripted_metric value: %+v", r28SmVal)
 	}
+
+	// 26. Round-29: Lucene field:[* TO *] / *:* exists, ids boost, date_histogram -> terms -> cumulative_sum + bucket_sort, foreach+script ingest, and Painless generic types / shift compound assignments
+	r29SimResp, err := http.Post(ts.URL+"/_ingest/pipeline/_simulate", "application/json", strings.NewReader(`{
+		"pipeline": {
+			"processors": [
+				{
+					"foreach": {
+						"field": "tags",
+						"processor": {
+							"script": {
+								"source": "ctx._ingest._value.processed = true;"
+							}
+						}
+					}
+				}
+			]
+		},
+		"docs": [
+			{"_index": "live_auto_index", "_id": "r29-1", "_source": {"tags": [{"k": "a"}, {"k": "b"}]}}
+		]
+	}`))
+	if err != nil || r29SimResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_ingest/pipeline/_simulate (R29 foreach+script) failed: status=%v err=%v", r29SimResp.StatusCode, err)
+	}
+	var r29SimRes map[string]any
+	_ = json.NewDecoder(r29SimResp.Body).Decode(&r29SimRes)
+	_ = r29SimResp.Body.Close()
+	r29Tags := r29SimRes["docs"].([]any)[0].(map[string]any)["doc"].(map[string]any)["_source"].(map[string]any)["tags"].([]any)
+	if r29Tags[0].(map[string]any)["processed"] != true || r29Tags[1].(map[string]any)["processed"] != true {
+		t.Fatalf("expected R29 foreach+script in-place mutation on tags, got %+v", r29Tags)
+	}
+
+	r29SearchResp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
+		"query": {
+			"bool": {
+				"must": [
+					{"query_string": {"query": "latency_ms:[* TO *] AND *:*"}},
+					{"ids": {"values": ["auto-1", "auto-2", "auto-3"], "boost": 2.5}}
+				]
+			}
+		},
+		"script_fields": {
+			"shift_and_generic": {
+				"script": "List<String> items = ['x', 'y']; int x = 3; x <<= 2; String label; label = items.get(0) + ':' + x; return label;"
+			}
+		},
+		"aggs": {
+			"by_day": {
+				"date_histogram": {
+					"field": "created_at",
+					"calendar_interval": "1d"
+				},
+				"aggs": {
+					"by_svc": {
+						"terms": {
+							"field": "service",
+							"order": {"_key": "asc"}
+						},
+						"aggs": {
+							"sum_lat": {"sum": {"field": "latency_ms"}},
+							"cum_lat": {"cumulative_sum": {"buckets_path": "sum_lat"}},
+							"page": {"bucket_sort": {"from": 0, "size": 5}}
+						}
+					}
+				}
+			}
+		}
+	}`))
+	if err != nil || r29SearchResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search (R29) failed: status=%v err=%v", r29SearchResp.StatusCode, err)
+	}
+	var r29SearchRes map[string]any
+	_ = json.NewDecoder(r29SearchResp.Body).Decode(&r29SearchRes)
+	_ = r29SearchResp.Body.Close()
+	r29Hits := r29SearchRes["hits"].(map[string]any)["hits"].([]any)
+	if len(r29Hits) == 0 {
+		t.Fatalf("expected R29 search hits on live_auto_index, got 0")
+	}
+	r29Fields, _ := r29Hits[0].(map[string]any)["fields"].(map[string]any)
+	if r29Fields == nil || r29Fields["shift_and_generic"].([]any)[0] != "x:12" {
+		t.Fatalf("expected R29 script_fields shift_and_generic='x:12', got %+v", r29Fields)
+	}
 }

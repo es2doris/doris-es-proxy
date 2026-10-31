@@ -180,7 +180,7 @@ func GeneratePromoteVariantFieldDDL(s *IndexSchema, esFieldPath string, esType s
 	if existing, ok := s.Fields[cleanPath]; ok && existing.Kind != StorageDynamicVariant {
 		return nil
 	}
-	for _, root := range s.NestedRoots {
+	for root := range s.NestedRoots {
 		if cleanPath == root || strings.HasPrefix(cleanPath, root+".") {
 			return nil
 		}

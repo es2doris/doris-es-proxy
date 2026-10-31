@@ -610,6 +610,19 @@ func (s *IndexSchema) registerLeafField(
 // If `esFieldPath` ends with `.keyword` and has no explicit `.keyword` sub-field,
 // it checks the base field first and strips `.keyword` from the dynamic JSON path.
 func (s *IndexSchema) ResolveField(esFieldPath string) FieldBinding {
+	if s == nil || s.Fields == nil {
+		cleanPath := strings.TrimSuffix(esFieldPath, ".keyword")
+		var segs []string
+		if cleanPath != "" {
+			segs = strings.Split(cleanPath, ".")
+		}
+		return FieldBinding{
+			ESFieldPath:    esFieldPath,
+			SourceJSONPath: segs,
+			Kind:           StorageDynamicVariant,
+			DorisType:      DorisString,
+		}
+	}
 	if b, ok := s.Fields[esFieldPath]; ok {
 		return b
 	}

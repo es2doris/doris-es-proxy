@@ -763,6 +763,31 @@ func (t *TermEntry) UnmarshalJSON(data []byte) error {
 
 type IdsQuery struct {
 	Values []string `json:"values"`
+	Boost  *float64 `json:"boost,omitempty"`
+}
+
+func (iq *IdsQuery) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Values any      `json:"values"`
+		Boost  *float64 `json:"boost"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	iq.Boost = raw.Boost
+	switch v := raw.Values.(type) {
+	case nil:
+	case []any:
+		iq.Values = make([]string, 0, len(v))
+		for _, item := range v {
+			if item != nil {
+				iq.Values = append(iq.Values, fmt.Sprintf("%v", item))
+			}
+		}
+	default:
+		iq.Values = []string{fmt.Sprintf("%v", v)}
+	}
+	return nil
 }
 
 type ExistsQuery struct {
@@ -942,6 +967,7 @@ type PhraseEntry struct {
 	Operator           string  `json:"operator,omitempty"`
 	MinimumShouldMatch any     `json:"minimum_should_match,omitempty"`
 	ZeroTermsQuery     string  `json:"zero_terms_query,omitempty"`
+	Fuzziness          any     `json:"fuzziness,omitempty"`
 	Boost              float64 `json:"boost,omitempty"`
 }
 
@@ -955,6 +981,7 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 			Operator           string   `json:"operator"`
 			MinimumShouldMatch any      `json:"minimum_should_match"`
 			ZeroTermsQuery     string   `json:"zero_terms_query"`
+			Fuzziness          any      `json:"fuzziness"`
 			Boost              *float64 `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
@@ -967,6 +994,7 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 		p.Operator = strings.ToLower(full.Operator)
 		p.MinimumShouldMatch = full.MinimumShouldMatch
 		p.ZeroTermsQuery = full.ZeroTermsQuery
+		p.Fuzziness = full.Fuzziness
 		if full.Boost != nil {
 			p.Boost = *full.Boost
 		}

@@ -82,7 +82,8 @@ var (
 	reLocalArrayRemoveIf   = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)*)\.removeIf\(\s*\(?\s*([a-zA-Z0-9_]+)\s*\)?\s*->\s*(.+)\s*\)$`)
 	reLocalCompoundAssign  = regexp.MustCompile(`(?s)^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)*)\s*(\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>>=|>>=)\s*(.+)$`)
 	reLocalPropAssign      = regexp.MustCompile(`(?s)^([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)\s*=\s*(.+)$`)
-	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|Object|Map|HashMap|LinkedHashMap|TreeMap|List|ArrayList|LinkedList|Set|HashSet|ZonedDateTime|Instant|LocalDateTime|LocalDate)\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$`)
+	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|Object|Map|HashMap|LinkedHashMap|TreeMap|List|ArrayList|LinkedList|Set|HashSet|ZonedDateTime|Instant|LocalDateTime|LocalDate)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$`)
+	reNullVarDecl          = regexp.MustCompile(`^(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|Object|Map|HashMap|LinkedHashMap|TreeMap|List|ArrayList|LinkedList|Set|HashSet|ZonedDateTime|Instant|LocalDateTime|LocalDate)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_][a-zA-Z0-9_]*)$`)
 	reSimpleFieldPath      = regexp.MustCompile(`^[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+$`)
 	reNumericLiteralSuffix = regexp.MustCompile(`^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?[lLdDfF]$`)
 )
@@ -247,7 +248,13 @@ func isTopLevelAssignmentStmt(s string) bool {
 					i++
 					continue
 				}
-				if i > 0 && (s[i-1] == '=' || s[i-1] == '!' || s[i-1] == '<' || s[i-1] == '>') {
+				if i > 0 && (s[i-1] == '=' || s[i-1] == '!') {
+					continue
+				}
+				if i > 0 && s[i-1] == '<' && (i < 2 || s[i-2] != '<') {
+					continue
+				}
+				if i > 0 && s[i-1] == '>' && (i < 2 || s[i-2] != '>') {
 					continue
 				}
 				return true
@@ -520,6 +527,9 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 		iterExpr = strings.TrimSpace(header[idx+sepLen:])
 	} else {
 		return nil
+	}
+	if closeIdx := strings.LastIndexAny(varName, ">]"); closeIdx >= 0 && closeIdx+1 < len(varName) {
+		varName = strings.TrimSpace(varName[closeIdx+1:])
 	}
 	fields := strings.Fields(varName)
 	if len(fields) > 0 {
@@ -1496,6 +1506,11 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		if !matchedAlias {
 			delete(params, "__alias_"+varName)
 		}
+		return nil
+	}
+	if m := reNullVarDecl.FindStringSubmatch(stmt); m != nil {
+		params[m[1]] = nil
+		delete(params, "__alias_"+m[1])
 		return nil
 	}
 

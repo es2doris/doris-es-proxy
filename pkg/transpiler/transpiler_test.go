@@ -1055,6 +1055,157 @@ func TestTranspilerRound28ComprehensiveCoverage(t *testing.T) {
 	}
 }
 
+func TestRound29TranspilerNestedDateBoundsRelativeNestedPathsLuceneExistsAndSubAggs(t *testing.T) {
+	rawMapping := `{
+		"properties": {
+			"service": {"type": "keyword"},
+			"latency": {"type": "long"},
+			"created_at": {"type": "date"},
+			"client_ip": {"type": "ip"},
+			"tags": {"type": "keyword", "multi_valued": true},
+			"items": {
+				"type": "nested",
+				"properties": {
+					"ts": {"type": "date"},
+					"price": {"type": "double"},
+					"title": {
+						"type": "text",
+						"fields": {
+							"keyword": {"type": "keyword", "normalizer": "lowercase", "ignore_above": 64}
+						}
+					},
+					"title_alias": {"type": "alias", "path": "items.title"}
+				}
+			}
+		}
+	}`
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(rawMapping), &spec); err != nil {
+		t.Fatal(err)
+	}
+	sch := schema.CompileIndexSchema("db", "r29_tr", &spec)
+	tr := NewTranspiler(sch, TranspilerOptions{})
+
+	// 1. Nested date range with ISO-8601 'T' strings on gt and lte (roundUp=true) must stay ISO strings
+	var reqNestedRange esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"query": {
+			"nested": {
+				"path": "items",
+				"query": {
+					"bool": {
+						"must": [
+							{"range": {"items.ts": {"gt": "2026-10-01T00:00:00Z", "lte": "2026-10-02T23:59:59Z"}}},
+							{"regexp": {"title.keyword": {"value": "widg.*"}}},
+							{"term": {"title_alias.keyword": "Widget"}}
+						]
+					}
+				}
+			}
+		},
+		"sort": [
+			{
+				"items.title.keyword": {
+					"order": "asc",
+					"nested": {
+						"path": "items",
+						"filter": {"term": {"title.keyword": "Widget"}}
+					}
+				}
+			}
+		]
+	}`), &reqNestedRange)
+	planNR, err := tr.BuildSearchPlan(&reqNestedRange)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan(reqNestedRange) failed: %v", err)
+	}
+	if !strings.Contains(planNR.HitsSQL, "'2026-10-01T00:00:00Z'") || !strings.Contains(planNR.HitsSQL, "'2026-10-02T23:59:59Z'") {
+		t.Fatalf("expected nested date gt/lte ISO bounds to remain ISO strings, got:\n%s", planNR.HitsSQL)
+	}
+	if !strings.Contains(planNR.HitsSQL, "$.title__keyword") {
+		t.Fatalf("expected relative nested title.keyword and nested sort filter to route to $.title__keyword, got:\n%s", planNR.HitsSQL)
+	}
+
+	// 2. Lucene unbounded range field:[* TO *], field:{* TO *}, field:*, *:*, *:[* TO *]
+	for _, qs := range []string{`service:[* TO *]`, `service:{* TO *}`, `service:*`} {
+		var reqQS esast.SearchRequest
+		_ = json.Unmarshal([]byte(`{"query":{"query_string":{"query":"`+qs+`"}}}`), &reqQS)
+		p, err := tr.BuildSearchPlan(&reqQS)
+		if err != nil {
+			t.Fatalf("BuildSearchPlan(%s) failed: %v", qs, err)
+		}
+		if !strings.Contains(p.HitsSQL, "`f__service` IS NOT NULL") {
+			t.Fatalf("expected %s to compile to Exists (`f__service` IS NOT NULL), got:\n%s", qs, p.HitsSQL)
+		}
+	}
+	for _, qsAll := range []string{`*:*`, `*:[* TO *]`} {
+		var reqAll esast.SearchRequest
+		_ = json.Unmarshal([]byte(`{"query":{"query_string":{"query":"`+qsAll+`"}}}`), &reqAll)
+		p, err := tr.BuildSearchPlan(&reqAll)
+		if err != nil || !strings.Contains(p.HitsSQL, "TRUE") || strings.Contains(p.HitsSQL, "LIKE") || strings.Contains(p.HitsSQL, ">=") {
+			t.Fatalf("expected %s to compile to MatchAll TRUE without LIKE/>=, got err=%v sql=%s", qsAll, err, p.HitsSQL)
+		}
+	}
+
+	// 3. IdsQuery with numeric IDs + boost, and match_bool_prefix / multi_match bool_prefix with fuzziness
+	var reqIdsFuzz esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"query": {
+			"bool": {
+				"must": [
+					{"ids": {"values": [10, 20], "boost": 3.5}},
+					{"match_bool_prefix": {"service": {"query": "check out", "fuzziness": 1}}},
+					{"multi_match": {"query": "pay gate", "type": "bool_prefix", "fields": ["service"], "fuzziness": 1}}
+				]
+			}
+		}
+	}`), &reqIdsFuzz)
+	planIF, err := tr.BuildSearchPlan(&reqIdsFuzz)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan(reqIdsFuzz) failed: %v", err)
+	}
+	if !strings.Contains(planIF.HitsSQL, "`_id` IN ('10', '20')") || !strings.Contains(planIF.HitsSQL, "3.5000") || !strings.Contains(planIF.HitsSQL, "REGEXP") {
+		t.Fatalf("expected numeric ids + boost 3.5000 + fuzzy REGEXP in HitsSQL, got:\n%s", planIF.HitsSQL)
+	}
+
+	// 4. Nested sub-aggregations across terms, histogram, date_histogram, range, filters, nested, reverse_nested
+	var reqDeepAggs esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"size": 0,
+		"aggs": {
+			"by_tag": {
+				"terms": {"field": "tags", "size": 5},
+				"aggs": {
+					"avg_lat": {"avg": {"field": "latency"}},
+					"pct_lat": {"percentiles": {"field": "latency", "percents": [50, 95]}},
+					"prank_lat": {"percentile_ranks": {"field": "latency", "values": [100]}},
+					"box_lat": {"boxplot": {"field": "latency"}},
+					"sstats_svc": {"string_stats": {"field": "service"}},
+					"top_h": {"top_hits": {"size": 1, "sort": [{"latency": "desc"}]}},
+					"top_m": {"top_metrics": {"metrics": [{"field": "latency"}], "sort": [{"created_at": "desc"}]}},
+					"sub_hist": {"histogram": {"field": "latency", "interval": 50}},
+					"sub_dhist": {"date_histogram": {"field": "created_at", "fixed_interval": "1h"}},
+					"sub_range": {"range": {"field": "latency", "ranges": [{"to": 100}, {"from": 100}]}},
+					"sub_ip_range": {"ip_range": {"field": "client_ip", "ranges": [{"mask": "10.0.0.0/8"}]}},
+					"sub_filter": {"filter": {"term": {"service": "api"}}, "aggs": {"s": {"sum": {"field": "latency"}}}},
+					"sub_missing": {"missing": {"field": "service"}},
+					"sub_nested": {
+						"nested": {"path": "items"},
+						"aggs": {
+							"min_p": {"min": {"field": "items.price"}},
+							"back": {"reverse_nested": {}, "aggs": {"c": {"value_count": {"field": "service"}}}}
+						}
+					}
+				}
+			}
+		}
+	}`), &reqDeepAggs)
+	planDA, err := tr.BuildSearchPlan(&reqDeepAggs)
+	if err != nil || planDA.AggsSQL == "" {
+		t.Fatalf("BuildSearchPlan(reqDeepAggs) failed: err=%v sql=%s", err, planDA.AggsSQL)
+	}
+}
+
 func mustJSONString(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
