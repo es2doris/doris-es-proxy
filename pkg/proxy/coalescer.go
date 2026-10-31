@@ -346,24 +346,45 @@ func (qc *QueryResultCache) InvalidateAll() {
 	qc.mu.Unlock()
 }
 
-func containsNowDateMath(req *esast.SearchRequest, reqBytes []byte) bool {
-	lowerBytes := bytes.ToLower(reqBytes)
-	for _, pat := range [][]byte{
-		[]byte(`"now`),
-		[]byte("now-"),
-		[]byte("now+"),
-		[]byte("now/"),
-		[]byte("to now"),
-		[]byte(":now"),
-		[]byte(">now"),
-		[]byte("<now"),
-		[]byte("=now"),
-		[]byte("(now"),
-	} {
-		if bytes.Contains(lowerBytes, pat) {
+func isWordByteNowCheck(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
+}
+
+func isNowDateMathString(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return false
+	}
+	checkPart := func(part string) bool {
+		part = strings.TrimSpace(part)
+		return part == "now" || strings.HasPrefix(part, "now+") || strings.HasPrefix(part, "now-") || strings.HasPrefix(part, "now/")
+	}
+	if idx := strings.Index(s, "||"); idx >= 0 {
+		return checkPart(s[:idx]) || checkPart(s[idx+2:])
+	}
+	return checkPart(s)
+}
+
+func containsStandaloneNowToken(s string) bool {
+	lower := strings.ToLower(s)
+	offset := 0
+	for {
+		idx := strings.Index(lower[offset:], "now")
+		if idx < 0 {
+			return false
+		}
+		pos := offset + idx
+		prevWord := pos > 0 && isWordByteNowCheck(lower[pos-1])
+		nextPos := pos + 3
+		nextWord := nextPos < len(lower) && isWordByteNowCheck(lower[nextPos])
+		if !prevWord && !nextWord {
 			return true
 		}
+		offset = pos + 3
 	}
+}
+
+func containsNowDateMath(req *esast.SearchRequest, reqBytes []byte) bool {
 	if req != nil {
 		if queryContainsNow(req.Query) || queryContainsNow(req.PostFilter) || queryContainsNow(req.AliasFilter) {
 			return true
@@ -377,6 +398,41 @@ func containsNowDateMath(req *esast.SearchRequest, reqBytes []byte) bool {
 		}
 		if aggsContainNow(req.EffectiveAggs()) {
 			return true
+		}
+		for i := range req.Rescore {
+			if req.Rescore[i].Query != nil && queryContainsNow(req.Rescore[i].Query.RescoreQuery) {
+				return true
+			}
+		}
+	}
+	if len(reqBytes) > 0 {
+		lowerBytes := bytes.ToLower(reqBytes)
+		for _, pat := range [][]byte{
+			[]byte(`"now"`),
+			[]byte(`"now-`),
+			[]byte(`"now+`),
+			[]byte(`"now/`),
+			[]byte(`||now`),
+			[]byte("to now]"),
+			[]byte("to now}"),
+			[]byte("[now "),
+			[]byte("{now "),
+			[]byte("[now-"),
+			[]byte("{now-"),
+			[]byte("[now+"),
+			[]byte("{now+"),
+			[]byte("[now/"),
+			[]byte("{now/"),
+			[]byte(":now-"),
+			[]byte(":now+"),
+			[]byte(":now/"),
+			[]byte(">now"),
+			[]byte("<now"),
+			[]byte("=now"),
+		} {
+			if bytes.Contains(lowerBytes, pat) {
+				return true
+			}
 		}
 	}
 	return false
@@ -429,7 +485,7 @@ func boundsContainNow(b *esast.HistogramBoundsSpec) bool {
 
 func boundValContainsNow(v any) bool {
 	if s, ok := v.(string); ok {
-		return strings.Contains(strings.ToLower(s), "now")
+		return isNowDateMathString(s)
 	}
 	return false
 }
@@ -438,11 +494,25 @@ func queryContainsNow(q *esast.Query) bool {
 	if q == nil {
 		return false
 	}
-	if q.QueryString != nil && strings.Contains(strings.ToLower(q.QueryString.Query), "now") {
+	if q.QueryString != nil && containsStandaloneNowToken(q.QueryString.Query) {
 		return true
 	}
-	if q.SimpleQueryString != nil && strings.Contains(strings.ToLower(q.SimpleQueryString.Query), "now") {
+	if q.SimpleQueryString != nil && containsStandaloneNowToken(q.SimpleQueryString.Query) {
 		return true
+	}
+	for _, tc := range q.Term {
+		if boundValContainsNow(tc.Value) {
+			return true
+		}
+	}
+	if q.Terms != nil {
+		for _, vals := range q.Terms.Fields {
+			for _, v := range vals {
+				if boundValContainsNow(v) {
+					return true
+				}
+			}
+		}
 	}
 	for _, rc := range q.Range {
 		if boundValContainsNow(rc.GT) || boundValContainsNow(rc.GTE) || boundValContainsNow(rc.LT) || boundValContainsNow(rc.LTE) || boundValContainsNow(rc.From) || boundValContainsNow(rc.To) {

@@ -188,13 +188,22 @@ func rewriteDorisArrayExists(q string) string {
 			j++
 		}
 		if depth == 0 && lastTopComma > start {
-			lambdaPart := strings.TrimSpace(q[start:lastTopComma])
-			colPart := strings.TrimSpace(q[lastTopComma+1 : j-1])
-			out.WriteString("array_contains(array_exists(")
-			out.WriteString(lambdaPart)
-			out.WriteString(", IFNULL(")
-			out.WriteString(colPart)
-			out.WriteString(", CAST([] AS ARRAY<STRING>))), true)")
+			lambdaPart := rewriteDorisArrayExists(strings.TrimSpace(q[start:lastTopComma]))
+			colPart := rewriteDorisArrayExists(strings.TrimSpace(q[lastTopComma+1 : j-1]))
+			alreadyWrapped := strings.HasPrefix(colPart, "IFNULL(") && strings.HasSuffix(colPart, "CAST([] AS ARRAY<STRING>))")
+			if alreadyWrapped {
+				out.WriteString("array_exists(")
+				out.WriteString(lambdaPart)
+				out.WriteString(", ")
+				out.WriteString(colPart)
+				out.WriteString(")")
+			} else {
+				out.WriteString("array_contains(array_exists(")
+				out.WriteString(lambdaPart)
+				out.WriteString(", IFNULL(")
+				out.WriteString(colPart)
+				out.WriteString(", CAST([] AS ARRAY<STRING>))), true)")
+			}
 			i = j
 		} else {
 			out.WriteString(prefix)

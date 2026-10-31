@@ -19,6 +19,7 @@ package schema
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -321,4 +322,150 @@ func TestInferMergeAlterPromoteAndDateMath(t *testing.T) {
 func mustNow() (t time.Time) {
 	t, _ = time.Parse(time.RFC3339, "2026-10-25T12:00:00Z")
 	return t
+}
+
+func TestSchemaRound28ComprehensiveCoverage(t *testing.T) {
+	now := mustNow()
+
+	// 1. coerceScalarForDoris across DorisBigInt, DorisInt (32-bit clamping), DorisDouble, DorisBoolean, DorisVarchar, DorisString
+	if got := coerceScalarForDoris(uint64(math.MaxUint64), DorisBigInt, false, now); got != int64(math.MaxInt64) {
+		t.Fatalf("expected MaxInt64 for uint64 overflow, got %#v", got)
+	}
+	if got := coerceScalarForDoris(math.NaN(), DorisBigInt, false, now); got != nil {
+		t.Fatalf("expected nil for NaN on DorisBigInt, got %#v", got)
+	}
+	if got := coerceScalarForDoris(float64(1e25), DorisBigInt, false, now); got != int64(math.MaxInt64) {
+		t.Fatalf("expected MaxInt64 for +1e25 on DorisBigInt, got %#v", got)
+	}
+	if got := coerceScalarForDoris(float64(-1e25), DorisBigInt, false, now); got != int64(math.MinInt64) {
+		t.Fatalf("expected MinInt64 for -1e25 on DorisBigInt, got %#v", got)
+	}
+	if got := coerceScalarForDoris(json.Number("18446744073709551615"), DorisBigInt, false, now); got != int64(math.MaxInt64) {
+		t.Fatalf("expected MaxInt64 for uint64 json.Number on DorisBigInt, got %#v", got)
+	}
+	if got := coerceScalarForDoris(json.Number("1e25"), DorisBigInt, false, now); got != int64(math.MaxInt64) {
+		t.Fatalf("expected MaxInt64 for 1e25 json.Number on DorisBigInt, got %#v", got)
+	}
+	if got := coerceScalarForDoris("18446744073709551615", DorisBigInt, false, now); got != int64(math.MaxInt64) {
+		t.Fatalf("expected MaxInt64 for uint64 string on DorisBigInt, got %#v", got)
+	}
+	if got := coerceScalarForDoris("1e25", DorisBigInt, false, now); got != int64(math.MaxInt64) {
+		t.Fatalf("expected MaxInt64 for 1e25 string on DorisBigInt, got %#v", got)
+	}
+
+	// DorisInt 32-bit clamping
+	if got := coerceScalarForDoris(int64(5_000_000_000), DorisInt, false, now); got != int(math.MaxInt32) {
+		t.Fatalf("expected MaxInt32 for int64 overflow on DorisInt, got %#v", got)
+	}
+	if got := coerceScalarForDoris(int64(-5_000_000_000), DorisInt, false, now); got != int(math.MinInt32) {
+		t.Fatalf("expected MinInt32 for int64 underflow on DorisInt, got %#v", got)
+	}
+	if got := coerceScalarForDoris(uint64(5_000_000_000), DorisInt, false, now); got != int(math.MaxInt32) {
+		t.Fatalf("expected MaxInt32 for uint64 overflow on DorisInt, got %#v", got)
+	}
+	if got := coerceScalarForDoris(float64(5e12), DorisInt, false, now); got != int(math.MaxInt32) {
+		t.Fatalf("expected MaxInt32 for float64 overflow on DorisInt, got %#v", got)
+	}
+	if got := coerceScalarForDoris(math.Inf(1), DorisInt, false, now); got != nil {
+		t.Fatalf("expected nil for +Inf on DorisInt, got %#v", got)
+	}
+	if got := coerceScalarForDoris(json.Number("5000000000"), DorisInt, false, now); got != int(math.MaxInt32) {
+		t.Fatalf("expected MaxInt32 for json.Number overflow on DorisInt, got %#v", got)
+	}
+	if got := coerceScalarForDoris(json.Number("-5000000000"), DorisInt, false, now); got != int(math.MinInt32) {
+		t.Fatalf("expected MinInt32 for json.Number underflow on DorisInt, got %#v", got)
+	}
+	if got := coerceScalarForDoris(json.Number("42.8"), DorisInt, false, now); got != 42 {
+		t.Fatalf("expected 42 for json.Number(42.8) on DorisInt, got %#v", got)
+	}
+	if got := coerceScalarForDoris("5000000000", DorisInt, false, now); got != int(math.MaxInt32) {
+		t.Fatalf("expected MaxInt32 for string overflow on DorisInt, got %#v", got)
+	}
+	if got := coerceScalarForDoris("19.9", DorisInt, false, now); got != 19 {
+		t.Fatalf("expected 19 for string 19.9 on DorisInt, got %#v", got)
+	}
+
+	// DorisDouble & DorisBoolean (including json.Number("0.0"))
+	if got := coerceScalarForDoris(math.NaN(), DorisDouble, false, now); got != nil {
+		t.Fatalf("expected nil for NaN on DorisDouble, got %#v", got)
+	}
+	if got := coerceScalarForDoris(int64(123), DorisDouble, false, now); got != float64(123) {
+		t.Fatalf("expected 123.0 on DorisDouble, got %#v", got)
+	}
+	if got := coerceScalarForDoris(json.Number("0.0"), DorisBoolean, false, now); got != false {
+		t.Fatalf("expected false for json.Number(\"0.0\") on DorisBoolean, got %#v", got)
+	}
+	if got := coerceScalarForDoris(json.Number("1.0"), DorisBoolean, false, now); got != true {
+		t.Fatalf("expected true for json.Number(\"1.0\") on DorisBoolean, got %#v", got)
+	}
+	if got := coerceScalarForDoris("false", DorisBoolean, false, now); got != false {
+		t.Fatalf("expected false for \"false\" on DorisBoolean, got %#v", got)
+	}
+	if got := coerceScalarForDoris(0, DorisBoolean, false, now); got != false {
+		t.Fatalf("expected false for 0 on DorisBoolean, got %#v", got)
+	}
+	longUTF8 := strings.Repeat("é", 600) // 1200 UTF-8 bytes
+	truncVal, ok := coerceScalarForDoris(longUTF8, DorisVarchar, true, now).(string)
+	if !ok || len(truncVal) > 1024 {
+		t.Fatalf("expected DorisVarchar string truncated to <= 1024 bytes, got len=%d", len(truncVal))
+	}
+
+	// 2. GeneratePromoteVariantFieldDDL guards (existing promoted field, nested root, vector types)
+	sch := buildOpenMetadataTestSchema(t)
+	if ddls := GeneratePromoteVariantFieldDDL(nil, "x", "keyword"); ddls != nil {
+		t.Fatalf("expected nil DDLs for nil schema")
+	}
+	if ddls := GeneratePromoteVariantFieldDDL(sch, "", "keyword"); ddls != nil {
+		t.Fatalf("expected nil DDLs for empty field path")
+	}
+	if ddls := GeneratePromoteVariantFieldDDL(sch, "name", "keyword"); ddls != nil {
+		t.Fatalf("expected nil DDLs for already-promoted field 'name'")
+	}
+	if ddls := GeneratePromoteVariantFieldDDL(sch, "columns.name", "keyword"); ddls != nil {
+		t.Fatalf("expected nil DDLs for nested subfield 'columns.name'")
+	}
+	if ddls := GeneratePromoteVariantFieldDDL(sch, "dyn_vec", "dense_vector"); ddls != nil {
+		t.Fatalf("expected nil DDLs for dense_vector promotion")
+	}
+	if ddls := GeneratePromoteVariantFieldDDL(sch, "dyn_tags", "array"); len(ddls) != 2 || !strings.Contains(ddls[0], "ARRAY<STRING>") {
+		t.Fatalf("expected ARRAY<STRING> DDL for array promotion, got %v", ddls)
+	}
+
+	// 3. EffectiveArrayColumn(preferKeyword) with KeywordNormalizer
+	b := FieldBinding{
+		ESFieldPath:       "items.title",
+		Kind:              StorageNestedSubfield,
+		ColumnName:        "n__items__title",
+		PrefilterArrayCol: "n__items__title",
+		KeywordCompanion:  "n__items__title__keyword",
+		KeywordNormalizer: true,
+	}
+	if got := b.EffectiveArrayColumn(false); got != "n__items__title" {
+		t.Fatalf("EffectiveArrayColumn(false) = %q, want \"n__items__title\"", got)
+	}
+	if got := b.EffectiveArrayColumn(true); got != "n__items__title__keyword" {
+		t.Fatalf("EffectiveArrayColumn(true) = %q, want \"n__items__title__keyword\"", got)
+	}
+
+	// 4. InferMappingFromSampleDocs & MergeMappingSpecs
+	inferred := InferMappingFromSampleDocs([]json.RawMessage{
+		json.RawMessage(`{
+			"ts": "2026-10-25T12:00:00Z",
+			"client_ip": "192.168.1.10",
+			"price": 19.99,
+			"qty": 5,
+			"active": true,
+			"title": "Quick brown fox jumps over lazy dog",
+			"code": "ABC-123",
+			"tags": ["alpha", "beta"],
+			"items": [{"sku": "S1", "cost": 10.5}]
+		}`),
+	})
+	if inferred == nil || len(inferred.Properties) == 0 {
+		t.Fatalf("expected non-empty inferred mapping")
+	}
+	merged := MergeMappingSpecs(inferred, sch.RawMapping)
+	if merged == nil || len(merged.Properties) < len(inferred.Properties) {
+		t.Fatalf("unexpected MergeMappingSpecs result")
+	}
 }

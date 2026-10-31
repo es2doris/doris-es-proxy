@@ -466,11 +466,29 @@ func coerceScalarForDoris(val any, dorisType DorisScalarType, lowercase bool, no
 			return nil
 		}
 	case DorisInt:
+		clamp32 := func(i int64) int {
+			if i > int64(math.MaxInt32) {
+				return int(math.MaxInt32)
+			}
+			if i < int64(math.MinInt32) {
+				return int(math.MinInt32)
+			}
+			return int(i)
+		}
+		clampFloat32 := func(f float64) int {
+			if f >= float64(math.MaxInt32) {
+				return int(math.MaxInt32)
+			}
+			if f <= float64(math.MinInt32) {
+				return int(math.MinInt32)
+			}
+			return int(f)
+		}
 		switch v := val.(type) {
 		case int:
-			return v
+			return clamp32(int64(v))
 		case int64:
-			return int(v)
+			return clamp32(v)
 		case uint64:
 			if v > uint64(math.MaxInt32) {
 				return int(math.MaxInt32)
@@ -480,22 +498,34 @@ func coerceScalarForDoris(val any, dorisType DorisScalarType, lowercase bool, no
 			if math.IsNaN(v) || math.IsInf(v, 0) {
 				return nil
 			}
-			return int(v)
+			return clampFloat32(v)
 		case json.Number:
 			if i, err := v.Int64(); err == nil {
-				return int(i)
+				return clamp32(i)
+			}
+			if u, err := strconv.ParseUint(v.String(), 10, 64); err == nil {
+				if u > uint64(math.MaxInt32) {
+					return int(math.MaxInt32)
+				}
+				return int(u)
 			}
 			if f, err := v.Float64(); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
-				return int(f)
+				return clampFloat32(f)
 			}
 			return nil
 		case string:
 			trimmed := strings.TrimSpace(v)
-			if i, err := strconv.Atoi(trimmed); err == nil {
-				return i
+			if i, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+				return clamp32(i)
+			}
+			if u, err := strconv.ParseUint(trimmed, 10, 64); err == nil {
+				if u > uint64(math.MaxInt32) {
+					return int(math.MaxInt32)
+				}
+				return int(u)
 			}
 			if f, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
-				return int(f)
+				return clampFloat32(f)
 			}
 			return nil
 		default:
@@ -536,7 +566,10 @@ func coerceScalarForDoris(val any, dorisType DorisScalarType, lowercase bool, no
 		case float64:
 			return v != 0 && !math.IsNaN(v)
 		case json.Number:
-			return v.String() != "0"
+			if f, err := v.Float64(); err == nil {
+				return f != 0 && !math.IsNaN(f)
+			}
+			return v.String() != "0" && v.String() != ""
 		case string:
 			switch strings.ToLower(strings.TrimSpace(v)) {
 			case "true", "1":

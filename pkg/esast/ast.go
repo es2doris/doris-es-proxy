@@ -158,7 +158,7 @@ func (r *SearchRequest) EffectiveFieldSpecs() []FieldRequestSpec {
 	return out
 }
 
-// ShouldTrackTotalHits returns false only when TrackTotalHits is explicitly disabled (`false` or `0`).
+// ShouldTrackTotalHits returns false only when TrackTotalHits is explicitly disabled (`false` or `<= 0`).
 func (r *SearchRequest) ShouldTrackTotalHits() bool {
 	if r == nil || r.TrackTotalHits == nil {
 		return true
@@ -167,7 +167,17 @@ func (r *SearchRequest) ShouldTrackTotalHits() bool {
 	case bool:
 		return v
 	case string:
-		return !strings.EqualFold(strings.TrimSpace(v), "false") && strings.TrimSpace(v) != "0"
+		trimmed := strings.TrimSpace(v)
+		if strings.EqualFold(trimmed, "false") {
+			return false
+		}
+		if strings.EqualFold(trimmed, "true") {
+			return true
+		}
+		if f, err := strconv.ParseFloat(trimmed, 64); err == nil {
+			return f > 0
+		}
+		return true
 	case int:
 		return v > 0
 	case int64:
@@ -177,6 +187,9 @@ func (r *SearchRequest) ShouldTrackTotalHits() bool {
 	case json.Number:
 		if n, err := v.Int64(); err == nil {
 			return n > 0
+		}
+		if f, err := v.Float64(); err == nil {
+			return f > 0
 		}
 	}
 	return true
@@ -1861,6 +1874,14 @@ func (s SortSpec) MarshalJSON() ([]byte, error) {
 		if geoMap, ok := s.Entry.Script.(map[string]any); ok {
 			return json.Marshal(map[string]any{"_geo_distance": geoMap})
 		}
+		inner := map[string]any{"order": order}
+		if s.Entry.Mode != "" {
+			inner["mode"] = s.Entry.Mode
+		}
+		if s.Entry.Missing != "" {
+			inner["missing"] = s.Entry.Missing
+		}
+		return json.Marshal(map[string]any{"_geo_distance": inner})
 	}
 	if s.Entry.Mode != "" || s.Entry.Missing != "" || s.Entry.Nested != nil || s.Entry.Type != "" {
 		inner := map[string]any{"order": order}
@@ -1996,6 +2017,34 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 		}
 		missing := ""
 		mode := ""
+		sortType := ""
+		if rawOrd, hasOrd := m["order"]; hasOrd && field != "order" {
+			var ordStr string
+			if json.Unmarshal(rawOrd, &ordStr) == nil && ordStr != "" {
+				order = ordStr
+			}
+		}
+		if rawMode, hasMode := m["mode"]; hasMode && field != "mode" {
+			_ = json.Unmarshal(rawMode, &mode)
+		}
+		if rawMissing, hasMissing := m["missing"]; hasMissing && field != "missing" {
+			var mv any
+			if json.Unmarshal(rawMissing, &mv) == nil && mv != nil {
+				if fv, ok := mv.(float64); ok && fv == math.Trunc(fv) && !math.IsInf(fv, 0) && !math.IsNaN(fv) {
+					missing = strconv.FormatInt(int64(fv), 10)
+				} else {
+					missing = fmt.Sprintf("%v", mv)
+				}
+			}
+		}
+		if rawUT, hasUT := m["unmapped_type"]; hasUT && field != "unmapped_type" {
+			_ = json.Unmarshal(rawUT, &sortType)
+		}
+		if sortType == "" {
+			if rawNT, hasNT := m["numeric_type"]; hasNT && field != "numeric_type" {
+				_ = json.Unmarshal(rawNT, &sortType)
+			}
+		}
 		var nestedSpec *NestedSortSpec
 		if rawNested, hasNested := m["nested"]; hasNested {
 			var ns NestedSortSpec
@@ -2052,14 +2101,15 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 			} else if obj.NestedPath != "" || obj.NestedFilter != nil {
 				nestedSpec = &NestedSortSpec{Path: obj.NestedPath, Filter: obj.NestedFilter}
 			}
-			sortType := obj.UnmappedType
-			if sortType == "" {
+			if obj.UnmappedType != "" {
+				sortType = obj.UnmappedType
+			} else if obj.NumericType != "" {
 				sortType = obj.NumericType
 			}
 			s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Type: strings.ToLower(sortType), Nested: nestedSpec}
 			return nil
 		}
-		s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Nested: nestedSpec}
+		s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Type: strings.ToLower(sortType), Nested: nestedSpec}
 	}
 	return nil
 }
