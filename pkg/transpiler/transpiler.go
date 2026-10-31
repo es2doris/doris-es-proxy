@@ -338,9 +338,13 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 			quoted = append(quoted, quoteStr(id))
 		}
 		pred := fmt.Sprintf("`_id` IN (%s)", strings.Join(quoted, ", "))
-		score := "1.0"
+		boost := 1.0
+		if q.Ids.Boost != nil {
+			boost = *q.Ids.Boost
+		}
+		score := fmt.Sprintf("%.4f", boost)
 		if scoring {
-			score = fmt.Sprintf("(CASE WHEN %s THEN 1.0000 ELSE 0.0 END)", pred)
+			score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", pred, boost)
 		}
 		return CompiledQuery{
 			WhereSQL:     pred,
@@ -505,7 +509,7 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		usesFT := false
 		boost := 1.0
 		compileSingleRegexp := func(field string, re esast.RegexpEntry) (string, string, bool) {
-			b := t.Schema.ResolveEffectiveField(field, true)
+			field, b := t.resolveFieldInNestedCtx(field, true, nctx)
 			if b.Kind == schema.StoragePromotedVector {
 				return "FALSE", "FALSE", false
 			}
@@ -666,7 +670,7 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 				for i := 0; i < len(tokens)-1; i++ {
 					shoulds = append(shoulds, esast.Query{
 						Match: map[string]esast.MatchEntry{
-							keys[0]: {Query: tokens[i], Operator: "or", Boost: 1.0},
+							keys[0]: {Query: tokens[i], Operator: "or", Fuzziness: pe.Fuzziness, Boost: 1.0},
 						},
 					})
 				}
@@ -1620,6 +1624,7 @@ func (t *Transpiler) compileMultiMatch(mm *esast.MultiMatchQuery, scoring bool, 
 						Query:              qStr,
 						Operator:           op,
 						MinimumShouldMatch: mm.MinimumShouldMatch,
+						Fuzziness:          mm.Fuzziness,
 						Boost:              bf.Boost,
 					},
 				},
@@ -2541,7 +2546,7 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 						if ms, ok := schema.ParseESDateBoundToEpochMillis(strVal, now, roundUp); ok {
 							return time.UnixMilli(ms).UTC().Format(time.RFC3339)
 						}
-					} else if strings.ContainsAny(trimmed, "Tt") && !roundUp {
+					} else if strings.ContainsAny(trimmed, "Tt") {
 						return v
 					}
 				}
@@ -5732,6 +5737,9 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 			}
 			subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, corrCol, ntAlias, nelAlias)
 			subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, nelAlias)
+			if nctx != nil && strings.HasPrefix(subSpec.Nested.Path, nctx.nestedPath+".") {
+				subWhere = fmt.Sprintf("(%s) AND json_extract_string(%s, '$._parent_id') = json_extract_string(%s, '$._nested_id')", subWhere, nelAlias, nctx.elemVar)
+			}
 			*branches = append(*branches, fmt.Sprintf(
 				"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(%s) AS DOUBLE) AS `_doc_count` "+
 					"FROM %s WHERE %s GROUP BY `_bucket_key`",
@@ -7376,7 +7384,11 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 }
 
 func (t *Transpiler) sqlSortColumnRefWithType(field string, sampleVal any, desc bool, mode string, nested *esast.NestedSortSpec, effType string) string {
-	b := t.Schema.ResolveEffectiveField(field, true)
+	var sortNCtx *nestedCtx
+	if nested != nil && nested.Path != "" {
+		sortNCtx = &nestedCtx{nestedPath: nested.Path}
+	}
+	field, b := t.resolveFieldInNestedCtx(field, true, sortNCtx)
 	if effType == "" {
 		effType = b.ESType
 	}
@@ -7435,14 +7447,7 @@ func (t *Transpiler) sqlSortColumnRefWithType(field string, sampleVal any, desc 
 				corrCol = "n__" + schema.SanitizeDorisIdentifier(nestedPath)
 			}
 			fCompiled := t.CompileQuery(nested.Filter, false, &nestedCtx{nestedPath: nestedPath, elemVar: "_el"})
-			effField := field
-			if b.AliasTarget != "" {
-				effField = b.AliasTarget
-			}
-			relPath := "$." + strings.TrimSuffix(strings.TrimPrefix(effField, nestedPath+"."), ".keyword")
-			if len(b.RelativeJSONPath) > 0 {
-				relPath = "$." + strings.Join(b.RelativeJSONPath, ".")
-			}
+			relPath := t.nestedRelativeJSONPath(field, true, nestedPath)
 			filteredArr := fmt.Sprintf("array_map(_el -> json_extract_string(_el, %s), array_filter(_el -> %s, `%s`))", quoteStr(relPath), fCompiled.WhereSQL, corrCol)
 			return formatArraySortExpr(filteredArr)
 		}
@@ -7464,7 +7469,7 @@ func (t *Transpiler) sqlColumnRef(field string, preferKeyword bool, nctx *nested
 }
 
 func (t *Transpiler) sqlNumericColumnRef(field string, nctx *nestedCtx) string {
-	b := t.Schema.ResolveEffectiveField(field, true)
+	field, b := t.resolveFieldInNestedCtx(field, true, nctx)
 	switch b.Kind {
 	case schema.StoragePromotedScalar:
 		if b.DorisType == schema.DorisBigInt || b.DorisType == schema.DorisInt || b.DorisType == schema.DorisDouble {
@@ -7482,11 +7487,11 @@ func (t *Transpiler) sqlNumericColumnRef(field string, nctx *nestedCtx) string {
 }
 
 func (t *Transpiler) nestedRelativeJSONPath(field string, preferKeyword bool, nestedPath string) string {
-	b := t.Schema.ResolveEffectiveField(field, preferKeyword)
-	effField := field
+	resolvedField, b := t.resolveFieldInNestedCtx(field, preferKeyword, &nestedCtx{nestedPath: nestedPath})
+	effField := resolvedField
 	if b.AliasTarget != "" {
 		effField = b.AliasTarget
-		if strings.HasSuffix(field, ".keyword") && !strings.HasSuffix(effField, ".keyword") {
+		if strings.HasSuffix(resolvedField, ".keyword") && !strings.HasSuffix(effField, ".keyword") {
 			effField += ".keyword"
 		}
 	}

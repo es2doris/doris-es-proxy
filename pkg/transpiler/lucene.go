@@ -125,7 +125,7 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 		compiled.ScoreSQL = fmt.Sprintf("((%s) * %.4f)", compiled.ScoreSQL, *qsq.Boost)
 	}
 	if !isSimple && flags.quoteFieldSuffix == "" {
-		if rewrittenRaw, ok := t.rewriteDoris4SearchQuery(raw); ok && t.Opts.UseDoris4SearchFunc && nctx == nil && qsq.MinimumShouldMatch == nil && defaultField != "__unmatched_wildcard__" && !strings.ContainsAny(raw, "[{><~/^") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, "`n__") {
+		if rewrittenRaw, ok := t.rewriteDoris4SearchQuery(raw); ok && t.Opts.UseDoris4SearchFunc && nctx == nil && qsq.MinimumShouldMatch == nil && defaultField != "__unmatched_wildcard__" && !strings.ContainsAny(raw, "[{><~/^") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, "`n__") && !strings.Contains(compiled.WhereSQL, " IS NOT NULL") && !strings.Contains(compiled.WhereSQL, "array_size(") {
 			if len(expandedFields) > 1 {
 				if canEmitMultiFieldDoris4SearchDisjunction(rewrittenRaw, defaultOp) {
 					var searchPreds []string
@@ -787,6 +787,22 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			}
 		}
 		if rc := parseLuceneRangeToken(val, boost); rc != nil {
+			if rc.GTE == nil && rc.GT == nil && rc.LTE == nil && rc.LT == nil {
+				if field == "*" {
+					if boost != 1.0 {
+						b := boost
+						return esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: esast.Query{MatchAll: map[string]any{}}, Boost: &b}}
+					}
+					return esast.Query{MatchAll: map[string]any{}}
+				}
+				if !strings.ContainsAny(field, "*?") {
+					if boost != 1.0 {
+						b := boost
+						return esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: esast.Query{Exists: &esast.ExistsQuery{Field: field}}, Boost: &b}}
+					}
+					return esast.Query{Exists: &esast.ExistsQuery{Field: field}}
+				}
+			}
 			return esast.Query{
 				Range: map[string]esast.RangeCond{field: *rc},
 			}
@@ -846,6 +862,22 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			}
 		}
 		if !isQuoted && hasUnescapedLuceneWildcard(rawWild) {
+			if rawWild == "*" {
+				if field == "*" {
+					if boost != 1.0 {
+						b := boost
+						return esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: esast.Query{MatchAll: map[string]any{}}, Boost: &b}}
+					}
+					return esast.Query{MatchAll: map[string]any{}}
+				}
+				if !strings.ContainsAny(field, "*?") {
+					if boost != 1.0 {
+						b := boost
+						return esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: esast.Query{Exists: &esast.ExistsQuery{Field: field}}, Boost: &b}}
+					}
+					return esast.Query{Exists: &esast.ExistsQuery{Field: field}}
+				}
+			}
 			return esast.Query{
 				Wildcard: map[string]esast.WildcardEntry{
 					field: {Value: rawWild, CaseInsensitive: true, Boost: boost},

@@ -614,3 +614,47 @@ func TestPainlessRound28ComprehensiveCoverage(t *testing.T) {
 		t.Fatalf("expected infinite while loop to fail with step budget error")
 	}
 }
+
+func TestRound29PainlessShiftCompoundAssignGenericTypesAndNullVarDecl(t *testing.T) {
+	// 1. Compound shift assignments as final statement and inside scripts
+	out, err := Eval(map[string]any{}, `
+		int a = 4;
+		a <<= 2;
+		int b = 32;
+		b >>= 2;
+		int c = 64;
+		c >>>= 3;
+		return a + b + c;
+	`, nil)
+	if err != nil || out != int64(32) {
+		t.Fatalf("expected a(16)+b(8)+c(8) == 32, got %v (err=%v)", out, err)
+	}
+	// Ensure a trailing compound shift assignment is recognized as an assignment statement
+	if !isTopLevelAssignmentStmt("x <<= 2") || !isTopLevelAssignmentStmt("x >>= 1") || !isTopLevelAssignmentStmt("x >>>= 1") {
+		t.Fatalf("expected <<= / >>= / >>>= to be classified as top-level assignment statements")
+	}
+	if isTopLevelAssignmentStmt("x <= 2") || isTopLevelAssignmentStmt("x >= 2") || isTopLevelAssignmentStmt("x == 2") || isTopLevelAssignmentStmt("x != 2") {
+		t.Fatalf("expected <= / >= / == / != not to be classified as top-level assignment statements")
+	}
+
+	// 2. Generic type arguments (List<String>, Map<String, Object>), array types (String[]), and uninitialized declarations (def res; String label;)
+	genOut, err := Eval(map[string]any{}, `
+		List<String> items = ['alpha', 'beta'];
+		Map<String, Object> meta = ['k1': 10, 'k2': 20];
+		String[] parts = 'a,b,c'.split(',');
+		String chosen;
+		int total = 0;
+		for (Map.Entry<String, Object> entry : meta.entrySet()) {
+			total += entry.getValue();
+		}
+		for (String item : items) {
+			if (item == 'beta') {
+				chosen = item;
+			}
+		}
+		return chosen + ':' + total + ':' + parts.length;
+	`, nil)
+	if err != nil || genOut != "beta:30:3" {
+		t.Fatalf("expected generic/array/uninitialized script to return 'beta:30:3', got %v (err=%v)", genOut, err)
+	}
+}

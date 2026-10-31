@@ -469,3 +469,93 @@ func TestSchemaRound28ComprehensiveCoverage(t *testing.T) {
 		t.Fatalf("unexpected MergeMappingSpecs result")
 	}
 }
+
+func TestRound29SchemaPromoteVariantNestedRootGuardNilResolveAndShredIgnoreAbove(t *testing.T) {
+	rawMap := `{
+		"properties": {
+			"code": {"type": "keyword", "ignore_above": 5, "copy_to": "summary"},
+			"summary": {
+				"type": "text",
+				"fields": {
+					"keyword": {"type": "keyword", "ignore_above": 6, "normalizer": "lowercase"}
+				}
+			},
+			"items": {
+				"type": "nested",
+				"properties": {
+					"sku": {"type": "keyword", "ignore_above": 4, "normalizer": "lowercase"},
+					"name": {"type": "text"}
+				}
+			}
+		}
+	}`
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(rawMap), &spec); err != nil {
+		t.Fatalf("unmarshal mapping failed: %v", err)
+	}
+	sch := CompileIndexSchema("db", "r29_idx", &spec)
+
+	// 1. GeneratePromoteVariantFieldDDL must block nested root ("items") and nested subpaths ("items.extra")
+	if ddls := GeneratePromoteVariantFieldDDL(sch, "items", "keyword"); len(ddls) != 0 {
+		t.Fatalf("expected nil DDL when promoting nested root 'items', got %v", ddls)
+	}
+	if ddls := GeneratePromoteVariantFieldDDL(sch, "items.extra", "keyword"); len(ddls) != 0 {
+		t.Fatalf("expected nil DDL when promoting nested subpath 'items.extra', got %v", ddls)
+	}
+
+	// 2. Nil receiver guard on ResolveField
+	var nilSchema *IndexSchema
+	nilBinding := nilSchema.ResolveField("dyn.field.keyword")
+	if nilBinding.Kind != StorageDynamicVariant || len(nilBinding.SourceJSONPath) != 2 {
+		t.Fatalf("expected nil IndexSchema.ResolveField to return StorageDynamicVariant, got %+v", nilBinding)
+	}
+
+	// 3. ShredDocument: numeric scalar exceeding ignore_above on keyword column & scalar .keyword companion copy_to
+	shredBytes, err := ShredDocument(sch, "doc1", 1, false, json.RawMessage(`{
+		"code": 1234567,
+		"items": [
+			{"sku": 98765, "name": "TooLongSku"},
+			{"sku": "AB12", "name": "ValidSku"}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("ShredDocument failed: %v", err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(shredBytes, &row); err != nil {
+		t.Fatalf("unmarshal shredded row failed: %v", err)
+	}
+	if _, exists := row["f__code"]; exists {
+		t.Fatalf("expected numeric code 1234567 (7 chars > ignore_above 5) to be omitted from f__code, got %v", row["f__code"])
+	}
+	// Now test copy_to where source ignore_above is not exceeded, or test direct copy_to into summary.keyword
+	rawMap2 := `{
+		"properties": {
+			"tag": {"type": "keyword", "copy_to": "summary"},
+			"summary": {
+				"type": "text",
+				"fields": {
+					"keyword": {"type": "keyword", "ignore_above": 5, "normalizer": "lowercase"}
+				}
+			}
+		}
+	}`
+	var spec2 esast.MappingSpec
+	_ = json.Unmarshal([]byte(rawMap2), &spec2)
+	sch2 := CompileIndexSchema("db", "r29_idx2", &spec2)
+	shredBytes2, err := ShredDocument(sch2, "doc2", 1, false, json.RawMessage(`{"tag": "TOOLONGVAL"}`))
+	if err != nil {
+		t.Fatalf("ShredDocument 2 failed: %v", err)
+	}
+	var row2 map[string]any
+	_ = json.Unmarshal(shredBytes2, &row2)
+	if kwVal, hasKw := row2["f__summary__keyword"]; hasKw && kwVal != nil && kwVal != "" {
+		t.Fatalf("expected summary.keyword ignore_above=5 to skip 'TOOLONGVAL', got %v", kwVal)
+	}
+
+	// 4. GenerateAddColumnsDDL & GeneratePromoteVariantFieldDDL
+	promoteDDLs := GeneratePromoteVariantFieldDDL(sch2, "new_dyn_str", "text")
+	if len(promoteDDLs) < 2 {
+		t.Fatalf("expected GeneratePromoteVariantFieldDDL for text to include companion .keyword, got %v", promoteDDLs)
+	}
+}

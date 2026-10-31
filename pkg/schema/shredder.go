@@ -107,8 +107,13 @@ func ShredDocument(
 			if val == nil && b.NullValue != nil && hasExplicitNullAtPath(parsedDoc, b.SourceJSONPath) {
 				val = b.NullValue
 			}
-			if b.IgnoreAbove > 0 {
-				if str, ok := val.(string); ok && len([]rune(str)) > b.IgnoreAbove {
+			if b.IgnoreAbove > 0 && val != nil {
+				str, ok := val.(string)
+				if !ok && (b.ESType == "keyword" || b.ESType == "constant_keyword" || b.ESType == "wildcard" || b.DorisType == DorisVarchar) {
+					str = fmt.Sprintf("%v", val)
+					ok = true
+				}
+				if ok && len([]rune(str)) > b.IgnoreAbove {
 					val = nil
 				}
 			}
@@ -254,7 +259,8 @@ func ShredDocument(
 						}
 					}
 					if tb.KeywordCompanion != "" {
-						if kwB, hasKw := s.Fields[targetField+".keyword"]; hasKw && kwB.Kind == StoragePromotedArray {
+						kwB, hasKw := s.Fields[targetField+".keyword"]
+						if hasKw && kwB.Kind == StoragePromotedArray {
 							var curKw []string
 							if existing, ok := row[tb.KeywordCompanion].([]string); ok {
 								curKw = append(curKw, existing...)
@@ -272,14 +278,23 @@ func ShredDocument(
 								row[tb.KeywordCompanion] = curKw
 							}
 						} else {
-							kwVal := strings.Join(srcVals, " ")
-							if tb.KeywordNormalizer {
-								kwVal = strings.ToLower(kwVal)
+							var filteredKw []string
+							for _, sv := range srcVals {
+								if hasKw && kwB.IgnoreAbove > 0 && len([]rune(sv)) > kwB.IgnoreAbove {
+									continue
+								}
+								if tb.KeywordNormalizer || (hasKw && kwB.LowercaseNormalizer) {
+									sv = strings.ToLower(sv)
+								}
+								filteredKw = append(filteredKw, sv)
 							}
-							if existing, exists := row[tb.KeywordCompanion]; exists && existing != nil {
-								row[tb.KeywordCompanion] = fmt.Sprintf("%v %s", existing, kwVal)
-							} else {
-								row[tb.KeywordCompanion] = kwVal
+							if len(filteredKw) > 0 {
+								kwVal := strings.Join(filteredKw, " ")
+								if existing, exists := row[tb.KeywordCompanion]; exists && existing != nil {
+									row[tb.KeywordCompanion] = fmt.Sprintf("%v %s", existing, kwVal)
+								} else {
+									row[tb.KeywordCompanion] = kwVal
+								}
 							}
 						}
 					}
@@ -1355,7 +1370,12 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 		return out
 	}
 	if b.IgnoreAbove > 0 {
-		if str, ok := val.(string); ok && len([]rune(str)) > b.IgnoreAbove {
+		str, ok := val.(string)
+		if !ok && (b.ESType == "keyword" || b.ESType == "constant_keyword" || b.ESType == "wildcard" || b.DorisType == DorisVarchar) {
+			str = fmt.Sprintf("%v", val)
+			ok = true
+		}
+		if ok && len([]rune(str)) > b.IgnoreAbove {
 			return nil
 		}
 	}
@@ -1380,6 +1400,8 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 	} else if b.LowercaseNormalizer {
 		if str, ok := val.(string); ok {
 			return strings.ToLower(str)
+		} else if b.ESType == "keyword" || b.ESType == "constant_keyword" || b.ESType == "wildcard" || b.DorisType == DorisVarchar {
+			return strings.ToLower(fmt.Sprintf("%v", val))
 		}
 	}
 	return val

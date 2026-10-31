@@ -3129,6 +3129,10 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if found && aliasFilter != nil && (existingHit == nil || !s.docMatchesAliasFilter(r.Context(), indexName, docID, existingHit.Source, aliasFilter)) {
+		if updReq.DocAsUpsert || updReq.Upsert != nil || updReq.ScriptedUpsert {
+			writeESError(w, http.StatusConflict, "version_conflict_engine_exception", fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", docID))
+			return
+		}
 		writeESError(w, http.StatusNotFound, "document_missing_exception", fmt.Sprintf("[%s]: document missing", docID))
 		return
 	}
@@ -4107,6 +4111,17 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			existingHit, found := existingByIndex[targetIndex][op.ID]
 			if found && opAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), targetIndex, op.ID, existingHit.Source, opAliasFilter) {
 				hasErrors = true
+				if upd.DocAsUpsert || upd.Upsert != nil || upd.ScriptedUpsert {
+					items = append(items, map[string]any{
+						op.Action: map[string]any{
+							"_index": targetIndex,
+							"_id":    op.ID,
+							"status": http.StatusConflict,
+							"error":  map[string]any{"type": "version_conflict_engine_exception", "reason": fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", op.ID)},
+						},
+					})
+					continue
+				}
 				items = append(items, map[string]any{
 					op.Action: map[string]any{
 						"_index": targetIndex,
@@ -4229,10 +4244,32 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 					if op.ID != origOpID || targetIndex != origTargetIndex {
-						if destExisting, destOK := existingByIndex[targetIndex][op.ID]; destOK && destExisting.Version+1 > minFloor {
-							minFloor = destExisting.Version + 1
-						} else if destHit, destFound, dErr := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, op.ID); dErr == nil && destFound && destHit != nil && destHit.Version+1 > minFloor {
-							minFloor = destHit.Version + 1
+						var destSrc json.RawMessage
+						hasDest := false
+						if destExisting, destOK := existingByIndex[targetIndex][op.ID]; destOK {
+							hasDest = true
+							destSrc = destExisting.Source
+							if destExisting.Version+1 > minFloor {
+								minFloor = destExisting.Version + 1
+							}
+						} else if destHit, destFound, dErr := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, op.ID); dErr == nil && destFound && destHit != nil {
+							hasDest = true
+							destSrc = destHit.Source
+							if destHit.Version+1 > minFloor {
+								minFloor = destHit.Version + 1
+							}
+						}
+						if hasDest && opAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), targetIndex, op.ID, destSrc, opAliasFilter) {
+							hasErrors = true
+							items = append(items, map[string]any{
+								op.Action: map[string]any{
+									"_index": targetIndex,
+									"_id":    op.ID,
+									"status": http.StatusConflict,
+									"error":  map[string]any{"type": "version_conflict_engine_exception", "reason": fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", op.ID)},
+								},
+							})
+							continue
 						}
 						if lastVer, okLV := lastVerByIndex[targetIndex][op.ID]; okLV && lastVer+1 > minFloor {
 							minFloor = lastVer + 1
@@ -6593,6 +6630,7 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 					if docForIH == nil {
 						docForIH = make(map[string]any)
 					}
+					docForIH["__meta_id"] = h.ID
 				})
 				return docForIH
 			}
@@ -8257,7 +8295,6 @@ func buildAggsMap(
 				}
 				if len(subAggs) > 0 {
 					attachSubAggsToBucket(indexName, bucketMap, fullKey, r.BucketKey, subAggs, bucketsByAgg, docLookup)
-					scaleBucketRates(bucketMap, subAggs, &spec)
 					evaluateSiblingPipelineAggs(subAggs, bucketMap)
 				}
 				b = append(b, bucketMap)
@@ -8288,7 +8325,6 @@ func buildAggsMap(
 				}
 				if len(subAggs) > 0 {
 					attachSubAggsToBucket(indexName, bucketMap, fullKey, r.BucketKey, subAggs, bucketsByAgg, docLookup)
-					scaleBucketRates(bucketMap, subAggs, &spec)
 					evaluateSiblingPipelineAggs(subAggs, bucketMap)
 				}
 				b = append(b, bucketMap)
@@ -8703,59 +8739,6 @@ func rateScaleFactor(rateSpec *esast.RateAggSpec, histSpec *esast.AggSpec) float
 		return 1.0 / histSpec.Histogram.Interval
 	}
 	return 1.0
-}
-
-func scaleBucketRates(bucketMap map[string]any, subAggs map[string]esast.AggSpec, histSpec *esast.AggSpec) {
-	if bucketMap == nil || len(subAggs) == 0 || histSpec == nil {
-		return
-	}
-	for subName, subSpec := range subAggs {
-		subMap, ok := bucketMap[subName].(map[string]any)
-		if !ok {
-			continue
-		}
-		if subSpec.Rate != nil {
-			continue
-		}
-		if grandSubAggs := subSpec.SubAggs(); len(grandSubAggs) > 0 {
-			if childBuckets, okB := subMap["buckets"].([]map[string]any); okB {
-				for _, cb := range childBuckets {
-					scaleBucketRates(cb, grandSubAggs, histSpec)
-					evaluateSiblingPipelineAggs(grandSubAggs, cb)
-				}
-				subMap["buckets"] = evaluateChildPipelineAggs(childBuckets, grandSubAggs)
-			} else if keyedBuckets, okK := subMap["buckets"].(map[string]any); okK {
-				keys := make([]string, 0, len(keyedBuckets))
-				for k := range keyedBuckets {
-					keys = append(keys, k)
-				}
-				sort.Strings(keys)
-				ordered := make([]map[string]any, 0, len(keys))
-				for _, k := range keys {
-					if cb, okCB := keyedBuckets[k].(map[string]any); okCB {
-						scaleBucketRates(cb, grandSubAggs, histSpec)
-						evaluateSiblingPipelineAggs(grandSubAggs, cb)
-						cb["__keyed_map_key"] = k
-						ordered = append(ordered, cb)
-					}
-				}
-				filtered := evaluateChildPipelineAggs(ordered, grandSubAggs)
-				newKeyed := make(map[string]any, len(filtered))
-				for _, cb := range filtered {
-					k, _ := cb["__keyed_map_key"].(string)
-					delete(cb, "__keyed_map_key")
-					if k != "" {
-						newKeyed[k] = cb
-					}
-				}
-				subMap["buckets"] = newKeyed
-			} else {
-				scaleBucketRates(subMap, grandSubAggs, histSpec)
-				evaluateSiblingPipelineAggs(grandSubAggs, subMap)
-				_ = evaluateChildPipelineAggs([]map[string]any{subMap}, grandSubAggs)
-			}
-		}
-	}
 }
 
 func buildStatsAggObject(rows []AggRow, extSpec *esast.MetricAggSpec) map[string]any {
@@ -9175,6 +9158,8 @@ func filterAndSortTermsRows(
 					}
 					if asCount {
 						m[k] = float64(sr.effectiveCount())
+					} else if sr.Weight < 0 {
+						continue
 					} else if prop != "" && prop != "value" && prop != "_count" && prop != "doc_count" {
 						if _, rv, _, okSM := parseScriptedMetricBucketKey(sr.BucketKey); okSM {
 							if rvMap, okM := rv.(map[string]any); okM {
@@ -9300,8 +9285,12 @@ func filterAndSortTermsRows(
 						return ci < cj
 					}
 				default:
-					vi, vj := c.metricByKey[cpRows[i].BucketKey], c.metricByKey[cpRows[j].BucketKey]
-					if vi != vj {
+					vi, okI := c.metricByKey[cpRows[i].BucketKey]
+					vj, okJ := c.metricByKey[cpRows[j].BucketKey]
+					if okI != okJ {
+						return okI
+					}
+					if okI && vi != vj {
 						if c.desc {
 							return vi > vj
 						}
@@ -12128,7 +12117,6 @@ func attachSubAggsToBucket(
 				}
 				if len(grandSubAggs) > 0 {
 					attachSubAggsToBucket(indexName, cb, subFullKey, parentBucketKey+"\x1f"+r.BucketKey, grandSubAggs, bucketsByAgg, docLookup)
-					scaleBucketRates(cb, grandSubAggs, &subSpec)
 					evaluateSiblingPipelineAggs(grandSubAggs, cb)
 				}
 				childBuckets = append(childBuckets, cb)
@@ -12167,7 +12155,6 @@ func attachSubAggsToBucket(
 				}
 				if len(grandSubAggs) > 0 {
 					attachSubAggsToBucket(indexName, cb, subFullKey, parentBucketKey+"\x1f"+r.BucketKey, grandSubAggs, bucketsByAgg, docLookup)
-					scaleBucketRates(cb, grandSubAggs, &subSpec)
 					evaluateSiblingPipelineAggs(grandSubAggs, cb)
 				}
 				childBuckets = append(childBuckets, cb)
@@ -15432,7 +15419,20 @@ func aggSpecHasDirectRuntimeScript(spec esast.AggSpec) bool {
 	if spec.ScriptedMetric != nil {
 		return true
 	}
+	if reverseNestedPath(spec.ReverseNested) != "" {
+		return true
+	}
 	return false
+}
+
+func reverseNestedPath(rn map[string]any) string {
+	if rn == nil {
+		return ""
+	}
+	if p, ok := rn["path"].(string); ok {
+		return strings.TrimSpace(p)
+	}
+	return ""
 }
 
 func aggsHaveRuntimeScript(aggs map[string]esast.AggSpec) bool {
@@ -15601,16 +15601,38 @@ func resolveRuntimeEvalSchema(idxSchema *schema.IndexSchema, doc map[string]any,
 	return effSchema
 }
 
+func marshalDocAndExtractEvalID(doc map[string]any, defaultID string) ([]byte, string, error) {
+	docID := defaultID
+	if doc != nil {
+		if idStr, ok := doc["__meta_id"].(string); ok && idStr != "" {
+			docID = idStr
+			clean := make(map[string]any, len(doc))
+			for k, v := range doc {
+				if k != "__meta_id" {
+					clean[k] = v
+				}
+			}
+			b, err := json.Marshal(clean)
+			return b, docID, err
+		}
+		if idStr, ok := doc["_id"].(string); ok && idStr != "" {
+			docID = idStr
+		}
+	}
+	b, err := json.Marshal(doc)
+	return b, docID, err
+}
+
 func docMatchesNonScriptClause(idxSchema *schema.IndexSchema, doc map[string]any, q *esast.Query) bool {
 	if q == nil {
 		return true
 	}
-	rawSource, err := json.Marshal(doc)
+	rawSource, docID, err := marshalDocAndExtractEvalID(doc, "_eval")
 	if err != nil {
 		return false
 	}
 	effSchema := resolveRuntimeEvalSchema(idxSchema, doc, q, rawSource)
-	shreddedBytes, err := schema.ShredDocument(effSchema, "_eval", 1, false, rawSource)
+	shreddedBytes, err := schema.ShredDocument(effSchema, docID, 1, false, rawSource)
 	if err != nil {
 		return false
 	}
@@ -16017,12 +16039,12 @@ func scoreNonScriptClauseOnDoc(idxSchema *schema.IndexSchema, doc map[string]any
 	if queryHasNestedScoring(q) {
 		return evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q, 1.0)
 	}
-	rawBytes, err := json.Marshal(doc)
+	rawBytes, docID, err := marshalDocAndExtractEvalID(doc, "0")
 	if err != nil {
 		return 1.0
 	}
 	evalSchema := resolveRuntimeEvalSchema(idxSchema, doc, q, rawBytes)
-	shredBytes, err := schema.ShredDocument(evalSchema, "0", 1, false, rawBytes)
+	shredBytes, err := schema.ShredDocument(evalSchema, docID, 1, false, rawBytes)
 	if err != nil {
 		return 1.0
 	}
@@ -16339,11 +16361,18 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 	return baseScore
 }
 
+type runtimeNestedAncestor struct {
+	doc    map[string]any
+	schema *schema.IndexSchema
+	elemID string
+}
+
 type runtimeMatchedDoc struct {
-	hit        HitRow
-	doc        map[string]any
-	rootDoc    map[string]any
-	rootSchema *schema.IndexSchema
+	hit             HitRow
+	doc             map[string]any
+	rootDoc         map[string]any
+	rootSchema      *schema.IndexSchema
+	nestedAncestors map[string]runtimeNestedAncestor
 }
 
 func (md runtimeMatchedDoc) EffectiveSchema(fallback *schema.IndexSchema) *schema.IndexSchema {
@@ -17409,10 +17438,37 @@ func splitNestedSubAggsByBucketKeyMode(subAggs map[string]esast.AggSpec) (map[st
 	return direct, grouped
 }
 
-func restoreRootDocsForReverseNested(docs []runtimeMatchedDoc, fallbackSchema *schema.IndexSchema) ([]runtimeMatchedDoc, *schema.IndexSchema) {
+func restoreRootDocsForReverseNested(docs []runtimeMatchedDoc, targetPath string, fallbackSchema *schema.IndexSchema) ([]runtimeMatchedDoc, *schema.IndexSchema) {
 	seenID := make(map[string]bool, len(docs))
 	out := make([]runtimeMatchedDoc, 0, len(docs))
 	outSchema := fallbackSchema
+	if targetPath != "" {
+		for _, md := range docs {
+			anc, ok := md.nestedAncestors[targetPath]
+			if !ok {
+				continue
+			}
+			if anc.elemID != "" {
+				if seenID[anc.elemID] {
+					continue
+				}
+				seenID[anc.elemID] = true
+			}
+			if anc.schema != nil {
+				outSchema = anc.schema
+			}
+			hitCopy := md.hit
+			hitCopy.Schema = outSchema
+			out = append(out, runtimeMatchedDoc{
+				hit:             hitCopy,
+				doc:             anc.doc,
+				rootDoc:         md.rootDoc,
+				rootSchema:      md.rootSchema,
+				nestedAncestors: md.nestedAncestors,
+			})
+		}
+		return out, outSchema
+	}
 	for _, md := range docs {
 		if md.hit.ID != "" {
 			if seenID[md.hit.ID] {
@@ -17523,15 +17579,30 @@ func emitRuntimeAllSubAggRows(
 				if rSchema == nil {
 					rSchema = md.EffectiveSchema(idxSchema)
 				}
-				for _, cand := range extractNestedElementsAtPath(md.doc, pathSegs) {
+				for idx, cand := range extractNestedElementsAtPath(md.doc, pathSegs) {
 					elemDoc := buildSingleNestedElementDoc(pathSegs, cand.obj)
+					if idStr, ok := rDoc["__meta_id"].(string); ok && idStr != "" {
+						elemDoc["__meta_id"] = idStr
+					} else if md.hit.ID != "" {
+						elemDoc["__meta_id"] = md.hit.ID
+					}
+					ancs := make(map[string]runtimeNestedAncestor, len(md.nestedAncestors)+1)
+					for k, v := range md.nestedAncestors {
+						ancs[k] = v
+					}
+					ancs[subSpec.Nested.Path] = runtimeNestedAncestor{
+						doc:    elemDoc,
+						schema: nSchema,
+						elemID: fmt.Sprintf("%s#%s#%d", md.hit.ID, subSpec.Nested.Path, idx),
+					}
 					hitCopy := md.hit
 					hitCopy.Schema = nSchema
 					nDocs = append(nDocs, runtimeMatchedDoc{
-						hit:        hitCopy,
-						doc:        elemDoc,
-						rootDoc:    rDoc,
-						rootSchema: rSchema,
+						hit:             hitCopy,
+						doc:             elemDoc,
+						rootDoc:         rDoc,
+						rootSchema:      rSchema,
+						nestedAncestors: ancs,
 					})
 				}
 			}
@@ -17559,8 +17630,8 @@ func emitRuntimeAllSubAggRows(
 				}
 			}
 		case subSpec.ReverseNested != nil:
-			rnDocs, rnSchema := restoreRootDocsForReverseNested(bDocs, idxSchema)
-			rnBucketKey := "_reverse_nested_doc_count"
+			rnDocs, rnSchema := restoreRootDocsForReverseNested(bDocs, reverseNestedPath(subSpec.ReverseNested), idxSchema)
+			rnBucketKey := "_reverse_nested"
 			if parentBucketKey != "" {
 				rnBucketKey = parentBucketKey
 			}
@@ -17574,7 +17645,7 @@ func emitRuntimeAllSubAggRows(
 				emitRuntimeAllSubAggRows(subFullKey, parentBucketKey, subSpec.SubAggs(), rnDocs, out, rnSchema)
 			}
 		case subSpec.EffectiveSampler() != nil:
-			sBucketKey := "_sampler_doc_count"
+			sBucketKey := "_sampler"
 			if parentBucketKey != "" {
 				sBucketKey = parentBucketKey
 			}
@@ -18122,6 +18193,26 @@ func applyRuntimeScriptAggsForMap(
 					aggRows = applyRuntimeScriptAggsForMap(fullKey, rowKey, spec.SubAggs(), otherDocs, globalDocs, aggRows, idxSchema)
 				}
 			}
+		case spec.ReverseNested != nil && (reverseNestedPath(spec.ReverseNested) != "" || aggsHaveRuntimeScript(spec.SubAggs())):
+			rnDocs, rnSchema := restoreRootDocsForReverseNested(docs, reverseNestedPath(spec.ReverseNested), idxSchema)
+			if reverseNestedPath(spec.ReverseNested) != "" {
+				aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
+				rnBucketKey := "_reverse_nested"
+				if parentBucketKey != "" {
+					rnBucketKey = parentBucketKey
+				}
+				aggRows = append(aggRows, AggRow{
+					AggName:   fullKey,
+					BucketKey: rnBucketKey,
+					DocCount:  int64(len(rnDocs)),
+					Value:     float64(len(rnDocs)),
+				})
+				if len(spec.SubAggs()) > 0 {
+					emitRuntimeAllSubAggRows(fullKey, parentBucketKey, spec.SubAggs(), rnDocs, &aggRows, rnSchema)
+				}
+			} else {
+				aggRows = applyRuntimeScriptAggsForMap(fullKey, parentBucketKey, spec.SubAggs(), rnDocs, globalDocs, aggRows, rnSchema)
+			}
 		case aggSpecHasDirectRuntimeScript(spec):
 			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
 			emitRuntimeMetricAggRows(fullKey, parentBucketKey, spec, docs, &aggRows)
@@ -18134,7 +18225,7 @@ func applyRuntimeScriptAggsForMap(
 				}
 				aggRows = applyRuntimeScriptAggsForMap(fullKey, parentBucketKey, spec.SubAggs(), gDocs, globalDocs, aggRows, idxSchema)
 			case spec.ReverseNested != nil:
-				rnDocs, rnSchema := restoreRootDocsForReverseNested(docs, idxSchema)
+				rnDocs, rnSchema := restoreRootDocsForReverseNested(docs, reverseNestedPath(spec.ReverseNested), idxSchema)
 				aggRows = applyRuntimeScriptAggsForMap(fullKey, parentBucketKey, spec.SubAggs(), rnDocs, globalDocs, aggRows, rnSchema)
 			case spec.EffectiveSampler() != nil:
 				aggRows = applyRuntimeScriptAggsForMap(fullKey, parentBucketKey, spec.SubAggs(), docs, globalDocs, aggRows, idxSchema)
@@ -18167,15 +18258,30 @@ func applyRuntimeScriptAggsForMap(
 					if rSchema == nil {
 						rSchema = md.EffectiveSchema(idxSchema)
 					}
-					for _, cand := range extractNestedElementsAtPath(md.doc, pathSegs) {
+					for idx, cand := range extractNestedElementsAtPath(md.doc, pathSegs) {
 						elemDoc := buildSingleNestedElementDoc(pathSegs, cand.obj)
+						if idStr, ok := rDoc["__meta_id"].(string); ok && idStr != "" {
+							elemDoc["__meta_id"] = idStr
+						} else if md.hit.ID != "" {
+							elemDoc["__meta_id"] = md.hit.ID
+						}
+						ancs := make(map[string]runtimeNestedAncestor, len(md.nestedAncestors)+1)
+						for k, v := range md.nestedAncestors {
+							ancs[k] = v
+						}
+						ancs[spec.Nested.Path] = runtimeNestedAncestor{
+							doc:    elemDoc,
+							schema: nSchema,
+							elemID: fmt.Sprintf("%s#%s#%d", md.hit.ID, spec.Nested.Path, idx),
+						}
 						hitCopy := md.hit
 						hitCopy.Schema = nSchema
 						nDocs = append(nDocs, runtimeMatchedDoc{
-							hit:        hitCopy,
-							doc:        elemDoc,
-							rootDoc:    rDoc,
-							rootSchema: rSchema,
+							hit:             hitCopy,
+							doc:             elemDoc,
+							rootDoc:         rDoc,
+							rootSchema:      rSchema,
+							nestedAncestors: ancs,
 						})
 					}
 				}
@@ -18224,6 +18330,7 @@ func hitsToRuntimeMatchedDocs(hits []HitRow, idxSchema *schema.IndexSchema) []ru
 		if doc == nil {
 			doc = make(map[string]any)
 		}
+		doc["__meta_id"] = h.ID
 		out = append(out, runtimeMatchedDoc{
 			hit:        h,
 			doc:        doc,
@@ -18235,11 +18342,31 @@ func hitsToRuntimeMatchedDocs(hits []HitRow, idxSchema *schema.IndexSchema) []ru
 }
 
 func applyRuntimeScriptAggsOnlyWithGlobal(matchedQueryHits []HitRow, globalHits []HitRow, aggRows []AggRow, idxTotal int64, req *esast.SearchRequest, idxSchema *schema.IndexSchema) []AggRow {
+	foundQueryMeta := false
+	prePostQueryTotal := int64(len(matchedQueryHits))
+	if prePostQueryTotal < idxTotal {
+		prePostQueryTotal = idxTotal
+	}
 	for i := range aggRows {
-		if aggRows[i].AggName == "__meta_total" {
+		switch aggRows[i].AggName {
+		case "__meta_total":
 			aggRows[i].DocCount = idxTotal
 			aggRows[i].Value = float64(idxTotal)
+		case "__meta_query_total":
+			if req != nil && req.PostFilter != nil {
+				aggRows[i].DocCount = prePostQueryTotal
+				aggRows[i].Value = float64(prePostQueryTotal)
+				foundQueryMeta = true
+			}
 		}
+	}
+	if req != nil && req.PostFilter != nil && !foundQueryMeta {
+		aggRows = append(aggRows, AggRow{
+			AggName:   "__meta_query_total",
+			BucketKey: "_count",
+			DocCount:  prePostQueryTotal,
+			Value:     float64(prePostQueryTotal),
+		})
 	}
 	effAggs := req.EffectiveAggs()
 	if !aggsHaveRuntimeScript(effAggs) {
@@ -18290,6 +18417,7 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 		if doc == nil {
 			doc = make(map[string]any)
 		}
+		doc["__meta_id"] = h.ID
 		if hasAliasScript && !evalQueryScriptFilterOnDocWithSchema(idxSchema, doc, aliasFilterQ) {
 			continue
 		}
