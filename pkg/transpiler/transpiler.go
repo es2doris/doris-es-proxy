@@ -426,7 +426,7 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		keys := sortedMapKeys(q.Fuzzy)
 		if len(keys) == 1 {
 			fe := q.Fuzzy[keys[0]]
-			return t.compileFuzzyField(keys[0], fe.Value, "or", fe.Fuzziness, fe.Boost, scoring, nctx)
+			return t.compileFuzzyFieldWithCI(keys[0], fe.Value, "or", fe.Fuzziness, fe.CaseInsensitive, fe.Boost, scoring, nctx)
 		}
 		var subs []esast.Query
 		for _, k := range keys {
@@ -474,7 +474,7 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		boost := 1.0
 		for _, field := range keys {
 			pe := q.Prefix[field]
-			if pe.Boost != 0 {
+			if pe.HasBoost || pe.Boost != 0 {
 				boost = pe.Boost
 			}
 			preds = append(preds, t.compilePrefixPredicate(field, pe.Value, pe.CaseInsensitive, nctx))
@@ -491,7 +491,7 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		boost := 1.0
 		for _, field := range keys {
 			we := q.Wildcard[field]
-			if we.Boost != 0 {
+			if we.HasBoost || we.Boost != 0 {
 				boost = we.Boost
 			}
 			preds = append(preds, t.compileWildcardPredicate(field, we.Value, we.CaseInsensitive, nctx))
@@ -535,7 +535,7 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		}
 		for _, field := range keys {
 			re := q.Regexp[field]
-			if re.Boost != 0 {
+			if re.HasBoost || re.Boost != 0 {
 				boost = re.Boost
 			}
 			if strings.ContainsAny(field, "*?") && t.Schema != nil {
@@ -1259,7 +1259,30 @@ func (t *Transpiler) compileFuzzyField(
 	scoring bool,
 	nctx *nestedCtx,
 ) CompiledQuery {
+	return t.compileFuzzyFieldWithCI(field, queryVal, operator, fuzziness, false, boost, scoring, nctx)
+}
+
+func (t *Transpiler) compileFuzzyFieldWithCI(
+	field string,
+	queryVal any,
+	operator string,
+	fuzziness any,
+	caseInsensitive bool,
+	boost float64,
+	scoring bool,
+	nctx *nestedCtx,
+) CompiledQuery {
 	if isZeroFuzziness(fuzziness) {
+		if caseInsensitive {
+			resolvedField, b := t.resolveFieldInNestedCtx(field, false, nctx)
+			if isExactKeywordField(resolvedField, b) {
+				return t.CompileQuery(&esast.Query{
+					Term: map[string]esast.TermEntry{
+						resolvedField: {Value: queryVal, CaseInsensitive: true, Boost: boost},
+					},
+				}, scoring, nctx)
+			}
+		}
 		return t.compileMatchField(field, queryVal, operator, boost, scoring, nctx)
 	}
 	if strings.ContainsAny(field, "*?") && t.Schema != nil {
@@ -1268,15 +1291,23 @@ func (t *Transpiler) compileFuzzyField(
 			if nctx != nil {
 				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 			}
-			return t.compileFuzzyField("_all_text", queryVal, operator, fuzziness, boost, scoring, nctx)
+			return t.compileFuzzyFieldWithCI("_all_text", queryVal, operator, fuzziness, caseInsensitive, boost, scoring, nctx)
 		}
 		var shoulds []esast.Query
 		for _, bf := range exp {
-			shoulds = append(shoulds, esast.Query{
-				Match: map[string]esast.MatchEntry{
-					bf.Field: {Query: queryVal, Operator: operator, Fuzziness: fuzziness, Boost: bf.Boost},
-				},
-			})
+			if caseInsensitive {
+				shoulds = append(shoulds, esast.Query{
+					Fuzzy: map[string]esast.FuzzyEntry{
+						bf.Field: {Value: queryVal, Fuzziness: fuzziness, CaseInsensitive: true, Boost: bf.Boost},
+					},
+				})
+			} else {
+				shoulds = append(shoulds, esast.Query{
+					Match: map[string]esast.MatchEntry{
+						bf.Field: {Query: queryVal, Operator: operator, Fuzziness: fuzziness, Boost: bf.Boost},
+					},
+				})
+			}
 		}
 		b := boost
 		return t.compileBool(&esast.BoolQuery{Should: shoulds, MinimumShouldMatch: 1, Boost: &b}, scoring, nctx)
@@ -1302,7 +1333,7 @@ func (t *Transpiler) compileFuzzyField(
 		pat := "^(" + buildOneEditDistanceRegex(queryStr) + ")$"
 		return t.CompileQuery(&esast.Query{
 			Regexp: map[string]esast.RegexpEntry{
-				resolvedField: {Value: pat, CaseInsensitive: b.EffectiveLowercase(true), Boost: boost},
+				resolvedField: {Value: pat, CaseInsensitive: caseInsensitive || b.EffectiveLowercase(true), Boost: boost, HasBoost: true},
 			},
 		}, scoring, nctx)
 	}
@@ -2456,6 +2487,9 @@ func (t *Transpiler) compileRangePredicate(field string, rc esast.RangeCond, nct
 func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, nctx *nestedCtx) string {
 	gt, gte, lt, lte := rc.NormalizedBounds()
 	field, b := t.resolveFieldInNestedCtx(field, true, nctx)
+	if b.Kind == schema.StoragePromotedVector {
+		return "FALSE"
+	}
 	if b.ESType == "ip" {
 		if b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath)) {
 			colName := b.EffectiveArrayColumn(true)
@@ -4682,7 +4716,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 				effField = docF
 			}
 		}
-		b := t.Schema.ResolveField(effField)
+		effField, b := t.resolveFieldInNestedCtx(effField, false, nctx)
 		arrCol := b.EffectiveArrayColumn(true)
 		if isExplodedNested(b, effField) {
 			col := t.sqlNumericColumnRef(effField, nctx)
@@ -4788,9 +4822,9 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					quoteStr(subFull), parentBucketExpr, fromClause, whereClause,
 				))
 			} else if strings.EqualFold(subSpec.Rate.Mode, "value_count") {
-				b := t.Schema.ResolveEffectiveField(subSpec.Rate.Field, true)
+				rateField, b := t.resolveFieldInNestedCtx(subSpec.Rate.Field, true, nctx)
 				arrCol := b.EffectiveArrayColumn(true)
-				if !isExplodedNested(b, subSpec.Rate.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
+				if !isExplodedNested(b, rateField) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 					subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
 					subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, subElemAlias)
 					*branches = append(*branches, fmt.Sprintf(
@@ -4799,7 +4833,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 						quoteStr(subFull), parentBucketExpr, subElemAlias, subFrom, subWhere,
 					))
 				} else {
-					col := t.sqlColumnRef(subSpec.Rate.Field, true, nctx)
+					col := t.sqlColumnRef(rateField, true, nctx)
 					*branches = append(*branches, fmt.Sprintf(
 						"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(%s) AS DOUBLE) AS `_doc_count` "+
 							"FROM %s WHERE %s GROUP BY `_bucket_key`",
@@ -4831,7 +4865,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					effPctField = docF
 				}
 			}
-			b := t.Schema.ResolveField(effPctField)
+			effPctField, b := t.resolveFieldInNestedCtx(effPctField, false, nctx)
 			arrCol := b.EffectiveArrayColumn(true)
 			for _, pct := range subSpec.Percentiles.EffectivePercents() {
 				q := pct / 100.0
@@ -4909,7 +4943,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					effBpField = docF
 				}
 			}
-			b := t.Schema.ResolveField(effBpField)
+			effBpField, b := t.resolveFieldInNestedCtx(effBpField, false, nctx)
 			arrCol := b.EffectiveArrayColumn(true)
 			for _, pct := range []float64{0.0, 25.0, 50.0, 75.0, 100.0} {
 				q := pct / 100.0
@@ -4979,7 +5013,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					effPrField = docF
 				}
 			}
-			b := t.Schema.ResolveField(effPrField)
+			effPrField, b := t.resolveFieldInNestedCtx(effPrField, false, nctx)
 			arrCol := b.EffectiveArrayColumn(true)
 			for _, v := range subSpec.PercentileRanks.Values {
 				valKey := strconv.FormatFloat(v, 'f', -1, 64)
@@ -5047,15 +5081,15 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 				}
 			}
 		case subSpec.StringStats != nil:
-			b := t.Schema.ResolveEffectiveField(subSpec.StringStats.Field, true)
+			ssField, b := t.resolveFieldInNestedCtx(subSpec.StringStats.Field, true, nctx)
 			arrCol := b.EffectiveArrayColumn(true)
 			var lenExpr, subFrom, subWhere string
-			if !isExplodedNested(b, subSpec.StringStats.Field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
+			if !isExplodedNested(b, ssField) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 				lenExpr = fmt.Sprintf("CAST(CHAR_LENGTH(CAST(%s AS STRING)) AS DOUBLE)", subElemAlias)
 				subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
 				subWhere = fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, subElemAlias)
 			} else {
-				col := t.sqlColumnRef(subSpec.StringStats.Field, true, nctx)
+				col := t.sqlColumnRef(ssField, true, nctx)
 				lenExpr = fmt.Sprintf("CAST(CHAR_LENGTH(CAST(%s AS STRING)) AS DOUBLE)", col)
 				subFrom = fromClause
 				subWhere = fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, col)
@@ -5129,7 +5163,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					effVCField = docF
 				}
 			}
-			b := t.Schema.ResolveEffectiveField(effVCField, true)
+			effVCField, b := t.resolveFieldInNestedCtx(effVCField, true, nctx)
 			arrCol := b.EffectiveArrayColumn(true)
 			if !isExplodedNested(b, effVCField) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 				valExpr := subElemAlias
@@ -5189,7 +5223,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					effCardField = docF
 				}
 			}
-			b := t.Schema.ResolveEffectiveField(effCardField, true)
+			effCardField, b := t.resolveFieldInNestedCtx(effCardField, true, nctx)
 			if !isExplodedNested(b, effCardField) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 				arrCol := b.EffectiveArrayColumn(true)
 				valExpr := subElemAlias
@@ -5250,7 +5284,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					effSubField = docF
 				}
 			}
-			b := t.Schema.ResolveEffectiveField(effSubField, true)
+			effSubField, b := t.resolveFieldInNestedCtx(effSubField, true, nctx)
 			effSubSize := t.capBucketSize(subTerms.Size)
 			if subTerms.Order != nil || subTerms.Include != nil || subTerms.Exclude != nil {
 				effSubSize = t.maxAggBuckets()
@@ -5348,7 +5382,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					effDHField = docF
 				}
 			}
-			b := t.Schema.ResolveField(effDHField)
+			effDHField, b := t.resolveFieldInNestedCtx(effDHField, false, nctx)
 			arrCol := b.EffectiveArrayColumn(true)
 			subFrom := fromClause
 			var col, notNullExpr string
@@ -5443,7 +5477,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					effHField = docF
 				}
 			}
-			b := t.Schema.ResolveField(effHField)
+			effHField, b := t.resolveFieldInNestedCtx(effHField, false, nctx)
 			arrCol := b.EffectiveArrayColumn(true)
 			subFrom := fromClause
 			var col, notNullExpr string
@@ -5532,7 +5566,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					effRField = docF
 				}
 			}
-			b := t.Schema.ResolveEffectiveField(effRField, true)
+			effRField, b := t.resolveFieldInNestedCtx(effRField, true, nctx)
 			arrCol := b.EffectiveArrayColumn(true)
 			isArray := !isExplodedNested(b, effRField) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield)
 			for _, rng := range rngSpec.Ranges {
@@ -5794,7 +5828,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 			compFrom := fromClause
 			compExplodeIdx := explodeDepth
 			resolveSubCompSourceCol := func(field string, isNumeric bool, hasMissing bool) string {
-				b := t.Schema.ResolveEffectiveField(field, true)
+				field, b := t.resolveFieldInNestedCtx(field, true, nctx)
 				if !isExplodedNested(b, field) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 					arrCol := b.EffectiveArrayColumn(true)
 					compExplodeIdx++
@@ -6440,9 +6474,38 @@ func (t *Transpiler) parseStringScriptExpr(s string, params map[string]any, defa
 	}
 	if len(s) >= 2 && ((s[0] == '\'' && s[len(s)-1] == '\'') || (s[0] == '"' && s[len(s)-1] == '"')) {
 		qChar := s[0]
-		innerLit := s[1 : len(s)-1]
-		if !strings.ContainsRune(innerLit, rune(qChar)) {
-			return quoteStr(innerLit), true, true
+		innerRaw := s[1 : len(s)-1]
+		var unescaped strings.Builder
+		valid := true
+		for i := 0; i < len(innerRaw); i++ {
+			if innerRaw[i] == '\\' {
+				if i+1 >= len(innerRaw) {
+					valid = false
+					break
+				}
+				i++
+				switch innerRaw[i] {
+				case '\\', '\'', '"':
+					unescaped.WriteByte(innerRaw[i])
+				case 'n':
+					unescaped.WriteByte('\n')
+				case 'r':
+					unescaped.WriteByte('\r')
+				case 't':
+					unescaped.WriteByte('\t')
+				default:
+					unescaped.WriteByte(innerRaw[i])
+				}
+				continue
+			}
+			if innerRaw[i] == qChar {
+				valid = false
+				break
+			}
+			unescaped.WriteByte(innerRaw[i])
+		}
+		if valid {
+			return quoteStr(unescaped.String()), true, true
 		}
 	}
 	if (s == "_value" || s == "params._value") && defaultField != "" {
@@ -6961,14 +7024,22 @@ func (t *Transpiler) parseSafeThresholdExpr(s string, params map[string]any, num
 		if tail != "" && tail != ".value" && tail != ".size()" && tail != ".length" {
 			return "", false
 		}
-		b := t.Schema.ResolveEffectiveField(field, true)
-		if (tail == ".size()" || tail == ".length") && (b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && nctx == nil)) {
-			colName := b.EffectiveArrayColumn(true)
-			if colName != "" {
-				return fmt.Sprintf("COALESCE(array_size(`%s`), 0)", colName), true
+		field, b := t.resolveFieldInNestedCtx(field, true, nctx)
+		if tail == ".size()" || tail == ".length" {
+			if b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath || b.IsMultiValued)) {
+				if nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued {
+					col := t.sqlColumnRef(field, true, nctx)
+					return fmt.Sprintf("COALESCE(array_size(CAST(%s AS ARRAY<STRING>)), 0)", col), true
+				}
+				colName := b.EffectiveArrayColumn(true)
+				if colName != "" {
+					return fmt.Sprintf("COALESCE(array_size(`%s`), 0)", colName), true
+				}
 			}
+			col := t.sqlColumnRef(field, true, nctx)
+			return fmt.Sprintf("(CASE WHEN %s IS NOT NULL THEN 1 ELSE 0 END)", col), true
 		}
-		return fmt.Sprintf("COALESCE(%s, 1)", t.sqlColumnRef(field, true, nctx)), true
+		return fmt.Sprintf("COALESCE(%s, 1)", t.sqlNumericColumnRef(field, nctx)), true
 	}
 	if s == "params.num_terms" {
 		if numTerms > 0 {
@@ -7499,7 +7570,7 @@ func (t *Transpiler) nestedRelativeJSONPath(field string, preferKeyword bool, ne
 	if len(b.RelativeJSONPath) > 0 {
 		relKey = strings.Join(b.RelativeJSONPath, ".")
 	}
-	if t.Schema != nil && (b.IgnoreAbove > 0 || b.LowercaseNormalizer) {
+	if t.Schema != nil && (b.IgnoreAbove > 0 || b.LowercaseNormalizer || b.IsMultiValued) {
 		basePath := strings.TrimSuffix(effField, ".keyword")
 		isKw := strings.HasSuffix(effField, ".keyword") || (preferKeyword && b.ESType == "keyword")
 		if isKw {

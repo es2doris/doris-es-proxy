@@ -1232,7 +1232,7 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 			}
 		}
 		if isKwCompanion {
-			if b.IgnoreAbove > 0 || b.LowercaseNormalizer {
+			if b.IgnoreAbove > 0 || b.LowercaseNormalizer || b.IsMultiValued {
 				applyNestedKwCompanionNormalizationAtPath(cloned, relPath, b, getNow)
 			}
 			if b.NullValue != nil {
@@ -1293,6 +1293,31 @@ func appendNestedCopyToAtPath(curr map[string]any, relPath []string, srcVals []s
 			curr[key] = arr
 		}
 	} else {
+		if tb.KeywordCompanion != "" {
+			kwKey := key + "__keyword"
+			var kwArr []any
+			if exKw, hasKw := curr[kwKey]; hasKw && exKw != nil {
+				if exSlice, okS := exKw.([]any); okS {
+					kwArr = append(kwArr, exSlice...)
+				} else {
+					kwArr = append(kwArr, exKw)
+				}
+			} else if existing, exists := curr[key]; exists && existing != nil {
+				if exSlice, okS := existing.([]any); okS {
+					kwArr = append(kwArr, exSlice...)
+				} else {
+					kwArr = append(kwArr, existing)
+				}
+			}
+			for _, sv := range srcVals {
+				kwArr = append(kwArr, sv)
+			}
+			if len(kwArr) == 1 {
+				curr[kwKey] = kwArr[0]
+			} else if len(kwArr) > 1 {
+				curr[kwKey] = kwArr
+			}
+		}
 		joined := strings.Join(srcVals, " ")
 		if existing, exists := curr[key]; exists && existing != nil {
 			curr[key] = fmt.Sprintf("%v %s", existing, joined)
@@ -1324,7 +1349,11 @@ func applyNestedKwCompanionNormalizationAtPath(curr map[string]any, relPath []st
 		}
 		return
 	}
-	curr[key+"__keyword"] = normalizeNestedLeafValue(val, b, getNow)
+	if kwVal, hasKw := curr[key+"__keyword"]; hasKw {
+		curr[key+"__keyword"] = normalizeNestedLeafValue(kwVal, b, getNow)
+	} else {
+		curr[key+"__keyword"] = normalizeNestedLeafValue(val, b, getNow)
+	}
 }
 
 func applyNestedBindingNormalizationAtPath(curr map[string]any, relPath []string, b FieldBinding, getNow func() time.Time) {

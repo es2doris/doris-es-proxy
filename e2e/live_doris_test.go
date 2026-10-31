@@ -1356,4 +1356,65 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	if r29Fields == nil || r29Fields["shift_and_generic"].([]any)[0] != "x:12" {
 		t.Fatalf("expected R29 script_fields shift_and_generic='x:12', got %+v", r29Fields)
 	}
+
+	// 27. Round-30 E2E: top_hits _score when size:0, Painless ! precedence & $ identifiers, and _clone endpoint
+	r30SimResp, err := http.Post(ts.URL+"/_ingest/pipeline/_simulate?verbose=true", "application/json", strings.NewReader(`{
+		"pipeline": {
+			"processors": [
+				{
+					"script": {
+						"source": "def list = ['r30']; ctx._source.tags = list; list.add('ok'); ctx._source.$schema = 'v1'; if (!ctx._source.flag == true) { ctx._source.verified = true; }"
+					}
+				}
+			]
+		},
+		"docs": [
+			{"_index": "live_auto_index", "_id": "r30-1", "_source": {"flag": false}}
+		]
+	}`))
+	if err != nil || r30SimResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_ingest/pipeline/_simulate (R30) failed: status=%v err=%v", r30SimResp.StatusCode, err)
+	}
+	var r30SimRes map[string]any
+	_ = json.NewDecoder(r30SimResp.Body).Decode(&r30SimRes)
+	_ = r30SimResp.Body.Close()
+	r30ProcRes := r30SimRes["docs"].([]any)[0].(map[string]any)["processor_results"].([]any)[0].(map[string]any)
+	r30Doc := r30ProcRes["doc"].(map[string]any)["_source"].(map[string]any)
+	if r30Doc["verified"] != true || r30Doc["$schema"] != "v1" || len(r30Doc["tags"].([]any)) != 2 {
+		t.Fatalf("unexpected R30 simulated doc: %+v", r30Doc)
+	}
+
+	r30THResp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
+		"size": 0,
+		"query": {
+			"bool": {
+				"should": [
+					{"ids": {"values": ["auto-1"], "boost": 4.0}},
+					{"ids": {"values": ["auto-2"], "boost": 1.0}}
+				]
+			}
+		},
+		"aggs": {
+			"top_1": {
+				"top_hits": {"size": 1}
+			}
+		}
+	}`))
+	if err != nil || r30THResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search (R30 top_hits size:0) failed: status=%v err=%v", r30THResp.StatusCode, err)
+	}
+	var r30THRes map[string]any
+	_ = json.NewDecoder(r30THResp.Body).Decode(&r30THRes)
+	_ = r30THResp.Body.Close()
+	r30TopHitsEnv := r30THRes["aggregations"].(map[string]any)["top_1"].(map[string]any)["hits"].(map[string]any)
+	r30TopHit := r30TopHitsEnv["hits"].([]any)[0].(map[string]any)
+	if r30TopHitsEnv["max_score"] != 4.0 || r30TopHit["_id"] != "auto-1" || r30TopHit["_score"] != 4.0 {
+		t.Fatalf("expected R30 top_hits size:0 max_score=4.0 hit[0] _id='auto-1' _score=4.0, got env=%+v hit=%+v", r30TopHitsEnv, r30TopHit)
+	}
+
+	r30CloneResp, err := http.Post(ts.URL+"/live_auto_index/_clone/live_auto_index_cloned", "application/json", strings.NewReader(`{}`))
+	if err != nil || r30CloneResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_clone/live_auto_index_cloned failed: status=%v err=%v", r30CloneResp.StatusCode, err)
+	}
+	_ = r30CloneResp.Body.Close()
 }

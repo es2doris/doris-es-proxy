@@ -618,9 +618,10 @@ type TermsSetEntry struct {
 
 // FuzzyEntry models a `fuzzy` query (`{"fuzzy": {"name": "alice"}}` or `{"fuzzy": {"name": {"value": "alice", "fuzziness": "AUTO"}}}`).
 type FuzzyEntry struct {
-	Value     any     `json:"value"`
-	Fuzziness any     `json:"fuzziness,omitempty"`
-	Boost     float64 `json:"boost,omitempty"`
+	Value           any     `json:"value"`
+	Fuzziness       any     `json:"fuzziness,omitempty"`
+	CaseInsensitive bool    `json:"case_insensitive,omitempty"`
+	Boost           float64 `json:"boost,omitempty"`
 }
 
 func (f *FuzzyEntry) UnmarshalJSON(data []byte) error {
@@ -628,15 +629,17 @@ func (f *FuzzyEntry) UnmarshalJSON(data []byte) error {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		var full struct {
-			Value     any      `json:"value"`
-			Fuzziness any      `json:"fuzziness"`
-			Boost     *float64 `json:"boost"`
+			Value           any      `json:"value"`
+			Fuzziness       any      `json:"fuzziness"`
+			CaseInsensitive bool     `json:"case_insensitive"`
+			Boost           *float64 `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
 		}
 		f.Value = full.Value
 		f.Fuzziness = full.Fuzziness
+		f.CaseInsensitive = full.CaseInsensitive
 		if full.Boost != nil {
 			f.Boost = *full.Boost
 		}
@@ -836,6 +839,7 @@ type PrefixEntry struct {
 	Value           string  `json:"value"`
 	CaseInsensitive bool    `json:"case_insensitive,omitempty"`
 	Boost           float64 `json:"boost,omitempty"`
+	HasBoost        bool    `json:"-"`
 }
 
 func (p *PrefixEntry) UnmarshalJSON(data []byte) error {
@@ -843,27 +847,41 @@ func (p *PrefixEntry) UnmarshalJSON(data []byte) error {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		var full struct {
-			Value           string   `json:"value"`
+			Value           any      `json:"value"`
+			Prefix          any      `json:"prefix"`
 			CaseInsensitive bool     `json:"case_insensitive"`
 			Boost           *float64 `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
 		}
-		p.Value = full.Value
+		if full.Value != nil {
+			p.Value = fmt.Sprintf("%v", full.Value)
+		} else if full.Prefix != nil {
+			p.Value = fmt.Sprintf("%v", full.Prefix)
+		}
 		p.CaseInsensitive = full.CaseInsensitive
 		if full.Boost != nil {
 			p.Boost = *full.Boost
+			p.HasBoost = true
 		}
 		return nil
 	}
-	return json.Unmarshal(trimmed, &p.Value)
+	var raw any
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if raw != nil {
+		p.Value = fmt.Sprintf("%v", raw)
+	}
+	return nil
 }
 
 type WildcardEntry struct {
 	Value           string  `json:"value"`
 	CaseInsensitive bool    `json:"case_insensitive,omitempty"`
 	Boost           float64 `json:"boost,omitempty"`
+	HasBoost        bool    `json:"-"`
 }
 
 func (w *WildcardEntry) UnmarshalJSON(data []byte) error {
@@ -871,32 +889,41 @@ func (w *WildcardEntry) UnmarshalJSON(data []byte) error {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		var full struct {
-			Value           string   `json:"value"`
-			Wildcard        string   `json:"wildcard"`
+			Value           any      `json:"value"`
+			Wildcard        any      `json:"wildcard"`
 			CaseInsensitive bool     `json:"case_insensitive"`
 			Boost           *float64 `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
 		}
-		if full.Value != "" {
-			w.Value = full.Value
-		} else {
-			w.Value = full.Wildcard
+		if full.Value != nil {
+			w.Value = fmt.Sprintf("%v", full.Value)
+		} else if full.Wildcard != nil {
+			w.Value = fmt.Sprintf("%v", full.Wildcard)
 		}
 		w.CaseInsensitive = full.CaseInsensitive
 		if full.Boost != nil {
 			w.Boost = *full.Boost
+			w.HasBoost = true
 		}
 		return nil
 	}
-	return json.Unmarshal(trimmed, &w.Value)
+	var raw any
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if raw != nil {
+		w.Value = fmt.Sprintf("%v", raw)
+	}
+	return nil
 }
 
 type RegexpEntry struct {
 	Value           string  `json:"value"`
 	CaseInsensitive bool    `json:"case_insensitive,omitempty"`
 	Boost           float64 `json:"boost,omitempty"`
+	HasBoost        bool    `json:"-"`
 }
 
 func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
@@ -904,21 +931,34 @@ func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		var full struct {
-			Value           string   `json:"value"`
+			Value           any      `json:"value"`
+			Regexp          any      `json:"regexp"`
 			CaseInsensitive bool     `json:"case_insensitive"`
 			Boost           *float64 `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
 		}
-		r.Value = full.Value
+		if full.Value != nil {
+			r.Value = fmt.Sprintf("%v", full.Value)
+		} else if full.Regexp != nil {
+			r.Value = fmt.Sprintf("%v", full.Regexp)
+		}
 		r.CaseInsensitive = full.CaseInsensitive
 		if full.Boost != nil {
 			r.Boost = *full.Boost
+			r.HasBoost = true
 		}
 		return nil
 	}
-	return json.Unmarshal(trimmed, &r.Value)
+	var raw any
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if raw != nil {
+		r.Value = fmt.Sprintf("%v", raw)
+	}
+	return nil
 }
 
 type MatchEntry struct {

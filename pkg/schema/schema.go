@@ -204,7 +204,8 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 			} else if tb.Kind == StorageNestedSubfield && tb.ESType != "text" {
 				tb.IsMultiValued = true
 				s.Fields[target] = tb
-			} else if tb.ESType == "text" && tb.KeywordCompanion != "" {
+			}
+			if tb.KeywordCompanion != "" {
 				if kwB, hasKw := s.Fields[target+".keyword"]; hasKw {
 					switch kwB.Kind {
 					case StoragePromotedScalar:

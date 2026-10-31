@@ -56,35 +56,35 @@ type ScriptSpec struct {
 
 var (
 	reCtxOp                = regexp.MustCompile(`(?s)^ctx\??\.op\s*=\s*(.+)$`)
-	reCtxIncDec            = regexp.MustCompile(`^(?:(\+\+|--)\s*ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)|ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)\s*(\+\+|--))$`)
-	reCompoundAssign       = regexp.MustCompile(`(?s)^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)\s*(\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>>=|>>=)\s*(.+)$`)
-	reAssignParam          = regexp.MustCompile(`(?s)^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)\s*=\s*(.+)$`)
-	reRemoveField          = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+))?\.remove\(\s*(.+?)\s*\)$`)
-	reClearField           = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+))?\.clear\(\s*\)$`)
-	reArrayAdd             = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)\.add\(\s*(.+?)\s*\)$`)
-	reArraySet             = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)\.set\(\s*(.+)\s*\)$`)
-	reArrayAddAll          = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)\.addAll\(\s*(.+?)\s*\)$`)
-	reArrayRemoveAll       = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)\.removeAll\(\s*(.+?)\s*\)$`)
-	reArrayRetainAll       = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)\.retainAll\(\s*(.+?)\s*\)$`)
-	reMapPut               = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+))?\.put\(\s*(.+)\s*\)$`)
-	reMapPutAll            = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+))?\.putAll\(\s*(.+?)\s*\)$`)
-	reArrayRemoveIf        = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)\.removeIf\(\s*\(?\s*([a-zA-Z0-9_]+)\s*\)?\s*->\s*(.+)\s*\)$`)
-	reLocalIncDec          = regexp.MustCompile(`^(?:(\+\+|--)\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)*)|([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)*)\s*(\+\+|--))$`)
-	reLocalRemoveField     = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)*)\.remove\(\s*(.+?)\s*\)$`)
-	reLocalClearField      = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)*)\.clear\(\s*\)$`)
-	reLocalArrayAdd        = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)*)\.add\(\s*(.+?)\s*\)$`)
-	reLocalArraySet        = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)*)\.set\(\s*(.+)\s*\)$`)
-	reLocalArrayAddAll     = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)*)\.addAll\(\s*(.+?)\s*\)$`)
-	reLocalArrayRemoveAll  = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)*)\.removeAll\(\s*(.+?)\s*\)$`)
-	reLocalArrayRetainAll  = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)*)\.retainAll\(\s*(.+?)\s*\)$`)
-	reLocalMapPut          = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)*)\.put\(\s*(.+)\s*\)$`)
-	reLocalMapPutAll       = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)*)\.putAll\(\s*(.+?)\s*\)$`)
-	reLocalArrayRemoveIf   = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)*)\.removeIf\(\s*\(?\s*([a-zA-Z0-9_]+)\s*\)?\s*->\s*(.+)\s*\)$`)
-	reLocalCompoundAssign  = regexp.MustCompile(`(?s)^([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)*)\s*(\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>>=|>>=)\s*(.+)$`)
-	reLocalPropAssign      = regexp.MustCompile(`(?s)^([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+)\s*=\s*(.+)$`)
-	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|Object|Map|HashMap|LinkedHashMap|TreeMap|List|ArrayList|LinkedList|Set|HashSet|ZonedDateTime|Instant|LocalDateTime|LocalDate)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$`)
-	reNullVarDecl          = regexp.MustCompile(`^(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|Object|Map|HashMap|LinkedHashMap|TreeMap|List|ArrayList|LinkedList|Set|HashSet|ZonedDateTime|Instant|LocalDateTime|LocalDate)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_][a-zA-Z0-9_]*)$`)
-	reSimpleFieldPath      = regexp.MustCompile(`^[a-zA-Z0-9_.@/:?\x00-\x08\x10-\x15-]+$`)
+	reCtxIncDec            = regexp.MustCompile(`^(?:(\+\+|--)\s*ctx\??\._source\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)|ctx\??\._source\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)\s*(\+\+|--))$`)
+	reCompoundAssign       = regexp.MustCompile(`(?s)^ctx\??\._source\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)\s*(\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>>=|>>=)\s*(.+)$`)
+	reAssignParam          = regexp.MustCompile(`(?s)^ctx\??\._source\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)\s*=\s*(.+)$`)
+	reRemoveField          = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+))?\.remove\(\s*(.+?)\s*\)$`)
+	reClearField           = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+))?\.clear\(\s*\)$`)
+	reArrayAdd             = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)\.add\(\s*(.+?)\s*\)$`)
+	reArraySet             = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)\.set\(\s*(.+)\s*\)$`)
+	reArrayAddAll          = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)\.addAll\(\s*(.+?)\s*\)$`)
+	reArrayRemoveAll       = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)\.removeAll\(\s*(.+?)\s*\)$`)
+	reArrayRetainAll       = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)\.retainAll\(\s*(.+?)\s*\)$`)
+	reMapPut               = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+))?\.put\(\s*(.+)\s*\)$`)
+	reMapPutAll            = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+))?\.putAll\(\s*(.+?)\s*\)$`)
+	reArrayRemoveIf        = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)\.removeIf\(\s*\(?\s*([a-zA-Z0-9_$]+)\s*\)?\s*->\s*(.+)\s*\)$`)
+	reLocalIncDec          = regexp.MustCompile(`^(?:(\+\+|--)\s*([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)*)|([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)*)\s*(\+\+|--))$`)
+	reLocalRemoveField     = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)*)\.remove\(\s*(.+?)\s*\)$`)
+	reLocalClearField      = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)*)\.clear\(\s*\)$`)
+	reLocalArrayAdd        = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)*)\.add\(\s*(.+?)\s*\)$`)
+	reLocalArraySet        = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)*)\.set\(\s*(.+)\s*\)$`)
+	reLocalArrayAddAll     = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)*)\.addAll\(\s*(.+?)\s*\)$`)
+	reLocalArrayRemoveAll  = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)*)\.removeAll\(\s*(.+?)\s*\)$`)
+	reLocalArrayRetainAll  = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)*)\.retainAll\(\s*(.+?)\s*\)$`)
+	reLocalMapPut          = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)*)\.put\(\s*(.+)\s*\)$`)
+	reLocalMapPutAll       = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)*)\.putAll\(\s*(.+?)\s*\)$`)
+	reLocalArrayRemoveIf   = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)*)\.removeIf\(\s*\(?\s*([a-zA-Z0-9_$]+)\s*\)?\s*->\s*(.+)\s*\)$`)
+	reLocalCompoundAssign  = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)*)\s*(\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>>=|>>=)\s*(.+)$`)
+	reLocalPropAssign      = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*)\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+)\s*=\s*(.+)$`)
+	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|Object|Map|HashMap|LinkedHashMap|TreeMap|List|ArrayList|LinkedList|Set|HashSet|ZonedDateTime|Instant|LocalDateTime|LocalDate)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
+	reNullVarDecl          = regexp.MustCompile(`^(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|Object|Map|HashMap|LinkedHashMap|TreeMap|List|ArrayList|LinkedList|Set|HashSet|ZonedDateTime|Instant|LocalDateTime|LocalDate)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
+	reSimpleFieldPath      = regexp.MustCompile(`^[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x15-]+$`)
 	reNumericLiteralSuffix = regexp.MustCompile(`^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?[lLdDfF]$`)
 )
 
@@ -519,6 +519,21 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 		for k, v := range loopParams {
 			if (preExistingKeys[k] && !initVars[k]) || k == "_return_val" || k == "_ctx_op" {
 				params[k] = v
+			} else if strings.HasPrefix(k, "__alias_") {
+				baseVar := strings.TrimPrefix(k, "__alias_")
+				if preExistingKeys[baseVar] && !initVars[baseVar] {
+					params[k] = v
+				}
+			}
+		}
+		for k := range preExistingKeys {
+			if strings.HasPrefix(k, "__alias_") {
+				baseVar := strings.TrimPrefix(k, "__alias_")
+				if !initVars[baseVar] {
+					if _, stillExists := loopParams[k]; !stillExists {
+						delete(params, k)
+					}
+				}
 			}
 		}
 		return loopErr
@@ -596,6 +611,21 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 	for k, v := range loopParams {
 		if (preExistingKeys[k] && k != varName) || k == "_return_val" || k == "_ctx_op" {
 			params[k] = v
+		} else if strings.HasPrefix(k, "__alias_") {
+			baseVar := strings.TrimPrefix(k, "__alias_")
+			if preExistingKeys[baseVar] && baseVar != varName {
+				params[k] = v
+			}
+		}
+	}
+	for k := range preExistingKeys {
+		if strings.HasPrefix(k, "__alias_") {
+			baseVar := strings.TrimPrefix(k, "__alias_")
+			if baseVar != varName {
+				if _, stillExists := loopParams[k]; !stillExists {
+					delete(params, k)
+				}
+			}
 		}
 	}
 	return loopErr
@@ -635,7 +665,7 @@ func findTopLevelForInOrColon(header string) (int, int) {
 }
 
 func isIdentByte(c byte) bool {
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '$'
 }
 
 func isBracketReceiverByte(c byte) bool {
@@ -819,6 +849,16 @@ func expandDynamicBrackets(s string, sourceMap map[string]any, params map[string
 			}
 		}
 		if !isChainedOrAssign {
+			recvStart := getIdx
+			for recvStart > 0 && (isBracketReceiverByte(res[recvStart-1]) || res[recvStart-1] == '.') {
+				recvStart--
+			}
+			before := strings.TrimSpace(res[:recvStart])
+			if strings.HasSuffix(before, "++") || strings.HasSuffix(before, "--") {
+				isChainedOrAssign = true
+			}
+		}
+		if !isChainedOrAssign {
 			searchFrom = closeParen + 1
 			continue
 		}
@@ -883,6 +923,20 @@ func syncLocalVarAlias(sourceMap map[string]any, params map[string]any, varName 
 		switch val.(type) {
 		case []any, map[string]any:
 			setValueAtPath(sourceMap, strings.Split(aliasPath, "."), val)
+		}
+	}
+}
+
+func syncSourceAliasToLocalVars(sourceMap map[string]any, params map[string]any, targetPath string) {
+	if sourceMap == nil || params == nil || targetPath == "" {
+		return
+	}
+	for k, v := range params {
+		if strings.HasPrefix(k, "__alias_") {
+			if aliasPath, ok := v.(string); ok && aliasPath == targetPath {
+				varName := strings.TrimPrefix(k, "__alias_")
+				params[varName] = resolveParamPath(sourceMap, strings.Split(aliasPath, "."))
+			}
 		}
 	}
 }
@@ -970,6 +1024,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 	if m := reArrayRemoveIf.FindStringSubmatch(stmt); m != nil {
 		arrPath := strings.Split(m[1], ".")
 		params["_last_expr_val"] = removeIfCondFromSlice(sourceMap, sourceMap, arrPath, m[2], strings.TrimSpace(m[3]), params)
+		syncSourceAliasToLocalVars(sourceMap, params, m[1])
 		return nil
 	}
 
@@ -995,6 +1050,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 				changed = true
 			}
 		}
+		syncSourceAliasToLocalVars(sourceMap, params, m[1])
 		params["_last_expr_val"] = changed
 		return nil
 	}
@@ -1006,6 +1062,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			return err
 		}
 		params["_last_expr_val"] = mutateSliceRemoveOrRetainAtPath(sourceMap, arrPath, argVal, false)
+		syncSourceAliasToLocalVars(sourceMap, params, m[1])
 		return nil
 	}
 	if m := reArrayRetainAll.FindStringSubmatch(stmt); m != nil {
@@ -1015,6 +1072,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			return err
 		}
 		params["_last_expr_val"] = mutateSliceRemoveOrRetainAtPath(sourceMap, arrPath, argVal, true)
+		syncSourceAliasToLocalVars(sourceMap, params, m[1])
 		return nil
 	}
 
@@ -1033,6 +1091,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			if err := insertIntoSliceAtPath(sourceMap, arrPath, idxVal, valToAdd); err != nil {
 				return err
 			}
+			syncSourceAliasToLocalVars(sourceMap, params, m[1])
 			params["_last_expr_val"] = true
 			return nil
 		}
@@ -1043,6 +1102,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		if err := appendToSlice(sourceMap, arrPath, valToAdd); err != nil {
 			return err
 		}
+		syncSourceAliasToLocalVars(sourceMap, params, m[1])
 		params["_last_expr_val"] = true
 		return nil
 	}
@@ -1412,6 +1472,21 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			return err
 		}
 		setValueAtPath(sourceMap, lhsPath, val)
+		for k, v := range params {
+			if strings.HasPrefix(k, "__alias_") {
+				if aliasPath, ok := v.(string); ok && (aliasPath == m[1] || strings.HasPrefix(aliasPath, m[1]+".")) {
+					delete(params, k)
+				}
+			}
+		}
+		if reSimpleFieldPath.MatchString(rhsExpr) && !strings.Contains(rhsExpr, ".") {
+			if _, exists := params[rhsExpr]; exists {
+				switch val.(type) {
+				case []any, map[string]any:
+					params["__alias_"+rhsExpr] = m[1]
+				}
+			}
+		}
 		return nil
 	}
 
@@ -1862,6 +1937,26 @@ func evalConditionDepth(sourceMap map[string]any, cond string, params map[string
 		}
 		return true
 	}
+	if idx := findTopLevelOpPainless(cond, "!=="); idx > 0 {
+		lhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
+		rhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+3:]), params, depth+1)
+		return !valuesEqual(lhs, rhs)
+	}
+	if idx := findTopLevelOpPainless(cond, "==="); idx > 0 {
+		lhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
+		rhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+3:]), params, depth+1)
+		return valuesEqual(lhs, rhs)
+	}
+	if idx := findTopLevelOpPainless(cond, "!="); idx > 0 {
+		lhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
+		rhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+2:]), params, depth+1)
+		return !valuesEqual(lhs, rhs)
+	}
+	if idx := findTopLevelOpPainless(cond, "=="); idx > 0 {
+		lhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
+		rhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+2:]), params, depth+1)
+		return valuesEqual(lhs, rhs)
+	}
 	if strings.HasPrefix(cond, "!") && !strings.HasPrefix(cond, "!=") {
 		return !evalConditionDepth(sourceMap, cond[1:], params, depth+1)
 	}
@@ -1885,26 +1980,6 @@ func evalConditionDepth(sourceMap map[string]any, cond string, params map[string
 			rhs, _ = evalRHSExprDepth(sourceMap, rhsRaw, params, depth+1)
 		}
 		return evalRegexMatchPainless(lhs, rhs, isRegexLit, false)
-	}
-	if idx := findTopLevelOpPainless(cond, "!=="); idx > 0 {
-		lhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
-		rhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+3:]), params, depth+1)
-		return !valuesEqual(lhs, rhs)
-	}
-	if idx := findTopLevelOpPainless(cond, "==="); idx > 0 {
-		lhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
-		rhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+3:]), params, depth+1)
-		return valuesEqual(lhs, rhs)
-	}
-	if idx := findTopLevelOpPainless(cond, "!="); idx > 0 {
-		lhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
-		rhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+2:]), params, depth+1)
-		return !valuesEqual(lhs, rhs)
-	}
-	if idx := findTopLevelOpPainless(cond, "=="); idx > 0 {
-		lhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
-		rhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+2:]), params, depth+1)
-		return valuesEqual(lhs, rhs)
 	}
 	for _, op := range []string{">=", "<=", ">", "<"} {
 		if idx := findTopLevelOpPainless(cond, op); idx > 0 {

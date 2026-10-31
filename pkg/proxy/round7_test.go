@@ -102,7 +102,7 @@ func TestRound7_TermsSetScriptASTSecurityAndSelfCorruption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.Contains(planSelf.HitsSQL, "f__'3'") || !strings.Contains(planSelf.HitsSQL, "LEAST(3, COALESCE(`f__num_terms`, 1))") {
+	if strings.Contains(planSelf.HitsSQL, "f__'3'") || !strings.Contains(planSelf.HitsSQL, "LEAST(3, (CASE WHEN `f__num_terms` IS NOT NULL THEN 1 ELSE 0 END))") {
 		t.Fatalf("expected clean AST compilation for doc['num_terms'].size(), got:\n%s", planSelf.HitsSQL)
 	}
 

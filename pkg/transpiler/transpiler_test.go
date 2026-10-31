@@ -1206,6 +1206,136 @@ func TestRound29TranspilerNestedDateBoundsRelativeNestedPathsLuceneExistsAndSubA
 	}
 }
 
+func TestRound30BoostZeroFuzzyCaseInsensitiveTermsSetAndRelativeNestedSubAggs(t *testing.T) {
+	rawMap := `{
+		"properties": {
+			"service": {"type": "keyword"},
+			"tags": {"type": "keyword", "multi_valued": true},
+			"req_count": {"type": "integer"},
+			"vec": {"type": "dense_vector", "dims": 3},
+			"events": {
+				"type": "nested",
+				"properties": {
+					"code": {"type": "keyword", "normalizer": "lowercase"},
+					"flag": {"type": "boolean"},
+					"ms": {"type": "long"},
+					"ts": {"type": "date_nanos"}
+				}
+			}
+		}
+	}`
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(rawMap), &spec); err != nil {
+		t.Fatalf("unmarshal mapping failed: %v", err)
+	}
+	sch := schema.CompileIndexSchema("db", "r30_tr_idx", &spec)
+	tr := NewTranspiler(sch, TranspilerOptions{})
+
+	// 1. Explicit boost: 0 on prefix, wildcard, and regexp queries + fuzzy case_insensitive: true + range on vector field
+	var req1 esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"bool": {
+				"should": [
+					{"prefix": {"service": {"prefix": "api", "boost": 0}}},
+					{"wildcard": {"service": {"wildcard": "*web*", "boost": 0}}},
+					{"regexp": {"service": {"regexp": "auth.*", "boost": 0}}},
+					{"fuzzy": {"service": {"value": "PayMent", "fuzziness": 1, "case_insensitive": true}}},
+					{"range": {"vec": {"gte": 0, "lte": 1}}}
+				]
+			}
+		}
+	}`), &req1); err != nil {
+		t.Fatalf("unmarshal req1 failed: %v", err)
+	}
+	plan1, err := tr.BuildSearchPlan(&req1)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan(req1) failed: %v", err)
+	}
+	if strings.Contains(plan1.HitsSQL, "THEN 1.0000") && !strings.Contains(plan1.HitsSQL, "THEN 0.0000") {
+		t.Fatalf("expected explicit boost:0 to emit THEN 0.0000, got:\n%s", plan1.HitsSQL)
+	}
+	if !strings.Contains(plan1.HitsSQL, "REGEXP '(?i)^(PayMent|") {
+		t.Fatalf("expected fuzzy case_insensitive:true to use (?i) REGEXP, got:\n%s", plan1.HitsSQL)
+	}
+	if strings.Contains(plan1.HitsSQL, "f__vec") {
+		t.Fatalf("expected range query on dense_vector field 'vec' to compile to FALSE without referencing f__vec, got:\n%s", plan1.HitsSQL)
+	}
+
+	// 2. terms_set minimum_should_match_script on unmapped dynamic field (CAST AS DOUBLE) and scalar .size()
+	var req2 esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"bool": {
+				"must": [
+					{
+						"terms_set": {
+							"tags": {
+								"terms": ["a", "b"],
+								"minimum_should_match_script": {"source": "doc['dyn_thresh'].value"}
+							}
+						}
+					},
+					{
+						"terms_set": {
+							"tags": {
+								"terms": ["a", "b"],
+								"minimum_should_match_script": {"source": "doc['req_count'].size()"}
+							}
+						}
+					}
+				]
+			}
+		}
+	}`), &req2); err != nil {
+		t.Fatalf("unmarshal req2 failed: %v", err)
+	}
+	plan2, err := tr.BuildSearchPlan(&req2)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan(req2) failed: %v", err)
+	}
+	if !strings.Contains(plan2.HitsSQL, "COALESCE(CAST(`_doc`['dyn_thresh'] AS DOUBLE), 1)") {
+		t.Fatalf("expected numeric column ref in COALESCE for dyn_thresh, got:\n%s", plan2.HitsSQL)
+	}
+	if !strings.Contains(plan2.HitsSQL, "(CASE WHEN `f__req_count` IS NOT NULL THEN 1 ELSE 0 END)") {
+		t.Fatalf("expected scalar .size() CASE WHEN IS NOT NULL expression, got:\n%s", plan2.HitsSQL)
+	}
+
+	// 3. Relative field names inside nested sub-aggregations + escaped quote in string script
+	var req3 esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"size": 0,
+		"aggs": {
+			"n_events": {
+				"nested": {"path": "events"},
+				"aggs": {
+					"by_flag": {
+						"terms": {"field": "flag"},
+						"aggs": {
+							"by_code": {"terms": {"field": "code"}},
+							"by_ts": {"date_histogram": {"field": "ts", "fixed_interval": "1s"}},
+							"avg_ms": {"avg": {"field": "ms"}},
+							"quoted": {"terms": {"script": {"source": "doc['code'].value + 'a\\'b'"}}}
+						}
+					}
+				}
+			}
+		}
+	}`), &req3); err != nil {
+		t.Fatalf("unmarshal req3 failed: %v", err)
+	}
+	plan3, err := tr.BuildSearchPlan(&req3)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan(req3) failed: %v", err)
+	}
+	if strings.Contains(plan3.AggsSQL, "`_doc`['flag']") || strings.Contains(plan3.AggsSQL, "`_doc`['code']") || strings.Contains(plan3.AggsSQL, "`_doc`['ms']") {
+		t.Fatalf("expected relative nested sub-agg fields ('flag', 'code', 'ms') to resolve against nested element _nel_0, got:\n%s", plan3.AggsSQL)
+	}
+	if !strings.Contains(plan3.AggsSQL, "LOWER(") {
+		t.Fatalf("expected relative nested field 'code' with lowercase normalizer to wrap in LOWER(...), got:\n%s", plan3.AggsSQL)
+	}
+}
+
 func mustJSONString(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)

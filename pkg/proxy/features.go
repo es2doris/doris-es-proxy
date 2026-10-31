@@ -1956,6 +1956,13 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			}
 			return false, false, procType, procTag, specMap, fmt.Errorf("pipeline [%s] is missing", subName)
 		}
+		var prevMsg, prevType, prevTag any
+		var hadPrevMsg, hadPrevType, hadPrevTag bool
+		if preIngest, ok := doc["_ingest"].(map[string]any); ok && preIngest != nil {
+			prevMsg, hadPrevMsg = preIngest["on_failure_message"]
+			prevType, hadPrevType = preIngest["on_failure_processor_type"]
+			prevTag, hadPrevTag = preIngest["on_failure_processor_tag"]
+		}
 		subProcs, _ := subPipe["processors"].([]any)
 		subMut, subDropped, subErr := runIngestProcessorList(s, doc, subProcs, depth+1, trace)
 		if subErr != nil {
@@ -1976,9 +1983,21 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				}
 				if fErr == nil {
 					if curIngest, ok := doc["_ingest"].(map[string]any); ok {
-						delete(curIngest, "on_failure_message")
-						delete(curIngest, "on_failure_processor_type")
-						delete(curIngest, "on_failure_processor_tag")
+						if hadPrevMsg {
+							curIngest["on_failure_message"] = prevMsg
+						} else {
+							delete(curIngest, "on_failure_message")
+						}
+						if hadPrevType {
+							curIngest["on_failure_processor_type"] = prevType
+						} else {
+							delete(curIngest, "on_failure_processor_type")
+						}
+						if hadPrevTag {
+							curIngest["on_failure_processor_tag"] = prevTag
+						} else {
+							delete(curIngest, "on_failure_processor_tag")
+						}
 					}
 				}
 				subErr = fErr
@@ -3666,11 +3685,15 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 			prevType, hadPrevType = preIngest["on_failure_processor_type"]
 			prevTag, hadPrevTag = preIngest["on_failure_processor_tag"]
 		}
+		traceLenBefore := 0
+		if trace != nil {
+			traceLenBefore = len(*trace)
+		}
 		m, dropped, procType, procTag, specMap, procErr := executeSingleIngestProcessor(s, doc, pMap, depth, trace)
 		if m {
 			mutated = true
 		}
-		if trace != nil && procType != "" && procType != "pipeline" {
+		if trace != nil && procType != "" && (procType != "pipeline" || (procErr != nil && len(*trace) == traceLenBefore)) {
 			entry := map[string]any{
 				"processor_type": procType,
 			}
@@ -6514,4 +6537,130 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 		setIngestPath(doc, target, matches[0])
 	}
 	return true, nil
+}
+
+// handleResizeOrCloneIndex implements `POST/PUT /{index}/_clone/{target}`,
+// `/{index}/_shrink/{target}`, and `/{index}/_split/{target}` by creating the target
+// index with the source index's mappings and settings (plus any request overrides)
+// and copying all documents from the source index into the target index.
+func (s *Server) handleResizeOrCloneIndex(w http.ResponseWriter, r *http.Request) {
+	srcIndex := s.resolveIndexName(r.PathValue("index"))
+	targetIndex := strings.TrimSpace(r.PathValue("target"))
+	if targetIndex == "" {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "target index name is required")
+		return
+	}
+	var req esast.IndexCreateRequest
+	bodyBytes, ok := readRequestBody(w, r)
+	if !ok {
+		return
+	}
+	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		if err := json.Unmarshal(bodyBytes, &req); err != nil {
+			writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+			return
+		}
+	}
+
+	_ = s.syncCatalogFromBackend(r.Context())
+	s.mu.RLock()
+	srcSchema := s.indices[srcIndex]
+	_, targetExists := s.indices[targetIndex]
+	srcDefPipe, hasSrcDef := s.indexDefaultPipelines[srcIndex]
+	srcFinPipe, hasSrcFin := s.indexFinalPipelines[srcIndex]
+	s.mu.RUnlock()
+
+	if srcSchema == nil {
+		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+srcIndex+"]")
+		return
+	}
+	if targetExists || srcIndex == targetIndex {
+		writeESError(w, http.StatusBadRequest, "resource_already_exists_exception", "index ["+targetIndex+"] already exists")
+		return
+	}
+
+	effectiveMappings := schema.MergeMappingSpecs(srcSchema.RawMapping, req.Mappings)
+	compiled := schema.CompileIndexSchema(s.dorisDB, targetIndex, effectiveMappings)
+	ddl := schema.GenerateCreateTableDDL(compiled)
+	if err := s.backend.ExecDDL(r.Context(), ddl); err != nil {
+		writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", err.Error())
+		return
+	}
+
+	aliasesToPersist := make(map[string][]string)
+	s.mu.Lock()
+	s.indices[targetIndex] = compiled
+	if hasSrcDef && srcDefPipe != "" {
+		s.indexDefaultPipelines[targetIndex] = srcDefPipe
+	}
+	if hasSrcFin && srcFinPipe != "" {
+		s.indexFinalPipelines[targetIndex] = srcFinPipe
+	}
+	if p, found := extractDefaultPipelineFromSettings(req.Settings); found {
+		if p == "" {
+			delete(s.indexDefaultPipelines, targetIndex)
+		} else {
+			s.indexDefaultPipelines[targetIndex] = p
+		}
+	}
+	if fp, found := extractFinalPipelineFromSettings(req.Settings); found {
+		if fp == "" {
+			delete(s.indexFinalPipelines, targetIndex)
+		} else {
+			s.indexFinalPipelines[targetIndex] = fp
+		}
+	}
+	for alias, rawMeta := range req.Aliases {
+		meta := parseAliasMetadata(rawMeta)
+		s.addAliasWithMetaLocked(alias, targetIndex, meta)
+		aliasesToPersist[alias] = append([]string(nil), s.aliases[alias]...)
+	}
+	s.mu.Unlock()
+	s.persistIndex(r.Context(), targetIndex, compiled)
+	for alias, targets := range aliasesToPersist {
+		s.persistAlias(r.Context(), alias, targets)
+	}
+
+	_ = s.coalescer.FlushTable(r.Context(), srcSchema.DorisTable)
+	tr := transpiler.NewTranspiler(srcSchema, s.transpileOpts)
+	batchSize := 1000
+	var searchAfter []any
+	for {
+		plan, err := tr.BuildSearchPlan(&esast.SearchRequest{
+			Size:           &batchSize,
+			TrackTotalHits: false,
+			Sort:           esast.SortSlice{{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}}},
+			SearchAfter:    searchAfter,
+		})
+		if err != nil {
+			break
+		}
+		hits, err := s.backend.QueryHits(r.Context(), plan.HitsSQL)
+		if err != nil || len(hits) == 0 {
+			break
+		}
+		var buf bytes.Buffer
+		for _, h := range hits {
+			shredded, err := schema.ShredDocument(compiled, h.ID, h.Version, false, h.Source)
+			if err != nil {
+				continue
+			}
+			buf.Write(shredded)
+			buf.WriteByte('\n')
+		}
+		if buf.Len() > 0 {
+			_ = s.streamLoad(r.Context(), compiled.DorisTable, buf.Bytes(), true)
+		}
+		searchAfter = []any{hits[len(hits)-1].ID}
+		if len(hits) < batchSize {
+			break
+		}
+	}
+	s.queryCache.InvalidateAll()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"acknowledged":        true,
+		"shards_acknowledged": true,
+		"index":               targetIndex,
+	})
 }

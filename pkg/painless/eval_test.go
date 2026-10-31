@@ -658,3 +658,65 @@ func TestRound29PainlessShiftCompoundAssignGenericTypesAndNullVarDecl(t *testing
 		t.Fatalf("expected generic/array/uninitialized script to return 'beta:30:3', got %v (err=%v)", genOut, err)
 	}
 }
+
+func TestRound30PainlessUnaryNotPrecedenceAliasDollarAndPrefixGet(t *testing.T) {
+	// 1. Unary ! precedence with ==, !=, and instanceof
+	ok1, err := EvalFilter(map[string]any{"flag": false}, `!doc['flag'].value == true && !doc['flag'].value != false && !doc['flag'].value instanceof String && (!doc['flag'].value) instanceof Boolean`, nil)
+	if err != nil || !ok1 {
+		t.Fatalf("expected !doc['flag'].value == true && !doc['flag'].value != false && !doc['flag'].value instanceof String && (!doc['flag'].value) instanceof Boolean to be true, got %v (err=%v)", ok1, err)
+	}
+	ok2, err := EvalFilter(map[string]any{"flag": true}, `!doc['flag'].value == false`, nil)
+	if err != nil || !ok2 {
+		t.Fatalf("expected !true == false to evaluate as (!true) == false -> true, got %v (err=%v)", ok2, err)
+	}
+
+	// 2. Local List/Map alias assigned TO ctx._source.<field> and mutated via local variable (including inside for loop)
+	updated, op, err := ApplyUpdateWithResult(
+		json.RawMessage(`{"existing":1}`),
+		&UpdateRequest{
+			Script: &ScriptSpec{
+				Source: `
+					def list = ['a'];
+					ctx._source.tags = list;
+					list.add('b');
+					for (int i = 0; i < 2; i++) {
+						list.add('item-' + i);
+					}
+				`,
+			},
+		},
+		true,
+	)
+	if err != nil || op != "updated" {
+		t.Fatalf("expected updated result for local list alias, got op=%s err=%v", op, err)
+	}
+	var doc2 map[string]any
+	_ = json.Unmarshal(updated, &doc2)
+	tags, _ := doc2["tags"].([]any)
+	if len(tags) != 4 || tags[0] != "a" || tags[1] != "b" || tags[2] != "item-0" || tags[3] != "item-1" {
+		t.Fatalf("expected tags=['a','b','item-0','item-1'], got %v", doc2["tags"])
+	}
+
+	// 3. $-prefixed field names ($schema, $ref, $id) and prefix ++/-- on .get('field')
+	updated3, op3, err := ApplyUpdateWithResult(
+		json.RawMessage(`{"$id":"doc-1","count":10}`),
+		&UpdateRequest{
+			Script: &ScriptSpec{
+				Source: `
+					def $local = 'https://example.com/schema.json';
+					ctx._source.$schema = $local;
+					++ctx._source.get('count');
+				`,
+			},
+		},
+		true,
+	)
+	if err != nil || op3 != "updated" {
+		t.Fatalf("expected updated result for $schema and ++ctx._source.get('count'), got op=%s err=%v", op3, err)
+	}
+	var doc3 map[string]any
+	_ = json.Unmarshal(updated3, &doc3)
+	if doc3["$schema"] != "https://example.com/schema.json" || doc3["count"] != float64(11) {
+		t.Fatalf("expected $schema set and count=11, got %+v", doc3)
+	}
+}
