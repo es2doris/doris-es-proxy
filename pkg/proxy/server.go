@@ -5145,6 +5145,7 @@ func (s *Server) executeSearchRequest(
 					if docMap == nil {
 						docMap = make(map[string]any)
 					}
+					docMap["__meta_id"] = hits[i].ID
 					hits[i].Score = evalQueryScriptScoreOnDocWithSchema(idxSchema, docMap, req.Query, hits[i].Score)
 				}
 				if len(targets) == 1 && len(req.SearchAfter) == 0 && (len(req.Sort) == 0 || sortSpecsUseScore(req.Sort)) && len(hits) > 1 {
@@ -5548,6 +5549,7 @@ func (s *Server) executeSearchRequest(
 						if docMap == nil {
 							docMap = make(map[string]any)
 						}
+						docMap["__meta_id"] = h.ID
 						if queryHasRuntimeScript(req.Query) || queryHasNestedScoring(req.Query) || req.Query.FunctionScore != nil {
 							h.Score = evalQueryScriptScoreOnDocWithSchema(tSchema, docMap, req.Query, 1.0)
 						} else {

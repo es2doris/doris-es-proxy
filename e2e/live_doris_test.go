@@ -1378,7 +1378,8 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	var r30SimRes map[string]any
 	_ = json.NewDecoder(r30SimResp.Body).Decode(&r30SimRes)
 	_ = r30SimResp.Body.Close()
-	r30Doc := r30SimRes["docs"].([]any)[0].(map[string]any)["doc"].(map[string]any)["_source"].(map[string]any)
+	r30ProcRes := r30SimRes["docs"].([]any)[0].(map[string]any)["processor_results"].([]any)[0].(map[string]any)
+	r30Doc := r30ProcRes["doc"].(map[string]any)["_source"].(map[string]any)
 	if r30Doc["verified"] != true || r30Doc["$schema"] != "v1" || len(r30Doc["tags"].([]any)) != 2 {
 		t.Fatalf("unexpected R30 simulated doc: %+v", r30Doc)
 	}
@@ -1405,8 +1406,15 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	var r30THRes map[string]any
 	_ = json.NewDecoder(r30THResp.Body).Decode(&r30THRes)
 	_ = r30THResp.Body.Close()
-	r30TopHit := r30THRes["aggregations"].(map[string]any)["top_1"].(map[string]any)["hits"].(map[string]any)["hits"].([]any)[0].(map[string]any)
-	if r30TopHit["_id"] != "auto-1" || r30TopHit["_score"] != 4.0 {
-		t.Fatalf("expected R30 top_hits size:0 hit[0] _id='auto-1' _score=4.0, got %+v", r30TopHit)
+	r30TopHitsEnv := r30THRes["aggregations"].(map[string]any)["top_1"].(map[string]any)["hits"].(map[string]any)
+	r30TopHit := r30TopHitsEnv["hits"].([]any)[0].(map[string]any)
+	if r30TopHitsEnv["max_score"] != 4.0 || r30TopHit["_id"] != "auto-1" || r30TopHit["_score"] != 4.0 {
+		t.Fatalf("expected R30 top_hits size:0 max_score=4.0 hit[0] _id='auto-1' _score=4.0, got env=%+v hit=%+v", r30TopHitsEnv, r30TopHit)
 	}
+
+	r30CloneResp, err := http.Post(ts.URL+"/live_auto_index/_clone/live_auto_index_cloned", "application/json", strings.NewReader(`{}`))
+	if err != nil || r30CloneResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_clone/live_auto_index_cloned failed: status=%v err=%v", r30CloneResp.StatusCode, err)
+	}
+	_ = r30CloneResp.Body.Close()
 }
