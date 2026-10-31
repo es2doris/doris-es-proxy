@@ -2600,7 +2600,17 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "dot_expander":
 		field, _ := specMap["field"].(string)
+		if strings.Contains(field, "{{") {
+			field = fmt.Sprintf("%v", expandIngestTemplate(field, doc))
+		}
 		subPath, _ := specMap["path"].(string)
+		if strings.Contains(subPath, "{{") {
+			subPath = fmt.Sprintf("%v", expandIngestTemplate(subPath, doc))
+		}
+		override := true
+		if ov, hasOv := specMap["override"].(bool); hasOv {
+			override = ov
+		}
 		if field != "" {
 			targetMap := doc
 			if subPath != "" {
@@ -2614,6 +2624,54 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					targetMap = nil
 				}
 			}
+			expandKeyInMap := func(m map[string]any, k string) bool {
+				val, exists := m[k]
+				if !exists {
+					return false
+				}
+				if !override {
+					firstSeg := k
+					if dotIdx := strings.IndexByte(k, '.'); dotIdx > 0 {
+						firstSeg = k[:dotIdx]
+					}
+					if existing, hasEx := m[firstSeg]; hasEx {
+						if _, isMap := existing.(map[string]any); !isMap {
+							return false
+						}
+					}
+					if strings.Contains(k, ".") {
+						segs := strings.Split(k, ".")
+						cur := m
+						leafConflict := false
+						for i, seg := range segs {
+							ex, hasEx := cur[seg]
+							if !hasEx {
+								break
+							}
+							if i == len(segs)-1 {
+								if _, isMap := ex.(map[string]any); !isMap {
+									leafConflict = true
+								} else if _, valIsMap := val.(map[string]any); !valIsMap {
+									leafConflict = true
+								}
+								break
+							}
+							nextMap, isMap := ex.(map[string]any)
+							if !isMap {
+								return false
+							}
+							cur = nextMap
+						}
+						if leafConflict {
+							delete(m, k)
+							return true
+						}
+					}
+				}
+				delete(m, k)
+				setIngestPathMerge(m, k, expandDottedIngestValue(val))
+				return true
+			}
 			if targetMap != nil {
 				if field == "*" {
 					var dottedKeys []string
@@ -2624,15 +2682,39 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					}
 					sort.Strings(dottedKeys)
 					for _, k := range dottedKeys {
-						val := targetMap[k]
-						delete(targetMap, k)
-						setIngestPathMerge(targetMap, k, expandDottedIngestValue(val))
-						mutated = true
+						if expandKeyInMap(targetMap, k) {
+							mutated = true
+						}
 					}
-				} else if val, exists := targetMap[field]; exists {
-					delete(targetMap, field)
-					setIngestPathMerge(targetMap, field, expandDottedIngestValue(val))
+					for k, v := range targetMap {
+						if k == "_ingest" || k == "_id" || k == "_index" {
+							continue
+						}
+						switch v.(type) {
+						case map[string]any, []any:
+							targetMap[k] = expandDottedIngestValue(v)
+							mutated = true
+						}
+					}
+				} else if expandKeyInMap(targetMap, field) {
 					mutated = true
+				} else if strings.Contains(field, ".") {
+					parts := strings.Split(field, ".")
+					curMap := targetMap
+					for i := 0; i < len(parts)-1; i++ {
+						nextMap, ok := curMap[parts[i]].(map[string]any)
+						if !ok {
+							break
+						}
+						remKey := strings.Join(parts[i+1:], ".")
+						if strings.Contains(remKey, ".") {
+							if expandKeyInMap(nextMap, remKey) {
+								mutated = true
+								break
+							}
+						}
+						curMap = nextMap
+					}
 				}
 			}
 		}
@@ -4051,6 +4133,13 @@ func getIngestPath(doc map[string]any, path string) (any, bool) {
 }
 
 func expandDottedIngestValue(val any) any {
+	if arr, ok := val.([]any); ok {
+		outArr := make([]any, len(arr))
+		for i, elem := range arr {
+			outArr[i] = expandDottedIngestValue(elem)
+		}
+		return outArr
+	}
 	m, ok := val.(map[string]any)
 	if !ok {
 		return val
@@ -4409,14 +4498,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	var destSchema *schema.IndexSchema
 	srcTargets, aliasFilters := s.resolveTargetIndicesWithFilters(srcPattern)
 	if len(srcTargets) == 0 && !hasExclusionOrWildcard(srcPattern) {
-		target, f := s.resolveIndexNameWithFilter(srcPattern)
-		srcTargets = []string{target}
-		if f != nil {
-			if aliasFilters == nil {
-				aliasFilters = make(map[string]*esast.Query)
-			}
-			aliasFilters[target] = f
-		}
+		srcTargets = []string{s.resolveIndexName(srcPattern)}
 	}
 	aliasFilters = s.resolveTermsLookupsInAliasFilters(r.Context(), aliasFilters)
 
@@ -4840,6 +4922,10 @@ func (s *Server) handleDorisPromoteField(w http.ResponseWriter, r *http.Request)
 
 	ddls, err := s.promoteFieldInternal(r.Context(), idxName, req.Field, req.Type)
 	if err != nil {
+		if strings.Contains(err.Error(), "cannot promote field") {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+			return
+		}
 		writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", err.Error())
 		return
 	}
@@ -4902,6 +4988,9 @@ func (s *Server) promoteFieldInternal(ctx context.Context, idxName, field, esTyp
 		ddlType = "array"
 	}
 	ddls := schema.GeneratePromoteVariantFieldDDL(idxSchema, cleanField, ddlType)
+	if ddls == nil {
+		return nil, fmt.Errorf("cannot promote field [%s] with type [%s]", cleanField, esType)
+	}
 	for _, ddl := range ddls {
 		if err := s.backend.ExecDDL(ctx, ddl); err != nil {
 			return nil, err
@@ -5031,14 +5120,7 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if rawIndex != "" {
-			target, f := s.resolveIndexNameWithFilter(rawIndex)
-			targets = []string{target}
-			if f != nil {
-				if aliasFilters == nil {
-					aliasFilters = make(map[string]*esast.Query)
-				}
-				aliasFilters[target] = f
-			}
+			targets = []string{s.resolveIndexName(rawIndex)}
 		} else {
 			targets = []string{"_all"}
 		}
@@ -5218,9 +5300,24 @@ func unicodeToLower(r rune) rune {
 
 // handleRollover implements `POST /{alias}/_rollover` and `POST /{alias}/_rollover/{new_index}`.
 func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
-	if _, ok := readRequestBody(w, r); !ok {
+	bodyBytes, ok := readRequestBody(w, r)
+	if !ok {
 		return
 	}
+	var req struct {
+		Conditions map[string]any     `json:"conditions,omitempty"`
+		Mappings   *esast.MappingSpec `json:"mappings,omitempty"`
+		Settings   map[string]any     `json:"settings,omitempty"`
+		Aliases    map[string]any     `json:"aliases,omitempty"`
+		DryRun     *bool              `json:"dry_run,omitempty"`
+	}
+	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		if err := json.Unmarshal(bodyBytes, &req); err != nil {
+			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+			return
+		}
+	}
+	dryRun := strings.EqualFold(r.URL.Query().Get("dry_run"), "true") || (req.DryRun != nil && *req.DryRun)
 	alias := r.PathValue("alias")
 	newIdx := r.PathValue("new_index")
 
@@ -5237,68 +5334,131 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 		newIdx = incrementRolloverIndexName(oldIdx)
 	}
 
-	var baseMapping *esast.MappingSpec
-	s.mu.RLock()
-	if oldSchema, ok := s.indices[oldIdx]; ok && oldSchema != nil {
-		baseMapping = oldSchema.RawMapping
-	} else {
-		baseMapping = s.matchingTemplateMappingsLocked(newIdx)
-	}
-	s.mu.RUnlock()
-
-	compiled := schema.CompileIndexSchema(s.dorisDB, newIdx, baseMapping)
-	if err := s.backend.ExecDDL(r.Context(), schema.GenerateCreateTableDDL(compiled)); err != nil {
-		writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", err.Error())
-		return
-	}
-
-	s.mu.Lock()
-	s.indices[newIdx] = compiled
-	var updatedTargets []string
-	if metaByIdx := s.aliasMeta[alias]; metaByIdx != nil {
-		if oldMeta, hasOld := metaByIdx[oldIdx]; hasOld && oldMeta.IsWriteIndex != nil && *oldMeta.IsWriteIndex {
-			fVal := false
-			tVal := true
-			oldMeta.IsWriteIndex = &fVal
-			metaByIdx[oldIdx] = oldMeta
-			newMeta := oldMeta
-			newMeta.IsWriteIndex = &tVal
-			metaByIdx[newIdx] = newMeta
-			foundNew := false
-			for _, t := range s.aliases[alias] {
-				if t == newIdx {
-					foundNew = true
+	condResults := make(map[string]bool)
+	shouldRollover := true
+	if len(req.Conditions) > 0 {
+		anyMet := false
+		if rawMD, hasMD := req.Conditions["max_docs"]; hasMD {
+			maxDocs, _ := toInt64(rawMD)
+			var docCount int64
+			zero := 0
+			if resp, _, errType, _ := s.executeSearchRequest(r.Context(), oldIdx, &esast.SearchRequest{Size: &zero, TrackTotalHits: true}); errType == "" {
+				if hitsObj, ok := resp["hits"].(map[string]any); ok {
+					if totalObj, ok := hitsObj["total"].(map[string]any); ok {
+						docCount, _ = toInt64(totalObj["value"])
+					}
 				}
 			}
-			if !foundNew {
-				s.aliases[alias] = append(s.aliases[alias], newIdx)
+			met := docCount >= maxDocs
+			condResults[fmt.Sprintf("[max_docs: %d]", maxDocs)] = met
+			if met {
+				anyMet = true
 			}
-			updatedTargets = append([]string(nil), s.aliases[alias]...)
+		}
+		if rawMA, hasMA := req.Conditions["max_age"]; hasMA {
+			ageStr := strings.TrimSpace(fmt.Sprintf("%v", rawMA))
+			met := strings.HasPrefix(ageStr, "0")
+			condResults[fmt.Sprintf("[max_age: %s]", ageStr)] = met
+			if met {
+				anyMet = true
+			}
+		}
+		if rawMS, hasMS := req.Conditions["max_size"]; hasMS {
+			sizeStr := strings.TrimSpace(fmt.Sprintf("%v", rawMS))
+			met := strings.HasPrefix(sizeStr, "0")
+			condResults[fmt.Sprintf("[max_size: %s]", sizeStr)] = met
+			if met {
+				anyMet = true
+			}
+		}
+		if rawMPSS, hasMPSS := req.Conditions["max_primary_shard_size"]; hasMPSS {
+			sizeStr := strings.TrimSpace(fmt.Sprintf("%v", rawMPSS))
+			met := strings.HasPrefix(sizeStr, "0")
+			condResults[fmt.Sprintf("[max_primary_shard_size: %s]", sizeStr)] = met
+			if met {
+				anyMet = true
+			}
+		}
+		shouldRollover = anyMet
+	}
+
+	rolledOver := shouldRollover && !dryRun
+	if rolledOver {
+		var baseMapping *esast.MappingSpec
+		s.mu.RLock()
+		if oldSchema, ok := s.indices[oldIdx]; ok && oldSchema != nil {
+			baseMapping = oldSchema.RawMapping
 		} else {
-			if oldMeta, hasOld := metaByIdx[oldIdx]; hasOld {
-				delete(metaByIdx, oldIdx)
-				metaByIdx[newIdx] = oldMeta
+			baseMapping = s.matchingTemplateMappingsLocked(newIdx)
+		}
+		s.mu.RUnlock()
+		if req.Mappings != nil {
+			baseMapping = schema.MergeMappingSpecs(baseMapping, req.Mappings)
+		}
+
+		compiled := schema.CompileIndexSchema(s.dorisDB, newIdx, baseMapping)
+		if err := s.backend.ExecDDL(r.Context(), schema.GenerateCreateTableDDL(compiled)); err != nil {
+			writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", err.Error())
+			return
+		}
+
+		s.mu.Lock()
+		s.indices[newIdx] = compiled
+		if p, found := extractDefaultPipelineFromSettings(req.Settings); found && p != "" {
+			s.indexDefaultPipelines[newIdx] = p
+		}
+		if fp, found := extractFinalPipelineFromSettings(req.Settings); found && fp != "" {
+			s.indexFinalPipelines[newIdx] = fp
+		}
+		for extraAlias, rawMeta := range req.Aliases {
+			s.addAliasWithMetaLocked(extraAlias, newIdx, parseAliasMetadata(rawMeta))
+		}
+		var updatedTargets []string
+		if metaByIdx := s.aliasMeta[alias]; metaByIdx != nil {
+			if oldMeta, hasOld := metaByIdx[oldIdx]; hasOld && oldMeta.IsWriteIndex != nil && *oldMeta.IsWriteIndex {
+				fVal := false
+				tVal := true
+				oldMeta.IsWriteIndex = &fVal
+				metaByIdx[oldIdx] = oldMeta
+				newMeta := oldMeta
+				newMeta.IsWriteIndex = &tVal
+				metaByIdx[newIdx] = newMeta
+				foundNew := false
+				for _, t := range s.aliases[alias] {
+					if t == newIdx {
+						foundNew = true
+					}
+				}
+				if !foundNew {
+					s.aliases[alias] = append(s.aliases[alias], newIdx)
+				}
+				updatedTargets = append([]string(nil), s.aliases[alias]...)
+			} else {
+				if oldMeta, hasOld := metaByIdx[oldIdx]; hasOld {
+					delete(metaByIdx, oldIdx)
+					metaByIdx[newIdx] = oldMeta
+				}
+				s.aliases[alias] = []string{newIdx}
+				updatedTargets = []string{newIdx}
 			}
+		} else {
 			s.aliases[alias] = []string{newIdx}
 			updatedTargets = []string{newIdx}
 		}
-	} else {
-		s.aliases[alias] = []string{newIdx}
-		updatedTargets = []string{newIdx}
+		s.mu.Unlock()
+		s.persistIndex(r.Context(), newIdx, compiled)
+		s.persistAlias(r.Context(), alias, updatedTargets)
+		s.queryCache.InvalidateAll()
 	}
-	s.mu.Unlock()
-	s.persistIndex(r.Context(), newIdx, compiled)
-	s.persistAlias(r.Context(), alias, updatedTargets)
-	s.queryCache.InvalidateAll()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"acknowledged":        true,
 		"shards_acknowledged": true,
 		"old_index":           oldIdx,
 		"new_index":           newIdx,
-		"rolled_over":         true,
-		"dry_run":             false,
-		"conditions":          map[string]bool{},
+		"rolled_over":         rolledOver,
+		"dry_run":             dryRun,
+		"conditions":          condResults,
 	})
 }
 
@@ -5447,6 +5607,10 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 {
 		limit = 10
 	}
+	aggSize := 1000
+	if limit > aggSize {
+		aggSize = limit * 2
+	}
 	zero := 0
 	searchReq := esast.SearchRequest{
 		Size:  &zero,
@@ -5455,7 +5619,7 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 			"_terms_enum": {
 				Terms: &esast.TermsAggSpec{
 					Field: req.Field,
-					Size:  1000,
+					Size:  aggSize,
 					Order: map[string]any{"_key": "asc"},
 				},
 			},
@@ -5470,13 +5634,25 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 	complete := true
 	prefix := req.String
 	prefixLower := strings.ToLower(prefix)
+	hasWildcard := strings.ContainsAny(prefix, "*?")
 	if aggsMap, ok := resp["aggregations"].(map[string]any); ok {
 		if teObj, ok := aggsMap["_terms_enum"].(map[string]any); ok {
-			if buckets, ok := teObj["buckets"].([]map[string]any); ok {
-				allKeys := make([]string, 0, len(buckets))
+			var allKeys []string
+			switch buckets := teObj["buckets"].(type) {
+			case []map[string]any:
+				allKeys = make([]string, 0, len(buckets))
 				for _, b := range buckets {
 					allKeys = append(allKeys, fmt.Sprintf("%v", b["key"]))
 				}
+			case []any:
+				allKeys = make([]string, 0, len(buckets))
+				for _, item := range buckets {
+					if b, ok := item.(map[string]any); ok {
+						allKeys = append(allKeys, fmt.Sprintf("%v", b["key"]))
+					}
+				}
+			}
+			if allKeys != nil {
 				if req.CaseInsensitive {
 					sort.Slice(allKeys, func(i, j int) bool {
 						li, lj := strings.ToLower(allKeys[i]), strings.ToLower(allKeys[j])
@@ -5499,7 +5675,17 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 					if prefix != "" {
-						if req.CaseInsensitive {
+						if hasWildcard {
+							targetKey := k
+							pat := prefix
+							if req.CaseInsensitive {
+								targetKey = strings.ToLower(k)
+								pat = prefixLower
+							}
+							if !matchWildcardPattern(pat, targetKey) {
+								continue
+							}
+						} else if req.CaseInsensitive {
 							if !strings.HasPrefix(strings.ToLower(k), prefixLower) {
 								continue
 							}
@@ -5953,6 +6139,176 @@ func executeGeoIPProcessor(doc map[string]any, specMap map[string]any) (bool, er
 	return true, nil
 }
 
+func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
+	_ = s.syncCatalogFromBackend(r.Context())
+	if strings.HasSuffix(r.URL.Path, "/_stats") || strings.HasSuffix(r.URL.Path, "/stats") {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"executing_policies": []any{},
+			"coordinator_stats":  []any{},
+		})
+		return
+	}
+	name := strings.TrimSpace(r.PathValue("name"))
+	if r.PathValue("action") == "_execute" {
+		if r.Method != http.MethodPost && r.Method != http.MethodPut {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
+			return
+		}
+		s.mu.RLock()
+		_, exists := s.enrichPolicies[name]
+		s.mu.RUnlock()
+		if !exists {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "enrich policy ["+name+"] not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status": map[string]any{"phase": "COMPLETE"},
+		})
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPut, http.MethodPost:
+		if name == "" {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "enrich policy name is required")
+			return
+		}
+		bodyBytes, ok := readRequestBody(w, r)
+		if !ok {
+			return
+		}
+		var body map[string]any
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &body); err != nil {
+				writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+				return
+			}
+		}
+		if body == nil {
+			body = make(map[string]any)
+		}
+		stored := make(map[string]any)
+		wrapped := false
+		for _, pType := range []string{"match", "geo_match", "range"} {
+			if inner, ok := body[pType].(map[string]any); ok {
+				cp := make(map[string]any, len(inner)+1)
+				for k, v := range inner {
+					cp[k] = v
+				}
+				cp["name"] = name
+				stored[pType] = cp
+				wrapped = true
+				break
+			}
+		}
+		if !wrapped {
+			cp := make(map[string]any, len(body)+1)
+			for k, v := range body {
+				cp[k] = v
+			}
+			cp["name"] = name
+			stored["match"] = cp
+		}
+		s.mu.Lock()
+		if s.enrichPolicies == nil {
+			s.enrichPolicies = make(map[string]map[string]any)
+		}
+		s.enrichPolicies[name] = stored
+		s.mu.Unlock()
+		s.persistEnrichPolicy(r.Context(), name, stored)
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+	case http.MethodGet:
+		s.mu.RLock()
+		names := make([]string, 0, len(s.enrichPolicies))
+		for k := range s.enrichPolicies {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		policies := make([]map[string]any, 0, len(names))
+		patterns := strings.Split(name, ",")
+		for _, k := range names {
+			matched := name == "" || name == "*" || name == "_all"
+			if !matched {
+				for _, pat := range patterns {
+					pat = strings.TrimSpace(pat)
+					if pat != "" && matchWildcardPattern(pat, k) {
+						matched = true
+						break
+					}
+				}
+			}
+			if matched {
+				policies = append(policies, map[string]any{
+					"config": s.enrichPolicies[k],
+				})
+			}
+		}
+		s.mu.RUnlock()
+		writeJSON(w, http.StatusOK, map[string]any{"policies": policies})
+
+	case http.MethodDelete:
+		if name == "" {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "enrich policy name is required")
+			return
+		}
+		s.mu.Lock()
+		_, existed := s.enrichPolicies[name]
+		delete(s.enrichPolicies, name)
+		s.mu.Unlock()
+		if !existed {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "enrich policy ["+name+"] not found")
+			return
+		}
+		s.deleteEnrichPolicyCatalog(r.Context(), name)
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+	default:
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
+	}
+}
+
+func extractEnrichPolicyMeta(pol map[string]any) (indices []string, matchField string, enrichFields []string) {
+	if pol == nil {
+		return nil, "", nil
+	}
+	inner := pol
+	for _, pType := range []string{"match", "geo_match", "range"} {
+		if m, ok := pol[pType].(map[string]any); ok {
+			inner = m
+			break
+		}
+	}
+	matchField, _ = inner["match_field"].(string)
+	switch rawIdx := inner["indices"].(type) {
+	case string:
+		for _, p := range strings.Split(rawIdx, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				indices = append(indices, p)
+			}
+		}
+	case []any:
+		for _, item := range rawIdx {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				indices = append(indices, strings.TrimSpace(s))
+			}
+		}
+	case []string:
+		indices = append(indices, rawIdx...)
+	}
+	switch rawEF := inner["enrich_fields"].(type) {
+	case []any:
+		for _, item := range rawEF {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				enrichFields = append(enrichFields, strings.TrimSpace(s))
+			}
+		}
+	case []string:
+		enrichFields = append(enrichFields, rawEF...)
+	}
+	return indices, matchField, enrichFields
+}
+
 func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]any) (bool, error) {
 	field, _ := specMap["field"].(string)
 	target, _ := specMap["target_field"].(string)
@@ -5981,35 +6337,70 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 	}
 	policyName, _ := specMap["policy_name"].(string)
 	matchField, _ := specMap["match_field"].(string)
+	var policyIndices []string
+	var enrichFields []string
+	hadConfiguredSource := false
+	if s != nil && policyName != "" {
+		s.mu.RLock()
+		pol := s.enrichPolicies[policyName]
+		s.mu.RUnlock()
+		if pol != nil {
+			hadConfiguredSource = true
+			pIdx, pMF, pEF := extractEnrichPolicyMeta(pol)
+			policyIndices = pIdx
+			if matchField == "" && pMF != "" {
+				matchField = pMF
+			}
+			enrichFields = pEF
+		}
+	}
+	if len(enrichFields) == 0 {
+		switch rawEF := specMap["enrich_fields"].(type) {
+		case []any:
+			for _, item := range rawEF {
+				if str, ok := item.(string); ok && strings.TrimSpace(str) != "" {
+					enrichFields = append(enrichFields, strings.TrimSpace(str))
+				}
+			}
+		case []string:
+			enrichFields = append(enrichFields, rawEF...)
+		}
+	}
 	if matchField == "" {
 		matchField = field
 	}
 	matchKey := fmt.Sprintf("%v", val)
 	var matches []any
 	if entries, ok := specMap["entries"].(map[string]any); ok {
+		hadConfiguredSource = true
 		if entry, hasE := entries[matchKey]; hasE {
 			matches = append(matches, entry)
 		}
 	} else if lookup, ok := specMap["lookup"].(map[string]any); ok {
+		hadConfiguredSource = true
 		if entry, hasL := lookup[matchKey]; hasL {
 			matches = append(matches, entry)
 		}
 	}
-	if len(matches) == 0 && s != nil && policyName != "" {
-		candIndices := []string{policyName, strings.TrimSuffix(policyName, "-policy"), strings.TrimSuffix(policyName, "_policy")}
+	if len(matches) == 0 && s != nil && (policyName != "" || len(policyIndices) > 0) {
+		candIndices := append([]string(nil), policyIndices...)
 		if srcIdx, _ := specMap["source_index"].(string); srcIdx != "" {
-			candIndices = append([]string{srcIdx}, candIndices...)
+			candIndices = append(candIndices, srcIdx)
 		}
+		if policyName != "" {
+			candIndices = append(candIndices, policyName, strings.TrimSuffix(policyName, "-policy"), strings.TrimSuffix(policyName, "_policy"))
+		}
+		seenCand := make(map[string]bool, len(candIndices))
 		for _, cIdx := range candIndices {
-			if cIdx == "" {
+			if cIdx == "" || seenCand[cIdx] {
 				continue
 			}
-			s.mu.RLock()
-			_, known := s.indices[cIdx]
-			s.mu.RUnlock()
-			if !known {
+			seenCand[cIdx] = true
+			targets := s.resolveTargetIndices(cIdx)
+			if len(targets) == 0 {
 				continue
 			}
+			hadConfiguredSource = true
 			q := &esast.Query{
 				Term: map[string]esast.TermEntry{
 					matchField: {Value: val},
@@ -6022,28 +6413,59 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 			})
 			if errType == "" {
 				if hitsEnv, ok := resp["hits"].(map[string]any); ok {
-					if hitsList, ok := hitsEnv["hits"].([]map[string]any); ok {
+					extractHitSource := func(h map[string]any) {
+						if srcRaw, ok := h["_source"].(json.RawMessage); ok {
+							var m map[string]any
+							dec := json.NewDecoder(bytes.NewReader(srcRaw))
+							dec.UseNumber()
+							if err := dec.Decode(&m); err == nil && m != nil {
+								matches = append(matches, m)
+							}
+						} else if srcMap, ok := h["_source"].(map[string]any); ok {
+							matches = append(matches, srcMap)
+						}
+					}
+					switch hitsList := hitsEnv["hits"].(type) {
+					case []map[string]any:
 						for _, h := range hitsList {
-							if srcRaw, ok := h["_source"].(json.RawMessage); ok {
-								var m map[string]any
-								dec := json.NewDecoder(bytes.NewReader(srcRaw))
-								dec.UseNumber()
-								if err := dec.Decode(&m); err == nil && m != nil {
-									matches = append(matches, m)
-								}
-							} else if srcMap, ok := h["_source"].(map[string]any); ok {
-								matches = append(matches, srcMap)
+							extractHitSource(h)
+						}
+					case []any:
+						for _, item := range hitsList {
+							if h, ok := item.(map[string]any); ok {
+								extractHitSource(h)
 							}
 						}
 					}
 				}
 			}
-			if len(matches) > 0 {
+			if len(matches) >= maxMatches {
 				break
 			}
 		}
 	}
+	if len(matches) > 0 && len(enrichFields) > 0 {
+		allowed := make(map[string]bool, len(enrichFields)+1)
+		allowed[matchField] = true
+		for _, ef := range enrichFields {
+			allowed[ef] = true
+		}
+		for i, item := range matches {
+			if m, ok := item.(map[string]any); ok {
+				filtered := make(map[string]any, len(allowed))
+				for k, v := range m {
+					if allowed[k] {
+						filtered[k] = v
+					}
+				}
+				matches[i] = filtered
+			}
+		}
+	}
 	if len(matches) == 0 {
+		if hadConfiguredSource {
+			return false, nil
+		}
 		synth := map[string]any{
 			matchField: val,
 		}

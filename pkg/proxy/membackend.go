@@ -966,7 +966,9 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 			nums := byBucket[bKey]
 			sort.Float64s(nums)
 			var res float64
+			var w int64 = -1
 			if len(nums) > 0 {
+				w = 0
 				pos := q * float64(len(nums)-1)
 				lower := int(math.Floor(pos))
 				upper := int(math.Ceil(pos))
@@ -982,6 +984,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				BucketKey: bKey,
 				DocCount:  int64(res),
 				Value:     res,
+				Weight:    w,
 			})
 		}
 		return out
@@ -1054,7 +1057,9 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		}
 		sort.Float64s(nums)
 		var res float64
+		var w int64 = -1
 		if len(nums) > 0 {
+			w = 0
 			pos := q * float64(len(nums)-1)
 			lower := int(math.Floor(pos))
 			upper := int(math.Ceil(pos))
@@ -1065,7 +1070,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				res = nums[lower]*(1-weight) + nums[upper]*weight
 			}
 		}
-		return []AggRow{{AggName: aggName, BucketKey: pctKey, DocCount: int64(res), Value: res}}
+		return []AggRow{{AggName: aggName, BucketKey: pctKey, DocCount: int64(res), Value: res, Weight: w}}
 	}
 
 	if m := reAggPercentileRank.FindStringSubmatch(branch); m != nil {

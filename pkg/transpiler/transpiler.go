@@ -6522,6 +6522,8 @@ func parseScriptParamKey(s string) (string, bool) {
 		suffix := quote + "]"
 		if strings.HasPrefix(s, prefix) && strings.HasSuffix(s, suffix) {
 			key := s[len(prefix) : len(s)-len(suffix)]
+			key = strings.ReplaceAll(key, `\`+quote, quote)
+			key = strings.ReplaceAll(key, `\\`, `\`)
 			if key != "" {
 				return key, true
 			}
@@ -6548,9 +6550,14 @@ func (t *Transpiler) parseMetricScriptExpr(s string, params map[string]any, defa
 	for _, ops := range []string{"+-", "*/%"} {
 		parenDepth := 0
 		var inQuote byte
-		for i := len(s) - 1; i > 0; i-- {
+		var opIndices []int
+		for i := 0; i < len(s); i++ {
 			ch := s[i]
 			if inQuote != 0 {
+				if ch == '\\' {
+					i++
+					continue
+				}
 				if ch == inQuote {
 					inQuote = 0
 				}
@@ -6561,18 +6568,23 @@ func (t *Transpiler) parseMetricScriptExpr(s string, params map[string]any, defa
 				continue
 			}
 			switch ch {
-			case ')', ']':
-				parenDepth++
 			case '(', '[':
+				parenDepth++
+			case ')', ']':
 				parenDepth--
 			default:
-				if parenDepth == 0 && strings.IndexByte(ops, ch) >= 0 {
-					lhs, ok1 := t.parseMetricScriptExpr(s[:i], params, defaultField, fieldOverrideExpr, nctx, depth+1)
-					rhs, ok2 := t.parseMetricScriptExpr(s[i+1:], params, defaultField, fieldOverrideExpr, nctx, depth+1)
-					if ok1 && ok2 {
-						return fmt.Sprintf("(%s %c %s)", lhs, ch, rhs), true
-					}
+				if i > 0 && parenDepth == 0 && strings.IndexByte(ops, ch) >= 0 {
+					opIndices = append(opIndices, i)
 				}
+			}
+		}
+		for k := len(opIndices) - 1; k >= 0; k-- {
+			i := opIndices[k]
+			ch := s[i]
+			lhs, ok1 := t.parseMetricScriptExpr(s[:i], params, defaultField, fieldOverrideExpr, nctx, depth+1)
+			rhs, ok2 := t.parseMetricScriptExpr(s[i+1:], params, defaultField, fieldOverrideExpr, nctx, depth+1)
+			if ok1 && ok2 {
+				return fmt.Sprintf("(%s %c %s)", lhs, ch, rhs), true
 			}
 		}
 	}
@@ -6802,6 +6814,10 @@ func hasMatchingThresholdParens(s string) bool {
 	for i := 0; i < len(s); i++ {
 		ch := s[i]
 		if inQuote != 0 {
+			if ch == '\\' {
+				i++
+				continue
+			}
 			if ch == inQuote {
 				inQuote = 0
 			}
@@ -6845,9 +6861,14 @@ func (t *Transpiler) parseSafeThresholdExpr(s string, params map[string]any, num
 	for _, ops := range []string{"+-", "*/%"} {
 		parenDepth := 0
 		var inQuote byte
-		for i := len(s) - 1; i > 0; i-- {
+		var opIndices []int
+		for i := 0; i < len(s); i++ {
 			ch := s[i]
 			if inQuote != 0 {
+				if ch == '\\' {
+					i++
+					continue
+				}
 				if ch == inQuote {
 					inQuote = 0
 				}
@@ -6858,18 +6879,23 @@ func (t *Transpiler) parseSafeThresholdExpr(s string, params map[string]any, num
 				continue
 			}
 			switch ch {
-			case ')', ']':
-				parenDepth++
 			case '(', '[':
+				parenDepth++
+			case ')', ']':
 				parenDepth--
 			default:
-				if parenDepth == 0 && strings.IndexByte(ops, ch) >= 0 {
-					lhs, ok1 := t.parseSafeThresholdExpr(s[:i], params, numTerms, nctx, depth+1)
-					rhs, ok2 := t.parseSafeThresholdExpr(s[i+1:], params, numTerms, nctx, depth+1)
-					if ok1 && ok2 {
-						return fmt.Sprintf("(%s %c %s)", lhs, ch, rhs), true
-					}
+				if i > 0 && parenDepth == 0 && strings.IndexByte(ops, ch) >= 0 {
+					opIndices = append(opIndices, i)
 				}
+			}
+		}
+		for k := len(opIndices) - 1; k >= 0; k-- {
+			i := opIndices[k]
+			ch := s[i]
+			lhs, ok1 := t.parseSafeThresholdExpr(s[:i], params, numTerms, nctx, depth+1)
+			rhs, ok2 := t.parseSafeThresholdExpr(s[i+1:], params, numTerms, nctx, depth+1)
+			if ok1 && ok2 {
+				return fmt.Sprintf("(%s %c %s)", lhs, ch, rhs), true
 			}
 		}
 	}
@@ -6989,6 +7015,10 @@ func splitTwoThresholdArgs(s string) (string, string, bool) {
 	for i := 0; i < len(s); i++ {
 		ch := s[i]
 		if inQuote != 0 {
+			if ch == '\\' {
+				i++
+				continue
+			}
 			if ch == inQuote {
 				inQuote = 0
 			}
@@ -7737,7 +7767,10 @@ func normalizeBooleanQueryValue(val any) (bool, bool) {
 	case float64:
 		return v != 0 && !math.IsNaN(v), true
 	case json.Number:
-		return v.String() != "0", true
+		if f, err := v.Float64(); err == nil {
+			return f != 0 && !math.IsNaN(f), true
+		}
+		return v.String() != "0" && v.String() != "", true
 	case string:
 		switch strings.ToLower(strings.TrimSpace(v)) {
 		case "true", "1":

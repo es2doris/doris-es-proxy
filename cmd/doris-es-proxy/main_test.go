@@ -259,4 +259,82 @@ func TestSubcommands_Transpile_DDL_Doctor_MigrateSchema(t *testing.T) {
 		"--es-user", "elastic",
 		"--es-password", "changeme",
 	})
+	runMigrateSchemaSubcommand([]string{
+		"--es-url", esServer.URL,
+		"--index", "_all",
+		"--db", "es_migrated",
+		"--out-dir", outDir,
+		"--es-api-key", "Bearer custom-token",
+	})
+
+	// 6. Stdin branches for transpile and ddl, plus main() version dispatch and doctor error branches
+	oldStdin := os.Stdin
+	oldArgs := os.Args
+	defer func() {
+		os.Stdin = oldStdin
+		os.Args = oldArgs
+	}()
+
+	rIn, wIn, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = wIn.WriteString(`{"query":{"match_all":{}}}`)
+	_ = wIn.Close()
+	os.Stdin = rIn
+	os.Args = []string{"doris-es-proxy", "transpile", "--index", "stdin_idx"}
+	stdinTranspileOut := captureStdout(t, func() {
+		main()
+	})
+	_ = rIn.Close()
+	if !strings.Contains(stdinTranspileOut, "stdin_idx") {
+		t.Fatalf("expected stdin_idx in main() transpile output, got:\n%s", stdinTranspileOut)
+	}
+
+	rIn2, wIn2, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = wIn2.WriteString(`{"properties":{"host":{"type":"keyword"}}}`)
+	_ = wIn2.Close()
+	os.Stdin = rIn2
+	os.Args = []string{"doris-es-proxy", "ddl", "--index", "stdin_ddl_idx"}
+	stdinDDLOut := captureStdout(t, func() {
+		main()
+	})
+	_ = rIn2.Close()
+	if !strings.Contains(stdinDDLOut, "stdin_ddl_idx") || !strings.Contains(stdinDDLOut, "f__host") {
+		t.Fatalf("expected stdin_ddl_idx and f__host in main() ddl output, got:\n%s", stdinDDLOut)
+	}
+
+	for _, verArg := range []string{"version", "--version", "-v"} {
+		os.Args = []string{"doris-es-proxy", verArg}
+		verOut := captureStdout(t, func() {
+			main()
+		})
+		if !strings.Contains(verOut, "doris-es-proxy") {
+			t.Fatalf("expected version output for %s, got %q", verArg, verOut)
+		}
+	}
+
+	// Doctor with failing HTTP status (503) and unreachable HTTP port
+	failFEServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer failFEServer.Close()
+	os.Args = []string{"doris-es-proxy", "doctor", "--doris-dsn", "root:@tcp(127.0.0.1:1)/?timeout=20ms", "--doris-http", failFEServer.URL}
+	docFailOut := captureStdout(t, func() {
+		main()
+	})
+	if !strings.Contains(docFailOut, "FAIL (HTTP 503)") {
+		t.Fatalf("expected FAIL (HTTP 503) in doctor output, got:\n%s", docFailOut)
+	}
+
+	os.Args = []string{"doris-es-proxy", "doctor", "--doris-dsn", "root:@tcp(127.0.0.1:1)/?timeout=20ms", "--doris-http", "http://127.0.0.1:1"}
+	docUnreachOut := captureStdout(t, func() {
+		main()
+	})
+	if !strings.Contains(docUnreachOut, "UNREACHABLE") {
+		t.Fatalf("expected UNREACHABLE in doctor output, got:\n%s", docUnreachOut)
+	}
 }

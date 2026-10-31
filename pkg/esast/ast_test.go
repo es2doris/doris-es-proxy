@@ -266,3 +266,268 @@ func TestASTQueryAndAggVariants(t *testing.T) {
 		t.Fatalf("expected error for unknown query clause")
 	}
 }
+
+func TestASTRound28ComprehensiveCoverage(t *testing.T) {
+	// 1. SearchRequest helpers: EffectiveFieldSpecs, HasStoredFieldsNone, ShouldTrackTotalHits, StoredFieldsSlice
+	var nilReq *SearchRequest
+	if nilReq.HasStoredFieldsNone() || nilReq.EffectiveFieldSpecs() != nil || !nilReq.ShouldTrackTotalHits() {
+		t.Fatalf("unexpected nil SearchRequest helper behavior")
+	}
+	if StoredFieldsSlice(nil) != nil || len(StoredFieldsSlice("_none_")) != 1 || len(StoredFieldsSlice([]any{"a", "b"})) != 2 || len(StoredFieldsSlice([]string{"x"})) != 1 {
+		t.Fatalf("unexpected StoredFieldsSlice results")
+	}
+	req := &SearchRequest{
+		StoredFields:   []any{"_none_", "title"},
+		Fields:         []FieldRequestSpec{{Field: "status"}},
+		DocvalueFields: []FieldRequestSpec{{Field: "@timestamp", Format: "epoch_millis"}},
+	}
+	if !req.HasStoredFieldsNone() {
+		t.Fatalf("expected HasStoredFieldsNone=true")
+	}
+	if specs := req.EffectiveFieldSpecs(); len(specs) != 3 {
+		t.Fatalf("expected 3 EffectiveFieldSpecs, got %d", len(specs))
+	}
+	for _, tc := range []struct {
+		val  any
+		want bool
+	}{
+		{nil, true},
+		{true, true},
+		{false, false},
+		{"true", true},
+		{"false", false},
+		{"FALSE", false},
+		{"0", false},
+		{"0.0", false},
+		{"-1", false},
+		{"100", true},
+		{0, false},
+		{-5, false},
+		{10, true},
+		{int64(0), false},
+		{int64(50), true},
+		{float64(0), false},
+		{float64(-1.5), false},
+		{float64(25.0), true},
+		{json.Number("0"), false},
+		{json.Number("0.0"), false},
+		{json.Number("-2.5"), false},
+		{json.Number("1000"), true},
+		{json.Number("10.5"), true},
+	} {
+		r := &SearchRequest{TrackTotalHits: tc.val}
+		if got := r.ShouldTrackTotalHits(); got != tc.want {
+			t.Fatalf("ShouldTrackTotalHits(%#v) = %v, want %v", tc.val, got, tc.want)
+		}
+	}
+
+	// 2. FieldRequestSpec & KNNQuery UnmarshalJSON
+	var frs1, frs2 FieldRequestSpec
+	if err := json.Unmarshal([]byte(`"host.name"`), &frs1); err != nil || frs1.Field != "host.name" {
+		t.Fatalf("FieldRequestSpec string unmarshal failed: %+v (%v)", frs1, err)
+	}
+	if err := json.Unmarshal([]byte(`{"field":"@timestamp","format":"strict_date"}`), &frs2); err != nil || frs2.Field != "@timestamp" || frs2.Format != "strict_date" {
+		t.Fatalf("FieldRequestSpec object unmarshal failed: %+v (%v)", frs2, err)
+	}
+	var knn1, knn2 KNNQuery
+	if err := json.Unmarshal([]byte(`{"field":"vec","query_vector":[0.1,0.2],"k":5,"num_candidates":10}`), &knn1); err != nil || knn1.Field != "vec" || knn1.K != 5 {
+		t.Fatalf("KNNQuery standard unmarshal failed: %+v (%v)", knn1, err)
+	}
+	if err := json.Unmarshal([]byte(`{"embedding":{"vector":[0.5,0.6],"k":3}}`), &knn2); err != nil || knn2.Field != "embedding" || len(knn2.QueryVector) != 2 {
+		t.Fatalf("KNNQuery OpenSearch unmarshal failed: %+v (%v)", knn2, err)
+	}
+
+	// 3. CollapseSpec, CollapseInnerHits, InnerHitsSpec, RescoreList
+	var srCollapse SearchRequest
+	collapseJSON := `{
+		"collapse": {
+			"field": "category",
+			"inner_hits": {"name": "top_in_cat", "size": 2, "fields": ["title"], "docvalue_fields": [{"field": "price"}]}
+		},
+		"rescore": {
+			"window_size": 50,
+			"query": {"rescore_query": {"match": {"title": "laptop"}}, "query_weight": 1.2, "rescore_query_weight": 2.0, "score_mode": "multiply"}
+		}
+	}`
+	if err := json.Unmarshal([]byte(collapseJSON), &srCollapse); err != nil {
+		t.Fatalf("collapse/rescore unmarshal failed: %v", err)
+	}
+	if srCollapse.Collapse == nil || len(srCollapse.Collapse.InnerHits) != 1 {
+		t.Fatalf("expected 1 collapse inner_hits, got %+v", srCollapse.Collapse)
+	}
+	ih := srCollapse.Collapse.InnerHits[0]
+	if ih.EffectiveSize() != 2 || len(ih.EffectiveFieldSpecs()) != 2 {
+		t.Fatalf("unexpected InnerHitsSpec helpers: size=%d specs=%v", ih.EffectiveSize(), ih.EffectiveFieldSpecs())
+	}
+	negSize := -1
+	if (&InnerHitsSpec{Size: &negSize}).EffectiveSize() != 0 || (&InnerHitsSpec{}).EffectiveSize() != 3 {
+		t.Fatalf("unexpected InnerHitsSpec default/negative EffectiveSize")
+	}
+	if len(srCollapse.Rescore) != 1 || srCollapse.Rescore[0].WindowSize == nil || *srCollapse.Rescore[0].WindowSize != 50 {
+		t.Fatalf("unexpected RescoreList single-object unmarshal: %+v", srCollapse.Rescore)
+	}
+	var srRescoreArr SearchRequest
+	if err := json.Unmarshal([]byte(`{"collapse":{"field":"f","inner_hits":[{"name":"a"},{"name":"b"}]},"rescore":[{"window_size":10}]}`), &srRescoreArr); err != nil || len(srRescoreArr.Collapse.InnerHits) != 2 || len(srRescoreArr.Rescore) != 1 {
+		t.Fatalf("array collapse/rescore unmarshal failed: %v", err)
+	}
+
+	// 4. KNNQuery (ES 8/9 standard & OpenSearch field-keyed syntax) and KNNSlice
+	var knnStd, knnOS KNNQuery
+	if err := json.Unmarshal([]byte(`{"field":"vec","query_vector":[0.1,0.2],"k":5,"num_candidates":10}`), &knnStd); err != nil || knnStd.Field != "vec" || knnStd.K != 5 {
+		t.Fatalf("KNNQuery standard unmarshal failed: %+v (%v)", knnStd, err)
+	}
+	if err := json.Unmarshal([]byte(`{"vec_os":{"vector":[0.3,0.4],"k":3,"num_candidates":8}}`), &knnOS); err != nil || knnOS.Field != "vec_os" || knnOS.K != 3 || len(knnOS.QueryVector) != 2 {
+		t.Fatalf("KNNQuery OpenSearch unmarshal failed: %+v (%v)", knnOS, err)
+	}
+	var srKNN SearchRequest
+	if err := json.Unmarshal([]byte(`{"knn":{"field":"vec","query_vector":[1,2],"k":2},"aggs":{"a":{"terms":{"field":"f"}}}}`), &srKNN); err != nil || len(srKNN.KNN) != 1 || len(srKNN.EffectiveAggs()) != 1 {
+		t.Fatalf("KNNSlice single-object & EffectiveAggs failed: %v", err)
+	}
+
+	// 5. RangeCond NormalizedBounds, ScriptQuery, FuzzyEntry, PrefixEntry, WildcardEntry, RegexpEntry, MatchEntry, PhraseEntry
+	var rcQ, sqStrQ, sqObjQ, fzShortQ, fzFullQ, pfShortQ, pfFullQ, wcFullQ, rxFullQ, mShortQ, mFullQ, mpShortQ, mpFullQ Query
+	if err := json.Unmarshal([]byte(`{"range":{"age":{"from":18,"to":65,"include_lower":false,"include_upper":true}}}`), &rcQ); err != nil {
+		t.Fatalf("RangeCond from/to unmarshal failed: %v", err)
+	}
+	gt, gte, lt, lte := rcQ.Range["age"].NormalizedBounds()
+	if gt == nil || gte != nil || lt != nil || lte == nil {
+		t.Fatalf("unexpected NormalizedBounds: gt=%v gte=%v lt=%v lte=%v", gt, gte, lt, lte)
+	}
+	if err := json.Unmarshal([]byte(`{"script":"doc['a'].value > 1"}`), &sqStrQ); err != nil || sqStrQ.Script == nil {
+		t.Fatalf("ScriptQuery string unmarshal failed: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"script":{"script":{"source":"doc['a'].value > 1"},"boost":1.5}}`), &sqObjQ); err != nil || sqObjQ.Script == nil || sqObjQ.Script.Boost == nil {
+		t.Fatalf("ScriptQuery object unmarshal failed: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"fuzzy":{"name":"alice"}}`), &fzShortQ); err != nil || fzShortQ.Fuzzy["name"].Value != "alice" {
+		t.Fatalf("FuzzyEntry short unmarshal failed: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"fuzzy":{"name":{"value":"alice","fuzziness":"AUTO","boost":2.0}}}`), &fzFullQ); err != nil || fzFullQ.Fuzzy["name"].Boost != 2.0 {
+		t.Fatalf("FuzzyEntry full unmarshal failed: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"prefix":{"name":"al"}}`), &pfShortQ); err != nil || pfShortQ.Prefix["name"].Value != "al" {
+		t.Fatalf("PrefixEntry short unmarshal failed: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"prefix":{"name":{"value":"al","case_insensitive":true,"boost":1.5}}}`), &pfFullQ); err != nil || !pfFullQ.Prefix["name"].CaseInsensitive {
+		t.Fatalf("PrefixEntry full unmarshal failed: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"wildcard":{"name":{"wildcard":"al*","case_insensitive":true,"boost":1.2}}}`), &wcFullQ); err != nil || wcFullQ.Wildcard["name"].Value != "al*" {
+		t.Fatalf("WildcardEntry full unmarshal failed: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"regexp":{"name":{"value":"al.*","case_insensitive":true,"boost":1.2}}}`), &rxFullQ); err != nil || !rxFullQ.Regexp["name"].CaseInsensitive {
+		t.Fatalf("RegexpEntry full unmarshal failed: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"match":{"title":"hello world"}}`), &mShortQ); err != nil || mShortQ.Match["title"].Query != "hello world" {
+		t.Fatalf("MatchEntry short unmarshal failed: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"match":{"title":{"query":"hello world","operator":"AND","boost":2.0,"fuzziness":1}}}`), &mFullQ); err != nil || mFullQ.Match["title"].Operator != "and" {
+		t.Fatalf("MatchEntry full unmarshal failed: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"match_phrase":{"title":"hello world"}}`), &mpShortQ); err != nil || mpShortQ.MatchPhrase["title"].Query != "hello world" {
+		t.Fatalf("PhraseEntry short unmarshal failed: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"match_phrase":{"title":{"query":"hello world","slop":2,"boost":1.5}}}`), &mpFullQ); err != nil || mpFullQ.MatchPhrase["title"].Slop != 2 {
+		t.Fatalf("PhraseEntry full unmarshal failed: %v", err)
+	}
+
+	// 6. CombinedFieldsQuery, QueryString, SimpleQueryString, MultiMatch, TermsQuery (with lookup)
+	var cfQ, qsQ, sqsQ, mmQ, tLookupQ Query
+	if err := json.Unmarshal([]byte(`{"combined_fields":{"query":"database error","fields":["title^2","body"],"operator":"and","minimum_should_match":2}}`), &cfQ); err != nil || cfQ.CombinedFields == nil {
+		t.Fatalf("CombinedFieldsQuery failed: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"query_string":{"query":"status:active","fields":["title","body"],"default_operator":"AND","fuzziness":"AUTO","minimum_should_match":"75%"}}`), &qsQ); err != nil || qsQ.QueryString == nil {
+		t.Fatalf("QueryStringQuery failed: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"simple_query_string":{"query":"foo + bar","fields":["title"],"flags":"ALL","minimum_should_match":1}}`), &sqsQ); err != nil || sqsQ.SimpleQueryString == nil {
+		t.Fatalf("SimpleQueryStringQuery failed: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"multi_match":{"query":"quick fox","fields":["title^3","body"],"type":"cross_fields","operator":"and","fuzziness":1,"minimum_should_match":"2<-25%"}}`), &mmQ); err != nil || mmQ.MultiMatch == nil {
+		t.Fatalf("MultiMatchQuery failed: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"terms":{"role":{"index":"users","id":"u1","path":"roles"},"boost":1.5}}`), &tLookupQ); err != nil || tLookupQ.Terms == nil || len(tLookupQ.Terms.Lookups) != 1 {
+		t.Fatalf("TermsQuery lookup unmarshal failed: %+v (%v)", tLookupQ.Terms, err)
+	}
+	if _, err := json.Marshal(tLookupQ.Terms); err != nil {
+		t.Fatalf("TermsQuery MarshalJSON failed: %v", err)
+	}
+
+	// 7. SortSpec legacy multi-key options, _script sort, _geo_distance sort, and round-trip MarshalJSON
+	sortCases := []struct {
+		raw         string
+		wantField   string
+		wantOrder   string
+		wantMode    string
+		wantMissing string
+		wantType    string
+	}{
+		{`{"price": "desc", "mode": "avg", "missing": "_last", "unmapped_type": "long"}`, "price", "desc", "avg", "_last", "long"},
+		{`{"rating": {"order": "asc"}, "mode": "max", "missing": 0, "numeric_type": "double"}`, "rating", "asc", "max", "0", "double"},
+		{`{"_script": {"type": "number", "order": "desc", "missing": -1, "script": {"source": "doc['a'].value"}}}`, "_script", "desc", "", "-1", "number"},
+		{`{"_geo_distance": {"pin.location": [-70, 40], "order": "asc", "unit": "km", "mode": "min"}}`, "_geo_distance", "asc", "min", "", ""},
+		{`"_score"`, "_score", "desc", "", "", ""},
+		{`"created_at"`, "created_at", "asc", "", "", ""},
+	}
+	for _, sc := range sortCases {
+		var sp SortSpec
+		if err := json.Unmarshal([]byte(sc.raw), &sp); err != nil {
+			t.Fatalf("SortSpec(%s) unmarshal failed: %v", sc.raw, err)
+		}
+		if sp.Entry.Field != sc.wantField || sp.Entry.Order != sc.wantOrder || sp.Entry.Mode != sc.wantMode || sp.Entry.Missing != sc.wantMissing || sp.Entry.Type != sc.wantType {
+			t.Fatalf("SortSpec(%s) = %+v, want field=%q order=%q mode=%q missing=%q type=%q", sc.raw, sp.Entry, sc.wantField, sc.wantOrder, sc.wantMode, sc.wantMissing, sc.wantType)
+		}
+		if _, err := json.Marshal(sp); err != nil {
+			t.Fatalf("SortSpec(%s) marshal failed: %v", sc.raw, err)
+		}
+	}
+	// Also test scriptless _geo_distance MarshalJSON
+	geoNoScript := SortSpec{Entry: SortFieldSpec{Field: "_geo_distance", Order: "desc", Mode: "min", Missing: "_last"}}
+	if b, err := json.Marshal(geoNoScript); err != nil || !strings.Contains(string(b), `"order":"desc"`) {
+		t.Fatalf("scriptless _geo_distance MarshalJSON failed: %s (%v)", string(b), err)
+	}
+
+	// 8. TopMetricsAggSpec, FiltersAggSpec, TopHitsAggSpec, DateHistogramAggSpec (Offset + TimeZone)
+	var tmSingle, tmMulti TopMetricsAggSpec
+	if err := json.Unmarshal([]byte(`{"metric":{"field":"m1"},"sort":{"ts":"desc"}}`), &tmSingle); err != nil || len(tmSingle.EffectiveMetricFields()) != 1 || tmSingle.EffectiveSize() != 1 {
+		t.Fatalf("TopMetricsAggSpec single failed: %+v (%v)", tmSingle, err)
+	}
+	if err := json.Unmarshal([]byte(`{"metrics":[{"field":"m1"},{"field":"m2"}],"size":5,"sort":[{"ts":"desc"}]}`), &tmMulti); err != nil || len(tmMulti.EffectiveMetricFields()) != 2 || tmMulti.EffectiveSize() != 5 {
+		t.Fatalf("TopMetricsAggSpec multi failed: %+v (%v)", tmMulti, err)
+	}
+	if _, err := json.Marshal(tmMulti); err != nil {
+		t.Fatalf("TopMetricsAggSpec MarshalJSON failed: %v", err)
+	}
+	var fAnon, fNamed FiltersAggSpec
+	if err := json.Unmarshal([]byte(`{"filters":[{"term":{"a":"1"}},{"term":{"b":"2"}}],"other_bucket":true}`), &fAnon); err != nil || !fAnon.IsAnonymous || fAnon.EffectiveKeyed() || fAnon.EffectiveOtherBucketKey() != "_other_" {
+		t.Fatalf("FiltersAggSpec anonymous failed: %+v (%v)", fAnon, err)
+	}
+	if _, err := json.Marshal(fAnon); err != nil {
+		t.Fatalf("FiltersAggSpec anonymous marshal failed: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"filters":{"errors":{"term":{"level":"error"}}},"other_bucket_key":"rest","keyed":true}`), &fNamed); err != nil || fNamed.IsAnonymous || !fNamed.EffectiveKeyed() || fNamed.EffectiveOtherBucketKey() != "rest" {
+		t.Fatalf("FiltersAggSpec named failed: %+v (%v)", fNamed, err)
+	}
+	if _, err := json.Marshal(fNamed); err != nil {
+		t.Fatalf("FiltersAggSpec named marshal failed: %v", err)
+	}
+	dhTz := &DateHistogramAggSpec{FixedInterval: "1h", Offset: "+30m", TimeZone: "-05:00"}
+	if dhTz.EffectiveOffsetMs() != 30*60*1000 || dhTz.EffectiveTimeZoneOffsetMs() != -5*3600*1000 {
+		t.Fatalf("unexpected DateHistogram offset/timezone: offset=%d tz=%d", dhTz.EffectiveOffsetMs(), dhTz.EffectiveTimeZoneOffsetMs())
+	}
+	if ParseTimeZoneOffsetMs("+0530") != (5*3600+30*60)*1000 || ParseTimeZoneOffsetMs("+2") != 2*3600*1000 || ParseTimeZoneOffsetMs("America/New_York") == 0 {
+		t.Fatalf("unexpected ParseTimeZoneOffsetMs results")
+	}
+
+	// 9. SourceFilter & HighlightSpec
+	var sfBoolFalse, sfBoolTrue, sfStr, sfArr, sfObj SourceFilter
+	_ = json.Unmarshal([]byte(`false`), &sfBoolFalse)
+	_ = json.Unmarshal([]byte(`true`), &sfBoolTrue)
+	_ = json.Unmarshal([]byte(`"obj.*"`), &sfStr)
+	_ = json.Unmarshal([]byte(`["a","b"]`), &sfArr)
+	_ = json.Unmarshal([]byte(`{"includes":["a"],"excludes":["b"]}`), &sfObj)
+	if !sfBoolFalse.Disabled || sfBoolTrue.Disabled || len(sfStr.Includes) != 1 || len(sfArr.Includes) != 2 || len(sfObj.Excludes) != 1 {
+		t.Fatalf("unexpected SourceFilter unmarshal results")
+	}
+	_, _ = json.Marshal(sfBoolFalse)
+	_, _ = json.Marshal(sfBoolTrue)
+	_, _ = json.Marshal(sfObj)
+}

@@ -174,7 +174,19 @@ func GeneratePromoteVariantFieldDDL(s *IndexSchema, esFieldPath string, esType s
 		return nil
 	}
 	cleanPath := strings.TrimSuffix(esFieldPath, ".keyword")
+	if cleanPath == "" {
+		return nil
+	}
 	if existing, ok := s.Fields[cleanPath]; ok && existing.Kind != StorageDynamicVariant {
+		return nil
+	}
+	for _, root := range s.NestedRoots {
+		if cleanPath == root || strings.HasPrefix(cleanPath, root+".") {
+			return nil
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(esType)) {
+	case "dense_vector", "knn_vector", "nested", "object", "flattened", "join", "percolator":
 		return nil
 	}
 	colName := "f__" + SanitizeDorisIdentifier(cleanPath)

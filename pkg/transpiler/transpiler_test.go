@@ -891,3 +891,171 @@ func TestTranspiler_Round3DeepEvalFixes(t *testing.T) {
 		t.Fatalf("expected composite after cursor filter > 'checkout\\x1fprod', got:\n%s", plan3.AggsSQL)
 	}
 }
+
+func TestTranspilerRound28ComprehensiveCoverage(t *testing.T) {
+	mappingJSON := `{
+		"properties": {
+			"service": {"type": "keyword"},
+			"env": {"type": "keyword"},
+			"title": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+			"latency": {"type": "double"},
+			"status": {"type": "integer"},
+			"ok": {"type": "boolean"},
+			"client_ip": {"type": "ip"},
+			"created_at": {"type": "date"},
+			"location": {"type": "geo_point"},
+			"tags": {"type": "keyword"},
+			"embedding": {"type": "dense_vector", "dims": 3},
+			"events": {
+				"type": "nested",
+				"properties": {
+					"kind": {"type": "keyword"},
+					"ms": {"type": "long"}
+				}
+			}
+		}
+	}`
+	var mSpec esast.MappingSpec
+	if err := json.Unmarshal([]byte(mappingJSON), &mSpec); err != nil {
+		t.Fatal(err)
+	}
+	idxSchema := schema.CompileIndexSchema("logs_db", "round28_idx", &mSpec)
+	tr := NewTranspiler(idxSchema, TranspilerOptions{})
+
+	// 1. Lucene query_string parser (field groups, ranges, regex, wildcards, _exists_, boolean ops, boosts, fuzzy, sloppy phrases)
+	luceneQueries := []string{
+		`service:checkout AND (env:prod OR env:staging) AND NOT status:500`,
+		`title:(+database -timeout "connection pool"~2)^2.5`,
+		`latency:[10 TO 500} AND status:{100 TO *] AND _exists_:service`,
+		`service:/check.*/ AND service:check* AND title:quikc~1`,
+		`latency:>=100 AND latency:<500 AND ok:0.0`,
+	}
+	for _, lq := range luceneQueries {
+		var req esast.SearchRequest
+		raw := `{"query":{"query_string":{"query":` + mustJSONString(lq) + `,"default_field":"title"}}}`
+		if err := json.Unmarshal([]byte(raw), &req); err != nil {
+			t.Fatalf("unmarshal lucene query %q failed: %v", lq, err)
+		}
+		plan, err := tr.BuildSearchPlan(&req)
+		if err != nil || plan.HitsSQL == "" {
+			t.Fatalf("BuildSearchPlan(%q) failed: %v", lq, err)
+		}
+	}
+
+	// 2. simple_query_string, combined_fields, match_bool_prefix, match_phrase_prefix, terms_set, dis_max, boosting, function_score, knn
+	complexQueryJSON := `{
+		"query": {
+			"bool": {
+				"must": [
+					{"simple_query_string": {"query": "\"error\" + (timeout | retry) -fatal*", "fields": ["title^2", "service"]}},
+					{"combined_fields": {"query": "checkout prod", "fields": ["title", "service"], "operator": "and"}},
+					{"match_bool_prefix": {"title": {"query": "quick brown fox", "operator": "and"}}},
+					{"match_phrase_prefix": {"title": {"query": "quick br", "slop": 1}}},
+					{"terms_set": {"tags": {"terms": ["go", "doris"], "minimum_should_match_script": {"source": "Math.min(params.num_terms, 1)"}}}}
+				],
+				"filter": [
+					{"dis_max": {"tie_breaker": 0.3, "queries": [{"term": {"service": "checkout"}}, {"prefix": {"service": "pay"}}]}},
+					{"boosting": {"positive": {"match": {"title": "database"}}, "negative": {"term": {"status": 500}}, "negative_boost": 0.2}},
+					{"function_score": {"query": {"match_all": {}}, "functions": [{"filter": {"term": {"service": "checkout"}}, "weight": 2.0}, {"field_value_factor": {"field": "latency", "factor": 1.2, "modifier": "log1p", "missing": 1.0}}], "score_mode": "sum", "boost_mode": "multiply"}},
+					{"fuzzy": {"title": {"value": "databse", "fuzziness": 1}}},
+					{"term": {"ok": 0.0}}
+				]
+			}
+		},
+		"knn": [
+			{"field": "embedding", "query_vector": [0.1, 0.2, 0.3], "k": 5, "num_candidates": 10}
+		]
+	}`
+	var reqComplex esast.SearchRequest
+	dec := json.NewDecoder(strings.NewReader(complexQueryJSON))
+	dec.UseNumber()
+	if err := dec.Decode(&reqComplex); err != nil {
+		t.Fatalf("decode complexQueryJSON failed: %v", err)
+	}
+	planComplex, err := tr.BuildSearchPlan(&reqComplex)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan(complex) failed: %v", err)
+	}
+	if !strings.Contains(planComplex.HitsSQL, "`f__ok` = FALSE") {
+		t.Fatalf("expected json.Number(\"0.0\") on boolean term query to compile to `f__ok` = FALSE, got:\n%s", planComplex.HitsSQL)
+	}
+
+	// 3. Advanced aggregations & script expression with escaped single quote (\')
+	aggsJSON := `{
+		"size": 0,
+		"aggs": {
+			"by_hour": {
+				"date_histogram": {"field": "created_at", "fixed_interval": "1h", "offset": "+15m", "time_zone": "+02:00"},
+				"aggs": {
+					"req_rate": {"rate": {"field": "latency", "unit": "minute", "mode": "sum"}}
+				}
+			},
+			"by_date_range": {
+				"date_range": {
+					"field": "created_at",
+					"ranges": [{"from": "2026-10-01T00:00:00Z", "to": "2026-10-25T00:00:00Z", "key": "oct"}]
+				}
+			},
+			"by_ip_range": {
+				"ip_range": {
+					"field": "client_ip",
+					"ranges": [{"mask": "10.0.0.0/8"}, {"from": "192.168.1.1", "to": "192.168.1.255"}]
+				}
+			},
+			"named_filters": {
+				"filters": {
+					"filters": {
+						"prod": {"term": {"env": "prod"}},
+						"stage": {"term": {"env": "staging"}}
+					},
+					"other_bucket": true
+				}
+			},
+			"adj": {
+				"adjacency_matrix": {
+					"filters": {
+						"a": {"term": {"service": "checkout"}},
+						"b": {"term": {"env": "prod"}}
+					}
+				}
+			},
+			"rare": {"rare_terms": {"field": "service", "max_doc_count": 5}},
+			"sig": {"significant_terms": {"field": "service", "size": 5}},
+			"top_m": {"top_metrics": {"metrics": [{"field": "latency"}, {"field": "status"}], "sort": [{"created_at": "desc"}], "size": 2}},
+			"box": {"boxplot": {"field": "latency"}},
+			"sstats": {"string_stats": {"field": "service"}},
+			"pranks": {"percentile_ranks": {"field": "latency", "values": [50, 100, 250]}},
+			"ttest": {
+				"t_test": {
+					"a": {"field": "latency", "filter": {"term": {"env": "prod"}}},
+					"b": {"field": "latency", "filter": {"term": {"env": "staging"}}},
+					"type": "heteroscedastic"
+				}
+			},
+			"escaped_quote_sum": {
+				"sum": {
+					"script": {
+						"source": "(doc['latency'].value + params['a\\'b']) * 2",
+						"params": {"a'b": 10}
+					}
+				}
+			}
+		}
+	}`
+	var reqAggs esast.SearchRequest
+	if err := json.Unmarshal([]byte(aggsJSON), &reqAggs); err != nil {
+		t.Fatalf("unmarshal aggsJSON failed: %v", err)
+	}
+	planAggs, err := tr.BuildSearchPlan(&reqAggs)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan(aggs) failed: %v", err)
+	}
+	if !strings.Contains(planAggs.AggsSQL, "+ 10)) * 2)") {
+		t.Fatalf("expected escaped quote param params['a\\'b'] to compile to (+ 10)) * 2), got:\n%s", planAggs.AggsSQL)
+	}
+}
+
+func mustJSONString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}

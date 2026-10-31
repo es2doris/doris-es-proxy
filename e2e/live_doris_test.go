@@ -1163,4 +1163,115 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	if r23Fields == nil || r23Fields["bw_shift"].([]any)[0] != float64(8) || r23Fields["j11_str"].([]any)[0] != "okok" {
 		t.Fatalf("unexpected R23 script_fields on live_auto_index: %+v", r23Fields)
 	}
+
+	// 25. Round-24 through Round-28: enrich policy lifecycle, fuzzy edit-distance search, scripted_metric, and Painless Instant/Comparator/live _score
+	r28UsersPutReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/live_users_r28/_doc/u1?refresh=true", strings.NewReader(`{"email":"alice@example.com","tier":"enterprise","region":"us-east"}`))
+	r28UsersPutReq.Header.Set("Content-Type", "application/json")
+	r28UsersPutResp, err := http.DefaultClient.Do(r28UsersPutReq)
+	if err != nil || (r28UsersPutResp.StatusCode != http.StatusCreated && r28UsersPutResp.StatusCode != http.StatusOK) {
+		t.Fatalf("PUT /live_users_r28/_doc/u1 failed: status=%v err=%v", r28UsersPutResp.StatusCode, err)
+	}
+	_ = r28UsersPutResp.Body.Close()
+
+	r28PolPutReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/_enrich/policy/r28-users-pol", strings.NewReader(`{
+		"match": {
+			"indices": "live_users_r28",
+			"match_field": "email",
+			"enrich_fields": ["tier"]
+		}
+	}`))
+	r28PolPutReq.Header.Set("Content-Type", "application/json")
+	r28PolPutResp, err := http.DefaultClient.Do(r28PolPutReq)
+	if err != nil || r28PolPutResp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT /_enrich/policy/r28-users-pol failed: status=%v err=%v", r28PolPutResp.StatusCode, err)
+	}
+	_ = r28PolPutResp.Body.Close()
+
+	r28PolExecResp, err := http.Post(ts.URL+"/_enrich/policy/r28-users-pol/_execute", "application/json", strings.NewReader(`{}`))
+	if err != nil || r28PolExecResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_enrich/policy/r28-users-pol/_execute failed: status=%v err=%v", r28PolExecResp.StatusCode, err)
+	}
+	_ = r28PolExecResp.Body.Close()
+
+	r28SimResp, err := http.Post(ts.URL+"/_ingest/pipeline/_simulate", "application/json", strings.NewReader(`{
+		"pipeline": {
+			"processors": [
+				{
+					"enrich": {
+						"policy_name": "r28-users-pol",
+						"field": "user_email",
+						"target_field": "account"
+					}
+				},
+				{
+					"community_id": {
+						"source_ip": "10.0.0.1",
+						"destination_ip": "10.0.0.2",
+						"source_port": "443",
+						"destination_port": "51234",
+						"transport": "tcp",
+						"target_field": "net.cid"
+					}
+				}
+			]
+		},
+		"docs": [
+			{"_index": "live_auto_index", "_id": "sim-1", "_source": {"user_email": "alice@example.com", "10.0.0.1": "10.0.0.1", "10.0.0.2": "10.0.0.2", "443": 443, "51234": 51234, "tcp": "tcp"}}
+		]
+	}`))
+	if err != nil || r28SimResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_ingest/pipeline/_simulate (R28 enrich + community_id) failed: status=%v err=%v", r28SimResp.StatusCode, err)
+	}
+	var r28SimRes map[string]any
+	_ = json.NewDecoder(r28SimResp.Body).Decode(&r28SimRes)
+	_ = r28SimResp.Body.Close()
+	r28SimDoc := r28SimRes["docs"].([]any)[0].(map[string]any)["doc"].(map[string]any)["_source"].(map[string]any)
+	r28Acc, _ := r28SimDoc["account"].(map[string]any)
+	if r28Acc == nil || r28Acc["tier"] != "enterprise" || r28Acc["region"] != nil {
+		t.Fatalf("expected R28 enrich account.tier=enterprise without unrequested region, got %+v", r28Acc)
+	}
+
+	r28SearchResp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
+		"query": {
+			"fuzzy": {
+				"service": {
+					"value": "checkouX",
+					"fuzziness": 1
+				}
+			}
+		},
+		"script_fields": {
+			"live_score": {"script": "_score * 2"},
+			"epoch_sec":  {"script": "Instant.ofEpochMilli(1700000000000L).getEpochSecond()"},
+			"sorted_arr": {"script": "def a = [3, 1, 2]; a.sort(Comparator.naturalOrder()); return a;"}
+		},
+		"aggs": {
+			"custom_sm": {
+				"scripted_metric": {
+					"init_script": "state.sum = 0; state.cnt = 0;",
+					"map_script": "state.sum += doc['latency_ms'].value; state.cnt += 1;",
+					"combine_script": "return ['sum': state.sum, 'cnt': state.cnt];",
+					"reduce_script": "double s = 0; int c = 0; for (st in states) { s += st.sum; c += st.cnt; } return ['total': s, 'count': c];"
+				}
+			}
+		}
+	}`))
+	if err != nil || r28SearchResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search (R24-R28 fuzzy + scripted_metric + Painless) failed: status=%v err=%v", r28SearchResp.StatusCode, err)
+	}
+	var r28SearchRes map[string]any
+	_ = json.NewDecoder(r28SearchResp.Body).Decode(&r28SearchRes)
+	_ = r28SearchResp.Body.Close()
+	r28Hits := r28SearchRes["hits"].(map[string]any)["hits"].([]any)
+	if len(r28Hits) == 0 {
+		t.Fatalf("expected R28 fuzzy search hits on live_auto_index, got 0")
+	}
+	r28Fields, _ := r28Hits[0].(map[string]any)["fields"].(map[string]any)
+	if r28Fields == nil || r28Fields["epoch_sec"].([]any)[0] != float64(1700000000) {
+		t.Fatalf("unexpected R28 script_fields on live_auto_index: %+v", r28Fields)
+	}
+	r28SmVal, _ := r28SearchRes["aggregations"].(map[string]any)["custom_sm"].(map[string]any)["value"].(map[string]any)
+	if r28SmVal == nil || r28SmVal["count"].(float64) < 1 {
+		t.Fatalf("unexpected R28 scripted_metric value: %+v", r28SmVal)
+	}
 }

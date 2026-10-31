@@ -182,6 +182,7 @@ type Server struct {
 	templates             map[string]esast.IndexTemplateRequest
 	componentTemplates    map[string]map[string]any
 	pipelines             map[string]map[string]any
+	enrichPolicies        map[string]map[string]any
 }
 
 func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerOptions) *Server {
@@ -204,6 +205,7 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		templates:             make(map[string]esast.IndexTemplateRequest),
 		componentTemplates:    make(map[string]map[string]any),
 		pipelines:             make(map[string]map[string]any),
+		enrichPolicies:        make(map[string]map[string]any),
 	}
 	s.coalescer = newStreamLoadCoalescer(func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
 		err := s.backend.StreamLoad(ctx, table, ndjson, syncRefresh)
@@ -344,6 +346,18 @@ func (s *Server) syncCatalogFromBackend(ctx context.Context) error {
 				}
 				s.pipelines[e.EntityKey] = pipe
 			}
+		case "enrich_policy":
+			if isDeleted {
+				delete(s.enrichPolicies, e.EntityKey)
+				continue
+			}
+			var pol map[string]any
+			if err := json.Unmarshal([]byte(e.PayloadJSON), &pol); err == nil && pol != nil {
+				if s.enrichPolicies == nil {
+					s.enrichPolicies = make(map[string]map[string]any)
+				}
+				s.enrichPolicies[e.EntityKey] = pol
+			}
 		case "alias":
 			if isDeleted {
 				delete(s.aliases, e.EntityKey)
@@ -412,6 +426,23 @@ func (s *Server) persistIngestPipeline(ctx context.Context, id string, body map[
 
 func (s *Server) deleteIngestPipelineCatalog(ctx context.Context, id string) {
 	s.deleteCatalogEntity(ctx, "pipeline", id)
+}
+
+func (s *Server) persistEnrichPolicy(ctx context.Context, name string, body map[string]any) {
+	if cb, ok := s.backend.(CatalogBackend); ok {
+		if raw, err := json.Marshal(body); err == nil {
+			_ = cb.UpsertCatalogEntry(ctx, s.dorisDB, CatalogEntry{
+				EntityType:     "enrich_policy",
+				EntityKey:      name,
+				PayloadJSON:    string(raw),
+				UpdatedEpochMs: s.allocVersion(0),
+			})
+		}
+	}
+}
+
+func (s *Server) deleteEnrichPolicyCatalog(ctx context.Context, name string) {
+	s.deleteCatalogEntity(ctx, "enrich_policy", name)
 }
 
 func (s *Server) persistIndex(ctx context.Context, indexName string, idxSchema *schema.IndexSchema) {
@@ -637,6 +668,8 @@ func (s *Server) Handler() http.Handler {
 				s.handleValidateQuery(w, r)
 			case segs[0] == "_ingest" && segs[1] == "pipeline":
 				s.handleIngestPipeline(w, r)
+			case segs[0] == "_enrich" && (segs[1] == "policy" || segs[1] == "_stats" || segs[1] == "stats"):
+				s.handleEnrichAPI(w, r)
 			case segs[0] == "_security" && segs[1] == "_authenticate":
 				s.handleSecurityAuthenticate(w, r)
 			case segs[0] == "_alias":
@@ -734,6 +767,11 @@ func (s *Server) Handler() http.Handler {
 				}
 				r.SetPathValue("id", segs[2])
 				s.handleIngestPipeline(w, r)
+				return
+			}
+			if segs[0] == "_enrich" && segs[1] == "policy" {
+				r.SetPathValue("name", segs[2])
+				s.handleEnrichAPI(w, r)
 				return
 			}
 			if segs[0] == "_cat" {
@@ -861,6 +899,12 @@ func (s *Server) Handler() http.Handler {
 			if segs[0] == "_ingest" && segs[1] == "pipeline" && segs[3] == "_simulate" {
 				r.SetPathValue("id", segs[2])
 				s.handleSimulateIngestPipeline(w, r)
+				return
+			}
+			if segs[0] == "_enrich" && segs[1] == "policy" && segs[3] == "_execute" {
+				r.SetPathValue("name", segs[2])
+				r.SetPathValue("action", "_execute")
+				s.handleEnrichAPI(w, r)
 				return
 			}
 			if (segs[1] == "_doc" || segs[1] == "_explain") && segs[3] == "_explain" {
@@ -3271,14 +3315,7 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 	rawIndex := r.PathValue("index")
 	targets, aliasFilters := s.resolveTargetIndicesWithFilters(rawIndex)
 	if len(targets) == 0 && !hasExclusionOrWildcard(rawIndex) {
-		target, f := s.resolveIndexNameWithFilter(rawIndex)
-		targets = []string{target}
-		if f != nil {
-			if aliasFilters == nil {
-				aliasFilters = make(map[string]*esast.Query)
-			}
-			aliasFilters[target] = f
-		}
+		targets = []string{s.resolveIndexName(rawIndex)}
 	}
 
 	var body struct {
@@ -3603,14 +3640,7 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 	rawIndex := r.PathValue("index")
 	targets, aliasFilters := s.resolveTargetIndicesWithFilters(rawIndex)
 	if len(targets) == 0 && !hasExclusionOrWildcard(rawIndex) {
-		target, f := s.resolveIndexNameWithFilter(rawIndex)
-		targets = []string{target}
-		if f != nil {
-			if aliasFilters == nil {
-				aliasFilters = make(map[string]*esast.Query)
-			}
-			aliasFilters[target] = f
-		}
+		targets = []string{s.resolveIndexName(rawIndex)}
 	}
 
 	var body struct {
@@ -4508,14 +4538,7 @@ func (s *Server) buildDorisExplainObject(ctx context.Context, rawIndexPattern st
 	}
 	targets, aliasFilters := s.resolveTargetIndicesWithFilters(rawIndexPattern)
 	if len(targets) == 0 && !hasExclusionOrWildcard(rawIndexPattern) {
-		target, f := s.resolveIndexNameWithFilter(rawIndexPattern)
-		targets = []string{target}
-		if f != nil {
-			if aliasFilters == nil {
-				aliasFilters = make(map[string]*esast.Query)
-			}
-			aliasFilters[target] = f
-		}
+		targets = []string{s.resolveIndexName(rawIndexPattern)}
 	}
 	if req != nil && hasTermsLookupInSearchRequest(req) {
 		req = s.resolveTermsLookupsInSearchRequest(ctx, req)
@@ -4799,14 +4822,7 @@ func (s *Server) executeSearchRequest(
 		if hasExclusionOrWildcard(rawIndexPattern) {
 			return buildESResponse(rawIndexPattern, nil, req, nil, nil, 1, nil), http.StatusOK, "", ""
 		}
-		target, f := s.resolveIndexNameWithFilter(rawIndexPattern)
-		targets = []string{target}
-		if f != nil {
-			if aliasFilters == nil {
-				aliasFilters = make(map[string]*esast.Query)
-			}
-			aliasFilters[target] = f
-		}
+		targets = []string{s.resolveIndexName(rawIndexPattern)}
 	}
 
 	if req != nil {
@@ -4830,9 +4846,6 @@ func (s *Server) executeSearchRequest(
 					aliasHasNow = true
 				}
 				if afBytes, err := json.Marshal(af); err == nil {
-					if bytes.Contains(afBytes, []byte("now")) {
-						aliasHasNow = true
-					}
 					cacheTargets = append(cacheTargets, t+"\x00af:"+string(afBytes))
 					continue
 				}
@@ -5188,8 +5201,8 @@ func (s *Server) executeSearchRequest(
 					if r.effectiveCount() == 0 {
 						emptyStatsAggs[r.AggName] = true
 					}
-				} else if strings.HasSuffix(r.AggName, "._stats_count") {
-					baseAgg := strings.TrimSuffix(r.AggName, "._stats_count")
+				} else if strings.HasSuffix(r.AggName, "._stats_count") || strings.HasSuffix(r.AggName, "._sstats_count") {
+					baseAgg := strings.TrimSuffix(strings.TrimSuffix(r.AggName, "._stats_count"), "._sstats_count")
 					statsCounts[baseAgg+"\x00"+r.BucketKey] = r.effectiveCount()
 					if r.effectiveCount() == 0 {
 						emptySubStatsBuckets[baseAgg+"\x00"+r.BucketKey] = true
@@ -5203,17 +5216,20 @@ func (s *Server) executeSearchRequest(
 				if emptyStatsAggs[r.AggName] && r.BucketKey != "_stats_count" && r.BucketKey != "_sstats_count" {
 					continue
 				}
-				if dot := strings.LastIndexByte(r.AggName, '.'); dot > 0 && strings.HasPrefix(r.AggName[dot+1:], "_stats_") && r.AggName[dot+1:] != "_stats_count" {
+				if dot := strings.LastIndexByte(r.AggName, '.'); dot > 0 &&
+					(strings.HasPrefix(r.AggName[dot+1:], "_stats_") || strings.HasPrefix(r.AggName[dot+1:], "_sstats_")) &&
+					r.AggName[dot+1:] != "_stats_count" && r.AggName[dot+1:] != "_sstats_count" {
 					if emptySubStatsBuckets[r.AggName[:dot]+"\x00"+r.BucketKey] {
 						continue
 					}
 				}
-				if r.BucketKey == "_stats_avg" || r.BucketKey == "_sstats_avg" {
+				if r.BucketKey == "_stats_avg" || r.BucketKey == "_sstats_avg" || r.BucketKey == "_stats_entropy" || r.BucketKey == "_sstats_entropy" {
 					if cnt := statsCounts[r.AggName]; cnt > 0 {
 						r.Weight = cnt
 					}
-				} else if strings.HasSuffix(r.AggName, "._stats_avg") {
-					baseAgg := strings.TrimSuffix(r.AggName, "._stats_avg")
+				} else if strings.HasSuffix(r.AggName, "._stats_avg") || strings.HasSuffix(r.AggName, "._sstats_avg") ||
+					strings.HasSuffix(r.AggName, "._stats_entropy") || strings.HasSuffix(r.AggName, "._sstats_entropy") {
+					baseAgg := r.AggName[:strings.LastIndexByte(r.AggName, '.')]
 					if cnt := statsCounts[baseAgg+"\x00"+r.BucketKey]; cnt > 0 {
 						r.Weight = cnt
 					}
@@ -6233,13 +6249,33 @@ func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, totalQueryHits int64
 		}
 		spec := resolveAggSpecByPath(aggs, r.AggName)
 		val := r.effectiveValue()
+		if r.Weight < 0 {
+			if _, ok := merged[k]; !ok {
+				cp := r
+				cp.DocCount = r.effectiveCount()
+				cp.Value = val
+				merged[k] = &mergeAcc{
+					row:         cp,
+					count:       0,
+					weightSum:   0,
+					weightedVal: 0,
+				}
+				order = append(order, k)
+			}
+			return
+		}
+		if existing, ok := merged[k]; ok && existing.row.Weight < 0 {
+			delete(merged, k)
+		}
 		w := r.Weight
 		if w <= 0 {
 			w = 1
 		}
-		isMin := r.BucketKey == "_stats_min" || strings.HasSuffix(r.AggName, "._stats_min") || spec.Min != nil ||
+		isMin := r.BucketKey == "_stats_min" || r.BucketKey == "_sstats_min" ||
+			strings.HasSuffix(r.AggName, "._stats_min") || strings.HasSuffix(r.AggName, "._sstats_min") || spec.Min != nil ||
 			(spec.Boxplot != nil && (r.BucketKey == "0.0" || strings.HasSuffix(r.AggName, ".0.0")))
-		isMax := r.BucketKey == "_stats_max" || strings.HasSuffix(r.AggName, "._stats_max") || spec.Max != nil ||
+		isMax := r.BucketKey == "_stats_max" || r.BucketKey == "_sstats_max" ||
+			strings.HasSuffix(r.AggName, "._stats_max") || strings.HasSuffix(r.AggName, "._sstats_max") || spec.Max != nil ||
 			(spec.Boxplot != nil && (r.BucketKey == "100.0" || strings.HasSuffix(r.AggName, ".100.0")))
 		if existing, ok := merged[k]; ok {
 			existing.count++
@@ -6333,8 +6369,10 @@ func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, totalQueryHits int64
 		}
 		isBoxplotQuartile := spec.Boxplot != nil && k.bucket != "0.0" && k.bucket != "100.0" &&
 			!strings.HasSuffix(k.agg, ".0.0") && !strings.HasSuffix(k.agg, ".100.0")
-		isAvgLike := k.bucket == "_stats_avg" || k.bucket == "_stats_std" || k.bucket == "_stats_entropy" ||
-			strings.HasSuffix(k.agg, "._stats_avg") || strings.HasSuffix(k.agg, "._stats_std") || strings.HasSuffix(k.agg, "._stats_entropy") ||
+		isAvgLike := k.bucket == "_stats_avg" || k.bucket == "_sstats_avg" ||
+			k.bucket == "_stats_std" || k.bucket == "_stats_entropy" || k.bucket == "_sstats_entropy" ||
+			strings.HasSuffix(k.agg, "._stats_avg") || strings.HasSuffix(k.agg, "._sstats_avg") ||
+			strings.HasSuffix(k.agg, "._stats_std") || strings.HasSuffix(k.agg, "._stats_entropy") || strings.HasSuffix(k.agg, "._sstats_entropy") ||
 			spec.Avg != nil || spec.Percentiles != nil || spec.PercentileRanks != nil || isBoxplotQuartile
 		if isAvgLike && acc.count > 1 && acc.weightSum > 0 {
 			acc.row.Value = acc.weightedVal / float64(acc.weightSum)
@@ -7781,6 +7819,19 @@ func preScaleRateAggRows(aggs map[string]esast.AggSpec, prefix string, histSpec 
 		if spec.DateHistogram != nil || spec.Histogram != nil {
 			specCopy := spec
 			curHist = &specCopy
+		} else if spec.Composite != nil {
+			for _, srcMap := range spec.Composite.Sources {
+				for _, srcSpec := range srcMap {
+					if srcSpec.DateHistogram != nil || srcSpec.Histogram != nil {
+						srcCopy := srcSpec
+						curHist = &srcCopy
+						break
+					}
+				}
+				if curHist != histSpec {
+					break
+				}
+			}
 		}
 		if spec.Rate != nil && curHist != nil {
 			scale := rateScaleFactor(spec.Rate, curHist)
@@ -8060,7 +8111,7 @@ func buildAggsMap(
 					smVal = rv
 				}
 			} else {
-				smVal = evalScriptedMetricAgg(spec.ScriptedMetric, nil)
+				smVal, _ = evalScriptedMetricCombineAndReduce(spec.ScriptedMetric, nil)
 			}
 			aggsOut[aggName] = map[string]any{"value": smVal}
 		case spec.Rate != nil:
@@ -8088,16 +8139,30 @@ func buildAggsMap(
 					entropyVal = r.effectiveValue()
 				}
 			}
-			aggsOut[aggName] = map[string]any{
-				"count":      cntVal,
-				"min_length": int64(minLen),
-				"max_length": int64(maxLen),
-				"avg_length": avgLen,
-				"entropy":    entropyVal,
+			if cntVal == 0 {
+				aggsOut[aggName] = map[string]any{
+					"count":      int64(0),
+					"min_length": nil,
+					"max_length": nil,
+					"avg_length": nil,
+					"entropy":    0.0,
+				}
+			} else {
+				aggsOut[aggName] = map[string]any{
+					"count":      cntVal,
+					"min_length": int64(minLen),
+					"max_length": int64(maxLen),
+					"avg_length": avgLen,
+					"entropy":    entropyVal,
+				}
 			}
 		case spec.Boxplot != nil:
+			hasValidBox := false
 			var minVal, maxVal, q1, q2, q3 float64
 			for _, r := range rows {
+				if r.Weight >= 0 {
+					hasValidBox = true
+				}
 				switch r.BucketKey {
 				case "0.0", "_box_min":
 					minVal = r.effectiveValue()
@@ -8111,17 +8176,29 @@ func buildAggsMap(
 					q3 = r.effectiveValue()
 				}
 			}
-			iqr := q3 - q1
-			lower := math.Max(minVal, q1-1.5*iqr)
-			upper := math.Min(maxVal, q3+1.5*iqr)
-			aggsOut[aggName] = map[string]any{
-				"min":   minVal,
-				"max":   maxVal,
-				"q1":    q1,
-				"q2":    q2,
-				"q3":    q3,
-				"lower": lower,
-				"upper": upper,
+			if !hasValidBox {
+				aggsOut[aggName] = map[string]any{
+					"min":   nil,
+					"max":   nil,
+					"q1":    nil,
+					"q2":    nil,
+					"q3":    nil,
+					"lower": nil,
+					"upper": nil,
+				}
+			} else {
+				iqr := q3 - q1
+				lower := math.Max(minVal, q1-1.5*iqr)
+				upper := math.Min(maxVal, q3+1.5*iqr)
+				aggsOut[aggName] = map[string]any{
+					"min":   minVal,
+					"max":   maxVal,
+					"q1":    q1,
+					"q2":    q2,
+					"q3":    q3,
+					"lower": lower,
+					"upper": upper,
+				}
 			}
 		case spec.Percentiles != nil:
 			if spec.Percentiles.Keyed != nil && !*spec.Percentiles.Keyed {
@@ -9007,21 +9084,39 @@ func filterAndSortTermsRows(
 				switch prop {
 				case "", "value", "_count", "doc_count":
 				case "count":
-					rowKey = fullKey + "." + subName + "._stats_count"
+					if _, ok := bucketsByAgg[fullKey+"."+subName+"._sstats_count"]; ok && len(bucketsByAgg[fullKey+"."+subName+"._stats_count"]) == 0 {
+						rowKey = fullKey + "." + subName + "._sstats_count"
+					} else {
+						rowKey = fullKey + "." + subName + "._stats_count"
+					}
 				case "min", "min_length":
 					if _, ok := bucketsByAgg[fullKey+"."+subName+".0.0"]; ok && len(bucketsByAgg[fullKey+"."+subName+"._stats_min"]) == 0 {
 						rowKey = fullKey + "." + subName + ".0.0"
+					} else if _, ok := bucketsByAgg[fullKey+"."+subName+"._sstats_min"]; ok && len(bucketsByAgg[fullKey+"."+subName+"._stats_min"]) == 0 {
+						rowKey = fullKey + "." + subName + "._sstats_min"
 					} else {
 						rowKey = fullKey + "." + subName + "._stats_min"
 					}
 				case "max", "max_length":
 					if _, ok := bucketsByAgg[fullKey+"."+subName+".100.0"]; ok && len(bucketsByAgg[fullKey+"."+subName+"._stats_max"]) == 0 {
 						rowKey = fullKey + "." + subName + ".100.0"
+					} else if _, ok := bucketsByAgg[fullKey+"."+subName+"._sstats_max"]; ok && len(bucketsByAgg[fullKey+"."+subName+"._stats_max"]) == 0 {
+						rowKey = fullKey + "." + subName + "._sstats_max"
 					} else {
 						rowKey = fullKey + "." + subName + "._stats_max"
 					}
 				case "avg", "avg_length":
-					rowKey = fullKey + "." + subName + "._stats_avg"
+					if _, ok := bucketsByAgg[fullKey+"."+subName+"._sstats_avg"]; ok && len(bucketsByAgg[fullKey+"."+subName+"._stats_avg"]) == 0 {
+						rowKey = fullKey + "." + subName + "._sstats_avg"
+					} else {
+						rowKey = fullKey + "." + subName + "._stats_avg"
+					}
+				case "entropy":
+					if _, ok := bucketsByAgg[fullKey+"."+subName+"._sstats_entropy"]; ok && len(bucketsByAgg[fullKey+"."+subName+"._stats_entropy"]) == 0 {
+						rowKey = fullKey + "." + subName + "._sstats_entropy"
+					} else {
+						rowKey = fullKey + "." + subName + "._stats_entropy"
+					}
 				case "sum":
 					rowKey = fullKey + "." + subName + "._stats_sum"
 				case "sum_of_squares":
@@ -11768,7 +11863,7 @@ func attachSubAggsToBucket(
 				}
 			}
 			if !foundSM {
-				smVal = evalScriptedMetricAgg(subSpec.ScriptedMetric, nil)
+				smVal, _ = evalScriptedMetricCombineAndReduce(subSpec.ScriptedMetric, nil)
 			}
 			bucketMap[subName] = map[string]any{"value": smVal}
 		case subSpec.EffectiveStats() != nil:
@@ -11857,22 +11952,38 @@ func attachSubAggsToBucket(
 					}
 				}
 			}
+			hasValidBox := false
 			vals := make(map[string]float64, 5)
 			for _, r := range matchingRows {
+				if r.Weight >= 0 {
+					hasValidBox = true
+				}
 				vals[r.BucketKey] = r.effectiveValue()
 			}
-			q1, q3 := vals["25.0"], vals["75.0"]
-			iqr := q3 - q1
-			lower := math.Max(vals["0.0"], q1-1.5*iqr)
-			upper := math.Min(vals["100.0"], q3+1.5*iqr)
-			bucketMap[subName] = map[string]any{
-				"min":   vals["0.0"],
-				"max":   vals["100.0"],
-				"q1":    q1,
-				"q2":    vals["50.0"],
-				"q3":    q3,
-				"lower": lower,
-				"upper": upper,
+			if !hasValidBox || bucketDocCount == 0 {
+				bucketMap[subName] = map[string]any{
+					"min":   nil,
+					"max":   nil,
+					"q1":    nil,
+					"q2":    nil,
+					"q3":    nil,
+					"lower": nil,
+					"upper": nil,
+				}
+			} else {
+				q1, q3 := vals["25.0"], vals["75.0"]
+				iqr := q3 - q1
+				lower := math.Max(vals["0.0"], q1-1.5*iqr)
+				upper := math.Min(vals["100.0"], q3+1.5*iqr)
+				bucketMap[subName] = map[string]any{
+					"min":   vals["0.0"],
+					"max":   vals["100.0"],
+					"q1":    q1,
+					"q2":    vals["50.0"],
+					"q3":    q3,
+					"lower": lower,
+					"upper": upper,
+				}
 			}
 		case subSpec.PercentileRanks != nil:
 			var matchingRows []AggRow
@@ -11956,12 +12067,22 @@ func attachSubAggsToBucket(
 					entropyVal = r.effectiveValue()
 				}
 			}
-			bucketMap[subName] = map[string]any{
-				"count":      cntVal,
-				"min_length": int64(minVal),
-				"max_length": int64(maxVal),
-				"avg_length": avgVal,
-				"entropy":    entropyVal,
+			if cntVal == 0 {
+				bucketMap[subName] = map[string]any{
+					"count":      int64(0),
+					"min_length": nil,
+					"max_length": nil,
+					"avg_length": nil,
+					"entropy":    0.0,
+				}
+			} else {
+				bucketMap[subName] = map[string]any{
+					"count":      cntVal,
+					"min_length": int64(minVal),
+					"max_length": int64(maxVal),
+					"avg_length": avgVal,
+					"entropy":    entropyVal,
+				}
 			}
 		case subSpec.Filter != nil || subSpec.Missing != nil || subSpec.EffectiveSampler() != nil || subSpec.ReverseNested != nil || subSpec.Nested != nil:
 			var cnt int64
@@ -13818,6 +13939,7 @@ func collectTermsFromQueryForFields(q *esast.Query, allowed map[string]bool, out
 
 func extractLuceneScopedTermsForHighlight(raw string, defaultMatched bool, allowed map[string]bool, out *[]string) {
 	appendCleaned := func(tok string) {
+		hadSlop := false
 		if tildeIdx := strings.LastIndexByte(tok, '~'); tildeIdx > 0 {
 			allDigits := true
 			for j := tildeIdx + 1; j < len(tok); j++ {
@@ -13827,12 +13949,21 @@ func extractLuceneScopedTermsForHighlight(raw string, defaultMatched bool, allow
 				}
 			}
 			if allDigits {
+				hadSlop = true
 				tok = tok[:tildeIdx]
 			}
 		}
 		tok = strings.Trim(tok, "()\"+-!~")
 		if strings.Trim(tok, "*?") != "" {
 			*out = append(*out, tok)
+			if hadSlop && strings.ContainsAny(tok, " \t") {
+				for _, w := range strings.Fields(tok) {
+					w = strings.Trim(w, "()\"+-!~*?")
+					if w != "" {
+						*out = append(*out, w)
+					}
+				}
+			}
 		}
 	}
 	n := len(raw)
@@ -13845,6 +13976,9 @@ func extractLuceneScopedTermsForHighlight(raw string, defaultMatched bool, allow
 		}
 		if i >= n {
 			break
+		}
+		if (raw[i] == '+' || raw[i] == '-' || raw[i] == '!') && i+1 < n && raw[i+1] == '(' {
+			i++
 		}
 		if raw[i] == '(' {
 			if groupDepth > 0 {
@@ -14564,43 +14698,6 @@ func hasExclusionOrWildcard(rawIndex string) bool {
 		}
 	}
 	return false
-}
-
-func (s *Server) resolveIndexNameWithFilter(nameOrAlias string) (string, *esast.Query) {
-	if nameOrAlias == "" {
-		return "default_index", nil
-	}
-	if idx := strings.IndexByte(nameOrAlias, ','); idx > 0 {
-		nameOrAlias = nameOrAlias[:idx]
-	}
-	lookupLocked := func() (string, *esast.Query, bool) {
-		if targets, ok := s.aliases[nameOrAlias]; ok && len(targets) > 0 {
-			var f *esast.Query
-			if metaByIdx := s.aliasMeta[nameOrAlias]; metaByIdx != nil && metaByIdx[targets[0]].Filter != nil {
-				cp := *metaByIdx[targets[0]].Filter
-				f = &cp
-			}
-			return targets[0], f, true
-		}
-		if _, ok := s.indices[nameOrAlias]; ok {
-			return nameOrAlias, nil, true
-		}
-		return "", nil, false
-	}
-	s.mu.RLock()
-	if resolved, f, ok := lookupLocked(); ok {
-		s.mu.RUnlock()
-		return resolved, f
-	}
-	s.mu.RUnlock()
-
-	_ = s.syncCatalogFromBackend(context.Background())
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if resolved, f, ok := lookupLocked(); ok {
-		return resolved, f
-	}
-	return nameOrAlias, nil
 }
 
 func (s *Server) resolveIndexName(nameOrAlias string) string {
@@ -16861,11 +16958,6 @@ func parseScriptedMetricBucketKey(bk string) (logicalBucket string, reducedVal a
 	_ = json.Unmarshal([]byte(rest[:idx2]), &reducedVal)
 	_ = json.Unmarshal([]byte(rest[idx2+1:]), &combinedVal)
 	return logicalBucket, reducedVal, combinedVal, true
-}
-
-func evalScriptedMetricAgg(sm *esast.ScriptedMetricAggSpec, bDocs []runtimeMatchedDoc) any {
-	reduced, _ := evalScriptedMetricCombineAndReduce(sm, bDocs)
-	return reduced
 }
 
 func evalScriptedMetricCombineAndReduce(sm *esast.ScriptedMetricAggSpec, bDocs []runtimeMatchedDoc) (any, any) {
