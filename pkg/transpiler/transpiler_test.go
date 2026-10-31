@@ -1802,3 +1802,146 @@ func mustJSONString(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
 }
+
+func TestRound32NestedDateQueriesMultiValuedIPsLuceneAndStringStats(t *testing.T) {
+	rawMapping := `{
+		"properties": {
+			"status": {"type": "constant_keyword", "value": "active"},
+			"tags": {"type": "keyword", "multi_valued": true},
+			"created_at": {"type": "date"},
+			"items": {
+				"type": "nested",
+				"properties": {
+					"ts": {"type": "date"},
+					"ts_nanos": {"type": "date_nanos"},
+					"ips": {"type": "ip", "multi_valued": true},
+					"name": {
+						"type": "text",
+						"fields": {
+							"keyword": {"type": "keyword", "null_value": "UNKNOWN"}
+						}
+					}
+				}
+			}
+		}
+	}`
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(rawMapping), &spec); err != nil {
+		t.Fatalf("unmarshal mapping failed: %v", err)
+	}
+	idxSchema := schema.CompileIndexSchema("es_compat", "r32_idx", &spec)
+	tr := NewTranspiler(idxSchema, TranspilerOptions{})
+
+	// Fix 1 & Fix 4 & Fix 5: Correlated nested date/date_nanos term/terms/range epoch millis, nested .keyword null_value path, and multi-valued nested IP range/CIDR/ip_range
+	var req1 esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"bool": {
+				"must": [
+					{
+						"nested": {
+							"path": "items",
+							"query": {
+								"bool": {
+									"must": [
+										{"term": {"items.ts": "2026-01-01T00:00:00Z"}},
+										{"terms": {"items.ts_nanos": ["2026-01-01T00:00:00Z"]}},
+										{"range": {"items.ts": {"gte": "2026-01-01T00:00:00Z", "lte": "2026-01-02||/d"}}},
+										{"term": {"items.name.keyword": "UNKNOWN"}},
+										{"term": {"items.ips": "10.0.0.0/8"}},
+										{"range": {"items.ips": {"gte": "10.0.0.1", "lte": "10.0.0.254"}}}
+									]
+								}
+							}
+						}
+					},
+					{"match": {"status": "active"}},
+					{"match": {"tags": "foo bar"}}
+				]
+			}
+		},
+		"aggs": {
+			"nested_items": {
+				"nested": {"path": "items"},
+				"aggs": {
+					"ip_Sub": {
+						"ip_range": {
+							"field": "items.ips",
+							"ranges": [{"mask": "10.0.0.0/8"}]
+						}
+					},
+					"sstats_sub": {
+						"string_stats": {
+							"field": "items.name.keyword",
+							"missing": "NONE",
+							"script": {"source": "doc['items.name.keyword'].value + '_s'"}
+						}
+					}
+				}
+			},
+			"top_sstats": {
+				"string_stats": {
+					"field": "status",
+					"missing": "EMPTY",
+					"script": {"source": "_value + '_top'"}
+				}
+			}
+		}
+	}`), &req1); err != nil {
+		t.Fatalf("unmarshal req1 failed: %v", err)
+	}
+	plan1, err := tr.BuildSearchPlan(&req1)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan(req1) failed: %v", err)
+	}
+	// Verify Fix 1: nested date term/terms/range uses epoch milliseconds (1767225600000 and 1767398399999)
+	if !strings.Contains(plan1.HitsSQL, "1767225600000") || !strings.Contains(plan1.HitsSQL, "1767398399999") {
+		t.Fatalf("expected nested date queries to use epoch millis 1767225600000 and 1767398399999, got:\n%s", plan1.HitsSQL)
+	}
+	// Verify Fix 4: nested .keyword with null_value uses $.name__keyword
+	if !strings.Contains(plan1.HitsSQL, "$.name__keyword") {
+		t.Fatalf("expected $.name__keyword in HitsSQL for nested .keyword with null_value, got:\n%s", plan1.HitsSQL)
+	}
+	// Verify Fix 5: multi-valued nested IP uses array_exists with IPV4_STRING_TO_NUM_OR_NULL
+	if !strings.Contains(plan1.HitsSQL, "IPV4_STRING_TO_NUM_OR_NULL(_x)") || !strings.Contains(plan1.AggsSQL, "IPV4_STRING_TO_NUM_OR_NULL(_x)") {
+		t.Fatalf("expected IPV4_STRING_TO_NUM_OR_NULL(_x) for multi-valued nested IP in HitsSQL and AggsSQL, got:\nHits: %s\nAggs: %s", plan1.HitsSQL, plan1.AggsSQL)
+	}
+	// Verify Fix 8: string_stats missing & script SQL pushdown
+	if !strings.Contains(plan1.AggsSQL, "'EMPTY'") || !strings.Contains(plan1.AggsSQL, "'_top'") {
+		t.Fatalf("expected string_stats missing and script in AggsSQL, got:\n%s", plan1.AggsSQL)
+	}
+
+	// Fix 6 & Fix 7: Lucene query_string time_zone, phrase_slop, fuzziness, lenient, NOT +foo, and standalone dangling "NOT" / "-"
+	var reqLucene esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"bool": {
+				"must": [
+					{
+						"query_string": {
+							"query": "NOT +legacy created_at:[2026-01-01 TO 2026-01-02]",
+							"default_field": "status",
+							"time_zone": "+09:00"
+						}
+					},
+					{
+						"query_string": {
+							"query": "NOT",
+							"default_field": "status"
+						}
+					}
+				]
+			}
+		}
+	}`), &reqLucene); err != nil {
+		t.Fatalf("unmarshal reqLucene failed: %v", err)
+	}
+	planLucene, err := tr.BuildSearchPlan(&reqLucene)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan(reqLucene) failed: %v", err)
+	}
+	// NOT +legacy must search for 'legacy' (not '+legacy'), and standalone "NOT" must compile to FALSE / 1 = 0
+	if strings.Contains(planLucene.HitsSQL, "+legacy") || !strings.Contains(planLucene.HitsSQL, "FALSE") {
+		t.Fatalf("unexpected Lucene HitsSQL:\n%s", planLucene.HitsSQL)
+	}
+}

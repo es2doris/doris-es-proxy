@@ -822,3 +822,159 @@ func TestRound31PainlessFixes(t *testing.T) {
 		t.Fatalf("expected meta == 'orders-2026:doc-42:v7', got %v", doc21["meta"])
 	}
 }
+
+func TestRound32PainlessControlFlowStreamsConstantsAndUpdateNoop(t *testing.T) {
+	// Fix 18: Multi-variable declarations (int a = 1, b = 2; int c, d;) and for-loop variable shadowing
+	res18, _, err := ApplyUpdateWithResult(
+		json.RawMessage(`{}`),
+		&UpdateRequest{
+			Script: &ScriptSpec{
+				Source: `
+					int a = 10, b = 20;
+					int c, d = 5;
+					int sum = 0;
+					for (int a = 1; a <= 3; a++) {
+						int innerOnly = a * 2;
+						sum += innerOnly;
+					}
+					ctx._source.outer_a = a;
+					ctx._source.b = b;
+					ctx._source.d = d;
+					ctx._source.sum = sum;
+				`,
+			},
+		},
+		true,
+	)
+	if err != nil {
+		t.Fatalf("Fix 18 failed: %v", err)
+	}
+	var doc18 map[string]any
+	_ = json.Unmarshal(res18, &doc18)
+	if doc18["outer_a"] != float64(10) || doc18["b"] != float64(20) || doc18["d"] != float64(5) || doc18["sum"] != float64(12) {
+		t.Fatalf("unexpected Fix 18 doc: %+v", doc18)
+	}
+
+	// Fix 19: try / catch / finally, throw new IllegalArgumentException(...), do { ... } while (...);, and catchable Integer.parseInt error
+	res19, _, err := ApplyUpdateWithResult(
+		json.RawMessage(`{"raw":"not_a_number"}`),
+		&UpdateRequest{
+			Script: &ScriptSpec{
+				Source: `
+					int parsed = -1;
+					String errMsg = "";
+					int finallyRan = 0;
+					try {
+						parsed = Integer.parseInt(ctx._source.raw);
+					} catch (NumberFormatException e) {
+						errMsg = e.getMessage();
+						parsed = 99;
+					} finally {
+						finallyRan = 1;
+					}
+					int count = 0;
+					do {
+						count++;
+					} while (count < 3);
+					ctx._source.parsed = parsed;
+					ctx._source.has_err = errMsg.length() > 0;
+					ctx._source.finally_ran = finallyRan;
+					ctx._source.do_count = count;
+				`,
+			},
+		},
+		true,
+	)
+	if err != nil {
+		t.Fatalf("Fix 19 failed: %v", err)
+	}
+	var doc19 map[string]any
+	_ = json.Unmarshal(res19, &doc19)
+	if doc19["parsed"] != float64(99) || doc19["has_err"] != true || doc19["finally_ran"] != float64(1) || doc19["do_count"] != float64(3) {
+		t.Fatalf("unexpected Fix 19 doc: %+v", doc19)
+	}
+
+	// Fix 20: List.replaceAll(x -> ...), .forEach(...), Map.computeIfAbsent / computeIfPresent / merge, and .stream() pipelines
+	res20, _, err := ApplyUpdateWithResult(
+		json.RawMessage(`{"tags":["a","b"],"nums":[1,2,3,4,2]}`),
+		&UpdateRequest{
+			Script: &ScriptSpec{
+				Source: `
+					ctx._source.tags.replaceAll(t -> t.toUpperCase());
+					int streamSum = ctx._source.nums.stream().distinct().filter(x -> x > 1).map(x -> x * 10).sum();
+					List collected = ctx._source.nums.stream().sorted().limit(3).collect(Collectors.toList());
+					boolean anyBig = ctx._source.nums.stream().anyMatch(x -> x >= 4);
+					Map m = [:];
+					m.computeIfAbsent('k1', k -> 100);
+					m.computeIfPresent('k1', (k, v) -> v + 50);
+					m.merge('k1', 25, (oldV, newV) -> oldV + newV);
+					int forEachSum = 0;
+					ctx._source.nums.forEach(n -> { forEachSum += n; });
+					ctx._source.stream_sum = streamSum;
+					ctx._source.collected = collected;
+					ctx._source.any_big = anyBig;
+					ctx._source.k1 = m.get('k1');
+					ctx._source.fe_sum = forEachSum;
+				`,
+			},
+		},
+		true,
+	)
+	if err != nil {
+		t.Fatalf("Fix 20 failed: %v", err)
+	}
+	var doc20 map[string]any
+	_ = json.Unmarshal(res20, &doc20)
+	tags20, _ := doc20["tags"].([]any)
+	if len(tags20) != 2 || tags20[0] != "A" || tags20[1] != "B" || doc20["stream_sum"] != float64(90) || doc20["any_big"] != true || doc20["k1"] != float64(175) || doc20["fe_sum"] != float64(12) {
+		t.Fatalf("unexpected Fix 20 doc: %+v", doc20)
+	}
+
+	// Fix 21: Hex (0xFF) / binary (0b1010) literals, Math.PI / Integer.MAX_VALUE, Math.sin/cos/floorDiv/floorMod, and ctx._source slice alias sync
+	res21, _, err := ApplyUpdateWithResult(
+		json.RawMessage(`{"arr":[1,2,3]}`),
+		&UpdateRequest{
+			Script: &ScriptSpec{
+				Source: `
+					def localRef = ctx._source.arr;
+					ctx._source.arr.remove(0);
+					ctx._source.local_len = localRef.size();
+					ctx._source.hex = 0xFF;
+					ctx._source.bin = 0b1010;
+					ctx._source.fdiv = Math.floorDiv(-7, 2);
+					ctx._source.fmod = Math.floorMod(-7, 2);
+					ctx._source.cos0 = Math.round(Math.cos(0));
+					ctx._source.has_pi = Math.PI > 3.14;
+					ctx._source.max_int = Integer.MAX_VALUE;
+				`,
+			},
+		},
+		true,
+	)
+	if err != nil {
+		t.Fatalf("Fix 21 failed: %v", err)
+	}
+	var doc21 map[string]any
+	_ = json.Unmarshal(res21, &doc21)
+	if doc21["local_len"] != float64(2) || doc21["hex"] != float64(255) || doc21["bin"] != float64(10) || doc21["fdiv"] != float64(-4) || doc21["fmod"] != float64(1) || doc21["cos0"] != float64(1) || doc21["has_pi"] != true || doc21["max_int"] != float64(2147483647) {
+		t.Fatalf("unexpected Fix 21 doc: %+v", doc21)
+	}
+
+	// Fix 22: {"doc": {}} is a noop on existing docs and creates {} when doc_as_upsert: true
+	_, op22a, err := ApplyUpdateWithResult(
+		json.RawMessage(`{"a":1}`),
+		&UpdateRequest{Doc: map[string]any{}},
+		true,
+	)
+	if err != nil || op22a != "noop" {
+		t.Fatalf("expected noop for empty doc update on existing doc, got op=%s err=%v", op22a, err)
+	}
+	created22b, op22b, err := ApplyUpdateWithResult(
+		nil,
+		&UpdateRequest{Doc: map[string]any{}, DocAsUpsert: true},
+		false,
+	)
+	if err != nil || op22b != "created" || string(created22b) != "{}" {
+		t.Fatalf("expected created '{}' for empty doc_as_upsert on missing doc, got op=%s body=%s err=%v", op22b, string(created22b), err)
+	}
+}

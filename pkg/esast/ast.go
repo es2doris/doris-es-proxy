@@ -968,6 +968,7 @@ type MatchEntry struct {
 	ZeroTermsQuery     string  `json:"zero_terms_query,omitempty"`
 	MinimumShouldMatch any     `json:"minimum_should_match,omitempty"`
 	Fuzziness          any     `json:"fuzziness,omitempty"`
+	Lenient            *bool   `json:"lenient,omitempty"`
 }
 
 func (m *MatchEntry) UnmarshalJSON(data []byte) error {
@@ -982,6 +983,7 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 			ZeroTermsQuery     string   `json:"zero_terms_query"`
 			MinimumShouldMatch any      `json:"minimum_should_match"`
 			Fuzziness          any      `json:"fuzziness"`
+			Lenient            *bool    `json:"lenient"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
@@ -996,6 +998,7 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 		m.ZeroTermsQuery = full.ZeroTermsQuery
 		m.MinimumShouldMatch = full.MinimumShouldMatch
 		m.Fuzziness = full.Fuzziness
+		m.Lenient = full.Lenient
 		return nil
 	}
 	return json.Unmarshal(trimmed, &m.Query)
@@ -1060,18 +1063,30 @@ type MultiMatchQuery struct {
 	TieBreaker         *float64 `json:"tie_breaker,omitempty"`
 	ZeroTermsQuery     string   `json:"zero_terms_query,omitempty"`
 	Fuzziness          any      `json:"fuzziness,omitempty"`
+	Lenient            *bool    `json:"lenient,omitempty"`
 	Boost              *float64 `json:"boost,omitempty"`
 }
 
 type QueryStringQuery struct {
-	Query              string   `json:"query"`
-	DefaultField       string   `json:"default_field,omitempty"`
-	Fields             []string `json:"fields,omitempty"`
-	DefaultOperator    string   `json:"default_operator,omitempty"`
-	MinimumShouldMatch any      `json:"minimum_should_match,omitempty"`
-	QuoteFieldSuffix   string   `json:"quote_field_suffix,omitempty"`
-	Flags              string   `json:"flags,omitempty"`
-	Boost              *float64 `json:"boost,omitempty"`
+	Query                           string   `json:"query"`
+	DefaultField                    string   `json:"default_field,omitempty"`
+	Fields                          []string `json:"fields,omitempty"`
+	DefaultOperator                 string   `json:"default_operator,omitempty"`
+	MinimumShouldMatch              any      `json:"minimum_should_match,omitempty"`
+	QuoteFieldSuffix                string   `json:"quote_field_suffix,omitempty"`
+	Flags                           string   `json:"flags,omitempty"`
+	TimeZone                        string   `json:"time_zone,omitempty"`
+	Type                            string   `json:"type,omitempty"`
+	TieBreaker                      *float64 `json:"tie_breaker,omitempty"`
+	PhraseSlop                      int      `json:"phrase_slop,omitempty"`
+	Fuzziness                       any      `json:"fuzziness,omitempty"`
+	FuzzyTranspositions             *bool    `json:"fuzzy_transpositions,omitempty"`
+	Lenient                         *bool    `json:"lenient,omitempty"`
+	ZeroTermsQuery                  string   `json:"zero_terms_query,omitempty"`
+	AnalyzeWildcard                 *bool    `json:"analyze_wildcard,omitempty"`
+	AllowLeadingWildcard            *bool    `json:"allow_leading_wildcard,omitempty"`
+	AutoGenerateSynonymsPhraseQuery *bool    `json:"auto_generate_synonyms_phrase_query,omitempty"`
+	Boost                           *float64 `json:"boost,omitempty"`
 }
 
 type NestedQuery struct {
@@ -1220,8 +1235,10 @@ func (a *AggSpec) EffectiveCumulative() *PipelineAggSpec {
 
 // SamplerAggSpec models a `sampler` or `diversified_sampler` aggregation.
 type SamplerAggSpec struct {
-	ShardSize int    `json:"shard_size,omitempty"`
-	Field     string `json:"field,omitempty"`
+	ShardSize       int    `json:"shard_size,omitempty"`
+	Field           string `json:"field,omitempty"`
+	Script          any    `json:"script,omitempty"`
+	MaxDocsPerValue int    `json:"max_docs_per_value,omitempty"`
 }
 
 // PercentileRanksAggSpec models a `percentile_ranks` metric aggregation.
@@ -1662,6 +1679,7 @@ type TermsAggSpec struct {
 	MinDocCount   *int   `json:"min_doc_count,omitempty"`
 	Include       any    `json:"include,omitempty"`
 	Exclude       any    `json:"exclude,omitempty"`
+	ValueType     string `json:"value_type,omitempty"`
 }
 
 type HistogramBoundsSpec struct {
@@ -2309,22 +2327,25 @@ type MappingSpec struct {
 }
 
 type FieldProperty struct {
-	Type           string                   `json:"type,omitempty"`
-	Path           string                   `json:"path,omitempty"`
-	Analyzer       string                   `json:"analyzer,omitempty"`
-	SearchAnalyzer string                   `json:"search_analyzer,omitempty"`
-	Normalizer     string                   `json:"normalizer,omitempty"`
-	Format         string                   `json:"format,omitempty"`
-	Dims           int                      `json:"dims,omitempty"`
-	Dimension      int                      `json:"dimension,omitempty"`
-	Similarity     string                   `json:"similarity,omitempty"`
-	MultiValued    bool                     `json:"multi_valued,omitempty"`
-	UpgradedArray  bool                     `json:"upgraded_array,omitempty"`
-	CopyTo         any                      `json:"copy_to,omitempty"`
-	NullValue      any                      `json:"null_value,omitempty"`
-	IgnoreAbove    int                      `json:"ignore_above,omitempty"`
-	Fields         map[string]FieldProperty `json:"fields,omitempty"`
-	Properties     map[string]FieldProperty `json:"properties,omitempty"`
+	Type            string                   `json:"type,omitempty"`
+	Path            string                   `json:"path,omitempty"`
+	Analyzer        string                   `json:"analyzer,omitempty"`
+	SearchAnalyzer  string                   `json:"search_analyzer,omitempty"`
+	Normalizer      string                   `json:"normalizer,omitempty"`
+	Format          string                   `json:"format,omitempty"`
+	Dims            int                      `json:"dims,omitempty"`
+	Dimension       int                      `json:"dimension,omitempty"`
+	Similarity      string                   `json:"similarity,omitempty"`
+	MultiValued     bool                     `json:"multi_valued,omitempty"`
+	UpgradedArray   bool                     `json:"upgraded_array,omitempty"`
+	CopyTo          any                      `json:"copy_to,omitempty"`
+	NullValue       any                      `json:"null_value,omitempty"`
+	IgnoreAbove     int                      `json:"ignore_above,omitempty"`
+	IgnoreMalformed *bool                    `json:"ignore_malformed,omitempty"`
+	Coerce          *bool                    `json:"coerce,omitempty"`
+	ScalingFactor   float64                  `json:"scaling_factor,omitempty"`
+	Fields          map[string]FieldProperty `json:"fields,omitempty"`
+	Properties      map[string]FieldProperty `json:"properties,omitempty"`
 }
 
 func (fp FieldProperty) EffectiveDims() int {

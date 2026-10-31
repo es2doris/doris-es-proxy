@@ -1893,6 +1893,65 @@ func isExplicitIgnoreMissingFalse(specMap map[string]any) bool {
 	return false
 }
 
+func hasIngestScalarAncestor(doc map[string]any, path string) (string, bool) {
+	segs := strings.Split(path, ".")
+	for i := 1; i < len(segs); i++ {
+		prefix := strings.Join(segs[:i], ".")
+		if ancVal, ok := getIngestPath(doc, prefix); ok && ancVal != nil {
+			if _, isMap := ancVal.(map[string]any); isMap {
+				continue
+			}
+			if _, isSlice := ancVal.([]any); isSlice {
+				if _, err := strconv.Atoi(segs[i]); err == nil {
+					continue
+				}
+			}
+			return prefix, true
+		}
+	}
+	return "", false
+}
+
+func ingestNumericFloat64(v any) (float64, bool) {
+	switch tv := v.(type) {
+	case int:
+		return float64(tv), true
+	case int32:
+		return float64(tv), true
+	case int64:
+		return float64(tv), true
+	case uint:
+		return float64(tv), true
+	case uint64:
+		return float64(tv), true
+	case float32:
+		return float64(tv), true
+	case float64:
+		return tv, true
+	case json.Number:
+		fv, err := tv.Float64()
+		return fv, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func ingestValuesEqual(a, b any) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	if fa, okA := ingestNumericFloat64(a); okA {
+		if fb, okB := ingestNumericFloat64(b); okB {
+			return fa == fb
+		}
+		return false
+	}
+	if _, okB := ingestNumericFloat64(b); okB {
+		return false
+	}
+	return reflect.DeepEqual(a, b)
+}
+
 func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string]any, depth int, trace *[]map[string]any) (mutated bool, dropped bool, procType string, procTag string, specMap map[string]any, procErr error) {
 	if topIf, ok := pMap["if"].(string); ok && !evalIngestIfCondition(topIf, doc) {
 		return false, false, "", "", nil, nil
@@ -2042,21 +2101,29 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 	case "set":
 		if field, _ := specMap["field"].(string); field != "" {
 			field = fmt.Sprintf("%v", expandIngestTemplate(field, doc))
-			if override, hasOverride := specMap["override"].(bool); hasOverride && !override {
-				if existing, exists := getIngestPath(doc, field); exists && existing != nil {
-					return false, false, procType, procTag, specMap, nil
-				}
-			}
 			if copyFrom, _ := specMap["copy_from"].(string); copyFrom != "" {
 				copyFrom = fmt.Sprintf("%v", expandIngestTemplate(copyFrom, doc))
-				if val, exists := getIngestPath(doc, copyFrom); exists {
-					setIngestPath(doc, field, deepCloneIngestValue(val))
-					mutated = true
-				} else if isExplicitIgnoreMissingFalse(specMap) {
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", copyFrom)
+				val, exists := getIngestPath(doc, copyFrom)
+				if !exists {
+					if isExplicitIgnoreMissingFalse(specMap) {
+						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", copyFrom)
+					}
+					return false, false, procType, procTag, specMap, nil
 				}
+				if override, hasOverride := specMap["override"].(bool); hasOverride && !override {
+					if existing, exOk := getIngestPath(doc, field); exOk && existing != nil {
+						return false, false, procType, procTag, specMap, nil
+					}
+				}
+				setIngestPath(doc, field, deepCloneIngestValue(val))
+				mutated = true
 			} else if val, hasVal := specMap["value"]; hasVal {
-				setIngestPath(doc, field, expandIngestTemplate(val, doc))
+				if override, hasOverride := specMap["override"].(bool); hasOverride && !override {
+					if existing, exists := getIngestPath(doc, field); exists && existing != nil {
+						return false, false, procType, procTag, specMap, nil
+					}
+				}
+				setIngestPath(doc, field, deepCloneIngestValue(expandIngestTemplate(val, doc)))
 				mutated = true
 			}
 		}
@@ -2064,7 +2131,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		if field, _ := specMap["field"].(string); field != "" {
 			field = fmt.Sprintf("%v", expandIngestTemplate(field, doc))
 			if existing, exists := getIngestPath(doc, field); !exists || existing == nil {
-				setIngestPath(doc, field, expandIngestTemplate(specMap["value"], doc))
+				setIngestPath(doc, field, deepCloneIngestValue(expandIngestTemplate(specMap["value"], doc)))
 				mutated = true
 			}
 		}
@@ -2077,18 +2144,28 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			if srcField == dstField {
 				return false, false, procType, procTag, specMap, fmt.Errorf("source and target_field are the same: [%s]", srcField)
 			}
+			val, exists := getIngestPath(doc, srcField)
+			if !exists {
+				if isExplicitIgnoreMissingFalse(specMap) {
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", srcField)
+				}
+				return false, false, procType, procTag, specMap, nil
+			}
 			if override, hasOverride := specMap["override"].(bool); hasOverride && !override {
-				if existing, exists := getIngestPath(doc, dstField); exists && existing != nil {
+				if existing, exOk := getIngestPath(doc, dstField); exOk && existing != nil {
+					return false, false, procType, procTag, specMap, nil
+				}
+				if anc, hasScalarAnc := hasIngestScalarAncestor(doc, dstField); hasScalarAnc && srcField != anc && !strings.HasPrefix(srcField, anc+".") {
 					return false, false, procType, procTag, specMap, nil
 				}
 			}
-			if val, exists := getIngestPath(doc, srcField); exists {
-				deleteIngestPath(doc, srcField)
-				setIngestPath(doc, dstField, val)
-				mutated = true
-			} else if isExplicitIgnoreMissingFalse(specMap) {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", srcField)
+			if anc, hasScalarAnc := hasIngestScalarAncestor(doc, dstField); hasScalarAnc && srcField != anc && !strings.HasPrefix(srcField, anc+".") && !strings.HasPrefix(dstField, srcField+".") {
+				return false, false, procType, procTag, specMap, fmt.Errorf("target_field [%s] cannot be set because [%s] is not an object", dstField, anc)
 			}
+			cloned := deepCloneIngestValue(val)
+			deleteIngestPath(doc, srcField)
+			setIngestPath(doc, dstField, cloned)
+			mutated = true
 		}
 	case "copy":
 		srcField, _ := specMap["field"].(string)
@@ -2096,17 +2173,20 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		if srcField != "" && dstField != "" {
 			srcField = fmt.Sprintf("%v", expandIngestTemplate(srcField, doc))
 			dstField = fmt.Sprintf("%v", expandIngestTemplate(dstField, doc))
+			val, exists := getIngestPath(doc, srcField)
+			if !exists {
+				if isExplicitIgnoreMissingFalse(specMap) {
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", srcField)
+				}
+				return false, false, procType, procTag, specMap, nil
+			}
 			if override, hasOverride := specMap["override"].(bool); hasOverride && !override {
-				if existing, exists := getIngestPath(doc, dstField); exists && existing != nil {
+				if existing, exOk := getIngestPath(doc, dstField); exOk && existing != nil {
 					return false, false, procType, procTag, specMap, nil
 				}
 			}
-			if val, exists := getIngestPath(doc, srcField); exists {
-				setIngestPath(doc, dstField, deepCloneIngestValue(val))
-				mutated = true
-			} else if isExplicitIgnoreMissingFalse(specMap) {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", srcField)
-			}
+			setIngestPath(doc, dstField, deepCloneIngestValue(val))
+			mutated = true
 		}
 	case "remove":
 		extractRemoveStrings := func(raw any) []string {
@@ -2153,9 +2233,19 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				}
 			}
 			for _, kp := range fieldsToKeep {
+				foundAny := false
 				if val, exists := getIngestPath(doc, kp); exists {
-					setIngestPath(kept, kp, val)
-				} else if isExplicitIgnoreMissingFalse(specMap) {
+					setIngestPath(kept, kp, deepCloneIngestValue(val))
+					foundAny = true
+				}
+				prefix := kp + "."
+				for k, v := range doc {
+					if strings.HasPrefix(k, prefix) {
+						setIngestPath(kept, k, deepCloneIngestValue(v))
+						foundAny = true
+					}
+				}
+				if !foundAny && isExplicitIgnoreMissingFalse(specMap) {
 					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", kp)
 				}
 			}
@@ -2345,11 +2435,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				toAdd = []any{v}
 			}
 			for _, item := range toAdd {
-				expanded := expandIngestTemplate(item, doc)
+				expanded := deepCloneIngestValue(expandIngestTemplate(item, doc))
 				if !allowDups {
 					dup := false
 					for _, ex := range curSlice {
-						if fmt.Sprintf("%v", ex) == fmt.Sprintf("%v", expanded) {
+						if ingestValuesEqual(ex, expanded) {
 							dup = true
 							break
 						}
@@ -4803,7 +4893,10 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				}
 				existing, exists := existingDocs[pd.id]
 				if pd.isDelete {
-					if exists && pd.aliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), pd.destIndex, pd.id, existing.Source, pd.aliasFilter) {
+					if !exists {
+						continue
+					}
+					if pd.aliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), pd.destIndex, pd.id, existing.Source, pd.aliasFilter) {
 						if proceedOnConflict {
 							versionConflicts++
 							continue
@@ -4812,7 +4905,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 							fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", pd.id))
 						return
 					}
-					if exists && existing.Version+1 > minVer {
+					if existing.Version+1 > minVer {
 						minVer = existing.Version + 1
 					}
 					nextVer := s.allocVersion(minVer)
@@ -4924,25 +5017,97 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-var (
-	reReindexMetaID      = regexp.MustCompile(`(^|[^a-zA-Z0-9_.])(?:ctx\?\._id|ctx\._id)\b`)
-	reReindexMetaIndex   = regexp.MustCompile(`(^|[^a-zA-Z0-9_.])(?:ctx\?\._index|ctx\._index)\b`)
-	reReindexMetaVersion = regexp.MustCompile(`(^|[^a-zA-Z0-9_.])(?:ctx\?\._version|ctx\._version)\b`)
-)
-
 func rewriteReindexMetaScript(src string) (string, bool) {
-	rewritten := reReindexMetaID.ReplaceAllString(src, "${1}ctx._source.__reindex_id")
-	for _, pat := range []string{"ctx?.['_id']", "ctx['_id']", `ctx?.["_id"]`, `ctx["_id"]`} {
-		rewritten = strings.ReplaceAll(rewritten, pat, "ctx._source.__reindex_id")
+	type metaReplacement struct {
+		pattern string
+		target  string
+		dotForm bool
 	}
-	rewritten = reReindexMetaIndex.ReplaceAllString(rewritten, "${1}ctx._source.__reindex_index")
-	for _, pat := range []string{"ctx?.['_index']", "ctx['_index']", `ctx?.["_index"]`, `ctx["_index"]`} {
-		rewritten = strings.ReplaceAll(rewritten, pat, "ctx._source.__reindex_index")
+	patterns := []metaReplacement{
+		{"ctx?._id", "ctx._source.__reindex_id", true},
+		{"ctx._id", "ctx._source.__reindex_id", true},
+		{"ctx?.['_id']", "ctx._source.__reindex_id", false},
+		{"ctx['_id']", "ctx._source.__reindex_id", false},
+		{`ctx?.["_id"]`, "ctx._source.__reindex_id", false},
+		{`ctx["_id"]`, "ctx._source.__reindex_id", false},
+		{"ctx?._index", "ctx._source.__reindex_index", true},
+		{"ctx._index", "ctx._source.__reindex_index", true},
+		{"ctx?.['_index']", "ctx._source.__reindex_index", false},
+		{"ctx['_index']", "ctx._source.__reindex_index", false},
+		{`ctx?.["_index"]`, "ctx._source.__reindex_index", false},
+		{`ctx["_index"]`, "ctx._source.__reindex_index", false},
+		{"ctx?._version", "ctx._source.__reindex_version", true},
+		{"ctx._version", "ctx._source.__reindex_version", true},
+		{"ctx?.['_version']", "ctx._source.__reindex_version", false},
+		{"ctx['_version']", "ctx._source.__reindex_version", false},
+		{`ctx?.["_version"]`, "ctx._source.__reindex_version", false},
+		{`ctx["_version"]`, "ctx._source.__reindex_version", false},
 	}
-	rewritten = reReindexMetaVersion.ReplaceAllString(rewritten, "${1}ctx._source.__reindex_version")
-	for _, pat := range []string{"ctx?.['_version']", "ctx['_version']", `ctx?.["_version"]`, `ctx["_version"]`} {
-		rewritten = strings.ReplaceAll(rewritten, pat, "ctx._source.__reindex_version")
+	var out strings.Builder
+	out.Grow(len(src) + 16)
+	inQuotes := byte(0)
+	for i := 0; i < len(src); i++ {
+		c := src[i]
+		if inQuotes != 0 {
+			out.WriteByte(c)
+			if c == '\\' && i+1 < len(src) {
+				i++
+				out.WriteByte(src[i])
+				continue
+			}
+			if c == inQuotes {
+				inQuotes = 0
+			}
+			continue
+		}
+		if c == '\'' || c == '"' {
+			inQuotes = c
+			out.WriteByte(c)
+			continue
+		}
+		if c == '/' && i+1 < len(src) {
+			if src[i+1] == '/' {
+				nl := strings.IndexByte(src[i+2:], '\n')
+				if nl < 0 {
+					out.WriteString(src[i:])
+					break
+				}
+				out.WriteString(src[i : i+2+nl+1])
+				i += 2 + nl
+				continue
+			}
+			if src[i+1] == '*' {
+				end := strings.Index(src[i+2:], "*/")
+				if end < 0 {
+					out.WriteString(src[i:])
+					break
+				}
+				out.WriteString(src[i : i+2+end+2])
+				i += 2 + end + 1
+				continue
+			}
+		}
+		if (i == 0 || (!isIngestIdentByte(src[i-1]) && src[i-1] != '.')) && strings.HasPrefix(src[i:], "ctx") {
+			matched := false
+			for _, p := range patterns {
+				if strings.HasPrefix(src[i:], p.pattern) {
+					afterIdx := i + len(p.pattern)
+					if p.dotForm && afterIdx < len(src) && isIngestIdentByte(src[afterIdx]) {
+						continue
+					}
+					out.WriteString(p.target)
+					i = afterIdx - 1
+					matched = true
+					break
+				}
+			}
+			if matched {
+				continue
+			}
+		}
+		out.WriteByte(c)
 	}
+	rewritten := out.String()
 	return rewritten, rewritten != src
 }
 
@@ -5086,7 +5251,9 @@ func (s *Server) backfillIndexSchema(ctx context.Context, newSchema *schema.Inde
 		return
 	}
 	_ = s.coalescer.FlushTable(ctx, newSchema.DorisTable)
-	tr := transpiler.NewTranspiler(newSchema, s.transpileOpts)
+	opts := s.transpileOpts
+	opts.MaxResultWindow = 0
+	tr := transpiler.NewTranspiler(newSchema, opts)
 	batchSize := 1000
 	var searchAfter []any
 	for {
@@ -5196,7 +5363,9 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	aliasFilters = s.resolveTermsLookupsInAliasFilters(r.Context(), aliasFilters)
-	_ = s.resolveTermsLookupsInSearchRequest(r.Context(), &req)
+	if resolved := s.resolveTermsLookupsInSearchRequest(r.Context(), &req); resolved != nil {
+		req = *resolved
+	}
 
 	var explanations []map[string]any
 	for _, idxName := range targets {
@@ -6687,7 +6856,9 @@ func (s *Server) handleResizeOrCloneIndex(w http.ResponseWriter, r *http.Request
 	}
 
 	_ = s.coalescer.FlushTable(r.Context(), srcSchema.DorisTable)
-	tr := transpiler.NewTranspiler(srcSchema, s.transpileOpts)
+	opts := s.transpileOpts
+	opts.MaxResultWindow = 0
+	tr := transpiler.NewTranspiler(srcSchema, opts)
 	batchSize := 1000
 	var searchAfter []any
 	for {

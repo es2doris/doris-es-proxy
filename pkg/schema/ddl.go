@@ -130,6 +130,29 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 
 	for _, k := range newKeys {
 		b := newSchema.Fields[k]
+		if oldSchema != nil {
+			if oldB, hadOld := oldSchema.Fields[k]; hadOld &&
+				oldB.Kind == StoragePromotedScalar &&
+				b.Kind == StoragePromotedArray &&
+				b.ColumnName == oldB.ColumnName {
+				b.ColumnName = "f__arr__" + SanitizeDorisIdentifier(k)
+				newSchema.Fields[k] = b
+				if strings.HasSuffix(k, ".keyword") {
+					baseName := strings.TrimSuffix(k, ".keyword")
+					if baseB, ok := newSchema.Fields[baseName]; ok && baseB.KeywordCompanion == oldB.ColumnName {
+						baseB.KeywordCompanion = b.ColumnName
+						newSchema.Fields[baseName] = baseB
+					}
+				}
+				for i := range newSchema.OrderedFields {
+					if newSchema.OrderedFields[i].ESFieldPath == k {
+						newSchema.OrderedFields[i] = b
+					} else if strings.HasSuffix(k, ".keyword") && newSchema.OrderedFields[i].ESFieldPath == strings.TrimSuffix(k, ".keyword") {
+						newSchema.OrderedFields[i] = newSchema.Fields[newSchema.OrderedFields[i].ESFieldPath]
+					}
+				}
+			}
+		}
 		if b.AliasTarget != "" || b.ColumnName == "" || existingCols[b.ColumnName] {
 			continue
 		}

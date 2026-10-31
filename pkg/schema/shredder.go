@@ -100,7 +100,7 @@ func ShredDocument(
 		case StoragePromotedScalar:
 			val := extractScalarValue(parsedDoc, b.SourceJSONPath)
 			if (b.ESType == "text" || b.ESType == "match_only_text") && b.DorisType == DorisString {
-				if strs := extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer, b.NullValue); len(strs) > 1 {
+				if strs := extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer, b.NullValue); len(strs) >= 1 {
 					val = strings.Join(strs, " ")
 				}
 			}
@@ -635,6 +635,141 @@ func ParseESDateToEpochMillis(input string, now time.Time) (int64, bool) {
 	return ParseESDateBoundToEpochMillis(input, now, false)
 }
 
+// ESDateFormatToGoLayout converts an Elasticsearch / Java DateTimeFormatter pattern
+// (such as "dd/MM/yyyy", "yyyy-MM-dd HH:mm:ss", "MM/dd/yyyy") into a Go time layout.
+func ESDateFormatToGoLayout(pattern string) string {
+	var b strings.Builder
+	for i := 0; i < len(pattern); {
+		if pattern[i] == '\'' {
+			i++
+			for i < len(pattern) && pattern[i] != '\'' {
+				b.WriteByte(pattern[i])
+				i++
+			}
+			if i < len(pattern) {
+				i++
+			}
+			continue
+		}
+		ch := pattern[i]
+		j := i + 1
+		for j < len(pattern) && pattern[j] == ch {
+			j++
+		}
+		token := pattern[i:j]
+		switch token {
+		case "yyyy", "uuuu":
+			b.WriteString("2006")
+		case "yy", "uu":
+			b.WriteString("06")
+		case "MM":
+			b.WriteString("01")
+		case "M":
+			b.WriteString("1")
+		case "dd":
+			b.WriteString("02")
+		case "d":
+			b.WriteString("2")
+		case "HH":
+			b.WriteString("15")
+		case "hh":
+			b.WriteString("03")
+		case "h":
+			b.WriteString("3")
+		case "mm":
+			b.WriteString("04")
+		case "m":
+			b.WriteString("4")
+		case "ss":
+			b.WriteString("05")
+		case "s":
+			b.WriteString("5")
+		case "SSS":
+			b.WriteString("000")
+		case "Z":
+			b.WriteString("-0700")
+		case "X", "XX", "XXX":
+			b.WriteString("Z07:00")
+		default:
+			b.WriteString(token)
+		}
+		i = j
+	}
+	return b.String()
+}
+
+// ParseESDateWithFormatToEpochMillis parses a date string or date math expression using an
+// optional ES date format specification (e.g., "dd/MM/yyyy||epoch_millis") before falling back
+// to standard ISO-8601 / epoch millis parsing.
+func ParseESDateWithFormatToEpochMillis(input, format string, now time.Time) (int64, bool) {
+	s := strings.TrimSpace(input)
+	if s == "" {
+		return 0, false
+	}
+	if strings.HasPrefix(s, "now") {
+		return ParseESDateToEpochMillis(s, now)
+	}
+	if strings.TrimSpace(format) != "" {
+		prefix := s
+		mathExpr := ""
+		hasMath := false
+		if idx := strings.Index(s, "||"); idx >= 0 {
+			prefix = strings.TrimSpace(s[:idx])
+			mathExpr = strings.TrimSpace(s[idx+2:])
+			hasMath = true
+		}
+		for _, rawFmt := range strings.Split(format, "||") {
+			fmtPart := strings.TrimSpace(rawFmt)
+			if fmtPart == "" {
+				continue
+			}
+			switch fmtPart {
+			case "epoch_second":
+				if f, err := strconv.ParseFloat(prefix, 64); err == nil {
+					base := time.UnixMilli(int64(f * 1000)).UTC()
+					if hasMath {
+						if t, ok := applyESDateMathWithRound(base, mathExpr, false); ok {
+							return t.UnixMilli(), true
+						}
+						return 0, false
+					}
+					return base.UnixMilli(), true
+				}
+			case "epoch_millis":
+				if iv, err := strconv.ParseInt(prefix, 10, 64); err == nil {
+					base := time.UnixMilli(iv).UTC()
+					if hasMath {
+						if t, ok := applyESDateMathWithRound(base, mathExpr, false); ok {
+							return t.UnixMilli(), true
+						}
+						return 0, false
+					}
+					return iv, true
+				}
+			case "strict_date_optional_time", "date_optional_time", "strict_date", "basic_date":
+				if ms, ok := ParseESDateToEpochMillis(s, now); ok {
+					return ms, true
+				}
+			default:
+				layout := ESDateFormatToGoLayout(fmtPart)
+				if layout != "" {
+					if t, err := time.Parse(layout, prefix); err == nil {
+						base := t.UTC()
+						if hasMath {
+							if mt, ok := applyESDateMathWithRound(base, mathExpr, false); ok {
+								return mt.UnixMilli(), true
+							}
+							return 0, false
+						}
+						return base.UnixMilli(), true
+					}
+				}
+			}
+		}
+	}
+	return ParseESDateToEpochMillis(s, now)
+}
+
 // ParseESDateBoundToEpochMillis parses ISO-8601 / RFC3339 date strings, epoch strings,
 // and Elasticsearch date math expressions into Unix epoch milliseconds.
 // When `roundUp` is true (used for inclusive upper bounds like `lte`), rounding units (`/d`, `/h`, etc.)
@@ -915,10 +1050,12 @@ func normalizeScalar(v any) any {
 	case nil:
 		return nil
 	case []any:
-		if len(val) == 0 {
-			return nil
+		for _, elem := range val {
+			if norm := normalizeScalar(elem); norm != nil {
+				return norm
+			}
 		}
-		return normalizeScalar(val[0])
+		return nil
 	case map[string]any:
 		b, _ := json.Marshal(val)
 		return string(b)
@@ -1246,16 +1383,8 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 			}
 		}
 		if isKwCompanion {
-			if b.IgnoreAbove > 0 || b.LowercaseNormalizer || b.IsMultiValued {
+			if b.IgnoreAbove > 0 || b.LowercaseNormalizer || b.IsMultiValued || b.NullValue != nil {
 				applyNestedKwCompanionNormalizationAtPath(cloned, relPath, b, getNow)
-			}
-			if b.NullValue != nil {
-				bNorm := b
-				bNorm.IgnoreAbove = 0
-				bNorm.LowercaseNormalizer = false
-				if b.IgnoreAbove == 0 || len([]rune(fmt.Sprintf("%v", b.NullValue))) <= b.IgnoreAbove {
-					applyNestedBindingNormalizationAtPath(cloned, relPath, bNorm, getNow)
-				}
 			}
 		} else {
 			applyNestedBindingNormalizationAtPath(cloned, relPath, b, getNow)
