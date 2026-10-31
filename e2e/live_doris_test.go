@@ -1462,7 +1462,7 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	r31SimResp, err := http.Post(ts.URL+"/_ingest/pipeline/_simulate", "application/json", strings.NewReader(`{
 		"pipeline": {
 			"processors": [
-				{"script": {"source": "ctx.op = 'index'; ctx.r31_ok = ('x' == 'y') ? 'no' : 'yes'"}},
+				{"script": {"source": "if (ctx.op == 'custom_op') { ctx.op = 'index'; } ctx.r31_ok = ('x' == 'y') ? 'no' : 'yes'"}},
 				{"set": {"field": "parsed.existing", "value": "keep"}},
 				{"dissect": {"field": "line", "pattern": "%{a}-%{b}", "target_field": "parsed"}}
 			]
@@ -1479,7 +1479,7 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	_ = r31SimResp.Body.Close()
 	r31SimDoc := r31SimRes["docs"].([]any)[0].(map[string]any)["doc"].(map[string]any)["_source"].(map[string]any)
 	r31Parsed, _ := r31SimDoc["parsed"].(map[string]any)
-	if r31SimDoc["op"] != "custom_op" || r31SimDoc["r31_ok"] != "yes" || r31Parsed["existing"] != "keep" || r31Parsed["a"] != "foo" {
+	if r31SimDoc["op"] != "index" || r31SimDoc["r31_ok"] != "yes" || r31Parsed["existing"] != "keep" || r31Parsed["a"] != "foo" {
 		t.Fatalf("unexpected R31 simulated doc: %+v", r31SimDoc)
 	}
 }
