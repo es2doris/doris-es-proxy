@@ -423,4 +423,48 @@ func TestRound34_IngestProcessorsMutationGhostIndexAndDeleteExternalVersion(t *t
 	if code != http.StatusNotFound {
 		t.Fatalf("expected doc 1 to be deleted (404) after external version=12 delete, got %d", code)
 	}
+
+	// Verify exact E2E payloads for Round 34
+	doRound27Req(t, srv, http.MethodPost, "/_bulk?refresh=true", strings.Join([]string{
+		`{"index":{"_index":"live_auto_index","_id":"auto-1"}}`,
+		`{"service":"checkout-api","latency_ms":42,"ok":true}`,
+		`{"index":{"_index":"live_auto_index","_id":"auto-2"}}`,
+		`{"service":"billing-api","latency_ms":15,"env":"prod"}`,
+	}, "\n")+"\n")
+	code, e2eAggRes := doRound27Req(t, srv, http.MethodPost, "/live_auto_index/_search?typed_keys=true", `{
+		"size": 0,
+		"query": {
+			"terms": {
+				"service": ["CHECKOUT-API", "BILLING-API"],
+				"case_insensitive": true
+			}
+		},
+		"aggs": {
+			"sig_srv": {
+				"significant_text": {
+					"field": "service",
+					"min_doc_count": 1
+				}
+			},
+			"dsamp": {
+				"diversified_sampler": {
+					"shard_size": 2,
+					"field": "service"
+				}
+			},
+			"lat_h": {
+				"histogram": {
+					"field": "latency_ms",
+					"interval": 20
+				}
+			}
+		}
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 on E2E agg payload, got %d: %+v", code, e2eAggRes)
+	}
+	e2eAggs, _ := e2eAggRes["aggregations"].(map[string]any)
+	if e2eAggs["significant_text#sig_srv"] == nil || e2eAggs["diversified_sampler#dsamp"] == nil || e2eAggs["histogram#lat_h"] == nil {
+		t.Fatalf("expected significant_text#sig_srv, diversified_sampler#dsamp, and histogram#lat_h, got %+v", e2eAggs)
+	}
 }
