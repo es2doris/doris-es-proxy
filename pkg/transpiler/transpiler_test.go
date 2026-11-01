@@ -2087,3 +2087,100 @@ func TestRound33TranspilerDateFormatsNestedNullsMultiTermsMsmAndLucene(t *testin
 		t.Fatalf("expected array_median with array_filter for filtered nested sort in HitsSQL, got:\n%s", plan.HitsSQL)
 	}
 }
+
+func TestRound34NestedParentCorrelationTermsCaseInsensitiveLuceneEscapedRangeMustNotNullAndDateSortAfter(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"title": {"type": "text"},
+			"status": {"type": "keyword"},
+			"tags": {"type": "keyword"},
+			"euro_date": {"type": "date", "format": "dd/MM/yyyy"},
+			"ts": {"type": "date"},
+			"columns": {
+				"type": "nested",
+				"properties": {
+					"name": {"type": "keyword"},
+					"tags": {
+						"type": "nested",
+						"properties": {
+							"key": {"type": "keyword"}
+						}
+					}
+				}
+			}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("unmarshal spec failed: %v", err)
+	}
+	sch := schema.CompileIndexSchema("db", "r34_tr", &spec)
+	bTags := sch.Fields["tags"]
+	bTags.Kind = schema.StoragePromotedArray
+	sch.Fields["tags"] = bTags
+	tr := NewTranspiler(sch, TranspilerOptions{})
+
+	var req esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"bool": {
+				"must": [
+					{
+						"nested": {
+							"path": "columns",
+							"query": {
+								"bool": {
+									"must": [
+										{"term": {"columns.name": "email"}},
+										{
+											"nested": {
+												"path": "columns.tags",
+												"query": {"term": {"columns.tags.key": "pii"}}
+											}
+										}
+									]
+								}
+							}
+						}
+					},
+					{"terms": {"status": ["ACTIVE", "Pending"], "case_insensitive": true}},
+					{"terms": {"tags": ["PROD", "Staging"], "case_insensitive": true}},
+					{"query_string": {"query": "ts:[2024\\-01\\-01T00\\:00\\:00Z TO 2024\\-01\\-02T00\\:00\\:00Z]"}}
+				],
+				"must_not": [
+					{"match": {"title": "deprecated"}}
+				]
+			}
+		},
+		"sort": [
+			{"euro_date": {"order": "asc", "missing": "01/01/2020"}}
+		],
+		"search_after": ["15/03/2024"]
+	}`), &req); err != nil {
+		t.Fatalf("unmarshal req failed: %v", err)
+	}
+	plan, err := tr.BuildSearchPlan(&req)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan failed: %v", err)
+	}
+	// F1: multi-level nested query parent correlation
+	if !strings.Contains(plan.HitsSQL, "json_extract_string(_el2, '$._parent_id') = json_extract_string(_el, '$._nested_id')") {
+		t.Fatalf("expected multi-level nested parent correlation in HitsSQL, got:\n%s", plan.HitsSQL)
+	}
+	// F4: case_insensitive terms on scalar and array columns
+	if !strings.Contains(plan.HitsSQL, "lower(`f__status`) IN ('active', 'pending')") ||
+		!strings.Contains(plan.HitsSQL, "array_exists(_x -> lower(_x) IN ('prod', 'staging'), `f__tags`)") {
+		t.Fatalf("expected case_insensitive terms predicates in HitsSQL, got:\n%s", plan.HitsSQL)
+	}
+	// F7: Lucene escaped range bounds parsed to epoch millis (1704067200000 and 1704153600000)
+	if !strings.Contains(plan.HitsSQL, "1704067200000") || !strings.Contains(plan.HitsSQL, "1704153600000") {
+		t.Fatalf("expected Lucene escaped ISO range bounds converted to epoch millis, got:\n%s", plan.HitsSQL)
+	}
+	// F8: must_not fulltext match preserves NULL rows
+	if !strings.Contains(plan.HitsSQL, "(`f__title` IS NULL OR NOT (`f__title` MATCH_ANY 'deprecated'))") {
+		t.Fatalf("expected null-safe fulltext must_not in HitsSQL, got:\n%s", plan.HitsSQL)
+	}
+	// F10: custom date format in sort missing (01/01/2020 -> 1577836800000) and search_after (15/03/2024 -> 1710460800000)
+	if !strings.Contains(plan.HitsSQL, "1577836800000") || !strings.Contains(plan.HitsSQL, "1710460800000") {
+		t.Fatalf("expected custom date format in sort missing and search_after converted to epoch millis, got:\n%s", plan.HitsSQL)
+	}
+}

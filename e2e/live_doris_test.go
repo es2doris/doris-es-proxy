@@ -1588,4 +1588,63 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	if r33SimDoc["fallback"] != "ok" || r33SimDoc["re_ok"] != true || r33SimDoc["joined"] != "a,b" || r33SimDoc["secret"] != "pin <REDACTED>" || r33SimDoc["fp"] == nil {
 		t.Fatalf("unexpected R33 simulated doc: %+v", r33SimDoc)
 	}
+
+	// =========================================================================
+	// Round-34 Live Doris E2E Verification:
+	// 1. typed_keys on multi_terms, variable_width_histogram, geo_bounds, geo_centroid, matrix_stats
+	// 2. Painless String.replaceAll(/regex/, repl), flatMap, Pattern.compile, and ingest uri_parts/csv/kv in _simulate
+	// =========================================================================
+	r34AggResp, err := http.Post(ts.URL+"/live_auto_index/_search?typed_keys=true", "application/json", strings.NewReader(`{
+		"size": 0,
+		"aggs": {
+			"mt": {
+				"multi_terms": {
+					"terms": [{"field": "category.keyword"}, {"field": "views"}]
+				}
+			},
+			"vwh": {
+				"variable_width_histogram": {
+					"field": "views",
+					"buckets": 2
+				}
+			}
+		}
+	}`))
+	if err != nil || r34AggResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search?typed_keys=true (R34) failed: status=%v err=%v", r34AggResp.StatusCode, err)
+	}
+	var r34AggRes map[string]any
+	_ = json.NewDecoder(r34AggResp.Body).Decode(&r34AggRes)
+	_ = r34AggResp.Body.Close()
+	r34Aggs, _ := r34AggRes["aggregations"].(map[string]any)
+	if r34Aggs["multi_terms#mt"] == nil || r34Aggs["variable_width_histogram#vwh"] == nil {
+		t.Fatalf("expected multi_terms#mt and variable_width_histogram#vwh in R34 typed_keys response, got %+v", r34Aggs)
+	}
+
+	r34SimResp, err := http.Post(ts.URL+"/_ingest/pipeline/_simulate", "application/json", strings.NewReader(`{
+		"pipeline": {
+			"processors": [
+				{
+					"script": {
+						"source": "ctx.cleaned = ctx.raw.replaceAll(/\\d+/, '#'); def p = Pattern.compile('([a-z]+)-(\\\\d+)'); def m = p.matcher('ord-42'); if (m.find()) { ctx.grp = m.group(2); } ctx.flat = [[1, 2], [3]].stream().flatMap(x -> x.stream()).collect(Collectors.toList());"
+					}
+				},
+				{"uri_parts": {"field": "url", "target_field": "parsed_url"}},
+				{"kv": {"field": "kv_raw", "field_split": "&", "value_split": "=", "exclude_keys": ["secret"], "prefix": "q_"}}
+			]
+		},
+		"docs": [
+			{"_index": "live_auto_index", "_id": "r34-sim-1", "_source": {"raw": "item123", "url": "https://example.com:8443/app/index.html?x=1#top", "kv_raw": "a=1&secret=xyz"}}
+		]
+	}`))
+	if err != nil || r34SimResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_ingest/pipeline/_simulate (R34) failed: status=%v err=%v", r34SimResp.StatusCode, err)
+	}
+	var r34SimRes map[string]any
+	_ = json.NewDecoder(r34SimResp.Body).Decode(&r34SimRes)
+	_ = r34SimResp.Body.Close()
+	r34SimDoc := r34SimRes["docs"].([]any)[0].(map[string]any)["doc"].(map[string]any)["_source"].(map[string]any)
+	if r34SimDoc["cleaned"] != "item#" || r34SimDoc["grp"] != "42" || r34SimDoc["q_a"] != "1" || r34SimDoc["q_secret"] != nil {
+		t.Fatalf("unexpected R34 simulated doc: %+v", r34SimDoc)
+	}
 }

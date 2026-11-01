@@ -437,7 +437,7 @@ func (m *MemoryBackend) QueryAggs(_ context.Context, sqlStr string) ([]AggRow, e
 var (
 	reAggArrayExplode        = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\((.+?) AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_t` AS `_elem` WHERE (?:\\((.+)\\) AND )?`_elem` IS NOT NULL GROUP BY (?:`_elem`|`_bucket_key`) ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggArrayExplodeMissing = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\(CAST\\((.+?) AS STRING\\), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(CASE WHEN `([^`]+)` IS NULL.+?\\) `_t` AS `_elem`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
-	reAggScalarTerms         = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\((.+?) AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (?:\\((.+)\\) AND )?(?:(?:LOWER|UPPER|TRIM|CONCAT)\\(.+\\)|`[^`]+`|CAST\\([^)]+\\)|`_doc`\\[[^\\]]+\\]|'[^']*') IS NOT NULL GROUP BY .+? ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
+	reAggScalarTerms         = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\((.+?) AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (.+?) IS NOT NULL GROUP BY .+? ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggScalarTermsMissing  = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\(CAST\\((.+?) AS STRING\\), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggNestedTerms         = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (?:json_extract_string\\(`_nel`, '\\$\\.([^']+)'\\)|CAST\\((.+?) AS STRING\\)) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_nt` AS `_nel` WHERE (?:\\((.+)\\) AND )?(?:json_extract_string\\(`_nel`, '\\$\\.[^']+'\\)|CAST\\(.+? AS STRING\\)) IS NOT NULL GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggNestedTermsMissing  = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\((?:json_extract_string\\(`_nel`, '\\$\\.([^']+)'\\)|CAST\\((.+?) AS STRING\\)), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\((?:CASE WHEN )?`([^`]+)`(?: IS NULL.+?)?\\) `_nt` AS `_nel`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
@@ -814,7 +814,14 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 	}
 
 	if m := reAggScalarTerms.FindStringSubmatch(branch); m != nil {
-		aggName, colExpr, extraWhere := m[1], m[2], m[3]
+		aggName, colExpr, wherePrefix := m[1], m[2], strings.TrimSpace(m[3])
+		var extraWhere string
+		if strings.HasSuffix(wherePrefix, " AND "+colExpr) {
+			extraWhere = strings.TrimSpace(strings.TrimSuffix(wherePrefix, " AND "+colExpr))
+			if strings.HasPrefix(extraWhere, "(") && strings.HasSuffix(extraWhere, ")") {
+				extraWhere = extraWhere[1 : len(extraWhere)-1]
+			}
+		}
 		limit, _ := strconv.Atoi(m[4])
 		counts := make(map[string]int64)
 		for _, row := range baseRows {
@@ -2267,20 +2274,36 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 				ci = true
 				rhs = rhs[6 : len(rhs)-1]
 			}
-			if op == ">=" && (strings.Contains(lhs, " + ") || strings.Contains(lhs, " * ") || strings.Contains(lhs, " - ") || strings.Contains(lhs, " / ") || strings.Contains(lhs, "AS INT") || strings.Contains(lhs, "AS DOUBLE") || strings.Contains(lhs, "CASE WHEN") || strings.Contains(lhs, "GREATEST(") || strings.Contains(lhs, "LEAST(")) {
+			if isArithmeticSQLExpr(lhs) || strings.Contains(lhs, "AS INT") || (op == ">=" && strings.Contains(lhs, "AS DOUBLE")) {
+				if isArithmeticSQLExpr(lhs) && hasUnwrappedNullColumnRef(row, lhs) {
+					return false
+				}
 				lhsNum := evalNumericExpr(row, lhs)
 				rhsNum, err := strconv.ParseFloat(rhs, 64)
 				if err != nil {
 					rhsNum = evalNumericExpr(row, rhs)
 				}
-				return lhsNum >= rhsNum
+				switch op {
+				case ">=":
+					return lhsNum >= rhsNum
+				case "<=":
+					return lhsNum <= rhsNum
+				case "!=":
+					return lhsNum != rhsNum
+				case "=":
+					return lhsNum == rhsNum
+				case ">":
+					return lhsNum > rhsNum
+				case "<":
+					return lhsNum < rhsNum
+				}
 			}
 			val := resolveColumnValue(row, lhs)
 			if val == nil {
 				return false
 			}
 			var rhsVal any
-			if strings.HasPrefix(rhs, "json_extract_string(") || (strings.HasPrefix(rhs, "`") && strings.HasSuffix(rhs, "`")) {
+			if strings.HasPrefix(rhs, "json_extract_string(") || (strings.HasPrefix(rhs, "`") && strings.HasSuffix(rhs, "`")) || isArithmeticSQLExpr(rhs) || strings.HasPrefix(rhs, "CAST(") || strings.HasPrefix(rhs, "COALESCE(") {
 				rhsVal = resolveColumnValue(row, rhs)
 				if rhsVal == nil {
 					return false
@@ -2557,12 +2580,16 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 		return prod
 	}
 
-	if parts := splitTopLevelBinaryMath(expr, '/'); len(parts) == 2 {
-		denom := evalNumericExpr(row, parts[1])
-		if denom == 0 {
-			return 0
+	if parts := splitTopLevelBinaryMath(expr, '/'); len(parts) >= 2 {
+		res := evalNumericExpr(row, parts[0])
+		for _, p := range parts[1:] {
+			denom := evalNumericExpr(row, p)
+			if denom == 0 {
+				return 0
+			}
+			res /= denom
 		}
-		return evalNumericExpr(row, parts[0]) / denom
+		return res
 	}
 
 	if strings.HasPrefix(expr, "CASE WHEN ") && strings.HasSuffix(expr, " END") {

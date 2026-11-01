@@ -1520,11 +1520,11 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 	if scrollID == "" {
 		scrollID = strings.TrimSpace(r.PathValue("scroll_id"))
 	}
-	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+	if trimmedBody := bytes.TrimSpace(bodyBytes); len(trimmedBody) > 0 {
 		var body struct {
 			ScrollID any `json:"scroll_id"`
 		}
-		if err := json.Unmarshal(bodyBytes, &body); err == nil {
+		if err := json.Unmarshal(trimmedBody, &body); err == nil {
 			switch v := body.ScrollID.(type) {
 			case string:
 				if v != "" {
@@ -1534,6 +1534,13 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 				if len(v) > 0 {
 					scrollID = fmt.Sprintf("%v", v[0])
 				}
+			}
+		} else {
+			var rawStr string
+			if errStr := json.Unmarshal(trimmedBody, &rawStr); errStr == nil && rawStr != "" {
+				scrollID = rawStr
+			} else if trimmedBody[0] != '{' && trimmedBody[0] != '[' {
+				scrollID = strings.Trim(string(trimmedBody), "\"'")
 			}
 		}
 	}
@@ -1560,6 +1567,9 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 	zero := 0
 	req.From = &zero
 	req.SearchAfter = cursor.LastSort
+	req.Aggs = nil
+	req.Aggregations = nil
+	req.Suggest = nil
 	resp, status, errType, errReason := s.executeSearchRequest(r.Context(), cursor.Index, &req)
 	if errType != "" {
 		writeESError(w, status, errType, errReason)
@@ -3184,10 +3194,10 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	docID := r.PathValue("id")
-	idxSchema := s.ensureIndexSchema(r.Context(), indexName)
+	roSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
 
-	_ = s.coalescer.FlushTable(r.Context(), idxSchema.DorisTable)
-	existingHit, found, err := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, docID)
+	_ = s.coalescer.FlushTable(r.Context(), roSchema.DorisTable)
+	existingHit, found, err := s.backend.GetDocByID(r.Context(), roSchema.DorisDB, roSchema.DorisTable, docID)
 	if err != nil {
 		writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
 		return
@@ -3216,11 +3226,12 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	idxSchema := s.ensureIndexSchema(r.Context(), indexName)
 	nextVer := s.allocVersion(existingHit.Version + 1)
 	if existingHit.Version > 0 && existingHit.Version < 1_000_000_000_000 {
 		nextVer = existingHit.Version + 1
 	}
-	if assignedVer > 0 && assignedVer > existingHit.Version {
+	if assignedVer > 0 && assignedVer >= existingHit.Version {
 		nextVer = assignedVer
 		_ = s.allocVersion(assignedVer)
 	}
@@ -3558,7 +3569,7 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 	aliasFilters = s.resolveTermsLookupsInAliasFilters(r.Context(), aliasFilters)
 
 	for _, indexName := range targets {
-		idxSchema := s.ensureIndexSchema(r.Context(), indexName)
+		idxSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
 		_ = s.coalescer.FlushTable(r.Context(), idxSchema.DorisTable)
 		tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
 		var searchAfter []any
@@ -3594,6 +3605,12 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 
 			hits, err := s.backend.QueryHits(r.Context(), plan.HitsSQL)
 			if err != nil {
+				s.mu.RLock()
+				_, indexKnown := s.indices[indexName]
+				s.mu.RUnlock()
+				if !indexKnown {
+					break
+				}
 				writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
 				return
 			}
@@ -3627,6 +3644,7 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 					if rawMap == nil {
 						rawMap = make(map[string]any)
 					}
+					rawMap["__meta_id"] = h.ID
 					if !evalQueryScriptFilterOnDocWithSchema(idxSchema, rawMap, effQuery) {
 						continue
 					}
@@ -3708,123 +3726,122 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 				})
 			}
 
-			schemasByIdx := map[string]*schema.IndexSchema{indexName: idxSchema}
-			for tIdx, sDocs := range sampleDocsByIdx {
-				sch := s.ensureWritableIndexSchemaWithDocs(r.Context(), tIdx, sDocs)
-				schemasByIdx[tIdx] = sch
-				if tIdx == indexName {
-					idxSchema = sch
-				}
-			}
-			existingByIdx := make(map[string]map[string]HitRow, len(candIDsByIdx))
-			for tIdx, ids := range candIDsByIdx {
-				if len(ids) == 0 {
-					continue
-				}
-				sch := schemasByIdx[tIdx]
-				if sch == nil {
-					sch = s.ensureIndexSchema(r.Context(), tIdx)
+			if len(pending) > 0 {
+				idxSchema = s.ensureIndexSchema(r.Context(), indexName)
+				schemasByIdx := map[string]*schema.IndexSchema{indexName: idxSchema}
+				for tIdx, sDocs := range sampleDocsByIdx {
+					sch := s.ensureWritableIndexSchemaWithDocs(r.Context(), tIdx, sDocs)
 					schemasByIdx[tIdx] = sch
+					if tIdx == indexName {
+						idxSchema = sch
+					}
 				}
-				_ = s.coalescer.FlushTable(r.Context(), sch.DorisTable)
-				ex, _ := s.backend.GetDocsByIDs(r.Context(), sch.DorisDB, sch.DorisTable, ids)
-				existingByIdx[tIdx] = ex
-			}
+				existingByIdx := make(map[string]map[string]HitRow, len(candIDsByIdx))
+				for tIdx, ids := range candIDsByIdx {
+					if len(ids) == 0 {
+						continue
+					}
+					sch := s.getOrCompileReadOnlySchema(r.Context(), tIdx)
+					_ = s.coalescer.FlushTable(r.Context(), sch.DorisTable)
+					ex, _ := s.backend.GetDocsByIDs(r.Context(), sch.DorisDB, sch.DorisTable, ids)
+					existingByIdx[tIdx] = ex
+				}
 
-			batchBufByTable := make(map[string]*bytes.Buffer)
-			var tableOrder []string
-			getTableBuf := func(table string) *bytes.Buffer {
-				buf, ok := batchBufByTable[table]
-				if !ok {
-					buf = &bytes.Buffer{}
-					batchBufByTable[table] = buf
-					tableOrder = append(tableOrder, table)
-				}
-				return buf
-			}
-			writtenInBatch := make(map[string]bool, len(pending))
-			lastVerInBatch := make(map[string]int64, len(pending))
-			for _, pu := range pending {
-				minVer := pu.version + 1
-				targetKey := pu.targetIndex + "\x00" + pu.id
-				if prevBatchVer, okBV := lastVerInBatch[targetKey]; okBV && prevBatchVer+1 > minVer {
-					minVer = prevBatchVer + 1
-				}
-				if exMap := existingByIdx[pu.targetIndex]; exMap != nil {
-					if exDoc, exists := exMap[pu.id]; exists {
-						if pu.oldID != "" && pu.targetAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), pu.targetIndex, pu.id, exDoc.Source, pu.targetAliasFilter) {
-							if conflictsProceed {
-								versionConflicts++
-								continue
-							}
-							writeESError(w, http.StatusConflict, "version_conflict_engine_exception",
-								fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", pu.id))
-							return
-						}
-						if exDoc.Version+1 > minVer {
-							minVer = exDoc.Version + 1
-						}
+				batchBufByTable := make(map[string]*bytes.Buffer)
+				var tableOrder []string
+				getTableBuf := func(table string) *bytes.Buffer {
+					buf, ok := batchBufByTable[table]
+					if !ok {
+						buf = &bytes.Buffer{}
+						batchBufByTable[table] = buf
+						tableOrder = append(tableOrder, table)
 					}
+					return buf
 				}
-				if pu.oldID != "" {
-					oldKey := pu.oldIndex + "\x00" + pu.oldID
-					if !writtenInBatch[oldKey] {
-						oldSch := schemasByIdx[pu.oldIndex]
-						if oldSch == nil {
-							oldSch = idxSchema
-						}
-						tombVer := s.allocVersion(pu.version + 1)
-						tombShredded, err := schema.ShredDocument(oldSch, pu.oldID, tombVer, true, nil)
-						if err != nil {
-							writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
-							return
-						}
-						tBuf := getTableBuf(oldSch.DorisTable)
-						tBuf.Write(tombShredded)
-						tBuf.WriteByte('\n')
-						lastVerInBatch[oldKey] = tombVer
-						if exMap := existingByIdx[pu.oldIndex]; exMap != nil {
-							delete(exMap, pu.oldID)
-						}
+				writtenInBatch := make(map[string]bool, len(pending))
+				lastVerInBatch := make(map[string]int64, len(pending))
+				for _, pu := range pending {
+					minVer := pu.version + 1
+					targetKey := pu.targetIndex + "\x00" + pu.id
+					if prevBatchVer, okBV := lastVerInBatch[targetKey]; okBV && prevBatchVer+1 > minVer {
+						minVer = prevBatchVer + 1
 					}
-				}
-				tSch := schemasByIdx[pu.targetIndex]
-				if tSch == nil {
-					tSch = s.ensureIndexSchema(r.Context(), pu.targetIndex)
-					schemasByIdx[pu.targetIndex] = tSch
-				}
-				nextVer := s.allocVersion(minVer)
-				shredded, err := schema.ShredDocument(tSch, pu.id, nextVer, pu.isDel, pu.source)
-				if err != nil {
-					writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
-					return
-				}
-				buf := getTableBuf(tSch.DorisTable)
-				buf.Write(shredded)
-				buf.WriteByte('\n')
-				lastVerInBatch[targetKey] = nextVer
-				if pu.isDel {
-					writtenInBatch[targetKey] = false
 					if exMap := existingByIdx[pu.targetIndex]; exMap != nil {
-						delete(exMap, pu.id)
+						if exDoc, exists := exMap[pu.id]; exists {
+							if pu.oldID != "" && pu.targetAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), pu.targetIndex, pu.id, exDoc.Source, pu.targetAliasFilter) {
+								if conflictsProceed {
+									versionConflicts++
+									continue
+								}
+								writeESError(w, http.StatusConflict, "version_conflict_engine_exception",
+									fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", pu.id))
+								return
+							}
+							if exDoc.Version+1 > minVer {
+								minVer = exDoc.Version + 1
+							}
+						}
 					}
-					totalDeleted++
-				} else {
-					writtenInBatch[targetKey] = true
-					if existingByIdx[pu.targetIndex] == nil {
-						existingByIdx[pu.targetIndex] = make(map[string]HitRow)
+					if pu.oldID != "" {
+						oldKey := pu.oldIndex + "\x00" + pu.oldID
+						if !writtenInBatch[oldKey] {
+							oldSch := schemasByIdx[pu.oldIndex]
+							if oldSch == nil {
+								oldSch = idxSchema
+							}
+							tombVer := s.allocVersion(pu.version + 1)
+							tombShredded, err := schema.ShredDocument(oldSch, pu.oldID, tombVer, true, nil)
+							if err != nil {
+								writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+								return
+							}
+							tBuf := getTableBuf(oldSch.DorisTable)
+							tBuf.Write(tombShredded)
+							tBuf.WriteByte('\n')
+							lastVerInBatch[oldKey] = tombVer
+							if exMap := existingByIdx[pu.oldIndex]; exMap != nil {
+								delete(exMap, pu.oldID)
+							}
+						}
 					}
-					existingByIdx[pu.targetIndex][pu.id] = HitRow{ID: pu.id, Version: nextVer, Source: pu.source}
-					totalUpdated++
-				}
-			}
-
-			for _, tbl := range tableOrder {
-				buf := batchBufByTable[tbl]
-				if buf != nil && buf.Len() > 0 {
-					if err := s.streamLoad(r.Context(), tbl, buf.Bytes(), true); err != nil {
-						writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
+					tSch := schemasByIdx[pu.targetIndex]
+					if tSch == nil {
+						tSch = s.ensureIndexSchema(r.Context(), pu.targetIndex)
+						schemasByIdx[pu.targetIndex] = tSch
+					}
+					nextVer := s.allocVersion(minVer)
+					shredded, err := schema.ShredDocument(tSch, pu.id, nextVer, pu.isDel, pu.source)
+					if err != nil {
+						writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 						return
+					}
+					buf := getTableBuf(tSch.DorisTable)
+					buf.Write(shredded)
+					buf.WriteByte('\n')
+					lastVerInBatch[targetKey] = nextVer
+					if pu.isDel {
+						writtenInBatch[targetKey] = false
+						if exMap := existingByIdx[pu.targetIndex]; exMap != nil {
+							delete(exMap, pu.id)
+						}
+						totalDeleted++
+					} else {
+						writtenInBatch[targetKey] = true
+						if existingByIdx[pu.targetIndex] == nil {
+							existingByIdx[pu.targetIndex] = make(map[string]HitRow)
+						}
+						existingByIdx[pu.targetIndex][pu.id] = HitRow{ID: pu.id, Version: nextVer, Source: pu.source}
+						totalUpdated++
+					}
+				}
+
+				for _, tbl := range tableOrder {
+					buf := batchBufByTable[tbl]
+					if buf != nil && buf.Len() > 0 {
+						if err := s.streamLoad(r.Context(), tbl, buf.Bytes(), true); err != nil {
+							writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
+							return
+						}
 					}
 				}
 			}
@@ -3904,7 +3921,7 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	aliasFilters = s.resolveTermsLookupsInAliasFilters(r.Context(), aliasFilters)
 	for _, indexName := range targets {
-		idxSchema := s.ensureIndexSchema(r.Context(), indexName)
+		idxSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
 		_ = s.coalescer.FlushTable(r.Context(), idxSchema.DorisTable)
 		tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
 		var searchAfter []any
@@ -3940,6 +3957,12 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 
 			hits, err := s.backend.QueryHits(r.Context(), plan.HitsSQL)
 			if err != nil {
+				s.mu.RLock()
+				_, indexKnown := s.indices[indexName]
+				s.mu.RUnlock()
+				if !indexKnown {
+					break
+				}
 				writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
 				return
 			}
@@ -3949,6 +3972,7 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 			batches++
 
 			var batchBuf bytes.Buffer
+			schemaEnsured := false
 			for _, h := range hits {
 				if maxDocs > 0 && totalDeleted >= maxDocs {
 					break
@@ -3961,9 +3985,14 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 					if rawMap == nil {
 						rawMap = make(map[string]any)
 					}
+					rawMap["__meta_id"] = h.ID
 					if !evalQueryScriptFilterOnDocWithSchema(idxSchema, rawMap, effQuery) {
 						continue
 					}
+				}
+				if !schemaEnsured {
+					idxSchema = s.ensureIndexSchema(r.Context(), indexName)
+					schemaEnsured = true
 				}
 				nextVer := s.allocVersion(h.Version + 1)
 				tombstone, err := schema.ShredDocument(idxSchema, h.ID, nextVer, true, nil)
@@ -4107,14 +4136,11 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			idsToFetchByIndex[idxName] = append(idsToFetchByIndex[idxName], op.ID)
 		}
 	}
-	for idxName, samples := range sampleDocsByIndex {
-		_ = s.ensureWritableIndexSchemaWithDocs(r.Context(), idxName, samples)
-	}
 	existingByIndex := make(map[string]map[string]HitRow, len(idsToFetchByIndex))
 	initialExistingByIndex := make(map[string]map[string]HitRow, len(idsToFetchByIndex))
 	lastVerByIndex := make(map[string]map[string]int64, len(idsToFetchByIndex))
 	for idxName, ids := range idsToFetchByIndex {
-		idxSchema := s.ensureIndexSchema(r.Context(), idxName)
+		idxSchema := s.getOrCompileReadOnlySchema(r.Context(), idxName)
 		_ = s.coalescer.FlushTable(r.Context(), idxSchema.DorisTable)
 		if m, err := s.backend.GetDocsByIDs(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, ids); err == nil {
 			existingByIndex[idxName] = m
@@ -4241,13 +4267,6 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 				},
 			})
 			continue
-		}
-
-		idxSchema := s.ensureIndexSchema(r.Context(), targetIndex)
-		buf, ok := byIndex[idxSchema.DorisTable]
-		if !ok {
-			buf = &bytes.Buffer{}
-			byIndex[idxSchema.DorisTable] = buf
 		}
 
 		if (op.Action == "index" || op.Action == "create") && opAliasFilter != nil {
@@ -4494,24 +4513,18 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 						}
 						targetIndex = resolvedIdx
 						opAliasFilter = resolvedFilter
-						idxSchema = s.ensureIndexSchema(r.Context(), targetIndex)
-						var okBuf bool
-						buf, okBuf = byIndex[idxSchema.DorisTable]
-						if !okBuf {
-							buf = &bytes.Buffer{}
-							byIndex[idxSchema.DorisTable] = buf
-						}
 					}
 					if op.ID != origOpID || targetIndex != origTargetIndex {
 						var destSrc json.RawMessage
 						hasDest := false
+						roDestSchema := s.getOrCompileReadOnlySchema(r.Context(), targetIndex)
 						if destExisting, destOK := existingByIndex[targetIndex][op.ID]; destOK {
 							hasDest = true
 							destSrc = destExisting.Source
 							if destExisting.Version+1 > minFloor {
 								minFloor = destExisting.Version + 1
 							}
-						} else if destHit, destFound, dErr := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, op.ID); dErr == nil && destFound && destHit != nil {
+						} else if destHit, destFound, dErr := s.backend.GetDocByID(r.Context(), roDestSchema.DorisDB, roDestSchema.DorisTable, op.ID); dErr == nil && destFound && destHit != nil {
 							hasDest = true
 							destSrc = destHit.Source
 							if destHit.Version+1 > minFloor {
@@ -4604,18 +4617,30 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 						lastVerByIndex[origTargetIndex][origOpID] = tombVer
 					}
 				}
-				if len(sourceToShred) > 0 {
-					prevSchema := idxSchema
-					idxSchema = s.ensureWritableIndexSchemaWithDocs(r.Context(), targetIndex, []json.RawMessage{sourceToShred})
-					if idxSchema != prevSchema && len(pendingRowsByTable[idxSchema.DorisTable]) > 0 {
-						buf.Reset()
-						for _, prevRow := range pendingRowsByTable[idxSchema.DorisTable] {
-							if reShredded, reErr := schema.ShredDocument(idxSchema, prevRow.id, prevRow.ver, prevRow.deleted, prevRow.source); reErr == nil {
-								buf.Write(reShredded)
-								buf.WriteByte('\n')
-							}
-						}
-					}
+			}
+		}
+
+		s.mu.RLock()
+		prevSchema := s.indices[targetIndex]
+		s.mu.RUnlock()
+		var idxSchema *schema.IndexSchema
+		if !deleted && len(sourceToShred) > 0 {
+			samples := append(append([]json.RawMessage(nil), sampleDocsByIndex[targetIndex]...), sourceToShred)
+			idxSchema = s.ensureWritableIndexSchemaWithDocs(r.Context(), targetIndex, samples)
+		} else {
+			idxSchema = s.ensureIndexSchema(r.Context(), targetIndex)
+		}
+		buf, ok := byIndex[idxSchema.DorisTable]
+		if !ok {
+			buf = &bytes.Buffer{}
+			byIndex[idxSchema.DorisTable] = buf
+		}
+		if prevSchema != nil && idxSchema != prevSchema && len(pendingRowsByTable[idxSchema.DorisTable]) > 0 {
+			buf.Reset()
+			for _, prevRow := range pendingRowsByTable[idxSchema.DorisTable] {
+				if reShredded, reErr := schema.ShredDocument(idxSchema, prevRow.id, prevRow.ver, prevRow.deleted, prevRow.source); reErr == nil {
+					buf.Write(reShredded)
+					buf.WriteByte('\n')
 				}
 			}
 		}
@@ -4649,7 +4674,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		buf.WriteByte('\n')
 		pendingRowsByTable[idxSchema.DorisTable] = append(pendingRowsByTable[idxSchema.DorisTable], pendingBulkRow{
 			id:      op.ID,
-			ver:     nextVer,
+			ver:     shredVer,
 			deleted: deleted,
 			source:  sourceToShred,
 		})
@@ -5099,7 +5124,10 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 			FilterPath         string `json:"filter_path"`
 			TerminateAfter     *int   `json:"terminate_after"`
 		}
-		_ = json.Unmarshal(headerLine, &hdr)
+		if err := json.Unmarshal(headerLine, &hdr); err != nil {
+			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+			return
+		}
 		targetIdx := defaultIndex
 		idxField := hdr.Index
 		if idxField == nil {
@@ -5130,6 +5158,7 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
+		applyURISearchParams(r, &req)
 		if strings.EqualFold(hdr.SearchType, "count") || (hdr.SearchType == "" && strings.EqualFold(r.URL.Query().Get("search_type"), "count")) {
 			zero := 0
 			req.Size = &zero
@@ -5137,15 +5166,8 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 				req.TrackTotalHits = true
 			}
 		}
-		if req.TerminateAfter == nil && hdr.TerminateAfter != nil {
+		if hdr.TerminateAfter != nil {
 			req.TerminateAfter = hdr.TerminateAfter
-		}
-		if req.TerminateAfter == nil {
-			if taStr := r.URL.Query().Get("terminate_after"); taStr != "" {
-				if ta, err := strconv.Atoi(taStr); err == nil && ta > 0 {
-					req.TerminateAfter = &ta
-				}
-			}
 		}
 
 		targetIdx = extractPITIndex(targetIdx, req.PIT)
@@ -5434,7 +5456,7 @@ func (s *Server) executeSearchRequest(
 		if needsRuntimeScriptEval {
 			var matchedQueryHits []HitRow
 			var globalHits []HitRow
-			if req.Query != nil && globalAggsHaveRuntimeScript(req.EffectiveAggs()) {
+			if (req.Query != nil && globalAggsHaveRuntimeScript(req.EffectiveAggs())) || (queryHasRuntimeScript(aliasFilters[indexName]) && aggsHaveGlobalAgg(req.EffectiveAggs())) {
 				zero := 0
 				fetchAll := 10000
 				gReq := esast.SearchRequest{
@@ -5458,6 +5480,7 @@ func (s *Server) executeSearchRequest(
 								if gDoc == nil {
 									gDoc = make(map[string]any)
 								}
+								gDoc["__meta_id"] = gh.ID
 								if evalQueryScriptFilterOnDocWithSchema(idxSchema, gDoc, aliasFilters[indexName]) {
 									globalHits = append(globalHits, gh)
 								}
@@ -5483,6 +5506,16 @@ func (s *Server) executeSearchRequest(
 				aggSubReq := *subReqPtr
 				aggSubReq.MinScore = nil
 				aggSubReq.Query = combineQueryWithAliasFilter(&esast.Query{Ids: &esast.IdsQuery{Values: matchedIDs}}, aliasFilters[indexName])
+				if queryHasRuntimeScript(aliasFilters[indexName]) && aggsHaveGlobalAgg(req.EffectiveAggs()) {
+					globalIDs := make([]string, 0, len(globalHits))
+					for _, gh := range globalHits {
+						globalIDs = append(globalIDs, gh.ID)
+					}
+					if len(globalIDs) == 0 {
+						globalIDs = []string{"__NO_MATCHING_DOCS_AFTER_RUNTIME_SCRIPT__"}
+					}
+					aggSubReq.AliasFilter = &esast.Query{Ids: &esast.IdsQuery{Values: globalIDs}}
+				}
 				if aggPlan, aErr := tr.BuildSearchPlan(&aggSubReq); aErr == nil && aggPlan.AggsSQL != "" {
 					if reAggRows, rErr := s.backend.QueryAggs(ctx, aggPlan.AggsSQL); rErr == nil {
 						aggRows = applyRuntimeScriptAggsOnlyWithGlobal(matchedQueryHits, globalHits, reAggRows, idxTotal, evalReq, idxSchema)
@@ -5940,7 +5973,7 @@ func (s *Server) executeSearchRequest(
 		s.populateCollapseInnerHits(ctx, targets, aliasFilters, schemasByIndex, primarySchema, req, allHits, resp)
 	}
 	if req != nil && len(req.Suggest) > 0 {
-		resp["suggest"] = s.evaluateSearchSuggest(ctx, targets, aliasFilters, schemasByIndex, primarySchema, req.Suggest, allFetchedHits)
+		resp["suggest"] = s.evaluateSearchSuggest(ctx, targets, aliasFilters, schemasByIndex, primarySchema, req, req.Suggest, allFetchedHits)
 	}
 	if !aliasHasNow {
 		s.queryCache.PutWithMeta(cacheTargets, req, resp, allUnindexedFields)
@@ -6024,6 +6057,18 @@ func hasTermsLookupInInnerHits(ih *esast.InnerHitsSpec) bool {
 func hasTermsLookupInAggSpec(spec esast.AggSpec) bool {
 	if spec.Filter != nil && hasTermsLookupInQuery(spec.Filter) {
 		return true
+	}
+	if tSpec := spec.EffectiveTerms(); tSpec != nil && tSpec.BackgroundFilter != nil && hasTermsLookupInQuery(tSpec.BackgroundFilter) {
+		return true
+	}
+	if spec.Composite != nil {
+		for _, srcMap := range spec.Composite.Sources {
+			for _, srcSpec := range srcMap {
+				if hasTermsLookupInAggSpec(srcSpec) {
+					return true
+				}
+			}
+		}
 	}
 	if spec.Filters != nil {
 		for i := range spec.Filters.Filters {
@@ -6267,6 +6312,17 @@ func (s *Server) resolveTermsLookupsInAggSpec(ctx context.Context, spec *esast.A
 	}
 	if spec.Filter != nil {
 		s.resolveTermsLookupsInQuery(ctx, spec.Filter)
+	}
+	if tSpec := spec.EffectiveTerms(); tSpec != nil && tSpec.BackgroundFilter != nil {
+		s.resolveTermsLookupsInQuery(ctx, tSpec.BackgroundFilter)
+	}
+	if spec.Composite != nil {
+		for i, srcMap := range spec.Composite.Sources {
+			for k, srcSpec := range srcMap {
+				s.resolveTermsLookupsInAggSpec(ctx, &srcSpec)
+				spec.Composite.Sources[i][k] = srcSpec
+			}
+		}
 	}
 	if spec.Filters != nil {
 		for k, q := range spec.Filters.Filters {
@@ -7094,6 +7150,8 @@ func applyURISearchParams(r *http.Request, req *esast.SearchRequest) {
 
 func aggTypePrefix(spec esast.AggSpec) string {
 	switch {
+	case spec.SignificantText != nil:
+		return "significant_text"
 	case spec.IsSignificantTerms():
 		return "sterms"
 	case spec.EffectiveTerms() != nil:
@@ -7188,6 +7246,10 @@ func aggTypePrefix(spec esast.AggSpec) string {
 		return "normalize"
 	case spec.BucketScript != nil:
 		return "bucket_script"
+	case spec.BucketSort != nil:
+		return "bucket_sort"
+	case spec.BucketSelector != nil:
+		return "bucket_selector"
 	default:
 		return "agg"
 	}
@@ -7263,11 +7325,13 @@ func (s *Server) evaluateSearchSuggest(
 	aliasFilters map[string]*esast.Query,
 	schemasByIndex map[string]*schema.IndexSchema,
 	primarySchema *schema.IndexSchema,
+	req *esast.SearchRequest,
 	specs map[string]esast.SuggestSpec,
 	fetchedHits []HitRow,
 ) map[string]any {
 	candHits := fetchedHits
-	if len(candHits) == 0 {
+	if len(candHits) == 0 || (req != nil && (req.Query != nil || req.Size != nil)) {
+		candHits = nil
 		zero := 0
 		fetchLimit := 1000
 		for _, idxName := range targets {
@@ -9582,17 +9646,21 @@ func buildCompositeAggObjectWithSchema(
 			entry := srcMap[k]
 			if entry.Terms != nil && strings.TrimSpace(entry.Terms.ValueType) == "" && idxSchema != nil {
 				fName := strings.TrimSpace(entry.Terms.Field)
-				b, ok := idxSchema.Fields[fName]
-				if !ok && strings.HasSuffix(fName, ".keyword") {
-					b, ok = idxSchema.Fields[strings.TrimSuffix(fName, ".keyword")]
-				}
-				if ok {
+				b := idxSchema.ResolveField(fName)
+				if b.Kind != schema.StorageDynamicVariant || b.ESType != "" {
 					tCopy := *entry.Terms
 					switch b.ESType {
 					case "long", "integer", "short", "byte", "unsigned_long", "date", "date_nanos":
 						tCopy.ValueType = "long"
 					case "double", "float", "half_float", "scaled_float":
 						tCopy.ValueType = "double"
+					default:
+						switch b.DorisType {
+						case schema.DorisBigInt, schema.DorisInt:
+							tCopy.ValueType = "long"
+						case schema.DorisDouble:
+							tCopy.ValueType = "double"
+						}
 					}
 					if tCopy.ValueType != "" {
 						entry.Terms = &tCopy
@@ -14161,10 +14229,22 @@ func deepCloneDocMap(m map[string]any) map[string]any {
 }
 
 func prepareDocForRuntimeScript(idxSchema *schema.IndexSchema, doc map[string]any) map[string]any {
+	var cp map[string]any
+	if doc != nil {
+		if metaID, ok := doc["__meta_id"].(string); ok && metaID != "" && doc["_id"] == nil {
+			cp = deepCloneDocMap(doc)
+			if cp == nil {
+				cp = make(map[string]any)
+			}
+			cp["_id"] = metaID
+		}
+	}
 	if idxSchema == nil || len(idxSchema.Fields) == 0 {
+		if cp != nil {
+			return cp
+		}
 		return doc
 	}
-	var cp map[string]any
 	for fieldName, fb := range idxSchema.Fields {
 		cleanField := strings.TrimSuffix(strings.TrimSuffix(fieldName, ".keyword"), ".ngram")
 		if cleanField == "" {
@@ -16116,6 +16196,7 @@ func (s *Server) docMatchesAliasFilter(ctx context.Context, indexName, docID str
 		if docMap == nil {
 			docMap = make(map[string]any)
 		}
+		docMap["__meta_id"] = docID
 		if !evalQueryScriptFilterOnDocWithSchema(idxSchema, docMap, effFilter) {
 			return false
 		}
@@ -17007,6 +17088,15 @@ func globalAggsHaveRuntimeScript(aggs map[string]esast.AggSpec) bool {
 			return true
 		}
 		if globalAggsHaveRuntimeScript(spec.SubAggs()) {
+			return true
+		}
+	}
+	return false
+}
+
+func aggsHaveGlobalAgg(aggs map[string]esast.AggSpec) bool {
+	for _, spec := range aggs {
+		if spec.Global != nil || aggsHaveGlobalAgg(spec.SubAggs()) {
 			return true
 		}
 	}
@@ -19948,6 +20038,7 @@ func hitsToRuntimeMatchedDocs(hits []HitRow, idxSchema *schema.IndexSchema) []ru
 }
 
 func applyRuntimeScriptAggsOnlyWithGlobal(matchedQueryHits []HitRow, globalHits []HitRow, aggRows []AggRow, idxTotal int64, req *esast.SearchRequest, idxSchema *schema.IndexSchema) []AggRow {
+	foundTotalMeta := false
 	foundQueryMeta := false
 	prePostQueryTotal := int64(len(matchedQueryHits))
 	if prePostQueryTotal < idxTotal {
@@ -19958,6 +20049,7 @@ func applyRuntimeScriptAggsOnlyWithGlobal(matchedQueryHits []HitRow, globalHits 
 		case "__meta_total":
 			aggRows[i].DocCount = idxTotal
 			aggRows[i].Value = float64(idxTotal)
+			foundTotalMeta = true
 		case "__meta_query_total":
 			if req != nil && req.PostFilter != nil {
 				aggRows[i].DocCount = prePostQueryTotal
@@ -19965,6 +20057,14 @@ func applyRuntimeScriptAggsOnlyWithGlobal(matchedQueryHits []HitRow, globalHits 
 				foundQueryMeta = true
 			}
 		}
+	}
+	if !foundTotalMeta {
+		aggRows = append(aggRows, AggRow{
+			AggName:   "__meta_total",
+			BucketKey: "_count",
+			DocCount:  idxTotal,
+			Value:     float64(idxTotal),
+		})
 	}
 	if req != nil && req.PostFilter != nil && !foundQueryMeta {
 		aggRows = append(aggRows, AggRow{
@@ -19975,6 +20075,21 @@ func applyRuntimeScriptAggsOnlyWithGlobal(matchedQueryHits []HitRow, globalHits 
 		})
 	}
 	effAggs := req.EffectiveAggs()
+	if req != nil && req.AliasFilter != nil {
+		afQ := esast.Query(*req.AliasFilter)
+		if queryHasRuntimeScript(&afQ) {
+			for aggName, spec := range effAggs {
+				if spec.Global != nil {
+					for i := range aggRows {
+						if aggRows[i].AggName == aggName && aggRows[i].BucketKey == "_global" {
+							aggRows[i].DocCount = int64(len(globalHits))
+							aggRows[i].Value = float64(len(globalHits))
+						}
+					}
+				}
+			}
+		}
+	}
 	if !aggsHaveRuntimeScript(effAggs) {
 		return aggRows
 	}
@@ -20073,6 +20188,7 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 				if gdoc == nil {
 					gdoc = make(map[string]any)
 				}
+				gdoc["__meta_id"] = gh.ID
 				if !evalQueryScriptFilterOnDocWithSchema(idxSchema, gdoc, aliasFilterQ) {
 					continue
 				}
@@ -20091,17 +20207,27 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 	aggRows = applyRuntimeScriptAggsOnlyWithGlobal(filteredQueryHits, filteredGlobalHits, aggRows, idxTotal, req, idxSchema)
 	if req.PostFilter != nil {
 		idxTotal = int64(len(postFilteredHits))
+		foundTotalMeta := false
 		foundQueryMeta := false
 		for i := range aggRows {
 			switch aggRows[i].AggName {
 			case "__meta_total":
 				aggRows[i].DocCount = idxTotal
 				aggRows[i].Value = float64(idxTotal)
+				foundTotalMeta = true
 			case "__meta_query_total":
 				aggRows[i].DocCount = prePostQueryTotal
 				aggRows[i].Value = float64(prePostQueryTotal)
 				foundQueryMeta = true
 			}
+		}
+		if !foundTotalMeta {
+			aggRows = append(aggRows, AggRow{
+				AggName:   "__meta_total",
+				BucketKey: "_count",
+				DocCount:  idxTotal,
+				Value:     float64(idxTotal),
+			})
 		}
 		if !foundQueryMeta {
 			aggRows = append(aggRows, AggRow{
