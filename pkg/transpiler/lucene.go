@@ -37,8 +37,12 @@ func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring boo
 
 func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, scoring bool, nctx *nestedCtx, isSimple bool) CompiledQuery {
 	raw := strings.TrimSpace(qsq.Query)
-	if raw == "" || raw == "*" || raw == "*:*" {
-		return CompiledQuery{WhereSQL: "TRUE", ScoreSQL: "1.0"}
+	if raw == "" || raw == "*:*" || (raw == "*" && (qsq.DefaultField == "" || qsq.DefaultField == "*" || qsq.DefaultField == "_all_text") && len(qsq.Fields) == 0) {
+		score := "1.0"
+		if scoring && qsq.Boost != nil {
+			score = fmt.Sprintf("%.4f", *qsq.Boost)
+		}
+		return CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: score}
 	}
 
 	var expandedFields []string
@@ -106,6 +110,9 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 		}
 	}
 	defaultOp := strings.ToUpper(qsq.DefaultOperator)
+	if defaultOp == "" {
+		defaultOp = strings.ToUpper(qsq.Operator)
+	}
 	if defaultOp != "AND" {
 		defaultOp = "OR"
 	}
@@ -119,11 +126,15 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 	flags.fuzziness = qsq.Fuzziness
 	flags.lenient = qsq.Lenient
 	parsedAST := parseSimpleLuceneToASTWithFlags(raw, defaultField, expandedFields, defaultOp, 0, isSimple, flags)
-	if qsq.MinimumShouldMatch != nil && parsedAST.Bool != nil && len(parsedAST.Bool.Should) > 0 {
-		if len(parsedAST.Bool.Should) == 1 && parsedAST.Bool.Should[0].Bool != nil && len(parsedAST.Bool.Should[0].Bool.Should) > 0 && len(parsedAST.Bool.Must) == 0 && len(parsedAST.Bool.Filter) == 0 {
-			parsedAST.Bool.Should[0].Bool.MinimumShouldMatch = qsq.MinimumShouldMatch
-		} else {
-			parsedAST.Bool.MinimumShouldMatch = qsq.MinimumShouldMatch
+	if qsq.MinimumShouldMatch != nil && parsedAST.Bool != nil {
+		if len(parsedAST.Bool.Should) > 0 {
+			if len(parsedAST.Bool.Should) == 1 && parsedAST.Bool.Should[0].Bool != nil && len(parsedAST.Bool.Should[0].Bool.Should) > 0 && len(parsedAST.Bool.Must) == 0 && len(parsedAST.Bool.Filter) == 0 {
+				parsedAST.Bool.Should[0].Bool.MinimumShouldMatch = qsq.MinimumShouldMatch
+			} else {
+				parsedAST.Bool.MinimumShouldMatch = qsq.MinimumShouldMatch
+			}
+		} else if len(parsedAST.Bool.Must) == 1 && parsedAST.Bool.Must[0].Bool != nil && len(parsedAST.Bool.Must[0].Bool.Should) > 0 && len(parsedAST.Bool.Filter) == 0 {
+			parsedAST.Bool.Must[0].Bool.MinimumShouldMatch = qsq.MinimumShouldMatch
 		}
 	}
 	compiled := t.CompileQuery(&parsedAST, scoring, nctx)
@@ -672,18 +683,18 @@ func hasUnescapedLuceneWildcard(s string) bool {
 	return false
 }
 
-func parseLuceneQuotedOrFuzzyEx(raw string) (clean string, rawWildcard string, isQuoted bool, slop int, isFuzzy bool) {
+func parseLuceneQuotedOrFuzzyEx(raw string) (clean string, rawWildcard string, isQuoted bool, slop int, isFuzzy bool, explicitZeroFuzzy bool) {
 	s := strings.TrimSpace(raw)
 	if strings.HasPrefix(s, `"`) && len(s) >= 2 {
 		if strings.HasSuffix(s, `"`) {
 			inner := s[1 : len(s)-1]
-			return unescapeLuceneToken(inner), inner, true, 0, false
+			return unescapeLuceneToken(inner), inner, true, 0, false, false
 		}
 		if tildeIdx := strings.LastIndex(s, `"~`); tildeIdx > 0 {
 			slopStr := s[tildeIdx+2:]
 			if n, err := strconv.Atoi(slopStr); err == nil && n >= 0 {
 				inner := s[1:tildeIdx]
-				return unescapeLuceneToken(inner), inner, true, n, false
+				return unescapeLuceneToken(inner), inner, true, n, false, false
 			}
 		}
 	}
@@ -695,12 +706,14 @@ func parseLuceneQuotedOrFuzzyEx(raw string) (clean string, rawWildcard string, i
 		} else if n, err := strconv.Atoi(suffix); err == nil && n >= 0 {
 			s = s[:tildeIdx]
 			isFuzzy = n > 0
+			explicitZeroFuzzy = n == 0
 		} else if f, err := strconv.ParseFloat(suffix, 64); err == nil && f >= 0 && f <= 2.0 {
 			s = s[:tildeIdx]
 			isFuzzy = f > 0
+			explicitZeroFuzzy = f == 0
 		}
 	}
-	return unescapeLuceneToken(s), s, false, 0, isFuzzy
+	return unescapeLuceneToken(s), s, false, 0, isFuzzy, explicitZeroFuzzy
 }
 
 func findLuceneFieldColon(s string) int {
@@ -867,7 +880,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			}
 			return inner
 		}
-		val, rawWild, isQuoted, slop, isFuzzy := parseLuceneQuotedOrFuzzyEx(val)
+		val, rawWild, isQuoted, slop, isFuzzy, explicitZeroFuzzy := parseLuceneQuotedOrFuzzyEx(val)
 		if isQuoted && slop == 0 && flags.phraseSlop > 0 {
 			slop = flags.phraseSlop
 		}
@@ -877,7 +890,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 		var fuzzAny any
 		if isFuzzy && !isQuoted {
 			fuzzAny = "AUTO"
-		} else if !isQuoted && flags.fuzziness != nil {
+		} else if !isQuoted && !explicitZeroFuzzy && flags.fuzziness != nil {
 			fuzzAny = flags.fuzziness
 		}
 		if !isQuoted && (strings.EqualFold(val, "true") || strings.EqualFold(val, "false")) {
@@ -1005,7 +1018,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			}
 		}
 	}
-	cleanVal, rawWild, isQuoted, slop, isFuzzy := parseLuceneQuotedOrFuzzyEx(token)
+	cleanVal, rawWild, isQuoted, slop, isFuzzy, explicitZeroFuzzy := parseLuceneQuotedOrFuzzyEx(token)
 	if isQuoted && slop == 0 && flags.phraseSlop > 0 {
 		slop = flags.phraseSlop
 	}
@@ -1025,7 +1038,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 	var fuzzAny any
 	if isFuzzy && !isQuoted {
 		fuzzAny = "AUTO"
-	} else if !isQuoted && flags.fuzziness != nil {
+	} else if !isQuoted && !explicitZeroFuzzy && flags.fuzziness != nil {
 		fuzzAny = flags.fuzziness
 	}
 	targetDefaultField := defaultField
@@ -1054,6 +1067,15 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			var shoulds []esast.Query
 			for _, fpat := range fields {
 				fname, fBoost := splitLuceneBoost(fpat)
+				if rawWild == "*" && fname != "*" && fname != "_all_text" {
+					effB := boost * fBoost
+					if effB != 1.0 {
+						shoulds = append(shoulds, esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: esast.Query{Exists: &esast.ExistsQuery{Field: fname}}, Boost: &effB}})
+					} else {
+						shoulds = append(shoulds, esast.Query{Exists: &esast.ExistsQuery{Field: fname}})
+					}
+					continue
+				}
 				shoulds = append(shoulds, esast.Query{
 					Wildcard: map[string]esast.WildcardEntry{
 						fname: {Value: rawWild, CaseInsensitive: true, Boost: boost * fBoost},
@@ -1066,6 +1088,13 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			if len(shoulds) > 1 {
 				return esast.Query{Bool: &esast.BoolQuery{Should: shoulds}}
 			}
+		}
+		if rawWild == "*" && defaultField != "*" && defaultField != "_all_text" && defaultField != "" {
+			if boost != 1.0 {
+				b := boost
+				return esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: esast.Query{Exists: &esast.ExistsQuery{Field: defaultField}}, Boost: &b}}
+			}
+			return esast.Query{Exists: &esast.ExistsQuery{Field: defaultField}}
 		}
 		return esast.Query{
 			Wildcard: map[string]esast.WildcardEntry{

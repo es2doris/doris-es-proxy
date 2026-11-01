@@ -481,8 +481,43 @@ func computePopStdDev(nums []float64) float64 {
 }
 
 func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
+	hasHavingCountGtZero := false
+	havingExpr := ""
 	if hIdx := strings.LastIndex(branch, " HAVING COUNT("); hIdx > 0 && strings.HasSuffix(branch, ") > 0") {
+		hasHavingCountGtZero = true
 		branch = branch[:hIdx]
+	} else if hIdx := strings.LastIndex(branch, " HAVING "); hIdx > 0 {
+		tail := branch[hIdx+len(" HAVING "):]
+		orderIdx := strings.Index(tail, " ORDER BY ")
+		limitIdx := strings.Index(tail, " LIMIT ")
+		endIdx := len(tail)
+		if orderIdx >= 0 && orderIdx < endIdx {
+			endIdx = orderIdx
+		}
+		if limitIdx >= 0 && limitIdx < endIdx {
+			endIdx = limitIdx
+		}
+		havingExpr = strings.TrimSpace(tail[:endIdx])
+		branch = branch[:hIdx] + tail[endIdx:]
+	}
+	filterHaving := func(rows []AggRow) []AggRow {
+		if havingExpr == "" {
+			return rows
+		}
+		filtered := make([]AggRow, 0, len(rows))
+		for _, r := range rows {
+			synth := map[string]any{
+				"_agg_name":   r.AggName,
+				"_bucket_key": r.BucketKey,
+				"_doc_count":  r.DocCount,
+				"doc_count":   r.DocCount,
+				"bucket_key":  r.BucketKey,
+			}
+			if evalWhereExpr(synth, havingExpr) {
+				filtered = append(filtered, r)
+			}
+		}
+		return filtered
 	}
 	if strings.Contains(branch, "'__meta_total'") || strings.Contains(branch, "'__meta_query_total'") {
 		metaName := "__meta_total"
@@ -794,7 +829,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				}
 			}
 		}
-		return topBuckets(aggName, counts, limit)
+		return filterHaving(topBuckets(aggName, counts, limit))
 	}
 
 	if m := reAggFilter.FindStringSubmatch(branch); m != nil {
@@ -964,6 +999,9 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		var out []AggRow
 		for _, bKey := range bucketOrder {
 			nums := byBucket[bKey]
+			if len(nums) == 0 && hasHavingCountGtZero {
+				continue
+			}
 			sort.Float64s(nums)
 			var res float64
 			var w int64 = -1
@@ -1027,6 +1065,9 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		var out []AggRow
 		for _, bKey := range bucketOrder {
 			acc := byBucket[bKey]
+			if acc.total == 0 && hasHavingCountGtZero {
+				continue
+			}
 			var res float64
 			var w int64 = -1
 			if acc.total > 0 {
@@ -1397,7 +1438,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		var out []AggRow
 		for _, bKey := range bucketOrder {
 			acc := byBucket[bKey]
-			if len(acc.nums) == 0 && (fn == "AVG" || fn == "MIN" || fn == "MAX") {
+			if len(acc.nums) == 0 && (fn == "AVG" || fn == "MIN" || fn == "MAX" || hasHavingCountGtZero) {
 				continue
 			}
 			var res float64
@@ -2985,6 +3026,77 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 		return nil
 	}
+	if (strings.HasPrefix(colExpr, "DATE_FORMAT(") || strings.HasPrefix(colExpr, "date_format(")) && strings.HasSuffix(colExpr, ")") {
+		inner := colExpr[len("DATE_FORMAT(") : len(colExpr)-1]
+		args := splitTopLevelArgs(inner)
+		if len(args) == 2 {
+			tsArg := strings.TrimSpace(args[0])
+			fmtStr := unquoteSQLLiteral(strings.TrimSpace(args[1]))
+			if (strings.HasPrefix(tsArg, "FROM_UNIXTIME(") || strings.HasPrefix(tsArg, "from_unixtime(")) && strings.HasSuffix(tsArg, ")") {
+				tsArg = strings.TrimSpace(tsArg[len("FROM_UNIXTIME(") : len(tsArg)-1])
+			}
+			rawVal := resolveColumnValue(row, tsArg)
+			if rawVal == nil && isArithmeticSQLExpr(tsArg) {
+				rawVal = evalNumericExpr(row, tsArg)
+			}
+			if rawVal != nil {
+				var t time.Time
+				hasTime := false
+				if fv, ok := toFloat(rawVal); ok {
+					if fv > 1e11 || fv < -1e11 {
+						t = time.UnixMilli(int64(fv)).UTC()
+					} else {
+						sec := int64(math.Floor(fv))
+						nsec := int64(math.Round((fv - float64(sec)) * 1e9))
+						t = time.Unix(sec, nsec).UTC()
+					}
+					hasTime = true
+				} else if sv, ok := rawVal.(string); ok {
+					if ms, ok := schema.ParseESDateToEpochMillis(sv, time.Now().UTC()); ok {
+						t = time.UnixMilli(ms).UTC()
+						hasTime = true
+					}
+				}
+				if hasTime {
+					var out strings.Builder
+					for i := 0; i < len(fmtStr); i++ {
+						if fmtStr[i] == '%' && i+1 < len(fmtStr) {
+							i++
+							switch fmtStr[i] {
+							case 'Y':
+								out.WriteString(t.Format("2006"))
+							case 'm':
+								out.WriteString(t.Format("01"))
+							case 'd':
+								out.WriteString(t.Format("02"))
+							case 'H':
+								out.WriteString(t.Format("15"))
+							case 'i':
+								out.WriteString(t.Format("04"))
+							case 's':
+								out.WriteString(t.Format("05"))
+							case 'T':
+								out.WriteString(t.Format("15:04:05"))
+							case 'F':
+								out.WriteString(t.Format("2006-01-02"))
+							case 'f':
+								_, _ = fmt.Fprintf(&out, "%06d", t.Nanosecond()/1000)
+							case '%':
+								out.WriteByte('%')
+							default:
+								out.WriteByte('%')
+								out.WriteByte(fmtStr[i])
+							}
+						} else {
+							out.WriteByte(fmtStr[i])
+						}
+					}
+					return out.String()
+				}
+			}
+		}
+		return nil
+	}
 	if (strings.HasPrefix(colExpr, "CONCAT(") || strings.HasPrefix(colExpr, "concat(")) && strings.HasSuffix(colExpr, ")") && !strings.Contains(colExpr, "'\\x1f'") {
 		inner := colExpr[len("CONCAT(") : len(colExpr)-1]
 		args := splitTopLevelArgs(inner)
@@ -3029,6 +3141,9 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 	if strings.HasPrefix(colExpr, "CAST(") && !strings.HasPrefix(colExpr, "CAST(`_doc`") {
 		if strings.HasSuffix(colExpr, " AS DOUBLE)") {
 			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS DOUBLE)")])
+			if f, err := strconv.ParseFloat(inner, 64); err == nil {
+				return f
+			}
 			if v := resolveColumnValue(row, inner); v != nil {
 				switch v.(type) {
 				case []any, []string:
@@ -3048,7 +3163,7 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 					}
 				}
 			}
-			if isArithmeticSQLExpr(inner) {
+			if isArithmeticSQLExpr(inner) || strings.Contains(inner, "CASE WHEN") {
 				if hasUnwrappedNullColumnRef(row, inner) {
 					return nil
 				}

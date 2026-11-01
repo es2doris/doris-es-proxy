@@ -783,3 +783,46 @@ func TestRound32QueryStringAndFieldPropertyOptions(t *testing.T) {
 		t.Fatalf("unexpected FieldProperty options: %+v", priceProp)
 	}
 }
+
+func TestRound33QueryStringOperatorAndSuggestRequest(t *testing.T) {
+	var sr SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"query_string": {
+				"query": "alpha beta",
+				"operator": "AND"
+			}
+		},
+		"suggest": {
+			"text": "golng",
+			"term_sug": {
+				"text": "golng",
+				"term": {"field": "title", "size": 3, "suggest_mode": "always"}
+			},
+			"phrase_sug": {
+				"phrase": {"field": "title", "size": 2, "highlight": {"pre_tag": "<em>", "post_tag": "</em>"}}
+			},
+			"comp_sug": {
+				"prefix": "go",
+				"completion": {"field": "suggest_title", "size": 5, "skip_duplicates": true}
+			}
+		}
+	}`), &sr); err != nil {
+		t.Fatalf("unmarshal SearchRequest with suggest failed: %v", err)
+	}
+	if sr.Query == nil || sr.Query.QueryString == nil || sr.Query.QueryString.Operator != "AND" {
+		t.Fatalf("expected QueryString.Operator == 'AND', got %+v", sr.Query)
+	}
+	if len(sr.Suggest) != 4 || sr.Suggest["text"].Text != "golng" {
+		t.Fatalf("expected global suggest text 'golng' and 4 entries, got %+v", sr.Suggest)
+	}
+	if sr.Suggest["term_sug"].Term == nil || sr.Suggest["term_sug"].Term.Field != "title" || sr.Suggest["term_sug"].Term.Size != 3 {
+		t.Fatalf("unexpected term suggest spec: %+v", sr.Suggest["term_sug"])
+	}
+	if sr.Suggest["phrase_sug"].Phrase == nil || sr.Suggest["phrase_sug"].Phrase.Highlight == nil || sr.Suggest["phrase_sug"].Phrase.Highlight.PreTag != "<em>" {
+		t.Fatalf("unexpected phrase suggest spec: %+v", sr.Suggest["phrase_sug"])
+	}
+	if sr.Suggest["comp_sug"].Completion == nil || !sr.Suggest["comp_sug"].Completion.SkipDuplicates {
+		t.Fatalf("unexpected completion suggest spec: %+v", sr.Suggest["comp_sug"])
+	}
+}

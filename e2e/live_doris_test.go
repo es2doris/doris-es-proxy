@@ -1534,4 +1534,58 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	if r32SimDoc["caught"] != true || r32SimDoc["sum"] != float64(31) {
 		t.Fatalf("unexpected R32 simulated doc: %+v", r32SimDoc)
 	}
+
+	// =========================================================================
+	// Round-33 Live Doris E2E Verification:
+	// 1. Search suggest API (term, phrase, completion) and track_scores: true
+	// 2. Painless Elvis (?:), regex (=~ / ==~), Collectors.joining, and ingest sort/redact/fingerprint in _simulate
+	// =========================================================================
+	r33SugResp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
+		"size": 1,
+		"track_scores": true,
+		"sort": [{"views": "desc"}],
+		"suggest": {
+			"text": "electrnics",
+			"cat_sug": {
+				"term": {"field": "category"}
+			}
+		}
+	}`))
+	if err != nil || r33SugResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search (R33 suggest) failed: status=%v err=%v", r33SugResp.StatusCode, err)
+	}
+	var r33SugRes map[string]any
+	_ = json.NewDecoder(r33SugResp.Body).Decode(&r33SugRes)
+	_ = r33SugResp.Body.Close()
+	if r33SugRes["suggest"] == nil {
+		t.Fatalf("expected suggest block in R33 search response, got %+v", r33SugRes)
+	}
+
+	r33SimResp, err := http.Post(ts.URL+"/_ingest/pipeline/_simulate", "application/json", strings.NewReader(`{
+		"pipeline": {
+			"processors": [
+				{
+					"script": {
+						"source": "ctx.fallback = ctx.missing ?: 'ok'; ctx.re_ok = (ctx.code ==~ /^[A-Z]+-\d+$/); ctx.joined = ctx.tags.stream().collect(Collectors.joining(','));"
+					}
+				},
+				{"sort": {"field": "tags", "order": "desc"}},
+				{"redact": {"field": "secret", "patterns": ["\\d{4}"]}},
+				{"fingerprint": {"fields": ["code"], "target_field": "fp"}}
+			]
+		},
+		"docs": [
+			{"_index": "live_auto_index", "_id": "r33-sim-1", "_source": {"code": "ORD-99", "tags": ["a", "b"], "secret": "pin 1234"}}
+		]
+	}`))
+	if err != nil || r33SimResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_ingest/pipeline/_simulate (R33) failed: status=%v err=%v", r33SimResp.StatusCode, err)
+	}
+	var r33SimRes map[string]any
+	_ = json.NewDecoder(r33SimResp.Body).Decode(&r33SimRes)
+	_ = r33SimResp.Body.Close()
+	r33SimDoc := r33SimRes["docs"].([]any)[0].(map[string]any)["doc"].(map[string]any)["_source"].(map[string]any)
+	if r33SimDoc["fallback"] != "ok" || r33SimDoc["re_ok"] != true || r33SimDoc["joined"] != "a,b" || r33SimDoc["secret"] != "pin <REDACTED>" || r33SimDoc["fp"] == nil {
+		t.Fatalf("unexpected R33 simulated doc: %+v", r33SimDoc)
+	}
 }

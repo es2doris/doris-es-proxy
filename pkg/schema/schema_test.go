@@ -791,3 +791,73 @@ func TestRound32NullLeadingArraysNestedKwNullValueAndCopyToAlterDDL(t *testing.T
 		t.Fatalf("expected ALTER TABLE ADD COLUMN f__arr__full__keyword ARRAY<STRING>, got ddls=%v binding=%+v", ddls, newSch.Fields["full.keyword"])
 	}
 }
+
+func TestRound33CustomDateFormatCoerceAndIgnoreMalformed(t *testing.T) {
+	// F1: Custom date formats ("yyyy/MM/dd||epoch_millis", "dd/MM/yyyy", "basic_date", "epoch_second")
+	// and F2: coerce: false, ignore_malformed: true, and DeepMergeMappingProperties preserving scaling_factor/coerce/ignore_malformed
+	var baseSpec, extraSpec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"slash_date": {"type": "date", "format": "yyyy/MM/dd||epoch_millis"},
+			"euro_date": {"type": "date", "format": "dd/MM/yyyy"},
+			"basic_dt": {"type": "date", "format": "basic_date"},
+			"sec_dt": {"type": "date", "format": "epoch_second"},
+			"strict_int": {"type": "integer", "coerce": false},
+			"lenient_int": {"type": "integer", "coerce": false, "ignore_malformed": true},
+			"bad_num": {"type": "long", "ignore_malformed": true},
+			"price": {"type": "scaled_float", "scaling_factor": 100}
+		}
+	}`), &baseSpec); err != nil {
+		t.Fatalf("unmarshal baseSpec failed: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"properties": {"extra": {"type": "keyword"}}}`), &extraSpec); err != nil {
+		t.Fatalf("unmarshal extraSpec failed: %v", err)
+	}
+	merged := DeepMergeMappingProperties(baseSpec.Properties, extraSpec.Properties)
+	sch := CompileIndexSchema("db", "r33_schema", &esast.MappingSpec{Properties: merged})
+
+	if sch.Fields["price"].ScalingFactor != 100 {
+		t.Fatalf("expected ScalingFactor=100 preserved after DeepMergeMappingProperties, got %v", sch.Fields["price"].ScalingFactor)
+	}
+	if sch.Fields["strict_int"].Coerce == nil || *sch.Fields["strict_int"].Coerce {
+		t.Fatalf("expected strict_int Coerce=false preserved, got %+v", sch.Fields["strict_int"].Coerce)
+	}
+
+	// 1. Strict integer with string "42" should fail when coerce=false and ignore_malformed=false
+	if _, err := ShredDocument(sch, "bad-1", 1, false, json.RawMessage(`{"strict_int": "42"}`)); err == nil {
+		t.Fatalf("expected ShredDocument to reject string '42' on strict_int (coerce=false)")
+	}
+	// 2. Strict integer with float 42.7 should fail when coerce=false
+	if _, err := ShredDocument(sch, "bad-2", 1, false, json.RawMessage(`{"strict_int": 42.7}`)); err == nil {
+		t.Fatalf("expected ShredDocument to reject fractional 42.7 on strict_int (coerce=false)")
+	}
+	// 3. Valid custom dates + lenient_int (coerce=false, ignore_malformed=true) + bad_num (ignore_malformed=true)
+	raw, err := ShredDocument(sch, "ok-1", 1, false, json.RawMessage(`{
+		"slash_date": "2026/03/15",
+		"euro_date": "15/03/2026",
+		"basic_dt": "20260315",
+		"sec_dt": 1773532800,
+		"strict_int": 42,
+		"lenient_int": "42",
+		"bad_num": "not-a-number"
+	}`))
+	if err != nil {
+		t.Fatalf("expected ShredDocument to succeed with custom dates and ignore_malformed=true, got: %v", err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(raw, &row); err != nil {
+		t.Fatalf("unmarshal shredded row failed: %v", err)
+	}
+	expectedMs := float64(1773532800000) // 2026-03-15T00:00:00Z
+	for _, col := range []string{"f__slash_date", "f__euro_date", "f__basic_dt", "f__sec_dt"} {
+		if row[col] != expectedMs {
+			t.Fatalf("expected %s == %v, got %v", col, expectedMs, row[col])
+		}
+	}
+	if row["f__strict_int"] != float64(42) {
+		t.Fatalf("expected f__strict_int == 42, got %v", row["f__strict_int"])
+	}
+	if row["f__lenient_int"] != nil || row["f__bad_num"] != nil {
+		t.Fatalf("expected malformed coerced fields with ignore_malformed=true to be nil, got lenient_int=%v bad_num=%v", row["f__lenient_int"], row["f__bad_num"])
+	}
+}

@@ -118,7 +118,11 @@ func ShredDocument(
 				}
 			}
 			if val != nil {
-				val = coerceScalarForDoris(val, b.DorisType, b.LowercaseNormalizer, getNow())
+				coerced := coerceScalarBindingForDoris(val, b, getNow())
+				if coerced == nil && b.Coerce != nil && !*b.Coerce && (b.IgnoreMalformed == nil || !*b.IgnoreMalformed) {
+					return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", b.ESFieldPath, b.ESType)
+				}
+				val = coerced
 			}
 			if b.ESType == "date_nanos" {
 				if iv, ok := val.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
@@ -141,6 +145,12 @@ func ShredDocument(
 			}
 			if b.ESType == "date" || b.ESType == "date_nanos" {
 				for i, v := range vals {
+					if b.Format != "" {
+						if ms, ok := ParseESDateWithFormatToEpochMillis(v, b.Format, getNow()); ok {
+							vals[i] = strconv.FormatInt(ms, 10)
+							continue
+						}
+					}
 					if iv, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
 						if b.ESType == "date_nanos" && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
 							vals[i] = strconv.FormatInt(iv/1_000_000, 10)
@@ -254,7 +264,7 @@ func ShredDocument(
 					}
 					if len(filteredSrc) > 0 {
 						joined := strings.Join(filteredSrc, " ")
-						coerced := coerceScalarForDoris(joined, tb.DorisType, tb.LowercaseNormalizer, getNow())
+						coerced := coerceScalarBindingForDoris(joined, tb, getNow())
 						if coerced != nil {
 							if existing, exists := row[tb.ColumnName]; exists && existing != nil {
 								if tb.DorisType == DorisString || tb.DorisType == DorisVarchar {
@@ -315,6 +325,13 @@ func ShredDocument(
 							continue
 						}
 						if tb.ESType == "date" || tb.ESType == "date_nanos" {
+							if tb.Format != "" {
+								if ms, ok := ParseESDateWithFormatToEpochMillis(sv, tb.Format, getNow()); ok {
+									sv = strconv.FormatInt(ms, 10)
+									cur = append(cur, sv)
+									continue
+								}
+							}
 							if iv, err := strconv.ParseInt(strings.TrimSpace(sv), 10, 64); err == nil {
 								if tb.ESType == "date_nanos" && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
 									sv = strconv.FormatInt(iv/1_000_000, 10)
@@ -411,6 +428,79 @@ func ShredDocument(
 	}
 
 	return json.Marshal(row)
+}
+
+func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
+	if val == nil {
+		return nil
+	}
+	if b.Coerce != nil && !*b.Coerce {
+		switch b.DorisType {
+		case DorisBigInt, DorisInt:
+			if b.ESType != "date" && b.ESType != "date_nanos" {
+				switch v := val.(type) {
+				case string, bool:
+					return nil
+				case float64:
+					if math.IsNaN(v) || math.IsInf(v, 0) || math.Trunc(v) != v {
+						return nil
+					}
+				case json.Number:
+					if strings.ContainsAny(v.String(), ".eE") {
+						if f, err := v.Float64(); err != nil || math.Trunc(f) != f {
+							return nil
+						}
+					} else if _, err := v.Int64(); err != nil {
+						if _, uerr := strconv.ParseUint(v.String(), 10, 64); uerr != nil {
+							return nil
+						}
+					}
+				}
+			}
+		case DorisDouble:
+			switch val.(type) {
+			case string, bool:
+				return nil
+			}
+		case DorisBoolean:
+			if _, ok := val.(bool); !ok {
+				return nil
+			}
+		}
+	}
+	if (b.ESType == "date" || b.ESType == "date_nanos") && b.Format != "" {
+		switch v := val.(type) {
+		case string:
+			if ms, ok := ParseESDateWithFormatToEpochMillis(v, b.Format, now); ok {
+				return ms
+			}
+		case int64:
+			if ms, ok := ParseESDateWithFormatToEpochMillis(strconv.FormatInt(v, 10), b.Format, now); ok {
+				return ms
+			}
+		case int:
+			if ms, ok := ParseESDateWithFormatToEpochMillis(strconv.Itoa(v), b.Format, now); ok {
+				return ms
+			}
+		case float64:
+			if !math.IsNaN(v) && !math.IsInf(v, 0) {
+				if ms, ok := ParseESDateWithFormatToEpochMillis(strconv.FormatFloat(v, 'f', -1, 64), b.Format, now); ok {
+					return ms
+				}
+			}
+		case json.Number:
+			if ms, ok := ParseESDateWithFormatToEpochMillis(v.String(), b.Format, now); ok {
+				return ms
+			}
+		}
+	}
+	coerced := coerceScalarForDoris(val, b.DorisType, b.LowercaseNormalizer, now)
+	if b.ESType == "scaled_float" && b.ScalingFactor > 0 {
+		if fv, ok := coerced.(float64); ok && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+			coerced = math.Round(fv*b.ScalingFactor) / b.ScalingFactor
+		}
+	}
+	return coerced
 }
 
 func coerceScalarForDoris(val any, dorisType DorisScalarType, lowercase bool, now time.Time) any {
@@ -617,6 +707,41 @@ func coerceScalarForDoris(val any, dorisType DorisScalarType, lowercase bool, no
 	return val
 }
 
+func hasExplicitNullAtPath(node any, path []string) bool {
+	if len(path) == 0 || node == nil {
+		return false
+	}
+	switch v := node.(type) {
+	case map[string]any:
+		child, exists := v[path[0]]
+		if !exists {
+			if len(path) > 1 {
+				for i := len(path); i >= 2; i-- {
+					joined := strings.Join(path[:i], ".")
+					if c, ok := v[joined]; ok {
+						if i == len(path) {
+							return c == nil
+						}
+						return hasExplicitNullAtPath(c, path[i:])
+					}
+				}
+			}
+			return false
+		}
+		if len(path) == 1 {
+			return child == nil
+		}
+		return hasExplicitNullAtPath(child, path[1:])
+	case []any:
+		for _, elem := range v {
+			if hasExplicitNullAtPath(elem, path) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func truncateUTF8Bytes(s string, maxBytes int) string {
 	if len(s) <= maxBytes {
 		return s
@@ -702,12 +827,18 @@ func ESDateFormatToGoLayout(pattern string) string {
 // optional ES date format specification (e.g., "dd/MM/yyyy||epoch_millis") before falling back
 // to standard ISO-8601 / epoch millis parsing.
 func ParseESDateWithFormatToEpochMillis(input, format string, now time.Time) (int64, bool) {
+	return ParseESDateBoundWithFormatToEpochMillis(input, format, now, false)
+}
+
+// ParseESDateBoundWithFormatToEpochMillis parses a date string or date math expression using an
+// optional ES date format specification, rounding date-only or `/unit` expressions up when `roundUp` is true.
+func ParseESDateBoundWithFormatToEpochMillis(input, format string, now time.Time, roundUp bool) (int64, bool) {
 	s := strings.TrimSpace(input)
 	if s == "" {
 		return 0, false
 	}
 	if strings.HasPrefix(s, "now") {
-		return ParseESDateToEpochMillis(s, now)
+		return ParseESDateBoundToEpochMillis(s, now, roundUp)
 	}
 	if strings.TrimSpace(format) != "" {
 		prefix := s
@@ -718,6 +849,23 @@ func ParseESDateWithFormatToEpochMillis(input, format string, now time.Time) (in
 			mathExpr = strings.TrimSpace(s[idx+2:])
 			hasMath = true
 		}
+		finalizeFormatMatch := func(base time.Time, dateOnly bool) (int64, bool) {
+			base = base.UTC()
+			if !hasMath || mathExpr == "" {
+				if roundUp && dateOnly {
+					base = base.AddDate(0, 0, 1).Add(-time.Millisecond)
+				}
+				return base.UnixMilli(), true
+			}
+			mt, ok := applyESDateMathWithRound(base, mathExpr, roundUp)
+			if !ok {
+				return 0, false
+			}
+			if roundUp && dateOnly && !strings.Contains(mathExpr, "/") && hasOnlyCalendarDayOrLargerOffsets(mathExpr) {
+				mt = mt.AddDate(0, 0, 1).Add(-time.Millisecond)
+			}
+			return mt.UnixMilli(), true
+		}
 		for _, rawFmt := range strings.Split(format, "||") {
 			fmtPart := strings.TrimSpace(rawFmt)
 			if fmtPart == "" {
@@ -725,49 +873,49 @@ func ParseESDateWithFormatToEpochMillis(input, format string, now time.Time) (in
 			}
 			switch fmtPart {
 			case "epoch_second":
-				if f, err := strconv.ParseFloat(prefix, 64); err == nil {
-					base := time.UnixMilli(int64(f * 1000)).UTC()
-					if hasMath {
-						if t, ok := applyESDateMathWithRound(base, mathExpr, false); ok {
-							return t.UnixMilli(), true
-						}
-						return 0, false
-					}
-					return base.UnixMilli(), true
+				if f, err := strconv.ParseFloat(prefix, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+					base := time.UnixMilli(int64(math.Round(f * 1000))).UTC()
+					return finalizeFormatMatch(base, false)
 				}
 			case "epoch_millis":
 				if iv, err := strconv.ParseInt(prefix, 10, 64); err == nil {
 					base := time.UnixMilli(iv).UTC()
-					if hasMath {
-						if t, ok := applyESDateMathWithRound(base, mathExpr, false); ok {
-							return t.UnixMilli(), true
-						}
-						return 0, false
-					}
-					return iv, true
+					return finalizeFormatMatch(base, false)
 				}
-			case "strict_date_optional_time", "date_optional_time", "strict_date", "basic_date":
-				if ms, ok := ParseESDateToEpochMillis(s, now); ok {
-					return ms, true
+			case "basic_date", "strict_basic_date":
+				if len(prefix) == 8 {
+					if t, err := time.Parse("20060102", prefix); err == nil {
+						return finalizeFormatMatch(t, true)
+					}
+				}
+			case "basic_date_time", "strict_basic_date_time":
+				for _, l := range []string{"20060102T150405.000Z0700", "20060102T150405.000Z", "20060102T150405.999999999Z07:00"} {
+					if t, err := time.Parse(l, prefix); err == nil {
+						return finalizeFormatMatch(t, false)
+					}
+				}
+			case "basic_date_time_no_millis", "strict_basic_date_time_no_millis":
+				for _, l := range []string{"20060102T150405Z0700", "20060102T150405Z", "20060102T150405Z07:00"} {
+					if t, err := time.Parse(l, prefix); err == nil {
+						return finalizeFormatMatch(t, false)
+					}
+				}
+			case "strict_date_optional_time", "date_optional_time", "strict_date", "date", "strict_date_hour_minute_second", "date_hour_minute_second":
+				if t, ok := parseISODateString(prefix); ok {
+					return finalizeFormatMatch(t, isDateOnlyString(prefix))
 				}
 			default:
 				layout := ESDateFormatToGoLayout(fmtPart)
 				if layout != "" {
 					if t, err := time.Parse(layout, prefix); err == nil {
-						base := t.UTC()
-						if hasMath {
-							if mt, ok := applyESDateMathWithRound(base, mathExpr, false); ok {
-								return mt.UnixMilli(), true
-							}
-							return 0, false
-						}
-						return base.UnixMilli(), true
+						dateOnly := !strings.ContainsAny(fmtPart, "HhmsS")
+						return finalizeFormatMatch(t, dateOnly)
 					}
 				}
 			}
 		}
 	}
-	return ParseESDateToEpochMillis(s, now)
+	return ParseESDateBoundToEpochMillis(s, now, roundUp)
 }
 
 // ParseESDateBoundToEpochMillis parses ISO-8601 / RFC3339 date strings, epoch strings,
@@ -984,42 +1132,6 @@ func roundTimeToUnit(t time.Time, roundUnit byte, roundUp bool) time.Time {
 		}
 	}
 	return t
-}
-
-func hasExplicitNullAtPath(node any, path []string) bool {
-	if len(path) == 0 {
-		if node == nil {
-			return true
-		}
-		if arr, ok := node.([]any); ok {
-			for _, elem := range arr {
-				if elem == nil {
-					return true
-				}
-			}
-		}
-		return false
-	}
-	if node == nil {
-		return false
-	}
-	switch curr := node.(type) {
-	case map[string]any:
-		next, exists := curr[path[0]]
-		if !exists {
-			return false
-		}
-		return hasExplicitNullAtPath(next, path[1:])
-	case []any:
-		for _, elem := range curr {
-			if hasExplicitNullAtPath(elem, path) {
-				return true
-			}
-		}
-		return false
-	default:
-		return false
-	}
 }
 
 func extractScalarValue(node any, path []string) any {
@@ -1553,6 +1665,14 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 	}
 	if b.ESType == "date" || b.ESType == "date_nanos" {
 		str := strings.TrimSpace(fmt.Sprintf("%v", val))
+		if b.Format != "" {
+			if ms, ok := ParseESDateWithFormatToEpochMillis(str, b.Format, getNow()); ok {
+				if b.ESType == "date_nanos" && (ms > 1_000_000_000_000_000 || ms < -1_000_000_000_000_000) {
+					return ms / 1_000_000
+				}
+				return ms
+			}
+		}
 		if iv, err := strconv.ParseInt(str, 10, 64); err == nil {
 			if b.ESType == "date_nanos" && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
 				return iv / 1_000_000
