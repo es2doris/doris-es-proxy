@@ -725,3 +725,61 @@ func TestRound31IndexTemplatePriorityAndEffectiveHelpers(t *testing.T) {
 		t.Fatalf("unexpected composable template fields: %+v", compTpl)
 	}
 }
+
+func TestRound32QueryStringAndFieldPropertyOptions(t *testing.T) {
+	var q Query
+	if err := json.Unmarshal([]byte(`{
+		"query_string": {
+			"query": "status:ok",
+			"default_field": "status",
+			"time_zone": "+09:00",
+			"type": "cross_fields",
+			"tie_breaker": 0.3,
+			"phrase_slop": 2,
+			"fuzziness": "AUTO",
+			"lenient": true,
+			"zero_terms_query": "all",
+			"analyze_wildcard": true
+		}
+	}`), &q); err != nil {
+		t.Fatalf("unmarshal QueryStringQuery failed: %v", err)
+	}
+	if q.QueryString == nil || q.QueryString.TimeZone != "+09:00" || q.QueryString.Type != "cross_fields" || q.QueryString.TieBreaker == nil || *q.QueryString.TieBreaker != 0.3 || q.QueryString.PhraseSlop != 2 || q.QueryString.Fuzziness != "AUTO" || q.QueryString.Lenient == nil || !*q.QueryString.Lenient || q.QueryString.ZeroTermsQuery != "all" {
+		t.Fatalf("unexpected QueryStringQuery fields: %+v", q.QueryString)
+	}
+
+	var sq Query
+	if err := json.Unmarshal([]byte(`{
+		"simple_query_string": {
+			"query": "alpha beta",
+			"fields": ["title^2", "body"],
+			"lenient": true,
+			"zero_terms_query": "all",
+			"analyze_wildcard": true,
+			"auto_generate_synonyms_phrase_query": true
+		}
+	}`), &sq); err != nil {
+		t.Fatalf("unmarshal SimpleQueryStringQuery failed: %v", err)
+	}
+	if sq.SimpleQueryString == nil || sq.SimpleQueryString.Lenient == nil || !*sq.SimpleQueryString.Lenient || sq.SimpleQueryString.ZeroTermsQuery != "all" || sq.SimpleQueryString.AnalyzeWildcard == nil || !*sq.SimpleQueryString.AnalyzeWildcard {
+		t.Fatalf("unexpected SimpleQueryStringQuery fields: %+v", sq.SimpleQueryString)
+	}
+
+	var mapping MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"price": {
+				"type": "scaled_float",
+				"scaling_factor": 100,
+				"ignore_malformed": true,
+				"coerce": false
+			}
+		}
+	}`), &mapping); err != nil {
+		t.Fatalf("unmarshal MappingSpec failed: %v", err)
+	}
+	priceProp := mapping.Properties["price"]
+	if priceProp.ScalingFactor != 100 || priceProp.IgnoreMalformed == nil || !*priceProp.IgnoreMalformed || priceProp.Coerce == nil || *priceProp.Coerce {
+		t.Fatalf("unexpected FieldProperty options: %+v", priceProp)
+	}
+}

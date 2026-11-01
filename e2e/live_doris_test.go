@@ -1482,4 +1482,56 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	if r31SimDoc["op"] != "index" || r31SimDoc["r31_ok"] != "yes" || r31Parsed["existing"] != "keep" || r31Parsed["a"] != "foo" {
 		t.Fatalf("unexpected R31 simulated doc: %+v", r31SimDoc)
 	}
+
+	// =========================================================================
+	// Round-32 Live Doris E2E Verification:
+	// 1. sampler & diversified_sampler aggregations
+	// 2. Painless try/catch, .stream() pipeline, List.replaceAll, and hex/binary literals in _ingest/pipeline/_simulate
+	// 3. _update validation of empty {} and noop detection on {"doc": {}}
+	// =========================================================================
+	r32SampResp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
+		"size": 0,
+		"aggs": {
+			"samp": {
+				"sampler": {"shard_size": 1},
+				"aggs": {
+					"top_c": {"terms": {"field": "category.keyword"}}
+				}
+			}
+		}
+	}`))
+	if err != nil || r32SampResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search (R32 sampler) failed: status=%v err=%v", r32SampResp.StatusCode, err)
+	}
+	var r32SampRes map[string]any
+	_ = json.NewDecoder(r32SampResp.Body).Decode(&r32SampRes)
+	_ = r32SampResp.Body.Close()
+	if r32SampRes["aggregations"].(map[string]any)["samp"].(map[string]any)["doc_count"] != float64(1) {
+		t.Fatalf("expected sampler shard_size:1 doc_count=1, got %+v", r32SampRes["aggregations"])
+	}
+
+	r32SimResp, err := http.Post(ts.URL+"/_ingest/pipeline/_simulate", "application/json", strings.NewReader(`{
+		"pipeline": {
+			"processors": [
+				{
+					"script": {
+						"source": "int a = 0x10, b = 0b101; try { Integer.parseInt('bad'); } catch (Exception e) { ctx.caught = true; } ctx.tags.replaceAll(x -> x.toUpperCase()); ctx.sum = ctx.nums.stream().filter(n -> n > 1).map(n -> n * 2).sum() + a + b;"
+					}
+				}
+			]
+		},
+		"docs": [
+			{"_index": "live_auto_index", "_id": "r32-sim-1", "_source": {"tags": ["x", "y"], "nums": [1, 2, 3]}}
+		]
+	}`))
+	if err != nil || r32SimResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_ingest/pipeline/_simulate (R32) failed: status=%v err=%v", r32SimResp.StatusCode, err)
+	}
+	var r32SimRes map[string]any
+	_ = json.NewDecoder(r32SimResp.Body).Decode(&r32SimRes)
+	_ = r32SimResp.Body.Close()
+	r32SimDoc := r32SimRes["docs"].([]any)[0].(map[string]any)["doc"].(map[string]any)["_source"].(map[string]any)
+	if r32SimDoc["caught"] != true || r32SimDoc["sum"] != float64(31) {
+		t.Fatalf("unexpected R32 simulated doc: %+v", r32SimDoc)
+	}
 }

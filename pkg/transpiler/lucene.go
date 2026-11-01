@@ -112,6 +112,12 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 
 	flags := parseSimpleQueryFlags(qsq.Flags, isSimple)
 	flags.quoteFieldSuffix = strings.TrimSpace(qsq.QuoteFieldSuffix)
+	flags.timeZone = strings.TrimSpace(qsq.TimeZone)
+	flags.queryType = strings.TrimSpace(qsq.Type)
+	flags.tieBreaker = qsq.TieBreaker
+	flags.phraseSlop = qsq.PhraseSlop
+	flags.fuzziness = qsq.Fuzziness
+	flags.lenient = qsq.Lenient
 	parsedAST := parseSimpleLuceneToASTWithFlags(raw, defaultField, expandedFields, defaultOp, 0, isSimple, flags)
 	if qsq.MinimumShouldMatch != nil && parsedAST.Bool != nil && len(parsedAST.Bool.Should) > 0 {
 		if len(parsedAST.Bool.Should) == 1 && parsedAST.Bool.Should[0].Bool != nil && len(parsedAST.Bool.Should[0].Bool.Should) > 0 && len(parsedAST.Bool.Must) == 0 && len(parsedAST.Bool.Filter) == 0 {
@@ -124,7 +130,7 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 	if scoring && qsq.Boost != nil && *qsq.Boost != 1.0 && compiled.ScoreSQL != "" && compiled.ScoreSQL != "0.0" {
 		compiled.ScoreSQL = fmt.Sprintf("((%s) * %.4f)", compiled.ScoreSQL, *qsq.Boost)
 	}
-	if !isSimple && flags.quoteFieldSuffix == "" {
+	if !isSimple && flags.quoteFieldSuffix == "" && flags.timeZone == "" && flags.phraseSlop == 0 && flags.fuzziness == nil && compiled.WhereSQL != "FALSE" {
 		if rewrittenRaw, ok := t.rewriteDoris4SearchQuery(raw); ok && t.Opts.UseDoris4SearchFunc && nctx == nil && qsq.MinimumShouldMatch == nil && defaultField != "__unmatched_wildcard__" && !strings.ContainsAny(raw, "[{><~/^") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, "`n__") && !strings.Contains(compiled.WhereSQL, " IS NOT NULL") && !strings.Contains(compiled.WhereSQL, "array_size(") {
 			if len(expandedFields) > 1 {
 				if canEmitMultiFieldDoris4SearchDisjunction(rewrittenRaw, defaultOp) {
@@ -267,6 +273,12 @@ type simpleQueryFlags struct {
 	fuzzy            bool
 	slop             bool
 	quoteFieldSuffix string
+	timeZone         string
+	queryType        string
+	tieBreaker       *float64
+	phraseSlop       int
+	fuzziness        any
+	lenient          *bool
 }
 
 func allSimpleQueryFlags() simpleQueryFlags {
@@ -537,12 +549,18 @@ func parseLuceneTokenSliceWithFlags(tokens []string, defaultField string, fields
 
 		mustClause := forceMustNext
 		forceMustNext = false
-		if ((strings.HasPrefix(tok, "-") && (!isSimple || flags.not)) || (strings.HasPrefix(tok, "!") && !isSimple)) && len(tok) > 1 {
-			negateNext = true
-			tok = tok[1:]
-		} else if strings.HasPrefix(tok, "+") && (!isSimple || flags.and) && len(tok) > 1 {
-			mustClause = true
-			tok = tok[1:]
+		for len(tok) > 0 {
+			if ((strings.HasPrefix(tok, "-") && (!isSimple || flags.not)) || (strings.HasPrefix(tok, "!") && !isSimple)) && len(tok) > 1 {
+				negateNext = true
+				tok = tok[1:]
+			} else if strings.HasPrefix(tok, "+") && (!isSimple || flags.and) && len(tok) > 1 {
+				mustClause = true
+				tok = tok[1:]
+			} else if (tok == "-" && (!isSimple || flags.not)) || (tok == "!" && !isSimple) || (tok == "+" && (!isSimple || flags.and)) {
+				tok = ""
+			} else {
+				break
+			}
 		}
 		if strings.TrimSpace(tok) == "" {
 			continue
@@ -566,6 +584,9 @@ func parseLuceneTokenSliceWithFlags(tokens []string, defaultField string, fields
 		}
 	}
 	if len(boolQ.Must) == 0 && len(boolQ.Should) == 0 && len(boolQ.Filter) == 0 && len(boolQ.MustNot) == 0 {
+		if len(tokens) > 0 {
+			return esast.Query{MatchNone: map[string]any{}}
+		}
 		return esast.Query{MatchAll: map[string]any{}}
 	}
 	if len(boolQ.Should) > 0 && len(boolQ.Must) == 0 && len(boolQ.Filter) == 0 && len(boolQ.MustNot) > 0 {
@@ -801,6 +822,9 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 				}
 				return esast.Query{Exists: &esast.ExistsQuery{Field: field}}
 			}
+			if flags.timeZone != "" && rc.TimeZone == "" {
+				rc.TimeZone = flags.timeZone
+			}
 			return esast.Query{
 				Range: map[string]esast.RangeCond{field: *rc},
 			}
@@ -844,12 +868,17 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			return inner
 		}
 		val, rawWild, isQuoted, slop, isFuzzy := parseLuceneQuotedOrFuzzyEx(val)
+		if isQuoted && slop == 0 && flags.phraseSlop > 0 {
+			slop = flags.phraseSlop
+		}
 		if isQuoted && flags.quoteFieldSuffix != "" && field != "_all_text" && !strings.HasSuffix(field, flags.quoteFieldSuffix) {
 			field += flags.quoteFieldSuffix
 		}
 		var fuzzAny any
 		if isFuzzy && !isQuoted {
 			fuzzAny = "AUTO"
+		} else if !isQuoted && flags.fuzziness != nil {
+			fuzzAny = flags.fuzziness
 		}
 		if !isQuoted && (strings.EqualFold(val, "true") || strings.EqualFold(val, "false")) {
 			boolVal := strings.EqualFold(val, "true")
@@ -883,18 +912,23 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 		if strings.ContainsAny(field, "*?") {
 			b := boost
 			qType := "best_fields"
+			if flags.queryType != "" {
+				qType = flags.queryType
+			}
 			if isQuoted && (strings.Contains(val, " ") || slop > 0) {
 				qType = "phrase"
 			}
 			return esast.Query{
 				MultiMatch: &esast.MultiMatchQuery{
-					Query:     val,
-					Fields:    []string{field},
-					Type:      qType,
-					Operator:  strings.ToLower(defaultOp),
-					Slop:      slop,
-					Fuzziness: fuzzAny,
-					Boost:     &b,
+					Query:      val,
+					Fields:     []string{field},
+					Type:       qType,
+					Operator:   strings.ToLower(defaultOp),
+					Slop:       slop,
+					Fuzziness:  fuzzAny,
+					TieBreaker: flags.tieBreaker,
+					Lenient:    flags.lenient,
+					Boost:      &b,
 				},
 			}
 		}
@@ -907,7 +941,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 		}
 		return esast.Query{
 			Match: map[string]esast.MatchEntry{
-				field: {Query: val, Operator: strings.ToLower(defaultOp), Fuzziness: fuzzAny, Boost: boost},
+				field: {Query: val, Operator: strings.ToLower(defaultOp), Fuzziness: fuzzAny, Lenient: flags.lenient, Boost: boost},
 			},
 		}
 	}
@@ -918,6 +952,9 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 
 	if !isSimple {
 		if rc := parseLuceneRangeToken(token, boost); rc != nil {
+			if flags.timeZone != "" && rc.TimeZone == "" {
+				rc.TimeZone = flags.timeZone
+			}
 			if len(fields) > 0 {
 				var shoulds []esast.Query
 				for _, fpat := range fields {
@@ -969,11 +1006,14 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 		}
 	}
 	cleanVal, rawWild, isQuoted, slop, isFuzzy := parseLuceneQuotedOrFuzzyEx(token)
+	if isQuoted && slop == 0 && flags.phraseSlop > 0 {
+		slop = flags.phraseSlop
+	}
 	if isSimple {
 		if !flags.phrase {
 			isQuoted = false
 			slop = 0
-		} else if !flags.slop {
+		} else if !flags.slop && flags.phraseSlop == 0 {
 			slop = 0
 		}
 		if !flags.fuzzy && !isQuoted {
@@ -985,6 +1025,8 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 	var fuzzAny any
 	if isFuzzy && !isQuoted {
 		fuzzAny = "AUTO"
+	} else if !isQuoted && flags.fuzziness != nil {
+		fuzzAny = flags.fuzziness
 	}
 	targetDefaultField := defaultField
 	targetFields := fields
@@ -1036,11 +1078,13 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 		if len(targetFields) > 0 {
 			return esast.Query{
 				MultiMatch: &esast.MultiMatchQuery{
-					Query:  cleanVal,
-					Fields: targetFields,
-					Type:   "phrase",
-					Slop:   slop,
-					Boost:  &boost,
+					Query:      cleanVal,
+					Fields:     targetFields,
+					Type:       "phrase",
+					Slop:       slop,
+					TieBreaker: flags.tieBreaker,
+					Lenient:    flags.lenient,
+					Boost:      &boost,
 				},
 			}
 		}
@@ -1054,17 +1098,20 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 	if len(targetFields) > 0 {
 		return esast.Query{
 			MultiMatch: &esast.MultiMatchQuery{
-				Query:     cleanVal,
-				Fields:    targetFields,
-				Operator:  strings.ToLower(defaultOp),
-				Fuzziness: fuzzAny,
-				Boost:     &boost,
+				Query:      cleanVal,
+				Fields:     targetFields,
+				Type:       flags.queryType,
+				Operator:   strings.ToLower(defaultOp),
+				Fuzziness:  fuzzAny,
+				TieBreaker: flags.tieBreaker,
+				Lenient:    flags.lenient,
+				Boost:      &boost,
 			},
 		}
 	}
 	return esast.Query{
 		Match: map[string]esast.MatchEntry{
-			targetDefaultField: {Query: cleanVal, Operator: strings.ToLower(defaultOp), Fuzziness: fuzzAny, Boost: boost},
+			targetDefaultField: {Query: cleanVal, Operator: strings.ToLower(defaultOp), Fuzziness: fuzzAny, Lenient: flags.lenient, Boost: boost},
 		},
 	}
 }

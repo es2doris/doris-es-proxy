@@ -721,3 +721,73 @@ func TestRound31PromoteTextVariantNestedCopyToNormalizerAndTypeWidening(t *testi
 		}
 	}
 }
+
+func TestRound32NullLeadingArraysNestedKwNullValueAndCopyToAlterDDL(t *testing.T) {
+	// Fix 3 & Fix 4: ShredDocument handles [null, 42] on scalar fields, [null, "hello"] on text fields,
+	// and nested .keyword companion null_value without clobbering parent text field
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"count": {"type": "long", "null_value": -1},
+			"title": {"type": "text"},
+			"items": {
+				"type": "nested",
+				"properties": {
+					"name": {
+						"type": "text",
+						"fields": {
+							"keyword": {"type": "keyword", "null_value": "MISSING_KW"}
+						}
+					}
+				}
+			}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("unmarshal spec failed: %v", err)
+	}
+	sch := CompileIndexSchema("db", "r32_shred", &spec)
+	raw, err := ShredDocument(sch, "doc-1", 1, false, json.RawMessage(`{"count":[null, 42],"title":[null, "hello"],"items":[{"name":null},{"name":"actual"}]}`))
+	if err != nil {
+		t.Fatalf("ShredDocument failed: %v", err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(raw, &row); err != nil {
+		t.Fatalf("unmarshal shredded row failed: %v", err)
+	}
+	if row["f__count"] != float64(42) {
+		t.Fatalf("expected f__count == 42 from [null, 42], got %v", row["f__count"])
+	}
+	if row["f__title"] != "hello" {
+		t.Fatalf("expected f__title == 'hello' from [null, 'hello'], got %v", row["f__title"])
+	}
+	nItems, _ := row["n__items"].([]any)
+	if len(nItems) != 2 {
+		t.Fatalf("expected 2 nested items, got %v", row["n__items"])
+	}
+	var el0 map[string]any
+	_ = json.Unmarshal([]byte(nItems[0].(string)), &el0)
+	if el0["name"] != nil || el0["name__keyword"] != "MISSING_KW" {
+		t.Fatalf("expected el0.name == nil and el0.name__keyword == 'MISSING_KW', got %+v", el0)
+	}
+	preKw, _ := row["n__items__name__keyword"].([]any)
+	if len(preKw) != 2 || preKw[0] != "MISSING_KW" || preKw[1] != "actual" {
+		t.Fatalf("expected n__items__name__keyword == ['MISSING_KW', 'actual'], got %v", preKw)
+	}
+
+	// Fix 9: GenerateAlterTableDDL when a .keyword companion is upgraded from StoragePromotedScalar to StoragePromotedArray via copy_to
+	var oldSpec, newSpec esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{"properties":{"full":{"type":"text","fields":{"keyword":{"type":"keyword"}}}}}`), &oldSpec)
+	_ = json.Unmarshal([]byte(`{"properties":{"full":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"part":{"type":"keyword","copy_to":"full"}}}`), &newSpec)
+	oldSch := CompileIndexSchema("db", "r32_evolve", &oldSpec)
+	newSch := CompileIndexSchema("db", "r32_evolve", &newSpec)
+	ddls := GenerateAlterTableDDL(oldSch, newSch)
+	foundArrDDL := false
+	for _, d := range ddls {
+		if strings.Contains(d, "f__arr__full__keyword") && strings.Contains(d, "ARRAY<STRING>") {
+			foundArrDDL = true
+		}
+	}
+	if !foundArrDDL || newSch.Fields["full.keyword"].ColumnName != "f__arr__full__keyword" {
+		t.Fatalf("expected ALTER TABLE ADD COLUMN f__arr__full__keyword ARRAY<STRING>, got ddls=%v binding=%+v", ddls, newSch.Fields["full.keyword"])
+	}
+}
