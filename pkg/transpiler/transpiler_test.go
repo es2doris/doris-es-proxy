@@ -1945,3 +1945,145 @@ func TestRound32NestedDateQueriesMultiValuedIPsLuceneAndStringStats(t *testing.T
 		t.Fatalf("unexpected Lucene HitsSQL:\n%s", planLucene.HitsSQL)
 	}
 }
+
+func TestRound33TranspilerDateFormatsNestedNullsMultiTermsMsmAndLucene(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"slash_date": {"type": "date", "format": "yyyy/MM/dd||epoch_millis"},
+			"status": {"type": "keyword", "null_value": "MISSING_STATUS"},
+			"title": {"type": "text"},
+			"tags": {"type": "keyword", "copy_to": "all_tags"},
+			"all_tags": {"type": "keyword"},
+			"score_val": {"type": "double"},
+			"items": {
+				"type": "nested",
+				"properties": {
+					"code": {"type": "keyword", "null_value": "MISSING_CODE"},
+					"name": {
+						"type": "text",
+						"fields": {
+							"keyword": {"type": "keyword", "null_value": "MISSING_KW"}
+						}
+					},
+					"val": {"type": "long"}
+				}
+			}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("unmarshal spec failed: %v", err)
+	}
+	sch := schema.CompileIndexSchema("db", "r33_tr", &spec)
+	tr := NewTranspiler(sch, TranspilerOptions{})
+
+	// F1, F3, F4, F5, F6, F7, F8, F10
+	var req esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"bool": {
+				"must": [
+					{"range": {"slash_date": {"gte": "2026/03/15", "lte": "2026/03/16"}}},
+					{"term": {"slash_date": "2026/03/15"}},
+					{"terms_set": {"status": {"terms": ["MISSING_STATUS", "active"], "minimum_should_match_script": {"source": "Math.min(params.num_terms, 1)"}}}},
+					{"match": {"title": {"query": "alpha beta gamma", "operator": "or", "minimum_should_match": "2"}}},
+					{"match": {"status": {"query": "open closed", "operator": "and"}}},
+					{"match": {"all_tags": "foo bar"}},
+					{"match": {"unmapped_dyn": "hello world"}},
+					{"match_bool_prefix": {"title^2.5": "quick brown"}},
+					{
+						"nested": {
+							"path": "items",
+							"query": {
+								"bool": {
+									"must": [
+										{"exists": {"field": "items.code"}},
+										{"exists": {"field": "items.name.keyword"}},
+										{"wildcard": {"items.code": "MISS*"}},
+										{"prefix": {"items.name.keyword": "MISS"}},
+										{"regexp": {"items.code": "MISS.*"}},
+										{"script": {"script": "doc['val'].value > 5"}}
+									]
+								}
+							}
+						}
+					},
+					{
+						"query_string": {
+							"query": "*^3.5",
+							"default_field": "status"
+						}
+					},
+					{
+						"query_string": {
+							"query": "alpha OR beta OR gamma",
+							"default_field": "title",
+							"default_operator": "AND",
+							"minimum_should_match": "2"
+						}
+					},
+					{
+						"query_string": {
+							"query": "exact~0",
+							"default_field": "status",
+							"fuzziness": "AUTO"
+						}
+					}
+				]
+			}
+		},
+		"sort": [
+			{"slash_date": {"order": "asc", "missing": "2026/01/01"}},
+			{"all_tags": {"order": "asc", "mode": "min", "type": "double"}},
+			{"items.val": {"order": "desc", "mode": "median", "nested": {"path": "items", "filter": {"term": {"items.code": "MISSING_CODE"}}}}}
+		],
+		"search_after": ["2026/03/15", 1.5, 10],
+		"aggs": {
+			"nested_items": {
+				"nested": {"path": "items"},
+				"aggs": {
+					"code_terms": {"terms": {"field": "items.code"}},
+					"kw_terms": {"terms": {"field": "items.name.keyword"}},
+					"code_card": {"cardinality": {"field": "items.code"}},
+					"script_sum": {"sum": {"script": "doc['val'].value"}},
+					"nested_comp": {
+						"composite": {
+							"sources": [
+								{"c": {"terms": {"field": "code"}}}
+							]
+						}
+					}
+				}
+			}
+		}
+	}`), &req); err != nil {
+		t.Fatalf("unmarshal req failed: %v", err)
+	}
+	plan, err := tr.BuildSearchPlan(&req)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan failed: %v", err)
+	}
+	// F1: custom date format 2026/03/15 -> 1773532800000 and 2026/03/16 upper bound -> 1773619199999, sort missing 2026/01/01 -> 1767225600000
+	if !strings.Contains(plan.HitsSQL, "1773532800000") || !strings.Contains(plan.HitsSQL, "1767225600000") {
+		t.Fatalf("expected custom date format millis in HitsSQL, got:\n%s", plan.HitsSQL)
+	}
+	// F3: match on multi-valued keyword uses array_contains and unmapped dynamic variant uses LIKE
+	if !strings.Contains(plan.HitsSQL, "array_contains(`f__all_tags`, 'foo bar')") || !strings.Contains(plan.HitsSQL, "LIKE lower('%hello%')") {
+		t.Fatalf("expected array_contains on multi-valued keyword and LIKE on unmapped dynamic field, got:\n%s", plan.HitsSQL)
+	}
+	// F4 & F5: nested script pushdown and direct nested script-only metric sub-agg
+	if !strings.Contains(plan.AggsSQL, "script_sum") || !strings.Contains(plan.AggsSQL, "nested_comp") {
+		t.Fatalf("expected script_sum and nested_comp in AggsSQL, got:\n%s", plan.AggsSQL)
+	}
+	// F6: array sort with explicit type: double casts array elements to DOUBLE
+	if !strings.Contains(plan.HitsSQL, "AS DOUBLE") {
+		t.Fatalf("expected AS DOUBLE for array sort with explicit type:double, got:\n%s", plan.HitsSQL)
+	}
+	// F8: *^3.5 boost and exact~0 (no fuzzy expansion despite fuzziness:AUTO)
+	if !strings.Contains(plan.HitsSQL, "3.5000") || strings.Contains(plan.HitsSQL, "%e%x%a%c%t%") {
+		t.Fatalf("expected *^3.5 boost and exact~0 exact match in HitsSQL, got:\n%s", plan.HitsSQL)
+	}
+	// F10: nested sort mode median with filter uses array_median(array_map(..., array_filter(...)))
+	if !strings.Contains(plan.HitsSQL, "array_median(") || !strings.Contains(plan.HitsSQL, "array_filter(") {
+		t.Fatalf("expected array_median with array_filter for filtered nested sort in HitsSQL, got:\n%s", plan.HitsSQL)
+	}
+}

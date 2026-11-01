@@ -41,29 +41,97 @@ func NextAutoID() string {
 
 // SearchRequest models an Elasticsearch / OpenSearch `/_search` request payload.
 type SearchRequest struct {
-	Query          *Query             `json:"query,omitempty"`
-	AliasFilter    *Query             `json:"-"`
-	KNN            KNNSlice           `json:"knn,omitempty"`
-	PostFilter     *Query             `json:"post_filter,omitempty"`
-	From           *int               `json:"from,omitempty"`
-	Size           *int               `json:"size,omitempty"`
-	TerminateAfter *int               `json:"terminate_after,omitempty"`
-	MinScore       *float64           `json:"min_score,omitempty"`
-	Aggs           map[string]AggSpec `json:"aggs,omitempty"`
-	Aggregations   map[string]AggSpec `json:"aggregations,omitempty"`
-	Sort           SortSlice          `json:"sort,omitempty"`
-	SearchAfter    []any              `json:"search_after,omitempty"`
-	Source         *SourceFilter      `json:"_source,omitempty"`
-	TrackTotalHits any                `json:"track_total_hits,omitempty"`
-	TrackScores    *bool              `json:"track_scores,omitempty"`
-	Highlight      *HighlightSpec     `json:"highlight,omitempty"`
-	Collapse       *CollapseSpec      `json:"collapse,omitempty"`
-	Rescore        RescoreSlice       `json:"rescore,omitempty"`
-	PIT            *PITSpec           `json:"pit,omitempty"`
-	Fields         []FieldRequestSpec `json:"fields,omitempty"`
-	DocvalueFields []FieldRequestSpec `json:"docvalue_fields,omitempty"`
-	StoredFields   any                `json:"stored_fields,omitempty"`
-	ScriptFields   map[string]any     `json:"script_fields,omitempty"`
+	Query          *Query                 `json:"query,omitempty"`
+	AliasFilter    *Query                 `json:"-"`
+	KNN            KNNSlice               `json:"knn,omitempty"`
+	PostFilter     *Query                 `json:"post_filter,omitempty"`
+	From           *int                   `json:"from,omitempty"`
+	Size           *int                   `json:"size,omitempty"`
+	TerminateAfter *int                   `json:"terminate_after,omitempty"`
+	MinScore       *float64               `json:"min_score,omitempty"`
+	Aggs           map[string]AggSpec     `json:"aggs,omitempty"`
+	Aggregations   map[string]AggSpec     `json:"aggregations,omitempty"`
+	Sort           SortSlice              `json:"sort,omitempty"`
+	SearchAfter    []any                  `json:"search_after,omitempty"`
+	Source         *SourceFilter          `json:"_source,omitempty"`
+	TrackTotalHits any                    `json:"track_total_hits,omitempty"`
+	TrackScores    *bool                  `json:"track_scores,omitempty"`
+	Highlight      *HighlightSpec         `json:"highlight,omitempty"`
+	Collapse       *CollapseSpec          `json:"collapse,omitempty"`
+	Rescore        RescoreSlice           `json:"rescore,omitempty"`
+	PIT            *PITSpec               `json:"pit,omitempty"`
+	Fields         []FieldRequestSpec     `json:"fields,omitempty"`
+	DocvalueFields []FieldRequestSpec     `json:"docvalue_fields,omitempty"`
+	StoredFields   any                    `json:"stored_fields,omitempty"`
+	ScriptFields   map[string]any         `json:"script_fields,omitempty"`
+	Suggest        map[string]SuggestSpec `json:"suggest,omitempty"`
+}
+
+// SuggestSpec models an entry in a search request `suggest` map (`term`, `phrase`, `completion`, or global `text`).
+type SuggestSpec struct {
+	Text       string                 `json:"text,omitempty"`
+	Prefix     string                 `json:"prefix,omitempty"`
+	Regex      string                 `json:"regex,omitempty"`
+	Term       *TermSuggestSpec       `json:"term,omitempty"`
+	Phrase     *PhraseSuggestSpec     `json:"phrase,omitempty"`
+	Completion *CompletionSuggestSpec `json:"completion,omitempty"`
+}
+
+func (ss *SuggestSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	if trimmed[0] == '"' {
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err != nil {
+			return err
+		}
+		ss.Text = s
+		return nil
+	}
+	type alias SuggestSpec
+	var a alias
+	if err := json.Unmarshal(trimmed, &a); err != nil {
+		return err
+	}
+	*ss = SuggestSpec(a)
+	return nil
+}
+
+// TermSuggestSpec models a `term` suggester configuration.
+type TermSuggestSpec struct {
+	Field          string `json:"field"`
+	Size           int    `json:"size,omitempty"`
+	SuggestMode    string `json:"suggest_mode,omitempty"`
+	MaxEdits       int    `json:"max_edits,omitempty"`
+	PrefixLength   int    `json:"prefix_length,omitempty"`
+	MinWordLength  int    `json:"min_word_length,omitempty"`
+	MinDocFreq     int    `json:"min_doc_freq,omitempty"`
+	StringDistance string `json:"string_distance,omitempty"`
+	Sort           string `json:"sort,omitempty"`
+}
+
+// PhraseSuggestSpec models a `phrase` suggester configuration.
+type PhraseSuggestSpec struct {
+	Field     string               `json:"field"`
+	Size      int                  `json:"size,omitempty"`
+	MaxErrors float64              `json:"max_errors,omitempty"`
+	Highlight *PhraseHighlightSpec `json:"highlight,omitempty"`
+}
+
+// PhraseHighlightSpec models `highlight` options on a `phrase` suggester.
+type PhraseHighlightSpec struct {
+	PreTag  string `json:"pre_tag,omitempty"`
+	PostTag string `json:"post_tag,omitempty"`
+}
+
+// CompletionSuggestSpec models a `completion` suggester configuration.
+type CompletionSuggestSpec struct {
+	Field          string         `json:"field"`
+	Size           int            `json:"size,omitempty"`
+	SkipDuplicates bool           `json:"skip_duplicates,omitempty"`
+	Fuzzy          map[string]any `json:"fuzzy,omitempty"`
 }
 
 // StoredFieldsSlice normalizes a `stored_fields` value (string or []string) into a slice of field names.
@@ -1072,6 +1140,7 @@ type QueryStringQuery struct {
 	DefaultField                    string   `json:"default_field,omitempty"`
 	Fields                          []string `json:"fields,omitempty"`
 	DefaultOperator                 string   `json:"default_operator,omitempty"`
+	Operator                        string   `json:"operator,omitempty"`
 	MinimumShouldMatch              any      `json:"minimum_should_match,omitempty"`
 	QuoteFieldSuffix                string   `json:"quote_field_suffix,omitempty"`
 	Flags                           string   `json:"flags,omitempty"`

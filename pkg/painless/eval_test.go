@@ -978,3 +978,105 @@ func TestRound32PainlessControlFlowStreamsConstantsAndUpdateNoop(t *testing.T) {
 		t.Fatalf("expected created '{}' for empty doc_as_upsert on missing doc, got op=%s body=%s err=%v", op22b, string(created22b), err)
 	}
 }
+
+func TestRound33PainlessHardening(t *testing.T) {
+	// F17: Postfix ++ / -- on LHS of binary + / - arithmetic (x++ + 10, y-- - 2)
+	// F18: Collection constructors with generics (new ArrayList<>(), new HashMap<String, Object>()) and copy constructors (new ArrayList(list), new HashSet(list), new HashMap(map))
+	// F19: switch / case / default / break statement support (including fallthrough)
+	// F20: while and do-while loops block-scoped local variable declarations (do not leak into outer scope)
+	// F21: ctx._source alias synchronization on +=, .put(), .putAll(), and ++/--
+	res, _, err := ApplyUpdateWithResult(
+		json.RawMessage(`{"items":[10,20,10],"tags":["a"],"meta":{"k1":"v1"},"counter":5,"tier":"silver"}`),
+		&UpdateRequest{
+			Script: &ScriptSpec{
+				Source: `
+					// F17: Postfix ++/-- on LHS of binary +/-
+					int x = 5;
+					int postAdd = x++ + 10;
+					int y = 8;
+					int postSub = y-- - 3;
+
+					// F18: Generic diamond constructors & copy/dedup constructors
+					List genList = new ArrayList<>();
+					genList.add('first');
+					List copiedList = new ArrayList(ctx._source.items);
+					Set dedupSet = new HashSet(ctx._source.items);
+					Map copiedMap = new HashMap(ctx._source.meta);
+					copiedMap.put('k2', 'v2');
+
+					// F19: switch / case / default / break + fallthrough
+					int bonus = 0;
+					switch (ctx._source.tier) {
+						case 'bronze':
+							bonus = 10;
+							break;
+						case 'silver':
+							bonus += 20;
+						case 'gold':
+							bonus += 30;
+							break;
+						default:
+							bonus = 1;
+					}
+
+					// F20: while and do-while block-scoped variable declarations do not leak
+					int wCount = 0;
+					while (wCount < 2) {
+						int innerVar = 99;
+						wCount += 1;
+					}
+					int dwCount = 0;
+					do {
+						int innerDoVar = 77;
+						dwCount += 1;
+					} while (dwCount < 2);
+
+					// F21: ctx._source alias synchronization on +=, .put(), .putAll(), ++
+					def tagsAlias = ctx._source.tags;
+					ctx._source.tags += ['b'];
+					int aliasLenAfterPlusEq = tagsAlias.size();
+					def metaAlias = ctx._source.meta;
+					ctx._source.meta.put('k3', 'v3');
+					ctx._source.counter++;
+
+					ctx._source.post_add = postAdd;
+					ctx._source.x_after = x;
+					ctx._source.post_sub = postSub;
+					ctx._source.y_after = y;
+					ctx._source.gen_size = genList.size();
+					ctx._source.copied_size = copiedList.size();
+					ctx._source.dedup_size = dedupSet.size();
+					ctx._source.copied_map_k2 = copiedMap['k2'];
+					ctx._source.bonus = bonus;
+					ctx._source.w_count = wCount;
+					ctx._source.dw_count = dwCount;
+					ctx._source.alias_len = aliasLenAfterPlusEq;
+					ctx._source.meta_k3 = metaAlias['k3'];
+				`,
+			},
+		},
+		true,
+	)
+	if err != nil {
+		t.Fatalf("TestRound33PainlessHardening failed: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(res, &doc); err != nil {
+		t.Fatalf("unmarshal result failed: %v", err)
+	}
+	if doc["post_add"] != float64(15) || doc["x_after"] != float64(6) || doc["post_sub"] != float64(5) || doc["y_after"] != float64(7) {
+		t.Fatalf("F17 assertions failed: %+v", doc)
+	}
+	if doc["gen_size"] != float64(1) || doc["copied_size"] != float64(3) || doc["dedup_size"] != float64(2) || doc["copied_map_k2"] != "v2" {
+		t.Fatalf("F18 assertions failed: %+v", doc)
+	}
+	if doc["bonus"] != float64(50) {
+		t.Fatalf("F19 switch assertions failed (expected fallthrough 20+30=50): %+v", doc)
+	}
+	if doc["w_count"] != float64(2) || doc["dw_count"] != float64(2) || doc["innerVar"] != nil || doc["innerDoVar"] != nil {
+		t.Fatalf("F20 loop scoping assertions failed: %+v", doc)
+	}
+	if doc["alias_len"] != float64(2) || doc["meta_k3"] != "v3" || doc["counter"] != float64(6) {
+		t.Fatalf("F21 ctx._source alias sync assertions failed: %+v", doc)
+	}
+}

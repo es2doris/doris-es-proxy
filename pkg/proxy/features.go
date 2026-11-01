@@ -45,6 +45,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
 	"github.com/es2doris/doris-es-proxy/pkg/painless"
@@ -1952,6 +1953,13 @@ func ingestValuesEqual(a, b any) bool {
 	return reflect.DeepEqual(a, b)
 }
 
+func expandIngestFieldName(raw string, doc map[string]any) string {
+	if strings.Contains(raw, "{{") {
+		return fmt.Sprintf("%v", expandIngestTemplate(raw, doc))
+	}
+	return raw
+}
+
 func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string]any, depth int, trace *[]map[string]any) (mutated bool, dropped bool, procType string, procTag string, specMap map[string]any, procErr error) {
 	if topIf, ok := pMap["if"].(string); ok && !evalIngestIfCondition(topIf, doc) {
 		return false, false, "", "", nil, nil
@@ -2062,6 +2070,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		return subMut, subDropped, procType, procTag, specMap, subErr
 	case "dissect":
 		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
 		pattern, _ := specMap["pattern"].(string)
 		appendSep, _ := specMap["append_separator"].(string)
 		if field != "" && pattern != "" {
@@ -2082,6 +2091,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				return false, false, procType, procTag, specMap, err
 			}
 			targetField, _ := specMap["target_field"].(string)
+			targetField = expandIngestFieldName(targetField, doc)
 			if targetField != "" {
 				if existing, ok := getIngestPath(doc, targetField); !ok || existing == nil {
 					setIngestPath(doc, targetField, map[string]any{})
@@ -2269,9 +2279,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "lowercase":
 		if field, _ := specMap["field"].(string); field != "" {
+			field = expandIngestFieldName(field, doc)
 			target := field
 			if tf, _ := specMap["target_field"].(string); tf != "" {
-				target = tf
+				target = expandIngestFieldName(tf, doc)
 			}
 			if val, ok := getIngestPath(doc, field); ok && val != nil {
 				switch v := val.(type) {
@@ -2298,9 +2309,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "uppercase":
 		if field, _ := specMap["field"].(string); field != "" {
+			field = expandIngestFieldName(field, doc)
 			target := field
 			if tf, _ := specMap["target_field"].(string); tf != "" {
-				target = tf
+				target = expandIngestFieldName(tf, doc)
 			}
 			if val, ok := getIngestPath(doc, field); ok && val != nil {
 				switch v := val.(type) {
@@ -2327,9 +2339,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "trim":
 		if field, _ := specMap["field"].(string); field != "" {
+			field = expandIngestFieldName(field, doc)
 			target := field
 			if tf, _ := specMap["target_field"].(string); tf != "" {
-				target = tf
+				target = expandIngestFieldName(tf, doc)
 			}
 			if val, ok := getIngestPath(doc, field); ok && val != nil {
 				switch v := val.(type) {
@@ -2356,10 +2369,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "split":
 		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
 		sep, _ := specMap["separator"].(string)
 		target := field
 		if tf, _ := specMap["target_field"].(string); tf != "" {
-			target = tf
+			target = expandIngestFieldName(tf, doc)
 		}
 		preserveTrailing, _ := specMap["preserve_trailing"].(bool)
 		if field != "" && sep != "" {
@@ -2393,10 +2407,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "join":
 		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
 		sep, _ := specMap["separator"].(string)
 		target := field
 		if tf, _ := specMap["target_field"].(string); tf != "" {
-			target = tf
+			target = expandIngestFieldName(tf, doc)
 		}
 		if field != "" {
 			if val, ok := getIngestPath(doc, field); ok && val != nil {
@@ -2416,6 +2431,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "append":
 		if field, _ := specMap["field"].(string); field != "" {
+			field = expandIngestFieldName(field, doc)
 			allowDups := true
 			if ad, hasAD := specMap["allow_duplicates"].(bool); hasAD {
 				allowDups = ad
@@ -2434,31 +2450,49 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			} else if v, hasV := specMap["value"]; hasV {
 				toAdd = []any{v}
 			}
-			for _, item := range toAdd {
-				expanded := deepCloneIngestValue(expandIngestTemplate(item, doc))
+			appendSingleItem := func(val any) {
 				if !allowDups {
-					dup := false
 					for _, ex := range curSlice {
-						if ingestValuesEqual(ex, expanded) {
-							dup = true
-							break
+						if ingestValuesEqual(ex, val) {
+							return
 						}
 					}
-					if dup {
-						continue
+				}
+				curSlice = append(curSlice, val)
+			}
+			for _, item := range toAdd {
+				if s, ok := item.(string); ok {
+					trimmedT := strings.TrimSpace(s)
+					var tplKey string
+					if strings.HasPrefix(trimmedT, "{{{") && strings.HasSuffix(trimmedT, "}}}") && !strings.Contains(trimmedT[3:len(trimmedT)-3], "{{") {
+						tplKey = strings.TrimPrefix(strings.TrimSpace(trimmedT[3:len(trimmedT)-3]), "_source.")
+					} else if strings.HasPrefix(trimmedT, "{{") && strings.HasSuffix(trimmedT, "}}") && !strings.Contains(trimmedT[2:len(trimmedT)-2], "{{") {
+						tplKey = strings.TrimPrefix(strings.TrimSpace(trimmedT[2:len(trimmedT)-2]), "_source.")
+					}
+					if tplKey != "" {
+						if rawV, exists := getIngestPath(doc, tplKey); exists {
+							if expSlice, okSlice := rawV.([]any); okSlice {
+								for _, el := range expSlice {
+									appendSingleItem(deepCloneIngestValue(el))
+								}
+								continue
+							}
+						}
 					}
 				}
-				curSlice = append(curSlice, expanded)
+				expanded := deepCloneIngestValue(expandIngestTemplate(item, doc))
+				appendSingleItem(expanded)
 			}
 			setIngestPath(doc, field, curSlice)
 			mutated = true
 		}
 	case "convert":
 		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
 		convType, _ := specMap["type"].(string)
 		target := field
 		if tf, _ := specMap["target_field"].(string); tf != "" {
-			target = tf
+			target = expandIngestFieldName(tf, doc)
 		}
 		if field != "" && convType != "" {
 			val, exists := getIngestPath(doc, field)
@@ -2533,9 +2567,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "json":
 		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
 		target := field
 		if tf, _ := specMap["target_field"].(string); tf != "" {
-			target = tf
+			target = expandIngestFieldName(tf, doc)
 		}
 		addToRoot, _ := specMap["add_to_root"].(bool)
 		conflictStrategy, _ := specMap["add_to_root_conflict_strategy"].(string)
@@ -2595,10 +2630,13 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "kv":
 		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
 		fieldSplit, _ := specMap["field_split"].(string)
 		valueSplit, _ := specMap["value_split"].(string)
 		targetField, _ := specMap["target_field"].(string)
+		targetField = expandIngestFieldName(targetField, doc)
 		prefix, _ := specMap["prefix"].(string)
+		prefix = expandIngestFieldName(prefix, doc)
 		trimKey, _ := specMap["trim_key"].(string)
 		trimVal, _ := specMap["trim_value"].(string)
 		stripBrackets, _ := specMap["strip_brackets"].(bool)
@@ -2866,9 +2904,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "urldecode":
 		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
 		target := field
 		if tf, _ := specMap["target_field"].(string); tf != "" {
-			target = tf
+			target = expandIngestFieldName(tf, doc)
 		}
 		if field != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
@@ -2904,9 +2943,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "bytes":
 		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
 		target := field
 		if tf, _ := specMap["target_field"].(string); tf != "" {
-			target = tf
+			target = expandIngestFieldName(tf, doc)
 		}
 		if field != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
@@ -2935,9 +2975,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "html_strip":
 		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
 		target := field
 		if tf, _ := specMap["target_field"].(string); tf != "" {
-			target = tf
+			target = expandIngestFieldName(tf, doc)
 		}
 		if field != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
@@ -2965,9 +3006,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "date":
 		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
 		target := "@timestamp"
 		if tf, _ := specMap["target_field"].(string); tf != "" {
-			target = tf
+			target = expandIngestFieldName(tf, doc)
 		}
 		formats, _ := specMap["formats"].([]any)
 		tzName, _ := specMap["timezone"].(string)
@@ -3052,7 +3094,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				layouts := convertESDateFormatToGoLayouts(idxFmt)
 				target := "_index"
 				if tf, _ := specMap["target_field"].(string); tf != "" {
-					target = tf
+					target = expandIngestFieldName(tf, doc)
 				}
 				setIngestPath(doc, target, prefix+parsedTime.Format(layouts[0]))
 				mutated = true
@@ -3062,9 +3104,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "grok":
 		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
 		patterns, _ := specMap["patterns"].([]any)
 		customDefs, _ := specMap["pattern_definitions"].(map[string]any)
 		targetField, _ := specMap["target_field"].(string)
+		targetField = expandIngestFieldName(targetField, doc)
 		if field != "" && len(patterns) > 0 {
 			val, exists := getIngestPath(doc, field)
 			if !exists || val == nil {
@@ -3121,9 +3165,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "sort":
 		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
 		target := field
 		if tf, _ := specMap["target_field"].(string); tf != "" {
-			target = tf
+			target = expandIngestFieldName(tf, doc)
 		}
 		order, _ := specMap["order"].(string)
 		desc := strings.EqualFold(order, "desc")
@@ -3150,9 +3195,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "compact":
 		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
 		target := field
 		if tf, _ := specMap["target_field"].(string); tf != "" {
-			target = tf
+			target = expandIngestFieldName(tf, doc)
 		}
 		if field != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
@@ -3192,7 +3238,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		fieldsAny, _ := specMap["fields"].([]any)
 		target := "fingerprint"
 		if tf, _ := specMap["target_field"].(string); tf != "" {
-			target = tf
+			target = expandIngestFieldName(tf, doc)
 		}
 		method, _ := specMap["method"].(string)
 		salt, _ := specMap["salt"].(string)
@@ -3200,7 +3246,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			var fields []string
 			for _, f := range fieldsAny {
 				if fs, ok := f.(string); ok && fs != "" {
-					fields = append(fields, fs)
+					fields = append(fields, expandIngestFieldName(fs, doc))
 				}
 			}
 			sort.Strings(fields)
@@ -3240,6 +3286,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "redact":
 		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
 		patterns, _ := specMap["patterns"].([]any)
 		customDefs, _ := specMap["pattern_definitions"].(map[string]any)
 		prefix := "<"
@@ -3322,9 +3369,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "attachment":
 		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
 		target := "attachment"
 		if tf, _ := specMap["target_field"].(string); tf != "" {
-			target = tf
+			target = expandIngestFieldName(tf, doc)
 		}
 		removeBinary, _ := specMap["remove_binary"].(bool)
 		indexedChars := -1
@@ -3367,6 +3415,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "csv":
 		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
 		targetFields, _ := specMap["target_fields"].([]any)
 		sepStr, _ := specMap["separator"].(string)
 		quoteStr, _ := specMap["quote"].(string)
@@ -3380,18 +3429,36 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 				}
 				if strings.TrimSpace(strVal) == "" {
-					if !ignoreMissing && strVal == "" && !hasEmptyVal {
+					if hasEmptyVal {
+						for _, tfAny := range targetFields {
+							if tfName, ok := tfAny.(string); ok && tfName != "" {
+								tfName = expandIngestFieldName(tfName, doc)
+								setIngestPath(doc, tfName, emptyVal)
+							}
+						}
+						mutated = true
+						return mutated, false, procType, procTag, specMap, nil
+					}
+					if !ignoreMissing && strVal == "" {
 						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is empty", field)
 					}
 					return false, false, procType, procTag, specMap, nil
 				}
 				comma := ','
 				if len(sepStr) > 0 {
-					comma = rune(sepStr[0])
+					if r, sz := utf8.DecodeRuneInString(sepStr); sz > 0 && r != utf8.RuneError {
+						comma = r
+					} else {
+						comma = rune(sepStr[0])
+					}
 				}
 				customQuote := rune(0)
-				if len(quoteStr) > 0 && quoteStr[0] != '"' {
-					customQuote = rune(quoteStr[0])
+				if len(quoteStr) > 0 && quoteStr != `"` {
+					if r, sz := utf8.DecodeRuneInString(quoteStr); sz > 0 && r != utf8.RuneError {
+						customQuote = r
+					} else {
+						customQuote = rune(quoteStr[0])
+					}
 					strVal = strings.Map(func(r rune) rune {
 						switch r {
 						case customQuote:
@@ -3434,6 +3501,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					if !ok || tfName == "" {
 						continue
 					}
+					tfName = expandIngestFieldName(tfName, doc)
 					var cell string
 					if idx < len(record) {
 						cell = record[idx]
@@ -3456,9 +3524,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "user_agent":
 		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
 		target := "user_agent"
 		if tf, _ := specMap["target_field"].(string); tf != "" {
-			target = tf
+			target = expandIngestFieldName(tf, doc)
 		}
 		if field != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
@@ -3501,9 +3570,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "uri_parts":
 		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
 		target := "url"
 		if tf, _ := specMap["target_field"].(string); tf != "" {
-			target = tf
+			target = expandIngestFieldName(tf, doc)
 		}
 		keepOrig := true
 		if ko, hasKO := specMap["keep_original"].(bool); hasKO {
@@ -3563,9 +3633,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "registered_domain":
 		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
 		target := field
 		if tf, _ := specMap["target_field"].(string); tf != "" {
-			target = tf
+			target = expandIngestFieldName(tf, doc)
 		}
 		if field != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
@@ -3627,6 +3698,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "foreach":
 		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
 		var subProcs []any
 		if subProc, ok := specMap["processor"].(map[string]any); ok && subProc != nil {
 			subProcs = []any{subProc}
@@ -4565,6 +4637,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 			Query  *esast.Query        `json:"query,omitempty"`
 			Size   *int                `json:"size,omitempty"`
 			Source *esast.SourceFilter `json:"_source,omitempty"`
+			Sort   esast.SortSlice     `json:"sort,omitempty"`
 		} `json:"source"`
 		Dest struct {
 			Index       string `json:"index"`
@@ -4663,13 +4736,104 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.resolveTermsLookupsInQuery(r.Context(), body.Source.Query)
-	for _, srcIdx := range srcTargets {
-		srcSchema := s.getOrCompileReadOnlySchema(r.Context(), srcIdx)
-		_ = s.coalescer.FlushTable(r.Context(), srcSchema.DorisTable)
-		tr := transpiler.NewTranspiler(srcSchema, s.transpileOpts)
+	var effSort esast.SortSlice
+	if len(body.Source.Sort) > 0 {
+		effSort = append(effSort, body.Source.Sort...)
+		hasIDTie := false
+		for _, sp := range effSort {
+			if sp.Entry.Field == "_id" {
+				hasIDTie = true
+				break
+			}
+		}
+		if !hasIDTie {
+			effSort = append(effSort, esast.SortSpec{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}})
+		}
+	} else {
+		effSort = esast.SortSlice{{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}}}
+	}
+
+	useGlobalSort := len(body.Source.Sort) > 0 && (len(srcTargets) > 1 || sortsHaveScript(effSort))
+	var globalSortedHits []HitRow
+	loopTargets := srcTargets
+	if useGlobalSort {
+		for _, srcIdx := range srcTargets {
+			srcSchema := s.getOrCompileReadOnlySchema(r.Context(), srcIdx)
+			_ = s.coalescer.FlushTable(r.Context(), srcSchema.DorisTable)
+			tr := transpiler.NewTranspiler(srcSchema, s.transpileOpts)
+			effQuery := combineQueryWithAliasFilter(body.Source.Query, aliasFilters[srcIdx])
+			hasRuntimeQueryScript := queryHasRuntimeScript(effQuery)
+			var sa []any
+			chunkSz := 1000
+			for {
+				plan, err := tr.BuildSearchPlan(&esast.SearchRequest{
+					Query:          effQuery,
+					Size:           &chunkSz,
+					TrackTotalHits: false,
+					Sort:           esast.SortSlice{{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}}},
+					SearchAfter:    sa,
+				})
+				if err != nil {
+					writeESError(w, http.StatusBadRequest, "search_phase_execution_exception", err.Error())
+					return
+				}
+				hRows, err := s.backend.QueryHits(r.Context(), plan.HitsSQL)
+				if err != nil {
+					writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
+					return
+				}
+				if len(hRows) == 0 {
+					break
+				}
+				for _, h := range hRows {
+					if hasRuntimeQueryScript {
+						var rawMap map[string]any
+						dec := json.NewDecoder(bytes.NewReader(h.Source))
+						dec.UseNumber()
+						_ = dec.Decode(&rawMap)
+						if rawMap == nil {
+							rawMap = make(map[string]any)
+						}
+						if !evalQueryScriptFilterOnDocWithSchema(srcSchema, rawMap, effQuery) {
+							continue
+						}
+					}
+					h.Index = srcIdx
+					h.Schema = srcSchema
+					globalSortedHits = append(globalSortedHits, h)
+				}
+				sa = []any{hRows[len(hRows)-1].ID}
+				if len(hRows) < chunkSz {
+					break
+				}
+			}
+		}
+		sort.SliceStable(globalSortedHits, func(i, j int) bool {
+			if cmp := compareHitRowsBySortWithSchemas(globalSortedHits[i], globalSortedHits[j], effSort, globalSortedHits[i].Schema, globalSortedHits[j].Schema); cmp != 0 {
+				return cmp < 0
+			}
+			return globalSortedHits[i].ID < globalSortedHits[j].ID
+		})
+		if len(globalSortedHits) > 0 {
+			loopTargets = []string{"__global_sorted__"}
+		} else {
+			loopTargets = nil
+		}
+	}
+
+	for _, srcIdx := range loopTargets {
+		var srcSchema *schema.IndexSchema
+		var tr *transpiler.Transpiler
 		var searchAfter []any
-		effQuery := combineQueryWithAliasFilter(body.Source.Query, aliasFilters[srcIdx])
-		hasRuntimeQueryScript := queryHasRuntimeScript(effQuery)
+		var effQuery *esast.Query
+		var hasRuntimeQueryScript bool
+		if !useGlobalSort {
+			srcSchema = s.getOrCompileReadOnlySchema(r.Context(), srcIdx)
+			_ = s.coalescer.FlushTable(r.Context(), srcSchema.DorisTable)
+			tr = transpiler.NewTranspiler(srcSchema, s.transpileOpts)
+			effQuery = combineQueryWithAliasFilter(body.Source.Query, aliasFilters[srcIdx])
+			hasRuntimeQueryScript = queryHasRuntimeScript(effQuery)
+		}
 
 		for {
 			fetchSize := batchSize
@@ -4679,24 +4843,37 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 			if fetchSize <= 0 || (maxDocs > 0 && totalMatched >= maxDocs) {
 				break
 			}
-			plan, err := tr.BuildSearchPlan(&esast.SearchRequest{
-				Query:          effQuery,
-				Size:           &fetchSize,
-				TrackTotalHits: false,
-				Sort:           esast.SortSlice{{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}}},
-				SearchAfter:    searchAfter,
-			})
-			if err != nil {
-				writeESError(w, http.StatusBadRequest, "search_phase_execution_exception", err.Error())
-				return
-			}
-			hits, err := s.backend.QueryHits(r.Context(), plan.HitsSQL)
-			if err != nil {
-				writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
-				return
-			}
-			if len(hits) == 0 {
-				break
+			var hits []HitRow
+			if useGlobalSort {
+				if len(globalSortedHits) == 0 {
+					break
+				}
+				take := fetchSize
+				if take > len(globalSortedHits) {
+					take = len(globalSortedHits)
+				}
+				hits = globalSortedHits[:take]
+				globalSortedHits = globalSortedHits[take:]
+			} else {
+				plan, err := tr.BuildSearchPlan(&esast.SearchRequest{
+					Query:          effQuery,
+					Size:           &fetchSize,
+					TrackTotalHits: false,
+					Sort:           effSort,
+					SearchAfter:    searchAfter,
+				})
+				if err != nil {
+					writeESError(w, http.StatusBadRequest, "search_phase_execution_exception", err.Error())
+					return
+				}
+				hits, err = s.backend.QueryHits(r.Context(), plan.HitsSQL)
+				if err != nil {
+					writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
+					return
+				}
+				if len(hits) == 0 {
+					break
+				}
 			}
 			batches++
 			type preparedDoc struct {
@@ -4757,6 +4934,9 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 							scriptInput = b
 						}
 					}
+					updSpec.MetaID = docID
+					updSpec.MetaIndex = docDestIdx
+					updSpec.MetaVersion = docSrcVer
 					mutated, opRes, err := painless.ApplyUpdateWithResult(scriptInput, updSpec, true)
 					if err != nil {
 						writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
@@ -4855,7 +5035,13 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				sampleDocsByIdx[docDestIdx] = append(sampleDocsByIdx[docDestIdx], docSource)
 			}
 			if len(prepared) == 0 {
-				searchAfter = []any{hits[len(hits)-1].ID}
+				if !useGlobalSort {
+					nextSA := extractHitSortValues(hits[len(hits)-1], effSort, srcSchema)
+					if len(nextSA) == 0 {
+						nextSA = []any{hits[len(hits)-1].ID}
+					}
+					searchAfter = nextSA
+				}
 				if len(hits) < fetchSize || (maxDocs > 0 && totalMatched >= maxDocs) {
 					break
 				}
@@ -4985,7 +5171,13 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			searchAfter = []any{hits[len(hits)-1].ID}
+			if !useGlobalSort {
+				nextSA := extractHitSortValues(hits[len(hits)-1], effSort, srcSchema)
+				if len(nextSA) == 0 {
+					nextSA = []any{hits[len(hits)-1].ID}
+				}
+				searchAfter = nextSA
+			}
 			if len(hits) < fetchSize || (maxDocs > 0 && totalMatched >= maxDocs) {
 				break
 			}
@@ -5027,20 +5219,26 @@ func rewriteReindexMetaScript(src string) (string, bool) {
 		{"ctx?._id", "ctx._source.__reindex_id", true},
 		{"ctx._id", "ctx._source.__reindex_id", true},
 		{"ctx?.['_id']", "ctx._source.__reindex_id", false},
+		{"ctx?['_id']", "ctx._source.__reindex_id", false},
 		{"ctx['_id']", "ctx._source.__reindex_id", false},
 		{`ctx?.["_id"]`, "ctx._source.__reindex_id", false},
+		{`ctx?["_id"]`, "ctx._source.__reindex_id", false},
 		{`ctx["_id"]`, "ctx._source.__reindex_id", false},
 		{"ctx?._index", "ctx._source.__reindex_index", true},
 		{"ctx._index", "ctx._source.__reindex_index", true},
 		{"ctx?.['_index']", "ctx._source.__reindex_index", false},
+		{"ctx?['_index']", "ctx._source.__reindex_index", false},
 		{"ctx['_index']", "ctx._source.__reindex_index", false},
 		{`ctx?.["_index"]`, "ctx._source.__reindex_index", false},
+		{`ctx?["_index"]`, "ctx._source.__reindex_index", false},
 		{`ctx["_index"]`, "ctx._source.__reindex_index", false},
 		{"ctx?._version", "ctx._source.__reindex_version", true},
 		{"ctx._version", "ctx._source.__reindex_version", true},
 		{"ctx?.['_version']", "ctx._source.__reindex_version", false},
+		{"ctx?['_version']", "ctx._source.__reindex_version", false},
 		{"ctx['_version']", "ctx._source.__reindex_version", false},
 		{`ctx?.["_version"]`, "ctx._source.__reindex_version", false},
+		{`ctx?["_version"]`, "ctx._source.__reindex_version", false},
 		{`ctx["_version"]`, "ctx._source.__reindex_version", false},
 	}
 	var out strings.Builder
@@ -5085,6 +5283,13 @@ func rewriteReindexMetaScript(src string) (string, bool) {
 				out.WriteString(src[i : i+2+end+2])
 				i += 2 + end + 1
 				continue
+			}
+			if isRegexStartContext(src, i) {
+				if endSlash := scanRegexLiteralEnd(src, i); endSlash > i {
+					out.WriteString(src[i : endSlash+1])
+					i = endSlash
+					continue
+				}
 			}
 		}
 		if (i == 0 || (!isIngestIdentByte(src[i-1]) && src[i-1] != '.')) && strings.HasPrefix(src[i:], "ctx") {
@@ -6148,18 +6353,19 @@ func isIPInNetworkDirectionNets(ip net.IP, nets []string) bool {
 func executeNetworkDirectionProcessor(doc map[string]any, specMap map[string]any) (bool, error) {
 	srcField := "source.ip"
 	if sf, _ := specMap["source_ip"].(string); sf != "" {
-		srcField = sf
+		srcField = expandIngestFieldName(sf, doc)
 	}
 	dstField := "destination.ip"
 	if df, _ := specMap["destination_ip"].(string); df != "" {
-		dstField = df
+		dstField = expandIngestFieldName(df, doc)
 	}
 	target := "network.direction"
 	if tf, _ := specMap["target_field"].(string); tf != "" {
-		target = tf
+		target = expandIngestFieldName(tf, doc)
 	}
 	var nets []string
 	if netsField, _ := specMap["internal_networks_field"].(string); netsField != "" {
+		netsField = expandIngestFieldName(netsField, doc)
 		if nfVal, ok := getIngestPath(doc, netsField); ok && nfVal != nil {
 			switch tv := nfVal.(type) {
 			case []any:
@@ -6214,39 +6420,39 @@ func executeNetworkDirectionProcessor(doc map[string]any, specMap map[string]any
 func executeCommunityIDProcessor(doc map[string]any, specMap map[string]any) (bool, error) {
 	srcIPField := "source.ip"
 	if v, _ := specMap["source_ip"].(string); v != "" {
-		srcIPField = v
+		srcIPField = expandIngestFieldName(v, doc)
 	}
 	dstIPField := "destination.ip"
 	if v, _ := specMap["destination_ip"].(string); v != "" {
-		dstIPField = v
+		dstIPField = expandIngestFieldName(v, doc)
 	}
 	srcPortField := "source.port"
 	if v, _ := specMap["source_port"].(string); v != "" {
-		srcPortField = v
+		srcPortField = expandIngestFieldName(v, doc)
 	}
 	dstPortField := "destination.port"
 	if v, _ := specMap["destination_port"].(string); v != "" {
-		dstPortField = v
+		dstPortField = expandIngestFieldName(v, doc)
 	}
 	transportField := "network.transport"
 	if v, _ := specMap["transport"].(string); v != "" {
-		transportField = v
+		transportField = expandIngestFieldName(v, doc)
 	}
 	ianaField := "network.iana_number"
 	if v, _ := specMap["iana_number"].(string); v != "" {
-		ianaField = v
+		ianaField = expandIngestFieldName(v, doc)
 	}
 	icmpTypeField := "icmp.type"
 	if v, _ := specMap["icmp_type"].(string); v != "" {
-		icmpTypeField = v
+		icmpTypeField = expandIngestFieldName(v, doc)
 	}
 	icmpCodeField := "icmp.code"
 	if v, _ := specMap["icmp_code"].(string); v != "" {
-		icmpCodeField = v
+		icmpCodeField = expandIngestFieldName(v, doc)
 	}
 	target := "network.community_id"
 	if tf, _ := specMap["target_field"].(string); tf != "" {
-		target = tf
+		target = expandIngestFieldName(tf, doc)
 	}
 	var seed uint16
 	if sVal, ok := toInt64(specMap["seed"]); ok && sVal >= 0 && sVal <= 65535 {
@@ -6358,12 +6564,13 @@ func executeCommunityIDProcessor(doc map[string]any, specMap map[string]any) (bo
 
 func executeGeoIPProcessor(doc map[string]any, specMap map[string]any) (bool, error) {
 	field, _ := specMap["field"].(string)
+	field = expandIngestFieldName(field, doc)
 	if field == "" {
 		return false, nil
 	}
 	target := "geoip"
 	if tf, _ := specMap["target_field"].(string); tf != "" {
-		target = tf
+		target = expandIngestFieldName(tf, doc)
 	}
 	val, exists := getIngestPath(doc, field)
 	if !exists || val == nil {
@@ -6599,7 +6806,9 @@ func extractEnrichPolicyMeta(pol map[string]any) (indices []string, matchField s
 
 func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]any) (bool, error) {
 	field, _ := specMap["field"].(string)
+	field = expandIngestFieldName(field, doc)
 	target, _ := specMap["target_field"].(string)
+	target = expandIngestFieldName(target, doc)
 	if field == "" || target == "" {
 		return false, nil
 	}

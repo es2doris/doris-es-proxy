@@ -81,6 +81,9 @@ type FieldBinding struct {
 	NullValue          any
 	IgnoreAbove        int
 	AliasTarget        string
+	ScalingFactor      float64
+	Coerce             *bool
+	IgnoreMalformed    *bool
 }
 
 // EffectiveLowercase returns true if this field (or its `.keyword` companion when `preferKeyword` is true)
@@ -383,6 +386,15 @@ func DeepMergeMappingProperties(
 			if v.IgnoreAbove > 0 {
 				merged.IgnoreAbove = v.IgnoreAbove
 			}
+			if v.ScalingFactor > 0 {
+				merged.ScalingFactor = v.ScalingFactor
+			}
+			if v.Coerce != nil {
+				merged.Coerce = v.Coerce
+			}
+			if v.IgnoreMalformed != nil {
+				merged.IgnoreMalformed = v.IgnoreMalformed
+			}
 			if len(v.Properties) > 0 {
 				merged.Properties = DeepMergeMappingProperties(existing.Properties, v.Properties)
 			}
@@ -557,6 +569,9 @@ func (s *IndexSchema) registerLeafField(
 			CopyTo:              copyTo,
 			NullValue:           prop.NullValue,
 			IgnoreAbove:         prop.IgnoreAbove,
+			ScalingFactor:       prop.ScalingFactor,
+			Coerce:              prop.Coerce,
+			IgnoreMalformed:     prop.IgnoreMalformed,
 		}
 		return
 	}
@@ -597,6 +612,9 @@ func (s *IndexSchema) registerLeafField(
 			CopyTo:              copyTo,
 			NullValue:           prop.NullValue,
 			IgnoreAbove:         prop.IgnoreAbove,
+			ScalingFactor:       prop.ScalingFactor,
+			Coerce:              prop.Coerce,
+			IgnoreMalformed:     prop.IgnoreMalformed,
 		}
 		return
 	}
@@ -614,6 +632,9 @@ func (s *IndexSchema) registerLeafField(
 		CopyTo:              copyTo,
 		NullValue:           prop.NullValue,
 		IgnoreAbove:         prop.IgnoreAbove,
+		ScalingFactor:       prop.ScalingFactor,
+		Coerce:              prop.Coerce,
+		IgnoreMalformed:     prop.IgnoreMalformed,
 	}
 }
 
