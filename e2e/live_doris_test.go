@@ -1566,7 +1566,7 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 			"processors": [
 				{
 					"script": {
-						"source": "ctx.fallback = ctx.missing ?: 'ok'; ctx.re_ok = (ctx.code ==~ /^[A-Z]+-\d+$/); ctx.joined = ctx.tags.stream().collect(Collectors.joining(','));"
+						"source": "ctx.fallback = ctx.missing ?: 'ok'; ctx.re_ok = (ctx.code ==~ /^[A-Z]+-\\d+$/); ctx.joined = ctx.tags.stream().collect(Collectors.joining(','));"
 					}
 				},
 				{"sort": {"field": "tags", "order": "desc"}},

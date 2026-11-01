@@ -424,4 +424,29 @@ func TestRound33_IngestProcessorsReindexSortAndCtxMetadataMutations(t *testing.T
 	if csvDoc["upper_name"] != "HELLO" || len(csvDoc["tags"].([]any)) != 3 || csvDoc["col1"] != "N/A" || csvDoc["col2"] != "N/A" || csvDoc["u1"] != "left" || csvDoc["u2"] != "right" {
 		t.Fatalf("unexpected F22/F23 simulated doc: %+v", csvDoc)
 	}
+
+	code, e2eSim := doRound27Req(t, srv, http.MethodPost, "/_ingest/pipeline/_simulate", `{
+		"pipeline": {
+			"processors": [
+				{
+					"script": {
+						"source": "ctx.fallback = ctx.missing ?: 'ok'; ctx.re_ok = (ctx.code ==~ /^[A-Z]+-\\d+$/); ctx.joined = ctx.tags.stream().collect(Collectors.joining(','));"
+					}
+				},
+				{"sort": {"field": "tags", "order": "desc"}},
+				{"redact": {"field": "secret", "patterns": ["\\d{4}"]}},
+				{"fingerprint": {"fields": ["code"], "target_field": "fp"}}
+			]
+		},
+		"docs": [
+			{"_index": "live_auto_index", "_id": "r33-sim-1", "_source": {"code": "ORD-99", "tags": ["a", "b"], "secret": "pin 1234"}}
+		]
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 on e2e simulate payload, got %d: %+v", code, e2eSim)
+	}
+	e2eSimDoc := e2eSim["docs"].([]any)[0].(map[string]any)["doc"].(map[string]any)["_source"].(map[string]any)
+	if e2eSimDoc["fallback"] != "ok" || e2eSimDoc["re_ok"] != true || e2eSimDoc["joined"] != "a,b" || e2eSimDoc["secret"] != "pin <REDACTED>" || e2eSimDoc["fp"] == nil {
+		t.Fatalf("unexpected R33 e2e simulated doc: %+v", e2eSimDoc)
+	}
 }
