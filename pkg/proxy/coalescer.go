@@ -404,6 +404,22 @@ func containsNowDateMath(req *esast.SearchRequest, reqBytes []byte) bool {
 				return true
 			}
 		}
+		if req.Highlight != nil {
+			if queryContainsNow(req.Highlight.HighlightQuery) {
+				return true
+			}
+			for field := range req.Highlight.Fields {
+				spec := req.Highlight.FieldSpec(field)
+				if queryContainsNow(spec.HighlightQuery) {
+					return true
+				}
+			}
+		}
+		for i := range req.Sort {
+			if req.Sort[i].Entry.Nested != nil && queryContainsNow(req.Sort[i].Entry.Nested.Filter) {
+				return true
+			}
+		}
 	}
 	if len(reqBytes) > 0 {
 		lowerBytes := bytes.ToLower(reqBytes)
@@ -415,6 +431,9 @@ func containsNowDateMath(req *esast.SearchRequest, reqBytes []byte) bool {
 			[]byte(`||now`),
 			[]byte("to now]"),
 			[]byte("to now}"),
+			[]byte("to now-"),
+			[]byte("to now+"),
+			[]byte("to now/"),
 			[]byte("[now "),
 			[]byte("{now "),
 			[]byte("[now-"),
@@ -536,10 +555,16 @@ func queryContainsNow(q *esast.Query) bool {
 		return true
 	}
 	if q.FunctionScore != nil {
+		if q.FunctionScore.RandomScore != nil && q.FunctionScore.RandomScore.Seed == nil {
+			return true
+		}
 		if queryContainsNow(q.FunctionScore.Query) {
 			return true
 		}
 		for i := range q.FunctionScore.Functions {
+			if q.FunctionScore.Functions[i].RandomScore != nil && q.FunctionScore.Functions[i].RandomScore.Seed == nil {
+				return true
+			}
 			if queryContainsNow(q.FunctionScore.Functions[i].Filter) {
 				return true
 			}

@@ -764,19 +764,14 @@ func parseLuceneRangeToken(val string, boost float64) *esast.RangeCond {
 		incLower := strings.HasPrefix(val, "[")
 		incUpper := strings.HasSuffix(val, "]")
 		inner := strings.TrimSpace(val[1 : len(val)-1])
-		parts := strings.Split(inner, " TO ")
-		if len(parts) != 2 {
-			parts = strings.Split(inner, " to ")
-		}
-		if len(parts) == 2 {
-			lowerStr := unescapeLuceneToken(strings.Trim(strings.TrimSpace(parts[0]), `"`))
-			upperStr := unescapeLuceneToken(strings.Trim(strings.TrimSpace(parts[1]), `"`))
+		if rawLower, rawUpper, ok := splitLuceneRangeBounds(inner); ok {
 			rc := &esast.RangeCond{}
 			if boost != 1.0 {
 				b := boost
 				rc.Boost = &b
 			}
-			if lowerStr != "" && lowerStr != "*" {
+			if rawLower != "" && rawLower != "*" {
+				lowerStr := unescapeLuceneToken(strings.Trim(rawLower, `"`))
 				bound := parseLuceneRangeBound(lowerStr)
 				if incLower {
 					rc.GTE = bound
@@ -784,7 +779,8 @@ func parseLuceneRangeToken(val string, boost float64) *esast.RangeCond {
 					rc.GT = bound
 				}
 			}
-			if upperStr != "" && upperStr != "*" {
+			if rawUpper != "" && rawUpper != "*" {
+				upperStr := unescapeLuceneToken(strings.Trim(rawUpper, `"`))
 				bound := parseLuceneRangeBound(upperStr)
 				if incUpper {
 					rc.LTE = bound
@@ -796,6 +792,36 @@ func parseLuceneRangeToken(val string, boost float64) *esast.RangeCond {
 		}
 	}
 	return nil
+}
+
+func splitLuceneRangeBounds(inner string) (string, string, bool) {
+	inQuotes := false
+	for i := 0; i < len(inner); i++ {
+		ch := inner[i]
+		if ch == '\\' {
+			i++
+			continue
+		}
+		if ch == '"' {
+			inQuotes = !inQuotes
+			continue
+		}
+		if !inQuotes && i > 0 && (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') {
+			j := i
+			for j < len(inner) && (inner[j] == ' ' || inner[j] == '\t' || inner[j] == '\n' || inner[j] == '\r') {
+				j++
+			}
+			if j+2 < len(inner) && strings.EqualFold(inner[j:j+2], "TO") &&
+				(inner[j+2] == ' ' || inner[j+2] == '\t' || inner[j+2] == '\n' || inner[j+2] == '\r') {
+				k := j + 2
+				for k < len(inner) && (inner[k] == ' ' || inner[k] == '\t' || inner[k] == '\n' || inner[k] == '\r') {
+					k++
+				}
+				return strings.TrimSpace(inner[:i]), strings.TrimSpace(inner[k:]), true
+			}
+		}
+	}
+	return "", "", false
 }
 
 func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, defaultOp string, depth int, isSimple bool, flags simpleQueryFlags) esast.Query {

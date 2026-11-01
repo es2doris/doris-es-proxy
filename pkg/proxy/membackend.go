@@ -305,7 +305,12 @@ func (m *MemoryBackend) QueryHits(_ context.Context, sqlStr string) ([]HitRow, e
 			score := evalNumericExpr(row, scoreExpr)
 			ver, _ := toInt64(row["_version"])
 			srcStr, _ := row["_source"].(string)
-			matchedRows = append(matchedRows, row)
+			rowCopy := make(map[string]any, len(row)+1)
+			for k, v := range row {
+				rowCopy[k] = v
+			}
+			rowCopy["_score"] = score
+			matchedRows = append(matchedRows, rowCopy)
 			hits = append(hits, HitRow{
 				ID:      fmt.Sprintf("%v", row["_id"]),
 				Version: ver,
@@ -370,6 +375,24 @@ func (m *MemoryBackend) QueryHits(_ context.Context, sqlStr string) ([]HitRow, e
 	for _, idx := range sortIdx {
 		if collapseCol != "" {
 			cVal := resolveColumnValue(matchedRows[idx], collapseCol)
+			switch s := cVal.(type) {
+			case []any:
+				cVal = nil
+				for _, el := range s {
+					if el != nil {
+						cVal = el
+						break
+					}
+				}
+			case []string:
+				cVal = nil
+				for _, el := range s {
+					if el != "" {
+						cVal = el
+						break
+					}
+				}
+			}
 			if cVal != nil {
 				cKey := fmt.Sprintf("%v", cVal)
 				if cKey != "" {
@@ -2274,7 +2297,7 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 				ci = true
 				rhs = rhs[6 : len(rhs)-1]
 			}
-			if isArithmeticSQLExpr(lhs) || strings.Contains(lhs, "AS INT") || (op == ">=" && strings.Contains(lhs, "AS DOUBLE")) {
+			if isArithmeticSQLExpr(lhs) || strings.Contains(lhs, "AS INT") || (strings.Contains(lhs, "AS DOUBLE") && !strings.HasPrefix(lhs, "CAST(`_doc`")) {
 				if isArithmeticSQLExpr(lhs) && hasUnwrappedNullColumnRef(row, lhs) {
 					return false
 				}
@@ -2632,6 +2655,18 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 		return 0
 	}
 
+	if strings.HasPrefix(expr, "CAST(") && !strings.HasPrefix(expr, "CAST(`_doc`") {
+		for _, suffix := range []string{" AS DOUBLE)", " AS BIGINT)", " AS INT)"} {
+			if strings.HasSuffix(expr, suffix) {
+				inner := strings.TrimSpace(expr[len("CAST:") : len(expr)-len(suffix)])
+				if strings.HasPrefix(expr, "CAST(") {
+					inner = strings.TrimSpace(expr[len("CAST(") : len(expr)-len(suffix)])
+				}
+				return evalNumericExpr(row, inner)
+			}
+		}
+	}
+
 	for _, fn := range []string{"GREATEST", "LEAST", "COALESCE", "LOG10", "LN", "SQRT", "FLOOR", "CEIL", "ROUND", "ABS"} {
 		if strings.HasPrefix(expr, fn+"(") && strings.HasSuffix(expr, ")") {
 			inner := expr[len(fn)+1 : len(expr)-1]
@@ -2691,7 +2726,7 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 }
 
 func resolveColumnValue(row map[string]any, colExpr string) any {
-	colExpr = strings.TrimSpace(colExpr)
+	colExpr = trimOuterParens(strings.TrimSpace(colExpr))
 	if strings.HasPrefix(colExpr, "CONCAT_WS('\\x1f', ") && strings.HasSuffix(colExpr, ")") {
 		return evalCompositeKeyExpr(row, colExpr)
 	}
@@ -2952,6 +2987,9 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			}
 			srcStr, _ := row["_source"].(string)
 			res := extractJSONPathFromStr(srcStr, segs)
+			if res == nil && len(segs) == 1 && segs[0] == "_ignored" {
+				res = row["_ignored"]
+			}
 			if res != nil {
 				if strings.HasSuffix(colExpr, " AS BIGINT)") {
 					if iv, ok := toInt64(res); ok {
@@ -3229,6 +3267,28 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 				}
 			}
 			if isArithmeticSQLExpr(inner) {
+				if hasUnwrappedNullColumnRef(row, inner) {
+					return nil
+				}
+				return int64(evalNumericExpr(row, inner))
+			}
+			return nil
+		}
+		if strings.HasSuffix(colExpr, " AS INT)") {
+			if strings.HasPrefix(colExpr, "CAST(COALESCE(") && strings.HasSuffix(colExpr, ", FALSE) AS INT)") {
+				innerCond := colExpr[len("CAST(COALESCE(") : len(colExpr)-len(", FALSE) AS INT)")]
+				if evalWhereExpr(row, innerCond) {
+					return int64(1)
+				}
+				return int64(0)
+			}
+			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS INT)")])
+			if v := resolveColumnValue(row, inner); v != nil {
+				if f, ok := toFloat(v); ok {
+					return int64(f)
+				}
+			}
+			if isArithmeticSQLExpr(inner) || strings.Contains(inner, "CASE WHEN") {
 				if hasUnwrappedNullColumnRef(row, inner) {
 					return nil
 				}

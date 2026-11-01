@@ -700,7 +700,12 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 			if strings.TrimSpace(pe.Query) == "" && strings.EqualFold(pe.ZeroTermsQuery, "all") {
 				return CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: fmt.Sprintf("%.4f", effBoost)}
 			}
-			tokens := strings.Fields(strings.TrimSpace(pe.Query))
+			effKey0, b := t.resolveFieldInNestedCtx(cleanKey0, false, nctx)
+			qStr := strings.TrimSpace(pe.Query)
+			tokens := strings.Fields(qStr)
+			if isExactKeywordField(effKey0, b) && qStr != "" && pe.Fuzziness == nil {
+				tokens = []string{qStr}
+			}
 			if len(tokens) == 1 && pe.MinimumShouldMatch != nil && parseMinShouldMatch(pe.MinimumShouldMatch, 1, true) > 1 {
 				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 			}
@@ -873,6 +878,9 @@ func (t *Transpiler) compileKNN(kq *esast.KNNQuery, scoring bool, nctx *nestedCt
 func sortedMapKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
+		if k == "_name" {
+			continue
+		}
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
@@ -1173,18 +1181,29 @@ func effectiveDorisScalarType(b schema.FieldBinding) schema.DorisScalarType {
 	}
 }
 
-func isScalarQueryCompatible(dt schema.DorisScalarType, queryVal any) bool {
+func isScalarQueryCompatible(b schema.FieldBinding, queryVal any) bool {
+	dt := effectiveDorisScalarType(b)
 	s := strings.TrimSpace(fmt.Sprintf("%v", queryVal))
 	switch dt {
 	case schema.DorisBigInt:
+		if b.ESType == "date" || b.ESType == "date_nanos" || b.ESType == "" {
+			if _, err := strconv.ParseInt(s, 10, 64); err == nil {
+				return true
+			}
+			if f, err := strconv.ParseFloat(s, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+				return true
+			}
+			_, ok := schema.ParseESDateWithFormatToEpochMillis(s, b.Format, time.Now().UTC())
+			return ok
+		}
 		if _, err := strconv.ParseInt(s, 10, 64); err == nil {
 			return true
 		}
-		if f, err := strconv.ParseFloat(s, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+		if _, err := strconv.ParseUint(s, 10, 64); err == nil {
 			return true
 		}
-		_, ok := schema.ParseESDateToEpochMillis(s, time.Now().UTC())
-		return ok
+		f, err := strconv.ParseFloat(s, 64)
+		return err == nil && !math.IsNaN(f) && !math.IsInf(f, 0)
 	case schema.DorisInt, schema.DorisDouble:
 		f, err := strconv.ParseFloat(s, 64)
 		return err == nil && !math.IsNaN(f) && !math.IsInf(f, 0)
@@ -1489,7 +1508,7 @@ func (t *Transpiler) compileMatchField(
 		return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: score}
 	}
 	if effDT := effectiveDorisScalarType(b); (b.Kind == schema.StoragePromotedScalar || b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) && effDT != schema.DorisString && effDT != schema.DorisVarchar {
-		if !isScalarQueryCompatible(effDT, queryVal) {
+		if !isScalarQueryCompatible(b, queryVal) {
 			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 		}
 		pred := t.compileTermPredicate(field, queryVal, false, nctx)
@@ -1605,7 +1624,7 @@ func (t *Transpiler) compileMatchPhraseField(
 		return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: score}
 	}
 	if effDT := effectiveDorisScalarType(b); (b.Kind == schema.StoragePromotedScalar || b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) && effDT != schema.DorisString && effDT != schema.DorisVarchar {
-		if !isScalarQueryCompatible(effDT, queryStr) {
+		if !isScalarQueryCompatible(b, queryStr) {
 			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 		}
 		pred := t.compileTermPredicate(field, queryStr, false, nctx)
@@ -2401,11 +2420,25 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 			val = bv
 		}
 	} else if strVal, ok := val.(string); ok {
-		if effLower {
+		if effLower && effDT != schema.DorisBigInt && effDT != schema.DorisInt && effDT != schema.DorisDouble && b.ESType != "date" && b.ESType != "date_nanos" {
 			val = strings.ToLower(strVal)
-		} else if effDT == schema.DorisBigInt || b.ESType == "date" || b.ESType == "date_nanos" {
+		} else if b.ESType == "date" || b.ESType == "date_nanos" || (b.ESType == "" && effDT == schema.DorisBigInt) {
 			if ms, ok := schema.ParseESDateWithFormatToEpochMillis(strVal, b.Format, time.Now().UTC()); ok {
 				val = ms
+			}
+		} else if effDT == schema.DorisBigInt || effDT == schema.DorisInt {
+			if iv, err := strconv.ParseInt(strings.TrimSpace(strVal), 10, 64); err == nil {
+				val = iv
+			} else if fv, err := strconv.ParseFloat(strings.TrimSpace(strVal), 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) {
+				val = int64(fv)
+			} else if b.ESType != "" {
+				return "FALSE"
+			}
+		} else if effDT == schema.DorisDouble {
+			if fv, err := strconv.ParseFloat(strings.TrimSpace(strVal), 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+				val = fv
+			} else if b.ESType != "" {
+				return "FALSE"
 			}
 		}
 	} else if val != nil && (b.Kind == schema.StoragePromotedScalar || b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) && (effDT == schema.DorisVarchar || effDT == schema.DorisString) {
@@ -2415,6 +2448,7 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 		}
 		val = sv
 	}
+	val = normalizeScaledFloatValue(b, val)
 	val = normalizeDateNanosValue(b.ESType, val)
 	lit := quoteValue(val)
 
@@ -2532,11 +2566,25 @@ func (t *Transpiler) compileTermsPredicateWithCI(field string, vals []any, caseI
 				v = bv
 			}
 		} else if strVal, ok := v.(string); ok {
-			if effLower && effDT != schema.DorisBigInt && b.ESType != "date" && b.ESType != "date_nanos" {
+			if effLower && effDT != schema.DorisBigInt && effDT != schema.DorisInt && effDT != schema.DorisDouble && b.ESType != "date" && b.ESType != "date_nanos" {
 				v = strings.ToLower(strVal)
-			} else if effDT == schema.DorisBigInt || b.ESType == "date" || b.ESType == "date_nanos" {
+			} else if b.ESType == "date" || b.ESType == "date_nanos" || (b.ESType == "" && effDT == schema.DorisBigInt) {
 				if ms, ok := schema.ParseESDateWithFormatToEpochMillis(strVal, b.Format, now); ok {
 					v = ms
+				}
+			} else if effDT == schema.DorisBigInt || effDT == schema.DorisInt {
+				if iv, err := strconv.ParseInt(strings.TrimSpace(strVal), 10, 64); err == nil {
+					v = iv
+				} else if fv, err := strconv.ParseFloat(strings.TrimSpace(strVal), 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) {
+					v = int64(fv)
+				} else if b.ESType != "" {
+					continue
+				}
+			} else if effDT == schema.DorisDouble {
+				if fv, err := strconv.ParseFloat(strings.TrimSpace(strVal), 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+					v = fv
+				} else if b.ESType != "" {
+					continue
 				}
 			}
 		} else if v != nil && (b.Kind == schema.StoragePromotedScalar || b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) && (effDT == schema.DorisVarchar || effDT == schema.DorisString) {
@@ -2546,6 +2594,7 @@ func (t *Transpiler) compileTermsPredicateWithCI(field string, vals []any, caseI
 			}
 			v = sv
 		}
+		v = normalizeScaledFloatValue(b, v)
 		v = normalizeDateNanosValue(b.ESType, v)
 		normalizedVals = append(normalizedVals, v)
 		if isArrayCol {
@@ -2553,6 +2602,9 @@ func (t *Transpiler) compileTermsPredicateWithCI(field string, vals []any, caseI
 		} else {
 			quoted = append(quoted, quoteValue(v))
 		}
+	}
+	if len(quoted) == 0 {
+		return "FALSE"
 	}
 	if isArrayCol {
 		colName := b.EffectiveArrayColumn(true)
@@ -2785,16 +2837,6 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 		if v == nil {
 			return nil
 		}
-		if b.Kind == schema.StorageNestedSubfield && nctx != nil && nctx.nestedPath == b.NestedPath {
-			if b.ESType == "date" || b.ESType == "date_nanos" {
-				if strVal, ok := v.(string); ok && effFormat == "" && rc.TimeZone == "" {
-					trimmed := strings.TrimSpace(strVal)
-					if !strings.HasPrefix(trimmed, "now") && !strings.Contains(trimmed, "||") && strings.ContainsAny(trimmed, "Tt") {
-						return v
-					}
-				}
-			}
-		}
 		switch effectiveDorisScalarType(b) {
 		case schema.DorisBigInt:
 			if strVal, ok := v.(string); ok {
@@ -2825,19 +2867,21 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 					}
 					return iv
 				}
-				if ms, ok := schema.ParseESDateBoundWithFormatToEpochMillis(strVal, effFormat, now, roundUp); ok {
-					datePart := trimmed
-					if idx := strings.Index(datePart, "||"); idx >= 0 {
-						datePart = strings.TrimSpace(datePart[:idx])
+				if b.ESType == "date" || b.ESType == "date_nanos" || b.ESType == "" || rc.Format != "" {
+					if ms, ok := schema.ParseESDateBoundWithFormatToEpochMillis(strVal, effFormat, now, roundUp); ok {
+						datePart := trimmed
+						if idx := strings.Index(datePart, "||"); idx >= 0 {
+							datePart = strings.TrimSpace(datePart[:idx])
+						}
+						if _, intErr := strconv.ParseInt(datePart, 10, 64); intErr != nil &&
+							tzOffsetMs != 0 && !strings.HasPrefix(datePart, "now") &&
+							!strings.HasSuffix(datePart, "Z") && !strings.HasSuffix(datePart, "z") &&
+							!strings.Contains(datePart[min(10, len(datePart)):], "+") &&
+							!strings.Contains(datePart[min(10, len(datePart)):], "-") {
+							ms -= tzOffsetMs
+						}
+						return normalizeDateNanosValue(b.ESType, ms)
 					}
-					if _, intErr := strconv.ParseInt(datePart, 10, 64); intErr != nil &&
-						tzOffsetMs != 0 && !strings.HasPrefix(datePart, "now") &&
-						!strings.HasSuffix(datePart, "Z") && !strings.HasSuffix(datePart, "z") &&
-						!strings.Contains(datePart[min(10, len(datePart)):], "+") &&
-						!strings.Contains(datePart[min(10, len(datePart)):], "-") {
-						ms -= tzOffsetMs
-					}
-					return normalizeDateNanosValue(b.ESType, ms)
 				}
 			}
 			if b.ESType == "date_nanos" && !isEpochSecond {
@@ -2868,9 +2912,10 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 		case schema.DorisDouble:
 			if strVal, ok := v.(string); ok {
 				if f, err := strconv.ParseFloat(strings.TrimSpace(strVal), 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
-					return f
+					return normalizeScaledFloatValue(b, f)
 				}
 			}
+			return normalizeScaledFloatValue(b, v)
 		}
 		return v
 	}
@@ -2879,6 +2924,16 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 	gte = coerceBound(gte, false)
 	lt = coerceBound(lt, false)
 	lte = coerceBound(lte, true)
+
+	effDT := effectiveDorisScalarType(b)
+	if b.ESType != "" && b.ESType != "date" && b.ESType != "date_nanos" &&
+		(effDT == schema.DorisBigInt || effDT == schema.DorisInt || effDT == schema.DorisDouble) {
+		for _, cand := range []any{gt, gte, lt, lte} {
+			if _, isStr := cand.(string); isStr {
+				return "FALSE"
+			}
+		}
+	}
 
 	var sampleBound any
 	for _, cand := range []any{gt, gte, lt, lte} {
@@ -7631,7 +7686,7 @@ func (t *Transpiler) resolveSortMissing(s esast.SortSpec, b schema.FieldBinding)
 			return n, strconv.FormatInt(n, 10)
 		}
 	}
-	if b.DorisType == schema.DorisBigInt || effType == "date" || effType == "date_nanos" {
+	if effType == "date" || effType == "date_nanos" || (effType == "" && b.DorisType == schema.DorisBigInt) {
 		effFormat := s.Entry.Format
 		if effFormat == "" {
 			effFormat = b.Format
@@ -7725,7 +7780,7 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 				orderPart := scriptExpr + " " + dir
 				if strings.EqualFold(s.Entry.Missing, "_first") {
 					orderPart += " NULLS FIRST"
-				} else if missingSQL == "" && (strings.EqualFold(s.Entry.Missing, "_last") || dir == "ASC") {
+				} else if missingSQL == "" {
 					orderPart += " NULLS LAST"
 				}
 				parts = append(parts, orderPart)
@@ -7752,14 +7807,22 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 					if bv, ok := normalizeBooleanQueryValue(sampleVal); ok {
 						sampleVal = bv
 					}
+				} else if effType == "ip" {
+					if n, ok := parseIPv4ToUint32(sampleVal); ok {
+						sampleVal = n
+					}
 				} else if strVal, ok := sampleVal.(string); ok {
-					if b.DorisType == schema.DorisBigInt || effType == "date" || effType == "date_nanos" {
+					if effType == "date" || effType == "date_nanos" || (effType == "" && b.DorisType == schema.DorisBigInt) {
 						effFormat := s.Entry.Format
 						if effFormat == "" {
 							effFormat = b.Format
 						}
 						if ms, ok := schema.ParseESDateWithFormatToEpochMillis(strVal, effFormat, time.Now().UTC()); ok {
 							sampleVal = ms
+						}
+					} else if b.DorisType == schema.DorisBigInt || b.DorisType == schema.DorisInt {
+						if iv, err := strconv.ParseInt(strings.TrimSpace(strVal), 10, 64); err == nil {
+							sampleVal = iv
 						}
 					}
 				}
@@ -7772,7 +7835,7 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 			orderPart := col + " " + dir
 			if strings.EqualFold(s.Entry.Missing, "_first") {
 				orderPart += " NULLS FIRST"
-			} else if missingSQL == "" && (strings.EqualFold(s.Entry.Missing, "_last") || dir == "ASC") {
+			} else if missingSQL == "" {
 				orderPart += " NULLS LAST"
 			}
 			parts = append(parts, orderPart)
@@ -7844,15 +7907,23 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 					val = n
 				}
 			} else if strVal, ok := val.(string); ok {
-				if b.EffectiveLowercase(true) && effType != "date" && effType != "date_nanos" {
+				if b.EffectiveLowercase(true) && effType != "date" && effType != "date_nanos" && b.DorisType != schema.DorisBigInt && b.DorisType != schema.DorisInt && b.DorisType != schema.DorisDouble {
 					val = strings.ToLower(strVal)
-				} else if b.DorisType == schema.DorisBigInt || effType == "date" || effType == "date_nanos" {
+				} else if effType == "date" || effType == "date_nanos" || (effType == "" && b.DorisType == schema.DorisBigInt) {
 					effFormat := effectiveSorts[idx].Entry.Format
 					if effFormat == "" {
 						effFormat = b.Format
 					}
 					if ms, ok := schema.ParseESDateWithFormatToEpochMillis(strVal, effFormat, time.Now().UTC()); ok {
 						val = ms
+					}
+				} else if b.DorisType == schema.DorisBigInt || b.DorisType == schema.DorisInt {
+					if iv, err := strconv.ParseInt(strings.TrimSpace(strVal), 10, 64); err == nil {
+						val = iv
+					}
+				} else if b.DorisType == schema.DorisDouble {
+					if fv, err := strconv.ParseFloat(strings.TrimSpace(strVal), 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+						val = fv
 					}
 				}
 			}
@@ -8325,6 +8396,34 @@ func wildcardToLike(w string) string {
 		sb.WriteString(`\\`)
 	}
 	return sb.String()
+}
+
+func normalizeScaledFloatValue(b schema.FieldBinding, val any) any {
+	if b.ESType != "scaled_float" || b.ScalingFactor <= 0 || val == nil {
+		return val
+	}
+	var fv float64
+	var ok bool
+	switch v := val.(type) {
+	case float64:
+		fv, ok = v, true
+	case int:
+		fv, ok = float64(v), true
+	case int64:
+		fv, ok = float64(v), true
+	case json.Number:
+		if f, err := v.Float64(); err == nil {
+			fv, ok = f, true
+		}
+	case string:
+		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+			fv, ok = f, true
+		}
+	}
+	if ok && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+		return math.Round(fv*b.ScalingFactor) / b.ScalingFactor
+	}
+	return val
 }
 
 func normalizeBooleanQueryValue(val any) (bool, bool) {

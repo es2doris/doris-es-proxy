@@ -1662,4 +1662,78 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	if r34SimDoc["bw_ok"] != true || len(r34SimDoc["fp_md5"].(string)) != 32 || r34SimDoc["q_a"] != "1" || r34SimDoc["q_secret"] != nil {
 		t.Fatalf("unexpected R34 simulated doc: %+v", r34SimDoc)
 	}
+
+	// =========================================================================
+	// Round-35 Live Doris E2E Verification:
+	// 1. Named/boosted queries + function_score.random_score + string case_insensitive
+	// 2. Painless Map.replace / Map.replaceAll, block lambdas, forEach early return, and _simulate _ingest.timestamp preservation
+	// =========================================================================
+	r35SearchResp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
+		"query": {
+			"function_score": {
+				"query": {
+					"term": {
+						"service": {
+							"value": "CHECKOUT-API",
+							"case_insensitive": "true",
+							"_name": "ci_service"
+						},
+						"_name": "outer_term",
+						"boost": 1.5
+					}
+				},
+				"random_score": {
+					"seed": 42,
+					"field": "_seq_no"
+				}
+			}
+		}
+	}`))
+	if err != nil || r35SearchResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search (R35) failed: status=%v err=%v", r35SearchResp.StatusCode, err)
+	}
+	var r35SearchRes map[string]any
+	_ = json.NewDecoder(r35SearchResp.Body).Decode(&r35SearchRes)
+	_ = r35SearchResp.Body.Close()
+	r35Hits := r35SearchRes["hits"].(map[string]any)["hits"].([]any)
+	if len(r35Hits) == 0 {
+		t.Fatalf("expected non-empty hits in R35 random_score + case_insensitive search")
+	}
+
+	r35SimResp, err := http.Post(ts.URL+"/_ingest/pipeline/_simulate?verbose=true", "application/json", strings.NewReader(`{
+		"pipeline": {
+			"processors": [
+				{
+					"script": {
+						"source": "if (ctx.op == null) { ctx.scores.replace('a', 15); ctx.scores.replaceAll((k, v) -> v * 2); } def s = 0; ctx.nums.forEach(n -> { if (n == 2) { return; } s += n; }); ctx.sum = s; ctx.nums.removeIf(n -> { def ev = n % 2 == 0; return ev; });"
+					}
+				},
+				{
+					"set": {
+						"field": "copied_ts",
+						"value": "{{_ingest.timestamp}}"
+					}
+				}
+			]
+		},
+		"docs": [
+			{
+				"_index": "live_auto_index",
+				"_id": "r35-sim-1",
+				"_ingest": {"timestamp": "2025-05-05T00:00:00Z"},
+				"_source": {"scores": {"a": 10, "b": 5}, "nums": [1, 2, 3]}
+			}
+		]
+	}`))
+	if err != nil || r35SimResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_ingest/pipeline/_simulate (R35) failed: status=%v err=%v", r35SimResp.StatusCode, err)
+	}
+	var r35SimRes map[string]any
+	_ = json.NewDecoder(r35SimResp.Body).Decode(&r35SimRes)
+	_ = r35SimResp.Body.Close()
+	r35Procs := r35SimRes["docs"].([]any)[0].(map[string]any)["processor_results"].([]any)
+	r35SimDoc := r35Procs[len(r35Procs)-1].(map[string]any)["doc"].(map[string]any)["_source"].(map[string]any)
+	if r35SimDoc["copied_ts"] != "2025-05-05T00:00:00Z" || r35SimDoc["sum"].(float64) != 4 || len(r35SimDoc["nums"].([]any)) != 2 {
+		t.Fatalf("unexpected R35 simulated doc: %+v", r35SimDoc)
+	}
 }

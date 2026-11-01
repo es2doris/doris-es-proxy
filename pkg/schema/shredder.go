@@ -95,6 +95,15 @@ func ShredDocument(
 			fieldsToVisit = append(fieldsToVisit, b)
 		}
 	}
+	var ignoredFields []string
+	ignoredSeen := make(map[string]bool)
+	recordIgnored := func(fieldPath string) {
+		base := strings.TrimSuffix(fieldPath, ".keyword")
+		if base != "" && !ignoredSeen[base] {
+			ignoredSeen[base] = true
+			ignoredFields = append(ignoredFields, base)
+		}
+	}
 	for _, b := range fieldsToVisit {
 		switch b.Kind {
 		case StoragePromotedScalar:
@@ -118,11 +127,19 @@ func ShredDocument(
 				}
 			}
 			if val != nil {
-				coerced := coerceScalarBindingForDoris(val, b, getNow())
-				if coerced == nil && b.Coerce != nil && !*b.Coerce && (b.IgnoreMalformed == nil || !*b.IgnoreMalformed) {
-					return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", b.ESFieldPath, b.ESType)
+				if strVal, isStr := val.(string); isStr && strings.TrimSpace(strVal) == "" && (b.Coerce == nil || *b.Coerce) && b.DorisType != DorisString && b.DorisType != DorisVarchar {
+					val = nil
+				} else {
+					coerced := coerceScalarBindingForDoris(val, b, getNow())
+					if coerced == nil {
+						if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+							recordIgnored(b.ESFieldPath)
+						} else {
+							return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", b.ESFieldPath, b.ESType)
+						}
+					}
+					val = coerced
 				}
-				val = coerced
 			}
 			if b.ESType == "date_nanos" {
 				if iv, ok := val.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
@@ -133,6 +150,36 @@ func ShredDocument(
 				row[b.ColumnName] = val
 			}
 		case StoragePromotedArray, StorageNestedSubfield:
+			if isTypedNonStringBinding(b) {
+				rawLeafs := extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
+				var vals []string
+				for _, rv := range rawLeafs {
+					if rv == nil {
+						continue
+					}
+					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && (b.Coerce == nil || *b.Coerce) {
+						continue
+					}
+					coerced := coerceScalarBindingForDoris(rv, b, getNow())
+					if coerced == nil {
+						if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+							recordIgnored(b.ESFieldPath)
+							continue
+						}
+						return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", b.ESFieldPath, b.ESType)
+					}
+					if b.ESType == "date_nanos" {
+						if iv, ok := coerced.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
+							coerced = iv / 1_000_000
+						}
+					}
+					vals = append(vals, formatCoercedArrayElement(coerced))
+				}
+				if len(vals) > 0 {
+					row[b.ColumnName] = vals
+				}
+				continue
+			}
 			vals := extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer, b.NullValue)
 			if b.IgnoreAbove > 0 && len(vals) > 0 {
 				filtered := vals[:0]
@@ -142,37 +189,6 @@ func ShredDocument(
 					}
 				}
 				vals = filtered
-			}
-			if b.ESType == "date" || b.ESType == "date_nanos" {
-				for i, v := range vals {
-					if b.Format != "" {
-						if ms, ok := ParseESDateWithFormatToEpochMillis(v, b.Format, getNow()); ok {
-							if b.ESType == "date_nanos" && (ms > 1_000_000_000_000_000 || ms < -1_000_000_000_000_000) {
-								ms /= 1_000_000
-							}
-							vals[i] = strconv.FormatInt(ms, 10)
-							continue
-						}
-					}
-					if iv, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
-						if b.ESType == "date_nanos" && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
-							vals[i] = strconv.FormatInt(iv/1_000_000, 10)
-						}
-					} else {
-						if ms, ok := ParseESDateToEpochMillis(v, getNow()); ok {
-							vals[i] = strconv.FormatInt(ms, 10)
-						}
-					}
-				}
-			} else if b.ESType == "boolean" || b.DorisType == DorisBoolean {
-				for i, v := range vals {
-					switch strings.ToLower(strings.TrimSpace(v)) {
-					case "true", "1":
-						vals[i] = "true"
-					case "false", "0":
-						vals[i] = "false"
-					}
-				}
 			}
 			if len(vals) > 0 {
 				row[b.ColumnName] = vals
@@ -438,15 +454,102 @@ func ShredDocument(
 		}
 	}
 
+	if len(ignoredFields) > 0 {
+		sort.Strings(ignoredFields)
+		row["_ignored"] = ignoredFields
+	}
+
 	return json.Marshal(row)
+}
+
+func isTypedNonStringBinding(b FieldBinding) bool {
+	switch b.ESType {
+	case "long", "unsigned_long", "integer", "short", "byte", "double", "float", "half_float", "scaled_float", "date", "date_nanos", "boolean":
+		return true
+	}
+	switch b.DorisType {
+	case DorisBigInt, DorisInt, DorisDouble, DorisBoolean:
+		return true
+	}
+	return false
+}
+
+func formatCoercedArrayElement(v any) string {
+	switch tv := v.(type) {
+	case int64:
+		return strconv.FormatInt(tv, 10)
+	case int:
+		return strconv.Itoa(tv)
+	case float64:
+		return strconv.FormatFloat(tv, 'f', -1, 64)
+	case bool:
+		if tv {
+			return "true"
+		}
+		return "false"
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func extractRawLeafValuesWithNull(node any, path []string, nullVal any) []any {
+	var out []any
+	collectRawLeafsAtPathWithNull(node, path, nullVal, &out)
+	return out
+}
+
+func collectRawLeafsAtPathWithNull(node any, path []string, nullVal any, out *[]any) {
+	if len(path) == 0 {
+		if node == nil {
+			if nullVal != nil {
+				*out = append(*out, nullVal)
+			}
+			return
+		}
+		switch v := node.(type) {
+		case []any:
+			for _, item := range v {
+				collectRawLeafsAtPathWithNull(item, nil, nullVal, out)
+			}
+		case map[string]any:
+			return
+		default:
+			*out = append(*out, v)
+		}
+		return
+	}
+	if node == nil {
+		return
+	}
+	switch curr := node.(type) {
+	case map[string]any:
+		if next, ok := curr[path[0]]; ok {
+			collectRawLeafsAtPathWithNull(next, path[1:], nullVal, out)
+			return
+		}
+		for i := len(path); i > 1; i-- {
+			if next, ok := curr[strings.Join(path[:i], ".")]; ok {
+				collectRawLeafsAtPathWithNull(next, path[i:], nullVal, out)
+				return
+			}
+		}
+	case []any:
+		for _, elem := range curr {
+			collectRawLeafsAtPathWithNull(elem, path, nullVal, out)
+		}
+	}
 }
 
 func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 	if val == nil {
 		return nil
 	}
+	effDorisType := b.DorisType
+	if (effDorisType == DorisString || effDorisType == "") && b.ESType != "" {
+		effDorisType = mapESTypeToDoris(b.ESType)
+	}
 	if b.Coerce != nil && !*b.Coerce {
-		switch b.DorisType {
+		switch effDorisType {
 		case DorisBigInt, DorisInt:
 			if b.ESType != "date" && b.ESType != "date_nanos" {
 				switch v := val.(type) {
@@ -479,6 +582,18 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 			}
 		}
 	}
+	if b.ESType == "long" || b.ESType == "unsigned_long" {
+		if strVal, ok := val.(string); ok {
+			trimmed := strings.TrimSpace(strVal)
+			if _, err := strconv.ParseInt(trimmed, 10, 64); err != nil {
+				if _, uerr := strconv.ParseUint(trimmed, 10, 64); uerr != nil {
+					if f, ferr := strconv.ParseFloat(trimmed, 64); ferr != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+						return nil
+					}
+				}
+			}
+		}
+	}
 	if (b.ESType == "date" || b.ESType == "date_nanos") && b.Format != "" {
 		switch v := val.(type) {
 		case string:
@@ -505,7 +620,7 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 			}
 		}
 	}
-	coerced := coerceScalarForDoris(val, b.DorisType, b.LowercaseNormalizer, now)
+	coerced := coerceScalarForDoris(val, effDorisType, b.LowercaseNormalizer, now)
 	if b.ESType == "scaled_float" && b.ScalingFactor > 0 {
 		if fv, ok := coerced.(float64); ok && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
 			coerced = math.Round(fv*b.ScalingFactor) / b.ScalingFactor
@@ -1717,12 +1832,34 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 		if ms, ok := ParseESDateToEpochMillis(str, getNow()); ok {
 			return ms
 		}
+		if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+			return nil
+		}
 	} else if b.ESType == "boolean" || b.DorisType == DorisBoolean {
 		switch strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", val))) {
 		case "true", "1":
 			return true
 		case "false", "0":
 			return false
+		}
+		if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+			return nil
+		}
+	} else if b.ESType == "scaled_float" && b.ScalingFactor > 0 {
+		coerced := coerceScalarBindingForDoris(val, b, getNow())
+		if coerced != nil {
+			return coerced
+		}
+		if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+			return nil
+		}
+	} else if isTypedNonStringBinding(b) {
+		coerced := coerceScalarBindingForDoris(val, b, getNow())
+		if coerced != nil {
+			return coerced
+		}
+		if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+			return nil
 		}
 	} else if b.LowercaseNormalizer {
 		if str, ok := val.(string); ok {
