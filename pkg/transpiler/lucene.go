@@ -769,8 +769,8 @@ func parseLuceneRangeToken(val string, boost float64) *esast.RangeCond {
 			parts = strings.Split(inner, " to ")
 		}
 		if len(parts) == 2 {
-			lowerStr := strings.Trim(strings.TrimSpace(parts[0]), `"`)
-			upperStr := strings.Trim(strings.TrimSpace(parts[1]), `"`)
+			lowerStr := unescapeLuceneToken(strings.Trim(strings.TrimSpace(parts[0]), `"`))
+			upperStr := unescapeLuceneToken(strings.Trim(strings.TrimSpace(parts[1]), `"`))
 			rc := &esast.RangeCond{}
 			if boost != 1.0 {
 				b := boost

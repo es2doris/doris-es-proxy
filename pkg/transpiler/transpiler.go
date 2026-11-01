@@ -382,7 +382,7 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		fields := sortedMapKeys(q.Terms.Fields)
 		var preds []string
 		for _, field := range fields {
-			preds = append(preds, t.compileTermsPredicate(field, q.Terms.Fields[field], nctx))
+			preds = append(preds, t.compileTermsPredicateWithCI(field, q.Terms.Fields[field], q.Terms.CaseInsensitive, nctx))
 		}
 		pred := strings.Join(preds, " AND ")
 		score := "1.0"
@@ -1055,7 +1055,7 @@ func (t *Transpiler) compileBool(b *esast.BoolQuery, scoring bool, nctx *nestedC
 		c := t.CompileQuery(&b.MustNot[i], false, nctx)
 		if c.UsesFulltextMatch {
 			// Doris BE does not allow MATCH_* inside COALESCE(...)
-			conjuncts = append(conjuncts, fmt.Sprintf("NOT (%s)", c.WhereSQL))
+			conjuncts = append(conjuncts, negateFulltextWhereSQL(c.WhereSQL))
 		} else {
 			conjuncts = append(conjuncts, fmt.Sprintf("NOT COALESCE(%s, FALSE)", c.WhereSQL))
 		}
@@ -1853,6 +1853,20 @@ func (t *Transpiler) compileMultiMatch(mm *esast.MultiMatchQuery, scoring bool, 
 	}
 }
 
+func negateFulltextWhereSQL(whereSQL string) string {
+	trimmed := strings.TrimSpace(whereSQL)
+	if strings.HasPrefix(trimmed, "`") {
+		if endTick := strings.IndexByte(trimmed[1:], '`'); endTick > 0 {
+			colIdent := trimmed[:endTick+2]
+			rest := strings.TrimSpace(trimmed[endTick+2:])
+			if strings.HasPrefix(rest, "MATCH_") && !strings.Contains(rest, " AND ") && !strings.Contains(rest, " OR ") {
+				return fmt.Sprintf("(%s IS NULL OR NOT (%s))", colIdent, whereSQL)
+			}
+		}
+	}
+	return fmt.Sprintf("NOT (%s)", whereSQL)
+}
+
 func (t *Transpiler) compileNestedWithParent(nq *esast.NestedQuery, scoring bool, parentNctx *nestedCtx) CompiledQuery {
 	if nq.Path == "" {
 		if nq.IgnoreUnmapped {
@@ -1874,8 +1888,13 @@ func (t *Transpiler) compileNestedWithParent(nq *esast.NestedQuery, scoring bool
 		nestedPath: nq.Path,
 		elemVar:    elemVar,
 	})
+	innerWhere := inner.WhereSQL
+	if parentNctx != nil && parentNctx.nestedPath != "" && strings.HasPrefix(nq.Path, parentNctx.nestedPath+".") {
+		parentCorr := fmt.Sprintf("json_extract_string(%s, '$._parent_id') = json_extract_string(%s, '$._nested_id')", elemVar, parentNctx.elemVar)
+		innerWhere = fmt.Sprintf("(%s AND %s)", parentCorr, innerWhere)
+	}
 	prefilter := t.extractNestedPrefilter(nq.Path, &nq.Query)
-	whereSQL := fmt.Sprintf("array_exists(%s -> %s, `%s`)", elemVar, inner.WhereSQL, corrCol)
+	whereSQL := fmt.Sprintf("array_exists(%s -> %s, `%s`)", elemVar, innerWhere, corrCol)
 	if prefilter != "" {
 		whereSQL = fmt.Sprintf("(%s AND %s)", prefilter, whereSQL)
 	}
@@ -2452,7 +2471,7 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 	return fmt.Sprintf("%s = %s", col, lit)
 }
 
-func (t *Transpiler) compileTermsPredicate(field string, vals []any, nctx *nestedCtx) string {
+func (t *Transpiler) compileTermsPredicateWithCI(field string, vals []any, caseInsensitive bool, nctx *nestedCtx) string {
 	if len(vals) == 0 {
 		return "FALSE"
 	}
@@ -2461,7 +2480,7 @@ func (t *Transpiler) compileTermsPredicate(field string, vals []any, nctx *neste
 		if len(exp) > 0 {
 			var disjuncts []string
 			for _, bf := range exp {
-				disjuncts = append(disjuncts, t.compileTermsPredicate(bf.Field, vals, nctx))
+				disjuncts = append(disjuncts, t.compileTermsPredicateWithCI(bf.Field, vals, caseInsensitive, nctx))
 			}
 			if len(disjuncts) == 1 {
 				return disjuncts[0]
@@ -2494,12 +2513,12 @@ func (t *Transpiler) compileTermsPredicate(field string, vals []any, nctx *neste
 			return "(" + strings.Join(disjuncts, " OR ") + ")"
 		}
 	}
-	effLower := b.EffectiveLowercase(true)
+	effLower := b.EffectiveLowercase(true) || caseInsensitive
 	isArrayCol := b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath))
 	if nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued {
 		var disjuncts []string
 		for _, v := range vals {
-			disjuncts = append(disjuncts, t.compileTermPredicate(field, v, false, nctx))
+			disjuncts = append(disjuncts, t.compileTermPredicate(field, v, caseInsensitive, nctx))
 		}
 		return "(" + strings.Join(disjuncts, " OR ") + ")"
 	}
@@ -2513,7 +2532,7 @@ func (t *Transpiler) compileTermsPredicate(field string, vals []any, nctx *neste
 				v = bv
 			}
 		} else if strVal, ok := v.(string); ok {
-			if effLower {
+			if effLower && effDT != schema.DorisBigInt && b.ESType != "date" && b.ESType != "date_nanos" {
 				v = strings.ToLower(strVal)
 			} else if effDT == schema.DorisBigInt || b.ESType == "date" || b.ESType == "date_nanos" {
 				if ms, ok := schema.ParseESDateWithFormatToEpochMillis(strVal, b.Format, now); ok {
@@ -2537,10 +2556,14 @@ func (t *Transpiler) compileTermsPredicate(field string, vals []any, nctx *neste
 	}
 	if isArrayCol {
 		colName := b.EffectiveArrayColumn(true)
+		if caseInsensitive && !b.EffectiveLowercase(true) {
+			return fmt.Sprintf("array_exists(_x -> lower(_x) IN (%s), `%s`)", strings.Join(quoted, ", "), colName)
+		}
 		return fmt.Sprintf("arrays_overlap(`%s`, [%s])", colName, strings.Join(quoted, ", "))
 	}
 	col := t.sqlTypedColumnRef(field, normalizedVals[0], true, nctx)
-	if nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && effLower {
+	if (caseInsensitive && !b.EffectiveLowercase(true) && (effDT == schema.DorisVarchar || effDT == schema.DorisString)) ||
+		(nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && effLower) {
 		col = fmt.Sprintf("lower(%s)", col)
 	}
 	return fmt.Sprintf("%s IN (%s)", col, strings.Join(quoted, ", "))
@@ -3130,6 +3153,19 @@ func (t *Transpiler) appendAggBranches(
 
 		case spec.EffectiveTerms() != nil:
 			termsSpec := spec.EffectiveTerms()
+			termsExtraWhere := extraWhere
+			termsWherePrefix := wherePrefix
+			if termsSpec.BackgroundFilter != nil {
+				bgCond := t.CompileQuery(termsSpec.BackgroundFilter, false, nil)
+				if bgCond.WhereSQL != "" && bgCond.WhereSQL != "1=1" {
+					if termsExtraWhere != "" {
+						termsExtraWhere = fmt.Sprintf("(%s) AND (%s)", termsExtraWhere, bgCond.WhereSQL)
+					} else {
+						termsExtraWhere = bgCond.WhereSQL
+					}
+					termsWherePrefix = fmt.Sprintf("(%s) AND ", termsExtraWhere)
+				}
+			}
 			size := t.maxAggBuckets()
 			if capSz := t.capBucketSize(termsSpec.Size); capSz > size {
 				size = capSz
@@ -3155,8 +3191,8 @@ func (t *Transpiler) appendAggBranches(
 					coalescedElem := fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", elemValExpr, missingLit)
 					explodeFrom := fmt.Sprintf("`base_matched` LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) `_t` AS `_elem`", arrCol, arrCol, arrCol)
 					wCond := ""
-					if extraWhere != "" {
-						wCond = "WHERE " + extraWhere + " "
+					if termsExtraWhere != "" {
+						wCond = "WHERE " + termsExtraWhere + " "
 					}
 					*branches = append(*branches, fmt.Sprintf(
 						"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
@@ -3168,8 +3204,8 @@ func (t *Transpiler) appendAggBranches(
 					))
 					if subAggs := spec.SubAggs(); len(subAggs) > 0 {
 						subWhere := "TRUE"
-						if extraWhere != "" {
-							subWhere = extraWhere
+						if termsExtraWhere != "" {
+							subWhere = termsExtraWhere
 						}
 						dedupIdx := *subIdx
 						dedupFrom := fmt.Sprintf("`base_matched` INNER JOIN (SELECT DISTINCT `_id` AS `_rn_id_%d`, %s AS `_rn_bkey_%d` FROM %s WHERE %s) `_rn_dedup_%d` ON `base_matched`.`_id` = `_rn_dedup_%d`.`_rn_id_%d`", dedupIdx, coalescedElem, dedupIdx, explodeFrom, subWhere, dedupIdx, dedupIdx, dedupIdx)
@@ -3184,11 +3220,11 @@ func (t *Transpiler) appendAggBranches(
 							"WHERE %s`_elem` IS NOT NULL "+
 							"GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT %d"+
 							") `_agg_sub_%d`",
-						quoteStr(fullAggName), bucketKeyExpr, arrCol, wherePrefix, size, *subIdx,
+						quoteStr(fullAggName), bucketKeyExpr, arrCol, termsWherePrefix, size, *subIdx,
 					))
 					if subAggs := spec.SubAggs(); len(subAggs) > 0 {
 						explodeFrom := fmt.Sprintf("`base_matched` LATERAL VIEW EXPLODE(`%s`) `_t` AS `_elem`", arrCol)
-						explodeWhere := fmt.Sprintf("%s`_elem` IS NOT NULL", wherePrefix)
+						explodeWhere := fmt.Sprintf("%s`_elem` IS NOT NULL", termsWherePrefix)
 						dedupIdx := *subIdx
 						dedupFrom := fmt.Sprintf("`base_matched` INNER JOIN (SELECT DISTINCT `_id` AS `_rn_id_%d`, %s AS `_rn_bkey_%d` FROM %s WHERE %s) `_rn_dedup_%d` ON `base_matched`.`_id` = `_rn_dedup_%d`.`_rn_id_%d`", dedupIdx, bucketKeyExpr, dedupIdx, explodeFrom, explodeWhere, dedupIdx, dedupIdx, dedupIdx)
 						t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, fmt.Sprintf("`_rn_bkey_%d`", dedupIdx),
@@ -3206,8 +3242,8 @@ func (t *Transpiler) appendAggBranches(
 					missingLit := quoteStr(formatMissingScalar(termsSpec.Missing))
 					coalescedCol := fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", col, missingLit)
 					wCond := ""
-					if extraWhere != "" {
-						wCond = "WHERE " + extraWhere + " "
+					if termsExtraWhere != "" {
+						wCond = "WHERE " + termsExtraWhere + " "
 					}
 					*branches = append(*branches, fmt.Sprintf(
 						"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
@@ -3220,8 +3256,8 @@ func (t *Transpiler) appendAggBranches(
 					))
 					if subAggs := spec.SubAggs(); len(subAggs) > 0 {
 						subWhere := "TRUE"
-						if extraWhere != "" {
-							subWhere = extraWhere
+						if termsExtraWhere != "" {
+							subWhere = termsExtraWhere
 						}
 						t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, coalescedCol,
 							"`base_matched`", subWhere, subAggs)
@@ -3234,11 +3270,11 @@ func (t *Transpiler) appendAggBranches(
 							"WHERE %s%s IS NOT NULL "+
 							"GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT %d"+
 							") `_agg_sub_%d`",
-						quoteStr(fullAggName), col, wherePrefix, col, size, *subIdx,
+						quoteStr(fullAggName), col, termsWherePrefix, col, size, *subIdx,
 					))
 					if subAggs := spec.SubAggs(); len(subAggs) > 0 {
 						t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, fmt.Sprintf("CAST(%s AS STRING)", col),
-							"`base_matched`", fmt.Sprintf("%s%s IS NOT NULL", wherePrefix, col), subAggs)
+							"`base_matched`", fmt.Sprintf("%s%s IS NOT NULL", termsWherePrefix, col), subAggs)
 					}
 				}
 			}
@@ -7596,7 +7632,11 @@ func (t *Transpiler) resolveSortMissing(s esast.SortSpec, b schema.FieldBinding)
 		}
 	}
 	if b.DorisType == schema.DorisBigInt || effType == "date" || effType == "date_nanos" {
-		if ms, ok := schema.ParseESDateToEpochMillis(mStr, time.Now().UTC()); ok {
+		effFormat := s.Entry.Format
+		if effFormat == "" {
+			effFormat = b.Format
+		}
+		if ms, ok := schema.ParseESDateWithFormatToEpochMillis(mStr, effFormat, time.Now().UTC()); ok {
 			if niv, ok := normalizeDateNanosValue(effType, ms).(int64); ok {
 				ms = niv
 			}
@@ -7714,7 +7754,11 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 					}
 				} else if strVal, ok := sampleVal.(string); ok {
 					if b.DorisType == schema.DorisBigInt || effType == "date" || effType == "date_nanos" {
-						if ms, ok := schema.ParseESDateToEpochMillis(strVal, time.Now().UTC()); ok {
+						effFormat := s.Entry.Format
+						if effFormat == "" {
+							effFormat = b.Format
+						}
+						if ms, ok := schema.ParseESDateWithFormatToEpochMillis(strVal, effFormat, time.Now().UTC()); ok {
 							sampleVal = ms
 						}
 					}
@@ -7803,7 +7847,11 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 				if b.EffectiveLowercase(true) && effType != "date" && effType != "date_nanos" {
 					val = strings.ToLower(strVal)
 				} else if b.DorisType == schema.DorisBigInt || effType == "date" || effType == "date_nanos" {
-					if ms, ok := schema.ParseESDateToEpochMillis(strVal, time.Now().UTC()); ok {
+					effFormat := effectiveSorts[idx].Entry.Format
+					if effFormat == "" {
+						effFormat = b.Format
+					}
+					if ms, ok := schema.ParseESDateWithFormatToEpochMillis(strVal, effFormat, time.Now().UTC()); ok {
 						val = ms
 					}
 				}

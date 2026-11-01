@@ -1080,3 +1080,79 @@ func TestRound33PainlessHardening(t *testing.T) {
 		t.Fatalf("F21 ctx._source alias sync assertions failed: %+v", doc)
 	}
 }
+
+func TestRound34PainlessAllocationBudgetBitwiseAndNoop(t *testing.T) {
+	// F21: Slice and string concatenation are bounded at MaxPainlessSliceItems and MaxPainlessStringBytes
+	val, err := Eval(map[string]any{}, `
+		def a = [1, 2];
+		for (int i = 0; i < 16; i++) {
+			a = a + a;
+		}
+		def s = 'abcd';
+		for (int i = 0; i < 20; i++) {
+			s = s.concat(s);
+		}
+		return [a.size(), s.length()];
+	`, nil)
+	if err != nil {
+		t.Fatalf("F21 bounded concat failed: %v", err)
+	}
+	resSlice, ok := val.([]any)
+	if !ok || len(resSlice) != 2 || resSlice[0] != int64(MaxPainlessSliceItems) || resSlice[1] != int64(MaxPainlessStringBytes) {
+		t.Fatalf("F21 expected [%d, %d], got %+v", MaxPainlessSliceItems, MaxPainlessStringBytes, val)
+	}
+
+	// F22: Shared evalBudget across nested forEach / lambdas enforces MaxPainlessSteps
+	_, err = Eval(map[string]any{}, `
+		def xs = [];
+		for (int i = 0; i < 120; i++) { xs.add(i); }
+		int sum = 0;
+		xs.forEach(x -> {
+			xs.forEach(y -> {
+				sum += 1;
+			});
+		});
+		return sum;
+	`, nil)
+	if err == nil || !strings.Contains(err.Error(), "exceeded maximum step budget") {
+		t.Fatalf("F22 expected step budget error from nested forEach, got: %v", err)
+	}
+
+	// F23: Boolean bitwise operators (&, |, ^) truthiness and precedence with comparisons
+	bwVal, err := Eval(map[string]any{"a": int64(1), "b": int64(2), "flags": int64(2)}, `
+		boolean c1 = false & false;
+		boolean c2 = (doc['a'].value == 1 & doc['b'].value == 2);
+		boolean c3 = (doc['a'].value == 1 & doc['b'].value == 99);
+		boolean c4 = (doc['a'].value == 99 | doc['b'].value == 2);
+		boolean c5 = (doc['a'].value == 1 ^ doc['b'].value == 2);
+		boolean c6 = false;
+		if (doc['flags'].value & 4) {
+			c6 = true;
+		}
+		return [c1, c2, c3, c4, c5, c6];
+	`, nil)
+	if err != nil {
+		t.Fatalf("F23 boolean bitwise eval failed: %v", err)
+	}
+	bwArr, ok := bwVal.([]any)
+	if !ok || len(bwArr) != 6 || bwArr[0] != false || bwArr[1] != true || bwArr[2] != false || bwArr[3] != true || bwArr[4] != false || bwArr[5] != false {
+		t.Fatalf("F23 unexpected boolean bitwise results: %+v", bwVal)
+	}
+
+	// F24: ApplyUpdateWithResult semantic JSON noop detection for float 10.0 vs 10
+	detectNoop := true
+	_, opRes, err := ApplyUpdateWithResult(
+		json.RawMessage(`{"price":10.0}`),
+		&UpdateRequest{
+			Doc:        map[string]any{"price": float64(10)},
+			DetectNoop: &detectNoop,
+		},
+		true,
+	)
+	if err != nil {
+		t.Fatalf("F24 ApplyUpdateWithResult failed: %v", err)
+	}
+	if opRes != "noop" {
+		t.Fatalf("F24 expected noop for 10.0 vs 10, got %q", opRes)
+	}
+}

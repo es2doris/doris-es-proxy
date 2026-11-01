@@ -861,3 +861,92 @@ func TestRound33CustomDateFormatCoerceAndIgnoreMalformed(t *testing.T) {
 		t.Fatalf("expected malformed coerced fields with ignore_malformed=true to be nil, got lenient_int=%v bad_num=%v", row["f__lenient_int"], row["f__bad_num"])
 	}
 }
+
+func TestRound34FlatDottedKeysDateNanosEpochNanosAndAliasKeyword(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"service": {
+				"properties": {
+					"name": {"type": "keyword"}
+				}
+			},
+			"tags": {
+				"properties": {
+					"env": {"type": "keyword"}
+				}
+			},
+			"vec": {
+				"properties": {
+					"emb": {"type": "dense_vector", "dims": 2}
+				}
+			},
+			"ts_nanos": {
+				"type": "date_nanos",
+				"format": "strict_date_optional_time||epoch_nanos||epoch_millis",
+				"copy_to": ["ts_copy"]
+			},
+			"ts_copy": {
+				"type": "date_nanos",
+				"format": "strict_date_optional_time||epoch_millis"
+			},
+			"mapped_code": {"type": "keyword"},
+			"alias_to_mapped_kw": {"type": "alias", "path": "mapped_code.keyword"},
+			"alias_to_unmapped_kw": {"type": "alias", "path": "dyn.sub.keyword"}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("unmarshal spec failed: %v", err)
+	}
+	sch := CompileIndexSchema("db", "r34_schema", &spec)
+	// Make tags.env and ts_nanos promoted arrays to verify array paths as well
+	bTags := sch.Fields["tags.env"]
+	bTags.Kind = StoragePromotedArray
+	sch.Fields["tags.env"] = bTags
+	bNanos := sch.Fields["ts_nanos"]
+	bNanos.Kind = StoragePromotedArray
+	sch.Fields["ts_nanos"] = bNanos
+	sch.finalizeCompiledSlices()
+
+	// F9: alias resolution for mapped_code.keyword and dyn.sub.keyword
+	if sch.Fields["alias_to_mapped_kw"].ColumnName != "f__mapped_code" {
+		t.Fatalf("expected alias_to_mapped_kw to resolve to f__mapped_code, got %+v", sch.Fields["alias_to_mapped_kw"])
+	}
+	unmappedAlias := sch.Fields["alias_to_unmapped_kw"]
+	if len(unmappedAlias.SourceJSONPath) != 2 || unmappedAlias.SourceJSONPath[0] != "dyn" || unmappedAlias.SourceJSONPath[1] != "sub" {
+		t.Fatalf("expected alias_to_unmapped_kw SourceJSONPath=[dyn sub], got %+v", unmappedAlias.SourceJSONPath)
+	}
+
+	// F2 & F6: Flat dotted JSON keys in _source + date_nanos with Format + epoch_nanos
+	raw, err := ShredDocument(sch, "d1", 1, false, json.RawMessage(`{
+		"service.name": "auth-api",
+		"tags.env": ["prod", "staging"],
+		"vec.emb": [0.25, 0.75],
+		"ts_nanos": ["1700000000123456789"]
+	}`))
+	if err != nil {
+		t.Fatalf("ShredDocument failed: %v", err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(raw, &row); err != nil {
+		t.Fatalf("unmarshal shredded row failed: %v", err)
+	}
+	if row["f__service__name"] != "auth-api" {
+		t.Fatalf("expected f__service__name == 'auth-api', got %v", row["f__service__name"])
+	}
+	envSlice, _ := row["f__tags__env"].([]any)
+	if len(envSlice) != 2 || envSlice[0] != "prod" || envSlice[1] != "staging" {
+		t.Fatalf("expected f__tags__env == [prod staging], got %v", row["f__tags__env"])
+	}
+	vecSlice, _ := row["f__vec__emb"].([]any)
+	if len(vecSlice) != 2 || vecSlice[0] != 0.25 || vecSlice[1] != 0.75 {
+		t.Fatalf("expected f__vec__emb == [0.25 0.75], got %v", row["f__vec__emb"])
+	}
+	nanosSlice, _ := row["f__ts_nanos"].([]any)
+	if len(nanosSlice) != 1 || nanosSlice[0] != "1700000000123" {
+		t.Fatalf("expected f__ts_nanos == ['1700000000123'], got %v", row["f__ts_nanos"])
+	}
+	copySlice, _ := row["f__ts_copy"].([]any)
+	if len(copySlice) != 1 || copySlice[0] != "1700000000123" {
+		t.Fatalf("expected f__ts_copy == ['1700000000123'], got %v", row["f__ts_copy"])
+	}
+}

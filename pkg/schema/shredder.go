@@ -147,6 +147,9 @@ func ShredDocument(
 				for i, v := range vals {
 					if b.Format != "" {
 						if ms, ok := ParseESDateWithFormatToEpochMillis(v, b.Format, getNow()); ok {
+							if b.ESType == "date_nanos" && (ms > 1_000_000_000_000_000 || ms < -1_000_000_000_000_000) {
+								ms /= 1_000_000
+							}
 							vals[i] = strconv.FormatInt(ms, 10)
 							continue
 						}
@@ -265,6 +268,11 @@ func ShredDocument(
 					if len(filteredSrc) > 0 {
 						joined := strings.Join(filteredSrc, " ")
 						coerced := coerceScalarBindingForDoris(joined, tb, getNow())
+						if tb.ESType == "date_nanos" {
+							if iv, ok := coerced.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
+								coerced = iv / 1_000_000
+							}
+						}
 						if coerced != nil {
 							if existing, exists := row[tb.ColumnName]; exists && existing != nil {
 								if tb.DorisType == DorisString || tb.DorisType == DorisVarchar {
@@ -327,6 +335,9 @@ func ShredDocument(
 						if tb.ESType == "date" || tb.ESType == "date_nanos" {
 							if tb.Format != "" {
 								if ms, ok := ParseESDateWithFormatToEpochMillis(sv, tb.Format, getNow()); ok {
+									if tb.ESType == "date_nanos" && (ms > 1_000_000_000_000_000 || ms < -1_000_000_000_000_000) {
+										ms /= 1_000_000
+									}
 									sv = strconv.FormatInt(ms, 10)
 									cur = append(cur, sv)
 									continue
@@ -882,6 +893,11 @@ func ParseESDateBoundWithFormatToEpochMillis(input, format string, now time.Time
 					base := time.UnixMilli(iv).UTC()
 					return finalizeFormatMatch(base, false)
 				}
+			case "epoch_nanos":
+				if iv, err := strconv.ParseInt(prefix, 10, 64); err == nil {
+					base := time.Unix(0, iv).UTC()
+					return finalizeFormatMatch(base, false)
+				}
 			case "basic_date", "strict_basic_date":
 				if len(prefix) == 8 {
 					if t, err := time.Parse("20060102", prefix); err == nil {
@@ -1140,11 +1156,15 @@ func extractScalarValue(node any, path []string) any {
 	}
 	switch curr := node.(type) {
 	case map[string]any:
-		next, exists := curr[path[0]]
-		if !exists {
-			return nil
+		if next, exists := curr[path[0]]; exists {
+			return extractScalarValue(next, path[1:])
 		}
-		return extractScalarValue(next, path[1:])
+		for i := len(path); i > 1; i-- {
+			if next, exists := curr[strings.Join(path[:i], ".")]; exists {
+				return extractScalarValue(next, path[i:])
+			}
+		}
+		return nil
 	case []any:
 		for _, elem := range curr {
 			if v := extractScalarValue(elem, path); v != nil {
@@ -1221,6 +1241,13 @@ func collectStringsAtPathWithNull(node any, path []string, lowercase bool, nullV
 	case map[string]any:
 		if next, ok := curr[path[0]]; ok {
 			collectStringsAtPathWithNull(next, path[1:], lowercase, nullVal, out)
+			return
+		}
+		for i := len(path); i > 1; i-- {
+			if next, ok := curr[strings.Join(path[:i], ".")]; ok {
+				collectStringsAtPathWithNull(next, path[i:], lowercase, nullVal, out)
+				return
+			}
 		}
 	case []any:
 		for _, elem := range curr {
@@ -1358,7 +1385,15 @@ func extractFloatSliceValues(node any, path []string) []float64 {
 	if !ok {
 		return nil
 	}
-	return extractFloatSliceValues(m[path[0]], path[1:])
+	if next, exists := m[path[0]]; exists {
+		return extractFloatSliceValues(next, path[1:])
+	}
+	for i := len(path); i > 1; i-- {
+		if next, exists := m[strings.Join(path[:i], ".")]; exists {
+			return extractFloatSliceValues(next, path[i:])
+		}
+	}
+	return nil
 }
 
 func cloneNestedMap(m map[string]any) map[string]any {

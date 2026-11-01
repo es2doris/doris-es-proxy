@@ -279,10 +279,24 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return nil
 	}
-	type knnAlias KNNQuery
-	var std knnAlias
-	if err := json.Unmarshal(trimmed, &std); err == nil && std.Field != "" {
-		*kq = KNNQuery(std)
+	type knnPlain KNNQuery
+	type knnAlias struct {
+		knnPlain
+		Vector []float64 `json:"vector,omitempty"`
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	if _, hasField := rawMap["field"]; hasField {
+		var std knnAlias
+		if err := json.Unmarshal(trimmed, &std); err != nil {
+			return err
+		}
+		if len(std.QueryVector) == 0 && len(std.Vector) > 0 {
+			std.QueryVector = std.Vector
+		}
+		*kq = KNNQuery(std.knnPlain)
 		return nil
 	}
 	// Support OpenSearch knn syntax: {"<field>": {"vector": [...], "k": 5, "filter": {...}}}
@@ -613,14 +627,15 @@ type TermsLookupSpec struct {
 // TermsQuery handles `"terms": {"field": ["a", "b"], "boost": 1.0}` as well as
 // Terms Lookup queries `"terms": {"field": {"index": "users", "id": "u1", "path": "roles"}}`.
 type TermsQuery struct {
-	Fields   map[string][]any
-	Lookups  map[string]TermsLookupSpec
-	Boost    float64
-	HasBoost bool
+	Fields          map[string][]any
+	Lookups         map[string]TermsLookupSpec
+	Boost           float64
+	HasBoost        bool
+	CaseInsensitive bool
 }
 
 func (tq TermsQuery) MarshalJSON() ([]byte, error) {
-	m := make(map[string]any, len(tq.Fields)+len(tq.Lookups)+1)
+	m := make(map[string]any, len(tq.Fields)+len(tq.Lookups)+2)
 	for k, v := range tq.Fields {
 		m[k] = v
 	}
@@ -630,12 +645,16 @@ func (tq TermsQuery) MarshalJSON() ([]byte, error) {
 	if tq.HasBoost || (tq.Boost != 0 && tq.Boost != 1.0) {
 		m["boost"] = tq.Boost
 	}
+	if tq.CaseInsensitive {
+		m["case_insensitive"] = true
+	}
 	return json.Marshal(m)
 }
 
 func (tq *TermsQuery) UnmarshalJSON(data []byte) error {
 	tq.Boost = 1.0
 	tq.HasBoost = false
+	tq.CaseInsensitive = false
 	tq.Fields = make(map[string][]any)
 	tq.Lookups = make(map[string]TermsLookupSpec)
 	var raw map[string]json.RawMessage
@@ -646,6 +665,19 @@ func (tq *TermsQuery) UnmarshalJSON(data []byte) error {
 		if k == "boost" {
 			_ = json.Unmarshal(v, &tq.Boost)
 			tq.HasBoost = true
+			continue
+		}
+		if k == "case_insensitive" {
+			var ci bool
+			if err := json.Unmarshal(v, &ci); err != nil {
+				var ciStr string
+				if json.Unmarshal(v, &ciStr) == nil {
+					ci = strings.EqualFold(strings.TrimSpace(ciStr), "true")
+				} else {
+					return fmt.Errorf("parsing_exception: [terms] invalid case_insensitive value: %w", err)
+				}
+			}
+			tq.CaseInsensitive = ci
 			continue
 		}
 		if k == "_name" {
@@ -1738,17 +1770,18 @@ func (a *AggSpec) SubAggs() map[string]AggSpec {
 }
 
 type TermsAggSpec struct {
-	Field         string `json:"field"`
-	Script        any    `json:"script,omitempty"`
-	Size          int    `json:"size,omitempty"`
-	Missing       any    `json:"missing,omitempty"`
-	MissingBucket bool   `json:"missing_bucket,omitempty"`
-	MissingOrder  string `json:"missing_order,omitempty"`
-	Order         any    `json:"order,omitempty"`
-	MinDocCount   *int   `json:"min_doc_count,omitempty"`
-	Include       any    `json:"include,omitempty"`
-	Exclude       any    `json:"exclude,omitempty"`
-	ValueType     string `json:"value_type,omitempty"`
+	Field            string `json:"field"`
+	Script           any    `json:"script,omitempty"`
+	Size             int    `json:"size,omitempty"`
+	Missing          any    `json:"missing,omitempty"`
+	MissingBucket    bool   `json:"missing_bucket,omitempty"`
+	MissingOrder     string `json:"missing_order,omitempty"`
+	Order            any    `json:"order,omitempty"`
+	MinDocCount      *int   `json:"min_doc_count,omitempty"`
+	Include          any    `json:"include,omitempty"`
+	Exclude          any    `json:"exclude,omitempty"`
+	ValueType        string `json:"value_type,omitempty"`
+	BackgroundFilter *Query `json:"background_filter,omitempty"`
 }
 
 type HistogramBoundsSpec struct {
@@ -2000,6 +2033,7 @@ type SortFieldSpec struct {
 	Missing string
 	Script  any
 	Type    string
+	Format  string
 	Nested  *NestedSortSpec
 }
 
@@ -2151,16 +2185,30 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 
 	reservedOpts := map[string]bool{
 		"order": true, "mode": true, "missing": true, "unmapped_type": true,
-		"numeric_type": true, "format": true, "nested": true, "nested_path": true,
+		"numeric_type": true, "type": true, "format": true, "nested": true, "nested_path": true,
 		"nested_filter": true, "unit": true, "distance_type": true,
 		"validation_method": true, "ignore_unmapped": true,
 	}
 	keys := make([]string, 0, len(m))
-	for k := range m {
+	for k, rawV := range m {
 		if len(m) > 1 && reservedOpts[k] {
+			vTrim := bytes.TrimSpace(rawV)
+			if len(vTrim) > 0 && vTrim[0] == '{' && k != "nested" && k != "nested_filter" {
+				keys = append(keys, k)
+			}
 			continue
 		}
 		keys = append(keys, k)
+	}
+	if len(keys) == 0 && len(m) > 0 {
+		for k, rawV := range m {
+			var strV string
+			if json.Unmarshal(rawV, &strV) == nil && (strings.EqualFold(strV, "asc") || strings.EqualFold(strV, "desc")) {
+				if k != "order" || len(m) == 1 {
+					keys = append(keys, k)
+				}
+			}
+		}
 	}
 	sort.Strings(keys)
 	if len(keys) > 0 {
@@ -2173,6 +2221,7 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 		missing := ""
 		mode := ""
 		sortType := ""
+		sortFormat := ""
 		if rawOrd, hasOrd := m["order"]; hasOrd && field != "order" {
 			var ordStr string
 			if json.Unmarshal(rawOrd, &ordStr) == nil && ordStr != "" {
@@ -2181,6 +2230,9 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 		}
 		if rawMode, hasMode := m["mode"]; hasMode && field != "mode" {
 			_ = json.Unmarshal(rawMode, &mode)
+		}
+		if rawFmt, hasFmt := m["format"]; hasFmt && field != "format" {
+			_ = json.Unmarshal(rawFmt, &sortFormat)
 		}
 		if rawMissing, hasMissing := m["missing"]; hasMissing && field != "missing" {
 			var mv any
@@ -2198,6 +2250,11 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 		if sortType == "" {
 			if rawNT, hasNT := m["numeric_type"]; hasNT && field != "numeric_type" {
 				_ = json.Unmarshal(rawNT, &sortType)
+			}
+		}
+		if sortType == "" {
+			if rawT, hasT := m["type"]; hasT && field != "type" {
+				_ = json.Unmarshal(rawT, &sortType)
 			}
 		}
 		var nestedSpec *NestedSortSpec
@@ -2233,6 +2290,8 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 				Missing      any             `json:"missing"`
 				UnmappedType string          `json:"unmapped_type"`
 				NumericType  string          `json:"numeric_type"`
+				Type         string          `json:"type"`
+				Format       string          `json:"format"`
 				Nested       *NestedSortSpec `json:"nested"`
 				NestedPath   string          `json:"nested_path"`
 				NestedFilter *Query          `json:"nested_filter"`
@@ -2243,6 +2302,9 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 			}
 			if obj.Mode != "" {
 				mode = obj.Mode
+			}
+			if obj.Format != "" {
+				sortFormat = obj.Format
 			}
 			if obj.Missing != nil {
 				if fv, ok := obj.Missing.(float64); ok && fv == math.Trunc(fv) && !math.IsInf(fv, 0) && !math.IsNaN(fv) {
@@ -2260,11 +2322,13 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 				sortType = obj.UnmappedType
 			} else if obj.NumericType != "" {
 				sortType = obj.NumericType
+			} else if obj.Type != "" {
+				sortType = obj.Type
 			}
-			s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Type: strings.ToLower(sortType), Nested: nestedSpec}
+			s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Type: strings.ToLower(sortType), Format: sortFormat, Nested: nestedSpec}
 			return nil
 		}
-		s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Type: strings.ToLower(sortType), Nested: nestedSpec}
+		s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Type: strings.ToLower(sortType), Format: sortFormat, Nested: nestedSpec}
 	}
 	return nil
 }

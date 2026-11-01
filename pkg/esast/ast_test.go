@@ -826,3 +826,52 @@ func TestRound33QueryStringOperatorAndSuggestRequest(t *testing.T) {
 		t.Fatalf("unexpected completion suggest spec: %+v", sr.Suggest["comp_sug"])
 	}
 }
+
+func TestRound34SortSpecTermsCaseInsensitiveAndKNN(t *testing.T) {
+	// F3: SortSpec with flat "type" and reserved field names ("mode", "format")
+	var sr SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"sort": [
+			{"weight": "asc", "type": "double", "format": "strict_date"},
+			{"mode": {"order": "desc", "missing": "_last"}, "ignore_unmapped": true},
+			{"mode": "desc", "missing": "_last"}
+		],
+		"query": {
+			"terms": {
+				"status": ["ACTIVE", "Pending"],
+				"case_insensitive": true,
+				"boost": 1.5
+			}
+		},
+		"knn": [
+			{"field": "emb", "vector": [0.1, 0.2, 0.3], "k": 5}
+		]
+	}`), &sr); err != nil {
+		t.Fatalf("unmarshal Round34 SearchRequest failed: %v", err)
+	}
+	if len(sr.Sort) != 3 {
+		t.Fatalf("expected 3 sort specs, got %d", len(sr.Sort))
+	}
+	if sr.Sort[0].Entry.Field != "weight" || sr.Sort[0].Entry.Order != "asc" || sr.Sort[0].Entry.Type != "double" || sr.Sort[0].Entry.Format != "strict_date" {
+		t.Fatalf("unexpected sort[0]: %+v", sr.Sort[0].Entry)
+	}
+	if sr.Sort[1].Entry.Field != "mode" || sr.Sort[1].Entry.Order != "desc" || sr.Sort[1].Entry.Missing != "_last" {
+		t.Fatalf("unexpected sort[1]: %+v", sr.Sort[1].Entry)
+	}
+	if sr.Sort[2].Entry.Field != "mode" || sr.Sort[2].Entry.Order != "desc" || sr.Sort[2].Entry.Missing != "_last" {
+		t.Fatalf("unexpected sort[2]: %+v", sr.Sort[2].Entry)
+	}
+	// F4: TermsQuery case_insensitive
+	if sr.Query == nil || sr.Query.Terms == nil || !sr.Query.Terms.CaseInsensitive || len(sr.Query.Terms.Fields["status"]) != 2 {
+		t.Fatalf("unexpected TermsQuery: %+v", sr.Query)
+	}
+	// F5: KNNQuery flat vector and filter error propagation
+	if len(sr.KNN) != 1 || sr.KNN[0].Field != "emb" || len(sr.KNN[0].QueryVector) != 3 {
+		t.Fatalf("unexpected KNNQuery: %+v", sr.KNN)
+	}
+	var badKNN KNNQuery
+	err := json.Unmarshal([]byte(`{"field": "emb", "query_vector": [0.1, 0.2], "k": 5, "filter": {"unknown_query_clause": {"x": 1}}}`), &badKNN)
+	if err == nil || !strings.Contains(err.Error(), "parsing_exception") {
+		t.Fatalf("expected parsing_exception for invalid KNN filter, got %v", err)
+	}
+}

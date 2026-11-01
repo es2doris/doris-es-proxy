@@ -21,7 +21,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	// #nosec G505 -- Community ID v1 network flow hashing specification requires SHA-1
+	// #nosec G501 -- Elasticsearch ingest fingerprint processor supports MD5
+	"crypto/md5"
+	// #nosec G505 -- Community ID v1 network flow hashing and ingest fingerprint processor support SHA-1
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -3270,6 +3272,17 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				buf.WriteString("|")
 				var digest []byte
 				switch strings.ToUpper(strings.TrimSpace(method)) {
+				case "MD5":
+					// #nosec G401 -- Elasticsearch ingest fingerprint processor supports MD5
+					sum := md5.Sum([]byte(buf.String()))
+					digest = sum[:]
+				case "SHA-1":
+					// #nosec G401 -- Elasticsearch ingest fingerprint processor supports SHA-1
+					sum := sha1.Sum([]byte(buf.String()))
+					digest = sum[:]
+				case "", "SHA-256":
+					sum := sha256.Sum256([]byte(buf.String()))
+					digest = sum[:]
 				case "SHA-384":
 					sum := sha512.Sum384([]byte(buf.String()))
 					digest = sum[:]
@@ -3277,8 +3290,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					sum := sha512.Sum512([]byte(buf.String()))
 					digest = sum[:]
 				default:
-					sum := sha256.Sum256([]byte(buf.String()))
-					digest = sum[:]
+					return false, false, procType, procTag, specMap, fmt.Errorf("unsupported fingerprint method [%s]", method)
 				}
 				setIngestPath(doc, target, hex.EncodeToString(digest))
 				mutated = true
@@ -3299,70 +3311,93 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 		if field != "" && len(patterns) > 0 {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				strVal, ok := val.(string)
-				if !ok {
-					strVal = fmt.Sprintf("%v", val)
-				}
-				for _, patAny := range patterns {
-					patStr, ok := patAny.(string)
-					if !ok || patStr == "" {
-						continue
+				redactOneString := func(strVal string) (string, error) {
+					for _, patAny := range patterns {
+						patStr, ok := patAny.(string)
+						if !ok || patStr == "" {
+							continue
+						}
+						re, grpMap, _, err := compileGrokRegex(patStr, customDefs)
+						if err != nil {
+							return "", err
+						}
+						subexpNames := re.SubexpNames()
+						locs := re.FindAllStringSubmatchIndex(strVal, -1)
+						if len(locs) == 0 {
+							continue
+						}
+						var b strings.Builder
+						lastPos := 0
+						for _, loc := range locs {
+							if loc[0] < lastPos {
+								continue
+							}
+							b.WriteString(strVal[lastPos:loc[0]])
+							type subSpan struct {
+								start int
+								end   int
+								label string
+							}
+							var spans []subSpan
+							for si := 1; si < len(subexpNames) && 2*si+1 < len(loc); si++ {
+								gID := subexpNames[si]
+								lbl := grpMap[gID]
+								if lbl == "" || loc[2*si] < 0 || loc[2*si+1] < loc[2*si] {
+									continue
+								}
+								if len(spans) > 0 && loc[2*si] < spans[len(spans)-1].end {
+									continue
+								}
+								spans = append(spans, subSpan{start: loc[2*si], end: loc[2*si+1], label: lbl})
+							}
+							if len(spans) == 0 {
+								b.WriteString(prefix + "REDACTED" + suffix)
+							} else {
+								cur := loc[0]
+								for _, sp := range spans {
+									if sp.start > cur {
+										b.WriteString(strVal[cur:sp.start])
+									}
+									b.WriteString(prefix + sp.label + suffix)
+									cur = sp.end
+								}
+								if cur < loc[1] {
+									b.WriteString(strVal[cur:loc[1]])
+								}
+							}
+							lastPos = loc[1]
+						}
+						b.WriteString(strVal[lastPos:])
+						strVal = b.String()
 					}
-					re, grpMap, _, err := compileGrokRegex(patStr, customDefs)
+					return strVal, nil
+				}
+				switch tv := val.(type) {
+				case string:
+					redacted, err := redactOneString(tv)
 					if err != nil {
 						return false, false, procType, procTag, specMap, err
 					}
-					subexpNames := re.SubexpNames()
-					locs := re.FindAllStringSubmatchIndex(strVal, -1)
-					if len(locs) == 0 {
-						continue
+					setIngestPath(doc, field, redacted)
+					mutated = true
+				case []any:
+					outSlice := make([]any, len(tv))
+					for idx, elem := range tv {
+						elemStr, ok := elem.(string)
+						if !ok {
+							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] element at index [%d] is not a string", field, idx)
+						}
+						redacted, err := redactOneString(elemStr)
+						if err != nil {
+							return false, false, procType, procTag, specMap, err
+						}
+						outSlice[idx] = redacted
 					}
-					var b strings.Builder
-					lastPos := 0
-					for _, loc := range locs {
-						if loc[0] < lastPos {
-							continue
-						}
-						b.WriteString(strVal[lastPos:loc[0]])
-						type subSpan struct {
-							start int
-							end   int
-							label string
-						}
-						var spans []subSpan
-						for si := 1; si < len(subexpNames) && 2*si+1 < len(loc); si++ {
-							gID := subexpNames[si]
-							lbl := grpMap[gID]
-							if lbl == "" || loc[2*si] < 0 || loc[2*si+1] < loc[2*si] {
-								continue
-							}
-							if len(spans) > 0 && loc[2*si] < spans[len(spans)-1].end {
-								continue
-							}
-							spans = append(spans, subSpan{start: loc[2*si], end: loc[2*si+1], label: lbl})
-						}
-						if len(spans) == 0 {
-							b.WriteString(prefix + "REDACTED" + suffix)
-						} else {
-							cur := loc[0]
-							for _, sp := range spans {
-								if sp.start > cur {
-									b.WriteString(strVal[cur:sp.start])
-								}
-								b.WriteString(prefix + sp.label + suffix)
-								cur = sp.end
-							}
-							if cur < loc[1] {
-								b.WriteString(strVal[cur:loc[1]])
-							}
-						}
-						lastPos = loc[1]
-					}
-					b.WriteString(strVal[lastPos:])
-					strVal = b.String()
+					setIngestPath(doc, field, outSlice)
+					mutated = true
+				default:
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] of type [%T] is not supported for redact processor", field, val)
 				}
-				setIngestPath(doc, field, strVal)
-				mutated = true
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
@@ -3396,12 +3431,14 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					return false, false, procType, procTag, specMap, fmt.Errorf("failed to base64-decode attachment field [%s]: %w", field, err)
 				}
 				content := string(decoded)
-				if indexedChars >= 0 && len(content) > indexedChars {
-					content = content[:indexedChars]
+				runes := []rune(content)
+				origRuneLen := len(runes)
+				if indexedChars >= 0 && len(runes) > indexedChars {
+					content = string(runes[:indexedChars])
 				}
 				attMap := map[string]any{
 					"content":        content,
-					"content_length": len(content),
+					"content_length": origRuneLen,
 					"content_type":   http.DetectContentType(decoded),
 				}
 				setIngestPath(doc, target, attMap)
@@ -3773,7 +3810,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 		params, _ := specMap["params"].(map[string]any)
 		if src != "" {
-			_, hadOpField := doc["op"]
+			origOpVal, hadOpField := doc["op"]
 			normSrc := rewriteIngestCtxReferences(src)
 			docBytes, err := json.Marshal(doc)
 			if err == nil {
@@ -3795,13 +3832,15 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					dec2 := json.NewDecoder(bytes.NewReader(mutatedBytes))
 					dec2.UseNumber()
 					if err := dec2.Decode(&nextDoc); err == nil && nextDoc != nil {
-						if !hadOpField {
-							if opStr, isStr := nextDoc["op"].(string); isStr {
-								switch strings.ToLower(strings.TrimSpace(opStr)) {
-								case "delete", "drop":
-									return false, true, procType, procTag, specMap, nil
-								case "noop", "none":
-									return false, false, procType, procTag, specMap, nil
+						if opStr, isStr := nextDoc["op"].(string); isStr && (!hadOpField || origOpVal != opStr) {
+							switch strings.ToLower(strings.TrimSpace(opStr)) {
+							case "delete", "drop":
+								return false, true, procType, procTag, specMap, nil
+							case "noop", "none":
+								return false, false, procType, procTag, specMap, nil
+							case "index", "create":
+								if !hadOpField {
+									delete(nextDoc, "op")
 								}
 							}
 						}
@@ -6275,6 +6314,7 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 			if docMap == nil {
 				docMap = make(map[string]any)
 			}
+			docMap["__meta_id"] = docID
 			baseScore := scoreVal
 			if effQuery != nil && ((effQuery.ScriptScore != nil && effQuery.ScriptScore.Query == nil) || (effQuery.FunctionScore != nil && effQuery.FunctionScore.Query == nil)) {
 				baseScore = 1.0
@@ -6841,6 +6881,12 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 		s.mu.RLock()
 		pol := s.enrichPolicies[policyName]
 		s.mu.RUnlock()
+		if pol == nil {
+			_ = s.syncCatalogFromBackend(context.Background())
+			s.mu.RLock()
+			pol = s.enrichPolicies[policyName]
+			s.mu.RUnlock()
+		}
 		if pol != nil {
 			hadConfiguredSource = true
 			pIdx, pMF, pEF := extractEnrichPolicyMeta(pol)
@@ -6866,17 +6912,30 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 	if matchField == "" {
 		matchField = field
 	}
-	matchKey := fmt.Sprintf("%v", val)
+	var matchKeys []string
+	if valSlice, isSlice := val.([]any); isSlice {
+		for _, elem := range valSlice {
+			if elem != nil {
+				matchKeys = append(matchKeys, fmt.Sprintf("%v", elem))
+			}
+		}
+	} else {
+		matchKeys = []string{fmt.Sprintf("%v", val)}
+	}
 	var matches []any
 	if entries, ok := specMap["entries"].(map[string]any); ok {
 		hadConfiguredSource = true
-		if entry, hasE := entries[matchKey]; hasE {
-			matches = append(matches, entry)
+		for _, mk := range matchKeys {
+			if entry, hasE := entries[mk]; hasE {
+				matches = append(matches, entry)
+			}
 		}
 	} else if lookup, ok := specMap["lookup"].(map[string]any); ok {
 		hadConfiguredSource = true
-		if entry, hasL := lookup[matchKey]; hasL {
-			matches = append(matches, entry)
+		for _, mk := range matchKeys {
+			if entry, hasL := lookup[mk]; hasL {
+				matches = append(matches, entry)
+			}
 		}
 	}
 	if len(matches) == 0 && s != nil && (policyName != "" || len(policyIndices) > 0) {
@@ -6898,10 +6957,21 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 				continue
 			}
 			hadConfiguredSource = true
-			q := &esast.Query{
-				Term: map[string]esast.TermEntry{
-					matchField: {Value: val},
-				},
+			var q *esast.Query
+			if valSlice, isSlice := val.([]any); isSlice {
+				q = &esast.Query{
+					Terms: &esast.TermsQuery{
+						Fields: map[string][]any{
+							matchField: valSlice,
+						},
+					},
+				}
+			} else {
+				q = &esast.Query{
+					Term: map[string]esast.TermEntry{
+						matchField: {Value: val},
+					},
+				}
 			}
 			sz := maxMatches
 			resp, _, errType, _ := s.executeSearchRequest(context.Background(), cIdx, &esast.SearchRequest{

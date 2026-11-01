@@ -256,10 +256,18 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 	// Any remaining unresolved alias (pointing to a dynamic/unmapped field) falls back to StorageDynamicVariant on AliasTarget.
 	for k, b := range s.Fields {
 		if b.AliasTarget != "" && b.ColumnName == "" {
+			cleanTarget := strings.TrimSuffix(b.AliasTarget, ".keyword")
+			if tb, ok := s.Fields[cleanTarget]; ok && tb.ColumnName != "" {
+				aliased := tb
+				aliased.ESFieldPath = k
+				aliased.AliasTarget = b.AliasTarget
+				s.Fields[k] = aliased
+				continue
+			}
 			b.Kind = StorageDynamicVariant
 			b.DorisType = DorisString
 			b.ESType = "keyword"
-			b.SourceJSONPath = strings.Split(b.AliasTarget, ".")
+			b.SourceJSONPath = strings.Split(cleanTarget, ".")
 			s.Fields[k] = b
 		}
 	}

@@ -1588,4 +1588,78 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	if r33SimDoc["fallback"] != "ok" || r33SimDoc["re_ok"] != true || r33SimDoc["joined"] != "a,b" || r33SimDoc["secret"] != "pin <REDACTED>" || r33SimDoc["fp"] == nil {
 		t.Fatalf("unexpected R33 simulated doc: %+v", r33SimDoc)
 	}
+
+	// =========================================================================
+	// Round-34 Live Doris E2E Verification:
+	// 1. typed_keys on significant_text, diversified_sampler, histogram + case_insensitive terms query
+	// 2. Painless boolean bitwise (&, |, ^), flatMap, fingerprint MD5, array redact, and uri_parts/kv in _simulate
+	// =========================================================================
+	r34AggResp, err := http.Post(ts.URL+"/live_auto_index/_search?typed_keys=true", "application/json", strings.NewReader(`{
+		"size": 0,
+		"query": {
+			"terms": {
+				"service": ["CHECKOUT-API", "BILLING-API"],
+				"case_insensitive": true
+			}
+		},
+		"aggs": {
+			"sig_srv": {
+				"significant_text": {
+					"field": "service",
+					"min_doc_count": 1
+				}
+			},
+			"dsamp": {
+				"diversified_sampler": {
+					"shard_size": 2,
+					"field": "service"
+				}
+			},
+			"lat_h": {
+				"histogram": {
+					"field": "latency_ms",
+					"interval": 20
+				}
+			}
+		}
+	}`))
+	if err != nil || r34AggResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /live_auto_index/_search?typed_keys=true (R34) failed: status=%v err=%v", r34AggResp.StatusCode, err)
+	}
+	var r34AggRes map[string]any
+	_ = json.NewDecoder(r34AggResp.Body).Decode(&r34AggRes)
+	_ = r34AggResp.Body.Close()
+	r34Aggs, _ := r34AggRes["aggregations"].(map[string]any)
+	if r34Aggs["significant_text#sig_srv"] == nil || r34Aggs["diversified_sampler#dsamp"] == nil || r34Aggs["histogram#lat_h"] == nil {
+		t.Fatalf("expected significant_text#sig_srv, diversified_sampler#dsamp, and histogram#lat_h in R34 typed_keys response, got %+v", r34Aggs)
+	}
+
+	r34SimResp, err := http.Post(ts.URL+"/_ingest/pipeline/_simulate", "application/json", strings.NewReader(`{
+		"pipeline": {
+			"processors": [
+				{
+					"script": {
+						"source": "ctx.bw_ok = (ctx.a == 1 & ctx.b == 2) & !(false & false); ctx.flat = [[1, 2], [3]].stream().flatMap(x -> x.stream()).collect(Collectors.toList());"
+					}
+				},
+				{"fingerprint": {"fields": ["raw"], "target_field": "fp_md5", "method": "MD5"}},
+				{"redact": {"field": "notes", "patterns": ["%{EMAILADDRESS:EMAIL}"]}},
+				{"uri_parts": {"field": "url", "target_field": "parsed_url"}},
+				{"kv": {"field": "kv_raw", "field_split": "&", "value_split": "=", "exclude_keys": ["secret"], "prefix": "q_"}}
+			]
+		},
+		"docs": [
+			{"_index": "live_auto_index", "_id": "r34-sim-1", "_source": {"a": 1, "b": 2, "raw": "item123", "notes": ["mail ops@example.com"], "url": "https://example.com:8443/app/index.html?x=1#top", "kv_raw": "a=1&secret=xyz"}}
+		]
+	}`))
+	if err != nil || r34SimResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_ingest/pipeline/_simulate (R34) failed: status=%v err=%v", r34SimResp.StatusCode, err)
+	}
+	var r34SimRes map[string]any
+	_ = json.NewDecoder(r34SimResp.Body).Decode(&r34SimRes)
+	_ = r34SimResp.Body.Close()
+	r34SimDoc := r34SimRes["docs"].([]any)[0].(map[string]any)["doc"].(map[string]any)["_source"].(map[string]any)
+	if r34SimDoc["bw_ok"] != true || len(r34SimDoc["fp_md5"].(string)) != 32 || r34SimDoc["q_a"] != "1" || r34SimDoc["q_secret"] != nil {
+		t.Fatalf("unexpected R34 simulated doc: %+v", r34SimDoc)
+	}
 }
