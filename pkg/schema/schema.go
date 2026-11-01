@@ -211,11 +211,11 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 	}
 	for target := range copyToTargets {
 		if tb, ok := s.Fields[target]; ok {
-			if tb.Kind == StoragePromotedScalar && tb.ESType != "text" {
+			if tb.Kind == StoragePromotedScalar && tb.ESType != "text" && tb.ESType != "match_only_text" {
 				tb.Kind = StoragePromotedArray
 				tb.IsMultiValued = true
 				s.Fields[target] = tb
-			} else if tb.Kind == StorageNestedSubfield && tb.ESType != "text" {
+			} else if tb.Kind == StorageNestedSubfield && tb.ESType != "text" && tb.ESType != "match_only_text" {
 				tb.IsMultiValued = true
 				s.Fields[target] = tb
 			}

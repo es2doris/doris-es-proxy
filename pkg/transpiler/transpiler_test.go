@@ -878,8 +878,8 @@ func TestTranspiler_Round3DeepEvalFixes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(plan3.HitsSQL, "json_extract_string(_el, '$.ts') >= '2026-10-01T00:00:00Z'") {
-		t.Fatalf("expected nested date range to preserve ISO string in json_extract_string, got:\n%s", plan3.HitsSQL)
+	if !strings.Contains(plan3.HitsSQL, "CAST(json_extract_string(_el, '$.ts') AS BIGINT) >= 1790812800000") {
+		t.Fatalf("expected nested date range to normalize ISO string to epoch millis in json_extract_string, got:\n%s", plan3.HitsSQL)
 	}
 	if !strings.Contains(plan3.AggsSQL, "COALESCE(CAST(`f__env` AS STRING), 'N/A')") {
 		t.Fatalf("expected terms missing to emit COALESCE(CAST(`f__env` AS STRING), 'N/A'), got:\n%s", plan3.AggsSQL)
@@ -1119,8 +1119,8 @@ func TestRound29TranspilerNestedDateBoundsRelativeNestedPathsLuceneExistsAndSubA
 	if err != nil {
 		t.Fatalf("BuildSearchPlan(reqNestedRange) failed: %v", err)
 	}
-	if !strings.Contains(planNR.HitsSQL, "'2026-10-01T00:00:00Z'") || !strings.Contains(planNR.HitsSQL, "'2026-10-02T23:59:59Z'") {
-		t.Fatalf("expected nested date gt/lte ISO bounds to remain ISO strings, got:\n%s", planNR.HitsSQL)
+	if !strings.Contains(planNR.HitsSQL, "1790812800000") || !strings.Contains(planNR.HitsSQL, "1790985599000") {
+		t.Fatalf("expected nested date gt/lte ISO bounds to normalize to epoch millis, got:\n%s", planNR.HitsSQL)
 	}
 	if !strings.Contains(planNR.HitsSQL, "$.title__keyword") {
 		t.Fatalf("expected relative nested title.keyword and nested sort filter to route to $.title__keyword, got:\n%s", planNR.HitsSQL)

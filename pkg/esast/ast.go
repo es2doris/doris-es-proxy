@@ -576,6 +576,60 @@ var knownQueryClauses = map[string]bool{
 	"script_score":        true,
 	"script":              true,
 	"knn":                 true,
+	"_name":               true,
+	"boost":               true,
+}
+
+func parseFlexibleBool(v any) (bool, error) {
+	switch val := v.(type) {
+	case nil:
+		return false, nil
+	case bool:
+		return val, nil
+	case string:
+		switch strings.ToLower(strings.TrimSpace(val)) {
+		case "true", "1":
+			return true, nil
+		case "false", "0", "":
+			return false, nil
+		default:
+			return false, fmt.Errorf("parsing_exception: invalid boolean value [%s]", val)
+		}
+	default:
+		return false, fmt.Errorf("parsing_exception: invalid boolean value [%v]", val)
+	}
+}
+
+func stripNamedQueryAndMapBoost(rawClause json.RawMessage, requireMultipleKeysForBoost bool) (json.RawMessage, *float64) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(rawClause, &m); err != nil {
+		return rawClause, nil
+	}
+	modified := false
+	if _, hasName := m["_name"]; hasName {
+		delete(m, "_name")
+		modified = true
+	}
+	var mapBoost *float64
+	if rawBoost, hasBoost := m["boost"]; hasBoost && (!requireMultipleKeysForBoost || len(m) > 1) {
+		tb := bytes.TrimSpace(rawBoost)
+		if len(tb) > 0 && tb[0] != '{' {
+			var b float64
+			if json.Unmarshal(tb, &b) == nil {
+				mapBoost = &b
+			}
+			delete(m, "boost")
+			modified = true
+		}
+	}
+	if !modified {
+		return rawClause, nil
+	}
+	cleaned, err := json.Marshal(m)
+	if err != nil {
+		return rawClause, mapBoost
+	}
+	return cleaned, mapBoost
 }
 
 func (q *Query) UnmarshalJSON(data []byte) error {
@@ -592,10 +646,138 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: unknown query clause [%s]", k)
 		}
 	}
+	mapBoosts := make(map[string]*float64)
+	rawModified := false
+	for _, clauseKey := range []string{
+		"range", "terms_set",
+		"term", "prefix", "wildcard", "regexp", "fuzzy",
+		"match", "match_phrase", "match_phrase_prefix", "match_bool_prefix",
+	} {
+		if rawClause, ok := raw[clauseKey]; ok {
+			reqMulti := clauseKey != "range" && clauseKey != "terms_set"
+			cleaned, mb := stripNamedQueryAndMapBoost(rawClause, reqMulti)
+			if !bytes.Equal(cleaned, rawClause) {
+				raw[clauseKey] = cleaned
+				rawModified = true
+			}
+			if mb != nil {
+				mapBoosts[clauseKey] = mb
+			}
+		}
+	}
+	if rawModified {
+		if reMarshaled, err := json.Marshal(raw); err == nil {
+			trimmed = reMarshaled
+		}
+	}
 	type queryAlias Query
 	var alias queryAlias
 	if err := json.Unmarshal(trimmed, &alias); err != nil {
 		return err
+	}
+	delete(alias.Term, "_name")
+	delete(alias.TermsSet, "_name")
+	delete(alias.Range, "_name")
+	delete(alias.Prefix, "_name")
+	delete(alias.Wildcard, "_name")
+	delete(alias.Regexp, "_name")
+	delete(alias.Fuzzy, "_name")
+	delete(alias.Match, "_name")
+	delete(alias.MatchPhrase, "_name")
+	delete(alias.MatchPhrasePrefix, "_name")
+	delete(alias.MatchBoolPrefix, "_name")
+	if b := mapBoosts["range"]; b != nil {
+		for k, rc := range alias.Range {
+			if rc.Boost == nil {
+				v := *b
+				rc.Boost = &v
+				alias.Range[k] = rc
+			}
+		}
+	}
+	if b := mapBoosts["terms_set"]; b != nil {
+		for k, ts := range alias.TermsSet {
+			if ts.Boost == nil {
+				v := *b
+				ts.Boost = &v
+				alias.TermsSet[k] = ts
+			}
+		}
+	}
+	if b := mapBoosts["term"]; b != nil {
+		for k, te := range alias.Term {
+			if te.Boost == 1.0 {
+				te.Boost = *b
+				alias.Term[k] = te
+			}
+		}
+	}
+	if b := mapBoosts["prefix"]; b != nil {
+		for k, pe := range alias.Prefix {
+			if !pe.HasBoost {
+				pe.Boost = *b
+				pe.HasBoost = true
+				alias.Prefix[k] = pe
+			}
+		}
+	}
+	if b := mapBoosts["wildcard"]; b != nil {
+		for k, we := range alias.Wildcard {
+			if !we.HasBoost {
+				we.Boost = *b
+				we.HasBoost = true
+				alias.Wildcard[k] = we
+			}
+		}
+	}
+	if b := mapBoosts["regexp"]; b != nil {
+		for k, re := range alias.Regexp {
+			if !re.HasBoost {
+				re.Boost = *b
+				re.HasBoost = true
+				alias.Regexp[k] = re
+			}
+		}
+	}
+	if b := mapBoosts["fuzzy"]; b != nil {
+		for k, fe := range alias.Fuzzy {
+			if fe.Boost == 1.0 {
+				fe.Boost = *b
+				alias.Fuzzy[k] = fe
+			}
+		}
+	}
+	if b := mapBoosts["match"]; b != nil {
+		for k, me := range alias.Match {
+			if me.Boost == 1.0 {
+				me.Boost = *b
+				alias.Match[k] = me
+			}
+		}
+	}
+	if b := mapBoosts["match_phrase"]; b != nil {
+		for k, pe := range alias.MatchPhrase {
+			if pe.Boost == 1.0 {
+				pe.Boost = *b
+				alias.MatchPhrase[k] = pe
+			}
+		}
+	}
+	if b := mapBoosts["match_phrase_prefix"]; b != nil {
+		for k, pe := range alias.MatchPhrasePrefix {
+			if pe.Boost == 1.0 {
+				pe.Boost = *b
+				alias.MatchPhrasePrefix[k] = pe
+			}
+		}
+	}
+	if b := mapBoosts["match_bool_prefix"]; b != nil {
+		for k, pe := range alias.MatchBoolPrefix {
+			if pe.Boost == 1.0 {
+				pe.Boost = *b
+				alias.MatchBoolPrefix[k] = pe
+			}
+		}
 	}
 	*q = Query(alias)
 	return nil
@@ -731,15 +913,19 @@ func (f *FuzzyEntry) UnmarshalJSON(data []byte) error {
 		var full struct {
 			Value           any      `json:"value"`
 			Fuzziness       any      `json:"fuzziness"`
-			CaseInsensitive bool     `json:"case_insensitive"`
+			CaseInsensitive any      `json:"case_insensitive"`
 			Boost           *float64 `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
 		}
+		ci, err := parseFlexibleBool(full.CaseInsensitive)
+		if err != nil {
+			return err
+		}
 		f.Value = full.Value
 		f.Fuzziness = full.Fuzziness
-		f.CaseInsensitive = full.CaseInsensitive
+		f.CaseInsensitive = ci
 		if full.Boost != nil {
 			f.Boost = *full.Boost
 		}
@@ -849,16 +1035,20 @@ func (t *TermEntry) UnmarshalJSON(data []byte) error {
 		var full struct {
 			Value           any      `json:"value"`
 			Boost           *float64 `json:"boost"`
-			CaseInsensitive bool     `json:"case_insensitive"`
+			CaseInsensitive any      `json:"case_insensitive"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
+			return err
+		}
+		ci, err := parseFlexibleBool(full.CaseInsensitive)
+		if err != nil {
 			return err
 		}
 		t.Value = full.Value
 		if full.Boost != nil {
 			t.Boost = *full.Boost
 		}
-		t.CaseInsensitive = full.CaseInsensitive
+		t.CaseInsensitive = ci
 		return nil
 	}
 	return json.Unmarshal(trimmed, &t.Value)
@@ -949,10 +1139,14 @@ func (p *PrefixEntry) UnmarshalJSON(data []byte) error {
 		var full struct {
 			Value           any      `json:"value"`
 			Prefix          any      `json:"prefix"`
-			CaseInsensitive bool     `json:"case_insensitive"`
+			CaseInsensitive any      `json:"case_insensitive"`
 			Boost           *float64 `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
+			return err
+		}
+		ci, err := parseFlexibleBool(full.CaseInsensitive)
+		if err != nil {
 			return err
 		}
 		if full.Value != nil {
@@ -960,7 +1154,7 @@ func (p *PrefixEntry) UnmarshalJSON(data []byte) error {
 		} else if full.Prefix != nil {
 			p.Value = fmt.Sprintf("%v", full.Prefix)
 		}
-		p.CaseInsensitive = full.CaseInsensitive
+		p.CaseInsensitive = ci
 		if full.Boost != nil {
 			p.Boost = *full.Boost
 			p.HasBoost = true
@@ -991,10 +1185,14 @@ func (w *WildcardEntry) UnmarshalJSON(data []byte) error {
 		var full struct {
 			Value           any      `json:"value"`
 			Wildcard        any      `json:"wildcard"`
-			CaseInsensitive bool     `json:"case_insensitive"`
+			CaseInsensitive any      `json:"case_insensitive"`
 			Boost           *float64 `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
+			return err
+		}
+		ci, err := parseFlexibleBool(full.CaseInsensitive)
+		if err != nil {
 			return err
 		}
 		if full.Value != nil {
@@ -1002,7 +1200,7 @@ func (w *WildcardEntry) UnmarshalJSON(data []byte) error {
 		} else if full.Wildcard != nil {
 			w.Value = fmt.Sprintf("%v", full.Wildcard)
 		}
-		w.CaseInsensitive = full.CaseInsensitive
+		w.CaseInsensitive = ci
 		if full.Boost != nil {
 			w.Boost = *full.Boost
 			w.HasBoost = true
@@ -1033,10 +1231,14 @@ func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
 		var full struct {
 			Value           any      `json:"value"`
 			Regexp          any      `json:"regexp"`
-			CaseInsensitive bool     `json:"case_insensitive"`
+			CaseInsensitive any      `json:"case_insensitive"`
 			Boost           *float64 `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
+			return err
+		}
+		ci, err := parseFlexibleBool(full.CaseInsensitive)
+		if err != nil {
 			return err
 		}
 		if full.Value != nil {
@@ -1044,7 +1246,7 @@ func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
 		} else if full.Regexp != nil {
 			r.Value = fmt.Sprintf("%v", full.Regexp)
 		}
-		r.CaseInsensitive = full.CaseInsensitive
+		r.CaseInsensitive = ci
 		if full.Boost != nil {
 			r.Boost = *full.Boost
 			r.HasBoost = true
@@ -1215,6 +1417,7 @@ type FunctionScoreQuery struct {
 	Weight           *float64                 `json:"weight,omitempty"`
 	FieldValueFactor *FieldValueFactorSpec    `json:"field_value_factor,omitempty"`
 	ScriptScore      *ScriptScoreFunctionSpec `json:"script_score,omitempty"`
+	RandomScore      *RandomScoreSpec         `json:"random_score,omitempty"`
 }
 
 type ScoreFunctionSpec struct {
@@ -1222,6 +1425,12 @@ type ScoreFunctionSpec struct {
 	Weight           *float64                 `json:"weight,omitempty"`
 	FieldValueFactor *FieldValueFactorSpec    `json:"field_value_factor,omitempty"`
 	ScriptScore      *ScriptScoreFunctionSpec `json:"script_score,omitempty"`
+	RandomScore      *RandomScoreSpec         `json:"random_score,omitempty"`
+}
+
+type RandomScoreSpec struct {
+	Seed  any    `json:"seed,omitempty"`
+	Field string `json:"field,omitempty"`
 }
 
 type ScriptScoreFunctionSpec struct {
@@ -2072,7 +2281,7 @@ func (s SortSpec) MarshalJSON() ([]byte, error) {
 		}
 		return json.Marshal(map[string]any{"_geo_distance": inner})
 	}
-	if s.Entry.Mode != "" || s.Entry.Missing != "" || s.Entry.Nested != nil || s.Entry.Type != "" {
+	if s.Entry.Mode != "" || s.Entry.Missing != "" || s.Entry.Nested != nil || s.Entry.Type != "" || s.Entry.Format != "" {
 		inner := map[string]any{"order": order}
 		if s.Entry.Mode != "" {
 			inner["mode"] = s.Entry.Mode
@@ -2082,6 +2291,9 @@ func (s SortSpec) MarshalJSON() ([]byte, error) {
 		}
 		if s.Entry.Type != "" {
 			inner["type"] = s.Entry.Type
+		}
+		if s.Entry.Format != "" {
+			inner["format"] = s.Entry.Format
 		}
 		if s.Entry.Nested != nil {
 			inner["nested"] = s.Entry.Nested

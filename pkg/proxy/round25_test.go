@@ -345,7 +345,7 @@ func TestRound25_P0_2_CompositeSubAggsAndDynamicNestedFilters(t *testing.T) {
 	}
 	cb0 := compBuckets[0].(map[string]any)
 	keyMap := cb0["key"].(map[string]any)
-	if keyMap["env"] != "prod" || keyMap["act"] != "true" {
+	if keyMap["env"] != "prod" || keyMap["act"] != true {
 		t.Fatalf("expected composite key env=prod, act=true, got %v", keyMap)
 	}
 	if cb0["total_amt"].(map[string]any)["value"] != float64(150) {
