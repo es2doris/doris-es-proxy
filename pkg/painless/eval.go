@@ -5710,11 +5710,14 @@ func parseHexOrBinaryIntLiteralPainless(s string) (int64, bool) {
 	if digits == "" {
 		return 0, false
 	}
-	if iv, err := strconv.ParseInt(digits, base, 64); err == nil {
-		return sign * iv, true
+	if sign < 0 {
+		if iv, err := strconv.ParseInt("-"+digits, base, 64); err == nil {
+			return iv, true
+		}
+		return 0, false
 	}
-	if uv, err := strconv.ParseUint(digits, base, 64); err == nil {
-		return sign * int64(uv), true
+	if iv, err := strconv.ParseInt(digits, base, 64); err == nil {
+		return iv, true
 	}
 	return 0, false
 }
