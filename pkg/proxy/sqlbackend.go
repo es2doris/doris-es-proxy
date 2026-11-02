@@ -334,6 +334,8 @@ func (b *DorisSQLBackend) QueryAggs(ctx context.Context, aggsSQL string) ([]AggR
 		if nullVal.Valid && !math.IsNaN(nullVal.Float64) && !math.IsInf(nullVal.Float64, 0) {
 			r.Value = nullVal.Float64
 			r.DocCount = int64(nullVal.Float64)
+		} else {
+			r.Weight = -1
 		}
 		out = append(out, r)
 	}

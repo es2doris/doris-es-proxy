@@ -130,7 +130,7 @@ func (c *StreamLoadCoalescer) Submit(ctx context.Context, table string, ndjson [
 			delete(c.inflight, b)
 			c.mu.Unlock()
 		}()
-		flushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
 		c.executeBatch(flushCtx, table, b, syncRefresh)
 		return b.err
@@ -157,10 +157,10 @@ func (c *StreamLoadCoalescer) Submit(ctx context.Context, table string, ndjson [
 // previously submitted writes.
 func (c *StreamLoadCoalescer) FlushTable(ctx context.Context, table string) error {
 	c.mu.Lock()
-	var waitChs []chan struct{}
+	var waitBatches []*coalesceBatch
 	for ib, tbl := range c.inflight {
 		if tbl == table {
-			waitChs = append(waitChs, ib.done)
+			waitBatches = append(waitBatches, ib)
 		}
 	}
 	b, exists := c.batches[table]
@@ -185,36 +185,44 @@ func (c *StreamLoadCoalescer) FlushTable(ctx context.Context, table string) erro
 			c.executeBatch(flushCtx, table, b, true)
 		}()
 	}
-	for _, ch := range waitChs {
+	var firstErr error
+	if exists && b.err != nil {
+		firstErr = b.err
+	}
+	for _, ib := range waitBatches {
 		select {
-		case <-ch:
+		case <-ib.done:
+			if ib.err != nil && firstErr == nil {
+				firstErr = ib.err
+			}
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
-	if exists {
-		return b.err
-	}
-	return nil
+	return firstErr
 }
 
 // FlushAll stops any pending group-commit timers and synchronously flushes all buffered batches.
 func (c *StreamLoadCoalescer) FlushAll(ctx context.Context) error {
 	c.mu.Lock()
-	var waitChs []chan struct{}
+	var waitBatches []*coalesceBatch
 	for ib := range c.inflight {
-		waitChs = append(waitChs, ib.done)
+		waitBatches = append(waitBatches, ib)
 	}
 	if len(c.batches) == 0 {
 		c.mu.Unlock()
-		for _, ch := range waitChs {
+		var firstErr error
+		for _, ib := range waitBatches {
 			select {
-			case <-ch:
+			case <-ib.done:
+				if ib.err != nil && firstErr == nil {
+					firstErr = ib.err
+				}
 			case <-ctx.Done():
 				return ctx.Err()
 			}
 		}
-		return nil
+		return firstErr
 	}
 	pending := make(map[string]*coalesceBatch, len(c.batches))
 	for tbl, b := range c.batches {
@@ -239,9 +247,12 @@ func (c *StreamLoadCoalescer) FlushAll(ctx context.Context) error {
 			firstErr = b.err
 		}
 	}
-	for _, ch := range waitChs {
+	for _, ib := range waitBatches {
 		select {
-		case <-ch:
+		case <-ib.done:
+			if ib.err != nil && firstErr == nil {
+				firstErr = ib.err
+			}
 		case <-ctx.Done():
 			if firstErr == nil {
 				firstErr = ctx.Err()

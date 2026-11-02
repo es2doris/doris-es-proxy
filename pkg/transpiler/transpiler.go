@@ -2033,6 +2033,7 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 						}
 					}
 				}
+				val = normalizeScaledFloatValue(b, val)
 				val = normalizeDateNanosValue(b.ESType, val)
 				parts = append(parts, fmt.Sprintf("array_contains(`%s`, %s)", arrCol, quoteStr(fmt.Sprintf("%v", val))))
 			}
@@ -2047,6 +2048,9 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 			_, b := t.resolveFieldInNestedCtx(cleanField, true, nctx)
 			if b.Kind == schema.StorageNestedSubfield && b.NestedPath == nestedPath && b.PrefilterArrayCol != "" && len(vals) > 0 {
 				effLower := b.EffectiveLowercase(true)
+				if q.Terms.CaseInsensitive && !effLower {
+					continue
+				}
 				arrCol := b.EffectiveArrayColumn(true)
 				if b.ESType == "ip" {
 					hasCIDR := false
@@ -2076,6 +2080,7 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 							}
 						}
 					}
+					v = normalizeScaledFloatValue(b, v)
 					v = normalizeDateNanosValue(b.ESType, v)
 					quoted = append(quoted, quoteStr(fmt.Sprintf("%v", v)))
 				}
@@ -2418,6 +2423,8 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 	if effDT == schema.DorisBoolean {
 		if bv, ok := normalizeBooleanQueryValue(val); ok {
 			val = bv
+		} else if b.ESType != "" {
+			return "FALSE"
 		}
 	} else if strVal, ok := val.(string); ok {
 		if effLower && effDT != schema.DorisBigInt && effDT != schema.DorisInt && effDT != schema.DorisDouble && b.ESType != "date" && b.ESType != "date_nanos" {
@@ -2469,8 +2476,22 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 				rawLit := quoteStr(fmt.Sprintf("%v", val))
 				_, isStr := val.(string)
 				if isStr || b.DorisType == schema.DorisString {
-					strVal := `"` + fmt.Sprintf("%v", val) + `"`
+					valStr := fmt.Sprintf("%v", val)
+					strVal := `"` + valStr + `"`
 					likePat := quoteStr("%" + escapeLikeLiteral(strVal) + "%")
+					if _, numErr := strconv.ParseFloat(strings.TrimSpace(valStr), 64); numErr == nil {
+						escVal := escapeLikeLiteral(valStr)
+						p1 := quoteStr("[" + escVal + "]")
+						p2 := quoteStr("[" + escVal + ",%")
+						p3 := quoteStr("%," + escVal + ",%")
+						p4 := quoteStr("%," + escVal + "]")
+						if caseInsensitive || effLower {
+							return fmt.Sprintf("(lower(%s) = lower(%s) OR lower(%s) LIKE lower(%s) OR %s LIKE %s OR %s LIKE %s OR %s LIKE %s OR %s LIKE %s)",
+								extracted, rawLit, extracted, likePat, extracted, p1, extracted, p2, extracted, p3, extracted, p4)
+						}
+						return fmt.Sprintf("(%s = %s OR %s LIKE %s OR %s LIKE %s OR %s LIKE %s OR %s LIKE %s OR %s LIKE %s)",
+							extracted, rawLit, extracted, likePat, extracted, p1, extracted, p2, extracted, p3, extracted, p4)
+					}
 					if caseInsensitive || effLower {
 						return fmt.Sprintf("(lower(%s) = lower(%s) OR lower(%s) LIKE lower(%s))", extracted, rawLit, extracted, likePat)
 					}
@@ -2483,6 +2504,10 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 				p4 := quoteStr("%," + escVal + "]")
 				return fmt.Sprintf("(%s = %s OR %s LIKE %s OR %s LIKE %s OR %s LIKE %s OR %s LIKE %s)",
 					extracted, rawLit, extracted, p1, extracted, p2, extracted, p3, extracted, p4)
+			}
+			if effDT == schema.DorisDouble && !caseInsensitive && !effLower {
+				col := t.sqlTypedColumnRef(field, val, true, nctx)
+				return fmt.Sprintf("%s = %s", col, lit)
 			}
 			if caseInsensitive || effLower {
 				return fmt.Sprintf("lower(json_extract_string(%s, %s)) = lower(%s)", nctx.elemVar, quoteStr(relPath), quoteStr(fmt.Sprintf("%v", val)))
@@ -2564,6 +2589,8 @@ func (t *Transpiler) compileTermsPredicateWithCI(field string, vals []any, caseI
 		if effDT == schema.DorisBoolean {
 			if bv, ok := normalizeBooleanQueryValue(v); ok {
 				v = bv
+			} else if b.ESType != "" {
+				continue
 			}
 		} else if strVal, ok := v.(string); ok {
 			if effLower && effDT != schema.DorisBigInt && effDT != schema.DorisInt && effDT != schema.DorisDouble && b.ESType != "date" && b.ESType != "date_nanos" {
@@ -2613,7 +2640,14 @@ func (t *Transpiler) compileTermsPredicateWithCI(field string, vals []any, caseI
 		}
 		return fmt.Sprintf("arrays_overlap(`%s`, [%s])", colName, strings.Join(quoted, ", "))
 	}
-	col := t.sqlTypedColumnRef(field, normalizedVals[0], true, nctx)
+	sampleVal := normalizedVals[0]
+	for _, nv := range normalizedVals {
+		if fv, ok := nv.(float64); ok && fv != math.Trunc(fv) {
+			sampleVal = nv
+			break
+		}
+	}
+	col := t.sqlTypedColumnRef(field, sampleVal, true, nctx)
 	if (caseInsensitive && !b.EffectiveLowercase(true) && (effDT == schema.DorisVarchar || effDT == schema.DorisString)) ||
 		(nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && effLower) {
 		col = fmt.Sprintf("lower(%s)", col)
@@ -8205,6 +8239,9 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 	}
 
 	field, b := t.resolveFieldInNestedCtx(field, preferKeyword, nctx)
+	if effectiveDorisScalarType(b) == schema.DorisDouble && castType == "BIGINT" {
+		castType = "DOUBLE"
+	}
 	effField := field
 	if b.AliasTarget != "" {
 		effField = b.AliasTarget

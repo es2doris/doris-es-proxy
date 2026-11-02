@@ -2380,7 +2380,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		preserveTrailing, _ := specMap["preserve_trailing"].(bool)
 		if field != "" && sep != "" {
 			if val, ok := getIngestPath(doc, field); ok && val != nil {
-				if strVal, ok := val.(string); ok {
+				splitOne := func(strVal string) []any {
 					var parts []string
 					if sep == "|" || sep == "." {
 						parts = strings.Split(strVal, sep)
@@ -2398,9 +2398,27 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					for i, pt := range parts {
 						out[i] = pt
 					}
+					return out
+				}
+				switch v := val.(type) {
+				case string:
+					setIngestPath(doc, target, splitOne(v))
+					mutated = true
+				case []any:
+					var out []any
+					for _, elem := range v {
+						strElem, isStr := elem.(string)
+						if !isStr {
+							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
+						}
+						out = append(out, splitOne(strElem)...)
+					}
+					if out == nil {
+						out = []any{}
+					}
 					setIngestPath(doc, target, out)
 					mutated = true
-				} else {
+				default:
 					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 				}
 			} else if isExplicitIgnoreMissingFalse(specMap) {
@@ -2657,7 +2675,27 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 		if field != "" && fieldSplit != "" && valueSplit != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				if strVal, ok := val.(string); ok {
+				var strInputs []string
+				switch v := val.(type) {
+				case string:
+					strInputs = []string{v}
+				case []any:
+					for _, elem := range v {
+						strElem, isStr := elem.(string)
+						if !isStr {
+							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
+						}
+						strInputs = append(strInputs, strElem)
+					}
+				default:
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
+				}
+				var valSplitRe *regexp.Regexp
+				if valueSplit != "=" && valueSplit != ":" && valueSplit != "|" && valueSplit != "." {
+					valSplitRe, _ = regexp.Compile(valueSplit)
+				}
+				kvMap := make(map[string]any)
+				for _, strVal := range strInputs {
 					if stripBrackets && len(strVal) >= 2 {
 						first, last := strVal[0], strVal[len(strVal)-1]
 						if (first == '[' && last == ']') || (first == '(' && last == ')') || (first == '<' && last == '>') {
@@ -2672,11 +2710,6 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					} else {
 						pairs = strings.Split(strVal, fieldSplit)
 					}
-					var valSplitRe *regexp.Regexp
-					if valueSplit != "=" && valueSplit != ":" && valueSplit != "|" && valueSplit != "." {
-						valSplitRe, _ = regexp.Compile(valueSplit)
-					}
-					kvMap := make(map[string]any)
 					for _, pair := range pairs {
 						if pair == "" {
 							continue
@@ -2728,22 +2761,22 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 							kvMap[fullKey] = v
 						}
 					}
-					if targetField != "" {
-						if existing, ok := getIngestPath(doc, targetField); !ok || existing == nil {
-							setIngestPath(doc, targetField, map[string]any{})
-						}
-						for k, v := range kvMap {
-							setIngestPath(doc, targetField+"."+k, v)
-						}
-					} else {
-						for k, v := range kvMap {
-							setIngestPath(doc, k, v)
-						}
-					}
-					mutated = true
-				} else {
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 				}
+				if targetField != "" {
+					if existing, ok := getIngestPath(doc, targetField); !ok || existing == nil {
+						setIngestPath(doc, targetField, map[string]any{})
+					} else if _, isMap := existing.(map[string]any); !isMap {
+						setIngestPath(doc, targetField, map[string]any{})
+					}
+					for k, v := range kvMap {
+						setIngestPath(doc, targetField+"."+k, v)
+					}
+				} else {
+					for k, v := range kvMap {
+						setIngestPath(doc, k, v)
+					}
+				}
+				mutated = true
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
@@ -3120,50 +3153,81 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				}
 				return false, false, procType, procTag, specMap, nil
 			}
-			strVal := fmt.Sprintf("%v", val)
-			matched := false
-			for _, patAny := range patterns {
-				patStr, ok := patAny.(string)
-				if !ok || patStr == "" {
-					continue
+			var strInputs []string
+			switch v := val.(type) {
+			case string:
+				strInputs = []string{v}
+			case []any:
+				for _, elem := range v {
+					strElem, isStr := elem.(string)
+					if !isStr {
+						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
+					}
+					strInputs = append(strInputs, strElem)
 				}
-				re, grpMap, grpTypes, err := compileGrokRegex(patStr, customDefs)
-				if err != nil {
-					return false, false, procType, procTag, specMap, err
-				}
-				m := re.FindStringSubmatch(strVal)
-				loc := re.FindStringSubmatchIndex(strVal)
-				if m == nil || loc == nil {
-					continue
-				}
-				matched = true
-				names := re.SubexpNames()
-				for i, grpID := range names {
-					if i == 0 || grpID == "" || i >= len(m) || 2*i >= len(loc) || loc[2*i] < 0 {
+			default:
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
+			}
+			extracted := make(map[string]any)
+			var extractedOrder []string
+			for _, strVal := range strInputs {
+				matched := false
+				for _, patAny := range patterns {
+					patStr, ok := patAny.(string)
+					if !ok || patStr == "" {
 						continue
 					}
-					fieldName := grpMap[grpID]
-					if fieldName == "" {
+					re, grpMap, grpTypes, err := compileGrokRegex(patStr, customDefs)
+					if err != nil {
+						return false, false, procType, procTag, specMap, err
+					}
+					m := re.FindStringSubmatch(strVal)
+					loc := re.FindStringSubmatchIndex(strVal)
+					if m == nil || loc == nil {
 						continue
 					}
-					var finalVal any = m[i]
-					if convT := grpTypes[grpID]; convT != "" {
-						if cv, err := convertSingleIngestValue(m[i], convT); err == nil {
-							finalVal = cv
+					matched = true
+					names := re.SubexpNames()
+					for i, grpID := range names {
+						if i == 0 || grpID == "" || i >= len(m) || 2*i >= len(loc) || loc[2*i] < 0 {
+							continue
+						}
+						fieldName := grpMap[grpID]
+						if fieldName == "" {
+							continue
+						}
+						var finalVal any = m[i]
+						if convT := grpTypes[grpID]; convT != "" {
+							if cv, err := convertSingleIngestValue(m[i], convT); err == nil {
+								finalVal = cv
+							}
+						}
+						if prev, hasPrev := extracted[fieldName]; hasPrev {
+							if prevArr, isArr := prev.([]any); isArr {
+								extracted[fieldName] = append(prevArr, finalVal)
+							} else {
+								extracted[fieldName] = []any{prev, finalVal}
+							}
+						} else {
+							extracted[fieldName] = finalVal
+							extractedOrder = append(extractedOrder, fieldName)
 						}
 					}
-					if targetField != "" {
-						setIngestPath(doc, targetField+"."+fieldName, finalVal)
-					} else {
-						setIngestPath(doc, fieldName, finalVal)
-					}
+					break
 				}
-				mutated = true
-				break
+				if !matched {
+					return false, false, procType, procTag, specMap, fmt.Errorf("provided Grok expressions do not match field value: [%s]", strVal)
+				}
 			}
-			if !matched {
-				return false, false, procType, procTag, specMap, fmt.Errorf("provided Grok expressions do not match field value: [%s]", strVal)
+			for _, fieldName := range extractedOrder {
+				finalVal := extracted[fieldName]
+				if targetField != "" {
+					setIngestPath(doc, targetField+"."+fieldName, finalVal)
+				} else {
+					setIngestPath(doc, fieldName, finalVal)
+				}
 			}
+			mutated = true
 		}
 	case "sort":
 		field, _ := specMap["field"].(string)
@@ -4139,7 +4203,11 @@ func applyIngestPipelineSpecWithIngestTS(s *Server, pipe map[string]any, indexNa
 	if v, ok := doc["_id"]; ok && v != nil {
 		if sv := fmt.Sprintf("%v", v); sv != "" {
 			outID = sv
+		} else if docID != "" {
+			outID = esast.NextAutoID()
 		}
+	} else if docID != "" {
+		outID = esast.NextAutoID()
 	}
 	outIngestTS := ""
 	if curIngest, ok := doc["_ingest"].(map[string]any); ok {
@@ -5075,6 +5143,8 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					}
 					if updSpec.MetaID != "" {
 						docID = updSpec.MetaID
+					} else {
+						docID = esast.NextAutoID()
 					}
 					if sIdx := strings.TrimSpace(updSpec.MetaIndex); sIdx != "" && sIdx != docDestIdx {
 						resolvedIdx, resolvedFilter, rErr := s.resolveWriteIndexWithFilter(sIdx)

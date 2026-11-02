@@ -373,6 +373,16 @@ func ShredDocument(
 							case "false", "0":
 								sv = "false"
 							}
+						} else if (tb.ESType == "scaled_float" && tb.ScalingFactor > 0) || isTypedNonStringBinding(tb) {
+							coerced := coerceScalarBindingForDoris(sv, tb, getNow())
+							if coerced == nil {
+								if tb.IgnoreMalformed != nil && *tb.IgnoreMalformed {
+									recordIgnored(targetField)
+									continue
+								}
+								return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", targetField, tb.ESType)
+							}
+							sv = formatCoercedArrayElement(coerced)
 						} else if tb.LowercaseNormalizer {
 							sv = strings.ToLower(sv)
 						}
@@ -1866,6 +1876,10 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 			return strings.ToLower(str)
 		} else if b.ESType == "keyword" || b.ESType == "constant_keyword" || b.ESType == "wildcard" || b.DorisType == DorisVarchar {
 			return strings.ToLower(fmt.Sprintf("%v", val))
+		}
+	} else if b.ESType == "keyword" || b.ESType == "constant_keyword" || b.ESType == "wildcard" || b.ESType == "text" || b.DorisType == DorisVarchar {
+		if _, isStr := val.(string); !isStr {
+			return fmt.Sprintf("%v", val)
 		}
 	}
 	return val

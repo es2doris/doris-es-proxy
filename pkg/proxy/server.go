@@ -3057,6 +3057,11 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 	defaultSF := body.Source
 	if defaultSF == nil {
 		defaultSF = urlSF
+	} else if !defaultSF.Disabled && len(defaultSF.Includes) == 0 && len(defaultSF.Excludes) == 0 && urlSF != nil && !urlSF.Disabled {
+		cp := *defaultSF
+		cp.Includes = urlSF.Includes
+		cp.Excludes = urlSF.Excludes
+		defaultSF = &cp
 	}
 	defaultSF = mergeMGetSourceFilter(defaultSF, body.SourceIncludes, body.SourceExcludes)
 	defaultStoredFields := esast.StoredFieldsSlice(body.StoredFields)
@@ -3156,6 +3161,11 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 		effSF := spec.Source
 		if effSF == nil {
 			effSF = defaultSF
+		} else if !effSF.Disabled && len(effSF.Includes) == 0 && len(effSF.Excludes) == 0 && defaultSF != nil && !defaultSF.Disabled {
+			cp := *effSF
+			cp.Includes = defaultSF.Includes
+			cp.Excludes = defaultSF.Excludes
+			effSF = &cp
 		}
 		effSF = mergeMGetSourceFilter(effSF, spec.SourceIncludes, spec.SourceExcludes)
 		effStored := esast.StoredFieldsSlice(spec.StoredFields)
@@ -3544,6 +3554,11 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if body.Query == nil && r.URL.Query().Get("q") != "" {
+		tmpReq := esast.SearchRequest{}
+		applyURISearchParams(r, &tmpReq)
+		body.Query = tmpReq.Query
+	}
 
 	maxDocs := 0
 	if body.MaxDocs != nil && *body.MaxDocs > 0 {
@@ -3900,6 +3915,11 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
 			return
 		}
+	}
+	if body.Query == nil && r.URL.Query().Get("q") != "" {
+		tmpReq := esast.SearchRequest{}
+		applyURISearchParams(r, &tmpReq)
+		body.Query = tmpReq.Query
 	}
 
 	maxDocs := 0
@@ -4485,7 +4505,11 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 				sourceToShred = merged
 			} else {
 				if len(merged) > 0 {
-					piped, nextIdx, nextID, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithMeta(targetIndex, op.ID, defaultPipeline, op.Pipeline, merged)
+					pipeInputIdx := op.Index
+					if pipeInputIdx == "" || targetIndex != origTargetIndex {
+						pipeInputIdx = targetIndex
+					}
+					piped, nextIdx, nextID, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithMeta(pipeInputIdx, op.ID, defaultPipeline, op.Pipeline, merged)
 					if pipeErr != nil {
 						hasErrors = true
 						items = append(items, map[string]any{
@@ -4530,7 +4554,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 					if nextID != "" {
 						op.ID = nextID
 					}
-					if nextIdx != "" && nextIdx != targetIndex {
+					if nextIdx != "" && nextIdx != pipeInputIdx {
 						resolvedIdx, resolvedFilter, rErr := s.resolveWriteIndexWithFilter(nextIdx)
 						if rErr != nil {
 							hasErrors = true
@@ -4597,7 +4621,9 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 				}
 				if found && (op.ID != origOpID || targetIndex != origTargetIndex) {
 					reroutedToInBatch[targetIndex+"\x00"+op.ID] = true
-					if !reroutedToInBatch[origTargetIndex+"\x00"+origOpID] {
+					_, existedInitially := initialExistingByIndex[origTargetIndex][origOpID]
+					if !reroutedToInBatch[origTargetIndex+"\x00"+origOpID] || !existedInitially {
+						delete(reroutedToInBatch, origTargetIndex+"\x00"+origOpID)
 						origSchema := s.ensureIndexSchema(r.Context(), origTargetIndex)
 						origBuf, okOrig := byIndex[origSchema.DorisTable]
 						if !okOrig {
@@ -5027,7 +5053,7 @@ func (s *Server) buildDorisExplainObject(ctx context.Context, rawIndexPattern st
 
 func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 	_ = s.syncCatalogFromBackend(r.Context())
-	targets := s.resolveTargetIndices(r.PathValue("index"))
+	targets, aliasFilters := s.resolveTargetIndicesWithFilters(r.PathValue("index"))
 	var filterPatterns []string
 	if fieldsFilter := r.URL.Query().Get("fields"); fieldsFilter != "" {
 		filterPatterns = append(filterPatterns, strings.Split(fieldsFilter, ",")...)
@@ -5064,6 +5090,7 @@ func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 				Size:           &zero,
 				TrackTotalHits: true,
 				Query:          indexFilter,
+				AliasFilter:    aliasFilters[idxName],
 			}
 			resp, _, errType, _ := s.executeSearchRequest(r.Context(), idxName, &cntReq)
 			if errType != "" {
@@ -6996,10 +7023,28 @@ func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, totalQueryHits int64
 			continue
 		}
 		switch {
-		case r.BucketKey == "_stats_count":
+		case r.BucketKey == "_stats_count" || r.BucketKey == "_sstats_count":
 			lastStatCount[key{agg: r.AggName, bucket: ""}] = r.effectiveCount()
 		case strings.HasSuffix(r.AggName, "._stats_count"):
 			lastStatCount[key{agg: strings.TrimSuffix(r.AggName, "._stats_count"), bucket: r.BucketKey}] = r.effectiveCount()
+		case strings.HasSuffix(r.AggName, "._sstats_count"):
+			lastStatCount[key{agg: strings.TrimSuffix(r.AggName, "._sstats_count"), bucket: r.BucketKey}] = r.effectiveCount()
+		case r.BucketKey == "_sstats_min" || r.BucketKey == "_sstats_max" || r.BucketKey == "_sstats_avg" || r.BucketKey == "_sstats_entropy":
+			cnt := lastStatCount[key{agg: r.AggName, bucket: ""}]
+			if cnt == 0 {
+				r.Weight = -1
+			} else if r.Weight <= 0 {
+				r.Weight = cnt
+			}
+		case strings.HasSuffix(r.AggName, "._sstats_min") || strings.HasSuffix(r.AggName, "._sstats_max") || strings.HasSuffix(r.AggName, "._sstats_avg") || strings.HasSuffix(r.AggName, "._sstats_entropy"):
+			dotIdx := strings.LastIndex(r.AggName, ".")
+			baseAgg := r.AggName[:dotIdx]
+			cnt := lastStatCount[key{agg: baseAgg, bucket: r.BucketKey}]
+			if cnt == 0 {
+				r.Weight = -1
+			} else if r.Weight <= 0 {
+				r.Weight = cnt
+			}
 		case r.BucketKey == "_stats_sum":
 			lastStatSum[key{agg: r.AggName, bucket: ""}] = r.effectiveValue()
 		case strings.HasSuffix(r.AggName, "._stats_sum"):
@@ -7581,9 +7626,11 @@ func (s *Server) evaluateSearchSuggest(
 					matched := strings.HasPrefix(strLower, prefixLower)
 					score := 1.0
 					if !matched && maxFuzzy > 0 && len(prefixLower) > 0 {
+						prefixRunes := []rune(prefixLower)
+						strRunes := []rune(strLower)
 						candPrefix := strLower
-						if len(candPrefix) > len(prefixLower) {
-							candPrefix = candPrefix[:len(prefixLower)]
+						if len(strRunes) > len(prefixRunes) {
+							candPrefix = string(strRunes[:len(prefixRunes)])
 						}
 						if d := levenshtein(prefixLower, candPrefix); d <= maxFuzzy {
 							matched = true
@@ -7595,13 +7642,20 @@ func (s *Server) evaluateSearchSuggest(
 							continue
 						}
 						seenText[str] = true
-						opts = append(opts, map[string]any{
-							"text":    str,
-							"_index":  dp.hit.Index,
-							"_id":     dp.hit.ID,
-							"_score":  score,
-							"_source": filterSourceJSON(dp.hit.Source, nil),
-						})
+						opt := map[string]any{
+							"text":   str,
+							"_index": dp.hit.Index,
+							"_id":    dp.hit.ID,
+							"_score": score,
+						}
+						if req == nil || req.Source == nil || !req.Source.Disabled {
+							var reqSF *esast.SourceFilter
+							if req != nil {
+								reqSF = req.Source
+							}
+							opt["_source"] = filterSourceJSON(dp.hit.Source, reqSF)
+						}
+						opts = append(opts, opt)
 					}
 				}
 			}
@@ -7615,7 +7669,7 @@ func (s *Server) evaluateSearchSuggest(
 				{
 					"text":    text,
 					"offset":  0,
-					"length":  len(text),
+					"length":  utf8.RuneCountInString(text),
 					"options": opts,
 				},
 			}
@@ -7748,9 +7802,9 @@ func (s *Server) evaluateSearchSuggest(
 						}
 						d := levenshtein(tok, cand)
 						if d > 0 && d <= maxEdits {
-							maxLen := len(tok)
-							if len(cand) > maxLen {
-								maxLen = len(cand)
+							maxLen := utf8.RuneCountInString(tok)
+							if candLen := utf8.RuneCountInString(cand); candLen > maxLen {
+								maxLen = candLen
 							}
 							sc := 1.0 - float64(d)/float64(maxLen)
 							cands = append(cands, candOpt{word: cand, score: math.Round(sc*100) / 100, freq: freq})
@@ -9381,12 +9435,12 @@ func buildAggsMapWithSchema(
 			}
 			aggsOut[aggName] = map[string]any{"value": cnt}
 		case spec.Avg != nil || spec.Sum != nil || spec.Min != nil || spec.Max != nil:
-			if len(rows) == 0 && (spec.Avg != nil || spec.Min != nil || spec.Max != nil) {
+			if (len(rows) == 0 || rows[0].Weight < 0) && (spec.Avg != nil || spec.Min != nil || spec.Max != nil) {
 				aggsOut[aggName] = map[string]any{"value": nil}
 				continue
 			}
 			var val float64
-			if len(rows) > 0 {
+			if len(rows) > 0 && rows[0].Weight >= 0 {
 				val = rows[0].effectiveValue()
 			}
 			aggsOut[aggName] = map[string]any{"value": val}
@@ -13414,8 +13468,10 @@ func attachSubAggsToBucketWithSchema(
 			found := false
 			for _, r := range subRows {
 				if r.BucketKey == parentBucketKey {
-					val = r.effectiveValue()
-					found = true
+					if r.Weight >= 0 {
+						val = r.effectiveValue()
+						found = true
+					}
 					break
 				}
 			}
@@ -15230,14 +15286,14 @@ func compileHighlightRegexForFields(q *esast.Query, targetFields []string, requi
 		seenTerms[lc] = struct{}{}
 		if strings.ContainsAny(term, "*?") {
 			var sb strings.Builder
-			for i := 0; i < len(term); i++ {
-				switch term[i] {
+			for _, r := range term {
+				switch r {
 				case '*':
-					sb.WriteString(`\w*`)
+					sb.WriteString(`[\p{L}\p{N}_]*`)
 				case '?':
-					sb.WriteString(`\w`)
+					sb.WriteString(`[\p{L}\p{N}_]`)
 				default:
-					sb.WriteString(regexp.QuoteMeta(string(term[i])))
+					sb.WriteString(regexp.QuoteMeta(string(r)))
 				}
 			}
 			quotedTerms = append(quotedTerms, sb.String())
@@ -15729,7 +15785,7 @@ func buildHighlightedFieldSnippets(
 		if re == nil || !re.MatchString(v) {
 			continue
 		}
-		if numFrags == 0 || fragSize <= 0 || len(v) <= fragSize {
+		if numFrags == 0 || fragSize <= 0 || utf8.RuneCountInString(v) <= fragSize {
 			highlighted, ok := highlightWithCombinedRegexAndEncoder(v, re, preTag, postTag, htmlEscape)
 			if ok {
 				out = append(out, highlighted)
