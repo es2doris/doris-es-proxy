@@ -777,3 +777,248 @@ func TestRound37_F30_BulkExternalVersionDeleteThenIndexAndReindexScriptVersion(t
 		t.Fatalf("expected _reindex with ctx._version=7 to write _version=7, got %+v", destDoc)
 	}
 }
+
+func TestRound37_AdditionalBranchCoverage(t *testing.T) {
+	srv, _ := newTestServer()
+
+	// 1. F1 & F2: KNNQuery OpenSearch syntax with query_vector and inner boost, plus InferMappingFromSampleDocs double + dense_vector widening
+	var qKNN2 esast.Query
+	if err := json.Unmarshal([]byte(`{"knn": {"embedding": {"query_vector": [0.5, 0.6], "k": 3, "boost": 1.5}, "_name": "knn2"}}`), &qKNN2); err != nil {
+		t.Fatalf("unmarshal knn2: %v", err)
+	}
+	if qKNN2.KNN == nil || qKNN2.KNN.Boost == nil || *qKNN2.KNN.Boost != 1.5 {
+		t.Fatalf("expected knn2 boost=1.5, got %+v", qKNN2.KNN)
+	}
+	inferred2 := schema.InferMappingFromSampleDocs([]json.RawMessage{
+		json.RawMessage(`{"v": [1.5], "v2": [1.0, 2.0]}`),
+		json.RawMessage(`{"v": [1.5, 2.5], "v2": [3.0]}`),
+	})
+	if inferred2.Properties["v"].Type != "double" || inferred2.Properties["v2"].Type != "double" {
+		t.Fatalf("expected double+dense_vector to widen to double, got %+v", inferred2.Properties)
+	}
+
+	// 2. F6: Nested .keyword companion with normalizer and null_value
+	var nestedMap esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{
+		"properties": {
+			"items": {
+				"type": "nested",
+				"properties": {
+					"tag": {
+						"type": "text",
+						"fields": {
+							"keyword": {"type": "keyword", "normalizer": "lowercase", "null_value": "NONE"}
+						}
+					}
+				}
+			}
+		}
+	}`), &nestedMap)
+	nSchema := schema.CompileIndexSchema("n_idx", "doris_es", &nestedMap)
+	shredN, err := schema.ShredDocument(nSchema, "1", 1, false, json.RawMessage(`{"items": [{"tag": "HELLO"}, {"tag": null}]}`))
+	if err != nil {
+		t.Fatalf("ShredDocument nested companion: %v", err)
+	}
+	if !strings.Contains(string(shredN), `"n__items__tag__keyword":["hello","none"]`) {
+		t.Fatalf("expected lowercase and null_value on nested tag__keyword, got %s", string(shredN))
+	}
+
+	// 3. F7 & F8: Lucene ^0 boost on wildcard, regexp, phrase, range + field-scoped unary !, +, -/regex/
+	doReq(t, srv, http.MethodPut, "/luc_cov", `{
+		"mappings": {
+			"properties": {
+				"env": {"type": "keyword"},
+				"msg": {"type": "text"},
+				"num": {"type": "integer"},
+				"ts": {"type": "date"},
+				"arr_tags": {"type": "keyword"}
+			}
+		}
+	}`)
+	doReq(t, srv, http.MethodPut, "/luc_cov/_doc/1?refresh=true", `{"env": "prod", "msg": "payment api", "num": 15, "ts": "2026-01-01T00:00:00Z", "arr_tags": ["z", "a"]}`)
+	doReq(t, srv, http.MethodPut, "/luc_cov/_doc/2?refresh=true", `{"env": "staging", "msg": "legacy system", "num": 25, "ts": "2026-01-02T00:00:00Z", "arr_tags": ["m", "b"]}`)
+
+	_, lucRes := doReq(t, srv, http.MethodPost, "/luc_cov/_search", `{
+		"query": {
+			"query_string": {
+				"query": "env:pr*^0 AND env:/pr.*/^0 AND msg:\"payment api\"^0 AND num:[10 TO 20]^0 AND env:!staging AND env:+prod AND env:-/stag.*/"
+			}
+		}
+	}`)
+	if len(lucRes["hits"].(map[string]any)["hits"].([]any)) != 1 {
+		t.Fatalf("expected 1 hit for lucene zero boost + unary operators, got %+v", lucRes)
+	}
+
+	// 4. F12 & F20: min_doc_count HAVING on histogram, date_histogram, scalar missing, array missing + collapse on array field (minimum value selection)
+	_, histRes := doReq(t, srv, http.MethodPost, "/luc_cov/_search", `{
+		"size": 10,
+		"collapse": {"field": "arr_tags"},
+		"sort": [{"num": "asc"}],
+		"aggs": {
+			"h": {"histogram": {"field": "num", "interval": 10, "min_doc_count": 2}},
+			"dh": {"date_histogram": {"field": "ts", "fixed_interval": "1d", "min_doc_count": 2}},
+			"tm_miss": {"terms": {"field": "env", "missing": "N/A", "min_doc_count": 2}},
+			"arr_miss": {"terms": {"field": "arr_tags", "missing": "N/A", "min_doc_count": 2}}
+		}
+	}`)
+	hBuckets := histRes["aggregations"].(map[string]any)["h"].(map[string]any)["buckets"].([]any)
+	dhBuckets := histRes["aggregations"].(map[string]any)["dh"].(map[string]any)["buckets"].([]any)
+	if len(hBuckets) != 0 || len(dhBuckets) != 0 {
+		t.Fatalf("expected 0 buckets with min_doc_count=2 when each bucket has 1 doc, got h=%+v dh=%+v", hBuckets, dhBuckets)
+	}
+
+	// 5. F16: prepareDocForRuntimeScript with ignore_above on string array + nested array of objects
+	doReq(t, srv, http.MethodPut, "/ia_cov", `{
+		"mappings": {
+			"properties": {
+				"tags": {"type": "keyword", "ignore_above": 4},
+				"status": {"type": "keyword", "null_value": "NULL_STAT"},
+				"nested_items": {
+					"type": "object",
+					"dynamic": false,
+					"properties": {
+						"k": {"type": "keyword", "ignore_above": 4}
+					}
+				}
+			}
+		}
+	}`)
+	doReq(t, srv, http.MethodPut, "/ia_cov/_doc/1?refresh=true", `{
+		"tags": ["LONG_TAG_1", "ok"],
+		"status": null,
+		"nested_items": {"k": "LONG_K", "ignored_sub": "x"}
+	}`)
+	doReq(t, srv, http.MethodPut, "/ia_cov/_doc/2?refresh=true", `{
+		"tags": ["LONG_TAG_1", "LONG_TAG_2"],
+		"status": "active"
+	}`)
+	_, iaRes := doReq(t, srv, http.MethodPost, "/ia_cov/_search", `{
+		"query": {
+			"script": {
+				"script": "doc['status'].value == 'NULL_STAT' && doc['tags'].value == 'ok'"
+			}
+		}
+	}`)
+	if len(iaRes["hits"].(map[string]any)["hits"].([]any)) != 1 {
+		t.Fatalf("expected 1 hit for ignore_above array filtering + null_value in runtime script, got %+v", iaRes)
+	}
+
+	// 6. F28 & F29: dynamic:strict on array of objects, alias index_routing, ingest pipeline setting ctx._routing, _update and _update_by_query preserving routing
+	codeStrictArr, _ := doReq(t, srv, http.MethodPut, "/strict_arr_idx", `{
+		"mappings": {
+			"properties": {
+				"list": {
+					"type": "object",
+					"dynamic": "strict",
+					"properties": {"id": {"type": "integer"}}
+				}
+			}
+		}
+	}`)
+	if codeStrictArr != http.StatusOK {
+		t.Fatalf("expected 200 creating strict_arr_idx, got %d", codeStrictArr)
+	}
+	if c, _ := doReq(t, srv, http.MethodPut, "/strict_arr_idx/_doc/1", `{"list": [{"id": 1, "bad": "x"}]}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unmapped field inside array of strict objects, got %d", c)
+	}
+
+	doReq(t, srv, http.MethodPut, "/_ingest/pipeline/route_pipe", `{
+		"processors": [
+			{"script": {"source": "ctx._routing = ctx.tenant"}}
+		]
+	}`)
+	doReq(t, srv, http.MethodPut, "/route_cov_idx", `{
+		"mappings": {
+			"_routing": {"required": true},
+			"properties": {"tenant": {"type": "keyword"}, "v": {"type": "integer"}}
+		},
+		"aliases": {
+			"route_cov_alias": {"index_routing": "alias-shard"}
+		}
+	}`)
+	// Write via ingest pipeline that populates ctx._routing even without ?routing= query param
+	cPipeRoute, pipeRouteRes := doReq(t, srv, http.MethodPut, "/route_cov_idx/_doc/1?pipeline=route_pipe&refresh=true", `{"tenant": "t-100", "v": 1}`)
+	if cPipeRoute != http.StatusCreated || pipeRouteRes["_routing"] != "t-100" {
+		t.Fatalf("expected ingest pipeline ctx._routing to satisfy _routing.required and return 't-100', got %d %+v", cPipeRoute, pipeRouteRes)
+	}
+	// Write via alias with index_routing
+	cAliasRoute, aliasRouteRes := doReq(t, srv, http.MethodPut, "/route_cov_alias/_doc/2?refresh=true", `{"tenant": "t-200", "v": 2}`)
+	if cAliasRoute != http.StatusCreated || aliasRouteRes["_routing"] != "alias-shard" {
+		t.Fatalf("expected alias index_routing to satisfy _routing.required, got %d %+v", cAliasRoute, aliasRouteRes)
+	}
+	// _update with routing
+	cUpdMissing, _ := doReq(t, srv, http.MethodPost, "/route_cov_idx/_update/1", `{"doc": {"v": 10}}`)
+	if cUpdMissing != http.StatusBadRequest {
+		t.Fatalf("expected _update without routing on _routing.required index to return 400, got %d", cUpdMissing)
+	}
+	cUpdOK, updRes := doReq(t, srv, http.MethodPost, "/route_cov_idx/_update/1?routing=t-100&refresh=true", `{"doc": {"v": 10}}`)
+	if cUpdOK != http.StatusOK || updRes["_routing"] != "t-100" {
+		t.Fatalf("expected _update with routing to return 200 and _routing='t-100', got %d %+v", cUpdOK, updRes)
+	}
+	// _update_by_query preserves existing document _routing
+	cUBQ, _ := doReq(t, srv, http.MethodPost, "/route_cov_idx/_update_by_query?refresh=true", `{
+		"script": {"source": "ctx._source.v = ctx._source.v + 1"}
+	}`)
+	if cUBQ != http.StatusOK {
+		t.Fatalf("expected _update_by_query on routed index to succeed, got %d", cUBQ)
+	}
+
+	// 7. F25: dedup (dedupe alias, map elements, ignore_empty:false, error on non-array) & compact (array of maps, error on scalar)
+	_, simRes := doReq(t, srv, http.MethodPost, "/_ingest/pipeline/_simulate", `{
+		"pipeline": {
+			"processors": [
+				{"dedupe": {"field": "items", "target_field": "unique_items", "ignore_empty": false}},
+				{"compact": {"field": "arr_of_maps", "target_field": "clean_arr"}}
+			]
+		},
+		"docs": [
+			{
+				"_source": {
+					"items": [{"id": 1}, {"id": 1}, {"id": 2}, ""],
+					"arr_of_maps": [{"a": "", "b": "keep"}, {"c": null}]
+				}
+			}
+		]
+	}`)
+	simDoc := simRes["docs"].([]any)[0].(map[string]any)["doc"].(map[string]any)["_source"].(map[string]any)
+	if len(simDoc["unique_items"].([]any)) != 3 {
+		t.Fatalf("expected unique_items length 3, got %+v", simDoc["unique_items"])
+	}
+	if len(simDoc["clean_arr"].([]any)) != 1 {
+		t.Fatalf("expected clean_arr length 1 after compacting empty map element, got %+v", simDoc["clean_arr"])
+	}
+
+	// 8. F21, F22, F23, F24: Painless Pattern.compile, Matcher.find/replaceAll/replaceFirst/start/end/named group, sort lambda outer var, forEach + ctx._index, and UTF-8 indexOf/lastIndexOf with fromIndex
+	pVal, err := painless.Eval(map[string]any{"s": "ééaé"}, `
+		Pattern p = Pattern.compile("(?<word>[a-z]+)-(\\d+)");
+		def m = p.matcher("id:foo-12,id:bar-34");
+		String first = m.replaceFirst("$1");
+		String all = m.replaceAll("$1");
+		int found = 0;
+		while (m.find()) {
+			found += 1;
+		}
+		def m2 = p.matcher("foo-12");
+		String grp = m2.matches() ? m2.group("word") + ":" + m2.start(1) + ":" + m2.end(1) : "none";
+		String u = doc['s'].value;
+		return first + "|" + all + "|" + found + "|" + grp + "|" + u.indexOf('é', 1) + "|" + u.lastIndexOf('é', 2);
+	`, nil)
+	if err != nil || pVal != "id:foo,id:bar-34|id:foo,id:bar|2|foo:0:3|1|1" {
+		t.Fatalf("unexpected Painless Pattern/Matcher/UTF-8 result: val=%v err=%v", pVal, err)
+	}
+
+	docSort := map[string]any{"nums": []any{int64(3), int64(1), int64(2)}}
+	sortParams := map[string]any{"_ctx_index": "orig_idx"}
+	_, err = painless.EvalPainlessWithOp(docSort, `
+		int comparisons = 0;
+		ctx._source.nums.sort((a, b) -> {
+			comparisons += 1;
+			return a - b;
+		});
+		ctx._index = 'rerouted_idx';
+		ctx._source.cmp_ok = (comparisons > 0);
+	`, sortParams)
+	if err != nil || docSort["cmp_ok"] != true || sortParams["_ctx_index"] != "rerouted_idx" {
+		t.Fatalf("expected sort lambda to propagate outer var and preserve subsequent ctx._index='rerouted_idx', got doc=%+v params=%+v err=%v", docSort, sortParams, err)
+	}
+}

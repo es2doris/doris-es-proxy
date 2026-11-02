@@ -14771,8 +14771,10 @@ func filterIgnoreAboveInPlace(curr any, segs []string, ignoreAbove int) {
 			}
 			return
 		}
-		if next, exists := node[segs[0]]; exists {
-			filterIgnoreAboveInPlace(next, segs[1:], ignoreAbove)
+		if len(segs) > 1 {
+			if next, exists := node[segs[0]]; exists {
+				filterIgnoreAboveInPlace(next, segs[1:], ignoreAbove)
+			}
 		}
 		if flatKey := strings.Join(segs, "."); node[flatKey] != nil {
 			filterIgnoreAboveInPlace(node, []string{flatKey}, ignoreAbove)
