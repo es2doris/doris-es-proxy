@@ -125,6 +125,20 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 	flags.phraseSlop = qsq.PhraseSlop
 	flags.fuzziness = qsq.Fuzziness
 	flags.lenient = qsq.Lenient
+	if t.Schema != nil {
+		flags.expandFields = func(pat string) []string {
+			exp := t.expandFieldPatternForContext(pat, nctx)
+			out := make([]string, 0, len(exp))
+			for _, bf := range exp {
+				if bf.Boost != 1.0 {
+					out = append(out, fmt.Sprintf("%s^%g", bf.Field, bf.Boost))
+				} else {
+					out = append(out, bf.Field)
+				}
+			}
+			return out
+		}
+	}
 	parsedAST := parseSimpleLuceneToASTWithFlags(raw, defaultField, expandedFields, defaultOp, 0, isSimple, flags)
 	if qsq.MinimumShouldMatch != nil && parsedAST.Bool != nil {
 		if len(parsedAST.Bool.Should) > 0 {
@@ -170,7 +184,7 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 						}
 					}
 				}
-			} else if t.isDoris4SearchableField(defaultField) {
+			} else if t.isDoris4SearchableField(defaultField) && (!strings.Contains(raw, `"`) || t.Schema == nil || t.Schema.ResolveField(defaultField).DorisType != schema.DorisVarchar) {
 				col := strings.Trim(t.sqlColumnRef(defaultField, false, nctx), "`")
 				pred := fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(rewrittenRaw), quoteStr(col), quoteStr(defaultOp))
 				return CompiledQuery{
@@ -215,10 +229,13 @@ func (t *Transpiler) rewriteDoris4SearchQuery(raw string) (string, bool) {
 		if idx := findLuceneFieldColon(rest); idx > 0 {
 			field := unescapeLuceneToken(rest[:idx])
 			val := rest[idx+1:]
+			if val == "" || hasMatchingOuterParens(val) {
+				return "", false
+			}
 			if !t.isDoris4SearchableField(field) {
 				return "", false
 			}
-			if hasMatchingOuterParens(val) && strings.Contains(val, ":") {
+			if t.Schema != nil && strings.Contains(val, `"`) && t.Schema.ResolveField(field).DorisType == schema.DorisVarchar {
 				return "", false
 			}
 			col := strings.Trim(t.sqlColumnRef(field, false, nil), "`")
@@ -290,6 +307,7 @@ type simpleQueryFlags struct {
 	phraseSlop       int
 	fuzziness        any
 	lenient          *bool
+	expandFields     func(string) []string
 }
 
 func allSimpleQueryFlags() simpleQueryFlags {
@@ -862,6 +880,26 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 					}
 					return esast.Query{MatchAll: map[string]any{}}
 				}
+				if strings.ContainsAny(field, "*?") && flags.expandFields != nil {
+					expFields := flags.expandFields(field)
+					if len(expFields) == 0 {
+						return esast.Query{MatchNone: map[string]any{}}
+					}
+					var shoulds []esast.Query
+					for _, ef := range expFields {
+						fname, fBoost := splitLuceneBoost(ef)
+						effB := boost * fBoost
+						if effB != 1.0 {
+							shoulds = append(shoulds, esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: esast.Query{Exists: &esast.ExistsQuery{Field: fname}}, Boost: &effB}})
+						} else {
+							shoulds = append(shoulds, esast.Query{Exists: &esast.ExistsQuery{Field: fname}})
+						}
+					}
+					if len(shoulds) == 1 {
+						return shoulds[0]
+					}
+					return esast.Query{Bool: &esast.BoolQuery{Should: shoulds}}
+				}
 				if boost != 1.0 {
 					b := boost
 					return esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: esast.Query{Exists: &esast.ExistsQuery{Field: field}}, Boost: &b}}
@@ -870,6 +908,26 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			}
 			if flags.timeZone != "" && rc.TimeZone == "" {
 				rc.TimeZone = flags.timeZone
+			}
+			if strings.ContainsAny(field, "*?") && flags.expandFields != nil {
+				expFields := flags.expandFields(field)
+				if len(expFields) == 0 {
+					return esast.Query{MatchNone: map[string]any{}}
+				}
+				var shoulds []esast.Query
+				for _, ef := range expFields {
+					fname, fBoost := splitLuceneBoost(ef)
+					rcCopy := *rc
+					effB := boost * fBoost
+					if effB != 1.0 {
+						rcCopy.Boost = &effB
+					}
+					shoulds = append(shoulds, esast.Query{Range: map[string]esast.RangeCond{fname: rcCopy}})
+				}
+				if len(shoulds) == 1 {
+					return shoulds[0]
+				}
+				return esast.Query{Bool: &esast.BoolQuery{Should: shoulds}}
 			}
 			return esast.Query{
 				Range: map[string]esast.RangeCond{field: *rc},
@@ -901,9 +959,29 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			}
 		}
 		if strings.HasPrefix(val, "/") && strings.HasSuffix(val, "/") && len(val) > 2 {
+			pat := strings.ReplaceAll(val[1:len(val)-1], `\/`, `/`)
+			if strings.ContainsAny(field, "*?") && flags.expandFields != nil {
+				expFields := flags.expandFields(field)
+				if len(expFields) == 0 {
+					return esast.Query{MatchNone: map[string]any{}}
+				}
+				var shoulds []esast.Query
+				for _, ef := range expFields {
+					fname, fBoost := splitLuceneBoost(ef)
+					shoulds = append(shoulds, esast.Query{
+						Regexp: map[string]esast.RegexpEntry{
+							fname: {Value: pat, Boost: boost * fBoost, HasBoost: true},
+						},
+					})
+				}
+				if len(shoulds) == 1 {
+					return shoulds[0]
+				}
+				return esast.Query{Bool: &esast.BoolQuery{Should: shoulds}}
+			}
 			return esast.Query{
 				Regexp: map[string]esast.RegexpEntry{
-					field: {Value: strings.ReplaceAll(val[1:len(val)-1], `\/`, `/`), Boost: boost, HasBoost: true},
+					field: {Value: pat, Boost: boost, HasBoost: true},
 				},
 			}
 		}
@@ -920,8 +998,17 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			var subFields []string
 			subDefault := field
 			if strings.ContainsAny(field, "*?") {
-				subFields = []string{field}
-				subDefault = defaultField
+				if flags.expandFields != nil {
+					subFields = flags.expandFields(field)
+					if len(subFields) > 0 {
+						subDefault = strings.Split(subFields[0], "^")[0]
+					} else {
+						subDefault = "__unmatched_wildcard__"
+					}
+				} else {
+					subFields = []string{field}
+					subDefault = defaultField
+				}
 			}
 			inner := parseSimpleLuceneToASTWithFlags(valRest[1:len(valRest)-1], subDefault, subFields, defaultOp, depth+1, isSimple, flags)
 			if valUnary == '-' || valUnary == '!' {
@@ -953,6 +1040,25 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 		}
 		if !isQuoted && (strings.EqualFold(val, "true") || strings.EqualFold(val, "false")) {
 			boolVal := strings.EqualFold(val, "true")
+			if strings.ContainsAny(field, "*?") && flags.expandFields != nil {
+				expFields := flags.expandFields(field)
+				if len(expFields) == 0 {
+					return esast.Query{MatchNone: map[string]any{}}
+				}
+				var shoulds []esast.Query
+				for _, ef := range expFields {
+					fname, fBoost := splitLuceneBoost(ef)
+					shoulds = append(shoulds, esast.Query{
+						Term: map[string]esast.TermEntry{
+							fname: {Value: boolVal, Boost: boost * fBoost},
+						},
+					})
+				}
+				if len(shoulds) == 1 {
+					return shoulds[0]
+				}
+				return esast.Query{Bool: &esast.BoolQuery{Should: shoulds}}
+			}
 			return esast.Query{
 				Term: map[string]esast.TermEntry{
 					field: {Value: boolVal, Boost: boost},
@@ -968,11 +1074,50 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 					}
 					return esast.Query{MatchAll: map[string]any{}}
 				}
+				if strings.ContainsAny(field, "*?") && flags.expandFields != nil {
+					expFields := flags.expandFields(field)
+					if len(expFields) == 0 {
+						return esast.Query{MatchNone: map[string]any{}}
+					}
+					var shoulds []esast.Query
+					for _, ef := range expFields {
+						fname, fBoost := splitLuceneBoost(ef)
+						effB := boost * fBoost
+						if effB != 1.0 {
+							shoulds = append(shoulds, esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: esast.Query{Exists: &esast.ExistsQuery{Field: fname}}, Boost: &effB}})
+						} else {
+							shoulds = append(shoulds, esast.Query{Exists: &esast.ExistsQuery{Field: fname}})
+						}
+					}
+					if len(shoulds) == 1 {
+						return shoulds[0]
+					}
+					return esast.Query{Bool: &esast.BoolQuery{Should: shoulds}}
+				}
 				if boost != 1.0 {
 					b := boost
 					return esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: esast.Query{Exists: &esast.ExistsQuery{Field: field}}, Boost: &b}}
 				}
 				return esast.Query{Exists: &esast.ExistsQuery{Field: field}}
+			}
+			if strings.ContainsAny(field, "*?") && flags.expandFields != nil {
+				expFields := flags.expandFields(field)
+				if len(expFields) == 0 {
+					return esast.Query{MatchNone: map[string]any{}}
+				}
+				var shoulds []esast.Query
+				for _, ef := range expFields {
+					fname, fBoost := splitLuceneBoost(ef)
+					shoulds = append(shoulds, esast.Query{
+						Wildcard: map[string]esast.WildcardEntry{
+							fname: {Value: rawWild, CaseInsensitive: true, Boost: boost * fBoost, HasBoost: true},
+						},
+					})
+				}
+				if len(shoulds) == 1 {
+					return shoulds[0]
+				}
+				return esast.Query{Bool: &esast.BoolQuery{Should: shoulds}}
 			}
 			return esast.Query{
 				Wildcard: map[string]esast.WildcardEntry{

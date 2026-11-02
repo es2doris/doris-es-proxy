@@ -39,8 +39,16 @@ const (
 	DefaultQueryCacheMaxEntryBytes = 1 * 1024 * 1024
 )
 
+type coalesceSubmission struct {
+	data     []byte
+	canceled bool
+}
+
 type coalesceBatch struct {
 	buf           bytes.Buffer
+	submissions   []*coalesceSubmission
+	totalBytes    int
+	flushing      bool
 	done          chan struct{}
 	err           error
 	timer         *time.Timer
@@ -114,15 +122,20 @@ func (c *StreamLoadCoalescer) Submit(ctx context.Context, table string, ndjson [
 		}
 		c.batches[table] = b
 	}
-	b.buf.Write(ndjson)
-	if ndjson[len(ndjson)-1] != '\n' {
-		b.buf.WriteByte('\n')
+	entryBytes := make([]byte, len(ndjson), len(ndjson)+1)
+	copy(entryBytes, ndjson)
+	if entryBytes[len(entryBytes)-1] != '\n' {
+		entryBytes = append(entryBytes, '\n')
 	}
+	sub := &coalesceSubmission{data: entryBytes}
+	b.submissions = append(b.submissions, sub)
+	b.totalBytes += len(entryBytes)
 
-	if syncRefresh || b.buf.Len() >= maxBytes {
+	if syncRefresh || b.totalBytes >= maxBytes {
 		if b.timer != nil {
 			b.timer.Stop()
 		}
+		b.flushing = true
 		delete(c.batches, table)
 		c.inflight[b] = table
 		c.mu.Unlock()
@@ -150,6 +163,12 @@ func (c *StreamLoadCoalescer) Submit(ctx context.Context, table string, ndjson [
 	case <-doneCh:
 		return b.err
 	case <-ctx.Done():
+		c.mu.Lock()
+		if !b.flushing {
+			sub.canceled = true
+			b.totalBytes -= len(sub.data)
+		}
+		c.mu.Unlock()
 		atomic.AddInt64(&b.activeWaiters, -1)
 		return ctx.Err()
 	}
@@ -171,6 +190,7 @@ func (c *StreamLoadCoalescer) FlushTable(ctx context.Context, table string) erro
 		if b.timer != nil {
 			b.timer.Stop()
 		}
+		b.flushing = true
 		delete(c.batches, table)
 		c.inflight[b] = table
 	}
@@ -232,6 +252,7 @@ func (c *StreamLoadCoalescer) FlushAll(ctx context.Context) error {
 		if b.timer != nil {
 			b.timer.Stop()
 		}
+		b.flushing = true
 		pending[tbl] = b
 		c.inflight[b] = tbl
 	}
@@ -288,6 +309,7 @@ func (c *StreamLoadCoalescer) onTimerFlush(table string, target *coalesceBatch) 
 		c.mu.Unlock()
 		return
 	}
+	target.flushing = true
 	c.inflight[target] = table
 	c.mu.Unlock()
 	defer func() {
@@ -303,8 +325,25 @@ func (c *StreamLoadCoalescer) onTimerFlush(table string, target *coalesceBatch) 
 
 func (c *StreamLoadCoalescer) executeBatch(ctx context.Context, table string, b *coalesceBatch, syncRefresh bool) {
 	defer close(b.done)
+	c.mu.Lock()
+	var buf bytes.Buffer
+	if b.buf.Len()+b.totalBytes > 0 {
+		buf.Grow(b.buf.Len() + b.totalBytes)
+	}
+	if b.buf.Len() > 0 {
+		buf.Write(b.buf.Bytes())
+	}
+	for _, sub := range b.submissions {
+		if !sub.canceled {
+			buf.Write(sub.data)
+		}
+	}
+	c.mu.Unlock()
+	if buf.Len() == 0 {
+		return
+	}
 	atomic.AddInt64(&c.coalescedFlushes, 1)
-	b.err = c.loadFn(ctx, table, b.buf.Bytes(), syncRefresh)
+	b.err = c.loadFn(ctx, table, buf.Bytes(), syncRefresh)
 }
 
 type queryCacheEntry struct {
@@ -479,6 +518,8 @@ func containsNowDateMath(req *esast.SearchRequest, reqBytes []byte) bool {
 			[]byte("offsetdatetime.now"),
 			[]byte("localdate.now"),
 			[]byte("new date("),
+			[]byte("math.random"),
+			[]byte("randomuuid"),
 		} {
 			if bytes.Contains(lowerBytes, pat) {
 				return true
@@ -576,6 +617,32 @@ func queryContainsNow(q *esast.Query) bool {
 		if boundValContainsNow(tc.Value) {
 			return true
 		}
+	}
+	for _, mc := range q.Match {
+		if boundValContainsNow(mc.Query) {
+			return true
+		}
+	}
+	for _, mp := range q.MatchPhrase {
+		if boundValContainsNow(mp.Query) {
+			return true
+		}
+	}
+	for _, mpp := range q.MatchPhrasePrefix {
+		if boundValContainsNow(mpp.Query) {
+			return true
+		}
+	}
+	for _, mbp := range q.MatchBoolPrefix {
+		if boundValContainsNow(mbp.Query) {
+			return true
+		}
+	}
+	if q.MultiMatch != nil && boundValContainsNow(q.MultiMatch.Query) {
+		return true
+	}
+	if q.CombinedFields != nil && boundValContainsNow(q.CombinedFields.Query) {
+		return true
 	}
 	if q.Terms != nil {
 		for _, vals := range q.Terms.Fields {

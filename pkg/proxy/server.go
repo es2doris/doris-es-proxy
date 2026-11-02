@@ -179,12 +179,15 @@ type Server struct {
 	aliases               map[string][]string                 // aliasName -> ordered target indexNames
 	aliasMeta             map[string]map[string]AliasMetadata // aliasName -> indexName -> metadata
 	docRouting            map[string]map[string]string        // indexName -> docID -> routing
+	docVersions           map[string]map[string]int64         // indexName -> docID -> last known version (including tombstones)
 	indexDefaultPipelines map[string]string                   // indexName -> default ingest pipeline ID
 	indexFinalPipelines   map[string]string                   // indexName -> final ingest pipeline ID
 	templates             map[string]esast.IndexTemplateRequest
 	componentTemplates    map[string]map[string]any
 	pipelines             map[string]map[string]any
 	enrichPolicies        map[string]map[string]any
+	ilmPolicies           map[string]map[string]any
+	dataStreams           map[string]map[string]any
 }
 
 func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerOptions) *Server {
@@ -203,12 +206,15 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		aliases:               make(map[string][]string),
 		aliasMeta:             make(map[string]map[string]AliasMetadata),
 		docRouting:            make(map[string]map[string]string),
+		docVersions:           make(map[string]map[string]int64),
 		indexDefaultPipelines: make(map[string]string),
 		indexFinalPipelines:   make(map[string]string),
 		templates:             make(map[string]esast.IndexTemplateRequest),
 		componentTemplates:    make(map[string]map[string]any),
 		pipelines:             make(map[string]map[string]any),
 		enrichPolicies:        make(map[string]map[string]any),
+		ilmPolicies:           make(map[string]map[string]any),
+		dataStreams:           make(map[string]map[string]any),
 	}
 	s.coalescer = newStreamLoadCoalescer(func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
 		err := s.backend.StreamLoad(ctx, table, ndjson, syncRefresh)
@@ -304,6 +310,36 @@ func (s *Server) getDocRouting(indexName, docID string) string {
 		return m[docID]
 	}
 	return ""
+}
+
+func (s *Server) setDocVersion(indexName, docID string, ver int64) {
+	if indexName == "" || docID == "" || ver <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.docVersions == nil {
+		s.docVersions = make(map[string]map[string]int64)
+	}
+	if s.docVersions[indexName] == nil {
+		s.docVersions[indexName] = make(map[string]int64)
+	}
+	s.docVersions[indexName][docID] = ver
+}
+
+func (s *Server) getDocVersion(indexName, docID string) int64 {
+	if indexName == "" || docID == "" {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.docVersions == nil {
+		return 0
+	}
+	if m, ok := s.docVersions[indexName]; ok {
+		return m[docID]
+	}
+	return 0
 }
 
 func (s *Server) resolveEffectiveWriteRouting(rawIndex, targetIndex, reqRouting, pipeRouting string) string {
@@ -1398,14 +1434,90 @@ func (s *Server) handleClusterStats(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleILMPolicy(w http.ResponseWriter, r *http.Request) {
-	policy := r.PathValue("policy")
+	policy := strings.TrimSpace(r.PathValue("policy"))
 	switch r.Method {
-	case http.MethodPut, http.MethodPost, http.MethodDelete:
+	case http.MethodPut, http.MethodPost:
+		if policy != "" {
+			bodyBytes, ok := readRequestBody(w, r)
+			if !ok {
+				return
+			}
+			var polObj map[string]any
+			if len(bytes.TrimSpace(bodyBytes)) > 0 {
+				if err := json.Unmarshal(bodyBytes, &polObj); err != nil {
+					writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+					return
+				}
+			}
+			if polObj == nil {
+				polObj = map[string]any{"policy": map[string]any{"phases": map[string]any{}}}
+			}
+			s.mu.Lock()
+			if s.ilmPolicies == nil {
+				s.ilmPolicies = make(map[string]map[string]any)
+			}
+			ver := 1
+			if existing, exists := s.ilmPolicies[policy]; exists {
+				if v, okV := toInt64(existing["version"]); okV && v > 0 {
+					ver = int(v) + 1
+				}
+			}
+			polInner, okInner := polObj["policy"].(map[string]any)
+			if !okInner {
+				polInner = polObj
+			}
+			s.ilmPolicies[policy] = map[string]any{
+				"version":       ver,
+				"modified_date": "2026-01-01T00:00:00.000Z",
+				"policy":        polInner,
+			}
+			s.mu.Unlock()
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+	case http.MethodDelete:
+		if policy != "" {
+			s.mu.Lock()
+			_, exists := s.ilmPolicies[policy]
+			delete(s.ilmPolicies, policy)
+			s.mu.Unlock()
+			if !exists {
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "lifecycle policy ["+policy+"] does not exist")
+				return
+			}
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 	case http.MethodHead:
+		if policy != "" {
+			s.mu.RLock()
+			_, exists := s.ilmPolicies[policy]
+			s.mu.RUnlock()
+			if !exists {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+		}
 		w.WriteHeader(http.StatusOK)
 	default:
+		s.mu.RLock()
 		if policy != "" {
+			if stored, exists := s.ilmPolicies[policy]; exists {
+				cp := deepCloneDocMap(stored)
+				s.mu.RUnlock()
+				writeJSON(w, http.StatusOK, map[string]any{policy: cp})
+				return
+			}
+			if strings.ContainsAny(policy, "*?") {
+				out := make(map[string]any)
+				for k, v := range s.ilmPolicies {
+					if matchWildcardPattern(policy, k) {
+						out[k] = deepCloneDocMap(v)
+					}
+				}
+				s.mu.RUnlock()
+				writeJSON(w, http.StatusOK, out)
+				return
+			}
+			s.mu.RUnlock()
 			writeJSON(w, http.StatusOK, map[string]any{
 				policy: map[string]any{
 					"version":       1,
@@ -1415,7 +1527,12 @@ func (s *Server) handleILMPolicy(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{})
+		out := make(map[string]any, len(s.ilmPolicies))
+		for k, v := range s.ilmPolicies {
+			out[k] = deepCloneDocMap(v)
+		}
+		s.mu.RUnlock()
+		writeJSON(w, http.StatusOK, out)
 	}
 }
 
@@ -1432,11 +1549,74 @@ func (s *Server) handleILMExplain(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDataStream(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
 	switch r.Method {
-	case http.MethodPut, http.MethodPost, http.MethodDelete:
+	case http.MethodPut, http.MethodPost:
+		if name != "" {
+			_ = s.ensureIndexSchema(r.Context(), name)
+			s.mu.Lock()
+			if s.dataStreams == nil {
+				s.dataStreams = make(map[string]map[string]any)
+			}
+			s.dataStreams[name] = map[string]any{
+				"name":            name,
+				"timestamp_field": map[string]any{"name": "@timestamp"},
+				"indices": []any{
+					map[string]any{
+						"index_name": name,
+						"index_uuid": name,
+					},
+				},
+				"generation": 1,
+				"status":     "GREEN",
+				"hidden":     false,
+				"system":     false,
+				"replicated": false,
+			}
+			s.mu.Unlock()
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+	case http.MethodDelete:
+		if name != "" {
+			s.mu.Lock()
+			var matched []string
+			for k := range s.dataStreams {
+				if k == name || matchWildcardPattern(name, k) {
+					matched = append(matched, k)
+				}
+			}
+			for _, k := range matched {
+				delete(s.dataStreams, k)
+			}
+			s.mu.Unlock()
+			if len(matched) == 0 {
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "data_streams ["+name+"] missing")
+				return
+			}
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 	default:
-		writeJSON(w, http.StatusOK, map[string]any{"data_streams": []any{}})
+		s.mu.RLock()
+		var list []any
+		var names []string
+		for k := range s.dataStreams {
+			if name == "" || name == "*" || name == "_all" || matchWildcardPattern(name, k) {
+				names = append(names, k)
+			}
+		}
+		sort.Strings(names)
+		for _, k := range names {
+			list = append(list, deepCloneDocMap(s.dataStreams[k]))
+		}
+		s.mu.RUnlock()
+		if name != "" && !strings.ContainsAny(name, "*?") && name != "_all" && len(list) == 0 {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "data_stream ["+name+"] missing")
+			return
+		}
+		if list == nil {
+			list = []any{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data_streams": list})
 	}
 }
 
@@ -1614,7 +1794,7 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 	cursor, ok := decodeScrollCursor(scrollID)
 	if !ok || len(cursor.LastSort) == 0 {
 		eofTotal := any(map[string]any{"value": 0, "relation": "eq"})
-		if r.URL.Query().Get("rest_total_hits_as_int") == "true" {
+		if isTruthyBoolQueryParam(r, "rest_total_hits_as_int") {
 			eofTotal = 0
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -1647,7 +1827,7 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 		nextScrollID = encodeScrollCursor(cursor.Index, &req, lastSort)
 	}
 	resp["_scroll_id"] = nextScrollID
-	if r.URL.Query().Get("typed_keys") == "true" || (r.URL.Query().Has("typed_keys") && r.URL.Query().Get("typed_keys") != "false") {
+	if isTruthyBoolQueryParam(r, "typed_keys") {
 		if aggsMap, ok := resp["aggregations"].(map[string]any); ok {
 			applyTypedKeysToAggregations(aggsMap, req.EffectiveAggs())
 		}
@@ -1655,10 +1835,44 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 			applyTypedKeysToSuggestions(sugMap, req.Suggest)
 		}
 	}
-	if r.URL.Query().Get("rest_total_hits_as_int") == "true" || (r.URL.Query().Has("rest_total_hits_as_int") && r.URL.Query().Get("rest_total_hits_as_int") != "false") {
+	if isTruthyBoolQueryParam(r, "rest_total_hits_as_int") {
 		applyRestTotalHitsAsInt(resp, &req)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func isTruthyBoolQueryParam(r *http.Request, key string) bool {
+	if r == nil || r.URL == nil {
+		return false
+	}
+	q := r.URL.Query()
+	if !q.Has(key) {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(q.Get(key))) {
+	case "", "true", "1":
+		return true
+	default:
+		return false
+	}
+}
+
+func parseOptionalBoolAny(v any) (bool, bool) {
+	if v == nil {
+		return false, false
+	}
+	switch tv := v.(type) {
+	case bool:
+		return tv, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(tv)) {
+		case "true", "1":
+			return true, true
+		case "false", "0":
+			return false, true
+		}
+	}
+	return false, false
 }
 
 func extractLastHitSort(resp map[string]any) []any {
@@ -2172,6 +2386,7 @@ func (s *Server) handleDeleteIndex(w http.ResponseWriter, r *http.Request) {
 		}
 		delete(s.indices, indexName)
 		delete(s.docRouting, indexName)
+		delete(s.docVersions, indexName)
 		delete(s.indexDefaultPipelines, indexName)
 		delete(s.indexFinalPipelines, indexName)
 		for alias := range s.aliases {
@@ -2468,6 +2683,28 @@ func (s *Server) handleIndexAliasByName(w http.ResponseWriter, r *http.Request) 
 	case http.MethodDelete:
 		modifiedAliases := make(map[string][]string)
 		s.mu.Lock()
+		var existingTargets []string
+		for _, indexName := range targetIndices {
+			if _, ok := s.indices[indexName]; ok {
+				existingTargets = append(existingTargets, indexName)
+			}
+		}
+		if len(existingTargets) == 0 {
+			s.mu.Unlock()
+			writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
+			return
+		}
+		removedAny := false
+		aliasHasAnyTargetLocked := func(al string, idxs []string) bool {
+			for _, t := range s.aliases[al] {
+				for _, idx := range idxs {
+					if t == idx {
+						return true
+					}
+				}
+			}
+			return false
+		}
 		if strings.ContainsAny(aliasName, "*?") || aliasName == "_all" {
 			var matchingAliases []string
 			for al := range s.aliases {
@@ -2476,18 +2713,28 @@ func (s *Server) handleIndexAliasByName(w http.ResponseWriter, r *http.Request) 
 				}
 			}
 			for _, al := range matchingAliases {
-				for _, indexName := range targetIndices {
+				if aliasHasAnyTargetLocked(al, existingTargets) {
+					removedAny = true
+				}
+				for _, indexName := range existingTargets {
 					s.removeAliasTargetLocked(al, indexName)
 				}
 				modifiedAliases[al] = append([]string(nil), s.aliases[al]...)
 			}
 		} else {
-			for _, indexName := range targetIndices {
+			if aliasHasAnyTargetLocked(aliasName, existingTargets) {
+				removedAny = true
+			}
+			for _, indexName := range existingTargets {
 				s.removeAliasTargetLocked(aliasName, indexName)
 			}
 			modifiedAliases[aliasName] = append([]string(nil), s.aliases[aliasName]...)
 		}
 		s.mu.Unlock()
+		if !removedAny {
+			writeESError(w, http.StatusNotFound, "aliases_not_found_exception", "aliases ["+aliasName+"] missing")
+			return
+		}
 		for al, targets := range modifiedAliases {
 			s.persistAlias(r.Context(), al, targets)
 		}
@@ -2559,13 +2806,82 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = s.syncCatalogFromBackend(r.Context())
 	modifiedAliases := make(map[string][]string)
+	var removedIndices []string
+	var tablesToDrop []*schema.IndexSchema
 	s.mu.Lock()
+	expandIndexListLocked := func(rawList []string) []string {
+		var out []string
+		seen := make(map[string]bool)
+		for _, pat := range rawList {
+			pat = strings.TrimSpace(pat)
+			if pat == "" {
+				continue
+			}
+			if pat == "*" || pat == "_all" {
+				for idxName := range s.indices {
+					if !seen[idxName] {
+						seen[idxName] = true
+						out = append(out, idxName)
+					}
+				}
+				continue
+			}
+			if strings.ContainsAny(pat, "*?") {
+				for idxName := range s.indices {
+					if matchWildcardPattern(pat, idxName) && !seen[idxName] {
+						seen[idxName] = true
+						out = append(out, idxName)
+					}
+				}
+				continue
+			}
+			if !seen[pat] {
+				seen[pat] = true
+				out = append(out, pat)
+			}
+		}
+		return out
+	}
+	expandAliasListLocked := func(rawList []string) []string {
+		var out []string
+		seen := make(map[string]bool)
+		for _, pat := range rawList {
+			pat = strings.TrimSpace(pat)
+			if pat == "" {
+				continue
+			}
+			if pat == "*" || pat == "_all" {
+				for alName := range s.aliases {
+					if !seen[alName] {
+						seen[alName] = true
+						out = append(out, alName)
+					}
+				}
+				continue
+			}
+			if strings.ContainsAny(pat, "*?") {
+				for alName := range s.aliases {
+					if matchWildcardPattern(pat, alName) && !seen[alName] {
+						seen[alName] = true
+						out = append(out, alName)
+					}
+				}
+				continue
+			}
+			if !seen[pat] {
+				seen[pat] = true
+				out = append(out, pat)
+			}
+		}
+		return out
+	}
 	for _, action := range payload.Actions {
 		if add, ok := action["add"]; ok {
-			indices := add.Indices
+			rawIndices := add.Indices
 			if add.Index != "" {
-				indices = append(indices, add.Index)
+				rawIndices = append(rawIndices, add.Index)
 			}
+			indices := expandIndexListLocked(rawIndices)
 			aliases := add.Aliases
 			if add.Alias != "" {
 				aliases = append(aliases, add.Alias)
@@ -2585,30 +2901,67 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if rem, ok := action["remove"]; ok {
-			indices := rem.Indices
+			rawIndices := rem.Indices
 			if rem.Index != "" {
-				indices = append(indices, rem.Index)
+				rawIndices = append(rawIndices, rem.Index)
 			}
-			aliases := rem.Aliases
+			rawAliases := rem.Aliases
 			if rem.Alias != "" {
-				aliases = append(aliases, rem.Alias)
+				rawAliases = append(rawAliases, rem.Alias)
 			}
+			aliases := expandAliasListLocked(rawAliases)
+			hasAllIdx := false
+			for _, ri := range rawIndices {
+				if ri == "*" || ri == "_all" {
+					hasAllIdx = true
+					break
+				}
+			}
+			indices := expandIndexListLocked(rawIndices)
 			for _, al := range aliases {
-				for _, idx := range indices {
-					if idx == "*" || idx == "_all" {
-						delete(s.aliases, al)
-						delete(s.aliasMeta, al)
-					} else {
+				if hasAllIdx {
+					delete(s.aliases, al)
+					delete(s.aliasMeta, al)
+				} else {
+					for _, idx := range indices {
 						s.removeAliasTargetLocked(al, idx)
 					}
 				}
 				modifiedAliases[al] = append([]string(nil), s.aliases[al]...)
 			}
 		}
+		if remIdx, ok := action["remove_index"]; ok {
+			rawIndices := remIdx.Indices
+			if remIdx.Index != "" {
+				rawIndices = append(rawIndices, remIdx.Index)
+			}
+			for _, indexName := range expandIndexListLocked(rawIndices) {
+				if idx, exists := s.indices[indexName]; exists {
+					tablesToDrop = append(tablesToDrop, idx)
+				}
+				delete(s.indices, indexName)
+				delete(s.docRouting, indexName)
+				delete(s.docVersions, indexName)
+				delete(s.indexDefaultPipelines, indexName)
+				delete(s.indexFinalPipelines, indexName)
+				removedIndices = append(removedIndices, indexName)
+				for alias := range s.aliases {
+					s.removeAliasTargetLocked(alias, indexName)
+					modifiedAliases[alias] = append([]string(nil), s.aliases[alias]...)
+				}
+			}
+		}
 	}
 	s.mu.Unlock()
+	for _, indexName := range removedIndices {
+		s.deleteCatalogEntity(r.Context(), "index", indexName)
+	}
 	for al, targets := range modifiedAliases {
 		s.persistAlias(r.Context(), al, targets)
+	}
+	for _, idx := range tablesToDrop {
+		ddl := fmt.Sprintf("DROP TABLE IF EXISTS `%s`.`%s`;", idx.DorisDB, idx.DorisTable)
+		_ = s.backend.ExecDDL(r.Context(), ddl)
 	}
 	s.queryCache.InvalidateAll()
 	writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
@@ -2881,6 +3234,7 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 	}
 	var minVer int64
 	var curVer int64
+	var tombVer int64
 	wasExisting := false
 	_ = s.coalescer.FlushTable(r.Context(), roSchema.DorisTable)
 	if existing, found, err := s.backend.GetDocByID(r.Context(), roSchema.DorisDB, roSchema.DorisTable, docID); err == nil && found {
@@ -2898,9 +3252,20 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 			minVer = existing.Version + 1
 		}
 	} else if existing != nil {
+		tombVer = existing.Version
 		minVer = existing.Version + 1
 	}
-	assignedVer, occStatus, occType, occReason := validateOCC(docID, wasExisting, curVer, ifSeqNo, ifPrimaryTerm, reqVer, verType)
+	occFound := wasExisting
+	if !occFound && strings.HasPrefix(strings.ToLower(strings.TrimSpace(verType)), "external") {
+		if tombVer > 0 && tombVer < 1_000_000_000_000 {
+			occFound = true
+			curVer = tombVer
+		} else if lastVer := s.getDocVersion(indexName, docID); lastVer > 0 && lastVer < 1_000_000_000_000 {
+			occFound = true
+			curVer = lastVer
+		}
+	}
+	assignedVer, occStatus, occType, occReason := validateOCC(docID, occFound, curVer, ifSeqNo, ifPrimaryTerm, reqVer, verType)
 	if occType != "" {
 		writeESError(w, occStatus, occType, occReason)
 		return
@@ -2929,6 +3294,8 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setDocRouting(indexName, docID, effRouting)
+	s.setDocVersion(indexName, docID, nextVer)
+	s.queryCache.InvalidateAll()
 
 	status := http.StatusCreated
 	result := "created"
@@ -3364,9 +3731,6 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 		_ = s.allocVersion(assignedVer)
 	}
 	tombstoneVer := nextVer
-	if assignedVer == 0 && existingHit.Version > 0 && existingHit.Version < 1_000_000_000_000 {
-		tombstoneVer = existingHit.Version
-	}
 	tombstone, err := schema.ShredDocument(idxSchema, docID, tombstoneVer, true, nil)
 	if err != nil {
 		writeESError(w, http.StatusInternalServerError, "internal_exception", err.Error())
@@ -3378,6 +3742,8 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setDocRouting(indexName, docID, "")
+	s.setDocVersion(indexName, docID, tombstoneVer)
+	s.queryCache.InvalidateAll()
 	delResp := map[string]any{
 		"_index":        indexName,
 		"_type":         "_doc",
@@ -3609,10 +3975,12 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 		}
 		syncRefresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh") == "wait_for"
 		payload := append(shredded, '\n')
+		var clearOrigRouting bool
+		var origTombVer int64
 		if found && !isDelete && (docID != origDocID || indexName != origIndex) {
 			origSchema := s.ensureIndexSchema(r.Context(), origIndex)
-			tombVer := s.allocVersion(existingHit.Version + 1)
-			if tombShredded, tErr := schema.ShredDocument(origSchema, origDocID, tombVer, true, nil); tErr == nil {
+			origTombVer = s.allocVersion(existingHit.Version + 1)
+			if tombShredded, tErr := schema.ShredDocument(origSchema, origDocID, origTombVer, true, nil); tErr == nil {
 				if origSchema.DorisTable == idxSchema.DorisTable {
 					payload = append(append(tombShredded, '\n'), payload...)
 				} else if err := s.streamLoad(r.Context(), origSchema.DorisTable, append(tombShredded, '\n'), syncRefresh); err != nil {
@@ -3620,17 +3988,23 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
-			s.setDocRouting(origIndex, origDocID, "")
+			clearOrigRouting = true
 		}
 		if err := s.streamLoad(r.Context(), idxSchema.DorisTable, payload, syncRefresh); err != nil {
 			writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
 			return
+		}
+		if clearOrigRouting {
+			s.setDocRouting(origIndex, origDocID, "")
+			s.setDocVersion(origIndex, origDocID, origTombVer)
 		}
 		if isDelete {
 			s.setDocRouting(indexName, docID, "")
 		} else {
 			s.setDocRouting(indexName, docID, effRouting)
 		}
+		s.setDocVersion(indexName, docID, nextVersion)
+		s.queryCache.InvalidateAll()
 	} else {
 		if s.isRoutingRequired(roSchema) && effRouting == "" {
 			writeESError(w, http.StatusBadRequest, "routing_missing_exception", fmt.Sprintf("routing is required for [%s]/[_doc]/[%s]", indexName, docID))
@@ -4353,10 +4727,17 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		if m, err := s.backend.GetDocsByIDs(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, ids); err == nil {
 			existingByIndex[idxName] = m
 			initCopy := make(map[string]HitRow, len(m))
-			verMap := make(map[string]int64, len(m))
+			verMap := make(map[string]int64, len(ids))
 			for id, hr := range m {
 				initCopy[id] = hr
 				verMap[id] = hr.Version
+			}
+			for _, id := range ids {
+				if _, ok := verMap[id]; !ok {
+					if delVer := s.getDocVersion(idxName, id); delVer > 0 && delVer < 1_000_000_000_000 {
+						verMap[id] = delVer
+					}
+				}
 			}
 			initialExistingByIndex[idxName] = initCopy
 			lastVerByIndex[idxName] = verMap
@@ -4371,6 +4752,24 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 	}
 	byIndex := make(map[string]*bytes.Buffer)
 	pendingRowsByTable := make(map[string][]pendingBulkRow)
+	pendingRouting := make(map[string]map[string]string)
+	setPendingRouting := func(idxName, docID, rVal string) {
+		if idxName == "" || docID == "" {
+			return
+		}
+		if pendingRouting[idxName] == nil {
+			pendingRouting[idxName] = make(map[string]string)
+		}
+		pendingRouting[idxName][docID] = rVal
+	}
+	getPendingOrStoredRouting := func(idxName, docID string) string {
+		if m, ok := pendingRouting[idxName]; ok {
+			if rVal, has := m[docID]; has {
+				return rVal
+			}
+		}
+		return s.getDocRouting(idxName, docID)
+	}
 	writtenInBatch := make(map[string]bool, len(ops))
 	reroutedToInBatch := make(map[string]bool, len(ops))
 	var items []map[string]any
@@ -4645,7 +5044,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if effRouting == "" && found {
-				effRouting = s.getDocRouting(targetIndex, op.ID)
+				effRouting = getPendingOrStoredRouting(targetIndex, op.ID)
 			}
 			var baseSrc json.RawMessage
 			upd.MetaID = op.ID
@@ -4862,7 +5261,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 								deleted: true,
 							})
 						}
-						s.setDocRouting(origTargetIndex, origOpID, "")
+						setPendingRouting(origTargetIndex, origOpID, "")
 						delete(existingByIndex[origTargetIndex], origOpID)
 						if lastVerByIndex[origTargetIndex] == nil {
 							lastVerByIndex[origTargetIndex] = make(map[string]int64)
@@ -4919,9 +5318,6 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			_ = s.allocVersion(assignedVer)
 		}
 		shredVer := nextVer
-		if deleted && assignedVer == 0 && wasExistingBeforeOp && existingBeforeOp.Version > 0 && existingBeforeOp.Version < 1_000_000_000_000 {
-			shredVer = existingBeforeOp.Version
-		}
 		shredded, err := schema.ShredDocument(idxSchema, op.ID, shredVer, deleted, sourceToShred)
 		if err != nil {
 			hasErrors = true
@@ -4953,11 +5349,11 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		lastVerByIndex[targetIndex][op.ID] = nextVer
 		if deleted {
 			writtenInBatch[targetIndex+"\x00"+op.ID] = false
-			s.setDocRouting(targetIndex, op.ID, "")
+			setPendingRouting(targetIndex, op.ID, "")
 			delete(existingByIndex[targetIndex], op.ID)
 		} else {
 			writtenInBatch[targetIndex+"\x00"+op.ID] = true
-			s.setDocRouting(targetIndex, op.ID, effRouting)
+			setPendingRouting(targetIndex, op.ID, effRouting)
 			existingByIndex[targetIndex][op.ID] = HitRow{ID: op.ID, Version: nextVer, Source: sourceToShred, Routing: effRouting}
 		}
 
@@ -5022,6 +5418,17 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	for idxName, docMap := range pendingRouting {
+		for docID, rVal := range docMap {
+			s.setDocRouting(idxName, docID, rVal)
+		}
+	}
+	for idxName, verMap := range lastVerByIndex {
+		for docID, ver := range verMap {
+			s.setDocVersion(idxName, docID, ver)
+		}
+	}
+	s.queryCache.InvalidateAll()
 
 	tookMs := time.Since(start).Milliseconds()
 	if tookMs <= 0 {
@@ -5084,7 +5491,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		r.URL.Query().Get("_doris_explain") == "true" || r.URL.Query().Get("_doris_explain") == "1" {
 		resp["_doris_explain"] = s.buildDorisExplainObject(r.Context(), rawIndex, &req)
 	}
-	if r.URL.Query().Get("typed_keys") == "true" || (r.URL.Query().Has("typed_keys") && r.URL.Query().Get("typed_keys") != "false") {
+	if isTruthyBoolQueryParam(r, "typed_keys") {
 		if aggsMap, ok := resp["aggregations"].(map[string]any); ok {
 			applyTypedKeysToAggregations(aggsMap, req.EffectiveAggs())
 		}
@@ -5092,7 +5499,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			applyTypedKeysToSuggestions(sugMap, req.Suggest)
 		}
 	}
-	if r.URL.Query().Get("rest_total_hits_as_int") == "true" || (r.URL.Query().Has("rest_total_hits_as_int") && r.URL.Query().Get("rest_total_hits_as_int") != "false") {
+	if isTruthyBoolQueryParam(r, "rest_total_hits_as_int") {
 		applyRestTotalHitsAsInt(resp, &req)
 	}
 	tookMs, _ := toInt64(resp["took"])
@@ -5473,8 +5880,8 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 			Indices            any    `json:"indices"`
 			SearchType         string `json:"search_type"`
 			Routing            any    `json:"routing"`
-			RestTotalHitsAsInt *bool  `json:"rest_total_hits_as_int"`
-			TypedKeys          *bool  `json:"typed_keys"`
+			RestTotalHitsAsInt any    `json:"rest_total_hits_as_int"`
+			TypedKeys          any    `json:"typed_keys"`
 			FilterPath         string `json:"filter_path"`
 			TerminateAfter     *int   `json:"terminate_after"`
 		}
@@ -5537,7 +5944,8 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 			resp["pit_id"] = req.PIT.ID
 		}
 		resp["status"] = http.StatusOK
-		if (hdr.TypedKeys != nil && *hdr.TypedKeys) || (hdr.TypedKeys == nil && (r.URL.Query().Get("typed_keys") == "true" || (r.URL.Query().Has("typed_keys") && r.URL.Query().Get("typed_keys") != "false"))) {
+		hdrTypedKeys, hasHdrTypedKeys := parseOptionalBoolAny(hdr.TypedKeys)
+		if (hasHdrTypedKeys && hdrTypedKeys) || (!hasHdrTypedKeys && isTruthyBoolQueryParam(r, "typed_keys")) {
 			if aggsMap, ok := resp["aggregations"].(map[string]any); ok {
 				applyTypedKeysToAggregations(aggsMap, req.EffectiveAggs())
 			}
@@ -5545,7 +5953,8 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 				applyTypedKeysToSuggestions(sugMap, req.Suggest)
 			}
 		}
-		if (hdr.RestTotalHitsAsInt != nil && *hdr.RestTotalHitsAsInt) || (hdr.RestTotalHitsAsInt == nil && (r.URL.Query().Get("rest_total_hits_as_int") == "true" || (r.URL.Query().Has("rest_total_hits_as_int") && r.URL.Query().Get("rest_total_hits_as_int") != "false"))) {
+		hdrRestTotalHits, hasHdrRestTotalHits := parseOptionalBoolAny(hdr.RestTotalHitsAsInt)
+		if (hasHdrRestTotalHits && hdrRestTotalHits) || (!hasHdrRestTotalHits && isTruthyBoolQueryParam(r, "rest_total_hits_as_int")) {
 			applyRestTotalHitsAsInt(resp, &req)
 		}
 		if fp := strings.TrimSpace(hdr.FilterPath); fp != "" {
@@ -6323,7 +6732,8 @@ func (s *Server) executeSearchRequest(
 						}
 						docMap["__meta_id"] = h.ID
 						if queryHasRuntimeScript(req.Query) || queryHasNestedScoring(req.Query) || req.Query.FunctionScore != nil {
-							h.Score = evalQueryScriptScoreOnDocWithSchema(tSchema, docMap, req.Query, 1.0)
+							baseScore := scoreNonScriptClauseOnDoc(tSchema, docMap, req.Query)
+							h.Score = evalQueryScriptScoreOnDocWithSchema(tSchema, docMap, req.Query, baseScore)
 						} else {
 							h.Score = scoreNonScriptClauseOnDoc(tSchema, docMap, req.Query)
 						}
@@ -10664,6 +11074,7 @@ func buildTopMetricsObject(rows []AggRow, spec *esast.TopMetricsAggSpec, docLook
 		hit   *HitRow
 	}
 	candidates := make([]candidate, 0, len(rows))
+	seenDocID := make(map[string]bool, len(rows))
 	for _, r := range rows {
 		var h *HitRow
 		if docLookup != nil {
@@ -10673,6 +11084,10 @@ func buildTopMetricsObject(rows []AggRow, spec *esast.TopMetricsAggSpec, docLook
 		if nul := strings.IndexByte(docID, '\x00'); nul >= 0 {
 			docID = docID[nul+1:]
 		}
+		if seenDocID[docID] {
+			continue
+		}
+		seenDocID[docID] = true
 		candidates = append(candidates, candidate{docID: docID, hit: h})
 	}
 	if len(candidates) > 1 && len(spec.Sort) > 0 {
@@ -10799,7 +11214,8 @@ func filterAndSortTermsRowsWithSubAggs(
 	}
 	var criteria []termsOrderCriterion
 	addCriterion := func(field string, v any) {
-		desc := !strings.EqualFold(fmt.Sprintf("%v", v), "asc")
+		dirStr := extractCompositeSourceOrder(v)
+		desc := !strings.EqualFold(dirStr, "asc")
 		var metricByKey map[string]float64
 		if field != "_count" && field != "_key" && field != "_term" {
 			normField := strings.ReplaceAll(strings.TrimSpace(field), ">", ".")
@@ -11865,7 +12281,25 @@ func evaluateBucketSortPipelineAggs(buckets []map[string]any, subAggs map[string
 								vj, okJ = 0, true
 							}
 						}
+						if sSpec.Entry.Missing != "" && !strings.EqualFold(sSpec.Entry.Missing, "_first") && !strings.EqualFold(sSpec.Entry.Missing, "_last") {
+							if mf, okM := parseFiniteFloat(sSpec.Entry.Missing); okM {
+								if !okI {
+									vi, okI = mf, true
+								}
+								if !okJ {
+									vj, okJ = mf, true
+								}
+							}
+						}
 						if !okI && !okJ {
+							if si, okSI := buckets[i][field]; okSI || buckets[j][field] != nil {
+								if cmp := compareAny(si, buckets[j][field]); cmp != 0 {
+									if desc {
+										return cmp > 0
+									}
+									return cmp < 0
+								}
+							}
 							continue
 						}
 						missingFirst := strings.EqualFold(sSpec.Entry.Missing, "_first")
@@ -13603,6 +14037,7 @@ func buildTopHitsList(
 		hit   *HitRow
 	}
 	candidates := make([]candidate, 0, len(rows))
+	seenDocID := make(map[string]bool, len(rows))
 	var fallbackSchema *schema.IndexSchema
 	var searchQuery *esast.Query
 	for _, r := range rows {
@@ -13622,6 +14057,10 @@ func buildTopHitsList(
 		if nul := strings.IndexByte(docID, '\x00'); nul >= 0 {
 			docID = docID[nul+1:]
 		}
+		if seenDocID[docID] {
+			continue
+		}
+		seenDocID[docID] = true
 		candidates = append(candidates, candidate{docID: docID, hit: h})
 	}
 	if len(candidates) > 1 && len(spec.Sort) > 0 {
@@ -15404,7 +15843,7 @@ func sortHistogramBuckets(buckets []map[string]any, order any) []map[string]any 
 	var specs []histSortSpec
 	parseMap := func(m map[string]any) {
 		for k, v := range m {
-			if dir, ok := v.(string); ok {
+			if dir := extractCompositeSourceOrder(v); dir != "" {
 				specs = append(specs, histSortSpec{
 					target: strings.TrimSpace(k),
 					desc:   strings.EqualFold(strings.TrimSpace(dir), "desc"),
@@ -18893,7 +19332,7 @@ func emitRuntimeMetricAggRows(
 		for _, d := range bDocs {
 			vals = append(vals, extractDocNumericValuesForMetric(d, mSpec)...)
 		}
-		if len(vals) > 0 || (parentBucketKey == "" && subSpec.Sum != nil) {
+		if len(vals) > 0 || subSpec.Sum != nil {
 			var res float64
 			if len(vals) > 0 {
 				switch {
