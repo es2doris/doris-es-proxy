@@ -27,6 +27,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/es2doris/doris-es-proxy/pkg/esast"
 )
 
 // ShredDocument transforms an Elasticsearch document (`rawSource`) into a flat Doris Stream Load
@@ -66,6 +68,11 @@ func ShredDocument(
 			err = fmt.Errorf("expected JSON object")
 		}
 		return nil, fmt.Errorf("invalid document JSON for _id=%q: %w", id, err)
+	}
+	if s != nil && s.RawMapping != nil {
+		if _, err := validateStrictDynamicObject(parsedDoc, s.RawMapping.Properties, s.RawMapping.Dynamic, ""); err != nil {
+			return nil, err
+		}
 	}
 
 	row := make(map[string]any, len(s.Fields)+len(s.NestedRoots)+8)
@@ -843,6 +850,130 @@ func coerceScalarForDoris(val any, dorisType DorisScalarType, lowercase bool, no
 	return val
 }
 
+func isNullOrNullSlice(v any) bool {
+	if v == nil {
+		return true
+	}
+	if arr, ok := v.([]any); ok {
+		for _, elem := range arr {
+			if isNullOrNullSlice(elem) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func normalizeDynamicMode(dyn any) string {
+	switch v := dyn.(type) {
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "strict":
+			return "strict"
+		case "false":
+			return "false"
+		case "runtime":
+			return "runtime"
+		default:
+			return "true"
+		}
+	case bool:
+		if !v {
+			return "false"
+		}
+		return "true"
+	default:
+		return "true"
+	}
+}
+
+func validateStrictDynamicObject(obj map[string]any, props map[string]esast.FieldProperty, parentDynamic any, pathPrefix string) (bool, error) {
+	mode := normalizeDynamicMode(parentDynamic)
+	pruned := false
+	for k, v := range obj {
+		switch k {
+		case "_id", "_index", "_routing", "_version", "_ingest", "_ignored":
+			continue
+		}
+		prop, exists := props[k]
+		if !exists && strings.Contains(k, ".") {
+			parts := strings.SplitN(k, ".", 2)
+			if p0, ok := props[parts[0]]; ok {
+				subObj := map[string]any{parts[1]: v}
+				childMode := mode
+				if p0.Dynamic != nil {
+					childMode = normalizeDynamicMode(p0.Dynamic)
+				}
+				fullPath := parts[0]
+				if pathPrefix != "" {
+					fullPath = pathPrefix + "." + parts[0]
+				}
+				if strings.EqualFold(p0.Type, "flattened") {
+					continue
+				}
+				subPruned, err := validateStrictDynamicObject(subObj, p0.Properties, childMode, fullPath)
+				if err != nil {
+					return false, err
+				}
+				if subPruned {
+					if _, stillExists := subObj[parts[1]]; !stillExists {
+						delete(obj, k)
+					}
+					pruned = true
+				}
+				continue
+			}
+		}
+		if !exists {
+			if mode == "strict" {
+				scope := "_doc"
+				if pathPrefix != "" {
+					scope = pathPrefix
+				}
+				return false, fmt.Errorf("strict_dynamic_mapping_exception: mapping set to strict, dynamic introduction of [%s] within [%s] is not allowed", k, scope)
+			}
+			continue
+		}
+		if strings.EqualFold(prop.Type, "flattened") {
+			continue
+		}
+		isObjOrNested := len(prop.Properties) > 0 || prop.Type == "" || strings.EqualFold(prop.Type, "object") || strings.EqualFold(prop.Type, "nested")
+		if !isObjOrNested {
+			continue
+		}
+		childMode := mode
+		if prop.Dynamic != nil {
+			childMode = normalizeDynamicMode(prop.Dynamic)
+		}
+		fullPath := k
+		if pathPrefix != "" {
+			fullPath = pathPrefix + "." + k
+		}
+		if subMap, ok := v.(map[string]any); ok {
+			subPruned, err := validateStrictDynamicObject(subMap, prop.Properties, childMode, fullPath)
+			if err != nil {
+				return false, err
+			}
+			if subPruned {
+				pruned = true
+			}
+		} else if slice, ok := v.([]any); ok {
+			for _, elem := range slice {
+				if elemMap, ok := elem.(map[string]any); ok {
+					subPruned, err := validateStrictDynamicObject(elemMap, prop.Properties, childMode, fullPath)
+					if err != nil {
+						return false, err
+					}
+					if subPruned {
+						pruned = true
+					}
+				}
+			}
+		}
+	}
+	return pruned, nil
+}
+
 func hasExplicitNullAtPath(node any, path []string) bool {
 	if len(path) == 0 || node == nil {
 		return false
@@ -856,7 +987,7 @@ func hasExplicitNullAtPath(node any, path []string) bool {
 					joined := strings.Join(path[:i], ".")
 					if c, ok := v[joined]; ok {
 						if i == len(path) {
-							return c == nil
+							return isNullOrNullSlice(c)
 						}
 						return hasExplicitNullAtPath(c, path[i:])
 					}
@@ -865,7 +996,7 @@ func hasExplicitNullAtPath(node any, path []string) bool {
 			return false
 		}
 		if len(path) == 1 {
-			return child == nil
+			return isNullOrNullSlice(child)
 		}
 		return hasExplicitNullAtPath(child, path[1:])
 	case []any:
@@ -1640,6 +1771,24 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 		}
 	}
 
+	// Run .keyword companion normalization first so base field normalization does not clobber the raw value before __keyword is populated.
+	for _, b := range fields {
+		if b.Kind != StorageNestedSubfield || b.NestedPath != nestedPath {
+			continue
+		}
+		if len(b.SourceJSONPath) <= len(rootParts) || !strings.HasSuffix(b.ESFieldPath, ".keyword") {
+			continue
+		}
+		baseB, hasBase := s.Fields[strings.TrimSuffix(b.ESFieldPath, ".keyword")]
+		if !hasBase {
+			continue
+		}
+		relPath := b.SourceJSONPath[len(rootParts):]
+		if b.IgnoreAbove > 0 || b.LowercaseNormalizer || b.IsMultiValued || b.NullValue != nil ||
+			baseB.IgnoreAbove > 0 || baseB.LowercaseNormalizer || baseB.NullValue != nil {
+			applyNestedKwCompanionNormalizationAtPath(cloned, relPath, b, getNow)
+		}
+	}
 	for _, b := range fields {
 		if b.Kind != StorageNestedSubfield || b.NestedPath != nestedPath {
 			continue
@@ -1647,20 +1796,13 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 		if len(b.SourceJSONPath) <= len(rootParts) {
 			continue
 		}
-		relPath := b.SourceJSONPath[len(rootParts):]
-		isKwCompanion := false
 		if strings.HasSuffix(b.ESFieldPath, ".keyword") {
 			if _, hasBase := s.Fields[strings.TrimSuffix(b.ESFieldPath, ".keyword")]; hasBase {
-				isKwCompanion = true
+				continue
 			}
 		}
-		if isKwCompanion {
-			if b.IgnoreAbove > 0 || b.LowercaseNormalizer || b.IsMultiValued || b.NullValue != nil {
-				applyNestedKwCompanionNormalizationAtPath(cloned, relPath, b, getNow)
-			}
-		} else {
-			applyNestedBindingNormalizationAtPath(cloned, relPath, b, getNow)
-		}
+		relPath := b.SourceJSONPath[len(rootParts):]
+		applyNestedBindingNormalizationAtPath(cloned, relPath, b, getNow)
 	}
 	return cloned
 }

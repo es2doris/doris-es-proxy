@@ -655,7 +655,7 @@ func hasMatchingOuterParens(s string) bool {
 
 func splitLuceneBoost(s string) (string, float64) {
 	if idx := strings.LastIndexByte(s, '^'); idx > 0 && idx < len(s)-1 && s[idx-1] != '\\' {
-		if b, err := strconv.ParseFloat(s[idx+1:], 64); err == nil && !math.IsNaN(b) && !math.IsInf(b, 0) && b > 0 {
+		if b, err := strconv.ParseFloat(s[idx+1:], 64); err == nil && !math.IsNaN(b) && !math.IsInf(b, 0) && b >= 0 {
 			return s[:idx], b
 		}
 	}
@@ -875,10 +875,35 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 				Range: map[string]esast.RangeCond{field: *rc},
 			}
 		}
+		if len(val) > 1 && (val[0] == '+' || val[0] == '-' || val[0] == '!') {
+			trimmedAfterOp := strings.TrimSpace(val[1:])
+			isNegNumber := false
+			if val[0] == '-' {
+				if _, numErr := strconv.ParseFloat(val, 64); numErr == nil {
+					isNegNumber = true
+				}
+			}
+			if trimmedAfterOp != "" && !isNegNumber && !hasMatchingOuterParens(trimmedAfterOp) {
+				inner := buildLuceneAtomQueryWithFlags(field+":"+trimmedAfterOp, defaultField, fields, defaultOp, depth+1, isSimple, flags)
+				if val[0] == '-' || val[0] == '!' {
+					neg := esast.Query{Bool: &esast.BoolQuery{MustNot: []esast.Query{inner}}}
+					if boost != 1.0 {
+						b := boost
+						neg.Bool.Boost = &b
+					}
+					return neg
+				}
+				if boost != 1.0 {
+					b := boost
+					return esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: inner, Boost: &b}}
+				}
+				return inner
+			}
+		}
 		if strings.HasPrefix(val, "/") && strings.HasSuffix(val, "/") && len(val) > 2 {
 			return esast.Query{
 				Regexp: map[string]esast.RegexpEntry{
-					field: {Value: strings.ReplaceAll(val[1:len(val)-1], `\/`, `/`), Boost: boost},
+					field: {Value: strings.ReplaceAll(val[1:len(val)-1], `\/`, `/`), Boost: boost, HasBoost: true},
 				},
 			}
 		}
@@ -951,7 +976,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			}
 			return esast.Query{
 				Wildcard: map[string]esast.WildcardEntry{
-					field: {Value: rawWild, CaseInsensitive: true, Boost: boost},
+					field: {Value: rawWild, CaseInsensitive: true, Boost: boost, HasBoost: true},
 				},
 			}
 		}
@@ -1033,7 +1058,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 					fname, fBoost := splitLuceneBoost(fpat)
 					shoulds = append(shoulds, esast.Query{
 						Regexp: map[string]esast.RegexpEntry{
-							fname: {Value: pat, Boost: boost * fBoost},
+							fname: {Value: pat, Boost: boost * fBoost, HasBoost: true},
 						},
 					})
 				}
@@ -1046,7 +1071,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			}
 			return esast.Query{
 				Regexp: map[string]esast.RegexpEntry{
-					defaultField: {Value: pat, Boost: boost},
+					defaultField: {Value: pat, Boost: boost, HasBoost: true},
 				},
 			}
 		}
@@ -1111,7 +1136,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 				}
 				shoulds = append(shoulds, esast.Query{
 					Wildcard: map[string]esast.WildcardEntry{
-						fname: {Value: rawWild, CaseInsensitive: true, Boost: boost * fBoost},
+						fname: {Value: rawWild, CaseInsensitive: true, Boost: boost * fBoost, HasBoost: true},
 					},
 				})
 			}
@@ -1131,7 +1156,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 		}
 		return esast.Query{
 			Wildcard: map[string]esast.WildcardEntry{
-				defaultField: {Value: rawWild, CaseInsensitive: true, Boost: boost},
+				defaultField: {Value: rawWild, CaseInsensitive: true, Boost: boost, HasBoost: true},
 			},
 		}
 	}

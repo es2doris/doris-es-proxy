@@ -228,10 +228,7 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 		var saPred string
 		if len(req.SearchAfter) > 0 {
 			from = 0
-			saScoreExpr := scoreExpr
-			if req.Collapse != nil && req.Collapse.Field != "" {
-				saScoreExpr = "`_score`"
-			}
+			saScoreExpr := "`_score`"
 			saPred = t.compileSearchAfterPredicate(effSorts, req.SearchAfter, saScoreExpr)
 		}
 		if req.Collapse != nil && req.Collapse.Field != "" {
@@ -271,16 +268,30 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 				size,
 				from,
 			)
+		} else if saPred != "" && saPred != "TRUE" {
+			preAfterWhere := fmt.Sprintf("`__DORIS_DELETE_SIGN__` = 0 AND (%s) AND (%s)", mainQ.WhereSQL, postFilterSQL)
+			plan.HitsSQL = fmt.Sprintf(
+				"SELECT `_id`, `_version`, `_source`, `_score`, `_total_hits` "+
+					"FROM ("+
+					"SELECT *, CAST(%s AS DOUBLE) AS `_score`, %s "+
+					"FROM `%s`.`%s` "+
+					"WHERE %s"+
+					") `_scored` "+
+					"WHERE %s "+
+					"ORDER BY %s "+
+					"LIMIT %d OFFSET %d",
+				scoreExpr,
+				totalHitsExpr,
+				t.Schema.DorisDB,
+				t.Schema.DorisTable,
+				preAfterWhere,
+				saPred,
+				orderBy,
+				size,
+				from,
+			)
 		} else {
-			effectiveWhere := postFilterSQL
-			if saPred != "" && saPred != "TRUE" {
-				if effectiveWhere == "TRUE" {
-					effectiveWhere = saPred
-				} else {
-					effectiveWhere = fmt.Sprintf("(%s) AND (%s)", effectiveWhere, saPred)
-				}
-			}
-			whereClause := fmt.Sprintf("`__DORIS_DELETE_SIGN__` = 0 AND (%s) AND (%s)", mainQ.WhereSQL, effectiveWhere)
+			whereClause := fmt.Sprintf("`__DORIS_DELETE_SIGN__` = 0 AND (%s) AND (%s)", mainQ.WhereSQL, postFilterSQL)
 			plan.HitsSQL = fmt.Sprintf(
 				"SELECT `_id`, `_version`, `_source`, CAST(%s AS DOUBLE) AS `_score`, "+
 					"%s "+
@@ -7037,7 +7048,7 @@ func (t *Transpiler) parseStringScriptExpr(s string, params map[string]any, defa
 	if (s == "_value" || s == "params._value") && defaultField != "" {
 		_, b := t.resolveFieldInNestedCtx(defaultField, true, nctx)
 		effDT := effectiveDorisScalarType(b)
-		isStr := effDT == schema.DorisString || effDT == schema.DorisVarchar
+		isStr := effDT == schema.DorisString || effDT == schema.DorisVarchar || b.Kind == schema.StorageDynamicVariant
 		if fieldOverrideExpr != "" {
 			return fieldOverrideExpr, isStr, true
 		}
@@ -7046,7 +7057,7 @@ func (t *Transpiler) parseStringScriptExpr(s string, params map[string]any, defa
 	if field, tail, ok := parseDocFieldAccess(s); ok && (tail == "" || tail == ".value") {
 		_, b := t.resolveFieldInNestedCtx(field, true, nctx)
 		effDT := effectiveDorisScalarType(b)
-		isStr := effDT == schema.DorisString || effDT == schema.DorisVarchar || b.Kind == schema.StorageDynamicVariant || fieldOverrideExpr == "`_elem`"
+		isStr := effDT == schema.DorisString || effDT == schema.DorisVarchar || b.Kind == schema.StorageDynamicVariant
 		if fieldOverrideExpr != "" && t.sameScriptFieldInCtx(field, defaultField, nctx) {
 			return fieldOverrideExpr, isStr, true
 		}
@@ -8170,12 +8181,15 @@ func (t *Transpiler) nestedRelativeJSONPath(field string, preferKeyword bool, ne
 	if len(b.RelativeJSONPath) > 0 {
 		relKey = strings.Join(b.RelativeJSONPath, ".")
 	}
-	if t.Schema != nil && (b.IgnoreAbove > 0 || b.LowercaseNormalizer || b.IsMultiValued || b.NullValue != nil) {
+	if t.Schema != nil {
 		basePath := strings.TrimSuffix(effField, ".keyword")
 		isKw := strings.HasSuffix(effField, ".keyword") || (preferKeyword && b.ESType == "keyword")
 		if isKw {
-			if baseB, hasBase := t.Schema.Fields[basePath]; hasBase && baseB.ESType == "text" {
-				relKey += "__keyword"
+			if baseB, hasBase := t.Schema.Fields[basePath]; hasBase && (baseB.ESType == "text" || strings.HasSuffix(effField, ".keyword")) {
+				if b.IgnoreAbove > 0 || b.LowercaseNormalizer || b.IsMultiValued || b.NullValue != nil ||
+					baseB.IgnoreAbove > 0 || baseB.LowercaseNormalizer || baseB.NullValue != nil {
+					relKey += "__keyword"
+				}
 			}
 		}
 	}

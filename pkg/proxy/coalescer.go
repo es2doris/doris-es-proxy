@@ -40,10 +40,11 @@ const (
 )
 
 type coalesceBatch struct {
-	buf   bytes.Buffer
-	done  chan struct{}
-	err   error
-	timer *time.Timer
+	buf           bytes.Buffer
+	done          chan struct{}
+	err           error
+	timer         *time.Timer
+	activeWaiters int64
 }
 
 // StreamLoadCoalescer implements group-commit micro-batching across concurrent `/_bulk` and
@@ -135,6 +136,7 @@ func (c *StreamLoadCoalescer) Submit(ctx context.Context, table string, ndjson [
 		c.executeBatch(flushCtx, table, b, syncRefresh)
 		return b.err
 	}
+	atomic.AddInt64(&b.activeWaiters, 1)
 	if b.timer == nil {
 		batchRef := b
 		b.timer = time.AfterFunc(window, func() {
@@ -148,6 +150,7 @@ func (c *StreamLoadCoalescer) Submit(ctx context.Context, table string, ndjson [
 	case <-doneCh:
 		return b.err
 	case <-ctx.Done():
+		atomic.AddInt64(&b.activeWaiters, -1)
 		return ctx.Err()
 	}
 }
@@ -279,6 +282,12 @@ func (c *StreamLoadCoalescer) onTimerFlush(table string, target *coalesceBatch) 
 		return
 	}
 	delete(c.batches, table)
+	if atomic.LoadInt64(&target.activeWaiters) <= 0 {
+		target.err = context.Canceled
+		close(target.done)
+		c.mu.Unlock()
+		return
+	}
 	c.inflight[target] = table
 	c.mu.Unlock()
 	defer func() {
@@ -293,9 +302,9 @@ func (c *StreamLoadCoalescer) onTimerFlush(table string, target *coalesceBatch) 
 }
 
 func (c *StreamLoadCoalescer) executeBatch(ctx context.Context, table string, b *coalesceBatch, syncRefresh bool) {
+	defer close(b.done)
 	atomic.AddInt64(&c.coalescedFlushes, 1)
 	b.err = c.loadFn(ctx, table, b.buf.Bytes(), syncRefresh)
-	close(b.done)
 }
 
 type queryCacheEntry struct {
@@ -439,6 +448,10 @@ func containsNowDateMath(req *esast.SearchRequest, reqBytes []byte) bool {
 			[]byte(`"now-`),
 			[]byte(`"now+`),
 			[]byte(`"now/`),
+			[]byte(`" now"`),
+			[]byte(`" now-`),
+			[]byte(`" now+`),
+			[]byte(`" now/`),
 			[]byte(`||now`),
 			[]byte("to now]"),
 			[]byte("to now}"),
@@ -459,6 +472,13 @@ func containsNowDateMath(req *esast.SearchRequest, reqBytes []byte) bool {
 			[]byte(">now"),
 			[]byte("<now"),
 			[]byte("=now"),
+			[]byte("system.currenttimemillis"),
+			[]byte("instant.now"),
+			[]byte("zoneddatetime.now"),
+			[]byte("localdatetime.now"),
+			[]byte("offsetdatetime.now"),
+			[]byte("localdate.now"),
+			[]byte("new date("),
 		} {
 			if bytes.Contains(lowerBytes, pat) {
 				return true
@@ -496,6 +516,28 @@ func aggsContainNow(aggs map[string]esast.AggSpec) bool {
 			for _, r := range agg.DateRange.Ranges {
 				if boundValContainsNow(r.From) || boundValContainsNow(r.To) {
 					return true
+				}
+			}
+		}
+		if agg.Range != nil {
+			for _, r := range agg.Range.Ranges {
+				if boundValContainsNow(r.From) || boundValContainsNow(r.To) {
+					return true
+				}
+			}
+		}
+		if tSpec := agg.EffectiveTerms(); tSpec != nil && queryContainsNow(tSpec.BackgroundFilter) {
+			return true
+		}
+		if agg.Composite != nil {
+			for _, srcMap := range agg.Composite.Sources {
+				for _, src := range srcMap {
+					if src.Terms != nil && boundValContainsNow(src.Terms.Missing) {
+						return true
+					}
+					if src.DateHistogram != nil && boundValContainsNow(src.DateHistogram.Missing) {
+						return true
+					}
 				}
 			}
 		}

@@ -49,6 +49,7 @@ import (
 type HitRow struct {
 	Index     string
 	ID        string
+	Routing   string
 	Version   int64
 	Source    json.RawMessage
 	RawSource json.RawMessage
@@ -177,6 +178,7 @@ type Server struct {
 	indices               map[string]*schema.IndexSchema
 	aliases               map[string][]string                 // aliasName -> ordered target indexNames
 	aliasMeta             map[string]map[string]AliasMetadata // aliasName -> indexName -> metadata
+	docRouting            map[string]map[string]string        // indexName -> docID -> routing
 	indexDefaultPipelines map[string]string                   // indexName -> default ingest pipeline ID
 	indexFinalPipelines   map[string]string                   // indexName -> final ingest pipeline ID
 	templates             map[string]esast.IndexTemplateRequest
@@ -200,6 +202,7 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		indices:               make(map[string]*schema.IndexSchema),
 		aliases:               make(map[string][]string),
 		aliasMeta:             make(map[string]map[string]AliasMetadata),
+		docRouting:            make(map[string]map[string]string),
 		indexDefaultPipelines: make(map[string]string),
 		indexFinalPipelines:   make(map[string]string),
 		templates:             make(map[string]esast.IndexTemplateRequest),
@@ -267,6 +270,67 @@ func (s *Server) allocVersion(minFloor int64) int64 {
 	}
 }
 
+func (s *Server) setDocRouting(indexName, docID, routing string) {
+	if indexName == "" || docID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.docRouting == nil {
+		s.docRouting = make(map[string]map[string]string)
+	}
+	if routing == "" {
+		if m, ok := s.docRouting[indexName]; ok {
+			delete(m, docID)
+		}
+		return
+	}
+	if s.docRouting[indexName] == nil {
+		s.docRouting[indexName] = make(map[string]string)
+	}
+	s.docRouting[indexName][docID] = routing
+}
+
+func (s *Server) getDocRouting(indexName, docID string) string {
+	if indexName == "" || docID == "" {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.docRouting == nil {
+		return ""
+	}
+	if m, ok := s.docRouting[indexName]; ok {
+		return m[docID]
+	}
+	return ""
+}
+
+func (s *Server) resolveEffectiveWriteRouting(rawIndex, targetIndex, reqRouting, pipeRouting string) string {
+	if pipeRouting != "" {
+		return pipeRouting
+	}
+	if reqRouting != "" {
+		return reqRouting
+	}
+	if rawIndex != "" && targetIndex != "" {
+		s.mu.RLock()
+		meta := s.aliasMeta[rawIndex][targetIndex]
+		s.mu.RUnlock()
+		if meta.IndexRouting != "" {
+			return meta.IndexRouting
+		}
+		if meta.Routing != "" {
+			return meta.Routing
+		}
+	}
+	return ""
+}
+
+func (s *Server) isRoutingRequired(idxSchema *schema.IndexSchema) bool {
+	return idxSchema != nil && idxSchema.RawMapping != nil && idxSchema.RawMapping.Routing != nil && idxSchema.RawMapping.Routing.Required
+}
+
 // BootstrapCatalog creates `_es_catalog` if supported by the backend and rehydrates
 // all persisted index mappings, aliases, and templates into memory.
 func (s *Server) BootstrapCatalog(ctx context.Context) error {
@@ -332,7 +396,7 @@ func (s *Server) syncCatalogFromBackend(ctx context.Context) error {
 				_ = json.Unmarshal([]byte(e.PayloadJSON), &metaEnv)
 			}
 			var specPtr *esast.MappingSpec
-			if len(spec.Properties) > 0 || spec.Dynamic != nil {
+			if len(spec.Properties) > 0 || spec.Dynamic != nil || spec.Routing != nil {
 				specPtr = &spec
 			}
 			s.indices[e.EntityKey] = schema.CompileIndexSchema(s.dorisDB, e.EntityKey, specPtr)
@@ -484,6 +548,9 @@ func (s *Server) persistIndex(ctx context.Context, indexName string, idxSchema *
 			}
 			if idxSchema.RawMapping.Dynamic != nil {
 				payloadMap["dynamic"] = idxSchema.RawMapping.Dynamic
+			}
+			if idxSchema.RawMapping.Routing != nil {
+				payloadMap["_routing"] = idxSchema.RawMapping.Routing
 			}
 		}
 		if defPipe != "" {
@@ -1967,6 +2034,9 @@ func (s *Server) handleGetIndex(w http.ResponseWriter, r *http.Request) {
 		mappings := map[string]any{}
 		if idx.RawMapping != nil {
 			mappings["properties"] = idx.RawMapping.Properties
+			if idx.RawMapping.Routing != nil && idx.RawMapping.Routing.Required {
+				mappings["_routing"] = map[string]any{"required": true}
+			}
 		}
 		idxAliases := make(map[string]any)
 		for alias, aliasTargets := range s.aliases {
@@ -2101,6 +2171,7 @@ func (s *Server) handleDeleteIndex(w http.ResponseWriter, r *http.Request) {
 			tablesToDrop = append(tablesToDrop, idx)
 		}
 		delete(s.indices, indexName)
+		delete(s.docRouting, indexName)
 		delete(s.indexDefaultPipelines, indexName)
 		delete(s.indexFinalPipelines, indexName)
 		for alias := range s.aliases {
@@ -2133,8 +2204,12 @@ func (s *Server) handleGetAllMappings(w http.ResponseWriter, _ *http.Request) {
 		if idx.RawMapping != nil {
 			props = idx.RawMapping.Properties
 		}
+		mappings := map[string]any{"properties": props}
+		if idx.RawMapping != nil && idx.RawMapping.Routing != nil && idx.RawMapping.Routing.Required {
+			mappings["_routing"] = map[string]any{"required": true}
+		}
 		out[indexName] = map[string]any{
-			"mappings": map[string]any{"properties": props},
+			"mappings": mappings,
 		}
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -2151,8 +2226,12 @@ func (s *Server) handleGetMapping(w http.ResponseWriter, r *http.Request) {
 			if idx.RawMapping != nil {
 				props = idx.RawMapping.Properties
 			}
+			mappings := map[string]any{"properties": props}
+			if idx.RawMapping != nil && idx.RawMapping.Routing != nil && idx.RawMapping.Routing.Required {
+				mappings["_routing"] = map[string]any{"required": true}
+			}
 			out[indexName] = map[string]any{
-				"mappings": map[string]any{"properties": props},
+				"mappings": mappings,
 			}
 		}
 	}
@@ -2762,7 +2841,8 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 	if pipeInputIdx == "" {
 		pipeInputIdx = indexName
 	}
-	docPayload, nextIndex, nextDocID, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithMeta(pipeInputIdx, docID, r.URL.Query().Get("pipeline"), "", json.RawMessage(rawDoc))
+	reqRouting := strings.TrimSpace(r.URL.Query().Get("routing"))
+	docPayload, nextIndex, nextDocID, pipeRouting, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithRouting(pipeInputIdx, docID, r.URL.Query().Get("pipeline"), "", reqRouting, json.RawMessage(rawDoc))
 	if pipeErr != nil {
 		writeESError(w, http.StatusBadRequest, "ingest_processor_exception", pipeErr.Error())
 		return
@@ -2792,8 +2872,13 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		indexName = resolvedIdx
 		aliasFilter = resolvedFilter
 	}
+	effRouting := s.resolveEffectiveWriteRouting(rawReqIndex, indexName, reqRouting, pipeRouting)
 
 	roSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
+	if s.isRoutingRequired(roSchema) && effRouting == "" {
+		writeESError(w, http.StatusBadRequest, "routing_missing_exception", fmt.Sprintf("routing is required for [%s]/[_doc]/[%s]", indexName, docID))
+		return
+	}
 	var minVer int64
 	var curVer int64
 	wasExisting := false
@@ -2834,7 +2919,7 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 	}
 	shredded, err := schema.ShredDocument(idxSchema, docID, nextVer, false, docPayload)
 	if err != nil {
-		writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+		writeESError(w, http.StatusBadRequest, shredErrorType(err), err.Error())
 		return
 	}
 
@@ -2843,6 +2928,7 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
 		return
 	}
+	s.setDocRouting(indexName, docID, effRouting)
 
 	status := http.StatusCreated
 	result := "created"
@@ -2855,7 +2941,7 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		result = "updated"
 		reportedVer = nextVer
 	}
-	writeJSON(w, status, map[string]any{
+	respPayload := map[string]any{
 		"_index":        indexName,
 		"_type":         "_doc",
 		"_id":           docID,
@@ -2864,7 +2950,11 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
 		"_seq_no":       nextVer,
 		"_primary_term": 1,
-	})
+	}
+	if effRouting != "" {
+		respPayload["_routing"] = effRouting
+	}
+	writeJSON(w, status, respPayload)
 }
 
 func (s *Server) handleHeadDoc(w http.ResponseWriter, r *http.Request) {
@@ -2990,6 +3080,11 @@ func (s *Server) handleGetDoc(w http.ResponseWriter, r *http.Request) {
 		"_primary_term": 1,
 		"found":         true,
 	}
+	if rt := s.getDocRouting(indexName, hit.ID); rt != "" {
+		resp["_routing"] = rt
+	} else if reqRt := strings.TrimSpace(r.URL.Query().Get("routing")); reqRt != "" {
+		resp["_routing"] = reqRt
+	}
 	if (urlSF == nil || !urlSF.Disabled) && (!hasStoredNone || urlSF != nil) {
 		resp["_source"] = filterSourceJSON(hit.Source, urlSF)
 	}
@@ -3035,6 +3130,8 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 	type mgetDocSpec struct {
 		Index          string              `json:"_index"`
 		ID             string              `json:"_id"`
+		Routing        string              `json:"routing,omitempty"`
+		MetaRouting    string              `json:"_routing,omitempty"`
 		Source         *esast.SourceFilter `json:"_source,omitempty"`
 		SourceIncludes any                 `json:"_source_includes,omitempty"`
 		SourceExcludes any                 `json:"_source_excludes,omitempty"`
@@ -3158,6 +3255,13 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 			"_primary_term": 1,
 			"found":         true,
 		}
+		if rt := s.getDocRouting(idxName, hit.ID); rt != "" {
+			docItem["_routing"] = rt
+		} else if spec.Routing != "" {
+			docItem["_routing"] = spec.Routing
+		} else if spec.MetaRouting != "" {
+			docItem["_routing"] = spec.MetaRouting
+		}
 		effSF := spec.Source
 		if effSF == nil {
 			effSF = defaultSF
@@ -3196,7 +3300,8 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
-	indexName, aliasFilter, writeErr := s.resolveWriteIndexWithFilter(r.PathValue("index"))
+	rawReqIndex := r.PathValue("index")
+	indexName, aliasFilter, writeErr := s.resolveWriteIndexWithFilter(rawReqIndex)
 	if writeErr != nil {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", writeErr.Error())
 		return
@@ -3207,7 +3312,13 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	docID := r.PathValue("id")
+	reqRouting := strings.TrimSpace(r.URL.Query().Get("routing"))
+	effRouting := s.resolveEffectiveWriteRouting(rawReqIndex, indexName, reqRouting, "")
 	roSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
+	if s.isRoutingRequired(roSchema) && effRouting == "" {
+		writeESError(w, http.StatusBadRequest, "routing_missing_exception", fmt.Sprintf("routing is required for [%s]/[_doc]/[%s]", indexName, docID))
+		return
+	}
 
 	_ = s.coalescer.FlushTable(r.Context(), roSchema.DorisTable)
 	existingHit, found, err := s.backend.GetDocByID(r.Context(), roSchema.DorisDB, roSchema.DorisTable, docID)
@@ -3226,7 +3337,7 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !docFound {
-		writeJSON(w, http.StatusNotFound, map[string]any{
+		notFoundResp := map[string]any{
 			"_index":        indexName,
 			"_type":         "_doc",
 			"_id":           docID,
@@ -3235,7 +3346,11 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 			"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
 			"_seq_no":       0,
 			"_primary_term": 1,
-		})
+		}
+		if effRouting != "" {
+			notFoundResp["_routing"] = effRouting
+		}
+		writeJSON(w, http.StatusNotFound, notFoundResp)
 		return
 	}
 
@@ -3262,7 +3377,8 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	s.setDocRouting(indexName, docID, "")
+	delResp := map[string]any{
 		"_index":        indexName,
 		"_type":         "_doc",
 		"_id":           docID,
@@ -3271,11 +3387,16 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 		"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
 		"_seq_no":       nextVer,
 		"_primary_term": 1,
-	})
+	}
+	if effRouting != "" {
+		delResp["_routing"] = effRouting
+	}
+	writeJSON(w, http.StatusOK, delResp)
 }
 
 func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
-	indexName, aliasFilter, writeErr := s.resolveWriteIndexWithFilter(r.PathValue("index"))
+	rawReqIndex := r.PathValue("index")
+	indexName, aliasFilter, writeErr := s.resolveWriteIndexWithFilter(rawReqIndex)
 	if writeErr != nil {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", writeErr.Error())
 		return
@@ -3291,6 +3412,7 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	docID := r.PathValue("id")
+	reqRouting := strings.TrimSpace(r.URL.Query().Get("routing"))
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
 		return
@@ -3380,16 +3502,22 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var nextVersion int64
+	var pipeRouting string
+	effRouting := s.resolveEffectiveWriteRouting(rawReqIndex, indexName, reqRouting, "")
 	if opResult != "noop" {
 		isDelete := opResult == "deleted"
 		origIndex := indexName
 		origDocID := docID
 		if !isDelete && len(mutatedSource) > 0 {
-			pipeInputIdx := r.PathValue("index")
+			pipeInputIdx := rawReqIndex
 			if pipeInputIdx == "" {
 				pipeInputIdx = indexName
 			}
-			pipedDoc, nextIndex, nextDocID, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithMeta(pipeInputIdx, docID, r.URL.Query().Get("pipeline"), "", mutatedSource)
+			var pipedDoc json.RawMessage
+			var nextIndex, nextDocID string
+			var dropped bool
+			var pipeErr error
+			pipedDoc, nextIndex, nextDocID, pipeRouting, dropped, pipeErr = s.applyEffectiveAndFinalPipelinesWithRouting(pipeInputIdx, docID, r.URL.Query().Get("pipeline"), "", reqRouting, mutatedSource)
 			if pipeErr != nil {
 				writeESError(w, http.StatusBadRequest, "ingest_processor_exception", pipeErr.Error())
 				return
@@ -3451,6 +3579,7 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 			}
 			mutatedSource = pipedDoc
 		}
+		effRouting = s.resolveEffectiveWriteRouting(rawReqIndex, indexName, reqRouting, pipeRouting)
 		if !isDelete && aliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), indexName, docID, mutatedSource, aliasFilter) {
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
 				fmt.Sprintf("updated document [%s] does not match alias filter for [%s]", docID, r.PathValue("index")))
@@ -3466,9 +3595,16 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 			sampleDocs = []json.RawMessage{mutatedSource}
 		}
 		idxSchema := s.ensureWritableIndexSchemaWithDocs(r.Context(), indexName, sampleDocs)
+		if s.isRoutingRequired(idxSchema) && effRouting == "" {
+			writeESError(w, http.StatusBadRequest, "routing_missing_exception", fmt.Sprintf("routing is required for [%s]/[_doc]/[%s]", indexName, docID))
+			return
+		}
+		if effRouting == "" && found {
+			effRouting = s.getDocRouting(origIndex, origDocID)
+		}
 		shredded, err := schema.ShredDocument(idxSchema, docID, nextVersion, isDelete, mutatedSource)
 		if err != nil {
-			writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+			writeESError(w, http.StatusBadRequest, shredErrorType(err), err.Error())
 			return
 		}
 		syncRefresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh") == "wait_for"
@@ -3484,10 +3620,24 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+			s.setDocRouting(origIndex, origDocID, "")
 		}
 		if err := s.streamLoad(r.Context(), idxSchema.DorisTable, payload, syncRefresh); err != nil {
 			writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
 			return
+		}
+		if isDelete {
+			s.setDocRouting(indexName, docID, "")
+		} else {
+			s.setDocRouting(indexName, docID, effRouting)
+		}
+	} else {
+		if s.isRoutingRequired(roSchema) && effRouting == "" {
+			writeESError(w, http.StatusBadRequest, "routing_missing_exception", fmt.Sprintf("routing is required for [%s]/[_doc]/[%s]", indexName, docID))
+			return
+		}
+		if effRouting == "" && found {
+			effRouting = s.getDocRouting(indexName, docID)
 		}
 	}
 
@@ -3512,6 +3662,9 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 		"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
 		"_seq_no":       reportedVer,
 		"_primary_term": 1,
+	}
+	if effRouting != "" {
+		respPayload["_routing"] = effRouting
 	}
 	if effUpdateSF != nil && !effUpdateSF.Disabled && opResult != "deleted" {
 		if (found || opResult == "created" || opResult == "updated") && len(mutatedSource) > 0 {
@@ -3647,10 +3800,12 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 				version           int64
 				isDel             bool
 				source            json.RawMessage
+				routing           string
 			}
 			var pending []pendingUpdate
 			sampleDocsByIdx := make(map[string][]json.RawMessage)
 			candIDsByIdx := make(map[string][]string)
+			urlRouting := r.URL.Query().Get("routing")
 			for _, h := range hits {
 				if maxDocs > 0 && totalMatched >= maxDocs {
 					break
@@ -3687,12 +3842,17 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 				targetDocID := h.ID
 				targetIdx := indexName
 				targetAliasFilter := aliasFilters[indexName]
+				var pipeRouting string
 				if !isDel && len(mutated) > 0 {
 					pipeInputIdx := indexName
 					if len(targets) == 1 && rawIndex != "" && !hasExclusionOrWildcard(rawIndex) {
 						pipeInputIdx = rawIndex
 					}
-					piped, nextIdx, nextID, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithMeta(pipeInputIdx, h.ID, r.URL.Query().Get("pipeline"), body.Pipeline, mutated)
+					initRouting := urlRouting
+					if initRouting == "" {
+						initRouting = s.getDocRouting(indexName, h.ID)
+					}
+					piped, nextIdx, nextID, nextRouting, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithRouting(pipeInputIdx, h.ID, r.URL.Query().Get("pipeline"), body.Pipeline, initRouting, mutated)
 					if pipeErr != nil {
 						writeESError(w, http.StatusBadRequest, "ingest_processor_exception", pipeErr.Error())
 						return
@@ -3703,6 +3863,7 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 					if nextID != "" {
 						targetDocID = nextID
 					}
+					pipeRouting = nextRouting
 					if nextIdx != "" && nextIdx != pipeInputIdx {
 						resolvedIdx, resolvedFilter, rErr := s.resolveWriteIndexWithFilter(nextIdx)
 						if rErr != nil {
@@ -3713,6 +3874,10 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 						targetAliasFilter = resolvedFilter
 					}
 					mutated = piped
+				}
+				effRouting := s.resolveEffectiveWriteRouting(rawIndex, targetIdx, urlRouting, pipeRouting)
+				if effRouting == "" && !isDel {
+					effRouting = s.getDocRouting(indexName, h.ID)
 				}
 				if !isDel && targetAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), targetIdx, targetDocID, mutated, targetAliasFilter) {
 					if conflictsProceed {
@@ -3742,6 +3907,7 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 					version:           h.Version,
 					isDel:             isDel,
 					source:            mutated,
+					routing:           effRouting,
 				})
 			}
 
@@ -3811,13 +3977,14 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 							tombVer := s.allocVersion(pu.version + 1)
 							tombShredded, err := schema.ShredDocument(oldSch, pu.oldID, tombVer, true, nil)
 							if err != nil {
-								writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+								writeESError(w, http.StatusBadRequest, shredErrorType(err), err.Error())
 								return
 							}
 							tBuf := getTableBuf(oldSch.DorisTable)
 							tBuf.Write(tombShredded)
 							tBuf.WriteByte('\n')
 							lastVerInBatch[oldKey] = tombVer
+							s.setDocRouting(pu.oldIndex, pu.oldID, "")
 							if exMap := existingByIdx[pu.oldIndex]; exMap != nil {
 								delete(exMap, pu.oldID)
 							}
@@ -3828,10 +3995,15 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 						tSch = s.ensureIndexSchema(r.Context(), pu.targetIndex)
 						schemasByIdx[pu.targetIndex] = tSch
 					}
+					if !pu.isDel && pu.routing == "" && s.isRoutingRequired(tSch) {
+						writeESError(w, http.StatusBadRequest, "routing_missing_exception",
+							fmt.Sprintf("routing is required for [%s]/[%s]", pu.targetIndex, pu.id))
+						return
+					}
 					nextVer := s.allocVersion(minVer)
 					shredded, err := schema.ShredDocument(tSch, pu.id, nextVer, pu.isDel, pu.source)
 					if err != nil {
-						writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+						writeESError(w, http.StatusBadRequest, shredErrorType(err), err.Error())
 						return
 					}
 					buf := getTableBuf(tSch.DorisTable)
@@ -3840,16 +4012,18 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 					lastVerInBatch[targetKey] = nextVer
 					if pu.isDel {
 						writtenInBatch[targetKey] = false
+						s.setDocRouting(pu.targetIndex, pu.id, "")
 						if exMap := existingByIdx[pu.targetIndex]; exMap != nil {
 							delete(exMap, pu.id)
 						}
 						totalDeleted++
 					} else {
 						writtenInBatch[targetKey] = true
+						s.setDocRouting(pu.targetIndex, pu.id, pu.routing)
 						if existingByIdx[pu.targetIndex] == nil {
 							existingByIdx[pu.targetIndex] = make(map[string]HitRow)
 						}
-						existingByIdx[pu.targetIndex][pu.id] = HitRow{ID: pu.id, Version: nextVer, Source: pu.source}
+						existingByIdx[pu.targetIndex][pu.id] = HitRow{ID: pu.id, Version: nextVer, Source: pu.source, Routing: pu.routing}
 						totalUpdated++
 					}
 				}
@@ -4025,6 +4199,7 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 				}
 				batchBuf.Write(tombstone)
 				batchBuf.WriteByte('\n')
+				s.setDocRouting(indexName, h.ID, "")
 				totalDeleted++
 			}
 			if batchBuf.Len() > 0 {
@@ -4096,13 +4271,17 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	defaultPipeline := r.URL.Query().Get("pipeline")
+	urlRouting := r.URL.Query().Get("routing")
 	droppedOps := make([]bool, len(ops))
 	pipeErrs := make([]string, len(ops))
+	origOpIndices := make([]string, len(ops))
+	pipeRoutings := make([]string, len(ops))
 	// Collect sample docs per target index for dynamic mapping inference on auto-created indices.
 	sampleDocsByIndex := make(map[string][]json.RawMessage)
 	idsToFetchByIndex := make(map[string][]string)
 	for idx := range ops {
 		op := &ops[idx]
+		origOpIndices[idx] = op.Index
 		if op.ParseErr != "" {
 			continue
 		}
@@ -4113,7 +4292,11 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if (op.Action == "index" || op.Action == "create") && len(op.Source) > 0 {
-			piped, nextIdx, nextID, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithMeta(origOpIndex, op.ID, defaultPipeline, op.Pipeline, op.Source)
+			initOpRouting := op.Routing
+			if initOpRouting == "" {
+				initOpRouting = urlRouting
+			}
+			piped, nextIdx, nextID, nextRouting, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithRouting(origOpIndex, op.ID, op.Pipeline, defaultPipeline, initOpRouting, op.Source)
 			if pipeErr != nil {
 				pipeErrs[idx] = pipeErr.Error()
 				continue
@@ -4128,6 +4311,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			if nextID != "" {
 				op.ID = nextID
 			}
+			pipeRoutings[idx] = nextRouting
 			if nextIdx != "" && nextIdx != origOpIndex {
 				op.Index = nextIdx
 				resolvedIdx, _, rErr := s.resolveWriteIndexWithFilter(op.Index)
@@ -4193,10 +4377,19 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 	hasErrors := false
 
 	for opIdx, op := range ops {
+		origOpIdx := origOpIndices[opIdx]
+		if origOpIdx == "" {
+			origOpIdx = op.Index
+		}
 		targetIndex, opAliasFilter, writeErr := s.resolveWriteIndexWithFilter(op.Index)
 		if writeErr != nil {
 			targetIndex = op.Index
 		}
+		reqRouting := op.Routing
+		if reqRouting == "" {
+			reqRouting = urlRouting
+		}
+		effRouting := s.resolveEffectiveWriteRouting(origOpIdx, targetIndex, reqRouting, pipeRoutings[opIdx])
 		if pipeErrs[opIdx] != "" {
 			hasErrors = true
 			items = append(items, map[string]any{
@@ -4227,18 +4420,22 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if droppedOps[opIdx] {
+			dropItem := map[string]any{
+				"_index":        targetIndex,
+				"_type":         "_doc",
+				"_id":           op.ID,
+				"_version":      -1,
+				"result":        "noop",
+				"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+				"_seq_no":       -1,
+				"_primary_term": 1,
+				"status":        http.StatusOK,
+			}
+			if effRouting != "" {
+				dropItem["_routing"] = effRouting
+			}
 			items = append(items, map[string]any{
-				op.Action: map[string]any{
-					"_index":        targetIndex,
-					"_type":         "_doc",
-					"_id":           op.ID,
-					"_version":      -1,
-					"result":        "noop",
-					"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
-					"_seq_no":       -1,
-					"_primary_term": 1,
-					"status":        http.StatusOK,
-				},
+				op.Action: dropItem,
 			})
 			continue
 		}
@@ -4263,6 +4460,11 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		var curVerForOCC int64
 		if docFoundForOCC {
 			curVerForOCC = existingBeforeOp.Version
+		} else if !wasExistingBeforeOp && strings.HasPrefix(strings.ToLower(strings.TrimSpace(op.VersionType)), "external") {
+			if lastVer, ok := lastVerByIndex[targetIndex][op.ID]; ok && lastVer > 0 {
+				docFoundForOCC = true
+				curVerForOCC = lastVer
+			}
 		}
 		if op.Action == "update" && strings.HasPrefix(strings.ToLower(strings.TrimSpace(op.VersionType)), "external") {
 			hasErrors = true
@@ -4332,18 +4534,22 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if !found || (opAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), targetIndex, op.ID, existingHit.Source, opAliasFilter)) {
+				nfItem := map[string]any{
+					"_index":        targetIndex,
+					"_type":         "_doc",
+					"_id":           op.ID,
+					"_version":      1,
+					"result":        "not_found",
+					"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+					"_seq_no":       0,
+					"_primary_term": 1,
+					"status":        http.StatusNotFound,
+				}
+				if effRouting != "" {
+					nfItem["_routing"] = effRouting
+				}
 				items = append(items, map[string]any{
-					op.Action: map[string]any{
-						"_index":        targetIndex,
-						"_type":         "_doc",
-						"_id":           op.ID,
-						"_version":      1,
-						"result":        "not_found",
-						"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
-						"_seq_no":       0,
-						"_primary_term": 1,
-						"status":        http.StatusNotFound,
-					},
+					op.Action: nfItem,
 				})
 				continue
 			}
@@ -4438,6 +4644,9 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 				})
 				continue
 			}
+			if effRouting == "" && found {
+				effRouting = s.getDocRouting(targetIndex, op.ID)
+			}
 			var baseSrc json.RawMessage
 			upd.MetaID = op.ID
 			upd.MetaIndex = targetIndex
@@ -4480,6 +4689,9 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 					"_primary_term": 1,
 					"status":        http.StatusOK,
 				}
+				if effRouting != "" {
+					noopEntry["_routing"] = effRouting
+				}
 				if bulkUpdateSF != nil && !bulkUpdateSF.Disabled {
 					if found && len(merged) > 0 {
 						noopEntry["get"] = map[string]any{
@@ -4509,7 +4721,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 					if pipeInputIdx == "" || targetIndex != origTargetIndex {
 						pipeInputIdx = targetIndex
 					}
-					piped, nextIdx, nextID, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithMeta(pipeInputIdx, op.ID, defaultPipeline, op.Pipeline, merged)
+					piped, nextIdx, nextID, updPipeRouting, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithRouting(pipeInputIdx, op.ID, op.Pipeline, defaultPipeline, effRouting, merged)
 					if pipeErr != nil {
 						hasErrors = true
 						items = append(items, map[string]any{
@@ -4534,6 +4746,9 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 							"_primary_term": 1,
 							"status":        http.StatusOK,
 						}
+						if effRouting != "" {
+							dropEntry["_routing"] = effRouting
+						}
 						if bulkUpdateSF != nil && !bulkUpdateSF.Disabled {
 							if found && len(existingHit.Source) > 0 {
 								dropEntry["get"] = map[string]any{
@@ -4553,6 +4768,9 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 					}
 					if nextID != "" {
 						op.ID = nextID
+					}
+					if updPipeRouting != "" {
+						effRouting = updPipeRouting
 					}
 					if nextIdx != "" && nextIdx != pipeInputIdx {
 						resolvedIdx, resolvedFilter, rErr := s.resolveWriteIndexWithFilter(nextIdx)
@@ -4644,6 +4862,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 								deleted: true,
 							})
 						}
+						s.setDocRouting(origTargetIndex, origOpID, "")
 						delete(existingByIndex[origTargetIndex], origOpID)
 						if lastVerByIndex[origTargetIndex] == nil {
 							lastVerByIndex[origTargetIndex] = make(map[string]int64)
@@ -4663,6 +4882,18 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			idxSchema = s.ensureWritableIndexSchemaWithDocs(r.Context(), targetIndex, samples)
 		} else {
 			idxSchema = s.ensureIndexSchema(r.Context(), targetIndex)
+		}
+		if !deleted && effRouting == "" && s.isRoutingRequired(idxSchema) {
+			hasErrors = true
+			items = append(items, map[string]any{
+				op.Action: map[string]any{
+					"_index": targetIndex,
+					"_id":    op.ID,
+					"status": http.StatusBadRequest,
+					"error":  map[string]any{"type": "routing_missing_exception", "reason": fmt.Sprintf("routing is required for [%s]/[%s]", origOpIdx, op.ID)},
+				},
+			})
+			continue
 		}
 		buf, ok := byIndex[idxSchema.DorisTable]
 		if !ok {
@@ -4699,7 +4930,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 					"_index": targetIndex,
 					"_id":    op.ID,
 					"status": http.StatusBadRequest,
-					"error":  map[string]any{"type": "mapper_parsing_exception", "reason": err.Error()},
+					"error":  map[string]any{"type": shredErrorType(err), "reason": err.Error()},
 				},
 			})
 			continue
@@ -4722,10 +4953,12 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		lastVerByIndex[targetIndex][op.ID] = nextVer
 		if deleted {
 			writtenInBatch[targetIndex+"\x00"+op.ID] = false
+			s.setDocRouting(targetIndex, op.ID, "")
 			delete(existingByIndex[targetIndex], op.ID)
 		} else {
 			writtenInBatch[targetIndex+"\x00"+op.ID] = true
-			existingByIndex[targetIndex][op.ID] = HitRow{ID: op.ID, Version: nextVer, Source: sourceToShred}
+			s.setDocRouting(targetIndex, op.ID, effRouting)
+			existingByIndex[targetIndex][op.ID] = HitRow{ID: op.ID, Version: nextVer, Source: sourceToShred, Routing: effRouting}
 		}
 
 		status := http.StatusCreated
@@ -4764,6 +4997,9 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			"_seq_no":       nextVer,
 			"_primary_term": 1,
 			"status":        status,
+		}
+		if effRouting != "" {
+			itemMap["_routing"] = effRouting
 		}
 		if op.Action == "update" && bulkUpdateSF != nil && !bulkUpdateSF.Disabled && !deleted && len(sourceToShred) > 0 {
 			itemMap["get"] = map[string]any{
@@ -5420,6 +5656,7 @@ func (s *Server) executeSearchRequest(
 
 	var allHits []HitRow
 	var allFetchedHits []HitRow
+	var allPostFilterHits []HitRow
 	var allAggRows []AggRow
 	var totalHitsSum int64
 	var totalQueryHitsSum int64
@@ -5547,6 +5784,7 @@ func (s *Server) executeSearchRequest(
 		var idxTotal int64
 		for i := range hits {
 			hits[i].Index = indexName
+			hits[i].Routing = s.getDocRouting(indexName, hits[i].ID)
 			if len(req.SearchAfter) == 0 && hits[i].TotalHits > idxTotal {
 				idxTotal = hits[i].TotalHits
 			}
@@ -5569,6 +5807,7 @@ func (s *Server) executeSearchRequest(
 		}
 		if needsRuntimeScriptEval {
 			var matchedQueryHits []HitRow
+			var postFilteredHits []HitRow
 			var globalHits []HitRow
 			if (req.Query != nil && globalAggsHaveRuntimeScript(req.EffectiveAggs())) || (queryHasRuntimeScript(aliasFilters[indexName]) && aggsHaveGlobalAgg(req.EffectiveAggs())) {
 				zero := 0
@@ -5582,6 +5821,7 @@ func (s *Server) executeSearchRequest(
 					if gRows, qErr := s.backend.QueryHits(ctx, gPlan.HitsSQL); qErr == nil {
 						for i := range gRows {
 							gRows[i].Index = indexName
+							gRows[i].Routing = s.getDocRouting(indexName, gRows[i].ID)
 						}
 						if queryHasRuntimeScript(aliasFilters[indexName]) {
 							for _, gh := range gRows {
@@ -5606,8 +5846,9 @@ func (s *Server) executeSearchRequest(
 				}
 			}
 			evalReq := applyIndexAliasFilter(req, aliasFilters[indexName])
-			hits, aggRows, idxTotal, matchedQueryHits = applyRuntimeSearchScriptsWithMatchedAndGlobal(hits, globalHits, aggRows, idxTotal, evalReq, idxSchema, len(targets) > 1)
+			hits, aggRows, idxTotal, matchedQueryHits, postFilteredHits = applyRuntimeSearchScriptsWithMatchedAndGlobal(hits, globalHits, aggRows, idxTotal, evalReq, idxSchema, len(targets) > 1)
 			allFetchedHits = append(allFetchedHits, matchedQueryHits...)
+			allPostFilterHits = append(allPostFilterHits, postFilteredHits...)
 			hasQueryLevelFilter := queryHasRuntimeScript(req.Query) || queryHasRuntimeScript(aliasFilters[indexName]) || req.MinScore != nil || (req.Query != nil && req.Query.FunctionScore != nil && req.Query.FunctionScore.MinScore != nil) || (req.Query != nil && req.Query.ScriptScore != nil && req.Query.ScriptScore.MinScore != nil)
 			if hasQueryLevelFilter && plan.AggsSQL != "" && len(req.EffectiveAggs()) > 0 {
 				matchedIDs := make([]string, 0, len(matchedQueryHits))
@@ -5666,6 +5907,7 @@ func (s *Server) executeSearchRequest(
 				}
 			}
 			allFetchedHits = append(allFetchedHits, hits...)
+			allPostFilterHits = append(allPostFilterHits, hits...)
 		}
 		var hasNonZeroAggRow bool
 		var idxQueryTotal int64
@@ -5786,6 +6028,18 @@ func (s *Server) executeSearchRequest(
 						r.Weight = cnt
 					}
 				}
+				if r.AggName != "__meta_total" && r.AggName != "__meta_query_total" {
+					spec := resolveAggSpecByPath(effAggs, r.AggName)
+					if spec.TopHits != nil || spec.TopMetrics != nil {
+						if sep := strings.LastIndex(r.BucketKey, "\x1f"); sep >= 0 {
+							r.BucketKey = r.BucketKey[:sep+1] + indexName + "\x00" + r.BucketKey[sep+1:]
+						} else if sep := strings.LastIndex(r.BucketKey, "\\x1f"); sep >= 0 {
+							r.BucketKey = r.BucketKey[:sep+4] + indexName + "\x00" + r.BucketKey[sep+4:]
+						} else {
+							r.BucketKey = indexName + "\x00" + r.BucketKey
+						}
+					}
+				}
 				if r.AggName != "__meta_total" && r.AggName != "__meta_query_total" && r.Weight >= 0 {
 					spec := resolveAggSpecByPath(effAggs, r.AggName)
 					metricField := singleValueMetricField(spec)
@@ -5871,7 +6125,10 @@ func (s *Server) executeSearchRequest(
 		})
 		if rescoreWin > 0 && len(allHits) > 0 {
 			allHits = s.applyRescoreToHits(req, allHits, schemasByIndex, primarySchema, from+size)
-			allFetchedHits = append([]HitRow(nil), allHits...)
+			allPostFilterHits = append([]HitRow(nil), allHits...)
+			if req.PostFilter == nil {
+				allFetchedHits = append([]HitRow(nil), allHits...)
+			}
 		}
 		if req.Collapse != nil && req.Collapse.Field != "" && len(allHits) > 0 {
 			seenCollapse := make(map[string]struct{}, len(allHits))
@@ -5924,7 +6181,10 @@ func (s *Server) executeSearchRequest(
 		allAggRows = mergeMultiIndexAggRows(allAggRows, totalHitsSum, totalQueryHitsSum, req.EffectiveAggs())
 	} else if rescoreWin > 0 && len(allHits) > 0 {
 		allHits = s.applyRescoreToHits(req, allHits, schemasByIndex, primarySchema, from+size)
-		allFetchedHits = append([]HitRow(nil), allHits...)
+		allPostFilterHits = append([]HitRow(nil), allHits...)
+		if req.PostFilter == nil {
+			allFetchedHits = append([]HitRow(nil), allHits...)
+		}
 		if req.Collapse != nil && req.Collapse.Field != "" && len(allHits) > 0 {
 			seenCollapse := make(map[string]struct{}, len(allHits))
 			deduped := make([]HitRow, 0, len(allHits))
@@ -6021,24 +6281,36 @@ func (s *Server) executeSearchRequest(
 		if h.Query == nil && req != nil {
 			h.Query = req.Query
 		}
+		if h.Routing == "" && h.Index != "" && h.ID != "" {
+			h.Routing = s.getDocRouting(h.Index, h.ID)
+		}
 		return h
 	}
 	docLookup := func(id string) *HitRow {
+		var targetIdx string
+		docID := id
+		if nul := strings.IndexByte(id, '\x00'); nul >= 0 {
+			targetIdx = id[:nul]
+			docID = id[nul+1:]
+		}
 		for i := range allHits {
-			if allHits[i].ID == id {
+			if allHits[i].ID == docID && (targetIdx == "" || allHits[i].Index == targetIdx) {
 				return enrichHitRow(&allHits[i])
 			}
 		}
 		for i := range allFetchedHits {
-			if allFetchedHits[i].ID == id {
+			if allFetchedHits[i].ID == docID && (targetIdx == "" || allFetchedHits[i].Index == targetIdx) {
 				return enrichHitRow(&allFetchedHits[i])
 			}
 		}
 		for _, tName := range targets {
+			if targetIdx != "" && tName != targetIdx {
+				continue
+			}
 			tSchema := s.getOrCompileReadOnlySchema(ctx, tName)
 			if tSchema != nil {
-				if h, found, err := s.backend.GetDocByID(ctx, tSchema.DorisDB, tSchema.DorisTable, id); err == nil && found && h != nil {
-					if af := aliasFilters[tName]; af != nil && !s.docMatchesAliasFilter(ctx, tName, id, h.Source, af) {
+				if h, found, err := s.backend.GetDocByID(ctx, tSchema.DorisDB, tSchema.DorisTable, docID); err == nil && found && h != nil {
+					if af := aliasFilters[tName]; af != nil && !s.docMatchesAliasFilter(ctx, tName, docID, h.Source, af) {
 						continue
 					}
 					if req != nil && req.Query != nil {
@@ -6060,6 +6332,7 @@ func (s *Server) executeSearchRequest(
 					}
 					h.Index = tName
 					h.Schema = tSchema
+					h.Routing = s.getDocRouting(tName, h.ID)
 					return enrichHitRow(h)
 				}
 			}
@@ -6069,7 +6342,7 @@ func (s *Server) executeSearchRequest(
 	resp := buildESResponseWithSchemas(primaryIndex, primarySchema, schemasByIndex, req, allHits, allAggRows, tookMs, docLookup)
 	if size > 0 && req != nil {
 		var maxFetchedScore float64
-		for _, fh := range allFetchedHits {
+		for _, fh := range allPostFilterHits {
 			if fh.Score > maxFetchedScore {
 				maxFetchedScore = fh.Score
 			}
@@ -7029,14 +7302,16 @@ func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, totalQueryHits int64
 			lastStatCount[key{agg: strings.TrimSuffix(r.AggName, "._stats_count"), bucket: r.BucketKey}] = r.effectiveCount()
 		case strings.HasSuffix(r.AggName, "._sstats_count"):
 			lastStatCount[key{agg: strings.TrimSuffix(r.AggName, "._sstats_count"), bucket: r.BucketKey}] = r.effectiveCount()
-		case r.BucketKey == "_sstats_min" || r.BucketKey == "_sstats_max" || r.BucketKey == "_sstats_avg" || r.BucketKey == "_sstats_entropy":
+		case r.BucketKey == "_stats_min" || r.BucketKey == "_stats_max" || r.BucketKey == "_stats_avg" ||
+			r.BucketKey == "_sstats_min" || r.BucketKey == "_sstats_max" || r.BucketKey == "_sstats_avg" || r.BucketKey == "_sstats_entropy":
 			cnt := lastStatCount[key{agg: r.AggName, bucket: ""}]
 			if cnt == 0 {
 				r.Weight = -1
 			} else if r.Weight <= 0 {
 				r.Weight = cnt
 			}
-		case strings.HasSuffix(r.AggName, "._sstats_min") || strings.HasSuffix(r.AggName, "._sstats_max") || strings.HasSuffix(r.AggName, "._sstats_avg") || strings.HasSuffix(r.AggName, "._sstats_entropy"):
+		case strings.HasSuffix(r.AggName, "._stats_min") || strings.HasSuffix(r.AggName, "._stats_max") || strings.HasSuffix(r.AggName, "._stats_avg") ||
+			strings.HasSuffix(r.AggName, "._sstats_min") || strings.HasSuffix(r.AggName, "._sstats_max") || strings.HasSuffix(r.AggName, "._sstats_avg") || strings.HasSuffix(r.AggName, "._sstats_entropy"):
 			dotIdx := strings.LastIndex(r.AggName, ".")
 			baseAgg := r.AggName[:dotIdx]
 			cnt := lastStatCount[key{agg: baseAgg, bucket: r.BucketKey}]
@@ -7051,24 +7326,32 @@ func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, totalQueryHits int64
 			lastStatSum[key{agg: strings.TrimSuffix(r.AggName, "._stats_sum"), bucket: r.BucketKey}] = r.effectiveValue()
 		case r.BucketKey == "_stats_std":
 			sk := key{agg: r.AggName, bucket: ""}
-			if !hasExplicitSumSq[sk] {
-				if cnt := lastStatCount[sk]; cnt > 0 {
-					avg := lastStatSum[sk] / float64(cnt)
-					std := r.effectiveValue()
-					sq := float64(cnt) * (std*std + avg*avg)
-					accumulateRow(AggRow{AggName: r.AggName, BucketKey: "_stats_sum_sq", DocCount: int64(sq), Value: sq})
-				}
+			cnt := lastStatCount[sk]
+			if cnt == 0 {
+				r.Weight = -1
+			} else if r.Weight <= 0 {
+				r.Weight = cnt
+			}
+			if !hasExplicitSumSq[sk] && cnt > 0 {
+				avg := lastStatSum[sk] / float64(cnt)
+				std := r.effectiveValue()
+				sq := float64(cnt) * (std*std + avg*avg)
+				accumulateRow(AggRow{AggName: r.AggName, BucketKey: "_stats_sum_sq", DocCount: int64(sq), Value: sq})
 			}
 		case strings.HasSuffix(r.AggName, "._stats_std"):
 			baseAgg := strings.TrimSuffix(r.AggName, "._stats_std")
 			sk := key{agg: baseAgg, bucket: r.BucketKey}
-			if !hasExplicitSumSq[sk] {
-				if cnt := lastStatCount[sk]; cnt > 0 {
-					avg := lastStatSum[sk] / float64(cnt)
-					std := r.effectiveValue()
-					sq := float64(cnt) * (std*std + avg*avg)
-					accumulateRow(AggRow{AggName: baseAgg + "._stats_sum_sq", BucketKey: r.BucketKey, DocCount: int64(sq), Value: sq})
-				}
+			cnt := lastStatCount[sk]
+			if cnt == 0 {
+				r.Weight = -1
+			} else if r.Weight <= 0 {
+				r.Weight = cnt
+			}
+			if !hasExplicitSumSq[sk] && cnt > 0 {
+				avg := lastStatSum[sk] / float64(cnt)
+				std := r.effectiveValue()
+				sq := float64(cnt) * (std*std + avg*avg)
+				accumulateRow(AggRow{AggName: baseAgg + "._stats_sum_sq", BucketKey: r.BucketKey, DocCount: int64(sq), Value: sq})
 			}
 		}
 		accumulateRow(r)
@@ -7878,6 +8161,9 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 			"_type":  "_doc",
 			"_id":    h.ID,
 			"_score": h.Score,
+		}
+		if h.Routing != "" {
+			hitMap["_routing"] = h.Routing
 		}
 		if (req.Source == nil || !req.Source.Disabled) && (!req.HasStoredFieldsNone() || req.Source != nil) {
 			hitMap["_source"] = filterSourceJSON(h.Source, req.Source)
@@ -8928,6 +9214,7 @@ func (s *Server) populateCollapseInnerHits(
 		}
 		for i := range rows {
 			rows[i].Index = indexName
+			rows[i].Routing = s.getDocRouting(indexName, rows[i].ID)
 		}
 		if needsScript {
 			evalReq := *subReqPtr
@@ -9086,6 +9373,9 @@ func (s *Server) populateCollapseInnerHits(
 					"_type":  "_doc",
 					"_id":    gh.ID,
 					"_score": ghScore,
+				}
+				if gh.Routing != "" {
+					ghMap["_routing"] = gh.Routing
 				}
 				if ihSpec.Source == nil || !ihSpec.Source.Disabled {
 					ghMap["_source"] = filterSourceJSON(gh.EffectiveSource(), ihSpec.Source)
@@ -10379,7 +10669,11 @@ func buildTopMetricsObject(rows []AggRow, spec *esast.TopMetricsAggSpec, docLook
 		if docLookup != nil {
 			h = docLookup(r.BucketKey)
 		}
-		candidates = append(candidates, candidate{docID: r.BucketKey, hit: h})
+		docID := r.BucketKey
+		if nul := strings.IndexByte(docID, '\x00'); nul >= 0 {
+			docID = docID[nul+1:]
+		}
+		candidates = append(candidates, candidate{docID: docID, hit: h})
 	}
 	if len(candidates) > 1 && len(spec.Sort) > 0 {
 		sort.SliceStable(candidates, func(i, j int) bool {
@@ -13324,7 +13618,11 @@ func buildTopHitsList(
 				searchQuery = h.Query
 			}
 		}
-		candidates = append(candidates, candidate{docID: r.BucketKey, hit: h})
+		docID := r.BucketKey
+		if nul := strings.IndexByte(docID, '\x00'); nul >= 0 {
+			docID = docID[nul+1:]
+		}
+		candidates = append(candidates, candidate{docID: docID, hit: h})
 	}
 	if len(candidates) > 1 && len(spec.Sort) > 0 {
 		sort.SliceStable(candidates, func(i, j int) bool {
@@ -13401,6 +13699,9 @@ func buildTopHitsList(
 			"_score": scoreAny,
 		}
 		if c.hit != nil {
+			if c.hit.Routing != "" {
+				hitMap["_routing"] = c.hit.Routing
+			}
 			cSchema := c.hit.Schema
 			if cSchema == nil {
 				cSchema = fallbackSchema
@@ -14398,19 +14699,122 @@ func collectSchemaAwareScalarValues(doc map[string]any, field string, pathSegs [
 	return vals
 }
 
+func deepCloneAnySlice(s []any) []any {
+	if s == nil {
+		return nil
+	}
+	cp := make([]any, len(s))
+	for i, elem := range s {
+		switch tv := elem.(type) {
+		case map[string]any:
+			cp[i] = deepCloneDocMap(tv)
+		case []any:
+			cp[i] = deepCloneAnySlice(tv)
+		default:
+			cp[i] = elem
+		}
+	}
+	return cp
+}
+
 func deepCloneDocMap(m map[string]any) map[string]any {
 	if m == nil {
 		return nil
 	}
 	cp := make(map[string]any, len(m))
 	for k, v := range m {
-		if sub, ok := v.(map[string]any); ok {
+		switch sub := v.(type) {
+		case map[string]any:
 			cp[k] = deepCloneDocMap(sub)
-		} else {
+		case []any:
+			cp[k] = deepCloneAnySlice(sub)
+		default:
 			cp[k] = v
 		}
 	}
 	return cp
+}
+
+func filterIgnoreAboveInPlace(curr any, segs []string, ignoreAbove int) {
+	if curr == nil || len(segs) == 0 || ignoreAbove <= 0 {
+		return
+	}
+	switch node := curr.(type) {
+	case map[string]any:
+		if len(segs) == 1 {
+			k := segs[0]
+			val, exists := node[k]
+			if !exists {
+				return
+			}
+			switch tv := val.(type) {
+			case string:
+				if utf8.RuneCountInString(tv) > ignoreAbove {
+					node[k] = nil
+				}
+			case []any:
+				filtered := make([]any, 0, len(tv))
+				for _, item := range tv {
+					if s, ok := item.(string); ok && utf8.RuneCountInString(s) > ignoreAbove {
+						continue
+					}
+					filtered = append(filtered, item)
+				}
+				switch len(filtered) {
+				case 0:
+					node[k] = nil
+				case 1:
+					node[k] = filtered[0]
+				default:
+					node[k] = filtered
+				}
+			}
+			return
+		}
+		if next, exists := node[segs[0]]; exists {
+			filterIgnoreAboveInPlace(next, segs[1:], ignoreAbove)
+		}
+		if flatKey := strings.Join(segs, "."); node[flatKey] != nil {
+			filterIgnoreAboveInPlace(node, []string{flatKey}, ignoreAbove)
+		}
+	case []any:
+		for _, elem := range node {
+			filterIgnoreAboveInPlace(elem, segs, ignoreAbove)
+		}
+	}
+}
+
+func setRuntimeScriptDocPath(curr map[string]any, segs []string, val any) {
+	if curr == nil || len(segs) == 0 {
+		return
+	}
+	if len(segs) == 1 {
+		curr[segs[0]] = val
+		return
+	}
+	head := segs[0]
+	rest := segs[1:]
+	switch next := curr[head].(type) {
+	case map[string]any:
+		setRuntimeScriptDocPath(next, rest, val)
+	case []any:
+		wroteToElem := false
+		for _, elem := range next {
+			if em, ok := elem.(map[string]any); ok {
+				setRuntimeScriptDocPath(em, rest, val)
+				wroteToElem = true
+			}
+		}
+		if !wroteToElem {
+			child := make(map[string]any)
+			setRuntimeScriptDocPath(child, rest, val)
+			curr[head] = child
+		}
+	default:
+		child := make(map[string]any)
+		setRuntimeScriptDocPath(child, rest, val)
+		curr[head] = child
+	}
 }
 
 func prepareDocForRuntimeScript(idxSchema *schema.IndexSchema, doc map[string]any) map[string]any {
@@ -14453,15 +14857,7 @@ func prepareDocForRuntimeScript(idxSchema *schema.IndexSchema, doc map[string]an
 							cp = make(map[string]any)
 						}
 					}
-					vals := collectSchemaAwareScalarValues(doc, fieldName, rawSegs, idxSchema)
-					switch len(vals) {
-					case 0:
-						setIngestPath(cp, cleanField, nil)
-					case 1:
-						setIngestPath(cp, cleanField, vals[0])
-					default:
-						setIngestPath(cp, cleanField, vals)
-					}
+					filterIgnoreAboveInPlace(cp, rawSegs, fb.IgnoreAbove)
 				}
 			}
 			continue
@@ -14481,9 +14877,9 @@ func prepareDocForRuntimeScript(idxSchema *schema.IndexSchema, doc map[string]an
 			}
 		}
 		if len(vals) == 1 {
-			setIngestPath(cp, cleanField, vals[0])
+			setRuntimeScriptDocPath(cp, rawSegs, vals[0])
 		} else {
-			setIngestPath(cp, cleanField, vals)
+			setRuntimeScriptDocPath(cp, rawSegs, vals)
 		}
 	}
 	if cp != nil {
@@ -18531,6 +18927,14 @@ func emitRuntimeMetricAggRows(
 				Value:     res,
 				Weight:    int64(len(vals)),
 			})
+		} else if subSpec.Avg != nil || subSpec.Min != nil || subSpec.Max != nil {
+			*out = append(*out, AggRow{
+				AggName:   fullAggName,
+				BucketKey: metricBucketKey,
+				DocCount:  0,
+				Value:     0,
+				Weight:    -1,
+			})
 		}
 	case subSpec.ValueCount != nil || subSpec.Cardinality != nil:
 		mSpec := subSpec.ValueCount
@@ -18567,6 +18971,10 @@ func emitRuntimeMetricAggRows(
 			vals = append(vals, extractDocNumericValuesForMetric(d, mSpec)...)
 		}
 		sCnt := int64(len(vals))
+		w := sCnt
+		if sCnt == 0 {
+			w = -1
+		}
 		var sMin, sMax, sSum, sAvg, sSumSq, sStd float64
 		if sCnt > 0 {
 			sMin, sMax = vals[0], vals[0]
@@ -18589,29 +18997,29 @@ func emitRuntimeMetricAggRows(
 		if parentBucketKey == "" {
 			*out = append(*out,
 				AggRow{AggName: fullAggName, BucketKey: "_stats_count", DocCount: sCnt, Value: float64(sCnt)},
-				AggRow{AggName: fullAggName, BucketKey: "_stats_min", DocCount: int64(sMin), Value: sMin},
-				AggRow{AggName: fullAggName, BucketKey: "_stats_max", DocCount: int64(sMax), Value: sMax},
-				AggRow{AggName: fullAggName, BucketKey: "_stats_avg", DocCount: int64(sAvg), Value: sAvg, Weight: sCnt},
+				AggRow{AggName: fullAggName, BucketKey: "_stats_min", DocCount: int64(sMin), Value: sMin, Weight: w},
+				AggRow{AggName: fullAggName, BucketKey: "_stats_max", DocCount: int64(sMax), Value: sMax, Weight: w},
+				AggRow{AggName: fullAggName, BucketKey: "_stats_avg", DocCount: int64(sAvg), Value: sAvg, Weight: w},
 				AggRow{AggName: fullAggName, BucketKey: "_stats_sum", DocCount: int64(sSum), Value: sSum},
 			)
 			if subSpec.ExtendedStats != nil {
 				*out = append(*out,
 					AggRow{AggName: fullAggName, BucketKey: "_stats_sum_sq", DocCount: int64(sSumSq), Value: sSumSq},
-					AggRow{AggName: fullAggName, BucketKey: "_stats_std", DocCount: int64(sStd), Value: sStd, Weight: sCnt},
+					AggRow{AggName: fullAggName, BucketKey: "_stats_std", DocCount: int64(sStd), Value: sStd, Weight: w},
 				)
 			}
 		} else {
 			*out = append(*out,
 				AggRow{AggName: fullAggName + "._stats_count", BucketKey: parentBucketKey, DocCount: sCnt, Value: float64(sCnt)},
-				AggRow{AggName: fullAggName + "._stats_min", BucketKey: parentBucketKey, DocCount: int64(sMin), Value: sMin},
-				AggRow{AggName: fullAggName + "._stats_max", BucketKey: parentBucketKey, DocCount: int64(sMax), Value: sMax},
-				AggRow{AggName: fullAggName + "._stats_avg", BucketKey: parentBucketKey, DocCount: int64(sAvg), Value: sAvg, Weight: sCnt},
+				AggRow{AggName: fullAggName + "._stats_min", BucketKey: parentBucketKey, DocCount: int64(sMin), Value: sMin, Weight: w},
+				AggRow{AggName: fullAggName + "._stats_max", BucketKey: parentBucketKey, DocCount: int64(sMax), Value: sMax, Weight: w},
+				AggRow{AggName: fullAggName + "._stats_avg", BucketKey: parentBucketKey, DocCount: int64(sAvg), Value: sAvg, Weight: w},
 				AggRow{AggName: fullAggName + "._stats_sum", BucketKey: parentBucketKey, DocCount: int64(sSum), Value: sSum},
 			)
 			if subSpec.ExtendedStats != nil {
 				*out = append(*out,
 					AggRow{AggName: fullAggName + "._stats_sum_sq", BucketKey: parentBucketKey, DocCount: int64(sSumSq), Value: sSumSq},
-					AggRow{AggName: fullAggName + "._stats_std", BucketKey: parentBucketKey, DocCount: int64(sStd), Value: sStd, Weight: sCnt},
+					AggRow{AggName: fullAggName + "._stats_std", BucketKey: parentBucketKey, DocCount: int64(sStd), Value: sStd, Weight: w},
 				)
 			}
 		}
@@ -18711,6 +19119,10 @@ func emitRuntimeMetricAggRows(
 			}
 		}
 		sCnt := int64(len(strs))
+		w := sCnt
+		if sCnt == 0 {
+			w = -1
+		}
 		var minLen, maxLen, avgLen, entropy float64
 		if sCnt > 0 {
 			firstLen := float64(len([]rune(strs[0])))
@@ -18745,19 +19157,19 @@ func emitRuntimeMetricAggRows(
 		}
 		if parentBucketKey == "" {
 			*out = append(*out,
-				AggRow{AggName: fullAggName, BucketKey: "_stats_count", DocCount: sCnt, Value: float64(sCnt)},
-				AggRow{AggName: fullAggName, BucketKey: "_stats_min", DocCount: int64(minLen), Value: minLen},
-				AggRow{AggName: fullAggName, BucketKey: "_stats_max", DocCount: int64(maxLen), Value: maxLen},
-				AggRow{AggName: fullAggName, BucketKey: "_stats_avg", DocCount: int64(avgLen), Value: avgLen, Weight: sCnt},
-				AggRow{AggName: fullAggName, BucketKey: "_stats_entropy", DocCount: int64(entropy), Value: entropy, Weight: sCnt},
+				AggRow{AggName: fullAggName, BucketKey: "_sstats_count", DocCount: sCnt, Value: float64(sCnt)},
+				AggRow{AggName: fullAggName, BucketKey: "_sstats_min", DocCount: int64(minLen), Value: minLen, Weight: w},
+				AggRow{AggName: fullAggName, BucketKey: "_sstats_max", DocCount: int64(maxLen), Value: maxLen, Weight: w},
+				AggRow{AggName: fullAggName, BucketKey: "_sstats_avg", DocCount: int64(avgLen), Value: avgLen, Weight: w},
+				AggRow{AggName: fullAggName, BucketKey: "_sstats_entropy", DocCount: int64(entropy), Value: entropy, Weight: w},
 			)
 		} else {
 			*out = append(*out,
-				AggRow{AggName: fullAggName + "._stats_count", BucketKey: parentBucketKey, DocCount: sCnt, Value: float64(sCnt)},
-				AggRow{AggName: fullAggName + "._stats_min", BucketKey: parentBucketKey, DocCount: int64(minLen), Value: minLen},
-				AggRow{AggName: fullAggName + "._stats_max", BucketKey: parentBucketKey, DocCount: int64(maxLen), Value: maxLen},
-				AggRow{AggName: fullAggName + "._stats_avg", BucketKey: parentBucketKey, DocCount: int64(avgLen), Value: avgLen, Weight: sCnt},
-				AggRow{AggName: fullAggName + "._stats_entropy", BucketKey: parentBucketKey, DocCount: int64(entropy), Value: entropy, Weight: sCnt},
+				AggRow{AggName: fullAggName + "._sstats_count", BucketKey: parentBucketKey, DocCount: sCnt, Value: float64(sCnt)},
+				AggRow{AggName: fullAggName + "._sstats_min", BucketKey: parentBucketKey, DocCount: int64(minLen), Value: minLen, Weight: w},
+				AggRow{AggName: fullAggName + "._sstats_max", BucketKey: parentBucketKey, DocCount: int64(maxLen), Value: maxLen, Weight: w},
+				AggRow{AggName: fullAggName + "._sstats_avg", BucketKey: parentBucketKey, DocCount: int64(avgLen), Value: avgLen, Weight: w},
+				AggRow{AggName: fullAggName + "._sstats_entropy", BucketKey: parentBucketKey, DocCount: int64(entropy), Value: entropy, Weight: w},
 			)
 		}
 	case subSpec.Rate != nil:
@@ -20297,12 +20709,13 @@ func applyRuntimeSearchScripts(hits []HitRow, aggRows []AggRow, idxTotal int64, 
 }
 
 func applyRuntimeSearchScriptsWithMatched(hits []HitRow, aggRows []AggRow, idxTotal int64, req *esast.SearchRequest, idxSchema *schema.IndexSchema, isMultiIndex bool) ([]HitRow, []AggRow, int64, []HitRow) {
-	return applyRuntimeSearchScriptsWithMatchedAndGlobal(hits, nil, aggRows, idxTotal, req, idxSchema, isMultiIndex)
+	outHits, outAggs, outTotal, matchedHits, _ := applyRuntimeSearchScriptsWithMatchedAndGlobal(hits, nil, aggRows, idxTotal, req, idxSchema, isMultiIndex)
+	return outHits, outAggs, outTotal, matchedHits
 }
 
-func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []HitRow, aggRows []AggRow, idxTotal int64, req *esast.SearchRequest, idxSchema *schema.IndexSchema, isMultiIndex bool) ([]HitRow, []AggRow, int64, []HitRow) {
+func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []HitRow, aggRows []AggRow, idxTotal int64, req *esast.SearchRequest, idxSchema *schema.IndexSchema, isMultiIndex bool) ([]HitRow, []AggRow, int64, []HitRow, []HitRow) {
 	if req == nil {
-		return hits, aggRows, idxTotal, hits
+		return hits, aggRows, idxTotal, hits, hits
 	}
 	hasQueryScript := queryHasRuntimeScript(req.Query)
 	hasNestedScoring := queryHasNestedScoring(req.Query)
@@ -20499,7 +20912,7 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 	for i := range outHits {
 		outHits[i].TotalHits = idxTotal
 	}
-	return outHits, aggRows, idxTotal, filteredQueryHits
+	return outHits, aggRows, idxTotal, filteredQueryHits, postFilteredHits
 }
 
 func maxRescoreWindow(req *esast.SearchRequest, defaultWin int) int {
