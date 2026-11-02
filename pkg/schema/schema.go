@@ -865,6 +865,31 @@ func inferObjectProperties(obj map[string]any, dst map[string]esast.FieldPropert
 		if val == nil {
 			continue
 		}
+		if existing, exists := dst[k]; exists && len(existing.Properties) > 0 {
+			if subMap, isMap := val.(map[string]any); isMap {
+				if depth+1 < maxInferredDepth {
+					inferObjectProperties(subMap, existing.Properties, depth+1, totalFields)
+					dst[k] = existing
+				}
+				continue
+			}
+			if subSlice, isSlice := val.([]any); isSlice {
+				if depth+1 < maxInferredDepth {
+					hadAny := false
+					for _, elem := range subSlice {
+						if elemMap, ok := elem.(map[string]any); ok {
+							inferObjectProperties(elemMap, existing.Properties, depth+1, totalFields)
+							hadAny = true
+						}
+					}
+					if hadAny {
+						markPropertyMultiValued(&existing)
+						dst[k] = existing
+						continue
+					}
+				}
+			}
+		}
 		inferred, ok := inferValueProperty(val, depth, totalFields)
 		if !ok {
 			continue
@@ -934,6 +959,19 @@ func inferValueProperty(val any, depth int, totalFields *int) (esast.FieldProper
 				}
 			default:
 				allNumeric = false
+			}
+			if elemMap, isMap := elem.(map[string]any); isMap {
+				if depth+1 >= maxInferredDepth {
+					continue
+				}
+				if merged.Properties == nil {
+					merged.Properties = make(map[string]esast.FieldProperty)
+				}
+				inferObjectProperties(elemMap, merged.Properties, depth+1, totalFields)
+				if len(merged.Properties) > 0 {
+					hasElem = true
+				}
+				continue
 			}
 			elemProp, ok := inferValueProperty(elem, depth, totalFields)
 			if !ok {

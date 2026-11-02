@@ -606,9 +606,12 @@ func stripNamedQueryAndMapBoost(rawClause json.RawMessage, requireMultipleKeysFo
 		return rawClause, nil
 	}
 	modified := false
-	if _, hasName := m["_name"]; hasName {
-		delete(m, "_name")
-		modified = true
+	if rawName, hasName := m["_name"]; hasName && len(m) > 1 {
+		tn := bytes.TrimSpace(rawName)
+		if len(tn) > 0 && tn[0] == '"' {
+			delete(m, "_name")
+			modified = true
+		}
 	}
 	var mapBoost *float64
 	if rawBoost, hasBoost := m["boost"]; hasBoost && (!requireMultipleKeysForBoost || len(m) > 1) {
@@ -675,17 +678,6 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(trimmed, &alias); err != nil {
 		return err
 	}
-	delete(alias.Term, "_name")
-	delete(alias.TermsSet, "_name")
-	delete(alias.Range, "_name")
-	delete(alias.Prefix, "_name")
-	delete(alias.Wildcard, "_name")
-	delete(alias.Regexp, "_name")
-	delete(alias.Fuzzy, "_name")
-	delete(alias.Match, "_name")
-	delete(alias.MatchPhrase, "_name")
-	delete(alias.MatchPhrasePrefix, "_name")
-	delete(alias.MatchBoolPrefix, "_name")
 	if b := mapBoosts["range"]; b != nil {
 		for k, rc := range alias.Range {
 			if rc.Boost == nil {
@@ -862,10 +854,10 @@ func (tq *TermsQuery) UnmarshalJSON(data []byte) error {
 			tq.CaseInsensitive = ci
 			continue
 		}
-		if k == "_name" {
+		trimmed := bytes.TrimSpace(v)
+		if k == "_name" && len(trimmed) > 0 && trimmed[0] == '"' {
 			continue
 		}
-		trimmed := bytes.TrimSpace(v)
 		if len(trimmed) > 0 && trimmed[0] == '[' {
 			var arr []any
 			if err := json.Unmarshal(trimmed, &arr); err != nil {

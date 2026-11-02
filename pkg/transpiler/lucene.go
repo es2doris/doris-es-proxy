@@ -452,10 +452,17 @@ func parseLuceneTokensToASTWithFlags(tokens []string, defaultField string, field
 			outBool.MustNot = append(outBool.MustNot, uQ.Bool.MustNot...)
 		}
 		if remQ.Bool != nil {
+			remHasUnary := false
+			for _, rt := range remaining {
+				if isLuceneUnaryPrefixed(rt, isSimple, flags) || isLuceneStandaloneNot(rt, isSimple, flags) {
+					remHasUnary = true
+					break
+				}
+			}
 			if defaultOp == "AND" && len(remQ.Bool.Must) == 0 && len(remQ.Bool.Filter) == 0 && len(remQ.Bool.MustNot) == 0 && len(remQ.Bool.Should) > 0 {
 				remQ.Bool.MinimumShouldMatch = 1
 				outBool.Must = append(outBool.Must, remQ)
-			} else if defaultOp == "OR" && len(outBool.Must) > 0 && (len(remQ.Bool.Must) > 0 || len(remQ.Bool.MustNot) > 0 || len(remQ.Bool.Filter) > 0) {
+			} else if defaultOp == "OR" && len(outBool.Must) > 0 && !remHasUnary && (len(remQ.Bool.Must) > 0 || len(remQ.Bool.MustNot) > 0 || len(remQ.Bool.Filter) > 0) {
 				outBool.Should = append(outBool.Should, remQ)
 			} else {
 				outBool.Must = append(outBool.Must, remQ.Bool.Must...)
@@ -1299,8 +1306,13 @@ func tokenizeLuceneWithFlags(s string, isSimple bool, flags simpleQueryFlags) []
 			if !isSimple && !inQuotes && bracketDepth == 0 {
 				if inRegex {
 					inRegex = false
-				} else if (curr.Len() == 0 || strings.HasSuffix(curr.String(), ":")) && strings.ContainsRune(s[i+1:], '/') {
-					inRegex = true
+				} else if strings.ContainsRune(s[i+1:], '/') {
+					currStr := curr.String()
+					if currStr == "" || currStr == "+" || currStr == "-" || currStr == "!" ||
+						strings.HasSuffix(currStr, ":") || strings.HasSuffix(currStr, ":+") ||
+						strings.HasSuffix(currStr, ":-") || strings.HasSuffix(currStr, ":!") {
+						inRegex = true
+					}
 				}
 			}
 			curr.WriteRune(r)

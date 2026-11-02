@@ -33,6 +33,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
 )
@@ -542,6 +543,13 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		}
 		return filtered
 	}
+	topFilteredBuckets := func(aggName string, counts map[string]int64, limit int) []AggRow {
+		rows := filterHaving(topBuckets(aggName, counts, 0))
+		if limit > 0 && len(rows) > limit {
+			rows = rows[:limit]
+		}
+		return rows
+	}
 	if strings.Contains(branch, "'__meta_total'") || strings.Contains(branch, "'__meta_query_total'") {
 		metaName := "__meta_total"
 		if strings.Contains(branch, "'__meta_query_total'") {
@@ -593,7 +601,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				}
 			}
 		}
-		return topBuckets(aggName, counts, limit)
+		return topFilteredBuckets(aggName, counts, limit)
 	}
 
 	if m := reAggArrayExplodeMissing.FindStringSubmatch(branch); m != nil {
@@ -637,7 +645,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				counts[missingVal]++
 			}
 		}
-		return topBuckets(aggName, counts, limit)
+		return topFilteredBuckets(aggName, counts, limit)
 	}
 
 	if m := reAggNestedTerms.FindStringSubmatch(branch); m != nil {
@@ -675,7 +683,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				}
 			}
 		}
-		return topBuckets(aggName, counts, limit)
+		return topFilteredBuckets(aggName, counts, limit)
 	}
 
 	if m := reAggNestedTermsMissing.FindStringSubmatch(branch); m != nil {
@@ -726,7 +734,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				}
 			}
 		}
-		return topBuckets(aggName, counts, limit)
+		return topFilteredBuckets(aggName, counts, limit)
 	}
 
 	if !strings.HasSuffix(branch, " GROUP BY `_bucket_key`") {
@@ -765,8 +773,12 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 					}
 				}
 			}
-			if len(nums) == 0 && bKey == "_metric" && (fn == "AVG" || fn == "MIN" || fn == "MAX") {
-				return nil
+			w := int64(len(nums))
+			if len(nums) == 0 && (fn == "AVG" || fn == "MIN" || fn == "MAX" || fn == "STDDEV_POP") {
+				if bKey == "_metric" {
+					return nil
+				}
+				w = -1
 			}
 			var res float64
 			switch fn {
@@ -808,7 +820,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 			case "STDDEV_POP":
 				res = computePopStdDev(nums)
 			}
-			return []AggRow{{AggName: aggName, BucketKey: bKey, DocCount: int64(res), Value: res, Weight: int64(len(nums))}}
+			return []AggRow{{AggName: aggName, BucketKey: bKey, DocCount: int64(res), Value: res, Weight: w}}
 		}
 	}
 
@@ -833,7 +845,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				counts[s]++
 			}
 		}
-		return topBuckets(aggName, counts, limit)
+		return topFilteredBuckets(aggName, counts, limit)
 	}
 
 	if m := reAggScalarTerms.FindStringSubmatch(branch); m != nil {
@@ -859,7 +871,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				}
 			}
 		}
-		return filterHaving(topBuckets(aggName, counts, limit))
+		return topFilteredBuckets(aggName, counts, limit)
 	}
 
 	if m := reAggFilter.FindStringSubmatch(branch); m != nil {
@@ -964,8 +976,12 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				}
 			}
 		}
-		if len(nums) == 0 && bKey == "_metric" && (fn == "AVG" || fn == "MIN" || fn == "MAX") {
-			return nil
+		w := int64(len(nums))
+		if len(nums) == 0 && (fn == "AVG" || fn == "MIN" || fn == "MAX" || fn == "STDDEV_POP") {
+			if bKey == "_metric" {
+				return nil
+			}
+			w = -1
 		}
 		var res float64
 		if len(nums) > 0 {
@@ -999,7 +1015,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				res = computePopStdDev(nums)
 			}
 		}
-		return []AggRow{{AggName: aggName, BucketKey: bKey, DocCount: int64(res), Value: res, Weight: int64(len(nums))}}
+		return []AggRow{{AggName: aggName, BucketKey: bKey, DocCount: int64(res), Value: res, Weight: w}}
 	}
 
 	if m := reAggSubPercentile.FindStringSubmatch(branch); m != nil {
@@ -1229,7 +1245,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				Value:     float64(counts[k]),
 			})
 		}
-		return rows
+		return filterHaving(rows)
 	}
 
 	if m := reAggHist.FindStringSubmatch(branch); m != nil {
@@ -1282,7 +1298,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				Value:     float64(counts[k]),
 			})
 		}
-		return rows
+		return filterHaving(rows)
 	}
 
 	if m := reAggTopHits.FindStringSubmatch(branch); m != nil {
@@ -1413,7 +1429,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				}
 			}
 		}
-		return topBuckets(aggName, counts, 0)
+		return topFilteredBuckets(aggName, counts, 0)
 	}
 
 	if m := reAggSubMetric.FindStringSubmatch(branch); m != nil {
@@ -1468,7 +1484,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		var out []AggRow
 		for _, bKey := range bucketOrder {
 			acc := byBucket[bKey]
-			if len(acc.nums) == 0 && (fn == "AVG" || fn == "MIN" || fn == "MAX" || hasHavingCountGtZero) {
+			if len(acc.nums) == 0 && (fn == "AVG" || fn == "MIN" || fn == "MAX" || fn == "STDDEV_POP" || hasHavingCountGtZero) {
 				continue
 			}
 			var res float64
@@ -3185,20 +3201,31 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 		return nil
 	}
-	if strings.HasPrefix(colExpr, "LENGTH(") && strings.HasSuffix(colExpr, ")") {
-		inner := colExpr[len("LENGTH(") : len(colExpr)-1]
+	if (strings.HasPrefix(colExpr, "LENGTH(") || strings.HasPrefix(colExpr, "CHAR_LENGTH(")) && strings.HasSuffix(colExpr, ")") {
+		isCharLen := strings.HasPrefix(colExpr, "CHAR_LENGTH(")
+		prefixLen := len("LENGTH(")
+		if isCharLen {
+			prefixLen = len("CHAR_LENGTH(")
+		}
+		inner := colExpr[prefixLen : len(colExpr)-1]
+		measureStr := func(s string) int64 {
+			if isCharLen {
+				return int64(utf8.RuneCountInString(s))
+			}
+			return int64(len(s))
+		}
 		if v := resolveColumnValue(row, inner); v != nil {
 			switch sliceVal := v.(type) {
 			case []any, []string:
 				var out []any
 				for _, elem := range asSliceOrSingle(sliceVal) {
 					if elem != nil {
-						out = append(out, int64(len(fmt.Sprintf("%v", elem))))
+						out = append(out, measureStr(fmt.Sprintf("%v", elem)))
 					}
 				}
 				return out
 			default:
-				return int64(len(fmt.Sprintf("%v", v)))
+				return measureStr(fmt.Sprintf("%v", v))
 			}
 		}
 		return nil

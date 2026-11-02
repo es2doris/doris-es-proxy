@@ -1736,4 +1736,38 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	if r35SimDoc["copied_ts"] != "2025-05-05T00:00:00Z" || r35SimDoc["sum"].(float64) != 4 || len(r35SimDoc["nums"].([]any)) != 2 {
 		t.Fatalf("unexpected R35 simulated doc: %+v", r35SimDoc)
 	}
+
+	// Step 29: Round-36 Red-Team & Coverage Hardening E2E Checks
+	r36SimResp, err := http.Post(ts.URL+"/_ingest/pipeline/_simulate", "application/json", strings.NewReader(`{
+		"pipeline": {
+			"processors": [
+				{"split": {"field": "arr_lines", "separator": ","}},
+				{"kv": {"field": "kv_arr", "field_split": " ", "value_split": "=", "target_field": "kv_out"}},
+				{"grok": {"field": "pair_msg", "patterns": ["%{WORD:tok}-%{WORD:tok}"]}},
+				{"script": {"source": "def sub = ctx.kv_out; sub.extra = +.5 + -.5 + 1; if (ctx.missing_flag ?: true) { ctx.elvis_ok = true; }"}}
+			]
+		},
+		"docs": [
+			{
+				"_index": "live_auto_index",
+				"_id": "r36-sim-1",
+				"_source": {
+					"arr_lines": ["x,y", "z"],
+					"kv_arr": ["a=1 b=2", "a=3"],
+					"kv_out": "overwrite_me",
+					"pair_msg": "foo-bar"
+				}
+			}
+		]
+	}`))
+	if err != nil || r36SimResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_ingest/pipeline/_simulate (R36) failed: status=%v err=%v", r36SimResp.StatusCode, err)
+	}
+	var r36SimRes map[string]any
+	_ = json.NewDecoder(r36SimResp.Body).Decode(&r36SimRes)
+	_ = r36SimResp.Body.Close()
+	r36SimDoc := r36SimRes["docs"].([]any)[0].(map[string]any)["doc"].(map[string]any)["_source"].(map[string]any)
+	if len(r36SimDoc["arr_lines"].([]any)) != 3 || len(r36SimDoc["tok"].([]any)) != 2 || r36SimDoc["elvis_ok"] != true {
+		t.Fatalf("unexpected R36 simulated doc: %+v", r36SimDoc)
+	}
 }

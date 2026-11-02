@@ -249,8 +249,16 @@ const (
 )
 
 type evalBudget struct {
-	steps int
-	depth int
+	steps         int
+	depth         int
+	ctxOp         string
+	hasCtxOp      bool
+	ctxID         any
+	hasCtxID      bool
+	ctxIndex      any
+	hasCtxIndex   bool
+	ctxVersion    any
+	hasCtxVersion bool
 }
 
 func (b *evalBudget) step() error {
@@ -410,6 +418,22 @@ func EvalPainlessWithOp(sourceMap map[string]any, scriptSource string, params ma
 	err := execBlock(sourceMap, cleaned, evalParams, &ctxOp, budget)
 	if errors.Is(err, errPainlessReturn) {
 		err = nil
+	}
+	if budget.hasCtxOp {
+		ctxOp = budget.ctxOp
+	} else if ctxOp == "" {
+		if opStr, ok := evalParams["_ctx_op"].(string); ok && opStr != "" {
+			ctxOp = opStr
+		}
+	}
+	if budget.hasCtxID {
+		evalParams["_ctx_id"] = budget.ctxID
+	}
+	if budget.hasCtxIndex {
+		evalParams["_ctx_index"] = budget.ctxIndex
+	}
+	if budget.hasCtxVersion {
+		evalParams["_ctx_version"] = budget.ctxVersion
 	}
 	if params != nil {
 		for _, metaKey := range []string{"_ctx_id", "_ctx_index", "_ctx_version"} {
@@ -1659,6 +1683,10 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			*ctxOp = fmt.Sprintf("%v", val)
 		}
 		params["_ctx_op"] = *ctxOp
+		if budget != nil {
+			budget.ctxOp = *ctxOp
+			budget.hasCtxOp = true
+		}
 		return nil
 	}
 	if m := reCtxIncDec.FindStringSubmatch(stmt); m != nil {
@@ -2342,6 +2370,19 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 				break
 			}
 		}
+		if !matchedAlias && reSimpleFieldPath.MatchString(rhsExpr) && !strings.HasSuffix(rhsExpr, ".size()") && !strings.HasSuffix(rhsExpr, ".length()") {
+			rhsParts := normalizeLocalLHSPath(strings.Split(rhsExpr, "."), params)
+			if len(rhsParts) > 0 {
+				rootVar := decodeBracketSeg(rhsParts[0])
+				if baseAlias, ok := params["__alias_"+rootVar].(string); ok && baseAlias != "" {
+					switch val.(type) {
+					case []any, map[string]any:
+						params["__alias_"+varName] = strings.Join(append([]string{baseAlias}, rhsParts[1:]...), ".")
+						matchedAlias = true
+					}
+				}
+			}
+		}
 		if !matchedAlias {
 			delete(params, "__alias_"+varName)
 		}
@@ -2710,6 +2751,19 @@ func evalConditionDepth(sourceMap map[string]any, cond string, params map[string
 			return evalConditionDepth(sourceMap, strings.TrimSpace(rest[cIdx+1:]), params, depth+1)
 		}
 	}
+	if elvisIdx > 0 {
+		leftVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:elvisIdx]), params, depth+1)
+		if err == nil && leftVal != nil {
+			if b, ok := leftVal.(bool); ok {
+				return b
+			}
+			if f, ok := toFloat64(leftVal); ok {
+				return f != 0
+			}
+			return true
+		}
+		return evalConditionDepth(sourceMap, strings.TrimSpace(cond[elvisIdx+2:]), params, depth+1)
+	}
 	if parts := splitTopLevelCondOp(cond, "||"); len(parts) > 1 {
 		for _, p := range parts {
 			if evalConditionDepth(sourceMap, p, params, depth+1) {
@@ -3018,6 +3072,13 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			}
 			return normalizeIncDecPrevVal(curVal), nil
 		}
+	}
+	if strings.HasPrefix(rhs, "+") && len(rhs) > 1 && rhs[1] != '+' {
+		innerVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(rhs[1:]), params, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		return applyArithmetic(int64(0), innerVal, true), nil
 	}
 	if strings.HasPrefix(rhs, "-") && len(rhs) > 1 && (rhs[1] < '0' || rhs[1] > '9') {
 		innerVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(rhs[1:]), params, depth+1)
@@ -4468,6 +4529,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 	if reNumericLiteralSuffix.MatchString(numStr) {
 		numStr = numStr[:len(numStr)-1]
 	}
+	if strings.HasPrefix(numStr, ".") && len(numStr) > 1 && numStr[1] >= '0' && numStr[1] <= '9' {
+		numStr = "0" + numStr
+	} else if strings.HasPrefix(numStr, "-.") && len(numStr) > 2 && numStr[2] >= '0' && numStr[2] <= '9' {
+		numStr = "-0." + numStr[2:]
+	}
 	dec := json.NewDecoder(strings.NewReader(numStr))
 	dec.UseNumber()
 	var parsed any
@@ -5595,6 +5661,7 @@ func removeKeyOrIndexAtPath(root map[string]any, parentPath []string, keyOrIdx a
 				return true
 			}
 		}
+		return false
 	}
 	return nil
 }
@@ -6442,11 +6509,26 @@ func evalPainlessLambdaBody(body string, sourceMap, params map[string]any, depth
 		return nil, err
 	}
 	body = strings.TrimSpace(body)
-	if strings.HasPrefix(body, "{") && strings.HasSuffix(body, "}") {
-		inner := strings.TrimSpace(body[1 : len(body)-1])
+	if (strings.HasPrefix(body, "{") && strings.HasSuffix(body, "}")) || isTopLevelAssignmentStmt(body) {
+		inner := body
+		if strings.HasPrefix(body, "{") && strings.HasSuffix(body, "}") {
+			inner = strings.TrimSpace(body[1 : len(body)-1])
+		}
 		ctxOp := ""
 		delete(params, "_return_val")
 		err := execBlock(sourceMap, inner, params, &ctxOp, budget)
+		if v, exists := params["_ctx_id"]; exists {
+			budget.ctxID = v
+			budget.hasCtxID = true
+		}
+		if v, exists := params["_ctx_index"]; exists {
+			budget.ctxIndex = v
+			budget.hasCtxIndex = true
+		}
+		if v, exists := params["_ctx_version"]; exists {
+			budget.ctxVersion = v
+			budget.hasCtxVersion = true
+		}
 		if err != nil && !errors.Is(err, errPainlessReturn) {
 			return nil, err
 		}
