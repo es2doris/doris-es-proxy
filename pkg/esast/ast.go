@@ -483,6 +483,81 @@ type HighlightFieldSpec struct {
 	Type              string   `json:"type,omitempty"`
 }
 
+func parseFlexibleStringSlice(v any) ([]string, error) {
+	if v == nil {
+		return nil, nil
+	}
+	switch val := v.(type) {
+	case string:
+		return []string{val}, nil
+	case []string:
+		return val, nil
+	case []any:
+		out := make([]string, 0, len(val))
+		for _, el := range val {
+			if el != nil {
+				out = append(out, formatFlexibleScalarString(el))
+			}
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("parsing_exception: expected string or array of strings, got %T", v)
+	}
+}
+
+func formatFlexibleScalarString(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	if fv, ok := v.(float64); ok && fv == math.Trunc(fv) && !math.IsInf(fv, 0) && !math.IsNaN(fv) {
+		return strconv.FormatInt(int64(fv), 10)
+	}
+	return fmt.Sprintf("%v", v)
+}
+
+func (hfs *HighlightFieldSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	type plain HighlightFieldSpec
+	var raw struct {
+		plain
+		PreTags       any `json:"pre_tags"`
+		PostTags      any `json:"post_tags"`
+		MatchedFields any `json:"matched_fields"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	*hfs = HighlightFieldSpec(raw.plain)
+	if raw.PreTags != nil {
+		tags, err := parseFlexibleStringSlice(raw.PreTags)
+		if err != nil {
+			return err
+		}
+		hfs.PreTags = tags
+	}
+	if raw.PostTags != nil {
+		tags, err := parseFlexibleStringSlice(raw.PostTags)
+		if err != nil {
+			return err
+		}
+		hfs.PostTags = tags
+	}
+	if raw.MatchedFields != nil {
+		mf, err := parseFlexibleStringSlice(raw.MatchedFields)
+		if err != nil {
+			return err
+		}
+		hfs.MatchedFields = mf
+	}
+	return nil
+}
+
 type HighlightSpec struct {
 	PreTags           []string       `json:"pre_tags,omitempty"`
 	PostTags          []string       `json:"post_tags,omitempty"`
@@ -495,6 +570,38 @@ type HighlightSpec struct {
 	NoMatchSize       *int           `json:"no_match_size,omitempty"`
 	Type              string         `json:"type,omitempty"`
 	Fields            map[string]any `json:"fields,omitempty"`
+}
+
+func (h *HighlightSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	type plain HighlightSpec
+	var raw struct {
+		plain
+		PreTags  any `json:"pre_tags"`
+		PostTags any `json:"post_tags"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	*h = HighlightSpec(raw.plain)
+	if raw.PreTags != nil {
+		tags, err := parseFlexibleStringSlice(raw.PreTags)
+		if err != nil {
+			return err
+		}
+		h.PreTags = tags
+	}
+	if raw.PostTags != nil {
+		tags, err := parseFlexibleStringSlice(raw.PostTags)
+		if err != nil {
+			return err
+		}
+		h.PostTags = tags
+	}
+	return nil
 }
 
 // FieldSpec decodes the per-field highlight configuration for field into HighlightFieldSpec.
@@ -956,6 +1063,30 @@ type CombinedFieldsQuery struct {
 	Boost              *float64 `json:"boost,omitempty"`
 }
 
+func (cfq *CombinedFieldsQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	type plain CombinedFieldsQuery
+	var raw struct {
+		plain
+		Fields any `json:"fields"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	*cfq = CombinedFieldsQuery(raw.plain)
+	if raw.Fields != nil {
+		fields, err := parseFlexibleStringSlice(raw.Fields)
+		if err != nil {
+			return err
+		}
+		cfq.Fields = fields
+	}
+	return nil
+}
+
 // ScriptScoreQuery models an ES `script_score` query (`{"script_score": {"query": {...}, "script": {...}}}`).
 type ScriptScoreQuery struct {
 	Query    *Query         `json:"query,omitempty"`
@@ -1381,6 +1512,30 @@ type MultiMatchQuery struct {
 	Boost              *float64 `json:"boost,omitempty"`
 }
 
+func (mmq *MultiMatchQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	type plain MultiMatchQuery
+	var raw struct {
+		plain
+		Fields any `json:"fields"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	*mmq = MultiMatchQuery(raw.plain)
+	if raw.Fields != nil {
+		fields, err := parseFlexibleStringSlice(raw.Fields)
+		if err != nil {
+			return err
+		}
+		mmq.Fields = fields
+	}
+	return nil
+}
+
 type QueryStringQuery struct {
 	Query                           string   `json:"query"`
 	DefaultField                    string   `json:"default_field,omitempty"`
@@ -1402,6 +1557,34 @@ type QueryStringQuery struct {
 	AllowLeadingWildcard            *bool    `json:"allow_leading_wildcard,omitempty"`
 	AutoGenerateSynonymsPhraseQuery *bool    `json:"auto_generate_synonyms_phrase_query,omitempty"`
 	Boost                           *float64 `json:"boost,omitempty"`
+}
+
+func (qsq *QueryStringQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	type plain QueryStringQuery
+	var raw struct {
+		plain
+		Query  any `json:"query"`
+		Fields any `json:"fields"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	*qsq = QueryStringQuery(raw.plain)
+	if raw.Query != nil {
+		qsq.Query = formatFlexibleScalarString(raw.Query)
+	}
+	if raw.Fields != nil {
+		fields, err := parseFlexibleStringSlice(raw.Fields)
+		if err != nil {
+			return err
+		}
+		qsq.Fields = fields
+	}
+	return nil
 }
 
 type NestedQuery struct {
@@ -2241,8 +2424,10 @@ func (m *MetricAggSpec) EffectiveSigma() float64 {
 }
 
 type NestedSortSpec struct {
-	Path   string `json:"path,omitempty"`
-	Filter *Query `json:"filter,omitempty"`
+	Path        string          `json:"path,omitempty"`
+	Filter      *Query          `json:"filter,omitempty"`
+	Nested      *NestedSortSpec `json:"nested,omitempty"`
+	MaxChildren *int            `json:"max_children,omitempty"`
 }
 
 type SortEntry = SortFieldSpec
@@ -2282,7 +2467,23 @@ func (s SortSpec) MarshalJSON() ([]byte, error) {
 	}
 	if s.Entry.Field == "_geo_distance" {
 		if geoMap, ok := s.Entry.Script.(map[string]any); ok {
-			return json.Marshal(map[string]any{"_geo_distance": geoMap})
+			outMap := make(map[string]any, len(geoMap)+4)
+			for k, v := range geoMap {
+				outMap[k] = v
+			}
+			if s.Entry.Order != "" {
+				outMap["order"] = order
+			}
+			if s.Entry.Mode != "" {
+				outMap["mode"] = s.Entry.Mode
+			}
+			if s.Entry.Missing != "" {
+				outMap["missing"] = s.Entry.Missing
+			}
+			if s.Entry.Nested != nil {
+				outMap["nested"] = s.Entry.Nested
+			}
+			return json.Marshal(map[string]any{"_geo_distance": outMap})
 		}
 		inner := map[string]any{"order": order}
 		if s.Entry.Mode != "" {
@@ -2290,6 +2491,9 @@ func (s SortSpec) MarshalJSON() ([]byte, error) {
 		}
 		if s.Entry.Missing != "" {
 			inner["missing"] = s.Entry.Missing
+		}
+		if s.Entry.Nested != nil {
+			inner["nested"] = s.Entry.Nested
 		}
 		return json.Marshal(map[string]any{"_geo_distance": inner})
 	}
@@ -2384,9 +2588,12 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 	if rawVal, ok := m["_geo_distance"]; ok {
 		order := "asc"
 		var obj struct {
-			Order   string `json:"order"`
-			Mode    string `json:"mode"`
-			Missing any    `json:"missing"`
+			Order        string          `json:"order"`
+			Mode         string          `json:"mode"`
+			Missing      any             `json:"missing"`
+			Nested       *NestedSortSpec `json:"nested"`
+			NestedPath   string          `json:"nested_path"`
+			NestedFilter *Query          `json:"nested_filter"`
 		}
 		_ = json.Unmarshal(rawVal, &obj)
 		if obj.Order != "" {
@@ -2397,13 +2604,53 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 				order = strings.ToLower(ordStr)
 			}
 		}
+		mode := strings.ToLower(obj.Mode)
+		if mode == "" {
+			if modeRaw, hasMode := m["mode"]; hasMode {
+				var modeStr string
+				if json.Unmarshal(modeRaw, &modeStr) == nil && modeStr != "" {
+					mode = strings.ToLower(modeStr)
+				}
+			}
+		}
+		missingVal := obj.Missing
+		if missingVal == nil {
+			if missRaw, hasMiss := m["missing"]; hasMiss {
+				_ = json.Unmarshal(missRaw, &missingVal)
+			}
+		}
+		missing := formatFlexibleScalarString(missingVal)
+		nestedSpec := obj.Nested
+		if nestedSpec == nil && (obj.NestedPath != "" || obj.NestedFilter != nil) {
+			nestedSpec = &NestedSortSpec{Path: obj.NestedPath, Filter: obj.NestedFilter}
+		}
+		if nestedSpec == nil {
+			if rawNested, hasNested := m["nested"]; hasNested {
+				var ns NestedSortSpec
+				if json.Unmarshal(rawNested, &ns) == nil && (ns.Path != "" || ns.Filter != nil) {
+					nestedSpec = &ns
+				}
+			}
+		}
+		if nestedSpec == nil {
+			var np string
+			var nf *Query
+			if rawNP, ok := m["nested_path"]; ok {
+				_ = json.Unmarshal(rawNP, &np)
+			}
+			if rawNF, ok := m["nested_filter"]; ok {
+				var q Query
+				if json.Unmarshal(rawNF, &q) == nil {
+					nf = &q
+				}
+			}
+			if np != "" || nf != nil {
+				nestedSpec = &NestedSortSpec{Path: np, Filter: nf}
+			}
+		}
 		var geoMap map[string]any
 		_ = json.Unmarshal(rawVal, &geoMap)
-		missing := ""
-		if obj.Missing != nil {
-			missing = fmt.Sprintf("%v", obj.Missing)
-		}
-		s.Entry = SortFieldSpec{Field: "_geo_distance", Order: order, Mode: strings.ToLower(obj.Mode), Missing: missing, Script: geoMap}
+		s.Entry = SortFieldSpec{Field: "_geo_distance", Order: order, Mode: mode, Missing: missing, Nested: nestedSpec, Script: geoMap}
 		return nil
 	}
 
@@ -2605,16 +2852,32 @@ func (sf *SourceFilter) UnmarshalJSON(data []byte) error {
 	}
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		var obj struct {
-			Includes []string `json:"includes"`
-			Excludes []string `json:"excludes"`
-			Include  []string `json:"include"`
-			Exclude  []string `json:"exclude"`
+			Includes any `json:"includes"`
+			Excludes any `json:"excludes"`
+			Include  any `json:"include"`
+			Exclude  any `json:"exclude"`
 		}
 		if err := json.Unmarshal(trimmed, &obj); err != nil {
 			return err
 		}
-		sf.Includes = append(obj.Includes, obj.Include...)
-		sf.Excludes = append(obj.Excludes, obj.Exclude...)
+		inc1, err := parseFlexibleStringSlice(obj.Includes)
+		if err != nil {
+			return err
+		}
+		inc2, err := parseFlexibleStringSlice(obj.Include)
+		if err != nil {
+			return err
+		}
+		exc1, err := parseFlexibleStringSlice(obj.Excludes)
+		if err != nil {
+			return err
+		}
+		exc2, err := parseFlexibleStringSlice(obj.Exclude)
+		if err != nil {
+			return err
+		}
+		sf.Includes = append(inc1, inc2...)
+		sf.Excludes = append(exc1, exc2...)
 	}
 	return nil
 }

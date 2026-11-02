@@ -355,32 +355,10 @@ func ShredDocument(
 						if tb.IgnoreAbove > 0 && len([]rune(sv)) > tb.IgnoreAbove {
 							continue
 						}
-						if tb.ESType == "date" || tb.ESType == "date_nanos" {
-							if tb.Format != "" {
-								if ms, ok := ParseESDateWithFormatToEpochMillis(sv, tb.Format, getNow()); ok {
-									if tb.ESType == "date_nanos" && (ms > 1_000_000_000_000_000 || ms < -1_000_000_000_000_000) {
-										ms /= 1_000_000
-									}
-									sv = strconv.FormatInt(ms, 10)
-									cur = append(cur, sv)
-									continue
-								}
+						if isTypedNonStringBinding(tb) {
+							if strings.TrimSpace(sv) == "" && (tb.Coerce == nil || *tb.Coerce) {
+								continue
 							}
-							if iv, err := strconv.ParseInt(strings.TrimSpace(sv), 10, 64); err == nil {
-								if tb.ESType == "date_nanos" && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
-									sv = strconv.FormatInt(iv/1_000_000, 10)
-								}
-							} else if ms, ok := ParseESDateToEpochMillis(sv, getNow()); ok {
-								sv = strconv.FormatInt(ms, 10)
-							}
-						} else if tb.ESType == "boolean" || tb.DorisType == DorisBoolean {
-							switch strings.ToLower(strings.TrimSpace(sv)) {
-							case "true", "1":
-								sv = "true"
-							case "false", "0":
-								sv = "false"
-							}
-						} else if (tb.ESType == "scaled_float" && tb.ScalingFactor > 0) || isTypedNonStringBinding(tb) {
 							coerced := coerceScalarBindingForDoris(sv, tb, getNow())
 							if coerced == nil {
 								if tb.IgnoreMalformed != nil && *tb.IgnoreMalformed {
@@ -388,6 +366,11 @@ func ShredDocument(
 									continue
 								}
 								return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", targetField, tb.ESType)
+							}
+							if tb.ESType == "date_nanos" {
+								if iv, ok := coerced.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
+									coerced = iv / 1_000_000
+								}
 							}
 							sv = formatCoercedArrayElement(coerced)
 						} else if tb.LowercaseNormalizer {
@@ -636,6 +619,7 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 				return ms
 			}
 		}
+		return nil
 	}
 	coerced := coerceScalarForDoris(val, effDorisType, b.LowercaseNormalizer, now)
 	if b.ESType == "scaled_float" && b.ScalingFactor > 0 {
@@ -932,6 +916,10 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 				}
 				return false, fmt.Errorf("strict_dynamic_mapping_exception: mapping set to strict, dynamic introduction of [%s] within [%s] is not allowed", k, scope)
 			}
+			if mode == "false" {
+				delete(obj, k)
+				pruned = true
+			}
 			continue
 		}
 		if strings.EqualFold(prop.Type, "flattened") {
@@ -958,16 +946,36 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 				pruned = true
 			}
 		} else if slice, ok := v.([]any); ok {
-			for _, elem := range slice {
-				if elemMap, ok := elem.(map[string]any); ok {
-					subPruned, err := validateStrictDynamicObject(elemMap, prop.Properties, childMode, fullPath)
-					if err != nil {
-						return false, err
-					}
-					if subPruned {
-						pruned = true
-					}
-				}
+			subPruned, err := validateStrictDynamicSlice(slice, prop.Properties, childMode, fullPath)
+			if err != nil {
+				return false, err
+			}
+			if subPruned {
+				pruned = true
+			}
+		}
+	}
+	return pruned, nil
+}
+
+func validateStrictDynamicSlice(slice []any, props map[string]esast.FieldProperty, childMode string, fullPath string) (bool, error) {
+	pruned := false
+	for _, elem := range slice {
+		if elemMap, ok := elem.(map[string]any); ok {
+			subPruned, err := validateStrictDynamicObject(elemMap, props, childMode, fullPath)
+			if err != nil {
+				return false, err
+			}
+			if subPruned {
+				pruned = true
+			}
+		} else if subSlice, ok := elem.([]any); ok {
+			subPruned, err := validateStrictDynamicSlice(subSlice, props, childMode, fullPath)
+			if err != nil {
+				return false, err
+			}
+			if subPruned {
+				pruned = true
 			}
 		}
 	}
@@ -1186,6 +1194,7 @@ func ParseESDateBoundWithFormatToEpochMillis(input, format string, now time.Time
 				}
 			}
 		}
+		return 0, false
 	}
 	return ParseESDateBoundToEpochMillis(s, now, roundUp)
 }
@@ -1965,6 +1974,11 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 			return nil
 		}
 	}
+	if isTypedNonStringBinding(b) {
+		if strVal, isStr := val.(string); isStr && strings.TrimSpace(strVal) == "" && (b.Coerce == nil || *b.Coerce) {
+			return nil
+		}
+	}
 	if b.ESType == "date" || b.ESType == "date_nanos" {
 		str := strings.TrimSpace(fmt.Sprintf("%v", val))
 		if b.Format != "" {
@@ -1974,18 +1988,22 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 				}
 				return ms
 			}
-		}
-		if iv, err := strconv.ParseInt(str, 10, 64); err == nil {
-			if b.ESType == "date_nanos" && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
-				return iv / 1_000_000
+			if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+				return nil
 			}
-			return iv
-		}
-		if ms, ok := ParseESDateToEpochMillis(str, getNow()); ok {
-			return ms
-		}
-		if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
-			return nil
+		} else {
+			if iv, err := strconv.ParseInt(str, 10, 64); err == nil {
+				if b.ESType == "date_nanos" && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
+					return iv / 1_000_000
+				}
+				return iv
+			}
+			if ms, ok := ParseESDateToEpochMillis(str, getNow()); ok {
+				return ms
+			}
+			if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+				return nil
+			}
 		}
 	} else if b.ESType == "boolean" || b.DorisType == DorisBoolean {
 		switch strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", val))) {

@@ -1343,12 +1343,19 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		limit, _ := strconv.Atoi(limitStr)
 		expanded := expandFromClauseRows(baseRows, fromClause, whereClause)
 		byBucket := make(map[string][]map[string]any)
+		seenBucketDoc := make(map[string]bool)
 		var bucketOrder []string
 		for _, row := range expanded {
+			rowID := fmt.Sprintf("%v", row["_id"])
 			for _, bKey := range evalBucketKeyExprs(row, parentBucketExpr) {
 				if bKey == "" {
 					continue
 				}
+				dk := bKey + "\x00" + rowID
+				if seenBucketDoc[dk] {
+					continue
+				}
+				seenBucketDoc[dk] = true
 				if _, exists := byBucket[bKey]; !exists {
 					bucketOrder = append(bucketOrder, bKey)
 				}
@@ -1473,7 +1480,12 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 					byBucket[bKey] = acc
 					bucketOrder = append(bucketOrder, bKey)
 				}
-				val := resolveColumnValue(row, colExpr)
+				var val any
+				if strings.TrimSpace(colExpr) == "*" {
+					val = int64(1)
+				} else {
+					val = resolveColumnValue(row, colExpr)
+				}
 				if val == nil {
 					continue
 				}
@@ -1494,7 +1506,8 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		var out []AggRow
 		for _, bKey := range bucketOrder {
 			acc := byBucket[bKey]
-			if len(acc.nums) == 0 && (fn == "AVG" || fn == "MIN" || fn == "MAX" || fn == "STDDEV_POP" || hasHavingCountGtZero) {
+			hasCount := len(acc.nums) > 0 || (fn == "COUNT" && acc.cnt > 0)
+			if (len(acc.nums) == 0 && (fn == "AVG" || fn == "MIN" || fn == "MAX" || fn == "STDDEV_POP")) || (!hasCount && hasHavingCountGtZero) {
 				continue
 			}
 			var res float64
@@ -1537,12 +1550,16 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 			case "STDDEV_POP":
 				res = computePopStdDev(acc.nums)
 			}
+			weightVal := int64(len(acc.nums))
+			if fn == "COUNT" && weightVal == 0 {
+				weightVal = acc.cnt
+			}
 			out = append(out, AggRow{
 				AggName:   aggName,
 				BucketKey: bKey,
 				DocCount:  int64(res),
 				Value:     res,
-				Weight:    int64(len(acc.nums)),
+				Weight:    weightVal,
 			})
 		}
 		return out

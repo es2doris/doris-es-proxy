@@ -21,7 +21,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -350,18 +349,39 @@ func (b *DorisSQLBackend) GetDocByID(ctx context.Context, dbName, table, id stri
 	safeTable := schema.SanitizeDorisIdentifier(table)
 	// #nosec G201 -- identifiers are strictly sanitized via schema.SanitizeDorisIdentifier
 	q := fmt.Sprintf(
-		"SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` = ? LIMIT 1",
+		"SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` = ? ORDER BY `_version` DESC LIMIT 1",
 		safeDB, safeTable,
 	)
-	var h HitRow
-	var srcStr string
 	// #nosec G701 -- parameterized _id query on strictly sanitized identifier
-	err := b.db.QueryRowContext(ctx, q, id).Scan(&h.ID, &h.Version, &srcStr)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, false, nil
-	}
+	rows, err := b.db.QueryContext(ctx, q, id)
 	if err != nil {
 		return nil, false, err
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return nil, false, err
+		}
+		return nil, false, nil
+	}
+	var h HitRow
+	var srcStr string
+	var delSign sql.NullInt64
+	cols, _ := rows.Columns()
+	if len(cols) >= 4 {
+		if err := rows.Scan(&h.ID, &h.Version, &srcStr, &delSign); err != nil {
+			return nil, false, err
+		}
+	} else {
+		if err := rows.Scan(&h.ID, &h.Version, &srcStr); err != nil {
+			return nil, false, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	if (delSign.Valid && delSign.Int64 != 0) || strings.TrimSpace(srcStr) == "" {
+		return nil, false, nil
 	}
 	h.Source = json.RawMessage(srcStr)
 	h.Score = 1.0
@@ -383,7 +403,7 @@ func (b *DorisSQLBackend) GetDocsByIDs(ctx context.Context, dbName, table string
 	}
 	// #nosec G201 -- identifiers are strictly sanitized and values are bound via ? placeholders
 	q := fmt.Sprintf(
-		"SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` IN (%s)",
+		"SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` IN (%s) ORDER BY `_version` ASC",
 		safeDB, safeTable, strings.Join(placeholders, ","),
 	)
 	// #nosec G701 -- parameterized IN query on strictly sanitized identifier
@@ -392,11 +412,28 @@ func (b *DorisSQLBackend) GetDocsByIDs(ctx context.Context, dbName, table string
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
+	cols, _ := rows.Columns()
+	maxVer := make(map[string]int64, len(ids))
 	for rows.Next() {
 		var h HitRow
 		var srcStr string
-		if err := rows.Scan(&h.ID, &h.Version, &srcStr); err != nil {
-			return nil, err
+		var delSign sql.NullInt64
+		if len(cols) >= 4 {
+			if err := rows.Scan(&h.ID, &h.Version, &srcStr, &delSign); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := rows.Scan(&h.ID, &h.Version, &srcStr); err != nil {
+				return nil, err
+			}
+		}
+		if prevVer, seen := maxVer[h.ID]; seen && h.Version < prevVer {
+			continue
+		}
+		maxVer[h.ID] = h.Version
+		if (delSign.Valid && delSign.Int64 != 0) || strings.TrimSpace(srcStr) == "" {
+			delete(out, h.ID)
+			continue
 		}
 		h.Source = json.RawMessage(srcStr)
 		h.Score = 1.0

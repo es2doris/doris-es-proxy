@@ -209,6 +209,8 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 			}
 			if tb, ok := s.Fields[target]; ok && tb.AliasTarget != "" {
 				target = tb.AliasTarget
+				b.CopyTo[i] = target
+				updatedCopyTo = true
 			}
 			copyToTargets[target] = true
 		}
@@ -559,12 +561,14 @@ func (s *IndexSchema) registerLeafField(
 ) {
 	dorisType := mapESTypeToDoris(prop.Type)
 	esType := strings.ToLower(strings.TrimSpace(prop.Type))
-	if esType == "alias" && prop.Path != "" {
-		s.Fields[dotPath] = FieldBinding{
-			ESFieldPath: dotPath,
-			ESType:      "alias",
-			AliasTarget: prop.Path,
-			NestedPath:  activeNestedRoot,
+	if esType == "alias" {
+		if prop.Path != "" {
+			s.Fields[dotPath] = FieldBinding{
+				ESFieldPath: dotPath,
+				ESType:      "alias",
+				AliasTarget: prop.Path,
+				NestedPath:  activeNestedRoot,
+			}
 		}
 		return
 	}
@@ -762,13 +766,24 @@ func (s *IndexSchema) ExpandFieldPattern(patternWithBoost string) []BoostedField
 		return nil
 	}
 	var matched []BoostedField
+	matchedSet := make(map[string]bool)
 	for k, b := range s.Fields {
 		if b.Kind == StoragePromotedVector {
 			continue
 		}
-		if re.MatchString(k) {
-			matched = append(matched, BoostedField{Field: k, Boost: boost})
+		if b.ESType == "alias" && b.ColumnName == "" && b.Kind != StorageDynamicVariant {
+			continue
 		}
+		if re.MatchString(k) {
+			matchedSet[k] = true
+		}
+	}
+	for k := range matchedSet {
+		b := s.Fields[k]
+		if b.AliasTarget != "" && matchedSet[b.AliasTarget] {
+			continue
+		}
+		matched = append(matched, BoostedField{Field: k, Boost: boost})
 	}
 	if len(matched) == 0 && (pattern == "*" || pattern == "*.keyword") {
 		return []BoostedField{{Field: "_all_text", Boost: boost}}

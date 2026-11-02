@@ -6139,7 +6139,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					} else {
 						rWhere = strings.Join(conds, " AND ")
 					}
-				} else if isArray {
+				} else if isArray || isNestedMultiVal {
 					elemExpr := "CAST(_x AS DOUBLE)"
 					if rngSpec.Script != nil {
 						if scriptExpr, ok := t.compileMetricScriptExprWithOverride(rngSpec.Script, effRField, elemExpr, nil); ok {
@@ -6154,7 +6154,15 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 						elemConds = append(elemConds, fmt.Sprintf("%s < %s", elemExpr, quoteValue(t.coerceRangeAggBoundWithNow(effRField, rngSpec, rng.To, now))))
 					}
 					arrExpr := fmt.Sprintf("`%s`", arrCol)
-					if rngSpec.Missing != nil {
+					if isNestedMultiVal {
+						rawCol := t.sqlColumnRef(effRField, true, nctx)
+						arrExpr = fmt.Sprintf("CAST(%s AS ARRAY<STRING>)", rawCol)
+						if rngSpec.Missing != nil {
+							if mf, ok := t.resolveRangeAggMissingFloat(effRField, rngSpec, now); ok {
+								arrExpr = fmt.Sprintf("CASE WHEN %s IS NULL OR array_size(CAST(%s AS ARRAY<STRING>)) = 0 THEN [%s] ELSE CAST(%s AS ARRAY<STRING>) END", rawCol, rawCol, strconv.FormatFloat(mf, 'f', -1, 64), rawCol)
+							}
+						}
+					} else if rngSpec.Missing != nil {
 						if mf, ok := t.resolveRangeAggMissingFloat(effRField, rngSpec, now); ok {
 							arrExpr = fmt.Sprintf("CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [%s] ELSE `%s` END", arrCol, arrCol, strconv.FormatFloat(mf, 'f', -1, 64), arrCol)
 						}
@@ -7751,6 +7759,9 @@ func (t *Transpiler) resolveSortMissing(s esast.SortSpec, b schema.FieldBinding)
 		return iv, strconv.FormatInt(iv, 10)
 	}
 	if fv, err := strconv.ParseFloat(mStr, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+		if nfv, ok := normalizeScaledFloatValue(b, fv).(float64); ok {
+			fv = nfv
+		}
 		return fv, strconv.FormatFloat(fv, 'f', -1, 64)
 	}
 	if b.EffectiveLowercase(true) {
@@ -7973,6 +7984,7 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 				}
 			}
 			val = normalizeDateNanosValue(effType, val)
+			val = normalizeScaledFloatValue(b, val)
 			sampleForCol := val
 			if sampleForCol == nil {
 				sampleForCol = missSample
@@ -8033,12 +8045,52 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 
 func (t *Transpiler) sqlSortColumnRefWithType(field string, sampleVal any, desc bool, mode string, nested *esast.NestedSortSpec, effType string) string {
 	var sortNCtx *nestedCtx
-	if nested != nil && nested.Path != "" {
-		sortNCtx = &nestedCtx{nestedPath: nested.Path}
+	deepestNestedPath := ""
+	for cur := nested; cur != nil; cur = cur.Nested {
+		if cur.Path != "" {
+			deepestNestedPath = cur.Path
+		}
+	}
+	if deepestNestedPath != "" {
+		sortNCtx = &nestedCtx{nestedPath: deepestNestedPath}
 	}
 	field, b := t.resolveFieldInNestedCtx(field, true, sortNCtx)
 	if effType == "" {
 		effType = b.ESType
+	}
+	buildNestedSortFilterCond := func(leafPath string) string {
+		var conds []string
+		levelIdx := 0
+		for cur := nested; cur != nil; cur = cur.Nested {
+			levelIdx++
+			if cur.Filter == nil {
+				continue
+			}
+			curPath := cur.Path
+			if curPath == "" {
+				curPath = leafPath
+			}
+			if curPath == leafPath {
+				fCompiled := t.CompileQuery(cur.Filter, false, &nestedCtx{nestedPath: leafPath, elemVar: "_el"})
+				if fCompiled.WhereSQL != "" && fCompiled.WhereSQL != "TRUE" {
+					conds = append(conds, fCompiled.WhereSQL)
+				}
+			} else if strings.HasPrefix(leafPath, curPath+".") {
+				ancCorrCol, ok := t.Schema.NestedRoots[curPath]
+				if !ok {
+					ancCorrCol = "n__" + schema.SanitizeDorisIdentifier(curPath)
+				}
+				ancVar := fmt.Sprintf("_el_p%d", levelIdx)
+				fCompiled := t.CompileQuery(cur.Filter, false, &nestedCtx{nestedPath: curPath, elemVar: ancVar})
+				parentCorr := fmt.Sprintf("json_extract_string(_el, '$._parent_id') = json_extract_string(%s, '$._nested_id')", ancVar)
+				ancWhere := parentCorr
+				if fCompiled.WhereSQL != "" && fCompiled.WhereSQL != "TRUE" {
+					ancWhere = fmt.Sprintf("(%s AND %s)", parentCorr, fCompiled.WhereSQL)
+				}
+				conds = append(conds, fmt.Sprintf("array_exists(%s -> %s, `%s`)", ancVar, ancWhere, ancCorrCol))
+			}
+		}
+		return strings.Join(conds, " AND ")
 	}
 	resolveArraySortFn := func() string {
 		switch strings.ToLower(strings.TrimSpace(mode)) {
@@ -8093,27 +8145,22 @@ func (t *Transpiler) sqlSortColumnRefWithType(field string, sampleVal any, desc 
 	case schema.StoragePromotedArray:
 		return formatArraySortExpr(fmt.Sprintf("`%s`", b.EffectiveArrayColumn(true)))
 	case schema.StorageNestedSubfield:
-		if nested != nil && nested.Filter != nil {
-			nestedPath := nested.Path
-			if nestedPath == "" {
-				nestedPath = b.NestedPath
-			}
+		nestedPath := deepestNestedPath
+		if nestedPath == "" {
+			nestedPath = b.NestedPath
+		}
+		if filterCond := buildNestedSortFilterCond(nestedPath); filterCond != "" {
 			corrCol, ok := t.Schema.NestedRoots[nestedPath]
 			if !ok {
 				corrCol = "n__" + schema.SanitizeDorisIdentifier(nestedPath)
 			}
-			fCompiled := t.CompileQuery(nested.Filter, false, &nestedCtx{nestedPath: nestedPath, elemVar: "_el"})
 			relPath := t.nestedRelativeJSONPath(field, true, nestedPath)
-			filteredArr := fmt.Sprintf("array_map(_el -> json_extract_string(_el, %s), array_filter(_el -> %s, `%s`))", quoteStr(relPath), fCompiled.WhereSQL, corrCol)
+			filteredArr := fmt.Sprintf("array_map(_el -> json_extract_string(_el, %s), array_filter(_el -> %s, `%s`))", quoteStr(relPath), filterCond, corrCol)
 			return formatArraySortExpr(filteredArr)
 		}
 		colName := b.EffectiveArrayColumn(true)
 		if colName != "" {
 			return formatArraySortExpr(fmt.Sprintf("`%s`", colName))
-		}
-		nestedPath := b.NestedPath
-		if nested != nil && nested.Path != "" {
-			nestedPath = nested.Path
 		}
 		if nestedPath != "" {
 			corrCol, ok := t.Schema.NestedRoots[nestedPath]
@@ -8126,16 +8173,15 @@ func (t *Transpiler) sqlSortColumnRefWithType(field string, sampleVal any, desc 
 	case schema.StoragePromotedVector:
 		return fmt.Sprintf("element_at(`%s`, 1)", b.ColumnName)
 	}
-	if b.Kind == schema.StorageDynamicVariant && nested != nil && nested.Path != "" {
-		nestedPath := nested.Path
+	if b.Kind == schema.StorageDynamicVariant && deepestNestedPath != "" {
+		nestedPath := deepestNestedPath
 		corrCol, ok := t.Schema.NestedRoots[nestedPath]
 		if !ok {
 			corrCol = "n__" + schema.SanitizeDorisIdentifier(nestedPath)
 		}
 		relPath := t.nestedRelativeJSONPath(field, true, nestedPath)
-		if nested.Filter != nil {
-			fCompiled := t.CompileQuery(nested.Filter, false, &nestedCtx{nestedPath: nestedPath, elemVar: "_el"})
-			filteredArr := fmt.Sprintf("array_map(_el -> json_extract_string(_el, %s), array_filter(_el -> %s, `%s`))", quoteStr(relPath), fCompiled.WhereSQL, corrCol)
+		if filterCond := buildNestedSortFilterCond(nestedPath); filterCond != "" {
+			filteredArr := fmt.Sprintf("array_map(_el -> json_extract_string(_el, %s), array_filter(_el -> %s, `%s`))", quoteStr(relPath), filterCond, corrCol)
 			return formatArraySortExpr(filteredArr)
 		}
 		return formatArraySortExpr(fmt.Sprintf("array_map(_el -> json_extract_string(_el, %s), `%s`)", quoteStr(relPath), corrCol))
@@ -8322,19 +8368,25 @@ func parseMinShouldMatch(v any, numClauses int, defaultOne bool) int {
 		if strings.Contains(s, "<") {
 			parts := strings.Fields(s)
 			activeSpec := ""
-			first := true
+			bestThresh := math.MinInt
+			minThresh := math.MaxInt
+			hasValidThresh := false
 			for _, part := range parts {
 				if idx := strings.IndexByte(part, '<'); idx > 0 {
 					if thresh, err := strconv.Atoi(strings.TrimSpace(part[:idx])); err == nil {
-						if first && numClauses <= thresh {
-							return numClauses
+						hasValidThresh = true
+						if thresh < minThresh {
+							minThresh = thresh
 						}
-						first = false
-						if numClauses > thresh {
+						if numClauses > thresh && thresh >= bestThresh {
+							bestThresh = thresh
 							activeSpec = strings.TrimSpace(part[idx+1:])
 						}
 					}
 				}
+			}
+			if hasValidThresh && numClauses <= minThresh {
+				return numClauses
 			}
 			if activeSpec != "" {
 				s = activeSpec

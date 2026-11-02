@@ -1252,12 +1252,20 @@ func rewriteIngestCtxReferences(s string) string {
 		if (i == 0 || (!isIngestIdentByte(s[i-1]) && s[i-1] != '.')) && strings.HasPrefix(s[i:], "ctx") {
 			rest := s[i+3:]
 			isDirectDot := func(after string) bool {
-				return (strings.HasPrefix(after, "_source") && (len(after) == 7 || !isIngestIdentByte(after[7]))) ||
-					(strings.HasPrefix(after, "_now") && (len(after) == 4 || !isIngestIdentByte(after[4])))
+				for _, kw := range []string{"_source", "_now", "_index", "_id", "_routing", "_version"} {
+					if strings.HasPrefix(after, kw) && (len(after) == len(kw) || !isIngestIdentByte(after[len(kw)])) {
+						return true
+					}
+				}
+				return false
 			}
 			isDirectBracket := func(after string) bool {
-				return strings.HasPrefix(after, "'_source'") || strings.HasPrefix(after, `"_source"`) ||
-					strings.HasPrefix(after, "'_now'") || strings.HasPrefix(after, `"_now"`)
+				for _, kw := range []string{"_source", "_now", "_index", "_id", "_routing", "_version"} {
+					if strings.HasPrefix(after, "'"+kw+"'") || strings.HasPrefix(after, `"`+kw+`"`) {
+						return true
+					}
+				}
+				return false
 			}
 			if strings.HasPrefix(rest, "?.") {
 				after := rest[2:]
@@ -1357,21 +1365,42 @@ func hasTopLevelSemicolonOrReturn(s string) bool {
 	return false
 }
 
+func ingestMetaParamsFromDoc(doc map[string]any) map[string]any {
+	if doc == nil {
+		return nil
+	}
+	params := make(map[string]any, 4)
+	if v, ok := doc["_index"]; ok && v != nil {
+		params["_ctx_index"] = v
+	}
+	if v, ok := doc["_id"]; ok && v != nil {
+		params["_ctx_id"] = v
+	}
+	if v, ok := doc["_routing"]; ok && v != nil {
+		params["_ctx_routing"] = v
+	}
+	if v, ok := doc["_version"]; ok && v != nil {
+		params["_ctx_version"] = v
+	}
+	return params
+}
+
 func evalIngestIfCondition(cond string, doc map[string]any) bool {
 	cond = strings.TrimSpace(cond)
 	if cond == "" {
 		return true
 	}
 	normCond := strings.TrimSpace(rewriteIngestCtxReferences(cond))
+	metaParams := ingestMetaParamsFromDoc(doc)
 	if hasTopLevelSemicolonOrReturn(normCond) {
-		ok, err := painless.EvalFilter(doc, normCond, nil)
+		ok, err := painless.EvalFilter(doc, normCond, metaParams)
 		return err == nil && ok
 	}
 	normCond = strings.TrimSuffix(normCond, ";")
 	script := "if (" + normCond + "\n) { ctx.op = 'index' } else { ctx.op = 'noop' }"
-	opRes, err := painless.EvalPainlessWithOp(doc, script, nil)
+	opRes, err := painless.EvalPainlessWithOp(doc, script, metaParams)
 	if err != nil {
-		ok, fErr := painless.EvalFilter(doc, normCond, nil)
+		ok, fErr := painless.EvalFilter(doc, normCond, metaParams)
 		return fErr == nil && ok
 	}
 	return opRes == "index"
@@ -1478,11 +1507,55 @@ var defaultGrokPatterns = map[string]string{
 var (
 	reGrokToken        = regexp.MustCompile(`%\{([A-Za-z0-9_]+)(?::([A-Za-z0-9_.\-\[\]@]+))?(?::(int|integer|long|float|double|boolean|bool|string))?\}`)
 	reGrokNamedCapture = regexp.MustCompile(`\(\?P?<([A-Za-z0-9_.\-\[\]@]+)(?::(int|integer|long|float|double|boolean|bool|string))?>`)
-	rePositionalGroup  = regexp.MustCompile(`\$([0-9]+)`)
 )
 
 func normalizeGsubReplacement(repl string) string {
-	return rePositionalGroup.ReplaceAllString(repl, "${$1}")
+	var b strings.Builder
+	b.Grow(len(repl) + 8)
+	for i := 0; i < len(repl); i++ {
+		c := repl[i]
+		if c == '\\' && i+1 < len(repl) {
+			next := repl[i+1]
+			if next == '$' {
+				b.WriteString("$$")
+				i++
+				continue
+			}
+			if next == '\\' {
+				b.WriteByte('\\')
+				i++
+				continue
+			}
+		}
+		if c == '$' {
+			if i+1 < len(repl) {
+				next := repl[i+1]
+				if next >= '0' && next <= '9' {
+					j := i + 1
+					for j < len(repl) && repl[j] >= '0' && repl[j] <= '9' {
+						j++
+					}
+					b.WriteString("${")
+					b.WriteString(repl[i+1 : j])
+					b.WriteByte('}')
+					i = j - 1
+					continue
+				}
+				if next == '{' {
+					end := strings.IndexByte(repl[i+2:], '}')
+					if end >= 0 {
+						b.WriteString(repl[i : i+2+end+1])
+						i = i + 2 + end
+						continue
+					}
+				}
+			}
+			b.WriteString("$$")
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
 }
 
 func deepCloneIngestValue(val any) any {
@@ -3905,6 +3978,15 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		params, _ := specMap["params"].(map[string]any)
 		if src != "" {
 			origOpVal, hadOpField := doc["op"]
+			origMetaIndex, _ := doc["_index"].(string)
+			origMetaID := ""
+			if v, ok := doc["_id"]; ok && v != nil {
+				origMetaID = fmt.Sprintf("%v", v)
+			}
+			origMetaRouting := ""
+			if v, ok := doc["_routing"]; ok && v != nil {
+				origMetaRouting = fmt.Sprintf("%v", v)
+			}
 			normSrc := rewriteIngestCtxReferences(src)
 			docBytes, err := json.Marshal(doc)
 			if err == nil {
@@ -3913,6 +3995,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						Source: normSrc,
 						Params: params,
 					},
+					MetaID:            origMetaID,
+					MetaIndex:         origMetaIndex,
+					MetaRouting:       origMetaRouting,
+					AllowMetaMutation: true,
 				}
 				mutatedBytes, opRes, err := painless.ApplyUpdateWithResult(docBytes, upd, true)
 				if err != nil {
@@ -3936,6 +4022,27 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 								if !hadOpField {
 									delete(nextDoc, "op")
 								}
+							}
+						}
+						if upd.MetaIndex != origMetaIndex {
+							if upd.MetaIndex == "" {
+								delete(nextDoc, "_index")
+							} else {
+								nextDoc["_index"] = upd.MetaIndex
+							}
+						}
+						if upd.MetaID != origMetaID {
+							if upd.MetaID == "" {
+								delete(nextDoc, "_id")
+							} else {
+								nextDoc["_id"] = upd.MetaID
+							}
+						}
+						if upd.MetaRouting != origMetaRouting {
+							if upd.MetaRouting == "" {
+								delete(nextDoc, "_routing")
+							} else {
+								nextDoc["_routing"] = upd.MetaRouting
 							}
 						}
 						for k := range doc {
@@ -5234,11 +5341,16 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 				totalMatched++
+				effSrcIdx := srcIdx
+				if effSrcIdx == "__global_sorted__" {
+					effSrcIdx = h.Index
+				}
 				docID := h.ID
 				docDestIdx := destIndex
 				docDestAliasFilter := destAliasFilter
 				docSource := h.Source
 				docSrcVer := h.Version
+				docRouting := s.getDocRouting(effSrcIdx, h.ID)
 				scriptVerSet := false
 				if body.Source.Source != nil {
 					filtered := filterSourceJSON(docSource, body.Source.Source)
@@ -5251,6 +5363,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				if body.Script != nil {
 					updSpec.MetaID = docID
 					updSpec.MetaIndex = docDestIdx
+					updSpec.MetaRouting = docRouting
 					updSpec.MetaVersion = docSrcVer
 					updSpec.MetaVersionNil = false
 					updSpec.MetaVersionMutated = false
@@ -5267,6 +5380,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					} else {
 						docID = esast.NextAutoID()
 					}
+					docRouting = updSpec.MetaRouting
 					if sIdx := strings.TrimSpace(updSpec.MetaIndex); sIdx != "" && sIdx != docDestIdx {
 						resolvedIdx, resolvedFilter, rErr := s.resolveWriteIndexWithFilter(sIdx)
 						if rErr != nil {
@@ -5293,7 +5407,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					}
 					docSource = mutated
 				}
-				pipedDoc, nextDestIdx, nextDocID, pipeRouting, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithRouting(docDestIdx, docID, body.Dest.Pipeline, "", "", docSource)
+				pipedDoc, nextDestIdx, nextDocID, pipeRouting, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithRouting(docDestIdx, docID, body.Dest.Pipeline, "", docRouting, docSource)
 				if pipeErr != nil {
 					writeESError(w, http.StatusBadRequest, "ingest_processor_exception", pipeErr.Error())
 					return
@@ -5859,6 +5973,9 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 	if req.Analyzer == "" {
 		req.Analyzer = r.URL.Query().Get("analyzer")
 	}
+	if req.Normalizer == "" {
+		req.Normalizer = r.URL.Query().Get("normalizer")
+	}
 	if req.Field == "" {
 		req.Field = r.URL.Query().Get("field")
 	}
@@ -5876,6 +5993,9 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 		b := idxSchema.ResolveField(req.Field)
 		if b.Analyzer != "" && analyzer == "" {
 			analyzer = strings.ToLower(b.Analyzer)
+		}
+		if b.LowercaseNormalizer && req.Normalizer == "" {
+			req.Normalizer = "lowercase"
 		}
 		if b.DorisType == schema.DorisVarchar && b.Analyzer == "" && analyzer == "" {
 			analyzer = "keyword"
@@ -5906,7 +6026,11 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 	for _, txt := range texts {
 		if strings.Contains(analyzer, "keyword") || req.Normalizer != "" {
 			tok := txt
-			if strings.Contains(strings.ToLower(req.Normalizer), "lower") || strings.Contains(analyzer, "lower") {
+			normLower := strings.ToLower(strings.TrimSpace(req.Normalizer))
+			switch {
+			case strings.Contains(normLower, "upper") || strings.Contains(analyzer, "upper"):
+				tok = strings.ToUpper(tok)
+			case (normLower != "" && normLower != "none") || strings.Contains(analyzer, "lower"):
 				tok = strings.ToLower(tok)
 			}
 			tokens = append(tokens, map[string]any{
@@ -7303,6 +7427,28 @@ func (s *Server) handleResizeOrCloneIndex(w http.ResponseWriter, r *http.Request
 	aliasesToPersist := make(map[string][]string)
 	s.mu.Lock()
 	s.indices[targetIndex] = compiled
+	if srcRouting := s.docRouting[srcIndex]; len(srcRouting) > 0 {
+		if s.docRouting == nil {
+			s.docRouting = make(map[string]map[string]string)
+		}
+		if s.docRouting[targetIndex] == nil {
+			s.docRouting[targetIndex] = make(map[string]string, len(srcRouting))
+		}
+		for docID, rVal := range srcRouting {
+			s.docRouting[targetIndex][docID] = rVal
+		}
+	}
+	if srcVersions := s.docVersions[srcIndex]; len(srcVersions) > 0 {
+		if s.docVersions == nil {
+			s.docVersions = make(map[string]map[string]int64)
+		}
+		if s.docVersions[targetIndex] == nil {
+			s.docVersions[targetIndex] = make(map[string]int64, len(srcVersions))
+		}
+		for docID, ver := range srcVersions {
+			s.docVersions[targetIndex][docID] = ver
+		}
+	}
 	if hasSrcDef && srcDefPipe != "" {
 		s.indexDefaultPipelines[targetIndex] = srcDefPipe
 	}
