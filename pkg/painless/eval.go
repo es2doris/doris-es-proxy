@@ -3274,9 +3274,17 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			if f, fOk := toFloat64(innerVal); fOk {
 				switch castType {
 				case "short", "Short":
-					return int64(int16(int64(f))), nil
+					v := int64(f) & 0xFFFF
+					if v >= 0x8000 {
+						v -= 0x10000
+					}
+					return v, nil
 				case "byte", "Byte":
-					return int64(int8(int64(f))), nil
+					v := int64(f) & 0xFF
+					if v >= 0x80 {
+						v -= 0x100
+					}
+					return v, nil
 				default:
 					return int64(f), nil
 				}

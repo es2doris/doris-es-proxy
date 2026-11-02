@@ -538,10 +538,12 @@ func TestRound38_F21_F22_F23_F24_F25_PainlessEnhancements(t *testing.T) {
 		l.addAll(1, ['y1', 'y2']);
 		int codeA = (int) 'A';
 		String chB = (char) 66;
+		int sh = (short) 65535;
+		int by = (byte) 255;
 		ZonedDateTime zdt = ZonedDateTime.parse("2026-03-15T10:20:30Z").plusYears(1).plusMonths(2).minusDays(5).withHour(8).truncatedTo(ChronoUnit.HOURS);
-		return m['a'] + "|" + remFalse + "|" + remTrue + "|" + String.join(",", l) + "|" + codeA + "|" + chB + "|" + zdt.getYear() + "-" + zdt.getMonthValue() + "-" + zdt.getDayOfMonth() + "T" + zdt.getHour() + ":" + zdt.getMinute();
+		return m['a'] + "|" + remFalse + "|" + remTrue + "|" + String.join(",", l) + "|" + codeA + "|" + chB + "|" + sh + "|" + by + "|" + zdt.getYear() + "-" + zdt.getMonthValue() + "-" + zdt.getDayOfMonth() + "T" + zdt.getHour() + ":" + zdt.getMinute();
 	`, nil)
-	if err != nil || miscVal != "20|false|true|x,y1,y2,z|65|B|2027-5-10T8:0" {
+	if err != nil || miscVal != "20|false|true|x,y1,y2,z|65|B|-1|-1|2027-5-10T8:0" {
 		t.Fatalf("unexpected F24/F25 evaluation result: val=%v err=%v", miscVal, err)
 	}
 }
