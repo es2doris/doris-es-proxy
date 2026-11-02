@@ -1770,4 +1770,36 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	if len(r36SimDoc["arr_lines"].([]any)) != 3 || len(r36SimDoc["tok"].([]any)) != 2 || r36SimDoc["elvis_ok"] != true {
 		t.Fatalf("unexpected R36 simulated doc: %+v", r36SimDoc)
 	}
+
+	// Step 30: Round-37 Red-Team & Coverage Hardening E2E Checks
+	r37SimResp, err := http.Post(ts.URL+"/_ingest/pipeline/_simulate", "application/json", strings.NewReader(`{
+		"pipeline": {
+			"processors": [
+				{"dedup": {"field": "tags", "target_field": "unique_tags"}},
+				{"compact": {"field": "meta"}},
+				{"script": {"source": "int bump(int v) { return v + 10; } ctx.bumped = bump(5); def p = /^([a-z]+)-(\\d+)$/; def m = p.matcher(ctx.code); if (m.matches()) { ctx.prefix = m.group(1); } ctx.has_now = (ctx._now != null);"}}
+			]
+		},
+		"docs": [
+			{
+				"_index": "live_auto_index",
+				"_id": "r37-sim-1",
+				"_source": {
+					"tags": ["a", "b", "a"],
+					"meta": {"keep": "ok", "drop_null": null, "drop_empty": ""},
+					"code": "ord-99"
+				}
+			}
+		]
+	}`))
+	if err != nil || r37SimResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /_ingest/pipeline/_simulate (R37) failed: status=%v err=%v", r37SimResp.StatusCode, err)
+	}
+	var r37SimRes map[string]any
+	_ = json.NewDecoder(r37SimResp.Body).Decode(&r37SimRes)
+	_ = r37SimResp.Body.Close()
+	r37SimDoc := r37SimRes["docs"].([]any)[0].(map[string]any)["doc"].(map[string]any)["_source"].(map[string]any)
+	if len(r37SimDoc["unique_tags"].([]any)) != 2 || r37SimDoc["bumped"].(float64) != 15 || r37SimDoc["prefix"] != "ord" || r37SimDoc["has_now"] != true {
+		t.Fatalf("unexpected R37 simulated doc: %+v", r37SimDoc)
+	}
 }

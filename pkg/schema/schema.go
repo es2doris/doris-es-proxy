@@ -177,6 +177,13 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 		changed := false
 		for k, b := range s.Fields {
 			if b.AliasTarget != "" {
+				if _, ok := s.Fields[b.AliasTarget]; !ok && b.NestedPath != "" {
+					if _, rOK := s.Fields[b.NestedPath+"."+b.AliasTarget]; rOK {
+						b.AliasTarget = b.NestedPath + "." + b.AliasTarget
+						s.Fields[k] = b
+						changed = true
+					}
+				}
 				if tb, ok := s.Fields[b.AliasTarget]; ok && tb.AliasTarget != "" && tb.AliasTarget != b.AliasTarget {
 					b.AliasTarget = tb.AliasTarget
 					s.Fields[k] = b
@@ -243,6 +250,7 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 					aliased := tb
 					aliased.ESFieldPath = k
 					aliased.AliasTarget = b.AliasTarget
+					aliased.CopyTo = nil
 					s.Fields[k] = aliased
 					changed = true
 				}
@@ -261,6 +269,7 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 				aliased := tb
 				aliased.ESFieldPath = k
 				aliased.AliasTarget = b.AliasTarget
+				aliased.CopyTo = nil
 				s.Fields[k] = aliased
 				continue
 			}
@@ -315,12 +324,14 @@ func MergeMappingSpecs(oldSpec, newSpec *esast.MappingSpec) *esast.MappingSpec {
 	if oldSpec == nil {
 		return &esast.MappingSpec{
 			Dynamic:    newSpec.Dynamic,
+			Routing:    newSpec.Routing,
 			Properties: DeepMergeMappingProperties(nil, newSpec.Properties),
 		}
 	}
 	if newSpec == nil {
 		return &esast.MappingSpec{
 			Dynamic:    oldSpec.Dynamic,
+			Routing:    oldSpec.Routing,
 			Properties: DeepMergeMappingProperties(nil, oldSpec.Properties),
 		}
 	}
@@ -328,8 +339,13 @@ func MergeMappingSpecs(oldSpec, newSpec *esast.MappingSpec) *esast.MappingSpec {
 	if newSpec.Dynamic != nil {
 		dyn = newSpec.Dynamic
 	}
+	rt := oldSpec.Routing
+	if newSpec.Routing != nil {
+		rt = newSpec.Routing
+	}
 	return &esast.MappingSpec{
 		Dynamic:    dyn,
+		Routing:    rt,
 		Properties: DeepMergeMappingProperties(oldSpec.Properties, newSpec.Properties),
 	}
 }
@@ -402,6 +418,9 @@ func DeepMergeMappingProperties(
 			}
 			if v.IgnoreMalformed != nil {
 				merged.IgnoreMalformed = v.IgnoreMalformed
+			}
+			if v.Dynamic != nil {
+				merged.Dynamic = v.Dynamic
 			}
 			if len(v.Properties) > 0 {
 				merged.Properties = DeepMergeMappingProperties(existing.Properties, v.Properties)
@@ -545,6 +564,7 @@ func (s *IndexSchema) registerLeafField(
 			ESFieldPath: dotPath,
 			ESType:      "alias",
 			AliasTarget: prop.Path,
+			NestedPath:  activeNestedRoot,
 		}
 		return
 	}
@@ -869,6 +889,9 @@ func inferObjectProperties(obj map[string]any, dst map[string]esast.FieldPropert
 			if subMap, isMap := val.(map[string]any); isMap {
 				if depth+1 < maxInferredDepth {
 					inferObjectProperties(subMap, existing.Properties, depth+1, totalFields)
+					if existing.MultiValued {
+						markPropertyMultiValued(&existing)
+					}
 					dst[k] = existing
 				}
 				continue
@@ -1003,6 +1026,7 @@ func inferValueProperty(val any, depth int, totalFields *int) (esast.FieldProper
 
 func markPropertyMultiValued(fp *esast.FieldProperty) {
 	if len(fp.Properties) > 0 {
+		fp.MultiValued = true
 		for k, sub := range fp.Properties {
 			markPropertyMultiValued(&sub)
 			fp.Properties[k] = sub
@@ -1029,9 +1053,16 @@ func mergeFieldProperty(existing, incoming esast.FieldProperty) esast.FieldPrope
 			}
 		}
 		existing.MultiValued = mv
+		if mv {
+			markPropertyMultiValued(&existing)
+		}
 		return existing
 	}
 	if existing.Type == incoming.Type {
+		if (existing.Type == "dense_vector" || existing.Type == "knn_vector") &&
+			(existing.EffectiveDims() != incoming.EffectiveDims() || mv) {
+			return esast.FieldProperty{Type: "double", MultiValued: true}
+		}
 		existing.MultiValued = mv
 		if mv {
 			existing.Fields = nil
@@ -1046,8 +1077,14 @@ func mergeFieldProperty(existing, incoming esast.FieldProperty) esast.FieldPrope
 		existing.MultiValued = mv
 		return existing
 	}
-	// Widening rules: long + double -> double; keyword + text -> text (with .keyword); incompatible scalars -> keyword/text
-	if (existing.Type == "long" && incoming.Type == "double") || (existing.Type == "double" && incoming.Type == "long") {
+	// Widening rules: long + double -> double; dense_vector + numeric -> multi-valued double; keyword + text -> text (with .keyword); incompatible scalars -> keyword/text
+	isNumericOrVec := func(t string) bool {
+		return t == "long" || t == "double" || t == "dense_vector" || t == "knn_vector"
+	}
+	if isNumericOrVec(existing.Type) && isNumericOrVec(incoming.Type) {
+		if existing.Type == "dense_vector" || existing.Type == "knn_vector" || incoming.Type == "dense_vector" || incoming.Type == "knn_vector" {
+			return esast.FieldProperty{Type: "double", MultiValued: true}
+		}
 		return esast.FieldProperty{Type: "double", MultiValued: mv}
 	}
 	isStringType := func(t string) bool {

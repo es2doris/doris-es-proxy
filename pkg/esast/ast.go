@@ -300,6 +300,7 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 		return nil
 	}
 	// Support OpenSearch knn syntax: {"<field>": {"vector": [...], "k": 5, "filter": {...}}}
+	cleaned, mapBoost := stripNamedQueryAndMapBoost(trimmed, false)
 	var byField map[string]struct {
 		Vector        []float64  `json:"vector"`
 		QueryVector   []float64  `json:"query_vector"`
@@ -309,10 +310,13 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 		Boost         *float64   `json:"boost"`
 		Filter        QuerySlice `json:"filter"`
 	}
-	if err := json.Unmarshal(trimmed, &byField); err != nil {
+	if err := json.Unmarshal(cleaned, &byField); err != nil {
 		return err
 	}
 	for field, spec := range byField {
+		if field == "_name" || field == "boost" {
+			continue
+		}
 		vec := spec.Vector
 		if len(vec) == 0 {
 			vec = spec.QueryVector
@@ -322,7 +326,11 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 		kq.K = spec.K
 		kq.NumCandidates = spec.NumCandidates
 		kq.Similarity = spec.Similarity
-		kq.Boost = spec.Boost
+		if spec.Boost != nil {
+			kq.Boost = spec.Boost
+		} else {
+			kq.Boost = mapBoost
+		}
 		kq.Filter = spec.Filter
 		break
 	}
@@ -618,11 +626,23 @@ func stripNamedQueryAndMapBoost(rawClause json.RawMessage, requireMultipleKeysFo
 		tb := bytes.TrimSpace(rawBoost)
 		if len(tb) > 0 && tb[0] != '{' {
 			var b float64
+			parsed := false
 			if json.Unmarshal(tb, &b) == nil {
-				mapBoost = &b
+				parsed = true
+			} else if tb[0] == '"' {
+				var s string
+				if json.Unmarshal(tb, &s) == nil {
+					if fv, err := strconv.ParseFloat(strings.TrimSpace(s), 64); err == nil {
+						b = fv
+						parsed = true
+					}
+				}
 			}
-			delete(m, "boost")
-			modified = true
+			if parsed && !math.IsNaN(b) && !math.IsInf(b, 0) && b >= 0 {
+				mapBoost = &b
+				delete(m, "boost")
+				modified = true
+			}
 		}
 	}
 	if !modified {
@@ -2657,14 +2677,21 @@ func (t *IndexTemplateRequest) EffectiveAliases() map[string]map[string]any {
 	return t.Aliases
 }
 
+// RoutingMetaSpec models the `_routing` block in an Elasticsearch mapping.
+type RoutingMetaSpec struct {
+	Required bool `json:"required,omitempty"`
+}
+
 // MappingSpec models an Elasticsearch `_mapping` payload.
 type MappingSpec struct {
 	Dynamic    any                      `json:"dynamic,omitempty"`
+	Routing    *RoutingMetaSpec         `json:"_routing,omitempty"`
 	Properties map[string]FieldProperty `json:"properties,omitempty"`
 }
 
 type FieldProperty struct {
 	Type            string                   `json:"type,omitempty"`
+	Dynamic         any                      `json:"dynamic,omitempty"`
 	Path            string                   `json:"path,omitempty"`
 	Analyzer        string                   `json:"analyzer,omitempty"`
 	SearchAnalyzer  string                   `json:"search_analyzer,omitempty"`

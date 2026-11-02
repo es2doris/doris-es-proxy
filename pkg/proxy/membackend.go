@@ -217,9 +217,10 @@ func (m *MemoryBackend) GetDocsByIDs(_ context.Context, _, table string, ids []s
 }
 
 var (
-	reHitsSQL          = regexp.MustCompile(`(?s)^SELECT ` + "`_id`, `_version`, `_source`, CAST\\((.+) AS DOUBLE\\) AS `_score`, (COUNT\\(\\*\\) OVER\\(\\)|CAST\\(-1 AS BIGINT\\)) AS `_total_hits` FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0 AND (.+) ORDER BY (.+) LIMIT (\\d+) OFFSET (\\d+)$")
-	reCollapsedHitsSQL = regexp.MustCompile(`(?s)^SELECT ` + "`_id`, `_version`, `_source`, `_score`, `_total_hits` FROM \\(SELECT \\*, ROW_NUMBER\\(\\) OVER \\(PARTITION BY (.+?) ORDER BY .+\\) AS `_collapse_rn` FROM \\(SELECT \\*, CAST\\((.+) AS DOUBLE\\) AS `_score`, (COUNT\\(\\*\\) OVER\\(\\)|CAST\\(-1 AS BIGINT\\)) AS `_total_hits` FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0 AND (.+)\\) `_scored`\\) `_collapsed` WHERE (?:\\()?`_collapse_rn` = 1(?: OR .+? IS NULL)?(?:\\) AND \\((.+)\\))? ORDER BY (.+) LIMIT (\\d+) OFFSET (\\d+)$")
-	reCTEBase          = regexp.MustCompile(`(?s)^WITH ` + "`base_matched` AS \\(SELECT \\* FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0(?: AND \\((.+?)\\))?\\)\n(.+)$")
+	reHitsSQL            = regexp.MustCompile(`(?s)^SELECT ` + "`_id`, `_version`, `_source`, CAST\\((.+) AS DOUBLE\\) AS `_score`, (COUNT\\(\\*\\) OVER\\(\\)|CAST\\(-1 AS BIGINT\\)) AS `_total_hits` FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0 AND (.+) ORDER BY (.+) LIMIT (\\d+) OFFSET (\\d+)$")
+	reSearchAfterHitsSQL = regexp.MustCompile(`(?s)^SELECT ` + "`_id`, `_version`, `_source`, `_score`, `_total_hits` FROM \\(SELECT \\*, CAST\\((.+) AS DOUBLE\\) AS `_score`, (COUNT\\(\\*\\) OVER\\(\\)|CAST\\(-1 AS BIGINT\\)) AS `_total_hits` FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0 AND (.+)\\) `_scored` WHERE (.+) ORDER BY (.+) LIMIT (\\d+) OFFSET (\\d+)$")
+	reCollapsedHitsSQL   = regexp.MustCompile(`(?s)^SELECT ` + "`_id`, `_version`, `_source`, `_score`, `_total_hits` FROM \\(SELECT \\*, ROW_NUMBER\\(\\) OVER \\(PARTITION BY (.+?) ORDER BY .+\\) AS `_collapse_rn` FROM \\(SELECT \\*, CAST\\((.+) AS DOUBLE\\) AS `_score`, (COUNT\\(\\*\\) OVER\\(\\)|CAST\\(-1 AS BIGINT\\)) AS `_total_hits` FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0 AND (.+)\\) `_scored`\\) `_collapsed` WHERE (?:\\()?`_collapse_rn` = 1(?: OR .+? IS NULL)?(?:\\) AND \\((.+)\\))? ORDER BY (.+) LIMIT (\\d+) OFFSET (\\d+)$")
+	reCTEBase            = regexp.MustCompile(`(?s)^WITH ` + "`base_matched` AS \\(SELECT \\* FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0(?: AND \\((.+?)\\))?\\)\n(.+)$")
 )
 
 func parseOrderSpec(spec string) (colExpr string, desc bool, nullsFirst bool) {
@@ -283,6 +284,15 @@ func (m *MemoryBackend) QueryHits(_ context.Context, sqlStr string) ([]HitRow, e
 		orderByClause = sub[5]
 		limit, _ = strconv.Atoi(sub[6])
 		offset, _ = strconv.Atoi(sub[7])
+	} else if ssub := reSearchAfterHitsSQL.FindStringSubmatch(sqlStr); ssub != nil {
+		scoreExpr = ssub[1]
+		totalExpr = ssub[2]
+		tableName = ssub[3]
+		mainWhere, postWhere = splitHitsWhereBody(ssub[4])
+		collapseSearchAfterWhere = ssub[5]
+		orderByClause = ssub[6]
+		limit, _ = strconv.Atoi(ssub[7])
+		offset, _ = strconv.Atoi(ssub[8])
 	} else if csub := reCollapsedHitsSQL.FindStringSubmatch(sqlStr); csub != nil {
 		collapseCol = csub[1]
 		scoreExpr = csub[2]
@@ -380,32 +390,31 @@ func (m *MemoryBackend) QueryHits(_ context.Context, sqlStr string) ([]HitRow, e
 			case []any:
 				cVal = nil
 				for _, el := range s {
-					if el != nil {
+					if el == nil {
+						continue
+					}
+					if cVal == nil || compareAny(el, cVal) < 0 {
 						cVal = el
-						break
 					}
 				}
 			case []string:
 				cVal = nil
 				for _, el := range s {
-					if el != "" {
+					if cVal == nil || compareAny(el, cVal) < 0 {
 						cVal = el
-						break
 					}
 				}
 			}
 			if cVal != nil {
 				cKey := fmt.Sprintf("%v", cVal)
-				if cKey != "" {
-					if seenCollapse[cKey] {
-						continue
-					}
-					seenCollapse[cKey] = true
+				if seenCollapse[cKey] {
+					continue
 				}
+				seenCollapse[cKey] = true
 			}
-			if collapseSearchAfterWhere != "" && !evalWhereExpr(matchedRows[idx], collapseSearchAfterWhere) {
-				continue
-			}
+		}
+		if collapseSearchAfterWhere != "" && !evalWhereExpr(matchedRows[idx], collapseSearchAfterWhere) {
+			continue
 		}
 		sortedHits = append(sortedHits, hits[idx])
 	}
@@ -1394,9 +1403,6 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
-		if limit > 0 && len(keys) > limit {
-			keys = keys[:limit]
-		}
 		var out []AggRow
 		for _, k := range keys {
 			out = append(out, AggRow{
@@ -1405,6 +1411,10 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				DocCount:  counts[k],
 				Value:     float64(counts[k]),
 			})
+		}
+		out = filterHaving(out)
+		if limit > 0 && len(out) > limit {
+			out = out[:limit]
 		}
 		return out
 	}
@@ -1596,24 +1606,6 @@ func sortRowsByOrderClause(rows []map[string]any, orderByClause string) {
 	})
 }
 
-func evalCompositeKeyExpr(row map[string]any, expr string) string {
-	expr = strings.TrimSpace(expr)
-	if strings.HasPrefix(expr, "CONCAT_WS('\\x1f', ") && strings.HasSuffix(expr, ")") {
-		inner := expr[len("CONCAT_WS('\\x1f', ") : len(expr)-1]
-		args := splitTopLevelArgs(inner)
-		parts := make([]string, 0, len(args))
-		for _, a := range args {
-			p := evalBucketKeyExpr(row, a)
-			if p == "" {
-				return ""
-			}
-			parts = append(parts, p)
-		}
-		return strings.Join(parts, "\x1f")
-	}
-	return evalBucketKeyExpr(row, expr)
-}
-
 var (
 	reLateralViewExplode = regexp.MustCompile("LATERAL VIEW EXPLODE\\((?:(CASE WHEN )`([^`]+)` IS NULL.+?END|`([^`]+)`)\\) `[^`]+` AS `([^`]+)`")
 	reDedupSelectInner   = regexp.MustCompile("^SELECT DISTINCT `_id` AS `_rn_id(?:_\\d+)?`, (.+?) AS `(_rn_bkey(?:_\\d+)?)` FROM (.+)$")
@@ -1714,7 +1706,7 @@ func expandFromClauseRows(baseRows []map[string]any, fromClause, whereClause str
 		var deduped []map[string]any
 		for _, r := range innerRows {
 			idStr := fmt.Sprintf("%v", r["_id"])
-			bKey := evalCompositeKeyExpr(r, innerBucketExpr)
+			bKey := evalBucketKeyExpr(r, innerBucketExpr)
 			if bKey == "" {
 				continue
 			}
@@ -1960,7 +1952,10 @@ func evalBucketKeyExpr(row map[string]any, expr string) string {
 		return unquoteSQLLiteral(expr)
 	}
 	if strings.HasPrefix(expr, "CONCAT_WS('\\x1f', ") && strings.HasSuffix(expr, ")") {
-		return evalCompositeKeyExpr(row, expr)
+		if vals := evalBucketKeyExprs(row, expr); len(vals) > 0 {
+			return vals[0]
+		}
+		return ""
 	}
 	if strings.HasPrefix(expr, "CONCAT(") && strings.HasSuffix(expr, ")") {
 		inner := expr[len("CONCAT(") : len(expr)-1]
@@ -2744,7 +2739,14 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 func resolveColumnValue(row map[string]any, colExpr string) any {
 	colExpr = trimOuterParens(strings.TrimSpace(colExpr))
 	if strings.HasPrefix(colExpr, "CONCAT_WS('\\x1f', ") && strings.HasSuffix(colExpr, ")") {
-		return evalCompositeKeyExpr(row, colExpr)
+		vals := evalBucketKeyExprs(row, colExpr)
+		if len(vals) == 1 {
+			return vals[0]
+		}
+		if len(vals) > 1 {
+			return vals
+		}
+		return nil
 	}
 	if strings.HasPrefix(colExpr, "`") && strings.HasSuffix(colExpr, "`") {
 		colName := strings.Trim(colExpr, "`")
@@ -3002,6 +3004,13 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 				}
 			}
 			srcStr, _ := row["_source"].(string)
+			if docVal, hasDoc := row["_doc"]; hasDoc && docVal != nil {
+				if docStr, ok := docVal.(string); ok {
+					srcStr = docStr
+				} else if docBytes, err := json.Marshal(docVal); err == nil {
+					srcStr = string(docBytes)
+				}
+			}
 			res := extractJSONPathFromStr(srcStr, segs)
 			if res == nil && len(segs) == 1 && segs[0] == "_ignored" {
 				res = row["_ignored"]
@@ -3190,16 +3199,6 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			_, _ = fmt.Fprintf(&sb, "%v", v)
 		}
 		return sb.String()
-	}
-	if strings.HasPrefix(colExpr, "CONCAT_WS('\\x1f', ") && strings.HasSuffix(colExpr, ")") {
-		vals := evalBucketKeyExprs(row, colExpr)
-		if len(vals) == 1 {
-			return vals[0]
-		}
-		if len(vals) > 1 {
-			return vals
-		}
-		return nil
 	}
 	if (strings.HasPrefix(colExpr, "LENGTH(") || strings.HasPrefix(colExpr, "CHAR_LENGTH(")) && strings.HasSuffix(colExpr, ")") {
 		isCharLen := strings.HasPrefix(colExpr, "CHAR_LENGTH(")

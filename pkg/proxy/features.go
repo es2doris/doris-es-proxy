@@ -1082,10 +1082,10 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) applyIngestPipelineForWriteWithMeta(pipelineID, indexName, docID string, raw json.RawMessage) (json.RawMessage, string, string, bool, error) {
+func (s *Server) applyIngestPipelineForWriteWithRouting(pipelineID, indexName, docID, initialRouting string, raw json.RawMessage) (json.RawMessage, string, string, string, bool, error) {
 	pipelineID = strings.TrimSpace(pipelineID)
 	if pipelineID == "" || len(bytes.TrimSpace(raw)) == 0 {
-		return raw, indexName, docID, false, nil
+		return raw, indexName, docID, initialRouting, false, nil
 	}
 	s.mu.RLock()
 	pipe, ok := s.pipelines[pipelineID]
@@ -1097,13 +1097,13 @@ func (s *Server) applyIngestPipelineForWriteWithMeta(pipelineID, indexName, docI
 		s.mu.RUnlock()
 	}
 	if !ok || pipe == nil {
-		return raw, indexName, docID, false, nil
+		return raw, indexName, docID, initialRouting, false, nil
 	}
-	out, outIdx, outID, dropped, _, err := applyIngestPipelineSpecVerboseWithMeta(s, pipe, indexName, docID, raw, false)
-	return out, outIdx, outID, dropped, err
+	out, outIdx, outID, _, outRouting, dropped, _, err := applyIngestPipelineSpecWithRouting(s, pipe, indexName, docID, initialRouting, raw, false)
+	return out, outIdx, outID, outRouting, dropped, err
 }
 
-func (s *Server) applyEffectiveAndFinalPipelinesWithMeta(indexName, docID, reqPipeline, defaultPipeline string, raw json.RawMessage) (json.RawMessage, string, string, bool, error) {
+func (s *Server) applyEffectiveAndFinalPipelinesWithRouting(indexName, docID, reqPipeline, defaultPipeline, initialRouting string, raw json.RawMessage) (json.RawMessage, string, string, string, bool, error) {
 	effPipeline := s.resolveEffectivePipeline(indexName, reqPipeline, defaultPipeline)
 	if effPipeline == "" && s != nil {
 		if resolved, _, wErr := s.resolveWriteIndexWithFilter(indexName); wErr == nil && resolved != "" && resolved != indexName {
@@ -1113,10 +1113,11 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithMeta(indexName, docID, reqPi
 	cur := raw
 	curIndex := indexName
 	curID := docID
+	curRouting := initialRouting
 	if effPipeline != "" {
-		next, nextIdx, nextID, dropped, err := s.applyIngestPipelineForWriteWithMeta(effPipeline, curIndex, curID, cur)
+		next, nextIdx, nextID, nextRouting, dropped, err := s.applyIngestPipelineForWriteWithRouting(effPipeline, curIndex, curID, curRouting, cur)
 		if err != nil || dropped {
-			return next, nextIdx, nextID, dropped, err
+			return next, nextIdx, nextID, nextRouting, dropped, err
 		}
 		cur = next
 		if nextIdx != "" {
@@ -1125,6 +1126,7 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithMeta(indexName, docID, reqPi
 		if nextID != "" {
 			curID = nextID
 		}
+		curRouting = nextRouting
 	}
 	finalPipeline := s.resolveFinalPipeline(curIndex)
 	if finalPipeline == "" && s != nil {
@@ -1138,9 +1140,9 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithMeta(indexName, docID, reqPi
 		}
 	}
 	if finalPipeline != "" {
-		next, nextIdx, nextID, dropped, err := s.applyIngestPipelineForWriteWithMeta(finalPipeline, curIndex, curID, cur)
+		next, nextIdx, nextID, nextRouting, dropped, err := s.applyIngestPipelineForWriteWithRouting(finalPipeline, curIndex, curID, curRouting, cur)
 		if err != nil || dropped {
-			return next, nextIdx, nextID, dropped, err
+			return next, nextIdx, nextID, nextRouting, dropped, err
 		}
 		cur = next
 		if nextIdx != "" {
@@ -1149,8 +1151,9 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithMeta(indexName, docID, reqPi
 		if nextID != "" {
 			curID = nextID
 		}
+		curRouting = nextRouting
 	}
-	return cur, curIndex, curID, false, nil
+	return cur, curIndex, curID, curRouting, false, nil
 }
 
 func isIngestIdentByte(c byte) bool {
@@ -1248,31 +1251,38 @@ func rewriteIngestCtxReferences(s string) string {
 		}
 		if (i == 0 || (!isIngestIdentByte(s[i-1]) && s[i-1] != '.')) && strings.HasPrefix(s[i:], "ctx") {
 			rest := s[i+3:]
+			isDirectDot := func(after string) bool {
+				return (strings.HasPrefix(after, "_source") && (len(after) == 7 || !isIngestIdentByte(after[7]))) ||
+					(strings.HasPrefix(after, "_now") && (len(after) == 4 || !isIngestIdentByte(after[4])))
+			}
+			isDirectBracket := func(after string) bool {
+				return strings.HasPrefix(after, "'_source'") || strings.HasPrefix(after, `"_source"`) ||
+					strings.HasPrefix(after, "'_now'") || strings.HasPrefix(after, `"_now"`)
+			}
 			if strings.HasPrefix(rest, "?.") {
 				after := rest[2:]
-				if !strings.HasPrefix(after, "_source") || (len(after) > 7 && isIngestIdentByte(after[7])) {
+				if !isDirectDot(after) {
 					out.WriteString("ctx?._source.")
 					i += 4
 					continue
 				}
 			} else if strings.HasPrefix(rest, ".") {
 				after := rest[1:]
-				isSource := strings.HasPrefix(after, "_source") && (len(after) == 7 || !isIngestIdentByte(after[7]))
-				if !isSource {
+				if !isDirectDot(after) {
 					out.WriteString("ctx._source.")
 					i += 3
 					continue
 				}
 			} else if strings.HasPrefix(rest, "?[") {
 				after := strings.TrimSpace(rest[2:])
-				if !strings.HasPrefix(after, "'_source'") && !strings.HasPrefix(after, `"_source"`) {
+				if !isDirectBracket(after) {
 					out.WriteString("ctx?._source[")
 					i += 4
 					continue
 				}
 			} else if strings.HasPrefix(rest, "[") {
 				after := strings.TrimSpace(rest[1:])
-				if !strings.HasPrefix(after, "'_source'") && !strings.HasPrefix(after, `"_source"`) {
+				if !isDirectBracket(after) {
 					out.WriteString("ctx._source[")
 					i += 3
 					continue
@@ -3266,37 +3276,57 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		if tf, _ := specMap["target_field"].(string); tf != "" {
 			target = expandIngestFieldName(tf, doc)
 		}
+		ignoreMissing, _ := specMap["ignore_missing"].(bool)
 		if field != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
 				switch v := val.(type) {
 				case []any:
-					out := make([]any, 0, len(v))
-					for _, el := range v {
-						if el == nil || el == "" {
-							continue
-						}
-						out = append(out, el)
-					}
-					setIngestPath(doc, target, out)
+					setIngestPath(doc, target, compactIngestSlice(v))
 					mutated = true
 				case map[string]any:
-					out := make(map[string]any, len(v))
-					for k, el := range v {
-						if el == nil || el == "" {
-							continue
-						}
-						if mEl, ok := el.(map[string]any); ok && len(mEl) == 0 {
-							continue
-						}
-						if sEl, ok := el.([]any); ok && len(sEl) == 0 {
-							continue
-						}
-						out[k] = el
-					}
-					setIngestPath(doc, target, out)
+					setIngestPath(doc, target, compactIngestMap(v))
 					mutated = true
+				default:
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is neither an array nor an object", field)
 				}
-			} else if isExplicitIgnoreMissingFalse(specMap) {
+			} else if !ignoreMissing {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+			}
+		}
+	case "dedup", "dedupe":
+		field, _ := specMap["field"].(string)
+		field = expandIngestFieldName(field, doc)
+		target := field
+		if tf, _ := specMap["target_field"].(string); tf != "" {
+			target = expandIngestFieldName(tf, doc)
+		}
+		ignoreMissing, _ := specMap["ignore_missing"].(bool)
+		ignoreEmpty, _ := specMap["ignore_empty"].(bool)
+		if field != "" {
+			if val, exists := getIngestPath(doc, field); exists && val != nil {
+				arr, ok := val.([]any)
+				if !ok {
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not an array", field)
+				}
+				deduped := make([]any, 0, len(arr))
+				for _, el := range arr {
+					if ignoreEmpty && (el == nil || el == "") {
+						continue
+					}
+					seen := false
+					for _, prev := range deduped {
+						if ingestValuesEqual(prev, el) {
+							seen = true
+							break
+						}
+					}
+					if !seen {
+						deduped = append(deduped, el)
+					}
+				}
+				setIngestPath(doc, target, deduped)
+				mutated = true
+			} else if !ignoreMissing {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
 		}
@@ -3923,6 +3953,55 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 	return mutated, false, procType, procTag, specMap, nil
 }
 
+func compactIngestMap(v map[string]any) map[string]any {
+	out := make(map[string]any, len(v))
+	for k, el := range v {
+		if cEl, keep := compactIngestElement(el); keep {
+			out[k] = cEl
+		}
+	}
+	return out
+}
+
+func compactIngestSlice(v []any) []any {
+	out := make([]any, 0, len(v))
+	for _, el := range v {
+		if cEl, keep := compactIngestElement(el); keep {
+			out = append(out, cEl)
+		}
+	}
+	return out
+}
+
+func compactIngestElement(el any) (any, bool) {
+	if el == nil || el == "" {
+		return nil, false
+	}
+	switch sub := el.(type) {
+	case map[string]any:
+		cm := compactIngestMap(sub)
+		if len(cm) == 0 {
+			return nil, false
+		}
+		return cm, true
+	case []any:
+		cs := compactIngestSlice(sub)
+		if len(cs) == 0 {
+			return nil, false
+		}
+		return cs, true
+	default:
+		return el, true
+	}
+}
+
+func shredErrorType(err error) string {
+	if err != nil && strings.HasPrefix(err.Error(), "strict_dynamic_mapping_exception:") {
+		return "strict_dynamic_mapping_exception"
+	}
+	return "mapper_parsing_exception"
+}
+
 func snapshotIngestDoc(doc map[string]any) map[string]any {
 	raw, err := json.Marshal(doc)
 	if err != nil {
@@ -3932,7 +4011,7 @@ func snapshotIngestDoc(doc map[string]any) map[string]any {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	_ = dec.Decode(&cp)
-	if im, ok := doc["_ingest"].(map[string]any); ok {
+	if im, ok := doc["__internal_ingest_orig"].(map[string]any); ok {
 		if b, ok := im["_had_orig_index"].(bool); ok {
 			if b {
 				cp["_index"] = im["_orig_index_val"]
@@ -3947,7 +4026,15 @@ func snapshotIngestDoc(doc map[string]any) map[string]any {
 				delete(cp, "_id")
 			}
 		}
+		if b, ok := im["_had_orig_routing"].(bool); ok {
+			if b {
+				cp["_routing"] = im["_orig_routing_val"]
+			} else {
+				delete(cp, "_routing")
+			}
+		}
 	}
+	delete(cp, "__internal_ingest_orig")
 	delete(cp, "_ingest")
 	if cp == nil {
 		cp = map[string]any{}
@@ -4105,30 +4192,26 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 	return mutated, false, nil
 }
 
-func applyIngestPipelineSpecVerboseWithMeta(s *Server, pipe map[string]any, indexName, docID string, raw json.RawMessage, verbose bool) (json.RawMessage, string, string, bool, []map[string]any, error) {
-	out, outIdx, outID, _, dropped, trace, err := applyIngestPipelineSpecWithIngestTS(s, pipe, indexName, docID, raw, verbose)
-	return out, outIdx, outID, dropped, trace, err
-}
-
-func applyIngestPipelineSpecWithIngestTS(s *Server, pipe map[string]any, indexName, docID string, raw json.RawMessage, verbose bool) (json.RawMessage, string, string, string, bool, []map[string]any, error) {
+func applyIngestPipelineSpecWithRouting(s *Server, pipe map[string]any, indexName, docID, initialRouting string, raw json.RawMessage, verbose bool) (json.RawMessage, string, string, string, string, bool, []map[string]any, error) {
 	if pipe == nil || len(bytes.TrimSpace(raw)) == 0 {
-		return raw, indexName, docID, "", false, nil, nil
+		return raw, indexName, docID, "", initialRouting, false, nil, nil
 	}
 	procs, _ := pipe["processors"].([]any)
 	if len(procs) == 0 {
 		if verbose {
-			return raw, indexName, docID, "", false, []map[string]any{}, nil
+			return raw, indexName, docID, "", initialRouting, false, []map[string]any{}, nil
 		}
-		return raw, indexName, docID, "", false, nil, nil
+		return raw, indexName, docID, "", initialRouting, false, nil, nil
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	var doc map[string]any
 	if err := dec.Decode(&doc); err != nil || doc == nil {
-		return raw, indexName, docID, "", false, nil, err
+		return raw, indexName, docID, "", initialRouting, false, nil, err
 	}
 	origIndexVal, hadOrigIndex := doc["_index"]
 	origIDVal, hadOrigID := doc["_id"]
+	origRoutingVal, hadOrigRouting := doc["_routing"]
 	if indexName != "" {
 		doc["_index"] = indexName
 	} else {
@@ -4139,6 +4222,11 @@ func applyIngestPipelineSpecWithIngestTS(s *Server, pipe map[string]any, indexNa
 	} else {
 		delete(doc, "_id")
 	}
+	if initialRouting != "" {
+		doc["_routing"] = initialRouting
+	} else {
+		delete(doc, "_routing")
+	}
 	ingestMeta, _ := doc["_ingest"].(map[string]any)
 	if ingestMeta == nil {
 		ingestMeta = make(map[string]any)
@@ -4146,11 +4234,17 @@ func applyIngestPipelineSpecWithIngestTS(s *Server, pipe map[string]any, indexNa
 	if _, hasTS := ingestMeta["timestamp"]; !hasTS {
 		ingestMeta["timestamp"] = time.Now().UTC().Format(time.RFC3339Nano)
 	}
-	ingestMeta["_had_orig_index"] = hadOrigIndex
-	ingestMeta["_orig_index_val"] = origIndexVal
-	ingestMeta["_had_orig_id"] = hadOrigID
-	ingestMeta["_orig_id_val"] = origIDVal
 	doc["_ingest"] = ingestMeta
+	if verbose {
+		doc["__internal_ingest_orig"] = map[string]any{
+			"_had_orig_index":   hadOrigIndex,
+			"_orig_index_val":   origIndexVal,
+			"_had_orig_id":      hadOrigID,
+			"_orig_id_val":      origIDVal,
+			"_had_orig_routing": hadOrigRouting,
+			"_orig_routing_val": origRoutingVal,
+		}
+	}
 
 	var trace []map[string]any
 	var tracePtr *[]map[string]any
@@ -4160,7 +4254,7 @@ func applyIngestPipelineSpecWithIngestTS(s *Server, pipe map[string]any, indexNa
 	}
 	mutated, dropped, procErr := runIngestProcessorList(s, doc, procs, 0, tracePtr)
 	if dropped {
-		return json.RawMessage(`{}`), indexName, docID, "", true, trace, nil
+		return json.RawMessage(`{}`), indexName, docID, "", initialRouting, true, trace, nil
 	}
 	if procErr != nil {
 		if pipeOnFail, ok := pipe["on_failure"].([]any); ok && len(pipeOnFail) > 0 {
@@ -4169,18 +4263,24 @@ func applyIngestPipelineSpecWithIngestTS(s *Server, pipe map[string]any, indexNa
 				ingestMeta = make(map[string]any)
 			}
 			ingestMeta["on_failure_message"] = procErr.Error()
-			ingestMeta["_had_orig_index"] = hadOrigIndex
-			ingestMeta["_orig_index_val"] = origIndexVal
-			ingestMeta["_had_orig_id"] = hadOrigID
-			ingestMeta["_orig_id_val"] = origIDVal
 			doc["_ingest"] = ingestMeta
+			if verbose {
+				doc["__internal_ingest_orig"] = map[string]any{
+					"_had_orig_index":   hadOrigIndex,
+					"_orig_index_val":   origIndexVal,
+					"_had_orig_id":      hadOrigID,
+					"_orig_id_val":      origIDVal,
+					"_had_orig_routing": hadOrigRouting,
+					"_orig_routing_val": origRoutingVal,
+				}
+			}
 			mutated = true
 			subMut, subDropped, subErr := runIngestProcessorList(s, doc, pipeOnFail, 1, tracePtr)
 			if subMut {
 				mutated = true
 			}
 			if subDropped {
-				return json.RawMessage(`{}`), indexName, docID, "", true, trace, nil
+				return json.RawMessage(`{}`), indexName, docID, "", initialRouting, true, trace, nil
 			}
 			if subErr == nil {
 				if curIngest, ok := doc["_ingest"].(map[string]any); ok {
@@ -4192,7 +4292,8 @@ func applyIngestPipelineSpecWithIngestTS(s *Server, pipe map[string]any, indexNa
 			procErr = subErr
 		}
 		if procErr != nil {
-			return raw, indexName, docID, "", false, trace, procErr
+			delete(doc, "__internal_ingest_orig")
+			return raw, indexName, docID, "", initialRouting, false, trace, procErr
 		}
 	}
 	outIndex := indexName
@@ -4208,6 +4309,10 @@ func applyIngestPipelineSpecWithIngestTS(s *Server, pipe map[string]any, indexNa
 		}
 	} else if docID != "" {
 		outID = esast.NextAutoID()
+	}
+	outRouting := ""
+	if v, ok := doc["_routing"]; ok && v != nil {
+		outRouting = fmt.Sprintf("%v", v)
 	}
 	outIngestTS := ""
 	if curIngest, ok := doc["_ingest"].(map[string]any); ok {
@@ -4227,15 +4332,21 @@ func applyIngestPipelineSpecWithIngestTS(s *Server, pipe map[string]any, indexNa
 	} else {
 		delete(doc, "_id")
 	}
+	if hadOrigRouting {
+		doc["_routing"] = origRoutingVal
+	} else {
+		delete(doc, "_routing")
+	}
+	delete(doc, "__internal_ingest_orig")
 	delete(doc, "_ingest")
 	if !mutated {
-		return raw, outIndex, outID, outIngestTS, false, trace, nil
+		return raw, outIndex, outID, outIngestTS, outRouting, false, trace, nil
 	}
 	out, err := json.Marshal(doc)
 	if err != nil {
-		return raw, outIndex, outID, outIngestTS, false, trace, err
+		return raw, outIndex, outID, outIngestTS, outRouting, false, trace, err
 	}
-	return json.RawMessage(out), outIndex, outID, outIngestTS, false, trace, nil
+	return json.RawMessage(out), outIndex, outID, outIngestTS, outRouting, false, trace, nil
 }
 
 // handleSimulateIngestPipeline implements `POST /_ingest/pipeline/_simulate` and `POST /_ingest/pipeline/{id}/_simulate`.
@@ -4289,12 +4400,13 @@ func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Req
 		if id == "" {
 			id = fmt.Sprintf("%d", i)
 		}
+		inRouting, _ := docObj["_routing"].(string)
 		srcAny, hasSrc := docObj["_source"]
 		var srcMap map[string]any
 		if !hasSrc {
 			srcMap = make(map[string]any, len(docObj))
 			for k, v := range docObj {
-				if k == "_index" || k == "_id" {
+				if k == "_index" || k == "_id" || k == "_routing" {
 					continue
 				}
 				srcMap[k] = v
@@ -4336,7 +4448,7 @@ func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Req
 		if err != nil {
 			rawSrc = []byte(`{}`)
 		}
-		outBytes, outIdx, outID, outIngestTS, dropped, trace, procErr := applyIngestPipelineSpecWithIngestTS(s, pipe, idx, id, rawSrc, verbose)
+		outBytes, outIdx, outID, outIngestTS, outRouting, dropped, trace, procErr := applyIngestPipelineSpecWithRouting(s, pipe, idx, id, inRouting, rawSrc, verbose)
 		if outIngestTS != "" {
 			docIngestTS = outIngestTS
 		}
@@ -4378,16 +4490,20 @@ func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Req
 			outSrc = map[string]any{}
 		}
 		delete(outSrc, "_ingest")
-		docsOut = append(docsOut, map[string]any{
-			"doc": map[string]any{
-				"_index":   outIdx,
-				"_version": "-3",
-				"_id":      outID,
-				"_source":  outSrc,
-				"_ingest": map[string]any{
-					"timestamp": docIngestTS,
-				},
+		simDoc := map[string]any{
+			"_index":   outIdx,
+			"_version": "-3",
+			"_id":      outID,
+			"_source":  outSrc,
+			"_ingest": map[string]any{
+				"timestamp": docIngestTS,
 			},
+		}
+		if outRouting != "" {
+			simDoc["_routing"] = outRouting
+		}
+		docsOut = append(docsOut, map[string]any{
+			"doc": simDoc,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"docs": docsOut})
@@ -4922,6 +5038,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 
 	var totalMatched, totalCreated, totalUpdated, totalDeleted, versionConflicts, batches int
 	failures := make([]any, 0)
+	deletedVerByIdx := make(map[string]map[string]int64)
 	proceedOnConflict := strings.EqualFold(strings.TrimSpace(body.Conflicts), "proceed") ||
 		strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("conflicts")), "proceed")
 	updSpec := &painless.UpdateRequest{
@@ -5087,12 +5204,14 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 			}
 			batches++
 			type preparedDoc struct {
-				id          string
-				destIndex   string
-				aliasFilter *esast.Query
-				source      json.RawMessage
-				srcVer      int64
-				isDelete    bool
+				id           string
+				destIndex    string
+				aliasFilter  *esast.Query
+				source       json.RawMessage
+				srcVer       int64
+				scriptVerSet bool
+				isDelete     bool
+				routing      string
 			}
 			var prepared []preparedDoc
 			sampleDocsByIdx := make(map[string][]json.RawMessage)
@@ -5120,6 +5239,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				docDestAliasFilter := destAliasFilter
 				docSource := h.Source
 				docSrcVer := h.Version
+				scriptVerSet := false
 				if body.Source.Source != nil {
 					filtered := filterSourceJSON(docSource, body.Source.Source)
 					if filtered == nil {
@@ -5133,6 +5253,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					updSpec.MetaIndex = docDestIdx
 					updSpec.MetaVersion = docSrcVer
 					updSpec.MetaVersionNil = false
+					updSpec.MetaVersionMutated = false
 					mutated, opRes, err := painless.ApplyUpdateWithResult(docSource, updSpec, true)
 					if err != nil {
 						writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
@@ -5157,11 +5278,13 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					}
 					if updSpec.MetaVersionNil {
 						docSrcVer = 0
+						scriptVerSet = false
 					} else {
 						docSrcVer = updSpec.MetaVersion
+						scriptVerSet = updSpec.MetaVersionMutated
 					}
 					if opRes == "deleted" {
-						prepared = append(prepared, preparedDoc{id: docID, destIndex: docDestIdx, aliasFilter: docDestAliasFilter, srcVer: docSrcVer, isDelete: true})
+						prepared = append(prepared, preparedDoc{id: docID, destIndex: docDestIdx, aliasFilter: docDestAliasFilter, srcVer: docSrcVer, scriptVerSet: scriptVerSet, isDelete: true})
 						candIDsByIdx[docDestIdx] = append(candIDsByIdx[docDestIdx], docID)
 						if _, hasKey := sampleDocsByIdx[docDestIdx]; !hasKey {
 							sampleDocsByIdx[docDestIdx] = nil
@@ -5170,7 +5293,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					}
 					docSource = mutated
 				}
-				pipedDoc, nextDestIdx, nextDocID, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithMeta(docDestIdx, docID, body.Dest.Pipeline, "", docSource)
+				pipedDoc, nextDestIdx, nextDocID, pipeRouting, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithRouting(docDestIdx, docID, body.Dest.Pipeline, "", "", docSource)
 				if pipeErr != nil {
 					writeESError(w, http.StatusBadRequest, "ingest_processor_exception", pipeErr.Error())
 					return
@@ -5191,6 +5314,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					docDestAliasFilter = resolvedFilter
 				}
 				docSource = pipedDoc
+				effRouting := s.resolveEffectiveWriteRouting(body.Dest.Index, docDestIdx, "", pipeRouting)
 				if docDestAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), docDestIdx, docID, docSource, docDestAliasFilter) {
 					if proceedOnConflict {
 						versionConflicts++
@@ -5209,7 +5333,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "document does not match destination alias filter")
 					return
 				}
-				prepared = append(prepared, preparedDoc{id: docID, destIndex: docDestIdx, aliasFilter: docDestAliasFilter, source: docSource, srcVer: docSrcVer})
+				prepared = append(prepared, preparedDoc{id: docID, destIndex: docDestIdx, aliasFilter: docDestAliasFilter, source: docSource, srcVer: docSrcVer, scriptVerSet: scriptVerSet, routing: effRouting})
 				candIDsByIdx[docDestIdx] = append(candIDsByIdx[docDestIdx], docID)
 				sampleDocsByIdx[docDestIdx] = append(sampleDocsByIdx[docDestIdx], docSource)
 			}
@@ -5256,6 +5380,11 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				if pd.srcVer > 0 {
 					minVer = pd.srcVer + 1
 				}
+				if delMap := deletedVerByIdx[pd.destIndex]; delMap != nil {
+					if delVer, okDel := delMap[pd.id]; okDel && delVer+1 > minVer {
+						minVer = delVer + 1
+					}
+				}
 				existing, exists := existingDocs[pd.id]
 				if pd.isDelete {
 					if !exists {
@@ -5276,7 +5405,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					nextVer := s.allocVersion(minVer)
 					shredded, err := schema.ShredDocument(sch, pd.id, nextVer, true, nil)
 					if err != nil {
-						writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+						writeESError(w, http.StatusBadRequest, shredErrorType(err), err.Error())
 						return
 					}
 					buf, hasBuf := batchBufByTable[sch.DorisTable]
@@ -5288,17 +5417,22 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					buf.Write(shredded)
 					buf.WriteByte('\n')
 					delete(existingDocs, pd.id)
+					if deletedVerByIdx[pd.destIndex] == nil {
+						deletedVerByIdx[pd.destIndex] = make(map[string]int64)
+					}
+					deletedVerByIdx[pd.destIndex][pd.id] = nextVer
+					s.setDocRouting(pd.destIndex, pd.id, "")
 					totalDeleted++
 					continue
 				}
+				useExternalVer := (destVerType == "external" || destVerType == "external_gt" || destVerType == "external_gte" || pd.scriptVerSet) && pd.srcVer > 0
 				if exists {
 					extConflict := false
-					if pd.srcVer > 0 {
-						switch destVerType {
-						case "external", "external_gt":
-							extConflict = existing.Version >= pd.srcVer
-						case "external_gte":
+					if useExternalVer {
+						if destVerType == "external_gte" {
 							extConflict = existing.Version > pd.srcVer
+						} else {
+							extConflict = existing.Version >= pd.srcVer
 						}
 					}
 					conflict := isCreate || extConflict || (pd.aliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), pd.destIndex, pd.id, existing.Source, pd.aliasFilter))
@@ -5314,16 +5448,39 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					if existing.Version+1 > minVer {
 						minVer = existing.Version + 1
 					}
+				} else if useExternalVer {
+					if delMap := deletedVerByIdx[pd.destIndex]; delMap != nil {
+						if delVer, wasDel := delMap[pd.id]; wasDel && delVer > 0 {
+							extConflict := delVer >= pd.srcVer
+							if destVerType == "external_gte" {
+								extConflict = delVer > pd.srcVer
+							}
+							if extConflict {
+								if proceedOnConflict {
+									versionConflicts++
+									continue
+								}
+								writeESError(w, http.StatusConflict, "version_conflict_engine_exception",
+									fmt.Sprintf("[%s]: version conflict, current version [%d] is higher or equal to the one provided [%d]", pd.id, delVer, pd.srcVer))
+								return
+							}
+						}
+					}
+				}
+				if s.isRoutingRequired(sch) && pd.routing == "" {
+					writeESError(w, http.StatusBadRequest, "routing_missing_exception", fmt.Sprintf("routing is required for [%s]/[%s]/[%s]", pd.destIndex, "_doc", pd.id))
+					return
 				}
 				var nextVer int64
-				if (destVerType == "external" || destVerType == "external_gt" || destVerType == "external_gte") && pd.srcVer > 0 {
+				if useExternalVer {
 					nextVer = pd.srcVer
+					_ = s.allocVersion(nextVer)
 				} else {
 					nextVer = s.allocVersion(minVer)
 				}
 				shredded, err := schema.ShredDocument(sch, pd.id, nextVer, false, pd.source)
 				if err != nil {
-					writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+					writeESError(w, http.StatusBadRequest, shredErrorType(err), err.Error())
 					return
 				}
 				buf, hasBuf := batchBufByTable[sch.DorisTable]
@@ -5335,6 +5492,10 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				buf.Write(shredded)
 				buf.WriteByte('\n')
 				existingDocs[pd.id] = HitRow{ID: pd.id, Version: nextVer, Source: pd.source}
+				if deletedVerByIdx[pd.destIndex] != nil {
+					delete(deletedVerByIdx[pd.destIndex], pd.id)
+				}
+				s.setDocRouting(pd.destIndex, pd.id, pd.routing)
 				if exists {
 					totalUpdated++
 				} else {
@@ -7044,21 +7205,28 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 			}
 		}
 	}
-	if len(matches) > 0 && len(enrichFields) > 0 {
-		allowed := make(map[string]bool, len(enrichFields)+1)
-		allowed[matchField] = true
-		for _, ef := range enrichFields {
-			allowed[ef] = true
-		}
-		for i, item := range matches {
-			if m, ok := item.(map[string]any); ok {
-				filtered := make(map[string]any, len(allowed))
-				for k, v := range m {
-					if allowed[k] {
-						filtered[k] = v
+	if len(matches) > 0 {
+		if len(enrichFields) > 0 {
+			paths := make([]string, 0, len(enrichFields)+1)
+			paths = append(paths, matchField)
+			paths = append(paths, enrichFields...)
+			for i, item := range matches {
+				if m, ok := item.(map[string]any); ok {
+					filtered := make(map[string]any, len(paths))
+					for _, p := range paths {
+						if p == "" {
+							continue
+						}
+						if v, exists := getIngestPath(m, p); exists {
+							setIngestPath(filtered, p, deepCloneIngestValue(v))
+						}
 					}
+					matches[i] = filtered
 				}
-				matches[i] = filtered
+			}
+		} else {
+			for i, item := range matches {
+				matches[i] = deepCloneIngestValue(item)
 			}
 		}
 	}
@@ -7066,9 +7234,8 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 		if hadConfiguredSource {
 			return false, nil
 		}
-		synth := map[string]any{
-			matchField: val,
-		}
+		synth := make(map[string]any)
+		setIngestPath(synth, matchField, deepCloneIngestValue(val))
 		if policyName != "" {
 			synth["policy_name"] = policyName
 		}
