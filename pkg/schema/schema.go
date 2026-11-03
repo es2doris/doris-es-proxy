@@ -84,6 +84,8 @@ type FieldBinding struct {
 	ScalingFactor      float64
 	Coerce             *bool
 	IgnoreMalformed    *bool
+	NotIndexed         bool
+	EnabledFalse       bool
 }
 
 // EffectiveLowercase returns true if this field (or its `.keyword` companion when `preferKeyword` is true)
@@ -238,6 +240,22 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 					case StorageNestedSubfield:
 						kwB.IsMultiValued = true
 						s.Fields[target+".keyword"] = kwB
+					}
+				}
+			}
+			targetPrefix := target + "."
+			for subK, subB := range s.Fields {
+				if strings.HasPrefix(subK, targetPrefix) && subB.AliasTarget == "" && strings.Join(subB.SourceJSONPath, ".") == target {
+					if subB.ESType != "text" && subB.ESType != "match_only_text" {
+						switch subB.Kind {
+						case StoragePromotedScalar:
+							subB.Kind = StoragePromotedArray
+							subB.IsMultiValued = true
+							s.Fields[subK] = subB
+						case StorageNestedSubfield:
+							subB.IsMultiValued = true
+							s.Fields[subK] = subB
+						}
 					}
 				}
 			}
@@ -421,6 +439,12 @@ func DeepMergeMappingProperties(
 			if v.IgnoreMalformed != nil {
 				merged.IgnoreMalformed = v.IgnoreMalformed
 			}
+			if v.Enabled != nil {
+				merged.Enabled = v.Enabled
+			}
+			if v.Index != nil {
+				merged.Index = v.Index
+			}
 			if v.Dynamic != nil {
 				merged.Dynamic = v.Dynamic
 			}
@@ -463,6 +487,17 @@ func (s *IndexSchema) compileProperties(
 		currESPath := append(append([]string{}, esPathPrefix...), propName)
 		currJSONPath := append(append([]string{}, jsonPathPrefix...), propName)
 		dotPath := strings.Join(currESPath, ".")
+
+		if prop.Enabled != nil && !*prop.Enabled {
+			s.Fields[dotPath] = FieldBinding{
+				ESFieldPath:    dotPath,
+				SourceJSONPath: currJSONPath,
+				ESType:         "object",
+				NotIndexed:     true,
+				EnabledFalse:   true,
+			}
+			continue
+		}
 
 		if strings.EqualFold(prop.Type, "nested") {
 			corrCol := "n__" + SanitizeDorisIdentifier(dotPath)
@@ -574,6 +609,7 @@ func (s *IndexSchema) registerLeafField(
 	}
 	lowerNorm := prop.Normalizer != "" && !strings.EqualFold(prop.Normalizer, "none")
 	copyTo := parseCopyToTargets(prop.CopyTo)
+	notIndexed := (prop.Index != nil && !*prop.Index) || (prop.Enabled != nil && !*prop.Enabled)
 
 	if activeNestedRoot != "" {
 		corrCol := s.NestedRoots[activeNestedRoot]
@@ -604,6 +640,7 @@ func (s *IndexSchema) registerLeafField(
 			ScalingFactor:       prop.ScalingFactor,
 			Coerce:              prop.Coerce,
 			IgnoreMalformed:     prop.IgnoreMalformed,
+			NotIndexed:          notIndexed,
 		}
 		return
 	}
@@ -623,6 +660,7 @@ func (s *IndexSchema) registerLeafField(
 			ESType:         esType,
 			VectorDims:     prop.EffectiveDims(),
 			VectorMetric:   metric,
+			NotIndexed:     notIndexed,
 		}
 		return
 	}
@@ -647,6 +685,7 @@ func (s *IndexSchema) registerLeafField(
 			ScalingFactor:       prop.ScalingFactor,
 			Coerce:              prop.Coerce,
 			IgnoreMalformed:     prop.IgnoreMalformed,
+			NotIndexed:          notIndexed,
 		}
 		return
 	}
@@ -667,6 +706,7 @@ func (s *IndexSchema) registerLeafField(
 		ScalingFactor:       prop.ScalingFactor,
 		Coerce:              prop.Coerce,
 		IgnoreMalformed:     prop.IgnoreMalformed,
+		NotIndexed:          notIndexed,
 	}
 }
 
@@ -690,6 +730,23 @@ func (s *IndexSchema) ResolveField(esFieldPath string) FieldBinding {
 	}
 	if b, ok := s.Fields[esFieldPath]; ok {
 		return b
+	}
+	for prefix := esFieldPath; ; {
+		idx := strings.LastIndexByte(prefix, '.')
+		if idx <= 0 {
+			break
+		}
+		prefix = prefix[:idx]
+		if pb, ok := s.Fields[prefix]; ok && pb.EnabledFalse {
+			return FieldBinding{
+				ESFieldPath:    esFieldPath,
+				SourceJSONPath: strings.Split(strings.TrimSuffix(esFieldPath, ".keyword"), "."),
+				Kind:           StorageDynamicVariant,
+				DorisType:      DorisString,
+				NotIndexed:     true,
+				EnabledFalse:   true,
+			}
+		}
 	}
 	if strings.HasSuffix(esFieldPath, ".keyword") {
 		basePath := strings.TrimSuffix(esFieldPath, ".keyword")
@@ -768,7 +825,7 @@ func (s *IndexSchema) ExpandFieldPattern(patternWithBoost string) []BoostedField
 	var matched []BoostedField
 	matchedSet := make(map[string]bool)
 	for k, b := range s.Fields {
-		if b.Kind == StoragePromotedVector {
+		if b.Kind == StoragePromotedVector || b.NotIndexed || b.EnabledFalse {
 			continue
 		}
 		if b.ESType == "alias" && b.ColumnName == "" && b.Kind != StorageDynamicVariant {

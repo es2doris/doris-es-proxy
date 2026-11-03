@@ -156,14 +156,18 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 		compiled.ScoreSQL = fmt.Sprintf("((%s) * %.4f)", compiled.ScoreSQL, *qsq.Boost)
 	}
 	if !isSimple && flags.quoteFieldSuffix == "" && flags.timeZone == "" && flags.phraseSlop == 0 && flags.fuzziness == nil && compiled.WhereSQL != "FALSE" {
-		if rewrittenRaw, ok := t.rewriteDoris4SearchQuery(raw); ok && t.Opts.UseDoris4SearchFunc && nctx == nil && qsq.MinimumShouldMatch == nil && defaultField != "__unmatched_wildcard__" && !strings.ContainsAny(raw, "[{><~/^") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, "`n__") && !strings.Contains(compiled.WhereSQL, " IS NOT NULL") && !strings.Contains(compiled.WhereSQL, "array_size(") {
+		if rewrittenRaw, ok := t.rewriteDoris4SearchQuery(raw); ok && t.Opts.UseDoris4SearchFunc && nctx == nil && qsq.MinimumShouldMatch == nil && defaultField != "__unmatched_wildcard__" && !strings.ContainsAny(raw, "[{><~/^\\") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, "`n__") && !strings.Contains(compiled.WhereSQL, " IS NOT NULL") && !strings.Contains(compiled.WhereSQL, "array_size(") {
 			if len(expandedFields) > 1 {
 				if canEmitMultiFieldDoris4SearchDisjunction(rewrittenRaw, defaultOp) {
 					var searchPreds []string
 					allSupported := true
 					for _, ef := range expandedFields {
 						fname := strings.Split(ef, "^")[0]
-						if t.isDoris4SearchableField(fname) {
+						fb := schema.FieldBinding{}
+						if t.Schema != nil {
+							fb = t.Schema.ResolveField(fname)
+						}
+						if t.isDoris4SearchableField(fname) && (t.Schema == nil || fb.DorisType != schema.DorisVarchar || (!strings.Contains(raw, `"`) && (!fb.LowercaseNormalizer || strings.ToLower(raw) == raw) && (strings.Contains(raw, ":") || !strings.ContainsAny(strings.TrimSpace(raw), " \t\n\r")))) {
 							col := strings.Trim(t.sqlColumnRef(fname, false, nctx), "`")
 							searchPreds = append(searchPreds, fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(rewrittenRaw), quoteStr(col), quoteStr(defaultOp)))
 						} else {
@@ -184,7 +188,7 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 						}
 					}
 				}
-			} else if t.isDoris4SearchableField(defaultField) && (!strings.Contains(raw, `"`) || t.Schema == nil || t.Schema.ResolveField(defaultField).DorisType != schema.DorisVarchar) {
+			} else if t.isDoris4SearchableField(defaultField) && (t.Schema == nil || t.Schema.ResolveField(defaultField).DorisType != schema.DorisVarchar || (!strings.Contains(raw, `"`) && (strings.Contains(raw, ":") || ((!t.Schema.ResolveField(defaultField).LowercaseNormalizer || strings.ToLower(raw) == raw) && !strings.ContainsAny(strings.TrimSpace(raw), " \t\n\r"))))) {
 				col := strings.Trim(t.sqlColumnRef(defaultField, false, nctx), "`")
 				pred := fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(rewrittenRaw), quoteStr(col), quoteStr(defaultOp))
 				return CompiledQuery{
@@ -200,14 +204,41 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 }
 
 func (t *Transpiler) rewriteDoris4SearchQuery(raw string) (string, bool) {
-	if strings.Contains(raw, "_exists_:") || strings.Contains(raw, "&&") || strings.Contains(raw, "||") || strings.Contains(raw, "|") || strings.Contains(raw, "!") {
+	if strings.Contains(raw, "_exists_:") || strings.Contains(raw, "&&") || strings.Contains(raw, "||") || strings.Contains(raw, "|") || strings.Contains(raw, "!") || strings.Contains(raw, `\`) {
 		return "", false
-	}
-	if !strings.Contains(raw, ":") {
-		return raw, true
 	}
 	tokens := tokenizeLucene(raw)
 	if len(tokens) == 0 {
+		return raw, true
+	}
+	isBoolBinOp := func(tok string) bool {
+		u := strings.ToUpper(tok)
+		return u == "AND" || u == "OR"
+	}
+	isBoolUnaryOrBinOp := func(tok string) bool {
+		u := strings.ToUpper(tok)
+		return u == "AND" || u == "OR" || u == "NOT" || tok == "+" || tok == "-"
+	}
+	if isBoolBinOp(tokens[0]) || isBoolUnaryOrBinOp(tokens[len(tokens)-1]) {
+		return "", false
+	}
+	for i := 0; i < len(tokens)-1; i++ {
+		if isBoolBinOp(tokens[i]) && isBoolBinOp(tokens[i+1]) {
+			return "", false
+		}
+		if strings.EqualFold(tokens[i], "NOT") && isBoolUnaryOrBinOp(tokens[i+1]) {
+			return "", false
+		}
+	}
+	if !strings.Contains(raw, ":") {
+		for _, tok := range tokens {
+			rest := strings.TrimLeft(tok, "+-")
+			if hasMatchingOuterParens(rest) {
+				if _, ok := t.rewriteDoris4SearchQuery(rest[1 : len(rest)-1]); !ok {
+					return "", false
+				}
+			}
+		}
 		return raw, true
 	}
 	var out []string
@@ -229,14 +260,17 @@ func (t *Transpiler) rewriteDoris4SearchQuery(raw string) (string, bool) {
 		if idx := findLuceneFieldColon(rest); idx > 0 {
 			field := unescapeLuceneToken(rest[:idx])
 			val := rest[idx+1:]
-			if val == "" || hasMatchingOuterParens(val) {
+			if val == "" || hasMatchingOuterParens(val) || strings.HasPrefix(val, "+") || strings.HasPrefix(val, "-") || strings.HasPrefix(val, "!") {
 				return "", false
 			}
 			if !t.isDoris4SearchableField(field) {
 				return "", false
 			}
-			if t.Schema != nil && strings.Contains(val, `"`) && t.Schema.ResolveField(field).DorisType == schema.DorisVarchar {
-				return "", false
+			if t.Schema != nil {
+				fb := t.Schema.ResolveField(field)
+				if fb.DorisType == schema.DorisVarchar && (strings.Contains(val, `"`) || (fb.LowercaseNormalizer && strings.ToLower(val) != val)) {
+					return "", false
+				}
 			}
 			col := strings.Trim(t.sqlColumnRef(field, false, nil), "`")
 			out = append(out, prefix+col+":"+val)

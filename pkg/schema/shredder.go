@@ -80,11 +80,11 @@ func ShredDocument(
 	row["_version"] = version
 	row["__DORIS_DELETE_SIGN__"] = 0
 	row["_source"] = string(trimmed)
-	row["_doc"] = json.RawMessage(trimmed)
+	row["_doc"] = buildVariantDocPayload(trimmed, s)
 
 	var allTextBuilder strings.Builder
 	allTextBuilder.Grow(len(trimmed) / 2)
-	collectAllTextBuilder(parsedDoc, &allTextBuilder)
+	collectAllTextWithSchema(parsedDoc, s, nil, &allTextBuilder)
 	row["_all_text"] = allTextBuilder.String()
 
 	var now time.Time
@@ -112,17 +112,79 @@ func ShredDocument(
 		}
 	}
 	for _, b := range fieldsToVisit {
+		if b.EnabledFalse {
+			continue
+		}
+		if isStrictLeafFieldWithoutSubprops(s, b) && hasObjectValueAtPath(parsedDoc, b.SourceJSONPath) {
+			if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+				recordIgnored(b.ESFieldPath)
+				continue
+			}
+			return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", b.ESFieldPath, b.ESType)
+		}
 		switch b.Kind {
 		case StoragePromotedScalar:
-			val := extractScalarValue(parsedDoc, b.SourceJSONPath)
 			if (b.ESType == "text" || b.ESType == "match_only_text") && b.DorisType == DorisString {
+				var val any
 				if strs := extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer, b.NullValue); len(strs) >= 1 {
 					val = strings.Join(strs, " ")
 				}
+				if val == nil && b.NullValue != nil && hasExplicitNullAtPath(parsedDoc, b.SourceJSONPath) {
+					val = b.NullValue
+				}
+				if val != nil {
+					if coerced := coerceScalarBindingForDoris(val, b, getNow()); coerced != nil {
+						row[b.ColumnName] = coerced
+					}
+				}
+				continue
 			}
-			if val == nil && b.NullValue != nil && hasExplicitNullAtPath(parsedDoc, b.SourceJSONPath) {
-				val = b.NullValue
+			rawLeafs := extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, nil)
+			if len(rawLeafs) == 0 && b.NullValue != nil && hasExplicitNullAtPath(parsedDoc, b.SourceJSONPath) {
+				rawLeafs = []any{b.NullValue}
 			}
+			if len(rawLeafs) > 0 {
+				var firstVal any
+				for _, rv := range rawLeafs {
+					if rv == nil {
+						continue
+					}
+					if b.IgnoreAbove > 0 {
+						str, ok := rv.(string)
+						if !ok && (b.ESType == "keyword" || b.ESType == "constant_keyword" || b.ESType == "wildcard" || b.DorisType == DorisVarchar) {
+							str = fmt.Sprintf("%v", rv)
+							ok = true
+						}
+						if ok && len([]rune(str)) > b.IgnoreAbove {
+							continue
+						}
+					}
+					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && (b.Coerce == nil || *b.Coerce) && b.DorisType != DorisString && b.DorisType != DorisVarchar {
+						continue
+					}
+					coerced := coerceScalarBindingForDoris(rv, b, getNow())
+					if coerced == nil {
+						if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+							recordIgnored(b.ESFieldPath)
+							continue
+						}
+						return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", b.ESFieldPath, b.ESType)
+					}
+					if b.ESType == "date_nanos" {
+						if iv, ok := coerced.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
+							coerced = iv / 1_000_000
+						}
+					}
+					if firstVal == nil {
+						firstVal = coerced
+					}
+				}
+				if firstVal != nil {
+					row[b.ColumnName] = firstVal
+				}
+				continue
+			}
+			val := extractScalarValue(parsedDoc, b.SourceJSONPath)
 			if b.IgnoreAbove > 0 && val != nil {
 				str, ok := val.(string)
 				if !ok && (b.ESType == "keyword" || b.ESType == "constant_keyword" || b.ESType == "wildcard" || b.DorisType == DorisVarchar) {
@@ -346,6 +408,7 @@ func ShredDocument(
 							}
 						}
 					}
+					propagateCopyToCustomMultiFields(s, row, targetField, srcVals)
 				case StoragePromotedArray, StorageNestedSubfield:
 					var cur []string
 					if existing, ok := row[tb.ColumnName].([]string); ok {
@@ -400,6 +463,7 @@ func ShredDocument(
 							row[tb.KeywordCompanion] = curKw
 						}
 					}
+					propagateCopyToCustomMultiFields(s, row, targetField, srcVals)
 				}
 			}
 		}
@@ -923,6 +987,11 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 			continue
 		}
 		if strings.EqualFold(prop.Type, "flattened") {
+			continue
+		}
+		if prop.Enabled != nil && !*prop.Enabled {
+			delete(obj, k)
+			pruned = true
 			continue
 		}
 		isObjOrNested := len(prop.Properties) > 0 || prop.Type == "" || strings.EqualFold(prop.Type, "object") || strings.EqualFold(prop.Type, "nested")
@@ -1595,7 +1664,187 @@ func extractNestedElementMapsWithIDs(node any, path []string, curPrefix string) 
 	}
 }
 
-func collectAllTextBuilder(node any, sb *strings.Builder) {
+func propagateCopyToCustomMultiFields(s *IndexSchema, row map[string]any, targetField string, srcVals []string) {
+	if s == nil || len(s.Fields) == 0 || len(srcVals) == 0 {
+		return
+	}
+	targetPrefix := targetField + "."
+	for subK, subB := range s.Fields {
+		if !strings.HasPrefix(subK, targetPrefix) || subK == targetField+".keyword" || subB.AliasTarget != "" {
+			continue
+		}
+		if strings.Join(subB.SourceJSONPath, ".") != targetField || subB.ColumnName == "" {
+			continue
+		}
+		switch subB.Kind {
+		case StoragePromotedArray, StorageNestedSubfield:
+			var cur []string
+			if existing, ok := row[subB.ColumnName].([]string); ok {
+				cur = append(cur, existing...)
+			}
+			for _, sv := range srcVals {
+				if subB.IgnoreAbove > 0 && len([]rune(sv)) > subB.IgnoreAbove {
+					continue
+				}
+				if subB.LowercaseNormalizer {
+					sv = strings.ToLower(sv)
+				}
+				cur = append(cur, sv)
+			}
+			if len(cur) > 0 {
+				row[subB.ColumnName] = cur
+			}
+		case StoragePromotedScalar:
+			var filtered []string
+			for _, sv := range srcVals {
+				if subB.IgnoreAbove > 0 && len([]rune(sv)) > subB.IgnoreAbove {
+					continue
+				}
+				if subB.LowercaseNormalizer {
+					sv = strings.ToLower(sv)
+				}
+				filtered = append(filtered, sv)
+			}
+			if len(filtered) > 0 {
+				joined := strings.Join(filtered, " ")
+				if existing, exists := row[subB.ColumnName]; exists && existing != nil {
+					row[subB.ColumnName] = fmt.Sprintf("%v %s", existing, joined)
+				} else {
+					row[subB.ColumnName] = joined
+				}
+			}
+		}
+	}
+}
+
+func buildVariantDocPayload(trimmed []byte, s *IndexSchema) json.RawMessage {
+	if s == nil || len(s.Fields) == 0 {
+		return json.RawMessage(trimmed)
+	}
+	var enabledFalsePaths [][]string
+	for _, b := range s.Fields {
+		if b.EnabledFalse && len(b.SourceJSONPath) > 0 {
+			enabledFalsePaths = append(enabledFalsePaths, b.SourceJSONPath)
+		}
+	}
+	if len(enabledFalsePaths) == 0 {
+		return json.RawMessage(trimmed)
+	}
+	var docMap map[string]any
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.UseNumber()
+	if err := dec.Decode(&docMap); err != nil || docMap == nil {
+		return json.RawMessage(trimmed)
+	}
+	modified := false
+	for _, p := range enabledFalsePaths {
+		if deletePathInMap(docMap, p) {
+			modified = true
+		}
+	}
+	if !modified {
+		return json.RawMessage(trimmed)
+	}
+	b, err := json.Marshal(docMap)
+	if err != nil {
+		return json.RawMessage(trimmed)
+	}
+	return json.RawMessage(b)
+}
+
+func deletePathInMap(curr map[string]any, path []string) bool {
+	if len(path) == 0 || curr == nil {
+		return false
+	}
+	if len(path) == 1 {
+		if _, exists := curr[path[0]]; exists {
+			delete(curr, path[0])
+			return true
+		}
+		return false
+	}
+	next, exists := curr[path[0]]
+	if !exists {
+		return false
+	}
+	switch tv := next.(type) {
+	case map[string]any:
+		return deletePathInMap(tv, path[1:])
+	case []any:
+		removed := false
+		for _, elem := range tv {
+			if em, ok := elem.(map[string]any); ok {
+				if deletePathInMap(em, path[1:]) {
+					removed = true
+				}
+			}
+		}
+		return removed
+	}
+	return false
+}
+
+func isStrictLeafFieldWithoutSubprops(s *IndexSchema, b FieldBinding) bool {
+	if b.AliasTarget != "" || DefaultMultiValuedPaths[b.ESFieldPath] {
+		return false
+	}
+	switch b.ESType {
+	case "text", "match_only_text", "keyword", "constant_keyword", "wildcard", "ip",
+		"long", "unsigned_long", "integer", "short", "byte",
+		"double", "float", "half_float", "scaled_float", "boolean", "date", "date_nanos":
+	default:
+		return false
+	}
+	if s != nil {
+		srcDot := strings.Join(b.SourceJSONPath, ".")
+		prefix := srcDot + "."
+		for _, other := range s.Fields {
+			if len(other.SourceJSONPath) > len(b.SourceJSONPath) && strings.HasPrefix(strings.Join(other.SourceJSONPath, "."), prefix) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func hasObjectValueAtPath(node any, path []string) bool {
+	if node == nil {
+		return false
+	}
+	if len(path) == 0 {
+		switch v := node.(type) {
+		case map[string]any:
+			return true
+		case []any:
+			for _, elem := range v {
+				if hasObjectValueAtPath(elem, nil) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	switch curr := node.(type) {
+	case map[string]any:
+		if next, exists := curr[path[0]]; exists {
+			return hasObjectValueAtPath(next, path[1:])
+		}
+		for i := len(path); i > 1; i-- {
+			if next, exists := curr[strings.Join(path[:i], ".")]; exists {
+				return hasObjectValueAtPath(next, path[i:])
+			}
+		}
+	case []any:
+		for _, elem := range curr {
+			if hasObjectValueAtPath(elem, path) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func collectAllTextWithSchema(node any, s *IndexSchema, curPath []string, sb *strings.Builder) {
 	switch v := node.(type) {
 	case string:
 		if v != "" {
@@ -1611,11 +1860,18 @@ func collectAllTextBuilder(node any, sb *strings.Builder) {
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			collectAllTextBuilder(v[k], sb)
+			nextPath := append(append([]string(nil), curPath...), k)
+			if s != nil && len(s.Fields) > 0 {
+				dotPath := strings.Join(nextPath, ".")
+				if b, ok := s.Fields[dotPath]; ok && (b.NotIndexed || b.EnabledFalse) {
+					continue
+				}
+			}
+			collectAllTextWithSchema(v[k], s, nextPath, sb)
 		}
 	case []any:
 		for _, child := range v {
-			collectAllTextBuilder(child, sb)
+			collectAllTextWithSchema(child, s, curPath, sb)
 		}
 	}
 }
@@ -1809,6 +2065,9 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 			if _, hasBase := s.Fields[strings.TrimSuffix(b.ESFieldPath, ".keyword")]; hasBase {
 				continue
 			}
+		}
+		if b.AliasTarget == "" && strings.Join(b.SourceJSONPath, ".") != b.ESFieldPath {
+			continue
 		}
 		relPath := b.SourceJSONPath[len(rootParts):]
 		applyNestedBindingNormalizationAtPath(cloned, relPath, b, getNow)
@@ -2006,6 +2265,15 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 			}
 		}
 	} else if b.ESType == "boolean" || b.DorisType == DorisBoolean {
+		if b.Coerce != nil && !*b.Coerce {
+			if bv, ok := val.(bool); ok {
+				return bv
+			}
+			if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+				return nil
+			}
+			return val
+		}
 		switch strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", val))) {
 		case "true", "1":
 			return true

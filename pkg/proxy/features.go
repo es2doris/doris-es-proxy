@@ -5536,6 +5536,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					}
 					deletedVerByIdx[pd.destIndex][pd.id] = nextVer
 					s.setDocRouting(pd.destIndex, pd.id, "")
+					s.setDocVersion(pd.destIndex, pd.id, nextVer)
 					totalDeleted++
 					continue
 				}
@@ -5563,21 +5564,28 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 						minVer = existing.Version + 1
 					}
 				} else if useExternalVer {
+					var delVer int64
 					if delMap := deletedVerByIdx[pd.destIndex]; delMap != nil {
-						if delVer, wasDel := delMap[pd.id]; wasDel && delVer > 0 {
-							extConflict := delVer >= pd.srcVer
-							if destVerType == "external_gte" {
-								extConflict = delVer > pd.srcVer
+						delVer = delMap[pd.id]
+					}
+					if delVer == 0 {
+						if lastVer := s.getDocVersion(pd.destIndex, pd.id); lastVer > 0 && lastVer < 1_000_000_000_000 {
+							delVer = lastVer
+						}
+					}
+					if delVer > 0 {
+						extConflict := delVer >= pd.srcVer
+						if destVerType == "external_gte" {
+							extConflict = delVer > pd.srcVer
+						}
+						if extConflict {
+							if proceedOnConflict {
+								versionConflicts++
+								continue
 							}
-							if extConflict {
-								if proceedOnConflict {
-									versionConflicts++
-									continue
-								}
-								writeESError(w, http.StatusConflict, "version_conflict_engine_exception",
-									fmt.Sprintf("[%s]: version conflict, current version [%d] is higher or equal to the one provided [%d]", pd.id, delVer, pd.srcVer))
-								return
-							}
+							writeESError(w, http.StatusConflict, "version_conflict_engine_exception",
+								fmt.Sprintf("[%s]: version conflict, current version [%d] is higher or equal to the one provided [%d]", pd.id, delVer, pd.srcVer))
+							return
 						}
 					}
 				}
@@ -5610,6 +5618,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					delete(deletedVerByIdx[pd.destIndex], pd.id)
 				}
 				s.setDocRouting(pd.destIndex, pd.id, pd.routing)
+				s.setDocVersion(pd.destIndex, pd.id, nextVer)
 				if exists {
 					totalUpdated++
 				} else {
@@ -6036,7 +6045,7 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 			tokens = append(tokens, map[string]any{
 				"token":        tok,
 				"start_offset": 0,
-				"end_offset":   len(txt),
+				"end_offset":   utf8.RuneCountInString(txt),
 				"type":         "word",
 				"position":     pos,
 			})
@@ -6045,14 +6054,15 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 		}
 		startOff := -1
 		var cur strings.Builder
-		for i, ch := range txt {
+		runeIdx := 0
+		for _, ch := range txt {
 			isWord := (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch > 127
 			if strings.Contains(analyzer, "whitespace") {
 				isWord = ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r'
 			}
 			if isWord {
 				if startOff < 0 {
-					startOff = i
+					startOff = runeIdx
 				}
 				if strings.Contains(analyzer, "whitespace") && !strings.Contains(analyzer, "lower") {
 					cur.WriteRune(ch)
@@ -6063,7 +6073,7 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 				tokens = append(tokens, map[string]any{
 					"token":        cur.String(),
 					"start_offset": startOff,
-					"end_offset":   i,
+					"end_offset":   runeIdx,
 					"type":         "<ALPHANUM>",
 					"position":     pos,
 				})
@@ -6071,12 +6081,13 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 				cur.Reset()
 				startOff = -1
 			}
+			runeIdx++
 		}
 		if startOff >= 0 {
 			tokens = append(tokens, map[string]any{
 				"token":        cur.String(),
 				"start_offset": startOff,
-				"end_offset":   len(txt),
+				"end_offset":   runeIdx,
 				"type":         "<ALPHANUM>",
 				"position":     pos,
 			})
@@ -6124,6 +6135,22 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 
 	_ = s.syncCatalogFromBackend(r.Context())
 	s.mu.RLock()
+	ds, isDataStream := s.dataStreams[alias]
+	var dsGeneration int64 = 1
+	var dsLastBacking string
+	if isDataStream && ds != nil {
+		if g, ok := toInt64(ds["generation"]); ok && g > 0 {
+			dsGeneration = g
+		}
+		if rawIndices, ok := ds["indices"].([]any); ok && len(rawIndices) > 0 {
+			if m, okM := rawIndices[len(rawIndices)-1].(map[string]any); okM {
+				dsLastBacking, _ = m["index_name"].(string)
+			}
+		}
+		if dsLastBacking == "" {
+			dsLastBacking = alias
+		}
+	}
 	targets := append([]string(nil), s.aliases[alias]...)
 	metaByIdx := s.aliasMeta[alias]
 	writeIdx := ""
@@ -6137,7 +6164,10 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.RUnlock()
 
-	if len(targets) > 1 && writeIdx == "" {
+	if isDataStream && writeIdx == "" {
+		writeIdx = dsLastBacking
+	}
+	if !isDataStream && len(targets) > 1 && writeIdx == "" {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
 			fmt.Sprintf("Alias [%s] has more than one write index or no write index is specified", alias))
 		return
@@ -6148,8 +6178,13 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 	} else if len(targets) > 0 {
 		oldIdx = targets[len(targets)-1]
 	}
+	nextGen := int(dsGeneration) + 1
 	if newIdx == "" {
-		newIdx = incrementRolloverIndexName(oldIdx)
+		if isDataStream {
+			newIdx = fmt.Sprintf(".ds-%s-%06d", alias, nextGen)
+		} else {
+			newIdx = incrementRolloverIndexName(oldIdx)
+		}
 	}
 
 	condResults := make(map[string]bool)
@@ -6205,6 +6240,19 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 		var baseMapping *esast.MappingSpec
 		s.mu.RLock()
 		tplMapping, tplDefPipe, hasTplDefPipe, tplFinPipe, hasTplFinPipe, tplAliases := s.matchingTemplateConfigLocked(newIdx)
+		if isDataStream {
+			dsTplMap, dsDefPipe, hasDSDef, dsFinPipe, hasDSFin, dsAliases := s.matchingTemplateConfigLocked(alias)
+			tplMapping = schema.MergeMappingSpecs(dsTplMap, tplMapping)
+			if !hasTplDefPipe && hasDSDef {
+				tplDefPipe, hasTplDefPipe = dsDefPipe, true
+			}
+			if !hasTplFinPipe && hasDSFin {
+				tplFinPipe, hasTplFinPipe = dsFinPipe, true
+			}
+			if tplAliases == nil && len(dsAliases) > 0 {
+				tplAliases = dsAliases
+			}
+		}
 		if oldSchema, ok := s.indices[oldIdx]; ok && oldSchema != nil {
 			baseMapping = schema.MergeMappingSpecs(tplMapping, oldSchema.RawMapping)
 		} else {
@@ -6221,6 +6269,7 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		var persistedDS map[string]any
 		s.mu.Lock()
 		s.indices[newIdx] = compiled
 		if hasTplDefPipe && tplDefPipe != "" {
@@ -6253,7 +6302,23 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 			extraAliasTargets[extraAlias] = append([]string(nil), s.aliases[extraAlias]...)
 		}
 		var updatedTargets []string
-		if metaByIdx := s.aliasMeta[alias]; metaByIdx != nil {
+		if isDataStream {
+			fVal := false
+			tVal := true
+			s.addAliasWithMetaLocked(alias, oldIdx, AliasMetadata{IsWriteIndex: &fVal})
+			s.addAliasWithMetaLocked(alias, newIdx, AliasMetadata{IsWriteIndex: &tVal})
+			updatedTargets = append([]string(nil), s.aliases[alias]...)
+			if curDS := s.dataStreams[alias]; curDS != nil {
+				rawIndices, _ := curDS["indices"].([]any)
+				rawIndices = append(rawIndices, map[string]any{
+					"index_name": newIdx,
+					"index_uuid": newIdx,
+				})
+				curDS["indices"] = rawIndices
+				curDS["generation"] = nextGen
+				persistedDS = deepCloneDocMap(curDS)
+			}
+		} else if metaByIdx := s.aliasMeta[alias]; metaByIdx != nil {
 			if oldMeta, hasOld := metaByIdx[oldIdx]; hasOld && oldMeta.IsWriteIndex != nil && *oldMeta.IsWriteIndex {
 				fVal := false
 				tVal := true
@@ -6287,6 +6352,9 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		s.persistIndex(r.Context(), newIdx, compiled)
 		s.persistAlias(r.Context(), alias, updatedTargets)
+		if persistedDS != nil {
+			s.persistDataStream(r.Context(), alias, persistedDS)
+		}
 		for extraAlias, extraTargets := range extraAliasTargets {
 			s.persistAlias(r.Context(), extraAlias, extraTargets)
 		}
@@ -7121,14 +7189,15 @@ func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func extractEnrichPolicyMeta(pol map[string]any) (indices []string, matchField string, enrichFields []string) {
+func extractEnrichPolicyMeta(pol map[string]any) (indices []string, matchField string, enrichFields []string, policyType string, policyQuery *esast.Query) {
 	if pol == nil {
-		return nil, "", nil
+		return nil, "", nil, "", nil
 	}
 	inner := pol
 	for _, pType := range []string{"match", "geo_match", "range"} {
 		if m, ok := pol[pType].(map[string]any); ok {
 			inner = m
+			policyType = pType
 			break
 		}
 	}
@@ -7159,7 +7228,132 @@ func extractEnrichPolicyMeta(pol map[string]any) (indices []string, matchField s
 	case []string:
 		enrichFields = append(enrichFields, rawEF...)
 	}
-	return indices, matchField, enrichFields
+	if rawQ, hasQ := inner["query"]; hasQ && rawQ != nil {
+		switch qt := rawQ.(type) {
+		case string:
+			qTrim := strings.TrimSpace(qt)
+			if strings.HasPrefix(qTrim, "{") {
+				var parsed esast.Query
+				if json.Unmarshal([]byte(qTrim), &parsed) == nil {
+					policyQuery = &parsed
+				}
+			} else if qTrim != "" {
+				policyQuery = &esast.Query{
+					QueryString: &esast.QueryStringQuery{Query: qTrim},
+				}
+			}
+		case map[string]any:
+			if rawBytes, err := json.Marshal(qt); err == nil {
+				var parsed esast.Query
+				if json.Unmarshal(rawBytes, &parsed) == nil {
+					policyQuery = &parsed
+				}
+			}
+		}
+	}
+	return indices, matchField, enrichFields, policyType, policyQuery
+}
+
+func compareEnrichRangeValues(a, b any) (int, bool) {
+	if af, aOk := toFloat(a); aOk {
+		if bf, bOk := toFloat(b); bOk {
+			if af < bf {
+				return -1, true
+			}
+			if af > bf {
+				return 1, true
+			}
+			return 0, true
+		}
+	}
+	aStr := strings.TrimSpace(fmt.Sprintf("%v", a))
+	bStr := strings.TrimSpace(fmt.Sprintf("%v", b))
+	if aIP := net.ParseIP(aStr); aIP != nil {
+		if bIP := net.ParseIP(bStr); bIP != nil {
+			return bytes.Compare(aIP.To16(), bIP.To16()), true
+		}
+	}
+	if aMs, aOk := schema.ParseESDateWithFormatToEpochMillis(aStr, "", time.Now().UTC()); aOk {
+		if bMs, bOk := schema.ParseESDateWithFormatToEpochMillis(bStr, "", time.Now().UTC()); bOk {
+			if aMs < bMs {
+				return -1, true
+			}
+			if aMs > bMs {
+				return 1, true
+			}
+			return 0, true
+		}
+	}
+	return strings.Compare(aStr, bStr), true
+}
+
+func enrichSingleSpecMatchesSingleValue(rangeSpec any, lookupVal any) bool {
+	if rangeSpec == nil || lookupVal == nil {
+		return false
+	}
+	switch rs := rangeSpec.(type) {
+	case []any:
+		for _, elem := range rs {
+			if enrichSingleSpecMatchesSingleValue(elem, lookupVal) {
+				return true
+			}
+		}
+		return false
+	case string:
+		sTrim := strings.TrimSpace(rs)
+		valStr := strings.TrimSpace(fmt.Sprintf("%v", lookupVal))
+		if _, ipNet, err := net.ParseCIDR(sTrim); err == nil && ipNet != nil {
+			if ip := net.ParseIP(valStr); ip != nil {
+				return ipNet.Contains(ip)
+			}
+		}
+		return sTrim == valStr
+	case map[string]any:
+		hasBound := false
+		if bVal, ok := rs["gte"]; ok && bVal != nil {
+			hasBound = true
+			if cmp, okCmp := compareEnrichRangeValues(lookupVal, bVal); !okCmp || cmp < 0 {
+				return false
+			}
+		}
+		if bVal, ok := rs["gt"]; ok && bVal != nil {
+			hasBound = true
+			if cmp, okCmp := compareEnrichRangeValues(lookupVal, bVal); !okCmp || cmp <= 0 {
+				return false
+			}
+		}
+		if bVal, ok := rs["lte"]; ok && bVal != nil {
+			hasBound = true
+			if cmp, okCmp := compareEnrichRangeValues(lookupVal, bVal); !okCmp || cmp > 0 {
+				return false
+			}
+		}
+		if bVal, ok := rs["lt"]; ok && bVal != nil {
+			hasBound = true
+			if cmp, okCmp := compareEnrichRangeValues(lookupVal, bVal); !okCmp || cmp >= 0 {
+				return false
+			}
+		}
+		return hasBound
+	default:
+		return fmt.Sprintf("%v", rangeSpec) == fmt.Sprintf("%v", lookupVal)
+	}
+}
+
+func enrichDocMatchesRangeValue(srcMap map[string]any, matchField string, lookupVal any) bool {
+	rangeSpec, ok := getIngestPath(srcMap, matchField)
+	if !ok || rangeSpec == nil {
+		return false
+	}
+	if lookupSlice, isSlice := lookupVal.([]any); isSlice {
+		for _, elem := range lookupSlice {
+			if enrichSingleSpecMatchesSingleValue(rangeSpec, elem) {
+				return true
+			}
+		}
+		return false
+	}
+	return enrichSingleSpecMatchesSingleValue(rangeSpec, lookupVal)
 }
 
 func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]any) (bool, error) {
@@ -7194,6 +7388,8 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 	matchField, _ := specMap["match_field"].(string)
 	var policyIndices []string
 	var enrichFields []string
+	var policyType string
+	var policyQuery *esast.Query
 	hadConfiguredSource := false
 	if s != nil && policyName != "" {
 		s.mu.RLock()
@@ -7207,12 +7403,14 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 		}
 		if pol != nil {
 			hadConfiguredSource = true
-			pIdx, pMF, pEF := extractEnrichPolicyMeta(pol)
+			pIdx, pMF, pEF, pType, pQuery := extractEnrichPolicyMeta(pol)
 			policyIndices = pIdx
 			if matchField == "" && pMF != "" {
 				matchField = pMF
 			}
 			enrichFields = pEF
+			policyType = pType
+			policyQuery = pQuery
 		}
 	}
 	if len(enrichFields) == 0 {
@@ -7275,6 +7473,49 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 				continue
 			}
 			hadConfiguredSource = true
+			if policyType == "range" {
+				scanLimit := 1000
+				resp, _, errType, _ := s.executeSearchRequest(context.Background(), cIdx, &esast.SearchRequest{
+					Query: policyQuery,
+					Size:  &scanLimit,
+				})
+				if errType == "" {
+					if hitsEnv, ok := resp["hits"].(map[string]any); ok {
+						extractRangeHit := func(h map[string]any) {
+							if len(matches) >= maxMatches {
+								return
+							}
+							var srcMap map[string]any
+							if srcRaw, ok := h["_source"].(json.RawMessage); ok {
+								dec := json.NewDecoder(bytes.NewReader(srcRaw))
+								dec.UseNumber()
+								_ = dec.Decode(&srcMap)
+							} else if sm, ok := h["_source"].(map[string]any); ok {
+								srcMap = sm
+							}
+							if srcMap != nil && enrichDocMatchesRangeValue(srcMap, matchField, val) {
+								matches = append(matches, srcMap)
+							}
+						}
+						switch hitsList := hitsEnv["hits"].(type) {
+						case []map[string]any:
+							for _, h := range hitsList {
+								extractRangeHit(h)
+							}
+						case []any:
+							for _, item := range hitsList {
+								if h, ok := item.(map[string]any); ok {
+									extractRangeHit(h)
+								}
+							}
+						}
+					}
+				}
+				if len(matches) >= maxMatches {
+					break
+				}
+				continue
+			}
 			var q *esast.Query
 			if valSlice, isSlice := val.([]any); isSlice {
 				q = &esast.Query{
@@ -7291,6 +7532,7 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 					},
 				}
 			}
+			q = combineQueryWithAliasFilter(q, policyQuery)
 			sz := maxMatches
 			resp, _, errType, _ := s.executeSearchRequest(context.Background(), cIdx, &esast.SearchRequest{
 				Query: q,
@@ -7403,6 +7645,14 @@ func (s *Server) handleResizeOrCloneIndex(w http.ResponseWriter, r *http.Request
 	s.mu.RLock()
 	srcSchema := s.indices[srcIndex]
 	_, targetExists := s.indices[targetIndex]
+	hasTargetAliasCollision := len(s.aliases[targetIndex]) > 0 || s.dataStreams[targetIndex] != nil
+	var badAliasName string
+	for alias := range req.Aliases {
+		if alias == targetIndex || s.indices[alias] != nil || s.dataStreams[alias] != nil {
+			badAliasName = alias
+			break
+		}
+	}
 	srcDefPipe, hasSrcDef := s.indexDefaultPipelines[srcIndex]
 	srcFinPipe, hasSrcFin := s.indexFinalPipelines[srcIndex]
 	s.mu.RUnlock()
@@ -7413,6 +7663,14 @@ func (s *Server) handleResizeOrCloneIndex(w http.ResponseWriter, r *http.Request
 	}
 	if targetExists || srcIndex == targetIndex {
 		writeESError(w, http.StatusBadRequest, "resource_already_exists_exception", "index ["+targetIndex+"] already exists")
+		return
+	}
+	if hasTargetAliasCollision {
+		writeESError(w, http.StatusBadRequest, "invalid_index_name_exception", "Invalid index name ["+targetIndex+"], already exists as alias")
+		return
+	}
+	if badAliasName != "" {
+		writeESError(w, http.StatusBadRequest, "invalid_alias_name_exception", "Invalid alias name ["+badAliasName+"], an index or data stream exists with the same name as the alias")
 		return
 	}
 

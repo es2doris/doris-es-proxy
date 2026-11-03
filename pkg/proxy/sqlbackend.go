@@ -349,43 +349,60 @@ func (b *DorisSQLBackend) GetDocByID(ctx context.Context, dbName, table, id stri
 	safeTable := schema.SanitizeDorisIdentifier(table)
 	// #nosec G201 -- identifiers are strictly sanitized via schema.SanitizeDorisIdentifier
 	q := fmt.Sprintf(
-		"SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` = ? ORDER BY `_version` DESC LIMIT 1",
+		"SELECT `_id`, `_version`, `_source`, `__DORIS_DELETE_SIGN__` FROM `%s`.`%s` WHERE `_id` = ? ORDER BY `_version` DESC LIMIT 1",
 		safeDB, safeTable,
 	)
 	// #nosec G701 -- parameterized _id query on strictly sanitized identifier
 	rows, err := b.db.QueryContext(ctx, q, id)
 	if err != nil {
+		// #nosec G201 -- identifiers are strictly sanitized via schema.SanitizeDorisIdentifier
+		qFallback := fmt.Sprintf(
+			"SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` = ? ORDER BY `_version` DESC LIMIT 1",
+			safeDB, safeTable,
+		)
+		// #nosec G701 -- parameterized _id query on strictly sanitized identifier
+		if fbRows, fbErr := b.db.QueryContext(ctx, qFallback, id); fbErr == nil {
+			rows = fbRows
+			err = nil
+		}
+	}
+	if err != nil {
 		return nil, false, err
 	}
 	defer func() { _ = rows.Close() }()
-	if !rows.Next() {
-		if err := rows.Err(); err != nil {
-			return nil, false, err
-		}
-		return nil, false, nil
-	}
-	var h HitRow
-	var srcStr string
-	var delSign sql.NullInt64
 	cols, _ := rows.Columns()
-	if len(cols) >= 4 {
-		if err := rows.Scan(&h.ID, &h.Version, &srcStr, &delSign); err != nil {
-			return nil, false, err
+	var best HitRow
+	var bestDeleted bool
+	hasRow := false
+	for rows.Next() {
+		var h HitRow
+		var srcStr string
+		var delSign sql.NullInt64
+		if len(cols) >= 4 {
+			if err := rows.Scan(&h.ID, &h.Version, &srcStr, &delSign); err != nil {
+				return nil, false, err
+			}
+		} else {
+			if err := rows.Scan(&h.ID, &h.Version, &srcStr); err != nil {
+				return nil, false, err
+			}
 		}
-	} else {
-		if err := rows.Scan(&h.ID, &h.Version, &srcStr); err != nil {
-			return nil, false, err
+		if hasRow && h.Version < best.Version {
+			continue
 		}
+		hasRow = true
+		best = h
+		best.Source = json.RawMessage(srcStr)
+		best.Score = 1.0
+		bestDeleted = (delSign.Valid && delSign.Int64 != 0) || strings.TrimSpace(srcStr) == ""
 	}
 	if err := rows.Err(); err != nil {
 		return nil, false, err
 	}
-	if (delSign.Valid && delSign.Int64 != 0) || strings.TrimSpace(srcStr) == "" {
+	if !hasRow || bestDeleted {
 		return nil, false, nil
 	}
-	h.Source = json.RawMessage(srcStr)
-	h.Score = 1.0
-	return &h, true, nil
+	return &best, true, nil
 }
 
 func (b *DorisSQLBackend) GetDocsByIDs(ctx context.Context, dbName, table string, ids []string) (map[string]HitRow, error) {
@@ -403,11 +420,23 @@ func (b *DorisSQLBackend) GetDocsByIDs(ctx context.Context, dbName, table string
 	}
 	// #nosec G201 -- identifiers are strictly sanitized and values are bound via ? placeholders
 	q := fmt.Sprintf(
-		"SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` IN (%s) ORDER BY `_version` ASC",
+		"SELECT `_id`, `_version`, `_source`, `__DORIS_DELETE_SIGN__` FROM `%s`.`%s` WHERE `_id` IN (%s) ORDER BY `_version` ASC",
 		safeDB, safeTable, strings.Join(placeholders, ","),
 	)
 	// #nosec G701 -- parameterized IN query on strictly sanitized identifier
 	rows, err := b.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		// #nosec G201 -- identifiers are strictly sanitized and values are bound via ? placeholders
+		qFallback := fmt.Sprintf(
+			"SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` IN (%s) ORDER BY `_version` ASC",
+			safeDB, safeTable, strings.Join(placeholders, ","),
+		)
+		// #nosec G701 -- parameterized IN query on strictly sanitized identifier
+		if fbRows, fbErr := b.db.QueryContext(ctx, qFallback, args...); fbErr == nil {
+			rows = fbRows
+			err = nil
+		}
+	}
 	if err != nil {
 		return nil, err
 	}

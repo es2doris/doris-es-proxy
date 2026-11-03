@@ -132,6 +132,7 @@ type CompletionSuggestSpec struct {
 	Size           int            `json:"size,omitempty"`
 	SkipDuplicates bool           `json:"skip_duplicates,omitempty"`
 	Fuzzy          map[string]any `json:"fuzzy,omitempty"`
+	Regex          map[string]any `json:"regex,omitempty"`
 }
 
 // StoredFieldsSlice normalizes a `stored_fields` value (string or []string) into a slice of field names.
@@ -1023,10 +1024,31 @@ type FuzzyEntry struct {
 	Fuzziness       any     `json:"fuzziness,omitempty"`
 	CaseInsensitive bool    `json:"case_insensitive,omitempty"`
 	Boost           float64 `json:"boost,omitempty"`
+	HasBoost        bool    `json:"-"`
+}
+
+func (f FuzzyEntry) MarshalJSON() ([]byte, error) {
+	var boostPtr *float64
+	if f.HasBoost || (f.Boost != 0 && f.Boost != 1.0) {
+		b := f.Boost
+		boostPtr = &b
+	}
+	return json.Marshal(struct {
+		Value           any      `json:"value"`
+		Fuzziness       any      `json:"fuzziness,omitempty"`
+		CaseInsensitive bool     `json:"case_insensitive,omitempty"`
+		Boost           *float64 `json:"boost,omitempty"`
+	}{
+		Value:           f.Value,
+		Fuzziness:       f.Fuzziness,
+		CaseInsensitive: f.CaseInsensitive,
+		Boost:           boostPtr,
+	})
 }
 
 func (f *FuzzyEntry) UnmarshalJSON(data []byte) error {
 	f.Boost = 1.0
+	f.HasBoost = false
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		var full struct {
@@ -1047,6 +1069,7 @@ func (f *FuzzyEntry) UnmarshalJSON(data []byte) error {
 		f.CaseInsensitive = ci
 		if full.Boost != nil {
 			f.Boost = *full.Boost
+			f.HasBoost = true
 		}
 		return nil
 	}
@@ -1169,10 +1192,29 @@ type TermEntry struct {
 	Value           any     `json:"value"`
 	Boost           float64 `json:"boost,omitempty"`
 	CaseInsensitive bool    `json:"case_insensitive,omitempty"`
+	HasBoost        bool    `json:"-"`
+}
+
+func (t TermEntry) MarshalJSON() ([]byte, error) {
+	var boostPtr *float64
+	if t.HasBoost || (t.Boost != 0 && t.Boost != 1.0) {
+		b := t.Boost
+		boostPtr = &b
+	}
+	return json.Marshal(struct {
+		Value           any      `json:"value"`
+		Boost           *float64 `json:"boost,omitempty"`
+		CaseInsensitive bool     `json:"case_insensitive,omitempty"`
+	}{
+		Value:           t.Value,
+		Boost:           boostPtr,
+		CaseInsensitive: t.CaseInsensitive,
+	})
 }
 
 func (t *TermEntry) UnmarshalJSON(data []byte) error {
 	t.Boost = 1.0
+	t.HasBoost = false
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		var full struct {
@@ -1190,6 +1232,7 @@ func (t *TermEntry) UnmarshalJSON(data []byte) error {
 		t.Value = full.Value
 		if full.Boost != nil {
 			t.Boost = *full.Boost
+			t.HasBoost = true
 		}
 		t.CaseInsensitive = ci
 		return nil
@@ -1227,7 +1270,8 @@ func (iq *IdsQuery) UnmarshalJSON(data []byte) error {
 }
 
 type ExistsQuery struct {
-	Field string `json:"field"`
+	Field string   `json:"field"`
+	Boost *float64 `json:"boost,omitempty"`
 }
 
 // RangeCond supports both standard `gt`/`gte`/`lt`/`lte` bounds and Java `RangeQueryBuilder`
@@ -1275,8 +1319,26 @@ type PrefixEntry struct {
 	HasBoost        bool    `json:"-"`
 }
 
+func (p PrefixEntry) MarshalJSON() ([]byte, error) {
+	var boostPtr *float64
+	if p.HasBoost || (p.Boost != 0 && p.Boost != 1.0) {
+		b := p.Boost
+		boostPtr = &b
+	}
+	return json.Marshal(struct {
+		Value           string   `json:"value"`
+		CaseInsensitive bool     `json:"case_insensitive,omitempty"`
+		Boost           *float64 `json:"boost,omitempty"`
+	}{
+		Value:           p.Value,
+		CaseInsensitive: p.CaseInsensitive,
+		Boost:           boostPtr,
+	})
+}
+
 func (p *PrefixEntry) UnmarshalJSON(data []byte) error {
 	p.Boost = 1.0
+	p.HasBoost = false
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		var full struct {
@@ -1321,8 +1383,26 @@ type WildcardEntry struct {
 	HasBoost        bool    `json:"-"`
 }
 
+func (w WildcardEntry) MarshalJSON() ([]byte, error) {
+	var boostPtr *float64
+	if w.HasBoost || (w.Boost != 0 && w.Boost != 1.0) {
+		b := w.Boost
+		boostPtr = &b
+	}
+	return json.Marshal(struct {
+		Value           string   `json:"value"`
+		CaseInsensitive bool     `json:"case_insensitive,omitempty"`
+		Boost           *float64 `json:"boost,omitempty"`
+	}{
+		Value:           w.Value,
+		CaseInsensitive: w.CaseInsensitive,
+		Boost:           boostPtr,
+	})
+}
+
 func (w *WildcardEntry) UnmarshalJSON(data []byte) error {
 	w.Boost = 1.0
+	w.HasBoost = false
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		var full struct {
@@ -1367,8 +1447,26 @@ type RegexpEntry struct {
 	HasBoost        bool    `json:"-"`
 }
 
+func (r RegexpEntry) MarshalJSON() ([]byte, error) {
+	var boostPtr *float64
+	if r.HasBoost || (r.Boost != 0 && r.Boost != 1.0) {
+		b := r.Boost
+		boostPtr = &b
+	}
+	return json.Marshal(struct {
+		Value           string   `json:"value"`
+		CaseInsensitive bool     `json:"case_insensitive,omitempty"`
+		Boost           *float64 `json:"boost,omitempty"`
+	}{
+		Value:           r.Value,
+		CaseInsensitive: r.CaseInsensitive,
+		Boost:           boostPtr,
+	})
+}
+
 func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
 	r.Boost = 1.0
+	r.HasBoost = false
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		var full struct {
@@ -1414,10 +1512,37 @@ type MatchEntry struct {
 	MinimumShouldMatch any     `json:"minimum_should_match,omitempty"`
 	Fuzziness          any     `json:"fuzziness,omitempty"`
 	Lenient            *bool   `json:"lenient,omitempty"`
+	HasBoost           bool    `json:"-"`
+}
+
+func (m MatchEntry) MarshalJSON() ([]byte, error) {
+	var boostPtr *float64
+	if m.HasBoost || (m.Boost != 0 && m.Boost != 1.0) {
+		b := m.Boost
+		boostPtr = &b
+	}
+	return json.Marshal(struct {
+		Query              any      `json:"query"`
+		Operator           string   `json:"operator,omitempty"`
+		Boost              *float64 `json:"boost,omitempty"`
+		ZeroTermsQuery     string   `json:"zero_terms_query,omitempty"`
+		MinimumShouldMatch any      `json:"minimum_should_match,omitempty"`
+		Fuzziness          any      `json:"fuzziness,omitempty"`
+		Lenient            *bool    `json:"lenient,omitempty"`
+	}{
+		Query:              m.Query,
+		Operator:           m.Operator,
+		Boost:              boostPtr,
+		ZeroTermsQuery:     m.ZeroTermsQuery,
+		MinimumShouldMatch: m.MinimumShouldMatch,
+		Fuzziness:          m.Fuzziness,
+		Lenient:            m.Lenient,
+	})
 }
 
 func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 	m.Boost = 1.0
+	m.HasBoost = false
 	m.Operator = "or"
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
@@ -1439,6 +1564,7 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 		}
 		if full.Boost != nil {
 			m.Boost = *full.Boost
+			m.HasBoost = true
 		}
 		m.ZeroTermsQuery = full.ZeroTermsQuery
 		m.MinimumShouldMatch = full.MinimumShouldMatch
@@ -1457,10 +1583,37 @@ type PhraseEntry struct {
 	ZeroTermsQuery     string  `json:"zero_terms_query,omitempty"`
 	Fuzziness          any     `json:"fuzziness,omitempty"`
 	Boost              float64 `json:"boost,omitempty"`
+	HasBoost           bool    `json:"-"`
+}
+
+func (p PhraseEntry) MarshalJSON() ([]byte, error) {
+	var boostPtr *float64
+	if p.HasBoost || (p.Boost != 0 && p.Boost != 1.0) {
+		b := p.Boost
+		boostPtr = &b
+	}
+	return json.Marshal(struct {
+		Query              string   `json:"query"`
+		Slop               int      `json:"slop,omitempty"`
+		Operator           string   `json:"operator,omitempty"`
+		MinimumShouldMatch any      `json:"minimum_should_match,omitempty"`
+		ZeroTermsQuery     string   `json:"zero_terms_query,omitempty"`
+		Fuzziness          any      `json:"fuzziness,omitempty"`
+		Boost              *float64 `json:"boost,omitempty"`
+	}{
+		Query:              p.Query,
+		Slop:               p.Slop,
+		Operator:           p.Operator,
+		MinimumShouldMatch: p.MinimumShouldMatch,
+		ZeroTermsQuery:     p.ZeroTermsQuery,
+		Fuzziness:          p.Fuzziness,
+		Boost:              boostPtr,
+	})
 }
 
 func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 	p.Boost = 1.0
+	p.HasBoost = false
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		var full struct {
@@ -1485,6 +1638,7 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 		p.Fuzziness = full.Fuzziness
 		if full.Boost != nil {
 			p.Boost = *full.Boost
+			p.HasBoost = true
 		}
 		return nil
 	}
@@ -2650,6 +2804,19 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 		}
 		var geoMap map[string]any
 		_ = json.Unmarshal(rawVal, &geoMap)
+		if geoMap == nil {
+			geoMap = make(map[string]any)
+		}
+		for _, siblingKey := range []string{"unit", "distance_type", "validation_method", "ignore_unmapped"} {
+			if _, exists := geoMap[siblingKey]; !exists {
+				if rawOpt, hasOpt := m[siblingKey]; hasOpt {
+					var optVal any
+					if json.Unmarshal(rawOpt, &optVal) == nil {
+						geoMap[siblingKey] = optVal
+					}
+				}
+			}
+		}
 		s.Entry = SortFieldSpec{Field: "_geo_distance", Order: order, Mode: mode, Missing: missing, Nested: nestedSpec, Script: geoMap}
 		return nil
 	}
@@ -2955,6 +3122,8 @@ type MappingSpec struct {
 type FieldProperty struct {
 	Type            string                   `json:"type,omitempty"`
 	Dynamic         any                      `json:"dynamic,omitempty"`
+	Enabled         *bool                    `json:"enabled,omitempty"`
+	Index           *bool                    `json:"index,omitempty"`
 	Path            string                   `json:"path,omitempty"`
 	Analyzer        string                   `json:"analyzer,omitempty"`
 	SearchAnalyzer  string                   `json:"search_analyzer,omitempty"`
@@ -3020,15 +3189,21 @@ type BulkOperation struct {
 }
 
 type bulkActionMeta struct {
-	Index           string `json:"_index"`
-	ID              string `json:"_id"`
-	Pipeline        string `json:"pipeline,omitempty"`
-	Routing         string `json:"routing,omitempty"`
-	IfSeqNo         *int64 `json:"if_seq_no,omitempty"`
-	IfPrimaryTerm   *int64 `json:"if_primary_term,omitempty"`
-	Version         *int64 `json:"version,omitempty"`
-	VersionType     string `json:"version_type,omitempty"`
-	RetryOnConflict *int   `json:"retry_on_conflict,omitempty"`
+	Index             string `json:"_index"`
+	ID                any    `json:"_id"`
+	Pipeline          string `json:"pipeline,omitempty"`
+	Routing           string `json:"routing,omitempty"`
+	UnderscoreRouting string `json:"_routing,omitempty"`
+	IfSeqNo           *int64 `json:"if_seq_no,omitempty"`
+	UnderscoreIfSeqNo *int64 `json:"_if_seq_no,omitempty"`
+	IfPrimaryTerm     *int64 `json:"if_primary_term,omitempty"`
+	UnderscorePrimTrm *int64 `json:"_if_primary_term,omitempty"`
+	Version           *int64 `json:"version,omitempty"`
+	UnderscoreVersion *int64 `json:"_version,omitempty"`
+	VersionType       string `json:"version_type,omitempty"`
+	UnderscoreVerType string `json:"_version_type,omitempty"`
+	RetryOnConflict   *int   `json:"retry_on_conflict,omitempty"`
+	UnderscoreRetry   *int   `json:"_retry_on_conflict,omitempty"`
 }
 
 type bulkActionLine struct {
@@ -3052,7 +3227,9 @@ func ParseBulkNDJSON(r io.Reader, defaultIndex string) ([]BulkOperation, error) 
 			continue
 		}
 		var actionLine bulkActionLine
-		if err := json.Unmarshal(line, &actionLine); err != nil {
+		dec := json.NewDecoder(bytes.NewReader(line))
+		dec.UseNumber()
+		if err := dec.Decode(&actionLine); err != nil {
 			return nil, fmt.Errorf("invalid bulk action metadata line: %w", err)
 		}
 		var op BulkOperation
@@ -3077,14 +3254,34 @@ func ParseBulkNDJSON(r io.Reader, defaultIndex string) ([]BulkOperation, error) 
 		if op.Index == "" {
 			op.Index = defaultIndex
 		}
-		op.ID = meta.ID
+		if meta.ID != nil {
+			op.ID = fmt.Sprintf("%v", meta.ID)
+		}
 		op.Pipeline = meta.Pipeline
 		op.Routing = meta.Routing
+		if op.Routing == "" {
+			op.Routing = meta.UnderscoreRouting
+		}
 		op.IfSeqNo = meta.IfSeqNo
+		if op.IfSeqNo == nil {
+			op.IfSeqNo = meta.UnderscoreIfSeqNo
+		}
 		op.IfPrimaryTerm = meta.IfPrimaryTerm
+		if op.IfPrimaryTerm == nil {
+			op.IfPrimaryTerm = meta.UnderscorePrimTrm
+		}
 		op.Version = meta.Version
+		if op.Version == nil {
+			op.Version = meta.UnderscoreVersion
+		}
 		op.VersionType = meta.VersionType
+		if op.VersionType == "" {
+			op.VersionType = meta.UnderscoreVerType
+		}
 		op.RetryOnConflict = meta.RetryOnConflict
+		if op.RetryOnConflict == nil {
+			op.RetryOnConflict = meta.UnderscoreRetry
+		}
 		if op.ID == "" {
 			if op.Action == "index" || op.Action == "create" {
 				op.ID = NextAutoID()
