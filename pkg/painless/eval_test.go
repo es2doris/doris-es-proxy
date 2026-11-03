@@ -1156,3 +1156,51 @@ func TestRound34PainlessAllocationBudgetBitwiseAndNoop(t *testing.T) {
 		t.Fatalf("F24 expected noop for 10.0 vs 10, got %q", opRes)
 	}
 }
+
+func TestRound41PainlessTokenizerMapVarKeyForLoopPlusAndConvertBoolean(t *testing.T) {
+	// F21: Escaped backslashes before quote and semicolons inside regex literal
+	val, err := Eval(map[string]any{"msg": "a;b;c"}, `
+		String slash = 'x\\';
+		def parts = doc['msg'].value.split(/;/);
+		return [slash, parts.length];
+	`, nil)
+	if err != nil {
+		t.Fatalf("F21 Eval failed: %v", err)
+	}
+	arr, ok := val.([]any)
+	if !ok || len(arr) != 2 || arr[0] != `x\` || arr[1] != int64(3) {
+		t.Fatalf("F21 unexpected result: %+v", val)
+	}
+
+	// F22 & F23: Dynamic variable key in map bracket assignment + i = i + 1 in for-loop header + regex with '+'
+	val2, err := Eval(map[string]any{"text": "foo   bar"}, `
+		def m = [:];
+		for (int i = 0; i < 3; i = i + 1) {
+			String k = 'k' + i;
+			m[k] = i * 10;
+		}
+		String norm = doc['text'].value.replaceAll(/\s+/, '-');
+		int idx = 1;
+		String dynKey = 'k' + idx;
+		return [m['k0'], m[dynKey], m['k2'], norm];
+	`, nil)
+	if err != nil {
+		t.Fatalf("F22/F23 Eval failed: %v", err)
+	}
+	arr2, ok := val2.([]any)
+	if !ok || len(arr2) != 4 || arr2[0] != int64(0) || arr2[1] != int64(10) || arr2[2] != int64(20) || arr2[3] != "foo-bar" {
+		t.Fatalf("F22/F23 unexpected result: %+v", val2)
+	}
+
+	// F24: ctx._source.remove('nested.child') removes nested path
+	doc := map[string]any{
+		"nested": map[string]any{"child": "drop_me", "keep": "stay"},
+	}
+	if err := EvalPainless(doc, `ctx._source.remove('nested.child');`, nil); err != nil {
+		t.Fatalf("F24 remove('nested.child') failed: %v", err)
+	}
+	nestedMap, _ := doc["nested"].(map[string]any)
+	if _, exists := nestedMap["child"]; exists || nestedMap["keep"] != "stay" {
+		t.Fatalf("F24 expected nested.child removed and nested.keep preserved, got %+v", nestedMap)
+	}
+}

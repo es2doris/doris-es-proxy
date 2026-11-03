@@ -382,6 +382,20 @@ func markExplicitParamsKey(params map[string]any, key string) {
 	if ld, ok := params["__loop_declared"].(map[string]bool); ok {
 		delete(ld, key)
 	}
+	if ep, ok := params["__explicit_params_keys"].(map[string]bool); ok {
+		ep[key] = true
+	} else {
+		params["__explicit_params_keys"] = map[string]bool{key: true}
+	}
+}
+
+func unmarkExplicitParamsKey(params map[string]any, key string) {
+	if params == nil || key == "" {
+		return
+	}
+	if ep, ok := params["__explicit_params_keys"].(map[string]bool); ok {
+		delete(ep, key)
+	}
 }
 
 func parseUserFuncDecl(stmt string) (*painlessUserFunc, bool) {
@@ -450,11 +464,16 @@ func getOrInitEvalBudget(params map[string]any) *evalBudget {
 
 // Eval evaluates a Painless script expression or multi-statement block and returns its result value.
 func Eval(sourceMap map[string]any, scriptSource string, params map[string]any) (any, error) {
-	evalParams := make(map[string]any, len(params)+3)
+	evalParams := make(map[string]any, len(params)+4)
+	explicitParams := make(map[string]bool, len(params))
 	for k, v := range params {
 		evalParams[k] = v
+		if !isInternalPainlessMapKey(nil, k) {
+			explicitParams[k] = true
+		}
 	}
 	evalParams["__script_locals"] = make(map[string]bool)
+	evalParams["__explicit_params_keys"] = explicitParams
 	if sourceMap != nil && evalParams["_source"] == nil {
 		evalParams["_source"] = sourceMap
 	}
@@ -603,11 +622,16 @@ func EvalPainless(sourceMap map[string]any, scriptSource string, params map[stri
 // EvalPainlessWithOp evaluates a Painless script and returns any `ctx.op` set by the script.
 func EvalPainlessWithOp(sourceMap map[string]any, scriptSource string, params map[string]any) (string, error) {
 	origVer, hadOrigVer := params["_ctx_version"]
-	evalParams := make(map[string]any, len(params)+5)
+	evalParams := make(map[string]any, len(params)+6)
+	explicitParams := make(map[string]bool, len(params))
 	for k, v := range params {
 		evalParams[k] = v
+		if !isInternalPainlessMapKey(nil, k) {
+			explicitParams[k] = true
+		}
 	}
 	evalParams["__script_locals"] = make(map[string]bool)
+	evalParams["__explicit_params_keys"] = explicitParams
 	if sourceMap != nil {
 		if _, exists := evalParams["_source"]; !exists {
 			evalParams["_source"] = sourceMap
@@ -912,11 +936,12 @@ func execSwitchStatement(sourceMap map[string]any, stmt string, params map[strin
 }
 
 func syncLoopScopeBack(params, loopParams map[string]any, preExistingKeys, excludedVars, loopDeclared map[string]bool) {
+	ep, _ := loopParams["__explicit_params_keys"].(map[string]bool)
 	for k, v := range loopParams {
 		if k == "__loop_declared" {
 			continue
 		}
-		if (preExistingKeys[k] && !excludedVars[k] && !loopDeclared[k]) || k == "_return_val" || k == "_ctx_op" || k == "_ctx_id" || k == "_ctx_index" || k == "_ctx_routing" || k == "_ctx_version" {
+		if (ep != nil && ep[k]) || (preExistingKeys[k] && !excludedVars[k] && !loopDeclared[k]) || k == "_return_val" || k == "_ctx_op" || k == "_ctx_id" || k == "_ctx_index" || k == "_ctx_routing" || k == "_ctx_version" {
 			params[k] = v
 		} else if strings.HasPrefix(k, "__alias_") {
 			baseVar := strings.TrimPrefix(k, "__alias_")
@@ -926,12 +951,21 @@ func syncLoopScopeBack(params, loopParams map[string]any, preExistingKeys, exclu
 		}
 	}
 	for k := range preExistingKeys {
+		if k == "__loop_declared" || k == "__script_locals" || k == "__explicit_params_keys" || k == "__eval_budget" || k == "__user_funcs" || k == "__reassigned_vars" {
+			continue
+		}
 		if strings.HasPrefix(k, "__alias_") {
 			baseVar := strings.TrimPrefix(k, "__alias_")
 			if !excludedVars[baseVar] && !loopDeclared[baseVar] {
 				if _, stillExists := loopParams[k]; !stillExists {
 					delete(params, k)
 				}
+			}
+			continue
+		}
+		if !excludedVars[k] && !loopDeclared[k] {
+			if _, stillExists := loopParams[k]; !stillExists {
+				delete(params, k)
 			}
 		}
 	}
@@ -1132,16 +1166,34 @@ func matchesCatchException(err error, excTypes []string) bool {
 	return false
 }
 
+func isUnrecoverableSandboxError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "exceeded maximum step budget") ||
+		strings.Contains(msg, "exceeded maximum recursion depth") ||
+		strings.Contains(msg, "exceeded maximum size")
+}
+
 func execTryStatement(sourceMap map[string]any, stmt string, params map[string]any, ctxOp *string, budget *evalBudget) error {
 	tryBody, catches, finallyBody, hasFinally, ok := parseTryStatement(stmt)
 	if !ok {
 		return nil
 	}
 	tryErr := execBlock(sourceMap, tryBody, params, ctxOp, budget)
+	if isUnrecoverableSandboxError(tryErr) {
+		return tryErr
+	}
 	if tryErr != nil && !errors.Is(tryErr, errPainlessReturn) && !errors.Is(tryErr, errPainlessBreak) && !errors.Is(tryErr, errPainlessContinue) {
 		for _, clause := range catches {
 			if matchesCatchException(tryErr, clause.excTypes) {
 				prevVal, hadPrev := params[clause.varName]
+				sl, _ := params["__script_locals"].(map[string]bool)
+				hadSL := sl != nil && sl[clause.varName]
+				if sl != nil && !hadPrev {
+					sl[clause.varName] = true
+				}
 				msg := tryErr.Error()
 				exType := "RuntimeException"
 				var pEx *painlessExceptionError
@@ -1161,6 +1213,12 @@ func execTryStatement(sourceMap map[string]any, stmt string, params map[string]a
 					params[clause.varName] = prevVal
 				} else {
 					delete(params, clause.varName)
+					if sl != nil && !hadSL {
+						delete(sl, clause.varName)
+					}
+				}
+				if isUnrecoverableSandboxError(tryErr) {
+					return tryErr
 				}
 				break
 			}
@@ -1168,12 +1226,21 @@ func execTryStatement(sourceMap map[string]any, stmt string, params map[string]a
 	}
 	if hasFinally {
 		savedRet, hadRet := params["_return_val"]
+		savedLast, hadLast := params["_last_expr_val"]
 		delete(params, "_return_val")
+		delete(params, "_last_expr_val")
 		finErr := execBlock(sourceMap, finallyBody, params, ctxOp, budget)
 		if finErr != nil {
 			tryErr = finErr
-		} else if hadRet {
-			params["_return_val"] = savedRet
+		} else {
+			if hadRet {
+				params["_return_val"] = savedRet
+			}
+			if hadLast {
+				params["_last_expr_val"] = savedLast
+			} else {
+				delete(params, "_last_expr_val")
+			}
 		}
 	}
 	return tryErr
@@ -1236,11 +1303,14 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 				if m := reLocalVarAssign.FindStringSubmatch(fullSubInit); m != nil {
 					if initTypePrefix != "" || reVarTypeDeclPrefix.MatchString(fullSubInit) {
 						initVars[m[1]] = true
+						loopDeclared[m[1]] = true
 					} else if _, existed := params[m[1]]; !existed {
 						initVars[m[1]] = true
+						loopDeclared[m[1]] = true
 					}
 				} else if m := reNullVarDecl.FindStringSubmatch(fullSubInit); m != nil {
 					initVars[m[1]] = true
+					loopDeclared[m[1]] = true
 				}
 				if err := execSimpleStmt(sourceMap, fullSubInit, loopParams, ctxOp, budget); err != nil {
 					return err
@@ -1283,29 +1353,7 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 				}
 			}
 		}
-		for k, v := range loopParams {
-			if k == "__loop_declared" {
-				continue
-			}
-			if (preExistingKeys[k] && !initVars[k] && !loopDeclared[k]) || k == "_return_val" || k == "_ctx_op" || k == "_ctx_id" || k == "_ctx_index" || k == "_ctx_routing" || k == "_ctx_version" {
-				params[k] = v
-			} else if strings.HasPrefix(k, "__alias_") {
-				baseVar := strings.TrimPrefix(k, "__alias_")
-				if preExistingKeys[baseVar] && !initVars[baseVar] && !loopDeclared[baseVar] {
-					params[k] = v
-				}
-			}
-		}
-		for k := range preExistingKeys {
-			if strings.HasPrefix(k, "__alias_") {
-				baseVar := strings.TrimPrefix(k, "__alias_")
-				if !initVars[baseVar] && !loopDeclared[baseVar] {
-					if _, stillExists := loopParams[k]; !stillExists {
-						delete(params, k)
-					}
-				}
-			}
-		}
+		syncLoopScopeBack(params, loopParams, preExistingKeys, initVars, loopDeclared)
 		return loopErr
 	} else if idx, sepLen := findTopLevelForInOrColon(header); idx >= 0 {
 		varName = strings.TrimSpace(header[:idx])
@@ -1357,6 +1405,9 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 		loopParams[k] = v
 	}
 	loopDeclared := make(map[string]bool)
+	if !preExistingKeys[varName] || len(fields) > 1 {
+		loopDeclared[varName] = true
+	}
 	loopParams["__loop_declared"] = loopDeclared
 	var loopErr error
 	for _, item := range snapshot {
@@ -1376,29 +1427,7 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 			break
 		}
 	}
-	for k, v := range loopParams {
-		if k == "__loop_declared" {
-			continue
-		}
-		if (preExistingKeys[k] && k != varName && !loopDeclared[k]) || k == "_return_val" || k == "_ctx_op" || k == "_ctx_id" || k == "_ctx_index" || k == "_ctx_routing" || k == "_ctx_version" {
-			params[k] = v
-		} else if strings.HasPrefix(k, "__alias_") {
-			baseVar := strings.TrimPrefix(k, "__alias_")
-			if preExistingKeys[baseVar] && baseVar != varName && !loopDeclared[baseVar] {
-				params[k] = v
-			}
-		}
-	}
-	for k := range preExistingKeys {
-		if strings.HasPrefix(k, "__alias_") {
-			baseVar := strings.TrimPrefix(k, "__alias_")
-			if baseVar != varName && !loopDeclared[baseVar] {
-				if _, stillExists := loopParams[k]; !stillExists {
-					delete(params, k)
-				}
-			}
-		}
-	}
+	syncLoopScopeBack(params, loopParams, preExistingKeys, map[string]bool{varName: true}, loopDeclared)
 	return loopErr
 }
 
@@ -1641,6 +1670,37 @@ func findLambdaBodyEndPainless(s string, bodyStart int) int {
 	return len(s)
 }
 
+func isInsideCallArgsOrBrackets(s string, targetIdx int) bool {
+	inQuotes := byte(0)
+	inRegexClass := false
+	for i := 0; i < targetIdx && i < len(s); i++ {
+		if stepQuoteState(s, i, &inQuotes, &inRegexClass) {
+			continue
+		}
+		if s[i] == '(' && i > 0 && isIdentByte(s[i-1]) {
+			closeP := findMatchingDelimiter(s, i, '(', ')')
+			if closeP > targetIdx {
+				return true
+			}
+			if closeP > i {
+				i = closeP
+				continue
+			}
+		}
+		if s[i] == '[' {
+			closeB := findMatchingDelimiter(s, i, '[', ']')
+			if closeB > targetIdx {
+				return true
+			}
+			if closeB > i {
+				i = closeB
+				continue
+			}
+		}
+	}
+	return false
+}
+
 func expandDynamicBrackets(s string, sourceMap map[string]any, params map[string]any, depth int) string {
 	if (strings.IndexByte(s, '[') < 0 && !strings.Contains(s, ".get(")) || depth > 64 {
 		return s
@@ -1661,9 +1721,17 @@ func expandDynamicBrackets(s string, sourceMap map[string]any, params map[string
 			i = endIdx - 1
 			continue
 		}
-		if c == '[' && i > 0 {
+		if c == '(' && i > 0 && isIdentByte(s[i-1]) {
+			closeParen := findMatchingDelimiter(s, i, '(', ')')
+			if closeParen > i {
+				out.WriteString(s[i : closeParen+1])
+				i = closeParen
+				continue
+			}
+		}
+		if c == '[' {
 			closeIdx := findMatchingDelimiter(s, i, '[', ']')
-			if closeIdx > i+1 {
+			if closeIdx > i+1 && i > 0 {
 				if isRecv, hasSafeDot := isBracketReceiverAt(s, i, closeIdx); isRecv {
 					inner := strings.TrimSpace(s[i+1 : closeIdx])
 					if len(inner) >= 2 && (inner[0] == '\'' || inner[0] == '"') && inner[len(inner)-1] == inner[0] {
@@ -1717,6 +1785,11 @@ func expandDynamicBrackets(s string, sourceMap map[string]any, params map[string
 					}
 				}
 			}
+			if closeIdx > i && (i == 0 || func() bool { r, _ := isBracketReceiverAt(s, i, closeIdx); return !r }()) {
+				out.WriteString(s[i : closeIdx+1])
+				i = closeIdx
+				continue
+			}
 		}
 		out.WriteByte(c)
 	}
@@ -1739,6 +1812,10 @@ func expandDynamicBrackets(s string, sourceMap map[string]any, params map[string
 		closeParen := findMatchingDelimiter(res, openParen, '(', ')')
 		if closeParen <= openParen {
 			break
+		}
+		if isInsideCallArgsOrBrackets(res, getIdx) {
+			searchFrom = closeParen + 1
+			continue
 		}
 		after := strings.TrimSpace(res[closeParen+1:])
 		isChainedOrAssign := false
@@ -1886,9 +1963,78 @@ func syncSourceAliasToLocalVars(sourceMap map[string]any, params map[string]any,
 	}
 }
 
+func findTopLevelAssignOpStartPainless(s string) int {
+	depth := 0
+	inQuotes := byte(0)
+	inRegexClass := false
+	for i := 0; i < len(s); i++ {
+		if stepQuoteState(s, i, &inQuotes, &inRegexClass) {
+			continue
+		}
+		c := s[i]
+		switch c {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		case '=':
+			if depth == 0 {
+				if i+1 < len(s) && (s[i+1] == '=' || s[i+1] == '~') {
+					i++
+					continue
+				}
+				if i > 0 && (s[i-1] == '=' || s[i-1] == '!' || s[i-1] == '~') {
+					continue
+				}
+				if i > 0 && s[i-1] == '<' && (i < 2 || s[i-2] != '<') {
+					continue
+				}
+				if i > 0 && s[i-1] == '>' && (i < 2 || s[i-2] != '>') {
+					continue
+				}
+				if i >= 3 && s[i-3:i] == ">>>" {
+					return i - 3
+				}
+				if i >= 2 && (s[i-2:i] == "<<" || s[i-2:i] == ">>") {
+					return i - 2
+				}
+				if i >= 1 && strings.IndexByte("+-*/%&|^", s[i-1]) >= 0 {
+					return i - 1
+				}
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func expandStmtTargetsOnly(stmt string, sourceMap, params map[string]any) string {
+	stmt = strings.TrimSpace(stmt)
+	if stmt == "return" || strings.HasPrefix(stmt, "return ") || strings.HasPrefix(stmt, "return;") ||
+		strings.HasPrefix(stmt, "return(") || strings.HasPrefix(stmt, "return[") ||
+		strings.HasPrefix(stmt, "return'") || strings.HasPrefix(stmt, "return\"") || strings.HasPrefix(stmt, "return/") ||
+		stmt == "break" || stmt == "continue" ||
+		stmt == "throw" || strings.HasPrefix(stmt, "throw ") || strings.HasPrefix(stmt, "throw(") ||
+		reVarTypeDeclPrefix.MatchString(stmt) {
+		return stmt
+	}
+	if opStart := findTopLevelAssignOpStartPainless(stmt); opStart > 0 {
+		lhs := expandDynamicBrackets(stmt[:opStart], sourceMap, params, 0)
+		return strings.TrimSpace(lhs + stmt[opStart:])
+	}
+	if strings.HasPrefix(stmt, "++") || strings.HasPrefix(stmt, "--") ||
+		strings.HasSuffix(stmt, "++") || strings.HasSuffix(stmt, "--") ||
+		(strings.HasSuffix(stmt, ")") && !strings.HasPrefix(stmt, "(")) {
+		return strings.TrimSpace(expandDynamicBrackets(stmt, sourceMap, params, 0))
+	}
+	return stmt
+}
+
 func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any, ctxOp *string, budget *evalBudget) error {
 	delete(params, "_last_expr_val")
-	stmt = strings.TrimSpace(expandDynamicBrackets(stmt, sourceMap, params, 0))
+	stmt = expandStmtTargetsOnly(stmt, sourceMap, params)
 	if stmt == "return" || strings.HasPrefix(stmt, "return ") || strings.HasPrefix(stmt, "return;") || strings.HasPrefix(stmt, "return(") || strings.HasPrefix(stmt, "return[") || strings.HasPrefix(stmt, "return'") || strings.HasPrefix(stmt, "return\"") || strings.HasPrefix(stmt, "return/") {
 		retExpr := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(stmt, "return")), ";"))
 		if retExpr == "" {
@@ -1992,6 +2138,9 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			curVal := resolveParamPath(params, path)
 			nextVal := applyArithmetic(curVal, int64(1), op == "++")
 			setValueAtPath(params, path, nextVal)
+			if len(rawPath) > 0 && decodeBracketSeg(rawPath[0]) == "params" && len(path) == 1 {
+				markExplicitParamsKey(params, decodeBracketSeg(path[0]))
+			}
 			latchCtxMetaOnBudget(budget, path, nextVal)
 			if isPrefix {
 				params["_last_expr_val"] = nextVal
@@ -2460,7 +2609,11 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 				if err != nil {
 					return err
 				}
-				params["_last_expr_val"] = removeKeyValueAtPath(params, parentPath, kVal, vVal)
+				removed := removeKeyValueAtPath(params, parentPath, kVal, vVal)
+				if isRootParams && removed && kVal != nil {
+					unmarkExplicitParamsKey(params, fmt.Sprintf("%v", kVal))
+				}
+				params["_last_expr_val"] = removed
 				if rootVar != "" {
 					syncLocalVarAlias(sourceMap, params, rootVar)
 				}
@@ -2471,6 +2624,9 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 				return err
 			}
 			params["_last_expr_val"] = removeKeyOrIndexAtPath(params, parentPath, argVal)
+			if isRootParams && argVal != nil {
+				unmarkExplicitParamsKey(params, fmt.Sprintf("%v", argVal))
+			}
 			if rootVar != "" {
 				syncLocalVarAlias(sourceMap, params, rootVar)
 			}
@@ -2492,6 +2648,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 				for k := range params {
 					if !isInternalPainlessMapKey(params, k) {
 						delete(params, k)
+						unmarkExplicitParamsKey(params, k)
 					}
 				}
 			} else {
@@ -2617,6 +2774,9 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			nextVal = applyBitwiseAssign(curVal, rhsVal, op)
 		}
 		setValueAtPath(params, path, nextVal)
+		if len(rawPath) > 0 && decodeBracketSeg(rawPath[0]) == "params" && len(path) == 1 {
+			markExplicitParamsKey(params, decodeBracketSeg(path[0]))
+		}
 		latchCtxMetaOnBudget(budget, path, nextVal)
 		params["_last_expr_val"] = nextVal
 		if len(path) > 1 {
@@ -2720,6 +2880,9 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			return err
 		}
 		params[varName] = val
+		if rv, ok := params["__reassigned_vars"].(map[string]bool); ok {
+			rv[varName] = true
+		}
 		matchedAlias := false
 		if rhsExpr == "ctx._source" || rhsExpr == "ctx?._source" || rhsExpr == "ctx._source?" || rhsExpr == "ctx?._source?" ||
 			rhsExpr == "params._source" || rhsExpr == "params?._source" {
@@ -2778,6 +2941,9 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			}
 		}
 		params[m[1]] = nil
+		if rv, ok := params["__reassigned_vars"].(map[string]bool); ok {
+			rv[m[1]] = true
+		}
 		delete(params, "__alias_"+m[1])
 		return nil
 	}
@@ -3129,7 +3295,7 @@ func evalConditionDepth(sourceMap map[string]any, cond string, params map[string
 	if depth > 64 {
 		return false
 	}
-	cond = trimBalancedParens(expandDynamicBrackets(cond, sourceMap, params, depth+1))
+	cond = trimBalancedParens(cond)
 	if cond == "" || cond == "false" {
 		return false
 	}
@@ -3250,6 +3416,7 @@ func evalConditionDepth(sourceMap map[string]any, cond string, params map[string
 		typeName := strings.TrimSpace(cond[idx+len(" instanceof "):])
 		return evalInstanceOfPainless(lhs, typeName)
 	}
+	cond = trimBalancedParens(expandDynamicBrackets(cond, sourceMap, params, depth+1))
 
 	// Check `.isEmpty()`
 	if strings.HasSuffix(cond, ".isEmpty()") {
@@ -3331,7 +3498,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 	if depth > 64 {
 		return nil, fmt.Errorf("painless expression exceeded maximum recursion depth (64)")
 	}
-	rhs = trimBalancedParens(expandDynamicBrackets(rhs, sourceMap, params, depth+1))
+	rhs = trimBalancedParens(rhs)
 	if len(rhs) >= 3 && rhs[0] == '/' && findMatchingRegexSlash(rhs, 0) == len(rhs)-1 {
 		return rhs, nil
 	}
@@ -3455,6 +3622,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			return innerVal, nil
 		}
 	}
+	rhs = trimBalancedParens(expandDynamicBrackets(rhs, sourceMap, params, depth+1))
 	if m := reCtxIncDec.FindStringSubmatch(rhs); m != nil {
 		isPrefix := m[1] != ""
 		op := m[1]
@@ -3490,6 +3658,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			curVal := resolveParamPath(params, path)
 			nextVal := applyArithmetic(curVal, int64(1), op == "++")
 			setValueAtPath(params, path, nextVal)
+			if len(rawPath) > 0 && decodeBracketSeg(rawPath[0]) == "params" && len(path) == 1 {
+				markExplicitParamsKey(params, decodeBracketSeg(path[0]))
+			}
 			latchCtxMetaOnBudget(getOrInitEvalBudget(params), path, nextVal)
 			if len(path) > 1 {
 				syncLocalVarAlias(sourceMap, params, decodeBracketSeg(path[0]))
@@ -3925,7 +4096,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					rawPath := strings.Split(cleanRec, ".")
 					parentPath := normalizeLocalLHSPath(rawPath, params)
 					if len(parentPath) == 0 && len(rawPath) == 1 && decodeBracketSeg(rawPath[0]) == "params" {
-						return removeKeyValueAtPath(params, nil, kVal, vVal), nil
+						removed := removeKeyValueAtPath(params, nil, kVal, vVal)
+						if removed && kVal != nil {
+							unmarkExplicitParamsKey(params, fmt.Sprintf("%v", kVal))
+						}
+						return removed, nil
 					}
 					if len(parentPath) > 0 {
 						rootVar := decodeBracketSeg(parentPath[0])
@@ -3953,7 +4128,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				rawPath := strings.Split(cleanRec, ".")
 				parentPath := normalizeLocalLHSPath(rawPath, params)
 				if len(parentPath) == 0 && len(rawPath) == 1 && decodeBracketSeg(rawPath[0]) == "params" {
-					return removeKeyOrIndexAtPath(params, nil, argVal), nil
+					removed := removeKeyOrIndexAtPath(params, nil, argVal)
+					if argVal != nil {
+						unmarkExplicitParamsKey(params, fmt.Sprintf("%v", argVal))
+					}
+					return removed, nil
 				}
 				if len(parentPath) > 0 {
 					rootVar := decodeBracketSeg(parentPath[0])
@@ -4352,8 +4531,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					kVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
 					defVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
 					if kVal != nil {
-						if v, exists := tv[fmt.Sprintf("%v", kVal)]; exists && v != nil {
-							return v, nil
+						kStr := fmt.Sprintf("%v", kVal)
+						if !isInternalPainlessMapKey(tv, kStr) {
+							if v, exists := tv[kStr]; exists && v != nil {
+								return v, nil
+							}
 						}
 					}
 					return defVal, nil
@@ -4720,7 +4902,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				switch tv := recVal.(type) {
 				case map[string]any:
 					if argVal != nil {
-						return tv[fmt.Sprintf("%v", argVal)], nil
+						kStr := fmt.Sprintf("%v", argVal)
+						if isInternalPainlessMapKey(tv, kStr) {
+							return nil, nil
+						}
+						return tv[kStr], nil
 					}
 				case []any:
 					if argVal != nil {
@@ -5119,6 +5305,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			}
 		}
 		path := strings.Split(trimmed, ".")
+		if len(path) > 0 && strings.HasPrefix(decodeBracketSeg(path[0]), "__") {
+			return nil, nil
+		}
 		return resolveParamPath(sourceMap, path), nil
 	}
 	if strings.HasPrefix(rhs, "doc.") || strings.HasPrefix(rhs, "doc?.") {
@@ -5219,11 +5408,18 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				break
 			}
 		}
-		return resolveParamPath(sourceMap, strings.Split(trimmed, ".")), nil
+		path := strings.Split(trimmed, ".")
+		if len(path) > 0 && strings.HasPrefix(decodeBracketSeg(path[0]), "__") {
+			return nil, nil
+		}
+		return resolveParamPath(sourceMap, path), nil
 	}
 	if strings.HasPrefix(rhs, "params.") || strings.HasPrefix(rhs, "params?.") {
 		trimmed := strings.TrimPrefix(strings.TrimPrefix(rhs, "params?."), "params.")
 		paramPath := strings.Split(trimmed, ".")
+		if len(paramPath) > 0 && isInternalPainlessMapKey(params, decodeBracketSeg(paramPath[0])) {
+			return nil, nil
+		}
 		return resolveParamPath(params, paramPath), nil
 	}
 	if val, ok := params[decodeBracketSeg(rhs)]; ok {
@@ -6477,9 +6673,15 @@ func removeKeyOrIndexAtPath(root map[string]any, parentPath []string, keyOrIdx a
 			return nil
 		}
 		k := fmt.Sprintf("%v", keyOrIdx)
-		old := root[k]
-		delete(root, k)
-		return old
+		if old, exists := root[k]; exists {
+			delete(root, k)
+			return old
+		}
+		if strings.Contains(k, ".") {
+			segs := strings.Split(k, ".")
+			return removeKeyOrIndexAtPath(root, segs[:len(segs)-1], segs[len(segs)-1])
+		}
+		return nil
 	}
 	switch target := resolveParamPath(root, parentPath).(type) {
 	case map[string]any:
@@ -6487,9 +6689,16 @@ func removeKeyOrIndexAtPath(root map[string]any, parentPath []string, keyOrIdx a
 			return nil
 		}
 		k := fmt.Sprintf("%v", keyOrIdx)
-		old := target[k]
-		delete(target, k)
-		return old
+		if old, exists := target[k]; exists {
+			delete(target, k)
+			return old
+		}
+		if strings.Contains(k, ".") {
+			segs := strings.Split(k, ".")
+			subPath := append(append([]string(nil), parentPath...), segs[:len(segs)-1]...)
+			return removeKeyOrIndexAtPath(root, subPath, segs[len(segs)-1])
+		}
+		return nil
 	case []any:
 		removeAt := func(idx int) any {
 			old := target[idx]
@@ -7237,13 +7446,22 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 					argVals[i] = av
 				}
 			}
-			fnParams := make(map[string]any, len(params)+len(fn.paramNames)+2)
+			fnParams := make(map[string]any, len(params)+len(fn.paramNames)+4)
 			for k, v := range params {
-				if k == "_return_val" || k == "_last_expr_val" || k == "__loop_declared" {
+				if k == "_return_val" || k == "_last_expr_val" || k == "__loop_declared" || k == "__reassigned_vars" {
 					continue
 				}
 				fnParams[k] = v
 			}
+			fnLocals := make(map[string]bool)
+			if sl, ok := params["__script_locals"].(map[string]bool); ok {
+				for k, v := range sl {
+					fnLocals[k] = v
+				}
+			}
+			fnParams["__script_locals"] = fnLocals
+			reassignedVars := make(map[string]bool)
+			fnParams["__reassigned_vars"] = reassignedVars
 			fnParams["__eval_budget"] = budget
 			callerVarBindings := make(map[string]string, len(fn.paramNames))
 			for i, pName := range fn.paramNames {
@@ -7252,6 +7470,7 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 				} else {
 					fnParams[pName] = nil
 				}
+				fnLocals[pName] = true
 				delete(fnParams, "__alias_"+pName)
 				if i < len(args) {
 					argExpr := strings.TrimSpace(expandDynamicBrackets(strings.TrimSpace(args[i]), sourceMap, params, depth+1))
@@ -7272,7 +7491,9 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 					if !matchedAlias && reSimpleFieldPath.MatchString(argExpr) && !strings.Contains(argExpr, ".") {
 						callerVar := decodeBracketSeg(argExpr)
 						if _, exists := params[callerVar]; exists {
-							callerVarBindings[pName] = callerVar
+							if _, isSlice := argVals[i].([]any); isSlice {
+								callerVarBindings[pName] = callerVar
+							}
 							if aliasPath, ok := params["__alias_"+callerVar].(string); ok && aliasPath != "" {
 								fnParams["__alias_"+pName] = aliasPath
 							}
@@ -7294,10 +7515,21 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			fnCtxOp := ""
 			err := execBlock(sourceMap, fn.body, fnParams, &fnCtxOp, budget)
 			for _, pName := range fn.paramNames {
-				syncLocalVarAlias(sourceMap, fnParams, pName)
-				if callerVar, bound := callerVarBindings[pName]; bound && params != nil {
-					params[callerVar] = fnParams[pName]
-					syncLocalVarAlias(sourceMap, params, callerVar)
+				if !reassignedVars[pName] {
+					syncLocalVarAlias(sourceMap, fnParams, pName)
+					if callerVar, bound := callerVarBindings[pName]; bound && params != nil {
+						params[callerVar] = fnParams[pName]
+						syncLocalVarAlias(sourceMap, params, callerVar)
+					}
+				}
+			}
+			if params != nil {
+				if ep, ok := fnParams["__explicit_params_keys"].(map[string]bool); ok {
+					for k := range ep {
+						if v, exists := fnParams[k]; exists {
+							params[k] = v
+						}
+					}
 				}
 			}
 			if fnCtxOp != "" {
@@ -7711,10 +7943,13 @@ func execPainlessForEach(recExpr, argExpr string, sourceMap, params map[string]a
 		loopParams[k] = v
 	}
 	excludedVars := make(map[string]bool, len(pNames))
+	loopDeclared := make(map[string]bool)
 	for _, n := range pNames {
 		excludedVars[n] = true
+		if !preExistingKeys[n] {
+			loopDeclared[n] = true
+		}
 	}
-	loopDeclared := make(map[string]bool)
 	loopParams["__loop_declared"] = loopDeclared
 	var loopErr error
 

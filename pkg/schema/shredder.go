@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -69,8 +70,11 @@ func ShredDocument(
 		}
 		return nil, fmt.Errorf("invalid document JSON for _id=%q: %w", id, err)
 	}
+	prunedDynamic := false
 	if s != nil && s.RawMapping != nil {
-		if _, err := validateStrictDynamicObject(parsedDoc, s.RawMapping.Properties, s.RawMapping.Dynamic, ""); err != nil {
+		var err error
+		prunedDynamic, err = validateStrictDynamicObject(parsedDoc, s.RawMapping.Properties, s.RawMapping.Dynamic, "")
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -80,7 +84,6 @@ func ShredDocument(
 	row["_version"] = version
 	row["__DORIS_DELETE_SIGN__"] = 0
 	row["_source"] = string(trimmed)
-	row["_doc"] = buildVariantDocPayload(trimmed, s)
 
 	var allTextBuilder strings.Builder
 	allTextBuilder.Grow(len(trimmed) / 2)
@@ -115,22 +118,37 @@ func ShredDocument(
 		if b.EnabledFalse {
 			continue
 		}
+		hasObjAtPath := false
 		if isStrictLeafFieldWithoutSubprops(s, b) && hasObjectValueAtPath(parsedDoc, b.SourceJSONPath) {
 			if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
 				recordIgnored(b.ESFieldPath)
-				continue
+				hasObjAtPath = true
+			} else {
+				return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", b.ESFieldPath, b.ESType)
 			}
-			return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", b.ESFieldPath, b.ESType)
 		}
 		switch b.Kind {
 		case StoragePromotedScalar:
 			if (b.ESType == "text" || b.ESType == "match_only_text") && b.DorisType == DorisString {
 				var val any
-				if strs := extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer, b.NullValue); len(strs) >= 1 {
+				strs := extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer, b.NullValue)
+				if b.IgnoreAbove > 0 && len(strs) > 0 {
+					filtered := strs[:0]
+					for _, sv := range strs {
+						if len([]rune(sv)) <= b.IgnoreAbove {
+							filtered = append(filtered, sv)
+						}
+					}
+					strs = filtered
+				}
+				if len(strs) >= 1 {
 					val = strings.Join(strs, " ")
 				}
 				if val == nil && b.NullValue != nil && hasExplicitNullAtPath(parsedDoc, b.SourceJSONPath) {
-					val = b.NullValue
+					nullStr := fmt.Sprintf("%v", b.NullValue)
+					if b.IgnoreAbove <= 0 || len([]rune(nullStr)) <= b.IgnoreAbove {
+						val = b.NullValue
+					}
 				}
 				if val != nil {
 					if coerced := coerceScalarBindingForDoris(val, b, getNow()); coerced != nil {
@@ -139,11 +157,16 @@ func ShredDocument(
 				}
 				continue
 			}
-			rawLeafs := extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, nil)
+			var rawLeafs []any
+			if b.ESType == "geo_point" {
+				rawLeafs = extractGeoPointCandidatesWithNull(parsedDoc, b.SourceJSONPath, nil)
+			} else {
+				rawLeafs = extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, nil)
+			}
 			if len(rawLeafs) == 0 && b.NullValue != nil && hasExplicitNullAtPath(parsedDoc, b.SourceJSONPath) {
 				rawLeafs = []any{b.NullValue}
 			}
-			if len(rawLeafs) > 0 {
+			if len(rawLeafs) > 0 || b.ESType == "geo_point" || hasObjAtPath {
 				var firstVal any
 				for _, rv := range rawLeafs {
 					if rv == nil {
@@ -159,7 +182,7 @@ func ShredDocument(
 							continue
 						}
 					}
-					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && (b.Coerce == nil || *b.Coerce) && b.DorisType != DorisString && b.DorisType != DorisVarchar {
+					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && (b.Coerce == nil || *b.Coerce) && (b.ESType == "ip" || b.ESType == "geo_point" || (b.DorisType != DorisString && b.DorisType != DorisVarchar)) {
 						continue
 					}
 					coerced := coerceScalarBindingForDoris(rv, b, getNow())
@@ -179,8 +202,33 @@ func ShredDocument(
 						firstVal = coerced
 					}
 				}
+				if firstVal == nil && b.NullValue != nil && hasExplicitNullAtPath(parsedDoc, b.SourceJSONPath) {
+					nvAllowed := true
+					if b.IgnoreAbove > 0 {
+						str, ok := b.NullValue.(string)
+						if !ok && (b.ESType == "keyword" || b.ESType == "constant_keyword" || b.ESType == "wildcard" || b.DorisType == DorisVarchar) {
+							str = fmt.Sprintf("%v", b.NullValue)
+							ok = true
+						}
+						if ok && len([]rune(str)) > b.IgnoreAbove {
+							nvAllowed = false
+						}
+					}
+					if nvAllowed {
+						firstVal = coerceScalarBindingForDoris(b.NullValue, b, getNow())
+						if b.ESType == "date_nanos" {
+							if iv, ok := firstVal.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
+								firstVal = iv / 1_000_000
+							}
+						}
+					}
+				}
 				if firstVal != nil {
 					row[b.ColumnName] = firstVal
+				} else if ignoredSeen[strings.TrimSuffix(b.ESFieldPath, ".keyword")] && len(b.SourceJSONPath) > 0 {
+					if deletePathInMap(parsedDoc, b.SourceJSONPath) {
+						prunedDynamic = true
+					}
 				}
 				continue
 			}
@@ -196,13 +244,16 @@ func ShredDocument(
 				}
 			}
 			if val != nil {
-				if strVal, isStr := val.(string); isStr && strings.TrimSpace(strVal) == "" && (b.Coerce == nil || *b.Coerce) && b.DorisType != DorisString && b.DorisType != DorisVarchar {
+				if strVal, isStr := val.(string); isStr && strings.TrimSpace(strVal) == "" && (b.Coerce == nil || *b.Coerce) && (b.ESType == "ip" || b.ESType == "geo_point" || (b.DorisType != DorisString && b.DorisType != DorisVarchar)) {
 					val = nil
 				} else {
 					coerced := coerceScalarBindingForDoris(val, b, getNow())
 					if coerced == nil {
 						if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
 							recordIgnored(b.ESFieldPath)
+							if len(b.SourceJSONPath) > 0 && deletePathInMap(parsedDoc, b.SourceJSONPath) {
+								prunedDynamic = true
+							}
 						} else {
 							return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", b.ESFieldPath, b.ESType)
 						}
@@ -220,7 +271,12 @@ func ShredDocument(
 			}
 		case StoragePromotedArray, StorageNestedSubfield:
 			if isTypedNonStringBinding(b) {
-				rawLeafs := extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
+				var rawLeafs []any
+				if b.ESType == "geo_point" {
+					rawLeafs = extractGeoPointCandidatesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
+				} else {
+					rawLeafs = extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
+				}
 				var vals []string
 				for _, rv := range rawLeafs {
 					if rv == nil {
@@ -246,6 +302,10 @@ func ShredDocument(
 				}
 				if len(vals) > 0 {
 					row[b.ColumnName] = vals
+				} else if ignoredSeen[strings.TrimSuffix(b.ESFieldPath, ".keyword")] && len(b.SourceJSONPath) > 0 {
+					if deletePathInMap(parsedDoc, b.SourceJSONPath) {
+						prunedDynamic = true
+					}
 				}
 				continue
 			}
@@ -265,20 +325,27 @@ func ShredDocument(
 		case StoragePromotedVector:
 			vec := extractFloatSliceValues(parsedDoc, b.SourceJSONPath)
 			if len(vec) > 0 {
+				if b.VectorDims > 0 && len(vec) != b.VectorDims {
+					if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+						recordIgnored(b.ESFieldPath)
+						continue
+					}
+					return nil, fmt.Errorf("mapper_parsing_exception: vector dimension mismatch for [%s]: expected [%d], got [%d]", b.ESFieldPath, b.VectorDims, len(vec))
+				}
 				row[b.ColumnName] = vec
 			}
 		}
 	}
 
 	// Propagate `copy_to` field values to target bindings (supporting transitive A -> B -> C chains)
-	copiedRawVals := make(map[string][]string)
+	copiedRawVals := make(map[string][]any)
 	for _, b := range fieldsToVisit {
 		if len(b.CopyTo) > 0 {
-			vals := extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, false, b.NullValue)
+			vals := extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
 			if b.IgnoreAbove > 0 && len(vals) > 0 {
-				filtered := make([]string, 0, len(vals))
+				filtered := make([]any, 0, len(vals))
 				for _, v := range vals {
-					if len([]rune(v)) <= b.IgnoreAbove {
+					if len([]rune(fmt.Sprintf("%v", v))) <= b.IgnoreAbove {
 						filtered = append(filtered, v)
 					}
 				}
@@ -324,12 +391,15 @@ func ShredDocument(
 						tb = resolvedTB
 					}
 				}
+				if ok && tb.EnabledFalse {
+					continue
+				}
 				chainSrcVals := srcVals
 				if ok && tb.IgnoreAbove > 0 {
-					chainSrcVals = make([]string, 0, len(srcVals))
-					for _, sv := range srcVals {
-						if len([]rune(sv)) <= tb.IgnoreAbove {
-							chainSrcVals = append(chainSrcVals, sv)
+					chainSrcVals = make([]any, 0, len(srcVals))
+					for _, rv := range srcVals {
+						if len([]rune(fmt.Sprintf("%v", rv))) <= tb.IgnoreAbove {
+							chainSrcVals = append(chainSrcVals, rv)
 						}
 					}
 				}
@@ -339,32 +409,61 @@ func ShredDocument(
 				if !ok {
 					continue
 				}
+				srcStrs := make([]string, 0, len(srcVals))
+				for _, rv := range srcVals {
+					srcStrs = append(srcStrs, fmt.Sprintf("%v", rv))
+				}
 				switch tb.Kind {
 				case StoragePromotedScalar:
-					filteredSrc := srcVals
-					if tb.IgnoreAbove > 0 {
-						filteredSrc = make([]string, 0, len(srcVals))
-						for _, sv := range srcVals {
-							if len([]rune(sv)) <= tb.IgnoreAbove {
-								filteredSrc = append(filteredSrc, sv)
+					if isTypedNonStringBinding(tb) {
+						for _, rv := range srcVals {
+							if rv == nil {
+								continue
 							}
-						}
-					}
-					if len(filteredSrc) > 0 {
-						joined := strings.Join(filteredSrc, " ")
-						coerced := coerceScalarBindingForDoris(joined, tb, getNow())
-						if tb.ESType == "date_nanos" {
-							if iv, ok := coerced.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
-								coerced = iv / 1_000_000
+							if tb.IgnoreAbove > 0 && len([]rune(fmt.Sprintf("%v", rv))) > tb.IgnoreAbove {
+								continue
 							}
-						}
-						if coerced != nil {
-							if existing, exists := row[tb.ColumnName]; exists && existing != nil {
-								if tb.DorisType == DorisString || tb.DorisType == DorisVarchar {
-									row[tb.ColumnName] = fmt.Sprintf("%v %v", existing, coerced)
+							if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && (tb.Coerce == nil || *tb.Coerce) {
+								continue
+							}
+							coerced := coerceScalarBindingForDoris(rv, tb, getNow())
+							if coerced == nil {
+								if tb.IgnoreMalformed != nil && *tb.IgnoreMalformed {
+									recordIgnored(targetField)
+									continue
 								}
-							} else {
+								return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", targetField, tb.ESType)
+							}
+							if tb.ESType == "date_nanos" {
+								if iv, ok := coerced.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
+									coerced = iv / 1_000_000
+								}
+							}
+							if existing, exists := row[tb.ColumnName]; !exists || existing == nil {
 								row[tb.ColumnName] = coerced
+							}
+						}
+					} else {
+						filteredSrc := srcStrs
+						if tb.IgnoreAbove > 0 {
+							filteredSrc = make([]string, 0, len(srcStrs))
+							for _, sv := range srcStrs {
+								if len([]rune(sv)) <= tb.IgnoreAbove {
+									filteredSrc = append(filteredSrc, sv)
+								}
+							}
+						}
+						if len(filteredSrc) > 0 {
+							joined := strings.Join(filteredSrc, " ")
+							coerced := coerceScalarBindingForDoris(joined, tb, getNow())
+							if coerced != nil {
+								if existing, exists := row[tb.ColumnName]; exists && existing != nil {
+									if tb.DorisType == DorisString || tb.DorisType == DorisVarchar {
+										row[tb.ColumnName] = fmt.Sprintf("%v %v", existing, coerced)
+									}
+								} else {
+									row[tb.ColumnName] = coerced
+								}
 							}
 						}
 					}
@@ -375,7 +474,7 @@ func ShredDocument(
 							if existing, ok := row[tb.KeywordCompanion].([]string); ok {
 								curKw = append(curKw, existing...)
 							}
-							for _, sv := range srcVals {
+							for _, sv := range srcStrs {
 								if kwB.IgnoreAbove > 0 && len([]rune(sv)) > kwB.IgnoreAbove {
 									continue
 								}
@@ -389,7 +488,7 @@ func ShredDocument(
 							}
 						} else {
 							var filteredKw []string
-							for _, sv := range srcVals {
+							for _, sv := range srcStrs {
 								if hasKw && kwB.IgnoreAbove > 0 && len([]rune(sv)) > kwB.IgnoreAbove {
 									continue
 								}
@@ -408,21 +507,22 @@ func ShredDocument(
 							}
 						}
 					}
-					propagateCopyToCustomMultiFields(s, row, targetField, srcVals)
+					propagateCopyToCustomMultiFields(s, row, targetField, srcStrs)
 				case StoragePromotedArray, StorageNestedSubfield:
 					var cur []string
 					if existing, ok := row[tb.ColumnName].([]string); ok {
 						cur = append(cur, existing...)
 					}
-					for _, sv := range srcVals {
+					for _, rv := range srcVals {
+						sv := fmt.Sprintf("%v", rv)
 						if tb.IgnoreAbove > 0 && len([]rune(sv)) > tb.IgnoreAbove {
 							continue
 						}
 						if isTypedNonStringBinding(tb) {
-							if strings.TrimSpace(sv) == "" && (tb.Coerce == nil || *tb.Coerce) {
+							if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && (tb.Coerce == nil || *tb.Coerce) {
 								continue
 							}
-							coerced := coerceScalarBindingForDoris(sv, tb, getNow())
+							coerced := coerceScalarBindingForDoris(rv, tb, getNow())
 							if coerced == nil {
 								if tb.IgnoreMalformed != nil && *tb.IgnoreMalformed {
 									recordIgnored(targetField)
@@ -450,7 +550,7 @@ func ShredDocument(
 						if existing, ok := row[tb.KeywordCompanion].([]string); ok {
 							curKw = append(curKw, existing...)
 						}
-						for _, sv := range srcVals {
+						for _, sv := range srcStrs {
 							if kwB.IgnoreAbove > 0 && len([]rune(sv)) > kwB.IgnoreAbove {
 								continue
 							}
@@ -463,7 +563,7 @@ func ShredDocument(
 							row[tb.KeywordCompanion] = curKw
 						}
 					}
-					propagateCopyToCustomMultiFields(s, row, targetField, srcVals)
+					propagateCopyToCustomMultiFields(s, row, targetField, srcStrs)
 				}
 			}
 		}
@@ -521,14 +621,22 @@ func ShredDocument(
 	if len(ignoredFields) > 0 {
 		sort.Strings(ignoredFields)
 		row["_ignored"] = ignoredFields
+		if parsedDoc != nil {
+			for _, ig := range ignoredFields {
+				if deletePathInMap(parsedDoc, strings.Split(ig, ".")) {
+					prunedDynamic = true
+				}
+			}
+		}
 	}
+	row["_doc"] = buildVariantDocPayload(trimmed, parsedDoc, prunedDynamic, s)
 
 	return json.Marshal(row)
 }
 
 func isTypedNonStringBinding(b FieldBinding) bool {
 	switch b.ESType {
-	case "long", "unsigned_long", "integer", "short", "byte", "double", "float", "half_float", "scaled_float", "date", "date_nanos", "boolean":
+	case "long", "unsigned_long", "integer", "short", "byte", "double", "float", "half_float", "scaled_float", "date", "date_nanos", "boolean", "ip", "geo_point":
 		return true
 	}
 	switch b.DorisType {
@@ -536,6 +644,212 @@ func isTypedNonStringBinding(b FieldBinding) bool {
 		return true
 	}
 	return false
+}
+
+func isGeoNumericElem(v any) bool {
+	switch v.(type) {
+	case float64, int, int64, json.Number:
+		return true
+	default:
+		return false
+	}
+}
+
+func extractGeoPointCandidatesWithNull(node any, path []string, nullVal any) []any {
+	var out []any
+	collectGeoPointCandidatesWithNull(node, path, nullVal, &out)
+	return out
+}
+
+func collectGeoPointCandidatesWithNull(node any, path []string, nullVal any, out *[]any) {
+	if len(path) == 0 {
+		if node == nil {
+			if nullVal != nil {
+				*out = append(*out, nullVal)
+			}
+			return
+		}
+		if arr, ok := node.([]any); ok {
+			if len(arr) == 2 && isGeoNumericElem(arr[0]) && isGeoNumericElem(arr[1]) {
+				*out = append(*out, arr)
+				return
+			}
+			for _, item := range arr {
+				collectGeoPointCandidatesWithNull(item, nil, nullVal, out)
+			}
+			return
+		}
+		*out = append(*out, node)
+		return
+	}
+	if node == nil {
+		return
+	}
+	switch curr := node.(type) {
+	case map[string]any:
+		if next, ok := curr[path[0]]; ok {
+			collectGeoPointCandidatesWithNull(next, path[1:], nullVal, out)
+			return
+		}
+		for i := len(path); i > 1; i-- {
+			if next, ok := curr[strings.Join(path[:i], ".")]; ok {
+				collectGeoPointCandidatesWithNull(next, path[i:], nullVal, out)
+				return
+			}
+		}
+	case []any:
+		for _, elem := range curr {
+			collectGeoPointCandidatesWithNull(elem, path, nullVal, out)
+		}
+	}
+}
+
+func parseGeoFloatElem(x any) (float64, bool) {
+	switch nv := x.(type) {
+	case float64:
+		return nv, !math.IsNaN(nv) && !math.IsInf(nv, 0)
+	case int:
+		return float64(nv), true
+	case int64:
+		return float64(nv), true
+	case json.Number:
+		f, err := nv.Float64()
+		return f, err == nil && !math.IsNaN(f) && !math.IsInf(f, 0)
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(nv), 64)
+		return f, err == nil && !math.IsNaN(f) && !math.IsInf(f, 0)
+	default:
+		return 0, false
+	}
+}
+
+func decodeGeohashLatLon(hash string) (lat, lon float64, ok bool) {
+	if len(hash) == 0 || len(hash) > 12 {
+		return 0, 0, false
+	}
+	const base32 = "0123456789bcdefghjkmnpqrstuvwxyz"
+	minLat, maxLat := -90.0, 90.0
+	minLon, maxLon := -180.0, 180.0
+	isEven := true
+	for i := 0; i < len(hash); i++ {
+		ch := hash[i]
+		if ch >= 'A' && ch <= 'Z' {
+			ch = ch - 'A' + 'a'
+		}
+		idx := strings.IndexByte(base32, ch)
+		if idx < 0 {
+			return 0, 0, false
+		}
+		for bit := 4; bit >= 0; bit-- {
+			mask := (idx >> bit) & 1
+			if isEven {
+				mid := (minLon + maxLon) / 2
+				if mask == 1 {
+					minLon = mid
+				} else {
+					maxLon = mid
+				}
+			} else {
+				mid := (minLat + maxLat) / 2
+				if mask == 1 {
+					minLat = mid
+				} else {
+					maxLat = mid
+				}
+			}
+			isEven = !isEven
+		}
+	}
+	return (minLat + maxLat) / 2, (minLon + maxLon) / 2, true
+}
+
+func parseAndFormatGeoPointValue(val any) (formatted string, lat, lon float64, ok bool) {
+	checkBounds := func(la, lo float64) (string, float64, float64, bool) {
+		if math.IsNaN(la) || math.IsInf(la, 0) || la < -90.0 || la > 90.0 ||
+			math.IsNaN(lo) || math.IsInf(lo, 0) || lo < -180.0 || lo > 180.0 {
+			return "", 0, 0, false
+		}
+		return fmt.Sprintf("%s,%s", strconv.FormatFloat(la, 'f', -1, 64), strconv.FormatFloat(lo, 'f', -1, 64)), la, lo, true
+	}
+	switch tv := val.(type) {
+	case map[string]any:
+		if coords, hasCoords := tv["coordinates"]; hasCoords {
+			if tStr, _ := tv["type"].(string); strings.EqualFold(strings.TrimSpace(tStr), "Point") {
+				if arr, okArr := coords.([]any); okArr && len(arr) == 2 {
+					lo, okLon := parseGeoFloatElem(arr[0])
+					la, okLat := parseGeoFloatElem(arr[1])
+					if okLat && okLon {
+						return checkBounds(la, lo)
+					}
+				}
+			}
+			return "", 0, 0, false
+		}
+		rawLat, hasLat := tv["lat"]
+		rawLon, hasLon := tv["lon"]
+		if !hasLat || !hasLon {
+			return "", 0, 0, false
+		}
+		for k := range tv {
+			if k != "lat" && k != "lon" {
+				return "", 0, 0, false
+			}
+		}
+		la, okLat := parseGeoFloatElem(rawLat)
+		lo, okLon := parseGeoFloatElem(rawLon)
+		if !okLat || !okLon {
+			return "", 0, 0, false
+		}
+		return checkBounds(la, lo)
+	case []any:
+		if len(tv) != 2 || !isGeoNumericElem(tv[0]) || !isGeoNumericElem(tv[1]) {
+			return "", 0, 0, false
+		}
+		lo, okLon := parseGeoFloatElem(tv[0])
+		la, okLat := parseGeoFloatElem(tv[1])
+		if !okLat || !okLon {
+			return "", 0, 0, false
+		}
+		return checkBounds(la, lo)
+	case string:
+		str := strings.TrimSpace(tv)
+		if str == "" {
+			return "", 0, 0, false
+		}
+		if strings.HasPrefix(strings.ToUpper(str), "POINT") {
+			openIdx := strings.IndexByte(str, '(')
+			closeIdx := strings.LastIndexByte(str, ')')
+			if openIdx > 0 && closeIdx > openIdx && strings.TrimSpace(str[closeIdx+1:]) == "" {
+				fields := strings.Fields(str[openIdx+1 : closeIdx])
+				if len(fields) == 2 {
+					lo, err1 := strconv.ParseFloat(fields[0], 64)
+					la, err2 := strconv.ParseFloat(fields[1], 64)
+					if err1 == nil && err2 == nil {
+						return checkBounds(la, lo)
+					}
+				}
+			}
+			return "", 0, 0, false
+		}
+		if strings.Contains(str, ",") {
+			parts := strings.Split(str, ",")
+			if len(parts) != 2 {
+				return "", 0, 0, false
+			}
+			la, err1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+			lo, err2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+			if err1 != nil || err2 != nil {
+				return "", 0, 0, false
+			}
+			return checkBounds(la, lo)
+		}
+		if la, lo, okHash := decodeGeohashLatLon(str); okHash {
+			return checkBounds(la, lo)
+		}
+		return "", 0, 0, false
+	default:
+		return "", 0, 0, false
+	}
 }
 
 func formatCoercedArrayElement(v any) string {
@@ -645,6 +959,24 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 				return nil
 			}
 		}
+	}
+	if b.ESType == "ip" {
+		strVal, ok := val.(string)
+		if !ok {
+			return nil
+		}
+		trimmed := strings.TrimSpace(strVal)
+		if net.ParseIP(trimmed) == nil {
+			return nil
+		}
+		return trimmed
+	}
+	if b.ESType == "geo_point" {
+		formatted, _, _, ok := parseAndFormatGeoPointValue(val)
+		if !ok {
+			return nil
+		}
+		return formatted
 	}
 	if b.ESType == "long" || b.ESType == "unsigned_long" {
 		if strVal, ok := val.(string); ok {
@@ -1719,18 +2051,30 @@ func propagateCopyToCustomMultiFields(s *IndexSchema, row map[string]any, target
 	}
 }
 
-func buildVariantDocPayload(trimmed []byte, s *IndexSchema) json.RawMessage {
-	if s == nil || len(s.Fields) == 0 {
+func buildVariantDocPayload(trimmed []byte, parsedDoc map[string]any, prunedDynamic bool, s *IndexSchema) json.RawMessage {
+	if !prunedDynamic && (s == nil || len(s.Fields) == 0) {
 		return json.RawMessage(trimmed)
 	}
 	var enabledFalsePaths [][]string
-	for _, b := range s.Fields {
-		if b.EnabledFalse && len(b.SourceJSONPath) > 0 {
-			enabledFalsePaths = append(enabledFalsePaths, b.SourceJSONPath)
+	if s != nil {
+		for _, b := range s.Fields {
+			if b.EnabledFalse && len(b.SourceJSONPath) > 0 {
+				enabledFalsePaths = append(enabledFalsePaths, b.SourceJSONPath)
+			}
 		}
 	}
-	if len(enabledFalsePaths) == 0 {
+	if !prunedDynamic && len(enabledFalsePaths) == 0 {
 		return json.RawMessage(trimmed)
+	}
+	if prunedDynamic && parsedDoc != nil {
+		for _, p := range enabledFalsePaths {
+			deletePathInMap(parsedDoc, p)
+		}
+		b, err := json.Marshal(parsedDoc)
+		if err != nil {
+			return json.RawMessage(trimmed)
+		}
+		return json.RawMessage(b)
 	}
 	var docMap map[string]any
 	dec := json.NewDecoder(bytes.NewReader(trimmed))

@@ -22,6 +22,8 @@ import (
 	"hash/fnv"
 	"sort"
 	"strings"
+
+	"github.com/es2doris/doris-es-proxy/pkg/esast"
 )
 
 // GenerateCreateTableDDL produces the Apache Doris `CREATE TABLE` DDL for an `IndexSchema`.
@@ -137,6 +139,7 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 				b.ColumnName == oldB.ColumnName {
 				b.ColumnName = "f__arr__" + SanitizeDorisIdentifier(k)
 				newSchema.Fields[k] = b
+				markRawMappingUpgradedArray(newSchema.RawMapping, k, b.SourceJSONPath)
 				baseName := strings.TrimSuffix(k, ".keyword")
 				if strings.HasSuffix(k, ".keyword") {
 					if baseB, ok := newSchema.Fields[baseName]; ok && baseB.KeywordCompanion == oldB.ColumnName {
@@ -160,7 +163,21 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 				}
 			}
 		}
-		if b.AliasTarget != "" || b.ColumnName == "" || existingCols[b.ColumnName] {
+		if b.AliasTarget != "" || b.ColumnName == "" {
+			continue
+		}
+		if existingCols[b.ColumnName] {
+			if oldSchema != nil {
+				if oldB, hadOld := oldSchema.Fields[k]; hadOld && oldB.NotIndexed && !b.NotIndexed {
+					_, idxDef := buildColumnAndIndexDDL(b)
+					if idxDef != "" {
+						stmts = append(stmts, fmt.Sprintf(
+							"ALTER TABLE `%s`.`%s` ADD %s;",
+							newSchema.DorisDB, newSchema.DorisTable, idxDef,
+						))
+					}
+				}
+			}
 			continue
 		}
 		existingCols[b.ColumnName] = true
@@ -195,6 +212,53 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 	}
 
 	return stmts
+}
+
+func markRawMappingUpgradedArray(spec *esast.MappingSpec, esFieldPath string, sourceJSONPath []string) {
+	if spec == nil || len(spec.Properties) == 0 {
+		return
+	}
+	path := sourceJSONPath
+	if len(path) == 0 {
+		path = strings.Split(esFieldPath, ".")
+	}
+	dotSource := strings.Join(path, ".")
+	subField := ""
+	if esFieldPath != dotSource && strings.HasPrefix(esFieldPath, dotSource+".") {
+		subField = strings.TrimPrefix(esFieldPath, dotSource+".")
+	}
+	markPropsUpgradedArrayAtPath(spec.Properties, path, subField)
+}
+
+func markPropsUpgradedArrayAtPath(props map[string]esast.FieldProperty, path []string, subField string) {
+	if len(path) == 0 || len(props) == 0 {
+		return
+	}
+	prop, ok := props[path[0]]
+	if !ok {
+		return
+	}
+	if len(path) == 1 {
+		if subField != "" {
+			if len(prop.Fields) > 0 {
+				if sf, hasSF := prop.Fields[subField]; hasSF {
+					sf.MultiValued = true
+					sf.UpgradedArray = true
+					prop.Fields[subField] = sf
+					props[path[0]] = prop
+				}
+			}
+			return
+		}
+		prop.MultiValued = true
+		prop.UpgradedArray = true
+		props[path[0]] = prop
+		return
+	}
+	if len(prop.Properties) > 0 {
+		markPropsUpgradedArrayAtPath(prop.Properties, path[1:], subField)
+		props[path[0]] = prop
+	}
 }
 
 // GeneratePromoteVariantFieldDDL generates `ALTER TABLE` statements to promote a frequently

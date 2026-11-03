@@ -39,6 +39,7 @@ type StreamLoadConfig struct {
 	Password       string
 	Database       string // e.g. "es_compat"
 	Timeout        time.Duration
+	MaxBatchBytes  int // Optional maximum bytes per single HTTP Stream Load batch (default 64 MiB)
 }
 
 // StreamLoadClient streams NDJSON document batches into Apache Doris Unique Key Merge-on-Write
@@ -67,16 +68,20 @@ func NewStreamLoadClient(cfg StreamLoadConfig) *StreamLoadClient {
 	client := &http.Client{
 		Timeout:   cfg.Timeout,
 		Transport: transport,
-		// Preserve Authorization header when Doris FE (8030) issues a 307 Temporary Redirect to Doris BE (8040).
+		// Preserve Authorization and Stream Load headers when Doris FE (:8030) issues a 307 Temporary Redirect to Doris BE (:8040).
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 5 {
 				return fmt.Errorf("stopped after 5 redirects")
 			}
-			if len(via) > 0 && req.URL.Scheme == via[0].URL.Scheme &&
-				(req.URL.Hostname() == via[0].URL.Hostname() || strings.Contains(req.URL.Path, "_stream_load")) {
+			if len(via) > 0 && req.URL.Scheme == via[0].URL.Scheme && (req.URL.Hostname() == via[0].URL.Hostname() || strings.HasSuffix(req.URL.Path, "/_stream_load") || strings.HasPrefix(req.URL.Path, "/api/")) {
 				if auth := via[0].Header.Get("Authorization"); auth != "" {
-					// #nosec G119 -- Doris FE (:8030) redirects Stream Load PUTs to Doris BE (:8040) on the same scheme
+					// #nosec G119 -- Doris FE (:8030) redirects Stream Load PUTs to Doris BE (:8040) on the same scheme and Stream Load API path
 					req.Header.Set("Authorization", auth)
+				}
+				for _, h := range []string{"Expect", "format", "read_json_by_line", "strip_outer_array", "hidden_columns", "function_column.sequence_col"} {
+					if v := via[0].Header.Get(h); v != "" && req.Header.Get(h) == "" {
+						req.Header.Set(h, v)
+					}
 				}
 			}
 			return nil
@@ -107,6 +112,44 @@ func (c *StreamLoadClient) LoadNDJSON(
 	table string,
 	ndjsonPayload []byte,
 	_ bool,
+) error {
+	if len(bytes.TrimSpace(ndjsonPayload)) == 0 {
+		return nil
+	}
+	maxBytes := c.cfg.MaxBatchBytes
+	if maxBytes <= 0 {
+		maxBytes = 64 * 1024 * 1024
+	}
+	if len(ndjsonPayload) > maxBytes {
+		lines := bytes.Split(bytes.TrimRight(ndjsonPayload, "\n"), []byte("\n"))
+		if len(lines) > 1 {
+			var chunk bytes.Buffer
+			for _, line := range lines {
+				if len(bytes.TrimSpace(line)) == 0 {
+					continue
+				}
+				if chunk.Len() > 0 && chunk.Len()+len(line)+1 > maxBytes {
+					if err := c.loadSingleNDJSONBatch(ctx, table, chunk.Bytes()); err != nil {
+						return err
+					}
+					chunk.Reset()
+				}
+				chunk.Write(line)
+				chunk.WriteByte('\n')
+			}
+			if chunk.Len() > 0 {
+				return c.loadSingleNDJSONBatch(ctx, table, chunk.Bytes())
+			}
+			return nil
+		}
+	}
+	return c.loadSingleNDJSONBatch(ctx, table, ndjsonPayload)
+}
+
+func (c *StreamLoadClient) loadSingleNDJSONBatch(
+	ctx context.Context,
+	table string,
+	ndjsonPayload []byte,
 ) error {
 	if len(bytes.TrimSpace(ndjsonPayload)) == 0 {
 		return nil

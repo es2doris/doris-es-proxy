@@ -2184,3 +2184,88 @@ func TestRound34NestedParentCorrelationTermsCaseInsensitiveLuceneEscapedRangeMus
 		t.Fatalf("expected custom date format in sort missing and search_after converted to epoch millis, got:\n%s", plan.HitsSQL)
 	}
 }
+
+func TestRound41TranspilerNestedNotIndexedLuceneMetaSortUnmappedAndPhraseSlop(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"title": {"type": "text"},
+			"body": {"type": "text"},
+			"items": {
+				"type": "nested",
+				"properties": {
+					"secret": {"type": "keyword", "index": false},
+					"sku": {"type": "keyword"}
+				}
+			}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("unmarshal spec failed: %v", err)
+	}
+	sch := schema.CompileIndexSchema("db", "r41_tr", &spec)
+	tr := NewTranspiler(sch, TranspilerOptions{})
+
+	// F7: nested subfield with index: false emits FALSE in CompileQuery and returns not-indexed error in BuildSearchPlan
+	var nestedReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"query": {
+			"nested": {
+				"path": "items",
+				"query": {"term": {"items.secret": "hidden"}}
+			}
+		}
+	}`), &nestedReq)
+	cqNested := tr.CompileQuery(nestedReq.Query, false, nil)
+	if strings.Contains(cqNested.WhereSQL, "hidden") || !strings.Contains(cqNested.WhereSQL, "FALSE") {
+		t.Fatalf("F7 expected FALSE in CompileQuery for index:false nested subfield, got:\n%s", cqNested.WhereSQL)
+	}
+	if _, err := tr.BuildSearchPlan(&nestedReq); err == nil || !strings.Contains(err.Error(), "cannot search on field [items.secret] since it is not indexed") {
+		t.Fatalf("F7 expected not indexed error from BuildSearchPlan, got %v", err)
+	}
+
+	// F8: Lucene query_string with _id and _routing meta fields
+	var luceneMetaReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"query": {
+			"query_string": {
+				"query": "_id:(doc-1 OR doc-2) AND _routing:shard-a"
+			}
+		}
+	}`), &luceneMetaReq)
+	lucenePlan, err := tr.BuildSearchPlan(&luceneMetaReq)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan lucene meta failed: %v", err)
+	}
+	if !strings.Contains(lucenePlan.HitsSQL, "`_id` = 'doc-1'") || !strings.Contains(lucenePlan.HitsSQL, "`_routing` = 'shard-a'") {
+		t.Fatalf("F8 expected _id and _routing system columns in Lucene SQL, got:\n%s", lucenePlan.HitsSQL)
+	}
+
+	// F9: Sort on unmapped field without unmapped_type or ignore_unmapped returns search_phase_execution_exception
+	var badSortReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"sort": [{"unmapped_sort_field": {"order": "asc"}}]
+	}`), &badSortReq)
+	if _, err := tr.BuildSearchPlan(&badSortReq); err == nil || !strings.Contains(err.Error(), "no mapping found for [unmapped_sort_field] in order to sort on") {
+		t.Fatalf("F9 expected search_phase_execution_exception for unmapped sort field, got %v", err)
+	}
+
+	// F10: multi_match phrase with slop > 0 emits ~slop in MATCH_PHRASE
+	var mmPhraseSlop esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"query": {
+			"multi_match": {
+				"query": "quick fox",
+				"fields": ["title^2", "body"],
+				"type": "phrase",
+				"slop": 2
+			}
+		}
+	}`), &mmPhraseSlop)
+	mmPlan, err := tr.BuildSearchPlan(&mmPhraseSlop)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan multi_match phrase slop failed: %v", err)
+	}
+	if !strings.Contains(mmPlan.HitsSQL, "MATCH_PHRASE 'quick fox ~2'") {
+		t.Fatalf("F10 expected MATCH_PHRASE 'quick fox ~2' in HitsSQL, got:\n%s", mmPlan.HitsSQL)
+	}
+}

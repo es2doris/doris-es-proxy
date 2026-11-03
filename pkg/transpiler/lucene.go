@@ -913,8 +913,13 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 		field := unescapeLuceneToken(token[:idx])
 		val := strings.TrimSpace(token[idx+1:])
 		if field == "_exists_" && val != "" {
+			eq := &esast.ExistsQuery{Field: unescapeLuceneToken(strings.Trim(val, `"`))}
+			if boost != 1.0 {
+				b := boost
+				eq.Boost = &b
+			}
 			return esast.Query{
-				Exists: &esast.ExistsQuery{Field: unescapeLuceneToken(strings.Trim(val, `"`))},
+				Exists: eq,
 			}
 		}
 		if rc := parseLuceneRangeToken(val, boost); rc != nil {
@@ -1096,7 +1101,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 					fname, fBoost := splitLuceneBoost(ef)
 					shoulds = append(shoulds, esast.Query{
 						Term: map[string]esast.TermEntry{
-							fname: {Value: boolVal, Boost: boost * fBoost},
+							fname: {Value: boolVal, Boost: boost * fBoost, HasBoost: true},
 						},
 					})
 				}
@@ -1107,7 +1112,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			}
 			return esast.Query{
 				Term: map[string]esast.TermEntry{
-					field: {Value: boolVal, Boost: boost},
+					field: {Value: boolVal, Boost: boost, HasBoost: true},
 				},
 			}
 		}
@@ -1197,13 +1202,13 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 		if isQuoted && (strings.Contains(val, " ") || slop > 0) {
 			return esast.Query{
 				MatchPhrase: map[string]esast.PhraseEntry{
-					field: {Query: val, Slop: slop, Boost: boost},
+					field: {Query: val, Slop: slop, Boost: boost, HasBoost: true},
 				},
 			}
 		}
 		return esast.Query{
 			Match: map[string]esast.MatchEntry{
-				field: {Query: val, Operator: strings.ToLower(defaultOp), Fuzziness: fuzzAny, Lenient: flags.lenient, Boost: boost},
+				field: {Query: val, Operator: strings.ToLower(defaultOp), Fuzziness: fuzzAny, Lenient: flags.lenient, Boost: boost, HasBoost: true},
 			},
 		}
 	}
@@ -1368,7 +1373,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 		}
 		return esast.Query{
 			MatchPhrase: map[string]esast.PhraseEntry{
-				targetDefaultField: {Query: cleanVal, Slop: slop, Boost: boost},
+				targetDefaultField: {Query: cleanVal, Slop: slop, Boost: boost, HasBoost: true},
 			},
 		}
 	}
@@ -1389,7 +1394,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 	}
 	return esast.Query{
 		Match: map[string]esast.MatchEntry{
-			targetDefaultField: {Query: cleanVal, Operator: strings.ToLower(defaultOp), Fuzziness: fuzzAny, Lenient: flags.lenient, Boost: boost},
+			targetDefaultField: {Query: cleanVal, Operator: strings.ToLower(defaultOp), Fuzziness: fuzzAny, Lenient: flags.lenient, Boost: boost, HasBoost: true},
 		},
 	}
 }
