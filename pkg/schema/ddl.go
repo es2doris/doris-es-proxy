@@ -137,18 +137,25 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 				b.ColumnName == oldB.ColumnName {
 				b.ColumnName = "f__arr__" + SanitizeDorisIdentifier(k)
 				newSchema.Fields[k] = b
+				baseName := strings.TrimSuffix(k, ".keyword")
 				if strings.HasSuffix(k, ".keyword") {
-					baseName := strings.TrimSuffix(k, ".keyword")
 					if baseB, ok := newSchema.Fields[baseName]; ok && baseB.KeywordCompanion == oldB.ColumnName {
 						baseB.KeywordCompanion = b.ColumnName
 						newSchema.Fields[baseName] = baseB
 					}
 				}
+				for ak, ab := range newSchema.Fields {
+					if ab.AliasTarget == k && ab.ColumnName == oldB.ColumnName {
+						ab.ColumnName = b.ColumnName
+						newSchema.Fields[ak] = ab
+					} else if strings.HasSuffix(k, ".keyword") && ab.AliasTarget == baseName && ab.KeywordCompanion == oldB.ColumnName {
+						ab.KeywordCompanion = b.ColumnName
+						newSchema.Fields[ak] = ab
+					}
+				}
 				for i := range newSchema.OrderedFields {
-					if newSchema.OrderedFields[i].ESFieldPath == k {
-						newSchema.OrderedFields[i] = b
-					} else if strings.HasSuffix(k, ".keyword") && newSchema.OrderedFields[i].ESFieldPath == strings.TrimSuffix(k, ".keyword") {
-						newSchema.OrderedFields[i] = newSchema.Fields[newSchema.OrderedFields[i].ESFieldPath]
+					if updated, ok := newSchema.Fields[newSchema.OrderedFields[i].ESFieldPath]; ok {
+						newSchema.OrderedFields[i] = updated
 					}
 				}
 			}

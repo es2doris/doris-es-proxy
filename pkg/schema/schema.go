@@ -86,6 +86,7 @@ type FieldBinding struct {
 	IgnoreMalformed    *bool
 	NotIndexed         bool
 	EnabledFalse       bool
+	DocValuesFalse     bool
 }
 
 // EffectiveLowercase returns true if this field (or its `.keyword` companion when `preferKeyword` is true)
@@ -190,6 +191,16 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 					b.AliasTarget = tb.AliasTarget
 					s.Fields[k] = b
 					changed = true
+				} else if strings.HasSuffix(b.AliasTarget, ".keyword") {
+					baseTarget := strings.TrimSuffix(b.AliasTarget, ".keyword")
+					if tb, ok := s.Fields[baseTarget]; ok && tb.AliasTarget != "" {
+						newTarget := strings.TrimSuffix(tb.AliasTarget, ".keyword") + ".keyword"
+						if newTarget != b.AliasTarget {
+							b.AliasTarget = newTarget
+							s.Fields[k] = b
+							changed = true
+						}
+					}
 				}
 			}
 		}
@@ -281,11 +292,11 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 		}
 	}
 
-	// Any remaining unresolved alias (pointing to a dynamic/unmapped field) falls back to StorageDynamicVariant on AliasTarget.
+	// Any remaining unresolved alias (pointing to a dynamic/unmapped field or disabled object) falls back to StorageDynamicVariant on AliasTarget.
 	for k, b := range s.Fields {
 		if b.AliasTarget != "" && b.ColumnName == "" {
 			cleanTarget := strings.TrimSuffix(b.AliasTarget, ".keyword")
-			if tb, ok := s.Fields[cleanTarget]; ok && tb.ColumnName != "" {
+			if tb, ok := s.Fields[cleanTarget]; ok && (tb.ColumnName != "" || tb.EnabledFalse || tb.NotIndexed) {
 				aliased := tb
 				aliased.ESFieldPath = k
 				aliased.AliasTarget = b.AliasTarget
@@ -293,10 +304,14 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 				s.Fields[k] = aliased
 				continue
 			}
+			resolved := s.ResolveField(cleanTarget)
 			b.Kind = StorageDynamicVariant
 			b.DorisType = DorisString
 			b.ESType = "keyword"
 			b.SourceJSONPath = strings.Split(cleanTarget, ".")
+			b.NotIndexed = resolved.NotIndexed
+			b.EnabledFalse = resolved.EnabledFalse
+			b.DocValuesFalse = resolved.DocValuesFalse
 			s.Fields[k] = b
 		}
 	}
@@ -445,6 +460,9 @@ func DeepMergeMappingProperties(
 			if v.Index != nil {
 				merged.Index = v.Index
 			}
+			if v.DocValues != nil {
+				merged.DocValues = v.DocValues
+			}
 			if v.Dynamic != nil {
 				merged.Dynamic = v.Dynamic
 			}
@@ -495,6 +513,7 @@ func (s *IndexSchema) compileProperties(
 				ESType:         "object",
 				NotIndexed:     true,
 				EnabledFalse:   true,
+				DocValuesFalse: true,
 			}
 			continue
 		}
@@ -610,6 +629,7 @@ func (s *IndexSchema) registerLeafField(
 	lowerNorm := prop.Normalizer != "" && !strings.EqualFold(prop.Normalizer, "none")
 	copyTo := parseCopyToTargets(prop.CopyTo)
 	notIndexed := (prop.Index != nil && !*prop.Index) || (prop.Enabled != nil && !*prop.Enabled)
+	docValuesFalse := (prop.DocValues != nil && !*prop.DocValues) || (prop.Enabled != nil && !*prop.Enabled)
 
 	if activeNestedRoot != "" {
 		corrCol := s.NestedRoots[activeNestedRoot]
@@ -641,6 +661,7 @@ func (s *IndexSchema) registerLeafField(
 			Coerce:              prop.Coerce,
 			IgnoreMalformed:     prop.IgnoreMalformed,
 			NotIndexed:          notIndexed,
+			DocValuesFalse:      docValuesFalse,
 		}
 		return
 	}
@@ -661,6 +682,7 @@ func (s *IndexSchema) registerLeafField(
 			VectorDims:     prop.EffectiveDims(),
 			VectorMetric:   metric,
 			NotIndexed:     notIndexed,
+			DocValuesFalse: docValuesFalse,
 		}
 		return
 	}
@@ -686,6 +708,7 @@ func (s *IndexSchema) registerLeafField(
 			Coerce:              prop.Coerce,
 			IgnoreMalformed:     prop.IgnoreMalformed,
 			NotIndexed:          notIndexed,
+			DocValuesFalse:      docValuesFalse,
 		}
 		return
 	}
@@ -707,6 +730,7 @@ func (s *IndexSchema) registerLeafField(
 		Coerce:              prop.Coerce,
 		IgnoreMalformed:     prop.IgnoreMalformed,
 		NotIndexed:          notIndexed,
+		DocValuesFalse:      docValuesFalse,
 	}
 }
 
@@ -745,6 +769,7 @@ func (s *IndexSchema) ResolveField(esFieldPath string) FieldBinding {
 				DorisType:      DorisString,
 				NotIndexed:     true,
 				EnabledFalse:   true,
+				DocValuesFalse: true,
 			}
 		}
 	}

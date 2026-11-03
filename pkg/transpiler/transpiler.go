@@ -453,13 +453,13 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 			} else {
 				boost *= fBoost
 			}
-			b := t.Schema.ResolveField(cleanField)
-			if !t.checkFieldSearchable(cleanField, b) || len(ts.Terms) == 0 || b.Kind == schema.StoragePromotedVector {
+			resolvedField, b := t.resolveFieldInNestedCtx(cleanField, true, nctx)
+			if !t.checkFieldSearchable(resolvedField, b) || len(ts.Terms) == 0 || b.Kind == schema.StoragePromotedVector {
 				preds = append(preds, "FALSE")
 			} else {
 				var termSums []string
 				for _, tv := range ts.Terms {
-					tp := t.compileTermsSetTermPredicate(cleanField, tv, nctx)
+					tp := t.compileTermsSetTermPredicate(resolvedField, tv, nctx)
 					termSums = append(termSums, fmt.Sprintf("CAST(COALESCE(%s, FALSE) AS INT)", tp))
 				}
 				threshExpr := "1"
@@ -939,7 +939,7 @@ func (t *Transpiler) compileKNN(kq *esast.KNNQuery, scoring bool, nctx *nestedCt
 func sortedMapKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
-		if k == "_name" {
+		if k == "_name" && len(m) > 1 {
 			continue
 		}
 		keys = append(keys, k)
@@ -1277,6 +1277,9 @@ func isScalarQueryCompatible(b schema.FieldBinding, queryVal any) bool {
 }
 
 func isExactKeywordField(field string, b schema.FieldBinding) bool {
+	if field == "_id" || field == "_index" || field == "_version" || field == "_routing" {
+		return true
+	}
 	return strings.HasSuffix(field, ".keyword") || b.ESType == "keyword" || b.ESType == "constant_keyword"
 }
 
@@ -1584,7 +1587,7 @@ func (t *Transpiler) compileMatchField(
 	if queryVal == nil || strings.TrimSpace(queryStr) == "" {
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
-	if isExactKeywordField(field, b) && (b.ESType == "constant_keyword" || strings.ContainsAny(strings.TrimSpace(queryStr), " \t\n\r") || strings.ToLower(queryStr) != queryStr || strings.HasSuffix(field, ".keyword")) {
+	if isExactKeywordField(field, b) && (field == "_id" || field == "_index" || field == "_version" || field == "_routing" || b.ESType == "constant_keyword" || strings.ContainsAny(strings.TrimSpace(queryStr), " \t\n\r") || strings.ToLower(queryStr) != queryStr || strings.HasSuffix(field, ".keyword")) {
 		pred := t.compileTermPredicate(field, queryVal, false, nctx)
 		score := "0.0"
 		if scoring {
@@ -2365,12 +2368,13 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 		return base
 	}
 	funcs := fs.Functions
-	if len(funcs) == 0 && (fs.FieldValueFactor != nil || fs.ScriptScore != nil || fs.Weight != nil) {
+	if len(funcs) == 0 && (fs.FieldValueFactor != nil || fs.ScriptScore != nil || fs.RandomScore != nil || fs.Weight != nil) {
 		funcs = []esast.ScoreFunctionSpec{
 			{
 				Weight:           fs.Weight,
 				FieldValueFactor: fs.FieldValueFactor,
 				ScriptScore:      fs.ScriptScore,
+				RandomScore:      fs.RandomScore,
 			},
 		}
 	}
@@ -2442,6 +2446,25 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 				modExpr = scaled
 			}
 			valExpr = fmt.Sprintf("(%.4f * %s)", weight, modExpr)
+		} else if fn.RandomScore != nil {
+			seedRaw := fn.RandomScore.Seed
+			fieldRaw := fn.RandomScore.Field
+			fieldCol := "`_id`"
+			if fieldRaw != "" && fieldRaw != "_id" && fieldRaw != "_seq_no" && fieldRaw != "_uid" {
+				fieldCol = t.sqlColumnRef(fieldRaw, true, nctx)
+			}
+			var randExpr string
+			if seedRaw != nil {
+				seedStr := quoteStr(fmt.Sprintf("%v", seedRaw))
+				randExpr = fmt.Sprintf("(ABS(CAST(CONV(SUBSTRING(MD5(CONCAT(%s, ':', COALESCE(CAST(%s AS STRING), ''))), 1, 8), 16, 10) AS DOUBLE)) / 4294967296.0)", seedStr, fieldCol)
+			} else {
+				randExpr = "RAND()"
+			}
+			if fn.Weight != nil {
+				valExpr = fmt.Sprintf("(%.4f * %s)", weight, randExpr)
+			} else {
+				valExpr = randExpr
+			}
 		}
 		rawValExprs = append(rawValExprs, valExpr)
 		if fn.Filter != nil {
@@ -2572,10 +2595,13 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 
 func (t *Transpiler) compileTermsSetTermPredicate(field string, val any, nctx *nestedCtx) string {
 	basePred := t.compileTermPredicate(field, val, false, nctx)
-	b := t.Schema.ResolveEffectiveField(field, true)
+	if basePred == "FALSE" {
+		return "FALSE"
+	}
+	field, b := t.resolveFieldInNestedCtx(field, true, nctx)
 	if nctx != nil || b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield ||
 		b.Kind == schema.StoragePromotedVector || len(b.SourceJSONPath) == 0 ||
-		field == "_id" || field == "_doc" || field == "_all_text" || field == "*" {
+		field == "_id" || field == "_doc" || field == "_routing" || field == "_version" || field == "_index" || field == "_all_text" || field == "*" {
 		return basePred
 	}
 	effLower := b.EffectiveLowercase(true)
@@ -8600,6 +8626,9 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 	}
 	if field == "_version" {
 		return "`_version`"
+	}
+	if field == "_routing" {
+		return "`_routing`"
 	}
 	if field == "_source" {
 		return "`_source`"

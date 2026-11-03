@@ -21,10 +21,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/md5" // #nosec G501 -- used only to emulate Doris MD5() SQL function in MemoryBackend
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math"
+	"math/rand"
 	"net"
 	"regexp"
 	"sort"
@@ -153,12 +156,7 @@ func (m *MemoryBackend) StreamLoad(_ context.Context, table string, ndjson []byt
 				continue
 			}
 		}
-		delSign, _ := toInt64(row["__DORIS_DELETE_SIGN__"])
-		if delSign == 1 {
-			delete(m.tables[table], id)
-		} else {
-			m.tables[table][id] = row
-		}
+		m.tables[table][id] = row
 		rowsLoaded++
 	}
 	if m.logSQL {
@@ -166,6 +164,14 @@ func (m *MemoryBackend) StreamLoad(_ context.Context, table string, ndjson []byt
 		log.Printf("[Doris Stream Load] table=%s rows=%d merge_type=MERGE", table, rowsLoaded)
 	}
 	return scanner.Err()
+}
+
+func isTombstoneRow(row map[string]any) bool {
+	if row == nil {
+		return true
+	}
+	delSign, _ := toInt64(row["__DORIS_DELETE_SIGN__"])
+	return delSign != 0
 }
 
 func (m *MemoryBackend) Ping(_ context.Context) error {
@@ -185,12 +191,16 @@ func (m *MemoryBackend) GetDocByID(_ context.Context, _, table, id string) (*Hit
 	}
 	ver, _ := toInt64(row["_version"])
 	srcStr, _ := row["_source"].(string)
-	return &HitRow{
+	hit := &HitRow{
 		ID:      id,
 		Version: ver,
 		Source:  json.RawMessage(srcStr),
 		Score:   1.0,
-	}, true, nil
+	}
+	if isTombstoneRow(row) {
+		return hit, false, nil
+	}
+	return hit, true, nil
 }
 
 func (m *MemoryBackend) GetDocsByIDs(_ context.Context, _, table string, ids []string) (map[string]HitRow, error) {
@@ -202,7 +212,7 @@ func (m *MemoryBackend) GetDocsByIDs(_ context.Context, _, table string, ids []s
 		return out, nil
 	}
 	for _, id := range ids {
-		if row, ok := tbl[id]; ok {
+		if row, ok := tbl[id]; ok && !isTombstoneRow(row) {
 			ver, _ := toInt64(row["_version"])
 			srcStr, _ := row["_source"].(string)
 			out[id] = HitRow{
@@ -248,9 +258,13 @@ func parseOrderSpec(spec string) (colExpr string, desc bool, nullsFirst bool) {
 }
 
 func splitHitsWhereBody(whereBody string) (mainWhere, postWhere string) {
-	parts := splitTopLevelLogicalOp(strings.TrimSpace(whereBody), " AND ")
-	if len(parts) == 0 {
+	trimmed := strings.TrimSpace(whereBody)
+	if trimmed == "" {
 		return "TRUE", "TRUE"
+	}
+	parts := splitTopLevelLogicalOp(trimmed, " AND ")
+	if len(parts) == 0 {
+		return trimmed, "TRUE"
 	}
 	if len(parts) == 1 {
 		return parts[0], "TRUE"
@@ -312,6 +326,9 @@ func (m *MemoryBackend) QueryHits(_ context.Context, sqlStr string) ([]HitRow, e
 	var hits []HitRow
 
 	for _, row := range tbl {
+		if isTombstoneRow(row) {
+			continue
+		}
 		if evalWhereExpr(row, mainWhere) && evalWhereExpr(row, postWhere) {
 			score := evalNumericExpr(row, scoreExpr)
 			ver, _ := toInt64(row["_version"])
@@ -453,6 +470,9 @@ func (m *MemoryBackend) QueryAggs(_ context.Context, sqlStr string) ([]AggRow, e
 	tbl := m.tables[tableName]
 	var baseRows []map[string]any
 	for _, row := range tbl {
+		if isTombstoneRow(row) {
+			continue
+		}
 		if evalWhereExpr(row, baseWhere) {
 			baseRows = append(baseRows, row)
 		}
@@ -2240,6 +2260,11 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 
 	if idx := findTopLevelOp(expr, " IN ("); idx > 0 && strings.HasSuffix(expr, ")") {
 		colExpr := strings.TrimSpace(expr[:idx])
+		negate := false
+		if len(colExpr) > 4 && strings.EqualFold(colExpr[len(colExpr)-4:], " NOT") {
+			negate = true
+			colExpr = strings.TrimSpace(colExpr[:len(colExpr)-4])
+		}
 		listStr := expr[idx+len(" IN (") : len(expr)-1]
 		val := resolveColumnValue(row, colExpr)
 		if val == nil {
@@ -2252,20 +2277,29 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 			targets[unq] = true
 			parsedTargets = append(parsedTargets, parseSQLLiteralValue(item))
 		}
+		matched := false
 		for _, elem := range asSliceOrSingle(val) {
 			if elem == nil {
 				continue
 			}
 			if targets[fmt.Sprintf("%v", elem)] {
-				return true
+				matched = true
+				break
 			}
 			for _, pt := range parsedTargets {
 				if compareAny(elem, pt) == 0 {
-					return true
+					matched = true
+					break
 				}
 			}
+			if matched {
+				break
+			}
 		}
-		return false
+		if negate {
+			return !matched
+		}
+		return matched
 	}
 
 	if idx := findTopLevelOp(expr, " LIKE "); idx > 0 {
@@ -2653,33 +2687,62 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 	if strings.HasPrefix(expr, "CASE WHEN ") && strings.HasSuffix(expr, " END") {
 		inner := expr[len("CASE WHEN ") : len(expr)-len(" END")]
 		elseIdx := findTopLevelOp(inner, " ELSE ")
+		var elseExpr string
+		whenChain := inner
 		if elseIdx > 0 {
-			elseExpr := inner[elseIdx+6:]
-			whenChain := inner[:elseIdx]
-			for {
-				thenIdx := findTopLevelOp(whenChain, " THEN ")
-				if thenIdx <= 0 {
-					break
-				}
-				cond := whenChain[:thenIdx]
-				rest := whenChain[thenIdx+6:]
-				nextWhenIdx := findTopLevelOp(rest, " WHEN ")
-				var thenExpr string
-				if nextWhenIdx > 0 {
-					thenExpr = rest[:nextWhenIdx]
-				} else {
-					thenExpr = rest
-				}
-				if evalWhereExpr(row, cond) {
-					return evalNumericExpr(row, thenExpr)
-				}
-				if nextWhenIdx <= 0 {
-					break
-				}
-				whenChain = rest[nextWhenIdx+6:]
+			elseExpr = inner[elseIdx+6:]
+			whenChain = inner[:elseIdx]
+		}
+		for {
+			thenIdx := findTopLevelOp(whenChain, " THEN ")
+			if thenIdx <= 0 {
+				break
 			}
+			cond := whenChain[:thenIdx]
+			rest := whenChain[thenIdx+6:]
+			nextWhenIdx := findTopLevelOp(rest, " WHEN ")
+			var thenExpr string
+			if nextWhenIdx > 0 {
+				thenExpr = rest[:nextWhenIdx]
+			} else {
+				thenExpr = rest
+			}
+			if evalWhereExpr(row, cond) {
+				return evalNumericExpr(row, thenExpr)
+			}
+			if nextWhenIdx <= 0 {
+				break
+			}
+			whenChain = rest[nextWhenIdx+6:]
+		}
+		if elseIdx > 0 {
 			return evalNumericExpr(row, elseExpr)
 		}
+		return 0
+	}
+
+	if expr == "RAND()" {
+		// #nosec G404 -- non-cryptographic SQL RAND() emulation for unseeded random_score
+		return rand.Float64()
+	}
+	if strings.HasPrefix(expr, "CONV(SUBSTRING(MD5(CONCAT(") && strings.HasSuffix(expr, ")), 1, 8), 16, 10)") {
+		inner := expr[len("CONV(SUBSTRING(MD5(CONCAT(") : len(expr)-len(")), 1, 8), 16, 10)")]
+		var sb strings.Builder
+		for _, arg := range splitTopLevelArgs(inner) {
+			val := resolveColumnValue(row, strings.TrimSpace(arg))
+			if val != nil {
+				_, _ = fmt.Fprintf(&sb, "%v", val)
+			}
+		}
+		// #nosec G401 -- used only to emulate Doris MD5() SQL function in MemoryBackend
+		sum := md5.Sum([]byte(sb.String()))
+		hexStr := hex.EncodeToString(sum[:])
+		if len(hexStr) >= 8 {
+			if u, err := strconv.ParseUint(hexStr[:8], 16, 64); err == nil {
+				return float64(u)
+			}
+		}
+		return 0
 	}
 
 	if strings.HasPrefix(expr, "CAST(COALESCE(") && strings.HasSuffix(expr, ", FALSE) AS INT)") {
@@ -3481,11 +3544,12 @@ func evalCaseWhenBranchVal(row map[string]any, branchExpr string) any {
 func evalCaseWhenValue(row map[string]any, expr string) any {
 	inner := expr[len("CASE WHEN ") : len(expr)-len(" END")]
 	elseIdx := findTopLevelOp(inner, " ELSE ")
-	if elseIdx <= 0 {
-		return nil
+	var elseExpr string
+	whenChain := inner
+	if elseIdx > 0 {
+		elseExpr = inner[elseIdx+6:]
+		whenChain = inner[:elseIdx]
 	}
-	elseExpr := inner[elseIdx+6:]
-	whenChain := inner[:elseIdx]
 	for {
 		thenIdx := findTopLevelOp(whenChain, " THEN ")
 		if thenIdx <= 0 {
@@ -3508,7 +3572,10 @@ func evalCaseWhenValue(row map[string]any, expr string) any {
 		}
 		whenChain = rest[nextWhenIdx+6:]
 	}
-	return evalCaseWhenBranchVal(row, elseExpr)
+	if elseIdx > 0 {
+		return evalCaseWhenBranchVal(row, elseExpr)
+	}
+	return nil
 }
 
 var (
@@ -3887,7 +3954,9 @@ func splitTopLevelArgs(s string) []string {
 
 func findTopLevelOp(s, op string) int {
 	depth := 0
+	caseDepth := 0
 	inQuotes := false
+	inBackticks := false
 	for i := 0; i <= len(s)-len(op); i++ {
 		c := s[i]
 		if inQuotes {
@@ -3904,8 +3973,18 @@ func findTopLevelOp(s, op string) int {
 			}
 			continue
 		}
+		if inBackticks {
+			if c == '`' {
+				inBackticks = false
+			}
+			continue
+		}
 		if c == '\'' {
 			inQuotes = true
+			continue
+		}
+		if c == '`' {
+			inBackticks = true
 			continue
 		}
 		switch c {
@@ -3916,7 +3995,14 @@ func findTopLevelOp(s, op string) int {
 				depth--
 			}
 		}
-		if depth == 0 && s[i:i+len(op)] == op {
+		if depth == 0 {
+			if i+4 <= len(s) && strings.EqualFold(s[i:i+4], "CASE") && isSQLKeywordBoundary(s, i, 4) {
+				caseDepth++
+			} else if caseDepth > 0 && i+3 <= len(s) && strings.EqualFold(s[i:i+3], "END") && isSQLKeywordBoundary(s, i, 3) {
+				caseDepth--
+			}
+		}
+		if depth == 0 && caseDepth == 0 && s[i:i+len(op)] == op {
 			if op == ">" && i > 0 && s[i-1] == '-' {
 				continue
 			}

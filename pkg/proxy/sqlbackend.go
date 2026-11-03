@@ -399,8 +399,11 @@ func (b *DorisSQLBackend) GetDocByID(ctx context.Context, dbName, table, id stri
 	if err := rows.Err(); err != nil {
 		return nil, false, err
 	}
-	if !hasRow || bestDeleted {
+	if !hasRow {
 		return nil, false, nil
+	}
+	if bestDeleted {
+		return &best, false, nil
 	}
 	return &best, true, nil
 }
