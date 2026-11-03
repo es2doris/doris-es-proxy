@@ -12419,7 +12419,7 @@ func matchesTermsFilterPrecompiled(key string, filter any, precompiled *regexp.R
 				h ^= uint32(key[i])
 				h *= 16777619
 			}
-			return int64(h%uint32(numPart)) == part
+			return int64(h)%numPart == part
 		}
 		return false
 	}

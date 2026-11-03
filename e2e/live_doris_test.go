@@ -1543,7 +1543,7 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	r33SugResp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
 		"size": 1,
 		"track_scores": true,
-		"sort": [{"views": "desc"}],
+		"sort": [{"latency_ms": "desc"}],
 		"suggest": {
 			"text": "electrnics",
 			"cat_sug": {
