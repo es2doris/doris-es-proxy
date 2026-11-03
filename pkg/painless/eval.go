@@ -91,7 +91,7 @@ var (
 	reArrayRetainAll       = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)\.retainAll\(\s*(.+?)\s*\)$`)
 	reMapPut               = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+))?\.put\(\s*(.+)\s*\)$`)
 	reMapPutAll            = regexp.MustCompile(`^ctx\??\._source\??(?:\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+))?\.putAll\(\s*(.+?)\s*\)$`)
-	reArrayRemoveIf        = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)\.removeIf\(\s*\(?\s*([a-zA-Z0-9_$]+)\s*\)?\s*->\s*(.+)\s*\)$`)
+	reArrayRemoveIf        = regexp.MustCompile(`^ctx\??\._source\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)\.removeIf\(\s*\(?\s*(?:[a-zA-Z_$][a-zA-Z0-9_$<>[\]]*\s+)?([a-zA-Z0-9_$]+)\s*\)?\s*->\s*(.+)\s*\)$`)
 	reLocalIncDec          = regexp.MustCompile(`^(?:(\+\+|--)\s*([a-zA-Z_$][a-zA-Z0-9_$]*\??(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)|([a-zA-Z_$][a-zA-Z0-9_$]*\??(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\s*(\+\+|--))$`)
 	reLocalRemoveField     = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\.remove\(\s*(.+?)\s*\)$`)
 	reLocalClearField      = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\.clear\(\s*\)$`)
@@ -102,7 +102,7 @@ var (
 	reLocalArrayRetainAll  = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\.retainAll\(\s*(.+?)\s*\)$`)
 	reLocalMapPut          = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\.put\(\s*(.+)\s*\)$`)
 	reLocalMapPutAll       = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\.putAll\(\s*(.+?)\s*\)$`)
-	reLocalArrayRemoveIf   = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\.removeIf\(\s*\(?\s*([a-zA-Z0-9_$]+)\s*\)?\s*->\s*(.+)\s*\)$`)
+	reLocalArrayRemoveIf   = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\.removeIf\(\s*\(?\s*(?:[a-zA-Z_$][a-zA-Z0-9_$<>[\]]*\s+)?([a-zA-Z0-9_$]+)\s*\)?\s*->\s*(.+)\s*\)$`)
 	reLocalCompoundAssign  = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*\??(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\s*(\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>>=|>>=)\s*(.+)$`)
 	reLocalPropAssign      = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*)\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)\s*=\s*(.+)$`)
 	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|Object|Map|HashMap|LinkedHashMap|TreeMap|List|ArrayList|LinkedList|Set|HashSet|ZonedDateTime|Instant|LocalDateTime|LocalDate|Pattern|Matcher)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
@@ -1776,11 +1776,18 @@ func syncLocalVarAlias(sourceMap map[string]any, params map[string]any, varName 
 		return
 	}
 	if aliasPath, ok := params["__alias_"+varName].(string); ok && aliasPath != "" {
+		if aliasPath == "@root" {
+			for k := range sourceMap {
+				syncSourceAliasToLocalVars(sourceMap, params, k)
+			}
+			return
+		}
 		val := params[varName]
 		switch val.(type) {
 		case []any, map[string]any:
 			setValueAtPath(sourceMap, strings.Split(aliasPath, "."), val)
 		}
+		syncSourceAliasToLocalVars(sourceMap, params, aliasPath)
 	}
 }
 
@@ -1790,7 +1797,7 @@ func syncSourceAliasToLocalVars(sourceMap map[string]any, params map[string]any,
 	}
 	for k, v := range params {
 		if strings.HasPrefix(k, "__alias_") {
-			if aliasPath, ok := v.(string); ok && (aliasPath == targetPath || strings.HasPrefix(aliasPath, targetPath+".") || strings.HasPrefix(targetPath, aliasPath+".")) {
+			if aliasPath, ok := v.(string); ok && aliasPath != "@root" && (aliasPath == targetPath || strings.HasPrefix(aliasPath, targetPath+".") || strings.HasPrefix(targetPath, aliasPath+".")) {
 				varName := strings.TrimPrefix(k, "__alias_")
 				params[varName] = resolveParamPath(sourceMap, strings.Split(aliasPath, "."))
 			}
@@ -2056,6 +2063,13 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			putAllAtPath(sourceMap, targetPath, subMap)
 			if m[1] != "" {
 				syncSourceAliasToLocalVars(sourceMap, params, m[1])
+				for k := range subMap {
+					syncSourceAliasToLocalVars(sourceMap, params, m[1]+"."+k)
+				}
+			} else {
+				for k := range subMap {
+					syncSourceAliasToLocalVars(sourceMap, params, k)
+				}
 			}
 		}
 		params["_last_expr_val"] = nil
@@ -2606,6 +2620,11 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		}
 		params[varName] = val
 		matchedAlias := false
+		if rhsExpr == "ctx._source" || rhsExpr == "ctx?._source" || rhsExpr == "ctx._source?" || rhsExpr == "ctx?._source?" ||
+			rhsExpr == "params._source" || rhsExpr == "params?._source" {
+			params["__alias_"+varName] = "@root"
+			matchedAlias = true
+		}
 		for _, pfx := range []string{"ctx?._source?.", "ctx?._source.", "ctx._source?.", "ctx._source."} {
 			if strings.HasPrefix(rhsExpr, pfx) {
 				tail := strings.TrimSpace(strings.TrimPrefix(rhsExpr, pfx))
@@ -2626,7 +2645,15 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 				if baseAlias, ok := params["__alias_"+rootVar].(string); ok && baseAlias != "" {
 					switch val.(type) {
 					case []any, map[string]any:
-						params["__alias_"+varName] = strings.Join(append([]string{baseAlias}, rhsParts[1:]...), ".")
+						if baseAlias == "@root" {
+							if len(rhsParts) > 1 {
+								params["__alias_"+varName] = strings.Join(rhsParts[1:], ".")
+							} else {
+								params["__alias_"+varName] = "@root"
+							}
+						} else {
+							params["__alias_"+varName] = strings.Join(append([]string{baseAlias}, rhsParts[1:]...), ".")
+						}
 						matchedAlias = true
 					}
 				}
@@ -3726,8 +3753,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			if mName == ".removeIf(" {
 				arrowIdx := strings.Index(argExpr, "->")
 				if arrowIdx > 0 {
-					paramName := strings.TrimSpace(argExpr[:arrowIdx])
-					paramName = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(paramName, "("), ")"))
+					pNames := parsePainlessLambdaHeader(argExpr[:arrowIdx])
+					if len(pNames) == 0 {
+						return false, nil
+					}
+					paramName := pNames[0]
 					condExpr := strings.TrimSpace(argExpr[arrowIdx+2:])
 					for _, pfx := range []string{"ctx?._source?.", "ctx?._source.", "ctx._source?.", "ctx._source."} {
 						if strings.HasPrefix(recExpr, pfx) {
@@ -3751,6 +3781,16 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 								return nil, err
 							}
 							syncLocalVarAlias(sourceMap, params, rootVar)
+							return changed, nil
+						}
+					}
+					if recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1); err == nil {
+						if arr, ok := recVal.([]any); ok {
+							tmpMap := map[string]any{"_arr": arr}
+							changed, err := removeIfCondFromSlice(sourceMap, tmpMap, []string{"_arr"}, paramName, condExpr, params)
+							if err != nil {
+								return nil, err
+							}
 							return changed, nil
 						}
 					}
@@ -3986,14 +4026,22 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				if recExpr == "ctx._source" || recExpr == "ctx?._source" || recExpr == "ctx._source?" || recExpr == "ctx?._source?" {
 					if isSubMap {
 						putAllAtPath(sourceMap, nil, subMap)
+						for k := range subMap {
+							syncSourceAliasToLocalVars(sourceMap, params, k)
+						}
 					}
 					return nil, nil
 				}
 				for _, pfx := range []string{"ctx?._source?.", "ctx?._source.", "ctx._source?.", "ctx._source."} {
 					if strings.HasPrefix(recExpr, pfx) {
-						targetPath := strings.Split(strings.TrimSuffix(strings.TrimPrefix(recExpr, pfx), "?"), ".")
+						relPath := strings.TrimSuffix(strings.TrimPrefix(recExpr, pfx), "?")
+						targetPath := strings.Split(relPath, ".")
 						if isSubMap {
 							putAllAtPath(sourceMap, targetPath, subMap)
+							syncSourceAliasToLocalVars(sourceMap, params, relPath)
+							for k := range subMap {
+								syncSourceAliasToLocalVars(sourceMap, params, relPath+"."+k)
+							}
 						}
 						return nil, nil
 					}
@@ -4017,6 +4065,13 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						return nil, nil
 					}
 				}
+				if isSubMap {
+					if recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1); err == nil {
+						if m, ok := recVal.(map[string]any); ok && m != nil {
+							putAllAtPath(m, nil, subMap)
+						}
+					}
+				}
 				return nil, nil
 			}
 			if mName == ".put(" {
@@ -4028,14 +4083,18 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					if recExpr == "ctx._source" || recExpr == "ctx?._source" || recExpr == "ctx._source?" || recExpr == "ctx?._source?" {
 						prev := resolveParamPath(sourceMap, []string{keyStr})
 						setValueAtPath(sourceMap, []string{keyStr}, vVal)
+						syncSourceAliasToLocalVars(sourceMap, params, keyStr)
 						return prev, nil
 					}
 					for _, pfx := range []string{"ctx?._source?.", "ctx?._source.", "ctx._source?.", "ctx._source."} {
 						if strings.HasPrefix(recExpr, pfx) {
-							targetPath := strings.Split(strings.TrimSuffix(strings.TrimPrefix(recExpr, pfx), "?"), ".")
+							relPath := strings.TrimSuffix(strings.TrimPrefix(recExpr, pfx), "?")
+							targetPath := strings.Split(relPath, ".")
 							fullKeyPath := append(targetPath, keyStr)
 							prev := resolveParamPath(sourceMap, fullKeyPath)
 							setValueAtPath(sourceMap, fullKeyPath, vVal)
+							syncSourceAliasToLocalVars(sourceMap, params, relPath)
+							syncSourceAliasToLocalVars(sourceMap, params, strings.Join(fullKeyPath, "."))
 							return prev, nil
 						}
 					}
@@ -4057,6 +4116,13 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 							return prev, nil
 						}
 					}
+					if recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1); err == nil {
+						if m, ok := recVal.(map[string]any); ok && m != nil {
+							prev := m[keyStr]
+							m[keyStr] = vVal
+							return prev, nil
+						}
+					}
 				}
 				return nil, nil
 			}
@@ -4070,16 +4136,20 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						prev := resolveParamPath(sourceMap, []string{keyStr})
 						if prev == nil {
 							setValueAtPath(sourceMap, []string{keyStr}, vVal)
+							syncSourceAliasToLocalVars(sourceMap, params, keyStr)
 						}
 						return prev, nil
 					}
 					for _, pfx := range []string{"ctx?._source?.", "ctx?._source.", "ctx._source?.", "ctx._source."} {
 						if strings.HasPrefix(recExpr, pfx) {
-							targetPath := strings.Split(strings.TrimSuffix(strings.TrimPrefix(recExpr, pfx), "?"), ".")
+							relPath := strings.TrimSuffix(strings.TrimPrefix(recExpr, pfx), "?")
+							targetPath := strings.Split(relPath, ".")
 							fullKeyPath := append(targetPath, keyStr)
 							prev := resolveParamPath(sourceMap, fullKeyPath)
 							if prev == nil {
 								setValueAtPath(sourceMap, fullKeyPath, vVal)
+								syncSourceAliasToLocalVars(sourceMap, params, relPath)
+								syncSourceAliasToLocalVars(sourceMap, params, strings.Join(fullKeyPath, "."))
 							}
 							return prev, nil
 						}
@@ -4935,7 +5005,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		}
 		return ctxMap, nil
 	}
-	if rhs == "ctx._source" || rhs == "ctx?._source" {
+	if rhs == "ctx._source" || rhs == "ctx?._source" || rhs == "ctx._source?" || rhs == "ctx?._source?" {
 		return sourceMap, nil
 	}
 	if strings.HasPrefix(rhs, "ctx._source.") || strings.HasPrefix(rhs, "ctx._source?.") ||
@@ -4971,7 +5041,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				if err != nil || val == nil {
 					return int64(0), err
 				}
-				return int64(len(fmt.Sprintf("%v", val))), nil
+				return int64(utf8.RuneCountInString(fmt.Sprintf("%v", val))), nil
 			}
 			dv := resolveDocValuesSlice(sourceMap, strings.TrimSuffix(base, ".values"))
 			return int64(len(dv)), nil
@@ -5015,7 +5085,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			switch tv := recVal.(type) {
 			case string:
 				if isLen {
-					return int64(len(tv)), nil
+					return int64(utf8.RuneCountInString(tv)), nil
 				}
 				return len(tv) == 0, nil
 			case []any:
@@ -6036,7 +6106,7 @@ func resolveParamPath(params map[string]any, path []string) any {
 		}
 		if strVal, isStr := curr.(string); isStr && i == len(path)-1 {
 			if seg == "length" {
-				return int64(len(strVal))
+				return int64(utf8.RuneCountInString(strVal))
 			}
 			if seg == "empty" {
 				return len(strVal) == 0
@@ -7608,7 +7678,23 @@ func evalPainlessMapCompute(mName, recExpr, argExpr string, sourceMap, params ma
 	if !ok || m == nil {
 		return nil, nil
 	}
-	syncMutatedMap := func() {
+	syncMutatedMap := func(mutatedKey string) {
+		if recExpr == "ctx._source" || recExpr == "ctx?._source" || recExpr == "ctx._source?" || recExpr == "ctx?._source?" {
+			if mutatedKey != "" {
+				syncSourceAliasToLocalVars(sourceMap, params, mutatedKey)
+			}
+			return
+		}
+		for _, pfx := range []string{"ctx?._source?.", "ctx?._source.", "ctx._source?.", "ctx._source."} {
+			if strings.HasPrefix(recExpr, pfx) {
+				relPath := strings.TrimSuffix(strings.TrimPrefix(recExpr, pfx), "?")
+				syncSourceAliasToLocalVars(sourceMap, params, relPath)
+				if mutatedKey != "" {
+					syncSourceAliasToLocalVars(sourceMap, params, relPath+"."+mutatedKey)
+				}
+				return
+			}
+		}
 		cleanRec := strings.TrimSuffix(recExpr, "?")
 		rawPath := normalizeLocalLHSPath(strings.Split(cleanRec, "."), params)
 		if len(rawPath) > 0 {
@@ -7656,7 +7742,7 @@ func evalPainlessMapCompute(mName, recExpr, argExpr string, sourceMap, params ma
 		}
 		if newVal != nil {
 			m[keyStr] = newVal
-			syncMutatedMap()
+			syncMutatedMap(keyStr)
 		}
 		return newVal, nil
 
@@ -7705,7 +7791,7 @@ func evalPainlessMapCompute(mName, recExpr, argExpr string, sourceMap, params ma
 		} else {
 			m[keyStr] = newVal
 		}
-		syncMutatedMap()
+		syncMutatedMap(keyStr)
 		return newVal, nil
 
 	case ".merge(":
@@ -7725,7 +7811,7 @@ func evalPainlessMapCompute(mName, recExpr, argExpr string, sourceMap, params ma
 		if !exists || cur == nil {
 			if vVal != nil {
 				m[keyStr] = vVal
-				syncMutatedMap()
+				syncMutatedMap(keyStr)
 			}
 			return vVal, nil
 		}
@@ -7761,7 +7847,7 @@ func evalPainlessMapCompute(mName, recExpr, argExpr string, sourceMap, params ma
 		} else {
 			m[keyStr] = mergedVal
 		}
-		syncMutatedMap()
+		syncMutatedMap(keyStr)
 		return mergedVal, nil
 	}
 	return nil, nil

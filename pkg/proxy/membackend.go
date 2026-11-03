@@ -2326,7 +2326,7 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 				rhs = rhs[6 : len(rhs)-1]
 			}
 			if isArithmeticSQLExpr(lhs) || strings.Contains(lhs, "AS INT") || (strings.Contains(lhs, "AS DOUBLE") && !strings.HasPrefix(lhs, "CAST(`_doc`")) {
-				if isArithmeticSQLExpr(lhs) && hasUnwrappedNullColumnRef(row, lhs) {
+				if hasUnwrappedNullColumnRef(row, lhs) {
 					return false
 				}
 				lhsNum := evalNumericExpr(row, lhs)
@@ -2643,6 +2643,13 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 		return res
 	}
 
+	if strings.HasPrefix(expr, "-") {
+		return -evalNumericExpr(row, strings.TrimSpace(expr[1:]))
+	}
+	if strings.HasPrefix(expr, "+") {
+		return evalNumericExpr(row, strings.TrimSpace(expr[1:]))
+	}
+
 	if strings.HasPrefix(expr, "CASE WHEN ") && strings.HasSuffix(expr, " END") {
 		inner := expr[len("CASE WHEN ") : len(expr)-len(" END")]
 		elseIdx := findTopLevelOp(inner, " ELSE ")
@@ -2695,11 +2702,15 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 		}
 	}
 
-	for _, fn := range []string{"GREATEST", "LEAST", "COALESCE", "LOG10", "LN", "SQRT", "FLOOR", "CEIL", "ROUND", "ABS"} {
+	for _, fn := range []string{"GREATEST", "LEAST", "COALESCE", "POW", "LOG10", "LN", "SQRT", "FLOOR", "CEIL", "ROUND", "ABS"} {
 		if strings.HasPrefix(expr, fn+"(") && strings.HasSuffix(expr, ")") {
 			inner := expr[len(fn)+1 : len(expr)-1]
 			args := splitTopLevelArgs(inner)
 			switch fn {
+			case "POW":
+				if len(args) == 2 {
+					return math.Pow(evalNumericExpr(row, args[0]), evalNumericExpr(row, args[1]))
+				}
 			case "GREATEST":
 				maxVal := 0.0
 				for i, a := range args {
@@ -3058,6 +3069,59 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			return int64(0)
 		}
 		return int64(len(toStringSlice(val)))
+	}
+	if strings.HasPrefix(colExpr, "ST_Distance_Sphere(") && strings.HasSuffix(colExpr, ")") {
+		inner := colExpr[len("ST_Distance_Sphere(") : len(colExpr)-1]
+		args := splitTopLevelArgs(inner)
+		if len(args) == 4 {
+			tLon, errLon := strconv.ParseFloat(strings.TrimSpace(args[2]), 64)
+			tLat, errLat := strconv.ParseFloat(strings.TrimSpace(args[3]), 64)
+			if errLon == nil && errLat == nil {
+				lonExpr := strings.TrimSpace(args[0])
+				if strings.HasPrefix(lonExpr, "CAST(`_doc`") {
+					if asIdx := strings.LastIndex(lonExpr, " AS "); asIdx > 0 {
+						pathPart := lonExpr[len("CAST(`_doc`"):asIdx]
+						var segs []string
+						for _, p := range strings.Split(pathPart, "['") {
+							p = strings.TrimSuffix(p, "']")
+							if p != "" {
+								p = strings.ReplaceAll(p, "''", "'")
+								p = strings.ReplaceAll(p, `\\`, `\`)
+								segs = append(segs, p)
+							}
+						}
+						if len(segs) > 1 && segs[len(segs)-1] == "lon" {
+							segs = segs[:len(segs)-1]
+						}
+						srcStr, _ := row["_source"].(string)
+						if srcStr != "" {
+							var doc map[string]any
+							if json.Unmarshal([]byte(srcStr), &doc) == nil {
+								pts := collectGeoPointsAtPath(doc, segs)
+								if len(pts) > 0 {
+									minDist := math.MaxFloat64
+									for _, pt := range pts {
+										d := haversineDistanceMeters(tLat, tLon, pt[0], pt[1])
+										if d < minDist {
+											minDist = d
+										}
+									}
+									return minDist
+								}
+							}
+						}
+					}
+				}
+				lonVal := resolveColumnValue(row, lonExpr)
+				latVal := resolveColumnValue(row, strings.TrimSpace(args[1]))
+				if lonF, ok1 := toFloat(lonVal); ok1 {
+					if latF, ok2 := toFloat(latVal); ok2 {
+						return haversineDistanceMeters(tLat, tLon, latF, lonF)
+					}
+				}
+			}
+		}
+		return nil
 	}
 	if (strings.HasPrefix(colExpr, "COSINE_DISTANCE(") || strings.HasPrefix(colExpr, "L2_DISTANCE(") || strings.HasPrefix(colExpr, "INNER_PRODUCT(")) && strings.HasSuffix(colExpr, ")") {
 		isL2 := strings.HasPrefix(colExpr, "L2_DISTANCE(")
@@ -3451,6 +3515,7 @@ var (
 	reUnwrappedBacktickCol = regexp.MustCompile("`([a-zA-Z0-9_]+)`")
 	reUnwrappedJSONExtract = regexp.MustCompile(`json_extract_string\([^)]+\)`)
 	reUnwrappedDocExtract  = regexp.MustCompile("CAST\\(`_doc`(?:\\['[^']+'\\])+ AS [A-Z]+\\)")
+	reUnwrappedSTDistance  = regexp.MustCompile(`ST_Distance_Sphere\([^)]+\)`)
 )
 
 func stripCoalesceSubexprs(expr string) string {
@@ -3483,7 +3548,16 @@ func hasUnwrappedNullColumnRef(row map[string]any, expr string) bool {
 	if strings.Contains(expr, "CASE ") {
 		return false
 	}
+	if strings.Contains(expr, "_el ->") || strings.Contains(expr, "_x ->") {
+		return resolveColumnValue(row, expr) == nil
+	}
 	stripped := stripCoalesceSubexprs(expr)
+	for _, m := range reUnwrappedSTDistance.FindAllString(stripped, -1) {
+		if v := resolveColumnValue(row, m); v == nil {
+			return true
+		}
+	}
+	stripped = reUnwrappedSTDistance.ReplaceAllString(stripped, "1")
 	for _, m := range reUnwrappedDocExtract.FindAllString(stripped, -1) {
 		if v := resolveColumnValue(row, m); v == nil || fmt.Sprintf("%v", v) == "" {
 			return true
@@ -3510,7 +3584,7 @@ func hasUnwrappedNullColumnRef(row map[string]any, expr string) bool {
 
 func isArithmeticSQLExpr(expr string) bool {
 	trimmed := trimOuterParens(strings.TrimSpace(expr))
-	for _, fn := range []string{"CASE ", "GREATEST(", "LEAST(", "LOG10(", "LN(", "SQRT(", "FLOOR(", "CEIL(", "ROUND(", "ABS("} {
+	for _, fn := range []string{"CASE ", "ST_Distance_Sphere(", "GREATEST(", "LEAST(", "POW(", "LOG10(", "LN(", "SQRT(", "FLOOR(", "CEIL(", "ROUND(", "ABS("} {
 		if strings.HasPrefix(trimmed, fn) {
 			return true
 		}
@@ -3519,6 +3593,9 @@ func isArithmeticSQLExpr(expr string) bool {
 		if len(splitTopLevelBinaryMath(trimmed, op)) > 1 {
 			return true
 		}
+	}
+	if strings.HasPrefix(trimmed, "-") || strings.HasPrefix(trimmed, "+") {
+		return true
 	}
 	return false
 }
@@ -3654,10 +3731,39 @@ func splitTopLevelLogicalOp(s, op string) []string {
 	return parts
 }
 
+func isSQLKeywordBoundary(s string, pos, kwLen int) bool {
+	if pos > 0 {
+		prev := s[pos-1]
+		if (prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') || (prev >= '0' && prev <= '9') || prev == '_' || prev == '`' {
+			return false
+		}
+	}
+	end := pos + kwLen
+	if end < len(s) {
+		next := s[end]
+		if (next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') || (next >= '0' && next <= '9') || next == '_' || next == '`' {
+			return false
+		}
+	}
+	return true
+}
+
+func endsWithSQLUnaryPrefixKeyword(prev string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(prev))
+	for _, kw := range []string{"CASE", "WHEN", "THEN", "ELSE", "AND", "OR", "NOT"} {
+		if strings.HasSuffix(upper, kw) && isSQLKeywordBoundary(upper, len(upper)-len(kw), len(kw)) {
+			return true
+		}
+	}
+	return false
+}
+
 func splitTopLevelBinaryMath(s string, op byte) []string {
 	var parts []string
 	depth := 0
+	caseDepth := 0
 	inQuotes := false
+	inBackticks := false
 	lastStart := 0
 	for i := 0; i < len(s); i++ {
 		c := s[i]
@@ -3675,9 +3781,31 @@ func splitTopLevelBinaryMath(s string, op byte) []string {
 			}
 			continue
 		}
+		if inBackticks {
+			if c == '`' {
+				inBackticks = false
+			}
+			continue
+		}
 		if c == '\'' {
 			inQuotes = true
 			continue
+		}
+		if c == '`' {
+			inBackticks = true
+			continue
+		}
+		if depth == 0 {
+			if i+4 <= len(s) && strings.EqualFold(s[i:i+4], "CASE") && isSQLKeywordBoundary(s, i, 4) {
+				caseDepth++
+				i += 3
+				continue
+			}
+			if caseDepth > 0 && i+3 <= len(s) && strings.EqualFold(s[i:i+3], "END") && isSQLKeywordBoundary(s, i, 3) {
+				caseDepth--
+				i += 2
+				continue
+			}
 		}
 		switch c {
 		case '(':
@@ -3687,7 +3815,7 @@ func splitTopLevelBinaryMath(s string, op byte) []string {
 				depth--
 			}
 		case op:
-			if depth == 0 && i > 0 {
+			if depth == 0 && caseDepth == 0 && i > 0 {
 				if (op == '+' || op == '-') && (s[i-1] == 'e' || s[i-1] == 'E') && i >= 2 && ((s[i-2] >= '0' && s[i-2] <= '9') || s[i-2] == '.') {
 					continue
 				}
@@ -3698,7 +3826,8 @@ func splitTopLevelBinaryMath(s string, op byte) []string {
 				if op == '+' || op == '-' {
 					lastChar := prev[len(prev)-1]
 					if lastChar == '+' || lastChar == '-' || lastChar == '*' || lastChar == '/' || lastChar == '(' ||
-						lastChar == ',' || lastChar == '?' || lastChar == ':' || lastChar == '=' || lastChar == '<' || lastChar == '>' || lastChar == '!' {
+						lastChar == ',' || lastChar == '?' || lastChar == ':' || lastChar == '=' || lastChar == '<' || lastChar == '>' || lastChar == '!' ||
+						endsWithSQLUnaryPrefixKeyword(prev) {
 						continue
 					}
 				}
