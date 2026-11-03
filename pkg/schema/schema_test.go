@@ -1069,3 +1069,138 @@ func TestRound41ShredderStrictValidationDynamicFalseDenseVectorAndDDL(t *testing
 		t.Fatalf("F11 expected type conflict error, got %v", err)
 	}
 }
+
+func TestRound42ShredderNestedEnabledFalseMultiFieldIgnoreMalformedMappingCompatAndPromoteDDL(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"dynamic": false,
+		"properties": {
+			"raw_val": {
+				"type": "keyword",
+				"fields": {
+					"num": {"type": "integer", "ignore_malformed": true}
+				}
+			},
+			"scores": {
+				"type": "integer",
+				"ignore_malformed": true
+			},
+			"payload": {
+				"type": "object",
+				"enabled": false
+			},
+			"no_idx": {
+				"type": "keyword",
+				"index": false
+			},
+			"emb": {
+				"type": "dense_vector",
+				"dims": 3
+			},
+			"price": {
+				"type": "scaled_float",
+				"scaling_factor": 100
+			},
+			"price_alias": {
+				"type": "alias",
+				"path": "price"
+			},
+			"ts_nano": {
+				"type": "date_nanos"
+			},
+			"items": {
+				"type": "nested",
+				"properties": {
+					"sku": {"type": "keyword"},
+					"secret": {"type": "keyword", "index": false},
+					"meta": {"type": "object", "enabled": false}
+				}
+			}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("unmarshal spec failed: %v", err)
+	}
+	sch := CompileIndexSchema("db", "r42_idx", &spec)
+
+	// F1: buildColumnAndIndexDDL skips USING INVERTED for index: false fields (no_idx and items.secret)
+	createDDL := GenerateCreateTableDDL(sch)
+	if strings.Contains(createDDL, "idx_f__no_idx") || strings.Contains(createDDL, "idx_f__items__secret") {
+		t.Fatalf("F1 expected no USING INVERTED index for index:false fields, got:\n%s", createDDL)
+	}
+
+	// F2 & F8: ShredDocument preserves primary field when multi-field ignore_malformed fails,
+	// keeps valid array elements, and normalizes default-format date_nanos epoch nanos to millis.
+	shredded, err := ShredDocument(sch, "1", 1, false, json.RawMessage(`{
+		"raw_val": "hello",
+		"scores": [10, "bad_int", 20],
+		"ts_nano": 1700000000123456789,
+		"items": [
+			{"sku": "A1", "secret": "hidden", "meta": {"blob": "ignored"}, "extra_unmapped": "drop_me"}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("ShredDocument failed: %v", err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(shredded, &row); err != nil {
+		t.Fatalf("unmarshal shredded row failed: %v", err)
+	}
+	if row["f__raw_val"] != "hello" {
+		t.Fatalf("F2 expected f__raw_val == 'hello', got %v", row["f__raw_val"])
+	}
+	if row["f__raw_val__num"] != nil {
+		t.Fatalf("F2 expected f__raw_val__num == nil for malformed integer, got %v", row["f__raw_val__num"])
+	}
+	if row["f__ts_nano"] != float64(1700000000123) {
+		t.Fatalf("F8 expected f__ts_nano normalized to epoch millis 1700000000123, got %v", row["f__ts_nano"])
+	}
+	docVariant, ok := row["_doc"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected _doc to be map[string]any, got %T", row["_doc"])
+	}
+	if docVariant["raw_val"] != "hello" {
+		t.Fatalf("F2 expected _doc.raw_val preserved as 'hello', got %v", docVariant["raw_val"])
+	}
+	scoresArr, ok := docVariant["scores"].([]any)
+	if !ok || len(scoresArr) != 2 {
+		t.Fatalf("F2 expected _doc.scores to retain 2 valid elements [10, 20], got %+v", docVariant["scores"])
+	}
+	// F1: GenerateAlterTableDDL emits ADD INDEX when transitioning index: false -> true
+	var updatedSpec esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{
+		"properties": {
+			"no_idx": {"type": "keyword", "index": true}
+		}
+	}`), &updatedSpec)
+	newSch := CompileIndexSchema("db", "r42_idx", &updatedSpec)
+	alterStmts := GenerateAlterTableDDL(sch, newSch)
+	if len(alterStmts) == 0 || !strings.Contains(strings.Join(alterStmts, "; "), "ADD INDEX `idx_f__no_idx`") {
+		t.Fatalf("F1 expected ADD INDEX idx_f__no_idx on index:false -> true transition, got %v", alterStmts)
+	}
+
+	// F3: ValidateMappingUpdateCompatibility rejects incompatible updates on enabled, alias.path, dims, scaling_factor, and multi-fields
+	incompatSpecs := []string{
+		`{"properties": {"payload": {"type": "object", "enabled": true}}}`,
+		`{"properties": {"payload": {"type": "keyword"}}}`,
+		`{"properties": {"price_alias": {"type": "alias", "path": "raw_val"}}}`,
+		`{"properties": {"emb": {"type": "dense_vector", "dims": 5}}}`,
+		`{"properties": {"price": {"type": "scaled_float", "scaling_factor": 10}}}`,
+		`{"properties": {"raw_val": {"type": "keyword", "fields": {"num": {"type": "keyword"}}}}}`,
+	}
+	for _, rawIncompat := range incompatSpecs {
+		var inc esast.MappingSpec
+		if err := json.Unmarshal([]byte(rawIncompat), &inc); err != nil {
+			t.Fatalf("unmarshal incompat spec %s failed: %v", rawIncompat, err)
+		}
+		if err := ValidateMappingUpdateCompatibility(&spec, &inc); err == nil {
+			t.Fatalf("F3 expected compatibility error for %s, got nil", rawIncompat)
+		}
+	}
+
+	// F4: GeneratePromoteVariantFieldDDL skips enabled:false descendants, index:false fields, and unmapped fields under dynamic:false
+	for _, skipField := range []string{"payload.sub", "no_idx", "unmapped_dynamic_false"} {
+		if stmts := GeneratePromoteVariantFieldDDL(sch, skipField, "keyword"); len(stmts) != 0 {
+			t.Fatalf("F4 expected empty DDL for %q, got %v", skipField, stmts)
+		}
+	}
+}

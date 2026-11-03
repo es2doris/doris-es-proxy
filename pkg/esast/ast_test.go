@@ -941,3 +941,30 @@ func TestRound41FunctionScoreCompositeAndMultiLevelNestedSort(t *testing.T) {
 		t.Fatalf("expected nested.nested.path == 'comments.replies', got %q", got)
 	}
 }
+
+func TestRound42BoolQueryUnknownKeyAndClauseSliceParsingException(t *testing.T) {
+	// F5a: BoolQuery rejects unknown keys inside "bool"
+	var badBool SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"bool": {
+				"filtre": [{"term": {"status": "ok"}}]
+			}
+		}
+	}`), &badBool); err == nil || !strings.Contains(err.Error(), "parsing_exception") {
+		t.Fatalf("F5a expected parsing_exception for unknown bool key 'filtre', got %v", err)
+	}
+
+	// F5b: unmarshalClauseSlice preserves parsing_exception when a single-object clause is invalid
+	var badSingleClause SearchRequest
+	err := json.Unmarshal([]byte(`{
+		"query": {
+			"bool": {
+				"must": {"not_a_real_query": {"x": 1}}
+			}
+		}
+	}`), &badSingleClause)
+	if err == nil || !strings.Contains(err.Error(), "parsing_exception") {
+		t.Fatalf("F5b expected parsing_exception for invalid single-object bool.must clause, got %v", err)
+	}
+}

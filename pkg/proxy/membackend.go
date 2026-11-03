@@ -262,6 +262,9 @@ func splitHitsWhereBody(whereBody string) (mainWhere, postWhere string) {
 	if trimmed == "" {
 		return "TRUE", "TRUE"
 	}
+	if len(splitTopLevelLogicalOp(trimmed, " OR ")) > 1 {
+		return trimmed, "TRUE"
+	}
 	parts := splitTopLevelLogicalOp(trimmed, " AND ")
 	if len(parts) == 0 {
 		return trimmed, "TRUE"
@@ -2171,10 +2174,9 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 
 	if strings.HasPrefix(expr, "array_contains(") && strings.HasSuffix(expr, ")") {
 		inner := expr[len("array_contains(") : len(expr)-1]
-		commaIdx := strings.LastIndexByte(inner, ',')
-		if commaIdx > 0 {
-			colExpr := strings.TrimSpace(inner[:commaIdx])
-			target := unquoteSQLLiteral(strings.TrimSpace(inner[commaIdx+1:]))
+		if args := splitTopLevelArgs(inner); len(args) == 2 {
+			colExpr := strings.TrimSpace(args[0])
+			target := unquoteSQLLiteral(strings.TrimSpace(args[1]))
 			val := resolveColumnValue(row, colExpr)
 			for _, item := range toStringSlice(val) {
 				if item == target {
@@ -2187,10 +2189,10 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 
 	if strings.HasPrefix(expr, "arrays_overlap(") && strings.HasSuffix(expr, ")") {
 		inner := expr[len("arrays_overlap(") : len(expr)-1]
-		brackIdx := strings.IndexByte(inner, '[')
-		if brackIdx > 0 {
-			colExpr := strings.TrimSpace(inner[:strings.IndexByte(inner, ',')])
-			listStr := strings.TrimSuffix(inner[brackIdx+1:], "]")
+		if args := splitTopLevelArgs(inner); len(args) == 2 {
+			colExpr := strings.TrimSpace(args[0])
+			listArg := strings.TrimSpace(args[1])
+			listStr := strings.TrimSuffix(strings.TrimPrefix(listArg, "["), "]")
 			targets := make(map[string]bool)
 			for _, part := range splitTopLevelArgs(listStr) {
 				targets[unquoteSQLLiteral(strings.TrimSpace(part))] = true
@@ -2794,14 +2796,37 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 				}
 				return minVal
 			case "COALESCE":
-				if len(args) == 2 {
-					colVal := resolveColumnValue(row, strings.TrimSpace(args[0]))
-					if colVal != nil {
+				for i, rawArg := range args {
+					arg := strings.TrimSpace(rawArg)
+					if strings.EqualFold(arg, "NULL") {
+						continue
+					}
+					if colVal := resolveColumnValue(row, arg); colVal != nil {
 						if f, ok := toFloat(colVal); ok {
 							return f
 						}
+						switch sv := colVal.(type) {
+						case []any:
+							for _, el := range sv {
+								if f, ok := toFloat(el); ok {
+									return f
+								}
+							}
+						case []float64:
+							if len(sv) > 0 {
+								return sv[0]
+							}
+						case []string:
+							for _, el := range sv {
+								if f, ok := toFloat(el); ok {
+									return f
+								}
+							}
+						}
 					}
-					return evalNumericExpr(row, args[1])
+					if i == len(args)-1 {
+						return evalNumericExpr(row, arg)
+					}
 				}
 			case "LOG10":
 				return math.Log10(evalNumericExpr(row, inner))
@@ -3914,6 +3939,7 @@ func splitTopLevelArgs(s string) []string {
 	var parts []string
 	depth := 0
 	inQuotes := false
+	inBackticks := false
 	lastStart := 0
 	for i := 0; i < len(s); i++ {
 		c := s[i]
@@ -3931,14 +3957,24 @@ func splitTopLevelArgs(s string) []string {
 			}
 			continue
 		}
+		if inBackticks {
+			if c == '`' {
+				inBackticks = false
+			}
+			continue
+		}
 		if c == '\'' {
 			inQuotes = true
 			continue
 		}
+		if c == '`' {
+			inBackticks = true
+			continue
+		}
 		switch c {
-		case '(':
+		case '(', '[':
 			depth++
-		case ')':
+		case ')', ']':
 			if depth > 0 {
 				depth--
 			}

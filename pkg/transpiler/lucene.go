@@ -526,7 +526,7 @@ func parseLuceneTokensToASTWithFlags(tokens []string, defaultField string, field
 			if defaultOp == "AND" && len(remQ.Bool.Must) == 0 && len(remQ.Bool.Filter) == 0 && len(remQ.Bool.MustNot) == 0 && len(remQ.Bool.Should) > 0 {
 				remQ.Bool.MinimumShouldMatch = 1
 				outBool.Must = append(outBool.Must, remQ)
-			} else if defaultOp == "OR" && len(outBool.Must) > 0 && !remHasUnary && (len(remQ.Bool.Must) > 0 || len(remQ.Bool.MustNot) > 0 || len(remQ.Bool.Filter) > 0) {
+			} else if defaultOp == "OR" && len(outBool.Must) > 0 && !remHasUnary && len(remQ.Bool.MustNot) == 0 && (len(remQ.Bool.Must) > 0 || len(remQ.Bool.Filter) > 0) {
 				outBool.Should = append(outBool.Should, remQ)
 			} else {
 				outBool.Must = append(outBool.Must, remQ.Bool.Must...)

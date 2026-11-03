@@ -1486,7 +1486,11 @@ func (s *Server) handleClusterState(w http.ResponseWriter, r *http.Request) {
 		}
 		mappings := map[string]any{}
 		if idx.RawMapping != nil {
-			mappings["_doc"] = map[string]any{"properties": idx.RawMapping.Properties}
+			docMap := map[string]any{"properties": idx.RawMapping.Properties}
+			if idx.RawMapping.Dynamic != nil {
+				docMap["dynamic"] = idx.RawMapping.Dynamic
+			}
+			mappings["_doc"] = docMap
 		}
 		indicesMeta[name] = map[string]any{
 			"state":    "open",
@@ -2549,6 +2553,9 @@ func (s *Server) handleGetIndex(w http.ResponseWriter, r *http.Request) {
 		mappings := map[string]any{}
 		if idx.RawMapping != nil {
 			mappings["properties"] = idx.RawMapping.Properties
+			if idx.RawMapping.Dynamic != nil {
+				mappings["dynamic"] = idx.RawMapping.Dynamic
+			}
 			if idx.RawMapping.Routing != nil && idx.RawMapping.Routing.Required {
 				mappings["_routing"] = map[string]any{"required": true}
 			}
@@ -2583,19 +2590,69 @@ func (s *Server) handleGetIndex(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleHeadIndex(w http.ResponseWriter, r *http.Request) {
 	_ = s.syncCatalogFromBackend(r.Context())
-	raw := r.PathValue("index")
-	s.mu.RLock()
-	_, isIndex := s.indices[raw]
-	targets, isAlias := s.aliases[raw]
-	s.mu.RUnlock()
-	if !isIndex && (!isAlias || len(targets) == 0) {
-		_ = s.syncCatalogFromBackend(r.Context())
-		s.mu.RLock()
-		_, isIndex = s.indices[raw]
-		targets, isAlias = s.aliases[raw]
-		s.mu.RUnlock()
+	raw := strings.TrimSpace(r.PathValue("index"))
+	if raw == "" {
+		w.WriteHeader(http.StatusNotFound)
+		return
 	}
-	if !isIndex && (!isAlias || len(targets) == 0) {
+	ignoreUnavailable := strings.EqualFold(r.URL.Query().Get("ignore_unavailable"), "true")
+	checkExistsLocked := func(name string) bool {
+		if _, ok := s.indices[name]; ok {
+			return true
+		}
+		if targets, ok := s.aliases[name]; ok && len(targets) > 0 {
+			return true
+		}
+		if _, ok := s.dataStreams[name]; ok {
+			return true
+		}
+		return false
+	}
+
+	if !strings.ContainsAny(raw, "*,") && raw != "_all" {
+		s.mu.RLock()
+		exists := checkExistsLocked(raw)
+		s.mu.RUnlock()
+		if !exists {
+			_ = s.syncCatalogFromBackend(r.Context())
+			s.mu.RLock()
+			exists = checkExistsLocked(raw)
+			s.mu.RUnlock()
+		}
+		if !exists {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if !ignoreUnavailable {
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" || strings.HasPrefix(part, "-") || strings.Contains(part, "*") || part == "_all" {
+				continue
+			}
+			s.mu.RLock()
+			exists := checkExistsLocked(part)
+			s.mu.RUnlock()
+			if !exists {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+		}
+	}
+
+	targets := s.resolveTargetIndices(raw)
+	s.mu.RLock()
+	matched := 0
+	for _, t := range targets {
+		if checkExistsLocked(t) {
+			matched++
+		}
+	}
+	s.mu.RUnlock()
+	if matched == 0 {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -2722,6 +2779,9 @@ func (s *Server) handleGetAllMappings(w http.ResponseWriter, r *http.Request) {
 			props = idx.RawMapping.Properties
 		}
 		mappings := map[string]any{"properties": props}
+		if idx.RawMapping != nil && idx.RawMapping.Dynamic != nil {
+			mappings["dynamic"] = idx.RawMapping.Dynamic
+		}
 		if idx.RawMapping != nil && idx.RawMapping.Routing != nil && idx.RawMapping.Routing.Required {
 			mappings["_routing"] = map[string]any{"required": true}
 		}
@@ -2745,6 +2805,9 @@ func (s *Server) handleGetMapping(w http.ResponseWriter, r *http.Request) {
 				props = idx.RawMapping.Properties
 			}
 			mappings := map[string]any{"properties": props}
+			if idx.RawMapping != nil && idx.RawMapping.Dynamic != nil {
+				mappings["dynamic"] = idx.RawMapping.Dynamic
+			}
 			if idx.RawMapping != nil && idx.RawMapping.Routing != nil && idx.RawMapping.Routing.Required {
 				mappings["_routing"] = map[string]any{"required": true}
 			}
@@ -2762,6 +2825,9 @@ func (s *Server) handleGetMapping(w http.ResponseWriter, r *http.Request) {
 					props = idx.RawMapping.Properties
 				}
 				mappings := map[string]any{"properties": props}
+				if idx.RawMapping != nil && idx.RawMapping.Dynamic != nil {
+					mappings["dynamic"] = idx.RawMapping.Dynamic
+				}
 				if idx.RawMapping != nil && idx.RawMapping.Routing != nil && idx.RawMapping.Routing.Required {
 					mappings["_routing"] = map[string]any{"required": true}
 				}
@@ -4331,7 +4397,6 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	updReq.MetaID = docID
 	updReq.MetaIndex = indexName
 	updReq.MetaRouting = initEffRouting
-	updReq.AllowMetaMutation = true
 	if updReq.MetaRouting == "" && found && !s.isRoutingRequired(roSchema) {
 		updReq.MetaRouting = s.getDocRouting(indexName, docID)
 	}
@@ -4716,7 +4781,7 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 						rawMap = make(map[string]any)
 					}
 					rawMap["__meta_id"] = h.ID
-					if !evalQueryScriptFilterOnDocWithSchema(idxSchema, rawMap, effQuery) {
+					if !evalQueryScriptFilterOnDocWithScore(idxSchema, rawMap, effQuery, h.Score) {
 						continue
 					}
 				}
@@ -4737,9 +4802,6 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 					writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
 					return
 				}
-				if opRes == "noop" {
-					continue
-				}
 				isDel := opRes == "deleted"
 				targetDocID := h.ID
 				targetIdx := indexName
@@ -4751,28 +4813,41 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 					if len(targets) == 1 && rawIndex != "" && !hasExclusionOrWildcard(rawIndex) {
 						pipeInputIdx = rawIndex
 					}
-					piped, nextIdx, nextID, nextRouting, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithRouting(pipeInputIdx, h.ID, r.URL.Query().Get("pipeline"), body.Pipeline, initRouting, mutated)
-					if pipeErr != nil {
-						writeESError(w, http.StatusBadRequest, ingestErrorType(pipeErr), pipeErr.Error())
-						return
-					}
-					if dropped {
-						continue
-					}
-					if nextID != "" {
-						targetDocID = nextID
-					}
-					pipeRouting = nextRouting
-					if nextIdx != "" && nextIdx != pipeInputIdx {
-						resolvedIdx, resolvedFilter, rErr := s.resolveWriteIndexWithFilter(nextIdx)
-						if rErr != nil {
-							writeESError(w, http.StatusBadRequest, "illegal_argument_exception", rErr.Error())
+					reqPipe := r.URL.Query().Get("pipeline")
+					if opRes != "noop" || s.resolveEffectivePipeline(pipeInputIdx, reqPipe, body.Pipeline) != "" || s.resolveFinalPipeline(pipeInputIdx) != "" {
+						piped, nextIdx, nextID, nextRouting, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithRouting(pipeInputIdx, h.ID, reqPipe, body.Pipeline, initRouting, mutated)
+						if pipeErr != nil {
+							writeESError(w, http.StatusBadRequest, ingestErrorType(pipeErr), pipeErr.Error())
 							return
 						}
-						targetIdx = resolvedIdx
-						targetAliasFilter = resolvedFilter
+						if dropped {
+							continue
+						}
+						if opRes == "noop" &&
+							((nextIdx != "" && nextIdx != pipeInputIdx && nextIdx != indexName) ||
+								(nextID != "" && nextID != h.ID) ||
+								(nextRouting != "" && nextRouting != initRouting) ||
+								!jsonStructurallyEqual(mutated, piped)) {
+							opRes = "updated"
+						}
+						if nextID != "" {
+							targetDocID = nextID
+						}
+						pipeRouting = nextRouting
+						if nextIdx != "" && nextIdx != pipeInputIdx {
+							resolvedIdx, resolvedFilter, rErr := s.resolveWriteIndexWithFilter(nextIdx)
+							if rErr != nil {
+								writeESError(w, http.StatusBadRequest, "illegal_argument_exception", rErr.Error())
+								return
+							}
+							targetIdx = resolvedIdx
+							targetAliasFilter = resolvedFilter
+						}
+						mutated = piped
 					}
-					mutated = piped
+				}
+				if opRes == "noop" {
+					continue
 				}
 				effRouting := s.resolveEffectiveWriteRouting(rawIndex, targetIdx, initRouting, pipeRouting)
 				if effRouting == "" && !isDel && body.Script == nil {
@@ -5089,7 +5164,7 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 						rawMap = make(map[string]any)
 					}
 					rawMap["__meta_id"] = h.ID
-					if !evalQueryScriptFilterOnDocWithSchema(idxSchema, rawMap, effQuery) {
+					if !evalQueryScriptFilterOnDocWithScore(idxSchema, rawMap, effQuery, h.Score) {
 						continue
 					}
 				}
@@ -5629,7 +5704,6 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			upd.MetaID = op.ID
 			upd.MetaIndex = targetIndex
 			upd.MetaRouting = effRouting
-			upd.AllowMetaMutation = true
 			if found {
 				baseSrc = existingHit.Source
 				upd.MetaVersion = existingHit.Version
@@ -12062,6 +12136,12 @@ func filterAndSortTermsRowsWithSubAggs(
 				} else if strings.HasSuffix(normField, ".std_deviation_bounds.lower") || strings.HasSuffix(normField, ".std_deviation_bounds.lower_population") {
 					subName = strings.TrimSuffix(strings.TrimSuffix(normField, ".std_deviation_bounds.lower_population"), ".std_deviation_bounds.lower")
 					prop = "std_deviation_bounds.lower"
+				} else if strings.HasSuffix(normField, ".std_deviation_bounds.upper_sampling") {
+					subName = strings.TrimSuffix(normField, ".std_deviation_bounds.upper_sampling")
+					prop = "std_deviation_bounds.upper_sampling"
+				} else if strings.HasSuffix(normField, ".std_deviation_bounds.lower_sampling") {
+					subName = strings.TrimSuffix(normField, ".std_deviation_bounds.lower_sampling")
+					prop = "std_deviation_bounds.lower_sampling"
 				} else if dot := strings.LastIndexByte(normField, '.'); dot > 0 {
 					if prevDot := strings.LastIndexByte(normField[:dot], '.'); prevDot > 0 && isSignedASCIIDigits(normField[prevDot+1:dot]) && isAllDigitsASCII(normField[dot+1:]) {
 						subName = normField[:prevDot]
@@ -12131,7 +12211,7 @@ func filterAndSortTermsRowsWithSubAggs(
 					rowKey = fullKey + "." + subName + "._stats_sum"
 				case "sum_of_squares":
 					rowKey = fullKey + "." + subName + "._stats_sum_sq"
-				case "std_deviation", "std_deviation_population", "variance", "variance_population", "variance_sampling", "std_deviation_sampling", "std_deviation_bounds.upper", "std_deviation_bounds.lower":
+				case "std_deviation", "std_deviation_population", "variance", "variance_population", "variance_sampling", "std_deviation_sampling", "std_deviation_bounds.upper", "std_deviation_bounds.lower", "std_deviation_bounds.upper_sampling", "std_deviation_bounds.lower_sampling":
 					rowKey = fullKey + "." + subName + "._stats_std"
 				case "q1":
 					rowKey = fullKey + "." + subName + ".25.0"
@@ -12225,16 +12305,35 @@ func filterAndSortTermsRowsWithSubAggs(
 						}
 					}
 				}
-			case "std_deviation_bounds.upper", "std_deviation_bounds.lower":
+			case "std_deviation_bounds.upper", "std_deviation_bounds.lower", "std_deviation_bounds.upper_sampling", "std_deviation_bounds.lower_sampling":
+				sigma := 2.0
+				if subSpec, ok := subAggs[subName]; ok {
+					if st := subSpec.EffectiveStats(); st != nil {
+						sigma = st.EffectiveSigma()
+					}
+				}
 				stds := readSubSeries(basePath+"._stats_std", false)
 				avgs := readSubSeries(basePath+"._stats_avg", false)
+				isSampling := strings.HasSuffix(prop, "_sampling")
+				var cnts map[string]float64
+				if isSampling {
+					cnts = readSubSeries(basePath+"._stats_count", true)
+				}
+				isUpper := strings.Contains(prop, ".upper")
 				metricByKey = make(map[string]float64, len(avgs))
 				for k, avg := range avgs {
 					std := stds[k]
-					if prop == "std_deviation_bounds.upper" {
-						metricByKey[k] = avg + 2.0*std
+					if isSampling {
+						if cnt := cnts[k]; cnt > 1 {
+							std = math.Sqrt((std * std * cnt) / (cnt - 1.0))
+						} else {
+							std = 0
+						}
+					}
+					if isUpper {
+						metricByKey[k] = avg + sigma*std
 					} else {
-						metricByKey[k] = avg - 2.0*std
+						metricByKey[k] = avg - sigma*std
 					}
 				}
 			case "sum_of_squares":
@@ -16160,19 +16259,7 @@ func setRuntimeScriptDocPath(curr map[string]any, segs []string, val any) {
 
 func prepareDocForRuntimeScript(idxSchema *schema.IndexSchema, doc map[string]any) map[string]any {
 	var cp map[string]any
-	if doc != nil {
-		if metaID, ok := doc["__meta_id"].(string); ok && metaID != "" && doc["_id"] == nil {
-			cp = deepCloneDocMap(doc)
-			if cp == nil {
-				cp = make(map[string]any)
-			}
-			cp["_id"] = metaID
-		}
-	}
 	if idxSchema == nil || len(idxSchema.Fields) == 0 {
-		if cp != nil {
-			return cp
-		}
 		return doc
 	}
 	for fieldName, fb := range idxSchema.Fields {
@@ -18277,6 +18364,15 @@ func (s *Server) resolveReadDocIndexWithFilter(nameOrAlias string) (string, *esa
 			}
 			return targets[0], f, true, nil
 		}
+		if ds, ok := s.dataStreams[nameOrAlias]; ok {
+			if rawIndices, okI := ds["indices"].([]any); okI && len(rawIndices) > 0 {
+				if m, okM := rawIndices[len(rawIndices)-1].(map[string]any); okM {
+					if bIdx, okS := m["index_name"].(string); okS && bIdx != "" {
+						return bIdx, nil, true, nil
+					}
+				}
+			}
+		}
 		if _, ok := s.indices[nameOrAlias]; ok {
 			return nameOrAlias, nil, true, nil
 		}
@@ -19553,6 +19649,10 @@ func resolveMinimumShouldMatch(msm any, totalShould int, noMustOrFilter bool) in
 }
 
 func evalQueryScriptFilterOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[string]any, q *esast.Query) bool {
+	return evalQueryScriptFilterOnDocWithScore(idxSchema, doc, q, 1.0)
+}
+
+func evalQueryScriptFilterOnDocWithScore(idxSchema *schema.IndexSchema, doc map[string]any, q *esast.Query, baseScore float64) bool {
 	if q == nil {
 		return true
 	}
@@ -19655,19 +19755,19 @@ func evalQueryScriptFilterOnDocWithSchema(idxSchema *schema.IndexSchema, doc map
 		}
 	}
 	if q.ScriptScore != nil {
-		if q.ScriptScore.Query != nil && !evalBranchMatchesDoc(idxSchema, doc, q.ScriptScore.Query) {
+		if q.ScriptScore.Query != nil && !evalQueryScriptFilterOnDocWithSchema(idxSchema, doc, q.ScriptScore.Query) {
 			return false
 		}
-		if q.ScriptScore.MinScore != nil && evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q, 1.0) < *q.ScriptScore.MinScore {
+		if q.ScriptScore.MinScore != nil && evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q, baseScore) < *q.ScriptScore.MinScore {
 			return false
 		}
 		return true
 	}
 	if q.FunctionScore != nil {
-		if q.FunctionScore.Query != nil && !evalBranchMatchesDoc(idxSchema, doc, q.FunctionScore.Query) {
+		if q.FunctionScore.Query != nil && !evalQueryScriptFilterOnDocWithSchema(idxSchema, doc, q.FunctionScore.Query) {
 			return false
 		}
-		if q.FunctionScore.MinScore != nil && evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q, 1.0) < *q.FunctionScore.MinScore {
+		if q.FunctionScore.MinScore != nil && evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q, baseScore) < *q.FunctionScore.MinScore {
 			return false
 		}
 		return true
@@ -19704,7 +19804,7 @@ func evalFieldValueFactorOnDoc(idxSchema *schema.IndexSchema, doc map[string]any
 			}
 		}
 		if !found {
-			return 0, false
+			return 0, true
 		}
 	}
 	factor := 1.0
@@ -19732,12 +19832,12 @@ func evalFieldValueFactorOnDoc(idxSchema *schema.IndexSchema, doc map[string]any
 		v = math.Sqrt(math.Max(0, v))
 	case "reciprocal":
 		if 1.0+v == 0 {
-			return 0, false
+			return 0, true
 		}
 		v = 1.0 / (1.0 + v)
 	}
 	if math.IsNaN(v) || math.IsInf(v, 0) {
-		return 0, false
+		return 0, true
 	}
 	return v, true
 }
@@ -19923,12 +20023,12 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 	}
 	if q.ScriptScore != nil && q.ScriptScore.Script != nil {
 		if q.ScriptScore.Query != nil {
-			if !evalBranchMatchesDoc(idxSchema, doc, q.ScriptScore.Query) {
+			if !evalQueryScriptFilterOnDocWithSchema(idxSchema, doc, q.ScriptScore.Query) {
 				return 0.0
 			}
 			if queryHasRuntimeScript(q.ScriptScore.Query) || queryHasNestedScoring(q.ScriptScore.Query) || q.ScriptScore.Query.FunctionScore != nil {
-				baseScore = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q.ScriptScore.Query, 1.0)
-			} else {
+				baseScore = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q.ScriptScore.Query, baseScore)
+			} else if baseScore == 1.0 {
 				baseScore = scoreNonScriptClauseOnDoc(idxSchema, doc, q.ScriptScore.Query)
 			}
 		}
@@ -19953,12 +20053,12 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 	}
 	if q.FunctionScore != nil {
 		if q.FunctionScore.Query != nil {
-			if !evalBranchMatchesDoc(idxSchema, doc, q.FunctionScore.Query) {
+			if !evalQueryScriptFilterOnDocWithSchema(idxSchema, doc, q.FunctionScore.Query) {
 				return 0.0
 			}
 			if queryHasRuntimeScript(q.FunctionScore.Query) || queryHasNestedScoring(q.FunctionScore.Query) || q.FunctionScore.Query.FunctionScore != nil {
-				baseScore = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q.FunctionScore.Query, 1.0)
-			} else {
+				baseScore = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q.FunctionScore.Query, baseScore)
+			} else if baseScore == 1.0 {
 				baseScore = scoreNonScriptClauseOnDoc(idxSchema, doc, q.FunctionScore.Query)
 			}
 		}
@@ -20356,6 +20456,9 @@ func scriptHasMissingDocValueRef(doc map[string]any, src string) (string, bool) 
 		if strings.HasPrefix(tail, ".size") || strings.HasPrefix(tail, ".empty") || strings.HasPrefix(tail, ".length") {
 			continue
 		}
+		if rawField == "_id" && doc["__meta_id"] != nil {
+			continue
+		}
 		if len(collectScalarValuesAtPath(doc, strings.Split(rawField, "."))) == 0 {
 			return rawField, true
 		}
@@ -20398,11 +20501,12 @@ func extractDocRawValuesForMetric(md runtimeMatchedDoc, mSpec *esast.MetricAggSp
 			if len(rawVals) > 0 && strings.Contains(src, "_value") {
 				var out []any
 				for _, rv := range rawVals {
-					cp := make(map[string]any, len(params)+1)
+					cp := make(map[string]any, len(params)+2)
 					for k, v := range params {
 						cp[k] = v
 					}
 					cp["_value"] = rv
+					cp["_score"] = md.hit.Score
 					if v, err := painless.Eval(evalDoc, src, cp); err == nil && v != nil {
 						if arr, ok := v.([]any); ok {
 							out = append(out, arr...)
@@ -20423,7 +20527,12 @@ func extractDocRawValuesForMetric(md runtimeMatchedDoc, mSpec *esast.MetricAggSp
 			}
 			evalDoc = cloneDocWithFieldPath(evalDoc, missField, mSpec.Missing)
 		}
-		if v, err := painless.Eval(evalDoc, src, params); err == nil && v != nil {
+		cp := make(map[string]any, len(params)+1)
+		for k, v := range params {
+			cp[k] = v
+		}
+		cp["_score"] = md.hit.Score
+		if v, err := painless.Eval(evalDoc, src, cp); err == nil && v != nil {
 			if arr, ok := v.([]any); ok {
 				return arr
 			}
@@ -20910,8 +21019,11 @@ func evalScriptedMetricCombineAndReduce(sm *esast.ScriptedMetricAggSpec, bDocs [
 	if sm.CombineScript != nil {
 		combSrc, combP := extractScriptSourceAndParams(sm.CombineScript)
 		if combSrc != "" {
-			if v, err := painless.Eval(map[string]any{}, combSrc, buildParams(combP)); err == nil && v != nil {
-				combined = v
+			cp := buildParams(combP)
+			if v, err := painless.Eval(map[string]any{}, combSrc, cp); err == nil {
+				if _, hadExplicitReturn := cp["__had_explicit_return"]; v != nil || hadExplicitReturn {
+					combined = v
+				}
 			}
 		}
 	}
@@ -22365,14 +22477,14 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 		if hasAliasScript && !evalQueryScriptFilterOnDocWithSchema(idxSchema, doc, aliasFilterQ) {
 			continue
 		}
-		if hasQueryScript && !evalQueryScriptFilterOnDocWithSchema(idxSchema, doc, req.Query) {
+		baseScore := h.Score
+		if req.Query != nil && ((req.Query.ScriptScore != nil && req.Query.ScriptScore.Query == nil) || (req.Query.FunctionScore != nil && req.Query.FunctionScore.Query == nil)) {
+			baseScore = 1.0
+		}
+		if hasQueryScript && !evalQueryScriptFilterOnDocWithScore(idxSchema, doc, req.Query, baseScore) {
 			continue
 		}
 		if hasQueryScript || hasNestedScoring {
-			baseScore := h.Score
-			if req.Query != nil && ((req.Query.ScriptScore != nil && req.Query.ScriptScore.Query == nil) || (req.Query.FunctionScore != nil && req.Query.FunctionScore.Query == nil)) {
-				baseScore = 1.0
-			}
 			h.Score = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, req.Query, baseScore)
 		}
 		if req.MinScore != nil && h.Score < *req.MinScore {
@@ -22726,13 +22838,20 @@ func evalHitScriptFields(h HitRow, scriptFields map[string]any, idxSchema *schem
 	if idxSchema == nil && h.Schema != nil {
 		idxSchema = h.Schema
 	}
-	evalDoc := prepareDocForRuntimeScript(idxSchema, doc)
 	out := make(map[string][]any, len(scriptFields))
 	for fieldName, sfSpec := range scriptFields {
 		srcStr, params := extractScriptSourceAndParams(sfSpec)
 		if srcStr == "" {
 			continue
 		}
+		docForField := doc
+		if len(scriptFields) > 1 {
+			docForField = deepCloneDocMap(doc)
+			if docForField == nil {
+				docForField = make(map[string]any)
+			}
+		}
+		evalDoc := prepareDocForRuntimeScript(idxSchema, docForField)
 		cp := make(map[string]any, len(params)+1)
 		for k, v := range params {
 			cp[k] = v

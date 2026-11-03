@@ -168,6 +168,8 @@ func ShredDocument(
 			}
 			if len(rawLeafs) > 0 || b.ESType == "geo_point" || hasObjAtPath {
 				var firstVal any
+				var validLeafs []any
+				hadMalformed := hasObjAtPath
 				for _, rv := range rawLeafs {
 					if rv == nil {
 						continue
@@ -189,6 +191,7 @@ func ShredDocument(
 					if coerced == nil {
 						if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
 							recordIgnored(b.ESFieldPath)
+							hadMalformed = true
 							continue
 						}
 						return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", b.ESFieldPath, b.ESType)
@@ -198,6 +201,7 @@ func ShredDocument(
 							coerced = iv / 1_000_000
 						}
 					}
+					validLeafs = append(validLeafs, rv)
 					if firstVal == nil {
 						firstVal = coerced
 					}
@@ -225,7 +229,12 @@ func ShredDocument(
 				}
 				if firstVal != nil {
 					row[b.ColumnName] = firstVal
-				} else if ignoredSeen[strings.TrimSuffix(b.ESFieldPath, ".keyword")] && len(b.SourceJSONPath) > 0 {
+					if hadMalformed && isPrimaryFieldBinding(b) {
+						if replacePathSliceInMap(parsedDoc, b.SourceJSONPath, validLeafs) {
+							prunedDynamic = true
+						}
+					}
+				} else if hadMalformed && isPrimaryFieldBinding(b) {
 					if deletePathInMap(parsedDoc, b.SourceJSONPath) {
 						prunedDynamic = true
 					}
@@ -251,7 +260,7 @@ func ShredDocument(
 					if coerced == nil {
 						if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
 							recordIgnored(b.ESFieldPath)
-							if len(b.SourceJSONPath) > 0 && deletePathInMap(parsedDoc, b.SourceJSONPath) {
+							if isPrimaryFieldBinding(b) && deletePathInMap(parsedDoc, b.SourceJSONPath) {
 								prunedDynamic = true
 							}
 						} else {
@@ -278,6 +287,8 @@ func ShredDocument(
 					rawLeafs = extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
 				}
 				var vals []string
+				var validLeafs []any
+				hadMalformed := hasObjAtPath
 				for _, rv := range rawLeafs {
 					if rv == nil {
 						continue
@@ -289,6 +300,7 @@ func ShredDocument(
 					if coerced == nil {
 						if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
 							recordIgnored(b.ESFieldPath)
+							hadMalformed = true
 							continue
 						}
 						return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", b.ESFieldPath, b.ESType)
@@ -298,11 +310,17 @@ func ShredDocument(
 							coerced = iv / 1_000_000
 						}
 					}
+					validLeafs = append(validLeafs, rv)
 					vals = append(vals, formatCoercedArrayElement(coerced))
 				}
 				if len(vals) > 0 {
 					row[b.ColumnName] = vals
-				} else if ignoredSeen[strings.TrimSuffix(b.ESFieldPath, ".keyword")] && len(b.SourceJSONPath) > 0 {
+					if hadMalformed && isPrimaryFieldBinding(b) {
+						if replacePathSliceInMap(parsedDoc, b.SourceJSONPath, validLeafs) {
+							prunedDynamic = true
+						}
+					}
+				} else if hadMalformed && isPrimaryFieldBinding(b) {
 					if deletePathInMap(parsedDoc, b.SourceJSONPath) {
 						prunedDynamic = true
 					}
@@ -328,6 +346,9 @@ func ShredDocument(
 				if b.VectorDims > 0 && len(vec) != b.VectorDims {
 					if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
 						recordIgnored(b.ESFieldPath)
+						if isPrimaryFieldBinding(b) && deletePathInMap(parsedDoc, b.SourceJSONPath) {
+							prunedDynamic = true
+						}
 						continue
 					}
 					return nil, fmt.Errorf("mapper_parsing_exception: vector dimension mismatch for [%s]: expected [%d], got [%d]", b.ESFieldPath, b.VectorDims, len(vec))
@@ -621,13 +642,6 @@ func ShredDocument(
 	if len(ignoredFields) > 0 {
 		sort.Strings(ignoredFields)
 		row["_ignored"] = ignoredFields
-		if parsedDoc != nil {
-			for _, ig := range ignoredFields {
-				if deletePathInMap(parsedDoc, strings.Split(ig, ".")) {
-					prunedDynamic = true
-				}
-			}
-		}
 	}
 	row["_doc"] = buildVariantDocPayload(trimmed, parsedDoc, prunedDynamic, s)
 
@@ -991,33 +1005,44 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 		}
 	}
 	if (b.ESType == "date" || b.ESType == "date_nanos") && b.Format != "" {
+		normalizeNanos := func(ms int64) int64 {
+			if b.ESType == "date_nanos" && (ms > 1_000_000_000_000_000 || ms < -1_000_000_000_000_000) {
+				return ms / 1_000_000
+			}
+			return ms
+		}
 		switch v := val.(type) {
 		case string:
 			if ms, ok := ParseESDateWithFormatToEpochMillis(v, b.Format, now); ok {
-				return ms
+				return normalizeNanos(ms)
 			}
 		case int64:
 			if ms, ok := ParseESDateWithFormatToEpochMillis(strconv.FormatInt(v, 10), b.Format, now); ok {
-				return ms
+				return normalizeNanos(ms)
 			}
 		case int:
 			if ms, ok := ParseESDateWithFormatToEpochMillis(strconv.Itoa(v), b.Format, now); ok {
-				return ms
+				return normalizeNanos(ms)
 			}
 		case float64:
 			if !math.IsNaN(v) && !math.IsInf(v, 0) {
 				if ms, ok := ParseESDateWithFormatToEpochMillis(strconv.FormatFloat(v, 'f', -1, 64), b.Format, now); ok {
-					return ms
+					return normalizeNanos(ms)
 				}
 			}
 		case json.Number:
 			if ms, ok := ParseESDateWithFormatToEpochMillis(v.String(), b.Format, now); ok {
-				return ms
+				return normalizeNanos(ms)
 			}
 		}
 		return nil
 	}
 	coerced := coerceScalarForDoris(val, effDorisType, b.LowercaseNormalizer, now)
+	if b.ESType == "date_nanos" {
+		if iv, ok := coerced.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
+			coerced = iv / 1_000_000
+		}
+	}
 	if b.ESType == "scaled_float" && b.ScalingFactor > 0 {
 		if fv, ok := coerced.(float64); ok && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
 			coerced = math.Round(fv*b.ScalingFactor) / b.ScalingFactor
@@ -2096,6 +2121,36 @@ func buildVariantDocPayload(trimmed []byte, parsedDoc map[string]any, prunedDyna
 		return json.RawMessage(trimmed)
 	}
 	return json.RawMessage(b)
+}
+
+func isPrimaryFieldBinding(b FieldBinding) bool {
+	return len(b.SourceJSONPath) > 0 && b.ESFieldPath == strings.Join(b.SourceJSONPath, ".")
+}
+
+func replacePathSliceInMap(curr map[string]any, path []string, validLeafs []any) bool {
+	if len(path) == 0 || curr == nil {
+		return false
+	}
+	dotFull := strings.Join(path, ".")
+	if _, ok := curr[dotFull]; ok {
+		curr[dotFull] = validLeafs
+		return true
+	}
+	if len(path) == 1 {
+		if _, ok := curr[path[0]]; ok {
+			curr[path[0]] = validLeafs
+			return true
+		}
+		return false
+	}
+	next, exists := curr[path[0]]
+	if !exists {
+		return false
+	}
+	if tv, ok := next.(map[string]any); ok {
+		return replacePathSliceInMap(tv, path[1:], validLeafs)
+	}
+	return false
 }
 
 func deletePathInMap(curr map[string]any, path []string) bool {
