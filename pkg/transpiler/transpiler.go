@@ -109,6 +109,131 @@ func (t *Transpiler) checkFieldSearchable(field string, b schema.FieldBinding) b
 	return true
 }
 
+func (t *Transpiler) checkFieldDocValues(field string, b schema.FieldBinding) bool {
+	if b.EnabledFalse {
+		return false
+	}
+	if b.DocValuesFalse {
+		if t.searchErr == nil {
+			t.searchErr = fmt.Errorf("illegal_argument_exception: cannot use field [%s] for doc_values operations because doc_values is disabled", field)
+		}
+		return false
+	}
+	return true
+}
+
+func (t *Transpiler) validateAggsDocValues(aggs map[string]esast.AggSpec, nctx *nestedCtx) {
+	if len(aggs) == 0 {
+		return
+	}
+	checkField := func(field string, curNCtx *nestedCtx) {
+		if field == "" || strings.HasPrefix(field, "_") {
+			return
+		}
+		resolved, b := t.resolveFieldInNestedCtx(field, true, curNCtx)
+		t.checkFieldDocValues(resolved, b)
+	}
+	for _, spec := range aggs {
+		if termsSpec := spec.EffectiveTerms(); termsSpec != nil && spec.SignificantText == nil {
+			effField := termsSpec.Field
+			if effField == "" && termsSpec.Script != nil {
+				if df, ok := extractSimpleDocFieldFromScript(termsSpec.Script); ok {
+					effField = df
+				}
+			}
+			checkField(effField, nctx)
+		}
+		if spec.Histogram != nil {
+			checkField(spec.Histogram.Field, nctx)
+		}
+		if spec.DateHistogram != nil {
+			checkField(spec.DateHistogram.Field, nctx)
+		}
+		if rSpec := spec.EffectiveRange(); rSpec != nil {
+			checkField(rSpec.Field, nctx)
+		}
+		if spec.Composite != nil {
+			for _, srcMap := range spec.Composite.Sources {
+				t.validateAggsDocValues(srcMap, nctx)
+			}
+		}
+		if spec.Cardinality != nil {
+			checkField(spec.Cardinality.Field, nctx)
+		}
+		if spec.ValueCount != nil {
+			checkField(spec.ValueCount.Field, nctx)
+		}
+		if spec.Avg != nil {
+			checkField(spec.Avg.Field, nctx)
+		}
+		if spec.Sum != nil {
+			checkField(spec.Sum.Field, nctx)
+		}
+		if spec.Min != nil {
+			checkField(spec.Min.Field, nctx)
+		}
+		if spec.Max != nil {
+			checkField(spec.Max.Field, nctx)
+		}
+		if stSpec := spec.EffectiveStats(); stSpec != nil {
+			checkField(stSpec.Field, nctx)
+		}
+		if spec.StringStats != nil {
+			checkField(spec.StringStats.Field, nctx)
+		}
+		if spec.Boxplot != nil {
+			checkField(spec.Boxplot.Field, nctx)
+		}
+		if spec.Percentiles != nil {
+			checkField(spec.Percentiles.Field, nctx)
+		}
+		if spec.PercentileRanks != nil {
+			checkField(spec.PercentileRanks.Field, nctx)
+		}
+		if spec.Rate != nil {
+			checkField(spec.Rate.Field, nctx)
+		}
+		if spec.TopMetrics != nil {
+			for _, mf := range spec.TopMetrics.EffectiveMetricFields() {
+				checkField(mf, nctx)
+			}
+			for _, s := range spec.TopMetrics.Sort {
+				var sortNCtx *nestedCtx
+				if deepest := deepestNestedSortPath(s.Entry.Nested); deepest != "" {
+					sortNCtx = &nestedCtx{nestedPath: deepest}
+				} else {
+					sortNCtx = nctx
+				}
+				checkField(s.Entry.Field, sortNCtx)
+			}
+		}
+		if spec.TopHits != nil {
+			for _, s := range spec.TopHits.Sort {
+				var sortNCtx *nestedCtx
+				if deepest := deepestNestedSortPath(s.Entry.Nested); deepest != "" {
+					sortNCtx = &nestedCtx{nestedPath: deepest}
+				} else {
+					sortNCtx = nctx
+				}
+				checkField(s.Entry.Field, sortNCtx)
+			}
+		}
+		if sampSpec := spec.EffectiveSampler(); sampSpec != nil {
+			checkField(sampSpec.Field, nctx)
+		}
+		if spec.Missing != nil {
+			checkField(spec.Missing.Field, nctx)
+		}
+		if spec.Nested != nil && spec.Nested.Path != "" {
+			t.validateAggsDocValues(spec.SubAggs(), &nestedCtx{nestedPath: spec.Nested.Path})
+		} else if spec.ReverseNested != nil {
+			t.validateAggsDocValues(spec.SubAggs(), nil)
+		} else {
+			t.validateAggsDocValues(spec.SubAggs(), nctx)
+		}
+	}
+}
+
 type nestedCtx struct {
 	nestedPath string
 	elemVar    string
@@ -228,6 +353,19 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 		}
 	}
 
+	for _, dvf := range req.DocvalueFields {
+		if dvf.Field != "" && !strings.HasPrefix(dvf.Field, "_") && !strings.ContainsAny(dvf.Field, "*?") {
+			b := t.Schema.ResolveEffectiveField(dvf.Field, true)
+			t.checkFieldDocValues(dvf.Field, b)
+		}
+	}
+	effSorts := EffectiveSortsForRequest(req)
+	orderBy := t.compileOrderByWithAfter(effSorts, req.SearchAfter)
+	if req.Collapse != nil && req.Collapse.Field != "" {
+		bCollapse := t.Schema.ResolveEffectiveField(req.Collapse.Field, true)
+		t.checkFieldDocValues(req.Collapse.Field, bCollapse)
+	}
+
 	plan := &ExecutionPlan{}
 	if size > 0 {
 		scoreExpr := mainQ.ScoreSQL
@@ -238,8 +376,6 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 		if !req.ShouldTrackTotalHits() {
 			totalHitsExpr = "CAST(-1 AS BIGINT) AS `_total_hits`"
 		}
-		effSorts := EffectiveSortsForRequest(req)
-		orderBy := t.compileOrderByWithAfter(effSorts, req.SearchAfter)
 		var saPred string
 		if len(req.SearchAfter) > 0 {
 			from = 0
@@ -327,6 +463,7 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 	}
 
 	aggs := req.EffectiveAggs()
+	t.validateAggsDocValues(aggs, nil)
 	if len(aggs) > 0 || size == 0 {
 		plan.AggsSQL = t.buildAggsCTESQL(mainQ.WhereSQL, userWhere, aliasWhere, postFilterSQL, aggs)
 	}
@@ -849,13 +986,22 @@ func (t *Transpiler) compileKNN(kq *esast.KNNQuery, scoring bool, nctx *nestedCt
 	if kq == nil || kq.Field == "" || len(kq.QueryVector) == 0 {
 		return CompiledQuery{WhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
-	b := t.Schema.ResolveField(kq.Field)
+	resolvedField, b := t.resolveFieldInNestedCtx(kq.Field, false, nctx)
+	if !t.checkFieldSearchable(resolvedField, b) {
+		return CompiledQuery{WhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
+	if b.Kind != schema.StoragePromotedVector && b.Kind != schema.StorageDynamicVariant && b.ESType != "dense_vector" && b.ESType != "knn_vector" {
+		if t.searchErr == nil {
+			t.searchErr = fmt.Errorf("cannot execute knn search on field [%s] of type [%s]", resolvedField, b.ESType)
+		}
+		return CompiledQuery{WhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
 	var colExpr string
 	if b.ColumnName != "" {
 		colExpr = fmt.Sprintf("`%s`", b.ColumnName)
 	} else {
-		if t.unindexedFields != nil && kq.Field != "" {
-			t.unindexedFields[strings.TrimSuffix(kq.Field, ".keyword")] = true
+		if t.unindexedFields != nil && resolvedField != "" {
+			t.unindexedFields[strings.TrimSuffix(resolvedField, ".keyword")] = true
 		}
 		var pathBuilder strings.Builder
 		for _, seg := range b.SourceJSONPath {
@@ -1972,6 +2118,14 @@ func (t *Transpiler) compileNestedWithParent(nq *esast.NestedQuery, scoring bool
 		elemVar:    elemVar,
 	})
 	innerWhere := inner.WhereSQL
+	if innerWhere == "FALSE" {
+		return CompiledQuery{
+			WhereSQL:          "FALSE",
+			SafeWhereSQL:      "FALSE",
+			ScoreSQL:          "0.0",
+			UsesFulltextMatch: inner.UsesFulltextMatch,
+		}
+	}
 	if parentNctx != nil && parentNctx.nestedPath != "" && strings.HasPrefix(nq.Path, parentNctx.nestedPath+".") {
 		parentCorr := fmt.Sprintf("json_extract_string(%s, '$._parent_id') = json_extract_string(%s, '$._nested_id')", elemVar, parentNctx.elemVar)
 		innerWhere = fmt.Sprintf("(%s AND %s)", parentCorr, innerWhere)
@@ -8176,6 +8330,19 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 			dir = "DESC"
 		}
 		if s.Entry.Field == "_geo_distance" {
+			if geoMap, ok := s.Entry.Script.(map[string]any); ok {
+				reserved := map[string]bool{
+					"order": true, "mode": true, "missing": true, "unit": true,
+					"distance_type": true, "validation_method": true, "ignore_unmapped": true, "nested": true,
+				}
+				for k := range geoMap {
+					if !reserved[k] {
+						resolvedGeo, geoB := t.resolveSortFieldAndBinding(k, s.Entry.Nested)
+						t.checkFieldDocValues(resolvedGeo, geoB)
+						break
+					}
+				}
+			}
 			if geoExpr, ok := t.compileGeoDistanceSortExpr(s); ok {
 				orderPart := geoExpr + " " + dir
 				if strings.EqualFold(s.Entry.Missing, "_first") {
@@ -8211,7 +8378,19 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 		case "_id", "_doc":
 			parts = append(parts, "`_id` "+dir)
 		default:
-			b := t.Schema.ResolveEffectiveField(s.Entry.Field, true)
+			resolvedField, b := t.resolveSortFieldAndBinding(s.Entry.Field, s.Entry.Nested)
+			if s.Entry.IgnoreUnmapped && b.Kind == schema.StorageDynamicVariant && s.Entry.Type == "" {
+				afterIdx++
+				continue
+			}
+			hasSortSample := (afterIdx < len(after) && after[afterIdx] != nil) ||
+				(s.Entry.Missing != "" && !strings.EqualFold(s.Entry.Missing, "_first") && !strings.EqualFold(s.Entry.Missing, "_last"))
+			if t.Schema != nil && len(t.Schema.Fields) > 0 && !strings.HasPrefix(s.Entry.Field, "_") && b.Kind == schema.StorageDynamicVariant && s.Entry.Type == "" && !s.Entry.IgnoreUnmapped && !hasSortSample {
+				if t.searchErr == nil {
+					t.searchErr = fmt.Errorf("no mapping found for [%s] in order to sort on", s.Entry.Field)
+				}
+			}
+			t.checkFieldDocValues(resolvedField, b)
 			rawSortType := s.Entry.Type
 			effType := effectiveSortESType(b, rawSortType)
 			sampleVal, missingSQL := t.resolveSortMissing(s, b)
@@ -8265,11 +8444,50 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 	return strings.Join(parts, ", ")
 }
 
+func deepestNestedSortPath(nested *esast.NestedSortSpec) string {
+	deepest := ""
+	for cur := nested; cur != nil; cur = cur.Nested {
+		if cur.Path != "" {
+			deepest = cur.Path
+		}
+	}
+	return deepest
+}
+
+func parseFiniteFloatValue(v any) (float64, bool) {
+	switch nv := v.(type) {
+	case float64:
+		return nv, !math.IsNaN(nv) && !math.IsInf(nv, 0)
+	case int:
+		return float64(nv), true
+	case int64:
+		return float64(nv), true
+	case json.Number:
+		f, err := nv.Float64()
+		return f, err == nil && !math.IsNaN(f) && !math.IsInf(f, 0)
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(nv), 64)
+		return f, err == nil && !math.IsNaN(f) && !math.IsInf(f, 0)
+	default:
+		return 0, false
+	}
+}
+
+func (t *Transpiler) resolveSortFieldAndBinding(field string, nested *esast.NestedSortSpec) (string, schema.FieldBinding) {
+	var sortNCtx *nestedCtx
+	if deepestNestedPath := deepestNestedSortPath(nested); deepestNestedPath != "" {
+		sortNCtx = &nestedCtx{nestedPath: deepestNestedPath}
+	}
+	return t.resolveFieldInNestedCtx(field, true, sortNCtx)
+}
+
 func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after []any, scoreExpr string) string {
 	var effectiveSorts []esast.SortSpec
 	for _, s := range sorts {
 		if s.Entry.Field == "_geo_distance" {
-			break
+			if _, ok := t.compileGeoDistanceSortExpr(s); !ok {
+				break
+			}
 		}
 		if s.Entry.Field == "_script" {
 			if _, _, ok := t.compileScriptSortExpr(s); !ok {
@@ -8303,6 +8521,35 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 			return fmt.Sprintf("CAST(%s AS DOUBLE)", scoreExpr), val, true, nil
 		case "_id", "_doc":
 			return "`_id`", val, true, nil
+		case "_geo_distance":
+			geoExpr, _ := t.compileGeoDistanceSortExpr(effectiveSorts[idx])
+			if geoMap, ok := effectiveSorts[idx].Entry.Script.(map[string]any); ok {
+				unit := "m"
+				if uStr, okU := geoMap["unit"].(string); okU && uStr != "" {
+					unit = strings.ToLower(strings.TrimSpace(uStr))
+				}
+				if fv, okF := parseFiniteFloatValue(val); okF {
+					switch unit {
+					case "km", "kilometers", "kilometer":
+						val = fv * 1000.0
+					case "mi", "miles", "mile":
+						val = fv * 1609.344
+					case "yd", "yards", "yard":
+						val = fv * 0.9144
+					case "ft", "feet", "foot":
+						val = fv * 0.3048
+					case "in", "inch", "inches":
+						val = fv * 0.0254
+					case "nmi", "nm":
+						val = fv * 1852.0
+					case "cm", "centimeters", "centimeter":
+						val = fv * 0.01
+					case "mm", "millimeters", "millimeter":
+						val = fv * 0.001
+					}
+				}
+			}
+			return geoExpr, val, false, nil
 		case "_script":
 			scriptExpr, sb, _ := t.compileScriptSortExpr(effectiveSorts[idx])
 			missSample, missingSQL := t.resolveSortMissing(effectiveSorts[idx], sb)
@@ -8311,7 +8558,7 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 			}
 			return scriptExpr, val, missingSQL != "", missSample
 		default:
-			b := t.Schema.ResolveEffectiveField(field, true)
+			_, b := t.resolveSortFieldAndBinding(field, effectiveSorts[idx].Entry.Nested)
 			rawSortType := effectiveSorts[idx].Entry.Type
 			effType := effectiveSortESType(b, rawSortType)
 			missSample, missingSQL := t.resolveSortMissing(effectiveSorts[idx], b)

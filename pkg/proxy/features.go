@@ -1082,9 +1082,16 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func ingestErrorType(err error) string {
+	if err != nil && strings.Contains(err.Error(), "does not exist") {
+		return "illegal_argument_exception"
+	}
+	return "ingest_processor_exception"
+}
+
 func (s *Server) applyIngestPipelineForWriteWithRouting(pipelineID, indexName, docID, initialRouting string, raw json.RawMessage) (json.RawMessage, string, string, string, bool, error) {
 	pipelineID = strings.TrimSpace(pipelineID)
-	if pipelineID == "" || len(bytes.TrimSpace(raw)) == 0 {
+	if pipelineID == "" || pipelineID == "_none" || len(bytes.TrimSpace(raw)) == 0 {
 		return raw, indexName, docID, initialRouting, false, nil
 	}
 	s.mu.RLock()
@@ -1097,7 +1104,7 @@ func (s *Server) applyIngestPipelineForWriteWithRouting(pipelineID, indexName, d
 		s.mu.RUnlock()
 	}
 	if !ok || pipe == nil {
-		return raw, indexName, docID, initialRouting, false, nil
+		return raw, indexName, docID, initialRouting, false, fmt.Errorf("pipeline with id [%s] does not exist", pipelineID)
 	}
 	out, outIdx, outID, _, outRouting, dropped, _, err := applyIngestPipelineSpecWithRouting(s, pipe, indexName, docID, initialRouting, raw, false)
 	return out, outIdx, outID, outRouting, dropped, err
@@ -2320,22 +2327,44 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				}
 			}
 		}
+		for _, f := range fieldsToRemove {
+			if _, exists := getIngestPath(doc, f); !exists {
+				if isExplicitIgnoreMissingFalse(specMap) {
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", f)
+				}
+			} else {
+				deleteIngestPath(doc, f)
+				mutated = true
+			}
+		}
 		if len(fieldsToKeep) > 0 {
+			isInternalIngestKey := func(k string) bool {
+				switch k {
+				case "_ingest", "_index", "_id", "_version", "_routing", "__internal_ingest_orig":
+					return true
+				}
+				return false
+			}
 			kept := make(map[string]any)
-			for _, metaKey := range []string{"_ingest", "_index", "_id", "_version", "_routing"} {
+			for _, metaKey := range []string{"_ingest", "_index", "_id", "_version", "_routing", "__internal_ingest_orig"} {
 				if mv, ok := doc[metaKey]; ok {
 					kept[metaKey] = mv
 				}
 			}
 			for _, kp := range fieldsToKeep {
 				foundAny := false
-				if val, exists := getIngestPath(doc, kp); exists {
-					setIngestPath(kept, kp, deepCloneIngestValue(val))
-					foundAny = true
+				if !isInternalIngestKey(kp) {
+					if val, exists := getIngestPath(doc, kp); exists {
+						setIngestPath(kept, kp, deepCloneIngestValue(val))
+						foundAny = true
+					}
 				}
 				prefix := kp + "."
 				for k, v := range doc {
-					if strings.HasPrefix(k, prefix) {
+					if isInternalIngestKey(k) {
+						continue
+					}
+					if strings.HasPrefix(k, prefix) || (strings.Contains(kp, "*") && matchWildcardPattern(kp, k)) {
 						setIngestPath(kept, k, deepCloneIngestValue(v))
 						foundAny = true
 					}
@@ -2351,16 +2380,6 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				doc[k] = v
 			}
 			mutated = true
-		}
-		for _, f := range fieldsToRemove {
-			if _, exists := getIngestPath(doc, f); !exists {
-				if isExplicitIgnoreMissingFalse(specMap) {
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", f)
-				}
-			} else {
-				deleteIngestPath(doc, f)
-				mutated = true
-			}
 		}
 	case "lowercase":
 		if field, _ := specMap["field"].(string); field != "" {
@@ -3830,9 +3849,20 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						parts["password"] = pw
 					}
 				}
-				setIngestPath(doc, target, parts)
 				if removeIfSuccess && field != target {
 					deleteIngestPath(doc, field)
+				}
+				if existingVal, hasExisting := getIngestPath(doc, target); hasExisting {
+					if existingMap, ok := existingVal.(map[string]any); ok && existingMap != nil {
+						for k, v := range parts {
+							existingMap[k] = v
+						}
+						setIngestPath(doc, target, existingMap)
+					} else {
+						setIngestPath(doc, target, parts)
+					}
+				} else {
+					setIngestPath(doc, target, parts)
 				}
 				mutated = true
 			} else if isExplicitIgnoreMissingFalse(specMap) {
@@ -3945,7 +3975,9 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						if ingestMeta == nil {
 							ingestMeta = make(map[string]any)
 						}
-						ingestMeta["_value"] = deepCloneIngestValue(elem)
+						initVal := deepCloneIngestValue(elem)
+						initValSnapshot := deepCloneIngestValue(elem)
+						ingestMeta["_value"] = initVal
 						delete(ingestMeta, "_key")
 						doc["_ingest"] = ingestMeta
 						subMut, subDropped, subErr := runIngestProcessorList(s, doc, subProcs, depth+1, trace)
@@ -3965,7 +3997,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						} else {
 							outArr[idx] = elem
 						}
-						if !reflect.DeepEqual(outArr[idx], elem) {
+						if !reflect.DeepEqual(outArr[idx], initValSnapshot) {
 							elemChanged = true
 						}
 					}
@@ -3989,8 +4021,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						if ingestMeta == nil {
 							ingestMeta = make(map[string]any)
 						}
+						initVal := deepCloneIngestValue(elem)
+						initValSnapshot := deepCloneIngestValue(elem)
 						ingestMeta["_key"] = k
-						ingestMeta["_value"] = deepCloneIngestValue(elem)
+						ingestMeta["_value"] = initVal
 						doc["_ingest"] = ingestMeta
 						subMut, subDropped, subErr := runIngestProcessorList(s, doc, subProcs, depth+1, trace)
 						if subMut {
@@ -4005,7 +4039,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 							return mutated, true, procType, procTag, specMap, nil
 						}
 						if curIngest, ok := doc["_ingest"].(map[string]any); ok {
-							if newVal, hasVal := curIngest["_value"]; hasVal && !reflect.DeepEqual(newVal, elem) {
+							if newVal, hasVal := curIngest["_value"]; hasVal && !reflect.DeepEqual(newVal, initValSnapshot) {
 								changedEntries[k] = newVal
 							}
 						}
@@ -5440,6 +5474,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				}
 				totalMatched++
 				docID := h.ID
+				docDestRawIdx := body.Dest.Index
 				docDestIdx := destIndex
 				docDestAliasFilter := destAliasFilter
 				docSource := h.Source
@@ -5494,6 +5529,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 							writeESError(w, http.StatusBadRequest, "illegal_argument_exception", rErr.Error())
 							return
 						}
+						docDestRawIdx = sIdx
 						docDestIdx = resolvedIdx
 						docDestAliasFilter = resolvedFilter
 					}
@@ -5514,9 +5550,9 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					}
 					docSource = mutated
 				}
-				pipedDoc, nextDestIdx, nextDocID, pipeRouting, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithRouting(docDestIdx, docID, body.Dest.Pipeline, "", docRouting, docSource)
+				pipedDoc, nextDestIdx, nextDocID, pipeRouting, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithRouting(docDestRawIdx, docID, body.Dest.Pipeline, "", docRouting, docSource)
 				if pipeErr != nil {
-					writeESError(w, http.StatusBadRequest, "ingest_processor_exception", pipeErr.Error())
+					writeESError(w, http.StatusBadRequest, ingestErrorType(pipeErr), pipeErr.Error())
 					return
 				}
 				if dropped {
@@ -5525,17 +5561,18 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				if nextDocID != "" {
 					docID = nextDocID
 				}
-				if nextDestIdx != "" && nextDestIdx != docDestIdx {
+				if nextDestIdx != "" && nextDestIdx != docDestRawIdx && nextDestIdx != docDestIdx {
 					resolvedIdx, resolvedFilter, rErr := s.resolveWriteIndexWithFilter(nextDestIdx)
 					if rErr != nil {
 						writeESError(w, http.StatusBadRequest, "illegal_argument_exception", rErr.Error())
 						return
 					}
+					docDestRawIdx = nextDestIdx
 					docDestIdx = resolvedIdx
 					docDestAliasFilter = resolvedFilter
 				}
 				docSource = pipedDoc
-				effRouting := s.resolveEffectiveWriteRouting(body.Dest.Index, docDestIdx, "", pipeRouting)
+				effRouting := s.resolveEffectiveWriteRouting(docDestRawIdx, docDestIdx, "", pipeRouting)
 				if docDestAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), docDestIdx, docID, docSource, docDestAliasFilter) {
 					if proceedOnConflict {
 						versionConflicts++
@@ -5597,9 +5634,6 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				sch := schemasByIdx[pd.destIndex]
 				existingDocs := existingByIdx[pd.destIndex]
 				var minVer int64
-				if pd.srcVer > 0 {
-					minVer = pd.srcVer + 1
-				}
 				if delMap := deletedVerByIdx[pd.destIndex]; delMap != nil {
 					if delVer, okDel := delMap[pd.id]; okDel && delVer+1 > minVer {
 						minVer = delVer + 1
@@ -5646,17 +5680,19 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					totalDeleted++
 					continue
 				}
-				useExternalVer := (destVerType == "external" || destVerType == "external_gt" || destVerType == "external_gte" || pd.scriptVerSet) && pd.srcVer > 0
+				useExternalVer := (destVerType == "external" || destVerType == "external_gt" || destVerType == "external_gte") && pd.srcVer > 0
 				if exists {
-					extConflict := false
+					verConflict := false
 					if useExternalVer {
 						if destVerType == "external_gte" {
-							extConflict = existing.Version > pd.srcVer
+							verConflict = existing.Version > pd.srcVer
 						} else {
-							extConflict = existing.Version >= pd.srcVer
+							verConflict = existing.Version >= pd.srcVer
 						}
+					} else if pd.scriptVerSet && pd.srcVer > 0 {
+						verConflict = existing.Version != pd.srcVer
 					}
-					conflict := isCreate || extConflict || (pd.aliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), pd.destIndex, pd.id, existing.Source, pd.aliasFilter))
+					conflict := isCreate || verConflict || (pd.aliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), pd.destIndex, pd.id, existing.Source, pd.aliasFilter))
 					if conflict {
 						if proceedOnConflict {
 							versionConflicts++
@@ -5700,9 +5736,16 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				var nextVer int64
-				if useExternalVer {
+				if useExternalVer || (!exists && pd.scriptVerSet && pd.srcVer > 0) {
 					nextVer = pd.srcVer
 					_ = s.allocVersion(nextVer)
+				} else if exists && pd.scriptVerSet && pd.srcVer > 0 {
+					nextVer = existing.Version + 1
+					_ = s.allocVersion(nextVer)
+				} else if !exists && minVer == 0 {
+					nextVer = 1
+				} else if exists && existing.Version > 0 && existing.Version < 1_000_000_000_000 && existing.Version+1 >= minVer {
+					nextVer = existing.Version + 1
 				} else {
 					nextVer = s.allocVersion(minVer)
 				}

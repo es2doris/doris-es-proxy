@@ -20,6 +20,7 @@ package schema
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"hash/fnv"
 	"math"
 	"regexp"
@@ -385,6 +386,82 @@ func MergeMappingSpecs(oldSpec, newSpec *esast.MappingSpec) *esast.MappingSpec {
 	}
 }
 
+// ValidateMappingUpdateCompatibility checks whether `newSpec` attempts to change the type of any existing field in `oldSpec`.
+func ValidateMappingUpdateCompatibility(oldSpec, newSpec *esast.MappingSpec) error {
+	if oldSpec == nil || newSpec == nil {
+		return nil
+	}
+	return validatePropertiesCompatibility(oldSpec.Properties, newSpec.Properties, "")
+}
+
+func validatePropertiesCompatibility(oldProps, newProps map[string]esast.FieldProperty, prefix string) error {
+	for k, newProp := range newProps {
+		fullPath := k
+		if prefix != "" {
+			fullPath = prefix + "." + k
+		}
+		oldProp, exists := oldProps[k]
+		if !exists {
+			continue
+		}
+		oldType := strings.ToLower(strings.TrimSpace(oldProp.Type))
+		if oldType == "" && len(oldProp.Properties) > 0 {
+			oldType = "object"
+		}
+		newType := strings.ToLower(strings.TrimSpace(newProp.Type))
+		if newType == "" && len(newProp.Properties) > 0 {
+			newType = "object"
+		}
+		if oldType != "" && newType != "" && oldType != newType {
+			return fmt.Errorf("mapper [%s] cannot be changed from type [%s] to [%s]", fullPath, oldType, newType)
+		}
+		if len(oldProp.Fields) > 0 && len(newProp.Fields) > 0 {
+			if err := validatePropertiesCompatibility(oldProp.Fields, newProp.Fields, fullPath); err != nil {
+				return err
+			}
+		}
+		if len(oldProp.Properties) > 0 && len(newProp.Properties) > 0 {
+			if err := validatePropertiesCompatibility(oldProp.Properties, newProp.Properties, fullPath); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// IsDynamicFalseUnmappedField reports whether `esFieldPath` is an unmapped field under a `dynamic: false` mapping scope.
+func (s *IndexSchema) IsDynamicFalseUnmappedField(esFieldPath string) bool {
+	if s == nil || s.RawMapping == nil {
+		return false
+	}
+	cleanPath := strings.TrimSuffix(strings.TrimSuffix(esFieldPath, ".keyword"), ".ngram")
+	if cleanPath == "" || strings.HasPrefix(cleanPath, "_") {
+		return false
+	}
+	if _, ok := s.Fields[esFieldPath]; ok {
+		return false
+	}
+	if _, ok := s.Fields[cleanPath]; ok {
+		return false
+	}
+	mode := normalizeDynamicMode(s.RawMapping.Dynamic)
+	props := s.RawMapping.Properties
+	for _, seg := range strings.Split(cleanPath, ".") {
+		prop, ok := props[seg]
+		if !ok {
+			return mode == "false"
+		}
+		if strings.EqualFold(prop.Type, "flattened") {
+			return false
+		}
+		if prop.Dynamic != nil {
+			mode = normalizeDynamicMode(prop.Dynamic)
+		}
+		props = prop.Properties
+	}
+	return false
+}
+
 // DeepMergeMappingProperties recursively merges `src` into a copy of `dst`.
 func DeepMergeMappingProperties(
 	dst, src map[string]esast.FieldProperty,
@@ -561,7 +638,7 @@ func (s *IndexSchema) compileProperties(
 				s.registerLeafField(multiDotPath, currJSONPath, activeNestedRoot, nestedRootDepth, subProp)
 				if subKey == "keyword" {
 					subBinding := s.Fields[multiDotPath]
-					if baseBinding, ok := s.Fields[dotPath]; ok && baseBinding.Kind == subBinding.Kind && (baseBinding.Kind == StoragePromotedScalar || baseBinding.Kind == StoragePromotedArray || baseBinding.Kind == StorageNestedSubfield) {
+					if baseBinding, ok := s.Fields[dotPath]; ok && (baseBinding.Kind == subBinding.Kind || (baseBinding.Kind == StoragePromotedScalar && subBinding.Kind == StoragePromotedArray)) && (baseBinding.Kind == StoragePromotedScalar || baseBinding.Kind == StoragePromotedArray || baseBinding.Kind == StorageNestedSubfield) {
 						companionCol := subBinding.ColumnName
 						if baseBinding.Kind == StorageNestedSubfield && subBinding.PrefilterArrayCol != "" {
 							companionCol = subBinding.PrefilterArrayCol

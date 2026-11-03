@@ -950,3 +950,122 @@ func TestRound34FlatDottedKeysDateNanosEpochNanosAndAliasKeyword(t *testing.T) {
 		t.Fatalf("expected f__ts_copy == ['1700000000123'], got %v", row["f__ts_copy"])
 	}
 }
+
+func TestRound41ShredderStrictValidationDynamicFalseDenseVectorAndDDL(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"dynamic": false,
+		"properties": {
+			"count": {"type": "long"},
+			"lenient_num": {"type": "long", "ignore_malformed": true},
+			"emb": {"type": "dense_vector", "dims": 3},
+			"no_idx": {"type": "keyword", "index": false},
+			"user": {
+				"properties": {
+					"name": {"type": "keyword"}
+				}
+			}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("unmarshal spec failed: %v", err)
+	}
+	sch := CompileIndexSchema("db", "r41_idx", &spec)
+
+	// F2: ShredDocument rejects malformed long when ignore_malformed is false
+	if _, err := ShredDocument(sch, "1", 1, false, json.RawMessage(`{"count": "not_a_number"}`)); err == nil || !strings.Contains(err.Error(), "mapper_parsing_exception") {
+		t.Fatalf("F2 expected mapper_parsing_exception for malformed long, got %v", err)
+	}
+
+	// F2 + F3: ignore_malformed: true records _ignored and prunes from _doc; dynamic: false prunes unmapped fields from _doc
+	raw, err := ShredDocument(sch, "2", 1, false, json.RawMessage(`{
+		"count": 42,
+		"lenient_num": "bad_long",
+		"unmapped_secret": "should_not_enter_doc",
+		"user": {"name": "alice", "extra": "pruned"}
+	}`))
+	if err != nil {
+		t.Fatalf("ShredDocument valid+ignored failed: %v", err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(raw, &row); err != nil {
+		t.Fatalf("unmarshal row failed: %v", err)
+	}
+	docVariant, ok := row["_doc"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected _doc to unmarshal as map[string]any, got %T", row["_doc"])
+	}
+	if _, exists := docVariant["unmapped_secret"]; exists {
+		t.Fatalf("F3 expected unmapped_secret pruned from _doc under dynamic:false, got %+v", docVariant)
+	}
+	if _, exists := docVariant["lenient_num"]; exists {
+		t.Fatalf("F2 expected ignore_malformed field lenient_num pruned from _doc, got %+v", docVariant)
+	}
+	if userMap, ok := docVariant["user"].(map[string]any); ok {
+		if _, exists := userMap["extra"]; exists {
+			t.Fatalf("F3 expected user.extra pruned from _doc under dynamic:false, got %+v", userMap)
+		}
+	}
+
+	// F4: dense_vector dimensionality validation
+	if _, err := ShredDocument(sch, "3", 1, false, json.RawMessage(`{"emb": [0.1, 0.2]}`)); err == nil || !strings.Contains(err.Error(), "mapper_parsing_exception") {
+		t.Fatalf("F4 expected mapper_parsing_exception for dense_vector dim mismatch (2 != 3), got %v", err)
+	}
+
+	// F5: GenerateAlterTableDDL emits ADD INDEX when NotIndexed transitions from true to false
+	var specIdxTrue esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{
+		"dynamic": false,
+		"properties": {
+			"count": {"type": "long"},
+			"lenient_num": {"type": "long", "ignore_malformed": true},
+			"emb": {"type": "dense_vector", "dims": 3},
+			"no_idx": {"type": "keyword", "index": true},
+			"user": {
+				"properties": {
+					"name": {"type": "keyword"}
+				}
+			}
+		}
+	}`), &specIdxTrue)
+	sch2 := CompileIndexSchema("db", "r41_idx", &specIdxTrue)
+	alterStmts := GenerateAlterTableDDL(sch, sch2)
+	foundAddIdx := false
+	for _, stmt := range alterStmts {
+		if strings.Contains(stmt, "ADD INDEX `idx_f__no_idx`") {
+			foundAddIdx = true
+		}
+	}
+	if !foundAddIdx {
+		t.Fatalf("F5 expected ADD INDEX idx_f__no_idx in GenerateAlterTableDDL, got %v", alterStmts)
+	}
+
+	// F6: MergeMappingSpecs recursively merges nested object properties
+	var overlay esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{
+		"properties": {
+			"user": {
+				"properties": {
+					"age": {"type": "integer"}
+				}
+			}
+		}
+	}`), &overlay)
+	merged := MergeMappingSpecs(&spec, &overlay)
+	if _, hasName := merged.Properties["user"].Properties["name"]; !hasName {
+		t.Fatalf("F6 expected MergeMappingSpecs to preserve user.name when adding user.age, got %+v", merged.Properties["user"].Properties)
+	}
+	if _, hasAge := merged.Properties["user"].Properties["age"]; !hasAge {
+		t.Fatalf("F6 expected MergeMappingSpecs to include user.age, got %+v", merged.Properties["user"].Properties)
+	}
+
+	// F11: ValidateMappingUpdateCompatibility rejects type changes
+	var badUpdate esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{
+		"properties": {
+			"count": {"type": "keyword"}
+		}
+	}`), &badUpdate)
+	if err := ValidateMappingUpdateCompatibility(&spec, &badUpdate); err == nil || !strings.Contains(err.Error(), "cannot be changed from type [long] to [keyword]") {
+		t.Fatalf("F11 expected type conflict error, got %v", err)
+	}
+}

@@ -119,6 +119,7 @@ func rewriteDorisArrayExists(q string) string {
 	var out strings.Builder
 	out.Grow(len(q) + 64)
 	inOuterQuote := false
+	inOuterBacktick := false
 	i := 0
 	for i < len(q) {
 		ch := q[i]
@@ -140,8 +141,22 @@ func rewriteDorisArrayExists(q string) string {
 			i++
 			continue
 		}
+		if inOuterBacktick {
+			if ch == '`' {
+				inOuterBacktick = false
+			}
+			out.WriteByte(ch)
+			i++
+			continue
+		}
 		if ch == '\'' {
 			inOuterQuote = true
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+		if ch == '`' {
+			inOuterBacktick = true
 			out.WriteByte(ch)
 			i++
 			continue
@@ -154,6 +169,7 @@ func rewriteDorisArrayExists(q string) string {
 		start := i + len(prefix)
 		depth := 1
 		inQuote := false
+		inBacktick := false
 		j := start
 		lastTopComma := -1
 		for j < len(q) && depth > 0 {
@@ -170,10 +186,16 @@ func rewriteDorisArrayExists(q string) string {
 					}
 					inQuote = false
 				}
+			} else if inBacktick {
+				if c == '`' {
+					inBacktick = false
+				}
 			} else {
 				switch c {
 				case '\'':
 					inQuote = true
+				case '`':
+					inBacktick = true
 				case '(':
 					depth++
 				case ')':
@@ -291,15 +313,24 @@ func (b *DorisSQLBackend) QueryHits(ctx context.Context, querySQL string) ([]Hit
 	var hits []HitRow
 	for rows.Next() {
 		var h HitRow
-		var srcStr string
+		var nullID sql.NullString
+		var nullVer sql.NullInt64
+		var nullSrc sql.NullString
 		var nullScore sql.NullFloat64
-		if err := rows.Scan(&h.ID, &h.Version, &srcStr, &nullScore, &h.TotalHits); err != nil {
+		var nullTotal sql.NullInt64
+		if err := rows.Scan(&nullID, &nullVer, &nullSrc, &nullScore, &nullTotal); err != nil {
 			return nil, err
 		}
+		if !nullID.Valid {
+			continue
+		}
+		h.ID = nullID.String
+		h.Version = nullVer.Int64
+		h.TotalHits = nullTotal.Int64
 		if nullScore.Valid && !math.IsNaN(nullScore.Float64) && !math.IsInf(nullScore.Float64, 0) {
 			h.Score = nullScore.Float64
 		}
-		h.Source = json.RawMessage(srcStr)
+		h.Source = json.RawMessage(nullSrc.String)
 		hits = append(hits, h)
 	}
 	return hits, rows.Err()
@@ -322,14 +353,17 @@ func (b *DorisSQLBackend) QueryAggs(ctx context.Context, aggsSQL string) ([]AggR
 	var out []AggRow
 	for rows.Next() {
 		var r AggRow
+		var nullAggName sql.NullString
 		var nullBucket sql.NullString
 		var nullVal sql.NullFloat64
-		if err := rows.Scan(&r.AggName, &nullBucket, &nullVal); err != nil {
+		if err := rows.Scan(&nullAggName, &nullBucket, &nullVal); err != nil {
 			return nil, err
 		}
-		if nullBucket.Valid {
-			r.BucketKey = nullBucket.String
+		if !nullAggName.Valid || !nullBucket.Valid {
+			continue
 		}
+		r.AggName = nullAggName.String
+		r.BucketKey = nullBucket.String
 		if nullVal.Valid && !math.IsNaN(nullVal.Float64) && !math.IsInf(nullVal.Float64, 0) {
 			r.Value = nullVal.Float64
 			r.DocCount = int64(nullVal.Float64)

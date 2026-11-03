@@ -881,9 +881,10 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		aggName, colExpr, wherePrefix := m[1], m[2], strings.TrimSpace(m[3])
 		var extraWhere string
 		if strings.HasSuffix(wherePrefix, " AND "+colExpr) {
-			extraWhere = strings.TrimSpace(strings.TrimSuffix(wherePrefix, " AND "+colExpr))
-			if strings.HasPrefix(extraWhere, "(") && strings.HasSuffix(extraWhere, ")") {
-				extraWhere = extraWhere[1 : len(extraWhere)-1]
+			extraWhere = trimOuterParens(strings.TrimSpace(strings.TrimSuffix(wherePrefix, " AND "+colExpr)))
+		} else if wherePrefix != colExpr {
+			if parts := splitTopLevelLogicalOp(wherePrefix, " AND "); len(parts) > 1 {
+				extraWhere = trimOuterParens(strings.TrimSpace(strings.Join(parts[:len(parts)-1], " AND ")))
 			}
 		}
 		limit, _ := strconv.Atoi(m[4])

@@ -875,3 +875,69 @@ func TestRound34SortSpecTermsCaseInsensitiveAndKNN(t *testing.T) {
 		t.Fatalf("expected parsing_exception for invalid KNN filter, got %v", err)
 	}
 }
+
+func TestRound41FunctionScoreCompositeAndMultiLevelNestedSort(t *testing.T) {
+	// F1a: FunctionScoreSpec rejects invalid inner query
+	var badFS SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"function_score": {
+				"query": {"not_a_real_query": {"x": 1}}
+			}
+		}
+	}`), &badFS); err == nil || !strings.Contains(err.Error(), "parsing_exception") {
+		t.Fatalf("expected parsing_exception for invalid function_score.query, got %v", err)
+	}
+
+	// F1b: CompositeAggSpec rejects invalid sources and empty sources
+	var badCompEmpty SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"aggs": {
+			"comp": {
+				"composite": {
+					"sources": []
+				}
+			}
+		}
+	}`), &badCompEmpty); err == nil || !strings.Contains(err.Error(), "parsing_exception") {
+		t.Fatalf("expected parsing_exception for empty composite.sources, got %v", err)
+	}
+	var badCompType SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"aggs": {
+			"comp": {
+				"composite": {
+					"sources": "not-an-array"
+				}
+			}
+		}
+	}`), &badCompType); err == nil || !strings.Contains(err.Error(), "parsing_exception") {
+		t.Fatalf("expected parsing_exception for malformed composite.sources, got %v", err)
+	}
+
+	// F14: Multi-level nested sort spec preserves nested.nested chain and DeepestNestedPath
+	var sr SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"sort": [
+			{
+				"comments.replies.likes": {
+					"order": "desc",
+					"nested": {
+						"path": "comments",
+						"nested": {
+							"path": "comments.replies"
+						}
+					}
+				}
+			}
+		]
+	}`), &sr); err != nil {
+		t.Fatalf("unmarshal multi-level nested sort failed: %v", err)
+	}
+	if len(sr.Sort) != 1 || sr.Sort[0].Entry.Nested == nil || sr.Sort[0].Entry.Nested.Nested == nil {
+		t.Fatalf("expected nested.nested sort chain, got %+v", sr.Sort)
+	}
+	if got := sr.Sort[0].Entry.Nested.Nested.Path; got != "comments.replies" {
+		t.Fatalf("expected nested.nested.path == 'comments.replies', got %q", got)
+	}
+}

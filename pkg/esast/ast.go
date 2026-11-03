@@ -43,6 +43,7 @@ func NextAutoID() string {
 type SearchRequest struct {
 	Query          *Query                 `json:"query,omitempty"`
 	AliasFilter    *Query                 `json:"-"`
+	Routing        string                 `json:"-"`
 	KNN            KNNSlice               `json:"knn,omitempty"`
 	PostFilter     *Query                 `json:"post_filter,omitempty"`
 	From           *int                   `json:"from,omitempty"`
@@ -848,8 +849,9 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 	}
 	if b := mapBoosts["term"]; b != nil {
 		for k, te := range alias.Term {
-			if te.Boost == 1.0 {
+			if !te.HasBoost {
 				te.Boost = *b
+				te.HasBoost = true
 				alias.Term[k] = te
 			}
 		}
@@ -883,40 +885,45 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 	}
 	if b := mapBoosts["fuzzy"]; b != nil {
 		for k, fe := range alias.Fuzzy {
-			if fe.Boost == 1.0 {
+			if !fe.HasBoost {
 				fe.Boost = *b
+				fe.HasBoost = true
 				alias.Fuzzy[k] = fe
 			}
 		}
 	}
 	if b := mapBoosts["match"]; b != nil {
 		for k, me := range alias.Match {
-			if me.Boost == 1.0 {
+			if !me.HasBoost {
 				me.Boost = *b
+				me.HasBoost = true
 				alias.Match[k] = me
 			}
 		}
 	}
 	if b := mapBoosts["match_phrase"]; b != nil {
 		for k, pe := range alias.MatchPhrase {
-			if pe.Boost == 1.0 {
+			if !pe.HasBoost {
 				pe.Boost = *b
+				pe.HasBoost = true
 				alias.MatchPhrase[k] = pe
 			}
 		}
 	}
 	if b := mapBoosts["match_phrase_prefix"]; b != nil {
 		for k, pe := range alias.MatchPhrasePrefix {
-			if pe.Boost == 1.0 {
+			if !pe.HasBoost {
 				pe.Boost = *b
+				pe.HasBoost = true
 				alias.MatchPhrasePrefix[k] = pe
 			}
 		}
 	}
 	if b := mapBoosts["match_bool_prefix"]; b != nil {
 		for k, pe := range alias.MatchBoolPrefix {
-			if pe.Boost == 1.0 {
+			if !pe.HasBoost {
 				pe.Boost = *b
+				pe.HasBoost = true
 				alias.MatchBoolPrefix[k] = pe
 			}
 		}
@@ -2192,6 +2199,19 @@ type CompositeAggSpec struct {
 	After   map[string]any       `json:"after,omitempty"`
 }
 
+func (c *CompositeAggSpec) UnmarshalJSON(data []byte) error {
+	type compositeAlias CompositeAggSpec
+	var alias compositeAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return fmt.Errorf("parsing_exception: invalid [composite] aggregation: %w", err)
+	}
+	if len(alias.Sources) == 0 {
+		return fmt.Errorf("parsing_exception: [composite] aggregation requires at least one source in [sources]")
+	}
+	*c = CompositeAggSpec(alias)
+	return nil
+}
+
 type FiltersAggSpec struct {
 	Filters          map[string]Query `json:"-"`
 	AnonymousFilters []Query          `json:"-"`
@@ -2631,14 +2651,15 @@ type NestedSortSpec struct {
 type SortEntry = SortFieldSpec
 
 type SortFieldSpec struct {
-	Field   string
-	Order   string
-	Mode    string
-	Missing string
-	Script  any
-	Type    string
-	Format  string
-	Nested  *NestedSortSpec
+	Field          string
+	Order          string
+	Mode           string
+	Missing        string
+	Script         any
+	Type           string
+	Format         string
+	IgnoreUnmapped bool
+	Nested         *NestedSortSpec
 }
 
 type SortSpec struct {
@@ -2695,7 +2716,7 @@ func (s SortSpec) MarshalJSON() ([]byte, error) {
 		}
 		return json.Marshal(map[string]any{"_geo_distance": inner})
 	}
-	if s.Entry.Mode != "" || s.Entry.Missing != "" || s.Entry.Nested != nil || s.Entry.Type != "" || s.Entry.Format != "" {
+	if s.Entry.Mode != "" || s.Entry.Missing != "" || s.Entry.Nested != nil || s.Entry.Type != "" || s.Entry.Format != "" || s.Entry.IgnoreUnmapped {
 		inner := map[string]any{"order": order}
 		if s.Entry.Mode != "" {
 			inner["mode"] = s.Entry.Mode
@@ -2708,6 +2729,9 @@ func (s SortSpec) MarshalJSON() ([]byte, error) {
 		}
 		if s.Entry.Format != "" {
 			inner["format"] = s.Entry.Format
+		}
+		if s.Entry.IgnoreUnmapped {
+			inner["ignore_unmapped"] = true
 		}
 		if s.Entry.Nested != nil {
 			inner["nested"] = s.Entry.Nested
@@ -3033,6 +3057,15 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 				_ = json.Unmarshal(rawT, &sortType)
 			}
 		}
+		ignoreUnmapped := false
+		if rawIU, hasIU := m["ignore_unmapped"]; hasIU && field != "ignore_unmapped" {
+			var iuVal any
+			if json.Unmarshal(rawIU, &iuVal) == nil {
+				if bv, err := parseFlexibleBool(iuVal); err == nil {
+					ignoreUnmapped = bv
+				}
+			}
+		}
 		var nestedSpec *NestedSortSpec
 		if rawNested, hasNested := m["nested"]; hasNested {
 			var ns NestedSortSpec
@@ -3061,16 +3094,17 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 			_ = json.Unmarshal(valTrimmed, &order)
 		} else if len(valTrimmed) > 0 && valTrimmed[0] == '{' {
 			var obj struct {
-				Order        string          `json:"order"`
-				Mode         string          `json:"mode"`
-				Missing      any             `json:"missing"`
-				UnmappedType string          `json:"unmapped_type"`
-				NumericType  string          `json:"numeric_type"`
-				Type         string          `json:"type"`
-				Format       string          `json:"format"`
-				Nested       *NestedSortSpec `json:"nested"`
-				NestedPath   string          `json:"nested_path"`
-				NestedFilter *Query          `json:"nested_filter"`
+				Order          string          `json:"order"`
+				Mode           string          `json:"mode"`
+				Missing        any             `json:"missing"`
+				UnmappedType   string          `json:"unmapped_type"`
+				NumericType    string          `json:"numeric_type"`
+				Type           string          `json:"type"`
+				Format         string          `json:"format"`
+				IgnoreUnmapped any             `json:"ignore_unmapped"`
+				Nested         *NestedSortSpec `json:"nested"`
+				NestedPath     string          `json:"nested_path"`
+				NestedFilter   *Query          `json:"nested_filter"`
 			}
 			_ = json.Unmarshal(valTrimmed, &obj)
 			if obj.Order != "" {
@@ -3081,6 +3115,11 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 			}
 			if obj.Format != "" {
 				sortFormat = obj.Format
+			}
+			if obj.IgnoreUnmapped != nil {
+				if bv, err := parseFlexibleBool(obj.IgnoreUnmapped); err == nil {
+					ignoreUnmapped = bv
+				}
 			}
 			if obj.Missing != nil {
 				if fv, ok := obj.Missing.(float64); ok && fv == math.Trunc(fv) && !math.IsInf(fv, 0) && !math.IsNaN(fv) {
@@ -3101,10 +3140,10 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 			} else if obj.Type != "" {
 				sortType = obj.Type
 			}
-			s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Type: strings.ToLower(sortType), Format: sortFormat, Nested: nestedSpec}
+			s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Type: strings.ToLower(sortType), Format: sortFormat, IgnoreUnmapped: ignoreUnmapped, Nested: nestedSpec}
 			return nil
 		}
-		s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Type: strings.ToLower(sortType), Format: sortFormat, Nested: nestedSpec}
+		s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Type: strings.ToLower(sortType), Format: sortFormat, IgnoreUnmapped: ignoreUnmapped, Nested: nestedSpec}
 	}
 	return nil
 }
