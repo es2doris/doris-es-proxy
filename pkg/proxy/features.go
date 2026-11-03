@@ -3466,6 +3466,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 	case "redact":
 		field, _ := specMap["field"].(string)
 		field = expandIngestFieldName(field, doc)
+		target := field
+		if tf, _ := specMap["target_field"].(string); tf != "" {
+			target = expandIngestFieldName(tf, doc)
+		}
 		patterns, _ := specMap["patterns"].([]any)
 		customDefs, _ := specMap["pattern_definitions"].(map[string]any)
 		prefix := "<"
@@ -3545,7 +3549,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					if err != nil {
 						return false, false, procType, procTag, specMap, err
 					}
-					setIngestPath(doc, field, redacted)
+					setIngestPath(doc, target, redacted)
 					mutated = true
 				case []any:
 					outSlice := make([]any, len(tv))
@@ -3560,7 +3564,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						}
 						outSlice[idx] = redacted
 					}
-					setIngestPath(doc, field, outSlice)
+					setIngestPath(doc, target, outSlice)
 					mutated = true
 				default:
 					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] of type [%T] is not supported for redact processor", field, val)
@@ -3903,6 +3907,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 	case "foreach":
 		field, _ := specMap["field"].(string)
 		field = expandIngestFieldName(field, doc)
+		ignoreMissing, _ := specMap["ignore_missing"].(bool)
 		var subProcs []any
 		if subProc, ok := specMap["processor"].(map[string]any); ok && subProc != nil {
 			subProcs = []any{subProc}
@@ -3911,29 +3916,37 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 		if field != "" && len(subProcs) > 0 {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				if arr, ok := val.([]any); ok {
-					var prevVal any
-					var hadPrev bool
-					if origIngest, ok := doc["_ingest"].(map[string]any); ok && origIngest != nil {
-						prevVal, hadPrev = origIngest["_value"]
-					}
-					restoreIngestVal := func() {
-						if curIngest, ok := doc["_ingest"].(map[string]any); ok && curIngest != nil {
-							if hadPrev {
-								curIngest["_value"] = prevVal
-							} else {
-								delete(curIngest, "_value")
-							}
+				var prevVal, prevKey any
+				var hadPrevVal, hadPrevKey bool
+				if origIngest, ok := doc["_ingest"].(map[string]any); ok && origIngest != nil {
+					prevVal, hadPrevVal = origIngest["_value"]
+					prevKey, hadPrevKey = origIngest["_key"]
+				}
+				restoreIngestVal := func() {
+					if curIngest, ok := doc["_ingest"].(map[string]any); ok && curIngest != nil {
+						if hadPrevVal {
+							curIngest["_value"] = prevVal
+						} else {
+							delete(curIngest, "_value")
+						}
+						if hadPrevKey {
+							curIngest["_key"] = prevKey
+						} else {
+							delete(curIngest, "_key")
 						}
 					}
-					outArr := make([]any, len(arr))
+				}
+				switch coll := val.(type) {
+				case []any:
+					outArr := make([]any, len(coll))
 					elemChanged := false
-					for idx, elem := range arr {
+					for idx, elem := range coll {
 						ingestMeta, _ := doc["_ingest"].(map[string]any)
 						if ingestMeta == nil {
 							ingestMeta = make(map[string]any)
 						}
 						ingestMeta["_value"] = deepCloneIngestValue(elem)
+						delete(ingestMeta, "_key")
 						doc["_ingest"] = ingestMeta
 						subMut, subDropped, subErr := runIngestProcessorList(s, doc, subProcs, depth+1, trace)
 						if subMut {
@@ -3963,10 +3976,58 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 							mutated = true
 						}
 					}
-				} else {
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not an array", field)
+				case map[string]any:
+					keys := make([]string, 0, len(coll))
+					for k := range coll {
+						keys = append(keys, k)
+					}
+					sort.Strings(keys)
+					changedEntries := make(map[string]any)
+					for _, k := range keys {
+						elem := coll[k]
+						ingestMeta, _ := doc["_ingest"].(map[string]any)
+						if ingestMeta == nil {
+							ingestMeta = make(map[string]any)
+						}
+						ingestMeta["_key"] = k
+						ingestMeta["_value"] = deepCloneIngestValue(elem)
+						doc["_ingest"] = ingestMeta
+						subMut, subDropped, subErr := runIngestProcessorList(s, doc, subProcs, depth+1, trace)
+						if subMut {
+							mutated = true
+						}
+						if subErr != nil {
+							restoreIngestVal()
+							return mutated, false, procType, procTag, specMap, subErr
+						}
+						if subDropped {
+							restoreIngestVal()
+							return mutated, true, procType, procTag, specMap, nil
+						}
+						if curIngest, ok := doc["_ingest"].(map[string]any); ok {
+							if newVal, hasVal := curIngest["_value"]; hasVal && !reflect.DeepEqual(newVal, elem) {
+								changedEntries[k] = newVal
+							}
+						}
+					}
+					restoreIngestVal()
+					if len(changedEntries) > 0 {
+						if curMapAny, stillExists := getIngestPath(doc, field); stillExists {
+							if curMap, okM := curMapAny.(map[string]any); okM {
+								for k, v := range changedEntries {
+									curMap[k] = v
+								}
+								mutated = true
+							}
+						}
+					}
+				default:
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is neither an array nor an object", field)
 				}
-			} else if isExplicitIgnoreMissingFalse(specMap) {
+			} else if !ignoreMissing {
+				if exists && val == nil {
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is null, cannot iterate over it", field)
+				}
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
 		}
@@ -5069,17 +5130,19 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		Size      *int   `json:"size,omitempty"`
 		Conflicts string `json:"conflicts,omitempty"`
 		Source    struct {
-			Index  any                 `json:"index"`
-			Query  *esast.Query        `json:"query,omitempty"`
-			Size   *int                `json:"size,omitempty"`
-			Source *esast.SourceFilter `json:"_source,omitempty"`
-			Sort   esast.SortSlice     `json:"sort,omitempty"`
+			Index   any                 `json:"index"`
+			Query   *esast.Query        `json:"query,omitempty"`
+			Size    *int                `json:"size,omitempty"`
+			Source  *esast.SourceFilter `json:"_source,omitempty"`
+			Sort    esast.SortSlice     `json:"sort,omitempty"`
+			Routing any                 `json:"routing,omitempty"`
 		} `json:"source"`
 		Dest struct {
 			Index       string `json:"index"`
 			Pipeline    string `json:"pipeline,omitempty"`
 			OpType      string `json:"op_type,omitempty"`
 			VersionType string `json:"version_type,omitempty"`
+			Routing     string `json:"routing,omitempty"`
 		} `json:"dest"`
 		Script *painless.ScriptSpec `json:"script,omitempty"`
 	}
@@ -5093,10 +5156,31 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	if body.Dest.Pipeline == "" {
 		body.Dest.Pipeline = r.URL.Query().Get("pipeline")
 	}
+	if body.Dest.OpType == "" {
+		body.Dest.OpType = r.URL.Query().Get("op_type")
+	}
 	destVerType := strings.ToLower(strings.TrimSpace(body.Dest.VersionType))
 	if destVerType != "" && destVerType != "internal" && destVerType != "external" && destVerType != "external_gt" && destVerType != "external_gte" {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("unknown version_type [%s] for reindex dest", body.Dest.VersionType))
 		return
+	}
+	destRoutingMode := strings.TrimSpace(body.Dest.Routing)
+	if destRoutingMode != "" && destRoutingMode != "keep" && destRoutingMode != "discard" && !strings.HasPrefix(destRoutingMode, "=") {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("invalid routing mode [%s] for reindex dest", body.Dest.Routing))
+		return
+	}
+	var srcRoutingFilter string
+	switch rv := body.Source.Routing.(type) {
+	case string:
+		srcRoutingFilter = strings.TrimSpace(rv)
+	case []any:
+		var rParts []string
+		for _, item := range rv {
+			if rs := strings.TrimSpace(fmt.Sprintf("%v", item)); rs != "" {
+				rParts = append(rParts, rs)
+			}
+		}
+		srcRoutingFilter = strings.Join(rParts, ",")
 	}
 
 	var srcPattern string
@@ -5214,6 +5298,10 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 				for _, h := range hRows {
+					effSrcRouting := s.resolveEffectiveReadRouting(srcPattern, srcIdx, srcRoutingFilter)
+					if effSrcRouting != "" && !s.docMatchesRequestRouting(srcIdx, h.ID, effSrcRouting) {
+						continue
+					}
 					if hasRuntimeQueryScript || hasNestedScore {
 						var rawMap map[string]any
 						dec := json.NewDecoder(bytes.NewReader(h.Source))
@@ -5271,7 +5359,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 
 		for {
 			fetchSize := batchSize
-			if !hasRuntimeQueryScript && maxDocs > 0 && totalMatched+fetchSize > maxDocs {
+			if !hasRuntimeQueryScript && srcRoutingFilter == "" && maxDocs > 0 && totalMatched+fetchSize > maxDocs {
 				fetchSize = maxDocs - totalMatched
 			}
 			if fetchSize <= 0 || (maxDocs > 0 && totalMatched >= maxDocs) {
@@ -5318,14 +5406,24 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				srcVer       int64
 				scriptVerSet bool
 				isDelete     bool
+				isCreate     bool
 				routing      string
 			}
 			var prepared []preparedDoc
 			sampleDocsByIdx := make(map[string][]json.RawMessage)
 			candIDsByIdx := make(map[string][]string)
+			defaultIsCreate := strings.EqualFold(strings.TrimSpace(body.Dest.OpType), "create")
 			for _, h := range hits {
 				if maxDocs > 0 && totalMatched >= maxDocs {
 					break
+				}
+				effSrcIdx := srcIdx
+				if effSrcIdx == "__global_sorted__" {
+					effSrcIdx = h.Index
+				}
+				effSrcRouting := s.resolveEffectiveReadRouting(srcPattern, effSrcIdx, srcRoutingFilter)
+				if effSrcRouting != "" && !s.docMatchesRequestRouting(effSrcIdx, h.ID, effSrcRouting) {
+					continue
 				}
 				if hasRuntimeQueryScript {
 					var rawMap map[string]any
@@ -5341,16 +5439,19 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 				totalMatched++
-				effSrcIdx := srcIdx
-				if effSrcIdx == "__global_sorted__" {
-					effSrcIdx = h.Index
-				}
 				docID := h.ID
 				docDestIdx := destIndex
 				docDestAliasFilter := destAliasFilter
 				docSource := h.Source
 				docSrcVer := h.Version
 				docRouting := s.getDocRouting(effSrcIdx, h.ID)
+				switch {
+				case destRoutingMode == "discard":
+					docRouting = ""
+				case strings.HasPrefix(destRoutingMode, "="):
+					docRouting = destRoutingMode[1:]
+				}
+				docIsCreate := defaultIsCreate
 				scriptVerSet := false
 				if body.Source.Source != nil {
 					filtered := filterSourceJSON(docSource, body.Source.Source)
@@ -5367,6 +5468,11 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					updSpec.MetaVersion = docSrcVer
 					updSpec.MetaVersionNil = false
 					updSpec.MetaVersionMutated = false
+					if docIsCreate {
+						updSpec.MetaOp = "create"
+					} else {
+						updSpec.MetaOp = "index"
+					}
 					mutated, opRes, err := painless.ApplyUpdateWithResult(docSource, updSpec, true)
 					if err != nil {
 						writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
@@ -5375,6 +5481,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					if opRes == "noop" {
 						continue
 					}
+					docIsCreate = strings.EqualFold(updSpec.MetaOp, "create")
 					if updSpec.MetaID != "" {
 						docID = updSpec.MetaID
 					} else {
@@ -5447,7 +5554,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "document does not match destination alias filter")
 					return
 				}
-				prepared = append(prepared, preparedDoc{id: docID, destIndex: docDestIdx, aliasFilter: docDestAliasFilter, source: docSource, srcVer: docSrcVer, scriptVerSet: scriptVerSet, routing: effRouting})
+				prepared = append(prepared, preparedDoc{id: docID, destIndex: docDestIdx, aliasFilter: docDestAliasFilter, source: docSource, srcVer: docSrcVer, scriptVerSet: scriptVerSet, isCreate: docIsCreate, routing: effRouting})
 				candIDsByIdx[docDestIdx] = append(candIDsByIdx[docDestIdx], docID)
 				sampleDocsByIdx[docDestIdx] = append(sampleDocsByIdx[docDestIdx], docSource)
 			}
@@ -5483,11 +5590,10 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					existingByIdx[idxName] = make(map[string]HitRow)
 				}
 			}
-			isCreate := strings.EqualFold(strings.TrimSpace(body.Dest.OpType), "create")
-
 			batchBufByTable := make(map[string]*bytes.Buffer, len(schemasByIdx))
 			var tableOrder []string
 			for _, pd := range prepared {
+				isCreate := pd.isCreate
 				sch := schemasByIdx[pd.destIndex]
 				existingDocs := existingByIdx[pd.destIndex]
 				var minVer int64

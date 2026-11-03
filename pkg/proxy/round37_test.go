@@ -716,7 +716,7 @@ func TestRound37_F29_RoutingRequiredEnforcementAndPropagation(t *testing.T) {
 	}
 
 	// GET _doc returns _routing
-	_, getRes := doReq(t, srv, http.MethodGet, "/routed_idx/_doc/1", "")
+	_, getRes := doReq(t, srv, http.MethodGet, "/routed_idx/_doc/1?routing=shard-a", "")
 	if getRes["_routing"] != "shard-a" {
 		t.Fatalf("expected GET _doc to include _routing='shard-a', got %+v", getRes)
 	}

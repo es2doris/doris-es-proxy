@@ -167,7 +167,7 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 						if t.Schema != nil {
 							fb = t.Schema.ResolveField(fname)
 						}
-						if t.isDoris4SearchableField(fname) && (t.Schema == nil || fb.DorisType != schema.DorisVarchar || (!strings.Contains(raw, `"`) && (!fb.LowercaseNormalizer || strings.ToLower(raw) == raw) && (strings.Contains(raw, ":") || !strings.ContainsAny(strings.TrimSpace(raw), " \t\n\r")))) {
+						if t.isDoris4SearchableField(fname) && (t.Schema == nil || fb.DorisType != schema.DorisVarchar || (!strings.Contains(raw, `"`) && !strings.ContainsAny(raw, "+-") && (!fb.LowercaseNormalizer || strings.ToLower(raw) == raw) && (strings.Contains(raw, ":") || !strings.ContainsAny(strings.TrimSpace(raw), " \t\n\r")))) {
 							col := strings.Trim(t.sqlColumnRef(fname, false, nctx), "`")
 							searchPreds = append(searchPreds, fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(rewrittenRaw), quoteStr(col), quoteStr(defaultOp)))
 						} else {
@@ -188,7 +188,7 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 						}
 					}
 				}
-			} else if t.isDoris4SearchableField(defaultField) && (t.Schema == nil || t.Schema.ResolveField(defaultField).DorisType != schema.DorisVarchar || (!strings.Contains(raw, `"`) && (strings.Contains(raw, ":") || ((!t.Schema.ResolveField(defaultField).LowercaseNormalizer || strings.ToLower(raw) == raw) && !strings.ContainsAny(strings.TrimSpace(raw), " \t\n\r"))))) {
+			} else if t.isDoris4SearchableField(defaultField) && (t.Schema == nil || t.Schema.ResolveField(defaultField).DorisType != schema.DorisVarchar || (!strings.Contains(raw, `"`) && !strings.ContainsAny(raw, "+-") && (strings.Contains(raw, ":") || ((!t.Schema.ResolveField(defaultField).LowercaseNormalizer || strings.ToLower(raw) == raw) && !strings.ContainsAny(strings.TrimSpace(raw), " \t\n\r"))))) {
 				col := strings.Trim(t.sqlColumnRef(defaultField, false, nctx), "`")
 				pred := fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(rewrittenRaw), quoteStr(col), quoteStr(defaultOp))
 				return CompiledQuery{
@@ -222,12 +222,21 @@ func (t *Transpiler) rewriteDoris4SearchQuery(raw string) (string, bool) {
 	if isBoolBinOp(tokens[0]) || isBoolUnaryOrBinOp(tokens[len(tokens)-1]) {
 		return "", false
 	}
-	for i := 0; i < len(tokens)-1; i++ {
-		if isBoolBinOp(tokens[i]) && isBoolBinOp(tokens[i+1]) {
+	for i := range tokens {
+		if tokens[i] == "+" || tokens[i] == "-" {
 			return "", false
 		}
-		if strings.EqualFold(tokens[i], "NOT") && isBoolUnaryOrBinOp(tokens[i+1]) {
+		rest := strings.TrimLeft(tokens[i], "+-")
+		if len(tokens[i])-len(rest) > 1 || (len(tokens[i]) > len(rest) && isBoolUnaryOrBinOp(rest)) {
 			return "", false
+		}
+		if i < len(tokens)-1 {
+			if isBoolBinOp(tokens[i]) && isBoolBinOp(tokens[i+1]) {
+				return "", false
+			}
+			if strings.EqualFold(tokens[i], "NOT") && isBoolUnaryOrBinOp(tokens[i+1]) {
+				return "", false
+			}
 		}
 	}
 	if !strings.Contains(raw, ":") {
@@ -268,7 +277,10 @@ func (t *Transpiler) rewriteDoris4SearchQuery(raw string) (string, bool) {
 			}
 			if t.Schema != nil {
 				fb := t.Schema.ResolveField(field)
-				if fb.DorisType == schema.DorisVarchar && (strings.Contains(val, `"`) || (fb.LowercaseNormalizer && strings.ToLower(val) != val)) {
+				if fb.DorisType == schema.DorisVarchar && (prefix != "" || strings.Contains(val, `"`) || (fb.LowercaseNormalizer && strings.ToLower(val) != val)) {
+					return "", false
+				}
+				if fb.IgnoreAbove > 0 && len([]rune(strings.Trim(val, `"`))) > fb.IgnoreAbove {
 					return "", false
 				}
 			}
@@ -317,7 +329,7 @@ func (t *Transpiler) isDoris4SearchableField(fname string) bool {
 		return false
 	}
 	b := t.Schema.ResolveField(fname)
-	if b.LowercaseNormalizer {
+	if b.NotIndexed || b.EnabledFalse || b.LowercaseNormalizer || b.ESType == "ip" || b.ESType == "binary" {
 		return false
 	}
 	return b.Kind == schema.StoragePromotedScalar && (b.DorisType == schema.DorisString || b.DorisType == schema.DorisVarchar)

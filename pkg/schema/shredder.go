@@ -956,7 +956,7 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 				if pathPrefix != "" {
 					fullPath = pathPrefix + "." + parts[0]
 				}
-				if strings.EqualFold(p0.Type, "flattened") {
+				if (p0.Enabled != nil && !*p0.Enabled) || strings.EqualFold(p0.Type, "flattened") {
 					continue
 				}
 				subPruned, err := validateStrictDynamicObject(subObj, p0.Properties, childMode, fullPath)
@@ -1558,6 +1558,8 @@ func collectStringsAtPathWithNull(node any, path []string, lowercase bool, nullV
 			for _, item := range v {
 				collectStringsAtPathWithNull(item, nil, lowercase, nullVal, out)
 			}
+		case map[string]any:
+			return
 		default:
 			s := fmt.Sprintf("%v", v)
 			if lowercase {
@@ -1756,22 +1758,28 @@ func deletePathInMap(curr map[string]any, path []string) bool {
 	if len(path) == 0 || curr == nil {
 		return false
 	}
-	if len(path) == 1 {
-		if _, exists := curr[path[0]]; exists {
-			delete(curr, path[0])
-			return true
+	dotFull := strings.Join(path, ".")
+	dotPrefix := dotFull + "."
+	removed := false
+	for k := range curr {
+		if k == dotFull || strings.HasPrefix(k, dotPrefix) {
+			delete(curr, k)
+			removed = true
 		}
-		return false
+	}
+	if len(path) == 1 {
+		return removed
 	}
 	next, exists := curr[path[0]]
 	if !exists {
-		return false
+		return removed
 	}
 	switch tv := next.(type) {
 	case map[string]any:
-		return deletePathInMap(tv, path[1:])
+		if deletePathInMap(tv, path[1:]) {
+			removed = true
+		}
 	case []any:
-		removed := false
 		for _, elem := range tv {
 			if em, ok := elem.(map[string]any); ok {
 				if deletePathInMap(em, path[1:]) {
@@ -1779,9 +1787,8 @@ func deletePathInMap(curr map[string]any, path []string) bool {
 				}
 			}
 		}
-		return removed
 	}
-	return false
+	return removed
 }
 
 func isStrictLeafFieldWithoutSubprops(s *IndexSchema, b FieldBinding) bool {
@@ -1863,7 +1870,8 @@ func collectAllTextWithSchema(node any, s *IndexSchema, curPath []string, sb *st
 			nextPath := append(append([]string(nil), curPath...), k)
 			if s != nil && len(s.Fields) > 0 {
 				dotPath := strings.Join(nextPath, ".")
-				if b, ok := s.Fields[dotPath]; ok && (b.NotIndexed || b.EnabledFalse) {
+				b := s.ResolveField(dotPath)
+				if b.NotIndexed || b.EnabledFalse {
 					continue
 				}
 			}

@@ -375,19 +375,41 @@ type InnerHitsSpec struct {
 	Sort           SortSlice          `json:"sort,omitempty"`
 	TrackScores    *bool              `json:"track_scores,omitempty"`
 	Source         *SourceFilter      `json:"_source,omitempty"`
+	StoredFields   any                `json:"stored_fields,omitempty"`
 	Fields         []FieldRequestSpec `json:"fields,omitempty"`
 	DocvalueFields []FieldRequestSpec `json:"docvalue_fields,omitempty"`
 	ScriptFields   map[string]any     `json:"script_fields,omitempty"`
 	Highlight      *HighlightSpec     `json:"highlight,omitempty"`
 }
 
+func (ih *InnerHitsSpec) HasStoredFieldsNone() bool {
+	if ih == nil {
+		return false
+	}
+	for _, f := range StoredFieldsSlice(ih.StoredFields) {
+		if f == "_none_" {
+			return true
+		}
+	}
+	return false
+}
+
 func (ih *InnerHitsSpec) EffectiveFieldSpecs() []FieldRequestSpec {
-	if ih == nil || (len(ih.Fields) == 0 && len(ih.DocvalueFields) == 0) {
+	if ih == nil {
 		return nil
 	}
-	out := make([]FieldRequestSpec, 0, len(ih.Fields)+len(ih.DocvalueFields))
+	sfList := StoredFieldsSlice(ih.StoredFields)
+	if len(ih.Fields) == 0 && len(ih.DocvalueFields) == 0 && len(sfList) == 0 {
+		return nil
+	}
+	out := make([]FieldRequestSpec, 0, len(ih.Fields)+len(ih.DocvalueFields)+len(sfList))
 	out = append(out, ih.Fields...)
 	out = append(out, ih.DocvalueFields...)
+	for _, sf := range sfList {
+		if sf != "_none_" {
+			out = append(out, FieldRequestSpec{Field: sf})
+		}
+	}
 	return out
 }
 
@@ -722,17 +744,10 @@ func stripNamedQueryAndMapBoost(rawClause json.RawMessage, requireMultipleKeysFo
 		return rawClause, nil
 	}
 	modified := false
-	if rawName, hasName := m["_name"]; hasName && len(m) > 1 {
-		tn := bytes.TrimSpace(rawName)
-		if len(tn) > 0 && tn[0] == '"' {
-			delete(m, "_name")
-			modified = true
-		}
-	}
 	var mapBoost *float64
 	if rawBoost, hasBoost := m["boost"]; hasBoost && (!requireMultipleKeysForBoost || len(m) > 1) {
 		tb := bytes.TrimSpace(rawBoost)
-		if len(tb) > 0 && tb[0] != '{' {
+		if len(tb) > 0 && tb[0] != '{' && tb[0] != '[' {
 			var b float64
 			parsed := false
 			if json.Unmarshal(tb, &b) == nil {
@@ -751,6 +766,13 @@ func stripNamedQueryAndMapBoost(rawClause json.RawMessage, requireMultipleKeysFo
 				delete(m, "boost")
 				modified = true
 			}
+		}
+	}
+	if rawName, hasName := m["_name"]; hasName && len(m) > 1 {
+		tn := bytes.TrimSpace(rawName)
+		if len(tn) > 0 && tn[0] == '"' {
+			delete(m, "_name")
+			modified = true
 		}
 	}
 	if !modified {
@@ -964,12 +986,13 @@ func (tq *TermsQuery) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	for k, v := range raw {
-		if k == "boost" {
+		trimmed := bytes.TrimSpace(v)
+		if k == "boost" && len(trimmed) > 0 && trimmed[0] != '[' && trimmed[0] != '{' {
 			_ = json.Unmarshal(v, &tq.Boost)
 			tq.HasBoost = true
 			continue
 		}
-		if k == "case_insensitive" {
+		if k == "case_insensitive" && len(trimmed) > 0 && trimmed[0] != '[' && trimmed[0] != '{' {
 			var ci bool
 			if err := json.Unmarshal(v, &ci); err != nil {
 				var ciStr string
@@ -982,7 +1005,6 @@ func (tq *TermsQuery) UnmarshalJSON(data []byte) error {
 			tq.CaseInsensitive = ci
 			continue
 		}
-		trimmed := bytes.TrimSpace(v)
 		if k == "_name" && len(trimmed) > 0 && trimmed[0] == '"' {
 			continue
 		}
@@ -2273,19 +2295,41 @@ type TopHitsAggSpec struct {
 	Sort           SortSlice          `json:"sort,omitempty"`
 	TrackScores    *bool              `json:"track_scores,omitempty"`
 	Source         *SourceFilter      `json:"_source,omitempty"`
+	StoredFields   any                `json:"stored_fields,omitempty"`
 	Fields         []FieldRequestSpec `json:"fields,omitempty"`
 	DocvalueFields []FieldRequestSpec `json:"docvalue_fields,omitempty"`
 	ScriptFields   map[string]any     `json:"script_fields,omitempty"`
 	Highlight      *HighlightSpec     `json:"highlight,omitempty"`
 }
 
+func (th *TopHitsAggSpec) HasStoredFieldsNone() bool {
+	if th == nil {
+		return false
+	}
+	for _, f := range StoredFieldsSlice(th.StoredFields) {
+		if f == "_none_" {
+			return true
+		}
+	}
+	return false
+}
+
 func (th *TopHitsAggSpec) EffectiveFieldSpecs() []FieldRequestSpec {
-	if th == nil || (len(th.Fields) == 0 && len(th.DocvalueFields) == 0) {
+	if th == nil {
 		return nil
 	}
-	out := make([]FieldRequestSpec, 0, len(th.Fields)+len(th.DocvalueFields))
+	sfList := StoredFieldsSlice(th.StoredFields)
+	if len(th.Fields) == 0 && len(th.DocvalueFields) == 0 && len(sfList) == 0 {
+		return nil
+	}
+	out := make([]FieldRequestSpec, 0, len(th.Fields)+len(th.DocvalueFields)+len(sfList))
 	out = append(out, th.Fields...)
 	out = append(out, th.DocvalueFields...)
+	for _, sf := range sfList {
+		if sf != "_none_" {
+			out = append(out, FieldRequestSpec{Field: sf})
+		}
+	}
 	return out
 }
 
@@ -2676,6 +2720,84 @@ func (s SortSpec) MarshalJSON() ([]byte, error) {
 // SortSlice accepts either a single sort specification (`"_doc"` / `{"updatedAt": "desc"}`) or an array.
 type SortSlice []SortSpec
 
+func unmarshalSortElement(raw []byte) ([]SortSpec, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, nil
+	}
+	if trimmed[0] == '{' {
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &m); err != nil {
+			return nil, err
+		}
+		if _, hasScript := m["_script"]; !hasScript {
+			if _, hasGeo := m["_geo_distance"]; !hasGeo {
+				reservedOpts := map[string]bool{
+					"order": true, "mode": true, "missing": true, "unmapped_type": true,
+					"numeric_type": true, "type": true, "format": true, "nested": true, "nested_path": true,
+					"nested_filter": true, "unit": true, "distance_type": true,
+					"validation_method": true, "ignore_unmapped": true,
+				}
+				var orderedKeys []string
+				dec := json.NewDecoder(bytes.NewReader(trimmed))
+				if tok, err := dec.Token(); err == nil && tok == json.Delim('{') {
+					for dec.More() {
+						kt, err := dec.Token()
+						if err != nil {
+							break
+						}
+						if ks, ok := kt.(string); ok {
+							orderedKeys = append(orderedKeys, ks)
+						}
+						var skip json.RawMessage
+						if err := dec.Decode(&skip); err != nil {
+							break
+						}
+					}
+				}
+				if len(orderedKeys) == 0 {
+					for k := range m {
+						orderedKeys = append(orderedKeys, k)
+					}
+					sort.Strings(orderedKeys)
+				}
+				var fieldKeys []string
+				for _, k := range orderedKeys {
+					rawV := m[k]
+					if len(m) > 1 && reservedOpts[k] {
+						vTrim := bytes.TrimSpace(rawV)
+						if len(vTrim) > 0 && vTrim[0] == '{' && k != "nested" && k != "nested_filter" {
+							fieldKeys = append(fieldKeys, k)
+						}
+						continue
+					}
+					fieldKeys = append(fieldKeys, k)
+				}
+				if len(fieldKeys) > 1 {
+					out := make([]SortSpec, 0, len(fieldKeys))
+					for _, fk := range fieldKeys {
+						singleBytes, err := json.Marshal(map[string]json.RawMessage{fk: m[fk]})
+						if err != nil {
+							return nil, err
+						}
+						var sp SortSpec
+						if err := json.Unmarshal(singleBytes, &sp); err != nil {
+							return nil, err
+						}
+						out = append(out, sp)
+					}
+					return out, nil
+				}
+			}
+		}
+	}
+	var single SortSpec
+	if err := json.Unmarshal(trimmed, &single); err != nil {
+		return nil, err
+	}
+	return []SortSpec{single}, nil
+}
+
 func (ss *SortSlice) UnmarshalJSON(data []byte) error {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -2683,18 +2805,26 @@ func (ss *SortSlice) UnmarshalJSON(data []byte) error {
 		return nil
 	}
 	if trimmed[0] == '[' {
-		var list []SortSpec
-		if err := json.Unmarshal(trimmed, &list); err != nil {
+		var rawList []json.RawMessage
+		if err := json.Unmarshal(trimmed, &rawList); err != nil {
 			return err
 		}
-		*ss = list
+		var out []SortSpec
+		for _, item := range rawList {
+			specs, err := unmarshalSortElement(item)
+			if err != nil {
+				return err
+			}
+			out = append(out, specs...)
+		}
+		*ss = out
 		return nil
 	}
-	var single SortSpec
-	if err := json.Unmarshal(trimmed, &single); err != nil {
+	specs, err := unmarshalSortElement(trimmed)
+	if err != nil {
 		return err
 	}
-	*ss = []SortSpec{single}
+	*ss = specs
 	return nil
 }
 
@@ -2844,6 +2974,14 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 			if json.Unmarshal(rawV, &strV) == nil && (strings.EqualFold(strV, "asc") || strings.EqualFold(strV, "desc")) {
 				if k != "order" || len(m) == 1 {
 					keys = append(keys, k)
+				}
+			}
+		}
+		if len(keys) == 0 {
+			if rawOrd, ok := m["order"]; ok {
+				var strV string
+				if json.Unmarshal(rawOrd, &strV) == nil && (strings.EqualFold(strV, "asc") || strings.EqualFold(strV, "desc")) {
+					keys = append(keys, "order")
 				}
 			}
 		}
@@ -3124,6 +3262,7 @@ type FieldProperty struct {
 	Dynamic         any                      `json:"dynamic,omitempty"`
 	Enabled         *bool                    `json:"enabled,omitempty"`
 	Index           *bool                    `json:"index,omitempty"`
+	DocValues       *bool                    `json:"doc_values,omitempty"`
 	Path            string                   `json:"path,omitempty"`
 	Analyzer        string                   `json:"analyzer,omitempty"`
 	SearchAnalyzer  string                   `json:"search_analyzer,omitempty"`
