@@ -285,6 +285,12 @@ func GeneratePromoteVariantFieldDDL(s *IndexSchema, esFieldPath string, esType s
 	if existing, ok := s.Fields[checkPath]; ok && existing.Kind != StorageDynamicVariant {
 		return nil
 	}
+	if resolved := s.ResolveField(checkPath); resolved.EnabledFalse || resolved.NotIndexed {
+		return nil
+	}
+	if s.IsDynamicFalseUnmappedField(checkPath) || isUnpromotableDynamicScope(s, checkPath) {
+		return nil
+	}
 	for root := range s.NestedRoots {
 		if cleanPath == root || strings.HasPrefix(cleanPath, root+".") {
 			return nil
@@ -366,12 +372,15 @@ func buildColumnAndIndexDDL(b FieldBinding) (string, string) {
 
 	case StoragePromotedArray, StorageNestedSubfield:
 		colDef := fmt.Sprintf("`%s` ARRAY<STRING> NULL", b.ColumnName)
+		if b.NotIndexed {
+			return colDef, ""
+		}
 		idxDef := fmt.Sprintf("INDEX `%s` (`%s`) USING INVERTED", idxName, b.ColumnName)
 		return colDef, idxDef
 
 	case StoragePromotedScalar:
 		colDef := fmt.Sprintf("`%s` %s NULL", b.ColumnName, b.DorisType)
-		if b.DorisType == DorisDouble {
+		if b.NotIndexed || b.DorisType == DorisDouble {
 			// Apache Doris BKD inverted index does not support IEEE-754 floating-point columns.
 			return colDef, ""
 		}
@@ -403,4 +412,36 @@ func mapESAnalyzerToDorisParser(analyzer string) string {
 	default:
 		return "standard"
 	}
+}
+
+func isUnpromotableDynamicScope(s *IndexSchema, esFieldPath string) bool {
+	if s == nil || s.RawMapping == nil {
+		return false
+	}
+	cleanPath := strings.TrimSuffix(strings.TrimSuffix(esFieldPath, ".keyword"), ".ngram")
+	if cleanPath == "" || strings.HasPrefix(cleanPath, "_") {
+		return false
+	}
+	if _, ok := s.Fields[esFieldPath]; ok {
+		return false
+	}
+	if _, ok := s.Fields[cleanPath]; ok {
+		return false
+	}
+	mode := normalizeDynamicMode(s.RawMapping.Dynamic)
+	props := s.RawMapping.Properties
+	for _, seg := range strings.Split(cleanPath, ".") {
+		prop, ok := props[seg]
+		if !ok {
+			return mode == "false" || mode == "strict"
+		}
+		if strings.EqualFold(prop.Type, "flattened") {
+			return false
+		}
+		if prop.Dynamic != nil {
+			mode = normalizeDynamicMode(prop.Dynamic)
+		}
+		props = prop.Properties
+	}
+	return false
 }

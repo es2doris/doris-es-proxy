@@ -122,6 +122,26 @@ func (t *Transpiler) checkFieldDocValues(field string, b schema.FieldBinding) bo
 	return true
 }
 
+func (t *Transpiler) checkScriptDocValues(script any, nctx *nestedCtx) {
+	s, _, ok := normalizeScriptSourceAndParams(script)
+	if !ok || s == "" {
+		return
+	}
+	rest := s
+	for {
+		idx := strings.Index(rest, "doc[")
+		if idx < 0 {
+			break
+		}
+		sub := rest[idx:]
+		if field, _, okF := parseDocFieldAccess(sub); okF && field != "" && !strings.HasPrefix(field, "_") {
+			resolved, b := t.resolveFieldInNestedCtx(field, true, nctx)
+			t.checkFieldDocValues(resolved, b)
+		}
+		rest = sub[4:]
+	}
+}
+
 func (t *Transpiler) validateAggsDocValues(aggs map[string]esast.AggSpec, nctx *nestedCtx) {
 	if len(aggs) == 0 {
 		return
@@ -142,15 +162,19 @@ func (t *Transpiler) validateAggsDocValues(aggs map[string]esast.AggSpec, nctx *
 				}
 			}
 			checkField(effField, nctx)
+			t.checkScriptDocValues(termsSpec.Script, nctx)
 		}
 		if spec.Histogram != nil {
 			checkField(spec.Histogram.Field, nctx)
+			t.checkScriptDocValues(spec.Histogram.Script, nctx)
 		}
 		if spec.DateHistogram != nil {
 			checkField(spec.DateHistogram.Field, nctx)
+			t.checkScriptDocValues(spec.DateHistogram.Script, nctx)
 		}
 		if rSpec := spec.EffectiveRange(); rSpec != nil {
 			checkField(rSpec.Field, nctx)
+			t.checkScriptDocValues(rSpec.Script, nctx)
 		}
 		if spec.Composite != nil {
 			for _, srcMap := range spec.Composite.Sources {
@@ -159,39 +183,57 @@ func (t *Transpiler) validateAggsDocValues(aggs map[string]esast.AggSpec, nctx *
 		}
 		if spec.Cardinality != nil {
 			checkField(spec.Cardinality.Field, nctx)
+			t.checkScriptDocValues(spec.Cardinality.Script, nctx)
 		}
 		if spec.ValueCount != nil {
 			checkField(spec.ValueCount.Field, nctx)
+			t.checkScriptDocValues(spec.ValueCount.Script, nctx)
 		}
 		if spec.Avg != nil {
 			checkField(spec.Avg.Field, nctx)
+			t.checkScriptDocValues(spec.Avg.Script, nctx)
 		}
 		if spec.Sum != nil {
 			checkField(spec.Sum.Field, nctx)
+			t.checkScriptDocValues(spec.Sum.Script, nctx)
 		}
 		if spec.Min != nil {
 			checkField(spec.Min.Field, nctx)
+			t.checkScriptDocValues(spec.Min.Script, nctx)
 		}
 		if spec.Max != nil {
 			checkField(spec.Max.Field, nctx)
+			t.checkScriptDocValues(spec.Max.Script, nctx)
 		}
 		if stSpec := spec.EffectiveStats(); stSpec != nil {
 			checkField(stSpec.Field, nctx)
+			t.checkScriptDocValues(stSpec.Script, nctx)
 		}
 		if spec.StringStats != nil {
 			checkField(spec.StringStats.Field, nctx)
+			t.checkScriptDocValues(spec.StringStats.Script, nctx)
 		}
 		if spec.Boxplot != nil {
 			checkField(spec.Boxplot.Field, nctx)
+			t.checkScriptDocValues(spec.Boxplot.Script, nctx)
 		}
 		if spec.Percentiles != nil {
 			checkField(spec.Percentiles.Field, nctx)
+			t.checkScriptDocValues(spec.Percentiles.Script, nctx)
 		}
 		if spec.PercentileRanks != nil {
 			checkField(spec.PercentileRanks.Field, nctx)
+			t.checkScriptDocValues(spec.PercentileRanks.Script, nctx)
 		}
 		if spec.Rate != nil {
 			checkField(spec.Rate.Field, nctx)
+			t.checkScriptDocValues(spec.Rate.Script, nctx)
+		}
+		if spec.ScriptedMetric != nil {
+			t.checkScriptDocValues(spec.ScriptedMetric.InitScript, nctx)
+			t.checkScriptDocValues(spec.ScriptedMetric.MapScript, nctx)
+			t.checkScriptDocValues(spec.ScriptedMetric.CombineScript, nctx)
+			t.checkScriptDocValues(spec.ScriptedMetric.ReduceScript, nctx)
 		}
 		if spec.TopMetrics != nil {
 			for _, mf := range spec.TopMetrics.EffectiveMetricFields() {
@@ -205,9 +247,18 @@ func (t *Transpiler) validateAggsDocValues(aggs map[string]esast.AggSpec, nctx *
 					sortNCtx = nctx
 				}
 				checkField(s.Entry.Field, sortNCtx)
+				if s.Entry.Field == "_script" {
+					t.checkScriptDocValues(s.Entry.Script, sortNCtx)
+				}
 			}
 		}
 		if spec.TopHits != nil {
+			for _, dvf := range spec.TopHits.DocvalueFields {
+				checkField(dvf.Field, nctx)
+			}
+			for _, sf := range spec.TopHits.ScriptFields {
+				t.checkScriptDocValues(sf, nctx)
+			}
 			for _, s := range spec.TopHits.Sort {
 				var sortNCtx *nestedCtx
 				if deepest := deepestNestedSortPath(s.Entry.Nested); deepest != "" {
@@ -216,10 +267,14 @@ func (t *Transpiler) validateAggsDocValues(aggs map[string]esast.AggSpec, nctx *
 					sortNCtx = nctx
 				}
 				checkField(s.Entry.Field, sortNCtx)
+				if s.Entry.Field == "_script" {
+					t.checkScriptDocValues(s.Entry.Script, sortNCtx)
+				}
 			}
 		}
 		if sampSpec := spec.EffectiveSampler(); sampSpec != nil {
 			checkField(sampSpec.Field, nctx)
+			t.checkScriptDocValues(sampSpec.Script, nctx)
 		}
 		if spec.Missing != nil {
 			checkField(spec.Missing.Field, nctx)
@@ -357,6 +412,22 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 		if dvf.Field != "" && !strings.HasPrefix(dvf.Field, "_") && !strings.ContainsAny(dvf.Field, "*?") {
 			b := t.Schema.ResolveEffectiveField(dvf.Field, true)
 			t.checkFieldDocValues(dvf.Field, b)
+		}
+	}
+	for _, sf := range req.ScriptFields {
+		t.checkScriptDocValues(sf, nil)
+	}
+	if req.Collapse != nil {
+		for _, ih := range req.Collapse.InnerHits {
+			for _, dvf := range ih.DocvalueFields {
+				if dvf.Field != "" && !strings.HasPrefix(dvf.Field, "_") && !strings.ContainsAny(dvf.Field, "*?") {
+					b := t.Schema.ResolveEffectiveField(dvf.Field, true)
+					t.checkFieldDocValues(dvf.Field, b)
+				}
+			}
+			for _, sf := range ih.ScriptFields {
+				t.checkScriptDocValues(sf, nil)
+			}
 		}
 	}
 	effSorts := EffectiveSortsForRequest(req)
@@ -594,16 +665,28 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 			if !t.checkFieldSearchable(resolvedField, b) || len(ts.Terms) == 0 || b.Kind == schema.StoragePromotedVector {
 				preds = append(preds, "FALSE")
 			} else {
-				var termSums []string
+				var uniqueTerms []any
+				seenTerms := make(map[string]bool, len(ts.Terms))
 				for _, tv := range ts.Terms {
+					key := fmt.Sprintf("%T:%v", tv, tv)
+					if !seenTerms[key] {
+						seenTerms[key] = true
+						uniqueTerms = append(uniqueTerms, tv)
+					}
+				}
+				var termSums []string
+				for _, tv := range uniqueTerms {
 					tp := t.compileTermsSetTermPredicate(resolvedField, tv, nctx)
 					termSums = append(termSums, fmt.Sprintf("CAST(COALESCE(%s, FALSE) AS INT)", tp))
 				}
 				threshExpr := "1"
 				if ts.MinimumShouldMatchField != "" {
+					resolvedMSM, bMSM := t.resolveFieldInNestedCtx(ts.MinimumShouldMatchField, true, nctx)
+					t.checkFieldDocValues(resolvedMSM, bMSM)
 					threshExpr = fmt.Sprintf("COALESCE(%s, 1)", t.sqlNumericColumnRef(ts.MinimumShouldMatchField, nctx))
 				} else if len(ts.MinimumShouldMatchScript) > 0 {
-					threshExpr = t.compileTermsSetScriptThreshold(ts.MinimumShouldMatchScript, len(ts.Terms), nctx)
+					t.checkScriptDocValues(ts.MinimumShouldMatchScript, nctx)
+					threshExpr = t.compileTermsSetScriptThreshold(ts.MinimumShouldMatchScript, len(uniqueTerms), nctx)
 				}
 				preds = append(preds, fmt.Sprintf("((%s) >= %s)", strings.Join(termSums, " + "), threshExpr))
 			}
@@ -1733,7 +1816,7 @@ func (t *Transpiler) compileMatchField(
 	if queryVal == nil || strings.TrimSpace(queryStr) == "" {
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
-	if isExactKeywordField(field, b) && (field == "_id" || field == "_index" || field == "_version" || field == "_routing" || b.ESType == "constant_keyword" || strings.ContainsAny(strings.TrimSpace(queryStr), " \t\n\r") || strings.ToLower(queryStr) != queryStr || strings.HasSuffix(field, ".keyword")) {
+	if isExactKeywordField(field, b) && (field == "_id" || field == "_index" || field == "_version" || field == "_routing" || b.ESType == "constant_keyword" || b.NullValue != nil || strings.ContainsAny(strings.TrimSpace(queryStr), " \t\n\r") || strings.ToLower(queryStr) != queryStr || strings.HasSuffix(field, ".keyword")) {
 		pred := t.compileTermPredicate(field, queryVal, false, nctx)
 		score := "0.0"
 		if scoring {
@@ -2164,6 +2247,7 @@ func (t *Transpiler) compileScriptScore(ss *esast.ScriptScoreQuery, scoring bool
 	scoreSQL := base.ScoreSQL
 	scriptCompiled := false
 	if ss.Script != nil {
+		t.checkScriptDocValues(ss.Script, nctx)
 		if expr, ok := t.compileMetricScriptExprWithOverride(ss.Script, "_score", base.ScoreSQL, nctx); ok {
 			scoreSQL = expr
 			scriptCompiled = true
@@ -2204,9 +2288,12 @@ func (t *Transpiler) compileScriptQuery(sq *esast.ScriptQuery, scoring bool, nct
 		boost = *sq.Boost
 	}
 	whereSQL := "TRUE"
-	if sq != nil && sq.Script != nil && nctx == nil {
-		if condSQL, ok := t.compileBooleanScriptComparison(sq.Script, nctx); ok && condSQL != "" {
-			whereSQL = condSQL
+	if sq != nil && sq.Script != nil {
+		t.checkScriptDocValues(sq.Script, nctx)
+		if nctx == nil {
+			if condSQL, ok := t.compileBooleanScriptComparison(sq.Script, nctx); ok && condSQL != "" {
+				whereSQL = condSQL
+			}
 		}
 	}
 	scoreSQL := "1.0"
@@ -2264,11 +2351,15 @@ func (t *Transpiler) parseBooleanScriptCond(s string, params map[string]any, nct
 	if strings.HasPrefix(s, "!") {
 		inner := strings.TrimSpace(s[1:])
 		if field, tail, ok := parseDocFieldAccess(inner); ok && tail == ".empty" {
+			resolved, b := t.resolveFieldInNestedCtx(field, true, nctx)
+			t.checkFieldDocValues(resolved, b)
 			return t.compileExistsPredicate(field, nctx), true
 		}
 		return "", false
 	}
 	if field, tail, ok := parseDocFieldAccess(s); ok && tail == ".empty" {
+		resolved, b := t.resolveFieldInNestedCtx(field, true, nctx)
+		t.checkFieldDocValues(resolved, b)
 		return fmt.Sprintf("NOT COALESCE(%s, FALSE)", t.compileExistsPredicate(field, nctx)), true
 	}
 	for _, cmpOp := range []struct{ op, sqlOp string }{
@@ -2499,11 +2590,23 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 	}
 	hasUncompilableScriptFn := false
 	if fs.ScriptScore != nil {
+		t.checkScriptDocValues(fs.ScriptScore.Script, nctx)
 		if _, ok := t.compileMetricScriptExprWithOverride(fs.ScriptScore.Script, "_score", base.ScoreSQL, nctx); !ok {
 			hasUncompilableScriptFn = true
 		}
 	}
+	if fs.FieldValueFactor != nil && fs.FieldValueFactor.Field != "" {
+		resolvedFVF, bFVF := t.resolveFieldInNestedCtx(fs.FieldValueFactor.Field, true, nctx)
+		t.checkFieldDocValues(resolvedFVF, bFVF)
+	}
 	for i := range fs.Functions {
+		if fs.Functions[i].FieldValueFactor != nil && fs.Functions[i].FieldValueFactor.Field != "" {
+			resolvedFVF, bFVF := t.resolveFieldInNestedCtx(fs.Functions[i].FieldValueFactor.Field, true, nctx)
+			t.checkFieldDocValues(resolvedFVF, bFVF)
+		}
+		if fs.Functions[i].ScriptScore != nil {
+			t.checkScriptDocValues(fs.Functions[i].ScriptScore.Script, nctx)
+		}
 		if queryContainsScript(fs.Functions[i].Filter) {
 			hasUncompilableScriptFn = true
 			break
@@ -7330,6 +7433,8 @@ func (t *Transpiler) compilePolymorphicScriptExpr(script any, defaultField strin
 		return t.sqlStringScalarColumnRef(defaultField, true, nctx), true
 	}
 	if field, tail, ok := parseDocFieldAccess(sClean); ok && (tail == "" || tail == ".value") {
+		resolved, b := t.resolveFieldInNestedCtx(field, true, nctx)
+		t.checkFieldDocValues(resolved, b)
 		if fieldOverrideExpr != "" && t.sameScriptFieldInCtx(field, defaultField, nctx) {
 			return fieldOverrideExpr, true
 		}
@@ -7464,7 +7569,8 @@ func (t *Transpiler) parseStringScriptExpr(s string, params map[string]any, defa
 		return t.sqlStringScalarColumnRef(defaultField, true, nctx), isStr, true
 	}
 	if field, tail, ok := parseDocFieldAccess(s); ok && (tail == "" || tail == ".value") {
-		_, b := t.resolveFieldInNestedCtx(field, true, nctx)
+		resolved, b := t.resolveFieldInNestedCtx(field, true, nctx)
+		t.checkFieldDocValues(resolved, b)
 		effDT := effectiveDorisScalarType(b)
 		isStr := effDT == schema.DorisString || effDT == schema.DorisVarchar || b.Kind == schema.StorageDynamicVariant
 		if fieldOverrideExpr != "" && t.sameScriptFieldInCtx(field, defaultField, nctx) {
@@ -7660,6 +7766,7 @@ func (t *Transpiler) parseMetricScriptExpr(s string, params map[string]any, defa
 			return "", false
 		}
 		effField, b := t.resolveFieldInNestedCtx(field, true, nctx)
+		t.checkFieldDocValues(effField, b)
 		if tail == ".size()" || tail == ".length" {
 			if nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued {
 				relPath := t.nestedRelativeJSONPath(effField, true, b.NestedPath)
@@ -7981,6 +8088,7 @@ func (t *Transpiler) parseSafeThresholdExpr(s string, params map[string]any, num
 			return "", false
 		}
 		field, b := t.resolveFieldInNestedCtx(field, true, nctx)
+		t.checkFieldDocValues(field, b)
 		if tail == ".size()" || tail == ".length" {
 			if b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath || b.IsMultiValued)) {
 				if nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued {
@@ -8152,12 +8260,14 @@ func (t *Transpiler) resolveSortMissing(s esast.SortSpec, b schema.FieldBinding)
 			return ms, strconv.FormatInt(ms, 10)
 		}
 	}
-	if iv, err := strconv.ParseInt(mStr, 10, 64); err == nil {
-		norm := normalizeDateNanosValue(effType, iv)
-		if niv, ok := norm.(int64); ok {
-			return niv, strconv.FormatInt(niv, 10)
+	if effType != "scaled_float" {
+		if iv, err := strconv.ParseInt(mStr, 10, 64); err == nil {
+			norm := normalizeDateNanosValue(effType, iv)
+			if niv, ok := norm.(int64); ok {
+				return niv, strconv.FormatInt(niv, 10)
+			}
+			return iv, strconv.FormatInt(iv, 10)
 		}
-		return iv, strconv.FormatInt(iv, 10)
 	}
 	if fv, err := strconv.ParseFloat(mStr, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
 		if nfv, ok := normalizeScaledFloatValue(b, fv).(float64); ok {
@@ -8356,6 +8466,7 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 			continue
 		}
 		if s.Entry.Field == "_script" {
+			t.checkScriptDocValues(s.Entry.Script, nil)
 			if scriptExpr, sb, ok := t.compileScriptSortExpr(s); ok {
 				_, missingSQL := t.resolveSortMissing(s, sb)
 				if missingSQL != "" {
@@ -8380,7 +8491,9 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 		default:
 			resolvedField, b := t.resolveSortFieldAndBinding(s.Entry.Field, s.Entry.Nested)
 			if s.Entry.IgnoreUnmapped && b.Kind == schema.StorageDynamicVariant && s.Entry.Type == "" {
-				afterIdx++
+				if len(after) >= len(sorts) {
+					afterIdx++
+				}
 				continue
 			}
 			hasSortSample := (afterIdx < len(after) && after[afterIdx] != nil) ||
@@ -8423,6 +8536,7 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 					}
 				}
 				sampleVal = normalizeDateNanosValue(effType, sampleVal)
+				sampleVal = normalizeScaledFloatValue(b, sampleVal)
 			}
 			col := t.sqlSortColumnRefWithType(s.Entry.Field, sampleVal, dir == "DESC", s.Entry.Mode, s.Entry.Nested, effType)
 			if missingSQL != "" {
@@ -8483,7 +8597,10 @@ func (t *Transpiler) resolveSortFieldAndBinding(field string, nested *esast.Nest
 
 func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after []any, scoreExpr string) string {
 	var effectiveSorts []esast.SortSpec
-	for _, s := range sorts {
+	var effectiveAfter []any
+	useOrigIdx := len(after) >= len(sorts)
+	seqIdx := 0
+	for origIdx, s := range sorts {
 		if s.Entry.Field == "_geo_distance" {
 			if _, ok := t.compileGeoDistanceSortExpr(s); !ok {
 				break
@@ -8494,8 +8611,22 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 				break
 			}
 		}
+		if s.Entry.Field != "" && s.Entry.Field != "_score" && s.Entry.Field != "_id" && s.Entry.Field != "_doc" && s.Entry.Field != "_geo_distance" && s.Entry.Field != "_script" {
+			_, b := t.resolveSortFieldAndBinding(s.Entry.Field, s.Entry.Nested)
+			if s.Entry.IgnoreUnmapped && b.Kind == schema.StorageDynamicVariant && s.Entry.Type == "" {
+				continue
+			}
+		}
 		if s.Entry.Field != "" {
 			effectiveSorts = append(effectiveSorts, s)
+			if useOrigIdx {
+				if origIdx < len(after) {
+					effectiveAfter = append(effectiveAfter, after[origIdx])
+				}
+			} else if seqIdx < len(after) {
+				effectiveAfter = append(effectiveAfter, after[seqIdx])
+				seqIdx++
+			}
 		}
 	}
 	if len(sorts) == 0 {
@@ -8503,10 +8634,11 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 			{Entry: esast.SortFieldSpec{Field: "_score", Order: "desc"}},
 			{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}},
 		}
+		effectiveAfter = after
 	}
 	n := len(effectiveSorts)
-	if len(after) < n {
-		n = len(after)
+	if len(effectiveAfter) < n {
+		n = len(effectiveAfter)
 	}
 	if n == 0 {
 		return "TRUE"
@@ -8514,7 +8646,7 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 
 	sortExpr := func(idx int) (string, any, bool, any) {
 		field := effectiveSorts[idx].Entry.Field
-		val := after[idx]
+		val := effectiveAfter[idx]
 		desc := strings.EqualFold(effectiveSorts[idx].Entry.Order, "desc")
 		switch field {
 		case "_score":

@@ -1204,3 +1204,93 @@ func TestRound41PainlessTokenizerMapVarKeyForLoopPlusAndConvertBoolean(t *testin
 		t.Fatalf("F24 expected nested.child removed and nested.keep preserved, got %+v", nestedMap)
 	}
 }
+
+func TestRound42PainlessParamsIsolationBracketAliasCtxMapMutationsAndSortVoid(t *testing.T) {
+	// F21: Lambda params and user function params do not leak into or overwrite caller params
+	params := map[string]any{"x": int64(5), "drop_me": "bye"}
+	val, err := Eval(map[string]any{}, `
+		int f(int x) {
+			params.remove('drop_me');
+			return x * 2;
+		}
+		def arr = [1, 2, 3];
+		arr.removeIf(x -> params.size() != 2 || x == 2);
+		int res = f(10);
+		return [params.x, params.size(), res, arr.size()];
+	`, params)
+	if err != nil {
+		t.Fatalf("F21 Eval failed: %v", err)
+	}
+	resArr, ok := val.([]any)
+	if !ok || len(resArr) != 4 || resArr[0] != int64(5) || resArr[1] != int64(1) || resArr[2] != int64(20) || resArr[3] != int64(2) {
+		t.Fatalf("F21 unexpected result: %+v", val)
+	}
+
+	// F22: Bracket alias tracking (`def tags = ctx._source['tags']`), escaped bracket key, and `params._source.a = 99`
+	doc := map[string]any{
+		"tags": []any{"a"},
+		"a\nb": "line_val",
+		"a":    int64(1),
+	}
+	if err := EvalPainless(doc, `
+		def tags = ctx._source['tags'];
+		tags.add('b');
+		params._source.a = 99;
+		ctx._source.copied = ctx._source['a\nb'];
+	`, nil); err != nil {
+		t.Fatalf("F22 EvalPainless failed: %v", err)
+	}
+	tagsSlice, _ := doc["tags"].([]any)
+	if len(tagsSlice) != 2 || tagsSlice[1] != "b" || doc["a"] != int64(99) || doc["copied"] != "line_val" {
+		t.Fatalf("F22 unexpected doc state: %+v", doc)
+	}
+
+	// F23: Direct map mutations on ctx (`ctx.put`, `ctx.remove`, `ctx.putIfAbsent`, `ctx.putAll`) and clearing MetaID with `ctx._id = ""`
+	updReq := &UpdateRequest{
+		Script: &ScriptSpec{
+			Source: `ctx.put('_routing', 'r2'); ctx.putIfAbsent('_routing', 'r3'); ctx.putAll(['_index': 'idx2']); ctx.remove('_id');`,
+		},
+		MetaID:            "orig-id",
+		MetaIndex:         "idx",
+		AllowMetaMutation: true,
+	}
+	_, _, err = ApplyUpdateWithResult(json.RawMessage(`{"x":1}`), updReq, true)
+	if err != nil {
+		t.Fatalf("F23 ApplyUpdateWithResult failed: %v", err)
+	}
+	if updReq.MetaRouting != "r2" || updReq.MetaID != "" || updReq.MetaIndex != "idx2" {
+		t.Fatalf("F23 expected MetaRouting='r2', MetaID='', MetaIndex='idx2', got MetaRouting=%q MetaID=%q MetaIndex=%q", updReq.MetaRouting, updReq.MetaID, updReq.MetaIndex)
+	}
+	opParams := map[string]any{"__readonly_ctx_meta": true}
+	if _, err := Eval(map[string]any{}, `ctx.put('_id', 'x');`, opParams); err == nil {
+		t.Fatalf("F23 expected readonly _id error on ctx.put")
+	}
+	if _, err := Eval(map[string]any{}, `ctx.remove('_id');`, opParams); err == nil {
+		t.Fatalf("F23 expected readonly _id error on ctx.remove")
+	}
+
+	// F30: List.sort returns nil (void) and propagates comparator errors
+	sortVal, err := Eval(map[string]any{}, `
+		def items = [3, 1, 2];
+		items.sort((a, b) -> a - b);
+	`, nil)
+	if err != nil || sortVal != nil {
+		t.Fatalf("F30 expected nil, nil from trailing items.sort, got val=%v err=%v", sortVal, err)
+	}
+	if _, err := Eval(map[string]any{}, `
+		def items = [3, 1, 2];
+		items.sort((a, b) -> { throw new IllegalArgumentException('bad cmp'); });
+	`, nil); err == nil || !strings.Contains(err.Error(), "bad cmp") {
+		t.Fatalf("F30 expected comparator error from items.sort, got %v", err)
+	}
+	if _, err := Eval(map[string]any{}, `
+		[3, 1, 2].stream().sorted((a, b) -> { throw new IllegalArgumentException('bad stream sort'); }).toList();
+	`, nil); err == nil || !strings.Contains(err.Error(), "bad stream sort") {
+		t.Fatalf("F30 expected comparator error from stream().sorted, got %v", err)
+	}
+	if _, err := Eval(map[string]any{}, `
+		[3, 1, 2].stream().min((a, b) -> { throw new IllegalArgumentException('bad stream min'); });
+	`, nil); err == nil || !strings.Contains(err.Error(), "bad stream min") {
+		t.Fatalf("F30 expected comparator error from stream().min, got %v", err)
+	}
+}

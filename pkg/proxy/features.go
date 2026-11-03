@@ -2369,6 +2369,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						foundAny = true
 					}
 				}
+				if strings.Contains(kp, "*") {
+					if keepMatchingIngestPaths(doc, kept, strings.Split(kp, "."), isInternalIngestKey) {
+						foundAny = true
+					}
+				}
 				if !foundAny && isExplicitIgnoreMissingFalse(specMap) {
 					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", kp)
 				}
@@ -2625,6 +2630,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			} else if arr, isArr := val.([]any); isArr {
 				outArr := make([]any, len(arr))
 				for idx, elem := range arr {
+					if elem == nil {
+						outArr[idx] = nil
+						continue
+					}
 					cv, err := convertSingleIngestValue(elem, convType)
 					if err != nil {
 						return false, false, procType, procTag, specMap, err
@@ -2696,6 +2705,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 		addToRoot, _ := specMap["add_to_root"].(bool)
 		conflictStrategy, _ := specMap["add_to_root_conflict_strategy"].(string)
+		strictParsing := true
+		if sp, ok := specMap["strict_json_parsing"].(bool); ok {
+			strictParsing = sp
+		}
 		if field != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
 				switch v := val.(type) {
@@ -2705,6 +2718,12 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					var parsed any
 					if err := dec.Decode(&parsed); err != nil {
 						return false, false, procType, procTag, specMap, err
+					}
+					if strictParsing {
+						var extra any
+						if err := dec.Decode(&extra); err != io.EOF {
+							return false, false, procType, procTag, specMap, fmt.Errorf("unexpected trailing token in json field [%s]", field)
+						}
 					}
 					if addToRoot {
 						m, ok := parsed.(map[string]any)
@@ -2738,6 +2757,12 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						var parsed any
 						if err := dec.Decode(&parsed); err != nil {
 							return false, false, procType, procTag, specMap, err
+						}
+						if strictParsing {
+							var extra any
+							if err := dec.Decode(&extra); err != io.EOF {
+								return false, false, procType, procTag, specMap, fmt.Errorf("unexpected trailing token in json field [%s]", field)
+							}
 						}
 						outArr[i] = parsed
 					}
@@ -4015,6 +4040,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					}
 					sort.Strings(keys)
 					changedEntries := make(map[string]any)
+					deletedKeys := make(map[string]bool)
 					for _, k := range keys {
 						elem := coll[k]
 						ingestMeta, _ := doc["_ingest"].(map[string]any)
@@ -4039,15 +4065,28 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 							return mutated, true, procType, procTag, specMap, nil
 						}
 						if curIngest, ok := doc["_ingest"].(map[string]any); ok {
-							if newVal, hasVal := curIngest["_value"]; hasVal && !reflect.DeepEqual(newVal, initValSnapshot) {
-								changedEntries[k] = newVal
+							newVal, hasVal := curIngest["_value"]
+							rawKey, hasKey := curIngest["_key"]
+							if !hasVal || !hasKey || rawKey == nil {
+								deletedKeys[k] = true
+							} else {
+								newKey := fmt.Sprintf("%v", rawKey)
+								if newKey != k {
+									deletedKeys[k] = true
+									changedEntries[newKey] = newVal
+								} else if !reflect.DeepEqual(newVal, initValSnapshot) {
+									changedEntries[k] = newVal
+								}
 							}
 						}
 					}
 					restoreIngestVal()
-					if len(changedEntries) > 0 {
+					if len(changedEntries) > 0 || len(deletedKeys) > 0 {
 						if curMapAny, stillExists := getIngestPath(doc, field); stillExists {
 							if curMap, okM := curMapAny.(map[string]any); okM {
+								for dk := range deletedKeys {
+									delete(curMap, dk)
+								}
 								for k, v := range changedEntries {
 									curMap[k] = v
 								}
@@ -4082,8 +4121,37 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			if v, ok := doc["_routing"]; ok && v != nil {
 				origMetaRouting = fmt.Sprintf("%v", v)
 			}
+			origMetaVersion, hadOrigVersion := toInt64(doc["_version"])
+			savedIngestOrig := doc["__internal_ingest_orig"]
+			savedIngestMeta := doc["_ingest"]
+			origMetaMap, _ := savedIngestOrig.(map[string]any)
+			hadUserIndex, _ := origMetaMap["_had_orig_index"].(bool)
+			hadUserID, _ := origMetaMap["_had_orig_id"].(bool)
+			hadUserRouting, _ := origMetaMap["_had_orig_routing"].(bool)
+
+			cleanDoc := make(map[string]any, len(doc))
+			for k, v := range doc {
+				switch k {
+				case "__internal_ingest_orig", "_version":
+					continue
+				case "_index":
+					if !hadUserIndex {
+						continue
+					}
+				case "_id":
+					if !hadUserID {
+						continue
+					}
+				case "_routing":
+					if !hadUserRouting {
+						continue
+					}
+				}
+				cleanDoc[k] = v
+			}
+
 			normSrc := rewriteIngestCtxReferences(src)
-			docBytes, err := json.Marshal(doc)
+			docBytes, err := json.Marshal(cleanDoc)
 			if err == nil {
 				upd := &painless.UpdateRequest{
 					Script: &painless.ScriptSpec{
@@ -4093,6 +4161,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					MetaID:            origMetaID,
 					MetaIndex:         origMetaIndex,
 					MetaRouting:       origMetaRouting,
+					MetaVersion:       origMetaVersion,
 					AllowMetaMutation: true,
 				}
 				mutatedBytes, opRes, err := painless.ApplyUpdateWithResult(docBytes, upd, true)
@@ -4102,7 +4171,58 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				if opRes == "deleted" {
 					return false, true, procType, procTag, specMap, nil
 				}
-				if opRes != "noop" {
+				applyMetaToTarget := func(target map[string]any) bool {
+					metaChanged := upd.MetaIndex != origMetaIndex
+					if upd.MetaIndex == "" {
+						if !hadUserIndex {
+							delete(target, "_index")
+						}
+					} else {
+						target["_index"] = upd.MetaIndex
+					}
+					if upd.MetaID != origMetaID {
+						metaChanged = true
+					}
+					if upd.MetaID == "" {
+						if !hadUserID {
+							delete(target, "_id")
+						}
+					} else {
+						target["_id"] = upd.MetaID
+					}
+					if upd.MetaRouting != origMetaRouting {
+						metaChanged = true
+					}
+					if upd.MetaRouting == "" {
+						if !hadUserRouting {
+							delete(target, "_routing")
+						}
+					} else {
+						target["_routing"] = upd.MetaRouting
+					}
+					if upd.MetaVersionMutated {
+						metaChanged = true
+						if upd.MetaVersionNil {
+							delete(target, "_version")
+						} else {
+							target["_version"] = upd.MetaVersion
+						}
+					} else if hadOrigVersion {
+						target["_version"] = origMetaVersion
+					}
+					if savedIngestOrig != nil {
+						target["__internal_ingest_orig"] = savedIngestOrig
+					}
+					if target["_ingest"] == nil && savedIngestMeta != nil {
+						target["_ingest"] = savedIngestMeta
+					}
+					return metaChanged
+				}
+				if opRes == "noop" {
+					if applyMetaToTarget(doc) {
+						mutated = true
+					}
+				} else {
 					var nextDoc map[string]any
 					dec2 := json.NewDecoder(bytes.NewReader(mutatedBytes))
 					dec2.UseNumber()
@@ -4112,34 +4232,17 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 							case "delete", "drop":
 								return false, true, procType, procTag, specMap, nil
 							case "noop", "none":
-								return false, false, procType, procTag, specMap, nil
+								if applyMetaToTarget(doc) {
+									mutated = true
+								}
+								return mutated, false, procType, procTag, specMap, nil
 							case "index", "create":
 								if !hadOpField {
 									delete(nextDoc, "op")
 								}
 							}
 						}
-						if upd.MetaIndex != origMetaIndex {
-							if upd.MetaIndex == "" {
-								delete(nextDoc, "_index")
-							} else {
-								nextDoc["_index"] = upd.MetaIndex
-							}
-						}
-						if upd.MetaID != origMetaID {
-							if upd.MetaID == "" {
-								delete(nextDoc, "_id")
-							} else {
-								nextDoc["_id"] = upd.MetaID
-							}
-						}
-						if upd.MetaRouting != origMetaRouting {
-							if upd.MetaRouting == "" {
-								delete(nextDoc, "_routing")
-							} else {
-								nextDoc["_routing"] = upd.MetaRouting
-							}
-						}
+						_ = applyMetaToTarget(nextDoc)
 						for k := range doc {
 							delete(doc, k)
 						}
@@ -4323,6 +4426,23 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 				ignoreFail, _ = pMap["ignore_failure"].(bool)
 			}
 			if ignoreFail {
+				if curIngest, ok := doc["_ingest"].(map[string]any); ok {
+					if hadPrevMsg {
+						curIngest["on_failure_message"] = prevMsg
+					} else {
+						delete(curIngest, "on_failure_message")
+					}
+					if hadPrevType {
+						curIngest["on_failure_processor_type"] = prevType
+					} else {
+						delete(curIngest, "on_failure_processor_type")
+					}
+					if hadPrevTag {
+						curIngest["on_failure_processor_tag"] = prevTag
+					} else {
+						delete(curIngest, "on_failure_processor_tag")
+					}
+				}
 				continue
 			}
 			onFail, _ := specMap["on_failure"].([]any)
@@ -4437,15 +4557,13 @@ func applyIngestPipelineSpecWithRouting(s *Server, pipe map[string]any, indexNam
 		ingestMeta["timestamp"] = time.Now().UTC().Format(time.RFC3339Nano)
 	}
 	doc["_ingest"] = ingestMeta
-	if verbose {
-		doc["__internal_ingest_orig"] = map[string]any{
-			"_had_orig_index":   hadOrigIndex,
-			"_orig_index_val":   origIndexVal,
-			"_had_orig_id":      hadOrigID,
-			"_orig_id_val":      origIDVal,
-			"_had_orig_routing": hadOrigRouting,
-			"_orig_routing_val": origRoutingVal,
-		}
+	doc["__internal_ingest_orig"] = map[string]any{
+		"_had_orig_index":   hadOrigIndex,
+		"_orig_index_val":   origIndexVal,
+		"_had_orig_id":      hadOrigID,
+		"_orig_id_val":      origIDVal,
+		"_had_orig_routing": hadOrigRouting,
+		"_orig_routing_val": origRoutingVal,
 	}
 
 	var trace []map[string]any
@@ -4466,15 +4584,13 @@ func applyIngestPipelineSpecWithRouting(s *Server, pipe map[string]any, indexNam
 			}
 			ingestMeta["on_failure_message"] = procErr.Error()
 			doc["_ingest"] = ingestMeta
-			if verbose {
-				doc["__internal_ingest_orig"] = map[string]any{
-					"_had_orig_index":   hadOrigIndex,
-					"_orig_index_val":   origIndexVal,
-					"_had_orig_id":      hadOrigID,
-					"_orig_id_val":      origIDVal,
-					"_had_orig_routing": hadOrigRouting,
-					"_orig_routing_val": origRoutingVal,
-				}
+			doc["__internal_ingest_orig"] = map[string]any{
+				"_had_orig_index":   hadOrigIndex,
+				"_orig_index_val":   origIndexVal,
+				"_had_orig_id":      hadOrigID,
+				"_orig_id_val":      origIDVal,
+				"_had_orig_routing": hadOrigRouting,
+				"_orig_routing_val": origRoutingVal,
 			}
 			mutated = true
 			subMut, subDropped, subErr := runIngestProcessorList(s, doc, pipeOnFail, 1, tracePtr)
@@ -4712,6 +4828,13 @@ func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Req
 }
 
 func convertSingleIngestValue(val any, convType string) (any, error) {
+	if val == nil {
+		return nil, nil
+	}
+	switch val.(type) {
+	case map[string]any, []any:
+		return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
+	}
 	str := strings.TrimSpace(fmt.Sprintf("%v", val))
 	switch strings.ToLower(convType) {
 	case "integer", "int", "long":
@@ -5036,12 +5159,59 @@ func setIngestPath(doc map[string]any, path string, val any) {
 	}
 }
 
+func keepMatchingIngestPaths(src, dst map[string]any, patternSegs []string, isInternal func(string) bool) bool {
+	if len(patternSegs) == 0 || src == nil || dst == nil {
+		return false
+	}
+	seg := patternSegs[0]
+	matchedAny := false
+	for k, v := range src {
+		if isInternal != nil && isInternal(k) {
+			continue
+		}
+		if len(patternSegs) > 1 {
+			joinedKey := strings.Join(patternSegs, ".")
+			if matchWildcardPattern(joinedKey, k) {
+				dst[k] = deepCloneIngestValue(v)
+				matchedAny = true
+				continue
+			}
+		}
+		if !matchWildcardPattern(seg, k) {
+			continue
+		}
+		if len(patternSegs) == 1 {
+			dst[k] = deepCloneIngestValue(v)
+			matchedAny = true
+			continue
+		}
+		if subSrc, ok := v.(map[string]any); ok {
+			subDst, _ := dst[k].(map[string]any)
+			created := false
+			if subDst == nil {
+				subDst = make(map[string]any)
+				created = true
+			}
+			if keepMatchingIngestPaths(subSrc, subDst, patternSegs[1:], nil) {
+				if created {
+					dst[k] = subDst
+				}
+				matchedAny = true
+			}
+		}
+	}
+	return matchedAny
+}
+
 func deleteIngestPath(doc map[string]any, path string) {
 	delete(doc, path)
 	segs := strings.Split(path, ".")
 	if len(segs) <= 1 {
 		return
 	}
+	var parent any
+	var parentKey string
+	var parentIdx int
 	var curr any = doc
 	for i := 0; i < len(segs)-1; i++ {
 		switch node := curr.(type) {
@@ -5054,19 +5224,36 @@ func deleteIngestPath(doc map[string]any, path string) {
 			if !exists {
 				return
 			}
+			parent = node
+			parentKey = segs[i]
 			curr = next
 		case []any:
 			idx, ok := parseIngestSliceIndex(segs[i], len(node))
 			if !ok {
 				return
 			}
+			parent = node
+			parentIdx = idx
 			curr = node[idx]
 		default:
 			return
 		}
 	}
-	if node, ok := curr.(map[string]any); ok {
-		delete(node, segs[len(segs)-1])
+	lastSeg := segs[len(segs)-1]
+	switch node := curr.(type) {
+	case map[string]any:
+		delete(node, lastSeg)
+	case []any:
+		if idx, ok := parseIngestSliceIndex(lastSeg, len(node)); ok {
+			updated := append([]any{}, node[:idx]...)
+			updated = append(updated, node[idx+1:]...)
+			switch p := parent.(type) {
+			case map[string]any:
+				p[parentKey] = updated
+			case []any:
+				p[parentIdx] = updated
+			}
+		}
 	}
 }
 

@@ -405,15 +405,35 @@ func validatePropertiesCompatibility(oldProps, newProps map[string]esast.FieldPr
 			continue
 		}
 		oldType := strings.ToLower(strings.TrimSpace(oldProp.Type))
-		if oldType == "" && len(oldProp.Properties) > 0 {
+		if oldType == "" && (len(oldProp.Properties) > 0 || oldProp.Enabled != nil) {
 			oldType = "object"
 		}
 		newType := strings.ToLower(strings.TrimSpace(newProp.Type))
-		if newType == "" && len(newProp.Properties) > 0 {
+		if newType == "" && (len(newProp.Properties) > 0 || newProp.Enabled != nil) {
 			newType = "object"
 		}
 		if oldType != "" && newType != "" && oldType != newType {
 			return fmt.Errorf("mapper [%s] cannot be changed from type [%s] to [%s]", fullPath, oldType, newType)
+		}
+		if oldProp.Enabled != nil && newProp.Enabled != nil && *oldProp.Enabled != *newProp.Enabled {
+			return fmt.Errorf("mapper [%s] enabled cannot be changed from [%v] to [%v]", fullPath, *oldProp.Enabled, *newProp.Enabled)
+		}
+		if oldProp.Path != "" && newProp.Path != "" && oldProp.Path != newProp.Path {
+			return fmt.Errorf("cannot change path of alias [%s] from [%s] to [%s]", fullPath, oldProp.Path, newProp.Path)
+		}
+		oldDims := oldProp.Dims
+		if oldDims == 0 {
+			oldDims = oldProp.Dimension
+		}
+		newDims := newProp.Dims
+		if newDims == 0 {
+			newDims = newProp.Dimension
+		}
+		if oldDims > 0 && newDims > 0 && oldDims != newDims {
+			return fmt.Errorf("cannot update parameter [dims] from [%d] to [%d] for field [%s]", oldDims, newDims, fullPath)
+		}
+		if oldProp.ScalingFactor > 0 && newProp.ScalingFactor > 0 && oldProp.ScalingFactor != newProp.ScalingFactor {
+			return fmt.Errorf("cannot update parameter [scaling_factor] from [%v] to [%v] for field [%s]", oldProp.ScalingFactor, newProp.ScalingFactor, fullPath)
 		}
 		if len(oldProp.Fields) > 0 && len(newProp.Fields) > 0 {
 			if err := validatePropertiesCompatibility(oldProp.Fields, newProp.Fields, fullPath); err != nil {

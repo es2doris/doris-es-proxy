@@ -1191,6 +1191,31 @@ type BoolQuery struct {
 	Boost              *float64   `json:"boost,omitempty"`
 }
 
+func (bq *BoolQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	for k := range raw {
+		switch k {
+		case "must", "filter", "should", "must_not", "minimum_should_match", "boost", "_name", "adjust_pure_negative":
+		default:
+			return fmt.Errorf("parsing_exception: [bool] unknown field [%s]", k)
+		}
+	}
+	type plain BoolQuery
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	*bq = BoolQuery(p)
+	return nil
+}
+
 // QuerySlice unmarshals either a single Query object `{...}` or an array of Query objects `[{...}]`.
 type QuerySlice []Query
 
@@ -1207,6 +1232,9 @@ func (qs *QuerySlice) UnmarshalJSON(data []byte) error {
 		}
 		*qs = list
 		return nil
+	}
+	if trimmed[0] != '{' {
+		return fmt.Errorf("parsing_exception: [bool] query clause must be an object or array of objects")
 	}
 	var single Query
 	if err := json.Unmarshal(trimmed, &single); err != nil {

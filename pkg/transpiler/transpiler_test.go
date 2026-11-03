@@ -2269,3 +2269,103 @@ func TestRound41TranspilerNestedNotIndexedLuceneMetaSortUnmappedAndPhraseSlop(t 
 		t.Fatalf("F10 expected MATCH_PHRASE 'quick fox ~2' in HitsSQL, got:\n%s", mmPlan.HitsSQL)
 	}
 }
+
+func TestRound42LuceneDocValuesScaledFloatSortSearchAfterTermsSetDedupAndNullValueMatch(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"title": {"type": "text"},
+			"status": {"type": "keyword", "null_value": "missing"},
+			"tag": {"type": "keyword"},
+			"no_dv": {"type": "integer", "doc_values": false},
+			"price": {"type": "scaled_float", "scaling_factor": 100}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("unmarshal spec failed: %v", err)
+	}
+	sch := schema.CompileIndexSchema("db", "r42_tr", &spec)
+	tr := NewTranspiler(sch, TranspilerOptions{})
+
+	// F6: default_operator: OR with +title:hello and status:open AND NOT status:closed preserves Must and MustNot
+	var luceneNotReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"query": {
+			"query_string": {
+				"default_operator": "OR",
+				"query": "+title:hello status:open AND NOT status:closed"
+			}
+		}
+	}`), &luceneNotReq)
+	cqNot := tr.CompileQuery(luceneNotReq.Query, false, nil)
+	if !strings.Contains(cqNot.WhereSQL, "open") || !strings.Contains(cqNot.WhereSQL, "NOT") || !strings.Contains(cqNot.WhereSQL, "closed") || !strings.Contains(cqNot.WhereSQL, "hello") {
+		t.Fatalf("F6 expected status:open, NOT status:closed, and +title:hello in WhereSQL, got:\n%s", cqNot.WhereSQL)
+	}
+
+	// F7: doc_values: false validation enforced on script doc['no_dv'], field_value_factor, terms_set.minimum_should_match_field, and aggregations
+	dvInvalidReqs := []string{
+		`{"query": {"script_score": {"query": {"match_all": {}}, "script": {"source": "doc['no_dv'].value * 2"}}}}`,
+		`{"query": {"function_score": {"query": {"match_all": {}}, "field_value_factor": {"field": "no_dv"}}}}`,
+		`{"query": {"terms_set": {"tag": {"terms": ["a", "b"], "minimum_should_match_field": "no_dv"}}}}`,
+		`{"size": 0, "aggs": {"st": {"significant_terms": {"field": "no_dv"}}}}`,
+		`{"size": 0, "aggs": {"tm": {"top_metrics": {"metrics": {"field": "no_dv"}, "sort": [{"tag": "asc"}]}}}}`,
+		`{"size": 0, "aggs": {"bp": {"boxplot": {"field": "no_dv"}}}}`,
+	}
+	for _, rawReq := range dvInvalidReqs {
+		var req esast.SearchRequest
+		if err := json.Unmarshal([]byte(rawReq), &req); err != nil {
+			t.Fatalf("unmarshal %s failed: %v", rawReq, err)
+		}
+		trDV := NewTranspiler(sch, TranspilerOptions{})
+		if _, err := trDV.BuildSearchPlan(&req); err == nil || !strings.Contains(err.Error(), "doc_values") {
+			t.Fatalf("F7 expected doc_values error for %s, got %v", rawReq, err)
+		}
+	}
+
+	// F8 & F9: Sort missing: "10.556" and search_after on scaled_float apply scaling_factor,
+	// and compileSearchAfterPredicate skips ignore_unmapped: true unmapped sort fields without emitting WHERE FALSE
+	var sortAfterReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"sort": [
+			{"unmapped_sort": {"order": "asc", "ignore_unmapped": true}},
+			{"price": {"order": "asc", "missing": "10.556"}}
+		],
+		"search_after": ["ignored_cursor", 12.346]
+	}`), &sortAfterReq)
+	planSA, err := tr.BuildSearchPlan(&sortAfterReq)
+	if err != nil {
+		t.Fatalf("F8/F9 BuildSearchPlan failed: %v", err)
+	}
+	if strings.Contains(planSA.HitsSQL, "WHERE FALSE") || !strings.Contains(planSA.HitsSQL, "10.56") || !strings.Contains(planSA.HitsSQL, "12.35") {
+		t.Fatalf("F8/F9 expected scaled missing (10.56) and search_after (12.35) without WHERE FALSE, got:\n%s", planSA.HitsSQL)
+	}
+
+	// F10: terms_set deduplicates duplicate terms, and compileMatchField on keyword with null_value includes IS NULL
+	var tsDedupReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"query": {
+			"terms_set": {
+				"tag": {
+					"terms": ["go", "go"],
+					"minimum_should_match_script": {"source": "2"}
+				}
+			}
+		}
+	}`), &tsDedupReq)
+	cqTS := tr.CompileQuery(tsDedupReq.Query, false, nil)
+	if strings.Count(cqTS.WhereSQL, "CAST(COALESCE") != 1 {
+		t.Fatalf("F10 expected deduplicated 'go' term in terms_set WhereSQL, got:\n%s", cqTS.WhereSQL)
+	}
+
+	var matchNullValReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"query": {
+			"match": {
+				"status": "missing"
+			}
+		}
+	}`), &matchNullValReq)
+	cqNullMatch := tr.CompileQuery(matchNullValReq.Query, false, nil)
+	if !strings.Contains(cqNullMatch.WhereSQL, "= 'missing'") || strings.Contains(cqNullMatch.WhereSQL, "MATCH_ANY") {
+		t.Fatalf("F10 expected match on keyword with null_value='missing' to use term equality (= 'missing'), got:\n%s", cqNullMatch.WhereSQL)
+	}
+}
