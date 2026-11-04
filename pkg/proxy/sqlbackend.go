@@ -119,6 +119,7 @@ func rewriteDorisArrayExists(q string) string {
 	var out strings.Builder
 	out.Grow(len(q) + 64)
 	inOuterQuote := false
+	inOuterDoubleQuote := false
 	inOuterBacktick := false
 	i := 0
 	for i < len(q) {
@@ -141,6 +142,19 @@ func rewriteDorisArrayExists(q string) string {
 			i++
 			continue
 		}
+		if inOuterDoubleQuote {
+			if ch == '\\' && i+1 < len(q) {
+				out.WriteString(q[i : i+2])
+				i += 2
+				continue
+			}
+			if ch == '"' {
+				inOuterDoubleQuote = false
+			}
+			out.WriteByte(ch)
+			i++
+			continue
+		}
 		if inOuterBacktick {
 			if ch == '`' {
 				inOuterBacktick = false
@@ -151,6 +165,12 @@ func rewriteDorisArrayExists(q string) string {
 		}
 		if ch == '\'' {
 			inOuterQuote = true
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+		if ch == '"' {
+			inOuterDoubleQuote = true
 			out.WriteByte(ch)
 			i++
 			continue
@@ -169,6 +189,7 @@ func rewriteDorisArrayExists(q string) string {
 		start := i + len(prefix)
 		depth := 1
 		inQuote := false
+		inDoubleQuote := false
 		inBacktick := false
 		j := start
 		lastTopComma := -1
@@ -186,6 +207,14 @@ func rewriteDorisArrayExists(q string) string {
 					}
 					inQuote = false
 				}
+			} else if inDoubleQuote {
+				if c == '\\' && j+1 < len(q) {
+					j += 2
+					continue
+				}
+				if c == '"' {
+					inDoubleQuote = false
+				}
 			} else if inBacktick {
 				if c == '`' {
 					inBacktick = false
@@ -194,6 +223,8 @@ func rewriteDorisArrayExists(q string) string {
 				switch c {
 				case '\'':
 					inQuote = true
+				case '"':
+					inDoubleQuote = true
 				case '`':
 					inBacktick = true
 				case '(':

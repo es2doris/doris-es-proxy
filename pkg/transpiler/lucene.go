@@ -542,7 +542,7 @@ func parseLuceneTokensToASTWithFlags(tokens []string, defaultField string, field
 	}
 
 	tokens = merged
-	hasAND, hasOR, hasExplicitOR, hasUnary := false, false, false, false
+	hasAND, hasOR, hasExplicitOR, hasNegUnary, hasPlusUnary := false, false, false, false, false
 	var normalizedTokens []string
 	prevWasClause = false
 	for _, tok := range tokens {
@@ -556,13 +556,17 @@ func parseLuceneTokensToASTWithFlags(tokens []string, defaultField string, field
 			prevWasClause = false
 			tok = "\x00OR"
 		} else if isLuceneStandaloneNot(tok, isSimple, flags) {
-			hasUnary = true
+			hasNegUnary = true
 			prevWasClause = false
 			tok = "\x00NOT"
 		} else {
 			isUnaryPrefix := isLuceneUnaryPrefixed(tok, isSimple, flags)
 			if isUnaryPrefix {
-				hasUnary = true
+				if strings.HasPrefix(tok, "+") {
+					hasPlusUnary = true
+				} else {
+					hasNegUnary = true
+				}
 			}
 			if prevWasClause && defaultOp == "OR" && !isUnaryPrefix {
 				normalizedTokens = append(normalizedTokens, "\x00OR")
@@ -574,8 +578,8 @@ func parseLuceneTokensToASTWithFlags(tokens []string, defaultField string, field
 	}
 	tokens = normalizedTokens
 
-	// In Lucene grammar, `AND` (and unary `NOT`/`+`/`-`) binds tighter than `OR` (e.g., `a:1 AND b:2 OR c:3` -> `(a:1 AND b:2) OR c:3`).
-	if (hasAND || defaultOp == "AND" || (hasExplicitOR && hasUnary)) && hasOR {
+	// In Lucene grammar, `AND` binds tighter than `OR` (e.g., `a:1 AND b:2 OR c:3` -> `(a:1 AND b:2) OR c:3`).
+	if (hasAND || (defaultOp == "AND" && (!hasExplicitOR || !hasPlusUnary)) || (hasExplicitOR && hasNegUnary)) && hasOR {
 		var orGroups [][]string
 		var curGroup []string
 		for _, tok := range tokens {
@@ -1219,6 +1223,46 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 
 	if !isSimple {
 		if rc := parseLuceneRangeToken(token, boost); rc != nil {
+			if rc.GTE == nil && rc.GT == nil && rc.LTE == nil && rc.LT == nil {
+				if len(fields) > 0 {
+					var shoulds []esast.Query
+					for _, fpat := range fields {
+						fname, fBoost := splitLuceneBoost(fpat)
+						effBoost := boost * fBoost
+						if fname == "*" || fname == "_all_text" {
+							if effBoost != 1.0 {
+								b := effBoost
+								shoulds = append(shoulds, esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: esast.Query{MatchAll: map[string]any{}}, Boost: &b}})
+							} else {
+								shoulds = append(shoulds, esast.Query{MatchAll: map[string]any{}})
+							}
+						} else if effBoost != 1.0 {
+							b := effBoost
+							shoulds = append(shoulds, esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: esast.Query{Exists: &esast.ExistsQuery{Field: fname}}, Boost: &b}})
+						} else {
+							shoulds = append(shoulds, esast.Query{Exists: &esast.ExistsQuery{Field: fname}})
+						}
+					}
+					if len(shoulds) == 1 {
+						return shoulds[0]
+					}
+					if len(shoulds) > 1 {
+						return esast.Query{Bool: &esast.BoolQuery{Should: shoulds}}
+					}
+				}
+				if defaultField == "" || defaultField == "*" || defaultField == "_all_text" {
+					if boost != 1.0 {
+						b := boost
+						return esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: esast.Query{MatchAll: map[string]any{}}, Boost: &b}}
+					}
+					return esast.Query{MatchAll: map[string]any{}}
+				}
+				if boost != 1.0 {
+					b := boost
+					return esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: esast.Query{Exists: &esast.ExistsQuery{Field: defaultField}}, Boost: &b}}
+				}
+				return esast.Query{Exists: &esast.ExistsQuery{Field: defaultField}}
+			}
 			if flags.timeZone != "" && rc.TimeZone == "" {
 				rc.TimeZone = flags.timeZone
 			}

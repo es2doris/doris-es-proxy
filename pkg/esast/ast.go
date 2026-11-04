@@ -995,7 +995,23 @@ func (tq *TermsQuery) UnmarshalJSON(data []byte) error {
 	for k, v := range raw {
 		trimmed := bytes.TrimSpace(v)
 		if k == "boost" && len(trimmed) > 0 && trimmed[0] != '[' && trimmed[0] != '{' {
-			_ = json.Unmarshal(v, &tq.Boost)
+			var b float64
+			parsed := false
+			if json.Unmarshal(trimmed, &b) == nil {
+				parsed = true
+			} else if trimmed[0] == '"' {
+				var s string
+				if json.Unmarshal(trimmed, &s) == nil {
+					if fv, err := strconv.ParseFloat(strings.TrimSpace(s), 64); err == nil {
+						b = fv
+						parsed = true
+					}
+				}
+			}
+			if !parsed || math.IsNaN(b) || math.IsInf(b, 0) || b < 0 {
+				return fmt.Errorf("parsing_exception: [terms] invalid boost value: %s", string(trimmed))
+			}
+			tq.Boost = b
 			tq.HasBoost = true
 			continue
 		}
@@ -1041,10 +1057,10 @@ func (tq *TermsQuery) UnmarshalJSON(data []byte) error {
 
 // TermsSetEntry models a `terms_set` query on a field.
 type TermsSetEntry struct {
-	Terms                    []any          `json:"terms"`
-	MinimumShouldMatchField  string         `json:"minimum_should_match_field,omitempty"`
-	MinimumShouldMatchScript map[string]any `json:"minimum_should_match_script,omitempty"`
-	Boost                    *float64       `json:"boost,omitempty"`
+	Terms                    []any    `json:"terms"`
+	MinimumShouldMatchField  string   `json:"minimum_should_match_field,omitempty"`
+	MinimumShouldMatchScript any      `json:"minimum_should_match_script,omitempty"`
+	Boost                    *float64 `json:"boost,omitempty"`
 }
 
 // FuzzyEntry models a `fuzzy` query (`{"fuzzy": {"name": "alice"}}` or `{"fuzzy": {"name": {"value": "alice", "fuzziness": "AUTO"}}}`).
@@ -1141,10 +1157,10 @@ func (cfq *CombinedFieldsQuery) UnmarshalJSON(data []byte) error {
 
 // ScriptScoreQuery models an ES `script_score` query (`{"script_score": {"query": {...}, "script": {...}}}`).
 type ScriptScoreQuery struct {
-	Query    *Query         `json:"query,omitempty"`
-	Script   map[string]any `json:"script,omitempty"`
-	MinScore *float64       `json:"min_score,omitempty"`
-	Boost    *float64       `json:"boost,omitempty"`
+	Query    *Query   `json:"query,omitempty"`
+	Script   any      `json:"script,omitempty"`
+	MinScore *float64 `json:"min_score,omitempty"`
+	Boost    *float64 `json:"boost,omitempty"`
 }
 
 // ScriptQuery models an ES `script` filter query (`{"script": {"script": {...}}}`).
@@ -2707,8 +2723,14 @@ func (s SortSpec) MarshalJSON() ([]byte, error) {
 		if s.Entry.Type != "" {
 			inner["type"] = s.Entry.Type
 		}
+		if s.Entry.Mode != "" {
+			inner["mode"] = s.Entry.Mode
+		}
 		if s.Entry.Missing != "" {
 			inner["missing"] = s.Entry.Missing
+		}
+		if s.Entry.Nested != nil {
+			inner["nested"] = s.Entry.Nested
 		}
 		return json.Marshal(map[string]any{"_script": inner})
 	}
@@ -2901,24 +2923,83 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 	if rawVal, ok := m["_script"]; ok {
 		order := "asc"
 		var obj struct {
-			Order   string `json:"order"`
-			Script  any    `json:"script"`
-			Type    string `json:"type"`
-			Missing any    `json:"missing"`
+			Order        string          `json:"order"`
+			Script       any             `json:"script"`
+			Type         string          `json:"type"`
+			Mode         string          `json:"mode"`
+			Missing      any             `json:"missing"`
+			Nested       *NestedSortSpec `json:"nested"`
+			NestedPath   string          `json:"nested_path"`
+			NestedFilter *Query          `json:"nested_filter"`
 		}
 		_ = json.Unmarshal(rawVal, &obj)
 		if obj.Order != "" {
 			order = strings.ToLower(obj.Order)
-		}
-		missing := ""
-		if obj.Missing != nil {
-			if fv, ok := obj.Missing.(float64); ok && fv == math.Trunc(fv) && !math.IsInf(fv, 0) && !math.IsNaN(fv) {
-				missing = strconv.FormatInt(int64(fv), 10)
-			} else {
-				missing = fmt.Sprintf("%v", obj.Missing)
+		} else if ordRaw, hasOrd := m["order"]; hasOrd {
+			var ordStr string
+			if json.Unmarshal(ordRaw, &ordStr) == nil && ordStr != "" {
+				order = strings.ToLower(ordStr)
 			}
 		}
-		s.Entry = SortFieldSpec{Field: "_script", Order: order, Script: obj.Script, Type: obj.Type, Missing: missing}
+		scriptType := obj.Type
+		if scriptType == "" {
+			if typeRaw, hasType := m["type"]; hasType {
+				_ = json.Unmarshal(typeRaw, &scriptType)
+			}
+		}
+		mode := strings.ToLower(obj.Mode)
+		if mode == "" {
+			if modeRaw, hasMode := m["mode"]; hasMode {
+				var modeStr string
+				if json.Unmarshal(modeRaw, &modeStr) == nil && modeStr != "" {
+					mode = strings.ToLower(modeStr)
+				}
+			}
+		}
+		missingVal := obj.Missing
+		if missingVal == nil {
+			if missRaw, hasMiss := m["missing"]; hasMiss {
+				_ = json.Unmarshal(missRaw, &missingVal)
+			}
+		}
+		missing := formatFlexibleScalarString(missingVal)
+		nestedSpec := obj.Nested
+		if nestedSpec == nil && (obj.NestedPath != "" || obj.NestedFilter != nil) {
+			nestedSpec = &NestedSortSpec{Path: obj.NestedPath, Filter: obj.NestedFilter}
+		}
+		if nestedSpec == nil {
+			if rawNested, hasNested := m["nested"]; hasNested {
+				var ns NestedSortSpec
+				if json.Unmarshal(rawNested, &ns) == nil && (ns.Path != "" || ns.Filter != nil) {
+					nestedSpec = &ns
+				}
+			}
+		}
+		if nestedSpec == nil {
+			var np string
+			var nf *Query
+			if rawNP, ok := m["nested_path"]; ok {
+				_ = json.Unmarshal(rawNP, &np)
+			}
+			if rawNF, ok := m["nested_filter"]; ok {
+				var q Query
+				if json.Unmarshal(rawNF, &q) == nil {
+					nf = &q
+				}
+			}
+			if np != "" || nf != nil {
+				nestedSpec = &NestedSortSpec{Path: np, Filter: nf}
+			}
+		}
+		s.Entry = SortFieldSpec{
+			Field:   "_script",
+			Order:   order,
+			Script:  obj.Script,
+			Type:    scriptType,
+			Mode:    mode,
+			Missing: missing,
+			Nested:  nestedSpec,
+		}
 		return nil
 	}
 	if rawVal, ok := m["_geo_distance"]; ok {

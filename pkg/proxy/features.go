@@ -1037,6 +1037,10 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 		if body == nil {
 			body = map[string]any{"description": "doris-es-proxy compatibility pipeline", "processors": []any{}}
 		}
+		if err := validateIngestPipelineSpec(body); err != nil {
+			writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+			return
+		}
 		s.mu.Lock()
 		if s.pipelines == nil {
 			s.pipelines = make(map[string]map[string]any)
@@ -1080,6 +1084,55 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
 	}
+}
+
+func validateIngestPipelineProcessors(procs []any) error {
+	for _, p := range procs {
+		pm, ok := p.(map[string]any)
+		if !ok {
+			continue
+		}
+		for procType, rawSpec := range pm {
+			specMap, ok := rawSpec.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch procType {
+			case "json":
+				addToRoot, _ := specMap["add_to_root"].(bool)
+				tf, _ := specMap["target_field"].(string)
+				if addToRoot && strings.TrimSpace(tf) != "" {
+					return fmt.Errorf("cannot specify both [target_field] and [add_to_root]")
+				}
+			case "fingerprint":
+				fieldsAny, hasFields := specMap["fields"].([]any)
+				exclAny, hasExcl := specMap["exclude_fields"].([]any)
+				if (hasFields && hasExcl) && (len(fieldsAny) > 0 || len(exclAny) > 0) {
+					return fmt.Errorf("cannot specify both [fields] and [exclude_fields]")
+				}
+			}
+			if onFail, ok := specMap["on_failure"].([]any); ok {
+				if err := validateIngestPipelineProcessors(onFail); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func validateIngestPipelineSpec(body map[string]any) error {
+	if procs, ok := body["processors"].([]any); ok {
+		if err := validateIngestPipelineProcessors(procs); err != nil {
+			return err
+		}
+	}
+	if onFail, ok := body["on_failure"].([]any); ok {
+		if err := validateIngestPipelineProcessors(onFail); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func ingestErrorType(err error) string {
@@ -1205,9 +1258,17 @@ func scanRegexLiteralEnd(s string, slashIdx int) int {
 }
 
 func rewriteIngestCtxReferences(s string) string {
+	return rewriteIngestCtxReferencesWithOp(s, true)
+}
+
+func rewriteIngestCtxReferencesWithOp(s string, preserveOp bool) string {
 	var out strings.Builder
 	out.Grow(len(s) + 16)
 	inQuotes := byte(0)
+	directKws := []string{"_source", "_now", "_index", "_id", "_routing", "_version"}
+	if preserveOp {
+		directKws = append(directKws, "op")
+	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if inQuotes != 0 {
@@ -1259,7 +1320,7 @@ func rewriteIngestCtxReferences(s string) string {
 		if (i == 0 || (!isIngestIdentByte(s[i-1]) && s[i-1] != '.')) && strings.HasPrefix(s[i:], "ctx") {
 			rest := s[i+3:]
 			isDirectDot := func(after string) bool {
-				for _, kw := range []string{"_source", "_now", "_index", "_id", "_routing", "_version"} {
+				for _, kw := range directKws {
 					if strings.HasPrefix(after, kw) && (len(after) == len(kw) || !isIngestIdentByte(after[len(kw)])) {
 						return true
 					}
@@ -1267,7 +1328,7 @@ func rewriteIngestCtxReferences(s string) string {
 				return false
 			}
 			isDirectBracket := func(after string) bool {
-				for _, kw := range []string{"_source", "_now", "_index", "_id", "_routing", "_version"} {
+				for _, kw := range directKws {
 					if strings.HasPrefix(after, "'"+kw+"'") || strings.HasPrefix(after, `"`+kw+`"`) {
 						return true
 					}
@@ -1311,8 +1372,10 @@ func rewriteIngestCtxReferences(s string) string {
 
 func hasTopLevelSemicolonOrReturn(s string) bool {
 	trimmed := strings.TrimSpace(s)
-	if strings.HasPrefix(trimmed, "return ") || strings.HasPrefix(trimmed, "return(") || strings.HasPrefix(trimmed, "return;") {
-		return true
+	for _, kw := range []string{"return", "if", "for", "while", "switch", "try", "do", "def", "int", "long", "double", "float", "boolean", "String", "List", "Map", "Set", "Object"} {
+		if strings.HasPrefix(trimmed, kw) && (len(trimmed) == len(kw) || trimmed[len(kw)] == ' ' || trimmed[len(kw)] == '\t' || trimmed[len(kw)] == '\n' || trimmed[len(kw)] == '(' || trimmed[len(kw)] == '{' || trimmed[len(kw)] == ';') {
+			return true
+		}
 	}
 	inQuotes := byte(0)
 	depth := 0
@@ -1356,6 +1419,9 @@ func hasTopLevelSemicolonOrReturn(s string) bool {
 				}
 			}
 		}
+		if (i == 0 || (!isIngestIdentByte(s[i-1]) && s[i-1] != '.')) && strings.HasPrefix(s[i:], "return") && (i+6 == len(s) || !isIngestIdentByte(s[i+6])) {
+			return true
+		}
 		switch c {
 		case '(', '[', '{':
 			depth++
@@ -1363,7 +1429,7 @@ func hasTopLevelSemicolonOrReturn(s string) bool {
 			if depth > 0 {
 				depth--
 			}
-		case ';':
+		case ';', '\n':
 			if depth == 0 && strings.TrimSpace(s[i+1:]) != "" {
 				return true
 			}
@@ -2699,11 +2765,15 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 	case "json":
 		field, _ := specMap["field"].(string)
 		field = expandIngestFieldName(field, doc)
-		target := field
-		if tf, _ := specMap["target_field"].(string); tf != "" {
-			target = expandIngestFieldName(tf, doc)
-		}
+		rawTF, _ := specMap["target_field"].(string)
 		addToRoot, _ := specMap["add_to_root"].(bool)
+		if addToRoot && strings.TrimSpace(rawTF) != "" {
+			return false, false, procType, procTag, specMap, fmt.Errorf("cannot specify both [target_field] and [add_to_root]")
+		}
+		target := field
+		if rawTF != "" {
+			target = expandIngestFieldName(rawTF, doc)
+		}
 		conflictStrategy, _ := specMap["add_to_root_conflict_strategy"].(string)
 		strictParsing := true
 		if sp, ok := specMap["strict_json_parsing"].(bool); ok {
@@ -2730,10 +2800,18 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						if !ok {
 							return false, false, procType, procTag, specMap, fmt.Errorf("json must be an object when [add_to_root] is true")
 						}
+						cleanM := make(map[string]any, len(m))
+						for k, mv := range m {
+							switch k {
+							case "_ingest", "__internal_ingest_orig", "_index", "_id", "_routing", "_version":
+								continue
+							}
+							cleanM[k] = mv
+						}
 						if strings.EqualFold(strings.TrimSpace(conflictStrategy), "merge") {
-							deepMergeIngestMap(doc, m)
+							deepMergeIngestMap(doc, cleanM)
 						} else {
-							for k, mv := range m {
+							for k, mv := range cleanM {
 								doc[k] = mv
 							}
 						}
@@ -3448,20 +3526,71 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			}
 		}
 	case "fingerprint":
-		fieldsAny, _ := specMap["fields"].([]any)
+		fieldsAny, hasFields := specMap["fields"].([]any)
+		excludeFieldsAny, hasExclude := specMap["exclude_fields"].([]any)
+		if hasFields && hasExclude && (len(fieldsAny) > 0 || len(excludeFieldsAny) > 0) {
+			return false, false, procType, procTag, specMap, fmt.Errorf("cannot specify both [fields] and [exclude_fields]")
+		}
 		target := "fingerprint"
 		if tf, _ := specMap["target_field"].(string); tf != "" {
 			target = expandIngestFieldName(tf, doc)
 		}
 		method, _ := specMap["method"].(string)
 		salt, _ := specMap["salt"].(string)
-		if len(fieldsAny) > 0 {
-			var fields []string
-			for _, f := range fieldsAny {
-				if fs, ok := f.(string); ok && fs != "" {
-					fields = append(fields, expandIngestFieldName(fs, doc))
+		excludeSet := make(map[string]bool, len(excludeFieldsAny))
+		for _, ef := range excludeFieldsAny {
+			if efs, ok := ef.(string); ok && efs != "" {
+				excludeSet[expandIngestFieldName(efs, doc)] = true
+			}
+		}
+		isExcludedPath := func(p string) bool {
+			if excludeSet[p] {
+				return true
+			}
+			for ex := range excludeSet {
+				if strings.HasPrefix(p, ex+".") {
+					return true
 				}
 			}
+			return false
+		}
+		var fields []string
+		if len(fieldsAny) > 0 {
+			for _, f := range fieldsAny {
+				if fs, ok := f.(string); ok && fs != "" {
+					expF := expandIngestFieldName(fs, doc)
+					if !isExcludedPath(expF) {
+						fields = append(fields, expF)
+					}
+				}
+			}
+		} else {
+			var collectLeafPaths func(prefix string, m map[string]any)
+			collectLeafPaths = func(prefix string, m map[string]any) {
+				for k, v := range m {
+					if prefix == "" {
+						switch k {
+						case "_ingest", "__internal_ingest_orig", "_index", "_id", "_routing", "_version":
+							continue
+						}
+					}
+					fullPath := k
+					if prefix != "" {
+						fullPath = prefix + "." + k
+					}
+					if isExcludedPath(fullPath) || v == nil {
+						continue
+					}
+					if subM, ok := v.(map[string]any); ok {
+						collectLeafPaths(fullPath, subM)
+					} else {
+						fields = append(fields, fullPath)
+					}
+				}
+			}
+			collectLeafPaths("", doc)
+		}
+		if len(fields) > 0 {
 			sort.Strings(fields)
 			var buf strings.Builder
 			if salt != "" {
@@ -4111,7 +4240,6 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 		params, _ := specMap["params"].(map[string]any)
 		if src != "" {
-			origOpVal, hadOpField := doc["op"]
 			origMetaIndex, _ := doc["_index"].(string)
 			origMetaID := ""
 			if v, ok := doc["_id"]; ok && v != nil {
@@ -4129,7 +4257,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			hadUserID, _ := origMetaMap["_had_orig_id"].(bool)
 			hadUserRouting, _ := origMetaMap["_had_orig_routing"].(bool)
 
-			cleanDoc := make(map[string]any, len(doc))
+			cleanDoc := make(map[string]any, len(doc)+1)
 			for k, v := range doc {
 				switch k {
 				case "__internal_ingest_orig", "_version":
@@ -4149,8 +4277,8 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				}
 				cleanDoc[k] = v
 			}
-
-			normSrc := rewriteIngestCtxReferences(src)
+			_, hadOrigOp := cleanDoc["op"]
+			normSrc := rewriteIngestCtxReferencesWithOp(src, !hadOrigOp)
 			docBytes, err := json.Marshal(cleanDoc)
 			if err == nil {
 				upd := &painless.UpdateRequest{
@@ -4227,21 +4355,6 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					dec2 := json.NewDecoder(bytes.NewReader(mutatedBytes))
 					dec2.UseNumber()
 					if err := dec2.Decode(&nextDoc); err == nil && nextDoc != nil {
-						if opStr, isStr := nextDoc["op"].(string); isStr && (!hadOpField || origOpVal != opStr) {
-							switch strings.ToLower(strings.TrimSpace(opStr)) {
-							case "delete", "drop":
-								return false, true, procType, procTag, specMap, nil
-							case "noop", "none":
-								if applyMetaToTarget(doc) {
-									mutated = true
-								}
-								return mutated, false, procType, procTag, specMap, nil
-							case "index", "create":
-								if !hadOpField {
-									delete(nextDoc, "op")
-								}
-							}
-						}
 						_ = applyMetaToTarget(nextDoc)
 						for k := range doc {
 							delete(doc, k)
@@ -5316,6 +5429,45 @@ func (s *Server) handleCatCount(w http.ResponseWriter, r *http.Request) {
 	writeCatResponse(w, r, []string{"epoch", "timestamp", "count"}, rows)
 }
 
+// handleCatHealth implements `GET /_cat/health`.
+func (s *Server) handleCatHealth(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	numIndices := len(s.indices)
+	s.mu.RUnlock()
+
+	status := "green"
+	if err := s.backend.Ping(r.Context()); err != nil {
+		status = "red"
+	}
+
+	now := time.Now().UTC()
+	headers := []string{
+		"epoch", "timestamp", "cluster", "status",
+		"node.total", "node.data", "shards", "pri",
+		"relo", "init", "unassign", "pending_tasks",
+		"max_task_wait_time", "active_shards_percent",
+	}
+	rows := []map[string]any{
+		{
+			"epoch":                 fmt.Sprintf("%d", now.Unix()),
+			"timestamp":             now.Format("15:04:05"),
+			"cluster":               "apache-doris-search-cluster",
+			"status":                status,
+			"node.total":            "1",
+			"node.data":             "1",
+			"shards":                fmt.Sprintf("%d", numIndices),
+			"pri":                   fmt.Sprintf("%d", numIndices),
+			"relo":                  "0",
+			"init":                  "0",
+			"unassign":              "0",
+			"pending_tasks":         "0",
+			"max_task_wait_time":    "-",
+			"active_shards_percent": "100.0%",
+		},
+	}
+	writeCatResponse(w, r, headers, rows)
+}
+
 func writeCatResponse(w http.ResponseWriter, r *http.Request, headers []string, rows []map[string]any) {
 	format := strings.ToLower(r.URL.Query().Get("format"))
 	if format == "text" || format == "txt" {
@@ -5532,7 +5684,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 							rawMap = make(map[string]any)
 						}
 						rawMap["__meta_id"] = h.ID
-						if hasRuntimeQueryScript && !evalQueryScriptFilterOnDocWithSchema(srcSchema, rawMap, effQuery) {
+						if hasRuntimeQueryScript && !evalQueryScriptFilterOnDocWithScore(srcSchema, rawMap, effQuery, h.Score) {
 							continue
 						}
 						baseScore := h.Score
@@ -5655,7 +5807,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 						rawMap = make(map[string]any)
 					}
 					rawMap["__meta_id"] = h.ID
-					if !evalQueryScriptFilterOnDocWithSchema(srcSchema, rawMap, effQuery) {
+					if !evalQueryScriptFilterOnDocWithScore(srcSchema, rawMap, effQuery, h.Score) {
 						continue
 					}
 				}
@@ -5844,6 +5996,9 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 						minVer = existing.Version + 1
 					}
 					nextVer := s.allocVersion(minVer)
+					if minVer > 0 && minVer < 1_000_000_000_000 {
+						nextVer = minVer
+					}
 					shredded, err := schema.ShredDocument(sch, pd.id, nextVer, true, nil)
 					if err != nil {
 						writeESError(w, http.StatusBadRequest, shredErrorType(err), err.Error())
@@ -5931,8 +6086,8 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					_ = s.allocVersion(nextVer)
 				} else if !exists && minVer == 0 {
 					nextVer = 1
-				} else if exists && existing.Version > 0 && existing.Version < 1_000_000_000_000 && existing.Version+1 >= minVer {
-					nextVer = existing.Version + 1
+				} else if minVer > 0 && minVer < 1_000_000_000_000 {
+					nextVer = minVer
 				} else {
 					nextVer = s.allocVersion(minVer)
 				}

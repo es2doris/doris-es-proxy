@@ -968,3 +968,93 @@ func TestRound42BoolQueryUnknownKeyAndClauseSliceParsingException(t *testing.T) 
 		t.Fatalf("F5b expected parsing_exception for invalid single-object bool.must clause, got %v", err)
 	}
 }
+
+func TestRound43ScriptSortNestedModeStringScriptShorthandsAndTermsBoostValidation(t *testing.T) {
+	// F1: _script sort parses mode, nested, and legacy nested_path / nested_filter
+	var sr SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"sort": [
+			{
+				"_script": {
+					"type": "number",
+					"order": "desc",
+					"mode": "max",
+					"nested": {
+						"path": "items",
+						"filter": {"term": {"items.active": true}}
+					},
+					"script": {"source": "doc['items.price'].value"}
+				}
+			},
+			{
+				"_script": {
+					"type": "number",
+					"order": "asc",
+					"nested_path": "comments",
+					"nested_filter": {"term": {"comments.flagged": false}},
+					"script": "doc['comments.votes'].value"
+				}
+			}
+		]
+	}`), &sr); err != nil {
+		t.Fatalf("F1 unmarshal _script sort failed: %v", err)
+	}
+	if len(sr.Sort) != 2 || sr.Sort[0].Entry.Mode != "max" || sr.Sort[0].Entry.Nested == nil || sr.Sort[0].Entry.Nested.Path != "items" || sr.Sort[0].Entry.Nested.Filter == nil {
+		t.Fatalf("F1 unexpected first _script sort entry: %+v", sr.Sort)
+	}
+	if sr.Sort[1].Entry.Nested == nil || sr.Sort[1].Entry.Nested.Path != "comments" || sr.Sort[1].Entry.Nested.Filter == nil {
+		t.Fatalf("F1 unexpected second _script sort legacy nested entry: %+v", sr.Sort[1].Entry)
+	}
+
+	// F2: String script shorthands in terms_set.minimum_should_match_script, script_score.script, and script query
+	var qReq SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"bool": {
+				"must": [
+					{
+						"terms_set": {
+							"tags": {
+								"terms": ["a", "b", "c"],
+								"minimum_should_match_script": "Math.min(params.num_terms, 2)"
+							}
+						}
+					},
+					{
+						"script_score": {
+							"query": {"match_all": {}},
+							"script": "_score * 2"
+						}
+					},
+					{
+						"script": "doc['x'].value > 5"
+					}
+				]
+			}
+		}
+	}`), &qReq); err != nil {
+		t.Fatalf("F2 unmarshal string script shorthands failed: %v", err)
+	}
+	must := qReq.Query.Bool.Must
+	if len(must) != 3 || must[0].TermsSet["tags"].MinimumShouldMatchScript != "Math.min(params.num_terms, 2)" {
+		t.Fatalf("F2 unexpected terms_set minimum_should_match_script: %+v", must)
+	}
+	if must[1].ScriptScore.Script != "_score * 2" {
+		t.Fatalf("F2 unexpected script_score script: %+v", must[1].ScriptScore)
+	}
+	if must[2].Script.Script != "doc['x'].value > 5" {
+		t.Fatalf("F2 unexpected script query shorthand: %+v", must[2].Script)
+	}
+
+	// F3: TermsQuery validates boost (rejects negative and non-numeric boost)
+	for _, rawTerms := range []string{
+		`{"query": {"terms": {"tags": ["a", "b"], "boost": -1}}}`,
+		`{"query": {"terms": {"tags": ["a", "b"], "boost": "not_a_number"}}}`,
+		`{"query": {"terms": {"tags": ["a", "b"], "boost": true}}}`,
+	} {
+		var bad SearchRequest
+		if err := json.Unmarshal([]byte(rawTerms), &bad); err == nil || !strings.Contains(err.Error(), "parsing_exception") {
+			t.Fatalf("F3 expected parsing_exception for %s, got %v", rawTerms, err)
+		}
+	}
+}

@@ -234,12 +234,15 @@ func ApplyUpdateWithResult(rawSource json.RawMessage, req *UpdateRequest, docExi
 			}
 		}
 		switch strings.ToLower(ctxOp) {
+		case "", "index", "update":
 		case "noop", "none":
 			return rawSource, "noop", nil
 		case "delete", "drop":
 			opResult = "deleted"
 		case "create":
 			opResult = "created"
+		default:
+			return nil, "", fmt.Errorf("operation [%s] is not supported, only [index, create, update, delete, noop, none] are allowed", ctxOp)
 		}
 	}
 
@@ -6312,7 +6315,7 @@ func hasTrailingContinuationOp(s string) bool {
 	if t == "" {
 		return false
 	}
-	for _, sfx := range []string{"&&", "||", "?:", "==", "!=", ">=", "<=", "=~", "==~"} {
+	for _, sfx := range []string{"&&", "||", "?:", "===", "!==", "==", "!=", ">=", "<=", "=~", "==~", ">>>", "<<", ">>", "?."} {
 		if strings.HasSuffix(t, sfx) {
 			return true
 		}
@@ -6321,7 +6324,9 @@ func hasTrailingContinuationOp(s string) bool {
 		return false
 	}
 	last := t[len(t)-1]
-	return last == '+' || last == '-' || last == '*' || last == ',' || last == '?' || last == ':' || last == '='
+	return last == '+' || last == '-' || last == '*' || last == '/' || last == '%' ||
+		last == '&' || last == '|' || last == '^' || last == '<' || last == '>' ||
+		last == ',' || last == '?' || last == ':' || last == '=' || last == '.'
 }
 
 func isControlBlockStmt(s string) bool {
@@ -6501,7 +6506,7 @@ func splitTopLevelStatements(s string) []string {
 		case ';', '\n':
 			if braceDepth == 0 && parenDepth == 0 {
 				rem := strings.TrimSpace(s[i+1:])
-				if c == '\n' && (hasElseKeywordPrefix(rem) || hasCatchOrFinallyPrefix(rem) || hasDoWhileContinuation(curr.String(), rem) || isIncompleteControlHeader(curr.String()) || hasTrailingContinuationOp(curr.String())) {
+				if c == '\n' && (hasElseKeywordPrefix(rem) || hasCatchOrFinallyPrefix(rem) || hasDoWhileContinuation(curr.String(), rem) || isIncompleteControlHeader(curr.String()) || hasTrailingContinuationOp(curr.String()) || strings.HasPrefix(rem, ".") || strings.HasPrefix(rem, "?.")) {
 					curr.WriteByte(c)
 					continue
 				}
@@ -6615,6 +6620,14 @@ func resolveParamPath(params map[string]any, path []string) any {
 		}
 		val, exists := m[seg]
 		if !exists {
+			if i == len(path)-1 {
+				if seg == "empty" {
+					return visiblePainlessMapLen(m) == 0
+				}
+				if seg == "length" {
+					return int64(visiblePainlessMapLen(m))
+				}
+			}
 			if strings.Contains(seg, ".") {
 				return resolveParamPath(m, append(strings.Split(seg, "."), path[i+1:]...))
 			} else if i < len(path)-1 {

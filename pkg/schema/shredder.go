@@ -528,7 +528,9 @@ func ShredDocument(
 							}
 						}
 					}
-					propagateCopyToCustomMultiFields(s, row, targetField, srcStrs)
+					if err := propagateCopyToCustomMultiFields(s, row, targetField, srcVals, getNow, recordIgnored); err != nil {
+						return nil, err
+					}
 				case StoragePromotedArray, StorageNestedSubfield:
 					var cur []string
 					if existing, ok := row[tb.ColumnName].([]string); ok {
@@ -584,7 +586,9 @@ func ShredDocument(
 							row[tb.KeywordCompanion] = curKw
 						}
 					}
-					propagateCopyToCustomMultiFields(s, row, targetField, srcStrs)
+					if err := propagateCopyToCustomMultiFields(s, row, targetField, srcVals, getNow, recordIgnored); err != nil {
+						return nil, err
+					}
 				}
 			}
 		}
@@ -735,6 +739,11 @@ func parseGeoFloatElem(x any) (float64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// DecodeGeohashLatLon decodes a geohash string into its center (lat, lon) coordinates.
+func DecodeGeohashLatLon(hash string) (lat, lon float64, ok bool) {
+	return decodeGeohashLatLon(hash)
 }
 
 func decodeGeohashLatLon(hash string) (lat, lon float64, ok bool) {
@@ -2023,9 +2032,9 @@ func extractNestedElementMapsWithIDs(node any, path []string, curPrefix string) 
 	}
 }
 
-func propagateCopyToCustomMultiFields(s *IndexSchema, row map[string]any, targetField string, srcVals []string) {
+func propagateCopyToCustomMultiFields(s *IndexSchema, row map[string]any, targetField string, srcVals []any, getNow func() time.Time, recordIgnored func(string)) error {
 	if s == nil || len(s.Fields) == 0 || len(srcVals) == 0 {
-		return
+		return nil
 	}
 	targetPrefix := targetField + "."
 	for subK, subB := range s.Fields {
@@ -2041,11 +2050,35 @@ func propagateCopyToCustomMultiFields(s *IndexSchema, row map[string]any, target
 			if existing, ok := row[subB.ColumnName].([]string); ok {
 				cur = append(cur, existing...)
 			}
-			for _, sv := range srcVals {
+			for _, rv := range srcVals {
+				if rv == nil {
+					continue
+				}
+				sv := fmt.Sprintf("%v", rv)
 				if subB.IgnoreAbove > 0 && len([]rune(sv)) > subB.IgnoreAbove {
 					continue
 				}
-				if subB.LowercaseNormalizer {
+				if isTypedNonStringBinding(subB) {
+					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && (subB.Coerce == nil || *subB.Coerce) {
+						continue
+					}
+					coerced := coerceScalarBindingForDoris(rv, subB, getNow())
+					if coerced == nil {
+						if subB.IgnoreMalformed != nil && *subB.IgnoreMalformed {
+							if recordIgnored != nil {
+								recordIgnored(subK)
+							}
+							continue
+						}
+						return fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", subK, subB.ESType)
+					}
+					if subB.ESType == "date_nanos" {
+						if iv, ok := coerced.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
+							coerced = iv / 1_000_000
+						}
+					}
+					sv = formatCoercedArrayElement(coerced)
+				} else if subB.LowercaseNormalizer {
 					sv = strings.ToLower(sv)
 				}
 				cur = append(cur, sv)
@@ -2054,26 +2087,63 @@ func propagateCopyToCustomMultiFields(s *IndexSchema, row map[string]any, target
 				row[subB.ColumnName] = cur
 			}
 		case StoragePromotedScalar:
-			var filtered []string
-			for _, sv := range srcVals {
-				if subB.IgnoreAbove > 0 && len([]rune(sv)) > subB.IgnoreAbove {
-					continue
+			if isTypedNonStringBinding(subB) {
+				for _, rv := range srcVals {
+					if rv == nil {
+						continue
+					}
+					if subB.IgnoreAbove > 0 && len([]rune(fmt.Sprintf("%v", rv))) > subB.IgnoreAbove {
+						continue
+					}
+					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && (subB.Coerce == nil || *subB.Coerce) {
+						continue
+					}
+					coerced := coerceScalarBindingForDoris(rv, subB, getNow())
+					if coerced == nil {
+						if subB.IgnoreMalformed != nil && *subB.IgnoreMalformed {
+							if recordIgnored != nil {
+								recordIgnored(subK)
+							}
+							continue
+						}
+						return fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", subK, subB.ESType)
+					}
+					if subB.ESType == "date_nanos" {
+						if iv, ok := coerced.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
+							coerced = iv / 1_000_000
+						}
+					}
+					if existing, exists := row[subB.ColumnName]; !exists || existing == nil {
+						row[subB.ColumnName] = coerced
+					}
 				}
-				if subB.LowercaseNormalizer {
-					sv = strings.ToLower(sv)
+			} else {
+				var filtered []string
+				for _, rv := range srcVals {
+					if rv == nil {
+						continue
+					}
+					sv := fmt.Sprintf("%v", rv)
+					if subB.IgnoreAbove > 0 && len([]rune(sv)) > subB.IgnoreAbove {
+						continue
+					}
+					if subB.LowercaseNormalizer {
+						sv = strings.ToLower(sv)
+					}
+					filtered = append(filtered, sv)
 				}
-				filtered = append(filtered, sv)
-			}
-			if len(filtered) > 0 {
-				joined := strings.Join(filtered, " ")
-				if existing, exists := row[subB.ColumnName]; exists && existing != nil {
-					row[subB.ColumnName] = fmt.Sprintf("%v %s", existing, joined)
-				} else {
-					row[subB.ColumnName] = joined
+				if len(filtered) > 0 {
+					joined := strings.Join(filtered, " ")
+					if existing, exists := row[subB.ColumnName]; exists && existing != nil {
+						row[subB.ColumnName] = fmt.Sprintf("%v %s", existing, joined)
+					} else {
+						row[subB.ColumnName] = joined
+					}
 				}
 			}
 		}
 	}
+	return nil
 }
 
 func buildVariantDocPayload(trimmed []byte, parsedDoc map[string]any, prunedDynamic bool, s *IndexSchema) json.RawMessage {
@@ -2267,12 +2337,37 @@ func collectAllTextWithSchema(node any, s *IndexSchema, curPath []string, sb *st
 		sort.Strings(keys)
 		for _, k := range keys {
 			nextPath := append(append([]string(nil), curPath...), k)
+			var b FieldBinding
 			if s != nil && len(s.Fields) > 0 {
 				dotPath := strings.Join(nextPath, ".")
-				b := s.ResolveField(dotPath)
-				if b.NotIndexed || b.EnabledFalse {
+				b = s.ResolveField(dotPath)
+				if b.EnabledFalse {
 					continue
 				}
+				if b.NotIndexed {
+					hasIndexedCopyOrSub := false
+					if b.KeywordCompanion != "" {
+						if kwB, ok := s.Fields[dotPath+".keyword"]; ok && !kwB.NotIndexed && !kwB.EnabledFalse {
+							hasIndexedCopyOrSub = true
+						}
+					}
+					if !hasIndexedCopyOrSub {
+						for _, ct := range b.CopyTo {
+							tb := s.ResolveField(ct)
+							if !tb.NotIndexed && !tb.EnabledFalse {
+								hasIndexedCopyOrSub = true
+								break
+							}
+						}
+					}
+					if !hasIndexedCopyOrSub {
+						continue
+					}
+				}
+			}
+			if v[k] == nil && b.NullValue != nil && !b.NotIndexed && !b.EnabledFalse {
+				collectAllTextWithSchema(fmt.Sprintf("%v", b.NullValue), s, nextPath, sb)
+				continue
 			}
 			collectAllTextWithSchema(v[k], s, nextPath, sb)
 		}

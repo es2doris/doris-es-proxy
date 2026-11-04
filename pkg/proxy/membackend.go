@@ -3159,6 +3159,22 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 		return int64(len(toStringSlice(val)))
 	}
+	if (strings.HasPrefix(colExpr, "SPLIT_PART(") || strings.HasPrefix(colExpr, "split_part(")) && strings.HasSuffix(colExpr, ")") {
+		inner := colExpr[len("SPLIT_PART(") : len(colExpr)-1]
+		args := splitTopLevelArgs(inner)
+		if len(args) == 3 {
+			strVal := resolveColumnValue(row, strings.TrimSpace(args[0]))
+			delim := unquoteSQLLiteral(strings.TrimSpace(args[1]))
+			idx, err := strconv.Atoi(strings.TrimSpace(args[2]))
+			if strVal != nil && err == nil && idx >= 1 {
+				parts := strings.Split(fmt.Sprintf("%v", strVal), delim)
+				if idx <= len(parts) {
+					return strings.TrimSpace(parts[idx-1])
+				}
+			}
+		}
+		return nil
+	}
 	if strings.HasPrefix(colExpr, "ST_Distance_Sphere(") && strings.HasSuffix(colExpr, ")") {
 		inner := colExpr[len("ST_Distance_Sphere(") : len(colExpr)-1]
 		args := splitTopLevelArgs(inner)
@@ -3167,9 +3183,10 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			tLat, errLat := strconv.ParseFloat(strings.TrimSpace(args[3]), 64)
 			if errLon == nil && errLat == nil {
 				lonExpr := strings.TrimSpace(args[0])
-				if strings.HasPrefix(lonExpr, "CAST(`_doc`") {
-					if asIdx := strings.LastIndex(lonExpr, " AS "); asIdx > 0 {
-						pathPart := lonExpr[len("CAST(`_doc`"):asIdx]
+				if docIdx := strings.Index(lonExpr, "CAST(`_doc`"); docIdx >= 0 {
+					docSub := lonExpr[docIdx:]
+					if asIdx := strings.Index(docSub, " AS "); asIdx > 0 {
+						pathPart := docSub[len("CAST(`_doc`"):asIdx]
 						var segs []string
 						for _, p := range strings.Split(pathPart, "['") {
 							p = strings.TrimSuffix(p, "']")

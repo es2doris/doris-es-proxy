@@ -1204,3 +1204,113 @@ func TestRound42ShredderNestedEnabledFalseMultiFieldIgnoreMalformedMappingCompat
 		}
 	}
 }
+
+func TestRound43TextPromotionGuardImplicitObjectEnabledCopyToMultiFieldsAllTextAndGeohash(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"meta_obj": {
+				"properties": {
+					"k": {"type": "keyword"}
+				}
+			},
+			"src_tag": {
+				"type": "keyword",
+				"copy_to": "agg_target"
+			},
+			"agg_target": {
+				"type": "text",
+				"fields": {
+					"num": {"type": "integer"},
+					"safe_num": {"type": "integer", "ignore_malformed": true},
+					"kw": {"type": "keyword", "ignore_above": 5}
+				}
+			},
+			"raw_unindexed": {
+				"type": "text",
+				"index": false,
+				"fields": {
+					"keyword": {"type": "keyword"}
+				}
+			},
+			"status": {
+				"type": "keyword",
+				"null_value": "NULL_STATUS"
+			},
+			"loc": {
+				"type": "geo_point"
+			}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("unmarshal spec failed: %v", err)
+	}
+	sch := CompileIndexSchema("db", "r43_idx", &spec)
+
+	// F4: registerLeafField and copy_to must not promote "text" or "match_only_text" to StoragePromotedArray (ARRAY<STRING>)
+	if bAgg, ok := sch.Fields["agg_target"]; !ok || bAgg.Kind != StoragePromotedScalar {
+		t.Fatalf("F4 expected copy_to text target agg_target to remain StoragePromotedScalar, got %+v", bAgg)
+	}
+	var mvTextSpec esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{
+		"properties": {
+			"owners": {
+				"properties": {
+					"displayName": {"type": "text"}
+				}
+			},
+			"log_msg": {"type": "match_only_text", "multi_valued": true}
+		}
+	}`), &mvTextSpec)
+	mvSch := CompileIndexSchema("db", "r43_mv_text", &mvTextSpec)
+	for _, fName := range []string{"owners.displayName", "log_msg"} {
+		if fb, ok := mvSch.Fields[fName]; !ok || fb.Kind != StoragePromotedScalar {
+			t.Fatalf("F4 expected %s to be StoragePromotedScalar, got %+v", fName, fb)
+		}
+	}
+
+	// F5: ValidateMappingUpdateCompatibility rejects changing implicit enabled:true object to enabled:false
+	var disableObjSpec esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{
+		"properties": {
+			"meta_obj": {
+				"type": "object",
+				"enabled": false
+			}
+		}
+	}`), &disableObjSpec)
+	if err := ValidateMappingUpdateCompatibility(&spec, &disableObjSpec); err == nil {
+		t.Fatalf("F5 expected error when changing implicit enabled:true object to enabled:false")
+	}
+
+	// F6, F7, F8: ShredDocument with copy_to typed multi-fields, index:false + .keyword in _all_text, null_value in _all_text, and geohash geo_point
+	outBytes, err := ShredDocument(sch, "1", 1, false, []byte(`{
+		"src_tag": "42",
+		"raw_unindexed": "searchable_via_keyword",
+		"status": null,
+		"loc": "u4pruydqqvj"
+	}`))
+	if err != nil {
+		t.Fatalf("ShredDocument failed: %v", err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(outBytes, &row); err != nil {
+		t.Fatalf("unmarshal shredded row failed: %v", err)
+	}
+	arrNum, okArr := row["f__agg_target__num"].([]any)
+	if !okArr || len(arrNum) != 1 || arrNum[0] != "42" {
+		t.Fatalf("F6 expected f__agg_target__num == [\"42\"], got %T %v", row["f__agg_target__num"], row["f__agg_target__num"])
+	}
+	allText, _ := row["_all_text"].(string)
+	if !strings.Contains(allText, "searchable_via_keyword") || !strings.Contains(allText, "NULL_STATUS") {
+		t.Fatalf("F7 expected _all_text to contain searchable_via_keyword and NULL_STATUS, got %q", allText)
+	}
+	locStr, _ := row["f__loc"].(string)
+	if !strings.HasPrefix(locStr, "57.64911") || !strings.Contains(locStr, ",10.40743") {
+		t.Fatalf("F8 expected geohash 'u4pruydqqvj' decoded to ~57.64911,10.407439, got %q", locStr)
+	}
+
+	// F6: Malformed copy_to into non-ignore_malformed sub-field returns error
+	if _, err := ShredDocument(sch, "2", 1, false, []byte(`{"src_tag": "not_an_int"}`)); err == nil {
+		t.Fatalf("F6 expected error when copy_to value 'not_an_int' fails integer sub-field coercion")
+	}
+}
