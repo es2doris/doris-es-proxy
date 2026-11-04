@@ -746,7 +746,11 @@ func buildQueryCacheKey(targets []string, req *esast.SearchRequest) (string, boo
 	if containsNowDateMath(req, checkBytes) {
 		return "", false
 	}
-	return strings.Join(targets, ",") + "\x00" + string(reqBytes) + afSuffix, true
+	var rtSuffix string
+	if strings.TrimSpace(req.Routing) != "" {
+		rtSuffix = "\x00rt:" + strings.TrimSpace(req.Routing)
+	}
+	return strings.Join(targets, ",") + "\x00" + string(reqBytes) + afSuffix + rtSuffix, true
 }
 
 // Get looks up a cached search response for `(targets, req)` and returns a fresh unmarshaled copy.

@@ -457,7 +457,9 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 			bCollapse := t.Schema.ResolveEffectiveField(req.Collapse.Field, true)
 			collapseCol := t.sqlColumnRef(req.Collapse.Field, true, nil)
 			if bCollapse.Kind == schema.StoragePromotedArray || bCollapse.Kind == schema.StorageNestedSubfield {
-				collapseCol = fmt.Sprintf("element_at(`%s`, 1)", bCollapse.EffectiveArrayColumn(true))
+				if arrCol := bCollapse.EffectiveArrayColumn(true); arrCol != "" {
+					collapseCol = fmt.Sprintf("element_at(`%s`, 1)", arrCol)
+				}
 			}
 			preCollapseWhere := fmt.Sprintf("`__DORIS_DELETE_SIGN__` = 0 AND (%s) AND (%s)", mainQ.WhereSQL, postFilterSQL)
 			outerCollapseWhere := fmt.Sprintf("`_collapse_rn` = 1 OR %s IS NULL", collapseCol)
@@ -652,18 +654,18 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 	case len(q.TermsSet) > 0:
 		fields := sortedMapKeys(q.TermsSet)
 		var preds []string
-		boost := 1.0
+		var scores []string
 		for _, field := range fields {
 			ts := q.TermsSet[field]
 			cleanField, fBoost := parseFieldBoost(field, 1.0)
+			fieldBoost := fBoost
 			if ts.Boost != nil {
-				boost = *ts.Boost * fBoost
-			} else {
-				boost *= fBoost
+				fieldBoost = *ts.Boost * fBoost
 			}
 			resolvedField, b := t.resolveFieldInNestedCtx(cleanField, true, nctx)
+			var fp string
 			if !t.checkFieldSearchable(resolvedField, b) || len(ts.Terms) == 0 || b.Kind == schema.StoragePromotedVector {
-				preds = append(preds, "FALSE")
+				fp = "FALSE"
 			} else {
 				var uniqueTerms []any
 				seenTerms := make(map[string]bool, len(ts.Terms))
@@ -684,17 +686,25 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 					resolvedMSM, bMSM := t.resolveFieldInNestedCtx(ts.MinimumShouldMatchField, true, nctx)
 					t.checkFieldDocValues(resolvedMSM, bMSM)
 					threshExpr = fmt.Sprintf("COALESCE(%s, 1)", t.sqlNumericColumnRef(ts.MinimumShouldMatchField, nctx))
-				} else if len(ts.MinimumShouldMatchScript) > 0 {
+				} else if ts.MinimumShouldMatchScript != nil {
 					t.checkScriptDocValues(ts.MinimumShouldMatchScript, nctx)
 					threshExpr = t.compileTermsSetScriptThreshold(ts.MinimumShouldMatchScript, len(uniqueTerms), nctx)
 				}
-				preds = append(preds, fmt.Sprintf("((%s) >= %s)", strings.Join(termSums, " + "), threshExpr))
+				fp = fmt.Sprintf("((%s) >= %s)", strings.Join(termSums, " + "), threshExpr)
+			}
+			preds = append(preds, fp)
+			if scoring {
+				scores = append(scores, fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", fp, fieldBoost))
 			}
 		}
 		pred := strings.Join(preds, " AND ")
 		score := "1.0"
 		if scoring {
-			score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", pred, boost)
+			if len(scores) == 1 {
+				score = scores[0]
+			} else {
+				score = "(" + strings.Join(scores, " + ") + ")"
+			}
 		}
 		return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: score}
 	case len(q.Fuzzy) > 0:
@@ -3277,6 +3287,9 @@ func (t *Transpiler) compileRangePredicate(field string, rc esast.RangeCond, nct
 
 func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, nctx *nestedCtx) string {
 	gt, gte, lt, lte := rc.NormalizedBounds()
+	if gt == nil && gte == nil && lt == nil && lte == nil {
+		return t.compileExistsPredicate(field, nctx)
+	}
 	field, b := t.resolveFieldInNestedCtx(field, true, nctx)
 	if !t.checkFieldSearchable(field, b) || b.Kind == schema.StoragePromotedVector {
 		return "FALSE"
@@ -3779,8 +3792,11 @@ func (t *Transpiler) appendAggBranches(
 						elemValExpr = scriptExpr
 					}
 				}
-				if termsSpec.Missing != nil {
-					missingLit := quoteStr(formatMissingScalar(termsSpec.Missing))
+				if termsSpec.Missing != nil || termsSpec.MissingBucket {
+					missingLit := "'__ES_MISSING_BUCKET__'"
+					if termsSpec.Missing != nil {
+						missingLit = quoteStr(formatMissingScalar(termsSpec.Missing))
+					}
 					coalescedElem := fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", elemValExpr, missingLit)
 					explodeFrom := fmt.Sprintf("`base_matched` LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) `_t` AS `_elem`", arrCol, arrCol, arrCol)
 					wCond := ""
@@ -3831,8 +3847,11 @@ func (t *Transpiler) appendAggBranches(
 						col = scriptExpr
 					}
 				}
-				if termsSpec.Missing != nil {
-					missingLit := quoteStr(formatMissingScalar(termsSpec.Missing))
+				if termsSpec.Missing != nil || termsSpec.MissingBucket {
+					missingLit := "'__ES_MISSING_BUCKET__'"
+					if termsSpec.Missing != nil {
+						missingLit = quoteStr(formatMissingScalar(termsSpec.Missing))
+					}
 					coalescedCol := fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", col, missingLit)
 					wCond := ""
 					if termsExtraWhere != "" {
@@ -3941,8 +3960,11 @@ func (t *Transpiler) appendAggBranches(
 					}
 					*subIdx++
 					var bucketExpr, fromExpr, whereExpr string
-					if subTerms.Missing != nil {
-						missingLit := quoteStr(formatMissingScalar(subTerms.Missing))
+					if subTerms.Missing != nil || subTerms.MissingBucket {
+						missingLit := "'__ES_MISSING_BUCKET__'"
+						if subTerms.Missing != nil {
+							missingLit = quoteStr(formatMissingScalar(subTerms.Missing))
+						}
 						bucketExpr = fmt.Sprintf("COALESCE(%s, %s)", rawElemExpr, missingLit)
 						fromExpr = fmt.Sprintf("`base_matched` LATERAL VIEW EXPLODE(`%s`) `_nt` AS `_nel`", corrCol)
 						whereExpr = "1=1"
@@ -5785,18 +5807,41 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					quoteStr(subFull), parentBucketExpr, fromClause, whereClause,
 				))
 			} else if strings.EqualFold(subSpec.Rate.Mode, "value_count") {
-				rateField, b := t.resolveFieldInNestedCtx(subSpec.Rate.Field, true, nctx)
+				effRateField := subSpec.Rate.Field
+				if effRateField == "" && subSpec.Rate.Script != nil {
+					if docF, ok := extractSimpleDocFieldFromScript(subSpec.Rate.Script); ok {
+						effRateField = docF
+					}
+				}
+				rateField, b := t.resolveFieldInNestedCtx(effRateField, true, nctx)
 				arrCol := b.EffectiveArrayColumn(true)
 				if !isExplodedNested(b, rateField) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
+					valExpr := subElemAlias
+					if subSpec.Rate.Script != nil {
+						if scriptExpr, ok := t.compilePolymorphicScriptExpr(subSpec.Rate.Script, rateField, subElemAlias, nil); ok {
+							valExpr = scriptExpr
+						}
+					}
 					subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
 					subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, subElemAlias)
 					*branches = append(*branches, fmt.Sprintf(
 						"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(%s) AS DOUBLE) AS `_doc_count` "+
 							"FROM %s WHERE %s GROUP BY `_bucket_key`",
-						quoteStr(subFull), parentBucketExpr, subElemAlias, subFrom, subWhere,
+						quoteStr(subFull), parentBucketExpr, valExpr, subFrom, subWhere,
 					))
 				} else {
-					col := t.sqlColumnRef(rateField, true, nctx)
+					var col string
+					if rateField != "" {
+						col = t.sqlColumnRef(rateField, true, nctx)
+					}
+					if subSpec.Rate.Script != nil {
+						if scriptExpr, ok := t.compilePolymorphicScriptExpr(subSpec.Rate.Script, rateField, col, nctx); ok {
+							col = scriptExpr
+						}
+					}
+					if col == "" {
+						col = t.sqlColumnRef(rateField, true, nctx)
+					}
 					*branches = append(*branches, fmt.Sprintf(
 						"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(%s) AS DOUBLE) AS `_doc_count` "+
 							"FROM %s WHERE %s GROUP BY `_bucket_key`",
@@ -6296,8 +6341,11 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 				subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
 				valExpr := fmt.Sprintf("CAST(%s AS STRING)", subElemAlias)
 				subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, subElemAlias)
-				if subTerms.Missing != nil {
-					missingLit := quoteStr(formatMissingScalar(subTerms.Missing))
+				if subTerms.Missing != nil || subTerms.MissingBucket {
+					missingLit := "'__ES_MISSING_BUCKET__'"
+					if subTerms.Missing != nil {
+						missingLit = quoteStr(formatMissingScalar(subTerms.Missing))
+					}
 					subFrom = fmt.Sprintf("%s LATERAL VIEW EXPLODE(CASE WHEN `%s` IS NULL OR array_size(`%s`) = 0 THEN [NULL] ELSE `%s` END) %s AS %s", fromClause, arrCol, arrCol, arrCol, subTableAlias, subElemAlias)
 					valExpr = fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", subElemAlias, missingLit)
 					subWhere = whereClause
@@ -6341,8 +6389,12 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 						col = fmt.Sprintf("LOWER(CAST(%s AS STRING))", col)
 					}
 				}
-				if subTerms.Missing != nil && effSubField != "" {
-					col = fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", col, quoteStr(formatMissingScalar(subTerms.Missing)))
+				if (subTerms.Missing != nil || subTerms.MissingBucket) && effSubField != "" {
+					missingLit := "'__ES_MISSING_BUCKET__'"
+					if subTerms.Missing != nil {
+						missingLit = quoteStr(formatMissingScalar(subTerms.Missing))
+					}
+					col = fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", col, missingLit)
 				}
 				if subTerms.Script != nil {
 					overrideExpr := ""
@@ -6353,12 +6405,16 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 						col = scriptExpr
 					}
 				}
-				if subTerms.Missing != nil && effSubField == "" {
-					col = fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", col, quoteStr(formatMissingScalar(subTerms.Missing)))
+				if (subTerms.Missing != nil || subTerms.MissingBucket) && effSubField == "" {
+					missingLit := "'__ES_MISSING_BUCKET__'"
+					if subTerms.Missing != nil {
+						missingLit = quoteStr(formatMissingScalar(subTerms.Missing))
+					}
+					col = fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", col, missingLit)
 				}
 				childKeyExpr := fmt.Sprintf("CONCAT(%s, '\\x1f', CAST(%s AS STRING))", parentBucketExpr, col)
 				subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, col)
-				if subTerms.Missing != nil {
+				if subTerms.Missing != nil || subTerms.MissingBucket {
 					subWhere = whereClause
 				}
 				*branches = append(*branches, fmt.Sprintf(
@@ -7385,12 +7441,12 @@ func extractSimpleDocFieldFromScript(script any) (string, bool) {
 }
 
 func (t *Transpiler) sqlStringScalarColumnRef(field string, preferKeyword bool, nctx *nestedCtx) string {
-	b := t.Schema.ResolveEffectiveField(field, preferKeyword)
+	field, b := t.resolveFieldInNestedCtx(field, preferKeyword, nctx)
 	effField := field
 	if b.AliasTarget != "" {
 		effField = b.AliasTarget
 	}
-	if nctx != nil && ((b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath) || strings.HasPrefix(effField, nctx.nestedPath+".")) {
+	if nctx != nil && nctx.elemVar != "" && ((b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath) || strings.HasPrefix(effField, nctx.nestedPath+".")) {
 		return t.sqlColumnRef(field, preferKeyword, nctx)
 	}
 	if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
@@ -7768,11 +7824,11 @@ func (t *Transpiler) parseMetricScriptExpr(s string, params map[string]any, defa
 		effField, b := t.resolveFieldInNestedCtx(field, true, nctx)
 		t.checkFieldDocValues(effField, b)
 		if tail == ".size()" || tail == ".length" {
-			if nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued {
+			if nctx != nil && nctx.elemVar != "" && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued {
 				relPath := t.nestedRelativeJSONPath(effField, true, b.NestedPath)
 				return fmt.Sprintf("COALESCE(array_size(CAST(json_extract_string(%s, %s) AS ARRAY<STRING>)), 0)", nctx.elemVar, quoteStr(relPath)), true
 			}
-			if b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath)) {
+			if b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.elemVar == "" || nctx.nestedPath != b.NestedPath)) {
 				colName := b.EffectiveArrayColumn(true)
 				if colName != "" {
 					return fmt.Sprintf("COALESCE(array_size(`%s`), 0)", colName), true
@@ -7910,28 +7966,11 @@ func (t *Transpiler) appendMetricAggBranchWithMissingAndScript(branches *[]strin
 	))
 }
 
-func (t *Transpiler) compileTermsSetScriptThreshold(script map[string]any, numTerms int, nctx *nestedCtx) string {
-	src, _ := script["source"].(string)
-	if src == "" {
-		src, _ = script["inline"].(string)
-	}
-	s := strings.TrimSpace(src)
-	for strings.HasPrefix(s, "{") && strings.HasSuffix(s, "}") {
-		s = strings.TrimSpace(s[1 : len(s)-1])
-	}
-	for strings.HasSuffix(s, ";") {
-		s = strings.TrimSpace(strings.TrimSuffix(s, ";"))
-	}
-	if strings.HasPrefix(s, "return") && (len(s) == 6 || s[6] == ' ' || s[6] == '\t' || s[6] == '(') {
-		s = strings.TrimSpace(s[6:])
-	}
-	for strings.HasSuffix(s, ";") {
-		s = strings.TrimSpace(strings.TrimSuffix(s, ";"))
-	}
-	if s == "" {
+func (t *Transpiler) compileTermsSetScriptThreshold(script any, numTerms int, nctx *nestedCtx) string {
+	s, params, ok := normalizeScriptSourceAndParams(script)
+	if !ok || s == "" {
 		return "1"
 	}
-	params, _ := script["params"].(map[string]any)
 	compiled, ok := t.parseSafeThresholdExpr(s, params, numTerms, nctx, 0)
 	if !ok || compiled == "" {
 		return "1"
@@ -8282,13 +8321,17 @@ func (t *Transpiler) resolveSortMissing(s esast.SortSpec, b schema.FieldBinding)
 }
 
 func (t *Transpiler) compileScriptSortExpr(s esast.SortSpec) (string, schema.FieldBinding, bool) {
+	var sortNCtx *nestedCtx
+	if deepest := deepestNestedSortPath(s.Entry.Nested); deepest != "" {
+		sortNCtx = &nestedCtx{nestedPath: deepest}
+	}
 	if strings.EqualFold(s.Entry.Type, "string") {
-		if scriptExpr, ok := t.compilePolymorphicScriptExpr(s.Entry.Script, "", "", nil); ok {
+		if scriptExpr, ok := t.compilePolymorphicScriptExpr(s.Entry.Script, "", "", sortNCtx); ok {
 			return fmt.Sprintf("CAST(%s AS STRING)", scriptExpr), schema.FieldBinding{DorisType: schema.DorisString, ESType: "keyword"}, true
 		}
 		return "", schema.FieldBinding{}, false
 	}
-	if scriptExpr, ok := t.compileMetricScriptExpr(s.Entry.Script, "", nil); ok {
+	if scriptExpr, ok := t.compileMetricScriptExpr(s.Entry.Script, "", sortNCtx); ok {
 		return scriptExpr, schema.FieldBinding{DorisType: schema.DorisDouble}, true
 	}
 	return "", schema.FieldBinding{}, false
@@ -8346,8 +8389,9 @@ func (t *Transpiler) compileGeoDistanceSortExpr(s esast.SortSpec) (string, bool)
 		return "", false
 	}
 	segs := strings.Split(geoField, ".")
+	var b schema.FieldBinding
 	if t.Schema != nil {
-		b := t.Schema.ResolveField(geoField)
+		b = t.Schema.ResolveField(geoField)
 		if len(b.SourceJSONPath) > 0 {
 			segs = b.SourceJSONPath
 		}
@@ -8358,6 +8402,10 @@ func (t *Transpiler) compileGeoDistanceSortExpr(s esast.SortSpec) (string, bool)
 	}
 	lonExpr := fmt.Sprintf("CAST(`_doc`%s['lon'] AS DOUBLE)", pathBuilder.String())
 	latExpr := fmt.Sprintf("CAST(`_doc`%s['lat'] AS DOUBLE)", pathBuilder.String())
+	if b.Kind == schema.StoragePromotedScalar && b.ColumnName != "" {
+		lonExpr = fmt.Sprintf("COALESCE(CAST(SPLIT_PART(`%s`, ',', 2) AS DOUBLE), %s)", b.ColumnName, lonExpr)
+		latExpr = fmt.Sprintf("COALESCE(CAST(SPLIT_PART(`%s`, ',', 1) AS DOUBLE), %s)", b.ColumnName, latExpr)
+	}
 	return fmt.Sprintf("ST_Distance_Sphere(%s, %s, %s, %s)",
 		lonExpr, latExpr,
 		strconv.FormatFloat(tLon, 'f', -1, 64),
@@ -8421,6 +8469,9 @@ func parseSortGeoPointLatLon(v any) (lat, lon float64, ok bool) {
 				return latVal, lonVal, true
 			}
 		}
+		if latVal, lonVal, okHash := schema.DecodeGeohashLatLon(str); okHash {
+			return latVal, lonVal, true
+		}
 	}
 	return 0, 0, false
 }
@@ -8466,7 +8517,11 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 			continue
 		}
 		if s.Entry.Field == "_script" {
-			t.checkScriptDocValues(s.Entry.Script, nil)
+			var sortNCtx *nestedCtx
+			if deepest := deepestNestedSortPath(s.Entry.Nested); deepest != "" {
+				sortNCtx = &nestedCtx{nestedPath: deepest}
+			}
+			t.checkScriptDocValues(s.Entry.Script, sortNCtx)
 			if scriptExpr, sb, ok := t.compileScriptSortExpr(s); ok {
 				_, missingSQL := t.resolveSortMissing(s, sb)
 				if missingSQL != "" {
@@ -8947,7 +9002,7 @@ func (t *Transpiler) sqlNumericColumnRef(field string, nctx *nestedCtx) string {
 	case schema.StoragePromotedArray, schema.StoragePromotedVector:
 		return fmt.Sprintf("CAST(element_at(`%s`, 1) AS DOUBLE)", b.EffectiveArrayColumn(true))
 	case schema.StorageNestedSubfield:
-		if (nctx == nil || nctx.nestedPath != b.NestedPath) && b.EffectiveArrayColumn(true) != "" {
+		if (nctx == nil || nctx.elemVar == "" || nctx.nestedPath != b.NestedPath) && b.EffectiveArrayColumn(true) != "" {
 			return fmt.Sprintf("CAST(element_at(`%s`, 1) AS DOUBLE)", b.EffectiveArrayColumn(true))
 		}
 	}
@@ -9049,7 +9104,7 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 	if b.AliasTarget != "" {
 		effField = b.AliasTarget
 	}
-	if nctx != nil && ((b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath) || strings.HasPrefix(effField, nctx.nestedPath+".") || b.Kind == schema.StorageDynamicVariant) {
+	if nctx != nil && nctx.elemVar != "" && ((b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath) || strings.HasPrefix(effField, nctx.nestedPath+".") || b.Kind == schema.StorageDynamicVariant) {
 		relPath := t.nestedRelativeJSONPath(field, preferKeyword, nctx.nestedPath)
 		extractExpr := fmt.Sprintf("json_extract_string(%s, %s)", nctx.elemVar, quoteStr(relPath))
 		if castType != "STRING" {

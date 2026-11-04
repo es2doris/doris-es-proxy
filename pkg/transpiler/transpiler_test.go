@@ -2369,3 +2369,167 @@ func TestRound42LuceneDocValuesScaledFloatSortSearchAfterTermsSetDedupAndNullVal
 		t.Fatalf("F10 expected match on keyword with null_value='missing' to use term equality (= 'missing'), got:\n%s", cqNullMatch.WhereSQL)
 	}
 }
+
+func TestRound43ScriptSortNestedGeoSortGeohashMissingBucketLuceneAndCollapseArray(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"items": {
+				"type": "nested",
+				"properties": {
+					"active": {"type": "boolean"},
+					"price": {"type": "double"}
+				}
+			},
+			"tags": {"type": "keyword", "multi_valued": true, "upgraded_array": true},
+			"labels": {"type": "keyword"},
+			"loc": {"type": "geo_point"},
+			"env": {"type": "keyword"},
+			"level": {"type": "keyword"},
+			"age": {"type": "integer"},
+			"ts": {"type": "date"}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("unmarshal spec failed: %v", err)
+	}
+	sch := schema.CompileIndexSchema("db", "r43_tr", &spec)
+	tr := NewTranspiler(sch, TranspilerOptions{})
+
+	// F1: _script sort with nested path resolves relative subfield via sortNCtx
+	var scriptSortReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"sort": [
+			{
+				"_script": {
+					"type": "number",
+					"order": "desc",
+					"mode": "max",
+					"nested": {
+						"path": "items",
+						"filter": {"term": {"items.active": true}}
+					},
+					"script": "doc['price'].value * 2"
+				}
+			}
+		]
+	}`), &scriptSortReq)
+	planF1, err := tr.BuildSearchPlan(&scriptSortReq)
+	if err != nil {
+		t.Fatalf("F1 BuildSearchPlan failed: %v", err)
+	}
+	if !strings.Contains(planF1.HitsSQL, "`n__items__price`") {
+		t.Fatalf("F1 expected relative 'price' in _script nested sort to resolve to `n__items__price`, got:\n%s", planF1.HitsSQL)
+	}
+
+	// F2 & F10: terms_set with string minimum_should_match_script and multi-field boost summation
+	var tsReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"query": {
+			"terms_set": {
+				"tags": {
+					"terms": ["a", "b", "c"],
+					"minimum_should_match_script": "Math.min(params.num_terms, 2)",
+					"boost": 2.0
+				},
+				"labels": {
+					"terms": ["x"],
+					"minimum_should_match": 1,
+					"boost": 3.0
+				}
+			}
+		}
+	}`), &tsReq)
+	cqF2 := tr.CompileQuery(tsReq.Query, true, nil)
+	if !strings.Contains(cqF2.WhereSQL, ">= LEAST(3, 2)") || !strings.Contains(cqF2.ScoreSQL, "2.0000") || !strings.Contains(cqF2.ScoreSQL, "3.0000") {
+		t.Fatalf("F2/F10 expected threshold >= LEAST(3, 2) and both field boosts (2.0000 and 3.0000) in terms_set compilation, got WhereSQL=%s ScoreSQL=%s", cqF2.WhereSQL, cqF2.ScoreSQL)
+	}
+
+	// F8: _geo_distance sort with geohash origin and SPLIT_PART
+	var geoSortReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"sort": [
+			{
+				"_geo_distance": {
+					"loc": "u4pruydqqvj",
+					"order": "asc",
+					"unit": "km"
+				}
+			}
+		]
+	}`), &geoSortReq)
+	planF8, err := tr.BuildSearchPlan(&geoSortReq)
+	if err != nil {
+		t.Fatalf("F8 BuildSearchPlan failed: %v", err)
+	}
+	if !strings.Contains(planF8.HitsSQL, "SPLIT_PART(") || !strings.Contains(planF8.HitsSQL, "57.64911") {
+		t.Fatalf("F8 expected SPLIT_PART and decoded geohash coordinates in _geo_distance sort SQL, got:\n%s", planF8.HitsSQL)
+	}
+
+	// F9 & F18: terms agg with missing_bucket:true and rate sub-agg in value_count mode with script
+	var aggReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"size": 0,
+		"aggs": {
+			"by_env": {
+				"terms": {
+					"field": "env",
+					"missing_bucket": true
+				}
+			},
+			"by_hour": {
+				"date_histogram": {
+					"field": "ts",
+					"fixed_interval": "1h"
+				},
+				"aggs": {
+					"r": {
+						"rate": {
+							"mode": "value_count",
+							"unit": "1h",
+							"script": "doc['age'].value"
+						}
+					}
+				}
+			}
+		}
+	}`), &aggReq)
+	planF9, err := tr.BuildSearchPlan(&aggReq)
+	if err != nil {
+		t.Fatalf("F9/F18 BuildSearchPlan failed: %v", err)
+	}
+	if !strings.Contains(planF9.AggsSQL, `'__ES_MISSING_BUCKET__'`) {
+		t.Fatalf("F9 expected missing_bucket sentinel in AggsSQL, got:\n%s", planF9.AggsSQL)
+	}
+	if !strings.Contains(planF9.AggsSQL, "COUNT(`f__age`)") {
+		t.Fatalf("F18 expected COUNT(`f__age`) for rate value_count with script, got:\n%s", planF9.AggsSQL)
+	}
+
+	// F10: Lucene NOT env:prod OR level:error, unfielded [* TO *], and empty-bounds range query
+	qLuceneDisj := parseSimpleLuceneToASTWithFlags("NOT env:prod OR level:error", "", nil, "OR", 0, false, simpleQueryFlags{})
+	if qLuceneDisj.Bool == nil || len(qLuceneDisj.Bool.Should) != 2 || len(qLuceneDisj.Bool.MustNot) != 0 {
+		t.Fatalf("F10 expected 2 Should disjuncts and 0 top-level MustNot for 'NOT env:prod OR level:error', got %+v", qLuceneDisj.Bool)
+	}
+	qLuceneRangeAll := parseSimpleLuceneToASTWithFlags("[* TO *]", "age", nil, "OR", 0, false, simpleQueryFlags{})
+	if qLuceneRangeAll.Bool == nil || len(qLuceneRangeAll.Bool.Should) != 1 || qLuceneRangeAll.Bool.Should[0].Exists == nil || qLuceneRangeAll.Bool.Should[0].Exists.Field != "age" {
+		t.Fatalf("F10 expected ExistsQuery(age) in Bool.Should[0] for [* TO *] with defaultField='age', got %+v", qLuceneRangeAll)
+	}
+	var emptyRangeReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query": {"range": {"age": {"boost": 2.5}}}}`), &emptyRangeReq)
+	cqEmptyRange := tr.CompileQuery(emptyRangeReq.Query, true, nil)
+	if !strings.Contains(cqEmptyRange.WhereSQL, "`f__age` IS NOT NULL") || strings.Contains(cqEmptyRange.WhereSQL, "TRUE") {
+		t.Fatalf("F10 expected IS NOT NULL for empty-bounds range query, got %s", cqEmptyRange.WhereSQL)
+	}
+
+	// F20: collapse on promoted array field uses element_at(f__arr__tags, 1)
+	var colReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"collapse": {"field": "tags"}
+	}`), &colReq)
+	planF20, err := tr.BuildSearchPlan(&colReq)
+	if err != nil {
+		t.Fatalf("F20 BuildSearchPlan failed: %v", err)
+	}
+	if !strings.Contains(planF20.HitsSQL, "PARTITION BY element_at(`f__arr__tags`, 1)") {
+		t.Fatalf("F20 expected PARTITION BY element_at(`f__arr__tags`, 1) in collapse SQL, got:\n%s", planF20.HitsSQL)
+	}
+}

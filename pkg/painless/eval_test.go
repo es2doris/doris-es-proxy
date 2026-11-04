@@ -1294,3 +1294,73 @@ func TestRound42PainlessParamsIsolationBracketAliasCtxMapMutationsAndSortVoid(t 
 		t.Fatalf("F30 expected comparator error from stream().min, got %v", err)
 	}
 }
+
+func TestRound43MultiLineFluentChainsRemoveAllRetainAllRemoveIfExprMapEmptyAndInvalidCtxOp(t *testing.T) {
+	// F21: Multi-line fluent stream chain and multi-line binary/bitwise continuation operators
+	docF21 := map[string]any{
+		"nums": []any{int64(1), int64(2), int64(3), int64(4)},
+	}
+	if err := EvalPainless(docF21, `
+		ctx._source.evens = ctx._source.nums.stream()
+			.filter(x -> x % 2 == 0)
+			.map(x -> x * 10)
+			.collect(Collectors.toList());
+		ctx._source.math = 100 /
+			5 %
+			7 + (6 &
+			3) + (1 <<
+			2);
+	`, nil); err != nil {
+		t.Fatalf("F21 EvalPainless failed: %v", err)
+	}
+	evens, _ := docF21["evens"].([]any)
+	if len(evens) != 2 || evens[0] != int64(20) || evens[1] != int64(40) || docF21["math"] != int64(12) {
+		t.Fatalf("F21 unexpected docF21 state: %+v", docF21)
+	}
+
+	// F22: removeIf, removeAll, and retainAll mutate backing list when evaluated in expression context
+	docF22 := map[string]any{
+		"tags": []any{"a", "b", "c", "d"},
+	}
+	if err := EvalPainless(docF22, `
+		if (ctx._source.tags.removeIf(x -> x == 'b')) {
+			ctx._source.removed_b = true;
+		}
+		def remC = ctx._source.tags.removeAll(['c']);
+		if (ctx._source.tags.retainAll(['a'])) {
+			ctx._source.retained_only_a = remC;
+		}
+	`, nil); err != nil {
+		t.Fatalf("F22 EvalPainless failed: %v", err)
+	}
+	tagsOut, _ := docF22["tags"].([]any)
+	if len(tagsOut) != 1 || tagsOut[0] != "a" || docF22["removed_b"] != true || docF22["retained_only_a"] != true {
+		t.Fatalf("F22 unexpected docF22 state: %+v", docF22)
+	}
+
+	// F23: .empty and .length on map[string]any via resolveParamPath
+	docF23 := map[string]any{
+		"empty_map": map[string]any{},
+		"full_map":  map[string]any{"k1": "v1", "k2": "v2"},
+	}
+	if err := EvalPainless(docF23, `
+		ctx._source.is_empty = ctx._source.empty_map.empty;
+		ctx._source.is_not_empty = !ctx._source.full_map.empty;
+		ctx._source.map_len = ctx._source.full_map.length;
+	`, nil); err != nil {
+		t.Fatalf("F23 EvalPainless failed: %v", err)
+	}
+	if docF23["is_empty"] != true || docF23["is_not_empty"] != true || docF23["map_len"] != int64(2) {
+		t.Fatalf("F23 unexpected docF23 state: %+v", docF23)
+	}
+
+	// F24: ApplyUpdateWithResult rejects unsupported ctx.op values
+	badUpd := &UpdateRequest{
+		Script: &ScriptSpec{
+			Source: `ctx.op = 'bogus_op';`,
+		},
+	}
+	if _, _, err := ApplyUpdateWithResult(json.RawMessage(`{"a":1}`), badUpd, true); err == nil || !strings.Contains(strings.ToLower(err.Error()), "operation [bogus_op] is not supported") {
+		t.Fatalf("F24 expected unsupported ctx.op error, got %v", err)
+	}
+}

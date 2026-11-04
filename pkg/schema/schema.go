@@ -415,8 +415,14 @@ func validatePropertiesCompatibility(oldProps, newProps map[string]esast.FieldPr
 		if oldType != "" && newType != "" && oldType != newType {
 			return fmt.Errorf("mapper [%s] cannot be changed from type [%s] to [%s]", fullPath, oldType, newType)
 		}
-		if oldProp.Enabled != nil && newProp.Enabled != nil && *oldProp.Enabled != *newProp.Enabled {
-			return fmt.Errorf("mapper [%s] enabled cannot be changed from [%v] to [%v]", fullPath, *oldProp.Enabled, *newProp.Enabled)
+		if newProp.Enabled != nil && (oldType == "object" || oldProp.Enabled != nil) {
+			oldEnabled := true
+			if oldProp.Enabled != nil {
+				oldEnabled = *oldProp.Enabled
+			}
+			if oldEnabled != *newProp.Enabled {
+				return fmt.Errorf("mapper [%s] enabled cannot be changed from [%v] to [%v]", fullPath, oldEnabled, *newProp.Enabled)
+			}
 		}
 		if oldProp.Path != "" && newProp.Path != "" && oldProp.Path != newProp.Path {
 			return fmt.Errorf("cannot change path of alias [%s] from [%s] to [%s]", fullPath, oldProp.Path, newProp.Path)
@@ -783,7 +789,7 @@ func (s *IndexSchema) registerLeafField(
 		}
 		return
 	}
-	if prop.MultiValued || DefaultMultiValuedPaths[dotPath] {
+	if (prop.MultiValued || DefaultMultiValuedPaths[dotPath]) && esType != "text" && esType != "match_only_text" {
 		arrColName := colName
 		if prop.UpgradedArray {
 			arrColName = "f__arr__" + SanitizeDorisIdentifier(dotPath)
