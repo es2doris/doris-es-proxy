@@ -254,6 +254,9 @@ func (c *StreamLoadClient) fetchErrorURLDetail(ctx context.Context, errURL strin
 	if err != nil {
 		return ""
 	}
+	if c.cfg.User != "" || c.cfg.Password != "" {
+		req.SetBasicAuth(c.cfg.User, c.cfg.Password)
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return ""

@@ -299,10 +299,16 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 			std.QueryVector = std.Vector
 		}
 		*kq = KNNQuery(std.knnPlain)
+		if kq.Boost != nil && (*kq.Boost < 0 || math.IsNaN(*kq.Boost) || math.IsInf(*kq.Boost, 0)) {
+			return fmt.Errorf("parsing_exception: [knn] boost must be a non-negative number")
+		}
 		return nil
 	}
 	// Support OpenSearch knn syntax: {"<field>": {"vector": [...], "k": 5, "filter": {...}}}
-	cleaned, mapBoost := stripNamedQueryAndMapBoost(trimmed, false)
+	cleaned, mapBoost, err := stripNamedQueryAndMapBoost(trimmed, false)
+	if err != nil {
+		return err
+	}
 	var byField map[string]struct {
 		Vector        []float64  `json:"vector"`
 		QueryVector   []float64  `json:"query_vector"`
@@ -335,6 +341,9 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 		}
 		kq.Filter = spec.Filter
 		break
+	}
+	if kq.Boost != nil && (*kq.Boost < 0 || math.IsNaN(*kq.Boost) || math.IsInf(*kq.Boost, 0)) {
+		return fmt.Errorf("parsing_exception: [knn] boost must be a non-negative number")
 	}
 	return nil
 }
@@ -739,36 +748,36 @@ func parseFlexibleBool(v any) (bool, error) {
 	}
 }
 
-func stripNamedQueryAndMapBoost(rawClause json.RawMessage, requireMultipleKeysForBoost bool) (json.RawMessage, *float64) {
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(rawClause, &m); err != nil {
-		return rawClause, nil
+func parseOptionalNonNegativeBoost(raw json.RawMessage) (*float64, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, nil
 	}
-	modified := false
-	var mapBoost *float64
-	if rawBoost, hasBoost := m["boost"]; hasBoost && (!requireMultipleKeysForBoost || len(m) > 1) {
-		tb := bytes.TrimSpace(rawBoost)
-		if len(tb) > 0 && tb[0] != '{' && tb[0] != '[' {
-			var b float64
-			parsed := false
-			if json.Unmarshal(tb, &b) == nil {
+	var b float64
+	parsed := false
+	if json.Unmarshal(trimmed, &b) == nil {
+		parsed = true
+	} else if trimmed[0] == '"' {
+		var s string
+		if json.Unmarshal(trimmed, &s) == nil {
+			if fv, err := strconv.ParseFloat(strings.TrimSpace(s), 64); err == nil {
+				b = fv
 				parsed = true
-			} else if tb[0] == '"' {
-				var s string
-				if json.Unmarshal(tb, &s) == nil {
-					if fv, err := strconv.ParseFloat(strings.TrimSpace(s), 64); err == nil {
-						b = fv
-						parsed = true
-					}
-				}
-			}
-			if parsed && !math.IsNaN(b) && !math.IsInf(b, 0) && b >= 0 {
-				mapBoost = &b
-				delete(m, "boost")
-				modified = true
 			}
 		}
 	}
+	if !parsed || math.IsNaN(b) || math.IsInf(b, 0) || b < 0 {
+		return nil, fmt.Errorf("parsing_exception: [boost] must be a non-negative number, got %s", string(trimmed))
+	}
+	return &b, nil
+}
+
+func stripNamedQueryAndMapBoost(rawClause json.RawMessage, requireMultipleKeysForBoost bool) (json.RawMessage, *float64, error) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(rawClause, &m); err != nil {
+		return rawClause, nil, nil
+	}
+	modified := false
 	if rawName, hasName := m["_name"]; hasName && len(m) > 1 {
 		tn := bytes.TrimSpace(rawName)
 		if len(tn) > 0 && tn[0] == '"' {
@@ -776,14 +785,37 @@ func stripNamedQueryAndMapBoost(rawClause json.RawMessage, requireMultipleKeysFo
 			modified = true
 		}
 	}
+	var mapBoost *float64
+	if rawBoost, hasBoost := m["boost"]; hasBoost && (!requireMultipleKeysForBoost || len(m) > 1) {
+		tb := bytes.TrimSpace(rawBoost)
+		isFieldObject := len(tb) > 0 && tb[0] == '{'
+		if !isFieldObject {
+			b, err := parseOptionalNonNegativeBoost(rawBoost)
+			if err != nil {
+				if !requireMultipleKeysForBoost || !strings.HasPrefix(string(tb), `"`) {
+					return rawClause, nil, err
+				}
+				var strVal string
+				if json.Unmarshal(tb, &strVal) == nil {
+					if fv, pErr := strconv.ParseFloat(strings.TrimSpace(strVal), 64); pErr == nil && fv < 0 {
+						return rawClause, nil, err
+					}
+				}
+			} else if b != nil {
+				mapBoost = b
+				delete(m, "boost")
+				modified = true
+			}
+		}
+	}
 	if !modified {
-		return rawClause, nil
+		return rawClause, nil, nil
 	}
 	cleaned, err := json.Marshal(m)
 	if err != nil {
-		return rawClause, mapBoost
+		return rawClause, mapBoost, nil
 	}
-	return cleaned, mapBoost
+	return cleaned, mapBoost, nil
 }
 
 func (q *Query) UnmarshalJSON(data []byte) error {
@@ -800,6 +832,11 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: unknown query clause [%s]", k)
 		}
 	}
+	if rawTopBoost, ok := raw["boost"]; ok {
+		if _, err := parseOptionalNonNegativeBoost(rawTopBoost); err != nil {
+			return err
+		}
+	}
 	mapBoosts := make(map[string]*float64)
 	rawModified := false
 	for _, clauseKey := range []string{
@@ -809,7 +846,10 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 	} {
 		if rawClause, ok := raw[clauseKey]; ok {
 			reqMulti := clauseKey != "range" && clauseKey != "terms_set"
-			cleaned, mb := stripNamedQueryAndMapBoost(rawClause, reqMulti)
+			cleaned, mb, err := stripNamedQueryAndMapBoost(rawClause, reqMulti)
+			if err != nil {
+				return err
+			}
 			if !bytes.Equal(cleaned, rawClause) {
 				raw[clauseKey] = cleaned
 				rawModified = true
@@ -828,6 +868,104 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 	var alias queryAlias
 	if err := json.Unmarshal(trimmed, &alias); err != nil {
 		return err
+	}
+	if alias.MatchAll != nil {
+		if rawMB, ok := alias.MatchAll["boost"]; ok && rawMB != nil {
+			mbBytes, _ := json.Marshal(rawMB)
+			if _, err := parseOptionalNonNegativeBoost(mbBytes); err != nil {
+				return err
+			}
+		}
+	}
+	for _, ptrBoost := range []*float64{
+		func() *float64 {
+			if alias.Bool != nil {
+				return alias.Bool.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.DisMax != nil {
+				return alias.DisMax.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.Boosting != nil {
+				return alias.Boosting.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.Ids != nil {
+				return alias.Ids.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.Exists != nil {
+				return alias.Exists.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.MultiMatch != nil {
+				return alias.MultiMatch.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.CombinedFields != nil {
+				return alias.CombinedFields.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.QueryString != nil {
+				return alias.QueryString.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.SimpleQueryString != nil {
+				return alias.SimpleQueryString.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.Nested != nil {
+				return alias.Nested.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.ConstantScore != nil {
+				return alias.ConstantScore.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.FunctionScore != nil {
+				return alias.FunctionScore.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.ScriptScore != nil {
+				return alias.ScriptScore.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.Script != nil {
+				return alias.Script.Boost
+			}
+			return nil
+		}(),
+	} {
+		if ptrBoost != nil && (*ptrBoost < 0 || math.IsNaN(*ptrBoost) || math.IsInf(*ptrBoost, 0)) {
+			return fmt.Errorf("parsing_exception: [boost] must be a non-negative number")
+		}
 	}
 	if b := mapBoosts["range"]; b != nil {
 		for k, rc := range alias.Range {
@@ -941,10 +1079,76 @@ type DisMaxQuery struct {
 
 // BoostingQuery represents an ES `boosting` query (`positive`, `negative`, `negative_boost`).
 type BoostingQuery struct {
-	Positive      Query    `json:"positive"`
-	Negative      Query    `json:"negative"`
-	NegativeBoost float64  `json:"negative_boost,omitempty"`
-	Boost         *float64 `json:"boost,omitempty"`
+	Positive         Query    `json:"positive"`
+	Negative         Query    `json:"negative"`
+	NegativeBoost    float64  `json:"negative_boost,omitempty"`
+	HasNegativeBoost bool     `json:"-"`
+	Boost            *float64 `json:"boost,omitempty"`
+}
+
+func (bq BoostingQuery) EffectiveNegativeBoost() float64 {
+	if bq.HasNegativeBoost {
+		return bq.NegativeBoost
+	}
+	if bq.NegativeBoost > 0 {
+		return bq.NegativeBoost
+	}
+	return 0.5
+}
+
+func (bq BoostingQuery) MarshalJSON() ([]byte, error) {
+	var negBoostPtr *float64
+	if bq.HasNegativeBoost || bq.NegativeBoost != 0 {
+		nb := bq.NegativeBoost
+		negBoostPtr = &nb
+	}
+	return json.Marshal(struct {
+		Positive      Query    `json:"positive"`
+		Negative      Query    `json:"negative"`
+		NegativeBoost *float64 `json:"negative_boost,omitempty"`
+		Boost         *float64 `json:"boost,omitempty"`
+	}{
+		Positive:      bq.Positive,
+		Negative:      bq.Negative,
+		NegativeBoost: negBoostPtr,
+		Boost:         bq.Boost,
+	})
+}
+
+func (bq *BoostingQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var raw struct {
+		Positive      Query           `json:"positive"`
+		Negative      Query           `json:"negative"`
+		NegativeBoost json.RawMessage `json:"negative_boost"`
+		Boost         json.RawMessage `json:"boost"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	bq.Positive = raw.Positive
+	bq.Negative = raw.Negative
+	if len(raw.NegativeBoost) > 0 {
+		nb, err := parseOptionalNonNegativeBoost(raw.NegativeBoost)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [boosting] negative_boost must be a non-negative number")
+		}
+		if nb != nil {
+			bq.NegativeBoost = *nb
+			bq.HasNegativeBoost = true
+		}
+	}
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		bq.Boost = b
+	}
+	return nil
 }
 
 // TermsLookupSpec models an external document lookup in a `terms` query (`{"index": "...", "id": "...", "path": "..."}`).
@@ -1063,6 +1267,48 @@ type TermsSetEntry struct {
 	Boost                    *float64 `json:"boost,omitempty"`
 }
 
+func (tse *TermsSetEntry) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "terms", "minimum_should_match", "minimum_should_match_field", "minimum_should_match_script", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [terms_set] unknown field [%s]", k)
+		}
+	}
+	var full struct {
+		Terms                    []any           `json:"terms"`
+		MinimumShouldMatch       any             `json:"minimum_should_match"`
+		MinimumShouldMatchField  string          `json:"minimum_should_match_field"`
+		MinimumShouldMatchScript any             `json:"minimum_should_match_script"`
+		Boost                    json.RawMessage `json:"boost"`
+	}
+	if err := json.Unmarshal(trimmed, &full); err != nil {
+		return err
+	}
+	tse.Terms = full.Terms
+	tse.MinimumShouldMatchField = full.MinimumShouldMatchField
+	tse.MinimumShouldMatchScript = full.MinimumShouldMatchScript
+	if tse.MinimumShouldMatchScript == nil && full.MinimumShouldMatch != nil {
+		tse.MinimumShouldMatchScript = full.MinimumShouldMatch
+	}
+	if len(full.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(full.Boost)
+		if err != nil {
+			return err
+		}
+		tse.Boost = b
+	}
+	return nil
+}
+
 // FuzzyEntry models a `fuzzy` query (`{"fuzzy": {"name": "alice"}}` or `{"fuzzy": {"name": {"value": "alice", "fuzziness": "AUTO"}}}`).
 type FuzzyEntry struct {
 	Value           any     `json:"value"`
@@ -1096,11 +1342,25 @@ func (f *FuzzyEntry) UnmarshalJSON(data []byte) error {
 	f.HasBoost = false
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var rawMap map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+			return err
+		}
+		for k := range rawMap {
+			switch k {
+			case "value", "fuzziness", "case_insensitive", "boost", "prefix_length", "max_expansions", "transpositions", "rewrite", "_name":
+			default:
+				return fmt.Errorf("parsing_exception: [fuzzy] unknown field [%s]", k)
+			}
+		}
+		if _, hasVal := rawMap["value"]; !hasVal {
+			return fmt.Errorf("parsing_exception: [fuzzy] missing required [value] field")
+		}
 		var full struct {
-			Value           any      `json:"value"`
-			Fuzziness       any      `json:"fuzziness"`
-			CaseInsensitive any      `json:"case_insensitive"`
-			Boost           *float64 `json:"boost"`
+			Value           any             `json:"value"`
+			Fuzziness       any             `json:"fuzziness"`
+			CaseInsensitive any             `json:"case_insensitive"`
+			Boost           json.RawMessage `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
@@ -1112,9 +1372,15 @@ func (f *FuzzyEntry) UnmarshalJSON(data []byte) error {
 		f.Value = full.Value
 		f.Fuzziness = full.Fuzziness
 		f.CaseInsensitive = ci
-		if full.Boost != nil {
-			f.Boost = *full.Boost
-			f.HasBoost = true
+		if len(full.Boost) > 0 {
+			b, err := parseOptionalNonNegativeBoost(full.Boost)
+			if err != nil {
+				return err
+			}
+			if b != nil {
+				f.Boost = *b
+				f.HasBoost = true
+			}
 		}
 		return nil
 	}
@@ -1290,10 +1556,24 @@ func (t *TermEntry) UnmarshalJSON(data []byte) error {
 	t.HasBoost = false
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var rawMap map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+			return err
+		}
+		for k := range rawMap {
+			switch k {
+			case "value", "boost", "case_insensitive", "_name":
+			default:
+				return fmt.Errorf("parsing_exception: [term] unknown field [%s]", k)
+			}
+		}
+		if _, hasVal := rawMap["value"]; !hasVal {
+			return fmt.Errorf("parsing_exception: [term] missing required [value] field")
+		}
 		var full struct {
-			Value           any      `json:"value"`
-			Boost           *float64 `json:"boost"`
-			CaseInsensitive any      `json:"case_insensitive"`
+			Value           any             `json:"value"`
+			Boost           json.RawMessage `json:"boost"`
+			CaseInsensitive any             `json:"case_insensitive"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
@@ -1303,9 +1583,15 @@ func (t *TermEntry) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		t.Value = full.Value
-		if full.Boost != nil {
-			t.Boost = *full.Boost
-			t.HasBoost = true
+		if len(full.Boost) > 0 {
+			b, err := parseOptionalNonNegativeBoost(full.Boost)
+			if err != nil {
+				return err
+			}
+			if b != nil {
+				t.Boost = *b
+				t.HasBoost = true
+			}
 		}
 		t.CaseInsensitive = ci
 		return nil
@@ -1320,13 +1606,19 @@ type IdsQuery struct {
 
 func (iq *IdsQuery) UnmarshalJSON(data []byte) error {
 	var raw struct {
-		Values any      `json:"values"`
-		Boost  *float64 `json:"boost"`
+		Values any             `json:"values"`
+		Boost  json.RawMessage `json:"boost"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
-	iq.Boost = raw.Boost
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		iq.Boost = b
+	}
 	switch v := raw.Values.(type) {
 	case nil:
 	case []any:
@@ -1361,6 +1653,58 @@ type RangeCond struct {
 	Boost        *float64 `json:"boost,omitempty"`
 	Format       string   `json:"format,omitempty"`
 	TimeZone     string   `json:"time_zone,omitempty"`
+}
+
+func (rc *RangeCond) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "gt", "gte", "lt", "lte", "from", "to", "include_lower", "include_upper", "boost", "format", "time_zone", "relation", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [range] unknown field [%s]", k)
+		}
+	}
+	var full struct {
+		GT           any             `json:"gt"`
+		GTE          any             `json:"gte"`
+		LT           any             `json:"lt"`
+		LTE          any             `json:"lte"`
+		From         any             `json:"from"`
+		To           any             `json:"to"`
+		IncludeLower *bool           `json:"include_lower"`
+		IncludeUpper *bool           `json:"include_upper"`
+		Boost        json.RawMessage `json:"boost"`
+		Format       string          `json:"format"`
+		TimeZone     string          `json:"time_zone"`
+	}
+	if err := json.Unmarshal(trimmed, &full); err != nil {
+		return err
+	}
+	rc.GT = full.GT
+	rc.GTE = full.GTE
+	rc.LT = full.LT
+	rc.LTE = full.LTE
+	rc.From = full.From
+	rc.To = full.To
+	rc.IncludeLower = full.IncludeLower
+	rc.IncludeUpper = full.IncludeUpper
+	rc.Format = full.Format
+	rc.TimeZone = full.TimeZone
+	if len(full.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(full.Boost)
+		if err != nil {
+			return err
+		}
+		rc.Boost = b
+	}
+	return nil
 }
 
 // NormalizedBounds returns the effective (gt, gte, lt, lte) bounds after normalizing `from`/`to`.
@@ -1414,11 +1758,27 @@ func (p *PrefixEntry) UnmarshalJSON(data []byte) error {
 	p.HasBoost = false
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var rawMap map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+			return err
+		}
+		for k := range rawMap {
+			switch k {
+			case "value", "prefix", "case_insensitive", "boost", "rewrite", "_name":
+			default:
+				return fmt.Errorf("parsing_exception: [prefix] unknown field [%s]", k)
+			}
+		}
+		_, hasVal := rawMap["value"]
+		_, hasPfx := rawMap["prefix"]
+		if !hasVal && !hasPfx {
+			return fmt.Errorf("parsing_exception: [prefix] missing required [value] field")
+		}
 		var full struct {
-			Value           any      `json:"value"`
-			Prefix          any      `json:"prefix"`
-			CaseInsensitive any      `json:"case_insensitive"`
-			Boost           *float64 `json:"boost"`
+			Value           any             `json:"value"`
+			Prefix          any             `json:"prefix"`
+			CaseInsensitive any             `json:"case_insensitive"`
+			Boost           json.RawMessage `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
@@ -1433,9 +1793,15 @@ func (p *PrefixEntry) UnmarshalJSON(data []byte) error {
 			p.Value = fmt.Sprintf("%v", full.Prefix)
 		}
 		p.CaseInsensitive = ci
-		if full.Boost != nil {
-			p.Boost = *full.Boost
-			p.HasBoost = true
+		if len(full.Boost) > 0 {
+			b, err := parseOptionalNonNegativeBoost(full.Boost)
+			if err != nil {
+				return err
+			}
+			if b != nil {
+				p.Boost = *b
+				p.HasBoost = true
+			}
 		}
 		return nil
 	}
@@ -1478,11 +1844,27 @@ func (w *WildcardEntry) UnmarshalJSON(data []byte) error {
 	w.HasBoost = false
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var rawMap map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+			return err
+		}
+		for k := range rawMap {
+			switch k {
+			case "value", "wildcard", "case_insensitive", "boost", "rewrite", "_name":
+			default:
+				return fmt.Errorf("parsing_exception: [wildcard] unknown field [%s]", k)
+			}
+		}
+		_, hasVal := rawMap["value"]
+		_, hasWc := rawMap["wildcard"]
+		if !hasVal && !hasWc {
+			return fmt.Errorf("parsing_exception: [wildcard] missing required [value] field")
+		}
 		var full struct {
-			Value           any      `json:"value"`
-			Wildcard        any      `json:"wildcard"`
-			CaseInsensitive any      `json:"case_insensitive"`
-			Boost           *float64 `json:"boost"`
+			Value           any             `json:"value"`
+			Wildcard        any             `json:"wildcard"`
+			CaseInsensitive any             `json:"case_insensitive"`
+			Boost           json.RawMessage `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
@@ -1497,9 +1879,15 @@ func (w *WildcardEntry) UnmarshalJSON(data []byte) error {
 			w.Value = fmt.Sprintf("%v", full.Wildcard)
 		}
 		w.CaseInsensitive = ci
-		if full.Boost != nil {
-			w.Boost = *full.Boost
-			w.HasBoost = true
+		if len(full.Boost) > 0 {
+			b, err := parseOptionalNonNegativeBoost(full.Boost)
+			if err != nil {
+				return err
+			}
+			if b != nil {
+				w.Boost = *b
+				w.HasBoost = true
+			}
 		}
 		return nil
 	}
@@ -1542,11 +1930,27 @@ func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
 	r.HasBoost = false
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var rawMap map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+			return err
+		}
+		for k := range rawMap {
+			switch k {
+			case "value", "regexp", "case_insensitive", "boost", "flags", "max_determinized_states", "rewrite", "_name":
+			default:
+				return fmt.Errorf("parsing_exception: [regexp] unknown field [%s]", k)
+			}
+		}
+		_, hasVal := rawMap["value"]
+		_, hasRx := rawMap["regexp"]
+		if !hasVal && !hasRx {
+			return fmt.Errorf("parsing_exception: [regexp] missing required [value] field")
+		}
 		var full struct {
-			Value           any      `json:"value"`
-			Regexp          any      `json:"regexp"`
-			CaseInsensitive any      `json:"case_insensitive"`
-			Boost           *float64 `json:"boost"`
+			Value           any             `json:"value"`
+			Regexp          any             `json:"regexp"`
+			CaseInsensitive any             `json:"case_insensitive"`
+			Boost           json.RawMessage `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
@@ -1561,9 +1965,15 @@ func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
 			r.Value = fmt.Sprintf("%v", full.Regexp)
 		}
 		r.CaseInsensitive = ci
-		if full.Boost != nil {
-			r.Boost = *full.Boost
-			r.HasBoost = true
+		if len(full.Boost) > 0 {
+			b, err := parseOptionalNonNegativeBoost(full.Boost)
+			if err != nil {
+				return err
+			}
+			if b != nil {
+				r.Boost = *b
+				r.HasBoost = true
+			}
 		}
 		return nil
 	}
@@ -1619,14 +2029,30 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 	m.Operator = "or"
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var rawMap map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+			return err
+		}
+		for k := range rawMap {
+			switch k {
+			case "query", "operator", "boost", "zero_terms_query", "minimum_should_match", "fuzziness", "lenient",
+				"analyzer", "auto_generate_synonyms_phrase_query", "fuzzy_transpositions", "fuzzy_rewrite",
+				"max_expansions", "prefix_length", "cutoff_frequency", "_name":
+			default:
+				return fmt.Errorf("parsing_exception: [match] unknown field [%s]", k)
+			}
+		}
+		if _, hasQ := rawMap["query"]; !hasQ {
+			return fmt.Errorf("parsing_exception: [match] missing required [query] field")
+		}
 		var full struct {
-			Query              any      `json:"query"`
-			Operator           string   `json:"operator"`
-			Boost              *float64 `json:"boost"`
-			ZeroTermsQuery     string   `json:"zero_terms_query"`
-			MinimumShouldMatch any      `json:"minimum_should_match"`
-			Fuzziness          any      `json:"fuzziness"`
-			Lenient            *bool    `json:"lenient"`
+			Query              any             `json:"query"`
+			Operator           string          `json:"operator"`
+			Boost              json.RawMessage `json:"boost"`
+			ZeroTermsQuery     string          `json:"zero_terms_query"`
+			MinimumShouldMatch any             `json:"minimum_should_match"`
+			Fuzziness          any             `json:"fuzziness"`
+			Lenient            *bool           `json:"lenient"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
@@ -1635,9 +2061,15 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 		if full.Operator != "" {
 			m.Operator = strings.ToLower(full.Operator)
 		}
-		if full.Boost != nil {
-			m.Boost = *full.Boost
-			m.HasBoost = true
+		if len(full.Boost) > 0 {
+			b, err := parseOptionalNonNegativeBoost(full.Boost)
+			if err != nil {
+				return err
+			}
+			if b != nil {
+				m.Boost = *b
+				m.HasBoost = true
+			}
 		}
 		m.ZeroTermsQuery = full.ZeroTermsQuery
 		m.MinimumShouldMatch = full.MinimumShouldMatch
@@ -1689,14 +2121,28 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 	p.HasBoost = false
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var rawMap map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+			return err
+		}
+		for k := range rawMap {
+			switch k {
+			case "query", "slop", "operator", "minimum_should_match", "zero_terms_query", "fuzziness", "boost", "analyzer", "max_expansions", "_name":
+			default:
+				return fmt.Errorf("parsing_exception: [match_phrase] unknown field [%s]", k)
+			}
+		}
+		if _, hasQ := rawMap["query"]; !hasQ {
+			return fmt.Errorf("parsing_exception: [match_phrase] missing required [query] field")
+		}
 		var full struct {
-			Query              any      `json:"query"`
-			Slop               int      `json:"slop"`
-			Operator           string   `json:"operator"`
-			MinimumShouldMatch any      `json:"minimum_should_match"`
-			ZeroTermsQuery     string   `json:"zero_terms_query"`
-			Fuzziness          any      `json:"fuzziness"`
-			Boost              *float64 `json:"boost"`
+			Query              any             `json:"query"`
+			Slop               int             `json:"slop"`
+			Operator           string          `json:"operator"`
+			MinimumShouldMatch any             `json:"minimum_should_match"`
+			ZeroTermsQuery     string          `json:"zero_terms_query"`
+			Fuzziness          any             `json:"fuzziness"`
+			Boost              json.RawMessage `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
@@ -1709,9 +2155,15 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 		p.MinimumShouldMatch = full.MinimumShouldMatch
 		p.ZeroTermsQuery = full.ZeroTermsQuery
 		p.Fuzziness = full.Fuzziness
-		if full.Boost != nil {
-			p.Boost = *full.Boost
-			p.HasBoost = true
+		if len(full.Boost) > 0 {
+			b, err := parseOptionalNonNegativeBoost(full.Boost)
+			if err != nil {
+				return err
+			}
+			if b != nil {
+				p.Boost = *b
+				p.HasBoost = true
+			}
 		}
 		return nil
 	}
@@ -1866,6 +2318,79 @@ type FieldValueFactorSpec struct {
 	Missing  *float64 `json:"missing,omitempty"`
 }
 
+var knownAggTypeKeys = map[string]bool{
+	"terms":                     true,
+	"rare_terms":                true,
+	"significant_terms":         true,
+	"significant_text":          true,
+	"date_histogram":            true,
+	"auto_date_histogram":       true,
+	"variable_width_histogram":  true,
+	"histogram":                 true,
+	"range":                     true,
+	"date_range":                true,
+	"ip_range":                  true,
+	"composite":                 true,
+	"filter":                    true,
+	"filters":                   true,
+	"adjacency_matrix":          true,
+	"missing":                   true,
+	"nested":                    true,
+	"reverse_nested":            true,
+	"children":                  true,
+	"parent":                    true,
+	"global":                    true,
+	"sampler":                   true,
+	"diversified_sampler":       true,
+	"cardinality":               true,
+	"value_count":               true,
+	"avg":                       true,
+	"weighted_avg":              true,
+	"sum":                       true,
+	"min":                       true,
+	"max":                       true,
+	"median_absolute_deviation": true,
+	"stats":                     true,
+	"extended_stats":            true,
+	"matrix_stats":              true,
+	"string_stats":              true,
+	"boxplot":                   true,
+	"percentiles":               true,
+	"percentile_ranks":          true,
+	"t_test":                    true,
+	"top_hits":                  true,
+	"top_metrics":               true,
+	"rate":                      true,
+	"geo_bounds":                true,
+	"geo_centroid":              true,
+	"geo_distance":              true,
+	"geohash_grid":              true,
+	"geotile_grid":              true,
+	"geohex_grid":               true,
+	"bucket_sort":               true,
+	"cumulative_sum":            true,
+	"cumulative_cardinality":    true,
+	"derivative":                true,
+	"moving_avg":                true,
+	"moving_fn":                 true,
+	"moving_percentiles":        true,
+	"serial_diff":               true,
+	"normalize":                 true,
+	"avg_bucket":                true,
+	"sum_bucket":                true,
+	"min_bucket":                true,
+	"max_bucket":                true,
+	"stats_bucket":              true,
+	"extended_stats_bucket":     true,
+	"percentiles_bucket":        true,
+	"bucket_selector":           true,
+	"bucket_script":             true,
+	"bucket_correlation":        true,
+	"bucket_count_ks_test":      true,
+	"inference":                 true,
+	"scripted_metric":           true,
+}
+
 // AggSpec represents an Elasticsearch aggregation definition.
 type AggSpec struct {
 	Terms                 *TermsAggSpec             `json:"terms,omitempty"`
@@ -1920,6 +2445,40 @@ type AggSpec struct {
 	ScriptedMetric        *ScriptedMetricAggSpec    `json:"scripted_metric,omitempty"`
 	Aggs                  map[string]AggSpec        `json:"aggs,omitempty"`
 	Aggregations          map[string]AggSpec        `json:"aggregations,omitempty"`
+}
+
+func (a *AggSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	typeCount := 0
+	for k := range rawMap {
+		if k == "aggs" || k == "aggregations" || k == "meta" {
+			continue
+		}
+		if !knownAggTypeKeys[k] {
+			return fmt.Errorf("parsing_exception: unknown aggregation type [%s]", k)
+		}
+		typeCount++
+	}
+	if typeCount == 0 {
+		return fmt.Errorf("parsing_exception: aggregation definition must specify an aggregation type")
+	}
+	if typeCount > 1 {
+		return fmt.Errorf("parsing_exception: aggregation definition cannot specify multiple aggregation types")
+	}
+	type plain AggSpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	*a = AggSpec(p)
+	return nil
 }
 
 // EffectiveRange returns the range specification for `range`, `date_range`, or `ip_range`.

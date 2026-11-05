@@ -85,11 +85,6 @@ func ShredDocument(
 	row["__DORIS_DELETE_SIGN__"] = 0
 	row["_source"] = string(trimmed)
 
-	var allTextBuilder strings.Builder
-	allTextBuilder.Grow(len(trimmed) / 2)
-	collectAllTextWithSchema(parsedDoc, s, nil, &allTextBuilder)
-	row["_all_text"] = allTextBuilder.String()
-
 	var now time.Time
 	getNow := func() time.Time {
 		if now.IsZero() {
@@ -153,6 +148,19 @@ func ShredDocument(
 				if val != nil {
 					if coerced := coerceScalarBindingForDoris(val, b, getNow()); coerced != nil {
 						row[b.ColumnName] = coerced
+					}
+				}
+				if hasObjAtPath && isPrimaryFieldBinding(b) {
+					if len(strs) > 0 {
+						validLeafs := make([]any, 0, len(strs))
+						for _, sv := range strs {
+							validLeafs = append(validLeafs, sv)
+						}
+						if replacePathSliceInMap(parsedDoc, b.SourceJSONPath, validLeafs) {
+							prunedDynamic = true
+						}
+					} else if deletePathInMap(parsedDoc, b.SourceJSONPath) {
+						prunedDynamic = true
 					}
 				}
 				continue
@@ -339,6 +347,19 @@ func ShredDocument(
 			}
 			if len(vals) > 0 {
 				row[b.ColumnName] = vals
+			}
+			if hasObjAtPath && isPrimaryFieldBinding(b) {
+				if len(vals) > 0 {
+					validLeafs := make([]any, 0, len(vals))
+					for _, sv := range vals {
+						validLeafs = append(validLeafs, sv)
+					}
+					if replacePathSliceInMap(parsedDoc, b.SourceJSONPath, validLeafs) {
+						prunedDynamic = true
+					}
+				} else if deletePathInMap(parsedDoc, b.SourceJSONPath) {
+					prunedDynamic = true
+				}
 			}
 		case StoragePromotedVector:
 			vec := extractFloatSliceValues(parsedDoc, b.SourceJSONPath)
@@ -647,6 +668,10 @@ func ShredDocument(
 		sort.Strings(ignoredFields)
 		row["_ignored"] = ignoredFields
 	}
+	var allTextBuilder strings.Builder
+	allTextBuilder.Grow(len(trimmed) / 2)
+	collectAllTextWithSchema(parsedDoc, s, nil, &allTextBuilder)
+	row["_all_text"] = allTextBuilder.String()
 	row["_doc"] = buildVariantDocPayload(trimmed, parsedDoc, prunedDynamic, s)
 
 	return json.Marshal(row)
@@ -1643,6 +1668,15 @@ func ParseESDateBoundToEpochMillis(input string, now time.Time, roundUp bool) (i
 	if s == "" {
 		return 0, false
 	}
+	if len(s) == 4 && (strings.HasPrefix(s, "19") || strings.HasPrefix(s, "20") || strings.HasPrefix(s, "21")) {
+		if t, err := time.Parse("2006", s); err == nil {
+			t = t.UTC()
+			if roundUp {
+				t = t.AddDate(1, 0, 0).Add(-time.Millisecond)
+			}
+			return t.UnixMilli(), true
+		}
+	}
 	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
 		return i, true
 	}
@@ -2324,6 +2358,13 @@ func collectAllTextWithSchema(node any, s *IndexSchema, curPath []string, sb *st
 	switch v := node.(type) {
 	case string:
 		if v != "" {
+			if s != nil && len(s.Fields) > 0 && len(curPath) > 0 {
+				dotPath := strings.Join(curPath, ".")
+				b := s.ResolveField(dotPath)
+				if b.IgnoreAbove > 0 && len([]rune(v)) > b.IgnoreAbove {
+					return
+				}
+			}
 			if sb.Len() > 0 {
 				sb.WriteByte(' ')
 			}
@@ -2538,22 +2579,31 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 		}
 	}
 
-	// Run .keyword companion normalization first so base field normalization does not clobber the raw value before __keyword is populated.
+	// Run .keyword and custom multi-field companion normalization first so base field normalization does not clobber the raw value before companion keys are populated.
 	for _, b := range fields {
 		if b.Kind != StorageNestedSubfield || b.NestedPath != nestedPath {
 			continue
 		}
-		if len(b.SourceJSONPath) <= len(rootParts) || !strings.HasSuffix(b.ESFieldPath, ".keyword") {
+		if len(b.SourceJSONPath) <= len(rootParts) || b.AliasTarget != "" {
 			continue
 		}
-		baseB, hasBase := s.Fields[strings.TrimSuffix(b.ESFieldPath, ".keyword")]
+		srcDotPath := strings.Join(b.SourceJSONPath, ".")
+		if !strings.HasPrefix(b.ESFieldPath, srcDotPath+".") {
+			continue
+		}
+		subKey := strings.TrimPrefix(b.ESFieldPath, srcDotPath+".")
+		if subKey == "" || strings.Contains(subKey, ".") {
+			continue
+		}
+		baseB, hasBase := s.Fields[srcDotPath]
 		if !hasBase {
 			continue
 		}
 		relPath := b.SourceJSONPath[len(rootParts):]
 		if b.IgnoreAbove > 0 || b.LowercaseNormalizer || b.IsMultiValued || b.NullValue != nil ||
-			baseB.IgnoreAbove > 0 || baseB.LowercaseNormalizer || baseB.NullValue != nil {
-			applyNestedKwCompanionNormalizationAtPath(cloned, relPath, b, getNow)
+			baseB.IgnoreAbove > 0 || baseB.LowercaseNormalizer || baseB.NullValue != nil ||
+			b.ESType != baseB.ESType || b.Format != baseB.Format || b.ScalingFactor != baseB.ScalingFactor {
+			applyNestedCompanionNormalizationAtPath(cloned, relPath, "__"+subKey, b, getNow)
 		}
 	}
 	for _, b := range fields {
@@ -2654,7 +2704,7 @@ func appendNestedCopyToAtPath(curr map[string]any, relPath []string, srcVals []s
 	}
 }
 
-func applyNestedKwCompanionNormalizationAtPath(curr map[string]any, relPath []string, b FieldBinding, getNow func() time.Time) {
+func applyNestedCompanionNormalizationAtPath(curr map[string]any, relPath []string, suffix string, b FieldBinding, getNow func() time.Time) {
 	if len(relPath) == 0 || curr == nil {
 		return
 	}
@@ -2666,20 +2716,21 @@ func applyNestedKwCompanionNormalizationAtPath(curr map[string]any, relPath []st
 	if len(relPath) > 1 {
 		switch tv := val.(type) {
 		case map[string]any:
-			applyNestedKwCompanionNormalizationAtPath(tv, relPath[1:], b, getNow)
+			applyNestedCompanionNormalizationAtPath(tv, relPath[1:], suffix, b, getNow)
 		case []any:
 			for _, item := range tv {
 				if subM, ok := item.(map[string]any); ok {
-					applyNestedKwCompanionNormalizationAtPath(subM, relPath[1:], b, getNow)
+					applyNestedCompanionNormalizationAtPath(subM, relPath[1:], suffix, b, getNow)
 				}
 			}
 		}
 		return
 	}
-	if kwVal, hasKw := curr[key+"__keyword"]; hasKw {
-		curr[key+"__keyword"] = normalizeNestedLeafValue(kwVal, b, getNow)
+	compKey := key + suffix
+	if compVal, hasComp := curr[compKey]; hasComp {
+		curr[compKey] = normalizeNestedLeafValue(compVal, b, getNow)
 	} else {
-		curr[key+"__keyword"] = normalizeNestedLeafValue(val, b, getNow)
+		curr[compKey] = normalizeNestedLeafValue(val, b, getNow)
 	}
 }
 

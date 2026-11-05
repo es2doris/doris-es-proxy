@@ -1058,3 +1058,103 @@ func TestRound43ScriptSortNestedModeStringScriptShorthandsAndTermsBoostValidatio
 		}
 	}
 }
+
+func TestRound44ASTBoostValidationAggSpecAndLeafUnknownKeys(t *testing.T) {
+	// F1: Negative boost rejected across all query types, map-level boost, and BoostingQuery.NegativeBoost
+	for _, badBoostJSON := range []string{
+		`{"query": {"term": {"status": "ok", "boost": -1.0}}}`,
+		`{"query": {"term": {"status": {"value": "ok", "boost": -1}}}}`,
+		`{"query": {"prefix": {"status": {"value": "ok", "boost": -0.5}}}}`,
+		`{"query": {"wildcard": {"status": {"value": "ok*", "boost": -2}}}}`,
+		`{"query": {"regexp": {"status": {"value": "ok.*", "boost": -1}}}}`,
+		`{"query": {"fuzzy": {"status": {"value": "ok", "boost": -1}}}}`,
+		`{"query": {"match": {"title": {"query": "hello", "boost": -1}}}}`,
+		`{"query": {"match_phrase": {"title": {"query": "hello", "boost": -1}}}}`,
+		`{"query": {"range": {"age": {"gte": 1, "boost": -1}}}}`,
+		`{"query": {"terms_set": {"tags": {"terms": ["a"], "boost": -1}}}}`,
+		`{"query": {"bool": {"must": [{"match_all": {}}], "boost": -1}}}`,
+		`{"query": {"dis_max": {"queries": [{"match_all": {}}], "boost": -1}}}`,
+		`{"query": {"boosting": {"positive": {"match_all": {}}, "negative": {"match_none": {}}, "negative_boost": -0.5}}}`,
+		`{"query": {"boosting": {"positive": {"match_all": {}}, "negative": {"match_none": {}}, "boost": -1}}}`,
+		`{"query": {"constant_score": {"filter": {"match_all": {}}, "boost": -1}}}`,
+		`{"query": {"exists": {"field": "a", "boost": -1}}}`,
+		`{"query": {"ids": {"values": ["1"], "boost": -1}}}`,
+		`{"query": {"multi_match": {"query": "x", "boost": -1}}}`,
+		`{"query": {"query_string": {"query": "x", "boost": -1}}}`,
+		`{"query": {"simple_query_string": {"query": "x", "boost": -1}}}`,
+		`{"query": {"nested": {"path": "items", "query": {"match_all": {}}, "boost": -1}}}`,
+		`{"query": {"function_score": {"query": {"match_all": {}}, "boost": -1}}}`,
+		`{"query": {"script_score": {"query": {"match_all": {}}, "script": "1", "boost": -1}}}`,
+		`{"query": {"script": {"script": "true", "boost": -1}}}`,
+		`{"query": {"match_all": {"boost": -1}}}`,
+	} {
+		var bad SearchRequest
+		if err := json.Unmarshal([]byte(badBoostJSON), &bad); err == nil || !strings.Contains(err.Error(), "parsing_exception") {
+			t.Fatalf("F1 expected parsing_exception for negative boost %s, got %v", badBoostJSON, err)
+		}
+	}
+
+	// F1: String-encoded float boosts ("boost": "1.5") accepted on RangeCond, FuzzyEntry, TermsSetEntry
+	var strBoostReq SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"bool": {
+				"must": [
+					{"range": {"age": {"gte": 10, "boost": "1.5"}}},
+					{"fuzzy": {"name": {"value": "alice", "boost": "2.5"}}},
+					{"terms_set": {"tags": {"terms": ["a"], "minimum_should_match": 1, "boost": "3.5"}}}
+				]
+			}
+		}
+	}`), &strBoostReq); err != nil {
+		t.Fatalf("F1 expected string-encoded boost to unmarshal cleanly: %v", err)
+	}
+	mustClauses := strBoostReq.Query.Bool.Must
+	if mustClauses[0].Range["age"].Boost == nil || *mustClauses[0].Range["age"].Boost != 1.5 ||
+		mustClauses[1].Fuzzy["name"].Boost != 2.5 ||
+		mustClauses[2].TermsSet["tags"].Boost == nil || *mustClauses[2].TermsSet["tags"].Boost != 3.5 {
+		t.Fatalf("F1 unexpected parsed string boosts: %+v", mustClauses)
+	}
+
+	// F2: AggSpec rejects unknown agg types, empty agg types, and multiple agg types
+	for _, badAggJSON := range []string{
+		`{"aggs": {"a": {"unknown_agg_type": {"field": "x"}}}}`,
+		`{"aggs": {"a": {}}}`,
+		`{"aggs": {"a": {"aggs": {"sub": {"avg": {"field": "x"}}}}}}`,
+		`{"aggs": {"a": {"avg": {"field": "x"}, "sum": {"field": "x"}}}}`,
+	} {
+		var bad SearchRequest
+		if err := json.Unmarshal([]byte(badAggJSON), &bad); err == nil || !strings.Contains(err.Error(), "parsing_exception") {
+			t.Fatalf("F2 expected parsing_exception for invalid agg %s, got %v", badAggJSON, err)
+		}
+	}
+
+	// F3: Unknown keys and missing required value/query rejected inside leaf queries
+	for _, badLeafJSON := range []string{
+		`{"query": {"term": {"status": {"value": "ok", "bogus": 1}}}}`,
+		`{"query": {"term": {"status": {"query": "ok"}}}}`,
+		`{"query": {"prefix": {"status": {"value": "ok", "bogus": 1}}}}`,
+		`{"query": {"wildcard": {"status": {"value": "ok*", "bogus": 1}}}}`,
+		`{"query": {"regexp": {"status": {"value": "ok.*", "bogus": 1}}}}`,
+		`{"query": {"fuzzy": {"status": {"value": "ok", "bogus": 1}}}}`,
+		`{"query": {"match": {"title": {"query": "hi", "bogus": 1}}}}`,
+		`{"query": {"match": {"title": {"value": "hi"}}}}`,
+		`{"query": {"match_phrase": {"title": {"query": "hi", "bogus": 1}}}}`,
+		`{"query": {"range": {"age": {"greater_than": 18}}}}`,
+		`{"query": {"terms_set": {"tags": {"terms": ["a"], "bogus": 1}}}}`,
+	} {
+		var bad SearchRequest
+		if err := json.Unmarshal([]byte(badLeafJSON), &bad); err == nil || !strings.Contains(err.Error(), "parsing_exception") {
+			t.Fatalf("F3 expected parsing_exception for invalid leaf query %s, got %v", badLeafJSON, err)
+		}
+	}
+
+	// F11: BoostingQuery preserves explicit negative_boost: 0
+	var bqZero SearchRequest
+	if err := json.Unmarshal([]byte(`{"query": {"boosting": {"positive": {"match_all": {}}, "negative": {"match_all": {}}, "negative_boost": 0}}}`), &bqZero); err != nil {
+		t.Fatalf("F11 unmarshal boosting negative_boost:0 failed: %v", err)
+	}
+	if bqZero.Query.Boosting.EffectiveNegativeBoost() != 0 {
+		t.Fatalf("F11 expected EffectiveNegativeBoost() == 0, got %v", bqZero.Query.Boosting.EffectiveNegativeBoost())
+	}
+}

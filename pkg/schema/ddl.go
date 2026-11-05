@@ -314,7 +314,7 @@ func GeneratePromoteVariantFieldDDL(s *IndexSchema, esFieldPath string, esType s
 		DorisType:   mapESTypeToDoris(esType),
 		ESType:      strings.ToLower(strings.TrimSpace(esType)),
 	}
-	if DefaultMultiValuedPaths[cleanPath] || strings.EqualFold(esType, "array") {
+	if (DefaultMultiValuedPaths[cleanPath] && !strings.EqualFold(esType, "text") && !strings.EqualFold(esType, "match_only_text")) || strings.EqualFold(esType, "array") {
 		binding.Kind = StoragePromotedArray
 		binding.DorisType = DorisString
 	}

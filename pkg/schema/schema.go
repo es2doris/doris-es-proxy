@@ -405,12 +405,16 @@ func validatePropertiesCompatibility(oldProps, newProps map[string]esast.FieldPr
 			continue
 		}
 		oldType := strings.ToLower(strings.TrimSpace(oldProp.Type))
-		if oldType == "" && (len(oldProp.Properties) > 0 || oldProp.Enabled != nil) {
+		if oldType == "" && (len(oldProp.Properties) > 0 || oldProp.Enabled != nil || oldProp.Dynamic != nil) {
 			oldType = "object"
 		}
 		newType := strings.ToLower(strings.TrimSpace(newProp.Type))
-		if newType == "" && (len(newProp.Properties) > 0 || newProp.Enabled != nil) {
-			newType = "object"
+		if newType == "" && (len(newProp.Properties) > 0 || newProp.Enabled != nil || newProp.Dynamic != nil) {
+			if oldType == "nested" && newProp.Enabled == nil {
+				newType = "nested"
+			} else {
+				newType = "object"
+			}
 		}
 		if oldType != "" && newType != "" && oldType != newType {
 			return fmt.Errorf("mapper [%s] cannot be changed from type [%s] to [%s]", fullPath, oldType, newType)
