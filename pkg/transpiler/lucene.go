@@ -487,20 +487,46 @@ func isLuceneStandaloneNot(tok string, isSimple bool, flags simpleQueryFlags) bo
 	return strings.EqualFold(tok, "NOT") || tok == "!" || tok == "-"
 }
 
-func isLuceneUnaryPrefixed(tok string, isSimple bool, flags simpleQueryFlags) bool {
+func extractLuceneTokenUnary(tok string, isSimple bool, flags simpleQueryFlags) (byte, string) {
 	if len(tok) <= 1 {
-		return false
+		return 0, tok
 	}
-	if strings.HasPrefix(tok, "+") {
-		return !isSimple || flags.and
+	if strings.HasPrefix(tok, "+") && (!isSimple || flags.and) {
+		return '+', tok[1:]
 	}
-	if strings.HasPrefix(tok, "-") {
-		return !isSimple || flags.not
+	if strings.HasPrefix(tok, "-") && (!isSimple || flags.not) {
+		return '-', tok[1:]
 	}
-	if strings.HasPrefix(tok, "!") {
-		return !isSimple
+	if strings.HasPrefix(tok, "!") && !isSimple {
+		return '-', tok[1:]
 	}
-	return false
+	if !isSimple {
+		if idx := findLuceneFieldColon(tok); idx > 0 && idx+2 <= len(tok) {
+			val := strings.TrimSpace(tok[idx+1:])
+			if len(val) > 1 && (val[0] == '+' || val[0] == '-' || val[0] == '!') {
+				valNoBoost, _ := splitLuceneBoost(val)
+				isNegNum := false
+				if val[0] == '-' {
+					if _, err := strconv.ParseFloat(valNoBoost, 64); err == nil {
+						isNegNum = true
+					}
+				}
+				afterOp := strings.TrimSpace(val[1:])
+				if !isNegNum && afterOp != "" {
+					if val[0] == '+' {
+						return '+', tok[:idx+1] + afterOp
+					}
+					return '-', tok[:idx+1] + afterOp
+				}
+			}
+		}
+	}
+	return 0, tok
+}
+
+func isLuceneUnaryPrefixed(tok string, isSimple bool, flags simpleQueryFlags) bool {
+	uOp, _ := extractLuceneTokenUnary(tok, isSimple, flags)
+	return uOp != 0
 }
 
 func parseSimpleLuceneToASTWithFlags(expr, defaultField string, fields []string, defaultOp string, depth int, isSimple bool, flags simpleQueryFlags) esast.Query {
@@ -614,9 +640,10 @@ func parseLuceneTokensToASTWithFlags(tokens []string, defaultField string, field
 			prevWasClause = false
 			tok = "\x00NOT"
 		} else {
-			isUnaryPrefix := isLuceneUnaryPrefixed(tok, isSimple, flags)
+			uOp, _ := extractLuceneTokenUnary(tok, isSimple, flags)
+			isUnaryPrefix := uOp != 0
 			if isUnaryPrefix {
-				if strings.HasPrefix(tok, "+") {
+				if uOp == '+' {
 					hasPlusUnary = true
 				} else {
 					hasNegUnary = true
@@ -690,15 +717,22 @@ func parseLuceneTokenSliceWithFlags(tokens []string, defaultField string, fields
 		mustClause := forceMustNext
 		forceMustNext = false
 		for len(tok) > 0 {
-			if ((strings.HasPrefix(tok, "-") && (!isSimple || flags.not)) || (strings.HasPrefix(tok, "!") && !isSimple)) && len(tok) > 1 {
-				negateNext = true
-				tok = tok[1:]
-			} else if strings.HasPrefix(tok, "+") && (!isSimple || flags.and) && len(tok) > 1 {
-				mustClause = true
-				tok = tok[1:]
-			} else if (tok == "-" && (!isSimple || flags.not)) || (tok == "!" && !isSimple) || (tok == "+" && (!isSimple || flags.and)) {
+			if (tok == "-" && (!isSimple || flags.not)) || (tok == "!" && !isSimple) || (tok == "+" && (!isSimple || flags.and)) {
 				tok = ""
-			} else {
+				break
+			}
+			uOp, stripped := extractLuceneTokenUnary(tok, isSimple, flags)
+			switch uOp {
+			case '-':
+				negateNext = true
+				tok = stripped
+			case '+':
+				mustClause = true
+				tok = stripped
+			default:
+				tok = stripped
+			}
+			if uOp == 0 {
 				break
 			}
 		}
@@ -966,14 +1000,157 @@ func splitLuceneRangeBounds(inner string) (string, string, bool) {
 	return "", "", false
 }
 
+func applyLuceneQueryBoost(q *esast.Query, boost float64) {
+	if q == nil || boost == 1.0 {
+		return
+	}
+	if q.Bool != nil {
+		b := boost
+		if q.Bool.Boost != nil {
+			b = *q.Bool.Boost * boost
+		}
+		q.Bool.Boost = &b
+		return
+	}
+	if q.ConstantScore != nil {
+		b := boost
+		if q.ConstantScore.Boost != nil {
+			b = *q.ConstantScore.Boost * boost
+		}
+		q.ConstantScore.Boost = &b
+		return
+	}
+	if q.Exists != nil {
+		b := boost
+		if q.Exists.Boost != nil {
+			b = *q.Exists.Boost * boost
+		}
+		q.Exists.Boost = &b
+		return
+	}
+	if len(q.Range) > 0 {
+		for k, rc := range q.Range {
+			b := boost
+			if rc.Boost != nil {
+				b = *rc.Boost * boost
+			}
+			rc.Boost = &b
+			q.Range[k] = rc
+		}
+		return
+	}
+	if len(q.Regexp) > 0 {
+		for k, re := range q.Regexp {
+			eff := boost
+			if re.HasBoost {
+				eff = re.Boost * boost
+			}
+			re.Boost = eff
+			re.HasBoost = true
+			q.Regexp[k] = re
+		}
+		return
+	}
+	if len(q.Term) > 0 {
+		for k, te := range q.Term {
+			eff := boost
+			if te.HasBoost {
+				eff = te.Boost * boost
+			}
+			te.Boost = eff
+			te.HasBoost = true
+			q.Term[k] = te
+		}
+		return
+	}
+	if len(q.Match) > 0 {
+		for k, me := range q.Match {
+			if me.Boost == 0 {
+				me.Boost = boost
+			} else {
+				me.Boost *= boost
+			}
+			q.Match[k] = me
+		}
+		return
+	}
+	if len(q.MatchPhrase) > 0 {
+		for k, pe := range q.MatchPhrase {
+			if pe.Boost == 0 {
+				pe.Boost = boost
+			} else {
+				pe.Boost *= boost
+			}
+			q.MatchPhrase[k] = pe
+		}
+		return
+	}
+	if len(q.MatchPhrasePrefix) > 0 {
+		for k, pe := range q.MatchPhrasePrefix {
+			if pe.Boost == 0 {
+				pe.Boost = boost
+			} else {
+				pe.Boost *= boost
+			}
+			q.MatchPhrasePrefix[k] = pe
+		}
+		return
+	}
+	if len(q.Wildcard) > 0 {
+		for k, we := range q.Wildcard {
+			eff := boost
+			if we.HasBoost {
+				eff = we.Boost * boost
+			}
+			we.Boost = eff
+			we.HasBoost = true
+			q.Wildcard[k] = we
+		}
+		return
+	}
+	if len(q.Prefix) > 0 {
+		for k, pe := range q.Prefix {
+			eff := boost
+			if pe.HasBoost {
+				eff = pe.Boost * boost
+			}
+			pe.Boost = eff
+			pe.HasBoost = true
+			q.Prefix[k] = pe
+		}
+		return
+	}
+	if len(q.Fuzzy) > 0 {
+		for k, fe := range q.Fuzzy {
+			eff := boost
+			if fe.HasBoost {
+				eff = fe.Boost * boost
+			}
+			fe.Boost = eff
+			fe.HasBoost = true
+			q.Fuzzy[k] = fe
+		}
+		return
+	}
+	if q.MultiMatch != nil {
+		b := boost
+		if q.MultiMatch.Boost != nil {
+			b = *q.MultiMatch.Boost * boost
+		}
+		q.MultiMatch.Boost = &b
+		return
+	}
+	b := boost
+	inner := *q
+	*q = esast.Query{Bool: &esast.BoolQuery{Must: []esast.Query{inner}, Boost: &b}}
+}
+
 func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, defaultOp string, depth int, isSimple bool, flags simpleQueryFlags) esast.Query {
 	token = strings.TrimSpace(token)
 	token, boost := splitLuceneBoost(token)
 	if (!isSimple || flags.precedence) && hasMatchingOuterParens(token) {
 		inner := parseSimpleLuceneToASTWithFlags(token[1:len(token)-1], defaultField, fields, defaultOp, depth+1, isSimple, flags)
-		if boost != 1.0 && inner.Bool != nil {
-			inner.Bool.Boost = &boost
-		}
+		applyLuceneQueryBoost(&inner, boost)
 		return inner
 	}
 	idx := -1
@@ -1074,8 +1251,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 					return neg
 				}
 				if boost != 1.0 {
-					b := boost
-					return esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: inner, Boost: &b}}
+					applyLuceneQueryBoost(&inner, boost)
 				}
 				return inner
 			}
@@ -1141,10 +1317,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 				}
 				return neg
 			}
-			if boost != 1.0 && inner.Bool != nil {
-				b := boost
-				inner.Bool.Boost = &b
-			}
+			applyLuceneQueryBoost(&inner, boost)
 			return inner
 		}
 		val, rawWild, isQuoted, slop, isFuzzy, explicitZeroFuzzy := parseLuceneQuotedOrFuzzyEx(val)

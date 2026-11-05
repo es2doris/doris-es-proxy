@@ -3663,7 +3663,6 @@ var (
 	reUnwrappedBacktickCol = regexp.MustCompile("`([a-zA-Z0-9_]+)`")
 	reUnwrappedJSONExtract = regexp.MustCompile(`json_extract_string\([^)]+\)`)
 	reUnwrappedDocExtract  = regexp.MustCompile("CAST\\(`_doc`(?:\\['[^']+'\\])+ AS [A-Z]+\\)")
-	reUnwrappedSTDistance  = regexp.MustCompile(`ST_Distance_Sphere\([^)]+\)`)
 )
 
 func stripCoalesceSubexprs(expr string) string {
@@ -3700,12 +3699,33 @@ func hasUnwrappedNullColumnRef(row map[string]any, expr string) bool {
 		return resolveColumnValue(row, expr) == nil
 	}
 	stripped := stripCoalesceSubexprs(expr)
-	for _, m := range reUnwrappedSTDistance.FindAllString(stripped, -1) {
-		if v := resolveColumnValue(row, m); v == nil {
+	for {
+		idx := strings.Index(stripped, "ST_Distance_Sphere(")
+		if idx < 0 {
+			break
+		}
+		depth := 0
+		end := -1
+		for i := idx + len("ST_Distance_Sphere"); i < len(stripped); i++ {
+			if stripped[i] == '(' {
+				depth++
+			} else if stripped[i] == ')' {
+				depth--
+				if depth == 0 {
+					end = i
+					break
+				}
+			}
+		}
+		if end < 0 {
+			break
+		}
+		call := stripped[idx : end+1]
+		if v := resolveColumnValue(row, call); v == nil {
 			return true
 		}
+		stripped = stripped[:idx] + "1" + stripped[end+1:]
 	}
-	stripped = reUnwrappedSTDistance.ReplaceAllString(stripped, "1")
 	for _, m := range reUnwrappedDocExtract.FindAllString(stripped, -1) {
 		if v := resolveColumnValue(row, m); v == nil || fmt.Sprintf("%v", v) == "" {
 			return true

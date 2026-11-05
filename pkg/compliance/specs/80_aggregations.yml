@@ -1,0 +1,253 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+---
+setup:
+  - do:
+      indices.create:
+        index: comp_agg_idx
+        body:
+          mappings:
+            properties:
+              service:
+                type: keyword
+              env:
+                type: keyword
+              host:
+                type: keyword
+              latency:
+                type: integer
+              cost:
+                type: float
+              ts:
+                type: date
+              items:
+                type: nested
+                properties:
+                  sku:
+                    type: keyword
+                  qty:
+                    type: integer
+  - do:
+      bulk:
+        index: comp_agg_idx
+        body:
+          - index: { _id: "1" }
+          - service: "api"
+            env: "prod"
+            host: "h1"
+            latency: 10
+            cost: 1.5
+            ts: "2026-01-01T00:00:00Z"
+            items:
+              - { sku: "sku-a", qty: 2 }
+              - { sku: "sku-b", qty: 4 }
+          - index: { _id: "2" }
+          - service: "api"
+            env: "prod"
+            host: "h2"
+            latency: 30
+            cost: 2.5
+            ts: "2026-01-01T01:00:00Z"
+            items:
+              - { sku: "sku-a", qty: 3 }
+          - index: { _id: "3" }
+          - service: "web"
+            env: "stage"
+            latency: 50
+            cost: 4.0
+            ts: "2026-01-02T00:00:00Z"
+          - index: { _id: "4" }
+          - service: "web"
+            env: "prod"
+            host: "h1"
+            latency: 70
+            cost: 8.0
+            ts: "2026-01-02T01:00:00Z"
+
+---
+"Metric aggregations avg sum min max stats extended_stats cardinality value_count percentiles top_hits":
+  - do:
+      search:
+        index: comp_agg_idx
+        body:
+          size: 0
+          aggs:
+            avg_lat: { avg: { field: "latency" } }
+            sum_lat: { sum: { field: "latency" } }
+            min_lat: { min: { field: "latency" } }
+            max_lat: { max: { field: "latency" } }
+            stats_lat: { stats: { field: "latency" } }
+            ext_stats_lat: { extended_stats: { field: "latency" } }
+            card_svc: { cardinality: { field: "service" } }
+            cnt_lat: { value_count: { field: "latency" } }
+            pct_lat: { percentiles: { field: "latency", percents: [ 50, 95 ] } }
+            top_docs:
+              top_hits:
+                size: 1
+                sort:
+                  - { latency: "desc" }
+  - match: { aggregations.avg_lat.value: 40 }
+  - match: { aggregations.sum_lat.value: 160 }
+  - match: { aggregations.min_lat.value: 10 }
+  - match: { aggregations.max_lat.value: 70 }
+  - match: { aggregations.stats_lat.count: 4 }
+  - match: { aggregations.stats_lat.sum: 160 }
+  - match: { aggregations.ext_stats_lat.count: 4 }
+  - match: { aggregations.card_svc.value: 2 }
+  - match: { aggregations.cnt_lat.value: 4 }
+  - is_true: aggregations.pct_lat.values
+  - match: { aggregations.top_docs.hits.hits.0._id: "4" }
+
+---
+"Bucket aggregations terms histogram date_histogram and range":
+  - do:
+      search:
+        index: comp_agg_idx
+        body:
+          size: 0
+          aggs:
+            by_service:
+              terms:
+                field: "service"
+            lat_hist:
+              histogram:
+                field: "latency"
+                interval: 50
+            by_day:
+              date_histogram:
+                field: "ts"
+                calendar_interval: "1d"
+            lat_ranges:
+              range:
+                field: "latency"
+                ranges:
+                  - { to: 40 }
+                  - { from: 40 }
+  - length: { aggregations.by_service.buckets: 2 }
+  - match: { aggregations.by_service.buckets.0.doc_count: 2 }
+  - length: { aggregations.lat_hist.buckets: 2 }
+  - length: { aggregations.by_day.buckets: 2 }
+  - length: { aggregations.lat_ranges.buckets: 2 }
+  - match: { aggregations.lat_ranges.buckets.0.doc_count: 2 }
+  - match: { aggregations.lat_ranges.buckets.1.doc_count: 2 }
+
+---
+"Filter filters missing global nested and composite aggregations":
+  - do:
+      search:
+        index: comp_agg_idx
+        body:
+          size: 0
+          query:
+            term:
+              service: "api"
+          aggs:
+            all_docs:
+              global: {}
+            only_prod:
+              filter:
+                term:
+                  env: "prod"
+            by_env_filters:
+              filters:
+                filters:
+                  prod_f: { term: { env: "prod" } }
+                  stage_f: { term: { env: "stage" } }
+            missing_host:
+              missing:
+                field: "host"
+            nested_items:
+              nested:
+                path: "items"
+              aggs:
+                total_qty:
+                  sum:
+                    field: "items.qty"
+            comp_buckets:
+              composite:
+                sources:
+                  - svc: { terms: { field: "service" } }
+                  - env: { terms: { field: "env" } }
+  - match: { aggregations.all_docs.doc_count: 4 }
+  - match: { aggregations.only_prod.doc_count: 2 }
+  - match: { aggregations.by_env_filters.buckets.prod_f.doc_count: 2 }
+  - match: { aggregations.missing_host.doc_count: 0 }
+  - match: { aggregations.nested_items.total_qty.value: 9 }
+  - length: { aggregations.comp_buckets.buckets: 1 }
+
+---
+"Missing bucket across all documents":
+  - do:
+      search:
+        index: comp_agg_idx
+        body:
+          size: 0
+          aggs:
+            no_host:
+              missing:
+                field: "host"
+  - match: { aggregations.no_host.doc_count: 1 }
+
+---
+"Pipeline aggregations avg_bucket sum_bucket bucket_script bucket_selector bucket_sort cumulative_sum derivative":
+  - do:
+      search:
+        index: comp_agg_idx
+        body:
+          size: 0
+          aggs:
+            by_svc:
+              terms:
+                field: "service"
+              aggs:
+                sum_lat:
+                  sum:
+                    field: "latency"
+                sum_cost:
+                  sum:
+                    field: "cost"
+                cost_per_lat:
+                  bucket_script:
+                    buckets_path:
+                      lat: "sum_lat"
+                      cost: "sum_cost"
+                    script: "params.cost * 10"
+                high_lat_only:
+                  bucket_selector:
+                    buckets_path:
+                      lat: "sum_lat"
+                    script: "params.lat >= 40"
+                sorted_svcs:
+                  bucket_sort:
+                    sort:
+                      - { sum_lat: { order: "desc" } }
+            avg_svc_lat:
+              avg_bucket:
+                buckets_path: "by_svc>sum_lat"
+            sum_svc_lat:
+              sum_bucket:
+                buckets_path: "by_svc>sum_lat"
+            hist_lat:
+              histogram:
+                field: "latency"
+                interval: 50
+              aggs:
+                lat_sum:
+                  sum:
+                    field: "latency"
+                running_lat:
+                  cumulative_sum:
+                    buckets_path: "lat_sum"
+                delta_lat:
+                  derivative:
+                    buckets_path: "lat_sum"
+  - length: { aggregations.by_svc.buckets: 2 }
+  - match: { aggregations.by_svc.buckets.0.key: "web" }
+  - match: { aggregations.by_svc.buckets.0.sum_lat.value: 120 }
+  - match: { aggregations.by_svc.buckets.0.cost_per_lat.value: 120 }
+  - match: { aggregations.avg_svc_lat.value: 80 }
+  - match: { aggregations.sum_svc_lat.value: 160 }
+  - match: { aggregations.hist_lat.buckets.1.running_lat.value: 160 }
+  - match: { aggregations.hist_lat.buckets.1.delta_lat.value: 80 }

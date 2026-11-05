@@ -2832,3 +2832,137 @@ func TestRound45TranspilerLuceneDateMathRangeBoostsAndNestedSort(t *testing.T) {
 		t.Fatalf("F14 expected ARRAY_MIN in HitsSQL for nested sort mode min, got:\n%s", planF14.HitsSQL)
 	}
 }
+
+func TestRound46TranspilerGeoDecayLuceneAndTermsAggNormalizer(t *testing.T) {
+	spec := esast.MappingSpec{
+		Properties: map[string]esast.FieldProperty{
+			"title":      {Type: "text"},
+			"status":     {Type: "keyword", Normalizer: "lowercase"},
+			"active":     {Type: "boolean"},
+			"price":      {Type: "double"},
+			"created_at": {Type: "date"},
+			"loc":        {Type: "geo_point"},
+			"vec":        {Type: "dense_vector", Dims: 3, Similarity: "cosine"},
+		},
+	}
+	sch := schema.CompileIndexSchema("db", "r46_tr_idx", &spec)
+	tr := NewTranspiler(sch, TranspilerOptions{})
+
+	// F1 & F2: geo_distance and geo_bounding_box transpilation
+	var geoReq esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"bool": {
+				"must": [
+					{"geo_distance": {"distance": "10km", "loc": {"lat": 40.7128, "lon": -74.0060}, "boost": 2.5}},
+					{"geo_bounding_box": {"loc": {"top_left": {"lat": 41.0, "lon": -75.0}, "bottom_right": {"lat": 40.0, "lon": -73.0}}}}
+				]
+			}
+		}
+	}`), &geoReq); err != nil {
+		t.Fatalf("F1/F2 unmarshal failed: %v", err)
+	}
+	cqGeo := tr.CompileQuery(geoReq.Query, true, nil)
+	if !strings.Contains(cqGeo.WhereSQL, "ST_Distance_Sphere") || !strings.Contains(cqGeo.WhereSQL, "10000") || !strings.Contains(cqGeo.ScoreSQL, "2.5") {
+		t.Fatalf("F1/F2 unexpected geo WhereSQL=%s ScoreSQL=%s", cqGeo.WhereSQL, cqGeo.ScoreSQL)
+	}
+
+	// F8 & F9: Lucene field:-term, field:+term, field:!term, and single-clause boosted group (title:foo)^3.5
+	var qsReq esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"query_string": {
+				"query": "status:+open status:-closed (title:foo)^3.5"
+			}
+		}
+	}`), &qsReq); err != nil {
+		t.Fatalf("F8/F9 unmarshal failed: %v", err)
+	}
+	cqQS := tr.CompileQuery(qsReq.Query, true, nil)
+	if !strings.Contains(cqQS.WhereSQL, "NOT (") || !strings.Contains(cqQS.ScoreSQL, "3.5") {
+		t.Fatalf("F8/F9 expected NOT COALESCE for status:-closed and 3.5 boost for (title:foo)^3.5, got WhereSQL=%s ScoreSQL=%s", cqQS.WhereSQL, cqQS.ScoreSQL)
+	}
+
+	// F10: function_score with gauss / exp / linear decay on numeric, date, and geo_point fields
+	var decayReq esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"function_score": {
+				"query": {"match_all": {}},
+				"functions": [
+					{"gauss": {"price": {"origin": 100, "scale": 20, "offset": 5, "decay": 0.5}}},
+					{"exp": {"created_at": {"origin": "2025-01-01T00:00:00Z", "scale": "10d", "offset": "1d", "decay": 0.5}}},
+					{"linear": {"loc": {"origin": "40.7128,-74.0060", "scale": "5km", "offset": "500m", "decay": 0.5}}}
+				],
+				"score_mode": "sum",
+				"boost_mode": "replace"
+			}
+		}
+	}`), &decayReq); err != nil {
+		t.Fatalf("F10 unmarshal failed: %v", err)
+	}
+	cqDecay := tr.CompileQuery(decayReq.Query, true, nil)
+	if !strings.Contains(cqDecay.ScoreSQL, "EXP(") || !strings.Contains(cqDecay.ScoreSQL, "ST_Distance_Sphere") || !strings.Contains(cqDecay.ScoreSQL, "GREATEST(0.0") {
+		t.Fatalf("F10 expected EXP, ST_Distance_Sphere, and GREATEST(0.0 in decay ScoreSQL, got %s", cqDecay.ScoreSQL)
+	}
+
+	// F11: kNN dimension mismatch returns error via BuildSearchPlan
+	var badKNN esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{"knn": {"field": "vec", "query_vector": [1.0, 2.0], "k": 5}}`), &badKNN); err != nil {
+		t.Fatalf("F11 unmarshal failed: %v", err)
+	}
+	if _, err := tr.BuildSearchPlan(&badKNN); err == nil || !strings.Contains(err.Error(), "dimension") {
+		t.Fatalf("F11 expected dimension mismatch error from BuildSearchPlan, got %v", err)
+	}
+
+	// F12: Top-level terms agg on boolean and lowercase-normalizer keyword
+	var aggReq esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"size": 0,
+		"aggs": {
+			"by_active": {"terms": {"field": "active"}},
+			"by_status": {"terms": {"field": "status"}}
+		}
+	}`), &aggReq); err != nil {
+		t.Fatalf("F12 unmarshal failed: %v", err)
+	}
+	plan, err := tr.BuildSearchPlan(&aggReq)
+	if err != nil {
+		t.Fatalf("F12 BuildSearchPlan failed: %v", err)
+	}
+	if !strings.Contains(plan.AggsSQL, "THEN 'true' ELSE 'false'") || !strings.Contains(plan.AggsSQL, "LOWER(") {
+		t.Fatalf("F12 expected boolean ('true'/'false') and LOWER() normalization in AggsSQL, got %s", plan.AggsSQL)
+	}
+
+	// Additional geo_distance / geo_bounding_box / decay branches (dynamic geo, array geo, dateline crossing, duration units)
+	var dynGeoReq esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"bool": {
+				"must": [
+					{"geo_distance": {"distance": "5km", "unmapped_loc": "40.7,-74.0"}},
+					{"geo_bounding_box": {"unmapped_loc": {"top_left": [170.0, 45.0], "bottom_right": [-170.0, 35.0]}, "boost": 2.0}}
+				]
+			}
+		}
+	}`), &dynGeoReq); err != nil {
+		t.Fatalf("dynGeoReq unmarshal failed: %v", err)
+	}
+	cqDynGeo := tr.CompileQuery(dynGeoReq.Query, true, nil)
+	if !strings.Contains(cqDynGeo.WhereSQL, "OR") || !strings.Contains(cqDynGeo.ScoreSQL, "2.0") {
+		t.Fatalf("expected dateline OR and boost 2.0 in dynGeo query, got where=%s score=%s", cqDynGeo.WhereSQL, cqDynGeo.ScoreSQL)
+	}
+	for _, u := range []string{"100ms", "30s", "5m", "2h", "3d", "1w", "1M", "1y"} {
+		if ms, ok := parseDecayDurationMillis(u); !ok || ms <= 0 {
+			t.Fatalf("expected valid decay duration for %s, got %v (%v)", u, ms, ok)
+		}
+	}
+	sfBinding := schema.FieldBinding{ESType: "scaled_float", ScalingFactor: 100}
+	for _, v := range []any{float64(1.234), int(5), int64(6), json.Number("7.891"), "9.876"} {
+		_ = normalizeScaledFloatValue(sfBinding, v)
+	}
+	for _, v := range []any{true, false, int(1), int(0), int64(1), float64(1.0), json.Number("1"), "true", "false", "1", "0", "invalid"} {
+		_, _ = normalizeBooleanQueryValue(v)
+	}
+	_ = wildcardToLike(`a\*b\?c\%d\_e\\f\`)
+}

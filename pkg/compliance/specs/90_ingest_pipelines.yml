@@ -1,0 +1,158 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+---
+"Ingest pipeline put get and delete lifecycle":
+  - do:
+      ingest.put_pipeline:
+        id: comp_pipe_lifecycle
+        body:
+          description: "Compliance lifecycle pipeline"
+          processors:
+            - set:
+                field: "processed"
+                value: true
+  - is_true: acknowledged
+  - do:
+      ingest.get_pipeline:
+        id: comp_pipe_lifecycle
+  - match: { comp_pipe_lifecycle.description: "Compliance lifecycle pipeline" }
+  - do:
+      ingest.delete_pipeline:
+        id: comp_pipe_lifecycle
+  - is_true: acknowledged
+
+---
+"Simulate string processors set lowercase uppercase trim split join and gsub":
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - trim:
+                  field: "raw_name"
+              - lowercase:
+                  field: "raw_name"
+                  target_field: "lower_name"
+              - uppercase:
+                  field: "raw_name"
+                  target_field: "upper_name"
+              - gsub:
+                  field: "path"
+                  pattern: "/"
+                  replacement: "."
+              - split:
+                  field: "csv_tags"
+                  separator: ","
+              - join:
+                  field: "csv_tags"
+                  separator: "|"
+                  target_field: "pipe_tags"
+              - set:
+                  field: "ingested_by"
+                  value: "doris-es-proxy"
+          docs:
+            - _source:
+                raw_name: "  Alice_Admin  "
+                path: "org/team/service"
+                csv_tags: "alpha,beta,gamma"
+  - length: { docs: 1 }
+  - match: { docs.0.doc._source.raw_name: "Alice_Admin" }
+  - match: { docs.0.doc._source.lower_name: "alice_admin" }
+  - match: { docs.0.doc._source.upper_name: "ALICE_ADMIN" }
+  - match: { docs.0.doc._source.path: "org.team.service" }
+  - match: { docs.0.doc._source.pipe_tags: "alpha|beta|gamma" }
+  - match: { docs.0.doc._source.ingested_by: "doris-es-proxy" }
+
+---
+"Simulate convert rename remove and script processors":
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - convert:
+                  field: "str_code"
+                  type: "integer"
+                  target_field: "status_code"
+              - rename:
+                  field: "old_host"
+                  target_field: "host"
+              - remove:
+                  field: "secret_token"
+              - script:
+                  source: "ctx._source.score = ctx._source.status_code * 2"
+          docs:
+            - _source:
+                str_code: "200"
+                old_host: "node-01"
+                secret_token: "redact-me"
+  - match: { docs.0.doc._source.status_code: 200 }
+  - match: { docs.0.doc._source.host: "node-01" }
+  - is_false: docs.0.doc._source.secret_token
+  - is_false: docs.0.doc._source.old_host
+  - match: { docs.0.doc._source.score: 400 }
+
+---
+"Simulate drop processor and on_failure handler":
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - convert:
+                  field: "bad_int"
+                  type: "integer"
+                  on_failure:
+                    - set:
+                        field: "conversion_failed"
+                        value: true
+              - drop:
+                  if: "ctx._source.drop_me == true"
+          docs:
+            - _source:
+                bad_int: "not-a-number"
+                drop_me: false
+            - _source:
+                bad_int: "10"
+                drop_me: true
+  - is_true: docs.0.doc._source.conversion_failed
+  - is_false: docs.1.doc
+
+---
+"Index document through stored ingest pipeline":
+  - do:
+      indices.create:
+        index: comp_pipe_write_idx
+        body:
+          mappings:
+            properties:
+              env:
+                type: keyword
+              code:
+                type: integer
+  - do:
+      ingest.put_pipeline:
+        id: comp_write_enrich
+        body:
+          processors:
+            - lowercase:
+                field: "env"
+            - convert:
+                field: "code"
+                type: "integer"
+  - do:
+      index:
+        index: comp_pipe_write_idx
+        id: "p1"
+        pipeline: comp_write_enrich
+        body:
+          env: "PRODUCTION"
+          code: "201"
+  - do:
+      get:
+        index: comp_pipe_write_idx
+        id: "p1"
+  - match: { _source.env: "production" }
+  - match: { _source.code: 201 }

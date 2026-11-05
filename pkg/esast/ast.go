@@ -41,32 +41,199 @@ func NextAutoID() string {
 
 // SearchRequest models an Elasticsearch / OpenSearch `/_search` request payload.
 type SearchRequest struct {
-	Query           *Query                   `json:"query,omitempty"`
-	AliasFilter     *Query                   `json:"-"`
-	Routing         string                   `json:"-"`
-	KNN             KNNSlice                 `json:"knn,omitempty"`
-	PostFilter      *Query                   `json:"post_filter,omitempty"`
-	From            *int                     `json:"from,omitempty"`
-	Size            *int                     `json:"size,omitempty"`
-	TerminateAfter  *int                     `json:"terminate_after,omitempty"`
-	MinScore        *float64                 `json:"min_score,omitempty"`
-	Aggs            map[string]AggSpec       `json:"aggs,omitempty"`
-	Aggregations    map[string]AggSpec       `json:"aggregations,omitempty"`
-	Sort            SortSlice                `json:"sort,omitempty"`
-	SearchAfter     []any                    `json:"search_after,omitempty"`
-	Source          *SourceFilter            `json:"_source,omitempty"`
-	TrackTotalHits  any                      `json:"track_total_hits,omitempty"`
-	TrackScores     *bool                    `json:"track_scores,omitempty"`
-	Highlight       *HighlightSpec           `json:"highlight,omitempty"`
-	Collapse        *CollapseSpec            `json:"collapse,omitempty"`
-	Rescore         RescoreSlice             `json:"rescore,omitempty"`
-	PIT             *PITSpec                 `json:"pit,omitempty"`
-	Fields          []FieldRequestSpec       `json:"fields,omitempty"`
-	DocvalueFields  []FieldRequestSpec       `json:"docvalue_fields,omitempty"`
-	StoredFields    any                      `json:"stored_fields,omitempty"`
-	ScriptFields    map[string]any           `json:"script_fields,omitempty"`
-	RuntimeMappings map[string]FieldProperty `json:"runtime_mappings,omitempty"`
-	Suggest         map[string]SuggestSpec   `json:"suggest,omitempty"`
+	Query            *Query                   `json:"query,omitempty"`
+	AliasFilter      *Query                   `json:"-"`
+	Routing          string                   `json:"-"`
+	KNN              KNNSlice                 `json:"knn,omitempty"`
+	PostFilter       *Query                   `json:"post_filter,omitempty"`
+	From             *int                     `json:"from,omitempty"`
+	Size             *int                     `json:"size,omitempty"`
+	TerminateAfter   *int                     `json:"terminate_after,omitempty"`
+	MinScore         *float64                 `json:"min_score,omitempty"`
+	Aggs             map[string]AggSpec       `json:"aggs,omitempty"`
+	Aggregations     map[string]AggSpec       `json:"aggregations,omitempty"`
+	Sort             SortSlice                `json:"sort,omitempty"`
+	SearchAfter      []any                    `json:"search_after,omitempty"`
+	Source           *SourceFilter            `json:"_source,omitempty"`
+	TrackTotalHits   any                      `json:"track_total_hits,omitempty"`
+	TrackScores      *bool                    `json:"track_scores,omitempty"`
+	Version          bool                     `json:"version,omitempty"`
+	SeqNoPrimaryTerm bool                     `json:"seq_no_primary_term,omitempty"`
+	Explain          bool                     `json:"explain,omitempty"`
+	IndicesBoost     map[string]float64       `json:"-"`
+	Highlight        *HighlightSpec           `json:"highlight,omitempty"`
+	Collapse         *CollapseSpec            `json:"collapse,omitempty"`
+	Rescore          RescoreSlice             `json:"rescore,omitempty"`
+	PIT              *PITSpec                 `json:"pit,omitempty"`
+	Fields           []FieldRequestSpec       `json:"fields,omitempty"`
+	DocvalueFields   []FieldRequestSpec       `json:"docvalue_fields,omitempty"`
+	StoredFields     any                      `json:"stored_fields,omitempty"`
+	ScriptFields     map[string]any           `json:"script_fields,omitempty"`
+	RuntimeMappings  map[string]FieldProperty `json:"runtime_mappings,omitempty"`
+	Suggest          map[string]SuggestSpec   `json:"suggest,omitempty"`
+}
+
+var knownSearchRequestKeys = map[string]bool{
+	"query":               true,
+	"knn":                 true,
+	"post_filter":         true,
+	"from":                true,
+	"size":                true,
+	"terminate_after":     true,
+	"min_score":           true,
+	"aggs":                true,
+	"aggregations":        true,
+	"sort":                true,
+	"search_after":        true,
+	"_source":             true,
+	"track_total_hits":    true,
+	"track_scores":        true,
+	"version":             true,
+	"seq_no_primary_term": true,
+	"explain":             true,
+	"indices_boost":       true,
+	"highlight":           true,
+	"collapse":            true,
+	"rescore":             true,
+	"pit":                 true,
+	"point_in_time":       true,
+	"fields":              true,
+	"docvalue_fields":     true,
+	"stored_fields":       true,
+	"script_fields":       true,
+	"runtime_mappings":    true,
+	"suggest":             true,
+	"timeout":             true,
+	"slice":               true,
+	"profile":             true,
+	"stats":               true,
+	"ext":                 true,
+	"sub_searches":        true,
+	"rank":                true,
+}
+
+func parseIndicesBoost(raw json.RawMessage) (map[string]float64, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, nil
+	}
+	parseEntryMap := func(m map[string]json.RawMessage, out map[string]float64) error {
+		if len(m) == 0 {
+			return fmt.Errorf("parsing_exception: [indices_boost] entry cannot be empty")
+		}
+		for idx, rawVal := range m {
+			idxTrim := strings.TrimSpace(idx)
+			if idxTrim == "" {
+				return fmt.Errorf("parsing_exception: [indices_boost] index name cannot be empty")
+			}
+			b, err := parseOptionalNonNegativeBoost(rawVal)
+			if err != nil || b == nil {
+				return fmt.Errorf("parsing_exception: [indices_boost] boost for [%s] must be a non-negative number", idx)
+			}
+			out[idxTrim] = *b
+		}
+		return nil
+	}
+	if trimmed[0] == '[' {
+		var list []json.RawMessage
+		if err := json.Unmarshal(trimmed, &list); err != nil {
+			return nil, fmt.Errorf("parsing_exception: [indices_boost] invalid array: %w", err)
+		}
+		out := make(map[string]float64, len(list))
+		for _, elem := range list {
+			et := bytes.TrimSpace(elem)
+			if len(et) == 0 || et[0] != '{' {
+				return nil, fmt.Errorf("parsing_exception: [indices_boost] array element must be an object")
+			}
+			var m map[string]json.RawMessage
+			if err := json.Unmarshal(et, &m); err != nil {
+				return nil, fmt.Errorf("parsing_exception: [indices_boost] invalid element: %w", err)
+			}
+			if err := parseEntryMap(m, out); err != nil {
+				return nil, err
+			}
+		}
+		return out, nil
+	}
+	if trimmed[0] == '{' {
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &m); err != nil {
+			return nil, fmt.Errorf("parsing_exception: [indices_boost] invalid object: %w", err)
+		}
+		out := make(map[string]float64, len(m))
+		if len(m) > 0 {
+			if err := parseEntryMap(m, out); err != nil {
+				return nil, err
+			}
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("parsing_exception: [indices_boost] must be an object or array of objects")
+}
+
+func (r *SearchRequest) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		if !knownSearchRequestKeys[k] {
+			return fmt.Errorf("parsing_exception: Unknown key for a START_OBJECT in [%s]", k)
+		}
+	}
+	type plain SearchRequest
+	var raw struct {
+		plain
+		TrackScores      any             `json:"track_scores"`
+		Version          any             `json:"version"`
+		SeqNoPrimaryTerm any             `json:"seq_no_primary_term"`
+		Explain          any             `json:"explain"`
+		IndicesBoost     json.RawMessage `json:"indices_boost"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	*r = SearchRequest(raw.plain)
+	if raw.TrackScores != nil {
+		ts, err := parseFlexibleBool(raw.TrackScores)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [track_scores] %w", err)
+		}
+		r.TrackScores = &ts
+	}
+	if raw.Version != nil {
+		v, err := parseFlexibleBool(raw.Version)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [version] %w", err)
+		}
+		r.Version = v
+	}
+	if raw.SeqNoPrimaryTerm != nil {
+		sn, err := parseFlexibleBool(raw.SeqNoPrimaryTerm)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [seq_no_primary_term] %w", err)
+		}
+		r.SeqNoPrimaryTerm = sn
+	}
+	if raw.Explain != nil {
+		ex, err := parseFlexibleBool(raw.Explain)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [explain] %w", err)
+		}
+		r.Explain = ex
+	}
+	if len(raw.IndicesBoost) > 0 {
+		ib, err := parseIndicesBoost(raw.IndicesBoost)
+		if err != nil {
+			return err
+		}
+		r.IndicesBoost = ib
+	}
+	return nil
 }
 
 // SuggestSpec models an entry in a search request `suggest` map (`term`, `phrase`, `completion`, or global `text`).
@@ -275,6 +442,7 @@ type KNNQuery struct {
 	Similarity    *float64   `json:"similarity,omitempty"`
 	Boost         *float64   `json:"boost,omitempty"`
 	Filter        QuerySlice `json:"filter,omitempty"`
+	Name          string     `json:"_name,omitempty"`
 }
 
 func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
@@ -282,17 +450,31 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return nil
 	}
-	type knnPlain KNNQuery
-	type knnAlias struct {
-		knnPlain
-		Vector []float64 `json:"vector,omitempty"`
-	}
 	var rawMap map[string]json.RawMessage
 	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
 		return err
 	}
-	if _, hasField := rawMap["field"]; hasField {
-		var std knnAlias
+	_, hasField := rawMap["field"]
+	_, hasQV := rawMap["query_vector"]
+	_, hasVec := rawMap["vector"]
+	_, hasK := rawMap["k"]
+	_, hasNC := rawMap["num_candidates"]
+	_, hasSim := rawMap["similarity"]
+	_, hasFilter := rawMap["filter"]
+	if hasField || hasQV || hasVec || hasK || hasNC || hasSim || hasFilter {
+		for k := range rawMap {
+			switch k {
+			case "field", "query_vector", "vector", "k", "num_candidates", "filter", "similarity", "boost", "_name":
+			default:
+				return fmt.Errorf("parsing_exception: [knn] unknown field [%s]", k)
+			}
+		}
+		type knnPlain KNNQuery
+		var std struct {
+			knnPlain
+			Vector []float64       `json:"vector,omitempty"`
+			Boost  json.RawMessage `json:"boost,omitempty"`
+		}
 		if err := json.Unmarshal(trimmed, &std); err != nil {
 			return err
 		}
@@ -300,8 +482,26 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 			std.QueryVector = std.Vector
 		}
 		*kq = KNNQuery(std.knnPlain)
-		if kq.Boost != nil && (*kq.Boost < 0 || math.IsNaN(*kq.Boost) || math.IsInf(*kq.Boost, 0)) {
-			return fmt.Errorf("parsing_exception: [knn] boost must be a non-negative number")
+		if len(std.Boost) > 0 {
+			b, err := parseOptionalNonNegativeBoost(std.Boost)
+			if err != nil {
+				return fmt.Errorf("parsing_exception: [knn] boost must be a non-negative number")
+			}
+			kq.Boost = b
+		}
+		if strings.TrimSpace(kq.Field) == "" {
+			return fmt.Errorf("parsing_exception: [knn] requires non-empty [field]")
+		}
+		if len(kq.QueryVector) == 0 {
+			return fmt.Errorf("parsing_exception: [knn] requires non-empty [query_vector]")
+		}
+		if hasK && kq.K <= 0 {
+			return fmt.Errorf("parsing_exception: [knn] [k] must be greater than 0")
+		}
+		if hasNC {
+			if kq.NumCandidates <= 0 || (kq.K > 0 && kq.NumCandidates < kq.K) {
+				return fmt.Errorf("parsing_exception: [knn] [num_candidates] must be >= [k] and > 0")
+			}
 		}
 		return nil
 	}
@@ -310,21 +510,37 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	var byField map[string]struct {
-		Vector        []float64  `json:"vector"`
-		QueryVector   []float64  `json:"query_vector"`
-		K             int        `json:"k"`
-		NumCandidates int        `json:"num_candidates"`
-		Similarity    *float64   `json:"similarity"`
-		Boost         *float64   `json:"boost"`
-		Filter        QuerySlice `json:"filter"`
-	}
+	var byField map[string]json.RawMessage
 	if err := json.Unmarshal(cleaned, &byField); err != nil {
 		return err
 	}
-	for field, spec := range byField {
+	foundField := false
+	for field, rawSpec := range byField {
 		if field == "_name" || field == "boost" {
 			continue
+		}
+		var specMap map[string]json.RawMessage
+		if err := json.Unmarshal(rawSpec, &specMap); err != nil {
+			return fmt.Errorf("parsing_exception: [knn] invalid field specification for [%s]: %w", field, err)
+		}
+		for k := range specMap {
+			switch k {
+			case "vector", "query_vector", "k", "num_candidates", "similarity", "boost", "filter", "_name":
+			default:
+				return fmt.Errorf("parsing_exception: [knn] unknown field [%s]", k)
+			}
+		}
+		var spec struct {
+			Vector        []float64       `json:"vector"`
+			QueryVector   []float64       `json:"query_vector"`
+			K             int             `json:"k"`
+			NumCandidates int             `json:"num_candidates"`
+			Similarity    *float64        `json:"similarity"`
+			Boost         json.RawMessage `json:"boost"`
+			Filter        QuerySlice      `json:"filter"`
+		}
+		if err := json.Unmarshal(rawSpec, &spec); err != nil {
+			return err
 		}
 		vec := spec.Vector
 		if len(vec) == 0 {
@@ -335,16 +551,29 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 		kq.K = spec.K
 		kq.NumCandidates = spec.NumCandidates
 		kq.Similarity = spec.Similarity
-		if spec.Boost != nil {
-			kq.Boost = spec.Boost
+		if len(spec.Boost) > 0 {
+			b, err := parseOptionalNonNegativeBoost(spec.Boost)
+			if err != nil {
+				return fmt.Errorf("parsing_exception: [knn] boost must be a non-negative number")
+			}
+			kq.Boost = b
 		} else {
 			kq.Boost = mapBoost
 		}
 		kq.Filter = spec.Filter
+		if _, okK := specMap["k"]; okK && kq.K <= 0 {
+			return fmt.Errorf("parsing_exception: [knn] [k] must be greater than 0")
+		}
+		if _, okNC := specMap["num_candidates"]; okNC {
+			if kq.NumCandidates <= 0 || (kq.K > 0 && kq.NumCandidates < kq.K) {
+				return fmt.Errorf("parsing_exception: [knn] [num_candidates] must be >= [k] and > 0")
+			}
+		}
+		foundField = true
 		break
 	}
-	if kq.Boost != nil && (*kq.Boost < 0 || math.IsNaN(*kq.Boost) || math.IsInf(*kq.Boost, 0)) {
-		return fmt.Errorf("parsing_exception: [knn] boost must be a non-negative number")
+	if !foundField || strings.TrimSpace(kq.Field) == "" || len(kq.QueryVector) == 0 {
+		return fmt.Errorf("parsing_exception: [knn] requires non-empty [field] and [query_vector]")
 	}
 	return nil
 }
@@ -391,6 +620,7 @@ type InnerHitsSpec struct {
 	DocvalueFields []FieldRequestSpec `json:"docvalue_fields,omitempty"`
 	ScriptFields   map[string]any     `json:"script_fields,omitempty"`
 	Highlight      *HighlightSpec     `json:"highlight,omitempty"`
+	Collapse       *CollapseSpec      `json:"collapse,omitempty"`
 }
 
 func (ih *InnerHitsSpec) HasStoredFieldsNone() bool {
@@ -459,8 +689,40 @@ func (ci *CollapseInnerHits) UnmarshalJSON(data []byte) error {
 }
 
 type CollapseSpec struct {
-	Field     string            `json:"field"`
-	InnerHits CollapseInnerHits `json:"inner_hits,omitempty"`
+	Field                      string            `json:"field"`
+	InnerHits                  CollapseInnerHits `json:"inner_hits,omitempty"`
+	MaxConcurrentGroupSearches *int              `json:"max_concurrent_group_searches,omitempty"`
+}
+
+func (cs *CollapseSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "field", "inner_hits", "max_concurrent_group_searches":
+		default:
+			return fmt.Errorf("parsing_exception: [collapse] unknown field [%s]", k)
+		}
+	}
+	type plain CollapseSpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if strings.TrimSpace(p.Field) == "" {
+		return fmt.Errorf("parsing_exception: [collapse] requires non-empty [field]")
+	}
+	if p.MaxConcurrentGroupSearches != nil && *p.MaxConcurrentGroupSearches <= 0 {
+		return fmt.Errorf("parsing_exception: [collapse] [max_concurrent_group_searches] must be > 0")
+	}
+	*cs = CollapseSpec(p)
+	return nil
 }
 
 // RescoreQuerySpec models the `query` object inside a `rescore` block.
@@ -471,10 +733,79 @@ type RescoreQuerySpec struct {
 	ScoreMode          string   `json:"score_mode,omitempty"`
 }
 
+func (rqs *RescoreQuerySpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "rescore_query", "query_weight", "rescore_query_weight", "score_mode":
+		default:
+			return fmt.Errorf("parsing_exception: [rescore] unknown field [%s]", k)
+		}
+	}
+	rawRQ, hasRQ := rawMap["rescore_query"]
+	if !hasRQ || len(bytes.TrimSpace(rawRQ)) == 0 || bytes.Equal(bytes.TrimSpace(rawRQ), []byte("null")) {
+		return fmt.Errorf("parsing_exception: [rescore] missing required [rescore_query]")
+	}
+	type plain RescoreQuerySpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if p.RescoreQuery == nil {
+		return fmt.Errorf("parsing_exception: [rescore] missing required [rescore_query]")
+	}
+	switch strings.ToLower(strings.TrimSpace(p.ScoreMode)) {
+	case "", "total", "multiply", "avg", "max", "min":
+		p.ScoreMode = strings.ToLower(strings.TrimSpace(p.ScoreMode))
+	default:
+		return fmt.Errorf("parsing_exception: [rescore] invalid score_mode [%s]", p.ScoreMode)
+	}
+	*rqs = RescoreQuerySpec(p)
+	return nil
+}
+
 // RescoreSpec models a single `rescore` entry in a search request.
 type RescoreSpec struct {
 	WindowSize *int              `json:"window_size,omitempty"`
 	Query      *RescoreQuerySpec `json:"query,omitempty"`
+}
+
+func (rs *RescoreSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "window_size", "query":
+		default:
+			return fmt.Errorf("parsing_exception: [rescore] unknown field [%s]", k)
+		}
+	}
+	type plain RescoreSpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if p.WindowSize != nil && *p.WindowSize < 0 {
+		return fmt.Errorf("parsing_exception: [rescore] window_size must be >= 0")
+	}
+	if p.Query == nil || p.Query.RescoreQuery == nil {
+		return fmt.Errorf("parsing_exception: [rescore] requires [query.rescore_query]")
+	}
+	*rs = RescoreSpec(p)
+	return nil
 }
 
 // RescoreSlice unmarshals either a single `RescoreSpec` object `{...}` or an array `[{...}]`.
@@ -693,6 +1024,8 @@ type Query struct {
 	ScriptScore       *ScriptScoreQuery        `json:"script_score,omitempty"`
 	Script            *ScriptQuery             `json:"script,omitempty"`
 	KNN               *KNNQuery                `json:"knn,omitempty"`
+	GeoDistance       *GeoDistanceQuery        `json:"geo_distance,omitempty"`
+	GeoBoundingBox    *GeoBoundingBoxQuery     `json:"geo_bounding_box,omitempty"`
 }
 
 var knownQueryClauses = map[string]bool{
@@ -725,6 +1058,8 @@ var knownQueryClauses = map[string]bool{
 	"script_score":        true,
 	"script":              true,
 	"knn":                 true,
+	"geo_distance":        true,
+	"geo_bounding_box":    true,
 	"_name":               true,
 	"boost":               true,
 }
@@ -1103,6 +1438,735 @@ type DisMaxQuery struct {
 	Queries    QuerySlice `json:"queries,omitempty"`
 	TieBreaker float64    `json:"tie_breaker,omitempty"`
 	Boost      *float64   `json:"boost,omitempty"`
+	Name       string     `json:"_name,omitempty"`
+}
+
+func (dmq *DisMaxQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "queries", "tie_breaker", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [dis_max] unknown field [%s]", k)
+		}
+	}
+	var raw struct {
+		Queries    QuerySlice      `json:"queries"`
+		TieBreaker json.RawMessage `json:"tie_breaker"`
+		Boost      json.RawMessage `json:"boost"`
+		Name       string          `json:"_name"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if len(raw.Queries) == 0 {
+		return fmt.Errorf("parsing_exception: [dis_max] requires non-empty [queries]")
+	}
+	dmq.Queries = raw.Queries
+	dmq.Name = raw.Name
+	if len(raw.TieBreaker) > 0 {
+		tbTrim := bytes.TrimSpace(raw.TieBreaker)
+		if !bytes.Equal(tbTrim, []byte("null")) {
+			var tb float64
+			parsed := false
+			if json.Unmarshal(tbTrim, &tb) == nil {
+				parsed = true
+			} else if len(tbTrim) > 0 && tbTrim[0] == '"' {
+				var s string
+				if json.Unmarshal(tbTrim, &s) == nil {
+					if fv, err := strconv.ParseFloat(strings.TrimSpace(s), 64); err == nil {
+						tb = fv
+						parsed = true
+					}
+				}
+			}
+			if !parsed || math.IsNaN(tb) || math.IsInf(tb, 0) || tb < 0 || tb > 1.0 {
+				return fmt.Errorf("parsing_exception: [dis_max] tie_breaker must be in [0.0, 1.0]")
+			}
+			dmq.TieBreaker = tb
+		}
+	}
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		dmq.Boost = b
+	}
+	return nil
+}
+
+// GeoDistanceQuery models an Elasticsearch `geo_distance` query.
+type GeoDistanceQuery struct {
+	Field            string   `json:"-"`
+	Lat              float64  `json:"-"`
+	Lon              float64  `json:"-"`
+	Distance         string   `json:"distance"`
+	DistanceMeters   float64  `json:"-"`
+	DistanceType     string   `json:"distance_type,omitempty"`
+	ValidationMethod string   `json:"validation_method,omitempty"`
+	Boost            *float64 `json:"boost,omitempty"`
+	Name             string   `json:"_name,omitempty"`
+}
+
+func (gd GeoDistanceQuery) MarshalJSON() ([]byte, error) {
+	m := map[string]any{
+		"distance": gd.Distance,
+	}
+	if gd.Field != "" {
+		m[gd.Field] = map[string]float64{"lat": gd.Lat, "lon": gd.Lon}
+	}
+	if gd.DistanceType != "" {
+		m["distance_type"] = gd.DistanceType
+	}
+	if gd.ValidationMethod != "" {
+		m["validation_method"] = gd.ValidationMethod
+	}
+	if gd.Boost != nil {
+		m["boost"] = *gd.Boost
+	}
+	if gd.Name != "" {
+		m["_name"] = gd.Name
+	}
+	return json.Marshal(m)
+}
+
+func (gd *GeoDistanceQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	rawDist, hasDist := rawMap["distance"]
+	if !hasDist {
+		return fmt.Errorf("parsing_exception: [geo_distance] requires [distance]")
+	}
+	var distAny any
+	dec := json.NewDecoder(bytes.NewReader(rawDist))
+	dec.UseNumber()
+	if err := dec.Decode(&distAny); err != nil {
+		return fmt.Errorf("parsing_exception: [geo_distance] invalid [distance]: %w", err)
+	}
+	if rawUnit, hasUnit := rawMap["unit"]; hasUnit {
+		var unitStr string
+		if err := json.Unmarshal(rawUnit, &unitStr); err != nil {
+			return fmt.Errorf("parsing_exception: [geo_distance] invalid [unit]: %w", err)
+		}
+		unitStr = strings.TrimSpace(unitStr)
+		if _, ok := GeoDistanceUnitMultiplier(unitStr); !ok {
+			return fmt.Errorf("parsing_exception: [geo_distance] unknown distance unit [%s]", unitStr)
+		}
+		distAny = fmt.Sprintf("%v%s", distAny, unitStr)
+	}
+	distStr, distMeters, err := ParseGeoDistanceMeters(distAny)
+	if err != nil {
+		return err
+	}
+	gd.Distance = distStr
+	gd.DistanceMeters = distMeters
+
+	if rawDT, ok := rawMap["distance_type"]; ok {
+		var dt string
+		if err := json.Unmarshal(rawDT, &dt); err != nil {
+			return fmt.Errorf("parsing_exception: [geo_distance] invalid [distance_type]")
+		}
+		switch strings.ToLower(strings.TrimSpace(dt)) {
+		case "arc", "plane":
+			gd.DistanceType = strings.ToLower(strings.TrimSpace(dt))
+		default:
+			return fmt.Errorf("parsing_exception: [geo_distance] invalid distance_type [%s]", dt)
+		}
+	}
+	if rawVM, ok := rawMap["validation_method"]; ok {
+		var vm string
+		if err := json.Unmarshal(rawVM, &vm); err != nil {
+			return fmt.Errorf("parsing_exception: [geo_distance] invalid [validation_method]")
+		}
+		switch strings.ToUpper(strings.TrimSpace(vm)) {
+		case "STRICT", "IGNORE_MALFORMED", "COERCE":
+			gd.ValidationMethod = strings.ToUpper(strings.TrimSpace(vm))
+		default:
+			return fmt.Errorf("parsing_exception: [geo_distance] invalid validation_method [%s]", vm)
+		}
+	}
+	if rawBoost, ok := rawMap["boost"]; ok {
+		b, err := parseOptionalNonNegativeBoost(rawBoost)
+		if err != nil {
+			return err
+		}
+		gd.Boost = b
+	}
+	if rawName, ok := rawMap["_name"]; ok {
+		var n string
+		if err := json.Unmarshal(rawName, &n); err != nil {
+			return fmt.Errorf("parsing_exception: [geo_distance] invalid [_name]")
+		}
+		gd.Name = n
+	}
+	if rawIU, ok := rawMap["ignore_unmapped"]; ok {
+		var iu any
+		if err := json.Unmarshal(rawIU, &iu); err != nil {
+			return fmt.Errorf("parsing_exception: [geo_distance] invalid [ignore_unmapped]")
+		}
+		if _, err := parseFlexibleBool(iu); err != nil {
+			return err
+		}
+	}
+	var fieldKeys []string
+	for k := range rawMap {
+		switch k {
+		case "distance", "unit", "distance_type", "validation_method", "boost", "_name", "ignore_unmapped":
+		default:
+			fieldKeys = append(fieldKeys, k)
+		}
+	}
+	if len(fieldKeys) != 1 {
+		return fmt.Errorf("parsing_exception: [geo_distance] must specify exactly one field, got %d", len(fieldKeys))
+	}
+	gd.Field = fieldKeys[0]
+	lat, lon, err := ParseGeoPoint(rawMap[gd.Field])
+	if err != nil {
+		return err
+	}
+	lat, lon, err = validateAndNormalizeGeoPoint(lat, lon, gd.ValidationMethod)
+	if err != nil {
+		return err
+	}
+	gd.Lat = lat
+	gd.Lon = lon
+	return nil
+}
+
+// GeoBoundingBoxQuery models an Elasticsearch `geo_bounding_box` query.
+type GeoBoundingBoxQuery struct {
+	Field            string   `json:"-"`
+	Top              float64  `json:"-"`
+	Left             float64  `json:"-"`
+	Bottom           float64  `json:"-"`
+	Right            float64  `json:"-"`
+	ValidationMethod string   `json:"validation_method,omitempty"`
+	Type             string   `json:"type,omitempty"`
+	Boost            *float64 `json:"boost,omitempty"`
+	Name             string   `json:"_name,omitempty"`
+}
+
+func (gb GeoBoundingBoxQuery) MarshalJSON() ([]byte, error) {
+	m := map[string]any{}
+	if gb.Field != "" {
+		m[gb.Field] = map[string]any{
+			"top_left":     map[string]float64{"lat": gb.Top, "lon": gb.Left},
+			"bottom_right": map[string]float64{"lat": gb.Bottom, "lon": gb.Right},
+		}
+	}
+	if gb.ValidationMethod != "" {
+		m["validation_method"] = gb.ValidationMethod
+	}
+	if gb.Type != "" {
+		m["type"] = gb.Type
+	}
+	if gb.Boost != nil {
+		m["boost"] = *gb.Boost
+	}
+	if gb.Name != "" {
+		m["_name"] = gb.Name
+	}
+	return json.Marshal(m)
+}
+
+func (gb *GeoBoundingBoxQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	if rawVM, ok := rawMap["validation_method"]; ok {
+		var vm string
+		if err := json.Unmarshal(rawVM, &vm); err != nil {
+			return fmt.Errorf("parsing_exception: [geo_bounding_box] invalid [validation_method]")
+		}
+		switch strings.ToUpper(strings.TrimSpace(vm)) {
+		case "STRICT", "IGNORE_MALFORMED", "COERCE":
+			gb.ValidationMethod = strings.ToUpper(strings.TrimSpace(vm))
+		default:
+			return fmt.Errorf("parsing_exception: [geo_bounding_box] invalid validation_method [%s]", vm)
+		}
+	}
+	if rawType, ok := rawMap["type"]; ok {
+		tTrim := bytes.TrimSpace(rawType)
+		if len(tTrim) == 0 || tTrim[0] != '{' {
+			var tStr string
+			if err := json.Unmarshal(rawType, &tStr); err != nil {
+				return fmt.Errorf("parsing_exception: [geo_bounding_box] invalid [type]")
+			}
+			switch strings.ToLower(strings.TrimSpace(tStr)) {
+			case "memory", "indexed":
+				gb.Type = strings.ToLower(strings.TrimSpace(tStr))
+			default:
+				return fmt.Errorf("parsing_exception: [geo_bounding_box] invalid type [%s]", tStr)
+			}
+		}
+	}
+	if rawBoost, ok := rawMap["boost"]; ok {
+		b, err := parseOptionalNonNegativeBoost(rawBoost)
+		if err != nil {
+			return err
+		}
+		gb.Boost = b
+	}
+	if rawName, ok := rawMap["_name"]; ok {
+		var n string
+		if err := json.Unmarshal(rawName, &n); err != nil {
+			return fmt.Errorf("parsing_exception: [geo_bounding_box] invalid [_name]")
+		}
+		gb.Name = n
+	}
+	if rawIU, ok := rawMap["ignore_unmapped"]; ok {
+		var iu any
+		if err := json.Unmarshal(rawIU, &iu); err != nil {
+			return fmt.Errorf("parsing_exception: [geo_bounding_box] invalid [ignore_unmapped]")
+		}
+		if _, err := parseFlexibleBool(iu); err != nil {
+			return err
+		}
+	}
+	var fieldKeys []string
+	for k, v := range rawMap {
+		switch k {
+		case "validation_method", "boost", "_name", "ignore_unmapped":
+		case "type":
+			vTrim := bytes.TrimSpace(v)
+			if len(vTrim) > 0 && vTrim[0] == '{' {
+				fieldKeys = append(fieldKeys, k)
+			}
+		default:
+			fieldKeys = append(fieldKeys, k)
+		}
+	}
+	if len(fieldKeys) != 1 {
+		return fmt.Errorf("parsing_exception: [geo_bounding_box] must specify exactly one field, got %d", len(fieldKeys))
+	}
+	gb.Field = fieldKeys[0]
+	var boxMap map[string]json.RawMessage
+	if err := json.Unmarshal(rawMap[gb.Field], &boxMap); err != nil || len(boxMap) == 0 {
+		return fmt.Errorf("parsing_exception: [geo_bounding_box] field [%s] must be a bounding box object", gb.Field)
+	}
+	var top, left, bottom, right float64
+	if rawWKT, hasWKT := boxMap["wkt"]; hasWKT {
+		if len(boxMap) != 1 {
+			return fmt.Errorf("parsing_exception: [geo_bounding_box] [wkt] cannot be combined with other bounds")
+		}
+		var wktStr string
+		if err := json.Unmarshal(rawWKT, &wktStr); err != nil {
+			return fmt.Errorf("parsing_exception: [geo_bounding_box] invalid [wkt]")
+		}
+		l, r, tVal, bVal, err := parseGeoWKTBBox(wktStr)
+		if err != nil {
+			return err
+		}
+		left, right, top, bottom = l, r, tVal, bVal
+	} else if rawTL, hasTL := boxMap["top_left"]; hasTL {
+		rawBR, hasBR := boxMap["bottom_right"]
+		if !hasBR || len(boxMap) != 2 {
+			return fmt.Errorf("parsing_exception: [geo_bounding_box] [top_left] requires [bottom_right] and no extra keys")
+		}
+		tVal, lVal, err := ParseGeoPoint(rawTL)
+		if err != nil {
+			return err
+		}
+		bVal, rVal, err := ParseGeoPoint(rawBR)
+		if err != nil {
+			return err
+		}
+		top, left, bottom, right = tVal, lVal, bVal, rVal
+	} else if rawTR, hasTR := boxMap["top_right"]; hasTR {
+		rawBL, hasBL := boxMap["bottom_left"]
+		if !hasBL || len(boxMap) != 2 {
+			return fmt.Errorf("parsing_exception: [geo_bounding_box] [top_right] requires [bottom_left] and no extra keys")
+		}
+		tVal, rVal, err := ParseGeoPoint(rawTR)
+		if err != nil {
+			return err
+		}
+		bVal, lVal, err := ParseGeoPoint(rawBL)
+		if err != nil {
+			return err
+		}
+		top, right, bottom, left = tVal, rVal, bVal, lVal
+	} else if len(boxMap) == 4 {
+		rawT, hasT := boxMap["top"]
+		rawL, hasL := boxMap["left"]
+		rawB, hasB := boxMap["bottom"]
+		rawR, hasR := boxMap["right"]
+		if !hasT || !hasL || !hasB || !hasR {
+			return fmt.Errorf("parsing_exception: [geo_bounding_box] expected [top], [left], [bottom], [right]")
+		}
+		var err error
+		if top, err = parseGeoCoordFloat(rawT); err != nil {
+			return err
+		}
+		if left, err = parseGeoCoordFloat(rawL); err != nil {
+			return err
+		}
+		if bottom, err = parseGeoCoordFloat(rawB); err != nil {
+			return err
+		}
+		if right, err = parseGeoCoordFloat(rawR); err != nil {
+			return err
+		}
+	} else {
+		return fmt.Errorf("parsing_exception: [geo_bounding_box] malformed bounding box specification for [%s]", gb.Field)
+	}
+	var err error
+	top, left, err = validateAndNormalizeGeoPoint(top, left, gb.ValidationMethod)
+	if err != nil {
+		return err
+	}
+	bottom, right, err = validateAndNormalizeGeoPoint(bottom, right, gb.ValidationMethod)
+	if err != nil {
+		return err
+	}
+	if top < bottom {
+		vm := strings.ToUpper(strings.TrimSpace(gb.ValidationMethod))
+		if vm == "COERCE" || vm == "IGNORE_MALFORMED" {
+			top, bottom = bottom, top
+		} else {
+			return fmt.Errorf("parsing_exception: [geo_bounding_box] top_left latitude [%v] cannot be smaller than bottom_right latitude [%v]", top, bottom)
+		}
+	}
+	gb.Top = top
+	gb.Left = left
+	gb.Bottom = bottom
+	gb.Right = right
+	return nil
+}
+
+// ParseGeoDistanceMeters parses an Elasticsearch distance string or number into its normalized string and meters.
+func ParseGeoDistanceMeters(raw any) (string, float64, error) {
+	switch v := raw.(type) {
+	case nil:
+		return "", 0, fmt.Errorf("parsing_exception: [geo_distance] distance cannot be null")
+	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
+			return "", 0, fmt.Errorf("parsing_exception: [geo_distance] distance must be > 0")
+		}
+		return strconv.FormatFloat(v, 'f', -1, 64) + "m", v, nil
+	case int:
+		if v <= 0 {
+			return "", 0, fmt.Errorf("parsing_exception: [geo_distance] distance must be > 0")
+		}
+		return strconv.Itoa(v) + "m", float64(v), nil
+	case int64:
+		if v <= 0 {
+			return "", 0, fmt.Errorf("parsing_exception: [geo_distance] distance must be > 0")
+		}
+		return strconv.FormatInt(v, 10) + "m", float64(v), nil
+	case json.Number:
+		fv, err := v.Float64()
+		if err != nil || math.IsNaN(fv) || math.IsInf(fv, 0) || fv <= 0 {
+			return "", 0, fmt.Errorf("parsing_exception: [geo_distance] distance must be > 0")
+		}
+		return v.String() + "m", fv, nil
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return "", 0, fmt.Errorf("parsing_exception: [geo_distance] distance cannot be empty")
+		}
+		numEnd := 0
+		for numEnd < len(s) {
+			ch := s[numEnd]
+			if (ch >= '0' && ch <= '9') || ch == '.' || ch == '-' || ch == '+' || ch == 'e' || ch == 'E' {
+				numEnd++
+			} else {
+				break
+			}
+		}
+		if numEnd == 0 {
+			return "", 0, fmt.Errorf("parsing_exception: [geo_distance] invalid distance [%s]", v)
+		}
+		val, err := strconv.ParseFloat(s[:numEnd], 64)
+		if err != nil || math.IsNaN(val) || math.IsInf(val, 0) || val <= 0 {
+			return "", 0, fmt.Errorf("parsing_exception: [geo_distance] distance must be > 0, got [%s]", v)
+		}
+		unit := strings.ToLower(strings.TrimSpace(s[numEnd:]))
+		mult, ok := GeoDistanceUnitMultiplier(unit)
+		if !ok {
+			return "", 0, fmt.Errorf("parsing_exception: [geo_distance] unknown distance unit [%s]", unit)
+		}
+		return s, val * mult, nil
+	default:
+		return "", 0, fmt.Errorf("parsing_exception: [geo_distance] invalid distance [%v]", raw)
+	}
+}
+
+// GeoDistanceUnitMultiplier returns the conversion factor from the given ES distance unit to meters.
+func GeoDistanceUnitMultiplier(unit string) (float64, bool) {
+	switch strings.ToLower(strings.TrimSpace(unit)) {
+	case "", "m", "meter", "meters":
+		return 1.0, true
+	case "km", "kilometer", "kilometers":
+		return 1000.0, true
+	case "mi", "mile", "miles":
+		return 1609.344, true
+	case "nmi", "nm", "nauticalmile", "nauticalmiles":
+		return 1852.0, true
+	case "yd", "yard", "yards":
+		return 0.9144, true
+	case "ft", "feet", "foot":
+		return 0.3048, true
+	case "in", "inch", "inches":
+		return 0.0254, true
+	case "cm", "centimeter", "centimeters":
+		return 0.01, true
+	case "mm", "millimeter", "millimeters":
+		return 0.001, true
+	default:
+		return 0, false
+	}
+}
+
+// ParseGeoPoint parses an ES geo_point value from object {"lat", "lon"}, GeoJSON Point, [lon, lat], "lat,lon", WKT "POINT (lon lat)", or geohash.
+func ParseGeoPoint(raw any) (lat, lon float64, err error) {
+	switch v := raw.(type) {
+	case nil:
+		return 0, 0, fmt.Errorf("parsing_exception: geo_point cannot be null")
+	case json.RawMessage:
+		var decoded any
+		dec := json.NewDecoder(bytes.NewReader(v))
+		dec.UseNumber()
+		if err := dec.Decode(&decoded); err != nil {
+			return 0, 0, fmt.Errorf("parsing_exception: invalid geo_point JSON: %w", err)
+		}
+		return ParseGeoPoint(decoded)
+	case []byte:
+		var decoded any
+		dec := json.NewDecoder(bytes.NewReader(v))
+		dec.UseNumber()
+		if err := dec.Decode(&decoded); err != nil {
+			return 0, 0, fmt.Errorf("parsing_exception: invalid geo_point JSON: %w", err)
+		}
+		return ParseGeoPoint(decoded)
+	case map[string]any:
+		if rawType, hasType := v["type"]; hasType {
+			tStr, _ := rawType.(string)
+			if !strings.EqualFold(strings.TrimSpace(tStr), "Point") {
+				return 0, 0, fmt.Errorf("parsing_exception: unsupported GeoJSON type [%v]", rawType)
+			}
+			coords, hasCoords := v["coordinates"]
+			if !hasCoords {
+				return 0, 0, fmt.Errorf("parsing_exception: GeoJSON Point missing [coordinates]")
+			}
+			return ParseGeoPoint(coords)
+		}
+		rawLat, hasLat := v["lat"]
+		rawLon, hasLon := v["lon"]
+		if !hasLon {
+			rawLon, hasLon = v["lng"]
+		}
+		if !hasLat || !hasLon {
+			return 0, 0, fmt.Errorf("parsing_exception: geo_point object requires [lat] and [lon]")
+		}
+		for k := range v {
+			if k != "lat" && k != "lon" && k != "lng" {
+				return 0, 0, fmt.Errorf("parsing_exception: unknown geo_point field [%s]", k)
+			}
+		}
+		latVal, err1 := parseGeoCoordAny(rawLat)
+		lonVal, err2 := parseGeoCoordAny(rawLon)
+		if err1 != nil || err2 != nil {
+			return 0, 0, fmt.Errorf("parsing_exception: invalid geo_point coordinates")
+		}
+		return latVal, lonVal, nil
+	case []any:
+		if len(v) < 2 || len(v) > 3 {
+			return 0, 0, fmt.Errorf("parsing_exception: geo_point array must have [lon, lat]")
+		}
+		lonVal, err1 := parseGeoCoordAny(v[0])
+		latVal, err2 := parseGeoCoordAny(v[1])
+		if err1 != nil || err2 != nil {
+			return 0, 0, fmt.Errorf("parsing_exception: invalid geo_point array coordinates")
+		}
+		return latVal, lonVal, nil
+	case []float64:
+		if len(v) < 2 || len(v) > 3 {
+			return 0, 0, fmt.Errorf("parsing_exception: geo_point array must have [lon, lat]")
+		}
+		return v[1], v[0], nil
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return 0, 0, fmt.Errorf("parsing_exception: geo_point string cannot be empty")
+		}
+		upper := strings.ToUpper(s)
+		if strings.HasPrefix(upper, "POINT") {
+			rest := strings.TrimSpace(s[5:])
+			if !strings.HasPrefix(rest, "(") || !strings.HasSuffix(rest, ")") {
+				return 0, 0, fmt.Errorf("parsing_exception: invalid WKT POINT [%s]", v)
+			}
+			inner := strings.Fields(strings.TrimSpace(rest[1 : len(rest)-1]))
+			if len(inner) < 2 || len(inner) > 3 {
+				return 0, 0, fmt.Errorf("parsing_exception: invalid WKT POINT coordinates [%s]", v)
+			}
+			lonVal, err1 := strconv.ParseFloat(inner[0], 64)
+			latVal, err2 := strconv.ParseFloat(inner[1], 64)
+			if err1 != nil || err2 != nil {
+				return 0, 0, fmt.Errorf("parsing_exception: invalid WKT POINT numbers [%s]", v)
+			}
+			return latVal, lonVal, nil
+		}
+		if strings.Contains(s, ",") {
+			parts := strings.Split(s, ",")
+			if len(parts) < 2 || len(parts) > 3 {
+				return 0, 0, fmt.Errorf("parsing_exception: invalid geo_point string [%s]", v)
+			}
+			latVal, err1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+			lonVal, err2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+			if err1 != nil || err2 != nil {
+				return 0, 0, fmt.Errorf("parsing_exception: invalid geo_point string coordinates [%s]", v)
+			}
+			return latVal, lonVal, nil
+		}
+		return decodeGeohashMidpoint(s)
+	default:
+		return 0, 0, fmt.Errorf("parsing_exception: unsupported geo_point value [%v]", raw)
+	}
+}
+
+func parseGeoCoordFloat(raw json.RawMessage) (float64, error) {
+	var v any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&v); err != nil {
+		return 0, fmt.Errorf("parsing_exception: invalid coordinate: %w", err)
+	}
+	return parseGeoCoordAny(v)
+}
+
+func parseGeoCoordAny(v any) (float64, error) {
+	switch tv := v.(type) {
+	case float64:
+		if math.IsNaN(tv) || math.IsInf(tv, 0) {
+			return 0, fmt.Errorf("parsing_exception: coordinate cannot be NaN or Inf")
+		}
+		return tv, nil
+	case int:
+		return float64(tv), nil
+	case int64:
+		return float64(tv), nil
+	case json.Number:
+		fv, err := tv.Float64()
+		if err != nil || math.IsNaN(fv) || math.IsInf(fv, 0) {
+			return 0, fmt.Errorf("parsing_exception: invalid coordinate [%v]", v)
+		}
+		return fv, nil
+	case string:
+		fv, err := strconv.ParseFloat(strings.TrimSpace(tv), 64)
+		if err != nil || math.IsNaN(fv) || math.IsInf(fv, 0) {
+			return 0, fmt.Errorf("parsing_exception: invalid coordinate [%s]", tv)
+		}
+		return fv, nil
+	default:
+		return 0, fmt.Errorf("parsing_exception: invalid coordinate [%v]", v)
+	}
+}
+
+func parseGeoWKTBBox(wkt string) (left, right, top, bottom float64, err error) {
+	s := strings.TrimSpace(wkt)
+	if !strings.HasPrefix(strings.ToUpper(s), "BBOX") {
+		return 0, 0, 0, 0, fmt.Errorf("parsing_exception: expected WKT BBOX, got [%s]", wkt)
+	}
+	rest := strings.TrimSpace(s[4:])
+	if !strings.HasPrefix(rest, "(") || !strings.HasSuffix(rest, ")") {
+		return 0, 0, 0, 0, fmt.Errorf("parsing_exception: invalid WKT BBOX [%s]", wkt)
+	}
+	parts := strings.Split(rest[1:len(rest)-1], ",")
+	if len(parts) != 4 {
+		return 0, 0, 0, 0, fmt.Errorf("parsing_exception: WKT BBOX requires 4 coordinates, got [%s]", wkt)
+	}
+	left, err1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	right, err2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	top, err3 := strconv.ParseFloat(strings.TrimSpace(parts[2]), 64)
+	bottom, err4 := strconv.ParseFloat(strings.TrimSpace(parts[3]), 64)
+	if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
+		return 0, 0, 0, 0, fmt.Errorf("parsing_exception: invalid WKT BBOX coordinates [%s]", wkt)
+	}
+	return left, right, top, bottom, nil
+}
+
+func decodeGeohashMidpoint(hash string) (lat, lon float64, err error) {
+	const base32 = "0123456789bcdefghjkmnpqrstuvwxyz"
+	if len(hash) == 0 || len(hash) > 12 {
+		return 0, 0, fmt.Errorf("parsing_exception: invalid geohash [%s]", hash)
+	}
+	minLat, maxLat := -90.0, 90.0
+	minLon, maxLon := -180.0, 180.0
+	isEven := true
+	for i := 0; i < len(hash); i++ {
+		idx := strings.IndexByte(base32, hash[i])
+		if idx < 0 {
+			return 0, 0, fmt.Errorf("parsing_exception: invalid geohash character in [%s]", hash)
+		}
+		for bit := 4; bit >= 0; bit-- {
+			mask := (idx >> bit) & 1
+			if isEven {
+				mid := (minLon + maxLon) / 2.0
+				if mask == 1 {
+					minLon = mid
+				} else {
+					maxLon = mid
+				}
+			} else {
+				mid := (minLat + maxLat) / 2.0
+				if mask == 1 {
+					minLat = mid
+				} else {
+					maxLat = mid
+				}
+			}
+			isEven = !isEven
+		}
+	}
+	return (minLat + maxLat) / 2.0, (minLon + maxLon) / 2.0, nil
+}
+
+func validateAndNormalizeGeoPoint(lat, lon float64, validationMethod string) (float64, float64, error) {
+	if math.IsNaN(lat) || math.IsNaN(lon) || math.IsInf(lat, 0) || math.IsInf(lon, 0) {
+		return 0, 0, fmt.Errorf("parsing_exception: geo_point coordinates must be finite")
+	}
+	vm := strings.ToUpper(strings.TrimSpace(validationMethod))
+	if vm == "COERCE" || vm == "IGNORE_MALFORMED" {
+		if lat > 90 {
+			lat = 90
+		} else if lat < -90 {
+			lat = -90
+		}
+		for lon > 180 {
+			lon -= 360
+		}
+		for lon < -180 {
+			lon += 360
+		}
+		return lat, lon, nil
+	}
+	if lat < -90.0 || lat > 90.0 {
+		return 0, 0, fmt.Errorf("parsing_exception: illegal latitude value [%v]", lat)
+	}
+	if lon < -180.0 || lon > 180.0 {
+		return 0, 0, fmt.Errorf("parsing_exception: illegal longitude value [%v]", lon)
+	}
+	return lat, lon, nil
 }
 
 // BoostingQuery represents an ES `boosting` query (`positive`, `negative`, `negative_boost`).
@@ -1788,16 +2852,36 @@ func (t *TermEntry) UnmarshalJSON(data []byte) error {
 type IdsQuery struct {
 	Values []string `json:"values"`
 	Boost  *float64 `json:"boost,omitempty"`
+	Name   string   `json:"_name,omitempty"`
 }
 
 func (iq *IdsQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "values", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [ids] unknown field [%s]", k)
+		}
+	}
 	var raw struct {
 		Values any             `json:"values"`
 		Boost  json.RawMessage `json:"boost"`
+		Name   string          `json:"_name"`
 	}
-	if err := json.Unmarshal(data, &raw); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.UseNumber()
+	if err := dec.Decode(&raw); err != nil {
 		return err
 	}
+	iq.Name = raw.Name
 	if len(raw.Boost) > 0 {
 		b, err := parseOptionalNonNegativeBoost(raw.Boost)
 		if err != nil {
@@ -1810,12 +2894,16 @@ func (iq *IdsQuery) UnmarshalJSON(data []byte) error {
 	case []any:
 		iq.Values = make([]string, 0, len(v))
 		for _, item := range v {
-			if item != nil {
-				iq.Values = append(iq.Values, fmt.Sprintf("%v", item))
+			if isNonScalarOrNullValue(item) {
+				return fmt.Errorf("parsing_exception: [ids] values cannot contain null or non-scalar elements")
 			}
+			iq.Values = append(iq.Values, formatFlexibleScalarString(item))
 		}
 	default:
-		iq.Values = []string{fmt.Sprintf("%v", v)}
+		if isNonScalarOrNullValue(v) {
+			return fmt.Errorf("parsing_exception: [ids] values must be an array of scalars")
+		}
+		iq.Values = []string{formatFlexibleScalarString(v)}
 	}
 	return nil
 }
@@ -1823,6 +2911,46 @@ func (iq *IdsQuery) UnmarshalJSON(data []byte) error {
 type ExistsQuery struct {
 	Field string   `json:"field"`
 	Boost *float64 `json:"boost,omitempty"`
+	Name  string   `json:"_name,omitempty"`
+}
+
+func (eq *ExistsQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "field", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [exists] unknown field [%s]", k)
+		}
+	}
+	var raw struct {
+		Field string          `json:"field"`
+		Boost json.RawMessage `json:"boost"`
+		Name  string          `json:"_name"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if strings.TrimSpace(raw.Field) == "" {
+		return fmt.Errorf("parsing_exception: [exists] requires non-empty [field]")
+	}
+	eq.Field = raw.Field
+	eq.Name = raw.Name
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		eq.Boost = b
+	}
+	return nil
 }
 
 // RangeCond supports both standard `gt`/`gte`/`lt`/`lte` bounds and Java `RangeQueryBuilder`
@@ -2576,11 +3704,229 @@ type NestedQuery struct {
 	IgnoreUnmapped bool           `json:"ignore_unmapped,omitempty"`
 	Boost          *float64       `json:"boost,omitempty"`
 	InnerHits      *InnerHitsSpec `json:"inner_hits,omitempty"`
+	Name           string         `json:"_name,omitempty"`
+}
+
+func (nq *NestedQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "path", "query", "score_mode", "ignore_unmapped", "inner_hits", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [nested] unknown field [%s]", k)
+		}
+	}
+	rawQuery, hasQuery := rawMap["query"]
+	if !hasQuery || len(bytes.TrimSpace(rawQuery)) == 0 || bytes.Equal(bytes.TrimSpace(rawQuery), []byte("null")) {
+		return fmt.Errorf("parsing_exception: [nested] missing required [query] field")
+	}
+	var raw struct {
+		Path           string          `json:"path"`
+		Query          Query           `json:"query"`
+		ScoreMode      string          `json:"score_mode"`
+		IgnoreUnmapped any             `json:"ignore_unmapped"`
+		Boost          json.RawMessage `json:"boost"`
+		InnerHits      *InnerHitsSpec  `json:"inner_hits"`
+		Name           string          `json:"_name"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if strings.TrimSpace(raw.Path) == "" {
+		return fmt.Errorf("parsing_exception: [nested] requires non-empty [path]")
+	}
+	switch strings.ToLower(strings.TrimSpace(raw.ScoreMode)) {
+	case "", "avg", "sum", "min", "max", "none":
+		nq.ScoreMode = strings.ToLower(strings.TrimSpace(raw.ScoreMode))
+	default:
+		return fmt.Errorf("parsing_exception: [nested] invalid score_mode [%s]", raw.ScoreMode)
+	}
+	if raw.IgnoreUnmapped != nil {
+		iu, err := parseFlexibleBool(raw.IgnoreUnmapped)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [nested] %w", err)
+		}
+		nq.IgnoreUnmapped = iu
+	}
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		nq.Boost = b
+	}
+	nq.Path = raw.Path
+	nq.Query = raw.Query
+	nq.InnerHits = raw.InnerHits
+	nq.Name = raw.Name
+	return nil
 }
 
 type ConstantScoreQuery struct {
 	Filter Query    `json:"filter"`
 	Boost  *float64 `json:"boost,omitempty"`
+	Name   string   `json:"_name,omitempty"`
+}
+
+func (csq *ConstantScoreQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "filter", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [constant_score] unknown field [%s]", k)
+		}
+	}
+	rawFilter, hasFilter := rawMap["filter"]
+	if !hasFilter || len(bytes.TrimSpace(rawFilter)) == 0 || bytes.Equal(bytes.TrimSpace(rawFilter), []byte("null")) {
+		return fmt.Errorf("parsing_exception: [constant_score] missing required [filter] field")
+	}
+	var raw struct {
+		Filter Query           `json:"filter"`
+		Boost  json.RawMessage `json:"boost"`
+		Name   string          `json:"_name"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	csq.Filter = raw.Filter
+	csq.Name = raw.Name
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		csq.Boost = b
+	}
+	return nil
+}
+
+// DecayFunctionSpec models a `gauss`, `exp`, or `linear` decay function inside `function_score`.
+type DecayFunctionSpec struct {
+	Field          string   `json:"-"`
+	Origin         any      `json:"origin"`
+	Scale          any      `json:"scale"`
+	Offset         any      `json:"offset,omitempty"`
+	Decay          *float64 `json:"decay,omitempty"`
+	MultiValueMode string   `json:"multi_value_mode,omitempty"`
+}
+
+func (df DecayFunctionSpec) MarshalJSON() ([]byte, error) {
+	inner := map[string]any{
+		"origin": df.Origin,
+		"scale":  df.Scale,
+	}
+	if df.Offset != nil {
+		inner["offset"] = df.Offset
+	}
+	if df.Decay != nil {
+		inner["decay"] = *df.Decay
+	}
+	m := map[string]any{}
+	if df.Field != "" {
+		m[df.Field] = inner
+	}
+	if df.MultiValueMode != "" {
+		m["multi_value_mode"] = df.MultiValueMode
+	}
+	return json.Marshal(m)
+}
+
+func (df *DecayFunctionSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	var fieldKeys []string
+	for k, v := range rawMap {
+		if k == "multi_value_mode" {
+			var mvm string
+			if err := json.Unmarshal(v, &mvm); err != nil {
+				return fmt.Errorf("parsing_exception: invalid [multi_value_mode] in decay function")
+			}
+			switch strings.ToLower(strings.TrimSpace(mvm)) {
+			case "", "min", "max", "avg", "sum":
+				df.MultiValueMode = strings.ToLower(strings.TrimSpace(mvm))
+			default:
+				return fmt.Errorf("parsing_exception: invalid multi_value_mode [%s] in decay function", mvm)
+			}
+			continue
+		}
+		fieldKeys = append(fieldKeys, k)
+	}
+	if len(fieldKeys) != 1 {
+		return fmt.Errorf("parsing_exception: decay function must specify exactly one field, got %d", len(fieldKeys))
+	}
+	df.Field = fieldKeys[0]
+	var innerMap map[string]json.RawMessage
+	if err := json.Unmarshal(rawMap[df.Field], &innerMap); err != nil {
+		return fmt.Errorf("parsing_exception: decay function field [%s] must be an object", df.Field)
+	}
+	for k := range innerMap {
+		switch k {
+		case "origin", "scale", "offset", "decay", "multi_value_mode":
+		default:
+			return fmt.Errorf("parsing_exception: unknown field [%s] in decay function for [%s]", k, df.Field)
+		}
+	}
+	if _, hasOrigin := innerMap["origin"]; !hasOrigin {
+		return fmt.Errorf("parsing_exception: decay function for [%s] requires [origin]", df.Field)
+	}
+	if _, hasScale := innerMap["scale"]; !hasScale {
+		return fmt.Errorf("parsing_exception: decay function for [%s] requires [scale]", df.Field)
+	}
+	var inner struct {
+		Origin         any             `json:"origin"`
+		Scale          any             `json:"scale"`
+		Offset         any             `json:"offset"`
+		Decay          json.RawMessage `json:"decay"`
+		MultiValueMode string          `json:"multi_value_mode"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(rawMap[df.Field]))
+	dec.UseNumber()
+	if err := dec.Decode(&inner); err != nil {
+		return err
+	}
+	if inner.Origin == nil || inner.Scale == nil {
+		return fmt.Errorf("parsing_exception: decay function for [%s] requires non-null [origin] and [scale]", df.Field)
+	}
+	df.Origin = inner.Origin
+	df.Scale = inner.Scale
+	df.Offset = inner.Offset
+	if inner.MultiValueMode != "" && df.MultiValueMode == "" {
+		switch strings.ToLower(strings.TrimSpace(inner.MultiValueMode)) {
+		case "min", "max", "avg", "sum":
+			df.MultiValueMode = strings.ToLower(strings.TrimSpace(inner.MultiValueMode))
+		default:
+			return fmt.Errorf("parsing_exception: invalid multi_value_mode [%s] in decay function", inner.MultiValueMode)
+		}
+	}
+	if len(inner.Decay) > 0 {
+		d, err := parseOptionalNonNegativeBoost(inner.Decay)
+		if err != nil || d == nil || *d <= 0 || *d >= 1.0 {
+			return fmt.Errorf("parsing_exception: [decay] must be in (0.0, 1.0)")
+		}
+		df.Decay = d
+	}
+	return nil
 }
 
 type FunctionScoreQuery struct {
@@ -2595,7 +3941,107 @@ type FunctionScoreQuery struct {
 	FieldValueFactor *FieldValueFactorSpec    `json:"field_value_factor,omitempty"`
 	ScriptScore      *ScriptScoreFunctionSpec `json:"script_score,omitempty"`
 	RandomScore      *RandomScoreSpec         `json:"random_score,omitempty"`
+	Gauss            *DecayFunctionSpec       `json:"gauss,omitempty"`
+	Exp              *DecayFunctionSpec       `json:"exp,omitempty"`
+	Linear           *DecayFunctionSpec       `json:"linear,omitempty"`
+	Name             string                   `json:"_name,omitempty"`
 }
+
+func (fsq *FunctionScoreQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "query", "functions", "score_mode", "boost_mode", "max_boost", "min_score", "boost",
+			"weight", "field_value_factor", "script_score", "random_score", "gauss", "exp", "linear", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [function_score] unknown field [%s]", k)
+		}
+	}
+	type plain FunctionScoreQuery
+	var raw struct {
+		plain
+		MaxBoost json.RawMessage `json:"max_boost"`
+		MinScore json.RawMessage `json:"min_score"`
+		Boost    json.RawMessage `json:"boost"`
+		Weight   json.RawMessage `json:"weight"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	*fsq = FunctionScoreQuery(raw.plain)
+	switch strings.ToLower(strings.TrimSpace(fsq.ScoreMode)) {
+	case "", "multiply", "sum", "avg", "first", "max", "min":
+		fsq.ScoreMode = strings.ToLower(strings.TrimSpace(fsq.ScoreMode))
+	default:
+		return fmt.Errorf("parsing_exception: [function_score] unknown score_mode [%s]", fsq.ScoreMode)
+	}
+	switch strings.ToLower(strings.TrimSpace(fsq.BoostMode)) {
+	case "", "multiply", "replace", "sum", "avg", "max", "min":
+		fsq.BoostMode = strings.ToLower(strings.TrimSpace(fsq.BoostMode))
+	default:
+		return fmt.Errorf("parsing_exception: [function_score] unknown boost_mode [%s]", fsq.BoostMode)
+	}
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		fsq.Boost = b
+	}
+	if len(raw.MaxBoost) > 0 {
+		mb, err := parseOptionalNonNegativeBoost(raw.MaxBoost)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [function_score] max_boost must be a non-negative number")
+		}
+		fsq.MaxBoost = mb
+	}
+	if len(raw.MinScore) > 0 {
+		ms, err := parseOptionalNonNegativeBoost(raw.MinScore)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [function_score] min_score must be a non-negative number")
+		}
+		fsq.MinScore = ms
+	}
+	if len(raw.Weight) > 0 {
+		w, err := parseOptionalNonNegativeBoost(raw.Weight)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [function_score] weight must be a non-negative number")
+		}
+		fsq.Weight = w
+	}
+	topFuncs := 0
+	if fsq.FieldValueFactor != nil {
+		topFuncs++
+	}
+	if fsq.ScriptScore != nil {
+		topFuncs++
+	}
+	if fsq.RandomScore != nil {
+		topFuncs++
+	}
+	if fsq.Gauss != nil {
+		topFuncs++
+	}
+	if fsq.Exp != nil {
+		topFuncs++
+	}
+	if fsq.Linear != nil {
+		topFuncs++
+	}
+	if topFuncs > 1 || (len(fsq.Functions) > 0 && (topFuncs > 0 || fsq.Weight != nil)) {
+		return fmt.Errorf("parsing_exception: [function_score] cannot combine multiple inline score functions or [functions] with inline function")
+	}
+	return nil
+}
+
+type ScoreFunction = ScoreFunctionSpec
 
 type ScoreFunctionSpec struct {
 	Filter           *Query                   `json:"filter,omitempty"`
@@ -2603,6 +4049,69 @@ type ScoreFunctionSpec struct {
 	FieldValueFactor *FieldValueFactorSpec    `json:"field_value_factor,omitempty"`
 	ScriptScore      *ScriptScoreFunctionSpec `json:"script_score,omitempty"`
 	RandomScore      *RandomScoreSpec         `json:"random_score,omitempty"`
+	Gauss            *DecayFunctionSpec       `json:"gauss,omitempty"`
+	Exp              *DecayFunctionSpec       `json:"exp,omitempty"`
+	Linear           *DecayFunctionSpec       `json:"linear,omitempty"`
+}
+
+func (sfs *ScoreFunctionSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "filter", "weight", "field_value_factor", "script_score", "random_score", "gauss", "exp", "linear":
+		default:
+			return fmt.Errorf("parsing_exception: [function_score] unknown field [%s] in score function", k)
+		}
+	}
+	type plain ScoreFunctionSpec
+	var raw struct {
+		plain
+		Weight json.RawMessage `json:"weight"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	*sfs = ScoreFunctionSpec(raw.plain)
+	if len(raw.Weight) > 0 {
+		w, err := parseOptionalNonNegativeBoost(raw.Weight)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [function_score] weight must be a non-negative number")
+		}
+		sfs.Weight = w
+	}
+	fnCount := 0
+	if sfs.FieldValueFactor != nil {
+		fnCount++
+	}
+	if sfs.ScriptScore != nil {
+		fnCount++
+	}
+	if sfs.RandomScore != nil {
+		fnCount++
+	}
+	if sfs.Gauss != nil {
+		fnCount++
+	}
+	if sfs.Exp != nil {
+		fnCount++
+	}
+	if sfs.Linear != nil {
+		fnCount++
+	}
+	if fnCount > 1 {
+		return fmt.Errorf("parsing_exception: [function_score] each entry in [functions] may specify at most one score function")
+	}
+	if fnCount == 0 && sfs.Weight == nil {
+		return fmt.Errorf("parsing_exception: [function_score] each entry in [functions] must specify a score function or [weight]")
+	}
+	return nil
 }
 
 type RandomScoreSpec struct {
@@ -4462,6 +5971,7 @@ type BulkOperation struct {
 	Action          string          // "index", "create", "update", "delete"
 	Index           string          // Target index name
 	ID              string          // Document _id
+	AutoGeneratedID bool            `json:"-"` // True when _id was omitted and generated via NextAutoID()
 	Pipeline        string          // Optional per-item ingest pipeline override
 	Routing         string          // Optional per-item routing value
 	IfSeqNo         *int64          // Optional optimistic concurrency _seq_no
@@ -4469,26 +5979,65 @@ type BulkOperation struct {
 	Version         *int64          // Optional external/internal version check
 	VersionType     string          // Optional version_type ("internal", "external", "external_gte")
 	RetryOnConflict *int            // Optional retry_on_conflict count
+	RequireAlias    *bool           `json:"require_alias,omitempty"`
+	DocAsUpsert     *bool           `json:"doc_as_upsert,omitempty"`
+	DetectNoop      *bool           `json:"detect_noop,omitempty"`
+	SourceFilter    *SourceFilter   `json:"_source,omitempty"`
+	SourceIncludes  any             `json:"_source_includes,omitempty"`
+	SourceExcludes  any             `json:"_source_excludes,omitempty"`
 	Source          json.RawMessage // Verbatim raw JSON line for `_source` (or update payload)
 	ParseErr        string          // Per-item validation or JSON error (isolated to this bulk item)
 }
 
 type bulkActionMeta struct {
-	Index             string `json:"_index"`
-	ID                any    `json:"_id"`
-	Pipeline          string `json:"pipeline,omitempty"`
-	Routing           string `json:"routing,omitempty"`
-	UnderscoreRouting string `json:"_routing,omitempty"`
-	IfSeqNo           *int64 `json:"if_seq_no,omitempty"`
-	UnderscoreIfSeqNo *int64 `json:"_if_seq_no,omitempty"`
-	IfPrimaryTerm     *int64 `json:"if_primary_term,omitempty"`
-	UnderscorePrimTrm *int64 `json:"_if_primary_term,omitempty"`
-	Version           *int64 `json:"version,omitempty"`
-	UnderscoreVersion *int64 `json:"_version,omitempty"`
-	VersionType       string `json:"version_type,omitempty"`
-	UnderscoreVerType string `json:"_version_type,omitempty"`
-	RetryOnConflict   *int   `json:"retry_on_conflict,omitempty"`
-	UnderscoreRetry   *int   `json:"_retry_on_conflict,omitempty"`
+	Index             string        `json:"_index"`
+	ID                any           `json:"_id"`
+	Pipeline          string        `json:"pipeline,omitempty"`
+	Routing           string        `json:"routing,omitempty"`
+	UnderscoreRouting string        `json:"_routing,omitempty"`
+	IfSeqNo           *int64        `json:"if_seq_no,omitempty"`
+	UnderscoreIfSeqNo *int64        `json:"_if_seq_no,omitempty"`
+	IfPrimaryTerm     *int64        `json:"if_primary_term,omitempty"`
+	UnderscorePrimTrm *int64        `json:"_if_primary_term,omitempty"`
+	Version           *int64        `json:"version,omitempty"`
+	UnderscoreVersion *int64        `json:"_version,omitempty"`
+	VersionType       string        `json:"version_type,omitempty"`
+	UnderscoreVerType string        `json:"_version_type,omitempty"`
+	RetryOnConflict   *int          `json:"retry_on_conflict,omitempty"`
+	UnderscoreRetry   *int          `json:"_retry_on_conflict,omitempty"`
+	RequireAlias      any           `json:"require_alias,omitempty"`
+	DocAsUpsert       any           `json:"doc_as_upsert,omitempty"`
+	DetectNoop        any           `json:"detect_noop,omitempty"`
+	SourceFilter      *SourceFilter `json:"_source,omitempty"`
+	SourceIncludes    any           `json:"_source_includes,omitempty"`
+	SourceExcludes    any           `json:"_source_excludes,omitempty"`
+}
+
+func parseBulkSourcePatternList(raw any) []string {
+	if raw == nil {
+		return nil
+	}
+	switch v := raw.(type) {
+	case string:
+		var out []string
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				out = append(out, p)
+			}
+		}
+		return out
+	case []string:
+		return v
+	case []any:
+		var out []string
+		for _, item := range v {
+			if s := strings.TrimSpace(formatFlexibleScalarString(item)); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 type bulkActionLine struct {
@@ -4567,9 +6116,37 @@ func ParseBulkNDJSON(r io.Reader, defaultIndex string) ([]BulkOperation, error) 
 		if op.RetryOnConflict == nil {
 			op.RetryOnConflict = meta.UnderscoreRetry
 		}
+		if meta.RequireAlias != nil {
+			if b, err := parseFlexibleBool(meta.RequireAlias); err == nil {
+				op.RequireAlias = &b
+			}
+		}
+		if meta.DocAsUpsert != nil {
+			if b, err := parseFlexibleBool(meta.DocAsUpsert); err == nil {
+				op.DocAsUpsert = &b
+			}
+		}
+		if meta.DetectNoop != nil {
+			if b, err := parseFlexibleBool(meta.DetectNoop); err == nil {
+				op.DetectNoop = &b
+			}
+		}
+		op.SourceFilter = meta.SourceFilter
+		op.SourceIncludes = meta.SourceIncludes
+		op.SourceExcludes = meta.SourceExcludes
+		incList := parseBulkSourcePatternList(meta.SourceIncludes)
+		excList := parseBulkSourcePatternList(meta.SourceExcludes)
+		if len(incList) > 0 || len(excList) > 0 {
+			if op.SourceFilter == nil {
+				op.SourceFilter = &SourceFilter{}
+			}
+			op.SourceFilter.Includes = append(op.SourceFilter.Includes, incList...)
+			op.SourceFilter.Excludes = append(op.SourceFilter.Excludes, excList...)
+		}
 		if op.ID == "" {
 			if op.Action == "index" || op.Action == "create" {
 				op.ID = NextAutoID()
+				op.AutoGeneratedID = true
 			} else {
 				op.ParseErr = fmt.Sprintf("missing _id for bulk %s action", op.Action)
 			}
