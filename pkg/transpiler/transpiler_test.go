@@ -2533,3 +2533,189 @@ func TestRound43ScriptSortNestedGeoSortGeohashMissingBucketLuceneAndCollapseArra
 		t.Fatalf("F20 expected PARTITION BY element_at(`f__arr__tags`, 1) in collapse SQL, got:\n%s", planF20.HitsSQL)
 	}
 }
+
+func TestRound44TranspilerNestedMultiFieldLuceneRangeDateZoneDoris4SearchAndMinScore(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"zip": {"type": "keyword"},
+			"lc_kw": {"type": "keyword", "normalizer": "lowercase"},
+			"title": {"type": "text"},
+			"body": {"type": "text"},
+			"dt_basic": {"type": "date", "format": "basic_date||epoch_millis"},
+			"dt_iso": {"type": "date"},
+			"items": {
+				"type": "nested",
+				"properties": {
+					"code": {
+						"type": "keyword",
+						"fields": {
+							"lc": {"type": "keyword", "normalizer": "lowercase"}
+						}
+					},
+					"price": {"type": "double"},
+					"qty": {"type": "integer"},
+					"active": {"type": "boolean"}
+				}
+			}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("unmarshal spec failed: %v", err)
+	}
+	sch := schema.CompileIndexSchema("db", "r44_tr", &spec)
+	tr := NewTranspiler(sch, TranspilerOptions{})
+
+	// F7: Correlated nested query on custom multi-field (items.code.lc) resolves relative companion path $.code__lc and lowercases value
+	var nestedMFReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"query": {
+			"nested": {
+				"path": "items",
+				"query": {
+					"bool": {
+						"must": [
+							{"term": {"items.code.lc": "SKU-1"}},
+							{"term": {"items.price": 10}}
+						]
+					}
+				}
+			}
+		}
+	}`), &nestedMFReq)
+	cqNestedMF := tr.CompileQuery(nestedMFReq.Query, false, nil)
+	if !strings.Contains(cqNestedMF.WhereSQL, "json_extract_string(_el, '$.code__lc')") || !strings.Contains(cqNestedMF.WhereSQL, "'sku-1'") {
+		t.Fatalf("F7 expected correlated nested custom multi-field items.code.lc to extract $.code__lc with 'sku-1', got:\n%s", cqNestedMF.WhereSQL)
+	}
+
+	// F8: Lucene range preserves leading-zero keyword strings, basic_date strings, and lowercases normalizer range bounds
+	qZip := parseSimpleLuceneToASTWithFlags("zip:[01000 TO 02000]", "", nil, "OR", 0, false, simpleQueryFlags{})
+	cqZip := tr.CompileQuery(&qZip, false, nil)
+	if !strings.Contains(cqZip.WhereSQL, ">= '01000'") || !strings.Contains(cqZip.WhereSQL, "<= '02000'") {
+		t.Fatalf("F8 expected leading-zero keyword range bounds '01000'..'02000', got:\n%s", cqZip.WhereSQL)
+	}
+	qBasicDate := parseSimpleLuceneToASTWithFlags("dt_basic:[20260101 TO 20260102]", "", nil, "OR", 0, false, simpleQueryFlags{})
+	cqBasicDate := tr.CompileQuery(&qBasicDate, false, nil)
+	if !strings.Contains(cqBasicDate.WhereSQL, "1767225600000") {
+		t.Fatalf("F8 expected basic_date '20260101' in Lucene range to parse to 1767225600000, got:\n%s", cqBasicDate.WhereSQL)
+	}
+	var lcRangeReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"query": {
+			"range": {
+				"lc_kw": {"gte": "ABC", "lte": "XYZ"}
+			}
+		}
+	}`), &lcRangeReq)
+	cqLcRange := tr.CompileQuery(lcRangeReq.Query, false, nil)
+	if !strings.Contains(cqLcRange.WhereSQL, ">= 'abc'") || !strings.Contains(cqLcRange.WhereSQL, "<= 'xyz'") {
+		t.Fatalf("F8 expected lowercase normalizer range bounds 'abc'..'xyz', got:\n%s", cqLcRange.WhereSQL)
+	}
+
+	// F9: Date range epoch numeric string not shifted by time_zone when format is set, and 4-digit year string "2026" parsed as 2026-01-01T00:00:00Z
+	var dateRangeReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"query": {
+			"bool": {
+				"must": [
+					{"range": {"dt_basic": {"gte": "1700000000000", "time_zone": "+02:00"}}},
+					{"range": {"dt_iso": {"gte": "2026"}}}
+				]
+			}
+		}
+	}`), &dateRangeReq)
+	cqDateRange := tr.CompileQuery(dateRangeReq.Query, false, nil)
+	if !strings.Contains(cqDateRange.WhereSQL, "`f__dt_basic` >= 1700000000000") || !strings.Contains(cqDateRange.WhereSQL, "`f__dt_iso` >= 1767225600000") {
+		t.Fatalf("F9 expected unshifted epoch string 1700000000000 and 2026-01-01 epoch 1767225600000, got:\n%s", cqDateRange.WhereSQL)
+	}
+
+	// F10: extractNestedPrefilter coerces numeric/boolean string literals on nested subfields
+	var nestedCoerceReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"query": {
+			"nested": {
+				"path": "items",
+				"query": {
+					"bool": {
+						"must": [
+							{"term": {"items.price": "42.0"}},
+							{"term": {"items.qty": "010"}},
+							{"term": {"items.active": "TRUE"}}
+						]
+					}
+				}
+			}
+		}
+	}`), &nestedCoerceReq)
+	cqNestedCoerce := tr.CompileQuery(nestedCoerceReq.Query, false, nil)
+	if !strings.Contains(cqNestedCoerce.WhereSQL, "array_contains(`n__items__price`, '42')") ||
+		!strings.Contains(cqNestedCoerce.WhereSQL, "array_contains(`n__items__qty`, '10')") ||
+		!strings.Contains(cqNestedCoerce.WhereSQL, "array_contains(`n__items__active`, 'true')") {
+		t.Fatalf("F10 expected canonical coerced prefilters '42', '10', 'true', got:\n%s", cqNestedCoerce.WhereSQL)
+	}
+
+	// F11: BoostingQuery negative_boost: 0 emits * 0.0000, and empty function_score applies max_boost + boost_mode
+	var f11Req esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"query": {
+			"bool": {
+				"should": [
+					{
+						"boosting": {
+							"positive": {"term": {"zip": "10001"}},
+							"negative": {"term": {"lc_kw": "bad"}},
+							"negative_boost": 0
+						}
+					},
+					{
+						"function_score": {
+							"query": {"term": {"zip": {"value": "10001", "boost": 3.0}}},
+							"max_boost": 0.5,
+							"boost_mode": "replace"
+						}
+					}
+				]
+			}
+		}
+	}`), &f11Req)
+	cqF11 := tr.CompileQuery(f11Req.Query, true, nil)
+	if !strings.Contains(cqF11.ScoreSQL, "THEN 0.0000 ELSE 1.0 END") || !strings.Contains(cqF11.ScoreSQL, "LEAST(0.5000, 1.0)") {
+		t.Fatalf("F11 expected 'THEN 0.0000 ELSE 1.0 END' and 'LEAST(0.5000, 1.0)', got:\n%s", cqF11.ScoreSQL)
+	}
+
+	// F12: Doris 4 SEARCH fast-path on multi-field query_string with explicit field prefix and quoted phrase on fielded text column
+	trDoris4 := NewTranspiler(sch, TranspilerOptions{UseDoris4SearchFunc: true})
+	var qsDoris4Req esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"query": {
+			"query_string": {
+				"default_field": "zip",
+				"fields": ["title", "body"],
+				"query": "title:\"hello world\""
+			}
+		}
+	}`), &qsDoris4Req)
+	cqDoris4 := trDoris4.CompileQuery(qsDoris4Req.Query, false, nil)
+	if !strings.Contains(cqDoris4.WhereSQL, "SEARCH(") {
+		t.Fatalf("F12 expected Doris 4 SEARCH(...) pushdown for fielded phrase on text column, got:\n%s", cqDoris4.WhereSQL)
+	}
+
+	// F13: BuildSearchPlan skips SQL min_score pushdown when queryContainsNestedScoring is true
+	var minScoreNestedReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"min_score": 1.5,
+		"query": {
+			"nested": {
+				"path": "items",
+				"score_mode": "sum",
+				"query": {"term": {"items.code": "A"}}
+			}
+		}
+	}`), &minScoreNestedReq)
+	planF13, err := tr.BuildSearchPlan(&minScoreNestedReq)
+	if err != nil {
+		t.Fatalf("F13 BuildSearchPlan failed: %v", err)
+	}
+	if strings.Contains(planF13.HitsSQL, ">= 1.5000") {
+		t.Fatalf("F13 expected min_score SQL pushdown skipped for nested scoring query, got:\n%s", planF13.HitsSQL)
+	}
+}

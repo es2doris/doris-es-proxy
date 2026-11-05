@@ -2444,7 +2444,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			if err != nil {
 				return err
 			}
-			keyStr := fmt.Sprintf("%v", kVal)
+			keyStr := encodeBracketKey(fmt.Sprintf("%v", kVal))
 			fullKeyPath := append(targetPath, keyStr)
 			params["_last_expr_val"] = resolveParamPath(sourceMap, fullKeyPath)
 			setValueAtPath(sourceMap, fullKeyPath, vVal)
@@ -5658,6 +5658,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 	}
 	if strings.HasPrefix(rhs, "[") && strings.HasSuffix(rhs, "]") && findMatchingDelimiter(rhs, 0, '[', ']') == len(rhs)-1 {
 		inner := strings.TrimSpace(rhs[1 : len(rhs)-1])
+		if inner == ":" {
+			return map[string]any{}, nil
+		}
 		if inner != "" {
 			items := splitTopLevelCommaPainless(inner)
 			firstColon := -1
@@ -5702,7 +5705,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			return unescapePainlessString(rhs[1 : len(rhs)-1]), nil
 		}
 	}
-	numStr := rhs
+	numStr := stripNumericUnderscoresPainless(rhs)
 	if v, ok := parseHexOrBinaryIntLiteralPainless(numStr); ok {
 		return v, nil
 	}
@@ -5835,6 +5838,32 @@ func unescapePainlessString(s string) string {
 		sb.WriteByte(s[i])
 	}
 	return sb.String()
+}
+
+func isHexDigitBytePainless(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
+}
+
+func stripNumericUnderscoresPainless(s string) string {
+	if !strings.Contains(s, "_") {
+		return s
+	}
+	t := strings.TrimPrefix(strings.TrimPrefix(s, "-"), "+")
+	if len(t) == 0 || ((t[0] < '0' || t[0] > '9') && t[0] != '.') {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '_' {
+			if i > 0 && i+1 < len(s) && isHexDigitBytePainless(s[i-1]) && isHexDigitBytePainless(s[i+1]) {
+				continue
+			}
+			return s
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 func stripConstructorGenericsPainless(s string) string {
@@ -6557,6 +6586,12 @@ func resolveDocValuesSlice(sourceMap map[string]any, fieldPath string) []any {
 	if val == nil && (fieldPath == "_id" || fieldPath == "_id.keyword" || fieldPath == "_id\x00keyword") {
 		val = sourceMap["__meta_id"]
 	}
+	if val == nil && (fieldPath == "_index" || fieldPath == "_index.keyword" || fieldPath == "_index\x00keyword") {
+		val = sourceMap["__meta_index"]
+	}
+	if val == nil && fieldPath == "_version" {
+		val = sourceMap["__meta_version"]
+	}
 	if val == nil {
 		return []any{}
 	}
@@ -6695,6 +6730,15 @@ func setValueAtPath(root map[string]any, path []string, val any) {
 	lastSeg := decodeBracketSeg(path[len(path)-1])
 	switch node := curr.(type) {
 	case map[string]any:
+		if strings.Contains(lastSeg, ".") {
+			if _, flatExists := node[lastSeg]; !flatExists {
+				subSegs := strings.Split(lastSeg, ".")
+				if resolveParamPath(node, subSegs) != nil {
+					setValueAtPath(node, subSegs, val)
+					return
+				}
+			}
+		}
 		node[lastSeg] = val
 	case []any:
 		if idx, ok := parseSliceIndex(lastSeg, len(node)); ok {

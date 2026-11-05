@@ -187,6 +187,34 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 							UsesFulltextMatch: true,
 						}
 					}
+				} else if hasOnlyFieldedDoris4Clauses(rewrittenRaw) {
+					col := "_all_text"
+					for _, ef := range expandedFields {
+						fname := strings.Split(ef, "^")[0]
+						if t.isDoris4SearchableField(fname) {
+							col = strings.Trim(t.sqlColumnRef(fname, false, nctx), "`")
+							break
+						}
+					}
+					pred := fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(rewrittenRaw), quoteStr(col), quoteStr(defaultOp))
+					return CompiledQuery{
+						WhereSQL:          pred,
+						SafeWhereSQL:      compiled.EffectiveSafeWhere(),
+						ScoreSQL:          compiled.ScoreSQL,
+						UsesFulltextMatch: true,
+					}
+				}
+			} else if hasOnlyFieldedDoris4Clauses(rewrittenRaw) {
+				col := "_all_text"
+				if t.isDoris4SearchableField(defaultField) {
+					col = strings.Trim(t.sqlColumnRef(defaultField, false, nctx), "`")
+				}
+				pred := fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(rewrittenRaw), quoteStr(col), quoteStr(defaultOp))
+				return CompiledQuery{
+					WhereSQL:          pred,
+					SafeWhereSQL:      compiled.EffectiveSafeWhere(),
+					ScoreSQL:          compiled.ScoreSQL,
+					UsesFulltextMatch: true,
 				}
 			} else if t.isDoris4SearchableField(defaultField) && (t.Schema == nil || t.Schema.ResolveField(defaultField).DorisType != schema.DorisVarchar || (!strings.Contains(raw, `"`) && !strings.ContainsAny(raw, "+-") && (strings.Contains(raw, ":") || ((!t.Schema.ResolveField(defaultField).LowercaseNormalizer || strings.ToLower(raw) == raw) && !strings.ContainsAny(strings.TrimSpace(raw), " \t\n\r"))))) {
 				col := strings.Trim(t.sqlColumnRef(defaultField, false, nctx), "`")
@@ -291,6 +319,30 @@ func (t *Transpiler) rewriteDoris4SearchQuery(raw string) (string, bool) {
 		}
 	}
 	return strings.Join(out, " "), true
+}
+
+func hasOnlyFieldedDoris4Clauses(rewrittenRaw string) bool {
+	tokens := tokenizeLucene(rewrittenRaw)
+	hasClause := false
+	for _, tok := range tokens {
+		upper := strings.ToUpper(tok)
+		if upper == "AND" || upper == "OR" || upper == "NOT" {
+			continue
+		}
+		rest := strings.TrimLeft(tok, "+-")
+		if hasMatchingOuterParens(rest) {
+			if !hasOnlyFieldedDoris4Clauses(rest[1 : len(rest)-1]) {
+				return false
+			}
+			hasClause = true
+			continue
+		}
+		if findLuceneFieldColon(rest) <= 0 {
+			return false
+		}
+		hasClause = true
+	}
+	return hasClause
 }
 
 func canEmitMultiFieldDoris4SearchDisjunction(rewrittenRaw string, defaultOp string) bool {
@@ -814,8 +866,13 @@ func findLuceneFieldColon(s string) int {
 func parseLuceneRangeToken(val string, boost float64) *esast.RangeCond {
 	for _, op := range []string{">=", "<=", ">", "<"} {
 		if strings.HasPrefix(val, op) && len(val) > len(op) {
-			boundStr := unescapeLuceneToken(strings.Trim(strings.TrimSpace(val[len(op):]), `"`))
-			bound := parseLuceneRangeBound(boundStr)
+			rawBound := strings.TrimSpace(val[len(op):])
+			wasQuoted := strings.HasPrefix(rawBound, `"`) && strings.HasSuffix(rawBound, `"`)
+			boundStr := unescapeLuceneToken(strings.Trim(rawBound, `"`))
+			var bound any = boundStr
+			if !wasQuoted {
+				bound = parseLuceneRangeBound(boundStr)
+			}
 			rc := &esast.RangeCond{}
 			if boost != 1.0 {
 				b := boost
@@ -846,8 +903,12 @@ func parseLuceneRangeToken(val string, boost float64) *esast.RangeCond {
 				rc.Boost = &b
 			}
 			if rawLower != "" && rawLower != "*" {
+				wasQuoted := strings.HasPrefix(rawLower, `"`) && strings.HasSuffix(rawLower, `"`)
 				lowerStr := unescapeLuceneToken(strings.Trim(rawLower, `"`))
-				bound := parseLuceneRangeBound(lowerStr)
+				var bound any = lowerStr
+				if !wasQuoted {
+					bound = parseLuceneRangeBound(lowerStr)
+				}
 				if incLower {
 					rc.GTE = bound
 				} else {
@@ -855,8 +916,12 @@ func parseLuceneRangeToken(val string, boost float64) *esast.RangeCond {
 				}
 			}
 			if rawUpper != "" && rawUpper != "*" {
+				wasQuoted := strings.HasPrefix(rawUpper, `"`) && strings.HasSuffix(rawUpper, `"`)
 				upperStr := unescapeLuceneToken(strings.Trim(rawUpper, `"`))
-				bound := parseLuceneRangeBound(upperStr)
+				var bound any = upperStr
+				if !wasQuoted {
+					bound = parseLuceneRangeBound(upperStr)
+				}
 				if incUpper {
 					rc.LTE = bound
 				} else {
@@ -1444,6 +1509,9 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 }
 
 func parseLuceneRangeBound(s string) any {
+	if len(s) > 1 && ((s[0] == '0' && s[1] >= '0' && s[1] <= '9') || (s[0] == '-' && len(s) > 2 && s[1] == '0' && s[2] >= '0' && s[2] <= '9')) {
+		return s
+	}
 	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
 		return i
 	}

@@ -1364,3 +1364,67 @@ func TestRound43MultiLineFluentChainsRemoveAllRetainAllRemoveIfExprMapEmptyAndIn
 		t.Fatalf("F24 expected unsupported ctx.op error, got %v", err)
 	}
 }
+
+func TestRound44PainlessEmptyMapUnderscoreLiteralsDottedKeysDocMetaAndUpdateRouting(t *testing.T) {
+	// F24: Whitespace empty map literal [ : ] and underscore numeric literals (1_000_000, 1_000.50, 1_000L)
+	docF24 := map[string]any{}
+	if err := EvalPainless(docF24, `
+		def m = [ : ];
+		ctx._source.is_map = (m instanceof Map) && m.isEmpty();
+		ctx._source.int_val = 1_000_000 + 2_000;
+		ctx._source.float_val = 1_000.50;
+		ctx._source.long_val = 1_000L;
+	`, nil); err != nil {
+		t.Fatalf("F24 EvalPainless failed: %v", err)
+	}
+	if docF24["is_map"] != true || docF24["int_val"] != int64(1002000) || docF24["float_val"] != float64(1000.5) || docF24["long_val"] != int64(1000) {
+		t.Fatalf("F24 unexpected state: %+v", docF24)
+	}
+
+	// F25: Dotted bracket key read/write symmetry and put('a.b', ...) on nested & flat maps
+	docF25 := map[string]any{
+		"a": map[string]any{"b": int64(10)},
+	}
+	if err := EvalPainless(docF25, `
+		ctx._source['a.b'] = ctx._source['a.b'] + 5;
+		ctx._source.put('a.b', ctx._source['a.b'] + 5);
+		def flat = [ : ];
+		flat.put('x.y', 42);
+		ctx._source.flat_xy = flat['x.y'];
+	`, nil); err != nil {
+		t.Fatalf("F25 EvalPainless failed: %v", err)
+	}
+	if _, hasFlatAB := docF25["a.b"]; hasFlatAB {
+		t.Fatalf("F25 expected no duplicate flat key 'a.b' when nested a.b existed, got %+v", docF25)
+	}
+	nestedA, _ := docF25["a"].(map[string]any)
+	if nestedA["b"] != int64(20) || docF25["flat_xy"] != int64(42) {
+		t.Fatalf("F25 expected nested a.b=20 and flat_xy=42, got %+v", docF25)
+	}
+
+	// F34: doc['_index'].value and doc['_version'].value resolution
+	docF34 := map[string]any{
+		"__meta_id":      "doc-1",
+		"__meta_index":   "orders_v1",
+		"__meta_version": int64(7),
+	}
+	okFilter, err := EvalFilter(docF34, `doc['_index'].value == 'orders_v1' && doc['_version'].value == 7 && doc['_id'].value == 'doc-1'`, nil)
+	if err != nil || !okFilter {
+		t.Fatalf("F34 expected doc['_index'].value and doc['_version'].value filter to match, got %v (err=%v)", okFilter, err)
+	}
+
+	// F35: ApplyUpdateWithResult mutates req.MetaRouting in-place
+	updReq := &UpdateRequest{
+		MetaRouting: "old-shard",
+		Script: &ScriptSpec{
+			Source: `ctx._routing = 'new-shard'; ctx._source.v = 2;`,
+		},
+	}
+	outBytes, opRes, err := ApplyUpdateWithResult(json.RawMessage(`{"v":1}`), updReq, true)
+	if err != nil || opRes != "updated" {
+		t.Fatalf("F35 ApplyUpdateWithResult failed: opRes=%q err=%v", opRes, err)
+	}
+	if updReq.MetaRouting != "new-shard" || !strings.Contains(string(outBytes), `"v":2`) {
+		t.Fatalf("F35 expected updReq.MetaRouting='new-shard' and v=2, got routing=%q body=%s", updReq.MetaRouting, string(outBytes))
+	}
+}

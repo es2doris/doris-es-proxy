@@ -2362,7 +2362,7 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 				ci = true
 				rhs = rhs[6 : len(rhs)-1]
 			}
-			if isArithmeticSQLExpr(lhs) || strings.Contains(lhs, "AS INT") || (strings.Contains(lhs, "AS DOUBLE") && !strings.HasPrefix(lhs, "CAST(`_doc`")) {
+			if isArithmeticSQLExpr(lhs) || strings.HasPrefix(lhs, "CAST(COALESCE(") {
 				if hasUnwrappedNullColumnRef(row, lhs) {
 					return false
 				}
@@ -2880,6 +2880,9 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 	}
 	if val, ok := row[colExpr]; ok {
 		return val
+	}
+	if f, err := strconv.ParseFloat(colExpr, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+		return f
 	}
 	if strings.HasPrefix(colExpr, "element_at(") && strings.HasSuffix(colExpr, ", 1)") {
 		inner := strings.TrimSpace(colExpr[len("element_at(") : len(colExpr)-len(", 1)")])
@@ -3497,8 +3500,22 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			}
 			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS INT)")])
 			if v := resolveColumnValue(row, inner); v != nil {
-				if f, ok := toFloat(v); ok {
-					return int64(f)
+				switch v.(type) {
+				case []any, []string:
+					var out []any
+					for _, elem := range asSliceOrSingle(v) {
+						if f, ok := toFloat(elem); ok {
+							out = append(out, int64(f))
+						}
+					}
+					if len(out) == 0 {
+						return nil
+					}
+					return out
+				default:
+					if f, ok := toFloat(v); ok {
+						return int64(f)
+					}
 				}
 			}
 			if isArithmeticSQLExpr(inner) || strings.Contains(inner, "CASE WHEN") {

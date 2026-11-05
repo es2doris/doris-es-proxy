@@ -1314,3 +1314,94 @@ func TestRound43TextPromotionGuardImplicitObjectEnabledCopyToMultiFieldsAllTextA
 		t.Fatalf("F6 expected error when copy_to value 'not_an_int' fails integer sub-field coercion")
 	}
 }
+
+func TestRound44SchemaNestedCompatibilityPromoteTextAndShredderAllText(t *testing.T) {
+	// F4: ValidateMappingUpdateCompatibility allows adding sub-properties to an existing nested field without repeating "type": "nested"
+	var oldNestedSpec, newNestedSpec esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{
+		"properties": {
+			"items": {
+				"type": "nested",
+				"properties": {
+					"sku": {"type": "keyword"}
+				}
+			},
+			"dyn_obj": {
+				"dynamic": true
+			}
+		}
+	}`), &oldNestedSpec)
+	_ = json.Unmarshal([]byte(`{
+		"properties": {
+			"items": {
+				"properties": {
+					"qty": {"type": "integer"}
+				}
+			},
+			"dyn_obj": {
+				"type": "object",
+				"properties": {
+					"sub": {"type": "keyword"}
+				}
+			}
+		}
+	}`), &newNestedSpec)
+	if err := ValidateMappingUpdateCompatibility(&oldNestedSpec, &newNestedSpec); err != nil {
+		t.Fatalf("F4 expected compatible nested sub-property update and implicit dynamic object, got %v", err)
+	}
+
+	// F5: GeneratePromoteVariantFieldDDL promotes "text" and "match_only_text" on DefaultMultiValuedPaths ("tags") as scalar STRING, not ARRAY<STRING>
+	emptySch := CompileIndexSchema("db", "r44_ddl", &esast.MappingSpec{})
+	textDDLs := GeneratePromoteVariantFieldDDL(emptySch, "tags", "text")
+	joinedDDL := strings.Join(textDDLs, "\n")
+	if strings.Contains(joinedDDL, "ARRAY<") || !strings.Contains(joinedDDL, "`f__tags` STRING") || !strings.Contains(joinedDDL, "`f__tags__keyword` VARCHAR") {
+		t.Fatalf("F5 expected scalar STRING + .keyword VARCHAR DDL for promoted text field 'tags', got:\n%s", joinedDDL)
+	}
+	motDDLs := GeneratePromoteVariantFieldDDL(emptySch, "tags", "match_only_text")
+	if strings.Contains(strings.Join(motDDLs, "\n"), "ARRAY<") {
+		t.Fatalf("F5 expected scalar TEXT DDL for match_only_text field 'tags', got:\n%v", motDDLs)
+	}
+
+	// F6: ShredDocument excludes ignore_malformed values (and strings exceeding ignore_above) from _all_text and _doc
+	var f6Spec esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{
+		"properties": {
+			"age": {"type": "integer", "ignore_malformed": true},
+			"title": {"type": "text", "ignore_malformed": true},
+			"tags": {"type": "keyword", "ignore_malformed": true},
+			"code": {"type": "keyword", "ignore_above": 5},
+			"valid_note": {"type": "keyword"}
+		}
+	}`), &f6Spec)
+	f6Sch := CompileIndexSchema("db", "r44_f6", &f6Spec)
+	shredded, err := ShredDocument(f6Sch, "1", 1, false, []byte(`{
+		"age": "malformed_age_token",
+		"title": {"bad_obj": "malformed_title_obj"},
+		"tags": [{"bad_tag_obj": "malformed_tag_obj"}],
+		"code": "TOO_LONG_FOR_IGNORE_ABOVE",
+		"valid_note": "keep_me"
+	}`))
+	if err != nil {
+		t.Fatalf("F6 ShredDocument failed: %v", err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(shredded, &row); err != nil {
+		t.Fatalf("unmarshal shredded row failed: %v", err)
+	}
+	allText, _ := row["_all_text"].(string)
+	for _, banned := range []string{"malformed_age_token", "malformed_title_obj", "malformed_tag_obj", "TOO_LONG_FOR_IGNORE_ABOVE"} {
+		if strings.Contains(allText, banned) {
+			t.Fatalf("F6 expected _all_text to exclude %q, got %q", banned, allText)
+		}
+	}
+	if !strings.Contains(allText, "keep_me") {
+		t.Fatalf("F6 expected _all_text to contain 'keep_me', got %q", allText)
+	}
+	docMap, _ := row["_doc"].(map[string]any)
+	if _, hasAge := docMap["age"]; hasAge {
+		t.Fatalf("F6 expected malformed age removed from _doc, got %+v", docMap)
+	}
+	if _, hasTitle := docMap["title"]; hasTitle {
+		t.Fatalf("F6 expected malformed object title removed from _doc, got %+v", docMap)
+	}
+}

@@ -1265,13 +1265,13 @@ func extractFinalPipelineFromSettings(settings map[string]any) (string, bool) {
 
 func (s *Server) resolveEffectivePipeline(indexName, reqPipeline, itemPipeline string) string {
 	if p := strings.TrimSpace(reqPipeline); p != "" {
-		if p == "_none" {
+		if p == "_none" || p == "none" {
 			return ""
 		}
 		return p
 	}
 	if p := strings.TrimSpace(itemPipeline); p != "" {
-		if p == "_none" {
+		if p == "_none" || p == "none" {
 			return ""
 		}
 		return p
@@ -1293,7 +1293,7 @@ func (s *Server) resolveEffectivePipeline(indexName, reqPipeline, itemPipeline s
 		}
 		s.mu.RUnlock()
 	}
-	if defPipe == "_none" {
+	if defPipe == "_none" || defPipe == "none" {
 		return ""
 	}
 	return defPipe
@@ -1317,7 +1317,7 @@ func (s *Server) resolveFinalPipeline(indexName string) string {
 		}
 		s.mu.RUnlock()
 	}
-	if finPipe == "_none" {
+	if finPipe == "_none" || finPipe == "none" {
 		return ""
 	}
 	return finPipe
@@ -1348,33 +1348,47 @@ func (s *Server) handleIndexSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(bytes.TrimSpace(bodyBytes)) > 0 {
 			var settings map[string]any
-			if err := json.Unmarshal(bodyBytes, &settings); err == nil {
-				defPipe, hasDef := extractDefaultPipelineFromSettings(settings)
-				finPipe, hasFin := extractFinalPipelineFromSettings(settings)
-				if hasDef || hasFin {
-					for _, indexName := range validTargets {
-						s.mu.Lock()
-						if hasDef {
-							if defPipe == "" {
-								delete(s.indexDefaultPipelines, indexName)
-							} else {
-								s.indexDefaultPipelines[indexName] = defPipe
-							}
-						}
-						if hasFin {
-							if finPipe == "" {
-								delete(s.indexFinalPipelines, indexName)
-							} else {
-								s.indexFinalPipelines[indexName] = finPipe
-							}
-						}
-						idxSchema := s.indices[indexName]
-						s.mu.Unlock()
-						s.persistIndex(r.Context(), indexName, idxSchema)
+			if err := json.Unmarshal(bodyBytes, &settings); err != nil {
+				writeESError(w, http.StatusBadRequest, "parse_exception", "Failed to parse content to map")
+				return
+			}
+			defPipe, hasDef := extractDefaultPipelineFromSettings(settings)
+			finPipe, hasFin := extractFinalPipelineFromSettings(settings)
+			for _, pName := range []string{defPipe, finPipe} {
+				if pName != "" && pName != "_none" && pName != "none" {
+					s.mu.RLock()
+					_, exists := s.pipelines[pName]
+					s.mu.RUnlock()
+					if !exists {
+						writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Pipeline ["+pName+"] is not defined")
+						return
 					}
 				}
 			}
+			if hasDef || hasFin {
+				for _, indexName := range validTargets {
+					s.mu.Lock()
+					if hasDef {
+						if defPipe == "" {
+							delete(s.indexDefaultPipelines, indexName)
+						} else {
+							s.indexDefaultPipelines[indexName] = defPipe
+						}
+					}
+					if hasFin {
+						if finPipe == "" {
+							delete(s.indexFinalPipelines, indexName)
+						} else {
+							s.indexFinalPipelines[indexName] = finPipe
+						}
+					}
+					idxSchema := s.indices[indexName]
+					s.mu.Unlock()
+					s.persistIndex(r.Context(), indexName, idxSchema)
+				}
+			}
 		}
+		s.queryCache.InvalidateAll()
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 		return
 	}
@@ -1814,6 +1828,7 @@ func (s *Server) handleCatIndices(w http.ResponseWriter, r *http.Request) {
 	if pat := r.PathValue("index"); pat != "" {
 		names = s.resolveTargetIndices(pat)
 	} else {
+		_ = s.syncCatalogFromBackend(r.Context())
 		s.mu.RLock()
 		names = make([]string, 0, len(s.indices))
 		for name := range s.indices {
@@ -1834,6 +1849,7 @@ func (s *Server) handleCatIndices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCatAliases(w http.ResponseWriter, r *http.Request) {
+	_ = s.syncCatalogFromBackend(r.Context())
 	namePattern := r.PathValue("name")
 	s.mu.RLock()
 	list := make([]map[string]any, 0)
@@ -1969,13 +1985,40 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == http.MethodDelete {
 		numFreed := 1
+		if pathScrollID := strings.TrimSpace(r.PathValue("scroll_id")); pathScrollID != "" && pathScrollID != "_all" {
+			parts := strings.Split(pathScrollID, ",")
+			cnt := 0
+			for _, p := range parts {
+				if strings.TrimSpace(p) != "" {
+					cnt++
+				}
+			}
+			if cnt > 0 {
+				numFreed = cnt
+			}
+		}
 		if len(bytes.TrimSpace(bodyBytes)) > 0 {
 			var body struct {
 				ScrollID any `json:"scroll_id"`
 			}
 			if err := json.Unmarshal(bodyBytes, &body); err == nil {
-				if arr, ok := body.ScrollID.([]any); ok && len(arr) > 0 {
-					numFreed = len(arr)
+				switch sid := body.ScrollID.(type) {
+				case []any:
+					if len(sid) > 0 {
+						numFreed = len(sid)
+					}
+				case string:
+					if strings.Contains(sid, ",") {
+						cnt := 0
+						for _, p := range strings.Split(sid, ",") {
+							if strings.TrimSpace(p) != "" {
+								cnt++
+							}
+						}
+						if cnt > 0 {
+							numFreed = cnt
+						}
+					}
 				}
 			}
 		}
@@ -2016,7 +2059,11 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cursor.Exhausted || len(cursor.LastSort) == 0 {
-		eofTotal := any(map[string]any{"value": cursor.Total, "relation": "eq"})
+		eofRel := "eq"
+		if thresh, okT := trackTotalHitsThreshold(&cursor.Req); okT && thresh > 0 && cursor.Total >= thresh {
+			eofRel = "gte"
+		}
+		eofTotal := any(map[string]any{"value": cursor.Total, "relation": eofRel})
 		if !cursor.Req.ShouldTrackTotalHits() {
 			eofTotal = nil
 		}
@@ -2060,7 +2107,11 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 		total = respTot
 	} else if total > 0 && req.ShouldTrackTotalHits() {
 		if hitsMap, okH := resp["hits"].(map[string]any); okH {
-			hitsMap["total"] = map[string]any{"value": total, "relation": "eq"}
+			rel := "eq"
+			if thresh, okT := trackTotalHitsThreshold(&req); okT && thresh > 0 && total >= thresh {
+				rel = "gte"
+			}
+			hitsMap["total"] = map[string]any{"value": total, "relation": rel}
 		}
 	}
 	lastSort := extractLastHitSort(resp)
@@ -2444,7 +2495,7 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if p, found := extractDefaultPipelineFromSettings(req.Settings); found && p != "" && p != "_none" {
+	if p, found := extractDefaultPipelineFromSettings(req.Settings); found && p != "" && p != "_none" && p != "none" {
 		s.mu.RLock()
 		hasPipes := len(s.pipelines) > 0
 		_, pipeExists := s.pipelines[p]
@@ -2454,7 +2505,7 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if fp, found := extractFinalPipelineFromSettings(req.Settings); found && fp != "" && fp != "_none" {
+	if fp, found := extractFinalPipelineFromSettings(req.Settings); found && fp != "" && fp != "_none" && fp != "none" {
 		s.mu.RLock()
 		hasPipes := len(s.pipelines) > 0
 		_, pipeExists := s.pipelines[fp]
@@ -4895,9 +4946,9 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 				totalMatched++
-				docInitRouting := urlRouting
-				if docInitRouting == "" {
-					docInitRouting = s.getDocRouting(indexName, h.ID)
+				docInitRouting := s.getDocRouting(indexName, h.ID)
+				if docInitRouting == "" && !strings.Contains(urlRouting, ",") {
+					docInitRouting = urlRouting
 				}
 				updItem := &painless.UpdateRequest{
 					Script:      body.Script,
@@ -7936,6 +7987,7 @@ func (s *Server) resolveTermsLookupsInSearchRequest(ctx context.Context, req *es
 		return nil
 	}
 	origAliasFilter := req.AliasFilter
+	origRouting := req.Routing
 	if raw, err := json.Marshal(req); err == nil {
 		var cloned esast.SearchRequest
 		if err := json.Unmarshal(raw, &cloned); err == nil {
@@ -7948,6 +8000,7 @@ func (s *Server) resolveTermsLookupsInSearchRequest(ctx context.Context, req *es
 				}
 			}
 			cloned.AliasFilter = origAliasFilter
+			cloned.Routing = origRouting
 			req = &cloned
 		}
 	}
@@ -8130,7 +8183,7 @@ func (s *Server) resolveTermsLookupsInQuery(ctx context.Context, q *esast.Query)
 				lookupSchema := s.getOrCompileReadOnlySchema(ctx, lookupIdx)
 				if lookupSchema != nil {
 					_ = s.coalescer.FlushTable(ctx, lookupSchema.DorisTable)
-					if hit, found, err := s.backend.GetDocByID(ctx, lookupSchema.DorisDB, lookupSchema.DorisTable, lookup.ID); err == nil && found && hit != nil && len(hit.Source) > 0 && s.docMatchesAliasFilter(ctx, lookupIdx, lookup.ID, hit.Source, aliasFilter) {
+					if hit, found, err := s.backend.GetDocByID(ctx, lookupSchema.DorisDB, lookupSchema.DorisTable, lookup.ID); err == nil && found && hit != nil && len(hit.Source) > 0 && s.docMatchesAliasFilter(ctx, lookupIdx, lookup.ID, hit.Source, aliasFilter) && (lookup.Routing == "" || s.docMatchesRequestRouting(lookupIdx, lookup.ID, lookup.Routing)) {
 						dec := json.NewDecoder(bytes.NewReader(hit.Source))
 						dec.UseNumber()
 						var doc map[string]any
@@ -8880,40 +8933,80 @@ func applyURISearchParams(r *http.Request, req *esast.SearchRequest) {
 		b := strings.EqualFold(ts, "true") || ts == "1"
 		req.TrackScores = &b
 	}
-	if sortParam := q.Get("sort"); sortParam != "" && len(req.Sort) == 0 {
-		for _, part := range strings.Split(sortParam, ",") {
-			field := part
-			order := "asc"
-			if idx := strings.IndexByte(part, ':'); idx > 0 {
-				field = part[:idx]
-				order = part[idx+1:]
+	if sortVals := q["sort"]; len(sortVals) > 0 && len(req.Sort) == 0 {
+		for _, sortParam := range sortVals {
+			for _, part := range strings.Split(sortParam, ",") {
+				part = strings.TrimSpace(part)
+				if part == "" {
+					continue
+				}
+				field := part
+				order := "asc"
+				if idx := strings.IndexByte(part, ':'); idx > 0 {
+					field = part[:idx]
+					order = part[idx+1:]
+				}
+				req.Sort = append(req.Sort, esast.SortSpec{
+					Entry: esast.SortEntry{Field: field, Order: order},
+				})
 			}
-			req.Sort = append(req.Sort, esast.SortSpec{
-				Entry: esast.SortEntry{Field: field, Order: order},
-			})
 		}
 	}
-	if srcParam := q.Get("_source"); srcParam != "" && req.Source == nil {
-		if srcParam == "false" {
-			req.Source = &esast.SourceFilter{Disabled: true}
-		} else if srcParam != "true" {
-			req.Source = &esast.SourceFilter{Includes: strings.Split(srcParam, ",")}
+	if srcVals := q["_source"]; len(srcVals) > 0 && req.Source == nil {
+		for _, srcParam := range srcVals {
+			if srcParam == "false" {
+				req.Source = &esast.SourceFilter{Disabled: true}
+			} else if srcParam != "true" && srcParam != "" {
+				if req.Source == nil {
+					req.Source = &esast.SourceFilter{}
+				}
+				req.Source.Disabled = false
+				req.Source.Includes = append(req.Source.Includes, strings.Split(srcParam, ",")...)
+			}
 		}
 	}
-	if inc := q.Get("_source_includes"); inc != "" {
-		if req.Source == nil {
-			req.Source = &esast.SourceFilter{}
+	for _, key := range []string{"_source_includes", "_source_include"} {
+		for _, inc := range q[key] {
+			if inc != "" {
+				if req.Source == nil {
+					req.Source = &esast.SourceFilter{}
+				}
+				req.Source.Disabled = false
+				req.Source.Includes = append(req.Source.Includes, strings.Split(inc, ",")...)
+			}
 		}
-		req.Source.Includes = append(req.Source.Includes, strings.Split(inc, ",")...)
 	}
-	if exc := q.Get("_source_excludes"); exc != "" {
-		if req.Source == nil {
-			req.Source = &esast.SourceFilter{}
+	for _, key := range []string{"_source_excludes", "_source_exclude"} {
+		for _, exc := range q[key] {
+			if exc != "" {
+				if req.Source == nil {
+					req.Source = &esast.SourceFilter{}
+				}
+				req.Source.Disabled = false
+				req.Source.Excludes = append(req.Source.Excludes, strings.Split(exc, ",")...)
+			}
 		}
-		req.Source.Excludes = append(req.Source.Excludes, strings.Split(exc, ",")...)
 	}
-	if sfParam := q.Get("stored_fields"); sfParam != "" && req.StoredFields == nil {
-		req.StoredFields = sfParam
+	if sfVals := q["stored_fields"]; len(sfVals) > 0 && req.StoredFields == nil {
+		req.StoredFields = strings.Join(sfVals, ",")
+	}
+	if fVals := q["fields"]; len(fVals) > 0 && len(req.Fields) == 0 {
+		for _, fv := range fVals {
+			for _, part := range strings.Split(fv, ",") {
+				if p := strings.TrimSpace(part); p != "" {
+					req.Fields = append(req.Fields, esast.FieldRequestSpec{Field: p})
+				}
+			}
+		}
+	}
+	if dvVals := q["docvalue_fields"]; len(dvVals) > 0 && len(req.DocvalueFields) == 0 {
+		for _, dvv := range dvVals {
+			for _, part := range strings.Split(dvv, ",") {
+				if p := strings.TrimSpace(part); p != "" {
+					req.DocvalueFields = append(req.DocvalueFields, esast.FieldRequestSpec{Field: p})
+				}
+			}
+		}
 	}
 	if strings.EqualFold(q.Get("search_type"), "count") {
 		zero := 0
@@ -8922,8 +9015,16 @@ func applyURISearchParams(r *http.Request, req *esast.SearchRequest) {
 			req.TrackTotalHits = true
 		}
 	}
-	if rt := strings.TrimSpace(q.Get("routing")); rt != "" {
-		req.Routing = rt
+	if rtVals := q["routing"]; len(rtVals) > 0 {
+		var rts []string
+		for _, rv := range rtVals {
+			if t := strings.TrimSpace(rv); t != "" {
+				rts = append(rts, t)
+			}
+		}
+		if len(rts) > 0 {
+			req.Routing = strings.Join(rts, ",")
+		}
 	}
 }
 
@@ -9634,21 +9735,14 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 						ihName = nq.InnerHits.Name
 					}
 					ihNameCounts[ihName]++
-				}
-				for _, nq := range nestedWithIH {
-					ihName := nq.Path
-					if nq.InnerHits.Name != "" {
-						ihName = nq.InnerHits.Name
-					}
-					nqCopy := *nq
-					if req.TrackScores != nil && *req.TrackScores && nqCopy.InnerHits != nil && nqCopy.InnerHits.TrackScores == nil {
-						ihCopy := *nqCopy.InnerHits
+					nextSpec := nq.InnerHits
+					if req.TrackScores != nil && *req.TrackScores && nextSpec != nil && nextSpec.TrackScores == nil {
+						ihCopy := *nextSpec
 						ihCopy.TrackScores = req.TrackScores
-						nqCopy.InnerHits = &ihCopy
+						nextSpec = &ihCopy
 					}
-					if prevSpec := ihSpecByName[ihName]; prevSpec != nil && nqCopy.InnerHits != nil {
+					if prevSpec := ihSpecByName[ihName]; prevSpec != nil && nextSpec != nil {
 						mergedSpec := *prevSpec
-						nextSpec := nqCopy.InnerHits
 						if len(mergedSpec.Sort) == 0 && len(nextSpec.Sort) > 0 {
 							mergedSpec.Sort = nextSpec.Sort
 						}
@@ -9681,7 +9775,21 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 						}
 						ihSpecByName[ihName] = &mergedSpec
 					} else {
-						ihSpecByName[ihName] = nqCopy.InnerHits
+						ihSpecByName[ihName] = nextSpec
+					}
+				}
+				for _, nq := range nestedWithIH {
+					ihName := nq.Path
+					if nq.InnerHits.Name != "" {
+						ihName = nq.InnerHits.Name
+					}
+					nqCopy := *nq
+					if merged := ihSpecByName[ihName]; merged != nil {
+						ihCopy := *merged
+						if nq.InnerHits != nil && nq.InnerHits.Highlight != nil {
+							ihCopy.Highlight = nq.InnerHits.Highlight
+						}
+						nqCopy.InnerHits = &ihCopy
 					}
 					ihPathByName[ihName] = nqCopy.Path
 					skipPaging := ihNameCounts[ihName] > 1
@@ -10572,7 +10680,7 @@ func (s *Server) populateCollapseInnerHits(
 
 	var uncollapsed []HitRow
 	zero := 0
-	fetchLimit := 1000
+	fetchLimit := 10000
 	for _, indexName := range targets {
 		idxSchema := schemasByIndex[indexName]
 		if idxSchema == nil {
@@ -12578,16 +12686,14 @@ func filterAndSortTermsRowsWithSubAggs(
 	if spec.Order != nil {
 		switch ov := spec.Order.(type) {
 		case map[string]any:
-			for k, v := range ov {
-				addCriterion(k, v)
-				break
+			for _, k := range sortedOrderMapKeys(ov) {
+				addCriterion(k, ov[k])
 			}
 		case []any:
 			for _, elem := range ov {
 				if m, ok := elem.(map[string]any); ok {
-					for k, v := range m {
-						addCriterion(k, v)
-						break
+					for _, k := range sortedOrderMapKeys(m) {
+						addCriterion(k, m[k])
 					}
 				}
 			}
@@ -13648,9 +13754,20 @@ func evaluateSiblingPipelineAggs(aggs map[string]esast.AggSpec, aggsOut map[stri
 			segs := normalizeBucketsPath(bp)
 			depReady := true
 			for _, other := range pipeNames {
-				if other != aggName && !placed[other] && len(segs) > 0 && (segs[len(segs)-1] == other || segs[0] == other) {
-					depReady = false
-					break
+				if other != aggName && !placed[other] {
+					for _, seg := range segs {
+						cleanSeg := seg
+						if brIdx := strings.IndexByte(cleanSeg, '['); brIdx > 0 {
+							cleanSeg = cleanSeg[:brIdx]
+						}
+						if cleanSeg == other {
+							depReady = false
+							break
+						}
+					}
+					if !depReady {
+						break
+					}
 				}
 			}
 			if depReady || pass == len(pipeNames)-1 {
@@ -16479,7 +16596,28 @@ func setRuntimeScriptDocPath(curr map[string]any, segs []string, val any) {
 
 func prepareDocForRuntimeScript(idxSchema *schema.IndexSchema, doc map[string]any) map[string]any {
 	var cp map[string]any
+	ensureCopy := func() {
+		if cp == nil {
+			cp = deepCloneDocMap(doc)
+			if cp == nil {
+				cp = make(map[string]any)
+			}
+		}
+	}
+	if doc != nil {
+		if doc["__meta_index"] == nil && idxSchema != nil && idxSchema.IndexName != "" && idxSchema.IndexName != "eval_idx" {
+			ensureCopy()
+			cp["__meta_index"] = idxSchema.IndexName
+		}
+		if doc["__meta_version"] == nil {
+			ensureCopy()
+			cp["__meta_version"] = int64(1)
+		}
+	}
 	if idxSchema == nil || len(idxSchema.Fields) == 0 {
+		if cp != nil {
+			return cp
+		}
 		return doc
 	}
 	for fieldName, fb := range idxSchema.Fields {
@@ -16499,12 +16637,7 @@ func prepareDocForRuntimeScript(idxSchema *schema.IndexSchema, doc map[string]an
 					}
 				}
 				if exceeded {
-					if cp == nil {
-						cp = deepCloneDocMap(doc)
-						if cp == nil {
-							cp = make(map[string]any)
-						}
-					}
+					ensureCopy()
 					filterIgnoreAboveInPlace(cp, rawSegs, fb.IgnoreAbove)
 				}
 			}
@@ -16518,12 +16651,7 @@ func prepareDocForRuntimeScript(idxSchema *schema.IndexSchema, doc map[string]an
 		if len(vals) == 0 {
 			continue
 		}
-		if cp == nil {
-			cp = deepCloneDocMap(doc)
-			if cp == nil {
-				cp = make(map[string]any)
-			}
-		}
+		ensureCopy()
 		if len(vals) == 1 {
 			setRuntimeScriptDocPath(cp, rawSegs, vals[0])
 		} else {
@@ -16544,11 +16672,19 @@ func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.In
 		dec.UseNumber()
 		_ = dec.Decode(&doc)
 	}
+	if doc == nil {
+		doc = make(map[string]any)
+	}
 	if h.ID != "" {
-		if doc == nil {
-			doc = make(map[string]any)
-		}
 		doc["__meta_id"] = h.ID
+	}
+	if h.Index != "" {
+		doc["__meta_index"] = h.Index
+	}
+	if h.Version > 0 {
+		doc["__meta_version"] = h.Version
+	} else {
+		doc["__meta_version"] = int64(1)
 	}
 	if idxSchema == nil && h.Schema != nil {
 		idxSchema = h.Schema
@@ -17082,6 +17218,23 @@ func formatDateHistogramKeyAsString(epochMs int64, spec *esast.DateHistogramAggS
 	}
 }
 
+func sortedOrderMapKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		ki, kj := strings.TrimSpace(keys[i]), strings.TrimSpace(keys[j])
+		pi := ki != "_key" && ki != "_term" && ki != "key"
+		pj := kj != "_key" && kj != "_term" && kj != "key"
+		if pi != pj {
+			return pi
+		}
+		return ki < kj
+	})
+	return keys
+}
+
 func sortHistogramBuckets(buckets []map[string]any, order any) []map[string]any {
 	type histSortSpec struct {
 		target string
@@ -17089,7 +17242,8 @@ func sortHistogramBuckets(buckets []map[string]any, order any) []map[string]any 
 	}
 	var specs []histSortSpec
 	parseMap := func(m map[string]any) {
-		for k, v := range m {
+		for _, k := range sortedOrderMapKeys(m) {
+			v := m[k]
 			if dir := extractCompositeSourceOrder(v); dir != "" {
 				specs = append(specs, histSortSpec{
 					target: strings.TrimSpace(k),
@@ -19762,17 +19916,18 @@ func marshalDocAndExtractEvalID(doc map[string]any, defaultID string) ([]byte, s
 	if doc != nil {
 		if idStr, ok := doc["__meta_id"].(string); ok && idStr != "" {
 			docID = idStr
+		} else if idStr, ok := doc["_id"].(string); ok && idStr != "" {
+			docID = idStr
+		}
+		if doc["__meta_id"] != nil || doc["__meta_index"] != nil || doc["__meta_version"] != nil {
 			clean := make(map[string]any, len(doc))
 			for k, v := range doc {
-				if k != "__meta_id" {
+				if k != "__meta_id" && k != "__meta_index" && k != "__meta_version" {
 					clean[k] = v
 				}
 			}
 			b, err := json.Marshal(clean)
 			return b, docID, err
-		}
-		if idStr, ok := doc["_id"].(string); ok && idStr != "" {
-			docID = idStr
 		}
 	}
 	b, err := json.Marshal(doc)
@@ -19916,7 +20071,12 @@ func evalQueryScriptFilterOnDocWithScore(idxSchema *schema.IndexSchema, doc map[
 		src, params := extractScriptSourceAndParams(q.Script.Script)
 		if src != "" {
 			evalDoc := prepareDocForRuntimeScript(idxSchema, doc)
-			ok, err := painless.EvalFilter(evalDoc, src, params)
+			cp := make(map[string]any, len(params)+1)
+			for k, v := range params {
+				cp[k] = v
+			}
+			cp["_score"] = baseScore
+			ok, err := painless.EvalFilter(evalDoc, src, cp)
 			if err != nil || !ok {
 				return false
 			}
@@ -20406,10 +20566,15 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 			}
 			return res
 		}
-		if q.FunctionScore.Boost != nil {
-			return baseScore * *q.FunctionScore.Boost
+		combined := 1.0
+		if q.FunctionScore.MaxBoost != nil && combined > *q.FunctionScore.MaxBoost {
+			combined = *q.FunctionScore.MaxBoost
 		}
-		return baseScore
+		res := applyFunctionScoreBoostMode(baseScore, combined, q.FunctionScore.BoostMode)
+		if q.FunctionScore.Boost != nil {
+			res *= *q.FunctionScore.Boost
+		}
+		return res
 	}
 	if q.DisMax != nil {
 		var scores []float64
@@ -20452,11 +20617,7 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 		}
 		res := posScore
 		if evalBranchMatchesDoc(idxSchema, doc, &q.Boosting.Negative) {
-			negBoost := q.Boosting.NegativeBoost
-			if negBoost <= 0 {
-				negBoost = 0.5
-			}
-			res *= negBoost
+			res *= q.Boosting.EffectiveNegativeBoost()
 		}
 		if q.Boosting.Boost != nil {
 			res *= *q.Boosting.Boost
@@ -20712,7 +20873,9 @@ func scriptHasMissingDocValueRef(doc map[string]any, src string) (string, bool) 
 		if strings.HasPrefix(tail, ".size") || strings.HasPrefix(tail, ".empty") || strings.HasPrefix(tail, ".length") {
 			continue
 		}
-		if rawField == "_id" && doc["__meta_id"] != nil {
+		if (rawField == "_id" && doc["__meta_id"] != nil) ||
+			(rawField == "_index" && doc["__meta_index"] != nil) ||
+			(rawField == "_version" && doc["__meta_version"] != nil) {
 			continue
 		}
 		if len(collectScalarValuesAtPath(doc, strings.Split(rawField, "."))) == 0 {
@@ -22617,6 +22780,14 @@ func hitsToRuntimeMatchedDocs(hits []HitRow, idxSchema *schema.IndexSchema) []ru
 			doc = make(map[string]any)
 		}
 		doc["__meta_id"] = h.ID
+		if h.Index != "" {
+			doc["__meta_index"] = h.Index
+		}
+		if h.Version > 0 {
+			doc["__meta_version"] = h.Version
+		} else {
+			doc["__meta_version"] = int64(1)
+		}
 		out = append(out, runtimeMatchedDoc{
 			hit:        h,
 			doc:        doc,
@@ -22730,6 +22901,14 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 			doc = make(map[string]any)
 		}
 		doc["__meta_id"] = h.ID
+		if h.Index != "" {
+			doc["__meta_index"] = h.Index
+		}
+		if h.Version > 0 {
+			doc["__meta_version"] = h.Version
+		} else {
+			doc["__meta_version"] = int64(1)
+		}
 		if hasAliasScript && !evalQueryScriptFilterOnDocWithSchema(idxSchema, doc, aliasFilterQ) {
 			continue
 		}
@@ -23090,6 +23269,14 @@ func evalHitScriptFields(h HitRow, scriptFields map[string]any, idxSchema *schem
 	}
 	if h.ID != "" {
 		doc["__meta_id"] = h.ID
+	}
+	if h.Index != "" {
+		doc["__meta_index"] = h.Index
+	}
+	if h.Version > 0 {
+		doc["__meta_version"] = h.Version
+	} else {
+		doc["__meta_version"] = int64(1)
 	}
 	if idxSchema == nil && h.Schema != nil {
 		idxSchema = h.Schema

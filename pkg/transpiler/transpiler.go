@@ -344,7 +344,7 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 	}
 
 	userWhere := mainQ.WhereSQL
-	if req.MinScore != nil && !queryContainsScript(req.Query) {
+	if req.MinScore != nil && !queryContainsScript(req.Query) && !queryContainsNestedScoring(req.Query) {
 		minScoreExpr := mainQ.ScoreSQL
 		if len(req.KNN) == 0 && mainQ.UsesFulltextMatch && t.Opts.UseDoris4SearchFunc {
 			minScoreExpr = fmt.Sprintf("COALESCE(score(), 1.0) * (%s)", mainQ.ScoreSQL)
@@ -1246,10 +1246,7 @@ func (t *Transpiler) compileBoosting(bq *esast.BoostingQuery, scoring bool, nctx
 	}
 	pos := t.CompileQuery(&bq.Positive, scoring, nctx)
 	neg := t.CompileQuery(&bq.Negative, true, nctx)
-	negBoost := bq.NegativeBoost
-	if negBoost <= 0 {
-		negBoost = 0.5
-	}
+	negBoost := bq.EffectiveNegativeBoost()
 	boost := 1.0
 	if bq.Boost != nil {
 		boost = *bq.Boost
@@ -1328,6 +1325,46 @@ func queryContainsScript(q *esast.Query) bool {
 		}
 		for i := range q.Bool.MustNot {
 			if queryContainsScript(&q.Bool.MustNot[i]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func queryContainsNestedScoring(q *esast.Query) bool {
+	if q == nil {
+		return false
+	}
+	if q.Nested != nil && !strings.EqualFold(q.Nested.ScoreMode, "none") {
+		return true
+	}
+	if q.FunctionScore != nil && queryContainsNestedScoring(q.FunctionScore.Query) {
+		return true
+	}
+	if q.ScriptScore != nil && queryContainsNestedScoring(q.ScriptScore.Query) {
+		return true
+	}
+	if q.DisMax != nil {
+		for i := range q.DisMax.Queries {
+			if queryContainsNestedScoring(&q.DisMax.Queries[i]) {
+				return true
+			}
+		}
+	}
+	if q.Boosting != nil {
+		if queryContainsNestedScoring(&q.Boosting.Positive) || queryContainsNestedScoring(&q.Boosting.Negative) {
+			return true
+		}
+	}
+	if q.Bool != nil {
+		for i := range q.Bool.Must {
+			if queryContainsNestedScoring(&q.Bool.Must[i]) {
+				return true
+			}
+		}
+		for i := range q.Bool.Should {
+			if queryContainsNestedScoring(&q.Bool.Should[i]) {
 				return true
 			}
 		}
@@ -2268,7 +2305,7 @@ func (t *Transpiler) compileScriptScore(ss *esast.ScriptScoreQuery, scoring bool
 	}
 	whereSQL := base.WhereSQL
 	safeWhereSQL := base.EffectiveSafeWhere()
-	if ss.MinScore != nil && (ss.Script == nil || scriptCompiled) && !queryContainsScript(ss.Query) {
+	if ss.MinScore != nil && (ss.Script == nil || scriptCompiled) && !queryContainsScript(ss.Query) && !queryContainsNestedScoring(ss.Query) {
 		minScoreCond := fmt.Sprintf("(%s >= %.4f)", scoreSQL, *ss.MinScore)
 		if whereSQL == "" || whereSQL == "TRUE" {
 			whereSQL = minScoreCond
@@ -2328,7 +2365,8 @@ func (t *Transpiler) compileBooleanScriptComparison(script any, nctx *nestedCtx)
 	}
 	if strings.ContainsAny(s, ";?") || strings.Contains(s, "def ") || strings.Contains(s, "for ") ||
 		strings.Contains(s, "while ") || strings.Contains(s, "if ") || strings.Contains(s, "ctx.") ||
-		strings.Contains(s, "_source") || strings.Contains(s, ".contains(") || strings.Contains(s, "=~") {
+		strings.Contains(s, "_source") || strings.Contains(s, ".contains(") || strings.Contains(s, "=~") ||
+		strings.Contains(s, "_score") {
 		return "", false
 	}
 	return t.parseBooleanScriptCond(s, params, nctx, 0)
@@ -2495,23 +2533,9 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 						continue
 					}
 				}
-				val := entry.Value
-				if b.ESType == "boolean" || b.DorisType == schema.DorisBoolean {
-					if bv, ok := normalizeBooleanQueryValue(val); ok {
-						val = bv
-					}
-				} else if strVal, ok := val.(string); ok {
-					if effLower {
-						val = strings.ToLower(strVal)
-					} else if b.ESType == "date" || b.ESType == "date_nanos" {
-						if ms, ok := schema.ParseESDateWithFormatToEpochMillis(strVal, b.Format, time.Now().UTC()); ok {
-							val = ms
-						}
-					}
+				if normStr, ok := normalizeNestedPrefilterValue(b, entry.Value, effLower, time.Now().UTC()); ok {
+					parts = append(parts, fmt.Sprintf("array_contains(`%s`, %s)", arrCol, quoteStr(normStr)))
 				}
-				val = normalizeScaledFloatValue(b, val)
-				val = normalizeDateNanosValue(b.ESType, val)
-				parts = append(parts, fmt.Sprintf("array_contains(`%s`, %s)", arrCol, quoteStr(fmt.Sprintf("%v", val))))
 			}
 		}
 		return strings.Join(parts, " AND ")
@@ -2542,25 +2566,18 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 				}
 				now := time.Now().UTC()
 				var quoted []string
+				allValid := true
 				for _, v := range vals {
-					if b.ESType == "boolean" || b.DorisType == schema.DorisBoolean {
-						if bv, ok := normalizeBooleanQueryValue(v); ok {
-							v = bv
-						}
-					} else if strVal, ok := v.(string); ok {
-						if effLower {
-							v = strings.ToLower(strVal)
-						} else if b.ESType == "date" || b.ESType == "date_nanos" {
-							if ms, ok := schema.ParseESDateWithFormatToEpochMillis(strVal, b.Format, now); ok {
-								v = ms
-							}
-						}
+					if normStr, ok := normalizeNestedPrefilterValue(b, v, effLower, now); ok {
+						quoted = append(quoted, quoteStr(normStr))
+					} else {
+						allValid = false
+						break
 					}
-					v = normalizeScaledFloatValue(b, v)
-					v = normalizeDateNanosValue(b.ESType, v)
-					quoted = append(quoted, quoteStr(fmt.Sprintf("%v", v)))
 				}
-				parts = append(parts, fmt.Sprintf("arrays_overlap(`%s`, [%s])", arrCol, strings.Join(quoted, ", ")))
+				if allValid && len(quoted) > 0 {
+					parts = append(parts, fmt.Sprintf("arrays_overlap(`%s`, [%s])", arrCol, strings.Join(quoted, ", ")))
+				}
 			}
 		}
 		return strings.Join(parts, " AND ")
@@ -2591,6 +2608,82 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 		return strings.Join(parts, " AND ")
 	}
 	return ""
+}
+
+func normalizeNestedPrefilterValue(b schema.FieldBinding, val any, effLower bool, now time.Time) (string, bool) {
+	if val == nil {
+		return "", false
+	}
+	effDT := effectiveDorisScalarType(b)
+	if b.ESType == "boolean" || effDT == schema.DorisBoolean {
+		bv, ok := normalizeBooleanQueryValue(val)
+		if !ok {
+			return "", false
+		}
+		if bv {
+			return "true", true
+		}
+		return "false", true
+	}
+	if strVal, ok := val.(string); ok {
+		if effLower && effDT != schema.DorisBigInt && effDT != schema.DorisInt && effDT != schema.DorisDouble && b.ESType != "date" && b.ESType != "date_nanos" {
+			val = strings.ToLower(strVal)
+		} else if b.ESType == "date" || b.ESType == "date_nanos" || (b.ESType == "" && effDT == schema.DorisBigInt) {
+			ms, ok := schema.ParseESDateWithFormatToEpochMillis(strVal, b.Format, now)
+			if !ok {
+				return "", false
+			}
+			val = ms
+		} else if effDT == schema.DorisBigInt || effDT == schema.DorisInt {
+			trimmed := strings.TrimSpace(strVal)
+			if iv, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+				val = iv
+			} else if fv, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) {
+				val = int64(fv)
+			} else {
+				return "", false
+			}
+		} else if effDT == schema.DorisDouble {
+			trimmed := strings.TrimSpace(strVal)
+			fv, err := strconv.ParseFloat(trimmed, 64)
+			if err != nil || math.IsNaN(fv) || math.IsInf(fv, 0) {
+				return "", false
+			}
+			val = fv
+		}
+	}
+	val = normalizeScaledFloatValue(b, val)
+	val = normalizeDateNanosValue(b.ESType, val)
+	switch tv := val.(type) {
+	case int64:
+		return strconv.FormatInt(tv, 10), true
+	case int:
+		return strconv.Itoa(tv), true
+	case float64:
+		if math.IsNaN(tv) || math.IsInf(tv, 0) {
+			return "", false
+		}
+		return strconv.FormatFloat(tv, 'f', -1, 64), true
+	case json.Number:
+		if effDT == schema.DorisBigInt || effDT == schema.DorisInt {
+			if iv, err := tv.Int64(); err == nil {
+				return strconv.FormatInt(iv, 10), true
+			}
+			if fv, err := tv.Float64(); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) {
+				return strconv.FormatInt(int64(fv), 10), true
+			}
+			return "", false
+		}
+		if effDT == schema.DorisDouble {
+			if fv, err := tv.Float64(); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+				return strconv.FormatFloat(fv, 'f', -1, 64), true
+			}
+			return "", false
+		}
+		return tv.String(), true
+	default:
+		return fmt.Sprintf("%v", val), true
+	}
 }
 
 func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *nestedCtx) CompiledQuery {
@@ -2646,10 +2739,30 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 		}
 	}
 	if len(funcs) == 0 {
+		if fs.BoostMode != "" || fs.MaxBoost != nil {
+			combinedFuncs := "1.0"
+			if fs.MaxBoost != nil {
+				combinedFuncs = fmt.Sprintf("LEAST(%.4f, 1.0)", *fs.MaxBoost)
+			}
+			switch strings.ToLower(fs.BoostMode) {
+			case "sum":
+				base.ScoreSQL = fmt.Sprintf("((%s) + (%s))", base.ScoreSQL, combinedFuncs)
+			case "avg":
+				base.ScoreSQL = fmt.Sprintf("(((%s) + (%s)) / 2.0)", base.ScoreSQL, combinedFuncs)
+			case "max":
+				base.ScoreSQL = fmt.Sprintf("GREATEST(%s, %s)", base.ScoreSQL, combinedFuncs)
+			case "min":
+				base.ScoreSQL = fmt.Sprintf("LEAST(%s, %s)", base.ScoreSQL, combinedFuncs)
+			case "replace":
+				base.ScoreSQL = combinedFuncs
+			default:
+				base.ScoreSQL = fmt.Sprintf("((%s) * (%s))", base.ScoreSQL, combinedFuncs)
+			}
+		}
 		if fs.Boost != nil && *fs.Boost != 1.0 {
 			base.ScoreSQL = fmt.Sprintf("(%.4f * (%s))", *fs.Boost, base.ScoreSQL)
 		}
-		if fs.MinScore != nil && !queryContainsScript(fs.Query) {
+		if fs.MinScore != nil && !queryContainsScript(fs.Query) && !queryContainsNestedScoring(fs.Query) {
 			minCond := fmt.Sprintf("(%s >= %.4f)", base.ScoreSQL, *fs.MinScore)
 			base.WhereSQL = fmt.Sprintf("(%s) AND %s", base.WhereSQL, minCond)
 			base.SafeWhereSQL = fmt.Sprintf("(%s) AND %s", base.EffectiveSafeWhere(), minCond)
@@ -2839,7 +2952,7 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 	}
 	whereSQL := base.WhereSQL
 	safeWhereSQL := base.EffectiveSafeWhere()
-	if fs.MinScore != nil && !hasUncompilableScriptFn && !queryContainsScript(fs.Query) {
+	if fs.MinScore != nil && !hasUncompilableScriptFn && !queryContainsScript(fs.Query) && !queryContainsNestedScoring(fs.Query) {
 		minScoreCond := fmt.Sprintf("(%s >= %.4f)", finalScore, *fs.MinScore)
 		if whereSQL == "" || whereSQL == "TRUE" {
 			whereSQL = minScoreCond
@@ -3387,6 +3500,17 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 		}
 		switch effectiveDorisScalarType(b) {
 		case schema.DorisBigInt:
+			if effFormat != "" && (b.ESType == "date" || b.ESType == "date_nanos" || rc.Format != "") && (!strings.Contains(strings.ToLower(effFormat), "epoch") || strings.Contains(strings.ToLower(effFormat), "basic_date")) {
+				switch iv := v.(type) {
+				case int, int64:
+					if ms, ok := schema.ParseESDateBoundWithFormatToEpochMillis(fmt.Sprintf("%v", iv), effFormat, now, roundUp); ok {
+						if tzOffsetMs != 0 && !strings.Contains(strings.ToLower(effFormat), "epoch") {
+							ms -= tzOffsetMs
+						}
+						return normalizeDateNanosValue(b.ESType, ms)
+					}
+				}
+			}
 			if strVal, ok := v.(string); ok {
 				trimmed := strings.TrimSpace(strVal)
 				if effFormat != "" && (b.ESType == "date" || b.ESType == "date_nanos" || rc.Format != "") {
@@ -3395,7 +3519,23 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 						if idx := strings.Index(datePart, "||"); idx >= 0 {
 							datePart = strings.TrimSpace(datePart[:idx])
 						}
-						if !isEpochSecond &&
+						if _, numErr := strconv.ParseFloat(datePart, 64); numErr != nil && !isEpochSecond &&
+							tzOffsetMs != 0 && !strings.HasPrefix(datePart, "now") &&
+							!strings.HasSuffix(datePart, "Z") && !strings.HasSuffix(datePart, "z") &&
+							!strings.Contains(datePart[min(10, len(datePart)):], "+") &&
+							!strings.Contains(datePart[min(10, len(datePart)):], "-") {
+							ms -= tzOffsetMs
+						}
+						return normalizeDateNanosValue(b.ESType, ms)
+					}
+				}
+				if b.ESType == "date" || b.ESType == "date_nanos" || rc.Format != "" {
+					if ms, ok := schema.ParseESDateBoundWithFormatToEpochMillis(strVal, effFormat, now, roundUp); ok {
+						datePart := trimmed
+						if idx := strings.Index(datePart, "||"); idx >= 0 {
+							datePart = strings.TrimSpace(datePart[:idx])
+						}
+						if _, numErr := strconv.ParseFloat(datePart, 64); numErr != nil &&
 							tzOffsetMs != 0 && !strings.HasPrefix(datePart, "now") &&
 							!strings.HasSuffix(datePart, "Z") && !strings.HasSuffix(datePart, "z") &&
 							!strings.Contains(datePart[min(10, len(datePart)):], "+") &&
@@ -3415,13 +3555,13 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 					}
 					return iv
 				}
-				if b.ESType == "date" || b.ESType == "date_nanos" || b.ESType == "" || rc.Format != "" {
+				if b.ESType == "" {
 					if ms, ok := schema.ParseESDateBoundWithFormatToEpochMillis(strVal, effFormat, now, roundUp); ok {
 						datePart := trimmed
 						if idx := strings.Index(datePart, "||"); idx >= 0 {
 							datePart = strings.TrimSpace(datePart[:idx])
 						}
-						if _, intErr := strconv.ParseInt(datePart, 10, 64); intErr != nil &&
+						if _, numErr := strconv.ParseFloat(datePart, 64); numErr != nil &&
 							tzOffsetMs != 0 && !strings.HasPrefix(datePart, "now") &&
 							!strings.HasSuffix(datePart, "Z") && !strings.HasSuffix(datePart, "z") &&
 							!strings.Contains(datePart[min(10, len(datePart)):], "+") &&
@@ -3464,6 +3604,17 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 				}
 			}
 			return normalizeScaledFloatValue(b, v)
+		case schema.DorisVarchar, schema.DorisString:
+			if b.ESType != "" {
+				s := fmt.Sprintf("%v", v)
+				if b.EffectiveLowercase(true) {
+					s = strings.ToLower(s)
+				}
+				return s
+			}
+			if strVal, ok := v.(string); ok && b.EffectiveLowercase(true) {
+				return strings.ToLower(strVal)
+			}
 		}
 		return v
 	}
@@ -9017,19 +9168,38 @@ func (t *Transpiler) nestedRelativeJSONPath(field string, preferKeyword bool, ne
 		if strings.HasSuffix(resolvedField, ".keyword") && !strings.HasSuffix(effField, ".keyword") {
 			effField += ".keyword"
 		}
+		if t.Schema != nil {
+			b = t.Schema.ResolveEffectiveField(effField, preferKeyword)
+		}
 	}
 	relKey := strings.TrimSuffix(strings.TrimPrefix(effField, nestedPath+"."), ".keyword")
 	if len(b.RelativeJSONPath) > 0 {
 		relKey = strings.Join(b.RelativeJSONPath, ".")
+	} else if len(b.SourceJSONPath) > 0 {
+		srcPath := strings.Join(b.SourceJSONPath, ".")
+		if strings.HasPrefix(srcPath, nestedPath+".") {
+			relKey = strings.TrimPrefix(srcPath, nestedPath+".")
+		}
 	}
 	if t.Schema != nil {
-		basePath := strings.TrimSuffix(effField, ".keyword")
-		isKw := strings.HasSuffix(effField, ".keyword") || (preferKeyword && b.ESType == "keyword")
-		if isKw {
-			if baseB, hasBase := t.Schema.Fields[basePath]; hasBase && (baseB.ESType == "text" || strings.HasSuffix(effField, ".keyword")) {
-				if b.IgnoreAbove > 0 || b.LowercaseNormalizer || b.IsMultiValued || b.NullValue != nil ||
-					baseB.IgnoreAbove > 0 || baseB.LowercaseNormalizer || baseB.NullValue != nil {
-					relKey += "__keyword"
+		srcDotPath := strings.Join(b.SourceJSONPath, ".")
+		if srcDotPath == "" {
+			srcDotPath = strings.TrimSuffix(effField, ".keyword")
+		}
+		subKey := ""
+		if strings.HasPrefix(effField, srcDotPath+".") {
+			subKey = strings.TrimPrefix(effField, srcDotPath+".")
+		} else if preferKeyword && b.ESType == "keyword" && effField == srcDotPath {
+			subKey = "keyword"
+		}
+		if subKey != "" && !strings.Contains(subKey, ".") {
+			if baseB, hasBase := t.Schema.Fields[srcDotPath]; hasBase {
+				if subKey != "keyword" || baseB.ESType == "text" || strings.HasSuffix(effField, ".keyword") {
+					if b.IgnoreAbove > 0 || b.LowercaseNormalizer || b.IsMultiValued || b.NullValue != nil ||
+						baseB.IgnoreAbove > 0 || baseB.LowercaseNormalizer || baseB.NullValue != nil ||
+						b.ESType != baseB.ESType || b.Format != baseB.Format || b.ScalingFactor != baseB.ScalingFactor {
+						relKey += "__" + subKey
+					}
 				}
 			}
 		}
