@@ -1142,10 +1142,9 @@ func ingestErrorType(err error) string {
 	return "ingest_processor_exception"
 }
 
-func (s *Server) applyIngestPipelineForWriteWithRouting(pipelineID, indexName, docID, initialRouting string, raw json.RawMessage) (json.RawMessage, string, string, string, bool, error) {
-	pipelineID = strings.TrimSpace(pipelineID)
-	if pipelineID == "" || pipelineID == "_none" || pipelineID == "none" || len(bytes.TrimSpace(raw)) == 0 {
-		return raw, indexName, docID, initialRouting, false, nil
+func (s *Server) applyIngestPipelineForWriteWithRoutingAndIngestMeta(pipelineID, indexName, docID, initialRouting string, raw json.RawMessage, initialIngestMeta map[string]any) (json.RawMessage, string, string, string, bool, map[string]any, error) {
+	if pipelineID == "" || pipelineID == "_none" {
+		return raw, indexName, docID, initialRouting, false, initialIngestMeta, nil
 	}
 	s.mu.RLock()
 	pipe, ok := s.pipelines[pipelineID]
@@ -1157,10 +1156,10 @@ func (s *Server) applyIngestPipelineForWriteWithRouting(pipelineID, indexName, d
 		s.mu.RUnlock()
 	}
 	if !ok || pipe == nil {
-		return raw, indexName, docID, initialRouting, false, fmt.Errorf("pipeline with id [%s] does not exist", pipelineID)
+		return raw, indexName, docID, initialRouting, false, initialIngestMeta, fmt.Errorf("pipeline with id [%s] does not exist", pipelineID)
 	}
-	out, outIdx, outID, _, outRouting, dropped, _, err := applyIngestPipelineSpecWithRouting(s, pipe, indexName, docID, initialRouting, raw, false)
-	return out, outIdx, outID, outRouting, dropped, err
+	out, outIdx, outID, _, outRouting, dropped, _, outIngestMeta, err := applyIngestPipelineSpecWithRoutingAndIngestMeta(s, pipe, indexName, docID, initialRouting, raw, false, initialIngestMeta)
+	return out, outIdx, outID, outRouting, dropped, outIngestMeta, err
 }
 
 func (s *Server) applyEffectiveAndFinalPipelinesWithRouting(indexName, docID, reqPipeline, defaultPipeline, initialRouting string, raw json.RawMessage) (json.RawMessage, string, string, string, bool, error) {
@@ -1174,8 +1173,9 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithRouting(indexName, docID, re
 	curIndex := indexName
 	curID := docID
 	curRouting := initialRouting
+	var curIngestMeta map[string]any
 	if effPipeline != "" {
-		next, nextIdx, nextID, nextRouting, dropped, err := s.applyIngestPipelineForWriteWithRouting(effPipeline, curIndex, curID, curRouting, cur)
+		next, nextIdx, nextID, nextRouting, dropped, nextIngestMeta, err := s.applyIngestPipelineForWriteWithRoutingAndIngestMeta(effPipeline, curIndex, curID, curRouting, cur, nil)
 		if err != nil || dropped {
 			return next, nextIdx, nextID, nextRouting, dropped, err
 		}
@@ -1187,6 +1187,7 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithRouting(indexName, docID, re
 			curID = nextID
 		}
 		curRouting = nextRouting
+		curIngestMeta = nextIngestMeta
 	}
 	finalPipeline := s.resolveFinalPipeline(curIndex)
 	if finalPipeline == "" && s != nil {
@@ -1200,7 +1201,7 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithRouting(indexName, docID, re
 		}
 	}
 	if finalPipeline != "" {
-		next, nextIdx, nextID, nextRouting, dropped, err := s.applyIngestPipelineForWriteWithRouting(finalPipeline, curIndex, curID, curRouting, cur)
+		next, nextIdx, nextID, nextRouting, dropped, _, err := s.applyIngestPipelineForWriteWithRoutingAndIngestMeta(finalPipeline, curIndex, curID, curRouting, cur, curIngestMeta)
 		if err != nil || dropped {
 			return next, nextIdx, nextID, nextRouting, dropped, err
 		}
@@ -4148,20 +4149,32 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				fqdn := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", val))), ".")
 				labels := strings.Split(fqdn, ".")
 				out := map[string]any{"domain": fqdn}
-				if len(labels) >= 2 {
-					tld := labels[len(labels)-1]
-					regDom := labels[len(labels)-2] + "." + tld
-					if len(labels) >= 3 && len(labels[len(labels)-2]) <= 3 && (labels[len(labels)-2] == "co" || labels[len(labels)-2] == "com" || labels[len(labels)-2] == "org" || labels[len(labels)-2] == "gov" || labels[len(labels)-2] == "ac") {
-						tld = labels[len(labels)-2] + "." + labels[len(labels)-1]
-						regDom = labels[len(labels)-3] + "." + tld
-						if len(labels) > 3 {
-							out["subdomain"] = strings.Join(labels[:len(labels)-3], ".")
-						}
-					} else if len(labels) > 2 {
-						out["subdomain"] = strings.Join(labels[:len(labels)-2], ".")
+				isIP := net.ParseIP(strings.Trim(fqdn, "[]")) != nil
+				isSecondLevelPublicSuffix := func(sld string) bool {
+					switch sld {
+					case "co", "com", "org", "gov", "ac", "net", "edu", "mil":
+						return true
 					}
-					out["top_level_domain"] = tld
-					out["registered_domain"] = regDom
+					return false
+				}
+				if !isIP && len(labels) >= 2 && labels[0] != "" && labels[len(labels)-1] != "" {
+					tld := labels[len(labels)-1]
+					if len(labels) == 2 && len(labels[0]) <= 3 && isSecondLevelPublicSuffix(labels[0]) {
+						out["top_level_domain"] = labels[0] + "." + tld
+					} else {
+						regDom := labels[len(labels)-2] + "." + tld
+						if len(labels) >= 3 && len(labels[len(labels)-2]) <= 3 && isSecondLevelPublicSuffix(labels[len(labels)-2]) {
+							tld = labels[len(labels)-2] + "." + labels[len(labels)-1]
+							regDom = labels[len(labels)-3] + "." + tld
+							if len(labels) > 3 {
+								out["subdomain"] = strings.Join(labels[:len(labels)-3], ".")
+							}
+						} else if len(labels) > 2 {
+							out["subdomain"] = strings.Join(labels[:len(labels)-2], ".")
+						}
+						out["top_level_domain"] = tld
+						out["registered_domain"] = regDom
+					}
 				}
 				setIngestPath(doc, target, out)
 				mutated = true
@@ -4785,21 +4798,26 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 }
 
 func applyIngestPipelineSpecWithRouting(s *Server, pipe map[string]any, indexName, docID, initialRouting string, raw json.RawMessage, verbose bool) (json.RawMessage, string, string, string, string, bool, []map[string]any, error) {
+	out, outIdx, outID, outTS, outRouting, dropped, trace, _, err := applyIngestPipelineSpecWithRoutingAndIngestMeta(s, pipe, indexName, docID, initialRouting, raw, verbose, nil)
+	return out, outIdx, outID, outTS, outRouting, dropped, trace, err
+}
+
+func applyIngestPipelineSpecWithRoutingAndIngestMeta(s *Server, pipe map[string]any, indexName, docID, initialRouting string, raw json.RawMessage, verbose bool, initialIngestMeta map[string]any) (json.RawMessage, string, string, string, string, bool, []map[string]any, map[string]any, error) {
 	if pipe == nil || len(bytes.TrimSpace(raw)) == 0 {
-		return raw, indexName, docID, "", initialRouting, false, nil, nil
+		return raw, indexName, docID, "", initialRouting, false, nil, initialIngestMeta, nil
 	}
 	procs, _ := pipe["processors"].([]any)
 	if len(procs) == 0 {
 		if verbose {
-			return raw, indexName, docID, "", initialRouting, false, []map[string]any{}, nil
+			return raw, indexName, docID, "", initialRouting, false, []map[string]any{}, initialIngestMeta, nil
 		}
-		return raw, indexName, docID, "", initialRouting, false, nil, nil
+		return raw, indexName, docID, "", initialRouting, false, nil, initialIngestMeta, nil
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	var doc map[string]any
 	if err := dec.Decode(&doc); err != nil || doc == nil {
-		return raw, indexName, docID, "", initialRouting, false, nil, err
+		return raw, indexName, docID, "", initialRouting, false, nil, initialIngestMeta, err
 	}
 	origIndexVal, hadOrigIndex := doc["_index"]
 	origIDVal, hadOrigID := doc["_id"]
@@ -4824,6 +4842,11 @@ func applyIngestPipelineSpecWithRouting(s *Server, pipe map[string]any, indexNam
 	if ingestMeta == nil {
 		ingestMeta = make(map[string]any)
 	}
+	for k, v := range initialIngestMeta {
+		if _, exists := ingestMeta[k]; !exists {
+			ingestMeta[k] = v
+		}
+	}
 	if _, hasTS := ingestMeta["timestamp"]; !hasTS {
 		ingestMeta["timestamp"] = time.Now().UTC().Format(time.RFC3339Nano)
 	}
@@ -4847,7 +4870,7 @@ func applyIngestPipelineSpecWithRouting(s *Server, pipe map[string]any, indexNam
 	}
 	mutated, dropped, procErr := runIngestProcessorList(s, doc, procs, 0, tracePtr)
 	if dropped {
-		return json.RawMessage(`{}`), indexName, docID, "", initialRouting, true, trace, nil
+		return json.RawMessage(`{}`), indexName, docID, "", initialRouting, true, trace, nil, nil
 	}
 	if procErr != nil {
 		if pipeOnFail, ok := pipe["on_failure"].([]any); ok && len(pipeOnFail) > 0 {
@@ -4873,7 +4896,7 @@ func applyIngestPipelineSpecWithRouting(s *Server, pipe map[string]any, indexNam
 				mutated = true
 			}
 			if subDropped {
-				return json.RawMessage(`{}`), indexName, docID, "", initialRouting, true, trace, nil
+				return json.RawMessage(`{}`), indexName, docID, "", initialRouting, true, trace, nil, nil
 			}
 			if subErr == nil {
 				if curIngest, ok := doc["_ingest"].(map[string]any); ok {
@@ -4886,7 +4909,7 @@ func applyIngestPipelineSpecWithRouting(s *Server, pipe map[string]any, indexNam
 		}
 		if procErr != nil {
 			delete(doc, "__internal_ingest_orig")
-			return raw, indexName, docID, "", initialRouting, false, trace, procErr
+			return raw, indexName, docID, "", initialRouting, false, trace, nil, procErr
 		}
 	}
 	outIndex := indexName
@@ -4908,7 +4931,12 @@ func applyIngestPipelineSpecWithRouting(s *Server, pipe map[string]any, indexNam
 		outRouting = fmt.Sprintf("%v", v)
 	}
 	outIngestTS := ""
+	var outIngestMeta map[string]any
 	if curIngest, ok := doc["_ingest"].(map[string]any); ok {
+		outIngestMeta = make(map[string]any, len(curIngest))
+		for k, v := range curIngest {
+			outIngestMeta[k] = v
+		}
 		if ts, ok := curIngest["timestamp"].(string); ok {
 			outIngestTS = ts
 		} else if tsAny, ok := curIngest["timestamp"]; ok && tsAny != nil {
@@ -4938,13 +4966,13 @@ func applyIngestPipelineSpecWithRouting(s *Server, pipe map[string]any, indexNam
 	delete(doc, "__internal_ingest_orig")
 	delete(doc, "_ingest")
 	if !mutated {
-		return raw, outIndex, outID, outIngestTS, outRouting, false, trace, nil
+		return raw, outIndex, outID, outIngestTS, outRouting, false, trace, outIngestMeta, nil
 	}
 	out, err := json.Marshal(doc)
 	if err != nil {
-		return raw, outIndex, outID, outIngestTS, outRouting, false, trace, err
+		return raw, outIndex, outID, outIngestTS, outRouting, false, trace, outIngestMeta, err
 	}
-	return json.RawMessage(out), outIndex, outID, outIngestTS, outRouting, false, trace, nil
+	return json.RawMessage(out), outIndex, outID, outIngestTS, outRouting, false, trace, outIngestMeta, nil
 }
 
 // handleSimulateIngestPipeline implements `POST /_ingest/pipeline/_simulate` and `POST /_ingest/pipeline/{id}/_simulate`.
@@ -6047,7 +6075,8 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 						scriptVerSet = updSpec.MetaVersionMutated
 					}
 					if opRes == "deleted" {
-						prepared = append(prepared, preparedDoc{id: docID, destIndex: docDestIdx, aliasFilter: docDestAliasFilter, srcVer: docSrcVer, scriptVerSet: scriptVerSet, isDelete: true})
+						effDelRouting := s.resolveEffectiveWriteRouting(docDestRawIdx, docDestIdx, "", docRouting)
+						prepared = append(prepared, preparedDoc{id: docID, destIndex: docDestIdx, aliasFilter: docDestAliasFilter, srcVer: docSrcVer, scriptVerSet: scriptVerSet, isDelete: true, routing: effDelRouting})
 						candIDsByIdx[docDestIdx] = append(candIDsByIdx[docDestIdx], docID)
 						if _, hasKey := sampleDocsByIdx[docDestIdx]; !hasKey {
 							sampleDocsByIdx[docDestIdx] = nil
@@ -6056,7 +6085,11 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					}
 					docSource = mutated
 				}
-				pipedDoc, nextDestIdx, nextDocID, pipeRouting, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithRouting(docDestRawIdx, docID, body.Dest.Pipeline, "", docRouting, docSource)
+				prePipeRouting := docRouting
+				if prePipeRouting == "" {
+					prePipeRouting = s.resolveEffectiveIndexRouting(docDestRawIdx, "")
+				}
+				pipedDoc, nextDestIdx, nextDocID, pipeRouting, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithRouting(docDestRawIdx, docID, body.Dest.Pipeline, "", prePipeRouting, docSource)
 				if pipeErr != nil {
 					writeESError(w, http.StatusBadRequest, ingestErrorType(pipeErr), pipeErr.Error())
 					return
@@ -6145,9 +6178,24 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 						minVer = delVer + 1
 					}
 				}
+				if lastVer := s.getDocVersion(pd.destIndex, pd.id); lastVer > 0 && lastVer < 1_000_000_000_000 && lastVer+1 > minVer {
+					minVer = lastVer + 1
+				}
 				existing, exists := existingDocs[pd.id]
+				if !exists && minVer == 0 {
+					if destHit, found, _ := s.backend.GetDocByID(r.Context(), sch.DorisDB, sch.DorisTable, pd.id); !found && destHit != nil && destHit.Version > 0 && destHit.Version < 1_000_000_000_000 {
+						minVer = destHit.Version + 1
+					}
+				}
 				if pd.isDelete {
+					if s.isRoutingRequired(sch) && pd.routing == "" {
+						writeESError(w, http.StatusBadRequest, "routing_missing_exception", fmt.Sprintf("routing is required for [%s]/[%s]/[%s]", pd.destIndex, "_doc", pd.id))
+						return
+					}
 					if !exists {
+						continue
+					}
+					if pd.routing != "" && !s.docMatchesRequestRouting(pd.destIndex, pd.id, pd.routing) {
 						continue
 					}
 					if pd.aliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), pd.destIndex, pd.id, existing.Source, pd.aliasFilter) {
@@ -6812,11 +6860,15 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 	targets := append([]string(nil), s.aliases[alias]...)
 	metaByIdx := s.aliasMeta[alias]
 	writeIdx := ""
+	explicitNonWriteCount := 0
 	for _, t := range targets {
 		if metaByIdx != nil {
-			if m, ok := metaByIdx[t]; ok && m.IsWriteIndex != nil && *m.IsWriteIndex {
-				writeIdx = t
-				break
+			if m, ok := metaByIdx[t]; ok && m.IsWriteIndex != nil {
+				if *m.IsWriteIndex {
+					writeIdx = t
+					break
+				}
+				explicitNonWriteCount++
 			}
 		}
 	}
@@ -6825,7 +6877,7 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 	if isDataStream && writeIdx == "" {
 		writeIdx = dsLastBacking
 	}
-	if !isDataStream && len(targets) > 1 && writeIdx == "" {
+	if !isDataStream && ((len(targets) > 1 && writeIdx == "") || (len(targets) == 1 && explicitNonWriteCount == 1)) {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
 			fmt.Sprintf("Alias [%s] has more than one write index or no write index is specified", alias))
 		return
@@ -7301,6 +7353,7 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 	idxSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
 	s.resolveTermsLookupsInQuery(r.Context(), aliasFilter)
 	resolvedReq := s.resolveTermsLookupsInSearchRequest(r.Context(), &req)
+	idxSchema = s.augmentSchemaWithRuntimeMappings(idxSchema, resolvedReq.RuntimeMappings)
 	effQuery := combineQueryWithAliasFilter(resolvedReq.Query, aliasFilter)
 	tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
 	if _, err := tr.BuildSearchPlan(&esast.SearchRequest{Query: effQuery}); err != nil {
@@ -7313,7 +7366,12 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
 		return
 	}
-	if !found || hit == nil || (aliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), indexName, docID, hit.Source, aliasFilter)) {
+	if found && hit != nil {
+		hitSlice := []HitRow{*hit}
+		s.evalRuntimeMappingsOnHitRows(idxSchema, resolvedReq.RuntimeMappings, hitSlice)
+		*hit = hitSlice[0]
+	}
+	if !found || hit == nil || (aliasFilter != nil && !s.docMatchesAliasFilterWithSchema(r.Context(), indexName, idxSchema, docID, hit.EffectiveSource(), aliasFilter)) {
 		writeJSON(w, http.StatusNotFound, map[string]any{
 			"_index":  indexName,
 			"_type":   "_doc",
@@ -7328,19 +7386,20 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	matched := s.docMatchesAliasFilter(r.Context(), indexName, docID, hit.Source, effQuery)
+	effSrc := hit.EffectiveSource()
+	matched := s.docMatchesAliasFilterWithSchema(r.Context(), indexName, idxSchema, docID, effSrc, effQuery)
 	cq := tr.CompileQuery(effQuery, true, nil)
 	scoreVal := 0.0
 	desc := "no match on required clause (" + cq.WhereSQL + ")"
 	if matched {
 		scoreVal = 1.0
-		if shreddedBytes, err := schema.ShredDocument(idxSchema, docID, hit.Version, false, hit.Source); err == nil {
+		if shreddedBytes, err := schema.ShredDocument(idxSchema, docID, hit.Version, false, effSrc); err == nil {
 			var row map[string]any
 			dec := json.NewDecoder(bytes.NewReader(shreddedBytes))
 			dec.UseNumber()
 			if err := dec.Decode(&row); err == nil && row != nil {
 				var docMap map[string]any
-				docDec := json.NewDecoder(bytes.NewReader(hit.Source))
+				docDec := json.NewDecoder(bytes.NewReader(effSrc))
 				docDec.UseNumber()
 				if err := docDec.Decode(&docMap); err == nil {
 					row["_doc"] = docMap
@@ -7350,9 +7409,12 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		if queryHasRuntimeScript(effQuery) || queryHasNestedScoring(effQuery) || (effQuery != nil && (effQuery.FunctionScore != nil || effQuery.ScriptScore != nil)) {
+		origQuery := resolvedReq.Query
+		hasScoringWrapper := (effQuery != nil && (effQuery.FunctionScore != nil || effQuery.ScriptScore != nil)) ||
+			(origQuery != nil && (origQuery.FunctionScore != nil || origQuery.ScriptScore != nil))
+		if queryHasRuntimeScript(effQuery) || queryHasNestedScoring(effQuery) || hasScoringWrapper {
 			var docMap map[string]any
-			dec := json.NewDecoder(bytes.NewReader(hit.Source))
+			dec := json.NewDecoder(bytes.NewReader(effSrc))
 			dec.UseNumber()
 			_ = dec.Decode(&docMap)
 			if docMap == nil {
@@ -7360,12 +7422,24 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 			}
 			docMap["__meta_id"] = docID
 			baseScore := scoreVal
-			if effQuery != nil && ((effQuery.ScriptScore != nil && effQuery.ScriptScore.Query == nil) || (effQuery.FunctionScore != nil && effQuery.FunctionScore.Query == nil)) {
+			if (effQuery != nil && ((effQuery.ScriptScore != nil && effQuery.ScriptScore.Query == nil) || (effQuery.FunctionScore != nil && effQuery.FunctionScore.Query == nil))) ||
+				(origQuery != nil && ((origQuery.ScriptScore != nil && origQuery.ScriptScore.Query == nil) || (origQuery.FunctionScore != nil && origQuery.FunctionScore.Query == nil))) {
 				baseScore = 1.0
 			}
 			scoreVal = evalQueryScriptScoreOnDocWithSchema(idxSchema, docMap, effQuery, baseScore)
 		}
-		if resolvedReq.PostFilter != nil && !s.docMatchesAliasFilter(r.Context(), indexName, docID, hit.Source, resolvedReq.PostFilter) {
+		var effScriptScoreMin, effFuncScoreMin *float64
+		if effQuery != nil && effQuery.ScriptScore != nil && effQuery.ScriptScore.MinScore != nil {
+			effScriptScoreMin = effQuery.ScriptScore.MinScore
+		} else if origQuery != nil && origQuery.ScriptScore != nil && origQuery.ScriptScore.MinScore != nil {
+			effScriptScoreMin = origQuery.ScriptScore.MinScore
+		}
+		if effQuery != nil && effQuery.FunctionScore != nil && effQuery.FunctionScore.MinScore != nil {
+			effFuncScoreMin = effQuery.FunctionScore.MinScore
+		} else if origQuery != nil && origQuery.FunctionScore != nil && origQuery.FunctionScore.MinScore != nil {
+			effFuncScoreMin = origQuery.FunctionScore.MinScore
+		}
+		if resolvedReq.PostFilter != nil && !s.docMatchesAliasFilterWithSchema(r.Context(), indexName, idxSchema, docID, hit.Source, resolvedReq.PostFilter) {
 			matched = false
 			scoreVal = 0.0
 			desc = "no match on post_filter"
@@ -7373,14 +7447,14 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 			matched = false
 			scoreVal = 0.0
 			desc = fmt.Sprintf("score (< %.4f) is less than min_score", *resolvedReq.MinScore)
-		} else if effQuery != nil && effQuery.ScriptScore != nil && effQuery.ScriptScore.MinScore != nil && scoreVal < *effQuery.ScriptScore.MinScore {
+		} else if effScriptScoreMin != nil && scoreVal < *effScriptScoreMin {
 			matched = false
 			scoreVal = 0.0
-			desc = fmt.Sprintf("score (< %.4f) is less than min_score", *effQuery.ScriptScore.MinScore)
-		} else if effQuery != nil && effQuery.FunctionScore != nil && effQuery.FunctionScore.MinScore != nil && scoreVal < *effQuery.FunctionScore.MinScore {
+			desc = fmt.Sprintf("score (< %.4f) is less than min_score", *effScriptScoreMin)
+		} else if effFuncScoreMin != nil && scoreVal < *effFuncScoreMin {
 			matched = false
 			scoreVal = 0.0
-			desc = fmt.Sprintf("score (< %.4f) is less than min_score", *effQuery.FunctionScore.MinScore)
+			desc = fmt.Sprintf("score (< %.4f) is less than min_score", *effFuncScoreMin)
 		} else {
 			desc = "weight(" + cq.WhereSQL + ") [DorisInvertedIndex], result of: " + cq.ScoreSQL
 		}

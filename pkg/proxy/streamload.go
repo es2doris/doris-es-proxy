@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
@@ -166,6 +167,7 @@ func (c *StreamLoadClient) loadSingleNDJSONBatch(
 	const maxAttempts = 3
 	backoff := 25 * time.Millisecond
 	var lastErr error
+	batchLabel := fmt.Sprintf("es_proxy_%s_%d_%d", safeTable, time.Now().UnixNano(), atomic.AddUint64(&streamLoadLabelSeq, 1))
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if attempt > 1 {
@@ -184,6 +186,7 @@ func (c *StreamLoadClient) loadSingleNDJSONBatch(
 		}
 		req.SetBasicAuth(c.cfg.User, c.cfg.Password)
 		req.Header.Set("Expect", "100-continue")
+		req.Header.Set("label", batchLabel)
 		req.Header.Set("format", "json")
 		req.Header.Set("read_json_by_line", "true")
 		req.Header.Set("strip_outer_array", "false")
@@ -216,8 +219,11 @@ func (c *StreamLoadClient) loadSingleNDJSONBatch(
 		}
 
 		var slResp streamLoadResponse
-		if err := json.Unmarshal(bodyBytes, &slResp); err != nil {
+		if err := json.Unmarshal(bodyBytes, &slResp); err != nil || (slResp.Status == "" && resp.StatusCode >= 400) {
 			return fmt.Errorf("unexpected stream load response (HTTP %d): %s", resp.StatusCode, string(bodyBytes))
+		}
+		if strings.EqualFold(slResp.Status, "Label Already Exists") && attempt > 1 {
+			return nil
 		}
 		if !strings.EqualFold(slResp.Status, "Success") && !strings.EqualFold(slResp.Status, "Publish Timeout") {
 			if isTransientStreamLoadError(slResp.Status, slResp.Message) && attempt < maxAttempts {
@@ -225,7 +231,11 @@ func (c *StreamLoadClient) loadSingleNDJSONBatch(
 				continue
 			}
 			detail := c.fetchErrorURLDetail(ctx, slResp.ErrorURL)
-			return fmt.Errorf("doris stream load failed (status=%s): %s (error_url=%s detail=%s)", slResp.Status, slResp.Message, slResp.ErrorURL, detail)
+			msg := slResp.Message
+			if msg == "" {
+				msg = string(bodyBytes)
+			}
+			return fmt.Errorf("doris stream load failed (HTTP %d, status=%s): %s (error_url=%s detail=%s)", resp.StatusCode, slResp.Status, msg, slResp.ErrorURL, detail)
 		}
 		if slResp.NumberFilteredRows > 0 {
 			detail := c.fetchErrorURLDetail(ctx, slResp.ErrorURL)
@@ -236,6 +246,8 @@ func (c *StreamLoadClient) loadSingleNDJSONBatch(
 	}
 	return lastErr
 }
+
+var streamLoadLabelSeq uint64
 
 func isTransientStreamLoadError(status, msg string) bool {
 	combined := strings.ToUpper(status + " " + msg)
@@ -249,13 +261,19 @@ func (c *StreamLoadClient) fetchErrorURLDetail(ctx context.Context, errURL strin
 	if strings.TrimSpace(errURL) == "" {
 		return ""
 	}
+	parsedErrURL, err := url.Parse(strings.TrimSpace(errURL))
+	if err != nil || (parsedErrURL.Scheme != "http" && parsedErrURL.Scheme != "https") {
+		return ""
+	}
 	// #nosec G704 -- fetching diagnostic error summary from Doris BE ErrorURL on Stream Load failure
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, errURL, nil)
 	if err != nil {
 		return ""
 	}
-	if c.cfg.User != "" || c.cfg.Password != "" {
-		req.SetBasicAuth(c.cfg.User, c.cfg.Password)
+	if (c.cfg.User != "" || c.cfg.Password != "") && strings.Contains(parsedErrURL.Path, "_load_error") {
+		if feURL, feErr := url.Parse(c.cfg.FEHTTPEndpoint); feErr == nil && strings.EqualFold(feURL.Scheme, parsedErrURL.Scheme) {
+			req.SetBasicAuth(c.cfg.User, c.cfg.Password)
+		}
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

@@ -1158,3 +1158,85 @@ func TestRound44ASTBoostValidationAggSpecAndLeafUnknownKeys(t *testing.T) {
 		t.Fatalf("F11 expected EffectiveNegativeBoost() == 0, got %v", bqZero.Query.Boosting.EffectiveNegativeBoost())
 	}
 }
+
+func TestRound45ASTValidationSortSuggestAndRuntimeAggs(t *testing.T) {
+	// F1: Query-DSL leaf validation rejects unknown keys & invalid values
+	for _, badLeaf := range []string{
+		`{"query": {"multi_match": {"query": "hi", "fields": ["title"], "bogus": 1}}}`,
+		`{"query": {"query_string": {"query": "hi", "bogus": 1}}}`,
+		`{"query": {"simple_query_string": {"query": "hi", "bogus": 1}}}`,
+		`{"query": {"combined_fields": {"query": "hi", "fields": ["title"], "bogus": 1}}}`,
+		`{"query": {"script_score": {"query": {"match_all": {}}, "script": {"source": "1"}, "bogus": 1}}}`,
+		`{"query": {"script_score": {"query": {"match_all": {}}}}}`,
+		`{"query": {"match_phrase_prefix": {"title": {"query": "hi", "bogus": 1}}}}`,
+		`{"query": {"match_bool_prefix": {"title": {"query": "hi", "bogus": 1}}}}`,
+		`{"query": {"bool": {"must": [{"match_all": {}}], "bogus": 1}}}`,
+		`{"query": {"script": {"script": {"source": "1"}, "bogus": 1}}}`,
+	} {
+		var req SearchRequest
+		if err := json.Unmarshal([]byte(badLeaf), &req); err == nil || !strings.Contains(err.Error(), "parsing_exception") {
+			t.Fatalf("F1 expected parsing_exception for %s, got %v", badLeaf, err)
+		}
+	}
+
+	// F2: Aggregation validation rejects unknown agg types, empty agg definitions, and multiple agg types
+	for _, badAgg := range []string{
+		`{"aggs": {"a": {"unknown_agg_type": {"field": "status"}}}}`,
+		`{"aggs": {"a": {}}}`,
+		`{"aggs": {"a": {"terms": {"field": "status"}, "avg": {"field": "age"}}}}`,
+		`{"aggs": {"a": {"composite": {"sources": []}}}}`,
+	} {
+		var req SearchRequest
+		if err := json.Unmarshal([]byte(badAgg), &req); err == nil {
+			t.Fatalf("F2 expected error for %s, got nil", badAgg)
+		}
+	}
+
+	// Valid _geo_distance sort and nested filter/max_children parse cleanly
+	var validSortReq SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"sort": [
+			{"_geo_distance": {"pin.location": {"lat": 40, "lon": -70}, "order": "asc", "unit": "km"}},
+			{"items.price": {"order": "desc", "mode": "avg", "nested": {"path": "items", "max_children": 3, "filter": {"term": {"items.active": true}}}}}
+		]
+	}`), &validSortReq); err != nil {
+		t.Fatalf("F3/F14 valid sort failed: %v", err)
+	}
+	if len(validSortReq.Sort) != 2 || validSortReq.Sort[0].Entry.Field != "_geo_distance" || validSortReq.Sort[1].Entry.Nested == nil || validSortReq.Sort[1].Entry.Nested.MaxChildren == nil || *validSortReq.Sort[1].Entry.Nested.MaxChildren != 3 {
+		t.Fatalf("F3/F14 unexpected parsed sort: %+v", validSortReq.Sort)
+	}
+
+	// F5 & F18 & F20: Suggest, RareTerms, AutoDateHistogram, VariableWidthHistogram, WeightedAvg, MAD, Geo, Matrix, TTest aggs parse cleanly
+	var fullAggReq SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"suggest": {
+			"text": "devloper",
+			"my_term": {"term": {"field": "title", "size": 3}},
+			"my_phrase": {"phrase": {"field": "title"}},
+			"my_comp": {"prefix": "dev", "completion": {"field": "suggest"}}
+		},
+		"aggs": {
+			"rt": {"rare_terms": {"field": "tag", "max_doc_count": 2}},
+			"adh": {"auto_date_histogram": {"field": "ts", "buckets": 5}},
+			"vwh": {"variable_width_histogram": {"field": "price", "buckets": 3}},
+			"wavg": {"weighted_avg": {"value": {"field": "grade"}, "weight": {"field": "credits"}}},
+			"mad": {"median_absolute_deviation": {"field": "latency"}},
+			"gb": {"geo_bounds": {"field": "loc"}},
+			"gc": {"geo_centroid": {"field": "loc"}},
+			"gd": {"geo_distance": {"field": "loc", "origin": "40,-70", "ranges": [{"to": 100}]}},
+			"gh": {"geohash_grid": {"field": "loc", "precision": 4}},
+			"gt": {"geotile_grid": {"field": "loc", "precision": 6}},
+			"am": {"adjacency_matrix": {"filters": {"a": {"term": {"tag": "a"}}, "b": {"term": {"tag": "b"}}}}},
+			"ms": {"matrix_stats": {"fields": ["price", "latency"]}},
+			"tt": {"t_test": {"a": {"field": "price"}, "b": {"field": "latency"}, "type": "paired"}}
+		}
+	}`), &fullAggReq); err != nil {
+		t.Fatalf("F5/F18/F20 unmarshal failed: %v", err)
+	}
+	if len(fullAggReq.Suggest) != 4 || fullAggReq.Suggest["text"].Text != "devloper" || fullAggReq.Suggest["my_term"].Term == nil {
+		t.Fatalf("F5 unexpected suggest parsed: %+v", fullAggReq.Suggest)
+	}
+	if len(fullAggReq.Aggs) != 13 {
+		t.Fatalf("F18/F20 expected 13 aggs, got %d", len(fullAggReq.Aggs))
+	}
+}

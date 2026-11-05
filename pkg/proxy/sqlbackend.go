@@ -242,7 +242,7 @@ func rewriteDorisArrayExists(q string) string {
 		if depth == 0 && lastTopComma > start {
 			lambdaPart := rewriteDorisArrayExists(strings.TrimSpace(q[start:lastTopComma]))
 			colPart := rewriteDorisArrayExists(strings.TrimSpace(q[lastTopComma+1 : j-1]))
-			alreadyWrapped := strings.HasPrefix(colPart, "IFNULL(") && strings.HasSuffix(colPart, "CAST([] AS ARRAY<STRING>))")
+			alreadyWrapped := strings.HasPrefix(colPart, "IFNULL(") && strings.Contains(colPart, "CAST([] AS ARRAY<")
 			if alreadyWrapped {
 				out.WriteString("array_exists(")
 				out.WriteString(lambdaPart)
@@ -250,11 +250,19 @@ func rewriteDorisArrayExists(q string) string {
 				out.WriteString(colPart)
 				out.WriteString(")")
 			} else {
+				emptyArrType := "ARRAY<STRING>"
+				if strings.HasPrefix(colPart, "array_map(_x -> CAST(_x AS DOUBLE),") || strings.HasSuffix(colPart, " AS ARRAY<DOUBLE>)") {
+					emptyArrType = "ARRAY<DOUBLE>"
+				} else if strings.HasPrefix(colPart, "array_map(_x -> CAST(_x AS BIGINT),") || strings.HasSuffix(colPart, " AS ARRAY<BIGINT>)") {
+					emptyArrType = "ARRAY<BIGINT>"
+				}
 				out.WriteString("array_contains(array_exists(")
 				out.WriteString(lambdaPart)
 				out.WriteString(", IFNULL(")
 				out.WriteString(colPart)
-				out.WriteString(", CAST([] AS ARRAY<STRING>))), true)")
+				out.WriteString(", CAST([] AS ")
+				out.WriteString(emptyArrType)
+				out.WriteString("))), true)")
 			}
 			i = j
 		} else {
@@ -441,25 +449,26 @@ func (b *DorisSQLBackend) GetDocByID(ctx context.Context, dbName, table, id stri
 	hasRow := false
 	for rows.Next() {
 		var h HitRow
-		var srcStr string
+		var nullSrc sql.NullString
 		var delSign sql.NullInt64
 		if len(cols) >= 4 {
-			if err := rows.Scan(&h.ID, &h.Version, &srcStr, &delSign); err != nil {
+			if err := rows.Scan(&h.ID, &h.Version, &nullSrc, &delSign); err != nil {
 				return nil, false, err
 			}
 		} else {
-			if err := rows.Scan(&h.ID, &h.Version, &srcStr); err != nil {
+			if err := rows.Scan(&h.ID, &h.Version, &nullSrc); err != nil {
 				return nil, false, err
 			}
 		}
 		if hasRow && h.Version < best.Version {
 			continue
 		}
+		srcStr := nullSrc.String
 		hasRow = true
 		best = h
 		best.Source = json.RawMessage(srcStr)
 		best.Score = 1.0
-		bestDeleted = (delSign.Valid && delSign.Int64 != 0) || strings.TrimSpace(srcStr) == ""
+		bestDeleted = (delSign.Valid && delSign.Int64 != 0) || !nullSrc.Valid || strings.TrimSpace(srcStr) == ""
 	}
 	if err := rows.Err(); err != nil {
 		return nil, false, err
@@ -513,14 +522,14 @@ func (b *DorisSQLBackend) GetDocsByIDs(ctx context.Context, dbName, table string
 	maxVer := make(map[string]int64, len(ids))
 	for rows.Next() {
 		var h HitRow
-		var srcStr string
+		var nullSrc sql.NullString
 		var delSign sql.NullInt64
 		if len(cols) >= 4 {
-			if err := rows.Scan(&h.ID, &h.Version, &srcStr, &delSign); err != nil {
+			if err := rows.Scan(&h.ID, &h.Version, &nullSrc, &delSign); err != nil {
 				return nil, err
 			}
 		} else {
-			if err := rows.Scan(&h.ID, &h.Version, &srcStr); err != nil {
+			if err := rows.Scan(&h.ID, &h.Version, &nullSrc); err != nil {
 				return nil, err
 			}
 		}
@@ -528,7 +537,8 @@ func (b *DorisSQLBackend) GetDocsByIDs(ctx context.Context, dbName, table string
 			continue
 		}
 		maxVer[h.ID] = h.Version
-		if (delSign.Valid && delSign.Int64 != 0) || strings.TrimSpace(srcStr) == "" {
+		srcStr := nullSrc.String
+		if (delSign.Valid && delSign.Int64 != 0) || !nullSrc.Valid || strings.TrimSpace(srcStr) == "" {
 			delete(out, h.ID)
 			continue
 		}

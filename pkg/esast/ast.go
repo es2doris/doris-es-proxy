@@ -41,31 +41,32 @@ func NextAutoID() string {
 
 // SearchRequest models an Elasticsearch / OpenSearch `/_search` request payload.
 type SearchRequest struct {
-	Query          *Query                 `json:"query,omitempty"`
-	AliasFilter    *Query                 `json:"-"`
-	Routing        string                 `json:"-"`
-	KNN            KNNSlice               `json:"knn,omitempty"`
-	PostFilter     *Query                 `json:"post_filter,omitempty"`
-	From           *int                   `json:"from,omitempty"`
-	Size           *int                   `json:"size,omitempty"`
-	TerminateAfter *int                   `json:"terminate_after,omitempty"`
-	MinScore       *float64               `json:"min_score,omitempty"`
-	Aggs           map[string]AggSpec     `json:"aggs,omitempty"`
-	Aggregations   map[string]AggSpec     `json:"aggregations,omitempty"`
-	Sort           SortSlice              `json:"sort,omitempty"`
-	SearchAfter    []any                  `json:"search_after,omitempty"`
-	Source         *SourceFilter          `json:"_source,omitempty"`
-	TrackTotalHits any                    `json:"track_total_hits,omitempty"`
-	TrackScores    *bool                  `json:"track_scores,omitempty"`
-	Highlight      *HighlightSpec         `json:"highlight,omitempty"`
-	Collapse       *CollapseSpec          `json:"collapse,omitempty"`
-	Rescore        RescoreSlice           `json:"rescore,omitempty"`
-	PIT            *PITSpec               `json:"pit,omitempty"`
-	Fields         []FieldRequestSpec     `json:"fields,omitempty"`
-	DocvalueFields []FieldRequestSpec     `json:"docvalue_fields,omitempty"`
-	StoredFields   any                    `json:"stored_fields,omitempty"`
-	ScriptFields   map[string]any         `json:"script_fields,omitempty"`
-	Suggest        map[string]SuggestSpec `json:"suggest,omitempty"`
+	Query           *Query                   `json:"query,omitempty"`
+	AliasFilter     *Query                   `json:"-"`
+	Routing         string                   `json:"-"`
+	KNN             KNNSlice                 `json:"knn,omitempty"`
+	PostFilter      *Query                   `json:"post_filter,omitempty"`
+	From            *int                     `json:"from,omitempty"`
+	Size            *int                     `json:"size,omitempty"`
+	TerminateAfter  *int                     `json:"terminate_after,omitempty"`
+	MinScore        *float64                 `json:"min_score,omitempty"`
+	Aggs            map[string]AggSpec       `json:"aggs,omitempty"`
+	Aggregations    map[string]AggSpec       `json:"aggregations,omitempty"`
+	Sort            SortSlice                `json:"sort,omitempty"`
+	SearchAfter     []any                    `json:"search_after,omitempty"`
+	Source          *SourceFilter            `json:"_source,omitempty"`
+	TrackTotalHits  any                      `json:"track_total_hits,omitempty"`
+	TrackScores     *bool                    `json:"track_scores,omitempty"`
+	Highlight       *HighlightSpec           `json:"highlight,omitempty"`
+	Collapse        *CollapseSpec            `json:"collapse,omitempty"`
+	Rescore         RescoreSlice             `json:"rescore,omitempty"`
+	PIT             *PITSpec                 `json:"pit,omitempty"`
+	Fields          []FieldRequestSpec       `json:"fields,omitempty"`
+	DocvalueFields  []FieldRequestSpec       `json:"docvalue_fields,omitempty"`
+	StoredFields    any                      `json:"stored_fields,omitempty"`
+	ScriptFields    map[string]any           `json:"script_fields,omitempty"`
+	RuntimeMappings map[string]FieldProperty `json:"runtime_mappings,omitempty"`
+	Suggest         map[string]SuggestSpec   `json:"suggest,omitempty"`
 }
 
 // SuggestSpec models an entry in a search request `suggest` map (`term`, `phrase`, `completion`, or global `text`).
@@ -827,10 +828,17 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
+	clauseCount := 0
 	for k := range raw {
 		if !knownQueryClauses[k] {
 			return fmt.Errorf("parsing_exception: unknown query clause [%s]", k)
 		}
+		if k != "_name" && k != "boost" {
+			clauseCount++
+		}
+	}
+	if clauseCount > 1 {
+		return fmt.Errorf("parsing_exception: query malformed, must not start with multiple query clauses")
 	}
 	if rawTopBoost, ok := raw["boost"]; ok {
 		if _, err := parseOptionalNonNegativeBoost(rawTopBoost); err != nil {
@@ -1066,6 +1074,26 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 			}
 		}
 	}
+	for _, check := range []struct {
+		key string
+		cnt int
+	}{
+		{"term", len(alias.Term)},
+		{"range", len(alias.Range)},
+		{"match", len(alias.Match)},
+		{"prefix", len(alias.Prefix)},
+		{"wildcard", len(alias.Wildcard)},
+		{"regexp", len(alias.Regexp)},
+		{"fuzzy", len(alias.Fuzzy)},
+		{"match_phrase", len(alias.MatchPhrase)},
+		{"match_phrase_prefix", len(alias.MatchPhrasePrefix)},
+		{"match_bool_prefix", len(alias.MatchBoolPrefix)},
+		{"terms_set", len(alias.TermsSet)},
+	} {
+		if _, ok := raw[check.key]; ok && check.cnt == 0 {
+			return fmt.Errorf("parsing_exception: [%s] query must specify at least one field", check.key)
+		}
+	}
 	*q = Query(alias)
 	return nil
 }
@@ -1256,6 +1284,9 @@ func (tq *TermsQuery) UnmarshalJSON(data []byte) error {
 		}
 		return fmt.Errorf("parsing_exception: [terms] query does not support scalar value for [%s]", k)
 	}
+	if len(tq.Fields)+len(tq.Lookups) == 0 {
+		return fmt.Errorf("parsing_exception: [terms] query must specify at least one field")
+	}
 	return nil
 }
 
@@ -1337,6 +1368,39 @@ func (f FuzzyEntry) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func isNonScalarOrNullValue(v any) bool {
+	if v == nil {
+		return true
+	}
+	switch v.(type) {
+	case []any, map[string]any:
+		return true
+	}
+	return false
+}
+
+func validateQueryOperator(op, clause string) error {
+	if op == "" {
+		return nil
+	}
+	lower := strings.ToLower(strings.TrimSpace(op))
+	if lower != "or" && lower != "and" {
+		return fmt.Errorf("parsing_exception: [%s] operator must be [or] or [and], got [%s]", clause, op)
+	}
+	return nil
+}
+
+func validateZeroTermsQuery(ztq, clause string) error {
+	if ztq == "" {
+		return nil
+	}
+	lower := strings.ToLower(strings.TrimSpace(ztq))
+	if lower != "none" && lower != "all" {
+		return fmt.Errorf("parsing_exception: [%s] unsupported zero_terms_query [%s]", clause, ztq)
+	}
+	return nil
+}
+
 func (f *FuzzyEntry) UnmarshalJSON(data []byte) error {
 	f.Boost = 1.0
 	f.HasBoost = false
@@ -1365,6 +1429,9 @@ func (f *FuzzyEntry) UnmarshalJSON(data []byte) error {
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
 		}
+		if isNonScalarOrNullValue(full.Value) {
+			return fmt.Errorf("parsing_exception: [fuzzy] query does not support non-scalar or null value")
+		}
 		ci, err := parseFlexibleBool(full.CaseInsensitive)
 		if err != nil {
 			return err
@@ -1384,7 +1451,13 @@ func (f *FuzzyEntry) UnmarshalJSON(data []byte) error {
 		}
 		return nil
 	}
-	return json.Unmarshal(trimmed, &f.Value)
+	if err := json.Unmarshal(trimmed, &f.Value); err != nil {
+		return err
+	}
+	if isNonScalarOrNullValue(f.Value) {
+		return fmt.Errorf("parsing_exception: [fuzzy] query does not support non-scalar or null value")
+	}
+	return nil
 }
 
 // CombinedFieldsQuery models an ES 8+ `combined_fields` query.
@@ -1402,15 +1475,40 @@ func (cfq *CombinedFieldsQuery) UnmarshalJSON(data []byte) error {
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return nil
 	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "query", "fields", "operator", "minimum_should_match", "zero_terms_query", "auto_generate_synonyms_phrase_query", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [combined_fields] unknown field [%s]", k)
+		}
+	}
 	type plain CombinedFieldsQuery
 	var raw struct {
 		plain
-		Fields any `json:"fields"`
+		Fields any             `json:"fields"`
+		Boost  json.RawMessage `json:"boost"`
 	}
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
 	*cfq = CombinedFieldsQuery(raw.plain)
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		cfq.Boost = b
+	}
+	if err := validateQueryOperator(cfq.Operator, "combined_fields"); err != nil {
+		return err
+	}
+	if err := validateZeroTermsQuery(cfq.ZeroTermsQuery, "combined_fields"); err != nil {
+		return err
+	}
 	if raw.Fields != nil {
 		fields, err := parseFlexibleStringSlice(raw.Fields)
 		if err != nil {
@@ -1427,6 +1525,58 @@ type ScriptScoreQuery struct {
 	Script   any      `json:"script,omitempty"`
 	MinScore *float64 `json:"min_score,omitempty"`
 	Boost    *float64 `json:"boost,omitempty"`
+}
+
+func (ssq *ScriptScoreQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "query", "script", "min_score", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [script_score] unknown field [%s]", k)
+		}
+	}
+	rawQuery, hasQuery := rawMap["query"]
+	if !hasQuery || len(bytes.TrimSpace(rawQuery)) == 0 || bytes.Equal(bytes.TrimSpace(rawQuery), []byte("null")) {
+		return fmt.Errorf("parsing_exception: [script_score] missing required [query] field")
+	}
+	rawScript, hasScript := rawMap["script"]
+	if !hasScript || len(bytes.TrimSpace(rawScript)) == 0 || bytes.Equal(bytes.TrimSpace(rawScript), []byte("null")) {
+		return fmt.Errorf("parsing_exception: [script_score] missing required [script] field")
+	}
+	var full struct {
+		Query    *Query          `json:"query"`
+		Script   any             `json:"script"`
+		MinScore json.RawMessage `json:"min_score"`
+		Boost    json.RawMessage `json:"boost"`
+	}
+	if err := json.Unmarshal(trimmed, &full); err != nil {
+		return err
+	}
+	ssq.Query = full.Query
+	ssq.Script = full.Script
+	if len(full.MinScore) > 0 {
+		ms, err := parseOptionalNonNegativeBoost(full.MinScore)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [script_score] min_score must be a non-negative number")
+		}
+		ssq.MinScore = ms
+	}
+	if len(full.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(full.Boost)
+		if err != nil {
+			return err
+		}
+		ssq.Boost = b
+	}
+	return nil
 }
 
 // ScriptQuery models an ES `script` filter query (`{"script": {"script": {...}}}`).
@@ -1448,14 +1598,41 @@ func (sq *ScriptQuery) UnmarshalJSON(data []byte) error {
 		sq.Script = s
 		return nil
 	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	_, hasInnerScript := rawMap["script"]
+	for k := range rawMap {
+		if hasInnerScript {
+			switch k {
+			case "script", "boost", "_name":
+			default:
+				return fmt.Errorf("parsing_exception: [script] unknown field [%s]", k)
+			}
+		} else {
+			switch k {
+			case "source", "inline", "id", "lang", "params", "options", "boost", "_name":
+			default:
+				return fmt.Errorf("parsing_exception: [script] unknown field [%s]", k)
+			}
+		}
+	}
+	if rawBoost, ok := rawMap["boost"]; ok {
+		b, err := parseOptionalNonNegativeBoost(rawBoost)
+		if err != nil {
+			return err
+		}
+		sq.Boost = b
+	}
 	var m map[string]any
 	if err := json.Unmarshal(trimmed, &m); err != nil {
 		return err
 	}
-	if b, ok := m["boost"].(float64); ok {
-		sq.Boost = &b
-	}
 	if inner, ok := m["script"]; ok {
+		if inner == nil {
+			return fmt.Errorf("parsing_exception: [script] script cannot be null")
+		}
 		sq.Script = inner
 	} else {
 		sq.Script = m
@@ -1578,6 +1755,9 @@ func (t *TermEntry) UnmarshalJSON(data []byte) error {
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
 		}
+		if isNonScalarOrNullValue(full.Value) {
+			return fmt.Errorf("parsing_exception: [term] query does not support non-scalar or null value")
+		}
 		ci, err := parseFlexibleBool(full.CaseInsensitive)
 		if err != nil {
 			return err
@@ -1596,7 +1776,13 @@ func (t *TermEntry) UnmarshalJSON(data []byte) error {
 		t.CaseInsensitive = ci
 		return nil
 	}
-	return json.Unmarshal(trimmed, &t.Value)
+	if err := json.Unmarshal(trimmed, &t.Value); err != nil {
+		return err
+	}
+	if isNonScalarOrNullValue(t.Value) {
+		return fmt.Errorf("parsing_exception: [term] query does not support non-scalar or null value")
+	}
+	return nil
 }
 
 type IdsQuery struct {
@@ -1787,11 +1973,14 @@ func (p *PrefixEntry) UnmarshalJSON(data []byte) error {
 		if err != nil {
 			return err
 		}
-		if full.Value != nil {
-			p.Value = fmt.Sprintf("%v", full.Value)
-		} else if full.Prefix != nil {
-			p.Value = fmt.Sprintf("%v", full.Prefix)
+		val := full.Value
+		if val == nil {
+			val = full.Prefix
 		}
+		if isNonScalarOrNullValue(val) {
+			return fmt.Errorf("parsing_exception: [prefix] query does not support non-scalar or null value")
+		}
+		p.Value = fmt.Sprintf("%v", val)
 		p.CaseInsensitive = ci
 		if len(full.Boost) > 0 {
 			b, err := parseOptionalNonNegativeBoost(full.Boost)
@@ -1809,9 +1998,10 @@ func (p *PrefixEntry) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
-	if raw != nil {
-		p.Value = fmt.Sprintf("%v", raw)
+	if isNonScalarOrNullValue(raw) {
+		return fmt.Errorf("parsing_exception: [prefix] query does not support non-scalar or null value")
 	}
+	p.Value = fmt.Sprintf("%v", raw)
 	return nil
 }
 
@@ -1873,11 +2063,14 @@ func (w *WildcardEntry) UnmarshalJSON(data []byte) error {
 		if err != nil {
 			return err
 		}
-		if full.Value != nil {
-			w.Value = fmt.Sprintf("%v", full.Value)
-		} else if full.Wildcard != nil {
-			w.Value = fmt.Sprintf("%v", full.Wildcard)
+		val := full.Value
+		if val == nil {
+			val = full.Wildcard
 		}
+		if isNonScalarOrNullValue(val) {
+			return fmt.Errorf("parsing_exception: [wildcard] query does not support non-scalar or null value")
+		}
+		w.Value = fmt.Sprintf("%v", val)
 		w.CaseInsensitive = ci
 		if len(full.Boost) > 0 {
 			b, err := parseOptionalNonNegativeBoost(full.Boost)
@@ -1895,9 +2088,10 @@ func (w *WildcardEntry) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
-	if raw != nil {
-		w.Value = fmt.Sprintf("%v", raw)
+	if isNonScalarOrNullValue(raw) {
+		return fmt.Errorf("parsing_exception: [wildcard] query does not support non-scalar or null value")
 	}
+	w.Value = fmt.Sprintf("%v", raw)
 	return nil
 }
 
@@ -1959,11 +2153,14 @@ func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
 		if err != nil {
 			return err
 		}
-		if full.Value != nil {
-			r.Value = fmt.Sprintf("%v", full.Value)
-		} else if full.Regexp != nil {
-			r.Value = fmt.Sprintf("%v", full.Regexp)
+		val := full.Value
+		if val == nil {
+			val = full.Regexp
 		}
+		if isNonScalarOrNullValue(val) {
+			return fmt.Errorf("parsing_exception: [regexp] query does not support non-scalar or null value")
+		}
+		r.Value = fmt.Sprintf("%v", val)
 		r.CaseInsensitive = ci
 		if len(full.Boost) > 0 {
 			b, err := parseOptionalNonNegativeBoost(full.Boost)
@@ -1981,9 +2178,10 @@ func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
-	if raw != nil {
-		r.Value = fmt.Sprintf("%v", raw)
+	if isNonScalarOrNullValue(raw) {
+		return fmt.Errorf("parsing_exception: [regexp] query does not support non-scalar or null value")
 	}
+	r.Value = fmt.Sprintf("%v", raw)
 	return nil
 }
 
@@ -2057,9 +2255,15 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
 		}
+		if isNonScalarOrNullValue(full.Query) {
+			return fmt.Errorf("parsing_exception: [match] query does not support non-scalar or null value")
+		}
 		m.Query = full.Query
 		if full.Operator != "" {
-			m.Operator = strings.ToLower(full.Operator)
+			if err := validateQueryOperator(full.Operator, "match"); err != nil {
+				return err
+			}
+			m.Operator = strings.ToLower(strings.TrimSpace(full.Operator))
 		}
 		if len(full.Boost) > 0 {
 			b, err := parseOptionalNonNegativeBoost(full.Boost)
@@ -2071,13 +2275,22 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 				m.HasBoost = true
 			}
 		}
+		if err := validateZeroTermsQuery(full.ZeroTermsQuery, "match"); err != nil {
+			return err
+		}
 		m.ZeroTermsQuery = full.ZeroTermsQuery
 		m.MinimumShouldMatch = full.MinimumShouldMatch
 		m.Fuzziness = full.Fuzziness
 		m.Lenient = full.Lenient
 		return nil
 	}
-	return json.Unmarshal(trimmed, &m.Query)
+	if err := json.Unmarshal(trimmed, &m.Query); err != nil {
+		return err
+	}
+	if isNonScalarOrNullValue(m.Query) {
+		return fmt.Errorf("parsing_exception: [match] query does not support non-scalar or null value")
+	}
+	return nil
 }
 
 type PhraseEntry struct {
@@ -2147,12 +2360,22 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
 		}
-		if full.Query != nil {
-			p.Query = fmt.Sprintf("%v", full.Query)
+		if isNonScalarOrNullValue(full.Query) {
+			return fmt.Errorf("parsing_exception: [match_phrase] query does not support non-scalar or null value")
+		}
+		p.Query = fmt.Sprintf("%v", full.Query)
+		if full.Slop < 0 {
+			return fmt.Errorf("parsing_exception: [match_phrase] slop must be non-negative, got [%d]", full.Slop)
 		}
 		p.Slop = full.Slop
-		p.Operator = strings.ToLower(full.Operator)
+		if err := validateQueryOperator(full.Operator, "match_phrase"); err != nil {
+			return err
+		}
+		p.Operator = strings.ToLower(strings.TrimSpace(full.Operator))
 		p.MinimumShouldMatch = full.MinimumShouldMatch
+		if err := validateZeroTermsQuery(full.ZeroTermsQuery, "match_phrase"); err != nil {
+			return err
+		}
 		p.ZeroTermsQuery = full.ZeroTermsQuery
 		p.Fuzziness = full.Fuzziness
 		if len(full.Boost) > 0 {
@@ -2171,9 +2394,10 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
-	if raw != nil {
-		p.Query = fmt.Sprintf("%v", raw)
+	if isNonScalarOrNullValue(raw) {
+		return fmt.Errorf("parsing_exception: [match_phrase] query does not support non-scalar or null value")
 	}
+	p.Query = fmt.Sprintf("%v", raw)
 	return nil
 }
 
@@ -2196,15 +2420,55 @@ func (mmq *MultiMatchQuery) UnmarshalJSON(data []byte) error {
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return nil
 	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "query", "fields", "type", "operator", "slop", "minimum_should_match", "tie_breaker",
+			"zero_terms_query", "fuzziness", "lenient", "boost", "analyzer", "prefix_length",
+			"max_expansions", "fuzzy_rewrite", "fuzzy_transpositions",
+			"auto_generate_synonyms_phrase_query", "cutoff_frequency", "rewrite", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [multi_match] unknown field [%s]", k)
+		}
+	}
 	type plain MultiMatchQuery
 	var raw struct {
 		plain
-		Fields any `json:"fields"`
+		Fields any             `json:"fields"`
+		Boost  json.RawMessage `json:"boost"`
 	}
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
 	*mmq = MultiMatchQuery(raw.plain)
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		mmq.Boost = b
+	}
+	switch strings.ToLower(strings.TrimSpace(mmq.Type)) {
+	case "", "best_fields", "most_fields", "cross_fields", "phrase", "phrase_prefix", "bool_prefix":
+		mmq.Type = strings.ToLower(strings.TrimSpace(mmq.Type))
+	default:
+		return fmt.Errorf("parsing_exception: [multi_match] unsupported type [%s]", mmq.Type)
+	}
+	if err := validateQueryOperator(mmq.Operator, "multi_match"); err != nil {
+		return err
+	}
+	if err := validateZeroTermsQuery(mmq.ZeroTermsQuery, "multi_match"); err != nil {
+		return err
+	}
+	if mmq.Slop < 0 {
+		return fmt.Errorf("parsing_exception: [multi_match] slop must be non-negative, got [%d]", mmq.Slop)
+	}
+	if mmq.TieBreaker != nil && (*mmq.TieBreaker < 0 || *mmq.TieBreaker > 1.0 || math.IsNaN(*mmq.TieBreaker)) {
+		return fmt.Errorf("parsing_exception: [multi_match] tie_breaker must be in [0.0, 1.0], got [%v]", *mmq.TieBreaker)
+	}
 	if raw.Fields != nil {
 		fields, err := parseFlexibleStringSlice(raw.Fields)
 		if err != nil {
@@ -2243,16 +2507,55 @@ func (qsq *QueryStringQuery) UnmarshalJSON(data []byte) error {
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return nil
 	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "query", "default_field", "fields", "default_operator", "operator", "minimum_should_match",
+			"quote_field_suffix", "quote_analyzer", "analyzer", "escape", "flags", "time_zone", "type",
+			"tie_breaker", "phrase_slop", "fuzziness", "fuzzy_transpositions", "fuzzy_max_expansions",
+			"fuzzy_prefix_length", "fuzzy_rewrite", "lenient", "zero_terms_query", "analyze_wildcard",
+			"allow_leading_wildcard", "auto_generate_synonyms_phrase_query", "enable_position_increments",
+			"max_determinized_states", "split_on_whitespace", "rewrite", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [query_string] unknown field [%s]", k)
+		}
+	}
 	type plain QueryStringQuery
 	var raw struct {
 		plain
-		Query  any `json:"query"`
-		Fields any `json:"fields"`
+		Query  any             `json:"query"`
+		Fields any             `json:"fields"`
+		Boost  json.RawMessage `json:"boost"`
 	}
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
 	*qsq = QueryStringQuery(raw.plain)
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		qsq.Boost = b
+	}
+	if err := validateQueryOperator(qsq.DefaultOperator, "query_string"); err != nil {
+		return err
+	}
+	if err := validateQueryOperator(qsq.Operator, "query_string"); err != nil {
+		return err
+	}
+	if err := validateZeroTermsQuery(qsq.ZeroTermsQuery, "query_string"); err != nil {
+		return err
+	}
+	if qsq.PhraseSlop < 0 {
+		return fmt.Errorf("parsing_exception: [query_string] phrase_slop must be non-negative, got [%d]", qsq.PhraseSlop)
+	}
+	if qsq.TieBreaker != nil && (*qsq.TieBreaker < 0 || *qsq.TieBreaker > 1.0 || math.IsNaN(*qsq.TieBreaker)) {
+		return fmt.Errorf("parsing_exception: [query_string] tie_breaker must be in [0.0, 1.0], got [%v]", *qsq.TieBreaker)
+	}
 	if raw.Query != nil {
 		qsq.Query = formatFlexibleScalarString(raw.Query)
 	}
@@ -2337,8 +2640,6 @@ var knownAggTypeKeys = map[string]bool{
 	"missing":                   true,
 	"nested":                    true,
 	"reverse_nested":            true,
-	"children":                  true,
-	"parent":                    true,
 	"global":                    true,
 	"sampler":                   true,
 	"diversified_sampler":       true,
@@ -2353,11 +2654,11 @@ var knownAggTypeKeys = map[string]bool{
 	"stats":                     true,
 	"extended_stats":            true,
 	"matrix_stats":              true,
+	"t_test":                    true,
 	"string_stats":              true,
 	"boxplot":                   true,
 	"percentiles":               true,
 	"percentile_ranks":          true,
-	"t_test":                    true,
 	"top_hits":                  true,
 	"top_metrics":               true,
 	"rate":                      true,
@@ -2366,14 +2667,12 @@ var knownAggTypeKeys = map[string]bool{
 	"geo_distance":              true,
 	"geohash_grid":              true,
 	"geotile_grid":              true,
-	"geohex_grid":               true,
 	"bucket_sort":               true,
 	"cumulative_sum":            true,
 	"cumulative_cardinality":    true,
 	"derivative":                true,
 	"moving_avg":                true,
 	"moving_fn":                 true,
-	"moving_percentiles":        true,
 	"serial_diff":               true,
 	"normalize":                 true,
 	"avg_bucket":                true,
@@ -2385,66 +2684,201 @@ var knownAggTypeKeys = map[string]bool{
 	"percentiles_bucket":        true,
 	"bucket_selector":           true,
 	"bucket_script":             true,
-	"bucket_correlation":        true,
-	"bucket_count_ks_test":      true,
-	"inference":                 true,
 	"scripted_metric":           true,
 }
 
 // AggSpec represents an Elasticsearch aggregation definition.
 type AggSpec struct {
-	Terms                 *TermsAggSpec             `json:"terms,omitempty"`
-	SignificantTerms      *TermsAggSpec             `json:"significant_terms,omitempty"`
-	SignificantText       *TermsAggSpec             `json:"significant_text,omitempty"`
-	DateHistogram         *DateHistogramAggSpec     `json:"date_histogram,omitempty"`
-	Histogram             *HistogramAggSpec         `json:"histogram,omitempty"`
-	Range                 *RangeAggSpec             `json:"range,omitempty"`
-	DateRange             *RangeAggSpec             `json:"date_range,omitempty"`
-	IPRange               *RangeAggSpec             `json:"ip_range,omitempty"`
-	Composite             *CompositeAggSpec         `json:"composite,omitempty"`
-	Filter                *Query                    `json:"filter,omitempty"`
-	Filters               *FiltersAggSpec           `json:"filters,omitempty"`
-	Missing               *ExistsQuery              `json:"missing,omitempty"`
-	Nested                *NestedAggSpec            `json:"nested,omitempty"`
-	ReverseNested         map[string]any            `json:"reverse_nested,omitempty"`
-	Global                map[string]any            `json:"global,omitempty"`
-	Sampler               *SamplerAggSpec           `json:"sampler,omitempty"`
-	DiversifiedSampler    *SamplerAggSpec           `json:"diversified_sampler,omitempty"`
-	Cardinality           *MetricAggSpec            `json:"cardinality,omitempty"`
-	ValueCount            *MetricAggSpec            `json:"value_count,omitempty"`
-	Avg                   *MetricAggSpec            `json:"avg,omitempty"`
-	Sum                   *MetricAggSpec            `json:"sum,omitempty"`
-	Min                   *MetricAggSpec            `json:"min,omitempty"`
-	Max                   *MetricAggSpec            `json:"max,omitempty"`
-	Stats                 *MetricAggSpec            `json:"stats,omitempty"`
-	ExtendedStats         *MetricAggSpec            `json:"extended_stats,omitempty"`
-	StringStats           *MetricAggSpec            `json:"string_stats,omitempty"`
-	Boxplot               *MetricAggSpec            `json:"boxplot,omitempty"`
-	Percentiles           *PercentilesAggSpec       `json:"percentiles,omitempty"`
-	PercentileRanks       *PercentileRanksAggSpec   `json:"percentile_ranks,omitempty"`
-	TopHits               *TopHitsAggSpec           `json:"top_hits,omitempty"`
-	TopMetrics            *TopMetricsAggSpec        `json:"top_metrics,omitempty"`
-	Rate                  *RateAggSpec              `json:"rate,omitempty"`
-	BucketSort            *BucketSortAggSpec        `json:"bucket_sort,omitempty"`
-	CumulativeSum         *PipelineAggSpec          `json:"cumulative_sum,omitempty"`
-	CumulativeCardinality *PipelineAggSpec          `json:"cumulative_cardinality,omitempty"`
-	Derivative            *PipelineAggSpec          `json:"derivative,omitempty"`
-	MovingAvg             *MovingAvgAggSpec         `json:"moving_avg,omitempty"`
-	MovingFn              *MovingAvgAggSpec         `json:"moving_fn,omitempty"`
-	SerialDiff            *SerialDiffAggSpec        `json:"serial_diff,omitempty"`
-	Normalize             *NormalizeAggSpec         `json:"normalize,omitempty"`
-	AvgBucket             *PipelineAggSpec          `json:"avg_bucket,omitempty"`
-	SumBucket             *PipelineAggSpec          `json:"sum_bucket,omitempty"`
-	MinBucket             *PipelineAggSpec          `json:"min_bucket,omitempty"`
-	MaxBucket             *PipelineAggSpec          `json:"max_bucket,omitempty"`
-	StatsBucket           *PipelineAggSpec          `json:"stats_bucket,omitempty"`
-	ExtendedStatsBucket   *PipelineAggSpec          `json:"extended_stats_bucket,omitempty"`
-	PercentilesBucket     *PercentilesBucketAggSpec `json:"percentiles_bucket,omitempty"`
-	BucketSelector        *BucketSelectorAggSpec    `json:"bucket_selector,omitempty"`
-	BucketScript          *BucketSelectorAggSpec    `json:"bucket_script,omitempty"`
-	ScriptedMetric        *ScriptedMetricAggSpec    `json:"scripted_metric,omitempty"`
-	Aggs                  map[string]AggSpec        `json:"aggs,omitempty"`
-	Aggregations          map[string]AggSpec        `json:"aggregations,omitempty"`
+	Terms                   *TermsAggSpec                  `json:"terms,omitempty"`
+	RareTerms               *RareTermsAggSpec              `json:"rare_terms,omitempty"`
+	SignificantTerms        *TermsAggSpec                  `json:"significant_terms,omitempty"`
+	SignificantText         *TermsAggSpec                  `json:"significant_text,omitempty"`
+	DateHistogram           *DateHistogramAggSpec          `json:"date_histogram,omitempty"`
+	AutoDateHistogram       *AutoDateHistogramAggSpec      `json:"auto_date_histogram,omitempty"`
+	VariableWidthHistogram  *VariableWidthHistogramAggSpec `json:"variable_width_histogram,omitempty"`
+	Histogram               *HistogramAggSpec              `json:"histogram,omitempty"`
+	Range                   *RangeAggSpec                  `json:"range,omitempty"`
+	DateRange               *RangeAggSpec                  `json:"date_range,omitempty"`
+	IPRange                 *RangeAggSpec                  `json:"ip_range,omitempty"`
+	Composite               *CompositeAggSpec              `json:"composite,omitempty"`
+	Filter                  *Query                         `json:"filter,omitempty"`
+	Filters                 *FiltersAggSpec                `json:"filters,omitempty"`
+	AdjacencyMatrix         *AdjacencyMatrixAggSpec        `json:"adjacency_matrix,omitempty"`
+	Missing                 *ExistsQuery                   `json:"missing,omitempty"`
+	Nested                  *NestedAggSpec                 `json:"nested,omitempty"`
+	ReverseNested           map[string]any                 `json:"reverse_nested,omitempty"`
+	Global                  map[string]any                 `json:"global,omitempty"`
+	Sampler                 *SamplerAggSpec                `json:"sampler,omitempty"`
+	DiversifiedSampler      *SamplerAggSpec                `json:"diversified_sampler,omitempty"`
+	Cardinality             *MetricAggSpec                 `json:"cardinality,omitempty"`
+	ValueCount              *MetricAggSpec                 `json:"value_count,omitempty"`
+	Avg                     *MetricAggSpec                 `json:"avg,omitempty"`
+	WeightedAvg             *WeightedAvgAggSpec            `json:"weighted_avg,omitempty"`
+	Sum                     *MetricAggSpec                 `json:"sum,omitempty"`
+	Min                     *MetricAggSpec                 `json:"min,omitempty"`
+	Max                     *MetricAggSpec                 `json:"max,omitempty"`
+	MedianAbsoluteDeviation *MetricAggSpec                 `json:"median_absolute_deviation,omitempty"`
+	Stats                   *MetricAggSpec                 `json:"stats,omitempty"`
+	ExtendedStats           *MetricAggSpec                 `json:"extended_stats,omitempty"`
+	MatrixStats             *MatrixStatsAggSpec            `json:"matrix_stats,omitempty"`
+	TTest                   *TTestAggSpec                  `json:"t_test,omitempty"`
+	StringStats             *MetricAggSpec                 `json:"string_stats,omitempty"`
+	Boxplot                 *MetricAggSpec                 `json:"boxplot,omitempty"`
+	Percentiles             *PercentilesAggSpec            `json:"percentiles,omitempty"`
+	PercentileRanks         *PercentileRanksAggSpec        `json:"percentile_ranks,omitempty"`
+	TopHits                 *TopHitsAggSpec                `json:"top_hits,omitempty"`
+	TopMetrics              *TopMetricsAggSpec             `json:"top_metrics,omitempty"`
+	Rate                    *RateAggSpec                   `json:"rate,omitempty"`
+	GeoBounds               *GeoBoundsAggSpec              `json:"geo_bounds,omitempty"`
+	GeoCentroid             *MetricAggSpec                 `json:"geo_centroid,omitempty"`
+	GeoDistance             *GeoDistanceAggSpec            `json:"geo_distance,omitempty"`
+	GeohashGrid             *GeoGridAggSpec                `json:"geohash_grid,omitempty"`
+	GeotileGrid             *GeoGridAggSpec                `json:"geotile_grid,omitempty"`
+	BucketSort              *BucketSortAggSpec             `json:"bucket_sort,omitempty"`
+	CumulativeSum           *PipelineAggSpec               `json:"cumulative_sum,omitempty"`
+	CumulativeCardinality   *PipelineAggSpec               `json:"cumulative_cardinality,omitempty"`
+	Derivative              *PipelineAggSpec               `json:"derivative,omitempty"`
+	MovingAvg               *MovingAvgAggSpec              `json:"moving_avg,omitempty"`
+	MovingFn                *MovingAvgAggSpec              `json:"moving_fn,omitempty"`
+	SerialDiff              *SerialDiffAggSpec             `json:"serial_diff,omitempty"`
+	Normalize               *NormalizeAggSpec              `json:"normalize,omitempty"`
+	AvgBucket               *PipelineAggSpec               `json:"avg_bucket,omitempty"`
+	SumBucket               *PipelineAggSpec               `json:"sum_bucket,omitempty"`
+	MinBucket               *PipelineAggSpec               `json:"min_bucket,omitempty"`
+	MaxBucket               *PipelineAggSpec               `json:"max_bucket,omitempty"`
+	StatsBucket             *PipelineAggSpec               `json:"stats_bucket,omitempty"`
+	ExtendedStatsBucket     *PipelineAggSpec               `json:"extended_stats_bucket,omitempty"`
+	PercentilesBucket       *PercentilesBucketAggSpec      `json:"percentiles_bucket,omitempty"`
+	BucketSelector          *BucketSelectorAggSpec         `json:"bucket_selector,omitempty"`
+	BucketScript            *BucketSelectorAggSpec         `json:"bucket_script,omitempty"`
+	ScriptedMetric          *ScriptedMetricAggSpec         `json:"scripted_metric,omitempty"`
+	Aggs                    map[string]AggSpec             `json:"aggs,omitempty"`
+	Aggregations            map[string]AggSpec             `json:"aggregations,omitempty"`
+}
+
+// RareTermsAggSpec models an ES `rare_terms` bucket aggregation.
+type RareTermsAggSpec struct {
+	Field       string `json:"field"`
+	MaxDocCount *int   `json:"max_doc_count,omitempty"`
+	Include     any    `json:"include,omitempty"`
+	Exclude     any    `json:"exclude,omitempty"`
+	Missing     any    `json:"missing,omitempty"`
+}
+
+func (r *RareTermsAggSpec) EffectiveMaxDocCount() int {
+	if r != nil && r.MaxDocCount != nil && *r.MaxDocCount >= 0 {
+		return *r.MaxDocCount
+	}
+	return 1
+}
+
+// AutoDateHistogramAggSpec models an ES `auto_date_histogram` bucket aggregation.
+type AutoDateHistogramAggSpec struct {
+	Field           string `json:"field"`
+	Buckets         int    `json:"buckets,omitempty"`
+	Format          string `json:"format,omitempty"`
+	TimeZone        string `json:"time_zone,omitempty"`
+	MinimumInterval string `json:"minimum_interval,omitempty"`
+	Missing         any    `json:"missing,omitempty"`
+	Script          any    `json:"script,omitempty"`
+}
+
+func (a *AutoDateHistogramAggSpec) EffectiveBuckets() int {
+	if a != nil && a.Buckets > 0 {
+		return a.Buckets
+	}
+	return 10
+}
+
+// VariableWidthHistogramAggSpec models an ES `variable_width_histogram` bucket aggregation.
+type VariableWidthHistogramAggSpec struct {
+	Field         string `json:"field"`
+	Buckets       int    `json:"buckets,omitempty"`
+	InitialBuffer int    `json:"initial_buffer,omitempty"`
+	Missing       any    `json:"missing,omitempty"`
+	Script        any    `json:"script,omitempty"`
+}
+
+func (v *VariableWidthHistogramAggSpec) EffectiveBuckets() int {
+	if v != nil && v.Buckets > 0 {
+		return v.Buckets
+	}
+	return 10
+}
+
+// WeightedAvgFieldSpec models the `value` or `weight` field/script block in `weighted_avg`.
+type WeightedAvgFieldSpec struct {
+	Field   string `json:"field,omitempty"`
+	Missing any    `json:"missing,omitempty"`
+	Script  any    `json:"script,omitempty"`
+}
+
+// WeightedAvgAggSpec models an ES `weighted_avg` metric aggregation.
+type WeightedAvgAggSpec struct {
+	Value     WeightedAvgFieldSpec `json:"value"`
+	Weight    WeightedAvgFieldSpec `json:"weight"`
+	Format    string               `json:"format,omitempty"`
+	ValueType string               `json:"value_type,omitempty"`
+}
+
+// GeoBoundsAggSpec models an ES `geo_bounds` metric aggregation.
+type GeoBoundsAggSpec struct {
+	Field         string `json:"field"`
+	WrapLongitude *bool  `json:"wrap_longitude,omitempty"`
+}
+
+// GeoDistanceAggSpec models an ES `geo_distance` bucket aggregation.
+type GeoDistanceAggSpec struct {
+	Field        string           `json:"field"`
+	Origin       any              `json:"origin"`
+	Unit         string           `json:"unit,omitempty"`
+	DistanceType string           `json:"distance_type,omitempty"`
+	Keyed        bool             `json:"keyed,omitempty"`
+	Ranges       []RangeAggBucket `json:"ranges"`
+}
+
+// GeoGridAggSpec models an ES `geohash_grid` or `geotile_grid` bucket aggregation.
+type GeoGridAggSpec struct {
+	Field     string         `json:"field"`
+	Precision *int           `json:"precision,omitempty"`
+	Size      int            `json:"size,omitempty"`
+	ShardSize int            `json:"shard_size,omitempty"`
+	Bounds    map[string]any `json:"bounds,omitempty"`
+}
+
+// AdjacencyMatrixAggSpec models an ES `adjacency_matrix` bucket aggregation.
+type AdjacencyMatrixAggSpec struct {
+	Filters   map[string]Query `json:"filters"`
+	Separator string           `json:"separator,omitempty"`
+}
+
+func (a *AdjacencyMatrixAggSpec) EffectiveSeparator() string {
+	if a != nil && a.Separator != "" {
+		return a.Separator
+	}
+	return "&"
+}
+
+// MatrixStatsAggSpec models an ES `matrix_stats` metric aggregation.
+type MatrixStatsAggSpec struct {
+	Fields  []string           `json:"fields"`
+	Mode    string             `json:"mode,omitempty"`
+	Missing map[string]float64 `json:"missing,omitempty"`
+}
+
+// TTestSampleSpec models the `a` or `b` sample block in `t_test`.
+type TTestSampleSpec struct {
+	Field   string `json:"field,omitempty"`
+	Missing any    `json:"missing,omitempty"`
+	Script  any    `json:"script,omitempty"`
+	Filter  *Query `json:"filter,omitempty"`
+}
+
+// TTestAggSpec models an ES `t_test` metric aggregation.
+type TTestAggSpec struct {
+	A    TTestSampleSpec `json:"a"`
+	B    TTestSampleSpec `json:"b"`
+	Type string          `json:"type,omitempty"`
 }
 
 func (a *AggSpec) UnmarshalJSON(data []byte) error {
@@ -3960,17 +4394,22 @@ type RoutingMetaSpec struct {
 // MappingSpec models an Elasticsearch `_mapping` payload.
 type MappingSpec struct {
 	Dynamic    any                      `json:"dynamic,omitempty"`
+	Subobjects *bool                    `json:"subobjects,omitempty"`
 	Routing    *RoutingMetaSpec         `json:"_routing,omitempty"`
+	Runtime    map[string]FieldProperty `json:"runtime,omitempty"`
 	Properties map[string]FieldProperty `json:"properties,omitempty"`
 }
 
 type FieldProperty struct {
 	Type            string                   `json:"type,omitempty"`
 	Dynamic         any                      `json:"dynamic,omitempty"`
+	Subobjects      *bool                    `json:"subobjects,omitempty"`
 	Enabled         *bool                    `json:"enabled,omitempty"`
 	Index           *bool                    `json:"index,omitempty"`
 	DocValues       *bool                    `json:"doc_values,omitempty"`
 	Path            string                   `json:"path,omitempty"`
+	Value           any                      `json:"value,omitempty"`
+	Script          any                      `json:"script,omitempty"`
 	Analyzer        string                   `json:"analyzer,omitempty"`
 	SearchAnalyzer  string                   `json:"search_analyzer,omitempty"`
 	Normalizer      string                   `json:"normalizer,omitempty"`

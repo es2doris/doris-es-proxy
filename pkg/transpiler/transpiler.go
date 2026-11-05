@@ -372,7 +372,6 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 				mainQ.WhereSQL = fmt.Sprintf("((%s) AND (%s))", mainQ.WhereSQL, aliasWhere)
 				mainQ.SafeWhereSQL = fmt.Sprintf("((%s) AND (%s))", mainQ.EffectiveSafeWhere(), afCompiled.EffectiveSafeWhere())
 			}
-			mainQ.UsesFulltextMatch = mainQ.UsesFulltextMatch || afCompiled.UsesFulltextMatch
 		}
 	}
 
@@ -1061,7 +1060,7 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 			WhereSQL:          inner.WhereSQL,
 			SafeWhereSQL:      safeCond,
 			ScoreSQL:          scoreSQL,
-			UsesFulltextMatch: inner.UsesFulltextMatch,
+			UsesFulltextMatch: false,
 		}
 	case q.FunctionScore != nil:
 		return t.compileFunctionScore(q.FunctionScore, nctx)
@@ -1117,12 +1116,9 @@ func (t *Transpiler) compileKNN(kq *esast.KNNQuery, scoring bool, nctx *nestedCt
 	conds = append(conds, baseCond)
 	safeConds = append(safeConds, baseCond)
 	for i := range kq.Filter {
-		fc := t.CompileQuery(&kq.Filter[i], true, nctx)
+		fc := t.CompileQuery(&kq.Filter[i], false, nctx)
 		conds = append(conds, fmt.Sprintf("(%s)", fc.WhereSQL))
 		safeConds = append(safeConds, fmt.Sprintf("(%s)", fc.EffectiveSafeWhere()))
-		if fc.UsesFulltextMatch {
-			usesFT = true
-		}
 	}
 
 	distFn := "COSINE_DISTANCE"
@@ -1384,28 +1380,26 @@ func (t *Transpiler) compileBool(b *esast.BoolQuery, scoring bool, nctx *nestedC
 		safeConjuncts = append(safeConjuncts, fmt.Sprintf("(%s)", c.EffectiveSafeWhere()))
 		if scoring {
 			scoreTerms = append(scoreTerms, c.ScoreSQL)
+			usesFT = usesFT || c.UsesFulltextMatch
 		}
-		usesFT = usesFT || c.UsesFulltextMatch
 	}
 	for i := range b.Filter {
 		c := t.CompileQuery(&b.Filter[i], false, nctx)
 		conjuncts = append(conjuncts, fmt.Sprintf("(%s)", c.WhereSQL))
 		safeConjuncts = append(safeConjuncts, fmt.Sprintf("(%s)", c.EffectiveSafeWhere()))
-		usesFT = usesFT || c.UsesFulltextMatch
 	}
 	for i := range b.MustNot {
 		c := t.CompileQuery(&b.MustNot[i], false, nctx)
 		if queryContainsScript(&b.MustNot[i]) && (c.WhereSQL == "" || c.WhereSQL == "TRUE" || strings.Contains(c.WhereSQL, "(TRUE)")) {
 			continue
 		}
-		if c.UsesFulltextMatch {
+		if c.UsesFulltextMatch || strings.Contains(c.WhereSQL, "MATCH_") || strings.Contains(c.WhereSQL, "SEARCH(") {
 			// Doris BE does not allow MATCH_* inside COALESCE(...)
 			conjuncts = append(conjuncts, negateFulltextWhereSQL(c.WhereSQL))
 		} else {
 			conjuncts = append(conjuncts, fmt.Sprintf("NOT COALESCE(%s, FALSE)", c.WhereSQL))
 		}
 		safeConjuncts = append(safeConjuncts, fmt.Sprintf("NOT COALESCE(%s, FALSE)", c.EffectiveSafeWhere()))
-		usesFT = usesFT || c.UsesFulltextMatch
 	}
 	minShould := 0
 	if len(b.Should) > 0 {
@@ -1421,8 +1415,8 @@ func (t *Transpiler) compileBool(b *esast.BoolQuery, scoring bool, nctx *nestedC
 			safeDisjuncts = append(safeDisjuncts, fmt.Sprintf("(%s)", c.EffectiveSafeWhere()))
 			if scoring {
 				scoreTerms = append(scoreTerms, c.ScoreSQL)
+				shouldUsesFT = shouldUsesFT || c.UsesFulltextMatch
 			}
-			shouldUsesFT = shouldUsesFT || c.UsesFulltextMatch
 		}
 		minShould = parseMinShouldMatch(b.MinimumShouldMatch, len(b.Should), len(b.Must) == 0 && len(b.Filter) == 0)
 		if len(disjuncts) == 0 || minShould > len(disjuncts) {
@@ -2337,10 +2331,8 @@ func (t *Transpiler) compileScriptQuery(sq *esast.ScriptQuery, scoring bool, nct
 	whereSQL := "TRUE"
 	if sq != nil && sq.Script != nil {
 		t.checkScriptDocValues(sq.Script, nctx)
-		if nctx == nil {
-			if condSQL, ok := t.compileBooleanScriptComparison(sq.Script, nctx); ok && condSQL != "" {
-				whereSQL = condSQL
-			}
+		if condSQL, ok := t.compileBooleanScriptComparison(sq.Script, nctx); ok && condSQL != "" {
+			whereSQL = condSQL
 		}
 	}
 	scoreSQL := "1.0"
@@ -2383,6 +2375,12 @@ func (t *Transpiler) parseBooleanScriptCond(s string, params map[string]any, nct
 	if s == "" {
 		return "", false
 	}
+	if s == "true" {
+		return "TRUE", true
+	}
+	if s == "false" {
+		return "FALSE", true
+	}
 	for _, logOp := range []struct{ op, sqlOp string }{{"||", " OR "}, {"&&", " AND "}} {
 		if parts := splitTopLevelScriptToken(s, logOp.op); len(parts) > 1 {
 			var compiledParts []string
@@ -2403,12 +2401,35 @@ func (t *Transpiler) parseBooleanScriptCond(s string, params map[string]any, nct
 			t.checkFieldDocValues(resolved, b)
 			return t.compileExistsPredicate(field, nctx), true
 		}
+		if cp, ok := t.parseBooleanScriptCond(inner, params, nctx, depth+1); ok {
+			if cp == "TRUE" {
+				return "FALSE", true
+			}
+			if cp == "FALSE" {
+				return "TRUE", true
+			}
+			return fmt.Sprintf("NOT COALESCE(%s, FALSE)", cp), true
+		}
 		return "", false
 	}
 	if field, tail, ok := parseDocFieldAccess(s); ok && tail == ".empty" {
 		resolved, b := t.resolveFieldInNestedCtx(field, true, nctx)
 		t.checkFieldDocValues(resolved, b)
 		return fmt.Sprintf("NOT COALESCE(%s, FALSE)", t.compileExistsPredicate(field, nctx)), true
+	}
+	resolveBoolLit := func(raw string) (bool, bool) {
+		if raw == "true" {
+			return true, true
+		}
+		if raw == "false" {
+			return false, true
+		}
+		if strings.HasPrefix(raw, "params.") && params != nil {
+			if bv, ok := params[strings.TrimPrefix(raw, "params.")].(bool); ok {
+				return bv, true
+			}
+		}
+		return false, false
 	}
 	for _, cmpOp := range []struct{ op, sqlOp string }{
 		{">=", ">="},
@@ -2424,6 +2445,31 @@ func (t *Transpiler) parseBooleanScriptCond(s string, params map[string]any, nct
 			if !t.scriptSideUsesOnlyScalarOrSize(lhsRaw, nctx) || !t.scriptSideUsesOnlyScalarOrSize(rhsRaw, nctx) {
 				return "", false
 			}
+			if cmpOp.op == "==" || cmpOp.op == "!=" {
+				checkBoolFieldVsLit := func(fieldRaw, litRaw string) (string, bool) {
+					field, tail, okF := parseDocFieldAccess(fieldRaw)
+					bv, okB := resolveBoolLit(litRaw)
+					if !okF || (tail != "" && tail != ".value") || !okB || t.Schema == nil {
+						return "", false
+					}
+					resolved, b := t.resolveFieldInNestedCtx(field, true, nctx)
+					if effectiveDorisScalarType(b) != schema.DorisBoolean {
+						return "", false
+					}
+					t.checkFieldDocValues(resolved, b)
+					target := bv
+					if cmpOp.op == "!=" {
+						target = !bv
+					}
+					return t.compileTermPredicate(field, target, false, nctx), true
+				}
+				if cond, ok := checkBoolFieldVsLit(lhsRaw, rhsRaw); ok {
+					return cond, true
+				}
+				if cond, ok := checkBoolFieldVsLit(rhsRaw, lhsRaw); ok {
+					return cond, true
+				}
+			}
 			if strL, isStrL, okL := t.parseStringScriptExpr(lhsRaw, params, "", "", nctx, 0); okL {
 				if strR, isStrR, okR := t.parseStringScriptExpr(rhsRaw, params, "", "", nctx, 0); okR && (isStrL || isStrR) {
 					return fmt.Sprintf("(%s %s %s)", strL, cmpOp.sqlOp, strR), true
@@ -2435,6 +2481,21 @@ func (t *Transpiler) parseBooleanScriptCond(s string, params map[string]any, nct
 				return fmt.Sprintf("(%s %s %s)", numL, cmpOp.sqlOp, numR), true
 			}
 			return "", false
+		}
+	}
+	if bv, ok := resolveBoolLit(s); ok {
+		if bv {
+			return "TRUE", true
+		}
+		return "FALSE", true
+	}
+	if field, tail, ok := parseDocFieldAccess(s); ok && (tail == "" || tail == ".value") {
+		if t.Schema != nil && t.scriptSideUsesOnlyScalarOrSize(s, nctx) {
+			resolved, b := t.resolveFieldInNestedCtx(field, true, nctx)
+			if effectiveDorisScalarType(b) == schema.DorisBoolean {
+				t.checkFieldDocValues(resolved, b)
+				return t.compileTermPredicate(field, true, false, nctx), true
+			}
 		}
 	}
 	return "", false
@@ -2455,7 +2516,7 @@ func (t *Transpiler) scriptSideUsesOnlyScalarOrSize(expr string, nctx *nestedCtx
 		if !strings.HasPrefix(tail, ".size()") && !strings.HasPrefix(tail, ".length") && !strings.HasPrefix(tail, ".empty") {
 			if t.Schema != nil {
 				_, b := t.resolveFieldInNestedCtx(field, true, nctx)
-				if b.IsMultiValued || b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield || b.Kind == schema.StoragePromotedVector {
+				if b.IsMultiValued || b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath)) || b.Kind == schema.StoragePromotedVector {
 					return false
 				}
 			}
@@ -3036,6 +3097,11 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 				return fmt.Sprintf("(%s >= %d AND %s <= %d)", numCol, startNum, numCol, endNum)
 			}
 		}
+		ip := net.ParseIP(strings.TrimSpace(fmt.Sprintf("%v", val)))
+		if ip == nil {
+			return "FALSE"
+		}
+		val = ip.String()
 	}
 	if b.ESType == "text" && b.KeywordCompanion == "" && !strings.HasSuffix(field, ".keyword") {
 		if _, isBool := val.(bool); isBool {
@@ -3056,6 +3122,10 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 		} else if b.ESType == "date" || b.ESType == "date_nanos" || (b.ESType == "" && effDT == schema.DorisBigInt) {
 			if ms, ok := schema.ParseESDateWithFormatToEpochMillis(strVal, b.Format, time.Now().UTC()); ok {
 				val = ms
+			} else if iv, err := strconv.ParseInt(strings.TrimSpace(strVal), 10, 64); err == nil {
+				val = iv
+			} else if b.ESType == "date" || b.ESType == "date_nanos" {
+				return "FALSE"
 			}
 		} else if effDT == schema.DorisBigInt || effDT == schema.DorisInt {
 			if iv, err := strconv.ParseInt(strings.TrimSpace(strVal), 10, 64); err == nil {
@@ -3222,6 +3292,10 @@ func (t *Transpiler) compileTermsPredicateWithCI(field string, vals []any, caseI
 			} else if b.ESType == "date" || b.ESType == "date_nanos" || (b.ESType == "" && effDT == schema.DorisBigInt) {
 				if ms, ok := schema.ParseESDateWithFormatToEpochMillis(strVal, b.Format, now); ok {
 					v = ms
+				} else if iv, err := strconv.ParseInt(strings.TrimSpace(strVal), 10, 64); err == nil {
+					v = iv
+				} else if b.ESType == "date" || b.ESType == "date_nanos" {
+					continue
 				}
 			} else if effDT == schema.DorisBigInt || effDT == schema.DorisInt {
 				if iv, err := strconv.ParseInt(strings.TrimSpace(strVal), 10, 64); err == nil {
@@ -3408,6 +3482,11 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 		return "FALSE"
 	}
 	if b.ESType == "ip" {
+		for _, cand := range []any{gt, gte, lt, lte} {
+			if cand != nil && net.ParseIP(strings.TrimSpace(fmt.Sprintf("%v", cand))) == nil {
+				return "FALSE"
+			}
+		}
 		isNestedMultiVal := nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued
 		if b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath)) || isNestedMultiVal {
 			colName := b.EffectiveArrayColumn(true)
@@ -3625,7 +3704,7 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 	lte = coerceBound(lte, true)
 
 	effDT := effectiveDorisScalarType(b)
-	if b.ESType != "" && b.ESType != "date" && b.ESType != "date_nanos" &&
+	if b.ESType != "" &&
 		(effDT == schema.DorisBigInt || effDT == schema.DorisInt || effDT == schema.DorisDouble) {
 		for _, cand := range []any{gt, gte, lt, lte} {
 			if _, isStr := cand.(string); isStr {
@@ -4070,13 +4149,24 @@ func (t *Transpiler) appendAggBranches(
 					if extraWhere != "" {
 						rnWhere = fmt.Sprintf("(%s) AND (%s)", extraWhere, rnWhere)
 					}
-					*branches = append(*branches, fmt.Sprintf(
-						"SELECT %s AS `_agg_name`, '_reverse_nested' AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
-							"FROM `base_matched` WHERE %s",
-						quoteStr(subFull), rnWhere,
-					))
-					if rnSubAggs := subSpec.SubAggs(); len(rnSubAggs) > 0 {
-						t.appendAggBranches(branches, subIdx, subFull, rnWhere, rnSubAggs)
+					rnPathRaw, _ := subSpec.ReverseNested["path"].(string)
+					rnPath := strings.TrimSpace(rnPathRaw)
+					if rnPath != "" && t.Schema != nil {
+						t.appendAggBranches(branches, subIdx, fullAggName, rnWhere, map[string]esast.AggSpec{
+							subName: {
+								Nested: &esast.NestedAggSpec{Path: rnPath},
+								Aggs:   subSpec.SubAggs(),
+							},
+						})
+					} else {
+						*branches = append(*branches, fmt.Sprintf(
+							"SELECT %s AS `_agg_name`, '_reverse_nested' AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+								"FROM `base_matched` WHERE %s",
+							quoteStr(subFull), rnWhere,
+						))
+						if rnSubAggs := subSpec.SubAggs(); len(rnSubAggs) > 0 {
+							t.appendAggBranches(branches, subIdx, subFull, rnWhere, rnSubAggs)
+						}
 					}
 				case subSpec.EffectiveTerms() != nil:
 					subTerms := subSpec.EffectiveTerms()
@@ -6312,12 +6402,13 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 				t.appendGroupedBucketSubAggsWithNested(branches, subIdx, subFull, parentBucketExpr, fromClause, whereClause, nctx, nestedSubs)
 			}
 		case subSpec.ReverseNested != nil:
-			*branches = append(*branches, fmt.Sprintf(
-				"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(DISTINCT `_id`) AS DOUBLE) AS `_doc_count` "+
-					"FROM %s WHERE %s GROUP BY `_bucket_key`",
-				quoteStr(subFull), parentBucketExpr, fromClause, whereClause,
-			))
-			if nestedSubs := subSpec.SubAggs(); len(nestedSubs) > 0 {
+			rnPathRaw, _ := subSpec.ReverseNested["path"].(string)
+			rnPath := strings.TrimSpace(rnPathRaw)
+			if rnPath != "" && t.Schema != nil {
+				rnCorrCol, ok := t.Schema.NestedRoots[rnPath]
+				if !ok {
+					rnCorrCol = "n__" + schema.SanitizeDorisIdentifier(rnPath)
+				}
 				rnFrom := fromClause
 				rnBucketExpr := parentBucketExpr
 				rnWhere := whereClause
@@ -6328,7 +6419,38 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					rnBucketExpr = fmt.Sprintf("`_rn_bkey_%d`", rnIdx)
 					rnWhere = "1=1"
 				}
-				t.appendGroupedBucketSubAggsWithNested(branches, subIdx, subFull, rnBucketExpr, rnFrom, rnWhere, nil, nestedSubs)
+				rnFromExploded := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) `_nt_rn` AS `_nel`", rnFrom, rnCorrCol)
+				rnWhereExploded := "`_nel` IS NOT NULL"
+				if rnWhere != "" && rnWhere != "1=1" {
+					rnWhereExploded = fmt.Sprintf("(%s) AND `_nel` IS NOT NULL", rnWhere)
+				}
+				*branches = append(*branches, fmt.Sprintf(
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(`_id`) AS DOUBLE) AS `_doc_count` "+
+						"FROM %s WHERE %s GROUP BY `_bucket_key`",
+					quoteStr(subFull), rnBucketExpr, rnFromExploded, rnWhereExploded,
+				))
+				if nestedSubs := subSpec.SubAggs(); len(nestedSubs) > 0 {
+					t.appendGroupedBucketSubAggsWithNested(branches, subIdx, subFull, rnBucketExpr, rnFromExploded, rnWhereExploded, &nestedCtx{nestedPath: rnPath, elemVar: "`_nel`"}, nestedSubs)
+				}
+			} else {
+				*branches = append(*branches, fmt.Sprintf(
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(DISTINCT `_id`) AS DOUBLE) AS `_doc_count` "+
+						"FROM %s WHERE %s GROUP BY `_bucket_key`",
+					quoteStr(subFull), parentBucketExpr, fromClause, whereClause,
+				))
+				if nestedSubs := subSpec.SubAggs(); len(nestedSubs) > 0 {
+					rnFrom := fromClause
+					rnBucketExpr := parentBucketExpr
+					rnWhere := whereClause
+					if fromClause != "`base_matched`" {
+						*subIdx++
+						rnIdx := *subIdx
+						rnFrom = fmt.Sprintf("`base_matched` INNER JOIN (SELECT DISTINCT `_id` AS `_rn_id_%d`, %s AS `_rn_bkey_%d` FROM %s WHERE %s) `_rn_dedup_%d` ON `base_matched`.`_id` = `_rn_dedup_%d`.`_rn_id_%d`", rnIdx, parentBucketExpr, rnIdx, fromClause, whereClause, rnIdx, rnIdx, rnIdx)
+						rnBucketExpr = fmt.Sprintf("`_rn_bkey_%d`", rnIdx)
+						rnWhere = "1=1"
+					}
+					t.appendGroupedBucketSubAggsWithNested(branches, subIdx, subFull, rnBucketExpr, rnFrom, rnWhere, nil, nestedSubs)
+				}
 			}
 		case subSpec.Filter != nil:
 			cond := t.CompileQuery(subSpec.Filter, false, nctx)

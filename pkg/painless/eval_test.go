@@ -1428,3 +1428,86 @@ func TestRound44PainlessEmptyMapUnderscoreLiteralsDottedKeysDocMetaAndUpdateRout
 		t.Fatalf("F35 expected updReq.MetaRouting='new-shard' and v=2, got routing=%q body=%s", updReq.MetaRouting, string(outBytes))
 	}
 }
+
+func TestRound45PainlessMultiCatchThrowStringSplitAndEmit(t *testing.T) {
+	// F26: Multiple catch blocks & typed exception matching + throw Statement
+	doc := map[string]any{"x": int64(10)}
+	res, err := Eval(doc, `
+		try {
+			throw new IllegalArgumentException("bad_arg");
+		} catch (NullPointerException e) {
+			return "caught_npe";
+		} catch (IllegalArgumentException e) {
+			return "caught_iae:" + e.getMessage();
+		}
+	`, nil)
+	if err != nil || res != "caught_iae:bad_arg" {
+		t.Fatalf("F26 expected 'caught_iae:bad_arg', got %v (err=%v)", res, err)
+	}
+
+	// F26: Multi-exception pipe syntax catch (ArithmeticException | NullPointerException e)
+	resPipe, err := Eval(doc, `
+		try {
+			throw new NullPointerException("missing_ref");
+		} catch (IllegalArgumentException e) {
+			return "wrong";
+		} catch (ArithmeticException | NullPointerException e) {
+			return "multi:" + e.getMessage();
+		}
+	`, nil)
+	if err != nil || resPipe != "multi:missing_ref" {
+		t.Fatalf("F26 expected 'multi:missing_ref', got %v (err=%v)", resPipe, err)
+	}
+
+	// F27: Java String.split(regex) strips trailing empty strings while split(regex, -1) preserves them, and splitOnToken works
+	resSplitDefault, err := Eval(doc, `"a,b,c,,".split(",").length`, nil)
+	if err != nil || resSplitDefault != int64(3) {
+		t.Fatalf("F27 expected default split length 3 (trailing empties stripped), got %v (err=%v)", resSplitDefault, err)
+	}
+	resSplitNeg, err := Eval(doc, `"a,b,c,,".split(",", -1).length`, nil)
+	if err != nil || resSplitNeg != int64(5) {
+		t.Fatalf("F27 expected split(_, -1) length 5, got %v (err=%v)", resSplitNeg, err)
+	}
+	resSplitLim, err := Eval(doc, `"a,b,c".split(",", 2).length`, nil)
+	if err != nil || resSplitLim != int64(2) {
+		t.Fatalf("F27 expected split(_, 2) length 2, got %v (err=%v)", resSplitLim, err)
+	}
+	resSplitTok, err := Eval(doc, `"a..b".splitOnToken(".").length`, nil)
+	if err != nil || resSplitTok != int64(3) {
+		t.Fatalf("F27 expected splitOnToken length 3, got %v (err=%v)", resSplitTok, err)
+	}
+
+	// F28: Compound bitwise assignment &=, |=, ^= and shift assignment <<=, >>=, >>>= on map/nested properties
+	docBit := map[string]any{
+		"flags": int64(10),
+		"mask":  int64(5),
+		"sh":    int64(2),
+	}
+	if err := EvalPainless(docBit, `
+		ctx._source.flags |= ctx._source.mask;
+		ctx._source.flags &= 7;
+		ctx._source.flags ^= 1;
+		ctx._source.sh <<= 3;
+		ctx._source.sh >>= 1;
+	`, nil); err != nil {
+		t.Fatalf("F28 EvalPainless failed: %v", err)
+	}
+	// 10 | 5 = 15; 15 & 7 = 7; 7 ^ 1 = 6
+	if docBit["flags"] != int64(6) || docBit["sh"] != int64(8) {
+		t.Fatalf("F28 expected flags=6 and sh=8, got flags=%v sh=%v", docBit["flags"], docBit["sh"])
+	}
+
+	// Runtime field emit(...) accumulation
+	emitted, err := Eval(map[string]any{"tags": []any{"go", "doris"}}, `
+		for (def t : doc['tags'].values) {
+			emit(t.toUpperCase());
+		}
+	`, nil)
+	if err != nil {
+		t.Fatalf("emit(...) eval failed: %v", err)
+	}
+	emittedSlice, ok := emitted.([]any)
+	if !ok || len(emittedSlice) != 2 || emittedSlice[0] != "GO" || emittedSlice[1] != "DORIS" {
+		t.Fatalf("expected emitted slice [GO DORIS], got %#v", emitted)
+	}
+}

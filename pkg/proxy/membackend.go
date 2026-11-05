@@ -2680,6 +2680,18 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 		return res
 	}
 
+	if parts := splitTopLevelBinaryMath(expr, '%'); len(parts) >= 2 {
+		res := evalNumericExpr(row, parts[0])
+		for _, p := range parts[1:] {
+			denom := evalNumericExpr(row, p)
+			if denom == 0 {
+				return 0
+			}
+			res = math.Mod(res, denom)
+		}
+		return res
+	}
+
 	if strings.HasPrefix(expr, "-") {
 		return -evalNumericExpr(row, strings.TrimSpace(expr[1:]))
 	}
@@ -2768,7 +2780,7 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 		}
 	}
 
-	for _, fn := range []string{"GREATEST", "LEAST", "COALESCE", "POW", "LOG10", "LN", "SQRT", "FLOOR", "CEIL", "ROUND", "ABS"} {
+	for _, fn := range []string{"GREATEST", "LEAST", "COALESCE", "POW", "LOG10", "LN", "SQRT", "FLOOR", "CEIL", "ROUND", "TRUNCATE", "ABS"} {
 		if strings.HasPrefix(expr, fn+"(") && strings.HasSuffix(expr, ")") {
 			inner := expr[len(fn)+1 : len(expr)-1]
 			args := splitTopLevelArgs(inner)
@@ -2776,6 +2788,10 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 			case "POW":
 				if len(args) == 2 {
 					return math.Pow(evalNumericExpr(row, args[0]), evalNumericExpr(row, args[1]))
+				}
+			case "TRUNCATE":
+				if len(args) >= 1 {
+					return math.Trunc(evalNumericExpr(row, args[0]))
 				}
 			case "GREATEST":
 				maxVal := 0.0
@@ -3529,7 +3545,7 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		if strings.HasSuffix(colExpr, " AS STRING)") {
 			inner := colExpr[len("CAST(") : len(colExpr)-len(" AS STRING)")]
 			if v := resolveColumnValue(row, inner); v != nil {
-				switch v.(type) {
+				switch tv := v.(type) {
 				case []any, []string:
 					var out []any
 					for _, elem := range asSliceOrSingle(v) {
@@ -3541,6 +3557,11 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 						return nil
 					}
 					return out
+				case float64:
+					if isArithmeticSQLExpr(inner) && !math.IsNaN(tv) && !math.IsInf(tv, 0) && tv == math.Trunc(tv) {
+						return strconv.FormatInt(int64(tv), 10)
+					}
+					return fmt.Sprintf("%v", v)
 				default:
 					return fmt.Sprintf("%v", v)
 				}
@@ -3711,12 +3732,12 @@ func hasUnwrappedNullColumnRef(row map[string]any, expr string) bool {
 
 func isArithmeticSQLExpr(expr string) bool {
 	trimmed := trimOuterParens(strings.TrimSpace(expr))
-	for _, fn := range []string{"CASE ", "ST_Distance_Sphere(", "GREATEST(", "LEAST(", "POW(", "LOG10(", "LN(", "SQRT(", "FLOOR(", "CEIL(", "ROUND(", "ABS("} {
+	for _, fn := range []string{"CASE ", "ST_Distance_Sphere(", "GREATEST(", "LEAST(", "POW(", "LOG10(", "LN(", "SQRT(", "FLOOR(", "CEIL(", "ROUND(", "TRUNCATE(", "ABS("} {
 		if strings.HasPrefix(trimmed, fn) {
 			return true
 		}
 	}
-	for _, op := range []byte{'+', '-', '*', '/'} {
+	for _, op := range []byte{'+', '-', '*', '/', '%'} {
 		if len(splitTopLevelBinaryMath(trimmed, op)) > 1 {
 			return true
 		}

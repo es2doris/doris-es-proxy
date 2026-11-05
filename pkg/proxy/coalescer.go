@@ -168,8 +168,8 @@ func (c *StreamLoadCoalescer) Submit(ctx context.Context, table string, ndjson [
 			sub.canceled = true
 			b.totalBytes -= len(sub.data)
 		}
-		c.mu.Unlock()
 		atomic.AddInt64(&b.activeWaiters, -1)
+		c.mu.Unlock()
 		return ctx.Err()
 	}
 }

@@ -2719,3 +2719,116 @@ func TestRound44TranspilerNestedMultiFieldLuceneRangeDateZoneDoris4SearchAndMinS
 		t.Fatalf("F13 expected min_score SQL pushdown skipped for nested scoring query, got:\n%s", planF13.HitsSQL)
 	}
 }
+
+func TestRound45TranspilerLuceneDateMathRangeBoostsAndNestedSort(t *testing.T) {
+	spec := esast.MappingSpec{
+		Dynamic: true,
+		Properties: map[string]esast.FieldProperty{
+			"title":      {Type: "text"},
+			"status":     {Type: "keyword"},
+			"age":        {Type: "integer"},
+			"created_at": {Type: "date"},
+			"items": {
+				Type: "nested",
+				Properties: map[string]esast.FieldProperty{
+					"price":  {Type: "double"},
+					"active": {Type: "boolean"},
+				},
+			},
+		},
+	}
+	sch := schema.CompileIndexSchema("db", "r45_tr_idx", &spec)
+	tr := NewTranspiler(sch, TranspilerOptions{})
+
+	// F10: Lucene query_string with date math inside range [2025-01-01T00:00:00Z||+1d/d TO 2025-01-10T00:00:00Z] and field:(...)^boost
+	var qsDateMath esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"query_string": {
+				"query": "created_at:[2025-01-01T00:00:00Z||+1d/d TO 2025-01-10T00:00:00Z] AND status:(open closed)^2.5"
+			}
+		}
+	}`), &qsDateMath); err != nil {
+		t.Fatalf("F10 unmarshal failed: %v", err)
+	}
+	cqF10 := tr.CompileQuery(qsDateMath.Query, true, nil)
+	// 2025-01-02T00:00:00Z in epoch millis is 1735776000000
+	if strings.Contains(cqF10.WhereSQL, "1=0") || !strings.Contains(cqF10.WhereSQL, "1735776000000") {
+		t.Fatalf("F10 expected date math resolved in Lucene range query, got WhereSQL=%s", cqF10.WhereSQL)
+	}
+	if !strings.Contains(cqF10.ScoreSQL, "2.5") {
+		t.Fatalf("F10 expected parenthesized group boost 2.5 in ScoreSQL, got ScoreSQL=%s", cqF10.ScoreSQL)
+	}
+
+	// F11: Range query on date field with time_zone offset and boost
+	var rangeTZ esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"range": {
+				"created_at": {
+					"gte": "2025-05-01T00:00:00",
+					"lt": "2025-05-02T00:00:00",
+					"time_zone": "+02:00",
+					"boost": 3.5
+				}
+			}
+		}
+	}`), &rangeTZ); err != nil {
+		t.Fatalf("F11 unmarshal failed: %v", err)
+	}
+	cqF11 := tr.CompileQuery(rangeTZ.Query, true, nil)
+	// 2025-05-01T00:00:00+02:00 is 2025-04-30T22:00:00Z = 1746050400000
+	if !strings.Contains(cqF11.WhereSQL, "1746050400000") {
+		t.Fatalf("F11 expected time_zone +02:00 shifted to UTC epoch 1746050400000, got WhereSQL=%s", cqF11.WhereSQL)
+	}
+	if !strings.Contains(cqF11.ScoreSQL, "3.5") {
+		t.Fatalf("F11 expected range boost 3.5 in ScoreSQL, got ScoreSQL=%s", cqF11.ScoreSQL)
+	}
+
+	// F12: Boost propagation for prefix, wildcard, regexp, fuzzy, terms, exists, ids
+	for _, qJSON := range []string{
+		`{"query": {"prefix": {"status": {"value": "ac", "boost": 4.25}}}}`,
+		`{"query": {"wildcard": {"status": {"value": "ac*", "boost": 4.25}}}}`,
+		`{"query": {"regexp": {"status": {"value": "ac.*", "boost": 4.25}}}}`,
+		`{"query": {"fuzzy": {"status": {"value": "act", "boost": 4.25}}}}`,
+		`{"query": {"terms": {"status": ["a", "b"], "boost": 4.25}}}`,
+		`{"query": {"exists": {"field": "status", "boost": 4.25}}}`,
+		`{"query": {"ids": {"values": ["1", "2"], "boost": 4.25}}}`,
+	} {
+		var req esast.SearchRequest
+		if err := json.Unmarshal([]byte(qJSON), &req); err != nil {
+			t.Fatalf("F12 unmarshal %s failed: %v", qJSON, err)
+		}
+		cq := tr.CompileQuery(req.Query, true, nil)
+		if !strings.Contains(cq.ScoreSQL, "4.25") {
+			t.Fatalf("F12 expected ScoreSQL to contain 4.25 for %s, got %s", qJSON, cq.ScoreSQL)
+		}
+	}
+
+	// F14: Nested sort with filter and max_children compiles without losing nested context
+	var nestedSortReq esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"sort": [
+			{
+				"items.price": {
+					"order": "asc",
+					"mode": "min",
+					"nested": {
+						"path": "items",
+						"max_children": 2,
+						"filter": {"term": {"items.active": true}}
+					}
+				}
+			}
+		]
+	}`), &nestedSortReq); err != nil {
+		t.Fatalf("F14 unmarshal nested sort failed: %v", err)
+	}
+	planF14, err := tr.BuildSearchPlan(&nestedSortReq)
+	if err != nil {
+		t.Fatalf("F14 BuildSearchPlan failed: %v", err)
+	}
+	if !strings.Contains(strings.ToUpper(planF14.HitsSQL), "ARRAY_MIN") {
+		t.Fatalf("F14 expected ARRAY_MIN in HitsSQL for nested sort mode min, got:\n%s", planF14.HitsSQL)
+	}
+}
