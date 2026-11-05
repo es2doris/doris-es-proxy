@@ -216,7 +216,9 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 					ScoreSQL:          compiled.ScoreSQL,
 					UsesFulltextMatch: true,
 				}
-			} else if t.isDoris4SearchableField(defaultField) && (t.Schema == nil || t.Schema.ResolveField(defaultField).DorisType != schema.DorisVarchar || (!strings.Contains(raw, `"`) && !strings.ContainsAny(raw, "+-") && (strings.Contains(raw, ":") || ((!t.Schema.ResolveField(defaultField).LowercaseNormalizer || strings.ToLower(raw) == raw) && !strings.ContainsAny(strings.TrimSpace(raw), " \t\n\r"))))) {
+			} else if t.isDoris4SearchableField(defaultField) &&
+				(t.Schema == nil || t.Schema.ResolveField(defaultField).IgnoreAbove <= 0 || len([]rune(strings.TrimSpace(raw))) <= t.Schema.ResolveField(defaultField).IgnoreAbove) &&
+				(t.Schema == nil || t.Schema.ResolveField(defaultField).DorisType != schema.DorisVarchar || (!strings.Contains(raw, `"`) && !strings.ContainsAny(raw, "+-") && (strings.Contains(raw, ":") || ((!t.Schema.ResolveField(defaultField).LowercaseNormalizer || strings.ToLower(raw) == raw) && !strings.ContainsAny(strings.TrimSpace(raw), " \t\n\r"))))) {
 				col := strings.Trim(t.sqlColumnRef(defaultField, false, nctx), "`")
 				pred := fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(rewrittenRaw), quoteStr(col), quoteStr(defaultOp))
 				return CompiledQuery{
@@ -1514,6 +1516,9 @@ func parseLuceneRangeBound(s string) any {
 	}
 	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
 		return i
+	}
+	if strings.Contains(s, ".") && strings.HasSuffix(s, "0") {
+		return s
 	}
 	if f, err := strconv.ParseFloat(s, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
 		return f

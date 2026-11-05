@@ -304,6 +304,7 @@ type evalBudget struct {
 	hasCtxRouting bool
 	ctxVersion    any
 	hasCtxVersion bool
+	emittedVals   []any
 	userFuncs     map[string]*painlessUserFunc
 }
 
@@ -518,6 +519,17 @@ func Eval(sourceMap map[string]any, scriptSource string, params map[string]any) 
 	}
 	if err != nil && !errors.Is(err, errPainlessReturn) {
 		return nil, err
+	}
+	if len(budget.emittedVals) > 0 {
+		if params != nil {
+			params["__emitted_vals"] = budget.emittedVals
+		}
+		if _, hasRet := evalParams["_return_val"]; !hasRet {
+			if len(budget.emittedVals) == 1 {
+				return budget.emittedVals[0], nil
+			}
+			return budget.emittedVals, nil
+		}
 	}
 	if retVal, hasRet := evalParams["_return_val"]; hasRet {
 		if params != nil {
@@ -2123,7 +2135,7 @@ func expandStmtTargetsOnly(stmt string, sourceMap, params map[string]any) string
 		return stmt
 	}
 	if opStart := findTopLevelAssignOpStartPainless(stmt); opStart > 0 {
-		lhs := strings.TrimSpace(expandDynamicBrackets(stmt[:opStart], sourceMap, params, 0))
+		lhs := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(expandDynamicBrackets(stmt[:opStart]+" =", sourceMap, params, 0)), "="))
 		for _, pfx := range []string{"params?._source?.", "params?._source.", "params._source?.", "params._source."} {
 			if strings.HasPrefix(lhs, pfx) {
 				lhs = "ctx._source." + strings.TrimPrefix(lhs, pfx)
@@ -3507,10 +3519,6 @@ func evalConditionDepth(sourceMap map[string]any, cond string, params map[string
 		rhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+2:]), params, depth+1)
 		return valuesEqual(lhs, rhs)
 	}
-	if strings.HasPrefix(cond, "!") && !strings.HasPrefix(cond, "!=") {
-		return !evalConditionDepth(sourceMap, cond[1:], params, depth+1)
-	}
-
 	if idx := findTopLevelOpPainless(cond, "==~"); idx > 0 {
 		lhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
 		rhsRaw := strings.TrimSpace(cond[idx+3:])
@@ -3530,6 +3538,19 @@ func evalConditionDepth(sourceMap map[string]any, cond string, params map[string
 			rhs, _ = evalRHSExprDepth(sourceMap, rhsRaw, params, depth+1)
 		}
 		return evalRegexMatchPainless(lhs, rhs, isRegexLit, false)
+	}
+	if idx := findTopLevelOpPainless(cond, "!~"); idx > 0 {
+		lhs, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
+		rhsRaw := strings.TrimSpace(cond[idx+2:])
+		isRegexLit := isRawRegexLiteralPainless(rhsRaw)
+		var rhs any = rhsRaw
+		if !isRegexLit {
+			rhs, _ = evalRHSExprDepth(sourceMap, rhsRaw, params, depth+1)
+		}
+		return !evalRegexMatchPainless(lhs, rhs, isRegexLit, false)
+	}
+	if strings.HasPrefix(cond, "!") && !strings.HasPrefix(cond, "!=") {
+		return !evalConditionDepth(sourceMap, cond[1:], params, depth+1)
 	}
 	for _, op := range []string{">=", "<=", ">", "<"} {
 		if idx := findTopLevelOpPainless(cond, op); idx > 0 {
@@ -3831,7 +3852,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 	for _, mSuffix := range []string{
 		".toLowerCase()", ".toUpperCase()", ".trim()", ".strip()", ".stripLeading()", ".stripTrailing()", ".isBlank()",
 		".length()", ".size()", ".keySet()", ".values()", ".entrySet()", ".getKey()", ".getValue()", ".getMessage()", ".toString()",
-		".getYear()", ".getMonthValue()", ".getMonth()", ".getDayOfMonth()", ".getDayOfYear()", ".getDate()", ".getHour()", ".getMinute()", ".getSecond()", ".getNano()",
+		".getYear()", ".getMonthValue()", ".getMonthOfYear()", ".getMonth()", ".getDayOfMonth()", ".getDayOfYear()", ".getDate()", ".getHour()", ".getHourOfDay()", ".getMinute()", ".getMinuteOfHour()", ".getSecond()", ".getSecondOfMinute()", ".getNano()",
 		".getDayOfWeek()", ".getDayOfWeekEnum()", ".getMillis()", ".toEpochMilli()", ".getEpochSecond()", ".toInstant()",
 		".find()", ".matches()", ".group()", ".groupCount()", ".start()", ".end()", ".reset()", ".pattern()",
 	} {
@@ -3879,12 +3900,12 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				return fmt.Sprintf("%v", recVal), nil
 			case ".toInstant()":
 				return recVal, nil
-			case ".getYear()", ".getMonthValue()", ".getMonth()", ".getDayOfMonth()", ".getDayOfYear()", ".getDate()", ".getHour()", ".getMinute()", ".getSecond()", ".getNano()", ".getDayOfWeek()", ".getDayOfWeekEnum()", ".getMillis()", ".toEpochMilli()", ".getEpochSecond()":
+			case ".getYear()", ".getMonthValue()", ".getMonthOfYear()", ".getMonth()", ".getDayOfMonth()", ".getDayOfYear()", ".getDate()", ".getHour()", ".getHourOfDay()", ".getMinute()", ".getMinuteOfHour()", ".getSecond()", ".getSecondOfMinute()", ".getNano()", ".getDayOfWeek()", ".getDayOfWeekEnum()", ".getMillis()", ".toEpochMilli()", ".getEpochSecond()":
 				if tm, ok := parsePainlessDateTime(recVal); ok {
 					switch mSuffix {
 					case ".getYear()":
 						return int64(tm.Year()), nil
-					case ".getMonthValue()":
+					case ".getMonthValue()", ".getMonthOfYear()":
 						return int64(tm.Month()), nil
 					case ".getMonth()":
 						return strings.ToUpper(tm.Month().String()), nil
@@ -3892,11 +3913,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						return int64(tm.Day()), nil
 					case ".getDayOfYear()":
 						return int64(tm.YearDay()), nil
-					case ".getHour()":
+					case ".getHour()", ".getHourOfDay()":
 						return int64(tm.Hour()), nil
-					case ".getMinute()":
+					case ".getMinute()", ".getMinuteOfHour()":
 						return int64(tm.Minute()), nil
-					case ".getSecond()":
+					case ".getSecond()", ".getSecondOfMinute()":
 						return int64(tm.Second()), nil
 					case ".getNano()":
 						return int64(tm.Nanosecond()), nil
@@ -5492,6 +5513,37 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		}
 		return ctxMap, nil
 	}
+	if strings.HasPrefix(rhs, "emit(") && findMatchingDelimiter(rhs, 4, '(', ')') == len(rhs)-1 {
+		argInner := strings.TrimSpace(rhs[5 : len(rhs)-1])
+		args := splitTopLevelCommaPainless(argInner)
+		if len(args) == 1 {
+			v, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			if v != nil {
+				b := getOrInitEvalBudget(params)
+				b.emittedVals = append(b.emittedVals, v)
+			}
+			return v, nil
+		} else if len(args) == 2 {
+			v1, err1 := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err1 != nil {
+				return nil, err1
+			}
+			v2, err2 := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+			if err2 != nil {
+				return nil, err2
+			}
+			if v1 != nil && v2 != nil {
+				combined := fmt.Sprintf("%v,%v", v1, v2)
+				b := getOrInitEvalBudget(params)
+				b.emittedVals = append(b.emittedVals, combined)
+				return combined, nil
+			}
+		}
+		return nil, nil
+	}
 	if rhs == "ctx._source" || rhs == "ctx?._source" || rhs == "ctx._source?" || rhs == "ctx?._source?" {
 		return sourceMap, nil
 	}
@@ -5509,6 +5561,49 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			return nil, nil
 		}
 		return resolveParamPath(sourceMap, path), nil
+	}
+	for _, dProp := range []string{
+		".year", ".monthValue", ".monthOfYear", ".month", ".dayOfMonth", ".dayOfYear", ".date",
+		".hour", ".hourOfDay", ".minute", ".minuteOfHour", ".second", ".secondOfMinute",
+		".nano", ".dayOfWeek", ".dayOfWeekEnum", ".millis",
+	} {
+		if strings.HasSuffix(rhs, dProp) {
+			recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:len(rhs)-len(dProp)], "?"))
+			if recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1); err == nil && recVal != nil {
+				if tm, ok := parsePainlessDateTime(recVal); ok {
+					switch dProp {
+					case ".year":
+						return int64(tm.Year()), nil
+					case ".monthValue", ".monthOfYear":
+						return int64(tm.Month()), nil
+					case ".month":
+						return strings.ToUpper(tm.Month().String()), nil
+					case ".dayOfMonth", ".date":
+						return int64(tm.Day()), nil
+					case ".dayOfYear":
+						return int64(tm.YearDay()), nil
+					case ".hour", ".hourOfDay":
+						return int64(tm.Hour()), nil
+					case ".minute", ".minuteOfHour":
+						return int64(tm.Minute()), nil
+					case ".second", ".secondOfMinute":
+						return int64(tm.Second()), nil
+					case ".nano":
+						return int64(tm.Nanosecond()), nil
+					case ".dayOfWeek":
+						dow := int64(tm.Weekday())
+						if dow == 0 {
+							dow = 7
+						}
+						return dow, nil
+					case ".dayOfWeekEnum":
+						return strings.ToUpper(tm.Weekday().String()), nil
+					case ".millis":
+						return tm.UnixMilli(), nil
+					}
+				}
+			}
+		}
 	}
 	if strings.HasPrefix(rhs, "doc.") || strings.HasPrefix(rhs, "doc?.") {
 		trimmed := strings.TrimPrefix(strings.TrimPrefix(rhs, "doc?."), "doc.")
@@ -6039,7 +6134,7 @@ func hasTopLevelBooleanOrRegexOp(s string) bool {
 	if len(splitTopLevelCondOp(s, "||")) > 1 || len(splitTopLevelCondOp(s, "&&")) > 1 {
 		return true
 	}
-	for _, op := range []string{"==~", "=~", "===", "!==", "==", "!=", ">=", "<=", ">", "<", " instanceof "} {
+	for _, op := range []string{"==~", "=~", "!~", "===", "!==", "==", "!=", ">=", "<=", ">", "<", " instanceof "} {
 		if findTopLevelOpPainless(s, op) > 0 {
 			return true
 		}
@@ -7851,15 +7946,26 @@ func normalizeJavaRegexReplacement(repl string) string {
 			}
 			continue
 		}
-		if repl[i] == '$' && i+1 < len(repl) && repl[i+1] >= '0' && repl[i+1] <= '9' {
-			j := i + 1
-			for j < len(repl) && repl[j] >= '0' && repl[j] <= '9' {
-				j++
+		if repl[i] == '$' {
+			if i+1 < len(repl) && repl[i+1] >= '0' && repl[i+1] <= '9' {
+				j := i + 1
+				for j < len(repl) && repl[j] >= '0' && repl[j] <= '9' {
+					j++
+				}
+				sb.WriteString("${")
+				sb.WriteString(repl[i+1 : j])
+				sb.WriteByte('}')
+				i = j - 1
+				continue
 			}
-			sb.WriteString("${")
-			sb.WriteString(repl[i+1 : j])
-			sb.WriteByte('}')
-			i = j - 1
+			if i+1 < len(repl) && repl[i+1] == '{' {
+				if closeRel := strings.IndexByte(repl[i+2:], '}'); closeRel > 0 {
+					sb.WriteString(repl[i : i+2+closeRel+1])
+					i += 2 + closeRel
+					continue
+				}
+			}
+			sb.WriteString("$$")
 			continue
 		}
 		sb.WriteByte(repl[i])

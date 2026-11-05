@@ -1405,3 +1405,84 @@ func TestRound44SchemaNestedCompatibilityPromoteTextAndShredderAllText(t *testin
 		t.Fatalf("F6 expected malformed object title removed from _doc, got %+v", docMap)
 	}
 }
+
+func TestRound45SchemaWildcardsNumericBoundsAndIgnoreMalformed(t *testing.T) {
+	ignoreMalformedTrue := true
+	ignoreMalformedFalse := false
+	spec := esast.MappingSpec{
+		Dynamic: true,
+		Runtime: map[string]esast.FieldProperty{
+			"computed_day": {
+				Type:   "keyword",
+				Script: map[string]any{"source": "emit('monday')"},
+			},
+		},
+		Properties: map[string]esast.FieldProperty{
+			"foo_123_bar_456_baz": {Type: "keyword"},
+			"b_val":               {Type: "byte"},
+			"s_val":               {Type: "short"},
+			"i_val":               {Type: "integer"},
+			"l_val":               {Type: "long"},
+			"u_val":               {Type: "unsigned_long"},
+			"f_bad":               {Type: "float", IgnoreMalformed: &ignoreMalformedFalse},
+			"f_ignore":            {Type: "float", IgnoreMalformed: &ignoreMalformedTrue},
+			"ip_ignore":           {Type: "ip", IgnoreMalformed: &ignoreMalformedTrue},
+			"ip_strict":           {Type: "ip", IgnoreMalformed: &ignoreMalformedFalse},
+			"items": {
+				Type: "nested",
+				Properties: map[string]esast.FieldProperty{
+					"qty": {Type: "integer", IgnoreMalformed: &ignoreMalformedTrue},
+				},
+			},
+		},
+	}
+	sch := CompileIndexSchema("db", "r45_schema_idx", &spec)
+
+	// F6: Multi-wildcard ExpandFieldPattern ("foo*bar*baz^2")
+	expanded := sch.ExpandFieldPattern("foo*bar*baz^2")
+	if len(expanded) != 1 || expanded[0].Field != "foo_123_bar_456_baz" || expanded[0].Boost != 2.0 {
+		t.Fatalf("F6 multi-wildcard ExpandFieldPattern failed: %+v", expanded)
+	}
+
+	// F7: Numeric bounds enforcement for byte, short, integer, long, unsigned_long
+	for _, tc := range []struct {
+		doc string
+		msg string
+	}{
+		{`{"b_val": 200}`, "mapper_parsing_exception"},
+		{`{"b_val": -200}`, "mapper_parsing_exception"},
+		{`{"s_val": 40000}`, "mapper_parsing_exception"},
+		{`{"i_val": 3000000000}`, "mapper_parsing_exception"},
+		{`{"u_val": -1}`, "mapper_parsing_exception"},
+		{`{"f_bad": "NaN"}`, "mapper_parsing_exception"},
+		{`{"f_bad": "Infinity"}`, "mapper_parsing_exception"},
+		{`{"ip_strict": "not-an-ip"}`, "mapper_parsing_exception"},
+	} {
+		if _, err := ShredDocument(sch, "1", 1, false, []byte(tc.doc)); err == nil || !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(tc.msg)) {
+			t.Fatalf("F7 expected error containing %q for %s, got %v", tc.msg, tc.doc, err)
+		}
+	}
+
+	// F8: Runtime mappings preserved in RawMapping
+	if sch.RawMapping == nil || len(sch.RawMapping.Runtime) != 1 || sch.RawMapping.Runtime["computed_day"].Type != "keyword" {
+		t.Fatalf("F8 expected Runtime preserved on RawMapping, got %+v", sch.RawMapping)
+	}
+
+	// F9: ignore_malformed on float ("NaN"), ip ("not-an-ip"), and nested subfields ("items.qty") drops malformed value cleanly
+	shredded, err := ShredDocument(sch, "2", 1, false, []byte(`{
+		"b_val": 120,
+		"f_ignore": "NaN",
+		"ip_ignore": "not-an-ip",
+		"items": [{"qty": "not-a-number"}, {"qty": 5}]
+	}`))
+	if err != nil {
+		t.Fatalf("F9 ShredDocument with ignore_malformed=true failed: %v", err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(shredded, &row); err != nil {
+		t.Fatalf("F9 unmarshal row failed: %v", err)
+	}
+	if row["f__f_ignore"] != nil || row["f__ip_ignore"] != nil {
+		t.Fatalf("F9 expected malformed f__f_ignore and f__ip_ignore to be nil, got f_ignore=%v ip_ignore=%v", row["f__f_ignore"], row["f__ip_ignore"])
+	}
+}

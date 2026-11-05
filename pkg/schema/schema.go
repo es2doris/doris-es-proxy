@@ -80,6 +80,7 @@ type FieldBinding struct {
 	IsMultiValued      bool
 	CopyTo             []string
 	NullValue          any
+	ConstantValue      any
 	IgnoreAbove        int
 	AliasTarget        string
 	ScalingFactor      float64
@@ -360,14 +361,18 @@ func MergeMappingSpecs(oldSpec, newSpec *esast.MappingSpec) *esast.MappingSpec {
 	if oldSpec == nil {
 		return &esast.MappingSpec{
 			Dynamic:    newSpec.Dynamic,
+			Subobjects: newSpec.Subobjects,
 			Routing:    newSpec.Routing,
+			Runtime:    DeepMergeMappingProperties(nil, newSpec.Runtime),
 			Properties: DeepMergeMappingProperties(nil, newSpec.Properties),
 		}
 	}
 	if newSpec == nil {
 		return &esast.MappingSpec{
 			Dynamic:    oldSpec.Dynamic,
+			Subobjects: oldSpec.Subobjects,
 			Routing:    oldSpec.Routing,
+			Runtime:    DeepMergeMappingProperties(nil, oldSpec.Runtime),
 			Properties: DeepMergeMappingProperties(nil, oldSpec.Properties),
 		}
 	}
@@ -375,13 +380,19 @@ func MergeMappingSpecs(oldSpec, newSpec *esast.MappingSpec) *esast.MappingSpec {
 	if newSpec.Dynamic != nil {
 		dyn = newSpec.Dynamic
 	}
+	subobj := oldSpec.Subobjects
+	if newSpec.Subobjects != nil {
+		subobj = newSpec.Subobjects
+	}
 	rt := oldSpec.Routing
 	if newSpec.Routing != nil {
 		rt = newSpec.Routing
 	}
 	return &esast.MappingSpec{
 		Dynamic:    dyn,
+		Subobjects: subobj,
 		Routing:    rt,
+		Runtime:    DeepMergeMappingProperties(oldSpec.Runtime, newSpec.Runtime),
 		Properties: DeepMergeMappingProperties(oldSpec.Properties, newSpec.Properties),
 	}
 }
@@ -549,6 +560,12 @@ func DeepMergeMappingProperties(
 			if v.NullValue != nil {
 				merged.NullValue = v.NullValue
 			}
+			if v.Value != nil {
+				merged.Value = v.Value
+			}
+			if v.Subobjects != nil {
+				merged.Subobjects = v.Subobjects
+			}
 			if v.IgnoreAbove > 0 {
 				merged.IgnoreAbove = v.IgnoreAbove
 			}
@@ -572,6 +589,9 @@ func DeepMergeMappingProperties(
 			}
 			if v.Dynamic != nil {
 				merged.Dynamic = v.Dynamic
+			}
+			if v.Script != nil {
+				merged.Script = v.Script
 			}
 			if len(v.Properties) > 0 {
 				merged.Properties = DeepMergeMappingProperties(existing.Properties, v.Properties)
@@ -763,6 +783,7 @@ func (s *IndexSchema) registerLeafField(
 			IsMultiValued:       prop.MultiValued || len(relJSONPath) > 1 || DefaultMultiValuedPaths[dotPath],
 			CopyTo:              copyTo,
 			NullValue:           prop.NullValue,
+			ConstantValue:       prop.Value,
 			IgnoreAbove:         prop.IgnoreAbove,
 			ScalingFactor:       prop.ScalingFactor,
 			Coerce:              prop.Coerce,
@@ -780,16 +801,17 @@ func (s *IndexSchema) registerLeafField(
 			metric = "cosine"
 		}
 		s.Fields[dotPath] = FieldBinding{
-			ESFieldPath:    dotPath,
-			SourceJSONPath: sourceJSONPath,
-			Kind:           StoragePromotedVector,
-			ColumnName:     colName,
-			DorisType:      DorisFloatArray,
-			ESType:         esType,
-			VectorDims:     prop.EffectiveDims(),
-			VectorMetric:   metric,
-			NotIndexed:     notIndexed,
-			DocValuesFalse: docValuesFalse,
+			ESFieldPath:     dotPath,
+			SourceJSONPath:  sourceJSONPath,
+			Kind:            StoragePromotedVector,
+			ColumnName:      colName,
+			DorisType:       DorisFloatArray,
+			ESType:          esType,
+			VectorDims:      prop.EffectiveDims(),
+			VectorMetric:    metric,
+			IgnoreMalformed: prop.IgnoreMalformed,
+			NotIndexed:      notIndexed,
+			DocValuesFalse:  docValuesFalse,
 		}
 		return
 	}
@@ -810,6 +832,7 @@ func (s *IndexSchema) registerLeafField(
 			IsMultiValued:       true,
 			CopyTo:              copyTo,
 			NullValue:           prop.NullValue,
+			ConstantValue:       prop.Value,
 			IgnoreAbove:         prop.IgnoreAbove,
 			ScalingFactor:       prop.ScalingFactor,
 			Coerce:              prop.Coerce,
@@ -832,6 +855,7 @@ func (s *IndexSchema) registerLeafField(
 		LowercaseNormalizer: lowerNorm,
 		CopyTo:              copyTo,
 		NullValue:           prop.NullValue,
+		ConstantValue:       prop.Value,
 		IgnoreAbove:         prop.IgnoreAbove,
 		ScalingFactor:       prop.ScalingFactor,
 		Coerce:              prop.Coerce,
