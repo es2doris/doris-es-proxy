@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/es2doris/doris-es-proxy/pkg/esast"
 	"github.com/es2doris/doris-es-proxy/pkg/transpiler"
 )
 
@@ -422,5 +423,334 @@ func TestRound45FilterPathCoalescerStreamLoadMembackendAndIngest(t *testing.T) {
 	srv.Handler().ServeHTTP(recDBQ, reqDBQ)
 	if recDBQ.Code != http.StatusNotFound {
 		t.Fatalf("F35 expected 404 index_not_found_exception for _delete_by_query with wildcard and expand_wildcards=none, got %d: %s", recDBQ.Code, recDBQ.Body.String())
+	}
+
+	// Additional coverage for t_test (homoscedastic, heteroscedastic, filters), geo_grid bounds (top_left/bottom_right, top_right/bottom_left, top/left/bottom/right),
+	// geo_distance units (mi, yd, ft, in, cm, mm, nmi), rare_terms include/exclude + sub-aggs, runtime boxplot/string_stats/rate,
+	// runtime_mappings types (boolean, long, date, ip, geo_point, composite), network_direction, community_id, _terms_enum, and _field_caps.
+	doRound39JSON(t, srv, http.MethodPost, "/r45_misc/_search", `{
+		"size": 10,
+		"runtime_mappings": {
+			"rt_bool": {"type": "boolean", "script": {"source": "emit(true)"}},
+			"rt_long": {"type": "long", "script": {"source": "emit(42)"}},
+			"rt_date": {"type": "date", "script": {"source": "emit('2025-01-01T00:00:00Z')"}},
+			"rt_ip": {"type": "ip", "script": {"source": "emit('10.0.0.1')"}},
+			"rt_geo": {"type": "geo_point", "script": {"source": "emit('40.71,-74.00')"}},
+			"rt_comp": {
+				"type": "composite",
+				"script": {"source": "emit([name: 'alice'])"},
+				"fields": {"name": {"type": "keyword"}}
+			}
+		},
+		"fields": ["*"]
+	}`)
+
+	doRound39JSON(t, srv, http.MethodPut, "/r45_cov", `{
+		"mappings": {
+			"properties": {
+				"grp": {"type": "keyword"},
+				"a": {"type": "double"},
+				"b": {"type": "double"},
+				"ts": {"type": "date"},
+				"loc": {"type": "geo_point"}
+			}
+		}
+	}`)
+	for i, d := range []string{
+		`{"grp": "g1", "a": 10.0, "b": 12.0, "ts": "2025-01-01T00:00:00Z", "loc": {"lat": 40.71, "lon": -74.00}}`,
+		`{"grp": "g1", "a": 20.0, "b": 25.0, "ts": "2025-01-01T01:00:00Z", "loc": {"lat": 34.05, "lon": -118.24}}`,
+		`{"grp": "g2", "a": 15.0, "b": 30.0, "ts": "2025-02-01T00:00:00Z", "loc": {"lat": 41.87, "lon": 170.00}}`,
+		`{"grp": "g2", "a": 35.0, "b": 45.0, "ts": "2026-01-01T00:00:00Z", "loc": {"lat": 37.77, "lon": -170.00}}`,
+	} {
+		doRound39JSON(t, srv, http.MethodPut, fmt.Sprintf("/r45_cov/_doc/%d?refresh=true", i+1), d)
+	}
+
+	_, covAggRes := doRound39JSON(t, srv, http.MethodPost, "/r45_cov/_search", `{
+		"size": 0,
+		"aggs": {
+			"tt_homo": {
+				"t_test": {
+					"a": {"field": "a", "filter": {"term": {"grp": "g1"}}},
+					"b": {"field": "b", "filter": {"term": {"grp": "g2"}}},
+					"type": "homoscedastic"
+				}
+			},
+			"tt_hetero": {
+				"t_test": {
+					"a": {"field": "a"},
+					"b": {"field": "b"},
+					"type": "heteroscedastic"
+				}
+			},
+			"gh_tlbr": {
+				"geohash_grid": {
+					"field": "loc",
+					"precision": 3,
+					"size": 2,
+					"bounds": {
+						"top_left": {"lat": 50.0, "lon": -130.0},
+						"bottom_right": {"lat": 30.0, "lon": -70.0}
+					},
+					"aggs": {"avg_a": {"avg": {"field": "a"}}}
+				}
+			},
+			"gt_trbl": {
+				"geotile_grid": {
+					"field": "loc",
+					"precision": 4,
+					"bounds": {
+						"top_right": {"lat": 50.0, "lon": -70.0},
+						"bottom_left": {"lat": 30.0, "lon": -130.0}
+					}
+				}
+			},
+			"gh_box": {
+				"geohash_grid": {
+					"field": "loc",
+					"precision": 2,
+					"bounds": {"top": 50.0, "left": 160.0, "bottom": 30.0, "right": -160.0}
+				}
+			},
+			"gd_mi": {"geo_distance": {"field": "loc", "origin": "40.71,-74.00", "unit": "mi", "ranges": [{"to": 100}, {"from": 100}], "aggs": {"mx": {"max": {"field": "a"}}}}},
+			"gd_yd": {"geo_distance": {"field": "loc", "origin": "40.71,-74.00", "unit": "yd", "ranges": [{"to": 1000}]}},
+			"gd_ft": {"geo_distance": {"field": "loc", "origin": "40.71,-74.00", "unit": "ft", "ranges": [{"to": 1000}]}},
+			"gd_in": {"geo_distance": {"field": "loc", "origin": "40.71,-74.00", "unit": "in", "ranges": [{"to": 1000}]}},
+			"gd_cm": {"geo_distance": {"field": "loc", "origin": "40.71,-74.00", "unit": "cm", "ranges": [{"to": 1000}]}},
+			"gd_mm": {"geo_distance": {"field": "loc", "origin": "40.71,-74.00", "unit": "mm", "ranges": [{"to": 1000}]}},
+			"gd_nmi": {"geo_distance": {"field": "loc", "origin": "40.71,-74.00", "unit": "nmi", "ranges": [{"to": 1000}]}},
+			"rare_inc": {
+				"rare_terms": {
+					"field": "grp",
+					"max_doc_count": 2,
+					"include": "g.*",
+					"exclude": "none",
+					"aggs": {"min_a": {"min": {"field": "a"}}}
+				}
+			},
+			"adh_sub": {
+				"auto_date_histogram": {
+					"field": "ts",
+					"buckets": 3,
+					"minimum_interval": "day",
+					"aggs": {
+						"r_sum": {"rate": {"field": "a", "unit": "day", "mode": "sum"}},
+						"r_vc": {"rate": {"field": "a", "unit": "day", "mode": "value_count"}}
+					}
+				}
+			},
+			"vwh_sub": {
+				"variable_width_histogram": {
+					"field": "a",
+					"buckets": 2,
+					"aggs": {"sum_b": {"sum": {"field": "b"}}}
+				}
+			},
+			"script_terms": {
+				"terms": {
+					"script": {"source": "doc['grp'].value"}
+				},
+				"aggs": {
+					"bp": {"boxplot": {"field": "a"}},
+					"ss": {"string_stats": {"field": "grp"}},
+					"wavg_fmt": {
+						"weighted_avg": {
+							"value": {"field": "a"},
+							"weight": {"field": "b"},
+							"format": "0.00"
+						}
+					}
+				}
+			}
+		}
+	}`)
+	if covAggRes["aggregations"] == nil {
+		t.Fatalf("expected covAggRes aggregations, got %+v", covAggRes)
+	}
+
+	// Test network_direction and community_id ingest processors
+	doRound39JSON(t, srv, http.MethodPut, "/_ingest/pipeline/r45_net_pipe", `{
+		"processors": [
+			{
+				"network_direction": {
+					"source_ip": "src_ip",
+					"destination_ip": "dst_ip",
+					"target_field": "net_dir",
+					"internal_networks": ["private", "loopback", "link_local", "multicast", "198.51.100.0/24", "203.0.113.5"]
+				}
+			},
+			{
+				"community_id": {
+					"source_ip": "src_ip",
+					"destination_ip": "dst_ip",
+					"source_port": "src_port",
+					"destination_port": "dst_port",
+					"transport": "proto",
+					"icmp_type": "icmp_t",
+					"icmp_code": "icmp_c",
+					"target_field": "cid",
+					"seed": 1
+				}
+			}
+		]
+	}`)
+	_, netSim := doRound39JSON(t, srv, http.MethodPost, "/_ingest/pipeline/r45_net_pipe/_simulate", `{
+		"docs": [
+			{"_source": {"src_ip": "10.0.0.1", "dst_ip": "8.8.8.8", "src_port": 12345, "dst_port": 53, "proto": "udp"}},
+			{"_source": {"src_ip": "8.8.8.8", "dst_ip": "198.51.100.42", "src_port": 443, "dst_port": 54321, "proto": "tcp"}},
+			{"_source": {"src_ip": "127.0.0.1", "dst_ip": "169.254.1.1", "icmp_t": 8, "icmp_c": 0, "proto": "icmp"}},
+			{"_source": {"src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "icmp_t": 128, "icmp_c": 0, "proto": "icmpv6"}}
+		]
+	}`)
+	if len(netSim["docs"].([]any)) != 4 {
+		t.Fatalf("expected 4 simulated net docs, got %+v", netSim)
+	}
+
+	// Test _terms_enum and _field_caps with filters
+	_, teRes := doRound39JSON(t, srv, http.MethodPost, "/r45_cov/_terms_enum", `{
+		"field": "grp",
+		"string": "G",
+		"case_insensitive": true,
+		"size": 5,
+		"index_filter": {"range": {"a": {"gte": 10}}}
+	}`)
+	if len(teRes["terms"].([]any)) != 2 {
+		t.Fatalf("expected 2 terms from _terms_enum, got %+v", teRes)
+	}
+	_, fcRes := doRound39JSON(t, srv, http.MethodPost, "/r45_cov/_field_caps?fields=grp,a", `{
+		"index_filter": {"term": {"grp": "g1"}}
+	}`)
+	if fcRes["fields"] == nil {
+		t.Fatalf("expected fields in _field_caps, got %+v", fcRes)
+	}
+
+	// Test filter_path with ** wildcard
+	reqGlob := httptest.NewRequest(http.MethodPost, "/r45_cov/_search?filter_path=**.hits._id,-**._score", strings.NewReader(`{"size": 2}`))
+	reqGlob.Header.Set("Content-Type", "application/json")
+	recGlob := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(recGlob, reqGlob)
+	if recGlob.Code != http.StatusOK {
+		t.Fatalf("expected 200 for ** filter_path, got %d", recGlob.Code)
+	}
+}
+
+func TestRound45HelperAndTypedKeysPrefixCoverage(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		{`{"significant_text":{"field":"f"}}`, "significant_text"},
+		{`{"significant_terms":{"field":"f"}}`, "sterms"},
+		{`{"terms":{"field":"f"}}`, "sterms"},
+		{`{"date_histogram":{"field":"f"}}`, "date_histogram"},
+		{`{"histogram":{"field":"f","interval":10}}`, "histogram"},
+		{`{"date_range":{"field":"f"}}`, "date_range"},
+		{`{"ip_range":{"field":"f"}}`, "ip_range"},
+		{`{"range":{"field":"f"}}`, "range"},
+		{`{"filters":{}}`, "filters"},
+		{`{"filter":{"match_all":{}}}`, "filter"},
+		{`{"missing":{"field":"f"}}`, "missing"},
+		{`{"nested":{"path":"p"}}`, "nested"},
+		{`{"reverse_nested":{}}`, "reverse_nested"},
+		{`{"global":{}}`, "global"},
+		{`{"diversified_sampler":{"field":"f"}}`, "diversified_sampler"},
+		{`{"sampler":{}}`, "sampler"},
+		{`{"composite":{"sources":[{"s":{"terms":{"field":"f"}}}]}}`, "composite"},
+		{`{"avg":{"field":"f"}}`, "avg"},
+		{`{"sum":{"field":"f"}}`, "sum"},
+		{`{"min":{"field":"f"}}`, "min"},
+		{`{"max":{"field":"f"}}`, "max"},
+		{`{"value_count":{"field":"f"}}`, "value_count"},
+		{`{"cardinality":{"field":"f"}}`, "cardinality"},
+		{`{"extended_stats":{"field":"f"}}`, "extended_stats"},
+		{`{"stats":{"field":"f"}}`, "stats"},
+		{`{"string_stats":{"field":"f"}}`, "string_stats"},
+		{`{"percentiles":{"field":"f"}}`, "tdigest_percentiles"},
+		{`{"percentile_ranks":{"field":"f","values":[10]}}`, "tdigest_percentile_ranks"},
+		{`{"boxplot":{"field":"f"}}`, "boxplot"},
+		{`{"top_hits":{}}`, "top_hits"},
+		{`{"top_metrics":{"metrics":[{"field":"f"}],"sort":[{"f":"desc"}]}}`, "top_metrics"},
+		{`{"scripted_metric":{}}`, "scripted_metric"},
+		{`{"rate":{"field":"f"}}`, "rate"},
+		{`{"avg_bucket":{"buckets_path":"p"}}`, "avg_bucket"},
+		{`{"sum_bucket":{"buckets_path":"p"}}`, "sum_bucket"},
+		{`{"min_bucket":{"buckets_path":"p"}}`, "min_bucket"},
+		{`{"max_bucket":{"buckets_path":"p"}}`, "max_bucket"},
+		{`{"stats_bucket":{"buckets_path":"p"}}`, "stats_bucket"},
+		{`{"extended_stats_bucket":{"buckets_path":"p"}}`, "extended_stats_bucket"},
+		{`{"percentiles_bucket":{"buckets_path":"p"}}`, "percentiles_bucket"},
+		{`{"derivative":{"buckets_path":"p"}}`, "derivative"},
+		{`{"cumulative_cardinality":{"buckets_path":"p"}}`, "cumulative_cardinality"},
+		{`{"cumulative_sum":{"buckets_path":"p"}}`, "cumulative_sum"},
+		{`{"moving_avg":{"buckets_path":"p"}}`, "moving_avg"},
+		{`{"moving_fn":{"buckets_path":"p","window":5,"script":"1"}}`, "moving_fn"},
+		{`{"serial_diff":{"buckets_path":"p"}}`, "serial_diff"},
+		{`{"normalize":{"buckets_path":"p","method":" rescale_0_1"}}`, "normalize"},
+		{`{"bucket_script":{"buckets_path":{"a":"p"},"script":"params.a"}}`, "bucket_script"},
+		{`{"bucket_sort":{}}`, "bucket_sort"},
+		{`{"bucket_selector":{"buckets_path":{"a":"p"},"script":"params.a > 0"}}`, "bucket_selector"},
+	}
+	for _, tc := range cases {
+		var spec esast.AggSpec
+		if err := json.Unmarshal([]byte(tc.raw), &spec); err != nil {
+			t.Fatalf("unmarshal %s failed: %v", tc.raw, err)
+		}
+		if got := aggTypePrefix(spec); got != tc.want {
+			t.Fatalf("aggTypePrefix(%s) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+	if got := aggTypePrefix(esast.AggSpec{}); got != "agg" {
+		t.Fatalf("aggTypePrefix(empty) = %q, want agg", got)
+	}
+
+	if isTableNotFoundError(nil) || !isTableNotFoundError(fmt.Errorf("Unknown table 'foo'")) {
+		t.Fatalf("unexpected isTableNotFoundError result")
+	}
+	if isAllDigitsASCII("") || isAllDigitsASCII("12a") || !isAllDigitsASCII("12345") {
+		t.Fatalf("unexpected isAllDigitsASCII result")
+	}
+	if !jsonStructurallyEqual(json.RawMessage(`{"a":1,"b":2}`), json.RawMessage(`{"b": 2, "a": 1}`)) || jsonStructurallyEqual(json.RawMessage(`invalid`), json.RawMessage(`{}`)) {
+		t.Fatalf("unexpected jsonStructurallyEqual result")
+	}
+	if !enrichSingleSpecMatchesSingleValue([]any{"10.0.0.0/8"}, "10.1.2.3") ||
+		!enrichSingleSpecMatchesSingleValue(map[string]any{"gte": 10, "gt": 9, "lte": 20, "lt": 21}, 15) ||
+		enrichSingleSpecMatchesSingleValue(map[string]any{"gte": 10, "lte": 20}, 25) {
+		t.Fatalf("unexpected enrichSingleSpecMatchesSingleValue result")
+	}
+	ihMap := map[string]any{
+		"inner_hits": map[string]any{
+			"comments": map[string]any{
+				"hits": map[string]any{
+					"total": map[string]any{"value": int64(3)},
+				},
+			},
+		},
+	}
+	convertInnerHitsTotalToInt([]any{ihMap})
+	convertInnerHitsTotalToInt([]map[string]any{ihMap})
+
+	for _, in := range []any{nil, true, false, "true", "1", "false", "0", "other", 123} {
+		_, _ = parseOptionalBoolAny(in)
+	}
+	_ = compactIngestMap(map[string]any{"a": "", "b": nil, "c": "keep", "d": []any{"", "x"}, "e": map[string]any{"k": ""}})
+	_, _ = parseIngestSliceIndex("", 3)
+	_, _ = parseIngestSliceIndex("abc", 3)
+	_, _ = parseIngestSliceIndex("-1", 3)
+	_, _ = parseIngestSliceIndex("-5", 3)
+	_, _ = parseIngestSliceIndex("5", 3)
+	dst := map[string]any{"nested": map[string]any{"keep": 1}, "existing": "old"}
+	deepMergeIngestMap(dst, map[string]any{"nested": map[string]any{"added": 2}, "existing": "new"})
+	deepMergeIngestMapWithOverride(dst, map[string]any{"existing": "ignored", "fresh": "val"}, false)
+
+	mb := NewMemoryBackend(false)
+	srv := NewServer("es_db", mb, transpiler.TranspilerOptions{})
+	doRound39JSON(t, srv, http.MethodPut, "/r45_geo_sa", `{
+		"mappings": {"properties": {"loc": {"type": "geo_point"}}}
+	}`)
+	doRound39JSON(t, srv, http.MethodPut, "/r45_geo_sa/_doc/1?refresh=true", `{"loc": {"lat": 40.71, "lon": -74.00}}`)
+	for _, u := range []string{"km", "mi", "yd", "ft", "in", "nmi", "cm", "mm"} {
+		doRound39JSON(t, srv, http.MethodPost, "/r45_geo_sa/_search", fmt.Sprintf(`{
+			"sort": [{"_geo_distance": {"loc": {"lat": 40.0, "lon": -74.0}, "order": "asc", "unit": %q}}],
+			"search_after": [1.5]
+		}`, u))
 	}
 }
