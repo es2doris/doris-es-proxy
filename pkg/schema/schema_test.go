@@ -1872,3 +1872,126 @@ func TestRound48SchemaAndShredderSpecCompliance(t *testing.T) {
 		t.Fatalf("F16 expected placeholder substitution on metric_cpu, got %+v", inferred.Properties["metric_cpu"])
 	}
 }
+
+func TestRound49SchemaAndShredderSpecCompliance(t *testing.T) {
+	// F13: unsigned_long in (math.MaxInt64, math.MaxUint64] preserved in _doc, array, and nested subfield
+	var uSpec esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{
+		"properties": {
+			"u_scalar": {"type": "unsigned_long"},
+			"u_arr":    {"type": "unsigned_long", "multi_valued": true},
+			"items": {
+				"type": "nested",
+				"properties": {
+					"u_nested": {"type": "unsigned_long"}
+				}
+			}
+		}
+	}`), &uSpec)
+	uSch := CompileIndexSchema("db", "r49_u_idx", &uSpec)
+	uRowBytes, err := ShredDocument(uSch, "1", 1, false, []byte(`{
+		"u_scalar": "18446744073709551615",
+		"u_arr": ["10000000000000000000", "18446744073709551615"],
+		"items": [{"u_nested": "18446744073709551615"}]
+	}`))
+	if err != nil {
+		t.Fatalf("F13 ShredDocument failed: %v", err)
+	}
+	var uRow map[string]any
+	_ = json.Unmarshal(uRowBytes, &uRow)
+	uArr, _ := uRow["f__u_arr"].([]any)
+	if len(uArr) != 2 || uArr[0] != "10000000000000000000" || uArr[1] != "18446744073709551615" {
+		t.Fatalf("F13 expected exact uint64 strings in f__u_arr, got %+v", uArr)
+	}
+	uNestedPre, _ := uRow["n__items__u_nested"].([]any)
+	if len(uNestedPre) != 1 || uNestedPre[0] != "18446744073709551615" {
+		t.Fatalf("F13 expected exact uint64 string in n__items__u_nested, got %+v", uNestedPre)
+	}
+
+	// F17: ExpandFieldPattern expands search_as_you_type subfields (_2gram, _3gram, _index_prefix)
+	var saytSpec esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{"properties": {"suggest": {"type": "search_as_you_type"}}}`), &saytSpec)
+	saytSch := CompileIndexSchema("db", "r49_sayt_idx", &saytSpec)
+	expSayt := saytSch.ExpandFieldPattern("suggest.*")
+	if len(expSayt) != 3 {
+		t.Fatalf("F17 expected 3 subfields for suggest.*, got %+v", expSayt)
+	}
+
+	// F20: token_count enable_position_increments: false stopword filtering, null_value, object rejection, and multi-field
+	var tcSpec esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{
+		"properties": {
+			"tc_default": {"type": "token_count", "analyzer": "standard", "null_value": 0},
+			"tc_no_pos":  {"type": "token_count", "analyzer": "standard", "enable_position_increments": false},
+			"title": {
+				"type": "text",
+				"fields": {
+					"words": {"type": "token_count", "analyzer": "standard", "enable_position_increments": false}
+				}
+			}
+		}
+	}`), &tcSpec)
+	tcSch := CompileIndexSchema("db", "r49_tc_idx", &tcSpec)
+	tcBytes, err := ShredDocument(tcSch, "1", 1, false, []byte(`{
+		"tc_default": null,
+		"tc_no_pos": "the quick and brown fox",
+		"title": "the quick and brown fox"
+	}`))
+	if err != nil {
+		t.Fatalf("F20 ShredDocument failed: %v", err)
+	}
+	var tcRow map[string]any
+	_ = json.Unmarshal(tcBytes, &tcRow)
+	// "the" and "and" are stopwords; 3 non-stopword tokens remain ("quick", "brown", "fox")
+	if tcRow["f__tc_default"] != float64(0) || tcRow["f__tc_no_pos"] != float64(3) || tcRow["f__title__words"] != float64(3) {
+		t.Fatalf("F20 unexpected token_count values: default=%v no_pos=%v title.words=%v", tcRow["f__tc_default"], tcRow["f__tc_no_pos"], tcRow["f__title__words"])
+	}
+	if _, err := ShredDocument(tcSch, "2", 1, false, []byte(`{"tc_default": {"bad": "object"}}`)); err == nil {
+		t.Fatalf("F20 expected mapper_parsing_exception when indexing object into token_count field")
+	}
+
+	// F21: InferMappingFromSampleDocs respects dynamic: "false" / "runtime", dynamic_templates double array vs dense_vector, and preserves multi-fields
+	var baseSpec esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{
+		"dynamic": "true",
+		"dynamic_templates": [
+			{
+				"float_arrays_as_double": {
+					"match": "scores_*",
+					"mapping": {"type": "double"}
+				}
+			}
+		],
+		"properties": {
+			"frozen_obj": {
+				"type": "object",
+				"dynamic": "false",
+				"properties": {
+					"known": {"type": "keyword"}
+				}
+			},
+			"tags": {
+				"type": "text",
+				"fields": {
+					"raw": {"type": "keyword"}
+				}
+			}
+		}
+	}`), &baseSpec)
+	inf := InferMappingFromSampleDocs([]json.RawMessage{
+		json.RawMessage(`{
+			"frozen_obj": {"known": "ok", "secret": "do_not_infer"},
+			"scores_vec": [0.1, 0.2, 0.3],
+			"tags": ["a", "b"]
+		}`),
+	}, &baseSpec)
+	if _, hasSecret := inf.Properties["frozen_obj"].Properties["secret"]; hasSecret {
+		t.Fatalf("F21 expected dynamic:false sub-object to skip inferring 'secret', got %+v", inf.Properties["frozen_obj"].Properties)
+	}
+	if inf.Properties["scores_vec"].Type != "double" {
+		t.Fatalf("F21 expected dynamic_template to map scores_vec as double instead of dense_vector, got %+v", inf.Properties["scores_vec"])
+	}
+	if _, hasRaw := inf.Properties["tags"].Fields["raw"]; !hasRaw {
+		t.Fatalf("F21 expected tags.fields.raw to be preserved when upgraded to multi-valued, got %+v", inf.Properties["tags"])
+	}
+}

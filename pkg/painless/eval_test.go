@@ -2337,3 +2337,339 @@ func TestRound48PainlessDeepStdlibAndMutationsCoverage(t *testing.T) {
 		t.Fatalf("unexpected stdRes: %#v", stdRes)
 	}
 }
+
+func TestRound49PainlessFindingsF23ToF29(t *testing.T) {
+	// F23: Chained mutators on method-call receivers (.computeIfAbsent, .compute, .get, .getOrDefault)
+	t.Run("F23_ChainedMutatorsOnMethodReceivers", func(t *testing.T) {
+		doc := map[string]any{
+			"nested": map[string]any{},
+		}
+		_, err := Eval(doc, `
+			Map m = new HashMap();
+			m.computeIfAbsent('tags', k -> new ArrayList()).add('a');
+			m.computeIfAbsent('tags', k -> new ArrayList()).add('b');
+			m.computeIfAbsent('tags', k -> new ArrayList()).addAll(['c', 'd']);
+			m.get('tags').add(0, 'z');
+			m.get('tags').addAll(1, ['x', 'y']);
+			m.get('tags').removeIf(v -> v == 'z');
+			m.get('tags').removeAll(['x', 'y']);
+			m.get('tags').retainAll(['a', 'b', 'c', 'd']);
+			m.get('tags').set(1, 'B');
+			m.get('tags').remove('c');
+			m.computeIfAbsent('meta', k -> new HashMap()).put('k1', 10);
+			m.get('meta').putIfAbsent('k2', 20);
+			m.get('meta').putAll(['k3': 30, 'k4': 40, 'k5': 50]);
+			m.get('meta').remove('k4', 40);
+			m.get('meta').remove('k5');
+			ctx._source.nested.computeIfAbsent('items', k -> new ArrayList()).add(100);
+			ctx._source.nested.get('items').add(200);
+			ctx._source.m = m;
+		`, nil)
+		if err != nil {
+			t.Fatalf("F23 Eval failed: %v", err)
+		}
+		m, ok := doc["m"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected map m in doc, got %#v", doc["m"])
+		}
+		tags, ok := m["tags"].([]any)
+		if !ok || len(tags) != 3 || tags[0] != "a" || tags[1] != "B" || tags[2] != "d" {
+			t.Fatalf("unexpected tags slice: %#v", m["tags"])
+		}
+		meta, ok := m["meta"].(map[string]any)
+		if !ok || meta["k1"] != int64(10) || meta["k2"] != int64(20) || meta["k3"] != int64(30) {
+			t.Fatalf("unexpected meta map: %#v", m["meta"])
+		}
+		nested, _ := doc["nested"].(map[string]any)
+		items, _ := nested["items"].([]any)
+		if len(items) != 2 || items[0] != int64(100) || items[1] != int64(200) {
+			t.Fatalf("unexpected nested.items: %#v", nested["items"])
+		}
+	})
+
+	// F24: Direct ctx.<mapMethod> resolution & hiding internal _ingest key from map inspection
+	t.Run("F24_DirectCtxMapMethodsAndHideIngestKey", func(t *testing.T) {
+		doc := map[string]any{
+			"_ingest": map[string]any{"timestamp": "2026-01-01T00:00:00Z"},
+			"a":       int64(1),
+			"b":       int64(2),
+		}
+		_, err := Eval(doc, `
+			int sz1 = ctx._source.size();
+			int sz2 = ctx.size();
+			boolean emp = ctx.isEmpty();
+			boolean hasVal = ctx.containsValue(2);
+			def ks = new ArrayList(ctx.keySet());
+			ctx.replace('a', 10);
+			ctx.computeIfAbsent('c', k -> 30);
+			ctx.computeIfPresent('b', (k, v) -> v + 20);
+			ctx.merge('c', 5, (oldV, newV) -> oldV + newV);
+			int sum = 0;
+			ctx.forEach((k, v) -> { sum += v; });
+			String ts = ctx._ingest.timestamp;
+			ctx.clear();
+			ctx._source.summary = [sz1, sz2, emp, hasVal, ks.size(), sum, ts, ctx.isEmpty()];
+		`, nil)
+		if err != nil {
+			t.Fatalf("F24 Eval failed: %v", err)
+		}
+		if _, hasIngest := doc["_ingest"]; !hasIngest {
+			t.Fatalf("expected _ingest to be preserved after ctx.clear()")
+		}
+		if _, hasA := doc["a"]; hasA {
+			t.Fatalf("expected 'a' to be cleared by ctx.clear()")
+		}
+		summary, ok := doc["summary"].([]any)
+		if !ok || len(summary) != 8 {
+			t.Fatalf("unexpected summary: %#v", doc["summary"])
+		}
+		if summary[0] != int64(2) || summary[1] != int64(2) || summary[2] != false || summary[3] != true ||
+			summary[4] != int64(2) || summary[5] != int64(67) || summary[6] != "2026-01-01T00:00:00Z" || summary[7] != true {
+			t.Fatalf("unexpected F24 summary values: %#v", summary)
+		}
+	})
+
+	// F25: DateTimeFormatter.format(temporal) inverted receiver, .now(), YearMonth, DayOfWeek, Month
+	t.Run("F25_DateTimeFormatterAndYearMonthDayOfWeekMonth", func(t *testing.T) {
+		res, err := Eval(nil, `
+			DateTimeFormatter fmt = DateTimeFormatter.ofPattern("yyyy/MM/dd");
+			LocalDate ld = LocalDate.of(2024, Month.FEBRUARY, 15);
+			String s1 = fmt.format(ld);
+			String s2 = ld.format(fmt);
+			YearMonth ym = YearMonth.of(2024, 2);
+			YearMonth ym2 = YearMonth.parse("2024-02").plusMonths(1);
+			DayOfWeek dow = DayOfWeek.of(3);
+			Month m = Month.of(12);
+			int enumVals = DayOfWeek.MONDAY.getValue() + DayOfWeek.TUESDAY.getValue() + DayOfWeek.WEDNESDAY.getValue() +
+				DayOfWeek.THURSDAY.getValue() + DayOfWeek.FRIDAY.getValue() + DayOfWeek.SATURDAY.getValue() + DayOfWeek.SUNDAY.getValue() +
+				Month.JANUARY.getValue() + Month.FEBRUARY.getValue() + Month.MARCH.getValue() + Month.APRIL.getValue() +
+				Month.MAY.getValue() + Month.JUNE.getValue() + Month.JULY.getValue() + Month.AUGUST.getValue() +
+				Month.SEPTEMBER.getValue() + Month.OCTOBER.getValue() + Month.NOVEMBER.getValue() + Month.DECEMBER.getValue();
+			boolean nowOk = Instant.now() != null && ZonedDateTime.now() != null && LocalDate.now() != null && YearMonth.now() != null && enumVals == 106;
+			return [
+				s1, s2,
+				ym.lengthOfMonth(), ym.lengthOfYear(), ym.isLeapYear(), ym.atDay(10), ym.atEndOfMonth(),
+				ym2.toString(),
+				dow, DayOfWeek.MONDAY, dow.getValue(),
+				m, Month.JANUARY, m.getValue(),
+				nowOk
+			];
+		`, nil)
+		if err != nil {
+			t.Fatalf("F25 Eval failed: %v", err)
+		}
+		arr, ok := res.([]any)
+		if !ok || len(arr) != 15 {
+			t.Fatalf("unexpected F25 result: %#v", res)
+		}
+		if arr[0] != "2024/02/15" || arr[1] != "2024/02/15" ||
+			arr[2] != int64(29) || arr[3] != int64(366) || arr[4] != true ||
+			arr[5] != "2024-02-10" || arr[6] != "2024-02-29" || arr[7] != "2024-03" ||
+			arr[8] != "WEDNESDAY" || arr[9] != "MONDAY" || arr[10] != int64(3) ||
+			arr[11] != "DECEMBER" || arr[12] != "JANUARY" || arr[13] != int64(12) || arr[14] != true {
+			t.Fatalf("unexpected F25 values: %#v", arr)
+		}
+	})
+
+	// F26: Base64 & new String(bytes[, charset]), StandardCharsets.*, Charset.forName
+	t.Run("F26_NewStringBytesAndStandardCharsets", func(t *testing.T) {
+		res, err := Eval(nil, `
+			Charset cs = StandardCharsets.UTF_8;
+			Charset cs2 = Charset.forName("UTF-8");
+			byte[] raw = "hello world".getBytes(cs);
+			String b64 = Base64.getEncoder().encodeToString(raw);
+			byte[] decoded = Base64.getDecoder().decode(b64);
+			String roundTrip = new String(decoded, StandardCharsets.UTF_8);
+			String sliced = new String(decoded, 6, 5, cs2);
+			String emptyStr = new String();
+			return [roundTrip, sliced, emptyStr, cs, cs2];
+		`, nil)
+		if err != nil {
+			t.Fatalf("F26 Eval failed: %v", err)
+		}
+		arr, ok := res.([]any)
+		if !ok || len(arr) != 5 {
+			t.Fatalf("unexpected F26 result: %#v", res)
+		}
+		if arr[0] != "hello world" || arr[1] != "world" || arr[2] != "" || arr[3] != "UTF-8" || arr[4] != "UTF-8" {
+			t.Fatalf("unexpected F26 values: %#v", arr)
+		}
+	})
+
+	// F27: StringBuilder .setCharAt, .subSequence, .capacity, .ensureCapacity, .trimToSize, .codePointAt
+	t.Run("F27_StringBuilderMethods", func(t *testing.T) {
+		res, err := Eval(nil, `
+			StringBuilder sb = new StringBuilder("abcde");
+			sb.setCharAt(1, 'B');
+			sb.ensureCapacity(100);
+			sb.trimToSize();
+			int cp = sb.codePointAt(1);
+			String sub = sb.subSequence(1, 4);
+			boolean capOk = sb.capacity() >= 5;
+			return [sb.toString(), cp, sub, capOk];
+		`, nil)
+		if err != nil {
+			t.Fatalf("F27 Eval failed: %v", err)
+		}
+		arr, ok := res.([]any)
+		if !ok || len(arr) != 4 {
+			t.Fatalf("unexpected F27 result: %#v", res)
+		}
+		if arr[0] != "aBcde" || arr[1] != int64('B') || arr[2] != "Bcd" || arr[3] != true {
+			t.Fatalf("unexpected F27 values: %#v", arr)
+		}
+	})
+
+	// F28: Pattern.split(input[, limit]), Matcher.replaceAll(Function)/replaceFirst(Function), appendReplacement/appendTail, region
+	t.Run("F28_PatternSplitAndMatcherEnhancements", func(t *testing.T) {
+		res, err := Eval(nil, `
+			Pattern p = Pattern.compile(",\\s*");
+			def parts = p.split("a, b, c", 2);
+			Pattern wordPat = Pattern.compile("(\\w+)");
+			Matcher m1 = wordPat.matcher("hello world");
+			String repAll = m1.replaceAll(mr -> mr.group(1).toUpperCase());
+			Matcher m2 = wordPat.matcher("hello world");
+			String repFirst = m2.replaceFirst(mr -> mr.group(0).toUpperCase());
+
+			Matcher m3 = Pattern.compile("cat").matcher("one cat two cats");
+			StringBuilder sb = new StringBuilder();
+			while (m3.find()) {
+				m3.appendReplacement(sb, "dog");
+			}
+			m3.appendTail(sb);
+
+			Matcher m4 = wordPat.matcher("aa bb cc");
+			m4.region(3, 5);
+			int rStart = m4.regionStart();
+			int rEnd = m4.regionEnd();
+			boolean foundInRegion = m4.find();
+			String regMatch = m4.group();
+
+			return [parts.size(), parts[0], parts[1], repAll, repFirst, sb.toString(), rStart, rEnd, foundInRegion, regMatch];
+		`, nil)
+		if err != nil {
+			t.Fatalf("F28 Eval failed: %v", err)
+		}
+		arr, ok := res.([]any)
+		if !ok || len(arr) != 10 {
+			t.Fatalf("unexpected F28 result: %#v", res)
+		}
+		if arr[0] != int64(2) || arr[1] != "a" || arr[2] != "b, c" ||
+			arr[3] != "HELLO WORLD" || arr[4] != "HELLO world" ||
+			arr[5] != "one dog two dogs" || arr[6] != int64(3) || arr[7] != int64(5) ||
+			arr[8] != true || arr[9] != "bb" {
+			t.Fatalf("unexpected F28 values: %#v", arr)
+		}
+	})
+
+	// F29: IntStream/LongStream/DoubleStream.of, Stream.empty/concat, summaryStatistics, Collectors.summarizing*, collectingAndThen, reducing, Map.entry/ofEntries, Optional
+	t.Run("F29_StreamsCollectorsMapEntriesAndOptional", func(t *testing.T) {
+		res, err := Eval(nil, `
+			int isSum = IntStream.of(1, 2, 3, 4).sum();
+			long lsSum = LongStream.of(10L, 20L).sum();
+			double dsSum = DoubleStream.of(1.5, 2.5).sum();
+			long empCount = Stream.empty().count();
+			def catList = Stream.concat(Stream.of("a", "b"), Stream.of("c")).collect(Collectors.toList());
+
+			IntSummaryStatistics stats1 = IntStream.of(2, 4, 6).summaryStatistics();
+			def statsL = LongStream.of(2L, 4L, 6L).summaryStatistics();
+			def statsD = DoubleStream.of(2.0, 4.0, 6.0).summaryStatistics();
+			def stats2 = ["a", "bb", "ccc"].stream().collect(Collectors.summarizingInt(s -> s.length()));
+			def stats3 = ["a", "bb", "ccc"].stream().collect(Collectors.summarizingLong(s -> s.length()));
+			def stats4 = ["a", "bb", "ccc"].stream().collect(Collectors.summarizingDouble(s -> s.length() * 1.0));
+
+			int catSize = [1, 2, 2, 3].stream().collect(Collectors.collectingAndThen(Collectors.toSet(), s -> s.size()));
+			int red1 = [1, 2, 3, 4].stream().collect(Collectors.reducing((a, b) -> a + b)).orElse(0);
+			int red2 = [1, 2, 3, 4].stream().collect(Collectors.reducing(10, (a, b) -> a + b));
+			int red3 = ["a", "bb", "ccc"].stream().collect(Collectors.reducing(0, s -> s.length(), (a, b) -> a + b));
+
+			Map m = Map.ofEntries(Map.entry("k1", 100), Map.entry("k2", 200));
+			Optional opt1 = Optional.of("val");
+			Optional opt2 = Optional.ofNullable(null);
+			def seen = [];
+			opt1.ifPresent(v -> seen.add(v));
+			String lazyVal = opt2.orElseGet(() -> "lazy");
+			boolean statsExtraOk = statsL.getSum() == 12 && statsD.getSum() == 12.0 && stats3.getSum() == 6 && stats4.getSum() == 6.0 && seen.size() == 1 && lazyVal == "lazy";
+
+			return [
+				isSum, lsSum, dsSum, empCount, catList.size(),
+				stats1.getCount(), stats1.getSum(), stats1.getMin(), stats1.getMax(), stats1.getAverage(),
+				stats2.getCount(), stats2.getSum(),
+				catSize, red1, red2, red3,
+				m.get("k1"), m.get("k2"),
+				opt1.isPresent(), opt1.get(), opt2.isPresent(), statsExtraOk ? opt2.orElse("fallback") : "bad"
+			];
+		`, nil)
+		if err != nil {
+			t.Fatalf("F29 Eval failed: %v", err)
+		}
+		arr, ok := res.([]any)
+		if !ok || len(arr) != 22 {
+			t.Fatalf("unexpected F29 result: %#v", res)
+		}
+		if arr[0] != int64(10) || arr[1] != int64(30) || arr[2] != float64(4.0) ||
+			arr[3] != int64(0) || arr[4] != int64(3) ||
+			arr[5] != int64(3) || arr[6] != int64(12) || arr[7] != int64(2) || arr[8] != int64(6) || arr[9] != float64(4.0) ||
+			arr[10] != int64(3) || arr[11] != int64(6) ||
+			arr[12] != int64(3) || arr[13] != int64(10) || arr[14] != int64(20) || arr[15] != int64(6) ||
+			arr[16] != int64(100) || arr[17] != int64(200) ||
+			arr[18] != true || arr[19] != "val" || arr[20] != false || arr[21] != "fallback" {
+			t.Fatalf("unexpected F29 values: %#v", arr)
+		}
+	})
+
+	t.Run("ArraysCollectionsDigestsAndEncodings", func(t *testing.T) {
+		res, err := Eval(nil, `
+			def a = [4, 2, 1, 3];
+			Arrays.sort(a, 0, 3);
+			Arrays.sort(a);
+			int bs1 = Arrays.binarySearch(a, 3);
+			int bs2 = Arrays.binarySearch(a, 0, 3, 2);
+			def fArr = [0, 0, 0, 0];
+			Arrays.fill(fArr, 1, 3, 9);
+			def cp1 = Arrays.copyOf(a, 2);
+			def cp2 = Arrays.copyOfRange(a, 1, 3);
+			boolean eq1 = Arrays.equals([1, 2], [1, 2]);
+			boolean eq2 = Arrays.deepEquals([[1]], [[1]]);
+			String ts1 = Arrays.toString([1, null, 2]);
+			String ts2 = Arrays.deepToString([[1, 2], [3]]);
+			long asSum = Arrays.stream([10, 20, 30, 40], 1, 3).mapToInt(x -> x).sum();
+			long isArr = IntStream.of([1, 2, 3]).sum();
+			double dsArr = DoubleStream.of([1.5, 2.5]).sum();
+			def empIS = IntStream.empty().summaryStatistics();
+			def empDS = DoubleStream.empty().summaryStatistics();
+			def lc = List.copyOf([1, 2, 2]);
+			def sc = Set.copyOf([1, 2, 2]);
+			def mc = Map.copyOf(['a': 1]);
+			def el = Collections.emptyList();
+			def es = Collections.emptySet();
+			def em = Collections.emptyMap();
+			def sl = Collections.singletonList("x");
+			def sm = Collections.singletonMap("k", "v");
+			def d1 = Digest.sha256("abc");
+			def d2 = Digest.md5("abc");
+			def d3 = Digest.sha1("abc");
+			def d4 = Digest.sha384("abc");
+			def d5 = Digest.sha512("abc");
+			def eb = Encoding.encodeBase64("hi");
+			def db = Encoding.decodeBase64(eb);
+			def eh = Encoding.encodeHex("hi");
+			def dh = Encoding.decodeHex(eh);
+			def ub = Base64.getUrlEncoder().encodeToString("hi?".getBytes());
+			def udb = Base64.getUrlDecoder().decode(ub);
+			def dcs = Charset.defaultCharset();
+			def oe = Optional.empty();
+			def minByV = [3, 1, 2].stream().collect(Collectors.minBy((x, y) -> Integer.compare(x, y))).orElse(0);
+			def maxByV = [3, 1, 2].stream().collect(Collectors.maxBy((x, y) -> Integer.compare(x, y))).orElse(0);
+			def mappedCol = ["aa", "b"].stream().collect(Collectors.mapping(s -> s.length(), Collectors.toList()));
+			def partCol = [1, 2, 3, 4].stream().collect(Collectors.partitioningBy(x -> x % 2 == 0, Collectors.counting()));
+			return [bs1, bs2, fArr[1], cp1.size(), cp2.size(), eq1, eq2, ts1.length() > 0, ts2.length() > 0, asSum, isArr, dsArr, empIS.getCount(), empDS.getCount(), lc.size(), sc.size(), mc.size(), el.size(), es.size(), em.size(), sl.size(), sm.size(), d1.length() > 0 && d2.length() > 0 && d3.length() > 0 && d4.length() > 0 && d5.length() > 0, db, dh, udb, dcs, oe == null, minByV, maxByV, mappedCol.size(), partCol.get("true")];
+		`, nil)
+		if err != nil {
+			t.Fatalf("ArraysCollectionsDigestsAndEncodings failed: %v", err)
+		}
+		if arr, ok := res.([]any); !ok || len(arr) != 32 {
+			t.Fatalf("unexpected ArraysCollectionsDigestsAndEncodings result: %#v", res)
+		}
+	})
+}

@@ -11,6 +11,11 @@
   - is_true: ""
 
   - do:
+      cat.fielddata:
+        format: "json"
+  - is_true: ""
+
+  - do:
       cat.master:
         format: "json"
   - length: { $body: 1 }
@@ -36,6 +41,11 @@
   - is_true: ""
 
   - do:
+      cat.repositories:
+        format: "json"
+  - is_true: ""
+
+  - do:
       cat.segments:
         format: "json"
   - is_true: ""
@@ -51,7 +61,23 @@
   - is_true: ""
 
   - do:
+      cat.templates:
+        format: "json"
+  - is_true: ""
+
+  - do:
       tasks.list: {}
+  - is_true: nodes
+
+  - do:
+      tasks.get:
+        task_id: "node-1:1"
+  - match: { completed: true }
+  - match: { task.node: "node-1" }
+
+  - do:
+      tasks.cancel:
+        task_id: "node-1:1"
   - is_true: nodes
 
   - do:
@@ -68,8 +94,20 @@
   - match: { acknowledged: true }
 
   - do:
+      cluster.remote_info: {}
+  - is_true: ""
+
+  - do:
       nodes.usage: {}
   - is_true: nodes
+
+  - do:
+      nodes.hot_threads: {}
+  - is_true: ""
+
+  - do:
+      nodes.reload_secure_settings: {}
+  - match: { _nodes.failed: 0 }
 
   - do:
       indices.recovery:
@@ -99,4 +137,177 @@
   - do:
       indices.open:
         index: "admin_spec_idx"
+  - match: { acknowledged: true }
+
+---
+"Data streams stats, index template simulation, kNN search, and snapshot lifecycle":
+  - do:
+      indices.create_data_stream:
+        name: "ds_admin_logs"
+  - match: { acknowledged: true }
+
+  - do:
+      cat.data_streams:
+        name: "ds_admin_logs"
+        format: "json"
+  - length: { $body: 1 }
+  - match: { 0.name: "ds_admin_logs" }
+  - match: { 0.status: "GREEN" }
+
+  - do:
+      indices.data_stream_stats:
+        name: "ds_admin_logs"
+  - match: { data_stream_count: 1 }
+  - match: { data_streams.0.data_stream: "ds_admin_logs" }
+
+  - do:
+      cluster.put_component_template:
+        name: "ct_sim_base"
+        body:
+          template:
+            settings:
+              number_of_shards: 1
+            mappings:
+              properties:
+                host:
+                  type: "keyword"
+  - match: { acknowledged: true }
+
+  - do:
+      indices.put_index_template:
+        name: "it_sim_logs"
+        body:
+          index_patterns: ["sim-logs-*"]
+          composed_of: ["ct_sim_base"]
+          priority: 100
+          template:
+            mappings:
+              properties:
+                message:
+                  type: "text"
+  - match: { acknowledged: true }
+
+  - do:
+      indices.simulate_template:
+        name: "it_sim_logs"
+  - match: { template.mappings.properties.host.type: "keyword" }
+  - match: { template.mappings.properties.message.type: "text" }
+
+  - do:
+      indices.simulate_index_template:
+        name: "sim-logs-2026"
+  - match: { template.mappings.properties.host.type: "keyword" }
+  - match: { template.mappings.properties.message.type: "text" }
+
+  - do:
+      indices.create:
+        index: "knn_spec_idx"
+        body:
+          mappings:
+            properties:
+              vec:
+                type: "dense_vector"
+                dims: 3
+              tag:
+                type: "keyword"
+  - match: { acknowledged: true }
+
+  - do:
+      index:
+        index: "knn_spec_idx"
+        id: "k1"
+        refresh: true
+        body:
+          vec: [1.0, 0.0, 0.0]
+          tag: "a"
+
+  - do:
+      index:
+        index: "knn_spec_idx"
+        id: "k2"
+        refresh: true
+        body:
+          vec: [0.0, 1.0, 0.0]
+          tag: "b"
+
+  - do:
+      knn_search:
+        index: "knn_spec_idx"
+        body:
+          knn:
+            field: "vec"
+            query_vector: [1.0, 0.0, 0.0]
+            k: 1
+            num_candidates: 2
+          filter:
+            term:
+              tag: "a"
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "k1" }
+
+  - do:
+      snapshot.put_repository:
+        repository: "repo_spec_fs"
+        body:
+          type: "fs"
+          settings:
+            location: "/tmp/repo_spec_fs"
+  - match: { acknowledged: true }
+
+  - do:
+      snapshot.get_repository:
+        repository: "repo_spec_fs"
+  - match: { repo_spec_fs.type: "fs" }
+
+  - do:
+      snapshot.verify_repository:
+        repository: "repo_spec_fs"
+  - is_true: nodes
+
+  - do:
+      snapshot.create:
+        repository: "repo_spec_fs"
+        snapshot: "snap_1"
+        body:
+          indices: "admin_spec_idx"
+  - match: { accepted: true }
+  - match: { snapshot.snapshot: "snap_1" }
+  - match: { snapshot.state: "SUCCESS" }
+
+  - do:
+      snapshot.get:
+        repository: "repo_spec_fs"
+        snapshot: "snap_1"
+  - length: { snapshots: 1 }
+  - match: { snapshots.0.snapshot: "snap_1" }
+
+  - do:
+      snapshot.status:
+        repository: "repo_spec_fs"
+        snapshot: "snap_1"
+  - length: { snapshots: 1 }
+  - match: { snapshots.0.state: "SUCCESS" }
+
+  - do:
+      cat.snapshots:
+        repository: "repo_spec_fs"
+        format: "json"
+  - length: { $body: 1 }
+  - match: { 0.id: "snap_1" }
+
+  - do:
+      snapshot.restore:
+        repository: "repo_spec_fs"
+        snapshot: "snap_1"
+  - match: { accepted: true }
+
+  - do:
+      snapshot.delete:
+        repository: "repo_spec_fs"
+        snapshot: "snap_1"
+  - match: { acknowledged: true }
+
+  - do:
+      snapshot.delete_repository:
+        repository: "repo_spec_fs"
   - match: { acknowledged: true }

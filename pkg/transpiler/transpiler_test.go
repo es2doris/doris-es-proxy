@@ -3067,7 +3067,7 @@ func TestRound47TranspilerSpecCompliance(t *testing.T) {
 		`{"has_child": {"type": "child", "query": {"match": {"title": "quick"}}, "score_mode": "max"}}`,
 		`{"has_parent": {"parent_type": "parent", "query": {"match": {"title": "quick"}}, "score": true}}`,
 		`{"parent_id": {"type": "child", "id": "p1"}}`,
-		`{"percolate": {"field": "title", "document": {"title": "quick"}}}`,
+		`{"percolate": {"field": "query", "document": {"title": "quick"}}}`,
 	}
 	for _, raw := range f12Queries {
 		var q esast.Query
@@ -3304,5 +3304,143 @@ func TestRound48TranspilerSpecCompliance(t *testing.T) {
 	}
 	if w := tr.CompileQuery(&flatNestedQ, false, nil).WhereSQL; !strings.Contains(w, "$.attrs.color") || !strings.Contains(w, "ARRAY<STRING>") {
 		t.Fatalf("F15 expected nested flattened sub-key query to extract $.attrs.color and check ARRAY<STRING>, got %s", w)
+	}
+}
+
+func TestRound49TranspilerSpecCompliance(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"title":      {"type": "text", "analyzer": "stop"},
+			"body":       {"type": "text"},
+			"sayt":       {"type": "search_as_you_type"},
+			"u_val":      {"type": "unsigned_long"},
+			"ver":        {"type": "version"},
+			"labels":     {"type": "flattened"},
+			"loc":        {"type": "geo_point"},
+			"perc_query": {"type": "percolator"},
+			"my_join": {
+				"type": "join",
+				"relations": {
+					"question": ["answer", "comment"]
+				}
+			}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("mapping unmarshal failed: %v", err)
+	}
+	sch := schema.CompileIndexSchema("db", "r49_tr_idx", &spec)
+	tr := NewTranspiler(sch, TranspilerOptions{UseDoris4SearchFunc: true})
+
+	// F5-AST: IdsQuery with ResolvedScores emits CASE WHEN `_id` = ... score expression
+	idsQ := esast.Query{
+		Ids: &esast.IdsQuery{
+			Values:         []string{"p1", "p2"},
+			ResolvedScores: map[string]float64{"p1": 3.5, "p2": 1.25},
+		},
+	}
+	cqIds := tr.CompileQuery(&idsQ, true, nil)
+	if !strings.Contains(cqIds.ScoreSQL, "WHEN `_id` = 'p1' THEN 3.5") {
+		t.Fatalf("F5 expected ResolvedScores CASE expression in ScoreSQL, got %s", cqIds.ScoreSQL)
+	}
+
+	// F12: MoreLikeThis per-item fields override, min_term_freq, max_query_terms, boost_terms, like_text, ids
+	var mltQ esast.Query
+	if err := json.Unmarshal([]byte(`{
+		"more_like_this": {
+			"fields": ["body"],
+			"like": [
+				{"_id": "1", "fields": ["title"], "doc": {"title": "alpha alpha beta", "body": "ignored_body"}}
+			],
+			"min_term_freq": 2,
+			"max_query_terms": 1,
+			"boost_terms": 2.5
+		}
+	}`), &mltQ); err != nil {
+		t.Fatalf("F12 MLT unmarshal failed: %v", err)
+	}
+	cqMLT := tr.CompileQuery(&mltQ, true, nil)
+	if !strings.Contains(cqMLT.WhereSQL, "alpha") || strings.Contains(cqMLT.WhereSQL, "beta") || strings.Contains(cqMLT.WhereSQL, "ignored_body") {
+		t.Fatalf("F12 expected MLT to use item fields=['title'] and filter min_term_freq=2 (keeping only 'alpha'), got %s", cqMLT.WhereSQL)
+	}
+
+	// F13: unsigned_long in (math.MaxInt64, math.MaxUint64] uses CAST(`_doc`['u_val'] AS LARGEINT) and exact uint64 literal
+	var uTermQ, uRangeQ esast.Query
+	_ = json.Unmarshal([]byte(`{"term": {"u_val": "18446744073709551615"}}`), &uTermQ)
+	_ = json.Unmarshal([]byte(`{"range": {"u_val": {"gt": "9223372036854775807", "lte": "18446744073709551615"}}}`), &uRangeQ)
+	if w := tr.CompileQuery(&uTermQ, false, nil).WhereSQL; !strings.Contains(w, "LARGEINT") || !strings.Contains(w, "18446744073709551615") || strings.Contains(w, "-9223372036854775808") {
+		t.Fatalf("F13 expected LARGEINT and exact uint64 literal in term query, got %s", w)
+	}
+	if w := tr.CompileQuery(&uRangeQ, false, nil).WhereSQL; !strings.Contains(w, "LARGEINT") || !strings.Contains(w, "9223372036854775807") || !strings.Contains(w, "18446744073709551615") || strings.Contains(w, "-9223372036854775808") {
+		t.Fatalf("F13 expected LARGEINT and no int64 overflow in range query, got %s", w)
+	}
+
+	// F14: parent_id does not emit bare OR `_routing` = '...' when join field is mapped; unmapped child type errors unless ignore_unmapped:true; percolate validates field type
+	var pidQ, pidBadQ, pidIgnoreQ, percBadQ esast.Query
+	_ = json.Unmarshal([]byte(`{"parent_id": {"type": "answer", "id": "q1"}}`), &pidQ)
+	_ = json.Unmarshal([]byte(`{"parent_id": {"type": "unknown_child", "id": "q1"}}`), &pidBadQ)
+	_ = json.Unmarshal([]byte(`{"parent_id": {"type": "unknown_child", "id": "q1", "ignore_unmapped": true}}`), &pidIgnoreQ)
+	_ = json.Unmarshal([]byte(`{"percolate": {"field": "title", "document": {"title": "hello"}}}`), &percBadQ)
+
+	if w := tr.CompileQuery(&pidQ, false, nil).WhereSQL; strings.Contains(w, "_routing") || !strings.Contains(w, "['my_join']") {
+		t.Fatalf("F14 expected parent_id with mapped join field to omit bare _routing fallback, got %s", w)
+	}
+	if _, err := tr.BuildSearchPlan(&esast.SearchRequest{Query: &pidBadQ}); err == nil {
+		t.Fatalf("F14 expected error for parent_id with unconfigured child type when ignore_unmapped=false")
+	}
+	if plan, err := tr.BuildSearchPlan(&esast.SearchRequest{Query: &pidIgnoreQ}); err != nil || !strings.Contains(plan.HitsSQL, "FALSE") {
+		t.Fatalf("F14 expected FALSE without error for parent_id with ignore_unmapped=true, got err=%v", err)
+	}
+	if _, err := tr.BuildSearchPlan(&esast.SearchRequest{Query: &percBadQ}); err == nil {
+		t.Fatalf("F14 expected error when percolate targets non-percolator field 'title'")
+	}
+
+	// F15: GeoShape polygon with interior hole ring, anti-meridian envelope, and multipoint
+	var gsHole, gsAntiEnv, gsMultiPt esast.Query
+	_ = json.Unmarshal([]byte(`{"geo_shape": {"loc": {"shape": "POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0), (2 2, 8 2, 8 8, 2 8, 2 2))"}}}`), &gsHole)
+	_ = json.Unmarshal([]byte(`{"geo_shape": {"loc": {"shape": {"type": "envelope", "coordinates": [[170.0, 20.0], [-170.0, -20.0]]}}}}`), &gsAntiEnv)
+	_ = json.Unmarshal([]byte(`{"geo_shape": {"loc": {"shape": "MULTIPOINT ((-74 40), (-73 41))"}}}`), &gsMultiPt)
+
+	if w := tr.CompileQuery(&gsHole, false, nil).WhereSQL; !strings.Contains(w, "AND NOT ") {
+		t.Fatalf("F15 expected polygon with hole to emit AND NOT hole condition, got %s", w)
+	}
+	if w := tr.CompileQuery(&gsAntiEnv, false, nil).WhereSQL; !strings.Contains(w, ">= 170 OR ") || !strings.Contains(w, "<= -170") {
+		t.Fatalf("F15 expected anti-meridian envelope to emit OR across dateline, got %s", w)
+	}
+	if w := tr.CompileQuery(&gsMultiPt, false, nil).WhereSQL; !strings.Contains(w, " OR ") {
+		t.Fatalf("F15 expected multipoint to emit OR of point predicates, got %s", w)
+	}
+
+	// F16: Stopword filtering in match_phrase & common terms query compilation
+	var mpStopQ, commonQ esast.Query
+	_ = json.Unmarshal([]byte(`{"match_phrase": {"title": "quick the fox"}}`), &mpStopQ)
+	_ = json.Unmarshal([]byte(`{"common": {"body": {"query": "the quick brown", "low_freq_operator": "and"}}}`), &commonQ)
+	if w := tr.CompileQuery(&mpStopQ, false, nil).WhereSQL; !strings.Contains(w, "quick fox") {
+		t.Fatalf("F16 expected match_phrase on stop-analyzed field to strip stopword 'the', got %s", w)
+	}
+	if w := tr.CompileQuery(&commonQ, false, nil).WhereSQL; !strings.Contains(w, "quick") || !strings.Contains(w, "brown") {
+		t.Fatalf("F16 expected common query to compile low-freq terms 'quick' and 'brown', got %s", w)
+	}
+
+	// F17: search_as_you_type ._index_prefix in match and term queries
+	var saytPrefixTerm esast.Query
+	_ = json.Unmarshal([]byte(`{"term": {"sayt._index_prefix": "qui"}}`), &saytPrefixTerm)
+	if w := tr.CompileQuery(&saytPrefixTerm, false, nil).WhereSQL; !strings.Contains(w, "LIKE") || !strings.Contains(w, "qui%") {
+		t.Fatalf("F17 expected term on sayt._index_prefix to compile as prefix LIKE 'qui%%', got %s", w)
+	}
+
+	// F18: version semantic version range query (1.2.0 < 1.10.0, 1.0.0-alpha < 1.0.0)
+	var verRangeQ esast.Query
+	_ = json.Unmarshal([]byte(`{"range": {"ver": {"gt": "1.2.0", "lte": "1.10.0"}}}`), &verRangeQ)
+	wVer := tr.CompileQuery(&verRangeQ, false, nil).WhereSQL
+	if !strings.Contains(wVer, "LPAD") || !strings.Contains(wVer, "0000000001.0000000002.0000000000~") || !strings.Contains(wVer, "0000000001.0000000010.0000000000~") {
+		t.Fatalf("F18 expected semver padded sort key comparison in range query on version field, got %s", wVer)
+	}
+
+	// F19: flattened sub-key range query supports both scalar and array values
+	var flatRangeQ esast.Query
+	_ = json.Unmarshal([]byte(`{"range": {"labels.tier": {"gte": "a", "lte": "m"}}}`), &flatRangeQ)
+	if w := tr.CompileQuery(&flatRangeQ, false, nil).WhereSQL; !strings.Contains(w, "array_exists") || !strings.Contains(w, "ARRAY<STRING>") {
+		t.Fatalf("F19 expected flattened sub-key range query to include array_exists over ARRAY<STRING>, got %s", w)
 	}
 }

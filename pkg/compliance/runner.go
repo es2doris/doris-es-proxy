@@ -187,43 +187,45 @@ func RunSuiteFS(t *testing.T, fsys fs.FS, baseURL string) SuiteReport {
 }
 
 type runnerContext struct {
-	client             *http.Client
-	baseURL            string
-	stash              map[string]any
-	lastStatus         int
-	lastMethod         string
-	lastBodyRaw        string
-	lastResponse       any
-	lastHeaders        map[string]any
-	lastWarnings       []string
-	createdIndices     map[string]bool
-	createdDataStreams map[string]bool
-	createdTemplates   map[string]bool
-	createdLegacyTmpls map[string]bool
-	createdCompTmpls   map[string]bool
-	createdPipelines   map[string]bool
-	createdILMPolicies map[string]bool
-	createdEnrichPols  map[string]bool
-	createdScripts     map[string]struct{}
-	createdAliases     map[string]string // alias -> index
+	client              *http.Client
+	baseURL             string
+	stash               map[string]any
+	lastStatus          int
+	lastMethod          string
+	lastBodyRaw         string
+	lastResponse        any
+	lastHeaders         map[string]any
+	lastWarnings        []string
+	createdIndices      map[string]bool
+	createdDataStreams  map[string]bool
+	createdTemplates    map[string]bool
+	createdLegacyTmpls  map[string]bool
+	createdCompTmpls    map[string]bool
+	createdPipelines    map[string]bool
+	createdILMPolicies  map[string]bool
+	createdEnrichPols   map[string]bool
+	createdScripts      map[string]struct{}
+	createdRepositories map[string]struct{}
+	createdAliases      map[string]string // alias -> index
 }
 
 func newRunnerContext(client *http.Client, baseURL string) *runnerContext {
 	return &runnerContext{
-		client:             client,
-		baseURL:            baseURL,
-		stash:              make(map[string]any),
-		lastHeaders:        make(map[string]any),
-		createdIndices:     make(map[string]bool),
-		createdDataStreams: make(map[string]bool),
-		createdTemplates:   make(map[string]bool),
-		createdLegacyTmpls: make(map[string]bool),
-		createdCompTmpls:   make(map[string]bool),
-		createdPipelines:   make(map[string]bool),
-		createdILMPolicies: make(map[string]bool),
-		createdEnrichPols:  make(map[string]bool),
-		createdScripts:     make(map[string]struct{}),
-		createdAliases:     make(map[string]string),
+		client:              client,
+		baseURL:             baseURL,
+		stash:               make(map[string]any),
+		lastHeaders:         make(map[string]any),
+		createdIndices:      make(map[string]bool),
+		createdDataStreams:  make(map[string]bool),
+		createdTemplates:    make(map[string]bool),
+		createdLegacyTmpls:  make(map[string]bool),
+		createdCompTmpls:    make(map[string]bool),
+		createdPipelines:    make(map[string]bool),
+		createdILMPolicies:  make(map[string]bool),
+		createdEnrichPols:   make(map[string]bool),
+		createdScripts:      make(map[string]struct{}),
+		createdRepositories: make(map[string]struct{}),
+		createdAliases:      make(map[string]string),
 	}
 }
 
@@ -276,6 +278,11 @@ func (c *runnerContext) cleanupAll() {
 	for scriptID := range c.createdScripts {
 		if scriptID != "" {
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/_scripts/"+url.PathEscape(scriptID), nil, nil, nil)
+		}
+	}
+	for repo := range c.createdRepositories {
+		if repo != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_snapshot/"+url.PathEscape(repo), nil, nil, nil)
 		}
 	}
 }
@@ -687,6 +694,10 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 	case "put_script":
 		if id := paramString(params, "id"); id != "" {
 			c.createdScripts[id] = struct{}{}
+		}
+	case "snapshot.create_repository", "snapshot.put_repository":
+		if repo := paramString(params, "repository"); repo != "" {
+			c.createdRepositories[repo] = struct{}{}
 		}
 	}
 }
@@ -1558,6 +1569,14 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		}
 		reqPath = "/_scripts/" + id
 
+	case "exists_script":
+		method = http.MethodHead
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("exists_script requires id parameter")
+		}
+		reqPath = "/_scripts/" + id
+
 	case "execute_painless_execute", "scripts_painless_execute":
 		method = http.MethodPost
 		reqPath = "/_scripts/painless/_execute"
@@ -1826,6 +1845,139 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		} else {
 			reqPath = "/_nodes/hot_threads"
 		}
+
+	case "knn_search":
+		method = http.MethodPost
+		if idx := popString("index"); idx != "" {
+			reqPath = "/" + idx + "/_knn_search"
+		} else {
+			reqPath = "/_knn_search"
+		}
+
+	case "cat.data_streams":
+		method = http.MethodGet
+		if name := popString("name"); name != "" {
+			reqPath = "/_cat/data_streams/" + name
+		} else {
+			reqPath = "/_cat/data_streams"
+		}
+
+	case "snapshot.create_repository", "snapshot.put_repository":
+		method = http.MethodPut
+		repo := popString("repository")
+		if repo == "" {
+			return nil, fmt.Errorf("%s requires repository parameter", action)
+		}
+		reqPath = "/_snapshot/" + repo
+
+	case "snapshot.get_repository":
+		method = http.MethodGet
+		if repo := popString("repository"); repo != "" {
+			reqPath = "/_snapshot/" + repo
+		} else {
+			reqPath = "/_snapshot"
+		}
+
+	case "snapshot.delete_repository":
+		method = http.MethodDelete
+		repo := popString("repository")
+		if repo == "" {
+			return nil, fmt.Errorf("snapshot.delete_repository requires repository parameter")
+		}
+		reqPath = "/_snapshot/" + repo
+
+	case "snapshot.verify_repository":
+		method = http.MethodPost
+		repo := popString("repository")
+		if repo == "" {
+			return nil, fmt.Errorf("snapshot.verify_repository requires repository parameter")
+		}
+		reqPath = "/_snapshot/" + repo + "/_verify"
+
+	case "snapshot.create":
+		method = http.MethodPut
+		repo := popString("repository")
+		snap := popString("snapshot")
+		if repo == "" || snap == "" {
+			return nil, fmt.Errorf("snapshot.create requires repository and snapshot parameters")
+		}
+		reqPath = "/_snapshot/" + repo + "/" + snap
+
+	case "snapshot.get":
+		method = http.MethodGet
+		repo := popString("repository")
+		snap := popString("snapshot")
+		if repo == "" || snap == "" {
+			return nil, fmt.Errorf("snapshot.get requires repository and snapshot parameters")
+		}
+		reqPath = "/_snapshot/" + repo + "/" + snap
+
+	case "snapshot.delete":
+		method = http.MethodDelete
+		repo := popString("repository")
+		snap := popString("snapshot")
+		if repo == "" || snap == "" {
+			return nil, fmt.Errorf("snapshot.delete requires repository and snapshot parameters")
+		}
+		reqPath = "/_snapshot/" + repo + "/" + snap
+
+	case "snapshot.status":
+		method = http.MethodGet
+		repo := popString("repository")
+		snap := popString("snapshot")
+		switch {
+		case repo != "" && snap != "":
+			reqPath = "/_snapshot/" + repo + "/" + snap + "/_status"
+		case repo != "":
+			reqPath = "/_snapshot/" + repo + "/_status"
+		default:
+			reqPath = "/_snapshot/_status"
+		}
+
+	case "snapshot.restore":
+		method = http.MethodPost
+		repo := popString("repository")
+		snap := popString("snapshot")
+		if repo == "" || snap == "" {
+			return nil, fmt.Errorf("snapshot.restore requires repository and snapshot parameters")
+		}
+		reqPath = "/_snapshot/" + repo + "/" + snap + "/_restore"
+
+	case "cat.snapshots":
+		method = http.MethodGet
+		if repo := popString("repository"); repo != "" {
+			reqPath = "/_cat/snapshots/" + repo
+		} else {
+			reqPath = "/_cat/snapshots"
+		}
+
+	case "cluster.remote_info":
+		method = http.MethodGet
+		reqPath = "/_remote/info"
+
+	case "nodes.reload_secure_settings":
+		method = http.MethodPost
+		if nodeID := popString("node_id"); nodeID != "" {
+			reqPath = "/_nodes/" + nodeID + "/reload_secure_settings"
+		} else {
+			reqPath = "/_nodes/reload_secure_settings"
+		}
+
+	case "indices.simulate_template":
+		method = http.MethodPost
+		if name := popString("name"); name != "" {
+			reqPath = "/_index_template/_simulate/" + name
+		} else {
+			reqPath = "/_index_template/_simulate"
+		}
+
+	case "indices.simulate_index_template":
+		method = http.MethodPost
+		name := popString("name")
+		if name == "" {
+			return nil, fmt.Errorf("indices.simulate_index_template requires name parameter")
+		}
+		reqPath = "/_index_template/_simulate_index/" + name
 
 	default:
 		return nil, fmt.Errorf("unsupported rest-api-spec action %q", action)

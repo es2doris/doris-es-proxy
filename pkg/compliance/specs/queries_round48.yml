@@ -1,5 +1,5 @@
 ---
-"Pinned, MoreLikeThis, Percolate, and Join queries":
+"Pinned, Wrapper, MatchedQueries, Slice, MoreLikeThis, Percolate, and Join queries":
   - do:
       index:
         index: "r48_books"
@@ -44,12 +44,53 @@
         index: "r48_books"
         body:
           query:
+            wrapper:
+              query: "eyJ0ZXJtIjp7ImNhdGVnb3J5IjoiZGF0YWJhc2UifX0="
+              _name: "wrapped_db"
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "b1" }
+  - match: { hits.hits.0.matched_queries.0: "wrapped_db" }
+
+  - do:
+      search:
+        index: "r48_books"
+        body:
+          slice:
+            id: 0
+            max: 2
+          query:
+            match_all: {}
+  - gt: { hits.total.value: 0 }
+
+  - do:
+      search:
+        index: "r48_books"
+        body:
+          query:
             more_like_this:
               fields: ["title"]
               like: "doris"
               min_term_freq: 1
               min_doc_freq: 1
   - match: { hits.total.value: 2 }
+
+  - do:
+      search:
+        index: "r48_books"
+        body:
+          query:
+            more_like_this:
+              fields: ["title"]
+              like:
+                - _index: "r48_books"
+                  _id: "b1"
+              unlike: "recipes"
+              stop_words: ["with"]
+              min_term_freq: 1
+              min_doc_freq: 1
+              min_word_length: 4
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "b2" }
 
   - do:
       indices.create:
@@ -60,6 +101,8 @@
               query:
                 type: "percolator"
               severity:
+                type: "keyword"
+              service:
                 type: "keyword"
 
   - do:
@@ -73,6 +116,16 @@
               severity: "critical"
 
   - do:
+      index:
+        index: "r48_perc"
+        id: "rule_warn"
+        refresh: true
+        body:
+          query:
+            term:
+              severity: "warning"
+
+  - do:
       search:
         index: "r48_perc"
         body:
@@ -83,3 +136,155 @@
                 severity: "critical"
   - match: { hits.total.value: 1 }
   - match: { hits.hits.0._id: "rule_crit" }
+
+  - do:
+      search:
+        index: "r48_perc"
+        body:
+          query:
+            percolate:
+              field: "query"
+              documents:
+                - severity: "warning"
+                - severity: "critical"
+  - match: { hits.total.value: 2 }
+  - is_true: hits.hits.0.fields._percolator_document_slot
+
+  - do:
+      index:
+        index: "r48_perc_docs"
+        id: "doc_crit_1"
+        refresh: true
+        body:
+          severity: "critical"
+
+  - do:
+      search:
+        index: "r48_perc"
+        body:
+          query:
+            percolate:
+              field: "query"
+              index: "r48_perc_docs"
+              id: "doc_crit_1"
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "rule_crit" }
+
+  - do:
+      search:
+        index: "r48_perc"
+        body:
+          query:
+            percolate:
+              field: "missing_percolator_field"
+              ignore_unmapped: true
+              document:
+                severity: "critical"
+  - match: { hits.total.value: 0 }
+
+---
+"Join family queries: parent_id, has_child, and has_parent":
+  - do:
+      indices.create:
+        index: "r49_join_idx"
+        body:
+          mappings:
+            properties:
+              my_join_field:
+                type: "join"
+                relations:
+                  question: "answer"
+              text:
+                type: "text"
+              votes:
+                type: "integer"
+
+  - do:
+      index:
+        index: "r49_join_idx"
+        id: "q1"
+        refresh: true
+        body:
+          text: "How does Doris ES proxy work?"
+          my_join_field: "question"
+
+  - do:
+      index:
+        index: "r49_join_idx"
+        id: "q2"
+        refresh: true
+        body:
+          text: "Unanswered question"
+          my_join_field:
+            name: "question"
+
+  - do:
+      index:
+        index: "r49_join_idx"
+        id: "a1"
+        routing: "q1"
+        refresh: true
+        body:
+          text: "It translates Elasticsearch DSL to Doris SQL"
+          votes: 10
+          my_join_field:
+            name: "answer"
+            parent: "q1"
+
+  - do:
+      index:
+        index: "r49_join_idx"
+        id: "a2"
+        routing: "q1"
+        refresh: true
+        body:
+          text: "And supports full REST compliance"
+          votes: 5
+          my_join_field:
+            name: "answer"
+            parent: "q1"
+
+  - do:
+      search:
+        index: "r49_join_idx"
+        body:
+          query:
+            parent_id:
+              type: "answer"
+              id: "q1"
+  - match: { hits.total.value: 2 }
+
+  - do:
+      search:
+        index: "r49_join_idx"
+        body:
+          query:
+            has_child:
+              type: "answer"
+              score_mode: "sum"
+              min_children: 2
+              inner_hits:
+                name: "matching_answers"
+              query:
+                match_all: {}
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "q1" }
+  - gt: { hits.hits.0._score: 1.0 }
+  - match: { hits.hits.0.inner_hits.matching_answers.hits.total.value: 2 }
+
+  - do:
+      search:
+        index: "r49_join_idx"
+        body:
+          query:
+            has_parent:
+              parent_type: "question"
+              score: true
+              inner_hits:
+                name: "parent_question"
+              query:
+                match:
+                  text: "Doris"
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0.inner_hits.parent_question.hits.total.value: 1 }
+  - match: { hits.hits.0.inner_hits.parent_question.hits.hits.0._id: "q1" }

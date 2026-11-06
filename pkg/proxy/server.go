@@ -190,6 +190,8 @@ type Server struct {
 	ilmPolicies           map[string]map[string]any
 	dataStreams           map[string]map[string]any
 	scripts               map[string]map[string]any
+	snapshotRepos         map[string]map[string]any
+	snapshots             map[string]map[string]map[string]any
 }
 
 func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerOptions) *Server {
@@ -218,6 +220,8 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		ilmPolicies:           make(map[string]map[string]any),
 		dataStreams:           make(map[string]map[string]any),
 		scripts:               make(map[string]map[string]any),
+		snapshotRepos:         make(map[string]map[string]any),
+		snapshots:             make(map[string]map[string]map[string]any),
 	}
 	s.coalescer = newStreamLoadCoalescer(func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
 		err := s.backend.StreamLoad(ctx, table, ndjson, syncRefresh)
@@ -817,6 +821,10 @@ func (s *Server) Handler() http.Handler {
 				s.handleBulk(w, r)
 			case "_search":
 				s.handleSearch(w, r)
+			case "_knn_search":
+				s.handleKNNSearch(w, r)
+			case "_snapshot":
+				s.handleSnapshotRoot(w, r)
 			case "_msearch":
 				s.handleMSearch(w, r)
 			case "_mget":
@@ -915,8 +923,15 @@ func (s *Server) Handler() http.Handler {
 				s.handleClusterPendingTasks(w, r)
 			case segs[0] == "_cluster" && segs[1] == "reroute":
 				s.handleClusterReroute(w, r)
+			case segs[0] == "_remote" && segs[1] == "info":
+				s.handleRemoteInfo(w, r)
+			case segs[0] == "_nodes" && segs[1] == "reload_secure_settings":
+				s.handleReloadSecureSettings(w, r)
 			case segs[0] == "_nodes":
 				s.handleNodes(w, r)
+			case segs[0] == "_snapshot":
+				r.SetPathValue("repository", segs[1])
+				s.handleSnapshotRepo(w, r)
 			case segs[0] == "_scripts":
 				r.SetPathValue("id", segs[1])
 				s.handleScriptsAPI(w, r)
@@ -939,9 +954,15 @@ func (s *Server) Handler() http.Handler {
 				s.handleILMExplain(w, r)
 			case segs[0] == "_ilm" && segs[1] == "status":
 				writeJSON(w, http.StatusOK, map[string]any{"operation_mode": "RUNNING"})
+			case segs[0] == "_data_stream" && segs[1] == "_stats":
+				s.handleDataStreamsStats(w, r)
 			case segs[0] == "_data_stream":
 				r.SetPathValue("name", segs[1])
 				s.handleDataStream(w, r)
+			case segs[0] == "_cat" && segs[1] == "data_streams":
+				s.handleCatDataStreams(w, r)
+			case segs[0] == "_cat" && segs[1] == "snapshots":
+				s.handleCatSnapshots(w, r)
 			case segs[0] == "_cat" && segs[1] == "indices":
 				s.handleCatIndices(w, r)
 			case segs[0] == "_cat" && segs[1] == "aliases":
@@ -1004,6 +1025,8 @@ func (s *Server) Handler() http.Handler {
 			case segs[0] == "_alias" || segs[0] == "_aliases":
 				r.SetPathValue("name", segs[1])
 				s.handleGetAliases(w, r)
+			case segs[0] == "_index_template" && segs[1] == "_simulate":
+				s.handleSimulateIndexTemplate(w, r)
 			case segs[0] == "_index_template" || segs[0] == "_template" || segs[0] == "_component_template":
 				r.SetPathValue("name", segs[1])
 				s.handleIndexTemplate(w, r)
@@ -1022,6 +1045,8 @@ func (s *Server) Handler() http.Handler {
 					s.handleGetIndexAliases(w, r)
 				case "_search":
 					s.handleSearch(w, r)
+				case "_knn_search":
+					s.handleKNNSearch(w, r)
 				case "_msearch":
 					s.handleMSearch(w, r)
 				case "_mget":
@@ -1096,8 +1121,28 @@ func (s *Server) Handler() http.Handler {
 				s.handleClusterAllocationExplain(w, r)
 				return
 			}
+			if segs[0] == "_nodes" && segs[2] == "reload_secure_settings" {
+				s.handleReloadSecureSettings(w, r)
+				return
+			}
 			if segs[0] == "_nodes" {
 				s.handleNodes(w, r)
+				return
+			}
+			if segs[0] == "_snapshot" {
+				r.SetPathValue("repository", segs[1])
+				r.SetPathValue("snapshot", segs[2])
+				s.handleSnapshotActionOrItem(w, r)
+				return
+			}
+			if segs[0] == "_index_template" && segs[1] == "_simulate" {
+				r.SetPathValue("name", segs[2])
+				s.handleSimulateIndexTemplate(w, r)
+				return
+			}
+			if segs[0] == "_index_template" && segs[1] == "_simulate_index" {
+				r.SetPathValue("name", segs[2])
+				s.handleSimulateIndexTemplateIndex(w, r)
 				return
 			}
 			if segs[0] == "_scripts" {
@@ -1150,6 +1195,11 @@ func (s *Server) Handler() http.Handler {
 				s.handleResolveIndex(w, r)
 				return
 			}
+			if segs[0] == "_data_stream" && segs[2] == "_stats" {
+				r.SetPathValue("name", segs[1])
+				s.handleDataStreamsStats(w, r)
+				return
+			}
 			if segs[0] == "_data_stream" && segs[2] == "_rollover" {
 				r.SetPathValue("alias", segs[1])
 				s.handleRollover(w, r)
@@ -1173,6 +1223,13 @@ func (s *Server) Handler() http.Handler {
 				r.SetPathValue("index", segs[2])
 				r.SetPathValue("name", segs[2])
 				switch segs[1] {
+				case "data_streams":
+					s.handleCatDataStreams(w, r)
+					return
+				case "snapshots":
+					r.SetPathValue("repository", segs[2])
+					s.handleCatSnapshots(w, r)
+					return
 				case "indices":
 					s.handleCatIndices(w, r)
 					return
@@ -1312,6 +1369,13 @@ func (s *Server) Handler() http.Handler {
 			}
 
 		case 4:
+			if segs[0] == "_snapshot" {
+				r.SetPathValue("repository", segs[1])
+				r.SetPathValue("snapshot", segs[2])
+				r.SetPathValue("action", segs[3])
+				s.handleSnapshotItemAction(w, r)
+				return
+			}
 			if segs[0] == "_cluster" && segs[1] == "state" {
 				s.handleClusterState(w, r)
 				return
@@ -4576,6 +4640,10 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 	}
 	docPayload, nextIndex, nextDocID, pipeRouting, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithRouting(pipeInputIdx, docID, r.URL.Query().Get("pipeline"), "", reqRouting, json.RawMessage(rawDoc))
 	if pipeErr != nil {
+		if strings.Contains(pipeErr.Error(), "cannot execute stored script") {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", pipeErr.Error())
+			return
+		}
 		writeESError(w, http.StatusBadRequest, ingestErrorType(pipeErr), pipeErr.Error())
 		return
 	}
@@ -5343,6 +5411,10 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 			updReq.DetectNoop = &b
 		}
 	}
+	if missingID := s.findMissingStoredScriptInRawBody(bodyBytes); missingID != "" {
+		writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("cannot execute stored script [%s] because it does not exist", missingID))
+		return
+	}
 	s.resolvePainlessScriptSpecFromRaw(&updReq.Script, bodyBytes)
 	if updReq.Doc == nil && (updReq.Script == nil || strings.TrimSpace(updReq.Script.Source) == "") {
 		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: script or doc is missing;")
@@ -5788,6 +5860,16 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
 			return
 		}
+		if missingID := s.findMissingStoredScriptInRawBody(bodyBytes); missingID != "" {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("cannot execute stored script [%s] because it does not exist", missingID))
+			return
+		}
+		if body.Query != nil {
+			if missingID := s.validateStoredScriptsInQuery(body.Query); missingID != "" {
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("cannot execute stored script [%s] because it does not exist", missingID))
+				return
+			}
+		}
 		s.resolvePainlessScriptSpecFromRaw(&body.Script, bodyBytes)
 	}
 	sliceID, sliceMax, hasSlice, sliceErrStatus, sliceErrType, sliceErrReason := parseAndValidateSliceParams(r, body.Slices, body.Slice)
@@ -5859,6 +5941,10 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 	batches := 0
 	conflictsProceed := strings.EqualFold(effConflicts, "proceed")
 	if body.Query != nil {
+		if missingID := s.validateStoredScriptsInQuery(body.Query); missingID != "" {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("cannot execute stored script [%s] because it does not exist", missingID))
+			return
+		}
 		s.resolveStoredScriptsInQuery(body.Query)
 		if hasTermsLookupInQuery(body.Query) {
 			s.resolveTermsLookupsInQuery(r.Context(), body.Query)
@@ -6345,6 +6431,10 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 	totalDeleted := 0
 	batches := 0
 	if body.Query != nil {
+		if missingID := s.validateStoredScriptsInQuery(body.Query); missingID != "" {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("cannot execute stored script [%s] because it does not exist", missingID))
+			return
+		}
 		s.resolveStoredScriptsInQuery(body.Query)
 		if hasTermsLookupInQuery(body.Query) {
 			s.resolveTermsLookupsInQuery(r.Context(), body.Query)
@@ -8160,6 +8250,9 @@ func (s *Server) executeSearchRequest(
 		}
 		if errMsg := validatePipelineAggs(req.EffectiveAggs()); errMsg != "" {
 			return nil, http.StatusBadRequest, "illegal_argument_exception", errMsg
+		}
+		if missingID := s.validateStoredScriptsInSearchRequest(req); missingID != "" {
+			return nil, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("cannot execute stored script [%s] because it does not exist", missingID)
 		}
 		s.resolveStoredScriptsInSearchRequest(req)
 		if hasTermsLookupInSearchRequest(req) {
@@ -11172,8 +11265,32 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 				}
 				hitMap["inner_hits"] = ihMap
 			}
-			if queryHasNamedClauses(req.Query) {
-				if matchedNames := collectMatchedQueryNames(hitSchema, getDoc(), req.Query); len(matchedNames) > 0 {
+			var joinIdsWithIH []*esast.IdsQuery
+			collectIdsQueriesWithInnerHits(req.Query, &joinIdsWithIH)
+			collectIdsQueriesWithInnerHits(req.PostFilter, &joinIdsWithIH)
+			if len(joinIdsWithIH) > 0 {
+				ihMap, _ := hitMap["inner_hits"].(map[string]any)
+				if ihMap == nil {
+					ihMap = make(map[string]any, len(joinIdsWithIH))
+				}
+				for _, iq := range joinIdsWithIH {
+					if ihVal, ok := iq.ResolvedInnerHits[h.ID]; ok && ihVal != nil {
+						ihName := iq.JoinRelType
+						if iq.InnerHitsSpec != nil && iq.InnerHitsSpec.Name != "" {
+							ihName = iq.InnerHitsSpec.Name
+						}
+						if ihName == "" {
+							ihName = "inner_hits"
+						}
+						ihMap[ihName] = ihVal
+					}
+				}
+				if len(ihMap) > 0 {
+					hitMap["inner_hits"] = ihMap
+				}
+			}
+			if queryHasNamedClauses(req.Query) || queryHasNamedClauses(req.PostFilter) || knnSliceHasNamedClauses(req.KNN) {
+				if matchedNames := collectMatchedQueryNamesForSearch(hitSchema, getDoc(), req.Query, req.PostFilter, req.KNN); len(matchedNames) > 0 {
 					hitMap["matched_queries"] = matchedNames
 				}
 			}
@@ -22389,6 +22506,15 @@ func scoreNonScriptClauseOnDoc(idxSchema *schema.IndexSchema, doc map[string]any
 	if q == nil {
 		return 1.0
 	}
+	if q.Ids != nil && len(q.Ids.ResolvedScores) > 0 {
+		docID, _ := doc["__meta_id"].(string)
+		if docID == "" {
+			docID, _ = doc["_id"].(string)
+		}
+		if sc, ok := q.Ids.ResolvedScores[docID]; ok {
+			return sc
+		}
+	}
 	if queryHasNestedScoring(q) {
 		return evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q, 1.0)
 	}
@@ -22446,6 +22572,15 @@ func evalRandomScoreOnDoc(doc map[string]any, rs *esast.RandomScoreSpec) float64
 func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[string]any, q *esast.Query, baseScore float64) float64 {
 	if q == nil {
 		return baseScore
+	}
+	if q.Ids != nil && len(q.Ids.ResolvedScores) > 0 {
+		docID, _ := doc["__meta_id"].(string)
+		if docID == "" {
+			docID, _ = doc["_id"].(string)
+		}
+		if sc, ok := q.Ids.ResolvedScores[docID]; ok {
+			return sc
+		}
 	}
 	if q.ConstantScore != nil {
 		if !evalBranchMatchesDoc(idxSchema, doc, &q.ConstantScore.Filter) {

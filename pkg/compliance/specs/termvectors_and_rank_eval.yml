@@ -7,6 +7,7 @@
         refresh: true
         body:
           text: "search engine search fast"
+          summary: "a fast search tool"
 
   - do:
       termvectors:
@@ -21,6 +22,23 @@
   - match: { term_vectors.text.terms.fast.term_freq: 1 }
 
   - do:
+      termvectors:
+        index: "tv_test"
+        body:
+          doc:
+            text: "alpha beta_two alpha"
+          fields: ["te*"]
+          per_field_analyzer:
+            text: "whitespace"
+          filter:
+            min_term_freq: 2
+            min_word_length: 4
+  - match: { _index: "tv_test" }
+  - match: { _version: 0 }
+  - match: { found: true }
+  - match: { term_vectors.text.terms.alpha.term_freq: 2 }
+
+  - do:
       mtermvectors:
         index: "tv_test"
         body:
@@ -29,8 +47,24 @@
   - match: { docs.0._id: "doc1" }
   - match: { docs.0.found: true }
 
+  - do:
+      mtermvectors:
+        body:
+          docs:
+            - _index: "tv_test"
+              _id: "doc1"
+              fields: ["text"]
+            - _index: "tv_test"
+              doc:
+                text: "inline artificial document"
+  - length: { docs: 2 }
+  - match: { docs.0._id: "doc1" }
+  - match: { docs.0.found: true }
+  - match: { docs.1.found: true }
+  - match: { docs.1._version: 0 }
+
 ---
-"Rank evaluation precision and MRR":
+"Rank evaluation precision, MRR, DCG, NDCG, ERR, and recall":
   - do:
       index:
         index: "rank_idx"
@@ -67,3 +101,84 @@
               relevant_rating_threshold: 1
   - match: { metric_score: 1.0 }
   - is_true: details.compliance_q
+
+  - do:
+      rank_eval:
+        index: "rank_idx"
+        body:
+          requests:
+            - id: "compliance_q"
+              request:
+                query:
+                  match:
+                    title: "compliance"
+              ratings:
+                - _index: "rank_idx"
+                  _id: "1"
+                  rating: 2
+          metric:
+            mean_reciprocal_rank:
+              k: 5
+              relevant_rating_threshold: 1
+  - match: { metric_score: 1.0 }
+
+  - do:
+      rank_eval:
+        index: "rank_idx"
+        body:
+          requests:
+            - id: "compliance_q"
+              request:
+                query:
+                  match:
+                    title: "compliance"
+              ratings:
+                - _index: "rank_idx"
+                  _id: "1"
+                  rating: 3
+          metric:
+            dcg:
+              k: 5
+              normalize: true
+              discount_factor: "linear"
+  - match: { metric_score: 1.0 }
+
+  - do:
+      rank_eval:
+        index: "rank_idx"
+        body:
+          requests:
+            - id: "compliance_q"
+              request:
+                query:
+                  match:
+                    title: "compliance"
+              ratings:
+                - _index: "rank_idx"
+                  _id: "1"
+                  rating: 3
+          metric:
+            expected_reciprocal_rank:
+              k: 5
+              maximum_relevance: 3
+  - gt: { metric_score: 0.8 }
+
+  - do:
+      rank_eval:
+        index: "rank_idx"
+        body:
+          requests:
+            - id: "compliance_q"
+              request:
+                query:
+                  match:
+                    title: "compliance"
+              ratings:
+                - _index: "rank_idx"
+                  _id: "1"
+                  rating: 2
+          metric:
+            recall:
+              k: 5
+              relevant_rating_threshold: 1
+  - match: { metric_score: 1.0 }
