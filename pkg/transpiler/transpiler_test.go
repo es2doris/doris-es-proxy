@@ -3172,3 +3172,137 @@ func TestRound47TranspilerSpecCompliance(t *testing.T) {
 		}
 	}
 }
+
+func TestRound48TranspilerSpecCompliance(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"title":      {"type": "text", "analyzer": "stop"},
+			"body":       {"type": "text"},
+			"age":        {"type": "integer"},
+			"location":   {"type": "geo_point"},
+			"region":     {"type": "geo_shape"},
+			"labels":     {"type": "flattened"},
+			"date_rng":   {"type": "date_range"},
+			"rng_alias":  {"type": "alias", "path": "date_rng"},
+			"items": {
+				"type": "nested",
+				"properties": {
+					"attrs": {"type": "flattened"},
+					"win":   {"type": "integer_range"}
+				}
+			}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("mapping unmarshal failed: %v", err)
+	}
+	sch := schema.CompileIndexSchema("db", "r48_tr_idx", &spec)
+	tr := NewTranspiler(sch, TranspilerOptions{UseDoris4SearchFunc: true})
+
+	// F8: WrapperQuery.Decoded compilation and queryContainsScript / queryContainsNestedScoring traversal
+	var wq esast.Query
+	if err := json.Unmarshal([]byte(`{"wrapper": {"query": "eyJzY3JpcHQiOnsic2NyaXB0IjoiZG9jWydhZ2UnXS52YWx1ZSA+IDEwIn19"}}`), &wq); err != nil {
+		t.Fatalf("F8 wrapper unmarshal failed: %v", err)
+	}
+	if !queryContainsScript(&wq) {
+		t.Fatalf("F8 expected queryContainsScript to traverse Wrapper.Decoded")
+	}
+	cqWrap := tr.CompileQuery(&wq, true, nil)
+	if !strings.Contains(cqWrap.WhereSQL, "f__age") {
+		t.Fatalf("F8 expected WrapperQuery.Decoded to compile script condition on f__age, got %s", cqWrap.WhereSQL)
+	}
+
+	// F11: MoreLikeThisQuery array/nested doc fields, minimum_should_match, unlike, and include=false _id exclusion
+	var mltQ esast.Query
+	if err := json.Unmarshal([]byte(`{
+		"more_like_this": {
+			"fields": ["body", "meta.tags"],
+			"like": [
+				{"_id": "doc-1", "doc": {"body": ["alpha beta", "gamma"], "meta": {"tags": ["delta"]}}}
+			],
+			"unlike": ["poison"],
+			"minimum_should_match": 2,
+			"include": false
+		}
+	}`), &mltQ); err != nil {
+		t.Fatalf("F11 MLT unmarshal failed: %v", err)
+	}
+	cqMLT := tr.CompileQuery(&mltQ, true, nil)
+	if !strings.Contains(cqMLT.WhereSQL, ">= 2") || !strings.Contains(cqMLT.WhereSQL, "NOT COALESCE") || !strings.Contains(cqMLT.WhereSQL, "`_id` NOT IN ('doc-1')") {
+		t.Fatalf("F11 expected MSM >= 2, NOT COALESCE for unlike, and _id NOT IN ('doc-1'), got %s", cqMLT.WhereSQL)
+	}
+
+	// F12: GeoShapeQuery circle radius, polygon ray-casting, geometrycollection, CONTAINS on geo_point, and _doc geo_shape evaluation
+	var gsCircle, gsPoly, gsColl, gsContains, gsDocShape esast.Query
+	_ = json.Unmarshal([]byte(`{"geo_shape": {"location": {"shape": {"type": "circle", "coordinates": [-74.0, 40.7], "radius": "5km"}}}}`), &gsCircle)
+	_ = json.Unmarshal([]byte(`{"geo_shape": {"location": {"shape": "POLYGON ((-75 40, -73 40, -73 42, -75 42, -75 40))"}}}`), &gsPoly)
+	_ = json.Unmarshal([]byte(`{"geo_shape": {"location": {"shape": "GEOMETRYCOLLECTION (POINT (-74 40.7), POINT (-73.9 40.8))"}}}`), &gsColl)
+	_ = json.Unmarshal([]byte(`{"geo_shape": {"location": {"shape": "POLYGON ((-75 40, -73 40, -73 42, -75 42, -75 40))", "relation": "CONTAINS"}}}`), &gsContains)
+	_ = json.Unmarshal([]byte(`{"geo_shape": {"region": {"shape": {"type": "envelope", "coordinates": [[-75.0, 42.0], [-73.0, 40.0]]}}}}`), &gsDocShape)
+
+	if w := tr.CompileQuery(&gsCircle, false, nil).WhereSQL; !strings.Contains(w, "ST_Distance_Sphere") || !strings.Contains(w, "5000") {
+		t.Fatalf("F12 expected circle GeoShapeQuery to emit ST_Distance_Sphere <= 5000, got %s", w)
+	}
+	if w := tr.CompileQuery(&gsPoly, false, nil).WhereSQL; !strings.Contains(w, "% 2 = 1") {
+		t.Fatalf("F12 expected polygon GeoShapeQuery to emit ray-casting parity check, got %s", w)
+	}
+	if w := tr.CompileQuery(&gsColl, false, nil).WhereSQL; !strings.Contains(w, " OR ") {
+		t.Fatalf("F12 expected geometrycollection GeoShapeQuery to combine child shapes with OR, got %s", w)
+	}
+	if w := tr.CompileQuery(&gsContains, false, nil).WhereSQL; w != "FALSE" {
+		t.Fatalf("F12 expected geo_point CONTAINS non-point polygon to be FALSE, got %s", w)
+	}
+	if w := tr.CompileQuery(&gsDocShape, false, nil).WhereSQL; !strings.Contains(w, "['coordinates']") {
+		t.Fatalf("F12 expected _doc geo_shape field to extract coordinates from _doc, got %s", w)
+	}
+
+	// F13: lenient: true on single-field query_string / match and zero_terms_query: "all" after stopword filtering
+	var qsLenient, matchLenient, matchStopAll, matchStopNone esast.Query
+	_ = json.Unmarshal([]byte(`{"query_string": {"default_field": "age", "query": "not_an_int", "lenient": true}}`), &qsLenient)
+	_ = json.Unmarshal([]byte(`{"match": {"age": {"query": "not_an_int 42", "lenient": true}}}`), &matchLenient)
+	_ = json.Unmarshal([]byte(`{"match": {"body": {"query": "the and of", "zero_terms_query": "all"}}}`), &matchStopAll)
+	_ = json.Unmarshal([]byte(`{"match": {"title": {"query": "the and of"}}}`), &matchStopNone)
+
+	if w := tr.CompileQuery(&qsLenient, false, nil).WhereSQL; w != "FALSE" {
+		t.Fatalf("F13 expected lenient query_string on integer field with non-int to return FALSE, got %s", w)
+	}
+	if w := tr.CompileQuery(&matchLenient, false, nil).WhereSQL; !strings.Contains(w, "`f__age` = 42") {
+		t.Fatalf("F13 expected lenient multi-token match on integer field to keep valid token 42, got %s", w)
+	}
+	if w := tr.CompileQuery(&matchStopAll, false, nil).WhereSQL; w != "TRUE" {
+		t.Fatalf("F13 expected stopword-only match with zero_terms_query='all' to return TRUE, got %s", w)
+	}
+	if w := tr.CompileQuery(&matchStopNone, false, nil).WhereSQL; w != "FALSE" {
+		t.Fatalf("F13 expected stopword-only match on stop-analyzed field with zero_terms_query='none' to return FALSE, got %s", w)
+	}
+
+	// F14: Range field inside nested query, alias to range field, and date_range with explicit Z timezone + time_zone param
+	var nestedRangeQ, aliasRangeQ esast.Query
+	_ = json.Unmarshal([]byte(`{"nested": {"path": "items", "query": {"range": {"win": {"gte": 2, "lte": 8}}}}}`), &nestedRangeQ)
+	_ = json.Unmarshal([]byte(`{"range": {"rng_alias": {"gte": "2026-01-01T00:00:00Z", "lte": "2026-01-01", "time_zone": "+02:00"}}}`), &aliasRangeQ)
+
+	if w := tr.CompileQuery(&nestedRangeQ, false, nil).WhereSQL; !strings.Contains(w, "$.win._gte") || !strings.Contains(w, "n__items") {
+		t.Fatalf("F14 expected nested range query to read $.win._gte from correlated nested element, got %s", w)
+	}
+	wAliasRng := tr.CompileQuery(&aliasRangeQ, false, nil).WhereSQL
+	// 2026-01-01T00:00:00Z has explicit Z so it must NOT subtract +02:00 (stays 1767225600000), while "2026-01-01" has no explicit TZ so it rounds up and subtracts +02:00
+	if !strings.Contains(wAliasRng, "['date_rng']") || !strings.Contains(wAliasRng, "1767225600000") {
+		t.Fatalf("F14 expected alias range query to resolve ['date_rng'] and preserve explicit Z timestamp 1767225600000, got %s", wAliasRng)
+	}
+
+	// F15: Flattened root leaf search, sub-key array matching, and nested flattened sub-key matching
+	var flatRootQ, flatSubKeyQ, flatNestedQ esast.Query
+	_ = json.Unmarshal([]byte(`{"term": {"labels": "prod"}}`), &flatRootQ)
+	_ = json.Unmarshal([]byte(`{"term": {"labels.env": "prod"}}`), &flatSubKeyQ)
+	_ = json.Unmarshal([]byte(`{"nested": {"path": "items", "query": {"term": {"attrs.color": "red"}}}}`), &flatNestedQ)
+
+	if w := tr.CompileQuery(&flatRootQ, false, nil).WhereSQL; !strings.Contains(w, `LIKE '%"prod"%'`) {
+		t.Fatalf("F15 expected root flattened term query to match JSON leaf string, got %s", w)
+	}
+	if w := tr.CompileQuery(&flatSubKeyQ, false, nil).WhereSQL; !strings.Contains(w, "array_contains(CAST(`_doc`['labels']['env'] AS ARRAY<STRING>), 'prod')") {
+		t.Fatalf("F15 expected flattened sub-key term query to check array_contains on _doc['labels']['env'], got %s", w)
+	}
+	if w := tr.CompileQuery(&flatNestedQ, false, nil).WhereSQL; !strings.Contains(w, "$.attrs.color") || !strings.Contains(w, "ARRAY<STRING>") {
+		t.Fatalf("F15 expected nested flattened sub-key query to extract $.attrs.color and check ARRAY<STRING>, got %s", w)
+	}
+}

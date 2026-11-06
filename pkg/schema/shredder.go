@@ -1695,7 +1695,7 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 			if strings.Contains(k, ".") {
 				return false, fmt.Errorf("mapper_parsing_exception: object mapping for [%s] tried to parse field [%s] as object, but subobjects is set to false", scope, k)
 			}
-			isAllowedObjectProp := exists && (strings.EqualFold(prop.Type, "flattened") || strings.EqualFold(prop.Type, "geo_point") || strings.EqualFold(prop.Type, "completion") || IsRangeFieldType(prop.Type) || (prop.Enabled != nil && !*prop.Enabled))
+			isAllowedObjectProp := exists && (strings.EqualFold(prop.Type, "flattened") || strings.EqualFold(prop.Type, "percolator") || strings.EqualFold(prop.Type, "join") || strings.EqualFold(prop.Type, "geo_point") || strings.EqualFold(prop.Type, "geo_shape") || strings.EqualFold(prop.Type, "completion") || IsRangeFieldType(prop.Type) || (prop.Enabled != nil && !*prop.Enabled))
 			if !isAllowedObjectProp && hasObjectValueAtPath(v, nil) {
 				return false, fmt.Errorf("mapper_parsing_exception: object mapping for [%s] tried to parse field [%s] as object, but subobjects is set to false", scope, k)
 			}
@@ -1716,7 +1716,7 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 				if pathPrefix != "" {
 					fullPath = pathPrefix + "." + parts[0]
 				}
-				if (p0.Enabled != nil && !*p0.Enabled) || strings.EqualFold(p0.Type, "flattened") {
+				if (p0.Enabled != nil && !*p0.Enabled) || strings.EqualFold(p0.Type, "flattened") || strings.EqualFold(p0.Type, "percolator") {
 					continue
 				}
 				subPruned, err := validateStrictDynamicObject(subObj, p0.Properties, childMode, childSubobjects, fullPath)
@@ -1742,7 +1742,7 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 			}
 			continue
 		}
-		if strings.EqualFold(prop.Type, "flattened") {
+		if strings.EqualFold(prop.Type, "flattened") || strings.EqualFold(prop.Type, "percolator") {
 			continue
 		}
 		if prop.Enabled != nil && !*prop.Enabled {
@@ -2292,6 +2292,9 @@ func normalizeScalar(v any) any {
 		}
 		return nil
 	case map[string]any:
+		if nameVal, ok := val["name"]; ok && nameVal != nil {
+			return fmt.Sprintf("%v", nameVal)
+		}
 		b, _ := json.Marshal(val)
 		return string(b)
 	default:
@@ -3695,7 +3698,7 @@ func parseCIDRRangeMap(cidrStr, fieldPath string) (map[string]any, error) {
 	}, nil
 }
 
-func parseRangeBoundValue(raw any, b FieldBinding, getNow func() time.Time) (float64, int64, bool) {
+func parseRangeBoundValue(raw any, b FieldBinding, getNow func() time.Time, roundUp bool) (float64, int64, bool) {
 	if raw == nil {
 		return 0, 0, false
 	}
@@ -3754,7 +3757,7 @@ func parseRangeBoundValue(raw any, b FieldBinding, getNow func() time.Time) (flo
 		switch tv := raw.(type) {
 		case string:
 			if b.Format != "" {
-				if ms, ok := ParseESDateWithFormatToEpochMillis(tv, b.Format, getNow()); ok {
+				if ms, ok := ParseESDateBoundWithFormatToEpochMillis(tv, b.Format, getNow(), roundUp); ok {
 					return float64(ms), ms, true
 				}
 				return 0, 0, false
@@ -3762,7 +3765,7 @@ func parseRangeBoundValue(raw any, b FieldBinding, getNow func() time.Time) (flo
 			if iv, err := strconv.ParseInt(strings.TrimSpace(tv), 10, 64); err == nil {
 				return float64(iv), iv, true
 			}
-			if ms, ok := ParseESDateToEpochMillis(tv, getNow()); ok {
+			if ms, ok := ParseESDateBoundToEpochMillis(tv, getNow(), roundUp); ok {
 				return float64(ms), ms, true
 			}
 		case json.Number:
@@ -3824,13 +3827,13 @@ func validateAndPopulateSingleRangeMap(m map[string]any, b FieldBinding, getNow 
 		return fmt.Errorf("mapper_parsing_exception: invalid range bounds for field [%s]", b.ESFieldPath)
 	}
 	esType := strings.ToLower(strings.TrimSpace(b.ESType))
-	isIntRange := esType == "integer_range" || esType == "long_range"
+	isIntRange := esType == "integer_range" || esType == "long_range" || esType == "date_range"
 	hasLower := hasGt || hasGte
 	hasUpper := hasLt || hasLte
 	var lowerFloat, upperFloat float64
 	var lowerInt, upperInt int64
 	if hasLower {
-		lf, li, ok := parseRangeBoundValue(rawLower, b, getNow)
+		lf, li, ok := parseRangeBoundValue(rawLower, b, getNow, false)
 		if !ok {
 			return fmt.Errorf("mapper_parsing_exception: failed to parse lower bound of range field [%s] of type [%s]", b.ESFieldPath, b.ESType)
 		}
@@ -3843,12 +3846,14 @@ func validateAndPopulateSingleRangeMap(m map[string]any, b FieldBinding, getNow 
 				lf = float64(li)
 			} else if esType == "ip_range" {
 				lf += 1.0
+			} else {
+				lf = math.Nextafter(lf, math.Inf(1))
 			}
 		}
 		lowerFloat, lowerInt = lf, li
 	}
 	if hasUpper {
-		uf, ui, ok := parseRangeBoundValue(rawUpper, b, getNow)
+		uf, ui, ok := parseRangeBoundValue(rawUpper, b, getNow, hasLte)
 		if !ok {
 			return fmt.Errorf("mapper_parsing_exception: failed to parse upper bound of range field [%s] of type [%s]", b.ESFieldPath, b.ESType)
 		}
@@ -3861,6 +3866,8 @@ func validateAndPopulateSingleRangeMap(m map[string]any, b FieldBinding, getNow 
 				uf = float64(ui)
 			} else if esType == "ip_range" {
 				uf -= 1.0
+			} else {
+				uf = math.Nextafter(uf, math.Inf(-1))
 			}
 		}
 		upperFloat, upperInt = uf, ui
@@ -3870,12 +3877,8 @@ func validateAndPopulateSingleRangeMap(m map[string]any, b FieldBinding, getNow 
 			if lowerInt > upperInt {
 				return fmt.Errorf("mapper_parsing_exception: lower bound cannot be greater than upper bound in range field [%s]", b.ESFieldPath)
 			}
-		} else if esType == "ip_range" {
-			if lowerFloat > upperFloat {
-				return fmt.Errorf("mapper_parsing_exception: lower bound cannot be greater than upper bound in range field [%s]", b.ESFieldPath)
-			}
 		} else {
-			if lowerFloat > upperFloat || (lowerFloat == upperFloat && (hasGt || hasLt)) {
+			if lowerFloat > upperFloat {
 				return fmt.Errorf("mapper_parsing_exception: lower bound cannot be greater than upper bound in range field [%s]", b.ESFieldPath)
 			}
 		}

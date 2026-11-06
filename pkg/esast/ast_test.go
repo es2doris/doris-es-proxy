@@ -1542,3 +1542,69 @@ func TestRound47ASTSpecCompliance(t *testing.T) {
 		t.Fatalf("ParseBulkNDJSON _source_includes failed: err=%v actions=%+v", err, bulkActions)
 	}
 }
+
+func TestRound48ASTSpecCompliance(t *testing.T) {
+	// F29: SearchRequest.Slice
+	var req SearchRequest
+	if err := json.Unmarshal([]byte(`{"slice": {"id": 1, "max": 4, "field": "uid"}, "query": {"match_all": {"_name": "all_q"}}}`), &req); err != nil {
+		t.Fatalf("F29 SearchRequest.Slice unmarshal failed: %v", err)
+	}
+	if req.Slice == nil || req.Slice.ID != 1 || req.Slice.Max != 4 || req.Slice.Field != "uid" {
+		t.Fatalf("F29 unexpected Slice: %+v", req.Slice)
+	}
+	if req.Query == nil || req.Query.Name != "all_q" {
+		t.Fatalf("F8 expected Query.Name='all_q', got %+v", req.Query)
+	}
+
+	// F8: Named queries (_name) extraction across query types
+	namedQueries := map[string]string{
+		`{"term": {"status": {"value": "active", "_name": "term_q"}}}`:       "term_q",
+		`{"range": {"age": {"gte": 10, "_name": "range_q"}}}`:                "range_q",
+		`{"match": {"title": {"query": "hello", "_name": "match_q"}}}`:       "match_q",
+		`{"bool": {"must": [{"match_all": {}}], "_name": "bool_q"}}`:         "bool_q",
+		`{"constant_score": {"filter": {"match_all": {}}, "_name": "cs_q"}}`: "cs_q",
+		`{"exists": {"field": "tags", "_name": "exists_q"}}`:                 "exists_q",
+	}
+	for raw, wantName := range namedQueries {
+		var q Query
+		if err := json.Unmarshal([]byte(raw), &q); err != nil {
+			t.Fatalf("F8 failed to unmarshal %s: %v", raw, err)
+		}
+		if q.Name != wantName {
+			t.Fatalf("F8 for %s expected q.Name=%q, got %q", raw, wantName, q.Name)
+		}
+	}
+
+	// F8: WrapperQuery.Decoded populated and invalid inner query rejected
+	var wq Query
+	if err := json.Unmarshal([]byte(`{"wrapper": {"query": "eyJ0ZXJtIjp7InN0YXR1cyI6ImFjdGl2ZSJ9fQ=="}}`), &wq); err != nil {
+		t.Fatalf("F8 WrapperQuery unmarshal failed: %v", err)
+	}
+	if wq.Wrapper == nil || wq.Wrapper.Decoded == nil || len(wq.Wrapper.Decoded.Term) != 1 {
+		t.Fatalf("F8 expected WrapperQuery.Decoded to contain inner Term query, got %+v", wq.Wrapper)
+	}
+	var badWQ Query
+	if err := json.Unmarshal([]byte(`{"wrapper": {"query": "eyJ1bmtub3duX3F1ZXJ5Ijp7fX0="}}`), &badWQ); err == nil {
+		t.Fatalf("F8 expected error for wrapper query with invalid inner query JSON")
+	}
+
+	// F12: WKT string parsing in GeoShapeQuery
+	wktCases := map[string]string{
+		`{"geo_shape": {"loc": {"shape": "POINT (-74.0 40.7)"}}}`:                                               "point",
+		`{"geo_shape": {"loc": {"shape": "BBOX (-75.0, -73.0, 41.0, 40.0)"}}}`:                                  "envelope",
+		`{"geo_shape": {"loc": {"shape": "ENVELOPE (-75.0, -73.0, 41.0, 40.0)"}}}`:                              "envelope",
+		`{"geo_shape": {"loc": {"shape": "LINESTRING (-74.0 40.7, -73.9 40.8)"}}}`:                              "linestring",
+		`{"geo_shape": {"loc": {"shape": "POLYGON ((-75 40, -73 40, -73 42, -75 42, -75 40))"}}}`:               "polygon",
+		`{"geo_shape": {"loc": {"shape": "MULTIPOINT ((-74 40), (-73 41))"}}}`:                                  "multipoint",
+		`{"geo_shape": {"loc": {"shape": "GEOMETRYCOLLECTION (POINT (-74 40), LINESTRING (-74 40, -73 41))"}}}`: "geometrycollection",
+	}
+	for raw, wantType := range wktCases {
+		var q Query
+		if err := json.Unmarshal([]byte(raw), &q); err != nil {
+			t.Fatalf("F12 WKT GeoShapeQuery unmarshal failed for %s: %v", raw, err)
+		}
+		if q.GeoShape == nil || q.GeoShape.Shape == nil || q.GeoShape.Shape["type"] != wantType {
+			t.Fatalf("F12 for %s expected shape type %q, got %+v", raw, wantType, q.GeoShape)
+		}
+	}
+}

@@ -1756,3 +1756,119 @@ func TestRound47SchemaAndShredderSpecCompliance(t *testing.T) {
 		t.Fatalf("ShredDocument CIDR/float_range/IPv6 failed: %v", err)
 	}
 }
+
+func TestRound48SchemaAndShredderSpecCompliance(t *testing.T) {
+	// F14, F15, F16, F17
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"dynamic": "strict",
+		"properties": {
+			"date_rng": {"type": "date_range"},
+			"flt_rng":  {"type": "float_range"},
+			"labels":   {"type": "flattened"},
+			"queries":  {"type": "percolator"},
+			"rel":      {"type": "join", "relations": {"question": "answer"}},
+			"ver":      {"type": "version"},
+			"sayt":     {"type": "search_as_you_type"},
+			"nested_items": {
+				"type": "nested",
+				"properties": {
+					"attrs": {"type": "flattened"},
+					"win":   {"type": "integer_range"}
+				}
+			}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("F14-F17 mapping unmarshal failed: %v", err)
+	}
+	sch := CompileIndexSchema("db", "r48_sch_idx", &spec)
+
+	// F15: flattened sub-key resolves with ESType="flattened" and NestedPath preserved
+	if b := sch.ResolveField("labels.env"); b.ESType != "flattened" || b.Kind != StorageDynamicVariant {
+		t.Fatalf("F15 expected labels.env to resolve as flattened StorageDynamicVariant, got %+v", b)
+	}
+	if b := sch.ResolveField("nested_items.attrs.color"); b.ESType != "flattened" || b.NestedPath != "nested_items" {
+		t.Fatalf("F15 expected nested_items.attrs.color to preserve NestedPath='nested_items', got %+v", b)
+	}
+	if b := sch.ResolveField("nested_items.win"); b.ESType != "integer_range" || b.NestedPath != "nested_items" {
+		t.Fatalf("F14 expected nested_items.win to preserve NestedPath='nested_items', got %+v", b)
+	}
+
+	// F17: search_as_you_type default analyzer is "standard", version is DorisVarchar
+	if b := sch.ResolveField("sayt"); b.Analyzer != "standard" {
+		t.Fatalf("F17 expected sayt Analyzer='standard', got %q", b.Analyzer)
+	}
+	if b := sch.ResolveField("ver"); b.DorisType != DorisVarchar {
+		t.Fatalf("F17 expected ver DorisVarchar, got %+v", b)
+	}
+
+	// F14 & F17: Shred document under dynamic: "strict" with percolator object, join object {"name":"answer","parent":"1"}, date_range lte rounding, float_range exclusive Nextafter
+	shredBytes, err := ShredDocument(sch, "1", 1, false, []byte(`{
+		"date_rng": {"gt": "2026-01-01T00:00:00Z", "lte": "2026-01-02"},
+		"flt_rng": {"gt": 1.0, "lt": 2.0},
+		"labels": {"env": ["prod", "staging"], "tier": "backend"},
+		"queries": {"match": {"sayt": "hello"}},
+		"rel": {"name": "answer", "parent": "1"},
+		"ver": "1.2.3",
+		"sayt": "hello world",
+		"nested_items": [{"attrs": {"color": ["red", "blue"]}, "win": {"gte": 1, "lte": 10}}]
+	}`))
+	if err != nil {
+		t.Fatalf("F14/F17 ShredDocument failed: %v", err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(shredBytes, &row); err != nil {
+		t.Fatalf("unmarshal shredded row failed: %v", err)
+	}
+	if row["f__rel"] != "answer" {
+		t.Fatalf("F17 expected join object to normalize f__rel='answer', got %v", row["f__rel"])
+	}
+	docMap, _ := row["_doc"].(map[string]any)
+	dateRngMap, _ := docMap["date_rng"].(map[string]any)
+	// gt "2026-01-01T00:00:00Z" (1767225600000) + 1ms = 1767225600001; lte "2026-01-02" rounds up to 2026-01-02T23:59:59.999Z (1767398399999)
+	if dateRngMap["_gte"] != float64(1767225600001) || dateRngMap["_lte"] != float64(1767398399999) {
+		t.Fatalf("F14 unexpected date_rng bounds: %+v", dateRngMap)
+	}
+	fltRngMap, _ := docMap["flt_rng"].(map[string]any)
+	if fltRngMap["_gte"].(float64) <= 1.0 || fltRngMap["_lte"].(float64) >= 2.0 {
+		t.Fatalf("F14 expected exclusive float_range bounds to be shifted via Nextafter, got %+v", fltRngMap)
+	}
+
+	// F16: InferMappingFromSampleDocs preserves existing explicit mappings, supports match_mapping_type array, {name}/{dynamic_type} placeholders, and object-level templates
+	existing := &esast.MappingSpec{
+		Properties: map[string]esast.FieldProperty{
+			"existing_kw": {Type: "keyword", DocValues: nil},
+		},
+		DynamicTemplates: []map[string]any{
+			{
+				"flatten_meta": map[string]any{
+					"match_mapping_type": "object",
+					"match":              "meta_*",
+					"mapping":            map[string]any{"type": "flattened"},
+				},
+			},
+			{
+				"num_array_types": map[string]any{
+					"match_mapping_type": []any{"long", "double"},
+					"match":              "metric_*",
+					"mapping": map[string]any{
+						"type":    "{dynamic_type}",
+						"copy_to": "{name}_all",
+					},
+				},
+			},
+		},
+	}
+	inferred := InferMappingFromSampleDocs([]json.RawMessage{
+		json.RawMessage(`{"existing_kw": "2026-01-01T00:00:00Z", "meta_tags": {"a": "b"}, "metric_cpu": 42}`),
+	}, existing)
+	if inferred.Properties["existing_kw"].Type != "keyword" {
+		t.Fatalf("F16 expected existing_kw to remain keyword, got %+v", inferred.Properties["existing_kw"])
+	}
+	if inferred.Properties["meta_tags"].Type != "flattened" {
+		t.Fatalf("F16 expected object template meta_tags to map as flattened, got %+v", inferred.Properties["meta_tags"])
+	}
+	if inferred.Properties["metric_cpu"].Type != "long" || inferred.Properties["metric_cpu"].CopyTo != "metric_cpu_all" {
+		t.Fatalf("F16 expected placeholder substitution on metric_cpu, got %+v", inferred.Properties["metric_cpu"])
+	}
+}

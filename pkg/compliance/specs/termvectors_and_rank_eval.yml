@@ -1,0 +1,69 @@
+---
+"Term vectors and multi term vectors":
+  - do:
+      index:
+        index: "tv_test"
+        id: "doc1"
+        refresh: true
+        body:
+          text: "search engine search fast"
+
+  - do:
+      termvectors:
+        index: "tv_test"
+        id: "doc1"
+        term_statistics: true
+        field_statistics: true
+  - match: { _index: "tv_test" }
+  - match: { _id: "doc1" }
+  - match: { found: true }
+  - match: { term_vectors.text.terms.search.term_freq: 2 }
+  - match: { term_vectors.text.terms.fast.term_freq: 1 }
+
+  - do:
+      mtermvectors:
+        index: "tv_test"
+        body:
+          ids: ["doc1"]
+  - length: { docs: 1 }
+  - match: { docs.0._id: "doc1" }
+  - match: { docs.0.found: true }
+
+---
+"Rank evaluation precision and MRR":
+  - do:
+      index:
+        index: "rank_idx"
+        id: "1"
+        refresh: true
+        body:
+          title: "elasticsearch rest compliance suite"
+
+  - do:
+      index:
+        index: "rank_idx"
+        id: "2"
+        refresh: true
+        body:
+          title: "unrelated document"
+
+  - do:
+      rank_eval:
+        index: "rank_idx"
+        body:
+          requests:
+            - id: "compliance_q"
+              request:
+                query:
+                  match:
+                    title: "compliance"
+              ratings:
+                - _index: "rank_idx"
+                  _id: "1"
+                  rating: 2
+          metric:
+            precision:
+              k: 1
+              relevant_rating_threshold: 1
+  - match: { metric_score: 1.0 }
+  - is_true: details.compliance_q

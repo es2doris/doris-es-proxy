@@ -693,6 +693,18 @@ func queryContainsNow(q *esast.Query) bool {
 	if q.ScriptScore != nil && queryContainsNow(q.ScriptScore.Query) {
 		return true
 	}
+	if q.Wrapper != nil && queryContainsNow(q.Wrapper.Decoded) {
+		return true
+	}
+	if q.Pinned != nil && queryContainsNow(q.Pinned.Organic) {
+		return true
+	}
+	if q.HasChild != nil && queryContainsNow(&q.HasChild.Query) {
+		return true
+	}
+	if q.HasParent != nil && queryContainsNow(&q.HasParent.Query) {
+		return true
+	}
 	if q.KNN != nil {
 		for i := range q.KNN.Filter {
 			if queryContainsNow(&q.KNN.Filter[i]) {

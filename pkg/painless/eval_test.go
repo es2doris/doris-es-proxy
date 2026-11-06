@@ -1886,3 +1886,454 @@ func TestRound47PainlessEvaluatorFindings(t *testing.T) {
 		t.Fatalf("DateTimeFormatter extended tokens failed: %v", err)
 	}
 }
+
+func TestRound48PainlessTrack5Findings(t *testing.T) {
+	// F18: Matcher start-anchored (^ / \A) slicing, UTF-8 zero-length advance, & named group start(String) / end(String)
+	valF18, err := Eval(nil, `
+		def mCaret = Pattern.compile("^foo").matcher("foofoo");
+		def c1 = mCaret.find();
+		def c2 = mCaret.find();
+		def c3 = mCaret.find(3);
+		def mAbs = Pattern.compile("\\Afoo").matcher("foo\nfoo");
+		def a1 = mAbs.find();
+		def a2 = mAbs.find();
+		def mMulti = Pattern.compile("(?m)^foo").matcher("foofoo\nfoo");
+		def ml1 = mMulti.find();
+		def ml1Start = mMulti.start();
+		def ml2 = mMulti.find();
+		def ml2Start = mMulti.start();
+		def mZero = Pattern.compile("a*").matcher("éa");
+		def zMatches = [];
+		while (mZero.find()) {
+			zMatches.add(mZero.start() + ":" + mZero.end() + ":" + mZero.group());
+		}
+		def mNamed = Pattern.compile("(?<prefix>é+)-(?<num>\\d+)").matcher("xx éé-42 yy");
+		def nFound = mNamed.find();
+		def nGrp = mNamed.group("num");
+		def nStart = mNamed.start("num");
+		def nEnd = mNamed.end("num");
+		return [c1, c2, c3, a1, a2, ml1, ml1Start, ml2, ml2Start, zMatches, nFound, nGrp, nStart, nEnd];
+	`, nil)
+	if err != nil {
+		t.Fatalf("Round48 F18 Eval failed: %v", err)
+	}
+	arrF18, ok := valF18.([]any)
+	if !ok || len(arrF18) != 14 {
+		t.Fatalf("Round48 F18 unexpected result: %#v", valF18)
+	}
+	if arrF18[0] != true || arrF18[1] != false || arrF18[2] != false ||
+		arrF18[3] != true || arrF18[4] != false ||
+		arrF18[5] != true || arrF18[6] != int64(0) || arrF18[7] != true || arrF18[8] != int64(7) ||
+		arrF18[10] != true || arrF18[11] != "42" || arrF18[12] != int64(6) || arrF18[13] != int64(8) {
+		t.Fatalf("Round48 F18 values mismatch: %#v", arrF18)
+	}
+	zSlice, _ := arrF18[9].([]any)
+	if len(zSlice) != 3 || zSlice[0] != "0:0:" || zSlice[1] != "1:2:a" || zSlice[2] != "2:2:" {
+		t.Fatalf("Round48 F18 zero-length UTF-8 matches mismatch: %#v", zSlice)
+	}
+
+	// F19: Arrays.* static methods & stream pipelines
+	docF19 := map[string]any{
+		"nums": []any{int64(4), int64(1), int64(3), int64(2)},
+	}
+	valF19, err := Eval(docF19, `
+		Arrays.sort(ctx._source.nums);
+		def bsHit = Arrays.binarySearch(ctx._source.nums, 3);
+		def bsMiss = Arrays.binarySearch(ctx._source.nums, 5);
+		def cp1 = Arrays.copyOf(ctx._source.nums, 2);
+		def cp2 = Arrays.copyOf(ctx._source.nums, 6);
+		def cpr = Arrays.copyOfRange(ctx._source.nums, 1, 3);
+		def eqOk = Arrays.equals(cp1, [1, 2]);
+		def deepEqOk = Arrays.deepEquals([[1, 2], [3]], [[1, 2], [3]]);
+		def str1 = Arrays.toString(cp1);
+		def strDeep = Arrays.deepToString([[1, 2], [null, "a"]]);
+		def filled = [0, 0, 0, 0];
+		Arrays.fill(filled, 1, 3, 9);
+		def streamSum = Arrays.stream(ctx._source.nums, 1, 4).map(x -> x * 10).sum();
+		def rangeList = IntStream.range(1, 4).map(x -> x + 1).collect(Collectors.toList());
+		def rangeClosedSum = IntStream.rangeClosed(1, 4).sum();
+		def streamOfJoined = Stream.of("a", "b", "c").collect(Collectors.joining("-"));
+		return [bsHit, bsMiss, cp1, cp2, cpr, eqOk, deepEqOk, str1, strDeep, filled, streamSum, rangeList, rangeClosedSum, streamOfJoined];
+	`, nil)
+	if err != nil {
+		t.Fatalf("Round48 F19 Eval failed: %v", err)
+	}
+	arrF19, ok := valF19.([]any)
+	if !ok || len(arrF19) != 14 {
+		t.Fatalf("Round48 F19 unexpected result: %#v", valF19)
+	}
+	if arrF19[0] != int64(2) || arrF19[1] != int64(-5) || arrF19[5] != true || arrF19[6] != true ||
+		arrF19[7] != "[1, 2]" || arrF19[8] != "[[1, 2], [null, a]]" || arrF19[10] != int64(90) ||
+		arrF19[12] != int64(10) || arrF19[13] != "a-b-c" {
+		t.Fatalf("Round48 F19 values mismatch: %#v", arrF19)
+	}
+
+	// F20: Period.*, DateTimeFormatter.withZone / withLocale, Temporal.plus / minus, ChronoUnit.MICROS / NANOS
+	valF20, err := Eval(nil, `
+		Period p = Period.of(1, 14, 5).normalized();
+		def pYears = p.getYears();
+		def pMonths = p.getMonths();
+		def pDays = p.getDays();
+		def pTotalMonths = p.toTotalMonths();
+		def pStr = p.toString();
+		def pBetween = Period.between("2024-01-15", "2025-03-20").toString();
+		def pParsed = Period.parse("P2W3D").getDays();
+		def dPlusP = LocalDate.parse("2025-01-31").plus(Period.ofMonths(1)).toString();
+		def dMinusU = LocalDate.parse("2025-03-10").minus(10, ChronoUnit.DAYS);
+		def dtPlusDur = Instant.parse("2025-01-01T00:00:00Z").plus(Duration.ofMinutes(90));
+		def fmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone("UTC+02:00").withLocale("en_US");
+		def formatted = Instant.parse("2025-01-01T10:30:00Z").format(fmt);
+		def micros = ChronoUnit.MICROS.between("2025-01-01T00:00:00Z", "2025-01-01T00:00:00.001500Z");
+		def nanos = ChronoUnit.NANOS.between("2025-01-01T00:00:00Z", "2025-01-01T00:00:00.000001500Z");
+		return [pYears, pMonths, pDays, pTotalMonths, pStr, pBetween, pParsed, dPlusP, dMinusU, dtPlusDur, formatted, micros, nanos];
+	`, nil)
+	if err != nil {
+		t.Fatalf("Round48 F20 Eval failed: %v", err)
+	}
+	arrF20, ok := valF20.([]any)
+	if !ok || len(arrF20) != 13 {
+		t.Fatalf("Round48 F20 unexpected result: %#v", valF20)
+	}
+	if arrF20[0] != int64(2) || arrF20[1] != int64(2) || arrF20[2] != int64(5) || arrF20[3] != int64(26) ||
+		arrF20[4] != "P2Y2M5D" || arrF20[5] != "P1Y2M5D" || arrF20[6] != int64(17) ||
+		arrF20[7] != "2025-02-28" || arrF20[8] != "2025-02-28" || arrF20[9] != "2025-01-01T01:30:00Z" ||
+		arrF20[10] != "2025-01-01 12:30" || arrF20[11] != int64(1500) || arrF20[12] != int64(1500) {
+		t.Fatalf("Round48 F20 values mismatch: %#v", arrF20)
+	}
+
+	// F21: Collection constructor capacity vs copy constructor
+	valF21, err := Eval(nil, `
+		def lCap = new ArrayList(10);
+		def lCopy = new ArrayList([1, 2, 3]);
+		def sCap = new HashSet(16);
+		def sCopy = new LinkedHashSet([1, 2, 1, 3]);
+		def mCap = new HashMap(16);
+		def mCapLoad = new LinkedHashMap(16, 0.75);
+		def mCopy = new TreeMap(["a": 1, "b": 2]);
+		return [lCap.size(), lCopy.size(), sCap.size(), sCopy, mCap.size(), mCapLoad.size(), mCopy.size(), mCopy instanceof Map, sCopy instanceof Set];
+	`, nil)
+	if err != nil {
+		t.Fatalf("Round48 F21 Eval failed: %v", err)
+	}
+	arrF21, ok := valF21.([]any)
+	if !ok || len(arrF21) != 9 {
+		t.Fatalf("Round48 F21 unexpected result: %#v", valF21)
+	}
+	if arrF21[0] != int64(0) || arrF21[1] != int64(3) || arrF21[2] != int64(0) ||
+		arrF21[4] != int64(0) || arrF21[5] != int64(0) || arrF21[6] != int64(2) ||
+		arrF21[7] != true || arrF21[8] != true {
+		t.Fatalf("Round48 F21 values mismatch: %#v", arrF21)
+	}
+
+	// F22: StringBuilder & UUID static methods
+	valF22, err := Eval(nil, `
+		StringBuilder sb = new StringBuilder(32);
+		sb.append("hello").append(" ").append("world", 0, 5);
+		sb.insert(5, ",");
+		sb.replace(0, 5, "hi");
+		sb.deleteCharAt(2);
+		def sub = sb.substring(0, 2);
+		def ch = sb.charAt(0);
+		def idx = sb.indexOf("world");
+		def rev = new StringBuilder("abc").reverse().toString();
+		UUID u1 = UUID.randomUUID();
+		def u2 = UUID.nameUUIDFromBytes("test-seed");
+		def u3 = UUID.fromString("123e4567-e89b-12d3-a456-426614174000");
+		return [sb.toString(), sb.length(), sub, ch, idx, rev, u1.length() == 36, u2, u3, sb instanceof StringBuilder];
+	`, nil)
+	if err != nil {
+		t.Fatalf("Round48 F22 Eval failed: %v", err)
+	}
+	arrF22, ok := valF22.([]any)
+	if !ok || len(arrF22) != 10 {
+		t.Fatalf("Round48 F22 unexpected result: %#v", valF22)
+	}
+	if arrF22[0] != "hi world" || arrF22[1] != int64(8) || arrF22[2] != "hi" || arrF22[3] != "h" ||
+		arrF22[4] != int64(3) || arrF22[5] != "cba" || arrF22[6] != true ||
+		arrF22[7] != "bfe71b97-a2d8-3474-b154-45d05efa6c45" ||
+		arrF22[8] != "123e4567-e89b-12d3-a456-426614174000" || arrF22[9] != true {
+		t.Fatalf("Round48 F22 values mismatch: %#v", arrF22)
+	}
+
+	// F23: Math.*Exact, Math.ulp/nextAfter/nextUp/nextDown/IEEEremainder, unsigned Integer/Long, Objects.requireNonNull*, List/Set/Map.copyOf
+	valF23, err := Eval(nil, `
+		def addOk = Math.addExact(10, 20);
+		def subOk = Math.subtractExact(50, 15);
+		def mulOk = Math.multiplyExact(6, 7);
+		def incOk = Math.incrementExact(9);
+		def decOk = Math.decrementExact(9);
+		def negOk = Math.negateExact(-5);
+		def toIntOk = Math.toIntExact(12345);
+		def overflowCaught = false;
+		try {
+			def x = Math.addExact(Long.MAX_VALUE, 1);
+		} catch (ArithmeticException e) {
+			overflowCaught = true;
+		}
+		def uIntStr = Integer.toUnsignedString(-1);
+		def uDiv = Integer.divideUnsigned(-2, 2);
+		def uRem = Integer.remainderUnsigned(-2, 3);
+		def uCmp = Integer.compareUnsigned(-1, 1);
+		def reqDef = Objects.requireNonNullElse(null, "fallback");
+		def npeCaught = false;
+		try {
+			def y = Objects.requireNonNull(null, "must not be null");
+		} catch (NullPointerException e) {
+			npeCaught = true;
+		}
+		def setCp = Set.copyOf([1, 2, 1, 3]);
+		return [addOk, subOk, mulOk, incOk, decOk, negOk, toIntOk, overflowCaught, uIntStr, uDiv, uRem, uCmp > 0, reqDef, npeCaught, setCp.size()];
+	`, nil)
+	if err != nil {
+		t.Fatalf("Round48 F23 Eval failed: %v", err)
+	}
+	arrF23, ok := valF23.([]any)
+	if !ok || len(arrF23) != 15 {
+		t.Fatalf("Round48 F23 unexpected result: %#v", valF23)
+	}
+	if arrF23[0] != int64(30) || arrF23[1] != int64(35) || arrF23[2] != int64(42) ||
+		arrF23[3] != int64(10) || arrF23[4] != int64(8) || arrF23[5] != int64(5) ||
+		arrF23[6] != int64(12345) || arrF23[7] != true || arrF23[8] != "4294967295" ||
+		arrF23[9] != int64(2147483647) || arrF23[10] != int64(2) || arrF23[11] != true ||
+		arrF23[12] != "fallback" || arrF23[13] != true || arrF23[14] != int64(3) {
+		t.Fatalf("Round48 F23 values mismatch: %#v", arrF23)
+	}
+
+	// F24 (Painless part): Ingest/Update chained ctx.get('nested').put(...) / ctx.get('nested').field = ...
+	docF24 := map[string]any{
+		"nested": map[string]any{"a": int64(1)},
+		"items":  []any{"x"},
+	}
+	_, err = Eval(docF24, `
+		ctx.get("nested").put("b", 2);
+		ctx.get("nested").c = 3;
+		ctx.get("items").add("y");
+		ctx.get("_source").put("top", "ok");
+	`, nil)
+	if err != nil {
+		t.Fatalf("Round48 F24 Eval failed: %v", err)
+	}
+	nestedMap, _ := docF24["nested"].(map[string]any)
+	itemsSlice, _ := docF24["items"].([]any)
+	if nestedMap["a"] != int64(1) || nestedMap["b"] != int64(2) || nestedMap["c"] != int64(3) ||
+		len(itemsSlice) != 2 || itemsSlice[1] != "y" || docF24["top"] != "ok" {
+		t.Fatalf("Round48 F24 document mutation mismatch: %#v", docF24)
+	}
+}
+
+func TestRound48PainlessDeepStdlibAndMutationsCoverage(t *testing.T) {
+	// 1. Map & List mutations on ctx, ctx._source, ctx._source.sub, params, and local vars
+	doc := map[string]any{
+		"arr":    []any{10, 20, 30},
+		"nested": map[string]any{"k1": "v1", "k2": "v2"},
+		"top":    "keep",
+		"drop":   "gone",
+	}
+	params := map[string]any{
+		"p1":      "val1",
+		"p2":      "val2",
+		"parr":    []any{"a", "b"},
+		"pmap":    map[string]any{"x": 1},
+		"_ctx_op": "update",
+	}
+	_, err := Eval(doc, `
+		ctx._source.remove("drop");
+		ctx._source.nested.remove("k1", "v1");
+		ctx._source.nested.put("k3", "v3");
+		ctx._source.nested.putIfAbsent("k2", "ignored");
+		ctx._source.nested.putIfAbsent("k4", "v4");
+		ctx._source.nested.putAll(["k5": "v5"]);
+		ctx._source.put("added_top", 100);
+		ctx._source.putIfAbsent("added_top", 200);
+		ctx._source.putIfAbsent("new_top", 300);
+		ctx._source.putAll(["batch1": 1, "batch2": 2]);
+		ctx._source.arr.set(1, 25);
+		ctx._source.arr.add(1, 15);
+		ctx._source.arr.add(40);
+		ctx._source.arr.addAll([50, 60]);
+		ctx._source.arr.addAll(0, [5]);
+		ctx._source.arr.sort((a, b) -> b - a);
+		params.remove("p1");
+		params.remove("p2", "val2");
+		params.put("p3", "v3");
+		params.putIfAbsent("p3", "ignored");
+		params.putIfAbsent("p4", "v4");
+		params.putAll(["p5": "v5"]);
+		def localArr = [3, 1, 2];
+		localArr.set(0, 9);
+		localArr.add(1, 8);
+		localArr.addAll([7, 6]);
+		localArr.addAll(0, [10]);
+		localArr.sort();
+		def localMap = ["a": 1];
+		localMap.put("b", 2);
+		localMap.putIfAbsent("b", 99);
+		localMap.putIfAbsent("c", 3);
+		localMap.putAll(["d": 4]);
+		localMap.remove("a", 1);
+		localMap.remove("b");
+	`, params)
+	if err != nil {
+		t.Fatalf("mutations script failed: %v", err)
+	}
+
+	// 2. Period, Duration, ZonedDateTime, LocalDate, LocalDateTime, Instant, ChronoUnit
+	dtRes, err := Eval(nil, `
+		def p = Period.of(1, 2, 3)
+			.plus(Period.ofDays(4))
+			.minus(Period.ofMonths(1))
+			.plusYears(1).minusYears(1)
+			.plusMonths(2).minusMonths(1)
+			.plusDays(5).minusDays(2)
+			.multipliedBy(2);
+		def d = Duration.ofHours(2)
+			.plus(30, ChronoUnit.MINUTES)
+			.minus(10, ChronoUnit.SECONDS)
+			.plus(1, ChronoUnit.DAYS)
+			.plus(1, ChronoUnit.HOURS)
+			.plus(1, ChronoUnit.MILLIS)
+			.plus(1, ChronoUnit.MICROS)
+			.plus(1, ChronoUnit.NANOS)
+			.plus(Duration.ofMinutes(5))
+			.plusDays(1).minusHours(1).plusMinutes(1).minusSeconds(1).plusMillis(100).minusNanos(50)
+			.multipliedBy(2);
+		def zdt = ZonedDateTime.parse("2025-03-15T14:30:45.123456789Z");
+		def tDays = zdt.truncatedTo(ChronoUnit.DAYS);
+		def tHours = zdt.truncatedTo(ChronoUnit.HOURS);
+		def tMins = zdt.truncatedTo(ChronoUnit.MINUTES);
+		def tSecs = zdt.truncatedTo(ChronoUnit.SECONDS);
+		def tMillis = zdt.truncatedTo(ChronoUnit.MILLIS);
+		def tMicros = zdt.truncatedTo(ChronoUnit.MICROS);
+		def zdt2 = zdt
+			.plus(1, ChronoUnit.YEARS)
+			.plus(1, ChronoUnit.MONTHS)
+			.plus(1, ChronoUnit.WEEKS)
+			.plus(1, ChronoUnit.DAYS)
+			.plus(1, ChronoUnit.HOURS)
+			.plus(1, ChronoUnit.MINUTES)
+			.plus(1, ChronoUnit.SECONDS)
+			.plus(1, ChronoUnit.MILLIS)
+			.plus(1, ChronoUnit.MICROS)
+			.plus(1, ChronoUnit.NANOS)
+			.plus(Period.ofDays(2))
+			.plus(Duration.ofHours(3))
+			.plusYears(1).minusMonths(1).plusWeeks(1).minusDays(1)
+			.plusHours(1).minusMinutes(1).plusSeconds(1).minusMillis(1).plusNanos(1)
+			.withYear(2026).withMonth(6).withDayOfMonth(10)
+			.withHour(8).withMinute(15).withSecond(20).withNano(500);
+		def cmpAfter = zdt2.isAfter(zdt);
+		def cmpBefore = zdt.isBefore(zdt2);
+		def cmpEq = zdt.isEqual(zdt);
+		def props = [zdt2.year, zdt2.monthValue, zdt2.month, zdt2.dayOfMonth, zdt2.dayOfYear, zdt2.hour, zdt2.minute, zdt2.second, zdt2.nano, zdt2.dayOfWeek, zdt2.dayOfWeekEnum];
+		def cu = [
+			ChronoUnit.YEARS.between(zdt, zdt2),
+			ChronoUnit.MONTHS.between(zdt, zdt2),
+			ChronoUnit.WEEKS.between(zdt, zdt2),
+			ChronoUnit.DAYS.between(zdt, zdt2),
+			ChronoUnit.HOURS.between(zdt, zdt2),
+			ChronoUnit.MINUTES.between(zdt, zdt2),
+			ChronoUnit.SECONDS.between(zdt, zdt2),
+			ChronoUnit.MILLIS.between(zdt, zdt2),
+			ChronoUnit.MICROS.between(zdt, zdt2),
+			ChronoUnit.NANOS.between(zdt, zdt2)
+		];
+		def zOf = ZonedDateTime.of(2025, 1, 2, 3, 4, 5, 0, ZoneId.of("UTC"));
+		def zInst = ZonedDateTime.ofInstant(Instant.ofEpochSecond(1700000000, 500), ZoneOffset.ofHours(2));
+		def ld1 = LocalDate.of(2025, 5, 10);
+		def ld2 = LocalDate.ofEpochDay(100);
+		def ldt = LocalDateTime.of(2025, 5, 10, 12, 30, 15, 100);
+		def dBet = Duration.between(zdt, zdt2);
+		def pBet = Period.between("2024-01-20", "2025-03-10");
+		return [p.getYears(), d != null, tDays != null, tHours != null, tMins != null, tSecs != null, tMillis != null, tMicros != null, cmpAfter, cmpBefore, cmpEq, props.size(), cu.size(), zOf != null, zInst != null, ld1, ld2, ldt != null, dBet != null, pBet.getYears()];
+	`, nil)
+	if err != nil {
+		t.Fatalf("datetime & period script failed: %v", err)
+	}
+	if arr, ok := dtRes.([]any); !ok || len(arr) != 20 {
+		t.Fatalf("unexpected dtRes: %#v", dtRes)
+	}
+
+	// 3. Math, Integer/Long/Short/Byte/Double/Float/Boolean, Objects, Collections, and Stream operations
+	stdRes, err := Eval(nil, `
+		def m = [
+			Math.toRadians(180),
+			Math.toDegrees(3.141592653589793),
+			Math.floorDiv(-7, 3),
+			Math.floorMod(-7, 3),
+			Math.ulp(1.0),
+			Math.nextAfter(1.0, 2.0),
+			Math.nextUp(1.0),
+			Math.nextDown(1.0),
+			Math.IEEEremainder(10.0, 3.0),
+			Math.copySign(5.0, -1.0),
+			Math.scalb(1.5, 2),
+			Math.getExponent(8.0),
+			Math.getExponent(0.0)
+		];
+		def nums = [
+			Integer.parseInt("ff", 16),
+			Long.parseLong("1010", 2),
+			Short.parseShort("123"),
+			Byte.parseByte("12"),
+			Double.parseDouble("3.5"),
+			Float.parseFloat("2.5"),
+			Boolean.parseBoolean("true"),
+			Integer.toString(255, 16),
+			Double.toString(1.5),
+			Boolean.toString(true),
+			Integer.toHexString(255),
+			Integer.toBinaryString(5),
+			Integer.toOctalString(8),
+			Long.toHexString(255),
+			Long.toUnsignedString(-1),
+			Integer.parseUnsignedInt("4294967295"),
+			Long.parseUnsignedLong("100"),
+			Long.compareUnsigned(-1, 1),
+			Long.divideUnsigned(100, 3),
+			Long.remainderUnsigned(100, 3),
+			Integer.compare(1, 2),
+			Boolean.compare(true, false)
+		];
+		def objs = [
+			Objects.equals("a", "a"),
+			Objects.isNull(null),
+			Objects.nonNull("x"),
+			Objects.toString(null, "def"),
+			Objects.toString("hi")
+		];
+		def colList = [1, 2, 3, 4];
+		Collections.rotate(colList, 1);
+		Collections.replaceAll(colList, 2, 20);
+		Collections.reverse(colList);
+		Collections.sort(colList);
+		def fillList = [1, 2, 3];
+		Collections.fill(fillList, 9);
+
+		def s1 = [1, 2, 2, 3, 4, 5].stream()
+			.filter(x -> x > 1)
+			.distinct()
+			.sorted()
+			.skip(1)
+			.limit(3)
+			.mapToInt(x -> x * 2)
+			.sum();
+		def s2 = [2.0, 4.0, 6.0].stream().mapToDouble(x -> x).average().orElse(0.0);
+		def s3 = [3, 1, 4].stream().min().orElse(0);
+		def s4 = [3, 1, 4].stream().max().orElse(0);
+		def s5 = [3, 1, 4].stream().findFirst().orElse(0);
+		def s6 = [1, 2, 3].stream().anyMatch(x -> x == 2);
+		def s7 = [1, 2, 3].stream().allMatch(x -> x > 0);
+		def s8 = [1, 2, 3].stream().noneMatch(x -> x < 0);
+		def s9 = [1, 2, 3, 4].stream().reduce(0, (a, b) -> a + b);
+		def s10 = ["a", "b", "c"].stream().collect(Collectors.joining(",", "[", "]"));
+		def s11 = [1, 1, 2].stream().collect(Collectors.toSet());
+		def s12 = [[1, 2], [3, 4]].stream().flatMap(x -> x.stream()).count();
+		return [m.size(), nums.size(), objs.size(), colList.size(), fillList[0], s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11.size(), s12];
+	`, nil)
+	if err != nil {
+		t.Fatalf("stdlib & stream script failed: %v", err)
+	}
+	if arr, ok := stdRes.([]any); !ok || len(arr) != 17 {
+		t.Fatalf("unexpected stdRes: %#v", stdRes)
+	}
+}

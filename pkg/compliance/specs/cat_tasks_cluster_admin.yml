@@ -1,0 +1,102 @@
+---
+"Cat endpoints and cluster tasks admin":
+  - do:
+      indices.create:
+        index: "admin_spec_idx"
+  - match: { acknowledged: true }
+
+  - do:
+      cat.allocation:
+        format: "json"
+  - is_true: ""
+
+  - do:
+      cat.master:
+        format: "json"
+  - length: { $body: 1 }
+
+  - do:
+      cat.nodeattrs:
+        format: "json"
+  - is_true: ""
+
+  - do:
+      cat.pending_tasks:
+        format: "json"
+  - is_true: ""
+
+  - do:
+      cat.plugins:
+        format: "json"
+  - is_true: ""
+
+  - do:
+      cat.recovery:
+        format: "json"
+  - is_true: ""
+
+  - do:
+      cat.segments:
+        format: "json"
+  - is_true: ""
+
+  - do:
+      cat.tasks:
+        format: "json"
+  - is_true: ""
+
+  - do:
+      cat.thread_pool:
+        format: "json"
+  - is_true: ""
+
+  - do:
+      tasks.list: {}
+  - is_true: nodes
+
+  - do:
+      cluster.allocation_explain: {}
+  - is_true: index
+  - is_true: current_state
+
+  - do:
+      cluster.pending_tasks: {}
+  - is_true: tasks
+
+  - do:
+      cluster.reroute: {}
+  - match: { acknowledged: true }
+
+  - do:
+      nodes.usage: {}
+  - is_true: nodes
+
+  - do:
+      indices.recovery:
+        index: "admin_spec_idx"
+  - is_true: admin_spec_idx.shards
+
+  - do:
+      indices.segments:
+        index: "admin_spec_idx"
+  - is_true: indices.admin_spec_idx.shards
+
+  - do:
+      indices.shard_stores:
+        index: "admin_spec_idx"
+  - is_true: indices
+
+  - do:
+      indices.clear_cache:
+        index: "admin_spec_idx"
+  - match: { _shards.failed: 0 }
+
+  - do:
+      indices.close:
+        index: "admin_spec_idx"
+  - match: { acknowledged: true }
+
+  - do:
+      indices.open:
+        index: "admin_spec_idx"
+  - match: { acknowledged: true }
