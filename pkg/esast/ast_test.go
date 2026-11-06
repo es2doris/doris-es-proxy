@@ -1384,3 +1384,161 @@ func TestRound46GeoQueriesBoolMatchDisMaxAndBulkMeta(t *testing.T) {
 		t.Fatalf("F33 expected action-level update options parsed on ops[1], got %+v", ops[1])
 	}
 }
+
+func TestRound47ASTSpecCompliance(t *testing.T) {
+	// F5: RangeCond.Relation parsing and validation
+	for _, rel := range []string{"intersects", "CONTAINS", "Within"} {
+		var q Query
+		raw := `{"range": {"age_range": {"gte": 10, "lte": 20, "relation": "` + rel + `"}}}`
+		if err := json.Unmarshal([]byte(raw), &q); err != nil {
+			t.Fatalf("F5 expected valid range relation %q, got err: %v", rel, err)
+		}
+		if q.Range["age_range"].Relation != strings.ToUpper(rel) {
+			t.Fatalf("F5 expected normalized relation %s, got %s", strings.ToUpper(rel), q.Range["age_range"].Relation)
+		}
+	}
+	var badRel Query
+	if err := json.Unmarshal([]byte(`{"range": {"age_range": {"gte": 10, "lte": 20, "relation": "INVALID_REL"}}}`), &badRel); err == nil {
+		t.Fatalf("F5 expected parsing_exception for invalid range relation")
+	}
+
+	// F7: MappingSpec and FieldProperty metadata & dynamic detection settings
+	var ms MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"_meta": {"version": "1.0"},
+		"_source": {"enabled": true},
+		"date_detection": false,
+		"numeric_detection": true,
+		"dynamic_date_formats": ["yyyy/MM/dd"],
+		"dynamic_templates": [{"strings_as_kw": {"match_mapping_type": "string", "mapping": {"type": "keyword"}}}],
+		"properties": {
+			"title": {
+				"type": "text",
+				"meta": {"unit": "words"},
+				"index_prefixes": {"min_chars": 2, "max_chars": 5},
+				"index_phrases": true,
+				"store": true,
+				"time_zone": "+02:00",
+				"split_queries_on_whitespace": true
+			}
+		}
+	}`), &ms); err != nil {
+		t.Fatalf("F7 MappingSpec unmarshal failed: %v", err)
+	}
+	if ms.Meta["version"] != "1.0" || ms.DateDetection == nil || *ms.DateDetection || ms.NumericDetection == nil || !*ms.NumericDetection || len(ms.DynamicTemplates) != 1 || len(ms.DynamicDateFormats) != 1 {
+		t.Fatalf("F7 MappingSpec fields not preserved: %+v", ms)
+	}
+	tp := ms.Properties["title"]
+	if tp.Meta["unit"] != "words" || tp.IndexPrefixes["min_chars"] != float64(2) || tp.IndexPhrases == nil || !*tp.IndexPhrases || tp.Store == nil || !*tp.Store || tp.TimeZone != "+02:00" || tp.SplitQueriesOnWhitespace == nil || !*tp.SplitQueriesOnWhitespace {
+		t.Fatalf("F7 FieldProperty fields not preserved: %+v", tp)
+	}
+
+	// F10 & F11: PhraseEntry and FuzzyEntry parameters
+	var qPhraseFuzzy Query
+	if err := json.Unmarshal([]byte(`{
+		"bool": {
+			"must": [
+				{"match_phrase": {"title": {"query": "quick fox", "slop": 2, "zero_terms_query": "all", "auto_generate_synonyms_phrase_query": true}}},
+				{"match_bool_prefix": {"title": {"query": "quick f", "fuzziness": "AUTO", "prefix_length": 1, "max_expansions": 25, "fuzzy_transpositions": false, "fuzzy_rewrite": "constant_score", "lenient": true}}},
+				{"fuzzy": {"title": {"value": "quikc", "fuzziness": 2, "prefix_length": 2, "max_expansions": 30, "transpositions": false, "rewrite": "constant_score"}}}
+			]
+		}
+	}`), &qPhraseFuzzy); err != nil {
+		t.Fatalf("F10/F11 unmarshal failed: %v", err)
+	}
+	mbp := qPhraseFuzzy.Bool.Must[1].MatchBoolPrefix["title"]
+	if mbp.PrefixLength != 1 || mbp.MaxExpansions != 25 || mbp.FuzzyTranspositions == nil || *mbp.FuzzyTranspositions || mbp.FuzzyRewrite != "constant_score" || mbp.Lenient == nil || !*mbp.Lenient {
+		t.Fatalf("F10 PhraseEntry fields not preserved: %+v", mbp)
+	}
+	fe := qPhraseFuzzy.Bool.Must[2].Fuzzy["title"]
+	if fe.PrefixLength != 2 || fe.MaxExpansions != 30 || fe.Transpositions == nil || *fe.Transpositions || fe.Rewrite != "constant_score" {
+		t.Fatalf("F11 FuzzyEntry fields not preserved: %+v", fe)
+	}
+
+	// F12: Additional Query DSL clauses
+	f12Clauses := []string{
+		`{"geo_polygon": {"loc": {"points": [{"lat": 40, "lon": -70}, {"lat": 41, "lon": -71}, {"lat": 39, "lon": -72}]}}}`,
+		`{"geo_shape": {"loc": {"shape": {"type": "envelope", "coordinates": [[-75.0, 41.0], [-73.0, 40.0]]}, "relation": "WITHIN"}}}`,
+		`{"wrapper": {"query": "eyJtYXRjaF9hbGwiOnt9fQ=="}}`,
+		`{"pinned": {"ids": ["1", "2"], "organic": {"match_all": {}}}}`,
+		`{"more_like_this": {"fields": ["title"], "like": "quick brown fox", "min_term_freq": 1}}`,
+		`{"intervals": {"title": {"all_of": {"ordered": true, "intervals": [{"match": {"query": "quick"}}, {"prefix": {"prefix": "fo"}}]}}}}`,
+		`{"span_term": {"title": {"value": "quick", "boost": 2.0}}}`,
+		`{"span_near": {"clauses": [{"span_term": {"title": "quick"}}, {"span_term": {"title": "fox"}}], "slop": 2, "in_order": true}}`,
+		`{"span_or": {"clauses": [{"span_term": {"title": "quick"}}, {"span_term": {"title": "lazy"}}]}}`,
+		`{"span_not": {"include": {"span_term": {"title": "quick"}}, "exclude": {"span_term": {"title": "brown"}}}}`,
+		`{"span_first": {"match": {"span_term": {"title": "quick"}}, "end": 3}}`,
+		`{"span_multi": {"match": {"prefix": {"title": {"value": "qu"}}}}}`,
+		`{"span_containing": {"little": {"span_term": {"title": "fox"}}, "big": {"span_near": {"clauses": [{"span_term": {"title": "quick"}}, {"span_term": {"title": "brown"}}], "slop": 5}}}}`,
+		`{"span_within": {"little": {"span_term": {"title": "fox"}}, "big": {"span_near": {"clauses": [{"span_term": {"title": "quick"}}, {"span_term": {"title": "brown"}}], "slop": 5}}}}`,
+		`{"field_masking_span": {"query": {"span_term": {"title": "quick"}}, "field": "body"}}`,
+		`{"rank_feature": {"field": "pagerank", "saturation": {"pivot": 8}}}`,
+		`{"distance_feature": {"field": "created_at", "origin": "now", "pivot": "7d"}}`,
+		`{"has_child": {"type": "child_doc", "query": {"match_all": {}}, "score_mode": "max"}}`,
+		`{"has_parent": {"parent_type": "parent_doc", "query": {"match_all": {}}, "score": true}}`,
+		`{"parent_id": {"type": "child_doc", "id": "parent-1"}}`,
+		`{"percolate": {"field": "query", "document": {"title": "quick fox"}}}`,
+	}
+	for _, raw := range f12Clauses {
+		var q Query
+		if err := json.Unmarshal([]byte(raw), &q); err != nil {
+			t.Fatalf("F12 failed to unmarshal %s: %v", raw, err)
+		}
+	}
+
+	// Additional F12 options and error-branch coverage
+	f12ExtendedValid := []string{
+		`{"geo_polygon": {"validation_method": "COERCE", "boost": 1.5, "_name": "gp", "ignore_unmapped": true, "loc": {"points": [{"lat": 40, "lon": -70}, {"lat": 41, "lon": -71}, {"lat": 39, "lon": -72}]}}}`,
+		`{"geo_shape": {"boost": 1.2, "_name": "gs", "ignore_unmapped": true, "loc": {"indexed_shape": {"id": "1", "index": "shapes"}}}}`,
+		`{"wrapper": {"query": "eyJtYXRjaF9hbGwiOnt9fQ==", "boost": 2.0, "_name": "w"}}`,
+		`{"pinned": {"docs": [{"_index": "idx", "_id": "1"}], "organic": {"match_all": {}}, "boost": 1.5, "_name": "p"}}`,
+		`{"more_like_this": {"fields": ["title"], "like": ["text", {"_id": "1"}], "unlike": "bad", "stop_words": ["the"], "boost": 1.5, "_name": "m"}}`,
+		`{"intervals": {"title": {"any_of": {"intervals": [{"wildcard": {"pattern": "qu*"}}, {"fuzzy": {"term": "fox"}}]}, "boost": 1.5, "_name": "iv"}}}`,
+		`{"rank_feature": {"field": "pagerank", "log": {"scaling_factor": 2.0}, "boost": 1.5, "_name": "rf"}}`,
+		`{"rank_feature": {"field": "pagerank", "sigmoid": {"pivot": 5.0, "exponent": 0.6}}}`,
+		`{"rank_feature": {"field": "pagerank", "linear": {}}}`,
+		`{"distance_feature": {"field": "loc", "origin": [40.0, -70.0], "pivot": "1000m", "boost": 1.5, "_name": "df"}}`,
+		`{"has_child": {"type": "c", "query": {"match_all": {}}, "min_children": 1, "max_children": 5, "ignore_unmapped": true, "boost": 1.2, "_name": "hc"}}`,
+		`{"has_parent": {"parent_type": "p", "query": {"match_all": {}}, "ignore_unmapped": true, "boost": 1.2, "_name": "hp"}}`,
+		`{"parent_id": {"type": "c", "id": 42, "ignore_unmapped": true, "boost": 1.2, "_name": "pi"}}`,
+		`{"percolate": {"field": "query", "documents": [{"title": "a"}], "boost": 1.2, "_name": "pc"}}`,
+	}
+	for _, raw := range f12ExtendedValid {
+		var q Query
+		if err := json.Unmarshal([]byte(raw), &q); err != nil {
+			t.Fatalf("F12 extended valid failed for %s: %v", raw, err)
+		}
+	}
+	f12Invalid := []string{
+		`{"geo_polygon": {"validation_method": "BAD", "loc": {"points": [{"lat": 40, "lon": -70}, {"lat": 41, "lon": -71}, {"lat": 39, "lon": -72}]}}}`,
+		`{"geo_polygon": {"loc": {"points": [{"lat": 40, "lon": -70}]}}}`,
+		`{"geo_shape": {"loc": {"shape": {"type": "point"}, "relation": "BAD_REL"}}}`,
+		`{"geo_shape": {"loc": {}}}`,
+		`{"wrapper": {"query": "!!!not_base64!!!"}}`,
+		`{"wrapper": {"unknown": 1}}`,
+		`{"pinned": {"ids": ["1"]}}`,
+		`{"pinned": {"organic": {"match_all": {}}}}`,
+		`{"more_like_this": {"fields": ["title"]}}`,
+		`{"intervals": {"title": {}}}`,
+		`{"rank_feature": {}}`,
+		`{"rank_feature": {"field": "f", "unknown": 1}}`,
+		`{"distance_feature": {"field": "f", "origin": "now"}}`,
+		`{"has_child": {"type": "c"}}`,
+		`{"has_parent": {"parent_type": "p"}}`,
+		`{"parent_id": {"type": "c"}}`,
+		`{"percolate": {}}`,
+	}
+	for _, raw := range f12Invalid {
+		var q Query
+		if err := json.Unmarshal([]byte(raw), &q); err == nil {
+			t.Fatalf("F12 expected error for %s, got nil", raw)
+		}
+	}
+	bulkActions, err := ParseBulkNDJSON(strings.NewReader(
+		`{"update":{"_index":"idx","_id":"1","_source_includes":["a","b"],"_source_excludes":"c"}}`+"\n"+
+			`{"doc":{"a":1},"_source":{"includes":["x"],"excludes":["y"]}}`+"\n",
+	), "idx")
+	if err != nil || len(bulkActions) != 1 || bulkActions[0].SourceFilter == nil || len(bulkActions[0].SourceFilter.Includes) != 2 {
+		t.Fatalf("ParseBulkNDJSON _source_includes failed: err=%v actions=%+v", err, bulkActions)
+	}
+}

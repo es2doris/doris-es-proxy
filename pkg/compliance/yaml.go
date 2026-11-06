@@ -399,8 +399,13 @@ func (p *yamlParser) parseSequence(seqIndent int) ([]any, error) {
 		}
 
 		// Line starts with "- "
-		rest := strings.TrimSpace(trimmed[2:])
-		itemIndent := seqIndent + 2
+		afterDash := trimmed[1:]
+		leadingSpacesAfterDash := countLeadingSpaces(afterDash)
+		if leadingSpacesAfterDash < 1 {
+			leadingSpacesAfterDash = 1
+		}
+		rest := strings.TrimSpace(afterDash)
+		itemIndent := seqIndent + 1 + leadingSpacesAfterDash
 
 		if isBlockScalarIndicator(rest) {
 			p.pos++
@@ -414,8 +419,11 @@ func (p *yamlParser) parseSequence(seqIndent int) ([]any, error) {
 
 		if strings.HasPrefix(rest, "{") || strings.HasPrefix(rest, "[") {
 			// Replace current line temporarily or parse inline flow if balanced
-			p.rawLines[p.pos] = strings.Repeat(" ", itemIndent) + rest
+			lineIdx := p.pos
+			orig := p.rawLines[lineIdx]
+			p.rawLines[lineIdx] = strings.Repeat(" ", itemIndent) + rest
 			flowStr, err := p.collectFlowLines()
+			p.rawLines[lineIdx] = orig
 			if err != nil {
 				return nil, err
 			}
@@ -429,10 +437,11 @@ func (p *yamlParser) parseSequence(seqIndent int) ([]any, error) {
 
 		if _, _, ok := splitKeyValue(rest); ok {
 			// Compact mapping inside sequence item: rewrite `- key: val` as `  key: val` at itemIndent
-			orig := p.rawLines[p.pos]
-			p.rawLines[p.pos] = strings.Repeat(" ", itemIndent) + rest
+			lineIdx := p.pos
+			orig := p.rawLines[lineIdx]
+			p.rawLines[lineIdx] = strings.Repeat(" ", itemIndent) + rest
 			val, err := p.parseMapping(itemIndent)
-			p.rawLines[findLineIndex(p.rawLines, orig)] = orig // no-op safe restore if needed
+			p.rawLines[lineIdx] = orig
 			if err != nil {
 				return nil, err
 			}
@@ -448,15 +457,6 @@ func (p *yamlParser) parseSequence(seqIndent int) ([]any, error) {
 		items = append(items, val)
 	}
 	return items, nil
-}
-
-func findLineIndex(lines []string, target string) int {
-	for i, l := range lines {
-		if l == target {
-			return i
-		}
-	}
-	return 0
 }
 
 func (p *yamlParser) parseMapping(mapIndent int) (*OrderedMap, error) {
@@ -722,7 +722,7 @@ func splitKeyValue(s string) (string, string, bool) {
 			depthBracket--
 		case ':':
 			if depthBrace == 0 && depthBracket == 0 {
-				if i+1 == len(s) || s[i+1] == ' ' || s[i+1] == '\t' {
+				if i+1 == len(s) || s[i+1] == ' ' || s[i+1] == '\t' || (i > 0 && (s[i-1] == '"' || s[i-1] == '\'')) {
 					return strings.TrimSpace(s[:i]), s[i+1:], true
 				}
 			}

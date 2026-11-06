@@ -42,6 +42,19 @@ func ShredDocument(
 	deleted bool,
 	rawSource json.RawMessage,
 ) ([]byte, error) {
+	return ShredDocumentWithNow(s, id, version, deleted, rawSource, time.Time{})
+}
+
+// ShredDocumentWithNow transforms an Elasticsearch document (`rawSource`) into a flat Doris Stream Load
+// JSON row using an explicit `now` timestamp for date math expressions.
+func ShredDocumentWithNow(
+	s *IndexSchema,
+	id string,
+	version int64,
+	deleted bool,
+	rawSource json.RawMessage,
+	now time.Time,
+) ([]byte, error) {
 	if version <= 0 {
 		version = 1
 	}
@@ -85,7 +98,6 @@ func ShredDocument(
 	row["__DORIS_DELETE_SIGN__"] = 0
 	row["_source"] = string(trimmed)
 
-	var now time.Time
 	getNow := func() time.Time {
 		if now.IsZero() {
 			now = time.Now().UTC()
@@ -175,8 +187,12 @@ func ShredDocument(
 				}
 				validLeafs = append(validLeafs, rv)
 			}
-			if b.Kind == StoragePromotedArray || b.Kind == StorageNestedSubfield {
+			if b.Kind == StoragePromotedArray {
 				row[b.ColumnName] = []string{expectedStr}
+			} else if b.Kind == StorageNestedSubfield {
+				if len(extractNestedElementMapsWithIDs(parsedDoc, strings.Split(b.NestedPath, "."), "")) > 0 {
+					row[b.ColumnName] = []string{expectedStr}
+				}
 			} else if b.ColumnName != "" {
 				row[b.ColumnName] = expectedStr
 			}
@@ -191,9 +207,25 @@ func ShredDocument(
 		}
 		switch b.Kind {
 		case StoragePromotedScalar:
-			if (b.ESType == "text" || b.ESType == "match_only_text") && b.DorisType == DorisString {
+			if IsTextLikeESType(b.ESType) && b.DorisType == DorisString {
 				var val any
-				strs := extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer, b.NullValue)
+				var strs []string
+				if b.ESType == "completion" {
+					var compErr error
+					strs, compErr = extractCompletionStringsWithNull(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer, b.NullValue)
+					if compErr != nil {
+						if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+							recordIgnored(b.ESFieldPath)
+							if isPrimaryFieldBinding(b) {
+								deferDeletePath(b.SourceJSONPath)
+							}
+							continue
+						}
+						return nil, compErr
+					}
+				} else {
+					strs = extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer, b.NullValue)
+				}
 				if b.IgnoreAbove > 0 && len(strs) > 0 {
 					filtered := strs[:0]
 					for _, sv := range strs {
@@ -241,6 +273,36 @@ func ShredDocument(
 			if len(rawLeafs) == 0 && b.NullValue != nil && hasExplicitNullAtPath(parsedDoc, b.SourceJSONPath) {
 				rawLeafs = []any{b.NullValue}
 			}
+			if b.ESType == "token_count" && len(rawLeafs) > 0 {
+				var totalTokens int64
+				hasTokenVal := false
+				for _, rv := range rawLeafs {
+					if rv == nil {
+						continue
+					}
+					if sv, isStr := rv.(string); isStr {
+						totalTokens += int64(len(strings.Fields(sv)))
+						hasTokenVal = true
+					} else if coerced := coerceScalarBindingForDoris(rv, b, getNow()); coerced != nil {
+						switch iv := coerced.(type) {
+						case int64:
+							totalTokens += iv
+							hasTokenVal = true
+						case int:
+							totalTokens += int64(iv)
+							hasTokenVal = true
+						}
+					} else if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+						recordIgnored(b.ESFieldPath)
+					} else {
+						return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", b.ESFieldPath, b.ESType)
+					}
+				}
+				if hasTokenVal {
+					row[b.ColumnName] = totalTokens
+				}
+				continue
+			}
 			if len(rawLeafs) > 0 || b.ESType == "geo_point" || hasObjAtPath {
 				var firstVal any
 				var validLeafs []any
@@ -262,7 +324,7 @@ func ShredDocument(
 							continue
 						}
 					}
-					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && (b.Coerce == nil || *b.Coerce) && (b.ESType == "ip" || b.ESType == "geo_point" || (b.DorisType != DorisString && b.DorisType != DorisVarchar)) {
+					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && (b.Coerce == nil || *b.Coerce) && (b.ESType == "ip" || b.ESType == "geo_point" || (b.DorisType != DorisString && b.DorisType != DorisVarchar)) {
 						continue
 					}
 					coerced := coerceScalarBindingForDoris(rv, b, getNow())
@@ -330,7 +392,7 @@ func ShredDocument(
 				}
 			}
 			if val != nil {
-				if strVal, isStr := val.(string); isStr && strings.TrimSpace(strVal) == "" && (b.Coerce == nil || *b.Coerce) && (b.ESType == "ip" || b.ESType == "geo_point" || (b.DorisType != DorisString && b.DorisType != DorisVarchar)) {
+				if strVal, isStr := val.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && (b.Coerce == nil || *b.Coerce) && (b.ESType == "ip" || b.ESType == "geo_point" || (b.DorisType != DorisString && b.DorisType != DorisVarchar)) {
 					val = nil
 				} else {
 					coerced := coerceScalarBindingForDoris(val, b, getNow())
@@ -448,6 +510,33 @@ func ShredDocument(
 					return nil, fmt.Errorf("mapper_parsing_exception: failed to parse vector field [%s] of type [%s]", b.ESFieldPath, b.ESType)
 				}
 				row[b.ColumnName] = vec
+			}
+		}
+	}
+
+	if s != nil && len(s.Fields) > 0 {
+		rangeFieldKeys := make([]string, 0)
+		for k, b := range s.Fields {
+			if IsRangeFieldType(b.ESType) && b.AliasTarget == "" && !b.EnabledFalse {
+				rangeFieldKeys = append(rangeFieldKeys, k)
+			}
+		}
+		sort.Strings(rangeFieldKeys)
+		for _, k := range rangeFieldKeys {
+			b := s.Fields[k]
+			modified, err := validateAndNormalizeRangeFieldInDoc(parsedDoc, b.SourceJSONPath, b, getNow)
+			if err != nil {
+				if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+					recordIgnored(b.ESFieldPath)
+					if deletePathInMap(parsedDoc, b.SourceJSONPath) {
+						prunedDynamic = true
+					}
+					continue
+				}
+				return nil, err
+			}
+			if modified {
+				prunedDynamic = true
 			}
 		}
 	}
@@ -767,7 +856,7 @@ func ShredDocument(
 
 func isTypedNonStringBinding(b FieldBinding) bool {
 	switch b.ESType {
-	case "long", "unsigned_long", "integer", "short", "byte", "double", "float", "half_float", "scaled_float", "date", "date_nanos", "boolean", "ip", "geo_point":
+	case "long", "unsigned_long", "integer", "short", "byte", "token_count", "double", "float", "half_float", "scaled_float", "date", "date_nanos", "boolean", "ip", "geo_point":
 		return true
 	}
 	switch b.DorisType {
@@ -1057,6 +1146,26 @@ func collectRawLeafsAtPathWithNull(node any, path []string, nullVal any, out *[]
 func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 	if val == nil {
 		return nil
+	}
+	if b.ESType == "token_count" {
+		switch tv := val.(type) {
+		case string:
+			return int64(len(strings.Fields(tv)))
+		case []string:
+			var total int64
+			for _, sv := range tv {
+				total += int64(len(strings.Fields(sv)))
+			}
+			return total
+		case []any:
+			var total int64
+			for _, elem := range tv {
+				if sv, ok := elem.(string); ok {
+					total += int64(len(strings.Fields(sv)))
+				}
+			}
+			return total
+		}
 	}
 	effDorisType := b.DorisType
 	if (effDorisType == DorisString || effDorisType == "") && b.ESType != "" {
@@ -1586,7 +1695,7 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 			if strings.Contains(k, ".") {
 				return false, fmt.Errorf("mapper_parsing_exception: object mapping for [%s] tried to parse field [%s] as object, but subobjects is set to false", scope, k)
 			}
-			isAllowedObjectProp := exists && (strings.EqualFold(prop.Type, "flattened") || strings.EqualFold(prop.Type, "geo_point") || (prop.Enabled != nil && !*prop.Enabled))
+			isAllowedObjectProp := exists && (strings.EqualFold(prop.Type, "flattened") || strings.EqualFold(prop.Type, "geo_point") || strings.EqualFold(prop.Type, "completion") || IsRangeFieldType(prop.Type) || (prop.Enabled != nil && !*prop.Enabled))
 			if !isAllowedObjectProp && hasObjectValueAtPath(v, nil) {
 				return false, fmt.Errorf("mapper_parsing_exception: object mapping for [%s] tried to parse field [%s] as object, but subobjects is set to false", scope, k)
 			}
@@ -2881,11 +2990,47 @@ func cloneNestedMap(m map[string]any) map[string]any {
 	return out
 }
 
+func expandFlatDottedKeysInMap(curr map[string]any) {
+	if curr == nil {
+		return
+	}
+	var dottedKeys []string
+	for k := range curr {
+		if strings.Contains(k, ".") && !strings.HasPrefix(k, "_") {
+			dottedKeys = append(dottedKeys, k)
+		}
+	}
+	sort.Strings(dottedKeys)
+	for _, k := range dottedKeys {
+		val := curr[k]
+		delete(curr, k)
+		parts := strings.SplitN(k, ".", 2)
+		if existingSub, ok := curr[parts[0]].(map[string]any); ok {
+			existingSub[parts[1]] = val
+		} else {
+			curr[parts[0]] = map[string]any{parts[1]: val}
+		}
+	}
+	for _, v := range curr {
+		switch tv := v.(type) {
+		case map[string]any:
+			expandFlatDottedKeysInMap(tv)
+		case []any:
+			for _, elem := range tv {
+				if subM, ok := elem.(map[string]any); ok {
+					expandFlatDottedKeysInMap(subM)
+				}
+			}
+		}
+	}
+}
+
 func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootParts []string, elemMap map[string]any, getNow func() time.Time) map[string]any {
-	if s == nil || len(elemMap) == 0 {
+	if s == nil || elemMap == nil {
 		return elemMap
 	}
 	cloned := cloneNestedMap(elemMap)
+	expandFlatDottedKeysInMap(cloned)
 	fields := s.OrderedFields
 	if len(fields) == 0 {
 		for _, b := range s.Fields {
@@ -3047,7 +3192,7 @@ func appendNestedCopyToAtPath(s *IndexSchema, curr map[string]any, relPath []str
 		}
 		return
 	}
-	if tb.ESType != "text" && tb.ESType != "match_only_text" {
+	if !IsTextLikeESType(tb.ESType) {
 		var arr []any
 		if existing, exists := curr[key]; exists && existing != nil {
 			if exSlice, okS := existing.([]any); okS {
@@ -3119,6 +3264,7 @@ func applyNestedCompanionNormalizationAtPath(curr map[string]any, relPath []stri
 	if len(relPath) == 0 || curr == nil {
 		return
 	}
+	expandFlatDottedKeysInMap(curr)
 	key := relPath[0]
 	val, exists := curr[key]
 	if !exists {
@@ -3155,9 +3301,23 @@ func applyNestedBindingNormalizationAtPath(curr map[string]any, relPath []string
 	if len(relPath) == 0 || curr == nil {
 		return
 	}
+	expandFlatDottedKeysInMap(curr)
 	key := relPath[0]
 	val, exists := curr[key]
 	if !exists {
+		if b.ESType == "constant_keyword" && b.ConstantValue != nil {
+			if len(relPath) == 1 {
+				expectedStr := fmt.Sprintf("%v", b.ConstantValue)
+				if b.LowercaseNormalizer {
+					expectedStr = strings.ToLower(expectedStr)
+				}
+				curr[key] = expectedStr
+			} else {
+				nextMap := make(map[string]any)
+				curr[key] = nextMap
+				applyNestedBindingNormalizationAtPath(nextMap, relPath[1:], b, getNow)
+			}
+		}
 		return
 	}
 	if len(relPath) > 1 {
@@ -3295,10 +3455,448 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 		} else if b.ESType == "keyword" || b.ESType == "constant_keyword" || b.ESType == "wildcard" || b.DorisType == DorisVarchar {
 			return strings.ToLower(fmt.Sprintf("%v", val))
 		}
-	} else if b.ESType == "keyword" || b.ESType == "constant_keyword" || b.ESType == "wildcard" || b.ESType == "text" || b.DorisType == DorisVarchar {
+	} else if b.ESType == "keyword" || b.ESType == "constant_keyword" || b.ESType == "wildcard" || IsTextLikeESType(b.ESType) || b.DorisType == DorisVarchar {
 		if _, isStr := val.(string); !isStr {
 			return fmt.Sprintf("%v", val)
 		}
 	}
 	return val
+}
+
+func extractCompletionStringsWithNull(node any, path []string, lowercase bool, nullVal any) ([]string, error) {
+	var out []string
+	if err := collectCompletionStringsAtPath(node, path, lowercase, nullVal, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func collectCompletionStringsAtPath(node any, path []string, lowercase bool, nullVal any, out *[]string) error {
+	if len(path) == 0 {
+		if node == nil {
+			if nullVal != nil {
+				s := fmt.Sprintf("%v", nullVal)
+				if lowercase {
+					s = strings.ToLower(s)
+				}
+				*out = append(*out, s)
+			}
+			return nil
+		}
+		switch v := node.(type) {
+		case string:
+			if lowercase {
+				v = strings.ToLower(v)
+			}
+			*out = append(*out, v)
+		case []any:
+			for _, item := range v {
+				if err := collectCompletionStringsAtPath(item, nil, lowercase, nullVal, out); err != nil {
+					return err
+				}
+			}
+		case map[string]any:
+			inp, hasInput := v["input"]
+			if !hasInput || inp == nil {
+				return fmt.Errorf("mapper_parsing_exception: [completion] field object missing required [input]")
+			}
+			for k := range v {
+				switch k {
+				case "input", "weight", "contexts":
+				default:
+					return fmt.Errorf("mapper_parsing_exception: [completion] unknown field [%s]", k)
+				}
+			}
+			switch iv := inp.(type) {
+			case string:
+				if lowercase {
+					iv = strings.ToLower(iv)
+				}
+				*out = append(*out, iv)
+			case []any:
+				for _, elem := range iv {
+					if elem == nil {
+						continue
+					}
+					if _, isMap := elem.(map[string]any); isMap {
+						return fmt.Errorf("mapper_parsing_exception: [completion] input cannot contain objects")
+					}
+					s := fmt.Sprintf("%v", elem)
+					if lowercase {
+						s = strings.ToLower(s)
+					}
+					*out = append(*out, s)
+				}
+			default:
+				return fmt.Errorf("mapper_parsing_exception: [completion] invalid input value")
+			}
+		default:
+			s := fmt.Sprintf("%v", v)
+			if lowercase {
+				s = strings.ToLower(s)
+			}
+			*out = append(*out, s)
+		}
+		return nil
+	}
+	if node == nil {
+		return nil
+	}
+	switch curr := node.(type) {
+	case map[string]any:
+		if next, ok := curr[path[0]]; ok {
+			return collectCompletionStringsAtPath(next, path[1:], lowercase, nullVal, out)
+		}
+		for i := len(path); i > 1; i-- {
+			if next, ok := curr[strings.Join(path[:i], ".")]; ok {
+				return collectCompletionStringsAtPath(next, path[i:], lowercase, nullVal, out)
+			}
+		}
+	case []any:
+		for _, elem := range curr {
+			if err := collectCompletionStringsAtPath(elem, path, lowercase, nullVal, out); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// IPToSortableFloat converts an IPv4 or IPv6 address string into an order-preserving float64.
+func IPToSortableFloat(ipStr string) (float64, bool) {
+	trimmed := strings.TrimSpace(ipStr)
+	ip := net.ParseIP(trimmed)
+	if ip == nil {
+		return 0, false
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		u := uint32(ip4[0])<<24 | uint32(ip4[1])<<16 | uint32(ip4[2])<<8 | uint32(ip4[3])
+		return float64(u), true
+	}
+	ip16 := ip.To16()
+	if ip16 == nil {
+		return 0, false
+	}
+	var val float64
+	for i := 0; i < 16; i++ {
+		val = val*256.0 + float64(ip16[i])
+	}
+	return val, true
+}
+
+func validateAndNormalizeRangeFieldInDoc(curr map[string]any, path []string, b FieldBinding, getNow func() time.Time) (bool, error) {
+	if curr == nil || len(path) == 0 {
+		return false, nil
+	}
+	if len(path) == 1 {
+		raw, exists := curr[path[0]]
+		if !exists || raw == nil {
+			return false, nil
+		}
+		norm, modified, err := validateAndNormalizeRangeValue(raw, b, getNow)
+		if err != nil {
+			return false, err
+		}
+		if modified {
+			curr[path[0]] = norm
+		}
+		return modified, nil
+	}
+	if next, exists := curr[path[0]]; exists {
+		switch tv := next.(type) {
+		case map[string]any:
+			return validateAndNormalizeRangeFieldInDoc(tv, path[1:], b, getNow)
+		case []any:
+			anyMod := false
+			for _, elem := range tv {
+				if em, ok := elem.(map[string]any); ok {
+					mod, err := validateAndNormalizeRangeFieldInDoc(em, path[1:], b, getNow)
+					if err != nil {
+						return false, err
+					}
+					if mod {
+						anyMod = true
+					}
+				}
+			}
+			return anyMod, nil
+		}
+	}
+	return false, nil
+}
+
+func validateAndNormalizeRangeValue(raw any, b FieldBinding, getNow func() time.Time) (any, bool, error) {
+	if raw == nil {
+		return nil, false, nil
+	}
+	switch v := raw.(type) {
+	case map[string]any:
+		if err := validateAndPopulateSingleRangeMap(v, b, getNow); err != nil {
+			return nil, false, err
+		}
+		return v, true, nil
+	case []any:
+		for i, elem := range v {
+			if elem == nil {
+				continue
+			}
+			em, ok := elem.(map[string]any)
+			if !ok {
+				if str, isStr := elem.(string); isStr && b.ESType == "ip_range" {
+					cidrMap, err := parseCIDRRangeMap(str, b.ESFieldPath)
+					if err != nil {
+						return nil, false, err
+					}
+					v[i] = cidrMap
+					continue
+				}
+				return nil, false, fmt.Errorf("mapper_parsing_exception: failed to parse range field [%s] of type [%s]: expected range object", b.ESFieldPath, b.ESType)
+			}
+			if err := validateAndPopulateSingleRangeMap(em, b, getNow); err != nil {
+				return nil, false, err
+			}
+		}
+		return v, true, nil
+	case string:
+		if b.ESType == "ip_range" {
+			cidrMap, err := parseCIDRRangeMap(v, b.ESFieldPath)
+			if err != nil {
+				return nil, false, err
+			}
+			return cidrMap, true, nil
+		}
+		return nil, false, fmt.Errorf("mapper_parsing_exception: failed to parse range field [%s] of type [%s]: expected range object", b.ESFieldPath, b.ESType)
+	default:
+		return nil, false, fmt.Errorf("mapper_parsing_exception: failed to parse range field [%s] of type [%s]: expected range object", b.ESFieldPath, b.ESType)
+	}
+}
+
+func parseCIDRRangeMap(cidrStr, fieldPath string) (map[string]any, error) {
+	_, ipNet, err := net.ParseCIDR(strings.TrimSpace(cidrStr))
+	if err != nil || ipNet == nil {
+		return nil, fmt.Errorf("mapper_parsing_exception: failed to parse ip_range field [%s]: invalid CIDR [%s]", fieldPath, cidrStr)
+	}
+	startIP := make(net.IP, len(ipNet.IP))
+	copy(startIP, ipNet.IP)
+	endIP := make(net.IP, len(ipNet.IP))
+	for i := range ipNet.IP {
+		endIP[i] = ipNet.IP[i] | ^ipNet.Mask[i]
+	}
+	lo, ok1 := IPToSortableFloat(startIP.String())
+	hi, ok2 := IPToSortableFloat(endIP.String())
+	if !ok1 || !ok2 {
+		return nil, fmt.Errorf("mapper_parsing_exception: failed to parse ip_range field [%s]", fieldPath)
+	}
+	return map[string]any{
+		"gte":  startIP.String(),
+		"lte":  endIP.String(),
+		"_gte": lo,
+		"_lte": hi,
+	}, nil
+}
+
+func parseRangeBoundValue(raw any, b FieldBinding, getNow func() time.Time) (float64, int64, bool) {
+	if raw == nil {
+		return 0, 0, false
+	}
+	if _, isBool := raw.(bool); isBool {
+		return 0, 0, false
+	}
+	esType := strings.ToLower(strings.TrimSpace(b.ESType))
+	switch esType {
+	case "integer_range", "long_range":
+		var iv int64
+		var ok bool
+		switch tv := raw.(type) {
+		case json.Number:
+			if parsed, err := tv.Int64(); err == nil {
+				iv, ok = parsed, true
+			}
+		case float64:
+			if !math.IsNaN(tv) && !math.IsInf(tv, 0) && math.Trunc(tv) == tv && tv >= -9223372036854775808.0 && tv < 9223372036854775808.0 {
+				iv, ok = int64(tv), true
+			}
+		case string:
+			if b.Coerce == nil || *b.Coerce {
+				if parsed, err := strconv.ParseInt(strings.TrimSpace(tv), 10, 64); err == nil {
+					iv, ok = parsed, true
+				}
+			}
+		}
+		if !ok || (esType == "integer_range" && (iv < math.MinInt32 || iv > math.MaxInt32)) {
+			return 0, 0, false
+		}
+		return float64(iv), iv, true
+	case "float_range", "double_range":
+		var fv float64
+		var ok bool
+		switch tv := raw.(type) {
+		case json.Number:
+			if parsed, err := tv.Float64(); err == nil && !math.IsNaN(parsed) && !math.IsInf(parsed, 0) {
+				fv, ok = parsed, true
+			}
+		case float64:
+			if !math.IsNaN(tv) && !math.IsInf(tv, 0) {
+				fv, ok = tv, true
+			}
+		case string:
+			if b.Coerce == nil || *b.Coerce {
+				if parsed, err := strconv.ParseFloat(strings.TrimSpace(tv), 64); err == nil && !math.IsNaN(parsed) && !math.IsInf(parsed, 0) {
+					fv, ok = parsed, true
+				}
+			}
+		}
+		if !ok || (esType == "float_range" && math.Abs(fv) > math.MaxFloat32) {
+			return 0, 0, false
+		}
+		return fv, 0, true
+	case "date_range":
+		switch tv := raw.(type) {
+		case string:
+			if b.Format != "" {
+				if ms, ok := ParseESDateWithFormatToEpochMillis(tv, b.Format, getNow()); ok {
+					return float64(ms), ms, true
+				}
+				return 0, 0, false
+			}
+			if iv, err := strconv.ParseInt(strings.TrimSpace(tv), 10, 64); err == nil {
+				return float64(iv), iv, true
+			}
+			if ms, ok := ParseESDateToEpochMillis(tv, getNow()); ok {
+				return float64(ms), ms, true
+			}
+		case json.Number:
+			if iv, err := tv.Int64(); err == nil {
+				return float64(iv), iv, true
+			}
+			if fv, err := tv.Float64(); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+				return fv, int64(fv), true
+			}
+		case float64:
+			if !math.IsNaN(tv) && !math.IsInf(tv, 0) {
+				return tv, int64(tv), true
+			}
+		}
+		return 0, 0, false
+	case "ip_range":
+		str, ok := raw.(string)
+		if !ok {
+			return 0, 0, false
+		}
+		fv, okIP := IPToSortableFloat(str)
+		return fv, int64(fv), okIP
+	}
+	return 0, 0, false
+}
+
+func validateAndPopulateSingleRangeMap(m map[string]any, b FieldBinding, getNow func() time.Time) error {
+	hasGt, hasGte, hasLt, hasLte := false, false, false, false
+	var rawLower, rawUpper any
+	for k, v := range m {
+		switch k {
+		case "_gte", "_lte":
+			continue
+		case "gt":
+			if v != nil {
+				hasGt = true
+				rawLower = v
+			}
+		case "gte":
+			if v != nil {
+				hasGte = true
+				rawLower = v
+			}
+		case "lt":
+			if v != nil {
+				hasLt = true
+				rawUpper = v
+			}
+		case "lte":
+			if v != nil {
+				hasLte = true
+				rawUpper = v
+			}
+		default:
+			return fmt.Errorf("mapper_parsing_exception: range field [%s] unknown bound key [%s]", b.ESFieldPath, k)
+		}
+	}
+	if (hasGt && hasGte) || (hasLt && hasLte) || (!hasGt && !hasGte && !hasLt && !hasLte) {
+		return fmt.Errorf("mapper_parsing_exception: invalid range bounds for field [%s]", b.ESFieldPath)
+	}
+	esType := strings.ToLower(strings.TrimSpace(b.ESType))
+	isIntRange := esType == "integer_range" || esType == "long_range"
+	hasLower := hasGt || hasGte
+	hasUpper := hasLt || hasLte
+	var lowerFloat, upperFloat float64
+	var lowerInt, upperInt int64
+	if hasLower {
+		lf, li, ok := parseRangeBoundValue(rawLower, b, getNow)
+		if !ok {
+			return fmt.Errorf("mapper_parsing_exception: failed to parse lower bound of range field [%s] of type [%s]", b.ESFieldPath, b.ESType)
+		}
+		if hasGt {
+			if isIntRange {
+				if (esType == "integer_range" && li == math.MaxInt32) || li == math.MaxInt64 {
+					return fmt.Errorf("mapper_parsing_exception: lower bound overflow in range field [%s]", b.ESFieldPath)
+				}
+				li++
+				lf = float64(li)
+			} else if esType == "ip_range" {
+				lf += 1.0
+			}
+		}
+		lowerFloat, lowerInt = lf, li
+	}
+	if hasUpper {
+		uf, ui, ok := parseRangeBoundValue(rawUpper, b, getNow)
+		if !ok {
+			return fmt.Errorf("mapper_parsing_exception: failed to parse upper bound of range field [%s] of type [%s]", b.ESFieldPath, b.ESType)
+		}
+		if hasLt {
+			if isIntRange {
+				if (esType == "integer_range" && ui == math.MinInt32) || ui == math.MinInt64 {
+					return fmt.Errorf("mapper_parsing_exception: upper bound underflow in range field [%s]", b.ESFieldPath)
+				}
+				ui--
+				uf = float64(ui)
+			} else if esType == "ip_range" {
+				uf -= 1.0
+			}
+		}
+		upperFloat, upperInt = uf, ui
+	}
+	if hasLower && hasUpper {
+		if isIntRange {
+			if lowerInt > upperInt {
+				return fmt.Errorf("mapper_parsing_exception: lower bound cannot be greater than upper bound in range field [%s]", b.ESFieldPath)
+			}
+		} else if esType == "ip_range" {
+			if lowerFloat > upperFloat {
+				return fmt.Errorf("mapper_parsing_exception: lower bound cannot be greater than upper bound in range field [%s]", b.ESFieldPath)
+			}
+		} else {
+			if lowerFloat > upperFloat || (lowerFloat == upperFloat && (hasGt || hasLt)) {
+				return fmt.Errorf("mapper_parsing_exception: lower bound cannot be greater than upper bound in range field [%s]", b.ESFieldPath)
+			}
+		}
+	}
+	if hasLower {
+		if isIntRange {
+			m["_gte"] = lowerInt
+		} else {
+			m["_gte"] = lowerFloat
+		}
+	} else {
+		m["_gte"] = -1e100
+	}
+	if hasUpper {
+		if isIntRange {
+			m["_lte"] = upperInt
+		} else {
+			m["_lte"] = upperFloat
+		}
+	} else {
+		m["_lte"] = 1e100
+	}
+	return nil
 }

@@ -1567,3 +1567,192 @@ func TestRound46SchemaDottedMappingsDateMathAndNestedIgnoreMalformed(t *testing.
 		t.Fatalf("F7 expected 2025-06-15||/y roundUp = 1767225599999, got %d (ok=%v)", msEndYear, okY)
 	}
 }
+
+func TestRound47SchemaAndShredderSpecCompliance(t *testing.T) {
+	// F5 & F6 & F9: Range field types, search_as_you_type, completion, token_count, annotated-text, nested constant_keyword, flat dotted nested keys, empty nested prefilter guard
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"int_rng":    {"type": "integer_range"},
+			"date_rng":   {"type": "date_range"},
+			"ip_rng":     {"type": "ip_range"},
+			"sayt":       {"type": "search_as_you_type"},
+			"suggest":    {"type": "completion"},
+			"annotated":  {"type": "annotated-text"},
+			"tok_cnt":    {"type": "token_count", "analyzer": "standard"},
+			"items": {
+				"type": "nested",
+				"properties": {
+					"kind": {"type": "constant_keyword", "value": "BOOK"},
+					"meta": {
+						"properties": {
+							"tag": {"type": "keyword"}
+						}
+					}
+				}
+			}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("F5/F6/F9 mapping unmarshal failed: %v", err)
+	}
+	sch := CompileIndexSchema("db", "r47_sch_idx", &spec)
+
+	// F5: Range types map to DorisVariant (StorageDynamicVariant)
+	for _, rf := range []string{"int_rng", "date_rng", "ip_rng"} {
+		b := sch.ResolveField(rf)
+		if b.Kind != StorageDynamicVariant || b.DorisType != DorisVariant {
+			t.Fatalf("F5 expected %s to resolve to StorageDynamicVariant/DorisVariant, got %+v", rf, b)
+		}
+	}
+
+	// F6: search_as_you_type subfields resolve to base field
+	for _, sub := range []string{"sayt._index_prefix", "sayt._2gram", "sayt._3gram"} {
+		b := sch.ResolveField(sub)
+		if b.ColumnName != "f__sayt" {
+			t.Fatalf("F6 expected %s to resolve to f__sayt, got %+v", sub, b)
+		}
+		eb := sch.ResolveEffectiveField(sub, false)
+		if eb.ColumnName != "f__sayt" {
+			t.Fatalf("F6 expected effective field for %s to resolve to f__sayt, got %+v", sub, eb)
+		}
+	}
+
+	// F6: token_count maps to DorisInt
+	if tcB := sch.ResolveField("tok_cnt"); tcB.DorisType != DorisInt {
+		t.Fatalf("F6 expected tok_cnt DorisInt, got %+v", tcB)
+	}
+
+	// Shred document with range fields, completion object, array sayt/annotated-text, token_count, and flat dotted key in nested element
+	shredBytes, err := ShredDocument(sch, "1", 1, false, []byte(`{
+		"int_rng": {"gt": 10, "lte": 20},
+		"date_rng": {"gte": "2025-01-01T00:00:00Z", "lt": "2025-01-02T00:00:00Z"},
+		"ip_rng": {"gte": "10.0.0.1", "lte": "10.0.0.255"},
+		"sayt": ["quick", "brown", "fox"],
+		"suggest": {"input": ["foo", "bar"], "weight": 10},
+		"annotated": ["hello", "world"],
+		"tok_cnt": "one two three four",
+		"items": [{"meta.tag": "scifi"}]
+	}`))
+	if err != nil {
+		t.Fatalf("ShredDocument failed: %v", err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(shredBytes, &row); err != nil {
+		t.Fatalf("unmarshal shredded row failed: %v", err)
+	}
+	if row["f__sayt"] != "quick brown fox" {
+		t.Fatalf("F6 expected f__sayt='quick brown fox', got %v", row["f__sayt"])
+	}
+	if row["f__suggest"] != "foo bar" {
+		t.Fatalf("F6 expected f__suggest='foo bar', got %v", row["f__suggest"])
+	}
+	if row["f__annotated"] != "hello world" {
+		t.Fatalf("F6 expected f__annotated='hello world', got %v", row["f__annotated"])
+	}
+	if row["f__tok_cnt"] != float64(4) {
+		t.Fatalf("F6 expected f__tok_cnt=4, got %v", row["f__tok_cnt"])
+	}
+	docObj, _ := row["_doc"].(map[string]any)
+	intRngObj, _ := docObj["int_rng"].(map[string]any)
+	if intRngObj["_gte"] != float64(11) || intRngObj["_lte"] != float64(20) {
+		t.Fatalf("F5 expected int_rng._gte=11 and _lte=20, got %+v", intRngObj)
+	}
+	// F9: Nested element in n__items has expanded meta.tag and injected constant_keyword kind="BOOK"
+	nestedElems, _ := row["n__items"].([]any)
+	if len(nestedElems) != 1 {
+		t.Fatalf("F9 expected 1 nested item in n__items, got %+v", row["n__items"])
+	}
+	var elem0 map[string]any
+	if err := json.Unmarshal([]byte(nestedElems[0].(string)), &elem0); err != nil {
+		t.Fatalf("F9 unmarshal nested element failed: %v", err)
+	}
+	if elem0["kind"] != "BOOK" {
+		t.Fatalf("F9 expected nested constant_keyword kind='BOOK', got %+v", elem0)
+	}
+	metaMap, _ := elem0["meta"].(map[string]any)
+	if metaMap["tag"] != "scifi" {
+		t.Fatalf("F9 expected expanded nested meta.tag='scifi', got %+v", elem0)
+	}
+
+	// F9: Empty nested array does NOT populate nested constant_keyword prefilter column
+	shredEmptyNested, err := ShredDocument(sch, "2", 1, false, []byte(`{"sayt": "only top"}`))
+	if err != nil {
+		t.Fatalf("ShredDocument empty nested failed: %v", err)
+	}
+	var rowEmpty map[string]any
+	_ = json.Unmarshal(shredEmptyNested, &rowEmpty)
+	if v, has := rowEmpty["n__items__kind"]; has && v != nil {
+		t.Fatalf("F9 expected n__items__kind to be empty when items is absent, got %v", v)
+	}
+
+	// F5: Invalid range bounds (lower > upper or unknown key) rejected with mapper_parsing_exception
+	if _, err := ShredDocument(sch, "3", 1, false, []byte(`{"int_rng": {"gte": 30, "lte": 20}}`)); err == nil || !strings.Contains(err.Error(), "mapper_parsing_exception") {
+		t.Fatalf("F5 expected mapper_parsing_exception for gte > lte, got %v", err)
+	}
+	if _, err := ShredDocument(sch, "4", 1, false, []byte(`{"int_rng": {"gt": 20, "lte": 20}}`)); err == nil || !strings.Contains(err.Error(), "mapper_parsing_exception") {
+		t.Fatalf("F5 expected mapper_parsing_exception for gt == lte, got %v", err)
+	}
+
+	// F7: InferMappingFromSampleDocs with DateDetection=false, NumericDetection=true, DynamicTemplates
+	fFalse := false
+	fTrue := true
+	existing := &esast.MappingSpec{
+		DateDetection:    &fFalse,
+		NumericDetection: &fTrue,
+		DynamicTemplates: []map[string]any{
+			{
+				"code_as_keyword": map[string]any{
+					"match":   "code_*",
+					"mapping": map[string]any{"type": "keyword"},
+				},
+			},
+		},
+	}
+	inferred := InferMappingFromSampleDocs([]json.RawMessage{
+		json.RawMessage(`{"created": "2025-01-01T00:00:00Z", "count_str": "42", "ratio_str": "3.14", "code_id": "ABC"}`),
+	}, existing)
+	if inferred.Properties["created"].Type == "date" {
+		t.Fatalf("F7 expected DateDetection=false to prevent date inference on created, got %+v", inferred.Properties["created"])
+	}
+	if inferred.Properties["count_str"].Type != "long" || inferred.Properties["ratio_str"].Type != "float" {
+		t.Fatalf("F7 expected NumericDetection=true to infer long and float, got count=%s ratio=%s", inferred.Properties["count_str"].Type, inferred.Properties["ratio_str"].Type)
+	}
+	if inferred.Properties["code_id"].Type != "keyword" {
+		t.Fatalf("F7 expected dynamic_template to map code_id as keyword, got %+v", inferred.Properties["code_id"])
+	}
+
+	// F8: ValidateMappingUpdateCompatibility rejects immutable parameter changes
+	baseSpec := &esast.MappingSpec{
+		Properties: map[string]esast.FieldProperty{
+			"kw":      {Type: "keyword", Normalizer: "lowercase"},
+			"txt":     {Type: "text", Analyzer: "standard"},
+			"sf":      {Type: "scaled_float", ScalingFactor: 100},
+			"vec":     {Type: "dense_vector", Dims: 3, Similarity: "cosine"},
+			"indexed": {Type: "keyword"},
+		},
+	}
+	for _, badUpdate := range []*esast.MappingSpec{
+		{Properties: map[string]esast.FieldProperty{"kw": {Type: "keyword", Normalizer: "my_norm"}}},
+		{Properties: map[string]esast.FieldProperty{"txt": {Type: "text", Analyzer: "whitespace"}}},
+		{Properties: map[string]esast.FieldProperty{"sf": {Type: "scaled_float", ScalingFactor: 10}}},
+		{Properties: map[string]esast.FieldProperty{"vec": {Type: "dense_vector", Dims: 4, Similarity: "cosine"}}},
+		{Properties: map[string]esast.FieldProperty{"vec": {Type: "dense_vector", Dims: 3, Similarity: "l2_norm"}}},
+		{Properties: map[string]esast.FieldProperty{"indexed": {Type: "keyword", Index: &fFalse}}},
+		{Properties: map[string]esast.FieldProperty{"indexed": {Type: "keyword", DocValues: &fFalse}}},
+	} {
+		if err := ValidateMappingUpdateCompatibility(baseSpec, badUpdate); err == nil || !strings.Contains(err.Error(), "illegal_argument_exception") {
+			t.Fatalf("F8 expected illegal_argument_exception for incompatible mapping update %+v, got %v", badUpdate, err)
+		}
+	}
+
+	// Additional range shredder coverage: CIDR string on ip_range, array of ranges, float_range, and IPv6
+	spec.Properties["flt_rng"] = esast.FieldProperty{Type: "float_range"}
+	sch2 := CompileIndexSchema("db", "r47_idx2", &spec)
+	if _, err := ShredDocument(sch2, "5", 1, false, []byte(`{
+		"ip_rng": ["192.168.1.0/24", {"gt": "2001:db8::1", "lt": "2001:db8::ff"}],
+		"flt_rng": {"gt": 1.25, "lt": 5.75},
+		"date_rng": {"gt": 1700000000000, "lte": 1700000099999}
+	}`)); err != nil {
+		t.Fatalf("ShredDocument CIDR/float_range/IPv6 failed: %v", err)
+	}
+}

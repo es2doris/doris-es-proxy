@@ -1,0 +1,145 @@
+---
+"Ping headers transform_and_set and non-skipped skip":
+  - skip:
+      version: " - 6.99.99"
+      reason: "only skipped prior to 7.0"
+      features: [headers, contains, transform_and_set, regex]
+  - do:
+      ping: {}
+  - is_true: ''
+
+  - do:
+      info: {}
+  - match:
+      $headers.content-type: "/^application\\/json/"
+  - transform_and_set:
+      ver_b64: "base64Encode(version.number)"
+      flavor_upper: "upper(version.build_flavor)"
+      flavor_lower: "lower(version.build_flavor)"
+  - match:
+      version.number: "7.10.2"
+
+---
+"Version skipped section":
+  - skip:
+      version: "7.0.0 - 7.99.99"
+      reason: "intentionally skipped on 7.x to verify version range skip"
+  - do:
+      info: {}
+
+---
+"Contains assertion with recursive regex and clone and search_shards":
+  - do:
+      indices.create:
+        index: r47_src_idx
+  - do:
+      index:
+        index: r47_src_idx
+        id: "1"
+        body: { "tag": "alpha_item", "score_num": 10 }
+  - do:
+      index:
+        index: r47_src_idx
+        id: "2"
+        body: { "tag": "beta_item", "score_num": 20 }
+  - do:
+      indices.refresh:
+        index: r47_src_idx
+  - do:
+      search:
+        index: r47_src_idx
+        body:
+          query:
+            match_all: {}
+  - contains:
+      hits.hits:
+        _id: "1"
+        _source:
+          tag: "/^alpha_/"
+  - contains:
+      hits.hits:
+        _id: "2"
+        _source:
+          tag: "/^beta_/"
+
+  - do:
+      indices.clone:
+        index: r47_src_idx
+        target: r47_cloned_idx
+  - match: { acknowledged: true }
+
+  - do:
+      search_shards:
+        index: r47_cloned_idx
+  - is_true: shards
+
+---
+"ILM lifecycle policy CRUD":
+  - do:
+      ilm.put_lifecycle:
+        policy: r47_ilm_policy
+        body:
+          policy:
+            phases:
+              hot:
+                actions:
+                  rollover:
+                    max_age: "30d"
+  - match: { acknowledged: true }
+
+  - do:
+      ilm.get_lifecycle:
+        policy: r47_ilm_policy
+  - is_true: r47_ilm_policy
+
+  - do:
+      ilm.delete_lifecycle:
+        policy: r47_ilm_policy
+  - match: { acknowledged: true }
+
+---
+"Enrich policy CRUD and execute":
+  - do:
+      indices.create:
+        index: r47_enrich_src
+  - do:
+      enrich.put_policy:
+        name: r47_enrich_pol
+        body:
+          match:
+            indices: r47_enrich_src
+            match_field: k
+            enrich_fields: ["v"]
+  - match: { acknowledged: true }
+
+  - do:
+      enrich.get_policy:
+        name: r47_enrich_pol
+  - is_true: policies
+
+  - do:
+      enrich.execute_policy:
+        name: r47_enrich_pol
+  - is_true: status
+
+  - do:
+      enrich.delete_policy:
+        name: r47_enrich_pol
+  - match: { acknowledged: true }
+
+---
+"Data stream lifecycle":
+  - do:
+      indices.create_data_stream:
+        name: r47_ds
+  - match: { acknowledged: true }
+
+  - do:
+      indices.get_data_stream:
+        name: r47_ds
+  - is_true: data_streams
+
+  - do:
+      indices.delete_data_stream:
+        name: r47_ds
+  - match: { acknowledged: true }

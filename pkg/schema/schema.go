@@ -53,7 +53,29 @@ const (
 	DorisBoolean    DorisScalarType = "BOOLEAN"
 	DorisDateTimeV2 DorisScalarType = "DATETIMEV2(3)"
 	DorisFloatArray DorisScalarType = "ARRAY<FLOAT>"
+	DorisVariant    DorisScalarType = "VARIANT"
 )
+
+// IsRangeFieldType returns true if esType is one of the 6 Elasticsearch range field types.
+func IsRangeFieldType(esType string) bool {
+	switch strings.ToLower(strings.TrimSpace(esType)) {
+	case "integer_range", "long_range", "float_range", "double_range", "date_range", "ip_range":
+		return true
+	default:
+		return false
+	}
+}
+
+// IsTextLikeESType returns true if esType is tokenized full-text or completion/search_as_you_type/annotated-text
+// where multi-valued string arrays are joined with spaces in a single STRING column rather than promoted to ARRAY<STRING>.
+func IsTextLikeESType(esType string) bool {
+	switch strings.ToLower(strings.TrimSpace(esType)) {
+	case "text", "match_only_text", "search_as_you_type", "completion", "annotated-text", "annotated_text":
+		return true
+	default:
+		return false
+	}
+}
 
 // FieldBinding describes how an Elasticsearch field path (e.g. `name.keyword`,
 // `tags.tagFQN`, `columns.dataType`) maps to physical Apache Doris column(s).
@@ -235,11 +257,11 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 	}
 	for target := range copyToTargets {
 		if tb, ok := s.Fields[target]; ok {
-			if tb.Kind == StoragePromotedScalar && tb.ESType != "text" && tb.ESType != "match_only_text" {
+			if tb.Kind == StoragePromotedScalar && !IsTextLikeESType(tb.ESType) {
 				tb.Kind = StoragePromotedArray
 				tb.IsMultiValued = true
 				s.Fields[target] = tb
-			} else if tb.Kind == StorageNestedSubfield && tb.ESType != "text" && tb.ESType != "match_only_text" {
+			} else if tb.Kind == StorageNestedSubfield && !IsTextLikeESType(tb.ESType) {
 				tb.IsMultiValued = true
 				s.Fields[target] = tb
 			}
@@ -259,7 +281,7 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 			targetPrefix := target + "."
 			for subK, subB := range s.Fields {
 				if strings.HasPrefix(subK, targetPrefix) && subB.AliasTarget == "" && strings.Join(subB.SourceJSONPath, ".") == target {
-					if subB.ESType != "text" && subB.ESType != "match_only_text" {
+					if !IsTextLikeESType(subB.ESType) {
 						switch subB.Kind {
 						case StoragePromotedScalar:
 							subB.Kind = StoragePromotedArray
@@ -360,20 +382,32 @@ func MergeMappingSpecs(oldSpec, newSpec *esast.MappingSpec) *esast.MappingSpec {
 	}
 	if oldSpec == nil {
 		return &esast.MappingSpec{
-			Dynamic:    newSpec.Dynamic,
-			Subobjects: newSpec.Subobjects,
-			Routing:    newSpec.Routing,
-			Runtime:    DeepMergeMappingProperties(nil, newSpec.Runtime),
-			Properties: DeepMergeMappingProperties(nil, newSpec.Properties),
+			Dynamic:            newSpec.Dynamic,
+			Subobjects:         newSpec.Subobjects,
+			Routing:            newSpec.Routing,
+			Meta:               newSpec.Meta,
+			Source:             newSpec.Source,
+			DynamicTemplates:   newSpec.DynamicTemplates,
+			DateDetection:      newSpec.DateDetection,
+			NumericDetection:   newSpec.NumericDetection,
+			DynamicDateFormats: newSpec.DynamicDateFormats,
+			Runtime:            DeepMergeMappingProperties(nil, newSpec.Runtime),
+			Properties:         DeepMergeMappingProperties(nil, newSpec.Properties),
 		}
 	}
 	if newSpec == nil {
 		return &esast.MappingSpec{
-			Dynamic:    oldSpec.Dynamic,
-			Subobjects: oldSpec.Subobjects,
-			Routing:    oldSpec.Routing,
-			Runtime:    DeepMergeMappingProperties(nil, oldSpec.Runtime),
-			Properties: DeepMergeMappingProperties(nil, oldSpec.Properties),
+			Dynamic:            oldSpec.Dynamic,
+			Subobjects:         oldSpec.Subobjects,
+			Routing:            oldSpec.Routing,
+			Meta:               oldSpec.Meta,
+			Source:             oldSpec.Source,
+			DynamicTemplates:   oldSpec.DynamicTemplates,
+			DateDetection:      oldSpec.DateDetection,
+			NumericDetection:   oldSpec.NumericDetection,
+			DynamicDateFormats: oldSpec.DynamicDateFormats,
+			Runtime:            DeepMergeMappingProperties(nil, oldSpec.Runtime),
+			Properties:         DeepMergeMappingProperties(nil, oldSpec.Properties),
 		}
 	}
 	dyn := oldSpec.Dynamic
@@ -388,16 +422,46 @@ func MergeMappingSpecs(oldSpec, newSpec *esast.MappingSpec) *esast.MappingSpec {
 	if newSpec.Routing != nil {
 		rt = newSpec.Routing
 	}
+	meta := oldSpec.Meta
+	if newSpec.Meta != nil {
+		meta = newSpec.Meta
+	}
+	source := oldSpec.Source
+	if newSpec.Source != nil {
+		source = newSpec.Source
+	}
+	dynTemplates := oldSpec.DynamicTemplates
+	if newSpec.DynamicTemplates != nil {
+		dynTemplates = newSpec.DynamicTemplates
+	}
+	dateDet := oldSpec.DateDetection
+	if newSpec.DateDetection != nil {
+		dateDet = newSpec.DateDetection
+	}
+	numDet := oldSpec.NumericDetection
+	if newSpec.NumericDetection != nil {
+		numDet = newSpec.NumericDetection
+	}
+	dynDateFormats := oldSpec.DynamicDateFormats
+	if newSpec.DynamicDateFormats != nil {
+		dynDateFormats = newSpec.DynamicDateFormats
+	}
 	return &esast.MappingSpec{
-		Dynamic:    dyn,
-		Subobjects: subobj,
-		Routing:    rt,
-		Runtime:    DeepMergeMappingProperties(oldSpec.Runtime, newSpec.Runtime),
-		Properties: DeepMergeMappingProperties(oldSpec.Properties, newSpec.Properties),
+		Dynamic:            dyn,
+		Subobjects:         subobj,
+		Routing:            rt,
+		Meta:               meta,
+		Source:             source,
+		DynamicTemplates:   dynTemplates,
+		DateDetection:      dateDet,
+		NumericDetection:   numDet,
+		DynamicDateFormats: dynDateFormats,
+		Runtime:            DeepMergeMappingProperties(oldSpec.Runtime, newSpec.Runtime),
+		Properties:         DeepMergeMappingProperties(oldSpec.Properties, newSpec.Properties),
 	}
 }
 
-// ValidateMappingUpdateCompatibility checks whether `newSpec` attempts to change the type of any existing field in `oldSpec`.
+// ValidateMappingUpdateCompatibility checks whether `newSpec` attempts to change the type or immutable parameters of any existing field in `oldSpec`.
 func ValidateMappingUpdateCompatibility(oldSpec, newSpec *esast.MappingSpec) error {
 	if oldSpec == nil || newSpec == nil {
 		return nil
@@ -442,19 +506,30 @@ func validatePropertiesCompatibility(oldProps, newProps map[string]esast.FieldPr
 		if oldProp.Path != "" && newProp.Path != "" && oldProp.Path != newProp.Path {
 			return fmt.Errorf("cannot change path of alias [%s] from [%s] to [%s]", fullPath, oldProp.Path, newProp.Path)
 		}
-		oldDims := oldProp.Dims
-		if oldDims == 0 {
-			oldDims = oldProp.Dimension
+		if newProp.Normalizer != "" && newProp.Normalizer != oldProp.Normalizer {
+			return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: cannot update parameter [normalizer] from [%s] to [%s]", fullPath, oldProp.Normalizer, newProp.Normalizer)
 		}
-		newDims := newProp.Dims
-		if newDims == 0 {
-			newDims = newProp.Dimension
+		if newProp.Analyzer != "" && newProp.Analyzer != oldProp.Analyzer {
+			return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: cannot update parameter [analyzer] from [%s] to [%s]", fullPath, oldProp.Analyzer, newProp.Analyzer)
 		}
+		if newProp.ScalingFactor != 0 && newProp.ScalingFactor != oldProp.ScalingFactor {
+			return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: cannot update parameter [scaling_factor] from [%v] to [%v] for field [%s]", fullPath, oldProp.ScalingFactor, newProp.ScalingFactor, fullPath)
+		}
+		if (newProp.Index != nil && oldProp.Index != nil && *newProp.Index != *oldProp.Index) ||
+			(newProp.Index != nil && oldProp.Index == nil && !*newProp.Index) {
+			return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: cannot update parameter [index]", fullPath)
+		}
+		if (newProp.DocValues != nil && oldProp.DocValues != nil && *newProp.DocValues != *oldProp.DocValues) ||
+			(newProp.DocValues != nil && oldProp.DocValues == nil && !*newProp.DocValues) {
+			return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: cannot update parameter [doc_values]", fullPath)
+		}
+		oldDims := oldProp.EffectiveDims()
+		newDims := newProp.EffectiveDims()
 		if oldDims > 0 && newDims > 0 && oldDims != newDims {
-			return fmt.Errorf("cannot update parameter [dims] from [%d] to [%d] for field [%s]", oldDims, newDims, fullPath)
+			return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: cannot update parameter [dims] from [%d] to [%d] for field [%s]", fullPath, oldDims, newDims, fullPath)
 		}
-		if oldProp.ScalingFactor > 0 && newProp.ScalingFactor > 0 && oldProp.ScalingFactor != newProp.ScalingFactor {
-			return fmt.Errorf("cannot update parameter [scaling_factor] from [%v] to [%v] for field [%s]", oldProp.ScalingFactor, newProp.ScalingFactor, fullPath)
+		if newProp.Similarity != "" && oldProp.Similarity != "" && !strings.EqualFold(newProp.Similarity, oldProp.Similarity) {
+			return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: cannot update parameter [similarity] from [%s] to [%s]", fullPath, oldProp.Similarity, newProp.Similarity)
 		}
 		if len(oldProp.Fields) > 0 && len(newProp.Fields) > 0 {
 			if err := validatePropertiesCompatibility(oldProp.Fields, newProp.Fields, fullPath); err != nil {
@@ -476,6 +551,9 @@ func (s *IndexSchema) IsDynamicFalseUnmappedField(esFieldPath string) bool {
 		return false
 	}
 	cleanPath := strings.TrimSuffix(strings.TrimSuffix(esFieldPath, ".keyword"), ".ngram")
+	for _, saytSuffix := range []string{"._index_prefix", "._2gram", "._3gram"} {
+		cleanPath = strings.TrimSuffix(cleanPath, saytSuffix)
+	}
 	if cleanPath == "" || strings.HasPrefix(cleanPath, "_") {
 		return false
 	}
@@ -592,6 +670,24 @@ func DeepMergeMappingProperties(
 			}
 			if v.Script != nil {
 				merged.Script = v.Script
+			}
+			if v.Meta != nil {
+				merged.Meta = v.Meta
+			}
+			if v.IndexPrefixes != nil {
+				merged.IndexPrefixes = v.IndexPrefixes
+			}
+			if v.IndexPhrases != nil {
+				merged.IndexPhrases = v.IndexPhrases
+			}
+			if v.Store != nil {
+				merged.Store = v.Store
+			}
+			if v.TimeZone != "" {
+				merged.TimeZone = v.TimeZone
+			}
+			if v.SplitQueriesOnWhitespace != nil {
+				merged.SplitQueriesOnWhitespace = v.SplitQueriesOnWhitespace
 			}
 			if len(v.Properties) > 0 {
 				merged.Properties = DeepMergeMappingProperties(existing.Properties, v.Properties)
@@ -759,6 +855,24 @@ func (s *IndexSchema) registerLeafField(
 	notIndexed := (prop.Index != nil && !*prop.Index) || (prop.Enabled != nil && !*prop.Enabled)
 	docValuesFalse := (prop.DocValues != nil && !*prop.DocValues) || (prop.Enabled != nil && !*prop.Enabled)
 
+	if IsRangeFieldType(esType) {
+		s.Fields[dotPath] = FieldBinding{
+			ESFieldPath:     dotPath,
+			SourceJSONPath:  sourceJSONPath,
+			Kind:            StorageDynamicVariant,
+			ColumnName:      "",
+			DorisType:       DorisVariant,
+			ESType:          esType,
+			Format:          prop.Format,
+			NestedPath:      activeNestedRoot,
+			Coerce:          prop.Coerce,
+			IgnoreMalformed: prop.IgnoreMalformed,
+			NotIndexed:      notIndexed,
+			DocValuesFalse:  docValuesFalse,
+		}
+		return
+	}
+
 	if activeNestedRoot != "" {
 		corrCol := s.NestedRoots[activeNestedRoot]
 		relPrefixLen := nestedRootDepth
@@ -816,7 +930,7 @@ func (s *IndexSchema) registerLeafField(
 		}
 		return
 	}
-	if (prop.MultiValued || DefaultMultiValuedPaths[dotPath]) && esType != "text" && esType != "match_only_text" {
+	if (prop.MultiValued || DefaultMultiValuedPaths[dotPath]) && !IsTextLikeESType(esType) {
 		arrColName := colName
 		if prop.UpgradedArray {
 			arrColName = "f__arr__" + SanitizeDorisIdentifier(dotPath)
@@ -887,6 +1001,15 @@ func (s *IndexSchema) ResolveField(esFieldPath string) FieldBinding {
 	if b, ok := s.Fields[esFieldPath]; ok {
 		return b
 	}
+	for _, saytSuffix := range []string{"._index_prefix", "._2gram", "._3gram"} {
+		if strings.HasSuffix(esFieldPath, saytSuffix) {
+			basePath := strings.TrimSuffix(esFieldPath, saytSuffix)
+			if b, ok := s.Fields[basePath]; ok && strings.EqualFold(b.ESType, "search_as_you_type") {
+				b.ESFieldPath = esFieldPath
+				return b
+			}
+		}
+	}
 	for prefix := esFieldPath; ; {
 		idx := strings.LastIndexByte(prefix, '.')
 		if idx <= 0 {
@@ -916,7 +1039,7 @@ func (s *IndexSchema) ResolveField(esFieldPath string) FieldBinding {
 				}
 			}
 			b.ESFieldPath = esFieldPath
-			if b.ESType == "text" {
+			if IsTextLikeESType(b.ESType) {
 				b.ESType = "keyword"
 			}
 			return b
@@ -1009,14 +1132,16 @@ func (s *IndexSchema) ExpandFieldPattern(patternWithBoost string) []BoostedField
 }
 
 func mapESTypeToDoris(esType string) DorisScalarType {
-	switch strings.ToLower(esType) {
+	switch strings.ToLower(strings.TrimSpace(esType)) {
+	case "integer_range", "long_range", "float_range", "double_range", "date_range", "ip_range":
+		return DorisVariant
 	case "keyword", "constant_keyword", "wildcard", "ip":
 		return DorisVarchar
-	case "text", "match_only_text":
+	case "text", "match_only_text", "search_as_you_type", "completion", "annotated-text", "annotated_text":
 		return DorisString
 	case "long", "unsigned_long":
 		return DorisBigInt
-	case "integer", "short", "byte":
+	case "integer", "short", "byte", "token_count":
 		return DorisInt
 	case "double", "float", "half_float", "scaled_float":
 		return DorisDouble
@@ -1060,13 +1185,43 @@ const (
 	maxInferredDepth      = 4
 )
 
+type inferOptions struct {
+	dateDetection      bool
+	numericDetection   bool
+	dynamicDateFormats []string
+	dynamicTemplates   []map[string]any
+}
+
+func newInferOptions(existing *esast.MappingSpec) inferOptions {
+	opts := inferOptions{
+		dateDetection:    true,
+		numericDetection: false,
+	}
+	if existing != nil {
+		if existing.DateDetection != nil {
+			opts.dateDetection = *existing.DateDetection
+		}
+		if existing.NumericDetection != nil {
+			opts.numericDetection = *existing.NumericDetection
+		}
+		opts.dynamicDateFormats = existing.DynamicDateFormats
+		opts.dynamicTemplates = existing.DynamicTemplates
+	}
+	return opts
+}
+
 // InferMappingFromSampleDocs inspects up to 16 sample JSON documents on first write to an
 // auto-created schemaless index (`dynamic: true`) and infers Elasticsearch field mappings
 // (`keyword`, `text` + `.keyword`, `long`, `double`, `boolean`, `date`, and nested object properties).
-func InferMappingFromSampleDocs(docs []json.RawMessage) *esast.MappingSpec {
+func InferMappingFromSampleDocs(docs []json.RawMessage, existing ...*esast.MappingSpec) *esast.MappingSpec {
+	var baseSpec *esast.MappingSpec
+	if len(existing) > 0 {
+		baseSpec = existing[0]
+	}
 	if len(docs) == 0 {
 		return nil
 	}
+	opts := newInferOptions(baseSpec)
 	props := make(map[string]esast.FieldProperty)
 	totalFields := 0
 	limit := len(docs)
@@ -1084,17 +1239,21 @@ func InferMappingFromSampleDocs(docs []json.RawMessage) *esast.MappingSpec {
 		if err := dec.Decode(&obj); err != nil {
 			continue
 		}
-		inferObjectProperties(obj, props, 0, &totalFields)
+		inferObjectPropertiesWithOpts(obj, props, "", 0, &totalFields, opts)
 	}
 	if len(props) == 0 {
 		return nil
 	}
-	return &esast.MappingSpec{
+	inferredSpec := &esast.MappingSpec{
 		Properties: props,
 	}
+	if baseSpec != nil {
+		return MergeMappingSpecs(inferredSpec, baseSpec)
+	}
+	return inferredSpec
 }
 
-func inferObjectProperties(obj map[string]any, dst map[string]esast.FieldProperty, depth int, totalFields *int) {
+func inferObjectPropertiesWithOpts(obj map[string]any, dst map[string]esast.FieldProperty, pathPrefix string, depth int, totalFields *int, opts inferOptions) {
 	if depth >= maxInferredDepth || *totalFields >= maxInferredProperties {
 		return
 	}
@@ -1114,10 +1273,14 @@ func inferObjectProperties(obj map[string]any, dst map[string]esast.FieldPropert
 		if val == nil {
 			continue
 		}
+		fullPath := k
+		if pathPrefix != "" {
+			fullPath = pathPrefix + "." + k
+		}
 		if existing, exists := dst[k]; exists && len(existing.Properties) > 0 {
 			if subMap, isMap := val.(map[string]any); isMap {
 				if depth+1 < maxInferredDepth {
-					inferObjectProperties(subMap, existing.Properties, depth+1, totalFields)
+					inferObjectPropertiesWithOpts(subMap, existing.Properties, fullPath, depth+1, totalFields, opts)
 					if existing.MultiValued {
 						markPropertyMultiValued(&existing)
 					}
@@ -1130,7 +1293,7 @@ func inferObjectProperties(obj map[string]any, dst map[string]esast.FieldPropert
 					hadAny := false
 					for _, elem := range subSlice {
 						if elemMap, ok := elem.(map[string]any); ok {
-							inferObjectProperties(elemMap, existing.Properties, depth+1, totalFields)
+							inferObjectPropertiesWithOpts(elemMap, existing.Properties, fullPath, depth+1, totalFields, opts)
 							hadAny = true
 						}
 					}
@@ -1142,7 +1305,7 @@ func inferObjectProperties(obj map[string]any, dst map[string]esast.FieldPropert
 				}
 			}
 		}
-		inferred, ok := inferValueProperty(val, depth, totalFields)
+		inferred, ok := inferValuePropertyWithOpts(val, k, fullPath, depth, totalFields, opts)
 		if !ok {
 			continue
 		}
@@ -1155,7 +1318,170 @@ func inferObjectProperties(obj map[string]any, dst map[string]esast.FieldPropert
 	}
 }
 
-func inferValueProperty(val any, depth int, totalFields *int) (esast.FieldProperty, bool) {
+func detectDynamicMappingType(val any, opts inferOptions) string {
+	switch v := val.(type) {
+	case bool:
+		return "boolean"
+	case json.Number:
+		if strings.ContainsAny(v.String(), ".eE") {
+			return "double"
+		}
+		return "long"
+	case float64:
+		return "double"
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if opts.dateDetection && matchesInferredDate(trimmed, opts.dynamicDateFormats) {
+			return "date"
+		}
+		if opts.numericDetection && trimmed != "" {
+			if _, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+				return "long"
+			}
+			if f, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+				return "double"
+			}
+		}
+		return "string"
+	case map[string]any:
+		return "object"
+	case []any:
+		for _, elem := range v {
+			if elem != nil {
+				return detectDynamicMappingType(elem, opts)
+			}
+		}
+	}
+	return ""
+}
+
+func matchesInferredDate(v string, dynamicDateFormats []string) bool {
+	if len(dynamicDateFormats) > 0 {
+		if _, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return false
+		}
+		if _, err := strconv.ParseFloat(v, 64); err == nil {
+			return false
+		}
+		for _, fmtSpec := range dynamicDateFormats {
+			for _, singleFmt := range strings.Split(fmtSpec, "||") {
+				singleFmt = strings.TrimSpace(singleFmt)
+				if singleFmt == "" || singleFmt == "epoch_millis" || singleFmt == "epoch_second" {
+					continue
+				}
+				if _, ok := ParseESDateWithFormatToEpochMillis(v, singleFmt, time.Time{}); ok {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if looksLikeISODateString(v) {
+		if _, ok := ParseESDateToEpochMillis(v, time.Time{}); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func matchDynamicTemplatePattern(pattern, candidate, matchPatternType string) bool {
+	if pattern == "" {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(matchPatternType), "regex") {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return false
+		}
+		return re.MatchString(candidate)
+	}
+	reStr := "^" + strings.ReplaceAll(strings.ReplaceAll(regexp.QuoteMeta(pattern), `\*`, ".*"), `\?`, ".") + "$"
+	re, err := regexp.Compile(reStr)
+	if err != nil {
+		return false
+	}
+	return re.MatchString(candidate)
+}
+
+func applyMatchingDynamicTemplate(fieldName, fullPath, detectedType string, templates []map[string]any) (esast.FieldProperty, bool) {
+	if len(templates) == 0 || detectedType == "" {
+		return esast.FieldProperty{}, false
+	}
+	for _, entry := range templates {
+		var rules []map[string]any
+		if _, hasMapping := entry["mapping"]; hasMapping {
+			rules = append(rules, entry)
+		} else {
+			for _, v := range entry {
+				if rm, ok := v.(map[string]any); ok {
+					rules = append(rules, rm)
+				}
+			}
+		}
+		for _, rule := range rules {
+			mmt, _ := rule["match_mapping_type"].(string)
+			mmt = strings.ToLower(strings.TrimSpace(mmt))
+			if mmt != "" && mmt != "*" && mmt != detectedType {
+				isFloatCompat := (mmt == "double" || mmt == "float") && (detectedType == "double" || detectedType == "float")
+				if !isFloatCompat {
+					continue
+				}
+			}
+			mpType, _ := rule["match_pattern"].(string)
+			if matchPat, ok := rule["match"].(string); ok && matchPat != "" {
+				if !matchDynamicTemplatePattern(matchPat, fieldName, mpType) {
+					continue
+				}
+			}
+			if unmatchPat, ok := rule["unmatch"].(string); ok && unmatchPat != "" {
+				if matchDynamicTemplatePattern(unmatchPat, fieldName, mpType) {
+					continue
+				}
+			}
+			if pathMatchPat, ok := rule["path_match"].(string); ok && pathMatchPat != "" {
+				if !matchDynamicTemplatePattern(pathMatchPat, fullPath, mpType) {
+					continue
+				}
+			}
+			if pathUnmatchPat, ok := rule["path_unmatch"].(string); ok && pathUnmatchPat != "" {
+				if matchDynamicTemplatePattern(pathUnmatchPat, fullPath, mpType) {
+					continue
+				}
+			}
+			rawMapping, hasMap := rule["mapping"]
+			if !hasMap || rawMapping == nil {
+				continue
+			}
+			b, err := json.Marshal(rawMapping)
+			if err != nil {
+				continue
+			}
+			var fp esast.FieldProperty
+			if err := json.Unmarshal(b, &fp); err != nil {
+				continue
+			}
+			if fp.Type == "{dynamic_type}" {
+				if detectedType == "string" {
+					fp.Type = "text"
+				} else {
+					fp.Type = detectedType
+				}
+			}
+			return fp, true
+		}
+	}
+	return esast.FieldProperty{}, false
+}
+
+func inferValuePropertyWithOpts(val any, fieldName, fullPath string, depth int, totalFields *int, opts inferOptions) (esast.FieldProperty, bool) {
+	if _, isSlice := val.([]any); !isSlice {
+		if _, isMap := val.(map[string]any); !isMap && len(opts.dynamicTemplates) > 0 {
+			detType := detectDynamicMappingType(val, opts)
+			if tmplProp, matched := applyMatchingDynamicTemplate(fieldName, fullPath, detType, opts.dynamicTemplates); matched {
+				return tmplProp, true
+			}
+		}
+	}
 	switch v := val.(type) {
 	case bool:
 		return esast.FieldProperty{Type: "boolean"}, true
@@ -1168,9 +1494,16 @@ func inferValueProperty(val any, depth int, totalFields *int) (esast.FieldProper
 	case float64:
 		return esast.FieldProperty{Type: "double"}, true
 	case string:
-		if looksLikeISODateString(v) {
-			if _, ok := ParseESDateToEpochMillis(v, time.Time{}); ok {
-				return esast.FieldProperty{Type: "date"}, true
+		trimmed := strings.TrimSpace(v)
+		if opts.dateDetection && matchesInferredDate(trimmed, opts.dynamicDateFormats) {
+			return esast.FieldProperty{Type: "date"}, true
+		}
+		if opts.numericDetection && trimmed != "" {
+			if _, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+				return esast.FieldProperty{Type: "long"}, true
+			}
+			if f, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+				return esast.FieldProperty{Type: "float"}, true
 			}
 		}
 		if strings.ContainsAny(v, " \t\n") || len(v) > 128 {
@@ -1187,7 +1520,7 @@ func inferValueProperty(val any, depth int, totalFields *int) (esast.FieldProper
 			return esast.FieldProperty{}, false
 		}
 		childProps := make(map[string]esast.FieldProperty)
-		inferObjectProperties(v, childProps, depth+1, totalFields)
+		inferObjectPropertiesWithOpts(v, childProps, fullPath, depth+1, totalFields, opts)
 		if len(childProps) == 0 {
 			return esast.FieldProperty{}, false
 		}
@@ -1219,13 +1552,13 @@ func inferValueProperty(val any, depth int, totalFields *int) (esast.FieldProper
 				if merged.Properties == nil {
 					merged.Properties = make(map[string]esast.FieldProperty)
 				}
-				inferObjectProperties(elemMap, merged.Properties, depth+1, totalFields)
+				inferObjectPropertiesWithOpts(elemMap, merged.Properties, fullPath, depth+1, totalFields, opts)
 				if len(merged.Properties) > 0 {
 					hasElem = true
 				}
 				continue
 			}
-			elemProp, ok := inferValueProperty(elem, depth, totalFields)
+			elemProp, ok := inferValuePropertyWithOpts(elem, fieldName, fullPath, depth, totalFields, opts)
 			if !ok {
 				continue
 			}

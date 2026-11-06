@@ -19,6 +19,12 @@ package painless
 
 import (
 	"bytes"
+	"crypto/md5"  // #nosec G501 -- Painless Digest.md5 compatibility
+	"crypto/sha1" // #nosec G505 -- Painless Digest.sha1 compatibility
+	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -106,10 +112,10 @@ var (
 	reLocalArrayRemoveIf   = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\.removeIf\(\s*\(?\s*(?:[a-zA-Z_$][a-zA-Z0-9_$<>[\]]*\s+)?([a-zA-Z0-9_$]+)\s*\)?\s*->\s*(.+)\s*\)$`)
 	reLocalCompoundAssign  = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*\??(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\s*(\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>>=|>>=)\s*(.+)$`)
 	reLocalPropAssign      = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*)\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)\s*=\s*(.+)$`)
-	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|Object|Map|HashMap|LinkedHashMap|TreeMap|List|ArrayList|LinkedList|Set|HashSet|ZonedDateTime|Instant|LocalDateTime|LocalDate|Pattern|Matcher)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
-	reNullVarDecl          = regexp.MustCompile(`^(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|Object|Map|HashMap|LinkedHashMap|TreeMap|List|ArrayList|LinkedList|Set|HashSet|ZonedDateTime|Instant|LocalDateTime|LocalDate|Pattern|Matcher)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
-	reVarTypeDeclPrefix    = regexp.MustCompile(`(?s)^((?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|Object|Map|HashMap|LinkedHashMap|TreeMap|List|ArrayList|LinkedList|Set|HashSet|ZonedDateTime|Instant|LocalDateTime|LocalDate|Pattern|Matcher)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*)\s+(.+)$`)
-	reUserFuncHeaderPrefix = regexp.MustCompile(`^(void|def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|Object|Map|HashMap|LinkedHashMap|TreeMap|List|ArrayList|LinkedList|Set|HashSet|ZonedDateTime|Instant|LocalDateTime|LocalDate|Pattern|Matcher)(?:\s*<[^>]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
+	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|Object|Map|HashMap|LinkedHashMap|TreeMap|List|ArrayList|LinkedList|Set|HashSet|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|DateTimeFormatter|Duration|ZoneId|ZoneOffset|Pattern|Matcher)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
+	reNullVarDecl          = regexp.MustCompile(`^(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|Object|Map|HashMap|LinkedHashMap|TreeMap|List|ArrayList|LinkedList|Set|HashSet|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|DateTimeFormatter|Duration|ZoneId|ZoneOffset|Pattern|Matcher)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
+	reVarTypeDeclPrefix    = regexp.MustCompile(`(?s)^((?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|Object|Map|HashMap|LinkedHashMap|TreeMap|List|ArrayList|LinkedList|Set|HashSet|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|DateTimeFormatter|Duration|ZoneId|ZoneOffset|Pattern|Matcher)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*)\s+(.+)$`)
+	reUserFuncHeaderPrefix = regexp.MustCompile(`^(void|def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|Object|Map|HashMap|LinkedHashMap|TreeMap|List|ArrayList|LinkedList|Set|HashSet|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|DateTimeFormatter|Duration|ZoneId|ZoneOffset|Pattern|Matcher)(?:\s*<[^>]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
 	reIdentAssign          = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
 	reIdentOnly            = regexp.MustCompile(`^[a-zA-Z_$][a-zA-Z0-9_$]*$`)
 	reSimpleFieldPath      = regexp.MustCompile(`^[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+$`)
@@ -148,8 +154,10 @@ func ApplyUpdateWithResult(rawSource json.RawMessage, req *UpdateRequest, docExi
 			}
 		} else if req.DocAsUpsert && req.Doc != nil {
 			deepMergeMap(doc, req.Doc)
-			out, err := json.Marshal(doc)
-			return json.RawMessage(out), "created", err
+			if !req.ScriptedUpsert {
+				out, err := json.Marshal(doc)
+				return json.RawMessage(out), "created", err
+			}
 		}
 	}
 
@@ -159,7 +167,7 @@ func ApplyUpdateWithResult(rawSource json.RawMessage, req *UpdateRequest, docExi
 		preMergeSnapshot, _ = json.Marshal(doc)
 	}
 
-	if len(req.Doc) > 0 && (docExisted || !req.ScriptedUpsert) {
+	if len(req.Doc) > 0 && (docExisted || (!req.ScriptedUpsert && !req.DocAsUpsert)) {
 		deepMergeMap(doc, req.Doc)
 	}
 
@@ -187,6 +195,10 @@ func ApplyUpdateWithResult(rawSource json.RawMessage, req *UpdateRequest, docExi
 		}
 		if req.MetaOp != "" {
 			scriptParams["_ctx_op"] = req.MetaOp
+		} else if !docExisted {
+			scriptParams["_ctx_op"] = "create"
+		} else {
+			scriptParams["_ctx_op"] = "index"
 		}
 		if !req.AllowMetaMutation {
 			scriptParams["__readonly_ctx_meta"] = true
@@ -341,7 +353,7 @@ func isInternalPainlessMapKey(m map[string]any, k string) bool {
 		return true
 	}
 	switch k {
-	case "_source", "_ctx_id", "_ctx_index", "_ctx_routing", "_ctx_version", "_ctx_version_mutated", "_ctx_op", "_ctx_now", "_return_val", "_last_expr_val":
+	case "_source", "_ctx_id", "_ctx_index", "_ctx_routing", "_ctx_version", "_ctx_version_mutated", "_ctx_op", "_ctx_now", "_now", "_return_val", "_last_expr_val":
 		return true
 	}
 	if m != nil {
@@ -462,6 +474,10 @@ func newEvalBudget(params map[string]any) *evalBudget {
 	nowMillis := time.Now().UTC().UnixMilli()
 	if params != nil {
 		if v, ok := params["_ctx_now"]; ok && v != nil {
+			if f, fOk := toFloat64(v); fOk && f > 0 {
+				nowMillis = int64(f)
+			}
+		} else if v, ok := params["_now"]; ok && v != nil {
 			if f, fOk := toFloat64(v); fOk && f > 0 {
 				nowMillis = int64(f)
 			}
@@ -3872,14 +3888,17 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		return streamVal, err
 	}
 
-	// Check trailing zero-arg methods `.toLowerCase()`, `.toUpperCase()`, `.trim()`, `.strip()`, `.stripLeading()`, `.stripTrailing()`, `.isBlank()`, `.length()`, `.size()`, `.keySet()`, `.values()`, `.entrySet()`, `.getKey()`, `.getValue()`, `.getMessage()`, `.toString()`, and ZonedDateTime getters
+	// Check trailing zero-arg methods `.toLowerCase()`, `.toUpperCase()`, `.trim()`, `.strip()`, `.stripLeading()`, `.stripTrailing()`, `.isBlank()`, `.length()`, `.size()`, `.keySet()`, `.values()`, `.entrySet()`, `.getKey()`, `.getValue()`, `.getMessage()`, `.toString()`, and ZonedDateTime/Duration/Matcher getters
 	for _, mSuffix := range []string{
 		".toLowerCase()", ".toUpperCase()", ".trim()", ".strip()", ".stripLeading()", ".stripTrailing()", ".isBlank()", ".toCharArray()",
+		".lines()", ".chars()", ".codePoints()", ".getBytes()", ".withoutPadding()",
 		".intValue()", ".longValue()", ".doubleValue()", ".floatValue()", ".shortValue()", ".byteValue()",
 		".length()", ".size()", ".keySet()", ".values()", ".entrySet()", ".getKey()", ".getValue()", ".getMessage()", ".toString()",
 		".getYear()", ".getMonthValue()", ".getMonthOfYear()", ".getMonth()", ".getDayOfMonth()", ".getDayOfYear()", ".getDate()", ".getHour()", ".getHourOfDay()", ".getMinute()", ".getMinuteOfHour()", ".getSecond()", ".getSecondOfMinute()", ".getNano()",
 		".getDayOfWeek()", ".getDayOfWeekEnum()", ".getMillis()", ".toEpochMilli()", ".getEpochSecond()", ".toInstant()",
-		".find()", ".matches()", ".group()", ".groupCount()", ".start()", ".end()", ".reset()", ".pattern()",
+		".toEpochDay()", ".toLocalDate()", ".toLocalDateTime()",
+		".toDays()", ".toHours()", ".toMinutes()", ".toSeconds()", ".toMillis()", ".toNanos()", ".getSeconds()", ".isZero()", ".isNegative()", ".abs()", ".negated()",
+		".find()", ".matches()", ".lookingAt()", ".group()", ".groupCount()", ".start()", ".end()", ".reset()", ".pattern()",
 	} {
 		if strings.HasSuffix(rhs, mSuffix) {
 			recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:len(rhs)-len(mSuffix)], "?"))
@@ -3913,6 +3932,31 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					out[i] = string(r)
 				}
 				return out, nil
+			case ".lines()":
+				return splitLinesPainless(fmt.Sprintf("%v", recVal)), nil
+			case ".chars()", ".codePoints()":
+				s := fmt.Sprintf("%v", recVal)
+				runes := []rune(s)
+				out := make([]any, len(runes))
+				for i, r := range runes {
+					out[i] = int64(r)
+				}
+				return out, nil
+			case ".getBytes()":
+				s := fmt.Sprintf("%v", recVal)
+				out := make([]any, len(s))
+				for i := 0; i < len(s); i++ {
+					out[i] = int64(s[i])
+				}
+				return out, nil
+			case ".withoutPadding()":
+				if s, ok := recVal.(string); ok && strings.HasPrefix(s, "__base64_encoder:") {
+					if !strings.HasSuffix(s, ":nopad") {
+						return s + ":nopad", nil
+					}
+					return s, nil
+				}
+				return recVal, nil
 			case ".intValue()", ".longValue()", ".shortValue()", ".byteValue()":
 				var iv int64
 				var okNum bool
@@ -3937,11 +3981,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				}
 				switch mSuffix {
 				case ".intValue()":
-					return int64(int32(iv)), nil
+					return int64(int32(iv)), nil // #nosec G115 -- intentional Java 32-bit signed integer wrap
 				case ".shortValue()":
-					return int64(int16(iv)), nil
+					return int64(int16(iv)), nil // #nosec G115 -- intentional Java 16-bit signed short wrap
 				case ".byteValue()":
-					return int64(int8(iv)), nil
+					return int64(int8(iv)), nil // #nosec G115 -- intentional Java 8-bit signed byte wrap
 				default:
 					return iv, nil
 				}
@@ -3970,7 +4014,51 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				return fmt.Sprintf("%v", recVal), nil
 			case ".toInstant()":
 				return recVal, nil
-			case ".getYear()", ".getMonthValue()", ".getMonthOfYear()", ".getMonth()", ".getDayOfMonth()", ".getDayOfYear()", ".getDate()", ".getHour()", ".getHourOfDay()", ".getMinute()", ".getMinuteOfHour()", ".getSecond()", ".getSecondOfMinute()", ".getNano()", ".getDayOfWeek()", ".getDayOfWeekEnum()", ".getMillis()", ".toEpochMilli()", ".getEpochSecond()":
+			case ".toDays()", ".toHours()", ".toMinutes()", ".toSeconds()", ".toMillis()", ".toNanos()", ".getSeconds()", ".isZero()", ".isNegative()", ".abs()", ".negated()":
+				if dur, ok := parsePainlessDuration(recVal); ok {
+					switch mSuffix {
+					case ".toDays()":
+						return int64(dur / (24 * time.Hour)), nil
+					case ".toHours()":
+						return int64(dur / time.Hour), nil
+					case ".toMinutes()":
+						return int64(dur / time.Minute), nil
+					case ".toSeconds()":
+						return int64(dur / time.Second), nil
+					case ".getSeconds()":
+						sec := int64(dur / time.Second)
+						if dur%time.Second < 0 {
+							sec--
+						}
+						return sec, nil
+					case ".toMillis()":
+						return dur.Milliseconds(), nil
+					case ".toNanos()":
+						return dur.Nanoseconds(), nil
+					case ".isZero()":
+						return dur == 0, nil
+					case ".isNegative()":
+						return dur < 0, nil
+					case ".abs()":
+						if dur < 0 {
+							return -dur, nil
+						}
+						return dur, nil
+					case ".negated()":
+						return -dur, nil
+					}
+				}
+				return nil, nil
+			case ".getYear()", ".getMonthValue()", ".getMonthOfYear()", ".getMonth()", ".getDayOfMonth()", ".getDayOfYear()", ".getDate()", ".getHour()", ".getHourOfDay()", ".getMinute()", ".getMinuteOfHour()", ".getSecond()", ".getSecondOfMinute()", ".getNano()", ".getDayOfWeek()", ".getDayOfWeekEnum()", ".getMillis()", ".toEpochMilli()", ".getEpochSecond()", ".toEpochDay()", ".toLocalDate()", ".toLocalDateTime()":
+				if mSuffix == ".getNano()" {
+					if dur, ok := parsePainlessDuration(recVal); ok {
+						rem := int64(dur % time.Second)
+						if rem < 0 {
+							rem += 1e9
+						}
+						return rem, nil
+					}
+				}
 				if tm, ok := parsePainlessDateTime(recVal); ok {
 					switch mSuffix {
 					case ".getYear()":
@@ -4003,6 +4091,15 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						return tm.UnixMilli(), nil
 					case ".getEpochSecond()":
 						return tm.Unix(), nil
+					case ".toEpochDay()":
+						return time.Date(tm.Year(), tm.Month(), tm.Day(), 0, 0, 0, 0, time.UTC).Unix() / 86400, nil
+					case ".toLocalDate()":
+						return tm.Format("2006-01-02"), nil
+					case ".toLocalDateTime()":
+						if tm.Nanosecond() > 0 {
+							return tm.Format("2006-01-02T15:04:05.999999999"), nil
+						}
+						return tm.Format("2006-01-02T15:04:05"), nil
 					}
 				}
 				return nil, nil
@@ -4143,6 +4240,25 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					return true, nil
 				}
 				return false, nil
+			case ".lookingAt()":
+				if pm, ok := recVal.(*painlessMatcher); ok && pm != nil {
+					if pm.re == nil {
+						return false, nil
+					}
+					prefixRe, err := regexp.Compile("^(?:" + pm.re.String() + ")")
+					if err != nil {
+						return false, nil
+					}
+					loc := prefixRe.FindStringSubmatchIndex(pm.input)
+					if loc == nil {
+						pm.lastMatch = nil
+						return false, nil
+					}
+					pm.lastMatch = loc
+					pm.curPos = loc[1]
+					return true, nil
+				}
+				return false, nil
 			case ".group()":
 				if pm, ok := recVal.(*painlessMatcher); ok && pm != nil {
 					if len(pm.lastMatch) >= 2 && pm.lastMatch[0] >= 0 && pm.lastMatch[1] >= 0 {
@@ -4199,17 +4315,22 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 	}
 
 	for _, mName := range []string{
-		".startsWith(", ".endsWith(", ".containsAll(", ".removeAll(", ".retainAll(", ".removeIf(", ".forEach(", ".compute(", ".computeIfAbsent(", ".computeIfPresent(", ".merge(", ".contains(", ".containsKey(", ".containsValue(", ".getOrDefault(", ".get(",
-		".indexOf(", ".lastIndexOf(", ".charAt(", ".codePointAt(", ".repeat(", ".matches(", ".matcher(", ".group(", ".start(", ".end(", ".replaceAll(", ".replaceFirst(",
-		".splitOnToken(", ".split(", ".replace(", ".substring(", ".subList(", ".join(",
+		".startsWith(", ".endsWith(", ".regionMatches(", ".containsAll(", ".removeAll(", ".retainAll(", ".removeIf(", ".forEach(", ".compute(", ".computeIfAbsent(", ".computeIfPresent(", ".merge(", ".contains(", ".containsKey(", ".containsValue(", ".getOrDefault(", ".get(",
+		".indexOf(", ".lastIndexOf(", ".charAt(", ".codePointAt(", ".getBytes(", ".repeat(", ".matches(", ".matcher(", ".find(", ".reset(", ".group(", ".start(", ".end(", ".replaceAll(", ".replaceFirst(",
+		".encodeToString(", ".encode(", ".decode(",
+		".splitOnToken(", ".split(", ".replace(", ".substring(", ".subList(", ".join(", ".format(",
 		".equals(", ".equalsIgnoreCase(", ".compareTo(", ".compareToIgnoreCase(", ".concat(", ".remove(", ".setValue(", ".set(", ".addAll(", ".add(", ".putAll(", ".putIfAbsent(", ".put(", ".sort(",
 		".plusYears(", ".minusYears(", ".plusMonths(", ".minusMonths(", ".plusWeeks(", ".minusWeeks(", ".plusDays(", ".minusDays(",
 		".plusHours(", ".minusHours(", ".plusMinutes(", ".minusMinutes(", ".plusSeconds(", ".minusSeconds(", ".plusMillis(", ".minusMillis(", ".plusNanos(", ".minusNanos(",
 		".withYear(", ".withMonth(", ".withDayOfMonth(", ".withHour(", ".withMinute(", ".withSecond(", ".withNano(", ".truncatedTo(",
+		".withZoneSameInstant(", ".withZoneSameLocal(",
 		".isAfter(", ".isBefore(", ".isEqual(",
 	} {
 		if recExpr, argExpr, ok := matchTrailingMethodCallPainless(rhs, mName); ok {
-			if mName == ".equals(" && recExpr == "Objects" {
+			if (mName == ".equals(" && (recExpr == "Objects" || recExpr == "Arrays")) ||
+				(mName == ".replaceAll(" && recExpr == "Collections") ||
+				(mName == ".matches(" && recExpr == "Pattern") ||
+				(mName == ".format(" && recExpr == "String") {
 				continue
 			}
 			if recExpr == "params._source" || recExpr == "params?._source" || recExpr == "params._source?" || recExpr == "params?._source?" {
@@ -4819,7 +4940,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				recVal, err = evalRHSExprDepth(sourceMap, recExpr, params, depth+1)
 			}
 			if err != nil || recVal == nil {
-				if mName == ".startsWith(" || mName == ".endsWith(" || mName == ".containsAll(" || mName == ".removeAll(" || mName == ".retainAll(" || mName == ".contains(" || mName == ".containsKey(" || mName == ".containsValue(" || mName == ".matches(" || mName == ".equals(" || mName == ".equalsIgnoreCase(" || mName == ".isAfter(" || mName == ".isBefore(" || mName == ".isEqual(" {
+				if mName == ".startsWith(" || mName == ".endsWith(" || mName == ".regionMatches(" || mName == ".containsAll(" || mName == ".removeAll(" || mName == ".retainAll(" || mName == ".contains(" || mName == ".containsKey(" || mName == ".containsValue(" || mName == ".matches(" || mName == ".find(" || mName == ".equals(" || mName == ".equalsIgnoreCase(" || mName == ".isAfter(" || mName == ".isBefore(" || mName == ".isEqual(" {
 					return false, err
 				}
 				return nil, err
@@ -4854,28 +4975,83 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				return []any{}, nil
 			case ".getOrDefault(":
 				args := splitTopLevelCommaPainless(argExpr)
-				if tv, ok := recVal.(map[string]any); ok && len(args) == 2 {
+				if len(args) == 2 {
 					kVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
 					defVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
-					if kVal != nil {
-						kStr := fmt.Sprintf("%v", kVal)
-						if !isInternalPainlessMapKey(tv, kStr) {
-							if v, exists := tv[kStr]; exists && v != nil {
+					if (recExpr == "ctx" || recExpr == "ctx?") && params["ctx"] == nil {
+						if kVal != nil {
+							if v, exists := lookupCtxMapKeyPainless(fmt.Sprintf("%v", kVal), sourceMap, params); exists && v != nil {
 								return v, nil
 							}
 						}
+						return defVal, nil
 					}
-					return defVal, nil
+					if tv, ok := recVal.(map[string]any); ok {
+						if kVal != nil {
+							kStr := fmt.Sprintf("%v", kVal)
+							if !isInternalPainlessMapKey(tv, kStr) {
+								if v, exists := tv[kStr]; exists && v != nil {
+									return v, nil
+								}
+							}
+						}
+						return defVal, nil
+					}
 				}
 				return nil, nil
+			case ".regionMatches(":
+				args := splitTopLevelCommaPainless(argExpr)
+				if s, ok := recVal.(string); ok && (len(args) == 4 || len(args) == 5) {
+					ignoreCase := false
+					offsetIdx := 0
+					if len(args) == 5 {
+						icVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+						if b, bOk := icVal.(bool); bOk {
+							ignoreCase = b
+						} else if icVal != nil {
+							ignoreCase = strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", icVal)), "true")
+						}
+						offsetIdx = 1
+					}
+					toffVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[offsetIdx]), params, depth+1)
+					otherVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[offsetIdx+1]), params, depth+1)
+					ooffVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[offsetIdx+2]), params, depth+1)
+					lenVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[offsetIdx+3]), params, depth+1)
+					tf, tOk := toFloat64(toffVal)
+					of, oOk := toFloat64(ooffVal)
+					lf, lOk := toFloat64(lenVal)
+					if !tOk || !oOk || !lOk || otherVal == nil {
+						return false, nil
+					}
+					toff, ooff, rlen := int(tf), int(of), int(lf)
+					sRunes := []rune(s)
+					oRunes := []rune(fmt.Sprintf("%v", otherVal))
+					if toff < 0 || ooff < 0 || rlen < 0 || toff+rlen > len(sRunes) || ooff+rlen > len(oRunes) {
+						return false, nil
+					}
+					sub1 := string(sRunes[toff : toff+rlen])
+					sub2 := string(oRunes[ooff : ooff+rlen])
+					if ignoreCase {
+						return strings.EqualFold(sub1, sub2), nil
+					}
+					return sub1 == sub2, nil
+				}
+				return false, nil
 			case ".replace(":
 				args := splitTopLevelCommaPainless(argExpr)
 				if recMap, isMap := recVal.(map[string]any); isMap && recMap != nil {
-					syncReplacedMap := func() {
+					syncReplacedMap := func(keyStr string) {
+						if recExpr == "ctx._source" || recExpr == "ctx?._source" || recExpr == "ctx._source?" || recExpr == "ctx?._source?" {
+							syncSourceAliasToLocalVars(sourceMap, params, keyStr)
+							return
+						}
 						for _, pfx := range []string{"ctx?._source?.", "ctx?._source.", "ctx._source?.", "ctx._source."} {
 							if strings.HasPrefix(recExpr, pfx) {
 								relPath := strings.TrimSuffix(strings.TrimPrefix(recExpr, pfx), "?")
 								syncSourceAliasToLocalVars(sourceMap, params, relPath)
+								if keyStr != "" {
+									syncSourceAliasToLocalVars(sourceMap, params, relPath+"."+keyStr)
+								}
 								return
 							}
 						}
@@ -4895,10 +5071,12 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 							return nil, err
 						}
 						keyStr := fmt.Sprintf("%v", kVal)
-						if cur, exists := recMap[keyStr]; exists {
-							recMap[keyStr] = newVal
-							syncReplacedMap()
-							return cur, nil
+						if !isInternalPainlessMapKey(recMap, keyStr) {
+							if cur, exists := recMap[keyStr]; exists {
+								recMap[keyStr] = newVal
+								syncReplacedMap(keyStr)
+								return cur, nil
+							}
 						}
 						return nil, nil
 					}
@@ -4916,10 +5094,12 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 							return nil, err
 						}
 						keyStr := fmt.Sprintf("%v", kVal)
-						if cur, exists := recMap[keyStr]; exists && valuesEqual(cur, oldVal) {
-							recMap[keyStr] = newVal
-							syncReplacedMap()
-							return true, nil
+						if !isInternalPainlessMapKey(recMap, keyStr) {
+							if cur, exists := recMap[keyStr]; exists && valuesEqual(cur, oldVal) {
+								recMap[keyStr] = newVal
+								syncReplacedMap(keyStr)
+								return true, nil
+							}
 						}
 						return false, nil
 					}
@@ -5024,6 +5204,117 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				}
 				re, _ := regexp.Compile(patStr)
 				return &painlessMatcher{re: re, input: inStr}, nil
+			case ".find(":
+				if pm, ok := recVal.(*painlessMatcher); ok && pm != nil && argVal != nil {
+					if f, fOk := toFloat64(argVal); fOk {
+						runeStart := int(f)
+						runes := []rune(pm.input)
+						if pm.re == nil || runeStart < 0 || runeStart > len(runes) {
+							pm.lastMatch = nil
+							return false, nil
+						}
+						bytePos := len(string(runes[:runeStart]))
+						pm.curPos = bytePos
+						loc := pm.re.FindStringSubmatchIndex(pm.input[pm.curPos:])
+						if loc == nil {
+							pm.lastMatch = nil
+							pm.curPos = len(pm.input) + 1
+							return false, nil
+						}
+						shifted := make([]int, len(loc))
+						for i, idx := range loc {
+							if idx >= 0 {
+								shifted[i] = idx + pm.curPos
+							} else {
+								shifted[i] = -1
+							}
+						}
+						pm.lastMatch = shifted
+						if shifted[1] == pm.curPos {
+							pm.curPos++
+						} else {
+							pm.curPos = shifted[1]
+						}
+						return true, nil
+					}
+				}
+				return false, nil
+			case ".reset(":
+				if pm, ok := recVal.(*painlessMatcher); ok && pm != nil {
+					if argVal != nil {
+						pm.input = fmt.Sprintf("%v", argVal)
+					} else {
+						pm.input = ""
+					}
+					pm.curPos = 0
+					pm.lastMatch = nil
+					return pm, nil
+				}
+				return recVal, nil
+			case ".getBytes(":
+				s := fmt.Sprintf("%v", recVal)
+				out := make([]any, len(s))
+				for i := 0; i < len(s); i++ {
+					out[i] = int64(s[i])
+				}
+				return out, nil
+			case ".encodeToString(", ".encode(":
+				if s, ok := recVal.(string); ok && strings.HasPrefix(s, "__base64_encoder:") {
+					rawBytes := toBytesPainless(argVal)
+					switch s {
+					case "__base64_encoder:url":
+						return base64.URLEncoding.EncodeToString(rawBytes), nil
+					case "__base64_encoder:url:nopad":
+						return base64.RawURLEncoding.EncodeToString(rawBytes), nil
+					case "__base64_encoder:std:nopad":
+						return base64.RawStdEncoding.EncodeToString(rawBytes), nil
+					default:
+						return base64.StdEncoding.EncodeToString(rawBytes), nil
+					}
+				}
+				return "", nil
+			case ".decode(":
+				if s, ok := recVal.(string); ok && strings.HasPrefix(s, "__base64_decoder:") {
+					inStr := strings.TrimSpace(fmt.Sprintf("%v", argVal))
+					if s == "__base64_decoder:url" {
+						if dec, err := base64.URLEncoding.DecodeString(inStr); err == nil {
+							return string(dec), nil
+						}
+						if dec, err := base64.RawURLEncoding.DecodeString(inStr); err == nil {
+							return string(dec), nil
+						}
+					}
+					if dec, err := base64.StdEncoding.DecodeString(inStr); err == nil {
+						return string(dec), nil
+					}
+					if dec, err := base64.RawStdEncoding.DecodeString(inStr); err == nil {
+						return string(dec), nil
+					}
+					if dec, err := base64.URLEncoding.DecodeString(inStr); err == nil {
+						return string(dec), nil
+					}
+					if dec, err := base64.RawURLEncoding.DecodeString(inStr); err == nil {
+						return string(dec), nil
+					}
+				}
+				return "", nil
+			case ".format(":
+				if tm, ok := parsePainlessDateTime(recVal); ok {
+					layout := resolveDateTimeFormatterLayoutPainless(argVal)
+					return tm.Format(layout), nil
+				}
+				return fmt.Sprintf("%v", recVal), nil
+			case ".withZoneSameInstant(", ".withZoneSameLocal(":
+				if tm, ok := parsePainlessDateTime(recVal); ok {
+					loc := parseZoneLocationPainless(argVal)
+					if mName == ".withZoneSameInstant(" {
+						tm = tm.In(loc)
+					} else {
+						tm = time.Date(tm.Year(), tm.Month(), tm.Day(), tm.Hour(), tm.Minute(), tm.Second(), tm.Nanosecond(), loc)
+					}
+					return tm.Format(time.RFC3339Nano), nil
+				}
+				return recVal, nil
 			case ".group(":
 				if pm, ok := recVal.(*painlessMatcher); ok && pm != nil && argVal != nil {
 					if f, fOk := toFloat64(argVal); fOk {
@@ -5215,6 +5506,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				}
 				return false, nil
 			case ".containsKey(":
+				if (recExpr == "ctx" || recExpr == "ctx?") && params["ctx"] == nil && argVal != nil {
+					_, exists := lookupCtxMapKeyPainless(fmt.Sprintf("%v", argVal), sourceMap, params)
+					return exists, nil
+				}
 				if m, ok := recVal.(map[string]any); ok && argVal != nil {
 					k := fmt.Sprintf("%v", argVal)
 					if isInternalPainlessMapKey(m, k) {
@@ -5237,6 +5532,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				}
 				return false, nil
 			case ".get(":
+				if (recExpr == "ctx" || recExpr == "ctx?") && params["ctx"] == nil && argVal != nil {
+					v, _ := lookupCtxMapKeyPainless(fmt.Sprintf("%v", argVal), sourceMap, params)
+					return v, nil
+				}
 				switch tv := recVal.(type) {
 				case map[string]any:
 					if argVal != nil {
@@ -5265,6 +5564,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						subVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
 						fromVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
 						if subVal != nil {
+							needle, okNeedle := resolveStringSearchNeedlePainless(subVal)
+							if !okNeedle {
+								return int64(-1), nil
+							}
 							fromIdx := 0
 							if ff, ok := toFloat64(fromVal); ok {
 								fromIdx = int(ff)
@@ -5276,14 +5579,18 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 								return int64(-1), nil
 							}
 							tailStr := string(runes[fromIdx:])
-							byteIdx := strings.Index(tailStr, fmt.Sprintf("%v", subVal))
+							byteIdx := strings.Index(tailStr, needle)
 							if byteIdx < 0 {
 								return int64(-1), nil
 							}
 							return int64(fromIdx + utf8.RuneCountInString(tailStr[:byteIdx])), nil
 						}
 					} else if argVal != nil {
-						byteIdx := strings.Index(tv, fmt.Sprintf("%v", argVal))
+						needle, okNeedle := resolveStringSearchNeedlePainless(argVal)
+						if !okNeedle {
+							return int64(-1), nil
+						}
+						byteIdx := strings.Index(tv, needle)
 						if byteIdx < 0 {
 							return int64(-1), nil
 						}
@@ -5306,6 +5613,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						subVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
 						fromVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
 						if subVal != nil {
+							needle, okNeedle := resolveStringSearchNeedlePainless(subVal)
+							if !okNeedle {
+								return int64(-1), nil
+							}
 							fromIdx := len(runes)
 							if ff, ok := toFloat64(fromVal); ok {
 								fromIdx = int(ff)
@@ -5313,7 +5624,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 							if fromIdx < 0 {
 								return int64(-1), nil
 							}
-							subRunes := []rune(fmt.Sprintf("%v", subVal))
+							subRunes := []rune(needle)
 							maxEnd := fromIdx + len(subRunes)
 							if maxEnd > len(runes) {
 								maxEnd = len(runes)
@@ -5326,7 +5637,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 							return int64(utf8.RuneCountInString(headStr[:byteIdx])), nil
 						}
 					} else if argVal != nil {
-						byteIdx := strings.LastIndex(tv, fmt.Sprintf("%v", argVal))
+						needle, okNeedle := resolveStringSearchNeedlePainless(argVal)
+						if !okNeedle {
+							return int64(-1), nil
+						}
+						byteIdx := strings.LastIndex(tv, needle)
 						if byteIdx < 0 {
 							return int64(-1), nil
 						}
@@ -5466,6 +5781,31 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			case ".plusYears(", ".minusYears(", ".plusMonths(", ".minusMonths(", ".plusWeeks(", ".minusWeeks(", ".plusDays(", ".minusDays(",
 				".plusHours(", ".minusHours(", ".plusMinutes(", ".minusMinutes(", ".plusSeconds(", ".minusSeconds(", ".plusMillis(", ".minusMillis(", ".plusNanos(", ".minusNanos(",
 				".withYear(", ".withMonth(", ".withDayOfMonth(", ".withHour(", ".withMinute(", ".withSecond(", ".withNano(", ".truncatedTo(":
+				if dur, ok := parsePainlessDuration(recVal); ok {
+					f, fOk := toFloat64(argVal)
+					if !fOk {
+						return dur, nil
+					}
+					n := int64(f)
+					if strings.HasPrefix(mName, ".minus") {
+						n = -n
+					}
+					switch mName {
+					case ".plusDays(", ".minusDays(":
+						return dur + time.Duration(n)*24*time.Hour, nil
+					case ".plusHours(", ".minusHours(":
+						return dur + time.Duration(n)*time.Hour, nil
+					case ".plusMinutes(", ".minusMinutes(":
+						return dur + time.Duration(n)*time.Minute, nil
+					case ".plusSeconds(", ".minusSeconds(":
+						return dur + time.Duration(n)*time.Second, nil
+					case ".plusMillis(", ".minusMillis(":
+						return dur + time.Duration(n)*time.Millisecond, nil
+					case ".plusNanos(", ".minusNanos(":
+						return dur + time.Duration(n)*time.Nanosecond, nil
+					}
+					return dur, nil
+				}
 				if tm, ok := parsePainlessDateTime(recVal); ok {
 					if mName == ".truncatedTo(" {
 						unitStr := strings.ToUpper(strings.TrimSpace(fmt.Sprintf("%v", argVal)))
@@ -5597,14 +5937,28 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			}
 			return nil, nil
 		case "_now":
+			if v, ok := params["_now"]; ok && v != nil {
+				if f, fOk := toFloat64(v); fOk {
+					return int64(f), nil
+				}
+				return v, nil
+			}
 			return getOrInitEvalBudget(params).nowMillis, nil
 		}
 	}
 	if rhs == "ctx" {
+		nowVal := any(getOrInitEvalBudget(params).nowMillis)
+		if v, ok := params["_now"]; ok && v != nil {
+			if f, fOk := toFloat64(v); fOk {
+				nowVal = int64(f)
+			} else {
+				nowVal = v
+			}
+		}
 		ctxMap := map[string]any{
 			"_source": sourceMap,
 			"op":      "index",
-			"_now":    getOrInitEvalBudget(params).nowMillis,
+			"_now":    nowVal,
 		}
 		if v, ok := params["_ctx_op"]; ok {
 			ctxMap["op"] = v
@@ -5864,9 +6218,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		return []any{}, nil
 	case "[:]", "{}", "new HashMap()", "new LinkedHashMap()", "new TreeMap()":
 		return map[string]any{}, nil
-	case "Math.PI":
+	case "Math.PI", "StrictMath.PI":
 		return math.Pi, nil
-	case "Math.E":
+	case "Math.E", "StrictMath.E":
 		return math.E, nil
 	case "Integer.MAX_VALUE":
 		return int64(math.MaxInt32), nil
@@ -5880,6 +6234,34 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		return math.MaxFloat64, nil
 	case "Double.MIN_VALUE":
 		return math.SmallestNonzeroFloat64, nil
+	case "Pattern.UNIX_LINES":
+		return int64(1), nil
+	case "Pattern.CASE_INSENSITIVE":
+		return int64(2), nil
+	case "Pattern.COMMENTS":
+		return int64(4), nil
+	case "Pattern.MULTILINE":
+		return int64(8), nil
+	case "Pattern.LITERAL":
+		return int64(16), nil
+	case "Pattern.DOTALL":
+		return int64(32), nil
+	case "Pattern.UNICODE_CASE":
+		return int64(64), nil
+	case "Pattern.CANON_EQ":
+		return int64(128), nil
+	case "Pattern.UNICODE_CHARACTER_CLASS":
+		return int64(256), nil
+	case "DateTimeFormatter.ISO_LOCAL_DATE", "DateTimeFormatter.ISO_DATE":
+		return "2006-01-02", nil
+	case "DateTimeFormatter.BASIC_ISO_DATE":
+		return "20060102", nil
+	case "DateTimeFormatter.ISO_LOCAL_DATE_TIME":
+		return "2006-01-02T15:04:05", nil
+	case "DateTimeFormatter.ISO_OFFSET_DATE_TIME", "DateTimeFormatter.ISO_ZONED_DATE_TIME", "DateTimeFormatter.ISO_INSTANT", "DateTimeFormatter.ISO_DATE_TIME":
+		return time.RFC3339Nano, nil
+	case "ZoneOffset.UTC":
+		return "UTC", nil
 	}
 	if strings.HasPrefix(rhs, "[") && strings.HasSuffix(rhs, "]") && findMatchingDelimiter(rhs, 0, '[', ']') == len(rhs)-1 {
 		inner := strings.TrimSpace(rhs[1 : len(rhs)-1])
@@ -7296,8 +7678,13 @@ func applyBitwiseAssign(curVal, rhsVal any, op string) any {
 
 func parsePainlessDateTime(v any) (time.Time, bool) {
 	switch tv := v.(type) {
+	case time.Time:
+		return tv, true
 	case string:
 		s := strings.TrimSpace(tv)
+		if idx := strings.IndexByte(s, '['); idx > 0 && strings.HasSuffix(s, "]") {
+			s = strings.TrimSpace(s[:idx])
+		}
 		for _, layout := range []string{
 			time.RFC3339Nano,
 			time.RFC3339,
@@ -7311,7 +7698,9 @@ func parsePainlessDateTime(v any) (time.Time, bool) {
 			"2006-01-02 15:04:05.999999999",
 			"2006-01-02T15:04:05",
 			"2006-01-02 15:04:05",
+			"2006-01-02T15:04",
 			"2006-01-02",
+			"20060102",
 		} {
 			if tm, err := time.Parse(layout, s); err == nil {
 				return tm, true
@@ -7491,6 +7880,9 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 		return nil, false, nil
 	}
 	fnName := strings.TrimSpace(rhs[:openParen])
+	if strings.HasPrefix(fnName, "StrictMath.") {
+		fnName = "Math." + strings.TrimPrefix(fnName, "StrictMath.")
+	}
 	argStr := strings.TrimSpace(rhs[openParen+1 : len(rhs)-1])
 	args := splitTopLevelCommaPainless(argStr)
 
@@ -8008,6 +8400,338 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			return strings.Join(parts, sepStr), true, nil
 		}
 		return "", true, nil
+	case "Encoding.encodeBase64":
+		if len(args) >= 1 {
+			v, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return "", true, err
+			}
+			return base64.StdEncoding.EncodeToString(toBytesPainless(v)), true, nil
+		}
+		return "", true, nil
+	case "Encoding.decodeBase64":
+		if len(args) >= 1 {
+			v, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return "", true, err
+			}
+			s := strings.TrimSpace(fmt.Sprintf("%v", v))
+			if dec, dErr := base64.StdEncoding.DecodeString(s); dErr == nil {
+				return string(dec), true, nil
+			}
+			if dec, dErr := base64.RawStdEncoding.DecodeString(s); dErr == nil {
+				return string(dec), true, nil
+			}
+			if dec, dErr := base64.URLEncoding.DecodeString(s); dErr == nil {
+				return string(dec), true, nil
+			}
+			if dec, dErr := base64.RawURLEncoding.DecodeString(s); dErr == nil {
+				return string(dec), true, nil
+			}
+		}
+		return "", true, nil
+	case "Encoding.encodeHex", "Hex.encodeHexString":
+		if len(args) >= 1 {
+			v, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return "", true, err
+			}
+			return hex.EncodeToString(toBytesPainless(v)), true, nil
+		}
+		return "", true, nil
+	case "Encoding.decodeHex":
+		if len(args) >= 1 {
+			v, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return "", true, err
+			}
+			if dec, dErr := hex.DecodeString(strings.TrimSpace(fmt.Sprintf("%v", v))); dErr == nil {
+				return string(dec), true, nil
+			}
+		}
+		return "", true, nil
+	case "Base64.getEncoder", "Base64.getMimeEncoder":
+		return "__base64_encoder:std", true, nil
+	case "Base64.getUrlEncoder":
+		return "__base64_encoder:url", true, nil
+	case "Base64.getDecoder", "Base64.getMimeDecoder":
+		return "__base64_decoder:std", true, nil
+	case "Base64.getUrlDecoder":
+		return "__base64_decoder:url", true, nil
+	case "Digest.sha256", "Digest.md5", "Digest.sha1", "Digest.sha384", "Digest.sha512":
+		if len(args) >= 1 {
+			v, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return "", true, err
+			}
+			raw := toBytesPainless(v)
+			switch fnName {
+			case "Digest.sha256":
+				sum := sha256.Sum256(raw)
+				return hex.EncodeToString(sum[:]), true, nil
+			case "Digest.md5":
+				sum := md5.Sum(raw) // #nosec G401 -- intentional Painless Digest.md5 support
+				return hex.EncodeToString(sum[:]), true, nil
+			case "Digest.sha1":
+				sum := sha1.Sum(raw) // #nosec G401 -- intentional Painless Digest.sha1 support
+				return hex.EncodeToString(sum[:]), true, nil
+			case "Digest.sha384":
+				sum := sha512.Sum384(raw)
+				return hex.EncodeToString(sum[:]), true, nil
+			case "Digest.sha512":
+				sum := sha512.Sum512(raw)
+				return hex.EncodeToString(sum[:]), true, nil
+			}
+		}
+		return "", true, nil
+	case "Arrays.asList", "List.of", "Set.of":
+		if argStr == "" {
+			return []any{}, true, nil
+		}
+		out := make([]any, 0, len(args))
+		for _, a := range args {
+			av, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(a), params, depth+1)
+			if err != nil {
+				return nil, true, err
+			}
+			if fnName == "Set.of" {
+				dup := false
+				for _, existing := range out {
+					if valuesEqual(existing, av) {
+						dup = true
+						break
+					}
+				}
+				if dup {
+					continue
+				}
+			}
+			out = append(out, av)
+		}
+		return out, true, nil
+	case "Map.of":
+		out := make(map[string]any, len(args)/2)
+		if argStr == "" {
+			return out, true, nil
+		}
+		for i := 0; i+1 < len(args); i += 2 {
+			kv, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[i]), params, depth+1)
+			if err != nil {
+				return nil, true, err
+			}
+			vv, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[i+1]), params, depth+1)
+			if err != nil {
+				return nil, true, err
+			}
+			if kv != nil {
+				out[fmt.Sprintf("%v", kv)] = vv
+			}
+		}
+		return out, true, nil
+	case "Collections.emptyList", "Collections.emptySet":
+		return []any{}, true, nil
+	case "Collections.emptyMap":
+		return map[string]any{}, true, nil
+	case "Collections.singletonList", "Collections.singleton":
+		if len(args) >= 1 {
+			v, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return nil, true, err
+			}
+			return []any{v}, true, nil
+		}
+		return []any{}, true, nil
+	case "Collections.singletonMap":
+		if len(args) >= 2 {
+			kv, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return nil, true, err
+			}
+			vv, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+			if err != nil {
+				return nil, true, err
+			}
+			if kv != nil {
+				return map[string]any{fmt.Sprintf("%v", kv): vv}, true, nil
+			}
+		}
+		return map[string]any{}, true, nil
+	case "Collections.min", "Collections.max":
+		if len(args) >= 1 {
+			listVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return nil, true, err
+			}
+			if arr, ok := listVal.([]any); ok && len(arr) > 0 {
+				best := arr[0]
+				for _, it := range arr[1:] {
+					cmp := comparePainlessValues(it, best)
+					if (fnName == "Collections.min" && cmp < 0) || (fnName == "Collections.max" && cmp > 0) {
+						best = it
+					}
+				}
+				return best, true, nil
+			}
+		}
+		return nil, true, nil
+	case "Collections.frequency":
+		if len(args) >= 2 {
+			listVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return int64(0), true, err
+			}
+			needle, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+			if err != nil {
+				return int64(0), true, err
+			}
+			if arr, ok := listVal.([]any); ok {
+				var count int64
+				for _, it := range arr {
+					if valuesEqual(it, needle) {
+						count++
+					}
+				}
+				return count, true, nil
+			}
+		}
+		return int64(0), true, nil
+	case "Collections.disjoint":
+		if len(args) >= 2 {
+			c1Val, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return true, true, err
+			}
+			c2Val, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+			if err != nil {
+				return true, true, err
+			}
+			a1, ok1 := c1Val.([]any)
+			a2, ok2 := c2Val.([]any)
+			if ok1 && ok2 {
+				for _, x := range a1 {
+					for _, y := range a2 {
+						if valuesEqual(x, y) {
+							return false, true, nil
+						}
+					}
+				}
+			}
+		}
+		return true, true, nil
+	case "Collections.nCopies":
+		if len(args) >= 2 {
+			nf, ok := evalNumArg(0)
+			if !ok || int(nf) <= 0 {
+				return []any{}, true, nil
+			}
+			n := int(nf)
+			if n > MaxPainlessSliceItems {
+				n = MaxPainlessSliceItems
+			}
+			val, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+			if err != nil {
+				return nil, true, err
+			}
+			out := make([]any, n)
+			for i := 0; i < n; i++ {
+				out[i] = val
+			}
+			return out, true, nil
+		}
+		return []any{}, true, nil
+	case "Collections.swap":
+		if len(args) >= 3 {
+			listVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return nil, true, err
+			}
+			f1, ok1 := evalNumArg(1)
+			f2, ok2 := evalNumArg(2)
+			if arr, ok := listVal.([]any); ok && ok1 && ok2 {
+				i, j := int(f1), int(f2)
+				if i >= 0 && i < len(arr) && j >= 0 && j < len(arr) {
+					arr[i], arr[j] = arr[j], arr[i]
+					syncMutatedListExprPainless(args[0], arr, sourceMap, params)
+				}
+				return arr, true, nil
+			}
+		}
+		return nil, true, nil
+	case "Collections.fill":
+		if len(args) >= 2 {
+			listVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return nil, true, err
+			}
+			fillVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+			if err != nil {
+				return nil, true, err
+			}
+			if arr, ok := listVal.([]any); ok {
+				for i := range arr {
+					arr[i] = fillVal
+				}
+				syncMutatedListExprPainless(args[0], arr, sourceMap, params)
+				return arr, true, nil
+			}
+		}
+		return nil, true, nil
+	case "Collections.rotate":
+		if len(args) >= 2 {
+			listVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return nil, true, err
+			}
+			df, okDist := evalNumArg(1)
+			if arr, ok := listVal.([]any); ok && okDist {
+				n := len(arr)
+				if n > 1 {
+					d := int(df) % n
+					if d < 0 {
+						d += n
+					}
+					if d > 0 {
+						tmp := make([]any, n)
+						for i := 0; i < n; i++ {
+							tmp[(i+d)%n] = arr[i]
+						}
+						copy(arr, tmp)
+						syncMutatedListExprPainless(args[0], arr, sourceMap, params)
+					}
+				}
+				return arr, true, nil
+			}
+		}
+		return nil, true, nil
+	case "Collections.replaceAll":
+		if len(args) >= 3 {
+			listVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return false, true, err
+			}
+			oldVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+			if err != nil {
+				return false, true, err
+			}
+			newVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[2]), params, depth+1)
+			if err != nil {
+				return false, true, err
+			}
+			if arr, ok := listVal.([]any); ok {
+				changed := false
+				for i, it := range arr {
+					if valuesEqual(it, oldVal) {
+						arr[i] = newVal
+						changed = true
+					}
+				}
+				if changed {
+					syncMutatedListExprPainless(args[0], arr, sourceMap, params)
+				}
+				return changed, true, nil
+			}
+		}
+		return false, true, nil
 	case "Collections.sort":
 		if len(args) >= 1 {
 			listVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
@@ -8019,6 +8743,7 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 				if err := sortPainlessSliceInPlace(arr, cmpExpr, sourceMap, params, depth+1); err != nil {
 					return nil, true, err
 				}
+				syncMutatedListExprPainless(args[0], arr, sourceMap, params)
 				return arr, true, nil
 			}
 		}
@@ -8030,10 +8755,38 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 				for i, j := 0, len(arr)-1; i < j; i, j = i+1, j-1 {
 					arr[i], arr[j] = arr[j], arr[i]
 				}
+				syncMutatedListExprPainless(args[0], arr, sourceMap, params)
 				return arr, true, nil
 			}
 		}
 		return nil, true, nil
+	case "DateTimeFormatter.ofPattern":
+		if len(args) >= 1 {
+			v, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return "", true, err
+			}
+			return translateJavaDateTimePatternToGo(fmt.Sprintf("%v", v)), true, nil
+		}
+		return time.RFC3339Nano, true, nil
+	case "ZoneId.of", "ZoneOffset.of":
+		if len(args) >= 1 {
+			v, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			return fmt.Sprintf("%v", v), true, nil
+		}
+		return "UTC", true, nil
+	case "ZoneOffset.ofHours":
+		if f, ok := evalNumArg(0); ok {
+			hrs := int(f)
+			if hrs == 0 {
+				return "UTC", true, nil
+			}
+			if hrs > 0 {
+				return fmt.Sprintf("+%02d:00", hrs), true, nil
+			}
+			return fmt.Sprintf("-%02d:00", -hrs), true, nil
+		}
+		return "UTC", true, nil
 	case "Instant.ofEpochMilli":
 		if f, ok := evalNumArg(0); ok {
 			return time.UnixMilli(int64(f)).UTC().Format(time.RFC3339Nano), true, nil
@@ -8041,7 +8794,14 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 		return nil, true, nil
 	case "Instant.ofEpochSecond":
 		if f, ok := evalNumArg(0); ok {
-			return time.Unix(int64(f), 0).UTC().Format(time.RFC3339Nano), true, nil
+			sec := int64(f)
+			var nsec int64
+			if len(args) >= 2 {
+				if nf, ok2 := evalNumArg(1); ok2 {
+					nsec = int64(nf)
+				}
+			}
+			return time.Unix(sec, nsec).UTC().Format(time.RFC3339Nano), true, nil
 		}
 		return nil, true, nil
 	case "Instant.parse":
@@ -8052,14 +8812,154 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			}
 		}
 		return nil, true, nil
-	case "ZonedDateTime.parse", "LocalDateTime.parse", "LocalDate.parse":
+	case "ZonedDateTime.parse", "LocalDateTime.parse", "LocalDate.parse", "OffsetDateTime.parse":
 		if len(args) >= 1 {
 			v, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if len(args) >= 2 {
+				fmtVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+				if tm, ok := parseDateTimeWithFormatterPainless(v, fmtVal); ok {
+					if fnName == "LocalDate.parse" {
+						return tm.Format("2006-01-02"), true, nil
+					}
+					return tm.Format(time.RFC3339Nano), true, nil
+				}
+			}
 			if tm, ok := parsePainlessDateTime(v); ok {
+				if fnName == "LocalDate.parse" && len(strings.TrimSpace(fmt.Sprintf("%v", v))) == 10 {
+					return tm.Format("2006-01-02"), true, nil
+				}
 				return tm.Format(time.RFC3339Nano), true, nil
 			}
 		}
 		return nil, true, nil
+	case "ZonedDateTime.of":
+		if len(args) == 2 {
+			ldtVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			zVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+			if tm, ok := parsePainlessDateTime(ldtVal); ok {
+				loc := parseZoneLocationPainless(zVal)
+				return time.Date(tm.Year(), tm.Month(), tm.Day(), tm.Hour(), tm.Minute(), tm.Second(), tm.Nanosecond(), loc).Format(time.RFC3339Nano), true, nil
+			}
+		}
+		if len(args) >= 7 {
+			y, _ := evalNumArg(0)
+			m, _ := evalNumArg(1)
+			d, _ := evalNumArg(2)
+			hr, _ := evalNumArg(3)
+			min, _ := evalNumArg(4)
+			sec, _ := evalNumArg(5)
+			nano, _ := evalNumArg(6)
+			loc := time.UTC
+			if len(args) >= 8 {
+				zVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[7]), params, depth+1)
+				loc = parseZoneLocationPainless(zVal)
+			}
+			tm := time.Date(int(y), time.Month(int(m)), int(d), int(hr), int(min), int(sec), int(nano), loc)
+			return tm.Format(time.RFC3339Nano), true, nil
+		}
+		return nil, true, nil
+	case "ZonedDateTime.ofInstant":
+		if len(args) >= 2 {
+			instVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			zVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+			if tm, ok := parsePainlessDateTime(instVal); ok {
+				loc := parseZoneLocationPainless(zVal)
+				return tm.In(loc).Format(time.RFC3339Nano), true, nil
+			}
+		}
+		return nil, true, nil
+	case "LocalDate.of":
+		if len(args) >= 3 {
+			y, _ := evalNumArg(0)
+			m, _ := evalNumArg(1)
+			d, _ := evalNumArg(2)
+			tm := time.Date(int(y), time.Month(int(m)), int(d), 0, 0, 0, 0, time.UTC)
+			return tm.Format("2006-01-02"), true, nil
+		}
+		return nil, true, nil
+	case "LocalDate.ofEpochDay":
+		if f, ok := evalNumArg(0); ok {
+			tm := time.Unix(int64(f)*86400, 0).UTC()
+			return tm.Format("2006-01-02"), true, nil
+		}
+		return nil, true, nil
+	case "LocalDateTime.of":
+		if len(args) >= 5 {
+			y, _ := evalNumArg(0)
+			m, _ := evalNumArg(1)
+			d, _ := evalNumArg(2)
+			hr, _ := evalNumArg(3)
+			min, _ := evalNumArg(4)
+			sec := 0.0
+			nano := 0.0
+			if len(args) >= 6 {
+				sec, _ = evalNumArg(5)
+			}
+			if len(args) >= 7 {
+				nano, _ = evalNumArg(6)
+			}
+			tm := time.Date(int(y), time.Month(int(m)), int(d), int(hr), int(min), int(sec), int(nano), time.UTC)
+			if int(nano) > 0 {
+				return tm.Format("2006-01-02T15:04:05.999999999"), true, nil
+			}
+			return tm.Format("2006-01-02T15:04:05"), true, nil
+		}
+		return nil, true, nil
+	case "Duration.between":
+		if len(args) >= 2 {
+			v1, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			v2, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+			t1, ok1 := parsePainlessDateTime(v1)
+			t2, ok2 := parsePainlessDateTime(v2)
+			if ok1 && ok2 {
+				return t2.Sub(t1), true, nil
+			}
+		}
+		return time.Duration(0), true, nil
+	case "Duration.ofDays":
+		if f, ok := evalNumArg(0); ok {
+			return time.Duration(int64(f)) * 24 * time.Hour, true, nil
+		}
+		return time.Duration(0), true, nil
+	case "Duration.ofHours":
+		if f, ok := evalNumArg(0); ok {
+			return time.Duration(int64(f)) * time.Hour, true, nil
+		}
+		return time.Duration(0), true, nil
+	case "Duration.ofMinutes":
+		if f, ok := evalNumArg(0); ok {
+			return time.Duration(int64(f)) * time.Minute, true, nil
+		}
+		return time.Duration(0), true, nil
+	case "Duration.ofSeconds":
+		if f, ok := evalNumArg(0); ok {
+			dur := time.Duration(int64(f)) * time.Second
+			if len(args) >= 2 {
+				if nf, ok2 := evalNumArg(1); ok2 {
+					dur += time.Duration(int64(nf)) * time.Nanosecond
+				}
+			}
+			return dur, true, nil
+		}
+		return time.Duration(0), true, nil
+	case "Duration.ofMillis":
+		if f, ok := evalNumArg(0); ok {
+			return time.Duration(int64(f)) * time.Millisecond, true, nil
+		}
+		return time.Duration(0), true, nil
+	case "Duration.ofNanos":
+		if f, ok := evalNumArg(0); ok {
+			return time.Duration(int64(f)) * time.Nanosecond, true, nil
+		}
+		return time.Duration(0), true, nil
+	case "Duration.parse":
+		if len(args) >= 1 {
+			v, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if dur, ok := parsePainlessDuration(v); ok {
+				return dur, true, nil
+			}
+		}
+		return time.Duration(0), true, nil
 	case "ChronoUnit.YEARS.between", "ChronoUnit.MONTHS.between", "ChronoUnit.WEEKS.between", "ChronoUnit.DAYS.between", "ChronoUnit.HOURS.between", "ChronoUnit.MINUTES.between", "ChronoUnit.SECONDS.between", "ChronoUnit.MILLIS.between":
 		if len(args) >= 2 {
 			v1, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
@@ -8101,13 +9001,56 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			v, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
 			if v != nil {
 				patStr := fmt.Sprintf("%v", v)
-				if isRawRegexLiteralPainless(patStr) {
-					return patStr, true, nil
+				if isRawRegexLiteralPainless(patStr) && len(patStr) >= 2 && patStr[0] == '/' && patStr[len(patStr)-1] == '/' {
+					patStr = strings.ReplaceAll(patStr[1:len(patStr)-1], `\/`, `/`)
+				}
+				if len(args) >= 2 {
+					if ff, ok := evalNumArg(1); ok {
+						flags := int64(ff)
+						if flags&16 != 0 { // Pattern.LITERAL
+							patStr = regexp.QuoteMeta(patStr)
+						}
+						var flagChars strings.Builder
+						if flags&2 != 0 { // Pattern.CASE_INSENSITIVE
+							flagChars.WriteByte('i')
+						}
+						if flags&8 != 0 { // Pattern.MULTILINE
+							flagChars.WriteByte('m')
+						}
+						if flags&32 != 0 { // Pattern.DOTALL
+							flagChars.WriteByte('s')
+						}
+						if flagChars.Len() > 0 {
+							patStr = "(?" + flagChars.String() + ")" + patStr
+						}
+					}
 				}
 				return "/" + strings.ReplaceAll(patStr, "/", `\/`) + "/", true, nil
 			}
 		}
 		return nil, true, nil
+	case "Pattern.matches":
+		if len(args) >= 2 {
+			patVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			inVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+			return evalRegexMatchPainless(inVal, patVal, isRawRegexLiteralPainless(strings.TrimSpace(args[0])), true), true, nil
+		}
+		return false, true, nil
+	case "Pattern.quote":
+		if len(args) >= 1 {
+			v, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			return regexp.QuoteMeta(fmt.Sprintf("%v", v)), true, nil
+		}
+		return "", true, nil
+	case "Matcher.quoteReplacement":
+		if len(args) >= 1 {
+			v, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			s := fmt.Sprintf("%v", v)
+			s = strings.ReplaceAll(s, `\`, `\\`)
+			s = strings.ReplaceAll(s, `$`, `\$`)
+			return s, true, nil
+		}
+		return "", true, nil
 	}
 	budget := getOrInitEvalBudget(params)
 	if budget != nil && budget.userFuncs != nil {
@@ -8569,6 +9512,13 @@ func execPainlessListReplaceAll(recExpr, argExpr string, sourceMap, params map[s
 		} else {
 			delete(params, vName)
 		}
+		if recExpr == "ctx._source" || recExpr == "ctx?._source" || recExpr == "ctx._source?" || recExpr == "ctx?._source?" {
+			for _, k := range keys {
+				sourceMap[k] = recMap[k]
+				syncSourceAliasToLocalVars(sourceMap, params, k)
+			}
+			return nil
+		}
 		for _, pfx := range []string{"ctx?._source?.", "ctx?._source.", "ctx._source?.", "ctx._source."} {
 			if strings.HasPrefix(recExpr, pfx) {
 				relPath := strings.TrimSuffix(strings.TrimPrefix(recExpr, pfx), "?")
@@ -8968,13 +9918,31 @@ func parseStreamChainStepsPainless(chain string) ([]painlessStreamStep, string, 
 	return steps, "", len(steps) > 0
 }
 
+func findStreamStartOutsideQuotesPainless(s string) (int, string) {
+	bestIdx := -1
+	bestSub := ""
+	for _, sub := range []string{".stream()", ".lines()", ".chars()", ".codePoints()"} {
+		idx := findTopLevelSubstrPainless(s, sub)
+		if idx > 0 {
+			rest := strings.TrimSpace(s[idx+len(sub):])
+			if strings.HasPrefix(rest, ".") || strings.HasPrefix(rest, "?.") {
+				if bestIdx < 0 || idx < bestIdx {
+					bestIdx = idx
+					bestSub = sub
+				}
+			}
+		}
+	}
+	return bestIdx, bestSub
+}
+
 func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map[string]any, depth int) (any, bool, error) {
-	streamIdx := findTopLevelSubstrPainless(rhs, ".stream()")
+	streamIdx, streamSub := findStreamStartOutsideQuotesPainless(rhs)
 	if streamIdx <= 0 {
 		return nil, false, nil
 	}
 	recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:streamIdx], "?"))
-	chainRest := strings.TrimSpace(rhs[streamIdx+len(".stream()"):])
+	chainRest := strings.TrimSpace(rhs[streamIdx+len(streamSub):])
 	if chainRest == "" {
 		return nil, false, nil
 	}
@@ -8985,7 +9953,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 
 	var recVal any
 	expRec := strings.TrimSpace(expandDynamicBrackets(recExpr, sourceMap, params, depth+1))
-	if (strings.HasPrefix(expRec, "doc.") || strings.HasPrefix(expRec, "doc?.")) &&
+	if streamSub == ".stream()" && (strings.HasPrefix(expRec, "doc.") || strings.HasPrefix(expRec, "doc?.")) &&
 		!strings.HasSuffix(expRec, ".value") && !strings.Contains(expRec, ".value.") && !strings.Contains(expRec, ".values.") && !strings.Contains(expRec, "(") {
 		docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(expRec, "doc?."), "doc."), ".values")
 		recVal = resolveDocValuesSlice(sourceMap, docPath)
@@ -8996,9 +9964,26 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 			return nil, true, err
 		}
 	}
-	srcSlice, ok := recVal.([]any)
-	if !ok {
-		srcSlice = []any{}
+	var srcSlice []any
+	switch streamSub {
+	case ".lines()":
+		if recVal != nil {
+			srcSlice = splitLinesPainless(fmt.Sprintf("%v", recVal))
+		}
+	case ".chars()", ".codePoints()":
+		if recVal != nil {
+			runes := []rune(fmt.Sprintf("%v", recVal))
+			srcSlice = make([]any, len(runes))
+			for i, r := range runes {
+				srcSlice[i] = int64(r)
+			}
+		}
+	default:
+		if s, ok := recVal.([]any); ok {
+			srcSlice = s
+		} else {
+			srcSlice = []any{}
+		}
 	}
 	items := make([]any, len(srcSlice))
 	copy(items, srcSlice)
@@ -9191,7 +10176,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 					items = filtered
 				}
 			}
-		case "map", "mapToInt", "mapToLong", "mapToDouble":
+		case "map", "mapToObj", "mapToInt", "mapToLong", "mapToDouble":
 			arrowIdx := findNextUnquotedSubstr(step.args, "->", 0)
 			if arrowIdx > 0 {
 				pNames := parsePainlessLambdaHeader(step.args[:arrowIdx])
@@ -9317,7 +10302,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 					}
 				}
 			}
-		case "boxed", "asDoubleStream", "asLongStream":
+		case "boxed", "asDoubleStream", "asLongStream", "stream":
 			// No-op intermediate stream conversion
 		case "peek":
 			if arrowIdx := findNextUnquotedSubstr(step.args, "->", 0); arrowIdx > 0 {
@@ -9830,4 +10815,470 @@ func evalStreamCollectorPainless(collectorExpr string, items []any, sourceMap, p
 		return evalStreamCollectorPainless("Collectors.toSet()", items, sourceMap, params, depth)
 	}
 	return items, nil
+}
+
+func splitLinesPainless(s string) []any {
+	if s == "" {
+		return []any{}
+	}
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	s = strings.TrimSuffix(s, "\n")
+	parts := strings.Split(s, "\n")
+	out := make([]any, len(parts))
+	for i, p := range parts {
+		out[i] = p
+	}
+	return out
+}
+
+func resolveStringSearchNeedlePainless(subVal any) (string, bool) {
+	if subVal == nil {
+		return "", false
+	}
+	switch tv := subVal.(type) {
+	case int:
+		if tv < 0 || tv > 0x10FFFF {
+			return "", false
+		}
+		return string(rune(tv)), true // #nosec G115 -- bounds checked in 0..0x10FFFF
+	case int64:
+		if tv < 0 || tv > 0x10FFFF {
+			return "", false
+		}
+		return string(rune(tv)), true // #nosec G115 -- bounds checked in 0..0x10FFFF
+	case float64:
+		if tv == float64(int64(tv)) {
+			cp := int64(tv)
+			if cp < 0 || cp > 0x10FFFF {
+				return "", false
+			}
+			return string(rune(cp)), true // #nosec G115 -- bounds checked in 0..0x10FFFF
+		}
+	case json.Number:
+		if iv, err := tv.Int64(); err == nil {
+			if iv < 0 || iv > 0x10FFFF {
+				return "", false
+			}
+			return string(rune(iv)), true // #nosec G115 -- bounds checked in 0..0x10FFFF
+		}
+	}
+	return fmt.Sprintf("%v", subVal), true
+}
+
+func toBytesPainless(v any) []byte {
+	if v == nil {
+		return nil
+	}
+	switch tv := v.(type) {
+	case []byte:
+		return tv
+	case string:
+		return []byte(tv)
+	case []any:
+		out := make([]byte, len(tv))
+		for i, item := range tv {
+			if f, ok := toFloat64(item); ok {
+				out[i] = byte(int64(f)) // #nosec G115 -- intentional Java byte array element truncation
+			} else if s, ok := item.(string); ok && len(s) > 0 {
+				out[i] = s[0]
+			}
+		}
+		return out
+	default:
+		return []byte(fmt.Sprintf("%v", v))
+	}
+}
+
+func syncMutatedListExprPainless(listExpr string, arr []any, sourceMap, params map[string]any) {
+	listExpr = strings.TrimSpace(listExpr)
+	for _, pfx := range []string{"ctx?._source?.", "ctx?._source.", "ctx._source?.", "ctx._source."} {
+		if strings.HasPrefix(listExpr, pfx) {
+			relPath := strings.TrimSuffix(strings.TrimPrefix(listExpr, pfx), "?")
+			setValueAtPath(sourceMap, strings.Split(relPath, "."), arr)
+			syncSourceAliasToLocalVars(sourceMap, params, relPath)
+			return
+		}
+	}
+	cleanRec := strings.TrimSuffix(listExpr, "?")
+	arrPath := normalizeLocalLHSPath(strings.Split(cleanRec, "."), params)
+	if len(arrPath) > 0 {
+		rootVar := decodeBracketSeg(arrPath[0])
+		if _, exists := params[rootVar]; exists {
+			setValueAtPath(params, arrPath, arr)
+			syncLocalVarAlias(sourceMap, params, rootVar)
+		}
+	}
+}
+
+func lookupCtxMapKeyPainless(kStr string, sourceMap, params map[string]any) (any, bool) {
+	switch kStr {
+	case "_index":
+		if v, ok := params["_ctx_index"]; ok {
+			return v, v != nil
+		}
+		if v, ok := sourceMap["__reindex_index"]; ok {
+			return v, v != nil
+		}
+		if v, ok := sourceMap["_index"]; ok {
+			return v, v != nil
+		}
+		return nil, false
+	case "_id":
+		if v, ok := params["_ctx_id"]; ok {
+			return v, v != nil
+		}
+		if v, ok := sourceMap["__reindex_id"]; ok {
+			return v, v != nil
+		}
+		if v, ok := sourceMap["_id"]; ok {
+			return v, v != nil
+		}
+		return nil, false
+	case "_routing":
+		if v, ok := params["_ctx_routing"]; ok {
+			return v, v != nil
+		}
+		if v, ok := sourceMap["_routing"]; ok {
+			return v, v != nil
+		}
+		return nil, false
+	case "_version":
+		if v, ok := params["_ctx_version"]; ok {
+			return v, v != nil
+		}
+		if v, ok := sourceMap["__reindex_version"]; ok {
+			return v, v != nil
+		}
+		if v, ok := sourceMap["_version"]; ok {
+			return v, v != nil
+		}
+		return nil, false
+	case "op":
+		if v, ok := params["_ctx_op"]; ok {
+			return v, true
+		}
+		return "index", true
+	case "_now":
+		if v, ok := params["_now"]; ok && v != nil {
+			if f, fOk := toFloat64(v); fOk {
+				return int64(f), true
+			}
+			return v, true
+		}
+		return getOrInitEvalBudget(params).nowMillis, true
+	case "_source":
+		return sourceMap, sourceMap != nil
+	default:
+		if sourceMap != nil && !isInternalPainlessMapKey(sourceMap, kStr) {
+			v, exists := sourceMap[kStr]
+			return v, exists
+		}
+		return nil, false
+	}
+}
+
+func translateJavaDateTimePatternToGo(pattern string) string {
+	var sb strings.Builder
+	n := len(pattern)
+	for i := 0; i < n; {
+		c := pattern[i]
+		if c == '\'' {
+			if i+1 < n && pattern[i+1] == '\'' {
+				sb.WriteByte('\'')
+				i += 2
+				continue
+			}
+			j := i + 1
+			for j < n {
+				if pattern[j] == '\'' {
+					if j+1 < n && pattern[j+1] == '\'' {
+						sb.WriteByte('\'')
+						j += 2
+						continue
+					}
+					break
+				}
+				sb.WriteByte(pattern[j])
+				j++
+			}
+			if j < n && pattern[j] == '\'' {
+				j++
+			}
+			i = j
+			continue
+		}
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			j := i + 1
+			for j < n && pattern[j] == c {
+				j++
+			}
+			tok := pattern[i:j]
+			switch c {
+			case 'y', 'u':
+				if len(tok) == 2 {
+					sb.WriteString("06")
+				} else {
+					sb.WriteString("2006")
+				}
+			case 'M':
+				switch len(tok) {
+				case 1:
+					sb.WriteString("1")
+				case 2:
+					sb.WriteString("01")
+				case 3:
+					sb.WriteString("Jan")
+				default:
+					sb.WriteString("January")
+				}
+			case 'd':
+				if len(tok) == 1 {
+					sb.WriteString("2")
+				} else {
+					sb.WriteString("02")
+				}
+			case 'H':
+				sb.WriteString("15")
+			case 'h':
+				if len(tok) == 1 {
+					sb.WriteString("3")
+				} else {
+					sb.WriteString("03")
+				}
+			case 'm':
+				if len(tok) == 1 {
+					sb.WriteString("4")
+				} else {
+					sb.WriteString("04")
+				}
+			case 's':
+				if len(tok) == 1 {
+					sb.WriteString("5")
+				} else {
+					sb.WriteString("05")
+				}
+			case 'S':
+				sb.WriteString(strings.Repeat("0", len(tok)))
+			case 'n', 'N':
+				sb.WriteString("999999999")
+			case 'a':
+				sb.WriteString("PM")
+			case 'E':
+				if len(tok) <= 3 {
+					sb.WriteString("Mon")
+				} else {
+					sb.WriteString("Monday")
+				}
+			case 'X':
+				switch len(tok) {
+				case 1:
+					sb.WriteString("Z07")
+				case 2:
+					sb.WriteString("Z0700")
+				default:
+					sb.WriteString("Z07:00")
+				}
+			case 'x':
+				switch len(tok) {
+				case 1:
+					sb.WriteString("-07")
+				case 2:
+					sb.WriteString("-0700")
+				default:
+					sb.WriteString("-07:00")
+				}
+			case 'Z':
+				if len(tok) >= 4 {
+					sb.WriteString("Z07:00")
+				} else {
+					sb.WriteString("-0700")
+				}
+			case 'z', 'V':
+				sb.WriteString("MST")
+			default:
+				sb.WriteString(tok)
+			}
+			i = j
+			continue
+		}
+		sb.WriteByte(c)
+		i++
+	}
+	return sb.String()
+}
+
+func resolveDateTimeFormatterLayoutPainless(fmtVal any) string {
+	if fmtVal == nil {
+		return time.RFC3339Nano
+	}
+	s := strings.TrimSpace(fmt.Sprintf("%v", fmtVal))
+	switch s {
+	case "ISO_LOCAL_DATE", "ISO_DATE", "DateTimeFormatter.ISO_LOCAL_DATE", "DateTimeFormatter.ISO_DATE":
+		return "2006-01-02"
+	case "BASIC_ISO_DATE", "DateTimeFormatter.BASIC_ISO_DATE":
+		return "20060102"
+	case "ISO_LOCAL_DATE_TIME", "DateTimeFormatter.ISO_LOCAL_DATE_TIME":
+		return "2006-01-02T15:04:05"
+	case "ISO_OFFSET_DATE_TIME", "ISO_ZONED_DATE_TIME", "ISO_INSTANT", "ISO_DATE_TIME",
+		"DateTimeFormatter.ISO_OFFSET_DATE_TIME", "DateTimeFormatter.ISO_ZONED_DATE_TIME",
+		"DateTimeFormatter.ISO_INSTANT", "DateTimeFormatter.ISO_DATE_TIME":
+		return time.RFC3339Nano
+	}
+	if !strings.Contains(s, "2006") && !strings.Contains(s, "01") && !strings.Contains(s, "02") && !strings.Contains(s, "15") {
+		return translateJavaDateTimePatternToGo(s)
+	}
+	return s
+}
+
+func parseDateTimeWithFormatterPainless(val, fmtVal any) (time.Time, bool) {
+	if val == nil {
+		return time.Time{}, false
+	}
+	s := strings.TrimSpace(fmt.Sprintf("%v", val))
+	if idx := strings.IndexByte(s, '['); idx > 0 && strings.HasSuffix(s, "]") {
+		s = strings.TrimSpace(s[:idx])
+	}
+	layout := resolveDateTimeFormatterLayoutPainless(fmtVal)
+	candidates := []string{
+		layout,
+		strings.ReplaceAll(layout, "-0700", "Z0700"),
+		strings.ReplaceAll(layout, "-0700", "Z07:00"),
+		strings.ReplaceAll(layout, "Z0700", "Z07:00"),
+		strings.ReplaceAll(layout, "Z07:00", "Z0700"),
+		strings.ReplaceAll(layout, "Z07", "Z07:00"),
+	}
+	for _, c := range candidates {
+		if tm, err := time.Parse(c, s); err == nil {
+			return tm, true
+		}
+	}
+	return parsePainlessDateTime(s)
+}
+
+func parseZoneLocationPainless(zVal any) *time.Location {
+	if zVal == nil {
+		return time.UTC
+	}
+	s := strings.TrimSpace(fmt.Sprintf("%v", zVal))
+	if s == "" || strings.EqualFold(s, "Z") || strings.EqualFold(s, "UTC") || strings.EqualFold(s, "GMT") || s == "ZoneOffset.UTC" {
+		return time.UTC
+	}
+	if strings.HasPrefix(s, "UTC+") || strings.HasPrefix(s, "UTC-") || strings.HasPrefix(s, "GMT+") || strings.HasPrefix(s, "GMT-") {
+		s = s[3:]
+	}
+	if len(s) >= 2 && (s[0] == '+' || s[0] == '-') {
+		sign := 1
+		if s[0] == '-' {
+			sign = -1
+		}
+		rest := s[1:]
+		var hrs, mins int
+		if strings.Contains(rest, ":") {
+			parts := strings.SplitN(rest, ":", 2)
+			hrs, _ = strconv.Atoi(parts[0])
+			mins, _ = strconv.Atoi(parts[1])
+		} else if len(rest) == 4 {
+			hrs, _ = strconv.Atoi(rest[:2])
+			mins, _ = strconv.Atoi(rest[2:])
+		} else {
+			hrs, _ = strconv.Atoi(rest)
+		}
+		offsetSec := sign * (hrs*3600 + mins*60)
+		return time.FixedZone(s, offsetSec)
+	}
+	if loc, err := time.LoadLocation(s); err == nil {
+		return loc
+	}
+	return time.UTC
+}
+
+func parsePainlessDuration(v any) (time.Duration, bool) {
+	switch tv := v.(type) {
+	case time.Duration:
+		return tv, true
+	case string:
+		return parseISO8601DurationPainless(tv)
+	}
+	return 0, false
+}
+
+func parseISO8601DurationPainless(s string) (time.Duration, bool) {
+	s = strings.TrimSpace(strings.ToUpper(s))
+	if s == "" {
+		return 0, false
+	}
+	neg := false
+	switch s[0] {
+	case '-':
+		neg = true
+		s = s[1:]
+	case '+':
+		s = s[1:]
+	}
+	if !strings.HasPrefix(s, "P") || len(s) < 2 {
+		return 0, false
+	}
+	s = s[1:]
+	inTime := false
+	var total time.Duration
+	parsedAny := false
+	for i := 0; i < len(s); {
+		if s[i] == 'T' {
+			inTime = true
+			i++
+			continue
+		}
+		partNeg := false
+		switch s[i] {
+		case '-':
+			partNeg = true
+			i++
+		case '+':
+			i++
+		}
+		start := i
+		for i < len(s) && ((s[i] >= '0' && s[i] <= '9') || s[i] == '.' || s[i] == ',') {
+			i++
+		}
+		if i == start || i >= len(s) {
+			return 0, false
+		}
+		numStr := strings.ReplaceAll(s[start:i], ",", ".")
+		val, err := strconv.ParseFloat(numStr, 64)
+		if err != nil {
+			return 0, false
+		}
+		if partNeg {
+			val = -val
+		}
+		unit := s[i]
+		i++
+		var d time.Duration
+		if !inTime && unit == 'D' {
+			d = time.Duration(val * float64(24*time.Hour))
+		} else if inTime {
+			switch unit {
+			case 'H':
+				d = time.Duration(val * float64(time.Hour))
+			case 'M':
+				d = time.Duration(val * float64(time.Minute))
+			case 'S':
+				d = time.Duration(val * float64(time.Second))
+			default:
+				return 0, false
+			}
+		} else {
+			return 0, false
+		}
+		total += d
+		parsedAny = true
+	}
+	if !parsedAny {
+		return 0, false
+	}
+	if neg {
+		total = -total
+	}
+	return total, true
 }

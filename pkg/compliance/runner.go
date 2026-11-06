@@ -2,7 +2,9 @@ package compliance
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -17,6 +19,35 @@ import (
 	"testing"
 	"time"
 )
+
+const proxyTargetVersion = "7.10.2"
+
+var supportedRunnerFeatures = map[string]bool{
+	"headers":                true,
+	"warnings":               true,
+	"warnings_regex":         true,
+	"allowed_warnings":       true,
+	"allowed_warnings_regex": true,
+	"contains":               true,
+	"transform_and_set":      true,
+	"arbitrary_key":          true,
+	"regex":                  true,
+	"gt":                     true,
+	"gte":                    true,
+	"lt":                     true,
+	"lte":                    true,
+	"catch_param":            true,
+	"stash_in_key":           true,
+	"stash_in_path":          true,
+}
+
+type errSkipSection struct {
+	reason string
+}
+
+func (e *errSkipSection) Error() string {
+	return "skip: " + e.reason
+}
 
 // FileReport summarizes compliance execution for a single rest-api-spec YAML file.
 type FileReport struct {
@@ -75,6 +106,21 @@ func RunSuiteFS(t *testing.T, fsys fs.FS, baseURL string) SuiteReport {
 
 		fileRep := FileReport{File: path.Base(file)}
 		t.Run(path.Base(file), func(t *testing.T) {
+			probeCtx := newRunnerContext(client, strings.TrimRight(baseURL, "/"))
+			for _, step := range specDoc.Setup {
+				if step.Op == "skip" {
+					fileRep.StepsRun++
+					report.StepsRun++
+					if err := probeCtx.execStep(step, false); err != nil {
+						var skipErr *errSkipSection
+						if errors.As(err, &skipErr) {
+							t.Skipf("setup skipped: %s", skipErr.reason)
+						}
+						t.Fatalf("[setup skip] %v", err)
+					}
+				}
+			}
+
 			for _, sec := range specDoc.Sections {
 				sec := sec
 				fileRep.SectionsRun++
@@ -87,15 +133,23 @@ func RunSuiteFS(t *testing.T, fsys fs.FS, baseURL string) SuiteReport {
 						fileRep.StepsRun++
 						report.StepsRun++
 						if err := ctx.execStep(step, false); err != nil {
+							var skipErr *errSkipSection
+							if errors.As(err, &skipErr) {
+								t.Skipf("setup skipped: %s", skipErr.reason)
+							}
 							t.Fatalf("[setup step %d (%s)] %v", i+1, step.Op, err)
 						}
 					}
 
 					var testErr error
+					var skipErr *errSkipSection
 					for i, step := range sec.Steps {
 						fileRep.StepsRun++
 						report.StepsRun++
 						if err := ctx.execStep(step, false); err != nil {
+							if errors.As(err, &skipErr) {
+								break
+							}
 							testErr = fmt.Errorf("[step %d (%s)] %w", i+1, step.Op, err)
 							break
 						}
@@ -104,11 +158,17 @@ func RunSuiteFS(t *testing.T, fsys fs.FS, baseURL string) SuiteReport {
 					for i, step := range specDoc.Teardown {
 						fileRep.StepsRun++
 						report.StepsRun++
-						if err := ctx.execStep(step, true); err != nil && testErr == nil {
-							testErr = fmt.Errorf("[teardown step %d (%s)] %w", i+1, step.Op, err)
+						if err := ctx.execStep(step, true); err != nil && testErr == nil && skipErr == nil {
+							var tdSkip *errSkipSection
+							if !errors.As(err, &tdSkip) {
+								testErr = fmt.Errorf("[teardown step %d (%s)] %w", i+1, step.Op, err)
+							}
 						}
 					}
 
+					if skipErr != nil {
+						t.Skipf("skipped: %s", skipErr.reason)
+					}
 					if testErr != nil {
 						t.Fatal(testErr)
 					}
@@ -123,30 +183,41 @@ func RunSuiteFS(t *testing.T, fsys fs.FS, baseURL string) SuiteReport {
 }
 
 type runnerContext struct {
-	client           *http.Client
-	baseURL          string
-	stash            map[string]any
-	lastStatus       int
-	lastMethod       string
-	lastBodyRaw      string
-	lastResponse     any
-	createdIndices   map[string]bool
-	createdTemplates map[string]bool
-	createdCompTmpls map[string]bool
-	createdPipelines map[string]bool
-	createdAliases   map[string]string // alias -> index
+	client             *http.Client
+	baseURL            string
+	stash              map[string]any
+	lastStatus         int
+	lastMethod         string
+	lastBodyRaw        string
+	lastResponse       any
+	lastHeaders        map[string]any
+	lastWarnings       []string
+	createdIndices     map[string]bool
+	createdDataStreams map[string]bool
+	createdTemplates   map[string]bool
+	createdLegacyTmpls map[string]bool
+	createdCompTmpls   map[string]bool
+	createdPipelines   map[string]bool
+	createdILMPolicies map[string]bool
+	createdEnrichPols  map[string]bool
+	createdAliases     map[string]string // alias -> index
 }
 
 func newRunnerContext(client *http.Client, baseURL string) *runnerContext {
 	return &runnerContext{
-		client:           client,
-		baseURL:          baseURL,
-		stash:            make(map[string]any),
-		createdIndices:   make(map[string]bool),
-		createdTemplates: make(map[string]bool),
-		createdCompTmpls: make(map[string]bool),
-		createdPipelines: make(map[string]bool),
-		createdAliases:   make(map[string]string),
+		client:             client,
+		baseURL:            baseURL,
+		stash:              make(map[string]any),
+		lastHeaders:        make(map[string]any),
+		createdIndices:     make(map[string]bool),
+		createdDataStreams: make(map[string]bool),
+		createdTemplates:   make(map[string]bool),
+		createdLegacyTmpls: make(map[string]bool),
+		createdCompTmpls:   make(map[string]bool),
+		createdPipelines:   make(map[string]bool),
+		createdILMPolicies: make(map[string]bool),
+		createdEnrichPols:  make(map[string]bool),
+		createdAliases:     make(map[string]string),
 	}
 }
 
@@ -154,6 +225,11 @@ func (c *runnerContext) cleanupAll() {
 	for alias, idx := range c.createdAliases {
 		if idx != "" && alias != "" {
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/"+url.PathEscape(idx)+"/_alias/"+url.PathEscape(alias), nil, nil, nil)
+		}
+	}
+	for ds := range c.createdDataStreams {
+		if ds != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_data_stream/"+url.PathEscape(ds), nil, nil, nil)
 		}
 	}
 	for idx := range c.createdIndices {
@@ -166,6 +242,11 @@ func (c *runnerContext) cleanupAll() {
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/_index_template/"+url.PathEscape(tmpl), nil, nil, nil)
 		}
 	}
+	for tmpl := range c.createdLegacyTmpls {
+		if tmpl != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_template/"+url.PathEscape(tmpl), nil, nil, nil)
+		}
+	}
 	for comp := range c.createdCompTmpls {
 		if comp != "" {
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/_component_template/"+url.PathEscape(comp), nil, nil, nil)
@@ -176,16 +257,32 @@ func (c *runnerContext) cleanupAll() {
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ingest/pipeline/"+url.PathEscape(pipe), nil, nil, nil)
 		}
 	}
+	for pol := range c.createdILMPolicies {
+		if pol != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ilm/policy/"+url.PathEscape(pol), nil, nil, nil)
+		}
+	}
+	for pol := range c.createdEnrichPols {
+		if pol != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_enrich/policy/"+url.PathEscape(pol), nil, nil, nil)
+		}
+	}
 }
 
 func (c *runnerContext) execStep(step SpecStep, isTeardown bool) error {
 	switch step.Op {
+	case "skip":
+		return c.execSkip(step.Value)
 	case "do":
 		return c.execDo(step.Value, isTeardown)
 	case "set":
 		return c.execSet(step.Value)
+	case "transform_and_set":
+		return c.execTransformAndSet(step.Value)
 	case "match":
 		return c.execMatch(step.Value)
+	case "contains":
+		return c.execContains(step.Value)
 	case "is_true":
 		return c.execIsTrue(step.Value)
 	case "is_false":
@@ -214,6 +311,8 @@ func (c *runnerContext) execDo(rawVal any, isTeardown bool) error {
 	var catchSpec string
 	var headers map[string]string
 	var ignoreStatuses map[int]bool
+	var expectedWarnings []string
+	var expectedWarningsRegex []string
 	var actionName string
 	var actionParams any
 
@@ -230,8 +329,12 @@ func (c *runnerContext) execDo(rawVal any, isTeardown bool) error {
 			}
 		case "ignore":
 			ignoreStatuses = parseIgnoreStatuses(c.expandStash(f.Value))
-		case "warnings", "allowed_warnings", "allowed_warnings_regex":
-			// Ignored warning metadata directives from upstream rest-api-spec
+		case "warnings":
+			expectedWarnings = append(expectedWarnings, extractStringSlice(c.expandStash(f.Value))...)
+		case "warnings_regex":
+			expectedWarningsRegex = append(expectedWarningsRegex, extractStringSlice(c.expandStash(f.Value))...)
+		case "allowed_warnings", "allowed_warnings_regex":
+			// Allowed warning metadata directives from upstream rest-api-spec
 		default:
 			actionName = f.Key
 			actionParams = f.Value
@@ -259,6 +362,9 @@ func (c *runnerContext) execDo(rawVal any, isTeardown bool) error {
 
 	reqSpec, err := c.buildActionRequest(actionName, paramMap)
 	if err != nil {
+		if catchSpec == "param" {
+			return nil
+		}
 		return err
 	}
 
@@ -274,6 +380,39 @@ func (c *runnerContext) execDo(rawVal any, isTeardown bool) error {
 
 	// Record resources created during this section for automatic post-section cleanup
 	c.trackCreatedResources(actionName, paramMap, c.lastResponse)
+
+	for _, expWarn := range expectedWarnings {
+		matched := false
+		for _, actualWarn := range c.lastWarnings {
+			if actualWarn == expWarn || strings.Contains(actualWarn, expWarn) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return fmt.Errorf("action %s expected warning %q, got %v", actionName, expWarn, c.lastWarnings)
+		}
+	}
+	for _, expRegex := range expectedWarningsRegex {
+		pattern := expRegex
+		if len(pattern) >= 2 && strings.HasPrefix(pattern, "/") && strings.HasSuffix(pattern, "/") {
+			pattern = pattern[1 : len(pattern)-1]
+		}
+		re, compErr := regexp.Compile(pattern)
+		if compErr != nil {
+			return fmt.Errorf("action %s invalid warnings_regex %q: %w", actionName, expRegex, compErr)
+		}
+		matched := false
+		for _, actualWarn := range c.lastWarnings {
+			if re.MatchString(actualWarn) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return fmt.Errorf("action %s expected warning matching %q, got %v", actionName, expRegex, c.lastWarnings)
+		}
+	}
 
 	if isTeardown && catchSpec == "" && (status == http.StatusNotFound || status == http.StatusBadRequest) {
 		return nil
@@ -297,6 +436,26 @@ func (c *runnerContext) execDo(rawVal any, isTeardown bool) error {
 		return fmt.Errorf("action %s (%s %s) returned unexpected HTTP %d: %s", actionName, reqSpec.method, reqSpec.path, status, bodyStr)
 	}
 	return nil
+}
+
+func extractStringSlice(v any) []string {
+	if v == nil {
+		return nil
+	}
+	switch val := v.(type) {
+	case string:
+		return []string{val}
+	case []any:
+		out := make([]string, 0, len(val))
+		for _, item := range val {
+			if item != nil {
+				out = append(out, fmt.Sprintf("%v", item))
+			}
+		}
+		return out
+	default:
+		return []string{fmt.Sprintf("%v", val)}
+	}
 }
 
 func parseIgnoreStatuses(v any) map[int]bool {
@@ -354,6 +513,16 @@ func (c *runnerContext) verifyCatch(catchSpec, actionName string, status int, bo
 	case "request_timeout":
 		if status != http.StatusRequestTimeout {
 			return fmt.Errorf("action %s expected catch: request_timeout (HTTP 408), got HTTP %d: %s", actionName, status, bodyStr)
+		}
+		return nil
+	case "unavailable":
+		if status != http.StatusServiceUnavailable {
+			return fmt.Errorf("action %s expected catch: unavailable (HTTP 503), got HTTP %d: %s", actionName, status, bodyStr)
+		}
+		return nil
+	case "method_not_allowed":
+		if status != http.StatusMethodNotAllowed {
+			return fmt.Errorf("action %s expected catch: method_not_allowed (HTTP 405), got HTTP %d: %s", actionName, status, bodyStr)
 		}
 		return nil
 	}
@@ -444,6 +613,17 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 				c.createdIndices[newIdx] = true
 			}
 		}
+	case "indices.clone", "indices.shrink", "indices.split":
+		if target := paramString(params, "target"); target != "" {
+			c.createdIndices[target] = true
+		}
+		if idx != "" {
+			c.createdIndices[idx] = true
+		}
+	case "indices.create_data_stream":
+		if name := paramString(params, "name"); name != "" {
+			c.createdDataStreams[name] = true
+		}
 	case "indices.put_alias":
 		name := paramString(params, "name")
 		if idx != "" && name != "" {
@@ -454,6 +634,10 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 		if name := paramString(params, "name"); name != "" {
 			c.createdTemplates[name] = true
 		}
+	case "indices.put_template":
+		if name := paramString(params, "name"); name != "" {
+			c.createdLegacyTmpls[name] = true
+		}
 	case "cluster.put_component_template":
 		if name := paramString(params, "name"); name != "" {
 			c.createdCompTmpls[name] = true
@@ -461,6 +645,16 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 	case "ingest.put_pipeline":
 		if id := paramString(params, "id"); id != "" {
 			c.createdPipelines[id] = true
+		}
+	case "ilm.put_lifecycle":
+		if pol := paramString(params, "policy"); pol != "" {
+			c.createdILMPolicies[pol] = true
+		} else if name := paramString(params, "name"); name != "" {
+			c.createdILMPolicies[name] = true
+		}
+	case "enrich.put_policy":
+		if name := paramString(params, "name"); name != "" {
+			c.createdEnrichPols[name] = true
 		}
 	}
 }
@@ -1089,6 +1283,221 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			reqPath = "/_cat/shards"
 		}
 
+	case "ping":
+		method = http.MethodHead
+		reqPath = "/"
+
+	case "indices.resolve_index":
+		method = http.MethodGet
+		if name := popString("name"); name != "" {
+			reqPath = "/_resolve/index/" + name
+		} else {
+			reqPath = "/_resolve/index"
+		}
+
+	case "indices.create_data_stream":
+		method = http.MethodPut
+		name := popString("name")
+		if name == "" {
+			return nil, fmt.Errorf("indices.create_data_stream requires name parameter")
+		}
+		reqPath = "/_data_stream/" + name
+
+	case "indices.get_data_stream":
+		method = http.MethodGet
+		if name := popString("name"); name != "" {
+			reqPath = "/_data_stream/" + name
+		} else {
+			reqPath = "/_data_stream"
+		}
+
+	case "indices.delete_data_stream":
+		method = http.MethodDelete
+		name := popString("name")
+		if name == "" {
+			return nil, fmt.Errorf("indices.delete_data_stream requires name parameter")
+		}
+		reqPath = "/_data_stream/" + name
+
+	case "indices.data_stream_stats":
+		method = http.MethodGet
+		if name := popString("name"); name != "" {
+			reqPath = "/_data_stream/" + name + "/_stats"
+		} else {
+			reqPath = "/_data_stream/_stats"
+		}
+
+	case "indices.put_template":
+		method = http.MethodPut
+		name := popString("name")
+		if name == "" {
+			return nil, fmt.Errorf("indices.put_template requires name parameter")
+		}
+		reqPath = "/_template/" + name
+
+	case "indices.get_template":
+		method = http.MethodGet
+		if name := popString("name"); name != "" {
+			reqPath = "/_template/" + name
+		} else {
+			reqPath = "/_template"
+		}
+
+	case "indices.delete_template":
+		method = http.MethodDelete
+		name := popString("name")
+		if name == "" {
+			return nil, fmt.Errorf("indices.delete_template requires name parameter")
+		}
+		reqPath = "/_template/" + name
+
+	case "indices.exists_template":
+		method = http.MethodHead
+		name := popString("name")
+		if name == "" {
+			return nil, fmt.Errorf("indices.exists_template requires name parameter")
+		}
+		reqPath = "/_template/" + name
+
+	case "indices.clone":
+		method = http.MethodPost
+		idx := popString("index")
+		target := popString("target")
+		if idx == "" || target == "" {
+			return nil, fmt.Errorf("indices.clone requires index and target parameters")
+		}
+		reqPath = "/" + idx + "/_clone/" + target
+
+	case "indices.shrink":
+		method = http.MethodPost
+		idx := popString("index")
+		target := popString("target")
+		if idx == "" || target == "" {
+			return nil, fmt.Errorf("indices.shrink requires index and target parameters")
+		}
+		reqPath = "/" + idx + "/_shrink/" + target
+
+	case "indices.split":
+		method = http.MethodPost
+		idx := popString("index")
+		target := popString("target")
+		if idx == "" || target == "" {
+			return nil, fmt.Errorf("indices.split requires index and target parameters")
+		}
+		reqPath = "/" + idx + "/_split/" + target
+
+	case "search_shards":
+		method = http.MethodGet
+		if idx := popString("index"); idx != "" {
+			reqPath = "/" + idx + "/_search_shards"
+		} else {
+			reqPath = "/_search_shards"
+		}
+
+	case "ilm.put_lifecycle":
+		method = http.MethodPut
+		pol := popString("policy", "name")
+		if pol == "" {
+			return nil, fmt.Errorf("ilm.put_lifecycle requires policy parameter")
+		}
+		reqPath = "/_ilm/policy/" + pol
+
+	case "ilm.get_lifecycle":
+		method = http.MethodGet
+		if pol := popString("policy", "name"); pol != "" {
+			reqPath = "/_ilm/policy/" + pol
+		} else {
+			reqPath = "/_ilm/policy"
+		}
+
+	case "ilm.delete_lifecycle":
+		method = http.MethodDelete
+		pol := popString("policy", "name")
+		if pol == "" {
+			return nil, fmt.Errorf("ilm.delete_lifecycle requires policy parameter")
+		}
+		reqPath = "/_ilm/policy/" + pol
+
+	case "ilm.explain_lifecycle":
+		method = http.MethodGet
+		idx := popString("index")
+		if idx == "" {
+			return nil, fmt.Errorf("ilm.explain_lifecycle requires index parameter")
+		}
+		reqPath = "/" + idx + "/_ilm/explain"
+
+	case "ilm.get_status":
+		method = http.MethodGet
+		reqPath = "/_ilm/status"
+
+	case "ilm.start":
+		method = http.MethodPost
+		reqPath = "/_ilm/start"
+
+	case "ilm.stop":
+		method = http.MethodPost
+		reqPath = "/_ilm/stop"
+
+	case "ilm.move_to_step":
+		method = http.MethodPost
+		idx := popString("index")
+		if idx == "" {
+			return nil, fmt.Errorf("ilm.move_to_step requires index parameter")
+		}
+		reqPath = "/_ilm/move/" + idx
+
+	case "ilm.remove_policy":
+		method = http.MethodPost
+		idx := popString("index")
+		if idx == "" {
+			return nil, fmt.Errorf("ilm.remove_policy requires index parameter")
+		}
+		reqPath = "/" + idx + "/_ilm/remove"
+
+	case "enrich.put_policy":
+		method = http.MethodPut
+		name := popString("name")
+		if name == "" {
+			return nil, fmt.Errorf("enrich.put_policy requires name parameter")
+		}
+		reqPath = "/_enrich/policy/" + name
+
+	case "enrich.get_policy":
+		method = http.MethodGet
+		if name := popString("name"); name != "" {
+			reqPath = "/_enrich/policy/" + name
+		} else {
+			reqPath = "/_enrich/policy"
+		}
+
+	case "enrich.delete_policy":
+		method = http.MethodDelete
+		name := popString("name")
+		if name == "" {
+			return nil, fmt.Errorf("enrich.delete_policy requires name parameter")
+		}
+		reqPath = "/_enrich/policy/" + name
+
+	case "enrich.execute_policy":
+		method = http.MethodPut
+		name := popString("name")
+		if name == "" {
+			return nil, fmt.Errorf("enrich.execute_policy requires name parameter")
+		}
+		reqPath = "/_enrich/policy/" + name + "/_execute"
+
+	case "enrich.stats":
+		method = http.MethodGet
+		reqPath = "/_enrich/_stats"
+
+	case "ingest.exists_pipeline":
+		method = http.MethodHead
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("ingest.exists_pipeline requires id parameter")
+		}
+		reqPath = "/_ingest/pipeline/" + id
+
 	default:
 		return nil, fmt.Errorf("unsupported rest-api-spec action %q", action)
 	}
@@ -1207,6 +1616,13 @@ func (c *runnerContext) rawHTTP(method, reqPath string, query url.Values, body [
 		return 0, "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	c.lastHeaders = make(map[string]any, len(resp.Header))
+	for k, vals := range resp.Header {
+		if len(vals) > 0 {
+			c.lastHeaders[strings.ToLower(k)] = vals[0]
+		}
+	}
+	c.lastWarnings = append([]string(nil), resp.Header.Values("Warning")...)
 	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return resp.StatusCode, "", err
@@ -1315,6 +1731,105 @@ func (c *runnerContext) expandStashString(s string) string {
 	})
 }
 
+func (c *runnerContext) execSkip(rawVal any) error {
+	pairs, err := extractFieldPairs("skip", rawVal)
+	if err != nil {
+		return err
+	}
+	var versionSpec string
+	var reason string
+	var features []string
+	for _, p := range pairs {
+		switch p.Key {
+		case "version":
+			if p.Value != nil {
+				versionSpec = strings.TrimSpace(fmt.Sprintf("%v", c.expandStash(p.Value)))
+			}
+		case "reason":
+			if p.Value != nil {
+				reason = strings.TrimSpace(fmt.Sprintf("%v", c.expandStash(p.Value)))
+			}
+		case "features":
+			for _, f := range extractStringSlice(c.expandStash(p.Value)) {
+				for _, part := range strings.Split(f, ",") {
+					if trimmed := strings.TrimSpace(part); trimmed != "" {
+						features = append(features, trimmed)
+					}
+				}
+			}
+		}
+	}
+	for _, feat := range features {
+		if !supportedRunnerFeatures[feat] {
+			r := reason
+			if r == "" {
+				r = fmt.Sprintf("unsupported feature %s", feat)
+			}
+			return &errSkipSection{reason: r}
+		}
+	}
+	if versionSpec != "" && versionInRange(proxyTargetVersion, versionSpec) {
+		r := reason
+		if r == "" {
+			r = fmt.Sprintf("version %s in skip range %s", proxyTargetVersion, versionSpec)
+		}
+		return &errSkipSection{reason: r}
+	}
+	return nil
+}
+
+func versionInRange(target, versionRange string) bool {
+	vr := strings.TrimSpace(versionRange)
+	if vr == "" {
+		return false
+	}
+	if strings.EqualFold(vr, "all") {
+		return true
+	}
+	if !strings.Contains(vr, "-") {
+		return compareSemver(target, vr) == 0
+	}
+	parts := strings.SplitN(vr, "-", 2)
+	minVer := strings.TrimSpace(parts[0])
+	maxVer := strings.TrimSpace(parts[1])
+	if minVer != "" && compareSemver(target, minVer) < 0 {
+		return false
+	}
+	if maxVer != "" && compareSemver(target, maxVer) > 0 {
+		return false
+	}
+	return true
+}
+
+func compareSemver(a, b string) int {
+	pa := parseSemverParts(a)
+	pb := parseSemverParts(b)
+	for i := 0; i < 3; i++ {
+		if pa[i] < pb[i] {
+			return -1
+		}
+		if pa[i] > pb[i] {
+			return 1
+		}
+	}
+	return 0
+}
+
+func parseSemverParts(v string) [3]int {
+	var out [3]int
+	v = strings.TrimSpace(v)
+	if idx := strings.IndexAny(v, "-+"); idx >= 0 {
+		v = v[:idx]
+	}
+	segs := strings.Split(v, ".")
+	for i := 0; i < 3 && i < len(segs); i++ {
+		if n, err := strconv.Atoi(strings.TrimSpace(segs[i])); err == nil {
+			out[i] = n
+		}
+	}
+	return out
+}
+
 func (c *runnerContext) execSet(rawVal any) error {
 	pairs, err := extractFieldPairs("set", rawVal)
 	if err != nil {
@@ -1331,6 +1846,109 @@ func (c *runnerContext) execSet(rawVal any) error {
 		c.stash[stashVar] = val
 	}
 	return nil
+}
+
+var reTransformExpr = regexp.MustCompile(`^([A-Za-z0-9_]+)\((.+)\)$`)
+
+func (c *runnerContext) execTransformAndSet(rawVal any) error {
+	pairs, err := extractFieldPairs("transform_and_set", rawVal)
+	if err != nil {
+		return err
+	}
+	for _, p := range pairs {
+		keyStr := strings.TrimSpace(p.Key)
+		valStr := strings.TrimSpace(fmt.Sprintf("%v", p.Value))
+
+		var varName, exprStr string
+		if reTransformExpr.MatchString(valStr) && !reTransformExpr.MatchString(keyStr) {
+			varName = keyStr
+			exprStr = valStr
+		} else if reTransformExpr.MatchString(keyStr) {
+			exprStr = keyStr
+			varName = valStr
+		} else {
+			return fmt.Errorf("transform_and_set: invalid transform expression in %q: %q", keyStr, valStr)
+		}
+
+		m := reTransformExpr.FindStringSubmatch(exprStr)
+		fnName := m[1]
+		rawPath := strings.TrimSpace(m[2])
+		fieldPath := c.expandStashString(rawPath)
+
+		val, found := c.lookupResponsePath(fieldPath)
+		if !found && strings.HasPrefix(rawPath, "$") {
+			val, found = c.stash[strings.TrimPrefix(rawPath, "$")]
+		}
+		if !found {
+			return fmt.Errorf("transform_and_set: response path %q not found in %s", fieldPath, c.lastBodyRaw)
+		}
+
+		strVal := fmt.Sprintf("%v", val)
+		var transformed string
+		switch fnName {
+		case "base64Encode":
+			transformed = base64.StdEncoding.EncodeToString([]byte(strVal))
+		case "lower":
+			transformed = strings.ToLower(strVal)
+		case "upper":
+			transformed = strings.ToUpper(strVal)
+		default:
+			return fmt.Errorf("transform_and_set: unsupported transform function %q", fnName)
+		}
+
+		varName = strings.TrimPrefix(varName, "$")
+		c.stash[varName] = transformed
+	}
+	return nil
+}
+
+func (c *runnerContext) execContains(rawVal any) error {
+	pairs, err := extractFieldPairs("contains", rawVal)
+	if err != nil {
+		return err
+	}
+	for _, p := range pairs {
+		fieldPath := c.expandStashString(p.Key)
+		expected := ToNative(c.expandStash(p.Value))
+		actual, found := c.lookupResponsePath(fieldPath)
+		if !found {
+			return fmt.Errorf("contains: path %q not found in response: %s", fieldPath, c.lastBodyRaw)
+		}
+		sliceVal, ok := actual.([]any)
+		if !ok {
+			return fmt.Errorf("contains %q: expected slice in response, got %T (%v)", fieldPath, actual, actual)
+		}
+		matched := false
+		for _, elem := range sliceVal {
+			if containsElementMatch(elem, expected) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			actJSON, _ := json.Marshal(actual)
+			expJSON, _ := json.Marshal(expected)
+			return fmt.Errorf("contains %q failed: no element in %s matched %s", fieldPath, string(actJSON), string(expJSON))
+		}
+	}
+	return nil
+}
+
+func containsElementMatch(elem, expected any) bool {
+	if expMap, ok := expected.(map[string]any); ok {
+		actMap, ok := elem.(map[string]any)
+		if !ok {
+			return false
+		}
+		for k, expVal := range expMap {
+			actVal, exists := actMap[k]
+			if !exists || !containsElementMatch(actVal, expVal) {
+				return false
+			}
+		}
+		return true
+	}
+	return matchValues("", elem, expected) == nil
 }
 
 func (c *runnerContext) execMatch(rawVal any) error {
@@ -1380,6 +1998,14 @@ func valuesEqual(a, b any) bool {
 	}
 	if a == nil || b == nil {
 		return false
+	}
+	if bs, ok := b.(string); ok && len(bs) >= 2 && strings.HasPrefix(bs, "/") && strings.HasSuffix(bs, "/") {
+		pattern := bs[1 : len(bs)-1]
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return false
+		}
+		return re.MatchString(fmt.Sprintf("%v", a))
 	}
 	if af, aOk := toFloat64(a); aOk {
 		if bf, bOk := toFloat64(b); bOk {
@@ -1597,6 +2223,25 @@ func extractFieldPairs(op string, raw any) ([]YAMLField, error) {
 func (c *runnerContext) lookupResponsePath(rawPath string) (any, bool) {
 	if rawPath == "" || rawPath == "$body" {
 		return c.lastResponse, c.lastResponse != nil
+	}
+	if rawPath == "$headers" {
+		return c.lastHeaders, c.lastHeaders != nil
+	}
+	if strings.HasPrefix(rawPath, "$headers.") {
+		hdrKey := strings.ToLower(strings.TrimPrefix(rawPath, "$headers."))
+		val, ok := c.lastHeaders[hdrKey]
+		return val, ok
+	}
+	if strings.HasPrefix(rawPath, "headers.") {
+		hasBodyHeaders := false
+		if bodyMap, ok := c.lastResponse.(map[string]any); ok {
+			_, hasBodyHeaders = bodyMap["headers"]
+		}
+		if !hasBodyHeaders {
+			hdrKey := strings.ToLower(strings.TrimPrefix(rawPath, "headers."))
+			val, ok := c.lastHeaders[hdrKey]
+			return val, ok
+		}
 	}
 	segments := splitEscapedPath(rawPath)
 	cur := c.lastResponse
