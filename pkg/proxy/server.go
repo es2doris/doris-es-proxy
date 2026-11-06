@@ -803,8 +803,12 @@ func (s *Server) Handler() http.Handler {
 				}
 			case "_alias":
 				s.handleGetAliases(w, r)
-			case "_refresh", "_flush":
+			case "_settings":
+				s.handleIndexSettings(w, r)
+			case "_refresh", "_flush", "_forcemerge":
 				s.handleRefresh(w, r)
+			case "_cat":
+				s.handleCatRoot(w, r)
 			case "_nodes":
 				s.handleNodes(w, r)
 			case "_mapping", "_mappings":
@@ -894,6 +898,9 @@ func (s *Server) Handler() http.Handler {
 				s.handleMetrics(w, r)
 			case segs[0] == "_validate" && segs[1] == "query":
 				s.handleValidateQuery(w, r)
+			case segs[0] == "_resolve" && segs[1] == "index":
+				r.SetPathValue("name", "*")
+				s.handleResolveIndex(w, r)
 			case segs[0] == "_ingest" && segs[1] == "pipeline":
 				s.handleIngestPipeline(w, r)
 			case segs[0] == "_enrich" && (segs[1] == "policy" || segs[1] == "_stats" || segs[1] == "stats"):
@@ -1299,6 +1306,22 @@ func (s *Server) resolveEffectivePipeline(indexName, reqPipeline, itemPipeline s
 	_, hasIdx := s.indices[indexName]
 	s.mu.RUnlock()
 	if !hasPipe && !hasIdx {
+		if resolved, _, wErr := s.resolveWriteIndexWithFilter(indexName); wErr == nil && resolved != "" && resolved != indexName {
+			s.mu.RLock()
+			defPipe, hasPipe = s.indexDefaultPipelines[resolved]
+			_, hasIdx = s.indices[resolved]
+			s.mu.RUnlock()
+		}
+		if !hasPipe && !hasIdx {
+			if resolved := s.resolveIndexName(indexName); resolved != "" && resolved != indexName {
+				s.mu.RLock()
+				defPipe, hasPipe = s.indexDefaultPipelines[resolved]
+				_, hasIdx = s.indices[resolved]
+				s.mu.RUnlock()
+			}
+		}
+	}
+	if !hasPipe && !hasIdx {
 		_ = s.syncCatalogFromBackend(context.Background())
 		s.mu.RLock()
 		defPipe, hasPipe = s.indexDefaultPipelines[indexName]
@@ -1323,6 +1346,22 @@ func (s *Server) resolveFinalPipeline(indexName string) string {
 	_, hasIdx := s.indices[indexName]
 	s.mu.RUnlock()
 	if !hasPipe && !hasIdx {
+		if resolved, _, wErr := s.resolveWriteIndexWithFilter(indexName); wErr == nil && resolved != "" && resolved != indexName {
+			s.mu.RLock()
+			finPipe, hasPipe = s.indexFinalPipelines[resolved]
+			_, hasIdx = s.indices[resolved]
+			s.mu.RUnlock()
+		}
+		if !hasPipe && !hasIdx {
+			if resolved := s.resolveIndexName(indexName); resolved != "" && resolved != indexName {
+				s.mu.RLock()
+				finPipe, hasPipe = s.indexFinalPipelines[resolved]
+				_, hasIdx = s.indices[resolved]
+				s.mu.RUnlock()
+			}
+		}
+	}
+	if !hasPipe && !hasIdx {
 		_ = s.syncCatalogFromBackend(context.Background())
 		s.mu.RLock()
 		finPipe, hasPipe = s.indexFinalPipelines[indexName]
@@ -1342,20 +1381,9 @@ func (s *Server) resolveFinalPipeline(indexName string) string {
 }
 
 func (s *Server) handleIndexSettings(w http.ResponseWriter, r *http.Request) {
-	_ = s.syncCatalogFromBackend(r.Context())
 	rawIndex := r.PathValue("index")
-	targets := s.resolveTargetIndices(rawIndex)
-	s.mu.RLock()
-	var validTargets []string
-	for _, t := range targets {
-		if _, ok := s.indices[t]; ok {
-			validTargets = append(validTargets, t)
-		}
-	}
-	s.mu.RUnlock()
-
-	if len(validTargets) == 0 && !strings.ContainsAny(rawIndex, "*,") && rawIndex != "_all" {
-		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
+	validTargets, _, ok := s.resolveValidatedReadTargets(w, r, rawIndex)
+	if !ok {
 		return
 	}
 
@@ -1574,62 +1602,89 @@ func (s *Server) handleILMPolicy(w http.ResponseWriter, r *http.Request) {
 	policy := strings.TrimSpace(r.PathValue("policy"))
 	switch r.Method {
 	case http.MethodPut, http.MethodPost:
-		if policy != "" {
-			bodyBytes, ok := readRequestBody(w, r)
-			if !ok {
+		if policy == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: lifecycle policy name is missing;")
+			return
+		}
+		bodyBytes, ok := readRequestBody(w, r)
+		if !ok {
+			return
+		}
+		var polObj map[string]any
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &polObj); err != nil {
+				writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
 				return
 			}
-			var polObj map[string]any
-			if len(bytes.TrimSpace(bodyBytes)) > 0 {
-				if err := json.Unmarshal(bodyBytes, &polObj); err != nil {
-					writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
-					return
-				}
-			}
-			if polObj == nil {
-				polObj = map[string]any{"policy": map[string]any{"phases": map[string]any{}}}
-			}
-			s.mu.Lock()
-			if s.ilmPolicies == nil {
-				s.ilmPolicies = make(map[string]map[string]any)
-			}
-			ver := 1
-			if existing, exists := s.ilmPolicies[policy]; exists {
-				if v, okV := toInt64(existing["version"]); okV && v > 0 {
-					ver = int(v) + 1
-				}
-			}
-			polInner, okInner := polObj["policy"].(map[string]any)
-			if !okInner {
-				polInner = polObj
-			}
-			storedPol := map[string]any{
-				"version":       ver,
-				"modified_date": "2026-01-01T00:00:00.000Z",
-				"policy":        polInner,
-			}
-			s.ilmPolicies[policy] = storedPol
-			s.mu.Unlock()
-			s.persistILMPolicy(r.Context(), policy, storedPol)
 		}
+		if polObj == nil {
+			polObj = map[string]any{"policy": map[string]any{"phases": map[string]any{}}}
+		}
+		s.mu.Lock()
+		if s.ilmPolicies == nil {
+			s.ilmPolicies = make(map[string]map[string]any)
+		}
+		ver := 1
+		if existing, exists := s.ilmPolicies[policy]; exists {
+			if v, okV := toInt64(existing["version"]); okV && v > 0 {
+				ver = int(v) + 1
+			}
+		}
+		polInner, okInner := polObj["policy"].(map[string]any)
+		if !okInner {
+			polInner = polObj
+		}
+		storedPol := map[string]any{
+			"version":       ver,
+			"modified_date": "2026-01-01T00:00:00.000Z",
+			"policy":        polInner,
+		}
+		s.ilmPolicies[policy] = storedPol
+		s.mu.Unlock()
+		s.persistILMPolicy(r.Context(), policy, storedPol)
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 	case http.MethodDelete:
-		if policy != "" {
-			s.mu.Lock()
-			_, exists := s.ilmPolicies[policy]
-			delete(s.ilmPolicies, policy)
-			s.mu.Unlock()
-			if !exists {
-				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "lifecycle policy ["+policy+"] does not exist")
-				return
+		if policy == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: lifecycle policy name is missing;")
+			return
+		}
+		s.mu.Lock()
+		var toDelete []string
+		if strings.ContainsAny(policy, "*?,") || strings.HasPrefix(policy, "-") || policy == "_all" {
+			for k := range s.ilmPolicies {
+				if matchMultiWildcardWithExclusions(policy, k) {
+					toDelete = append(toDelete, k)
+				}
 			}
-			s.deleteILMPolicyCatalog(r.Context(), policy)
+		} else if _, exists := s.ilmPolicies[policy]; exists {
+			toDelete = []string{policy}
+		}
+		for _, k := range toDelete {
+			delete(s.ilmPolicies, k)
+		}
+		s.mu.Unlock()
+		if len(toDelete) == 0 {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "lifecycle policy ["+policy+"] does not exist")
+			return
+		}
+		for _, k := range toDelete {
+			s.deleteILMPolicyCatalog(r.Context(), k)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 	case http.MethodHead:
 		if policy != "" {
 			s.mu.RLock()
-			_, exists := s.ilmPolicies[policy]
+			exists := false
+			if strings.ContainsAny(policy, "*?,") || strings.HasPrefix(policy, "-") || policy == "_all" {
+				for k := range s.ilmPolicies {
+					if matchMultiWildcardWithExclusions(policy, k) {
+						exists = true
+						break
+					}
+				}
+			} else {
+				_, exists = s.ilmPolicies[policy]
+			}
 			s.mu.RUnlock()
 			if !exists {
 				w.WriteHeader(http.StatusNotFound)
@@ -1639,17 +1694,22 @@ func (s *Server) handleILMPolicy(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	default:
 		s.mu.RLock()
-		if policy != "" {
-			if stored, exists := s.ilmPolicies[policy]; exists {
-				cp := deepCloneDocMap(stored)
-				s.mu.RUnlock()
-				writeJSON(w, http.StatusOK, map[string]any{policy: cp})
-				return
-			}
-			if strings.ContainsAny(policy, "*?") {
+		if policy != "" && policy != "_all" && policy != "*" {
+			if strings.ContainsAny(policy, "*?,") || strings.HasPrefix(policy, "-") {
+				for _, part := range strings.Split(policy, ",") {
+					part = strings.TrimSpace(part)
+					if part == "" || strings.HasPrefix(part, "-") || strings.ContainsAny(part, "*?") || part == "_all" {
+						continue
+					}
+					if _, exists := s.ilmPolicies[part]; !exists {
+						s.mu.RUnlock()
+						writeESError(w, http.StatusNotFound, "resource_not_found_exception", "lifecycle policy ["+part+"] does not exist")
+						return
+					}
+				}
 				out := make(map[string]any)
 				for k, v := range s.ilmPolicies {
-					if matchWildcardPattern(policy, k) {
+					if matchMultiWildcardWithExclusions(policy, k) {
 						out[k] = deepCloneDocMap(v)
 					}
 				}
@@ -1657,14 +1717,14 @@ func (s *Server) handleILMPolicy(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusOK, out)
 				return
 			}
+			if stored, exists := s.ilmPolicies[policy]; exists {
+				cp := deepCloneDocMap(stored)
+				s.mu.RUnlock()
+				writeJSON(w, http.StatusOK, map[string]any{policy: cp})
+				return
+			}
 			s.mu.RUnlock()
-			writeJSON(w, http.StatusOK, map[string]any{
-				policy: map[string]any{
-					"version":       1,
-					"modified_date": "2026-01-01T00:00:00.000Z",
-					"policy":        map[string]any{"phases": map[string]any{"hot": map[string]any{"actions": map[string]any{}}}},
-				},
-			})
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "lifecycle policy ["+policy+"] does not exist")
 			return
 		}
 		out := make(map[string]any, len(s.ilmPolicies))
@@ -1934,7 +1994,44 @@ func (s *Server) handleCatAliases(w http.ResponseWriter, r *http.Request) {
 	writeCatResponse(w, r, []string{"alias", "index", "filter", "routing.index", "routing.search", "is_write_index"}, list)
 }
 
+func (s *Server) handleCatRoot(w http.ResponseWriter, r *http.Request) {
+	endpoints := []string{
+		"/_cat/allocation",
+		"/_cat/shards",
+		"/_cat/master",
+		"/_cat/nodes",
+		"/_cat/tasks",
+		"/_cat/indices",
+		"/_cat/segments",
+		"/_cat/count",
+		"/_cat/recovery",
+		"/_cat/health",
+		"/_cat/pending_tasks",
+		"/_cat/aliases",
+		"/_cat/thread_pool",
+		"/_cat/plugins",
+		"/_cat/fielddata",
+		"/_cat/nodeattrs",
+		"/_cat/repositories",
+		"/_cat/snapshots",
+		"/_cat/templates",
+	}
+	if strings.EqualFold(r.URL.Query().Get("format"), "json") || strings.Contains(r.Header.Get("Accept"), "application/json") {
+		writeJSON(w, http.StatusOK, endpoints)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("=^.^=\n" + strings.Join(endpoints, "\n") + "\n"))
+}
+
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
+	rawIndex := strings.TrimSpace(r.PathValue("index"))
+	if rawIndex != "" {
+		if _, _, ok := s.resolveValidatedReadTargets(w, r, rawIndex); !ok {
+			return
+		}
+	}
 	_ = s.coalescer.FlushAll(r.Context())
 	s.queryCache.InvalidateAll()
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -2237,11 +2334,15 @@ func matchesTemplateNamePatterns(name string, patterns []string) bool {
 }
 
 func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
+	name := strings.TrimSpace(r.PathValue("name"))
 	isComponent := strings.Contains(r.URL.Path, "_component_template")
 	if isComponent {
 		switch r.Method {
 		case http.MethodPut, http.MethodPost:
+			if name == "" {
+				writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: name is missing;")
+				return
+			}
 			var comp map[string]any
 			bodyBytes, ok := readRequestBody(w, r)
 			if !ok {
@@ -2336,16 +2437,40 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"component_templates": list})
 		case http.MethodDelete:
+			if name == "" {
+				writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: name is missing;")
+				return
+			}
 			_ = s.syncCatalogFromBackend(r.Context())
+			patterns := []string{"*"}
+			if name != "_all" {
+				patterns = strings.Split(name, ",")
+				for i := range patterns {
+					patterns[i] = strings.TrimSpace(patterns[i])
+				}
+			}
 			s.mu.Lock()
-			_, existed := s.componentTemplates[name]
-			delete(s.componentTemplates, name)
+			var toDelete []string
+			if strings.ContainsAny(name, "*?,") || strings.HasPrefix(name, "-") || name == "_all" {
+				for k := range s.componentTemplates {
+					if matchesTemplateNamePatterns(k, patterns) {
+						toDelete = append(toDelete, k)
+					}
+				}
+			} else if _, existed := s.componentTemplates[name]; existed {
+				toDelete = []string{name}
+			}
+			for _, k := range toDelete {
+				delete(s.componentTemplates, k)
+			}
 			s.mu.Unlock()
-			if !existed {
+			if len(toDelete) == 0 {
 				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "component_template ["+name+"] missing")
 				return
 			}
-			s.deleteCatalogEntity(r.Context(), "component_template", name)
+			for _, k := range toDelete {
+				s.deleteCatalogEntity(r.Context(), "component_template", k)
+			}
 			s.queryCache.InvalidateAll()
 			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 		default:
@@ -2355,6 +2480,10 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodPut, http.MethodPost:
+		if name == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: name is missing;")
+			return
+		}
 		var tpl esast.IndexTemplateRequest
 		bodyBytes, ok := readRequestBody(w, r)
 		if !ok {
@@ -2458,16 +2587,40 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 		s.mu.RUnlock()
 		writeJSON(w, http.StatusOK, map[string]any{"index_templates": list})
 	case http.MethodDelete:
+		if name == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: name is missing;")
+			return
+		}
 		_ = s.syncCatalogFromBackend(r.Context())
+		patterns := []string{"*"}
+		if name != "_all" {
+			patterns = strings.Split(name, ",")
+			for i := range patterns {
+				patterns[i] = strings.TrimSpace(patterns[i])
+			}
+		}
 		s.mu.Lock()
-		_, existed := s.templates[name]
-		delete(s.templates, name)
+		var toDelete []string
+		if strings.ContainsAny(name, "*?,") || strings.HasPrefix(name, "-") || name == "_all" {
+			for k := range s.templates {
+				if matchesTemplateNamePatterns(k, patterns) {
+					toDelete = append(toDelete, k)
+				}
+			}
+		} else if _, existed := s.templates[name]; existed {
+			toDelete = []string{name}
+		}
+		for _, k := range toDelete {
+			delete(s.templates, k)
+		}
 		s.mu.Unlock()
-		if !existed {
+		if len(toDelete) == 0 {
 			writeESError(w, http.StatusNotFound, "index_template_missing_exception", "index_template ["+name+"] missing")
 			return
 		}
-		s.deleteCatalogEntity(r.Context(), "template", name)
+		for _, k := range toDelete {
+			s.deleteCatalogEntity(r.Context(), "template", k)
+		}
 		s.queryCache.InvalidateAll()
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 	default:
@@ -2547,8 +2700,126 @@ func (s *Server) matchingTemplateConfigLocked(indexName string) (*esast.MappingS
 	return merged, defaultPipeline, hasDefaultPipeline, finalPipeline, hasFinalPipeline, mergedAliases
 }
 
+func validateESIndexName(name string) (string, bool) {
+	if name == "" {
+		return "index name may not be empty", false
+	}
+	if name == "." || name == ".." {
+		return fmt.Sprintf("Invalid index name [%s], must not be '.' or '..'", name), false
+	}
+	if strings.HasPrefix(name, "-") || strings.HasPrefix(name, "_") || strings.HasPrefix(name, "+") {
+		return fmt.Sprintf("Invalid index name [%s], must not start with '_', '-', or '+'", name), false
+	}
+	if strings.ToLower(name) != name {
+		return fmt.Sprintf("Invalid index name [%s], must be lowercase", name), false
+	}
+	if len(name) > 255 {
+		return fmt.Sprintf("Invalid index name [%s], index name is too long, (%d > 255)", name, len(name)), false
+	}
+	if strings.ContainsAny(name, "\\/*?\"<>| ,#:") {
+		return fmt.Sprintf("Invalid index name [%s], must not contain the following characters [\\, /, *, ?, \", <, >, |,  , ,, #, :]", name), false
+	}
+	for i := 0; i < len(name); i++ {
+		if name[i] < 0x20 || name[i] == 0x7f {
+			return fmt.Sprintf("Invalid index name [%s], must not contain control characters", name), false
+		}
+	}
+	return "", true
+}
+
+func (s *Server) resolveValidatedReadTargets(w http.ResponseWriter, r *http.Request, rawIndex string) ([]string, map[string]*esast.Query, bool) {
+	_ = s.syncCatalogFromBackend(r.Context())
+	rawIndex = strings.TrimSpace(rawIndex)
+	ew := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("expand_wildcards")))
+	if (ew == "none" || ew == "closed") && (strings.ContainsAny(rawIndex, "*?") || rawIndex == "_all") {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusNotFound)
+			return nil, nil, false
+		}
+		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
+		return nil, nil, false
+	}
+	ignoreUnavailable := isTruthyBoolQueryParam(r, "ignore_unavailable")
+	allowNoIndices := true
+	hasExplicitAllowNoIndices := false
+	if rawAllow := strings.TrimSpace(r.URL.Query().Get("allow_no_indices")); rawAllow != "" {
+		hasExplicitAllowNoIndices = true
+		allowNoIndices = isTruthyBoolQueryParam(r, "allow_no_indices")
+	}
+
+	s.mu.RLock()
+	var missingConcrete string
+	if rawIndex != "" && rawIndex != "_all" && rawIndex != "*" {
+		for _, part := range strings.Split(rawIndex, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" || strings.HasPrefix(part, "-") || strings.ContainsAny(part, "*?") || part == "_all" {
+				continue
+			}
+			_, isIdx := s.indices[part]
+			_, isAlias := s.aliases[part]
+			_, isDS := s.dataStreams[part]
+			if !isIdx && !isAlias && !isDS && strings.HasPrefix(part, ".ds-") && strings.HasSuffix(part, "-000001") {
+				dsName := strings.TrimSuffix(strings.TrimPrefix(part, ".ds-"), "-000001")
+				if _, okDS := s.dataStreams[dsName]; okDS {
+					isDS = true
+				}
+			}
+			if !isIdx && !isAlias && !isDS && missingConcrete == "" {
+				missingConcrete = part
+			}
+		}
+	}
+	s.mu.RUnlock()
+
+	if missingConcrete != "" && !ignoreUnavailable {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusNotFound)
+			return nil, nil, false
+		}
+		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+missingConcrete+"]")
+		return nil, nil, false
+	}
+
+	targets, aliasFilters := s.resolveTargetIndicesWithFilters(rawIndex)
+	s.mu.RLock()
+	var validTargets []string
+	for _, t := range targets {
+		if _, ok := s.indices[t]; ok {
+			validTargets = append(validTargets, t)
+		} else if strings.HasPrefix(t, ".ds-") && strings.HasSuffix(t, "-000001") {
+			dsName := strings.TrimSuffix(strings.TrimPrefix(t, ".ds-"), "-000001")
+			if _, isDS := s.dataStreams[dsName]; isDS {
+				if _, okDS := s.indices[dsName]; okDS {
+					validTargets = append(validTargets, t)
+				}
+			}
+		}
+	}
+	s.mu.RUnlock()
+
+	if len(validTargets) == 0 && rawIndex != "" {
+		if !allowNoIndices || (!hasExplicitAllowNoIndices && !ignoreUnavailable && !strings.ContainsAny(rawIndex, "*?,") && !strings.HasPrefix(rawIndex, "-") && rawIndex != "_all") {
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusNotFound)
+				return nil, nil, false
+			}
+			errName := rawIndex
+			if missingConcrete != "" {
+				errName = missingConcrete
+			}
+			writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+errName+"]")
+			return nil, nil, false
+		}
+	}
+	return validTargets, aliasFilters, true
+}
+
 func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 	indexName := r.PathValue("index")
+	if reason, ok := validateESIndexName(indexName); !ok {
+		writeESError(w, http.StatusBadRequest, "invalid_index_name_exception", reason)
+		return
+	}
 	var req esast.IndexCreateRequest
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
@@ -2676,16 +2947,14 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetIndex(w http.ResponseWriter, r *http.Request) {
-	_ = s.syncCatalogFromBackend(r.Context())
-	targets := s.resolveTargetIndices(r.PathValue("index"))
-	if len(targets) == 0 {
-		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+r.PathValue("index")+"]")
+	targets, _, ok := s.resolveValidatedReadTargets(w, r, r.PathValue("index"))
+	if !ok {
 		return
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	resp := make(map[string]any)
+	resp := make(map[string]any, len(targets))
 	for _, indexName := range targets {
 		idx, ok := s.indices[indexName]
 		if !ok {
@@ -2724,10 +2993,6 @@ func (s *Server) handleGetIndex(w http.ResponseWriter, r *http.Request) {
 			"mappings": mappings,
 			"settings": map[string]any{"index": idxSettings},
 		}
-	}
-	if len(resp) == 0 {
-		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+r.PathValue("index")+"]")
-		return
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -2959,13 +3224,22 @@ func (s *Server) handleGetAllMappings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetMapping(w http.ResponseWriter, r *http.Request) {
-	_ = s.syncCatalogFromBackend(r.Context())
 	rawIndex := r.PathValue("index")
-	targets := s.resolveTargetIndices(rawIndex)
+	targets, _, ok := s.resolveValidatedReadTargets(w, r, rawIndex)
+	if !ok {
+		return
+	}
 	s.mu.RLock()
 	out := make(map[string]any, len(targets))
 	for _, indexName := range targets {
-		if idx, ok := s.indices[indexName]; ok {
+		idx, exists := s.indices[indexName]
+		if !exists && strings.HasPrefix(indexName, ".ds-") && strings.HasSuffix(indexName, "-000001") {
+			dsName := strings.TrimSuffix(strings.TrimPrefix(indexName, ".ds-"), "-000001")
+			if _, isDS := s.dataStreams[dsName]; isDS {
+				idx, exists = s.indices[dsName]
+			}
+		}
+		if exists {
 			props := map[string]esast.FieldProperty{}
 			if idx.RawMapping != nil {
 				props = idx.RawMapping.Properties
@@ -2985,35 +3259,7 @@ func (s *Server) handleGetMapping(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if len(out) == 0 && strings.HasPrefix(rawIndex, ".ds-") && strings.HasSuffix(rawIndex, "-000001") {
-		dsName := strings.TrimSuffix(strings.TrimPrefix(rawIndex, ".ds-"), "-000001")
-		if _, isDS := s.dataStreams[dsName]; isDS {
-			if idx, ok := s.indices[dsName]; ok {
-				props := map[string]esast.FieldProperty{}
-				if idx.RawMapping != nil {
-					props = idx.RawMapping.Properties
-				}
-				mappings := map[string]any{"properties": props}
-				if idx.RawMapping != nil && len(idx.RawMapping.Runtime) > 0 {
-					mappings["runtime"] = idx.RawMapping.Runtime
-				}
-				if idx.RawMapping != nil && idx.RawMapping.Dynamic != nil {
-					mappings["dynamic"] = idx.RawMapping.Dynamic
-				}
-				if idx.RawMapping != nil && idx.RawMapping.Routing != nil && idx.RawMapping.Routing.Required {
-					mappings["_routing"] = map[string]any{"required": true}
-				}
-				out[rawIndex] = map[string]any{
-					"mappings": mappings,
-				}
-			}
-		}
-	}
 	s.mu.RUnlock()
-	if len(out) == 0 && !strings.ContainsAny(rawIndex, "*,") && rawIndex != "_all" {
-		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
-		return
-	}
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -3289,15 +3535,9 @@ func (s *Server) handleGetIndexAliases(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
 		return
 	}
-	_ = s.syncCatalogFromBackend(r.Context())
 	rawIndex := r.PathValue("index")
-	targets := s.resolveTargetIndices(rawIndex)
-	if len(targets) == 0 {
-		if r.Method == http.MethodHead {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
+	targets, _, ok := s.resolveValidatedReadTargets(w, r, rawIndex)
+	if !ok {
 		return
 	}
 	s.mu.RLock()
@@ -3319,14 +3559,6 @@ func (s *Server) handleGetIndexAliases(w http.ResponseWriter, r *http.Request) {
 		out[indexName] = map[string]any{"aliases": idxAliases}
 	}
 	s.mu.RUnlock()
-	if len(out) == 0 {
-		if r.Method == http.MethodHead {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
-		return
-	}
 	if r.Method == http.MethodHead {
 		if totalAliases == 0 {
 			w.WriteHeader(http.StatusNotFound)
@@ -3599,11 +3831,41 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 	for k := range s.indices {
 		simulatedIndices[k] = true
 	}
+	simulatedAliases := make(map[string]map[string]bool, len(s.aliases))
+	for al, tList := range s.aliases {
+		m := make(map[string]bool, len(tList))
+		for _, t := range tList {
+			m[t] = true
+		}
+		simulatedAliases[al] = m
+	}
+	writeIndexSetForAlias := make(map[string]string)
 	for _, action := range payload.Actions {
+		if len(action) == 0 {
+			s.mu.Unlock()
+			writeESError(w, http.StatusBadRequest, "parsing_exception", "action object must specify one of [add, remove, remove_index]")
+			return
+		}
+		for actType := range action {
+			if actType != "add" && actType != "remove" && actType != "remove_index" {
+				s.mu.Unlock()
+				writeESError(w, http.StatusBadRequest, "parsing_exception", fmt.Sprintf("unknown alias action [%s]", actType))
+				return
+			}
+		}
 		if add, ok := action["add"]; ok {
 			rawIndices := add.Indices
 			if add.Index != "" {
 				rawIndices = append(rawIndices, add.Index)
+			}
+			rawAliases := add.Aliases
+			if add.Alias != "" {
+				rawAliases = append(rawAliases, add.Alias)
+			}
+			if len(rawIndices) == 0 || len(rawAliases) == 0 {
+				s.mu.Unlock()
+				writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: index and alias are required for [add];")
+				return
 			}
 			for _, pat := range rawIndices {
 				pat = strings.TrimSpace(pat)
@@ -3619,11 +3881,7 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 				writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+strings.Join(rawIndices, ",")+"]")
 				return
 			}
-			aliases := add.Aliases
-			if add.Alias != "" {
-				aliases = append(aliases, add.Alias)
-			}
-			for _, al := range aliases {
+			for _, al := range rawAliases {
 				if simulatedIndices[al] {
 					s.mu.Unlock()
 					writeESError(w, http.StatusBadRequest, "invalid_alias_name_exception", fmt.Sprintf("Invalid alias name [%s], an index exists with the same name as the alias", al))
@@ -3634,12 +3892,40 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 					writeESError(w, http.StatusBadRequest, "invalid_alias_name_exception", fmt.Sprintf("Invalid alias name [%s], a data stream exists with the same name as the alias", al))
 					return
 				}
+				if add.IsWriteIndex != nil && *add.IsWriteIndex {
+					if len(indices) > 1 {
+						s.mu.Unlock()
+						writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("Alias [%s] has more than one write index", al))
+						return
+					}
+					if prevIdx, hadPrev := writeIndexSetForAlias[al]; hadPrev && prevIdx != indices[0] {
+						s.mu.Unlock()
+						writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("Alias [%s] has more than one write index [%s, %s]", al, prevIdx, indices[0]))
+						return
+					}
+					writeIndexSetForAlias[al] = indices[0]
+				}
+				if simulatedAliases[al] == nil {
+					simulatedAliases[al] = make(map[string]bool)
+				}
+				for _, idx := range indices {
+					simulatedAliases[al][idx] = true
+				}
 			}
 		}
 		if rem, ok := action["remove"]; ok {
 			rawIndices := rem.Indices
 			if rem.Index != "" {
 				rawIndices = append(rawIndices, rem.Index)
+			}
+			rawAliases := rem.Aliases
+			if rem.Alias != "" {
+				rawAliases = append(rawAliases, rem.Alias)
+			}
+			if len(rawIndices) == 0 || len(rawAliases) == 0 {
+				s.mu.Unlock()
+				writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: index and alias are required for [remove];")
+				return
 			}
 			for _, pat := range rawIndices {
 				pat = strings.TrimSpace(pat)
@@ -3649,14 +3935,51 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+			indices := expandIndexListLocked(rawIndices)
+			for _, al := range rawAliases {
+				al = strings.TrimSpace(al)
+				if al == "" || strings.ContainsAny(al, "*?") || al == "_all" {
+					continue
+				}
+				foundOnTarget := false
+				if idxMap := simulatedAliases[al]; idxMap != nil {
+					for _, idx := range indices {
+						if idxMap[idx] {
+							foundOnTarget = true
+							delete(idxMap, idx)
+						}
+					}
+				}
+				if !foundOnTarget {
+					s.mu.Unlock()
+					writeESError(w, http.StatusNotFound, "aliases_not_found_exception", fmt.Sprintf("aliases [%s] missing", al))
+					return
+				}
+			}
 		}
 		if remIdx, ok := action["remove_index"]; ok {
 			rawIndices := remIdx.Indices
 			if remIdx.Index != "" {
 				rawIndices = append(rawIndices, remIdx.Index)
 			}
+			if len(rawIndices) == 0 {
+				s.mu.Unlock()
+				writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: index is required for [remove_index];")
+				return
+			}
+			for _, pat := range rawIndices {
+				pat = strings.TrimSpace(pat)
+				if pat != "" && !strings.ContainsAny(pat, "*?") && pat != "_all" && !simulatedIndices[pat] {
+					s.mu.Unlock()
+					writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+pat+"]")
+					return
+				}
+			}
 			for _, indexName := range expandIndexListLocked(rawIndices) {
 				delete(simulatedIndices, indexName)
+				for _, idxMap := range simulatedAliases {
+					delete(idxMap, indexName)
+				}
 			}
 		}
 	}
@@ -3776,6 +4099,15 @@ func (s *Server) addAliasWithMetaLocked(alias, indexName string, meta AliasMetad
 	}
 	if !found {
 		s.aliases[alias] = append(existing, indexName)
+	}
+	if meta.IsWriteIndex != nil && *meta.IsWriteIndex && s.aliasMeta[alias] != nil {
+		for otherIdx, otherMeta := range s.aliasMeta[alias] {
+			if otherIdx != indexName && otherMeta.IsWriteIndex != nil && *otherMeta.IsWriteIndex {
+				falseVal := false
+				otherMeta.IsWriteIndex = &falseVal
+				s.aliasMeta[alias][otherIdx] = otherMeta
+			}
+		}
 	}
 	if !meta.isEmpty() {
 		if s.aliasMeta[alias] == nil {
@@ -5147,6 +5479,67 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, respPayload)
 }
 
+type sliceSpec struct {
+	ID  *int `json:"id,omitempty"`
+	Max *int `json:"max,omitempty"`
+}
+
+func parseAndValidateSliceParams(r *http.Request, bodySlices any, bodySlice *sliceSpec) (int, int, bool, int, string, string) {
+	if slicesQuery := strings.TrimSpace(r.URL.Query().Get("slices")); slicesQuery != "" {
+		if !strings.EqualFold(slicesQuery, "auto") {
+			n, err := strconv.Atoi(slicesQuery)
+			if err != nil || n <= 0 {
+				return 0, 0, false, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("slices must be a positive integer or \"auto\" but was [%s]", slicesQuery)
+			}
+		}
+	} else if bodySlices != nil {
+		switch v := bodySlices.(type) {
+		case string:
+			s := strings.TrimSpace(v)
+			if !strings.EqualFold(s, "auto") {
+				n, err := strconv.Atoi(s)
+				if err != nil || n <= 0 {
+					return 0, 0, false, http.StatusBadRequest, "illegal_argument_exception",
+						fmt.Sprintf("slices must be a positive integer or \"auto\" but was [%s]", s)
+				}
+			}
+		default:
+			fv, ok := toFloat64(v)
+			if !ok || fv <= 0 || fv != math.Trunc(fv) {
+				return 0, 0, false, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("slices must be a positive integer or \"auto\" but was [%v]", v)
+			}
+		}
+	}
+	if bodySlice != nil {
+		if bodySlice.ID == nil || bodySlice.Max == nil {
+			return 0, 0, false, http.StatusBadRequest, "action_request_validation_exception",
+				"Validation Failed: 1: slice id and max are required;"
+		}
+		id := *bodySlice.ID
+		maxVal := *bodySlice.Max
+		if id < 0 || maxVal <= 1 || id >= maxVal {
+			return 0, 0, false, http.StatusBadRequest, "illegal_argument_exception",
+				fmt.Sprintf("invalid slice: id [%d] must be >= 0 and < max [%d] (with max > 1)", id, maxVal)
+		}
+		return id, maxVal, true, 0, "", ""
+	}
+	return 0, 0, false, 0, "", ""
+}
+
+func docMatchesSlice(docID string, sliceID, sliceMax int) bool {
+	if sliceMax <= 1 {
+		return sliceID == 0
+	}
+	var h uint32 = 2166136261
+	for i := 0; i < len(docID); i++ {
+		h ^= uint32(docID[i])
+		h *= 16777619
+	}
+	return int64(h)%int64(sliceMax) == int64(sliceID)
+}
+
 func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	rawIndex := r.PathValue("index")
@@ -5169,6 +5562,8 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 		Size              *int                 `json:"size,omitempty"`
 		Conflicts         string               `json:"conflicts,omitempty"`
 		RequestsPerSecond any                  `json:"requests_per_second,omitempty"`
+		Slices            any                  `json:"slices,omitempty"`
+		Slice             *sliceSpec           `json:"slice,omitempty"`
 		Pipeline          string               `json:"pipeline,omitempty"`
 		Query             *esast.Query         `json:"query,omitempty"`
 		Script            *painless.ScriptSpec `json:"script,omitempty"`
@@ -5182,6 +5577,11 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
 			return
 		}
+	}
+	sliceID, sliceMax, hasSlice, sliceErrStatus, sliceErrType, sliceErrReason := parseAndValidateSliceParams(r, body.Slices, body.Slice)
+	if sliceErrStatus != 0 {
+		writeESError(w, sliceErrStatus, sliceErrType, sliceErrReason)
+		return
 	}
 	if body.Query == nil && r.URL.Query().Get("q") != "" {
 		tmpReq := esast.SearchRequest{}
@@ -5266,7 +5666,7 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 
 		for {
 			fetchSize := batchLimit
-			if !hasRuntimeQueryScript && effSearchRouting == "" && maxDocs > 0 && totalMatched+fetchSize > maxDocs {
+			if !hasRuntimeQueryScript && !hasSlice && effSearchRouting == "" && maxDocs > 0 && totalMatched+fetchSize > maxDocs {
 				fetchSize = maxDocs - totalMatched
 			}
 			if fetchSize <= 0 || (maxDocs > 0 && totalMatched >= maxDocs) {
@@ -5317,6 +5717,9 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 			for _, h := range hits {
 				if maxDocs > 0 && totalMatched >= maxDocs {
 					break
+				}
+				if hasSlice && !docMatchesSlice(h.ID, sliceID, sliceMax) {
+					continue
 				}
 				if effSearchRouting != "" && !s.docMatchesRequestRouting(indexName, h.ID, effSearchRouting) {
 					continue
@@ -5640,6 +6043,8 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 		Size              *int         `json:"size,omitempty"`
 		Conflicts         string       `json:"conflicts,omitempty"`
 		RequestsPerSecond any          `json:"requests_per_second,omitempty"`
+		Slices            any          `json:"slices,omitempty"`
+		Slice             *sliceSpec   `json:"slice,omitempty"`
 		Query             *esast.Query `json:"query,omitempty"`
 	}
 	bodyBytes, ok := readRequestBody(w, r)
@@ -5651,6 +6056,11 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
 			return
 		}
+	}
+	sliceID, sliceMax, hasSlice, sliceErrStatus, sliceErrType, sliceErrReason := parseAndValidateSliceParams(r, body.Slices, body.Slice)
+	if sliceErrStatus != 0 {
+		writeESError(w, sliceErrStatus, sliceErrType, sliceErrReason)
+		return
 	}
 	if body.Query == nil && r.URL.Query().Get("q") != "" {
 		tmpReq := esast.SearchRequest{}
@@ -5728,7 +6138,7 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 
 		for {
 			fetchSize := batchLimit
-			if !hasRuntimeQueryScript && effSearchRouting == "" && maxDocs > 0 && totalDeleted+fetchSize > maxDocs {
+			if !hasRuntimeQueryScript && !hasSlice && effSearchRouting == "" && maxDocs > 0 && totalDeleted+fetchSize > maxDocs {
 				fetchSize = maxDocs - totalDeleted
 			}
 			if fetchSize <= 0 || (maxDocs > 0 && totalDeleted >= maxDocs) {
@@ -5767,6 +6177,9 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 			for _, h := range hits {
 				if maxDocs > 0 && totalDeleted >= maxDocs {
 					break
+				}
+				if hasSlice && !docMatchesSlice(h.ID, sliceID, sliceMax) {
+					continue
 				}
 				if effSearchRouting != "" && !s.docMatchesRequestRouting(indexName, h.ID, effSearchRouting) {
 					continue
@@ -9745,6 +10158,8 @@ func aggTypePrefix(spec esast.AggSpec) string {
 		return "bucket_selector"
 	case spec.RareTerms != nil:
 		return "rare_terms"
+	case spec.MultiTerms != nil:
+		return "multi_terms"
 	case spec.AutoDateHistogram != nil:
 		return "auto_date_histogram"
 	case spec.VariableWidthHistogram != nil:
@@ -11522,6 +11937,38 @@ func (s *Server) populateCollapseInnerHits(
 					maxGroupScore = g.Score
 				}
 			}
+			subCollapseField := ""
+			if ihSpec.Collapse != nil {
+				subCollapseField = strings.TrimSpace(ihSpec.Collapse.Field)
+			}
+			subCollapseKeyByDoc := make(map[string]any)
+			if subCollapseField != "" && len(sortedGroup) > 0 {
+				deduped := make([]HitRow, 0, len(sortedGroup))
+				seenSubKey := make(map[string]struct{}, len(sortedGroup))
+				for _, cand := range sortedGroup {
+					cSchema := schemasByIndex[cand.Index]
+					if cSchema == nil {
+						cSchema = primarySchema
+					}
+					vals := collectCollapseCandidateValues(cand, subCollapseField, cSchema)
+					for _, v := range vals {
+						if v == nil {
+							continue
+						}
+						sk := normalizeCollapseGroupKey(v, subCollapseField, primarySchema, cSchema)
+						if sk == "" {
+							continue
+						}
+						if _, exists := seenSubKey[sk]; !exists {
+							seenSubKey[sk] = struct{}{}
+							subCollapseKeyByDoc[cand.Index+"\x00"+cand.ID] = v
+							deduped = append(deduped, cand)
+							break
+						}
+					}
+				}
+				sortedGroup = deduped
+			}
 			ihFrom := ihSpec.From
 			if ihFrom < 0 {
 				ihFrom = 0
@@ -11575,6 +12022,26 @@ func (s *Server) populateCollapseInnerHits(
 				}
 				if len(ihFieldSpecs) > 0 {
 					if fm := extractHitFieldsMap(gh, gIdx, ihSyntheticReq, gSchema); len(fm) > 0 {
+						ghMap["fields"] = fm
+					}
+				}
+				if subCollapseField != "" {
+					subVal, hasSubVal := subCollapseKeyByDoc[gh.Index+"\x00"+gh.ID]
+					if !hasSubVal {
+						subSort := []esast.SortSpec{{Entry: esast.SortEntry{Field: subCollapseField}}}
+						if sVals := extractHitSortValues(gh, subSort, gSchema); len(sVals) > 0 && sVals[0] != nil {
+							subVal = sVals[0]
+							hasSubVal = true
+						}
+					}
+					if hasSubVal && subVal != nil {
+						fm, _ := ghMap["fields"].(map[string][]any)
+						if fm == nil {
+							fm = make(map[string][]any)
+						}
+						if _, exists := fm[subCollapseField]; !exists {
+							fm[subCollapseField] = []any{subVal}
+						}
 						ghMap["fields"] = fm
 					}
 				}
@@ -11716,13 +12183,13 @@ func buildAggsMapWithSchema(
 			}
 			for _, r := range rows {
 				docCnt := r.effectiveCount()
-				var keyVal any = r.BucketKey
-				if r.BucketKey == "__ES_MISSING_BUCKET__" {
-					keyVal = nil
-				}
+				keyVal, keyAsStr, hasKeyAsStr := formatTermsBucketKeyAndString(r.BucketKey, termsSpec, idxSchema)
 				bucketMap := map[string]any{
 					"key":       keyVal,
 					"doc_count": docCnt,
+				}
+				if hasKeyAsStr {
+					bucketMap["key_as_string"] = keyAsStr
 				}
 				if isSig {
 					fgProb := float64(docCnt) / bgDenom
@@ -12324,7 +12791,7 @@ func buildAggsMapWithSchema(
 			aggsOut[aggName] = buildTopMetricsObject(rows, spec.TopMetrics, docLookup)
 		case spec.Composite != nil:
 			aggsOut[aggName] = buildCompositeAggObjectWithSchema(indexName, fullKey, "", spec.Composite, spec.SubAggs(), rows, bucketsByAgg, docLookup, idxSchema)
-		case spec.RareTerms != nil || spec.AutoDateHistogram != nil || spec.VariableWidthHistogram != nil ||
+		case spec.RareTerms != nil || spec.MultiTerms != nil || spec.AutoDateHistogram != nil || spec.VariableWidthHistogram != nil ||
 			spec.GeoDistance != nil || spec.GeohashGrid != nil || spec.GeotileGrid != nil || spec.AdjacencyMatrix != nil:
 			aggsOut[aggName] = formatRuntimeBucketAggObjectWithSchema(indexName, fullKey, "", spec, rows, bucketsByAgg, docLookup, idxSchema)
 		case spec.WeightedAvg != nil || spec.MedianAbsoluteDeviation != nil || spec.GeoBounds != nil ||
@@ -13570,7 +14037,7 @@ func matchesTermsFilterPrecompiled(key string, filter any, precompiled *regexp.R
 }
 
 func isBucketAggSpec(spec esast.AggSpec) bool {
-	return spec.EffectiveTerms() != nil || spec.RareTerms != nil || spec.Histogram != nil ||
+	return spec.EffectiveTerms() != nil || spec.RareTerms != nil || spec.MultiTerms != nil || spec.Histogram != nil ||
 		spec.DateHistogram != nil || spec.AutoDateHistogram != nil || spec.VariableWidthHistogram != nil ||
 		spec.Filters != nil || spec.AdjacencyMatrix != nil || spec.Range != nil || spec.DateRange != nil ||
 		spec.IPRange != nil || spec.GeoDistance != nil || spec.GeohashGrid != nil || spec.GeotileGrid != nil ||
@@ -13579,7 +14046,7 @@ func isBucketAggSpec(spec esast.AggSpec) bool {
 }
 
 func isMultiBucketAggSpec(spec esast.AggSpec) bool {
-	return spec.EffectiveTerms() != nil || spec.RareTerms != nil || spec.Histogram != nil ||
+	return spec.EffectiveTerms() != nil || spec.RareTerms != nil || spec.MultiTerms != nil || spec.Histogram != nil ||
 		spec.DateHistogram != nil || spec.AutoDateHistogram != nil || spec.VariableWidthHistogram != nil ||
 		spec.Filters != nil || spec.AdjacencyMatrix != nil || spec.Range != nil || spec.DateRange != nil ||
 		spec.IPRange != nil || spec.GeoDistance != nil || spec.GeohashGrid != nil || spec.GeotileGrid != nil ||
@@ -13601,6 +14068,9 @@ func isKeyedBucketAggSpec(spec esast.AggSpec) bool {
 	}
 	if spec.GeoDistance != nil {
 		return spec.GeoDistance.Keyed
+	}
+	if spec.AdjacencyMatrix != nil {
+		return spec.AdjacencyMatrix.Keyed
 	}
 	if spec.Histogram != nil {
 		return spec.Histogram.Keyed
@@ -16859,13 +17329,13 @@ func attachSubAggsToBucketWithSchema(
 			childBuckets := make([]map[string]any, 0, len(matchingRows))
 			for _, r := range matchingRows {
 				docCnt := r.effectiveCount()
-				var keyVal any = r.BucketKey
-				if r.BucketKey == "__ES_MISSING_BUCKET__" {
-					keyVal = nil
-				}
+				keyVal, keyAsStr, hasKeyAsStr := formatTermsBucketKeyAndString(r.BucketKey, tSpec, idxSchema)
 				cb := map[string]any{
 					"key":       keyVal,
 					"doc_count": docCnt,
+				}
+				if hasKeyAsStr {
+					cb["key_as_string"] = keyAsStr
 				}
 				if isSig {
 					fgProb := float64(docCnt) / bgDenom
@@ -16928,7 +17398,7 @@ func attachSubAggsToBucketWithSchema(
 				}
 			}
 			bucketMap[subName] = buildCompositeAggObjectWithSchema(indexName, subFullKey, parentBucketKey, subSpec.Composite, subSpec.SubAggs(), matchingRows, bucketsByAgg, docLookup, idxSchema)
-		case subSpec.RareTerms != nil || subSpec.AutoDateHistogram != nil || subSpec.VariableWidthHistogram != nil ||
+		case subSpec.RareTerms != nil || subSpec.MultiTerms != nil || subSpec.AutoDateHistogram != nil || subSpec.VariableWidthHistogram != nil ||
 			subSpec.GeoDistance != nil || subSpec.GeohashGrid != nil || subSpec.GeotileGrid != nil || subSpec.AdjacencyMatrix != nil:
 			bucketMap[subName] = formatRuntimeBucketAggObjectWithSchema(indexName, subFullKey, parentBucketKey, subSpec, subRows, bucketsByAgg, docLookup, idxSchema)
 		case subSpec.WeightedAvg != nil || subSpec.MedianAbsoluteDeviation != nil || subSpec.GeoBounds != nil ||
@@ -20654,7 +21124,7 @@ func queryHasMinScore(q *esast.Query) bool {
 }
 
 func aggSpecHasDirectRuntimeScript(spec esast.AggSpec) bool {
-	if spec.RareTerms != nil || spec.AutoDateHistogram != nil || spec.VariableWidthHistogram != nil ||
+	if spec.RareTerms != nil || spec.MultiTerms != nil || spec.AutoDateHistogram != nil || spec.VariableWidthHistogram != nil ||
 		spec.WeightedAvg != nil || spec.MedianAbsoluteDeviation != nil ||
 		spec.GeoBounds != nil || spec.GeoCentroid != nil || spec.GeoDistance != nil ||
 		spec.GeohashGrid != nil || spec.GeotileGrid != nil ||
@@ -22978,6 +23448,275 @@ func approximateTwoSidedTTestPValue(tStat, df float64) float64 {
 	return math.Erfc(x / math.Sqrt2)
 }
 
+func formatTermsNumericPattern(fv float64, fmtPattern string) string {
+	fmtPattern = strings.TrimSpace(fmtPattern)
+	if fmtPattern == "" {
+		return strconv.FormatFloat(fv, 'f', -1, 64)
+	}
+	dotIdx := strings.IndexByte(fmtPattern, '.')
+	decPlaces := 0
+	minIntDigits := 0
+	intPartPat := fmtPattern
+	if dotIdx >= 0 {
+		intPartPat = fmtPattern[:dotIdx]
+		decPartPat := fmtPattern[dotIdx+1:]
+		for i := 0; i < len(decPartPat); i++ {
+			if decPartPat[i] == '0' || decPartPat[i] == '#' {
+				decPlaces++
+			}
+		}
+	}
+	for i := 0; i < len(intPartPat); i++ {
+		if intPartPat[i] == '0' {
+			minIntDigits++
+		}
+	}
+	formatted := strconv.FormatFloat(fv, 'f', decPlaces, 64)
+	neg := strings.HasPrefix(formatted, "-")
+	if neg {
+		formatted = formatted[1:]
+	}
+	parts := strings.SplitN(formatted, ".", 2)
+	for len(parts[0]) < minIntDigits {
+		parts[0] = "0" + parts[0]
+	}
+	if len(parts) == 2 {
+		formatted = parts[0] + "." + parts[1]
+	} else {
+		formatted = parts[0]
+	}
+	if neg {
+		formatted = "-" + formatted
+	}
+	return formatted
+}
+
+func formatTermsBucketKeyAndString(rawKey string, termsSpec *esast.TermsAggSpec, idxSchema *schema.IndexSchema) (any, string, bool) {
+	if rawKey == "__ES_MISSING_BUCKET__" {
+		return nil, "", false
+	}
+	var esType string
+	var isBool, isDate, isNum bool
+	if termsSpec != nil {
+		vt := strings.ToLower(strings.TrimSpace(termsSpec.ValueType))
+		switch vt {
+		case "boolean":
+			isBool = true
+		case "date":
+			isDate = true
+		case "long", "integer", "short", "byte", "double", "float", "half_float", "scaled_float", "number":
+			isNum = true
+		}
+		if idxSchema != nil && strings.TrimSpace(termsSpec.Field) != "" {
+			b := idxSchema.ResolveField(termsSpec.Field)
+			esType = b.ESType
+			if esType == "boolean" || b.DorisType == schema.DorisBoolean {
+				isBool = true
+			} else if esType == "date" || esType == "date_nanos" {
+				isDate = true
+			} else if b.DorisType == schema.DorisBigInt || b.DorisType == schema.DorisInt || b.DorisType == schema.DorisDouble {
+				isNum = true
+			}
+		}
+	}
+	if isBool {
+		lower := strings.ToLower(strings.TrimSpace(rawKey))
+		if lower == "true" || lower == "1" {
+			if termsSpec != nil && strings.EqualFold(strings.TrimSpace(termsSpec.ValueType), "boolean") {
+				return 1, "true", true
+			}
+			return "true", "true", true
+		}
+		if lower == "false" || lower == "0" {
+			if termsSpec != nil && strings.EqualFold(strings.TrimSpace(termsSpec.ValueType), "boolean") {
+				return 0, "false", true
+			}
+			return "false", "false", true
+		}
+	}
+	if isDate {
+		var ms int64
+		hasMs := false
+		if iv, err := strconv.ParseInt(strings.TrimSpace(rawKey), 10, 64); err == nil {
+			ms = iv
+			hasMs = true
+		} else if parsedMs, ok := schema.ParseESDateToEpochMillis(rawKey, time.Now().UTC()); ok {
+			ms = parsedMs
+			hasMs = true
+		}
+		if hasMs {
+			var fmtStr string
+			if termsSpec != nil {
+				fmtStr = termsSpec.Format
+			}
+			keyAsStr := formatDateHistogramKeyAsString(ms, &esast.DateHistogramAggSpec{Format: fmtStr})
+			if termsSpec != nil && (strings.TrimSpace(termsSpec.Format) != "" || strings.EqualFold(strings.TrimSpace(termsSpec.ValueType), "date")) {
+				return ms, keyAsStr, true
+			}
+			return rawKey, keyAsStr, true
+		}
+	}
+	if termsSpec != nil && strings.TrimSpace(termsSpec.Format) != "" {
+		if fv, ok := parseFiniteFloat(rawKey); ok {
+			keyAsStr := formatTermsNumericPattern(fv, termsSpec.Format)
+			if isNum {
+				return rawKey, keyAsStr, true
+			}
+			return rawKey, keyAsStr, true
+		}
+	}
+	return rawKey, "", false
+}
+
+func emitRuntimeMultiTermsAggRows(
+	fullAggName string,
+	parentBucketKey string,
+	aggSpec esast.AggSpec,
+	docs []runtimeMatchedDoc,
+	out *[]AggRow,
+	idxSchema *schema.IndexSchema,
+) {
+	mt := aggSpec.MultiTerms
+	if mt == nil || len(mt.Terms) == 0 {
+		return
+	}
+	type tupleBucket struct {
+		id         string
+		keyTuple   []any
+		keyAsStr   string
+		matchedDoc []runtimeMatchedDoc
+	}
+	byTuple := make(map[string]*tupleBucket)
+	var tupleOrder []string
+
+	for _, md := range docs {
+		effSchema := md.EffectiveSchema(idxSchema)
+		termValueLists := make([][]any, len(mt.Terms))
+		complete := true
+		for i, ts := range mt.Terms {
+			vals := extractDocRawValuesForMetric(md, &esast.MetricAggSpec{
+				Field:   ts.Field,
+				Missing: ts.Missing,
+				Script:  ts.Script,
+			})
+			if len(vals) == 0 {
+				complete = false
+				break
+			}
+			termValueLists[i] = vals
+		}
+		if !complete {
+			continue
+		}
+		tuples := [][]any{{}}
+		for _, vList := range termValueLists {
+			var next [][]any
+			for _, prefix := range tuples {
+				for _, v := range vList {
+					cp := make([]any, len(prefix)+1)
+					copy(cp, prefix)
+					cp[len(prefix)] = v
+					next = append(next, cp)
+				}
+			}
+			tuples = next
+		}
+		seenDocTuple := make(map[string]bool, len(tuples))
+		for _, tup := range tuples {
+			strParts := make([]string, len(tup))
+			normParts := make([]any, len(tup))
+			for i, v := range tup {
+				rawStr := fmt.Sprintf("%v", v)
+				ts := mt.Terms[i]
+				kv, kas, hasKAS := formatTermsBucketKeyAndString(rawStr, &esast.TermsAggSpec{
+					Field:     ts.Field,
+					ValueType: ts.ValueType,
+					Format:    ts.Format,
+				}, effSchema)
+				if hasKAS && kas != "" {
+					strParts[i] = kas
+				} else {
+					strParts[i] = fmt.Sprintf("%v", kv)
+				}
+				if fv, ok := toFloat64(v); ok {
+					if fv == math.Trunc(fv) {
+						normParts[i] = int64(fv)
+					} else {
+						normParts[i] = fv
+					}
+				} else {
+					normParts[i] = v
+				}
+			}
+			joined := strings.Join(strParts, "|")
+			metaBytes, _ := json.Marshal(map[string]any{
+				"key":           normParts,
+				"key_as_string": joined,
+			})
+			tid := joined + "\x00" + string(metaBytes)
+			if seenDocTuple[tid] {
+				continue
+			}
+			seenDocTuple[tid] = true
+			tb, exists := byTuple[tid]
+			if !exists {
+				tb = &tupleBucket{
+					id:       tid,
+					keyTuple: normParts,
+					keyAsStr: joined,
+				}
+				byTuple[tid] = tb
+				tupleOrder = append(tupleOrder, tid)
+			}
+			tb.matchedDoc = append(tb.matchedDoc, md)
+		}
+	}
+
+	minCount := 1
+	if mt.MinDocCount != nil && *mt.MinDocCount >= 0 {
+		minCount = *mt.MinDocCount
+	}
+	var filtered []string
+	for _, tid := range tupleOrder {
+		if len(byTuple[tid].matchedDoc) >= minCount {
+			filtered = append(filtered, tid)
+		}
+	}
+	sort.Slice(filtered, func(i, j int) bool {
+		bi, bj := byTuple[filtered[i]], byTuple[filtered[j]]
+		ci, cj := len(bi.matchedDoc), len(bj.matchedDoc)
+		if ci != cj {
+			return ci > cj
+		}
+		return bi.keyAsStr < bj.keyAsStr
+	})
+	sizeLimit := mt.Size
+	if sizeLimit <= 0 {
+		sizeLimit = 10
+	}
+	if len(filtered) > sizeLimit {
+		filtered = filtered[:sizeLimit]
+	}
+	subAggs := aggSpec.SubAggs()
+	for _, tid := range filtered {
+		tb := byTuple[tid]
+		rowKey := tid
+		if parentBucketKey != "" {
+			rowKey = parentBucketKey + "\x1f" + tid
+		}
+		cnt := int64(len(tb.matchedDoc))
+		*out = append(*out, AggRow{
+			AggName:   fullAggName,
+			BucketKey: rowKey,
+			DocCount:  cnt,
+			Value:     float64(cnt),
+		})
+		if len(subAggs) > 0 {
+			emitRuntimeAllSubAggRows(fullAggName, rowKey, subAggs, tb.matchedDoc, out, idxSchema)
+		}
+	}
+}
+
 func emitRuntimeRareTermsAggRows(
 	fullAggName string,
 	parentBucketKey string,
@@ -23640,7 +24379,7 @@ func formatRuntimeBucketAggObjectWithSchema(
 			"doc_count": r.DocCount,
 		}
 		switch {
-		case aggSpec.VariableWidthHistogram != nil:
+		case aggSpec.VariableWidthHistogram != nil || aggSpec.MultiTerms != nil:
 			if idx := strings.IndexByte(leafKey, '\x00'); idx >= 0 {
 				var meta map[string]any
 				if err := json.Unmarshal([]byte(leafKey[idx+1:]), &meta); err == nil {
@@ -23691,8 +24430,18 @@ func formatRuntimeBucketAggObjectWithSchema(
 	if buckets == nil {
 		buckets = []map[string]any{}
 	}
+	if aggSpec.GeoDistance != nil && aggSpec.GeoDistance.Keyed {
+		return formatKeyedBuckets(buckets, true, "key")
+	}
+	if aggSpec.AdjacencyMatrix != nil && aggSpec.AdjacencyMatrix.Keyed {
+		return formatKeyedBuckets(buckets, true, "key")
+	}
 	out := map[string]any{
 		"buckets": buckets,
+	}
+	if aggSpec.MultiTerms != nil {
+		out["doc_count_error_upper_bound"] = 0
+		out["sum_other_doc_count"] = 0
 	}
 	if aggSpec.AutoDateHistogram != nil {
 		targetB := aggSpec.AutoDateHistogram.EffectiveBuckets()
@@ -24257,6 +25006,8 @@ func emitRuntimeAllSubAggRows(
 			emitRuntimeTermsScriptAggRowsWithSchema(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
 		case subSpec.RareTerms != nil:
 			emitRuntimeRareTermsAggRows(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
+		case subSpec.MultiTerms != nil:
+			emitRuntimeMultiTermsAggRows(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
 		case subSpec.Histogram != nil:
 			emitRuntimeHistogramAggRows(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
 		case subSpec.DateHistogram != nil:
@@ -24897,6 +25648,9 @@ func applyRuntimeScriptAggsForMap(
 		case spec.RareTerms != nil:
 			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
 			emitRuntimeRareTermsAggRows(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
+		case spec.MultiTerms != nil:
+			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
+			emitRuntimeMultiTermsAggRows(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
 		case spec.Histogram != nil && spec.Histogram.Script != nil:
 			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
 			emitRuntimeHistogramAggRows(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)

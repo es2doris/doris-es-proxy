@@ -2,6 +2,7 @@ package compliance
 
 import (
 	"encoding/json"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,8 +22,8 @@ func TestRunEmbeddedSuite(t *testing.T) {
 	RunEmbeddedSuite(t, ts.URL)
 
 	report := RunSuiteFS(t, EmbeddedSpecsFS, ts.URL)
-	if report.FilesRun != 10 {
-		t.Fatalf("expected 10 embedded spec files, got %d", report.FilesRun)
+	if report.FilesRun != 11 {
+		t.Fatalf("expected 11 embedded spec files, got %d", report.FilesRun)
 	}
 	if report.SectionsRun < 50 {
 		t.Fatalf("expected at least 50 spec test sections, got %d", report.SectionsRun)
@@ -393,4 +394,273 @@ teardown:
 	_ = valuesEqual(map[string]any{"a": 1}, map[string]any{"b": 1})
 	_ = valuesEqual([]any{1}, []any{1, 2})
 	_ = valuesEqual([]any{1}, []any{2})
+}
+
+func TestParseYAMLSequenceIndentAndQuotedKeys(t *testing.T) {
+	yamlText := `---
+"Multi-space dash and tight quoted keys":
+  -   do:
+        info: {}
+  -   match:
+        "tight_double":42
+        'tight_single':"hello"
+`
+	spec, err := ParseSpecFile(yamlText)
+	if err != nil {
+		t.Fatalf("ParseSpecFile failed on multi-space dash and tight quoted keys: %v", err)
+	}
+	if len(spec.Sections) != 1 || len(spec.Sections[0].Steps) != 2 {
+		t.Fatalf("unexpected parsed sections/steps: %+v", spec)
+	}
+	matchMap := ToNative(spec.Sections[0].Steps[1].Value).(map[string]any)
+	if matchMap["tight_double"] != int64(42) || matchMap["tight_single"] != "hello" {
+		t.Fatalf("unexpected tight quoted key values: %#v", matchMap)
+	}
+
+	raw98, err := fs.ReadFile(EmbeddedSpecsFS, "specs/98_advanced_features.yml")
+	if err != nil {
+		t.Fatalf("failed reading embedded 98_advanced_features.yml: %v", err)
+	}
+	spec98, err := ParseSpecFile(string(raw98))
+	if err != nil {
+		t.Fatalf("failed parsing 98_advanced_features.yml: %v", err)
+	}
+	if len(spec98.Sections) < 6 {
+		t.Fatalf("expected at least 6 sections in 98_advanced_features.yml, got %d", len(spec98.Sections))
+	}
+}
+
+func TestRunnerRound47Features(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Proxy-Node", "NodeAlpha")
+		w.Header().Add("Warning", `299 Elasticsearch-7.10.2 "Deprecated API used"`)
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		_, _ = w.Write([]byte(`{
+			"acknowledged": true,
+			"name": "MixedCaseValue",
+			"items": [
+				{"id": "1", "nested": {"label": "alpha_123", "extra": true}},
+				{"id": "2", "nested": {"label": "beta_456", "extra": false}}
+			]
+		}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// F0: version range and feature skip evaluation
+	ctx := newRunnerContext(ts.Client(), ts.URL)
+	nonSkipCases := []map[string]any{
+		{"version": " - 6.99.99", "reason": "old"},
+		{"version": "7.0.0 - 7.9.99", "reason": "before 7.10.2"},
+		{"version": "7.11.0 - ", "reason": "after 7.10.2"},
+		{"version": "8.0.0 - 8.99.99", "reason": "8.x only"},
+		{"version": " - 6.99.99", "features": []any{"headers", "contains", "transform_and_set", "regex", "catch_param"}},
+		{"features": "headers, warnings, warnings_regex, allowed_warnings, allowed_warnings_regex"},
+	}
+	for _, sc := range nonSkipCases {
+		if err := ctx.execSkip(sc); err != nil {
+			t.Fatalf("expected skip %v not to trigger, got %v", sc, err)
+		}
+	}
+
+	skipCases := []map[string]any{
+		{"version": "all", "reason": "all versions"},
+		{"version": "7.0.0 - 7.99.99", "reason": "7.x range"},
+		{"version": "7.10.2", "reason": "exact match"},
+		{"version": " - 6.99.99", "features": []any{"headers", "nonexistent_feature"}},
+		{"features": "nonexistent_single_feature"},
+	}
+	for _, sc := range skipCases {
+		err := ctx.execSkip(sc)
+		if err == nil {
+			t.Fatalf("expected skip %v to return errSkipSection", sc)
+		}
+	}
+
+	// Verify RunSuiteFS handles setup skip and section skip cleanly
+	skipSuiteFS := fstest.MapFS{
+		"specs/01_setup_skip.yml": &fstest.MapFile{
+			Data: []byte(`---
+setup:
+  - skip:
+      version: "all"
+      reason: "skip entire file setup"
+---
+"Unreached section":
+  - do:
+      info: {}
+`),
+		},
+		"specs/02_section_skip.yml": &fstest.MapFile{
+			Data: []byte(`---
+"Skipped section":
+  - skip:
+      version: "7.0.0 - 7.99.99"
+      reason: "skip this section"
+  - do:
+      info: {}
+---
+"Executed section":
+  - skip:
+      version: "8.0.0 - 8.99.99"
+      reason: "only 8.x"
+  - do:
+      ping: {}
+  - is_true: ''
+`),
+		},
+	}
+	_ = RunSuiteFS(t, skipSuiteFS, ts.URL)
+
+	// F1 & F2: $headers, warnings, warnings_regex, transform_and_set, contains, and recursive regex in valuesEqual
+	doMap := NewOrderedMap()
+	doMap.Set("warnings", []any{"Deprecated API used"})
+	doMap.Set("warnings_regex", []any{`/Deprecated API/`})
+	doMap.Set("allowed_warnings", []any{"allowed"})
+	doMap.Set("allowed_warnings_regex", []any{`/allowed/`})
+	doMap.Set("info", NewOrderedMap())
+	if err := ctx.execDo(doMap, false); err != nil {
+		t.Fatalf("execDo with warnings and warnings_regex failed: %v", err)
+	}
+
+	if v, ok := ctx.lookupResponsePath("$headers"); !ok || v == nil {
+		t.Fatal("expected $headers lookup to succeed")
+	}
+	if v, ok := ctx.lookupResponsePath("$headers.x-proxy-node"); !ok || v != "NodeAlpha" {
+		t.Fatalf("expected $headers.x-proxy-node=NodeAlpha, got %v (%v)", v, ok)
+	}
+	if v, ok := ctx.lookupResponsePath("headers.x-proxy-node"); !ok || v != "NodeAlpha" {
+		t.Fatalf("expected headers.x-proxy-node=NodeAlpha when body has no headers key, got %v (%v)", v, ok)
+	}
+
+	if err := ctx.execTransformAndSet(map[string]any{
+		"b64_name":   "base64Encode(name)",
+		"lower_name": "lower(name)",
+		"upper_name": "upper(name)",
+	}); err != nil {
+		t.Fatalf("execTransformAndSet failed: %v", err)
+	}
+	if ctx.stash["b64_name"] != "TWl4ZWRDYXNlVmFsdWU=" ||
+		ctx.stash["lower_name"] != "mixedcasevalue" ||
+		ctx.stash["upper_name"] != "MIXEDCASEVALUE" {
+		t.Fatalf("unexpected stash after transform_and_set: %#v", ctx.stash)
+	}
+
+	if err := ctx.execContains(map[string]any{
+		"items": map[string]any{
+			"id": "2",
+			"nested": map[string]any{
+				"label": "/^beta_[0-9]+$/",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("execContains failed: %v", err)
+	}
+	if err := ctx.execContains(map[string]any{
+		"items": map[string]any{"id": "999"},
+	}); err == nil {
+		t.Fatal("expected execContains to fail when no element matches")
+	}
+
+	if !valuesEqual(
+		map[string]any{"nested": []any{"val_123", "ok"}},
+		map[string]any{"nested": []any{"/^val_[0-9]+$/", "/^ok$/"}},
+	) {
+		t.Fatal("expected valuesEqual to support recursive regex matching inside maps and slices")
+	}
+
+	// F3: 23 new action builders, catch: param|unavailable|method_not_allowed, and resource tracking
+	r47Actions := []struct {
+		action string
+		params map[string]any
+	}{
+		{"ping", map[string]any{}},
+		{"indices.resolve_index", map[string]any{}},
+		{"indices.resolve_index", map[string]any{"name": "idx*"}},
+		{"indices.create_data_stream", map[string]any{"name": "ds1"}},
+		{"indices.get_data_stream", map[string]any{}},
+		{"indices.get_data_stream", map[string]any{"name": "ds1"}},
+		{"indices.delete_data_stream", map[string]any{"name": "ds1"}},
+		{"indices.data_stream_stats", map[string]any{}},
+		{"indices.data_stream_stats", map[string]any{"name": "ds1"}},
+		{"indices.put_template", map[string]any{"name": "lt1"}},
+		{"indices.get_template", map[string]any{}},
+		{"indices.get_template", map[string]any{"name": "lt1"}},
+		{"indices.delete_template", map[string]any{"name": "lt1"}},
+		{"indices.exists_template", map[string]any{"name": "lt1"}},
+		{"indices.clone", map[string]any{"index": "src", "target": "dst"}},
+		{"indices.shrink", map[string]any{"index": "src", "target": "dst"}},
+		{"indices.split", map[string]any{"index": "src", "target": "dst"}},
+		{"search_shards", map[string]any{}},
+		{"search_shards", map[string]any{"index": "idx"}},
+		{"ilm.put_lifecycle", map[string]any{"policy": "p1"}},
+		{"ilm.get_lifecycle", map[string]any{}},
+		{"ilm.get_lifecycle", map[string]any{"policy": "p1"}},
+		{"ilm.delete_lifecycle", map[string]any{"policy": "p1"}},
+		{"ilm.explain_lifecycle", map[string]any{"index": "idx"}},
+		{"ilm.get_status", map[string]any{}},
+		{"ilm.start", map[string]any{}},
+		{"ilm.stop", map[string]any{}},
+		{"ilm.move_to_step", map[string]any{"index": "idx"}},
+		{"ilm.remove_policy", map[string]any{"index": "idx"}},
+		{"enrich.put_policy", map[string]any{"name": "ep1"}},
+		{"enrich.get_policy", map[string]any{}},
+		{"enrich.get_policy", map[string]any{"name": "ep1"}},
+		{"enrich.delete_policy", map[string]any{"name": "ep1"}},
+		{"enrich.execute_policy", map[string]any{"name": "ep1"}},
+		{"enrich.stats", map[string]any{}},
+		{"ingest.exists_pipeline", map[string]any{"id": "p1"}},
+	}
+	for _, tc := range r47Actions {
+		if _, err := ctx.buildActionRequest(tc.action, tc.params); err != nil {
+			t.Fatalf("buildActionRequest(%s) failed: %v", tc.action, err)
+		}
+	}
+
+	r47MissingParamActions := []string{
+		"indices.create_data_stream", "indices.delete_data_stream",
+		"indices.put_template", "indices.delete_template", "indices.exists_template",
+		"indices.clone", "indices.shrink", "indices.split",
+		"ilm.put_lifecycle", "ilm.delete_lifecycle", "ilm.explain_lifecycle",
+		"ilm.move_to_step", "ilm.remove_policy",
+		"enrich.put_policy", "enrich.delete_policy", "enrich.execute_policy",
+		"ingest.exists_pipeline",
+	}
+	for _, act := range r47MissingParamActions {
+		if _, err := ctx.buildActionRequest(act, map[string]any{}); err == nil {
+			t.Fatalf("expected missing param error for %s", act)
+		}
+	}
+
+	// Verify catch: param catches client-side missing param errors in execDo
+	catchParamDo := NewOrderedMap()
+	catchParamDo.Set("catch", "param")
+	catchParamDo.Set("indices.create", NewOrderedMap())
+	if err := ctx.execDo(catchParamDo, false); err != nil {
+		t.Fatalf("expected catch: param to catch buildActionRequest error, got %v", err)
+	}
+
+	if err := ctx.verifyCatch("param", "test", http.StatusBadRequest, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctx.verifyCatch("unavailable", "test", http.StatusServiceUnavailable, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctx.verifyCatch("method_not_allowed", "test", http.StatusMethodNotAllowed, "", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx.trackCreatedResources("indices.create_data_stream", map[string]any{"name": "ds1"}, nil)
+	ctx.trackCreatedResources("indices.put_template", map[string]any{"name": "lt1"}, nil)
+	ctx.trackCreatedResources("indices.clone", map[string]any{"index": "src", "target": "dst_clone"}, nil)
+	ctx.trackCreatedResources("indices.shrink", map[string]any{"index": "src", "target": "dst_shrink"}, nil)
+	ctx.trackCreatedResources("indices.split", map[string]any{"index": "src", "target": "dst_split"}, nil)
+	ctx.trackCreatedResources("ilm.put_lifecycle", map[string]any{"policy": "ilm1"}, nil)
+	ctx.trackCreatedResources("enrich.put_policy", map[string]any{"name": "ep1"}, nil)
+	ctx.cleanupAll()
 }

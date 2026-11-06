@@ -155,7 +155,7 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 	if scoring && qsq.Boost != nil && *qsq.Boost != 1.0 && compiled.ScoreSQL != "" && compiled.ScoreSQL != "0.0" {
 		compiled.ScoreSQL = fmt.Sprintf("((%s) * %.4f)", compiled.ScoreSQL, *qsq.Boost)
 	}
-	if !isSimple && flags.quoteFieldSuffix == "" && flags.timeZone == "" && flags.phraseSlop == 0 && flags.fuzziness == nil && compiled.WhereSQL != "FALSE" {
+	if !isSimple && (flags.queryType == "" || flags.queryType == "best_fields" || flags.queryType == "most_fields") && flags.quoteFieldSuffix == "" && flags.timeZone == "" && flags.phraseSlop == 0 && flags.fuzziness == nil && compiled.WhereSQL != "FALSE" {
 		if rewrittenRaw, ok := t.rewriteDoris4SearchQuery(raw); ok && t.Opts.UseDoris4SearchFunc && nctx == nil && qsq.MinimumShouldMatch == nil && defaultField != "__unmatched_wildcard__" && !strings.ContainsAny(raw, "[{><~/^\\") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, "`n__") && !strings.Contains(compiled.WhereSQL, " IS NOT NULL") && !strings.Contains(compiled.WhereSQL, "array_size(") {
 			if len(expandedFields) > 1 {
 				if canEmitMultiFieldDoris4SearchDisjunction(rewrittenRaw, defaultOp) {
@@ -165,9 +165,9 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 						fname := strings.Split(ef, "^")[0]
 						fb := schema.FieldBinding{}
 						if t.Schema != nil {
-							fb = t.Schema.ResolveField(fname)
+							fb = t.Schema.ResolveEffectiveField(fname, false)
 						}
-						if t.isDoris4SearchableField(fname) && (t.Schema == nil || fb.DorisType != schema.DorisVarchar || (!strings.Contains(raw, `"`) && !strings.ContainsAny(raw, "+-") && (!fb.LowercaseNormalizer || strings.ToLower(raw) == raw) && (strings.Contains(raw, ":") || !strings.ContainsAny(strings.TrimSpace(raw), " \t\n\r")))) {
+						if t.isDoris4SearchableField(fname) && (t.Schema == nil || !isExactKeywordField(fname, fb) || (!strings.Contains(raw, `"`) && !strings.ContainsAny(raw, "+-") && (!fb.EffectiveLowercase(true) || strings.ToLower(raw) == raw) && (strings.Contains(raw, ":") || !strings.ContainsAny(strings.TrimSpace(raw), " \t\n\r")))) {
 							col := strings.Trim(t.sqlColumnRef(fname, false, nctx), "`")
 							searchPreds = append(searchPreds, fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(rewrittenRaw), quoteStr(col), quoteStr(defaultOp)))
 						} else {
@@ -217,8 +217,8 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 					UsesFulltextMatch: true,
 				}
 			} else if t.isDoris4SearchableField(defaultField) &&
-				(t.Schema == nil || t.Schema.ResolveField(defaultField).IgnoreAbove <= 0 || len([]rune(strings.TrimSpace(raw))) <= t.Schema.ResolveField(defaultField).IgnoreAbove) &&
-				(t.Schema == nil || t.Schema.ResolveField(defaultField).DorisType != schema.DorisVarchar || (!strings.Contains(raw, `"`) && !strings.ContainsAny(raw, "+-") && (strings.Contains(raw, ":") || ((!t.Schema.ResolveField(defaultField).LowercaseNormalizer || strings.ToLower(raw) == raw) && !strings.ContainsAny(strings.TrimSpace(raw), " \t\n\r"))))) {
+				(t.Schema == nil || t.Schema.ResolveEffectiveField(defaultField, false).IgnoreAbove <= 0 || len([]rune(strings.TrimSpace(raw))) <= t.Schema.ResolveEffectiveField(defaultField, false).IgnoreAbove) &&
+				(t.Schema == nil || !isExactKeywordField(defaultField, t.Schema.ResolveEffectiveField(defaultField, false)) || (!strings.Contains(raw, `"`) && !strings.ContainsAny(raw, "+-") && (strings.Contains(raw, ":") || ((!t.Schema.ResolveEffectiveField(defaultField, false).EffectiveLowercase(true) || strings.ToLower(raw) == raw) && !strings.ContainsAny(strings.TrimSpace(raw), " \t\n\r"))))) {
 				col := strings.Trim(t.sqlColumnRef(defaultField, false, nctx), "`")
 				pred := fmt.Sprintf("SEARCH(%s, %s, %s)", quoteStr(rewrittenRaw), quoteStr(col), quoteStr(defaultOp))
 				return CompiledQuery{
@@ -306,8 +306,8 @@ func (t *Transpiler) rewriteDoris4SearchQuery(raw string) (string, bool) {
 				return "", false
 			}
 			if t.Schema != nil {
-				fb := t.Schema.ResolveField(field)
-				if fb.DorisType == schema.DorisVarchar && (prefix != "" || strings.Contains(val, `"`) || (fb.LowercaseNormalizer && strings.ToLower(val) != val)) {
+				fb := t.Schema.ResolveEffectiveField(field, false)
+				if isExactKeywordField(field, fb) && (prefix != "" || strings.Contains(val, `"`) || (fb.EffectiveLowercase(true) && strings.ToLower(val) != val)) {
 					return "", false
 				}
 				if fb.IgnoreAbove > 0 && len([]rune(strings.Trim(val, `"`))) > fb.IgnoreAbove {
@@ -382,8 +382,8 @@ func (t *Transpiler) isDoris4SearchableField(fname string) bool {
 	if t.Schema == nil {
 		return false
 	}
-	b := t.Schema.ResolveField(fname)
-	if b.NotIndexed || b.EnabledFalse || b.LowercaseNormalizer || b.ESType == "ip" || b.ESType == "binary" {
+	b := t.Schema.ResolveEffectiveField(fname, false)
+	if b.NotIndexed || b.EnabledFalse || b.LowercaseNormalizer || b.ESType == "ip" || b.ESType == "binary" || b.ESType == "constant_keyword" || b.NullValue != nil {
 		return false
 	}
 	return b.Kind == schema.StoragePromotedScalar && (b.DorisType == schema.DorisString || b.DorisType == schema.DorisVarchar)
@@ -846,18 +846,32 @@ func hasUnescapedLuceneWildcard(s string) bool {
 	return false
 }
 
-func parseLuceneQuotedOrFuzzyEx(raw string) (clean string, rawWildcard string, isQuoted bool, slop int, isFuzzy bool, explicitZeroFuzzy bool) {
+func isSimplePrefixToken(s string) bool {
+	if len(s) < 2 || s[len(s)-1] != '*' {
+		return false
+	}
+	if hasUnescapedLuceneWildcard(s[:len(s)-1]) {
+		return false
+	}
+	backslashes := 0
+	for i := len(s) - 2; i >= 0 && s[i] == '\\'; i-- {
+		backslashes++
+	}
+	return backslashes%2 == 0
+}
+
+func parseLuceneQuotedOrFuzzyEx(raw string) (clean string, rawWildcard string, isQuoted bool, slop int, isFuzzy bool, explicitZeroFuzzy bool, fuzzyDist any) {
 	s := strings.TrimSpace(raw)
 	if strings.HasPrefix(s, `"`) && len(s) >= 2 {
 		if strings.HasSuffix(s, `"`) {
 			inner := s[1 : len(s)-1]
-			return unescapeLuceneToken(inner), inner, true, 0, false, false
+			return unescapeLuceneToken(inner), inner, true, 0, false, false, nil
 		}
 		if tildeIdx := strings.LastIndex(s, `"~`); tildeIdx > 0 {
 			slopStr := s[tildeIdx+2:]
 			if n, err := strconv.Atoi(slopStr); err == nil && n >= 0 {
 				inner := s[1:tildeIdx]
-				return unescapeLuceneToken(inner), inner, true, n, false, false
+				return unescapeLuceneToken(inner), inner, true, n, false, false, nil
 			}
 		}
 	}
@@ -866,17 +880,20 @@ func parseLuceneQuotedOrFuzzyEx(raw string) (clean string, rawWildcard string, i
 		if suffix == "" || strings.EqualFold(suffix, "auto") {
 			s = s[:tildeIdx]
 			isFuzzy = true
+			fuzzyDist = "AUTO"
 		} else if n, err := strconv.Atoi(suffix); err == nil && n >= 0 {
 			s = s[:tildeIdx]
 			isFuzzy = n > 0
 			explicitZeroFuzzy = n == 0
+			fuzzyDist = n
 		} else if f, err := strconv.ParseFloat(suffix, 64); err == nil && f >= 0 && f <= 2.0 {
 			s = s[:tildeIdx]
 			isFuzzy = f > 0
 			explicitZeroFuzzy = f == 0
+			fuzzyDist = int(math.Round(f))
 		}
 	}
-	return unescapeLuceneToken(s), s, false, 0, isFuzzy, explicitZeroFuzzy
+	return unescapeLuceneToken(s), s, false, 0, isFuzzy, explicitZeroFuzzy, fuzzyDist
 }
 
 func findLuceneFieldColon(s string) int {
@@ -1004,150 +1021,24 @@ func applyLuceneQueryBoost(q *esast.Query, boost float64) {
 	if q == nil || boost == 1.0 {
 		return
 	}
+	b := boost
 	if q.Bool != nil {
-		b := boost
 		if q.Bool.Boost != nil {
 			b = *q.Bool.Boost * boost
 		}
 		q.Bool.Boost = &b
 		return
 	}
-	if q.ConstantScore != nil {
-		b := boost
-		if q.ConstantScore.Boost != nil {
-			b = *q.ConstantScore.Boost * boost
-		}
-		q.ConstantScore.Boost = &b
-		return
-	}
-	if q.Exists != nil {
-		b := boost
-		if q.Exists.Boost != nil {
-			b = *q.Exists.Boost * boost
-		}
-		q.Exists.Boost = &b
-		return
-	}
-	if len(q.Range) > 0 {
-		for k, rc := range q.Range {
-			b := boost
-			if rc.Boost != nil {
-				b = *rc.Boost * boost
-			}
-			rc.Boost = &b
-			q.Range[k] = rc
-		}
-		return
-	}
-	if len(q.Regexp) > 0 {
-		for k, re := range q.Regexp {
-			eff := boost
-			if re.HasBoost {
-				eff = re.Boost * boost
-			}
-			re.Boost = eff
-			re.HasBoost = true
-			q.Regexp[k] = re
-		}
-		return
-	}
-	if len(q.Term) > 0 {
-		for k, te := range q.Term {
-			eff := boost
-			if te.HasBoost {
-				eff = te.Boost * boost
-			}
-			te.Boost = eff
-			te.HasBoost = true
-			q.Term[k] = te
-		}
-		return
-	}
-	if len(q.Match) > 0 {
-		for k, me := range q.Match {
-			if me.Boost == 0 {
-				me.Boost = boost
-			} else {
-				me.Boost *= boost
-			}
-			q.Match[k] = me
-		}
-		return
-	}
-	if len(q.MatchPhrase) > 0 {
-		for k, pe := range q.MatchPhrase {
-			if pe.Boost == 0 {
-				pe.Boost = boost
-			} else {
-				pe.Boost *= boost
-			}
-			q.MatchPhrase[k] = pe
-		}
-		return
-	}
-	if len(q.MatchPhrasePrefix) > 0 {
-		for k, pe := range q.MatchPhrasePrefix {
-			if pe.Boost == 0 {
-				pe.Boost = boost
-			} else {
-				pe.Boost *= boost
-			}
-			q.MatchPhrasePrefix[k] = pe
-		}
-		return
-	}
-	if len(q.Wildcard) > 0 {
-		for k, we := range q.Wildcard {
-			eff := boost
-			if we.HasBoost {
-				eff = we.Boost * boost
-			}
-			we.Boost = eff
-			we.HasBoost = true
-			q.Wildcard[k] = we
-		}
-		return
-	}
-	if len(q.Prefix) > 0 {
-		for k, pe := range q.Prefix {
-			eff := boost
-			if pe.HasBoost {
-				eff = pe.Boost * boost
-			}
-			pe.Boost = eff
-			pe.HasBoost = true
-			q.Prefix[k] = pe
-		}
-		return
-	}
-	if len(q.Fuzzy) > 0 {
-		for k, fe := range q.Fuzzy {
-			eff := boost
-			if fe.HasBoost {
-				eff = fe.Boost * boost
-			}
-			fe.Boost = eff
-			fe.HasBoost = true
-			q.Fuzzy[k] = fe
-		}
-		return
-	}
-	if q.MultiMatch != nil {
-		b := boost
-		if q.MultiMatch.Boost != nil {
-			b = *q.MultiMatch.Boost * boost
-		}
-		q.MultiMatch.Boost = &b
-		return
-	}
-	b := boost
 	inner := *q
 	*q = esast.Query{Bool: &esast.BoolQuery{Must: []esast.Query{inner}, Boost: &b}}
 }
 
 func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, defaultOp string, depth int, isSimple bool, flags simpleQueryFlags) esast.Query {
 	token = strings.TrimSpace(token)
-	token, boost := splitLuceneBoost(token)
+	boost := 1.0
+	if !isSimple {
+		token, boost = splitLuceneBoost(token)
+	}
 	if (!isSimple || flags.precedence) && hasMatchingOuterParens(token) {
 		inner := parseSimpleLuceneToASTWithFlags(token[1:len(token)-1], defaultField, fields, defaultOp, depth+1, isSimple, flags)
 		applyLuceneQueryBoost(&inner, boost)
@@ -1320,7 +1211,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			applyLuceneQueryBoost(&inner, boost)
 			return inner
 		}
-		val, rawWild, isQuoted, slop, isFuzzy, explicitZeroFuzzy := parseLuceneQuotedOrFuzzyEx(val)
+		val, rawWild, isQuoted, slop, isFuzzy, explicitZeroFuzzy, fuzzyDist := parseLuceneQuotedOrFuzzyEx(val)
 		if isQuoted && slop == 0 && flags.phraseSlop > 0 {
 			slop = flags.phraseSlop
 		}
@@ -1329,7 +1220,9 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 		}
 		var fuzzAny any
 		if isFuzzy && !isQuoted {
-			fuzzAny = "AUTO"
+			fuzzAny = fuzzyDist
+		} else if explicitZeroFuzzy && !isQuoted {
+			fuzzAny = 0
 		} else if !isQuoted && !explicitZeroFuzzy && flags.fuzziness != nil {
 			fuzzAny = flags.fuzziness
 		}
@@ -1426,7 +1319,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			if flags.queryType != "" {
 				qType = flags.queryType
 			}
-			if isQuoted && (strings.Contains(val, " ") || slop > 0) {
+			if isQuoted && val != "" {
 				qType = "phrase"
 			}
 			return esast.Query{
@@ -1443,7 +1336,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 				},
 			}
 		}
-		if isQuoted && (strings.Contains(val, " ") || slop > 0) {
+		if isQuoted && val != "" {
 			return esast.Query{
 				MatchPhrase: map[string]esast.PhraseEntry{
 					field: {Query: val, Slop: slop, Boost: boost, HasBoost: true},
@@ -1556,7 +1449,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			}
 		}
 	}
-	cleanVal, rawWild, isQuoted, slop, isFuzzy, explicitZeroFuzzy := parseLuceneQuotedOrFuzzyEx(token)
+	cleanVal, rawWild, isQuoted, slop, isFuzzy, explicitZeroFuzzy, fuzzyDist := parseLuceneQuotedOrFuzzyEx(token)
 	if isQuoted && slop == 0 && flags.phraseSlop > 0 {
 		slop = flags.phraseSlop
 	}
@@ -1571,11 +1464,14 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			cleanVal = unescapeLuceneToken(strings.TrimSpace(token))
 			rawWild = strings.TrimSpace(token)
 			isFuzzy = false
+			explicitZeroFuzzy = false
 		}
 	}
 	var fuzzAny any
 	if isFuzzy && !isQuoted {
-		fuzzAny = "AUTO"
+		fuzzAny = fuzzyDist
+	} else if explicitZeroFuzzy && !isQuoted {
+		fuzzAny = 0
 	} else if !isQuoted && !explicitZeroFuzzy && flags.fuzziness != nil {
 		fuzzAny = flags.fuzziness
 	}
@@ -1600,7 +1496,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			}
 		}
 	}
-	if !isQuoted && (!isSimple || flags.prefix) && hasUnescapedLuceneWildcard(rawWild) {
+	if !isQuoted && ((!isSimple && hasUnescapedLuceneWildcard(rawWild)) || (isSimple && flags.prefix && isSimplePrefixToken(rawWild))) {
 		if len(fields) > 0 {
 			var shoulds []esast.Query
 			for _, fpat := range fields {
@@ -1641,7 +1537,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 		}
 	}
 
-	if isQuoted && (strings.Contains(cleanVal, " ") || slop > 0) {
+	if isQuoted && cleanVal != "" {
 		if len(targetFields) > 0 {
 			return esast.Query{
 				MultiMatch: &esast.MultiMatchQuery{

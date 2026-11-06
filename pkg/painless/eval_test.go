@@ -1630,3 +1630,259 @@ func TestRound46PainlessPrecedenceWrappersMapKeysAndDeterministicNow(t *testing.
 		t.Fatalf("F29 expected fixed _ctx_now=1700000000123, got %v (err=%v)", valF29Fixed, err)
 	}
 }
+
+func TestRound47PainlessEvaluatorFindings(t *testing.T) {
+	// F25: Encoding, Base64, Digest, StrictMath, Arrays.asList, List.of, Set.of, Map.of, Collections.*
+	docF25 := map[string]any{
+		"nums": []any{int64(1), int64(2), int64(3), int64(4)},
+		"tags": []any{"a", "b", "a"},
+	}
+	valF25, err := Eval(docF25, `
+		def b64 = Encoding.encodeBase64("hello");
+		def decB64 = Encoding.decodeBase64(b64);
+		def hexEnc = Encoding.encodeHex("abc");
+		def hexDec = Encoding.decodeHex(hexEnc);
+		def stdEnc = Base64.getEncoder().encodeToString("foo+bar?".getBytes());
+		def stdDec = Base64.getDecoder().decode(stdEnc);
+		def urlEnc = Base64.getUrlEncoder().withoutPadding().encodeToString("a?b/c");
+		def urlDec = Base64.getUrlDecoder().decode(urlEnc);
+		def sha256Hex = Digest.sha256("hello");
+		def md5Hex = Digest.md5("hello");
+		def sha1Hex = Digest.sha1("hello");
+		def sha384Hex = Digest.sha384("hello");
+		def sha512Hex = Digest.sha512("hello");
+		def hexStr = Hex.encodeHexString("Hi");
+		def sm = StrictMath.abs(-5) + (StrictMath.PI > 3.14 ? 1 : 0) + (StrictMath.E > 2.71 ? 1 : 0);
+		def asL = Arrays.asList(10, 20);
+		def lOf = List.of("x", "y");
+		def sOf = Set.of("a", "b", "a");
+		def mOf = Map.of("k1", 1, "k2", 2);
+		def eList = Collections.emptyList();
+		def eSet = Collections.emptySet();
+		def eMap = Collections.emptyMap();
+		def sList = Collections.singletonList(99);
+		def sSet = Collections.singleton("z");
+		def sMap = Collections.singletonMap("only", 7);
+		def cMin = Collections.min(ctx._source.nums);
+		def cMax = Collections.max(ctx._source.nums);
+		def cFreq = Collections.frequency(ctx._source.tags, "a");
+		def cDis1 = Collections.disjoint([1, 2], [3, 4]);
+		def cDis2 = Collections.disjoint([1, 2], [2, 3]);
+		def nCop = Collections.nCopies(3, "v");
+		Collections.swap(ctx._source.nums, 0, 3);
+		Collections.rotate(ctx._source.nums, 1);
+		def repChanged = Collections.replaceAll(ctx._source.tags, "a", "A");
+		def fillTarget = [1, 2, 3];
+		Collections.fill(fillTarget, 0);
+		return [
+			b64, decB64, hexEnc, hexDec, stdDec, urlEnc, urlDec,
+			sha256Hex, md5Hex, sha1Hex, sha384Hex.length(), sha512Hex.length(), hexStr,
+			sm, asL.size(), lOf.size(), sOf.size(), mOf.get("k2"),
+			eList.size(), eSet.size(), eMap.size(), sList.get(0), sSet.get(0), sMap.get("only"),
+			cMin, cMax, cFreq, cDis1, cDis2, nCop.size(), repChanged, fillTarget
+		];
+	`, nil)
+	if err != nil {
+		t.Fatalf("Round47 F25 Eval failed: %v", err)
+	}
+	arrF25, ok := valF25.([]any)
+	if !ok || len(arrF25) != 32 {
+		t.Fatalf("Round47 F25 unexpected result: %#v", valF25)
+	}
+	if arrF25[0] != "aGVsbG8=" || arrF25[1] != "hello" || arrF25[2] != "616263" || arrF25[3] != "abc" ||
+		arrF25[4] != "foo+bar?" || arrF25[5] != "YT9iL2M" || arrF25[6] != "a?b/c" ||
+		arrF25[7] != "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" ||
+		arrF25[8] != "5d41402abc4b2a76b9719d911017c592" ||
+		arrF25[9] != "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d" ||
+		arrF25[10] != int64(96) || arrF25[11] != int64(128) || arrF25[12] != "4869" ||
+		arrF25[13] != int64(7) || arrF25[14] != int64(2) || arrF25[15] != int64(2) || arrF25[16] != int64(2) || arrF25[17] != int64(2) ||
+		arrF25[18] != int64(0) || arrF25[19] != int64(0) || arrF25[20] != int64(0) ||
+		arrF25[21] != int64(99) || arrF25[22] != "z" || arrF25[23] != int64(7) ||
+		arrF25[24] != int64(1) || arrF25[25] != int64(4) || arrF25[26] != int64(2) ||
+		arrF25[27] != true || arrF25[28] != false || arrF25[29] != int64(3) || arrF25[30] != true {
+		t.Fatalf("Round47 F25 values mismatch: %#v", arrF25)
+	}
+	numsAfter, _ := docF25["nums"].([]any)
+	tagsAfter, _ := docF25["tags"].([]any)
+	// [1,2,3,4] -> swap(0,3) -> [4,2,3,1] -> rotate(1) -> [1,4,2,3]
+	if len(numsAfter) != 4 || numsAfter[0] != int64(1) || numsAfter[1] != int64(4) || numsAfter[2] != int64(2) || numsAfter[3] != int64(3) {
+		t.Fatalf("Round47 F25 nums mutation mismatch: %#v", numsAfter)
+	}
+	if len(tagsAfter) != 3 || tagsAfter[0] != "A" || tagsAfter[1] != "b" || tagsAfter[2] != "A" {
+		t.Fatalf("Round47 F25 tags mutation mismatch: %#v", tagsAfter)
+	}
+
+	// F26: String code-point indexOf/lastIndexOf overload, .regionMatches, .lines(), .chars(), .codePoints(), .getBytes()
+	valF26, err := Eval(map[string]any{}, `
+		def s = "abca";
+		def idx1 = s.indexOf(98);
+		def idx2 = s.indexOf(97, 1);
+		def lidx1 = s.lastIndexOf(97);
+		def lidx2 = s.lastIndexOf(97, 2);
+		def rm1 = "HelloWorld".regionMatches(5, "WorldPeace", 0, 5);
+		def rm2 = "HelloWorld".regionMatches(true, 5, "worldpeace", 0, 5);
+		def rm3 = "Hello".regionMatches(-1, "Hello", 0, 2);
+		def lineList = "l1\nl2\r\nl3\n".lines().filter(x -> x != "l2").collect(Collectors.toList());
+		def charSum = "AB".chars().sum();
+		def cpCount = "XYZ".codePoints().count();
+		def bytes1 = "AB".getBytes();
+		def bytes2 = "AB".getBytes("UTF-8");
+		return [idx1, idx2, lidx1, lidx2, rm1, rm2, rm3, lineList, charSum, cpCount, bytes1, bytes2];
+	`, nil)
+	if err != nil {
+		t.Fatalf("Round47 F26 Eval failed: %v", err)
+	}
+	arrF26, ok := valF26.([]any)
+	if !ok || len(arrF26) != 12 {
+		t.Fatalf("Round47 F26 unexpected result: %#v", valF26)
+	}
+	lineList, _ := arrF26[7].([]any)
+	bytes1, _ := arrF26[10].([]any)
+	bytes2, _ := arrF26[11].([]any)
+	if arrF26[0] != int64(1) || arrF26[1] != int64(3) || arrF26[2] != int64(3) || arrF26[3] != int64(0) ||
+		arrF26[4] != true || arrF26[5] != true || arrF26[6] != false ||
+		len(lineList) != 2 || lineList[0] != "l1" || lineList[1] != "l3" ||
+		arrF26[8] != int64(131) || arrF26[9] != int64(3) ||
+		len(bytes1) != 2 || bytes1[0] != int64(65) || bytes1[1] != int64(66) ||
+		len(bytes2) != 2 || bytes2[0] != int64(65) {
+		t.Fatalf("Round47 F26 values mismatch: %#v", arrF26)
+	}
+
+	// F27: DateTimeFormatter, Duration, ZonedDateTime/LocalDate/LocalDateTime factories & .format(formatter)
+	valF27, err := Eval(map[string]any{}, `
+		DateTimeFormatter fmt = DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss");
+		def ldt = LocalDateTime.parse("2025/03/15 14:30:00", fmt);
+		def formatted = ldt.format(DateTimeFormatter.ofPattern("dd-MM-yyyy"));
+		def isoFmt = ldt.format(DateTimeFormatter.ISO_LOCAL_DATE);
+		def ld = LocalDate.of(2025, 3, 15);
+		def epochDay = ld.toEpochDay();
+		def ldFromEpoch = LocalDate.ofEpochDay(epochDay);
+		def zdt = ZonedDateTime.of(2025, 3, 15, 12, 0, 0, 0, ZoneOffset.UTC);
+		def zdtShifted = zdt.withZoneSameInstant("+02:00");
+		def dur = Duration.between("2025-03-15T10:00:00Z", "2025-03-16T12:30:00Z");
+		def durHours = dur.toHours();
+		def durDays = dur.toDays();
+		def durParsed = Duration.parse("PT1H30M").plusMinutes(15).minusSeconds(30);
+		def negDur = Duration.parse("-PT5S");
+		return [
+			formatted, isoFmt, ld, epochDay, ldFromEpoch,
+			zdt.toLocalDate(), zdtShifted.getHour(),
+			durHours, durDays, durParsed.toSeconds(),
+			negDur.isNegative(), negDur.abs().toSeconds(), Duration.ofDays(2).plusHours(3).toHours()
+		];
+	`, nil)
+	if err != nil {
+		t.Fatalf("Round47 F27 Eval failed: %v", err)
+	}
+	arrF27, ok := valF27.([]any)
+	if !ok || len(arrF27) != 13 {
+		t.Fatalf("Round47 F27 unexpected result: %#v", valF27)
+	}
+	if arrF27[0] != "15-03-2025" || arrF27[1] != "2025-03-15" || arrF27[2] != "2025-03-15" ||
+		arrF27[3] != int64(20162) || arrF27[4] != "2025-03-15" ||
+		arrF27[5] != "2025-03-15" || arrF27[6] != int64(14) ||
+		arrF27[7] != int64(26) || arrF27[8] != int64(1) || arrF27[9] != int64(6270) ||
+		arrF27[10] != true || arrF27[11] != int64(5) || arrF27[12] != int64(51) {
+		t.Fatalf("Round47 F27 values mismatch: %#v", arrF27)
+	}
+
+	// F28: Pattern flags & Matcher methods (.lookingAt, .find(start), .reset(input), Pattern.matches, Pattern.quote, Matcher.quoteReplacement)
+	valF28, err := Eval(map[string]any{}, `
+		def p = Pattern.compile("^hello.*world$", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+		def m = p.matcher("HELLO\nWORLD");
+		def okMatch = m.matches();
+		def m2 = Pattern.compile("foo").matcher("foobar foo");
+		def lookOk = m2.lookingAt();
+		def findFrom3 = m2.find(3);
+		def findStart = m2.start();
+		m2.reset("xxfoo");
+		def lookFail = m2.lookingAt();
+		def findReset = m2.find();
+		def patMatches = Pattern.matches("\\d+", "12345");
+		def quotedPat = Pattern.compile(Pattern.quote("a+b")).matcher("a+b").matches();
+		def qRepl = "price: 10".replaceAll("10", Matcher.quoteReplacement("$10"));
+		return [okMatch, lookOk, findFrom3, findStart, lookFail, findReset, patMatches, quotedPat, qRepl];
+	`, nil)
+	if err != nil {
+		t.Fatalf("Round47 F28 Eval failed: %v", err)
+	}
+	arrF28, ok := valF28.([]any)
+	if !ok || len(arrF28) != 9 {
+		t.Fatalf("Round47 F28 unexpected result: %#v", valF28)
+	}
+	if arrF28[0] != true || arrF28[1] != true || arrF28[2] != true || arrF28[3] != int64(7) ||
+		arrF28[4] != false || arrF28[5] != true || arrF28[6] != true || arrF28[7] != true || arrF28[8] != "price: $10" {
+		t.Fatalf("Round47 F28 values mismatch: %#v", arrF28)
+	}
+
+	// F29: Map.replace(k, v), Map.replace(k, oldV, newV), and ctx._source.replaceAll((k, v) -> ...)
+	docF29 := map[string]any{
+		"a": int64(1),
+		"b": int64(2),
+	}
+	valF29, err := Eval(docF29, `
+		def oldA = ctx._source.replace("a", 10);
+		def miss = ctx._source.replace("missing", 99);
+		def ok3 = ctx._source.replace("b", 2, 20);
+		def fail3 = ctx._source.replace("b", 999, 30);
+		ctx._source.replaceAll((k, v) -> v + 1);
+		return [oldA, miss, ok3, fail3, ctx._source.a, ctx._source.b];
+	`, nil)
+	if err != nil {
+		t.Fatalf("Round47 F29 Eval failed: %v", err)
+	}
+	arrF29, ok := valF29.([]any)
+	if !ok || len(arrF29) != 6 {
+		t.Fatalf("Round47 F29 unexpected result: %#v", valF29)
+	}
+	if arrF29[0] != int64(1) || arrF29[1] != nil || arrF29[2] != true || arrF29[3] != false ||
+		arrF29[4] != int64(11) || arrF29[5] != int64(21) || docF29["a"] != int64(11) || docF29["b"] != int64(21) {
+		t.Fatalf("Round47 F29 values mismatch: %#v (doc=%#v)", arrF29, docF29)
+	}
+
+	// F30 & F32: scripted_upsert ctx.op = "create", doc_as_upsert + scripted_upsert, and ctx.get/getOrDefault/containsKey metadata support
+	upsertRaw, opRes, err := ApplyUpdateWithResult(nil, &UpdateRequest{
+		ScriptedUpsert: true,
+		DocAsUpsert:    true,
+		Doc:            map[string]any{"base": int64(10)},
+		MetaID:         "doc-1",
+		MetaIndex:      "idx-1",
+		MetaRouting:    "r-1",
+		MetaVersion:    int64(1),
+		Script: &ScriptSpec{
+			Source: `
+				ctx._source.seen_op = ctx.get("op");
+				ctx._source.seen_id = ctx.get("_id");
+				ctx._source.seen_idx = ctx.getOrDefault("_index", "none");
+				ctx._source.has_src = ctx.containsKey("_source");
+				ctx._source.has_now = ctx.containsKey("_now");
+				ctx._source.base = ctx._source.base + 5;
+			`,
+		},
+	}, false)
+	if err != nil {
+		t.Fatalf("Round47 F30/F32 ApplyUpdateWithResult failed: %v", err)
+	}
+	var upsertDoc map[string]any
+	if uErr := json.Unmarshal(upsertRaw, &upsertDoc); uErr != nil {
+		t.Fatalf("Round47 F30/F32 json.Unmarshal failed: %v", uErr)
+	}
+	if opRes != "created" || upsertDoc["seen_op"] != "create" || upsertDoc["seen_id"] != "doc-1" ||
+		upsertDoc["seen_idx"] != "idx-1" || upsertDoc["has_src"] != true ||
+		upsertDoc["has_now"] != true || upsertDoc["base"] != float64(15) {
+		t.Fatalf("Round47 F30/F32 unexpected upsert doc (opRes=%s): %#v", opRes, upsertDoc)
+	}
+
+	// Additional coverage for DateTimeFormatter pattern tokens and ctx Map methods
+	_, err = Eval(map[string]any{"k": "v"}, `
+		def f = DateTimeFormatter.ofPattern("yy-MMM-MMMM-d-h-m-s-S-a-EEE-EEEE-X-XX-XXX-x-xx-xxx-Z-ZZZZ-z-'lit''q'");
+		def z = ZonedDateTime.of(2025, 3, 15, 14, 5, 6, 0, "UTC-05:00");
+		def c1 = (0 == new ArrayList<String>().size());
+		def c2 = ctx.get("_routing") + ":" + ctx.get("_version") + ":" + ctx.get("k");
+		def c3 = "abc".indexOf(98) + "abc".lastIndexOf(99);
+		return z.format(f) + ":" + c1 + ":" + c2 + ":" + c3;
+	`, map[string]any{"_ctx_routing": "r1", "_ctx_version": int64(2)})
+	if err != nil {
+		t.Fatalf("DateTimeFormatter extended tokens failed: %v", err)
+	}
+}

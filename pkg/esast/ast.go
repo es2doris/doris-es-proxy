@@ -20,6 +20,7 @@ package esast
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1026,6 +1027,27 @@ type Query struct {
 	KNN               *KNNQuery                `json:"knn,omitempty"`
 	GeoDistance       *GeoDistanceQuery        `json:"geo_distance,omitempty"`
 	GeoBoundingBox    *GeoBoundingBoxQuery     `json:"geo_bounding_box,omitempty"`
+	GeoPolygon        *GeoPolygonQuery         `json:"geo_polygon,omitempty"`
+	GeoShape          *GeoShapeQuery           `json:"geo_shape,omitempty"`
+	Wrapper           *WrapperQuery            `json:"wrapper,omitempty"`
+	Pinned            *PinnedQuery             `json:"pinned,omitempty"`
+	MoreLikeThis      *MoreLikeThisQuery       `json:"more_like_this,omitempty"`
+	Intervals         map[string]IntervalsRule `json:"intervals,omitempty"`
+	SpanTerm          map[string]TermEntry     `json:"span_term,omitempty"`
+	SpanNear          *SpanNearQuery           `json:"span_near,omitempty"`
+	SpanOr            *SpanOrQuery             `json:"span_or,omitempty"`
+	SpanNot           *SpanNotQuery            `json:"span_not,omitempty"`
+	SpanFirst         *SpanFirstQuery          `json:"span_first,omitempty"`
+	SpanMulti         *SpanMultiQuery          `json:"span_multi,omitempty"`
+	SpanContaining    *SpanPairQuery           `json:"span_containing,omitempty"`
+	SpanWithin        *SpanPairQuery           `json:"span_within,omitempty"`
+	FieldMaskingSpan  *FieldMaskingSpanQuery   `json:"field_masking_span,omitempty"`
+	RankFeature       *RankFeatureQuery        `json:"rank_feature,omitempty"`
+	DistanceFeature   *DistanceFeatureQuery    `json:"distance_feature,omitempty"`
+	HasChild          *HasChildQuery           `json:"has_child,omitempty"`
+	HasParent         *HasParentQuery          `json:"has_parent,omitempty"`
+	ParentID          *ParentIDQuery           `json:"parent_id,omitempty"`
+	Percolate         *PercolateQuery          `json:"percolate,omitempty"`
 }
 
 var knownQueryClauses = map[string]bool{
@@ -1060,6 +1082,27 @@ var knownQueryClauses = map[string]bool{
 	"knn":                 true,
 	"geo_distance":        true,
 	"geo_bounding_box":    true,
+	"geo_polygon":         true,
+	"geo_shape":           true,
+	"wrapper":             true,
+	"pinned":              true,
+	"more_like_this":      true,
+	"intervals":           true,
+	"span_term":           true,
+	"span_near":           true,
+	"span_or":             true,
+	"span_not":            true,
+	"span_first":          true,
+	"span_multi":          true,
+	"span_containing":     true,
+	"span_within":         true,
+	"field_masking_span":  true,
+	"rank_feature":        true,
+	"distance_feature":    true,
+	"has_child":           true,
+	"has_parent":          true,
+	"parent_id":           true,
+	"percolate":           true,
 	"_name":               true,
 	"boost":               true,
 }
@@ -1183,12 +1226,12 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 	mapBoosts := make(map[string]*float64)
 	rawModified := false
 	for _, clauseKey := range []string{
-		"range", "terms_set",
-		"term", "prefix", "wildcard", "regexp", "fuzzy",
+		"range", "terms_set", "intervals",
+		"term", "span_term", "prefix", "wildcard", "regexp", "fuzzy",
 		"match", "match_phrase", "match_phrase_prefix", "match_bool_prefix",
 	} {
 		if rawClause, ok := raw[clauseKey]; ok {
-			reqMulti := clauseKey != "range" && clauseKey != "terms_set"
+			reqMulti := clauseKey != "range" && clauseKey != "terms_set" && clauseKey != "intervals"
 			cleaned, mb, err := stripNamedQueryAndMapBoost(rawClause, reqMulti)
 			if err != nil {
 				return err
@@ -1337,6 +1380,24 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 			}
 		}
 	}
+	if b := mapBoosts["span_term"]; b != nil {
+		for k, te := range alias.SpanTerm {
+			if !te.HasBoost {
+				te.Boost = *b
+				te.HasBoost = true
+				alias.SpanTerm[k] = te
+			}
+		}
+	}
+	if b := mapBoosts["intervals"]; b != nil {
+		for k, ir := range alias.Intervals {
+			if ir.Boost == nil {
+				v := *b
+				ir.Boost = &v
+				alias.Intervals[k] = ir
+			}
+		}
+	}
 	if b := mapBoosts["prefix"]; b != nil {
 		for k, pe := range alias.Prefix {
 			if !pe.HasBoost {
@@ -1424,6 +1485,8 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 		{"match_phrase_prefix", len(alias.MatchPhrasePrefix)},
 		{"match_bool_prefix", len(alias.MatchBoolPrefix)},
 		{"terms_set", len(alias.TermsSet)},
+		{"span_term", len(alias.SpanTerm)},
+		{"intervals", len(alias.Intervals)},
 	} {
 		if _, ok := raw[check.key]; ok && check.cnt == 0 {
 			return fmt.Errorf("parsing_exception: [%s] query must specify at least one field", check.key)
@@ -1850,6 +1913,882 @@ func (gb *GeoBoundingBoxQuery) UnmarshalJSON(data []byte) error {
 	gb.Left = left
 	gb.Bottom = bottom
 	gb.Right = right
+	return nil
+}
+
+// GeoPolygonQuery models an Elasticsearch `geo_polygon` query.
+type GeoPolygonQuery struct {
+	Field            string       `json:"-"`
+	Points           [][2]float64 `json:"-"`
+	ValidationMethod string       `json:"validation_method,omitempty"`
+	IgnoreUnmapped   bool         `json:"ignore_unmapped,omitempty"`
+	Boost            *float64     `json:"boost,omitempty"`
+	Name             string       `json:"_name,omitempty"`
+}
+
+func (gp *GeoPolygonQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	if rawVM, ok := rawMap["validation_method"]; ok {
+		var vm string
+		if err := json.Unmarshal(rawVM, &vm); err != nil {
+			return fmt.Errorf("parsing_exception: [geo_polygon] invalid [validation_method]")
+		}
+		switch strings.ToUpper(strings.TrimSpace(vm)) {
+		case "STRICT", "IGNORE_MALFORMED", "COERCE":
+			gp.ValidationMethod = strings.ToUpper(strings.TrimSpace(vm))
+		default:
+			return fmt.Errorf("parsing_exception: [geo_polygon] invalid validation_method [%s]", vm)
+		}
+	}
+	if rawBoost, ok := rawMap["boost"]; ok {
+		b, err := parseOptionalNonNegativeBoost(rawBoost)
+		if err != nil {
+			return err
+		}
+		gp.Boost = b
+	}
+	if rawName, ok := rawMap["_name"]; ok {
+		var n string
+		if err := json.Unmarshal(rawName, &n); err != nil {
+			return fmt.Errorf("parsing_exception: [geo_polygon] invalid [_name]")
+		}
+		gp.Name = n
+	}
+	if rawIU, ok := rawMap["ignore_unmapped"]; ok {
+		var iu any
+		if err := json.Unmarshal(rawIU, &iu); err != nil {
+			return fmt.Errorf("parsing_exception: [geo_polygon] invalid [ignore_unmapped]")
+		}
+		b, err := parseFlexibleBool(iu)
+		if err != nil {
+			return err
+		}
+		gp.IgnoreUnmapped = b
+	}
+	var fieldKeys []string
+	for k := range rawMap {
+		switch k {
+		case "validation_method", "boost", "_name", "ignore_unmapped":
+		default:
+			fieldKeys = append(fieldKeys, k)
+		}
+	}
+	if len(fieldKeys) != 1 {
+		return fmt.Errorf("parsing_exception: [geo_polygon] must specify exactly one field, got %d", len(fieldKeys))
+	}
+	gp.Field = fieldKeys[0]
+	var fieldObj struct {
+		Points []json.RawMessage `json:"points"`
+	}
+	if err := json.Unmarshal(rawMap[gp.Field], &fieldObj); err != nil || len(fieldObj.Points) < 3 {
+		return fmt.Errorf("parsing_exception: [geo_polygon] requires at least 3 [points] for [%s]", gp.Field)
+	}
+	pts := make([][2]float64, 0, len(fieldObj.Points))
+	for _, rp := range fieldObj.Points {
+		lat, lon, err := ParseGeoPoint(rp)
+		if err != nil {
+			return err
+		}
+		lat, lon, err = validateAndNormalizeGeoPoint(lat, lon, gp.ValidationMethod)
+		if err != nil {
+			return err
+		}
+		pts = append(pts, [2]float64{lat, lon})
+	}
+	gp.Points = pts
+	return nil
+}
+
+// GeoShapeQuery models an Elasticsearch `geo_shape` query.
+type GeoShapeQuery struct {
+	Field          string         `json:"-"`
+	Shape          map[string]any `json:"-"`
+	IndexedShape   map[string]any `json:"-"`
+	Relation       string         `json:"-"`
+	IgnoreUnmapped bool           `json:"ignore_unmapped,omitempty"`
+	Boost          *float64       `json:"boost,omitempty"`
+	Name           string         `json:"_name,omitempty"`
+}
+
+func (gs *GeoShapeQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	if rawBoost, ok := rawMap["boost"]; ok {
+		b, err := parseOptionalNonNegativeBoost(rawBoost)
+		if err != nil {
+			return err
+		}
+		gs.Boost = b
+	}
+	if rawName, ok := rawMap["_name"]; ok {
+		var n string
+		if err := json.Unmarshal(rawName, &n); err != nil {
+			return fmt.Errorf("parsing_exception: [geo_shape] invalid [_name]")
+		}
+		gs.Name = n
+	}
+	if rawIU, ok := rawMap["ignore_unmapped"]; ok {
+		var iu any
+		if err := json.Unmarshal(rawIU, &iu); err != nil {
+			return fmt.Errorf("parsing_exception: [geo_shape] invalid [ignore_unmapped]")
+		}
+		b, err := parseFlexibleBool(iu)
+		if err != nil {
+			return err
+		}
+		gs.IgnoreUnmapped = b
+	}
+	var fieldKeys []string
+	for k := range rawMap {
+		switch k {
+		case "boost", "_name", "ignore_unmapped":
+		default:
+			fieldKeys = append(fieldKeys, k)
+		}
+	}
+	if len(fieldKeys) != 1 {
+		return fmt.Errorf("parsing_exception: [geo_shape] must specify exactly one field, got %d", len(fieldKeys))
+	}
+	gs.Field = fieldKeys[0]
+	var spec struct {
+		Shape        map[string]any `json:"shape"`
+		IndexedShape map[string]any `json:"indexed_shape"`
+		Relation     string         `json:"relation"`
+	}
+	if err := json.Unmarshal(rawMap[gs.Field], &spec); err != nil {
+		return fmt.Errorf("parsing_exception: [geo_shape] field [%s] must be an object", gs.Field)
+	}
+	if len(spec.Shape) == 0 && len(spec.IndexedShape) == 0 {
+		return fmt.Errorf("parsing_exception: [geo_shape] requires [shape] or [indexed_shape]")
+	}
+	if strings.TrimSpace(spec.Relation) != "" {
+		rel := strings.ToUpper(strings.TrimSpace(spec.Relation))
+		switch rel {
+		case "INTERSECTS", "DISJOINT", "WITHIN", "CONTAINS":
+			gs.Relation = rel
+		default:
+			return fmt.Errorf("parsing_exception: [geo_shape] invalid relation [%s]", spec.Relation)
+		}
+	} else {
+		gs.Relation = "INTERSECTS"
+	}
+	gs.Shape = spec.Shape
+	gs.IndexedShape = spec.IndexedShape
+	return nil
+}
+
+// WrapperQuery models an ES `wrapper` query (`{"wrapper": {"query": "eyJ..."}}`).
+type WrapperQuery struct {
+	Query string   `json:"query"`
+	Boost *float64 `json:"boost,omitempty"`
+	Name  string   `json:"_name,omitempty"`
+}
+
+func (wq *WrapperQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "query", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [wrapper] unknown field [%s]", k)
+		}
+	}
+	var raw struct {
+		Query string          `json:"query"`
+		Boost json.RawMessage `json:"boost"`
+		Name  string          `json:"_name"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if strings.TrimSpace(raw.Query) == "" {
+		return fmt.Errorf("parsing_exception: [wrapper] requires non-empty [query]")
+	}
+	if _, err := base64.StdEncoding.DecodeString(strings.TrimSpace(raw.Query)); err != nil {
+		if _, err2 := base64.RawStdEncoding.DecodeString(strings.TrimSpace(raw.Query)); err2 != nil {
+			return fmt.Errorf("parsing_exception: [wrapper] failed to base64 decode [query]: %w", err)
+		}
+	}
+	wq.Query = strings.TrimSpace(raw.Query)
+	wq.Name = raw.Name
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		wq.Boost = b
+	}
+	return nil
+}
+
+// PinnedQuery models an ES `pinned` query (`{"pinned": {"ids": [...], "organic": {...}}}`).
+type PinnedQuery struct {
+	IDs     []string         `json:"ids,omitempty"`
+	Docs    []map[string]any `json:"docs,omitempty"`
+	Organic *Query           `json:"organic,omitempty"`
+	Boost   *float64         `json:"boost,omitempty"`
+	Name    string           `json:"_name,omitempty"`
+}
+
+func (pq *PinnedQuery) EffectiveIDs() []string {
+	if pq == nil {
+		return nil
+	}
+	out := make([]string, 0, len(pq.IDs)+len(pq.Docs))
+	out = append(out, pq.IDs...)
+	for _, d := range pq.Docs {
+		if idVal, ok := d["_id"]; ok && idVal != nil {
+			s := strings.TrimSpace(fmt.Sprintf("%v", idVal))
+			if s != "" {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
+}
+
+func (pq *PinnedQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "ids", "docs", "organic", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [pinned] unknown field [%s]", k)
+		}
+	}
+	var raw struct {
+		IDs     any              `json:"ids"`
+		Docs    []map[string]any `json:"docs"`
+		Organic *Query           `json:"organic"`
+		Boost   json.RawMessage  `json:"boost"`
+		Name    string           `json:"_name"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if raw.Organic == nil {
+		return fmt.Errorf("parsing_exception: [pinned] requires [organic] query")
+	}
+	if raw.IDs != nil {
+		ids, err := parseFlexibleStringSlice(raw.IDs)
+		if err != nil {
+			return err
+		}
+		pq.IDs = ids
+	}
+	pq.Docs = raw.Docs
+	pq.Organic = raw.Organic
+	pq.Name = raw.Name
+	if len(pq.EffectiveIDs()) == 0 {
+		return fmt.Errorf("parsing_exception: [pinned] requires non-empty [ids] or [docs]")
+	}
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		pq.Boost = b
+	}
+	return nil
+}
+
+// MoreLikeThisQuery models an ES `more_like_this` query.
+type MoreLikeThisQuery struct {
+	Fields             []string `json:"fields,omitempty"`
+	Like               any      `json:"like,omitempty"`
+	Unlike             any      `json:"unlike,omitempty"`
+	MinTermFreq        int      `json:"min_term_freq,omitempty"`
+	MaxQueryTerms      int      `json:"max_query_terms,omitempty"`
+	MinDocFreq         int      `json:"min_doc_freq,omitempty"`
+	MaxDocFreq         int      `json:"max_doc_freq,omitempty"`
+	MinWordLength      int      `json:"min_word_length,omitempty"`
+	MaxWordLength      int      `json:"max_word_length,omitempty"`
+	StopWords          []string `json:"stop_words,omitempty"`
+	Analyzer           string   `json:"analyzer,omitempty"`
+	MinimumShouldMatch any      `json:"minimum_should_match,omitempty"`
+	BoostTerms         float64  `json:"boost_terms,omitempty"`
+	Include            bool     `json:"include,omitempty"`
+	Boost              *float64 `json:"boost,omitempty"`
+	Name               string   `json:"_name,omitempty"`
+}
+
+func (mlt *MoreLikeThisQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "fields", "like", "unlike", "min_term_freq", "max_query_terms", "min_doc_freq", "max_doc_freq",
+			"min_word_length", "max_word_length", "stop_words", "analyzer", "minimum_should_match",
+			"boost_terms", "include", "fail_on_unsupported_field", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [more_like_this] unknown field [%s]", k)
+		}
+	}
+	if _, hasLike := rawMap["like"]; !hasLike {
+		return fmt.Errorf("parsing_exception: [more_like_this] requires [like]")
+	}
+	type plain MoreLikeThisQuery
+	var raw struct {
+		plain
+		Fields    any             `json:"fields"`
+		StopWords any             `json:"stop_words"`
+		Boost     json.RawMessage `json:"boost"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	*mlt = MoreLikeThisQuery(raw.plain)
+	if raw.Fields != nil {
+		fields, err := parseFlexibleStringSlice(raw.Fields)
+		if err != nil {
+			return err
+		}
+		mlt.Fields = fields
+	}
+	if raw.StopWords != nil {
+		sw, err := parseFlexibleStringSlice(raw.StopWords)
+		if err != nil {
+			return err
+		}
+		mlt.StopWords = sw
+	}
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		mlt.Boost = b
+	}
+	return nil
+}
+
+// IntervalsRule models a rule in an ES `intervals` query.
+type IntervalsRule struct {
+	Match    *IntervalsMatch    `json:"match,omitempty"`
+	Prefix   *IntervalsPrefix   `json:"prefix,omitempty"`
+	Wildcard *IntervalsWildcard `json:"wildcard,omitempty"`
+	Fuzzy    *IntervalsFuzzy    `json:"fuzzy,omitempty"`
+	AllOf    *IntervalsAllOf    `json:"all_of,omitempty"`
+	AnyOf    *IntervalsAnyOf    `json:"any_of,omitempty"`
+	Boost    *float64           `json:"boost,omitempty"`
+}
+
+type IntervalsMatch struct {
+	Query    string           `json:"query"`
+	MaxGaps  *int             `json:"max_gaps,omitempty"`
+	Ordered  bool             `json:"ordered,omitempty"`
+	Analyzer string           `json:"analyzer,omitempty"`
+	Filter   *IntervalsFilter `json:"filter,omitempty"`
+	UseField string           `json:"use_field,omitempty"`
+}
+
+type IntervalsPrefix struct {
+	Prefix   string `json:"prefix"`
+	Analyzer string `json:"analyzer,omitempty"`
+	UseField string `json:"use_field,omitempty"`
+}
+
+type IntervalsWildcard struct {
+	Pattern  string `json:"pattern"`
+	Analyzer string `json:"analyzer,omitempty"`
+	UseField string `json:"use_field,omitempty"`
+}
+
+type IntervalsFuzzy struct {
+	Term           string `json:"term"`
+	PrefixLength   int    `json:"prefix_length,omitempty"`
+	Transpositions *bool  `json:"transpositions,omitempty"`
+	Fuzziness      any    `json:"fuzziness,omitempty"`
+	Analyzer       string `json:"analyzer,omitempty"`
+	UseField       string `json:"use_field,omitempty"`
+}
+
+type IntervalsAllOf struct {
+	Intervals []IntervalsRule  `json:"intervals"`
+	MaxGaps   *int             `json:"max_gaps,omitempty"`
+	Ordered   bool             `json:"ordered,omitempty"`
+	Filter    *IntervalsFilter `json:"filter,omitempty"`
+}
+
+type IntervalsAnyOf struct {
+	Intervals []IntervalsRule  `json:"intervals"`
+	Filter    *IntervalsFilter `json:"filter,omitempty"`
+}
+
+type IntervalsFilter struct {
+	After          *IntervalsRule `json:"after,omitempty"`
+	Before         *IntervalsRule `json:"before,omitempty"`
+	ContainedBy    *IntervalsRule `json:"contained_by,omitempty"`
+	Containing     *IntervalsRule `json:"containing,omitempty"`
+	NotContainedBy *IntervalsRule `json:"not_contained_by,omitempty"`
+	NotContaining  *IntervalsRule `json:"not_containing,omitempty"`
+	NotOverlapping *IntervalsRule `json:"not_overlapping,omitempty"`
+	Overlapping    *IntervalsRule `json:"overlapping,omitempty"`
+	Script         any            `json:"script,omitempty"`
+}
+
+func (ir *IntervalsRule) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	ruleCount := 0
+	for k := range rawMap {
+		switch k {
+		case "match", "prefix", "wildcard", "fuzzy", "all_of", "any_of":
+			ruleCount++
+		case "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [intervals] unknown rule [%s]", k)
+		}
+	}
+	if ruleCount != 1 {
+		return fmt.Errorf("parsing_exception: [intervals] rule must specify exactly one of match, prefix, wildcard, fuzzy, all_of, or any_of")
+	}
+	type plain IntervalsRule
+	var raw struct {
+		plain
+		Boost json.RawMessage `json:"boost"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	*ir = IntervalsRule(raw.plain)
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		ir.Boost = b
+	}
+	return nil
+}
+
+// SpanNearQuery models an ES `span_near` query.
+type SpanNearQuery struct {
+	Clauses []Query  `json:"clauses"`
+	Slop    int      `json:"slop,omitempty"`
+	InOrder *bool    `json:"in_order,omitempty"`
+	Boost   *float64 `json:"boost,omitempty"`
+	Name    string   `json:"_name,omitempty"`
+}
+
+// SpanOrQuery models an ES `span_or` query.
+type SpanOrQuery struct {
+	Clauses []Query  `json:"clauses"`
+	Boost   *float64 `json:"boost,omitempty"`
+	Name    string   `json:"_name,omitempty"`
+}
+
+// SpanNotQuery models an ES `span_not` query.
+type SpanNotQuery struct {
+	Include *Query   `json:"include"`
+	Exclude *Query   `json:"exclude"`
+	Pre     int      `json:"pre,omitempty"`
+	Post    int      `json:"post,omitempty"`
+	Dist    int      `json:"dist,omitempty"`
+	Boost   *float64 `json:"boost,omitempty"`
+	Name    string   `json:"_name,omitempty"`
+}
+
+// SpanFirstQuery models an ES `span_first` query.
+type SpanFirstQuery struct {
+	Match *Query   `json:"match"`
+	End   int      `json:"end"`
+	Boost *float64 `json:"boost,omitempty"`
+	Name  string   `json:"_name,omitempty"`
+}
+
+// SpanMultiQuery models an ES `span_multi` query (`{"span_multi": {"match": {"prefix": ...}}}`).
+type SpanMultiQuery struct {
+	Match *Query   `json:"match"`
+	Boost *float64 `json:"boost,omitempty"`
+	Name  string   `json:"_name,omitempty"`
+}
+
+// SpanPairQuery models an ES `span_containing` or `span_within` query.
+type SpanPairQuery struct {
+	Little *Query   `json:"little"`
+	Big    *Query   `json:"big"`
+	Boost  *float64 `json:"boost,omitempty"`
+	Name   string   `json:"_name,omitempty"`
+}
+
+// FieldMaskingSpanQuery models an ES `field_masking_span` query.
+type FieldMaskingSpanQuery struct {
+	Query *Query   `json:"query"`
+	Field string   `json:"field"`
+	Boost *float64 `json:"boost,omitempty"`
+	Name  string   `json:"_name,omitempty"`
+}
+
+// RankFeatureQuery models an ES `rank_feature` query.
+type RankFeatureQuery struct {
+	Field      string         `json:"field"`
+	Boost      *float64       `json:"boost,omitempty"`
+	Saturation map[string]any `json:"saturation,omitempty"`
+	Log        map[string]any `json:"log,omitempty"`
+	Sigmoid    map[string]any `json:"sigmoid,omitempty"`
+	Linear     map[string]any `json:"linear,omitempty"`
+	Name       string         `json:"_name,omitempty"`
+}
+
+func (rf *RankFeatureQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "field", "boost", "saturation", "log", "sigmoid", "linear", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [rank_feature] unknown field [%s]", k)
+		}
+	}
+	type plain RankFeatureQuery
+	var raw struct {
+		plain
+		Boost json.RawMessage `json:"boost"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if strings.TrimSpace(raw.Field) == "" {
+		return fmt.Errorf("parsing_exception: [rank_feature] requires [field]")
+	}
+	*rf = RankFeatureQuery(raw.plain)
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		rf.Boost = b
+	}
+	return nil
+}
+
+// DistanceFeatureQuery models an ES `distance_feature` query.
+type DistanceFeatureQuery struct {
+	Field  string   `json:"field"`
+	Origin any      `json:"origin"`
+	Pivot  any      `json:"pivot"`
+	Boost  *float64 `json:"boost,omitempty"`
+	Name   string   `json:"_name,omitempty"`
+}
+
+func (dfq *DistanceFeatureQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "field", "origin", "pivot", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [distance_feature] unknown field [%s]", k)
+		}
+	}
+	type plain DistanceFeatureQuery
+	var raw struct {
+		plain
+		Boost json.RawMessage `json:"boost"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if strings.TrimSpace(raw.Field) == "" || raw.Origin == nil || raw.Pivot == nil {
+		return fmt.Errorf("parsing_exception: [distance_feature] requires [field], [origin], and [pivot]")
+	}
+	*dfq = DistanceFeatureQuery(raw.plain)
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		dfq.Boost = b
+	}
+	return nil
+}
+
+// HasChildQuery models an ES `has_child` join query.
+type HasChildQuery struct {
+	Type           string         `json:"type"`
+	Query          Query          `json:"query"`
+	ScoreMode      string         `json:"score_mode,omitempty"`
+	MinChildren    *int           `json:"min_children,omitempty"`
+	MaxChildren    *int           `json:"max_children,omitempty"`
+	IgnoreUnmapped bool           `json:"ignore_unmapped,omitempty"`
+	InnerHits      *InnerHitsSpec `json:"inner_hits,omitempty"`
+	Boost          *float64       `json:"boost,omitempty"`
+	Name           string         `json:"_name,omitempty"`
+}
+
+func (hc *HasChildQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "type", "query", "score_mode", "min_children", "max_children", "ignore_unmapped", "inner_hits", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [has_child] unknown field [%s]", k)
+		}
+	}
+	if _, hasQ := rawMap["query"]; !hasQ {
+		return fmt.Errorf("parsing_exception: [has_child] requires [query]")
+	}
+	type plain HasChildQuery
+	var raw struct {
+		plain
+		IgnoreUnmapped any             `json:"ignore_unmapped"`
+		Boost          json.RawMessage `json:"boost"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if strings.TrimSpace(raw.Type) == "" {
+		return fmt.Errorf("parsing_exception: [has_child] requires [type]")
+	}
+	*hc = HasChildQuery(raw.plain)
+	if raw.IgnoreUnmapped != nil {
+		b, err := parseFlexibleBool(raw.IgnoreUnmapped)
+		if err != nil {
+			return err
+		}
+		hc.IgnoreUnmapped = b
+	}
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		hc.Boost = b
+	}
+	return nil
+}
+
+// HasParentQuery models an ES `has_parent` join query.
+type HasParentQuery struct {
+	ParentType     string         `json:"parent_type"`
+	Query          Query          `json:"query"`
+	Score          *bool          `json:"score,omitempty"`
+	IgnoreUnmapped bool           `json:"ignore_unmapped,omitempty"`
+	InnerHits      *InnerHitsSpec `json:"inner_hits,omitempty"`
+	Boost          *float64       `json:"boost,omitempty"`
+	Name           string         `json:"_name,omitempty"`
+}
+
+func (hp *HasParentQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "parent_type", "query", "score", "ignore_unmapped", "inner_hits", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [has_parent] unknown field [%s]", k)
+		}
+	}
+	if _, hasQ := rawMap["query"]; !hasQ {
+		return fmt.Errorf("parsing_exception: [has_parent] requires [query]")
+	}
+	type plain HasParentQuery
+	var raw struct {
+		plain
+		Score          any             `json:"score"`
+		IgnoreUnmapped any             `json:"ignore_unmapped"`
+		Boost          json.RawMessage `json:"boost"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if strings.TrimSpace(raw.ParentType) == "" {
+		return fmt.Errorf("parsing_exception: [has_parent] requires [parent_type]")
+	}
+	*hp = HasParentQuery(raw.plain)
+	if raw.Score != nil {
+		b, err := parseFlexibleBool(raw.Score)
+		if err != nil {
+			return err
+		}
+		hp.Score = &b
+	}
+	if raw.IgnoreUnmapped != nil {
+		b, err := parseFlexibleBool(raw.IgnoreUnmapped)
+		if err != nil {
+			return err
+		}
+		hp.IgnoreUnmapped = b
+	}
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		hp.Boost = b
+	}
+	return nil
+}
+
+// ParentIDQuery models an ES `parent_id` join query.
+type ParentIDQuery struct {
+	Type           string   `json:"type"`
+	ID             any      `json:"id"`
+	IgnoreUnmapped bool     `json:"ignore_unmapped,omitempty"`
+	Boost          *float64 `json:"boost,omitempty"`
+	Name           string   `json:"_name,omitempty"`
+}
+
+func (pid *ParentIDQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "type", "id", "ignore_unmapped", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [parent_id] unknown field [%s]", k)
+		}
+	}
+	type plain ParentIDQuery
+	var raw struct {
+		plain
+		IgnoreUnmapped any             `json:"ignore_unmapped"`
+		Boost          json.RawMessage `json:"boost"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if strings.TrimSpace(raw.Type) == "" || raw.ID == nil {
+		return fmt.Errorf("parsing_exception: [parent_id] requires [type] and [id]")
+	}
+	*pid = ParentIDQuery(raw.plain)
+	if raw.IgnoreUnmapped != nil {
+		b, err := parseFlexibleBool(raw.IgnoreUnmapped)
+		if err != nil {
+			return err
+		}
+		pid.IgnoreUnmapped = b
+	}
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		pid.Boost = b
+	}
+	return nil
+}
+
+// PercolateQuery models an ES `percolate` query.
+type PercolateQuery struct {
+	Field      string           `json:"field"`
+	Document   map[string]any   `json:"document,omitempty"`
+	Documents  []map[string]any `json:"documents,omitempty"`
+	Index      string           `json:"index,omitempty"`
+	ID         string           `json:"id,omitempty"`
+	Routing    string           `json:"routing,omitempty"`
+	Preference string           `json:"preference,omitempty"`
+	Version    *int64           `json:"version,omitempty"`
+	Boost      *float64         `json:"boost,omitempty"`
+	Name       string           `json:"_name,omitempty"`
+}
+
+func (pq *PercolateQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "field", "document", "documents", "index", "id", "routing", "preference", "version", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [percolate] unknown field [%s]", k)
+		}
+	}
+	type plain PercolateQuery
+	var raw struct {
+		plain
+		Boost json.RawMessage `json:"boost"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if strings.TrimSpace(raw.Field) == "" {
+		return fmt.Errorf("parsing_exception: [percolate] requires [field]")
+	}
+	*pq = PercolateQuery(raw.plain)
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		pq.Boost = b
+	}
 	return nil
 }
 
@@ -2408,6 +3347,10 @@ func (tse *TermsSetEntry) UnmarshalJSON(data []byte) error {
 type FuzzyEntry struct {
 	Value           any     `json:"value"`
 	Fuzziness       any     `json:"fuzziness,omitempty"`
+	PrefixLength    int     `json:"prefix_length,omitempty"`
+	MaxExpansions   int     `json:"max_expansions,omitempty"`
+	Transpositions  *bool   `json:"transpositions,omitempty"`
+	Rewrite         string  `json:"rewrite,omitempty"`
 	CaseInsensitive bool    `json:"case_insensitive,omitempty"`
 	Boost           float64 `json:"boost,omitempty"`
 	HasBoost        bool    `json:"-"`
@@ -2422,11 +3365,19 @@ func (f FuzzyEntry) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		Value           any      `json:"value"`
 		Fuzziness       any      `json:"fuzziness,omitempty"`
+		PrefixLength    int      `json:"prefix_length,omitempty"`
+		MaxExpansions   int      `json:"max_expansions,omitempty"`
+		Transpositions  *bool    `json:"transpositions,omitempty"`
+		Rewrite         string   `json:"rewrite,omitempty"`
 		CaseInsensitive bool     `json:"case_insensitive,omitempty"`
 		Boost           *float64 `json:"boost,omitempty"`
 	}{
 		Value:           f.Value,
 		Fuzziness:       f.Fuzziness,
+		PrefixLength:    f.PrefixLength,
+		MaxExpansions:   f.MaxExpansions,
+		Transpositions:  f.Transpositions,
+		Rewrite:         f.Rewrite,
 		CaseInsensitive: f.CaseInsensitive,
 		Boost:           boostPtr,
 	})
@@ -2487,6 +3438,10 @@ func (f *FuzzyEntry) UnmarshalJSON(data []byte) error {
 		var full struct {
 			Value           any             `json:"value"`
 			Fuzziness       any             `json:"fuzziness"`
+			PrefixLength    int             `json:"prefix_length"`
+			MaxExpansions   int             `json:"max_expansions"`
+			Transpositions  any             `json:"transpositions"`
+			Rewrite         string          `json:"rewrite"`
 			CaseInsensitive any             `json:"case_insensitive"`
 			Boost           json.RawMessage `json:"boost"`
 		}
@@ -2496,12 +3451,28 @@ func (f *FuzzyEntry) UnmarshalJSON(data []byte) error {
 		if isNonScalarOrNullValue(full.Value) {
 			return fmt.Errorf("parsing_exception: [fuzzy] query does not support non-scalar or null value")
 		}
+		if full.PrefixLength < 0 {
+			return fmt.Errorf("parsing_exception: [fuzzy] prefix_length must be non-negative, got [%d]", full.PrefixLength)
+		}
+		if full.MaxExpansions < 0 {
+			return fmt.Errorf("parsing_exception: [fuzzy] max_expansions must be non-negative, got [%d]", full.MaxExpansions)
+		}
 		ci, err := parseFlexibleBool(full.CaseInsensitive)
 		if err != nil {
 			return err
 		}
+		if full.Transpositions != nil {
+			tp, err := parseFlexibleBool(full.Transpositions)
+			if err != nil {
+				return err
+			}
+			f.Transpositions = &tp
+		}
 		f.Value = full.Value
 		f.Fuzziness = full.Fuzziness
+		f.PrefixLength = full.PrefixLength
+		f.MaxExpansions = full.MaxExpansions
+		f.Rewrite = full.Rewrite
 		f.CaseInsensitive = ci
 		if len(full.Boost) > 0 {
 			b, err := parseOptionalNonNegativeBoost(full.Boost)
@@ -2967,6 +3938,7 @@ type RangeCond struct {
 	Boost        *float64 `json:"boost,omitempty"`
 	Format       string   `json:"format,omitempty"`
 	TimeZone     string   `json:"time_zone,omitempty"`
+	Relation     string   `json:"relation,omitempty"`
 }
 
 func (rc *RangeCond) UnmarshalJSON(data []byte) error {
@@ -2997,9 +3969,19 @@ func (rc *RangeCond) UnmarshalJSON(data []byte) error {
 		Boost        json.RawMessage `json:"boost"`
 		Format       string          `json:"format"`
 		TimeZone     string          `json:"time_zone"`
+		Relation     string          `json:"relation"`
 	}
 	if err := json.Unmarshal(trimmed, &full); err != nil {
 		return err
+	}
+	if strings.TrimSpace(full.Relation) != "" {
+		rel := strings.ToUpper(strings.TrimSpace(full.Relation))
+		switch rel {
+		case "INTERSECTS", "CONTAINS", "WITHIN":
+			rc.Relation = rel
+		default:
+			return fmt.Errorf("parsing_exception: [range] relation [%s] is not supported; must be INTERSECTS, CONTAINS, or WITHIN", full.Relation)
+		}
 	}
 	rc.GT = full.GT
 	rc.GTE = full.GTE
@@ -3314,14 +4296,18 @@ func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
 }
 
 type MatchEntry struct {
-	Query              any     `json:"query"`
-	Operator           string  `json:"operator,omitempty"`
-	Boost              float64 `json:"boost,omitempty"`
-	ZeroTermsQuery     string  `json:"zero_terms_query,omitempty"`
-	MinimumShouldMatch any     `json:"minimum_should_match,omitempty"`
-	Fuzziness          any     `json:"fuzziness,omitempty"`
-	Lenient            *bool   `json:"lenient,omitempty"`
-	HasBoost           bool    `json:"-"`
+	Query               any     `json:"query"`
+	Operator            string  `json:"operator,omitempty"`
+	Boost               float64 `json:"boost,omitempty"`
+	ZeroTermsQuery      string  `json:"zero_terms_query,omitempty"`
+	MinimumShouldMatch  any     `json:"minimum_should_match,omitempty"`
+	Fuzziness           any     `json:"fuzziness,omitempty"`
+	PrefixLength        int     `json:"prefix_length,omitempty"`
+	MaxExpansions       int     `json:"max_expansions,omitempty"`
+	FuzzyTranspositions *bool   `json:"fuzzy_transpositions,omitempty"`
+	FuzzyRewrite        string  `json:"fuzzy_rewrite,omitempty"`
+	Lenient             *bool   `json:"lenient,omitempty"`
+	HasBoost            bool    `json:"-"`
 }
 
 func (m MatchEntry) MarshalJSON() ([]byte, error) {
@@ -3331,21 +4317,29 @@ func (m MatchEntry) MarshalJSON() ([]byte, error) {
 		boostPtr = &b
 	}
 	return json.Marshal(struct {
-		Query              any      `json:"query"`
-		Operator           string   `json:"operator,omitempty"`
-		Boost              *float64 `json:"boost,omitempty"`
-		ZeroTermsQuery     string   `json:"zero_terms_query,omitempty"`
-		MinimumShouldMatch any      `json:"minimum_should_match,omitempty"`
-		Fuzziness          any      `json:"fuzziness,omitempty"`
-		Lenient            *bool    `json:"lenient,omitempty"`
+		Query               any      `json:"query"`
+		Operator            string   `json:"operator,omitempty"`
+		Boost               *float64 `json:"boost,omitempty"`
+		ZeroTermsQuery      string   `json:"zero_terms_query,omitempty"`
+		MinimumShouldMatch  any      `json:"minimum_should_match,omitempty"`
+		Fuzziness           any      `json:"fuzziness,omitempty"`
+		PrefixLength        int      `json:"prefix_length,omitempty"`
+		MaxExpansions       int      `json:"max_expansions,omitempty"`
+		FuzzyTranspositions *bool    `json:"fuzzy_transpositions,omitempty"`
+		FuzzyRewrite        string   `json:"fuzzy_rewrite,omitempty"`
+		Lenient             *bool    `json:"lenient,omitempty"`
 	}{
-		Query:              m.Query,
-		Operator:           m.Operator,
-		Boost:              boostPtr,
-		ZeroTermsQuery:     m.ZeroTermsQuery,
-		MinimumShouldMatch: m.MinimumShouldMatch,
-		Fuzziness:          m.Fuzziness,
-		Lenient:            m.Lenient,
+		Query:               m.Query,
+		Operator:            m.Operator,
+		Boost:               boostPtr,
+		ZeroTermsQuery:      m.ZeroTermsQuery,
+		MinimumShouldMatch:  m.MinimumShouldMatch,
+		Fuzziness:           m.Fuzziness,
+		PrefixLength:        m.PrefixLength,
+		MaxExpansions:       m.MaxExpansions,
+		FuzzyTranspositions: m.FuzzyTranspositions,
+		FuzzyRewrite:        m.FuzzyRewrite,
+		Lenient:             m.Lenient,
 	})
 }
 
@@ -3372,13 +4366,17 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: [match] missing required [query] field")
 		}
 		var full struct {
-			Query              any             `json:"query"`
-			Operator           string          `json:"operator"`
-			Boost              json.RawMessage `json:"boost"`
-			ZeroTermsQuery     string          `json:"zero_terms_query"`
-			MinimumShouldMatch any             `json:"minimum_should_match"`
-			Fuzziness          any             `json:"fuzziness"`
-			Lenient            *bool           `json:"lenient"`
+			Query               any             `json:"query"`
+			Operator            string          `json:"operator"`
+			Boost               json.RawMessage `json:"boost"`
+			ZeroTermsQuery      string          `json:"zero_terms_query"`
+			MinimumShouldMatch  any             `json:"minimum_should_match"`
+			Fuzziness           any             `json:"fuzziness"`
+			PrefixLength        int             `json:"prefix_length"`
+			MaxExpansions       int             `json:"max_expansions"`
+			FuzzyTranspositions *bool           `json:"fuzzy_transpositions"`
+			FuzzyRewrite        string          `json:"fuzzy_rewrite"`
+			Lenient             *bool           `json:"lenient"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
@@ -3409,6 +4407,10 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 		m.ZeroTermsQuery = full.ZeroTermsQuery
 		m.MinimumShouldMatch = full.MinimumShouldMatch
 		m.Fuzziness = full.Fuzziness
+		m.PrefixLength = full.PrefixLength
+		m.MaxExpansions = full.MaxExpansions
+		m.FuzzyTranspositions = full.FuzzyTranspositions
+		m.FuzzyRewrite = full.FuzzyRewrite
 		m.Lenient = full.Lenient
 		return nil
 	}
@@ -3422,14 +4424,19 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 }
 
 type PhraseEntry struct {
-	Query              string  `json:"query"`
-	Slop               int     `json:"slop,omitempty"`
-	Operator           string  `json:"operator,omitempty"`
-	MinimumShouldMatch any     `json:"minimum_should_match,omitempty"`
-	ZeroTermsQuery     string  `json:"zero_terms_query,omitempty"`
-	Fuzziness          any     `json:"fuzziness,omitempty"`
-	Boost              float64 `json:"boost,omitempty"`
-	HasBoost           bool    `json:"-"`
+	Query               string  `json:"query"`
+	Slop                int     `json:"slop,omitempty"`
+	Operator            string  `json:"operator,omitempty"`
+	MinimumShouldMatch  any     `json:"minimum_should_match,omitempty"`
+	ZeroTermsQuery      string  `json:"zero_terms_query,omitempty"`
+	Fuzziness           any     `json:"fuzziness,omitempty"`
+	MaxExpansions       int     `json:"max_expansions,omitempty"`
+	PrefixLength        int     `json:"prefix_length,omitempty"`
+	FuzzyTranspositions *bool   `json:"fuzzy_transpositions,omitempty"`
+	FuzzyRewrite        string  `json:"fuzzy_rewrite,omitempty"`
+	Lenient             *bool   `json:"lenient,omitempty"`
+	Boost               float64 `json:"boost,omitempty"`
+	HasBoost            bool    `json:"-"`
 }
 
 func (p PhraseEntry) MarshalJSON() ([]byte, error) {
@@ -3439,21 +4446,31 @@ func (p PhraseEntry) MarshalJSON() ([]byte, error) {
 		boostPtr = &b
 	}
 	return json.Marshal(struct {
-		Query              string   `json:"query"`
-		Slop               int      `json:"slop,omitempty"`
-		Operator           string   `json:"operator,omitempty"`
-		MinimumShouldMatch any      `json:"minimum_should_match,omitempty"`
-		ZeroTermsQuery     string   `json:"zero_terms_query,omitempty"`
-		Fuzziness          any      `json:"fuzziness,omitempty"`
-		Boost              *float64 `json:"boost,omitempty"`
+		Query               string   `json:"query"`
+		Slop                int      `json:"slop,omitempty"`
+		Operator            string   `json:"operator,omitempty"`
+		MinimumShouldMatch  any      `json:"minimum_should_match,omitempty"`
+		ZeroTermsQuery      string   `json:"zero_terms_query,omitempty"`
+		Fuzziness           any      `json:"fuzziness,omitempty"`
+		MaxExpansions       int      `json:"max_expansions,omitempty"`
+		PrefixLength        int      `json:"prefix_length,omitempty"`
+		FuzzyTranspositions *bool    `json:"fuzzy_transpositions,omitempty"`
+		FuzzyRewrite        string   `json:"fuzzy_rewrite,omitempty"`
+		Lenient             *bool    `json:"lenient,omitempty"`
+		Boost               *float64 `json:"boost,omitempty"`
 	}{
-		Query:              p.Query,
-		Slop:               p.Slop,
-		Operator:           p.Operator,
-		MinimumShouldMatch: p.MinimumShouldMatch,
-		ZeroTermsQuery:     p.ZeroTermsQuery,
-		Fuzziness:          p.Fuzziness,
-		Boost:              boostPtr,
+		Query:               p.Query,
+		Slop:                p.Slop,
+		Operator:            p.Operator,
+		MinimumShouldMatch:  p.MinimumShouldMatch,
+		ZeroTermsQuery:      p.ZeroTermsQuery,
+		Fuzziness:           p.Fuzziness,
+		MaxExpansions:       p.MaxExpansions,
+		PrefixLength:        p.PrefixLength,
+		FuzzyTranspositions: p.FuzzyTranspositions,
+		FuzzyRewrite:        p.FuzzyRewrite,
+		Lenient:             p.Lenient,
+		Boost:               boostPtr,
 	})
 }
 
@@ -3468,7 +4485,9 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 		}
 		for k := range rawMap {
 			switch k {
-			case "query", "slop", "operator", "minimum_should_match", "zero_terms_query", "fuzziness", "boost", "analyzer", "max_expansions", "_name":
+			case "query", "slop", "operator", "minimum_should_match", "zero_terms_query", "fuzziness", "boost", "analyzer",
+				"max_expansions", "prefix_length", "fuzzy_transpositions", "fuzzy_rewrite", "lenient",
+				"auto_generate_synonyms_phrase_query", "_name":
 			default:
 				return fmt.Errorf("parsing_exception: [match_phrase] unknown field [%s]", k)
 			}
@@ -3477,13 +4496,18 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: [match_phrase] missing required [query] field")
 		}
 		var full struct {
-			Query              any             `json:"query"`
-			Slop               int             `json:"slop"`
-			Operator           string          `json:"operator"`
-			MinimumShouldMatch any             `json:"minimum_should_match"`
-			ZeroTermsQuery     string          `json:"zero_terms_query"`
-			Fuzziness          any             `json:"fuzziness"`
-			Boost              json.RawMessage `json:"boost"`
+			Query               any             `json:"query"`
+			Slop                int             `json:"slop"`
+			Operator            string          `json:"operator"`
+			MinimumShouldMatch  any             `json:"minimum_should_match"`
+			ZeroTermsQuery      string          `json:"zero_terms_query"`
+			Fuzziness           any             `json:"fuzziness"`
+			MaxExpansions       int             `json:"max_expansions"`
+			PrefixLength        int             `json:"prefix_length"`
+			FuzzyTranspositions any             `json:"fuzzy_transpositions"`
+			FuzzyRewrite        string          `json:"fuzzy_rewrite"`
+			Lenient             any             `json:"lenient"`
+			Boost               json.RawMessage `json:"boost"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
@@ -3495,7 +4519,30 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 		if full.Slop < 0 {
 			return fmt.Errorf("parsing_exception: [match_phrase] slop must be non-negative, got [%d]", full.Slop)
 		}
+		if full.MaxExpansions < 0 {
+			return fmt.Errorf("parsing_exception: [match_phrase] max_expansions must be non-negative, got [%d]", full.MaxExpansions)
+		}
+		if full.PrefixLength < 0 {
+			return fmt.Errorf("parsing_exception: [match_phrase] prefix_length must be non-negative, got [%d]", full.PrefixLength)
+		}
 		p.Slop = full.Slop
+		p.MaxExpansions = full.MaxExpansions
+		p.PrefixLength = full.PrefixLength
+		p.FuzzyRewrite = full.FuzzyRewrite
+		if full.FuzzyTranspositions != nil {
+			ft, err := parseFlexibleBool(full.FuzzyTranspositions)
+			if err != nil {
+				return err
+			}
+			p.FuzzyTranspositions = &ft
+		}
+		if full.Lenient != nil {
+			ln, err := parseFlexibleBool(full.Lenient)
+			if err != nil {
+				return err
+			}
+			p.Lenient = &ln
+		}
 		if err := validateQueryOperator(full.Operator, "match_phrase"); err != nil {
 			return err
 		}
@@ -4132,6 +5179,7 @@ type FieldValueFactorSpec struct {
 
 var knownAggTypeKeys = map[string]bool{
 	"terms":                     true,
+	"multi_terms":               true,
 	"rare_terms":                true,
 	"significant_terms":         true,
 	"significant_text":          true,
@@ -4199,6 +5247,7 @@ var knownAggTypeKeys = map[string]bool{
 // AggSpec represents an Elasticsearch aggregation definition.
 type AggSpec struct {
 	Terms                   *TermsAggSpec                  `json:"terms,omitempty"`
+	MultiTerms              *MultiTermsAggSpec             `json:"multi_terms,omitempty"`
 	RareTerms               *RareTermsAggSpec              `json:"rare_terms,omitempty"`
 	SignificantTerms        *TermsAggSpec                  `json:"significant_terms,omitempty"`
 	SignificantText         *TermsAggSpec                  `json:"significant_text,omitempty"`
@@ -4359,6 +5408,24 @@ type GeoGridAggSpec struct {
 type AdjacencyMatrixAggSpec struct {
 	Filters   map[string]Query `json:"filters"`
 	Separator string           `json:"separator,omitempty"`
+	Keyed     bool             `json:"keyed,omitempty"`
+}
+
+// MultiTermTermSpec models a single term source in a `multi_terms` aggregation.
+type MultiTermTermSpec struct {
+	Field     string `json:"field,omitempty"`
+	Missing   any    `json:"missing,omitempty"`
+	Script    any    `json:"script,omitempty"`
+	ValueType string `json:"value_type,omitempty"`
+	Format    string `json:"format,omitempty"`
+}
+
+// MultiTermsAggSpec models an ES `multi_terms` bucket aggregation.
+type MultiTermsAggSpec struct {
+	Terms       []MultiTermTermSpec `json:"terms"`
+	Size        int                 `json:"size,omitempty"`
+	MinDocCount *int                `json:"min_doc_count,omitempty"`
+	Order       any                 `json:"order,omitempty"`
 }
 
 func (a *AdjacencyMatrixAggSpec) EffectiveSeparator() string {
@@ -4941,6 +6008,7 @@ type TermsAggSpec struct {
 	Field            string `json:"field"`
 	Script           any    `json:"script,omitempty"`
 	Size             int    `json:"size,omitempty"`
+	Format           string `json:"format,omitempty"`
 	Missing          any    `json:"missing,omitempty"`
 	MissingBucket    bool   `json:"missing_bucket,omitempty"`
 	MissingOrder     string `json:"missing_order,omitempty"`
@@ -5902,40 +6970,52 @@ type RoutingMetaSpec struct {
 
 // MappingSpec models an Elasticsearch `_mapping` payload.
 type MappingSpec struct {
-	Dynamic    any                      `json:"dynamic,omitempty"`
-	Subobjects *bool                    `json:"subobjects,omitempty"`
-	Routing    *RoutingMetaSpec         `json:"_routing,omitempty"`
-	Runtime    map[string]FieldProperty `json:"runtime,omitempty"`
-	Properties map[string]FieldProperty `json:"properties,omitempty"`
+	Dynamic            any                      `json:"dynamic,omitempty"`
+	Subobjects         *bool                    `json:"subobjects,omitempty"`
+	Routing            *RoutingMetaSpec         `json:"_routing,omitempty"`
+	Meta               map[string]any           `json:"_meta,omitempty"`
+	Source             map[string]any           `json:"_source,omitempty"`
+	DynamicTemplates   []map[string]any         `json:"dynamic_templates,omitempty"`
+	DateDetection      *bool                    `json:"date_detection,omitempty"`
+	NumericDetection   *bool                    `json:"numeric_detection,omitempty"`
+	DynamicDateFormats []string                 `json:"dynamic_date_formats,omitempty"`
+	Runtime            map[string]FieldProperty `json:"runtime,omitempty"`
+	Properties         map[string]FieldProperty `json:"properties,omitempty"`
 }
 
 type FieldProperty struct {
-	Type            string                   `json:"type,omitempty"`
-	Dynamic         any                      `json:"dynamic,omitempty"`
-	Subobjects      *bool                    `json:"subobjects,omitempty"`
-	Enabled         *bool                    `json:"enabled,omitempty"`
-	Index           *bool                    `json:"index,omitempty"`
-	DocValues       *bool                    `json:"doc_values,omitempty"`
-	Path            string                   `json:"path,omitempty"`
-	Value           any                      `json:"value,omitempty"`
-	Script          any                      `json:"script,omitempty"`
-	Analyzer        string                   `json:"analyzer,omitempty"`
-	SearchAnalyzer  string                   `json:"search_analyzer,omitempty"`
-	Normalizer      string                   `json:"normalizer,omitempty"`
-	Format          string                   `json:"format,omitempty"`
-	Dims            int                      `json:"dims,omitempty"`
-	Dimension       int                      `json:"dimension,omitempty"`
-	Similarity      string                   `json:"similarity,omitempty"`
-	MultiValued     bool                     `json:"multi_valued,omitempty"`
-	UpgradedArray   bool                     `json:"upgraded_array,omitempty"`
-	CopyTo          any                      `json:"copy_to,omitempty"`
-	NullValue       any                      `json:"null_value,omitempty"`
-	IgnoreAbove     int                      `json:"ignore_above,omitempty"`
-	IgnoreMalformed *bool                    `json:"ignore_malformed,omitempty"`
-	Coerce          *bool                    `json:"coerce,omitempty"`
-	ScalingFactor   float64                  `json:"scaling_factor,omitempty"`
-	Fields          map[string]FieldProperty `json:"fields,omitempty"`
-	Properties      map[string]FieldProperty `json:"properties,omitempty"`
+	Type                     string                   `json:"type,omitempty"`
+	Dynamic                  any                      `json:"dynamic,omitempty"`
+	Subobjects               *bool                    `json:"subobjects,omitempty"`
+	Enabled                  *bool                    `json:"enabled,omitempty"`
+	Index                    *bool                    `json:"index,omitempty"`
+	DocValues                *bool                    `json:"doc_values,omitempty"`
+	Store                    *bool                    `json:"store,omitempty"`
+	Path                     string                   `json:"path,omitempty"`
+	Value                    any                      `json:"value,omitempty"`
+	Script                   any                      `json:"script,omitempty"`
+	Analyzer                 string                   `json:"analyzer,omitempty"`
+	SearchAnalyzer           string                   `json:"search_analyzer,omitempty"`
+	Normalizer               string                   `json:"normalizer,omitempty"`
+	Format                   string                   `json:"format,omitempty"`
+	TimeZone                 string                   `json:"time_zone,omitempty"`
+	Dims                     int                      `json:"dims,omitempty"`
+	Dimension                int                      `json:"dimension,omitempty"`
+	Similarity               string                   `json:"similarity,omitempty"`
+	MultiValued              bool                     `json:"multi_valued,omitempty"`
+	UpgradedArray            bool                     `json:"upgraded_array,omitempty"`
+	CopyTo                   any                      `json:"copy_to,omitempty"`
+	NullValue                any                      `json:"null_value,omitempty"`
+	IgnoreAbove              int                      `json:"ignore_above,omitempty"`
+	IgnoreMalformed          *bool                    `json:"ignore_malformed,omitempty"`
+	Coerce                   *bool                    `json:"coerce,omitempty"`
+	ScalingFactor            float64                  `json:"scaling_factor,omitempty"`
+	Meta                     map[string]any           `json:"meta,omitempty"`
+	IndexPrefixes            map[string]any           `json:"index_prefixes,omitempty"`
+	IndexPhrases             *bool                    `json:"index_phrases,omitempty"`
+	SplitQueriesOnWhitespace *bool                    `json:"split_queries_on_whitespace,omitempty"`
+	Fields                   map[string]FieldProperty `json:"fields,omitempty"`
+	Properties               map[string]FieldProperty `json:"properties,omitempty"`
 }
 
 func (fp FieldProperty) EffectiveDims() int {

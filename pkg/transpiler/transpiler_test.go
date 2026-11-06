@@ -2879,7 +2879,7 @@ func TestRound46TranspilerGeoDecayLuceneAndTermsAggNormalizer(t *testing.T) {
 		t.Fatalf("F8/F9 unmarshal failed: %v", err)
 	}
 	cqQS := tr.CompileQuery(qsReq.Query, true, nil)
-	if !strings.Contains(cqQS.WhereSQL, "NOT (") || !strings.Contains(cqQS.ScoreSQL, "3.5") {
+	if (!strings.Contains(cqQS.WhereSQL, "NOT (") && !strings.Contains(cqQS.WhereSQL, "NOT COALESCE(")) || !strings.Contains(cqQS.ScoreSQL, "3.5") {
 		t.Fatalf("F8/F9 expected NOT COALESCE for status:-closed and 3.5 boost for (title:foo)^3.5, got WhereSQL=%s ScoreSQL=%s", cqQS.WhereSQL, cqQS.ScoreSQL)
 	}
 
@@ -2965,4 +2965,210 @@ func TestRound46TranspilerGeoDecayLuceneAndTermsAggNormalizer(t *testing.T) {
 		_, _ = normalizeBooleanQueryValue(v)
 	}
 	_ = wildcardToLike(`a\*b\?c\%d\_e\\f\`)
+}
+
+func TestRound47TranspilerSpecCompliance(t *testing.T) {
+	spec := esast.MappingSpec{
+		Properties: map[string]esast.FieldProperty{
+			"title":      {Type: "text"},
+			"sayt":       {Type: "search_as_you_type"},
+			"status":     {Type: "keyword", IgnoreAbove: 5},
+			"int_rng":    {Type: "integer_range"},
+			"date_rng":   {Type: "date_range"},
+			"ip_rng":     {Type: "ip_range"},
+			"pagerank":   {Type: "rank_feature"},
+			"created_at": {Type: "date"},
+			"loc":        {Type: "geo_point"},
+			"join_field": {Type: "join"},
+			"items": {
+				Type: "nested",
+				Properties: map[string]esast.FieldProperty{
+					"cat":   {Type: "keyword"},
+					"price": {Type: "double"},
+				},
+			},
+		},
+	}
+	sch := schema.CompileIndexSchema("db", "r47_tr_idx", &spec)
+	tr := NewTranspiler(sch, TranspilerOptions{UseDoris4SearchFunc: true})
+
+	// F5: term and range queries (INTERSECTS, CONTAINS, WITHIN) on range fields
+	for _, tc := range []struct {
+		raw      string
+		wantSub1 string
+		wantSub2 string
+	}{
+		{`{"term": {"int_rng": 15}}`, "<= 15", ">= 15"},
+		{`{"range": {"int_rng": {"gte": 10, "lte": 20, "relation": "INTERSECTS"}}}`, "<= 20", ">= 10"},
+		{`{"range": {"int_rng": {"gte": 10, "lte": 20, "relation": "CONTAINS"}}}`, "<= 10", ">= 20"},
+		{`{"range": {"int_rng": {"gte": 10, "lte": 20, "relation": "WITHIN"}}}`, ">= 10", "<= 20"},
+	} {
+		var q esast.Query
+		if err := json.Unmarshal([]byte(tc.raw), &q); err != nil {
+			t.Fatalf("F5 unmarshal %s failed: %v", tc.raw, err)
+		}
+		cq := tr.CompileQuery(&q, false, nil)
+		if !strings.Contains(cq.WhereSQL, tc.wantSub1) || !strings.Contains(cq.WhereSQL, tc.wantSub2) {
+			t.Fatalf("F5 query %s expected %q and %q in WhereSQL=%s", tc.raw, tc.wantSub1, tc.wantSub2, cq.WhereSQL)
+		}
+	}
+
+	// F6: search_as_you_type subfields resolve to f__sayt
+	var saytQ esast.Query
+	_ = json.Unmarshal([]byte(`{"match": {"sayt._2gram": "quick fox"}}`), &saytQ)
+	cqSayt := tr.CompileQuery(&saytQ, false, nil)
+	if !strings.Contains(cqSayt.WhereSQL, "`f__sayt`") {
+		t.Fatalf("F6 expected sayt._2gram to query `f__sayt`, got %s", cqSayt.WhereSQL)
+	}
+
+	// F10: match_bool_prefix with fuzziness compiles non-last tokens as fuzzy regex and last token as prefix
+	var mbpQ esast.Query
+	if err := json.Unmarshal([]byte(`{"match_bool_prefix": {"title": {"query": "quikc fo", "fuzziness": "AUTO"}}}`), &mbpQ); err != nil {
+		t.Fatalf("F10 unmarshal failed: %v", err)
+	}
+	cqMBP := tr.CompileQuery(&mbpQ, false, nil)
+	if !strings.Contains(cqMBP.WhereSQL, "REGEXP") || !strings.Contains(cqMBP.WhereSQL, "MATCH_PHRASE_PREFIX 'fo'") {
+		t.Fatalf("F10 expected fuzzy REGEXP for non-last token and MATCH_PHRASE_PREFIX 'fo' for last token, got %s", cqMBP.WhereSQL)
+	}
+
+	// F11: Fuzzy edit distance 2, prefix_length, transpositions:false, and Lucene ~2
+	var fzQ esast.Query
+	if err := json.Unmarshal([]byte(`{"fuzzy": {"title": {"value": "abcdef", "fuzziness": 2, "prefix_length": 2, "transpositions": false}}}`), &fzQ); err != nil {
+		t.Fatalf("F11 unmarshal failed: %v", err)
+	}
+	cqFZ := tr.CompileQuery(&fzQ, false, nil)
+	if !strings.Contains(cqFZ.WhereSQL, "abcd") {
+		t.Fatalf("F11 expected distance-2 deletions (e.g. abcd) in fuzzy regex, got %s", cqFZ.WhereSQL)
+	}
+	var luceneFzQ esast.Query
+	_ = json.Unmarshal([]byte(`{"query_string": {"default_field": "title", "query": "abcdef~2"}}`), &luceneFzQ)
+	cqLuceneFZ := tr.CompileQuery(&luceneFzQ, false, nil)
+	if !strings.Contains(cqLuceneFZ.WhereSQL, "abcd") {
+		t.Fatalf("F11 expected Lucene ~2 to generate distance-2 fuzzy regex, got %s", cqLuceneFZ.WhereSQL)
+	}
+
+	// F12: Compile all new Query DSL clauses
+	f12Queries := []string{
+		`{"geo_polygon": {"loc": {"points": [{"lat": 40, "lon": -70}, {"lat": 41, "lon": -71}, {"lat": 39, "lon": -72}]}}}`,
+		`{"geo_shape": {"loc": {"shape": {"type": "envelope", "coordinates": [[-75.0, 41.0], [-73.0, 40.0]]}, "relation": "DISJOINT"}}}`,
+		`{"wrapper": {"query": "eyJtYXRjaCI6eyJ0aXRsZSI6InF1aWNrIn19"}}`,
+		`{"pinned": {"ids": ["doc-1", "doc-2"], "organic": {"match": {"title": "quick"}}}}`,
+		`{"more_like_this": {"fields": ["title"], "like": "quick brown fox"}}`,
+		`{"intervals": {"title": {"all_of": {"ordered": true, "intervals": [{"match": {"query": "quick"}}, {"prefix": {"prefix": "fo"}}]}}}}`,
+		`{"span_near": {"clauses": [{"span_term": {"title": "quick"}}, {"span_or": {"clauses": [{"span_term": {"title": "fox"}}, {"span_not": {"include": {"span_term": {"title": "dog"}}, "exclude": {"span_term": {"title": "lazy"}}}}]}}], "slop": 2}}`,
+		`{"span_first": {"match": {"span_term": {"title": "quick"}}, "end": 3}}`,
+		`{"span_multi": {"match": {"prefix": {"title": "qu"}}}}`,
+		`{"span_containing": {"little": {"span_term": {"title": "fox"}}, "big": {"span_term": {"title": "quick"}}}}`,
+		`{"span_within": {"little": {"span_term": {"title": "fox"}}, "big": {"span_term": {"title": "quick"}}}}`,
+		`{"field_masking_span": {"query": {"span_term": {"title": "quick"}}, "field": "title"}}`,
+		`{"rank_feature": {"field": "pagerank", "saturation": {"pivot": 5}}}`,
+		`{"distance_feature": {"field": "created_at", "origin": "2025-01-01T00:00:00Z", "pivot": "7d"}}`,
+		`{"distance_feature": {"field": "loc", "origin": {"lat": 40.7, "lon": -74.0}, "pivot": "10km"}}`,
+		`{"has_child": {"type": "child", "query": {"match": {"title": "quick"}}, "score_mode": "max"}}`,
+		`{"has_parent": {"parent_type": "parent", "query": {"match": {"title": "quick"}}, "score": true}}`,
+		`{"parent_id": {"type": "child", "id": "p1"}}`,
+		`{"percolate": {"field": "title", "document": {"title": "quick"}}}`,
+	}
+	for _, raw := range f12Queries {
+		var q esast.Query
+		if err := json.Unmarshal([]byte(raw), &q); err != nil {
+			t.Fatalf("F12 unmarshal %s failed: %v", raw, err)
+		}
+		cq := tr.CompileQuery(&q, true, nil)
+		if cq.WhereSQL == "" || cq.WhereSQL == "FALSE" {
+			t.Fatalf("F12 expected non-FALSE WhereSQL for %s, got WhereSQL=%s ScoreSQL=%s", raw, cq.WhereSQL, cq.ScoreSQL)
+		}
+	}
+
+	// F13: match on keyword uses exact term equality, and IgnoreAbove > 5 returns FALSE
+	var kwMatchQ esast.Query
+	_ = json.Unmarshal([]byte(`{"match": {"status": "open"}}`), &kwMatchQ)
+	cqKwMatch := tr.CompileQuery(&kwMatchQ, false, nil)
+	if cqKwMatch.WhereSQL != "`f__status` = 'open'" {
+		t.Fatalf("F13 expected exact term match `f__status` = 'open', got %s", cqKwMatch.WhereSQL)
+	}
+	var kwIgnoreAboveQ esast.Query
+	_ = json.Unmarshal([]byte(`{"term": {"status": "too_long_value"}}`), &kwIgnoreAboveQ)
+	if cqIA := tr.CompileQuery(&kwIgnoreAboveQ, false, nil); cqIA.WhereSQL != "FALSE" {
+		t.Fatalf("F13 expected FALSE for term exceeding ignore_above=5, got %s", cqIA.WhereSQL)
+	}
+
+	// F14: simple_query_string mid-word wildcard literal, unquoted ^ literal, and quoted phrase match
+	var sqsQ esast.Query
+	_ = json.Unmarshal([]byte(`{"simple_query_string": {"fields": ["title"], "query": "\"quick fox\" foo*bar baz*"}}`), &sqsQ)
+	cqSQS := tr.CompileQuery(&sqsQ, false, nil)
+	if !strings.Contains(cqSQS.WhereSQL, "MATCH_PHRASE") || strings.Contains(cqSQS.WhereSQL, "foo%bar") || !strings.Contains(cqSQS.WhereSQL, "baz%") {
+		t.Fatalf("F14 expected MATCH_PHRASE for quoted phrase, no mid-word LIKE foo%%bar, and prefix LIKE baz%%, got %s", cqSQS.WhereSQL)
+	}
+
+	// F15: nested -> terms -> top_hits and terms -> nested -> avg sub-aggregations
+	var nestedSubAggReq esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"size": 0,
+		"aggs": {
+			"nested_items": {
+				"nested": {"path": "items"},
+				"aggs": {
+					"by_cat": {
+						"terms": {"field": "items.cat"},
+						"aggs": {
+							"top_items": {"top_hits": {"size": 2, "sort": [{"items.price": "desc"}]}}
+						}
+					}
+				}
+			},
+			"by_status": {
+				"terms": {"field": "status"},
+				"aggs": {
+					"nested_avg": {
+						"nested": {"path": "items"},
+						"aggs": {
+							"avg_price": {"avg": {"field": "items.price"}}
+						}
+					}
+				}
+			}
+		}
+	}`), &nestedSubAggReq); err != nil {
+		t.Fatalf("F15 unmarshal failed: %v", err)
+	}
+	planF15, err := tr.BuildSearchPlan(&nestedSubAggReq)
+	if err != nil {
+		t.Fatalf("F15 BuildSearchPlan failed: %v", err)
+	}
+	if !strings.Contains(planF15.AggsSQL, "top_items") || !strings.Contains(planF15.AggsSQL, "avg_price") {
+		t.Fatalf("F15 expected top_items and avg_price in AggsSQL, got:\n%s", planF15.AggsSQL)
+	}
+
+	// Additional coverage for range field types, intervals rules/filters, rank_feature modes, and Lucene boost application
+	spec.Properties["flt_rng"] = esast.FieldProperty{Type: "float_range"}
+	sch = schema.CompileIndexSchema("db", "r47_tr_idx", &spec)
+	tr = NewTranspiler(sch, TranspilerOptions{UseDoris4SearchFunc: true})
+	extraQueries := []string{
+		`{"range": {"flt_rng": {"gt": 1.5, "lt": 9.5, "relation": "WITHIN"}}}`,
+		`{"range": {"date_rng": {"gt": "2025-01-01T00:00:00Z", "lt": "2025-01-02T00:00:00Z"}}}`,
+		`{"range": {"ip_rng": {"gt": "10.0.0.1", "lt": "10.0.0.254"}}}`,
+		`{"range": {"ip_rng": {"gte": "10.0.0.0/24", "lte": "10.0.0.0/24"}}}`,
+		`{"intervals": {"title": {"any_of": {"intervals": [{"wildcard": {"pattern": "qu*"}}, {"fuzzy": {"term": "fox", "fuzziness": 1}}], "filter": {"containing": {"match": {"query": "brown"}}, "not_containing": {"match": {"query": "lazy"}}}}}}}`,
+		`{"rank_feature": {"field": "pagerank", "log": {"scaling_factor": 2}, "boost": 1.5}}`,
+		`{"rank_feature": {"field": "pagerank", "sigmoid": {"pivot": 2, "exponent": 0.5}}}`,
+		`{"rank_feature": {"field": "pagerank", "linear": {}}}`,
+		`{"simple_query_string": {"fields": ["title^2", "status"], "query": "\"quick fox\"~2 +bar* -baz~1", "flags": "PHRASE|PREFIX|FUZZY|WHITESPACE|NOT"}}`,
+		`{"query_string": {"fields": ["title"], "query": "(title:quick)^2.0 OR status:[a TO z]^1.5 OR title:/qu.*/^2.0 OR title:qu*^1.2 OR title:fox~1^1.3 OR _exists_:title^1.1"}}`,
+		`{"has_child": {"type": "c", "query": {"match": {"title": "fox"}}, "score_mode": "max", "boost": 2.0}}`,
+		`{"has_parent": {"parent_type": "p", "query": {"match": {"title": "fox"}}, "score": true, "boost": 2.0}}`,
+		`{"distance_feature": {"field": "location", "origin": {"lat": 40.7, "lon": -74.0}, "pivot": "10km", "boost": 1.5}}`,
+		`{"geo_shape": {"location": {"shape": {"type": "point", "coordinates": [-74.0, 40.7]}}, "boost": 1.5}}`,
+		`{"percolate": {"field": "query", "documents": [{"title": "fox"}], "boost": 1.5}}`,
+	}
+	for _, raw := range extraQueries {
+		var q esast.Query
+		if err := json.Unmarshal([]byte(raw), &q); err != nil {
+			t.Fatalf("extra unmarshal %s failed: %v", raw, err)
+		}
+		cq := tr.CompileQuery(&q, true, nil)
+		if cq.WhereSQL == "" || cq.WhereSQL == "FALSE" {
+			t.Fatalf("expected non-FALSE WhereSQL for %s, got %s", raw, cq.WhereSQL)
+		}
+	}
 }
