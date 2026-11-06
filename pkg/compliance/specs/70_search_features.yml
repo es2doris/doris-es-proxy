@@ -1,0 +1,205 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+---
+setup:
+  - do:
+      indices.create:
+        index: comp_feat_idx
+        body:
+          mappings:
+            properties:
+              service:
+                type: keyword
+              rank:
+                type: integer
+              latency:
+                type: integer
+              title:
+                type: text
+  - do:
+      bulk:
+        index: comp_feat_idx
+        body:
+          - index: { _id: "1" }
+          - { service: "svc-a", rank: 1, latency: 10, title: "alpha search query engine" }
+          - index: { _id: "2" }
+          - { service: "svc-a", rank: 2, latency: 20, title: "beta search result ranking" }
+          - index: { _id: "3" }
+          - { service: "svc-b", rank: 3, latency: 30, title: "gamma analytics pipeline" }
+          - index: { _id: "4" }
+          - { service: "svc-b", rank: 4, latency: 40, title: "delta search cluster" }
+
+---
+"Sort and search_after pagination":
+  - do:
+      search:
+        index: comp_feat_idx
+        body:
+          size: 2
+          sort:
+            - { rank: "asc" }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - set: { hits.hits.1.sort.0: last_rank }
+  - do:
+      search:
+        index: comp_feat_idx
+        body:
+          size: 2
+          sort:
+            - { rank: "asc" }
+          search_after: [ $last_rank ]
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "4" }
+
+---
+"Field collapse highlight script_fields docvalue_fields and fields":
+  - do:
+      search:
+        index: comp_feat_idx
+        body:
+          query:
+            match_all: {}
+          collapse:
+            field: "service"
+          sort:
+            - { rank: "asc" }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: comp_feat_idx
+        body:
+          query:
+            match:
+              title: "search"
+          highlight:
+            fields:
+              title: {}
+          script_fields:
+            doubled_latency:
+              script:
+                source: "doc['latency'].value * 2"
+          docvalue_fields: [ "service", "rank" ]
+          fields: [ "service" ]
+          sort:
+            - { rank: "asc" }
+  - match: { hits.total.value: 3 }
+  - is_true: hits.hits.0.highlight.title
+  - match: { hits.hits.0.fields.doubled_latency.0: 20 }
+  - match: { hits.hits.0.fields.service.0: "svc-a" }
+
+---
+"Post filter min_score and track_total_hits":
+  - do:
+      search:
+        index: comp_feat_idx
+        body:
+          query:
+            match_all: {}
+          post_filter:
+            term:
+              service: "svc-a"
+          min_score: 0.0
+          track_total_hits: true
+          aggs:
+            all_services:
+              terms:
+                field: "service"
+  - match: { hits.total.value: 2 }
+  - length: { aggregations.all_services.buckets: 2 }
+
+---
+"Scroll and clear_scroll lifecycle":
+  - do:
+      search:
+        index: comp_feat_idx
+        scroll: "1m"
+        body:
+          size: 2
+          sort:
+            - { rank: "asc" }
+  - set: { _scroll_id: sid }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      scroll:
+        scroll_id: $sid
+        scroll: "1m"
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - do:
+      clear_scroll:
+        scroll_id: $sid
+  - is_true: succeeded
+
+---
+"Point in time open_point_in_time and close_point_in_time":
+  - do:
+      open_point_in_time:
+        index: comp_feat_idx
+        keep_alive: "1m"
+  - is_true: id
+  - set: { id: pit_id }
+  - do:
+      search:
+        body:
+          size: 2
+          pit:
+            id: $pit_id
+            keep_alive: "1m"
+          sort:
+            - { rank: "asc" }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      close_point_in_time:
+        body:
+          id: $pit_id
+  - is_true: succeeded
+
+---
+"Count msearch explain and validate_query":
+  - do:
+      count:
+        index: comp_feat_idx
+        body:
+          query:
+            term:
+              service: "svc-a"
+  - match: { count: 2 }
+  - do:
+      msearch:
+        index: comp_feat_idx
+        body:
+          - {}
+          - { query: { term: { service: "svc-a" } } }
+          - {}
+          - { query: { term: { service: "svc-b" } } }
+  - length: { responses: 2 }
+  - match: { responses.0.hits.total.value: 2 }
+  - match: { responses.1.hits.total.value: 2 }
+  - do:
+      explain:
+        index: comp_feat_idx
+        id: "1"
+        body:
+          query:
+            term:
+              service: "svc-a"
+  - is_true: matched
+  - is_true: explanation
+  - do:
+      indices.validate_query:
+        index: comp_feat_idx
+        explain: true
+        body:
+          query:
+            term:
+              service: "svc-a"
+  - is_true: valid

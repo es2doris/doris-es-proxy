@@ -1,0 +1,168 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+---
+"Index create exists get and delete":
+  - do:
+      indices.exists:
+        index: comp_idx_lifecycle
+  - is_false: ''
+  - do:
+      indices.create:
+        index: comp_idx_lifecycle
+        body:
+          mappings:
+            properties:
+              host:
+                type: keyword
+              latency:
+                type: integer
+  - is_true: acknowledged
+  - match: { index: "comp_idx_lifecycle" }
+  - do:
+      indices.exists:
+        index: comp_idx_lifecycle
+  - is_true: ''
+  - do:
+      indices.get:
+        index: comp_idx_lifecycle
+  - is_true: comp_idx_lifecycle.mappings.properties.host
+  - match: { comp_idx_lifecycle.mappings.properties.host.type: "keyword" }
+  - do:
+      indices.delete:
+        index: comp_idx_lifecycle
+  - is_true: acknowledged
+  - do:
+      indices.exists:
+        index: comp_idx_lifecycle
+  - is_false: ''
+  - do:
+      catch: missing
+      indices.get:
+        index: comp_idx_lifecycle
+
+---
+"Put and get explicit mapping":
+  - do:
+      indices.create:
+        index: comp_idx_mapping
+        body:
+          mappings:
+            properties:
+              title:
+                type: text
+  - is_true: acknowledged
+  - do:
+      indices.put_mapping:
+        index: comp_idx_mapping
+        body:
+          properties:
+            status_code:
+              type: integer
+            region:
+              type: keyword
+  - is_true: acknowledged
+  - do:
+      indices.get_mapping:
+        index: comp_idx_mapping
+  - match: { comp_idx_mapping.mappings.properties.title.type: "text" }
+  - match: { comp_idx_mapping.mappings.properties.status_code.type: "integer" }
+  - match: { comp_idx_mapping.mappings.properties.region.type: "keyword" }
+
+---
+"Get field mapping single and multiple fields":
+  - do:
+      indices.create:
+        index: comp_idx_field_map
+        body:
+          mappings:
+            properties:
+              service:
+                type: keyword
+              duration_ms:
+                type: long
+  - do:
+      indices.get_field_mapping:
+        index: comp_idx_field_map
+        fields: [ service, duration_ms ]
+  - match: { comp_idx_field_map.mappings.service.full_name: "service" }
+  - match: { comp_idx_field_map.mappings.service.mapping.service.type: "keyword" }
+  - match: { comp_idx_field_map.mappings.duration_ms.full_name: "duration_ms" }
+  - match: { comp_idx_field_map.mappings.duration_ms.mapping.duration_ms.type: "long" }
+
+---
+"Field capabilities endpoint":
+  - do:
+      indices.create:
+        index: comp_idx_field_caps
+        body:
+          mappings:
+            properties:
+              env:
+                type: keyword
+              message:
+                type: text
+              cpu_pct:
+                type: float
+  - do:
+      field_caps:
+        index: comp_idx_field_caps
+        fields: "*"
+  - is_true: fields.env.keyword.searchable
+  - is_true: fields.env.keyword.aggregatable
+  - is_true: fields.message.text.searchable
+  - is_true: fields.cpu_pct.float.aggregatable
+
+---
+"Index settings get and put":
+  - do:
+      indices.create:
+        index: comp_idx_settings
+  - do:
+      indices.get_settings:
+        index: comp_idx_settings
+  - match: { comp_idx_settings.settings.index.number_of_shards: "1" }
+  - do:
+      indices.put_settings:
+        index: comp_idx_settings
+        body:
+          index:
+            number_of_replicas: 0
+  - is_true: acknowledged
+  - do:
+      indices.refresh:
+        index: comp_idx_settings
+  - match: { _shards.failed: 0 }
+  - do:
+      indices.flush:
+        index: comp_idx_settings
+  - match: { _shards.failed: 0 }
+  - do:
+      indices.forcemerge:
+        index: comp_idx_settings
+  - match: { _shards.failed: 0 }
+  - do:
+      indices.stats:
+        index: comp_idx_settings
+  - match: { _shards.failed: 0 }
+  - is_true: indices.comp_idx_settings
+
+---
+"Mapping conflict catch bad_request":
+  - do:
+      indices.create:
+        index: comp_idx_conflict
+        body:
+          mappings:
+            properties:
+              code:
+                type: integer
+  - do:
+      catch: bad_request
+      indices.put_mapping:
+        index: comp_idx_conflict
+        body:
+          properties:
+            code:
+              type: text

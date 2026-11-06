@@ -367,7 +367,7 @@ func TestASTRound28ComprehensiveCoverage(t *testing.T) {
 		t.Fatalf("unexpected RescoreList single-object unmarshal: %+v", srCollapse.Rescore)
 	}
 	var srRescoreArr SearchRequest
-	if err := json.Unmarshal([]byte(`{"collapse":{"field":"f","inner_hits":[{"name":"a"},{"name":"b"}]},"rescore":[{"window_size":10}]}`), &srRescoreArr); err != nil || len(srRescoreArr.Collapse.InnerHits) != 2 || len(srRescoreArr.Rescore) != 1 {
+	if err := json.Unmarshal([]byte(`{"collapse":{"field":"f","inner_hits":[{"name":"a"},{"name":"b"}]},"rescore":[{"window_size":10,"query":{"rescore_query":{"match_all":{}}}}]}`), &srRescoreArr); err != nil || len(srRescoreArr.Collapse.InnerHits) != 2 || len(srRescoreArr.Rescore) != 1 {
 		t.Fatalf("array collapse/rescore unmarshal failed: %v", err)
 	}
 
@@ -1238,5 +1238,149 @@ func TestRound45ASTValidationSortSuggestAndRuntimeAggs(t *testing.T) {
 	}
 	if len(fullAggReq.Aggs) != 13 {
 		t.Fatalf("F18/F20 expected 13 aggs, got %d", len(fullAggReq.Aggs))
+	}
+}
+
+func TestRound46GeoQueriesBoolMatchDisMaxAndBulkMeta(t *testing.T) {
+	// F1: geo_distance query parsing (map, array [lon,lat], string "lat,lon", WKT, geohash) and error validation
+	for _, validGD := range []string{
+		`{"query": {"geo_distance": {"distance": "15km", "loc": {"lat": 40.7128, "lon": -74.0060}}}}`,
+		`{"query": {"geo_distance": {"distance": "500m", "loc": [-74.0060, 40.7128], "distance_type": "arc", "validation_method": "STRICT", "_name": "gd1", "boost": 2.0}}}`,
+		`{"query": {"geo_distance": {"distance": 1000, "unit": "m", "loc": "40.7128,-74.0060"}}}`,
+		`{"query": {"geo_distance": {"distance": "2mi", "loc": "POINT (-74.0060 40.7128)"}}}`,
+		`{"query": {"geo_distance": {"distance": "10km", "loc": "dr5regw3pg6f"}}}`,
+	} {
+		var req SearchRequest
+		if err := json.Unmarshal([]byte(validGD), &req); err != nil {
+			t.Fatalf("F1 expected valid geo_distance for %s, got %v", validGD, err)
+		}
+		if req.Query == nil || req.Query.GeoDistance == nil || req.Query.GeoDistance.DistanceMeters <= 0 {
+			t.Fatalf("F1 unexpected parsed GeoDistance: %+v", req.Query)
+		}
+		if _, err := json.Marshal(req.Query.GeoDistance); err != nil {
+			t.Fatalf("F1 GeoDistance.MarshalJSON failed: %v", err)
+		}
+	}
+	for _, u := range []any{10, int64(20), float64(30.5), json.Number("40"), "5yd", "10ft", "12in", "2nmi", "100cm", "1000mm"} {
+		if _, m, err := ParseGeoDistanceMeters(u); err != nil || m <= 0 {
+			t.Fatalf("F1 ParseGeoDistanceMeters(%v) failed: m=%v err=%v", u, m, err)
+		}
+	}
+	for _, badGD := range []string{
+		`{"query": {"geo_distance": {"loc": {"lat": 40, "lon": -74}}}}`,
+		`{"query": {"geo_distance": {"distance": "-5km", "loc": {"lat": 40, "lon": -74}}}}`,
+		`{"query": {"geo_distance": {"distance": "5lightyears", "loc": {"lat": 40, "lon": -74}}}}`,
+		`{"query": {"geo_distance": {"distance": "5km"}}}`,
+		`{"query": {"geo_distance": {"distance": "5km", "loc": {"lat": 95, "lon": -74}}}}`,
+		`{"query": {"geo_distance": {"distance": "5km", "loc": {"lat": 40, "lon": -74}, "distance_type": "bogus"}}}`,
+	} {
+		var req SearchRequest
+		if err := json.Unmarshal([]byte(badGD), &req); err == nil {
+			t.Fatalf("F1 expected error for invalid geo_distance %s", badGD)
+		}
+	}
+
+	// F2: geo_bounding_box query parsing (top_left/bottom_right, top_right/bottom_left, wkt, top/left/bottom/right)
+	for _, validBB := range []string{
+		`{"query": {"geo_bounding_box": {"loc": {"top_left": {"lat": 42.0, "lon": -75.0}, "bottom_right": {"lat": 40.0, "lon": -72.0}}}}}`,
+		`{"query": {"geo_bounding_box": {"loc": {"top_right": [-72.0, 42.0], "bottom_left": [-75.0, 40.0]}, "type": "indexed"}}}`,
+		`{"query": {"geo_bounding_box": {"loc": {"top": 42.0, "left": -75.0, "bottom": 40.0, "right": -72.0}}}}`,
+		`{"query": {"geo_bounding_box": {"loc": {"wkt": "BBOX (-75.0, -72.0, 42.0, 40.0)"}}}}`,
+	} {
+		var req SearchRequest
+		if err := json.Unmarshal([]byte(validBB), &req); err != nil {
+			t.Fatalf("F2 expected valid geo_bounding_box for %s, got %v", validBB, err)
+		}
+		if req.Query == nil || req.Query.GeoBoundingBox == nil || req.Query.GeoBoundingBox.Top != 42.0 {
+			t.Fatalf("F2 unexpected parsed GeoBoundingBox: %+v", req.Query)
+		}
+		if _, err := json.Marshal(req.Query.GeoBoundingBox); err != nil {
+			t.Fatalf("F2 GeoBoundingBox.MarshalJSON failed: %v", err)
+		}
+	}
+	for _, badBB := range []string{
+		`{"query": {"geo_bounding_box": {"loc": {"top_left": {"lat": 40.0, "lon": -75.0}, "bottom_right": {"lat": 42.0, "lon": -72.0}}}}}`,
+		`{"query": {"geo_bounding_box": {"loc": {"top_left": {"lat": 42.0, "lon": -75.0}}}}}`,
+		`{"query": {"geo_bounding_box": {"loc": {"top_right": {"lat": 42.0, "lon": -72.0}}}}}`,
+		`{"query": {"geo_bounding_box": {"loc": {"wkt": "INVALID"}}}}`,
+		`{"query": {"geo_bounding_box": {"loc": {"top": 42.0, "left": -75.0, "bottom": 40.0, "extra": 1}}}}`,
+		`{"query": {"geo_bounding_box": {"loc": {"top_left": {"lat": 42.0, "lon": -75.0}, "bottom_right": {"lat": 40.0, "lon": -72.0}}, "type": "bogus"}}}`,
+		`{"query": {"geo_bounding_box": {"loc": {"top_left": {"lat": 42.0, "lon": -75.0}, "bottom_right": {"lat": 40.0, "lon": -72.0}}, "validation_method": "bogus"}}}`,
+	} {
+		var req SearchRequest
+		if err := json.Unmarshal([]byte(badBB), &req); err == nil {
+			t.Fatalf("F2 expected error for invalid geo_bounding_box %s", badBB)
+		}
+	}
+	var coerceBB SearchRequest
+	if err := json.Unmarshal([]byte(`{"query": {"geo_bounding_box": {"type": {"top_left": {"lat": 40.0, "lon": -75.0}, "bottom_right": {"lat": 42.0, "lon": -72.0}}, "validation_method": "COERCE", "boost": 1.5, "_name": "bb1", "ignore_unmapped": true}}}`), &coerceBB); err != nil {
+		t.Fatalf("F2 coerce geo_bounding_box failed: %v", err)
+	}
+	if _, err := json.Marshal(coerceBB.Query.GeoBoundingBox); err != nil {
+		t.Fatalf("F2 MarshalJSON failed: %v", err)
+	}
+
+	// F3: boolean & numeric query values in match, multi_match, combined_fields, and decay functions
+	var reqF3 SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"version": "true",
+		"seq_no_primary_term": true,
+		"explain": true,
+		"indices_boost": [{"idx_a": 2.5}, {"idx_b": 0.5}],
+		"query": {
+			"function_score": {
+				"query": {
+					"bool": {
+						"must": [
+							{"match": {"active": true}},
+							{"match": {"flag": {"query": false}}},
+							{"multi_match": {"query": true, "fields": ["active"]}},
+							{"combined_fields": {"query": 42, "fields": ["title"]}}
+						]
+					}
+				},
+				"gauss": {
+					"loc": {"origin": "40.7,-74.0", "scale": "5km", "offset": "1km", "decay": 0.5},
+					"multi_value_mode": "min"
+				}
+			}
+		}
+	}`), &reqF3); err != nil {
+		t.Fatalf("F3/F22 unmarshal failed: %v", err)
+	}
+	if !reqF3.Version || !reqF3.SeqNoPrimaryTerm || !reqF3.Explain || reqF3.IndicesBoost["idx_a"] != 2.5 {
+		t.Fatalf("F22 unexpected SearchRequest flags/indices_boost: %+v", reqF3)
+	}
+	if reqF3.Query.FunctionScore.Gauss == nil || reqF3.Query.FunctionScore.Gauss.Field != "loc" || reqF3.Query.FunctionScore.Gauss.MultiValueMode != "min" {
+		t.Fatalf("F3/F10 unexpected DecayFunctionSpec: %+v", reqF3.Query.FunctionScore.Gauss)
+	}
+
+	// F4: dis_max validation rejects empty queries and negative/ >1.0 tie_breaker
+	for _, badDM := range []string{
+		`{"query": {"dis_max": {"queries": []}}}`,
+		`{"query": {"dis_max": {"queries": [{"match_all": {}}], "tie_breaker": -0.1}}}`,
+		`{"query": {"dis_max": {"queries": [{"match_all": {}}], "tie_breaker": 1.5}}}`,
+	} {
+		var req SearchRequest
+		if err := json.Unmarshal([]byte(badDM), &req); err == nil {
+			t.Fatalf("F4 expected error for invalid dis_max %s", badDM)
+		}
+	}
+
+	// F33 & F34: ParseBulkNDJSON with require_alias, doc_as_upsert, detect_noop, _source, and auto-generated ID
+	ops, err := ParseBulkNDJSON(strings.NewReader(
+		"{\"index\":{\"_index\":\"my_alias\",\"require_alias\":true}}\n"+
+			"{\"title\":\"auto id doc\"}\n"+
+			"{\"update\":{\"_index\":\"my_alias\",\"_id\":\"1\",\"require_alias\":\"true\",\"doc_as_upsert\":true,\"detect_noop\":false,\"_source\":[\"title\"]}}\n"+
+			"{\"doc\":{\"title\":\"updated\"}}\n",
+	), "")
+	if err != nil || len(ops) != 2 {
+		t.Fatalf("F33/F34 ParseBulkNDJSON failed: len=%d err=%v", len(ops), err)
+	}
+	if ops[0].RequireAlias == nil || !*ops[0].RequireAlias || !ops[0].AutoGeneratedID || ops[0].ID == "" {
+		t.Fatalf("F34 expected RequireAlias=true and AutoGeneratedID=true on ops[0], got %+v", ops[0])
+	}
+	if ops[1].RequireAlias == nil || !*ops[1].RequireAlias || ops[1].DocAsUpsert == nil || !*ops[1].DocAsUpsert || ops[1].DetectNoop == nil || *ops[1].DetectNoop || ops[1].SourceFilter == nil || len(ops[1].SourceFilter.Includes) != 1 {
+		t.Fatalf("F33 expected action-level update options parsed on ops[1], got %+v", ops[1])
 	}
 }

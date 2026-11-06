@@ -1,0 +1,114 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+---
+setup:
+  - do:
+      indices.create:
+        index: comp_cat_idx
+        body:
+          mappings:
+            properties:
+              service:
+                type: keyword
+              message:
+                type: text
+  - do:
+      indices.put_alias:
+        index: comp_cat_idx
+        name: comp_cat_alias
+  - do:
+      index:
+        index: comp_cat_idx
+        id: "1"
+        body:
+          service: "catalog-api"
+          message: "Fast full text tokenization"
+  - do:
+      index:
+        index: comp_cat_idx
+        id: "2"
+        body:
+          service: "catalog-worker"
+          message: "Background indexing job"
+
+---
+"Cat indices aliases count and shards":
+  - do:
+      cat.indices:
+        index: comp_cat_idx
+  - length: { $body: 1 }
+  - match: { 0.index: "comp_cat_idx" }
+  - match: { 0.health: "green" }
+  - do:
+      cat.aliases:
+        name: comp_cat_alias
+  - length: { $body: 1 }
+  - match: { 0.alias: "comp_cat_alias" }
+  - match: { 0.index: "comp_cat_idx" }
+  - do:
+      cat.count:
+        index: comp_cat_idx
+  - length: { $body: 1 }
+  - match: { 0.count: "2" }
+  - do:
+      cat.shards:
+        index: comp_cat_idx
+  - length: { $body: 1 }
+  - match: { 0.index: "comp_cat_idx" }
+  - match: { 0.state: "STARTED" }
+
+---
+"Global parameters filter_path and pretty":
+  - do:
+      info:
+        pretty: true
+        filter_path: "name,version.number"
+  - match: { name: "doris-es-proxy" }
+  - match: { version.number: "7.10.2" }
+  - is_false: tagline
+  - do:
+      search:
+        index: comp_cat_idx
+        pretty: true
+        filter_path: "hits.total,hits.hits._id"
+        body:
+          query:
+            match_all: {}
+  - match: { hits.total.value: 2 }
+  - is_false: _shards
+
+---
+"Analyze and terms_enum endpoints":
+  - do:
+      indices.analyze:
+        index: comp_cat_idx
+        body:
+          analyzer: "standard"
+          text: "Quick Brown Fox"
+  - length: { tokens: 3 }
+  - match: { tokens.0.token: "quick" }
+  - match: { tokens.1.token: "brown" }
+  - match: { tokens.2.token: "fox" }
+  - do:
+      terms_enum:
+        index: comp_cat_idx
+        body:
+          field: "service"
+          string: "catalog-"
+  - is_true: complete
+  - length: { terms: 2 }
+
+---
+"Error handling catch bad_request and regex error matching":
+  - do:
+      catch: bad_request
+      search:
+        index: comp_cat_idx
+        body: "{ malformed json"
+  - do:
+      catch: /parse_exception|parsing_exception|illegal_argument_exception/
+      search:
+        index: comp_cat_idx
+        body: "{ malformed json"

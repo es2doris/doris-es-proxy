@@ -1486,3 +1486,84 @@ func TestRound45SchemaWildcardsNumericBoundsAndIgnoreMalformed(t *testing.T) {
 		t.Fatalf("F9 expected malformed f__f_ignore and f__ip_ignore to be nil, got f_ignore=%v ip_ignore=%v", row["f__f_ignore"], row["f__ip_ignore"])
 	}
 }
+
+func TestRound46SchemaDottedMappingsDateMathAndNestedIgnoreMalformed(t *testing.T) {
+	ignoreMalformedTrue := true
+	spec := esast.MappingSpec{
+		Dynamic: "strict",
+		Properties: map[string]esast.FieldProperty{
+			"user.name":  {Type: "keyword"},
+			"user.score": {Type: "integer", IgnoreMalformed: &ignoreMalformedTrue},
+			"event_date": {Type: "date"},
+			"items": {
+				Type: "nested",
+				Properties: map[string]esast.FieldProperty{
+					"sku":   {Type: "keyword"},
+					"price": {Type: "integer", IgnoreMalformed: &ignoreMalformedTrue},
+				},
+			},
+		},
+	}
+	sch := CompileIndexSchema("db", "r46_sch_idx", &spec)
+
+	// F5: Dotted mapping property names ("user.name") work with both nested JSON {"user":{"name":"alice"}} and flat {"user.name":"bob"} under dynamic: "strict"
+	shredNested, err := ShredDocument(sch, "1", 1, false, []byte(`{
+		"user": {"name": "alice", "score": "bad_int"},
+		"event_date": "2025-03-10||+1M/d",
+		"items": [
+			{"sku": "A", "price": 10},
+			{"sku": "B", "price": "not_an_int"},
+			{"sku": "C", "price": 30}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("F5/F6/F7 ShredDocument failed: %v", err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(shredNested, &row); err != nil {
+		t.Fatalf("unmarshal shredded row failed: %v", err)
+	}
+	if row["f__user__name"] != "alice" {
+		t.Fatalf("F5 expected f__user__name='alice', got %v", row["f__user__name"])
+	}
+	// F7: 2025-03-10 + 1M /d -> 2025-04-10T00:00:00Z (1744243200000)
+	if row["f__event_date"] != float64(1744243200000) {
+		t.Fatalf("F7 expected f__event_date=1744243200000 for 2025-03-10||+1M/d, got %v", row["f__event_date"])
+	}
+	// F6: Nested subfield ignore_malformed preserves each element's scalar price in _doc without overwriting with slice [10, 30]
+	docMap, _ := row["_doc"].(map[string]any)
+	itemsArr, _ := docMap["items"].([]any)
+	if len(itemsArr) != 3 {
+		t.Fatalf("F6 expected 3 items in _doc.items, got %+v", itemsArr)
+	}
+	item0, _ := itemsArr[0].(map[string]any)
+	item1, _ := itemsArr[1].(map[string]any)
+	item2, _ := itemsArr[2].(map[string]any)
+	if item0["price"] != float64(10) || item1["price"] != nil || item2["price"] != float64(30) {
+		t.Fatalf("F6 expected item0.price=10, item1.price omitted, item2.price=30, got items=%+v", itemsArr)
+	}
+
+	// Also verify flat key {"user.name": "bob"} works and unmapped {"user": {"unknown": 1}} is rejected by strict
+	shredFlat, err := ShredDocument(sch, "2", 1, false, []byte(`{"user.name": "bob"}`))
+	if err != nil {
+		t.Fatalf("F5 flat dotted key ShredDocument failed: %v", err)
+	}
+	var rowFlat map[string]any
+	_ = json.Unmarshal(shredFlat, &rowFlat)
+	if rowFlat["f__user__name"] != "bob" {
+		t.Fatalf("F5 expected f__user__name='bob', got %v", rowFlat["f__user__name"])
+	}
+	if _, err := ShredDocument(sch, "3", 1, false, []byte(`{"user": {"unmapped_sub": "val"}}`)); err == nil {
+		t.Fatalf("F5 expected strict_dynamic_mapping_exception for unmapped sub-property under user")
+	}
+
+	// F7: Date math roundUp on month (/M) and year (/y)
+	msEndMonth, okM := ParseESDateBoundWithFormatToEpochMillis("2025-02-15||/M", "", time.Now().UTC(), true)
+	msEndYear, okY := ParseESDateBoundWithFormatToEpochMillis("2025-06-15||/y", "", time.Now().UTC(), true)
+	if !okM || msEndMonth != 1740787199999 { // 2025-02-28T23:59:59.999Z
+		t.Fatalf("F7 expected 2025-02-15||/M roundUp = 1740787199999, got %d (ok=%v)", msEndMonth, okM)
+	}
+	if !okY || msEndYear != 1767225599999 { // 2025-12-31T23:59:59.999Z
+		t.Fatalf("F7 expected 2025-06-15||/y roundUp = 1767225599999, got %d (ok=%v)", msEndYear, okY)
+	}
+}

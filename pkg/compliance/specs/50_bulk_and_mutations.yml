@@ -1,0 +1,225 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+---
+setup:
+  - do:
+      indices.create:
+        index: comp_bulk_idx
+        body:
+          mappings:
+            properties:
+              service:
+                type: keyword
+              status:
+                type: integer
+              retries:
+                type: integer
+              message:
+                type: text
+
+---
+"Bulk index create update and delete":
+  - do:
+      bulk:
+        index: comp_bulk_idx
+        body:
+          - index: { _id: "b1" }
+          - { service: "auth", status: 200, retries: 0, message: "login ok" }
+          - create: { _id: "b2" }
+          - { service: "billing", status: 500, retries: 2, message: "charge failed" }
+          - index: { _id: "b3" }
+          - { service: "search", status: 200, retries: 1, message: "query ok" }
+  - is_false: errors
+  - length: { items: 3 }
+  - do:
+      bulk:
+        index: comp_bulk_idx
+        body:
+          - update: { _id: "b2" }
+          - doc: { status: 200, retries: 3 }
+          - delete: { _id: "b3" }
+  - is_false: errors
+  - length: { items: 2 }
+  - do:
+      get:
+        index: comp_bulk_idx
+        id: "b2"
+  - match: { _source.status: 200 }
+  - match: { _source.retries: 3 }
+  - match: { _source.service: "billing" }
+  - do:
+      exists:
+        index: comp_bulk_idx
+        id: "b3"
+  - is_false: ''
+
+---
+"Partial document update and detect_noop":
+  - do:
+      index:
+        index: comp_bulk_idx
+        id: "u1"
+        body:
+          service: "gateway"
+          status: 200
+          retries: 1
+          message: "initial state"
+  - do:
+      update:
+        index: comp_bulk_idx
+        id: "u1"
+        body:
+          doc:
+            service: "gateway"
+            status: 200
+          detect_noop: true
+  - match: { result: "noop" }
+  - do:
+      update:
+        index: comp_bulk_idx
+        id: "u1"
+        body:
+          doc:
+            status: 503
+            retries: 4
+  - match: { result: "updated" }
+  - do:
+      get:
+        index: comp_bulk_idx
+        id: "u1"
+  - match: { _source.service: "gateway" }
+  - match: { _source.status: 503 }
+  - match: { _source.retries: 4 }
+
+---
+"Scripted update with Painless and upsert":
+  - do:
+      update:
+        index: comp_bulk_idx
+        id: "u_upsert"
+        body:
+          script:
+            source: "ctx._source.retries += params.inc"
+            params:
+              inc: 5
+          upsert:
+            service: "worker"
+            status: 202
+            retries: 1
+            message: "upserted doc"
+  - match: { result: "created" }
+  - do:
+      update:
+        index: comp_bulk_idx
+        id: "u_upsert"
+        body:
+          script:
+            source: "ctx._source.retries += params.inc"
+            params:
+              inc: 5
+  - match: { result: "updated" }
+  - do:
+      get:
+        index: comp_bulk_idx
+        id: "u_upsert"
+  - match: { _source.retries: 6 }
+  - match: { _source.service: "worker" }
+
+---
+"Update by query with script and query filter":
+  - do:
+      bulk:
+        index: comp_bulk_idx
+        body:
+          - index: { _id: "ubq1" }
+          - { service: "api", status: 500, retries: 1, message: "err 1" }
+          - index: { _id: "ubq2" }
+          - { service: "api", status: 500, retries: 2, message: "err 2" }
+          - index: { _id: "ubq3" }
+          - { service: "web", status: 200, retries: 0, message: "ok" }
+  - do:
+      update_by_query:
+        index: comp_bulk_idx
+        body:
+          query:
+            term:
+              service: "api"
+          script:
+            source: "ctx._source.status = 200; ctx._source.retries = ctx._source.retries + 10"
+  - match: { updated: 2 }
+  - do:
+      get:
+        index: comp_bulk_idx
+        id: "ubq1"
+  - match: { _source.status: 200 }
+  - match: { _source.retries: 11 }
+
+---
+"Delete by query with filter":
+  - do:
+      bulk:
+        index: comp_bulk_idx
+        body:
+          - index: { _id: "dbq1" }
+          - { service: "temp", status: 404, retries: 0, message: "drop me 1" }
+          - index: { _id: "dbq2" }
+          - { service: "temp", status: 404, retries: 0, message: "drop me 2" }
+          - index: { _id: "dbq3" }
+          - { service: "keep", status: 200, retries: 0, message: "keep me" }
+  - do:
+      delete_by_query:
+        index: comp_bulk_idx
+        body:
+          query:
+            term:
+              service: "temp"
+  - match: { deleted: 2 }
+  - do:
+      count:
+        index: comp_bulk_idx
+  - match: { count: 1 }
+
+---
+"Reindex from source to destination index":
+  - do:
+      bulk:
+        index: comp_bulk_idx
+        body:
+          - index: { _id: "r1" }
+          - { service: "payments", status: 200, retries: 0, message: "paid" }
+          - index: { _id: "r2" }
+          - { service: "orders", status: 500, retries: 1, message: "failed" }
+  - do:
+      indices.create:
+        index: comp_reindex_dest
+        body:
+          mappings:
+            properties:
+              service:
+                type: keyword
+              status:
+                type: integer
+              retries:
+                type: integer
+              message:
+                type: text
+  - do:
+      reindex:
+        body:
+          source:
+            index: comp_bulk_idx
+            query:
+              term:
+                status: 200
+          dest:
+            index: comp_reindex_dest
+  - match: { created: 1 }
+  - match: { total: 1 }
+  - do:
+      get:
+        index: comp_reindex_dest
+        id: "r1"
+  - is_true: found
+  - match: { _source.service: "payments" }

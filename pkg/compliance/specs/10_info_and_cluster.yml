@@ -1,0 +1,88 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+---
+"Root info endpoint":
+  - do:
+      info: {}
+  - match: { name: "doris-es-proxy" }
+  - match: { cluster_name: "apache-doris-search-cluster" }
+  - match: { version.number: "7.10.2" }
+  - match: { tagline: "/You Know, for Search/" }
+  - is_true: version.number
+
+---
+"Cluster health endpoint":
+  - do:
+      indices.create:
+        index: comp_cluster_health_idx
+  - do:
+      cluster.health: {}
+  - match: { cluster_name: "apache-doris-search-cluster" }
+  - match: { status: "green" }
+  - is_false: timed_out
+  - gte: { number_of_nodes: 1 }
+  - do:
+      cluster.health:
+        index: comp_cluster_health_idx
+  - match: { status: "green" }
+
+---
+"Cluster state endpoint":
+  - do:
+      indices.create:
+        index: comp_cluster_state_idx
+        body:
+          mappings:
+            properties:
+              service:
+                type: keyword
+  - do:
+      cluster.state: {}
+  - match: { cluster_name: "apache-doris-search-cluster" }
+  - match: { master_node: "doris-fe-1" }
+  - is_true: metadata.indices.comp_cluster_state_idx
+  - match: { metadata.indices.comp_cluster_state_idx.state: "open" }
+
+---
+"Cluster stats endpoint":
+  - do:
+      cluster.stats: {}
+  - match: { cluster_name: "apache-doris-search-cluster" }
+  - match: { status: "green" }
+  - match: { nodes.count.total: 1 }
+  - gte: { indices.count: 0 }
+
+---
+"Cluster settings get and put":
+  - do:
+      cluster.get_settings: {}
+  - is_true: persistent
+  - is_true: transient
+  - do:
+      cluster.put_settings:
+        body:
+          transient:
+            indices.recovery.max_bytes_per_sec: "50mb"
+  - is_true: acknowledged
+
+---
+"Nodes info stats and cat health nodes":
+  - do:
+      nodes.info: {}
+  - match: { _nodes.total: 1 }
+  - match: { cluster_name: "apache-doris-search-cluster" }
+  - match: { nodes.doris-fe-1.version: "7.10.2" }
+  - do:
+      nodes.stats: {}
+  - match: { _nodes.total: 1 }
+  - match: { cluster_name: "apache-doris-search-cluster" }
+  - do:
+      cat.health: {}
+  - length: { $body: 1 }
+  - match: { 0.status: "green" }
+  - do:
+      cat.nodes: {}
+  - length: { $body: 1 }
+  - match: { 0.name: "doris-fe-1" }

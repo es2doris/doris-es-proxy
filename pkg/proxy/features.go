@@ -867,6 +867,32 @@ func (s *Server) handleDorisShadowStats(w http.ResponseWriter, _ *http.Request) 
 }
 
 // handleResolveIndex implements `GET /_resolve/index/{name}` for Kibana 8.x Data Views & Grafana 10+.
+func matchMultiWildcardWithExclusions(rawPattern, candidate string) bool {
+	if rawPattern == "" || rawPattern == "*" || rawPattern == "_all" {
+		return true
+	}
+	parts := strings.Split(rawPattern, ",")
+	matchedPos := false
+	excluded := false
+	for _, rawPart := range parts {
+		p := strings.TrimSpace(rawPart)
+		if p == "" {
+			continue
+		}
+		if strings.HasPrefix(p, "-") {
+			neg := strings.TrimSpace(strings.TrimPrefix(p, "-"))
+			if neg != "" && (neg == "_all" || matchWildcardPattern(neg, candidate)) {
+				excluded = true
+			}
+			continue
+		}
+		if p == "_all" || matchWildcardPattern(p, candidate) {
+			matchedPos = true
+		}
+	}
+	return matchedPos && !excluded
+}
+
 func (s *Server) handleResolveIndex(w http.ResponseWriter, r *http.Request) {
 	pattern := r.PathValue("name")
 	if pattern == "" {
@@ -875,6 +901,16 @@ func (s *Server) handleResolveIndex(w http.ResponseWriter, r *http.Request) {
 	_ = s.syncCatalogFromBackend(r.Context())
 
 	s.mu.RLock()
+	backingToDS := make(map[string]string)
+	for dsName, ds := range s.dataStreams {
+		if ds == nil {
+			continue
+		}
+		for _, biName := range extractDataStreamBackingIndexNames(ds) {
+			backingToDS[biName] = dsName
+		}
+	}
+
 	var indicesOut []map[string]any
 	idxNames := make([]string, 0, len(s.indices))
 	for name := range s.indices {
@@ -882,7 +918,7 @@ func (s *Server) handleResolveIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(idxNames)
 	for _, name := range idxNames {
-		if matchWildcardPattern(pattern, name) {
+		if matchMultiWildcardWithExclusions(pattern, name) {
 			var idxAliases []string
 			for al, targets := range s.aliases {
 				for _, t := range targets {
@@ -899,6 +935,9 @@ func (s *Server) handleResolveIndex(w http.ResponseWriter, r *http.Request) {
 			if len(idxAliases) > 0 {
 				entry["aliases"] = idxAliases
 			}
+			if dsName, ok := backingToDS[name]; ok {
+				entry["data_stream"] = dsName
+			}
 			indicesOut = append(indicesOut, entry)
 		}
 	}
@@ -910,10 +949,37 @@ func (s *Server) handleResolveIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(alNames)
 	for _, al := range alNames {
-		if matchWildcardPattern(pattern, al) {
+		if matchMultiWildcardWithExclusions(pattern, al) {
 			aliasesOut = append(aliasesOut, map[string]any{
 				"name":    al,
 				"indices": append([]string(nil), s.aliases[al]...),
+			})
+		}
+	}
+
+	var dataStreamsOut []map[string]any
+	dsNames := make([]string, 0, len(s.dataStreams))
+	for dsName := range s.dataStreams {
+		dsNames = append(dsNames, dsName)
+	}
+	sort.Strings(dsNames)
+	for _, dsName := range dsNames {
+		if matchMultiWildcardWithExclusions(pattern, dsName) {
+			ds := s.dataStreams[dsName]
+			if ds == nil {
+				continue
+			}
+			backing := extractDataStreamBackingIndexNames(ds)
+			tsField := "@timestamp"
+			if tfMap, ok := ds["timestamp_field"].(map[string]any); ok {
+				if nameStr, ok := tfMap["name"].(string); ok && nameStr != "" {
+					tsField = nameStr
+				}
+			}
+			dataStreamsOut = append(dataStreamsOut, map[string]any{
+				"name":            dsName,
+				"backing_indices": backing,
+				"timestamp_field": tsField,
 			})
 		}
 	}
@@ -925,12 +991,39 @@ func (s *Server) handleResolveIndex(w http.ResponseWriter, r *http.Request) {
 	if aliasesOut == nil {
 		aliasesOut = []map[string]any{}
 	}
+	if dataStreamsOut == nil {
+		dataStreamsOut = []map[string]any{}
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"indices":      indicesOut,
 		"aliases":      aliasesOut,
-		"data_streams": []any{},
+		"data_streams": dataStreamsOut,
 	})
+}
+
+func extractDataStreamBackingIndexNames(ds map[string]any) []string {
+	var backing []string
+	switch raw := ds["indices"].(type) {
+	case []any:
+		for _, item := range raw {
+			if m, ok := item.(map[string]any); ok {
+				if idxName, ok := m["index_name"].(string); ok && idxName != "" {
+					backing = append(backing, idxName)
+				}
+			}
+		}
+	case []map[string]any:
+		for _, m := range raw {
+			if idxName, ok := m["index_name"].(string); ok && idxName != "" {
+				backing = append(backing, idxName)
+			}
+		}
+	}
+	if backing == nil {
+		backing = []string{}
+	}
+	return backing
 }
 
 // handleIndexStats implements `GET /_stats` and `GET /{index}/_stats` for Elasticvue, Cerebro, and monitoring clients.
@@ -1020,9 +1113,13 @@ func (s *Server) handleSearchShards(w http.ResponseWriter, r *http.Request) {
 
 // handleIngestPipeline provides compatibility for Beats, OTel, and Logstash `/_ingest/pipeline` checks.
 func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+	id := strings.TrimSpace(r.PathValue("id"))
 	switch r.Method {
 	case http.MethodPut, http.MethodPost:
+		if id == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: pipeline id is missing;")
+			return
+		}
 		bodyBytes, ok := readRequestBody(w, r)
 		if !ok {
 			return
@@ -1045,45 +1142,153 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 		if s.pipelines == nil {
 			s.pipelines = make(map[string]map[string]any)
 		}
-		if id != "" {
-			s.pipelines[id] = body
-		}
+		s.pipelines[id] = body
 		s.mu.Unlock()
-		if id != "" {
-			s.persistIngestPipeline(r.Context(), id, body)
-		}
+		s.persistIngestPipeline(r.Context(), id, body)
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 	case http.MethodDelete:
+		if id == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: pipeline id is missing;")
+			return
+		}
 		_ = s.syncCatalogFromBackend(r.Context())
+		parts := strings.Split(id, ",")
 		s.mu.Lock()
-		delete(s.pipelines, id)
+		var toDelete []string
+		deletedSet := make(map[string]bool)
+		for _, rawPart := range parts {
+			pat := strings.TrimSpace(rawPart)
+			if pat == "" {
+				continue
+			}
+			if pat == "*" || pat == "_all" {
+				for k := range s.pipelines {
+					if !deletedSet[k] {
+						deletedSet[k] = true
+						toDelete = append(toDelete, k)
+					}
+				}
+				continue
+			}
+			if strings.Contains(pat, "*") {
+				matchedAny := false
+				for k := range s.pipelines {
+					if matchWildcardPattern(pat, k) {
+						matchedAny = true
+						if !deletedSet[k] {
+							deletedSet[k] = true
+							toDelete = append(toDelete, k)
+						}
+					}
+				}
+				if !matchedAny {
+					s.mu.Unlock()
+					writeESError(w, http.StatusNotFound, "resource_not_found_exception", "pipeline ["+pat+"] is missing")
+					return
+				}
+				continue
+			}
+			if _, ok := s.pipelines[pat]; !ok {
+				s.mu.Unlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "pipeline ["+pat+"] is missing")
+				return
+			}
+			if !deletedSet[pat] {
+				deletedSet[pat] = true
+				toDelete = append(toDelete, pat)
+			}
+		}
+		for _, k := range toDelete {
+			delete(s.pipelines, k)
+		}
 		s.mu.Unlock()
-		if id != "" {
-			s.deleteIngestPipelineCatalog(r.Context(), id)
+		for _, k := range toDelete {
+			s.deleteIngestPipelineCatalog(r.Context(), k)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
-	case http.MethodGet:
+	case http.MethodGet, http.MethodHead:
 		_ = s.syncCatalogFromBackend(r.Context())
 		s.mu.RLock()
 		defer s.mu.RUnlock()
-		if id != "" {
-			if p, ok := s.pipelines[id]; ok {
-				writeJSON(w, http.StatusOK, map[string]any{id: p})
+		if id == "" || id == "*" || id == "_all" {
+			if r.Method == http.MethodHead {
+				if len(s.pipelines) == 0 {
+					w.WriteHeader(http.StatusNotFound)
+				} else {
+					w.WriteHeader(http.StatusOK)
+				}
 				return
 			}
-			writeJSON(w, http.StatusOK, map[string]any{
-				id: map[string]any{"description": "doris-es-proxy default pipeline", "processors": []any{}},
-			})
+			out := make(map[string]any, len(s.pipelines))
+			for k, v := range s.pipelines {
+				out[k] = v
+			}
+			writeJSON(w, http.StatusOK, out)
 			return
 		}
-		out := make(map[string]any, len(s.pipelines))
-		for k, v := range s.pipelines {
-			out[k] = v
+		parts := strings.Split(id, ",")
+		out := make(map[string]any)
+		for _, rawPart := range parts {
+			pat := strings.TrimSpace(rawPart)
+			if pat == "" {
+				continue
+			}
+			if pat == "*" || pat == "_all" {
+				for k, v := range s.pipelines {
+					out[k] = v
+				}
+				continue
+			}
+			if strings.Contains(pat, "*") {
+				for k, v := range s.pipelines {
+					if matchWildcardPattern(pat, k) {
+						out[k] = v
+					}
+				}
+				continue
+			}
+			p, ok := s.pipelines[pat]
+			if !ok {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "pipeline ["+pat+"] is missing")
+				return
+			}
+			out[pat] = p
+		}
+		if len(out) == 0 {
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "pipeline ["+id+"] is missing")
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
 		}
 		writeJSON(w, http.StatusOK, out)
 	default:
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
 	}
+}
+
+func isSupportedIngestProcessorType(procType string) bool {
+	switch procType {
+	case "drop", "fail", "pipeline", "dissect", "set", "default", "rename", "copy",
+		"remove", "lowercase", "uppercase", "trim", "split", "join", "append",
+		"convert", "gsub", "json", "kv", "dot_expander", "urlencode", "urldecode",
+		"bytes", "html_strip", "date", "date_index_name", "grok", "sort", "compact",
+		"dedup", "dedupe", "fingerprint", "redact", "attachment", "csv", "user_agent",
+		"uri_parts", "registered_domain", "network_direction", "community_id",
+		"geoip", "enrich", "foreach", "script", "inference", "set_security_user",
+		"circle", "reroute":
+		return true
+	}
+	return false
 }
 
 func validateIngestPipelineProcessors(procs []any) error {
@@ -1092,7 +1297,19 @@ func validateIngestPipelineProcessors(procs []any) error {
 		if !ok {
 			continue
 		}
+		if topOnFail, ok := pm["on_failure"].([]any); ok {
+			if err := validateIngestPipelineProcessors(topOnFail); err != nil {
+				return err
+			}
+		}
 		for procType, rawSpec := range pm {
+			switch procType {
+			case "tag", "ignore_failure", "on_failure", "if", "description":
+				continue
+			}
+			if !isSupportedIngestProcessorType(procType) {
+				return fmt.Errorf("no processor type exists with name [%s]", procType)
+			}
 			specMap, ok := rawSpec.(map[string]any)
 			if !ok {
 				continue
@@ -1109,6 +1326,22 @@ func validateIngestPipelineProcessors(procs []any) error {
 				exclAny, hasExcl := specMap["exclude_fields"].([]any)
 				if (hasFields && hasExcl) && (len(fieldsAny) > 0 || len(exclAny) > 0) {
 					return fmt.Errorf("cannot specify both [fields] and [exclude_fields]")
+				}
+			case "set_security_user":
+				field, _ := specMap["field"].(string)
+				if strings.TrimSpace(field) == "" {
+					return fmt.Errorf("[field] required property is missing")
+				}
+			case "foreach":
+				if subProc, ok := specMap["processor"].(map[string]any); ok && subProc != nil {
+					if err := validateIngestPipelineProcessors([]any{subProc}); err != nil {
+						return err
+					}
+				}
+				if subProcs, ok := specMap["processors"].([]any); ok {
+					if err := validateIngestPipelineProcessors(subProcs); err != nil {
+						return err
+					}
 				}
 			}
 			if onFail, ok := specMap["on_failure"].([]any); ok {
@@ -3297,22 +3530,33 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 		if field != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				switch v := val.(type) {
-				case string:
-					bVal, err := parseIngestByteSize(v)
-					if err != nil {
-						return false, false, procType, procTag, specMap, err
+				parseByteElem := func(el any) (int64, error) {
+					switch ev := el.(type) {
+					case string:
+						return parseIngestByteSize(ev)
+					case int:
+						return int64(ev), nil
+					case int64:
+						return ev, nil
+					case float64:
+						return int64(ev), nil
+					case json.Number:
+						if iv, err := ev.Int64(); err == nil {
+							return iv, nil
+						}
+						if fv, err := ev.Float64(); err == nil {
+							return int64(fv), nil
+						}
+						return parseIngestByteSize(ev.String())
+					default:
+						return 0, fmt.Errorf("field [%s] is not a string", field)
 					}
-					setIngestPath(doc, target, bVal)
-					mutated = true
+				}
+				switch v := val.(type) {
 				case []any:
 					outArr := make([]any, len(v))
 					for idx, el := range v {
-						sEl, isStr := el.(string)
-						if !isStr {
-							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
-						}
-						bVal, err := parseIngestByteSize(sEl)
+						bVal, err := parseByteElem(el)
 						if err != nil {
 							return false, false, procType, procTag, specMap, err
 						}
@@ -3321,7 +3565,12 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					setIngestPath(doc, target, outArr)
 					mutated = true
 				default:
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
+					bVal, err := parseByteElem(v)
+					if err != nil {
+						return false, false, procType, procTag, specMap, err
+					}
+					setIngestPath(doc, target, bVal)
+					mutated = true
 				}
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
@@ -4075,12 +4324,27 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			keepOrig = ko
 		}
 		removeIfSuccess, _ := specMap["remove_if_successful"].(bool)
+		ignoreMissing, _ := specMap["ignore_missing"].(bool)
 		if field != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
 				rawURI := fmt.Sprintf("%v", val)
-				u, err := url.Parse(rawURI)
+				parseInput := rawURI
+				syntheticScheme := false
+				if !strings.Contains(rawURI, "://") {
+					if colonIdx := strings.IndexByte(rawURI, ':'); colonIdx > 0 {
+						slashIdx := strings.IndexByte(rawURI, '/')
+						if (slashIdx == -1 || colonIdx < slashIdx) && colonIdx+1 < len(rawURI) && rawURI[colonIdx+1] >= '0' && rawURI[colonIdx+1] <= '9' {
+							parseInput = "http://" + rawURI
+							syntheticScheme = true
+						}
+					}
+				}
+				u, err := url.Parse(parseInput)
 				if err != nil {
 					return false, false, procType, procTag, specMap, err
+				}
+				if syntheticScheme {
+					u.Scheme = ""
 				}
 				parts := map[string]any{}
 				if keepOrig {
@@ -4133,7 +4397,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					setIngestPath(doc, target, parts)
 				}
 				mutated = true
-			} else if isExplicitIgnoreMissingFalse(specMap) {
+			} else if !ignoreMissing {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
 		}
@@ -4144,6 +4408,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		if tf, _ := specMap["target_field"].(string); tf != "" {
 			target = expandIngestFieldName(tf, doc)
 		}
+		ignoreMissing, _ := specMap["ignore_missing"].(bool)
 		if field != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
 				fqdn := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", val))), ".")
@@ -4152,18 +4417,20 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				isIP := net.ParseIP(strings.Trim(fqdn, "[]")) != nil
 				isSecondLevelPublicSuffix := func(sld string) bool {
 					switch sld {
-					case "co", "com", "org", "gov", "ac", "net", "edu", "mil":
+					case "co", "com", "org", "gov", "govt", "ac", "net", "edu", "mil",
+						"or", "ne", "go", "ed", "gr", "lg", "gob", "nom", "ind",
+						"res", "ernet", "nic", "gen", "biz", "info", "per", "id", "asn", "me":
 						return true
 					}
 					return false
 				}
 				if !isIP && len(labels) >= 2 && labels[0] != "" && labels[len(labels)-1] != "" {
 					tld := labels[len(labels)-1]
-					if len(labels) == 2 && len(labels[0]) <= 3 && isSecondLevelPublicSuffix(labels[0]) {
+					if len(labels) == 2 && len(tld) == 2 && len(labels[0]) <= 5 && isSecondLevelPublicSuffix(labels[0]) {
 						out["top_level_domain"] = labels[0] + "." + tld
 					} else {
 						regDom := labels[len(labels)-2] + "." + tld
-						if len(labels) >= 3 && len(labels[len(labels)-2]) <= 3 && isSecondLevelPublicSuffix(labels[len(labels)-2]) {
+						if len(labels) >= 3 && len(tld) == 2 && len(labels[len(labels)-2]) <= 5 && isSecondLevelPublicSuffix(labels[len(labels)-2]) {
 							tld = labels[len(labels)-2] + "." + labels[len(labels)-1]
 							regDom = labels[len(labels)-3] + "." + tld
 							if len(labels) > 3 {
@@ -4178,7 +4445,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				}
 				setIngestPath(doc, target, out)
 				mutated = true
-			} else if isExplicitIgnoreMissingFalse(specMap) {
+			} else if !ignoreMissing {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
 		}
@@ -4530,6 +4797,48 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 		setIngestPath(doc, targetField, resultObj)
 		mutated = true
+	case "set_security_user":
+		field, _ := specMap["field"].(string)
+		field = strings.TrimSpace(expandIngestFieldName(field, doc))
+		if field == "" {
+			return false, false, procType, procTag, specMap, fmt.Errorf("[field] required property is missing")
+		}
+		userObj := map[string]any{
+			"username":  "elastic",
+			"roles":     []any{"superuser"},
+			"full_name": nil,
+			"email":     nil,
+			"metadata":  map[string]any{},
+			"enabled":   true,
+			"authentication_realm": map[string]any{
+				"name": "default_native",
+				"type": "native",
+			},
+			"lookup_realm": map[string]any{
+				"name": "default_native",
+				"type": "native",
+			},
+			"authentication_type": "realm",
+		}
+		if props, ok := specMap["properties"].([]any); ok && len(props) > 0 {
+			allowed := make(map[string]bool, len(props))
+			for _, p := range props {
+				if ps, ok := p.(string); ok {
+					allowed[ps] = true
+				}
+			}
+			for k := range userObj {
+				if !allowed[k] {
+					delete(userObj, k)
+				}
+			}
+		}
+		setIngestPath(doc, field, userObj)
+		mutated = true
+	case "circle", "reroute":
+		// Supported compatibility processors
+	default:
+		return false, false, procType, procTag, specMap, fmt.Errorf("no processor type exists with name [%s]", procType)
 	}
 	return mutated, false, procType, procTag, specMap, nil
 }
@@ -4977,6 +5286,10 @@ func applyIngestPipelineSpecWithRoutingAndIngestMeta(s *Server, pipe map[string]
 
 // handleSimulateIngestPipeline implements `POST /_ingest/pipeline/_simulate` and `POST /_ingest/pipeline/{id}/_simulate`.
 func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
+		return
+	}
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
 		return
@@ -4992,7 +5305,12 @@ func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Req
 		}
 	}
 	pipe := req.Pipeline
-	if pipe == nil {
+	if pipe != nil {
+		if err := validateIngestPipelineSpec(pipe); err != nil {
+			writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+			return
+		}
+	} else {
 		if id := r.PathValue("id"); id != "" {
 			_ = s.syncCatalogFromBackend(r.Context())
 			s.mu.RLock()
@@ -5145,7 +5463,7 @@ func convertSingleIngestValue(val any, convType string) (any, error) {
 	}
 	str := strings.TrimSpace(fmt.Sprintf("%v", val))
 	switch strings.ToLower(convType) {
-	case "integer", "int", "long":
+	case "integer", "int", "long", "short", "byte":
 		if iv, err := strconv.ParseInt(str, 10, 64); err == nil {
 			return iv, nil
 		}
@@ -5153,7 +5471,15 @@ func convertSingleIngestValue(val any, convType string) (any, error) {
 			return int64(fv), nil
 		}
 		return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
-	case "float", "double":
+	case "unsigned_long":
+		if uv, err := strconv.ParseUint(str, 10, 64); err == nil {
+			return uv, nil
+		}
+		if fv, err := strconv.ParseFloat(str, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv >= 0 {
+			return uint64(fv), nil
+		}
+		return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
+	case "float", "double", "half_float", "scaled_float":
 		if fv, err := strconv.ParseFloat(str, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
 			return fv, nil
 		}
@@ -5664,23 +5990,107 @@ func (s *Server) handleCatHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeCatResponse(w http.ResponseWriter, r *http.Request, headers []string, rows []map[string]any) {
+	if isTruthyBoolQueryParam(r, "help") {
+		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(http.StatusOK)
+		for _, h := range headers {
+			// #nosec G705 -- Content-Type is text/plain with X-Content-Type-Options: nosniff
+			_, _ = fmt.Fprintf(w, "%-20s |   | %s\n", h, h)
+		}
+		return
+	}
+
+	if rawSort := strings.TrimSpace(r.URL.Query().Get("s")); rawSort != "" && len(rows) > 1 {
+		type sortCol struct {
+			col  string
+			desc bool
+		}
+		var scols []sortCol
+		for _, part := range strings.Split(rawSort, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			col := part
+			desc := false
+			if colonIdx := strings.IndexByte(part, ':'); colonIdx > 0 {
+				col = strings.TrimSpace(part[:colonIdx])
+				ord := strings.ToLower(strings.TrimSpace(part[colonIdx+1:]))
+				desc = ord == "desc" || ord == "d"
+			}
+			scols = append(scols, sortCol{col: col, desc: desc})
+		}
+		if len(scols) > 0 {
+			sort.SliceStable(rows, func(i, j int) bool {
+				for _, sc := range scols {
+					cmp := compareAny(rows[i][sc.col], rows[j][sc.col])
+					if cmp != 0 {
+						if sc.desc {
+							return cmp > 0
+						}
+						return cmp < 0
+					}
+				}
+				return false
+			})
+		}
+	}
+
+	effHeaders := headers
+	hasCustomH := false
+	if rawH := strings.TrimSpace(r.URL.Query().Get("h")); rawH != "" {
+		var custom []string
+		for _, part := range strings.Split(rawH, ",") {
+			col := strings.TrimSpace(part)
+			if col != "" {
+				custom = append(custom, col)
+			}
+		}
+		if len(custom) > 0 {
+			effHeaders = custom
+			hasCustomH = true
+		}
+	}
+
 	format := strings.ToLower(r.URL.Query().Get("format"))
 	if format == "text" || format == "txt" {
 		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.WriteHeader(http.StatusOK)
-		if r.URL.Query().Has("v") {
+		if isTruthyBoolQueryParam(r, "v") {
 			// #nosec G705 -- Content-Type is text/plain with X-Content-Type-Options: nosniff
-			_, _ = fmt.Fprintln(w, strings.Join(headers, "\t"))
+			_, _ = fmt.Fprintln(w, strings.Join(effHeaders, "\t"))
 		}
 		for _, row := range rows {
-			vals := make([]string, 0, len(headers))
-			for _, h := range headers {
-				vals = append(vals, fmt.Sprintf("%v", row[h]))
+			vals := make([]string, 0, len(effHeaders))
+			for _, h := range effHeaders {
+				v, exists := row[h]
+				if !exists || v == nil {
+					vals = append(vals, "")
+				} else {
+					vals = append(vals, fmt.Sprintf("%v", v))
+				}
 			}
 			// #nosec G705 -- Content-Type is text/plain with X-Content-Type-Options: nosniff
 			_, _ = fmt.Fprintln(w, strings.Join(vals, "\t"))
 		}
+		return
+	}
+	if hasCustomH {
+		projected := make([]map[string]any, len(rows))
+		for i, row := range rows {
+			m := make(map[string]any, len(effHeaders))
+			for _, h := range effHeaders {
+				if v, ok := row[h]; ok {
+					m[h] = v
+				} else {
+					m[h] = nil
+				}
+			}
+			projected[i] = m
+		}
+		writeJSON(w, http.StatusOK, projected)
 		return
 	}
 	writeJSON(w, http.StatusOK, rows)
@@ -5694,10 +6104,11 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		MaxDocs   *int   `json:"max_docs,omitempty"`
-		Size      *int   `json:"size,omitempty"`
-		Conflicts string `json:"conflicts,omitempty"`
-		Source    struct {
+		MaxDocs           *int     `json:"max_docs,omitempty"`
+		Size              *int     `json:"size,omitempty"`
+		Conflicts         string   `json:"conflicts,omitempty"`
+		RequestsPerSecond *float64 `json:"requests_per_second,omitempty"`
+		Source            struct {
 			Index   any                 `json:"index"`
 			Query   *esast.Query        `json:"query,omitempty"`
 			Size    *int                `json:"size,omitempty"`
@@ -5721,11 +6132,21 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	if body.Conflicts == "" {
 		body.Conflicts = r.URL.Query().Get("conflicts")
 	}
+	conflictsMode := strings.ToLower(strings.TrimSpace(body.Conflicts))
+	if conflictsMode != "" && conflictsMode != "abort" && conflictsMode != "proceed" {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("conflicts may only be \"abort\" or \"proceed\" but was [%s]", body.Conflicts))
+		return
+	}
 	if body.Dest.Pipeline == "" {
 		body.Dest.Pipeline = r.URL.Query().Get("pipeline")
 	}
 	if body.Dest.OpType == "" {
 		body.Dest.OpType = r.URL.Query().Get("op_type")
+	}
+	destOpType := strings.ToLower(strings.TrimSpace(body.Dest.OpType))
+	if destOpType != "" && destOpType != "index" && destOpType != "create" {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("op_type must be 'index' or 'create', found: [%s]", body.Dest.OpType))
+		return
 	}
 	destVerType := strings.ToLower(strings.TrimSpace(body.Dest.VersionType))
 	if destVerType != "" && destVerType != "internal" && destVerType != "external" && destVerType != "external_gt" && destVerType != "external_gte" {
@@ -5736,6 +6157,17 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	if destRoutingMode != "" && destRoutingMode != "keep" && destRoutingMode != "discard" && !strings.HasPrefix(destRoutingMode, "=") {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("invalid routing mode [%s] for reindex dest", body.Dest.Routing))
 		return
+	}
+	rps := -1.0
+	if body.RequestsPerSecond != nil {
+		rps = *body.RequestsPerSecond
+	}
+	if qRPS := strings.TrimSpace(r.URL.Query().Get("requests_per_second")); qRPS != "" {
+		if strings.EqualFold(qRPS, "unlimited") {
+			rps = -1.0
+		} else if parsed, err := strconv.ParseFloat(qRPS, 64); err == nil {
+			rps = parsed
+		}
 	}
 	var srcRoutingFilter string
 	switch rv := body.Source.Routing.(type) {
@@ -5795,7 +6227,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	}
 	aliasFilters = s.resolveTermsLookupsInAliasFilters(r.Context(), aliasFilters)
 
-	var totalMatched, totalCreated, totalUpdated, totalDeleted, versionConflicts, batches int
+	var totalMatched, totalCreated, totalUpdated, totalDeleted, totalNoops, versionConflicts, batches int
 	failures := make([]any, 0)
 	deletedVerByIdx := make(map[string]map[string]int64)
 	proceedOnConflict := strings.EqualFold(strings.TrimSpace(body.Conflicts), "proceed") ||
@@ -6048,6 +6480,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 					if opRes == "noop" {
+						totalNoops++
 						continue
 					}
 					docIsCreate = strings.EqualFold(updSpec.MetaOp, "create")
@@ -6095,6 +6528,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				if dropped {
+					totalNoops++
 					continue
 				}
 				if nextDocID != "" {
@@ -6193,9 +6627,11 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 					if !exists {
+						totalNoops++
 						continue
 					}
 					if pd.routing != "" && !s.docMatchesRequestRouting(pd.destIndex, pd.id, pd.routing) {
+						totalNoops++
 						continue
 					}
 					if pd.aliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), pd.destIndex, pd.id, existing.Source, pd.aliasFilter) {
@@ -6369,10 +6805,10 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		"deleted":                totalDeleted,
 		"batches":                batches,
 		"version_conflicts":      versionConflicts,
-		"noops":                  totalMatched - totalCreated - totalUpdated - totalDeleted - versionConflicts,
+		"noops":                  totalNoops,
 		"retries":                map[string]any{"bulk": 0, "search": 0},
 		"throttled_millis":       0,
-		"requests_per_second":    -1.0,
+		"requests_per_second":    rps,
 		"throttled_until_millis": 0,
 		"failures":               failures,
 	})
@@ -7351,6 +7787,12 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 	applyURISearchParams(r, &req)
 
 	idxSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
+	reqRouting := strings.TrimSpace(r.URL.Query().Get("routing"))
+	effRouting := s.resolveEffectiveReadRouting(r.PathValue("index"), indexName, reqRouting)
+	if s.isRoutingRequired(idxSchema) && effRouting == "" {
+		writeESError(w, http.StatusBadRequest, "routing_missing_exception", fmt.Sprintf("routing is required for [%s]/[%s]/[%s]", indexName, "_doc", docID))
+		return
+	}
 	s.resolveTermsLookupsInQuery(r.Context(), aliasFilter)
 	resolvedReq := s.resolveTermsLookupsInSearchRequest(r.Context(), &req)
 	idxSchema = s.augmentSchemaWithRuntimeMappings(idxSchema, resolvedReq.RuntimeMappings)
@@ -7365,6 +7807,10 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
 		return
+	}
+	if found && hit != nil && effRouting != "" && !s.docMatchesRequestRouting(indexName, docID, effRouting) {
+		found = false
+		hit = nil
 	}
 	if found && hit != nil {
 		hitSlice := []HitRow{*hit}
@@ -7439,7 +7885,7 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 		} else if origQuery != nil && origQuery.FunctionScore != nil && origQuery.FunctionScore.MinScore != nil {
 			effFuncScoreMin = origQuery.FunctionScore.MinScore
 		}
-		if resolvedReq.PostFilter != nil && !s.docMatchesAliasFilterWithSchema(r.Context(), indexName, idxSchema, docID, hit.Source, resolvedReq.PostFilter) {
+		if resolvedReq.PostFilter != nil && !s.docMatchesAliasFilterWithSchema(r.Context(), indexName, idxSchema, docID, effSrc, resolvedReq.PostFilter) {
 			matched = false
 			scoreVal = 0.0
 			desc = "no match on post_filter"
@@ -7459,7 +7905,7 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 			desc = "weight(" + cq.WhereSQL + ") [DorisInvertedIndex], result of: " + cq.ScoreSQL
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	outResp := map[string]any{
 		"_index":  indexName,
 		"_type":   "_doc",
 		"_id":     docID,
@@ -7469,7 +7915,54 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 			"description": desc,
 			"details":     []any{},
 		},
-	})
+	}
+	if r.URL.Query().Has("_source") || r.URL.Query().Has("_source_includes") || r.URL.Query().Has("_source_excludes") || r.URL.Query().Has("stored_fields") {
+		getObj := map[string]any{
+			"found":         true,
+			"_seq_no":       hit.Version,
+			"_primary_term": 1,
+			"_version":      hit.Version,
+		}
+		if resolvedReq.Source == nil || !resolvedReq.Source.Disabled {
+			filtered := filterSourceJSON(hit.Source, resolvedReq.Source)
+			var srcVal any
+			if len(filtered) > 0 {
+				dec := json.NewDecoder(bytes.NewReader(filtered))
+				dec.UseNumber()
+				_ = dec.Decode(&srcVal)
+			}
+			if srcVal == nil {
+				srcVal = map[string]any{}
+			}
+			getObj["_source"] = srcVal
+		}
+		storedFieldsList := esast.StoredFieldsSlice(resolvedReq.StoredFields)
+		omitAllStored := resolvedReq.HasStoredFieldsNone()
+		if !omitAllStored && len(storedFieldsList) > 0 {
+			var docMap map[string]any
+			dec := json.NewDecoder(bytes.NewReader(hit.Source))
+			dec.UseNumber()
+			_ = dec.Decode(&docMap)
+			fieldsMap := make(map[string]any)
+			for _, sf := range storedFieldsList {
+				if sf == "_none_" {
+					continue
+				}
+				if val, exists := getIngestPath(docMap, sf); exists && val != nil {
+					if arr, isArr := val.([]any); isArr {
+						fieldsMap[sf] = arr
+					} else {
+						fieldsMap[sf] = []any{val}
+					}
+				}
+			}
+			if len(fieldsMap) > 0 {
+				getObj["fields"] = fieldsMap
+			}
+		}
+		outResp["get"] = getObj
+	}
+	writeJSON(w, http.StatusOK, outResp)
 }
 
 func isIPInNetworkDirectionNets(ip net.IP, nets []string) bool {

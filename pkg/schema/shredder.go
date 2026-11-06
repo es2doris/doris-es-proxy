@@ -110,9 +110,10 @@ func ShredDocument(
 		}
 	}
 	type deferredDocMutation struct {
-		path       []string
-		deletePath bool
-		validLeafs []any
+		path         []string
+		deletePath   bool
+		validLeafs   []any
+		cleanBinding *FieldBinding
 	}
 	var deferredMutations []deferredDocMutation
 	deferReplacePath := func(path []string, validLeafs []any) {
@@ -126,6 +127,13 @@ func ShredDocument(
 		deferredMutations = append(deferredMutations, deferredDocMutation{
 			path:       path,
 			deletePath: true,
+		})
+	}
+	deferCleanNestedPath := func(path []string, b FieldBinding) {
+		bc := b
+		deferredMutations = append(deferredMutations, deferredDocMutation{
+			path:         path,
+			cleanBinding: &bc,
 		})
 	}
 	for _, b := range fieldsToVisit {
@@ -385,7 +393,11 @@ func ShredDocument(
 				if len(vals) > 0 {
 					row[b.ColumnName] = vals
 					if hadMalformed && isPrimaryFieldBinding(b) {
-						deferReplacePath(b.SourceJSONPath, validLeafs)
+						if b.Kind == StorageNestedSubfield {
+							deferCleanNestedPath(b.SourceJSONPath, b)
+						} else {
+							deferReplacePath(b.SourceJSONPath, validLeafs)
+						}
 					}
 				} else if hadMalformed && isPrimaryFieldBinding(b) {
 					deferDeletePath(b.SourceJSONPath)
@@ -409,11 +421,15 @@ func ShredDocument(
 			}
 			if hasObjAtPath && isPrimaryFieldBinding(b) {
 				if len(vals) > 0 {
-					validLeafs := make([]any, 0, len(vals))
-					for _, sv := range vals {
-						validLeafs = append(validLeafs, sv)
+					if b.Kind == StorageNestedSubfield {
+						deferCleanNestedPath(b.SourceJSONPath, b)
+					} else {
+						validLeafs := make([]any, 0, len(vals))
+						for _, sv := range vals {
+							validLeafs = append(validLeafs, sv)
+						}
+						deferReplacePath(b.SourceJSONPath, validLeafs)
 					}
-					deferReplacePath(b.SourceJSONPath, validLeafs)
 				} else {
 					deferDeletePath(b.SourceJSONPath)
 				}
@@ -726,7 +742,11 @@ func ShredDocument(
 		row["_ignored"] = ignoredFields
 	}
 	for _, mut := range deferredMutations {
-		if mut.deletePath {
+		if mut.cleanBinding != nil {
+			if cleanMalformedNestedLeafInMap(parsedDoc, mut.path, *mut.cleanBinding, getNow()) {
+				prunedDynamic = true
+			}
+		} else if mut.deletePath {
 			if deletePathInMap(parsedDoc, mut.path) {
 				prunedDynamic = true
 			}
@@ -1539,6 +1559,29 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 			continue
 		}
 		prop, exists := props[k]
+		if (!exists || prop.Type == "" || strings.EqualFold(prop.Type, "object")) && len(props) > 0 {
+			prefix := k + "."
+			var synthProps map[string]esast.FieldProperty
+			for pk, pv := range props {
+				if strings.HasPrefix(pk, prefix) {
+					if synthProps == nil {
+						synthProps = make(map[string]esast.FieldProperty)
+						for ek, ev := range prop.Properties {
+							synthProps[ek] = ev
+						}
+					}
+					synthProps[strings.TrimPrefix(pk, prefix)] = pv
+				}
+			}
+			if len(synthProps) > 0 {
+				if !exists {
+					prop = esast.FieldProperty{Type: "object", Properties: synthProps}
+					exists = true
+				} else {
+					prop.Properties = synthProps
+				}
+			}
+		}
 		if parentSubobjects != nil && !*parentSubobjects {
 			if strings.Contains(k, ".") {
 				return false, fmt.Errorf("mapper_parsing_exception: object mapping for [%s] tried to parse field [%s] as object, but subobjects is set to false", scope, k)
@@ -2485,6 +2528,120 @@ func replacePathSliceInMap(curr map[string]any, path []string, validLeafs []any)
 	return false
 }
 
+func cleanMalformedNestedLeafInMap(curr map[string]any, path []string, b FieldBinding, now time.Time) bool {
+	if len(path) == 0 || curr == nil {
+		return false
+	}
+	dotFull := strings.Join(path, ".")
+	if val, ok := curr[dotFull]; ok {
+		cleaned, keep, changed := cleanMalformedNestedLeafValue(val, b, now)
+		if !keep {
+			delete(curr, dotFull)
+			return true
+		}
+		if changed {
+			curr[dotFull] = cleaned
+			return true
+		}
+		return false
+	}
+	if len(path) == 1 {
+		val, ok := curr[path[0]]
+		if !ok {
+			return false
+		}
+		cleaned, keep, changed := cleanMalformedNestedLeafValue(val, b, now)
+		if !keep {
+			delete(curr, path[0])
+			return true
+		}
+		if changed {
+			curr[path[0]] = cleaned
+			return true
+		}
+		return false
+	}
+	next, exists := curr[path[0]]
+	if !exists {
+		return false
+	}
+	switch tv := next.(type) {
+	case map[string]any:
+		return cleanMalformedNestedLeafInMap(tv, path[1:], b, now)
+	case []any:
+		modified := false
+		for _, elem := range tv {
+			if em, ok := elem.(map[string]any); ok {
+				if cleanMalformedNestedLeafInMap(em, path[1:], b, now) {
+					modified = true
+				}
+			}
+		}
+		return modified
+	}
+	return false
+}
+
+func cleanMalformedNestedLeafValue(val any, b FieldBinding, now time.Time) (any, bool, bool) {
+	if val == nil {
+		return nil, true, false
+	}
+	if arr, isSlice := val.([]any); isSlice {
+		if b.ESType == "geo_point" && len(arr) == 2 && isGeoNumericElem(arr[0]) && isGeoNumericElem(arr[1]) {
+			if _, _, _, ok := parseAndFormatGeoPointValue(arr); !ok {
+				return nil, false, true
+			}
+			return val, true, false
+		}
+		out := make([]any, 0, len(arr))
+		changed := false
+		for _, item := range arr {
+			cItem, keep, itemChanged := cleanMalformedNestedLeafValue(item, b, now)
+			if !keep {
+				changed = true
+				continue
+			}
+			if itemChanged {
+				changed = true
+			}
+			out = append(out, cItem)
+		}
+		if len(out) == 0 {
+			return nil, false, true
+		}
+		return out, true, changed
+	}
+	if m, isMap := val.(map[string]any); isMap {
+		if b.ESType == "geo_point" {
+			cands := extractGeoPointCandidatesWithNull(map[string]any{"v": m}, []string{"v"}, b.NullValue)
+			if len(cands) == 0 || coerceScalarBindingForDoris(cands[0], b, now) == nil {
+				return nil, false, true
+			}
+			return val, true, false
+		}
+		if b.ESType != "object" && b.ESType != "flattened" {
+			return nil, false, true
+		}
+		return val, true, false
+	}
+	if isTypedNonStringBinding(b) {
+		if b.ESType == "geo_point" {
+			cands := extractGeoPointCandidatesWithNull(map[string]any{"v": val}, []string{"v"}, b.NullValue)
+			if len(cands) == 0 || coerceScalarBindingForDoris(cands[0], b, now) == nil {
+				return nil, false, true
+			}
+			return val, true, false
+		}
+		if strVal, isStr := val.(string); isStr && strings.TrimSpace(strVal) == "" && (b.Coerce == nil || *b.Coerce) {
+			return nil, false, true
+		}
+		if coerceScalarBindingForDoris(val, b, now) == nil {
+			return nil, false, true
+		}
+	}
+	return val, true, false
+}
+
 func deletePathInMap(curr map[string]any, path []string) bool {
 	if len(path) == 0 || curr == nil {
 		return false
@@ -2802,12 +2959,12 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 					if len(filteredSrc) > 0 {
 						copiedNestedVals[targetField] = append(copiedNestedVals[targetField], filteredSrc...)
 					}
-					if !ok || tb.NestedPath != nestedPath || len(tb.SourceJSONPath) <= len(rootParts) || len(filteredSrc) == 0 {
+					if !ok || tb.NestedPath != nestedPath || len(tb.SourceJSONPath) <= len(rootParts) || len(srcVals) == 0 {
 						continue
 					}
 					tRelPath := tb.SourceJSONPath[len(rootParts):]
 					if len(tRelPath) >= 1 {
-						appendNestedCopyToAtPath(cloned, tRelPath, filteredSrc, tb)
+						appendNestedCopyToAtPath(s, cloned, tRelPath, srcVals, tb)
 					}
 				}
 			}
@@ -2865,7 +3022,7 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 	return cloned
 }
 
-func appendNestedCopyToAtPath(curr map[string]any, relPath []string, srcVals []string, tb FieldBinding) {
+func appendNestedCopyToAtPath(s *IndexSchema, curr map[string]any, relPath []string, srcVals []string, tb FieldBinding) {
 	if len(relPath) == 0 || curr == nil || len(srcVals) == 0 {
 		return
 	}
@@ -2875,16 +3032,16 @@ func appendNestedCopyToAtPath(curr map[string]any, relPath []string, srcVals []s
 		if !exists || nextVal == nil {
 			nextMap := make(map[string]any)
 			curr[key] = nextMap
-			appendNestedCopyToAtPath(nextMap, relPath[1:], srcVals, tb)
+			appendNestedCopyToAtPath(s, nextMap, relPath[1:], srcVals, tb)
 			return
 		}
 		switch tv := nextVal.(type) {
 		case map[string]any:
-			appendNestedCopyToAtPath(tv, relPath[1:], srcVals, tb)
+			appendNestedCopyToAtPath(s, tv, relPath[1:], srcVals, tb)
 		case []any:
 			for _, elem := range tv {
 				if em, ok := elem.(map[string]any); ok {
-					appendNestedCopyToAtPath(em, relPath[1:], srcVals, tb)
+					appendNestedCopyToAtPath(s, em, relPath[1:], srcVals, tb)
 				}
 			}
 		}
@@ -2908,8 +3065,24 @@ func appendNestedCopyToAtPath(curr map[string]any, relPath []string, srcVals []s
 			curr[key] = arr
 		}
 	} else {
+		var companionKeys []string
 		if tb.KeywordCompanion != "" {
-			kwKey := key + "__keyword"
+			companionKeys = append(companionKeys, key+"__keyword")
+		}
+		if s != nil && len(s.Fields) > 0 && tb.ESFieldPath != "" {
+			prefix := tb.ESFieldPath + "."
+			for fk, fb := range s.Fields {
+				if !strings.HasPrefix(fk, prefix) || fb.AliasTarget != "" {
+					continue
+				}
+				subKey := strings.TrimPrefix(fk, prefix)
+				if subKey == "" || strings.Contains(subKey, ".") || subKey == "keyword" {
+					continue
+				}
+				companionKeys = append(companionKeys, key+"__"+subKey)
+			}
+		}
+		for _, kwKey := range companionKeys {
 			var kwArr []any
 			if exKw, hasKw := curr[kwKey]; hasKw && exKw != nil {
 				if exSlice, okS := exKw.([]any); okS {
@@ -2965,10 +3138,16 @@ func applyNestedCompanionNormalizationAtPath(curr map[string]any, relPath []stri
 		return
 	}
 	compKey := key + suffix
+	var norm any
 	if compVal, hasComp := curr[compKey]; hasComp {
-		curr[compKey] = normalizeNestedLeafValue(compVal, b, getNow)
+		norm = normalizeNestedLeafValue(compVal, b, getNow)
 	} else {
-		curr[compKey] = normalizeNestedLeafValue(val, b, getNow)
+		norm = normalizeNestedLeafValue(val, b, getNow)
+	}
+	if norm == nil {
+		delete(curr, compKey)
+	} else {
+		curr[compKey] = norm
 	}
 }
 
@@ -2994,7 +3173,12 @@ func applyNestedBindingNormalizationAtPath(curr map[string]any, relPath []string
 		}
 		return
 	}
-	curr[key] = normalizeNestedLeafValue(val, b, getNow)
+	norm := normalizeNestedLeafValue(val, b, getNow)
+	if norm == nil && val != nil {
+		delete(curr, key)
+	} else {
+		curr[key] = norm
+	}
 }
 
 func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) any {
@@ -3005,12 +3189,24 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 		return nil
 	}
 	if arr, ok := val.([]any); ok {
+		if b.ESType == "geo_point" && len(arr) == 2 && isGeoNumericElem(arr[0]) && isGeoNumericElem(arr[1]) {
+			if formatted, _, _, okGeo := parseAndFormatGeoPointValue(arr); okGeo {
+				return formatted
+			}
+			if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+				return nil
+			}
+			return val
+		}
 		var out []any
 		for _, item := range arr {
 			norm := normalizeNestedLeafValue(item, b, getNow)
 			if norm != nil {
 				out = append(out, norm)
 			}
+		}
+		if len(out) == 0 && len(arr) > 0 {
+			return nil
 		}
 		return out
 	}

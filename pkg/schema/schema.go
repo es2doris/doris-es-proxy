@@ -629,8 +629,9 @@ func (s *IndexSchema) compileProperties(
 
 	for _, propName := range keys {
 		prop := props[propName]
-		currESPath := append(append([]string{}, esPathPrefix...), propName)
-		currJSONPath := append(append([]string{}, jsonPathPrefix...), propName)
+		segments := strings.Split(propName, ".")
+		currESPath := append(append([]string{}, esPathPrefix...), segments...)
+		currJSONPath := append(append([]string{}, jsonPathPrefix...), segments...)
 		dotPath := strings.Join(currESPath, ".")
 
 		if prop.Enabled != nil && !*prop.Enabled {

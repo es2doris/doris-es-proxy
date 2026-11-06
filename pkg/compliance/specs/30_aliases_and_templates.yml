@@ -1,0 +1,212 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+---
+"Put get exists and delete alias":
+  - do:
+      indices.create:
+        index: comp_alias_idx_1
+  - do:
+      indices.exists_alias:
+        index: comp_alias_idx_1
+        name: comp_alias_view
+  - is_false: ''
+  - do:
+      indices.put_alias:
+        index: comp_alias_idx_1
+        name: comp_alias_view
+  - is_true: acknowledged
+  - do:
+      indices.exists_alias:
+        index: comp_alias_idx_1
+        name: comp_alias_view
+  - is_true: ''
+  - do:
+      indices.get_alias:
+        index: comp_alias_idx_1
+        name: comp_alias_view
+  - is_true: comp_alias_idx_1.aliases.comp_alias_view
+  - do:
+      indices.delete_alias:
+        index: comp_alias_idx_1
+        name: comp_alias_view
+  - is_true: acknowledged
+  - do:
+      indices.exists_alias:
+        index: comp_alias_idx_1
+        name: comp_alias_view
+  - is_false: ''
+
+---
+"Update aliases atomic actions":
+  - do:
+      indices.create:
+        index: comp_alias_swap_v1
+  - do:
+      indices.create:
+        index: comp_alias_swap_v2
+  - do:
+      indices.update_aliases:
+        body:
+          actions:
+            - add:
+                index: comp_alias_swap_v1
+                alias: comp_alias_active
+  - is_true: acknowledged
+  - do:
+      indices.update_aliases:
+        body:
+          actions:
+            - remove:
+                index: comp_alias_swap_v1
+                alias: comp_alias_active
+            - add:
+                index: comp_alias_swap_v2
+                alias: comp_alias_active
+                is_write_index: true
+  - is_true: acknowledged
+  - do:
+      indices.get_alias:
+        name: comp_alias_active
+  - is_true: comp_alias_swap_v2.aliases.comp_alias_active
+  - is_false: comp_alias_swap_v1.aliases.comp_alias_active
+
+---
+"Filtered alias routing and search":
+  - do:
+      indices.create:
+        index: comp_alias_filtered_idx
+        body:
+          mappings:
+            properties:
+              env:
+                type: keyword
+              msg:
+                type: text
+  - do:
+      indices.update_aliases:
+        body:
+          actions:
+            - add:
+                index: comp_alias_filtered_idx
+                alias: comp_alias_prod_only
+                filter:
+                  term:
+                    env: prod
+  - do:
+      index:
+        index: comp_alias_filtered_idx
+        id: "1"
+        body:
+          env: prod
+          msg: "production alert"
+  - do:
+      index:
+        index: comp_alias_filtered_idx
+        id: "2"
+        body:
+          env: dev
+          msg: "dev debug log"
+  - do:
+      search:
+        index: comp_alias_prod_only
+        body:
+          query:
+            match_all: {}
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+
+---
+"Composable index template lifecycle":
+  - do:
+      indices.exists_index_template:
+        name: comp_logs_template
+  - is_false: ''
+  - do:
+      indices.put_index_template:
+        name: comp_logs_template
+        body:
+          index_patterns: [ "comp_tmpl_logs_*" ]
+          priority: 100
+          template:
+            mappings:
+              properties:
+                service_name:
+                  type: keyword
+                status_num:
+                  type: integer
+  - is_true: acknowledged
+  - do:
+      indices.exists_index_template:
+        name: comp_logs_template
+  - is_true: ''
+  - do:
+      indices.get_index_template:
+        name: comp_logs_template
+  - length: { index_templates: 1 }
+  - match: { index_templates.0.name: "comp_logs_template" }
+  - do:
+      indices.create:
+        index: comp_tmpl_logs_2026
+  - do:
+      indices.get_mapping:
+        index: comp_tmpl_logs_2026
+  - match: { comp_tmpl_logs_2026.mappings.properties.service_name.type: "keyword" }
+  - match: { comp_tmpl_logs_2026.mappings.properties.status_num.type: "integer" }
+  - do:
+      indices.delete_index_template:
+        name: comp_logs_template
+  - is_true: acknowledged
+  - do:
+      indices.exists_index_template:
+        name: comp_logs_template
+  - is_false: ''
+
+---
+"Component template lifecycle":
+  - do:
+      cluster.exists_component_template:
+        name: comp_base_mappings
+  - is_false: ''
+  - do:
+      cluster.put_component_template:
+        name: comp_base_mappings
+        body:
+          template:
+            mappings:
+              properties:
+                region_code:
+                  type: keyword
+  - is_true: acknowledged
+  - do:
+      cluster.exists_component_template:
+        name: comp_base_mappings
+  - is_true: ''
+  - do:
+      cluster.get_component_template:
+        name: comp_base_mappings
+  - length: { component_templates: 1 }
+  - match: { component_templates.0.name: "comp_base_mappings" }
+  - do:
+      cluster.delete_component_template:
+        name: comp_base_mappings
+  - is_true: acknowledged
+
+---
+"Index rollover via alias":
+  - do:
+      indices.create:
+        index: comp_rollover_000001
+  - do:
+      indices.put_alias:
+        index: comp_rollover_000001
+        name: comp_rollover_alias
+  - do:
+      indices.rollover:
+        alias: comp_rollover_alias
+        new_index: comp_rollover_000002
+  - is_true: acknowledged
+  - is_true: rolled_over
+  - match: { old_index: "comp_rollover_000001" }
+  - match: { new_index: "comp_rollover_000002" }

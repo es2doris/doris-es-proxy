@@ -1,0 +1,278 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+---
+setup:
+  - do:
+      indices.create:
+        index: comp_dsl_idx
+        body:
+          mappings:
+            properties:
+              service:
+                type: keyword
+              host:
+                type: keyword
+              level:
+                type: keyword
+              status:
+                type: integer
+              latency:
+                type: float
+              tag:
+                type: keyword
+              message:
+                type: text
+              comments:
+                type: nested
+                properties:
+                  author:
+                    type: keyword
+                  votes:
+                    type: integer
+  - do:
+      bulk:
+        index: comp_dsl_idx
+        body:
+          - index: { _id: "1" }
+          - service: "payment-api"
+            host: "prod-web-01"
+            level: "ERROR"
+            status: 500
+            latency: 125.5
+            tag: "urgent"
+            message: "database connection timeout during checkout"
+            comments:
+              - { author: "alice", votes: 5 }
+              - { author: "bob", votes: 1 }
+          - index: { _id: "2" }
+          - service: "auth-service"
+            host: "prod-web-02"
+            level: "WARN"
+            status: 401
+            latency: 42.0
+            tag: "security"
+            message: "invalid token signature detected"
+            comments:
+              - { author: "charlie", votes: 3 }
+          - index: { _id: "3" }
+          - service: "search-engine"
+            host: "stage-app-01"
+            level: "INFO"
+            status: 200
+            latency: 12.0
+            message: "distributed query completed quickly"
+          - index: { _id: "4" }
+          - service: "payment-worker"
+            host: "prod-worker-01"
+            level: "ERROR"
+            status: 503
+            latency: 310.0
+            tag: "retry"
+            message: "upstream gateway timeout error"
+
+---
+"Term terms range and exists queries":
+  - do:
+      search:
+        index: comp_dsl_idx
+        body:
+          query:
+            term:
+              level: "ERROR"
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: comp_dsl_idx
+        body:
+          query:
+            terms:
+              status: [ 200, 401 ]
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: comp_dsl_idx
+        body:
+          query:
+            range:
+              latency:
+                gte: 50.0
+                lte: 200.0
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      search:
+        index: comp_dsl_idx
+        body:
+          query:
+            exists:
+              field: "tag"
+  - match: { hits.total.value: 3 }
+
+---
+"Prefix wildcard regexp and fuzzy queries":
+  - do:
+      search:
+        index: comp_dsl_idx
+        body:
+          query:
+            prefix:
+              service: "payment"
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: comp_dsl_idx
+        body:
+          query:
+            wildcard:
+              host: "prod-web-*"
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: comp_dsl_idx
+        body:
+          query:
+            regexp:
+              host: "prod-web-0[12]"
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: comp_dsl_idx
+        body:
+          query:
+            fuzzy:
+              tag:
+                value: "urgant"
+                fuzziness: 1
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+
+---
+"Full text match match_phrase multi_match and query_string":
+  - do:
+      search:
+        index: comp_dsl_idx
+        body:
+          query:
+            match:
+              message: "timeout"
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: comp_dsl_idx
+        body:
+          query:
+            match_phrase:
+              message: "database connection"
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      search:
+        index: comp_dsl_idx
+        body:
+          query:
+            multi_match:
+              query: "signature"
+              fields: [ "message", "service" ]
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "2" }
+  - do:
+      search:
+        index: comp_dsl_idx
+        body:
+          query:
+            query_string:
+              query: "level:ERROR AND status:500"
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+
+---
+"Compound bool dis_max boosting constant_score and function_score":
+  - do:
+      search:
+        index: comp_dsl_idx
+        body:
+          query:
+            bool:
+              must:
+                - term: { level: "ERROR" }
+              filter:
+                - range:
+                    status:
+                      gte: 500
+              must_not:
+                - term: { host: "prod-worker-01" }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      search:
+        index: comp_dsl_idx
+        body:
+          query:
+            dis_max:
+              tie_breaker: 0.3
+              queries:
+                - term: { level: "INFO" }
+                - term: { level: "WARN" }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: comp_dsl_idx
+        body:
+          query:
+            boosting:
+              positive:
+                term: { level: "ERROR" }
+              negative:
+                term: { status: 503 }
+              negative_boost: 0.2
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      search:
+        index: comp_dsl_idx
+        body:
+          query:
+            constant_score:
+              filter:
+                term: { level: "INFO" }
+              boost: 2.5
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "3" }
+  - do:
+      search:
+        index: comp_dsl_idx
+        body:
+          query:
+            function_score:
+              query:
+                term: { level: "ERROR" }
+              field_value_factor:
+                field: "status"
+                factor: 1.0
+              boost_mode: "multiply"
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "4" }
+
+---
+"Nested query with inner_hits":
+  - do:
+      search:
+        index: comp_dsl_idx
+        body:
+          query:
+            nested:
+              path: "comments"
+              query:
+                bool:
+                  must:
+                    - term: { "comments.author": "alice" }
+                    - range:
+                        "comments.votes":
+                          gte: 4
+              inner_hits: {}
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.0.inner_hits.comments.hits.total.value: 1 }
+  - match: { hits.hits.0.inner_hits.comments.hits.hits.0._source.author: "alice" }

@@ -1,0 +1,221 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+---
+setup:
+  - do:
+      indices.create:
+        index: comp_crud_idx
+        body:
+          mappings:
+            properties:
+              title:
+                type: text
+              category:
+                type: keyword
+              views:
+                type: integer
+
+---
+"Document index get and delete lifecycle":
+  - do:
+      index:
+        index: comp_crud_idx
+        id: "doc-1"
+        body:
+          title: "Distributed SQL Search"
+          category: "database"
+          views: 42
+  - match: { _index: "comp_crud_idx" }
+  - match: { _id: "doc-1" }
+  - match: { result: "created" }
+  - do:
+      exists:
+        index: comp_crud_idx
+        id: "doc-1"
+  - is_true: ''
+  - do:
+      get:
+        index: comp_crud_idx
+        id: "doc-1"
+  - is_true: found
+  - match: { _id: "doc-1" }
+  - match: { _source.title: "Distributed SQL Search" }
+  - match: { _source.category: "database" }
+  - match: { _source.views: 42 }
+  - do:
+      delete:
+        index: comp_crud_idx
+        id: "doc-1"
+  - match: { result: "deleted" }
+  - do:
+      exists:
+        index: comp_crud_idx
+        id: "doc-1"
+  - is_false: ''
+  - do:
+      catch: missing
+      get:
+        index: comp_crud_idx
+        id: "doc-1"
+
+---
+"Auto ID generation with POST _doc and stash":
+  - do:
+      index:
+        index: comp_crud_idx
+        body:
+          title: "Auto Generated Document"
+          category: "auto"
+          views: 7
+  - match: { result: "created" }
+  - set: { _id: generated_id }
+  - do:
+      get:
+        index: comp_crud_idx
+        id: $generated_id
+  - is_true: found
+  - match: { _id: $generated_id }
+  - match: { _source.category: "auto" }
+
+---
+"Create action and conflict detection":
+  - do:
+      create:
+        index: comp_crud_idx
+        id: "create-1"
+        body:
+          title: "First Create"
+          category: "unique"
+          views: 1
+  - match: { result: "created" }
+  - do:
+      catch: conflict
+      create:
+        index: comp_crud_idx
+        id: "create-1"
+        body:
+          title: "Duplicate Create"
+          category: "unique"
+          views: 2
+  - do:
+      index:
+        index: comp_crud_idx
+        id: "create-1"
+        op_type: create
+        body:
+          title: "Duplicate via op_type"
+        catch: conflict
+      catch: conflict
+
+---
+"Get source exists source and source filtering":
+  - do:
+      index:
+        index: comp_crud_idx
+        id: "src-1"
+        body:
+          title: "Source Filtering Doc"
+          category: "filtering"
+          views: 99
+  - do:
+      exists_source:
+        index: comp_crud_idx
+        id: "src-1"
+  - is_true: ''
+  - do:
+      exists_source:
+        index: comp_crud_idx
+        id: "nonexistent-src"
+  - is_false: ''
+  - do:
+      get_source:
+        index: comp_crud_idx
+        id: "src-1"
+  - match: { title: "Source Filtering Doc" }
+  - match: { category: "filtering" }
+  - match: { views: 99 }
+  - do:
+      get:
+        index: comp_crud_idx
+        id: "src-1"
+        _source_includes: "title,views"
+  - match: { _source.title: "Source Filtering Doc" }
+  - match: { _source.views: 99 }
+  - is_false: _source.category
+  - do:
+      get:
+        index: comp_crud_idx
+        id: "src-1"
+        _source_excludes: "views"
+  - match: { _source.title: "Source Filtering Doc" }
+  - match: { _source.category: "filtering" }
+  - is_false: _source.views
+
+---
+"Optimistic concurrency control with if_seq_no and if_primary_term":
+  - do:
+      index:
+        index: comp_crud_idx
+        id: "occ-1"
+        body:
+          title: "Initial Version"
+          category: "occ"
+          views: 10
+  - set: { _seq_no: seq1 }
+  - set: { _primary_term: term1 }
+  - do:
+      index:
+        index: comp_crud_idx
+        id: "occ-1"
+        if_seq_no: $seq1
+        if_primary_term: $term1
+        body:
+          title: "Updated Version"
+          category: "occ"
+          views: 20
+  - match: { result: "updated" }
+  - do:
+      catch: conflict
+      index:
+        index: comp_crud_idx
+        id: "occ-1"
+        if_seq_no: $seq1
+        if_primary_term: $term1
+        body:
+          title: "Stale Update"
+          category: "occ"
+          views: 30
+
+---
+"Multi get mget across documents":
+  - do:
+      index:
+        index: comp_crud_idx
+        id: "m1"
+        body:
+          title: "Doc One"
+          category: "batch"
+          views: 11
+  - do:
+      index:
+        index: comp_crud_idx
+        id: "m2"
+        body:
+          title: "Doc Two"
+          category: "batch"
+          views: 22
+  - do:
+      mget:
+        index: comp_crud_idx
+        body:
+          ids: [ "m1", "m2", "m_missing" ]
+  - length: { docs: 3 }
+  - is_true: docs.0.found
+  - match: { docs.0._id: "m1" }
+  - match: { docs.0._source.views: 11 }
+  - is_true: docs.1.found
+  - match: { docs.1._id: "m2" }
+  - match: { docs.1._source.views: 22 }
+  - is_false: docs.2.found

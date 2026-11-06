@@ -32,6 +32,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
+	"github.com/es2doris/doris-es-proxy/pkg/compliance"
 	"github.com/es2doris/doris-es-proxy/pkg/proxy"
 	"github.com/es2doris/doris-es-proxy/pkg/transpiler"
 )
@@ -1802,4 +1803,7 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	if len(r37SimDoc["unique_tags"].([]any)) != 2 || r37SimDoc["bumped"].(float64) != 15 || r37SimDoc["prefix"] != "ord" || r37SimDoc["has_now"] != true {
 		t.Fatalf("unexpected R37 simulated doc: %+v", r37SimDoc)
 	}
+
+	// Step 31: Upstream Elasticsearch / OpenSearch rest-api-spec YAML Compliance Test Suite
+	compliance.RunEmbeddedSuite(t, ts.URL)
 }

@@ -1511,3 +1511,122 @@ func TestRound45PainlessMultiCatchThrowStringSplitAndEmit(t *testing.T) {
 		t.Fatalf("expected emitted slice [GO DORIS], got %#v", emitted)
 	}
 }
+
+func TestRound46PainlessPrecedenceWrappersMapKeysAndDeterministicNow(t *testing.T) {
+	// F26: Unary `!` precedence over binary `+` and relational/`instanceof` operators
+	docF26 := map[string]any{"active": false}
+	valF26, err := Eval(docF26, `
+		def s = !ctx._source.active + '_state';
+		def isBool = (!ctx._source.active) instanceof Boolean;
+		def notInst = !(ctx._source.active instanceof String);
+		return [s, isBool, notInst];
+	`, nil)
+	if err != nil {
+		t.Fatalf("F26 Eval failed: %v", err)
+	}
+	arrF26, ok := valF26.([]any)
+	if !ok || len(arrF26) != 3 || arrF26[0] != "true_state" || arrF26[1] != true || arrF26[2] != true {
+		t.Fatalf("F26 unexpected result: %#v", valF26)
+	}
+
+	// F27: Number instance conversion methods and static wrapper methods
+	valF27, err := Eval(map[string]any{"d": float64(42.9), "neg": float64(-15.7)}, `
+		int iv = ctx._source.d.intValue();
+		long lv = ctx._source.neg.longValue();
+		double dv = (10).doubleValue();
+		float fv = (10).floatValue();
+		short sv = (32768).shortValue();
+		byte bv = (128).byteValue();
+		def iVal = Integer.valueOf("ff", 16);
+		def lVal = Long.valueOf("1010", 2);
+		def dVal = Double.valueOf("3.5");
+		def bVal = Boolean.valueOf("TRUE");
+		def bParse = Boolean.parseBoolean("false");
+		def hexStr = Integer.toHexString(255);
+		def binStr = Integer.toBinaryString(5);
+		def octStr = Integer.toOctalString(8);
+		def lHex = Long.toHexString(256);
+		def iStr = Integer.toString(42);
+		def dStr = Double.toString(3.25);
+		def bStr = Boolean.toString(true);
+		def cmpI = Integer.compare(1, 2);
+		def cmpL = Long.compare(5, 5);
+		def cmpD = Double.compare(3.0, 1.0);
+		def cmpB = Boolean.compare(true, false);
+		def objEq = Objects.equals("a", "a");
+		def objNull = Objects.isNull(null);
+		def objNonNull = Objects.nonNull("x");
+		def objStr = Objects.toString(null, "fallback");
+		return [iv, lv, dv, fv, sv, bv, iVal, lVal, dVal, bVal, bParse, hexStr, binStr, octStr, lHex, iStr, dStr, bStr, cmpI, cmpL, cmpD, cmpB, objEq, objNull, objNonNull, objStr];
+	`, nil)
+	if err != nil {
+		t.Fatalf("F27 Eval failed: %v", err)
+	}
+	arrF27, ok := valF27.([]any)
+	if !ok || len(arrF27) != 26 {
+		t.Fatalf("F27 unexpected result slice: %#v", valF27)
+	}
+	if arrF27[0] != int64(42) || arrF27[1] != int64(-15) || arrF27[2] != float64(10) || arrF27[3] != float64(10) ||
+		arrF27[4] != int64(-32768) || arrF27[5] != int64(-128) || arrF27[6] != int64(255) || arrF27[7] != int64(10) ||
+		arrF27[8] != float64(3.5) || arrF27[9] != true || arrF27[10] != false ||
+		arrF27[11] != "ff" || arrF27[12] != "101" || arrF27[13] != "10" || arrF27[14] != "100" ||
+		arrF27[15] != "42" || arrF27[16] != "3.25" || arrF27[17] != "true" ||
+		arrF27[18] != int64(-1) || arrF27[19] != int64(0) || arrF27[20] != int64(1) || arrF27[21] != int64(1) ||
+		arrF27[22] != true || arrF27[23] != true || arrF27[24] != true || arrF27[25] != "fallback" {
+		t.Fatalf("F27 values mismatch: %#v", arrF27)
+	}
+
+	// F28: Map.put / Map.putIfAbsent / Map.remove dotted-key & ?-key handling and String methods (.toCharArray, .codePointAt, .compareToIgnoreCase)
+	docF28 := map[string]any{
+		"a": map[string]any{"b": int64(1)},
+	}
+	valF28, err := Eval(docF28, `
+		ctx.put('a.b', 2);
+		ctx.put('why?', 10);
+		ctx.putIfAbsent('why?', 99);
+		def m = ['a': ['b': 1]];
+		m.put('a.b', 5);
+		m.put('q?', 7);
+		m.putIfAbsent('q?', 8);
+		def remMissing = m.remove('a.c');
+		def chars = "Az".toCharArray();
+		def cp = "Az".codePointAt(0);
+		def cmpIC = "Hello".compareToIgnoreCase("hello");
+		return [ctx['a.b'], ctx['why?'], m['a.b'], m['a']['b'], m['q?'], remMissing, chars, cp, cmpIC];
+	`, nil)
+	if err != nil {
+		t.Fatalf("F28 Eval failed: %v", err)
+	}
+	arrF28, ok := valF28.([]any)
+	if !ok || len(arrF28) != 9 {
+		t.Fatalf("F28 unexpected result: %#v", valF28)
+	}
+	charsSlice, _ := arrF28[6].([]any)
+	if arrF28[0] != int64(2) || arrF28[1] != int64(10) || arrF28[2] != int64(5) || arrF28[3] != int64(1) ||
+		arrF28[4] != int64(7) || arrF28[5] != nil || len(charsSlice) != 2 || charsSlice[0] != "A" || charsSlice[1] != "z" ||
+		arrF28[7] != int64(65) || arrF28[8] != int64(0) {
+		t.Fatalf("F28 values mismatch: %#v", arrF28)
+	}
+
+	// F29: Deterministic ctx._now across multiple reads in a single script execution
+	valF29, err := Eval(map[string]any{}, `
+		long t1 = ctx._now;
+		long sum = 0;
+		for (int i = 0; i < 200; i++) {
+			sum += i;
+		}
+		long t2 = ctx['_now'];
+		return [t1 == t2, t1 > 0];
+	`, nil)
+	if err != nil {
+		t.Fatalf("F29 Eval failed: %v", err)
+	}
+	arrF29, ok := valF29.([]any)
+	if !ok || len(arrF29) != 2 || arrF29[0] != true || arrF29[1] != true {
+		t.Fatalf("F29 expected identical positive ctx._now reads, got %#v", valF29)
+	}
+	valF29Fixed, err := Eval(map[string]any{}, `return ctx._now - ctx['_now'] + ctx._now;`, map[string]any{"_ctx_now": int64(1700000000123)})
+	if err != nil || valF29Fixed != int64(1700000000123) {
+		t.Fatalf("F29 expected fixed _ctx_now=1700000000123, got %v (err=%v)", valF29Fixed, err)
+	}
+}
