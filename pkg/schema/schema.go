@@ -95,22 +95,24 @@ type FieldBinding struct {
 	VectorMetric        string
 
 	// For `StorageNestedSubfield` (`nested` arrays of objects):
-	NestedPath         string   // Root nested path, e.g. "columns"
-	CorrelatedArrayCol string   // e.g. "n__columns" (`ARRAY<STRING>` holding per-element JSON)
-	RelativeJSONPath   []string // Path inside each nested element, e.g. ["tags", "tagFQN"]
-	PrefilterArrayCol  string   // e.g. "n__columns__tags__tagFQN" (`ARRAY<STRING>` with `USING INVERTED`)
-	IsMultiValued      bool
-	CopyTo             []string
-	NullValue          any
-	ConstantValue      any
-	IgnoreAbove        int
-	AliasTarget        string
-	ScalingFactor      float64
-	Coerce             *bool
-	IgnoreMalformed    *bool
-	NotIndexed         bool
-	EnabledFalse       bool
-	DocValuesFalse     bool
+	NestedPath               string   // Root nested path, e.g. "columns"
+	CorrelatedArrayCol       string   // e.g. "n__columns" (`ARRAY<STRING>` holding per-element JSON)
+	RelativeJSONPath         []string // Path inside each nested element, e.g. ["tags", "tagFQN"]
+	PrefilterArrayCol        string   // e.g. "n__columns__tags__tagFQN" (`ARRAY<STRING>` with `USING INVERTED`)
+	IsMultiValued            bool
+	CopyTo                   []string
+	NullValue                any
+	ConstantValue            any
+	IgnoreAbove              int
+	AliasTarget              string
+	ScalingFactor            float64
+	Coerce                   *bool
+	IgnoreMalformed          *bool
+	EnablePositionIncrements *bool
+	Relations                map[string]any
+	NotIndexed               bool
+	EnabledFalse             bool
+	DocValuesFalse           bool
 }
 
 // EffectiveLowercase returns true if this field (or its `.keyword` companion when `preferKeyword` is true)
@@ -689,6 +691,12 @@ func DeepMergeMappingProperties(
 			if v.SplitQueriesOnWhitespace != nil {
 				merged.SplitQueriesOnWhitespace = v.SplitQueriesOnWhitespace
 			}
+			if v.EnablePositionIncrements != nil {
+				merged.EnablePositionIncrements = v.EnablePositionIncrements
+			}
+			if v.Relations != nil {
+				merged.Relations = v.Relations
+			}
 			if len(v.Properties) > 0 {
 				merged.Properties = DeepMergeMappingProperties(existing.Properties, v.Properties)
 			}
@@ -861,22 +869,25 @@ func (s *IndexSchema) registerLeafField(
 
 	if IsRangeFieldType(esType) || esType == "flattened" || esType == "percolator" || esType == "geo_shape" {
 		s.Fields[dotPath] = FieldBinding{
-			ESFieldPath:         dotPath,
-			SourceJSONPath:      sourceJSONPath,
-			Kind:                StorageDynamicVariant,
-			ColumnName:          "",
-			DorisType:           DorisVariant,
-			ESType:              esType,
-			Format:              prop.Format,
-			LowercaseNormalizer: lowerNorm,
-			NestedPath:          activeNestedRoot,
-			CopyTo:              copyTo,
-			NullValue:           prop.NullValue,
-			IgnoreAbove:         prop.IgnoreAbove,
-			Coerce:              prop.Coerce,
-			IgnoreMalformed:     prop.IgnoreMalformed,
-			NotIndexed:          notIndexed,
-			DocValuesFalse:      docValuesFalse,
+			ESFieldPath:              dotPath,
+			SourceJSONPath:           sourceJSONPath,
+			Kind:                     StorageDynamicVariant,
+			ColumnName:               "",
+			DorisType:                DorisVariant,
+			ESType:                   esType,
+			Format:                   prop.Format,
+			Analyzer:                 prop.Analyzer,
+			LowercaseNormalizer:      lowerNorm,
+			NestedPath:               activeNestedRoot,
+			CopyTo:                   copyTo,
+			NullValue:                prop.NullValue,
+			IgnoreAbove:              prop.IgnoreAbove,
+			Coerce:                   prop.Coerce,
+			IgnoreMalformed:          prop.IgnoreMalformed,
+			EnablePositionIncrements: prop.EnablePositionIncrements,
+			Relations:                prop.Relations,
+			NotIndexed:               notIndexed,
+			DocValuesFalse:           docValuesFalse,
 		}
 		return
 	}
@@ -890,29 +901,31 @@ func (s *IndexSchema) registerLeafField(
 		relJSONPath := sourceJSONPath[relPrefixLen:]
 		prefilterCol := "n__" + SanitizeDorisIdentifier(dotPath)
 		s.Fields[dotPath] = FieldBinding{
-			ESFieldPath:         dotPath,
-			SourceJSONPath:      sourceJSONPath,
-			Kind:                StorageNestedSubfield,
-			ColumnName:          prefilterCol,
-			DorisType:           dorisType,
-			ESType:              esType,
-			Format:              prop.Format,
-			Analyzer:            prop.Analyzer,
-			LowercaseNormalizer: lowerNorm,
-			NestedPath:          activeNestedRoot,
-			CorrelatedArrayCol:  corrCol,
-			RelativeJSONPath:    relJSONPath,
-			PrefilterArrayCol:   prefilterCol,
-			IsMultiValued:       prop.MultiValued || len(relJSONPath) > 1 || DefaultMultiValuedPaths[dotPath],
-			CopyTo:              copyTo,
-			NullValue:           prop.NullValue,
-			ConstantValue:       prop.Value,
-			IgnoreAbove:         prop.IgnoreAbove,
-			ScalingFactor:       prop.ScalingFactor,
-			Coerce:              prop.Coerce,
-			IgnoreMalformed:     prop.IgnoreMalformed,
-			NotIndexed:          notIndexed,
-			DocValuesFalse:      docValuesFalse,
+			ESFieldPath:              dotPath,
+			SourceJSONPath:           sourceJSONPath,
+			Kind:                     StorageNestedSubfield,
+			ColumnName:               prefilterCol,
+			DorisType:                dorisType,
+			ESType:                   esType,
+			Format:                   prop.Format,
+			Analyzer:                 prop.Analyzer,
+			LowercaseNormalizer:      lowerNorm,
+			NestedPath:               activeNestedRoot,
+			CorrelatedArrayCol:       corrCol,
+			RelativeJSONPath:         relJSONPath,
+			PrefilterArrayCol:        prefilterCol,
+			IsMultiValued:            prop.MultiValued || len(relJSONPath) > 1 || DefaultMultiValuedPaths[dotPath],
+			CopyTo:                   copyTo,
+			NullValue:                prop.NullValue,
+			ConstantValue:            prop.Value,
+			IgnoreAbove:              prop.IgnoreAbove,
+			ScalingFactor:            prop.ScalingFactor,
+			Coerce:                   prop.Coerce,
+			IgnoreMalformed:          prop.IgnoreMalformed,
+			EnablePositionIncrements: prop.EnablePositionIncrements,
+			Relations:                prop.Relations,
+			NotIndexed:               notIndexed,
+			DocValuesFalse:           docValuesFalse,
 		}
 		return
 	}
@@ -944,47 +957,52 @@ func (s *IndexSchema) registerLeafField(
 			arrColName = "f__arr__" + SanitizeDorisIdentifier(dotPath)
 		}
 		s.Fields[dotPath] = FieldBinding{
-			ESFieldPath:         dotPath,
-			SourceJSONPath:      sourceJSONPath,
-			Kind:                StoragePromotedArray,
-			ColumnName:          arrColName,
-			DorisType:           DorisString,
-			ESType:              esType,
-			Format:              prop.Format,
-			LowercaseNormalizer: lowerNorm,
-			IsMultiValued:       true,
-			CopyTo:              copyTo,
-			NullValue:           prop.NullValue,
-			ConstantValue:       prop.Value,
-			IgnoreAbove:         prop.IgnoreAbove,
-			ScalingFactor:       prop.ScalingFactor,
-			Coerce:              prop.Coerce,
-			IgnoreMalformed:     prop.IgnoreMalformed,
-			NotIndexed:          notIndexed,
-			DocValuesFalse:      docValuesFalse,
+			ESFieldPath:              dotPath,
+			SourceJSONPath:           sourceJSONPath,
+			Kind:                     StoragePromotedArray,
+			ColumnName:               arrColName,
+			DorisType:                DorisString,
+			ESType:                   esType,
+			Format:                   prop.Format,
+			Analyzer:                 prop.Analyzer,
+			LowercaseNormalizer:      lowerNorm,
+			IsMultiValued:            true,
+			CopyTo:                   copyTo,
+			NullValue:                prop.NullValue,
+			ConstantValue:            prop.Value,
+			IgnoreAbove:              prop.IgnoreAbove,
+			ScalingFactor:            prop.ScalingFactor,
+			Coerce:                   prop.Coerce,
+			IgnoreMalformed:          prop.IgnoreMalformed,
+			EnablePositionIncrements: prop.EnablePositionIncrements,
+			Relations:                prop.Relations,
+			NotIndexed:               notIndexed,
+			DocValuesFalse:           docValuesFalse,
 		}
 		return
 	}
 
 	s.Fields[dotPath] = FieldBinding{
-		ESFieldPath:         dotPath,
-		SourceJSONPath:      sourceJSONPath,
-		Kind:                StoragePromotedScalar,
-		ColumnName:          colName,
-		DorisType:           dorisType,
-		ESType:              esType,
-		Format:              prop.Format,
-		Analyzer:            prop.Analyzer,
-		LowercaseNormalizer: lowerNorm,
-		CopyTo:              copyTo,
-		NullValue:           prop.NullValue,
-		ConstantValue:       prop.Value,
-		IgnoreAbove:         prop.IgnoreAbove,
-		ScalingFactor:       prop.ScalingFactor,
-		Coerce:              prop.Coerce,
-		IgnoreMalformed:     prop.IgnoreMalformed,
-		NotIndexed:          notIndexed,
-		DocValuesFalse:      docValuesFalse,
+		ESFieldPath:              dotPath,
+		SourceJSONPath:           sourceJSONPath,
+		Kind:                     StoragePromotedScalar,
+		ColumnName:               colName,
+		DorisType:                dorisType,
+		ESType:                   esType,
+		Format:                   prop.Format,
+		Analyzer:                 prop.Analyzer,
+		LowercaseNormalizer:      lowerNorm,
+		CopyTo:                   copyTo,
+		NullValue:                prop.NullValue,
+		ConstantValue:            prop.Value,
+		IgnoreAbove:              prop.IgnoreAbove,
+		ScalingFactor:            prop.ScalingFactor,
+		Coerce:                   prop.Coerce,
+		IgnoreMalformed:          prop.IgnoreMalformed,
+		EnablePositionIncrements: prop.EnablePositionIncrements,
+		Relations:                prop.Relations,
+		NotIndexed:               notIndexed,
+		DocValuesFalse:           docValuesFalse,
 	}
 }
 
@@ -1141,6 +1159,14 @@ func (s *IndexSchema) ExpandFieldPattern(patternWithBoost string) []BoostedField
 		if re.MatchString(k) {
 			matchedSet[k] = true
 		}
+		if b.ESType == "search_as_you_type" && (strings.Contains(pattern, "_2gram") || strings.Contains(pattern, "_3gram") || strings.Contains(pattern, "_index_prefix") || strings.HasPrefix(pattern, k+".")) {
+			for _, sub := range []string{"._2gram", "._3gram", "._index_prefix"} {
+				cand := k + sub
+				if re.MatchString(cand) {
+					matchedSet[cand] = true
+				}
+			}
+		}
 	}
 	for k := range matchedSet {
 		b := s.Fields[k]
@@ -1217,12 +1243,14 @@ type inferOptions struct {
 	numericDetection   bool
 	dynamicDateFormats []string
 	dynamicTemplates   []map[string]any
+	dynamicMode        string
 }
 
 func newInferOptions(existing *esast.MappingSpec) inferOptions {
 	opts := inferOptions{
 		dateDetection:    true,
 		numericDetection: false,
+		dynamicMode:      "true",
 	}
 	if existing != nil {
 		if existing.DateDetection != nil {
@@ -1233,6 +1261,7 @@ func newInferOptions(existing *esast.MappingSpec) inferOptions {
 		}
 		opts.dynamicDateFormats = existing.DynamicDateFormats
 		opts.dynamicTemplates = existing.DynamicTemplates
+		opts.dynamicMode = normalizeDynamicMode(existing.Dynamic)
 	}
 	return opts
 }
@@ -1250,6 +1279,9 @@ func InferMappingFromSampleDocs(docs []json.RawMessage, existing ...*esast.Mappi
 	}
 	opts := newInferOptions(baseSpec)
 	props := make(map[string]esast.FieldProperty)
+	if baseSpec != nil && len(baseSpec.Properties) > 0 {
+		props = DeepMergeMappingProperties(nil, baseSpec.Properties)
+	}
 	totalFields := 0
 	limit := len(docs)
 	if limit > maxInferredSampleDocs {
@@ -1269,6 +1301,10 @@ func InferMappingFromSampleDocs(docs []json.RawMessage, existing ...*esast.Mappi
 		inferObjectPropertiesWithOpts(obj, props, "", 0, &totalFields, opts)
 	}
 	if len(props) == 0 {
+		if baseSpec != nil {
+			out := *baseSpec
+			return &out
+		}
 		return nil
 	}
 	inferredSpec := &esast.MappingSpec{
@@ -1335,10 +1371,21 @@ func inferObjectPropertiesWithOpts(obj map[string]any, dst map[string]esast.Fiel
 		if pathPrefix != "" {
 			fullPath = pathPrefix + "." + k
 		}
-		if existing, exists := dst[k]; exists && len(existing.Properties) > 0 {
+		existing, exists := dst[k]
+		if exists && (len(existing.Properties) > 0 || strings.EqualFold(existing.Type, "object") || strings.EqualFold(existing.Type, "nested")) {
+			if existing.Enabled != nil && !*existing.Enabled {
+				continue
+			}
+			childOpts := opts
+			if existing.Dynamic != nil {
+				childOpts.dynamicMode = normalizeDynamicMode(existing.Dynamic)
+			}
+			if existing.Properties == nil {
+				existing.Properties = make(map[string]esast.FieldProperty)
+			}
 			if subMap, isMap := val.(map[string]any); isMap {
 				if depth+1 < maxInferredDepth {
-					inferObjectPropertiesWithOpts(subMap, existing.Properties, fullPath, depth+1, totalFields, opts)
+					inferObjectPropertiesWithOpts(subMap, existing.Properties, fullPath, depth+1, totalFields, childOpts)
 					if existing.MultiValued {
 						markPropertyMultiValued(&existing)
 					}
@@ -1351,7 +1398,7 @@ func inferObjectPropertiesWithOpts(obj map[string]any, dst map[string]esast.Fiel
 					hadAny := false
 					for _, elem := range subSlice {
 						if elemMap, ok := elem.(map[string]any); ok {
-							inferObjectPropertiesWithOpts(elemMap, existing.Properties, fullPath, depth+1, totalFields, opts)
+							inferObjectPropertiesWithOpts(elemMap, existing.Properties, fullPath, depth+1, totalFields, childOpts)
 							hadAny = true
 						}
 					}
@@ -1363,11 +1410,14 @@ func inferObjectPropertiesWithOpts(obj map[string]any, dst map[string]esast.Fiel
 				}
 			}
 		}
+		if !exists && (opts.dynamicMode == "false" || opts.dynamicMode == "strict" || opts.dynamicMode == "runtime") {
+			continue
+		}
 		inferred, ok := inferValuePropertyWithOpts(val, k, fullPath, depth, totalFields, opts)
 		if !ok {
 			continue
 		}
-		if existing, exists := dst[k]; exists {
+		if exists {
 			dst[k] = mergeFieldProperty(existing, inferred)
 		} else {
 			*totalFields++
@@ -1725,11 +1775,21 @@ func inferValuePropertyWithOpts(val any, fieldName, fullPath string, depth int, 
 			return esast.FieldProperty{}, false
 		}
 		if allNumeric && hasFloat {
-			return esast.FieldProperty{
-				Type:       "dense_vector",
-				Dims:       len(v),
-				Similarity: "cosine",
-			}, true
+			matchedTmpl := false
+			if len(opts.dynamicTemplates) > 0 {
+				if _, ok := applyMatchingDynamicTemplate(fieldName, fullPath, "double", opts.dynamicTemplates); ok {
+					matchedTmpl = true
+				} else if _, ok := applyMatchingDynamicTemplate(fieldName, fullPath, "float", opts.dynamicTemplates); ok {
+					matchedTmpl = true
+				}
+			}
+			if !matchedTmpl {
+				return esast.FieldProperty{
+					Type:       "dense_vector",
+					Dims:       len(v),
+					Similarity: "cosine",
+				}, true
+			}
 		}
 		markPropertyMultiValued(&merged)
 		return merged, true
@@ -1749,7 +1809,13 @@ func markPropertyMultiValued(fp *esast.FieldProperty) {
 	}
 	if fp.Type != "" && fp.Type != "dense_vector" && fp.Type != "knn_vector" {
 		fp.MultiValued = true
-		fp.Fields = nil
+		if fp.Type == "text" {
+			if fp.Fields == nil {
+				fp.Fields = map[string]esast.FieldProperty{
+					"keyword": {Type: "keyword"},
+				}
+			}
+		}
 	}
 }
 
@@ -1778,8 +1844,8 @@ func mergeFieldProperty(existing, incoming esast.FieldProperty) esast.FieldPrope
 			return esast.FieldProperty{Type: "double", MultiValued: true}
 		}
 		existing.MultiValued = mv
-		if mv {
-			existing.Fields = nil
+		if len(incoming.Fields) > 0 {
+			existing.Fields = DeepMergeMappingProperties(existing.Fields, incoming.Fields)
 		}
 		return existing
 	}
@@ -1806,14 +1872,20 @@ func mergeFieldProperty(existing, incoming esast.FieldProperty) esast.FieldPrope
 	}
 	if isStringType(existing.Type) || isStringType(incoming.Type) {
 		hasText := existing.Type == "text" || incoming.Type == "text"
-		if mv || !hasText {
-			return esast.FieldProperty{Type: "keyword", MultiValued: mv}
+		mergedFields := DeepMergeMappingProperties(existing.Fields, incoming.Fields)
+		if mv && len(mergedFields) == 0 || !hasText {
+			return esast.FieldProperty{Type: "keyword", MultiValued: mv, Fields: mergedFields}
+		}
+		if mergedFields == nil {
+			mergedFields = make(map[string]esast.FieldProperty)
+		}
+		if _, hasKw := mergedFields["keyword"]; !hasKw {
+			mergedFields["keyword"] = esast.FieldProperty{Type: "keyword"}
 		}
 		return esast.FieldProperty{
-			Type: "text",
-			Fields: map[string]esast.FieldProperty{
-				"keyword": {Type: "keyword"},
-			},
+			Type:        "text",
+			MultiValued: mv,
+			Fields:      mergedFields,
 		}
 	}
 	return esast.FieldProperty{Type: "keyword", MultiValued: mv}

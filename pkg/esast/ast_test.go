@@ -1608,3 +1608,76 @@ func TestRound48ASTSpecCompliance(t *testing.T) {
 		}
 	}
 }
+
+func TestRound49ASTSpecCompliance(t *testing.T) {
+	// F5-AST & F7-AST: PercolateQuery ignore_unmapped and name alias; IdsQuery transient fields
+	var percQ Query
+	if err := json.Unmarshal([]byte(`{"percolate": {"field": "query", "document": {"title": "hello"}, "ignore_unmapped": true, "name": "perc_alias"}}`), &percQ); err != nil {
+		t.Fatalf("F7 PercolateQuery unmarshal failed: %v", err)
+	}
+	if percQ.Percolate == nil || !percQ.Percolate.IgnoreUnmapped || percQ.Percolate.Name != "perc_alias" || percQ.Name != "perc_alias" {
+		t.Fatalf("F7 expected IgnoreUnmapped=true and Name='perc_alias', got %+v (Query.Name=%q)", percQ.Percolate, percQ.Name)
+	}
+	ids := IdsQuery{
+		Values:         []string{"1"},
+		ResolvedScores: map[string]float64{"1": 2.5},
+		JoinQueryType:  "has_child",
+		JoinRelType:    "answer",
+		JoinScoreMode:  "max",
+	}
+	if ids.ResolvedScores["1"] != 2.5 || ids.JoinQueryType != "has_child" {
+		t.Fatalf("F5 IdsQuery transient fields mismatch: %+v", ids)
+	}
+
+	// F12: MoreLikeThisQuery like_text, ids, docs, fail_on_unsupported_field
+	for _, raw := range []string{
+		`{"more_like_this": {"fields": ["title"], "like_text": "quick brown fox", "fail_on_unsupported_field": false}}`,
+		`{"more_like_this": {"fields": ["title"], "ids": ["1", "2"]}}`,
+		`{"more_like_this": {"fields": ["title"], "docs": [{"_id": "1"}]}}`,
+	} {
+		var q Query
+		if err := json.Unmarshal([]byte(raw), &q); err != nil {
+			t.Fatalf("F12 MoreLikeThisQuery unmarshal failed for %s: %v", raw, err)
+		}
+		if q.MoreLikeThis == nil {
+			t.Fatalf("F12 expected MoreLikeThis non-nil for %s", raw)
+		}
+	}
+
+	// F15: WKT BBOX/ENVELOPE bounds validation
+	for _, badWKT := range []string{
+		"BBOX (-200.0, -73.0, 41.0, 40.0)",
+		"BBOX (-75.0, -73.0, 35.0, 40.0)", // maxLat < minLat
+		"ENVELOPE (-75.0, -73.0, 95.0, 40.0)",
+	} {
+		if _, err := ParseWKTGeoShape(badWKT); err == nil {
+			t.Fatalf("F15 expected error for invalid WKT %q", badWKT)
+		}
+	}
+
+	// F16: CommonTermsEntry unmarshaling & marshaling
+	var commonQ Query
+	if err := json.Unmarshal([]byte(`{"common": {"body": {"query": "the quick fox", "cutoff_frequency": 0.01, "low_freq_operator": "and", "high_freq_operator": "or", "boost": 1.5, "_name": "common_q"}}}`), &commonQ); err != nil {
+		t.Fatalf("F16 Common query unmarshal failed: %v", err)
+	}
+	if len(commonQ.Common) != 1 || commonQ.Common["body"].Query != "the quick fox" || commonQ.Common["body"].LowFreqOperator != "and" || commonQ.Name != "common_q" {
+		t.Fatalf("F16 unexpected CommonTermsEntry: %+v (Name=%q)", commonQ.Common, commonQ.Name)
+	}
+
+	// F19: WrapperQuery rejects decoded non-object JSON payload (e.g. "null" -> bnVsbA== or "[1,2]" -> WzEsMl0=)
+	for _, badB64 := range []string{"bnVsbA==", "WzEsMl0="} {
+		var wq Query
+		if err := json.Unmarshal([]byte(`{"wrapper": {"query": "`+badB64+`"}}`), &wq); err == nil {
+			t.Fatalf("F19 expected error for non-object wrapper payload %q", badB64)
+		}
+	}
+
+	// F20 & F14: FieldProperty enable_position_increments and relations
+	var fp FieldProperty
+	if err := json.Unmarshal([]byte(`{"type": "token_count", "analyzer": "standard", "enable_position_increments": false, "relations": {"question": ["answer", "comment"]}}`), &fp); err != nil {
+		t.Fatalf("F20 FieldProperty unmarshal failed: %v", err)
+	}
+	if fp.EnablePositionIncrements == nil || *fp.EnablePositionIncrements != false || len(fp.Relations) != 1 {
+		t.Fatalf("F20 unexpected FieldProperty: %+v", fp)
+	}
+}

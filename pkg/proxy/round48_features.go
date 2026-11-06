@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
@@ -25,6 +26,9 @@ import (
 // ============================================================================
 
 func (s *Server) persistStoredScript(ctx context.Context, id string, scriptObj map[string]any) {
+	activeStoredScriptsServerMu.Lock()
+	activeStoredScriptsServer = s
+	activeStoredScriptsServerMu.Unlock()
 	if cb, ok := s.backend.(CatalogBackend); ok {
 		if raw, err := json.Marshal(scriptObj); err == nil {
 			_ = cb.UpsertCatalogEntry(ctx, s.dorisDB, CatalogEntry{
@@ -66,6 +70,10 @@ func (s *Server) handleScriptsAPI(w http.ResponseWriter, r *http.Request) {
 		id = ctxOrId
 	}
 	if id == "" {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: script id is missing;")
 		return
 	}
@@ -130,6 +138,17 @@ func (s *Server) handleScriptsAPI(w http.ResponseWriter, r *http.Request) {
 		s.persistStoredScript(r.Context(), id, stored)
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 
+	case http.MethodHead:
+		if id == "" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if _, found := s.lookupStoredScript(id); !found {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+
 	case http.MethodGet:
 		sc, found := s.lookupStoredScript(id)
 		if !found {
@@ -186,6 +205,10 @@ func (s *Server) handlePainlessExecute(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "script is required")
 		return
 	}
+	if missingID := s.findMissingStoredScriptInSpec(rawScript); missingID != "" {
+		writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("cannot execute stored script [%s] because it does not exist", missingID))
+		return
+	}
 	resolvedScript := s.resolveStoredScriptSpec(rawScript)
 	src, params := extractScriptSourceAndParams(resolvedScript)
 	if strings.TrimSpace(src) == "" {
@@ -215,7 +238,7 @@ func (s *Server) handlePainlessExecute(w http.ResponseWriter, r *http.Request) {
 		params = make(map[string]any)
 	}
 	if _, hasSrc := params["_source"]; !hasSrc {
-		params["_source"] = docMap
+		params["_source"] = evalDoc
 	}
 
 	switch ctxName {
@@ -239,25 +262,48 @@ func (s *Server) handlePainlessExecute(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"result": matched})
+	case "ingest", "processor", "update":
+		if ctxName == "ingest" || ctxName == "processor" {
+			src = rewriteIngestCtxReferencesWithOp(src, true)
+		}
+		val, err := painless.Eval(evalDoc, src, params)
+		if err != nil {
+			writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
+			return
+		}
+		if m, okM := val.(map[string]any); okM {
+			writeJSON(w, http.StatusOK, map[string]any{"result": m})
+			return
+		}
+		cleaned := make(map[string]any, len(evalDoc))
+		for k, v := range evalDoc {
+			switch k {
+			case "__doc_values", "__fields", "__meta_id", "_ingest", "__internal_ingest_orig":
+				continue
+			}
+			cleaned[k] = v
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"result": cleaned})
 	default:
 		val, err := painless.Eval(evalDoc, src, params)
 		if err != nil {
 			writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
 			return
 		}
-		// Elastic's painless_test context stringifies results when context is omitted or painless_test,
-		// or returns raw value if primitive/string. Wait: in ES _scripts/painless/_execute:
-		// when context is omitted (painless_test), result is formatted as string (or if already string/number/bool, wait:
-		// let's check if tests expect string or raw value or both).
-		// Wait: in ES painless_test context, `result` is `String.valueOf(val)` if context is not specified, OR wait:
-		// let's check what our spec and prompt say!
-		// Prompt says:
-		// `otherwise return 200 {"result": result} (for "score" context return float64; for "filter" context return bool; for default/"painless_test" return the evaluated value formatted as string if non-primitive or raw value).`
 		switch val.(type) {
 		case nil, bool, int, int64, float64, json.Number, string:
 			writeJSON(w, http.StatusOK, map[string]any{"result": val})
 		default:
 			if b, errM := json.Marshal(val); errM == nil {
+				var decoded any
+				dec := json.NewDecoder(bytes.NewReader(b))
+				dec.UseNumber()
+				if errU := dec.Decode(&decoded); errU == nil {
+					if strVal, isStr := decoded.(string); isStr {
+						writeJSON(w, http.StatusOK, map[string]any{"result": strVal})
+						return
+					}
+				}
 				writeJSON(w, http.StatusOK, map[string]any{"result": string(b)})
 			} else {
 				writeJSON(w, http.StatusOK, map[string]any{"result": fmt.Sprintf("%v", val)})
@@ -475,6 +521,12 @@ func (s *Server) resolveStoredScriptsInQuery(q *esast.Query) {
 	if q.HasParent != nil {
 		s.resolveStoredScriptsInQuery(&q.HasParent.Query)
 	}
+	for k, ts := range q.TermsSet {
+		if ts.MinimumShouldMatchScript != nil {
+			ts.MinimumShouldMatchScript = s.resolveStoredScriptSpec(ts.MinimumShouldMatchScript)
+			q.TermsSet[k] = ts
+		}
+	}
 }
 
 func (s *Server) resolveStoredScriptsInAggs(aggs map[string]esast.AggSpec) {
@@ -524,6 +576,9 @@ func (s *Server) resolveStoredScriptsInAggs(aggs map[string]esast.AggSpec) {
 		if spec.Rate != nil && spec.Rate.Script != nil {
 			spec.Rate.Script = s.resolveStoredScriptSpec(spec.Rate.Script)
 		}
+		if spec.BucketScript != nil && spec.BucketScript.Script != nil {
+			spec.BucketScript.Script = s.resolveStoredScriptSpec(spec.BucketScript.Script)
+		}
 		if spec.ScriptedMetric != nil {
 			if spec.ScriptedMetric.InitScript != nil {
 				spec.ScriptedMetric.InitScript = s.resolveStoredScriptSpec(spec.ScriptedMetric.InitScript)
@@ -546,6 +601,295 @@ func (s *Server) resolveStoredScriptsInAggs(aggs map[string]esast.AggSpec) {
 		}
 		aggs[k] = spec
 	}
+}
+
+func (s *Server) findMissingStoredScriptInSpec(raw any) string {
+	if raw == nil || s == nil {
+		return ""
+	}
+	if v, ok := raw.(map[string]any); ok {
+		src, _ := v["source"].(string)
+		if src == "" {
+			src, _ = v["inline"].(string)
+		}
+		if strings.TrimSpace(src) != "" {
+			return ""
+		}
+		id, _ := v["id"].(string)
+		id = strings.TrimSpace(id)
+		if id != "" {
+			if _, ok := s.lookupStoredScript(id); !ok {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
+func (s *Server) findMissingStoredScriptInRawBody(rawBody []byte) string {
+	if s == nil || len(bytes.TrimSpace(rawBody)) == 0 {
+		return ""
+	}
+	var rawMap map[string]any
+	if err := json.Unmarshal(rawBody, &rawMap); err != nil {
+		return ""
+	}
+	return s.findMissingStoredScriptInSpec(rawMap["script"])
+}
+
+func (s *Server) validateStoredScriptsInSearchRequest(req *esast.SearchRequest) string {
+	if s == nil || req == nil {
+		return ""
+	}
+	if m := s.validateStoredScriptsInQuery(req.Query); m != "" {
+		return m
+	}
+	if m := s.validateStoredScriptsInQuery(req.PostFilter); m != "" {
+		return m
+	}
+	for i := range req.Sort {
+		if m := s.findMissingStoredScriptInSpec(req.Sort[i].Entry.Script); m != "" {
+			return m
+		}
+	}
+	for _, sf := range req.ScriptFields {
+		if sfMap, ok := sf.(map[string]any); ok {
+			if rawSc, hasSc := sfMap["script"]; hasSc && rawSc != nil {
+				if m := s.findMissingStoredScriptInSpec(rawSc); m != "" {
+					return m
+				}
+			} else if m := s.findMissingStoredScriptInSpec(sfMap); m != "" {
+				return m
+			}
+		}
+	}
+	for _, prop := range req.RuntimeMappings {
+		if m := s.findMissingStoredScriptInSpec(prop.Script); m != "" {
+			return m
+		}
+	}
+	if m := s.validateStoredScriptsInAggs(req.Aggs); m != "" {
+		return m
+	}
+	if m := s.validateStoredScriptsInAggs(req.Aggregations); m != "" {
+		return m
+	}
+	for i := range req.Rescore {
+		if req.Rescore[i].Query != nil && req.Rescore[i].Query.RescoreQuery != nil {
+			if m := s.validateStoredScriptsInQuery(req.Rescore[i].Query.RescoreQuery); m != "" {
+				return m
+			}
+		}
+	}
+	return ""
+}
+
+func (s *Server) validateStoredScriptsInQuery(q *esast.Query) string {
+	if s == nil || q == nil {
+		return ""
+	}
+	if q.Script != nil {
+		if m := s.findMissingStoredScriptInSpec(q.Script.Script); m != "" {
+			return m
+		}
+	}
+	if q.ScriptScore != nil {
+		if m := s.findMissingStoredScriptInSpec(q.ScriptScore.Script); m != "" {
+			return m
+		}
+		if m := s.validateStoredScriptsInQuery(q.ScriptScore.Query); m != "" {
+			return m
+		}
+	}
+	if q.FunctionScore != nil {
+		if m := s.validateStoredScriptsInQuery(q.FunctionScore.Query); m != "" {
+			return m
+		}
+		if q.FunctionScore.ScriptScore != nil {
+			if m := s.findMissingStoredScriptInSpec(q.FunctionScore.ScriptScore.Script); m != "" {
+				return m
+			}
+		}
+		for i := range q.FunctionScore.Functions {
+			fn := &q.FunctionScore.Functions[i]
+			if m := s.validateStoredScriptsInQuery(fn.Filter); m != "" {
+				return m
+			}
+			if fn.ScriptScore != nil {
+				if m := s.findMissingStoredScriptInSpec(fn.ScriptScore.Script); m != "" {
+					return m
+				}
+			}
+		}
+	}
+	if q.Bool != nil {
+		for i := range q.Bool.Must {
+			if m := s.validateStoredScriptsInQuery(&q.Bool.Must[i]); m != "" {
+				return m
+			}
+		}
+		for i := range q.Bool.Should {
+			if m := s.validateStoredScriptsInQuery(&q.Bool.Should[i]); m != "" {
+				return m
+			}
+		}
+		for i := range q.Bool.Filter {
+			if m := s.validateStoredScriptsInQuery(&q.Bool.Filter[i]); m != "" {
+				return m
+			}
+		}
+		for i := range q.Bool.MustNot {
+			if m := s.validateStoredScriptsInQuery(&q.Bool.MustNot[i]); m != "" {
+				return m
+			}
+		}
+	}
+	if q.ConstantScore != nil {
+		if m := s.validateStoredScriptsInQuery(&q.ConstantScore.Filter); m != "" {
+			return m
+		}
+	}
+	if q.Boosting != nil {
+		if m := s.validateStoredScriptsInQuery(&q.Boosting.Positive); m != "" {
+			return m
+		}
+		if m := s.validateStoredScriptsInQuery(&q.Boosting.Negative); m != "" {
+			return m
+		}
+	}
+	if q.DisMax != nil {
+		for i := range q.DisMax.Queries {
+			if m := s.validateStoredScriptsInQuery(&q.DisMax.Queries[i]); m != "" {
+				return m
+			}
+		}
+	}
+	if q.Nested != nil {
+		if m := s.validateStoredScriptsInQuery(&q.Nested.Query); m != "" {
+			return m
+		}
+	}
+	if q.Wrapper != nil && q.Wrapper.Decoded != nil {
+		if m := s.validateStoredScriptsInQuery(q.Wrapper.Decoded); m != "" {
+			return m
+		}
+	}
+	if q.Pinned != nil && q.Pinned.Organic != nil {
+		if m := s.validateStoredScriptsInQuery(q.Pinned.Organic); m != "" {
+			return m
+		}
+	}
+	if q.HasChild != nil {
+		if m := s.validateStoredScriptsInQuery(&q.HasChild.Query); m != "" {
+			return m
+		}
+	}
+	if q.HasParent != nil {
+		if m := s.validateStoredScriptsInQuery(&q.HasParent.Query); m != "" {
+			return m
+		}
+	}
+	for _, ts := range q.TermsSet {
+		if m := s.findMissingStoredScriptInSpec(ts.MinimumShouldMatchScript); m != "" {
+			return m
+		}
+	}
+	return ""
+}
+
+func (s *Server) validateStoredScriptsInAggs(aggs map[string]esast.AggSpec) string {
+	for _, spec := range aggs {
+		if t := spec.EffectiveTerms(); t != nil {
+			if m := s.findMissingStoredScriptInSpec(t.Script); m != "" {
+				return m
+			}
+		}
+		if spec.Histogram != nil {
+			if m := s.findMissingStoredScriptInSpec(spec.Histogram.Script); m != "" {
+				return m
+			}
+		}
+		if spec.DateHistogram != nil {
+			if m := s.findMissingStoredScriptInSpec(spec.DateHistogram.Script); m != "" {
+				return m
+			}
+		}
+		if r := spec.EffectiveRange(); r != nil {
+			if m := s.findMissingStoredScriptInSpec(r.Script); m != "" {
+				return m
+			}
+		}
+		if m := s.validateStoredScriptsInQuery(spec.Filter); m != "" {
+			return m
+		}
+		if spec.Filters != nil {
+			for _, fq := range spec.Filters.Filters {
+				q := fq
+				if m := s.validateStoredScriptsInQuery(&q); m != "" {
+					return m
+				}
+			}
+			for i := range spec.Filters.AnonymousFilters {
+				if m := s.validateStoredScriptsInQuery(&spec.Filters.AnonymousFilters[i]); m != "" {
+					return m
+				}
+			}
+		}
+		for _, mSpec := range []*esast.MetricAggSpec{
+			spec.Avg, spec.Sum, spec.Min, spec.Max,
+			spec.Stats, spec.ExtendedStats, spec.ValueCount, spec.Cardinality, spec.Boxplot,
+		} {
+			if mSpec != nil {
+				if m := s.findMissingStoredScriptInSpec(mSpec.Script); m != "" {
+					return m
+				}
+			}
+		}
+		if spec.Percentiles != nil {
+			if m := s.findMissingStoredScriptInSpec(spec.Percentiles.Script); m != "" {
+				return m
+			}
+		}
+		if spec.PercentileRanks != nil {
+			if m := s.findMissingStoredScriptInSpec(spec.PercentileRanks.Script); m != "" {
+				return m
+			}
+		}
+		if spec.StringStats != nil {
+			if m := s.findMissingStoredScriptInSpec(spec.StringStats.Script); m != "" {
+				return m
+			}
+		}
+		if spec.Rate != nil {
+			if m := s.findMissingStoredScriptInSpec(spec.Rate.Script); m != "" {
+				return m
+			}
+		}
+		if spec.BucketScript != nil {
+			if m := s.findMissingStoredScriptInSpec(spec.BucketScript.Script); m != "" {
+				return m
+			}
+		}
+		if spec.ScriptedMetric != nil {
+			for _, sc := range []any{
+				spec.ScriptedMetric.InitScript,
+				spec.ScriptedMetric.MapScript,
+				spec.ScriptedMetric.CombineScript,
+				spec.ScriptedMetric.ReduceScript,
+			} {
+				if m := s.findMissingStoredScriptInSpec(sc); m != "" {
+					return m
+				}
+			}
+		}
+		if m := s.validateStoredScriptsInAggs(spec.Aggs); m != "" {
+			return m
+		}
+		if m := s.validateStoredScriptsInAggs(spec.Aggregations); m != "" {
+			return m
+		}
+	}
+	return ""
 }
 
 // ============================================================================
@@ -594,6 +938,9 @@ func lookupMustacheVar(path string, ctx map[string]any, dotVal any) (any, bool) 
 	if path == "." {
 		if dotVal != nil {
 			return dotVal, true
+		}
+		if v, ok := ctx["."]; ok {
+			return v, true
 		}
 		return ctx, len(ctx) > 0
 	}
@@ -869,16 +1216,31 @@ func findMatchingMustacheSectionEnd(s, secName string) int {
 	return -1
 }
 
-func (s *Server) resolveTemplateSourceAndParams(pathID string, body map[string]any) (any, map[string]any, int, string, string) {
-	params, _ := body["params"].(map[string]any)
-	if params == nil {
-		params = make(map[string]any)
+func (s *Server) resolveTemplateSourceAndParams(r *http.Request, pathID string, body map[string]any) (any, map[string]any, int, string, string) {
+	rawParams, _ := body["params"].(map[string]any)
+	params := make(map[string]any, len(rawParams))
+	for k, v := range rawParams {
+		params[k] = v
+	}
+	if r != nil && r.URL != nil {
+		for k, vals := range r.URL.Query() {
+			switch k {
+			case "pretty", "human", "error_trace", "source", "source_content_type", "filter_path", "typed_keys", "rest_total_hits_as_int":
+				continue
+			}
+			if _, exists := params[k]; !exists && len(vals) > 0 {
+				params[k] = vals[0]
+			}
+		}
 	}
 	tplSource := body["source"]
 	if tplSource == nil {
 		tplSource = body["inline"]
 	}
 	tplID, _ := body["id"].(string)
+	if tplID == "" {
+		tplID, _ = body["file"].(string)
+	}
 	if tplID == "" {
 		tplID = pathID
 	}
@@ -923,7 +1285,7 @@ func (s *Server) handleRenderSearchTemplate(w http.ResponseWriter, r *http.Reque
 	if body == nil {
 		body = make(map[string]any)
 	}
-	tplSource, params, status, errType, errReason := s.resolveTemplateSourceAndParams(strings.TrimSpace(r.PathValue("id")), body)
+	tplSource, params, status, errType, errReason := s.resolveTemplateSourceAndParams(r, strings.TrimSpace(r.PathValue("id")), body)
 	if errType != "" {
 		writeESError(w, status, errType, errReason)
 		return
@@ -933,6 +1295,7 @@ func (s *Server) handleRenderSearchTemplate(w http.ResponseWriter, r *http.Reque
 		writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
 		return
 	}
+	renderedJSON = coerceSearchTemplateNumericFields(renderedJSON)
 	var parsed map[string]any
 	dec := json.NewDecoder(bytes.NewReader(renderedJSON))
 	dec.UseNumber()
@@ -945,15 +1308,12 @@ func (s *Server) handleRenderSearchTemplate(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-func coerceSearchTemplateNumericFields(raw json.RawMessage) json.RawMessage {
-	var m map[string]any
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	if err := dec.Decode(&m); err != nil || m == nil {
-		return raw
+func coerceSearchTemplateNumericInMap(m map[string]any) bool {
+	if m == nil {
+		return false
 	}
 	changed := false
-	for _, intKey := range []string{"size", "from", "terminate_after"} {
+	for _, intKey := range []string{"size", "from", "terminate_after", "shard_size", "min_doc_count", "k", "num_candidates"} {
 		if sv, ok := m[intKey].(string); ok {
 			if iv, err := strconv.Atoi(strings.TrimSpace(sv)); err == nil {
 				m[intKey] = iv
@@ -961,13 +1321,43 @@ func coerceSearchTemplateNumericFields(raw json.RawMessage) json.RawMessage {
 			}
 		}
 	}
-	if sf, ok := m["min_score"].(string); ok {
-		if fv, err := strconv.ParseFloat(strings.TrimSpace(sf), 64); err == nil {
-			m["min_score"] = fv
-			changed = true
+	for _, floatKey := range []string{"min_score", "boost"} {
+		if sf, ok := m[floatKey].(string); ok {
+			if fv, err := strconv.ParseFloat(strings.TrimSpace(sf), 64); err == nil {
+				m[floatKey] = fv
+				changed = true
+			}
 		}
 	}
-	if !changed {
+	for k, v := range m {
+		switch sub := v.(type) {
+		case map[string]any:
+			if coerceSearchTemplateNumericInMap(sub) {
+				changed = true
+			}
+		case []any:
+			for i, el := range sub {
+				if elMap, okM := el.(map[string]any); okM {
+					if coerceSearchTemplateNumericInMap(elMap) {
+						sub[i] = elMap
+						changed = true
+					}
+				}
+			}
+			m[k] = sub
+		}
+	}
+	return changed
+}
+
+func coerceSearchTemplateNumericFields(raw json.RawMessage) json.RawMessage {
+	var m map[string]any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&m); err != nil || m == nil {
+		return raw
+	}
+	if !coerceSearchTemplateNumericInMap(m) {
 		return raw
 	}
 	if b, err := json.Marshal(m); err == nil {
@@ -995,7 +1385,7 @@ func (s *Server) handleSearchTemplate(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "search template request body is required")
 		return
 	}
-	tplSource, params, status, errType, errReason := s.resolveTemplateSourceAndParams("", body)
+	tplSource, params, status, errType, errReason := s.resolveTemplateSourceAndParams(r, "", body)
 	if errType != "" {
 		writeESError(w, status, errType, errReason)
 		return
@@ -1012,47 +1402,84 @@ func (s *Server) handleSearchTemplate(w http.ResponseWriter, r *http.Request) {
 	s.handleSearch(w, clonedReq)
 }
 
+type bufferResponseWriter struct {
+	header http.Header
+	status int
+	buf    bytes.Buffer
+}
+
+func (b *bufferResponseWriter) Header() http.Header {
+	if b.header == nil {
+		b.header = make(http.Header)
+	}
+	return b.header
+}
+
+func (b *bufferResponseWriter) WriteHeader(statusCode int) {
+	b.status = statusCode
+}
+
+func (b *bufferResponseWriter) Write(p []byte) (int, error) {
+	if b.status == 0 {
+		b.status = http.StatusOK
+	}
+	return b.buf.Write(p)
+}
+
 func (s *Server) handleMSearchTemplate(w http.ResponseWriter, r *http.Request) {
 	_ = s.syncCatalogFromBackend(r.Context())
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
 		return
 	}
-	lines := strings.Split(strings.TrimRight(string(bodyBytes), "\r\n"), "\n")
+	rawLines := strings.Split(strings.TrimRight(string(bodyBytes), "\r\n"), "\n")
+	var lines []string
+	for _, rl := range rawLines {
+		if strings.TrimSpace(rl) != "" {
+			lines = append(lines, rl)
+		}
+	}
 	if len(lines) < 2 || len(lines)%2 != 0 {
 		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: no requests added;")
 		return
 	}
 	var rewrittenBuf bytes.Buffer
-	for i := 0; i+1 < len(lines); i += 2 {
-		hdrLine := strings.TrimSpace(lines[i])
-		tplLine := strings.TrimSpace(lines[i+1])
-		rewrittenBuf.WriteString(hdrLine)
-		rewrittenBuf.WriteByte('\n')
+	perItemErrors := make(map[int]map[string]any)
+	numItems := len(lines) / 2
+	validItems := 0
+	for idx := 0; idx < numItems; idx++ {
+		hdrLine := strings.TrimSpace(lines[idx*2])
+		tplLine := strings.TrimSpace(lines[idx*2+1])
 
 		var body map[string]any
 		dec := json.NewDecoder(strings.NewReader(tplLine))
 		dec.UseNumber()
 		if err := dec.Decode(&body); err != nil {
-			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
-			return
+			perItemErrors[idx] = map[string]any{
+				"status": http.StatusBadRequest,
+				"error":  map[string]any{"type": "parsing_exception", "reason": err.Error()},
+			}
+			continue
 		}
-		tplSource, params, _, errType, _ := s.resolveTemplateSourceAndParams("", body)
+		tplSource, params, status, errType, errReason := s.resolveTemplateSourceAndParams(r, "", body)
 		if errType != "" {
-			// Emit an invalid search line or empty search? Wait: in _msearch/template, if template fails per item,
-			// we can still pass an invalid query or handle error. Let's render if valid:
-			rewrittenBuf.WriteString(`{"__invalid_template_error": "` + errType + `"}`)
-			rewrittenBuf.WriteByte('\n')
+			perItemErrors[idx] = map[string]any{
+				"status": status,
+				"error":  map[string]any{"type": errType, "reason": errReason},
+			}
 			continue
 		}
 		renderedJSON, err := renderMustacheSearchTemplate(tplSource, params)
 		if err != nil {
-			rewrittenBuf.WriteString(`{}`)
-			rewrittenBuf.WriteByte('\n')
+			perItemErrors[idx] = map[string]any{
+				"status": http.StatusBadRequest,
+				"error":  map[string]any{"type": "parsing_exception", "reason": err.Error()},
+			}
 			continue
 		}
 		renderedJSON = coerceSearchTemplateNumericFields(renderedJSON)
-		// Compact onto single NDJSON line
+		rewrittenBuf.WriteString(hdrLine)
+		rewrittenBuf.WriteByte('\n')
 		var compact bytes.Buffer
 		if errC := json.Compact(&compact, renderedJSON); errC == nil {
 			rewrittenBuf.Write(compact.Bytes())
@@ -1060,11 +1487,45 @@ func (s *Server) handleMSearchTemplate(w http.ResponseWriter, r *http.Request) {
 			rewrittenBuf.Write(renderedJSON)
 		}
 		rewrittenBuf.WriteByte('\n')
+		validItems++
 	}
-	clonedReq := r.Clone(r.Context())
-	clonedReq.Body = io.NopCloser(bytes.NewReader(rewrittenBuf.Bytes()))
-	clonedReq.ContentLength = int64(rewrittenBuf.Len())
-	s.handleMSearch(w, clonedReq)
+	if len(perItemErrors) == 0 {
+		clonedReq := r.Clone(r.Context())
+		clonedReq.Body = io.NopCloser(bytes.NewReader(rewrittenBuf.Bytes()))
+		clonedReq.ContentLength = int64(rewrittenBuf.Len())
+		s.handleMSearch(w, clonedReq)
+		return
+	}
+	var validResponses []any
+	if validItems > 0 {
+		rec := &bufferResponseWriter{}
+		clonedReq := r.Clone(r.Context())
+		clonedReq.Body = io.NopCloser(bytes.NewReader(rewrittenBuf.Bytes()))
+		clonedReq.ContentLength = int64(rewrittenBuf.Len())
+		s.handleMSearch(rec, clonedReq)
+		var msearchOut map[string]any
+		dec := json.NewDecoder(bytes.NewReader(rec.buf.Bytes()))
+		dec.UseNumber()
+		if err := dec.Decode(&msearchOut); err == nil {
+			validResponses, _ = msearchOut["responses"].([]any)
+		}
+	}
+	finalResponses := make([]any, 0, numItems)
+	validCursor := 0
+	for idx := 0; idx < numItems; idx++ {
+		if errObj, hasErr := perItemErrors[idx]; hasErr {
+			finalResponses = append(finalResponses, errObj)
+		} else if validCursor < len(validResponses) {
+			finalResponses = append(finalResponses, validResponses[validCursor])
+			validCursor++
+		} else {
+			finalResponses = append(finalResponses, map[string]any{})
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"took":      4,
+		"responses": finalResponses,
+	})
 }
 
 // ============================================================================
@@ -1082,13 +1543,14 @@ func tokenizeTermVectorString(text string) []termTokenOccurrence {
 	var out []termTokenOccurrence
 	pos := 0
 	inTok := false
-	tokStartByte := 0
+	tokStartRune := 0
+	runeIdx := 0
 	var buf strings.Builder
-	for idx, r := range text {
+	for _, r := range text {
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {
 			if !inTok {
 				inTok = true
-				tokStartByte = idx
+				tokStartRune = runeIdx
 				buf.Reset()
 			}
 			buf.WriteRune(unicode.ToLower(r))
@@ -1096,22 +1558,102 @@ func tokenizeTermVectorString(text string) []termTokenOccurrence {
 			out = append(out, termTokenOccurrence{
 				term:        buf.String(),
 				position:    pos,
-				startOffset: tokStartByte,
-				endOffset:   idx,
+				startOffset: tokStartRune,
+				endOffset:   runeIdx,
 			})
 			pos++
 			inTok = false
 		}
+		runeIdx++
 	}
 	if inTok {
 		out = append(out, termTokenOccurrence{
 			term:        buf.String(),
 			position:    pos,
-			startOffset: tokStartByte,
-			endOffset:   len(text),
+			startOffset: tokStartRune,
+			endOffset:   runeIdx,
 		})
 	}
 	return out
+}
+
+func tokenizeTermVectorStringWithAnalyzer(text, analyzer string) []termTokenOccurrence {
+	switch strings.ToLower(strings.TrimSpace(analyzer)) {
+	case "keyword", "noop":
+		if text == "" {
+			return nil
+		}
+		return []termTokenOccurrence{{
+			term:        text,
+			position:    0,
+			startOffset: 0,
+			endOffset:   len([]rune(text)),
+		}}
+	case "whitespace":
+		var out []termTokenOccurrence
+		pos := 0
+		inTok := false
+		tokStartRune := 0
+		runeIdx := 0
+		var buf strings.Builder
+		for _, r := range text {
+			if !unicode.IsSpace(r) {
+				if !inTok {
+					inTok = true
+					tokStartRune = runeIdx
+					buf.Reset()
+				}
+				buf.WriteRune(r)
+			} else if inTok {
+				out = append(out, termTokenOccurrence{
+					term:        buf.String(),
+					position:    pos,
+					startOffset: tokStartRune,
+					endOffset:   runeIdx,
+				})
+				pos++
+				inTok = false
+			}
+			runeIdx++
+		}
+		if inTok {
+			out = append(out, termTokenOccurrence{
+				term:        buf.String(),
+				position:    pos,
+				startOffset: tokStartRune,
+				endOffset:   runeIdx,
+			})
+		}
+		return out
+	default:
+		return tokenizeTermVectorString(text)
+	}
+}
+
+func (s *Server) indexExistsInCatalog(ctx context.Context, rawIndex string) bool {
+	rawIndex = strings.TrimSpace(rawIndex)
+	if rawIndex == "" {
+		return true
+	}
+	_ = s.syncCatalogFromBackend(ctx)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, isIdx := s.indices[rawIndex]; isIdx {
+		return true
+	}
+	if _, isAlias := s.aliases[rawIndex]; isAlias {
+		return true
+	}
+	if _, isDS := s.dataStreams[rawIndex]; isDS {
+		return true
+	}
+	if strings.HasPrefix(rawIndex, ".ds-") && strings.HasSuffix(rawIndex, "-000001") {
+		dsName := strings.TrimSuffix(strings.TrimPrefix(rawIndex, ".ds-"), "-000001")
+		if _, okDS := s.dataStreams[dsName]; okDS {
+			return true
+		}
+	}
+	return false
 }
 
 func extractStringsFromFieldVal(v any) []string {
@@ -1186,6 +1728,9 @@ func (s *Server) computeSingleTermVectorResponse(
 			docID = bID
 		}
 	}
+	if rawIndex != "" && !s.indexExistsInCatalog(ctx, rawIndex) {
+		return nil, http.StatusNotFound, "index_not_found_exception", fmt.Sprintf("no such index [%s]", rawIndex)
+	}
 	indexName := rawIndex
 	if indexName != "" {
 		resolved, _, err := s.resolveReadDocIndexWithFilter(rawIndex)
@@ -1212,26 +1757,67 @@ func (s *Server) computeSingleTermVectorResponse(
 		}
 	}
 
-	var fields []string
+	var requestedFields []string
 	if rawFields, ok := bodyMap["fields"].([]any); ok {
 		for _, f := range rawFields {
 			if fs, okS := f.(string); okS && strings.TrimSpace(fs) != "" {
-				fields = append(fields, strings.TrimSpace(fs))
+				requestedFields = append(requestedFields, strings.TrimSpace(fs))
 			}
 		}
 	} else if rawFieldsStr, ok := bodyMap["fields"].([]string); ok {
-		fields = append(fields, rawFieldsStr...)
+		requestedFields = append(requestedFields, rawFieldsStr...)
 	}
-	if len(fields) == 0 && queryFields != "" {
+	if len(requestedFields) == 0 && queryFields != "" {
 		for _, f := range strings.Split(queryFields, ",") {
 			if f = strings.TrimSpace(f); f != "" {
-				fields = append(fields, f)
+				requestedFields = append(requestedFields, f)
 			}
 		}
 	}
-	if len(fields) == 0 && docMap != nil {
-		collectAllStringFieldPathsFromDoc("", docMap, &fields)
+	var allDocFields []string
+	if docMap != nil {
+		collectAllStringFieldPathsFromDoc("", docMap, &allDocFields)
 	}
+	var fields []string
+	if len(requestedFields) == 0 {
+		fields = allDocFields
+	} else {
+		seenField := make(map[string]bool)
+		for _, rf := range requestedFields {
+			if strings.ContainsAny(rf, "*?") {
+				for _, df := range allDocFields {
+					if matchWildcardPattern(rf, df) && !seenField[df] {
+						seenField[df] = true
+						fields = append(fields, df)
+					}
+				}
+			} else if !seenField[rf] {
+				seenField[rf] = true
+				fields = append(fields, rf)
+			}
+		}
+	}
+
+	perFieldAnalyzer := make(map[string]string)
+	if rawPFA, ok := bodyMap["per_field_analyzer"].(map[string]any); ok {
+		for k, v := range rawPFA {
+			if vs, okS := v.(string); okS {
+				perFieldAnalyzer[k] = vs
+			}
+		}
+	}
+
+	var filterMap map[string]any
+	if rawFlt, ok := bodyMap["filter"].(map[string]any); ok {
+		filterMap = rawFlt
+	}
+	minWordLen, hasMinWordLen := toInt64(filterMap["min_word_length"])
+	maxWordLen, hasMaxWordLen := toInt64(filterMap["max_word_length"])
+	minTermFreq, hasMinTermFreq := toInt64(filterMap["min_term_freq"])
+	maxTermFreq, hasMaxTermFreq := toInt64(filterMap["max_term_freq"])
+	minDocFreq, hasMinDocFreq := toInt64(filterMap["min_doc_freq"])
+	maxDocFreq, hasMaxDocFreq := toInt64(filterMap["max_doc_freq"])
+	maxNumTerms, hasMaxNumTerms := toInt64(filterMap["max_num_terms"])
 
 	termStats := queryTermStats
 	if bTS, ok := parseOptionalBoolAny(bodyMap["term_statistics"]); ok {
@@ -1271,7 +1857,7 @@ func (s *Server) computeSingleTermVectorResponse(
 				continue
 			}
 			joined := strings.Join(strs, " ")
-			occs := tokenizeTermVectorString(joined)
+			occs := tokenizeTermVectorStringWithAnalyzer(joined, perFieldAnalyzer[field])
 			if len(occs) == 0 {
 				continue
 			}
@@ -1283,9 +1869,45 @@ func (s *Server) computeSingleTermVectorResponse(
 				}
 				byTerm[occ.term] = append(byTerm[occ.term], occ)
 			}
-			sort.Strings(uniqueTerms)
-			termsMap := make(map[string]any, len(uniqueTerms))
+			var filteredTerms []string
 			for _, t := range uniqueTerms {
+				runeLen := int64(len([]rune(t)))
+				if hasMinWordLen && runeLen < minWordLen {
+					continue
+				}
+				if hasMaxWordLen && runeLen > maxWordLen {
+					continue
+				}
+				tf := int64(len(byTerm[t]))
+				if hasMinTermFreq && tf < minTermFreq {
+					continue
+				}
+				if hasMaxTermFreq && tf > maxTermFreq {
+					continue
+				}
+				df := int64(1)
+				if hasMinDocFreq && df < minDocFreq {
+					continue
+				}
+				if hasMaxDocFreq && df > maxDocFreq {
+					continue
+				}
+				filteredTerms = append(filteredTerms, t)
+			}
+			if hasMaxNumTerms && maxNumTerms > 0 && int64(len(filteredTerms)) > maxNumTerms {
+				sort.Slice(filteredTerms, func(i, j int) bool {
+					tfi := len(byTerm[filteredTerms[i]])
+					tfj := len(byTerm[filteredTerms[j]])
+					if tfi != tfj {
+						return tfi > tfj
+					}
+					return filteredTerms[i] < filteredTerms[j]
+				})
+				filteredTerms = filteredTerms[:maxNumTerms]
+			}
+			sort.Strings(filteredTerms)
+			termsMap := make(map[string]any, len(filteredTerms))
+			for _, t := range filteredTerms {
 				tOccs := byTerm[t]
 				tf := len(tOccs)
 				tEntry := map[string]any{
@@ -1416,11 +2038,21 @@ func (s *Server) handleMTermVectors(w http.ResponseWriter, r *http.Request) {
 		qOffsets = &v
 	}
 
+	defaultKeys := []string{"fields", "offsets", "positions", "payloads", "term_statistics", "field_statistics", "filter", "per_field_analyzer"}
 	var docSpecs []map[string]any
 	if rawDocs, okD := bodyMap["docs"].([]any); okD {
 		for _, item := range rawDocs {
 			if m, okM := item.(map[string]any); okM {
-				docSpecs = append(docSpecs, m)
+				mergedSpec := make(map[string]any, len(m)+len(defaultKeys))
+				for _, dk := range defaultKeys {
+					if dv, hasDV := bodyMap[dk]; hasDV {
+						mergedSpec[dk] = dv
+					}
+				}
+				for k, v := range m {
+					mergedSpec[k] = v
+				}
+				docSpecs = append(docSpecs, mergedSpec)
 			}
 		}
 	}
@@ -1457,7 +2089,7 @@ func (s *Server) handleMTermVectors(w http.ResponseWriter, r *http.Request) {
 			idx = defaultIndex
 		}
 		id, _ := spec["_id"].(string)
-		resp, _, _, _ := s.computeSingleTermVectorResponse(
+		resp, status, errType, errReason := s.computeSingleTermVectorResponse(
 			r.Context(),
 			idx,
 			id,
@@ -1468,9 +2100,64 @@ func (s *Server) handleMTermVectors(w http.ResponseWriter, r *http.Request) {
 			qPositions,
 			qOffsets,
 		)
+		if errType != "" {
+			docsOut = append(docsOut, map[string]any{
+				"_index": idx,
+				"_id":    id,
+				"error": map[string]any{
+					"type":   errType,
+					"reason": errReason,
+				},
+				"status": status,
+			})
+			continue
+		}
 		docsOut = append(docsOut, resp)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"docs": docsOut})
+}
+
+type rankEvalHitRef struct {
+	index string
+	id    string
+}
+
+func extractRankEvalHitRefs(resp map[string]any, fallbackIndex string) []rankEvalHitRef {
+	var out []rankEvalHitRef
+	if resp == nil {
+		return out
+	}
+	hitsMap, _ := resp["hits"].(map[string]any)
+	if hitsMap == nil {
+		return out
+	}
+	extractOne := func(hm map[string]any) {
+		if hm == nil {
+			return
+		}
+		id, _ := hm["_id"].(string)
+		if id == "" {
+			return
+		}
+		idx, _ := hm["_index"].(string)
+		if idx == "" {
+			idx = fallbackIndex
+		}
+		out = append(out, rankEvalHitRef{index: idx, id: id})
+	}
+	switch hl := hitsMap["hits"].(type) {
+	case []map[string]any:
+		for _, hm := range hl {
+			extractOne(hm)
+		}
+	case []any:
+		for _, item := range hl {
+			if hm, ok := item.(map[string]any); ok {
+				extractOne(hm)
+			}
+		}
+	}
+	return out
 }
 
 func (s *Server) handleRankEval(w http.ResponseWriter, r *http.Request) {
@@ -1596,21 +2283,25 @@ func (s *Server) handleRankEval(w http.ResponseWriter, r *http.Request) {
 			failures[item.ID] = map[string]any{"error": errReason}
 			continue
 		}
-		_, hitIDs := extractTotalAndHitIDs(resp)
-		if len(hitIDs) > kVal {
-			hitIDs = hitIDs[:kVal]
+		hitRefs := extractRankEvalHitRefs(resp, targetIndex)
+		if len(hitRefs) > kVal {
+			hitRefs = hitRefs[:kVal]
 		}
 
-		ratingByID := make(map[string]float64, len(item.Ratings))
+		ratingByID := make(map[string]float64, len(item.Ratings)*2)
 		totalRelevantInRatings := 0
 		for _, rt := range item.Ratings {
-			ratingByID[rt.ID] = rt.Rating
+			ratingByID[rt.Index+"\x00"+rt.ID] = rt.Rating
+			if _, exists := ratingByID["\x00"+rt.ID]; !exists || rt.Index == "" {
+				ratingByID["\x00"+rt.ID] = rt.Rating
+			}
 			if rt.Rating >= relevantThreshold {
 				totalRelevantInRatings++
 			}
 		}
 
-		hitsReport := make([]map[string]any, 0, len(hitIDs))
+		hitsReport := make([]map[string]any, 0, len(hitRefs))
+		unratedDocs := make([]map[string]any, 0)
 		relevantRetrieved := 0
 		mrr := 0.0
 		dcg := 0.0
@@ -1623,16 +2314,24 @@ func (s *Server) handleRankEval(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		for rankIdx, hID := range hitIDs {
-			rating, rated := ratingByID[hID]
+		for rankIdx, hRef := range hitRefs {
+			rating, rated := ratingByID[hRef.index+"\x00"+hRef.id]
+			if !rated {
+				rating, rated = ratingByID["\x00"+hRef.id]
+			}
 			var ratingOut any
 			if rated {
 				ratingOut = rating
+			} else {
+				unratedDocs = append(unratedDocs, map[string]any{
+					"_index": hRef.index,
+					"_id":    hRef.id,
+				})
 			}
 			hitsReport = append(hitsReport, map[string]any{
 				"hit": map[string]any{
-					"_index": targetIndex,
-					"_id":    hID,
+					"_index": hRef.index,
+					"_id":    hRef.id,
 				},
 				"rating": ratingOut,
 			})
@@ -1654,7 +2353,7 @@ func (s *Server) handleRankEval(w http.ResponseWriter, r *http.Request) {
 		var qScore float64
 		switch metricName {
 		case "precision":
-			denom := len(hitIDs)
+			denom := len(hitRefs)
 			if denom == 0 {
 				denom = kVal
 			}
@@ -1695,8 +2394,8 @@ func (s *Server) handleRankEval(w http.ResponseWriter, r *http.Request) {
 		case "expected_reciprocal_rank", "err":
 			qScore = errMetric
 		default:
-			if len(hitIDs) > 0 {
-				qScore = float64(relevantRetrieved) / float64(len(hitIDs))
+			if len(hitRefs) > 0 {
+				qScore = float64(relevantRetrieved) / float64(len(hitRefs))
 			}
 		}
 
@@ -1704,7 +2403,7 @@ func (s *Server) handleRankEval(w http.ResponseWriter, r *http.Request) {
 		validCount++
 		details[item.ID] = map[string]any{
 			"metric_score":   qScore,
-			"unrated_docs":   []any{},
+			"unrated_docs":   unratedDocs,
 			"hits":           hitsReport,
 			"metric_details": map[string]any{},
 		}
@@ -1851,7 +2550,25 @@ func (s *Server) handleCatRecovery(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCatRepositories(w http.ResponseWriter, r *http.Request) {
-	list := []map[string]any{}
+	s.mu.RLock()
+	repoNames := make([]string, 0, len(s.snapshotRepos))
+	for k := range s.snapshotRepos {
+		repoNames = append(repoNames, k)
+	}
+	sort.Strings(repoNames)
+	list := make([]map[string]any, 0, len(repoNames))
+	for _, name := range repoNames {
+		repoObj := s.snapshotRepos[name]
+		repoType, _ := repoObj["type"].(string)
+		if repoType == "" {
+			repoType = "fs"
+		}
+		list = append(list, map[string]any{
+			"id":   name,
+			"type": repoType,
+		})
+	}
+	s.mu.RUnlock()
 	writeCatResponse(w, r, []string{"id", "type"}, list)
 }
 
@@ -2251,6 +2968,27 @@ func (s *Server) handleIndexClose(w http.ResponseWriter, r *http.Request) {
 // F7: `matched_queries` in Search Hits
 // ============================================================================
 
+func querySliceHasNamedClauses(qs []esast.Query) bool {
+	for i := range qs {
+		if queryHasNamedClauses(&qs[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+func knnSliceHasNamedClauses(knns []esast.KNNQuery) bool {
+	for i := range knns {
+		if knns[i].Name != "" {
+			return true
+		}
+		if querySliceHasNamedClauses(knns[i].Filter) {
+			return true
+		}
+	}
+	return false
+}
+
 func queryHasNamedClauses(q *esast.Query) bool {
 	if q == nil {
 		return false
@@ -2262,39 +3000,28 @@ func queryHasNamedClauses(q *esast.Query) bool {
 		return true
 	}
 	if q.Bool != nil {
-		for i := range q.Bool.Must {
-			if queryHasNamedClauses(&q.Bool.Must[i]) {
-				return true
-			}
-		}
-		for i := range q.Bool.Should {
-			if queryHasNamedClauses(&q.Bool.Should[i]) {
-				return true
-			}
-		}
-		for i := range q.Bool.Filter {
-			if queryHasNamedClauses(&q.Bool.Filter[i]) {
-				return true
-			}
-		}
-		for i := range q.Bool.MustNot {
-			if queryHasNamedClauses(&q.Bool.MustNot[i]) {
-				return true
-			}
+		if querySliceHasNamedClauses(q.Bool.Must) ||
+			querySliceHasNamedClauses(q.Bool.Should) ||
+			querySliceHasNamedClauses(q.Bool.Filter) ||
+			querySliceHasNamedClauses(q.Bool.MustNot) {
+			return true
 		}
 	}
 	if q.Boosting != nil && (queryHasNamedClauses(&q.Boosting.Positive) || queryHasNamedClauses(&q.Boosting.Negative)) {
 		return true
 	}
-	if q.DisMax != nil {
-		for i := range q.DisMax.Queries {
-			if queryHasNamedClauses(&q.DisMax.Queries[i]) {
+	if q.DisMax != nil && querySliceHasNamedClauses(q.DisMax.Queries) {
+		return true
+	}
+	if q.FunctionScore != nil {
+		if q.FunctionScore.Query != nil && queryHasNamedClauses(q.FunctionScore.Query) {
+			return true
+		}
+		for i := range q.FunctionScore.Functions {
+			if q.FunctionScore.Functions[i].Filter != nil && queryHasNamedClauses(q.FunctionScore.Functions[i].Filter) {
 				return true
 			}
 		}
-	}
-	if q.FunctionScore != nil && q.FunctionScore.Query != nil && queryHasNamedClauses(q.FunctionScore.Query) {
-		return true
 	}
 	if q.ScriptScore != nil && q.ScriptScore.Query != nil && queryHasNamedClauses(q.ScriptScore.Query) {
 		return true
@@ -2306,6 +3033,33 @@ func queryHasNamedClauses(q *esast.Query) bool {
 		return true
 	}
 	if q.Pinned != nil && q.Pinned.Organic != nil && queryHasNamedClauses(q.Pinned.Organic) {
+		return true
+	}
+	if q.KNN != nil && querySliceHasNamedClauses(q.KNN.Filter) {
+		return true
+	}
+	if q.SpanNear != nil && querySliceHasNamedClauses(q.SpanNear.Clauses) {
+		return true
+	}
+	if q.SpanOr != nil && querySliceHasNamedClauses(q.SpanOr.Clauses) {
+		return true
+	}
+	if q.SpanNot != nil && (queryHasNamedClauses(q.SpanNot.Include) || queryHasNamedClauses(q.SpanNot.Exclude)) {
+		return true
+	}
+	if q.SpanFirst != nil && queryHasNamedClauses(q.SpanFirst.Match) {
+		return true
+	}
+	if q.SpanMulti != nil && queryHasNamedClauses(q.SpanMulti.Match) {
+		return true
+	}
+	if q.SpanContaining != nil && (queryHasNamedClauses(q.SpanContaining.Little) || queryHasNamedClauses(q.SpanContaining.Big)) {
+		return true
+	}
+	if q.SpanWithin != nil && (queryHasNamedClauses(q.SpanWithin.Little) || queryHasNamedClauses(q.SpanWithin.Big)) {
+		return true
+	}
+	if q.FieldMaskingSpan != nil && queryHasNamedClauses(q.FieldMaskingSpan.Query) {
 		return true
 	}
 	return false
@@ -2339,18 +3093,56 @@ func extractDirectQueryClauseName(q *esast.Query) string {
 	if q.MoreLikeThis != nil && q.MoreLikeThis.Name != "" {
 		return q.MoreLikeThis.Name
 	}
+	if q.KNN != nil && q.KNN.Name != "" {
+		return q.KNN.Name
+	}
+	if q.Wrapper != nil && q.Wrapper.Name != "" {
+		return q.Wrapper.Name
+	}
 	return ""
+}
+
+func collectMatchedQueryNamesForSearch(idxSchema *schema.IndexSchema, docMap map[string]any, q, postFilter *esast.Query, knns []esast.KNNQuery) []string {
+	seen := make(map[string]bool)
+	var out []string
+	addNames := func(names []string) {
+		for _, n := range names {
+			if n != "" && !seen[n] {
+				seen[n] = true
+				out = append(out, n)
+			}
+		}
+	}
+	if q != nil {
+		addNames(collectMatchedQueryNames(idxSchema, docMap, q))
+	}
+	if postFilter != nil {
+		addNames(collectMatchedQueryNames(idxSchema, docMap, postFilter))
+	}
+	for i := range knns {
+		kq := esast.Query{KNN: &knns[i]}
+		if evalBranchMatchesDoc(idxSchema, docMap, &kq) {
+			if knns[i].Name != "" {
+				addNames([]string{knns[i].Name})
+			}
+			for j := range knns[i].Filter {
+				addNames(collectMatchedQueryNames(idxSchema, docMap, &knns[i].Filter[j]))
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func collectMatchedQueryNames(idxSchema *schema.IndexSchema, docMap map[string]any, q *esast.Query) []string {
 	seen := make(map[string]bool)
 	var out []string
-	var walk func(cur *esast.Query)
-	walk = func(cur *esast.Query) {
+	var walk func(curSchema *schema.IndexSchema, curDoc map[string]any, cur *esast.Query)
+	walk = func(curSchema *schema.IndexSchema, curDoc map[string]any, cur *esast.Query) {
 		if cur == nil {
 			return
 		}
-		if !evalBranchMatchesDoc(idxSchema, docMap, cur) {
+		if !evalBranchMatchesDoc(curSchema, curDoc, cur) {
 			return
 		}
 		if name := extractDirectQueryClauseName(cur); name != "" && !seen[name] {
@@ -2359,47 +3151,145 @@ func collectMatchedQueryNames(idxSchema *schema.IndexSchema, docMap map[string]a
 		}
 		if cur.Bool != nil {
 			for i := range cur.Bool.Must {
-				walk(&cur.Bool.Must[i])
+				walk(curSchema, curDoc, &cur.Bool.Must[i])
 			}
 			for i := range cur.Bool.Should {
-				walk(&cur.Bool.Should[i])
+				walk(curSchema, curDoc, &cur.Bool.Should[i])
 			}
 			for i := range cur.Bool.Filter {
-				walk(&cur.Bool.Filter[i])
+				walk(curSchema, curDoc, &cur.Bool.Filter[i])
 			}
 		}
 		if cur.ConstantScore != nil {
-			walk(&cur.ConstantScore.Filter)
+			walk(curSchema, curDoc, &cur.ConstantScore.Filter)
 		}
 		if cur.Boosting != nil {
-			walk(&cur.Boosting.Positive)
+			walk(curSchema, curDoc, &cur.Boosting.Positive)
 		}
 		if cur.DisMax != nil {
 			for i := range cur.DisMax.Queries {
-				walk(&cur.DisMax.Queries[i])
+				walk(curSchema, curDoc, &cur.DisMax.Queries[i])
 			}
 		}
-		if cur.FunctionScore != nil && cur.FunctionScore.Query != nil {
-			walk(cur.FunctionScore.Query)
+		if cur.FunctionScore != nil {
+			if cur.FunctionScore.Query != nil {
+				walk(curSchema, curDoc, cur.FunctionScore.Query)
+			}
+			for i := range cur.FunctionScore.Functions {
+				if cur.FunctionScore.Functions[i].Filter != nil {
+					walk(curSchema, curDoc, cur.FunctionScore.Functions[i].Filter)
+				}
+			}
 		}
 		if cur.ScriptScore != nil && cur.ScriptScore.Query != nil {
-			walk(cur.ScriptScore.Query)
+			walk(curSchema, curDoc, cur.ScriptScore.Query)
+		}
+		if cur.Nested != nil {
+			pathSegs := strings.Split(cur.Nested.Path, ".")
+			nestedSchema := deriveNestedEvalSchema(curSchema, cur.Nested.Path)
+			for _, cand := range extractNestedElementsAtPath(curDoc, pathSegs) {
+				elemDoc := buildSingleNestedElementDoc(pathSegs, cand.obj)
+				walk(nestedSchema, elemDoc, &cur.Nested.Query)
+			}
 		}
 		if cur.Wrapper != nil && cur.Wrapper.Decoded != nil {
-			walk(cur.Wrapper.Decoded)
+			walk(curSchema, curDoc, cur.Wrapper.Decoded)
 		}
 		if cur.Pinned != nil && cur.Pinned.Organic != nil {
-			walk(cur.Pinned.Organic)
+			walk(curSchema, curDoc, cur.Pinned.Organic)
+		}
+		if cur.KNN != nil {
+			for i := range cur.KNN.Filter {
+				walk(curSchema, curDoc, &cur.KNN.Filter[i])
+			}
+		}
+		if cur.SpanNear != nil {
+			for i := range cur.SpanNear.Clauses {
+				walk(curSchema, curDoc, &cur.SpanNear.Clauses[i])
+			}
+		}
+		if cur.SpanOr != nil {
+			for i := range cur.SpanOr.Clauses {
+				walk(curSchema, curDoc, &cur.SpanOr.Clauses[i])
+			}
+		}
+		if cur.SpanNot != nil {
+			walk(curSchema, curDoc, cur.SpanNot.Include)
+		}
+		if cur.SpanFirst != nil {
+			walk(curSchema, curDoc, cur.SpanFirst.Match)
+		}
+		if cur.SpanMulti != nil {
+			walk(curSchema, curDoc, cur.SpanMulti.Match)
+		}
+		if cur.SpanContaining != nil {
+			walk(curSchema, curDoc, cur.SpanContaining.Little)
+			walk(curSchema, curDoc, cur.SpanContaining.Big)
+		}
+		if cur.SpanWithin != nil {
+			walk(curSchema, curDoc, cur.SpanWithin.Little)
+			walk(curSchema, curDoc, cur.SpanWithin.Big)
+		}
+		if cur.FieldMaskingSpan != nil {
+			walk(curSchema, curDoc, cur.FieldMaskingSpan.Query)
 		}
 	}
-	walk(q)
+	walk(idxSchema, docMap, q)
 	sort.Strings(out)
 	return out
+}
+
+func collectIdsQueriesWithInnerHits(q *esast.Query, out *[]*esast.IdsQuery) {
+	if q == nil || out == nil {
+		return
+	}
+	if q.Ids != nil && len(q.Ids.ResolvedInnerHits) > 0 {
+		*out = append(*out, q.Ids)
+	}
+	if q.Bool != nil {
+		for i := range q.Bool.Must {
+			collectIdsQueriesWithInnerHits(&q.Bool.Must[i], out)
+		}
+		for i := range q.Bool.Should {
+			collectIdsQueriesWithInnerHits(&q.Bool.Should[i], out)
+		}
+		for i := range q.Bool.Filter {
+			collectIdsQueriesWithInnerHits(&q.Bool.Filter[i], out)
+		}
+	}
+	if q.ConstantScore != nil {
+		collectIdsQueriesWithInnerHits(&q.ConstantScore.Filter, out)
+	}
+	if q.Boosting != nil {
+		collectIdsQueriesWithInnerHits(&q.Boosting.Positive, out)
+	}
+	if q.DisMax != nil {
+		for i := range q.DisMax.Queries {
+			collectIdsQueriesWithInnerHits(&q.DisMax.Queries[i], out)
+		}
+	}
+	if q.FunctionScore != nil && q.FunctionScore.Query != nil {
+		collectIdsQueriesWithInnerHits(q.FunctionScore.Query, out)
+	}
+	if q.ScriptScore != nil && q.ScriptScore.Query != nil {
+		collectIdsQueriesWithInnerHits(q.ScriptScore.Query, out)
+	}
+	if q.Wrapper != nil && q.Wrapper.Decoded != nil {
+		collectIdsQueriesWithInnerHits(q.Wrapper.Decoded, out)
+	}
+	if q.Pinned != nil && q.Pinned.Organic != nil {
+		collectIdsQueriesWithInnerHits(q.Pinned.Organic, out)
+	}
 }
 
 // ============================================================================
 // F8-F11: Query Pre-Resolution & Runtime Evaluation (`MoreLikeThis`, `HasChild`, `HasParent`, `ParentID`, `Percolate`)
 // ============================================================================
+
+var (
+	activeStoredScriptsServerMu sync.RWMutex
+	activeStoredScriptsServer   *Server
+)
 
 func hasSpecialLookupInSearchRequest(req *esast.SearchRequest) bool {
 	if req == nil {
@@ -2415,7 +3305,10 @@ func hasSpecialLookupInQuery(q *esast.Query) bool {
 	if q == nil {
 		return false
 	}
-	if q.HasChild != nil || q.HasParent != nil || q.Percolate != nil || q.MoreLikeThis != nil {
+	if q.HasChild != nil || q.HasParent != nil || q.ParentID != nil || q.Percolate != nil || q.MoreLikeThis != nil {
+		return true
+	}
+	if q.Nested != nil && hasSpecialLookupInQuery(&q.Nested.Query) {
 		return true
 	}
 	if q.Wrapper != nil && q.Wrapper.Decoded != nil && hasSpecialLookupInQuery(q.Wrapper.Decoded) {
@@ -2469,6 +3362,11 @@ func hasSpecialLookupInQuery(q *esast.Query) bool {
 }
 
 func (s *Server) preResolveSpecialQueriesInSearchRequest(ctx context.Context, targets []string, req *esast.SearchRequest) error {
+	if s != nil {
+		activeStoredScriptsServerMu.Lock()
+		activeStoredScriptsServer = s
+		activeStoredScriptsServerMu.Unlock()
+	}
 	if s == nil || req == nil || !hasSpecialLookupInSearchRequest(req) {
 		return nil
 	}
@@ -2487,6 +3385,138 @@ func (s *Server) preResolveSpecialQueriesInSearchRequest(ctx context.Context, ta
 		req.PostFilter = resolved
 	}
 	return nil
+}
+
+func (s *Server) validateJoinFieldForTargets(ctx context.Context, targets []string, relType string, isParentRel bool) (joinField string, hasJoin bool, hasRel bool, hasMappedFields bool) {
+	relType = strings.TrimSpace(relType)
+	for _, t := range targets {
+		sch := s.getOrCompileReadOnlySchema(ctx, t)
+		if sch == nil || len(sch.Fields) == 0 {
+			continue
+		}
+		hasMappedFields = true
+		for fname, fb := range sch.Fields {
+			if fb.ESType != "join" {
+				continue
+			}
+			hasJoin = true
+			if joinField == "" {
+				joinField = fname
+			}
+			if relType == "" || len(fb.Relations) == 0 {
+				hasRel = true
+				continue
+			}
+			if isParentRel {
+				if _, ok := fb.Relations[relType]; ok {
+					hasRel = true
+				}
+			} else {
+				for _, childSpec := range fb.Relations {
+					switch cs := childSpec.(type) {
+					case string:
+						if cs == relType {
+							hasRel = true
+						}
+					case []any:
+						for _, item := range cs {
+							if fmt.Sprintf("%v", item) == relType {
+								hasRel = true
+							}
+						}
+					case []string:
+						for _, item := range cs {
+							if item == relType {
+								hasRel = true
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return joinField, hasJoin, hasRel, hasMappedFields
+}
+
+func buildJoinInnerHitsEnvelope(hits []HitRow, spec *esast.InnerHitsSpec, idxSchema *schema.IndexSchema) map[string]any {
+	from := 0
+	size := 3
+	if spec != nil {
+		if spec.From >= 0 {
+			from = spec.From
+		}
+		if spec.Size != nil && *spec.Size >= 0 {
+			size = *spec.Size
+		}
+	}
+	total := len(hits)
+	var paged []HitRow
+	if from < total {
+		end := from + size
+		if end > total {
+			end = total
+		}
+		paged = hits[from:end]
+	}
+	var maxScoreVal any
+	hitObjs := make([]map[string]any, 0, len(paged))
+	for _, h := range paged {
+		rawSrc := h.Source
+		if spec != nil && spec.Source != nil {
+			rawSrc = filterSourceJSON(h.Source, spec.Source)
+		}
+		var filteredSrc any
+		if len(rawSrc) > 0 && string(rawSrc) != "null" {
+			var srcMap map[string]any
+			_ = json.Unmarshal(rawSrc, &srcMap)
+			filteredSrc = srcMap
+		}
+		scoreVal := h.Score
+		if maxScoreVal == nil || scoreVal > maxScoreVal.(float64) {
+			maxScoreVal = scoreVal
+		}
+		idxName := ""
+		if idxSchema != nil {
+			idxName = idxSchema.IndexName
+		}
+		hitObj := map[string]any{
+			"_index":  idxName,
+			"_id":     h.ID,
+			"_score":  scoreVal,
+			"_source": filteredSrc,
+		}
+		if spec != nil && (len(spec.Fields) > 0 || len(spec.DocvalueFields) > 0) {
+			if fMap := extractHitFieldsMap(h, idxName, &esast.SearchRequest{Fields: spec.EffectiveFieldSpecs()}, idxSchema); len(fMap) > 0 {
+				hitObj["fields"] = fMap
+			}
+		}
+		hitObjs = append(hitObjs, hitObj)
+	}
+	return map[string]any{
+		"hits": map[string]any{
+			"total": map[string]any{
+				"value":    total,
+				"relation": "eq",
+			},
+			"max_score": maxScoreVal,
+			"hits":      hitObjs,
+		},
+	}
+}
+
+func hitMapToHitRow(hm map[string]any) HitRow {
+	idStr, _ := hm["_id"].(string)
+	srcMap := extractSourceMapFromHitMap(hm)
+	rawBytes, _ := json.Marshal(srcMap)
+	scVal := 1.0
+	if sc, ok := toFloat(hm["_score"]); ok {
+		scVal = sc
+	}
+	return HitRow{
+		ID:     idStr,
+		Score:  scVal,
+		Source: rawBytes,
+	}
 }
 
 func (s *Server) preResolveSpecialQueriesInQuery(ctx context.Context, targets []string, q *esast.Query) (*esast.Query, error) {
@@ -2580,48 +3610,136 @@ func (s *Server) preResolveSpecialQueriesInQuery(ctx context.Context, targets []
 		cp.MoreLikeThis = &mlt
 	}
 
-	// F11: Percolate lookup by document `_id` (`index` + `id`)
-	if cp.Percolate != nil && cp.Percolate.ID != "" && cp.Percolate.Document == nil && len(cp.Percolate.Documents) == 0 {
+	// F7 / F11: Percolate validation + lookup by document `_id` (`index` + `id`)
+	if cp.Percolate != nil {
 		perc := *cp.Percolate
-		idx := perc.Index
-		if idx == "" {
-			idx = defaultIdx
+		field := strings.TrimSpace(perc.Field)
+		if field == "" {
+			field = "query"
 		}
-		if idx != "" && s.backend != nil {
-			resolvedIdx, _, _ := s.resolveReadDocIndexWithFilter(idx)
-			if resolvedIdx == "" {
-				resolvedIdx = idx
+		hasMappedFields := false
+		foundPercolator := false
+		hasDynamicSubfields := false
+		var wrongType string
+		for _, t := range targets {
+			sch := s.getOrCompileReadOnlySchema(ctx, t)
+			if sch == nil || len(sch.Fields) == 0 {
+				continue
 			}
-			roSchema := s.getOrCompileReadOnlySchema(ctx, resolvedIdx)
-			_ = s.coalescer.FlushTable(ctx, roSchema.DorisTable)
-			if existing, found, err := s.backend.GetDocByID(ctx, roSchema.DorisDB, roSchema.DorisTable, perc.ID); err == nil && found && existing != nil {
-				var docMap map[string]any
-				dec := json.NewDecoder(bytes.NewReader(existing.Source))
-				dec.UseNumber()
-				if dec.Decode(&docMap) == nil && docMap != nil {
-					perc.Document = docMap
+			hasMappedFields = true
+			fb := sch.ResolveEffectiveField(field, false)
+			if fb.ESType == "percolator" {
+				foundPercolator = true
+			} else if fb.ESType != "" {
+				wrongType = fb.ESType
+			}
+			prefix := field + "."
+			for fname := range sch.Fields {
+				if strings.HasPrefix(fname, prefix) {
+					hasDynamicSubfields = true
+					break
 				}
 			}
 		}
-		if perc.Document == nil {
-			perc.Document = map[string]any{}
+		if hasMappedFields && !foundPercolator {
+			if wrongType != "" {
+				return nil, fmt.Errorf("field [%s] is not of type [percolator]", field)
+			}
+			if !hasDynamicSubfields {
+				if perc.IgnoreUnmapped {
+					cp.Percolate = nil
+					cp.Ids = &esast.IdsQuery{
+						Values: []string{"__no_match_unmapped__"},
+						Name:   perc.Name,
+					}
+					return &cp, nil
+				}
+				return nil, fmt.Errorf("field [%s] does not exist or is not of type [percolator]", field)
+			}
+		}
+		if perc.ID != "" && perc.Document == nil && len(perc.Documents) == 0 {
+			idx := perc.Index
+			if idx == "" {
+				idx = defaultIdx
+			}
+			if idx != "" && s.backend != nil {
+				resolvedIdx, _, _ := s.resolveReadDocIndexWithFilter(idx)
+				if resolvedIdx == "" {
+					resolvedIdx = idx
+				}
+				roSchema := s.getOrCompileReadOnlySchema(ctx, resolvedIdx)
+				_ = s.coalescer.FlushTable(ctx, roSchema.DorisTable)
+				if existing, found, err := s.backend.GetDocByID(ctx, roSchema.DorisDB, roSchema.DorisTable, perc.ID); err == nil && found && existing != nil {
+					var docMap map[string]any
+					dec := json.NewDecoder(bytes.NewReader(existing.Source))
+					dec.UseNumber()
+					if dec.Decode(&docMap) == nil && docMap != nil {
+						perc.Document = docMap
+					}
+				}
+			}
+			if perc.Document == nil {
+				perc.Document = map[string]any{}
+			}
 		}
 		cp.Percolate = &perc
 	}
 
-	// F10: HasChild pre-resolution -> rewrite into `_id` IdsQuery of matching parent IDs
+	// F5: ParentID validation for unmapped join field/relation
+	if cp.ParentID != nil {
+		pid := cp.ParentID
+		_, hasJoin, hasRel, hasMappedFields := s.validateJoinFieldForTargets(ctx, targets, pid.Type, false)
+		if hasMappedFields && (!hasJoin || !hasRel) {
+			if pid.IgnoreUnmapped {
+				cp.ParentID = nil
+				cp.Ids = &esast.IdsQuery{
+					Values: []string{"__no_match_unmapped__"},
+					Name:   pid.Name,
+				}
+				return &cp, nil
+			}
+			return nil, fmt.Errorf("[parent_id] no join field has been configured or unknown child relation [%s]", pid.Type)
+		}
+	}
+
+	// F5 / F10: HasChild pre-resolution -> rewrite into `_id` IdsQuery of matching parent IDs
 	if cp.HasChild != nil {
 		hc := cp.HasChild
 		childType := strings.TrimSpace(hc.Type)
-		var joinField string
-		for _, t := range targets {
-			sch := s.getOrCompileReadOnlySchema(ctx, t)
-			if jf := findJoinFieldInSchema(sch); jf != "" {
-				joinField = jf
-				break
+		joinField, hasJoin, hasRel, hasMappedFields := s.validateJoinFieldForTargets(ctx, targets, childType, false)
+		if hasMappedFields && (!hasJoin || !hasRel) {
+			if hc.IgnoreUnmapped {
+				cp.HasChild = nil
+				cp.Ids = &esast.IdsQuery{
+					Values: []string{"__no_match_unmapped__"},
+					Name:   hc.Name,
+				}
+				return &cp, nil
 			}
+			return nil, fmt.Errorf("[has_child] no join field has been configured or unknown child relation [%s]", childType)
 		}
-		// Run inner query against targets to find matching child docs
+
+		minChildren := 1
+		if hc.MinChildren != nil && *hc.MinChildren > 0 {
+			minChildren = *hc.MinChildren
+		}
+		maxChildren := 0
+		if hc.MaxChildren != nil && *hc.MaxChildren > 0 {
+			maxChildren = *hc.MaxChildren
+		}
+		if maxChildren > 0 && minChildren > maxChildren {
+			cp.HasChild = nil
+			cp.Ids = &esast.IdsQuery{
+				Values: []string{"__no_match_unmapped__"},
+				Name:   hc.Name,
+			}
+			return &cp, nil
+		}
+
+		scoreMode := strings.ToLower(strings.TrimSpace(hc.ScoreMode))
+		if scoreMode == "" {
+			scoreMode = "none"
+		}
 		sz := 10000
 		resolvedInner, err := s.preResolveSpecialQueriesInQuery(ctx, targets, &hc.Query)
 		if err != nil {
@@ -2629,15 +3747,24 @@ func (s *Server) preResolveSpecialQueriesInQuery(ctx context.Context, targets []
 		}
 		innerQ := resolvedInner
 		parentCounts := make(map[string]int)
+		parentChildScores := make(map[string][]float64)
+		parentChildHits := make(map[string][]HitRow)
+		var firstTargetSchema *schema.IndexSchema
+
 		for _, t := range targets {
 			sch := s.getOrCompileReadOnlySchema(ctx, t)
 			if sch == nil || s.backend == nil {
 				continue
 			}
+			if firstTargetSchema == nil {
+				firstTargetSchema = sch
+			}
 			_ = s.coalescer.FlushTable(ctx, sch.DorisTable)
+			trackScoresTrue := true
 			resp, _, errType, _ := s.executeSearchRequest(ctx, t, &esast.SearchRequest{
-				Size:  &sz,
-				Query: innerQ,
+				Size:        &sz,
+				Query:       innerQ,
+				TrackScores: &trackScoresTrue,
 			})
 			if errType != "" {
 				continue
@@ -2665,18 +3792,25 @@ func (s *Server) preResolveSpecialQueriesInQuery(ctx context.Context, targets []
 				relName, parentID := extractJoinRelationAndParent(srcMap, joinField)
 				if parentID != "" && (childType == "" || relName == childType) {
 					parentCounts[parentID]++
+					childScore := 1.0
+					if sc, okSc := toFloat(hm["_score"]); okSc {
+						childScore = sc
+					}
+					parentChildScores[parentID] = append(parentChildScores[parentID], childScore)
+					if hc.InnerHits != nil {
+						parentChildHits[parentID] = append(parentChildHits[parentID], hitMapToHitRow(hm))
+					}
 				}
 			}
 		}
-		minChildren := 1
-		if hc.MinChildren != nil && *hc.MinChildren > 0 {
-			minChildren = *hc.MinChildren
-		}
-		maxChildren := 0
-		if hc.MaxChildren != nil && *hc.MaxChildren > 0 {
-			maxChildren = *hc.MaxChildren
+
+		boost := 1.0
+		if hc.Boost != nil {
+			boost = *hc.Boost
 		}
 		var matchedParentIDs []string
+		var resolvedScores map[string]float64
+		var resolvedInnerHits map[string]any
 		for pid, cnt := range parentCounts {
 			if cnt < minChildren {
 				continue
@@ -2685,29 +3819,83 @@ func (s *Server) preResolveSpecialQueriesInQuery(ctx context.Context, targets []
 				continue
 			}
 			matchedParentIDs = append(matchedParentIDs, pid)
+			if scoreMode != "none" {
+				scores := parentChildScores[pid]
+				if len(scores) > 0 {
+					var agg float64
+					switch scoreMode {
+					case "max":
+						agg = scores[0]
+						for _, sVal := range scores[1:] {
+							if sVal > agg {
+								agg = sVal
+							}
+						}
+					case "min":
+						agg = scores[0]
+						for _, sVal := range scores[1:] {
+							if sVal < agg {
+								agg = sVal
+							}
+						}
+					case "sum":
+						for _, sVal := range scores {
+							agg += sVal
+						}
+					case "avg":
+						for _, sVal := range scores {
+							agg += sVal
+						}
+						agg /= float64(len(scores))
+					default:
+						agg = 1.0
+					}
+					if resolvedScores == nil {
+						resolvedScores = make(map[string]float64)
+					}
+					resolvedScores[pid] = agg * boost
+				}
+			}
+			if hc.InnerHits != nil {
+				if resolvedInnerHits == nil {
+					resolvedInnerHits = make(map[string]any)
+				}
+				resolvedInnerHits[pid] = buildJoinInnerHitsEnvelope(parentChildHits[pid], hc.InnerHits, firstTargetSchema)
+			}
 		}
 		sort.Strings(matchedParentIDs)
 		cp.HasChild = nil
 		cp.Ids = &esast.IdsQuery{
-			Values: matchedParentIDs,
-			Boost:  hc.Boost,
-			Name:   hc.Name,
+			Values:            matchedParentIDs,
+			Boost:             hc.Boost,
+			Name:              hc.Name,
+			ResolvedScores:    resolvedScores,
+			ResolvedInnerHits: resolvedInnerHits,
+			InnerHitsSpec:     hc.InnerHits,
+			JoinQueryType:     "has_child",
+			JoinRelType:       childType,
+			JoinScoreMode:     scoreMode,
 		}
 		return &cp, nil
 	}
 
-	// F10: HasParent pre-resolution -> find matching parent `_id`s, then match child docs whose join parent is in that set
+	// F5 / F10: HasParent pre-resolution -> find matching parent `_id`s, then match child docs whose join parent is in that set
 	if cp.HasParent != nil {
 		hp := cp.HasParent
 		parentType := strings.TrimSpace(hp.ParentType)
-		var joinField string
-		for _, t := range targets {
-			sch := s.getOrCompileReadOnlySchema(ctx, t)
-			if jf := findJoinFieldInSchema(sch); jf != "" {
-				joinField = jf
-				break
+		joinField, hasJoin, hasRel, hasMappedFields := s.validateJoinFieldForTargets(ctx, targets, parentType, true)
+		if hasMappedFields && (!hasJoin || !hasRel) {
+			if hp.IgnoreUnmapped {
+				cp.HasParent = nil
+				cp.Ids = &esast.IdsQuery{
+					Values: []string{"__no_match_unmapped__"},
+					Name:   hp.Name,
+				}
+				return &cp, nil
 			}
+			return nil, fmt.Errorf("[has_parent] no join field has been configured or unknown parent relation [%s]", parentType)
 		}
+
 		sz := 10000
 		resolvedInner, err := s.preResolveSpecialQueriesInQuery(ctx, targets, &hp.Query)
 		if err != nil {
@@ -2715,15 +3903,24 @@ func (s *Server) preResolveSpecialQueriesInQuery(ctx context.Context, targets []
 		}
 		innerQ := resolvedInner
 		matchedParentSet := make(map[string]bool)
+		parentScores := make(map[string]float64)
+		parentHitRows := make(map[string]HitRow)
+		var firstTargetSchema *schema.IndexSchema
+
 		for _, t := range targets {
 			sch := s.getOrCompileReadOnlySchema(ctx, t)
 			if sch == nil || s.backend == nil {
 				continue
 			}
+			if firstTargetSchema == nil {
+				firstTargetSchema = sch
+			}
 			_ = s.coalescer.FlushTable(ctx, sch.DorisTable)
+			trackScoresTrue := true
 			resp, _, errType, _ := s.executeSearchRequest(ctx, t, &esast.SearchRequest{
-				Size:  &sz,
-				Query: innerQ,
+				Size:        &sz,
+				Query:       innerQ,
+				TrackScores: &trackScoresTrue,
 			})
 			if errType != "" {
 				continue
@@ -2752,11 +3949,27 @@ func (s *Server) preResolveSpecialQueriesInQuery(ctx context.Context, targets []
 				relName, _ := extractJoinRelationAndParent(srcMap, joinField)
 				if parentType == "" || relName == parentType || relName == "" {
 					matchedParentSet[idStr] = true
+					pScore := 1.0
+					if sc, okSc := toFloat(hm["_score"]); okSc {
+						pScore = sc
+					}
+					parentScores[idStr] = pScore
+					if hp.InnerHits != nil {
+						parentHitRows[idStr] = hitMapToHitRow(hm)
+					}
 				}
 			}
 		}
-		// Now find child doc `_id`s whose join.parent is in matchedParentSet
+
+		boost := 1.0
+		if hp.Boost != nil {
+			boost = *hp.Boost
+		}
+		scoreEnabled := hp.Score != nil && *hp.Score
 		var matchedChildIDs []string
+		var resolvedScores map[string]float64
+		var resolvedInnerHits map[string]any
+
 		if len(matchedParentSet) > 0 {
 			for _, t := range targets {
 				sch := s.getOrCompileReadOnlySchema(ctx, t)
@@ -2793,26 +4006,46 @@ func (s *Server) preResolveSpecialQueriesInQuery(ctx context.Context, targets []
 					_, parentID := extractJoinRelationAndParent(srcMap, joinField)
 					if parentID != "" && matchedParentSet[parentID] {
 						matchedChildIDs = append(matchedChildIDs, idStr)
+						if scoreEnabled {
+							if resolvedScores == nil {
+								resolvedScores = make(map[string]float64)
+							}
+							resolvedScores[idStr] = parentScores[parentID] * boost
+						}
+						if hp.InnerHits != nil {
+							if resolvedInnerHits == nil {
+								resolvedInnerHits = make(map[string]any)
+							}
+							resolvedInnerHits[idStr] = buildJoinInnerHitsEnvelope([]HitRow{parentHitRows[parentID]}, hp.InnerHits, firstTargetSchema)
+						}
 					}
 				}
 			}
 		}
 		sort.Strings(matchedChildIDs)
-		var boostVal *float64
-		if hp.Score != nil && *hp.Score && hp.Boost != nil {
-			boostVal = hp.Boost
-		} else if hp.Boost != nil {
-			boostVal = hp.Boost
-		}
 		cp.HasParent = nil
 		cp.Ids = &esast.IdsQuery{
-			Values: matchedChildIDs,
-			Boost:  boostVal,
-			Name:   hp.Name,
+			Values:            matchedChildIDs,
+			Boost:             hp.Boost,
+			Name:              hp.Name,
+			ResolvedScores:    resolvedScores,
+			ResolvedInnerHits: resolvedInnerHits,
+			InnerHitsSpec:     hp.InnerHits,
+			JoinQueryType:     "has_parent",
+			JoinRelType:       parentType,
 		}
 		return &cp, nil
 	}
 
+	if cp.Nested != nil {
+		nCopy := *cp.Nested
+		r, err := s.preResolveSpecialQueriesInQuery(ctx, targets, &nCopy.Query)
+		if err != nil {
+			return nil, err
+		}
+		nCopy.Query = *r
+		cp.Nested = &nCopy
+	}
 	if cp.Bool != nil {
 		bCopy := *cp.Bool
 		if len(bCopy.Must) > 0 {
@@ -2993,6 +4226,9 @@ func evalParentIDOnDoc(idxSchema *schema.IndexSchema, docMap map[string]any, pid
 	targetParent := strings.TrimSpace(fmt.Sprintf("%v", pid.ID))
 	childType := strings.TrimSpace(pid.Type)
 	joinField := findJoinFieldInSchema(idxSchema)
+	if idxSchema != nil && len(idxSchema.Fields) > 0 && joinField == "" {
+		return false
+	}
 	relName, parentID := extractJoinRelationAndParent(docMap, joinField)
 	if parentID == "" || parentID != targetParent {
 		return false
@@ -3198,6 +4434,13 @@ func evalPercolateQueryOnDoc(idxSchema *schema.IndexSchema, docMap map[string]an
 		return false, 0, nil
 	}
 
+	activeStoredScriptsServerMu.RLock()
+	srv := activeStoredScriptsServer
+	activeStoredScriptsServerMu.RUnlock()
+	if srv != nil {
+		srv.resolveStoredScriptsInQuery(&storedQuery)
+	}
+
 	var docsToTest []map[string]any
 	if len(perc.Documents) > 0 {
 		docsToTest = perc.Documents
@@ -3262,6 +4505,28 @@ func queryHasPercolateMultiDocs(q *esast.Query) bool {
 	if q.ConstantScore != nil && queryHasPercolateMultiDocs(&q.ConstantScore.Filter) {
 		return true
 	}
+	if q.Boosting != nil && queryHasPercolateMultiDocs(&q.Boosting.Positive) {
+		return true
+	}
+	if q.DisMax != nil {
+		for i := range q.DisMax.Queries {
+			if queryHasPercolateMultiDocs(&q.DisMax.Queries[i]) {
+				return true
+			}
+		}
+	}
+	if q.FunctionScore != nil && q.FunctionScore.Query != nil && queryHasPercolateMultiDocs(q.FunctionScore.Query) {
+		return true
+	}
+	if q.ScriptScore != nil && q.ScriptScore.Query != nil && queryHasPercolateMultiDocs(q.ScriptScore.Query) {
+		return true
+	}
+	if q.Pinned != nil && q.Pinned.Organic != nil && queryHasPercolateMultiDocs(q.Pinned.Organic) {
+		return true
+	}
+	if q.Wrapper != nil && q.Wrapper.Decoded != nil && queryHasPercolateMultiDocs(q.Wrapper.Decoded) {
+		return true
+	}
 	return false
 }
 
@@ -3297,6 +4562,26 @@ func collectPercolateMatchedSlots(idxSchema *schema.IndexSchema, docMap map[stri
 		}
 		if cur.ConstantScore != nil {
 			walk(&cur.ConstantScore.Filter)
+		}
+		if cur.Boosting != nil {
+			walk(&cur.Boosting.Positive)
+		}
+		if cur.DisMax != nil {
+			for i := range cur.DisMax.Queries {
+				walk(&cur.DisMax.Queries[i])
+			}
+		}
+		if cur.FunctionScore != nil && cur.FunctionScore.Query != nil {
+			walk(cur.FunctionScore.Query)
+		}
+		if cur.ScriptScore != nil && cur.ScriptScore.Query != nil {
+			walk(cur.ScriptScore.Query)
+		}
+		if cur.Pinned != nil && cur.Pinned.Organic != nil {
+			walk(cur.Pinned.Organic)
+		}
+		if cur.Wrapper != nil && cur.Wrapper.Decoded != nil {
+			walk(cur.Wrapper.Decoded)
 		}
 	}
 	walk(q)

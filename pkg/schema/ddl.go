@@ -433,7 +433,7 @@ func isUnpromotableDynamicScope(s *IndexSchema, esFieldPath string) bool {
 	for _, seg := range strings.Split(cleanPath, ".") {
 		prop, ok := props[seg]
 		if !ok {
-			return mode == "false" || mode == "strict"
+			return mode == "false" || mode == "strict" || mode == "runtime"
 		}
 		if strings.EqualFold(prop.Type, "flattened") {
 			return false

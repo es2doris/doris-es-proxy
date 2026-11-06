@@ -1608,9 +1608,8 @@ func rewriteIngestCtxReferencesWithOp(s string, preserveOp bool) string {
 					}
 				}
 				mapMethods := []string{
-					"putIfAbsent", "putAll", "put", "remove", "replaceAll", "replace",
-					"getOrDefault", "get", "containsKey", "containsValue", "isEmpty",
-					"size", "keySet", "values", "entrySet", "clear",
+					"putIfAbsent", "putAll", "put", "remove",
+					"getOrDefault", "get", "containsKey",
 				}
 				for _, mm := range mapMethods {
 					if strings.HasPrefix(after, mm) {
@@ -1828,15 +1827,39 @@ func evalIngestIfCondition(cond string, doc map[string]any) bool {
 	}
 	normCond := strings.TrimSpace(rewriteIngestCtxReferences(cond))
 	metaParams := ingestMetaParamsFromDoc(doc)
+	origMetaMap, _ := doc["__internal_ingest_orig"].(map[string]any)
+	hadUserIndex, _ := origMetaMap["_had_orig_index"].(bool)
+	hadUserID, _ := origMetaMap["_had_orig_id"].(bool)
+	hadUserRouting, _ := origMetaMap["_had_orig_routing"].(bool)
+	cleanDoc := make(map[string]any, len(doc))
+	for k, v := range doc {
+		switch k {
+		case "__internal_ingest_orig", "_version", "_ingest":
+			continue
+		case "_index":
+			if !hadUserIndex {
+				continue
+			}
+		case "_id":
+			if !hadUserID {
+				continue
+			}
+		case "_routing":
+			if !hadUserRouting {
+				continue
+			}
+		}
+		cleanDoc[k] = v
+	}
 	if hasTopLevelSemicolonOrReturn(normCond) {
-		ok, err := painless.EvalFilter(doc, normCond, metaParams)
+		ok, err := painless.EvalFilter(cleanDoc, normCond, metaParams)
 		return err == nil && ok
 	}
 	normCond = strings.TrimSuffix(normCond, ";")
 	script := "if (" + normCond + "\n) { ctx.op = 'index' } else { ctx.op = 'noop' }"
-	opRes, err := painless.EvalPainlessWithOp(doc, script, metaParams)
+	opRes, err := painless.EvalPainlessWithOp(cleanDoc, script, metaParams)
 	if err != nil {
-		ok, fErr := painless.EvalFilter(doc, normCond, metaParams)
+		ok, fErr := painless.EvalFilter(cleanDoc, normCond, metaParams)
 		return fErr == nil && ok
 	}
 	return opRes == "index"
@@ -4801,6 +4824,15 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 	case "script":
 		resolvedSpec := specMap
 		if s != nil {
+			if rawID, _ := specMap["id"].(string); strings.TrimSpace(rawID) != "" {
+				if src, _ := specMap["source"].(string); strings.TrimSpace(src) == "" {
+					if inl, _ := specMap["inline"].(string); strings.TrimSpace(inl) == "" {
+						if _, ok := s.lookupStoredScript(strings.TrimSpace(rawID)); !ok {
+							return false, false, procType, procTag, specMap, fmt.Errorf("cannot execute stored script [%s] because it does not exist", strings.TrimSpace(rawID))
+						}
+					}
+				}
+			}
 			if m, ok := s.resolveStoredScriptSpec(specMap).(map[string]any); ok {
 				resolvedSpec = m
 			}
@@ -6397,6 +6429,16 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	if sliceErrStatus != 0 {
 		writeESError(w, sliceErrStatus, sliceErrType, sliceErrReason)
 		return
+	}
+	if missingID := s.findMissingStoredScriptInRawBody(bodyBytes); missingID != "" {
+		writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("cannot execute stored script [%s] because it does not exist", missingID))
+		return
+	}
+	if body.Source.Query != nil {
+		if missingID := s.validateStoredScriptsInQuery(body.Source.Query); missingID != "" {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("cannot execute stored script [%s] because it does not exist", missingID))
+			return
+		}
 	}
 	s.resolvePainlessScriptSpecFromRaw(&body.Script, bodyBytes)
 	if body.Conflicts == "" {

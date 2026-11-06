@@ -1003,59 +1003,60 @@ func (r *SearchRequest) EffectiveAggs() map[string]AggSpec {
 
 // Query represents a polymorphic node in the Elasticsearch Query DSL AST.
 type Query struct {
-	MatchAll          map[string]any           `json:"match_all,omitempty"`
-	MatchNone         map[string]any           `json:"match_none,omitempty"`
-	Bool              *BoolQuery               `json:"bool,omitempty"`
-	DisMax            *DisMaxQuery             `json:"dis_max,omitempty"`
-	Boosting          *BoostingQuery           `json:"boosting,omitempty"`
-	Term              map[string]TermEntry     `json:"term,omitempty"`
-	Terms             *TermsQuery              `json:"terms,omitempty"`
-	TermsSet          map[string]TermsSetEntry `json:"terms_set,omitempty"`
-	Ids               *IdsQuery                `json:"ids,omitempty"`
-	Range             map[string]RangeCond     `json:"range,omitempty"`
-	Exists            *ExistsQuery             `json:"exists,omitempty"`
-	Prefix            map[string]PrefixEntry   `json:"prefix,omitempty"`
-	Wildcard          map[string]WildcardEntry `json:"wildcard,omitempty"`
-	Regexp            map[string]RegexpEntry   `json:"regexp,omitempty"`
-	Fuzzy             map[string]FuzzyEntry    `json:"fuzzy,omitempty"`
-	Match             map[string]MatchEntry    `json:"match,omitempty"`
-	MatchPhrase       map[string]PhraseEntry   `json:"match_phrase,omitempty"`
-	MatchPhrasePrefix map[string]PhraseEntry   `json:"match_phrase_prefix,omitempty"`
-	MatchBoolPrefix   map[string]PhraseEntry   `json:"match_bool_prefix,omitempty"`
-	MultiMatch        *MultiMatchQuery         `json:"multi_match,omitempty"`
-	CombinedFields    *CombinedFieldsQuery     `json:"combined_fields,omitempty"`
-	QueryString       *QueryStringQuery        `json:"query_string,omitempty"`
-	SimpleQueryString *QueryStringQuery        `json:"simple_query_string,omitempty"`
-	Nested            *NestedQuery             `json:"nested,omitempty"`
-	ConstantScore     *ConstantScoreQuery      `json:"constant_score,omitempty"`
-	FunctionScore     *FunctionScoreQuery      `json:"function_score,omitempty"`
-	ScriptScore       *ScriptScoreQuery        `json:"script_score,omitempty"`
-	Script            *ScriptQuery             `json:"script,omitempty"`
-	KNN               *KNNQuery                `json:"knn,omitempty"`
-	GeoDistance       *GeoDistanceQuery        `json:"geo_distance,omitempty"`
-	GeoBoundingBox    *GeoBoundingBoxQuery     `json:"geo_bounding_box,omitempty"`
-	GeoPolygon        *GeoPolygonQuery         `json:"geo_polygon,omitempty"`
-	GeoShape          *GeoShapeQuery           `json:"geo_shape,omitempty"`
-	Wrapper           *WrapperQuery            `json:"wrapper,omitempty"`
-	Pinned            *PinnedQuery             `json:"pinned,omitempty"`
-	MoreLikeThis      *MoreLikeThisQuery       `json:"more_like_this,omitempty"`
-	Intervals         map[string]IntervalsRule `json:"intervals,omitempty"`
-	SpanTerm          map[string]TermEntry     `json:"span_term,omitempty"`
-	SpanNear          *SpanNearQuery           `json:"span_near,omitempty"`
-	SpanOr            *SpanOrQuery             `json:"span_or,omitempty"`
-	SpanNot           *SpanNotQuery            `json:"span_not,omitempty"`
-	SpanFirst         *SpanFirstQuery          `json:"span_first,omitempty"`
-	SpanMulti         *SpanMultiQuery          `json:"span_multi,omitempty"`
-	SpanContaining    *SpanPairQuery           `json:"span_containing,omitempty"`
-	SpanWithin        *SpanPairQuery           `json:"span_within,omitempty"`
-	FieldMaskingSpan  *FieldMaskingSpanQuery   `json:"field_masking_span,omitempty"`
-	RankFeature       *RankFeatureQuery        `json:"rank_feature,omitempty"`
-	DistanceFeature   *DistanceFeatureQuery    `json:"distance_feature,omitempty"`
-	HasChild          *HasChildQuery           `json:"has_child,omitempty"`
-	HasParent         *HasParentQuery          `json:"has_parent,omitempty"`
-	ParentID          *ParentIDQuery           `json:"parent_id,omitempty"`
-	Percolate         *PercolateQuery          `json:"percolate,omitempty"`
-	Name              string                   `json:"_name,omitempty"`
+	MatchAll          map[string]any              `json:"match_all,omitempty"`
+	MatchNone         map[string]any              `json:"match_none,omitempty"`
+	Bool              *BoolQuery                  `json:"bool,omitempty"`
+	DisMax            *DisMaxQuery                `json:"dis_max,omitempty"`
+	Boosting          *BoostingQuery              `json:"boosting,omitempty"`
+	Term              map[string]TermEntry        `json:"term,omitempty"`
+	Terms             *TermsQuery                 `json:"terms,omitempty"`
+	TermsSet          map[string]TermsSetEntry    `json:"terms_set,omitempty"`
+	Ids               *IdsQuery                   `json:"ids,omitempty"`
+	Range             map[string]RangeCond        `json:"range,omitempty"`
+	Exists            *ExistsQuery                `json:"exists,omitempty"`
+	Prefix            map[string]PrefixEntry      `json:"prefix,omitempty"`
+	Wildcard          map[string]WildcardEntry    `json:"wildcard,omitempty"`
+	Regexp            map[string]RegexpEntry      `json:"regexp,omitempty"`
+	Fuzzy             map[string]FuzzyEntry       `json:"fuzzy,omitempty"`
+	Match             map[string]MatchEntry       `json:"match,omitempty"`
+	MatchPhrase       map[string]PhraseEntry      `json:"match_phrase,omitempty"`
+	MatchPhrasePrefix map[string]PhraseEntry      `json:"match_phrase_prefix,omitempty"`
+	MatchBoolPrefix   map[string]PhraseEntry      `json:"match_bool_prefix,omitempty"`
+	Common            map[string]CommonTermsEntry `json:"common,omitempty"`
+	MultiMatch        *MultiMatchQuery            `json:"multi_match,omitempty"`
+	CombinedFields    *CombinedFieldsQuery        `json:"combined_fields,omitempty"`
+	QueryString       *QueryStringQuery           `json:"query_string,omitempty"`
+	SimpleQueryString *QueryStringQuery           `json:"simple_query_string,omitempty"`
+	Nested            *NestedQuery                `json:"nested,omitempty"`
+	ConstantScore     *ConstantScoreQuery         `json:"constant_score,omitempty"`
+	FunctionScore     *FunctionScoreQuery         `json:"function_score,omitempty"`
+	ScriptScore       *ScriptScoreQuery           `json:"script_score,omitempty"`
+	Script            *ScriptQuery                `json:"script,omitempty"`
+	KNN               *KNNQuery                   `json:"knn,omitempty"`
+	GeoDistance       *GeoDistanceQuery           `json:"geo_distance,omitempty"`
+	GeoBoundingBox    *GeoBoundingBoxQuery        `json:"geo_bounding_box,omitempty"`
+	GeoPolygon        *GeoPolygonQuery            `json:"geo_polygon,omitempty"`
+	GeoShape          *GeoShapeQuery              `json:"geo_shape,omitempty"`
+	Wrapper           *WrapperQuery               `json:"wrapper,omitempty"`
+	Pinned            *PinnedQuery                `json:"pinned,omitempty"`
+	MoreLikeThis      *MoreLikeThisQuery          `json:"more_like_this,omitempty"`
+	Intervals         map[string]IntervalsRule    `json:"intervals,omitempty"`
+	SpanTerm          map[string]TermEntry        `json:"span_term,omitempty"`
+	SpanNear          *SpanNearQuery              `json:"span_near,omitempty"`
+	SpanOr            *SpanOrQuery                `json:"span_or,omitempty"`
+	SpanNot           *SpanNotQuery               `json:"span_not,omitempty"`
+	SpanFirst         *SpanFirstQuery             `json:"span_first,omitempty"`
+	SpanMulti         *SpanMultiQuery             `json:"span_multi,omitempty"`
+	SpanContaining    *SpanPairQuery              `json:"span_containing,omitempty"`
+	SpanWithin        *SpanPairQuery              `json:"span_within,omitempty"`
+	FieldMaskingSpan  *FieldMaskingSpanQuery      `json:"field_masking_span,omitempty"`
+	RankFeature       *RankFeatureQuery           `json:"rank_feature,omitempty"`
+	DistanceFeature   *DistanceFeatureQuery       `json:"distance_feature,omitempty"`
+	HasChild          *HasChildQuery              `json:"has_child,omitempty"`
+	HasParent         *HasParentQuery             `json:"has_parent,omitempty"`
+	ParentID          *ParentIDQuery              `json:"parent_id,omitempty"`
+	Percolate         *PercolateQuery             `json:"percolate,omitempty"`
+	Name              string                      `json:"_name,omitempty"`
 }
 
 var knownQueryClauses = map[string]bool{
@@ -1078,6 +1079,7 @@ var knownQueryClauses = map[string]bool{
 	"match_phrase":        true,
 	"match_phrase_prefix": true,
 	"match_bool_prefix":   true,
+	"common":              true,
 	"multi_match":         true,
 	"combined_fields":     true,
 	"query_string":        true,
@@ -1285,7 +1287,7 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 	for _, clauseKey := range []string{
 		"range", "terms_set", "intervals",
 		"term", "span_term", "prefix", "wildcard", "regexp", "fuzzy",
-		"match", "match_phrase", "match_phrase_prefix", "match_bool_prefix",
+		"match", "match_phrase", "match_phrase_prefix", "match_bool_prefix", "common",
 	} {
 		if rawClause, ok := raw[clauseKey]; ok {
 			reqMulti := clauseKey != "range" && clauseKey != "terms_set" && clauseKey != "intervals"
@@ -1527,6 +1529,15 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 			}
 		}
 	}
+	if b := mapBoosts["common"]; b != nil {
+		for k, ce := range alias.Common {
+			if !ce.HasBoost {
+				ce.Boost = *b
+				ce.HasBoost = true
+				alias.Common[k] = ce
+			}
+		}
+	}
 	for _, check := range []struct {
 		key string
 		cnt int
@@ -1541,6 +1552,7 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 		{"match_phrase", len(alias.MatchPhrase)},
 		{"match_phrase_prefix", len(alias.MatchPhrasePrefix)},
 		{"match_bool_prefix", len(alias.MatchBoolPrefix)},
+		{"common", len(alias.Common)},
 		{"terms_set", len(alias.TermsSet)},
 		{"span_term", len(alias.SpanTerm)},
 		{"intervals", len(alias.Intervals)},
@@ -1551,6 +1563,9 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 	}
 	if alias.Name == "" && extractedName != "" {
 		alias.Name = extractedName
+	}
+	if alias.Name == "" && alias.Percolate != nil && alias.Percolate.Name != "" {
+		alias.Name = alias.Percolate.Name
 	}
 	if alias.Name == "" && alias.Wrapper != nil && alias.Wrapper.Decoded != nil && alias.Wrapper.Decoded.Name != "" {
 		alias.Name = alias.Wrapper.Decoded.Name
@@ -2283,6 +2298,17 @@ func ParseWKTGeoShape(wkt string) (map[string]any, error) {
 		if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
 			return nil, fmt.Errorf("parsing_exception: [geo_shape] invalid WKT %s coordinates [%s]", geomType, wkt)
 		}
+		for _, f := range []float64{minLon, maxLon, maxLat, minLat} {
+			if math.IsNaN(f) || math.IsInf(f, 0) {
+				return nil, fmt.Errorf("parsing_exception: [geo_shape] invalid WKT %s coordinate value [%v]", geomType, f)
+			}
+		}
+		if minLon < -180 || minLon > 180 || maxLon < -180 || maxLon > 180 || maxLat < -90 || maxLat > 90 || minLat < -90 || minLat > 90 {
+			return nil, fmt.Errorf("parsing_exception: [geo_shape] WKT %s coordinates out of bounds [%s]", geomType, wkt)
+		}
+		if maxLat < minLat {
+			return nil, fmt.Errorf("parsing_exception: [geo_shape] WKT %s maxLat [%v] must be >= minLat [%v]", geomType, maxLat, minLat)
+		}
 		return map[string]any{
 			"type":        "envelope",
 			"coordinates": []any{[]any{minLon, maxLat}, []any{maxLon, minLat}},
@@ -2401,8 +2427,12 @@ func (wq *WrapperQuery) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: [wrapper] failed to base64 decode [query]: %w", err)
 		}
 	}
+	decTrimmed := bytes.TrimSpace(decodedBytes)
+	if len(decTrimmed) == 0 || decTrimmed[0] != '{' {
+		return fmt.Errorf("parsing_exception: [wrapper] decoded query must be a JSON object")
+	}
 	var inner Query
-	if err := json.Unmarshal(decodedBytes, &inner); err != nil {
+	if err := json.Unmarshal(decTrimmed, &inner); err != nil {
 		return fmt.Errorf("parsing_exception: wrapper query decoded payload is invalid query JSON: %w", err)
 	}
 	wq.Query = qStr
@@ -2498,22 +2528,26 @@ func (pq *PinnedQuery) UnmarshalJSON(data []byte) error {
 
 // MoreLikeThisQuery models an ES `more_like_this` query.
 type MoreLikeThisQuery struct {
-	Fields             []string `json:"fields,omitempty"`
-	Like               any      `json:"like,omitempty"`
-	Unlike             any      `json:"unlike,omitempty"`
-	MinTermFreq        int      `json:"min_term_freq,omitempty"`
-	MaxQueryTerms      int      `json:"max_query_terms,omitempty"`
-	MinDocFreq         int      `json:"min_doc_freq,omitempty"`
-	MaxDocFreq         int      `json:"max_doc_freq,omitempty"`
-	MinWordLength      int      `json:"min_word_length,omitempty"`
-	MaxWordLength      int      `json:"max_word_length,omitempty"`
-	StopWords          []string `json:"stop_words,omitempty"`
-	Analyzer           string   `json:"analyzer,omitempty"`
-	MinimumShouldMatch any      `json:"minimum_should_match,omitempty"`
-	BoostTerms         float64  `json:"boost_terms,omitempty"`
-	Include            bool     `json:"include,omitempty"`
-	Boost              *float64 `json:"boost,omitempty"`
-	Name               string   `json:"_name,omitempty"`
+	Fields                 []string         `json:"fields,omitempty"`
+	Like                   any              `json:"like,omitempty"`
+	LikeText               string           `json:"like_text,omitempty"`
+	Ids                    []string         `json:"ids,omitempty"`
+	Docs                   []map[string]any `json:"docs,omitempty"`
+	Unlike                 any              `json:"unlike,omitempty"`
+	MinTermFreq            int              `json:"min_term_freq,omitempty"`
+	MaxQueryTerms          int              `json:"max_query_terms,omitempty"`
+	MinDocFreq             int              `json:"min_doc_freq,omitempty"`
+	MaxDocFreq             int              `json:"max_doc_freq,omitempty"`
+	MinWordLength          int              `json:"min_word_length,omitempty"`
+	MaxWordLength          int              `json:"max_word_length,omitempty"`
+	StopWords              []string         `json:"stop_words,omitempty"`
+	Analyzer               string           `json:"analyzer,omitempty"`
+	MinimumShouldMatch     any              `json:"minimum_should_match,omitempty"`
+	BoostTerms             float64          `json:"boost_terms,omitempty"`
+	Include                bool             `json:"include,omitempty"`
+	FailOnUnsupportedField *bool            `json:"fail_on_unsupported_field,omitempty"`
+	Boost                  *float64         `json:"boost,omitempty"`
+	Name                   string           `json:"_name,omitempty"`
 }
 
 func (mlt *MoreLikeThisQuery) UnmarshalJSON(data []byte) error {
@@ -2527,22 +2561,28 @@ func (mlt *MoreLikeThisQuery) UnmarshalJSON(data []byte) error {
 	}
 	for k := range rawMap {
 		switch k {
-		case "fields", "like", "unlike", "min_term_freq", "max_query_terms", "min_doc_freq", "max_doc_freq",
+		case "fields", "like", "like_text", "ids", "docs", "unlike", "min_term_freq", "max_query_terms", "min_doc_freq", "max_doc_freq",
 			"min_word_length", "max_word_length", "stop_words", "analyzer", "minimum_should_match",
 			"boost_terms", "include", "fail_on_unsupported_field", "boost", "_name":
 		default:
 			return fmt.Errorf("parsing_exception: [more_like_this] unknown field [%s]", k)
 		}
 	}
-	if _, hasLike := rawMap["like"]; !hasLike {
+	_, hasLike := rawMap["like"]
+	_, hasLikeText := rawMap["like_text"]
+	_, hasIds := rawMap["ids"]
+	_, hasDocs := rawMap["docs"]
+	if !hasLike && !hasLikeText && !hasIds && !hasDocs {
 		return fmt.Errorf("parsing_exception: [more_like_this] requires [like]")
 	}
 	type plain MoreLikeThisQuery
 	var raw struct {
 		plain
-		Fields    any             `json:"fields"`
-		StopWords any             `json:"stop_words"`
-		Boost     json.RawMessage `json:"boost"`
+		Fields                 any             `json:"fields"`
+		Ids                    any             `json:"ids"`
+		StopWords              any             `json:"stop_words"`
+		FailOnUnsupportedField any             `json:"fail_on_unsupported_field"`
+		Boost                  json.RawMessage `json:"boost"`
 	}
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
@@ -2555,12 +2595,26 @@ func (mlt *MoreLikeThisQuery) UnmarshalJSON(data []byte) error {
 		}
 		mlt.Fields = fields
 	}
+	if raw.Ids != nil {
+		ids, err := parseFlexibleStringSlice(raw.Ids)
+		if err != nil {
+			return err
+		}
+		mlt.Ids = ids
+	}
 	if raw.StopWords != nil {
 		sw, err := parseFlexibleStringSlice(raw.StopWords)
 		if err != nil {
 			return err
 		}
 		mlt.StopWords = sw
+	}
+	if raw.FailOnUnsupportedField != nil {
+		b, err := parseFlexibleBool(raw.FailOnUnsupportedField)
+		if err != nil {
+			return err
+		}
+		mlt.FailOnUnsupportedField = &b
 	}
 	if len(raw.Boost) > 0 {
 		b, err := parseOptionalNonNegativeBoost(raw.Boost)
@@ -3019,16 +3073,17 @@ func (pid *ParentIDQuery) UnmarshalJSON(data []byte) error {
 
 // PercolateQuery models an ES `percolate` query.
 type PercolateQuery struct {
-	Field      string           `json:"field"`
-	Document   map[string]any   `json:"document,omitempty"`
-	Documents  []map[string]any `json:"documents,omitempty"`
-	Index      string           `json:"index,omitempty"`
-	ID         string           `json:"id,omitempty"`
-	Routing    string           `json:"routing,omitempty"`
-	Preference string           `json:"preference,omitempty"`
-	Version    *int64           `json:"version,omitempty"`
-	Boost      *float64         `json:"boost,omitempty"`
-	Name       string           `json:"_name,omitempty"`
+	Field          string           `json:"field"`
+	Document       map[string]any   `json:"document,omitempty"`
+	Documents      []map[string]any `json:"documents,omitempty"`
+	Index          string           `json:"index,omitempty"`
+	ID             string           `json:"id,omitempty"`
+	Routing        string           `json:"routing,omitempty"`
+	Preference     string           `json:"preference,omitempty"`
+	Version        *int64           `json:"version,omitempty"`
+	IgnoreUnmapped bool             `json:"ignore_unmapped,omitempty"`
+	Boost          *float64         `json:"boost,omitempty"`
+	Name           string           `json:"_name,omitempty"`
 }
 
 func (pq *PercolateQuery) UnmarshalJSON(data []byte) error {
@@ -3042,7 +3097,7 @@ func (pq *PercolateQuery) UnmarshalJSON(data []byte) error {
 	}
 	for k := range rawMap {
 		switch k {
-		case "field", "document", "documents", "index", "id", "routing", "preference", "version", "boost", "_name":
+		case "field", "document", "documents", "index", "id", "routing", "preference", "version", "ignore_unmapped", "boost", "_name", "name":
 		default:
 			return fmt.Errorf("parsing_exception: [percolate] unknown field [%s]", k)
 		}
@@ -3050,7 +3105,9 @@ func (pq *PercolateQuery) UnmarshalJSON(data []byte) error {
 	type plain PercolateQuery
 	var raw struct {
 		plain
-		Boost json.RawMessage `json:"boost"`
+		IgnoreUnmapped any             `json:"ignore_unmapped"`
+		AltName        string          `json:"name"`
+		Boost          json.RawMessage `json:"boost"`
 	}
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
@@ -3058,7 +3115,15 @@ func (pq *PercolateQuery) UnmarshalJSON(data []byte) error {
 	if strings.TrimSpace(raw.Field) == "" {
 		return fmt.Errorf("parsing_exception: [percolate] requires [field]")
 	}
+	iu, err := parseFlexibleBool(raw.IgnoreUnmapped)
+	if err != nil {
+		return err
+	}
 	*pq = PercolateQuery(raw.plain)
+	pq.IgnoreUnmapped = iu
+	if pq.Name == "" && raw.AltName != "" {
+		pq.Name = raw.AltName
+	}
 	if len(raw.Boost) > 0 {
 		b, err := parseOptionalNonNegativeBoost(raw.Boost)
 		if err != nil {
@@ -4098,9 +4163,15 @@ func (t *TermEntry) UnmarshalJSON(data []byte) error {
 }
 
 type IdsQuery struct {
-	Values []string `json:"values"`
-	Boost  *float64 `json:"boost,omitempty"`
-	Name   string   `json:"_name,omitempty"`
+	Values            []string           `json:"values"`
+	Boost             *float64           `json:"boost,omitempty"`
+	Name              string             `json:"_name,omitempty"`
+	ResolvedScores    map[string]float64 `json:"-"`
+	ResolvedInnerHits map[string]any     `json:"-"`
+	InnerHitsSpec     *InnerHitsSpec     `json:"-"`
+	JoinQueryType     string             `json:"-"`
+	JoinRelType       string             `json:"-"`
+	JoinScoreMode     string             `json:"-"`
 }
 
 func (iq *IdsQuery) UnmarshalJSON(data []byte) error {
@@ -4711,6 +4782,113 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+type CommonTermsEntry struct {
+	Query              any     `json:"query"`
+	CutoffFrequency    float64 `json:"cutoff_frequency,omitempty"`
+	LowFreqOperator    string  `json:"low_freq_operator,omitempty"`
+	HighFreqOperator   string  `json:"high_freq_operator,omitempty"`
+	MinimumShouldMatch any     `json:"minimum_should_match,omitempty"`
+	Analyzer           string  `json:"analyzer,omitempty"`
+	Boost              float64 `json:"boost,omitempty"`
+	HasBoost           bool    `json:"-"`
+}
+
+func (c CommonTermsEntry) MarshalJSON() ([]byte, error) {
+	var boostPtr *float64
+	if c.HasBoost || (c.Boost != 0 && c.Boost != 1.0) {
+		b := c.Boost
+		boostPtr = &b
+	}
+	return json.Marshal(struct {
+		Query              any      `json:"query"`
+		CutoffFrequency    float64  `json:"cutoff_frequency,omitempty"`
+		LowFreqOperator    string   `json:"low_freq_operator,omitempty"`
+		HighFreqOperator   string   `json:"high_freq_operator,omitempty"`
+		MinimumShouldMatch any      `json:"minimum_should_match,omitempty"`
+		Analyzer           string   `json:"analyzer,omitempty"`
+		Boost              *float64 `json:"boost,omitempty"`
+	}{
+		Query:              c.Query,
+		CutoffFrequency:    c.CutoffFrequency,
+		LowFreqOperator:    c.LowFreqOperator,
+		HighFreqOperator:   c.HighFreqOperator,
+		MinimumShouldMatch: c.MinimumShouldMatch,
+		Analyzer:           c.Analyzer,
+		Boost:              boostPtr,
+	})
+}
+
+func (c *CommonTermsEntry) UnmarshalJSON(data []byte) error {
+	c.Boost = 1.0
+	c.HasBoost = false
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var rawMap map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+			return err
+		}
+		for k := range rawMap {
+			switch k {
+			case "query", "cutoff_frequency", "low_freq_operator", "high_freq_operator", "minimum_should_match", "analyzer", "boost", "_name":
+			default:
+				return fmt.Errorf("parsing_exception: [common] unknown field [%s]", k)
+			}
+		}
+		if _, hasQuery := rawMap["query"]; !hasQuery {
+			return fmt.Errorf("parsing_exception: [common] missing required [query] field")
+		}
+		var full struct {
+			Query              any             `json:"query"`
+			CutoffFrequency    float64         `json:"cutoff_frequency"`
+			LowFreqOperator    string          `json:"low_freq_operator"`
+			HighFreqOperator   string          `json:"high_freq_operator"`
+			MinimumShouldMatch any             `json:"minimum_should_match"`
+			Analyzer           string          `json:"analyzer"`
+			Boost              json.RawMessage `json:"boost"`
+		}
+		if err := json.Unmarshal(trimmed, &full); err != nil {
+			return err
+		}
+		if isNonScalarOrNullValue(full.Query) {
+			return fmt.Errorf("parsing_exception: [common] query does not support non-scalar or null value")
+		}
+		c.Query = full.Query
+		c.CutoffFrequency = full.CutoffFrequency
+		c.Analyzer = strings.TrimSpace(full.Analyzer)
+		if full.LowFreqOperator != "" {
+			if err := validateQueryOperator(full.LowFreqOperator, "common"); err != nil {
+				return err
+			}
+			c.LowFreqOperator = strings.ToLower(strings.TrimSpace(full.LowFreqOperator))
+		}
+		if full.HighFreqOperator != "" {
+			if err := validateQueryOperator(full.HighFreqOperator, "common"); err != nil {
+				return err
+			}
+			c.HighFreqOperator = strings.ToLower(strings.TrimSpace(full.HighFreqOperator))
+		}
+		c.MinimumShouldMatch = full.MinimumShouldMatch
+		if len(full.Boost) > 0 {
+			b, err := parseOptionalNonNegativeBoost(full.Boost)
+			if err != nil {
+				return err
+			}
+			if b != nil {
+				c.Boost = *b
+				c.HasBoost = true
+			}
+		}
+		return nil
+	}
+	if err := json.Unmarshal(trimmed, &c.Query); err != nil {
+		return err
+	}
+	if isNonScalarOrNullValue(c.Query) {
+		return fmt.Errorf("parsing_exception: [common] query does not support non-scalar or null value")
+	}
+	return nil
+}
+
 type PhraseEntry struct {
 	Query               string  `json:"query"`
 	Slop                int     `json:"slop,omitempty"`
@@ -4870,18 +5048,20 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 }
 
 type MultiMatchQuery struct {
-	Query              any      `json:"query"`
-	Fields             []string `json:"fields,omitempty"`
-	Type               string   `json:"type,omitempty"`
-	Operator           string   `json:"operator,omitempty"`
-	Analyzer           string   `json:"analyzer,omitempty"`
-	Slop               int      `json:"slop,omitempty"`
-	MinimumShouldMatch any      `json:"minimum_should_match,omitempty"`
-	TieBreaker         *float64 `json:"tie_breaker,omitempty"`
-	ZeroTermsQuery     string   `json:"zero_terms_query,omitempty"`
-	Fuzziness          any      `json:"fuzziness,omitempty"`
-	Lenient            *bool    `json:"lenient,omitempty"`
-	Boost              *float64 `json:"boost,omitempty"`
+	Query               any      `json:"query"`
+	Fields              []string `json:"fields,omitempty"`
+	Type                string   `json:"type,omitempty"`
+	Operator            string   `json:"operator,omitempty"`
+	Analyzer            string   `json:"analyzer,omitempty"`
+	Slop                int      `json:"slop,omitempty"`
+	MinimumShouldMatch  any      `json:"minimum_should_match,omitempty"`
+	TieBreaker          *float64 `json:"tie_breaker,omitempty"`
+	ZeroTermsQuery      string   `json:"zero_terms_query,omitempty"`
+	Fuzziness           any      `json:"fuzziness,omitempty"`
+	PrefixLength        int      `json:"prefix_length,omitempty"`
+	FuzzyTranspositions *bool    `json:"fuzzy_transpositions,omitempty"`
+	Lenient             *bool    `json:"lenient,omitempty"`
+	Boost               *float64 `json:"boost,omitempty"`
 }
 
 func (mmq *MultiMatchQuery) UnmarshalJSON(data []byte) error {
@@ -4906,13 +5086,29 @@ func (mmq *MultiMatchQuery) UnmarshalJSON(data []byte) error {
 	type plain MultiMatchQuery
 	var raw struct {
 		plain
-		Fields any             `json:"fields"`
-		Boost  json.RawMessage `json:"boost"`
+		Fields              any             `json:"fields"`
+		FuzzyTranspositions any             `json:"fuzzy_transpositions"`
+		Lenient             any             `json:"lenient"`
+		Boost               json.RawMessage `json:"boost"`
 	}
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
 	*mmq = MultiMatchQuery(raw.plain)
+	if raw.FuzzyTranspositions != nil {
+		ft, err := parseFlexibleBool(raw.FuzzyTranspositions)
+		if err != nil {
+			return err
+		}
+		mmq.FuzzyTranspositions = &ft
+	}
+	if raw.Lenient != nil {
+		ln, err := parseFlexibleBool(raw.Lenient)
+		if err != nil {
+			return err
+		}
+		mmq.Lenient = &ln
+	}
 	if len(raw.Boost) > 0 {
 		b, err := parseOptionalNonNegativeBoost(raw.Boost)
 		if err != nil {
@@ -7308,6 +7504,8 @@ type FieldProperty struct {
 	IndexPrefixes            map[string]any           `json:"index_prefixes,omitempty"`
 	IndexPhrases             *bool                    `json:"index_phrases,omitempty"`
 	SplitQueriesOnWhitespace *bool                    `json:"split_queries_on_whitespace,omitempty"`
+	EnablePositionIncrements *bool                    `json:"enable_position_increments,omitempty"`
+	Relations                map[string]any           `json:"relations,omitempty"`
 	Fields                   map[string]FieldProperty `json:"fields,omitempty"`
 	Properties               map[string]FieldProperty `json:"properties,omitempty"`
 }

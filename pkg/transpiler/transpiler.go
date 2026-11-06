@@ -602,7 +602,16 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		}
 		score := fmt.Sprintf("%.4f", boost)
 		if scoring {
-			score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", pred, boost)
+			if len(q.Ids.ResolvedScores) > 0 {
+				var cases []string
+				for _, id := range q.Ids.Values {
+					sc := q.Ids.ResolvedScores[id] * boost
+					cases = append(cases, fmt.Sprintf("WHEN `_id` = %s THEN %.4f", quoteStr(id), sc))
+				}
+				score = fmt.Sprintf("(CASE %s ELSE 0.0 END)", strings.Join(cases, " "))
+			} else {
+				score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", pred, boost)
+			}
 		}
 		return CompiledQuery{
 			WhereSQL:     pred,
@@ -993,12 +1002,15 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 			if effAnalyzer == "" {
 				effAnalyzer = b.Analyzer
 			}
-			_, allStopwords := filterStopwordTokens(pe.Query, effAnalyzer, pe.ZeroTermsQuery)
+			filteredTokens, allStopwords := filterStopwordTokens(pe.Query, effAnalyzer, pe.ZeroTermsQuery)
 			if (strings.TrimSpace(pe.Query) == "" || allStopwords) && strings.EqualFold(pe.ZeroTermsQuery, "all") {
 				return CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: fmt.Sprintf("%.4f", pe.Boost*fBoost)}
 			}
 			if allStopwords {
 				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+			}
+			if len(filteredTokens) > 0 && len(filteredTokens) < len(strings.Fields(strings.TrimSpace(pe.Query))) {
+				pe.Query = strings.Join(filteredTokens, " ")
 			}
 			return t.compileMatchPhraseField(keys[0], pe.Query, pe.Slop, pe.Boost, false, scoring, nctx)
 		}
@@ -1017,12 +1029,15 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 			if effAnalyzer == "" {
 				effAnalyzer = b.Analyzer
 			}
-			_, allStopwords := filterStopwordTokens(pe.Query, effAnalyzer, pe.ZeroTermsQuery)
+			filteredTokens, allStopwords := filterStopwordTokens(pe.Query, effAnalyzer, pe.ZeroTermsQuery)
 			if (strings.TrimSpace(pe.Query) == "" || allStopwords) && strings.EqualFold(pe.ZeroTermsQuery, "all") {
 				return CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: fmt.Sprintf("%.4f", pe.Boost*fBoost)}
 			}
 			if allStopwords {
 				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+			}
+			if len(filteredTokens) > 0 && len(filteredTokens) < len(strings.Fields(strings.TrimSpace(pe.Query))) {
+				pe.Query = strings.Join(filteredTokens, " ")
 			}
 			return t.compileMatchPhraseField(keys[0], pe.Query, pe.Slop, pe.Boost, true, scoring, nctx)
 		}
@@ -1042,12 +1057,15 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 			if effAnalyzer == "" {
 				effAnalyzer = b.Analyzer
 			}
-			_, allStopwords := filterStopwordTokens(pe.Query, effAnalyzer, pe.ZeroTermsQuery)
+			filteredTokens, allStopwords := filterStopwordTokens(pe.Query, effAnalyzer, pe.ZeroTermsQuery)
 			if (strings.TrimSpace(pe.Query) == "" || allStopwords) && strings.EqualFold(pe.ZeroTermsQuery, "all") {
 				return CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: fmt.Sprintf("%.4f", effBoost)}
 			}
 			if allStopwords {
 				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+			}
+			if len(filteredTokens) > 0 && len(filteredTokens) < len(strings.Fields(strings.TrimSpace(pe.Query))) {
+				pe.Query = strings.Join(filteredTokens, " ")
 			}
 			qStr := strings.TrimSpace(pe.Query)
 			tokens := strings.Fields(qStr)
@@ -1065,9 +1083,11 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 							cleanKey0: {
 								Query:               tokens[i],
 								Operator:            "or",
+								Analyzer:            pe.Analyzer,
 								Fuzziness:           pe.Fuzziness,
 								PrefixLength:        pe.PrefixLength,
 								FuzzyTranspositions: pe.FuzzyTranspositions,
+								Lenient:             pe.Lenient,
 								Boost:               1.0,
 							},
 						},
@@ -1075,7 +1095,12 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 				}
 				shoulds = append(shoulds, esast.Query{
 					MatchPhrasePrefix: map[string]esast.PhraseEntry{
-						cleanKey0: {Query: tokens[len(tokens)-1], Boost: 1.0},
+						cleanKey0: {
+							Query:    tokens[len(tokens)-1],
+							Analyzer: pe.Analyzer,
+							Lenient:  pe.Lenient,
+							Boost:    1.0,
+						},
 					},
 				})
 				boost := effBoost
@@ -1100,6 +1125,59 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		var subs []esast.Query
 		for _, k := range keys {
 			subs = append(subs, esast.Query{MatchBoolPrefix: map[string]esast.PhraseEntry{k: q.MatchBoolPrefix[k]}})
+		}
+		return t.compileBool(&esast.BoolQuery{Must: subs}, scoring, nctx)
+	case len(q.Common) > 0:
+		keys := sortedMapKeys(q.Common)
+		if len(keys) == 1 {
+			ce := q.Common[keys[0]]
+			qStr := ""
+			if ce.Query != nil {
+				qStr = strings.TrimSpace(fmt.Sprintf("%v", ce.Query))
+			}
+			if qStr == "" {
+				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+			}
+			tokens := strings.Fields(qStr)
+			lowOp := ce.LowFreqOperator
+			if lowOp == "" {
+				lowOp = "or"
+			}
+			highOp := ce.HighFreqOperator
+			if highOp == "" {
+				highOp = "or"
+			}
+			var lowFreq, highFreq []string
+			for _, tok := range tokens {
+				cleanTok := strings.ToLower(strings.Trim(tok, ".,!?;:\"'()[]{}"))
+				if ce.CutoffFrequency > 0 && defaultEnglishStopwords[cleanTok] {
+					highFreq = append(highFreq, tok)
+				} else {
+					lowFreq = append(lowFreq, tok)
+				}
+			}
+			activeTokens := lowFreq
+			activeOp := lowOp
+			if len(activeTokens) == 0 {
+				activeTokens = highFreq
+				activeOp = highOp
+			}
+			return t.CompileQuery(&esast.Query{
+				Match: map[string]esast.MatchEntry{
+					keys[0]: {
+						Query:              strings.Join(activeTokens, " "),
+						Operator:           activeOp,
+						MinimumShouldMatch: ce.MinimumShouldMatch,
+						Analyzer:           ce.Analyzer,
+						Boost:              ce.Boost,
+						HasBoost:           ce.HasBoost,
+					},
+				},
+			}, scoring, nctx)
+		}
+		var subs []esast.Query
+		for _, k := range keys {
+			subs = append(subs, esast.Query{Common: map[string]esast.CommonTermsEntry{k: q.Common[k]}})
 		}
 		return t.compileBool(&esast.BoolQuery{Must: subs}, scoring, nctx)
 	case q.MultiMatch != nil:
@@ -2122,18 +2200,6 @@ func parseFieldBoost(fieldWithBoost string, baseBoost float64) (string, float64)
 	return fieldWithBoost, baseBoost
 }
 
-func (t *Transpiler) compileFuzzyField(
-	field string,
-	queryVal any,
-	operator string,
-	fuzziness any,
-	boost float64,
-	scoring bool,
-	nctx *nestedCtx,
-) CompiledQuery {
-	return t.compileFuzzyFieldWithOpts(field, queryVal, operator, fuzziness, false, 0, nil, boost, scoring, nctx)
-}
-
 func (t *Transpiler) compileFuzzyFieldWithOpts(
 	field string,
 	queryVal any,
@@ -2369,9 +2435,13 @@ func (t *Transpiler) compileMatchField(
 		}
 		return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: safeWhereSQL, ScoreSQL: scoreExpr, UsesFulltextMatch: usesFT}
 	}
+	origField := field
 	field, b := t.resolveFieldInNestedCtx(field, false, nctx)
 	if !t.checkFieldSearchable(field, b) || b.Kind == schema.StoragePromotedVector {
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
+	if b.ESType == "search_as_you_type" && strings.HasSuffix(origField, "._index_prefix") {
+		return t.compileMatchPhraseField(field, fmt.Sprintf("%v", queryVal), 0, boost, true, scoring, nctx)
 	}
 
 	// IP fields and non-string promoted scalar/array columns (BIGINT, INT, DOUBLE, BOOLEAN, date) use term/CIDR equality instead of MATCH_*
@@ -2609,6 +2679,15 @@ func (t *Transpiler) compileMatchPhraseField(
 		}
 		return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: score}
 	}
+	if !isExactKeywordField(field, b) {
+		filteredTokens, allStopwords := filterStopwordTokens(queryStr, b.Analyzer, "")
+		if allStopwords {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+		if len(filteredTokens) > 0 && len(filteredTokens) < len(strings.Fields(strings.TrimSpace(queryStr))) {
+			queryStr = strings.Join(filteredTokens, " ")
+		}
+	}
 	if b.EffectiveLowercase(false) {
 		queryStr = strings.ToLower(queryStr)
 	}
@@ -2697,7 +2776,7 @@ func (t *Transpiler) compileMultiMatch(mm *esast.MultiMatchQuery, scoring bool, 
 	if mm.Query != nil {
 		qStr = strings.TrimSpace(fmt.Sprintf("%v", mm.Query))
 	}
-	_, allStopwords := filterStopwordTokens(qStr, mm.Analyzer, mm.ZeroTermsQuery)
+	filteredTokens, allStopwords := filterStopwordTokens(qStr, mm.Analyzer, mm.ZeroTermsQuery)
 	if (qStr == "" || allStopwords) && strings.EqualFold(mm.ZeroTermsQuery, "all") {
 		boost := 1.0
 		if mm.Boost != nil {
@@ -2707,6 +2786,11 @@ func (t *Transpiler) compileMultiMatch(mm *esast.MultiMatchQuery, scoring bool, 
 	}
 	if allStopwords {
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
+	effQuery := mm.Query
+	if len(filteredTokens) > 0 && len(filteredTokens) < len(strings.Fields(qStr)) {
+		qStr = strings.Join(filteredTokens, " ")
+		effQuery = qStr
 	}
 	mmType := strings.ToLower(mm.Type)
 
@@ -2721,12 +2805,17 @@ func (t *Transpiler) compileMultiMatch(mm *esast.MultiMatchQuery, scoring bool, 
 			for _, tok := range tokens {
 				tokenQueries = append(tokenQueries, esast.Query{
 					MultiMatch: &esast.MultiMatchQuery{
-						Query:      tok,
-						Fields:     fields,
-						Type:       "best_fields",
-						Operator:   "or",
-						Fuzziness:  mm.Fuzziness,
-						TieBreaker: mm.TieBreaker,
+						Query:               tok,
+						Fields:              fields,
+						Type:                "best_fields",
+						Operator:            "or",
+						Analyzer:            mm.Analyzer,
+						ZeroTermsQuery:      mm.ZeroTermsQuery,
+						Fuzziness:           mm.Fuzziness,
+						PrefixLength:        mm.PrefixLength,
+						FuzzyTranspositions: mm.FuzzyTranspositions,
+						Lenient:             mm.Lenient,
+						TieBreaker:          mm.TieBreaker,
 					},
 				})
 			}
@@ -2775,11 +2864,16 @@ func (t *Transpiler) compileMultiMatch(mm *esast.MultiMatchQuery, scoring bool, 
 			c = t.CompileQuery(&esast.Query{
 				MatchBoolPrefix: map[string]esast.PhraseEntry{
 					bf.Field: {
-						Query:              qStr,
-						Operator:           op,
-						MinimumShouldMatch: mm.MinimumShouldMatch,
-						Fuzziness:          mm.Fuzziness,
-						Boost:              bf.Boost,
+						Query:               qStr,
+						Operator:            op,
+						Analyzer:            mm.Analyzer,
+						ZeroTermsQuery:      mm.ZeroTermsQuery,
+						MinimumShouldMatch:  mm.MinimumShouldMatch,
+						Fuzziness:           mm.Fuzziness,
+						PrefixLength:        mm.PrefixLength,
+						FuzzyTranspositions: mm.FuzzyTranspositions,
+						Lenient:             mm.Lenient,
+						Boost:               bf.Boost,
 					},
 				},
 			}, scoring, nctx)
@@ -2788,18 +2882,23 @@ func (t *Transpiler) compileMultiMatch(mm *esast.MultiMatchQuery, scoring bool, 
 				c = t.CompileQuery(&esast.Query{
 					Match: map[string]esast.MatchEntry{
 						bf.Field: {
-							Query:              mm.Query,
-							Operator:           op,
-							MinimumShouldMatch: mm.MinimumShouldMatch,
-							Fuzziness:          mm.Fuzziness,
-							Boost:              bf.Boost,
+							Query:               effQuery,
+							Operator:            op,
+							Analyzer:            mm.Analyzer,
+							ZeroTermsQuery:      mm.ZeroTermsQuery,
+							MinimumShouldMatch:  mm.MinimumShouldMatch,
+							Fuzziness:           mm.Fuzziness,
+							PrefixLength:        mm.PrefixLength,
+							FuzzyTranspositions: mm.FuzzyTranspositions,
+							Lenient:             mm.Lenient,
+							Boost:               bf.Boost,
 						},
 					},
 				}, scoring, nctx)
 			} else if mm.Fuzziness != nil {
-				c = t.compileFuzzyField(bf.Field, mm.Query, op, mm.Fuzziness, bf.Boost, scoring, nctx)
+				c = t.compileFuzzyFieldWithOpts(bf.Field, effQuery, op, mm.Fuzziness, false, mm.PrefixLength, mm.FuzzyTranspositions, bf.Boost, scoring, nctx)
 			} else {
-				c = t.compileMatchField(bf.Field, mm.Query, op, bf.Boost, scoring, nctx)
+				c = t.compileMatchField(bf.Field, effQuery, op, bf.Boost, scoring, nctx)
 			}
 		}
 		if c.WhereSQL == "FALSE" && len(allExpanded) > 1 {
@@ -3334,7 +3433,15 @@ func normalizeNestedPrefilterValue(b schema.FieldBinding, val any, effLower bool
 			trimmed := strings.TrimSpace(strVal)
 			if iv, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
 				val = iv
-			} else if fv, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) {
+			} else if b.ESType == "unsigned_long" {
+				if u, err := strconv.ParseUint(trimmed, 10, 64); err == nil {
+					val = u
+				} else if fv, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv >= 0 && fv < 18446744073709551616.0 && fv == math.Trunc(fv) {
+					val = uint64(fv)
+				} else {
+					return "", false
+				}
+			} else if fv, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) && fv >= float64(math.MinInt64) && fv < 9223372036854775808.0 {
 				val = int64(fv)
 			} else {
 				return "", false
@@ -3353,6 +3460,8 @@ func normalizeNestedPrefilterValue(b schema.FieldBinding, val any, effLower bool
 	switch tv := val.(type) {
 	case int64:
 		return strconv.FormatInt(tv, 10), true
+	case uint64:
+		return strconv.FormatUint(tv, 10), true
 	case int:
 		return strconv.Itoa(tv), true
 	case float64:
@@ -3365,7 +3474,12 @@ func normalizeNestedPrefilterValue(b schema.FieldBinding, val any, effLower bool
 			if iv, err := tv.Int64(); err == nil {
 				return strconv.FormatInt(iv, 10), true
 			}
-			if fv, err := tv.Float64(); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) {
+			if b.ESType == "unsigned_long" {
+				if u, err := strconv.ParseUint(tv.String(), 10, 64); err == nil {
+					return strconv.FormatUint(u, 10), true
+				}
+			}
+			if fv, err := tv.Float64(); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) && fv >= float64(math.MinInt64) && fv < 9223372036854775808.0 {
 				return strconv.FormatInt(int64(fv), 10), true
 			}
 			return "", false
@@ -3935,9 +4049,13 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 			return "(" + strings.Join(disjuncts, " OR ") + ")"
 		}
 	}
+	origField := field
 	field, b := t.resolveFieldInNestedCtx(field, true, nctx)
 	if !t.checkFieldSearchable(field, b) || b.Kind == schema.StoragePromotedVector {
 		return "FALSE"
+	}
+	if b.ESType == "search_as_you_type" && strings.HasSuffix(origField, "._index_prefix") {
+		return t.compilePrefixPredicate(field, fmt.Sprintf("%v", val), true, nctx)
 	}
 	if schema.IsRangeFieldType(b.ESType) {
 		qf, ok := coerceRangeFieldQueryScalar(val, b, b.Format, 0, false, false)
@@ -3998,9 +4116,25 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 				return "FALSE"
 			}
 		} else if effDT == schema.DorisBigInt || effDT == schema.DorisInt {
-			if iv, err := strconv.ParseInt(strings.TrimSpace(strVal), 10, 64); err == nil {
+			trimmed := strings.TrimSpace(strVal)
+			if iv, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+				if b.ESType == "unsigned_long" && iv < 0 {
+					return "FALSE"
+				}
 				val = iv
-			} else if fv, err := strconv.ParseFloat(strings.TrimSpace(strVal), 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) {
+			} else if b.ESType == "unsigned_long" {
+				if u, err := strconv.ParseUint(trimmed, 10, 64); err == nil {
+					val = u
+				} else if fv, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv >= 0 && fv < 18446744073709551616.0 && fv == math.Trunc(fv) {
+					if fv >= 9223372036854775808.0 {
+						val = uint64(fv)
+					} else {
+						val = int64(fv)
+					}
+				} else {
+					return "FALSE"
+				}
+			} else if fv, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) && fv >= float64(math.MinInt64) && fv < 9223372036854775808.0 {
 				val = int64(fv)
 			} else if b.ESType != "" {
 				return "FALSE"
@@ -4012,12 +4146,21 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 				return "FALSE"
 			}
 		}
-	} else if val != nil && (b.Kind == schema.StoragePromotedScalar || b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) && (effDT == schema.DorisVarchar || effDT == schema.DorisString) {
+	} else if val != nil && ((b.Kind == schema.StoragePromotedScalar || b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) && (effDT == schema.DorisVarchar || effDT == schema.DorisString) || b.ESType == "flattened") {
 		sv := fmt.Sprintf("%v", val)
 		if effLower {
 			sv = strings.ToLower(sv)
 		}
 		val = sv
+	} else if nv, ok := val.(json.Number); ok && b.ESType == "unsigned_long" {
+		if iv, err := nv.Int64(); err == nil {
+			if iv < 0 {
+				return "FALSE"
+			}
+			val = iv
+		} else if u, err := strconv.ParseUint(nv.String(), 10, 64); err == nil {
+			val = u
+		}
 	}
 	val = normalizeScaledFloatValue(b, val)
 	val = normalizeDateNanosValue(b.ESType, val)
@@ -4166,9 +4309,23 @@ func (t *Transpiler) compileTermsPredicateWithCI(field string, vals []any, caseI
 			return "(" + strings.Join(disjuncts, " OR ") + ")"
 		}
 	}
+	origField := field
 	field, b := t.resolveFieldInNestedCtx(field, true, nctx)
 	if !t.checkFieldSearchable(field, b) || b.Kind == schema.StoragePromotedVector {
 		return "FALSE"
+	}
+	if b.ESType == "search_as_you_type" && strings.HasSuffix(origField, "._index_prefix") {
+		var disjuncts []string
+		for _, v := range vals {
+			disjuncts = append(disjuncts, t.compilePrefixPredicate(field, fmt.Sprintf("%v", v), true, nctx))
+		}
+		if len(disjuncts) == 0 {
+			return "FALSE"
+		}
+		if len(disjuncts) == 1 {
+			return disjuncts[0]
+		}
+		return "(" + strings.Join(disjuncts, " OR ") + ")"
 	}
 	if schema.IsRangeFieldType(b.ESType) || b.ESType == "flattened" {
 		var disjuncts []string
@@ -4233,9 +4390,25 @@ func (t *Transpiler) compileTermsPredicateWithCI(field string, vals []any, caseI
 					continue
 				}
 			} else if effDT == schema.DorisBigInt || effDT == schema.DorisInt {
-				if iv, err := strconv.ParseInt(strings.TrimSpace(strVal), 10, 64); err == nil {
+				trimmed := strings.TrimSpace(strVal)
+				if iv, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+					if b.ESType == "unsigned_long" && iv < 0 {
+						continue
+					}
 					v = iv
-				} else if fv, err := strconv.ParseFloat(strings.TrimSpace(strVal), 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) {
+				} else if b.ESType == "unsigned_long" {
+					if u, err := strconv.ParseUint(trimmed, 10, 64); err == nil {
+						v = u
+					} else if fv, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv >= 0 && fv < 18446744073709551616.0 && fv == math.Trunc(fv) {
+						if fv >= 9223372036854775808.0 {
+							v = uint64(fv)
+						} else {
+							v = int64(fv)
+						}
+					} else {
+						continue
+					}
+				} else if fv, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) && fv >= float64(math.MinInt64) && fv < 9223372036854775808.0 {
 					v = int64(fv)
 				} else if b.ESType != "" {
 					continue
@@ -4253,6 +4426,15 @@ func (t *Transpiler) compileTermsPredicateWithCI(field string, vals []any, caseI
 				sv = strings.ToLower(sv)
 			}
 			v = sv
+		} else if nv, ok := v.(json.Number); ok && b.ESType == "unsigned_long" {
+			if iv, err := nv.Int64(); err == nil {
+				if iv < 0 {
+					continue
+				}
+				v = iv
+			} else if u, err := strconv.ParseUint(nv.String(), 10, 64); err == nil {
+				v = u
+			}
 		}
 		v = normalizeScaledFloatValue(b, v)
 		v = normalizeDateNanosValue(b.ESType, v)
@@ -4275,6 +4457,10 @@ func (t *Transpiler) compileTermsPredicateWithCI(field string, vals []any, caseI
 	}
 	sampleVal := normalizedVals[0]
 	for _, nv := range normalizedVals {
+		if _, isU := nv.(uint64); isU {
+			sampleVal = nv
+			break
+		}
 		if fv, ok := nv.(float64); ok && fv != math.Trunc(fv) {
 			sampleVal = nv
 			break
@@ -4437,6 +4623,46 @@ func (t *Transpiler) compileRangePredicate(field string, rc esast.RangeCond, nct
 	return t.compileRangeSingleField(field, rc, nctx)
 }
 
+func formatSemverBoundKey(v string) string {
+	s := strings.TrimSpace(v)
+	if idx := strings.IndexByte(s, '+'); idx >= 0 {
+		s = s[:idx]
+	}
+	core := s
+	prerelease := ""
+	hasPre := false
+	if idx := strings.IndexByte(s, '-'); idx >= 0 {
+		core = s[:idx]
+		prerelease = s[idx+1:]
+		hasPre = true
+	}
+	parts := strings.Split(core, ".")
+	parsePart := func(i int) int64 {
+		if i >= len(parts) || parts[i] == "" {
+			return 0
+		}
+		if n, err := strconv.ParseInt(parts[i], 10, 64); err == nil && n >= 0 {
+			return n
+		}
+		return 0
+	}
+	maj, minV, pat := parsePart(0), parsePart(1), parsePart(2)
+	if hasPre {
+		return fmt.Sprintf("%010d.%010d.%010d-%s", maj, minV, pat, prerelease)
+	}
+	return fmt.Sprintf("%010d.%010d.%010d~", maj, minV, pat)
+}
+
+func sqlSemverSortKeyExpr(colExpr string) string {
+	noBuild := fmt.Sprintf("SPLIT_PART(%s, '+', 1)", colExpr)
+	core := fmt.Sprintf("SPLIT_PART(%s, '-', 1)", noBuild)
+	maj := fmt.Sprintf("LPAD(IF(SPLIT_PART(%s, '.', 1) = '', '0', SPLIT_PART(%s, '.', 1)), 10, '0')", core, core)
+	minV := fmt.Sprintf("LPAD(IF(SPLIT_PART(%s, '.', 2) = '', '0', SPLIT_PART(%s, '.', 2)), 10, '0')", core, core)
+	pat := fmt.Sprintf("LPAD(IF(SPLIT_PART(%s, '.', 3) = '', '0', SPLIT_PART(%s, '.', 3)), 10, '0')", core, core)
+	pre := fmt.Sprintf("IF(LOCATE('-', %s) > 0, CONCAT('-', SUBSTRING(%s, LOCATE('-', %s) + 1)), '~')", noBuild, noBuild, noBuild)
+	return fmt.Sprintf("CONCAT(%s, '.', %s, '.', %s, %s)", maj, minV, pat, pre)
+}
+
 func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, nctx *nestedCtx) string {
 	gt, gte, lt, lte := rc.NormalizedBounds()
 	if gt == nil && gte == nil && lt == nil && lte == nil {
@@ -4448,6 +4674,53 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 	}
 	if schema.IsRangeFieldType(b.ESType) {
 		return t.compileRangeOnRangeField(field, b, rc, nctx)
+	}
+	if b.ESType == "version" {
+		isNestedMultiVal := nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued
+		if b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath)) || isNestedMultiVal {
+			colName := b.EffectiveArrayColumn(true)
+			verElem := sqlSemverSortKeyExpr("_x")
+			var elemParts []string
+			if gt != nil {
+				elemParts = append(elemParts, fmt.Sprintf("%s > %s", verElem, quoteStr(formatSemverBoundKey(fmt.Sprintf("%v", gt)))))
+			}
+			if gte != nil {
+				elemParts = append(elemParts, fmt.Sprintf("%s >= %s", verElem, quoteStr(formatSemverBoundKey(fmt.Sprintf("%v", gte)))))
+			}
+			if lt != nil {
+				elemParts = append(elemParts, fmt.Sprintf("%s < %s", verElem, quoteStr(formatSemverBoundKey(fmt.Sprintf("%v", lt)))))
+			}
+			if lte != nil {
+				elemParts = append(elemParts, fmt.Sprintf("%s <= %s", verElem, quoteStr(formatSemverBoundKey(fmt.Sprintf("%v", lte)))))
+			}
+			if len(elemParts) == 0 {
+				return "TRUE"
+			}
+			if isNestedMultiVal {
+				rawCol := t.sqlColumnRef(field, true, nctx)
+				return fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND %s, CAST(%s AS ARRAY<STRING>))", strings.Join(elemParts, " AND "), rawCol)
+			}
+			return fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND %s, `%s`)", strings.Join(elemParts, " AND "), colName)
+		}
+		rawCol := t.sqlColumnRef(field, true, nctx)
+		verCol := sqlSemverSortKeyExpr(rawCol)
+		var parts []string
+		if gt != nil {
+			parts = append(parts, fmt.Sprintf("%s > %s", verCol, quoteStr(formatSemverBoundKey(fmt.Sprintf("%v", gt)))))
+		}
+		if gte != nil {
+			parts = append(parts, fmt.Sprintf("%s >= %s", verCol, quoteStr(formatSemverBoundKey(fmt.Sprintf("%v", gte)))))
+		}
+		if lt != nil {
+			parts = append(parts, fmt.Sprintf("%s < %s", verCol, quoteStr(formatSemverBoundKey(fmt.Sprintf("%v", lt)))))
+		}
+		if lte != nil {
+			parts = append(parts, fmt.Sprintf("%s <= %s", verCol, quoteStr(formatSemverBoundKey(fmt.Sprintf("%v", lte)))))
+		}
+		if len(parts) == 0 {
+			return "TRUE"
+		}
+		return strings.Join(parts, " AND ")
 	}
 	if b.ESType == "ip" {
 		for _, cand := range []any{gt, gte, lt, lte} {
@@ -4545,6 +4818,13 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 		if v == nil {
 			return nil
 		}
+		if b.ESType == "flattened" {
+			s := fmt.Sprintf("%v", v)
+			if b.EffectiveLowercase(true) {
+				s = strings.ToLower(s)
+			}
+			return s
+		}
 		switch effectiveDorisScalarType(b) {
 		case schema.DorisBigInt:
 			if effFormat != "" && (b.ESType == "date" || b.ESType == "date_nanos" || rc.Format != "") && (!strings.Contains(strings.ToLower(effFormat), "epoch") || strings.Contains(strings.ToLower(effFormat), "basic_date")) {
@@ -4592,9 +4872,34 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 						return normalizeDateNanosValue(b.ESType, ms)
 					}
 				}
+				if !isEpochSecond {
+					if iv, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+						if norm, ok := normalizeDateNanosValue(b.ESType, iv).(int64); ok {
+							iv = norm
+						}
+						return iv
+					}
+					if b.ESType == "unsigned_long" {
+						if u, err := strconv.ParseUint(trimmed, 10, 64); err == nil {
+							return u
+						}
+					}
+				}
 				if rawSec, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(rawSec) && !math.IsInf(rawSec, 0) {
 					if isEpochSecond {
 						return int64(rawSec * 1000)
+					}
+					if b.ESType == "unsigned_long" && rawSec >= 9223372036854775808.0 {
+						if rawSec < 18446744073709551616.0 {
+							return uint64(rawSec)
+						}
+						return uint64(math.MaxUint64)
+					}
+					if rawSec >= 9223372036854775808.0 {
+						return int64(math.MaxInt64)
+					}
+					if rawSec < float64(math.MinInt64) {
+						return int64(math.MinInt64)
 					}
 					iv := int64(rawSec)
 					if norm, ok := normalizeDateNanosValue(b.ESType, iv).(int64); ok {
@@ -4617,6 +4922,14 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 						}
 						return normalizeDateNanosValue(b.ESType, ms)
 					}
+				}
+			}
+			if nv, ok := v.(json.Number); ok && b.ESType == "unsigned_long" && !isEpochSecond {
+				if iv, err := nv.Int64(); err == nil {
+					return iv
+				}
+				if u, err := strconv.ParseUint(nv.String(), 10, 64); err == nil {
+					return u
 				}
 			}
 			if b.ESType == "date_nanos" && !isEpochSecond {
@@ -4690,6 +5003,8 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 			sampleBound = cand
 		}
 		switch fv := cand.(type) {
+		case uint64:
+			sampleBound = cand
 		case float64:
 			if fv != math.Trunc(fv) {
 				sampleBound = cand
@@ -4705,6 +5020,8 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 	if b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath)) || isNestedMultiVal {
 		elemExpr := "_x"
 		switch sv := sampleBound.(type) {
+		case uint64:
+			elemExpr = "CAST(_x AS LARGEINT)"
 		case int, int64:
 			elemExpr = "CAST(_x AS BIGINT)"
 		case float64:
@@ -4716,6 +5033,8 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 		case json.Number:
 			if _, err := sv.Int64(); err == nil {
 				elemExpr = "CAST(_x AS BIGINT)"
+			} else if _, errU := strconv.ParseUint(sv.String(), 10, 64); errU == nil {
+				elemExpr = "CAST(_x AS LARGEINT)"
 			} else {
 				elemExpr = "CAST(_x AS DOUBLE)"
 			}
@@ -4760,6 +5079,29 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 	}
 	if len(parts) == 0 {
 		return "TRUE"
+	}
+	if b.ESType == "flattened" {
+		if _, isSubKey := t.flattenedFieldMode(field, b); isSubKey {
+			rawVar := t.flattenedRawVariantRef(field, b, nctx)
+			var elemParts []string
+			if gt != nil {
+				elemParts = append(elemParts, fmt.Sprintf("_x > %s", quoteValue(gt)))
+			}
+			if gte != nil {
+				elemParts = append(elemParts, fmt.Sprintf("_x >= %s", quoteValue(gte)))
+			}
+			if lt != nil {
+				elemParts = append(elemParts, fmt.Sprintf("_x < %s", quoteValue(lt)))
+			}
+			if lte != nil {
+				elemParts = append(elemParts, fmt.Sprintf("_x <= %s", quoteValue(lte)))
+			}
+			scalarCond := strings.Join(parts, " AND ")
+			if len(parts) > 1 {
+				scalarCond = "(" + scalarCond + ")"
+			}
+			return fmt.Sprintf("(%s OR array_exists(_x -> _x IS NOT NULL AND %s, CAST(%s AS ARRAY<STRING>)))", scalarCond, strings.Join(elemParts, " AND "), rawVar)
+		}
 	}
 	return strings.Join(parts, " AND ")
 }
@@ -8371,6 +8713,8 @@ func formatMissingScalar(v any) string {
 		return strconv.Itoa(val)
 	case int64:
 		return strconv.FormatInt(val, 10)
+	case uint64:
+		return strconv.FormatUint(val, 10)
 	case float64:
 		if math.IsNaN(val) || math.IsInf(val, 0) {
 			return "0"
@@ -10126,6 +10470,10 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 				if n, ok := parseIPv4ToUint32(val); ok {
 					val = n
 				}
+			} else if effType == "version" || b.ESType == "version" {
+				if val != nil {
+					val = formatSemverBoundKey(fmt.Sprintf("%v", val))
+				}
 			} else if strVal, ok := val.(string); ok {
 				if b.EffectiveLowercase(true) && effType != "date" && effType != "date_nanos" && b.DorisType != schema.DorisBigInt && b.DorisType != schema.DorisInt && b.DorisType != schema.DorisDouble {
 					val = strings.ToLower(strVal)
@@ -10280,6 +10628,9 @@ func (t *Transpiler) sqlSortColumnRefWithType(field string, sampleVal any, desc 
 		if effType == "ip" || b.ESType == "ip" {
 			return fmt.Sprintf("%s(array_map(_x -> IPV4_STRING_TO_NUM_OR_NULL(_x), %s))", fn, arrRef)
 		}
+		if effType == "version" || b.ESType == "version" {
+			return fmt.Sprintf("%s(array_map(_x -> %s, %s))", fn, sqlSemverSortKeyExpr("_x"), arrRef)
+		}
 		effDT := effectiveDorisScalarType(b)
 		switch strings.ToLower(strings.TrimSpace(effType)) {
 		case "long", "integer", "short", "byte", "date", "date_nanos":
@@ -10352,6 +10703,9 @@ func (t *Transpiler) sqlSortColumnRefWithType(field string, sampleVal any, desc 
 	}
 	if effType == "ip" || b.ESType == "ip" {
 		return fmt.Sprintf("IPV4_STRING_TO_NUM_OR_NULL(%s)", t.sqlColumnRef(field, true, nil))
+	}
+	if effType == "version" || b.ESType == "version" {
+		return sqlSemverSortKeyExpr(t.sqlColumnRef(field, true, nil))
 	}
 	return t.sqlTypedColumnRef(field, sampleVal, true, nil)
 }
@@ -10469,6 +10823,12 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 	}
 	castType := "STRING"
 	switch v := sampleVal.(type) {
+	case uint64:
+		if v > math.MaxInt64 {
+			castType = "LARGEINT"
+		} else {
+			castType = "BIGINT"
+		}
 	case int, int64:
 		castType = "BIGINT"
 	case float64:
@@ -10480,6 +10840,8 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 	case json.Number:
 		if _, err := v.Int64(); err == nil {
 			castType = "BIGINT"
+		} else if _, errU := strconv.ParseUint(v.String(), 10, 64); errU == nil {
+			castType = "LARGEINT"
 		} else {
 			castType = "DOUBLE"
 		}
@@ -10506,6 +10868,9 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 
 	switch b.Kind {
 	case schema.StoragePromotedScalar:
+		if b.ESType == "unsigned_long" && castType == "LARGEINT" && effField != "" {
+			break
+		}
 		if preferKeyword && b.KeywordCompanion != "" {
 			return fmt.Sprintf("`%s`", b.KeywordCompanion)
 		}
@@ -10519,11 +10884,15 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 			return fmt.Sprintf("`%s`", b.EffectiveArrayColumn(preferKeyword))
 		}
 	}
-	if t.unindexedFields != nil && field != "" && !strings.HasPrefix(field, "_") && !strings.ContainsAny(field, "*?") {
+	if b.Kind != schema.StoragePromotedScalar && t.unindexedFields != nil && field != "" && !strings.HasPrefix(field, "_") && !strings.ContainsAny(field, "*?") {
 		t.unindexedFields[strings.TrimSuffix(field, ".keyword")] = true
 	}
+	srcPath := b.SourceJSONPath
+	if len(srcPath) == 0 && effField != "" {
+		srcPath = strings.Split(strings.TrimSuffix(effField, ".keyword"), ".")
+	}
 	var pathBuilder strings.Builder
-	for _, seg := range b.SourceJSONPath {
+	for _, seg := range srcPath {
 		_, _ = fmt.Fprintf(&pathBuilder, "[%s]", quoteStr(seg))
 	}
 	return fmt.Sprintf("CAST(`_doc`%s AS %s)", pathBuilder.String(), castType)
@@ -10629,6 +10998,8 @@ func quoteValue(v any) string {
 		return strconv.Itoa(val)
 	case int64:
 		return strconv.FormatInt(val, 10)
+	case uint64:
+		return strconv.FormatUint(val, 10)
 	case float64:
 		if math.IsNaN(val) || math.IsInf(val, 0) {
 			return "NULL"
@@ -11047,7 +11418,7 @@ func buildPointInPolygonSQL(latExpr, lonExpr string, pts [][2]float64) string {
 	return fmt.Sprintf("(%s AND ((%s) %% 2 = 1))", bboxCond, strings.Join(edgeCases, " + "))
 }
 
-func extractGeoShapeRings(coords any, shapeType string) [][][2]float64 {
+func extractGeoShapePolygons(coords any, shapeType string) [][][][2]float64 {
 	parseRing := func(rawRing any) [][2]float64 {
 		arr, ok := rawRing.([]any)
 		if !ok {
@@ -11070,26 +11441,42 @@ func extractGeoShapeRings(coords any, shapeType string) [][][2]float64 {
 		}
 		return pts
 	}
+	parsePoly := func(polyArr []any) [][][2]float64 {
+		if len(polyArr) == 0 {
+			return nil
+		}
+		ext := parseRing(polyArr[0])
+		if len(ext) < 3 {
+			return nil
+		}
+		rings := [][][2]float64{ext}
+		for _, rawHole := range polyArr[1:] {
+			if hole := parseRing(rawHole); len(hole) >= 3 {
+				rings = append(rings, hole)
+			}
+		}
+		return rings
+	}
 	arr, ok := coords.([]any)
 	if !ok || len(arr) == 0 {
 		return nil
 	}
-	var rings [][][2]float64
+	var polys [][][][2]float64
 	switch shapeType {
 	case "polygon":
-		if pts := parseRing(arr[0]); len(pts) >= 3 {
-			rings = append(rings, pts)
+		if p := parsePoly(arr); len(p) > 0 {
+			polys = append(polys, p)
 		}
 	case "multipolygon":
 		for _, polyRaw := range arr {
-			if polyArr, ok := polyRaw.([]any); ok && len(polyArr) > 0 {
-				if pts := parseRing(polyArr[0]); len(pts) >= 3 {
-					rings = append(rings, pts)
+			if polyArr, ok := polyRaw.([]any); ok {
+				if p := parsePoly(polyArr); len(p) > 0 {
+					polys = append(polys, p)
 				}
 			}
 		}
 	}
-	return rings
+	return polys
 }
 
 func (t *Transpiler) evalGeoPointPredForField(field string, nctx *nestedCtx, buildCond func(latExpr, lonExpr string) string) string {
@@ -11227,26 +11614,116 @@ func (t *Transpiler) compileGeoShape(gs *esast.GeoShapeQuery, scoring bool, nctx
 	}
 
 	if shapeType == "polygon" || shapeType == "multipolygon" {
-		rings := extractGeoShapeRings(gs.Shape["coordinates"], shapeType)
-		if len(rings) > 0 {
+		polys := extractGeoShapePolygons(gs.Shape["coordinates"], shapeType)
+		if len(polys) > 0 {
 			if rel == "CONTAINS" {
 				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 			}
 			posWhere := t.evalGeoPointPredForField(gs.Field, nctx, func(latExpr, lonExpr string) string {
-				var ringPreds []string
-				for _, ring := range rings {
-					ringPreds = append(ringPreds, buildPointInPolygonSQL(latExpr, lonExpr, ring))
+				var polyPreds []string
+				for _, poly := range polys {
+					extCond := buildPointInPolygonSQL(latExpr, lonExpr, poly[0])
+					if len(poly) == 1 {
+						polyPreds = append(polyPreds, extCond)
+					} else {
+						var holeConds []string
+						holeConds = append(holeConds, extCond)
+						for _, hole := range poly[1:] {
+							holeConds = append(holeConds, "NOT "+buildPointInPolygonSQL(latExpr, lonExpr, hole))
+						}
+						polyPreds = append(polyPreds, "("+strings.Join(holeConds, " AND ")+")")
+					}
 				}
-				if len(ringPreds) == 1 {
-					return ringPreds[0]
+				if len(polyPreds) == 1 {
+					return polyPreds[0]
 				}
-				return "(" + strings.Join(ringPreds, " OR ") + ")"
+				return "(" + strings.Join(polyPreds, " OR ") + ")"
 			})
 			if rel == "DISJOINT" {
 				w := fmt.Sprintf("(%s AND NOT (%s))", t.compileExistsPredicate(gs.Field, nctx), posWhere)
 				return CompiledQuery{WhereSQL: w, SafeWhereSQL: w, ScoreSQL: scoreSQL}
 			}
 			return CompiledQuery{WhereSQL: posWhere, SafeWhereSQL: posWhere, ScoreSQL: scoreSQL}
+		}
+	}
+
+	if shapeType == "envelope" {
+		if arr, ok := gs.Shape["coordinates"].([]any); ok && len(arr) >= 2 {
+			pt0, ok0 := arr[0].([]any)
+			pt1, ok1 := arr[1].([]any)
+			if ok0 && ok1 && len(pt0) >= 2 && len(pt1) >= 2 {
+				lon0, okLon0 := toFloat64ForGeo(pt0[0])
+				lat0, okLat0 := toFloat64ForGeo(pt0[1])
+				lon1, okLon1 := toFloat64ForGeo(pt1[0])
+				lat1, okLat1 := toFloat64ForGeo(pt1[1])
+				if okLon0 && okLat0 && okLon1 && okLat1 {
+					top, bottom := lat0, lat1
+					if top < bottom {
+						top, bottom = bottom, top
+					}
+					if rel == "CONTAINS" && (top != bottom || lon0 != lon1) {
+						return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+					}
+					bp := t.compileGeoBoundingBox(&esast.GeoBoundingBoxQuery{
+						Field:  gs.Field,
+						Top:    top,
+						Bottom: bottom,
+						Left:   lon0,
+						Right:  lon1,
+						Boost:  gs.Boost,
+					}, scoring, nctx)
+					if rel == "DISJOINT" {
+						w := fmt.Sprintf("(%s AND NOT (%s))", t.compileExistsPredicate(gs.Field, nctx), bp.WhereSQL)
+						return CompiledQuery{WhereSQL: w, SafeWhereSQL: w, ScoreSQL: scoreSQL}
+					}
+					return bp
+				}
+			}
+		}
+	}
+
+	if shapeType == "multipoint" {
+		if arr, ok := gs.Shape["coordinates"].([]any); ok && len(arr) > 0 {
+			var ptPreds []string
+			for _, item := range arr {
+				ptArr, okPt := item.([]any)
+				if !okPt || len(ptArr) < 2 {
+					continue
+				}
+				lon, ok1 := toFloat64ForGeo(ptArr[0])
+				lat, ok2 := toFloat64ForGeo(ptArr[1])
+				if !ok1 || !ok2 {
+					continue
+				}
+				bp := t.compileGeoBoundingBox(&esast.GeoBoundingBoxQuery{
+					Field:  gs.Field,
+					Top:    lat,
+					Bottom: lat,
+					Left:   lon,
+					Right:  lon,
+				}, false, nctx)
+				if bp.WhereSQL != "FALSE" {
+					ptPreds = append(ptPreds, bp.WhereSQL)
+				} else if rel == "CONTAINS" {
+					return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+				}
+			}
+			if len(ptPreds) == 0 {
+				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+			}
+			joinOp := " OR "
+			if rel == "CONTAINS" {
+				joinOp = " AND "
+			}
+			combined := ptPreds[0]
+			if len(ptPreds) > 1 {
+				combined = "(" + strings.Join(ptPreds, joinOp) + ")"
+			}
+			if rel == "DISJOINT" {
+				w := fmt.Sprintf("(%s AND NOT (%s))", t.compileExistsPredicate(gs.Field, nctx), combined)
+				return CompiledQuery{WhereSQL: w, SafeWhereSQL: w, ScoreSQL: scoreSQL}
+			}
+			return CompiledQuery{WhereSQL: combined, SafeWhereSQL: combined, ScoreSQL: scoreSQL}
 		}
 	}
 
@@ -11511,8 +11988,35 @@ func extractMLTLikeTexts(v any, fields []string) ([]string, []string) {
 				docMap = sm
 			}
 			if docMap != nil {
-				if hasExplicitFields {
-					for _, f := range fields {
+				itemFields := fields
+				itemHasExplicit := hasExplicitFields
+				if rawF, hasF := lv["fields"]; hasF && rawF != nil {
+					var overrideFields []string
+					switch fv := rawF.(type) {
+					case []string:
+						for _, s := range fv {
+							if strings.TrimSpace(s) != "" {
+								overrideFields = append(overrideFields, strings.TrimSpace(s))
+							}
+						}
+					case []any:
+						for _, elem := range fv {
+							if s, ok := elem.(string); ok && strings.TrimSpace(s) != "" {
+								overrideFields = append(overrideFields, strings.TrimSpace(s))
+							}
+						}
+					case string:
+						if strings.TrimSpace(fv) != "" {
+							overrideFields = append(overrideFields, strings.TrimSpace(fv))
+						}
+					}
+					if len(overrideFields) > 0 {
+						itemFields = overrideFields
+						itemHasExplicit = len(itemFields) > 0 && (len(itemFields) != 1 || (itemFields[0] != "_all_text" && itemFields[0] != "*"))
+					}
+				}
+				if itemHasExplicit {
+					for _, f := range itemFields {
 						cleanF, _ := parseFieldBoost(f, 1.0)
 						if fv, ok := resolvePathInMLTMap(docMap, cleanF); ok {
 							appendValueTexts(fv)
@@ -11528,9 +12032,10 @@ func extractMLTLikeTexts(v any, fields []string) ([]string, []string) {
 	return texts, excludedIDs
 }
 
-func tokenizeMLTTexts(texts []string, stopSet map[string]bool, minWordLen, maxWordLen int) []string {
-	var tokens []string
+func tokenizeMLTTextsWithFreq(texts []string, stopSet map[string]bool, minWordLen, maxWordLen, minTermFreq, maxQueryTerms int) []string {
+	var ordered []string
 	seen := make(map[string]bool)
+	counts := make(map[string]int)
 	for _, txt := range texts {
 		for _, tok := range strings.Fields(txt) {
 			lowerTok := strings.ToLower(tok)
@@ -11543,13 +12048,28 @@ func tokenizeMLTTexts(texts []string, stopSet map[string]bool, minWordLen, maxWo
 			if maxWordLen > 0 && len([]rune(lowerTok)) > maxWordLen {
 				continue
 			}
+			counts[lowerTok]++
 			if !seen[lowerTok] {
 				seen[lowerTok] = true
-				tokens = append(tokens, tok)
+				ordered = append(ordered, tok)
 			}
 		}
 	}
+	var tokens []string
+	for _, tok := range ordered {
+		if minTermFreq > 1 && counts[strings.ToLower(tok)] < minTermFreq {
+			continue
+		}
+		tokens = append(tokens, tok)
+	}
+	if maxQueryTerms > 0 && len(tokens) > maxQueryTerms {
+		tokens = tokens[:maxQueryTerms]
+	}
 	return tokens
+}
+
+func tokenizeMLTTexts(texts []string, stopSet map[string]bool, minWordLen, maxWordLen int) []string {
+	return tokenizeMLTTextsWithFreq(texts, stopSet, minWordLen, maxWordLen, 0, 0)
 }
 
 func (t *Transpiler) compileMoreLikeThis(mlt *esast.MoreLikeThisQuery, inScoring bool, nctx *nestedCtx) CompiledQuery {
@@ -11560,12 +12080,27 @@ func (t *Transpiler) compileMoreLikeThis(mlt *esast.MoreLikeThisQuery, inScoring
 	if len(fields) == 0 {
 		fields = []string{"_all_text"}
 	}
-	texts, excludedIDs := extractMLTLikeTexts(mlt.Like, mlt.Fields)
+	var combinedLike []any
+	if mlt.Like != nil {
+		combinedLike = append(combinedLike, mlt.Like)
+	}
+	if strings.TrimSpace(mlt.LikeText) != "" {
+		combinedLike = append(combinedLike, mlt.LikeText)
+	}
+	for _, d := range mlt.Docs {
+		combinedLike = append(combinedLike, d)
+	}
+	for _, id := range mlt.Ids {
+		if strings.TrimSpace(id) != "" {
+			combinedLike = append(combinedLike, map[string]any{"_id": id})
+		}
+	}
+	texts, excludedIDs := extractMLTLikeTexts(combinedLike, mlt.Fields)
 	stopSet := make(map[string]bool, len(mlt.StopWords))
 	for _, sw := range mlt.StopWords {
 		stopSet[strings.ToLower(sw)] = true
 	}
-	tokens := tokenizeMLTTexts(texts, stopSet, mlt.MinWordLength, mlt.MaxWordLength)
+	tokens := tokenizeMLTTextsWithFreq(texts, stopSet, mlt.MinWordLength, mlt.MaxWordLength, mlt.MinTermFreq, mlt.MaxQueryTerms)
 	if len(tokens) == 0 && len(excludedIDs) > 0 && mlt.MinimumShouldMatch == nil {
 		// Document reference only (e.g., {"_id": "1"} without inline "doc"):
 		// if include is false, exclude the referenced _id; otherwise match all.
@@ -11585,6 +12120,9 @@ func (t *Transpiler) compileMoreLikeThis(mlt *esast.MoreLikeThisQuery, inScoring
 	boost := 1.0
 	if mlt.Boost != nil {
 		boost = *mlt.Boost
+	}
+	if mlt.BoostTerms > 0 {
+		boost *= mlt.BoostTerms
 	}
 
 	var whereSQL, safeWhereSQL string
@@ -12235,9 +12773,62 @@ func parseDurationOrDistancePivotMs(v any) float64 {
 	return 1.0
 }
 
+func joinFieldHasChild(fb schema.FieldBinding, childType string) bool {
+	if len(fb.Relations) == 0 {
+		return true
+	}
+	for _, v := range fb.Relations {
+		switch cv := v.(type) {
+		case string:
+			if cv == childType {
+				return true
+			}
+		case []string:
+			for _, s := range cv {
+				if s == childType {
+					return true
+				}
+			}
+		case []any:
+			for _, elem := range cv {
+				if s, ok := elem.(string); ok && s == childType {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func joinFieldHasParent(fb schema.FieldBinding, parentType string) bool {
+	if len(fb.Relations) == 0 {
+		return true
+	}
+	_, ok := fb.Relations[parentType]
+	return ok
+}
+
 func (t *Transpiler) compileHasChild(hc *esast.HasChildQuery, inScoring bool, nctx *nestedCtx) CompiledQuery {
 	if hc == nil {
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
+	if (hc.MinChildren != nil && hc.MaxChildren != nil && *hc.MinChildren > *hc.MaxChildren) || (hc.MaxChildren != nil && *hc.MaxChildren < 0) {
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
+	if t.Schema != nil && len(t.Schema.Fields) > 0 {
+		hasMatchingJoin := false
+		for _, fb := range t.Schema.Fields {
+			if fb.ESType == "join" && joinFieldHasChild(fb, hc.Type) {
+				hasMatchingJoin = true
+				break
+			}
+		}
+		if !hasMatchingJoin {
+			if !hc.IgnoreUnmapped && t.searchErr == nil {
+				t.searchErr = fmt.Errorf("[has_child] no join field has been configured for type [%s]", hc.Type)
+			}
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
 	}
 	cp := t.CompileQuery(&hc.Query, inScoring, nctx)
 	if hc.Boost != nil && inScoring {
@@ -12255,6 +12846,21 @@ func (t *Transpiler) compileHasChild(hc *esast.HasChildQuery, inScoring bool, nc
 func (t *Transpiler) compileHasParent(hp *esast.HasParentQuery, inScoring bool, nctx *nestedCtx) CompiledQuery {
 	if hp == nil {
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
+	if t.Schema != nil && len(t.Schema.Fields) > 0 {
+		hasMatchingJoin := false
+		for _, fb := range t.Schema.Fields {
+			if fb.ESType == "join" && joinFieldHasParent(fb, hp.ParentType) {
+				hasMatchingJoin = true
+				break
+			}
+		}
+		if !hasMatchingJoin {
+			if !hp.IgnoreUnmapped && t.searchErr == nil {
+				t.searchErr = fmt.Errorf("[has_parent] no join field has been configured for parent_type [%s]", hp.ParentType)
+			}
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
 	}
 	scoreOn := hp.Score != nil && *hp.Score && inScoring
 	cp := t.CompileQuery(&hp.Query, scoreOn, nctx)
@@ -12278,9 +12884,16 @@ func (t *Transpiler) compileParentID(pid *esast.ParentIDQuery, inScoring bool, n
 	var joinFields []string
 	if t.Schema != nil {
 		for fname, fb := range t.Schema.Fields {
-			if fb.ESType == "join" {
+			if fb.ESType == "join" && joinFieldHasChild(fb, pid.Type) {
 				joinFields = append(joinFields, fname)
 			}
+		}
+		sort.Strings(joinFields)
+		if len(t.Schema.Fields) > 0 && len(joinFields) == 0 {
+			if !pid.IgnoreUnmapped && t.searchErr == nil {
+				t.searchErr = fmt.Errorf("[parent_id] no join field has been configured for type [%s]", pid.Type)
+			}
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 		}
 	}
 	var disjuncts []string
@@ -12295,7 +12908,9 @@ func (t *Transpiler) compileParentID(pid *esast.ParentIDQuery, inScoring bool, n
 		disjuncts = append(disjuncts, fmt.Sprintf("(CAST(%s['name'] AS STRING) = %s AND CAST(%s['parent'] AS STRING) = %s)",
 			baseExpr, quoteStr(pid.Type), baseExpr, quoteStr(parentIDStr)))
 	}
-	disjuncts = append(disjuncts, fmt.Sprintf("(`_routing` = %s)", quoteStr(parentIDStr)))
+	if len(joinFields) == 0 {
+		disjuncts = append(disjuncts, fmt.Sprintf("(`_routing` = %s)", quoteStr(parentIDStr)))
+	}
 	whereSQL := "(" + strings.Join(disjuncts, " OR ") + ")"
 	scoreSQL := "0.0"
 	if inScoring {
@@ -12313,6 +12928,18 @@ func (t *Transpiler) compileParentID(pid *esast.ParentIDQuery, inScoring bool, n
 func (t *Transpiler) compilePercolate(pq *esast.PercolateQuery, inScoring bool, nctx *nestedCtx) CompiledQuery {
 	if pq == nil || strings.TrimSpace(pq.Field) == "" {
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
+	if t.Schema != nil && len(t.Schema.Fields) > 0 {
+		_, b := t.resolveFieldInNestedCtx(pq.Field, false, nctx)
+		if b.ESType != "" && b.ESType != "percolator" {
+			if t.searchErr == nil {
+				t.searchErr = fmt.Errorf("field [%s] is not of type [percolator]", pq.Field)
+			}
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+		if b.ESType == "" && pq.IgnoreUnmapped {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
 	}
 	whereSQL := t.compileExistsPredicate(pq.Field, nctx)
 	scoreSQL := "0.0"

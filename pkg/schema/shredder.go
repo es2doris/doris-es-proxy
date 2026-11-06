@@ -265,41 +265,57 @@ func ShredDocumentWithNow(
 				continue
 			}
 			var rawLeafs []any
-			if b.ESType == "geo_point" {
+			switch b.ESType {
+			case "geo_point":
 				rawLeafs = extractGeoPointCandidatesWithNull(parsedDoc, b.SourceJSONPath, nil)
-			} else {
+			case "token_count":
+				rawLeafs = extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
+			default:
 				rawLeafs = extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, nil)
 			}
 			if len(rawLeafs) == 0 && b.NullValue != nil && hasExplicitNullAtPath(parsedDoc, b.SourceJSONPath) {
 				rawLeafs = []any{b.NullValue}
 			}
-			if b.ESType == "token_count" && len(rawLeafs) > 0 {
+			if b.ESType == "token_count" && (len(rawLeafs) > 0 || hasObjAtPath) {
 				var totalTokens int64
+				var validLeafs []any
 				hasTokenVal := false
+				hadMalformed := hasObjAtPath
 				for _, rv := range rawLeafs {
 					if rv == nil {
 						continue
 					}
 					if sv, isStr := rv.(string); isStr {
-						totalTokens += int64(len(strings.Fields(sv)))
+						totalTokens += countTokensForBinding(sv, b)
 						hasTokenVal = true
+						validLeafs = append(validLeafs, rv)
 					} else if coerced := coerceScalarBindingForDoris(rv, b, getNow()); coerced != nil {
 						switch iv := coerced.(type) {
 						case int64:
 							totalTokens += iv
 							hasTokenVal = true
+							validLeafs = append(validLeafs, rv)
 						case int:
 							totalTokens += int64(iv)
 							hasTokenVal = true
+							validLeafs = append(validLeafs, rv)
 						}
 					} else if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
 						recordIgnored(b.ESFieldPath)
+						hadMalformed = true
 					} else {
 						return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", b.ESFieldPath, b.ESType)
 					}
 				}
 				if hasTokenVal {
 					row[b.ColumnName] = totalTokens
+				}
+				if hadMalformed && isPrimaryFieldBinding(b) {
+					if len(validLeafs) > 0 {
+						deferReplacePath(b.SourceJSONPath, validLeafs)
+					} else {
+						deferDeletePath(b.SourceJSONPath)
+					}
 				}
 				continue
 			}
@@ -450,6 +466,12 @@ func ShredDocumentWithNow(
 						}
 					}
 					validLeafs = append(validLeafs, rv)
+					if b.ESType == "unsigned_long" {
+						if u, okU := parseExactUint64(rv); okU && u > uint64(math.MaxInt64) {
+							vals = append(vals, strconv.FormatUint(u, 10))
+							continue
+						}
+					}
 					vals = append(vals, formatCoercedArrayElement(coerced))
 				}
 				if len(vals) > 0 {
@@ -1143,6 +1165,56 @@ func collectRawLeafsAtPathWithNull(node any, path []string, nullVal any, out *[]
 	}
 }
 
+var standardEnglishStopwords = map[string]struct{}{
+	"a": {}, "an": {}, "and": {}, "are": {}, "as": {}, "at": {}, "be": {}, "but": {}, "by": {},
+	"for": {}, "if": {}, "in": {}, "into": {}, "is": {}, "it": {}, "no": {}, "not": {}, "of": {},
+	"on": {}, "or": {}, "such": {}, "that": {}, "the": {}, "their": {}, "then": {}, "there": {},
+	"these": {}, "they": {}, "this": {}, "to": {}, "was": {}, "will": {}, "with": {},
+}
+
+func countTokensForBinding(sv string, b FieldBinding) int64 {
+	fields := strings.Fields(sv)
+	if len(fields) == 0 {
+		return 0
+	}
+	filterStops := false
+	if b.EnablePositionIncrements != nil && !*b.EnablePositionIncrements {
+		filterStops = true
+	} else if (strings.EqualFold(b.Analyzer, "stop") || strings.EqualFold(b.Analyzer, "english")) && (b.EnablePositionIncrements == nil || !*b.EnablePositionIncrements) {
+		filterStops = true
+	}
+	if !filterStops {
+		return int64(len(fields))
+	}
+	var cnt int64
+	for _, tok := range fields {
+		cleaned := strings.ToLower(strings.Trim(tok, ".,!?;:\"'()[]{}"))
+		if cleaned == "" {
+			continue
+		}
+		if _, isStop := standardEnglishStopwords[cleaned]; !isStop {
+			cnt++
+		}
+	}
+	return cnt
+}
+
+func parseExactUint64(val any) (uint64, bool) {
+	switch v := val.(type) {
+	case uint64:
+		return v, true
+	case json.Number:
+		if u, err := strconv.ParseUint(v.String(), 10, 64); err == nil {
+			return u, true
+		}
+	case string:
+		if u, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64); err == nil {
+			return u, true
+		}
+	}
+	return 0, false
+}
+
 func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 	if val == nil {
 		return nil
@@ -1150,18 +1222,18 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 	if b.ESType == "token_count" {
 		switch tv := val.(type) {
 		case string:
-			return int64(len(strings.Fields(tv)))
+			return countTokensForBinding(tv, b)
 		case []string:
 			var total int64
 			for _, sv := range tv {
-				total += int64(len(strings.Fields(sv)))
+				total += countTokensForBinding(sv, b)
 			}
 			return total
 		case []any:
 			var total int64
 			for _, elem := range tv {
 				if sv, ok := elem.(string); ok {
-					total += int64(len(strings.Fields(sv)))
+					total += countTokensForBinding(sv, b)
 				}
 			}
 			return total
@@ -2797,7 +2869,7 @@ func isStrictLeafFieldWithoutSubprops(s *IndexSchema, b FieldBinding) bool {
 	}
 	switch b.ESType {
 	case "text", "match_only_text", "keyword", "constant_keyword", "wildcard", "ip",
-		"long", "unsigned_long", "integer", "short", "byte",
+		"long", "unsigned_long", "integer", "short", "byte", "token_count",
 		"double", "float", "half_float", "scaled_float", "boolean", "date", "date_nanos":
 	default:
 		return false
@@ -3447,6 +3519,11 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 	} else if isTypedNonStringBinding(b) {
 		coerced := coerceScalarBindingForDoris(val, b, getNow())
 		if coerced != nil {
+			if b.ESType == "unsigned_long" {
+				if u, okU := parseExactUint64(val); okU && u > uint64(math.MaxInt64) {
+					return json.Number(strconv.FormatUint(u, 10))
+				}
+			}
 			return coerced
 		}
 		if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
