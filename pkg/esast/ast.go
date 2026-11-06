@@ -66,6 +66,7 @@ type SearchRequest struct {
 	Collapse         *CollapseSpec            `json:"collapse,omitempty"`
 	Rescore          RescoreSlice             `json:"rescore,omitempty"`
 	PIT              *PITSpec                 `json:"pit,omitempty"`
+	Slice            *SliceSpec               `json:"slice,omitempty"`
 	Fields           []FieldRequestSpec       `json:"fields,omitempty"`
 	DocvalueFields   []FieldRequestSpec       `json:"docvalue_fields,omitempty"`
 	StoredFields     any                      `json:"stored_fields,omitempty"`
@@ -609,6 +610,12 @@ type PITSpec struct {
 	KeepAlive string `json:"keep_alive,omitempty"`
 }
 
+type SliceSpec struct {
+	ID    int    `json:"id"`
+	Max   int    `json:"max"`
+	Field string `json:"field,omitempty"`
+}
+
 type InnerHitsSpec struct {
 	Name           string             `json:"name,omitempty"`
 	From           int                `json:"from,omitempty"`
@@ -1048,6 +1055,7 @@ type Query struct {
 	HasParent         *HasParentQuery          `json:"has_parent,omitempty"`
 	ParentID          *ParentIDQuery           `json:"parent_id,omitempty"`
 	Percolate         *PercolateQuery          `json:"percolate,omitempty"`
+	Name              string                   `json:"_name,omitempty"`
 }
 
 var knownQueryClauses = map[string]bool{
@@ -1197,6 +1205,54 @@ func stripNamedQueryAndMapBoost(rawClause json.RawMessage, requireMultipleKeysFo
 	return cleaned, mapBoost, nil
 }
 
+func extractQueryNameFromRaw(raw map[string]json.RawMessage) string {
+	if rawName, ok := raw["_name"]; ok {
+		var s string
+		if err := json.Unmarshal(bytes.TrimSpace(rawName), &s); err == nil && s != "" {
+			return s
+		}
+	}
+	for k, rawClause := range raw {
+		if k == "_name" || k == "boost" {
+			continue
+		}
+		tc := bytes.TrimSpace(rawClause)
+		if len(tc) == 0 || tc[0] != '{' {
+			continue
+		}
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(tc, &m); err != nil {
+			continue
+		}
+		if rawName, ok := m["_name"]; ok {
+			var s string
+			if err := json.Unmarshal(bytes.TrimSpace(rawName), &s); err == nil && s != "" {
+				return s
+			}
+		}
+		for fk, fv := range m {
+			if fk == "_name" || fk == "boost" {
+				continue
+			}
+			tfv := bytes.TrimSpace(fv)
+			if len(tfv) == 0 || tfv[0] != '{' {
+				continue
+			}
+			var innerMap map[string]json.RawMessage
+			if err := json.Unmarshal(tfv, &innerMap); err != nil {
+				continue
+			}
+			if rawName, ok := innerMap["_name"]; ok {
+				var s string
+				if err := json.Unmarshal(bytes.TrimSpace(rawName), &s); err == nil && s != "" {
+					return s
+				}
+			}
+		}
+	}
+	return ""
+}
+
 func (q *Query) UnmarshalJSON(data []byte) error {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -1206,6 +1262,7 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
+	extractedName := extractQueryNameFromRaw(raw)
 	clauseCount := 0
 	for k := range raw {
 		if !knownQueryClauses[k] {
@@ -1491,6 +1548,12 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 		if _, ok := raw[check.key]; ok && check.cnt == 0 {
 			return fmt.Errorf("parsing_exception: [%s] query must specify at least one field", check.key)
 		}
+	}
+	if alias.Name == "" && extractedName != "" {
+		alias.Name = extractedName
+	}
+	if alias.Name == "" && alias.Wrapper != nil && alias.Wrapper.Decoded != nil && alias.Wrapper.Decoded.Name != "" {
+		alias.Name = alias.Wrapper.Decoded.Name
 	}
 	*q = Query(alias)
 	return nil
@@ -2063,15 +2126,68 @@ func (gs *GeoShapeQuery) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("parsing_exception: [geo_shape] must specify exactly one field, got %d", len(fieldKeys))
 	}
 	gs.Field = fieldKeys[0]
+	var specMap map[string]json.RawMessage
+	if err := json.Unmarshal(rawMap[gs.Field], &specMap); err != nil {
+		return fmt.Errorf("parsing_exception: [geo_shape] field [%s] must be an object", gs.Field)
+	}
+	for k := range specMap {
+		switch k {
+		case "shape", "indexed_shape", "relation", "ignore_unmapped", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [geo_shape] unknown field [%s]", k)
+		}
+	}
 	var spec struct {
-		Shape        map[string]any `json:"shape"`
-		IndexedShape map[string]any `json:"indexed_shape"`
-		Relation     string         `json:"relation"`
+		Shape          json.RawMessage `json:"shape"`
+		IndexedShape   map[string]any  `json:"indexed_shape"`
+		Relation       string          `json:"relation"`
+		IgnoreUnmapped any             `json:"ignore_unmapped"`
+		Boost          json.RawMessage `json:"boost"`
+		Name           string          `json:"_name"`
 	}
 	if err := json.Unmarshal(rawMap[gs.Field], &spec); err != nil {
 		return fmt.Errorf("parsing_exception: [geo_shape] field [%s] must be an object", gs.Field)
 	}
-	if len(spec.Shape) == 0 && len(spec.IndexedShape) == 0 {
+	if spec.IgnoreUnmapped != nil {
+		b, err := parseFlexibleBool(spec.IgnoreUnmapped)
+		if err != nil {
+			return err
+		}
+		gs.IgnoreUnmapped = b
+	}
+	if len(spec.Boost) > 0 && gs.Boost == nil {
+		b, err := parseOptionalNonNegativeBoost(spec.Boost)
+		if err != nil {
+			return err
+		}
+		gs.Boost = b
+	}
+	if spec.Name != "" && gs.Name == "" {
+		gs.Name = spec.Name
+	}
+	shapeTrimmed := bytes.TrimSpace(spec.Shape)
+	var shapeMap map[string]any
+	if len(shapeTrimmed) > 0 && !bytes.Equal(shapeTrimmed, []byte("null")) {
+		switch shapeTrimmed[0] {
+		case '"':
+			var wktStr string
+			if err := json.Unmarshal(shapeTrimmed, &wktStr); err != nil {
+				return fmt.Errorf("parsing_exception: [geo_shape] invalid WKT [shape]: %w", err)
+			}
+			parsedWKT, err := ParseWKTGeoShape(wktStr)
+			if err != nil {
+				return err
+			}
+			shapeMap = parsedWKT
+		case '{':
+			if err := json.Unmarshal(shapeTrimmed, &shapeMap); err != nil {
+				return fmt.Errorf("parsing_exception: [geo_shape] invalid [shape]: %w", err)
+			}
+		default:
+			return fmt.Errorf("parsing_exception: [geo_shape] [shape] must be an object or WKT string")
+		}
+	}
+	if len(shapeMap) == 0 && len(spec.IndexedShape) == 0 {
 		return fmt.Errorf("parsing_exception: [geo_shape] requires [shape] or [indexed_shape]")
 	}
 	if strings.TrimSpace(spec.Relation) != "" {
@@ -2085,16 +2201,168 @@ func (gs *GeoShapeQuery) UnmarshalJSON(data []byte) error {
 	} else {
 		gs.Relation = "INTERSECTS"
 	}
-	gs.Shape = spec.Shape
+	gs.Shape = shapeMap
 	gs.IndexedShape = spec.IndexedShape
 	return nil
 }
 
+// ParseWKTGeoShape parses a WKT geometry string (`POINT`, `BBOX`/`ENVELOPE`, `LINESTRING`, `POLYGON`, `MULTIPOINT`, `MULTIPOLYGON`, `GEOMETRYCOLLECTION`) into a GeoJSON-like map.
+func ParseWKTGeoShape(wkt string) (map[string]any, error) {
+	s := strings.TrimSpace(wkt)
+	openIdx := strings.IndexByte(s, '(')
+	if openIdx <= 0 || !strings.HasSuffix(s, ")") {
+		return nil, fmt.Errorf("parsing_exception: [geo_shape] invalid WKT shape [%s]", wkt)
+	}
+	geomType := strings.ToUpper(strings.TrimSpace(s[:openIdx]))
+	inner := strings.TrimSpace(s[openIdx+1 : len(s)-1])
+	parseCoordPair := func(pairStr string) ([]any, error) {
+		fields := strings.Fields(strings.Trim(strings.TrimSpace(pairStr), "()"))
+		if len(fields) < 2 || len(fields) > 3 {
+			return nil, fmt.Errorf("parsing_exception: [geo_shape] invalid WKT coordinate pair [%s]", pairStr)
+		}
+		lon, err1 := strconv.ParseFloat(fields[0], 64)
+		lat, err2 := strconv.ParseFloat(fields[1], 64)
+		if err1 != nil || err2 != nil || math.IsNaN(lon) || math.IsNaN(lat) || math.IsInf(lon, 0) || math.IsInf(lat, 0) {
+			return nil, fmt.Errorf("parsing_exception: [geo_shape] invalid WKT coordinate numbers [%s]", pairStr)
+		}
+		return []any{lon, lat}, nil
+	}
+	parseCoordList := func(listStr string) ([]any, error) {
+		parts := strings.Split(listStr, ",")
+		out := make([]any, 0, len(parts))
+		for _, p := range parts {
+			pair, err := parseCoordPair(p)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, pair)
+		}
+		if len(out) == 0 {
+			return nil, fmt.Errorf("parsing_exception: [geo_shape] empty WKT coordinate list")
+		}
+		return out, nil
+	}
+	splitTopLevelGroups := func(str string) []string {
+		var groups []string
+		depth := 0
+		start := 0
+		for i := 0; i < len(str); i++ {
+			switch str[i] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+			case ',':
+				if depth == 0 {
+					groups = append(groups, strings.TrimSpace(str[start:i]))
+					start = i + 1
+				}
+			}
+		}
+		if last := strings.TrimSpace(str[start:]); last != "" {
+			groups = append(groups, last)
+		}
+		return groups
+	}
+	switch geomType {
+	case "POINT":
+		pt, err := parseCoordPair(inner)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"type": "point", "coordinates": pt}, nil
+	case "BBOX", "ENVELOPE":
+		parts := strings.Split(inner, ",")
+		if len(parts) != 4 {
+			return nil, fmt.Errorf("parsing_exception: [geo_shape] WKT %s requires 4 coordinates, got [%s]", geomType, wkt)
+		}
+		minLon, err1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+		maxLon, err2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+		maxLat, err3 := strconv.ParseFloat(strings.TrimSpace(parts[2]), 64)
+		minLat, err4 := strconv.ParseFloat(strings.TrimSpace(parts[3]), 64)
+		if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
+			return nil, fmt.Errorf("parsing_exception: [geo_shape] invalid WKT %s coordinates [%s]", geomType, wkt)
+		}
+		return map[string]any{
+			"type":        "envelope",
+			"coordinates": []any{[]any{minLon, maxLat}, []any{maxLon, minLat}},
+		}, nil
+	case "LINESTRING":
+		coords, err := parseCoordList(inner)
+		if err != nil || len(coords) < 2 {
+			return nil, fmt.Errorf("parsing_exception: [geo_shape] invalid WKT LINESTRING [%s]", wkt)
+		}
+		return map[string]any{"type": "linestring", "coordinates": coords}, nil
+	case "MULTIPOINT":
+		coords, err := parseCoordList(inner)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"type": "multipoint", "coordinates": coords}, nil
+	case "POLYGON":
+		ringStrs := splitTopLevelGroups(inner)
+		rings := make([]any, 0, len(ringStrs))
+		for _, rs := range ringStrs {
+			rsTrim := strings.TrimSpace(rs)
+			if !strings.HasPrefix(rsTrim, "(") || !strings.HasSuffix(rsTrim, ")") {
+				return nil, fmt.Errorf("parsing_exception: [geo_shape] invalid WKT POLYGON ring [%s]", rs)
+			}
+			ringCoords, err := parseCoordList(rsTrim[1 : len(rsTrim)-1])
+			if err != nil || len(ringCoords) < 3 {
+				return nil, fmt.Errorf("parsing_exception: [geo_shape] invalid WKT POLYGON coordinates [%s]", wkt)
+			}
+			rings = append(rings, ringCoords)
+		}
+		if len(rings) == 0 {
+			return nil, fmt.Errorf("parsing_exception: [geo_shape] empty WKT POLYGON [%s]", wkt)
+		}
+		return map[string]any{"type": "polygon", "coordinates": rings}, nil
+	case "MULTIPOLYGON":
+		polyStrs := splitTopLevelGroups(inner)
+		polys := make([]any, 0, len(polyStrs))
+		for _, ps := range polyStrs {
+			psTrim := strings.TrimSpace(ps)
+			if !strings.HasPrefix(psTrim, "(") || !strings.HasSuffix(psTrim, ")") {
+				return nil, fmt.Errorf("parsing_exception: [geo_shape] invalid WKT MULTIPOLYGON element [%s]", ps)
+			}
+			ringStrs := splitTopLevelGroups(psTrim[1 : len(psTrim)-1])
+			rings := make([]any, 0, len(ringStrs))
+			for _, rs := range ringStrs {
+				rsTrim := strings.TrimSpace(rs)
+				if !strings.HasPrefix(rsTrim, "(") || !strings.HasSuffix(rsTrim, ")") {
+					return nil, fmt.Errorf("parsing_exception: [geo_shape] invalid WKT MULTIPOLYGON ring [%s]", rs)
+				}
+				ringCoords, err := parseCoordList(rsTrim[1 : len(rsTrim)-1])
+				if err != nil || len(ringCoords) < 3 {
+					return nil, fmt.Errorf("parsing_exception: [geo_shape] invalid WKT MULTIPOLYGON coordinates [%s]", wkt)
+				}
+				rings = append(rings, ringCoords)
+			}
+			polys = append(polys, rings)
+		}
+		return map[string]any{"type": "multipolygon", "coordinates": polys}, nil
+	case "GEOMETRYCOLLECTION":
+		subStrs := splitTopLevelGroups(inner)
+		geoms := make([]any, 0, len(subStrs))
+		for _, sub := range subStrs {
+			g, err := ParseWKTGeoShape(sub)
+			if err != nil {
+				return nil, err
+			}
+			geoms = append(geoms, g)
+		}
+		return map[string]any{"type": "geometrycollection", "geometries": geoms}, nil
+	default:
+		return nil, fmt.Errorf("parsing_exception: [geo_shape] unsupported WKT shape type [%s]", geomType)
+	}
+}
+
 // WrapperQuery models an ES `wrapper` query (`{"wrapper": {"query": "eyJ..."}}`).
 type WrapperQuery struct {
-	Query string   `json:"query"`
-	Boost *float64 `json:"boost,omitempty"`
-	Name  string   `json:"_name,omitempty"`
+	Query   string   `json:"query"`
+	Decoded *Query   `json:"-"`
+	Boost   *float64 `json:"boost,omitempty"`
+	Name    string   `json:"_name,omitempty"`
 }
 
 func (wq *WrapperQuery) UnmarshalJSON(data []byte) error {
@@ -2121,15 +2389,24 @@ func (wq *WrapperQuery) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
-	if strings.TrimSpace(raw.Query) == "" {
+	qStr := strings.TrimSpace(raw.Query)
+	if qStr == "" {
 		return fmt.Errorf("parsing_exception: [wrapper] requires non-empty [query]")
 	}
-	if _, err := base64.StdEncoding.DecodeString(strings.TrimSpace(raw.Query)); err != nil {
-		if _, err2 := base64.RawStdEncoding.DecodeString(strings.TrimSpace(raw.Query)); err2 != nil {
+	decodedBytes, err := base64.StdEncoding.DecodeString(qStr)
+	if err != nil {
+		var err2 error
+		decodedBytes, err2 = base64.RawStdEncoding.DecodeString(qStr)
+		if err2 != nil {
 			return fmt.Errorf("parsing_exception: [wrapper] failed to base64 decode [query]: %w", err)
 		}
 	}
-	wq.Query = strings.TrimSpace(raw.Query)
+	var inner Query
+	if err := json.Unmarshal(decodedBytes, &inner); err != nil {
+		return fmt.Errorf("parsing_exception: wrapper query decoded payload is invalid query JSON: %w", err)
+	}
+	wq.Query = qStr
+	wq.Decoded = &inner
 	wq.Name = raw.Name
 	if len(raw.Boost) > 0 {
 		b, err := parseOptionalNonNegativeBoost(raw.Boost)
@@ -4298,6 +4575,7 @@ func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
 type MatchEntry struct {
 	Query               any     `json:"query"`
 	Operator            string  `json:"operator,omitempty"`
+	Analyzer            string  `json:"analyzer,omitempty"`
 	Boost               float64 `json:"boost,omitempty"`
 	ZeroTermsQuery      string  `json:"zero_terms_query,omitempty"`
 	MinimumShouldMatch  any     `json:"minimum_should_match,omitempty"`
@@ -4319,6 +4597,7 @@ func (m MatchEntry) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		Query               any      `json:"query"`
 		Operator            string   `json:"operator,omitempty"`
+		Analyzer            string   `json:"analyzer,omitempty"`
 		Boost               *float64 `json:"boost,omitempty"`
 		ZeroTermsQuery      string   `json:"zero_terms_query,omitempty"`
 		MinimumShouldMatch  any      `json:"minimum_should_match,omitempty"`
@@ -4331,6 +4610,7 @@ func (m MatchEntry) MarshalJSON() ([]byte, error) {
 	}{
 		Query:               m.Query,
 		Operator:            m.Operator,
+		Analyzer:            m.Analyzer,
 		Boost:               boostPtr,
 		ZeroTermsQuery:      m.ZeroTermsQuery,
 		MinimumShouldMatch:  m.MinimumShouldMatch,
@@ -4368,6 +4648,7 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 		var full struct {
 			Query               any             `json:"query"`
 			Operator            string          `json:"operator"`
+			Analyzer            string          `json:"analyzer"`
 			Boost               json.RawMessage `json:"boost"`
 			ZeroTermsQuery      string          `json:"zero_terms_query"`
 			MinimumShouldMatch  any             `json:"minimum_should_match"`
@@ -4376,7 +4657,7 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 			MaxExpansions       int             `json:"max_expansions"`
 			FuzzyTranspositions *bool           `json:"fuzzy_transpositions"`
 			FuzzyRewrite        string          `json:"fuzzy_rewrite"`
-			Lenient             *bool           `json:"lenient"`
+			Lenient             any             `json:"lenient"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
@@ -4385,6 +4666,7 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: [match] query does not support non-scalar or null value")
 		}
 		m.Query = full.Query
+		m.Analyzer = strings.TrimSpace(full.Analyzer)
 		if full.Operator != "" {
 			if err := validateQueryOperator(full.Operator, "match"); err != nil {
 				return err
@@ -4411,7 +4693,13 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 		m.MaxExpansions = full.MaxExpansions
 		m.FuzzyTranspositions = full.FuzzyTranspositions
 		m.FuzzyRewrite = full.FuzzyRewrite
-		m.Lenient = full.Lenient
+		if full.Lenient != nil {
+			ln, err := parseFlexibleBool(full.Lenient)
+			if err != nil {
+				return err
+			}
+			m.Lenient = &ln
+		}
 		return nil
 	}
 	if err := json.Unmarshal(trimmed, &m.Query); err != nil {
@@ -4427,6 +4715,7 @@ type PhraseEntry struct {
 	Query               string  `json:"query"`
 	Slop                int     `json:"slop,omitempty"`
 	Operator            string  `json:"operator,omitempty"`
+	Analyzer            string  `json:"analyzer,omitempty"`
 	MinimumShouldMatch  any     `json:"minimum_should_match,omitempty"`
 	ZeroTermsQuery      string  `json:"zero_terms_query,omitempty"`
 	Fuzziness           any     `json:"fuzziness,omitempty"`
@@ -4449,6 +4738,7 @@ func (p PhraseEntry) MarshalJSON() ([]byte, error) {
 		Query               string   `json:"query"`
 		Slop                int      `json:"slop,omitempty"`
 		Operator            string   `json:"operator,omitempty"`
+		Analyzer            string   `json:"analyzer,omitempty"`
 		MinimumShouldMatch  any      `json:"minimum_should_match,omitempty"`
 		ZeroTermsQuery      string   `json:"zero_terms_query,omitempty"`
 		Fuzziness           any      `json:"fuzziness,omitempty"`
@@ -4462,6 +4752,7 @@ func (p PhraseEntry) MarshalJSON() ([]byte, error) {
 		Query:               p.Query,
 		Slop:                p.Slop,
 		Operator:            p.Operator,
+		Analyzer:            p.Analyzer,
 		MinimumShouldMatch:  p.MinimumShouldMatch,
 		ZeroTermsQuery:      p.ZeroTermsQuery,
 		Fuzziness:           p.Fuzziness,
@@ -4499,6 +4790,7 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 			Query               any             `json:"query"`
 			Slop                int             `json:"slop"`
 			Operator            string          `json:"operator"`
+			Analyzer            string          `json:"analyzer"`
 			MinimumShouldMatch  any             `json:"minimum_should_match"`
 			ZeroTermsQuery      string          `json:"zero_terms_query"`
 			Fuzziness           any             `json:"fuzziness"`
@@ -4516,6 +4808,7 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: [match_phrase] query does not support non-scalar or null value")
 		}
 		p.Query = fmt.Sprintf("%v", full.Query)
+		p.Analyzer = strings.TrimSpace(full.Analyzer)
 		if full.Slop < 0 {
 			return fmt.Errorf("parsing_exception: [match_phrase] slop must be non-negative, got [%d]", full.Slop)
 		}
@@ -4581,6 +4874,7 @@ type MultiMatchQuery struct {
 	Fields             []string `json:"fields,omitempty"`
 	Type               string   `json:"type,omitempty"`
 	Operator           string   `json:"operator,omitempty"`
+	Analyzer           string   `json:"analyzer,omitempty"`
 	Slop               int      `json:"slop,omitempty"`
 	MinimumShouldMatch any      `json:"minimum_should_match,omitempty"`
 	TieBreaker         *float64 `json:"tie_breaker,omitempty"`

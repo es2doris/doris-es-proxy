@@ -1,0 +1,106 @@
+---
+"Stored scripts CRUD and Painless execute":
+  - do:
+      put_script:
+        id: "multiply_score"
+        body:
+          script:
+            lang: "painless"
+            source: "doc['val'].value * params.factor"
+  - match: { acknowledged: true }
+
+  - do:
+      get_script:
+        id: "multiply_score"
+  - match: { _id: "multiply_score" }
+  - match: { found: true }
+  - match: { script.lang: "painless" }
+  - match: { script.source: "doc['val'].value * params.factor" }
+
+  - do:
+      scripts_painless_execute:
+        body:
+          script:
+            id: "multiply_score"
+            params:
+              factor: 3
+          context: "score"
+          context_setup:
+            index: "test_exec"
+            document:
+              val: 7
+  - match: { result: 21.0 }
+
+  - do:
+      delete_script:
+        id: "multiply_score"
+  - match: { acknowledged: true }
+
+  - do:
+      catch: missing
+      get_script:
+        id: "multiply_score"
+
+---
+"Mustache search template render and execution":
+  - do:
+      put_script:
+        id: "tpl_by_status"
+        body:
+          script:
+            lang: "mustache"
+            source:
+              query:
+                term:
+                  status: "{{status}}"
+              size: "{{size}}{{^size}}10{{/size}}"
+  - match: { acknowledged: true }
+
+  - do:
+      render_search_template:
+        id: "tpl_by_status"
+        body:
+          params:
+            status: "published"
+  - match: { template_output.query.term.status: "published" }
+  - match: { template_output.size: "10" }
+
+  - do:
+      index:
+        index: "tpl_articles"
+        id: "1"
+        refresh: true
+        body:
+          title: "Doris ES Proxy"
+          status: "published"
+
+  - do:
+      index:
+        index: "tpl_articles"
+        id: "2"
+        refresh: true
+        body:
+          title: "Draft Post"
+          status: "draft"
+
+  - do:
+      search_template:
+        index: "tpl_articles"
+        body:
+          id: "tpl_by_status"
+          params:
+            status: "published"
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+
+  - do:
+      msearch_template:
+        index: "tpl_articles"
+        body:
+          - {}
+          - id: "tpl_by_status"
+            params:
+              status: "draft"
+  - length: { responses: 1 }
+  - match: { responses.0.hits.total.value: 1 }
+  - match: { responses.0.hits.hits.0._id: "2" }

@@ -189,6 +189,7 @@ type Server struct {
 	enrichPolicies        map[string]map[string]any
 	ilmPolicies           map[string]map[string]any
 	dataStreams           map[string]map[string]any
+	scripts               map[string]map[string]any
 }
 
 func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerOptions) *Server {
@@ -216,6 +217,7 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		enrichPolicies:        make(map[string]map[string]any),
 		ilmPolicies:           make(map[string]map[string]any),
 		dataStreams:           make(map[string]map[string]any),
+		scripts:               make(map[string]map[string]any),
 	}
 	s.coalescer = newStreamLoadCoalescer(func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
 		err := s.backend.StreamLoad(ctx, table, ndjson, syncRefresh)
@@ -468,7 +470,9 @@ func (s *Server) syncCatalogFromBackend(ctx context.Context) error {
 				_ = json.Unmarshal([]byte(e.PayloadJSON), &metaEnv)
 			}
 			var specPtr *esast.MappingSpec
-			if len(spec.Properties) > 0 || len(spec.Runtime) > 0 || spec.Dynamic != nil || spec.Subobjects != nil || spec.Routing != nil {
+			if len(spec.Properties) > 0 || len(spec.Runtime) > 0 || spec.Dynamic != nil || spec.Subobjects != nil || spec.Routing != nil ||
+				len(spec.DynamicTemplates) > 0 || spec.DateDetection != nil || spec.NumericDetection != nil || len(spec.DynamicDateFormats) > 0 ||
+				len(spec.Meta) > 0 || len(spec.Source) > 0 {
 				specPtr = &spec
 			}
 			s.indices[e.EntityKey] = schema.CompileIndexSchema(s.dorisDB, e.EntityKey, specPtr)
@@ -563,6 +567,18 @@ func (s *Server) syncCatalogFromBackend(ctx context.Context) error {
 					s.ilmPolicies = make(map[string]map[string]any)
 				}
 				s.ilmPolicies[e.EntityKey] = pol
+			}
+		case "script":
+			if isDeleted {
+				delete(s.scripts, e.EntityKey)
+				continue
+			}
+			var sc map[string]any
+			if err := json.Unmarshal([]byte(e.PayloadJSON), &sc); err == nil && len(sc) > 0 {
+				if s.scripts == nil {
+					s.scripts = make(map[string]map[string]any)
+				}
+				s.scripts[e.EntityKey] = sc
 			}
 		}
 	}
@@ -687,6 +703,24 @@ func (s *Server) persistIndex(ctx context.Context, indexName string, idxSchema *
 			}
 			if idxSchema.RawMapping.Routing != nil {
 				payloadMap["_routing"] = idxSchema.RawMapping.Routing
+			}
+			if len(idxSchema.RawMapping.DynamicTemplates) > 0 {
+				payloadMap["dynamic_templates"] = idxSchema.RawMapping.DynamicTemplates
+			}
+			if idxSchema.RawMapping.DateDetection != nil {
+				payloadMap["date_detection"] = idxSchema.RawMapping.DateDetection
+			}
+			if idxSchema.RawMapping.NumericDetection != nil {
+				payloadMap["numeric_detection"] = idxSchema.RawMapping.NumericDetection
+			}
+			if len(idxSchema.RawMapping.DynamicDateFormats) > 0 {
+				payloadMap["dynamic_date_formats"] = idxSchema.RawMapping.DynamicDateFormats
+			}
+			if len(idxSchema.RawMapping.Meta) > 0 {
+				payloadMap["_meta"] = idxSchema.RawMapping.Meta
+			}
+			if len(idxSchema.RawMapping.Source) > 0 {
+				payloadMap["_source"] = idxSchema.RawMapping.Source
 			}
 		}
 		if defPipe != "" {
@@ -823,6 +857,20 @@ func (s *Server) Handler() http.Handler {
 				s.handleIndexTemplate(w, r)
 			case "_data_stream":
 				s.handleDataStream(w, r)
+			case "_termvectors", "_termvector":
+				s.handleTermVectors(w, r)
+			case "_mtermvectors", "_mtermvector":
+				s.handleMTermVectors(w, r)
+			case "_rank_eval":
+				s.handleRankEval(w, r)
+			case "_tasks":
+				s.handleTasksList(w, r)
+			case "_recovery":
+				s.handleIndexRecovery(w, r)
+			case "_segments":
+				s.handleIndexSegments(w, r)
+			case "_shard_stores":
+				s.handleIndexShardStores(w, r)
 			case "metrics", "_prometheus":
 				s.handleMetrics(w, r)
 			case "healthz", "_healthz", "livez":
@@ -861,8 +909,30 @@ func (s *Server) Handler() http.Handler {
 				s.handleClusterState(w, r)
 			case segs[0] == "_cluster" && segs[1] == "stats":
 				s.handleClusterStats(w, r)
+			case segs[0] == "_cluster" && segs[1] == "allocation":
+				s.handleClusterAllocationExplain(w, r)
+			case segs[0] == "_cluster" && segs[1] == "pending_tasks":
+				s.handleClusterPendingTasks(w, r)
+			case segs[0] == "_cluster" && segs[1] == "reroute":
+				s.handleClusterReroute(w, r)
 			case segs[0] == "_nodes":
 				s.handleNodes(w, r)
+			case segs[0] == "_scripts":
+				r.SetPathValue("id", segs[1])
+				s.handleScriptsAPI(w, r)
+			case segs[0] == "_search" && segs[1] == "template":
+				s.handleSearchTemplate(w, r)
+			case segs[0] == "_render" && segs[1] == "template":
+				s.handleRenderSearchTemplate(w, r)
+			case segs[0] == "_msearch" && segs[1] == "template":
+				s.handleMSearchTemplate(w, r)
+			case segs[0] == "_tasks" && segs[1] == "_cancel":
+				s.handleTasksCancel(w, r)
+			case segs[0] == "_tasks":
+				r.SetPathValue("task_id", segs[1])
+				s.handleTasksGet(w, r)
+			case segs[0] == "_cache" && segs[1] == "clear":
+				s.handleCacheClear(w, r)
 			case segs[0] == "_ilm" && segs[1] == "policy":
 				s.handleILMPolicy(w, r)
 			case segs[0] == "_ilm" && segs[1] == "explain":
@@ -884,6 +954,30 @@ func (s *Server) Handler() http.Handler {
 				s.handleCatCount(w, r)
 			case segs[0] == "_cat" && segs[1] == "health":
 				s.handleCatHealth(w, r)
+			case segs[0] == "_cat" && segs[1] == "allocation":
+				s.handleCatAllocation(w, r)
+			case segs[0] == "_cat" && segs[1] == "fielddata":
+				s.handleCatFielddata(w, r)
+			case segs[0] == "_cat" && segs[1] == "master":
+				s.handleCatMaster(w, r)
+			case segs[0] == "_cat" && segs[1] == "nodeattrs":
+				s.handleCatNodeattrs(w, r)
+			case segs[0] == "_cat" && segs[1] == "pending_tasks":
+				s.handleCatPendingTasks(w, r)
+			case segs[0] == "_cat" && segs[1] == "plugins":
+				s.handleCatPlugins(w, r)
+			case segs[0] == "_cat" && segs[1] == "recovery":
+				s.handleCatRecovery(w, r)
+			case segs[0] == "_cat" && segs[1] == "repositories":
+				s.handleCatRepositories(w, r)
+			case segs[0] == "_cat" && segs[1] == "segments":
+				s.handleCatSegments(w, r)
+			case segs[0] == "_cat" && segs[1] == "tasks":
+				s.handleCatTasks(w, r)
+			case segs[0] == "_cat" && segs[1] == "thread_pool":
+				s.handleCatThreadPool(w, r)
+			case segs[0] == "_cat" && (segs[1] == "templates" || segs[1] == "index_templates"):
+				s.handleCatTemplates(w, r)
 			case segs[0] == "_search" && segs[1] == "scroll":
 				s.handleScroll(w, r)
 			case segs[0] == "_doris" && segs[1] == "explain":
@@ -957,6 +1051,22 @@ func (s *Server) Handler() http.Handler {
 				case "_rollover":
 					r.SetPathValue("alias", segs[0])
 					s.handleRollover(w, r)
+				case "_termvectors", "_termvector":
+					s.handleTermVectors(w, r)
+				case "_mtermvectors", "_mtermvector":
+					s.handleMTermVectors(w, r)
+				case "_rank_eval":
+					s.handleRankEval(w, r)
+				case "_recovery":
+					s.handleIndexRecovery(w, r)
+				case "_segments":
+					s.handleIndexSegments(w, r)
+				case "_shard_stores":
+					s.handleIndexShardStores(w, r)
+				case "_open":
+					s.handleIndexOpen(w, r)
+				case "_close":
+					s.handleIndexClose(w, r)
 				case "_doc":
 					if r.Method == http.MethodPost {
 						s.handlePutDoc(w, r)
@@ -982,8 +1092,47 @@ func (s *Server) Handler() http.Handler {
 				s.handleClusterState(w, r)
 				return
 			}
+			if segs[0] == "_cluster" && segs[1] == "allocation" && segs[2] == "explain" {
+				s.handleClusterAllocationExplain(w, r)
+				return
+			}
 			if segs[0] == "_nodes" {
 				s.handleNodes(w, r)
+				return
+			}
+			if segs[0] == "_scripts" {
+				if segs[1] == "painless" && segs[2] == "_execute" {
+					s.handlePainlessExecute(w, r)
+					return
+				}
+				r.SetPathValue("id", segs[1])
+				r.SetPathValue("context", segs[2])
+				s.handleScriptsAPI(w, r)
+				return
+			}
+			if segs[0] == "_render" && segs[1] == "template" {
+				r.SetPathValue("id", segs[2])
+				s.handleRenderSearchTemplate(w, r)
+				return
+			}
+			if segs[1] == "_search" && segs[2] == "template" {
+				r.SetPathValue("index", segs[0])
+				s.handleSearchTemplate(w, r)
+				return
+			}
+			if segs[1] == "_msearch" && segs[2] == "template" {
+				r.SetPathValue("index", segs[0])
+				s.handleMSearchTemplate(w, r)
+				return
+			}
+			if segs[0] == "_tasks" && segs[2] == "_cancel" {
+				r.SetPathValue("task_id", segs[1])
+				s.handleTasksCancel(w, r)
+				return
+			}
+			if segs[1] == "_cache" && segs[2] == "clear" {
+				r.SetPathValue("index", segs[0])
+				s.handleCacheClear(w, r)
 				return
 			}
 			if segs[0] == "_ilm" && segs[1] == "policy" {
@@ -1035,6 +1184,24 @@ func (s *Server) Handler() http.Handler {
 					return
 				case "shards":
 					s.handleCatShards(w, r)
+					return
+				case "allocation":
+					s.handleCatAllocation(w, r)
+					return
+				case "fielddata":
+					s.handleCatFielddata(w, r)
+					return
+				case "recovery":
+					s.handleCatRecovery(w, r)
+					return
+				case "segments":
+					s.handleCatSegments(w, r)
+					return
+				case "thread_pool":
+					s.handleCatThreadPool(w, r)
+					return
+				case "templates", "index_templates":
+					s.handleCatTemplates(w, r)
 					return
 				}
 			}
@@ -1131,6 +1298,8 @@ func (s *Server) Handler() http.Handler {
 				}
 			case "_explain":
 				s.handleExplainDoc(w, r)
+			case "_termvectors", "_termvector":
+				s.handleTermVectors(w, r)
 			case "_clone", "_shrink", "_split":
 				if r.Method == http.MethodPost || r.Method == http.MethodPut {
 					r.SetPathValue("target", segs[2])
@@ -1172,6 +1341,24 @@ func (s *Server) Handler() http.Handler {
 				r.SetPathValue("index", segs[0])
 				r.SetPathValue("id", segs[2])
 				s.handleExplainDoc(w, r)
+				return
+			}
+			if segs[1] == "_doc" && (segs[3] == "_termvectors" || segs[3] == "_termvector") {
+				r.SetPathValue("index", segs[0])
+				r.SetPathValue("id", segs[2])
+				s.handleTermVectors(w, r)
+				return
+			}
+			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+
+		case 6:
+			if segs[1] == "_mvt" {
+				r.SetPathValue("index", segs[0])
+				r.SetPathValue("field", segs[2])
+				r.SetPathValue("zoom", segs[3])
+				r.SetPathValue("x", segs[4])
+				r.SetPathValue("y", segs[5])
+				s.handleMVT(w, r)
 				return
 			}
 			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
@@ -1464,7 +1651,18 @@ func (s *Server) handleIndexSettings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-func (s *Server) handleNodes(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
+	if r != nil {
+		p := strings.Trim(r.URL.Path, "/")
+		if strings.HasSuffix(p, "/hot_threads") {
+			s.handleNodesHotThreads(w, r)
+			return
+		}
+		if strings.HasSuffix(p, "/usage") || strings.Contains(p, "/usage/") {
+			s.handleNodesUsage(w, r)
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
 		"cluster_name": "apache-doris-search-cluster",
@@ -5145,6 +5343,7 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 			updReq.DetectNoop = &b
 		}
 	}
+	s.resolvePainlessScriptSpecFromRaw(&updReq.Script, bodyBytes)
 	if updReq.Doc == nil && (updReq.Script == nil || strings.TrimSpace(updReq.Script.Source) == "") {
 		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: script or doc is missing;")
 		return
@@ -5480,8 +5679,9 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 }
 
 type sliceSpec struct {
-	ID  *int `json:"id,omitempty"`
-	Max *int `json:"max,omitempty"`
+	Field string `json:"field,omitempty"`
+	ID    *int   `json:"id,omitempty"`
+	Max   *int   `json:"max,omitempty"`
 }
 
 func parseAndValidateSliceParams(r *http.Request, bodySlices any, bodySlice *sliceSpec) (int, int, bool, int, string, string) {
@@ -5528,13 +5728,24 @@ func parseAndValidateSliceParams(r *http.Request, bodySlices any, bodySlice *sli
 	return 0, 0, false, 0, "", ""
 }
 
-func docMatchesSlice(docID string, sliceID, sliceMax int) bool {
+func docMatchesSlice(docID string, sliceField string, docSource json.RawMessage, sliceID, sliceMax int) bool {
 	if sliceMax <= 1 {
 		return sliceID == 0
 	}
+	hashKey := docID
+	if sf := strings.TrimSpace(sliceField); sf != "" && sf != "_id" && len(docSource) > 0 {
+		var docMap map[string]any
+		dec := json.NewDecoder(bytes.NewReader(docSource))
+		dec.UseNumber()
+		if dec.Decode(&docMap) == nil && docMap != nil {
+			if v, ok := getIngestPath(docMap, sf); ok && v != nil {
+				hashKey = fmt.Sprintf("%v", v)
+			}
+		}
+	}
 	var h uint32 = 2166136261
-	for i := 0; i < len(docID); i++ {
-		h ^= uint32(docID[i])
+	for i := 0; i < len(hashKey); i++ {
+		h ^= uint32(hashKey[i])
 		h *= 16777619
 	}
 	return int64(h)%int64(sliceMax) == int64(sliceID)
@@ -5577,11 +5788,16 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
 			return
 		}
+		s.resolvePainlessScriptSpecFromRaw(&body.Script, bodyBytes)
 	}
 	sliceID, sliceMax, hasSlice, sliceErrStatus, sliceErrType, sliceErrReason := parseAndValidateSliceParams(r, body.Slices, body.Slice)
 	if sliceErrStatus != 0 {
 		writeESError(w, sliceErrStatus, sliceErrType, sliceErrReason)
 		return
+	}
+	var sliceField string
+	if body.Slice != nil {
+		sliceField = body.Slice.Field
 	}
 	if body.Query == nil && r.URL.Query().Get("q") != "" {
 		tmpReq := esast.SearchRequest{}
@@ -5642,8 +5858,16 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 	versionConflicts := 0
 	batches := 0
 	conflictsProceed := strings.EqualFold(effConflicts, "proceed")
-	if body.Query != nil && hasTermsLookupInQuery(body.Query) {
-		s.resolveTermsLookupsInQuery(r.Context(), body.Query)
+	if body.Query != nil {
+		s.resolveStoredScriptsInQuery(body.Query)
+		if hasTermsLookupInQuery(body.Query) {
+			s.resolveTermsLookupsInQuery(r.Context(), body.Query)
+		}
+		if hasSpecialLookupInQuery(body.Query) {
+			if rq, err := s.preResolveSpecialQueriesInQuery(r.Context(), targets, body.Query); err == nil {
+				body.Query = rq
+			}
+		}
 	}
 	aliasFilters = s.resolveTermsLookupsInAliasFilters(r.Context(), aliasFilters)
 
@@ -5718,7 +5942,7 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 				if maxDocs > 0 && totalMatched >= maxDocs {
 					break
 				}
-				if hasSlice && !docMatchesSlice(h.ID, sliceID, sliceMax) {
+				if hasSlice && !docMatchesSlice(h.ID, sliceField, h.Source, sliceID, sliceMax) {
 					continue
 				}
 				if effSearchRouting != "" && !s.docMatchesRequestRouting(indexName, h.ID, effSearchRouting) {
@@ -6062,6 +6286,10 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, sliceErrStatus, sliceErrType, sliceErrReason)
 		return
 	}
+	var sliceField string
+	if body.Slice != nil {
+		sliceField = body.Slice.Field
+	}
 	if body.Query == nil && r.URL.Query().Get("q") != "" {
 		tmpReq := esast.SearchRequest{}
 		applyURISearchParams(r, &tmpReq)
@@ -6116,8 +6344,16 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 
 	totalDeleted := 0
 	batches := 0
-	if body.Query != nil && hasTermsLookupInQuery(body.Query) {
-		s.resolveTermsLookupsInQuery(r.Context(), body.Query)
+	if body.Query != nil {
+		s.resolveStoredScriptsInQuery(body.Query)
+		if hasTermsLookupInQuery(body.Query) {
+			s.resolveTermsLookupsInQuery(r.Context(), body.Query)
+		}
+		if hasSpecialLookupInQuery(body.Query) {
+			if rq, err := s.preResolveSpecialQueriesInQuery(r.Context(), targets, body.Query); err == nil {
+				body.Query = rq
+			}
+		}
 	}
 	aliasFilters = s.resolveTermsLookupsInAliasFilters(r.Context(), aliasFilters)
 	for _, indexName := range targets {
@@ -6178,7 +6414,7 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 				if maxDocs > 0 && totalDeleted >= maxDocs {
 					break
 				}
-				if hasSlice && !docMatchesSlice(h.ID, sliceID, sliceMax) {
+				if hasSlice && !docMatchesSlice(h.ID, sliceField, h.Source, sliceID, sliceMax) {
 					continue
 				}
 				if effSearchRouting != "" && !s.docMatchesRequestRouting(indexName, h.ID, effSearchRouting) {
@@ -6331,6 +6567,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			}
 			if nextID != "" {
 				op.ID = nextID
+				op.AutoGeneratedID = false
 			}
 			pipedOps[idx] = true
 			pipeRoutings[idx] = nextRouting
@@ -6717,6 +6954,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			if op.DetectNoop != nil && upd.DetectNoop == nil {
 				upd.DetectNoop = op.DetectNoop
 			}
+			s.resolvePainlessScriptSpecFromRaw(&upd.Script, op.Source)
 			if upd.Doc == nil && (upd.Script == nil || strings.TrimSpace(upd.Script.Source) == "") {
 				hasErrors = true
 				items = append(items, map[string]any{
@@ -7468,8 +7706,14 @@ func (s *Server) buildDorisExplainObject(ctx context.Context, rawIndexPattern st
 	if len(targets) == 0 && !hasExclusionOrWildcard(rawIndexPattern) {
 		targets = []string{s.resolveIndexName(rawIndexPattern)}
 	}
-	if req != nil && hasTermsLookupInSearchRequest(req) {
-		req = s.resolveTermsLookupsInSearchRequest(ctx, req)
+	if req != nil {
+		s.resolveStoredScriptsInSearchRequest(req)
+		if hasTermsLookupInSearchRequest(req) {
+			req = s.resolveTermsLookupsInSearchRequest(ctx, req)
+		}
+		if hasSpecialLookupInSearchRequest(req) {
+			_ = s.preResolveSpecialQueriesInSearchRequest(ctx, targets, req)
+		}
 	}
 	aliasFilters = s.resolveTermsLookupsInAliasFilters(ctx, aliasFilters)
 	var plans []map[string]any
@@ -7905,14 +8149,26 @@ func (s *Server) executeSearchRequest(
 	}
 
 	if req != nil {
+		if req.Slice != nil {
+			if req.Slice.ID < 0 || req.Slice.Max <= 1 || req.Slice.ID >= req.Slice.Max {
+				return nil, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("invalid slice: id [%d] must be >= 0 and < max [%d] (with max > 1)", req.Slice.ID, req.Slice.Max)
+			}
+		}
 		if len(req.SearchAfter) > 0 && len(req.Sort) > 0 && len(req.SearchAfter) < len(req.Sort) {
 			return nil, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("search_after has %d value(s) but sort has %d field(s)", len(req.SearchAfter), len(req.Sort))
 		}
 		if errMsg := validatePipelineAggs(req.EffectiveAggs()); errMsg != "" {
 			return nil, http.StatusBadRequest, "illegal_argument_exception", errMsg
 		}
+		s.resolveStoredScriptsInSearchRequest(req)
 		if hasTermsLookupInSearchRequest(req) {
 			req = s.resolveTermsLookupsInSearchRequest(ctx, req)
+		}
+		if hasSpecialLookupInSearchRequest(req) {
+			if err := s.preResolveSpecialQueriesInSearchRequest(ctx, targets, req); err != nil {
+				return nil, http.StatusBadRequest, "search_phase_execution_exception", err.Error()
+			}
 		}
 	}
 	aliasFilters = s.resolveTermsLookupsInAliasFilters(ctx, aliasFilters)
@@ -7978,7 +8234,7 @@ func (s *Server) executeSearchRequest(
 			}
 		}
 	}
-	needsRuntimeScriptEval := reqHasRuntimeMappings || queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasRuntimeScript(req.PostFilter) || sortsHaveScript(req.Sort) || aggsHaveRuntimeScript(req.EffectiveAggs()) || queryHasMinScore(req.Query) || aliasFiltersHaveMinScore(aliasFilters) || (req.MinScore != nil && (queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasNestedScoring(req.Query) || len(req.IndicesBoost) > 0)) || (queryHasNestedScoring(req.Query) && (req.Collapse != nil || len(req.SearchAfter) > 0))
+	needsRuntimeScriptEval := req.Slice != nil || reqHasRuntimeMappings || queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasRuntimeScript(req.PostFilter) || sortsHaveScript(req.Sort) || aggsHaveRuntimeScript(req.EffectiveAggs()) || queryHasMinScore(req.Query) || aliasFiltersHaveMinScore(aliasFilters) || (req.MinScore != nil && (queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasNestedScoring(req.Query) || len(req.IndicesBoost) > 0)) || (queryHasNestedScoring(req.Query) && (req.Collapse != nil || len(req.SearchAfter) > 0))
 
 	var allHits []HitRow
 	var allFetchedHits []HitRow
@@ -8219,7 +8475,7 @@ func (s *Server) executeSearchRequest(
 			hits, aggRows, idxTotal, matchedQueryHits, postFilteredHits = applyRuntimeSearchScriptsWithMatchedAndGlobal(hits, globalHits, aggRows, idxTotal, evalReq, idxSchema, len(targets) > 1)
 			allFetchedHits = append(allFetchedHits, matchedQueryHits...)
 			allPostFilterHits = append(allPostFilterHits, postFilteredHits...)
-			hasQueryLevelFilter := queryHasRuntimeScript(req.Query) || queryHasRuntimeScript(aliasFilters[indexName]) || req.MinScore != nil || queryHasMinScore(req.Query) || queryHasMinScore(aliasFilters[indexName])
+			hasQueryLevelFilter := req.Slice != nil || queryHasRuntimeScript(req.Query) || queryHasRuntimeScript(aliasFilters[indexName]) || req.MinScore != nil || queryHasMinScore(req.Query) || queryHasMinScore(aliasFilters[indexName])
 			if hasQueryLevelFilter && !hasRuntimeMappings && plan.AggsSQL != "" && len(req.EffectiveAggs()) > 0 {
 				matchedIDs := make([]string, 0, len(matchedQueryHits))
 				for _, mh := range matchedQueryHits {
@@ -8952,6 +9208,18 @@ func hasTermsLookupInQuery(q *esast.Query) bool {
 			}
 		}
 	}
+	if q.Wrapper != nil && q.Wrapper.Decoded != nil && hasTermsLookupInQuery(q.Wrapper.Decoded) {
+		return true
+	}
+	if q.Pinned != nil && q.Pinned.Organic != nil && hasTermsLookupInQuery(q.Pinned.Organic) {
+		return true
+	}
+	if q.HasChild != nil && hasTermsLookupInQuery(&q.HasChild.Query) {
+		return true
+	}
+	if q.HasParent != nil && hasTermsLookupInQuery(&q.HasParent.Query) {
+		return true
+	}
 	return false
 }
 
@@ -9228,6 +9496,18 @@ func (s *Server) resolveTermsLookupsInQuery(ctx context.Context, q *esast.Query)
 		for i := range q.KNN.Filter {
 			s.resolveTermsLookupsInQuery(ctx, &q.KNN.Filter[i])
 		}
+	}
+	if q.Wrapper != nil && q.Wrapper.Decoded != nil {
+		s.resolveTermsLookupsInQuery(ctx, q.Wrapper.Decoded)
+	}
+	if q.Pinned != nil && q.Pinned.Organic != nil {
+		s.resolveTermsLookupsInQuery(ctx, q.Pinned.Organic)
+	}
+	if q.HasChild != nil {
+		s.resolveTermsLookupsInQuery(ctx, &q.HasChild.Query)
+	}
+	if q.HasParent != nil {
+		s.resolveTermsLookupsInQuery(ctx, &q.HasParent.Query)
 	}
 }
 
@@ -10892,6 +11172,25 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 				}
 				hitMap["inner_hits"] = ihMap
 			}
+			if queryHasNamedClauses(req.Query) {
+				if matchedNames := collectMatchedQueryNames(hitSchema, getDoc(), req.Query); len(matchedNames) > 0 {
+					hitMap["matched_queries"] = matchedNames
+				}
+			}
+			if queryHasPercolateMultiDocs(req.Query) {
+				if slots := collectPercolateMatchedSlots(hitSchema, getDoc(), req.Query); len(slots) > 0 {
+					fm, _ := hitMap["fields"].(map[string][]any)
+					if fm == nil {
+						fm = make(map[string][]any, 1)
+					}
+					slotAny := make([]any, len(slots))
+					for i, sl := range slots {
+						slotAny[i] = sl
+					}
+					fm["_percolator_document_slot"] = slotAny
+					hitMap["fields"] = fm
+				}
+			}
 		}
 		esHits = append(esHits, hitMap)
 	}
@@ -11028,6 +11327,12 @@ func collectMatchingNestedQueriesWithInnerHits(idxSchema *schema.IndexSchema, ge
 	}
 	if q.ScriptScore != nil && q.ScriptScore.Query != nil {
 		collectMatchingNestedQueriesWithInnerHits(idxSchema, getDoc, q.ScriptScore.Query, out)
+	}
+	if q.Wrapper != nil && q.Wrapper.Decoded != nil {
+		collectMatchingNestedQueriesWithInnerHits(idxSchema, getDoc, q.Wrapper.Decoded, out)
+	}
+	if q.Pinned != nil && q.Pinned.Organic != nil {
+		collectMatchingNestedQueriesWithInnerHits(idxSchema, getDoc, q.Pinned.Organic, out)
 	}
 }
 
@@ -12702,6 +13007,13 @@ func buildAggsMapWithSchema(
 				}
 			}
 			isIPRange := spec.IPRange != nil
+			if isDateRange && rngSpec.Format == "" && idxSchema != nil && rngSpec.Field != "" {
+				if b := idxSchema.ResolveField(rngSpec.Field); b.Format != "" {
+					cpRng := *rngSpec
+					cpRng.Format = strings.TrimSpace(strings.Split(b.Format, "||")[0])
+					rngSpec = &cpRng
+				}
+			}
 			nowUTC := time.Now().UTC()
 			byKey := make(map[string]int64, len(rows))
 			for _, r := range rows {
@@ -17126,6 +17438,13 @@ func attachSubAggsToBucketWithSchema(
 				}
 			}
 			isIPRange := subSpec.IPRange != nil
+			if isDateRange && rngSpec.Format == "" && idxSchema != nil && rngSpec.Field != "" {
+				if b := idxSchema.ResolveField(rngSpec.Field); b.Format != "" {
+					cpRng := *rngSpec
+					cpRng.Format = strings.TrimSpace(strings.Split(b.Format, "||")[0])
+					rngSpec = &cpRng
+				}
+			}
 			nowUTC := time.Now().UTC()
 			byKey := make(map[string]int64)
 			for _, r := range subRows {
@@ -19129,6 +19448,94 @@ func collectTermsFromQueryForFields(q *esast.Query, allowed map[string]bool, out
 	if q.ConstantScore != nil {
 		collectTermsFromQueryForFields(&q.ConstantScore.Filter, allowed, out)
 	}
+	if q.Wrapper != nil && q.Wrapper.Decoded != nil {
+		collectTermsFromQueryForFields(q.Wrapper.Decoded, allowed, out)
+	}
+	if q.Pinned != nil && q.Pinned.Organic != nil {
+		collectTermsFromQueryForFields(q.Pinned.Organic, allowed, out)
+	}
+	for field, st := range q.SpanTerm {
+		if fieldMatchesAllowedHighlightSet(field, allowed) {
+			if s := strings.TrimSpace(fmt.Sprintf("%v", st.Value)); s != "" {
+				*out = append(*out, s)
+			}
+		}
+	}
+	if q.SpanMulti != nil && q.SpanMulti.Match != nil {
+		collectTermsFromQueryForFields(q.SpanMulti.Match, allowed, out)
+	}
+	if q.SpanNear != nil {
+		for i := range q.SpanNear.Clauses {
+			collectTermsFromQueryForFields(&q.SpanNear.Clauses[i], allowed, out)
+		}
+	}
+	if q.SpanOr != nil {
+		for i := range q.SpanOr.Clauses {
+			collectTermsFromQueryForFields(&q.SpanOr.Clauses[i], allowed, out)
+		}
+	}
+	if q.SpanNot != nil && q.SpanNot.Include != nil {
+		collectTermsFromQueryForFields(q.SpanNot.Include, allowed, out)
+	}
+	if q.SpanFirst != nil && q.SpanFirst.Match != nil {
+		collectTermsFromQueryForFields(q.SpanFirst.Match, allowed, out)
+	}
+	if q.SpanContaining != nil {
+		if q.SpanContaining.Big != nil {
+			collectTermsFromQueryForFields(q.SpanContaining.Big, allowed, out)
+		}
+		if q.SpanContaining.Little != nil {
+			collectTermsFromQueryForFields(q.SpanContaining.Little, allowed, out)
+		}
+	}
+	if q.SpanWithin != nil {
+		if q.SpanWithin.Big != nil {
+			collectTermsFromQueryForFields(q.SpanWithin.Big, allowed, out)
+		}
+		if q.SpanWithin.Little != nil {
+			collectTermsFromQueryForFields(q.SpanWithin.Little, allowed, out)
+		}
+	}
+	if q.FieldMaskingSpan != nil && q.FieldMaskingSpan.Query != nil {
+		if q.FieldMaskingSpan.Field == "" || fieldMatchesAllowedHighlightSet(q.FieldMaskingSpan.Field, allowed) {
+			collectTermsFromQueryForFields(q.FieldMaskingSpan.Query, nil, out)
+		} else {
+			collectTermsFromQueryForFields(q.FieldMaskingSpan.Query, allowed, out)
+		}
+	}
+	for field, rule := range q.Intervals {
+		if fieldMatchesAllowedHighlightSet(field, allowed) {
+			collectTermsFromIntervalsRule(&rule, out)
+		}
+	}
+}
+
+func collectTermsFromIntervalsRule(rule *esast.IntervalsRule, out *[]string) {
+	if rule == nil {
+		return
+	}
+	if rule.Match != nil && rule.Match.Query != "" {
+		*out = append(*out, strings.Fields(rule.Match.Query)...)
+	}
+	if rule.Prefix != nil && rule.Prefix.Prefix != "" {
+		*out = append(*out, rule.Prefix.Prefix+"*")
+	}
+	if rule.Wildcard != nil && strings.Trim(rule.Wildcard.Pattern, "*?") != "" {
+		*out = append(*out, rule.Wildcard.Pattern)
+	}
+	if rule.Fuzzy != nil && rule.Fuzzy.Term != "" {
+		*out = append(*out, rule.Fuzzy.Term)
+	}
+	if rule.AllOf != nil {
+		for i := range rule.AllOf.Intervals {
+			collectTermsFromIntervalsRule(&rule.AllOf.Intervals[i], out)
+		}
+	}
+	if rule.AnyOf != nil {
+		for i := range rule.AnyOf.Intervals {
+			collectTermsFromIntervalsRule(&rule.AnyOf.Intervals[i], out)
+		}
+	}
 }
 
 func extractLuceneScopedTermsForHighlight(raw string, defaultMatched bool, allowed map[string]bool, out *[]string) {
@@ -20294,7 +20701,7 @@ func (s *Server) docMatchesAliasFilterWithSchema(ctx context.Context, indexName 
 	}
 	origFields := idxSchema.Fields
 	if idxSchema.RawMapping == nil || idxSchema.RawMapping.Dynamic == nil || idxSchema.RawMapping.Dynamic == true || idxSchema.RawMapping.Dynamic == "true" {
-		inferred := schema.InferMappingFromSampleDocs([]json.RawMessage{rawSource})
+		inferred := schema.InferMappingFromSampleDocs([]json.RawMessage{rawSource}, idxSchema.RawMapping)
 		if inferred != nil && len(inferred.Properties) > 0 {
 			merged := schema.MergeMappingSpecs(inferred, idxSchema.RawMapping)
 			idxSchema = schema.CompileIndexSchema(s.dorisDB, indexName, merged)
@@ -20476,7 +20883,7 @@ func (s *Server) ensureWritableIndexSchemaWithDocs(ctx context.Context, indexNam
 
 	effectiveMappings := tplMappings
 	if len(sampleDocs) > 0 && (tplMappings == nil || tplMappings.Dynamic == nil || tplMappings.Dynamic == true || tplMappings.Dynamic == "true") {
-		inferred := schema.InferMappingFromSampleDocs(sampleDocs)
+		inferred := schema.InferMappingFromSampleDocs(sampleDocs, tplMappings)
 		effectiveMappings = schema.MergeMappingSpecs(inferred, tplMappings)
 	}
 
@@ -20822,7 +21229,19 @@ func queryHasRuntimeScript(q *esast.Query) bool {
 	if q == nil {
 		return false
 	}
-	if q.Script != nil || q.ScriptScore != nil {
+	if q.Script != nil || q.ScriptScore != nil || q.ParentID != nil || q.MoreLikeThis != nil || q.Percolate != nil {
+		return true
+	}
+	if q.Wrapper != nil && q.Wrapper.Decoded != nil && queryHasRuntimeScript(q.Wrapper.Decoded) {
+		return true
+	}
+	if q.Pinned != nil && q.Pinned.Organic != nil && queryHasRuntimeScript(q.Pinned.Organic) {
+		return true
+	}
+	if q.HasChild != nil && queryHasRuntimeScript(&q.HasChild.Query) {
+		return true
+	}
+	if q.HasParent != nil && queryHasRuntimeScript(&q.HasParent.Query) {
 		return true
 	}
 	if q.FunctionScore != nil {
@@ -21120,6 +21539,12 @@ func queryHasMinScore(q *esast.Query) bool {
 	if q.Nested != nil && queryHasMinScore(&q.Nested.Query) {
 		return true
 	}
+	if q.Wrapper != nil && q.Wrapper.Decoded != nil && queryHasMinScore(q.Wrapper.Decoded) {
+		return true
+	}
+	if q.Pinned != nil && q.Pinned.Organic != nil && queryHasMinScore(q.Pinned.Organic) {
+		return true
+	}
 	return false
 }
 
@@ -21372,6 +21797,12 @@ func collectNestedPathsFromQuery(q *esast.Query, out map[string]bool) {
 	if q.ScriptScore != nil && q.ScriptScore.Query != nil {
 		collectNestedPathsFromQuery(q.ScriptScore.Query, out)
 	}
+	if q.Wrapper != nil && q.Wrapper.Decoded != nil {
+		collectNestedPathsFromQuery(q.Wrapper.Decoded, out)
+	}
+	if q.Pinned != nil && q.Pinned.Organic != nil {
+		collectNestedPathsFromQuery(q.Pinned.Organic, out)
+	}
 }
 
 func resetNestedScalarMultiValued(props map[string]esast.FieldProperty, elems []nestedElemCandidate) map[string]esast.FieldProperty {
@@ -21447,7 +21878,6 @@ func resolveRuntimeEvalSchema(idxSchema *schema.IndexSchema, doc map[string]any,
 		}
 	}
 	if effSchema == nil || effSchema.RawMapping == nil || effSchema.RawMapping.Dynamic == nil || effSchema.RawMapping.Dynamic == true || effSchema.RawMapping.Dynamic == "true" || missingNestedRoot {
-		inferred := schema.InferMappingFromSampleDocs([]json.RawMessage{rawSource})
 		var baseMapping *esast.MappingSpec
 		dbName, idxName := "default", "eval_idx"
 		if effSchema != nil {
@@ -21455,6 +21885,7 @@ func resolveRuntimeEvalSchema(idxSchema *schema.IndexSchema, doc map[string]any,
 			dbName = effSchema.DorisDB
 			idxName = effSchema.IndexName
 		}
+		inferred := schema.InferMappingFromSampleDocs([]json.RawMessage{rawSource}, baseMapping)
 		merged := schema.MergeMappingSpecs(inferred, baseMapping)
 		if len(nestedPaths) > 0 {
 			if merged == nil {
@@ -21765,6 +22196,23 @@ func evalQueryScriptFilterOnDocWithScore(idxSchema *schema.IndexSchema, doc map[
 		}
 		return true
 	}
+	if q.ParentID != nil {
+		return evalParentIDOnDoc(idxSchema, doc, q.ParentID)
+	}
+	if q.MoreLikeThis != nil {
+		ok, _ := evalMoreLikeThisOnDoc(idxSchema, doc, q.MoreLikeThis)
+		return ok
+	}
+	if q.Percolate != nil {
+		ok, _, _ := evalPercolateQueryOnDoc(idxSchema, doc, q.Percolate)
+		return ok
+	}
+	if q.Wrapper != nil && q.Wrapper.Decoded != nil {
+		return evalQueryScriptFilterOnDocWithScore(idxSchema, doc, q.Wrapper.Decoded, baseScore)
+	}
+	if q.Pinned != nil && q.Pinned.Organic != nil {
+		return evalQueryScriptFilterOnDocWithScore(idxSchema, doc, q.Pinned.Organic, baseScore)
+	}
 	return true
 }
 
@@ -21900,7 +22348,10 @@ func queryHasNestedScoring(q *esast.Query) bool {
 	if q == nil {
 		return false
 	}
-	if q.Nested != nil {
+	if q.Nested != nil || q.Pinned != nil {
+		return true
+	}
+	if q.Wrapper != nil && q.Wrapper.Decoded != nil && queryHasNestedScoring(q.Wrapper.Decoded) {
 		return true
 	}
 	if q.Bool != nil {
@@ -22004,6 +22455,45 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 			return *q.ConstantScore.Boost
 		}
 		return 1.0
+	}
+	if q.Wrapper != nil && q.Wrapper.Decoded != nil {
+		return evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q.Wrapper.Decoded, baseScore)
+	}
+	if q.Pinned != nil {
+		if !evalBranchMatchesDoc(idxSchema, doc, q.Pinned.Organic) {
+			return 0.0
+		}
+		ids := q.Pinned.EffectiveIDs()
+		docID, _ := doc["__meta_id"].(string)
+		if docID == "" {
+			docID, _ = doc["_id"].(string)
+		}
+		for idx, pid := range ids {
+			if pid == docID {
+				return 1.0e6 + float64(len(ids)-idx)
+			}
+		}
+		if q.Pinned.Organic != nil {
+			if queryHasRuntimeScript(q.Pinned.Organic) || queryHasNestedScoring(q.Pinned.Organic) || q.Pinned.Organic.FunctionScore != nil {
+				return evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q.Pinned.Organic, baseScore)
+			}
+			return scoreNonScriptClauseOnDoc(idxSchema, doc, q.Pinned.Organic)
+		}
+		return baseScore
+	}
+	if q.MoreLikeThis != nil {
+		ok, sc := evalMoreLikeThisOnDoc(idxSchema, doc, q.MoreLikeThis)
+		if !ok {
+			return 0.0
+		}
+		return sc
+	}
+	if q.Percolate != nil {
+		ok, sc, _ := evalPercolateQueryOnDoc(idxSchema, doc, q.Percolate)
+		if !ok {
+			return 0.0
+		}
+		return sc
 	}
 	if q.Script != nil {
 		if !evalQueryScriptFilterOnDocWithSchema(idxSchema, doc, q) {
@@ -24845,6 +25335,13 @@ func filterDocsMatchingRangeEntry(
 		}
 	}
 	if isDateField {
+		if rngSpec.Format == "" && idxSchema != nil && rngSpec.Field != "" {
+			if b := idxSchema.ResolveField(rngSpec.Field); b.Format != "" {
+				cpRng := *rngSpec
+				cpRng.Format = strings.TrimSpace(strings.Split(b.Format, "||")[0])
+				rngSpec = &cpRng
+			}
+		}
 		fromMs, hasFrom := parseRuntimeDateRangeBoundMillis(rng.From, rngSpec, nowUTC)
 		toMs, hasTo := parseRuntimeDateRangeBoundMillis(rng.To, rngSpec, nowUTC)
 		for _, md := range docs {
@@ -26114,6 +26611,9 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 		if req.Query != nil && req.Query.ScriptScore != nil && req.Query.ScriptScore.MinScore != nil && h.Score < *req.Query.ScriptScore.MinScore {
 			continue
 		}
+		if req.Slice != nil && !docMatchesSlice(h.ID, req.Slice.Field, h.EffectiveSource(), req.Slice.ID, req.Slice.Max) {
+			continue
+		}
 		filteredQueryHits = append(filteredQueryHits, h)
 		if req.PostFilter != nil {
 			if hasPostScript || hasRuntimeMappings {
@@ -26154,7 +26654,7 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 		}
 	}
 
-	if hasQueryScript || hasAliasScript || hasMinScore || hasRuntimeMappings {
+	if hasQueryScript || hasAliasScript || hasMinScore || hasRuntimeMappings || req.Slice != nil {
 		idxTotal = int64(len(filteredQueryHits))
 	}
 	prePostQueryTotal := idxTotal

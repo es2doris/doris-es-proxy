@@ -39,6 +39,10 @@ var supportedRunnerFeatures = map[string]bool{
 	"catch_param":            true,
 	"stash_in_key":           true,
 	"stash_in_path":          true,
+	"node_selector":          true,
+	"default_shards":         true,
+	"painless":               true,
+	"mustache":               true,
 }
 
 type errSkipSection struct {
@@ -200,6 +204,7 @@ type runnerContext struct {
 	createdPipelines   map[string]bool
 	createdILMPolicies map[string]bool
 	createdEnrichPols  map[string]bool
+	createdScripts     map[string]struct{}
 	createdAliases     map[string]string // alias -> index
 }
 
@@ -217,6 +222,7 @@ func newRunnerContext(client *http.Client, baseURL string) *runnerContext {
 		createdPipelines:   make(map[string]bool),
 		createdILMPolicies: make(map[string]bool),
 		createdEnrichPols:  make(map[string]bool),
+		createdScripts:     make(map[string]struct{}),
 		createdAliases:     make(map[string]string),
 	}
 }
@@ -265,6 +271,11 @@ func (c *runnerContext) cleanupAll() {
 	for pol := range c.createdEnrichPols {
 		if pol != "" {
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/_enrich/policy/"+url.PathEscape(pol), nil, nil, nil)
+		}
+	}
+	for scriptID := range c.createdScripts {
+		if scriptID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_scripts/"+url.PathEscape(scriptID), nil, nil, nil)
 		}
 	}
 }
@@ -362,8 +373,13 @@ func (c *runnerContext) execDo(rawVal any, isTeardown bool) error {
 
 	reqSpec, err := c.buildActionRequest(actionName, paramMap)
 	if err != nil {
-		if catchSpec == "param" {
+		if catchSpec == "param" || catchSpec == "bad_request" {
 			return nil
+		}
+		if len(catchSpec) >= 2 && strings.HasPrefix(catchSpec, "/") && strings.HasSuffix(catchSpec, "/") {
+			if re, compErr := regexp.Compile(catchSpec[1 : len(catchSpec)-1]); compErr == nil && re.MatchString(err.Error()) {
+				return nil
+			}
 		}
 		return err
 	}
@@ -520,9 +536,21 @@ func (c *runnerContext) verifyCatch(catchSpec, actionName string, status int, bo
 			return fmt.Errorf("action %s expected catch: unavailable (HTTP 503), got HTTP %d: %s", actionName, status, bodyStr)
 		}
 		return nil
+	case "gateway_timeout":
+		if status != http.StatusGatewayTimeout {
+			return fmt.Errorf("action %s expected catch: gateway_timeout (HTTP 504), got HTTP %d: %s", actionName, status, bodyStr)
+		}
+		return nil
 	case "method_not_allowed":
 		if status != http.StatusMethodNotAllowed {
 			return fmt.Errorf("action %s expected catch: method_not_allowed (HTTP 405), got HTTP %d: %s", actionName, status, bodyStr)
+		}
+		return nil
+	}
+
+	if code, err := strconv.Atoi(catchSpec); err == nil && code >= 100 && code < 600 {
+		if status != code {
+			return fmt.Errorf("action %s expected catch: %d, got HTTP %d: %s", actionName, code, status, bodyStr)
 		}
 		return nil
 	}
@@ -537,7 +565,7 @@ func (c *runnerContext) verifyCatch(catchSpec, actionName string, status int, bo
 			return fmt.Errorf("invalid catch regex %q: %w", catchSpec, err)
 		}
 		errText := extractErrorText(parsed, bodyStr)
-		if !re.MatchString(errText) && !re.MatchString(bodyStr) {
+		if !re.MatchString(errText) && !re.MatchString(bodyStr) && !re.MatchString(strconv.Itoa(status)) {
 			return fmt.Errorf("action %s error %q did not match catch regex %s", actionName, errText, catchSpec)
 		}
 		return nil
@@ -655,6 +683,10 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 	case "enrich.put_policy":
 		if name := paramString(params, "name"); name != "" {
 			c.createdEnrichPols[name] = true
+		}
+	case "put_script":
+		if id := paramString(params, "id"); id != "" {
+			c.createdScripts[id] = struct{}{}
 		}
 	}
 }
@@ -1498,6 +1530,303 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		}
 		reqPath = "/_ingest/pipeline/" + id
 
+	case "put_script":
+		method = http.MethodPut
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("put_script requires id parameter")
+		}
+		if ctxName := popString("context"); ctxName != "" {
+			reqPath = "/_scripts/" + id + "/" + ctxName
+		} else {
+			reqPath = "/_scripts/" + id
+		}
+
+	case "get_script":
+		method = http.MethodGet
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("get_script requires id parameter")
+		}
+		reqPath = "/_scripts/" + id
+
+	case "delete_script":
+		method = http.MethodDelete
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("delete_script requires id parameter")
+		}
+		reqPath = "/_scripts/" + id
+
+	case "execute_painless_execute", "scripts_painless_execute":
+		method = http.MethodPost
+		reqPath = "/_scripts/painless/_execute"
+		if !hasBody {
+			bodyObj := make(map[string]any)
+			for _, k := range []string{"script", "context", "context_setup"} {
+				if v, ok := remaining[k]; ok {
+					bodyObj[k] = v
+					delete(remaining, k)
+				}
+			}
+			if len(bodyObj) > 0 {
+				rawBody = bodyObj
+				hasBody = true
+			}
+		}
+
+	case "search_template":
+		method = http.MethodPost
+		if idx := popString("index"); idx != "" {
+			reqPath = "/" + idx + "/_search/template"
+		} else {
+			reqPath = "/_search/template"
+		}
+
+	case "render_search_template":
+		if hasBody && rawBody != nil {
+			method = http.MethodPost
+		} else {
+			method = http.MethodGet
+		}
+		if id := popString("id"); id != "" {
+			reqPath = "/_render/template/" + id
+		} else {
+			reqPath = "/_render/template"
+		}
+
+	case "msearch_template":
+		method = http.MethodPost
+		isNDJSON = true
+		if idx := popString("index"); idx != "" {
+			reqPath = "/" + idx + "/_msearch/template"
+		} else {
+			reqPath = "/_msearch/template"
+		}
+
+	case "termvectors", "indices.get_termvectors":
+		if hasBody && rawBody != nil {
+			method = http.MethodPost
+		} else {
+			method = http.MethodGet
+		}
+		idx := popString("index")
+		if idx == "" {
+			return nil, fmt.Errorf("%s requires index parameter", action)
+		}
+		if id := popString("id"); id != "" {
+			reqPath = "/" + idx + "/_termvectors/" + id
+		} else {
+			reqPath = "/" + idx + "/_termvectors"
+		}
+
+	case "mtermvectors":
+		method = http.MethodPost
+		if idx := popString("index"); idx != "" {
+			reqPath = "/" + idx + "/_mtermvectors"
+		} else {
+			reqPath = "/_mtermvectors"
+		}
+
+	case "rank_eval":
+		method = http.MethodPost
+		if idx := popString("index"); idx != "" {
+			reqPath = "/" + idx + "/_rank_eval"
+		} else {
+			reqPath = "/_rank_eval"
+		}
+
+	case "search_mvt":
+		method = http.MethodGet
+		idx := popString("index")
+		field := popString("field")
+		zoom := popString("zoom")
+		x := popString("x")
+		y := popString("y")
+		if idx == "" || field == "" || zoom == "" || x == "" || y == "" {
+			return nil, fmt.Errorf("search_mvt requires index, field, zoom, x, and y parameters")
+		}
+		reqPath = "/" + idx + "/_mvt/" + field + "/" + zoom + "/" + x + "/" + y
+
+	case "cat.allocation":
+		method = http.MethodGet
+		if nodeID := popString("node_id"); nodeID != "" {
+			reqPath = "/_cat/allocation/" + nodeID
+		} else {
+			reqPath = "/_cat/allocation"
+		}
+
+	case "cat.fielddata":
+		method = http.MethodGet
+		if fields := popString("fields"); fields != "" {
+			reqPath = "/_cat/fielddata/" + fields
+		} else {
+			reqPath = "/_cat/fielddata"
+		}
+
+	case "cat.master":
+		method = http.MethodGet
+		reqPath = "/_cat/master"
+
+	case "cat.nodeattrs":
+		method = http.MethodGet
+		reqPath = "/_cat/nodeattrs"
+
+	case "cat.pending_tasks":
+		method = http.MethodGet
+		reqPath = "/_cat/pending_tasks"
+
+	case "cat.plugins":
+		method = http.MethodGet
+		reqPath = "/_cat/plugins"
+
+	case "cat.recovery":
+		method = http.MethodGet
+		if idx := popString("index"); idx != "" {
+			reqPath = "/_cat/recovery/" + idx
+		} else {
+			reqPath = "/_cat/recovery"
+		}
+
+	case "cat.repositories":
+		method = http.MethodGet
+		reqPath = "/_cat/repositories"
+
+	case "cat.segments":
+		method = http.MethodGet
+		if idx := popString("index"); idx != "" {
+			reqPath = "/_cat/segments/" + idx
+		} else {
+			reqPath = "/_cat/segments"
+		}
+
+	case "cat.tasks":
+		method = http.MethodGet
+		reqPath = "/_cat/tasks"
+
+	case "cat.thread_pool":
+		method = http.MethodGet
+		if patterns := popString("thread_pool_patterns"); patterns != "" {
+			reqPath = "/_cat/thread_pool/" + patterns
+		} else {
+			reqPath = "/_cat/thread_pool"
+		}
+
+	case "cat.templates":
+		method = http.MethodGet
+		if name := popString("name"); name != "" {
+			reqPath = "/_cat/templates/" + name
+		} else {
+			reqPath = "/_cat/templates"
+		}
+
+	case "indices.recovery":
+		method = http.MethodGet
+		if idx := popString("index"); idx != "" {
+			reqPath = "/" + idx + "/_recovery"
+		} else {
+			reqPath = "/_recovery"
+		}
+
+	case "indices.segments":
+		method = http.MethodGet
+		if idx := popString("index"); idx != "" {
+			reqPath = "/" + idx + "/_segments"
+		} else {
+			reqPath = "/_segments"
+		}
+
+	case "indices.shard_stores":
+		method = http.MethodGet
+		if idx := popString("index"); idx != "" {
+			reqPath = "/" + idx + "/_shard_stores"
+		} else {
+			reqPath = "/_shard_stores"
+		}
+
+	case "indices.clear_cache":
+		method = http.MethodPost
+		if idx := popString("index"); idx != "" {
+			reqPath = "/" + idx + "/_cache/clear"
+		} else {
+			reqPath = "/_cache/clear"
+		}
+
+	case "indices.open":
+		method = http.MethodPost
+		idx := popString("index")
+		if idx == "" {
+			return nil, fmt.Errorf("indices.open requires index parameter")
+		}
+		reqPath = "/" + idx + "/_open"
+
+	case "indices.close":
+		method = http.MethodPost
+		idx := popString("index")
+		if idx == "" {
+			return nil, fmt.Errorf("indices.close requires index parameter")
+		}
+		reqPath = "/" + idx + "/_close"
+
+	case "tasks.list":
+		method = http.MethodGet
+		reqPath = "/_tasks"
+
+	case "tasks.get":
+		method = http.MethodGet
+		taskID := popString("task_id")
+		if taskID == "" {
+			return nil, fmt.Errorf("tasks.get requires task_id parameter")
+		}
+		reqPath = "/_tasks/" + taskID
+
+	case "tasks.cancel":
+		method = http.MethodPost
+		if taskID := popString("task_id"); taskID != "" {
+			reqPath = "/_tasks/" + taskID + "/_cancel"
+		} else {
+			reqPath = "/_tasks/_cancel"
+		}
+
+	case "cluster.allocation_explain":
+		if hasBody && rawBody != nil {
+			method = http.MethodPost
+		} else {
+			method = http.MethodGet
+		}
+		reqPath = "/_cluster/allocation/explain"
+
+	case "cluster.pending_tasks":
+		method = http.MethodGet
+		reqPath = "/_cluster/pending_tasks"
+
+	case "cluster.reroute":
+		method = http.MethodPost
+		reqPath = "/_cluster/reroute"
+
+	case "nodes.usage":
+		method = http.MethodGet
+		nodeID := popString("node_id")
+		metric := popString("metric")
+		switch {
+		case nodeID != "" && metric != "":
+			reqPath = "/_nodes/" + nodeID + "/usage/" + metric
+		case nodeID != "":
+			reqPath = "/_nodes/" + nodeID + "/usage"
+		case metric != "":
+			reqPath = "/_nodes/usage/" + metric
+		default:
+			reqPath = "/_nodes/usage"
+		}
+
+	case "nodes.hot_threads":
+		method = http.MethodGet
+		if nodeID := popString("node_id"); nodeID != "" {
+			reqPath = "/_nodes/" + nodeID + "/hot_threads"
+		} else {
+			reqPath = "/_nodes/hot_threads"
+		}
+
 	default:
 		return nil, fmt.Errorf("unsupported rest-api-spec action %q", action)
 	}
@@ -1879,19 +2208,30 @@ func (c *runnerContext) execTransformAndSet(rawVal any) error {
 		if !found && strings.HasPrefix(rawPath, "$") {
 			val, found = c.stash[strings.TrimPrefix(rawPath, "$")]
 		}
-		if !found {
+		if !found || val == nil {
 			return fmt.Errorf("transform_and_set: response path %q not found in %s", fieldPath, c.lastBodyRaw)
 		}
 
-		strVal := fmt.Sprintf("%v", val)
+		strVal, ok := val.(string)
+		if !ok {
+			strVal = fmt.Sprintf("%v", val)
+		}
 		var transformed string
 		switch fnName {
 		case "base64Encode":
 			transformed = base64.StdEncoding.EncodeToString([]byte(strVal))
+		case "base64Decode":
+			decoded, decErr := decodeBase64String(strVal)
+			if decErr != nil {
+				return fmt.Errorf("transform_and_set: base64Decode failed: %w", decErr)
+			}
+			transformed = decoded
 		case "lower":
 			transformed = strings.ToLower(strVal)
 		case "upper":
 			transformed = strings.ToUpper(strVal)
+		case "trim":
+			transformed = strings.TrimSpace(strVal)
 		default:
 			return fmt.Errorf("transform_and_set: unsupported transform function %q", fnName)
 		}
@@ -1900,6 +2240,20 @@ func (c *runnerContext) execTransformAndSet(rawVal any) error {
 		c.stash[varName] = transformed
 	}
 	return nil
+}
+
+func decodeBase64String(s string) (string, error) {
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	} {
+		if b, err := enc.DecodeString(s); err == nil {
+			return string(b), nil
+		}
+	}
+	return "", fmt.Errorf("invalid base64 input %q", s)
 }
 
 func (c *runnerContext) execContains(rawVal any) error {

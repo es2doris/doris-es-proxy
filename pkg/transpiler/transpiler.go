@@ -830,6 +830,16 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 				return arrPred, arrPred, false
 			}
 			col := t.sqlColumnRef(field, true, nctx)
+			if b.ESType == "flattened" {
+				if isRoot, isSubKey := t.flattenedFieldMode(field, b); isSubKey {
+					rawVar := t.flattenedRawVariantRef(field, b, nctx)
+					arrPred := fmt.Sprintf("(%s REGEXP %s OR array_exists(_x -> _x REGEXP %s, CAST(%s AS ARRAY<STRING>)))", col, quoteStr(pat), quoteStr(pat), rawVar)
+					return arrPred, arrPred, false
+				} else if isRoot {
+					safePred := fmt.Sprintf("(%s IS NOT NULL AND %s REGEXP %s)", col, col, quoteStr(pat))
+					return fmt.Sprintf("%s REGEXP %s", col, quoteStr(pat)), safePred, false
+				}
+			}
 			if nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued {
 				arrPred := fmt.Sprintf("array_exists(_x -> _x REGEXP %s, CAST(%s AS ARRAY<STRING>))", quoteStr(pat), col)
 				return arrPred, arrPred, false
@@ -913,11 +923,24 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 			if me.Query != nil {
 				qStr = strings.TrimSpace(fmt.Sprintf("%v", me.Query))
 			}
-			if qStr == "" && strings.EqualFold(me.ZeroTermsQuery, "all") {
+			effKey0, b := t.resolveFieldInNestedCtx(cleanKey0, false, nctx)
+			effAnalyzer := me.Analyzer
+			if effAnalyzer == "" {
+				effAnalyzer = b.Analyzer
+			}
+			filteredTokens, allStopwords := filterStopwordTokens(qStr, effAnalyzer, me.ZeroTermsQuery)
+			if (qStr == "" || allStopwords) && strings.EqualFold(me.ZeroTermsQuery, "all") {
 				return CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: fmt.Sprintf("%.4f", effBoost)}
 			}
+			if allStopwords {
+				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+			}
+			queryForMatch := me.Query
+			if len(filteredTokens) > 0 && len(filteredTokens) < len(strings.Fields(qStr)) {
+				qStr = strings.Join(filteredTokens, " ")
+				queryForMatch = qStr
+			}
 			if me.MinimumShouldMatch != nil && !strings.ContainsAny(cleanKey0, "*?") {
-				effKey0, b := t.resolveFieldInNestedCtx(cleanKey0, false, nctx)
 				tokens := strings.Fields(qStr)
 				if isExactKeywordField(effKey0, b) && qStr != "" {
 					tokens = []string{qStr}
@@ -936,6 +959,7 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 									Fuzziness:           me.Fuzziness,
 									PrefixLength:        me.PrefixLength,
 									FuzzyTranspositions: me.FuzzyTranspositions,
+									Lenient:             me.Lenient,
 									Boost:               1.0,
 								},
 							},
@@ -950,9 +974,9 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 				}
 			}
 			if me.Fuzziness != nil {
-				return t.compileFuzzyFieldWithOpts(keys[0], me.Query, me.Operator, me.Fuzziness, false, me.PrefixLength, me.FuzzyTranspositions, me.Boost, scoring, nctx)
+				return t.compileFuzzyFieldWithOpts(keys[0], queryForMatch, me.Operator, me.Fuzziness, false, me.PrefixLength, me.FuzzyTranspositions, me.Boost, scoring, nctx)
 			}
-			return t.compileMatchField(keys[0], me.Query, me.Operator, me.Boost, scoring, nctx)
+			return t.compileMatchField(keys[0], queryForMatch, me.Operator, me.Boost, scoring, nctx)
 		}
 		var subs []esast.Query
 		for _, k := range keys {
@@ -963,9 +987,18 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		keys := sortedMapKeys(q.MatchPhrase)
 		if len(keys) == 1 {
 			pe := q.MatchPhrase[keys[0]]
-			_, fBoost := parseFieldBoost(keys[0], 1.0)
-			if strings.TrimSpace(pe.Query) == "" && strings.EqualFold(pe.ZeroTermsQuery, "all") {
+			cleanKey0, fBoost := parseFieldBoost(keys[0], 1.0)
+			_, b := t.resolveFieldInNestedCtx(cleanKey0, false, nctx)
+			effAnalyzer := pe.Analyzer
+			if effAnalyzer == "" {
+				effAnalyzer = b.Analyzer
+			}
+			_, allStopwords := filterStopwordTokens(pe.Query, effAnalyzer, pe.ZeroTermsQuery)
+			if (strings.TrimSpace(pe.Query) == "" || allStopwords) && strings.EqualFold(pe.ZeroTermsQuery, "all") {
 				return CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: fmt.Sprintf("%.4f", pe.Boost*fBoost)}
+			}
+			if allStopwords {
+				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 			}
 			return t.compileMatchPhraseField(keys[0], pe.Query, pe.Slop, pe.Boost, false, scoring, nctx)
 		}
@@ -978,9 +1011,18 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		keys := sortedMapKeys(q.MatchPhrasePrefix)
 		if len(keys) == 1 {
 			pe := q.MatchPhrasePrefix[keys[0]]
-			_, fBoost := parseFieldBoost(keys[0], 1.0)
-			if strings.TrimSpace(pe.Query) == "" && strings.EqualFold(pe.ZeroTermsQuery, "all") {
+			cleanKey0, fBoost := parseFieldBoost(keys[0], 1.0)
+			_, b := t.resolveFieldInNestedCtx(cleanKey0, false, nctx)
+			effAnalyzer := pe.Analyzer
+			if effAnalyzer == "" {
+				effAnalyzer = b.Analyzer
+			}
+			_, allStopwords := filterStopwordTokens(pe.Query, effAnalyzer, pe.ZeroTermsQuery)
+			if (strings.TrimSpace(pe.Query) == "" || allStopwords) && strings.EqualFold(pe.ZeroTermsQuery, "all") {
 				return CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: fmt.Sprintf("%.4f", pe.Boost*fBoost)}
+			}
+			if allStopwords {
+				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 			}
 			return t.compileMatchPhraseField(keys[0], pe.Query, pe.Slop, pe.Boost, true, scoring, nctx)
 		}
@@ -995,10 +1037,18 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 			pe := q.MatchBoolPrefix[keys[0]]
 			cleanKey0, fBoost := parseFieldBoost(keys[0], 1.0)
 			effBoost := pe.Boost * fBoost
-			if strings.TrimSpace(pe.Query) == "" && strings.EqualFold(pe.ZeroTermsQuery, "all") {
+			effKey0, b := t.resolveFieldInNestedCtx(cleanKey0, false, nctx)
+			effAnalyzer := pe.Analyzer
+			if effAnalyzer == "" {
+				effAnalyzer = b.Analyzer
+			}
+			_, allStopwords := filterStopwordTokens(pe.Query, effAnalyzer, pe.ZeroTermsQuery)
+			if (strings.TrimSpace(pe.Query) == "" || allStopwords) && strings.EqualFold(pe.ZeroTermsQuery, "all") {
 				return CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: fmt.Sprintf("%.4f", effBoost)}
 			}
-			effKey0, b := t.resolveFieldInNestedCtx(cleanKey0, false, nctx)
+			if allStopwords {
+				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+			}
 			qStr := strings.TrimSpace(pe.Query)
 			tokens := strings.Fields(qStr)
 			if isExactKeywordField(effKey0, b) && qStr != "" && pe.Fuzziness == nil {
@@ -1244,8 +1294,8 @@ func (t *Transpiler) extractGeoPointExprs(resolvedField string, b schema.FieldBi
 		_, _ = fmt.Fprintf(&pathBuilder, "[%s]", quoteStr(seg))
 	}
 	docRef := fmt.Sprintf("`_doc`%s", pathBuilder.String())
-	latExpr = fmt.Sprintf("COALESCE(CAST(%s['lat'] AS DOUBLE), CAST(SPLIT_PART(CAST(%s AS STRING), ',', 1) AS DOUBLE), CAST(element_at(CAST(%s AS ARRAY<DOUBLE>), 2) AS DOUBLE))", docRef, docRef, docRef)
-	lonExpr = fmt.Sprintf("COALESCE(CAST(%s['lon'] AS DOUBLE), CAST(SPLIT_PART(CAST(%s AS STRING), ',', 2) AS DOUBLE), CAST(element_at(CAST(%s AS ARRAY<DOUBLE>), 1) AS DOUBLE))", docRef, docRef, docRef)
+	latExpr = fmt.Sprintf("COALESCE(CAST(%s['lat'] AS DOUBLE), CAST(SPLIT_PART(CAST(%s AS STRING), ',', 1) AS DOUBLE), CAST(element_at(CAST(%s AS ARRAY<DOUBLE>), 2) AS DOUBLE), CAST(element_at(CAST(%s['coordinates'] AS ARRAY<DOUBLE>), 2) AS DOUBLE))", docRef, docRef, docRef, docRef)
+	lonExpr = fmt.Sprintf("COALESCE(CAST(%s['lon'] AS DOUBLE), CAST(SPLIT_PART(CAST(%s AS STRING), ',', 2) AS DOUBLE), CAST(element_at(CAST(%s AS ARRAY<DOUBLE>), 1) AS DOUBLE), CAST(element_at(CAST(%s['coordinates'] AS ARRAY<DOUBLE>), 1) AS DOUBLE))", docRef, docRef, docRef, docRef)
 	notNullCond = fmt.Sprintf("%s IS NOT NULL AND %s IS NOT NULL", latExpr, lonExpr)
 	return latExpr, lonExpr, notNullCond
 }
@@ -1476,6 +1526,50 @@ func queryContainsScript(q *esast.Query) bool {
 	if q.Nested != nil && queryContainsScript(&q.Nested.Query) {
 		return true
 	}
+	if q.Wrapper != nil && q.Wrapper.Decoded != nil && queryContainsScript(q.Wrapper.Decoded) {
+		return true
+	}
+	if q.Pinned != nil && queryContainsScript(q.Pinned.Organic) {
+		return true
+	}
+	if q.HasChild != nil && queryContainsScript(&q.HasChild.Query) {
+		return true
+	}
+	if q.HasParent != nil && queryContainsScript(&q.HasParent.Query) {
+		return true
+	}
+	if q.SpanNear != nil {
+		for i := range q.SpanNear.Clauses {
+			if queryContainsScript(&q.SpanNear.Clauses[i]) {
+				return true
+			}
+		}
+	}
+	if q.SpanOr != nil {
+		for i := range q.SpanOr.Clauses {
+			if queryContainsScript(&q.SpanOr.Clauses[i]) {
+				return true
+			}
+		}
+	}
+	if q.SpanNot != nil && (queryContainsScript(q.SpanNot.Include) || queryContainsScript(q.SpanNot.Exclude)) {
+		return true
+	}
+	if q.SpanFirst != nil && queryContainsScript(q.SpanFirst.Match) {
+		return true
+	}
+	if q.SpanMulti != nil && queryContainsScript(q.SpanMulti.Match) {
+		return true
+	}
+	if q.SpanContaining != nil && (queryContainsScript(q.SpanContaining.Big) || queryContainsScript(q.SpanContaining.Little)) {
+		return true
+	}
+	if q.SpanWithin != nil && (queryContainsScript(q.SpanWithin.Big) || queryContainsScript(q.SpanWithin.Little)) {
+		return true
+	}
+	if q.FieldMaskingSpan != nil && queryContainsScript(q.FieldMaskingSpan.Query) {
+		return true
+	}
 	if q.DisMax != nil {
 		for i := range q.DisMax.Queries {
 			if queryContainsScript(&q.DisMax.Queries[i]) {
@@ -1520,10 +1614,57 @@ func queryContainsNestedScoring(q *esast.Query) bool {
 	if q.Nested != nil && !strings.EqualFold(q.Nested.ScoreMode, "none") {
 		return true
 	}
+	if q.ConstantScore != nil && queryContainsNestedScoring(&q.ConstantScore.Filter) {
+		return true
+	}
 	if q.FunctionScore != nil && queryContainsNestedScoring(q.FunctionScore.Query) {
 		return true
 	}
 	if q.ScriptScore != nil && queryContainsNestedScoring(q.ScriptScore.Query) {
+		return true
+	}
+	if q.Wrapper != nil && q.Wrapper.Decoded != nil && queryContainsNestedScoring(q.Wrapper.Decoded) {
+		return true
+	}
+	if q.Pinned != nil && queryContainsNestedScoring(q.Pinned.Organic) {
+		return true
+	}
+	if q.HasChild != nil && queryContainsNestedScoring(&q.HasChild.Query) {
+		return true
+	}
+	if q.HasParent != nil && queryContainsNestedScoring(&q.HasParent.Query) {
+		return true
+	}
+	if q.SpanNear != nil {
+		for i := range q.SpanNear.Clauses {
+			if queryContainsNestedScoring(&q.SpanNear.Clauses[i]) {
+				return true
+			}
+		}
+	}
+	if q.SpanOr != nil {
+		for i := range q.SpanOr.Clauses {
+			if queryContainsNestedScoring(&q.SpanOr.Clauses[i]) {
+				return true
+			}
+		}
+	}
+	if q.SpanNot != nil && (queryContainsNestedScoring(q.SpanNot.Include) || queryContainsNestedScoring(q.SpanNot.Exclude)) {
+		return true
+	}
+	if q.SpanFirst != nil && queryContainsNestedScoring(q.SpanFirst.Match) {
+		return true
+	}
+	if q.SpanMulti != nil && queryContainsNestedScoring(q.SpanMulti.Match) {
+		return true
+	}
+	if q.SpanContaining != nil && (queryContainsNestedScoring(q.SpanContaining.Big) || queryContainsNestedScoring(q.SpanContaining.Little)) {
+		return true
+	}
+	if q.SpanWithin != nil && (queryContainsNestedScoring(q.SpanWithin.Big) || queryContainsNestedScoring(q.SpanWithin.Little)) {
+		return true
+	}
+	if q.FieldMaskingSpan != nil && queryContainsNestedScoring(q.FieldMaskingSpan.Query) {
 		return true
 	}
 	if q.DisMax != nil {
@@ -1541,6 +1682,11 @@ func queryContainsNestedScoring(q *esast.Query) bool {
 	if q.Bool != nil {
 		for i := range q.Bool.Must {
 			if queryContainsNestedScoring(&q.Bool.Must[i]) {
+				return true
+			}
+		}
+		for i := range q.Bool.Filter {
+			if queryContainsNestedScoring(&q.Bool.Filter[i]) {
 				return true
 			}
 		}
@@ -1634,7 +1780,7 @@ func (t *Transpiler) compileBool(b *esast.BoolQuery, scoring bool, nctx *nestedC
 	if len(conjuncts) > 0 && len(b.MustNot) == 0 {
 		allFalse := true
 		for _, cj := range conjuncts {
-			if cj != "FALSE" && cj != "(FALSE)" {
+			if cj != "FALSE" && cj != "(FALSE)" && cj != "((FALSE))" {
 				allFalse = false
 				break
 			}
@@ -1680,13 +1826,13 @@ func (t *Transpiler) compileBool(b *esast.BoolQuery, scoring bool, nctx *nestedC
 }
 
 func effectiveDorisScalarType(b schema.FieldBinding) schema.DorisScalarType {
-	if b.DorisType != schema.DorisString && b.DorisType != schema.DorisVarchar {
+	if b.DorisType != schema.DorisString && b.DorisType != schema.DorisVarchar && b.DorisType != schema.DorisVariant {
 		return b.DorisType
 	}
 	switch b.ESType {
 	case "date", "date_nanos", "long", "unsigned_long":
 		return schema.DorisBigInt
-	case "integer", "short", "byte":
+	case "integer", "short", "byte", "token_count":
 		return schema.DorisInt
 	case "double", "float", "half_float", "scaled_float":
 		return schema.DorisDouble
@@ -2133,6 +2279,46 @@ func (t *Transpiler) compileFuzzyFieldWithOpts(
 	return t.compileBool(&esast.BoolQuery{Should: subQueries, MinimumShouldMatch: 1, Boost: &bBoost}, scoring, nctx)
 }
 
+var defaultEnglishStopwords = map[string]bool{
+	"a": true, "an": true, "and": true, "are": true, "as": true, "at": true,
+	"be": true, "but": true, "by": true, "for": true, "if": true, "in": true,
+	"into": true, "is": true, "it": true, "no": true, "not": true, "of": true,
+	"on": true, "or": true, "such": true, "that": true, "the": true, "their": true,
+	"then": true, "there": true, "these": true, "they": true, "this": true,
+	"to": true, "was": true, "will": true, "with": true,
+}
+
+func filterStopwordTokens(qStr string, analyzer string, zeroTermsQuery string) (remaining []string, allFilteredOut bool) {
+	trimmed := strings.TrimSpace(qStr)
+	if trimmed == "" {
+		return nil, false
+	}
+	rawTokens := strings.Fields(trimmed)
+	if len(rawTokens) == 0 {
+		return nil, false
+	}
+	lowerAnalyzer := strings.ToLower(strings.TrimSpace(analyzer))
+	shouldFilter := lowerAnalyzer == "stop" || lowerAnalyzer == "english" || strings.EqualFold(zeroTermsQuery, "all")
+	if !shouldFilter {
+		return rawTokens, false
+	}
+	var kept []string
+	for _, tok := range rawTokens {
+		cleanTok := strings.ToLower(strings.Trim(tok, ".,!?;:\"'()[]{}"))
+		if cleanTok == "" || defaultEnglishStopwords[cleanTok] {
+			continue
+		}
+		kept = append(kept, tok)
+	}
+	if len(kept) == 0 {
+		return nil, true
+	}
+	if lowerAnalyzer == "stop" || lowerAnalyzer == "english" {
+		return kept, false
+	}
+	return rawTokens, false
+}
+
 func (t *Transpiler) compileMatchField(
 	field string,
 	queryVal any,
@@ -2196,6 +2382,36 @@ func (t *Transpiler) compileMatchField(
 		}
 		_, _, isCIDR := parseCIDRBounds(qStr)
 		if !isCIDR && net.ParseIP(qStr) == nil {
+			if tokens := strings.Fields(qStr); len(tokens) > 1 {
+				var preds []string
+				isAnd := strings.EqualFold(operator, "and")
+				for _, tok := range tokens {
+					tp := t.compileMatchField(field, tok, operator, boost, false, nctx).WhereSQL
+					if tp == "FALSE" {
+						if isAnd {
+							return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+						}
+						continue
+					}
+					preds = append(preds, tp)
+				}
+				if len(preds) == 0 {
+					return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+				}
+				joinOp := " OR "
+				if isAnd {
+					joinOp = " AND "
+				}
+				pred := preds[0]
+				if len(preds) > 1 {
+					pred = "(" + strings.Join(preds, joinOp) + ")"
+				}
+				score := "0.0"
+				if scoring {
+					score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", pred, boost)
+				}
+				return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: score}
+			}
 			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 		}
 		pred := t.compileTermPredicate(field, qStr, false, nctx)
@@ -2205,8 +2421,38 @@ func (t *Transpiler) compileMatchField(
 		}
 		return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: score}
 	}
-	if effDT := effectiveDorisScalarType(b); (b.Kind == schema.StoragePromotedScalar || b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) && effDT != schema.DorisString && effDT != schema.DorisVarchar {
+	if effDT := effectiveDorisScalarType(b); (b.Kind == schema.StoragePromotedScalar || b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield || b.ESType != "") && effDT != schema.DorisString && effDT != schema.DorisVarchar && effDT != schema.DorisVariant {
 		if !isScalarQueryCompatible(b, queryVal) {
+			if tokens := strings.Fields(strings.TrimSpace(fmt.Sprintf("%v", queryVal))); len(tokens) > 1 {
+				var preds []string
+				isAnd := strings.EqualFold(operator, "and")
+				for _, tok := range tokens {
+					tp := t.compileMatchField(field, tok, operator, boost, false, nctx).WhereSQL
+					if tp == "FALSE" {
+						if isAnd {
+							return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+						}
+						continue
+					}
+					preds = append(preds, tp)
+				}
+				if len(preds) == 0 {
+					return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+				}
+				joinOp := " OR "
+				if isAnd {
+					joinOp = " AND "
+				}
+				pred := preds[0]
+				if len(preds) > 1 {
+					pred = "(" + strings.Join(preds, joinOp) + ")"
+				}
+				score := "0.0"
+				if scoring {
+					score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", pred, boost)
+				}
+				return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: score}
+			}
 			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 		}
 		pred := t.compileTermPredicate(field, queryVal, false, nctx)
@@ -2229,6 +2475,15 @@ func (t *Transpiler) compileMatchField(
 	queryStr := fmt.Sprintf("%v", queryVal)
 	if queryVal == nil || strings.TrimSpace(queryStr) == "" {
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
+	if !isExactKeywordField(field, b) {
+		filteredTokens, allStopwords := filterStopwordTokens(queryStr, b.Analyzer, "")
+		if allStopwords {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+		if len(filteredTokens) > 0 && len(filteredTokens) < len(strings.Fields(queryStr)) {
+			queryStr = strings.Join(filteredTokens, " ")
+		}
 	}
 	if isExactKeywordField(field, b) && (field == "_id" || field == "_index" || field == "_version" || field == "_routing" || b.ESType == "constant_keyword" || b.NullValue != nil || b.IgnoreAbove > 0 || b.EffectiveLowercase(true) || strings.ContainsAny(strings.TrimSpace(queryStr), " \t\n\r") || strings.ToLower(queryStr) != queryStr || strings.HasSuffix(field, ".keyword")) {
 		pred := t.compileTermPredicate(field, queryVal, false, nctx)
@@ -2442,12 +2697,16 @@ func (t *Transpiler) compileMultiMatch(mm *esast.MultiMatchQuery, scoring bool, 
 	if mm.Query != nil {
 		qStr = strings.TrimSpace(fmt.Sprintf("%v", mm.Query))
 	}
-	if qStr == "" && strings.EqualFold(mm.ZeroTermsQuery, "all") {
+	_, allStopwords := filterStopwordTokens(qStr, mm.Analyzer, mm.ZeroTermsQuery)
+	if (qStr == "" || allStopwords) && strings.EqualFold(mm.ZeroTermsQuery, "all") {
 		boost := 1.0
 		if mm.Boost != nil {
 			boost = *mm.Boost
 		}
 		return CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: fmt.Sprintf("%.4f", boost)}
+	}
+	if allStopwords {
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
 	mmType := strings.ToLower(mm.Type)
 
@@ -3718,6 +3977,9 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 	}
 	effLower := b.EffectiveLowercase(true)
 	effDT := effectiveDorisScalarType(b)
+	if _, isBool := val.(bool); isBool && b.ESType != "" && effDT != schema.DorisBoolean && effDT != schema.DorisString && effDT != schema.DorisVarchar {
+		return "FALSE"
+	}
 	if effDT == schema.DorisBoolean {
 		if bv, ok := normalizeBooleanQueryValue(val); ok {
 			val = bv
@@ -3831,10 +4093,60 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 	}
 
 	col := t.sqlTypedColumnRef(field, val, true, nctx)
+	if b.ESType == "flattened" {
+		valStr := fmt.Sprintf("%v", val)
+		if isRoot, isSubKey := t.flattenedFieldMode(field, b); isRoot {
+			jsonLeafPat := quoteStr("%" + escapeLikeLiteral(`"`+valStr+`"`) + "%")
+			if caseInsensitive {
+				return fmt.Sprintf("(lower(%s) = lower(%s) OR lower(%s) LIKE lower(%s))", col, lit, col, jsonLeafPat)
+			}
+			return fmt.Sprintf("(%s = %s OR %s LIKE %s)", col, lit, col, jsonLeafPat)
+		} else if isSubKey {
+			rawVar := t.flattenedRawVariantRef(field, b, nctx)
+			strLit := quoteStr(valStr)
+			if caseInsensitive {
+				return fmt.Sprintf("(lower(%s) = lower(%s) OR array_exists(_x -> lower(_x) = lower(%s), CAST(%s AS ARRAY<STRING>)))", col, lit, strLit, rawVar)
+			}
+			return fmt.Sprintf("(%s = %s OR array_contains(CAST(%s AS ARRAY<STRING>), %s))", col, lit, rawVar, strLit)
+		}
+	}
 	if caseInsensitive {
 		return fmt.Sprintf("lower(%s) = lower(%s)", col, lit)
 	}
 	return fmt.Sprintf("%s = %s", col, lit)
+}
+
+func (t *Transpiler) flattenedFieldMode(field string, b schema.FieldBinding) (isRootFlattened bool, isSubKeyFlattened bool) {
+	if b.ESType != "flattened" {
+		return false, false
+	}
+	clean := strings.TrimSuffix(field, ".keyword")
+	if t.Schema != nil {
+		if fb, ok := t.Schema.Fields[clean]; ok && fb.ESType == "flattened" {
+			return true, false
+		}
+	}
+	return false, true
+}
+
+func (t *Transpiler) flattenedRawVariantRef(field string, b schema.FieldBinding, nctx *nestedCtx) string {
+	effField := field
+	if b.AliasTarget != "" {
+		effField = b.AliasTarget
+	}
+	if nctx != nil && nctx.elemVar != "" && (b.NestedPath == nctx.nestedPath || strings.HasPrefix(effField, nctx.nestedPath+".")) {
+		relPath := t.nestedRelativeJSONPath(field, true, nctx.nestedPath)
+		return fmt.Sprintf("json_extract_string(%s, %s)", nctx.elemVar, quoteStr(relPath))
+	}
+	segs := b.SourceJSONPath
+	if len(segs) == 0 {
+		segs = strings.Split(strings.TrimSuffix(effField, ".keyword"), ".")
+	}
+	var pathBuilder strings.Builder
+	for _, seg := range segs {
+		_, _ = fmt.Fprintf(&pathBuilder, "[%s]", quoteStr(seg))
+	}
+	return fmt.Sprintf("`_doc`%s", pathBuilder.String())
 }
 
 func (t *Transpiler) compileTermsPredicateWithCI(field string, vals []any, caseInsensitive bool, nctx *nestedCtx) string {
@@ -3858,10 +4170,10 @@ func (t *Transpiler) compileTermsPredicateWithCI(field string, vals []any, caseI
 	if !t.checkFieldSearchable(field, b) || b.Kind == schema.StoragePromotedVector {
 		return "FALSE"
 	}
-	if schema.IsRangeFieldType(b.ESType) {
+	if schema.IsRangeFieldType(b.ESType) || b.ESType == "flattened" {
 		var disjuncts []string
 		for _, v := range vals {
-			disjuncts = append(disjuncts, t.compileTermPredicate(field, v, false, nctx))
+			disjuncts = append(disjuncts, t.compileTermPredicate(field, v, caseInsensitive, nctx))
 		}
 		if len(disjuncts) == 1 {
 			return disjuncts[0]
@@ -4015,6 +4327,21 @@ func (t *Transpiler) compilePrefixSingleField(field, val string, caseInsensitive
 		return fmt.Sprintf("array_exists(_x -> _x LIKE %s, `%s`)", likePat, colName)
 	}
 	col := t.sqlColumnRef(field, true, nctx)
+	if b.ESType == "flattened" {
+		if isRoot, isSubKey := t.flattenedFieldMode(field, b); isRoot {
+			jsonLeafPat := quoteStr("%" + escapeLikeLiteral(`"`+val) + "%")
+			if caseInsensitive || (nctx != nil && effLower) {
+				return fmt.Sprintf("(lower(%s) LIKE lower(%s) OR lower(%s) LIKE lower(%s))", col, likePat, col, jsonLeafPat)
+			}
+			return fmt.Sprintf("(%s LIKE %s OR %s LIKE %s)", col, likePat, col, jsonLeafPat)
+		} else if isSubKey {
+			rawVar := t.flattenedRawVariantRef(field, b, nctx)
+			if caseInsensitive || (nctx != nil && effLower) {
+				return fmt.Sprintf("(lower(%s) LIKE lower(%s) OR array_exists(_x -> lower(_x) LIKE lower(%s), CAST(%s AS ARRAY<STRING>)))", col, likePat, likePat, rawVar)
+			}
+			return fmt.Sprintf("(%s LIKE %s OR array_exists(_x -> _x LIKE %s, CAST(%s AS ARRAY<STRING>)))", col, likePat, likePat, rawVar)
+		}
+	}
 	if nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued {
 		if caseInsensitive || effLower {
 			return fmt.Sprintf("array_exists(_x -> lower(_x) LIKE lower(%s), CAST(%s AS ARRAY<STRING>))", likePat, col)
@@ -4066,6 +4393,21 @@ func (t *Transpiler) compileWildcardSingleField(field, val string, caseInsensiti
 		return fmt.Sprintf("array_exists(_x -> _x LIKE %s, `%s`)", likePat, colName)
 	}
 	col := t.sqlColumnRef(field, true, nctx)
+	if b.ESType == "flattened" {
+		if isRoot, isSubKey := t.flattenedFieldMode(field, b); isRoot {
+			jsonLeafPat := quoteStr(`%"` + wildcardToLike(val) + `"%`)
+			if caseInsensitive || (nctx != nil && effLower) {
+				return fmt.Sprintf("(lower(%s) LIKE lower(%s) OR lower(%s) LIKE lower(%s))", col, likePat, col, jsonLeafPat)
+			}
+			return fmt.Sprintf("(%s LIKE %s OR %s LIKE %s)", col, likePat, col, jsonLeafPat)
+		} else if isSubKey {
+			rawVar := t.flattenedRawVariantRef(field, b, nctx)
+			if caseInsensitive || (nctx != nil && effLower) {
+				return fmt.Sprintf("(lower(%s) LIKE lower(%s) OR array_exists(_x -> lower(_x) LIKE lower(%s), CAST(%s AS ARRAY<STRING>)))", col, likePat, likePat, rawVar)
+			}
+			return fmt.Sprintf("(%s LIKE %s OR array_exists(_x -> _x LIKE %s, CAST(%s AS ARRAY<STRING>)))", col, likePat, likePat, rawVar)
+		}
+	}
 	if nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued {
 		if caseInsensitive || effLower {
 			return fmt.Sprintf("array_exists(_x -> lower(_x) LIKE lower(%s), CAST(%s AS ARRAY<STRING>))", likePat, col)
@@ -10088,9 +10430,12 @@ func (t *Transpiler) resolveFieldInNestedCtx(field string, preferKeyword bool, n
 		return field, schema.FieldBinding{ESFieldPath: field, Kind: schema.StorageDynamicVariant}
 	}
 	b := t.Schema.ResolveEffectiveField(field, preferKeyword)
-	if nctx != nil && nctx.nestedPath != "" && b.Kind == schema.StorageDynamicVariant && !strings.HasPrefix(field, nctx.nestedPath+".") {
+	if nctx != nil && nctx.nestedPath != "" && b.Kind == schema.StorageDynamicVariant && b.NestedPath != nctx.nestedPath && !strings.HasPrefix(field, nctx.nestedPath+".") {
 		prefixed := nctx.nestedPath + "." + field
-		if nb := t.Schema.ResolveEffectiveField(prefixed, preferKeyword); nb.Kind == schema.StorageNestedSubfield {
+		if nb := t.Schema.ResolveEffectiveField(prefixed, preferKeyword); nb.Kind == schema.StorageNestedSubfield || nb.NestedPath == nctx.nestedPath {
+			return prefixed, nb
+		}
+		if nb := t.Schema.ResolveField(prefixed); nb.Kind == schema.StorageNestedSubfield || nb.NestedPath == nctx.nestedPath {
 			return prefixed, nb
 		}
 	}
@@ -10434,7 +10779,18 @@ func coerceRangeFieldQueryScalar(v any, b schema.FieldBinding, format string, tz
 			if !ok {
 				return 0, false
 			}
-			ms = parsedMs - tzOffsetMs
+			ms = parsedMs
+			datePart := strings.TrimSpace(s)
+			if idx := strings.Index(datePart, "||"); idx >= 0 {
+				datePart = strings.TrimSpace(datePart[:idx])
+			}
+			if _, numErr := strconv.ParseFloat(datePart, 64); numErr != nil &&
+				tzOffsetMs != 0 && !strings.HasPrefix(datePart, "now") &&
+				!strings.HasSuffix(datePart, "Z") && !strings.HasSuffix(datePart, "z") &&
+				!strings.Contains(datePart[min(10, len(datePart)):], "+") &&
+				!strings.Contains(datePart[min(10, len(datePart)):], "-") {
+				ms -= tzOffsetMs
+			}
 		} else if fv, ok := parseFiniteFloatValue(v); ok {
 			ms = int64(fv)
 		} else {
@@ -10473,7 +10829,7 @@ func coerceRangeFieldQueryScalar(v any, b schema.FieldBinding, format string, tz
 }
 
 func (t *Transpiler) rangeFieldBoundsSQL(field string, b schema.FieldBinding, nctx *nestedCtx) (string, string) {
-	if nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath {
+	if nctx != nil && nctx.elemVar != "" && (b.Kind == schema.StorageNestedSubfield || b.NestedPath == nctx.nestedPath) && nctx.nestedPath == b.NestedPath {
 		relPath := t.nestedRelativeJSONPath(field, false, b.NestedPath)
 		gtePath := strings.TrimSuffix(relPath, "") + "._gte"
 		ltePath := strings.TrimSuffix(relPath, "") + "._lte"
@@ -10485,7 +10841,10 @@ func (t *Transpiler) rangeFieldBoundsSQL(field string, b schema.FieldBinding, nc
 			nctx.elemVar, quoteStr(ltePath), nctx.elemVar, quoteStr(rawLtePath))
 		return lower, upper
 	}
-	parts := strings.Split(field, ".")
+	parts := b.SourceJSONPath
+	if len(parts) == 0 {
+		parts = strings.Split(field, ".")
+	}
 	var base strings.Builder
 	base.WriteString("`_doc`")
 	for _, p := range parts {
@@ -10639,6 +10998,121 @@ func (t *Transpiler) compileGeoPolygon(gp *esast.GeoPolygonQuery, scoring bool, 
 	}, scoring, nctx)
 }
 
+func buildPointInPolygonSQL(latExpr, lonExpr string, pts [][2]float64) string {
+	if len(pts) < 3 {
+		return "FALSE"
+	}
+	minLat, maxLat := 90.0, -90.0
+	minLon, maxLon := 180.0, -180.0
+	for _, pt := range pts {
+		if pt[0] < minLat {
+			minLat = pt[0]
+		}
+		if pt[0] > maxLat {
+			maxLat = pt[0]
+		}
+		if pt[1] < minLon {
+			minLon = pt[1]
+		}
+		if pt[1] > maxLon {
+			maxLon = pt[1]
+		}
+	}
+	bboxCond := fmt.Sprintf("(%s >= %s AND %s <= %s AND %s >= %s AND %s <= %s)",
+		latExpr, strconv.FormatFloat(minLat, 'f', -1, 64),
+		latExpr, strconv.FormatFloat(maxLat, 'f', -1, 64),
+		lonExpr, strconv.FormatFloat(minLon, 'f', -1, 64),
+		lonExpr, strconv.FormatFloat(maxLon, 'f', -1, 64))
+	var edgeCases []string
+	n := len(pts)
+	for i := 0; i < n; i++ {
+		j := (i + n - 1) % n
+		latI, lonI := pts[i][0], pts[i][1]
+		latJ, lonJ := pts[j][0], pts[j][1]
+		if latI == latJ {
+			continue
+		}
+		latIStr := strconv.FormatFloat(latI, 'f', -1, 64)
+		lonIStr := strconv.FormatFloat(lonI, 'f', -1, 64)
+		latJStr := strconv.FormatFloat(latJ, 'f', -1, 64)
+		dLonStr := strconv.FormatFloat(lonJ-lonI, 'f', -1, 64)
+		dLatStr := strconv.FormatFloat(latJ-latI, 'f', -1, 64)
+		edgeCases = append(edgeCases, fmt.Sprintf(
+			"CASE WHEN ((%s > %s) != (%s > %s)) AND (%s <= (%s * (%s - %s) / %s + %s)) THEN 1 ELSE 0 END",
+			latIStr, latExpr, latJStr, latExpr, lonExpr, dLonStr, latExpr, latIStr, dLatStr, lonIStr))
+	}
+	if len(edgeCases) == 0 {
+		return bboxCond
+	}
+	return fmt.Sprintf("(%s AND ((%s) %% 2 = 1))", bboxCond, strings.Join(edgeCases, " + "))
+}
+
+func extractGeoShapeRings(coords any, shapeType string) [][][2]float64 {
+	parseRing := func(rawRing any) [][2]float64 {
+		arr, ok := rawRing.([]any)
+		if !ok {
+			return nil
+		}
+		var pts [][2]float64
+		for _, item := range arr {
+			ptArr, ok := item.([]any)
+			if !ok || len(ptArr) < 2 {
+				continue
+			}
+			lon, ok1 := toFloat64ForGeo(ptArr[0])
+			lat, ok2 := toFloat64ForGeo(ptArr[1])
+			if ok1 && ok2 {
+				pts = append(pts, [2]float64{lat, lon})
+			}
+		}
+		if len(pts) >= 2 && pts[0][0] == pts[len(pts)-1][0] && pts[0][1] == pts[len(pts)-1][1] {
+			pts = pts[:len(pts)-1]
+		}
+		return pts
+	}
+	arr, ok := coords.([]any)
+	if !ok || len(arr) == 0 {
+		return nil
+	}
+	var rings [][][2]float64
+	switch shapeType {
+	case "polygon":
+		if pts := parseRing(arr[0]); len(pts) >= 3 {
+			rings = append(rings, pts)
+		}
+	case "multipolygon":
+		for _, polyRaw := range arr {
+			if polyArr, ok := polyRaw.([]any); ok && len(polyArr) > 0 {
+				if pts := parseRing(polyArr[0]); len(pts) >= 3 {
+					rings = append(rings, pts)
+				}
+			}
+		}
+	}
+	return rings
+}
+
+func (t *Transpiler) evalGeoPointPredForField(field string, nctx *nestedCtx, buildCond func(latExpr, lonExpr string) string) string {
+	resolvedField, b := t.resolveFieldInNestedCtx(field, false, nctx)
+	if !t.checkFieldSearchable(resolvedField, b) {
+		return "FALSE"
+	}
+	if nctx != nil && nctx.elemVar != "" && ((b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath) || strings.HasPrefix(resolvedField, nctx.nestedPath+".")) {
+		elemExpr := t.sqlColumnRef(resolvedField, true, nctx)
+		latExpr := fmt.Sprintf("CAST(SPLIT_PART(%s, ',', 1) AS DOUBLE)", elemExpr)
+		lonExpr := fmt.Sprintf("CAST(SPLIT_PART(%s, ',', 2) AS DOUBLE)", elemExpr)
+		return fmt.Sprintf("(%s IS NOT NULL AND %s)", elemExpr, buildCond(latExpr, lonExpr))
+	}
+	if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
+		arrCol := fmt.Sprintf("`%s`", b.EffectiveArrayColumn(true))
+		latExpr := "CAST(SPLIT_PART(_x, ',', 1) AS DOUBLE)"
+		lonExpr := "CAST(SPLIT_PART(_x, ',', 2) AS DOUBLE)"
+		return fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND %s, %s)", buildCond(latExpr, lonExpr), arrCol)
+	}
+	latExpr, lonExpr, notNullCond := t.extractGeoPointExprs(resolvedField, b)
+	return fmt.Sprintf("(%s AND %s)", notNullCond, buildCond(latExpr, lonExpr))
+}
+
 func (t *Transpiler) compileGeoShape(gs *esast.GeoShapeQuery, scoring bool, nctx *nestedCtx) CompiledQuery {
 	if gs == nil || gs.Field == "" {
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
@@ -10655,6 +11129,127 @@ func (t *Transpiler) compileGeoShape(gs *esast.GeoShapeQuery, scoring bool, nctx
 		w := t.compileExistsPredicate(gs.Field, nctx)
 		return CompiledQuery{WhereSQL: w, SafeWhereSQL: w, ScoreSQL: scoreSQL}
 	}
+	if gs.Shape == nil {
+		w := t.compileExistsPredicate(gs.Field, nctx)
+		return CompiledQuery{WhereSQL: w, SafeWhereSQL: w, ScoreSQL: scoreSQL}
+	}
+	rel := strings.ToUpper(strings.TrimSpace(gs.Relation))
+	if rel == "" {
+		rel = "INTERSECTS"
+	}
+	shapeType, _ := gs.Shape["type"].(string)
+	shapeType = strings.ToLower(strings.TrimSpace(shapeType))
+
+	if shapeType == "geometrycollection" {
+		var childShapes []map[string]any
+		switch geoms := gs.Shape["geometries"].(type) {
+		case []any:
+			for _, g := range geoms {
+				if gm, ok := g.(map[string]any); ok {
+					childShapes = append(childShapes, gm)
+				}
+			}
+		case []map[string]any:
+			childShapes = geoms
+		}
+		if len(childShapes) == 0 {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+		childRel := "INTERSECTS"
+		if rel == "CONTAINS" {
+			childRel = "CONTAINS"
+		}
+		var childPreds []string
+		for _, cs := range childShapes {
+			cp := t.compileGeoShape(&esast.GeoShapeQuery{
+				Field:    gs.Field,
+				Shape:    cs,
+				Relation: childRel,
+			}, false, nctx)
+			if cp.WhereSQL != "FALSE" {
+				childPreds = append(childPreds, cp.WhereSQL)
+			} else if rel == "CONTAINS" {
+				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+			}
+		}
+		if len(childPreds) == 0 {
+			if rel == "DISJOINT" {
+				w := t.compileExistsPredicate(gs.Field, nctx)
+				return CompiledQuery{WhereSQL: w, SafeWhereSQL: w, ScoreSQL: scoreSQL}
+			}
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+		joinOp := " OR "
+		if rel == "CONTAINS" {
+			joinOp = " AND "
+		}
+		combined := childPreds[0]
+		if len(childPreds) > 1 {
+			combined = "(" + strings.Join(childPreds, joinOp) + ")"
+		}
+		if rel == "DISJOINT" {
+			w := fmt.Sprintf("(%s AND NOT (%s))", t.compileExistsPredicate(gs.Field, nctx), combined)
+			return CompiledQuery{WhereSQL: w, SafeWhereSQL: w, ScoreSQL: scoreSQL}
+		}
+		return CompiledQuery{WhereSQL: combined, SafeWhereSQL: combined, ScoreSQL: scoreSQL}
+	}
+
+	if shapeType == "circle" {
+		coords, ok := gs.Shape["coordinates"].([]any)
+		if !ok || len(coords) < 2 {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+		cLon, ok1 := toFloat64ForGeo(coords[0])
+		cLat, ok2 := toFloat64ForGeo(coords[1])
+		if !ok1 || !ok2 {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+		radiusMeters := 0.0
+		if rawRad, hasRad := gs.Shape["radius"]; hasRad && rawRad != nil {
+			if _, rm, err := esast.ParseGeoDistanceMeters(rawRad); err == nil {
+				radiusMeters = rm
+			}
+		}
+		if rel == "CONTAINS" && radiusMeters > 0 {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+		cLonStr := strconv.FormatFloat(cLon, 'f', -1, 64)
+		cLatStr := strconv.FormatFloat(cLat, 'f', -1, 64)
+		radStr := strconv.FormatFloat(radiusMeters, 'f', -1, 64)
+		posWhere := t.evalGeoPointPredForField(gs.Field, nctx, func(latExpr, lonExpr string) string {
+			return fmt.Sprintf("ST_Distance_Sphere(%s, %s, %s, %s) <= %s", lonExpr, latExpr, cLonStr, cLatStr, radStr)
+		})
+		if rel == "DISJOINT" {
+			w := fmt.Sprintf("(%s AND NOT (%s))", t.compileExistsPredicate(gs.Field, nctx), posWhere)
+			return CompiledQuery{WhereSQL: w, SafeWhereSQL: w, ScoreSQL: scoreSQL}
+		}
+		return CompiledQuery{WhereSQL: posWhere, SafeWhereSQL: posWhere, ScoreSQL: scoreSQL}
+	}
+
+	if shapeType == "polygon" || shapeType == "multipolygon" {
+		rings := extractGeoShapeRings(gs.Shape["coordinates"], shapeType)
+		if len(rings) > 0 {
+			if rel == "CONTAINS" {
+				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+			}
+			posWhere := t.evalGeoPointPredForField(gs.Field, nctx, func(latExpr, lonExpr string) string {
+				var ringPreds []string
+				for _, ring := range rings {
+					ringPreds = append(ringPreds, buildPointInPolygonSQL(latExpr, lonExpr, ring))
+				}
+				if len(ringPreds) == 1 {
+					return ringPreds[0]
+				}
+				return "(" + strings.Join(ringPreds, " OR ") + ")"
+			})
+			if rel == "DISJOINT" {
+				w := fmt.Sprintf("(%s AND NOT (%s))", t.compileExistsPredicate(gs.Field, nctx), posWhere)
+				return CompiledQuery{WhereSQL: w, SafeWhereSQL: w, ScoreSQL: scoreSQL}
+			}
+			return CompiledQuery{WhereSQL: posWhere, SafeWhereSQL: posWhere, ScoreSQL: scoreSQL}
+		}
+	}
+
 	minLat, maxLat := 90.0, -90.0
 	minLon, maxLon := 180.0, -180.0
 	hasCoords := false
@@ -10687,26 +11282,24 @@ func (t *Transpiler) compileGeoShape(gs *esast.GeoShapeQuery, scoring bool, nctx
 			}
 		}
 	}
-	if gs.Shape != nil {
-		visitCoords(gs.Shape["coordinates"])
-	}
+	visitCoords(gs.Shape["coordinates"])
 	if hasCoords {
-		_, b := t.resolveFieldInNestedCtx(gs.Field, false, nctx)
-		if b.ESType == "geo_point" || b.DorisType == schema.DorisVarchar || b.DorisType == schema.DorisString {
-			bp := t.compileGeoBoundingBox(&esast.GeoBoundingBoxQuery{
-				Field:  gs.Field,
-				Top:    maxLat,
-				Bottom: minLat,
-				Left:   minLon,
-				Right:  maxLon,
-				Boost:  gs.Boost,
-			}, scoring, nctx)
-			if strings.EqualFold(gs.Relation, "DISJOINT") {
-				w := fmt.Sprintf("(%s AND NOT (%s))", t.compileExistsPredicate(gs.Field, nctx), bp.WhereSQL)
-				return CompiledQuery{WhereSQL: w, SafeWhereSQL: w, ScoreSQL: scoreSQL}
-			}
-			return bp
+		if rel == "CONTAINS" && (minLat != maxLat || minLon != maxLon) {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 		}
+		bp := t.compileGeoBoundingBox(&esast.GeoBoundingBoxQuery{
+			Field:  gs.Field,
+			Top:    maxLat,
+			Bottom: minLat,
+			Left:   minLon,
+			Right:  maxLon,
+			Boost:  gs.Boost,
+		}, scoring, nctx)
+		if rel == "DISJOINT" {
+			w := fmt.Sprintf("(%s AND NOT (%s))", t.compileExistsPredicate(gs.Field, nctx), bp.WhereSQL)
+			return CompiledQuery{WhereSQL: w, SafeWhereSQL: w, ScoreSQL: scoreSQL}
+		}
+		return bp
 	}
 	w := t.compileExistsPredicate(gs.Field, nctx)
 	return CompiledQuery{WhereSQL: w, SafeWhereSQL: w, ScoreSQL: scoreSQL}
@@ -10729,21 +11322,38 @@ func toFloat64ForGeo(v any) (float64, bool) {
 }
 
 func (t *Transpiler) compileWrapperQuery(w *esast.WrapperQuery, inScoring bool, nctx *nestedCtx) CompiledQuery {
-	if w == nil || strings.TrimSpace(w.Query) == "" {
+	if w == nil || (w.Decoded == nil && strings.TrimSpace(w.Query) == "") {
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(w.Query))
-	if err != nil {
-		decoded, err = base64.RawStdEncoding.DecodeString(strings.TrimSpace(w.Query))
+	var inner *esast.Query
+	if w.Decoded != nil {
+		inner = w.Decoded
+	} else {
+		qTrim := strings.TrimSpace(w.Query)
+		decoded, err := base64.StdEncoding.DecodeString(qTrim)
 		if err != nil {
-			decoded = []byte(w.Query)
+			decoded, err = base64.RawStdEncoding.DecodeString(qTrim)
+			if err != nil {
+				if strings.HasPrefix(qTrim, "{") {
+					decoded = []byte(qTrim)
+				} else {
+					if t.searchErr == nil {
+						t.searchErr = fmt.Errorf("parsing_exception: [wrapper] failed to decode base64 query: %w", err)
+					}
+					return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+				}
+			}
 		}
+		var parsed esast.Query
+		if err := json.Unmarshal(decoded, &parsed); err != nil {
+			if t.searchErr == nil {
+				t.searchErr = fmt.Errorf("wrapper query decoded payload is invalid query JSON: %w", err)
+			}
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+		inner = &parsed
 	}
-	var inner esast.Query
-	if err := json.Unmarshal(decoded, &inner); err != nil {
-		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
-	}
-	cp := t.CompileQuery(&inner, inScoring, nctx)
+	cp := t.CompileQuery(inner, inScoring, nctx)
 	if w.Boost != nil && inScoring {
 		if *w.Boost == 0 {
 			cp.ScoreSQL = "0.0"
@@ -10816,42 +11426,109 @@ func (t *Transpiler) compilePinnedQuery(p *esast.PinnedQuery, inScoring bool, nc
 	return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: safeWhereSQL, ScoreSQL: scoreSQL, UsesFulltextMatch: orgCP.UsesFulltextMatch}
 }
 
-func (t *Transpiler) compileMoreLikeThis(mlt *esast.MoreLikeThisQuery, inScoring bool, nctx *nestedCtx) CompiledQuery {
-	if mlt == nil {
-		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+func resolvePathInMLTMap(m map[string]any, path string) (any, bool) {
+	if v, ok := m[path]; ok {
+		return v, true
 	}
-	fields := mlt.Fields
-	if len(fields) == 0 {
-		fields = []string{"_all_text"}
+	parts := strings.Split(path, ".")
+	if len(parts) <= 1 {
+		return nil, false
 	}
+	var cur any = m
+	for _, p := range parts {
+		cm, ok := cur.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		next, exists := cm[p]
+		if !exists {
+			return nil, false
+		}
+		cur = next
+	}
+	return cur, true
+}
+
+func extractMLTLikeTexts(v any, fields []string) ([]string, []string) {
 	var texts []string
-	var collectLike func(v any)
-	collectLike = func(v any) {
-		switch lv := v.(type) {
+	var excludedIDs []string
+	seenIDs := make(map[string]bool)
+
+	var appendValueTexts func(val any)
+	appendValueTexts = func(val any) {
+		switch tv := val.(type) {
+		case string:
+			if strings.TrimSpace(tv) != "" {
+				texts = append(texts, tv)
+			}
+		case []string:
+			for _, s := range tv {
+				if strings.TrimSpace(s) != "" {
+					texts = append(texts, s)
+				}
+			}
+		case []any:
+			for _, item := range tv {
+				appendValueTexts(item)
+			}
+		case map[string]any:
+			keys := sortedMapKeys(tv)
+			for _, k := range keys {
+				appendValueTexts(tv[k])
+			}
+		}
+	}
+
+	hasExplicitFields := len(fields) > 0 && (len(fields) != 1 || (fields[0] != "_all_text" && fields[0] != "*"))
+
+	var collect func(item any)
+	collect = func(item any) {
+		switch lv := item.(type) {
 		case string:
 			if strings.TrimSpace(lv) != "" {
 				texts = append(texts, lv)
 			}
+		case []string:
+			for _, s := range lv {
+				collect(s)
+			}
 		case []any:
-			for _, item := range lv {
-				collectLike(item)
+			for _, sub := range lv {
+				collect(sub)
 			}
 		case map[string]any:
-			if doc, ok := lv["doc"].(map[string]any); ok {
-				for _, fv := range doc {
-					if s, ok := fv.(string); ok {
-						texts = append(texts, s)
+			if rawID, hasID := lv["_id"]; hasID && rawID != nil {
+				idStr := strings.TrimSpace(fmt.Sprintf("%v", rawID))
+				if idStr != "" && !seenIDs[idStr] {
+					seenIDs[idStr] = true
+					excludedIDs = append(excludedIDs, idStr)
+				}
+			}
+			var docMap map[string]any
+			if dm, ok := lv["doc"].(map[string]any); ok {
+				docMap = dm
+			} else if sm, ok := lv["_source"].(map[string]any); ok {
+				docMap = sm
+			}
+			if docMap != nil {
+				if hasExplicitFields {
+					for _, f := range fields {
+						cleanF, _ := parseFieldBoost(f, 1.0)
+						if fv, ok := resolvePathInMLTMap(docMap, cleanF); ok {
+							appendValueTexts(fv)
+						}
 					}
+				} else {
+					appendValueTexts(docMap)
 				}
 			}
 		}
 	}
-	collectLike(mlt.Like)
-	stopSet := make(map[string]bool, len(mlt.StopWords))
-	for _, sw := range mlt.StopWords {
-		stopSet[strings.ToLower(sw)] = true
-	}
-	minWordLen := mlt.MinWordLength
+	collect(v)
+	return texts, excludedIDs
+}
+
+func tokenizeMLTTexts(texts []string, stopSet map[string]bool, minWordLen, maxWordLen int) []string {
 	var tokens []string
 	seen := make(map[string]bool)
 	for _, txt := range texts {
@@ -10863,7 +11540,7 @@ func (t *Transpiler) compileMoreLikeThis(mlt *esast.MoreLikeThisQuery, inScoring
 			if minWordLen > 0 && len([]rune(lowerTok)) < minWordLen {
 				continue
 			}
-			if mlt.MaxWordLength > 0 && len([]rune(lowerTok)) > mlt.MaxWordLength {
+			if maxWordLen > 0 && len([]rune(lowerTok)) > maxWordLen {
 				continue
 			}
 			if !seen[lowerTok] {
@@ -10872,6 +11549,36 @@ func (t *Transpiler) compileMoreLikeThis(mlt *esast.MoreLikeThisQuery, inScoring
 			}
 		}
 	}
+	return tokens
+}
+
+func (t *Transpiler) compileMoreLikeThis(mlt *esast.MoreLikeThisQuery, inScoring bool, nctx *nestedCtx) CompiledQuery {
+	if mlt == nil {
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
+	fields := mlt.Fields
+	if len(fields) == 0 {
+		fields = []string{"_all_text"}
+	}
+	texts, excludedIDs := extractMLTLikeTexts(mlt.Like, mlt.Fields)
+	stopSet := make(map[string]bool, len(mlt.StopWords))
+	for _, sw := range mlt.StopWords {
+		stopSet[strings.ToLower(sw)] = true
+	}
+	tokens := tokenizeMLTTexts(texts, stopSet, mlt.MinWordLength, mlt.MaxWordLength)
+	if len(tokens) == 0 && len(excludedIDs) > 0 && mlt.MinimumShouldMatch == nil {
+		// Document reference only (e.g., {"_id": "1"} without inline "doc"):
+		// if include is false, exclude the referenced _id; otherwise match all.
+		if !mlt.Include {
+			var quotedIDs []string
+			for _, id := range excludedIDs {
+				quotedIDs = append(quotedIDs, quoteStr(id))
+			}
+			w := fmt.Sprintf("`_id` NOT IN (%s)", strings.Join(quotedIDs, ", "))
+			return CompiledQuery{WhereSQL: w, SafeWhereSQL: w, ScoreSQL: "1.0"}
+		}
+		return CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: "1.0"}
+	}
 	if len(tokens) == 0 {
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
@@ -10879,29 +11586,129 @@ func (t *Transpiler) compileMoreLikeThis(mlt *esast.MoreLikeThisQuery, inScoring
 	if mlt.Boost != nil {
 		boost = *mlt.Boost
 	}
-	joined := strings.Join(tokens, " ")
-	var fieldPreds, safePreds, scoreTerms []string
+
+	var whereSQL, safeWhereSQL string
+	var scoreTerms []string
 	usesFT := false
-	for _, f := range fields {
-		cp := t.compileMatchField(f, joined, "or", boost, inScoring, nctx)
-		if cp.WhereSQL != "FALSE" {
-			fieldPreds = append(fieldPreds, cp.WhereSQL)
-			safePreds = append(safePreds, cp.EffectiveSafeWhere())
-			usesFT = usesFT || cp.UsesFulltextMatch
-			if inScoring && cp.ScoreSQL != "0.0" {
-				scoreTerms = append(scoreTerms, cp.ScoreSQL)
+
+	if mlt.MinimumShouldMatch != nil && len(tokens) > 1 {
+		var tokenConds, safeTokenConds []string
+		for _, tok := range tokens {
+			var fPreds, fSafePreds []string
+			for _, f := range fields {
+				cp := t.compileMatchField(f, tok, "or", boost, inScoring, nctx)
+				if cp.WhereSQL != "FALSE" {
+					fPreds = append(fPreds, cp.WhereSQL)
+					fSafePreds = append(fSafePreds, cp.EffectiveSafeWhere())
+					usesFT = usesFT || cp.UsesFulltextMatch
+					if inScoring && cp.ScoreSQL != "0.0" {
+						scoreTerms = append(scoreTerms, cp.ScoreSQL)
+					}
+				}
+			}
+			if len(fPreds) == 1 {
+				tokenConds = append(tokenConds, fPreds[0])
+				safeTokenConds = append(safeTokenConds, fSafePreds[0])
+			} else if len(fPreds) > 1 {
+				tokenConds = append(tokenConds, "("+strings.Join(fPreds, " OR ")+")")
+				safeTokenConds = append(safeTokenConds, "("+strings.Join(fSafePreds, " OR ")+")")
+			}
+		}
+		if len(tokenConds) == 0 {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+		minShould := parseMinShouldMatch(mlt.MinimumShouldMatch, len(tokenConds), true)
+		if minShould > len(tokenConds) {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+		if minShould <= 1 {
+			if len(tokenConds) == 1 {
+				whereSQL = tokenConds[0]
+				safeWhereSQL = safeTokenConds[0]
+			} else {
+				whereSQL = "(" + strings.Join(tokenConds, " OR ") + ")"
+				safeWhereSQL = "(" + strings.Join(safeTokenConds, " OR ") + ")"
+			}
+		} else if minShould == len(tokenConds) {
+			whereSQL = "(" + strings.Join(tokenConds, " AND ") + ")"
+			safeWhereSQL = "(" + strings.Join(safeTokenConds, " AND ") + ")"
+		} else {
+			var intCasts []string
+			for _, sc := range safeTokenConds {
+				intCasts = append(intCasts, fmt.Sprintf("CAST(COALESCE(%s, FALSE) AS INT)", sc))
+			}
+			msmCond := fmt.Sprintf("((%s) >= %d)", strings.Join(intCasts, " + "), minShould)
+			whereSQL = fmt.Sprintf("((%s) AND %s)", strings.Join(tokenConds, " OR "), msmCond)
+			safeWhereSQL = msmCond
+		}
+	} else {
+		joined := strings.Join(tokens, " ")
+		var fieldPreds, safePreds []string
+		for _, f := range fields {
+			cp := t.compileMatchField(f, joined, "or", boost, inScoring, nctx)
+			if cp.WhereSQL != "FALSE" {
+				fieldPreds = append(fieldPreds, cp.WhereSQL)
+				safePreds = append(safePreds, cp.EffectiveSafeWhere())
+				usesFT = usesFT || cp.UsesFulltextMatch
+				if inScoring && cp.ScoreSQL != "0.0" {
+					scoreTerms = append(scoreTerms, cp.ScoreSQL)
+				}
+			}
+		}
+		if len(fieldPreds) == 0 {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+		if mlt.MinimumShouldMatch != nil && len(tokens) == 1 && parseMinShouldMatch(mlt.MinimumShouldMatch, 1, true) > 1 {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+		whereSQL = fieldPreds[0]
+		safeWhereSQL = safePreds[0]
+		if len(fieldPreds) > 1 {
+			whereSQL = "(" + strings.Join(fieldPreds, " OR ") + ")"
+			safeWhereSQL = "(" + strings.Join(safePreds, " OR ") + ")"
+		}
+	}
+
+	if mlt.Unlike != nil {
+		unlikeTexts, _ := extractMLTLikeTexts(mlt.Unlike, mlt.Fields)
+		unlikeTokens := tokenizeMLTTexts(unlikeTexts, stopSet, mlt.MinWordLength, mlt.MaxWordLength)
+		if len(unlikeTokens) > 0 {
+			unlikeJoined := strings.Join(unlikeTokens, " ")
+			var uPreds, uSafePreds []string
+			for _, f := range fields {
+				ucp := t.compileMatchField(f, unlikeJoined, "or", 1.0, false, nctx)
+				if ucp.WhereSQL != "FALSE" {
+					if ucp.UsesFulltextMatch || strings.Contains(ucp.WhereSQL, "MATCH_") {
+						uPreds = append(uPreds, ucp.EffectiveSafeWhere())
+					} else {
+						uPreds = append(uPreds, ucp.WhereSQL)
+					}
+					uSafePreds = append(uSafePreds, ucp.EffectiveSafeWhere())
+				}
+			}
+			if len(uPreds) > 0 {
+				uCombined := uPreds[0]
+				uSafeCombined := uSafePreds[0]
+				if len(uPreds) > 1 {
+					uCombined = "(" + strings.Join(uPreds, " OR ") + ")"
+					uSafeCombined = "(" + strings.Join(uSafePreds, " OR ") + ")"
+				}
+				whereSQL = fmt.Sprintf("(%s AND NOT COALESCE(%s, FALSE))", whereSQL, uCombined)
+				safeWhereSQL = fmt.Sprintf("(%s AND NOT COALESCE(%s, FALSE))", safeWhereSQL, uSafeCombined)
 			}
 		}
 	}
-	if len(fieldPreds) == 0 {
-		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+
+	if !mlt.Include && len(excludedIDs) > 0 {
+		var quotedIDs []string
+		for _, id := range excludedIDs {
+			quotedIDs = append(quotedIDs, quoteStr(id))
+		}
+		exclCond := fmt.Sprintf("`_id` NOT IN (%s)", strings.Join(quotedIDs, ", "))
+		whereSQL = fmt.Sprintf("(%s AND %s)", whereSQL, exclCond)
+		safeWhereSQL = fmt.Sprintf("(%s AND %s)", safeWhereSQL, exclCond)
 	}
-	whereSQL := fieldPreds[0]
-	safeWhereSQL := safePreds[0]
-	if len(fieldPreds) > 1 {
-		whereSQL = "(" + strings.Join(fieldPreds, " OR ") + ")"
-		safeWhereSQL = "(" + strings.Join(safePreds, " OR ") + ")"
-	}
+
 	scoreSQL := "0.0"
 	if inScoring && boost != 0 {
 		if len(scoreTerms) == 1 {

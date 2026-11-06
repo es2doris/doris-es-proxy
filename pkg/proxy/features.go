@@ -1444,6 +1444,16 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithRouting(indexName, docID, re
 	}
 	if curIndex != indexName && reqPipeline != "_none" && defaultPipeline != "_none" {
 		destDef := s.resolveEffectivePipeline(curIndex, "", "")
+		if destDef == "" && s != nil {
+			if resolved, _, wErr := s.resolveWriteIndexWithFilter(curIndex); wErr == nil && resolved != "" && resolved != curIndex {
+				destDef = s.resolveEffectivePipeline(resolved, "", "")
+			}
+			if destDef == "" {
+				if resolved := s.resolveIndexName(curIndex); resolved != "" && resolved != curIndex {
+					destDef = s.resolveEffectivePipeline(resolved, "", "")
+				}
+			}
+		}
 		if destDef != "" && destDef != effPipeline {
 			next, nextIdx, nextID, nextRouting, dropped, nextIngestMeta, err := s.applyIngestPipelineForWriteWithRoutingAndIngestMeta(destDef, curIndex, curID, curRouting, cur, curIngestMeta)
 			if err != nil || dropped {
@@ -1620,8 +1630,71 @@ func rewriteIngestCtxReferencesWithOp(s string, preserveOp bool) string {
 				}
 				return false
 			}
+			tryChainedGet := func(after string) (string, int, bool) {
+				if !strings.HasPrefix(after, "get") || (len(after) > 3 && isIngestIdentByte(after[3])) {
+					return "", 0, false
+				}
+				idx := 3
+				for idx < len(after) && (after[idx] == ' ' || after[idx] == '\t') {
+					idx++
+				}
+				if idx >= len(after) || after[idx] != '(' {
+					return "", 0, false
+				}
+				idx++
+				for idx < len(after) && (after[idx] == ' ' || after[idx] == '\t') {
+					idx++
+				}
+				if idx >= len(after) || (after[idx] != '\'' && after[idx] != '"') {
+					return "", 0, false
+				}
+				qChar := after[idx]
+				litStart := idx
+				idx++
+				var keyBuf strings.Builder
+				for idx < len(after) {
+					if after[idx] == '\\' && idx+1 < len(after) {
+						keyBuf.WriteByte(after[idx+1])
+						idx += 2
+						continue
+					}
+					if after[idx] == qChar {
+						break
+					}
+					keyBuf.WriteByte(after[idx])
+					idx++
+				}
+				if idx >= len(after) || after[idx] != qChar {
+					return "", 0, false
+				}
+				rawQuoted := after[litStart : idx+1]
+				idx++
+				for idx < len(after) && (after[idx] == ' ' || after[idx] == '\t') {
+					idx++
+				}
+				if idx >= len(after) || after[idx] != ')' {
+					return "", 0, false
+				}
+				closeParenEnd := idx + 1
+				litKey := keyBuf.String()
+				for _, kw := range directKws {
+					if litKey == kw {
+						return "", 0, false
+					}
+				}
+				remAfterParen := strings.TrimLeft(after[closeParenEnd:], " \t")
+				if strings.HasPrefix(remAfterParen, ".") || strings.HasPrefix(remAfterParen, "?.") || strings.HasPrefix(remAfterParen, "[") || strings.HasPrefix(remAfterParen, "?[") {
+					return rawQuoted, closeParenEnd, true
+				}
+				return "", 0, false
+			}
 			if strings.HasPrefix(rest, "?.") {
 				after := rest[2:]
+				if rawLit, endOff, okG := tryChainedGet(after); okG {
+					out.WriteString("ctx?._source[" + rawLit + "]")
+					i += 4 + endOff
+					continue
+				}
 				if !isDirectDot(after) {
 					out.WriteString("ctx?._source.")
 					i += 4
@@ -1629,6 +1702,11 @@ func rewriteIngestCtxReferencesWithOp(s string, preserveOp bool) string {
 				}
 			} else if strings.HasPrefix(rest, ".") {
 				after := rest[1:]
+				if rawLit, endOff, okG := tryChainedGet(after); okG {
+					out.WriteString("ctx._source[" + rawLit + "]")
+					i += 3 + endOff
+					continue
+				}
 				if !isDirectDot(after) {
 					out.WriteString("ctx._source.")
 					i += 3
@@ -2304,28 +2382,34 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 			tok.padRight = true
 			inner = strings.TrimSuffix(inner, "->")
 		}
+		inner = strings.TrimSpace(inner)
 		switch {
 		case inner == "" || strings.HasPrefix(inner, "?"):
 			tok.skip = true
-			tok.rawKey = strings.TrimPrefix(inner, "?")
+			tok.rawKey = strings.TrimSpace(strings.TrimPrefix(inner, "?"))
 		case strings.HasPrefix(inner, "*"):
 			tok.skip = true
-			tok.rawKey = strings.TrimPrefix(inner, "*")
-		case strings.HasPrefix(inner, "+"):
-			tok.append = true
-			inner = strings.TrimPrefix(inner, "+")
+			tok.rawKey = strings.TrimSpace(strings.TrimPrefix(inner, "*"))
+		case strings.HasPrefix(inner, "+") || strings.HasPrefix(inner, "&"):
+			for strings.HasPrefix(inner, "+") || strings.HasPrefix(inner, "&") {
+				if strings.HasPrefix(inner, "+") {
+					tok.append = true
+					inner = strings.TrimPrefix(inner, "+")
+				}
+				if strings.HasPrefix(inner, "&") {
+					tok.indirect = true
+					inner = strings.TrimPrefix(inner, "&")
+				}
+			}
 			if slashIdx := strings.IndexByte(inner, '/'); slashIdx > 0 {
 				if ord, err := strconv.Atoi(inner[slashIdx+1:]); err == nil && ord > 0 {
 					tok.appendOrder = ord
 				}
 				inner = inner[:slashIdx]
 			}
-			tok.rawKey = inner
-		case strings.HasPrefix(inner, "&"):
-			tok.indirect = true
-			tok.rawKey = strings.TrimPrefix(inner, "&")
+			tok.rawKey = strings.TrimSpace(inner)
 		default:
-			tok.rawKey = inner
+			tok.rawKey = strings.TrimSpace(inner)
 		}
 		tokens = append(tokens, tok)
 	}
@@ -2363,7 +2447,7 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 			}
 		}
 		captured[i] = val
-		if !tok.indirect && tok.rawKey != "" {
+		if !tok.indirect && !tok.append && tok.rawKey != "" {
 			refValues[tok.rawKey] = val
 		}
 	}
@@ -3847,11 +3931,16 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						if fieldName == "" {
 							continue
 						}
+						if strings.HasPrefix(fieldName, "[") && strings.HasSuffix(fieldName, "]") {
+							fieldName = strings.ReplaceAll(strings.Trim(fieldName, "[]"), "][", ".")
+						}
 						var finalVal any = m[i]
 						if convT := grpTypes[grpID]; convT != "" {
-							if cv, err := convertSingleIngestValue(m[i], convT); err == nil {
-								finalVal = cv
+							cv, err := convertSingleIngestValue(m[i], convT)
+							if err != nil {
+								return false, false, procType, procTag, specMap, err
 							}
+							finalVal = cv
 						}
 						if prev, hasPrev := extracted[fieldName]; hasPrev {
 							if prevArr, isArr := prev.([]any); isArr {
@@ -4710,11 +4799,17 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			}
 		}
 	case "script":
-		src, _ := specMap["source"].(string)
-		if src == "" {
-			src, _ = specMap["inline"].(string)
+		resolvedSpec := specMap
+		if s != nil {
+			if m, ok := s.resolveStoredScriptSpec(specMap).(map[string]any); ok {
+				resolvedSpec = m
+			}
 		}
-		params, _ := specMap["params"].(map[string]any)
+		src, _ := resolvedSpec["source"].(string)
+		if src == "" {
+			src, _ = resolvedSpec["inline"].(string)
+		}
+		params, _ := resolvedSpec["params"].(map[string]any)
 		if src != "" {
 			origMetaIndex, _ := doc["_index"].(string)
 			origMetaID := ""
@@ -4931,30 +5026,46 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					dsType = s
 				}
 			}
-			dataset, hasExplicitDataset := specMap["dataset"].(string)
-			if hasExplicitDataset && dataset != "" {
-				dataset = strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(dataset, doc)))
-			} else {
-				dataset = "generic"
-				if v, ok := getIngestPath(doc, "data_stream.dataset"); ok && v != nil {
-					if s := strings.TrimSpace(fmt.Sprintf("%v", v)); s != "" {
-						dataset = s
+			resolveReroutePart := func(rawSpec any, docPath string, defaultVal string) string {
+				switch rv := rawSpec.(type) {
+				case string:
+					if rv != "" {
+						if exp := strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(rv, doc))); exp != "" {
+							return exp
+						}
 					}
-					deleteIngestPath(doc, "data_stream.dataset")
-				}
-			}
-			namespace, hasExplicitNamespace := specMap["namespace"].(string)
-			if hasExplicitNamespace && namespace != "" {
-				namespace = strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(namespace, doc)))
-			} else {
-				namespace = "default"
-				if v, ok := getIngestPath(doc, "data_stream.namespace"); ok && v != nil {
-					if s := strings.TrimSpace(fmt.Sprintf("%v", v)); s != "" {
-						namespace = s
+				case []any:
+					for _, item := range rv {
+						s := strings.TrimSpace(fmt.Sprintf("%v", item))
+						if s == "" {
+							continue
+						}
+						if strings.Contains(s, "{{") {
+							if exp := strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(s, doc))); exp != "" {
+								return exp
+							}
+							continue
+						}
+						if v, ok := getIngestPath(doc, s); ok && v != nil {
+							if vs := strings.TrimSpace(fmt.Sprintf("%v", v)); vs != "" {
+								return vs
+							}
+						} else {
+							return s
+						}
 					}
-					deleteIngestPath(doc, "data_stream.namespace")
 				}
+				out := defaultVal
+				if v, ok := getIngestPath(doc, docPath); ok && v != nil {
+					if s := strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(fmt.Sprintf("%v", v), doc))); s != "" {
+						out = s
+					}
+					deleteIngestPath(doc, docPath)
+				}
+				return out
 			}
+			dataset := resolveReroutePart(specMap["dataset"], "data_stream.dataset", "generic")
+			namespace := resolveReroutePart(specMap["namespace"], "data_stream.namespace", "default")
 			if dsObj, ok := getIngestPath(doc, "data_stream"); ok {
 				if dsMap, isMap := dsObj.(map[string]any); isMap && len(dsMap) == 0 {
 					deleteIngestPath(doc, "data_stream")
@@ -5605,16 +5716,20 @@ func convertSingleIngestValue(val any, convType string) (any, error) {
 		if iv, err := strconv.ParseInt(str, 10, 64); err == nil {
 			return iv, nil
 		}
-		if fv, err := strconv.ParseFloat(str, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
-			return int64(fv), nil
+		if !strings.Contains(str, ".") {
+			if fv, err := strconv.ParseFloat(str, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) {
+				return int64(fv), nil
+			}
 		}
 		return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
 	case "unsigned_long":
 		if uv, err := strconv.ParseUint(str, 10, 64); err == nil {
 			return uv, nil
 		}
-		if fv, err := strconv.ParseFloat(str, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv >= 0 {
-			return uint64(fv), nil
+		if !strings.Contains(str, ".") {
+			if fv, err := strconv.ParseFloat(str, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv >= 0 && fv == math.Trunc(fv) {
+				return uint64(fv), nil
+			}
 		}
 		return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
 	case "float", "double", "half_float", "scaled_float":
@@ -6274,11 +6389,16 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	if effSlice == nil {
 		effSlice = body.Source.Slice
 	}
+	var effSliceField string
+	if effSlice != nil {
+		effSliceField = effSlice.Field
+	}
 	sliceID, sliceMax, hasSlice, sliceErrStatus, sliceErrType, sliceErrReason := parseAndValidateSliceParams(r, body.Slices, effSlice)
 	if sliceErrStatus != 0 {
 		writeESError(w, sliceErrStatus, sliceErrType, sliceErrReason)
 		return
 	}
+	s.resolvePainlessScriptSpecFromRaw(&body.Script, bodyBytes)
 	if body.Conflicts == "" {
 		body.Conflicts = r.URL.Query().Get("conflicts")
 	}
@@ -6397,6 +6517,10 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	s.resolveStoredScriptsInQuery(body.Source.Query)
+	if rq, err := s.preResolveSpecialQueriesInQuery(r.Context(), srcTargets, body.Source.Query); err == nil {
+		body.Source.Query = rq
+	}
 	s.resolveTermsLookupsInQuery(r.Context(), body.Source.Query)
 	var effSort esast.SortSlice
 	if len(body.Source.Sort) > 0 {
@@ -6449,7 +6573,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 				for _, h := range hRows {
-					if hasSlice && !docMatchesSlice(h.ID, sliceID, sliceMax) {
+					if hasSlice && !docMatchesSlice(h.ID, effSliceField, h.Source, sliceID, sliceMax) {
 						continue
 					}
 					effSrcRouting := s.resolveEffectiveReadRouting(srcPattern, srcIdx, srcRoutingFilter)
@@ -6571,7 +6695,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				if maxDocs > 0 && totalMatched >= maxDocs {
 					break
 				}
-				if !useGlobalSort && hasSlice && !docMatchesSlice(h.ID, sliceID, sliceMax) {
+				if !useGlobalSort && hasSlice && !docMatchesSlice(h.ID, effSliceField, h.Source, sliceID, sliceMax) {
 					continue
 				}
 				effSrcIdx := srcIdx
@@ -7234,6 +7358,8 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 			targets = []string{"_all"}
 		}
 	}
+	s.resolveStoredScriptsInSearchRequest(&req)
+	_ = s.preResolveSpecialQueriesInSearchRequest(r.Context(), targets, &req)
 	aliasFilters = s.resolveTermsLookupsInAliasFilters(r.Context(), aliasFilters)
 	if resolved := s.resolveTermsLookupsInSearchRequest(r.Context(), &req); resolved != nil {
 		req = *resolved
@@ -7990,6 +8116,8 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "routing_missing_exception", fmt.Sprintf("routing is required for [%s]/[%s]/[%s]", indexName, "_doc", docID))
 		return
 	}
+	s.resolveStoredScriptsInSearchRequest(&req)
+	_ = s.preResolveSpecialQueriesInSearchRequest(r.Context(), []string{indexName}, &req)
 	s.resolveTermsLookupsInQuery(r.Context(), aliasFilter)
 	resolvedReq := s.resolveTermsLookupsInSearchRequest(r.Context(), &req)
 	idxSchema = s.augmentSchemaWithRuntimeMappings(idxSchema, resolvedReq.RuntimeMappings)
@@ -9098,6 +9226,24 @@ func (s *Server) handleResizeOrCloneIndex(w http.ResponseWriter, r *http.Request
 	if badAliasName != "" {
 		writeESError(w, http.StatusBadRequest, "invalid_alias_name_exception", "Invalid alias name ["+badAliasName+"], an index or data stream exists with the same name as the alias")
 		return
+	}
+	if p, found := extractDefaultPipelineFromSettings(req.Settings); found && p != "" && p != "_none" && p != "none" {
+		s.mu.RLock()
+		_, pipeExists := s.pipelines[p]
+		s.mu.RUnlock()
+		if !pipeExists {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("pipeline with id [%s] does not exist", p))
+			return
+		}
+	}
+	if fp, found := extractFinalPipelineFromSettings(req.Settings); found && fp != "" && fp != "_none" && fp != "none" {
+		s.mu.RLock()
+		_, pipeExists := s.pipelines[fp]
+		s.mu.RUnlock()
+		if !pipeExists {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("pipeline with id [%s] does not exist", fp))
+			return
+		}
 	}
 
 	effectiveMappings := schema.MergeMappingSpecs(srcSchema.RawMapping, req.Mappings)

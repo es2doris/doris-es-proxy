@@ -300,8 +300,8 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 	for pass := 0; pass < 4; pass++ {
 		changed := false
 		for k, b := range s.Fields {
-			if b.AliasTarget != "" && b.ColumnName == "" {
-				if tb, ok := s.Fields[b.AliasTarget]; ok && tb.ColumnName != "" {
+			if b.AliasTarget != "" && b.ColumnName == "" && (b.ESType == "" || b.ESType == "alias") {
+				if tb, ok := s.Fields[b.AliasTarget]; ok && (tb.ColumnName != "" || (tb.ESType != "" && tb.ESType != "alias")) {
 					aliased := tb
 					aliased.ESFieldPath = k
 					aliased.AliasTarget = b.AliasTarget
@@ -318,9 +318,9 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 
 	// Any remaining unresolved alias (pointing to a dynamic/unmapped field or disabled object) falls back to StorageDynamicVariant on AliasTarget.
 	for k, b := range s.Fields {
-		if b.AliasTarget != "" && b.ColumnName == "" {
+		if b.AliasTarget != "" && b.ColumnName == "" && (b.ESType == "" || b.ESType == "alias") {
 			cleanTarget := strings.TrimSuffix(b.AliasTarget, ".keyword")
-			if tb, ok := s.Fields[cleanTarget]; ok && (tb.ColumnName != "" || tb.EnabledFalse || tb.NotIndexed) {
+			if tb, ok := s.Fields[cleanTarget]; ok && (tb.ColumnName != "" || tb.EnabledFalse || tb.NotIndexed || (tb.ESType != "" && tb.ESType != "alias")) {
 				aliased := tb
 				aliased.ESFieldPath = k
 				aliased.AliasTarget = b.AliasTarget
@@ -855,20 +855,28 @@ func (s *IndexSchema) registerLeafField(
 	notIndexed := (prop.Index != nil && !*prop.Index) || (prop.Enabled != nil && !*prop.Enabled)
 	docValuesFalse := (prop.DocValues != nil && !*prop.DocValues) || (prop.Enabled != nil && !*prop.Enabled)
 
-	if IsRangeFieldType(esType) {
+	if esType == "search_as_you_type" && prop.Analyzer == "" {
+		prop.Analyzer = "standard"
+	}
+
+	if IsRangeFieldType(esType) || esType == "flattened" || esType == "percolator" || esType == "geo_shape" {
 		s.Fields[dotPath] = FieldBinding{
-			ESFieldPath:     dotPath,
-			SourceJSONPath:  sourceJSONPath,
-			Kind:            StorageDynamicVariant,
-			ColumnName:      "",
-			DorisType:       DorisVariant,
-			ESType:          esType,
-			Format:          prop.Format,
-			NestedPath:      activeNestedRoot,
-			Coerce:          prop.Coerce,
-			IgnoreMalformed: prop.IgnoreMalformed,
-			NotIndexed:      notIndexed,
-			DocValuesFalse:  docValuesFalse,
+			ESFieldPath:         dotPath,
+			SourceJSONPath:      sourceJSONPath,
+			Kind:                StorageDynamicVariant,
+			ColumnName:          "",
+			DorisType:           DorisVariant,
+			ESType:              esType,
+			Format:              prop.Format,
+			LowercaseNormalizer: lowerNorm,
+			NestedPath:          activeNestedRoot,
+			CopyTo:              copyTo,
+			NullValue:           prop.NullValue,
+			IgnoreAbove:         prop.IgnoreAbove,
+			Coerce:              prop.Coerce,
+			IgnoreMalformed:     prop.IgnoreMalformed,
+			NotIndexed:          notIndexed,
+			DocValuesFalse:      docValuesFalse,
 		}
 		return
 	}
@@ -1016,15 +1024,34 @@ func (s *IndexSchema) ResolveField(esFieldPath string) FieldBinding {
 			break
 		}
 		prefix = prefix[:idx]
-		if pb, ok := s.Fields[prefix]; ok && pb.EnabledFalse {
-			return FieldBinding{
-				ESFieldPath:    esFieldPath,
-				SourceJSONPath: strings.Split(strings.TrimSuffix(esFieldPath, ".keyword"), "."),
-				Kind:           StorageDynamicVariant,
-				DorisType:      DorisString,
-				NotIndexed:     true,
-				EnabledFalse:   true,
-				DocValuesFalse: true,
+		if pb, ok := s.Fields[prefix]; ok {
+			if pb.EnabledFalse {
+				return FieldBinding{
+					ESFieldPath:    esFieldPath,
+					SourceJSONPath: strings.Split(strings.TrimSuffix(esFieldPath, ".keyword"), "."),
+					Kind:           StorageDynamicVariant,
+					DorisType:      DorisString,
+					NotIndexed:     true,
+					EnabledFalse:   true,
+					DocValuesFalse: true,
+				}
+			}
+			if pb.ESType == "flattened" {
+				cleanPath := strings.TrimSuffix(esFieldPath, ".keyword")
+				suffixSegs := strings.Split(strings.TrimPrefix(cleanPath, prefix+"."), ".")
+				srcPath := append(append([]string{}, pb.SourceJSONPath...), suffixSegs...)
+				return FieldBinding{
+					ESFieldPath:         esFieldPath,
+					SourceJSONPath:      srcPath,
+					Kind:                StorageDynamicVariant,
+					DorisType:           DorisString,
+					ESType:              "flattened",
+					NestedPath:          pb.NestedPath,
+					LowercaseNormalizer: pb.LowercaseNormalizer,
+					IgnoreAbove:         pb.IgnoreAbove,
+					NotIndexed:          pb.NotIndexed,
+					DocValuesFalse:      pb.DocValuesFalse,
+				}
 			}
 		}
 	}
@@ -1133,9 +1160,9 @@ func (s *IndexSchema) ExpandFieldPattern(patternWithBoost string) []BoostedField
 
 func mapESTypeToDoris(esType string) DorisScalarType {
 	switch strings.ToLower(strings.TrimSpace(esType)) {
-	case "integer_range", "long_range", "float_range", "double_range", "date_range", "ip_range":
+	case "integer_range", "long_range", "float_range", "double_range", "date_range", "ip_range", "flattened", "percolator", "geo_shape":
 		return DorisVariant
-	case "keyword", "constant_keyword", "wildcard", "ip":
+	case "keyword", "constant_keyword", "wildcard", "ip", "version":
 		return DorisVarchar
 	case "text", "match_only_text", "search_as_you_type", "completion", "annotated-text", "annotated_text":
 		return DorisString
@@ -1248,9 +1275,40 @@ func InferMappingFromSampleDocs(docs []json.RawMessage, existing ...*esast.Mappi
 		Properties: props,
 	}
 	if baseSpec != nil {
-		return MergeMappingSpecs(inferredSpec, baseSpec)
+		out := *baseSpec
+		out.Properties = mergeInferredIntoExistingProps(baseSpec.Properties, inferredSpec.Properties)
+		return &out
 	}
 	return inferredSpec
+}
+
+func mergeInferredIntoExistingProps(
+	existingProps, inferredProps map[string]esast.FieldProperty,
+) map[string]esast.FieldProperty {
+	out := DeepMergeMappingProperties(nil, existingProps)
+	for k, infProp := range inferredProps {
+		exProp, exists := out[k]
+		if !exists {
+			copied := infProp
+			if len(infProp.Properties) > 0 {
+				copied.Properties = DeepMergeMappingProperties(nil, infProp.Properties)
+			}
+			if len(infProp.Fields) > 0 {
+				copied.Fields = DeepMergeMappingProperties(nil, infProp.Fields)
+			}
+			out[k] = copied
+			continue
+		}
+		if (exProp.Enabled != nil && !*exProp.Enabled) ||
+			(exProp.Type != "" && !strings.EqualFold(exProp.Type, "object") && !strings.EqualFold(exProp.Type, "nested")) {
+			continue
+		}
+		if len(infProp.Properties) > 0 {
+			exProp.Properties = mergeInferredIntoExistingProps(exProp.Properties, infProp.Properties)
+			out[k] = exProp
+		}
+	}
+	return out
 }
 
 func inferObjectPropertiesWithOpts(obj map[string]any, dst map[string]esast.FieldProperty, pathPrefix string, depth int, totalFields *int, opts inferOptions) {
@@ -1403,6 +1461,95 @@ func matchDynamicTemplatePattern(pattern, candidate, matchPatternType string) bo
 	return re.MatchString(candidate)
 }
 
+func matchesDynamicMappingType(rawMMT any, detectedType string) bool {
+	if rawMMT == nil {
+		return true
+	}
+	matchSingle := func(s string) bool {
+		s = strings.ToLower(strings.TrimSpace(s))
+		if s == "" || s == "*" || s == detectedType {
+			return true
+		}
+		return (s == "double" || s == "float") && (detectedType == "double" || detectedType == "float")
+	}
+	switch v := rawMMT.(type) {
+	case string:
+		return matchSingle(v)
+	case []string:
+		if len(v) == 0 {
+			return true
+		}
+		for _, item := range v {
+			if matchSingle(item) {
+				return true
+			}
+		}
+		return false
+	case []any:
+		if len(v) == 0 {
+			return true
+		}
+		for _, item := range v {
+			if s, ok := item.(string); ok && matchSingle(s) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func substituteDynamicTemplatePlaceholders(fp *esast.FieldProperty, fieldName, detectedType string) {
+	if fp == nil {
+		return
+	}
+	dynTypeForFieldType := detectedType
+	if dynTypeForFieldType == "string" {
+		dynTypeForFieldType = "text"
+	}
+	replaceStr := func(s, dynVal string) string {
+		s = strings.ReplaceAll(s, "{name}", fieldName)
+		s = strings.ReplaceAll(s, "{dynamic_type}", dynVal)
+		return s
+	}
+	if fp.Type != "" {
+		fp.Type = replaceStr(fp.Type, dynTypeForFieldType)
+	}
+	if fp.Path != "" {
+		fp.Path = replaceStr(fp.Path, detectedType)
+	}
+	switch ct := fp.CopyTo.(type) {
+	case string:
+		fp.CopyTo = replaceStr(ct, detectedType)
+	case []string:
+		out := make([]string, len(ct))
+		for i, item := range ct {
+			out[i] = replaceStr(item, detectedType)
+		}
+		fp.CopyTo = out
+	case []any:
+		out := make([]any, len(ct))
+		for i, item := range ct {
+			if s, ok := item.(string); ok {
+				out[i] = replaceStr(s, detectedType)
+			} else {
+				out[i] = item
+			}
+		}
+		fp.CopyTo = out
+	}
+	if len(fp.Fields) > 0 {
+		newFields := make(map[string]esast.FieldProperty, len(fp.Fields))
+		for subKey, subProp := range fp.Fields {
+			newKey := replaceStr(subKey, detectedType)
+			substituteDynamicTemplatePlaceholders(&subProp, fieldName, detectedType)
+			newFields[newKey] = subProp
+		}
+		fp.Fields = newFields
+	}
+}
+
 func applyMatchingDynamicTemplate(fieldName, fullPath, detectedType string, templates []map[string]any) (esast.FieldProperty, bool) {
 	if len(templates) == 0 || detectedType == "" {
 		return esast.FieldProperty{}, false
@@ -1419,13 +1566,8 @@ func applyMatchingDynamicTemplate(fieldName, fullPath, detectedType string, temp
 			}
 		}
 		for _, rule := range rules {
-			mmt, _ := rule["match_mapping_type"].(string)
-			mmt = strings.ToLower(strings.TrimSpace(mmt))
-			if mmt != "" && mmt != "*" && mmt != detectedType {
-				isFloatCompat := (mmt == "double" || mmt == "float") && (detectedType == "double" || detectedType == "float")
-				if !isFloatCompat {
-					continue
-				}
+			if !matchesDynamicMappingType(rule["match_mapping_type"], detectedType) {
+				continue
 			}
 			mpType, _ := rule["match_pattern"].(string)
 			if matchPat, ok := rule["match"].(string); ok && matchPat != "" {
@@ -1460,13 +1602,7 @@ func applyMatchingDynamicTemplate(fieldName, fullPath, detectedType string, temp
 			if err := json.Unmarshal(b, &fp); err != nil {
 				continue
 			}
-			if fp.Type == "{dynamic_type}" {
-				if detectedType == "string" {
-					fp.Type = "text"
-				} else {
-					fp.Type = detectedType
-				}
-			}
+			substituteDynamicTemplatePlaceholders(&fp, fieldName, detectedType)
 			return fp, true
 		}
 	}
@@ -1516,6 +1652,22 @@ func inferValuePropertyWithOpts(val any, fieldName, fullPath string, depth int, 
 		}
 		return esast.FieldProperty{Type: "keyword"}, true
 	case map[string]any:
+		if len(opts.dynamicTemplates) > 0 {
+			if tmplProp, matched := applyMatchingDynamicTemplate(fieldName, fullPath, "object", opts.dynamicTemplates); matched {
+				if (tmplProp.Enabled != nil && !*tmplProp.Enabled) ||
+					(tmplProp.Type != "" && !strings.EqualFold(tmplProp.Type, "object") && !strings.EqualFold(tmplProp.Type, "nested")) {
+					return tmplProp, true
+				}
+				if depth+1 < maxInferredDepth {
+					childProps := make(map[string]esast.FieldProperty)
+					inferObjectPropertiesWithOpts(v, childProps, fullPath, depth+1, totalFields, opts)
+					if len(childProps) > 0 {
+						tmplProp.Properties = DeepMergeMappingProperties(childProps, tmplProp.Properties)
+					}
+				}
+				return tmplProp, true
+			}
+		}
 		if depth+1 >= maxInferredDepth {
 			return esast.FieldProperty{}, false
 		}

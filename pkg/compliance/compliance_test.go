@@ -22,11 +22,11 @@ func TestRunEmbeddedSuite(t *testing.T) {
 	RunEmbeddedSuite(t, ts.URL)
 
 	report := RunSuiteFS(t, EmbeddedSpecsFS, ts.URL)
-	if report.FilesRun != 11 {
-		t.Fatalf("expected 11 embedded spec files, got %d", report.FilesRun)
+	if report.FilesRun != 15 {
+		t.Fatalf("expected 15 embedded spec files, got %d", report.FilesRun)
 	}
-	if report.SectionsRun < 50 {
-		t.Fatalf("expected at least 50 spec test sections, got %d", report.SectionsRun)
+	if report.SectionsRun < 65 {
+		t.Fatalf("expected at least 65 spec test sections, got %d", report.SectionsRun)
 	}
 }
 
@@ -663,4 +663,203 @@ setup:
 	ctx.trackCreatedResources("ilm.put_lifecycle", map[string]any{"policy": "ilm1"}, nil)
 	ctx.trackCreatedResources("enrich.put_policy", map[string]any{"name": "ep1"}, nil)
 	ctx.cleanupAll()
+}
+
+func TestRunnerRound48Features(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"acknowledged":true}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	ctx := newRunnerContext(ts.Client(), ts.URL)
+
+	// F0: Verify all 30+ newly added rest-api-spec actions in buildActionRequest
+	r48Actions := []struct {
+		action     string
+		params     map[string]any
+		wantMethod string
+		wantPath   string
+	}{
+		// Scripts & Search Templates
+		{"put_script", map[string]any{"id": "s1", "body": map[string]any{"script": map[string]any{"lang": "painless", "source": "1"}}}, http.MethodPut, "/_scripts/s1"},
+		{"put_script", map[string]any{"id": "s1", "context": "score", "timeout": "10s", "body": map[string]any{}}, http.MethodPut, "/_scripts/s1/score"},
+		{"get_script", map[string]any{"id": "s1", "master_timeout": "5s"}, http.MethodGet, "/_scripts/s1"},
+		{"delete_script", map[string]any{"id": "s1", "timeout": "5s"}, http.MethodDelete, "/_scripts/s1"},
+		{"execute_painless_execute", map[string]any{"body": map[string]any{"script": map[string]any{"source": "1+1"}}}, http.MethodPost, "/_scripts/painless/_execute"},
+		{"scripts_painless_execute", map[string]any{"script": map[string]any{"source": "1+1"}, "context": "score"}, http.MethodPost, "/_scripts/painless/_execute"},
+		{"search_template", map[string]any{"body": map[string]any{"id": "s1"}}, http.MethodPost, "/_search/template"},
+		{"search_template", map[string]any{"index": []any{"idx1", "idx2"}, "typed_keys": true, "body": map[string]any{"id": "s1"}}, http.MethodPost, "/idx1,idx2/_search/template"},
+		{"render_search_template", map[string]any{}, http.MethodGet, "/_render/template"},
+		{"render_search_template", map[string]any{"id": "s1", "body": map[string]any{"params": map[string]any{"q": "foo"}}}, http.MethodPost, "/_render/template/s1"},
+		{"msearch_template", map[string]any{"body": []any{map[string]any{}, map[string]any{"id": "s1"}}}, http.MethodPost, "/_msearch/template"},
+		{"msearch_template", map[string]any{"index": "idx1", "body": []any{map[string]any{}, map[string]any{"id": "s1"}}}, http.MethodPost, "/idx1/_msearch/template"},
+
+		// Term Vectors, Rank Eval & Vector Tiles
+		{"termvectors", map[string]any{"index": "idx1"}, http.MethodGet, "/idx1/_termvectors"},
+		{"termvectors", map[string]any{"index": "idx1", "id": "doc1", "fields": []any{"f1", "f2"}}, http.MethodGet, "/idx1/_termvectors/doc1"},
+		{"indices.get_termvectors", map[string]any{"index": "idx1", "id": "doc1", "body": map[string]any{"fields": []any{"f1"}}}, http.MethodPost, "/idx1/_termvectors/doc1"},
+		{"mtermvectors", map[string]any{"body": map[string]any{"ids": []any{"1", "2"}}}, http.MethodPost, "/_mtermvectors"},
+		{"mtermvectors", map[string]any{"index": "idx1", "ids": []any{"1", "2"}}, http.MethodPost, "/idx1/_mtermvectors"},
+		{"rank_eval", map[string]any{"body": map[string]any{"requests": []any{}}}, http.MethodPost, "/_rank_eval"},
+		{"rank_eval", map[string]any{"index": []any{"idx1", "idx2"}, "body": map[string]any{"requests": []any{}}}, http.MethodPost, "/idx1,idx2/_rank_eval"},
+		{"search_mvt", map[string]any{"index": "idx1", "field": "geo", "zoom": 5, "x": 10, "y": 12, "grid_precision": 4}, http.MethodGet, "/idx1/_mvt/geo/5/10/12"},
+
+		// cat.* Endpoints
+		{"cat.allocation", map[string]any{"v": true}, http.MethodGet, "/_cat/allocation"},
+		{"cat.allocation", map[string]any{"node_id": []any{"n1", "n2"}, "format": "json"}, http.MethodGet, "/_cat/allocation/n1,n2"},
+		{"cat.fielddata", map[string]any{}, http.MethodGet, "/_cat/fielddata"},
+		{"cat.fielddata", map[string]any{"fields": []any{"f1", "f2"}}, http.MethodGet, "/_cat/fielddata/f1,f2"},
+		{"cat.master", map[string]any{"v": true}, http.MethodGet, "/_cat/master"},
+		{"cat.nodeattrs", map[string]any{"h": "node,attr,value"}, http.MethodGet, "/_cat/nodeattrs"},
+		{"cat.pending_tasks", map[string]any{}, http.MethodGet, "/_cat/pending_tasks"},
+		{"cat.plugins", map[string]any{}, http.MethodGet, "/_cat/plugins"},
+		{"cat.recovery", map[string]any{}, http.MethodGet, "/_cat/recovery"},
+		{"cat.recovery", map[string]any{"index": []any{"i1", "i2"}}, http.MethodGet, "/_cat/recovery/i1,i2"},
+		{"cat.repositories", map[string]any{}, http.MethodGet, "/_cat/repositories"},
+		{"cat.segments", map[string]any{}, http.MethodGet, "/_cat/segments"},
+		{"cat.segments", map[string]any{"index": "i1"}, http.MethodGet, "/_cat/segments/i1"},
+		{"cat.tasks", map[string]any{}, http.MethodGet, "/_cat/tasks"},
+		{"cat.thread_pool", map[string]any{}, http.MethodGet, "/_cat/thread_pool"},
+		{"cat.thread_pool", map[string]any{"thread_pool_patterns": []any{"search", "write"}}, http.MethodGet, "/_cat/thread_pool/search,write"},
+		{"cat.templates", map[string]any{}, http.MethodGet, "/_cat/templates"},
+		{"cat.templates", map[string]any{"name": "tmpl*"}, http.MethodGet, "/_cat/templates/tmpl*"},
+
+		// indices.*, tasks.*, cluster.*, nodes.* Endpoints
+		{"indices.recovery", map[string]any{"detailed": true}, http.MethodGet, "/_recovery"},
+		{"indices.recovery", map[string]any{"index": "idx1", "active_only": true}, http.MethodGet, "/idx1/_recovery"},
+		{"indices.segments", map[string]any{"verbose": true}, http.MethodGet, "/_segments"},
+		{"indices.segments", map[string]any{"index": "idx1"}, http.MethodGet, "/idx1/_segments"},
+		{"indices.shard_stores", map[string]any{"status": "green"}, http.MethodGet, "/_shard_stores"},
+		{"indices.shard_stores", map[string]any{"index": "idx1"}, http.MethodGet, "/idx1/_shard_stores"},
+		{"indices.clear_cache", map[string]any{"fielddata": true}, http.MethodPost, "/_cache/clear"},
+		{"indices.clear_cache", map[string]any{"index": "idx1", "query": true}, http.MethodPost, "/idx1/_cache/clear"},
+		{"indices.open", map[string]any{"index": "idx1", "wait_for_active_shards": "1"}, http.MethodPost, "/idx1/_open"},
+		{"indices.close", map[string]any{"index": "idx1"}, http.MethodPost, "/idx1/_close"},
+		{"tasks.list", map[string]any{"detailed": true, "actions": "*search"}, http.MethodGet, "/_tasks"},
+		{"tasks.get", map[string]any{"task_id": "node1:123"}, http.MethodGet, "/_tasks/node1:123"},
+		{"tasks.cancel", map[string]any{"nodes": "node1"}, http.MethodPost, "/_tasks/_cancel"},
+		{"tasks.cancel", map[string]any{"task_id": "node1:123"}, http.MethodPost, "/_tasks/node1:123/_cancel"},
+		{"cluster.allocation_explain", map[string]any{"include_disk_info": true}, http.MethodGet, "/_cluster/allocation/explain"},
+		{"cluster.allocation_explain", map[string]any{"body": map[string]any{"index": "idx1", "shard": 0, "primary": true}}, http.MethodPost, "/_cluster/allocation/explain"},
+		{"cluster.pending_tasks", map[string]any{"local": true}, http.MethodGet, "/_cluster/pending_tasks"},
+		{"cluster.reroute", map[string]any{"dry_run": true, "body": map[string]any{"commands": []any{}}}, http.MethodPost, "/_cluster/reroute"},
+		{"nodes.usage", map[string]any{}, http.MethodGet, "/_nodes/usage"},
+		{"nodes.usage", map[string]any{"node_id": "n1"}, http.MethodGet, "/_nodes/n1/usage"},
+		{"nodes.usage", map[string]any{"metric": "rest_actions"}, http.MethodGet, "/_nodes/usage/rest_actions"},
+		{"nodes.usage", map[string]any{"node_id": "n1", "metric": "rest_actions"}, http.MethodGet, "/_nodes/n1/usage/rest_actions"},
+		{"nodes.hot_threads", map[string]any{"threads": 3}, http.MethodGet, "/_nodes/hot_threads"},
+		{"nodes.hot_threads", map[string]any{"node_id": "n1", "ignore_idle_threads": true}, http.MethodGet, "/_nodes/n1/hot_threads"},
+	}
+
+	for _, tc := range r48Actions {
+		spec, err := ctx.buildActionRequest(tc.action, tc.params)
+		if err != nil {
+			t.Fatalf("buildActionRequest(%s, %v) failed: %v", tc.action, tc.params, err)
+		}
+		if spec.method != tc.wantMethod || spec.path != tc.wantPath {
+			t.Fatalf("buildActionRequest(%s): got %s %s, want %s %s", tc.action, spec.method, spec.path, tc.wantMethod, tc.wantPath)
+		}
+	}
+
+	r48MissingParamActions := []string{
+		"put_script", "get_script", "delete_script",
+		"termvectors", "indices.get_termvectors", "search_mvt",
+		"indices.open", "indices.close", "tasks.get",
+	}
+	for _, act := range r48MissingParamActions {
+		if _, err := ctx.buildActionRequest(act, map[string]any{}); err == nil {
+			t.Fatalf("expected missing param error for %s", act)
+		}
+	}
+
+	// Resource tracking for put_script
+	ctx.trackCreatedResources("put_script", map[string]any{"id": "my_script"}, nil)
+	if _, ok := ctx.createdScripts["my_script"]; !ok {
+		t.Fatal("expected put_script to track script id in createdScripts")
+	}
+	ctx.cleanupAll()
+
+	// F1: supportedRunnerFeatures
+	if err := ctx.execSkip(map[string]any{
+		"features": "node_selector, default_shards, stash_in_key, arbitrary_key, painless, mustache",
+	}); err != nil {
+		t.Fatalf("expected Round 48 supportedRunnerFeatures not to skip, got: %v", err)
+	}
+
+	// F1: execDo client-side missing parameter catches with bad_request and regex
+	for _, catchVal := range []string{"param", "bad_request", "/requires index parameter/"} {
+		doStep := NewOrderedMap()
+		doStep.Set("catch", catchVal)
+		doStep.Set("indices.open", NewOrderedMap())
+		if err := ctx.execDo(doStep, false); err != nil {
+			t.Fatalf("expected catch: %q to succeed on missing param error, got: %v", catchVal, err)
+		}
+	}
+	doStepFail := NewOrderedMap()
+	doStepFail.Set("catch", "/non_matching_regex/")
+	doStepFail.Set("indices.open", NewOrderedMap())
+	if err := ctx.execDo(doStepFail, false); err == nil {
+		t.Fatal("expected non-matching regex catch on missing param error to fail")
+	}
+
+	// F1: verifyCatch for unavailable, gateway_timeout, numeric status codes, and plain text / status regex
+	if err := ctx.verifyCatch("unavailable", "test", http.StatusServiceUnavailable, "service unavailable", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctx.verifyCatch("gateway_timeout", "test", http.StatusGatewayTimeout, "gateway timeout", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctx.verifyCatch("gateway_timeout", "test", http.StatusOK, "ok", nil); err == nil {
+		t.Fatal("expected gateway_timeout catch to fail on 200 OK")
+	}
+	if err := ctx.verifyCatch("503", "test", http.StatusServiceUnavailable, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctx.verifyCatch("404", "test", http.StatusNotFound, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctx.verifyCatch("404", "test", http.StatusBadRequest, "", nil); err == nil {
+		t.Fatal("expected numeric status catch 404 to fail on 400")
+	}
+	if err := ctx.verifyCatch("/plain text error/", "test", http.StatusInternalServerError, "some plain text error body", "some plain text error body"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctx.verifyCatch("/^503$/", "test", http.StatusServiceUnavailable, "", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// F1: execTransformAndSet with non-string scalars, base64Decode, and trim
+	ctx.lastResponse = map[string]any{
+		"num_id":   int64(42),
+		"bool_val": true,
+		"padded":   "   hello world \n\t ",
+		"b64_std":  "aGVsbG8td29ybGQ=",
+		"b64_raw":  "aGVsbG8td29ybGQ",
+		"b64_url":  "aGVsbG9fd29ybGQ-",
+	}
+	if err := ctx.execTransformAndSet(map[string]any{
+		"num_upper":  "upper(num_id)",
+		"bool_lower": "lower(bool_val)",
+		"trimmed":    "trim(padded)",
+		"dec_std":    "base64Decode(b64_std)",
+		"dec_raw":    "base64Decode(b64_raw)",
+		"dec_url":    "base64Decode(b64_url)",
+	}); err != nil {
+		t.Fatalf("execTransformAndSet failed: %v", err)
+	}
+	if ctx.stash["num_upper"] != "42" ||
+		ctx.stash["bool_lower"] != "true" ||
+		ctx.stash["trimmed"] != "hello world" ||
+		ctx.stash["dec_std"] != "hello-world" ||
+		ctx.stash["dec_raw"] != "hello-world" ||
+		ctx.stash["dec_url"] != "hello_world>" {
+		t.Fatalf("unexpected stash values after Round 48 transform_and_set: %#v", ctx.stash)
+	}
+	ctx.lastResponse = map[string]any{"bad_b64": "!!!not_base64!!!"}
+	if err := ctx.execTransformAndSet(map[string]any{"out": "base64Decode(bad_b64)"}); err == nil {
+		t.Fatal("expected base64Decode to fail on invalid base64 input")
+	}
 }

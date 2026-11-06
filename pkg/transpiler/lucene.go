@@ -155,7 +155,7 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 	if scoring && qsq.Boost != nil && *qsq.Boost != 1.0 && compiled.ScoreSQL != "" && compiled.ScoreSQL != "0.0" {
 		compiled.ScoreSQL = fmt.Sprintf("((%s) * %.4f)", compiled.ScoreSQL, *qsq.Boost)
 	}
-	if !isSimple && (flags.queryType == "" || flags.queryType == "best_fields" || flags.queryType == "most_fields") && flags.quoteFieldSuffix == "" && flags.timeZone == "" && flags.phraseSlop == 0 && flags.fuzziness == nil && compiled.WhereSQL != "FALSE" {
+	if !isSimple && (flags.queryType == "" || flags.queryType == "best_fields" || flags.queryType == "most_fields") && flags.quoteFieldSuffix == "" && flags.timeZone == "" && flags.phraseSlop == 0 && flags.fuzziness == nil && (flags.lenient == nil || !*flags.lenient) && compiled.WhereSQL != "FALSE" {
 		if rewrittenRaw, ok := t.rewriteDoris4SearchQuery(raw); ok && t.Opts.UseDoris4SearchFunc && nctx == nil && qsq.MinimumShouldMatch == nil && defaultField != "__unmatched_wildcard__" && !strings.ContainsAny(raw, "[{><~/^\\") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, "`n__") && !strings.Contains(compiled.WhereSQL, " IS NOT NULL") && !strings.Contains(compiled.WhereSQL, "array_size(") {
 			if len(expandedFields) > 1 {
 				if canEmitMultiFieldDoris4SearchDisjunction(rewrittenRaw, defaultOp) {
@@ -1339,7 +1339,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 		if isQuoted && val != "" {
 			return esast.Query{
 				MatchPhrase: map[string]esast.PhraseEntry{
-					field: {Query: val, Slop: slop, Boost: boost, HasBoost: true},
+					field: {Query: val, Slop: slop, Lenient: flags.lenient, Boost: boost, HasBoost: true},
 				},
 			}
 		}
@@ -1553,7 +1553,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 		}
 		return esast.Query{
 			MatchPhrase: map[string]esast.PhraseEntry{
-				targetDefaultField: {Query: cleanVal, Slop: slop, Boost: boost, HasBoost: true},
+				targetDefaultField: {Query: cleanVal, Slop: slop, Lenient: flags.lenient, Boost: boost, HasBoost: true},
 			},
 		}
 	}
