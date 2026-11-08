@@ -44,6 +44,7 @@
         body:
           ids: ["doc1"]
   - length: { docs: 1 }
+  - match: { docs.0._index: "tv_test" }
   - match: { docs.0._id: "doc1" }
   - match: { docs.0.found: true }
 

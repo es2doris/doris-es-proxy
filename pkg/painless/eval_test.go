@@ -2673,3 +2673,381 @@ func TestRound49PainlessFindingsF23ToF29(t *testing.T) {
 		}
 	})
 }
+
+func TestRound50PainlessFindings(t *testing.T) {
+	t.Run("F20_MethodReferencesStreamTakeDropWhileAndOptional", func(t *testing.T) {
+		res, err := Eval(nil, `
+			List<String> raw = ["  Alpha ", null, "BETA", "  gamma "];
+			List<String> cleaned = raw.stream()
+				.filter(Objects::nonNull)
+				.map(String::trim)
+				.map(String::toLowerCase)
+				.collect(Collectors.toList());
+
+			int sumParsed = ["10", "20", "30"].stream()
+				.mapToInt(Integer::parseInt)
+				.sum();
+
+			int redSum = [1, 2, 3, 4].stream()
+				.reduce(0, Integer::sum);
+
+			List<Integer> taken = [1, 2, 3, 10, 4, 5].stream()
+				.takeWhile(x -> x < 5)
+				.collect(Collectors.toList());
+
+			List<Integer> dropped = [1, 2, 3, 10, 4, 5].stream()
+				.dropWhile(x -> x < 5)
+				.collect(Collectors.toList());
+
+			int flatSum = [[1, 2], [3, 4]].stream()
+				.flatMapToInt(List::stream)
+				.sum();
+
+			List<String> words = ["bb", "a", "ccc"];
+			words.sort(Comparator.comparingInt(String::length).reversed());
+
+			List<String> mutList = ["a", null, "b"];
+			mutList.removeIf(Objects::isNull);
+			mutList.replaceAll(String::toUpperCase);
+
+			Map<String, List<String>> grouped = new HashMap();
+			grouped.computeIfAbsent("k", ArrayList::new).add("v1");
+			Map<String, Integer> counts = new HashMap();
+			counts.merge("hits", 2, Integer::sum);
+			counts.merge("hits", 3, Integer::sum);
+
+			def log = [];
+			Optional.of("present").ifPresentOrElse(log::add, () -> log.add("empty"));
+			Optional.empty().ifPresentOrElse(log::add, () -> log.add("fallback_action"));
+			String orVal = Optional.empty().or(() -> Optional.of("recovered")).orElse("none");
+			List<String> optStreamList = Optional.of("item").stream().map(String::toUpperCase).collect(Collectors.toList());
+
+			return [
+				String.join(",", cleaned),
+				sumParsed,
+				redSum,
+				taken.size(),
+				dropped.size(),
+				flatSum,
+				String.join(",", words),
+				String.join(",", mutList),
+				grouped.get("k").get(0),
+				counts.get("hits"),
+				String.join(",", log),
+				orVal,
+				optStreamList.get(0)
+			];
+		`, nil)
+		if err != nil {
+			t.Fatalf("F20 Eval failed: %v", err)
+		}
+		arr, ok := res.([]any)
+		if !ok || len(arr) != 13 {
+			t.Fatalf("unexpected F20 result: %#v", res)
+		}
+		if arr[0] != "alpha,beta,gamma" ||
+			arr[1] != int64(60) ||
+			arr[2] != int64(10) ||
+			arr[3] != int64(3) ||
+			arr[4] != int64(3) ||
+			arr[5] != int64(10) ||
+			arr[6] != "ccc,bb,a" ||
+			arr[7] != "A,B" ||
+			arr[8] != "v1" ||
+			arr[9] != int64(5) ||
+			arr[10] != "present,fallback_action" ||
+			arr[11] != "recovered" ||
+			arr[12] != "ITEM" {
+			t.Fatalf("unexpected F20 values: %#v", arr)
+		}
+	})
+
+	t.Run("F21_LocalTimeAndTemporalBridges", func(t *testing.T) {
+		res, err := Eval(nil, `
+			LocalTime t1 = LocalTime.of(14, 30, 15);
+			LocalTime t2 = LocalTime.parse("09:05");
+			LocalTime t3 = t2.plusHours(2).plusMinutes(10).withSecond(30);
+			int secOfDay = t1.toSecondOfDay();
+			long nanoOfDay = LocalTime.of(0, 0, 1, 500).toNanoOfDay();
+			LocalTime fromSec = LocalTime.ofSecondOfDay(3661);
+			LocalDate d = LocalDate.of(2025, 3, 15);
+			String dt1 = d.atTime(t2);
+			String dt2 = d.atTime(18, 45);
+			String dt3 = t1.atDate(d);
+			String dt4 = LocalDateTime.of(d, t1);
+			String sod = d.atStartOfDay();
+			LocalTime extracted = ZonedDateTime.parse("2025-03-15T16:20:00Z").toLocalTime();
+			boolean isLt = t1 instanceof LocalTime;
+			return [
+				t1.toString(),
+				t2.toString(),
+				t3.toString(),
+				secOfDay,
+				nanoOfDay,
+				fromSec.toString(),
+				dt1,
+				dt2,
+				dt3,
+				dt4,
+				sod,
+				extracted.toString(),
+				LocalTime.MIDNIGHT,
+				LocalTime.NOON,
+				isLt
+			];
+		`, nil)
+		if err != nil {
+			t.Fatalf("F21 Eval failed: %v", err)
+		}
+		arr, ok := res.([]any)
+		if !ok || len(arr) != 15 {
+			t.Fatalf("unexpected F21 result: %#v", res)
+		}
+		if arr[0] != "14:30:15" ||
+			arr[1] != "09:05" ||
+			arr[2] != "11:15:30" ||
+			arr[3] != int64(52215) ||
+			arr[4] != int64(1_000_000_500) ||
+			arr[5] != "01:01:01" ||
+			arr[6] != "2025-03-15T09:05" ||
+			arr[7] != "2025-03-15T18:45" ||
+			arr[8] != "2025-03-15T14:30:15" ||
+			arr[9] != "2025-03-15T14:30:15" ||
+			arr[10] != "2025-03-15T00:00" ||
+			arr[11] != "16:20" ||
+			arr[12] != "00:00" ||
+			arr[13] != "12:00" ||
+			arr[14] != true {
+			t.Fatalf("unexpected F21 values: %#v", arr)
+		}
+	})
+
+	t.Run("F22_BigDecimalAndRoundingMode", func(t *testing.T) {
+		res, err := Eval(nil, `
+			BigDecimal price = new BigDecimal("19.99");
+			BigDecimal tax = price.multiply(new BigDecimal("0.0825")).setScale(2, RoundingMode.HALF_UP);
+			BigDecimal total = price.add(tax);
+			BigDecimal q = new BigDecimal("10").divide(new BigDecimal("3"), 4, RoundingMode.HALF_UP);
+			BigDecimal stripped = new BigDecimal("12.3400").stripTrailingZeros();
+			BigDecimal viaVal = BigDecimal.valueOf(12345, 2);
+			int cmp = total.compareTo(new BigDecimal("21.64"));
+			boolean isBd = total instanceof BigDecimal && total instanceof Number;
+			return [
+				tax.toPlainString(),
+				total.toString(),
+				total.doubleValue(),
+				q.toPlainString(),
+				stripped.toPlainString(),
+				viaVal.toPlainString(),
+				total.scale(),
+				total.precision(),
+				total.signum(),
+				cmp,
+				BigDecimal.TEN.subtract(BigDecimal.ONE).intValue(),
+				isBd
+			];
+		`, nil)
+		if err != nil {
+			t.Fatalf("F22 Eval failed: %v", err)
+		}
+		arr, ok := res.([]any)
+		if !ok || len(arr) != 12 {
+			t.Fatalf("unexpected F22 result: %#v", res)
+		}
+		if arr[0] != "1.65" ||
+			arr[1] != "21.64" ||
+			arr[2] != float64(21.64) ||
+			arr[3] != "3.3333" ||
+			arr[4] != "12.34" ||
+			arr[5] != "123.45" ||
+			arr[6] != int64(2) ||
+			arr[7] != int64(4) ||
+			arr[8] != int64(1) ||
+			arr[9] != int64(0) ||
+			arr[10] != int64(9) ||
+			arr[11] != true {
+			t.Fatalf("unexpected F22 values: %#v", arr)
+		}
+	})
+
+	t.Run("F23_NumericWrapperStaticMethodsAndConstants", func(t *testing.T) {
+		res, err := Eval(nil, `
+			int bc = Integer.bitCount(255);
+			long lbc = Long.bitCount(255L);
+			int hob = Integer.highestOneBit(20);
+			int lob = Integer.lowestOneBit(20);
+			int nlz = Integer.numberOfLeadingZeros(1);
+			int ntz = Integer.numberOfTrailingZeros(8);
+			int rotL = Integer.rotateLeft(1, 4);
+			int rotR = Integer.rotateRight(16, 2);
+			int sgn = Integer.signum(-42);
+			int decHex = Integer.decode("0xFF");
+			int decHash = Integer.decode("#10");
+			boolean nanCheck = Double.isNaN(Double.NaN);
+			boolean infCheck = Double.isInfinite(Double.POSITIVE_INFINITY);
+			boolean finCheck = Double.isFinite(42.5) && !Double.isFinite(Double.NEGATIVE_INFINITY);
+			return [
+				bc, lbc, hob, lob, nlz, ntz, rotL, rotR, sgn, decHex, decHash,
+				nanCheck, infCheck, finCheck,
+				Integer.BYTES, Long.SIZE, Short.MAX_VALUE, Byte.MIN_VALUE
+			];
+		`, nil)
+		if err != nil {
+			t.Fatalf("F23 Eval failed: %v", err)
+		}
+		arr, ok := res.([]any)
+		if !ok || len(arr) != 18 {
+			t.Fatalf("unexpected F23 result: %#v", res)
+		}
+		if arr[0] != int64(8) ||
+			arr[1] != int64(8) ||
+			arr[2] != int64(16) ||
+			arr[3] != int64(4) ||
+			arr[4] != int64(31) ||
+			arr[5] != int64(3) ||
+			arr[6] != int64(16) ||
+			arr[7] != int64(4) ||
+			arr[8] != int64(-1) ||
+			arr[9] != int64(255) ||
+			arr[10] != int64(16) ||
+			arr[11] != true ||
+			arr[12] != true ||
+			arr[13] != true ||
+			arr[14] != int64(4) ||
+			arr[15] != int64(64) ||
+			arr[16] != int64(32767) ||
+			arr[17] != int64(-128) {
+			t.Fatalf("unexpected F23 values: %#v", arr)
+		}
+	})
+
+	t.Run("F26_ParamsSourceRawUnflattenedNestedArrayAccess", func(t *testing.T) {
+		rawNested := map[string]any{
+			"items": []any{
+				map[string]any{"price": int64(10), "qty": int64(2)},
+				map[string]any{"price": int64(5), "qty": int64(3)},
+			},
+		}
+		flattenedDoc := map[string]any{
+			"items.price":  []any{int64(10), int64(5)},
+			"items.qty":    []any{int64(2), int64(3)},
+			"__raw_source": rawNested,
+		}
+		res, err := Eval(flattenedDoc, `
+			int total = 0;
+			for (def item : params._source.items) {
+				total += item.price * item.qty;
+			}
+			return total + params._source['items'][0]['price'];
+		`, nil)
+		if err != nil {
+			t.Fatalf("F26 Eval failed: %v", err)
+		}
+		if res != int64(45) {
+			t.Fatalf("expected 45 from params._source.items loop, got %#v", res)
+		}
+	})
+
+	t.Run("F20_F21_F22_F23_ExtendedBranchCoverage", func(t *testing.T) {
+		res, err := Eval(nil, `
+			BigDecimal a = new BigDecimal(100);
+			BigDecimal b = new BigDecimal(12.5);
+			BigDecimal c = new BigDecimal("+1.25e2");
+			BigDecimal d = new BigDecimal("-0.005");
+			BigDecimal z = new BigDecimal("0.00").stripTrailingZeros();
+			BigDecimal negScale = new BigDecimal("100").stripTrailingZeros();
+			BigDecimal sUp = new BigDecimal("1.234").setScale(2, RoundingMode.UP);
+			BigDecimal sDown = new BigDecimal("1.239").setScale(2, RoundingMode.DOWN);
+			BigDecimal sCeil = new BigDecimal("-1.234").setScale(2, RoundingMode.CEILING);
+			BigDecimal sFloor = new BigDecimal("-1.234").setScale(2, RoundingMode.FLOOR);
+			BigDecimal sHalfDown = new BigDecimal("1.235").setScale(2, RoundingMode.HALF_DOWN);
+			BigDecimal sHalfEven = new BigDecimal("1.225").setScale(2, RoundingMode.HALF_EVEN);
+			BigDecimal sUnnec = new BigDecimal("1.20").setScale(1, RoundingMode.UNNECESSARY);
+			BigDecimal sSame = sUnnec.setScale(1, RoundingMode.HALF_UP);
+			BigDecimal sWider = sUnnec.setScale(3, RoundingMode.HALF_UP);
+			List<String> Modes = new ArrayList();
+			for (int i = 0; i < 8; i++) {
+				Modes.add(RoundingMode.valueOf(i));
+			}
+			BigDecimal alignedSum = new BigDecimal("1.2").add(new BigDecimal("3.456")).add(new BigDecimal("0.1"));
+			BigDecimal rem = new BigDecimal("10.5").remainder(new BigDecimal("3"));
+			BigDecimal p = new BigDecimal("1.5").pow(2);
+			BigDecimal mn = a.min(b);
+			BigDecimal mx = a.max(b);
+			long lv = negScale.longValue() + sWider.longValue();
+			double fv = d.floatValue();
+			BigDecimal absD = d.abs();
+			BigDecimal negD = d.negate();
+			BigDecimal plusD = d.plus();
+
+			def optList = Optional.empty().orElseGet(ArrayList::new);
+			def optMap = Optional.empty().orElseGet(HashMap::new);
+			def optSet = Optional.empty().orElseGet(HashSet::new);
+			def optSb = Optional.empty().orElseGet(StringBuilder::new);
+			def optStr = Optional.empty().orElseGet(String::new);
+
+			def parsedLongs = ["10", "20"].stream().map(Long::parseLong).collect(Collectors.toList());
+			def parsedDoubles = ["1.5", "2.5"].stream().map(Double::parseDouble).collect(Collectors.toList());
+			def parsedFloats = ["1.5"].stream().map(Float::parseFloat).collect(Collectors.toList());
+			def parsedShorts = ["5"].stream().map(Short::parseShort).collect(Collectors.toList());
+			def parsedBytes = ["3"].stream().map(Byte::parseByte).collect(Collectors.toList());
+			def parsedBools = ["true", "false"].stream().map(Boolean::parseBoolean).collect(Collectors.toList());
+			def parsedBds = ["1.25", "2.75"].stream().map(BigDecimal::new).collect(Collectors.toList());
+			def bdValOf = [10, 20].stream().map(BigDecimal::valueOf).reduce(BigDecimal.ZERO, BigDecimal::add);
+			def nullCnt = [null, "a", null].stream().filter(Objects::isNull).count();
+			def strVals = [1, 2].stream().map(String::valueOf).map(Objects::toString).collect(Collectors.toList());
+			def absVals = [-5, 3].stream().map(Math::abs).collect(Collectors.toList());
+			def longSum = [10L, 20L].stream().reduce(0L, Long::sum);
+			def dblSum = [1.5, 2.5].stream().reduce(0.0, Double::sum);
+			def minVal = [5, 2, 8].stream().reduce(99, Math::min);
+			def catStr = ["a", "b", "c"].stream().reduce("", String::concat);
+			def words = ["b", "A", "c"];
+			words.sort(String::compareToIgnoreCase);
+			def nums = [3, 1, 2];
+			nums.sort(Integer::compare);
+
+			long wSum = Integer.sum(1, 2) + Long.sum(3L, 4L) + Integer.max(1, 5) + Long.max(2L, 6L) + Integer.min(1, 5) + Long.min(2L, 6L);
+			double dSum = Double.sum(1.0, 2.0) + Float.sum(1.0, 2.0) + Double.max(1.0, 5.0) + Double.min(1.0, 5.0);
+			long bitOps = Long.highestOneBit(32L) + Long.lowestOneBit(24L) + Long.numberOfLeadingZeros(1L) + Long.numberOfTrailingZeros(16L) +
+				Long.rotateLeft(1L, 2) + Long.rotateRight(8L, 1) + Integer.reverse(1) + Long.reverse(1L) +
+				Integer.reverseBytes(256) + Long.reverseBytes(256L) + Short.reverseBytes(256) + Long.signum(-5L) +
+				Long.decode("-0x10") + Short.decode("010") + Byte.decode("+12");
+
+			LocalTime ltNano = LocalTime.of(14, 30, 15, 123000000);
+			LocalTime ltNow = LocalTime.now(ZoneId.of("UTC"));
+			String ltMax = LocalTime.MAX;
+
+			return [
+				d.toPlainString(), z.toPlainString(), negScale.toPlainString(),
+				sUp.toPlainString(), sDown.toPlainString(), sCeil.toPlainString(), sFloor.toPlainString(),
+				sHalfDown.toPlainString(), sHalfEven.toPlainString(), sSame.toPlainString(), sWider.toPlainString(),
+				Modes.size(), alignedSum.toPlainString(), rem.toPlainString(), p.toPlainString(),
+				mn.toPlainString(), mx.toPlainString(), lv, fv < 0, absD.toPlainString(), negD.toPlainString(), plusD.toPlainString(),
+				optList.size(), optMap.size(), optSet.size(), optSb.length(), optStr.length(),
+				parsedLongs.size(), parsedDoubles.size(), parsedFloats.size(), parsedShorts.size(), parsedBytes.size(), parsedBools.size(), parsedBds.size(),
+				bdValOf.toPlainString(), nullCnt, strVals.size(), absVals[0], longSum, dblSum, minVal, catStr, words[0], nums[0],
+				wSum > 0, dSum > 0, bitOps != 0, ltNano.startsWith("14:30:15"), ltNow.length() >= 5, ltMax.startsWith("23:59:59")
+			];
+		`, nil)
+		if err != nil {
+			t.Fatalf("Extended branch coverage Eval failed: %v", err)
+		}
+		if arr, ok := res.([]any); !ok || len(arr) == 0 {
+			t.Fatalf("unexpected extended result: %#v", res)
+		}
+
+		// Also test ApplyUpdate JSON marshaling of BigDecimal, StringBuilder, and Period
+		updated, err := ApplyUpdate(json.RawMessage(`{"x": 1}`), &UpdateRequest{
+			Script: &ScriptSpec{
+				Source: `
+					ctx._source.bd = new BigDecimal("42.50");
+					ctx._source.sb = new StringBuilder("hello").append("!");
+					ctx._source.per = Period.ofDays(3);
+				`,
+			},
+		})
+		if err != nil || !strings.Contains(string(updated), "42.50") || !strings.Contains(string(updated), "hello!") || !strings.Contains(string(updated), "P3D") {
+			t.Fatalf("ApplyUpdate MarshalJSON failed: %s err=%v", string(updated), err)
+		}
+	})
+}

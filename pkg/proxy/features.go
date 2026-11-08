@@ -917,8 +917,19 @@ func (s *Server) handleResolveIndex(w http.ResponseWriter, r *http.Request) {
 		idxNames = append(idxNames, name)
 	}
 	sort.Strings(idxNames)
+	ew := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("expand_wildcards")))
+	isWildcardReq := strings.Contains(pattern, "*") || strings.Contains(pattern, ",") || pattern == "_all"
 	for _, name := range idxNames {
 		if matchMultiWildcardWithExclusions(pattern, name) {
+			isClosed := s.closedIndices[name]
+			if isWildcardReq {
+				if ew == "open" && isClosed {
+					continue
+				}
+				if ew == "closed" && !isClosed {
+					continue
+				}
+			}
 			var idxAliases []string
 			for al, targets := range s.aliases {
 				for _, t := range targets {
@@ -928,9 +939,16 @@ func (s *Server) handleResolveIndex(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			sort.Strings(idxAliases)
+			attrs := []string{"open"}
+			isOpen := true
+			if isClosed {
+				attrs = []string{"close"}
+				isOpen = false
+			}
 			entry := map[string]any{
 				"name":       name,
-				"attributes": []string{"open"},
+				"attributes": attrs,
+				"open":       isOpen,
 			}
 			if len(idxAliases) > 0 {
 				entry["aliases"] = idxAliases
@@ -1300,13 +1318,29 @@ func isSupportedIngestProcessorType(procType string) bool {
 	switch procType {
 	case "drop", "fail", "pipeline", "dissect", "set", "default", "rename", "copy",
 		"remove", "lowercase", "uppercase", "trim", "split", "join", "append",
-		"convert", "gsub", "json", "kv", "dot_expander", "urlencode", "urldecode",
+		"convert", "gsub", "json", "kv", "dot_expander", "urlencode", "url_encode", "URLEncode",
+		"urldecode", "url_decode", "URLDecode",
 		"bytes", "html_strip", "date", "date_index_name", "grok", "sort", "compact",
 		"dedup", "dedupe", "fingerprint", "redact", "attachment", "csv", "user_agent",
 		"uri_parts", "registered_domain", "network_direction", "community_id",
 		"geoip", "enrich", "foreach", "script", "inference", "set_security_user",
 		"circle", "reroute":
 		return true
+	}
+	return false
+}
+
+func isEmptyIngestSetValue(v any) bool {
+	if v == nil {
+		return true
+	}
+	switch tv := v.(type) {
+	case string:
+		return tv == ""
+	case []any:
+		return len(tv) == 0
+	case map[string]any:
+		return len(tv) == 0
 	}
 	return false
 }
@@ -2140,13 +2174,22 @@ func convertESDateFormatToGoLayouts(esFmt string) []string {
 		"MMM", "Jan",
 		"MM", "01",
 		"M", "1",
+		"EEEE", "Monday",
+		"EEE", "Mon",
 		"dd", "02",
 		"d", "2",
 		"HH", "15",
 		"H", "15",
+		"hh", "03",
+		"h", "3",
 		"mm", "04",
 		"ss", "05",
+		"SSSSSSSSS", "000000000",
+		"SSSSSS", "000000",
 		"SSS", "000",
+		"SS", "00",
+		"S", "0",
+		"a", "PM",
 		"XXX", "Z07:00",
 		"XX", "Z0700",
 		"X", "Z07",
@@ -2198,8 +2241,15 @@ func convertESDateFormatToGoLayouts(esFmt string) []string {
 	}
 	layout := b.String()
 	layouts := []string{layout}
+	flexFrac := strings.NewReplacer("000000000", "999999999", "000000", "999999", "000", "999").Replace(layout)
+	if flexFrac != layout {
+		layouts = append(layouts, flexFrac)
+	}
 	if hasUnquotedZ {
 		layouts = append(layouts, strings.ReplaceAll(layout, "Z0700", "Z07:00"))
+		if flexFrac != layout {
+			layouts = append(layouts, strings.ReplaceAll(flexFrac, "Z0700", "Z07:00"))
+		}
 	}
 	return layouts
 }
@@ -2785,6 +2835,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 	case "set":
 		if field, _ := specMap["field"].(string); field != "" {
 			field = fmt.Sprintf("%v", expandIngestTemplate(field, doc))
+			ignoreEmpty, _ := specMap["ignore_empty_value"].(bool)
 			if copyFrom, _ := specMap["copy_from"].(string); copyFrom != "" {
 				copyFrom = fmt.Sprintf("%v", expandIngestTemplate(copyFrom, doc))
 				val, exists := getIngestPath(doc, copyFrom)
@@ -2792,6 +2843,9 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					if isExplicitIgnoreMissingFalse(specMap) {
 						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", copyFrom)
 					}
+					return false, false, procType, procTag, specMap, nil
+				}
+				if ignoreEmpty && isEmptyIngestSetValue(val) {
 					return false, false, procType, procTag, specMap, nil
 				}
 				if override, hasOverride := specMap["override"].(bool); hasOverride && !override {
@@ -2807,7 +2861,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						return false, false, procType, procTag, specMap, nil
 					}
 				}
-				setIngestPath(doc, field, deepCloneIngestValue(expandIngestTemplate(val, doc)))
+				expandedVal := expandIngestTemplate(val, doc)
+				if ignoreEmpty && isEmptyIngestSetValue(expandedVal) {
+					return false, false, procType, procTag, specMap, nil
+				}
+				setIngestPath(doc, field, deepCloneIngestValue(expandedVal))
 				mutated = true
 			}
 		}
@@ -3626,17 +3684,12 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				}
 			}
 		}
-	case "urlencode":
+	case "urlencode", "url_encode", "URLEncode":
 		field, _ := specMap["field"].(string)
-		if strings.Contains(field, "{{") {
-			field = fmt.Sprintf("%v", expandIngestTemplate(field, doc))
-		}
+		field = expandIngestFieldName(field, doc)
 		target := field
 		if tf, _ := specMap["target_field"].(string); tf != "" {
-			if strings.Contains(tf, "{{") {
-				tf = fmt.Sprintf("%v", expandIngestTemplate(tf, doc))
-			}
-			target = tf
+			target = expandIngestFieldName(tf, doc)
 		}
 		if field != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
@@ -3662,7 +3715,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
 		}
-	case "urldecode":
+	case "urldecode", "url_decode", "URLDecode":
 		field, _ := specMap["field"].(string)
 		field = expandIngestFieldName(field, doc)
 		target := field
@@ -3763,17 +3816,47 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		if tf, _ := specMap["target_field"].(string); tf != "" {
 			target = expandIngestFieldName(tf, doc)
 		}
+		escapedTags := make(map[string]bool)
+		if rawEsc, ok := specMap["escaped_tags"].([]any); ok {
+			for _, t := range rawEsc {
+				if ts, ok := t.(string); ok && ts != "" {
+					escapedTags[strings.ToLower(strings.TrimSpace(ts))] = true
+				}
+			}
+		}
+		stripHTMLStr := func(s string) string {
+			if len(escapedTags) == 0 {
+				return html.UnescapeString(reHTMLTags.ReplaceAllString(s, ""))
+			}
+			stripped := reHTMLTags.ReplaceAllStringFunc(s, func(tag string) string {
+				inner := strings.TrimSpace(tag)
+				inner = strings.TrimPrefix(inner, "<")
+				inner = strings.TrimSuffix(inner, ">")
+				inner = strings.TrimSpace(inner)
+				inner = strings.TrimPrefix(inner, "/")
+				inner = strings.TrimSuffix(inner, "/")
+				inner = strings.TrimSpace(inner)
+				if spIdx := strings.IndexAny(inner, " \t\r\n"); spIdx >= 0 {
+					inner = inner[:spIdx]
+				}
+				if escapedTags[strings.ToLower(inner)] {
+					return tag
+				}
+				return ""
+			})
+			return html.UnescapeString(stripped)
+		}
 		if field != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
 				switch v := val.(type) {
 				case string:
-					setIngestPath(doc, target, html.UnescapeString(reHTMLTags.ReplaceAllString(v, "")))
+					setIngestPath(doc, target, stripHTMLStr(v))
 					mutated = true
 				case []any:
 					outArr := make([]any, len(v))
 					for idx, el := range v {
 						if sEl, ok := el.(string); ok {
-							outArr[idx] = html.UnescapeString(reHTMLTags.ReplaceAllString(sEl, ""))
+							outArr[idx] = stripHTMLStr(sEl)
 						} else {
 							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
 						}
@@ -3800,28 +3883,46 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			tzName = fmt.Sprintf("%v", expandIngestTemplate(tzName, doc))
 		}
 		outFmt, _ := specMap["output_format"].(string)
+		formatOneDate := func(rawVal any) (string, error) {
+			parsedTime, err := parseIngestDateValue(fmt.Sprintf("%v", rawVal), formats, tzName)
+			if err != nil {
+				return "", err
+			}
+			if outFmt != "" {
+				layouts := convertESDateFormatToGoLayouts(outFmt)
+				switch layouts[0] {
+				case "UNIX_MS":
+					return strconv.FormatInt(parsedTime.UnixMilli(), 10), nil
+				case "UNIX":
+					return strconv.FormatInt(parsedTime.Unix(), 10), nil
+				default:
+					return parsedTime.Format(layouts[0]), nil
+				}
+			}
+			return parsedTime.Format(time.RFC3339Nano), nil
+		}
 		if field != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				parsedTime, err := parseIngestDateValue(fmt.Sprintf("%v", val), formats, tzName)
-				if err != nil {
-					return false, false, procType, procTag, specMap, err
-				}
-				var formatted string
-				if outFmt != "" {
-					layouts := convertESDateFormatToGoLayouts(outFmt)
-					switch layouts[0] {
-					case "UNIX_MS":
-						formatted = strconv.FormatInt(parsedTime.UnixMilli(), 10)
-					case "UNIX":
-						formatted = strconv.FormatInt(parsedTime.Unix(), 10)
-					default:
-						formatted = parsedTime.Format(layouts[0])
+				switch v := val.(type) {
+				case []any:
+					outArr := make([]any, len(v))
+					for idx, el := range v {
+						formatted, err := formatOneDate(el)
+						if err != nil {
+							return false, false, procType, procTag, specMap, err
+						}
+						outArr[idx] = formatted
 					}
-				} else {
-					formatted = parsedTime.Format(time.RFC3339Nano)
+					setIngestPath(doc, target, outArr)
+					mutated = true
+				default:
+					formatted, err := formatOneDate(v)
+					if err != nil {
+						return false, false, procType, procTag, specMap, err
+					}
+					setIngestPath(doc, target, formatted)
+					mutated = true
 				}
-				setIngestPath(doc, target, formatted)
-				mutated = true
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
@@ -4378,9 +4479,6 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						mutated = true
 						return mutated, false, procType, procTag, specMap, nil
 					}
-					if !ignoreMissing && strVal == "" {
-						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is empty", field)
-					}
 					return false, false, procType, procTag, specMap, nil
 				}
 				comma := ','
@@ -4416,7 +4514,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				cr := csv.NewReader(strings.NewReader(strVal))
 				cr.Comma = comma
 				cr.TrimLeadingSpace = trimFlag
-				cr.LazyQuotes = true
+				cr.LazyQuotes = false
 				record, err := cr.Read()
 				if err != nil {
 					return false, false, procType, procTag, specMap, err
@@ -4711,6 +4809,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				switch coll := val.(type) {
 				case []any:
 					outArr := make([]any, len(coll))
+					copy(outArr, coll)
 					elemChanged := false
 					for idx, elem := range coll {
 						ingestMeta, _ := doc["_ingest"].(map[string]any)
@@ -4727,7 +4826,12 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 							mutated = true
 						}
 						if subErr != nil {
-							restoreIngestVal()
+							if elemChanged {
+								if _, stillExists := getIngestPath(doc, field); stillExists {
+									setIngestPath(doc, field, outArr)
+									mutated = true
+								}
+							}
 							return mutated, false, procType, procTag, specMap, subErr
 						}
 						if subDropped {
@@ -4741,6 +4845,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						}
 						if !reflect.DeepEqual(outArr[idx], initValSnapshot) {
 							elemChanged = true
+							if _, stillExists := getIngestPath(doc, field); stillExists {
+								setIngestPath(doc, field, outArr)
+								mutated = true
+							}
 						}
 					}
 					restoreIngestVal()
@@ -4774,7 +4882,6 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 							mutated = true
 						}
 						if subErr != nil {
-							restoreIngestVal()
 							return mutated, false, procType, procTag, specMap, subErr
 						}
 						if subDropped {
@@ -5300,6 +5407,10 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 			}
 			if ignoreFail {
 				if curIngest, ok := doc["_ingest"].(map[string]any); ok {
+					if procType == "foreach" {
+						delete(curIngest, "_value")
+						delete(curIngest, "_key")
+					}
 					if hadPrevMsg {
 						curIngest["on_failure_message"] = prevMsg
 					} else {
@@ -5341,6 +5452,12 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 				if subMut {
 					mutated = true
 				}
+				if procType == "foreach" {
+					if curIngest, ok := doc["_ingest"].(map[string]any); ok {
+						delete(curIngest, "_value")
+						delete(curIngest, "_key")
+					}
+				}
 				if subDropped {
 					return mutated, true, nil
 				}
@@ -5365,6 +5482,12 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 					}
 				}
 				continue
+			}
+			if procType == "foreach" {
+				if curIngest, ok := doc["_ingest"].(map[string]any); ok {
+					delete(curIngest, "_value")
+					delete(curIngest, "_key")
+				}
 			}
 			ingestMeta, _ := doc["_ingest"].(map[string]any)
 			if ingestMeta == nil {
@@ -8015,6 +8138,25 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 		IndexFilter     *esast.Query `json:"index_filter,omitempty"`
 	}
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		var rawMap map[string]any
+		if err := json.Unmarshal(bodyBytes, &rawMap); err != nil {
+			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+			return
+		}
+		for k := range rawMap {
+			switch k {
+			case "field", "string", "size", "index_filter", "case_insensitive", "search_after", "timeout":
+			default:
+				writeESError(w, http.StatusBadRequest, "parsing_exception", fmt.Sprintf("[terms_enum] unknown field [%s]", k))
+				return
+			}
+		}
+		if rawSize, hasSize := rawMap["size"]; hasSize {
+			if sz, ok := toInt64(rawSize); !ok || sz <= 0 {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "size must be greater than 0")
+				return
+			}
+		}
 		if err := json.Unmarshal(bodyBytes, &req); err != nil {
 			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
 			return
@@ -8024,11 +8166,34 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "field must be specified for _terms_enum")
 		return
 	}
+	rawIndex := strings.TrimSpace(r.PathValue("index"))
+	if rawIndex != "" {
+		targets, _, ok := s.resolveValidatedReadTargets(w, r, rawIndex)
+		if !ok {
+			return
+		}
+		s.mu.RLock()
+		for _, idxName := range targets {
+			if sch := s.indices[idxName]; sch != nil {
+				if fb, exists := sch.Fields[req.Field]; exists && fb.ESType != "" {
+					switch fb.ESType {
+					case "keyword", "constant_keyword", "flattened", "version", "wildcard":
+					default:
+						s.mu.RUnlock()
+						writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+							fmt.Sprintf("field [%s] is of an unsupported type [%s] for terms_enum", req.Field, fb.ESType))
+						return
+					}
+				}
+			}
+		}
+		s.mu.RUnlock()
+	}
 	limit := req.Size
 	if limit <= 0 {
 		limit = 10
 	}
-	aggSize := 1000
+	aggSize := 10000
 	if limit > aggSize {
 		aggSize = limit * 2
 	}

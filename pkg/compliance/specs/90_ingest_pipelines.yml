@@ -156,3 +156,53 @@
         id: "p1"
   - match: { _source.env: "production" }
   - match: { _source.code: 201 }
+
+---
+"Simulate Round 50 ingest processors set ignore_empty_value url_encode html_strip date array csv and foreach":
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - set:
+                  field: "skip_empty"
+                  value: ""
+                  ignore_empty_value: true
+              - url_encode:
+                  field: "raw_q"
+                  target_field: "{{enc_target}}"
+              - html_strip:
+                  field: "html_in"
+                  escaped_tags: ["b"]
+              - date:
+                  field: "dates"
+                  target_field: "parsed_dates"
+                  formats: ["EEE yyyy-MM-dd hh:mm:ss.SSSSSS a"]
+                  output_format: "yyyy-MM-dd"
+              - csv:
+                  field: "empty_csv"
+                  target_fields: ["c1", "c2"]
+              - foreach:
+                  field: "nums"
+                  processor:
+                    convert:
+                      field: "_ingest._value"
+                      type: "integer"
+                  on_failure:
+                    - set:
+                        field: "failed_elem"
+                        value: "{{_ingest._value}}"
+          docs:
+            - _source:
+                raw_q: "a b"
+                enc_target: "encoded_q"
+                html_in: "<p>hello <b>bold</b></p>"
+                dates: ["Wed 2026-07-01 02:30:00.123456 PM"]
+                empty_csv: ""
+                nums: ["10", "bad_int", "30"]
+  - is_false: docs.0.doc._source.skip_empty
+  - match: { docs.0.doc._source.encoded_q: "a+b" }
+  - match: { docs.0.doc._source.parsed_dates.0: "2026-07-01" }
+  - match: { docs.0.doc._source.failed_elem: "bad_int" }
+  - match: { docs.0.doc._source.nums.0: 10 }
+

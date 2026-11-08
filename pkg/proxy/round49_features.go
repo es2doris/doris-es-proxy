@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -239,6 +240,15 @@ func (s *Server) handleSnapshotRoot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+func cloneSnapshotWithoutInternal(snapObj map[string]any) map[string]any {
+	if snapObj == nil {
+		return nil
+	}
+	cp := deepCloneDocMap(snapObj)
+	delete(cp, "__schemas")
+	return cp
+}
+
 // handleSnapshotRepo implements `/_snapshot/{repository}` (including `/_snapshot/_all` and `/_snapshot/_status`) (F1).
 func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 	repo := strings.TrimSpace(r.PathValue("repository"))
@@ -255,6 +265,14 @@ func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 				out[k] = deepCloneDocMap(v)
 			}
 			s.mu.RUnlock()
+			if r.Method == http.MethodHead {
+				if len(out) == 0 {
+					w.WriteHeader(http.StatusNotFound)
+				} else {
+					w.WriteHeader(http.StatusOK)
+				}
+				return
+			}
 			writeJSON(w, http.StatusOK, out)
 			return
 		}
@@ -274,11 +292,23 @@ func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 				out[pat] = deepCloneDocMap(v)
 			} else {
 				s.mu.RUnlock()
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
 				writeESError(w, http.StatusNotFound, "repository_missing_exception", fmt.Sprintf("[%s] missing", pat))
 				return
 			}
 		}
 		s.mu.RUnlock()
+		if r.Method == http.MethodHead {
+			if len(out) == 0 {
+				w.WriteHeader(http.StatusNotFound)
+			} else {
+				w.WriteHeader(http.StatusOK)
+			}
+			return
+		}
 		writeJSON(w, http.StatusOK, out)
 	case http.MethodPut, http.MethodPost:
 		if repo == "" {
@@ -457,6 +487,19 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 			},
 		}
 		s.mu.Lock()
+		if s.snapshots != nil && s.snapshots[repo] != nil && s.snapshots[repo][snap] != nil {
+			s.mu.Unlock()
+			writeESError(w, http.StatusBadRequest, "invalid_snapshot_name_exception",
+				fmt.Sprintf("[%s:%s] Invalid snapshot name [%s], snapshot with the same name already exists", repo, snap, snap))
+			return
+		}
+		savedSchemas := make(map[string]*schema.IndexSchema, len(indices))
+		for _, idxName := range indices {
+			if sch := s.indices[idxName]; sch != nil {
+				savedSchemas[idxName] = sch
+			}
+		}
+		snapObj["__schemas"] = savedSchemas
 		if s.snapshots == nil {
 			s.snapshots = make(map[string]map[string]map[string]any)
 		}
@@ -464,10 +507,11 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 			s.snapshots[repo] = make(map[string]map[string]any)
 		}
 		s.snapshots[repo][snap] = snapObj
+		respSnap := cloneSnapshotWithoutInternal(snapObj)
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"accepted": true,
-			"snapshot": snapObj,
+			"snapshot": respSnap,
 		})
 	case http.MethodGet, http.MethodHead:
 		s.mu.RLock()
@@ -480,7 +524,7 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 			}
 			sort.Strings(names)
 			for _, k := range names {
-				matched = append(matched, deepCloneDocMap(bySnap[k]))
+				matched = append(matched, cloneSnapshotWithoutInternal(bySnap[k]))
 			}
 		} else {
 			for _, pat := range strings.Split(snap, ",") {
@@ -497,18 +541,30 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 					}
 					sort.Strings(names)
 					for _, k := range names {
-						matched = append(matched, deepCloneDocMap(bySnap[k]))
+						matched = append(matched, cloneSnapshotWithoutInternal(bySnap[k]))
 					}
 				} else if obj, exists := bySnap[pat]; exists {
-					matched = append(matched, deepCloneDocMap(obj))
+					matched = append(matched, cloneSnapshotWithoutInternal(obj))
 				} else {
 					s.mu.RUnlock()
+					if r.Method == http.MethodHead {
+						w.WriteHeader(http.StatusNotFound)
+						return
+					}
 					writeESError(w, http.StatusNotFound, "snapshot_missing_exception", fmt.Sprintf("[%s:%s] is missing", repo, pat))
 					return
 				}
 			}
 		}
 		s.mu.RUnlock()
+		if r.Method == http.MethodHead {
+			if len(matched) == 0 {
+				w.WriteHeader(http.StatusNotFound)
+			} else {
+				w.WriteHeader(http.StatusOK)
+			}
+			return
+		}
 		if matched == nil {
 			matched = []any{}
 		}
@@ -551,8 +607,12 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 	s.mu.RLock()
 	_, repoExists := s.snapshotRepos[repo]
 	var snapObj map[string]any
+	var savedSchemas map[string]*schema.IndexSchema
 	if repoExists && s.snapshots[repo] != nil {
-		snapObj = deepCloneDocMap(s.snapshots[repo][snap])
+		if rawSnap := s.snapshots[repo][snap]; rawSnap != nil {
+			savedSchemas, _ = rawSnap["__schemas"].(map[string]*schema.IndexSchema)
+			snapObj = cloneSnapshotWithoutInternal(rawSnap)
+		}
 	}
 	s.mu.RUnlock()
 
@@ -571,12 +631,103 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
 			return
 		}
-		_, _ = readRequestBody(w, r)
+		bodyBytes, ok := readRequestBody(w, r)
+		if !ok {
+			return
+		}
+		var reqMap map[string]any
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &reqMap); err != nil {
+				writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+				return
+			}
+		}
+		var snapIndices []string
+		switch iv := snapObj["indices"].(type) {
+		case []string:
+			snapIndices = append(snapIndices, iv...)
+		case []any:
+			for _, item := range iv {
+				if sStr, okS := item.(string); okS && sStr != "" {
+					snapIndices = append(snapIndices, sStr)
+				}
+			}
+		}
+		sourceIndices := snapIndices
+		if rawReqIdx := reqMap["indices"]; rawReqIdx != nil {
+			var patterns []string
+			switch iv := rawReqIdx.(type) {
+			case string:
+				for _, p := range strings.Split(iv, ",") {
+					if p = strings.TrimSpace(p); p != "" {
+						patterns = append(patterns, p)
+					}
+				}
+			case []any:
+				for _, item := range iv {
+					if str := strings.TrimSpace(fmt.Sprintf("%v", item)); str != "" {
+						patterns = append(patterns, str)
+					}
+				}
+			}
+			if len(patterns) > 0 {
+				joinedPat := strings.Join(patterns, ",")
+				filtered := make([]string, 0, len(snapIndices))
+				for _, idxName := range snapIndices {
+					if joinedPat == "_all" || joinedPat == "*" || matchMultiWildcardWithExclusions(joinedPat, idxName) {
+						filtered = append(filtered, idxName)
+					}
+				}
+				sourceIndices = filtered
+			}
+		}
+		var renameRe *regexp.Regexp
+		renamePattern, _ := reqMap["rename_pattern"].(string)
+		renameReplacement, _ := reqMap["rename_replacement"].(string)
+		if renamePattern != "" {
+			var err error
+			renameRe, err = regexp.Compile(renamePattern)
+			if err != nil {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+				return
+			}
+		}
+		restoredIndices := make([]string, 0, len(sourceIndices))
+		for _, srcIdx := range sourceIndices {
+			targetIdx := srcIdx
+			if renameRe != nil {
+				targetIdx = renameRe.ReplaceAllString(srcIdx, normalizeGsubReplacement(renameReplacement))
+			}
+			restoredIndices = append(restoredIndices, targetIdx)
+			s.mu.Lock()
+			_, alreadyExists := s.indices[targetIdx]
+			s.mu.Unlock()
+			if !alreadyExists {
+				var restoredSchema *schema.IndexSchema
+				if savedSchemas != nil && savedSchemas[srcIdx] != nil {
+					restoredSchema = schema.CompileIndexSchema(s.dorisDB, targetIdx, savedSchemas[srcIdx].RawMapping)
+				} else {
+					restoredSchema = schema.CompileIndexSchema(s.dorisDB, targetIdx, nil)
+				}
+				if restoredSchema != nil {
+					_ = s.backend.ExecDDL(r.Context(), schema.GenerateCreateTableDDL(restoredSchema))
+					s.mu.Lock()
+					if s.indices == nil {
+						s.indices = make(map[string]*schema.IndexSchema)
+					}
+					if s.indices[targetIdx] == nil {
+						s.indices[targetIdx] = restoredSchema
+					}
+					delete(s.closedIndices, targetIdx)
+					s.mu.Unlock()
+				}
+			}
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"accepted": true,
 			"snapshot": map[string]any{
 				"snapshot": snap,
-				"indices":  snapObj["indices"],
+				"indices":  restoredIndices,
 				"shards": map[string]any{
 					"total":      1,
 					"failed":     0,
@@ -724,6 +875,14 @@ func (s *Server) handleSimulateIndexTemplate(w http.ResponseWriter, r *http.Requ
 				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "index_template ["+name+"] missing")
 				return
 			}
+		}
+	}
+	for _, compName := range tpl.ComposedOf {
+		if _, exists := s.componentTemplates[compName]; !exists {
+			s.mu.RUnlock()
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				fmt.Sprintf("index_template [%s] invalid, cause [Validation Failed: 1: component template [%s] not found;]", name, compName))
+			return
 		}
 	}
 	resolvedTpl, overlapping := s.simulateTemplateConfigLocked(name, tpl)

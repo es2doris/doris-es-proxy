@@ -626,7 +626,7 @@ setup:
 		"indices.create_data_stream", "indices.delete_data_stream",
 		"indices.put_template", "indices.delete_template", "indices.exists_template",
 		"indices.clone", "indices.shrink", "indices.split",
-		"ilm.put_lifecycle", "ilm.delete_lifecycle", "ilm.explain_lifecycle",
+		"ilm.put_lifecycle", "ilm.delete_lifecycle",
 		"ilm.move_to_step", "ilm.remove_policy",
 		"enrich.put_policy", "enrich.delete_policy", "enrich.execute_policy",
 		"ingest.exists_pipeline",

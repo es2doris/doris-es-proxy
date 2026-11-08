@@ -268,10 +268,16 @@ func ShredDocumentWithNow(
 			switch b.ESType {
 			case "geo_point":
 				rawLeafs = extractGeoPointCandidatesWithNull(parsedDoc, b.SourceJSONPath, nil)
+				if len(rawLeafs) == 0 && b.NullValue != nil {
+					rawLeafs = extractGeoPointCandidatesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
+				}
 			case "token_count":
 				rawLeafs = extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
 			default:
 				rawLeafs = extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, nil)
+				if len(rawLeafs) == 0 && b.NullValue != nil {
+					rawLeafs = extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
+				}
 			}
 			if len(rawLeafs) == 0 && b.NullValue != nil && hasExplicitNullAtPath(parsedDoc, b.SourceJSONPath) {
 				rawLeafs = []any{b.NullValue}
@@ -567,7 +573,15 @@ func ShredDocumentWithNow(
 	copiedRawVals := make(map[string][]any)
 	for _, b := range fieldsToVisit {
 		if len(b.CopyTo) > 0 {
+			basePath := strings.TrimSuffix(b.ESFieldPath, ".keyword")
+			srcDot := strings.Join(b.SourceJSONPath, ".")
+			if ignoredSeen[b.ESFieldPath] || ignoredSeen[basePath] || (srcDot != "" && ignoredSeen[srcDot]) {
+				continue
+			}
 			vals := extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
+			if b.ESType == "constant_keyword" && len(vals) == 0 && b.ConstantValue != nil {
+				vals = []any{b.ConstantValue}
+			}
 			if b.IgnoreAbove > 0 && len(vals) > 0 {
 				filtered := make([]any, 0, len(vals))
 				for _, v := range vals {
@@ -3444,6 +3458,16 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 			return nil
 		}
 		return out
+	}
+	if IsRangeFieldType(b.ESType) {
+		norm, _, err := validateAndNormalizeRangeValue(val, b, getNow)
+		if err != nil {
+			if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+				return nil
+			}
+			return val
+		}
+		return norm
 	}
 	if _, isMap := val.(map[string]any); isMap && b.ESType != "geo_point" && b.ESType != "object" && b.ESType != "flattened" {
 		return nil
