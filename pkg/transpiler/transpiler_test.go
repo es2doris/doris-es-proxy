@@ -2440,8 +2440,8 @@ func TestRound43ScriptSortNestedGeoSortGeohashMissingBucketLuceneAndCollapseArra
 		}
 	}`), &tsReq)
 	cqF2 := tr.CompileQuery(tsReq.Query, true, nil)
-	if !strings.Contains(cqF2.WhereSQL, ">= LEAST(3, 2)") || !strings.Contains(cqF2.ScoreSQL, "2.0000") || !strings.Contains(cqF2.ScoreSQL, "3.0000") {
-		t.Fatalf("F2/F10 expected threshold >= LEAST(3, 2) and both field boosts (2.0000 and 3.0000) in terms_set compilation, got WhereSQL=%s ScoreSQL=%s", cqF2.WhereSQL, cqF2.ScoreSQL)
+	if !strings.Contains(cqF2.WhereSQL, ">= GREATEST(1, LEAST(3, 2))") || !strings.Contains(cqF2.ScoreSQL, "2.0000") || !strings.Contains(cqF2.ScoreSQL, "3.0000") {
+		t.Fatalf("F2/F10 expected threshold >= GREATEST(1, LEAST(3, 2)) and both field boosts (2.0000 and 3.0000) in terms_set compilation, got WhereSQL=%s ScoreSQL=%s", cqF2.WhereSQL, cqF2.ScoreSQL)
 	}
 
 	// F8: _geo_distance sort with geohash origin and SPLIT_PART
@@ -3443,4 +3443,157 @@ func TestRound49TranspilerSpecCompliance(t *testing.T) {
 	if w := tr.CompileQuery(&flatRangeQ, false, nil).WhereSQL; !strings.Contains(w, "array_exists") || !strings.Contains(w, "ARRAY<STRING>") {
 		t.Fatalf("F19 expected flattened sub-key range query to include array_exists over ARRAY<STRING>, got %s", w)
 	}
+}
+
+func TestRound50TranspilerGeoPolygonRangeContainsNestedSpanSortAndTermsSet(t *testing.T) {
+	var spec esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{
+		"properties": {
+			"title": {"type": "text"},
+			"status": {"type": "keyword"},
+			"price": {"type": "double"},
+			"loc": {"type": "geo_point"},
+			"valid_period": {"type": "integer_range"},
+			"tags": {"type": "keyword"},
+			"req_matches": {"type": "integer"},
+			"items": {
+				"type": "nested",
+				"properties": {
+					"name": {"type": "keyword"},
+					"window": {"type": "integer_range"}
+				}
+			}
+		}
+	}`), &spec)
+	idxSchema := schema.CompileIndexSchema("db", "r50_tr", &spec)
+	tr := NewTranspiler(idxSchema, TranspilerOptions{UseDoris4SearchFunc: true})
+
+	// F10: BoostingQuery _name in matched_queries
+	var boostReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"query": {
+			"boosting": {
+				"positive": {"term": {"status": "active"}},
+				"negative": {"term": {"status": "archived"}},
+				"negative_boost": 0.5,
+				"_name": "my_boosting"
+			}
+		}
+	}`), &boostReq)
+	planF10, err := tr.BuildSearchPlan(&boostReq)
+	if err != nil || boostReq.Query.Name != "my_boosting" || !strings.Contains(planF10.HitsSQL, "0.5000") {
+		t.Fatalf("F10 expected Query.Name == 'my_boosting' and negative_boost 0.5000 in HitsSQL, got plan=%+v err=%v", planF10, err)
+	}
+
+	// F11: compileGeoPolygon combines bounding box AND ray-casting point-in-polygon SQL
+	var polyQ esast.Query
+	_ = json.Unmarshal([]byte(`{
+		"geo_polygon": {
+			"loc": {
+				"points": [
+					{"lat": 40.0, "lon": -70.0},
+					{"lat": 45.0, "lon": -70.0},
+					{"lat": 45.0, "lon": -80.0}
+				]
+			}
+		}
+	}`), &polyQ)
+	cqPoly := tr.CompileQuery(&polyQ, false, nil)
+	if !strings.Contains(cqPoly.WhereSQL, ">= 40") || !strings.Contains(cqPoly.WhereSQL, "% 2 = 1") {
+		t.Fatalf("F11 expected geo_polygon to include both bbox and ray-casting (... %% 2 = 1), got %s", cqPoly.WhereSQL)
+	}
+
+	// F12: Range query on range field with single-bound CONTAINS & nested range subfield bounds
+	var rangeContainsQ, nestedRangeQ esast.Query
+	_ = json.Unmarshal([]byte(`{"range": {"valid_period": {"gte": 10, "relation": "CONTAINS"}}}`), &rangeContainsQ)
+	cqRC := tr.CompileQuery(&rangeContainsQ, false, nil)
+	if !strings.Contains(cqRC.WhereSQL, "<= 10") || !strings.Contains(cqRC.WhereSQL, ">= 1e99") {
+		t.Fatalf("F12 expected single-bound CONTAINS range query to require upper >= 1e99, got %s", cqRC.WhereSQL)
+	}
+	_ = json.Unmarshal([]byte(`{"nested": {"path": "items", "query": {"range": {"items.window": {"gte": 5, "lte": 15}}}}}`), &nestedRangeQ)
+	cqNR := tr.CompileQuery(&nestedRangeQ, false, nil)
+	if !strings.Contains(cqNR.WhereSQL, "$.window._gte") || !strings.Contains(cqNR.WhereSQL, "-1e100") || !strings.Contains(cqNR.WhereSQL, "1e100") {
+		t.Fatalf("F12 expected nested range subfield query to extract _gte/_lte with -1e100/1e100 fallback, got %s", cqNR.WhereSQL)
+	}
+
+	// F13: nested query and nested agg on non-nested or unmapped path returns error unless ignore_unmapped=true
+	var badNestedReq, ignoredNestedReq, badNestedAggReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query": {"nested": {"path": "status", "query": {"match_all": {}}}}}`), &badNestedReq)
+	if _, err := tr.BuildSearchPlan(&badNestedReq); err == nil || !strings.Contains(err.Error(), "failed to find nested object under path [status]") {
+		t.Fatalf("F13 expected nested query error on non-nested path 'status', got %v", err)
+	}
+	_ = json.Unmarshal([]byte(`{"query": {"nested": {"path": "unmapped_nested", "ignore_unmapped": true, "query": {"match_all": {}}}}}`), &ignoredNestedReq)
+	if planIU, err := tr.BuildSearchPlan(&ignoredNestedReq); err != nil || !strings.Contains(planIU.HitsSQL, "FALSE") {
+		t.Fatalf("F13 expected ignore_unmapped=true nested query to succeed with FALSE, got plan=%+v err=%v", planIU, err)
+	}
+	_ = json.Unmarshal([]byte(`{"size": 0, "aggs": {"bad_n": {"nested": {"path": "status"}}}}`), &badNestedAggReq)
+	if _, err := tr.BuildSearchPlan(&badNestedAggReq); err == nil || !strings.Contains(err.Error(), "failed to find nested object under path [status]") {
+		t.Fatalf("F13 expected nested agg error on non-nested path 'status', got %v", err)
+	}
+
+	// F14: SpanNear phrase compilation & SpanNot COALESCE null-safety
+	var spanNearQ, spanNotQ esast.Query
+	_ = json.Unmarshal([]byte(`{
+		"span_near": {
+			"clauses": [
+				{"span_term": {"title": "quick"}},
+				{"span_term": {"title": "fox"}}
+			],
+			"slop": 2,
+			"in_order": true
+		}
+	}`), &spanNearQ)
+	cqSN := tr.CompileQuery(&spanNearQ, false, nil)
+	if !strings.Contains(cqSN.WhereSQL, "MATCH_PHRASE") || !strings.Contains(cqSN.WhereSQL, "quick fox ~2") {
+		t.Fatalf("F14 expected span_near to compile via MATCH_PHRASE with slop 2, got %s", cqSN.WhereSQL)
+	}
+	_ = json.Unmarshal([]byte(`{
+		"span_not": {
+			"include": {"span_term": {"title": "quick"}},
+			"exclude": {"span_term": {"title": "lazy"}}
+		}
+	}`), &spanNotQ)
+	cqSNot := tr.CompileQuery(&spanNotQ, false, nil)
+	if !strings.Contains(cqSNot.WhereSQL, "NOT COALESCE(") {
+		t.Fatalf("F14 expected span_not to use NOT COALESCE(..., FALSE), got %s", cqSNot.WhereSQL)
+	}
+
+	// F16: Sort numeric_type cast and _geo_distance validation / missing
+	var numTypeSortReq, badGeoSortReq, unmappedGeoSortReq, missingGeoSortReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"sort": [{"price": {"order": "asc", "numeric_type": "long"}}]}`), &numTypeSortReq)
+	planNT, err := tr.BuildSearchPlan(&numTypeSortReq)
+	if err != nil || !strings.Contains(planNT.HitsSQL, "CAST(`f__price` AS BIGINT)") {
+		t.Fatalf("F16 expected numeric_type=long on double field to emit CAST(`f__price` AS BIGINT), got plan=%+v err=%v", planNT, err)
+	}
+	_ = json.Unmarshal([]byte(`{"sort": [{"_geo_distance": {"status": [0, 0], "order": "asc"}}]}`), &badGeoSortReq)
+	if _, err := tr.BuildSearchPlan(&badGeoSortReq); err == nil || !strings.Contains(err.Error(), "failed to find mapper for [status] for geo distance based sort") {
+		t.Fatalf("F16 expected error sorting _geo_distance on non-geo_point field, got %v", err)
+	}
+	_ = json.Unmarshal([]byte(`{"sort": [{"_geo_distance": {"unknown_geo": [0, 0], "order": "asc"}}]}`), &unmappedGeoSortReq)
+	if _, err := tr.BuildSearchPlan(&unmappedGeoSortReq); err == nil || !strings.Contains(err.Error(), "no mapping found for [unknown_geo] in order to sort on") {
+		t.Fatalf("F16 expected error sorting _geo_distance on unmapped field without ignore_unmapped, got %v", err)
+	}
+	_ = json.Unmarshal([]byte(`{"sort": [{"_geo_distance": {"loc": [0, 0], "order": "asc", "unit": "km", "missing": "500km"}}]}`), &missingGeoSortReq)
+	planMG, err := tr.BuildSearchPlan(&missingGeoSortReq)
+	if err != nil || !strings.Contains(planMG.HitsSQL, "COALESCE(") || !strings.Contains(planMG.HitsSQL, ", 500000)") {
+		t.Fatalf("F16 expected _geo_distance with missing='500km' to wrap in COALESCE(..., 500000), got plan=%+v err=%v", planMG, err)
+	}
+
+	// F19: terms_set minimum_should_match_field clamped to >= 1 via GREATEST(1, ...)
+	var tsFieldQ esast.Query
+	_ = json.Unmarshal([]byte(`{"terms_set": {"tags": {"terms": ["a", "b"], "minimum_should_match_field": "req_matches"}}}`), &tsFieldQ)
+	cqTSF := tr.CompileQuery(&tsFieldQ, false, nil)
+	if !strings.Contains(cqTSF.WhereSQL, "GREATEST(1, COALESCE(`f__req_matches`, 1))") {
+		t.Fatalf("F19 expected terms_set minimum_should_match_field to be wrapped in GREATEST(1, ...), got %s", cqTSF.WhereSQL)
+	}
+
+	// Additional wrapper and distance_feature branch coverage
+	b2 := 2.0
+	b0 := 0.0
+	tr.CompileQuery(&esast.Query{Wrapper: &esast.WrapperQuery{Query: `{"term":{"status":"active"}}`, Boost: &b2}}, true, nil)
+	tr.CompileQuery(&esast.Query{Wrapper: &esast.WrapperQuery{Query: `{"term":{"status":"active"}}`, Boost: &b0}}, true, nil)
+	tr.CompileQuery(&esast.Query{Wrapper: &esast.WrapperQuery{Query: "!!!bad_base64"}}, true, nil)
+	tr.CompileQuery(&esast.Query{DistanceFeature: &esast.DistanceFeatureQuery{Field: "price", Origin: 100, Pivot: "10d", Boost: &b2}}, true, nil)
+	tr.CompileQuery(&esast.Query{DistanceFeature: &esast.DistanceFeatureQuery{Field: "price", Origin: "100", Pivot: 50, Boost: &b2}}, true, nil)
+	tr.CompileQuery(&esast.Query{DistanceFeature: &esast.DistanceFeatureQuery{Field: "loc", Origin: []any{-70.0, 40.0}, Pivot: "5km", Boost: &b2}}, true, nil)
 }

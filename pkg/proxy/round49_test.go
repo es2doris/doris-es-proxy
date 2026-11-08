@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -388,7 +389,7 @@ func TestRound49DeepCoverageEndpointsScriptsNamedAndPercolate(t *testing.T) {
 		`{"query": {"bool": {"filter": [{"script": {"script": {"id": "missing_sc"}}}]}}}`,
 		`{"query": {"bool": {"must_not": [{"script": {"script": {"id": "missing_sc"}}}]}}}`,
 		`{"query": {"constant_score": {"filter": {"script": {"script": {"id": "missing_sc"}}}}}}`,
-		`{"query": {"boosting": {"positive": {"match_all": {}}, "negative": {"script": {"script": {"id": "missing_sc"}}}}}}`,
+		`{"query": {"boosting": {"positive": {"match_all": {}}, "negative": {"script": {"script": {"id": "missing_sc"}}}, "negative_boost": 0.5}}}`,
 		`{"query": {"dis_max": {"queries": [{"script": {"script": {"id": "missing_sc"}}}]}}}`,
 		`{"query": {"nested": {"path": "items", "query": {"script": {"script": {"id": "missing_sc"}}}}}}`,
 		`{"query": {"pinned": {"ids": ["1"], "organic": {"script": {"script": {"id": "missing_sc"}}}}}}`,
@@ -497,4 +498,348 @@ func TestRound49DeepCoverageEndpointsScriptsNamedAndPercolate(t *testing.T) {
 	if len(resps) != 2 {
 		t.Fatalf("expected 2 responses from _msearch/template, got %d (%v)", len(resps), resp)
 	}
+}
+
+func TestRound50ProxyAndIngestFindings(t *testing.T) {
+	_, handler := newTestServerWithMock(t)
+
+	// F1: _termvectors & _mtermvectors method validation and _index preservation with ids
+	doRound48Req(t, handler, http.MethodPut, "/r50_tv/_doc/1?refresh=true", `{"title": "hello world"}`)
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/r50_tv/_termvectors/1", ""); c != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for DELETE _termvectors, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/r50_tv/_mtermvectors", ""); c != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for DELETE _mtermvectors, got %d", c)
+	}
+	code, resp, _ := doRound48Req(t, handler, http.MethodPost, "/_mtermvectors", `{"index": "r50_tv", "ids": ["1"]}`)
+	if code != http.StatusOK {
+		t.Fatalf("_mtermvectors failed: %d %v", code, resp)
+	}
+	if tvDocs, ok := resp["docs"].([]any); !ok || len(tvDocs) != 1 || tvDocs[0].(map[string]any)["_index"] != "r50_tv" {
+		t.Fatalf("expected _mtermvectors docs[0]._index == r50_tv, got %v", resp)
+	}
+
+	// F2: Snapshot HEAD, duplicate snapshot name 400, and _restore with rename_pattern/rename_replacement
+	if c, _, raw := doRound48Req(t, handler, http.MethodHead, "/_snapshot/missing_repo", ""); c != http.StatusNotFound || raw != "" {
+		t.Fatalf("expected 404 empty body for HEAD missing repo, got %d %q", c, raw)
+	}
+	doRound48Req(t, handler, http.MethodPut, "/_snapshot/r50_repo", `{"type": "fs", "settings": {"location": "/tmp/r50_repo"}}`)
+	if c, _, raw := doRound48Req(t, handler, http.MethodHead, "/_snapshot/r50_repo", ""); c != http.StatusOK || raw != "" {
+		t.Fatalf("expected 200 empty body for HEAD repo, got %d %q", c, raw)
+	}
+	doRound48Req(t, handler, http.MethodPut, "/r50_snap_src", `{"mappings": {"properties": {" custom_k ": {"type": "keyword"}}}}`)
+	if c, rMap, _ := doRound48Req(t, handler, http.MethodPut, "/_snapshot/r50_repo/snap1", `{"indices": "r50_snap_src"}`); c != http.StatusOK {
+		t.Fatalf("create snapshot failed: %d %v", c, rMap)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_snapshot/r50_repo/snap1", `{"indices": "r50_snap_src"}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 for duplicate snapshot name, got %d", c)
+	}
+	if c, _, raw := doRound48Req(t, handler, http.MethodHead, "/_snapshot/r50_repo/snap1", ""); c != http.StatusOK || raw != "" {
+		t.Fatalf("expected 200 empty body for HEAD snapshot, got %d %q", c, raw)
+	}
+	if c, _, raw := doRound48Req(t, handler, http.MethodHead, "/_snapshot/r50_repo/missing_snap", ""); c != http.StatusNotFound || raw != "" {
+		t.Fatalf("expected 404 empty body for HEAD missing snapshot, got %d %q", c, raw)
+	}
+	code, resp, _ = doRound48Req(t, handler, http.MethodPost, "/_snapshot/r50_repo/snap1/_restore", `{
+		"indices": "r50_snap_src",
+		"rename_pattern": "r50_snap_(.+)",
+		"rename_replacement": "r50_restored_$1"
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("restore snapshot failed: %d %v", code, resp)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/r50_restored_src", ""); c != http.StatusOK {
+		t.Fatalf("expected restored index r50_restored_src to exist, got %d", c)
+	}
+
+	// F3: Index & Component template validation
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_index_template/r50_no_pat", `{"template": {}}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 for index template missing index_patterns, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_index_template/r50_bad_comp", `{"index_patterns": ["r50-*"], "composed_of": ["no_such_comp"]}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 for index template with missing component template, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_index_template/_simulate", `{"index_patterns": ["r50-*"], "composed_of": ["no_such_comp"]}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 for simulate index template with missing component template, got %d", c)
+	}
+	doRound48Req(t, handler, http.MethodPut, "/_component_template/r50_comp_in_use", `{"template": {"settings": {"number_of_shards": 1}}}`)
+	doRound48Req(t, handler, http.MethodPut, "/_index_template/r50_using_comp", `{"index_patterns": ["r50-use-*"], "composed_of": ["r50_comp_in_use"]}`)
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_component_template/r50_comp_in_use", ""); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 when deleting component template in use, got %d", c)
+	}
+
+	// F4: Stateful index close/open
+	doRound48Req(t, handler, http.MethodPut, "/r50_close_idx/_doc/1?refresh=true", `{"v": 1}`)
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/r50_close_idx/_close", ""); c != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for GET _close, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r50_missing_close/_close", ""); c != http.StatusNotFound {
+		t.Fatalf("expected 404 for closing missing index, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r50_close_idx/_close", ""); c != http.StatusOK {
+		t.Fatalf("expected 200 for POST _close, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r50_close_idx/_search", `{}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 index_closed_exception on search of closed index, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/r50_close_idx/_doc/2", `{"v": 2}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 index_closed_exception on write to closed index, got %d", c)
+	}
+	_, resIdxResp, _ := doRound48Req(t, handler, http.MethodGet, "/_resolve/index/r50_close_idx", "")
+	if idxArr, ok := resIdxResp["indices"].([]any); !ok || len(idxArr) != 1 || idxArr[0].(map[string]any)["open"] != false {
+		t.Fatalf("expected _resolve/index to report open:false for closed index, got %v", resIdxResp)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r50_close_idx/_open", ""); c != http.StatusOK {
+		t.Fatalf("expected 200 for POST _open, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r50_close_idx/_search", `{}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on search after _open, got %d", c)
+	}
+
+	// F5: Cluster & Index settings
+	code, resp, _ = doRound48Req(t, handler, http.MethodPut, "/_cluster/settings?flat_settings=true", `{
+		"persistent": {"cluster.routing.allocation.enable": "primaries"},
+		"transient": {"indices.recovery.max_bytes_per_sec": "100mb"}
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("PUT _cluster/settings failed: %d %v", code, resp)
+	}
+	if pMap, _ := resp["persistent"].(map[string]any); pMap["cluster.routing.allocation.enable"] != "primaries" {
+		t.Fatalf("expected flat persistent cluster setting, got %v", resp)
+	}
+	doRound48Req(t, handler, http.MethodPut, "/r50_close_idx/_settings", `{"index.refresh_interval": "5s"}`)
+	code, resp, _ = doRound48Req(t, handler, http.MethodGet, "/r50_close_idx/_settings/index.refresh_*?flat_settings=true", "")
+	if code != http.StatusOK {
+		t.Fatalf("GET /{index}/_settings/{name} failed: %d %v", code, resp)
+	}
+	if idxObj, _ := resp["r50_close_idx"].(map[string]any); idxObj == nil || idxObj["settings"].(map[string]any)["index.refresh_interval"] != "5s" {
+		t.Fatalf("expected filtered index.refresh_interval=5s, got %v", resp)
+	}
+
+	// F6, F7, F8, F9: _rank_eval, _field_caps, _mapping/field, _terms_enum validation
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r50_no_such_idx/_rank_eval", `{"requests": [], "metric": {"precision": {"k": 1}}}`); c != http.StatusNotFound {
+		t.Fatalf("expected 404 for _rank_eval on missing index, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/r50_no_such_idx/_field_caps?fields=*", ""); c != http.StatusNotFound {
+		t.Fatalf("expected 404 for _field_caps on missing index, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r50_close_idx/_field_caps?fields=*", "{bad_json"); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 for _field_caps with malformed JSON, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/r50_no_such_idx/_mapping/field/v", ""); c != http.StatusNotFound {
+		t.Fatalf("expected 404 for _mapping/field on missing index, got %d", c)
+	}
+	doRound48Req(t, handler, http.MethodPut, "/r50_te_idx", `{"mappings": {"properties": {"kw": {"type": "keyword"}, "txt": {"type": "text"}}}}`)
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r50_no_such_idx/_terms_enum", `{"field": "kw"}`); c != http.StatusNotFound {
+		t.Fatalf("expected 404 for _terms_enum on missing index, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r50_te_idx/_terms_enum", `{"field": "kw", "unknown_param": 1}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 for _terms_enum unknown field, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r50_te_idx/_terms_enum", `{"field": "kw", "size": 0}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 for _terms_enum size<=0, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r50_te_idx/_terms_enum", `{"field": "txt"}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 for _terms_enum on text field, got %d", c)
+	}
+
+	// F24: Painless _execute in ingest context returns mutated document map when no explicit return
+	code, resp, _ = doRound48Req(t, handler, http.MethodPost, "/_scripts/painless/_execute", `{
+		"script": {"source": "ctx.tag = 'mutated'"},
+		"context": "ingest",
+		"context_setup": {"document": {"x": 1}}
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("painless _execute ingest failed: %d %v", code, resp)
+	}
+	if resDoc, ok := resp["result"].(map[string]any); !ok || resDoc["tag"] != "mutated" || resDoc["x"] == nil {
+		t.Fatalf("expected mutated document map from ingest _execute, got %v", resp)
+	}
+
+	// F26: _reindex conflicts=abort & pipeline execution
+	doRound48Req(t, handler, http.MethodPut, "/_ingest/pipeline/r50_reidx_pipe", `{
+		"processors": [{"set": {"field": "piped", "value": true}}]
+	}`)
+	doRound48Req(t, handler, http.MethodPut, "/r50_reidx_dst/_doc/1?refresh=true", `{"v": 100}`)
+	code, resp, _ = doRound48Req(t, handler, http.MethodPost, "/_reindex?refresh=true", `{
+		"source": {"index": "r50_close_idx"},
+		"dest": {"index": "r50_reidx_dst", "op_type": "create", "pipeline": "r50_reidx_pipe"}
+	}`)
+	if code != http.StatusConflict {
+		t.Fatalf("expected 409 conflict on _reindex op_type=create with conflicts=abort, got %d %v", code, resp)
+	}
+	code, resp, _ = doRound48Req(t, handler, http.MethodPost, "/_reindex?refresh=true", `{
+		"conflicts": "proceed",
+		"source": {"index": "r50_close_idx"},
+		"dest": {"index": "r50_reidx_dst2", "pipeline": "r50_reidx_pipe"}
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 on _reindex to r50_reidx_dst2, got %d %v", code, resp)
+	}
+	_, dstDoc, _ := doRound48Req(t, handler, http.MethodGet, "/r50_reidx_dst2/_doc/1", "")
+	if srcMap, _ := dstDoc["_source"].(map[string]any); srcMap["piped"] != true {
+		t.Fatalf("expected reindexed doc to have piped:true, got %v", dstDoc)
+	}
+
+	// F27, F28, F29: Ingest processors (set ignore_empty_value, url_encode, html_strip escaped_tags, date array, csv empty/strict quote, foreach on_failure)
+	code, resp, _ = doRound48Req(t, handler, http.MethodPost, "/_ingest/pipeline/_simulate", `{
+		"pipeline": {
+			"processors": [
+				{"set": {"field": "skip_empty", "value": "", "ignore_empty_value": true}},
+				{"url_encode": {"field": "raw_q", "target_field": "{{enc_target}}"}},
+				{"html_strip": {"field": "html_in", "escaped_tags": ["b"]}},
+				{"date": {"field": "dates", "target_field": "parsed_dates", "formats": ["EEE yyyy-MM-dd hh:mm:ss.SSSSSS a"], "output_format": "yyyy-MM-dd"}},
+				{"csv": {"field": "empty_csv", "target_fields": ["c1", "c2"]}},
+				{
+					"foreach": {
+						"field": "nums",
+						"processor": {"convert": {"field": "_ingest._value", "type": "integer"}},
+						"on_failure": [{"set": {"field": "failed_elem", "value": "{{_ingest._value}}"}}]
+					}
+				}
+			]
+		},
+		"docs": [{
+			"_source": {
+				"raw_q": "a b",
+				"enc_target": "encoded_q",
+				"html_in": "<p>hello <b>bold</b></p>",
+				"dates": ["Wed 2026-07-01 02:30:00.123456 PM"],
+				"empty_csv": "",
+				"nums": ["10", "bad_int", "30"]
+			}
+		}]
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("ingest simulate failed: %d %v", code, resp)
+	}
+	simDoc := resp["docs"].([]any)[0].(map[string]any)["doc"].(map[string]any)
+	simSrc := simDoc["_source"].(map[string]any)
+	if _, hasSkip := simSrc["skip_empty"]; hasSkip {
+		t.Fatalf("expected skip_empty to be omitted by ignore_empty_value, got %v", simSrc)
+	}
+	if simSrc["encoded_q"] != "a+b" {
+		t.Fatalf("expected encoded_q='a+b', got %v", simSrc["encoded_q"])
+	}
+	if !strings.Contains(fmt.Sprintf("%v", simSrc["html_in"]), "<b>bold</b>") || strings.Contains(fmt.Sprintf("%v", simSrc["html_in"]), "<p>") {
+		t.Fatalf("expected html_strip escaped_tags to preserve <b> and strip <p>, got %v", simSrc["html_in"])
+	}
+	if pDates, ok := simSrc["parsed_dates"].([]any); !ok || len(pDates) != 1 || pDates[0] != "2026-07-01" {
+		t.Fatalf("expected parsed_dates=['2026-07-01'], got %v", simSrc["parsed_dates"])
+	}
+	if simSrc["failed_elem"] != "bad_int" {
+		t.Fatalf("expected foreach on_failure to capture _ingest._value='bad_int', got %v", simSrc["failed_elem"])
+	}
+	if numsArr, ok := simSrc["nums"].([]any); !ok || numsArr[0] != float64(10) {
+		t.Fatalf("expected foreach partial array progress nums[0]==10, got %v", simSrc["nums"])
+	}
+	if ingMeta, ok := simDoc["_ingest"].(map[string]any); ok {
+		if _, hasVal := ingMeta["_value"]; hasVal {
+			t.Fatalf("expected _ingest._value to be cleaned up after foreach on_failure, got %v", ingMeta)
+		}
+	}
+
+	// F25 & F26: Guarded missing doc value ref in metric agg script & params._source raw nested array access
+	doRound48Req(t, handler, http.MethodPut, "/r50_script_idx", `{
+		"mappings": {
+			"properties": {
+				"a": {"type": "integer"},
+				"b": {"type": "integer"},
+				"items": {
+					"type": "nested",
+					"properties": {
+						"price": {"type": "integer"},
+						"qty": {"type": "integer"}
+					}
+				}
+			}
+		}
+	}`)
+	doRound48Req(t, handler, http.MethodPut, "/r50_script_idx/_doc/1?refresh=true", `{
+		"a": 10,
+		"items": [
+			{"price": 5, "qty": 2},
+			{"price": 3, "qty": 4}
+		]
+	}`)
+	code, resp, _ = doRound48Req(t, handler, http.MethodPost, "/r50_script_idx/_search", `{
+		"script_fields": {
+			"nested_total": {
+				"script": {
+					"source": "int s = 0; for (def it : params._source.items) { s += it.price * it.qty; } return s;"
+				}
+			}
+		},
+		"aggs": {
+			"guarded_sum": {
+				"sum": {
+					"script": {
+						"source": "doc['b'].size() == 0 ? doc['a'].value : doc['a'].value + doc['b'].value"
+					}
+				}
+			},
+			"missing_sum": {
+				"sum": {
+					"missing": 5,
+					"script": {
+						"source": "doc['a'].value + doc['b'].value"
+					}
+				}
+			}
+		}
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("r50_script_idx search failed: %d %v", code, resp)
+	}
+	aggsMap := resp["aggregations"].(map[string]any)
+	if aggsMap["guarded_sum"].(map[string]any)["value"] != float64(10) {
+		t.Fatalf("expected guarded_sum=10, got %v", aggsMap["guarded_sum"])
+	}
+	if aggsMap["missing_sum"].(map[string]any)["value"] != float64(15) {
+		t.Fatalf("expected missing_sum=15, got %v", aggsMap["missing_sum"])
+	}
+	hit0Fields := resp["hits"].(map[string]any)["hits"].([]any)[0].(map[string]any)["fields"].(map[string]any)
+	if hit0Fields["nested_total"].([]any)[0] != float64(22) {
+		t.Fatalf("expected nested_total=[22], got %v", hit0Fields["nested_total"])
+	}
+
+	// Extended coverage for cluster/index settings, _cat endpoints, and _rank_eval metrics
+	doRound48Req(t, handler, http.MethodGet, "/_cluster/settings?include_defaults=true", "")
+	doRound48Req(t, handler, http.MethodGet, "/_cluster/settings?include_defaults=true&flat_settings=true", "")
+	doRound48Req(t, handler, http.MethodPut, "/_cluster/settings", `{"persistent": {"cluster.routing.allocation.enable": null}}`)
+	doRound48Req(t, handler, http.MethodGet, "/r50_close_idx/_settings?include_defaults=true", "")
+	doRound48Req(t, handler, http.MethodGet, "/r50_close_idx/_settings?include_defaults=true&flat_settings=true", "")
+	doRound48Req(t, handler, http.MethodGet, "/_cat/indices/r50_*?v=true&h=index,status,health&s=index:desc&format=json", "")
+	doRound48Req(t, handler, http.MethodGet, "/_cat/templates/r50_*?v=true&h=name,index_patterns&s=name&format=json", "")
+	doRound48Req(t, handler, http.MethodPost, "/r50_script_idx/_rank_eval", `{
+		"requests": [{
+			"id": "q1",
+			"request": {"query": {"match_all": {}}},
+			"ratings": [{"_index": "r50_script_idx", "_id": "1", "rating": 3}]
+		}],
+		"metric": {
+			"dcg": {"k": 5, "normalize": true, "discount_factor": 2.0}
+		}
+	}`)
+	doRound48Req(t, handler, http.MethodPost, "/r50_tv/_search", `{
+		"query": {
+			"intervals": {
+				"title": {
+					"all_of": {
+						"intervals": [
+							{"match": {"query": "hello"}},
+							{"any_of": {"intervals": [
+								{"prefix": {"prefix": "wor"}},
+								{"wildcard": {"pattern": "w*d"}},
+								{"fuzzy": {"term": "world"}}
+							]}}
+						]
+					}
+				}
+			}
+		},
+		"highlight": {
+			"fields": {"title": {}}
+		}
+	}`)
 }

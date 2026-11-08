@@ -1995,3 +1995,86 @@ func TestRound49SchemaAndShredderSpecCompliance(t *testing.T) {
 		t.Fatalf("F21 expected tags.fields.raw to be preserved when upgraded to multi-valued, got %+v", inf.Properties["tags"])
 	}
 }
+
+func TestRound50ShredderNestedRangeArrayNullValueAndCopyToGuards(t *testing.T) {
+	ignoreTrue := true
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"age": {
+				"type": "integer",
+				"ignore_malformed": true,
+				"null_value": -1,
+				"copy_to": "all_copied"
+			},
+			"const_env": {
+				"type": "constant_keyword",
+				"value": "production",
+				"copy_to": "all_copied"
+			},
+			"all_copied": {
+				"type": "keyword"
+			},
+			"items": {
+				"type": "nested",
+				"properties": {
+					"window": {
+						"type": "integer_range"
+					}
+				}
+			}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("unmarshal mapping failed: %v", err)
+	}
+	_ = ignoreTrue
+	idxSchema := CompileIndexSchema("db", "r50_idx", &spec)
+
+	// 1. F18: [null] array applies null_value (-1), constant_keyword omitted in _source still copies "production" to copy_to
+	shredded1, err := ShredDocument(idxSchema, "1", 1, false, []byte(`{
+		"age": [null],
+		"items": [{"window": {"gt": 10, "lt": 20}}]
+	}`))
+	if err != nil {
+		t.Fatalf("ShredDocument 1 failed: %v", err)
+	}
+	var row1 map[string]any
+	if err := json.Unmarshal(shredded1, &row1); err != nil {
+		t.Fatalf("unmarshal row1 failed: %v", err)
+	}
+	if gotAge, _ := row1["f__age"].(float64); gotAge != -1 {
+		t.Fatalf("F18 expected f__age == -1 for [null] with null_value=-1, got %v", row1["f__age"])
+	}
+	copied1, _ := row1["f__all_copied"].([]any)
+	hasProd := false
+	for _, v := range copied1 {
+		if v == "production" {
+			hasProd = true
+		}
+	}
+	if !hasProd {
+		t.Fatalf("F18 expected omitted constant_keyword to copy 'production' to f__all_copied, got %v", row1["f__all_copied"])
+	}
+	// F12: nested range subfield normalized with _gte and _lte in nested JSON element
+	nestedItems, _ := row1["n__items"].([]any)
+	if len(nestedItems) != 1 || !strings.Contains(nestedItems[0].(string), `"_gte":11`) || !strings.Contains(nestedItems[0].(string), `"_lte":19`) {
+		t.Fatalf("F12 expected nested integer_range element to contain _gte:11 and _lte:19, got %v", nestedItems)
+	}
+
+	// 2. F18: malformed field with ignore_malformed=true must NOT copy raw malformed value into copy_to target
+	shredded2, err := ShredDocument(idxSchema, "2", 1, false, []byte(`{
+		"age": "not_an_int"
+	}`))
+	if err != nil {
+		t.Fatalf("ShredDocument 2 failed: %v", err)
+	}
+	var row2 map[string]any
+	if err := json.Unmarshal(shredded2, &row2); err != nil {
+		t.Fatalf("unmarshal row2 failed: %v", err)
+	}
+	for _, v := range row2["f__all_copied"].([]any) {
+		if v == "not_an_int" {
+			t.Fatalf("F18 expected malformed age not to be copied to f__all_copied, got %v", row2["f__all_copied"])
+		}
+	}
+}

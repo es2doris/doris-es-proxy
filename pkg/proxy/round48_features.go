@@ -271,9 +271,15 @@ func (s *Server) handlePainlessExecute(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
 			return
 		}
-		if m, okM := val.(map[string]any); okM {
-			writeJSON(w, http.StatusOK, map[string]any{"result": m})
-			return
+		if _, hadExplicitReturn := params["__had_explicit_return"]; hadExplicitReturn {
+			if m, okM := val.(map[string]any); okM {
+				writeJSON(w, http.StatusOK, map[string]any{"result": m})
+				return
+			}
+			if val != nil {
+				writeJSON(w, http.StatusOK, map[string]any{"result": val})
+				return
+			}
 		}
 		cleaned := make(map[string]any, len(evalDoc))
 		for k, v := range evalDoc {
@@ -1961,6 +1967,10 @@ func (s *Server) computeSingleTermVectorResponse(
 }
 
 func (s *Server) handleTermVectors(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
+		return
+	}
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
 		return
@@ -2008,6 +2018,10 @@ func (s *Server) handleTermVectors(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMTermVectors(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
+		return
+	}
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
 		return
@@ -2076,7 +2090,13 @@ func (s *Server) handleMTermVectors(w http.ResponseWriter, r *http.Request) {
 					spec[k] = v
 				}
 			}
-			spec["_index"] = defaultIndex
+			if existingIdx, ok := spec["_index"].(string); !ok || existingIdx == "" {
+				if altIdx, okA := spec["index"].(string); okA && altIdx != "" {
+					spec["_index"] = altIdx
+				} else {
+					spec["_index"] = defaultIndex
+				}
+			}
 			spec["_id"] = id
 			docSpecs = append(docSpecs, spec)
 		}
@@ -2086,7 +2106,11 @@ func (s *Server) handleMTermVectors(w http.ResponseWriter, r *http.Request) {
 	for _, spec := range docSpecs {
 		idx, _ := spec["_index"].(string)
 		if idx == "" {
-			idx = defaultIndex
+			if altIdx, okA := spec["index"].(string); okA && altIdx != "" {
+				idx = altIdx
+			} else {
+				idx = defaultIndex
+			}
 		}
 		id, _ := spec["_id"].(string)
 		resp, status, errType, errReason := s.computeSingleTermVectorResponse(
@@ -2166,6 +2190,12 @@ func (s *Server) handleRankEval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.syncCatalogFromBackend(r.Context())
+	targetIndex := strings.TrimSpace(r.PathValue("index"))
+	if targetIndex != "" {
+		if _, _, ok := s.resolveValidatedReadTargets(w, r, targetIndex); !ok {
+			return
+		}
+	}
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
 		return
@@ -2223,6 +2253,7 @@ func (s *Server) handleRankEval(w http.ResponseWriter, r *http.Request) {
 	}
 	kVal := 10
 	relevantThreshold := 1.0
+	discountFactor := 1.0
 	if metricSpec != nil {
 		if kv, okK := toInt64(metricSpec["k"]); okK && kv > 0 {
 			kVal = int(kv)
@@ -2230,9 +2261,11 @@ func (s *Server) handleRankEval(w http.ResponseWriter, r *http.Request) {
 		if rt, okRT := toFloat64(metricSpec["relevant_rating_threshold"]); okRT {
 			relevantThreshold = rt
 		}
+		if df, okDF := toFloat64(metricSpec["discount_factor"]); okDF && df > 0 {
+			discountFactor = df
+		}
 	}
 
-	targetIndex := strings.TrimSpace(r.PathValue("index"))
 	details := make(map[string]any, len(payload.Requests))
 	failures := make(map[string]any)
 	var sumScore float64
@@ -2343,7 +2376,7 @@ func (s *Server) handleRankEval(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if rated && rating > 0 {
-				dcg += (math.Pow(2.0, rating) - 1.0) / math.Log2(float64(rankIdx+2))
+				dcg += (math.Pow(2.0, rating) - 1.0) / (math.Log2(float64(rankIdx+2)) * discountFactor)
 				rProb := (math.Pow(2.0, rating) - 1.0) / math.Pow(2.0, maxRating)
 				errMetric += pStop * rProb / float64(rankIdx+1)
 				pStop *= (1.0 - rProb)
@@ -2382,7 +2415,7 @@ func (s *Server) handleRankEval(w http.ResponseWriter, r *http.Request) {
 					}
 					idcg := 0.0
 					for idx, rVal := range idealRatings {
-						idcg += (math.Pow(2.0, rVal) - 1.0) / math.Log2(float64(idx+2))
+						idcg += (math.Pow(2.0, rVal) - 1.0) / (math.Log2(float64(idx+2)) * discountFactor)
 					}
 					if idcg > 0 {
 						qScore = dcg / idcg
@@ -2402,10 +2435,16 @@ func (s *Server) handleRankEval(w http.ResponseWriter, r *http.Request) {
 		sumScore += qScore
 		validCount++
 		details[item.ID] = map[string]any{
-			"metric_score":   qScore,
-			"unrated_docs":   unratedDocs,
-			"hits":           hitsReport,
-			"metric_details": map[string]any{},
+			"metric_score": qScore,
+			"unrated_docs": unratedDocs,
+			"hits":         hitsReport,
+			"metric_details": map[string]any{
+				metricName: map[string]any{
+					"relevant_docs_retrieved": relevantRetrieved,
+					"docs_retrieved":          len(hitRefs),
+					"unrated_docs":            len(unratedDocs),
+				},
+			},
 		}
 	}
 
@@ -2931,19 +2970,10 @@ func (s *Server) handleCacheClear(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleIndexOpen(w http.ResponseWriter, r *http.Request) {
-	rawIndex := strings.TrimSpace(r.PathValue("index"))
-	if rawIndex != "" {
-		if _, _, ok := s.resolveValidatedReadTargets(w, r, rawIndex); !ok {
-			return
-		}
+	if r.Method != http.MethodPost {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"acknowledged":        true,
-		"shards_acknowledged": true,
-	})
-}
-
-func (s *Server) handleIndexClose(w http.ResponseWriter, r *http.Request) {
 	rawIndex := strings.TrimSpace(r.PathValue("index"))
 	var targets []string
 	if rawIndex != "" {
@@ -2953,6 +2983,39 @@ func (s *Server) handleIndexClose(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	s.mu.Lock()
+	for _, idx := range targets {
+		delete(s.closedIndices, idx)
+	}
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"acknowledged":        true,
+		"shards_acknowledged": true,
+	})
+}
+
+func (s *Server) handleIndexClose(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
+		return
+	}
+	rawIndex := strings.TrimSpace(r.PathValue("index"))
+	var targets []string
+	if rawIndex != "" {
+		var ok bool
+		targets, _, ok = s.resolveValidatedReadTargets(w, r, rawIndex)
+		if !ok {
+			return
+		}
+	}
+	s.mu.Lock()
+	if s.closedIndices == nil {
+		s.closedIndices = make(map[string]bool)
+	}
+	for _, idx := range targets {
+		s.closedIndices[idx] = true
+	}
+	s.mu.Unlock()
 	indicesOut := make(map[string]any, len(targets))
 	for _, idx := range targets {
 		indicesOut[idx] = map[string]any{"closed": true}

@@ -453,27 +453,28 @@ func TestASTRound28ComprehensiveCoverage(t *testing.T) {
 
 	// 7. SortSpec legacy multi-key options, _script sort, _geo_distance sort, and round-trip MarshalJSON
 	sortCases := []struct {
-		raw         string
-		wantField   string
-		wantOrder   string
-		wantMode    string
-		wantMissing string
-		wantType    string
+		raw             string
+		wantField       string
+		wantOrder       string
+		wantMode        string
+		wantMissing     string
+		wantType        string
+		wantNumericType string
 	}{
-		{`{"price": "desc", "mode": "avg", "missing": "_last", "unmapped_type": "long"}`, "price", "desc", "avg", "_last", "long"},
-		{`{"rating": {"order": "asc"}, "mode": "max", "missing": 0, "numeric_type": "double"}`, "rating", "asc", "max", "0", "double"},
-		{`{"_script": {"type": "number", "order": "desc", "missing": -1, "script": {"source": "doc['a'].value"}}}`, "_script", "desc", "", "-1", "number"},
-		{`{"_geo_distance": {"pin.location": [-70, 40], "order": "asc", "unit": "km", "mode": "min"}}`, "_geo_distance", "asc", "min", "", ""},
-		{`"_score"`, "_score", "desc", "", "", ""},
-		{`"created_at"`, "created_at", "asc", "", "", ""},
+		{`{"price": "desc", "mode": "avg", "missing": "_last", "unmapped_type": "long"}`, "price", "desc", "avg", "_last", "long", ""},
+		{`{"rating": {"order": "asc"}, "mode": "max", "missing": 0, "numeric_type": "double"}`, "rating", "asc", "max", "0", "", "double"},
+		{`{"_script": {"type": "number", "order": "desc", "missing": -1, "script": {"source": "doc['a'].value"}}}`, "_script", "desc", "", "-1", "number", ""},
+		{`{"_geo_distance": {"pin.location": [-70, 40], "order": "asc", "unit": "km", "mode": "min"}}`, "_geo_distance", "asc", "min", "", "", ""},
+		{`"_score"`, "_score", "desc", "", "", "", ""},
+		{`"created_at"`, "created_at", "asc", "", "", "", ""},
 	}
 	for _, sc := range sortCases {
 		var sp SortSpec
 		if err := json.Unmarshal([]byte(sc.raw), &sp); err != nil {
 			t.Fatalf("SortSpec(%s) unmarshal failed: %v", sc.raw, err)
 		}
-		if sp.Entry.Field != sc.wantField || sp.Entry.Order != sc.wantOrder || sp.Entry.Mode != sc.wantMode || sp.Entry.Missing != sc.wantMissing || sp.Entry.Type != sc.wantType {
-			t.Fatalf("SortSpec(%s) = %+v, want field=%q order=%q mode=%q missing=%q type=%q", sc.raw, sp.Entry, sc.wantField, sc.wantOrder, sc.wantMode, sc.wantMissing, sc.wantType)
+		if sp.Entry.Field != sc.wantField || sp.Entry.Order != sc.wantOrder || sp.Entry.Mode != sc.wantMode || sp.Entry.Missing != sc.wantMissing || sp.Entry.Type != sc.wantType || sp.Entry.NumericType != sc.wantNumericType {
+			t.Fatalf("SortSpec(%s) = %+v, want field=%q order=%q mode=%q missing=%q type=%q numeric_type=%q", sc.raw, sp.Entry, sc.wantField, sc.wantOrder, sc.wantMode, sc.wantMissing, sc.wantType, sc.wantNumericType)
 		}
 		if _, err := json.Marshal(sp); err != nil {
 			t.Fatalf("SortSpec(%s) marshal failed: %v", sc.raw, err)
@@ -680,7 +681,7 @@ func TestRound30PrefixWildcardRegexpFuzzySortAndPipelineHelpers(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"items.price":{"order":"desc","mode":"max","numeric_type":"double","nested_path":"items","nested_filter":{"term":{"items.active":true}}}}`), &nestedSort); err != nil {
 		t.Fatalf("SortSpec nested_path/nested_filter unmarshal failed: %v", err)
 	}
-	if nestedSort.Entry.Nested == nil || nestedSort.Entry.Nested.Path != "items" || nestedSort.Entry.Nested.Filter == nil || nestedSort.Entry.Type != "double" {
+	if nestedSort.Entry.Nested == nil || nestedSort.Entry.Nested.Path != "items" || nestedSort.Entry.Nested.Filter == nil || nestedSort.Entry.NumericType != "double" || nestedSort.Entry.Type != "" {
 		t.Fatalf("unexpected nestedSort: %+v", nestedSort)
 	}
 	if b, err := json.Marshal(nestedSort); err != nil || len(b) == 0 {
@@ -1680,4 +1681,120 @@ func TestRound49ASTSpecCompliance(t *testing.T) {
 	if fp.EnablePositionIncrements == nil || *fp.EnablePositionIncrements != false || len(fp.Relations) != 1 {
 		t.Fatalf("F20 unexpected FieldProperty: %+v", fp)
 	}
+}
+
+func TestRound50ASTBoostingSpanPITSortAndSliceValidation(t *testing.T) {
+	// F10: BoostingQuery _name support, unknown key rejection, and required positive/negative/negative_boost
+	var validBoostQ Query
+	if err := json.Unmarshal([]byte(`{"boosting":{"positive":{"term":{"a":"1"}},"negative":{"term":{"b":"2"}},"negative_boost":0.5,"_name":"boost_q"}}`), &validBoostQ); err != nil {
+		t.Fatalf("F10 valid boosting query failed: %v", err)
+	}
+	if validBoostQ.Boosting == nil || validBoostQ.Boosting.Name != "boost_q" || validBoostQ.Name != "boost_q" {
+		t.Fatalf("F10 expected Boosting.Name and Query.Name == 'boost_q', got %+v", validBoostQ)
+	}
+	for _, badBoost := range []string{
+		`{"boosting":{"negative":{"term":{"b":"2"}},"negative_boost":0.5}}`,
+		`{"boosting":{"positive":{"term":{"a":"1"}},"negative_boost":0.5}}`,
+		`{"boosting":{"positive":{"term":{"a":"1"}},"negative":{"term":{"b":"2"}}}}`,
+		`{"boosting":{"positive":null,"negative":{"term":{"b":"2"}},"negative_boost":0.5}}`,
+		`{"boosting":{"positive":{"term":{"a":"1"}},"negative":{"term":{"b":"2"}},"negative_boost":0.5,"unknown_field":1}}`,
+	} {
+		var q Query
+		if err := json.Unmarshal([]byte(badBoost), &q); err == nil {
+			t.Fatalf("F10 expected error for invalid boosting query %s", badBoost)
+		}
+	}
+
+	// F14: Span queries UnmarshalJSON validation and negative boost check
+	for _, badSpan := range []string{
+		`{"span_near":{"clauses":[],"slop":1}}`,
+		`{"span_near":{"clauses":[{"span_term":{"title":"fox"}}],"slop":-1}}`,
+		`{"span_near":{"clauses":[{"span_term":{"title":"fox"}}],"unknown":1}}`,
+		`{"span_or":{}}`,
+		`{"span_or":{"clauses":[{"span_term":{"title":"fox"}}],"unknown":1}}`,
+		`{"span_not":{"include":{"span_term":{"title":"fox"}}}}`,
+		`{"span_not":{"include":{"span_term":{"title":"fox"}},"exclude":{"span_term":{"title":"lazy"}},"pre":-1}}`,
+		`{"span_first":{"match":{"span_term":{"title":"fox"}},"end":0}}`,
+		`{"span_multi":{"match":{"term":{"title":"fox"}}}}`,
+		`{"span_containing":{"little":{"span_term":{"title":"fox"}}}}`,
+		`{"span_within":{"big":{"span_term":{"title":"fox"}}}}`,
+		`{"field_masking_span":{"query":{"span_term":{"title":"fox"}},"field":""}}`,
+		`{"span_near":{"clauses":[{"span_term":{"title":"fox"}}],"boost":-1.0}}`,
+		`{"geo_distance":{"distance":"10km","loc":[0,0],"boost":-1.0}}`,
+	} {
+		var q Query
+		if err := json.Unmarshal([]byte(badSpan), &q); err == nil {
+			t.Fatalf("F14 expected error for invalid span/geo_distance query %s", badSpan)
+		}
+	}
+
+	// F15: SearchRequest point_in_time alias & PITSpec validation
+	var srPIT SearchRequest
+	if err := json.Unmarshal([]byte(`{"point_in_time":{"id":"pit_123","keep_alive":"5m"}}`), &srPIT); err != nil {
+		t.Fatalf("F15 valid point_in_time unmarshal failed: %v", err)
+	}
+	if srPIT.PIT == nil || srPIT.PIT.ID != "pit_123" || srPIT.PIT.KeepAlive != "5m" {
+		t.Fatalf("F15 unexpected PIT: %+v", srPIT.PIT)
+	}
+	for _, badPIT := range []string{
+		`{"pit":{"id":"a"},"point_in_time":{"id":"b"}}`,
+		`{"pit":{"id":"   "}}`,
+		`{"pit":{"id":"a","keep_alive":"-1m"}}`,
+		`{"pit":{"id":"a","keep_alive":"invalid"}}`,
+		`{"pit":{"id":"a","unknown":1}}`,
+	} {
+		var sr SearchRequest
+		if err := json.Unmarshal([]byte(badPIT), &sr); err == nil {
+			t.Fatalf("F15 expected error for invalid PIT request %s", badPIT)
+		}
+	}
+
+	// F16: SortSpec numeric_type vs unmapped_type preservation
+	var sortBoth SortSpec
+	if err := json.Unmarshal([]byte(`{"ts":{"order":"asc","numeric_type":"long","unmapped_type":"date"}}`), &sortBoth); err != nil {
+		t.Fatalf("F16 SortSpec unmarshal failed: %v", err)
+	}
+	if sortBoth.Entry.NumericType != "long" || sortBoth.Entry.Type != "date" {
+		t.Fatalf("F16 expected NumericType='long' and Type='date', got %+v", sortBoth.Entry)
+	}
+
+	// F17: SliceSpec UnmarshalJSON validation
+	var validSlice SliceSpec
+	if err := json.Unmarshal([]byte(`{"id":1,"max":4,"field":"uid"}`), &validSlice); err != nil || validSlice.ID != 1 || validSlice.Max != 4 || validSlice.Field != "uid" {
+		t.Fatalf("F17 valid SliceSpec failed: %+v (%v)", validSlice, err)
+	}
+	for _, badSlice := range []string{
+		`{"id":0}`,
+		`{"max":2}`,
+		`{"id":0,"max":1}`,
+		`{"id":2,"max":2}`,
+		`{"id":-1,"max":2}`,
+		`{"id":0,"max":2,"unknown":1}`,
+	} {
+		var sl SliceSpec
+		if err := json.Unmarshal([]byte(badSlice), &sl); err == nil {
+			t.Fatalf("F17 expected error for invalid SliceSpec %s", badSlice)
+		}
+	}
+
+	// Valid span queries & MarshalJSON coverage
+	for _, validSpan := range []string{
+		`{"span_or":{"clauses":[{"span_term":{"title":"fox"}}],"boost":1.5,"_name":"so"}}`,
+		`{"span_first":{"match":{"span_term":{"title":"fox"}},"end":3,"boost":1.2,"_name":"sf"}}`,
+		`{"span_multi":{"match":{"prefix":{"title":"fo"}},"boost":1.1,"_name":"sm"}}`,
+		`{"span_containing":{"little":{"span_term":{"title":"fox"}},"big":{"span_near":{"clauses":[{"span_term":{"title":"quick"}},{"span_term":{"title":"fox"}}],"slop":2}},"boost":1.3,"_name":"sc"}}`,
+		`{"span_within":{"little":{"span_term":{"title":"fox"}},"big":{"span_near":{"clauses":[{"span_term":{"title":"quick"}},{"span_term":{"title":"fox"}}],"slop":2}},"boost":1.4,"_name":"sw"}}`,
+		`{"field_masking_span":{"query":{"span_term":{"title":"fox"}},"field":"body","boost":1.5,"_name":"fms"}}`,
+	} {
+		var sq Query
+		if err := json.Unmarshal([]byte(validSpan), &sq); err != nil {
+			t.Fatalf("expected valid span query %s to unmarshal, got %v", validSpan, err)
+		}
+	}
+	decayVal := 0.5
+	_, _ = json.Marshal(validBoostQ.Boosting)
+	_, _ = json.Marshal(CommonTermsEntry{Query: "fox", Boost: 1.5, HasBoost: true})
+	_, _ = json.Marshal(DecayFunctionSpec{Field: "loc", Origin: "0,0", Scale: "1km", Offset: "100m", Decay: &decayVal, MultiValueMode: "min"})
+	_ = (BoostingQuery{NegativeBoost: 0.3}).EffectiveNegativeBoost()
+	_ = (BoostingQuery{}).EffectiveNegativeBoost()
 }

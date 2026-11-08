@@ -135,6 +135,11 @@
   - match: { acknowledged: true }
 
   - do:
+      catch: bad_request
+      search:
+        index: "admin_spec_idx"
+
+  - do:
       indices.open:
         index: "admin_spec_idx"
   - match: { acknowledged: true }

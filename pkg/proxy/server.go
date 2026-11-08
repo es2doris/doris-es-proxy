@@ -175,23 +175,27 @@ type Server struct {
 	basicAuthPass string
 	apiKey        string
 
-	mu                    sync.RWMutex
-	indices               map[string]*schema.IndexSchema
-	aliases               map[string][]string                 // aliasName -> ordered target indexNames
-	aliasMeta             map[string]map[string]AliasMetadata // aliasName -> indexName -> metadata
-	docRouting            map[string]map[string]string        // indexName -> docID -> routing
-	docVersions           map[string]map[string]int64         // indexName -> docID -> last known version (including tombstones)
-	indexDefaultPipelines map[string]string                   // indexName -> default ingest pipeline ID
-	indexFinalPipelines   map[string]string                   // indexName -> final ingest pipeline ID
-	templates             map[string]esast.IndexTemplateRequest
-	componentTemplates    map[string]map[string]any
-	pipelines             map[string]map[string]any
-	enrichPolicies        map[string]map[string]any
-	ilmPolicies           map[string]map[string]any
-	dataStreams           map[string]map[string]any
-	scripts               map[string]map[string]any
-	snapshotRepos         map[string]map[string]any
-	snapshots             map[string]map[string]map[string]any
+	mu                        sync.RWMutex
+	indices                   map[string]*schema.IndexSchema
+	aliases                   map[string][]string                 // aliasName -> ordered target indexNames
+	aliasMeta                 map[string]map[string]AliasMetadata // aliasName -> indexName -> metadata
+	docRouting                map[string]map[string]string        // indexName -> docID -> routing
+	docVersions               map[string]map[string]int64         // indexName -> docID -> last known version (including tombstones)
+	indexDefaultPipelines     map[string]string                   // indexName -> default ingest pipeline ID
+	indexFinalPipelines       map[string]string                   // indexName -> final ingest pipeline ID
+	templates                 map[string]esast.IndexTemplateRequest
+	componentTemplates        map[string]map[string]any
+	pipelines                 map[string]map[string]any
+	enrichPolicies            map[string]map[string]any
+	ilmPolicies               map[string]map[string]any
+	dataStreams               map[string]map[string]any
+	scripts                   map[string]map[string]any
+	snapshotRepos             map[string]map[string]any
+	snapshots                 map[string]map[string]map[string]any
+	closedIndices             map[string]bool
+	clusterPersistentSettings map[string]any
+	clusterTransientSettings  map[string]any
+	indexCustomSettings       map[string]map[string]any
 }
 
 func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerOptions) *Server {
@@ -199,29 +203,33 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		dorisDB = "es_compat"
 	}
 	s := &Server{
-		dorisDB:               dorisDB,
-		backend:               backend,
-		transpileOpts:         opts,
-		maxBodyBytes:          DefaultMaxRequestBodyBytes,
-		slowTracker:           newSlowQueryTracker(),
-		shadowVerifier:        newShadowVerifier(""),
-		queryCache:            newQueryResultCache(),
-		indices:               make(map[string]*schema.IndexSchema),
-		aliases:               make(map[string][]string),
-		aliasMeta:             make(map[string]map[string]AliasMetadata),
-		docRouting:            make(map[string]map[string]string),
-		docVersions:           make(map[string]map[string]int64),
-		indexDefaultPipelines: make(map[string]string),
-		indexFinalPipelines:   make(map[string]string),
-		templates:             make(map[string]esast.IndexTemplateRequest),
-		componentTemplates:    make(map[string]map[string]any),
-		pipelines:             make(map[string]map[string]any),
-		enrichPolicies:        make(map[string]map[string]any),
-		ilmPolicies:           make(map[string]map[string]any),
-		dataStreams:           make(map[string]map[string]any),
-		scripts:               make(map[string]map[string]any),
-		snapshotRepos:         make(map[string]map[string]any),
-		snapshots:             make(map[string]map[string]map[string]any),
+		dorisDB:                   dorisDB,
+		backend:                   backend,
+		transpileOpts:             opts,
+		maxBodyBytes:              DefaultMaxRequestBodyBytes,
+		slowTracker:               newSlowQueryTracker(),
+		shadowVerifier:            newShadowVerifier(""),
+		queryCache:                newQueryResultCache(),
+		indices:                   make(map[string]*schema.IndexSchema),
+		aliases:                   make(map[string][]string),
+		aliasMeta:                 make(map[string]map[string]AliasMetadata),
+		docRouting:                make(map[string]map[string]string),
+		docVersions:               make(map[string]map[string]int64),
+		indexDefaultPipelines:     make(map[string]string),
+		indexFinalPipelines:       make(map[string]string),
+		templates:                 make(map[string]esast.IndexTemplateRequest),
+		componentTemplates:        make(map[string]map[string]any),
+		pipelines:                 make(map[string]map[string]any),
+		enrichPolicies:            make(map[string]map[string]any),
+		ilmPolicies:               make(map[string]map[string]any),
+		dataStreams:               make(map[string]map[string]any),
+		scripts:                   make(map[string]map[string]any),
+		snapshotRepos:             make(map[string]map[string]any),
+		snapshots:                 make(map[string]map[string]map[string]any),
+		closedIndices:             make(map[string]bool),
+		clusterPersistentSettings: make(map[string]any),
+		clusterTransientSettings:  make(map[string]any),
+		indexCustomSettings:       make(map[string]map[string]any),
 	}
 	s.coalescer = newStreamLoadCoalescer(func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
 		err := s.backend.StreamLoad(ctx, table, ndjson, syncRefresh)
@@ -1303,6 +1311,11 @@ func (s *Server) Handler() http.Handler {
 				s.handleRollover(w, r)
 				return
 			}
+			if segs[1] == "_settings" {
+				r.SetPathValue("name", segs[2])
+				s.handleIndexSettings(w, r)
+				return
+			}
 			if segs[1] == "_mapping" || segs[1] == "_mappings" {
 				if r.Method == http.MethodGet {
 					s.handleGetMapping(w, r)
@@ -1482,19 +1495,125 @@ func (s *Server) handleClusterHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func flattenSettingsInput(prefix string, src map[string]any, out map[string]any) {
+	for k, v := range src {
+		fullKey := k
+		if prefix != "" {
+			fullKey = prefix + "." + k
+		}
+		if subMap, ok := v.(map[string]any); ok {
+			if len(subMap) == 0 {
+				out[fullKey] = nil
+			} else {
+				flattenSettingsInput(fullKey, subMap, out)
+			}
+			continue
+		}
+		out[fullKey] = v
+	}
+}
+
+func applyFlatSettingsToStore(store map[string]any, rawSection any) {
+	secMap, ok := rawSection.(map[string]any)
+	if !ok || secMap == nil {
+		return
+	}
+	flat := make(map[string]any)
+	flattenSettingsInput("", secMap, flat)
+	for k, v := range flat {
+		if v == nil {
+			delete(store, k)
+			dotPrefix := k + "."
+			for existingKey := range store {
+				if strings.HasPrefix(existingKey, dotPrefix) {
+					delete(store, existingKey)
+				}
+			}
+		} else {
+			store[k] = fmt.Sprintf("%v", v)
+		}
+	}
+}
+
+func formatSettingsMap(flat map[string]any, asFlat bool) map[string]any {
+	if asFlat {
+		out := make(map[string]any, len(flat))
+		for k, v := range flat {
+			out[k] = v
+		}
+		return out
+	}
+	out := make(map[string]any)
+	for k, v := range flat {
+		parts := strings.Split(k, ".")
+		curr := out
+		for i := 0; i < len(parts)-1; i++ {
+			p := parts[i]
+			next, ok := curr[p].(map[string]any)
+			if !ok {
+				next = make(map[string]any)
+				curr[p] = next
+			}
+			curr = next
+		}
+		curr[parts[len(parts)-1]] = v
+	}
+	return out
+}
+
 func (s *Server) handleClusterSettings(w http.ResponseWriter, r *http.Request) {
+	flatSettings := isTruthyBoolQueryParam(r, "flat_settings")
+	includeDefaults := isTruthyBoolQueryParam(r, "include_defaults")
+
 	if r.Method == http.MethodPut {
+		bodyBytes, ok := readRequestBody(w, r)
+		if !ok {
+			return
+		}
+		var reqMap map[string]any
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &reqMap); err != nil {
+				writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+				return
+			}
+		}
+		s.mu.Lock()
+		if s.clusterPersistentSettings == nil {
+			s.clusterPersistentSettings = make(map[string]any)
+		}
+		if s.clusterTransientSettings == nil {
+			s.clusterTransientSettings = make(map[string]any)
+		}
+		applyFlatSettingsToStore(s.clusterPersistentSettings, reqMap["persistent"])
+		applyFlatSettingsToStore(s.clusterTransientSettings, reqMap["transient"])
+		persOut := formatSettingsMap(s.clusterPersistentSettings, flatSettings)
+		transOut := formatSettingsMap(s.clusterTransientSettings, flatSettings)
+		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"acknowledged": true,
-			"persistent":   map[string]any{},
-			"transient":    map[string]any{},
+			"persistent":   persOut,
+			"transient":    transOut,
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"persistent": map[string]any{},
-		"transient":  map[string]any{},
-	})
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
+		return
+	}
+	s.mu.RLock()
+	persOut := formatSettingsMap(s.clusterPersistentSettings, flatSettings)
+	transOut := formatSettingsMap(s.clusterTransientSettings, flatSettings)
+	s.mu.RUnlock()
+	resp := map[string]any{
+		"persistent": persOut,
+		"transient":  transOut,
+	}
+	if includeDefaults {
+		resp["defaults"] = formatSettingsMap(map[string]any{
+			"cluster.routing.allocation.enable": "all",
+		}, flatSettings)
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func extractDefaultPipelineFromSettings(settings map[string]any) (string, bool) {
@@ -1631,6 +1750,63 @@ func (s *Server) resolveFinalPipeline(indexName string) string {
 	return finPipe
 }
 
+func extractCustomIndexSettings(settings map[string]any) map[string]any {
+	if len(settings) == 0 {
+		return nil
+	}
+	root := settings
+	if inner, ok := root["settings"].(map[string]any); ok {
+		root = inner
+	}
+	flat := make(map[string]any)
+	flattenSettingsInput("", root, flat)
+	normalized := make(map[string]any, len(flat))
+	for k, v := range flat {
+		cleanKey := strings.TrimPrefix(k, "index.")
+		if cleanKey == "" {
+			continue
+		}
+		normalized[cleanKey] = v
+	}
+	return normalized
+}
+
+func matchesSettingNameFilter(nameFilter string, shortKey string) bool {
+	if nameFilter == "" || nameFilter == "*" || nameFilter == "_all" {
+		return true
+	}
+	fullKey := "index." + shortKey
+	if matchMultiWildcardWithExclusions(nameFilter, shortKey) || matchMultiWildcardWithExclusions(nameFilter, fullKey) {
+		return true
+	}
+	for _, pat := range strings.Split(nameFilter, ",") {
+		pat = strings.TrimSpace(pat)
+		if pat == "" || strings.HasPrefix(pat, "-") {
+			continue
+		}
+		if strings.HasPrefix(shortKey, pat+".") || strings.HasPrefix(fullKey, pat+".") {
+			return true
+		}
+	}
+	return false
+}
+
+func formatIndexSettingsOutput(shortFlat map[string]any, flatSettings bool) map[string]any {
+	if flatSettings {
+		out := make(map[string]any, len(shortFlat))
+		for k, v := range shortFlat {
+			out["index."+k] = v
+		}
+		return out
+	}
+	if len(shortFlat) == 0 {
+		return map[string]any{}
+	}
+	return map[string]any{
+		"index": formatSettingsMap(shortFlat, false),
+	}
+}
+
 func (s *Server) handleIndexSettings(w http.ResponseWriter, r *http.Request) {
 	rawIndex := r.PathValue("index")
 	validTargets, _, ok := s.resolveValidatedReadTargets(w, r, rawIndex)
@@ -1662,25 +1838,42 @@ func (s *Server) handleIndexSettings(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			if hasDef || hasFin {
-				for _, indexName := range validTargets {
-					s.mu.Lock()
-					if hasDef {
-						if defPipe == "" {
-							delete(s.indexDefaultPipelines, indexName)
-						} else {
-							s.indexDefaultPipelines[indexName] = defPipe
-						}
+			customFlat := extractCustomIndexSettings(settings)
+			for _, indexName := range validTargets {
+				s.mu.Lock()
+				if s.indexCustomSettings == nil {
+					s.indexCustomSettings = make(map[string]map[string]any)
+				}
+				if s.indexCustomSettings[indexName] == nil {
+					s.indexCustomSettings[indexName] = make(map[string]any)
+				}
+				for k, v := range customFlat {
+					if k == "default_pipeline" || k == "final_pipeline" {
+						continue
 					}
-					if hasFin {
-						if finPipe == "" {
-							delete(s.indexFinalPipelines, indexName)
-						} else {
-							s.indexFinalPipelines[indexName] = finPipe
-						}
+					if v == nil {
+						delete(s.indexCustomSettings[indexName], k)
+					} else {
+						s.indexCustomSettings[indexName][k] = fmt.Sprintf("%v", v)
 					}
-					idxSchema := s.indices[indexName]
-					s.mu.Unlock()
+				}
+				if hasDef {
+					if defPipe == "" {
+						delete(s.indexDefaultPipelines, indexName)
+					} else {
+						s.indexDefaultPipelines[indexName] = defPipe
+					}
+				}
+				if hasFin {
+					if finPipe == "" {
+						delete(s.indexFinalPipelines, indexName)
+					} else {
+						s.indexFinalPipelines[indexName] = finPipe
+					}
+				}
+				idxSchema := s.indices[indexName]
+				s.mu.Unlock()
+				if hasDef || hasFin {
 					s.persistIndex(r.Context(), indexName, idxSchema)
 				}
 			}
@@ -1690,26 +1883,66 @@ func (s *Server) handleIndexSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
+		return
+	}
+
+	flatSettings := isTruthyBoolQueryParam(r, "flat_settings")
+	includeDefaults := isTruthyBoolQueryParam(r, "include_defaults")
+	nameFilter := strings.TrimSpace(r.PathValue("name"))
+
 	out := make(map[string]any, len(validTargets))
 	s.mu.RLock()
 	for _, indexName := range validTargets {
 		defPipe := s.indexDefaultPipelines[indexName]
 		finPipe := s.indexFinalPipelines[indexName]
-		idxSettings := map[string]any{
+		shortFlat := map[string]any{
 			"number_of_shards":   "1",
 			"number_of_replicas": "0",
+			"provided_name":      indexName,
+			"creation_date":      "1700000000000",
+			"uuid":               indexName,
+			"version.created":    "8120099",
 		}
 		if defPipe != "" {
-			idxSettings["default_pipeline"] = defPipe
+			shortFlat["default_pipeline"] = defPipe
 		}
 		if finPipe != "" {
-			idxSettings["final_pipeline"] = finPipe
+			shortFlat["final_pipeline"] = finPipe
 		}
-		out[indexName] = map[string]any{
-			"settings": map[string]any{
-				"index": idxSettings,
-			},
+		for k, v := range s.indexCustomSettings[indexName] {
+			shortFlat[k] = v
 		}
+		if nameFilter != "" {
+			filtered := make(map[string]any)
+			for k, v := range shortFlat {
+				if matchesSettingNameFilter(nameFilter, k) {
+					filtered[k] = v
+				}
+			}
+			shortFlat = filtered
+		}
+		idxEntry := map[string]any{
+			"settings": formatIndexSettingsOutput(shortFlat, flatSettings),
+		}
+		if includeDefaults {
+			defFlat := map[string]any{
+				"refresh_interval":  "1s",
+				"max_result_window": "10000",
+			}
+			if nameFilter != "" {
+				filteredDef := make(map[string]any)
+				for k, v := range defFlat {
+					if matchesSettingNameFilter(nameFilter, k) {
+						filteredDef[k] = v
+					}
+				}
+				defFlat = filteredDef
+			}
+			idxEntry["defaults"] = formatIndexSettingsOutput(defFlat, flatSettings)
+		}
+		out[indexName] = idxEntry
 	}
 	s.mu.RUnlock()
 	writeJSON(w, http.StatusOK, out)
@@ -2106,6 +2339,8 @@ func (s *Server) handleDataStream(w http.ResponseWriter, r *http.Request) {
 			delete(s.docVersions, idxName)
 			delete(s.indexDefaultPipelines, idxName)
 			delete(s.indexFinalPipelines, idxName)
+			delete(s.closedIndices, idxName)
+			delete(s.indexCustomSettings, idxName)
 			for alias := range s.aliases {
 				s.removeAliasTargetLocked(alias, idxName)
 				modifiedAliases[alias] = append([]string(nil), s.aliases[alias]...)
@@ -2182,9 +2417,13 @@ func (s *Server) handleCatIndices(w http.ResponseWriter, r *http.Request) {
 	sort.Strings(names)
 	list := make([]map[string]any, 0, len(names))
 	for _, name := range names {
+		idxStatus := "open"
+		if s.isIndexClosed(name) {
+			idxStatus = "close"
+		}
 		list = append(list, map[string]any{
 			"health":         "green",
-			"status":         "open",
+			"status":         idxStatus,
 			"index":          name,
 			"uuid":           name,
 			"pri":            "1",
@@ -2723,6 +2962,18 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 				toDelete = []string{name}
 			}
 			for _, k := range toDelete {
+				for _, tpl := range s.templates {
+					for _, comp := range tpl.ComposedOf {
+						if comp == k {
+							s.mu.Unlock()
+							writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+								fmt.Sprintf("component_template [%s] is in use by index templates", k))
+							return
+						}
+					}
+				}
+			}
+			for _, k := range toDelete {
 				delete(s.componentTemplates, k)
 			}
 			s.mu.Unlock()
@@ -2757,8 +3008,12 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if len(tpl.EffectivePatterns()) == 0 {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: index_patterns is missing;")
+			return
+		}
+		_ = s.syncCatalogFromBackend(r.Context())
 		if isTruthyBoolQueryParam(r, "create") {
-			_ = s.syncCatalogFromBackend(r.Context())
 			s.mu.RLock()
 			_, exists := s.templates[name]
 			s.mu.RUnlock()
@@ -2767,6 +3022,16 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		s.mu.RLock()
+		for _, compName := range tpl.ComposedOf {
+			if _, exists := s.componentTemplates[compName]; !exists {
+				s.mu.RUnlock()
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("index_template [%s] invalid, cause [Validation Failed: 1: component template [%s] not found;]", name, compName))
+				return
+			}
+		}
+		s.mu.RUnlock()
 		s.mu.Lock()
 		s.templates[name] = tpl
 		s.mu.Unlock()
@@ -2989,11 +3254,67 @@ func validateESIndexName(name string) (string, bool) {
 	return "", true
 }
 
+func (s *Server) isIndexClosed(indexName string) bool {
+	if indexName == "" {
+		return false
+	}
+	s.mu.RLock()
+	closed := s.closedIndices[indexName]
+	s.mu.RUnlock()
+	return closed
+}
+
+func (s *Server) findClosedTargetIndex(r *http.Request, rawIndex string) string {
+	rawIndex = strings.TrimSpace(rawIndex)
+	ew := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("expand_wildcards")))
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.closedIndices) == 0 {
+		return ""
+	}
+	if rawIndex == "" || rawIndex == "_all" || rawIndex == "*" {
+		if strings.Contains(ew, "closed") || ew == "all" {
+			for idxName := range s.indices {
+				if s.closedIndices[idxName] {
+					return idxName
+				}
+			}
+		}
+		return ""
+	}
+	for _, part := range strings.Split(rawIndex, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" || strings.HasPrefix(part, "-") {
+			continue
+		}
+		if strings.ContainsAny(part, "*?") || part == "_all" {
+			if ew == "open" {
+				continue
+			}
+			for idxName := range s.indices {
+				if (part == "_all" || matchWildcardPattern(part, idxName)) && s.closedIndices[idxName] {
+					return idxName
+				}
+			}
+			continue
+		}
+		if s.closedIndices[part] {
+			return part
+		}
+		for _, t := range s.aliases[part] {
+			if s.closedIndices[t] {
+				return t
+			}
+		}
+	}
+	return ""
+}
+
 func (s *Server) resolveValidatedReadTargets(w http.ResponseWriter, r *http.Request, rawIndex string) ([]string, map[string]*esast.Query, bool) {
 	_ = s.syncCatalogFromBackend(r.Context())
 	rawIndex = strings.TrimSpace(rawIndex)
 	ew := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("expand_wildcards")))
-	if (ew == "none" || ew == "closed") && (strings.ContainsAny(rawIndex, "*?") || rawIndex == "_all") {
+	if ew == "none" && (strings.ContainsAny(rawIndex, "*?") || rawIndex == "_all") {
 		if r.Method == http.MethodHead {
 			w.WriteHeader(http.StatusNotFound)
 			return nil, nil, false
@@ -3011,11 +3332,16 @@ func (s *Server) resolveValidatedReadTargets(w http.ResponseWriter, r *http.Requ
 
 	s.mu.RLock()
 	var missingConcrete string
+	concreteTargets := make(map[string]bool)
 	if rawIndex != "" && rawIndex != "_all" && rawIndex != "*" {
 		for _, part := range strings.Split(rawIndex, ",") {
 			part = strings.TrimSpace(part)
 			if part == "" || strings.HasPrefix(part, "-") || strings.ContainsAny(part, "*?") || part == "_all" {
 				continue
+			}
+			concreteTargets[part] = true
+			for _, at := range s.aliases[part] {
+				concreteTargets[at] = true
 			}
 			_, isIdx := s.indices[part]
 			_, isAlias := s.aliases[part]
@@ -3046,16 +3372,30 @@ func (s *Server) resolveValidatedReadTargets(w http.ResponseWriter, r *http.Requ
 	s.mu.RLock()
 	var validTargets []string
 	for _, t := range targets {
+		isValid := false
 		if _, ok := s.indices[t]; ok {
-			validTargets = append(validTargets, t)
+			isValid = true
 		} else if strings.HasPrefix(t, ".ds-") && strings.HasSuffix(t, "-000001") {
 			dsName := strings.TrimSuffix(strings.TrimPrefix(t, ".ds-"), "-000001")
 			if _, isDS := s.dataStreams[dsName]; isDS {
 				if _, okDS := s.indices[dsName]; okDS {
-					validTargets = append(validTargets, t)
+					isValid = true
 				}
 			}
 		}
+		if !isValid {
+			continue
+		}
+		isClosed := s.closedIndices[t]
+		if !concreteTargets[t] {
+			if ew == "closed" && !isClosed {
+				continue
+			}
+			if ew == "open" && isClosed {
+				continue
+			}
+		}
+		validTargets = append(validTargets, t)
 	}
 	s.mu.RUnlock()
 
@@ -3182,6 +3522,20 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 			delete(s.indexFinalPipelines, indexName)
 		} else {
 			s.indexFinalPipelines[indexName] = fp
+		}
+	}
+	if customFlat := extractCustomIndexSettings(req.Settings); len(customFlat) > 0 {
+		if s.indexCustomSettings == nil {
+			s.indexCustomSettings = make(map[string]map[string]any)
+		}
+		if s.indexCustomSettings[indexName] == nil {
+			s.indexCustomSettings[indexName] = make(map[string]any)
+		}
+		for k, v := range customFlat {
+			if k == "default_pipeline" || k == "final_pipeline" || v == nil {
+				continue
+			}
+			s.indexCustomSettings[indexName][k] = fmt.Sprintf("%v", v)
 		}
 	}
 	for alias, rawMeta := range tplAliases {
@@ -3437,6 +3791,8 @@ func (s *Server) handleDeleteIndex(w http.ResponseWriter, r *http.Request) {
 		delete(s.docVersions, indexName)
 		delete(s.indexDefaultPipelines, indexName)
 		delete(s.indexFinalPipelines, indexName)
+		delete(s.closedIndices, indexName)
+		delete(s.indexCustomSettings, indexName)
 		for alias := range s.aliases {
 			s.removeAliasTargetLocked(alias, indexName)
 			modifiedAliases[alias] = append([]string(nil), s.aliases[alias]...)
@@ -3528,7 +3884,16 @@ func (s *Server) handleGetMapping(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetFieldMapping(w http.ResponseWriter, r *http.Request) {
 	_ = s.syncCatalogFromBackend(r.Context())
 	rawIndex := strings.TrimSpace(r.PathValue("index"))
-	targets := s.resolveTargetIndices(rawIndex)
+	var targets []string
+	if rawIndex != "" {
+		var ok bool
+		targets, _, ok = s.resolveValidatedReadTargets(w, r, rawIndex)
+		if !ok {
+			return
+		}
+	} else {
+		targets = s.resolveTargetIndices("")
+	}
 	rawFields := r.PathValue("fields")
 	if rawFields == "" {
 		rawFields = "*"
@@ -3603,10 +3968,6 @@ func (s *Server) handleGetFieldMapping(w http.ResponseWriter, r *http.Request) {
 		out[idxName] = map[string]any{"mappings": mappingsOut}
 	}
 	s.mu.RUnlock()
-	if len(out) == 0 && rawIndex != "" && rawIndex != "_all" && !strings.ContainsAny(rawIndex, "*?,") && !strings.HasPrefix(rawIndex, "-") && !isTruthyBoolQueryParam(r, "ignore_unavailable") {
-		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
-		return
-	}
 
 	writeJSON(w, http.StatusOK, out)
 }
@@ -4314,6 +4675,8 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 				delete(s.docVersions, indexName)
 				delete(s.indexDefaultPipelines, indexName)
 				delete(s.indexFinalPipelines, indexName)
+				delete(s.closedIndices, indexName)
+				delete(s.indexCustomSettings, indexName)
 				removedIndices = append(removedIndices, indexName)
 				for alias := range s.aliases {
 					s.removeAliasTargetLocked(alias, indexName)
@@ -4617,6 +4980,10 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 	indexName, aliasFilter, writeErr := s.resolveWriteIndexWithFilter(rawReqIndex)
 	if writeErr != nil {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", writeErr.Error())
+		return
+	}
+	if s.isIndexClosed(indexName) {
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", indexName))
 		return
 	}
 	ifSeqNo, ifPrimaryTerm, reqVer, verType, occParseErr := parseOCCParamsFromRequest(r)
@@ -5264,6 +5631,10 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", writeErr.Error())
 		return
 	}
+	if s.isIndexClosed(indexName) {
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", indexName))
+		return
+	}
 	ifSeqNo, ifPrimaryTerm, reqVer, verType, occParseErr := parseOCCParamsFromRequest(r)
 	if occParseErr != "" {
 		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", occParseErr)
@@ -5377,6 +5748,10 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	indexName, aliasFilter, writeErr := s.resolveWriteIndexWithFilter(rawReqIndex)
 	if writeErr != nil {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", writeErr.Error())
+		return
+	}
+	if s.isIndexClosed(indexName) {
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", indexName))
 		return
 	}
 	ifSeqNo, ifPrimaryTerm, reqVer, verType, occParseErr := parseOCCParamsFromRequest(r)
@@ -7629,6 +8004,10 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rawIndex := extractPITIndex(r.PathValue("index"), req.PIT)
+	if closedIdx := s.findClosedTargetIndex(r, rawIndex); closedIdx != "" {
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
+		return
+	}
 	resp, status, errType, errReason := s.executeSearchRequest(r.Context(), rawIndex, &req)
 	if errType != "" {
 		writeESError(w, status, errType, errReason)
@@ -7858,7 +8237,18 @@ func (s *Server) buildDorisExplainObject(ctx context.Context, rawIndexPattern st
 
 func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 	_ = s.syncCatalogFromBackend(r.Context())
-	targets, aliasFilters := s.resolveTargetIndicesWithFilters(r.PathValue("index"))
+	rawIndex := strings.TrimSpace(r.PathValue("index"))
+	var targets []string
+	var aliasFilters map[string]*esast.Query
+	if rawIndex != "" {
+		var ok bool
+		targets, aliasFilters, ok = s.resolveValidatedReadTargets(w, r, rawIndex)
+		if !ok {
+			return
+		}
+	} else {
+		targets, aliasFilters = s.resolveTargetIndicesWithFilters("")
+	}
 	var filterPatterns []string
 	if fieldsFilter := r.URL.Query().Get("fields"); fieldsFilter != "" {
 		filterPatterns = append(filterPatterns, strings.Split(fieldsFilter, ",")...)
@@ -7873,16 +8263,18 @@ func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 			Fields      []string     `json:"fields"`
 			IndexFilter *esast.Query `json:"index_filter"`
 		}
-		if err := json.Unmarshal(bodyBytes, &body); err == nil {
-			if len(body.Fields) > 0 {
-				if len(filterPatterns) == 1 && filterPatterns[0] == "*" {
-					filterPatterns = body.Fields
-				} else {
-					filterPatterns = append(filterPatterns, body.Fields...)
-				}
-			}
-			indexFilter = body.IndexFilter
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+			return
 		}
+		if len(body.Fields) > 0 {
+			if len(filterPatterns) == 1 && filterPatterns[0] == "*" {
+				filterPatterns = body.Fields
+			} else {
+				filterPatterns = append(filterPatterns, body.Fields...)
+			}
+		}
+		indexFilter = body.IndexFilter
 	}
 	if len(filterPatterns) == 0 {
 		filterPatterns = []string{"*"}
@@ -10217,6 +10609,10 @@ func (s *Server) handleCount(w http.ResponseWriter, r *http.Request) {
 	req.Size = &zero
 	req.TrackTotalHits = true
 
+	if closedIdx := s.findClosedTargetIndex(r, r.PathValue("index")); closedIdx != "" {
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
+		return
+	}
 	resp, status, errType, errReason := s.executeSearchRequest(r.Context(), r.PathValue("index"), &req)
 	if errType != "" {
 		writeESError(w, status, errType, errReason)
@@ -18288,6 +18684,7 @@ func prepareDocForRuntimeScript(idxSchema *schema.IndexSchema, doc map[string]an
 			if cp == nil {
 				cp = make(map[string]any)
 			}
+			cp["__raw_source"] = doc
 		}
 	}
 	if doc != nil {
@@ -23062,6 +23459,11 @@ func scriptHasMissingDocValueRef(doc map[string]any, src string) (string, bool) 
 	if strings.Contains(src, ".size()") || strings.Contains(src, ".empty") || strings.Contains(src, ".length") || strings.Contains(src, "containsKey") {
 		return "", false
 	}
+	for _, guardTok := range []string{"?.", "?:", "?", "if", "else", "try", "catch", "null", "||", "&&"} {
+		if strings.Contains(src, guardTok) {
+			return "", false
+		}
+	}
 	matches := reScriptDocFieldRef.FindAllStringSubmatch(src, -1)
 	for _, m := range matches {
 		if len(m) < 2 {
@@ -23142,11 +23544,22 @@ func extractDocRawValuesForMetric(md runtimeMatchedDoc, mSpec *esast.MetricAggSp
 				return nil
 			}
 		}
-		if missField, isMiss := scriptHasMissingDocValueRef(evalDoc, src); isMiss {
-			if mSpec.Missing == nil {
-				return nil
+		if mSpec.Missing != nil {
+			matches := reScriptDocFieldRef.FindAllStringSubmatch(src, -1)
+			for _, m := range matches {
+				if len(m) < 2 {
+					continue
+				}
+				rawField := strings.TrimSuffix(strings.TrimSuffix(m[1], ".keyword"), ".ngram")
+				if rawField == "" || rawField == "_id" || rawField == "_index" || rawField == "_version" {
+					continue
+				}
+				if len(collectScalarValuesAtPath(evalDoc, strings.Split(rawField, "."))) == 0 {
+					evalDoc = cloneDocWithFieldPath(evalDoc, rawField, mSpec.Missing)
+				}
 			}
-			evalDoc = cloneDocWithFieldPath(evalDoc, missField, mSpec.Missing)
+		} else if _, isMiss := scriptHasMissingDocValueRef(evalDoc, src); isMiss {
+			return nil
 		}
 		cp := make(map[string]any, len(params)+1)
 		for k, v := range params {

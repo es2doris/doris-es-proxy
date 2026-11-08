@@ -83,10 +83,11 @@ type TranspilerOptions struct {
 }
 
 type Transpiler struct {
-	Schema          *schema.IndexSchema
-	Opts            TranspilerOptions
-	unindexedFields map[string]bool
-	searchErr       error
+	Schema           *schema.IndexSchema
+	Opts             TranspilerOptions
+	unindexedFields  map[string]bool
+	searchErr        error
+	inFilterAggQuery bool
 }
 
 func NewTranspiler(s *schema.IndexSchema, opts TranspilerOptions) *Transpiler {
@@ -694,10 +695,15 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 				if ts.MinimumShouldMatchField != "" {
 					resolvedMSM, bMSM := t.resolveFieldInNestedCtx(ts.MinimumShouldMatchField, true, nctx)
 					t.checkFieldDocValues(resolvedMSM, bMSM)
-					threshExpr = fmt.Sprintf("COALESCE(%s, 1)", t.sqlNumericColumnRef(ts.MinimumShouldMatchField, nctx))
+					threshExpr = fmt.Sprintf("GREATEST(1, COALESCE(%s, 1))", t.sqlNumericColumnRef(ts.MinimumShouldMatchField, nctx))
 				} else if ts.MinimumShouldMatchScript != nil {
 					t.checkScriptDocValues(ts.MinimumShouldMatchScript, nctx)
-					threshExpr = t.compileTermsSetScriptThreshold(ts.MinimumShouldMatchScript, len(uniqueTerms), nctx)
+					scriptExpr := t.compileTermsSetScriptThreshold(ts.MinimumShouldMatchScript, len(ts.Terms), nctx)
+					if scriptExpr == "1" {
+						threshExpr = "1"
+					} else {
+						threshExpr = fmt.Sprintf("GREATEST(1, %s)", scriptExpr)
+					}
 				}
 				fp = fmt.Sprintf("((%s) >= %s)", strings.Join(termSums, " + "), threshExpr)
 			}
@@ -2960,10 +2966,23 @@ func (t *Transpiler) compileNestedWithParent(nq *esast.NestedQuery, scoring bool
 			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 		}
 	}
-	corrCol, ok := t.Schema.NestedRoots[nq.Path]
+	var corrCol string
+	var ok bool
+	if t.Schema != nil {
+		corrCol, ok = t.Schema.NestedRoots[nq.Path]
+	}
 	if !ok {
 		if nq.IgnoreUnmapped {
 			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+		if t.Schema != nil && (len(t.Schema.Fields) > 0 || len(t.Schema.NestedRoots) > 0) {
+			_, isNonNestedField := t.Schema.Fields[nq.Path]
+			if isNonNestedField || len(t.Schema.NestedRoots) > 0 || !t.inFilterAggQuery {
+				if t.searchErr == nil {
+					t.searchErr = fmt.Errorf("[nested] failed to find nested object under path [%s]", nq.Path)
+				}
+				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+			}
 		}
 		corrCol = "n__" + schema.SanitizeDorisIdentifier(nq.Path)
 	}
@@ -5446,8 +5465,17 @@ func (t *Transpiler) appendAggBranches(
 			}
 
 		case spec.Nested != nil:
-			corrCol, ok := t.Schema.NestedRoots[spec.Nested.Path]
+			var corrCol string
+			var ok bool
+			if t.Schema != nil {
+				corrCol, ok = t.Schema.NestedRoots[spec.Nested.Path]
+			}
 			if !ok {
+				if t.Schema != nil && (len(t.Schema.Fields) > 0 || len(t.Schema.NestedRoots) > 0) {
+					if t.searchErr == nil {
+						t.searchErr = fmt.Errorf("[nested] failed to find nested object under path [%s]", spec.Nested.Path)
+					}
+				}
 				corrCol = "n__" + schema.SanitizeDorisIdentifier(spec.Nested.Path)
 			}
 			*branches = append(*branches, fmt.Sprintf(
@@ -5967,7 +5995,10 @@ func (t *Transpiler) appendAggBranches(
 			}
 
 		case spec.Filter != nil:
+			prevInFilter := t.inFilterAggQuery
+			t.inFilterAggQuery = true
 			cond := t.CompileQuery(spec.Filter, false, nil)
+			t.inFilterAggQuery = prevInFilter
 			combinedWhere := cond.WhereSQL
 			if extraWhere != "" {
 				combinedWhere = fmt.Sprintf("(%s) AND (%s)", extraWhere, cond.WhereSQL)
@@ -5986,7 +6017,10 @@ func (t *Transpiler) appendAggBranches(
 			if spec.Filters.IsAnonymous {
 				for i, fq := range spec.Filters.AnonymousFilters {
 					fk := strconv.Itoa(i)
+					prevInFilter := t.inFilterAggQuery
+					t.inFilterAggQuery = true
 					cond := t.CompileQuery(&fq, false, nil)
+					t.inFilterAggQuery = prevInFilter
 					matchedConds = append(matchedConds, fmt.Sprintf("(%s)", cond.EffectiveSafeWhere()))
 					combinedWhere := cond.WhereSQL
 					if extraWhere != "" {
@@ -6009,7 +6043,10 @@ func (t *Transpiler) appendAggBranches(
 				sort.Strings(fKeys)
 				for _, fk := range fKeys {
 					fq := spec.Filters.Filters[fk]
+					prevInFilter := t.inFilterAggQuery
+					t.inFilterAggQuery = true
 					cond := t.CompileQuery(&fq, false, nil)
+					t.inFilterAggQuery = prevInFilter
 					matchedConds = append(matchedConds, fmt.Sprintf("(%s)", cond.EffectiveSafeWhere()))
 					combinedWhere := cond.WhereSQL
 					if extraWhere != "" {
@@ -9920,8 +9957,15 @@ func sampleValForSortType(sortType string) any {
 	return nil
 }
 
-func effectiveSortESType(b schema.FieldBinding, sortType string) string {
+func effectiveSortESType(b schema.FieldBinding, sortType string, numericType ...string) string {
 	st := strings.ToLower(strings.TrimSpace(sortType))
+	nt := ""
+	if len(numericType) > 0 {
+		nt = strings.ToLower(strings.TrimSpace(numericType[0]))
+	}
+	if nt != "" && (b.ESType != "" || st != "") {
+		return nt
+	}
 	if st == "date_nanos" || b.ESType == "date_nanos" {
 		return "date_nanos"
 	}
@@ -9937,6 +9981,20 @@ func effectiveSortESType(b schema.FieldBinding, sortType string) string {
 	return st
 }
 
+func parseGeoSortMissingMeters(missing string) (float64, bool) {
+	m := strings.TrimSpace(missing)
+	if m == "" || strings.EqualFold(m, "_first") || strings.EqualFold(m, "_last") {
+		return 0, false
+	}
+	if _, distM, err := esast.ParseGeoDistanceMeters(m); err == nil && !math.IsNaN(distM) && !math.IsInf(distM, 0) {
+		return distM, true
+	}
+	if fv, err := strconv.ParseFloat(m, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+		return fv, true
+	}
+	return 0, false
+}
+
 func (t *Transpiler) compileOrderBy(sorts []esast.SortSpec) string {
 	return t.compileOrderByWithAfter(sorts, nil)
 }
@@ -9946,7 +10004,7 @@ func (t *Transpiler) resolveSortMissing(s esast.SortSpec, b schema.FieldBinding)
 		return nil, ""
 	}
 	mStr := strings.TrimSpace(s.Entry.Missing)
-	effType := effectiveSortESType(b, s.Entry.Type)
+	effType := effectiveSortESType(b, s.Entry.Type, s.Entry.NumericType)
 	if effType == "boolean" || b.DorisType == schema.DorisBoolean {
 		if bv, ok := normalizeBooleanQueryValue(mStr); ok {
 			if bv {
@@ -10207,17 +10265,31 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 			if geoMap, ok := s.Entry.Script.(map[string]any); ok {
 				reserved := map[string]bool{
 					"order": true, "mode": true, "missing": true, "unit": true,
-					"distance_type": true, "validation_method": true, "ignore_unmapped": true, "nested": true,
+					"distance_type": true, "validation_method": true, "ignore_unmapped": true, "unmapped_type": true, "nested": true,
 				}
 				for k := range geoMap {
 					if !reserved[k] {
 						resolvedGeo, geoB := t.resolveSortFieldAndBinding(k, s.Entry.Nested)
+						if t.Schema != nil && len(t.Schema.Fields) > 0 {
+							if geoB.ESType != "" && geoB.ESType != "geo_point" {
+								if t.searchErr == nil {
+									t.searchErr = fmt.Errorf("failed to find mapper for [%s] for geo distance based sort", k)
+								}
+							} else if geoB.ESType == "" && !s.Entry.IgnoreUnmapped && s.Entry.Type == "" && len(after) == 0 && s.Entry.Missing == "" {
+								if t.searchErr == nil {
+									t.searchErr = fmt.Errorf("no mapping found for [%s] in order to sort on", k)
+								}
+							}
+						}
 						t.checkFieldDocValues(resolvedGeo, geoB)
 						break
 					}
 				}
 			}
 			if geoExpr, ok := t.compileGeoDistanceSortExpr(s); ok {
+				if missDist, okM := parseGeoSortMissingMeters(s.Entry.Missing); okM {
+					geoExpr = fmt.Sprintf("COALESCE(%s, %g)", geoExpr, missDist)
+				}
 				orderPart := geoExpr + " " + dir
 				if strings.EqualFold(s.Entry.Missing, "_first") {
 					orderPart += " NULLS FIRST"
@@ -10273,10 +10345,10 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 			}
 			t.checkFieldDocValues(resolvedField, b)
 			rawSortType := s.Entry.Type
-			effType := effectiveSortESType(b, rawSortType)
+			effType := effectiveSortESType(b, rawSortType, s.Entry.NumericType)
 			sampleVal, missingSQL := t.resolveSortMissing(s, b)
-			if sampleVal == nil && rawSortType != "" {
-				sampleVal = sampleValForSortType(rawSortType)
+			if sampleVal == nil && effType != "" {
+				sampleVal = sampleValForSortType(effType)
 			}
 			if afterIdx < len(after) && after[afterIdx] != nil {
 				sampleVal = after[afterIdx]
@@ -10307,6 +10379,14 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 				sampleVal = normalizeScaledFloatValue(b, sampleVal)
 			}
 			col := t.sqlSortColumnRefWithType(s.Entry.Field, sampleVal, dir == "DESC", s.Entry.Mode, s.Entry.Nested, effType)
+			if b.ESType != "" && s.Entry.NumericType != "" && b.Kind == schema.StoragePromotedScalar {
+				switch strings.ToLower(s.Entry.NumericType) {
+				case "long", "date", "date_nanos":
+					col = fmt.Sprintf("CAST(%s AS BIGINT)", col)
+				case "double":
+					col = fmt.Sprintf("CAST(%s AS DOUBLE)", col)
+				}
+			}
 			if missingSQL != "" {
 				col = fmt.Sprintf("COALESCE(%s, %s)", col, missingSQL)
 			}
@@ -10423,6 +10503,13 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 			return "`_id`", val, true, nil
 		case "_geo_distance":
 			geoExpr, _ := t.compileGeoDistanceSortExpr(effectiveSorts[idx])
+			hasGeoMiss := false
+			var geoMissSample any
+			if missDist, okM := parseGeoSortMissingMeters(effectiveSorts[idx].Entry.Missing); okM {
+				geoExpr = fmt.Sprintf("COALESCE(%s, %g)", geoExpr, missDist)
+				hasGeoMiss = true
+				geoMissSample = missDist
+			}
 			if geoMap, ok := effectiveSorts[idx].Entry.Script.(map[string]any); ok {
 				unit := "m"
 				if uStr, okU := geoMap["unit"].(string); okU && uStr != "" {
@@ -10449,7 +10536,7 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 					}
 				}
 			}
-			return geoExpr, val, false, nil
+			return geoExpr, val, hasGeoMiss, geoMissSample
 		case "_script":
 			scriptExpr, sb, _ := t.compileScriptSortExpr(effectiveSorts[idx])
 			missSample, missingSQL := t.resolveSortMissing(effectiveSorts[idx], sb)
@@ -10460,7 +10547,7 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 		default:
 			_, b := t.resolveSortFieldAndBinding(field, effectiveSorts[idx].Entry.Nested)
 			rawSortType := effectiveSorts[idx].Entry.Type
-			effType := effectiveSortESType(b, rawSortType)
+			effType := effectiveSortESType(b, rawSortType, effectiveSorts[idx].Entry.NumericType)
 			missSample, missingSQL := t.resolveSortMissing(effectiveSorts[idx], b)
 			if effType == "boolean" || b.DorisType == schema.DorisBoolean {
 				if bv, ok := normalizeBooleanQueryValue(val); ok {
@@ -10501,10 +10588,18 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 			if sampleForCol == nil {
 				sampleForCol = missSample
 			}
-			if sampleForCol == nil && rawSortType != "" {
-				sampleForCol = sampleValForSortType(rawSortType)
+			if sampleForCol == nil && effType != "" {
+				sampleForCol = sampleValForSortType(effType)
 			}
 			col := t.sqlSortColumnRefWithType(field, sampleForCol, desc, effectiveSorts[idx].Entry.Mode, effectiveSorts[idx].Entry.Nested, effType)
+			if b.ESType != "" && effectiveSorts[idx].Entry.NumericType != "" && b.Kind == schema.StoragePromotedScalar {
+				switch strings.ToLower(effectiveSorts[idx].Entry.NumericType) {
+				case "long", "date", "date_nanos":
+					col = fmt.Sprintf("CAST(%s AS BIGINT)", col)
+				case "double":
+					col = fmt.Sprintf("CAST(%s AS DOUBLE)", col)
+				}
+			}
 			if missingSQL != "" {
 				col = fmt.Sprintf("COALESCE(%s, %s)", col, missingSQL)
 			}
@@ -11206,9 +11301,9 @@ func (t *Transpiler) rangeFieldBoundsSQL(field string, b schema.FieldBinding, nc
 		ltePath := strings.TrimSuffix(relPath, "") + "._lte"
 		rawGtePath := strings.TrimSuffix(relPath, "") + ".gte"
 		rawLtePath := strings.TrimSuffix(relPath, "") + ".lte"
-		lower := fmt.Sprintf("COALESCE(CAST(json_extract_string(%s, %s) AS DOUBLE), CAST(json_extract_string(%s, %s) AS DOUBLE))",
+		lower := fmt.Sprintf("COALESCE(CAST(json_extract_string(%s, %s) AS DOUBLE), CAST(json_extract_string(%s, %s) AS DOUBLE), -1e100)",
 			nctx.elemVar, quoteStr(gtePath), nctx.elemVar, quoteStr(rawGtePath))
-		upper := fmt.Sprintf("COALESCE(CAST(json_extract_string(%s, %s) AS DOUBLE), CAST(json_extract_string(%s, %s) AS DOUBLE))",
+		upper := fmt.Sprintf("COALESCE(CAST(json_extract_string(%s, %s) AS DOUBLE), CAST(json_extract_string(%s, %s) AS DOUBLE), 1e100)",
 			nctx.elemVar, quoteStr(ltePath), nctx.elemVar, quoteStr(rawLtePath))
 		return lower, upper
 	}
@@ -11294,11 +11389,17 @@ func (t *Transpiler) compileRangeOnRangeField(field string, b schema.FieldBindin
 	var conds []string
 	switch rel {
 	case "CONTAINS":
-		if hasLower {
-			conds = append(conds, fmt.Sprintf("%s <= %s", lowerSQL, qLowLit))
-		}
-		if hasUpper {
-			conds = append(conds, fmt.Sprintf("%s >= %s", upperSQL, qUpLit))
+		if hasLower || hasUpper {
+			if hasLower {
+				conds = append(conds, fmt.Sprintf("%s <= %s", lowerSQL, qLowLit))
+			} else {
+				conds = append(conds, fmt.Sprintf("%s <= -1e99", lowerSQL))
+			}
+			if hasUpper {
+				conds = append(conds, fmt.Sprintf("%s >= %s", upperSQL, qUpLit))
+			} else {
+				conds = append(conds, fmt.Sprintf("%s >= 1e99", upperSQL))
+			}
 		}
 	case "WITHIN":
 		if hasLower {
@@ -11357,7 +11458,7 @@ func (t *Transpiler) compileGeoPolygon(gp *esast.GeoPolygonQuery, scoring bool, 
 			maxLon = pt[1]
 		}
 	}
-	return t.compileGeoBoundingBox(&esast.GeoBoundingBoxQuery{
+	bboxQ := t.compileGeoBoundingBox(&esast.GeoBoundingBoxQuery{
 		Field:            gp.Field,
 		Top:              maxLat,
 		Bottom:           minLat,
@@ -11367,6 +11468,30 @@ func (t *Transpiler) compileGeoPolygon(gp *esast.GeoPolygonQuery, scoring bool, 
 		Boost:            gp.Boost,
 		Name:             gp.Name,
 	}, scoring, nctx)
+	if bboxQ.WhereSQL == "FALSE" || t.searchErr != nil {
+		return bboxQ
+	}
+	resolvedField, b := t.resolveFieldInNestedCtx(gp.Field, false, nctx)
+	var whereSQL string
+	if nctx != nil && nctx.elemVar != "" && ((b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath) || strings.HasPrefix(resolvedField, nctx.nestedPath+".")) {
+		elemExpr := t.sqlColumnRef(resolvedField, true, nctx)
+		latExpr := fmt.Sprintf("CAST(SPLIT_PART(%s, ',', 1) AS DOUBLE)", elemExpr)
+		lonExpr := fmt.Sprintf("CAST(SPLIT_PART(%s, ',', 2) AS DOUBLE)", elemExpr)
+		whereSQL = fmt.Sprintf("(%s AND %s)", bboxQ.WhereSQL, buildPointInPolygonSQL(latExpr, lonExpr, gp.Points))
+	} else if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
+		arrCol := fmt.Sprintf("`%s`", b.EffectiveArrayColumn(true))
+		latExpr := "CAST(SPLIT_PART(_x, ',', 1) AS DOUBLE)"
+		lonExpr := "CAST(SPLIT_PART(_x, ',', 2) AS DOUBLE)"
+		whereSQL = fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND %s, %s)", buildPointInPolygonSQL(latExpr, lonExpr, gp.Points), arrCol)
+	} else {
+		latExpr, lonExpr, _ := t.extractGeoPointExprs(resolvedField, b)
+		whereSQL = fmt.Sprintf("(%s AND %s)", bboxQ.WhereSQL, buildPointInPolygonSQL(latExpr, lonExpr, gp.Points))
+	}
+	return CompiledQuery{
+		WhereSQL:     whereSQL,
+		SafeWhereSQL: whereSQL,
+		ScoreSQL:     bboxQ.ScoreSQL,
+	}
 }
 
 func buildPointInPolygonSQL(latExpr, lonExpr string, pts [][2]float64) string {
@@ -12456,6 +12581,44 @@ func (t *Transpiler) compileSpanQuery(q *esast.Query, inScoring bool, nctx *nest
 		return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: safeWhereSQL, ScoreSQL: scoreSQL, UsesFulltextMatch: usesFT}
 
 	case q.SpanNear != nil:
+		if len(q.SpanNear.Clauses) == 0 {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+		boost := 1.0
+		if q.SpanNear.Boost != nil {
+			boost = *q.SpanNear.Boost
+		}
+		commonField := ""
+		allSameFieldTerms := true
+		var termStrs []string
+		for _, cl := range q.SpanNear.Clauses {
+			if len(cl.SpanTerm) != 1 {
+				allSameFieldTerms = false
+				break
+			}
+			for f, st := range cl.SpanTerm {
+				if f == "" || (commonField != "" && f != commonField) {
+					allSameFieldTerms = false
+					break
+				}
+				commonField = f
+				termStrs = append(termStrs, fmt.Sprintf("%v", st.Value))
+			}
+			if !allSameFieldTerms {
+				break
+			}
+		}
+		if allSameFieldTerms && commonField != "" && len(termStrs) > 0 {
+			slop := q.SpanNear.Slop
+			if q.SpanNear.InOrder != nil && !*q.SpanNear.InOrder && slop == 0 {
+				slop = 1
+			}
+			cp := t.compileMatchPhraseField(commonField, strings.Join(termStrs, " "), slop, boost, false, inScoring, nctx)
+			if q.SpanNear.Boost != nil && *q.SpanNear.Boost == 0 {
+				cp.ScoreSQL = "0.0"
+			}
+			return cp
+		}
 		var preds, safePreds []string
 		usesFT := false
 		for _, cl := range q.SpanNear.Clauses {
@@ -12465,17 +12628,10 @@ func (t *Transpiler) compileSpanQuery(q *esast.Query, inScoring bool, nctx *nest
 			safePreds = append(safePreds, cp.EffectiveSafeWhere())
 			usesFT = usesFT || cp.UsesFulltextMatch
 		}
-		if len(preds) == 0 {
-			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
-		}
 		w := "(" + strings.Join(preds, " AND ") + ")"
 		sw := "(" + strings.Join(safePreds, " AND ") + ")"
 		if len(preds) == 1 {
 			w, sw = preds[0], safePreds[0]
-		}
-		boost := 1.0
-		if q.SpanNear.Boost != nil {
-			boost = *q.SpanNear.Boost
 		}
 		sc := "0.0"
 		if inScoring && boost != 0 && w != "FALSE" {
@@ -12524,8 +12680,8 @@ func (t *Transpiler) compileSpanQuery(q *esast.Query, inScoring bool, nctx *nest
 		}
 		w, sw := inc.WhereSQL, inc.EffectiveSafeWhere()
 		if exc.WhereSQL != "FALSE" {
-			w = fmt.Sprintf("(%s AND NOT (%s))", inc.WhereSQL, exc.WhereSQL)
-			sw = fmt.Sprintf("(%s AND NOT (%s))", inc.EffectiveSafeWhere(), exc.EffectiveSafeWhere())
+			w = fmt.Sprintf("(%s AND NOT COALESCE(%s, FALSE))", inc.WhereSQL, exc.WhereSQL)
+			sw = fmt.Sprintf("(%s AND NOT COALESCE(%s, FALSE))", inc.EffectiveSafeWhere(), exc.EffectiveSafeWhere())
 		}
 		boost := 1.0
 		if q.SpanNot.Boost != nil {

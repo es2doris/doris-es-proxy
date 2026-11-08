@@ -234,6 +234,9 @@ func (c *runnerContext) cleanupAll() {
 		if idx != "" && alias != "" {
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/"+url.PathEscape(idx)+"/_alias/"+url.PathEscape(alias), nil, nil, nil)
 		}
+		if alias != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_all/_alias/"+url.PathEscape(alias), nil, nil, nil)
+		}
 	}
 	for ds := range c.createdDataStreams {
 		if ds != "" {
@@ -468,6 +471,8 @@ func extractStringSlice(v any) []string {
 	switch val := v.(type) {
 	case string:
 		return []string{val}
+	case []string:
+		return val
 	case []any:
 		out := make([]string, 0, len(val))
 		for _, item := range val {
@@ -614,6 +619,50 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 				}
 			}
 		}
+		if action == "indices.create" {
+			if bodyMap, ok := ToNative(params["body"]).(map[string]any); ok {
+				if aliasesMap, ok := bodyMap["aliases"].(map[string]any); ok {
+					for aliasName := range aliasesMap {
+						if aliasName != "" {
+							c.createdAliases[aliasName] = idx
+						}
+					}
+				}
+			}
+		}
+	case "indices.update_aliases":
+		if bodyMap, ok := ToNative(params["body"]).(map[string]any); ok {
+			if actions, ok := bodyMap["actions"].([]any); ok {
+				for _, actItem := range actions {
+					actMap, ok := actItem.(map[string]any)
+					if !ok {
+						continue
+					}
+					addMap, ok := actMap["add"].(map[string]any)
+					if !ok {
+						continue
+					}
+					targetIdx := paramString(addMap, "index")
+					if targetIdx == "" {
+						targetIdx = paramString(addMap, "indices")
+					}
+					if al := paramString(addMap, "alias"); al != "" {
+						for _, part := range strings.Split(al, ",") {
+							if p := strings.TrimSpace(part); p != "" {
+								c.createdAliases[p] = targetIdx
+							}
+						}
+					}
+					for _, al := range extractStringSlice(addMap["aliases"]) {
+						for _, part := range strings.Split(al, ",") {
+							if p := strings.TrimSpace(part); p != "" {
+								c.createdAliases[p] = targetIdx
+							}
+						}
+					}
+				}
+			}
+		}
 	case "bulk":
 		if idx != "" {
 			c.createdIndices[idx] = true
@@ -748,7 +797,18 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "cluster.state":
 		method = http.MethodGet
-		reqPath = "/_cluster/state"
+		metric := popString("metric")
+		idx := popString("index")
+		switch {
+		case metric != "" && idx != "":
+			reqPath = "/_cluster/state/" + metric + "/" + idx
+		case metric != "":
+			reqPath = "/_cluster/state/" + metric
+		case idx != "":
+			reqPath = "/_cluster/state/_all/" + idx
+		default:
+			reqPath = "/_cluster/state"
+		}
 
 	case "cluster.stats":
 		method = http.MethodGet
@@ -764,11 +824,33 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "nodes.info":
 		method = http.MethodGet
-		reqPath = "/_nodes"
+		nodeID := popString("node_id")
+		metric := popString("metric")
+		switch {
+		case nodeID != "" && metric != "":
+			reqPath = "/_nodes/" + nodeID + "/" + metric
+		case nodeID != "":
+			reqPath = "/_nodes/" + nodeID
+		case metric != "":
+			reqPath = "/_nodes/_all/" + metric
+		default:
+			reqPath = "/_nodes"
+		}
 
 	case "nodes.stats":
 		method = http.MethodGet
-		reqPath = "/_nodes/stats"
+		nodeID := popString("node_id")
+		metric := popString("metric")
+		switch {
+		case nodeID != "" && metric != "":
+			reqPath = "/_nodes/" + nodeID + "/stats/" + metric
+		case nodeID != "":
+			reqPath = "/_nodes/" + nodeID + "/stats"
+		case metric != "":
+			reqPath = "/_nodes/stats/" + metric
+		default:
+			reqPath = "/_nodes/stats"
+		}
 
 	case "indices.create":
 		method = http.MethodPut
@@ -797,10 +879,15 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "indices.get":
 		method = http.MethodGet
 		idx := popString("index")
+		feature := popString("feature")
 		if idx == "" {
 			return nil, fmt.Errorf("indices.get requires index parameter")
 		}
-		reqPath = "/" + idx
+		if feature != "" {
+			reqPath = "/" + idx + "/" + feature
+		} else {
+			reqPath = "/" + idx
+		}
 
 	case "indices.get_mapping":
 		method = http.MethodGet
@@ -833,9 +920,19 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.get_settings":
 		method = http.MethodGet
-		if idx := popString("index"); idx != "" {
+		idx := popString("index")
+		name := popString("name")
+		if name == "" {
+			name = paramString(params, "prefix")
+		}
+		switch {
+		case idx != "" && name != "":
+			reqPath = "/" + idx + "/_settings/" + name
+		case idx != "":
 			reqPath = "/" + idx + "/_settings"
-		} else {
+		case name != "":
+			reqPath = "/_all/_settings/" + name
+		default:
 			reqPath = "/_settings"
 		}
 
@@ -926,9 +1023,16 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.stats":
 		method = http.MethodGet
-		if idx := popString("index"); idx != "" {
+		idx := popString("index")
+		metric := popString("metric")
+		switch {
+		case idx != "" && metric != "":
+			reqPath = "/" + idx + "/_stats/" + metric
+		case idx != "":
 			reqPath = "/" + idx + "/_stats"
-		} else {
+		case metric != "":
+			reqPath = "/_stats/" + metric
+		default:
 			reqPath = "/_stats"
 		}
 
@@ -1463,11 +1567,11 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "ilm.explain_lifecycle":
 		method = http.MethodGet
-		idx := popString("index")
-		if idx == "" {
-			return nil, fmt.Errorf("ilm.explain_lifecycle requires index parameter")
+		if idx := popString("index"); idx != "" {
+			reqPath = "/" + idx + "/_ilm/explain"
+		} else {
+			reqPath = "/_ilm/explain"
 		}
-		reqPath = "/" + idx + "/_ilm/explain"
 
 	case "ilm.get_status":
 		method = http.MethodGet

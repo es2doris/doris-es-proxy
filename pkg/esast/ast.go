@@ -187,6 +187,11 @@ func (r *SearchRequest) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: Unknown key for a START_OBJECT in [%s]", k)
 		}
 	}
+	_, hasPIT := rawMap["pit"]
+	rawPointInTime, hasPointInTime := rawMap["point_in_time"]
+	if hasPIT && hasPointInTime {
+		return fmt.Errorf("parsing_exception: cannot specify both [pit] and [point_in_time]")
+	}
 	type plain SearchRequest
 	var raw struct {
 		plain
@@ -200,6 +205,16 @@ func (r *SearchRequest) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*r = SearchRequest(raw.plain)
+	if hasPointInTime {
+		ptTrim := bytes.TrimSpace(rawPointInTime)
+		if len(ptTrim) > 0 && !bytes.Equal(ptTrim, []byte("null")) {
+			var pit PITSpec
+			if err := json.Unmarshal(ptTrim, &pit); err != nil {
+				return err
+			}
+			r.PIT = &pit
+		}
+	}
 	if raw.TrackScores != nil {
 		ts, err := parseFlexibleBool(raw.TrackScores)
 		if err != nil {
@@ -610,10 +625,99 @@ type PITSpec struct {
 	KeepAlive string `json:"keep_alive,omitempty"`
 }
 
+func parsePositiveDuration(raw string) error {
+	s := strings.TrimSpace(raw)
+	if s == "" || strings.HasPrefix(s, "-") {
+		return fmt.Errorf("parsing_exception: invalid duration [%s]: must be positive", raw)
+	}
+	for _, unit := range []string{"nanos", "micros", "ms", "s", "m", "h", "d", "w"} {
+		if strings.HasSuffix(s, unit) {
+			numPart := strings.TrimSpace(strings.TrimSuffix(s, unit))
+			if numPart == "" {
+				return fmt.Errorf("parsing_exception: invalid duration [%s]", raw)
+			}
+			v, err := strconv.ParseFloat(numPart, 64)
+			if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
+				return fmt.Errorf("parsing_exception: invalid duration [%s]: must be > 0", raw)
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("parsing_exception: invalid duration [%s]: missing or unsupported time unit", raw)
+}
+
+func (p *PITSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		if k != "id" && k != "keep_alive" {
+			return fmt.Errorf("parsing_exception: [pit] unknown field [%s]", k)
+		}
+	}
+	type plain PITSpec
+	var raw plain
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if strings.TrimSpace(raw.ID) == "" {
+		return fmt.Errorf("parsing_exception: [pit] requires non-empty [id]")
+	}
+	if raw.KeepAlive != "" {
+		if err := parsePositiveDuration(raw.KeepAlive); err != nil {
+			return err
+		}
+	}
+	*p = PITSpec(raw)
+	return nil
+}
+
 type SliceSpec struct {
 	ID    int    `json:"id"`
 	Max   int    `json:"max"`
 	Field string `json:"field,omitempty"`
+}
+
+func (s *SliceSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		if k != "id" && k != "max" && k != "field" {
+			return fmt.Errorf("parsing_exception: [slice] unknown field [%s]", k)
+		}
+	}
+	rawID, hasID := rawMap["id"]
+	rawMax, hasMax := rawMap["max"]
+	if !hasID || len(bytes.TrimSpace(rawID)) == 0 || bytes.Equal(bytes.TrimSpace(rawID), []byte("null")) {
+		return fmt.Errorf("parsing_exception: [slice] requires [id]")
+	}
+	if !hasMax || len(bytes.TrimSpace(rawMax)) == 0 || bytes.Equal(bytes.TrimSpace(rawMax), []byte("null")) {
+		return fmt.Errorf("parsing_exception: [slice] requires [max]")
+	}
+	type plain SliceSpec
+	var raw plain
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if raw.Max <= 1 {
+		return fmt.Errorf("parsing_exception: [slice] max must be greater than 1, got [%d]", raw.Max)
+	}
+	if raw.ID < 0 || raw.ID >= raw.Max {
+		return fmt.Errorf("parsing_exception: [slice] id must be >= 0 and < max [%d], got [%d]", raw.Max, raw.ID)
+	}
+	*s = SliceSpec(raw)
+	return nil
 }
 
 type InnerHitsSpec struct {
@@ -1407,6 +1511,60 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 			}
 			return nil
 		}(),
+		func() *float64 {
+			if alias.SpanNear != nil {
+				return alias.SpanNear.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.SpanOr != nil {
+				return alias.SpanOr.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.SpanNot != nil {
+				return alias.SpanNot.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.SpanFirst != nil {
+				return alias.SpanFirst.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.SpanMulti != nil {
+				return alias.SpanMulti.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.SpanContaining != nil {
+				return alias.SpanContaining.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.SpanWithin != nil {
+				return alias.SpanWithin.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.FieldMaskingSpan != nil {
+				return alias.FieldMaskingSpan.Boost
+			}
+			return nil
+		}(),
+		func() *float64 {
+			if alias.GeoDistance != nil {
+				return alias.GeoDistance.Boost
+			}
+			return nil
+		}(),
 	} {
 		if ptrBoost != nil && (*ptrBoost < 0 || math.IsNaN(*ptrBoost) || math.IsInf(*ptrBoost, 0)) {
 			return fmt.Errorf("parsing_exception: [boost] must be a non-negative number")
@@ -1566,6 +1724,9 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 	}
 	if alias.Name == "" && alias.Percolate != nil && alias.Percolate.Name != "" {
 		alias.Name = alias.Percolate.Name
+	}
+	if alias.Name == "" && alias.Boosting != nil && alias.Boosting.Name != "" {
+		alias.Name = alias.Boosting.Name
 	}
 	if alias.Name == "" && alias.Wrapper != nil && alias.Wrapper.Decoded != nil && alias.Wrapper.Decoded.Name != "" {
 		alias.Name = alias.Wrapper.Decoded.Name
@@ -2741,11 +2902,103 @@ type SpanNearQuery struct {
 	Name    string   `json:"_name,omitempty"`
 }
 
+func (sn *SpanNearQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "clauses", "slop", "in_order", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [span_near] unknown field [%s]", k)
+		}
+	}
+	var raw struct {
+		Clauses []Query         `json:"clauses"`
+		Slop    int             `json:"slop"`
+		InOrder any             `json:"in_order"`
+		Boost   json.RawMessage `json:"boost"`
+		Name    string          `json:"_name"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if len(raw.Clauses) == 0 {
+		return fmt.Errorf("parsing_exception: [span_near] clauses must contain at least 1 clause")
+	}
+	if raw.Slop < 0 {
+		return fmt.Errorf("parsing_exception: [span_near] slop must be >= 0")
+	}
+	sn.Clauses = raw.Clauses
+	sn.Slop = raw.Slop
+	sn.Name = raw.Name
+	if raw.InOrder != nil {
+		b, err := parseFlexibleBool(raw.InOrder)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [span_near] in_order %w", err)
+		}
+		sn.InOrder = &b
+	}
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		sn.Boost = b
+	}
+	return nil
+}
+
 // SpanOrQuery models an ES `span_or` query.
 type SpanOrQuery struct {
 	Clauses []Query  `json:"clauses"`
 	Boost   *float64 `json:"boost,omitempty"`
 	Name    string   `json:"_name,omitempty"`
+}
+
+func (so *SpanOrQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "clauses", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [span_or] unknown field [%s]", k)
+		}
+	}
+	rawClauses, hasClauses := rawMap["clauses"]
+	if !hasClauses || len(bytes.TrimSpace(rawClauses)) == 0 || bytes.Equal(bytes.TrimSpace(rawClauses), []byte("null")) {
+		return fmt.Errorf("parsing_exception: [span_or] missing required [clauses] field")
+	}
+	var raw struct {
+		Clauses []Query         `json:"clauses"`
+		Boost   json.RawMessage `json:"boost"`
+		Name    string          `json:"_name"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	so.Clauses = raw.Clauses
+	so.Name = raw.Name
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		so.Boost = b
+	}
+	return nil
 }
 
 // SpanNotQuery models an ES `span_not` query.
@@ -2759,6 +3012,56 @@ type SpanNotQuery struct {
 	Name    string   `json:"_name,omitempty"`
 }
 
+func (sn *SpanNotQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "include", "exclude", "pre", "post", "dist", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [span_not] unknown field [%s]", k)
+		}
+	}
+	var raw struct {
+		Include *Query          `json:"include"`
+		Exclude *Query          `json:"exclude"`
+		Pre     int             `json:"pre"`
+		Post    int             `json:"post"`
+		Dist    int             `json:"dist"`
+		Boost   json.RawMessage `json:"boost"`
+		Name    string          `json:"_name"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if raw.Include == nil || raw.Exclude == nil {
+		return fmt.Errorf("parsing_exception: [span_not] requires both [include] and [exclude] clauses")
+	}
+	if raw.Pre < 0 || raw.Post < 0 || raw.Dist < 0 {
+		return fmt.Errorf("parsing_exception: [span_not] pre, post, and dist must be >= 0")
+	}
+	sn.Include = raw.Include
+	sn.Exclude = raw.Exclude
+	sn.Pre = raw.Pre
+	sn.Post = raw.Post
+	sn.Dist = raw.Dist
+	sn.Name = raw.Name
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		sn.Boost = b
+	}
+	return nil
+}
+
 // SpanFirstQuery models an ES `span_first` query.
 type SpanFirstQuery struct {
 	Match *Query   `json:"match"`
@@ -2767,11 +3070,97 @@ type SpanFirstQuery struct {
 	Name  string   `json:"_name,omitempty"`
 }
 
+func (sf *SpanFirstQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "match", "end", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [span_first] unknown field [%s]", k)
+		}
+	}
+	var raw struct {
+		Match *Query          `json:"match"`
+		End   int             `json:"end"`
+		Boost json.RawMessage `json:"boost"`
+		Name  string          `json:"_name"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if raw.Match == nil {
+		return fmt.Errorf("parsing_exception: [span_first] requires [match] clause")
+	}
+	if raw.End <= 0 {
+		return fmt.Errorf("parsing_exception: [span_first] end must be > 0")
+	}
+	sf.Match = raw.Match
+	sf.End = raw.End
+	sf.Name = raw.Name
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		sf.Boost = b
+	}
+	return nil
+}
+
 // SpanMultiQuery models an ES `span_multi` query (`{"span_multi": {"match": {"prefix": ...}}}`).
 type SpanMultiQuery struct {
 	Match *Query   `json:"match"`
 	Boost *float64 `json:"boost,omitempty"`
 	Name  string   `json:"_name,omitempty"`
+}
+
+func (sm *SpanMultiQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "match", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [span_multi] unknown field [%s]", k)
+		}
+	}
+	var raw struct {
+		Match *Query          `json:"match"`
+		Boost json.RawMessage `json:"boost"`
+		Name  string          `json:"_name"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if raw.Match == nil {
+		return fmt.Errorf("parsing_exception: [span_multi] requires [match] clause")
+	}
+	if len(raw.Match.Prefix) == 0 && len(raw.Match.Wildcard) == 0 && len(raw.Match.Regexp) == 0 && len(raw.Match.Fuzzy) == 0 && len(raw.Match.Range) == 0 {
+		return fmt.Errorf("parsing_exception: [span_multi] match must be a multi-term query (prefix, wildcard, regexp, fuzzy, or range)")
+	}
+	sm.Match = raw.Match
+	sm.Name = raw.Name
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		sm.Boost = b
+	}
+	return nil
 }
 
 // SpanPairQuery models an ES `span_containing` or `span_within` query.
@@ -2782,12 +3171,94 @@ type SpanPairQuery struct {
 	Name   string   `json:"_name,omitempty"`
 }
 
+func (sp *SpanPairQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "little", "big", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [span_pair] unknown field [%s]", k)
+		}
+	}
+	var raw struct {
+		Little *Query          `json:"little"`
+		Big    *Query          `json:"big"`
+		Boost  json.RawMessage `json:"boost"`
+		Name   string          `json:"_name"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if raw.Little == nil || raw.Big == nil {
+		return fmt.Errorf("parsing_exception: [span_pair] requires both [little] and [big] clauses")
+	}
+	sp.Little = raw.Little
+	sp.Big = raw.Big
+	sp.Name = raw.Name
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		sp.Boost = b
+	}
+	return nil
+}
+
 // FieldMaskingSpanQuery models an ES `field_masking_span` query.
 type FieldMaskingSpanQuery struct {
 	Query *Query   `json:"query"`
 	Field string   `json:"field"`
 	Boost *float64 `json:"boost,omitempty"`
 	Name  string   `json:"_name,omitempty"`
+}
+
+func (fm *FieldMaskingSpanQuery) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "query", "field", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [field_masking_span] unknown field [%s]", k)
+		}
+	}
+	var raw struct {
+		Query *Query          `json:"query"`
+		Field string          `json:"field"`
+		Boost json.RawMessage `json:"boost"`
+		Name  string          `json:"_name"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if raw.Query == nil || strings.TrimSpace(raw.Field) == "" {
+		return fmt.Errorf("parsing_exception: [field_masking_span] requires both [query] and non-empty [field]")
+	}
+	fm.Query = raw.Query
+	fm.Field = raw.Field
+	fm.Name = raw.Name
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		fm.Boost = b
+	}
+	return nil
 }
 
 // RankFeatureQuery models an ES `rank_feature` query.
@@ -3457,6 +3928,7 @@ type BoostingQuery struct {
 	NegativeBoost    float64  `json:"negative_boost,omitempty"`
 	HasNegativeBoost bool     `json:"-"`
 	Boost            *float64 `json:"boost,omitempty"`
+	Name             string   `json:"_name,omitempty"`
 }
 
 func (bq BoostingQuery) EffectiveNegativeBoost() float64 {
@@ -3480,11 +3952,13 @@ func (bq BoostingQuery) MarshalJSON() ([]byte, error) {
 		Negative      Query    `json:"negative"`
 		NegativeBoost *float64 `json:"negative_boost,omitempty"`
 		Boost         *float64 `json:"boost,omitempty"`
+		Name          string   `json:"_name,omitempty"`
 	}{
 		Positive:      bq.Positive,
 		Negative:      bq.Negative,
 		NegativeBoost: negBoostPtr,
 		Boost:         bq.Boost,
+		Name:          bq.Name,
 	})
 }
 
@@ -3493,17 +3967,36 @@ func (bq *BoostingQuery) UnmarshalJSON(data []byte) error {
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return nil
 	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "positive", "negative", "negative_boost", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [boosting] unknown field [%s]", k)
+		}
+	}
+	for _, reqKey := range []string{"positive", "negative", "negative_boost"} {
+		rv, ok := rawMap[reqKey]
+		if !ok || len(bytes.TrimSpace(rv)) == 0 || bytes.Equal(bytes.TrimSpace(rv), []byte("null")) {
+			return fmt.Errorf("parsing_exception: [boosting] query requires [%s] field", reqKey)
+		}
+	}
 	var raw struct {
 		Positive      Query           `json:"positive"`
 		Negative      Query           `json:"negative"`
 		NegativeBoost json.RawMessage `json:"negative_boost"`
 		Boost         json.RawMessage `json:"boost"`
+		Name          string          `json:"_name"`
 	}
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
 	bq.Positive = raw.Positive
 	bq.Negative = raw.Negative
+	bq.Name = raw.Name
 	if len(raw.NegativeBoost) > 0 {
 		nb, err := parseOptionalNonNegativeBoost(raw.NegativeBoost)
 		if err != nil {
@@ -6761,6 +7254,7 @@ type SortFieldSpec struct {
 	Missing        string
 	Script         any
 	Type           string
+	NumericType    string `json:"numeric_type,omitempty"`
 	Format         string
 	IgnoreUnmapped bool
 	Nested         *NestedSortSpec
@@ -6826,7 +7320,7 @@ func (s SortSpec) MarshalJSON() ([]byte, error) {
 		}
 		return json.Marshal(map[string]any{"_geo_distance": inner})
 	}
-	if s.Entry.Mode != "" || s.Entry.Missing != "" || s.Entry.Nested != nil || s.Entry.Type != "" || s.Entry.Format != "" || s.Entry.IgnoreUnmapped {
+	if s.Entry.Mode != "" || s.Entry.Missing != "" || s.Entry.Nested != nil || s.Entry.Type != "" || s.Entry.NumericType != "" || s.Entry.Format != "" || s.Entry.IgnoreUnmapped {
 		inner := map[string]any{"order": order}
 		if s.Entry.Mode != "" {
 			inner["mode"] = s.Entry.Mode
@@ -6836,6 +7330,9 @@ func (s SortSpec) MarshalJSON() ([]byte, error) {
 		}
 		if s.Entry.Type != "" {
 			inner["type"] = s.Entry.Type
+		}
+		if s.Entry.NumericType != "" {
+			inner["numeric_type"] = s.Entry.NumericType
 		}
 		if s.Entry.Format != "" {
 			inner["format"] = s.Entry.Format
@@ -7130,7 +7627,7 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 		if geoMap == nil {
 			geoMap = make(map[string]any)
 		}
-		for _, siblingKey := range []string{"unit", "distance_type", "validation_method", "ignore_unmapped"} {
+		for _, siblingKey := range []string{"unit", "distance_type", "validation_method", "ignore_unmapped", "unmapped_type"} {
 			if _, exists := geoMap[siblingKey]; !exists {
 				if rawOpt, hasOpt := m[siblingKey]; hasOpt {
 					var optVal any
@@ -7140,7 +7637,17 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 				}
 			}
 		}
-		s.Entry = SortFieldSpec{Field: "_geo_distance", Order: order, Mode: mode, Missing: missing, Nested: nestedSpec, Script: geoMap}
+		ignoreUnmapped := false
+		if rawIU, hasIU := geoMap["ignore_unmapped"]; hasIU && rawIU != nil {
+			if bv, err := parseFlexibleBool(rawIU); err == nil {
+				ignoreUnmapped = bv
+			}
+		}
+		unmappedType := ""
+		if utStr, okUT := geoMap["unmapped_type"].(string); okUT {
+			unmappedType = strings.ToLower(strings.TrimSpace(utStr))
+		}
+		s.Entry = SortFieldSpec{Field: "_geo_distance", Order: order, Mode: mode, Missing: missing, Type: unmappedType, IgnoreUnmapped: ignoreUnmapped, Nested: nestedSpec, Script: geoMap}
 		return nil
 	}
 
@@ -7190,6 +7697,7 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 		missing := ""
 		mode := ""
 		sortType := ""
+		numericType := ""
 		sortFormat := ""
 		if rawOrd, hasOrd := m["order"]; hasOrd && field != "order" {
 			var ordStr string
@@ -7216,10 +7724,16 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 		if rawUT, hasUT := m["unmapped_type"]; hasUT && field != "unmapped_type" {
 			_ = json.Unmarshal(rawUT, &sortType)
 		}
-		if sortType == "" {
-			if rawNT, hasNT := m["numeric_type"]; hasNT && field != "numeric_type" {
-				_ = json.Unmarshal(rawNT, &sortType)
+		if rawNT, hasNT := m["numeric_type"]; hasNT && field != "numeric_type" {
+			var nt string
+			if err := json.Unmarshal(rawNT, &nt); err != nil {
+				return fmt.Errorf("parsing_exception: [sort] numeric_type must be a string")
 			}
+			ntLower := strings.ToLower(strings.TrimSpace(nt))
+			if ntLower != "double" && ntLower != "long" && ntLower != "date" && ntLower != "date_nanos" {
+				return fmt.Errorf("parsing_exception: [sort] invalid numeric_type [%s]", nt)
+			}
+			numericType = ntLower
 		}
 		if sortType == "" {
 			if rawT, hasT := m["type"]; hasT && field != "type" {
@@ -7304,15 +7818,20 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 			}
 			if obj.UnmappedType != "" {
 				sortType = obj.UnmappedType
-			} else if obj.NumericType != "" {
-				sortType = obj.NumericType
 			} else if obj.Type != "" {
 				sortType = obj.Type
 			}
-			s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Type: strings.ToLower(sortType), Format: sortFormat, IgnoreUnmapped: ignoreUnmapped, Nested: nestedSpec}
+			if obj.NumericType != "" {
+				ntLower := strings.ToLower(strings.TrimSpace(obj.NumericType))
+				if ntLower != "double" && ntLower != "long" && ntLower != "date" && ntLower != "date_nanos" {
+					return fmt.Errorf("parsing_exception: [sort] invalid numeric_type [%s]", obj.NumericType)
+				}
+				numericType = ntLower
+			}
+			s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Type: strings.ToLower(sortType), NumericType: numericType, Format: sortFormat, IgnoreUnmapped: ignoreUnmapped, Nested: nestedSpec}
 			return nil
 		}
-		s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Type: strings.ToLower(sortType), Format: sortFormat, IgnoreUnmapped: ignoreUnmapped, Nested: nestedSpec}
+		s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Type: strings.ToLower(sortType), NumericType: numericType, Format: sortFormat, IgnoreUnmapped: ignoreUnmapped, Nested: nestedSpec}
 	}
 	return nil
 }
