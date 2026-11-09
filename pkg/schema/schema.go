@@ -201,37 +201,51 @@ func CompileIndexSchema(dorisDB, indexName string, mapping *esast.MappingSpec) *
 }
 
 func (s *IndexSchema) finalizeCompiledSlices() {
-	// First resolve alias chains (e.g. a1 -> a2 -> target) so copy_to targeting an alias resolves to the underlying field.
-	for pass := 0; pass < 4; pass++ {
-		changed := false
-		for k, b := range s.Fields {
-			if b.AliasTarget != "" {
-				if _, ok := s.Fields[b.AliasTarget]; !ok && b.NestedPath != "" {
-					if _, rOK := s.Fields[b.NestedPath+"."+b.AliasTarget]; rOK {
-						b.AliasTarget = b.NestedPath + "." + b.AliasTarget
-						s.Fields[k] = b
-						changed = true
-					}
+	// First resolve alias chains (e.g. a1 -> a2 -> target) with cycle detection so copy_to targeting an alias resolves to the underlying field.
+	for k, b := range s.Fields {
+		if b.AliasTarget == "" {
+			continue
+		}
+		visited := map[string]bool{k: true}
+		curr := b.AliasTarget
+		cyclic := false
+		for hop := 0; hop < 16 && curr != ""; hop++ {
+			if _, ok := s.Fields[curr]; !ok && b.NestedPath != "" {
+				if _, rOK := s.Fields[b.NestedPath+"."+curr]; rOK {
+					curr = b.NestedPath + "." + curr
 				}
-				if tb, ok := s.Fields[b.AliasTarget]; ok && tb.AliasTarget != "" && tb.AliasTarget != b.AliasTarget {
-					b.AliasTarget = tb.AliasTarget
-					s.Fields[k] = b
-					changed = true
-				} else if strings.HasSuffix(b.AliasTarget, ".keyword") {
-					baseTarget := strings.TrimSuffix(b.AliasTarget, ".keyword")
-					if tb, ok := s.Fields[baseTarget]; ok && tb.AliasTarget != "" {
-						newTarget := strings.TrimSuffix(tb.AliasTarget, ".keyword") + ".keyword"
-						if newTarget != b.AliasTarget {
-							b.AliasTarget = newTarget
-							s.Fields[k] = b
-							changed = true
-						}
+			}
+			if visited[curr] {
+				cyclic = true
+				break
+			}
+			visited[curr] = true
+			if tb, ok := s.Fields[curr]; ok && tb.AliasTarget != "" && tb.AliasTarget != curr {
+				curr = tb.AliasTarget
+				continue
+			}
+			if strings.HasSuffix(curr, ".keyword") {
+				baseTarget := strings.TrimSuffix(curr, ".keyword")
+				if tb, ok := s.Fields[baseTarget]; ok && tb.AliasTarget != "" {
+					nextTarget := strings.TrimSuffix(tb.AliasTarget, ".keyword") + ".keyword"
+					if nextTarget != curr {
+						curr = nextTarget
+						continue
 					}
 				}
 			}
-		}
-		if !changed {
 			break
+		}
+		if cyclic {
+			b.AliasTarget = ""
+			b.Kind = StorageDynamicVariant
+			b.DorisType = DorisString
+			b.ESType = "keyword"
+			b.SourceJSONPath = strings.Split(strings.TrimSuffix(k, ".keyword"), ".")
+			s.Fields[k] = b
+		} else if curr != b.AliasTarget {
+			b.AliasTarget = curr
+			s.Fields[k] = b
 		}
 	}
 
@@ -463,12 +477,156 @@ func MergeMappingSpecs(oldSpec, newSpec *esast.MappingSpec) *esast.MappingSpec {
 	}
 }
 
+// ValidateMappingSpec validates field definitions in a MappingSpec, including `alias` field `path` requirements,
+// target existence, alias-to-alias chaining rejection, and cycle detection.
+func ValidateMappingSpec(m *esast.MappingSpec) error {
+	if m == nil || len(m.Properties) == 0 {
+		return nil
+	}
+	allTypes := make(map[string]string)
+	aliasTargets := make(map[string]string)
+	aliasPrefixes := make(map[string]string)
+
+	var collect func(props map[string]esast.FieldProperty, prefix string) error
+	collect = func(props map[string]esast.FieldProperty, prefix string) error {
+		for k, prop := range props {
+			fullPath := k
+			if prefix != "" {
+				fullPath = prefix + "." + k
+			}
+			fType := strings.ToLower(strings.TrimSpace(prop.Type))
+			if fType == "" && len(prop.Properties) > 0 {
+				fType = "object"
+			}
+			allTypes[fullPath] = fType
+			if fType == "scaled_float" {
+				if prop.ScalingFactor <= 0.0 || math.IsNaN(prop.ScalingFactor) || math.IsInf(prop.ScalingFactor, 0) {
+					return fmt.Errorf("mapper_parsing_exception: [scaling_factor] must be > 0.0 for [scaled_float] field [%s]", fullPath)
+				}
+			}
+			if fType == "constant_keyword" && prop.Value != nil {
+				switch prop.Value.(type) {
+				case map[string]any, []any:
+					return fmt.Errorf("mapper_parsing_exception: [constant_keyword] field [%s] [value] must be a scalar value", fullPath)
+				}
+			}
+			if fType == "alias" {
+				target := strings.TrimSpace(prop.Path)
+				if target == "" {
+					return fmt.Errorf("mapper_parsing_exception: [path] is required for [alias] field [%s]", fullPath)
+				}
+				if len(prop.Properties) > 0 || len(prop.Fields) > 0 {
+					return fmt.Errorf("mapper_parsing_exception: [alias] field [%s] cannot have sub-properties or multi-fields", fullPath)
+				}
+				if target == fullPath {
+					return fmt.Errorf("mapper_parsing_exception: alias field [%s] cannot point to itself", fullPath)
+				}
+				aliasTargets[fullPath] = target
+				aliasPrefixes[fullPath] = prefix
+			}
+			if len(prop.Fields) > 0 {
+				for fk, fprop := range prop.Fields {
+					subFull := fullPath + "." + fk
+					sfType := strings.ToLower(strings.TrimSpace(fprop.Type))
+					allTypes[subFull] = sfType
+					if sfType == "scaled_float" {
+						if fprop.ScalingFactor <= 0.0 || math.IsNaN(fprop.ScalingFactor) || math.IsInf(fprop.ScalingFactor, 0) {
+							return fmt.Errorf("mapper_parsing_exception: [scaling_factor] must be > 0.0 for [scaled_float] field [%s]", subFull)
+						}
+					}
+					if sfType == "constant_keyword" && fprop.Value != nil {
+						switch fprop.Value.(type) {
+						case map[string]any, []any:
+							return fmt.Errorf("mapper_parsing_exception: [constant_keyword] field [%s] [value] must be a scalar value", subFull)
+						}
+					}
+					if sfType == "alias" {
+						target := strings.TrimSpace(fprop.Path)
+						if target == "" {
+							return fmt.Errorf("mapper_parsing_exception: [path] is required for [alias] field [%s]", subFull)
+						}
+						if target == subFull {
+							return fmt.Errorf("mapper_parsing_exception: alias field [%s] cannot point to itself", subFull)
+						}
+						aliasTargets[subFull] = target
+						aliasPrefixes[subFull] = prefix
+					}
+				}
+			}
+			if len(prop.Properties) > 0 {
+				if err := collect(prop.Properties, fullPath); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := collect(m.Properties, ""); err != nil {
+		return err
+	}
+
+	resolveTarget := func(aliasPath, target string) string {
+		if _, ok := allTypes[target]; ok {
+			return target
+		}
+		if pfx := aliasPrefixes[aliasPath]; pfx != "" {
+			if _, ok := allTypes[pfx+"."+target]; ok {
+				return pfx + "." + target
+			}
+		}
+		return target
+	}
+
+	for aliasPath, rawTarget := range aliasTargets {
+		target := resolveTarget(aliasPath, rawTarget)
+		if target == aliasPath {
+			return fmt.Errorf("mapper_parsing_exception: alias field [%s] cannot point to itself", aliasPath)
+		}
+		visited := map[string]bool{aliasPath: true}
+		curr := target
+		for curr != "" {
+			if visited[curr] {
+				return fmt.Errorf("mapper_parsing_exception: cycle detected for alias field [%s]", aliasPath)
+			}
+			visited[curr] = true
+			nextRaw, isAlias := aliasTargets[curr]
+			if !isAlias {
+				break
+			}
+			curr = resolveTarget(curr, nextRaw)
+		}
+		if _, isTargetAlias := aliasTargets[target]; isTargetAlias || allTypes[target] == "alias" {
+			return fmt.Errorf("mapper_parsing_exception: invalid [path] for alias [%s]: target [%s] cannot be another alias", aliasPath, rawTarget)
+		}
+		targetType, exists := allTypes[target]
+		if !exists && strings.HasSuffix(target, ".keyword") {
+			baseTarget := strings.TrimSuffix(target, ".keyword")
+			if bt, ok := allTypes[baseTarget]; ok && bt == "text" {
+				exists = true
+				targetType = "keyword"
+			}
+		}
+		if !exists || targetType == "" || targetType == "object" || targetType == "nested" {
+			return fmt.Errorf("mapper_parsing_exception: invalid [path] for alias [%s]: target field [%s] does not exist", aliasPath, rawTarget)
+		}
+	}
+	return nil
+}
+
 // ValidateMappingUpdateCompatibility checks whether `newSpec` attempts to change the type or immutable parameters of any existing field in `oldSpec`.
 func ValidateMappingUpdateCompatibility(oldSpec, newSpec *esast.MappingSpec) error {
+	if newSpec != nil && oldSpec == nil {
+		return ValidateMappingSpec(newSpec)
+	}
 	if oldSpec == nil || newSpec == nil {
 		return nil
 	}
-	return validatePropertiesCompatibility(oldSpec.Properties, newSpec.Properties, "")
+	if err := validatePropertiesCompatibility(oldSpec.Properties, newSpec.Properties, ""); err != nil {
+		return err
+	}
+	return ValidateMappingSpec(&esast.MappingSpec{
+		Properties: DeepMergeMappingProperties(oldSpec.Properties, newSpec.Properties),
+	})
 }
 
 func validatePropertiesCompatibility(oldProps, newProps map[string]esast.FieldProperty, prefix string) error {
@@ -1025,6 +1183,16 @@ func (s *IndexSchema) ResolveField(esFieldPath string) FieldBinding {
 		}
 	}
 	if b, ok := s.Fields[esFieldPath]; ok {
+		if b.ESType == "alias" && b.ColumnName == "" {
+			cleanPath := strings.TrimSuffix(esFieldPath, ".keyword")
+			return FieldBinding{
+				ESFieldPath:    esFieldPath,
+				SourceJSONPath: strings.Split(cleanPath, "."),
+				Kind:           StorageDynamicVariant,
+				DorisType:      DorisString,
+				ESType:         "keyword",
+			}
+		}
 		return b
 	}
 	for _, saytSuffix := range []string{"._index_prefix", "._2gram", "._3gram"} {
@@ -1821,6 +1989,9 @@ func markPropertyMultiValued(fp *esast.FieldProperty) {
 
 func mergeFieldProperty(existing, incoming esast.FieldProperty) esast.FieldProperty {
 	mv := existing.MultiValued || incoming.MultiValued
+	if len(existing.Properties) == 0 && existing.Type != "" && !strings.EqualFold(existing.Type, "object") && !strings.EqualFold(existing.Type, "nested") && len(incoming.Properties) > 0 {
+		return existing
+	}
 	if len(existing.Properties) > 0 || len(incoming.Properties) > 0 {
 		if existing.Properties == nil {
 			existing.Properties = make(map[string]esast.FieldProperty)

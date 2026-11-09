@@ -206,3 +206,154 @@
   - match: { docs.0.doc._source.failed_elem: "bad_int" }
   - match: { docs.0.doc._source.nums.0: 10 }
 
+---
+"Simulate Round 51 grok nested brackets dissect multi-arrow kv strip_brackets convert bounds and join error":
+  - do:
+      catch: bad_request
+      ingest.put_pipeline:
+        id: "comp_invalid_proc_pipe"
+        body:
+          processors:
+            - unknown_processor_xyz:
+                field: "x"
+
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - grok:
+                  field: "line"
+                  patterns: ["%{WORD:[http][request][method]} %{NUMBER:[http][response][status]:int}"]
+              - dissect:
+                  field: "dline"
+                  pattern: "%{a--->}%{b}"
+              - kv:
+                  field: "kvline"
+                  field_split: " "
+                  value_split: "="
+                  strip_brackets: true
+                  target_field: "kvout"
+              - convert:
+                  field: "flag_yes"
+                  type: "boolean"
+              - convert:
+                  field: "flag_off"
+                  type: "boolean"
+              - convert:
+                  field: "overflow_byte"
+                  type: "byte"
+                  on_failure:
+                    - set:
+                        field: "byte_overflow_caught"
+                        value: true
+              - join:
+                  field: "not_an_array"
+                  separator: ","
+                  on_failure:
+                    - set:
+                        field: "join_error_caught"
+                        value: true
+          docs:
+            - _source:
+                line: "POST 201"
+                dline: "alpha     beta"
+                kvline: "(k1={v1}) [k2=<v2>]"
+                flag_yes: "yes"
+                flag_off: "off"
+                overflow_byte: "200"
+                not_an_array: "scalar_str"
+  - match: { docs.0.doc._source.http.request.method: "POST" }
+  - match: { docs.0.doc._source.http.response.status: 201 }
+  - match: { docs.0.doc._source.a: "alpha" }
+  - match: { docs.0.doc._source.b: "beta" }
+  - match: { docs.0.doc._source.kvout.k1: "v1" }
+  - match: { docs.0.doc._source.kvout.k2: "v2" }
+  - match: { docs.0.doc._source.flag_yes: true }
+  - match: { docs.0.doc._source.flag_off: false }
+  - match: { docs.0.doc._source.byte_overflow_caught: true }
+  - match: { docs.0.doc._source.join_error_caught: true }
+
+---
+"Round 52 ingest metadata date_index_name user_agent uri_parts registered_domain and enrich exact match":
+  - do:
+      ingest.processor_grok: {}
+  - is_true: patterns
+  - do:
+      ingest.geo_ip_stats: {}
+  - is_true: stats
+
+  - do:
+      indices.create:
+        index: r52_comp_enrich_src
+  - do:
+      index:
+        index: r52_comp_enrich_src
+        id: "1"
+        body: { "code": "US-EAST-1", "region": "Virginia" }
+  - do:
+      index:
+        index: r52_comp_enrich_src
+        id: "2"
+        body: { "code": "US-EAST-1-OTHER", "region": "Other" }
+  - do:
+      enrich.put_policy:
+        name: r52_comp_enrich_pol
+        body:
+          match:
+            indices: r52_comp_enrich_src
+            match_field: code
+            enrich_fields: ["region"]
+  - match: { acknowledged: true }
+  - do:
+      catch: bad_request
+      enrich.put_policy:
+        name: r52_comp_enrich_pol
+        body:
+          match:
+            indices: r52_comp_enrich_src
+            match_field: code
+            enrich_fields: ["region"]
+  - do:
+      enrich.execute_policy:
+        name: r52_comp_enrich_pol
+  - is_true: status
+
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - date_index_name:
+                  field: "ts"
+                  index_name_prefix: "ev-"
+                  date_rounding: "d"
+                  index_name_format: "UNIX"
+              - user_agent:
+                  field: "ua"
+              - uri_parts:
+                  field: "uri"
+              - registered_domain:
+                  field: "fqdn"
+              - enrich:
+                  policy_name: "r52_comp_enrich_pol"
+                  field: "code"
+                  target_field: "enriched"
+          docs:
+            - _source:
+                ts: 1704067200000
+                ua: "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+                uri: "bob:pw@host.example.com:9000/dir/.profile"
+                fqdn: "a.b.example.co.uk."
+                code: "US-EAST-1"
+  - match: { docs.0.doc._index: "ev-1704067200" }
+  - match: { docs.0.doc._source.user_agent.os.name: "Android" }
+  - match: { docs.0.doc._source.user_agent.os.version: "14" }
+  - match: { docs.0.doc._source.url.username: "bob" }
+  - match: { docs.0.doc._source.url.domain: "host.example.com" }
+  - is_false: docs.0.doc._source.url.extension
+  - match: { docs.0.doc._source.fqdn.registered_domain: "example.co.uk" }
+  - match: { docs.0.doc._source.enriched.region: "Virginia" }
+
+
+

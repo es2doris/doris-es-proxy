@@ -210,3 +210,55 @@
   - is_true: rolled_over
   - match: { old_index: "comp_rollover_000001" }
   - match: { new_index: "comp_rollover_000002" }
+
+---
+"Alias conflicts rollover conditions resolve index state and search shards":
+  - do:
+      indices.create:
+        index: comp_r51_idx_1
+  - do:
+      indices.put_alias:
+        index: comp_r51_idx_1
+        name: comp_r51_alias_1
+  - is_true: acknowledged
+
+  - do:
+      catch: bad_request
+      indices.create:
+        index: comp_r51_alias_1
+
+  - do:
+      catch: bad_request
+      indices.put_alias:
+        index: comp_r51_idx_1
+        name: comp_r51_idx_1
+
+  - do:
+      catch: missing
+      indices.update_aliases:
+        body:
+          actions:
+            - remove:
+                index: comp_r51_idx_1
+                alias: "non_existent_alias_pattern*"
+
+  - do:
+      indices.rollover:
+        alias: comp_r51_alias_1
+        body:
+          conditions:
+            max_docs: 500
+  - match: { rolled_over: false }
+  - match: { conditions.[max_docs: 500]: false }
+
+  - do:
+      indices.resolve_index:
+        name: comp_r51_idx_1
+  - match: { indices.0.name: "comp_r51_idx_1" }
+  - match: { indices.0.state: "open" }
+
+  - do:
+      search_shards:
+        index: comp_r51_idx_1
+  - is_true: indices.comp_r51_idx_1
+  - is_true: shards

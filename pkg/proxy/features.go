@@ -894,6 +894,10 @@ func matchMultiWildcardWithExclusions(rawPattern, candidate string) bool {
 }
 
 func (s *Server) handleResolveIndex(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	pattern := r.PathValue("name")
 	if pattern == "" {
 		pattern = "*"
@@ -918,11 +922,20 @@ func (s *Server) handleResolveIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(idxNames)
 	ew := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("expand_wildcards")))
-	isWildcardReq := strings.Contains(pattern, "*") || strings.Contains(pattern, ",") || pattern == "_all"
+	concreteParts := make(map[string]bool)
+	for _, rawPart := range strings.Split(pattern, ",") {
+		part := strings.TrimSpace(rawPart)
+		if part != "" && !strings.HasPrefix(part, "-") && !strings.ContainsAny(part, "*?") && part != "_all" {
+			concreteParts[part] = true
+		}
+	}
 	for _, name := range idxNames {
+		if ew == "none" && !concreteParts[name] {
+			continue
+		}
 		if matchMultiWildcardWithExclusions(pattern, name) {
 			isClosed := s.closedIndices[name]
-			if isWildcardReq {
+			if ew != "" {
 				if ew == "open" && isClosed {
 					continue
 				}
@@ -940,14 +953,17 @@ func (s *Server) handleResolveIndex(w http.ResponseWriter, r *http.Request) {
 			}
 			sort.Strings(idxAliases)
 			attrs := []string{"open"}
+			stateStr := "open"
 			isOpen := true
 			if isClosed {
 				attrs = []string{"close"}
+				stateStr = "close"
 				isOpen = false
 			}
 			entry := map[string]any{
 				"name":       name,
 				"attributes": attrs,
+				"state":      stateStr,
 				"open":       isOpen,
 			}
 			if len(idxAliases) > 0 {
@@ -1111,6 +1127,10 @@ func (s *Server) handleIndexStats(w http.ResponseWriter, r *http.Request) {
 
 // handleSearchShards implements `GET /{index}/_search_shards` for Spark-ES / Hadoop-ES / Kibana clients.
 func (s *Server) handleSearchShards(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	rawIndex := r.PathValue("index")
 	var targets []string
 	if rawIndex == "" {
@@ -1119,6 +1139,10 @@ func (s *Server) handleSearchShards(w http.ResponseWriter, r *http.Request) {
 		var ok bool
 		targets, _, ok = s.resolveValidatedReadTargets(w, r, rawIndex)
 		if !ok {
+			return
+		}
+		if closedIdx := s.findClosedTargetIndex(r, rawIndex); closedIdx != "" {
+			writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
 			return
 		}
 	}
@@ -1153,7 +1177,7 @@ func (s *Server) handleSearchShards(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.PathValue("id"))
 	switch r.Method {
-	case http.MethodPut, http.MethodPost:
+	case http.MethodPut:
 		if id == "" {
 			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: pipeline id is missing;")
 			return
@@ -1170,10 +1194,11 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if body == nil {
-			body = map[string]any{"description": "doris-es-proxy compatibility pipeline", "processors": []any{}}
+			writeESError(w, http.StatusBadRequest, "parse_exception", "[processors] required property is missing")
+			return
 		}
 		if err := validateIngestPipelineSpec(body); err != nil {
-			writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+			writeESError(w, http.StatusBadRequest, ingestSpecValidationErrorType(err), err.Error())
 			return
 		}
 		s.mu.Lock()
@@ -1349,18 +1374,20 @@ func validateIngestPipelineProcessors(procs []any) error {
 	for _, p := range procs {
 		pm, ok := p.(map[string]any)
 		if !ok {
-			continue
+			return fmt.Errorf("processor must be a map")
 		}
 		if topOnFail, ok := pm["on_failure"].([]any); ok {
 			if err := validateIngestPipelineProcessors(topOnFail); err != nil {
 				return err
 			}
 		}
+		procCount := 0
 		for procType, rawSpec := range pm {
 			switch procType {
 			case "tag", "ignore_failure", "on_failure", "if", "description":
 				continue
 			}
+			procCount++
 			if !isSupportedIngestProcessorType(procType) {
 				return fmt.Errorf("no processor type exists with name [%s]", procType)
 			}
@@ -1386,6 +1413,39 @@ func validateIngestPipelineProcessors(procs []any) error {
 				if strings.TrimSpace(field) == "" {
 					return fmt.Errorf("[field] required property is missing")
 				}
+			case "date_index_name":
+				field, _ := specMap["field"].(string)
+				if strings.TrimSpace(field) == "" {
+					return fmt.Errorf("[field] required property is missing")
+				}
+				rounding, _ := specMap["date_rounding"].(string)
+				if strings.TrimSpace(rounding) == "" {
+					return fmt.Errorf("[date_rounding] required property is missing")
+				}
+				switch rounding {
+				case "y", "M", "w", "d", "h", "m", "s":
+				default:
+					return fmt.Errorf("invalid date rounding [%s], valid values are [y, M, w, d, h, m, s]", rounding)
+				}
+			case "enrich":
+				pn, _ := specMap["policy_name"].(string)
+				if strings.TrimSpace(pn) == "" {
+					return fmt.Errorf("[policy_name] required property is missing")
+				}
+				field, _ := specMap["field"].(string)
+				if strings.TrimSpace(field) == "" {
+					return fmt.Errorf("[field] required property is missing")
+				}
+				tf, _ := specMap["target_field"].(string)
+				if strings.TrimSpace(tf) == "" {
+					return fmt.Errorf("[target_field] required property is missing")
+				}
+				if rawMM, hasMM := specMap["max_matches"]; hasMM && rawMM != nil {
+					mm, ok := toInt64(rawMM)
+					if !ok || mm < 1 || mm > 128 {
+						return fmt.Errorf("[max_matches] must be between 1 and 128")
+					}
+				}
 			case "foreach":
 				if subProc, ok := specMap["processor"].(map[string]any); ok && subProc != nil {
 					if err := validateIngestPipelineProcessors([]any{subProc}); err != nil {
@@ -1404,15 +1464,27 @@ func validateIngestPipelineProcessors(procs []any) error {
 				}
 			}
 		}
+		if procCount == 0 {
+			return fmt.Errorf("processor doesn't specify type")
+		}
+		if procCount > 1 {
+			return fmt.Errorf("processor cannot specify more than one type")
+		}
 	}
 	return nil
 }
 
 func validateIngestPipelineSpec(body map[string]any) error {
-	if procs, ok := body["processors"].([]any); ok {
-		if err := validateIngestPipelineProcessors(procs); err != nil {
-			return err
-		}
+	rawProcs, hasProcs := body["processors"]
+	if !hasProcs {
+		return fmt.Errorf("[processors] required property is missing")
+	}
+	procs, ok := rawProcs.([]any)
+	if !ok {
+		return fmt.Errorf("[processors] property isn't a list")
+	}
+	if err := validateIngestPipelineProcessors(procs); err != nil {
+		return err
 	}
 	if onFail, ok := body["on_failure"].([]any); ok {
 		if err := validateIngestPipelineProcessors(onFail); err != nil {
@@ -1422,8 +1494,18 @@ func validateIngestPipelineSpec(body map[string]any) error {
 	return nil
 }
 
+func ingestSpecValidationErrorType(err error) string {
+	if err != nil {
+		msg := err.Error()
+		if strings.Contains(msg, "must be between") || strings.Contains(msg, "invalid date rounding") || strings.Contains(msg, "illegal_argument_exception") {
+			return "illegal_argument_exception"
+		}
+	}
+	return "parse_exception"
+}
+
 func ingestErrorType(err error) string {
-	if err != nil && strings.Contains(err.Error(), "does not exist") {
+	if err != nil && (strings.Contains(err.Error(), "does not exist") || strings.Contains(err.Error(), "must be between") || strings.Contains(err.Error(), "illegal_argument_exception")) {
 		return "illegal_argument_exception"
 	}
 	return "ingest_processor_exception"
@@ -2071,11 +2153,19 @@ func deepCloneIngestValue(val any) any {
 }
 
 func normalizeGrokFieldName(fieldName string) string {
-	if strings.HasPrefix(fieldName, "[") && strings.HasSuffix(fieldName, "]") {
-		trimmed := strings.TrimPrefix(strings.TrimSuffix(fieldName, "]"), "[")
-		return strings.ReplaceAll(trimmed, "][", ".")
+	if !strings.Contains(fieldName, "[") {
+		return fieldName
 	}
-	return fieldName
+	s := strings.TrimSpace(fieldName)
+	s = strings.TrimPrefix(s, "[")
+	s = strings.TrimSuffix(s, "]")
+	s = strings.ReplaceAll(s, "][", ".")
+	s = strings.ReplaceAll(s, "[", ".")
+	s = strings.ReplaceAll(s, "]", "")
+	for strings.Contains(s, "..") {
+		s = strings.ReplaceAll(s, "..", ".")
+	}
+	return strings.Trim(s, ".")
 }
 
 func compileGrokRegex(pat string, customDefs map[string]any) (*regexp.Regexp, map[string]string, map[string]string, error) {
@@ -2252,6 +2342,33 @@ func convertESDateFormatToGoLayouts(esFmt string) []string {
 		}
 	}
 	return layouts
+}
+
+func formatIngestDateInput(val any) string {
+	switch tv := val.(type) {
+	case json.Number:
+		return tv.String()
+	case float64:
+		if math.Trunc(tv) == tv {
+			return strconv.FormatInt(int64(tv), 10)
+		}
+		return strconv.FormatFloat(tv, 'f', -1, 64)
+	case int64:
+		return strconv.FormatInt(tv, 10)
+	case int:
+		return strconv.Itoa(tv)
+	default:
+		return fmt.Sprintf("%v", val)
+	}
+}
+
+func isNumericIngestDateValue(val any) bool {
+	switch val.(type) {
+	case json.Number, float64, float32, int, int64, int32, uint, uint64, uint32:
+		return true
+	default:
+		return false
+	}
 }
 
 func parseIngestDateValue(raw string, formats []any, tzName string) (time.Time, error) {
@@ -2454,6 +2571,7 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 		if strings.HasSuffix(inner, "->") {
 			tok.padRight = true
 			inner = strings.TrimSuffix(inner, "->")
+			inner = strings.TrimRight(inner, "-")
 		}
 		inner = strings.TrimSpace(inner)
 		switch {
@@ -2502,7 +2620,18 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 			val = cur
 			cur = ""
 		} else if tok.nextLit == "" {
-			val = ""
+			if tok.padRight {
+				wsIdx := strings.IndexAny(cur, " \t")
+				if wsIdx >= 0 {
+					val = cur[:wsIdx]
+					cur = strings.TrimLeft(cur[wsIdx:], " \t")
+				} else {
+					val = cur
+					cur = ""
+				}
+			} else {
+				val = ""
+			}
 		} else {
 			idx := strings.Index(cur, tok.nextLit)
 			if idx < 0 {
@@ -3199,7 +3328,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					setIngestPath(doc, target, strings.Join(strs, sep))
 					mutated = true
 				} else {
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not an array", field)
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not an array, cannot join", field)
 				}
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
@@ -3482,16 +3611,28 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				if valueSplit != "=" && valueSplit != ":" && valueSplit != "|" && valueSplit != "." {
 					valSplitRe, _ = regexp.Compile(valueSplit)
 				}
+				stripKVEnclosingBrackets := func(s string) string {
+					for len(s) >= 2 {
+						first, last := s[0], s[len(s)-1]
+						if (first == '[' && last == ']') || (first == '(' && last == ')') || (first == '<' && last == '>') || (first == '{' && last == '}') {
+							s = s[1 : len(s)-1]
+						} else {
+							break
+						}
+					}
+					return s
+				}
 				kvMap := make(map[string]any)
 				for _, strVal := range strInputs {
-					if stripBrackets && len(strVal) >= 2 {
-						first, last := strVal[0], strVal[len(strVal)-1]
-						if (first == '[' && last == ']') || (first == '(' && last == ')') || (first == '<' && last == '>') {
-							strVal = strVal[1 : len(strVal)-1]
-						}
+					if stripBrackets {
+						strVal = stripKVEnclosingBrackets(strings.TrimSpace(strVal))
 					}
 					pairs := splitIngestKVPairs(strVal, fieldSplit)
 					for _, pair := range pairs {
+						pair = strings.TrimSpace(pair)
+						if stripBrackets {
+							pair = stripKVEnclosingBrackets(pair)
+						}
 						if pair == "" {
 							continue
 						}
@@ -3526,8 +3667,8 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 							first, last := v[0], v[len(v)-1]
 							if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
 								v = v[1 : len(v)-1]
-							} else if stripBrackets && ((first == '(' && last == ')') || (first == '[' && last == ']') || (first == '<' && last == '>')) {
-								v = v[1 : len(v)-1]
+							} else if stripBrackets {
+								v = stripKVEnclosingBrackets(v)
 							}
 						}
 						if trimVal != "" {
@@ -3951,7 +4092,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		if field != "" {
 			field = fmt.Sprintf("%v", expandIngestTemplate(field, doc))
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				parsedTime, err := parseIngestDateValue(fmt.Sprintf("%v", val), formats, tzName)
+				effFormats := formats
+				if len(effFormats) == 0 && isNumericIngestDateValue(val) {
+					effFormats = []any{"ISO8601", "UNIX_MS", "UNIX"}
+				}
+				parsedTime, err := parseIngestDateValue(formatIngestDateInput(val), effFormats, tzName)
 				if err != nil {
 					return false, false, procType, procTag, specMap, err
 				}
@@ -3976,11 +4121,20 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					parsedTime = time.Date(parsedTime.Year(), parsedTime.Month(), parsedTime.Day(), parsedTime.Hour(), parsedTime.Minute(), parsedTime.Second(), 0, parsedTime.Location())
 				}
 				layouts := convertESDateFormatToGoLayouts(idxFmt)
+				var formattedDate string
+				switch layouts[0] {
+				case "UNIX_MS":
+					formattedDate = strconv.FormatInt(parsedTime.UnixMilli(), 10)
+				case "UNIX":
+					formattedDate = strconv.FormatInt(parsedTime.Unix(), 10)
+				default:
+					formattedDate = parsedTime.Format(layouts[0])
+				}
 				target := "_index"
 				if tf, _ := specMap["target_field"].(string); tf != "" {
 					target = expandIngestFieldName(tf, doc)
 				}
-				setIngestPath(doc, target, prefix+parsedTime.Format(layouts[0]))
+				setIngestPath(doc, target, prefix+formattedDate)
 				mutated = true
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
@@ -4569,35 +4723,85 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		if field != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
 				uaStr := fmt.Sprintf("%v", val)
+				extractUATokenVersion := func(s, prefix string) string {
+					idx := strings.Index(s, prefix)
+					if idx < 0 {
+						return ""
+					}
+					rem := s[idx+len(prefix):]
+					end := 0
+					for end < len(rem) && ((rem[end] >= '0' && rem[end] <= '9') || rem[end] == '.' || rem[end] == '_') {
+						end++
+					}
+					return strings.Trim(strings.ReplaceAll(rem[:end], "_", "."), ".")
+				}
 				uaMap := map[string]any{
 					"original": uaStr,
 					"name":     "Other",
 					"os":       map[string]any{"name": "Other"},
 					"device":   map[string]any{"name": "Other"},
 				}
+				var browserVer string
 				switch {
 				case strings.Contains(uaStr, "Edg/"):
 					uaMap["name"] = "Edge"
+					browserVer = extractUATokenVersion(uaStr, "Edg/")
 				case strings.Contains(uaStr, "Chrome/"):
 					uaMap["name"] = "Chrome"
+					browserVer = extractUATokenVersion(uaStr, "Chrome/")
 				case strings.Contains(uaStr, "Firefox/"):
 					uaMap["name"] = "Firefox"
+					browserVer = extractUATokenVersion(uaStr, "Firefox/")
 				case strings.Contains(uaStr, "Safari/") && !strings.Contains(uaStr, "Chrome/"):
 					uaMap["name"] = "Safari"
+					browserVer = extractUATokenVersion(uaStr, "Version/")
+					if browserVer == "" {
+						browserVer = extractUATokenVersion(uaStr, "Safari/")
+					}
 				case strings.Contains(uaStr, "curl/"):
 					uaMap["name"] = "curl"
+					browserVer = extractUATokenVersion(uaStr, "curl/")
 				}
+				if browserVer != "" {
+					uaMap["version"] = browserVer
+				}
+				osMap := map[string]any{"name": "Other"}
 				switch {
-				case strings.Contains(uaStr, "Mac OS X"):
-					uaMap["os"] = map[string]any{"name": "Mac OS X"}
-				case strings.Contains(uaStr, "Windows"):
-					uaMap["os"] = map[string]any{"name": "Windows"}
+				case strings.Contains(uaStr, "iPhone") || strings.Contains(uaStr, "iPad") || strings.Contains(uaStr, "iPod"):
+					osMap["name"] = "iOS"
+					if ver := extractUATokenVersion(uaStr, "OS "); ver != "" {
+						osMap["version"] = ver
+						osMap["full"] = "iOS " + ver
+					}
 				case strings.Contains(uaStr, "Android"):
-					uaMap["os"] = map[string]any{"name": "Android"}
-				case strings.Contains(uaStr, "iPhone") || strings.Contains(uaStr, "iPad"):
-					uaMap["os"] = map[string]any{"name": "iOS"}
+					osMap["name"] = "Android"
+					if ver := extractUATokenVersion(uaStr, "Android "); ver != "" {
+						osMap["version"] = ver
+						osMap["full"] = "Android " + ver
+					}
+				case strings.Contains(uaStr, "Mac OS X"):
+					osMap["name"] = "Mac OS X"
+					if ver := extractUATokenVersion(uaStr, "Mac OS X "); ver != "" {
+						osMap["version"] = ver
+						osMap["full"] = "Mac OS X " + ver
+					}
+				case strings.Contains(uaStr, "Windows"):
+					osMap["name"] = "Windows"
+					if ver := extractUATokenVersion(uaStr, "Windows NT "); ver != "" {
+						osMap["version"] = ver
+						osMap["full"] = "Windows " + ver
+					}
 				case strings.Contains(uaStr, "Linux"):
-					uaMap["os"] = map[string]any{"name": "Linux"}
+					osMap["name"] = "Linux"
+				}
+				uaMap["os"] = osMap
+				switch {
+				case strings.Contains(uaStr, "iPhone"):
+					uaMap["device"] = map[string]any{"name": "iPhone"}
+				case strings.Contains(uaStr, "iPad"):
+					uaMap["device"] = map[string]any{"name": "iPad"}
+				case strings.Contains(uaStr, "Macintosh"):
+					uaMap["device"] = map[string]any{"name": "Mac"}
 				}
 				setIngestPath(doc, target, uaMap)
 				mutated = true
@@ -4624,12 +4828,17 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				parseInput := rawURI
 				syntheticScheme := false
 				if !strings.Contains(rawURI, "://") {
-					if colonIdx := strings.IndexByte(rawURI, ':'); colonIdx > 0 {
-						slashIdx := strings.IndexByte(rawURI, '/')
-						if (slashIdx == -1 || colonIdx < slashIdx) && colonIdx+1 < len(rawURI) && rawURI[colonIdx+1] >= '0' && rawURI[colonIdx+1] <= '9' {
-							parseInput = "http://" + rawURI
-							syntheticScheme = true
-						}
+					slashIdx := strings.IndexByte(rawURI, '/')
+					authority := rawURI
+					if slashIdx >= 0 {
+						authority = rawURI[:slashIdx]
+					}
+					if atIdx := strings.IndexByte(authority, '@'); atIdx > 0 {
+						parseInput = "http://" + rawURI
+						syntheticScheme = true
+					} else if colonIdx := strings.IndexByte(authority, ':'); colonIdx > 0 && colonIdx+1 < len(authority) && authority[colonIdx+1] >= '0' && authority[colonIdx+1] <= '9' {
+						parseInput = "http://" + rawURI
+						syntheticScheme = true
 					}
 				}
 				u, err := url.Parse(parseInput)
@@ -4656,7 +4865,8 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				}
 				if u.Path != "" {
 					parts["path"] = u.Path
-					if dotIdx := strings.LastIndexByte(u.Path, '.'); dotIdx > strings.LastIndexByte(u.Path, '/') && dotIdx+1 < len(u.Path) {
+					lastSlash := strings.LastIndexByte(u.Path, '/')
+					if dotIdx := strings.LastIndexByte(u.Path, '.'); dotIdx > lastSlash+1 && dotIdx+1 < len(u.Path) {
 						parts["extension"] = u.Path[dotIdx+1:]
 					}
 				}
@@ -4704,7 +4914,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		ignoreMissing, _ := specMap["ignore_missing"].(bool)
 		if field != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				fqdn := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", val))), ".")
+				fqdn := strings.TrimRight(strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", val))), ".")
 				labels := strings.Split(fqdn, ".")
 				out := map[string]any{"domain": fqdn}
 				isIP := net.ParseIP(strings.Trim(fqdn, "[]")) != nil
@@ -4712,7 +4922,8 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					switch sld {
 					case "co", "com", "org", "gov", "govt", "ac", "net", "edu", "mil",
 						"or", "ne", "go", "ed", "gr", "lg", "gob", "nom", "ind",
-						"res", "ernet", "nic", "gen", "biz", "info", "per", "id", "asn", "me":
+						"res", "ernet", "nic", "gen", "biz", "info", "per", "id", "asn", "me",
+						"sch", "nhs", "police", "mod", "ltd", "plc", "geek", "kiwi", "maori", "iwi", "cri", "health":
 						return true
 					}
 					return false
@@ -5706,7 +5917,7 @@ func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Req
 	pipe := req.Pipeline
 	if pipe != nil {
 		if err := validateIngestPipelineSpec(pipe); err != nil {
-			writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+			writeESError(w, http.StatusBadRequest, ingestSpecValidationErrorType(err), err.Error())
 			return
 		}
 	} else {
@@ -5866,14 +6077,34 @@ func convertSingleIngestValue(val any, convType string) (any, error) {
 		return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
 	}
 	str := strings.TrimSpace(fmt.Sprintf("%v", val))
-	switch strings.ToLower(convType) {
+	lowerType := strings.ToLower(convType)
+	switch lowerType {
 	case "integer", "int", "long", "short", "byte":
+		checkBounds := func(iv int64) bool {
+			switch lowerType {
+			case "integer", "int":
+				return iv >= math.MinInt32 && iv <= math.MaxInt32
+			case "short":
+				return iv >= math.MinInt16 && iv <= math.MaxInt16
+			case "byte":
+				return iv >= math.MinInt8 && iv <= math.MaxInt8
+			default:
+				return true
+			}
+		}
 		if iv, err := strconv.ParseInt(str, 10, 64); err == nil {
+			if !checkBounds(iv) {
+				return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
+			}
 			return iv, nil
 		}
 		if !strings.Contains(str, ".") {
-			if fv, err := strconv.ParseFloat(str, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) {
-				return int64(fv), nil
+			if fv, err := strconv.ParseFloat(str, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) && fv >= float64(math.MinInt64) && fv < float64(math.MaxInt64) {
+				iv := int64(fv)
+				if !checkBounds(iv) {
+					return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
+				}
+				return iv, nil
 			}
 		}
 		return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
@@ -5896,9 +6127,9 @@ func convertSingleIngestValue(val any, convType string) (any, error) {
 		return fmt.Sprintf("%v", val), nil
 	case "boolean", "bool":
 		switch strings.ToLower(str) {
-		case "true", "1":
+		case "true", "1", "yes", "on":
 			return true, nil
-		case "false", "0":
+		case "false", "0", "no", "off":
 			return false, nil
 		}
 		return nil, fmt.Errorf("unable to convert [%v] to boolean", val)
@@ -6301,6 +6532,10 @@ func deleteIngestPath(doc map[string]any, path string) {
 
 // handleCatNodes implements `GET /_cat/nodes` for Elasticvue & Cerebro.
 func (s *Server) handleCatNodes(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	rows := []map[string]any{
 		{
 			"ip":           "127.0.0.1",
@@ -6317,6 +6552,10 @@ func (s *Server) handleCatNodes(w http.ResponseWriter, r *http.Request) {
 
 // handleCatShards implements `GET /_cat/shards` for Elasticvue & Cerebro.
 func (s *Server) handleCatShards(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	var names []string
 	if pat := r.PathValue("index"); pat != "" {
 		names = s.resolveTargetIndices(pat)
@@ -6344,6 +6583,10 @@ func (s *Server) handleCatShards(w http.ResponseWriter, r *http.Request) {
 
 // handleCatCount implements `GET /_cat/count`.
 func (s *Server) handleCatCount(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	zero := 0
 	resp, _, _, _ := s.executeSearchRequest(r.Context(), r.PathValue("index"), &esast.SearchRequest{Size: &zero})
 	total, _ := extractTotalAndHitIDs(resp)
@@ -6360,6 +6603,10 @@ func (s *Server) handleCatCount(w http.ResponseWriter, r *http.Request) {
 
 // handleCatHealth implements `GET /_cat/health`.
 func (s *Server) handleCatHealth(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	s.mu.RLock()
 	numIndices := len(s.indices)
 	s.mu.RUnlock()
@@ -6398,6 +6645,10 @@ func (s *Server) handleCatHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeCatResponse(w http.ResponseWriter, r *http.Request, headers []string, rows []map[string]any) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	if isTruthyBoolQueryParam(r, "help") {
 		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -6638,6 +6889,14 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", writeErr.Error())
 		return
 	}
+	if s.isIndexClosed(destIndex) {
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", destIndex))
+		return
+	}
+	if blocked, reason := s.isIndexWriteBlocked(destIndex); blocked {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
 
 	maxDocs := 0
 	if body.MaxDocs != nil && *body.MaxDocs > 0 {
@@ -6659,6 +6918,26 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	srcTargets, aliasFilters := s.resolveTargetIndicesWithFilters(srcPattern)
 	if len(srcTargets) == 0 && !hasExclusionOrWildcard(srcPattern) {
 		srcTargets = []string{s.resolveIndexName(srcPattern)}
+	}
+	if closedIdx := s.findClosedTargetIndex(r, srcPattern); closedIdx != "" {
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
+		return
+	}
+	for _, srcIdx := range srcTargets {
+		if s.isIndexClosed(srcIdx) {
+			writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", srcIdx))
+			return
+		}
+	}
+	if _, reason := s.findReadBlockedTargetIndex(r, srcPattern); reason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
+	for _, srcIdx := range srcTargets {
+		if blocked, reason := s.isIndexReadBlocked(srcIdx); blocked {
+			writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+			return
+		}
 	}
 	aliasFilters = s.resolveTermsLookupsInAliasFilters(r.Context(), aliasFilters)
 
@@ -6754,6 +7033,8 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 							rawMap = make(map[string]any)
 						}
 						rawMap["__meta_id"] = h.ID
+						rawMap["__meta_index"] = srcIdx
+						rawMap["__meta_version"] = h.Version
 						if hasRuntimeQueryScript && !evalQueryScriptFilterOnDocWithScore(srcSchema, rawMap, effQuery, h.Score) {
 							continue
 						}
@@ -6880,6 +7161,8 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 						rawMap = make(map[string]any)
 					}
 					rawMap["__meta_id"] = h.ID
+					rawMap["__meta_index"] = effSrcIdx
+					rawMap["__meta_version"] = h.Version
 					if !evalQueryScriptFilterOnDocWithScore(srcSchema, rawMap, effQuery, h.Score) {
 						continue
 					}
@@ -6922,7 +7205,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					}
 					mutated, opRes, err := painless.ApplyUpdateWithResult(docSource, updSpec, true)
 					if err != nil {
-						writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
+						writeESError(w, http.StatusBadRequest, updateScriptErrorType(err), err.Error())
 						return
 					}
 					if opRes == "noop" {
@@ -7466,7 +7749,47 @@ func buildNestedMappingProps(segments []string, leaf esast.FieldProperty) map[st
 
 // handleValidateQuery implements `GET/POST /_validate/query` and `GET/POST /{index}/_validate/query`.
 func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
-	rawIndex := r.PathValue("index")
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	rawIndex := strings.TrimSpace(r.PathValue("index"))
+	wantsExplain := r.URL.Query().Get("explain") == "true" || r.URL.Query().Has("explain") || r.URL.Query().Get("rewrite") == "true"
+	writeInvalidResp := func(errMsg string, targetList []string) {
+		nShards := len(targetList)
+		if nShards == 0 {
+			nShards = 1
+		}
+		resp := map[string]any{
+			"valid":   false,
+			"error":   errMsg,
+			"_shards": map[string]any{"total": nShards, "successful": nShards, "failed": 0},
+		}
+		if wantsExplain {
+			idxForExpl := rawIndex
+			if len(targetList) > 0 {
+				idxForExpl = targetList[0]
+			}
+			resp["explanations"] = []map[string]any{
+				{
+					"index": idxForExpl,
+					"valid": false,
+					"error": errMsg,
+				},
+			}
+		}
+		writeJSON(w, http.StatusOK, resp)
+	}
+
+	var targets []string
+	var aliasFilters map[string]*esast.Query
+	if rawIndex != "" {
+		var ok bool
+		targets, aliasFilters, ok = s.resolveValidatedReadTargets(w, r, rawIndex)
+		if !ok {
+			return
+		}
+	}
 
 	raw, ok := readRequestBody(w, r)
 	if !ok {
@@ -7474,12 +7797,21 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	var req esast.SearchRequest
 	if len(bytes.TrimSpace(raw)) > 0 {
+		var rawTop map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &rawTop); err != nil {
+			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+			return
+		}
+		for k := range rawTop {
+			switch k {
+			case "query", "pit", "aggs", "aggregations", "runtime_mappings":
+			default:
+				writeESError(w, http.StatusBadRequest, "parsing_exception", fmt.Sprintf("Unknown key for a START_OBJECT in [validate/query]: [%s].", k))
+				return
+			}
+		}
 		if err := json.Unmarshal(raw, &req); err != nil {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"valid":   false,
-				"error":   err.Error(),
-				"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0},
-			})
+			writeInvalidResp(err.Error(), targets)
 			return
 		}
 	}
@@ -7487,41 +7819,31 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 	if req.PIT != nil && req.PIT.ID != "" {
 		pitIdx, ok := decodePITIndex(req.PIT.ID)
 		if !ok || pitIdx == "" {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"valid":   false,
-				"error":   "invalid pit id [" + req.PIT.ID + "]",
-				"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0},
-			})
+			writeInvalidResp("invalid pit id ["+req.PIT.ID+"]", targets)
 			return
 		}
 	}
 	if errMsg := validatePipelineAggs(req.EffectiveAggs()); errMsg != "" {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"valid":   false,
-			"error":   errMsg,
-			"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0},
-		})
+		writeInvalidResp(errMsg, targets)
 		return
 	}
-	rawIndex = extractPITIndex(rawIndex, req.PIT)
-	targets, aliasFilters := s.resolveTargetIndicesWithFilters(rawIndex)
+	if rawIndex == "" {
+		rawIndex = extractPITIndex(rawIndex, req.PIT)
+		targets, aliasFilters = s.resolveTargetIndicesWithFilters(rawIndex)
+	}
 	if len(targets) == 0 {
-		if rawIndex != "" && hasExclusionOrWildcard(rawIndex) {
+		if rawIndex != "" {
 			resp := map[string]any{
 				"valid":   true,
 				"_shards": map[string]any{"total": 0, "successful": 0, "failed": 0},
 			}
-			if r.URL.Query().Get("explain") == "true" || r.URL.Query().Has("explain") || r.URL.Query().Get("rewrite") == "true" {
+			if wantsExplain {
 				resp["explanations"] = []map[string]any{}
 			}
 			writeJSON(w, http.StatusOK, resp)
 			return
 		}
-		if rawIndex != "" {
-			targets = []string{s.resolveIndexName(rawIndex)}
-		} else {
-			targets = []string{"_all"}
-		}
+		targets = []string{"_all"}
 	}
 	s.resolveStoredScriptsInSearchRequest(&req)
 	_ = s.preResolveSpecialQueriesInSearchRequest(r.Context(), targets, &req)
@@ -7537,11 +7859,7 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 		subReq := applyIndexAliasFilter(&req, aliasFilters[idxName])
 		plan, err := tr.BuildSearchPlan(subReq)
 		if err != nil {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"valid":   false,
-				"error":   err.Error(),
-				"_shards": map[string]any{"total": len(targets), "successful": len(targets), "failed": 0},
-			})
+			writeInvalidResp(err.Error(), targets)
 			return
 		}
 		expl := plan.HitsSQL
@@ -7714,6 +8032,10 @@ func unicodeToLower(r rune) rune {
 
 // handleRollover implements `POST /{alias}/_rollover` and `POST /{alias}/_rollover/{new_index}`.
 func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodPost {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
 		return
@@ -7819,6 +8141,20 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 		} else {
 			newIdx = incrementRolloverIndexName(oldIdx)
 		}
+	}
+	s.mu.RLock()
+	_, autoNewExists := s.indices[newIdx]
+	newAliasCollision := len(s.aliases[newIdx]) > 0 || s.dataStreams[newIdx] != nil
+	s.mu.RUnlock()
+	if autoNewExists {
+		writeESError(w, http.StatusBadRequest, "resource_already_exists_exception",
+			fmt.Sprintf("index [%s] already exists", newIdx))
+		return
+	}
+	if newAliasCollision {
+		writeESError(w, http.StatusBadRequest, "invalid_index_name_exception",
+			fmt.Sprintf("Invalid index name [%s], already exists as alias", newIdx))
+		return
 	}
 
 	condResults := make(map[string]bool)
@@ -8297,9 +8633,31 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 
 // handleExplainDoc implements `GET/POST /{index}/_explain/{id}` and `GET/POST /{index}/_doc/{id}/_explain`.
 func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
-	indexName, aliasFilter, readErr := s.resolveReadDocIndexWithFilter(r.PathValue("index"))
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	_ = s.syncCatalogFromBackend(r.Context())
+	rawIndex := strings.TrimSpace(r.PathValue("index"))
+	indexName, aliasFilter, readErr := s.resolveReadDocIndexWithFilter(rawIndex)
 	if readErr != nil {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", readErr.Error())
+		return
+	}
+	s.mu.RLock()
+	_, idxExists := s.indices[indexName]
+	isClosed := s.closedIndices[indexName]
+	s.mu.RUnlock()
+	if !idxExists {
+		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
+		return
+	}
+	if isClosed {
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", "closed ["+indexName+"]")
+		return
+	}
+	if blocked, reason := s.isIndexReadBlocked(indexName); blocked {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
 		return
 	}
 	docID := r.PathValue("id")
@@ -8309,6 +8667,19 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 	}
 	var req esast.SearchRequest
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		var rawTop map[string]json.RawMessage
+		if err := json.Unmarshal(bodyBytes, &rawTop); err != nil {
+			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+			return
+		}
+		for k := range rawTop {
+			switch k {
+			case "query", "post_filter", "min_score", "_source", "stored_fields", "fields", "docvalue_fields", "script_fields", "runtime_mappings":
+			default:
+				writeESError(w, http.StatusBadRequest, "parsing_exception", fmt.Sprintf("Unknown key for a START_OBJECT in [explain]: [%s].", k))
+				return
+			}
+		}
 		if err := json.Unmarshal(bodyBytes, &req); err != nil {
 			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
 			return
@@ -8820,6 +9191,10 @@ func executeGeoIPProcessor(doc map[string]any, specMap map[string]any) (bool, er
 func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
 	_ = s.syncCatalogFromBackend(r.Context())
 	if strings.HasSuffix(r.URL.Path, "/_stats") || strings.HasSuffix(r.URL.Path, "/stats") {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"executing_policies": []any{},
 			"coordinator_stats":  []any{},
@@ -8833,12 +9208,58 @@ func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.mu.RLock()
-		_, exists := s.enrichPolicies[name]
+		pol, exists := s.enrichPolicies[name]
 		s.mu.RUnlock()
 		if !exists {
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "enrich policy ["+name+"] not found")
 			return
 		}
+		pIdx, _, _, _, pQuery := extractEnrichPolicyMeta(pol)
+		var snapshotDocs []map[string]any
+		for _, idxPat := range pIdx {
+			for _, targetIdx := range s.resolveTargetIndices(idxPat) {
+				scanLimit := 10000
+				resp, _, errType, _ := s.executeSearchRequest(r.Context(), targetIdx, &esast.SearchRequest{
+					Query: pQuery,
+					Size:  &scanLimit,
+				})
+				if errType != "" {
+					continue
+				}
+				if hitsEnv, ok := resp["hits"].(map[string]any); ok {
+					appendHitDoc := func(h map[string]any) {
+						if srcRaw, ok := h["_source"].(json.RawMessage); ok {
+							var m map[string]any
+							dec := json.NewDecoder(bytes.NewReader(srcRaw))
+							dec.UseNumber()
+							if dec.Decode(&m) == nil && m != nil {
+								snapshotDocs = append(snapshotDocs, m)
+							}
+						} else if srcMap, ok := h["_source"].(map[string]any); ok && srcMap != nil {
+							snapshotDocs = append(snapshotDocs, srcMap)
+						}
+					}
+					switch hitsList := hitsEnv["hits"].(type) {
+					case []map[string]any:
+						for _, h := range hitsList {
+							appendHitDoc(h)
+						}
+					case []any:
+						for _, item := range hitsList {
+							if h, ok := item.(map[string]any); ok {
+								appendHitDoc(h)
+							}
+						}
+					}
+				}
+			}
+		}
+		s.mu.Lock()
+		if curPol := s.enrichPolicies[name]; curPol != nil {
+			curPol["__snapshot_docs"] = snapshotDocs
+			curPol["__executed"] = true
+		}
+		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status": map[string]any{"phase": "COMPLETE"},
 		})
@@ -8849,6 +9270,13 @@ func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut, http.MethodPost:
 		if name == "" {
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "enrich policy name is required")
+			return
+		}
+		s.mu.RLock()
+		_, alreadyExists := s.enrichPolicies[name]
+		s.mu.RUnlock()
+		if alreadyExists {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Cannot update enrich policy ["+name+"] - enrich policies are immutable")
 			return
 		}
 		bodyBytes, ok := readRequestBody(w, r)
@@ -8862,30 +9290,55 @@ func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if body == nil {
-			body = make(map[string]any)
+		if len(body) == 0 {
+			writeESError(w, http.StatusBadRequest, "parse_exception", "enrich policy must specify one of [match, geo_match, range]")
+			return
 		}
-		stored := make(map[string]any)
-		wrapped := false
-		for _, pType := range []string{"match", "geo_match", "range"} {
-			if inner, ok := body[pType].(map[string]any); ok {
-				cp := make(map[string]any, len(inner)+1)
-				for k, v := range inner {
-					cp[k] = v
+		var matchedType string
+		var innerMap map[string]any
+		for k, v := range body {
+			switch k {
+			case "match", "geo_match", "range":
+				if matchedType != "" {
+					writeESError(w, http.StatusBadRequest, "parse_exception", "enrich policy must specify only one policy type")
+					return
 				}
-				cp["name"] = name
-				stored[pType] = cp
-				wrapped = true
-				break
+				m, ok := v.(map[string]any)
+				if !ok || m == nil {
+					writeESError(w, http.StatusBadRequest, "parse_exception", "["+k+"] must be an object")
+					return
+				}
+				matchedType = k
+				innerMap = m
+			default:
+				writeESError(w, http.StatusBadRequest, "parse_exception", fmt.Sprintf("unknown field [%s] in enrich policy", k))
+				return
 			}
 		}
-		if !wrapped {
-			cp := make(map[string]any, len(body)+1)
-			for k, v := range body {
-				cp[k] = v
-			}
-			cp["name"] = name
-			stored["match"] = cp
+		if matchedType == "" || innerMap == nil {
+			writeESError(w, http.StatusBadRequest, "parse_exception", "enrich policy must specify one of [match, geo_match, range]")
+			return
+		}
+		pIdx, pMF, pEF, _, _ := extractEnrichPolicyMeta(map[string]any{matchedType: innerMap})
+		if len(pIdx) == 0 {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[indices] must not be empty")
+			return
+		}
+		if strings.TrimSpace(pMF) == "" {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[match_field] must not be empty")
+			return
+		}
+		if len(pEF) == 0 {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[enrich_fields] must not be empty")
+			return
+		}
+		cp := make(map[string]any, len(innerMap)+1)
+		for k, v := range innerMap {
+			cp[k] = v
+		}
+		cp["name"] = name
+		stored := map[string]any{
+			matchedType: cp,
 		}
 		s.mu.Lock()
 		if s.enrichPolicies == nil {
@@ -8898,6 +9351,13 @@ func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodGet:
 		s.mu.RLock()
+		if name != "" && !strings.ContainsAny(name, "*?,") && name != "_all" {
+			if _, ok := s.enrichPolicies[name]; !ok {
+				s.mu.RUnlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "enrich policy ["+name+"] not found")
+				return
+			}
+		}
 		names := make([]string, 0, len(s.enrichPolicies))
 		for k := range s.enrichPolicies {
 			names = append(names, k)
@@ -8917,8 +9377,14 @@ func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if matched {
+				cleanCfg := make(map[string]any, len(s.enrichPolicies[k]))
+				for ck, cv := range s.enrichPolicies[k] {
+					if !strings.HasPrefix(ck, "__") {
+						cleanCfg[ck] = cv
+					}
+				}
 				policies = append(policies, map[string]any{
-					"config": s.enrichPolicies[k],
+					"config": cleanCfg,
 				})
 			}
 		}
@@ -8949,6 +9415,9 @@ func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
 func extractEnrichPolicyMeta(pol map[string]any) (indices []string, matchField string, enrichFields []string, policyType string, policyQuery *esast.Query) {
 	if pol == nil {
 		return nil, "", nil, "", nil
+	}
+	if cfgWrap, ok := pol["config"].(map[string]any); ok && cfgWrap != nil {
+		pol = cfgWrap
 	}
 	inner := pol
 	for _, pType := range []string{"match", "geo_match", "range"} {
@@ -9113,6 +9582,59 @@ func enrichDocMatchesRangeValue(srcMap map[string]any, matchField string, lookup
 	return enrichSingleSpecMatchesSingleValue(rangeSpec, lookupVal)
 }
 
+func enrichScalarValuesEqual(a, b any) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if af, aOk := toFloat(a); aOk {
+		if bf, bOk := toFloat(b); bOk {
+			return af == bf
+		}
+	}
+	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
+}
+
+func expandEnrichScalarSlice(v any) []any {
+	switch s := v.(type) {
+	case []any:
+		out := make([]any, 0, len(s))
+		for _, el := range s {
+			if el != nil {
+				out = append(out, el)
+			}
+		}
+		return out
+	case []string:
+		out := make([]any, 0, len(s))
+		for _, el := range s {
+			out = append(out, el)
+		}
+		return out
+	default:
+		if v == nil {
+			return nil
+		}
+		return []any{v}
+	}
+}
+
+func enrichDocMatchesExactValue(srcMap map[string]any, matchField string, lookupVal any) bool {
+	docVal, ok := getIngestPath(srcMap, matchField)
+	if !ok || docVal == nil {
+		return false
+	}
+	docVals := expandEnrichScalarSlice(docVal)
+	lookupVals := expandEnrichScalarSlice(lookupVal)
+	for _, dv := range docVals {
+		for _, lv := range lookupVals {
+			if enrichScalarValuesEqual(dv, lv) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]any) (bool, error) {
 	field, _ := specMap["field"].(string)
 	field = expandIngestFieldName(field, doc)
@@ -9120,6 +9642,14 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 	target = expandIngestFieldName(target, doc)
 	if field == "" || target == "" {
 		return false, nil
+	}
+	maxMatches := 1
+	if rawMM, hasMM := specMap["max_matches"]; hasMM && rawMM != nil {
+		mm, ok := toInt64(rawMM)
+		if !ok || mm < 1 || mm > 128 {
+			return false, fmt.Errorf("[max_matches] must be between 1 and 128")
+		}
+		maxMatches = int(mm)
 	}
 	val, exists := getIngestPath(doc, field)
 	if !exists || val == nil {
@@ -9137,16 +9667,13 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 			return false, nil
 		}
 	}
-	maxMatches := 1
-	if mm, ok := toInt64(specMap["max_matches"]); ok && mm > 0 {
-		maxMatches = int(mm)
-	}
 	policyName, _ := specMap["policy_name"].(string)
 	matchField, _ := specMap["match_field"].(string)
 	var policyIndices []string
 	var enrichFields []string
 	var policyType string
 	var policyQuery *esast.Query
+	var snapshotDocs []map[string]any
 	hadConfiguredSource := false
 	if s != nil && policyName != "" {
 		s.mu.RLock()
@@ -9168,6 +9695,9 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 			enrichFields = pEF
 			policyType = pType
 			policyQuery = pQuery
+			if snap, ok := pol["__snapshot_docs"].([]map[string]any); ok {
+				snapshotDocs = snap
+			}
 		}
 	}
 	if len(enrichFields) == 0 {
@@ -9208,6 +9738,20 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 		for _, mk := range matchKeys {
 			if entry, hasL := lookup[mk]; hasL {
 				matches = append(matches, entry)
+			}
+		}
+	}
+	if len(matches) == 0 && len(snapshotDocs) > 0 {
+		for _, srcMap := range snapshotDocs {
+			if len(matches) >= maxMatches {
+				break
+			}
+			if policyType == "range" {
+				if enrichDocMatchesRangeValue(srcMap, matchField, val) {
+					matches = append(matches, srcMap)
+				}
+			} else if enrichDocMatchesExactValue(srcMap, matchField, val) {
+				matches = append(matches, srcMap)
 			}
 		}
 	}
@@ -9290,22 +9834,29 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 				}
 			}
 			q = combineQueryWithAliasFilter(q, policyQuery)
-			sz := maxMatches
+			sz := maxMatches * 4
+			if sz < 10 {
+				sz = 10
+			}
 			resp, _, errType, _ := s.executeSearchRequest(context.Background(), cIdx, &esast.SearchRequest{
 				Query: q,
 				Size:  &sz,
 			})
-			if errType == "" {
-				if hitsEnv, ok := resp["hits"].(map[string]any); ok {
+			extractExactHitsFromResp := func(rMap map[string]any) {
+				if hitsEnv, ok := rMap["hits"].(map[string]any); ok {
 					extractHitSource := func(h map[string]any) {
+						if len(matches) >= maxMatches {
+							return
+						}
+						var srcMap map[string]any
 						if srcRaw, ok := h["_source"].(json.RawMessage); ok {
-							var m map[string]any
 							dec := json.NewDecoder(bytes.NewReader(srcRaw))
 							dec.UseNumber()
-							if err := dec.Decode(&m); err == nil && m != nil {
-								matches = append(matches, m)
-							}
-						} else if srcMap, ok := h["_source"].(map[string]any); ok {
+							_ = dec.Decode(&srcMap)
+						} else if sm, ok := h["_source"].(map[string]any); ok {
+							srcMap = sm
+						}
+						if srcMap != nil && enrichDocMatchesExactValue(srcMap, matchField, val) {
 							matches = append(matches, srcMap)
 						}
 					}
@@ -9321,6 +9872,19 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 							}
 						}
 					}
+				}
+			}
+			if errType == "" {
+				extractExactHitsFromResp(resp)
+			}
+			if len(matches) == 0 {
+				scanLimit := 1000
+				scanResp, _, scanErr, _ := s.executeSearchRequest(context.Background(), cIdx, &esast.SearchRequest{
+					Query: policyQuery,
+					Size:  &scanLimit,
+				})
+				if scanErr == "" {
+					extractExactHitsFromResp(scanResp)
 				}
 			}
 			if len(matches) >= maxMatches {

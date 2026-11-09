@@ -196,6 +196,16 @@ type Server struct {
 	clusterPersistentSettings map[string]any
 	clusterTransientSettings  map[string]any
 	indexCustomSettings       map[string]map[string]any
+	templateVersions          map[string]int
+	ilmMode                   string
+	slmPolicies               map[string]map[string]any
+	slmMode                   string
+	slmStats                  map[string]int64
+	watches                   map[string]map[string]any
+	watcherState              string
+	transforms                map[string]map[string]any
+	danglingIndices           map[string]map[string]any
+	autoscalingPolicies       map[string]map[string]any
 }
 
 func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerOptions) *Server {
@@ -230,6 +240,16 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		clusterPersistentSettings: make(map[string]any),
 		clusterTransientSettings:  make(map[string]any),
 		indexCustomSettings:       make(map[string]map[string]any),
+		templateVersions:          make(map[string]int),
+		ilmMode:                   "RUNNING",
+		slmPolicies:               make(map[string]map[string]any),
+		slmMode:                   "RUNNING",
+		slmStats:                  make(map[string]int64),
+		watches:                   make(map[string]map[string]any),
+		watcherState:              "started",
+		transforms:                make(map[string]map[string]any),
+		danglingIndices:           make(map[string]map[string]any),
+		autoscalingPolicies:       make(map[string]map[string]any),
 	}
 	s.coalescer = newStreamLoadCoalescer(func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
 		err := s.backend.StreamLoad(ctx, table, ndjson, syncRefresh)
@@ -899,6 +919,10 @@ func (s *Server) Handler() http.Handler {
 					"license":  map[string]any{"type": "basic", "mode": "basic", "status": "active"},
 					"features": map[string]any{"security": map[string]any{"available": true, "enabled": true}},
 				})
+			case "_transform":
+				s.handleTransform(w, r)
+			case "_dangling":
+				s.handleDanglingIndices(w, r)
 			default:
 				r.SetPathValue("index", segs[0])
 				switch r.Method {
@@ -961,9 +985,32 @@ func (s *Server) Handler() http.Handler {
 			case segs[0] == "_ilm" && segs[1] == "explain":
 				s.handleILMExplain(w, r)
 			case segs[0] == "_ilm" && segs[1] == "status":
-				writeJSON(w, http.StatusOK, map[string]any{"operation_mode": "RUNNING"})
+				s.handleILMStatus(w, r)
+			case segs[0] == "_ilm" && segs[1] == "start":
+				s.handleILMStart(w, r)
+			case segs[0] == "_ilm" && segs[1] == "stop":
+				s.handleILMStop(w, r)
+			case segs[0] == "_slm" && segs[1] == "policy":
+				s.handleSLMPolicy(w, r)
+			case segs[0] == "_slm":
+				r.SetPathValue("action", segs[1])
+				s.handleSLMAction(w, r)
+			case segs[0] == "_watcher":
+				r.SetPathValue("action", segs[1])
+				s.handleWatcherRoot(w, r)
+			case segs[0] == "_transform":
+				r.SetPathValue("id", segs[1])
+				s.handleTransform(w, r)
+			case segs[0] == "_dangling":
+				r.SetPathValue("index_uuid", segs[1])
+				s.handleDanglingIndices(w, r)
+			case segs[0] == "_autoscaling":
+				r.SetPathValue("action", segs[1])
+				s.handleAutoscaling(w, r)
 			case segs[0] == "_data_stream" && segs[1] == "_stats":
 				s.handleDataStreamsStats(w, r)
+			case segs[0] == "_data_stream" && segs[1] == "_modify":
+				s.handleModifyDataStream(w, r)
 			case segs[0] == "_data_stream":
 				r.SetPathValue("name", segs[1])
 				s.handleDataStream(w, r)
@@ -1100,6 +1147,8 @@ func (s *Server) Handler() http.Handler {
 					s.handleIndexOpen(w, r)
 				case "_close":
 					s.handleIndexClose(w, r)
+				case "_downgrade":
+					s.handleIndexDowngrade(w, r)
 				case "_doc":
 					if r.Method == http.MethodPost {
 						s.handlePutDoc(w, r)
@@ -1193,6 +1242,44 @@ func (s *Server) Handler() http.Handler {
 				s.handleILMPolicy(w, r)
 				return
 			}
+			if segs[0] == "_ilm" && segs[1] == "move" {
+				r.SetPathValue("index", segs[2])
+				s.handleILMMoveToStep(w, r)
+				return
+			}
+			if segs[0] == "_slm" && segs[1] == "policy" {
+				r.SetPathValue("policy_id", segs[2])
+				s.handleSLMPolicy(w, r)
+				return
+			}
+			if segs[0] == "_watcher" && segs[1] == "watch" {
+				if segs[2] == "_execute" {
+					r.SetPathValue("action", "_execute")
+					s.handleWatcherWatchAction(w, r)
+					return
+				}
+				r.SetPathValue("id", segs[2])
+				s.handleWatcherWatch(w, r)
+				return
+			}
+			if segs[0] == "_watcher" && (segs[1] == "stats" || segs[1] == "_stats") {
+				r.SetPathValue("action", "stats")
+				r.SetPathValue("metric", segs[2])
+				s.handleWatcherRoot(w, r)
+				return
+			}
+			if segs[0] == "_transform" {
+				r.SetPathValue("id", segs[1])
+				r.SetPathValue("action", segs[2])
+				s.handleTransformAction(w, r)
+				return
+			}
+			if segs[0] == "_autoscaling" && segs[1] == "policy" {
+				r.SetPathValue("action", "policy")
+				r.SetPathValue("name", segs[2])
+				s.handleAutoscaling(w, r)
+				return
+			}
 			if segs[0] == "_search" && segs[1] == "scroll" {
 				r.SetPathValue("scroll_id", segs[2])
 				s.handleScroll(w, r)
@@ -1203,6 +1290,16 @@ func (s *Server) Handler() http.Handler {
 				s.handleResolveIndex(w, r)
 				return
 			}
+			if segs[0] == "_data_stream" && segs[1] == "_migrate" {
+				r.SetPathValue("name", segs[2])
+				s.handleMigrateToDataStream(w, r)
+				return
+			}
+			if segs[0] == "_data_stream" && segs[1] == "_promote" {
+				r.SetPathValue("name", segs[2])
+				s.handlePromoteDataStream(w, r)
+				return
+			}
 			if segs[0] == "_data_stream" && segs[2] == "_stats" {
 				r.SetPathValue("name", segs[1])
 				s.handleDataStreamsStats(w, r)
@@ -1211,6 +1308,14 @@ func (s *Server) Handler() http.Handler {
 			if segs[0] == "_data_stream" && segs[2] == "_rollover" {
 				r.SetPathValue("alias", segs[1])
 				s.handleRollover(w, r)
+				return
+			}
+			if segs[0] == "_ingest" && segs[1] == "processor" && segs[2] == "grok" {
+				s.handleIngestProcessorGrok(w, r)
+				return
+			}
+			if segs[0] == "_ingest" && segs[1] == "geoip" && segs[2] == "stats" {
+				s.handleIngestGeoIPStats(w, r)
 				return
 			}
 			if segs[0] == "_ingest" && segs[1] == "pipeline" {
@@ -1285,6 +1390,14 @@ func (s *Server) Handler() http.Handler {
 				s.handleILMExplain(w, r)
 				return
 			}
+			if segs[1] == "_ilm" && segs[2] == "remove" {
+				s.handleILMRemovePolicy(w, r)
+				return
+			}
+			if segs[1] == "_ilm" && segs[2] == "retry" {
+				s.handleILMRetry(w, r)
+				return
+			}
 			if segs[1] == "_doris" && segs[2] == "explain" {
 				s.handleDorisExplain(w, r)
 				return
@@ -1330,6 +1443,11 @@ func (s *Server) Handler() http.Handler {
 			}
 			if segs[1] == "_doc" && segs[2] == "_count" {
 				s.handleCount(w, r)
+				return
+			}
+			if segs[1] == "_block" {
+				r.SetPathValue("block", segs[2])
+				s.handleAddIndexBlock(w, r)
 				return
 			}
 			r.SetPathValue("id", segs[2])
@@ -1389,6 +1507,17 @@ func (s *Server) Handler() http.Handler {
 				s.handleSnapshotItemAction(w, r)
 				return
 			}
+			if segs[0] == "_slm" && segs[1] == "policy" && segs[3] == "_execute" {
+				r.SetPathValue("policy_id", segs[2])
+				s.handleSLMExecutePolicy(w, r)
+				return
+			}
+			if segs[0] == "_watcher" && segs[1] == "watch" {
+				r.SetPathValue("id", segs[2])
+				r.SetPathValue("action", segs[3])
+				s.handleWatcherWatchAction(w, r)
+				return
+			}
 			if segs[0] == "_cluster" && segs[1] == "state" {
 				s.handleClusterState(w, r)
 				return
@@ -1424,6 +1553,16 @@ func (s *Server) Handler() http.Handler {
 				r.SetPathValue("index", segs[0])
 				r.SetPathValue("id", segs[2])
 				s.handleTermVectors(w, r)
+				return
+			}
+			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+
+		case 5:
+			if segs[0] == "_watcher" && segs[1] == "watch" && segs[3] == "_ack" {
+				r.SetPathValue("id", segs[2])
+				r.SetPathValue("action", "_ack")
+				r.SetPathValue("action_id", segs[4])
+				s.handleWatcherWatchAction(w, r)
 				return
 			}
 			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
@@ -1465,6 +1604,10 @@ func (s *Server) handleRootHandshake(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleClusterHealth(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	s.mu.RLock()
 	numIndices := len(s.indices)
 	s.mu.RUnlock()
@@ -1839,6 +1982,19 @@ func (s *Server) handleIndexSettings(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			customFlat := extractCustomIndexSettings(settings)
+			isOnlyBlocksUpdate := !hasDef && !hasFin && len(customFlat) > 0
+			for k := range customFlat {
+				if !strings.HasPrefix(k, "blocks.") {
+					isOnlyBlocksUpdate = false
+					break
+				}
+			}
+			if !isOnlyBlocksUpdate {
+				if _, reason := s.findMetadataBlockedTargetIndex(validTargets, false); reason != "" {
+					writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+					return
+				}
+			}
 			for _, indexName := range validTargets {
 				s.mu.Lock()
 				if s.indexCustomSettings == nil {
@@ -1959,6 +2115,10 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 			s.handleNodesUsage(w, r)
 			return
 		}
+		if r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
@@ -2027,6 +2187,10 @@ func readRequestBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 }
 
 func (s *Server) handleClusterState(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	_ = s.syncCatalogFromBackend(r.Context())
 	s.mu.RLock()
 	indicesMeta := make(map[string]any, len(s.indices))
@@ -2072,7 +2236,11 @@ func (s *Server) handleClusterState(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleClusterStats(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleClusterStats(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	s.mu.RLock()
 	numIndices := len(s.indices)
 	s.mu.RUnlock()
@@ -2187,7 +2355,7 @@ func (s *Server) handleILMPolicy(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		w.WriteHeader(http.StatusOK)
-	default:
+	case http.MethodGet, "":
 		s.mu.RLock()
 		if policy != "" && policy != "_all" && policy != "*" {
 			if strings.ContainsAny(policy, "*?,") || strings.HasPrefix(policy, "-") {
@@ -2228,11 +2396,27 @@ func (s *Server) handleILMPolicy(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.RUnlock()
 		writeJSON(w, http.StatusOK, out)
+	default:
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 	}
 }
 
 func (s *Server) handleILMExplain(w http.ResponseWriter, r *http.Request) {
-	targets := s.resolveTargetIndices(r.PathValue("index"))
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	rawIndex := strings.TrimSpace(r.PathValue("index"))
+	var targets []string
+	if rawIndex != "" {
+		validTargets, _, ok := s.resolveValidatedReadTargets(w, r, rawIndex)
+		if !ok {
+			return
+		}
+		targets = validTargets
+	} else {
+		targets = s.resolveTargetIndices("")
+	}
 	indices := make(map[string]any, len(targets))
 	for _, idx := range targets {
 		indices[idx] = map[string]any{
@@ -2250,6 +2434,13 @@ func (s *Server) handleDataStream(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut, http.MethodPost:
 		if name == "" {
 			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: name is missing;")
+			return
+		}
+		if reason, ok := validateESIndexName(name); !ok || strings.HasPrefix(name, ".") {
+			if reason == "" {
+				reason = fmt.Sprintf("Invalid data stream name [%s], must not start with '.'", name)
+			}
+			writeESError(w, http.StatusBadRequest, "invalid_index_name_exception", reason)
 			return
 		}
 		s.mu.RLock()
@@ -2368,6 +2559,18 @@ func (s *Server) handleDataStream(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 	case http.MethodHead, http.MethodGet:
 		s.mu.RLock()
+		var missingConcrete string
+		if name != "" && name != "*" && name != "_all" {
+			for _, part := range strings.Split(name, ",") {
+				part = strings.TrimSpace(part)
+				if part == "" || strings.HasPrefix(part, "-") || strings.ContainsAny(part, "*?") || part == "_all" {
+					continue
+				}
+				if _, exists := s.dataStreams[part]; !exists && missingConcrete == "" {
+					missingConcrete = part
+				}
+			}
+		}
 		var list []any
 		var names []string
 		for k := range s.dataStreams {
@@ -2381,11 +2584,15 @@ func (s *Server) handleDataStream(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.RUnlock()
 		if r.Method == http.MethodHead {
-			if len(list) == 0 {
+			if missingConcrete != "" || len(list) == 0 {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
 			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if missingConcrete != "" {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "data_streams ["+missingConcrete+"] missing")
 			return
 		}
 		if name != "" && !strings.ContainsAny(name, "*?") && !strings.HasPrefix(name, "-") && name != "_all" && len(list) == 0 {
@@ -2402,6 +2609,10 @@ func (s *Server) handleDataStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCatIndices(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	var names []string
 	if pat := r.PathValue("index"); pat != "" {
 		names = s.resolveTargetIndices(pat)
@@ -2438,6 +2649,10 @@ func (s *Server) handleCatIndices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCatAliases(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	_ = s.syncCatalogFromBackend(r.Context())
 	namePattern := r.PathValue("name")
 	s.mu.RLock()
@@ -2496,6 +2711,10 @@ func (s *Server) handleCatAliases(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCatRoot(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	endpoints := []string{
 		"/_cat/allocation",
 		"/_cat/shards",
@@ -2998,6 +3217,9 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var tpl esast.IndexTemplateRequest
+		var verHolder struct {
+			Version *int `json:"version"`
+		}
 		bodyBytes, ok := readRequestBody(w, r)
 		if !ok {
 			return
@@ -3007,6 +3229,7 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 				writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 				return
 			}
+			_ = json.Unmarshal(bodyBytes, &verHolder)
 		}
 		if len(tpl.EffectivePatterns()) == 0 {
 			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: index_patterns is missing;")
@@ -3034,6 +3257,11 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 		s.mu.RUnlock()
 		s.mu.Lock()
 		s.templates[name] = tpl
+		if verHolder.Version != nil {
+			s.templateVersions[name] = *verHolder.Version
+		} else {
+			delete(s.templateVersions, name)
+		}
 		s.mu.Unlock()
 		s.persistTemplate(r.Context(), name, tpl)
 		s.queryCache.InvalidateAll()
@@ -3139,6 +3367,7 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, k := range toDelete {
 			delete(s.templates, k)
+			delete(s.templateVersions, k)
 		}
 		s.mu.Unlock()
 		if len(toDelete) == 0 {
@@ -3437,7 +3666,7 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 	_ = s.syncCatalogFromBackend(r.Context())
 	s.mu.RLock()
 	oldSchema := s.indices[indexName]
-	hasAliasCollision := s.dataStreams[indexName] != nil || (oldSchema == nil && len(s.aliases[indexName]) > 0)
+	hasAliasCollision := s.dataStreams[indexName] != nil || len(s.aliases[indexName]) > 0
 	var collidingAlias string
 	for alias := range req.Aliases {
 		if alias == indexName || s.indices[alias] != nil || s.dataStreams[alias] != nil {
@@ -3480,6 +3709,10 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	effectiveMappings := schema.MergeMappingSpecs(tplMappings, req.Mappings)
+	if err := validateAliasFieldsInMapping(effectiveMappings); err != nil {
+		writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+		return
+	}
 	compiled := schema.CompileIndexSchema(s.dorisDB, indexName, effectiveMappings)
 	ddl := schema.GenerateCreateTableDDL(compiled)
 	if err := s.backend.ExecDDL(r.Context(), ddl); err != nil {
@@ -3778,6 +4011,10 @@ func (s *Server) handleDeleteIndex(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
 		return
 	}
+	if _, reason := s.findMetadataBlockedTargetIndex(targets, true); reason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
 
 	modifiedAliases := make(map[string][]string)
 	var tablesToDrop []*schema.IndexSchema
@@ -4036,6 +4273,10 @@ func (s *Server) handlePutMapping(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusNotFound, "index_not_found_exception", fmt.Sprintf("no such index [%s]", missingName))
 		return
 	}
+	if _, reason := s.findMetadataBlockedTargetIndex(validTargets, false); reason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
 
 	// Validate mapping compatibility on all target indices before mutating any index.
 	s.mu.RLock()
@@ -4048,6 +4289,12 @@ func (s *Server) handlePutMapping(w http.ResponseWriter, r *http.Request) {
 		if err := schema.ValidateMappingUpdateCompatibility(oldRaw, &spec); err != nil {
 			s.mu.RUnlock()
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+			return
+		}
+		mergedPreview := schema.MergeMappingSpecs(oldRaw, &spec)
+		if err := validateAliasFieldsInMapping(mergedPreview); err != nil {
+			s.mu.RUnlock()
+			writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 			return
 		}
 	}
@@ -4196,6 +4443,32 @@ func (s *Server) handleGetIndexAliases(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleIndexAliasByName(w http.ResponseWriter, r *http.Request) {
 	_ = s.syncCatalogFromBackend(r.Context())
 	rawIndex := r.PathValue("index")
+	if rawIndex != "" && rawIndex != "*" && rawIndex != "_all" {
+		ignoreUnavail := (r.Method == http.MethodGet || r.Method == http.MethodHead) && isTruthyBoolQueryParam(r, "ignore_unavailable")
+		if !ignoreUnavail {
+			s.mu.RLock()
+			var missingPart string
+			for _, part := range strings.Split(rawIndex, ",") {
+				part = strings.TrimSpace(part)
+				if part == "" || strings.HasPrefix(part, "-") || strings.ContainsAny(part, "*?") || part == "_all" {
+					continue
+				}
+				if s.indices[part] == nil && len(s.aliases[part]) == 0 && s.dataStreams[part] == nil {
+					missingPart = part
+					break
+				}
+			}
+			s.mu.RUnlock()
+			if missingPart != "" {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+missingPart+"]")
+				return
+			}
+		}
+	}
 	targetIndices := s.resolveTargetIndices(rawIndex)
 	if len(targetIndices) == 0 {
 		targetIndices = []string{s.resolveIndexName(rawIndex)}
@@ -4225,6 +4498,13 @@ func (s *Server) handleIndexAliasByName(w http.ResponseWriter, r *http.Request) 
 			s.mu.Unlock()
 			writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
 			return
+		}
+		for _, indexName := range existingTargets {
+			if blocked, reason := s.isIndexMetadataBlockedLocked(indexName, false); blocked {
+				s.mu.Unlock()
+				writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+				return
+			}
 		}
 		if _, exists := s.indices[aliasName]; exists {
 			s.mu.Unlock()
@@ -4257,6 +4537,13 @@ func (s *Server) handleIndexAliasByName(w http.ResponseWriter, r *http.Request) 
 			s.mu.Unlock()
 			writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
 			return
+		}
+		for _, indexName := range existingTargets {
+			if blocked, reason := s.isIndexMetadataBlockedLocked(indexName, false); blocked {
+				s.mu.Unlock()
+				writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+				return
+			}
 		}
 		removedAny := false
 		aliasHasAnyTargetLocked := func(al string, idxs []string) bool {
@@ -4358,6 +4645,10 @@ func (s *Server) handleIndexAliasByName(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodPost {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
 		return
@@ -4504,6 +4795,13 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 				writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+strings.Join(rawIndices, ",")+"]")
 				return
 			}
+			for _, idx := range indices {
+				if blocked, reason := s.isIndexMetadataBlockedLocked(idx, false); blocked {
+					s.mu.Unlock()
+					writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+					return
+				}
+			}
 			for _, al := range rawAliases {
 				if simulatedIndices[al] {
 					s.mu.Unlock()
@@ -4559,13 +4857,31 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			indices := expandIndexListLocked(rawIndices)
+			for _, idx := range indices {
+				if blocked, reason := s.isIndexMetadataBlockedLocked(idx, false); blocked {
+					s.mu.Unlock()
+					writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+					return
+				}
+			}
 			for _, al := range rawAliases {
 				al = strings.TrimSpace(al)
-				if al == "" || strings.ContainsAny(al, "*?") || al == "_all" {
+				if al == "" {
 					continue
 				}
 				foundOnTarget := false
-				if idxMap := simulatedAliases[al]; idxMap != nil {
+				if strings.ContainsAny(al, "*?") || al == "_all" {
+					for simAl, idxMap := range simulatedAliases {
+						if al == "_all" || al == "*" || matchWildcardPattern(al, simAl) {
+							for _, idx := range indices {
+								if idxMap[idx] {
+									foundOnTarget = true
+									delete(idxMap, idx)
+								}
+							}
+						}
+					}
+				} else if idxMap := simulatedAliases[al]; idxMap != nil {
 					for _, idx := range indices {
 						if idxMap[idx] {
 							foundOnTarget = true
@@ -4599,6 +4915,11 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			for _, indexName := range expandIndexListLocked(rawIndices) {
+				if blocked, reason := s.isIndexMetadataBlockedLocked(indexName, true); blocked {
+					s.mu.Unlock()
+					writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+					return
+				}
 				delete(simulatedIndices, indexName)
 				for _, idxMap := range simulatedAliases {
 					delete(idxMap, indexName)
@@ -4986,6 +5307,10 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", indexName))
 		return
 	}
+	if blocked, reason := s.isIndexWriteBlocked(indexName); blocked {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
 	ifSeqNo, ifPrimaryTerm, reqVer, verType, occParseErr := parseOCCParamsFromRequest(r)
 	if occParseErr != "" {
 		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", occParseErr)
@@ -4993,6 +5318,10 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 	}
 	docID := r.PathValue("id")
 	isCreate := strings.Contains(r.URL.Path, "/_create/") || strings.EqualFold(r.URL.Query().Get("op_type"), "create")
+	if s.isDataStream(rawReqIndex) && !isCreate && docID != "" {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "only write ops with an op_type of create are allowed in data streams")
+		return
+	}
 	rawDoc, ok := readRequestBody(w, r)
 	if !ok {
 		return
@@ -5043,6 +5372,14 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		indexName = resolvedIdx
 		aliasFilter = resolvedFilter
 		effRawIndex = nextIndex
+		if s.isIndexClosed(indexName) {
+			writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", indexName))
+			return
+		}
+		if blocked, reason := s.isIndexWriteBlocked(indexName); blocked {
+			writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+			return
+		}
 	}
 	effRouting := s.resolveEffectiveWriteRouting(effRawIndex, indexName, "", pipeRouting)
 
@@ -5154,6 +5491,14 @@ func (s *Server) handleHeadDoc(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	if s.isIndexClosed(indexName) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if blocked, _ := s.isIndexReadBlocked(indexName); blocked {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
 	docID := r.PathValue("id")
 	if status, _, _ := validateReadDocVersionParams(r.URL.Query().Get("version"), r.URL.Query().Get("version_type"), docID, false, 0); status != 0 {
 		w.WriteHeader(status)
@@ -5189,6 +5534,22 @@ func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", readErr.Error())
+		return
+	}
+	if s.isIndexClosed(indexName) {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", indexName))
+		return
+	}
+	if blocked, reason := s.isIndexReadBlocked(indexName); blocked {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
 		return
 	}
 	docID := r.PathValue("id")
@@ -5270,6 +5631,14 @@ func (s *Server) handleGetDoc(w http.ResponseWriter, r *http.Request) {
 	indexName, aliasFilter, readErr := s.resolveReadDocIndexWithFilter(rawReqIndex)
 	if readErr != nil {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", readErr.Error())
+		return
+	}
+	if s.isIndexClosed(indexName) {
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", indexName))
+		return
+	}
+	if blocked, reason := s.isIndexReadBlocked(indexName); blocked {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
 		return
 	}
 	docID := r.PathValue("id")
@@ -5501,6 +5870,39 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 			})
 			continue
 		}
+		if s.isIndexClosed(idxName) {
+			errReason := fmt.Sprintf("closed [%s]", idxName)
+			docsOut = append(docsOut, map[string]any{
+				"_index": idxName,
+				"_type":  "_doc",
+				"_id":    spec.ID,
+				"error": map[string]any{
+					"root_cause": []map[string]any{
+						{"type": "index_closed_exception", "reason": errReason, "index": idxName},
+					},
+					"type":   "index_closed_exception",
+					"reason": errReason,
+					"index":  idxName,
+				},
+			})
+			continue
+		}
+		if blocked, blockReason := s.isIndexReadBlocked(idxName); blocked {
+			docsOut = append(docsOut, map[string]any{
+				"_index": idxName,
+				"_type":  "_doc",
+				"_id":    spec.ID,
+				"error": map[string]any{
+					"root_cause": []map[string]any{
+						{"type": "cluster_block_exception", "reason": blockReason, "index": idxName},
+					},
+					"type":   "cluster_block_exception",
+					"reason": blockReason,
+					"index":  idxName,
+				},
+			})
+			continue
+		}
 		specRouting := strings.TrimSpace(spec.Routing)
 		if specRouting == "" {
 			specRouting = strings.TrimSpace(spec.MetaRouting)
@@ -5635,6 +6037,10 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", indexName))
 		return
 	}
+	if blocked, reason := s.isIndexWriteBlocked(indexName); blocked {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
 	ifSeqNo, ifPrimaryTerm, reqVer, verType, occParseErr := parseOCCParamsFromRequest(r)
 	if occParseErr != "" {
 		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", occParseErr)
@@ -5739,6 +6145,16 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, delResp)
 }
 
+func updateScriptErrorType(err error) string {
+	if err != nil {
+		msg := err.Error()
+		if strings.Contains(msg, "illegal_argument_exception") || (strings.Contains(msg, "Operation [") && strings.Contains(msg, "is not supported")) {
+			return "illegal_argument_exception"
+		}
+	}
+	return "script_exception"
+}
+
 func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	rawReqIndex := r.PathValue("index")
 	if isTruthyBoolQueryParam(r, "require_alias") && !s.isTargetAliasOrDataStream(rawReqIndex) {
@@ -5752,6 +6168,10 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.isIndexClosed(indexName) {
 		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", indexName))
+		return
+	}
+	if blocked, reason := s.isIndexWriteBlocked(indexName); blocked {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
 		return
 	}
 	ifSeqNo, ifPrimaryTerm, reqVer, verType, occParseErr := parseOCCParamsFromRequest(r)
@@ -5870,7 +6290,7 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	}
 	mutatedSource, opResult, err := painless.ApplyUpdateWithResult(baseSource, &updReq, found)
 	if err != nil {
-		writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
+		writeESError(w, http.StatusBadRequest, updateScriptErrorType(err), err.Error())
 		return
 	}
 	if !found && opResult == "deleted" {
@@ -6214,6 +6634,24 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 	if len(targets) == 0 && !hasExclusionOrWildcard(rawIndex) {
 		targets = []string{s.resolveIndexName(rawIndex)}
 	}
+	if closedIdx := s.findClosedTargetIndex(r, rawIndex); closedIdx != "" {
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
+		return
+	}
+	for _, idx := range targets {
+		if s.isIndexClosed(idx) {
+			writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", idx))
+			return
+		}
+	}
+	if _, reason := s.findReadBlockedTargetIndex(r, rawIndex); reason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
+	if _, reason := s.findWriteBlockedTargetIndex(targets); reason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
 
 	var body struct {
 		MaxDocs           *int                 `json:"max_docs,omitempty"`
@@ -6418,6 +6856,8 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 						rawMap = make(map[string]any)
 					}
 					rawMap["__meta_id"] = h.ID
+					rawMap["__meta_index"] = indexName
+					rawMap["__meta_version"] = h.Version
 					if !evalQueryScriptFilterOnDocWithScore(idxSchema, rawMap, effQuery, h.Score) {
 						continue
 					}
@@ -6436,7 +6876,7 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 				}
 				mutated, opRes, err := painless.ApplyUpdateWithResult(h.Source, updItem, true)
 				if err != nil {
-					writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
+					writeESError(w, http.StatusBadRequest, updateScriptErrorType(err), err.Error())
 					return
 				}
 				if opRes == "created" {
@@ -6722,6 +7162,24 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 	if len(targets) == 0 && !hasExclusionOrWildcard(rawIndex) {
 		targets = []string{s.resolveIndexName(rawIndex)}
 	}
+	if closedIdx := s.findClosedTargetIndex(r, rawIndex); closedIdx != "" {
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
+		return
+	}
+	for _, idx := range targets {
+		if s.isIndexClosed(idx) {
+			writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", idx))
+			return
+		}
+	}
+	if _, reason := s.findReadBlockedTargetIndex(r, rawIndex); reason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
+	if _, reason := s.findWriteBlockedTargetIndex(targets); reason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
 
 	var body struct {
 		MaxDocs           *int         `json:"max_docs,omitempty"`
@@ -6894,6 +7352,8 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 						rawMap = make(map[string]any)
 					}
 					rawMap["__meta_id"] = h.ID
+					rawMap["__meta_index"] = indexName
+					rawMap["__meta_version"] = h.Version
 					if !evalQueryScriptFilterOnDocWithScore(idxSchema, rawMap, effQuery, h.Score) {
 						continue
 					}
@@ -7004,6 +7464,12 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		idxName, _, writeErr := s.resolveWriteIndexWithFilter(op.Index)
 		if writeErr != nil {
 			op.ParseErr = writeErr.Error()
+			continue
+		}
+		if s.isIndexClosed(idxName) {
+			continue
+		}
+		if blocked, _ := s.isIndexWriteBlocked(idxName); blocked {
 			continue
 		}
 		if (op.Action == "index" || op.Action == "create") && len(op.Source) > 0 {
@@ -7169,6 +7635,37 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		targetIndex, opAliasFilter, writeErr := s.resolveWriteIndexWithFilter(op.Index)
 		if writeErr != nil {
 			targetIndex = op.Index
+		} else {
+			if s.isIndexClosed(targetIndex) {
+				hasErrors = true
+				items = append(items, map[string]any{
+					op.Action: map[string]any{
+						"_index": targetIndex,
+						"_id":    op.ID,
+						"status": http.StatusBadRequest,
+						"error": map[string]any{
+							"type":   "index_closed_exception",
+							"reason": fmt.Sprintf("closed [%s]", targetIndex),
+						},
+					},
+				})
+				continue
+			}
+			if blocked, reason := s.isIndexWriteBlocked(targetIndex); blocked {
+				hasErrors = true
+				items = append(items, map[string]any{
+					op.Action: map[string]any{
+						"_index": targetIndex,
+						"_id":    op.ID,
+						"status": http.StatusForbidden,
+						"error": map[string]any{
+							"type":   "cluster_block_exception",
+							"reason": reason,
+						},
+					},
+				})
+				continue
+			}
 		}
 		reqRouting := op.Routing
 		if reqRouting == "" {
@@ -7513,7 +8010,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 						"_index": targetIndex,
 						"_id":    op.ID,
 						"status": http.StatusBadRequest,
-						"error":  map[string]any{"type": "script_exception", "reason": err.Error()},
+						"error":  map[string]any{"type": updateScriptErrorType(err), "reason": err.Error()},
 					},
 				})
 				continue
@@ -8008,6 +8505,10 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
 		return
 	}
+	if _, blockReason := s.findReadBlockedTargetIndex(r, rawIndex); blockReason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", blockReason)
+		return
+	}
 	resp, status, errType, errReason := s.executeSearchRequest(r.Context(), rawIndex, &req)
 	if errType != "" {
 		writeESError(w, status, errType, errReason)
@@ -8481,8 +8982,18 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		var bodyLine []byte
-		if scanner.Scan() {
-			bodyLine = append([]byte(nil), bytes.TrimSpace(scanner.Bytes())...)
+		hasBodyLine := false
+		for scanner.Scan() {
+			trimmed := bytes.TrimSpace(scanner.Bytes())
+			if len(trimmed) > 0 {
+				bodyLine = append([]byte(nil), trimmed...)
+				hasBodyLine = true
+				break
+			}
+		}
+		if !hasBodyLine {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: no requests added;")
+			return
 		}
 
 		var hdr struct {
@@ -8558,6 +9069,20 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 		}
 
 		targetIdx = extractPITIndex(targetIdx, req.PIT)
+		if closedIdx := s.findClosedTargetIndex(r, targetIdx); closedIdx != "" {
+			responses = append(responses, map[string]any{
+				"status": http.StatusBadRequest,
+				"error":  map[string]any{"type": "index_closed_exception", "reason": fmt.Sprintf("closed [%s]", closedIdx)},
+			})
+			continue
+		}
+		if _, blockReason := s.findReadBlockedTargetIndex(r, targetIdx); blockReason != "" {
+			responses = append(responses, map[string]any{
+				"status": http.StatusForbidden,
+				"error":  map[string]any{"type": "cluster_block_exception", "reason": blockReason},
+			})
+			continue
+		}
 		resp, status, errType, errReason := s.executeSearchRequest(r.Context(), targetIdx, &req)
 		if errType != "" {
 			responses = append(responses, map[string]any{
@@ -10593,12 +11118,29 @@ func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, totalQueryHits int64
 }
 
 func (s *Server) handleCount(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	var req esast.SearchRequest
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
 		return
 	}
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		var rawTop map[string]json.RawMessage
+		if err := json.Unmarshal(bodyBytes, &rawTop); err != nil {
+			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+			return
+		}
+		for k := range rawTop {
+			switch k {
+			case "query", "pit", "runtime_mappings":
+			default:
+				writeESError(w, http.StatusBadRequest, "parsing_exception", fmt.Sprintf("Unknown key for a START_OBJECT in [count]: [%s].", k))
+				return
+			}
+		}
 		if err := json.Unmarshal(bodyBytes, &req); err != nil {
 			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
 			return
@@ -10611,6 +11153,10 @@ func (s *Server) handleCount(w http.ResponseWriter, r *http.Request) {
 
 	if closedIdx := s.findClosedTargetIndex(r, r.PathValue("index")); closedIdx != "" {
 		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
+		return
+	}
+	if _, blockReason := s.findReadBlockedTargetIndex(r, r.PathValue("index")); blockReason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", blockReason)
 		return
 	}
 	resp, status, errType, errReason := s.executeSearchRequest(r.Context(), r.PathValue("index"), &req)
@@ -16593,6 +17139,105 @@ func toFloat64(v any) (float64, bool) {
 	return 0, false
 }
 
+func extractBucketMetricMapByPath(b map[string]any, metricPath string) (map[string]any, bool) {
+	segs := normalizeBucketsPath(metricPath)
+	if b == nil || len(segs) == 0 {
+		return nil, false
+	}
+	cur := b
+	for i, seg := range segs {
+		subMap, ok := cur[seg].(map[string]any)
+		if !ok {
+			if rawBuckets, okB := cur["buckets"].(map[string]any); okB {
+				if kb, okKB := lookupKeyedBucketMap(rawBuckets, seg); okKB {
+					subMap = kb
+					ok = true
+				}
+			} else if rawSlice, okS := cur["buckets"].([]map[string]any); okS {
+				for _, sb := range rawSlice {
+					if fmt.Sprintf("%v", sb["key"]) == seg || (sb["key_as_string"] != nil && fmt.Sprintf("%v", sb["key_as_string"]) == seg) {
+						subMap = sb
+						ok = true
+						break
+					}
+				}
+			}
+		}
+		if !ok {
+			return nil, false
+		}
+		if i < len(segs)-1 {
+			cur = subMap
+			continue
+		}
+		if isRuntimeBucketContainer(subMap) {
+			return nil, false
+		}
+		if val, hasVal := subMap["value"]; hasVal {
+			if _, isValMap := val.(map[string]any); !isValMap {
+				return nil, false
+			}
+		}
+		if cnt, hasCnt := toFloat64(subMap["count"]); hasCnt && cnt == 0 {
+			if _, hasAvg := subMap["avg"]; hasAvg && subMap["avg"] == nil {
+				return nil, false
+			}
+		}
+		if dc, hasDC := toFloat64(b["doc_count"]); hasDC && dc == 0 {
+			if _, hasVals := subMap["values"]; hasVals {
+				return nil, false
+			}
+		}
+		out := make(map[string]any, len(subMap)+4)
+		for mk, mv := range subMap {
+			out[mk] = mv
+		}
+		if valMap, okVM := subMap["value"].(map[string]any); okVM {
+			for mk, mv := range valMap {
+				out[mk] = mv
+			}
+		}
+		if valsF, okVF := subMap["values"].(map[string]float64); okVF {
+			valsAny := make(map[string]any, len(valsF))
+			for vk, vv := range valsF {
+				valsAny[vk] = vv
+				out[vk] = vv
+				if strings.HasSuffix(vk, ".0") {
+					out[strings.TrimSuffix(vk, ".0")] = vv
+				}
+			}
+			out["values"] = valsAny
+		} else if valsAny, okVA := subMap["values"].(map[string]any); okVA {
+			for vk, vv := range valsAny {
+				out[vk] = vv
+				if strings.HasSuffix(vk, ".0") {
+					out[strings.TrimSuffix(vk, ".0")] = vv
+				}
+			}
+		}
+		return out, true
+	}
+	return nil, false
+}
+
+func bindNestedPainlessParam(params map[string]any, key string, val any) {
+	params[key] = val
+	if !strings.Contains(key, ".") {
+		return
+	}
+	parts := strings.Split(key, ".")
+	cur := params
+	for i := 0; i < len(parts)-1; i++ {
+		sub, ok := cur[parts[i]].(map[string]any)
+		if !ok {
+			sub = make(map[string]any)
+			cur[parts[i]] = sub
+		}
+		cur = sub
+	}
+	cur[parts[len(parts)-1]] = val
+}
+
 func evalBucketScript(b map[string]any, spec *esast.BucketSelectorAggSpec) (float64, bool) {
 	if spec == nil {
 		return 0, false
@@ -16603,6 +17248,7 @@ func evalBucketScript(b map[string]any, spec *esast.BucketSelectorAggSpec) (floa
 	}
 	insertZeros := strings.EqualFold(spec.GapPolicy, "insert_zeros")
 	vars := make(map[string]float64, len(spec.BucketsPath)+len(scriptParams))
+	mapVars := make(map[string]map[string]any)
 	for k, v := range scriptParams {
 		if fv, ok := toFloat64(v); ok {
 			vars[k] = fv
@@ -16611,6 +17257,15 @@ func evalBucketScript(b map[string]any, spec *esast.BucketSelectorAggSpec) (floa
 	for k, v := range spec.BucketsPath {
 		val, ok := extractBucketMetricByPath(b, v)
 		if !ok {
+			if mVal, okMap := extractBucketMetricMapByPath(b, v); okMap {
+				mapVars[k] = mVal
+				for mk, mv := range mVal {
+					if fv, okF := toFloat64(mv); okF {
+						vars[k+"."+mk] = fv
+					}
+				}
+				continue
+			}
 			if insertZeros {
 				val = 0
 			} else {
@@ -16627,12 +17282,15 @@ func evalBucketScript(b map[string]any, spec *esast.BucketSelectorAggSpec) (floa
 			return fv, true
 		}
 	}
-	painlessParams := make(map[string]any, len(vars)+len(scriptParams))
+	painlessParams := make(map[string]any, len(vars)+len(scriptParams)+len(mapVars))
 	for k, v := range scriptParams {
-		painlessParams[k] = v
+		bindNestedPainlessParam(painlessParams, k, v)
+	}
+	for k, mVal := range mapVars {
+		bindNestedPainlessParam(painlessParams, k, mVal)
 	}
 	for k, v := range vars {
-		painlessParams[k] = v
+		bindNestedPainlessParam(painlessParams, k, v)
 	}
 	if res, err := painless.Eval(map[string]any{}, src, painlessParams); err == nil && res != nil {
 		return toFloat64(res)
@@ -16672,6 +17330,7 @@ func evalBucketSelector(b map[string]any, spec *esast.BucketSelectorAggSpec) boo
 	}
 	insertZeros := strings.EqualFold(spec.GapPolicy, "insert_zeros")
 	vars := make(map[string]float64, len(spec.BucketsPath)+len(scriptParams))
+	mapVars := make(map[string]map[string]any)
 	for k, v := range scriptParams {
 		if fv, ok := toFloat64(v); ok {
 			vars[k] = fv
@@ -16680,6 +17339,15 @@ func evalBucketSelector(b map[string]any, spec *esast.BucketSelectorAggSpec) boo
 	for k, v := range spec.BucketsPath {
 		val, ok := extractBucketMetricByPath(b, v)
 		if !ok {
+			if mVal, okMap := extractBucketMetricMapByPath(b, v); okMap {
+				mapVars[k] = mVal
+				for mk, mv := range mVal {
+					if fv, okF := toFloat64(mv); okF {
+						vars[k+"."+mk] = fv
+					}
+				}
+				continue
+			}
 			if insertZeros {
 				val = 0
 			} else {
@@ -16688,27 +17356,23 @@ func evalBucketSelector(b map[string]any, spec *esast.BucketSelectorAggSpec) boo
 		}
 		vars[k] = val
 	}
+	painlessParams := make(map[string]any, len(vars)+len(scriptParams)+len(mapVars))
+	for k, v := range scriptParams {
+		bindNestedPainlessParam(painlessParams, k, v)
+	}
+	for k, mVal := range mapVars {
+		bindNestedPainlessParam(painlessParams, k, mVal)
+	}
+	for k, v := range vars {
+		bindNestedPainlessParam(painlessParams, k, v)
+	}
 	if strings.ContainsAny(src, ";{") || strings.Contains(src, "def ") || strings.Contains(src, "return ") || strings.Contains(src, "Math.") {
-		painlessParams := make(map[string]any, len(vars)+len(scriptParams))
-		for k, v := range scriptParams {
-			painlessParams[k] = v
-		}
-		for k, v := range vars {
-			painlessParams[k] = v
-		}
 		if ok, err := painless.EvalFilter(map[string]any{}, src, painlessParams); err == nil {
 			return ok
 		}
 	}
 	if res, ok := evalBucketSelectorExpr(src, vars); ok {
 		return res
-	}
-	painlessParams := make(map[string]any, len(vars)+len(scriptParams))
-	for k, v := range scriptParams {
-		painlessParams[k] = v
-	}
-	for k, v := range vars {
-		painlessParams[k] = v
 	}
 	if ok, err := painless.EvalFilter(map[string]any{}, src, painlessParams); err == nil {
 		return ok
@@ -16994,11 +17658,31 @@ func evalBucketArithmeticExprDepth(expr string, vars map[string]float64, depth i
 	if f, ok := parseFiniteFloat(expr); ok {
 		return f, true
 	}
-	varKey := strings.TrimPrefix(expr, "params.")
+	varKey := normalizeBucketParamRef(expr)
 	if v, exists := vars[varKey]; exists {
 		return v, true
 	}
 	return 0, false
+}
+
+func normalizeBucketParamRef(expr string) string {
+	s := strings.TrimSpace(expr)
+	for strings.Contains(s, "[") {
+		openIdx := strings.IndexByte(s, '[')
+		closeIdx := strings.IndexByte(s[openIdx:], ']')
+		if closeIdx <= 0 {
+			break
+		}
+		closeIdx += openIdx
+		inner := strings.TrimSpace(s[openIdx+1 : closeIdx])
+		inner = strings.Trim(inner, "'\"")
+		prefix := s[:openIdx]
+		if prefix != "" && !strings.HasSuffix(prefix, ".") {
+			prefix += "."
+		}
+		s = prefix + inner + s[closeIdx+1:]
+	}
+	return strings.TrimPrefix(s, "params.")
 }
 
 func parseFiniteFloat(s string) (float64, bool) {

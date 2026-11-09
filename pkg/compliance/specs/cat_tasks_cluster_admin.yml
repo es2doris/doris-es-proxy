@@ -316,3 +316,119 @@
       snapshot.delete_repository:
         repository: "repo_spec_fs"
   - match: { acknowledged: true }
+
+---
+"Data stream migration ILM lifecycle status and cat templates version":
+  - do:
+      indices.create:
+        index: "mig_backing_000001"
+  - match: { acknowledged: true }
+
+  - do:
+      indices.update_aliases:
+        body:
+          actions:
+            - add:
+                index: "mig_backing_000001"
+                alias: "mig_logs_stream"
+                is_write_index: true
+  - match: { acknowledged: true }
+
+  - do:
+      indices.migrate_to_data_stream:
+        name: "mig_logs_stream"
+  - match: { acknowledged: true }
+
+  - do:
+      indices.get_data_stream:
+        name: "mig_logs_stream"
+  - length: { data_streams: 1 }
+  - match: { data_streams.0.name: "mig_logs_stream" }
+
+  - do:
+      catch: missing
+      indices.get_data_stream:
+        name: "non_existent_data_stream_xyz"
+
+  - do:
+      ilm.get_status: {}
+  - match: { operation_mode: "RUNNING" }
+
+  - do:
+      ilm.stop: {}
+  - match: { acknowledged: true }
+
+  - do:
+      ilm.get_status: {}
+  - match: { operation_mode: "STOPPED" }
+
+  - do:
+      ilm.start: {}
+  - match: { acknowledged: true }
+
+  - do:
+      ilm.get_status: {}
+  - match: { operation_mode: "RUNNING" }
+
+  - do:
+      ilm.move_to_step:
+        index: "mig_backing_000001"
+        body:
+          current_step:
+            phase: "new"
+            action: "complete"
+            name: "complete"
+          next_step:
+            phase: "hot"
+            action: "complete"
+            name: "complete"
+  - match: { acknowledged: true }
+
+  - do:
+      ilm.remove_policy:
+        index: "mig_backing_000001"
+  - match: { has_failures: false }
+
+  - do:
+      ilm.retry:
+        index: "mig_backing_000001"
+  - match: { acknowledged: true }
+
+  - do:
+      catch: missing
+      ilm.explain_lifecycle:
+        index: "no_such_ilm_index_xyz"
+
+  - do:
+      indices.put_index_template:
+        name: "it_cat_ver_spec"
+        body:
+          index_patterns: ["ver-spec-*"]
+          version: 7
+          template:
+            mappings:
+              properties:
+                host:
+                  type: "keyword"
+  - match: { acknowledged: true }
+
+  - do:
+      cat.templates:
+        name: "it_cat_ver_spec"
+        format: "json"
+  - length: { $body: 1 }
+  - match: { 0.name: "it_cat_ver_spec" }
+  - match: { 0.version: "7" }
+
+  - do:
+      catch: bad_request
+      tasks.get:
+        task_id: "malformed_task_id"
+
+  - do:
+      catch: missing
+      cluster.allocation_explain:
+        body:
+          index: "no_such_alloc_idx_xyz"
+          shard: 0
+          primary: true
