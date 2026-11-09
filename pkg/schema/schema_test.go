@@ -2183,3 +2183,116 @@ func TestRound51SchemaAliasAndShredderF15F16(t *testing.T) {
 		t.Fatalf("F16 expected enabled:false subtree to bypass strict/subobjects validation, got %v", err)
 	}
 }
+
+func TestRound52SchemaAndShredderF15ToF17(t *testing.T) {
+	// F15: scaled_float requires scaling_factor > 0; constant_keyword rejects non-scalar value
+	for _, badMapping := range []string{
+		`{"properties":{"price":{"type":"scaled_float"}}}`,
+		`{"properties":{"price":{"type":"scaled_float","scaling_factor":0}}}`,
+		`{"properties":{"price":{"type":"scaled_float","scaling_factor":-10}}}`,
+		`{"properties":{"env":{"type":"constant_keyword","value":{"nested":"bad"}}}}`,
+		`{"properties":{"env":{"type":"constant_keyword","value":["a","b"]}}}`,
+	} {
+		var ms esast.MappingSpec
+		if err := json.Unmarshal([]byte(badMapping), &ms); err != nil {
+			t.Fatalf("unmarshal mapping %s failed: %v", badMapping, err)
+		}
+		if err := ValidateMappingSpec(&ms); err == nil {
+			t.Fatalf("F15 expected ValidateMappingSpec error for %s", badMapping)
+		}
+	}
+
+	// F15: constant_keyword inside nested objects populated & validated by ShredDocument
+	var ckNestedSpec esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{
+		"properties": {
+			"items": {
+				"type": "nested",
+				"properties": {
+					"env": {"type": "constant_keyword", "value": "prod"},
+					"name": {"type": "keyword"}
+				}
+			}
+		}
+	}`), &ckNestedSpec)
+	if err := ValidateMappingSpec(&ckNestedSpec); err != nil {
+		t.Fatalf("F15 valid nested constant_keyword mapping failed: %v", err)
+	}
+	ckSchema := CompileIndexSchema("db", "ck_nested_idx", &ckNestedSpec)
+	rowCK, err := ShredDocument(ckSchema, "1", 1, false, []byte(`{"items":[{"name":"a"},{"name":"b","env":"prod"}]}`))
+	if err != nil {
+		t.Fatalf("F15 ShredDocument nested constant_keyword failed: %v", err)
+	}
+	if !strings.Contains(string(rowCK), `"n__items__env":["prod"]`) || !strings.Contains(string(rowCK), `\"env\":\"prod\"`) {
+		t.Fatalf("F15 expected n__items__env = ['prod'] and nested env = 'prod', got %s", string(rowCK))
+	}
+	if _, err := ShredDocument(ckSchema, "2", 1, false, []byte(`{"items":[{"name":"a","env":"staging"}]}`)); err == nil {
+		t.Fatalf("F15 expected ShredDocument to reject mismatched nested constant_keyword value")
+	}
+
+	// F16: flattened field rejects root scalar / scalar array, strips null leaves, and merges array-of-objects
+	var flatSpec esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{
+		"properties": {
+			"labels": {"type": "flattened"}
+		}
+	}`), &flatSpec)
+	flatSchema := CompileIndexSchema("db", "flat_idx", &flatSpec)
+	for _, badDoc := range []string{
+		`{"labels":"scalar_str"}`,
+		`{"labels":123}`,
+		`{"labels":true}`,
+		`{"labels":["a","b"]}`,
+	} {
+		if _, err := ShredDocument(flatSchema, "1", 1, false, []byte(badDoc)); err == nil || !strings.Contains(err.Error(), "mapper_parsing_exception") {
+			t.Fatalf("F16 expected mapper_parsing_exception for flattened root scalar %s, got %v", badDoc, err)
+		}
+	}
+	// Null-only leaves removed from _doc
+	rowNullFlat, err := ShredDocument(flatSchema, "2", 1, false, []byte(`{"labels":{"a":null,"b":[null]}}`))
+	if err != nil {
+		t.Fatalf("F16 ShredDocument null-only flattened failed: %v", err)
+	}
+	var nullFlatMap map[string]any
+	_ = json.Unmarshal(rowNullFlat, &nullFlatMap)
+	if docMap, ok := nullFlatMap["_doc"].(map[string]any); ok {
+		if _, hasLabels := docMap["labels"]; hasLabels {
+			t.Fatalf("F16 expected null-only flattened object to be omitted from _doc, got %s", string(rowNullFlat))
+		}
+	}
+	// Array of objects merged in _doc
+	rowArrFlat, err := ShredDocument(flatSchema, "3", 1, false, []byte(`{"labels":[{"env":"prod"},{"env":"dev","tier":"1"}]}`))
+	if err != nil {
+		t.Fatalf("F16 ShredDocument array-of-objects flattened failed: %v", err)
+	}
+	var arrFlatMap map[string]any
+	_ = json.Unmarshal(rowArrFlat, &arrFlatMap)
+	docMap, _ := arrFlatMap["_doc"].(map[string]any)
+	labelsMap, _ := docMap["labels"].(map[string]any)
+	envSlice, _ := labelsMap["env"].([]any)
+	if len(envSlice) != 2 || envSlice[0] != "prod" || envSlice[1] != "dev" {
+		t.Fatalf("F16 expected flattened array-of-objects to merge into {\"env\":[\"prod\",\"dev\"]} in _doc, got %s", string(rowArrFlat))
+	}
+
+	// F17: unsigned_long precision and 2^64 overflow rejection
+	var ulSpec esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{"properties":{"u":{"type":"unsigned_long"}}}`), &ulSpec)
+	ulSchema := CompileIndexSchema("db", "ul_idx", &ulSpec)
+	for _, badUL := range []string{
+		`{"u":18446744073709551616}`,
+		`{"u":"18446744073709551616"}`,
+		`{"u":"18446744073709551616.0"}`,
+		`{"u":-1}`,
+	} {
+		if _, err := ShredDocument(ulSchema, "1", 1, false, []byte(badUL)); err == nil {
+			t.Fatalf("F17 expected error for out-of-range unsigned_long %s", badUL)
+		}
+	}
+	rowMaxUL, err := ShredDocument(ulSchema, "2", 1, false, []byte(`{"u":"18446744073709551615.0"}`))
+	if err != nil {
+		t.Fatalf("F17 expected MaxUint64 decimal string '18446744073709551615.0' to succeed, got %v", err)
+	}
+	if !strings.Contains(string(rowMaxUL), `"f__u":9223372036854775807`) {
+		t.Fatalf("F17 expected MaxUint64 clamped to MaxInt64 in f__u, got %s", string(rowMaxUL))
+	}
+}

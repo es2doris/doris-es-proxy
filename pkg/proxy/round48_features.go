@@ -1063,6 +1063,37 @@ func formatMustacheScalar(v any) string {
 	}
 }
 
+func escapeMustacheJSONString(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\f':
+			b.WriteString(`\f`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			if c < 0x20 {
+				fmt.Fprintf(&b, `\u%04x`, c)
+			} else {
+				b.WriteByte(c)
+			}
+		}
+	}
+	return b.String()
+}
+
 func evalMustacheBlock(tpl string, ctx map[string]any, dotVal any) string {
 	var out strings.Builder
 	i := 0
@@ -1154,12 +1185,14 @@ func evalMustacheBlock(tpl string, ctx map[string]any, dotVal any) string {
 						switch arr := val.(type) {
 						case []any:
 							for _, el := range arr {
-								items = append(items, formatMustacheScalar(el))
+								items = append(items, escapeMustacheJSONString(formatMustacheScalar(el)))
 							}
 						case []string:
-							items = append(items, arr...)
+							for _, el := range arr {
+								items = append(items, escapeMustacheJSONString(el))
+							}
 						default:
-							items = []string{formatMustacheScalar(val)}
+							items = []string{escapeMustacheJSONString(formatMustacheScalar(val))}
 						}
 						out.WriteString(strings.Join(items, delim))
 					}
@@ -1225,7 +1258,7 @@ func evalMustacheBlock(tpl string, ctx map[string]any, dotVal any) string {
 			i = afterOpenTag
 		default:
 			if val, ok := lookupMustacheVar(rawTag, ctx, dotVal); ok {
-				out.WriteString(formatMustacheScalar(val))
+				out.WriteString(escapeMustacheJSONString(formatMustacheScalar(val)))
 			}
 			i = afterOpenTag
 		}
@@ -1369,6 +1402,44 @@ func coerceSearchTemplateNumericInMap(m map[string]any) bool {
 			}
 		}
 	}
+	for _, boolKey := range []string{"explain", "version", "seq_no_primary_term", "profile", "track_scores", "request_cache", "allow_partial_search_results", "lenient", "analyze_wildcard", "lowercase_expanded_terms", "case_insensitive", "ignore_unmapped", "show_term_doc_count_error"} {
+		if sv, ok := m[boolKey].(string); ok {
+			switch strings.ToLower(strings.TrimSpace(sv)) {
+			case "true":
+				m[boolKey] = true
+				changed = true
+			case "false":
+				m[boolKey] = false
+				changed = true
+			}
+		}
+	}
+	if sv, ok := m["_source"].(string); ok {
+		switch strings.ToLower(strings.TrimSpace(sv)) {
+		case "true":
+			m["_source"] = true
+			changed = true
+		case "false":
+			m["_source"] = false
+			changed = true
+		}
+	}
+	if sv, ok := m["track_total_hits"].(string); ok {
+		sTrim := strings.TrimSpace(sv)
+		switch strings.ToLower(sTrim) {
+		case "true":
+			m["track_total_hits"] = true
+			changed = true
+		case "false":
+			m["track_total_hits"] = false
+			changed = true
+		default:
+			if iv, err := strconv.Atoi(sTrim); err == nil {
+				m["track_total_hits"] = iv
+				changed = true
+			}
+		}
+	}
 	for k, v := range m {
 		switch sub := v.(type) {
 		case map[string]any:
@@ -1406,6 +1477,80 @@ func coerceSearchTemplateNumericFields(raw json.RawMessage) json.RawMessage {
 	return raw
 }
 
+func mergeTemplateTopLevelSearchOptions(raw json.RawMessage, body map[string]any) json.RawMessage {
+	if len(body) == 0 {
+		return raw
+	}
+	hasOpt := false
+	for _, k := range []string{"explain", "profile", "version", "seq_no_primary_term"} {
+		if _, ok := body[k]; ok {
+			hasOpt = true
+			break
+		}
+	}
+	if !hasOpt {
+		return raw
+	}
+	var m map[string]any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&m); err != nil || m == nil {
+		return raw
+	}
+	changed := false
+	for _, k := range []string{"explain", "profile", "version", "seq_no_primary_term"} {
+		if v, ok := body[k]; ok {
+			if _, exists := m[k]; !exists {
+				m[k] = v
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return raw
+	}
+	_ = coerceSearchTemplateNumericInMap(m)
+	if b, err := json.Marshal(m); err == nil {
+		return json.RawMessage(b)
+	}
+	return raw
+}
+
+func mergeMSearchTemplateHeaderOptions(hdrLine string, body map[string]any) string {
+	if len(body) == 0 {
+		return hdrLine
+	}
+	_, hasTK := body["typed_keys"]
+	_, hasRTH := body["rest_total_hits_as_int"]
+	if !hasTK && !hasRTH {
+		return hdrLine
+	}
+	var hdrMap map[string]any
+	if err := json.Unmarshal([]byte(hdrLine), &hdrMap); err != nil || hdrMap == nil {
+		return hdrLine
+	}
+	changed := false
+	if hasTK {
+		if _, exists := hdrMap["typed_keys"]; !exists {
+			hdrMap["typed_keys"] = body["typed_keys"]
+			changed = true
+		}
+	}
+	if hasRTH {
+		if _, exists := hdrMap["rest_total_hits_as_int"]; !exists {
+			hdrMap["rest_total_hits_as_int"] = body["rest_total_hits_as_int"]
+			changed = true
+		}
+	}
+	if !changed {
+		return hdrLine
+	}
+	if b, err := json.Marshal(hdrMap); err == nil {
+		return string(b)
+	}
+	return hdrLine
+}
+
 func (s *Server) handleSearchTemplate(w http.ResponseWriter, r *http.Request) {
 	_ = s.syncCatalogFromBackend(r.Context())
 	bodyBytes, ok := readRequestBody(w, r)
@@ -1436,7 +1581,21 @@ func (s *Server) handleSearchTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	renderedJSON = coerceSearchTemplateNumericFields(renderedJSON)
+	renderedJSON = mergeTemplateTopLevelSearchOptions(renderedJSON, body)
 	clonedReq := r.Clone(r.Context())
+	if clonedReq.URL != nil {
+		q := clonedReq.URL.Query()
+		qChanged := false
+		for _, qKey := range []string{"typed_keys", "rest_total_hits_as_int", "explain", "version", "seq_no_primary_term"} {
+			if rawVal, hasVal := body[qKey]; hasVal && q.Get(qKey) == "" {
+				q.Set(qKey, fmt.Sprintf("%v", rawVal))
+				qChanged = true
+			}
+		}
+		if qChanged {
+			clonedReq.URL.RawQuery = q.Encode()
+		}
+	}
 	clonedReq.Body = io.NopCloser(bytes.NewReader(renderedJSON))
 	clonedReq.ContentLength = int64(len(renderedJSON))
 	s.handleSearch(w, clonedReq)
@@ -1518,6 +1677,8 @@ func (s *Server) handleMSearchTemplate(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		renderedJSON = coerceSearchTemplateNumericFields(renderedJSON)
+		renderedJSON = mergeTemplateTopLevelSearchOptions(renderedJSON, body)
+		hdrLine = mergeMSearchTemplateHeaderOptions(hdrLine, body)
 		rewrittenBuf.WriteString(hdrLine)
 		rewrittenBuf.WriteByte('\n')
 		var compact bytes.Buffer

@@ -27,14 +27,10 @@ import (
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
 )
 
-// compileQueryString compiles an ES `query_string` or `simple_query_string` query.
+// compileQueryStringWithMode compiles an ES `query_string` or `simple_query_string` query.
 // When `Opts.UseDoris4SearchFunc` is enabled, it emits Apache Doris 4.0's native `SEARCH(...)`
 // function; otherwise, it parses Lucene `field:value`, `AND`/`OR`/`NOT`, `+`/`-`, parenthesized
 // groups, and wildcard clauses into standard Doris `MATCH_ANY` / `LIKE` / `=` predicates.
-func (t *Transpiler) compileQueryString(qsq *esast.QueryStringQuery, scoring bool, nctx *nestedCtx) CompiledQuery {
-	return t.compileQueryStringWithMode(qsq, scoring, nctx, false)
-}
-
 func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, scoring bool, nctx *nestedCtx, isSimple bool) CompiledQuery {
 	raw := strings.TrimSpace(qsq.Query)
 	if raw == "" || raw == "*:*" || (raw == "*" && (qsq.DefaultField == "" || qsq.DefaultField == "*" || qsq.DefaultField == "_all_text") && len(qsq.Fields) == 0) {

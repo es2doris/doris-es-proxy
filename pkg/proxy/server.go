@@ -198,6 +198,14 @@ type Server struct {
 	indexCustomSettings       map[string]map[string]any
 	templateVersions          map[string]int
 	ilmMode                   string
+	slmPolicies               map[string]map[string]any
+	slmMode                   string
+	slmStats                  map[string]int64
+	watches                   map[string]map[string]any
+	watcherState              string
+	transforms                map[string]map[string]any
+	danglingIndices           map[string]map[string]any
+	autoscalingPolicies       map[string]map[string]any
 }
 
 func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerOptions) *Server {
@@ -234,6 +242,14 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		indexCustomSettings:       make(map[string]map[string]any),
 		templateVersions:          make(map[string]int),
 		ilmMode:                   "RUNNING",
+		slmPolicies:               make(map[string]map[string]any),
+		slmMode:                   "RUNNING",
+		slmStats:                  make(map[string]int64),
+		watches:                   make(map[string]map[string]any),
+		watcherState:              "started",
+		transforms:                make(map[string]map[string]any),
+		danglingIndices:           make(map[string]map[string]any),
+		autoscalingPolicies:       make(map[string]map[string]any),
 	}
 	s.coalescer = newStreamLoadCoalescer(func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
 		err := s.backend.StreamLoad(ctx, table, ndjson, syncRefresh)
@@ -903,6 +919,10 @@ func (s *Server) Handler() http.Handler {
 					"license":  map[string]any{"type": "basic", "mode": "basic", "status": "active"},
 					"features": map[string]any{"security": map[string]any{"available": true, "enabled": true}},
 				})
+			case "_transform":
+				s.handleTransform(w, r)
+			case "_dangling":
+				s.handleDanglingIndices(w, r)
 			default:
 				r.SetPathValue("index", segs[0])
 				switch r.Method {
@@ -970,8 +990,27 @@ func (s *Server) Handler() http.Handler {
 				s.handleILMStart(w, r)
 			case segs[0] == "_ilm" && segs[1] == "stop":
 				s.handleILMStop(w, r)
+			case segs[0] == "_slm" && segs[1] == "policy":
+				s.handleSLMPolicy(w, r)
+			case segs[0] == "_slm":
+				r.SetPathValue("action", segs[1])
+				s.handleSLMAction(w, r)
+			case segs[0] == "_watcher":
+				r.SetPathValue("action", segs[1])
+				s.handleWatcherRoot(w, r)
+			case segs[0] == "_transform":
+				r.SetPathValue("id", segs[1])
+				s.handleTransform(w, r)
+			case segs[0] == "_dangling":
+				r.SetPathValue("index_uuid", segs[1])
+				s.handleDanglingIndices(w, r)
+			case segs[0] == "_autoscaling":
+				r.SetPathValue("action", segs[1])
+				s.handleAutoscaling(w, r)
 			case segs[0] == "_data_stream" && segs[1] == "_stats":
 				s.handleDataStreamsStats(w, r)
+			case segs[0] == "_data_stream" && segs[1] == "_modify":
+				s.handleModifyDataStream(w, r)
 			case segs[0] == "_data_stream":
 				r.SetPathValue("name", segs[1])
 				s.handleDataStream(w, r)
@@ -1108,6 +1147,8 @@ func (s *Server) Handler() http.Handler {
 					s.handleIndexOpen(w, r)
 				case "_close":
 					s.handleIndexClose(w, r)
+				case "_downgrade":
+					s.handleIndexDowngrade(w, r)
 				case "_doc":
 					if r.Method == http.MethodPost {
 						s.handlePutDoc(w, r)
@@ -1206,6 +1247,39 @@ func (s *Server) Handler() http.Handler {
 				s.handleILMMoveToStep(w, r)
 				return
 			}
+			if segs[0] == "_slm" && segs[1] == "policy" {
+				r.SetPathValue("policy_id", segs[2])
+				s.handleSLMPolicy(w, r)
+				return
+			}
+			if segs[0] == "_watcher" && segs[1] == "watch" {
+				if segs[2] == "_execute" {
+					r.SetPathValue("action", "_execute")
+					s.handleWatcherWatchAction(w, r)
+					return
+				}
+				r.SetPathValue("id", segs[2])
+				s.handleWatcherWatch(w, r)
+				return
+			}
+			if segs[0] == "_watcher" && (segs[1] == "stats" || segs[1] == "_stats") {
+				r.SetPathValue("action", "stats")
+				r.SetPathValue("metric", segs[2])
+				s.handleWatcherRoot(w, r)
+				return
+			}
+			if segs[0] == "_transform" {
+				r.SetPathValue("id", segs[1])
+				r.SetPathValue("action", segs[2])
+				s.handleTransformAction(w, r)
+				return
+			}
+			if segs[0] == "_autoscaling" && segs[1] == "policy" {
+				r.SetPathValue("action", "policy")
+				r.SetPathValue("name", segs[2])
+				s.handleAutoscaling(w, r)
+				return
+			}
 			if segs[0] == "_search" && segs[1] == "scroll" {
 				r.SetPathValue("scroll_id", segs[2])
 				s.handleScroll(w, r)
@@ -1221,6 +1295,11 @@ func (s *Server) Handler() http.Handler {
 				s.handleMigrateToDataStream(w, r)
 				return
 			}
+			if segs[0] == "_data_stream" && segs[1] == "_promote" {
+				r.SetPathValue("name", segs[2])
+				s.handlePromoteDataStream(w, r)
+				return
+			}
 			if segs[0] == "_data_stream" && segs[2] == "_stats" {
 				r.SetPathValue("name", segs[1])
 				s.handleDataStreamsStats(w, r)
@@ -1229,6 +1308,14 @@ func (s *Server) Handler() http.Handler {
 			if segs[0] == "_data_stream" && segs[2] == "_rollover" {
 				r.SetPathValue("alias", segs[1])
 				s.handleRollover(w, r)
+				return
+			}
+			if segs[0] == "_ingest" && segs[1] == "processor" && segs[2] == "grok" {
+				s.handleIngestProcessorGrok(w, r)
+				return
+			}
+			if segs[0] == "_ingest" && segs[1] == "geoip" && segs[2] == "stats" {
+				s.handleIngestGeoIPStats(w, r)
 				return
 			}
 			if segs[0] == "_ingest" && segs[1] == "pipeline" {
@@ -1358,6 +1445,11 @@ func (s *Server) Handler() http.Handler {
 				s.handleCount(w, r)
 				return
 			}
+			if segs[1] == "_block" {
+				r.SetPathValue("block", segs[2])
+				s.handleAddIndexBlock(w, r)
+				return
+			}
 			r.SetPathValue("id", segs[2])
 			switch segs[1] {
 			case "_doc":
@@ -1415,6 +1507,17 @@ func (s *Server) Handler() http.Handler {
 				s.handleSnapshotItemAction(w, r)
 				return
 			}
+			if segs[0] == "_slm" && segs[1] == "policy" && segs[3] == "_execute" {
+				r.SetPathValue("policy_id", segs[2])
+				s.handleSLMExecutePolicy(w, r)
+				return
+			}
+			if segs[0] == "_watcher" && segs[1] == "watch" {
+				r.SetPathValue("id", segs[2])
+				r.SetPathValue("action", segs[3])
+				s.handleWatcherWatchAction(w, r)
+				return
+			}
 			if segs[0] == "_cluster" && segs[1] == "state" {
 				s.handleClusterState(w, r)
 				return
@@ -1450,6 +1553,16 @@ func (s *Server) Handler() http.Handler {
 				r.SetPathValue("index", segs[0])
 				r.SetPathValue("id", segs[2])
 				s.handleTermVectors(w, r)
+				return
+			}
+			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+
+		case 5:
+			if segs[0] == "_watcher" && segs[1] == "watch" && segs[3] == "_ack" {
+				r.SetPathValue("id", segs[2])
+				r.SetPathValue("action", "_ack")
+				r.SetPathValue("action_id", segs[4])
+				s.handleWatcherWatchAction(w, r)
 				return
 			}
 			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
@@ -1869,6 +1982,19 @@ func (s *Server) handleIndexSettings(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			customFlat := extractCustomIndexSettings(settings)
+			isOnlyBlocksUpdate := !hasDef && !hasFin && len(customFlat) > 0
+			for k := range customFlat {
+				if !strings.HasPrefix(k, "blocks.") {
+					isOnlyBlocksUpdate = false
+					break
+				}
+			}
+			if !isOnlyBlocksUpdate {
+				if _, reason := s.findMetadataBlockedTargetIndex(validTargets, false); reason != "" {
+					writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+					return
+				}
+			}
 			for _, indexName := range validTargets {
 				s.mu.Lock()
 				if s.indexCustomSettings == nil {
@@ -2308,6 +2434,13 @@ func (s *Server) handleDataStream(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut, http.MethodPost:
 		if name == "" {
 			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: name is missing;")
+			return
+		}
+		if reason, ok := validateESIndexName(name); !ok || strings.HasPrefix(name, ".") {
+			if reason == "" {
+				reason = fmt.Sprintf("Invalid data stream name [%s], must not start with '.'", name)
+			}
+			writeESError(w, http.StatusBadRequest, "invalid_index_name_exception", reason)
 			return
 		}
 		s.mu.RLock()
@@ -3878,6 +4011,10 @@ func (s *Server) handleDeleteIndex(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
 		return
 	}
+	if _, reason := s.findMetadataBlockedTargetIndex(targets, true); reason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
 
 	modifiedAliases := make(map[string][]string)
 	var tablesToDrop []*schema.IndexSchema
@@ -4136,6 +4273,10 @@ func (s *Server) handlePutMapping(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusNotFound, "index_not_found_exception", fmt.Sprintf("no such index [%s]", missingName))
 		return
 	}
+	if _, reason := s.findMetadataBlockedTargetIndex(validTargets, false); reason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
 
 	// Validate mapping compatibility on all target indices before mutating any index.
 	s.mu.RLock()
@@ -4358,6 +4499,13 @@ func (s *Server) handleIndexAliasByName(w http.ResponseWriter, r *http.Request) 
 			writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
 			return
 		}
+		for _, indexName := range existingTargets {
+			if blocked, reason := s.isIndexMetadataBlockedLocked(indexName, false); blocked {
+				s.mu.Unlock()
+				writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+				return
+			}
+		}
 		if _, exists := s.indices[aliasName]; exists {
 			s.mu.Unlock()
 			writeESError(w, http.StatusBadRequest, "invalid_alias_name_exception", fmt.Sprintf("Invalid alias name [%s], an index exists with the same name as the alias", aliasName))
@@ -4389,6 +4537,13 @@ func (s *Server) handleIndexAliasByName(w http.ResponseWriter, r *http.Request) 
 			s.mu.Unlock()
 			writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
 			return
+		}
+		for _, indexName := range existingTargets {
+			if blocked, reason := s.isIndexMetadataBlockedLocked(indexName, false); blocked {
+				s.mu.Unlock()
+				writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+				return
+			}
 		}
 		removedAny := false
 		aliasHasAnyTargetLocked := func(al string, idxs []string) bool {
@@ -4640,6 +4795,13 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 				writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+strings.Join(rawIndices, ",")+"]")
 				return
 			}
+			for _, idx := range indices {
+				if blocked, reason := s.isIndexMetadataBlockedLocked(idx, false); blocked {
+					s.mu.Unlock()
+					writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+					return
+				}
+			}
 			for _, al := range rawAliases {
 				if simulatedIndices[al] {
 					s.mu.Unlock()
@@ -4695,6 +4857,13 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			indices := expandIndexListLocked(rawIndices)
+			for _, idx := range indices {
+				if blocked, reason := s.isIndexMetadataBlockedLocked(idx, false); blocked {
+					s.mu.Unlock()
+					writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+					return
+				}
+			}
 			for _, al := range rawAliases {
 				al = strings.TrimSpace(al)
 				if al == "" {
@@ -4746,6 +4915,11 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			for _, indexName := range expandIndexListLocked(rawIndices) {
+				if blocked, reason := s.isIndexMetadataBlockedLocked(indexName, true); blocked {
+					s.mu.Unlock()
+					writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+					return
+				}
 				delete(simulatedIndices, indexName)
 				for _, idxMap := range simulatedAliases {
 					delete(idxMap, indexName)
@@ -5133,6 +5307,10 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", indexName))
 		return
 	}
+	if blocked, reason := s.isIndexWriteBlocked(indexName); blocked {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
 	ifSeqNo, ifPrimaryTerm, reqVer, verType, occParseErr := parseOCCParamsFromRequest(r)
 	if occParseErr != "" {
 		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", occParseErr)
@@ -5140,6 +5318,10 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 	}
 	docID := r.PathValue("id")
 	isCreate := strings.Contains(r.URL.Path, "/_create/") || strings.EqualFold(r.URL.Query().Get("op_type"), "create")
+	if s.isDataStream(rawReqIndex) && !isCreate && docID != "" {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "only write ops with an op_type of create are allowed in data streams")
+		return
+	}
 	rawDoc, ok := readRequestBody(w, r)
 	if !ok {
 		return
@@ -5190,6 +5372,14 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		indexName = resolvedIdx
 		aliasFilter = resolvedFilter
 		effRawIndex = nextIndex
+		if s.isIndexClosed(indexName) {
+			writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", indexName))
+			return
+		}
+		if blocked, reason := s.isIndexWriteBlocked(indexName); blocked {
+			writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+			return
+		}
 	}
 	effRouting := s.resolveEffectiveWriteRouting(effRawIndex, indexName, "", pipeRouting)
 
@@ -5301,6 +5491,14 @@ func (s *Server) handleHeadDoc(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	if s.isIndexClosed(indexName) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if blocked, _ := s.isIndexReadBlocked(indexName); blocked {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
 	docID := r.PathValue("id")
 	if status, _, _ := validateReadDocVersionParams(r.URL.Query().Get("version"), r.URL.Query().Get("version_type"), docID, false, 0); status != 0 {
 		w.WriteHeader(status)
@@ -5336,6 +5534,22 @@ func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", readErr.Error())
+		return
+	}
+	if s.isIndexClosed(indexName) {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", indexName))
+		return
+	}
+	if blocked, reason := s.isIndexReadBlocked(indexName); blocked {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
 		return
 	}
 	docID := r.PathValue("id")
@@ -5417,6 +5631,14 @@ func (s *Server) handleGetDoc(w http.ResponseWriter, r *http.Request) {
 	indexName, aliasFilter, readErr := s.resolveReadDocIndexWithFilter(rawReqIndex)
 	if readErr != nil {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", readErr.Error())
+		return
+	}
+	if s.isIndexClosed(indexName) {
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", indexName))
+		return
+	}
+	if blocked, reason := s.isIndexReadBlocked(indexName); blocked {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
 		return
 	}
 	docID := r.PathValue("id")
@@ -5648,6 +5870,39 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 			})
 			continue
 		}
+		if s.isIndexClosed(idxName) {
+			errReason := fmt.Sprintf("closed [%s]", idxName)
+			docsOut = append(docsOut, map[string]any{
+				"_index": idxName,
+				"_type":  "_doc",
+				"_id":    spec.ID,
+				"error": map[string]any{
+					"root_cause": []map[string]any{
+						{"type": "index_closed_exception", "reason": errReason, "index": idxName},
+					},
+					"type":   "index_closed_exception",
+					"reason": errReason,
+					"index":  idxName,
+				},
+			})
+			continue
+		}
+		if blocked, blockReason := s.isIndexReadBlocked(idxName); blocked {
+			docsOut = append(docsOut, map[string]any{
+				"_index": idxName,
+				"_type":  "_doc",
+				"_id":    spec.ID,
+				"error": map[string]any{
+					"root_cause": []map[string]any{
+						{"type": "cluster_block_exception", "reason": blockReason, "index": idxName},
+					},
+					"type":   "cluster_block_exception",
+					"reason": blockReason,
+					"index":  idxName,
+				},
+			})
+			continue
+		}
 		specRouting := strings.TrimSpace(spec.Routing)
 		if specRouting == "" {
 			specRouting = strings.TrimSpace(spec.MetaRouting)
@@ -5782,6 +6037,10 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", indexName))
 		return
 	}
+	if blocked, reason := s.isIndexWriteBlocked(indexName); blocked {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
 	ifSeqNo, ifPrimaryTerm, reqVer, verType, occParseErr := parseOCCParamsFromRequest(r)
 	if occParseErr != "" {
 		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", occParseErr)
@@ -5886,6 +6145,16 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, delResp)
 }
 
+func updateScriptErrorType(err error) string {
+	if err != nil {
+		msg := err.Error()
+		if strings.Contains(msg, "illegal_argument_exception") || (strings.Contains(msg, "Operation [") && strings.Contains(msg, "is not supported")) {
+			return "illegal_argument_exception"
+		}
+	}
+	return "script_exception"
+}
+
 func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	rawReqIndex := r.PathValue("index")
 	if isTruthyBoolQueryParam(r, "require_alias") && !s.isTargetAliasOrDataStream(rawReqIndex) {
@@ -5899,6 +6168,10 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.isIndexClosed(indexName) {
 		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", indexName))
+		return
+	}
+	if blocked, reason := s.isIndexWriteBlocked(indexName); blocked {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
 		return
 	}
 	ifSeqNo, ifPrimaryTerm, reqVer, verType, occParseErr := parseOCCParamsFromRequest(r)
@@ -6017,7 +6290,7 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	}
 	mutatedSource, opResult, err := painless.ApplyUpdateWithResult(baseSource, &updReq, found)
 	if err != nil {
-		writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
+		writeESError(w, http.StatusBadRequest, updateScriptErrorType(err), err.Error())
 		return
 	}
 	if !found && opResult == "deleted" {
@@ -6361,6 +6634,24 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 	if len(targets) == 0 && !hasExclusionOrWildcard(rawIndex) {
 		targets = []string{s.resolveIndexName(rawIndex)}
 	}
+	if closedIdx := s.findClosedTargetIndex(r, rawIndex); closedIdx != "" {
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
+		return
+	}
+	for _, idx := range targets {
+		if s.isIndexClosed(idx) {
+			writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", idx))
+			return
+		}
+	}
+	if _, reason := s.findReadBlockedTargetIndex(r, rawIndex); reason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
+	if _, reason := s.findWriteBlockedTargetIndex(targets); reason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
 
 	var body struct {
 		MaxDocs           *int                 `json:"max_docs,omitempty"`
@@ -6585,7 +6876,7 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 				}
 				mutated, opRes, err := painless.ApplyUpdateWithResult(h.Source, updItem, true)
 				if err != nil {
-					writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
+					writeESError(w, http.StatusBadRequest, updateScriptErrorType(err), err.Error())
 					return
 				}
 				if opRes == "created" {
@@ -6870,6 +7161,24 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(targets) == 0 && !hasExclusionOrWildcard(rawIndex) {
 		targets = []string{s.resolveIndexName(rawIndex)}
+	}
+	if closedIdx := s.findClosedTargetIndex(r, rawIndex); closedIdx != "" {
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
+		return
+	}
+	for _, idx := range targets {
+		if s.isIndexClosed(idx) {
+			writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", idx))
+			return
+		}
+	}
+	if _, reason := s.findReadBlockedTargetIndex(r, rawIndex); reason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
+	if _, reason := s.findWriteBlockedTargetIndex(targets); reason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
 	}
 
 	var body struct {
@@ -7157,6 +7466,12 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			op.ParseErr = writeErr.Error()
 			continue
 		}
+		if s.isIndexClosed(idxName) {
+			continue
+		}
+		if blocked, _ := s.isIndexWriteBlocked(idxName); blocked {
+			continue
+		}
 		if (op.Action == "index" || op.Action == "create") && len(op.Source) > 0 {
 			initOpRouting := op.Routing
 			if initOpRouting == "" {
@@ -7320,6 +7635,37 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		targetIndex, opAliasFilter, writeErr := s.resolveWriteIndexWithFilter(op.Index)
 		if writeErr != nil {
 			targetIndex = op.Index
+		} else {
+			if s.isIndexClosed(targetIndex) {
+				hasErrors = true
+				items = append(items, map[string]any{
+					op.Action: map[string]any{
+						"_index": targetIndex,
+						"_id":    op.ID,
+						"status": http.StatusBadRequest,
+						"error": map[string]any{
+							"type":   "index_closed_exception",
+							"reason": fmt.Sprintf("closed [%s]", targetIndex),
+						},
+					},
+				})
+				continue
+			}
+			if blocked, reason := s.isIndexWriteBlocked(targetIndex); blocked {
+				hasErrors = true
+				items = append(items, map[string]any{
+					op.Action: map[string]any{
+						"_index": targetIndex,
+						"_id":    op.ID,
+						"status": http.StatusForbidden,
+						"error": map[string]any{
+							"type":   "cluster_block_exception",
+							"reason": reason,
+						},
+					},
+				})
+				continue
+			}
 		}
 		reqRouting := op.Routing
 		if reqRouting == "" {
@@ -7664,7 +8010,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 						"_index": targetIndex,
 						"_id":    op.ID,
 						"status": http.StatusBadRequest,
-						"error":  map[string]any{"type": "script_exception", "reason": err.Error()},
+						"error":  map[string]any{"type": updateScriptErrorType(err), "reason": err.Error()},
 					},
 				})
 				continue
@@ -8159,6 +8505,10 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
 		return
 	}
+	if _, blockReason := s.findReadBlockedTargetIndex(r, rawIndex); blockReason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", blockReason)
+		return
+	}
 	resp, status, errType, errReason := s.executeSearchRequest(r.Context(), rawIndex, &req)
 	if errType != "" {
 		writeESError(w, status, errType, errReason)
@@ -8632,8 +8982,18 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		var bodyLine []byte
-		if scanner.Scan() {
-			bodyLine = append([]byte(nil), bytes.TrimSpace(scanner.Bytes())...)
+		hasBodyLine := false
+		for scanner.Scan() {
+			trimmed := bytes.TrimSpace(scanner.Bytes())
+			if len(trimmed) > 0 {
+				bodyLine = append([]byte(nil), trimmed...)
+				hasBodyLine = true
+				break
+			}
+		}
+		if !hasBodyLine {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: no requests added;")
+			return
 		}
 
 		var hdr struct {
@@ -8709,6 +9069,20 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 		}
 
 		targetIdx = extractPITIndex(targetIdx, req.PIT)
+		if closedIdx := s.findClosedTargetIndex(r, targetIdx); closedIdx != "" {
+			responses = append(responses, map[string]any{
+				"status": http.StatusBadRequest,
+				"error":  map[string]any{"type": "index_closed_exception", "reason": fmt.Sprintf("closed [%s]", closedIdx)},
+			})
+			continue
+		}
+		if _, blockReason := s.findReadBlockedTargetIndex(r, targetIdx); blockReason != "" {
+			responses = append(responses, map[string]any{
+				"status": http.StatusForbidden,
+				"error":  map[string]any{"type": "cluster_block_exception", "reason": blockReason},
+			})
+			continue
+		}
 		resp, status, errType, errReason := s.executeSearchRequest(r.Context(), targetIdx, &req)
 		if errType != "" {
 			responses = append(responses, map[string]any{
@@ -10779,6 +11153,10 @@ func (s *Server) handleCount(w http.ResponseWriter, r *http.Request) {
 
 	if closedIdx := s.findClosedTargetIndex(r, r.PathValue("index")); closedIdx != "" {
 		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
+		return
+	}
+	if _, blockReason := s.findReadBlockedTargetIndex(r, r.PathValue("index")); blockReason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", blockReason)
 		return
 	}
 	resp, status, errType, errReason := s.executeSearchRequest(r.Context(), r.PathValue("index"), &req)

@@ -25,6 +25,7 @@ const proxyTargetVersion = "7.10.2"
 var supportedRunnerFeatures = map[string]bool{
 	"headers":                true,
 	"warnings":               true,
+	"warning_headers":        true,
 	"warnings_regex":         true,
 	"allowed_warnings":       true,
 	"allowed_warnings_regex": true,
@@ -188,45 +189,53 @@ func RunSuiteFS(t *testing.T, fsys fs.FS, baseURL string) SuiteReport {
 }
 
 type runnerContext struct {
-	client              *http.Client
-	baseURL             string
-	stash               map[string]any
-	lastStatus          int
-	lastMethod          string
-	lastBodyRaw         string
-	lastResponse        any
-	lastHeaders         map[string]any
-	lastWarnings        []string
-	createdIndices      map[string]bool
-	createdDataStreams  map[string]bool
-	createdTemplates    map[string]bool
-	createdLegacyTmpls  map[string]bool
-	createdCompTmpls    map[string]bool
-	createdPipelines    map[string]bool
-	createdILMPolicies  map[string]bool
-	createdEnrichPols   map[string]bool
-	createdScripts      map[string]struct{}
-	createdRepositories map[string]struct{}
-	createdAliases      map[string]string // alias -> index
+	client                     *http.Client
+	baseURL                    string
+	stash                      map[string]any
+	lastStatus                 int
+	lastMethod                 string
+	lastBodyRaw                string
+	lastResponse               any
+	lastHeaders                map[string]any
+	lastWarnings               []string
+	createdIndices             map[string]bool
+	createdDataStreams         map[string]bool
+	createdTemplates           map[string]bool
+	createdLegacyTmpls         map[string]bool
+	createdCompTmpls           map[string]bool
+	createdPipelines           map[string]bool
+	createdILMPolicies         map[string]bool
+	createdSLMPolicies         map[string]bool
+	createdEnrichPols          map[string]bool
+	createdWatches             map[string]bool
+	createdTransforms          map[string]bool
+	createdAutoscalingPolicies map[string]bool
+	createdScripts             map[string]struct{}
+	createdRepositories        map[string]struct{}
+	createdAliases             map[string]string // alias -> index
 }
 
 func newRunnerContext(client *http.Client, baseURL string) *runnerContext {
 	return &runnerContext{
-		client:              client,
-		baseURL:             baseURL,
-		stash:               make(map[string]any),
-		lastHeaders:         make(map[string]any),
-		createdIndices:      make(map[string]bool),
-		createdDataStreams:  make(map[string]bool),
-		createdTemplates:    make(map[string]bool),
-		createdLegacyTmpls:  make(map[string]bool),
-		createdCompTmpls:    make(map[string]bool),
-		createdPipelines:    make(map[string]bool),
-		createdILMPolicies:  make(map[string]bool),
-		createdEnrichPols:   make(map[string]bool),
-		createdScripts:      make(map[string]struct{}),
-		createdRepositories: make(map[string]struct{}),
-		createdAliases:      make(map[string]string),
+		client:                     client,
+		baseURL:                    baseURL,
+		stash:                      make(map[string]any),
+		lastHeaders:                make(map[string]any),
+		createdIndices:             make(map[string]bool),
+		createdDataStreams:         make(map[string]bool),
+		createdTemplates:           make(map[string]bool),
+		createdLegacyTmpls:         make(map[string]bool),
+		createdCompTmpls:           make(map[string]bool),
+		createdPipelines:           make(map[string]bool),
+		createdILMPolicies:         make(map[string]bool),
+		createdSLMPolicies:         make(map[string]bool),
+		createdEnrichPols:          make(map[string]bool),
+		createdWatches:             make(map[string]bool),
+		createdTransforms:          make(map[string]bool),
+		createdAutoscalingPolicies: make(map[string]bool),
+		createdScripts:             make(map[string]struct{}),
+		createdRepositories:        make(map[string]struct{}),
+		createdAliases:             make(map[string]string),
 	}
 }
 
@@ -244,8 +253,10 @@ func (c *runnerContext) cleanupAll() {
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/_data_stream/"+url.PathEscape(ds), nil, nil, nil)
 		}
 	}
+	unblockBody := []byte(`{"index.blocks.read_only":null,"index.blocks.read_only_allow_delete":null,"index.blocks.metadata":null,"index.blocks.write":null,"index.blocks.read":null}`)
 	for idx := range c.createdIndices {
 		if idx != "" && !strings.HasPrefix(idx, "_") {
+			_, _, _ = c.rawHTTP(http.MethodPut, "/"+url.PathEscape(idx)+"/_settings", nil, unblockBody, nil)
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/"+url.PathEscape(idx), nil, nil, nil)
 		}
 	}
@@ -274,9 +285,29 @@ func (c *runnerContext) cleanupAll() {
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ilm/policy/"+url.PathEscape(pol), nil, nil, nil)
 		}
 	}
+	for pol := range c.createdSLMPolicies {
+		if pol != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_slm/policy/"+url.PathEscape(pol), nil, nil, nil)
+		}
+	}
 	for pol := range c.createdEnrichPols {
 		if pol != "" {
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/_enrich/policy/"+url.PathEscape(pol), nil, nil, nil)
+		}
+	}
+	for watchID := range c.createdWatches {
+		if watchID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_watcher/watch/"+url.PathEscape(watchID), nil, nil, nil)
+		}
+	}
+	for transformID := range c.createdTransforms {
+		if transformID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_transform/"+url.PathEscape(transformID), url.Values{"force": []string{"true"}}, nil, nil)
+		}
+	}
+	for polName := range c.createdAutoscalingPolicies {
+		if polName != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_autoscaling/policy/"+url.PathEscape(polName), nil, nil, nil)
 		}
 	}
 	for scriptID := range c.createdScripts {
@@ -343,7 +374,9 @@ func (c *runnerContext) execDo(rawVal any, isTeardown bool) error {
 		case "catch":
 			catchSpec = fmt.Sprintf("%v", c.expandStash(f.Value))
 		case "headers":
-			headers = make(map[string]string)
+			if headers == nil {
+				headers = make(map[string]string)
+			}
 			if hm, ok := ToNative(c.expandStash(f.Value)).(map[string]any); ok {
 				for hk, hv := range hm {
 					headers[hk] = fmt.Sprintf("%v", hv)
@@ -351,7 +384,7 @@ func (c *runnerContext) execDo(rawVal any, isTeardown bool) error {
 			}
 		case "ignore":
 			ignoreStatuses = parseIgnoreStatuses(c.expandStash(f.Value))
-		case "warnings":
+		case "warnings", "warning_headers":
 			expectedWarnings = append(expectedWarnings, extractStringSlice(c.expandStash(f.Value))...)
 		case "warnings_regex":
 			expectedWarningsRegex = append(expectedWarningsRegex, extractStringSlice(c.expandStash(f.Value))...)
@@ -380,6 +413,26 @@ func (c *runnerContext) execDo(rawVal any, isTeardown bool) error {
 			ignoreStatuses[code] = true
 		}
 		delete(paramMap, "ignore")
+	}
+	if rawHeaders, ok := paramMap["headers"]; ok {
+		switch hm := ToNative(rawHeaders).(type) {
+		case map[string]any:
+			if headers == nil {
+				headers = make(map[string]string)
+			}
+			for hk, hv := range hm {
+				headers[hk] = fmt.Sprintf("%v", hv)
+			}
+			delete(paramMap, "headers")
+		case map[string]string:
+			if headers == nil {
+				headers = make(map[string]string)
+			}
+			for hk, hv := range hm {
+				headers[hk] = hv
+			}
+			delete(paramMap, "headers")
+		}
 	}
 
 	reqSpec, err := c.buildActionRequest(actionName, paramMap)
@@ -611,7 +664,7 @@ func extractErrorText(parsed any, raw string) string {
 func (c *runnerContext) trackCreatedResources(action string, params map[string]any, resp any) {
 	idx := paramString(params, "index")
 	switch action {
-	case "indices.create", "index", "create", "indices.put_mapping", "indices.put_settings":
+	case "indices.create", "index", "create", "indices.put_mapping", "indices.put_settings", "indices.add_block":
 		if idx != "" {
 			for _, part := range strings.Split(idx, ",") {
 				p := strings.TrimSpace(part)
@@ -726,9 +779,33 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 		if idx != "" {
 			c.createdIndices[idx] = true
 		}
-	case "indices.create_data_stream", "indices.migrate_to_data_stream":
+	case "indices.create_data_stream", "data_stream.create_data_stream", "indices.migrate_to_data_stream", "indices.promote_data_stream", "data_stream.promote_data_stream":
 		if name := paramString(params, "name"); name != "" {
 			c.createdDataStreams[name] = true
+		}
+	case "indices.modify_data_stream", "data_stream.modify_data_stream":
+		if name := paramString(params, "name"); name != "" {
+			c.createdDataStreams[name] = true
+		}
+		if bodyMap, ok := ToNative(params["body"]).(map[string]any); ok {
+			if actions, ok := bodyMap["actions"].([]any); ok {
+				for _, actItem := range actions {
+					actMap, ok := ToNative(actItem).(map[string]any)
+					if !ok {
+						continue
+					}
+					for _, opKey := range []string{"add_backing_index", "remove_backing_index"} {
+						if subMap, ok := ToNative(actMap[opKey]).(map[string]any); ok {
+							if ds := paramString(subMap, "data_stream"); ds != "" {
+								c.createdDataStreams[ds] = true
+							}
+							if bIdx := paramString(subMap, "index"); bIdx != "" {
+								c.createdIndices[bIdx] = true
+							}
+						}
+					}
+				}
+			}
 		}
 	case "indices.put_alias":
 		name := paramString(params, "name")
@@ -765,9 +842,35 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 		} else if name := paramString(params, "name"); name != "" {
 			c.createdILMPolicies[name] = true
 		}
+	case "slm.put_lifecycle":
+		if pol := paramString(params, "policy_id"); pol != "" {
+			c.createdSLMPolicies[pol] = true
+		} else if pol := paramString(params, "policy"); pol != "" {
+			c.createdSLMPolicies[pol] = true
+		} else if pol := paramString(params, "id"); pol != "" {
+			c.createdSLMPolicies[pol] = true
+		} else if pol := paramString(params, "name"); pol != "" {
+			c.createdSLMPolicies[pol] = true
+		}
 	case "enrich.put_policy":
 		if name := paramString(params, "name"); name != "" {
 			c.createdEnrichPols[name] = true
+		}
+	case "watcher.put_watch":
+		if id := paramString(params, "id"); id != "" {
+			c.createdWatches[id] = true
+		} else if id := paramString(params, "watch_id"); id != "" {
+			c.createdWatches[id] = true
+		}
+	case "transform.put_transform":
+		if id := paramString(params, "transform_id"); id != "" {
+			c.createdTransforms[id] = true
+		} else if id := paramString(params, "id"); id != "" {
+			c.createdTransforms[id] = true
+		}
+	case "autoscaling.put_autoscaling_policy":
+		if name := paramString(params, "name"); name != "" {
+			c.createdAutoscalingPolicies[name] = true
 		}
 	case "put_script":
 		if id := paramString(params, "id"); id != "" {
@@ -1471,15 +1574,15 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			reqPath = "/_resolve/index"
 		}
 
-	case "indices.create_data_stream":
+	case "indices.create_data_stream", "data_stream.create_data_stream":
 		method = http.MethodPut
 		name := popString("name")
 		if name == "" {
-			return nil, fmt.Errorf("indices.create_data_stream requires name parameter")
+			return nil, fmt.Errorf("%s requires name parameter", action)
 		}
 		reqPath = "/_data_stream/" + name
 
-	case "indices.get_data_stream":
+	case "indices.get_data_stream", "data_stream.get_data_stream":
 		method = http.MethodGet
 		if name := popString("name"); name != "" {
 			reqPath = "/_data_stream/" + name
@@ -1487,15 +1590,15 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			reqPath = "/_data_stream"
 		}
 
-	case "indices.delete_data_stream":
+	case "indices.delete_data_stream", "data_stream.delete_data_stream":
 		method = http.MethodDelete
 		name := popString("name")
 		if name == "" {
-			return nil, fmt.Errorf("indices.delete_data_stream requires name parameter")
+			return nil, fmt.Errorf("%s requires name parameter", action)
 		}
 		reqPath = "/_data_stream/" + name
 
-	case "indices.data_stream_stats", "indices.data_streams_stats":
+	case "indices.data_stream_stats", "indices.data_streams_stats", "data_stream.data_stream_stats":
 		method = http.MethodGet
 		if name := popString("name"); name != "" {
 			reqPath = "/_data_stream/" + name + "/_stats"
@@ -1503,13 +1606,25 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			reqPath = "/_data_stream/_stats"
 		}
 
-	case "indices.migrate_to_data_stream":
+	case "indices.migrate_to_data_stream", "data_stream.migrate_to_data_stream":
 		method = http.MethodPost
 		name := popString("name")
 		if name == "" {
-			return nil, fmt.Errorf("indices.migrate_to_data_stream requires name parameter")
+			return nil, fmt.Errorf("%s requires name parameter", action)
 		}
 		reqPath = "/_data_stream/_migrate/" + name
+
+	case "indices.modify_data_stream", "data_stream.modify_data_stream":
+		method = http.MethodPost
+		reqPath = "/_data_stream/_modify"
+
+	case "indices.promote_data_stream", "data_stream.promote_data_stream":
+		method = http.MethodPost
+		name := popString("name")
+		if name == "" {
+			return nil, fmt.Errorf("%s requires name parameter", action)
+		}
+		reqPath = "/_data_stream/_promote/" + name
 
 	case "indices.put_template":
 		method = http.MethodPut
@@ -2128,6 +2243,260 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		}
 		reqPath = "/_index_template/_simulate_index/" + name
 
+	case "indices.add_block":
+		method = http.MethodPut
+		idx := popString("index")
+		block := popString("block")
+		if idx == "" || block == "" {
+			return nil, fmt.Errorf("indices.add_block requires index and block parameters")
+		}
+		reqPath = "/" + idx + "/_block/" + block
+
+	case "indices.downgrade":
+		method = http.MethodPost
+		idx := popString("index")
+		if idx == "" {
+			return nil, fmt.Errorf("indices.downgrade requires index parameter")
+		}
+		reqPath = "/" + idx + "/_downgrade"
+
+	case "slm.put_lifecycle":
+		method = http.MethodPut
+		pol := popString("policy_id", "policy", "id", "name")
+		if pol == "" {
+			return nil, fmt.Errorf("slm.put_lifecycle requires policy_id parameter")
+		}
+		reqPath = "/_slm/policy/" + pol
+
+	case "slm.get_lifecycle":
+		method = http.MethodGet
+		if pol := popString("policy_id", "policy", "id", "name"); pol != "" {
+			reqPath = "/_slm/policy/" + pol
+		} else {
+			reqPath = "/_slm/policy"
+		}
+
+	case "slm.delete_lifecycle":
+		method = http.MethodDelete
+		pol := popString("policy_id", "policy", "id", "name")
+		if pol == "" {
+			return nil, fmt.Errorf("slm.delete_lifecycle requires policy_id parameter")
+		}
+		reqPath = "/_slm/policy/" + pol
+
+	case "slm.execute_lifecycle":
+		method = http.MethodPost
+		pol := popString("policy_id", "policy", "id", "name")
+		if pol == "" {
+			return nil, fmt.Errorf("slm.execute_lifecycle requires policy_id parameter")
+		}
+		reqPath = "/_slm/policy/" + pol + "/_execute"
+
+	case "slm.execute_retention":
+		method = http.MethodPost
+		reqPath = "/_slm/_execute_retention"
+
+	case "slm.get_stats":
+		method = http.MethodGet
+		reqPath = "/_slm/stats"
+
+	case "slm.get_status":
+		method = http.MethodGet
+		reqPath = "/_slm/status"
+
+	case "slm.start":
+		method = http.MethodPost
+		reqPath = "/_slm/start"
+
+	case "slm.stop":
+		method = http.MethodPost
+		reqPath = "/_slm/stop"
+
+	case "ingest.processor_grok":
+		method = http.MethodGet
+		reqPath = "/_ingest/processor/grok"
+
+	case "ingest.geo_ip_stats":
+		method = http.MethodGet
+		reqPath = "/_ingest/geoip/stats"
+
+	case "watcher.put_watch":
+		method = http.MethodPut
+		id := popString("id", "watch_id")
+		if id == "" {
+			return nil, fmt.Errorf("watcher.put_watch requires id parameter")
+		}
+		reqPath = "/_watcher/watch/" + id
+
+	case "watcher.get_watch":
+		method = http.MethodGet
+		id := popString("id", "watch_id")
+		if id == "" {
+			return nil, fmt.Errorf("watcher.get_watch requires id parameter")
+		}
+		reqPath = "/_watcher/watch/" + id
+
+	case "watcher.delete_watch":
+		method = http.MethodDelete
+		id := popString("id", "watch_id")
+		if id == "" {
+			return nil, fmt.Errorf("watcher.delete_watch requires id parameter")
+		}
+		reqPath = "/_watcher/watch/" + id
+
+	case "watcher.execute_watch":
+		method = http.MethodPost
+		if id := popString("id", "watch_id"); id != "" {
+			reqPath = "/_watcher/watch/" + id + "/_execute"
+		} else {
+			reqPath = "/_watcher/watch/_execute"
+		}
+
+	case "watcher.ack_watch":
+		method = http.MethodPut
+		watchID := popString("watch_id", "id")
+		actionID := popString("action_id")
+		if watchID == "" {
+			return nil, fmt.Errorf("watcher.ack_watch requires watch_id parameter")
+		}
+		if actionID != "" {
+			reqPath = "/_watcher/watch/" + watchID + "/_ack/" + actionID
+		} else {
+			reqPath = "/_watcher/watch/" + watchID + "/_ack"
+		}
+
+	case "watcher.activate_watch":
+		method = http.MethodPut
+		watchID := popString("watch_id", "id")
+		if watchID == "" {
+			return nil, fmt.Errorf("watcher.activate_watch requires watch_id parameter")
+		}
+		reqPath = "/_watcher/watch/" + watchID + "/_activate"
+
+	case "watcher.deactivate_watch":
+		method = http.MethodPut
+		watchID := popString("watch_id", "id")
+		if watchID == "" {
+			return nil, fmt.Errorf("watcher.deactivate_watch requires watch_id parameter")
+		}
+		reqPath = "/_watcher/watch/" + watchID + "/_deactivate"
+
+	case "watcher.stats":
+		method = http.MethodGet
+		if metric := popString("metric"); metric != "" {
+			reqPath = "/_watcher/stats/" + metric
+		} else {
+			reqPath = "/_watcher/stats"
+		}
+
+	case "watcher.start":
+		method = http.MethodPost
+		reqPath = "/_watcher/_start"
+
+	case "watcher.stop":
+		method = http.MethodPost
+		reqPath = "/_watcher/_stop"
+
+	case "transform.put_transform":
+		method = http.MethodPut
+		id := popString("transform_id", "id")
+		if id == "" {
+			return nil, fmt.Errorf("transform.put_transform requires transform_id parameter")
+		}
+		reqPath = "/_transform/" + id
+
+	case "transform.get_transform":
+		method = http.MethodGet
+		if id := popString("transform_id", "id"); id != "" {
+			reqPath = "/_transform/" + id
+		} else {
+			reqPath = "/_transform"
+		}
+
+	case "transform.delete_transform":
+		method = http.MethodDelete
+		id := popString("transform_id", "id")
+		if id == "" {
+			return nil, fmt.Errorf("transform.delete_transform requires transform_id parameter")
+		}
+		reqPath = "/_transform/" + id
+
+	case "transform.start_transform":
+		method = http.MethodPost
+		id := popString("transform_id", "id")
+		if id == "" {
+			return nil, fmt.Errorf("transform.start_transform requires transform_id parameter")
+		}
+		reqPath = "/_transform/" + id + "/_start"
+
+	case "transform.stop_transform":
+		method = http.MethodPost
+		id := popString("transform_id", "id")
+		if id == "" {
+			return nil, fmt.Errorf("transform.stop_transform requires transform_id parameter")
+		}
+		reqPath = "/_transform/" + id + "/_stop"
+
+	case "transform.get_transform_stats":
+		method = http.MethodGet
+		if id := popString("transform_id", "id"); id != "" {
+			reqPath = "/_transform/" + id + "/_stats"
+		} else {
+			reqPath = "/_transform/_stats"
+		}
+
+	case "transform.preview_transform":
+		method = http.MethodPost
+		reqPath = "/_transform/_preview"
+
+	case "dangling_indices.list_dangling_indices":
+		method = http.MethodGet
+		reqPath = "/_dangling"
+
+	case "dangling_indices.import_dangling_index":
+		method = http.MethodPost
+		uuid := popString("index_uuid")
+		if uuid == "" {
+			return nil, fmt.Errorf("dangling_indices.import_dangling_index requires index_uuid parameter")
+		}
+		reqPath = "/_dangling/" + uuid
+
+	case "dangling_indices.delete_dangling_index":
+		method = http.MethodDelete
+		uuid := popString("index_uuid")
+		if uuid == "" {
+			return nil, fmt.Errorf("dangling_indices.delete_dangling_index requires index_uuid parameter")
+		}
+		reqPath = "/_dangling/" + uuid
+
+	case "autoscaling.put_autoscaling_policy":
+		method = http.MethodPut
+		name := popString("name")
+		if name == "" {
+			return nil, fmt.Errorf("autoscaling.put_autoscaling_policy requires name parameter")
+		}
+		reqPath = "/_autoscaling/policy/" + name
+
+	case "autoscaling.get_autoscaling_policy":
+		method = http.MethodGet
+		if name := popString("name"); name != "" {
+			reqPath = "/_autoscaling/policy/" + name
+		} else {
+			reqPath = "/_autoscaling/policy"
+		}
+
+	case "autoscaling.delete_autoscaling_policy":
+		method = http.MethodDelete
+		name := popString("name")
+		if name == "" {
+			return nil, fmt.Errorf("autoscaling.delete_autoscaling_policy requires name parameter")
+		}
+		reqPath = "/_autoscaling/policy/" + name
+
+	case "autoscaling.get_autoscaling_capacity":
+		method = http.MethodGet
+		reqPath = "/_autoscaling/capacity"
+
 	default:
 		return nil, fmt.Errorf("unsupported rest-api-spec action %q", action)
 	}
@@ -2248,8 +2617,10 @@ func (c *runnerContext) rawHTTP(method, reqPath string, query url.Values, body [
 	defer func() { _ = resp.Body.Close() }()
 	c.lastHeaders = make(map[string]any, len(resp.Header))
 	for k, vals := range resp.Header {
-		if len(vals) > 0 {
+		if len(vals) == 1 {
 			c.lastHeaders[strings.ToLower(k)] = vals[0]
+		} else if len(vals) > 1 {
+			c.lastHeaders[strings.ToLower(k)] = strings.Join(vals, ", ")
 		}
 	}
 	c.lastWarnings = append([]string(nil), resp.Header.Values("Warning")...)
@@ -2569,41 +2940,65 @@ func (c *runnerContext) execContains(rawVal any) error {
 		if !found {
 			return fmt.Errorf("contains: path %q not found in response: %s", fieldPath, c.lastBodyRaw)
 		}
-		sliceVal, ok := actual.([]any)
-		if !ok {
-			return fmt.Errorf("contains %q: expected slice in response, got %T (%v)", fieldPath, actual, actual)
-		}
-		matched := false
-		for _, elem := range sliceVal {
-			if containsElementMatch(elem, expected) {
-				matched = true
-				break
+		switch actVal := actual.(type) {
+		case []any:
+			matched := false
+			for _, elem := range actVal {
+				if containsElementMatch(elem, expected) {
+					matched = true
+					break
+				}
 			}
-		}
-		if !matched {
-			actJSON, _ := json.Marshal(actual)
-			expJSON, _ := json.Marshal(expected)
-			return fmt.Errorf("contains %q failed: no element in %s matched %s", fieldPath, string(actJSON), string(expJSON))
+			if !matched {
+				actJSON, _ := json.Marshal(actual)
+				expJSON, _ := json.Marshal(expected)
+				return fmt.Errorf("contains %q failed: no element in %s matched %s", fieldPath, string(actJSON), string(expJSON))
+			}
+		case string:
+			if !strings.Contains(actVal, fmt.Sprintf("%v", expected)) && matchValues("", actVal, expected) != nil {
+				return fmt.Errorf("contains %q failed: string %q does not contain %v", fieldPath, actVal, expected)
+			}
+		case map[string]any:
+			if !containsElementMatch(actVal, expected) {
+				actJSON, _ := json.Marshal(actual)
+				expJSON, _ := json.Marshal(expected)
+				return fmt.Errorf("contains %q failed: map %s did not match %s", fieldPath, string(actJSON), string(expJSON))
+			}
+		default:
+			return fmt.Errorf("contains %q: expected slice, string, or map in response, got %T (%v)", fieldPath, actual, actual)
 		}
 	}
 	return nil
 }
 
 func containsElementMatch(elem, expected any) bool {
-	if expMap, ok := expected.(map[string]any); ok {
+	switch expVal := expected.(type) {
+	case map[string]any:
 		actMap, ok := elem.(map[string]any)
 		if !ok {
 			return false
 		}
-		for k, expVal := range expMap {
+		for k, v := range expVal {
 			actVal, exists := actMap[k]
-			if !exists || !containsElementMatch(actVal, expVal) {
+			if !exists || !containsElementMatch(actVal, v) {
 				return false
 			}
 		}
 		return true
+	case []any:
+		elemSlice, ok := elem.([]any)
+		if !ok || len(elemSlice) != len(expVal) {
+			return false
+		}
+		for i := range expVal {
+			if !containsElementMatch(elemSlice[i], expVal[i]) {
+				return false
+			}
+		}
+		return true
+	default:
+		return matchValues("", elem, expected) == nil
 	}
-	return matchValues("", elem, expected) == nil
 }
 
 func (c *runnerContext) execMatch(rawVal any) error {

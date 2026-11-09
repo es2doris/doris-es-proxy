@@ -3624,3 +3624,699 @@ func TestRound51F20ToF26Features(t *testing.T) {
 		}
 	})
 }
+
+func TestRound52F20ToF26Features(t *testing.T) {
+	evalOut := func(t *testing.T, script string, params map[string]any) any {
+		t.Helper()
+		doc := map[string]any{}
+		if _, err := Eval(doc, script, params); err != nil {
+			t.Fatalf("Eval failed for script:\n%s\nerr: %v", script, err)
+		}
+		return doc["out"]
+	}
+
+	t.Run("F20_OptionalEmptySentinel_GetException_IsEmpty_And_OrElseThrowSupplier", func(t *testing.T) {
+		got := evalOut(t, `
+			Optional o1 = Optional.empty();
+			Optional o2 = Optional.ofNullable(null);
+			Optional o3 = Optional.of("abc").filter(s -> s.length() > 10);
+			Optional o4 = Stream.of(1, 2, 3).filter(x -> x > 10).findFirst();
+			OptionalInt oi = OptionalInt.empty();
+			OptionalLong ol = OptionalLong.empty();
+			OptionalDouble od = OptionalDouble.empty();
+			String msg1 = "";
+			try {
+				o1.get();
+			} catch (NoSuchElementException e) {
+				msg1 = e.getMessage();
+			}
+			String msg2 = "";
+			try {
+				Stream.empty().findFirst().get();
+			} catch (NoSuchElementException e) {
+				msg2 = e.getMessage();
+			}
+			String msg3 = "";
+			try {
+				o2.orElseThrow(() -> new IllegalStateException("custom_missing"));
+			} catch (IllegalStateException e) {
+				msg3 = e.getMessage();
+			}
+			String msg4 = "";
+			try {
+				Stream.of(1, 2).filter(x -> x > 5).findAny().orElseThrow(IllegalArgumentException::new);
+			} catch (IllegalArgumentException e) {
+				msg4 = "caught_iae";
+			}
+			String msg5 = "";
+			try {
+				oi.getAsInt();
+			} catch (NoSuchElementException e) {
+				msg5 = "caught_oi";
+			}
+			ctx._source.out = [
+				'e1': o1.isEmpty(),
+				'p1': o1.isPresent(),
+				'e2': o2.isEmpty(),
+				'e3': o3.isEmpty(),
+				'e4': o4.isEmpty(),
+				'null_eq': o1 == null,
+				'obj_null': Objects.isNull(o1),
+				'obj_non_null': Objects.nonNull(o1),
+				'or_else': o1.orElse("fallback"),
+				'or_else_get': o2.orElseGet(() -> "computed"),
+				'or_present': Optional.of("ok").orElseThrow(() -> new IllegalStateException("never")),
+				'stream_cnt': o1.stream().count(),
+				'msg1': msg1,
+				'msg2': msg2,
+				'msg3': msg3,
+				'msg4': msg4,
+				'msg5': msg5,
+				'cls': o1.getClass().getName()
+			];
+		`, nil)
+		m, ok := got.(map[string]any)
+		if !ok {
+			t.Fatalf("expected map, got %T (%#v)", got, got)
+		}
+		if m["e1"] != true || m["p1"] != false || m["e2"] != true || m["e3"] != true || m["e4"] != true {
+			t.Fatalf("unexpected Optional emptiness flags: %#v", m)
+		}
+		if m["null_eq"] != true || m["obj_null"] != true || m["obj_non_null"] != false {
+			t.Fatalf("unexpected Optional null equality checks: %#v", m)
+		}
+		if m["or_else"] != "fallback" || m["or_else_get"] != "computed" || m["or_present"] != "ok" || m["stream_cnt"] != int64(0) {
+			t.Fatalf("unexpected Optional fallback values: %#v", m)
+		}
+		if m["msg1"] != "No value present" || m["msg2"] != "No value present" || m["msg3"] != "custom_missing" || m["msg4"] != "caught_iae" || m["msg5"] != "caught_oi" {
+			t.Fatalf("unexpected Optional exception messages: %#v", m)
+		}
+		if m["cls"] != "java.util.Optional" {
+			t.Fatalf("expected java.util.Optional, got %v", m["cls"])
+		}
+
+		// Top-level Eval should unwrap painlessEmptyOptional to nil
+		topRes, err := Eval(map[string]any{}, "return Optional.empty();", nil)
+		if err != nil || topRes != nil {
+			t.Fatalf("expected top-level Optional.empty() to unwrap to nil, got %#v (err=%v)", topRes, err)
+		}
+		if _, err := Eval(map[string]any{}, "return Optional.empty().get();", nil); err == nil || !strings.Contains(err.Error(), "NoSuchElementException") {
+			t.Fatalf("expected NoSuchElementException on Optional.empty().get(), got %v", err)
+		}
+	})
+
+	t.Run("F21_UUID_HexFormat_And_StrictBase64Validation", func(t *testing.T) {
+		got := evalOut(t, `
+			UUID u1 = UUID.fromString("123e4567-e89b-42d3-a456-426614174000");
+			UUID u2 = new UUID(u1.getMostSignificantBits(), u1.getLeastSignificantBits());
+			UUID uShort = UUID.fromString("1-2-3-4-5");
+			boolean badUuid = false;
+			try {
+				UUID.fromString("not-a-valid-uuid");
+			} catch (IllegalArgumentException e) {
+				badUuid = true;
+			}
+
+			HexFormat hf = HexFormat.of();
+			HexFormat hfUpper = HexFormat.ofDelimiter(":").withUpperCase().withPrefix("0x");
+			byte[] raw = "Hi".getBytes();
+			String hex1 = hf.formatHex(raw);
+			String hex2 = hfUpper.formatHex(raw);
+			byte[] parsed1 = hf.parseHex(hex1);
+			byte[] parsed2 = hfUpper.parseHex(hex2);
+			boolean badHex = false;
+			try {
+				hf.parseHex("zz");
+			} catch (IllegalArgumentException e) {
+				badHex = true;
+			}
+
+			String b64Mime = Base64.getMimeEncoder().withoutPadding().encodeToString("hello".getBytes());
+			String b64MimeDec = Base64.getMimeDecoder().decode("aGVs\r\nbG8=");
+			boolean badB64 = false;
+			try {
+				Base64.getDecoder().decode("@@@invalid@@@");
+			} catch (IllegalArgumentException e) {
+				badB64 = true;
+			}
+			boolean badUrlB64 = false;
+			try {
+				Base64.getUrlDecoder().decode("@@@invalid@@@");
+			} catch (IllegalArgumentException e) {
+				badUrlB64 = true;
+			}
+
+			ctx._source.out = [
+				'u1': u1,
+				'u2': u2,
+				'u_eq': u1 == u2,
+				'u_ver': u1.version(),
+				'u_var': u1.variant(),
+				'u_short': uShort,
+				'u_inst': u1 instanceof UUID,
+				'bad_uuid': badUuid,
+				'hex1': hex1,
+				'hex2': hex2,
+				'p1_str': new String(parsed1),
+				'p2_str': new String(parsed2),
+				'to_hex_byte': hf.toHexDigits((byte) 15),
+				'to_hex_4': hf.withUpperCase().toHexDigits(255, 4),
+				'from_hex': HexFormat.fromHexDigits("00ff"),
+				'from_hex_sub': HexFormat.fromHexDigits("xx00ffyy", 2, 6),
+				'from_hex_long': HexFormat.fromHexDigitsToLong("0102030405060708"),
+				'is_hex_t': HexFormat.isHexDigit('f'),
+				'is_hex_f': HexFormat.isHexDigit('g'),
+				'from_digit': HexFormat.fromHexDigit('E'),
+				'hf_inst': hf instanceof HexFormat,
+				'bad_hex': badHex,
+				'b64_mime': b64Mime,
+				'b64_mime_dec': b64MimeDec,
+				'bad_b64': badB64,
+				'bad_url_b64': badUrlB64
+			];
+		`, nil)
+		m, ok := got.(map[string]any)
+		if !ok {
+			t.Fatalf("expected map, got %T (%#v)", got, got)
+		}
+		if m["u1"] != "123e4567-e89b-42d3-a456-426614174000" || m["u_eq"] != true || m["u_ver"] != int64(4) || m["u_var"] != int64(2) {
+			t.Fatalf("unexpected UUID values: %#v", m)
+		}
+		if m["u_short"] != "00000001-0002-0003-0004-000000000005" || m["u_inst"] != true || m["bad_uuid"] != true {
+			t.Fatalf("unexpected UUID normalization/validation: %#v", m)
+		}
+		if m["hex1"] != "4869" || m["hex2"] != "0x48:0x69" || m["p1_str"] != "Hi" || m["p2_str"] != "Hi" || m["bad_hex"] != true {
+			t.Fatalf("unexpected HexFormat format/parse: %#v", m)
+		}
+		if m["to_hex_byte"] != "0f" || m["to_hex_4"] != "00FF" || m["from_hex"] != int64(255) || m["from_hex_sub"] != int64(255) || m["from_hex_long"] != int64(0x0102030405060708) {
+			t.Fatalf("unexpected HexFormat digit conversions: %#v", m)
+		}
+		if m["is_hex_t"] != true || m["is_hex_f"] != false || m["from_digit"] != int64(14) || m["hf_inst"] != true {
+			t.Fatalf("unexpected HexFormat char helpers: %#v", m)
+		}
+		if m["b64_mime"] != "aGVsbG8" || m["b64_mime_dec"] != "hello" || m["bad_b64"] != true || m["bad_url_b64"] != true {
+			t.Fatalf("unexpected Base64 results: %#v", m)
+		}
+	})
+
+	t.Run("F22_StringAndCharSequenceMethods", func(t *testing.T) {
+		got := evalOut(t, `
+			char[] chars = "hello world".toCharArray();
+			String s1 = String.valueOf(chars);
+			String s2 = String.valueOf(chars, 6, 5);
+			String s3 = String.copyValueOf(chars, 0, 5);
+			boolean oob = false;
+			try {
+				String.copyValueOf(chars, 8, 10);
+			} catch (IndexOutOfBoundsException e) {
+				oob = true;
+			}
+			StringBuilder sb = new StringBuilder("hello world");
+			String esc = 'a\\nb\\tc\\s\\101'.translateEscapes();
+			String fmt = "%s=%d".formatted("score", 42);
+			ctx._source.out = [
+				's1': s1,
+				's2': s2,
+				's3': s3,
+				'oob': oob,
+				'ce_sb': s1.contentEquals(sb),
+				'ce_str': s1.contentEquals("hello world"),
+				'ce_false': s1.contentEquals("other"),
+				'esc': esc,
+				'fmt': fmt,
+				'sw_t': "hello world".startsWith("world", 6),
+				'sw_f': "hello world".startsWith("world", 0),
+				'sw_neg': "hello world".startsWith("hello", -1),
+				'sw_oob': "hello world".startsWith("hello", 99)
+			];
+		`, nil)
+		m, ok := got.(map[string]any)
+		if !ok {
+			t.Fatalf("expected map, got %T (%#v)", got, got)
+		}
+		if m["s1"] != "hello world" || m["s2"] != "world" || m["s3"] != "hello" || m["oob"] != true {
+			t.Fatalf("unexpected String.valueOf/copyValueOf results: %#v", m)
+		}
+		if m["ce_sb"] != true || m["ce_str"] != true || m["ce_false"] != false {
+			t.Fatalf("unexpected contentEquals results: %#v", m)
+		}
+		if m["esc"] != "a\nb\tc A" || m["fmt"] != "score=42" {
+			t.Fatalf("unexpected translateEscapes/formatted results: %#v", m)
+		}
+		if m["sw_t"] != true || m["sw_f"] != false || m["sw_neg"] != false || m["sw_oob"] != false {
+			t.Fatalf("unexpected 2-arg startsWith results: %#v", m)
+		}
+	})
+
+	t.Run("F23_NavigableMap_NavigableSet_Deque_And_PriorityQueue", func(t *testing.T) {
+		got := evalOut(t, `
+			NavigableMap tm = new TreeMap();
+			tm.put("b", 2);
+			tm.put("a", 1);
+			tm.put("d", 4);
+			tm.put("c", 3);
+			String fk = tm.firstKey();
+			String lk = tm.lastKey();
+			String flk = tm.floorKey("c");
+			String lwk = tm.lowerKey("c");
+			String clk = tm.ceilingKey("b");
+			String hgk = tm.higherKey("b");
+			Map hm = tm.headMap("c", true);
+			Map tmap = tm.tailMap("b", false);
+			Map sm = tm.subMap("b", true, "d", false);
+			List dks = tm.descendingKeySet();
+			Map.Entry fe = tm.pollFirstEntry();
+			Map.Entry le = tm.pollLastEntry();
+
+			NavigableSet ts = new TreeSet();
+			ts.add(30);
+			ts.add(10);
+			ts.add(20);
+			ts.add(10);
+
+			Deque dq = new ArrayDeque();
+			dq.addLast("m");
+			dq.addFirst("a");
+			dq.offerLast("z");
+			String dqFirst = dq.peekFirst();
+			String dqLast = dq.pollLast();
+
+			Queue pq = new PriorityQueue();
+			pq.offer(30);
+			pq.offer(10);
+			pq.offer(20);
+			int pq1 = pq.poll();
+			int pq2 = pq.peek();
+
+			ctx._source.out = [
+				'fk': fk,
+				'lk': lk,
+				'flk': flk,
+				'lwk': lwk,
+				'clk': clk,
+				'hgk': hgk,
+				'hm_sz': hm.size(),
+				'tm_sz': tmap.size(),
+				'sm_sz': sm.size(),
+				'dks': dks,
+				'fe_k': fe.getKey(),
+				'le_k': le.getKey(),
+				'rem_sz': tm.size(),
+				'ts_first': ts.first(),
+				'ts_last': ts.last(),
+				'ts_floor': ts.floor(25),
+				'ts_ceil': ts.ceiling(15),
+				'ts_lower': ts.lower(20),
+				'ts_higher': ts.higher(20),
+				'ts_desc': ts.descendingSet(),
+				'dq_first': dqFirst,
+				'dq_last': dqLast,
+				'dq_sz': dq.size(),
+				'pq1': pq1,
+				'pq2': pq2
+			];
+		`, nil)
+		m, ok := got.(map[string]any)
+		if !ok {
+			t.Fatalf("expected map, got %T (%#v)", got, got)
+		}
+		if m["fk"] != "a" || m["lk"] != "d" || m["flk"] != "c" || m["lwk"] != "b" || m["clk"] != "b" || m["hgk"] != "c" {
+			t.Fatalf("unexpected TreeMap key navigation: %#v", m)
+		}
+		if m["hm_sz"] != int64(3) || m["tm_sz"] != int64(2) || m["sm_sz"] != int64(2) || m["fe_k"] != "a" || m["le_k"] != "d" || m["rem_sz"] != int64(2) {
+			t.Fatalf("unexpected TreeMap submaps/polls: %#v", m)
+		}
+		if m["ts_first"] != int64(10) || m["ts_last"] != int64(30) || m["ts_floor"] != int64(20) || m["ts_ceil"] != int64(20) || m["ts_lower"] != int64(10) || m["ts_higher"] != int64(30) {
+			t.Fatalf("unexpected TreeSet navigation: %#v", m)
+		}
+		if m["dq_first"] != "a" || m["dq_last"] != "z" || m["dq_sz"] != int64(2) || m["pq1"] != int64(10) || m["pq2"] != int64(20) {
+			t.Fatalf("unexpected ArrayDeque/PriorityQueue results: %#v", m)
+		}
+	})
+
+	t.Run("F24_StreamIterateGenerate_And_Collectors", func(t *testing.T) {
+		got := evalOut(t, `
+			List iter2 = Stream.iterate(1, n -> n * 2).limit(4).collect(Collectors.toList());
+			List iter3 = IntStream.iterate(1, n -> n < 10, n -> n + 3).boxed().collect(Collectors.toList());
+			List gen = Stream.generate(() -> "x").limit(3).collect(Collectors.toList());
+			Map unmod = Stream.of("a", "bb").collect(Collectors.toUnmodifiableMap(s -> s, s -> s.length()));
+			boolean dupKeyErr = false;
+			try {
+				Stream.of("a", "a").collect(Collectors.toUnmodifiableMap(s -> s, s -> 1));
+			} catch (IllegalStateException e) {
+				dupKeyErr = true;
+			}
+			List filt = Stream.of(1, 2, 3, 4, 5).collect(Collectors.filtering(x -> x % 2 == 1, Collectors.toList()));
+			List flat = Stream.of([1, 2], [3, 4]).collect(Collectors.flatMapping(x -> x.stream(), Collectors.toList()));
+			Map tee = Stream.of(10, 20, 30).collect(Collectors.teeing(
+				Collectors.summingInt(x -> x),
+				Collectors.counting(),
+				(sum, cnt) -> ['sum': sum, 'cnt': cnt, 'avg': sum / cnt]
+			));
+			ctx._source.out = [
+				'iter2': iter2,
+				'iter3': iter3,
+				'gen': gen,
+				'unmod_bb': unmod['bb'],
+				'dup_err': dupKeyErr,
+				'filt': filt,
+				'flat': flat,
+				'tee': tee
+			];
+		`, nil)
+		m, ok := got.(map[string]any)
+		if !ok {
+			t.Fatalf("expected map, got %T (%#v)", got, got)
+		}
+		if len(m["iter2"].([]any)) != 4 || m["iter2"].([]any)[3] != int64(8) {
+			t.Fatalf("unexpected iter2: %#v", m["iter2"])
+		}
+		if len(m["iter3"].([]any)) != 3 || m["iter3"].([]any)[2] != int64(7) {
+			t.Fatalf("unexpected iter3: %#v", m["iter3"])
+		}
+		if len(m["gen"].([]any)) != 3 || m["gen"].([]any)[0] != "x" {
+			t.Fatalf("unexpected gen: %#v", m["gen"])
+		}
+		if m["unmod_bb"] != int64(2) || m["dup_err"] != true {
+			t.Fatalf("unexpected toUnmodifiableMap results: %#v", m)
+		}
+		if len(m["filt"].([]any)) != 3 || m["filt"].([]any)[2] != int64(5) {
+			t.Fatalf("unexpected Collectors.filtering: %#v", m["filt"])
+		}
+		if len(m["flat"].([]any)) != 4 || m["flat"].([]any)[3] != int64(4) {
+			t.Fatalf("unexpected Collectors.flatMapping: %#v", m["flat"])
+		}
+		teeMap, _ := m["tee"].(map[string]any)
+		if teeMap["sum"] != int64(60) || teeMap["cnt"] != int64(3) || teeMap["avg"] != int64(20) {
+			t.Fatalf("unexpected Collectors.teeing: %#v", m["tee"])
+		}
+	})
+
+	t.Run("F25_LabeledLoops_And_MultiVarForInitializer", func(t *testing.T) {
+		got := evalOut(t, `
+			int hits = 0;
+			outer: for (int i = 0; i < 4; i++) {
+				for (int j = 0; j < 4; j++) {
+					if (j == 1 && i < 2) {
+						continue outer;
+					}
+					if (i == 2 && j == 1) {
+						break outer;
+					}
+					hits++;
+				}
+			}
+			int a = 0;
+			int b = 0;
+			int sum = 0;
+			for (a = 1, b = 10; a < b; a++, b--) {
+				sum += a + b;
+			}
+			ctx._source.out = [
+				'hits': hits,
+				'sum': sum,
+				'a': a,
+				'b': b
+			];
+		`, nil)
+		m, ok := got.(map[string]any)
+		if !ok {
+			t.Fatalf("expected map, got %T (%#v)", got, got)
+		}
+		if m["hits"] != int64(3) || m["sum"] != int64(55) || m["a"] != int64(6) || m["b"] != int64(5) {
+			t.Fatalf("unexpected labeled loop / multi-var for results: %#v", m)
+		}
+	})
+
+	t.Run("F26_CtxOpIllegalArgumentException_And_DirectCtxSourceAssign", func(t *testing.T) {
+		rawDoc := json.RawMessage(`{"old":"val"}`)
+		if _, _, err := ApplyUpdateWithResult(rawDoc, &UpdateRequest{
+			Script: &ScriptSpec{Source: `ctx.op = "invalid_op";`},
+		}, false); err == nil || !strings.Contains(err.Error(), "illegal_argument_exception") {
+			t.Fatalf("expected illegal_argument_exception for invalid ctx.op, got %v", err)
+		}
+
+		doc2 := map[string]any{"old": "val", "__reindex_id": "doc2"}
+		if _, err := Eval(doc2, `
+			Map prev = ctx._source;
+			int prevSz = prev.size();
+			ctx._source = ['fresh': 'data', 'prev_sz': prevSz];
+		`, nil); err != nil {
+			t.Fatalf("unexpected error on direct ctx._source assignment: %v", err)
+		}
+		if _, hasOld := doc2["old"]; hasOld {
+			t.Fatalf("expected old key to be removed after ctx._source replacement: %#v", doc2)
+		}
+		if doc2["fresh"] != "data" || doc2["prev_sz"] != int64(1) || doc2["__reindex_id"] != "doc2" {
+			t.Fatalf("unexpected doc2 after ctx._source replacement: %#v", doc2)
+		}
+
+		doc3 := map[string]any{"a": 1, "b": 2}
+		if _, err := Eval(doc3, `ctx['_source'] = ['only': 42];`, nil); err != nil {
+			t.Fatalf("unexpected error on bracket ctx['_source'] assignment: %v", err)
+		}
+		if _, hasA := doc3["a"]; hasA {
+			t.Fatalf("expected old key 'a' to be removed: %#v", doc3)
+		}
+		if doc3["only"] != int64(42) {
+			t.Fatalf("unexpected doc3 after ctx['_source'] replacement: %#v", doc3)
+		}
+	})
+
+	t.Run("HexFormat_Navigable_Deque_StreamIterate_And_CtxMutations_Coverage", func(t *testing.T) {
+		got := evalOut(t, `
+			def hf = HexFormat.ofDelimiter(":").withPrefix("0x").withSuffix("h").withUpperCase();
+			def formattedSub = hf.formatHex(new byte[]{1, 10, 255, 16}, 1, 3);
+			def parsedSub = hf.parseHex("0x01h:0x0Ah:0xFFh", 6, 17);
+			def hfPlain = HexFormat.of().withPrefix("<").withSuffix(">").withLowerCase();
+			def plainFormatted = hfPlain.formatHex(new byte[]{10, 11});
+			def plainParsed = hfPlain.parseHex("<0a><0b>");
+			def hByte = hfPlain.toHexDigits((byte) 15);
+			def hShort = hfPlain.toHexDigits((short) 255);
+			def hLong = hfPlain.toHexDigits(255L);
+			def hChar = hf.toHexDigits('A');
+			def hBig = hfPlain.toHexDigits(5000000000L);
+			def hZero = hfPlain.toHexDigits(255, 0);
+			def hFour = hf.toHexDigits(255, 4);
+			def fromSub = hfPlain.fromHexDigits("zz00ffzz", 2, 6);
+			def fromLongSub = hfPlain.fromHexDigitsToLong("zz0000000100000000zz", 2, 18);
+			boolean isD1 = HexFormat.isHexDigit('f');
+			boolean isD2 = HexFormat.isHexDigit('G');
+			boolean isD3 = HexFormat.isHexDigit(65);
+			int fd1 = HexFormat.fromHexDigit('a');
+			int fd2 = HexFormat.fromHexDigit('F');
+			int fd3 = HexFormat.fromHexDigit('9');
+			int fd4 = HexFormat.fromHexDigit(66);
+
+			boolean errFmtOob = false;
+			try { hf.formatHex(new byte[]{1, 2}, -1, 5); } catch (IndexOutOfBoundsException e) { errFmtOob = true; }
+			boolean errParseOob = false;
+			try { hf.parseHex("0x01h", 0, 99); } catch (IndexOutOfBoundsException e) { errParseOob = true; }
+			boolean errParseTok = false;
+			try { hf.parseHex("bad_tok"); } catch (IllegalArgumentException e) { errParseTok = true; }
+			boolean errParseLen = false;
+			try { hfPlain.parseHex("<0a>x"); } catch (IllegalArgumentException e) { errParseLen = true; }
+			boolean errParseAffix = false;
+			try { hfPlain.parseHex("[0a]"); } catch (IllegalArgumentException e) { errParseAffix = true; }
+			boolean errDigitsRange = false;
+			try { hfPlain.toHexDigits(10, 20); } catch (IllegalArgumentException e) { errDigitsRange = true; }
+			boolean errFromOob = false;
+			try { hfPlain.fromHexDigits("abcd", -1, 2); } catch (IndexOutOfBoundsException e) { errFromOob = true; }
+			boolean errFromBad = false;
+			try { hfPlain.fromHexDigits("zzzz"); } catch (NumberFormatException e) { errFromBad = true; }
+			boolean errFromDigit = false;
+			try { HexFormat.fromHexDigit('z'); } catch (NumberFormatException e) { errFromDigit = true; }
+
+			TreeMap tm = new TreeMap();
+			boolean emptyTmErr = false;
+			try { tm.firstKey(); } catch (NoSuchElementException e) { emptyTmErr = true; }
+			boolean emptyTmLastErr = false;
+			try { tm.lastKey(); } catch (NoSuchElementException e) { emptyTmLastErr = true; }
+			def emptyFirstEnt = tm.firstEntry();
+			def emptyLastEnt = tm.lastEntry();
+			def emptyPollFirst = tm.pollFirstEntry();
+			def emptyPollLast = tm.pollLastEntry();
+			tm.put("a", 1);
+			tm.put("b", 2);
+			tm.put("c", 3);
+			tm.put("d", 4);
+			tm.put("e", 5);
+			def fk = tm.firstKey();
+			def lk = tm.lastKey();
+			def fe = tm.firstEntry();
+			def le = tm.lastEntry();
+			def nks = tm.navigableKeySet();
+			def dks = tm.descendingKeySet();
+			def dmap = tm.descendingMap();
+			def flk = tm.floorKey("c");
+			def clk = tm.ceilingKey("c");
+			def lwk = tm.lowerKey("c");
+			def hgk = tm.higherKey("c");
+			def fle = tm.floorEntry("c");
+			def cle = tm.ceilingEntry("c");
+			def lwe = tm.lowerEntry("c");
+			def hge = tm.higherEntry("c");
+			def hm1 = tm.headMap("c");
+			def hm2 = tm.headMap("c", true);
+			def tm1 = tm.tailMap("c");
+			def tm2 = tm.tailMap("c", false);
+			def sm1 = tm.subMap("b", "d");
+			def sm2 = tm.subMap("b", false, "d", true);
+			def pfe = tm.pollFirstEntry();
+			def ple = tm.pollLastEntry();
+
+			TreeSet ts = new TreeSet([10, 20, 30, 40, 50]);
+			def tsFirst = ts.first();
+			def tsLast = ts.last();
+			def tsDesc = ts.descendingSet();
+			def tsFl = ts.floor(25);
+			def tsCl = ts.ceiling(25);
+			def tsLw = ts.lower(20);
+			def tsHg = ts.higher(40);
+			def tsHs1 = ts.headSet(30);
+			def tsHs2 = ts.headSet(30, true);
+			def tsTs1 = ts.tailSet(30);
+			def tsTs2 = ts.tailSet(30, false);
+			def tsSs1 = ts.subSet(20, 40);
+			def tsSs2 = ts.subSet(20, false, 40, true);
+
+			ArrayDeque dq = new ArrayDeque();
+			boolean dqEmptyErr1 = false;
+			try { dq.getFirst(); } catch (NoSuchElementException e) { dqEmptyErr1 = true; }
+			boolean dqEmptyErr2 = false;
+			try { dq.getLast(); } catch (NoSuchElementException e) { dqEmptyErr2 = true; }
+			boolean dqEmptyErr3 = false;
+			try { dq.removeFirst(); } catch (NoSuchElementException e) { dqEmptyErr3 = true; }
+			boolean dqEmptyErr4 = false;
+			try { dq.removeLast(); } catch (NoSuchElementException e) { dqEmptyErr4 = true; }
+			def dqPeekEmpty1 = dq.peekFirst();
+			def dqPeekEmpty2 = dq.peekLast();
+			def dqPollEmpty1 = dq.pollFirst();
+			def dqPollEmpty2 = dq.pollLast();
+			dq.addFirst(2);
+			dq.offerFirst(1);
+			dq.push(0);
+			dq.addLast(3);
+			dq.offerLast(4);
+			dq.offer(5);
+			def dqGf = dq.getFirst();
+			def dqGl = dq.getLast();
+			def dqPf = dq.peekFirst();
+			def dqPl = dq.peekLast();
+			def dqRf = dq.removeFirst();
+			def dqRl = dq.removeLast();
+			def dqPlf = dq.pollFirst();
+			def dqPll = dq.pollLast();
+			dq.add(2);
+			dq.add(3);
+			dq.add(2);
+			boolean rfo = dq.removeFirstOccurrence(2);
+			boolean rlo = dq.removeLastOccurrence(2);
+			boolean rfoMiss = dq.removeFirstOccurrence(999);
+			boolean rloMiss = dq.removeLastOccurrence(999);
+
+			def genList = Stream.generate(() -> 7).limit(3).collect(Collectors.toList());
+			def iterSkipList = Stream.iterate(1, n -> n + 1).skip(2).limit(3).collect(Collectors.toList());
+			def iterPredSum = IntStream.iterate(1, n -> n < 5, n -> n + 1).sum();
+
+			ctx._source.arr = [10, 20];
+			def prevSet = ctx._source.arr.set(0, 11);
+			def rAdd1 = ctx._source.arr.add(1, 15);
+			def rAdd2 = ctx._source.arr.add(25);
+			def rAddAll1 = ctx._source.arr.addAll([30, 35]);
+			def rAddAll2 = ctx._source.arr.addAll(0, [5]);
+			def rSort1 = ctx._source.arr.sort((a, b) -> a - b);
+			ctx._source.sub = ['k1': 'v1'];
+			def rPut1 = ctx._source.sub.put('k2', 'v2');
+			def rPutAll1 = ctx._source.sub.putAll(['k3': 'v3', 'k4': 'v4']);
+			def rPia1 = ctx._source.sub.putIfAbsent('k2', 'nope');
+			def rPia2 = ctx._source.sub.putIfAbsent('k5', 'v5');
+			def rRep1 = ctx._source.sub.replace('k5', 'v5_new');
+			def rRep2 = ctx._source.sub.replace('k5', 'v5_new', 'v5_final');
+			def rRem0 = ctx._source.sub.remove('k5');
+			def rRem1 = ctx._source.sub.remove('k4', 'v4');
+			def rRem2 = ctx._source.sub.remove('k3');
+			def rPutSrc = ctx._source.put('top_k', 'top_v');
+			def rPiaSrc = ctx._source.putIfAbsent('top_k', 'nope');
+			def rPutAllSrc = ctx._source.putAll(['top_k2': 'v2']);
+			def rRemSrc1 = ctx._source.remove('top_k2', 'v2');
+			def rRemSrc2 = ctx._source.remove('top_k');
+
+			List locArr = [10, 20];
+			def lSet = locArr.set(0, 11);
+			def lAdd1 = locArr.add(1, 15);
+			def lAdd2 = locArr.add(25);
+			def lAddAll1 = locArr.addAll([30, 35]);
+			def lAddAll2 = locArr.addAll(0, [5]);
+			def lSort = locArr.sort((a, b) -> a - b);
+			def lSub = locArr.subList(1, 3);
+			Map locMap = ['a': 1];
+			def lmPut = locMap.put('b', 2);
+			def lmPutAll = locMap.putAll(['c': 3, 'd': 4]);
+			def lmPia1 = locMap.putIfAbsent('b', 99);
+			def lmPia2 = locMap.putIfAbsent('e', 5);
+			def lmRep1 = locMap.replace('e', 50);
+			def lmRep2 = locMap.replace('e', 50, 500);
+			def lmRem1 = locMap.remove('d', 4);
+			def lmRem2 = locMap.remove('c');
+			def lmGod = locMap.getOrDefault('missing', 42);
+
+			def pPut = params.put('pk1', 100);
+			def pPia1 = params.putIfAbsent('pk1', 999);
+			def pPia2 = params.putIfAbsent('pk4', 400);
+			def pPutAll = params.putAll(['pk2': 200, 'pk3': 300]);
+			def pRem0 = params.remove('pk4');
+			def pRem1 = params.remove('pk2', 200);
+			def pRem2 = params.remove('pk3');
+
+			boolean rm1 = "Hello World".regionMatches(true, 0, "hello", 0, 5);
+			boolean rm2 = "Hello World".regionMatches(6, "World", 0, 5);
+			String sbRep = new StringBuilder("abcdef").replace(1, 4, "XY").toString();
+
+			ctx._source.out = [
+				'formattedSub': formattedSub,
+				'parsedSubLen': parsedSub.size(),
+				'plainFormatted': plainFormatted,
+				'plainParsedLen': plainParsed.size(),
+				'hByte': hByte,
+				'hShort': hShort,
+				'hLong': hLong,
+				'hChar': hChar,
+				'hBig': hBig,
+				'hZero': hZero,
+				'hFour': hFour,
+				'fromSub': fromSub,
+				'fromLongSub': fromLongSub,
+				'isD': [isD1, isD2, isD3],
+				'fd': [fd1, fd2, fd3, fd4],
+				'errs': [errFmtOob, errParseOob, errParseTok, errParseLen, errParseAffix, errDigitsRange, errFromOob, errFromBad, errFromDigit],
+				'tm': [fk, lk, fe.key, le.key, nks.size(), dks[0], dmap.firstKey(), flk, clk, lwk, hgk, fle.key, cle.key, lwe.key, hge.key, hm1.size(), hm2.size(), tm1.size(), tm2.size(), sm1.size(), sm2.size(), pfe.key, ple.key, emptyTmErr, emptyTmLastErr, emptyFirstEnt == null, emptyLastEnt == null, emptyPollFirst == null, emptyPollLast == null],
+				'ts': [tsFirst, tsLast, tsDesc[0], tsFl, tsCl, tsLw, tsHg, tsHs1.size(), tsHs2.size(), tsTs1.size(), tsTs2.size(), tsSs1.size(), tsSs2.size()],
+				'dq': [dqEmptyErr1, dqEmptyErr2, dqEmptyErr3, dqEmptyErr4, dqPeekEmpty1 == null, dqPeekEmpty2 == null, dqPollEmpty1 == null, dqPollEmpty2 == null, dqGf, dqGl, dqPf, dqPl, dqRf, dqRl, dqPlf, dqPll, rfo, rlo, !rfoMiss, !rloMiss],
+				'streams': [genList.size(), iterSkipList[0], iterPredSum],
+				'arrLen': ctx._source.arr.size(),
+				'prevSet': prevSet,
+				'subSize': ctx._source.sub.size(),
+				'pk1': params.pk1
+			];
+		`, map[string]any{})
+		m, ok := got.(map[string]any)
+		if !ok {
+			t.Fatalf("expected map, got %T (%#v)", got, got)
+		}
+		if m["formattedSub"] != "0x0Ah:0xFFh" || m["plainFormatted"] != "<0a><0b>" {
+			t.Fatalf("unexpected HexFormat results: %#v", m)
+		}
+		if m["hByte"] != "0f" || m["hShort"] != "00ff" || m["hChar"] != "0041" || m["hFour"] != "00FF" {
+			t.Fatalf("unexpected toHexDigits results: %#v", m)
+		}
+		for i, b := range m["errs"].([]any) {
+			if b != true {
+				t.Fatalf("expected errs[%d] to be true, got %#v", i, m["errs"])
+			}
+		}
+		if m["arrLen"] != int64(7) || m["prevSet"] != int64(10) || m["subSize"] != int64(2) || m["pk1"] != int64(100) {
+			t.Fatalf("unexpected mutation results: %#v", m)
+		}
+	})
+}

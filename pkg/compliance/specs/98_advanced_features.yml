@@ -143,3 +143,134 @@
       indices.delete_data_stream:
         name: r47_ds
   - match: { acknowledged: true }
+
+---
+"Round 52 Index blocks SLM Watcher Transform Dangling Autoscaling and Data Stream lifecycle":
+  - do:
+      indices.create:
+        index: r52_comp_blk
+  - do:
+      index:
+        index: r52_comp_blk
+        id: "1"
+        body: { "title": "doc1" }
+  - do:
+      indices.add_block:
+        index: r52_comp_blk
+        block: write
+  - match: { acknowledged: true }
+  - do:
+      catch: forbidden
+      index:
+        index: r52_comp_blk
+        id: "2"
+        body: { "title": "blocked" }
+  - do:
+      indices.put_settings:
+        index: r52_comp_blk
+        body:
+          index:
+            blocks:
+              write: false
+  - match: { acknowledged: true }
+
+  - do:
+      snapshot.create_repository:
+        repository: r52_comp_repo
+        body:
+          type: fs
+  - do:
+      slm.put_lifecycle:
+        policy_id: r52_comp_slm
+        body:
+          schedule: "0 30 1 * * ?"
+          name: "<r52-snap-{now/d}>"
+          repository: r52_comp_repo
+  - match: { acknowledged: true }
+  - do:
+      slm.execute_lifecycle:
+        policy_id: r52_comp_slm
+  - is_true: snapshot_name
+  - do:
+      slm.get_status: {}
+  - match: { operation_mode: "RUNNING" }
+  - do:
+      slm.delete_lifecycle:
+        policy_id: r52_comp_slm
+  - match: { acknowledged: true }
+
+  - do:
+      watcher.put_watch:
+        id: r52_comp_watch
+        body:
+          trigger: { schedule: { interval: "10m" } }
+          input: { simple: {} }
+          actions: { log: { logging: { text: "alert" } } }
+  - is_true: _id
+  - do:
+      watcher.execute_watch:
+        id: r52_comp_watch
+  - is_true: watch_record
+  - do:
+      watcher.delete_watch:
+        id: r52_comp_watch
+  - match: { found: true }
+
+  - do:
+      transform.put_transform:
+        transform_id: r52_comp_tf
+        body:
+          source: { index: ["r52_comp_blk"] }
+          dest: { index: "r52_comp_tf_dest" }
+          pivot:
+            group_by: { title: { terms: { field: "title" } } }
+            aggregations: { cnt: { value_count: { field: "title" } } }
+  - match: { acknowledged: true }
+  - do:
+      transform.start_transform:
+        transform_id: r52_comp_tf
+  - match: { acknowledged: true }
+  - do:
+      transform.stop_transform:
+        transform_id: r52_comp_tf
+  - match: { acknowledged: true }
+  - do:
+      transform.delete_transform:
+        transform_id: r52_comp_tf
+  - match: { acknowledged: true }
+
+  - do:
+      dangling_indices.list_dangling_indices: {}
+  - is_true: _nodes
+  - do:
+      autoscaling.put_autoscaling_policy:
+        name: r52_comp_auto
+        body:
+          roles: ["data_hot"]
+          deciders: { fixed: {} }
+  - match: { acknowledged: true }
+  - do:
+      autoscaling.get_autoscaling_capacity: {}
+  - is_true: policies
+  - do:
+      autoscaling.delete_autoscaling_policy:
+        name: r52_comp_auto
+  - match: { acknowledged: true }
+
+  - do:
+      indices.create_data_stream:
+        name: r52_comp_ds
+  - do:
+      catch: bad_request
+      index:
+        index: r52_comp_ds
+        id: "1"
+        body: { "@timestamp": "2026-01-01T00:00:00Z" }
+  - do:
+      indices.promote_data_stream:
+        name: r52_comp_ds
+  - match: { acknowledged: true }
+  - do:
+      indices.delete_data_stream:
+        name: r52_comp_ds
+  - match: { acknowledged: true }

@@ -1997,3 +1997,152 @@ func TestRound51ASTValidationF10ToF19(t *testing.T) {
 		}
 	}
 }
+
+func TestRound52ASTValidationF10ToF14(t *testing.T) {
+	// F10: PinnedQuery & MoreLikeThisQuery
+	for _, validQ := range []string{
+		`{"pinned":{"ids":["1","2"],"organic":{"match_all":{}}}}`,
+		`{"pinned":{"docs":[{"_index":"idx","_id":"1"}],"organic":{"match_all":{}}}}`,
+		`{"more_like_this":{"fields":["title"],"like":"quick fox","min_term_freq":1,"max_query_terms":12}}`,
+		`{"more_like_this":{"fields":["title"],"like":["quick fox",{"_index":"idx","_id":"1"}],"unlike":"lazy dog"}}`,
+	} {
+		var q Query
+		if err := json.Unmarshal([]byte(validQ), &q); err != nil {
+			t.Fatalf("F10 valid query %s failed: %v", validQ, err)
+		}
+	}
+	for _, badQ := range []string{
+		`{"pinned":{"ids":["1"],"docs":[{"_id":"1"}],"organic":{"match_all":{}}}}`,
+		`{"pinned":{"ids":[""],"organic":{"match_all":{}}}}`,
+		`{"pinned":{"docs":[{"_index":"idx"}],"organic":{"match_all":{}}}}`,
+		`{"pinned":{"docs":[{"_id":"1","unknown":1}],"organic":{"match_all":{}}}}`,
+		`{"more_like_this":{"like":""}}`,
+		`{"more_like_this":{"like":[]}}`,
+		`{"more_like_this":{"like":[""]}}`,
+		`{"more_like_this":{"like":[{"_index":"idx"}]}}`,
+		`{"more_like_this":{"like":[{"_id":"1","unknown":1}]}}`,
+		`{"more_like_this":{"like":"fox","unlike":[""]}}`,
+		`{"more_like_this":{"like":"fox","min_term_freq":-1}}`,
+		`{"more_like_this":{"like":"fox","max_query_terms":-1}}`,
+		`{"more_like_this":{"like":"fox","min_doc_freq":5,"max_doc_freq":2}}`,
+		`{"more_like_this":{"like":"fox","min_word_length":6,"max_word_length":3}}`,
+	} {
+		var q Query
+		if err := json.Unmarshal([]byte(badQ), &q); err == nil {
+			t.Fatalf("F10 expected error for invalid query %s", badQ)
+		}
+	}
+
+	// F11-F14: SuggestSpec, DateHistogram, AutoDateHistogram, Range, RareTerms, Sampler, TopHits, TopMetrics, Percentiles, Pipeline Aggs
+	for _, validReq := range []string{
+		`{"suggest":{"text":"quik","my_s":{"term":{"field":"title","size":5,"suggest_mode":"missing","sort":"score","string_distance":"levenshtein","max_edits":2}}}}`,
+		`{"suggest":{"my_p":{"text":"quik fox","phrase":{"field":"title","gram_size":2,"confidence":1.0,"highlight":{"pre_tag":"<em>","post_tag":"</em>"}}}}}`,
+		`{"suggest":{"my_c":{"prefix":"qu","completion":{"field":"suggest","size":5,"skip_duplicates":true,"fuzzy":{"fuzziness":"AUTO"}}}}}`,
+		`{"aggs":{"dh":{"date_histogram":{"field":"ts","calendar_interval":"1d","hard_bounds":{"min":"2025-01-01","max":"2025-01-10"}}}}}`,
+		`{"aggs":{"adh":{"auto_date_histogram":{"field":"ts","buckets":10,"minimum_interval":"day"}}}}`,
+		`{"aggs":{"r":{"range":{"field":"price","ranges":[{"to":50},{"from":50,"to":100},{"from":100}]}}}}`,
+		`{"aggs":{"rt":{"rare_terms":{"field":"tag","max_doc_count":5}}}}`,
+		`{"aggs":{"s":{"sampler":{"shard_size":100,"execution_hint":"map"}}}}`,
+		`{"aggs":{"th":{"top_hits":{"size":3,"from":0}}}}`,
+		`{"aggs":{"tm":{"top_metrics":{"metrics":{"field":"price"},"sort":[{"ts":"desc"}],"size":1}}}}`,
+		`{"aggs":{"p":{"percentiles":{"field":"price","percents":[50,95,99],"tdigest":{"compression":100}}}}}`,
+		`{"aggs":{"pr":{"percentile_ranks":{"field":"price","values":[10,50],"hdr":{"number_of_significant_value_digits":3}}}}}`,
+		`{"aggs":{"dh":{"date_histogram":{"field":"ts","calendar_interval":"1d"},"aggs":{"s":{"sum":{"field":"price"}},"d":{"derivative":{"buckets_path":"s","gap_policy":"skip"}},"bs":{"bucket_selector":{"buckets_path":{"v":"s"},"script":"params.v > 10"}},"bso":{"bucket_sort":{"from":0,"size":5}},"ma":{"moving_avg":{"buckets_path":"s","window":3}},"sd":{"serial_diff":{"buckets_path":"s","lag":1}},"norm":{"normalize":{"buckets_path":"s","method":"percent_of_sum"}},"pb":{"percentiles_bucket":{"buckets_path":"s","percents":[50,90]}}}}}}`,
+	} {
+		var sr SearchRequest
+		if err := json.Unmarshal([]byte(validReq), &sr); err != nil {
+			t.Fatalf("F11-F14 valid SearchRequest %s failed: %v", validReq, err)
+		}
+	}
+
+	for _, badReq := range []string{
+		// F11: SuggestSpec
+		`{"suggest":{"my_s":{"text":"quik"}}}`,
+		`{"suggest":{"my_s":{"text":"quik","term":{"field":"title"},"phrase":{"field":"title"}}}}`,
+		`{"suggest":{"my_s":{"text":"quik","unknown":1,"term":{"field":"title"}}}}`,
+		`{"suggest":{"my_s":{"text":"quik","term":{}}}}`,
+		`{"suggest":{"my_s":{"text":"quik","term":{"field":"title","size":0}}}}`,
+		`{"suggest":{"my_s":{"text":"quik","term":{"field":"title","suggest_mode":"bogus"}}}}`,
+		`{"suggest":{"my_s":{"text":"quik","term":{"field":"title","sort":"bogus"}}}}`,
+		`{"suggest":{"my_s":{"text":"quik","term":{"field":"title","string_distance":"bogus"}}}}`,
+		`{"suggest":{"my_s":{"text":"quik","term":{"field":"title","max_edits":3}}}}`,
+		`{"suggest":{"my_s":{"text":"quik","term":{"field":"title","unknown":1}}}}`,
+		`{"suggest":{"my_p":{"text":"quik","phrase":{}}}}`,
+		`{"suggest":{"my_p":{"text":"quik","phrase":{"field":"title","gram_size":0}}}}`,
+		`{"suggest":{"my_p":{"text":"quik","phrase":{"field":"title","confidence":-1}}}}`,
+		`{"suggest":{"my_p":{"text":"quik","phrase":{"field":"title","highlight":{"unknown":1}}}}}`,
+		`{"suggest":{"my_c":{"prefix":"qu","completion":{}}}}`,
+		`{"suggest":{"my_c":{"prefix":"qu","completion":{"field":"s","size":0}}}}`,
+		`{"suggest":{"my_c":{"prefix":"qu","completion":{"field":"s","unknown":1}}}}`,
+		// F12: DateHistogram & AutoDateHistogram & Date Bounds
+		`{"aggs":{"dh":{"date_histogram":{"calendar_interval":"1d"}}}}`,
+		`{"aggs":{"dh":{"date_histogram":{"field":"ts"}}}}`,
+		`{"aggs":{"dh":{"date_histogram":{"field":"ts","calendar_interval":"1d","fixed_interval":"1h"}}}}`,
+		`{"aggs":{"dh":{"date_histogram":{"field":"ts","calendar_interval":"2d"}}}}`,
+		`{"aggs":{"dh":{"date_histogram":{"field":"ts","fixed_interval":"0d"}}}}`,
+		`{"aggs":{"dh":{"date_histogram":{"field":"ts","calendar_interval":"1d","min_doc_count":-1}}}}`,
+		`{"aggs":{"dh":{"date_histogram":{"field":"ts","calendar_interval":"1d","missing_order":"bogus"}}}}`,
+		`{"aggs":{"dh":{"date_histogram":{"field":"ts","calendar_interval":"1d","hard_bounds":{"min":"2025-02-01","max":"2025-01-01"}}}}}`,
+		`{"aggs":{"dh":{"date_histogram":{"field":"ts","calendar_interval":"1d","unknown":1}}}}`,
+		`{"aggs":{"adh":{"auto_date_histogram":{"buckets":10}}}}`,
+		`{"aggs":{"adh":{"auto_date_histogram":{"field":"ts","buckets":0}}}}`,
+		`{"aggs":{"adh":{"auto_date_histogram":{"field":"ts","minimum_interval":"decade"}}}}`,
+		`{"aggs":{"adh":{"auto_date_histogram":{"field":"ts","unknown":1}}}}`,
+		// F13: Range, RareTerms, Sampler, TopHits, TopMetrics
+		`{"aggs":{"r":{"range":{"ranges":[{"to":50}]}}}}`,
+		`{"aggs":{"r":{"range":{"field":"price","ranges":[]}}}}`,
+		`{"aggs":{"r":{"range":{"field":"price","ranges":[{}]}}}}`,
+		`{"aggs":{"r":{"range":{"field":"price","ranges":[{"from":100,"to":50}]}}}}`,
+		`{"aggs":{"r":{"range":{"field":"price","ranges":[{"to":50,"unknown":1}]}}}}`,
+		`{"aggs":{"r":{"range":{"field":"price","ranges":[{"to":50}],"unknown":1}}}}`,
+		`{"aggs":{"rt":{"rare_terms":{}}}}`,
+		`{"aggs":{"rt":{"rare_terms":{"field":"tag","max_doc_count":0}}}}`,
+		`{"aggs":{"rt":{"rare_terms":{"field":"tag","max_doc_count":101}}}}`,
+		`{"aggs":{"rt":{"rare_terms":{"field":"tag","unknown":1}}}}`,
+		`{"aggs":{"s":{"sampler":{"shard_size":0}}}}`,
+		`{"aggs":{"s":{"sampler":{"max_docs_per_value":0}}}}`,
+		`{"aggs":{"s":{"sampler":{"execution_hint":"bogus"}}}}`,
+		`{"aggs":{"s":{"sampler":{"unknown":1}}}}`,
+		`{"aggs":{"th":{"top_hits":{"size":-1}}}}`,
+		`{"aggs":{"th":{"top_hits":{"from":-1}}}}`,
+		`{"aggs":{"th":{"top_hits":{"unknown":1}}}}`,
+		`{"aggs":{"tm":{"top_metrics":{"metrics":{"field":"price"},"sort":[]}}}}`,
+		`{"aggs":{"tm":{"top_metrics":{"metrics":{"field":""},"sort":[{"ts":"desc"}]}}}}`,
+		`{"aggs":{"tm":{"top_metrics":{"metrics":{"field":"price","unknown":1},"sort":[{"ts":"desc"}]}}}}`,
+		`{"aggs":{"tm":{"top_metrics":{"metrics":{"field":"price"},"sort":[{"ts":"desc"}],"size":0}}}}`,
+		`{"aggs":{"tm":{"top_metrics":{"metrics":{"field":"price"},"sort":[{"ts":"desc"}],"unknown":1}}}}`,
+		// F14: Percentiles, PercentileRanks, Pipeline Aggs
+		`{"aggs":{"p":{"percentiles":{}}}}`,
+		`{"aggs":{"p":{"percentiles":{"field":"price","percents":[]}}}}`,
+		`{"aggs":{"p":{"percentiles":{"field":"price","percents":[105]}}}}`,
+		`{"aggs":{"p":{"percentiles":{"field":"price","tdigest":{"compression":0}}}}}`,
+		`{"aggs":{"p":{"percentiles":{"field":"price","hdr":{"number_of_significant_value_digits":6}}}}}`,
+		`{"aggs":{"p":{"percentiles":{"field":"price","tdigest":{"compression":100},"hdr":{"number_of_significant_value_digits":3}}}}}`,
+		`{"aggs":{"p":{"percentiles":{"field":"price","unknown":1}}}}`,
+		`{"aggs":{"pr":{"percentile_ranks":{"field":"price"}}}}`,
+		`{"aggs":{"pr":{"percentile_ranks":{"field":"price","values":[]}}}}`,
+		`{"aggs":{"pr":{"percentile_ranks":{"field":"price","values":[10],"unknown":1}}}}`,
+		`{"aggs":{"d":{"derivative":{}}}}`,
+		`{"aggs":{"d":{"derivative":{"buckets_path":"s","gap_policy":"bogus"}}}}`,
+		`{"aggs":{"d":{"derivative":{"buckets_path":"s","unknown":1}}}}`,
+		`{"aggs":{"bs":{"bucket_selector":{"buckets_path":"s"}}}}`,
+		`{"aggs":{"bs":{"bucket_selector":{"script":"true"}}}}`,
+		`{"aggs":{"bs":{"bucket_selector":{"buckets_path":"s","script":"true","gap_policy":"bogus"}}}}`,
+		`{"aggs":{"bso":{"bucket_sort":{"from":-1}}}}`,
+		`{"aggs":{"bso":{"bucket_sort":{"size":0}}}}`,
+		`{"aggs":{"bso":{"bucket_sort":{"gap_policy":"bogus"}}}}`,
+		`{"aggs":{"ma":{"moving_avg":{"window":5}}}}`,
+		`{"aggs":{"ma":{"moving_avg":{"buckets_path":"s","window":0}}}}`,
+		`{"aggs":{"mf":{"moving_fn":{"buckets_path":"s","window":5}}}}`,
+		`{"aggs":{"sd":{"serial_diff":{"buckets_path":"s","lag":0}}}}`,
+		`{"aggs":{"norm":{"normalize":{"buckets_path":"s"}}}}`,
+		`{"aggs":{"norm":{"normalize":{"buckets_path":"s","method":"bogus"}}}}`,
+		`{"aggs":{"pb":{"percentiles_bucket":{"buckets_path":"s","percents":[120]}}}}`,
+		`{"aggs":{"esb":{"extended_stats_bucket":{"buckets_path":"s","sigma":-1}}}}`,
+	} {
+		var sr SearchRequest
+		if err := json.Unmarshal([]byte(badReq), &sr); err == nil {
+			t.Fatalf("F11-F14 expected error for invalid SearchRequest %s", badReq)
+		}
+	}
+}

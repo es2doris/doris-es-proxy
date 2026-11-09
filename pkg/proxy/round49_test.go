@@ -1189,3 +1189,473 @@ func TestRound51_ProxyAndComplianceFeatures(t *testing.T) {
 		t.Fatalf("expected 400 on alias targeting object, got %d", code)
 	}
 }
+
+func TestRound52_ProxyAndIngestFeatures(t *testing.T) {
+	srv, handler := newTestServerWithMock(t)
+
+	// --- F2: Index Blocks API & Stateful Read/Write/Metadata Block Enforcement ---
+	code, _, _ := doRound48Req(t, handler, http.MethodPut, "/r52_blk_idx", `{}`)
+	if code != http.StatusOK {
+		t.Fatalf("create r52_blk_idx failed: %d", code)
+	}
+	code, _, _ = doRound48Req(t, handler, http.MethodPut, "/r52_blk_idx/_doc/1", `{"title":"doc1","count":10}`)
+	if code != http.StatusCreated && code != http.StatusOK {
+		t.Fatalf("index doc failed: %d", code)
+	}
+	// Invalid block type -> 400
+	code, _, _ = doRound48Req(t, handler, http.MethodPut, "/r52_blk_idx/_block/invalid_block", `{}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on invalid block, got %d", code)
+	}
+	// Missing index -> 404
+	code, _, _ = doRound48Req(t, handler, http.MethodPut, "/r52_missing_idx/_block/write", `{}`)
+	if code != http.StatusNotFound {
+		t.Fatalf("expected 404 on missing index block, got %d", code)
+	}
+	// Add write block
+	code, resp, _ := doRound48Req(t, handler, http.MethodPut, "/r52_blk_idx/_block/write", `{}`)
+	if code != http.StatusOK || resp["acknowledged"] != true {
+		t.Fatalf("expected 200 on write block, got %d %v", code, resp)
+	}
+	// Write operations must return 403 cluster_block_exception
+	for _, tc := range []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodPut, "/r52_blk_idx/_doc/2", `{"title":"doc2"}`},
+		{http.MethodDelete, "/r52_blk_idx/_doc/1", ``},
+		{http.MethodPost, "/r52_blk_idx/_update/1", `{"doc":{"count":20}}`},
+		{http.MethodPost, "/r52_blk_idx/_update_by_query", `{"query":{"match_all":{}}}`},
+		{http.MethodPost, "/r52_blk_idx/_delete_by_query", `{"query":{"match_all":{}}}`},
+	} {
+		c, rMap, _ := doRound48Req(t, handler, tc.method, tc.path, tc.body)
+		if c != http.StatusForbidden {
+			t.Fatalf("expected 403 on %s %s under write block, got %d (%v)", tc.method, tc.path, c, rMap)
+		}
+	}
+	// Bulk write to write-blocked index returns per-item 403
+	code, resp, _ = doRound48Req(t, handler, http.MethodPost, "/_bulk", "{\"index\":{\"_index\":\"r52_blk_idx\",\"_id\":\"2\"}}\n{\"title\":\"b\"}\n")
+	if code != http.StatusOK || resp["errors"] != true {
+		t.Fatalf("expected bulk errors=true on write-blocked index, got %d %v", code, resp)
+	}
+	// Unblock write via _settings
+	code, _, _ = doRound48Req(t, handler, http.MethodPut, "/r52_blk_idx/_settings", `{"index":{"blocks":{"write":false}}}`)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 unblocking write, got %d", code)
+	}
+	// Add read block
+	code, _, _ = doRound48Req(t, handler, http.MethodPut, "/r52_blk_idx/_block/read", `{}`)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 on read block, got %d", code)
+	}
+	for _, tc := range []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodGet, "/r52_blk_idx/_doc/1", ``},
+		{http.MethodHead, "/r52_blk_idx/_doc/1", ``},
+		{http.MethodGet, "/r52_blk_idx/_source/1", ``},
+		{http.MethodPost, "/r52_blk_idx/_search", `{}`},
+		{http.MethodPost, "/r52_blk_idx/_count", `{}`},
+		{http.MethodPost, "/r52_blk_idx/_explain/1", `{"query":{"match_all":{}}}`},
+	} {
+		c, _, _ := doRound48Req(t, handler, tc.method, tc.path, tc.body)
+		if c != http.StatusForbidden {
+			t.Fatalf("expected 403 on %s %s under read block, got %d", tc.method, tc.path, c)
+		}
+	}
+	// Unblock read, add metadata block
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/r52_blk_idx/_settings", `{"index":{"blocks":{"read":false}}}`)
+	code, _, _ = doRound48Req(t, handler, http.MethodPut, "/r52_blk_idx/_block/metadata", `{}`)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 on metadata block, got %d", code)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/r52_blk_idx/_mapping", `{"properties":{"extra":{"type":"keyword"}}}`); c != http.StatusForbidden {
+		t.Fatalf("expected 403 on _mapping under metadata block, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/r52_blk_idx/_alias/r52_al", `{}`); c != http.StatusForbidden {
+		t.Fatalf("expected 403 on _alias under metadata block, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/r52_blk_idx", ``); c != http.StatusForbidden {
+		t.Fatalf("expected 403 on DELETE index under metadata block, got %d", c)
+	}
+	// Unblock metadata, test read_only_allow_delete allows DELETE index
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/r52_blk_idx/_settings", `{"index":{"blocks":{"metadata":false}}}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/r52_blk_idx/_block/read_only_allow_delete", `{}`)
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/r52_blk_idx", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE index under read_only_allow_delete, got %d", c)
+	}
+
+	// --- F3: Data Stream Lifecycle (_modify, _promote, name validation, op_type=create) & _downgrade ---
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_data_stream/.invalid_ds", `{}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on hidden data stream name, got %d", c)
+	}
+	code, _, _ = doRound48Req(t, handler, http.MethodPut, "/_data_stream/r52_ds", `{}`)
+	if code != http.StatusOK {
+		t.Fatalf("create data stream r52_ds failed: %d", code)
+	}
+	// PUT /{ds}/_doc/{id} without op_type=create must fail with 400
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/r52_ds/_doc/1", `{"@timestamp":"2026-01-01T00:00:00Z"}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on PUT /{ds}/_doc/{id} without op_type=create, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/r52_ds/_create/1", `{"@timestamp":"2026-01-01T00:00:00Z"}`); c != http.StatusCreated && c != http.StatusOK {
+		t.Fatalf("expected 201 on PUT /{ds}/_create/{id}, got %d", c)
+	}
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/r52_extra_backing", `{}`)
+	code, _, _ = doRound48Req(t, handler, http.MethodPost, "/_data_stream/_modify", `{"actions":[{"add_backing_index":{"data_stream":"r52_ds","index":"r52_extra_backing"}}]}`)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 on _data_stream/_modify add_backing_index, got %d", code)
+	}
+	code, _, _ = doRound48Req(t, handler, http.MethodPost, "/_data_stream/_modify", `{"actions":[{"remove_backing_index":{"data_stream":"r52_ds","index":"r52_extra_backing"}}]}`)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 on _data_stream/_modify remove_backing_index, got %d", code)
+	}
+	code, _, _ = doRound48Req(t, handler, http.MethodPost, "/_data_stream/_promote/r52_ds", `{}`)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 on _data_stream/_promote/r52_ds, got %d", code)
+	}
+	code, _, _ = doRound48Req(t, handler, http.MethodPost, "/r52_extra_backing/_downgrade", `{}`)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 on _downgrade, got %d", code)
+	}
+
+	// --- F4: Snapshot Lifecycle Management (/_slm/*) ---
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_snapshot/r52_repo", `{"type":"fs"}`)
+	code, _, _ = doRound48Req(t, handler, http.MethodPut, "/_slm/policy/daily-snapshots", `{"schedule":"0 30 1 * * ?","name":"<daily-snap-{now/d}>","repository":"r52_repo"}`)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /_slm/policy, got %d", code)
+	}
+	code, resp, _ = doRound48Req(t, handler, http.MethodPost, "/_slm/policy/daily-snapshots/_execute", `{}`)
+	if code != http.StatusOK || resp["snapshot_name"] == "" {
+		t.Fatalf("expected 200 on POST /_slm/policy/_execute, got %d %v", code, resp)
+	}
+	code, resp, _ = doRound48Req(t, handler, http.MethodGet, "/_slm/policy/daily-snapshots", ``)
+	if code != http.StatusOK || resp["daily-snapshots"] == nil {
+		t.Fatalf("expected 200 on GET /_slm/policy/daily-snapshots, got %d %v", code, resp)
+	}
+	code, _, _ = doRound48Req(t, handler, http.MethodPost, "/_slm/_execute_retention", `{}`)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 on _slm/_execute_retention, got %d", code)
+	}
+	code, _, _ = doRound48Req(t, handler, http.MethodPost, "/_slm/stop", `{}`)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 on _slm/stop, got %d", code)
+	}
+	code, resp, _ = doRound48Req(t, handler, http.MethodGet, "/_slm/status", ``)
+	if code != http.StatusOK || resp["operation_mode"] != "STOPPED" {
+		t.Fatalf("expected STOPPED on _slm/status, got %d %v", code, resp)
+	}
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_slm/start", `{}`)
+	code, resp, _ = doRound48Req(t, handler, http.MethodGet, "/_slm/stats", ``)
+	if code != http.StatusOK || resp["total_snapshots_taken"] != float64(1) {
+		t.Fatalf("expected total_snapshots_taken=1 on _slm/stats, got %d %v", code, resp)
+	}
+	code, _, _ = doRound48Req(t, handler, http.MethodDelete, "/_slm/policy/daily-snapshots", ``)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE /_slm/policy, got %d", code)
+	}
+
+	// --- F5 & F29: Enrich Policy Validation, Immutability, Snapshot & Exact Match ---
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/r52_enrich_src", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/r52_enrich_src/_doc/1", `{"code":"US-EAST-1","region_name":"N. Virginia"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/r52_enrich_src/_doc/2", `{"code":"US-EAST-1-EXTRA","region_name":"Extra"}`)
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_enrich/policy/r52_pol", `{}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on empty enrich policy, got %d", c)
+	}
+	code, _, _ = doRound48Req(t, handler, http.MethodPut, "/_enrich/policy/r52_pol", `{"match":{"indices":"r52_enrich_src","match_field":"code","enrich_fields":["region_name"]}}`)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /_enrich/policy/r52_pol, got %d", code)
+	}
+	// Immutability check -> 400
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_enrich/policy/r52_pol", `{"match":{"indices":"r52_enrich_src","match_field":"code","enrich_fields":["region_name"]}}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on duplicate PUT /_enrich/policy/r52_pol, got %d", c)
+	}
+	code, _, _ = doRound48Req(t, handler, http.MethodPost, "/_enrich/policy/r52_pol/_execute", `{}`)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 on _enrich/policy/r52_pol/_execute, got %d", code)
+	}
+	// Invalid max_matches -> 400
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_ingest/pipeline/_simulate", `{"pipeline":{"processors":[{"enrich":{"policy_name":"r52_pol","field":"code","target_field":"enriched","max_matches":200}}]},"docs":[{"_source":{"code":"US-EAST-1"}}]}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on enrich max_matches=200, got %d", c)
+	}
+	code, resp, _ = doRound48Req(t, handler, http.MethodPost, "/_ingest/pipeline/_simulate", `{"pipeline":{"processors":[{"enrich":{"policy_name":"r52_pol","field":"code","target_field":"enriched"}}]},"docs":[{"_source":{"code":"US-EAST-1"}}]}`)
+	if code != http.StatusOK {
+		t.Fatalf("enrich simulate failed: %d %v", code, resp)
+	}
+	simDoc := resp["docs"].([]any)[0].(map[string]any)["doc"].(map[string]any)["_source"].(map[string]any)
+	enrichedMap, _ := simDoc["enriched"].(map[string]any)
+	if enrichedMap == nil || enrichedMap["region_name"] != "N. Virginia" {
+		t.Fatalf("expected exact enrich match region_name='N. Virginia', got %v", simDoc)
+	}
+
+	// --- F6: Ingest Metadata Endpoints ---
+	if c, rMap, _ := doRound48Req(t, handler, http.MethodGet, "/_ingest/processor/grok", ``); c != http.StatusOK || rMap["patterns"] == nil {
+		t.Fatalf("expected 200 on GET /_ingest/processor/grok, got %d %v", c, rMap)
+	}
+	if c, rMap, _ := doRound48Req(t, handler, http.MethodGet, "/_ingest/geoip/stats", ``); c != http.StatusOK || rMap["stats"] == nil {
+		t.Fatalf("expected 200 on GET /_ingest/geoip/stats, got %d %v", c, rMap)
+	}
+
+	// --- F7: Watcher, Transform, Dangling Indices, Autoscaling ---
+	code, _, _ = doRound48Req(t, handler, http.MethodPut, "/_watcher/watch/w1", `{"trigger":{"schedule":{"interval":"10m"}},"input":{"simple":{}},"actions":{"log":{"logging":{"text":"hi"}}}}`)
+	if code != http.StatusCreated && code != http.StatusOK {
+		t.Fatalf("expected 201/200 on PUT /_watcher/watch/w1, got %d", code)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_watcher/watch/w1/_execute", `{}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on _watcher/watch/w1/_execute, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_watcher/watch/w1/_ack/log", `{}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on _watcher/watch/w1/_ack/log, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_watcher/watch/w1/_deactivate", `{}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on _watcher/watch/w1/_deactivate, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_watcher/watch/w1/_activate", `{}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on _watcher/watch/w1/_activate, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_watcher/stats", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on _watcher/stats, got %d", c)
+	}
+	_, _, _ = doRound48Req(t, handler, http.MethodDelete, "/_watcher/watch/w1", ``)
+
+	code, _, _ = doRound48Req(t, handler, http.MethodPut, "/_transform/t1", `{"source":{"index":["r52_enrich_src"]},"dest":{"index":"r52_tf_dest"},"pivot":{"group_by":{"code":{"terms":{"field":"code"}}},"aggregations":{"cnt":{"value_count":{"field":"code"}}}}}`)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /_transform/t1, got %d", code)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_transform/t1/_start", `{}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on _transform/t1/_start, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_transform/t1/_stats", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on _transform/t1/_stats, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_transform/t1/_stop", `{}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on _transform/t1/_stop, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_transform/_preview", `{"source":{"index":["r52_enrich_src"]},"pivot":{"group_by":{"code":{"terms":{"field":"code"}}}}}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on _transform/_preview, got %d", c)
+	}
+	_, _, _ = doRound48Req(t, handler, http.MethodDelete, "/_transform/t1", ``)
+
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_dangling", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_dangling, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_dangling/u1", ``); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on DELETE /_dangling/u1 without accept_data_loss=true, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_autoscaling/policy/a1", `{"roles":["data_hot"],"deciders":{"fixed":{}}}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /_autoscaling/policy/a1, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_autoscaling/capacity", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_autoscaling/capacity, got %d", c)
+	}
+	_, _, _ = doRound48Req(t, handler, http.MethodDelete, "/_autoscaling/policy/a1", ``)
+
+	// --- F8: Closed Index Enforcement & _msearch Blank-Line / Missing-Body Validation ---
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/r52_closed_idx", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/r52_closed_idx/_doc/1", `{"x":1}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/r52_closed_idx/_close", `{}`)
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/r52_closed_idx/_doc/1", ``); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 index_closed_exception on GET /_doc of closed index, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r52_closed_idx/_update_by_query", `{}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 index_closed_exception on _update_by_query of closed index, got %d", c)
+	}
+	// _msearch with trailing header and no body -> 400
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_msearch", "{\"index\":\"r52_enrich_src\"}\n"); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on _msearch with header and no body line, got %d", c)
+	}
+
+	// --- F9: Mustache JSON String Escaping & Top-Level Search Options ---
+	code, resp, _ = doRound48Req(t, handler, http.MethodPost, "/r52_enrich_src/_search/template", `{
+		"source": "{\"query\":{\"match\":{\"code\":\"{{q}}\"}},\"explain\":\"{{exp}}\"}",
+		"params": {"q": "US-\"EAST\"-1\nline2", "exp": true},
+		"rest_total_hits_as_int": true
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 on _search/template with quotes/newlines in param, got %d %v", code, resp)
+	}
+	if _, isNum := resp["hits"].(map[string]any)["total"].(float64); !isNum {
+		t.Fatalf("expected numeric hits.total when rest_total_hits_as_int=true on _search/template, got %T (%v)", resp["hits"].(map[string]any)["total"], resp["hits"])
+	}
+
+	// --- F26: Runtime Painless Invalid ctx.op -> 400 illegal_argument_exception ---
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/r52_upd_idx/_doc/1", `{"v":1}`)
+	code, resp, _ = doRound48Req(t, handler, http.MethodPost, "/r52_upd_idx/_update/1", `{"script":{"source":"ctx.op = 'bogus'"}}`)
+	if code != http.StatusBadRequest || resp["error"].(map[string]any)["type"] != "illegal_argument_exception" {
+		t.Fatalf("expected 400 illegal_argument_exception on invalid ctx.op, got %d %v", code, resp)
+	}
+
+	// --- F27 & F28: Ingest date_index_name, user_agent, uri_parts, registered_domain ---
+	code, resp, _ = doRound48Req(t, handler, http.MethodPost, "/_ingest/pipeline/_simulate", `{
+		"pipeline": {
+			"processors": [
+				{"date_index_name": {"field": "ts", "index_name_prefix": "logs-", "date_rounding": "d", "index_name_format": "UNIX"}},
+				{"user_agent": {"field": "ua"}},
+				{"uri_parts": {"field": "uri"}},
+				{"registered_domain": {"field": "fqdn"}}
+			]
+		},
+		"docs": [{
+			"_source": {
+				"ts": 1704067200000,
+				"ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
+				"uri": "alice:secret@example.com:8080/home/.bashrc",
+				"fqdn": "api.sub.example.co.jp."
+			}
+		}]
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("F27/F28 simulate failed: %d %v", code, resp)
+	}
+	simOut := resp["docs"].([]any)[0].(map[string]any)["doc"].(map[string]any)
+	if simOut["_index"] != "logs-1704067200" {
+		t.Fatalf("expected _index='logs-1704067200', got %v", simOut["_index"])
+	}
+	srcOut := simOut["_source"].(map[string]any)
+	uaOut := srcOut["user_agent"].(map[string]any)["os"].(map[string]any)
+	if uaOut["name"] != "iOS" || uaOut["version"] != "17.2" {
+		t.Fatalf("expected iOS 17.2 from user_agent, got %v", uaOut)
+	}
+	uriOut := srcOut["url"].(map[string]any)
+	if uriOut["username"] != "alice" || uriOut["domain"] != "example.com" || uriOut["extension"] != nil {
+		t.Fatalf("expected schemeless user:pass@host and nil extension for /.bashrc, got %v", uriOut)
+	}
+	rdOut := srcOut["fqdn"].(map[string]any)
+	if rdOut["registered_domain"] != "example.co.jp" || rdOut["top_level_domain"] != "co.jp" || rdOut["subdomain"] != "api.sub" {
+		t.Fatalf("expected registered_domain='example.co.jp', got %v", rdOut)
+	}
+
+	// --- Additional F7 Watcher / Transform / Dangling / Autoscaling Edge Cases ---
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_watcher/stats/_all,queued_watches,current_watches,pending_watches", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_watcher/stats/{metrics}, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_watcher/stats/bad_metric", ``); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on GET /_watcher/stats/bad_metric, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_watcher/stats", ``); c != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 on POST /_watcher/stats, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_watcher/_stop", `{}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_watcher/_stop, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_watcher/_stop", ``); c != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 on GET /_watcher/_stop, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_watcher/_start", `{}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_watcher/_start, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_watcher/_start", ``); c != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 on GET /_watcher/_start, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_watcher/unknown_act", ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 on GET /_watcher/unknown_act, got %d", c)
+	}
+
+	// Transform validation & action branches
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_transform/t_bad", ``); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on empty transform body, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_transform/t_bad", `{"dest":{"index":"d"}}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on missing transform source.index, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_transform/t_bad", `{"source":{"index":"s"}}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on missing transform dest.index, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_transform/t_bad", `{"source":{"index":"s"},"dest":{"index":"d"}}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on missing transform pivot/latest, got %d", c)
+	}
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_transform/t_cov", `{"source":{"index":"r52_enrich_src"},"dest":{"index":"r52_t_dest"},"latest":{"unique_key":["code"],"sort":"code"}}`)
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_transform/t_cov", `{"source":{"index":"r52_enrich_src"},"dest":{"index":"r52_t_dest"},"latest":{"unique_key":["code"],"sort":"code"}}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 resource_already_exists_exception on duplicate transform, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_transform/_stats", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_transform/_stats, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_transform/_preview", `{"source":{"index":"r52_enrich_src"},"latest":{"unique_key":["code"],"sort":"code"}}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_transform/_preview, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_transform/t_cov/_preview", `{}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_transform/t_cov/_preview, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_transform/missing_t/_preview", `{}`); c != http.StatusNotFound {
+		t.Fatalf("expected 404 on POST /_transform/missing_t/_preview, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_transform/missing_t", ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 on GET /_transform/missing_t, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodHead, "/_transform/missing_t", ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 on HEAD /_transform/missing_t, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_transform/missing_*?allow_no_match=false", ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 on GET /_transform/missing_*?allow_no_match=false, got %d", c)
+	}
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_transform/t_cov/_start", `{}`)
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_transform/t_cov", ``); c != http.StatusConflict {
+		t.Fatalf("expected 409 status_exception deleting started transform without force, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_transform/t_cov?force=true", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 deleting started transform with force=true, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_transform/t_cov", ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 deleting non-existent transform, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_transform/missing_t/_start", `{}`); c != http.StatusNotFound {
+		t.Fatalf("expected 404 starting non-existent transform, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_transform/missing_t/_stop", `{}`); c != http.StatusNotFound {
+		t.Fatalf("expected 404 stopping non-existent transform, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_transform/missing_t/_stop?allow_no_match=true", `{}`); c != http.StatusOK {
+		t.Fatalf("expected 200 stopping non-existent transform with allow_no_match=true, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_transform/missing_t/_stats", ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 on stats for non-existent transform, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_transform/t_cov/_bogus", `{}`); c != http.StatusNotFound {
+		t.Fatalf("expected 404 on unknown transform action, got %d", c)
+	}
+
+	// Dangling indices import & delete
+	srv.mu.Lock()
+	if srv.danglingIndices == nil {
+		srv.danglingIndices = make(map[string]map[string]any)
+	}
+	srv.danglingIndices["u_import"] = map[string]any{"index_name": "dangling_imp_idx", "index_uuid": "u_import"}
+	srv.danglingIndices["u_del"] = map[string]any{"index_name": "dangling_del_idx", "index_uuid": "u_del"}
+	srv.mu.Unlock()
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_dangling", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_dangling, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_dangling/u_import?accept_data_loss=true", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_dangling/u_import?accept_data_loss=true, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_dangling/u_del?accept_data_loss=true", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE /_dangling/u_del?accept_data_loss=true, got %d", c)
+	}
+
+	// Autoscaling validation & listing
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_autoscaling/policy/a_bad", ``); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on empty autoscaling policy body, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_autoscaling/policy/a_bad", `{"roles":[]}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on empty autoscaling roles, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_autoscaling/policy/a_bad", `{"roles":["data_hot"]}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on missing autoscaling deciders, got %d", c)
+	}
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_autoscaling/policy/a_cov", `{"roles":["data_hot"],"deciders":{}}`)
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_autoscaling/policy", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_autoscaling/policy, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_autoscaling/policy/missing_pol", ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 on GET /_autoscaling/policy/missing_pol, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodHead, "/_autoscaling/policy/missing_pol", ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 on HEAD /_autoscaling/policy/missing_pol, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_autoscaling/policy/missing_pol", ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 on DELETE /_autoscaling/policy/missing_pol, got %d", c)
+	}
+}

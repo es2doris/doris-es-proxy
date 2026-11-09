@@ -278,6 +278,60 @@ func (t *Transpiler) validateAggsDocValues(aggs map[string]esast.AggSpec, nctx *
 			checkField(sampSpec.Field, nctx)
 			t.checkScriptDocValues(sampSpec.Script, nctx)
 		}
+		if spec.MultiTerms != nil {
+			for _, mt := range spec.MultiTerms.Terms {
+				checkField(mt.Field, nctx)
+				t.checkScriptDocValues(mt.Script, nctx)
+			}
+		}
+		if spec.RareTerms != nil {
+			checkField(spec.RareTerms.Field, nctx)
+		}
+		if spec.AutoDateHistogram != nil {
+			checkField(spec.AutoDateHistogram.Field, nctx)
+			t.checkScriptDocValues(spec.AutoDateHistogram.Script, nctx)
+		}
+		if spec.VariableWidthHistogram != nil {
+			checkField(spec.VariableWidthHistogram.Field, nctx)
+			t.checkScriptDocValues(spec.VariableWidthHistogram.Script, nctx)
+		}
+		if spec.MedianAbsoluteDeviation != nil {
+			checkField(spec.MedianAbsoluteDeviation.Field, nctx)
+			t.checkScriptDocValues(spec.MedianAbsoluteDeviation.Script, nctx)
+		}
+		if spec.WeightedAvg != nil {
+			checkField(spec.WeightedAvg.Value.Field, nctx)
+			t.checkScriptDocValues(spec.WeightedAvg.Value.Script, nctx)
+			checkField(spec.WeightedAvg.Weight.Field, nctx)
+			t.checkScriptDocValues(spec.WeightedAvg.Weight.Script, nctx)
+		}
+		if spec.MatrixStats != nil {
+			for _, f := range spec.MatrixStats.Fields {
+				checkField(f, nctx)
+			}
+		}
+		if spec.TTest != nil {
+			checkField(spec.TTest.A.Field, nctx)
+			t.checkScriptDocValues(spec.TTest.A.Script, nctx)
+			checkField(spec.TTest.B.Field, nctx)
+			t.checkScriptDocValues(spec.TTest.B.Script, nctx)
+		}
+		if spec.GeoBounds != nil {
+			checkField(spec.GeoBounds.Field, nctx)
+		}
+		if spec.GeoCentroid != nil {
+			checkField(spec.GeoCentroid.Field, nctx)
+			t.checkScriptDocValues(spec.GeoCentroid.Script, nctx)
+		}
+		if spec.GeoDistance != nil {
+			checkField(spec.GeoDistance.Field, nctx)
+		}
+		if spec.GeohashGrid != nil {
+			checkField(spec.GeohashGrid.Field, nctx)
+		}
+		if spec.GeotileGrid != nil {
+			checkField(spec.GeotileGrid.Field, nctx)
+		}
 		if spec.Missing != nil {
 			checkField(spec.Missing.Field, nctx)
 		}
@@ -767,10 +821,11 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		}
 		return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: score}
 	case q.Exists != nil:
-		pred := t.compileExistsPredicate(q.Exists.Field, nctx)
-		boost := 1.0
+		cleanField, fBoost := parseFieldBoost(q.Exists.Field, 1.0)
+		pred := t.compileExistsPredicate(cleanField, nctx)
+		boost := fBoost
 		if q.Exists.Boost != nil {
-			boost = *q.Exists.Boost
+			boost = *q.Exists.Boost * fBoost
 		}
 		score := "1.0"
 		if boost != 1.0 {
@@ -955,9 +1010,9 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 				qStr = strings.Join(filteredTokens, " ")
 				queryForMatch = qStr
 			}
-			if me.MinimumShouldMatch != nil && !strings.ContainsAny(cleanKey0, "*?") {
+			if me.MinimumShouldMatch != nil {
 				tokens := strings.Fields(qStr)
-				if isExactKeywordField(effKey0, b) && qStr != "" {
+				if !strings.ContainsAny(cleanKey0, "*?") && isExactKeywordField(effKey0, b) && qStr != "" {
 					tokens = []string{qStr}
 				}
 				if len(tokens) == 1 && parseMinShouldMatch(me.MinimumShouldMatch, 1, true) > 1 {
@@ -968,7 +1023,7 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 					for _, tok := range tokens {
 						shoulds = append(shoulds, esast.Query{
 							Match: map[string]esast.MatchEntry{
-								cleanKey0: {
+								keys[0]: {
 									Query:               tok,
 									Operator:            "or",
 									Fuzziness:           me.Fuzziness,
@@ -980,7 +1035,7 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 							},
 						})
 					}
-					boost := effBoost
+					boost := me.Boost
 					return t.compileBool(&esast.BoolQuery{
 						Should:             shoulds,
 						MinimumShouldMatch: me.MinimumShouldMatch,
@@ -1189,9 +1244,9 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 	case q.MultiMatch != nil:
 		return t.compileMultiMatch(q.MultiMatch, scoring, nctx)
 	case q.QueryString != nil:
-		return t.compileQueryString(q.QueryString, scoring, nctx)
+		return t.compileQueryStringEntry(q.QueryString, scoring, nctx, false)
 	case q.SimpleQueryString != nil:
-		return t.compileQueryStringWithMode(q.SimpleQueryString, scoring, nctx, true)
+		return t.compileQueryStringEntry(q.SimpleQueryString, scoring, nctx, true)
 	case q.Nested != nil:
 		return t.compileNestedWithParent(q.Nested, scoring, nctx)
 	case q.ConstantScore != nil:
@@ -1861,15 +1916,20 @@ func (t *Transpiler) compileBool(b *esast.BoolQuery, scoring bool, nctx *nestedC
 		}
 	}
 
-	if len(conjuncts) > 0 && len(b.MustNot) == 0 {
-		allFalse := true
+	if len(conjuncts) > 0 {
+		hasPositive := false
+		allPosFalse := true
 		for _, cj := range conjuncts {
+			if strings.HasPrefix(cj, "NOT ") {
+				continue
+			}
+			hasPositive = true
 			if cj != "FALSE" && cj != "(FALSE)" && cj != "((FALSE))" {
-				allFalse = false
+				allPosFalse = false
 				break
 			}
 		}
-		if allFalse {
+		if hasPositive && allPosFalse {
 			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 		}
 	}
@@ -2170,12 +2230,46 @@ func buildFuzzyEditDistanceRegex(word string, maxEdits int, prefixLen int, trans
 	return strings.Join(alts, "|")
 }
 
-func (t *Transpiler) expandFieldPatternForContext(pattern string, nctx *nestedCtx) []schema.BoostedField {
-	if t.Schema == nil {
-		return nil
+func (t *Transpiler) compileQueryStringEntry(qsq *esast.QueryStringQuery, scoring bool, nctx *nestedCtx, isSimple bool) CompiledQuery {
+	if qsq == nil {
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
+	eff := *qsq
+	if strings.Contains(eff.DefaultField, "^") && len(eff.Fields) == 0 {
+		eff.Fields = []string{eff.DefaultField}
+		eff.DefaultField = ""
+	}
+	if eff.MinimumShouldMatch != nil {
+		raw := strings.TrimSpace(eff.Query)
+		simpleFlags := parseSimpleQueryFlags(eff.Flags, isSimple)
+		tokens := tokenizeLuceneWithFlags(raw, isSimple, simpleFlags)
+		if len(tokens) == 1 {
+			core := strings.TrimSpace(strings.TrimLeft(tokens[0], "+-!"))
+			isGroup := hasMatchingOuterParens(core)
+			if !isGroup && !isSimple {
+				if colonIdx := strings.IndexByte(core, ':'); colonIdx > 0 && core[colonIdx-1] != '\\' {
+					if hasMatchingOuterParens(strings.TrimSpace(core[colonIdx+1:])) {
+						isGroup = true
+					}
+				}
+			}
+			if !isGroup {
+				if parseMinShouldMatch(eff.MinimumShouldMatch, 1, true) > 1 {
+					return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+				}
+				eff.MinimumShouldMatch = nil
+			}
+		}
+	}
+	return t.compileQueryStringWithMode(&eff, scoring, nctx, isSimple)
+}
+
+func (t *Transpiler) expandFieldPatternForContext(pattern string, nctx *nestedCtx) []schema.BoostedField {
 	if nctx == nil || nctx.nestedPath == "" {
 		return t.Schema.ExpandFieldPattern(pattern)
+	}
+	if t.Schema == nil {
+		return nil
 	}
 	prefix := nctx.nestedPath + "."
 	filterNested := func(in []schema.BoostedField) []schema.BoostedField {
@@ -5181,6 +5275,7 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 }
 
 func (t *Transpiler) compileExistsPredicate(field string, nctx *nestedCtx) string {
+	field, _ = parseFieldBoost(field, 1.0)
 	if strings.ContainsAny(field, "*?") && t.Schema != nil {
 		exp := t.expandFieldPatternForContext(field, nctx)
 		if len(exp) == 0 {
@@ -5214,6 +5309,9 @@ func (t *Transpiler) compileExistsPredicate(field string, nctx *nestedCtx) strin
 	}
 	col := t.sqlColumnRef(field, preferKw, nctx)
 	basePred := fmt.Sprintf("%s IS NOT NULL", col)
+	if b.ESType == "flattened" {
+		basePred = fmt.Sprintf("(%s IS NOT NULL AND %s != '{}' AND %s != 'null')", col, col, col)
+	}
 	if b.Kind == schema.StorageDynamicVariant && t.Schema != nil && nctx == nil && !strings.ContainsAny(field, "*?") {
 		prefix := field + "."
 		var disjuncts []string
@@ -6689,6 +6787,14 @@ func (t *Transpiler) appendAggBranches(
 							notNullCond = extraWhere
 						}
 					}
+				}
+			}
+			if spec.DateHistogram.HardBounds != nil {
+				if minMs, okMin := t.resolveDateHistogramMissingMs(b.ESType, spec.DateHistogram.HardBounds.Min); okMin {
+					notNullCond = fmt.Sprintf("(%s) AND (%s >= %d)", notNullCond, col, minMs)
+				}
+				if maxMs, okMax := t.resolveDateHistogramMissingMs(b.ESType, spec.DateHistogram.HardBounds.Max); okMax {
+					notNullCond = fmt.Sprintf("(%s) AND (%s <= %d)", notNullCond, col, maxMs)
 				}
 			}
 			bucketExpr := fmt.Sprintf("CAST(CAST(FLOOR(%s / %d) * %d AS BIGINT) AS STRING)", col, intervalMs, intervalMs)
@@ -8210,6 +8316,14 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 			subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, notNullExpr)
 			if hasMissing {
 				subWhere = whereClause
+			}
+			if subSpec.DateHistogram.HardBounds != nil {
+				if minMs, okMin := t.resolveDateHistogramMissingMs(b.ESType, subSpec.DateHistogram.HardBounds.Min); okMin {
+					subWhere = fmt.Sprintf("(%s) AND (%s >= %d)", subWhere, col, minMs)
+				}
+				if maxMs, okMax := t.resolveDateHistogramMissingMs(b.ESType, subSpec.DateHistogram.HardBounds.Max); okMax {
+					subWhere = fmt.Sprintf("(%s) AND (%s <= %d)", subWhere, col, maxMs)
+				}
 			}
 			dhChildCountExpr := "COUNT(`_id`)"
 			isDHArray := !isExplodedNested(b, effDHField) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield)
@@ -11035,7 +11149,14 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 		relPath := t.nestedRelativeJSONPath(field, preferKeyword, nctx.nestedPath)
 		extractExpr := fmt.Sprintf("json_extract_string(%s, %s)", nctx.elemVar, quoteStr(relPath))
 		if castType != "STRING" {
-			return fmt.Sprintf("CAST(%s AS %s)", extractExpr, castType)
+			extractExpr = fmt.Sprintf("CAST(%s AS %s)", extractExpr, castType)
+		}
+		if b.ESType == "constant_keyword" && b.ConstantValue != nil {
+			constVal := fmt.Sprintf("%v", b.ConstantValue)
+			if b.LowercaseNormalizer {
+				constVal = strings.ToLower(constVal)
+			}
+			return fmt.Sprintf("COALESCE(%s, %s)", extractExpr, quoteStr(constVal))
 		}
 		return extractExpr
 	}
@@ -11069,7 +11190,15 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 	for _, seg := range srcPath {
 		_, _ = fmt.Fprintf(&pathBuilder, "[%s]", quoteStr(seg))
 	}
-	return fmt.Sprintf("CAST(`_doc`%s AS %s)", pathBuilder.String(), castType)
+	docExpr := fmt.Sprintf("CAST(`_doc`%s AS %s)", pathBuilder.String(), castType)
+	if b.ESType == "constant_keyword" && b.ConstantValue != nil && b.Kind == schema.StorageDynamicVariant {
+		constVal := fmt.Sprintf("%v", b.ConstantValue)
+		if b.LowercaseNormalizer {
+			constVal = strings.ToLower(constVal)
+		}
+		return fmt.Sprintf("COALESCE(%s, %s)", docExpr, quoteStr(constVal))
+	}
+	return docExpr
 }
 
 func parseMinShouldMatch(v any, numClauses int, defaultOne bool) int {

@@ -3758,3 +3758,137 @@ func TestRound51TranspilerF10ToF18(t *testing.T) {
 		t.Fatalf("F18 expected composite agg with after={t:null} and missing_bucket=true to use post-process LIMIT 10000, got sql=%s err=%v", planComp.AggsSQL, err)
 	}
 }
+
+func TestRound52TranspilerF12AndF15ToF19(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"title":   {"type": "text"},
+			"body":    {"type": "text"},
+			"ts":      {"type": "date"},
+			"labels":  {"type": "flattened"},
+			"no_dv":   {"type": "keyword", "doc_values": false},
+			"no_dv_n": {"type": "double", "doc_values": false}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("mapping unmarshal failed: %v", err)
+	}
+	sch := schema.CompileIndexSchema("db", "r52_tr_idx", &spec)
+	// Add a dynamic variant constant_keyword field (> MaxPromotedColumns simulation)
+	constVal := "production"
+	sch.Fields["dyn_env"] = schema.FieldBinding{
+		ESFieldPath:    "dyn_env",
+		ESType:         "constant_keyword",
+		Kind:           schema.StorageDynamicVariant,
+		DorisType:      schema.DorisString,
+		ConstantValue:  constVal,
+		SourceJSONPath: []string{"dyn_env"},
+	}
+	tr := NewTranspiler(sch, TranspilerOptions{UseDoris4SearchFunc: true})
+
+	// F12: date_histogram hard_bounds emits SQL WHERE filter in both top-level and sub-aggregation
+	var dhBoundsReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"size": 0,
+		"aggs": {
+			"dh": {
+				"date_histogram": {
+					"field": "ts",
+					"calendar_interval": "1d",
+					"hard_bounds": {"min": "2025-01-01T00:00:00Z", "max": "2025-01-10T00:00:00Z"}
+				},
+				"aggs": {
+					"sub_dh": {
+						"date_histogram": {
+							"field": "ts",
+							"calendar_interval": "1h",
+							"hard_bounds": {"min": 1735689600000, "max": 1735776000000}
+						}
+					}
+				}
+			}
+		}
+	}`), &dhBoundsReq)
+	planDH, err := tr.BuildSearchPlan(&dhBoundsReq)
+	if err != nil {
+		t.Fatalf("F12 BuildSearchPlan failed: %v", err)
+	}
+	if !strings.Contains(planDH.AggsSQL, ">= 1735689600000") || !strings.Contains(planDH.AggsSQL, "<= 1736467200000") || !strings.Contains(planDH.AggsSQL, "<= 1735776000000") {
+		t.Fatalf("F12 expected date_histogram hard_bounds SQL filter, got %s", planDH.AggsSQL)
+	}
+
+	// F15: dynamic variant constant_keyword coalesces with ConstantValue
+	var ckQ esast.Query
+	_ = json.Unmarshal([]byte(`{"term":{"dyn_env":"production"}}`), &ckQ)
+	if w := tr.CompileQuery(&ckQ, false, nil).WhereSQL; !strings.Contains(w, "COALESCE(") || !strings.Contains(w, "'production'") {
+		t.Fatalf("F15 expected COALESCE with 'production' for dynamic variant constant_keyword, got %s", w)
+	}
+
+	// F16: exists on flattened field excludes '{}' and 'null'
+	var flatExistsQ esast.Query
+	_ = json.Unmarshal([]byte(`{"exists":{"field":"labels"}}`), &flatExistsQ)
+	if w := tr.CompileQuery(&flatExistsQ, false, nil).WhereSQL; !strings.Contains(w, "!= '{}'") || !strings.Contains(w, "!= 'null'") {
+		t.Fatalf("F16 expected flattened exists predicate to exclude '{}' and 'null', got %s", w)
+	}
+
+	// F18: doc_values: false rejected across all 13 aggregation types
+	for _, dvAgg := range []string{
+		`{"size":0,"aggs":{"a":{"multi_terms":{"terms":[{"field":"no_dv"},{"field":"title"}]}}}}`,
+		`{"size":0,"aggs":{"a":{"rare_terms":{"field":"no_dv"}}}}`,
+		`{"size":0,"aggs":{"a":{"auto_date_histogram":{"field":"no_dv"}}}}`,
+		`{"size":0,"aggs":{"a":{"variable_width_histogram":{"field":"no_dv_n","buckets":5}}}}`,
+		`{"size":0,"aggs":{"a":{"median_absolute_deviation":{"field":"no_dv_n"}}}}`,
+		`{"size":0,"aggs":{"a":{"weighted_avg":{"value":{"field":"no_dv_n"},"weight":{"field":"ts"}}}}}`,
+		`{"size":0,"aggs":{"a":{"matrix_stats":{"fields":["no_dv_n","ts"]}}}}`,
+		`{"size":0,"aggs":{"a":{"t_test":{"a":{"field":"no_dv_n"},"b":{"field":"ts"}}}}}`,
+		`{"size":0,"aggs":{"a":{"geo_bounds":{"field":"no_dv"}}}}`,
+		`{"size":0,"aggs":{"a":{"geo_centroid":{"field":"no_dv"}}}}`,
+		`{"size":0,"aggs":{"a":{"geo_distance":{"field":"no_dv","origin":"0,0","ranges":[{"to":100}]}}}}`,
+		`{"size":0,"aggs":{"a":{"geohash_grid":{"field":"no_dv"}}}}`,
+		`{"size":0,"aggs":{"a":{"geotile_grid":{"field":"no_dv"}}}}`,
+	} {
+		var sr esast.SearchRequest
+		if err := json.Unmarshal([]byte(dvAgg), &sr); err != nil {
+			t.Fatalf("F18 unmarshal %s failed: %v", dvAgg, err)
+		}
+		if _, err := tr.BuildSearchPlan(&sr); err == nil {
+			t.Fatalf("F18 expected doc_values=false error for %s", dvAgg)
+		}
+	}
+
+	// F18: compileBool with FALSE conjunct + MustNot returns FALSE; single-token match/query_string/simple_query_string with minimum_should_match: 2 returns FALSE
+	for _, falseQ := range []string{
+		`{"bool":{"must":[{"match_none":{}}],"must_not":[{"term":{"title":"fox"}}]}}`,
+		`{"match":{"title*":{"query":"fox","minimum_should_match":2}}}`,
+		`{"query_string":{"default_field":"title","query":"fox","minimum_should_match":2}}`,
+		`{"simple_query_string":{"fields":["title"],"query":"fox","minimum_should_match":2}}`,
+	} {
+		var q esast.Query
+		if err := json.Unmarshal([]byte(falseQ), &q); err != nil {
+			t.Fatalf("F18 unmarshal %s failed: %v", falseQ, err)
+		}
+		if w := tr.CompileQuery(&q, false, nil).WhereSQL; w != "FALSE" {
+			t.Fatalf("F18 expected WhereSQL == FALSE for %s, got %s", falseQ, w)
+		}
+	}
+
+	// F19: field^boost in query_string exists (title^3:*), default_field: "title^3", and nil-schema Transpiler
+	var qsExistsBoost, qsDefFieldBoost esast.Query
+	_ = json.Unmarshal([]byte(`{"query_string":{"query":"title^3:*"}}`), &qsExistsBoost)
+	cqEB := tr.CompileQuery(&qsExistsBoost, true, nil)
+	if strings.Contains(cqEB.WhereSQL, "^3") || !strings.Contains(cqEB.ScoreSQL, "3.0000") {
+		t.Fatalf("F19 expected query_string 'title^3:*' to strip ^3 from column and apply 3.0000 boost, got where=%s score=%s", cqEB.WhereSQL, cqEB.ScoreSQL)
+	}
+	_ = json.Unmarshal([]byte(`{"query_string":{"default_field":"title^3","query":"fox"}}`), &qsDefFieldBoost)
+	cqDFB := tr.CompileQuery(&qsDefFieldBoost, true, nil)
+	if !strings.Contains(cqDFB.ScoreSQL, "3.0000") {
+		t.Fatalf("F19 expected query_string default_field='title^3' to apply 3.0000 boost, got score=%s", cqDFB.ScoreSQL)
+	}
+	nilTr := NewTranspiler(nil, TranspilerOptions{})
+	var mmBoost esast.Query
+	_ = json.Unmarshal([]byte(`{"multi_match":{"query":"fox","fields":["title^4"]}}`), &mmBoost)
+	cqNilMM := nilTr.CompileQuery(&mmBoost, true, nil)
+	if strings.Contains(cqNilMM.WhereSQL, "^4") || !strings.Contains(cqNilMM.ScoreSQL, "4.0000") {
+		t.Fatalf("F19 expected nil-schema multi_match fields=['title^4'] to strip ^4 and apply 4.0000 boost, got where=%s score=%s", cqNilMM.WhereSQL, cqNilMM.ScoreSQL)
+	}
+}

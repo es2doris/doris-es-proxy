@@ -148,6 +148,33 @@ func ShredDocumentWithNow(
 			cleanBinding: &bc,
 		})
 	}
+	if s != nil && len(s.Fields) > 0 {
+		flattenedFieldKeys := make([]string, 0)
+		for k, b := range s.Fields {
+			if b.ESType == "flattened" && b.AliasTarget == "" && !b.EnabledFalse {
+				flattenedFieldKeys = append(flattenedFieldKeys, k)
+			}
+		}
+		sort.Strings(flattenedFieldKeys)
+		for _, k := range flattenedFieldKeys {
+			b := s.Fields[k]
+			modified, err := validateAndNormalizeFlattenedFieldInDoc(parsedDoc, b.SourceJSONPath, b, recordIgnored)
+			if err != nil {
+				if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+					recordIgnored(b.ESFieldPath)
+					if deletePathInMap(parsedDoc, b.SourceJSONPath) {
+						prunedDynamic = true
+					}
+					continue
+				}
+				return nil, err
+			}
+			if modified {
+				prunedDynamic = true
+			}
+		}
+	}
+
 	for _, b := range fieldsToVisit {
 		if b.EnabledFalse {
 			continue
@@ -195,6 +222,8 @@ func ShredDocumentWithNow(
 				}
 			} else if b.ColumnName != "" {
 				row[b.ColumnName] = expectedStr
+			} else if b.Kind == StorageDynamicVariant && b.NestedPath == "" && len(b.SourceJSONPath) > 0 && len(rawLeafs) == 0 && !hadMalformed {
+				deferReplacePath(b.SourceJSONPath, []any{expectedStr})
 			}
 			if hadMalformed && isPrimaryFieldBinding(b) {
 				if len(validLeafs) > 0 {
@@ -1213,18 +1242,57 @@ func countTokensForBinding(sv string, b FieldBinding) int64 {
 	return cnt
 }
 
+func parseUnsignedLongString(s string, allowCoerce bool) (uint64, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" || strings.HasPrefix(s, "-") {
+		return 0, false
+	}
+	if u, err := strconv.ParseUint(strings.TrimPrefix(s, "+"), 10, 64); err == nil {
+		return u, true
+	}
+	if !strings.ContainsAny(s, "eE") && strings.Count(s, ".") == 1 {
+		parts := strings.SplitN(s, ".", 2)
+		intPart, fracPart := parts[0], parts[1]
+		if len(fracPart) == 0 {
+			return 0, false
+		}
+		for i := 0; i < len(fracPart); i++ {
+			c := fracPart[i]
+			if c < '0' || c > '9' {
+				return 0, false
+			}
+			if !allowCoerce && c != '0' {
+				return 0, false
+			}
+		}
+		intPart = strings.TrimPrefix(intPart, "+")
+		if intPart == "" {
+			intPart = "0"
+		}
+		u, err := strconv.ParseUint(intPart, 10, 64)
+		return u, err == nil
+	}
+	if strings.ContainsAny(s, "eE") {
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f >= 18446744073709551616.0 {
+			return 0, false
+		}
+		if !allowCoerce && math.Trunc(f) != f {
+			return 0, false
+		}
+		return uint64(f), true
+	}
+	return 0, false
+}
+
 func parseExactUint64(val any) (uint64, bool) {
 	switch v := val.(type) {
 	case uint64:
 		return v, true
 	case json.Number:
-		if u, err := strconv.ParseUint(v.String(), 10, 64); err == nil {
-			return u, true
-		}
+		return parseUnsignedLongString(v.String(), true)
 	case string:
-		if u, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64); err == nil {
-			return u, true
-		}
+		return parseUnsignedLongString(v, true)
 	}
 	return 0, false
 }
@@ -1310,6 +1378,7 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 		return formatted
 	}
 	if b.ESType == "unsigned_long" {
+		allowCoerce := b.Coerce == nil || *b.Coerce
 		clampUintToInt64 := func(u uint64) int64 {
 			if u > uint64(math.MaxInt64) {
 				return int64(math.MaxInt64)
@@ -1318,6 +1387,9 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 		}
 		checkFloatUint := func(f float64) any {
 			if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f >= 18446744073709551616.0 {
+				return nil
+			}
+			if !allowCoerce && math.Trunc(f) != f {
 				return nil
 			}
 			if f >= float64(math.MaxInt64) {
@@ -1341,25 +1413,16 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 		case float64:
 			return checkFloatUint(v)
 		case json.Number:
-			s := v.String()
-			if u, err := strconv.ParseUint(s, 10, 64); err == nil {
+			if u, ok := parseUnsignedLongString(v.String(), allowCoerce); ok {
 				return clampUintToInt64(u)
-			}
-			if strings.ContainsAny(s, ".eE") {
-				if f, err := v.Float64(); err == nil {
-					return checkFloatUint(f)
-				}
 			}
 			return nil
 		case string:
-			trimmed := strings.TrimSpace(v)
-			if u, err := strconv.ParseUint(trimmed, 10, 64); err == nil {
-				return clampUintToInt64(u)
+			if !allowCoerce {
+				return nil
 			}
-			if strings.ContainsAny(trimmed, ".eE") {
-				if f, err := strconv.ParseFloat(trimmed, 64); err == nil {
-					return checkFloatUint(f)
-				}
+			if u, ok := parseUnsignedLongString(v, allowCoerce); ok {
+				return clampUintToInt64(u)
 			}
 			return nil
 		default:
@@ -3455,11 +3518,28 @@ func applyNestedBindingNormalizationAtPath(curr map[string]any, relPath []string
 }
 
 func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) any {
+	if b.ESType == "constant_keyword" && b.ConstantValue != nil {
+		expectedStr := fmt.Sprintf("%v", b.ConstantValue)
+		if b.LowercaseNormalizer {
+			expectedStr = strings.ToLower(expectedStr)
+		}
+		return expectedStr
+	}
 	if val == nil {
 		if b.NullValue != nil {
 			return normalizeNestedLeafValue(b.NullValue, b, getNow)
 		}
 		return nil
+	}
+	if b.ESType == "flattened" {
+		norm, _, err := validateAndNormalizeFlattenedValue(val, b, nil)
+		if err != nil {
+			if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+				return nil
+			}
+			return val
+		}
+		return norm
 	}
 	if arr, ok := val.([]any); ok {
 		if b.ESType == "geo_point" && len(arr) == 2 && isGeoNumericElem(arr[0]) && isGeoNumericElem(arr[1]) {
@@ -3710,6 +3790,222 @@ func IPToSortableFloat(ipStr string) (float64, bool) {
 		val = val*256.0 + float64(ip16[i])
 	}
 	return val, true
+}
+
+func validateAndNormalizeFlattenedFieldInDoc(curr map[string]any, path []string, b FieldBinding, recordIgnored func(string)) (bool, error) {
+	if curr == nil || len(path) == 0 {
+		return false, nil
+	}
+	if len(path) == 1 {
+		raw, exists := curr[path[0]]
+		if !exists || raw == nil {
+			if exists && raw == nil {
+				delete(curr, path[0])
+				return true, nil
+			}
+			return false, nil
+		}
+		norm, modified, err := validateAndNormalizeFlattenedValue(raw, b, recordIgnored)
+		if err != nil {
+			return false, err
+		}
+		if norm == nil {
+			delete(curr, path[0])
+			return true, nil
+		}
+		if modified {
+			curr[path[0]] = norm
+		}
+		return modified, nil
+	}
+	if next, exists := curr[path[0]]; exists {
+		switch tv := next.(type) {
+		case map[string]any:
+			return validateAndNormalizeFlattenedFieldInDoc(tv, path[1:], b, recordIgnored)
+		case []any:
+			anyMod := false
+			for _, elem := range tv {
+				if em, ok := elem.(map[string]any); ok {
+					mod, err := validateAndNormalizeFlattenedFieldInDoc(em, path[1:], b, recordIgnored)
+					if err != nil {
+						return false, err
+					}
+					if mod {
+						anyMod = true
+					}
+				}
+			}
+			return anyMod, nil
+		}
+	}
+	return false, nil
+}
+
+func validateAndNormalizeFlattenedValue(raw any, b FieldBinding, recordIgnored func(string)) (any, bool, error) {
+	if raw == nil {
+		return nil, true, nil
+	}
+	switch v := raw.(type) {
+	case map[string]any:
+		normMap, mod := normalizeFlattenedObjectMap(v, b, recordIgnored)
+		if len(normMap) == 0 {
+			return nil, true, nil
+		}
+		return normMap, mod, nil
+	case []any:
+		var merged map[string]any
+		for _, elem := range v {
+			if elem == nil {
+				continue
+			}
+			em, ok := elem.(map[string]any)
+			if !ok {
+				return nil, false, fmt.Errorf("mapper_parsing_exception: object mapping for [%s] tried to parse field [%s] as object, but found a concrete value", b.ESFieldPath, b.ESFieldPath)
+			}
+			normMap, _ := normalizeFlattenedObjectMap(em, b, recordIgnored)
+			if len(normMap) == 0 {
+				continue
+			}
+			if merged == nil {
+				merged = make(map[string]any)
+			}
+			mergeFlattenedObjectMaps(merged, normMap)
+		}
+		if len(merged) == 0 {
+			return nil, true, nil
+		}
+		return merged, true, nil
+	default:
+		return nil, false, fmt.Errorf("mapper_parsing_exception: object mapping for [%s] tried to parse field [%s] as object, but found a concrete value", b.ESFieldPath, b.ESFieldPath)
+	}
+}
+
+func normalizeFlattenedObjectMap(m map[string]any, b FieldBinding, recordIgnored func(string)) (map[string]any, bool) {
+	out := make(map[string]any, len(m))
+	modified := false
+	for k, v := range m {
+		normV, mod := normalizeFlattenedInnerValue(v, b, recordIgnored)
+		if mod {
+			modified = true
+		}
+		if normV == nil {
+			modified = true
+			continue
+		}
+		out[k] = normV
+	}
+	return out, modified
+}
+
+func normalizeFlattenedInnerValue(v any, b FieldBinding, recordIgnored func(string)) (any, bool) {
+	if v == nil {
+		if b.NullValue != nil {
+			nv := fmt.Sprintf("%v", b.NullValue)
+			if b.LowercaseNormalizer {
+				nv = strings.ToLower(nv)
+			}
+			if b.IgnoreAbove > 0 && len([]rune(nv)) > b.IgnoreAbove {
+				if recordIgnored != nil {
+					recordIgnored(b.ESFieldPath)
+				}
+				return nil, true
+			}
+			return nv, true
+		}
+		return nil, true
+	}
+	switch tv := v.(type) {
+	case map[string]any:
+		normMap, mod := normalizeFlattenedObjectMap(tv, b, recordIgnored)
+		if len(normMap) == 0 {
+			return nil, true
+		}
+		return normMap, mod
+	case []any:
+		var scalarOut []any
+		var mergedObj map[string]any
+		modified := false
+		for _, elem := range tv {
+			normElem, mod := normalizeFlattenedInnerValue(elem, b, recordIgnored)
+			if mod {
+				modified = true
+			}
+			if normElem == nil {
+				modified = true
+				continue
+			}
+			if em, ok := normElem.(map[string]any); ok {
+				if mergedObj == nil {
+					mergedObj = make(map[string]any)
+				}
+				mergeFlattenedObjectMaps(mergedObj, em)
+				modified = true
+			} else {
+				scalarOut = append(scalarOut, normElem)
+			}
+		}
+		if len(mergedObj) > 0 && len(scalarOut) == 0 {
+			return mergedObj, true
+		}
+		if len(scalarOut) == 0 {
+			return nil, true
+		}
+		return scalarOut, modified
+	case string:
+		sv := tv
+		mod := false
+		if b.LowercaseNormalizer {
+			if lower := strings.ToLower(sv); lower != sv {
+				sv = lower
+				mod = true
+			}
+		}
+		if b.IgnoreAbove > 0 && len([]rune(sv)) > b.IgnoreAbove {
+			if recordIgnored != nil {
+				recordIgnored(b.ESFieldPath)
+			}
+			return nil, true
+		}
+		return sv, mod
+	default:
+		sv := fmt.Sprintf("%v", tv)
+		if b.IgnoreAbove > 0 && len([]rune(sv)) > b.IgnoreAbove {
+			if recordIgnored != nil {
+				recordIgnored(b.ESFieldPath)
+			}
+			return nil, true
+		}
+		return tv, false
+	}
+}
+
+func mergeFlattenedObjectMaps(dst, src map[string]any) {
+	for k, sv := range src {
+		dv, exists := dst[k]
+		if !exists || dv == nil {
+			dst[k] = sv
+			continue
+		}
+		dm, dIsMap := dv.(map[string]any)
+		sm, sIsMap := sv.(map[string]any)
+		if dIsMap && sIsMap {
+			mergeFlattenedObjectMaps(dm, sm)
+			dst[k] = dm
+			continue
+		}
+		var combined []any
+		if dSlice, ok := dv.([]any); ok {
+			combined = append(combined, dSlice...)
+		} else {
+			combined = append(combined, dv)
+		}
+		if sSlice, ok := sv.([]any); ok {
+			combined = append(combined, sSlice...)
+		} else {
+			combined = append(combined, sv)
+		}
+		dst[k] = combined
+	}
 }
 
 func validateAndNormalizeRangeFieldInDoc(curr map[string]any, path []string, b FieldBinding, getNow func() time.Time) (bool, error) {

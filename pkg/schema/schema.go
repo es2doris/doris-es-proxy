@@ -499,6 +499,17 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 				fType = "object"
 			}
 			allTypes[fullPath] = fType
+			if fType == "scaled_float" {
+				if prop.ScalingFactor <= 0.0 || math.IsNaN(prop.ScalingFactor) || math.IsInf(prop.ScalingFactor, 0) {
+					return fmt.Errorf("mapper_parsing_exception: [scaling_factor] must be > 0.0 for [scaled_float] field [%s]", fullPath)
+				}
+			}
+			if fType == "constant_keyword" && prop.Value != nil {
+				switch prop.Value.(type) {
+				case map[string]any, []any:
+					return fmt.Errorf("mapper_parsing_exception: [constant_keyword] field [%s] [value] must be a scalar value", fullPath)
+				}
+			}
 			if fType == "alias" {
 				target := strings.TrimSpace(prop.Path)
 				if target == "" {
@@ -518,6 +529,17 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 					subFull := fullPath + "." + fk
 					sfType := strings.ToLower(strings.TrimSpace(fprop.Type))
 					allTypes[subFull] = sfType
+					if sfType == "scaled_float" {
+						if fprop.ScalingFactor <= 0.0 || math.IsNaN(fprop.ScalingFactor) || math.IsInf(fprop.ScalingFactor, 0) {
+							return fmt.Errorf("mapper_parsing_exception: [scaling_factor] must be > 0.0 for [scaled_float] field [%s]", subFull)
+						}
+					}
+					if sfType == "constant_keyword" && fprop.Value != nil {
+						switch fprop.Value.(type) {
+						case map[string]any, []any:
+							return fmt.Errorf("mapper_parsing_exception: [constant_keyword] field [%s] [value] must be a scalar value", subFull)
+						}
+					}
 					if sfType == "alias" {
 						target := strings.TrimSpace(fprop.Path)
 						if target == "" {
