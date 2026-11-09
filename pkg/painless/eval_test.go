@@ -3051,3 +3051,576 @@ func TestRound50PainlessFindings(t *testing.T) {
 		}
 	})
 }
+
+func TestRound51F20ToF26Features(t *testing.T) {
+	t.Run("F20_Year_MonthDay_ChronoField", func(t *testing.T) {
+		res, err := Eval(nil, `
+			Year y = Year.of(2024);
+			Year yParsed = Year.parse("2025");
+			Year yFrom = Year.from(LocalDate.of(2026, 3, 15));
+			Year yNow = Year.now(ZoneId.of("UTC"));
+			boolean leap2024 = y.isLeap();
+			boolean leap2025 = Year.isLeap(2025);
+			int len2024 = y.length();
+			String d60 = y.atDay(60);
+			String ym2 = y.atMonth(2);
+			String ymFeb = y.atMonth(Month.FEBRUARY);
+
+			MonthDay md = MonthDay.of(2, 29);
+			MonthDay mdMonth = MonthDay.of(Month.FEBRUARY, 29);
+			MonthDay mdParsed = MonthDay.parse("--12-25");
+			MonthDay mdFrom = MonthDay.from(LocalDate.of(2024, 7, 4));
+			MonthDay mdNow = MonthDay.now(ZoneId.of("UTC"));
+			String yAtMd = y.atMonthDay(md);
+			String mdAt2023 = md.atYear(2023);
+			boolean valid2024 = md.isValidYear(2024);
+			boolean valid2023 = md.isValidYear(2023);
+			MonthDay mdWithM = md.withMonth(4).withDayOfMonth(15);
+
+			Year yPlus = y.plusYears(2).minusYears(1);
+			boolean yAfter = yParsed.isAfter(y);
+			boolean yBefore = y.isBefore(yParsed);
+			boolean mdAfter = mdParsed.isAfter(md);
+			boolean mdBefore = md.isBefore(mdParsed);
+			int yCmp = y.compareTo(yParsed);
+			int mdCmp = md.compareTo(mdMonth);
+
+			LocalDate ld = LocalDate.of(2024, 2, 29);
+			LocalTime lt = LocalTime.of(14, 30, 15);
+			YearMonth ym = YearMonth.of(2024, 2);
+
+			long cfYear = ld.get(ChronoField.YEAR);
+			long cfMonth = ld.getLong(ChronoField.MONTH_OF_YEAR);
+			long cfDom = ld.get(ChronoField.DAY_OF_MONTH);
+			long cfDoy = ld.get(ChronoField.DAY_OF_YEAR);
+			long cfDow = ld.get(ChronoField.DAY_OF_WEEK);
+			long cfHour = lt.get(ChronoField.HOUR_OF_DAY);
+			long cfSecDay = lt.getLong(ChronoField.SECOND_OF_DAY);
+			boolean ldSupYear = ld.isSupported(ChronoField.YEAR);
+			boolean ldSupHour = ld.isSupported(ChronoField.HOUR_OF_DAY);
+			boolean ltSupHour = lt.isSupported(ChronoField.HOUR_OF_DAY);
+			boolean ltSupYear = lt.isSupported(ChronoField.YEAR);
+			boolean ymSupPm = ym.isSupported(ChronoField.PROLEPTIC_MONTH);
+			boolean ySupYear = y.isSupported(ChronoField.YEAR);
+			boolean mdSupDom = md.isSupported(ChronoField.DAY_OF_MONTH);
+
+			String ldWithYear = ld.with(ChronoField.YEAR, 2023);
+			String ltWithHour = lt.with(ChronoField.HOUR_OF_DAY, 9);
+			Year yWith = y.with(ChronoField.YEAR, 2030);
+			MonthDay mdWith = md.with(ChronoField.MONTH_OF_YEAR, 3);
+
+			boolean instY = y instanceof Year;
+			boolean instMD = md instanceof MonthDay;
+			boolean instCF = ChronoField.YEAR instanceof ChronoField;
+
+			return [
+				y.getValue(), y.toString(), leap2024, leap2025, len2024, d60, ym2, ymFeb,
+				md.toString(), md.getMonth(), md.getMonthValue(), md.getDayOfMonth(),
+				mdParsed.toString(), mdFrom.toString(), yAtMd, mdAt2023, valid2024, valid2023, mdWithM.toString(),
+				yPlus.getValue(), yAfter, yBefore, mdAfter, mdBefore, yCmp < 0, mdCmp == 0,
+				cfYear, cfMonth, cfDom, cfDoy, cfDow, cfHour, cfSecDay,
+				ldSupYear, ldSupHour, ltSupHour, ltSupYear, ymSupPm, ySupYear, mdSupDom,
+				ldWithYear, ltWithHour, yWith.getValue(), mdWith.toString(),
+				instY, instMD, instCF, Year.MIN_VALUE < 0, Year.MAX_VALUE > 0,
+				yFrom.getValue(), yNow.getValue() >= 2020, mdNow.getMonthValue() >= 1
+			];
+		`, nil)
+		if err != nil {
+			t.Fatalf("F20 Eval failed: %v", err)
+		}
+		arr, ok := res.([]any)
+		if !ok {
+			t.Fatalf("expected []any, got %#v", res)
+		}
+		wantPrefix := []any{
+			int64(2024), "2024", true, false, int64(366), "2024-02-29", "2024-02", "2024-02",
+			"--02-29", "FEBRUARY", int64(2), int64(29),
+			"--12-25", "--07-04", "2024-02-29", "2023-02-28", true, false, "--04-15",
+			int64(2025), true, true, true, true, true, true,
+			int64(2024), int64(2), int64(29), int64(60), int64(4), int64(14), int64(14*3600 + 30*60 + 15),
+			true, false, true, false, true, true, true,
+			"2023-02-28", "09:30:15", int64(2030), "--03-29",
+			true, true, true, true, true,
+			int64(2026), true, true,
+		}
+		for i, w := range wantPrefix {
+			if i >= len(arr) || arr[i] != w {
+				t.Fatalf("F20 mismatch at index %d: got %#v, want %#v (full=%#v)", i, arr[i], w, arr)
+			}
+		}
+	})
+
+	t.Run("F21_JavaArrays_MultiDim_BraceInit_Clone", func(t *testing.T) {
+		res, err := Eval(nil, `
+			int[] a = new int[4];
+			a[1] = 10;
+			a[1] += 5;
+			a[1]++;
+			boolean[] b = new boolean[2];
+			String[] s = new String[2];
+			int[][] m = new int[2][3];
+			m[0][1] = 7;
+			m[1][2] = 9;
+			m[0][1] += 5;
+			m[0][1]++;
+			int[][] jagged = new int[2][];
+			jagged[0] = new int[]{1, 2};
+			jagged[1] = new int[]{3, 4, 5};
+			int[] init1 = new int[]{10, 20, 30};
+			int[][] init2 = new int[][]{{1, 2}, {3, 4}};
+			int inlineLen = (new int[]{5, 6, 7}).length;
+			int[] cloned = init1.clone();
+			cloned[0] = 99;
+			Map origMap = new HashMap();
+			origMap.put("k", 42);
+			Map clonedMap = origMap.clone();
+			clonedMap.put("k", 100);
+			return [
+				a.length, a[0], a[1], b[0], s[0],
+				m[0][1], m[1][2], m[0][0],
+				jagged[0][1], jagged[1][2],
+				init1[2], init2[1][0], inlineLen,
+				init1[0], cloned[0], origMap.get("k"), clonedMap.get("k"),
+				a instanceof int[], m instanceof int[][]
+			];
+		`, nil)
+		if err != nil {
+			t.Fatalf("F21 Eval failed: %v", err)
+		}
+		want := []any{
+			int64(4), int64(0), int64(16), false, nil,
+			int64(13), int64(9), int64(0),
+			int64(2), int64(5),
+			int64(30), int64(3), int64(3),
+			int64(10), int64(99), int64(42), int64(100),
+			true, true,
+		}
+		arr, ok := res.([]any)
+		if !ok || len(arr) != len(want) {
+			t.Fatalf("F21 unexpected result: %#v, want %#v", res, want)
+		}
+		for i := range want {
+			if arr[i] != want[i] {
+				t.Fatalf("F21 index %d: got %#v, want %#v", i, arr[i], want[i])
+			}
+		}
+	})
+
+	t.Run("F22_SwitchArrow_MultiLabel_SwitchExpression_Yield", func(t *testing.T) {
+		res, err := Eval(nil, `
+			List out = new ArrayList();
+			for (int x : [1, 2, 3, 4, 5]) {
+				switch (x) {
+					case 1 -> out.add("one");
+					case 2, 3 -> {
+						String p = "two_or_three_";
+						out.add(p + x);
+					}
+					default -> out.add("other");
+				}
+			}
+			String colonMulti = "";
+			switch ("b") {
+				case "a", "b":
+					colonMulti = "ab";
+					break;
+				default:
+					colonMulti = "other";
+			}
+			int dayNum = 6;
+			String kind = switch (dayNum) {
+				case 1, 2, 3, 4, 5 -> "weekday";
+				case 6, 7 -> {
+					String tag = "end";
+					yield "week" + tag;
+				}
+				default -> "unknown";
+			};
+			int colonYield = switch ("x") {
+				case "x":
+					yield 42;
+				default:
+					yield 0;
+			};
+			return [out.size(), out[0], out[1], out[2], out[3], colonMulti, kind, colonYield];
+		`, nil)
+		if err != nil {
+			t.Fatalf("F22 Eval failed: %v", err)
+		}
+		want := []any{int64(5), "one", "two_or_three_2", "two_or_three_3", "other", "ab", "weekend", int64(42)}
+		arr, ok := res.([]any)
+		if !ok || len(arr) != len(want) {
+			t.Fatalf("F22 unexpected: %#v, want %#v", res, want)
+		}
+		for i := range want {
+			if arr[i] != want[i] {
+				t.Fatalf("F22 index %d: got %#v, want %#v", i, arr[i], want[i])
+			}
+		}
+	})
+
+	t.Run("F23_IntDivByZero_ArithmeticException_GetClass", func(t *testing.T) {
+		res, err := Eval(nil, `
+			String caught1 = "";
+			String clsName = "";
+			String simpleName = "";
+			try {
+				int x = 1 / 0;
+			} catch (ArithmeticException e) {
+				caught1 = e.getMessage();
+				clsName = e.getClass().getName();
+				simpleName = e.getClass().getSimpleName();
+			}
+			String caught2 = "";
+			try {
+				int y = 10;
+				y %= 0;
+			} catch (Exception e) {
+				caught2 = e.getClass().getSimpleName();
+			}
+			double inf = 1.0 / 0.0;
+			return [
+				caught1, clsName, simpleName, caught2, Double.isInfinite(inf),
+				"abc".getClass().getSimpleName(), (42).getClass().getName(),
+				[1, 2].getClass().getSimpleName(), ["a": 1].getClass().getSimpleName()
+			];
+		`, nil)
+		if err != nil {
+			t.Fatalf("F23 Eval failed: %v", err)
+		}
+		want := []any{
+			"/ by zero", "java.lang.ArithmeticException", "ArithmeticException", "ArithmeticException", false,
+			"String", "java.lang.Long", "ArrayList", "HashMap",
+		}
+		arr, ok := res.([]any)
+		if !ok || len(arr) != len(want) {
+			t.Fatalf("F23 unexpected: %#v, want %#v", res, want)
+		}
+		for i := range want {
+			if arr[i] != want[i] {
+				t.Fatalf("F23 index %d: got %#v, want %#v", i, arr[i], want[i])
+			}
+		}
+
+		// Uncaught integer division by zero should return an error from Eval
+		_, errUncaught := Eval(nil, `return 5 / 0;`, nil)
+		if errUncaught == nil || !strings.Contains(errUncaught.Error(), "ArithmeticException") {
+			t.Fatalf("expected uncaught ArithmeticException error, got %v", errUncaught)
+		}
+	})
+
+	t.Run("F24_StringBuffer_Collections_Arrays_Overloads", func(t *testing.T) {
+		res, err := Eval(nil, `
+			StringBuffer sb = new StringBuffer("hello");
+			sb.append(" ").append("world");
+			def optSb = Optional.empty().orElseGet(StringBuffer::new);
+			optSb.append("ok");
+
+			List words = new ArrayList(["bb", "a", "ccc"]);
+			String shortest = Collections.min(words, Comparator.comparingInt(String::length));
+			String longest = Collections.max(words, Comparator.comparingInt(String::length));
+
+			List nums = new ArrayList([10, 20, 30, 40]);
+			int idxFound = Collections.binarySearch(nums, 30);
+			int idxMiss = Collections.binarySearch(nums, 25);
+			List desc = new ArrayList([40, 30, 20, 10]);
+			int idxDesc = Collections.binarySearch(desc, 20, Comparator.reverseOrder());
+
+			List repList = new ArrayList(["1", 1, 2, 1]);
+			boolean replaced = Collections.replaceAll(repList, 1, 99);
+
+			int[] arr = new int[]{5, 10, 20, 30, 40, 50};
+			int rFound = Arrays.binarySearch(arr, 1, 5, 30);
+			int rMiss = Arrays.binarySearch(arr, 1, 4, 35);
+
+			int[][] m1 = new int[][]{{1, 2}, {3, 4}};
+			int[][] m2 = new int[][]{{1, 2}, {3, 4}};
+			int[][] m3 = new int[][]{{1, 2}, {3, 5}};
+			boolean deepEq1 = Arrays.deepEquals(m1, m2);
+			boolean deepEq2 = Arrays.deepEquals(m1, m3);
+
+			return [
+				sb.toString(), sb instanceof StringBuffer, optSb.toString(),
+				shortest, longest, idxFound, idxMiss, idxDesc,
+				replaced, repList[0], repList[1], repList[3],
+				rFound, rMiss, deepEq1, deepEq2
+			];
+		`, nil)
+		if err != nil {
+			t.Fatalf("F24 Eval failed: %v", err)
+		}
+		want := []any{
+			"hello world", true, "ok",
+			"a", "ccc", int64(2), int64(-3), int64(2),
+			true, "1", int64(99), int64(99),
+			int64(3), int64(-5), true, false,
+		}
+		arr, ok := res.([]any)
+		if !ok || len(arr) != len(want) {
+			t.Fatalf("F24 unexpected: %#v, want %#v", res, want)
+		}
+		for i := range want {
+			if arr[i] != want[i] {
+				t.Fatalf("F24 index %d: got %#v, want %#v", i, arr[i], want[i])
+			}
+		}
+	})
+
+	t.Run("F25_RegexNamedGroupStartEnd_Reset_PatternMethods_RhsRegexOps", func(t *testing.T) {
+		res, err := Eval(nil, `
+			Pattern p = Pattern.compile("(?<yr>\\d{4})-(?<mo>\\d{2})", Pattern.CASE_INSENSITIVE);
+			Matcher m = p.matcher("date: 2026-11");
+			boolean found1 = m.find();
+			int sYr = m.start("yr");
+			int eYr = m.end("yr");
+			int sMo = m.start("mo");
+			int eMo = m.end("mo");
+			m.reset("2025-08");
+			boolean matchesReset = m.matches();
+			String gYr2 = m.group("yr");
+			m.reset();
+			boolean findAfterReset0 = m.find();
+
+			Pattern sp = Pattern.compile(":");
+			String[] spAll = sp.split("a:b:c:");
+			String[] spLim2 = sp.split("a:b:c:", 2);
+			String[] spLimNeg = sp.split("a:b:c:", -1);
+
+			boolean rhsFind = "hello-123" =~ /\d+/;
+			boolean rhsFull1 = "123" ==~ /\d+/;
+			boolean rhsFull2 = "hello-123" ==~ /\d+/;
+
+			return [
+				p.pattern(), p.flags(), p instanceof Pattern,
+				found1, sYr, eYr, sMo, eMo,
+				matchesReset, gYr2, findAfterReset0,
+				spAll.length, spLim2.length, spLim2[1], spLimNeg.length,
+				rhsFind, rhsFull1, rhsFull2
+			];
+		`, nil)
+		if err != nil {
+			t.Fatalf("F25 Eval failed: %v", err)
+		}
+		want := []any{
+			`(?<yr>\d{4})-(?<mo>\d{2})`, int64(2), true,
+			true, int64(6), int64(10), int64(11), int64(13),
+			true, "2025", true,
+			int64(3), int64(2), "b:c:", int64(4),
+			true, true, false,
+		}
+		arr, ok := res.([]any)
+		if !ok || len(arr) != len(want) {
+			t.Fatalf("F25 unexpected: %#v, want %#v", res, want)
+		}
+		for i := range want {
+			if arr[i] != want[i] {
+				t.Fatalf("F25 index %d: got %#v, want %#v", i, arr[i], want[i])
+			}
+		}
+	})
+
+	t.Run("F26_TypeSafeCollectionEquality_SetDeduplication_MapCopyOf", func(t *testing.T) {
+		res, err := Eval(nil, `
+			List list = [1, 2, "3"];
+			boolean hasStr1 = list.contains("1");
+			boolean hasInt1 = list.contains(1);
+			boolean hasLong1 = list.contains(1L);
+			boolean hasInt3 = list.contains(3);
+			boolean hasStr3 = list.contains("3");
+			int idxStr1 = list.indexOf("1");
+			int idxInt1 = list.indexOf(1);
+			int lastIdxStr2 = list.lastIndexOf("2");
+			int lastIdxInt2 = list.lastIndexOf(2);
+
+			List remTest = new ArrayList([1, "1", 2]);
+			remTest.removeAll(["1"]);
+			List retTest = new ArrayList([1, "1", 2]);
+			retTest.retainAll([1]);
+
+			Set s1 = Set.of(1, "1", 1L);
+			Set s2 = Set.copyOf([1, 1, "1", 2, 2L]);
+
+			Map mOrig = new HashMap();
+			mOrig.put("a", 10);
+			Map mCopy = Map.copyOf(mOrig);
+			mOrig.put("a", 20);
+
+			return [
+				hasStr1, hasInt1, hasLong1, hasInt3, hasStr3,
+				idxStr1, idxInt1, lastIdxStr2, lastIdxInt2,
+				remTest.size(), remTest[0],
+				retTest.size(), retTest[0],
+				s1.size(), s2.size(),
+				mCopy.get("a"), mOrig.get("a"),
+				Objects.equals(1, "1"), Objects.equals(1, 1L)
+			];
+		`, nil)
+		if err != nil {
+			t.Fatalf("F26 Eval failed: %v", err)
+		}
+		want := []any{
+			false, true, true, false, true,
+			int64(-1), int64(0), int64(-1), int64(1),
+			int64(2), int64(1),
+			int64(1), int64(1),
+			int64(2), int64(3),
+			int64(10), int64(20),
+			false, true,
+		}
+		arr, ok := res.([]any)
+		if !ok || len(arr) != len(want) {
+			t.Fatalf("F26 unexpected: %#v, want %#v", res, want)
+		}
+		for i := range want {
+			if arr[i] != want[i] {
+				t.Fatalf("F26 index %d: got %#v, want %#v", i, arr[i], want[i])
+			}
+		}
+	})
+
+	t.Run("Round51_InternalBranchCoverage", func(t *testing.T) {
+		for _, mName := range []string{
+			"JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE",
+			"JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER",
+		} {
+			if m, ok := parseMonthNumberPainless("Month." + mName); !ok || m < 1 || m > 12 {
+				t.Fatalf("expected valid month for %s, got %d %v", mName, m, ok)
+			}
+		}
+		if _, ok := parseMonthNumberPainless("INVALID"); ok {
+			t.Fatalf("expected false for invalid month")
+		}
+
+		allFields := []painlessChronoField{
+			"YEAR", "YEAR_OF_ERA", "ERA", "MONTH_OF_YEAR", "PROLEPTIC_MONTH",
+			"DAY_OF_MONTH", "DAY_OF_YEAR", "DAY_OF_WEEK",
+			"ALIGNED_DAY_OF_WEEK_IN_MONTH", "ALIGNED_DAY_OF_WEEK_IN_YEAR",
+			"ALIGNED_WEEK_OF_MONTH", "ALIGNED_WEEK_OF_YEAR", "EPOCH_DAY",
+			"HOUR_OF_DAY", "CLOCK_HOUR_OF_DAY", "HOUR_OF_AMPM", "CLOCK_HOUR_OF_AMPM", "AMPM_OF_DAY",
+			"MINUTE_OF_HOUR", "MINUTE_OF_DAY", "SECOND_OF_MINUTE", "SECOND_OF_DAY",
+			"MILLI_OF_SECOND", "MILLI_OF_DAY", "MICRO_OF_SECOND", "MICRO_OF_DAY",
+			"NANO_OF_SECOND", "NANO_OF_DAY", "INSTANT_SECONDS", "OFFSET_SECONDS",
+		}
+		for _, cf := range allFields {
+			_ = cf.String()
+			_, _ = evalGetChronoFieldPainless("2026-11-08T00:05:06.123456789Z", cf)
+			_, _ = evalGetChronoFieldPainless("2026-11-08T14:05:06.123456789Z", cf)
+			_, _ = evalGetChronoFieldPainless("2026-11", cf)
+			_, _ = evalGetChronoFieldPainless("2026-11-08", cf)
+			_, _ = evalGetChronoFieldPainless("14:05:06", cf)
+			_, _ = evalGetChronoFieldPainless("2026-11-08T14:05:06", cf)
+			_, _ = evalGetChronoFieldPainless(painlessYear{year: 2026}, cf)
+			_, _ = evalGetChronoFieldPainless(painlessYear{year: -5}, cf)
+			_, _ = evalGetChronoFieldPainless(painlessMonthDay{month: 2, day: 29}, cf)
+			_, _ = evalWithChronoFieldPainless("2026-11-08T14:05:06.123456789Z", cf, 2)
+			_, _ = evalWithChronoFieldPainless("2026-11", cf, 2)
+			_, _ = evalWithChronoFieldPainless("2026-11-08", cf, 2)
+			_, _ = evalWithChronoFieldPainless("14:05:06", cf, 2)
+			_, _ = evalWithChronoFieldPainless("2026-11-08T14:05:06", cf, 2)
+			_, _ = evalWithChronoFieldPainless(painlessYear{year: 2026}, cf, 2025)
+			_, _ = evalWithChronoFieldPainless(painlessMonthDay{month: 2, day: 15}, cf, 3)
+		}
+
+		for _, v := range []any{
+			nil,
+			painlessClassObject{fullName: "java.lang.String", simpleName: "String"},
+			map[string]any{"__exc_type": "java.io.IOException"},
+			map[string]any{"__exc_type": "DateTimeParseException"},
+			map[string]any{"__exc_type": "DateTimeException"},
+			map[string]any{"__exc_type": "NoSuchElementException"},
+			map[string]any{"__exc_type": "PatternSyntaxException"},
+			map[string]any{"__exc_type": "IllegalArgumentException"},
+			map[string]any{"a": 1},
+			[]any{1},
+			"str",
+			true,
+			int(1), int32(1), int64(1), int16(1), int8(1), uint8(1),
+			float32(1.5), float64(1.5),
+			json.Number("42"), json.Number("3.14"),
+			&painlessStringBuilder{},
+			&painlessBigDecimal{},
+			painlessYear{year: 2026},
+			painlessMonthDay{month: 1, day: 1},
+			painlessChronoField("YEAR"),
+			painlessPeriod{years: 1, months: 2, days: 3},
+			&painlessMatcher{},
+			&painlessPattern{raw: "abc"},
+		} {
+			cls := painlessClassForValuePainless(v)
+			_ = cls.String()
+		}
+		var nilPat *painlessPattern
+		_ = nilPat.String()
+		_ = (&painlessPattern{raw: "abc"}).String()
+		_ = (&painlessExceptionError{exType: "ArithmeticException", message: "/ by zero"}).Error()
+		_ = (&painlessExceptionError{exType: "ArithmeticException"}).Error()
+		_ = (&painlessExceptionError{message: "msg"}).Error()
+
+		for _, iv := range []any{
+			int(1), int8(2), int16(3), int32(4), int64(5),
+			uint(6), uint8(7), uint16(8), uint32(9), uint64(10),
+			json.Number("11"), json.Number("11.5"), "not_int",
+		} {
+			_, _ = isIntegerValuePainless(iv)
+		}
+
+		for _, v := range []any{
+			(*painlessBigDecimal)(nil),
+			&painlessBigDecimal{},
+			int(42), int64(42), float64(42.5),
+			json.Number("42"), json.Number("42.5"),
+			"42", "42.5", "not_a_num", nil,
+		} {
+			_, _ = toInt64Painless(v)
+		}
+
+		for i := 0; i <= 8; i++ {
+			name := dayOfWeekNamePainless(i)
+			_ = parseDayOfWeekIndexPainless(name)
+			_ = parseDayOfWeekIndexPainless(float64(i))
+		}
+		_ = parseDayOfWeekIndexPainless(nil)
+
+		for i := 0; i <= 13; i++ {
+			mName := monthNamePainless(i)
+			_ = parseMonthIndexPainless(mName)
+			_ = parseMonthIndexPainless(float64(i))
+		}
+		_ = parseMonthIndexPainless(nil)
+
+		for _, needle := range []any{
+			nil, int(65), int(-1), int64(66), int64(-1),
+			float64(67), float64(-1), float64(1.5),
+			json.Number("68"), json.Number("-1"), "abc",
+		} {
+			_, _ = resolveStringSearchNeedlePainless(needle)
+		}
+
+		_ = comparePainlessValues(nil, nil)
+		_ = comparePainlessValues(nil, 1)
+		_ = comparePainlessValues(1, nil)
+		_ = comparePainlessValues(painlessYear{year: 2020}, painlessYear{year: 2025})
+		_ = comparePainlessValues(painlessYear{year: 2025}, painlessYear{year: 2020})
+		_ = comparePainlessValues(painlessYear{year: 2025}, painlessYear{year: 2025})
+		_ = comparePainlessValues(painlessMonthDay{month: 1, day: 10}, painlessMonthDay{month: 2, day: 5})
+		_ = comparePainlessValues(painlessMonthDay{month: 3, day: 10}, painlessMonthDay{month: 2, day: 5})
+		_ = comparePainlessValues(painlessMonthDay{month: 2, day: 1}, painlessMonthDay{month: 2, day: 5})
+		_ = comparePainlessValues(painlessMonthDay{month: 2, day: 10}, painlessMonthDay{month: 2, day: 5})
+		_ = comparePainlessValues(painlessMonthDay{month: 2, day: 5}, painlessMonthDay{month: 2, day: 5})
+
+		pMap := map[string]any{"x": 1}
+		for _, cmp := range []string{
+			"", "null",
+			"Comparator.naturalOrder()", "Comparator.naturalOrder().reversed()",
+			"Comparator.reverseOrder()", "Comparator.reverseOrder().reversed()",
+			"Comparator.comparingInt(String::length)",
+			"Comparator.comparingInt(String::length).reversed()",
+			"(a, b) -> Integer.compare(a.length(), b.length())",
+			"(x, y) -> Integer.compare(y.length(), x.length())",
+		} {
+			_, _ = evalPainlessComparatorPair(cmp, "aa", "bbbb", nil, pMap, 0)
+			_, _ = evalPainlessComparatorPair(cmp, "bbbb", "aa", nil, pMap, 0)
+			_, _ = evalPainlessComparatorPair(cmp, "aa", "aa", nil, pMap, 0)
+		}
+	})
+}

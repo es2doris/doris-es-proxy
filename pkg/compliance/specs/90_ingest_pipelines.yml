@@ -206,3 +206,72 @@
   - match: { docs.0.doc._source.failed_elem: "bad_int" }
   - match: { docs.0.doc._source.nums.0: 10 }
 
+---
+"Simulate Round 51 grok nested brackets dissect multi-arrow kv strip_brackets convert bounds and join error":
+  - do:
+      catch: bad_request
+      ingest.put_pipeline:
+        id: "comp_invalid_proc_pipe"
+        body:
+          processors:
+            - unknown_processor_xyz:
+                field: "x"
+
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - grok:
+                  field: "line"
+                  patterns: ["%{WORD:[http][request][method]} %{NUMBER:[http][response][status]:int}"]
+              - dissect:
+                  field: "dline"
+                  pattern: "%{a--->}%{b}"
+              - kv:
+                  field: "kvline"
+                  field_split: " "
+                  value_split: "="
+                  strip_brackets: true
+                  target_field: "kvout"
+              - convert:
+                  field: "flag_yes"
+                  type: "boolean"
+              - convert:
+                  field: "flag_off"
+                  type: "boolean"
+              - convert:
+                  field: "overflow_byte"
+                  type: "byte"
+                  on_failure:
+                    - set:
+                        field: "byte_overflow_caught"
+                        value: true
+              - join:
+                  field: "not_an_array"
+                  separator: ","
+                  on_failure:
+                    - set:
+                        field: "join_error_caught"
+                        value: true
+          docs:
+            - _source:
+                line: "POST 201"
+                dline: "alpha     beta"
+                kvline: "(k1={v1}) [k2=<v2>]"
+                flag_yes: "yes"
+                flag_off: "off"
+                overflow_byte: "200"
+                not_an_array: "scalar_str"
+  - match: { docs.0.doc._source.http.request.method: "POST" }
+  - match: { docs.0.doc._source.http.response.status: 201 }
+  - match: { docs.0.doc._source.a: "alpha" }
+  - match: { docs.0.doc._source.b: "beta" }
+  - match: { docs.0.doc._source.kvout.k1: "v1" }
+  - match: { docs.0.doc._source.kvout.k2: "v2" }
+  - match: { docs.0.doc._source.flag_yes: true }
+  - match: { docs.0.doc._source.flag_off: false }
+  - match: { docs.0.doc._source.byte_overflow_caught: true }
+  - match: { docs.0.doc._source.join_error_caught: true }
+
+

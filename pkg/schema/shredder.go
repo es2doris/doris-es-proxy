@@ -1754,6 +1754,11 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 			continue
 		}
 		prop, exists := props[k]
+		if exists && prop.Enabled != nil && !*prop.Enabled {
+			delete(obj, k)
+			pruned = true
+			continue
+		}
 		if (!exists || prop.Type == "" || strings.EqualFold(prop.Type, "object")) && len(props) > 0 {
 			prefix := k + "."
 			var synthProps map[string]esast.FieldProperty
@@ -1805,6 +1810,12 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 				if (p0.Enabled != nil && !*p0.Enabled) || strings.EqualFold(p0.Type, "flattened") || strings.EqualFold(p0.Type, "percolator") {
 					continue
 				}
+				if isStrictLeafESType(p0.Type) && len(p0.Properties) == 0 && !DefaultMultiValuedPaths[fullPath] {
+					if p0.IgnoreMalformed == nil || !*p0.IgnoreMalformed {
+						return false, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", fullPath, strings.ToLower(strings.TrimSpace(p0.Type)))
+					}
+					continue
+				}
 				subPruned, err := validateStrictDynamicObject(subObj, p0.Properties, childMode, childSubobjects, fullPath)
 				if err != nil {
 					return false, err
@@ -1836,8 +1847,17 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 			pruned = true
 			continue
 		}
+		fullPath := k
+		if pathPrefix != "" {
+			fullPath = pathPrefix + "." + k
+		}
 		isObjOrNested := len(prop.Properties) > 0 || prop.Type == "" || strings.EqualFold(prop.Type, "object") || strings.EqualFold(prop.Type, "nested")
 		if !isObjOrNested {
+			if isStrictLeafESType(prop.Type) && !DefaultMultiValuedPaths[fullPath] && hasObjectValueAtPath(v, nil) {
+				if prop.IgnoreMalformed == nil || !*prop.IgnoreMalformed {
+					return false, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", fullPath, strings.ToLower(strings.TrimSpace(prop.Type)))
+				}
+			}
 			continue
 		}
 		childMode := mode
@@ -1847,10 +1867,6 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 		childSubobjects := parentSubobjects
 		if prop.Subobjects != nil {
 			childSubobjects = prop.Subobjects
-		}
-		fullPath := k
-		if pathPrefix != "" {
-			fullPath = pathPrefix + "." + k
 		}
 		if subMap, ok := v.(map[string]any); ok {
 			subPruned, err := validateStrictDynamicObject(subMap, prop.Properties, childMode, childSubobjects, fullPath)
@@ -2877,15 +2893,23 @@ func deletePathInMap(curr map[string]any, path []string) bool {
 	return removed
 }
 
+func isStrictLeafESType(esType string) bool {
+	switch strings.ToLower(strings.TrimSpace(esType)) {
+	case "text", "match_only_text", "keyword", "constant_keyword", "wildcard", "ip",
+		"long", "unsigned_long", "integer", "short", "byte", "token_count",
+		"double", "float", "half_float", "scaled_float", "boolean", "date", "date_nanos",
+		"version", "search_as_you_type", "annotated-text", "annotated_text":
+		return true
+	default:
+		return false
+	}
+}
+
 func isStrictLeafFieldWithoutSubprops(s *IndexSchema, b FieldBinding) bool {
 	if b.AliasTarget != "" || DefaultMultiValuedPaths[b.ESFieldPath] {
 		return false
 	}
-	switch b.ESType {
-	case "text", "match_only_text", "keyword", "constant_keyword", "wildcard", "ip",
-		"long", "unsigned_long", "integer", "short", "byte", "token_count",
-		"double", "float", "half_float", "scaled_float", "boolean", "date", "date_nanos":
-	default:
+	if !isStrictLeafESType(b.ESType) {
 		return false
 	}
 	if s != nil {

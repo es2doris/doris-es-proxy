@@ -894,6 +894,10 @@ func matchMultiWildcardWithExclusions(rawPattern, candidate string) bool {
 }
 
 func (s *Server) handleResolveIndex(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	pattern := r.PathValue("name")
 	if pattern == "" {
 		pattern = "*"
@@ -918,11 +922,20 @@ func (s *Server) handleResolveIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(idxNames)
 	ew := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("expand_wildcards")))
-	isWildcardReq := strings.Contains(pattern, "*") || strings.Contains(pattern, ",") || pattern == "_all"
+	concreteParts := make(map[string]bool)
+	for _, rawPart := range strings.Split(pattern, ",") {
+		part := strings.TrimSpace(rawPart)
+		if part != "" && !strings.HasPrefix(part, "-") && !strings.ContainsAny(part, "*?") && part != "_all" {
+			concreteParts[part] = true
+		}
+	}
 	for _, name := range idxNames {
+		if ew == "none" && !concreteParts[name] {
+			continue
+		}
 		if matchMultiWildcardWithExclusions(pattern, name) {
 			isClosed := s.closedIndices[name]
-			if isWildcardReq {
+			if ew != "" {
 				if ew == "open" && isClosed {
 					continue
 				}
@@ -940,14 +953,17 @@ func (s *Server) handleResolveIndex(w http.ResponseWriter, r *http.Request) {
 			}
 			sort.Strings(idxAliases)
 			attrs := []string{"open"}
+			stateStr := "open"
 			isOpen := true
 			if isClosed {
 				attrs = []string{"close"}
+				stateStr = "close"
 				isOpen = false
 			}
 			entry := map[string]any{
 				"name":       name,
 				"attributes": attrs,
+				"state":      stateStr,
 				"open":       isOpen,
 			}
 			if len(idxAliases) > 0 {
@@ -1111,6 +1127,10 @@ func (s *Server) handleIndexStats(w http.ResponseWriter, r *http.Request) {
 
 // handleSearchShards implements `GET /{index}/_search_shards` for Spark-ES / Hadoop-ES / Kibana clients.
 func (s *Server) handleSearchShards(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	rawIndex := r.PathValue("index")
 	var targets []string
 	if rawIndex == "" {
@@ -1119,6 +1139,10 @@ func (s *Server) handleSearchShards(w http.ResponseWriter, r *http.Request) {
 		var ok bool
 		targets, _, ok = s.resolveValidatedReadTargets(w, r, rawIndex)
 		if !ok {
+			return
+		}
+		if closedIdx := s.findClosedTargetIndex(r, rawIndex); closedIdx != "" {
+			writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
 			return
 		}
 	}
@@ -1153,7 +1177,7 @@ func (s *Server) handleSearchShards(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.PathValue("id"))
 	switch r.Method {
-	case http.MethodPut, http.MethodPost:
+	case http.MethodPut:
 		if id == "" {
 			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: pipeline id is missing;")
 			return
@@ -1170,7 +1194,8 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if body == nil {
-			body = map[string]any{"description": "doris-es-proxy compatibility pipeline", "processors": []any{}}
+			writeESError(w, http.StatusBadRequest, "parse_exception", "[processors] required property is missing")
+			return
 		}
 		if err := validateIngestPipelineSpec(body); err != nil {
 			writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
@@ -1349,18 +1374,20 @@ func validateIngestPipelineProcessors(procs []any) error {
 	for _, p := range procs {
 		pm, ok := p.(map[string]any)
 		if !ok {
-			continue
+			return fmt.Errorf("processor must be a map")
 		}
 		if topOnFail, ok := pm["on_failure"].([]any); ok {
 			if err := validateIngestPipelineProcessors(topOnFail); err != nil {
 				return err
 			}
 		}
+		procCount := 0
 		for procType, rawSpec := range pm {
 			switch procType {
 			case "tag", "ignore_failure", "on_failure", "if", "description":
 				continue
 			}
+			procCount++
 			if !isSupportedIngestProcessorType(procType) {
 				return fmt.Errorf("no processor type exists with name [%s]", procType)
 			}
@@ -1404,15 +1431,27 @@ func validateIngestPipelineProcessors(procs []any) error {
 				}
 			}
 		}
+		if procCount == 0 {
+			return fmt.Errorf("processor doesn't specify type")
+		}
+		if procCount > 1 {
+			return fmt.Errorf("processor cannot specify more than one type")
+		}
 	}
 	return nil
 }
 
 func validateIngestPipelineSpec(body map[string]any) error {
-	if procs, ok := body["processors"].([]any); ok {
-		if err := validateIngestPipelineProcessors(procs); err != nil {
-			return err
-		}
+	rawProcs, hasProcs := body["processors"]
+	if !hasProcs {
+		return fmt.Errorf("[processors] required property is missing")
+	}
+	procs, ok := rawProcs.([]any)
+	if !ok {
+		return fmt.Errorf("[processors] property isn't a list")
+	}
+	if err := validateIngestPipelineProcessors(procs); err != nil {
+		return err
 	}
 	if onFail, ok := body["on_failure"].([]any); ok {
 		if err := validateIngestPipelineProcessors(onFail); err != nil {
@@ -2071,11 +2110,19 @@ func deepCloneIngestValue(val any) any {
 }
 
 func normalizeGrokFieldName(fieldName string) string {
-	if strings.HasPrefix(fieldName, "[") && strings.HasSuffix(fieldName, "]") {
-		trimmed := strings.TrimPrefix(strings.TrimSuffix(fieldName, "]"), "[")
-		return strings.ReplaceAll(trimmed, "][", ".")
+	if !strings.Contains(fieldName, "[") {
+		return fieldName
 	}
-	return fieldName
+	s := strings.TrimSpace(fieldName)
+	s = strings.TrimPrefix(s, "[")
+	s = strings.TrimSuffix(s, "]")
+	s = strings.ReplaceAll(s, "][", ".")
+	s = strings.ReplaceAll(s, "[", ".")
+	s = strings.ReplaceAll(s, "]", "")
+	for strings.Contains(s, "..") {
+		s = strings.ReplaceAll(s, "..", ".")
+	}
+	return strings.Trim(s, ".")
 }
 
 func compileGrokRegex(pat string, customDefs map[string]any) (*regexp.Regexp, map[string]string, map[string]string, error) {
@@ -2454,6 +2501,7 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 		if strings.HasSuffix(inner, "->") {
 			tok.padRight = true
 			inner = strings.TrimSuffix(inner, "->")
+			inner = strings.TrimRight(inner, "-")
 		}
 		inner = strings.TrimSpace(inner)
 		switch {
@@ -2502,7 +2550,18 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 			val = cur
 			cur = ""
 		} else if tok.nextLit == "" {
-			val = ""
+			if tok.padRight {
+				wsIdx := strings.IndexAny(cur, " \t")
+				if wsIdx >= 0 {
+					val = cur[:wsIdx]
+					cur = strings.TrimLeft(cur[wsIdx:], " \t")
+				} else {
+					val = cur
+					cur = ""
+				}
+			} else {
+				val = ""
+			}
 		} else {
 			idx := strings.Index(cur, tok.nextLit)
 			if idx < 0 {
@@ -3199,7 +3258,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					setIngestPath(doc, target, strings.Join(strs, sep))
 					mutated = true
 				} else {
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not an array", field)
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not an array, cannot join", field)
 				}
 			} else if isExplicitIgnoreMissingFalse(specMap) {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
@@ -3482,16 +3541,28 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				if valueSplit != "=" && valueSplit != ":" && valueSplit != "|" && valueSplit != "." {
 					valSplitRe, _ = regexp.Compile(valueSplit)
 				}
+				stripKVEnclosingBrackets := func(s string) string {
+					for len(s) >= 2 {
+						first, last := s[0], s[len(s)-1]
+						if (first == '[' && last == ']') || (first == '(' && last == ')') || (first == '<' && last == '>') || (first == '{' && last == '}') {
+							s = s[1 : len(s)-1]
+						} else {
+							break
+						}
+					}
+					return s
+				}
 				kvMap := make(map[string]any)
 				for _, strVal := range strInputs {
-					if stripBrackets && len(strVal) >= 2 {
-						first, last := strVal[0], strVal[len(strVal)-1]
-						if (first == '[' && last == ']') || (first == '(' && last == ')') || (first == '<' && last == '>') {
-							strVal = strVal[1 : len(strVal)-1]
-						}
+					if stripBrackets {
+						strVal = stripKVEnclosingBrackets(strings.TrimSpace(strVal))
 					}
 					pairs := splitIngestKVPairs(strVal, fieldSplit)
 					for _, pair := range pairs {
+						pair = strings.TrimSpace(pair)
+						if stripBrackets {
+							pair = stripKVEnclosingBrackets(pair)
+						}
 						if pair == "" {
 							continue
 						}
@@ -3526,8 +3597,8 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 							first, last := v[0], v[len(v)-1]
 							if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
 								v = v[1 : len(v)-1]
-							} else if stripBrackets && ((first == '(' && last == ')') || (first == '[' && last == ']') || (first == '<' && last == '>')) {
-								v = v[1 : len(v)-1]
+							} else if stripBrackets {
+								v = stripKVEnclosingBrackets(v)
 							}
 						}
 						if trimVal != "" {
@@ -5866,14 +5937,34 @@ func convertSingleIngestValue(val any, convType string) (any, error) {
 		return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
 	}
 	str := strings.TrimSpace(fmt.Sprintf("%v", val))
-	switch strings.ToLower(convType) {
+	lowerType := strings.ToLower(convType)
+	switch lowerType {
 	case "integer", "int", "long", "short", "byte":
+		checkBounds := func(iv int64) bool {
+			switch lowerType {
+			case "integer", "int":
+				return iv >= math.MinInt32 && iv <= math.MaxInt32
+			case "short":
+				return iv >= math.MinInt16 && iv <= math.MaxInt16
+			case "byte":
+				return iv >= math.MinInt8 && iv <= math.MaxInt8
+			default:
+				return true
+			}
+		}
 		if iv, err := strconv.ParseInt(str, 10, 64); err == nil {
+			if !checkBounds(iv) {
+				return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
+			}
 			return iv, nil
 		}
 		if !strings.Contains(str, ".") {
-			if fv, err := strconv.ParseFloat(str, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) {
-				return int64(fv), nil
+			if fv, err := strconv.ParseFloat(str, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) && fv >= float64(math.MinInt64) && fv < float64(math.MaxInt64) {
+				iv := int64(fv)
+				if !checkBounds(iv) {
+					return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
+				}
+				return iv, nil
 			}
 		}
 		return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
@@ -5896,9 +5987,9 @@ func convertSingleIngestValue(val any, convType string) (any, error) {
 		return fmt.Sprintf("%v", val), nil
 	case "boolean", "bool":
 		switch strings.ToLower(str) {
-		case "true", "1":
+		case "true", "1", "yes", "on":
 			return true, nil
-		case "false", "0":
+		case "false", "0", "no", "off":
 			return false, nil
 		}
 		return nil, fmt.Errorf("unable to convert [%v] to boolean", val)
@@ -6301,6 +6392,10 @@ func deleteIngestPath(doc map[string]any, path string) {
 
 // handleCatNodes implements `GET /_cat/nodes` for Elasticvue & Cerebro.
 func (s *Server) handleCatNodes(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	rows := []map[string]any{
 		{
 			"ip":           "127.0.0.1",
@@ -6317,6 +6412,10 @@ func (s *Server) handleCatNodes(w http.ResponseWriter, r *http.Request) {
 
 // handleCatShards implements `GET /_cat/shards` for Elasticvue & Cerebro.
 func (s *Server) handleCatShards(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	var names []string
 	if pat := r.PathValue("index"); pat != "" {
 		names = s.resolveTargetIndices(pat)
@@ -6344,6 +6443,10 @@ func (s *Server) handleCatShards(w http.ResponseWriter, r *http.Request) {
 
 // handleCatCount implements `GET /_cat/count`.
 func (s *Server) handleCatCount(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	zero := 0
 	resp, _, _, _ := s.executeSearchRequest(r.Context(), r.PathValue("index"), &esast.SearchRequest{Size: &zero})
 	total, _ := extractTotalAndHitIDs(resp)
@@ -6360,6 +6463,10 @@ func (s *Server) handleCatCount(w http.ResponseWriter, r *http.Request) {
 
 // handleCatHealth implements `GET /_cat/health`.
 func (s *Server) handleCatHealth(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	s.mu.RLock()
 	numIndices := len(s.indices)
 	s.mu.RUnlock()
@@ -6398,6 +6505,10 @@ func (s *Server) handleCatHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeCatResponse(w http.ResponseWriter, r *http.Request, headers []string, rows []map[string]any) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	if isTruthyBoolQueryParam(r, "help") {
 		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -6754,6 +6865,8 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 							rawMap = make(map[string]any)
 						}
 						rawMap["__meta_id"] = h.ID
+						rawMap["__meta_index"] = srcIdx
+						rawMap["__meta_version"] = h.Version
 						if hasRuntimeQueryScript && !evalQueryScriptFilterOnDocWithScore(srcSchema, rawMap, effQuery, h.Score) {
 							continue
 						}
@@ -6880,6 +6993,8 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 						rawMap = make(map[string]any)
 					}
 					rawMap["__meta_id"] = h.ID
+					rawMap["__meta_index"] = effSrcIdx
+					rawMap["__meta_version"] = h.Version
 					if !evalQueryScriptFilterOnDocWithScore(srcSchema, rawMap, effQuery, h.Score) {
 						continue
 					}
@@ -7466,7 +7581,47 @@ func buildNestedMappingProps(segments []string, leaf esast.FieldProperty) map[st
 
 // handleValidateQuery implements `GET/POST /_validate/query` and `GET/POST /{index}/_validate/query`.
 func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
-	rawIndex := r.PathValue("index")
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	rawIndex := strings.TrimSpace(r.PathValue("index"))
+	wantsExplain := r.URL.Query().Get("explain") == "true" || r.URL.Query().Has("explain") || r.URL.Query().Get("rewrite") == "true"
+	writeInvalidResp := func(errMsg string, targetList []string) {
+		nShards := len(targetList)
+		if nShards == 0 {
+			nShards = 1
+		}
+		resp := map[string]any{
+			"valid":   false,
+			"error":   errMsg,
+			"_shards": map[string]any{"total": nShards, "successful": nShards, "failed": 0},
+		}
+		if wantsExplain {
+			idxForExpl := rawIndex
+			if len(targetList) > 0 {
+				idxForExpl = targetList[0]
+			}
+			resp["explanations"] = []map[string]any{
+				{
+					"index": idxForExpl,
+					"valid": false,
+					"error": errMsg,
+				},
+			}
+		}
+		writeJSON(w, http.StatusOK, resp)
+	}
+
+	var targets []string
+	var aliasFilters map[string]*esast.Query
+	if rawIndex != "" {
+		var ok bool
+		targets, aliasFilters, ok = s.resolveValidatedReadTargets(w, r, rawIndex)
+		if !ok {
+			return
+		}
+	}
 
 	raw, ok := readRequestBody(w, r)
 	if !ok {
@@ -7474,12 +7629,21 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	var req esast.SearchRequest
 	if len(bytes.TrimSpace(raw)) > 0 {
+		var rawTop map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &rawTop); err != nil {
+			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+			return
+		}
+		for k := range rawTop {
+			switch k {
+			case "query", "pit", "aggs", "aggregations", "runtime_mappings":
+			default:
+				writeESError(w, http.StatusBadRequest, "parsing_exception", fmt.Sprintf("Unknown key for a START_OBJECT in [validate/query]: [%s].", k))
+				return
+			}
+		}
 		if err := json.Unmarshal(raw, &req); err != nil {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"valid":   false,
-				"error":   err.Error(),
-				"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0},
-			})
+			writeInvalidResp(err.Error(), targets)
 			return
 		}
 	}
@@ -7487,41 +7651,31 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 	if req.PIT != nil && req.PIT.ID != "" {
 		pitIdx, ok := decodePITIndex(req.PIT.ID)
 		if !ok || pitIdx == "" {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"valid":   false,
-				"error":   "invalid pit id [" + req.PIT.ID + "]",
-				"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0},
-			})
+			writeInvalidResp("invalid pit id ["+req.PIT.ID+"]", targets)
 			return
 		}
 	}
 	if errMsg := validatePipelineAggs(req.EffectiveAggs()); errMsg != "" {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"valid":   false,
-			"error":   errMsg,
-			"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0},
-		})
+		writeInvalidResp(errMsg, targets)
 		return
 	}
-	rawIndex = extractPITIndex(rawIndex, req.PIT)
-	targets, aliasFilters := s.resolveTargetIndicesWithFilters(rawIndex)
+	if rawIndex == "" {
+		rawIndex = extractPITIndex(rawIndex, req.PIT)
+		targets, aliasFilters = s.resolveTargetIndicesWithFilters(rawIndex)
+	}
 	if len(targets) == 0 {
-		if rawIndex != "" && hasExclusionOrWildcard(rawIndex) {
+		if rawIndex != "" {
 			resp := map[string]any{
 				"valid":   true,
 				"_shards": map[string]any{"total": 0, "successful": 0, "failed": 0},
 			}
-			if r.URL.Query().Get("explain") == "true" || r.URL.Query().Has("explain") || r.URL.Query().Get("rewrite") == "true" {
+			if wantsExplain {
 				resp["explanations"] = []map[string]any{}
 			}
 			writeJSON(w, http.StatusOK, resp)
 			return
 		}
-		if rawIndex != "" {
-			targets = []string{s.resolveIndexName(rawIndex)}
-		} else {
-			targets = []string{"_all"}
-		}
+		targets = []string{"_all"}
 	}
 	s.resolveStoredScriptsInSearchRequest(&req)
 	_ = s.preResolveSpecialQueriesInSearchRequest(r.Context(), targets, &req)
@@ -7537,11 +7691,7 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 		subReq := applyIndexAliasFilter(&req, aliasFilters[idxName])
 		plan, err := tr.BuildSearchPlan(subReq)
 		if err != nil {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"valid":   false,
-				"error":   err.Error(),
-				"_shards": map[string]any{"total": len(targets), "successful": len(targets), "failed": 0},
-			})
+			writeInvalidResp(err.Error(), targets)
 			return
 		}
 		expl := plan.HitsSQL
@@ -7714,6 +7864,10 @@ func unicodeToLower(r rune) rune {
 
 // handleRollover implements `POST /{alias}/_rollover` and `POST /{alias}/_rollover/{new_index}`.
 func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodPost {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
 		return
@@ -7819,6 +7973,20 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 		} else {
 			newIdx = incrementRolloverIndexName(oldIdx)
 		}
+	}
+	s.mu.RLock()
+	_, autoNewExists := s.indices[newIdx]
+	newAliasCollision := len(s.aliases[newIdx]) > 0 || s.dataStreams[newIdx] != nil
+	s.mu.RUnlock()
+	if autoNewExists {
+		writeESError(w, http.StatusBadRequest, "resource_already_exists_exception",
+			fmt.Sprintf("index [%s] already exists", newIdx))
+		return
+	}
+	if newAliasCollision {
+		writeESError(w, http.StatusBadRequest, "invalid_index_name_exception",
+			fmt.Sprintf("Invalid index name [%s], already exists as alias", newIdx))
+		return
 	}
 
 	condResults := make(map[string]bool)
@@ -8297,9 +8465,27 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 
 // handleExplainDoc implements `GET/POST /{index}/_explain/{id}` and `GET/POST /{index}/_doc/{id}/_explain`.
 func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
-	indexName, aliasFilter, readErr := s.resolveReadDocIndexWithFilter(r.PathValue("index"))
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	_ = s.syncCatalogFromBackend(r.Context())
+	rawIndex := strings.TrimSpace(r.PathValue("index"))
+	indexName, aliasFilter, readErr := s.resolveReadDocIndexWithFilter(rawIndex)
 	if readErr != nil {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", readErr.Error())
+		return
+	}
+	s.mu.RLock()
+	_, idxExists := s.indices[indexName]
+	isClosed := s.closedIndices[indexName]
+	s.mu.RUnlock()
+	if !idxExists {
+		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
+		return
+	}
+	if isClosed {
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", "closed ["+indexName+"]")
 		return
 	}
 	docID := r.PathValue("id")
@@ -8309,6 +8495,19 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 	}
 	var req esast.SearchRequest
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		var rawTop map[string]json.RawMessage
+		if err := json.Unmarshal(bodyBytes, &rawTop); err != nil {
+			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+			return
+		}
+		for k := range rawTop {
+			switch k {
+			case "query", "post_filter", "min_score", "_source", "stored_fields", "fields", "docvalue_fields", "script_fields", "runtime_mappings":
+			default:
+				writeESError(w, http.StatusBadRequest, "parsing_exception", fmt.Sprintf("Unknown key for a START_OBJECT in [explain]: [%s].", k))
+				return
+			}
+		}
 		if err := json.Unmarshal(bodyBytes, &req); err != nil {
 			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
 			return

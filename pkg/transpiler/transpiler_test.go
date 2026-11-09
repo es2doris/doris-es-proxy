@@ -2980,6 +2980,7 @@ func TestRound47TranspilerSpecCompliance(t *testing.T) {
 			"created_at": {Type: "date"},
 			"loc":        {Type: "geo_point"},
 			"join_field": {Type: "join"},
+			"query":      {Type: "percolator"},
 			"items": {
 				Type: "nested",
 				Properties: map[string]esast.FieldProperty{
@@ -3596,4 +3597,164 @@ func TestRound50TranspilerGeoPolygonRangeContainsNestedSpanSortAndTermsSet(t *te
 	tr.CompileQuery(&esast.Query{DistanceFeature: &esast.DistanceFeatureQuery{Field: "price", Origin: 100, Pivot: "10d", Boost: &b2}}, true, nil)
 	tr.CompileQuery(&esast.Query{DistanceFeature: &esast.DistanceFeatureQuery{Field: "price", Origin: "100", Pivot: 50, Boost: &b2}}, true, nil)
 	tr.CompileQuery(&esast.Query{DistanceFeature: &esast.DistanceFeatureQuery{Field: "loc", Origin: []any{-70.0, 40.0}, Pivot: "5km", Boost: &b2}}, true, nil)
+}
+
+func TestRound51TranspilerF10ToF18(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"title":     {"type": "text"},
+			"body":      {"type": "text"},
+			"pagerank":  {"type": "rank_feature"},
+			"price":     {"type": "double"},
+			"scores":    {"type": "double", "multi_valued": true},
+			"ts":        {"type": "date"},
+			"ts_nanos":  {"type": "date_nanos"},
+			"loc":       {"type": "geo_point"},
+			"locs":      {"type": "geo_point", "multi_valued": true},
+			"perc_q":    {"type": "percolator"},
+			"places": {
+				"type": "nested",
+				"properties": {
+					"pin": {"type": "geo_point"}
+				}
+			}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("mapping unmarshal failed: %v", err)
+	}
+	sch := schema.CompileIndexSchema("db", "r51_tr_idx", &spec)
+	tr := NewTranspiler(sch, TranspilerOptions{UseDoris4SearchFunc: true})
+
+	// F10: rank_feature on non-rank_feature field returns query_shard_exception
+	var badRFReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"rank_feature":{"field":"price"}}}`), &badRFReq)
+	if _, err := tr.BuildSearchPlan(&badRFReq); err == nil || !strings.Contains(err.Error(), "query_shard_exception") {
+		t.Fatalf("F10 expected query_shard_exception for rank_feature on double field, got %v", err)
+	}
+
+	// F11: distance_feature on non-date/geo_point field returns query_shard_exception
+	var badDFReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"distance_feature":{"field":"price","origin":100,"pivot":10}}}`), &badDFReq)
+	if _, err := tr.BuildSearchPlan(&badDFReq); err == nil || !strings.Contains(err.Error(), "query_shard_exception") {
+		t.Fatalf("F11 expected query_shard_exception for distance_feature on double field, got %v", err)
+	}
+	// F11: distance_feature on date_nanos normalizes nanosecond origin to milliseconds
+	var nanosDFQ, arrGeoDFQ, nestedGeoDFQ esast.Query
+	_ = json.Unmarshal([]byte(`{"distance_feature":{"field":"ts_nanos","origin":1700000000000000000,"pivot":"1d"}}`), &nanosDFQ)
+	cqNanos := tr.CompileQuery(&nanosDFQ, true, nil)
+	if !strings.Contains(cqNanos.ScoreSQL, "1.7e+12") || strings.Contains(cqNanos.ScoreSQL, "1.7e+18") {
+		t.Fatalf("F11 expected date_nanos numeric origin to normalize to 1.7e+12 ms, got %s", cqNanos.ScoreSQL)
+	}
+	_ = json.Unmarshal([]byte(`{"distance_feature":{"field":"locs","origin":[-74.0,40.7],"pivot":"1000m"}}`), &arrGeoDFQ)
+	cqArrGeo := tr.CompileQuery(&arrGeoDFQ, true, nil)
+	if !strings.Contains(cqArrGeo.WhereSQL, "array_size(`f__locs`) > 0") || !strings.Contains(cqArrGeo.ScoreSQL, "array_min") {
+		t.Fatalf("F11 expected multi-valued geo_point distance_feature to use array_size > 0 and array_min, got where=%s score=%s", cqArrGeo.WhereSQL, cqArrGeo.ScoreSQL)
+	}
+	_ = json.Unmarshal([]byte(`{"nested":{"path":"places","query":{"distance_feature":{"field":"places.pin","origin":[-74.0,40.7],"pivot":"1000m"}}}}`), &nestedGeoDFQ)
+	cqNestedGeo := tr.CompileQuery(&nestedGeoDFQ, true, nil)
+	cqInnerGeo := tr.CompileQuery(&nestedGeoDFQ.Nested.Query, true, &nestedCtx{nestedPath: "places", elemVar: "_el"})
+	if !strings.Contains(cqNestedGeo.WhereSQL, "$.pin") || !strings.Contains(cqInnerGeo.ScoreSQL, "ST_Distance_Sphere") {
+		t.Fatalf("F11 expected nested geo_point distance_feature to extract $.pin and compute ST_Distance_Sphere, got where=%s score=%s", cqNestedGeo.WhereSQL, cqInnerGeo.ScoreSQL)
+	}
+
+	// F12: function_score decay wraps NULL check (ELSE 0.0) and honors multi_value_mode on array numeric field
+	var decayQ esast.Query
+	_ = json.Unmarshal([]byte(`{
+		"function_score": {
+			"gauss": {
+				"scores": {"origin": 50, "scale": 10},
+				"multi_value_mode": "max"
+			}
+		}
+	}`), &decayQ)
+	cqDecay := tr.CompileQuery(&decayQ, true, nil)
+	if !strings.Contains(cqDecay.ScoreSQL, "CASE WHEN") || !strings.Contains(cqDecay.ScoreSQL, "ELSE 0.0 END") || !strings.Contains(cqDecay.ScoreSQL, "array_max(array_map(") {
+		t.Fatalf("F12 expected decay function to wrap in CASE WHEN ... ELSE 0.0 END and use array_max(array_map(...)), got %s", cqDecay.ScoreSQL)
+	}
+
+	// F13: intervals use_field override and ordered match with max_gaps -> MATCH_PHRASE ~slop
+	var ivQ esast.Query
+	_ = json.Unmarshal([]byte(`{
+		"intervals": {
+			"title": {
+				"all_of": {
+					"intervals": [
+						{"match": {"query": "quick fox", "ordered": true, "max_gaps": 3, "use_field": "body"}},
+						{"prefix": {"prefix": "br", "use_field": "body"}}
+					]
+				}
+			}
+		}
+	}`), &ivQ)
+	cqIv := tr.CompileQuery(&ivQ, false, nil)
+	if !strings.Contains(cqIv.WhereSQL, "`f__body`") || !strings.Contains(cqIv.WhereSQL, "MATCH_PHRASE") || !strings.Contains(cqIv.WhereSQL, "~3") {
+		t.Fatalf("F13 expected intervals use_field='body' and ordered max_gaps=3 to emit `f__body` MATCH_PHRASE ... ~3, got %s", cqIv.WhereSQL)
+	}
+
+	// F14: percolate on unmapped field returns query_shard_exception unless ignore_unmapped=true
+	var badPercReq, ignoredPercReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"percolate":{"field":"unmapped_perc","document":{"title":"fox"}}}}`), &badPercReq)
+	if _, err := tr.BuildSearchPlan(&badPercReq); err == nil || !strings.Contains(err.Error(), "query_shard_exception") {
+		t.Fatalf("F14 expected query_shard_exception for unmapped percolate field, got %v", err)
+	}
+	_ = json.Unmarshal([]byte(`{"query":{"percolate":{"field":"unmapped_perc","ignore_unmapped":true,"document":{"title":"fox"}}}}`), &ignoredPercReq)
+	if planP, err := tr.BuildSearchPlan(&ignoredPercReq); err != nil || !strings.Contains(planP.HitsSQL, "FALSE") {
+		t.Fatalf("F14 expected ignore_unmapped=true percolate to succeed with FALSE, got plan=%+v err=%v", planP, err)
+	}
+
+	// F17: histogram hard_bounds emits SQL WHERE filter in both top-level and sub-aggregation
+	var histBoundsReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"size": 0,
+		"aggs": {
+			"price_hist": {
+				"histogram": {
+					"field": "price",
+					"interval": 10,
+					"hard_bounds": {"min": 20, "max": 100}
+				},
+				"aggs": {
+					"sub_hist": {
+						"histogram": {
+							"field": "price",
+							"interval": 5,
+							"hard_bounds": {"min": 30, "max": 80}
+						}
+					}
+				}
+			}
+		}
+	}`), &histBoundsReq)
+	planHB, err := tr.BuildSearchPlan(&histBoundsReq)
+	if err != nil {
+		t.Fatalf("F17 BuildSearchPlan failed: %v", err)
+	}
+	if !strings.Contains(planHB.AggsSQL, ">= 20") || !strings.Contains(planHB.AggsSQL, "<= 100") {
+		t.Fatalf("F17 expected top-level histogram SQL to filter hard_bounds [20, 100], got %s", planHB.AggsSQL)
+	}
+	if !strings.Contains(planHB.AggsSQL, ">= 30") || !strings.Contains(planHB.AggsSQL, "<= 80") {
+		t.Fatalf("F17 expected sub-histogram SQL to filter hard_bounds [30, 80], got %s", planHB.AggsSQL)
+	}
+
+	// F18: composite agg with missing_bucket: true and after: {"k": null} routes through postProcessCompositeAgg (LIMIT 10000)
+	var compAfterNullReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"size": 0,
+		"aggs": {
+			"comp": {
+				"composite": {
+					"size": 2,
+					"after": {"t": null},
+					"sources": [
+						{"t": {"terms": {"field": "title", "missing_bucket": true}}}
+					]
+				}
+			}
+		}
+	}`), &compAfterNullReq)
+	planComp, err := tr.BuildSearchPlan(&compAfterNullReq)
+	if err != nil || !strings.Contains(planComp.AggsSQL, "LIMIT 10000") {
+		t.Fatalf("F18 expected composite agg with after={t:null} and missing_bucket=true to use post-process LIMIT 10000, got sql=%s err=%v", planComp.AggsSQL, err)
+	}
 }

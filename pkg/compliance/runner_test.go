@@ -257,6 +257,148 @@ func TestBuildActionRequest(t *testing.T) {
 			strippedParam: []string{"index"},
 			wantQuery:     map[string]string{"only_errors": "true"},
 		},
+
+		// F0: data stream actions
+		{
+			name:       "indices.data_stream_stats default",
+			action:     "indices.data_stream_stats",
+			params:     map[string]any{"human": true},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_data_stream/_stats",
+			wantQuery:  map[string]string{"human": "true"},
+		},
+		{
+			name:          "indices.data_stream_stats with name",
+			action:        "indices.data_stream_stats",
+			params:        map[string]any{"name": "ds-1", "human": true},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_data_stream/ds-1/_stats",
+			strippedParam: []string{"name"},
+			wantQuery:     map[string]string{"human": "true"},
+		},
+		{
+			name:       "indices.data_streams_stats default",
+			action:     "indices.data_streams_stats",
+			params:     map[string]any{"human": true},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_data_stream/_stats",
+			wantQuery:  map[string]string{"human": "true"},
+		},
+		{
+			name:          "indices.data_streams_stats with name",
+			action:        "indices.data_streams_stats",
+			params:        map[string]any{"name": "ds-1,ds-2"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_data_stream/ds-1,ds-2/_stats",
+			strippedParam: []string{"name"},
+		},
+		{
+			name:          "indices.migrate_to_data_stream",
+			action:        "indices.migrate_to_data_stream",
+			params:        map[string]any{"name": "my-logs"},
+			wantMethod:    http.MethodPost,
+			wantPath:      "/_data_stream/_migrate/my-logs",
+			strippedParam: []string{"name"},
+		},
+
+		// F1: alias parameter variant
+		{
+			name:          "indices.put_alias with alias param",
+			action:        "indices.put_alias",
+			params:        map[string]any{"index": "idx1", "alias": "al1"},
+			wantMethod:    http.MethodPut,
+			wantPath:      "/idx1/_alias/al1",
+			strippedParam: []string{"index", "alias"},
+		},
+		{
+			name:          "indices.get_alias with alias param",
+			action:        "indices.get_alias",
+			params:        map[string]any{"index": "idx1", "alias": "al1"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/idx1/_alias/al1",
+			strippedParam: []string{"index", "alias"},
+		},
+		{
+			name:          "indices.delete_alias with alias param",
+			action:        "indices.delete_alias",
+			params:        map[string]any{"index": "idx1", "alias": "al1"},
+			wantMethod:    http.MethodDelete,
+			wantPath:      "/idx1/_alias/al1",
+			strippedParam: []string{"index", "alias"},
+		},
+		{
+			name:          "indices.exists_alias with alias param",
+			action:        "indices.exists_alias",
+			params:        map[string]any{"index": "idx1", "alias": "al1"},
+			wantMethod:    http.MethodHead,
+			wantPath:      "/idx1/_alias/al1",
+			strippedParam: []string{"index", "alias"},
+		},
+		{
+			name:          "cat.aliases with alias param",
+			action:        "cat.aliases",
+			params:        map[string]any{"alias": "al1", "v": true},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_cat/aliases/al1",
+			strippedParam: []string{"alias"},
+			wantQuery:     map[string]string{"v": "true"},
+		},
+
+		// F2: ilm.retry and policy_id
+		{
+			name:          "ilm.retry",
+			action:        "ilm.retry",
+			params:        map[string]any{"index": "my_idx"},
+			wantMethod:    http.MethodPost,
+			wantPath:      "/my_idx/_ilm/retry",
+			strippedParam: []string{"index"},
+		},
+		{
+			name:          "ilm.put_lifecycle with policy_id",
+			action:        "ilm.put_lifecycle",
+			params:        map[string]any{"policy_id": "pol_1"},
+			wantMethod:    http.MethodPut,
+			wantPath:      "/_ilm/policy/pol_1",
+			strippedParam: []string{"policy_id"},
+		},
+
+		// F3: cat.* optional path parameters
+		{
+			name:          "cat.allocation with node_id",
+			action:        "cat.allocation",
+			params:        map[string]any{"node_id": "node-1", "v": true},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_cat/allocation/node-1",
+			strippedParam: []string{"node_id"},
+			wantQuery:     map[string]string{"v": "true"},
+		},
+		{
+			name:          "cat.fielddata with fields",
+			action:        "cat.fielddata",
+			params:        map[string]any{"fields": "f1,f2", "v": true},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_cat/fielddata/f1,f2",
+			strippedParam: []string{"fields"},
+			wantQuery:     map[string]string{"v": "true"},
+		},
+		{
+			name:          "cat.segments with index",
+			action:        "cat.segments",
+			params:        map[string]any{"index": "idx1", "v": true},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_cat/segments/idx1",
+			strippedParam: []string{"index"},
+			wantQuery:     map[string]string{"v": "true"},
+		},
+		{
+			name:          "cat.thread_pool with thread_pool_patterns",
+			action:        "cat.thread_pool",
+			params:        map[string]any{"thread_pool_patterns": "search,write", "v": true},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_cat/thread_pool/search,write",
+			strippedParam: []string{"thread_pool_patterns"},
+			wantQuery:     map[string]string{"v": "true"},
+		},
 	}
 
 	for _, tc := range cases {
@@ -355,7 +497,33 @@ func TestTrackCreatedResourcesAndCleanup(t *testing.T) {
 		}
 	}
 
-	// 4. cleanupAll issues both DELETE /{idx}/_alias/{alias} and DELETE /_all/_alias/{alias}
+	// 4. F0, F1, F2, F9 resource tracking (migrate_to_data_stream, bulk OrderedMap + NDJSON, reindex OrderedMap, put_alias alias, ilm.put_lifecycle, put_script, ingest.put_pipeline)
+	ctx.trackCreatedResources("indices.migrate_to_data_stream", map[string]any{"name": "migrated_ds"}, nil)
+
+	bulkOpMeta := NewOrderedMap()
+	bulkOpMeta.Set("_index", "bulk_om_idx")
+	bulkOp := NewOrderedMap()
+	bulkOp.Set("index", bulkOpMeta)
+	ctx.trackCreatedResources("bulk", map[string]any{
+		"body": []any{bulkOp, map[string]any{"field": "val"}},
+	}, nil)
+
+	ctx.trackCreatedResources("bulk", map[string]any{
+		"body": "{\"index\":{\"_index\":\"bulk_ndjson_idx1\"}}\n{\"a\":1}\n{\"create\":{\"_index\":\"bulk_ndjson_idx2\"}}\n{\"b\":2}\n",
+	}, nil)
+
+	reindexDest := NewOrderedMap()
+	reindexDest.Set("index", "reindex_om_dest")
+	reindexBody := NewOrderedMap()
+	reindexBody.Set("dest", reindexDest)
+	ctx.trackCreatedResources("reindex", map[string]any{"body": reindexBody}, nil)
+
+	ctx.trackCreatedResources("indices.put_alias", map[string]any{"index": "alias_param_idx", "alias": "alias_param_name"}, nil)
+	ctx.trackCreatedResources("ilm.put_lifecycle", map[string]any{"policy_id": "test_ilm_pol"}, nil)
+	ctx.trackCreatedResources("put_script", map[string]any{"id": "test_script_id"}, nil)
+	ctx.trackCreatedResources("ingest.put_pipeline", map[string]any{"id": "test_pipeline_id"}, nil)
+
+	// 5. cleanupAll issues DELETE for all tracked resources
 	ctx.cleanupAll()
 
 	mu.Lock()
@@ -374,10 +542,39 @@ func TestTrackCreatedResourcesAndCleanup(t *testing.T) {
 		"/_all/_alias/upd_alias_single",
 		"/_all/_alias/upd_alias_multi_1",
 		"/_all/_alias/upd_alias_multi_2",
+		"/alias_param_idx/_alias/alias_param_name",
+		"/_all/_alias/alias_param_name",
+		"/_data_stream/migrated_ds",
+		"/bulk_om_idx",
+		"/bulk_ndjson_idx1",
+		"/bulk_ndjson_idx2",
+		"/reindex_om_dest",
+		"/_ilm/policy/test_ilm_pol",
+		"/_scripts/test_script_id",
+		"/_ingest/pipeline/test_pipeline_id",
 	}
 	for _, exp := range expectedDeletes {
 		if !seenDelete[exp] {
 			t.Errorf("expected cleanupAll to issue DELETE %s, got deletedPaths=%v", exp, deletedPaths)
 		}
+	}
+}
+
+func TestRunnerCleanTextFeatureAndMatch(t *testing.T) {
+	ctx := newRunnerContext(http.DefaultClient, "http://localhost:9200")
+
+	skipMap := NewOrderedMap()
+	skipMap.Set("features", "clean_text")
+	if err := ctx.execSkip(skipMap); err != nil {
+		t.Fatalf("expected clean_text feature to be supported and not skipped, got: %v", err)
+	}
+
+	ctx.lastBodyRaw = "  idx1   green   open  \n  idx2   yellow  open  \n\n"
+	ctx.lastResponse = ctx.lastBodyRaw
+
+	matchMap := NewOrderedMap()
+	matchMap.Set("$body", "\nidx1   green   open\nidx2   yellow  open\n")
+	if err := ctx.execMatch(matchMap); err != nil {
+		t.Fatalf("expected clean_text execMatch to succeed on line-trimmed text, got: %v", err)
 	}
 }

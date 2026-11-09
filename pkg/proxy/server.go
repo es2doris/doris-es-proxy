@@ -196,6 +196,8 @@ type Server struct {
 	clusterPersistentSettings map[string]any
 	clusterTransientSettings  map[string]any
 	indexCustomSettings       map[string]map[string]any
+	templateVersions          map[string]int
+	ilmMode                   string
 }
 
 func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerOptions) *Server {
@@ -230,6 +232,8 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		clusterPersistentSettings: make(map[string]any),
 		clusterTransientSettings:  make(map[string]any),
 		indexCustomSettings:       make(map[string]map[string]any),
+		templateVersions:          make(map[string]int),
+		ilmMode:                   "RUNNING",
 	}
 	s.coalescer = newStreamLoadCoalescer(func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
 		err := s.backend.StreamLoad(ctx, table, ndjson, syncRefresh)
@@ -961,7 +965,11 @@ func (s *Server) Handler() http.Handler {
 			case segs[0] == "_ilm" && segs[1] == "explain":
 				s.handleILMExplain(w, r)
 			case segs[0] == "_ilm" && segs[1] == "status":
-				writeJSON(w, http.StatusOK, map[string]any{"operation_mode": "RUNNING"})
+				s.handleILMStatus(w, r)
+			case segs[0] == "_ilm" && segs[1] == "start":
+				s.handleILMStart(w, r)
+			case segs[0] == "_ilm" && segs[1] == "stop":
+				s.handleILMStop(w, r)
 			case segs[0] == "_data_stream" && segs[1] == "_stats":
 				s.handleDataStreamsStats(w, r)
 			case segs[0] == "_data_stream":
@@ -1193,6 +1201,11 @@ func (s *Server) Handler() http.Handler {
 				s.handleILMPolicy(w, r)
 				return
 			}
+			if segs[0] == "_ilm" && segs[1] == "move" {
+				r.SetPathValue("index", segs[2])
+				s.handleILMMoveToStep(w, r)
+				return
+			}
 			if segs[0] == "_search" && segs[1] == "scroll" {
 				r.SetPathValue("scroll_id", segs[2])
 				s.handleScroll(w, r)
@@ -1201,6 +1214,11 @@ func (s *Server) Handler() http.Handler {
 			if segs[0] == "_resolve" && segs[1] == "index" {
 				r.SetPathValue("name", segs[2])
 				s.handleResolveIndex(w, r)
+				return
+			}
+			if segs[0] == "_data_stream" && segs[1] == "_migrate" {
+				r.SetPathValue("name", segs[2])
+				s.handleMigrateToDataStream(w, r)
 				return
 			}
 			if segs[0] == "_data_stream" && segs[2] == "_stats" {
@@ -1283,6 +1301,14 @@ func (s *Server) Handler() http.Handler {
 			}
 			if segs[1] == "_ilm" && segs[2] == "explain" {
 				s.handleILMExplain(w, r)
+				return
+			}
+			if segs[1] == "_ilm" && segs[2] == "remove" {
+				s.handleILMRemovePolicy(w, r)
+				return
+			}
+			if segs[1] == "_ilm" && segs[2] == "retry" {
+				s.handleILMRetry(w, r)
 				return
 			}
 			if segs[1] == "_doris" && segs[2] == "explain" {
@@ -1465,6 +1491,10 @@ func (s *Server) handleRootHandshake(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleClusterHealth(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	s.mu.RLock()
 	numIndices := len(s.indices)
 	s.mu.RUnlock()
@@ -1959,6 +1989,10 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 			s.handleNodesUsage(w, r)
 			return
 		}
+		if r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
@@ -2027,6 +2061,10 @@ func readRequestBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 }
 
 func (s *Server) handleClusterState(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	_ = s.syncCatalogFromBackend(r.Context())
 	s.mu.RLock()
 	indicesMeta := make(map[string]any, len(s.indices))
@@ -2072,7 +2110,11 @@ func (s *Server) handleClusterState(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleClusterStats(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleClusterStats(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	s.mu.RLock()
 	numIndices := len(s.indices)
 	s.mu.RUnlock()
@@ -2187,7 +2229,7 @@ func (s *Server) handleILMPolicy(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		w.WriteHeader(http.StatusOK)
-	default:
+	case http.MethodGet, "":
 		s.mu.RLock()
 		if policy != "" && policy != "_all" && policy != "*" {
 			if strings.ContainsAny(policy, "*?,") || strings.HasPrefix(policy, "-") {
@@ -2228,11 +2270,27 @@ func (s *Server) handleILMPolicy(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.RUnlock()
 		writeJSON(w, http.StatusOK, out)
+	default:
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 	}
 }
 
 func (s *Server) handleILMExplain(w http.ResponseWriter, r *http.Request) {
-	targets := s.resolveTargetIndices(r.PathValue("index"))
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	rawIndex := strings.TrimSpace(r.PathValue("index"))
+	var targets []string
+	if rawIndex != "" {
+		validTargets, _, ok := s.resolveValidatedReadTargets(w, r, rawIndex)
+		if !ok {
+			return
+		}
+		targets = validTargets
+	} else {
+		targets = s.resolveTargetIndices("")
+	}
 	indices := make(map[string]any, len(targets))
 	for _, idx := range targets {
 		indices[idx] = map[string]any{
@@ -2368,6 +2426,18 @@ func (s *Server) handleDataStream(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 	case http.MethodHead, http.MethodGet:
 		s.mu.RLock()
+		var missingConcrete string
+		if name != "" && name != "*" && name != "_all" {
+			for _, part := range strings.Split(name, ",") {
+				part = strings.TrimSpace(part)
+				if part == "" || strings.HasPrefix(part, "-") || strings.ContainsAny(part, "*?") || part == "_all" {
+					continue
+				}
+				if _, exists := s.dataStreams[part]; !exists && missingConcrete == "" {
+					missingConcrete = part
+				}
+			}
+		}
 		var list []any
 		var names []string
 		for k := range s.dataStreams {
@@ -2381,11 +2451,15 @@ func (s *Server) handleDataStream(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.RUnlock()
 		if r.Method == http.MethodHead {
-			if len(list) == 0 {
+			if missingConcrete != "" || len(list) == 0 {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
 			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if missingConcrete != "" {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "data_streams ["+missingConcrete+"] missing")
 			return
 		}
 		if name != "" && !strings.ContainsAny(name, "*?") && !strings.HasPrefix(name, "-") && name != "_all" && len(list) == 0 {
@@ -2402,6 +2476,10 @@ func (s *Server) handleDataStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCatIndices(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	var names []string
 	if pat := r.PathValue("index"); pat != "" {
 		names = s.resolveTargetIndices(pat)
@@ -2438,6 +2516,10 @@ func (s *Server) handleCatIndices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCatAliases(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	_ = s.syncCatalogFromBackend(r.Context())
 	namePattern := r.PathValue("name")
 	s.mu.RLock()
@@ -2496,6 +2578,10 @@ func (s *Server) handleCatAliases(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCatRoot(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	endpoints := []string{
 		"/_cat/allocation",
 		"/_cat/shards",
@@ -2998,6 +3084,9 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var tpl esast.IndexTemplateRequest
+		var verHolder struct {
+			Version *int `json:"version"`
+		}
 		bodyBytes, ok := readRequestBody(w, r)
 		if !ok {
 			return
@@ -3007,6 +3096,7 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 				writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 				return
 			}
+			_ = json.Unmarshal(bodyBytes, &verHolder)
 		}
 		if len(tpl.EffectivePatterns()) == 0 {
 			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: index_patterns is missing;")
@@ -3034,6 +3124,11 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 		s.mu.RUnlock()
 		s.mu.Lock()
 		s.templates[name] = tpl
+		if verHolder.Version != nil {
+			s.templateVersions[name] = *verHolder.Version
+		} else {
+			delete(s.templateVersions, name)
+		}
 		s.mu.Unlock()
 		s.persistTemplate(r.Context(), name, tpl)
 		s.queryCache.InvalidateAll()
@@ -3139,6 +3234,7 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, k := range toDelete {
 			delete(s.templates, k)
+			delete(s.templateVersions, k)
 		}
 		s.mu.Unlock()
 		if len(toDelete) == 0 {
@@ -3437,7 +3533,7 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 	_ = s.syncCatalogFromBackend(r.Context())
 	s.mu.RLock()
 	oldSchema := s.indices[indexName]
-	hasAliasCollision := s.dataStreams[indexName] != nil || (oldSchema == nil && len(s.aliases[indexName]) > 0)
+	hasAliasCollision := s.dataStreams[indexName] != nil || len(s.aliases[indexName]) > 0
 	var collidingAlias string
 	for alias := range req.Aliases {
 		if alias == indexName || s.indices[alias] != nil || s.dataStreams[alias] != nil {
@@ -3480,6 +3576,10 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	effectiveMappings := schema.MergeMappingSpecs(tplMappings, req.Mappings)
+	if err := validateAliasFieldsInMapping(effectiveMappings); err != nil {
+		writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+		return
+	}
 	compiled := schema.CompileIndexSchema(s.dorisDB, indexName, effectiveMappings)
 	ddl := schema.GenerateCreateTableDDL(compiled)
 	if err := s.backend.ExecDDL(r.Context(), ddl); err != nil {
@@ -4050,6 +4150,12 @@ func (s *Server) handlePutMapping(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
 			return
 		}
+		mergedPreview := schema.MergeMappingSpecs(oldRaw, &spec)
+		if err := validateAliasFieldsInMapping(mergedPreview); err != nil {
+			s.mu.RUnlock()
+			writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+			return
+		}
 	}
 	s.mu.RUnlock()
 
@@ -4196,6 +4302,32 @@ func (s *Server) handleGetIndexAliases(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleIndexAliasByName(w http.ResponseWriter, r *http.Request) {
 	_ = s.syncCatalogFromBackend(r.Context())
 	rawIndex := r.PathValue("index")
+	if rawIndex != "" && rawIndex != "*" && rawIndex != "_all" {
+		ignoreUnavail := (r.Method == http.MethodGet || r.Method == http.MethodHead) && isTruthyBoolQueryParam(r, "ignore_unavailable")
+		if !ignoreUnavail {
+			s.mu.RLock()
+			var missingPart string
+			for _, part := range strings.Split(rawIndex, ",") {
+				part = strings.TrimSpace(part)
+				if part == "" || strings.HasPrefix(part, "-") || strings.ContainsAny(part, "*?") || part == "_all" {
+					continue
+				}
+				if s.indices[part] == nil && len(s.aliases[part]) == 0 && s.dataStreams[part] == nil {
+					missingPart = part
+					break
+				}
+			}
+			s.mu.RUnlock()
+			if missingPart != "" {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+missingPart+"]")
+				return
+			}
+		}
+	}
 	targetIndices := s.resolveTargetIndices(rawIndex)
 	if len(targetIndices) == 0 {
 		targetIndices = []string{s.resolveIndexName(rawIndex)}
@@ -4358,6 +4490,10 @@ func (s *Server) handleIndexAliasByName(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodPost {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
 		return
@@ -4561,11 +4697,22 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 			indices := expandIndexListLocked(rawIndices)
 			for _, al := range rawAliases {
 				al = strings.TrimSpace(al)
-				if al == "" || strings.ContainsAny(al, "*?") || al == "_all" {
+				if al == "" {
 					continue
 				}
 				foundOnTarget := false
-				if idxMap := simulatedAliases[al]; idxMap != nil {
+				if strings.ContainsAny(al, "*?") || al == "_all" {
+					for simAl, idxMap := range simulatedAliases {
+						if al == "_all" || al == "*" || matchWildcardPattern(al, simAl) {
+							for _, idx := range indices {
+								if idxMap[idx] {
+									foundOnTarget = true
+									delete(idxMap, idx)
+								}
+							}
+						}
+					}
+				} else if idxMap := simulatedAliases[al]; idxMap != nil {
 					for _, idx := range indices {
 						if idxMap[idx] {
 							foundOnTarget = true
@@ -6418,6 +6565,8 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 						rawMap = make(map[string]any)
 					}
 					rawMap["__meta_id"] = h.ID
+					rawMap["__meta_index"] = indexName
+					rawMap["__meta_version"] = h.Version
 					if !evalQueryScriptFilterOnDocWithScore(idxSchema, rawMap, effQuery, h.Score) {
 						continue
 					}
@@ -6894,6 +7043,8 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 						rawMap = make(map[string]any)
 					}
 					rawMap["__meta_id"] = h.ID
+					rawMap["__meta_index"] = indexName
+					rawMap["__meta_version"] = h.Version
 					if !evalQueryScriptFilterOnDocWithScore(idxSchema, rawMap, effQuery, h.Score) {
 						continue
 					}
@@ -10593,12 +10744,29 @@ func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, totalQueryHits int64
 }
 
 func (s *Server) handleCount(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	var req esast.SearchRequest
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
 		return
 	}
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		var rawTop map[string]json.RawMessage
+		if err := json.Unmarshal(bodyBytes, &rawTop); err != nil {
+			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+			return
+		}
+		for k := range rawTop {
+			switch k {
+			case "query", "pit", "runtime_mappings":
+			default:
+				writeESError(w, http.StatusBadRequest, "parsing_exception", fmt.Sprintf("Unknown key for a START_OBJECT in [count]: [%s].", k))
+				return
+			}
+		}
 		if err := json.Unmarshal(bodyBytes, &req); err != nil {
 			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
 			return
@@ -16593,6 +16761,105 @@ func toFloat64(v any) (float64, bool) {
 	return 0, false
 }
 
+func extractBucketMetricMapByPath(b map[string]any, metricPath string) (map[string]any, bool) {
+	segs := normalizeBucketsPath(metricPath)
+	if b == nil || len(segs) == 0 {
+		return nil, false
+	}
+	cur := b
+	for i, seg := range segs {
+		subMap, ok := cur[seg].(map[string]any)
+		if !ok {
+			if rawBuckets, okB := cur["buckets"].(map[string]any); okB {
+				if kb, okKB := lookupKeyedBucketMap(rawBuckets, seg); okKB {
+					subMap = kb
+					ok = true
+				}
+			} else if rawSlice, okS := cur["buckets"].([]map[string]any); okS {
+				for _, sb := range rawSlice {
+					if fmt.Sprintf("%v", sb["key"]) == seg || (sb["key_as_string"] != nil && fmt.Sprintf("%v", sb["key_as_string"]) == seg) {
+						subMap = sb
+						ok = true
+						break
+					}
+				}
+			}
+		}
+		if !ok {
+			return nil, false
+		}
+		if i < len(segs)-1 {
+			cur = subMap
+			continue
+		}
+		if isRuntimeBucketContainer(subMap) {
+			return nil, false
+		}
+		if val, hasVal := subMap["value"]; hasVal {
+			if _, isValMap := val.(map[string]any); !isValMap {
+				return nil, false
+			}
+		}
+		if cnt, hasCnt := toFloat64(subMap["count"]); hasCnt && cnt == 0 {
+			if _, hasAvg := subMap["avg"]; hasAvg && subMap["avg"] == nil {
+				return nil, false
+			}
+		}
+		if dc, hasDC := toFloat64(b["doc_count"]); hasDC && dc == 0 {
+			if _, hasVals := subMap["values"]; hasVals {
+				return nil, false
+			}
+		}
+		out := make(map[string]any, len(subMap)+4)
+		for mk, mv := range subMap {
+			out[mk] = mv
+		}
+		if valMap, okVM := subMap["value"].(map[string]any); okVM {
+			for mk, mv := range valMap {
+				out[mk] = mv
+			}
+		}
+		if valsF, okVF := subMap["values"].(map[string]float64); okVF {
+			valsAny := make(map[string]any, len(valsF))
+			for vk, vv := range valsF {
+				valsAny[vk] = vv
+				out[vk] = vv
+				if strings.HasSuffix(vk, ".0") {
+					out[strings.TrimSuffix(vk, ".0")] = vv
+				}
+			}
+			out["values"] = valsAny
+		} else if valsAny, okVA := subMap["values"].(map[string]any); okVA {
+			for vk, vv := range valsAny {
+				out[vk] = vv
+				if strings.HasSuffix(vk, ".0") {
+					out[strings.TrimSuffix(vk, ".0")] = vv
+				}
+			}
+		}
+		return out, true
+	}
+	return nil, false
+}
+
+func bindNestedPainlessParam(params map[string]any, key string, val any) {
+	params[key] = val
+	if !strings.Contains(key, ".") {
+		return
+	}
+	parts := strings.Split(key, ".")
+	cur := params
+	for i := 0; i < len(parts)-1; i++ {
+		sub, ok := cur[parts[i]].(map[string]any)
+		if !ok {
+			sub = make(map[string]any)
+			cur[parts[i]] = sub
+		}
+		cur = sub
+	}
+	cur[parts[len(parts)-1]] = val
+}
+
 func evalBucketScript(b map[string]any, spec *esast.BucketSelectorAggSpec) (float64, bool) {
 	if spec == nil {
 		return 0, false
@@ -16603,6 +16870,7 @@ func evalBucketScript(b map[string]any, spec *esast.BucketSelectorAggSpec) (floa
 	}
 	insertZeros := strings.EqualFold(spec.GapPolicy, "insert_zeros")
 	vars := make(map[string]float64, len(spec.BucketsPath)+len(scriptParams))
+	mapVars := make(map[string]map[string]any)
 	for k, v := range scriptParams {
 		if fv, ok := toFloat64(v); ok {
 			vars[k] = fv
@@ -16611,6 +16879,15 @@ func evalBucketScript(b map[string]any, spec *esast.BucketSelectorAggSpec) (floa
 	for k, v := range spec.BucketsPath {
 		val, ok := extractBucketMetricByPath(b, v)
 		if !ok {
+			if mVal, okMap := extractBucketMetricMapByPath(b, v); okMap {
+				mapVars[k] = mVal
+				for mk, mv := range mVal {
+					if fv, okF := toFloat64(mv); okF {
+						vars[k+"."+mk] = fv
+					}
+				}
+				continue
+			}
 			if insertZeros {
 				val = 0
 			} else {
@@ -16627,12 +16904,15 @@ func evalBucketScript(b map[string]any, spec *esast.BucketSelectorAggSpec) (floa
 			return fv, true
 		}
 	}
-	painlessParams := make(map[string]any, len(vars)+len(scriptParams))
+	painlessParams := make(map[string]any, len(vars)+len(scriptParams)+len(mapVars))
 	for k, v := range scriptParams {
-		painlessParams[k] = v
+		bindNestedPainlessParam(painlessParams, k, v)
+	}
+	for k, mVal := range mapVars {
+		bindNestedPainlessParam(painlessParams, k, mVal)
 	}
 	for k, v := range vars {
-		painlessParams[k] = v
+		bindNestedPainlessParam(painlessParams, k, v)
 	}
 	if res, err := painless.Eval(map[string]any{}, src, painlessParams); err == nil && res != nil {
 		return toFloat64(res)
@@ -16672,6 +16952,7 @@ func evalBucketSelector(b map[string]any, spec *esast.BucketSelectorAggSpec) boo
 	}
 	insertZeros := strings.EqualFold(spec.GapPolicy, "insert_zeros")
 	vars := make(map[string]float64, len(spec.BucketsPath)+len(scriptParams))
+	mapVars := make(map[string]map[string]any)
 	for k, v := range scriptParams {
 		if fv, ok := toFloat64(v); ok {
 			vars[k] = fv
@@ -16680,6 +16961,15 @@ func evalBucketSelector(b map[string]any, spec *esast.BucketSelectorAggSpec) boo
 	for k, v := range spec.BucketsPath {
 		val, ok := extractBucketMetricByPath(b, v)
 		if !ok {
+			if mVal, okMap := extractBucketMetricMapByPath(b, v); okMap {
+				mapVars[k] = mVal
+				for mk, mv := range mVal {
+					if fv, okF := toFloat64(mv); okF {
+						vars[k+"."+mk] = fv
+					}
+				}
+				continue
+			}
 			if insertZeros {
 				val = 0
 			} else {
@@ -16688,27 +16978,23 @@ func evalBucketSelector(b map[string]any, spec *esast.BucketSelectorAggSpec) boo
 		}
 		vars[k] = val
 	}
+	painlessParams := make(map[string]any, len(vars)+len(scriptParams)+len(mapVars))
+	for k, v := range scriptParams {
+		bindNestedPainlessParam(painlessParams, k, v)
+	}
+	for k, mVal := range mapVars {
+		bindNestedPainlessParam(painlessParams, k, mVal)
+	}
+	for k, v := range vars {
+		bindNestedPainlessParam(painlessParams, k, v)
+	}
 	if strings.ContainsAny(src, ";{") || strings.Contains(src, "def ") || strings.Contains(src, "return ") || strings.Contains(src, "Math.") {
-		painlessParams := make(map[string]any, len(vars)+len(scriptParams))
-		for k, v := range scriptParams {
-			painlessParams[k] = v
-		}
-		for k, v := range vars {
-			painlessParams[k] = v
-		}
 		if ok, err := painless.EvalFilter(map[string]any{}, src, painlessParams); err == nil {
 			return ok
 		}
 	}
 	if res, ok := evalBucketSelectorExpr(src, vars); ok {
 		return res
-	}
-	painlessParams := make(map[string]any, len(vars)+len(scriptParams))
-	for k, v := range scriptParams {
-		painlessParams[k] = v
-	}
-	for k, v := range vars {
-		painlessParams[k] = v
 	}
 	if ok, err := painless.EvalFilter(map[string]any{}, src, painlessParams); err == nil {
 		return ok
@@ -16994,11 +17280,31 @@ func evalBucketArithmeticExprDepth(expr string, vars map[string]float64, depth i
 	if f, ok := parseFiniteFloat(expr); ok {
 		return f, true
 	}
-	varKey := strings.TrimPrefix(expr, "params.")
+	varKey := normalizeBucketParamRef(expr)
 	if v, exists := vars[varKey]; exists {
 		return v, true
 	}
 	return 0, false
+}
+
+func normalizeBucketParamRef(expr string) string {
+	s := strings.TrimSpace(expr)
+	for strings.Contains(s, "[") {
+		openIdx := strings.IndexByte(s, '[')
+		closeIdx := strings.IndexByte(s[openIdx:], ']')
+		if closeIdx <= 0 {
+			break
+		}
+		closeIdx += openIdx
+		inner := strings.TrimSpace(s[openIdx+1 : closeIdx])
+		inner = strings.Trim(inner, "'\"")
+		prefix := s[:openIdx]
+		if prefix != "" && !strings.HasSuffix(prefix, ".") {
+			prefix += "."
+		}
+		s = prefix + inner + s[closeIdx+1:]
+	}
+	return strings.TrimPrefix(s, "params.")
 }
 
 func parseFiniteFloat(s string) (float64, bool) {

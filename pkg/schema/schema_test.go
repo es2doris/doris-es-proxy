@@ -2078,3 +2078,108 @@ func TestRound50ShredderNestedRangeArrayNullValueAndCopyToGuards(t *testing.T) {
 		}
 	}
 }
+
+func TestRound51SchemaAliasAndShredderF15F16(t *testing.T) {
+	// F15: ValidateMappingSpec rejects invalid alias mappings
+	invalidAliases := []*esast.MappingSpec{
+		// Missing path
+		{Properties: map[string]esast.FieldProperty{
+			"a": {Type: "alias"},
+		}},
+		// Self-referencing path
+		{Properties: map[string]esast.FieldProperty{
+			"a": {Type: "alias", Path: "a"},
+		}},
+		// Chained alias -> alias
+		{Properties: map[string]esast.FieldProperty{
+			"real": {Type: "keyword"},
+			"a1":   {Type: "alias", Path: "real"},
+			"a2":   {Type: "alias", Path: "a1"},
+		}},
+		// Cyclic alias a -> b -> a
+		{Properties: map[string]esast.FieldProperty{
+			"a": {Type: "alias", Path: "b"},
+			"b": {Type: "alias", Path: "a"},
+		}},
+		// Dangling target field
+		{Properties: map[string]esast.FieldProperty{
+			"real": {Type: "keyword"},
+			"bad":  {Type: "alias", Path: "non_existent"},
+		}},
+	}
+	for i, spec := range invalidAliases {
+		if err := ValidateMappingSpec(spec); err == nil {
+			t.Fatalf("F15 case %d: expected ValidateMappingSpec error for %+v", i, spec)
+		}
+	}
+
+	// Valid alias mapping
+	validAliasSpec := &esast.MappingSpec{
+		Properties: map[string]esast.FieldProperty{
+			"title": {
+				Type: "text",
+				Fields: map[string]esast.FieldProperty{
+					"keyword": {Type: "keyword"},
+				},
+			},
+			"title_alias":    {Type: "alias", Path: "title"},
+			"title_kw_alias": {Type: "alias", Path: "title.keyword"},
+		},
+	}
+	if err := ValidateMappingSpec(validAliasSpec); err != nil {
+		t.Fatalf("F15 valid alias spec failed: %v", err)
+	}
+
+	// CompileIndexSchema cycle safety & ResolveField guard against empty ColumnName
+	cyclicSpec := &esast.MappingSpec{
+		Properties: map[string]esast.FieldProperty{
+			"a": {Type: "alias", Path: "b"},
+			"b": {Type: "alias", Path: "a"},
+		},
+	}
+	cyclicSchema := CompileIndexSchema("db", "cyclic_idx", cyclicSpec)
+	b := cyclicSchema.ResolveField("a")
+	if b.ESType == "alias" || (b.Kind == StoragePromotedScalar && b.ColumnName == "") {
+		t.Fatalf("F15 expected unresolved alias to fall back to variant instead of empty ColumnName, got %+v", b)
+	}
+
+	// F16: ShredDocument rejects JSON object or array of objects for concrete scalar fields
+	scalarSpec := &esast.MappingSpec{
+		Properties: map[string]esast.FieldProperty{
+			"name":  {Type: "keyword"},
+			"count": {Type: "long"},
+			"raw": {
+				Type:    "object",
+				Enabled: func() *bool { f := false; return &f }(),
+			},
+		},
+	}
+	// Even if InferMappingFromSampleDocs sees an object for "name", it must not corrupt scalar type
+	inferred := InferMappingFromSampleDocs([]json.RawMessage{
+		json.RawMessage(`{"name":{"nested":"bad"},"count":[{"nested":1}]}`),
+	}, scalarSpec)
+	sSchema := CompileIndexSchema("db", "scalar_idx", inferred)
+	if _, err := ShredDocument(sSchema, "1", 1, false, []byte(`{"name":{"nested":"bad"}}`)); err == nil || !strings.Contains(err.Error(), "mapper_parsing_exception") {
+		t.Fatalf("F16 expected mapper_parsing_exception for object in keyword field, got %v", err)
+	}
+	if _, err := ShredDocument(sSchema, "2", 1, false, []byte(`{"count":[{"nested":1}]}`)); err == nil || !strings.Contains(err.Error(), "mapper_parsing_exception") {
+		t.Fatalf("F16 expected mapper_parsing_exception for array of objects in long field, got %v", err)
+	}
+
+	// F16: enabled: false subtree bypasses strict/subobjects validation
+	subobjectsFalse := false
+	strictDisabledSpec := &esast.MappingSpec{
+		Dynamic:    "strict",
+		Subobjects: &subobjectsFalse,
+		Properties: map[string]esast.FieldProperty{
+			"payload": {
+				Type:    "object",
+				Enabled: func() *bool { f := false; return &f }(),
+			},
+		},
+	}
+	sdSchema := CompileIndexSchema("db", "strict_disabled_idx", strictDisabledSpec)
+	if _, err := ShredDocument(sdSchema, "1", 1, false, []byte(`{"payload":{"a.b.c":{"deep":123}}}`)); err != nil {
+		t.Fatalf("F16 expected enabled:false subtree to bypass strict/subobjects validation, got %v", err)
+	}
+}

@@ -3843,6 +3843,19 @@ func (t *Transpiler) compileFunctionScore(fs *esast.FunctionScoreQuery, nctx *ne
 	}
 }
 
+func resolveDecayArrayFn(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "max":
+		return "array_max"
+	case "avg":
+		return "array_avg"
+	case "sum":
+		return "array_sum"
+	default:
+		return "array_min"
+	}
+}
+
 func (t *Transpiler) compileDecayFunction(decayType string, df *esast.DecayFunctionSpec, nctx *nestedCtx) string {
 	if df == nil || df.Field == "" {
 		return "1.0"
@@ -3865,8 +3878,10 @@ func (t *Transpiler) compileDecayFunction(decayType string, df *esast.DecayFunct
 	}
 
 	var distExpr string
+	var notNullCond string
 	var scaleVal float64
 	var offsetVal float64
+	isArrayField := (b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.elemVar == "" || nctx.nestedPath != b.NestedPath))) && b.EffectiveArrayColumn(true) != ""
 
 	if isGeo {
 		lat, lon, err := esast.ParseGeoPoint(df.Origin)
@@ -3883,14 +3898,33 @@ func (t *Transpiler) compileDecayFunction(decayType string, df *esast.DecayFunct
 				offsetVal = oMeters
 			}
 		}
-		latExpr, lonExpr, _ := t.extractGeoPointExprs(resolvedField, b)
 		tLonStr := strconv.FormatFloat(lon, 'f', -1, 64)
 		tLatStr := strconv.FormatFloat(lat, 'f', -1, 64)
-		distExpr = fmt.Sprintf("COALESCE(ST_Distance_Sphere(%s, %s, %s, %s), 0.0)", lonExpr, latExpr, tLonStr, tLatStr)
+		if nctx != nil && nctx.elemVar != "" && ((b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath) || strings.HasPrefix(resolvedField, nctx.nestedPath+".")) {
+			elemExpr := t.sqlColumnRef(resolvedField, true, nctx)
+			latExpr := fmt.Sprintf("CAST(SPLIT_PART(%s, ',', 1) AS DOUBLE)", elemExpr)
+			lonExpr := fmt.Sprintf("CAST(SPLIT_PART(%s, ',', 2) AS DOUBLE)", elemExpr)
+			notNullCond = fmt.Sprintf("%s IS NOT NULL", elemExpr)
+			distExpr = fmt.Sprintf("COALESCE(ST_Distance_Sphere(%s, %s, %s, %s), 0.0)", lonExpr, latExpr, tLonStr, tLatStr)
+		} else if isArrayField {
+			arrCol := fmt.Sprintf("`%s`", b.EffectiveArrayColumn(true))
+			notNullCond = fmt.Sprintf("(%s IS NOT NULL AND array_size(%s) > 0)", arrCol, arrCol)
+			arrFn := resolveDecayArrayFn(df.MultiValueMode)
+			distExpr = fmt.Sprintf("COALESCE(%s(array_map(_x -> ST_Distance_Sphere(CAST(SPLIT_PART(_x, ',', 2) AS DOUBLE), CAST(SPLIT_PART(_x, ',', 1) AS DOUBLE), %s, %s), %s)), 0.0)", arrFn, tLonStr, tLatStr, arrCol)
+		} else {
+			var latExpr, lonExpr string
+			latExpr, lonExpr, notNullCond = t.extractGeoPointExprs(resolvedField, b)
+			distExpr = fmt.Sprintf("COALESCE(ST_Distance_Sphere(%s, %s, %s, %s), 0.0)", lonExpr, latExpr, tLonStr, tLatStr)
+		}
 	} else if b.ESType == "date" || b.ESType == "date_nanos" || isDateDecayOriginAndScale(df.Origin, df.Scale) {
 		originMs, ok := parseDecayDateOriginMillis(df.Origin, b.Format, time.Now().UTC())
 		if !ok {
 			return "1.0"
+		}
+		if b.ESType == "date_nanos" {
+			if niv, okN := normalizeDateNanosValue(b.ESType, originMs).(int64); okN {
+				originMs = niv
+			}
 		}
 		scaleMs, ok := parseDecayDurationMillis(df.Scale)
 		if !ok || scaleMs <= 0 {
@@ -3902,8 +3936,16 @@ func (t *Transpiler) compileDecayFunction(decayType string, df *esast.DecayFunct
 				offsetVal = offMs
 			}
 		}
-		col := t.sqlNumericColumnRef(df.Field, nctx)
-		distExpr = fmt.Sprintf("ABS(COALESCE(%s, %.4f) - %.4f)", col, float64(originMs), float64(originMs))
+		if isArrayField {
+			arrCol := fmt.Sprintf("`%s`", b.EffectiveArrayColumn(true))
+			notNullCond = fmt.Sprintf("(%s IS NOT NULL AND array_size(%s) > 0)", arrCol, arrCol)
+			arrFn := resolveDecayArrayFn(df.MultiValueMode)
+			distExpr = fmt.Sprintf("COALESCE(%s(array_map(_x -> ABS(CAST(_x AS DOUBLE) - %.4f), %s)), 0.0)", arrFn, float64(originMs), arrCol)
+		} else {
+			col := t.sqlNumericColumnRef(df.Field, nctx)
+			notNullCond = fmt.Sprintf("%s IS NOT NULL", col)
+			distExpr = fmt.Sprintf("ABS(COALESCE(%s, %.4f) - %.4f)", col, float64(originMs), float64(originMs))
+		}
 	} else {
 		originNum, ok := parseDecayNumericValue(df.Origin)
 		if !ok {
@@ -3919,24 +3961,37 @@ func (t *Transpiler) compileDecayFunction(decayType string, df *esast.DecayFunct
 				offsetVal = offNum
 			}
 		}
-		col := t.sqlNumericColumnRef(df.Field, nctx)
-		distExpr = fmt.Sprintf("ABS(COALESCE(%s, %.4f) - %.4f)", col, originNum, originNum)
+		if isArrayField {
+			arrCol := fmt.Sprintf("`%s`", b.EffectiveArrayColumn(true))
+			notNullCond = fmt.Sprintf("(%s IS NOT NULL AND array_size(%s) > 0)", arrCol, arrCol)
+			arrFn := resolveDecayArrayFn(df.MultiValueMode)
+			distExpr = fmt.Sprintf("COALESCE(%s(array_map(_x -> ABS(CAST(_x AS DOUBLE) - %.4f), %s)), 0.0)", arrFn, originNum, arrCol)
+		} else {
+			col := t.sqlNumericColumnRef(df.Field, nctx)
+			notNullCond = fmt.Sprintf("%s IS NOT NULL", col)
+			distExpr = fmt.Sprintf("ABS(COALESCE(%s, %.4f) - %.4f)", col, originNum, originNum)
+		}
 	}
 
 	effDist := fmt.Sprintf("GREATEST(0.0, (%s) - %.4f)", distExpr, offsetVal)
+	var rawDecayExpr string
 	switch decayType {
 	case "gauss":
 		coeff := math.Log(decay) / (scaleVal * scaleVal)
-		return fmt.Sprintf("EXP(%s * POW(%s, 2))", strconv.FormatFloat(coeff, 'g', 10, 64), effDist)
+		rawDecayExpr = fmt.Sprintf("EXP(%s * POW(%s, 2))", strconv.FormatFloat(coeff, 'g', 10, 64), effDist)
 	case "exp":
 		coeff := math.Log(decay) / scaleVal
-		return fmt.Sprintf("EXP(%s * (%s))", strconv.FormatFloat(coeff, 'g', 10, 64), effDist)
+		rawDecayExpr = fmt.Sprintf("EXP(%s * (%s))", strconv.FormatFloat(coeff, 'g', 10, 64), effDist)
 	case "linear":
 		slope := (1.0 - decay) / scaleVal
-		return fmt.Sprintf("GREATEST(0.0, 1.0 - (%s * (%s)))", strconv.FormatFloat(slope, 'g', 10, 64), effDist)
+		rawDecayExpr = fmt.Sprintf("GREATEST(0.0, 1.0 - (%s * (%s)))", strconv.FormatFloat(slope, 'g', 10, 64), effDist)
 	default:
 		return "1.0"
 	}
+	if notNullCond != "" {
+		return fmt.Sprintf("(CASE WHEN %s THEN %s ELSE 0.0 END)", notNullCond, rawDecayExpr)
+	}
+	return rawDecayExpr
 }
 
 func parseDecayNumericValue(raw any) (float64, bool) {
@@ -6736,6 +6791,14 @@ func (t *Transpiler) appendAggBranches(
 					}
 				}
 			}
+			if spec.Histogram.HardBounds != nil {
+				if minF, okMin := resolveHistogramMissingFloat(spec.Histogram.HardBounds.Min); okMin {
+					notNullCond = fmt.Sprintf("(%s) AND (%s >= %s)", notNullCond, col, strconv.FormatFloat(minF, 'f', -1, 64))
+				}
+				if maxF, okMax := resolveHistogramMissingFloat(spec.Histogram.HardBounds.Max); okMax {
+					notNullCond = fmt.Sprintf("(%s) AND (%s <= %s)", notNullCond, col, strconv.FormatFloat(maxF, 'f', -1, 64))
+				}
+			}
 			bucketExpr := fmt.Sprintf("CAST(FLOOR((%s - %v) / %v) * %v + %v AS STRING)", col, offset, interval, interval, offset)
 			hCountExpr := "COUNT(*)"
 			if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
@@ -7116,6 +7179,14 @@ func (t *Transpiler) appendAggBranches(
 				if len(notNullConds) > 0 {
 					wCond = strings.Join(notNullConds, " AND ")
 				}
+				if len(spec.Composite.After) > 0 {
+					for _, sn := range srcNames {
+						if av, ok := spec.Composite.After[sn]; !ok || av == nil {
+							hasHistogramSrc = true
+							break
+						}
+					}
+				}
 				if hasHistogramSrc {
 					size = t.maxAggBuckets()
 				} else if len(spec.Composite.After) > 0 {
@@ -7129,7 +7200,7 @@ func (t *Transpiler) appendAggBranches(
 								afterParts = append(afterParts, fmt.Sprintf("%v", av))
 							}
 						} else {
-							afterParts = append(afterParts, "")
+							afterParts = append(afterParts, "__ES_MISSING_BUCKET__")
 						}
 					}
 					afterCursor := strings.Join(afterParts, "\x1f")
@@ -8231,6 +8302,14 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 			subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, notNullExpr)
 			if hasMissing {
 				subWhere = whereClause
+			}
+			if subSpec.Histogram.HardBounds != nil {
+				if minF, okMin := resolveHistogramMissingFloat(subSpec.Histogram.HardBounds.Min); okMin {
+					subWhere = fmt.Sprintf("(%s) AND (%s >= %s)", subWhere, col, strconv.FormatFloat(minF, 'f', -1, 64))
+				}
+				if maxF, okMax := resolveHistogramMissingFloat(subSpec.Histogram.HardBounds.Max); okMax {
+					subWhere = fmt.Sprintf("(%s) AND (%s <= %s)", subWhere, col, strconv.FormatFloat(maxF, 'f', -1, 64))
+				}
 			}
 			hChildCountExpr := "COUNT(`_id`)"
 			isHArray := !isExplodedNested(b, effHField) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield)
@@ -12429,33 +12508,53 @@ func (t *Transpiler) compileIntervalsRule(field string, rule esast.IntervalsRule
 	var cp CompiledQuery
 	switch {
 	case rule.Match != nil:
+		targetField := field
+		if strings.TrimSpace(rule.Match.UseField) != "" {
+			targetField = strings.TrimSpace(rule.Match.UseField)
+		}
 		op := "and"
 		if !rule.Match.Ordered && rule.Match.MaxGaps != nil && *rule.Match.MaxGaps != 0 {
 			op = "or"
 		}
-		if rule.Match.Ordered && (rule.Match.MaxGaps == nil || *rule.Match.MaxGaps <= 0) {
-			cp = t.compileMatchPhraseField(field, rule.Match.Query, 0, boost, false, inScoring, nctx)
+		if rule.Match.Ordered && (rule.Match.MaxGaps == nil || *rule.Match.MaxGaps >= 0) {
+			slop := 0
+			if rule.Match.MaxGaps != nil && *rule.Match.MaxGaps > 0 {
+				slop = *rule.Match.MaxGaps
+			}
+			cp = t.compileMatchPhraseField(targetField, rule.Match.Query, slop, boost, false, inScoring, nctx)
 		} else {
-			cp = t.compileMatchField(field, rule.Match.Query, op, boost, inScoring, nctx)
+			cp = t.compileMatchField(targetField, rule.Match.Query, op, boost, inScoring, nctx)
 		}
 		if rule.Match.Filter != nil {
 			cp = t.applyIntervalsFilter(field, cp, rule.Match.Filter, inScoring, nctx)
 		}
 	case rule.Prefix != nil:
-		cp = t.compileMatchPhraseField(field, rule.Prefix.Prefix, 0, boost, true, inScoring, nctx)
+		targetField := field
+		if strings.TrimSpace(rule.Prefix.UseField) != "" {
+			targetField = strings.TrimSpace(rule.Prefix.UseField)
+		}
+		cp = t.compileMatchPhraseField(targetField, rule.Prefix.Prefix, 0, boost, true, inScoring, nctx)
 	case rule.Wildcard != nil:
-		w := t.compileWildcardPredicate(field, rule.Wildcard.Pattern, true, nctx)
+		targetField := field
+		if strings.TrimSpace(rule.Wildcard.UseField) != "" {
+			targetField = strings.TrimSpace(rule.Wildcard.UseField)
+		}
+		w := t.compileWildcardPredicate(targetField, rule.Wildcard.Pattern, true, nctx)
 		sc := "0.0"
 		if inScoring && boost != 0 && w != "FALSE" {
 			sc = fmt.Sprintf("%g", boost)
 		}
 		cp = CompiledQuery{WhereSQL: w, SafeWhereSQL: w, ScoreSQL: sc}
 	case rule.Fuzzy != nil:
+		targetField := field
+		if strings.TrimSpace(rule.Fuzzy.UseField) != "" {
+			targetField = strings.TrimSpace(rule.Fuzzy.UseField)
+		}
 		fuzz := any("AUTO")
 		if rule.Fuzzy.Fuzziness != nil {
 			fuzz = rule.Fuzzy.Fuzziness
 		}
-		cp = t.compileFuzzyFieldWithOpts(field, rule.Fuzzy.Term, "or", fuzz, false, rule.Fuzzy.PrefixLength, rule.Fuzzy.Transpositions, boost, inScoring, nctx)
+		cp = t.compileFuzzyFieldWithOpts(targetField, rule.Fuzzy.Term, "or", fuzz, false, rule.Fuzzy.PrefixLength, rule.Fuzzy.Transpositions, boost, inScoring, nctx)
 	case rule.AllOf != nil:
 		var subPreds, safePreds []string
 		usesFT := false
@@ -12780,6 +12879,12 @@ func (t *Transpiler) compileRankFeature(rf *esast.RankFeatureQuery, inScoring bo
 	if !t.checkFieldSearchable(field, b) {
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
+	if t.Schema != nil && len(t.Schema.Fields) > 0 && b.ESType != "" && b.ESType != "rank_feature" && b.ESType != "rank_features" {
+		if t.searchErr == nil {
+			t.searchErr = fmt.Errorf("query_shard_exception: [rank_feature] query only works on [rank_feature] or [rank_features] fields, not [%s]", b.ESType)
+		}
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
 	col := t.sqlTypedColumnRef(field, 1.0, false, nctx)
 	whereSQL := fmt.Sprintf("(%s IS NOT NULL AND %s > 0)", col, col)
 	scoreSQL := "0.0"
@@ -12831,6 +12936,12 @@ func (t *Transpiler) compileDistanceFeature(df *esast.DistanceFeatureQuery, inSc
 	if !t.checkFieldSearchable(field, b) {
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
+	if t.Schema != nil && len(t.Schema.Fields) > 0 && b.ESType != "" && b.ESType != "date" && b.ESType != "date_nanos" && b.ESType != "geo_point" {
+		if t.searchErr == nil {
+			t.searchErr = fmt.Errorf("query_shard_exception: [distance_feature] query only works on [date], [date_nanos], or [geo_point] fields, not [%s]", b.ESType)
+		}
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
 	whereSQL := t.compileExistsPredicate(df.Field, nctx)
 	scoreSQL := "0.0"
 	if inScoring {
@@ -12839,16 +12950,35 @@ func (t *Transpiler) compileDistanceFeature(df *esast.DistanceFeatureQuery, inSc
 			boost = *df.Boost
 		}
 		if boost != 0 {
-			if b.ESType == "geo_point" {
+			isGeo := b.ESType == "geo_point"
+			if !isGeo && b.ESType == "" {
+				if _, _, errG := esast.ParseGeoPoint(df.Origin); errG == nil {
+					if _, _, errP := esast.ParseGeoDistanceMeters(df.Pivot); errP == nil {
+						isGeo = true
+					}
+				}
+			}
+			if isGeo {
 				if origLat, origLon, err := esast.ParseGeoPoint(df.Origin); err == nil {
 					_, pivotM, err2 := esast.ParseGeoDistanceMeters(df.Pivot)
 					if err2 != nil || pivotM <= 0 {
 						pivotM = 1000.0
 					}
-					latExpr, lonExpr, _ := t.extractGeoPointExprs(field, b)
 					tLonStr := strconv.FormatFloat(origLon, 'f', -1, 64)
 					tLatStr := strconv.FormatFloat(origLat, 'f', -1, 64)
-					distExpr := fmt.Sprintf("ST_Distance_Sphere(%s, %s, %s, %s)", lonExpr, latExpr, tLonStr, tLatStr)
+					var distExpr string
+					if nctx != nil && nctx.elemVar != "" && ((b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath) || strings.HasPrefix(field, nctx.nestedPath+".")) {
+						elemExpr := t.sqlColumnRef(field, true, nctx)
+						latExpr := fmt.Sprintf("CAST(SPLIT_PART(%s, ',', 1) AS DOUBLE)", elemExpr)
+						lonExpr := fmt.Sprintf("CAST(SPLIT_PART(%s, ',', 2) AS DOUBLE)", elemExpr)
+						distExpr = fmt.Sprintf("ST_Distance_Sphere(%s, %s, %s, %s)", lonExpr, latExpr, tLonStr, tLatStr)
+					} else if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
+						arrCol := fmt.Sprintf("`%s`", b.EffectiveArrayColumn(true))
+						distExpr = fmt.Sprintf("array_min(array_map(_x -> ST_Distance_Sphere(CAST(SPLIT_PART(_x, ',', 2) AS DOUBLE), CAST(SPLIT_PART(_x, ',', 1) AS DOUBLE), %s, %s), %s))", tLonStr, tLatStr, arrCol)
+					} else {
+						latExpr, lonExpr, _ := t.extractGeoPointExprs(field, b)
+						distExpr = fmt.Sprintf("ST_Distance_Sphere(%s, %s, %s, %s)", lonExpr, latExpr, tLonStr, tLatStr)
+					}
 					scoreSQL = fmt.Sprintf("(%g * (%g / (%g + GREATEST(%s, 0.0))))", boost, pivotM, pivotM, distExpr)
 					return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: whereSQL, ScoreSQL: scoreSQL}
 				}
@@ -12860,16 +12990,42 @@ func (t *Transpiler) compileDistanceFeature(df *esast.DistanceFeatureQuery, inSc
 				if ms, ok := schema.ParseESDateWithFormatToEpochMillis(ov, b.Format, now); ok {
 					originMs = float64(ms)
 				} else if f, err := strconv.ParseFloat(strings.TrimSpace(ov), 64); err == nil {
+					if b.ESType == "date_nanos" {
+						if niv, okN := normalizeDateNanosValue(b.ESType, int64(f)).(int64); okN {
+							f = float64(niv)
+						}
+					}
 					originMs = f
 				}
 			case float64:
+				if b.ESType == "date_nanos" {
+					if niv, okN := normalizeDateNanosValue(b.ESType, int64(ov)).(int64); okN {
+						ov = float64(niv)
+					}
+				}
 				originMs = ov
 			case int64:
+				if b.ESType == "date_nanos" {
+					if niv, okN := normalizeDateNanosValue(b.ESType, ov).(int64); okN {
+						ov = niv
+					}
+				}
 				originMs = float64(ov)
 			case int:
-				originMs = float64(ov)
+				iv := int64(ov)
+				if b.ESType == "date_nanos" {
+					if niv, okN := normalizeDateNanosValue(b.ESType, iv).(int64); okN {
+						iv = niv
+					}
+				}
+				originMs = float64(iv)
 			case json.Number:
 				if f, err := ov.Float64(); err == nil {
+					if b.ESType == "date_nanos" {
+						if niv, okN := normalizeDateNanosValue(b.ESType, int64(f)).(int64); okN {
+							f = float64(niv)
+						}
+					}
 					originMs = f
 				}
 			}
@@ -12877,8 +13033,8 @@ func (t *Transpiler) compileDistanceFeature(df *esast.DistanceFeatureQuery, inSc
 			if pivotVal <= 0 {
 				pivotVal = 1.0
 			}
-			col := t.sqlTypedColumnRef(field, 1.0, false, nctx)
-			distExpr := fmt.Sprintf("ABS(COALESCE(CAST(%s AS DOUBLE), %g) - %g)", col, originMs, originMs)
+			col := t.sqlNumericColumnRef(field, nctx)
+			distExpr := fmt.Sprintf("ABS(COALESCE(%s, %g) - %g)", col, originMs, originMs)
 			scoreSQL = fmt.Sprintf("(%g * (%g / (%g + %s)))", boost, pivotVal, pivotVal, distExpr)
 		}
 	}
@@ -13087,13 +13243,16 @@ func (t *Transpiler) compilePercolate(pq *esast.PercolateQuery, inScoring bool, 
 	}
 	if t.Schema != nil && len(t.Schema.Fields) > 0 {
 		_, b := t.resolveFieldInNestedCtx(pq.Field, false, nctx)
-		if b.ESType != "" && b.ESType != "percolator" {
-			if t.searchErr == nil {
-				t.searchErr = fmt.Errorf("field [%s] is not of type [percolator]", pq.Field)
+		if b.ESType == "" {
+			if !pq.IgnoreUnmapped && t.searchErr == nil {
+				t.searchErr = fmt.Errorf("query_shard_exception: no mapping found for field [%s]", pq.Field)
 			}
 			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 		}
-		if b.ESType == "" && pq.IgnoreUnmapped {
+		if b.ESType != "percolator" {
+			if t.searchErr == nil {
+				t.searchErr = fmt.Errorf("field [%s] is not of type [percolator]", pq.Field)
+			}
 			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 		}
 	}
