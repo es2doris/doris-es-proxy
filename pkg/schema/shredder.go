@@ -173,6 +173,30 @@ func ShredDocumentWithNow(
 				prunedDynamic = true
 			}
 		}
+		sparseFieldKeys := make([]string, 0)
+		for k, b := range s.Fields {
+			if (b.ESType == "sparse_vector" || b.ESType == "rank_features") && b.AliasTarget == "" && !b.EnabledFalse {
+				sparseFieldKeys = append(sparseFieldKeys, k)
+			}
+		}
+		sort.Strings(sparseFieldKeys)
+		for _, k := range sparseFieldKeys {
+			b := s.Fields[k]
+			modified, err := validateAndNormalizeSparseVectorFieldInDoc(parsedDoc, b.SourceJSONPath, b)
+			if err != nil {
+				if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+					recordIgnored(b.ESFieldPath)
+					if deletePathInMap(parsedDoc, b.SourceJSONPath) {
+						prunedDynamic = true
+					}
+					continue
+				}
+				return nil, err
+			}
+			if modified {
+				prunedDynamic = true
+			}
+		}
 	}
 
 	for _, b := range fieldsToVisit {
@@ -483,7 +507,7 @@ func ShredDocumentWithNow(
 					if rv == nil {
 						continue
 					}
-					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && (b.Coerce == nil || *b.Coerce) {
+					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && (b.Coerce == nil || *b.Coerce) {
 						continue
 					}
 					coerced := coerceScalarBindingForDoris(rv, b, getNow())
@@ -1849,7 +1873,7 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 			if strings.Contains(k, ".") {
 				return false, fmt.Errorf("mapper_parsing_exception: object mapping for [%s] tried to parse field [%s] as object, but subobjects is set to false", scope, k)
 			}
-			isAllowedObjectProp := exists && (strings.EqualFold(prop.Type, "flattened") || strings.EqualFold(prop.Type, "percolator") || strings.EqualFold(prop.Type, "join") || strings.EqualFold(prop.Type, "geo_point") || strings.EqualFold(prop.Type, "geo_shape") || strings.EqualFold(prop.Type, "completion") || IsRangeFieldType(prop.Type) || (prop.Enabled != nil && !*prop.Enabled))
+			isAllowedObjectProp := exists && (strings.EqualFold(prop.Type, "flattened") || strings.EqualFold(prop.Type, "sparse_vector") || strings.EqualFold(prop.Type, "rank_features") || strings.EqualFold(prop.Type, "percolator") || strings.EqualFold(prop.Type, "join") || strings.EqualFold(prop.Type, "geo_point") || strings.EqualFold(prop.Type, "geo_shape") || strings.EqualFold(prop.Type, "completion") || IsRangeFieldType(prop.Type) || (prop.Enabled != nil && !*prop.Enabled))
 			if !isAllowedObjectProp && hasObjectValueAtPath(v, nil) {
 				return false, fmt.Errorf("mapper_parsing_exception: object mapping for [%s] tried to parse field [%s] as object, but subobjects is set to false", scope, k)
 			}
@@ -1870,7 +1894,7 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 				if pathPrefix != "" {
 					fullPath = pathPrefix + "." + parts[0]
 				}
-				if (p0.Enabled != nil && !*p0.Enabled) || strings.EqualFold(p0.Type, "flattened") || strings.EqualFold(p0.Type, "percolator") {
+				if (p0.Enabled != nil && !*p0.Enabled) || strings.EqualFold(p0.Type, "flattened") || strings.EqualFold(p0.Type, "sparse_vector") || strings.EqualFold(p0.Type, "rank_features") || strings.EqualFold(p0.Type, "percolator") {
 					continue
 				}
 				if isStrictLeafESType(p0.Type) && len(p0.Properties) == 0 && !DefaultMultiValuedPaths[fullPath] {
@@ -1902,7 +1926,7 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 			}
 			continue
 		}
-		if strings.EqualFold(prop.Type, "flattened") || strings.EqualFold(prop.Type, "percolator") {
+		if strings.EqualFold(prop.Type, "flattened") || strings.EqualFold(prop.Type, "sparse_vector") || strings.EqualFold(prop.Type, "rank_features") || strings.EqualFold(prop.Type, "percolator") {
 			continue
 		}
 		if prop.Enabled != nil && !*prop.Enabled {
@@ -3573,7 +3597,7 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 		}
 		return norm
 	}
-	if _, isMap := val.(map[string]any); isMap && b.ESType != "geo_point" && b.ESType != "object" && b.ESType != "flattened" {
+	if _, isMap := val.(map[string]any); isMap && b.ESType != "geo_point" && b.ESType != "object" && b.ESType != "flattened" && b.ESType != "sparse_vector" && b.ESType != "rank_features" {
 		return nil
 	}
 	if b.IgnoreAbove > 0 {
@@ -3790,6 +3814,76 @@ func IPToSortableFloat(ipStr string) (float64, bool) {
 		val = val*256.0 + float64(ip16[i])
 	}
 	return val, true
+}
+
+func validateAndNormalizeSparseVectorFieldInDoc(curr map[string]any, path []string, b FieldBinding) (bool, error) {
+	if curr == nil || len(path) == 0 {
+		return false, nil
+	}
+	if len(path) == 1 {
+		raw, exists := curr[path[0]]
+		if !exists || raw == nil {
+			return false, nil
+		}
+		tokMap, ok := raw.(map[string]any)
+		if !ok {
+			return false, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]: expected object mapping tokens to numeric weights", b.ESFieldPath, b.ESType)
+		}
+		modified := false
+		for tk, tv := range tokMap {
+			if strings.TrimSpace(tk) == "" {
+				return false, fmt.Errorf("mapper_parsing_exception: [%s] token key in [%s] cannot be empty", b.ESType, b.ESFieldPath)
+			}
+			var fv float64
+			var validNum bool
+			switch val := tv.(type) {
+			case float64:
+				fv, validNum = val, !math.IsNaN(val) && !math.IsInf(val, 0)
+			case json.Number:
+				if f, err := val.Float64(); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+					fv, validNum = f, true
+				}
+			case int:
+				fv, validNum = float64(val), true
+			case int64:
+				fv, validNum = float64(val), true
+			case string:
+				if f, err := strconv.ParseFloat(strings.TrimSpace(val), 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+					fv, validNum = f, true
+					tokMap[tk] = fv
+					modified = true
+				}
+			}
+			if !validNum {
+				return false, fmt.Errorf("mapper_parsing_exception: [%s] token [%s.%s] weight must be a finite number", b.ESType, b.ESFieldPath, tk)
+			}
+			if b.ESType == "rank_features" && fv <= 0 {
+				return false, fmt.Errorf("mapper_parsing_exception: [rank_features] feature [%s.%s] weight must be > 0, got [%v]", b.ESFieldPath, tk, fv)
+			}
+		}
+		return modified, nil
+	}
+	if next, exists := curr[path[0]]; exists {
+		switch tv := next.(type) {
+		case map[string]any:
+			return validateAndNormalizeSparseVectorFieldInDoc(tv, path[1:], b)
+		case []any:
+			anyMod := false
+			for _, elem := range tv {
+				if em, ok := elem.(map[string]any); ok {
+					mod, err := validateAndNormalizeSparseVectorFieldInDoc(em, path[1:], b)
+					if err != nil {
+						return false, err
+					}
+					if mod {
+						anyMod = true
+					}
+				}
+			}
+			return anyMod, nil
+		}
+	}
+	return false, nil
 }
 
 func validateAndNormalizeFlattenedFieldInDoc(curr map[string]any, path []string, b FieldBinding, recordIgnored func(string)) (bool, error) {

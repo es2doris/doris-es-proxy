@@ -3892,3 +3892,194 @@ func TestRound52TranspilerF12AndF15ToF19(t *testing.T) {
 		t.Fatalf("F19 expected nil-schema multi_match fields=['title^4'] to strip ^4 and apply 4.0000 boost, got where=%s score=%s", cqNilMM.WhereSQL, cqNilMM.ScoreSQL)
 	}
 }
+
+func TestRound53TranspilerF14AndF17ToF19(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"title":     {"type": "text"},
+			"status":    {"type": "keyword"},
+			"region":    {"type": "keyword"},
+			"price":     {"type": "double"},
+			"weight":    {"type": "double"},
+			"ts":        {"type": "date"},
+			"ts_sec":    {"type": "date", "format": "epoch_second"},
+			"loc":       {"type": "geo_point"},
+			"vec":       {"type": "dense_vector", "dims": 2, "similarity": "cosine"},
+			"ml_tokens": {"type": "sparse_vector"},
+			"no_dv":     {"type": "keyword", "doc_values": false},
+			"no_idx":    {"type": "keyword", "index": false},
+			"items": {
+				"type": "nested",
+				"properties": {
+					"sku": {"type": "keyword"}
+				}
+			}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("unmarshal mapping failed: %v", err)
+	}
+	sch := schema.CompileIndexSchema("db", "r53_tr_idx", &spec)
+	tr := NewTranspiler(sch, TranspilerOptions{})
+
+	// F14: Top-level retriever lowering (standard, knn, rrf, rule, text_similarity_reranker)
+	for _, retReqJSON := range []string{
+		`{"retriever":{"standard":{"query":{"match":{"title":"shoes"}},"filter":[{"term":{"status":"active"}}],"min_score":0.5,"collapse":{"field":"region"}}}}`,
+		`{"retriever":{"knn":{"field":"vec","query_vector":[0.5,0.5],"k":5,"num_candidates":10,"filter":[{"term":{"status":"active"}}],"similarity":0.1,"boost":2.0}}}`,
+		`{"retriever":{"rrf":{"retrievers":[{"standard":{"query":{"match":{"title":"shoes"}}}},{"knn":{"field":"vec","query_vector":[0.5,0.5],"k":5,"num_candidates":10}}],"rank_window_size":25,"rank_constant":60,"filter":[{"term":{"status":"active"}}]}}}`,
+		`{"retriever":{"rule":{"retriever":{"standard":{"query":{"match":{"title":"shoes"}}}},"ruleset_ids":["rs1"],"match_criteria":{"q":"shoes"}}}}`,
+		`{"retriever":{"text_similarity_reranker":{"retriever":{"standard":{"query":{"match":{"title":"shoes"}}}},"field":"title","inference_id":"rerank","inference_text":"comfortable shoes","rank_window_size":20,"min_score":0.1}}}`,
+	} {
+		var sr esast.SearchRequest
+		if err := json.Unmarshal([]byte(retReqJSON), &sr); err != nil {
+			t.Fatalf("F14 unmarshal %s failed: %v", retReqJSON, err)
+		}
+		plan, err := tr.BuildSearchPlan(&sr)
+		if err != nil || plan.HitsSQL == "" {
+			t.Fatalf("F14 BuildSearchPlan for %s failed: err=%v sql=%s", retReqJSON, err, plan.HitsSQL)
+		}
+	}
+
+	// F14: rule query, sparse_vector (query_vector + pruning_config + filter), text_expansion, weighted_tokens
+	for _, qJSON := range []struct {
+		raw     string
+		wantSub string
+	}{
+		{`{"rule":{"ruleset_ids":["r1"],"match_criteria":{"q":"shoes"},"organic":{"term":{"status":"active"}},"boost":2.0}}`, "`f__status` = 'active'"},
+		{`{"rule":{"ruleset_ids":["r1"],"match_criteria":{"q":"shoes"}}}`, "1=1"},
+		{`{"sparse_vector":{"field":"ml_tokens","query_vector":{"shoes":1.5,"low":0.05},"prune":true,"pruning_config":{"tokens_weight_threshold":0.5,"only_score_pruned_tokens":true},"filter":{"term":{"status":"active"}},"boost":2.0}}`, "ml_tokens"},
+		{`{"sparse_vector":{"field":"ml_tokens","inference_id":"elser","query":"running shoes"}}`, "ml_tokens"},
+		{`{"text_expansion":{"ml_tokens":{"model_id":"elser","model_text":"running shoes","boost":1.5}}}`, "ml_tokens"},
+		{`{"weighted_tokens":{"ml_tokens":{"tokens":{"shoes":2.0,"boots":1.0},"boost":1.5}}}`, "ml_tokens"},
+	} {
+		var q esast.Query
+		if err := json.Unmarshal([]byte(qJSON.raw), &q); err != nil {
+			t.Fatalf("F14 unmarshal query %s failed: %v", qJSON.raw, err)
+		}
+		cq := tr.CompileQuery(&q, true, nil)
+		if !strings.Contains(cq.WhereSQL, qJSON.wantSub) {
+			t.Fatalf("F14 expected WhereSQL for %s to contain %q, got where=%s score=%s", qJSON.raw, qJSON.wantSub, cq.WhereSQL, cq.ScoreSQL)
+		}
+	}
+
+	// F17: _geo_distance sort with unit:"km" and numeric missing:10 scales missing to 10000 meters
+	var geoSortReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"sort": [
+			{"_geo_distance": {"loc": [0, 0], "order": "asc", "unit": "km", "missing": 10}},
+			{"_id": "asc"}
+		],
+		"search_after": [5000, 12345]
+	}`), &geoSortReq)
+	planGeoSort, err := tr.BuildSearchPlan(&geoSortReq)
+	if err != nil {
+		t.Fatalf("F17 BuildSearchPlan geoSortReq failed: %v", err)
+	}
+	if !strings.Contains(planGeoSort.HitsSQL, "10000") {
+		t.Fatalf("F17 expected unit='km' numeric missing=10 scaled to 10000 meters in ORDER BY, got %s", planGeoSort.HitsSQL)
+	}
+	if !strings.Contains(planGeoSort.HitsSQL, "'12345'") {
+		t.Fatalf("F17 expected numeric _id search_after 12345 coerced to string '12345', got %s", planGeoSort.HitsSQL)
+	}
+
+	// F17: epoch_second date sort with missing and search_after scales seconds to milliseconds
+	var epochSecSortReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"sort": [{"ts_sec": {"order": "asc", "missing": 1700000000}}],
+		"search_after": [1700000005]
+	}`), &epochSecSortReq)
+	planEpochSec, err := tr.BuildSearchPlan(&epochSecSortReq)
+	if err != nil {
+		t.Fatalf("F17 BuildSearchPlan epochSecSortReq failed: %v", err)
+	}
+	if !strings.Contains(planEpochSec.HitsSQL, "1700000000000") || !strings.Contains(planEpochSec.HitsSQL, "1700000005000") {
+		t.Fatalf("F17 expected epoch_second missing and search_after scaled to ms, got %s", planEpochSec.HitsSQL)
+	}
+
+	// F18: SQL compilation for specialized root and sub-aggregations + doc_values check on t_test filter
+	var specAggsReq esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"size": 0,
+		"aggs": {
+			"wa":  {"weighted_avg": {"value": {"field": "price", "missing": 0}, "weight": {"field": "weight", "missing": 1}}},
+			"mad": {"median_absolute_deviation": {"field": "price"}},
+			"bp":  {"boxplot": {"field": "price"}},
+			"rt":  {"rare_terms": {"field": "status", "max_doc_count": 2}},
+			"mt":  {"multi_terms": {"terms": [{"field": "status"}, {"field": "region"}]}},
+			"adh": {"auto_date_histogram": {"field": "ts", "buckets": 5}},
+			"vwh": {"variable_width_histogram": {"field": "price", "buckets": 4}},
+			"am":  {"adjacency_matrix": {"filters": {"a": {"term": {"status": "ok"}}, "b": {"term": {"region": "us"}}}}},
+			"gb":  {"geo_bounds": {"field": "loc"}},
+			"gc":  {"geo_centroid": {"field": "loc"}},
+			"gd":  {"geo_distance": {"field": "loc", "origin": "0,0", "unit": "km", "ranges": [{"to": 10}, {"from": 10}]}},
+			"gh":  {"geohash_grid": {"field": "loc", "precision": 4}},
+			"gt":  {"geotile_grid": {"field": "loc", "precision": 6}},
+			"by_status": {
+				"terms": {"field": "status"},
+				"aggs": {
+					"sub_wa":  {"weighted_avg": {"value": {"field": "price"}, "weight": {"field": "weight"}}},
+					"sub_mad": {"median_absolute_deviation": {"field": "price"}},
+					"sub_bp":  {"boxplot": {"field": "price"}},
+					"sub_gb":  {"geo_bounds": {"field": "loc"}},
+					"sub_gc":  {"geo_centroid": {"field": "loc"}},
+					"sub_rt":  {"rare_terms": {"field": "region"}},
+					"sub_mt":  {"multi_terms": {"terms": [{"field": "status"}, {"field": "region"}]}},
+					"sub_adh": {"auto_date_histogram": {"field": "ts", "buckets": 3}},
+					"sub_vwh": {"variable_width_histogram": {"field": "price", "buckets": 3}},
+					"sub_gd":  {"geo_distance": {"field": "loc", "origin": "0,0", "ranges": [{"to": 50}]}},
+					"sub_gh":  {"geohash_grid": {"field": "loc", "precision": 3}},
+					"sub_gt":  {"geotile_grid": {"field": "loc", "precision": 4}}
+				}
+			}
+		}
+	}`), &specAggsReq); err != nil {
+		t.Fatalf("F18 unmarshal specAggsReq failed: %v", err)
+	}
+	planSpecAggs, err := tr.BuildSearchPlan(&specAggsReq)
+	if err != nil {
+		t.Fatalf("F18 BuildSearchPlan specAggsReq failed: %v", err)
+	}
+	for _, wantName := range []string{
+		"'wa'", "'mad'", "'bp'", "'rt'", "'mt'", "'adh'", "'vwh'", "'am'", "'gb._gb_top'", "'gc._gc_count'", "'gd'", "'gh'", "'gt'",
+		"'by_status.sub_wa'", "'by_status.sub_mad'", "'by_status.sub_bp.0.0'", "'by_status.sub_gb._gb_top'", "'by_status.sub_gc._gc_count'",
+		"'by_status.sub_rt'", "'by_status.sub_mt'", "'by_status.sub_adh'", "'by_status.sub_vwh'",
+		"'by_status.sub_gd'", "'by_status.sub_gh'", "'by_status.sub_gt'",
+	} {
+		if !strings.Contains(planSpecAggs.AggsSQL, wantName) {
+			t.Fatalf("F18 expected %s in AggsSQL, got:\n%s", wantName, planSpecAggs.AggsSQL)
+		}
+	}
+
+	// F18: validateAggsDocValues checks t_test sample filter queries and reverse_nested path
+	for _, badAggReq := range []string{
+		`{"size":0,"aggs":{"tt":{"t_test":{"a":{"field":"price","filter":{"term":{"no_idx":"x"}}},"b":{"field":"price"}}}}}`,
+		`{"size":0,"aggs":{"tt":{"t_test":{"a":{"field":"price","filter":{"script":{"script":"doc['no_dv'].value == 'x'"}}},"b":{"field":"price"}}}}}`,
+		`{"size":0,"aggs":{"n":{"nested":{"path":"items"},"aggs":{"rn":{"reverse_nested":{},"aggs":{"bad":{"terms":{"field":"no_dv"}}}}}}}}`,
+	} {
+		var badSR esast.SearchRequest
+		_ = json.Unmarshal([]byte(badAggReq), &badSR)
+		if _, err := tr.BuildSearchPlan(&badSR); err == nil {
+			t.Fatalf("F18 expected error for %s", badAggReq)
+		}
+	}
+
+	// F19: Unclosed range bracket in strict query_string with lenient != true returns error in BuildSearchPlan
+	for _, badQS := range []string{
+		`{"query":{"query_string":{"query":"price:[10 TO 20"}}}`,
+		`{"query":{"query_string":{"query":"price:{10 TO 20"}}}`,
+		`{"query":{"query_string":{"query":"(price:[10 TO 20)"}}}`,
+	} {
+		var sr esast.SearchRequest
+		if err := json.Unmarshal([]byte(badQS), &sr); err != nil {
+			t.Fatalf("F19 unmarshal %s failed: %v", badQS, err)
+		}
+		if _, err := tr.BuildSearchPlan(&sr); err == nil {
+			t.Fatalf("F19 expected syntax error from BuildSearchPlan for unclosed range in %s", badQS)
+		}
+	}
+	var lenientQS esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"query_string":{"query":"price:[10 TO 20","lenient":true}}}`), &lenientQS)
+	if _, err := tr.BuildSearchPlan(&lenientQS); err != nil {
+		t.Fatalf("F19 expected lenient:true query_string with unclosed range not to error, got %v", err)
+	}
+}

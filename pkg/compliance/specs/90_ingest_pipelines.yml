@@ -355,5 +355,75 @@
   - match: { docs.0.doc._source.fqdn.registered_domain: "example.co.uk" }
   - match: { docs.0.doc._source.enriched.region: "Virginia" }
 
+---
+"Round 53 Ingest Validation, Date Formats, Murmur3 Fingerprint, Attachment/UA Properties, and KV Escapes":
+  - do:
+      catch: bad_request
+      ingest.put_pipeline:
+        id: r53_bad_null_proc
+        body:
+          processors:
+            - set: null
+
+  - do:
+      catch: bad_request
+      ingest.put_pipeline:
+        id: r53_bad_convert_type
+        body:
+          processors:
+            - convert:
+                field: "a"
+                type: "invalid_type"
+
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - date:
+                  field: "epoch_ms"
+                  formats: ["epoch_millis"]
+                  target_field: "parsed_epoch"
+              - date:
+                  field: "uuuu_date"
+                  formats: ["uuuu-MM-dd'T'HH:mm:ss,SSSZ"]
+                  target_field: "parsed_uuuu"
+              - fingerprint:
+                  fields: ["msg"]
+                  method: "Murmur3@2.0"
+                  target_field: "fp_murmur"
+              - attachment:
+                  field: "b64"
+                  indexed_chars_field: "max_len"
+                  properties: ["content", "content_length"]
+              - user_agent:
+                  field: "ua"
+                  properties: ["name", "major", "minor"]
+              - kv:
+                  field: "kv_str"
+                  field_split: " "
+                  value_split: "="
+                  strip_brackets: true
+          docs:
+            - _source:
+                epoch_ms: 1704067200000
+                uuuu_date: "2024-01-01T00:00:00,000+0000"
+                msg: "hello"
+                b64: "aGVsbG8gd29ybGQ="
+                max_len: 5
+                ua: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.1.2"
+                kv_str: "[env]=\"prod\\\"1\" (tier)=[backend]"
+  - match: { docs.0.doc._source.parsed_epoch: "2024-01-01T00:00:00Z" }
+  - match: { docs.0.doc._source.parsed_uuuu: "2024-01-01T00:00:00Z" }
+  - is_true: docs.0.doc._source.fp_murmur
+  - match: { docs.0.doc._source.attachment.content: "hello" }
+  - is_false: docs.0.doc._source.attachment.content_type
+  - match: { docs.0.doc._source.user_agent.name: "Chrome" }
+  - match: { docs.0.doc._source.user_agent.major: "120" }
+  - is_false: docs.0.doc._source.user_agent.original
+  - match: { docs.0.doc._source.env: "prod\"1" }
+  - match: { docs.0.doc._source.tier: "backend" }
+
+
 
 

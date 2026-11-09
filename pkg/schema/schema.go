@@ -477,10 +477,227 @@ func MergeMappingSpecs(oldSpec, newSpec *esast.MappingSpec) *esast.MappingSpec {
 	}
 }
 
+var knownESFieldTypes = map[string]bool{
+	"keyword":                 true,
+	"constant_keyword":        true,
+	"wildcard":                true,
+	"text":                    true,
+	"match_only_text":         true,
+	"annotated-text":          true,
+	"annotated_text":          true,
+	"search_as_you_type":      true,
+	"completion":              true,
+	"token_count":             true,
+	"murmur3":                 true,
+	"long":                    true,
+	"integer":                 true,
+	"short":                   true,
+	"byte":                    true,
+	"double":                  true,
+	"float":                   true,
+	"half_float":              true,
+	"scaled_float":            true,
+	"unsigned_long":           true,
+	"boolean":                 true,
+	"date":                    true,
+	"date_nanos":              true,
+	"ip":                      true,
+	"version":                 true,
+	"binary":                  true,
+	"object":                  true,
+	"nested":                  true,
+	"flattened":               true,
+	"join":                    true,
+	"percolator":              true,
+	"geo_point":               true,
+	"geo_shape":               true,
+	"point":                   true,
+	"shape":                   true,
+	"dense_vector":            true,
+	"knn_vector":              true,
+	"sparse_vector":           true,
+	"rank_feature":            true,
+	"rank_features":           true,
+	"rank_vector":             true,
+	"histogram":               true,
+	"aggregate_metric_double": true,
+	"alias":                   true,
+	"integer_range":           true,
+	"float_range":             true,
+	"long_range":              true,
+	"double_range":            true,
+	"date_range":              true,
+	"ip_range":                true,
+	"passthrough":             true,
+}
+
+func validateDynamicModeVal(dyn any, path string) error {
+	if dyn == nil {
+		return nil
+	}
+	switch v := dyn.(type) {
+	case bool:
+		return nil
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "true", "false", "strict", "runtime":
+			return nil
+		default:
+			return fmt.Errorf("mapper_parsing_exception: wrong value for [dynamic] setting on [%s]: [%s]", path, v)
+		}
+	default:
+		return fmt.Errorf("mapper_parsing_exception: wrong value for [dynamic] setting on [%s]: [%v]", path, dyn)
+	}
+}
+
+func parseIntOption(raw any, optName, fieldPath string) (int, error) {
+	switch v := raw.(type) {
+	case int:
+		return v, nil
+	case int64:
+		return int(v), nil
+	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) || v != math.Trunc(v) {
+			return 0, fmt.Errorf("mapper_parsing_exception: [%s] on field [%s] must be an integer", optName, fieldPath)
+		}
+		return int(v), nil
+	default:
+		return 0, fmt.Errorf("mapper_parsing_exception: [%s] on field [%s] must be an integer", optName, fieldPath)
+	}
+}
+
+func validateSingleFieldProperty(fullPath, fType string, prop esast.FieldProperty) error {
+	if fType != "" && !knownESFieldTypes[fType] {
+		return fmt.Errorf("mapper_parsing_exception: No handler for type [%s] declared on field [%s]", prop.Type, fullPath)
+	}
+	if err := validateDynamicModeVal(prop.Dynamic, fullPath); err != nil {
+		return err
+	}
+	if fType == "scaled_float" {
+		if prop.ScalingFactor <= 0.0 || math.IsNaN(prop.ScalingFactor) || math.IsInf(prop.ScalingFactor, 0) {
+			return fmt.Errorf("mapper_parsing_exception: [scaling_factor] must be > 0.0 for [scaled_float] field [%s]", fullPath)
+		}
+	}
+	if fType == "constant_keyword" && prop.Value != nil {
+		switch prop.Value.(type) {
+		case map[string]any, []any:
+			return fmt.Errorf("mapper_parsing_exception: [constant_keyword] field [%s] [value] must be a scalar value", fullPath)
+		}
+	}
+	if fType == "dense_vector" || fType == "knn_vector" {
+		dims := prop.EffectiveDims()
+		if prop.Dims < 0 || prop.Dimension < 0 || dims < 1 || dims > 4096 {
+			return fmt.Errorf("mapper_parsing_exception: [%s] field [%s] requires [dims] in [1, 4096], got [%d]", fType, fullPath, dims)
+		}
+		switch strings.ToLower(strings.TrimSpace(prop.Similarity)) {
+		case "", "l2_norm", "dot_product", "cosine", "max_inner_product":
+		default:
+			return fmt.Errorf("mapper_parsing_exception: unknown [similarity] [%s] on [%s] field [%s]", prop.Similarity, fType, fullPath)
+		}
+	}
+	if prop.NullValue != nil {
+		switch fType {
+		case "text", "match_only_text", "annotated-text", "annotated_text", "search_as_you_type",
+			"nested", "object", "flattened", "percolator", "join", "dense_vector", "knn_vector", "sparse_vector", "rank_feature", "rank_features":
+			return fmt.Errorf("mapper_parsing_exception:Mapping definition for [%s] has unsupported parameters: [null_value] is not supported on [%s]", fullPath, fType)
+		}
+		switch prop.NullValue.(type) {
+		case map[string]any, []any:
+			return fmt.Errorf("mapper_parsing_exception: [null_value] on field [%s] must be a scalar value", fullPath)
+		}
+	}
+	if prop.IgnoreAbove < 0 {
+		return fmt.Errorf("mapper_parsing_exception: [ignore_above] must be >= 0 for field [%s]", fullPath)
+	}
+	if len(prop.IndexPrefixes) > 0 {
+		minChars := 2
+		maxChars := 5
+		for k, v := range prop.IndexPrefixes {
+			switch k {
+			case "min_chars":
+				iv, err := parseIntOption(v, "min_chars", fullPath)
+				if err != nil {
+					return err
+				}
+				minChars = iv
+			case "max_chars":
+				iv, err := parseIntOption(v, "max_chars", fullPath)
+				if err != nil {
+					return err
+				}
+				maxChars = iv
+			default:
+				return fmt.Errorf("mapper_parsing_exception: unknown parameter [%s] in [index_prefixes] on field [%s]", k, fullPath)
+			}
+		}
+		if minChars < 1 {
+			return fmt.Errorf("mapper_parsing_exception: [min_chars] in [index_prefixes] on field [%s] must be >= 1", fullPath)
+		}
+		if maxChars >= 20 {
+			return fmt.Errorf("mapper_parsing_exception: [max_chars] in [index_prefixes] on field [%s] must be < 20", fullPath)
+		}
+		if minChars > maxChars {
+			return fmt.Errorf("mapper_parsing_exception: [min_chars] (%d) must be <= [max_chars] (%d) in [index_prefixes] on field [%s]", minChars, maxChars, fullPath)
+		}
+	}
+	if fType == "join" {
+		if len(prop.Relations) == 0 {
+			return fmt.Errorf("mapper_parsing_exception: [relations] is required for [join] field [%s]", fullPath)
+		}
+		childParent := make(map[string]string)
+		for parent, rawChildren := range prop.Relations {
+			pTrim := strings.TrimSpace(parent)
+			if pTrim == "" {
+				return fmt.Errorf("mapper_parsing_exception: [join] field [%s] parent relation name cannot be empty", fullPath)
+			}
+			var children []string
+			switch cv := rawChildren.(type) {
+			case string:
+				children = []string{cv}
+			case []string:
+				children = cv
+			case []any:
+				for _, elem := range cv {
+					s, ok := elem.(string)
+					if !ok {
+						return fmt.Errorf("mapper_parsing_exception: [join] field [%s] child relation must be a string", fullPath)
+					}
+					children = append(children, s)
+				}
+			default:
+				return fmt.Errorf("mapper_parsing_exception: [join] field [%s] relation for [%s] must be a string or array of strings", fullPath, pTrim)
+			}
+			if len(children) == 0 {
+				return fmt.Errorf("mapper_parsing_exception: [join] field [%s] parent [%s] must have at least one child", fullPath, pTrim)
+			}
+			for _, child := range children {
+				cTrim := strings.TrimSpace(child)
+				if cTrim == "" {
+					return fmt.Errorf("mapper_parsing_exception: [join] field [%s] child relation name cannot be empty", fullPath)
+				}
+				if cTrim == pTrim {
+					return fmt.Errorf("mapper_parsing_exception: [join] field [%s] child [%s] cannot be its own parent", fullPath, cTrim)
+				}
+				if prevParent, exists := childParent[cTrim]; exists && prevParent != pTrim {
+					return fmt.Errorf("mapper_parsing_exception: [join] field [%s] child [%s] cannot have multiple parents ([%s] and [%s])", fullPath, cTrim, prevParent, pTrim)
+				}
+				childParent[cTrim] = pTrim
+			}
+		}
+	}
+	return nil
+}
+
 // ValidateMappingSpec validates field definitions in a MappingSpec, including `alias` field `path` requirements,
 // target existence, alias-to-alias chaining rejection, and cycle detection.
 func ValidateMappingSpec(m *esast.MappingSpec) error {
-	if m == nil || len(m.Properties) == 0 {
+	if m == nil {
+		return nil
+	}
+	if err := validateDynamicModeVal(m.Dynamic, "_root"); err != nil {
+		return err
+	}
+	if len(m.Properties) == 0 {
 		return nil
 	}
 	allTypes := make(map[string]string)
@@ -499,16 +716,8 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 				fType = "object"
 			}
 			allTypes[fullPath] = fType
-			if fType == "scaled_float" {
-				if prop.ScalingFactor <= 0.0 || math.IsNaN(prop.ScalingFactor) || math.IsInf(prop.ScalingFactor, 0) {
-					return fmt.Errorf("mapper_parsing_exception: [scaling_factor] must be > 0.0 for [scaled_float] field [%s]", fullPath)
-				}
-			}
-			if fType == "constant_keyword" && prop.Value != nil {
-				switch prop.Value.(type) {
-				case map[string]any, []any:
-					return fmt.Errorf("mapper_parsing_exception: [constant_keyword] field [%s] [value] must be a scalar value", fullPath)
-				}
+			if err := validateSingleFieldProperty(fullPath, fType, prop); err != nil {
+				return err
 			}
 			if fType == "alias" {
 				target := strings.TrimSpace(prop.Path)
@@ -529,16 +738,8 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 					subFull := fullPath + "." + fk
 					sfType := strings.ToLower(strings.TrimSpace(fprop.Type))
 					allTypes[subFull] = sfType
-					if sfType == "scaled_float" {
-						if fprop.ScalingFactor <= 0.0 || math.IsNaN(fprop.ScalingFactor) || math.IsInf(fprop.ScalingFactor, 0) {
-							return fmt.Errorf("mapper_parsing_exception: [scaling_factor] must be > 0.0 for [scaled_float] field [%s]", subFull)
-						}
-					}
-					if sfType == "constant_keyword" && fprop.Value != nil {
-						switch fprop.Value.(type) {
-						case map[string]any, []any:
-							return fmt.Errorf("mapper_parsing_exception: [constant_keyword] field [%s] [value] must be a scalar value", subFull)
-						}
+					if err := validateSingleFieldProperty(subFull, sfType, fprop); err != nil {
+						return err
 					}
 					if sfType == "alias" {
 						target := strings.TrimSpace(fprop.Path)
@@ -1025,7 +1226,7 @@ func (s *IndexSchema) registerLeafField(
 		prop.Analyzer = "standard"
 	}
 
-	if IsRangeFieldType(esType) || esType == "flattened" || esType == "percolator" || esType == "geo_shape" {
+	if IsRangeFieldType(esType) || esType == "flattened" || esType == "sparse_vector" || esType == "rank_features" || esType == "percolator" || esType == "geo_shape" {
 		s.Fields[dotPath] = FieldBinding{
 			ESFieldPath:              dotPath,
 			SourceJSONPath:           sourceJSONPath,
@@ -1222,16 +1423,20 @@ func (s *IndexSchema) ResolveField(esFieldPath string) FieldBinding {
 					DocValuesFalse: true,
 				}
 			}
-			if pb.ESType == "flattened" {
+			if pb.ESType == "flattened" || pb.ESType == "sparse_vector" || pb.ESType == "rank_features" {
 				cleanPath := strings.TrimSuffix(esFieldPath, ".keyword")
 				suffixSegs := strings.Split(strings.TrimPrefix(cleanPath, prefix+"."), ".")
 				srcPath := append(append([]string{}, pb.SourceJSONPath...), suffixSegs...)
+				dorisType := DorisString
+				if pb.ESType == "sparse_vector" || pb.ESType == "rank_features" {
+					dorisType = DorisDouble
+				}
 				return FieldBinding{
 					ESFieldPath:         esFieldPath,
 					SourceJSONPath:      srcPath,
 					Kind:                StorageDynamicVariant,
-					DorisType:           DorisString,
-					ESType:              "flattened",
+					DorisType:           dorisType,
+					ESType:              pb.ESType,
 					NestedPath:          pb.NestedPath,
 					LowercaseNormalizer: pb.LowercaseNormalizer,
 					IgnoreAbove:         pb.IgnoreAbove,

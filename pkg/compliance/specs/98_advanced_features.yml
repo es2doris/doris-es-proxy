@@ -274,3 +274,125 @@
       indices.delete_data_stream:
         name: r52_comp_ds
   - match: { acknowledged: true }
+
+---
+"Round 53 Synonyms, Query Rules, Features, Rollup, CCR, Security, and Logstash APIs":
+  - do:
+      synonyms.put_synonym:
+        id: r53_syn_set
+        body:
+          synonyms_set:
+            - id: "r1"
+              synonyms: "laptop, notebook"
+  - match: { result: "created" }
+  - do:
+      synonyms.get_synonym:
+        id: r53_syn_set
+  - match: { count: 1 }
+  - do:
+      synonyms.delete_synonym:
+        id: r53_syn_set
+  - match: { acknowledged: true }
+
+  - do:
+      query_rules.put_ruleset:
+        ruleset_id: r53_qr_set
+        body:
+          rules:
+            - rule_id: "r1"
+              type: "pinned"
+              criteria:
+                - type: "contains"
+                  metadata: "query_str"
+                  values: ["pug"]
+              actions:
+                ids: ["1"]
+  - match: { result: "created" }
+  - do:
+      query_rules.test:
+        ruleset_id: r53_qr_set
+        body:
+          match_criteria:
+            query_str: "cute pugs"
+  - length: { matched_rules: 1 }
+  - do:
+      query_rules.delete_ruleset:
+        ruleset_id: r53_qr_set
+  - match: { acknowledged: true }
+
+  - do:
+      features.get_features: {}
+  - is_true: features
+  - do:
+      features.reset_features: {}
+  - is_true: features
+
+  - do:
+      migration.deprecations: {}
+  - is_true: cluster_settings
+
+  - do:
+      rollup.put_job:
+        id: r53_rollup_job
+        body:
+          index_pattern: "r53_*"
+          rollup_index: "r53_rollup_idx"
+          cron: "0 * * * * ?"
+          page_size: 100
+          groups:
+            date_histogram:
+              field: "@timestamp"
+              fixed_interval: "1h"
+  - match: { acknowledged: true }
+  - do:
+      rollup.start_job:
+        id: r53_rollup_job
+  - match: { started: true }
+  - do:
+      rollup.stop_job:
+        id: r53_rollup_job
+  - match: { stopped: true }
+  - do:
+      rollup.delete_job:
+        id: r53_rollup_job
+  - match: { acknowledged: true }
+
+  - do:
+      ccr.put_auto_follow_pattern:
+        name: r53_af
+        body:
+          remote_cluster: "rc1"
+          leader_index_patterns: ["leader_*"]
+  - match: { acknowledged: true }
+  - do:
+      ccr.delete_auto_follow_pattern:
+        name: r53_af
+  - match: { acknowledged: true }
+
+  - do:
+      security.put_user:
+        username: r53_user
+        body:
+          password: "secretpassword"
+          roles: ["admin"]
+  - match: { user.created: true }
+  - do:
+      security.delete_user:
+        username: r53_user
+  - match: { found: true }
+
+  - do:
+      logstash.put_pipeline:
+        id: r53_ls_pipe
+        body:
+          pipeline: "input { stdin {} } output { stdout {} }"
+  - match: { acknowledged: true }
+  - do:
+      logstash.get_pipeline:
+        id: r53_ls_pipe
+  - is_true: r53_ls_pipe
+  - do:
+      logstash.delete_pipeline:
+        id: r53_ls_pipe
+  - match: { acknowledged: true }
+

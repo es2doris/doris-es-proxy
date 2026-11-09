@@ -1376,7 +1376,11 @@ func validateIngestPipelineProcessors(procs []any) error {
 		if !ok {
 			return fmt.Errorf("processor must be a map")
 		}
-		if topOnFail, ok := pm["on_failure"].([]any); ok {
+		if rawTopOnFail, hasTopOnFail := pm["on_failure"]; hasTopOnFail && rawTopOnFail != nil {
+			topOnFail, ok := rawTopOnFail.([]any)
+			if !ok {
+				return fmt.Errorf("[on_failure] property isn't a list")
+			}
 			if err := validateIngestPipelineProcessors(topOnFail); err != nil {
 				return err
 			}
@@ -1392,15 +1396,225 @@ func validateIngestPipelineProcessors(procs []any) error {
 				return fmt.Errorf("no processor type exists with name [%s]", procType)
 			}
 			specMap, ok := rawSpec.(map[string]any)
-			if !ok {
-				continue
+			if !ok || specMap == nil {
+				return fmt.Errorf("[%s] config isn't a map", procType)
+			}
+			reqStr := func(prop string) (string, error) {
+				val, ok := specMap[prop].(string)
+				if !ok || strings.TrimSpace(val) == "" {
+					return "", fmt.Errorf("[%s] required property is missing", prop)
+				}
+				return val, nil
 			}
 			switch procType {
+			case "set":
+				if _, err := reqStr("field"); err != nil {
+					return err
+				}
+				_, hasVal := specMap["value"]
+				copyFrom, _ := specMap["copy_from"].(string)
+				if !hasVal && strings.TrimSpace(copyFrom) == "" {
+					return fmt.Errorf("either [value] or [copy_from] must be present")
+				}
+			case "default", "append":
+				if _, err := reqStr("field"); err != nil {
+					return err
+				}
+				if _, hasVal := specMap["value"]; !hasVal {
+					return fmt.Errorf("[value] required property is missing")
+				}
+			case "remove":
+				isValidFieldOrSlice := func(raw any) bool {
+					switch fv := raw.(type) {
+					case string:
+						return strings.TrimSpace(fv) != ""
+					case []any:
+						if len(fv) == 0 {
+							return false
+						}
+						for _, el := range fv {
+							if s, ok := el.(string); !ok || strings.TrimSpace(s) == "" {
+								return false
+							}
+						}
+						return true
+					default:
+						return false
+					}
+				}
+				rawField, hasField := specMap["field"]
+				rawKeep, hasKeep := specMap["keep"]
+				if (!hasField || rawField == nil) && (!hasKeep || rawKeep == nil) {
+					return fmt.Errorf("[field] required property is missing")
+				}
+				if hasField && rawField != nil && !isValidFieldOrSlice(rawField) {
+					return fmt.Errorf("[field] required property is missing")
+				}
+				if hasKeep && rawKeep != nil && !isValidFieldOrSlice(rawKeep) {
+					return fmt.Errorf("[keep] required property is invalid")
+				}
+			case "rename", "copy":
+				f, err := reqStr("field")
+				if err != nil {
+					return err
+				}
+				tf, err := reqStr("target_field")
+				if err != nil {
+					return err
+				}
+				if f == tf && pm["on_failure"] == nil && specMap["on_failure"] == nil {
+					return fmt.Errorf("illegal_argument_exception: source and target_field are the same: [%s]", f)
+				}
+			case "lowercase", "uppercase", "trim", "bytes", "html_strip", "dot_expander",
+				"urlencode", "url_encode", "URLEncode", "urldecode", "url_decode", "URLDecode",
+				"sort", "compact", "dedup", "dedupe", "attachment", "user_agent", "uri_parts",
+				"registered_domain", "geoip", "set_security_user":
+				if _, err := reqStr("field"); err != nil {
+					return err
+				}
+			case "split":
+				if _, err := reqStr("field"); err != nil {
+					return err
+				}
+				if sep, ok := specMap["separator"].(string); !ok || sep == "" {
+					return fmt.Errorf("[separator] required property is missing")
+				}
+			case "join":
+				if _, err := reqStr("field"); err != nil {
+					return err
+				}
+				if _, ok := specMap["separator"].(string); !ok {
+					return fmt.Errorf("[separator] required property is missing")
+				}
+			case "convert":
+				if _, err := reqStr("field"); err != nil {
+					return err
+				}
+				convType, err := reqStr("type")
+				if err != nil {
+					return err
+				}
+				switch strings.ToLower(strings.TrimSpace(convType)) {
+				case "integer", "int", "long", "short", "byte", "unsigned_long",
+					"float", "double", "half_float", "scaled_float", "string",
+					"boolean", "bool", "ip", "auto":
+				default:
+					return fmt.Errorf("illegal_argument_exception: type [%s] not supported", convType)
+				}
+			case "gsub":
+				if _, err := reqStr("field"); err != nil {
+					return err
+				}
+				pat, err := reqStr("pattern")
+				if err != nil {
+					return err
+				}
+				if _, ok := specMap["replacement"].(string); !ok {
+					return fmt.Errorf("[replacement] required property is missing")
+				}
+				if _, err := regexp.Compile(pat); err != nil {
+					return fmt.Errorf("illegal_argument_exception: invalid pattern [%s]: %v", pat, err)
+				}
 			case "json":
+				if _, err := reqStr("field"); err != nil {
+					return err
+				}
 				addToRoot, _ := specMap["add_to_root"].(bool)
 				tf, _ := specMap["target_field"].(string)
 				if addToRoot && strings.TrimSpace(tf) != "" {
 					return fmt.Errorf("cannot specify both [target_field] and [add_to_root]")
+				}
+			case "kv":
+				if _, err := reqStr("field"); err != nil {
+					return err
+				}
+				fs, okFS := specMap["field_split"].(string)
+				if !okFS || fs == "" {
+					return fmt.Errorf("[field_split] required property is missing")
+				}
+				vs, okVS := specMap["value_split"].(string)
+				if !okVS || vs == "" {
+					return fmt.Errorf("[value_split] required property is missing")
+				}
+				if fs != "|" && fs != "." && fs != " " && fs != "," && fs != ";" && fs != "&" {
+					if _, err := regexp.Compile(fs); err != nil {
+						return fmt.Errorf("illegal_argument_exception: invalid field_split [%s]: %v", fs, err)
+					}
+				}
+				if vs != "=" && vs != ":" && vs != "|" && vs != "." {
+					if _, err := regexp.Compile(vs); err != nil {
+						return fmt.Errorf("illegal_argument_exception: invalid value_split [%s]: %v", vs, err)
+					}
+				}
+			case "csv":
+				if _, err := reqStr("field"); err != nil {
+					return err
+				}
+				tfs, ok := specMap["target_fields"].([]any)
+				if !ok || len(tfs) == 0 {
+					return fmt.Errorf("[target_fields] required property is missing")
+				}
+				if sep, ok := specMap["separator"].(string); ok && utf8.RuneCountInString(sep) > 1 {
+					return fmt.Errorf("illegal_argument_exception: separator must be a single character")
+				}
+				if q, ok := specMap["quote"].(string); ok && utf8.RuneCountInString(q) > 1 {
+					return fmt.Errorf("illegal_argument_exception: quote must be a single character")
+				}
+			case "date":
+				if _, err := reqStr("field"); err != nil {
+					return err
+				}
+				fmts, ok := specMap["formats"].([]any)
+				if !ok || len(fmts) == 0 {
+					return fmt.Errorf("[formats] required property is missing")
+				}
+				if tz, ok := specMap["timezone"].(string); ok && tz != "" && !strings.Contains(tz, "{{") {
+					if _, err := parseIngestTimezone(tz); err != nil {
+						return err
+					}
+				}
+			case "date_index_name":
+				if _, err := reqStr("field"); err != nil {
+					return err
+				}
+				rounding, err := reqStr("date_rounding")
+				if err != nil {
+					return err
+				}
+				switch rounding {
+				case "y", "M", "w", "d", "h", "m", "s":
+				default:
+					return fmt.Errorf("invalid date rounding [%s], valid values are [y, M, w, d, h, m, s]", rounding)
+				}
+				if tz, ok := specMap["timezone"].(string); ok && tz != "" && !strings.Contains(tz, "{{") {
+					if _, err := parseIngestTimezone(tz); err != nil {
+						return err
+					}
+				}
+			case "dissect":
+				if _, err := reqStr("field"); err != nil {
+					return err
+				}
+				if _, ok := specMap["pattern"].(string); !ok {
+					return fmt.Errorf("[pattern] required property is missing")
+				}
+			case "grok", "redact":
+				if _, err := reqStr("field"); err != nil {
+					return err
+				}
+				pats, ok := specMap["patterns"].([]any)
+				if !ok || len(pats) == 0 {
+					return fmt.Errorf("[patterns] required property is missing")
+				}
+				customDefs, _ := specMap["pattern_definitions"].(map[string]any)
+				for _, patAny := range pats {
+					patStr, ok := patAny.(string)
+					if !ok || patStr == "" {
+						return fmt.Errorf("illegal_argument_exception: pattern must be a non-empty string")
+					}
+					if _, _, _, err := compileGrokRegex(patStr, customDefs); err != nil {
+						return fmt.Errorf("illegal_argument_exception: %v", err)
+					}
 				}
 			case "fingerprint":
 				fieldsAny, hasFields := specMap["fields"].([]any)
@@ -1408,37 +1622,38 @@ func validateIngestPipelineProcessors(procs []any) error {
 				if (hasFields && hasExcl) && (len(fieldsAny) > 0 || len(exclAny) > 0) {
 					return fmt.Errorf("cannot specify both [fields] and [exclude_fields]")
 				}
-			case "set_security_user":
-				field, _ := specMap["field"].(string)
-				if strings.TrimSpace(field) == "" {
-					return fmt.Errorf("[field] required property is missing")
+				if rawMethod, ok := specMap["method"].(string); ok && strings.TrimSpace(rawMethod) != "" {
+					normMethod := normalizeFingerprintMethod(rawMethod)
+					switch normMethod {
+					case "MD5", "SHA-1", "SHA-256", "SHA-384", "SHA-512", "MURMUR3":
+					default:
+						return fmt.Errorf("illegal_argument_exception: unsupported fingerprint method [%s]", rawMethod)
+					}
 				}
-			case "date_index_name":
-				field, _ := specMap["field"].(string)
-				if strings.TrimSpace(field) == "" {
-					return fmt.Errorf("[field] required property is missing")
+			case "fail":
+				if _, ok := specMap["message"].(string); !ok {
+					return fmt.Errorf("[message] required property is missing")
 				}
-				rounding, _ := specMap["date_rounding"].(string)
-				if strings.TrimSpace(rounding) == "" {
-					return fmt.Errorf("[date_rounding] required property is missing")
+			case "pipeline":
+				if _, err := reqStr("name"); err != nil {
+					return err
 				}
-				switch rounding {
-				case "y", "M", "w", "d", "h", "m", "s":
-				default:
-					return fmt.Errorf("invalid date rounding [%s], valid values are [y, M, w, d, h, m, s]", rounding)
+			case "script":
+				src, _ := specMap["source"].(string)
+				inl, _ := specMap["inline"].(string)
+				id, _ := specMap["id"].(string)
+				if strings.TrimSpace(src) == "" && strings.TrimSpace(inl) == "" && strings.TrimSpace(id) == "" {
+					return fmt.Errorf("must specify either [source] or [id]")
 				}
 			case "enrich":
-				pn, _ := specMap["policy_name"].(string)
-				if strings.TrimSpace(pn) == "" {
-					return fmt.Errorf("[policy_name] required property is missing")
+				if _, err := reqStr("policy_name"); err != nil {
+					return err
 				}
-				field, _ := specMap["field"].(string)
-				if strings.TrimSpace(field) == "" {
-					return fmt.Errorf("[field] required property is missing")
+				if _, err := reqStr("field"); err != nil {
+					return err
 				}
-				tf, _ := specMap["target_field"].(string)
-				if strings.TrimSpace(tf) == "" {
-					return fmt.Errorf("[target_field] required property is missing")
+				if _, err := reqStr("target_field"); err != nil {
+					return err
 				}
 				if rawMM, hasMM := specMap["max_matches"]; hasMM && rawMM != nil {
 					mm, ok := toInt64(rawMM)
@@ -1447,18 +1662,34 @@ func validateIngestPipelineProcessors(procs []any) error {
 					}
 				}
 			case "foreach":
-				if subProc, ok := specMap["processor"].(map[string]any); ok && subProc != nil {
+				if _, err := reqStr("field"); err != nil {
+					return err
+				}
+				subProc, hasSubProc := specMap["processor"].(map[string]any)
+				subProcs, hasSubProcs := specMap["processors"].([]any)
+				if (!hasSubProc || subProc == nil) && (!hasSubProcs || len(subProcs) == 0) {
+					return fmt.Errorf("[processor] required property is missing")
+				}
+				if hasSubProc && subProc != nil {
 					if err := validateIngestPipelineProcessors([]any{subProc}); err != nil {
 						return err
 					}
 				}
-				if subProcs, ok := specMap["processors"].([]any); ok {
+				if hasSubProcs {
 					if err := validateIngestPipelineProcessors(subProcs); err != nil {
 						return err
 					}
 				}
+			case "inference":
+				if _, err := reqStr("model_id"); err != nil {
+					return err
+				}
 			}
-			if onFail, ok := specMap["on_failure"].([]any); ok {
+			if rawOnFail, hasOnFail := specMap["on_failure"]; hasOnFail && rawOnFail != nil {
+				onFail, ok := rawOnFail.([]any)
+				if !ok {
+					return fmt.Errorf("[on_failure] property isn't a list")
+				}
 				if err := validateIngestPipelineProcessors(onFail); err != nil {
 					return err
 				}
@@ -1486,7 +1717,11 @@ func validateIngestPipelineSpec(body map[string]any) error {
 	if err := validateIngestPipelineProcessors(procs); err != nil {
 		return err
 	}
-	if onFail, ok := body["on_failure"].([]any); ok {
+	if rawOnFail, hasOnFail := body["on_failure"]; hasOnFail && rawOnFail != nil {
+		onFail, ok := rawOnFail.([]any)
+		if !ok {
+			return fmt.Errorf("[on_failure] property isn't a list")
+		}
 		if err := validateIngestPipelineProcessors(onFail); err != nil {
 			return err
 		}
@@ -1725,7 +1960,10 @@ func rewriteIngestCtxReferencesWithOp(s string, preserveOp bool) string {
 				}
 				mapMethods := []string{
 					"putIfAbsent", "putAll", "put", "remove",
-					"getOrDefault", "get", "containsKey",
+					"getOrDefault", "get", "containsKey", "containsValue",
+					"clear", "replaceAll", "replace", "isEmpty", "size",
+					"keySet", "values", "entrySet", "forEach",
+					"computeIfAbsent", "computeIfPresent", "compute", "merge",
 				}
 				for _, mm := range mapMethods {
 					if strings.HasPrefix(after, mm) {
@@ -2239,7 +2477,7 @@ func compileGrokRegex(pat string, customDefs map[string]any) (*regexp.Regexp, ma
 
 func convertESDateFormatToGoLayouts(esFmt string) []string {
 	switch esFmt {
-	case "ISO8601", "strict_date_optional_time", "date_optional_time":
+	case "ISO8601", "strict_date_optional_time", "date_optional_time", "strict_date_optional_time_nanos":
 		return []string{
 			time.RFC3339Nano,
 			time.RFC3339,
@@ -2247,7 +2485,12 @@ func convertESDateFormatToGoLayouts(esFmt string) []string {
 			"2006-01-02T15:04:05Z0700",
 			"2006-01-02T15:04:05.000Z0700",
 			"2006-01-02T15:04:05.000Z07:00",
+			"2006-01-02T15:04:05,000Z0700",
+			"2006-01-02T15:04:05,000Z07:00",
+			"2006-01-02T15:04:05,999999999Z07:00",
+			"2006-01-02T15:04:05,999999999Z0700",
 			"2006-01-02T15:04:05.000",
+			"2006-01-02T15:04:05,000",
 			"2006-01-02T15:04:05",
 			"2006-01-02 15:04:05",
 			"2006-01-02",
@@ -2256,8 +2499,51 @@ func convertESDateFormatToGoLayouts(esFmt string) []string {
 		return []string{"UNIX"}
 	case "UNIX_MS", "epoch_millis":
 		return []string{"UNIX_MS"}
+	case "basic_date", "strict_basic_date":
+		return []string{"20060102"}
+	case "basic_date_time", "strict_basic_date_time":
+		return []string{
+			"20060102T150405.000Z0700",
+			"20060102T150405.000Z07:00",
+			"20060102T150405.999999999Z0700",
+			"20060102T150405.999999999Z07:00",
+		}
+	case "basic_date_time_no_millis", "strict_basic_date_time_no_millis":
+		return []string{
+			"20060102T150405Z0700",
+			"20060102T150405Z07:00",
+		}
+	case "date", "strict_date", "year_month_day", "strict_year_month_day":
+		return []string{"2006-01-02"}
+	case "date_time", "strict_date_time":
+		return []string{
+			time.RFC3339Nano,
+			"2006-01-02T15:04:05.000Z07:00",
+			"2006-01-02T15:04:05.000Z0700",
+			"2006-01-02T15:04:05.999999999Z0700",
+		}
+	case "date_time_no_millis", "strict_date_time_no_millis":
+		return []string{
+			time.RFC3339,
+			"2006-01-02T15:04:05Z07:00",
+			"2006-01-02T15:04:05Z0700",
+			"2006-01-02T15:04:05",
+		}
+	case "date_hour_minute_second", "strict_date_hour_minute_second":
+		return []string{"2006-01-02T15:04:05"}
+	case "date_hour_minute_second_millis", "strict_date_hour_minute_second_millis", "date_hour_minute_second_fraction", "strict_date_hour_minute_second_fraction":
+		return []string{"2006-01-02T15:04:05.000", "2006-01-02T15:04:05.999999999"}
+	case "rfc_1123_date_time":
+		return []string{
+			time.RFC1123,
+			time.RFC1123Z,
+			"Mon, 2 Jan 2006 15:04:05 MST",
+			"Mon, 2 Jan 2006 15:04:05 -0700",
+		}
 	}
 	r := strings.NewReplacer(
+		"uuuu", "2006",
+		"uu", "06",
 		"yyyy", "2006",
 		"yy", "06",
 		"MMMM", "January",
@@ -2280,10 +2566,16 @@ func convertESDateFormatToGoLayouts(esFmt string) []string {
 		"SS", "00",
 		"S", "0",
 		"a", "PM",
+		"xxxx", "Z0700",
+		"xxx", "Z07:00",
+		"xx", "Z0700",
+		"x", "Z07",
 		"XXX", "Z07:00",
 		"XX", "Z0700",
 		"X", "Z07",
 		"Z", "Z0700",
+		"zzz", "MST",
+		"z", "MST",
 	)
 	var b strings.Builder
 	inQuote := false
@@ -2293,7 +2585,7 @@ func convertESDateFormatToGoLayouts(esFmt string) []string {
 		if esFmt[i] == '\'' {
 			if !inQuote {
 				unquoted := esFmt[segStart:i]
-				if strings.Contains(unquoted, "Z") {
+				if strings.ContainsAny(unquoted, "ZxX") {
 					hasUnquotedZ = true
 				}
 				b.WriteString(r.Replace(unquoted))
@@ -2323,7 +2615,7 @@ func convertESDateFormatToGoLayouts(esFmt string) []string {
 		if inQuote {
 			b.WriteString(rem)
 		} else {
-			if strings.Contains(rem, "Z") {
+			if strings.ContainsAny(rem, "ZxX") {
 				hasUnquotedZ = true
 			}
 			b.WriteString(r.Replace(rem))
@@ -2331,14 +2623,21 @@ func convertESDateFormatToGoLayouts(esFmt string) []string {
 	}
 	layout := b.String()
 	layouts := []string{layout}
-	flexFrac := strings.NewReplacer("000000000", "999999999", "000000", "999999", "000", "999").Replace(layout)
+	flexFrac := strings.NewReplacer(
+		".000000000", ".999999999",
+		".000000", ".999999",
+		".000", ".999",
+		",000000000", ",999999999",
+		",000000", ",999999",
+		",000", ",999",
+	).Replace(layout)
 	if flexFrac != layout {
 		layouts = append(layouts, flexFrac)
 	}
 	if hasUnquotedZ {
-		layouts = append(layouts, strings.ReplaceAll(layout, "Z0700", "Z07:00"))
+		layouts = append(layouts, strings.ReplaceAll(layout, "Z0700", "Z07:00"), strings.ReplaceAll(layout, "Z07:00", "Z0700"))
 		if flexFrac != layout {
-			layouts = append(layouts, strings.ReplaceAll(flexFrac, "Z0700", "Z07:00"))
+			layouts = append(layouts, strings.ReplaceAll(flexFrac, "Z0700", "Z07:00"), strings.ReplaceAll(flexFrac, "Z07:00", "Z0700"))
 		}
 	}
 	return layouts
@@ -2371,32 +2670,53 @@ func isNumericIngestDateValue(val any) bool {
 	}
 }
 
-func parseIngestDateValue(raw string, formats []any, tzName string) (time.Time, error) {
-	loc := time.UTC
-	if tzName != "" {
-		if l, err := time.LoadLocation(tzName); err == nil {
-			loc = l
-		} else if len(tzName) == 6 && (tzName[0] == '+' || tzName[0] == '-') && tzName[3] == ':' {
-			h, err1 := strconv.Atoi(tzName[1:3])
-			m, err2 := strconv.Atoi(tzName[4:6])
-			if err1 == nil && err2 == nil {
-				offset := (h*3600 + m*60)
-				if tzName[0] == '-' {
-					offset = -offset
-				}
-				loc = time.FixedZone(tzName, offset)
+func parseIngestTimezone(tzName string) (*time.Location, error) {
+	tzName = strings.TrimSpace(tzName)
+	if tzName == "" || strings.EqualFold(tzName, "UTC") || strings.EqualFold(tzName, "Z") || strings.EqualFold(tzName, "GMT") {
+		return time.UTC, nil
+	}
+	if l, err := time.LoadLocation(tzName); err == nil {
+		return l, nil
+	}
+	if len(tzName) == 6 && (tzName[0] == '+' || tzName[0] == '-') && tzName[3] == ':' {
+		h, err1 := strconv.Atoi(tzName[1:3])
+		m, err2 := strconv.Atoi(tzName[4:6])
+		if err1 == nil && err2 == nil && h >= 0 && h <= 18 && m >= 0 && m <= 59 {
+			offset := h*3600 + m*60
+			if tzName[0] == '-' {
+				offset = -offset
 			}
-		} else if len(tzName) == 5 && (tzName[0] == '+' || tzName[0] == '-') {
-			h, err1 := strconv.Atoi(tzName[1:3])
-			m, err2 := strconv.Atoi(tzName[3:5])
-			if err1 == nil && err2 == nil {
-				offset := (h*3600 + m*60)
-				if tzName[0] == '-' {
-					offset = -offset
-				}
-				loc = time.FixedZone(tzName, offset)
-			}
+			return time.FixedZone(tzName, offset), nil
 		}
+	}
+	if len(tzName) == 5 && (tzName[0] == '+' || tzName[0] == '-') {
+		h, err1 := strconv.Atoi(tzName[1:3])
+		m, err2 := strconv.Atoi(tzName[3:5])
+		if err1 == nil && err2 == nil && h >= 0 && h <= 18 && m >= 0 && m <= 59 {
+			offset := h*3600 + m*60
+			if tzName[0] == '-' {
+				offset = -offset
+			}
+			return time.FixedZone(tzName, offset), nil
+		}
+	}
+	if len(tzName) == 3 && (tzName[0] == '+' || tzName[0] == '-') {
+		h, err1 := strconv.Atoi(tzName[1:3])
+		if err1 == nil && h >= 0 && h <= 18 {
+			offset := h * 3600
+			if tzName[0] == '-' {
+				offset = -offset
+			}
+			return time.FixedZone(tzName, offset), nil
+		}
+	}
+	return nil, fmt.Errorf("illegal_argument_exception: timezone [%s] is not supported", tzName)
+}
+
+func parseIngestDateValue(raw string, formats []any, tzName string) (time.Time, error) {
+	loc, err := parseIngestTimezone(tzName)
+	if err != nil {
+		return time.Time{}, err
 	}
 	if len(formats) == 0 {
 		formats = []any{"ISO8601"}
@@ -2429,6 +2749,157 @@ func parseIngestDateValue(raw string, formats []any, tzName string) (time.Time, 
 		}
 	}
 	return time.Time{}, fmt.Errorf("unable to parse date [%s]", raw)
+}
+
+func normalizeFingerprintMethod(raw string) string {
+	m := strings.ToUpper(strings.TrimSpace(raw))
+	if atIdx := strings.IndexByte(m, '@'); atIdx >= 0 {
+		m = strings.TrimSpace(m[:atIdx])
+	}
+	switch m {
+	case "SHA1":
+		return "SHA-1"
+	case "", "SHA256":
+		return "SHA-256"
+	case "SHA384":
+		return "SHA-384"
+	case "SHA512":
+		return "SHA-512"
+	}
+	return m
+}
+
+func murmur3Sum128(data []byte) [16]byte {
+	const (
+		c1 uint64 = 0x87c37b91114253d5
+		c2 uint64 = 0x4cf5ad432745937f
+	)
+	rotl64 := func(x uint64, r uint) uint64 {
+		return (x << r) | (x >> (64 - r))
+	}
+	fmix64 := func(k uint64) uint64 {
+		k ^= k >> 33
+		k *= 0xff51afd7ed558ccd
+		k ^= k >> 33
+		k *= 0xc4ceb9fe1a85ec53
+		k ^= k >> 33
+		return k
+	}
+	var h1, h2 uint64
+	nblocks := len(data) / 16
+	for i := 0; i < nblocks; i++ {
+		off := i * 16
+		k1 := uint64(data[off]) | uint64(data[off+1])<<8 | uint64(data[off+2])<<16 | uint64(data[off+3])<<24 |
+			uint64(data[off+4])<<32 | uint64(data[off+5])<<40 | uint64(data[off+6])<<48 | uint64(data[off+7])<<56
+		k2 := uint64(data[off+8]) | uint64(data[off+9])<<8 | uint64(data[off+10])<<16 | uint64(data[off+11])<<24 |
+			uint64(data[off+12])<<32 | uint64(data[off+13])<<40 | uint64(data[off+14])<<48 | uint64(data[off+15])<<56
+		k1 *= c1
+		k1 = rotl64(k1, 31)
+		k1 *= c2
+		h1 ^= k1
+		h1 = rotl64(h1, 27)
+		h1 += h2
+		h1 = h1*5 + 0x52dce729
+
+		k2 *= c2
+		k2 = rotl64(k2, 33)
+		k2 *= c1
+		h2 ^= k2
+		h2 = rotl64(h2, 31)
+		h2 += h1
+		h2 = h2*5 + 0x38495ab5
+	}
+	tail := data[nblocks*16:]
+	var k1, k2 uint64
+	switch len(tail) {
+	case 15:
+		k2 ^= uint64(tail[14]) << 48
+		fallthrough
+	case 14:
+		k2 ^= uint64(tail[13]) << 40
+		fallthrough
+	case 13:
+		k2 ^= uint64(tail[12]) << 32
+		fallthrough
+	case 12:
+		k2 ^= uint64(tail[11]) << 24
+		fallthrough
+	case 11:
+		k2 ^= uint64(tail[10]) << 16
+		fallthrough
+	case 10:
+		k2 ^= uint64(tail[9]) << 8
+		fallthrough
+	case 9:
+		k2 ^= uint64(tail[8])
+		k2 *= c2
+		k2 = rotl64(k2, 33)
+		k2 *= c1
+		h2 ^= k2
+		fallthrough
+	case 8:
+		k1 ^= uint64(tail[7]) << 56
+		fallthrough
+	case 7:
+		k1 ^= uint64(tail[6]) << 48
+		fallthrough
+	case 6:
+		k1 ^= uint64(tail[5]) << 40
+		fallthrough
+	case 5:
+		k1 ^= uint64(tail[4]) << 32
+		fallthrough
+	case 4:
+		k1 ^= uint64(tail[3]) << 24
+		fallthrough
+	case 3:
+		k1 ^= uint64(tail[2]) << 16
+		fallthrough
+	case 2:
+		k1 ^= uint64(tail[1]) << 8
+		fallthrough
+	case 1:
+		k1 ^= uint64(tail[0])
+		k1 *= c1
+		k1 = rotl64(k1, 31)
+		k1 *= c2
+		h1 ^= k1
+	}
+	dataLen := uint64(len(data)) // #nosec G115 -- slice length is non-negative
+	h1 ^= dataLen
+	h2 ^= dataLen
+	h1 += h2
+	h2 += h1
+	h1 = fmix64(h1)
+	h2 = fmix64(h2)
+	h1 += h2
+	h2 += h1
+	var out [16]byte
+	for i := uint(0); i < 8; i++ {
+		out[i] = byte((h1 >> (i * 8)) & 0xFF)   // #nosec G115 -- masked to 8 bits
+		out[8+i] = byte((h2 >> (i * 8)) & 0xFF) // #nosec G115 -- masked to 8 bits
+	}
+	return out
+}
+
+func unescapeKVQuotedString(s string) string {
+	if strings.IndexByte(s, '\\') < 0 {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			next := s[i+1]
+			if next == '"' || next == '\'' || next == '\\' {
+				b.WriteByte(next)
+				i++
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 var reHTMLTags = regexp.MustCompile(`<[^>]*>`)
@@ -3611,10 +4082,47 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				if valueSplit != "=" && valueSplit != ":" && valueSplit != "|" && valueSplit != "." {
 					valSplitRe, _ = regexp.Compile(valueSplit)
 				}
+				hasMatchingOuterKVBrackets := func(s string, openB, closeB byte) bool {
+					depth := 0
+					inQuote := byte(0)
+					escaped := false
+					for i := 0; i < len(s); i++ {
+						ch := s[i]
+						if escaped {
+							escaped = false
+							continue
+						}
+						if ch == '\\' && inQuote != 0 {
+							escaped = true
+							continue
+						}
+						if inQuote != 0 {
+							if ch == inQuote {
+								inQuote = 0
+							}
+							continue
+						}
+						if ch == '"' || ch == '\'' {
+							inQuote = ch
+							continue
+						}
+						switch ch {
+						case openB:
+							depth++
+						case closeB:
+							depth--
+							if depth == 0 {
+								return i == len(s)-1
+							}
+						}
+					}
+					return false
+				}
 				stripKVEnclosingBrackets := func(s string) string {
 					for len(s) >= 2 {
 						first, last := s[0], s[len(s)-1]
-						if (first == '[' && last == ']') || (first == '(' && last == ')') || (first == '<' && last == '>') || (first == '{' && last == '}') {
+						if ((first == '[' && last == ']') || (first == '(' && last == ')') || (first == '<' && last == '>') || (first == '{' && last == '}')) &&
+							hasMatchingOuterKVBrackets(s, first, last) {
 							s = s[1 : len(s)-1]
 						} else {
 							break
@@ -3653,6 +4161,9 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 							v = pair[idx+len(valueSplit):]
 						}
 						k = strings.TrimSpace(k)
+						if stripBrackets {
+							k = stripKVEnclosingBrackets(k)
+						}
 						if trimKey != "" {
 							k = strings.Trim(k, trimKey)
 						}
@@ -3666,7 +4177,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						if len(v) >= 2 {
 							first, last := v[0], v[len(v)-1]
 							if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
-								v = v[1 : len(v)-1]
+								v = unescapeKVQuotedString(v[1 : len(v)-1])
 							} else if stripBrackets {
 								v = stripKVEnclosingBrackets(v)
 							}
@@ -4025,7 +4536,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 		outFmt, _ := specMap["output_format"].(string)
 		formatOneDate := func(rawVal any) (string, error) {
-			parsedTime, err := parseIngestDateValue(fmt.Sprintf("%v", rawVal), formats, tzName)
+			parsedTime, err := parseIngestDateValue(formatIngestDateInput(rawVal), formats, tzName)
 			if err != nil {
 				return "", err
 			}
@@ -4424,7 +4935,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			if hasAny {
 				buf.WriteString("|")
 				var digest []byte
-				switch strings.ToUpper(strings.TrimSpace(method)) {
+				switch normalizeFingerprintMethod(method) {
 				case "MD5":
 					// #nosec G401 -- Elasticsearch ingest fingerprint processor supports MD5
 					sum := md5.Sum([]byte(buf.String()))
@@ -4441,6 +4952,9 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					digest = sum[:]
 				case "SHA-512":
 					sum := sha512.Sum512([]byte(buf.String()))
+					digest = sum[:]
+				case "MURMUR3":
+					sum := murmur3Sum128([]byte(buf.String()))
 					digest = sum[:]
 				default:
 					return false, false, procType, procTag, specMap, fmt.Errorf("unsupported fingerprint method [%s]", method)
@@ -4571,6 +5085,22 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		if ic, ok := toInt64(specMap["indexed_chars"]); ok {
 			indexedChars = int(ic)
 		}
+		if icField, _ := specMap["indexed_chars_field"].(string); strings.TrimSpace(icField) != "" {
+			if icVal, exists := getIngestPath(doc, expandIngestFieldName(icField, doc)); exists && icVal != nil {
+				if ic, ok := toInt64(icVal); ok {
+					indexedChars = int(ic)
+				}
+			}
+		}
+		var allowedProps map[string]bool
+		if propsAny, ok := specMap["properties"].([]any); ok && len(propsAny) > 0 {
+			allowedProps = make(map[string]bool, len(propsAny))
+			for _, p := range propsAny {
+				if ps, ok := p.(string); ok && strings.TrimSpace(ps) != "" {
+					allowedProps[strings.TrimSpace(ps)] = true
+				}
+			}
+		}
 		if field != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
 				rawB64 := strings.TrimSpace(fmt.Sprintf("%v", val))
@@ -4597,6 +5127,13 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					"content":        content,
 					"content_length": origRuneLen,
 					"content_type":   http.DetectContentType(decoded),
+				}
+				if allowedProps != nil {
+					for k := range attMap {
+						if !allowedProps[k] {
+							delete(attMap, k)
+						}
+					}
 				}
 				setIngestPath(doc, target, attMap)
 				if removeBinary && field != target {
@@ -4764,35 +5301,62 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				}
 				if browserVer != "" {
 					uaMap["version"] = browserVer
+					vParts := strings.Split(browserVer, ".")
+					if len(vParts) >= 1 && vParts[0] != "" {
+						uaMap["major"] = vParts[0]
+					}
+					if len(vParts) >= 2 && vParts[1] != "" {
+						uaMap["minor"] = vParts[1]
+					}
+					if len(vParts) >= 3 && vParts[2] != "" {
+						uaMap["patch"] = vParts[2]
+					}
 				}
 				osMap := map[string]any{"name": "Other"}
+				var osVer string
 				switch {
 				case strings.Contains(uaStr, "iPhone") || strings.Contains(uaStr, "iPad") || strings.Contains(uaStr, "iPod"):
 					osMap["name"] = "iOS"
 					if ver := extractUATokenVersion(uaStr, "OS "); ver != "" {
+						osVer = ver
 						osMap["version"] = ver
 						osMap["full"] = "iOS " + ver
 					}
 				case strings.Contains(uaStr, "Android"):
 					osMap["name"] = "Android"
 					if ver := extractUATokenVersion(uaStr, "Android "); ver != "" {
+						osVer = ver
 						osMap["version"] = ver
 						osMap["full"] = "Android " + ver
 					}
 				case strings.Contains(uaStr, "Mac OS X"):
 					osMap["name"] = "Mac OS X"
 					if ver := extractUATokenVersion(uaStr, "Mac OS X "); ver != "" {
+						osVer = ver
 						osMap["version"] = ver
 						osMap["full"] = "Mac OS X " + ver
 					}
 				case strings.Contains(uaStr, "Windows"):
 					osMap["name"] = "Windows"
 					if ver := extractUATokenVersion(uaStr, "Windows NT "); ver != "" {
+						osVer = ver
 						osMap["version"] = ver
 						osMap["full"] = "Windows " + ver
 					}
 				case strings.Contains(uaStr, "Linux"):
 					osMap["name"] = "Linux"
+				}
+				if osVer != "" {
+					osParts := strings.Split(osVer, ".")
+					if len(osParts) >= 1 && osParts[0] != "" {
+						osMap["major"] = osParts[0]
+					}
+					if len(osParts) >= 2 && osParts[1] != "" {
+						osMap["minor"] = osParts[1]
+					}
+					if len(osParts) >= 3 && osParts[2] != "" {
+						osMap["patch"] = osParts[2]
+					}
 				}
 				uaMap["os"] = osMap
 				switch {
@@ -4802,6 +5366,54 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					uaMap["device"] = map[string]any{"name": "iPad"}
 				case strings.Contains(uaStr, "Macintosh"):
 					uaMap["device"] = map[string]any{"name": "Mac"}
+				}
+				if propsAny, ok := specMap["properties"].([]any); ok && len(propsAny) > 0 {
+					allowed := make(map[string]bool, len(propsAny))
+					for _, p := range propsAny {
+						if ps, ok := p.(string); ok && strings.TrimSpace(ps) != "" {
+							allowed[strings.ToLower(strings.TrimSpace(ps))] = true
+						}
+					}
+					filtered := make(map[string]any)
+					if allowed["original"] {
+						filtered["original"] = uaMap["original"]
+					}
+					if allowed["name"] {
+						filtered["name"] = uaMap["name"]
+					}
+					if allowed["version"] && uaMap["version"] != nil {
+						filtered["version"] = uaMap["version"]
+					}
+					if allowed["major"] && uaMap["major"] != nil {
+						filtered["major"] = uaMap["major"]
+					}
+					if allowed["minor"] && uaMap["minor"] != nil {
+						filtered["minor"] = uaMap["minor"]
+					}
+					if allowed["patch"] && uaMap["patch"] != nil {
+						filtered["patch"] = uaMap["patch"]
+					}
+					if allowed["device"] {
+						filtered["device"] = uaMap["device"]
+					}
+					if allowed["os"] {
+						filtered["os"] = osMap
+					} else if allowed["os_name"] || allowed["os_major"] || allowed["os_minor"] {
+						subOS := make(map[string]any)
+						if allowed["os_name"] && osMap["name"] != nil {
+							subOS["name"] = osMap["name"]
+						}
+						if allowed["os_major"] && osMap["major"] != nil {
+							subOS["major"] = osMap["major"]
+						}
+						if allowed["os_minor"] && osMap["minor"] != nil {
+							subOS["minor"] = osMap["minor"]
+						}
+						if len(subOS) > 0 {
+							filtered["os"] = subOS
+						}
+					}
+					uaMap = filtered
 				}
 				setIngestPath(doc, target, uaMap)
 				mutated = true

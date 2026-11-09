@@ -74,7 +74,7 @@ func TestRound19_ScriptSortSearchAfterAndMissing(t *testing.T) {
 	page1 := doJSON(t, srv, http.MethodPost, "/r19_script_sort/_search", `{
 		"size": 2,
 		"sort": [
-			{"_script": {"script": "doc['price'].value * 2", "order": "asc", "missing": -5}},
+			{"_script": {"type": "number", "script": "doc['price'].value * 2", "order": "asc", "missing": -5}},
 			{"_id": "asc"}
 		]
 	}`)
@@ -94,7 +94,7 @@ func TestRound19_ScriptSortSearchAfterAndMissing(t *testing.T) {
 	page2 := doJSON(t, srv, http.MethodPost, "/r19_script_sort/_search", `{
 		"size": 2,
 		"sort": [
-			{"_script": {"script": "doc['price'].value * 2", "order": "asc", "missing": -5}},
+			{"_script": {"type": "number", "script": "doc['price'].value * 2", "order": "asc", "missing": -5}},
 			{"_id": "asc"}
 		],
 		"search_after": [20, "1"]
@@ -384,7 +384,7 @@ func TestRound19_MultiIndexEmptyShardMetricsAndRuntimeSubAggs(t *testing.T) {
 				"top_metrics": {
 					"metrics": {"field": "price"},
 					"sort": [
-						{"_script": {"script": "int p = (int) doc['price'].value; return p * 2;", "order": "desc"}}
+						{"_script": {"type": "number", "script": "int p = (int) doc['price'].value; return p * 2;", "order": "desc"}}
 					]
 				}
 			}

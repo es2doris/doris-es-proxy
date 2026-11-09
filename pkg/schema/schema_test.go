@@ -2296,3 +2296,107 @@ func TestRound52SchemaAndShredderF15ToF17(t *testing.T) {
 		t.Fatalf("F17 expected MaxUint64 clamped to MaxInt64 in f__u, got %s", string(rowMaxUL))
 	}
 }
+
+func TestRound53SchemaAndShredderF15F16(t *testing.T) {
+	// F15: ValidateMappingSpec rejects unknown types, invalid dynamic modes, bad dense_vector dims/similarity,
+	// null_value on text/flattened/nested/object, negative ignore_above, invalid index_prefixes, and invalid join relations.
+	for _, badMapping := range []string{
+		`{"properties":{"f":{"type":"nonexistent_type"}}}`,
+		`{"dynamic":"bogus","properties":{"f":{"type":"keyword"}}}`,
+		`{"properties":{"obj":{"type":"object","dynamic":"bogus"}}}`,
+		`{"properties":{"vec":{"type":"dense_vector","dims":0}}}`,
+		`{"properties":{"vec":{"type":"dense_vector","dims":5000}}}`,
+		`{"properties":{"vec":{"type":"dense_vector","dims":3,"similarity":"manhattan"}}}`,
+		`{"properties":{"txt":{"type":"text","null_value":"N/A"}}}`,
+		`{"properties":{"flat":{"type":"flattened","null_value":"N/A"}}}`,
+		`{"properties":{"nest":{"type":"nested","null_value":"N/A"}}}`,
+		`{"properties":{"obj":{"type":"object","null_value":"N/A"}}}`,
+		`{"properties":{"kw":{"type":"keyword","ignore_above":-5}}}`,
+		`{"properties":{"txt":{"type":"text","index_prefixes":{"min_chars":0,"max_chars":5}}}}`,
+		`{"properties":{"txt":{"type":"text","index_prefixes":{"min_chars":2,"max_chars":20}}}}`,
+		`{"properties":{"txt":{"type":"text","index_prefixes":{"min_chars":6,"max_chars":3}}}}`,
+		`{"properties":{"txt":{"type":"text","index_prefixes":{"unknown":1}}}}`,
+		`{"properties":{"j":{"type":"join"}}}`,
+		`{"properties":{"j":{"type":"join","relations":{}}}}`,
+		`{"properties":{"j":{"type":"join","relations":{"q":""}}}}`,
+		`{"properties":{"j":{"type":"join","relations":{"q":"q"}}}}`,
+	} {
+		var ms esast.MappingSpec
+		if err := json.Unmarshal([]byte(badMapping), &ms); err != nil {
+			t.Fatalf("unmarshal mapping %s failed: %v", badMapping, err)
+		}
+		if err := ValidateMappingSpec(&ms); err == nil {
+			t.Fatalf("F15 expected ValidateMappingSpec error for %s", badMapping)
+		}
+	}
+
+	// Valid F15 & F16 mapping with sparse_vector, rank_features, dense_vector, index_prefixes, join
+	var validSpec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"dynamic": "strict",
+		"properties": {
+			"ml_tokens": {"type": "sparse_vector"},
+			"topics":    {"type": "rank_features"},
+			"vec":       {"type": "dense_vector", "dims": 3, "similarity": "dot_product"},
+			"title":     {"type": "text", "index_prefixes": {"min_chars": 2, "max_chars": 5}},
+			"rel":       {"type": "join", "relations": {"question": ["answer", "comment"]}},
+			"items": {
+				"type": "nested",
+				"properties": {
+					"sub_tokens": {"type": "sparse_vector"}
+				}
+			}
+		}
+	}`), &validSpec); err != nil {
+		t.Fatalf("unmarshal validSpec failed: %v", err)
+	}
+	if err := ValidateMappingSpec(&validSpec); err != nil {
+		t.Fatalf("F15 expected validSpec to pass ValidateMappingSpec, got %v", err)
+	}
+
+	// F16: CompileIndexSchema & ResolveField for sparse_vector / rank_features + sub-key resolution + ShredDocument validation
+	sch := CompileIndexSchema("db", "r53_sparse_idx", &validSpec)
+	if b := sch.ResolveField("ml_tokens"); b.ESType != "sparse_vector" || b.Kind != StorageDynamicVariant {
+		t.Fatalf("F16 expected ml_tokens ESType=sparse_vector StorageDynamicVariant, got %+v", b)
+	}
+	if b := sch.ResolveField("ml_tokens.shoes"); b.ESType != "sparse_vector" || b.ESFieldPath != "ml_tokens.shoes" || b.DorisType != DorisDouble {
+		t.Fatalf("F16 expected ml_tokens.shoes to resolve as sparse_vector DorisDouble sub-key, got %+v", b)
+	}
+	if b := sch.ResolveField("topics.sports"); b.ESType != "rank_features" || b.ESFieldPath != "topics.sports" || b.DorisType != DorisDouble {
+		t.Fatalf("F16 expected topics.sports to resolve as rank_features DorisDouble sub-key, got %+v", b)
+	}
+	if b := sch.ResolveField("items.sub_tokens.boots"); b.ESType != "sparse_vector" || b.NestedPath != "items" {
+		t.Fatalf("F16 expected items.sub_tokens.boots to preserve NestedPath='items', got %+v", b)
+	}
+
+	// Shred valid sparse_vector & rank_features document under dynamic: "strict"
+	shredOK, err := ShredDocument(sch, "1", 1, false, []byte(`{
+		"ml_tokens": {"shoes": 1.5, "running": "0.75"},
+		"topics": {"sports": 2.5},
+		"vec": [0.1, 0.2, 0.3],
+		"title": "running shoes",
+		"rel": "question",
+		"items": [{"sub_tokens": {"boots": 1.2}}]
+	}`))
+	if err != nil {
+		t.Fatalf("F16 ShredDocument valid sparse_vector/rank_features failed: %v", err)
+	}
+	if !strings.Contains(string(shredOK), `"running":0.75`) {
+		t.Fatalf("F16 expected numeric string token weight coerced to float 0.75, got %s", string(shredOK))
+	}
+
+	// Shred invalid sparse_vector & rank_features documents
+	for _, badDoc := range []string{
+		`{"ml_tokens": "not_an_object"}`,
+		`{"ml_tokens": ["a", "b"]}`,
+		`{"ml_tokens": {"shoes": "not_a_number"}}`,
+		`{"ml_tokens": {"": 1.0}}`,
+		`{"topics": {"sports": 0}}`,
+		`{"topics": {"sports": -1.5}}`,
+		`{"items": [{"sub_tokens": "bad"}]}`,
+	} {
+		if _, err := ShredDocument(sch, "2", 1, false, []byte(badDoc)); err == nil || !strings.Contains(err.Error(), "mapper_parsing_exception") {
+			t.Fatalf("F16 expected mapper_parsing_exception for %s, got %v", badDoc, err)
+		}
+	}
+}

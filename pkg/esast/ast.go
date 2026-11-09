@@ -43,6 +43,10 @@ func NextAutoID() string {
 // SearchRequest models an Elasticsearch / OpenSearch `/_search` request payload.
 type SearchRequest struct {
 	Query            *Query                   `json:"query,omitempty"`
+	Retriever        *RetrieverSpec           `json:"-"`
+	SubSearches      []SubSearchSpec          `json:"sub_searches,omitempty"`
+	Rank             *RankSpec                `json:"rank,omitempty"`
+	retrieverLowered bool                     `json:"-"`
 	AliasFilter      *Query                   `json:"-"`
 	Routing          string                   `json:"-"`
 	KNN              KNNSlice                 `json:"knn,omitempty"`
@@ -75,8 +79,350 @@ type SearchRequest struct {
 	Suggest          map[string]SuggestSpec   `json:"suggest,omitempty"`
 }
 
+// SubSearchSpec models an entry in `sub_searches`.
+type SubSearchSpec struct {
+	Query *Query `json:"query,omitempty"`
+}
+
+// RankSpec models top-level `rank` in a search request.
+type RankSpec struct {
+	RRF *RRFSpec `json:"rrf,omitempty"`
+}
+
+// RRFSpec models reciprocal rank fusion parameters.
+type RRFSpec struct {
+	WindowSize   *int `json:"window_size,omitempty"`
+	RankConstant *int `json:"rank_constant,omitempty"`
+}
+
+// RetrieverSpec models an Elasticsearch 8.x `retriever` tree node.
+type RetrieverSpec struct {
+	Standard               *StandardRetrieverSpec               `json:"standard,omitempty"`
+	KNN                    *KNNRetrieverSpec                    `json:"knn,omitempty"`
+	RRF                    *RRFRetrieverSpec                    `json:"rrf,omitempty"`
+	Rule                   *RuleRetrieverSpec                   `json:"rule,omitempty"`
+	TextSimilarityReranker *TextSimilarityRerankerRetrieverSpec `json:"text_similarity_reranker,omitempty"`
+}
+
+type StandardRetrieverSpec struct {
+	Query    *Query        `json:"query,omitempty"`
+	Filter   QuerySlice    `json:"filter,omitempty"`
+	Collapse *CollapseSpec `json:"collapse,omitempty"`
+	MinScore *float64      `json:"min_score,omitempty"`
+}
+
+type KNNRetrieverSpec struct {
+	Field              string         `json:"field"`
+	QueryVector        []float64      `json:"query_vector,omitempty"`
+	QueryVectorBuilder map[string]any `json:"query_vector_builder,omitempty"`
+	K                  int            `json:"k,omitempty"`
+	NumCandidates      int            `json:"num_candidates,omitempty"`
+	Filter             QuerySlice     `json:"filter,omitempty"`
+	Similarity         *float64       `json:"similarity,omitempty"`
+	Boost              *float64       `json:"boost,omitempty"`
+	Name               string         `json:"_name,omitempty"`
+}
+
+type RRFRetrieverSpec struct {
+	Retrievers     []RetrieverSpec `json:"retrievers"`
+	RankWindowSize *int            `json:"rank_window_size,omitempty"`
+	RankConstant   *int            `json:"rank_constant,omitempty"`
+	Filter         QuerySlice      `json:"filter,omitempty"`
+}
+
+type RuleRetrieverSpec struct {
+	Retriever     *RetrieverSpec `json:"retriever"`
+	RulesetIDs    []string       `json:"ruleset_ids,omitempty"`
+	RulesetID     string         `json:"ruleset_id,omitempty"`
+	MatchCriteria map[string]any `json:"match_criteria,omitempty"`
+}
+
+type TextSimilarityRerankerRetrieverSpec struct {
+	Retriever      *RetrieverSpec `json:"retriever"`
+	Field          string         `json:"field"`
+	InferenceID    string         `json:"inference_id"`
+	InferenceText  string         `json:"inference_text"`
+	RankWindowSize *int           `json:"rank_window_size,omitempty"`
+	MinScore       *float64       `json:"min_score,omitempty"`
+	Filter         QuerySlice     `json:"filter,omitempty"`
+}
+
+func (r *RetrieverSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return fmt.Errorf("parsing_exception: [retriever] must be an object: %w", err)
+	}
+	if len(rawMap) != 1 {
+		return fmt.Errorf("parsing_exception: [retriever] must specify exactly one retriever type, got %d", len(rawMap))
+	}
+	for k, v := range rawMap {
+		switch k {
+		case "standard":
+			var subMap map[string]json.RawMessage
+			if err := json.Unmarshal(v, &subMap); err != nil {
+				return fmt.Errorf("parsing_exception: [standard] retriever must be an object: %w", err)
+			}
+			for sk := range subMap {
+				switch sk {
+				case "query", "filter", "collapse", "min_score":
+				default:
+					return fmt.Errorf("parsing_exception: [standard] retriever unknown field [%s]", sk)
+				}
+			}
+			var std StandardRetrieverSpec
+			if err := json.Unmarshal(v, &std); err != nil {
+				return err
+			}
+			if std.MinScore != nil && (math.IsNaN(*std.MinScore) || math.IsInf(*std.MinScore, 0)) {
+				return fmt.Errorf("parsing_exception: [standard] retriever [min_score] must be finite")
+			}
+			r.Standard = &std
+		case "knn":
+			var subMap map[string]json.RawMessage
+			if err := json.Unmarshal(v, &subMap); err != nil {
+				return fmt.Errorf("parsing_exception: [knn] retriever must be an object: %w", err)
+			}
+			for sk := range subMap {
+				switch sk {
+				case "field", "query_vector", "query_vector_builder", "k", "num_candidates", "filter", "similarity", "boost", "_name":
+				default:
+					return fmt.Errorf("parsing_exception: [knn] retriever unknown field [%s]", sk)
+				}
+			}
+			type plainKNN KNNRetrieverSpec
+			var rawKNN struct {
+				plainKNN
+				K             *int            `json:"k"`
+				NumCandidates *int            `json:"num_candidates"`
+				Boost         json.RawMessage `json:"boost"`
+			}
+			if err := json.Unmarshal(v, &rawKNN); err != nil {
+				return err
+			}
+			knn := rawKNN.plainKNN
+			if strings.TrimSpace(knn.Field) == "" {
+				return fmt.Errorf("parsing_exception: [knn] retriever requires [field]")
+			}
+			hasVec := len(knn.QueryVector) > 0
+			hasBuilder := len(knn.QueryVectorBuilder) > 0
+			if hasVec == hasBuilder {
+				return fmt.Errorf("parsing_exception: [knn] retriever requires exactly one of [query_vector] or [query_vector_builder]")
+			}
+			if rawKNN.K != nil {
+				if *rawKNN.K <= 0 {
+					return fmt.Errorf("illegal_argument_exception: [knn] retriever [k] must be > 0")
+				}
+				knn.K = *rawKNN.K
+			} else {
+				knn.K = 10
+			}
+			if rawKNN.NumCandidates != nil {
+				if *rawKNN.NumCandidates <= 0 || *rawKNN.NumCandidates < knn.K {
+					return fmt.Errorf("illegal_argument_exception: [knn] retriever [num_candidates] must be >= [k]")
+				}
+				knn.NumCandidates = *rawKNN.NumCandidates
+			} else {
+				knn.NumCandidates = knn.K
+				if knn.NumCandidates < 10 {
+					knn.NumCandidates = 10
+				}
+			}
+			if len(rawKNN.Boost) > 0 {
+				b, err := parseOptionalNonNegativeBoost(rawKNN.Boost)
+				if err != nil {
+					return err
+				}
+				knn.Boost = b
+			}
+			knnOut := KNNRetrieverSpec(knn)
+			r.KNN = &knnOut
+		case "rrf":
+			var subMap map[string]json.RawMessage
+			if err := json.Unmarshal(v, &subMap); err != nil {
+				return fmt.Errorf("parsing_exception: [rrf] retriever must be an object: %w", err)
+			}
+			for sk := range subMap {
+				switch sk {
+				case "retrievers", "rank_window_size", "rank_constant", "filter":
+				default:
+					return fmt.Errorf("parsing_exception: [rrf] retriever unknown field [%s]", sk)
+				}
+			}
+			var rrf RRFRetrieverSpec
+			if err := json.Unmarshal(v, &rrf); err != nil {
+				return err
+			}
+			if len(rrf.Retrievers) < 1 {
+				return fmt.Errorf("parsing_exception: [rrf] retriever requires at least 1 child in [retrievers]")
+			}
+			if rrf.RankWindowSize != nil && *rrf.RankWindowSize <= 0 {
+				return fmt.Errorf("illegal_argument_exception: [rrf] retriever [rank_window_size] must be > 0")
+			}
+			if rrf.RankConstant != nil && *rrf.RankConstant < 1 {
+				return fmt.Errorf("illegal_argument_exception: [rrf] retriever [rank_constant] must be >= 1")
+			}
+			r.RRF = &rrf
+		case "rule":
+			var subMap map[string]json.RawMessage
+			if err := json.Unmarshal(v, &subMap); err != nil {
+				return fmt.Errorf("parsing_exception: [rule] retriever must be an object: %w", err)
+			}
+			for sk := range subMap {
+				switch sk {
+				case "retriever", "ruleset_ids", "ruleset_id", "match_criteria":
+				default:
+					return fmt.Errorf("parsing_exception: [rule] retriever unknown field [%s]", sk)
+				}
+			}
+			var rule RuleRetrieverSpec
+			if err := json.Unmarshal(v, &rule); err != nil {
+				return err
+			}
+			if rule.Retriever == nil || (len(rule.RulesetIDs) == 0 && strings.TrimSpace(rule.RulesetID) == "") {
+				return fmt.Errorf("parsing_exception: [rule] retriever requires [retriever] and [ruleset_ids]")
+			}
+			r.Rule = &rule
+		case "text_similarity_reranker":
+			var subMap map[string]json.RawMessage
+			if err := json.Unmarshal(v, &subMap); err != nil {
+				return fmt.Errorf("parsing_exception: [text_similarity_reranker] retriever must be an object: %w", err)
+			}
+			for sk := range subMap {
+				switch sk {
+				case "retriever", "field", "inference_id", "inference_text", "rank_window_size", "min_score", "filter":
+				default:
+					return fmt.Errorf("parsing_exception: [text_similarity_reranker] retriever unknown field [%s]", sk)
+				}
+			}
+			var tsr TextSimilarityRerankerRetrieverSpec
+			if err := json.Unmarshal(v, &tsr); err != nil {
+				return err
+			}
+			if tsr.Retriever == nil || strings.TrimSpace(tsr.Field) == "" || strings.TrimSpace(tsr.InferenceID) == "" || strings.TrimSpace(tsr.InferenceText) == "" {
+				return fmt.Errorf("parsing_exception: [text_similarity_reranker] requires [retriever], [field], [inference_id], and [inference_text]")
+			}
+			if tsr.RankWindowSize != nil && *tsr.RankWindowSize <= 0 {
+				return fmt.Errorf("illegal_argument_exception: [text_similarity_reranker] [rank_window_size] must be > 0")
+			}
+			r.TextSimilarityReranker = &tsr
+		default:
+			return fmt.Errorf("parsing_exception: unknown retriever [%s]", k)
+		}
+	}
+	return nil
+}
+
+// LowerRetrieverToSearchRequest lowers an ES 8.x `retriever` tree into standard `SearchRequest` fields.
+func LowerRetrieverToSearchRequest(req *SearchRequest) {
+	if req == nil || req.Retriever == nil || req.retrieverLowered {
+		return
+	}
+	lowerRetrieverNode(req.Retriever, req)
+	req.retrieverLowered = true
+}
+
+func combineFiltersAsQuery(filters []Query) *Query {
+	if len(filters) == 0 {
+		return nil
+	}
+	if len(filters) == 1 {
+		q := filters[0]
+		return &q
+	}
+	cp := make([]Query, len(filters))
+	copy(cp, filters)
+	return &Query{Bool: &BoolQuery{Filter: QuerySlice(cp)}}
+}
+
+func lowerRetrieverNode(ret *RetrieverSpec, req *SearchRequest) {
+	if ret == nil || req == nil {
+		return
+	}
+	switch {
+	case ret.Standard != nil:
+		std := ret.Standard
+		if std.Collapse != nil && req.Collapse == nil {
+			req.Collapse = std.Collapse
+		}
+		if std.MinScore != nil && req.MinScore == nil {
+			req.MinScore = std.MinScore
+		}
+		if len(std.Filter) == 0 {
+			if std.Query != nil {
+				req.Query = std.Query
+			} else {
+				req.Query = &Query{MatchAll: map[string]any{}}
+			}
+		} else {
+			bq := &BoolQuery{Filter: std.Filter}
+			if std.Query != nil {
+				bq.Must = QuerySlice{*std.Query}
+			}
+			req.Query = &Query{Bool: bq}
+		}
+	case ret.KNN != nil:
+		k := ret.KNN
+		knnSpec := KNNQuery{
+			Field:              k.Field,
+			QueryVector:        k.QueryVector,
+			QueryVectorBuilder: k.QueryVectorBuilder,
+			K:                  k.K,
+			NumCandidates:      k.NumCandidates,
+			Filter:             k.Filter,
+			Similarity:         k.Similarity,
+			Boost:              k.Boost,
+			Name:               k.Name,
+		}
+		req.KNN = append(req.KNN, knnSpec)
+	case ret.RRF != nil:
+		for i := range ret.RRF.Retrievers {
+			var subReq SearchRequest
+			lowerRetrieverNode(&ret.RRF.Retrievers[i], &subReq)
+			if subReq.Query != nil {
+				req.SubSearches = append(req.SubSearches, SubSearchSpec{Query: subReq.Query})
+			}
+			if len(subReq.KNN) > 0 {
+				req.KNN = append(req.KNN, subReq.KNN...)
+			}
+		}
+		req.Rank = &RankSpec{
+			RRF: &RRFSpec{
+				WindowSize:   ret.RRF.RankWindowSize,
+				RankConstant: ret.RRF.RankConstant,
+			},
+		}
+		if len(ret.RRF.Filter) > 0 {
+			filterQ := combineFiltersAsQuery(ret.RRF.Filter)
+			if req.Query == nil {
+				req.Query = filterQ
+			} else {
+				req.Query = &Query{Bool: &BoolQuery{Must: QuerySlice{*req.Query}, Filter: ret.RRF.Filter}}
+			}
+		}
+	case ret.Rule != nil:
+		lowerRetrieverNode(ret.Rule.Retriever, req)
+	case ret.TextSimilarityReranker != nil:
+		lowerRetrieverNode(ret.TextSimilarityReranker.Retriever, req)
+		if ret.TextSimilarityReranker.MinScore != nil && req.MinScore == nil {
+			req.MinScore = ret.TextSimilarityReranker.MinScore
+		}
+		if len(ret.TextSimilarityReranker.Filter) > 0 {
+			if req.Query == nil {
+				req.Query = combineFiltersAsQuery(ret.TextSimilarityReranker.Filter)
+			} else {
+				req.Query = &Query{Bool: &BoolQuery{Must: QuerySlice{*req.Query}, Filter: ret.TextSimilarityReranker.Filter}}
+			}
+		}
+	}
+}
+
 var knownSearchRequestKeys = map[string]bool{
 	"query":               true,
+	"retriever":           true,
 	"knn":                 true,
 	"post_filter":         true,
 	"from":                true,
@@ -192,6 +538,18 @@ func (r *SearchRequest) UnmarshalJSON(data []byte) error {
 	if hasPIT && hasPointInTime {
 		return fmt.Errorf("parsing_exception: cannot specify both [pit] and [point_in_time]")
 	}
+	rawRetriever, hasRetriever := rawMap["retriever"]
+	if hasRetriever {
+		if _, hasQ := rawMap["query"]; hasQ {
+			return fmt.Errorf("parsing_exception: cannot specify both [retriever] and [query]")
+		}
+		if _, hasK := rawMap["knn"]; hasK {
+			return fmt.Errorf("parsing_exception: cannot specify both [retriever] and [knn]")
+		}
+		if _, hasSub := rawMap["sub_searches"]; hasSub {
+			return fmt.Errorf("parsing_exception: cannot specify both [retriever] and [sub_searches]")
+		}
+	}
 	type plain SearchRequest
 	var raw struct {
 		plain
@@ -205,6 +563,18 @@ func (r *SearchRequest) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*r = SearchRequest(raw.plain)
+	if hasRetriever {
+		retTrim := bytes.TrimSpace(rawRetriever)
+		if len(retTrim) == 0 || bytes.Equal(retTrim, []byte("null")) {
+			return fmt.Errorf("parsing_exception: [retriever] cannot be null")
+		}
+		var ret RetrieverSpec
+		if err := json.Unmarshal(retTrim, &ret); err != nil {
+			return err
+		}
+		r.Retriever = &ret
+		LowerRetrieverToSearchRequest(r)
+	}
 	if hasPointInTime {
 		ptTrim := bytes.TrimSpace(rawPointInTime)
 		if len(ptTrim) > 0 && !bytes.Equal(ptTrim, []byte("null")) {
@@ -249,6 +619,24 @@ func (r *SearchRequest) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		r.IndicesBoost = ib
+	}
+	if err := validateSearchRequestAggMap(r.EffectiveAggs()); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateSearchRequestAggMap(aggs map[string]AggSpec) error {
+	for _, agg := range aggs {
+		if agg.Filters != nil && len(agg.Filters.Filters) == 0 && len(agg.Filters.AnonymousFilters) == 0 && !agg.Filters.OtherBucket {
+			return fmt.Errorf("parsing_exception: [filters] aggregation requires non-empty [filters]")
+		}
+		if agg.ScriptedMetric != nil && agg.ScriptedMetric.MapScript == nil {
+			return fmt.Errorf("parsing_exception: [scripted_metric] requires [map_script]")
+		}
+		if err := validateSearchRequestAggMap(agg.SubAggs()); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -510,6 +898,134 @@ func (ph *PhraseHighlightSpec) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// CompletionFuzzySpec models the `fuzzy` options block inside a `completion` suggester.
+type CompletionFuzzySpec struct {
+	Enabled        bool  `json:"-"`
+	Fuzziness      any   `json:"fuzziness,omitempty"`
+	Transpositions *bool `json:"transpositions,omitempty"`
+	MinLength      *int  `json:"min_length,omitempty"`
+	PrefixLength   *int  `json:"prefix_length,omitempty"`
+	UnicodeAware   *bool `json:"unicode_aware,omitempty"`
+}
+
+func (cf *CompletionFuzzySpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	if trimmed[0] != '{' {
+		var val any
+		if err := json.Unmarshal(trimmed, &val); err != nil {
+			return fmt.Errorf("parsing_exception: [completion.fuzzy] invalid value: %w", err)
+		}
+		b, err := parseFlexibleBool(val)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [completion.fuzzy] must be a boolean or object")
+		}
+		cf.Enabled = b
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "fuzziness", "transpositions", "min_length", "prefix_length", "unicode_aware":
+		default:
+			return fmt.Errorf("parsing_exception: [completion.fuzzy] unknown field [%s]", k)
+		}
+	}
+	var raw struct {
+		Fuzziness      any  `json:"fuzziness"`
+		Transpositions any  `json:"transpositions"`
+		MinLength      *int `json:"min_length"`
+		PrefixLength   *int `json:"prefix_length"`
+		UnicodeAware   any  `json:"unicode_aware"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if raw.Fuzziness != nil {
+		switch fv := raw.Fuzziness.(type) {
+		case float64:
+			if fv < 0 || fv > 2 || fv != math.Trunc(fv) {
+				return fmt.Errorf("illegal_argument_exception: [completion.fuzzy] invalid [fuzziness] [%v]", fv)
+			}
+		case string:
+			fs := strings.ToUpper(strings.TrimSpace(fv))
+			if fs != "0" && fs != "1" && fs != "2" && fs != "AUTO" && !strings.HasPrefix(fs, "AUTO:") {
+				return fmt.Errorf("illegal_argument_exception: [completion.fuzzy] invalid [fuzziness] [%s]", fv)
+			}
+		default:
+			return fmt.Errorf("parsing_exception: [completion.fuzzy] invalid [fuzziness] [%v]", raw.Fuzziness)
+		}
+		cf.Fuzziness = raw.Fuzziness
+	}
+	if raw.Transpositions != nil {
+		b, err := parseFlexibleBool(raw.Transpositions)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [completion.fuzzy] [transpositions] %w", err)
+		}
+		cf.Transpositions = &b
+	}
+	if raw.MinLength != nil {
+		if *raw.MinLength < 0 {
+			return fmt.Errorf("illegal_argument_exception: [completion.fuzzy] [min_length] must be >= 0")
+		}
+		cf.MinLength = raw.MinLength
+	}
+	if raw.PrefixLength != nil {
+		if *raw.PrefixLength < 0 {
+			return fmt.Errorf("illegal_argument_exception: [completion.fuzzy] [prefix_length] must be >= 0")
+		}
+		cf.PrefixLength = raw.PrefixLength
+	}
+	if raw.UnicodeAware != nil {
+		b, err := parseFlexibleBool(raw.UnicodeAware)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [completion.fuzzy] [unicode_aware] %w", err)
+		}
+		cf.UnicodeAware = &b
+	}
+	cf.Enabled = true
+	return nil
+}
+
+// CompletionRegexSpec models the `regex` options block inside a `completion` suggester.
+type CompletionRegexSpec struct {
+	Flags                 string `json:"flags,omitempty"`
+	MaxDeterminizedStates *int   `json:"max_determinized_states,omitempty"`
+}
+
+func (cr *CompletionRegexSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return fmt.Errorf("parsing_exception: [completion.regex] must be an object: %w", err)
+	}
+	for k := range rawMap {
+		switch k {
+		case "flags", "max_determinized_states":
+		default:
+			return fmt.Errorf("parsing_exception: [completion.regex] unknown field [%s]", k)
+		}
+	}
+	type plain CompletionRegexSpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if p.MaxDeterminizedStates != nil && *p.MaxDeterminizedStates <= 0 {
+		return fmt.Errorf("illegal_argument_exception: [completion.regex] [max_determinized_states] must be > 0")
+	}
+	*cr = CompletionRegexSpec(p)
+	return nil
+}
+
 // CompletionSuggestSpec models a `completion` suggester configuration.
 type CompletionSuggestSpec struct {
 	Field          string         `json:"field"`
@@ -535,25 +1051,77 @@ func (cs *CompletionSuggestSpec) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: [completion] unknown field [%s]", k)
 		}
 	}
-	type plain CompletionSuggestSpec
+	rawFuzzy, hasFuzzy := rawMap["fuzzy"]
+	rawRegex, hasRegex := rawMap["regex"]
+	hasFuzzyVal := hasFuzzy && len(bytes.TrimSpace(rawFuzzy)) > 0 && !bytes.Equal(bytes.TrimSpace(rawFuzzy), []byte("null"))
+	hasRegexVal := hasRegex && len(bytes.TrimSpace(rawRegex)) > 0 && !bytes.Equal(bytes.TrimSpace(rawRegex), []byte("null"))
+	if hasFuzzyVal && hasRegexVal {
+		return fmt.Errorf("parsing_exception: [completion] cannot specify both [fuzzy] and [regex]")
+	}
 	var raw struct {
-		plain
-		Size *int `json:"size"`
+		Field          string `json:"field"`
+		Size           *int   `json:"size"`
+		SkipDuplicates any    `json:"skip_duplicates"`
 	}
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
-	p := raw.plain
-	if strings.TrimSpace(p.Field) == "" {
+	if strings.TrimSpace(raw.Field) == "" {
 		return fmt.Errorf("parsing_exception: [completion] field is required")
 	}
+	var p CompletionSuggestSpec
+	p.Field = raw.Field
 	if raw.Size != nil {
 		if *raw.Size <= 0 {
 			return fmt.Errorf("illegal_argument_exception: [completion] [size] must be > 0")
 		}
 		p.Size = *raw.Size
 	}
-	*cs = CompletionSuggestSpec(p)
+	if raw.SkipDuplicates != nil {
+		sd, err := parseFlexibleBool(raw.SkipDuplicates)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [completion] [skip_duplicates] %w", err)
+		}
+		p.SkipDuplicates = sd
+	}
+	if hasFuzzyVal {
+		var cf CompletionFuzzySpec
+		if err := json.Unmarshal(rawFuzzy, &cf); err != nil {
+			return err
+		}
+		if cf.Enabled {
+			p.Fuzzy = make(map[string]any)
+			if cf.Fuzziness != nil {
+				p.Fuzzy["fuzziness"] = cf.Fuzziness
+			}
+			if cf.Transpositions != nil {
+				p.Fuzzy["transpositions"] = *cf.Transpositions
+			}
+			if cf.MinLength != nil {
+				p.Fuzzy["min_length"] = *cf.MinLength
+			}
+			if cf.PrefixLength != nil {
+				p.Fuzzy["prefix_length"] = *cf.PrefixLength
+			}
+			if cf.UnicodeAware != nil {
+				p.Fuzzy["unicode_aware"] = *cf.UnicodeAware
+			}
+		}
+	}
+	if hasRegexVal {
+		var cr CompletionRegexSpec
+		if err := json.Unmarshal(rawRegex, &cr); err != nil {
+			return err
+		}
+		p.Regex = make(map[string]any)
+		if cr.Flags != "" {
+			p.Regex["flags"] = cr.Flags
+		}
+		if cr.MaxDeterminizedStates != nil {
+			p.Regex["max_determinized_states"] = *cr.MaxDeterminizedStates
+		}
+	}
+	*cs = p
 	return nil
 }
 
@@ -617,13 +1185,40 @@ func (frs *FieldRequestSpec) UnmarshalJSON(data []byte) error {
 		if err := json.Unmarshal(trimmed, &s); err != nil {
 			return err
 		}
+		if strings.TrimSpace(s) == "" {
+			return fmt.Errorf("parsing_exception: [fields] field name cannot be empty")
+		}
 		frs.Field = s
 		return nil
+	}
+	if trimmed[0] != '{' {
+		return fmt.Errorf("parsing_exception: [fields] entry must be a string or object")
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "field", "format", "include_unmapped":
+		default:
+			return fmt.Errorf("parsing_exception: [fields] unknown field [%s]", k)
+		}
 	}
 	type alias FieldRequestSpec
 	var obj alias
 	if err := json.Unmarshal(trimmed, &obj); err != nil {
 		return err
+	}
+	if strings.TrimSpace(obj.Field) == "" {
+		return fmt.Errorf("parsing_exception: [fields] requires non-empty [field]")
+	}
+	if obj.IncludeUnmapped != nil {
+		b, err := parseFlexibleBool(obj.IncludeUnmapped)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [fields] [include_unmapped] %w", err)
+		}
+		obj.IncludeUnmapped = b
 	}
 	*frs = FieldRequestSpec(obj)
 	return nil
@@ -688,14 +1283,15 @@ func (r *SearchRequest) ShouldTrackTotalHits() bool {
 
 // KNNQuery represents an Elasticsearch 8/9 or OpenSearch `knn` vector search clause.
 type KNNQuery struct {
-	Field         string     `json:"field,omitempty"`
-	QueryVector   []float64  `json:"query_vector,omitempty"`
-	K             int        `json:"k,omitempty"`
-	NumCandidates int        `json:"num_candidates,omitempty"`
-	Similarity    *float64   `json:"similarity,omitempty"`
-	Boost         *float64   `json:"boost,omitempty"`
-	Filter        QuerySlice `json:"filter,omitempty"`
-	Name          string     `json:"_name,omitempty"`
+	Field              string         `json:"field,omitempty"`
+	QueryVector        []float64      `json:"query_vector,omitempty"`
+	QueryVectorBuilder map[string]any `json:"query_vector_builder,omitempty"`
+	K                  int            `json:"k,omitempty"`
+	NumCandidates      int            `json:"num_candidates,omitempty"`
+	Similarity         *float64       `json:"similarity,omitempty"`
+	Boost              *float64       `json:"boost,omitempty"`
+	Filter             QuerySlice     `json:"filter,omitempty"`
+	Name               string         `json:"_name,omitempty"`
 }
 
 func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
@@ -1583,7 +2179,223 @@ type Query struct {
 	HasParent         *HasParentQuery             `json:"has_parent,omitempty"`
 	ParentID          *ParentIDQuery              `json:"parent_id,omitempty"`
 	Percolate         *PercolateQuery             `json:"percolate,omitempty"`
+	Rule              *RuleQuerySpec              `json:"rule,omitempty"`
+	SparseVector      *SparseVectorQuerySpec      `json:"sparse_vector,omitempty"`
 	Name              string                      `json:"_name,omitempty"`
+}
+
+// RuleQuerySpec models an ES `rule` / `rule_query` query.
+type RuleQuerySpec struct {
+	Organic       *Query         `json:"organic,omitempty"`
+	RulesetIDs    []string       `json:"ruleset_ids,omitempty"`
+	RulesetID     string         `json:"ruleset_id,omitempty"`
+	MatchCriteria map[string]any `json:"match_criteria,omitempty"`
+	Boost         *float64       `json:"boost,omitempty"`
+	Name          string         `json:"_name,omitempty"`
+}
+
+func (rq *RuleQuerySpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "organic", "ruleset_ids", "ruleset_id", "match_criteria", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [rule] unknown field [%s]", k)
+		}
+	}
+	type plain RuleQuerySpec
+	var raw struct {
+		plain
+		Boost json.RawMessage `json:"boost"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	hasRuleset := strings.TrimSpace(raw.RulesetID) != ""
+	for _, id := range raw.RulesetIDs {
+		if strings.TrimSpace(id) != "" {
+			hasRuleset = true
+			break
+		}
+	}
+	if !hasRuleset {
+		return fmt.Errorf("parsing_exception: [rule] requires [ruleset_ids] or [ruleset_id]")
+	}
+	if len(raw.MatchCriteria) == 0 {
+		return fmt.Errorf("parsing_exception: [rule] requires non-empty [match_criteria]")
+	}
+	*rq = RuleQuerySpec(raw.plain)
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		rq.Boost = b
+	}
+	return nil
+}
+
+// SparseVectorQuerySpec models an ES `sparse_vector`, `text_expansion`, or `weighted_tokens` query.
+type SparseVectorQuerySpec struct {
+	Field         string             `json:"field"`
+	InferenceID   string             `json:"inference_id,omitempty"`
+	ModelID       string             `json:"model_id,omitempty"`
+	Query         string             `json:"query,omitempty"`
+	QueryText     string             `json:"query_text,omitempty"`
+	ModelText     string             `json:"model_text,omitempty"`
+	QueryVector   map[string]float64 `json:"query_vector,omitempty"`
+	Tokens        map[string]float64 `json:"tokens,omitempty"`
+	Prune         *bool              `json:"prune,omitempty"`
+	PruningConfig map[string]any     `json:"pruning_config,omitempty"`
+	Filter        *Query             `json:"filter,omitempty"`
+	Boost         *float64           `json:"boost,omitempty"`
+	Name          string             `json:"_name,omitempty"`
+}
+
+func (sv *SparseVectorQuerySpec) EffectiveTokens() map[string]float64 {
+	if sv == nil {
+		return nil
+	}
+	if len(sv.QueryVector) > 0 {
+		return sv.QueryVector
+	}
+	return sv.Tokens
+}
+
+func (sv *SparseVectorQuerySpec) EffectiveQueryText() string {
+	if sv == nil {
+		return ""
+	}
+	if strings.TrimSpace(sv.Query) != "" {
+		return sv.Query
+	}
+	if strings.TrimSpace(sv.QueryText) != "" {
+		return sv.QueryText
+	}
+	return sv.ModelText
+}
+
+func (sv *SparseVectorQuerySpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	knownFlatKeys := map[string]bool{
+		"field": true, "inference_id": true, "model_id": true,
+		"query": true, "query_text": true, "model_text": true,
+		"query_vector": true, "tokens": true,
+		"prune": true, "pruning_config": true,
+		"filter": true, "boost": true, "_name": true,
+	}
+	// Support field-keyed wrapper syntax used by `text_expansion` / `weighted_tokens`: `{"ml.tokens": {"model_id": "...", "model_text": "..."}}`
+	if _, hasField := rawMap["field"]; !hasField && len(rawMap) == 1 {
+		for k, v := range rawMap {
+			if !knownFlatKeys[k] {
+				vTrim := bytes.TrimSpace(v)
+				if len(vTrim) > 0 && vTrim[0] == '{' {
+					var innerMap map[string]json.RawMessage
+					if err := json.Unmarshal(vTrim, &innerMap); err != nil {
+						return err
+					}
+					fieldBytes, _ := json.Marshal(k)
+					innerMap["field"] = fieldBytes
+					reBytes, err := json.Marshal(innerMap)
+					if err != nil {
+						return err
+					}
+					trimmed = reBytes
+					rawMap = innerMap
+				}
+			}
+		}
+	}
+	for k := range rawMap {
+		if !knownFlatKeys[k] {
+			return fmt.Errorf("parsing_exception: [sparse_vector] unknown field [%s]", k)
+		}
+	}
+	type plain SparseVectorQuerySpec
+	var raw struct {
+		plain
+		Prune         any             `json:"prune"`
+		PruningConfig map[string]any  `json:"pruning_config"`
+		Boost         json.RawMessage `json:"boost"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	p := raw.plain
+	if strings.TrimSpace(p.Field) == "" {
+		return fmt.Errorf("parsing_exception: [sparse_vector] requires [field]")
+	}
+	hasText := strings.TrimSpace(p.Query) != "" || strings.TrimSpace(p.QueryText) != "" || strings.TrimSpace(p.ModelText) != ""
+	hasVec := len(p.QueryVector) > 0 || len(p.Tokens) > 0
+	if !hasText && !hasVec {
+		return fmt.Errorf("parsing_exception: [sparse_vector] requires either query text or [query_vector]/[tokens]")
+	}
+	if hasText && hasVec {
+		return fmt.Errorf("parsing_exception: [sparse_vector] cannot specify both query text and [query_vector]/[tokens]")
+	}
+	if hasText && strings.TrimSpace(p.InferenceID) == "" && strings.TrimSpace(p.ModelID) == "" {
+		return fmt.Errorf("parsing_exception: [sparse_vector] with query text requires [inference_id] or [model_id]")
+	}
+	for _, w := range p.QueryVector {
+		if math.IsNaN(w) || math.IsInf(w, 0) {
+			return fmt.Errorf("illegal_argument_exception: [sparse_vector] [query_vector] weights must be finite")
+		}
+	}
+	for _, w := range p.Tokens {
+		if math.IsNaN(w) || math.IsInf(w, 0) {
+			return fmt.Errorf("illegal_argument_exception: [sparse_vector] [tokens] weights must be finite")
+		}
+	}
+	if raw.Prune != nil {
+		b, err := parseFlexibleBool(raw.Prune)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [sparse_vector] [prune] %w", err)
+		}
+		p.Prune = &b
+	}
+	for k, v := range raw.PruningConfig {
+		switch k {
+		case "tokens_freq_ratio_threshold":
+			f, ok := parseBoundFloat(v)
+			if !ok || f < 1 {
+				return fmt.Errorf("illegal_argument_exception: [sparse_vector.pruning_config] [tokens_freq_ratio_threshold] must be >= 1")
+			}
+		case "tokens_weight_threshold":
+			f, ok := parseBoundFloat(v)
+			if !ok || f < 0 {
+				return fmt.Errorf("illegal_argument_exception: [sparse_vector.pruning_config] [tokens_weight_threshold] must be >= 0")
+			}
+		case "only_score_pruned_tokens":
+			if _, err := parseFlexibleBool(v); err != nil {
+				return fmt.Errorf("parsing_exception: [sparse_vector.pruning_config] [only_score_pruned_tokens] %w", err)
+			}
+		default:
+			return fmt.Errorf("parsing_exception: [sparse_vector.pruning_config] unknown field [%s]", k)
+		}
+	}
+	if len(raw.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(raw.Boost)
+		if err != nil {
+			return err
+		}
+		p.Boost = b
+	}
+	*sv = SparseVectorQuerySpec(p)
+	return nil
 }
 
 var knownQueryClauses = map[string]bool{
@@ -1640,6 +2452,11 @@ var knownQueryClauses = map[string]bool{
 	"has_parent":          true,
 	"parent_id":           true,
 	"percolate":           true,
+	"rule":                true,
+	"rule_query":          true,
+	"sparse_vector":       true,
+	"text_expansion":      true,
+	"weighted_tokens":     true,
 	"_name":               true,
 	"boost":               true,
 }
@@ -1829,6 +2646,18 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 			if mb != nil {
 				mapBoosts[clauseKey] = mb
 			}
+		}
+	}
+	if rawRuleQ, ok := raw["rule_query"]; ok {
+		raw["rule"] = rawRuleQ
+		delete(raw, "rule_query")
+		rawModified = true
+	}
+	for _, svAlias := range []string{"text_expansion", "weighted_tokens"} {
+		if rawSV, ok := raw[svAlias]; ok {
+			raw["sparse_vector"] = rawSV
+			delete(raw, svAlias)
+			rawModified = true
 		}
 	}
 	if rawModified {
@@ -2153,6 +2982,12 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 	}
 	if alias.Name == "" && alias.Wrapper != nil && alias.Wrapper.Decoded != nil && alias.Wrapper.Decoded.Name != "" {
 		alias.Name = alias.Wrapper.Decoded.Name
+	}
+	if alias.Name == "" && alias.Rule != nil && alias.Rule.Name != "" {
+		alias.Name = alias.Rule.Name
+	}
+	if alias.Name == "" && alias.SparseVector != nil && alias.SparseVector.Name != "" {
+		alias.Name = alias.SparseVector.Name
 	}
 	*q = Query(alias)
 	return nil
@@ -5112,6 +5947,64 @@ type TermsLookupSpec struct {
 	ID      string `json:"id"`
 	Path    string `json:"path"`
 	Routing string `json:"routing,omitempty"`
+	Store   *bool  `json:"store,omitempty"`
+}
+
+func (tls *TermsLookupSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "index", "id", "path", "routing", "store":
+		default:
+			return fmt.Errorf("parsing_exception: [terms] lookup unknown field [%s]", k)
+		}
+	}
+	var raw struct {
+		Index   string `json:"index"`
+		ID      any    `json:"id"`
+		Path    string `json:"path"`
+		Routing string `json:"routing"`
+		Store   any    `json:"store"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.UseNumber()
+	if err := dec.Decode(&raw); err != nil {
+		return err
+	}
+	var idStr string
+	switch v := raw.ID.(type) {
+	case string:
+		idStr = v
+	case json.Number:
+		idStr = v.String()
+	case float64, int, int64:
+		idStr = formatFlexibleScalarString(v)
+	case nil:
+	default:
+		return fmt.Errorf("parsing_exception: [terms] lookup [id] must be a string or number")
+	}
+	if strings.TrimSpace(raw.Index) == "" || strings.TrimSpace(idStr) == "" || strings.TrimSpace(raw.Path) == "" {
+		return fmt.Errorf("parsing_exception: [terms] lookup requires non-empty [index], [id], and [path]")
+	}
+	tls.Index = raw.Index
+	tls.ID = idStr
+	tls.Path = raw.Path
+	tls.Routing = raw.Routing
+	if raw.Store != nil {
+		b, err := parseFlexibleBool(raw.Store)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [terms] lookup [store] %w", err)
+		}
+		tls.Store = &b
+	}
+	return nil
 }
 
 // TermsQuery handles `"terms": {"field": ["a", "b"], "boost": 1.0}` as well as
@@ -6749,6 +7642,36 @@ type QueryStringQuery struct {
 	Boost                           *float64 `json:"boost,omitempty"`
 }
 
+func validateFuzzinessValue(v any, queryName string) error {
+	if v == nil {
+		return nil
+	}
+	switch val := v.(type) {
+	case float64:
+		if val == 0 || val == 1 || val == 2 {
+			return nil
+		}
+	case int:
+		if val >= 0 && val <= 2 {
+			return nil
+		}
+	case int64:
+		if val >= 0 && val <= 2 {
+			return nil
+		}
+	case json.Number:
+		if n, err := val.Int64(); err == nil && n >= 0 && n <= 2 {
+			return nil
+		}
+	case string:
+		s := strings.ToUpper(strings.TrimSpace(val))
+		if s == "0" || s == "1" || s == "2" || s == "AUTO" || strings.HasPrefix(s, "AUTO:") {
+			return nil
+		}
+	}
+	return fmt.Errorf("illegal_argument_exception: [%s] invalid fuzziness [%v]", queryName, v)
+}
+
 func (qsq *QueryStringQuery) UnmarshalJSON(data []byte) error {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -6770,23 +7693,111 @@ func (qsq *QueryStringQuery) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: [query_string] unknown field [%s]", k)
 		}
 	}
+	if _, hasQ := rawMap["query"]; !hasQ {
+		return fmt.Errorf("parsing_exception: [query_string] must be provided with a [query]")
+	}
 	type plain QueryStringQuery
 	var raw struct {
 		plain
-		Query  any             `json:"query"`
-		Fields any             `json:"fields"`
-		Boost  json.RawMessage `json:"boost"`
+		Query                           any             `json:"query"`
+		Fields                          any             `json:"fields"`
+		FuzzyMaxExpansions              *int            `json:"fuzzy_max_expansions"`
+		FuzzyPrefixLength               *int            `json:"fuzzy_prefix_length"`
+		FuzzyTranspositions             any             `json:"fuzzy_transpositions"`
+		Lenient                         any             `json:"lenient"`
+		AnalyzeWildcard                 any             `json:"analyze_wildcard"`
+		AllowLeadingWildcard            any             `json:"allow_leading_wildcard"`
+		AutoGenerateSynonymsPhraseQuery any             `json:"auto_generate_synonyms_phrase_query"`
+		EnablePositionIncrements        any             `json:"enable_position_increments"`
+		SplitOnWhitespace               any             `json:"split_on_whitespace"`
+		Escape                          any             `json:"escape"`
+		Boost                           json.RawMessage `json:"boost"`
 	}
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
 	*qsq = QueryStringQuery(raw.plain)
+	if raw.FuzzyMaxExpansions != nil && *raw.FuzzyMaxExpansions <= 0 {
+		return fmt.Errorf("illegal_argument_exception: [query_string] [fuzzy_max_expansions] must be > 0")
+	}
+	if raw.FuzzyPrefixLength != nil && *raw.FuzzyPrefixLength < 0 {
+		return fmt.Errorf("illegal_argument_exception: [query_string] [fuzzy_prefix_length] must be >= 0")
+	}
+	if qsq.Fuzziness != nil {
+		if err := validateFuzzinessValue(qsq.Fuzziness, "query_string"); err != nil {
+			return err
+		}
+	}
 	if len(raw.Boost) > 0 {
 		b, err := parseOptionalNonNegativeBoost(raw.Boost)
 		if err != nil {
 			return err
 		}
 		qsq.Boost = b
+	}
+	if raw.FuzzyTranspositions != nil {
+		b, err := parseFlexibleBool(raw.FuzzyTranspositions)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [query_string] [fuzzy_transpositions] %w", err)
+		}
+		qsq.FuzzyTranspositions = &b
+	}
+	if raw.Lenient != nil {
+		b, err := parseFlexibleBool(raw.Lenient)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [query_string] [lenient] %w", err)
+		}
+		qsq.Lenient = &b
+	}
+	if raw.AnalyzeWildcard != nil {
+		b, err := parseFlexibleBool(raw.AnalyzeWildcard)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [query_string] [analyze_wildcard] %w", err)
+		}
+		qsq.AnalyzeWildcard = &b
+	}
+	if raw.AllowLeadingWildcard != nil {
+		b, err := parseFlexibleBool(raw.AllowLeadingWildcard)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [query_string] [allow_leading_wildcard] %w", err)
+		}
+		qsq.AllowLeadingWildcard = &b
+	}
+	if raw.AutoGenerateSynonymsPhraseQuery != nil {
+		b, err := parseFlexibleBool(raw.AutoGenerateSynonymsPhraseQuery)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [query_string] [auto_generate_synonyms_phrase_query] %w", err)
+		}
+		qsq.AutoGenerateSynonymsPhraseQuery = &b
+	}
+	for name, val := range map[string]any{
+		"enable_position_increments": raw.EnablePositionIncrements,
+		"split_on_whitespace":        raw.SplitOnWhitespace,
+		"escape":                     raw.Escape,
+	} {
+		if val != nil {
+			if _, err := parseFlexibleBool(val); err != nil {
+				return fmt.Errorf("parsing_exception: [query_string] [%s] %w", name, err)
+			}
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(qsq.Type)) {
+	case "", "best_fields", "most_fields", "cross_fields", "phrase", "phrase_prefix", "bool_prefix":
+	default:
+		return fmt.Errorf("parsing_exception: [query_string] unknown type [%s]", qsq.Type)
+	}
+	if strings.TrimSpace(qsq.Flags) != "" {
+		validFlags := map[string]bool{
+			"ALL": true, "NONE": true, "AND": true, "OR": true, "NOT": true,
+			"PREFIX": true, "PHRASE": true, "PRECEDENCE": true, "ESCAPE": true,
+			"WHITESPACE": true, "FUZZY": true, "NEAR": true, "SLOP": true,
+		}
+		for _, tok := range strings.Split(qsq.Flags, "|") {
+			ft := strings.ToUpper(strings.TrimSpace(tok))
+			if !validFlags[ft] {
+				return fmt.Errorf("illegal_argument_exception: [query_string] unknown flag [%s] in [flags]", tok)
+			}
+		}
 	}
 	if err := validateQueryOperator(qsq.DefaultOperator, "query_string"); err != nil {
 		return err
@@ -7649,8 +8660,66 @@ type VariableWidthHistogramAggSpec struct {
 	Field         string `json:"field"`
 	Buckets       int    `json:"buckets,omitempty"`
 	InitialBuffer int    `json:"initial_buffer,omitempty"`
+	ShardSize     int    `json:"shard_size,omitempty"`
 	Missing       any    `json:"missing,omitempty"`
 	Script        any    `json:"script,omitempty"`
+}
+
+func (v *VariableWidthHistogramAggSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "field", "script", "buckets", "initial_buffer", "shard_size", "missing", "aggs", "aggregations", "meta":
+		default:
+			return fmt.Errorf("parsing_exception: [variable_width_histogram] unknown field [%s]", k)
+		}
+	}
+	type plain VariableWidthHistogramAggSpec
+	var raw struct {
+		plain
+		Buckets       *int `json:"buckets"`
+		InitialBuffer *int `json:"initial_buffer"`
+		ShardSize     *int `json:"shard_size"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	p := raw.plain
+	if strings.TrimSpace(p.Field) == "" && p.Script == nil {
+		return fmt.Errorf("parsing_exception: [variable_width_histogram] requires either [field] or [script]")
+	}
+	if p.Script != nil {
+		if err := validateScriptValue(p.Script); err != nil {
+			return err
+		}
+	}
+	if raw.Buckets != nil {
+		if *raw.Buckets < 1 || *raw.Buckets > 100000 {
+			return fmt.Errorf("illegal_argument_exception: [variable_width_histogram] [buckets] must be between 1 and 100000")
+		}
+		p.Buckets = *raw.Buckets
+	}
+	if raw.InitialBuffer != nil {
+		if *raw.InitialBuffer < 1 {
+			return fmt.Errorf("illegal_argument_exception: [variable_width_histogram] [initial_buffer] must be >= 1")
+		}
+		p.InitialBuffer = *raw.InitialBuffer
+	}
+	if raw.ShardSize != nil {
+		if *raw.ShardSize < 1 {
+			return fmt.Errorf("illegal_argument_exception: [variable_width_histogram] [shard_size] must be >= 1")
+		}
+		p.ShardSize = *raw.ShardSize
+	}
+	*v = VariableWidthHistogramAggSpec(p)
+	return nil
 }
 
 func (v *VariableWidthHistogramAggSpec) EffectiveBuckets() int {
@@ -7667,6 +8736,39 @@ type WeightedAvgFieldSpec struct {
 	Script  any    `json:"script,omitempty"`
 }
 
+func (wf *WeightedAvgFieldSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "field", "script", "missing":
+		default:
+			return fmt.Errorf("parsing_exception: [weighted_avg] unknown field [%s]", k)
+		}
+	}
+	type plain WeightedAvgFieldSpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if strings.TrimSpace(p.Field) == "" && p.Script == nil {
+		return fmt.Errorf("parsing_exception: [weighted_avg] requires either [field] or [script]")
+	}
+	if p.Script != nil {
+		if err := validateScriptValue(p.Script); err != nil {
+			return err
+		}
+	}
+	*wf = WeightedAvgFieldSpec(p)
+	return nil
+}
+
 // WeightedAvgAggSpec models an ES `weighted_avg` metric aggregation.
 type WeightedAvgAggSpec struct {
 	Value     WeightedAvgFieldSpec `json:"value"`
@@ -7675,10 +8777,76 @@ type WeightedAvgAggSpec struct {
 	ValueType string               `json:"value_type,omitempty"`
 }
 
+func (w *WeightedAvgAggSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "value", "weight", "format", "value_type", "meta":
+		default:
+			return fmt.Errorf("parsing_exception: [weighted_avg] unknown field [%s]", k)
+		}
+	}
+	type plain WeightedAvgAggSpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if (strings.TrimSpace(p.Value.Field) == "" && p.Value.Script == nil) ||
+		(strings.TrimSpace(p.Weight.Field) == "" && p.Weight.Script == nil) {
+		return fmt.Errorf("parsing_exception: [weighted_avg] requires both [value] and [weight]")
+	}
+	*w = WeightedAvgAggSpec(p)
+	return nil
+}
+
 // GeoBoundsAggSpec models an ES `geo_bounds` metric aggregation.
 type GeoBoundsAggSpec struct {
 	Field         string `json:"field"`
 	WrapLongitude *bool  `json:"wrap_longitude,omitempty"`
+}
+
+func (gb *GeoBoundsAggSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "field", "wrap_longitude", "meta":
+		default:
+			return fmt.Errorf("parsing_exception: [geo_bounds] unknown field [%s]", k)
+		}
+	}
+	var raw struct {
+		Field         string `json:"field"`
+		WrapLongitude any    `json:"wrap_longitude"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if strings.TrimSpace(raw.Field) == "" {
+		return fmt.Errorf("parsing_exception: [geo_bounds] requires [field]")
+	}
+	gb.Field = raw.Field
+	if raw.WrapLongitude != nil {
+		b, err := parseFlexibleBool(raw.WrapLongitude)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [geo_bounds] [wrap_longitude] %w", err)
+		}
+		gb.WrapLongitude = &b
+	}
+	return nil
 }
 
 // GeoDistanceAggSpec models an ES `geo_distance` bucket aggregation.
@@ -7691,13 +8859,199 @@ type GeoDistanceAggSpec struct {
 	Ranges       []RangeAggBucket `json:"ranges"`
 }
 
+func (gd *GeoDistanceAggSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "field", "origin", "ranges", "unit", "distance_type", "keyed", "key", "aggs", "aggregations", "meta":
+		default:
+			return fmt.Errorf("parsing_exception: [geo_distance] unknown field [%s]", k)
+		}
+	}
+	type plain GeoDistanceAggSpec
+	var raw struct {
+		plain
+		Keyed any `json:"keyed"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	p := raw.plain
+	if strings.TrimSpace(p.Field) == "" {
+		return fmt.Errorf("parsing_exception: [geo_distance] requires [field]")
+	}
+	if p.Origin == nil {
+		return fmt.Errorf("parsing_exception: [geo_distance] requires [origin]")
+	}
+	if _, _, err := ParseGeoPoint(p.Origin); err != nil {
+		return fmt.Errorf("parsing_exception: [geo_distance] invalid [origin]: %w", err)
+	}
+	if len(p.Ranges) == 0 {
+		return fmt.Errorf("parsing_exception: [geo_distance] requires non-empty [ranges]")
+	}
+	for _, r := range p.Ranges {
+		if r.From == nil && r.To == nil {
+			return fmt.Errorf("parsing_exception: [geo_distance] range bucket requires [from] or [to]")
+		}
+		if r.Mask != "" {
+			return fmt.Errorf("parsing_exception: [geo_distance] range bucket does not support [mask]")
+		}
+	}
+	if strings.TrimSpace(p.Unit) != "" {
+		if _, ok := GeoDistanceUnitMultiplier(p.Unit); !ok {
+			if _, _, err := ParseGeoDistanceMeters("1" + strings.TrimSpace(p.Unit)); err != nil {
+				return fmt.Errorf("parsing_exception: [geo_distance] unknown distance unit [%s]", p.Unit)
+			}
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(p.DistanceType)) {
+	case "", "arc", "plane":
+	default:
+		return fmt.Errorf("parsing_exception: [geo_distance] invalid [distance_type] [%s]", p.DistanceType)
+	}
+	if raw.Keyed != nil {
+		b, err := parseFlexibleBool(raw.Keyed)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [geo_distance] [keyed] %w", err)
+		}
+		p.Keyed = b
+	}
+	*gd = GeoDistanceAggSpec(p)
+	return nil
+}
+
+// ParseGeoBoundingBox validates and extracts `(top, left, bottom, right)` from an ES bounding-box map.
+func ParseGeoBoundingBox(bounds map[string]any) (top, left, bottom, right float64, err error) {
+	if len(bounds) == 0 {
+		return 0, 0, 0, 0, fmt.Errorf("parsing_exception: [bounds] cannot be empty")
+	}
+	rawBytes, err := json.Marshal(map[string]any{"loc": bounds})
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	var q GeoBoundingBoxQuery
+	if err := json.Unmarshal(rawBytes, &q); err != nil {
+		return 0, 0, 0, 0, err
+	}
+	return q.Top, q.Left, q.Bottom, q.Right, nil
+}
+
+func geohashPrecisionFromMeters(meters float64) int {
+	thresholds := []struct {
+		maxMeters float64
+		precision int
+	}{
+		{0.037, 12},
+		{0.149, 11},
+		{1.19, 10},
+		{4.77, 9},
+		{38.2, 8},
+		{153.0, 7},
+		{1220.0, 6},
+		{4890.0, 5},
+		{39100.0, 4},
+		{156000.0, 3},
+		{1250000.0, 2},
+	}
+	for _, th := range thresholds {
+		if meters <= th.maxMeters {
+			return th.precision
+		}
+	}
+	return 1
+}
+
 // GeoGridAggSpec models an ES `geohash_grid` or `geotile_grid` bucket aggregation.
 type GeoGridAggSpec struct {
-	Field     string         `json:"field"`
-	Precision *int           `json:"precision,omitempty"`
-	Size      int            `json:"size,omitempty"`
-	ShardSize int            `json:"shard_size,omitempty"`
-	Bounds    map[string]any `json:"bounds,omitempty"`
+	Field                  string         `json:"field"`
+	Precision              *int           `json:"precision,omitempty"`
+	precisionWasDistString bool           `json:"-"`
+	Size                   int            `json:"size,omitempty"`
+	ShardSize              int            `json:"shard_size,omitempty"`
+	Bounds                 map[string]any `json:"bounds,omitempty"`
+}
+
+func (gg *GeoGridAggSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "field", "precision", "bounds", "size", "shard_size", "aggs", "aggregations", "meta":
+		default:
+			return fmt.Errorf("parsing_exception: [geo_grid] unknown field [%s]", k)
+		}
+	}
+	var raw struct {
+		Field     string          `json:"field"`
+		Precision json.RawMessage `json:"precision"`
+		Size      *int            `json:"size"`
+		ShardSize *int            `json:"shard_size"`
+		Bounds    map[string]any  `json:"bounds"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if strings.TrimSpace(raw.Field) == "" {
+		return fmt.Errorf("parsing_exception: [geo_grid] requires [field]")
+	}
+	var p GeoGridAggSpec
+	p.Field = raw.Field
+	if raw.Size != nil {
+		if *raw.Size <= 0 {
+			return fmt.Errorf("illegal_argument_exception: [geo_grid] [size] must be > 0")
+		}
+		p.Size = *raw.Size
+	}
+	if raw.ShardSize != nil {
+		if *raw.ShardSize <= 0 {
+			return fmt.Errorf("illegal_argument_exception: [geo_grid] [shard_size] must be > 0")
+		}
+		p.ShardSize = *raw.ShardSize
+	}
+	if raw.Bounds != nil {
+		if _, _, _, _, err := ParseGeoBoundingBox(raw.Bounds); err != nil {
+			return err
+		}
+		p.Bounds = raw.Bounds
+	}
+	precTrim := bytes.TrimSpace(raw.Precision)
+	if len(precTrim) > 0 && !bytes.Equal(precTrim, []byte("null")) {
+		var precInt int
+		if err := json.Unmarshal(precTrim, &precInt); err == nil {
+			p.Precision = &precInt
+		} else {
+			var precStr string
+			if err := json.Unmarshal(precTrim, &precStr); err != nil {
+				return fmt.Errorf("parsing_exception: [geo_grid] invalid [precision]")
+			}
+			if iv, err := strconv.Atoi(strings.TrimSpace(precStr)); err == nil {
+				p.Precision = &iv
+			} else {
+				_, meters, err := ParseGeoDistanceMeters(precStr)
+				if err != nil {
+					return fmt.Errorf("parsing_exception: [geo_grid] invalid [precision] [%s]: %w", precStr, err)
+				}
+				mapped := geohashPrecisionFromMeters(meters)
+				p.Precision = &mapped
+				p.precisionWasDistString = true
+			}
+		}
+	}
+	*gg = p
+	return nil
 }
 
 // AdjacencyMatrixAggSpec models an ES `adjacency_matrix` bucket aggregation.
@@ -7705,6 +9059,45 @@ type AdjacencyMatrixAggSpec struct {
 	Filters   map[string]Query `json:"filters"`
 	Separator string           `json:"separator,omitempty"`
 	Keyed     bool             `json:"keyed,omitempty"`
+}
+
+func (am *AdjacencyMatrixAggSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "filters", "separator", "keyed", "aggs", "aggregations", "meta":
+		default:
+			return fmt.Errorf("parsing_exception: [adjacency_matrix] unknown field [%s]", k)
+		}
+	}
+	type plain AdjacencyMatrixAggSpec
+	var raw struct {
+		plain
+		Keyed any `json:"keyed"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	p := raw.plain
+	if len(p.Filters) == 0 {
+		return fmt.Errorf("parsing_exception: [adjacency_matrix] requires non-empty [filters]")
+	}
+	if raw.Keyed != nil {
+		b, err := parseFlexibleBool(raw.Keyed)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [adjacency_matrix] [keyed] %w", err)
+		}
+		p.Keyed = b
+	}
+	*am = AdjacencyMatrixAggSpec(p)
+	return nil
 }
 
 // MultiTermTermSpec models a single term source in a `multi_terms` aggregation.
@@ -7716,12 +9109,113 @@ type MultiTermTermSpec struct {
 	Format    string `json:"format,omitempty"`
 }
 
+func (mt *MultiTermTermSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return fmt.Errorf("parsing_exception: [multi_terms] term cannot be null")
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "field", "script", "missing", "value_type", "format":
+		default:
+			return fmt.Errorf("parsing_exception: [multi_terms.terms] unknown field [%s]", k)
+		}
+	}
+	type plain MultiTermTermSpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if strings.TrimSpace(p.Field) == "" && p.Script == nil {
+		return fmt.Errorf("parsing_exception: [multi_terms.terms] requires either [field] or [script]")
+	}
+	if p.Script != nil {
+		if err := validateScriptValue(p.Script); err != nil {
+			return err
+		}
+	}
+	*mt = MultiTermTermSpec(p)
+	return nil
+}
+
 // MultiTermsAggSpec models an ES `multi_terms` bucket aggregation.
 type MultiTermsAggSpec struct {
-	Terms       []MultiTermTermSpec `json:"terms"`
-	Size        int                 `json:"size,omitempty"`
-	MinDocCount *int                `json:"min_doc_count,omitempty"`
-	Order       any                 `json:"order,omitempty"`
+	Terms               []MultiTermTermSpec `json:"terms"`
+	Size                int                 `json:"size,omitempty"`
+	ShardSize           int                 `json:"shard_size,omitempty"`
+	MinDocCount         *int                `json:"min_doc_count,omitempty"`
+	ShardMinDocCount    *int                `json:"shard_min_doc_count,omitempty"`
+	CollectMode         string              `json:"collect_mode,omitempty"`
+	ShowTermDocCountErr *bool               `json:"show_term_doc_count_error,omitempty"`
+	Order               any                 `json:"order,omitempty"`
+}
+
+func (m *MultiTermsAggSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "terms", "order", "size", "shard_size", "min_doc_count", "shard_min_doc_count", "collect_mode", "show_term_doc_count_error", "aggs", "aggregations", "meta":
+		default:
+			return fmt.Errorf("parsing_exception: [multi_terms] unknown field [%s]", k)
+		}
+	}
+	type plain MultiTermsAggSpec
+	var raw struct {
+		plain
+		Size                *int `json:"size"`
+		ShardSize           *int `json:"shard_size"`
+		ShowTermDocCountErr any  `json:"show_term_doc_count_error"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	p := raw.plain
+	if len(p.Terms) == 0 {
+		return fmt.Errorf("parsing_exception: [multi_terms] requires non-empty [terms]")
+	}
+	if raw.Size != nil {
+		if *raw.Size <= 0 {
+			return fmt.Errorf("illegal_argument_exception: [multi_terms] [size] must be > 0")
+		}
+		p.Size = *raw.Size
+	}
+	if raw.ShardSize != nil {
+		if *raw.ShardSize <= 0 {
+			return fmt.Errorf("illegal_argument_exception: [multi_terms] [shard_size] must be > 0")
+		}
+		p.ShardSize = *raw.ShardSize
+	}
+	if p.MinDocCount != nil && *p.MinDocCount < 0 {
+		return fmt.Errorf("illegal_argument_exception: [multi_terms] [min_doc_count] must be >= 0")
+	}
+	if p.ShardMinDocCount != nil && *p.ShardMinDocCount < 0 {
+		return fmt.Errorf("illegal_argument_exception: [multi_terms] [shard_min_doc_count] must be >= 0")
+	}
+	switch strings.ToLower(strings.TrimSpace(p.CollectMode)) {
+	case "", "depth_first", "breadth_first":
+	default:
+		return fmt.Errorf("parsing_exception: [multi_terms] unknown [collect_mode] [%s]", p.CollectMode)
+	}
+	if raw.ShowTermDocCountErr != nil {
+		b, err := parseFlexibleBool(raw.ShowTermDocCountErr)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [multi_terms] [show_term_doc_count_error] %w", err)
+		}
+		p.ShowTermDocCountErr = &b
+	}
+	*m = MultiTermsAggSpec(p)
+	return nil
 }
 
 func (a *AdjacencyMatrixAggSpec) EffectiveSeparator() string {
@@ -7738,6 +9232,44 @@ type MatrixStatsAggSpec struct {
 	Missing map[string]float64 `json:"missing,omitempty"`
 }
 
+func (ms *MatrixStatsAggSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "fields", "mode", "missing", "meta":
+		default:
+			return fmt.Errorf("parsing_exception: [matrix_stats] unknown field [%s]", k)
+		}
+	}
+	type plain MatrixStatsAggSpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if len(p.Fields) == 0 {
+		return fmt.Errorf("parsing_exception: [matrix_stats] requires non-empty [fields]")
+	}
+	for _, f := range p.Fields {
+		if strings.TrimSpace(f) == "" {
+			return fmt.Errorf("parsing_exception: [matrix_stats] field name cannot be empty")
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(p.Mode)) {
+	case "", "avg", "min", "max", "sum", "median":
+	default:
+		return fmt.Errorf("parsing_exception: [matrix_stats] unknown [mode] [%s]", p.Mode)
+	}
+	*ms = MatrixStatsAggSpec(p)
+	return nil
+}
+
 // TTestSampleSpec models the `a` or `b` sample block in `t_test`.
 type TTestSampleSpec struct {
 	Field   string `json:"field,omitempty"`
@@ -7746,11 +9278,78 @@ type TTestSampleSpec struct {
 	Filter  *Query `json:"filter,omitempty"`
 }
 
+func (ts *TTestSampleSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "field", "script", "filter", "missing":
+		default:
+			return fmt.Errorf("parsing_exception: [t_test] sample unknown field [%s]", k)
+		}
+	}
+	type plain TTestSampleSpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if strings.TrimSpace(p.Field) == "" && p.Script == nil {
+		return fmt.Errorf("parsing_exception: [t_test] sample requires either [field] or [script]")
+	}
+	if p.Script != nil {
+		if err := validateScriptValue(p.Script); err != nil {
+			return err
+		}
+	}
+	*ts = TTestSampleSpec(p)
+	return nil
+}
+
 // TTestAggSpec models an ES `t_test` metric aggregation.
 type TTestAggSpec struct {
 	A    TTestSampleSpec `json:"a"`
 	B    TTestSampleSpec `json:"b"`
 	Type string          `json:"type,omitempty"`
+}
+
+func (tt *TTestAggSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "a", "b", "type", "meta":
+		default:
+			return fmt.Errorf("parsing_exception: [t_test] unknown field [%s]", k)
+		}
+	}
+	type plain TTestAggSpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if (strings.TrimSpace(p.A.Field) == "" && p.A.Script == nil) ||
+		(strings.TrimSpace(p.B.Field) == "" && p.B.Script == nil) {
+		return fmt.Errorf("parsing_exception: [t_test] requires both [a] and [b]")
+	}
+	switch strings.ToLower(strings.TrimSpace(p.Type)) {
+	case "", "paired", "homoscedastic", "heteroscedastic":
+	default:
+		return fmt.Errorf("parsing_exception: [t_test] unknown [type] [%s]", p.Type)
+	}
+	*tt = TTestAggSpec(p)
+	return nil
 }
 
 func (a *AggSpec) UnmarshalJSON(data []byte) error {
@@ -7782,6 +9381,37 @@ func (a *AggSpec) UnmarshalJSON(data []byte) error {
 	var p plain
 	if err := json.Unmarshal(trimmed, &p); err != nil {
 		return err
+	}
+	if p.GeoCentroid != nil && strings.TrimSpace(p.GeoCentroid.Field) == "" {
+		return fmt.Errorf("parsing_exception: [geo_centroid] requires non-empty [field]")
+	}
+	if p.ReverseNested != nil {
+		for k, v := range p.ReverseNested {
+			if k != "path" {
+				return fmt.Errorf("parsing_exception: [reverse_nested] unknown field [%s]", k)
+			}
+			if v != nil {
+				if _, ok := v.(string); !ok {
+					return fmt.Errorf("parsing_exception: [reverse_nested] [path] must be a string")
+				}
+			}
+		}
+	}
+	if len(p.Global) > 0 {
+		return fmt.Errorf("parsing_exception: [global] aggregation does not accept any parameters")
+	}
+	if p.GeohashGrid != nil && p.GeohashGrid.Precision != nil {
+		if *p.GeohashGrid.Precision < 1 || *p.GeohashGrid.Precision > 12 {
+			return fmt.Errorf("illegal_argument_exception: [geohash_grid] [precision] must be between 1 and 12")
+		}
+	}
+	if p.GeotileGrid != nil {
+		if p.GeotileGrid.precisionWasDistString {
+			return fmt.Errorf("parsing_exception: [geotile_grid] [precision] must be an integer between 0 and 29")
+		}
+		if p.GeotileGrid.Precision != nil && (*p.GeotileGrid.Precision < 0 || *p.GeotileGrid.Precision > 29) {
+			return fmt.Errorf("illegal_argument_exception: [geotile_grid] [precision] must be between 0 and 29")
+		}
 	}
 	if p.MovingFn != nil {
 		if p.MovingFn.Script == nil || strings.TrimSpace(fmt.Sprintf("%v", p.MovingFn.Script)) == "" {
@@ -8140,6 +9770,69 @@ type RateAggSpec struct {
 	Mode   string `json:"mode,omitempty"`
 }
 
+func (r *RateAggSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "field", "script", "unit", "mode", "meta":
+		default:
+			return fmt.Errorf("parsing_exception: [rate] unknown field [%s]", k)
+		}
+	}
+	type plain RateAggSpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if p.Script != nil {
+		if err := validateScriptValue(p.Script); err != nil {
+			return err
+		}
+	}
+	if u := strings.TrimSpace(p.Unit); u != "" {
+		normU := u
+		if len(normU) > 1 && strings.HasPrefix(normU, "1") {
+			normU = strings.TrimSpace(normU[1:])
+		}
+		validUnit := false
+		if normU == "M" {
+			validUnit = true
+		} else {
+			switch strings.ToLower(normU) {
+			case "second", "seconds", "s",
+				"minute", "minutes", "m",
+				"hour", "hours", "h",
+				"day", "days", "d",
+				"week", "weeks", "w",
+				"month", "months",
+				"quarter", "quarters", "q",
+				"year", "years", "y":
+				validUnit = true
+			}
+		}
+		if !validUnit {
+			return fmt.Errorf("parsing_exception: [rate] unknown [unit] [%s]", p.Unit)
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(p.Mode)) {
+	case "", "sum", "value_count":
+	default:
+		return fmt.Errorf("parsing_exception: [rate] unknown [mode] [%s]", p.Mode)
+	}
+	if strings.TrimSpace(p.Field) == "" && p.Script == nil && strings.TrimSpace(p.Unit) == "" {
+		return fmt.Errorf("parsing_exception: [rate] requires [field], [script], or [unit]")
+	}
+	*r = RateAggSpec(p)
+	return nil
+}
+
 func validateGapPolicy(gp string, aggName string) error {
 	switch strings.ToLower(strings.TrimSpace(gp)) {
 	case "", "skip", "insert_zeros", "keep_values":
@@ -8254,6 +9947,41 @@ type ScriptedMetricAggSpec struct {
 	CombineScript any            `json:"combine_script,omitempty"`
 	ReduceScript  any            `json:"reduce_script,omitempty"`
 	Params        map[string]any `json:"params,omitempty"`
+}
+
+func (sm *ScriptedMetricAggSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "init_script", "map_script", "combine_script", "reduce_script", "params", "meta":
+		default:
+			return fmt.Errorf("parsing_exception: [scripted_metric] unknown field [%s]", k)
+		}
+	}
+	type plain ScriptedMetricAggSpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if p.MapScript == nil {
+		return fmt.Errorf("parsing_exception: [scripted_metric] requires [map_script]")
+	}
+	for _, sc := range []any{p.InitScript, p.MapScript, p.CombineScript, p.ReduceScript} {
+		if sc != nil {
+			if err := validateScriptValue(sc); err != nil {
+				return err
+			}
+		}
+	}
+	*sm = ScriptedMetricAggSpec(p)
+	return nil
 }
 
 func (m *MovingAvgAggSpec) EffectivePath() string {
@@ -8748,38 +10476,77 @@ type FiltersAggSpec struct {
 }
 
 func (f *FiltersAggSpec) UnmarshalJSON(data []byte) error {
-	var raw struct {
-		Filters        json.RawMessage `json:"filters"`
-		OtherBucket    bool            `json:"other_bucket"`
-		OtherBucketKey string          `json:"other_bucket_key"`
-		Keyed          *bool           `json:"keyed"`
-	}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
-	}
-	f.OtherBucket = raw.OtherBucket || raw.OtherBucketKey != ""
-	f.OtherBucketKey = raw.OtherBucketKey
-	f.Keyed = raw.Keyed
-	trimmed := bytes.TrimSpace(raw.Filters)
-	if len(trimmed) > 0 && trimmed[0] == '[' {
-		var list []Query
-		if err := json.Unmarshal(trimmed, &list); err != nil {
-			return err
-		}
-		f.IsAnonymous = true
-		f.AnonymousFilters = list
-		f.Filters = make(map[string]Query, len(list))
-		for i, q := range list {
-			f.Filters[strconv.Itoa(i)] = q
-		}
+	trimmedData := bytes.TrimSpace(data)
+	if len(trimmedData) == 0 || bytes.Equal(trimmedData, []byte("null")) {
 		return nil
 	}
-	if len(trimmed) > 0 && trimmed[0] == '{' {
-		var m map[string]Query
-		if err := json.Unmarshal(trimmed, &m); err != nil {
-			return err
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmedData, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "filters", "buckets", "other_bucket", "other_bucket_key", "keyed", "aggs", "aggregations", "meta":
+		default:
+			return fmt.Errorf("parsing_exception: [filters] unknown field [%s]", k)
 		}
-		f.Filters = m
+	}
+	var raw struct {
+		Filters        json.RawMessage `json:"filters"`
+		Buckets        json.RawMessage `json:"buckets"`
+		OtherBucket    any             `json:"other_bucket"`
+		OtherBucketKey string          `json:"other_bucket_key"`
+		Keyed          any             `json:"keyed"`
+	}
+	if err := json.Unmarshal(trimmedData, &raw); err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(raw.Filters)) == 0 && len(bytes.TrimSpace(raw.Buckets)) > 0 {
+		raw.Filters = raw.Buckets
+	}
+	otherBucket := false
+	if raw.OtherBucket != nil {
+		b, err := parseFlexibleBool(raw.OtherBucket)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [filters] [other_bucket] %w", err)
+		}
+		otherBucket = b
+	}
+	f.OtherBucket = otherBucket || raw.OtherBucketKey != ""
+	f.OtherBucketKey = raw.OtherBucketKey
+	if raw.Keyed != nil {
+		b, err := parseFlexibleBool(raw.Keyed)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [filters] [keyed] %w", err)
+		}
+		f.Keyed = &b
+	}
+	trimmed := bytes.TrimSpace(raw.Filters)
+	if len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null")) {
+		switch trimmed[0] {
+		case '[':
+			var list []Query
+			if err := json.Unmarshal(trimmed, &list); err != nil {
+				return err
+			}
+			f.IsAnonymous = true
+			f.AnonymousFilters = list
+			f.Filters = make(map[string]Query, len(list))
+			for i, q := range list {
+				f.Filters[strconv.Itoa(i)] = q
+			}
+		case '{':
+			var m map[string]Query
+			if err := json.Unmarshal(trimmed, &m); err != nil {
+				return err
+			}
+			f.Filters = m
+		default:
+			return fmt.Errorf("parsing_exception: [filters] [filters] must be an object or array")
+		}
+	}
+	if len(f.Filters) == 0 && len(f.AnonymousFilters) == 0 && !f.OtherBucket {
+		return fmt.Errorf("parsing_exception: [filters] requires non-empty [filters]")
 	}
 	return nil
 }
@@ -9667,11 +11434,105 @@ type NestedAggSpec struct {
 	Path string `json:"path"`
 }
 
+func (n *NestedAggSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "path", "aggs", "aggregations", "meta":
+		default:
+			return fmt.Errorf("parsing_exception: [nested] unknown field [%s]", k)
+		}
+	}
+	var raw struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	if strings.TrimSpace(raw.Path) == "" {
+		return fmt.Errorf("parsing_exception: [nested] requires non-empty [path]")
+	}
+	n.Path = raw.Path
+	return nil
+}
+
 type MetricAggSpec struct {
 	Field   string   `json:"field"`
 	Sigma   *float64 `json:"sigma,omitempty"`
 	Missing any      `json:"missing,omitempty"`
 	Script  any      `json:"script,omitempty"`
+}
+
+func (m *MetricAggSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "field", "script", "missing", "format", "value_type", "sigma", "precision_threshold", "execution_hint", "rehash", "compression", "show_distribution", "aggs", "aggregations", "meta":
+		default:
+			return fmt.Errorf("parsing_exception: [metric] unknown field [%s]", k)
+		}
+	}
+	type plain MetricAggSpec
+	var raw struct {
+		plain
+		PrecisionThreshold *int     `json:"precision_threshold"`
+		Compression        *float64 `json:"compression"`
+		Rehash             any      `json:"rehash"`
+		ShowDistribution   any      `json:"show_distribution"`
+		ExecutionHint      string   `json:"execution_hint"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	p := raw.plain
+	if strings.TrimSpace(p.Field) == "" && p.Script == nil {
+		return fmt.Errorf("parsing_exception: metric aggregation requires either [field] or [script]")
+	}
+	if p.Script != nil {
+		if err := validateScriptValue(p.Script); err != nil {
+			return err
+		}
+	}
+	if p.Sigma != nil && (*p.Sigma < 0 || math.IsNaN(*p.Sigma) || math.IsInf(*p.Sigma, 0)) {
+		return fmt.Errorf("illegal_argument_exception: [sigma] must be >= 0")
+	}
+	if raw.PrecisionThreshold != nil && (*raw.PrecisionThreshold < 0 || *raw.PrecisionThreshold > 40000) {
+		return fmt.Errorf("illegal_argument_exception: [precision_threshold] must be in [0, 40000]")
+	}
+	if raw.Compression != nil && (*raw.Compression <= 0 || math.IsNaN(*raw.Compression) || math.IsInf(*raw.Compression, 0)) {
+		return fmt.Errorf("illegal_argument_exception: [compression] must be > 0")
+	}
+	if raw.Rehash != nil {
+		if _, err := parseFlexibleBool(raw.Rehash); err != nil {
+			return fmt.Errorf("parsing_exception: [rehash] %w", err)
+		}
+	}
+	if raw.ShowDistribution != nil {
+		if _, err := parseFlexibleBool(raw.ShowDistribution); err != nil {
+			return fmt.Errorf("parsing_exception: [show_distribution] %w", err)
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(raw.ExecutionHint)) {
+	case "", "map", "global_ordinals", "bytes_hash", "ordinals", "direct":
+	default:
+		return fmt.Errorf("parsing_exception: unknown [execution_hint] [%s]", raw.ExecutionHint)
+	}
+	*m = MetricAggSpec(p)
+	return nil
 }
 
 func (m *MetricAggSpec) EffectiveSigma() float64 {
@@ -9686,6 +11547,37 @@ type NestedSortSpec struct {
 	Filter      *Query          `json:"filter,omitempty"`
 	Nested      *NestedSortSpec `json:"nested,omitempty"`
 	MaxChildren *int            `json:"max_children,omitempty"`
+}
+
+func (ns *NestedSortSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "path", "filter", "nested", "max_children":
+		default:
+			return fmt.Errorf("parsing_exception: [nested] sort unknown field [%s]", k)
+		}
+	}
+	type plain NestedSortSpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if strings.TrimSpace(p.Path) == "" {
+		return fmt.Errorf("parsing_exception: [nested] sort requires non-empty [path]")
+	}
+	if p.MaxChildren != nil && *p.MaxChildren <= 0 && *p.MaxChildren != -1 {
+		return fmt.Errorf("illegal_argument_exception: [nested] sort [max_children] must be > 0 or -1")
+	}
+	*ns = NestedSortSpec(p)
+	return nil
 }
 
 type SortEntry = SortFieldSpec
@@ -9902,12 +11794,85 @@ func (ss *SortSlice) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func validateSortOrderString(order string) (string, error) {
+	ord := strings.ToLower(strings.TrimSpace(order))
+	switch ord {
+	case "", "asc":
+		return "asc", nil
+	case "desc":
+		return "desc", nil
+	default:
+		return "", fmt.Errorf("illegal_argument_exception: No enum constant org.elasticsearch.search.sort.SortOrder.%s", order)
+	}
+}
+
+func validateSortModeString(mode string, isGeo bool) (string, error) {
+	m := strings.ToLower(strings.TrimSpace(mode))
+	switch m {
+	case "", "min", "max", "avg", "median":
+		return m, nil
+	case "sum":
+		if isGeo {
+			return "", fmt.Errorf("illegal_argument_exception: [_geo_distance] sort does not support [sum] mode")
+		}
+		return m, nil
+	default:
+		return "", fmt.Errorf("illegal_argument_exception: unknown sort [mode] [%s]", mode)
+	}
+}
+
+func validateGeoSortTargetValue(raw any, validationMethod string) error {
+	if raw == nil {
+		return fmt.Errorf("parsing_exception: [_geo_distance] target point cannot be null")
+	}
+	if arr, ok := raw.([]any); ok {
+		if len(arr) == 0 {
+			return fmt.Errorf("parsing_exception: [_geo_distance] target point array cannot be empty")
+		}
+		// Check if it is a [lon, lat] numeric coordinate pair vs an array of geo points
+		isCoordPair := (len(arr) == 2 || len(arr) == 3)
+		if isCoordPair {
+			for _, elem := range arr {
+				switch elem.(type) {
+				case float64, int, int64, json.Number:
+				default:
+					isCoordPair = false
+				}
+			}
+		}
+		if !isCoordPair {
+			for _, elem := range arr {
+				lat, lon, err := ParseGeoPoint(elem)
+				if err != nil {
+					return err
+				}
+				if _, _, err := validateAndNormalizeGeoPoint(lat, lon, validationMethod); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}
+	lat, lon, err := ParseGeoPoint(raw)
+	if err != nil {
+		return err
+	}
+	_, _, err = validateAndNormalizeGeoPoint(lat, lon, validationMethod)
+	return err
+}
+
 func (s *SortSpec) UnmarshalJSON(data []byte) error {
 	trimmed := bytes.TrimSpace(data)
-	if len(trimmed) > 0 && trimmed[0] == '"' {
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return fmt.Errorf("parsing_exception: sort specification cannot be null")
+	}
+	if trimmed[0] == '"' {
 		var fieldName string
 		if err := json.Unmarshal(trimmed, &fieldName); err != nil {
 			return err
+		}
+		if strings.TrimSpace(fieldName) == "" {
+			return fmt.Errorf("parsing_exception: sort field name cannot be empty")
 		}
 		order := "asc"
 		if fieldName == "_score" {
@@ -9916,11 +11881,35 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 		s.Entry = SortFieldSpec{Field: fieldName, Order: order}
 		return nil
 	}
+	if trimmed[0] != '{' {
+		return fmt.Errorf("parsing_exception: sort element must be a string or object")
+	}
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(trimmed, &m); err != nil {
 		return err
 	}
+	if len(m) == 0 {
+		return fmt.Errorf("parsing_exception: sort object cannot be empty")
+	}
 	if rawVal, ok := m["_script"]; ok {
+		allowedScriptSortKeys := map[string]bool{
+			"script": true, "type": true, "order": true, "mode": true,
+			"nested": true, "nested_path": true, "nested_filter": true, "missing": true,
+		}
+		for k := range m {
+			if k != "_script" && !allowedScriptSortKeys[k] {
+				return fmt.Errorf("parsing_exception: [_script] sort unknown field [%s]", k)
+			}
+		}
+		var innerRawMap map[string]json.RawMessage
+		if err := json.Unmarshal(rawVal, &innerRawMap); err != nil {
+			return fmt.Errorf("parsing_exception: [_script] sort must be an object: %w", err)
+		}
+		for k := range innerRawMap {
+			if !allowedScriptSortKeys[k] {
+				return fmt.Errorf("parsing_exception: [_script] sort unknown field [%s]", k)
+			}
+		}
 		order := "asc"
 		var obj struct {
 			Order        string          `json:"order"`
@@ -9932,29 +11921,50 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 			NestedPath   string          `json:"nested_path"`
 			NestedFilter *Query          `json:"nested_filter"`
 		}
-		_ = json.Unmarshal(rawVal, &obj)
+		if err := json.Unmarshal(rawVal, &obj); err != nil {
+			return err
+		}
 		if obj.Order != "" {
-			order = strings.ToLower(obj.Order)
+			order = obj.Order
 		} else if ordRaw, hasOrd := m["order"]; hasOrd {
 			var ordStr string
-			if json.Unmarshal(ordRaw, &ordStr) == nil && ordStr != "" {
-				order = strings.ToLower(ordStr)
+			if err := json.Unmarshal(ordRaw, &ordStr); err != nil {
+				return fmt.Errorf("parsing_exception: [_script] sort [order] must be a string")
 			}
+			order = ordStr
+		}
+		normOrder, err := validateSortOrderString(order)
+		if err != nil {
+			return err
+		}
+		if err := validateScriptValue(obj.Script); err != nil {
+			return err
 		}
 		scriptType := obj.Type
 		if scriptType == "" {
 			if typeRaw, hasType := m["type"]; hasType {
-				_ = json.Unmarshal(typeRaw, &scriptType)
-			}
-		}
-		mode := strings.ToLower(obj.Mode)
-		if mode == "" {
-			if modeRaw, hasMode := m["mode"]; hasMode {
-				var modeStr string
-				if json.Unmarshal(modeRaw, &modeStr) == nil && modeStr != "" {
-					mode = strings.ToLower(modeStr)
+				if err := json.Unmarshal(typeRaw, &scriptType); err != nil {
+					return fmt.Errorf("parsing_exception: [_script] sort [type] must be a string")
 				}
 			}
+		}
+		switch strings.ToLower(strings.TrimSpace(scriptType)) {
+		case "number", "string":
+			scriptType = strings.ToLower(strings.TrimSpace(scriptType))
+		default:
+			return fmt.Errorf("parsing_exception: [_script] sort requires [type] in [number, string], got [%s]", scriptType)
+		}
+		mode := obj.Mode
+		if mode == "" {
+			if modeRaw, hasMode := m["mode"]; hasMode {
+				if err := json.Unmarshal(modeRaw, &mode); err != nil {
+					return fmt.Errorf("parsing_exception: [_script] sort [mode] must be a string")
+				}
+			}
+		}
+		normMode, err := validateSortModeString(mode, false)
+		if err != nil {
+			return err
 		}
 		missingVal := obj.Missing
 		if missingVal == nil {
@@ -9970,22 +11980,26 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 		if nestedSpec == nil {
 			if rawNested, hasNested := m["nested"]; hasNested {
 				var ns NestedSortSpec
-				if json.Unmarshal(rawNested, &ns) == nil && (ns.Path != "" || ns.Filter != nil) {
-					nestedSpec = &ns
+				if err := json.Unmarshal(rawNested, &ns); err != nil {
+					return err
 				}
+				nestedSpec = &ns
 			}
 		}
 		if nestedSpec == nil {
 			var np string
 			var nf *Query
 			if rawNP, ok := m["nested_path"]; ok {
-				_ = json.Unmarshal(rawNP, &np)
+				if err := json.Unmarshal(rawNP, &np); err != nil {
+					return err
+				}
 			}
 			if rawNF, ok := m["nested_filter"]; ok {
 				var q Query
-				if json.Unmarshal(rawNF, &q) == nil {
-					nf = &q
+				if err := json.Unmarshal(rawNF, &q); err != nil {
+					return err
 				}
+				nf = &q
 			}
 			if np != "" || nf != nil {
 				nestedSpec = &NestedSortSpec{Path: np, Filter: nf}
@@ -9993,10 +12007,10 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 		}
 		s.Entry = SortFieldSpec{
 			Field:   "_script",
-			Order:   order,
+			Order:   normOrder,
 			Script:  obj.Script,
 			Type:    scriptType,
-			Mode:    mode,
+			Mode:    normMode,
 			Missing: missing,
 			Nested:  nestedSpec,
 		}
@@ -10012,23 +12026,33 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 			NestedPath   string          `json:"nested_path"`
 			NestedFilter *Query          `json:"nested_filter"`
 		}
-		_ = json.Unmarshal(rawVal, &obj)
+		if err := json.Unmarshal(rawVal, &obj); err != nil {
+			return fmt.Errorf("parsing_exception: [_geo_distance] sort must be an object: %w", err)
+		}
 		if obj.Order != "" {
-			order = strings.ToLower(obj.Order)
+			order = obj.Order
 		} else if ordRaw, hasOrd := m["order"]; hasOrd {
 			var ordStr string
-			if json.Unmarshal(ordRaw, &ordStr) == nil && ordStr != "" {
-				order = strings.ToLower(ordStr)
+			if err := json.Unmarshal(ordRaw, &ordStr); err != nil {
+				return fmt.Errorf("parsing_exception: [_geo_distance] sort [order] must be a string")
 			}
+			order = ordStr
 		}
-		mode := strings.ToLower(obj.Mode)
+		normOrder, err := validateSortOrderString(order)
+		if err != nil {
+			return err
+		}
+		mode := obj.Mode
 		if mode == "" {
 			if modeRaw, hasMode := m["mode"]; hasMode {
-				var modeStr string
-				if json.Unmarshal(modeRaw, &modeStr) == nil && modeStr != "" {
-					mode = strings.ToLower(modeStr)
+				if err := json.Unmarshal(modeRaw, &mode); err != nil {
+					return fmt.Errorf("parsing_exception: [_geo_distance] sort [mode] must be a string")
 				}
 			}
+		}
+		normMode, err := validateSortModeString(mode, true)
+		if err != nil {
+			return err
 		}
 		missingVal := obj.Missing
 		if missingVal == nil {
@@ -10044,29 +12068,35 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 		if nestedSpec == nil {
 			if rawNested, hasNested := m["nested"]; hasNested {
 				var ns NestedSortSpec
-				if json.Unmarshal(rawNested, &ns) == nil && (ns.Path != "" || ns.Filter != nil) {
-					nestedSpec = &ns
+				if err := json.Unmarshal(rawNested, &ns); err != nil {
+					return err
 				}
+				nestedSpec = &ns
 			}
 		}
 		if nestedSpec == nil {
 			var np string
 			var nf *Query
 			if rawNP, ok := m["nested_path"]; ok {
-				_ = json.Unmarshal(rawNP, &np)
+				if err := json.Unmarshal(rawNP, &np); err != nil {
+					return err
+				}
 			}
 			if rawNF, ok := m["nested_filter"]; ok {
 				var q Query
-				if json.Unmarshal(rawNF, &q) == nil {
-					nf = &q
+				if err := json.Unmarshal(rawNF, &q); err != nil {
+					return err
 				}
+				nf = &q
 			}
 			if np != "" || nf != nil {
 				nestedSpec = &NestedSortSpec{Path: np, Filter: nf}
 			}
 		}
 		var geoMap map[string]any
-		_ = json.Unmarshal(rawVal, &geoMap)
+		if err := json.Unmarshal(rawVal, &geoMap); err != nil {
+			return fmt.Errorf("parsing_exception: [_geo_distance] sort must be an object: %w", err)
+		}
 		if geoMap == nil {
 			geoMap = make(map[string]any)
 		}
@@ -10082,15 +12112,74 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 		}
 		ignoreUnmapped := false
 		if rawIU, hasIU := geoMap["ignore_unmapped"]; hasIU && rawIU != nil {
-			if bv, err := parseFlexibleBool(rawIU); err == nil {
-				ignoreUnmapped = bv
+			bv, err := parseFlexibleBool(rawIU)
+			if err != nil {
+				return fmt.Errorf("parsing_exception: [_geo_distance] [ignore_unmapped] %w", err)
 			}
+			ignoreUnmapped = bv
+		}
+		validationMethod := ""
+		if rawVM, hasVM := geoMap["validation_method"]; hasVM && rawVM != nil {
+			vmStr, ok := rawVM.(string)
+			if !ok {
+				return fmt.Errorf("parsing_exception: [_geo_distance] [validation_method] must be a string")
+			}
+			switch strings.ToUpper(strings.TrimSpace(vmStr)) {
+			case "STRICT", "IGNORE_MALFORMED", "COERCE":
+				validationMethod = strings.ToUpper(strings.TrimSpace(vmStr))
+			default:
+				return fmt.Errorf("parsing_exception: [_geo_distance] invalid [validation_method] [%s]", vmStr)
+			}
+		}
+		if rawDT, hasDT := geoMap["distance_type"]; hasDT && rawDT != nil {
+			dtStr, ok := rawDT.(string)
+			if !ok {
+				return fmt.Errorf("parsing_exception: [_geo_distance] [distance_type] must be a string")
+			}
+			switch strings.ToLower(strings.TrimSpace(dtStr)) {
+			case "arc", "plane":
+			default:
+				return fmt.Errorf("parsing_exception: [_geo_distance] invalid [distance_type] [%s]", dtStr)
+			}
+		}
+		if rawUnit, hasUnit := geoMap["unit"]; hasUnit && rawUnit != nil {
+			uStr, ok := rawUnit.(string)
+			if !ok {
+				return fmt.Errorf("parsing_exception: [_geo_distance] [unit] must be a string")
+			}
+			if _, ok := GeoDistanceUnitMultiplier(uStr); !ok {
+				if _, _, err := ParseGeoDistanceMeters("1" + strings.TrimSpace(uStr)); err != nil {
+					return fmt.Errorf("parsing_exception: [_geo_distance] unknown [unit] [%s]", uStr)
+				}
+			}
+		}
+		knownGeoOpts := map[string]bool{
+			"order": true, "mode": true, "missing": true, "nested": true,
+			"nested_path": true, "nested_filter": true, "unit": true,
+			"distance_type": true, "validation_method": true,
+			"ignore_unmapped": true, "unmapped_type": true, "type": true,
+		}
+		targetFieldCount := 0
+		for gk, gv := range geoMap {
+			if knownGeoOpts[gk] {
+				continue
+			}
+			if strings.TrimSpace(gk) == "" {
+				return fmt.Errorf("parsing_exception: [_geo_distance] field name cannot be empty")
+			}
+			if err := validateGeoSortTargetValue(gv, validationMethod); err != nil {
+				return err
+			}
+			targetFieldCount++
+		}
+		if targetFieldCount == 0 {
+			return fmt.Errorf("parsing_exception: [_geo_distance] sort requires at least one target field")
 		}
 		unmappedType := ""
 		if utStr, okUT := geoMap["unmapped_type"].(string); okUT {
 			unmappedType = strings.ToLower(strings.TrimSpace(utStr))
 		}
-		s.Entry = SortFieldSpec{Field: "_geo_distance", Order: order, Mode: mode, Missing: missing, Type: unmappedType, IgnoreUnmapped: ignoreUnmapped, Nested: nestedSpec, Script: geoMap}
+		s.Entry = SortFieldSpec{Field: "_geo_distance", Order: normOrder, Mode: normMode, Missing: missing, Type: unmappedType, IgnoreUnmapped: ignoreUnmapped, Nested: nestedSpec, Script: geoMap}
 		return nil
 	}
 
@@ -10130,153 +12219,210 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 		}
 	}
 	sort.Strings(keys)
-	if len(keys) > 0 {
-		field := keys[0]
-		rawVal := m[field]
-		order := "asc"
-		if field == "_score" {
-			order = "desc"
+	if len(keys) == 0 {
+		return fmt.Errorf("parsing_exception: invalid sort specification")
+	}
+	field := keys[0]
+	if strings.TrimSpace(field) == "" {
+		return fmt.Errorf("parsing_exception: sort field name cannot be empty")
+	}
+	rawVal := m[field]
+	order := "asc"
+	if field == "_score" {
+		order = "desc"
+	}
+	missing := ""
+	mode := ""
+	sortType := ""
+	numericType := ""
+	sortFormat := ""
+	if rawOrd, hasOrd := m["order"]; hasOrd && field != "order" {
+		var ordStr string
+		if err := json.Unmarshal(rawOrd, &ordStr); err != nil {
+			return fmt.Errorf("parsing_exception: [sort] [order] must be a string")
 		}
-		missing := ""
-		mode := ""
-		sortType := ""
-		numericType := ""
-		sortFormat := ""
-		if rawOrd, hasOrd := m["order"]; hasOrd && field != "order" {
-			var ordStr string
-			if json.Unmarshal(rawOrd, &ordStr) == nil && ordStr != "" {
-				order = ordStr
+		if ordStr != "" {
+			order = ordStr
+		}
+	}
+	if rawMode, hasMode := m["mode"]; hasMode && field != "mode" {
+		if err := json.Unmarshal(rawMode, &mode); err != nil {
+			return fmt.Errorf("parsing_exception: [sort] [mode] must be a string")
+		}
+	}
+	if rawFmt, hasFmt := m["format"]; hasFmt && field != "format" {
+		_ = json.Unmarshal(rawFmt, &sortFormat)
+	}
+	if rawMissing, hasMissing := m["missing"]; hasMissing && field != "missing" {
+		var mv any
+		if json.Unmarshal(rawMissing, &mv) == nil && mv != nil {
+			if fv, ok := mv.(float64); ok && fv == math.Trunc(fv) && !math.IsInf(fv, 0) && !math.IsNaN(fv) {
+				missing = strconv.FormatInt(int64(fv), 10)
+			} else {
+				missing = fmt.Sprintf("%v", mv)
 			}
 		}
-		if rawMode, hasMode := m["mode"]; hasMode && field != "mode" {
-			_ = json.Unmarshal(rawMode, &mode)
+	}
+	if rawUT, hasUT := m["unmapped_type"]; hasUT && field != "unmapped_type" {
+		_ = json.Unmarshal(rawUT, &sortType)
+	}
+	if rawNT, hasNT := m["numeric_type"]; hasNT && field != "numeric_type" {
+		var nt string
+		if err := json.Unmarshal(rawNT, &nt); err != nil {
+			return fmt.Errorf("parsing_exception: [sort] numeric_type must be a string")
 		}
-		if rawFmt, hasFmt := m["format"]; hasFmt && field != "format" {
-			_ = json.Unmarshal(rawFmt, &sortFormat)
+		ntLower := strings.ToLower(strings.TrimSpace(nt))
+		if ntLower != "double" && ntLower != "long" && ntLower != "date" && ntLower != "date_nanos" {
+			return fmt.Errorf("parsing_exception: [sort] invalid numeric_type [%s]", nt)
 		}
-		if rawMissing, hasMissing := m["missing"]; hasMissing && field != "missing" {
-			var mv any
-			if json.Unmarshal(rawMissing, &mv) == nil && mv != nil {
-				if fv, ok := mv.(float64); ok && fv == math.Trunc(fv) && !math.IsInf(fv, 0) && !math.IsNaN(fv) {
-					missing = strconv.FormatInt(int64(fv), 10)
-				} else {
-					missing = fmt.Sprintf("%v", mv)
-				}
+		numericType = ntLower
+	}
+	if sortType == "" {
+		if rawT, hasT := m["type"]; hasT && field != "type" {
+			_ = json.Unmarshal(rawT, &sortType)
+		}
+	}
+	ignoreUnmapped := false
+	if rawIU, hasIU := m["ignore_unmapped"]; hasIU && field != "ignore_unmapped" {
+		var iuVal any
+		if err := json.Unmarshal(rawIU, &iuVal); err != nil {
+			return err
+		}
+		bv, err := parseFlexibleBool(iuVal)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [sort] [ignore_unmapped] %w", err)
+		}
+		ignoreUnmapped = bv
+	}
+	var nestedSpec *NestedSortSpec
+	if rawNested, hasNested := m["nested"]; hasNested && field != "nested" {
+		var ns NestedSortSpec
+		if err := json.Unmarshal(rawNested, &ns); err != nil {
+			return err
+		}
+		nestedSpec = &ns
+	}
+	if nestedSpec == nil {
+		var np string
+		var nf *Query
+		if rawNP, ok := m["nested_path"]; ok && field != "nested_path" {
+			if err := json.Unmarshal(rawNP, &np); err != nil {
+				return err
 			}
 		}
-		if rawUT, hasUT := m["unmapped_type"]; hasUT && field != "unmapped_type" {
-			_ = json.Unmarshal(rawUT, &sortType)
-		}
-		if rawNT, hasNT := m["numeric_type"]; hasNT && field != "numeric_type" {
-			var nt string
-			if err := json.Unmarshal(rawNT, &nt); err != nil {
-				return fmt.Errorf("parsing_exception: [sort] numeric_type must be a string")
+		if rawNF, ok := m["nested_filter"]; ok && field != "nested_filter" {
+			var q Query
+			if err := json.Unmarshal(rawNF, &q); err != nil {
+				return err
 			}
-			ntLower := strings.ToLower(strings.TrimSpace(nt))
+			nf = &q
+		}
+		if np != "" || nf != nil {
+			nestedSpec = &NestedSortSpec{Path: np, Filter: nf}
+		}
+	}
+	valTrimmed := bytes.TrimSpace(rawVal)
+	if len(valTrimmed) == 0 || bytes.Equal(valTrimmed, []byte("null")) {
+		return fmt.Errorf("parsing_exception: sort option for [%s] cannot be null", field)
+	}
+	if valTrimmed[0] == '"' {
+		if err := json.Unmarshal(valTrimmed, &order); err != nil {
+			return err
+		}
+		normOrder, err := validateSortOrderString(order)
+		if err != nil {
+			return err
+		}
+		normMode, err := validateSortModeString(mode, false)
+		if err != nil {
+			return err
+		}
+		s.Entry = SortFieldSpec{Field: field, Order: normOrder, Mode: normMode, Missing: missing, Type: strings.ToLower(sortType), NumericType: numericType, Format: sortFormat, IgnoreUnmapped: ignoreUnmapped, Nested: nestedSpec}
+		return nil
+	}
+	if valTrimmed[0] == '{' {
+		var innerMap map[string]json.RawMessage
+		if err := json.Unmarshal(valTrimmed, &innerMap); err != nil {
+			return err
+		}
+		for ik := range innerMap {
+			switch ik {
+			case "order", "mode", "missing", "unmapped_type", "numeric_type", "type", "format", "ignore_unmapped", "nested", "nested_path", "nested_filter":
+			default:
+				return fmt.Errorf("parsing_exception: [sort] unknown field [%s] for [%s]", ik, field)
+			}
+		}
+		var obj struct {
+			Order          string          `json:"order"`
+			Mode           string          `json:"mode"`
+			Missing        any             `json:"missing"`
+			UnmappedType   string          `json:"unmapped_type"`
+			NumericType    string          `json:"numeric_type"`
+			Type           string          `json:"type"`
+			Format         string          `json:"format"`
+			IgnoreUnmapped any             `json:"ignore_unmapped"`
+			Nested         *NestedSortSpec `json:"nested"`
+			NestedPath     string          `json:"nested_path"`
+			NestedFilter   *Query          `json:"nested_filter"`
+		}
+		if err := json.Unmarshal(valTrimmed, &obj); err != nil {
+			return err
+		}
+		if obj.Order != "" {
+			order = obj.Order
+		}
+		normOrder, err := validateSortOrderString(order)
+		if err != nil {
+			return err
+		}
+		if obj.Mode != "" {
+			mode = obj.Mode
+		}
+		normMode, err := validateSortModeString(mode, false)
+		if err != nil {
+			return err
+		}
+		if obj.Format != "" {
+			sortFormat = obj.Format
+		}
+		if obj.IgnoreUnmapped != nil {
+			bv, err := parseFlexibleBool(obj.IgnoreUnmapped)
+			if err != nil {
+				return fmt.Errorf("parsing_exception: [sort] [ignore_unmapped] %w", err)
+			}
+			ignoreUnmapped = bv
+		}
+		if obj.Missing != nil {
+			if fv, ok := obj.Missing.(float64); ok && fv == math.Trunc(fv) && !math.IsInf(fv, 0) && !math.IsNaN(fv) {
+				missing = strconv.FormatInt(int64(fv), 10)
+			} else {
+				missing = fmt.Sprintf("%v", obj.Missing)
+			}
+		}
+		if obj.Nested != nil {
+			nestedSpec = obj.Nested
+		} else if obj.NestedPath != "" || obj.NestedFilter != nil {
+			if strings.TrimSpace(obj.NestedPath) == "" {
+				return fmt.Errorf("parsing_exception: [sort] [nested_filter] requires [nested_path]")
+			}
+			nestedSpec = &NestedSortSpec{Path: obj.NestedPath, Filter: obj.NestedFilter}
+		}
+		if obj.UnmappedType != "" {
+			sortType = obj.UnmappedType
+		} else if obj.Type != "" {
+			sortType = obj.Type
+		}
+		if obj.NumericType != "" {
+			ntLower := strings.ToLower(strings.TrimSpace(obj.NumericType))
 			if ntLower != "double" && ntLower != "long" && ntLower != "date" && ntLower != "date_nanos" {
-				return fmt.Errorf("parsing_exception: [sort] invalid numeric_type [%s]", nt)
+				return fmt.Errorf("parsing_exception: [sort] invalid numeric_type [%s]", obj.NumericType)
 			}
 			numericType = ntLower
 		}
-		if sortType == "" {
-			if rawT, hasT := m["type"]; hasT && field != "type" {
-				_ = json.Unmarshal(rawT, &sortType)
-			}
-		}
-		ignoreUnmapped := false
-		if rawIU, hasIU := m["ignore_unmapped"]; hasIU && field != "ignore_unmapped" {
-			var iuVal any
-			if json.Unmarshal(rawIU, &iuVal) == nil {
-				if bv, err := parseFlexibleBool(iuVal); err == nil {
-					ignoreUnmapped = bv
-				}
-			}
-		}
-		var nestedSpec *NestedSortSpec
-		if rawNested, hasNested := m["nested"]; hasNested {
-			var ns NestedSortSpec
-			if json.Unmarshal(rawNested, &ns) == nil && (ns.Path != "" || ns.Filter != nil) {
-				nestedSpec = &ns
-			}
-		}
-		if nestedSpec == nil {
-			var np string
-			var nf *Query
-			if rawNP, ok := m["nested_path"]; ok {
-				_ = json.Unmarshal(rawNP, &np)
-			}
-			if rawNF, ok := m["nested_filter"]; ok {
-				var q Query
-				if json.Unmarshal(rawNF, &q) == nil {
-					nf = &q
-				}
-			}
-			if np != "" || nf != nil {
-				nestedSpec = &NestedSortSpec{Path: np, Filter: nf}
-			}
-		}
-		valTrimmed := bytes.TrimSpace(rawVal)
-		if len(valTrimmed) > 0 && valTrimmed[0] == '"' {
-			_ = json.Unmarshal(valTrimmed, &order)
-		} else if len(valTrimmed) > 0 && valTrimmed[0] == '{' {
-			var obj struct {
-				Order          string          `json:"order"`
-				Mode           string          `json:"mode"`
-				Missing        any             `json:"missing"`
-				UnmappedType   string          `json:"unmapped_type"`
-				NumericType    string          `json:"numeric_type"`
-				Type           string          `json:"type"`
-				Format         string          `json:"format"`
-				IgnoreUnmapped any             `json:"ignore_unmapped"`
-				Nested         *NestedSortSpec `json:"nested"`
-				NestedPath     string          `json:"nested_path"`
-				NestedFilter   *Query          `json:"nested_filter"`
-			}
-			_ = json.Unmarshal(valTrimmed, &obj)
-			if obj.Order != "" {
-				order = obj.Order
-			}
-			if obj.Mode != "" {
-				mode = obj.Mode
-			}
-			if obj.Format != "" {
-				sortFormat = obj.Format
-			}
-			if obj.IgnoreUnmapped != nil {
-				if bv, err := parseFlexibleBool(obj.IgnoreUnmapped); err == nil {
-					ignoreUnmapped = bv
-				}
-			}
-			if obj.Missing != nil {
-				if fv, ok := obj.Missing.(float64); ok && fv == math.Trunc(fv) && !math.IsInf(fv, 0) && !math.IsNaN(fv) {
-					missing = strconv.FormatInt(int64(fv), 10)
-				} else {
-					missing = fmt.Sprintf("%v", obj.Missing)
-				}
-			}
-			if obj.Nested != nil && (obj.Nested.Path != "" || obj.Nested.Filter != nil) {
-				nestedSpec = obj.Nested
-			} else if obj.NestedPath != "" || obj.NestedFilter != nil {
-				nestedSpec = &NestedSortSpec{Path: obj.NestedPath, Filter: obj.NestedFilter}
-			}
-			if obj.UnmappedType != "" {
-				sortType = obj.UnmappedType
-			} else if obj.Type != "" {
-				sortType = obj.Type
-			}
-			if obj.NumericType != "" {
-				ntLower := strings.ToLower(strings.TrimSpace(obj.NumericType))
-				if ntLower != "double" && ntLower != "long" && ntLower != "date" && ntLower != "date_nanos" {
-					return fmt.Errorf("parsing_exception: [sort] invalid numeric_type [%s]", obj.NumericType)
-				}
-				numericType = ntLower
-			}
-			s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Type: strings.ToLower(sortType), NumericType: numericType, Format: sortFormat, IgnoreUnmapped: ignoreUnmapped, Nested: nestedSpec}
-			return nil
-		}
-		s.Entry = SortFieldSpec{Field: field, Order: strings.ToLower(order), Mode: strings.ToLower(mode), Missing: missing, Type: strings.ToLower(sortType), NumericType: numericType, Format: sortFormat, IgnoreUnmapped: ignoreUnmapped, Nested: nestedSpec}
+		s.Entry = SortFieldSpec{Field: field, Order: normOrder, Mode: normMode, Missing: missing, Type: strings.ToLower(sortType), NumericType: numericType, Format: sortFormat, IgnoreUnmapped: ignoreUnmapped, Nested: nestedSpec}
+		return nil
 	}
-	return nil
+	return fmt.Errorf("parsing_exception: sort option for [%s] must be a string or object", field)
 }
 
 type SourceFilter struct {

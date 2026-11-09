@@ -206,6 +206,19 @@ type Server struct {
 	transforms                map[string]map[string]any
 	danglingIndices           map[string]map[string]any
 	autoscalingPolicies       map[string]map[string]any
+	synonymSets               map[string][]map[string]any
+	queryRulesets             map[string][]map[string]any
+	votingExclusions          []map[string]any
+	nodeShutdowns             map[string]map[string]any
+	rollupJobs                map[string]map[string]any
+	ccrAutoFollow             map[string]map[string]any
+	ccrFollowers              map[string]map[string]any
+	securityUsers             map[string]map[string]any
+	securityRoles             map[string]map[string]any
+	securityPrivileges        map[string]map[string]map[string]any
+	securityAPIKeys           map[string]map[string]any
+	securityServiceTokens     map[string]map[string]any
+	logstashPipelines         map[string]map[string]any
 }
 
 func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerOptions) *Server {
@@ -250,6 +263,18 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		transforms:                make(map[string]map[string]any),
 		danglingIndices:           make(map[string]map[string]any),
 		autoscalingPolicies:       make(map[string]map[string]any),
+		synonymSets:               make(map[string][]map[string]any),
+		queryRulesets:             make(map[string][]map[string]any),
+		nodeShutdowns:             make(map[string]map[string]any),
+		rollupJobs:                make(map[string]map[string]any),
+		ccrAutoFollow:             make(map[string]map[string]any),
+		ccrFollowers:              make(map[string]map[string]any),
+		securityUsers:             make(map[string]map[string]any),
+		securityRoles:             make(map[string]map[string]any),
+		securityPrivileges:        make(map[string]map[string]map[string]any),
+		securityAPIKeys:           make(map[string]map[string]any),
+		securityServiceTokens:     make(map[string]map[string]any),
+		logstashPipelines:         make(map[string]map[string]any),
 	}
 	s.coalescer = newStreamLoadCoalescer(func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
 		err := s.backend.StreamLoad(ctx, table, ndjson, syncRefresh)
@@ -841,6 +866,64 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 		segs := strings.Split(trimmed, "/")
+
+		switch {
+		case segs[0] == "_synonyms":
+			s.handleSynonyms(w, r, segs)
+			return
+		case segs[0] == "_query_rules":
+			s.handleQueryRules(w, r, segs)
+			return
+		case segs[0] == "_features":
+			s.handleFeatures(w, r, segs)
+			return
+		case len(segs) == 2 && segs[0] == "_cluster" && segs[1] == "voting_config_exclusions":
+			s.handleVotingConfigExclusions(w, r)
+			return
+		case len(segs) == 2 && segs[0] == "_migration" && segs[1] == "deprecations":
+			s.handleMigrationDeprecations(w, r, "")
+			return
+		case len(segs) == 3 && segs[1] == "_migration" && segs[2] == "deprecations":
+			s.handleMigrationDeprecations(w, r, segs[0])
+			return
+		case len(segs) == 2 && segs[0] == "_nodes" && segs[1] == "shutdown":
+			s.handleNodesShutdown(w, r, "")
+			return
+		case len(segs) == 3 && segs[0] == "_nodes" && segs[2] == "shutdown":
+			s.handleNodesShutdown(w, r, segs[1])
+			return
+		case segs[0] == "_rollup":
+			s.handleRollup(w, r, segs, "")
+			return
+		case len(segs) == 3 && segs[1] == "_rollup" && segs[2] == "data":
+			s.handleRollup(w, r, segs, segs[0])
+			return
+		case len(segs) == 1 && segs[0] == "_rollup_search":
+			s.handleRollupSearch(w, r)
+			return
+		case len(segs) == 2 && segs[1] == "_rollup_search":
+			r.SetPathValue("index", segs[0])
+			s.handleRollupSearch(w, r)
+			return
+		case segs[0] == "_searchable_snapshots":
+			s.handleSearchableSnapshots(w, r, segs, "")
+			return
+		case len(segs) == 3 && segs[1] == "_searchable_snapshots" && segs[2] == "stats":
+			s.handleSearchableSnapshots(w, r, segs, segs[0])
+			return
+		case segs[0] == "_ccr":
+			s.handleCCR(w, r, segs, "")
+			return
+		case len(segs) == 3 && segs[1] == "_ccr":
+			s.handleCCR(w, r, segs, segs[0])
+			return
+		case segs[0] == "_security":
+			s.handleSecurityAPI(w, r, segs)
+			return
+		case segs[0] == "_logstash":
+			s.handleLogstashPipeline(w, r, segs)
+			return
+		}
 
 		switch len(segs) {
 		case 1:
@@ -2218,6 +2301,10 @@ func (s *Server) handleClusterState(w http.ResponseWriter, r *http.Request) {
 			"aliases":  aliases,
 		}
 	}
+	votingExcl := make([]any, 0, len(s.votingExclusions))
+	for _, ve := range s.votingExclusions {
+		votingExcl = append(votingExcl, deepCloneDocMap(ve))
+	}
 	s.mu.RUnlock()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"cluster_name": "apache-doris-search-cluster",
@@ -2232,6 +2319,12 @@ func (s *Server) handleClusterState(w http.ResponseWriter, r *http.Request) {
 		},
 		"metadata": map[string]any{
 			"indices": indicesMeta,
+			"cluster_coordination": map[string]any{
+				"voting_config_exclusions": votingExcl,
+			},
+		},
+		"cluster_coordination": map[string]any{
+			"voting_config_exclusions": votingExcl,
 		},
 	})
 }
@@ -3656,6 +3749,7 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	bodyBytes = s.rewriteSearchBodyQueryRules(bodyBytes)
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
 		if err := json.Unmarshal(bodyBytes, &req); err != nil {
 			writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
@@ -6668,6 +6762,7 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	bodyBytes = s.rewriteSearchBodyQueryRules(bodyBytes)
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
 		if err := json.Unmarshal(bodyBytes, &body); err != nil {
 			writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
@@ -7194,6 +7289,7 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	bodyBytes = s.rewriteSearchBodyQueryRules(bodyBytes)
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
 		if err := json.Unmarshal(bodyBytes, &body); err != nil {
 			writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
@@ -8477,6 +8573,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	bodyBytes = s.rewriteSearchBodyQueryRules(bodyBytes)
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
 		if err := json.Unmarshal(bodyBytes, &req); err != nil {
 			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
@@ -8638,6 +8735,7 @@ func (s *Server) handleDorisExplain(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	bodyBytes = s.rewriteSearchBodyQueryRules(bodyBytes)
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
 		if err := json.Unmarshal(bodyBytes, &req); err != nil {
 			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
@@ -9031,6 +9129,7 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var req esast.SearchRequest
+		bodyLine = s.rewriteSearchBodyQueryRules(bodyLine)
 		if len(bodyLine) > 0 {
 			if err := json.Unmarshal(bodyLine, &req); err != nil {
 				responses = append(responses, map[string]any{
@@ -11127,6 +11226,7 @@ func (s *Server) handleCount(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	bodyBytes = s.rewriteSearchBodyQueryRules(bodyBytes)
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
 		var rawTop map[string]json.RawMessage
 		if err := json.Unmarshal(bodyBytes, &rawTop); err != nil {
