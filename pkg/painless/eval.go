@@ -39,6 +39,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf16"
 	"unicode/utf8"
 )
 
@@ -73,11 +74,45 @@ func isEmptyOptionalOrNilPainless(v any) bool {
 	return v == nil || v == painlessEmptyOptional
 }
 
-func unwrapEmptyOptionalPainless(v any) any {
+func unwrapPainlessInternalValue(v any) any {
 	if v == painlessEmptyOptional {
 		return nil
 	}
+	switch tv := v.(type) {
+	case *painlessBigInteger:
+		if tv == nil || tv.val == nil {
+			return int64(0)
+		}
+		if tv.val.IsInt64() {
+			return tv.val.Int64()
+		}
+		return tv.val.String()
+	case []any:
+		changed := false
+		for _, elem := range tv {
+			if elem == painlessEmptyOptional {
+				changed = true
+				break
+			}
+			if _, isBI := elem.(*painlessBigInteger); isBI {
+				changed = true
+				break
+			}
+		}
+		if !changed {
+			return tv
+		}
+		out := make([]any, len(tv))
+		for i, elem := range tv {
+			out[i] = unwrapPainlessInternalValue(elem)
+		}
+		return out
+	}
 	return v
+}
+
+func unwrapEmptyOptionalPainless(v any) any {
+	return unwrapPainlessInternalValue(v)
 }
 
 // painlessHexFormat represents a java.util.HexFormat instance in Painless.
@@ -628,6 +663,23 @@ func painlessClassForValuePainless(val any) painlessClassObject {
 		return painlessClassObject{fullName: "java.lang.StringBuilder", simpleName: "StringBuilder"}
 	case *painlessBigDecimal:
 		return painlessClassObject{fullName: "java.math.BigDecimal", simpleName: "BigDecimal"}
+	case *painlessBigInteger:
+		return painlessClassObject{fullName: "java.math.BigInteger", simpleName: "BigInteger"}
+	case painlessMathContext:
+		return painlessClassObject{fullName: "java.math.MathContext", simpleName: "MathContext"}
+	case *painlessTemporalAdjuster:
+		return painlessClassObject{fullName: "java.time.temporal.TemporalAdjuster", simpleName: "TemporalAdjuster"}
+	case *painlessComparator:
+		return painlessClassObject{fullName: "java.util.Comparator", simpleName: "Comparator"}
+	case *painlessBitSet:
+		return painlessClassObject{fullName: "java.util.BitSet", simpleName: "BitSet"}
+	case *painlessStringJoiner:
+		return painlessClassObject{fullName: "java.util.StringJoiner", simpleName: "StringJoiner"}
+	case *painlessUserObject:
+		if tv != nil && tv.class != nil {
+			return painlessClassObject{fullName: tv.class.name, simpleName: tv.class.name}
+		}
+		return painlessClassObject{fullName: "java.lang.Object", simpleName: "Object"}
 	case painlessYear:
 		return painlessClassObject{fullName: "java.time.Year", simpleName: "Year"}
 	case painlessMonthDay:
@@ -768,6 +820,11 @@ func parsePainlessBigDecimal(v any) (*painlessBigDecimal, bool) {
 			return nil, false
 		}
 		return newPainlessBigDecimal(tv.unscaled, tv.scale), true
+	case *painlessBigInteger:
+		if tv == nil || tv.val == nil {
+			return nil, false
+		}
+		return newPainlessBigDecimal(tv.val, 0), true
 	case int:
 		return newPainlessBigDecimal(big.NewInt(int64(tv)), 0), true
 	case int64:
@@ -895,9 +952,37 @@ func (bd *painlessBigDecimal) float64Value() float64 {
 	return f
 }
 
-func (bd *painlessBigDecimal) longValue() int64 {
-	if bd == nil || bd.unscaled == nil {
+func bigIntToLongValuePainless(val *big.Int) int64 {
+	if val == nil {
 		return 0
+	}
+	if val.IsInt64() {
+		return val.Int64()
+	}
+	mod64 := new(big.Int).Lsh(big.NewInt(1), 64)
+	rem := new(big.Int).Mod(val, mod64)
+	half64 := new(big.Int).Lsh(big.NewInt(1), 63)
+	if rem.Cmp(half64) >= 0 {
+		rem.Sub(rem, mod64)
+	}
+	return rem.Int64()
+}
+
+func int64ToInt32Painless(v int64) int64 {
+	return int64(int32(v)) // #nosec G115 -- Intentional Java 32-bit int narrowing semantics
+}
+
+func int64ToInt16Painless(v int64) int64 {
+	return int64(int16(v)) // #nosec G115 -- Intentional Java 16-bit short narrowing semantics
+}
+
+func int64ToInt8Painless(v int64) int64 {
+	return int64(int8(v)) // #nosec G115 -- Intentional Java 8-bit byte narrowing semantics
+}
+
+func (bd *painlessBigDecimal) toBigInt() *big.Int {
+	if bd == nil || bd.unscaled == nil {
+		return big.NewInt(0)
 	}
 	val := new(big.Int).Set(bd.unscaled)
 	if bd.scale > 0 {
@@ -905,7 +990,138 @@ func (bd *painlessBigDecimal) longValue() int64 {
 	} else if bd.scale < 0 {
 		val.Mul(val, bigTenPowPainless(-bd.scale))
 	}
-	return val.Int64()
+	return val
+}
+
+func (bd *painlessBigDecimal) bigIntExact() (*big.Int, error) {
+	if bd == nil || bd.unscaled == nil {
+		return big.NewInt(0), nil
+	}
+	val := new(big.Int).Set(bd.unscaled)
+	if bd.scale > 0 {
+		q, r := new(big.Int).QuoRem(val, bigTenPowPainless(bd.scale), new(big.Int))
+		if r.Sign() != 0 {
+			return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Rounding necessary"}
+		}
+		return q, nil
+	}
+	if bd.scale < 0 {
+		val.Mul(val, bigTenPowPainless(-bd.scale))
+	}
+	return val, nil
+}
+
+func (bd *painlessBigDecimal) longValue() int64 {
+	return bigIntToLongValuePainless(bd.toBigInt())
+}
+
+func (bd *painlessBigDecimal) intValue() int64 {
+	return int64ToInt32Painless(bd.longValue())
+}
+
+func (bd *painlessBigDecimal) shortValue() int64 {
+	return int64ToInt16Painless(bd.longValue())
+}
+
+func (bd *painlessBigDecimal) byteValue() int64 {
+	return int64ToInt8Painless(bd.longValue())
+}
+
+func (bd *painlessBigDecimal) longValueExact() (int64, error) {
+	bi, err := bd.bigIntExact()
+	if err != nil {
+		return 0, err
+	}
+	if !bi.IsInt64() {
+		return 0, &painlessExceptionError{exType: "ArithmeticException", message: "Overflow"}
+	}
+	return bi.Int64(), nil
+}
+
+func (bd *painlessBigDecimal) intValueExact() (int64, error) {
+	lv, err := bd.longValueExact()
+	if err != nil {
+		return 0, err
+	}
+	if lv < math.MinInt32 || lv > math.MaxInt32 {
+		return 0, &painlessExceptionError{exType: "ArithmeticException", message: "Overflow"}
+	}
+	return lv, nil
+}
+
+func (bd *painlessBigDecimal) shortValueExact() (int64, error) {
+	lv, err := bd.longValueExact()
+	if err != nil {
+		return 0, err
+	}
+	if lv < math.MinInt16 || lv > math.MaxInt16 {
+		return 0, &painlessExceptionError{exType: "ArithmeticException", message: "Overflow"}
+	}
+	return lv, nil
+}
+
+func (bd *painlessBigDecimal) byteValueExact() (int64, error) {
+	lv, err := bd.longValueExact()
+	if err != nil {
+		return 0, err
+	}
+	if lv < math.MinInt8 || lv > math.MaxInt8 {
+		return 0, &painlessExceptionError{exType: "ArithmeticException", message: "Overflow"}
+	}
+	return lv, nil
+}
+
+func (bd *painlessBigDecimal) toEngineeringString() string {
+	if bd == nil || bd.unscaled == nil {
+		return "0"
+	}
+	neg := bd.unscaled.Sign() < 0
+	absVal := new(big.Int).Abs(bd.unscaled)
+	digits := absVal.String()
+	prec := len(digits)
+	adjusted := -bd.scale + (prec - 1)
+	if bd.scale >= 0 && adjusted >= -6 {
+		return bd.toPlainString()
+	}
+	if absVal.Sign() == 0 {
+		switch {
+		case bd.scale == 0:
+			return "0"
+		case bd.scale > 0 && bd.scale <= 6:
+			return "0." + strings.Repeat("0", bd.scale)
+		default:
+			rem := adjusted % 3
+			if rem < 0 {
+				rem += 3
+			}
+			exp := adjusted - rem
+			switch rem {
+			case 0:
+				return fmt.Sprintf("0.00E%+d", exp)
+			case 1:
+				return fmt.Sprintf("0.0E%+d", exp)
+			default:
+				return fmt.Sprintf("0E%+d", exp)
+			}
+		}
+	}
+	rem := adjusted % 3
+	if rem < 0 {
+		rem += 3
+	}
+	intDigits := rem + 1
+	exp := adjusted - rem
+	var mantissa string
+	if intDigits >= len(digits) {
+		mantissa = digits + strings.Repeat("0", intDigits-len(digits))
+	} else {
+		mantissa = digits[:intDigits] + "." + digits[intDigits:]
+	}
+	out := fmt.Sprintf("%sE%+d", mantissa, exp)
+	if neg {
+		return "-" + out
+	}
+	return out
 }
 
 func (bd *painlessBigDecimal) precision() int64 {
@@ -1021,6 +1237,940 @@ func compareBigDecimalPainless(a, b *painlessBigDecimal) int {
 	return ua.Cmp(ub)
 }
 
+func (bd *painlessBigDecimal) cmp(other *painlessBigDecimal) int {
+	return compareBigDecimalPainless(bd, other)
+}
+
+func (bd *painlessBigDecimal) sub(other *painlessBigDecimal) *painlessBigDecimal {
+	ua, ub, sc := alignBigDecimalsPainless(bd, other)
+	return &painlessBigDecimal{unscaled: new(big.Int).Sub(ua, ub), scale: sc}
+}
+
+func (bd *painlessBigDecimal) mul(other *painlessBigDecimal) *painlessBigDecimal {
+	return &painlessBigDecimal{
+		unscaled: new(big.Int).Mul(bd.unscaled, other.unscaled),
+		scale:    bd.scale + other.scale,
+	}
+}
+
+func (bd *painlessBigDecimal) div(other *painlessBigDecimal, targetScale int, mode string) (*painlessBigDecimal, error) {
+	if other == nil || other.unscaled == nil || other.unscaled.Sign() == 0 {
+		return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Division by zero"}
+	}
+	num := new(big.Int).Set(bd.unscaled)
+	den := new(big.Int).Set(other.unscaled)
+	shift := targetScale - bd.scale + other.scale
+	if shift > 0 {
+		num.Mul(num, bigTenPowPainless(shift))
+	} else if shift < 0 {
+		den.Mul(den, bigTenPowPainless(-shift))
+	}
+	q, err := roundBigIntQuotientPainless(num, den, mode)
+	if err != nil {
+		return nil, err
+	}
+	return &painlessBigDecimal{unscaled: q, scale: targetScale}, nil
+}
+
+func (bd *painlessBigDecimal) divideAndRemainder(other *painlessBigDecimal) (*painlessBigDecimal, *painlessBigDecimal, error) {
+	if other == nil || other.unscaled == nil || other.unscaled.Sign() == 0 {
+		return nil, nil, &painlessExceptionError{exType: "ArithmeticException", message: "Division by zero"}
+	}
+	ua, ub, maxSc := alignBigDecimalsPainless(bd, other)
+	qInt, rInt := new(big.Int).QuoRem(ua, ub, new(big.Int))
+	prefScale := bd.scale - other.scale
+	qBD := &painlessBigDecimal{unscaled: qInt, scale: 0}
+	if prefScale > 0 {
+		qBD = &painlessBigDecimal{
+			unscaled: new(big.Int).Mul(qInt, bigTenPowPainless(prefScale)),
+			scale:    prefScale,
+		}
+	}
+	rBD := &painlessBigDecimal{unscaled: rInt, scale: maxSc}
+	return qBD, rBD, nil
+}
+
+// painlessMathContext represents a java.math.MathContext instance in Painless.
+type painlessMathContext struct {
+	precision    int
+	roundingMode string
+}
+
+func (mc painlessMathContext) String() string {
+	mode := mc.roundingMode
+	if mode == "" {
+		mode = "HALF_UP"
+	}
+	return fmt.Sprintf("precision=%d roundingMode=%s", mc.precision, mode)
+}
+
+func normalizeRoundingModePainless(v any) string {
+	if v == nil {
+		return "HALF_UP"
+	}
+	mode := fmt.Sprintf("%v", v)
+	norm := strings.TrimPrefix(strings.TrimPrefix(strings.ToUpper(strings.TrimSpace(mode)), "ROUNDINGMODE."), "ROUND_")
+	switch norm {
+	case "UP", "0":
+		return "UP"
+	case "DOWN", "1":
+		return "DOWN"
+	case "CEILING", "2":
+		return "CEILING"
+	case "FLOOR", "3":
+		return "FLOOR"
+	case "HALF_UP", "4", "":
+		return "HALF_UP"
+	case "HALF_DOWN", "5":
+		return "HALF_DOWN"
+	case "HALF_EVEN", "6":
+		return "HALF_EVEN"
+	case "UNNECESSARY", "7":
+		return "UNNECESSARY"
+	default:
+		return "HALF_UP"
+	}
+}
+
+func applyMathContextPainless(bd *painlessBigDecimal, mc painlessMathContext) (*painlessBigDecimal, error) {
+	if bd == nil || bd.unscaled == nil {
+		return newPainlessBigDecimal(big.NewInt(0), 0), nil
+	}
+	if mc.precision <= 0 || bd.unscaled.Sign() == 0 {
+		return newPainlessBigDecimal(bd.unscaled, bd.scale), nil
+	}
+	absStr := new(big.Int).Abs(bd.unscaled).String()
+	curPrec := len(absStr)
+	if curPrec <= mc.precision {
+		return newPainlessBigDecimal(bd.unscaled, bd.scale), nil
+	}
+	drop := curPrec - mc.precision
+	targetScale := bd.scale - drop
+	return bd.setScale(targetScale, mc.roundingMode)
+}
+
+func divideBigDecimalWithMathContextPainless(a, b *painlessBigDecimal, mc painlessMathContext) (*painlessBigDecimal, error) {
+	if b == nil || b.unscaled == nil || b.unscaled.Sign() == 0 {
+		return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Division by zero"}
+	}
+	if a == nil || a.unscaled == nil || a.unscaled.Sign() == 0 {
+		preferredScale := 0
+		if a != nil {
+			preferredScale = a.scale - b.scale
+		}
+		return newPainlessBigDecimal(big.NewInt(0), preferredScale), nil
+	}
+	if mc.precision <= 0 {
+		ua, ub, _ := alignBigDecimalsPainless(a, b)
+		if q, r := new(big.Int).QuoRem(ua, ub, new(big.Int)); r.Sign() == 0 {
+			return newPainlessBigDecimal(q, 0), nil
+		}
+		scale := a.scale - b.scale
+		if scale < 10 {
+			scale = 10
+		}
+		num := new(big.Int).Set(a.unscaled)
+		den := new(big.Int).Set(b.unscaled)
+		shift := scale - a.scale + b.scale
+		if shift > 0 {
+			num.Mul(num, bigTenPowPainless(shift))
+		} else if shift < 0 {
+			den.Mul(den, bigTenPowPainless(-shift))
+		}
+		if q, r := new(big.Int).QuoRem(num, den, new(big.Int)); r.Sign() == 0 {
+			return (&painlessBigDecimal{unscaled: q, scale: scale}).stripTrailingZeros(), nil
+		}
+		return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Non-terminating decimal expansion; no exact representable decimal result."}
+	}
+	precA := len(new(big.Int).Abs(a.unscaled).String())
+	precB := len(new(big.Int).Abs(b.unscaled).String())
+	extraScale := mc.precision + precB - precA + 2
+	if extraScale < 0 {
+		extraScale = 0
+	}
+	targetScale := (a.scale - b.scale) + extraScale
+	num := new(big.Int).Set(a.unscaled)
+	den := new(big.Int).Set(b.unscaled)
+	if extraScale > 0 {
+		num.Mul(num, bigTenPowPainless(extraScale))
+	}
+	q, err := roundBigIntQuotientPainless(num, den, mc.roundingMode)
+	if err != nil {
+		return nil, err
+	}
+	res := &painlessBigDecimal{unscaled: q, scale: targetScale}
+	rounded, err := applyMathContextPainless(res, mc)
+	if err != nil {
+		return nil, err
+	}
+	// Strip unnecessary trailing zeros down to preferred scale (a.scale - b.scale) per Java BigDecimal.divide(divisor, mc)
+	prefScale := a.scale - b.scale
+	u := new(big.Int).Set(rounded.unscaled)
+	sc := rounded.scale
+	ten := big.NewInt(10)
+	rem := new(big.Int)
+	for sc > prefScale && u.Sign() != 0 {
+		qTen, rTen := new(big.Int).QuoRem(u, ten, rem)
+		if rTen.Sign() != 0 {
+			break
+		}
+		u = qTen
+		sc--
+	}
+	return &painlessBigDecimal{unscaled: u, scale: sc}, nil
+}
+
+// painlessBigInteger represents an arbitrary-precision java.math.BigInteger in Painless.
+type painlessBigInteger struct {
+	val *big.Int
+}
+
+func newPainlessBigInteger(v *big.Int) *painlessBigInteger {
+	if v == nil {
+		return &painlessBigInteger{val: big.NewInt(0)}
+	}
+	return &painlessBigInteger{val: new(big.Int).Set(v)}
+}
+
+func parsePainlessBigInteger(v any) (*painlessBigInteger, bool) {
+	switch tv := v.(type) {
+	case *painlessBigInteger:
+		if tv == nil || tv.val == nil {
+			return nil, false
+		}
+		return newPainlessBigInteger(tv.val), true
+	case *painlessBigDecimal:
+		if tv == nil || tv.unscaled == nil {
+			return nil, false
+		}
+		return newPainlessBigInteger(tv.toBigInt()), true
+	case int:
+		return newPainlessBigInteger(big.NewInt(int64(tv))), true
+	case int64:
+		return newPainlessBigInteger(big.NewInt(tv)), true
+	case float64:
+		if math.IsNaN(tv) || math.IsInf(tv, 0) {
+			return nil, false
+		}
+		return newPainlessBigInteger(big.NewInt(int64(tv))), true
+	case json.Number:
+		if bi, ok := new(big.Int).SetString(strings.TrimSpace(tv.String()), 10); ok {
+			return newPainlessBigInteger(bi), true
+		}
+		return nil, false
+	case string:
+		if bi, ok := new(big.Int).SetString(strings.TrimSpace(tv), 10); ok {
+			return newPainlessBigInteger(bi), true
+		}
+		return nil, false
+	}
+	return nil, false
+}
+
+func newPainlessBigIntegerFromBytes(raw []byte) *painlessBigInteger {
+	if len(raw) == 0 {
+		return newPainlessBigInteger(big.NewInt(0))
+	}
+	mag := new(big.Int).SetBytes(raw)
+	if raw[0]&0x80 != 0 {
+		twoPow := new(big.Int).Lsh(big.NewInt(1), uint(len(raw)*8)) // #nosec G115 -- len(raw) is non-negative
+		mag.Sub(mag, twoPow)
+	}
+	return newPainlessBigInteger(mag)
+}
+
+func (bi *painlessBigInteger) String() string {
+	if bi == nil || bi.val == nil {
+		return "0"
+	}
+	return bi.val.String()
+}
+
+func (bi *painlessBigInteger) MarshalJSON() ([]byte, error) {
+	if bi == nil || bi.val == nil {
+		return []byte("null"), nil
+	}
+	return []byte(bi.val.String()), nil
+}
+
+func (bi *painlessBigInteger) longValue() int64 {
+	if bi == nil || bi.val == nil {
+		return 0
+	}
+	return bigIntToLongValuePainless(bi.val)
+}
+
+func (bi *painlessBigInteger) intValue() int64 {
+	return int64ToInt32Painless(bi.longValue())
+}
+
+func (bi *painlessBigInteger) shortValue() int64 {
+	return int64ToInt16Painless(bi.longValue())
+}
+
+func (bi *painlessBigInteger) byteValue() int64 {
+	return int64ToInt8Painless(bi.longValue())
+}
+
+func (bi *painlessBigInteger) float64Value() float64 {
+	if bi == nil || bi.val == nil {
+		return 0
+	}
+	f, _ := new(big.Float).SetInt(bi.val).Float64()
+	return f
+}
+
+func (bi *painlessBigInteger) longValueExact() (int64, error) {
+	if bi == nil || bi.val == nil {
+		return 0, nil
+	}
+	if !bi.val.IsInt64() {
+		return 0, &painlessExceptionError{exType: "ArithmeticException", message: "BigInteger out of long range"}
+	}
+	return bi.val.Int64(), nil
+}
+
+func (bi *painlessBigInteger) intValueExact() (int64, error) {
+	lv, err := bi.longValueExact()
+	if err != nil {
+		return 0, err
+	}
+	if lv < math.MinInt32 || lv > math.MaxInt32 {
+		return 0, &painlessExceptionError{exType: "ArithmeticException", message: "BigInteger out of int range"}
+	}
+	return lv, nil
+}
+
+func (bi *painlessBigInteger) shortValueExact() (int64, error) {
+	lv, err := bi.longValueExact()
+	if err != nil {
+		return 0, err
+	}
+	if lv < math.MinInt16 || lv > math.MaxInt16 {
+		return 0, &painlessExceptionError{exType: "ArithmeticException", message: "BigInteger out of short range"}
+	}
+	return lv, nil
+}
+
+func (bi *painlessBigInteger) byteValueExact() (int64, error) {
+	lv, err := bi.longValueExact()
+	if err != nil {
+		return 0, err
+	}
+	if lv < math.MinInt8 || lv > math.MaxInt8 {
+		return 0, &painlessExceptionError{exType: "ArithmeticException", message: "BigInteger out of byte range"}
+	}
+	return lv, nil
+}
+
+func (bi *painlessBigInteger) bitLength() int64 {
+	if bi == nil || bi.val == nil || bi.val.Sign() == 0 {
+		return 0
+	}
+	if bi.val.Sign() > 0 {
+		return int64(bi.val.BitLen())
+	}
+	// Java BigInteger.bitLength() for negative v is bitLength of (~v) = (-v - 1)
+	negMinus1 := new(big.Int).Add(bi.val, big.NewInt(1))
+	negMinus1.Abs(negMinus1)
+	return int64(negMinus1.BitLen())
+}
+
+func (bi *painlessBigInteger) bitCount() int64 {
+	if bi == nil || bi.val == nil || bi.val.Sign() == 0 {
+		return 0
+	}
+	target := bi.val
+	if target.Sign() < 0 {
+		// Java BigInteger.bitCount() counts bits that differ from the sign bit, i.e., popcount(~v) = popcount(-v - 1)
+		target = new(big.Int).Add(target, big.NewInt(1))
+		target.Abs(target)
+	}
+	var count int64
+	for _, b := range target.Bytes() {
+		for x := b; x != 0; x &= x - 1 {
+			count++
+		}
+	}
+	return count
+}
+
+func (bi *painlessBigInteger) getLowestSetBit() int64 {
+	if bi == nil || bi.val == nil || bi.val.Sign() == 0 {
+		return -1
+	}
+	return int64(bi.val.TrailingZeroBits()) // #nosec G115 -- bit index fits in int64
+}
+
+func (bi *painlessBigInteger) toByteArray() []any {
+	if bi == nil || bi.val == nil || bi.val.Sign() == 0 {
+		return []any{int64(0)}
+	}
+	var raw []byte
+	if bi.val.Sign() > 0 {
+		raw = bi.val.Bytes()
+		if len(raw) == 0 || (raw[0]&0x80) != 0 {
+			raw = append([]byte{0}, raw...)
+		}
+	} else {
+		bitLen := int(bi.bitLength())
+		numBytes := (bitLen / 8) + 1
+		twoPow := new(big.Int).Lsh(big.NewInt(1), uint(numBytes*8)) // #nosec G115 -- numBytes > 0
+		tc := new(big.Int).Add(twoPow, bi.val)
+		raw = tc.Bytes()
+		for len(raw) < numBytes {
+			raw = append([]byte{0}, raw...)
+		}
+	}
+	out := make([]any, len(raw))
+	for i, b := range raw {
+		sb := int64(b)
+		if sb >= 128 {
+			sb -= 256
+		}
+		out[i] = sb
+	}
+	return out
+}
+
+// painlessTemporalAdjuster represents a java.time.temporal.TemporalAdjuster instance in Painless.
+type painlessTemporalAdjuster struct {
+	kind    string
+	dow     int // 1 (MONDAY) .. 7 (SUNDAY)
+	ordinal int
+}
+
+func (ta *painlessTemporalAdjuster) String() string {
+	if ta == nil {
+		return "TemporalAdjuster"
+	}
+	return fmt.Sprintf("TemporalAdjuster[%s]", ta.kind)
+}
+
+// painlessComparator represents a first-class java.util.Comparator in Painless.
+type painlessComparator struct {
+	kind       string // "natural", "reverse", "caseInsensitive", "comparing", "nullsFirst", "nullsLast", "lambda"
+	keyExpr    string
+	lambdaExpr string
+	keyCmp     *painlessComparator
+	inner      *painlessComparator
+	reversed   bool
+	thenList   []*painlessComparator
+}
+
+func (c *painlessComparator) clone() *painlessComparator {
+	if c == nil {
+		return nil
+	}
+	cp := *c
+	if len(c.thenList) > 0 {
+		cp.thenList = make([]*painlessComparator, len(c.thenList))
+		copy(cp.thenList, c.thenList)
+	}
+	return &cp
+}
+
+func (c *painlessComparator) cloneReversed() *painlessComparator {
+	if c == nil {
+		return &painlessComparator{kind: "reverse"}
+	}
+	if len(c.thenList) > 0 {
+		return &painlessComparator{
+			kind:     "nullsFirst",
+			inner:    c.clone(),
+			reversed: true,
+		}
+	}
+	cp := c.clone()
+	cp.reversed = !cp.reversed
+	return cp
+}
+
+func (c *painlessComparator) String() string {
+	if c == nil {
+		return "Comparator"
+	}
+	return fmt.Sprintf("Comparator[%s]", c.kind)
+}
+
+// painlessBitSet represents a java.util.BitSet in Painless.
+type painlessBitSet struct {
+	words []uint64
+}
+
+func newPainlessBitSet() *painlessBitSet {
+	return &painlessBitSet{}
+}
+
+func newPainlessBitSetFromValueOf(v any) *painlessBitSet {
+	bs := newPainlessBitSet()
+	arr, ok := v.([]any)
+	if !ok || len(arr) == 0 {
+		return bs
+	}
+	// Heuristic: if any element exceeds byte bounds [-128, 255] or fits 64-bit words,
+	// determine whether caller passed a byte[] or long[]. In BitSet.valueOf(long[]) vs BitSet.valueOf(byte[]),
+	// check if all elements are within signed byte range [-128, 127] and len > 1 with small values, or treat as long[] if any element > 127 or < -128.
+	// Wait: in Java, byte[] has elements in [-128, 127], whereas long[] can also have small values like `new long[] { 5L, 10L }`.
+	// How can we distinguish `new byte[] { ... }` vs `new long[] { ... }`?
+	// Let's check: if `len(arr)` > 0, in `BitSet.valueOf`, we can check the argument expression in `evalStaticCallPainless` or if `v` was a byte array vs long array!
+	// By default here, treat `arr` as `long[]` words, and we can also have `newPainlessBitSetFromBytes(raw []byte)`!
+	words := make([]uint64, len(arr))
+	for i, elem := range arr {
+		iv, _ := toInt64Painless(elem)
+		words[i] = uint64(iv) // #nosec G115 -- Intentional Java 64-bit word bit pattern
+	}
+	bs.words = words
+	bs.trimWords()
+	return bs
+}
+
+func (bs *painlessBitSet) clone() *painlessBitSet {
+	if bs == nil {
+		return newPainlessBitSet()
+	}
+	words := make([]uint64, len(bs.words))
+	copy(words, bs.words)
+	return &painlessBitSet{words: words}
+}
+
+func (bs *painlessBitSet) trimWords() {
+	if bs == nil {
+		return
+	}
+	for len(bs.words) > 0 && bs.words[len(bs.words)-1] == 0 {
+		bs.words = bs.words[:len(bs.words)-1]
+	}
+}
+
+func (bs *painlessBitSet) ensureWord(wordIdx int) {
+	if wordIdx >= len(bs.words) {
+		newWords := make([]uint64, wordIdx+1)
+		copy(newWords, bs.words)
+		bs.words = newWords
+	}
+}
+
+func (bs *painlessBitSet) set(bitIdx int) error {
+	return bs.setBit(bitIdx, true)
+}
+
+func (bs *painlessBitSet) clearBit(bitIdx int) error {
+	return bs.setBit(bitIdx, false)
+}
+
+func (bs *painlessBitSet) setBit(bitIdx int, val bool) error {
+	if bitIdx < 0 {
+		return &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("bitIndex < 0: %d", bitIdx)}
+	}
+	wordIdx := bitIdx / 64
+	mask := uint64(1) << uint(bitIdx%64) // #nosec G115 -- bitIdx >= 0
+	if val {
+		bs.ensureWord(wordIdx)
+		bs.words[wordIdx] |= mask
+	} else if wordIdx < len(bs.words) {
+		bs.words[wordIdx] &^= mask
+		bs.trimWords()
+	}
+	return nil
+}
+
+func (bs *painlessBitSet) setRange(fromIdx, toIdx int, val bool) error {
+	if fromIdx < 0 || toIdx < 0 || fromIdx > toIdx {
+		return &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("fromIndex: %d, toIndex: %d", fromIdx, toIdx)}
+	}
+	if fromIdx == toIdx {
+		return nil
+	}
+	for i := fromIdx; i < toIdx; i++ {
+		if err := bs.setBit(i, val); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (bs *painlessBitSet) flip(bitIdx int) error {
+	return bs.flipBit(bitIdx)
+}
+
+func (bs *painlessBitSet) flipBit(bitIdx int) error {
+	if bitIdx < 0 {
+		return &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("bitIndex < 0: %d", bitIdx)}
+	}
+	wordIdx := bitIdx / 64
+	bs.ensureWord(wordIdx)
+	bs.words[wordIdx] ^= uint64(1) << uint(bitIdx%64) // #nosec G115 -- bitIdx >= 0
+	bs.trimWords()
+	return nil
+}
+
+func (bs *painlessBitSet) flipRange(fromIdx, toIdx int) error {
+	if fromIdx < 0 || toIdx < 0 || fromIdx > toIdx {
+		return &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("fromIndex: %d, toIndex: %d", fromIdx, toIdx)}
+	}
+	for i := fromIdx; i < toIdx; i++ {
+		if err := bs.flipBit(i); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (bs *painlessBitSet) get(bitIdx int) (bool, error) {
+	return bs.getBit(bitIdx)
+}
+
+func (bs *painlessBitSet) getBit(bitIdx int) (bool, error) {
+	if bitIdx < 0 {
+		return false, &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("bitIndex < 0: %d", bitIdx)}
+	}
+	wordIdx := bitIdx / 64
+	if wordIdx >= len(bs.words) {
+		return false, nil
+	}
+	return (bs.words[wordIdx] & (uint64(1) << uint(bitIdx%64))) != 0, nil // #nosec G115 -- bitIdx >= 0
+}
+
+func (bs *painlessBitSet) getRange(fromIdx, toIdx int) (*painlessBitSet, error) {
+	if fromIdx < 0 || toIdx < 0 || fromIdx > toIdx {
+		return nil, &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("fromIndex: %d, toIndex: %d", fromIdx, toIdx)}
+	}
+	res := newPainlessBitSet()
+	for i := fromIdx; i < toIdx; i++ {
+		if b, _ := bs.getBit(i); b {
+			_ = res.setBit(i-fromIdx, true)
+		}
+	}
+	return res, nil
+}
+
+func (bs *painlessBitSet) nextSetBit(fromIdx int) (int64, error) {
+	if fromIdx < 0 {
+		return -1, &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("fromIndex < 0: %d", fromIdx)}
+	}
+	maxBit := len(bs.words) * 64
+	for i := fromIdx; i < maxBit; i++ {
+		if b, _ := bs.getBit(i); b {
+			return int64(i), nil
+		}
+	}
+	return -1, nil
+}
+
+func (bs *painlessBitSet) nextClearBit(fromIdx int) (int64, error) {
+	if fromIdx < 0 {
+		return -1, &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("fromIndex < 0: %d", fromIdx)}
+	}
+	maxBit := len(bs.words) * 64
+	for i := fromIdx; i < maxBit; i++ {
+		if b, _ := bs.getBit(i); !b {
+			return int64(i), nil
+		}
+	}
+	if fromIdx > maxBit {
+		return int64(fromIdx), nil
+	}
+	return int64(maxBit), nil
+}
+
+func (bs *painlessBitSet) previousSetBit(fromIdx int) (int64, error) {
+	if fromIdx < 0 {
+		if fromIdx == -1 {
+			return -1, nil
+		}
+		return -1, &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("fromIndex < -1: %d", fromIdx)}
+	}
+	start := fromIdx
+	maxBit := len(bs.words)*64 - 1
+	if start > maxBit {
+		start = maxBit
+	}
+	for i := start; i >= 0; i-- {
+		if b, _ := bs.getBit(i); b {
+			return int64(i), nil
+		}
+	}
+	return -1, nil
+}
+
+func (bs *painlessBitSet) previousClearBit(fromIdx int) (int64, error) {
+	if fromIdx < 0 {
+		if fromIdx == -1 {
+			return -1, nil
+		}
+		return -1, &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("fromIndex < -1: %d", fromIdx)}
+	}
+	for i := fromIdx; i >= 0; i-- {
+		if b, _ := bs.getBit(i); !b {
+			return int64(i), nil
+		}
+	}
+	return -1, nil
+}
+
+func (bs *painlessBitSet) cardinality() int64 {
+	if bs == nil {
+		return 0
+	}
+	var count int64
+	for _, w := range bs.words {
+		for x := w; x != 0; x &= x - 1 {
+			count++
+		}
+	}
+	return count
+}
+
+func (bs *painlessBitSet) length() int64 {
+	if bs == nil {
+		return 0
+	}
+	bs.trimWords()
+	if len(bs.words) == 0 {
+		return 0
+	}
+	lastIdx := len(bs.words) - 1
+	w := bs.words[lastIdx]
+	bitPos := 0
+	for w > 0 {
+		bitPos++
+		w >>= 1
+	}
+	return int64(lastIdx*64 + bitPos)
+}
+
+func (bs *painlessBitSet) size() int64 {
+	if bs == nil {
+		return 0
+	}
+	return int64(len(bs.words) * 64)
+}
+
+func (bs *painlessBitSet) intersects(other *painlessBitSet) bool {
+	if bs == nil || other == nil {
+		return false
+	}
+	minW := len(bs.words)
+	if len(other.words) < minW {
+		minW = len(other.words)
+	}
+	for i := 0; i < minW; i++ {
+		if (bs.words[i] & other.words[i]) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (bs *painlessBitSet) and(other *painlessBitSet) {
+	if bs == nil || other == nil {
+		return
+	}
+	if bs == other {
+		return
+	}
+	for i := range bs.words {
+		if i < len(other.words) {
+			bs.words[i] &= other.words[i]
+		} else {
+			bs.words[i] = 0
+		}
+	}
+	bs.trimWords()
+}
+
+func (bs *painlessBitSet) or(other *painlessBitSet) {
+	if bs == nil || other == nil || bs == other {
+		return
+	}
+	if len(other.words) > len(bs.words) {
+		bs.ensureWord(len(other.words) - 1)
+	}
+	for i := range other.words {
+		bs.words[i] |= other.words[i]
+	}
+	bs.trimWords()
+}
+
+func (bs *painlessBitSet) xor(other *painlessBitSet) {
+	if bs == nil || other == nil {
+		return
+	}
+	if bs == other {
+		bs.words = nil
+		return
+	}
+	if len(other.words) > len(bs.words) {
+		bs.ensureWord(len(other.words) - 1)
+	}
+	for i := range other.words {
+		bs.words[i] ^= other.words[i]
+	}
+	bs.trimWords()
+}
+
+func (bs *painlessBitSet) andNot(other *painlessBitSet) {
+	if bs == nil || other == nil {
+		return
+	}
+	minW := len(bs.words)
+	if len(other.words) < minW {
+		minW = len(other.words)
+	}
+	for i := 0; i < minW; i++ {
+		bs.words[i] &^= other.words[i]
+	}
+	bs.trimWords()
+}
+
+func (bs *painlessBitSet) toByteArray() []any {
+	if bs == nil {
+		return []any{}
+	}
+	bs.trimWords()
+	if len(bs.words) == 0 {
+		return []any{}
+	}
+	var raw []byte
+	for _, w := range bs.words {
+		for b := 0; b < 8; b++ {
+			raw = append(raw, byte((w>>uint(b*8))&0xFF)) // #nosec G115 -- masked to 8 bits
+		}
+	}
+	for len(raw) > 0 && raw[len(raw)-1] == 0 {
+		raw = raw[:len(raw)-1]
+	}
+	out := make([]any, len(raw))
+	for i, b := range raw {
+		sb := int64(b)
+		if sb >= 128 {
+			sb -= 256
+		}
+		out[i] = sb
+	}
+	return out
+}
+
+func (bs *painlessBitSet) toLongArray() []any {
+	if bs == nil {
+		return []any{}
+	}
+	bs.trimWords()
+	out := make([]any, len(bs.words))
+	for i, w := range bs.words {
+		out[i] = int64(w) // #nosec G115 -- Intentional Java 64-bit signed long bit pattern
+	}
+	return out
+}
+
+func (bs *painlessBitSet) streamSlice() []any {
+	if bs == nil {
+		return []any{}
+	}
+	var out []any
+	maxBit := len(bs.words) * 64
+	for i := 0; i < maxBit; i++ {
+		if b, _ := bs.getBit(i); b {
+			out = append(out, int64(i))
+		}
+	}
+	if out == nil {
+		return []any{}
+	}
+	return out
+}
+
+func (bs *painlessBitSet) equals(other any) bool {
+	o, ok := other.(*painlessBitSet)
+	if !ok || bs == nil || o == nil {
+		return false
+	}
+	bs.trimWords()
+	o.trimWords()
+	if len(bs.words) != len(o.words) {
+		return false
+	}
+	for i := range bs.words {
+		if bs.words[i] != o.words[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (bs *painlessBitSet) String() string {
+	if bs == nil {
+		return "{}"
+	}
+	var parts []string
+	maxBit := len(bs.words) * 64
+	for i := 0; i < maxBit; i++ {
+		if b, _ := bs.getBit(i); b {
+			parts = append(parts, strconv.Itoa(i))
+		}
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
+}
+
+// painlessStringJoiner represents a java.util.StringJoiner in Painless.
+type painlessStringJoiner struct {
+	delim    string
+	prefix   string
+	suffix   string
+	parts    []string
+	emptyVal *string
+	hasValue bool
+}
+
+func (sj *painlessStringJoiner) length() int64 {
+	if sj == nil {
+		return 0
+	}
+	return int64(utf8.RuneCountInString(sj.String()))
+}
+
+func (sj *painlessStringJoiner) String() string {
+	if sj == nil {
+		return ""
+	}
+	if !sj.hasValue && len(sj.parts) == 0 {
+		if sj.emptyVal != nil {
+			return *sj.emptyVal
+		}
+		return sj.prefix + sj.suffix
+	}
+	return sj.prefix + strings.Join(sj.parts, sj.delim) + sj.suffix
+}
+
+// painlessUserField represents a field declaration in a user-defined Painless class.
+type painlessUserField struct {
+	name     string
+	typeName string
+	initExpr string
+}
+
+// painlessUserClass represents a user-defined class (`class Foo { ... }`) in Painless.
+type painlessUserClass struct {
+	name         string
+	fields       []painlessUserField
+	constructors []*painlessUserFunc
+	methods      map[string][]*painlessUserFunc
+}
+
+// painlessUserObject represents an instantiated user-defined class object in Painless.
+type painlessUserObject struct {
+	class  *painlessUserClass
+	fields map[string]any
+}
+
+func (uo *painlessUserObject) String() string {
+	if uo == nil || uo.class == nil {
+		return "Object"
+	}
+	return fmt.Sprintf("%s@%p", uo.class.name, uo)
+}
+
 // UpdateRequest models an Elasticsearch `/_update/<id>` or `/_update_by_query` mutation spec.
 type UpdateRequest struct {
 	Doc                map[string]any `json:"doc,omitempty"`
@@ -1073,10 +2223,10 @@ var (
 	reLocalArrayRemoveIf   = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\.removeIf\(\s*\(?\s*(?:[a-zA-Z_$][a-zA-Z0-9_$<>[\]]*\s+)?([a-zA-Z0-9_$]+)\s*\)?\s*->\s*(.+)\s*\)$`)
 	reLocalCompoundAssign  = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*\??(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\s*(\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>>=|>>=)\s*(.+)$`)
 	reLocalPropAssign      = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*)\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)\s*=\s*(.+)$`)
-	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
-	reNullVarDecl          = regexp.MustCompile(`^(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
-	reVarTypeDeclPrefix    = regexp.MustCompile(`(?s)^((?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*)\s+(.+)$`)
-	reUserFuncHeaderPrefix = regexp.MustCompile(`^(void|def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^>]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
+	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
+	reNullVarDecl          = regexp.MustCompile(`^(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
+	reVarTypeDeclPrefix    = regexp.MustCompile(`(?s)^((?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*)\s+(.+)$`)
+	reUserFuncHeaderPrefix = regexp.MustCompile(`^(void|def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics|[a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*<[^>]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
 	reIdentAssign          = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
 	reIdentOnly            = regexp.MustCompile(`^[a-zA-Z_$][a-zA-Z0-9_$]*$`)
 	reSimpleFieldPath      = regexp.MustCompile(`^[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+$`)
@@ -1284,6 +2434,7 @@ type evalBudget struct {
 	hasCtxVersion bool
 	emittedVals   []any
 	userFuncs     map[string]*painlessUserFunc
+	userClasses   map[string]*painlessUserClass
 }
 
 func latchCtxMetaOnBudget(budget *evalBudget, path []string, val any) {
@@ -1398,6 +2549,141 @@ func unmarkExplicitParamsKey(params map[string]any, key string) {
 	}
 }
 
+func isPainlessReservedKeyword(w string) bool {
+	switch w {
+	case "if", "else", "for", "while", "do", "switch", "case", "default", "try", "catch", "finally", "return", "break", "continue", "throw", "new", "class", "instanceof":
+		return true
+	}
+	return false
+}
+
+func parseParamListNamesPainless(paramStr string) []string {
+	paramStr = strings.TrimSpace(paramStr)
+	if paramStr == "" {
+		return nil
+	}
+	var paramNames []string
+	for _, p := range splitTopLevelCommaPainless(paramStr) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if closeIdx := strings.LastIndexAny(p, ">]"); closeIdx >= 0 && closeIdx+1 < len(p) {
+			p = strings.TrimSpace(p[closeIdx+1:])
+		}
+		fields := strings.Fields(p)
+		if len(fields) > 0 {
+			paramNames = append(paramNames, fields[len(fields)-1])
+		}
+	}
+	return paramNames
+}
+
+func parseUserClassDecl(stmt string) (*painlessUserClass, bool) {
+	t := strings.TrimSpace(stmt)
+	if !strings.HasPrefix(t, "class ") && !strings.HasPrefix(t, "class\t") && !strings.HasPrefix(t, "class\n") {
+		return nil, false
+	}
+	rest := strings.TrimSpace(t[len("class"):])
+	openBrace := strings.IndexByte(rest, '{')
+	if openBrace <= 0 {
+		return nil, false
+	}
+	className := strings.TrimSpace(rest[:openBrace])
+	if !reIdentOnly.MatchString(className) || isPainlessReservedKeyword(className) {
+		return nil, false
+	}
+	bodyPart := strings.TrimSpace(rest[openBrace:])
+	if !strings.HasPrefix(bodyPart, "{") || findMatchingDelimiter(bodyPart, 0, '{', '}') != len(bodyPart)-1 {
+		return nil, false
+	}
+	classBody := strings.TrimSpace(bodyPart[1 : len(bodyPart)-1])
+	cls := &painlessUserClass{
+		name:    className,
+		methods: make(map[string][]*painlessUserFunc),
+	}
+	memberStmts := splitTopLevelStatements(classBody)
+	for _, mStmt := range memberStmts {
+		mStmt = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(mStmt), ";"))
+		if mStmt == "" {
+			continue
+		}
+		// Check constructor: <ClassName>(...) { ... }
+		if openP := strings.IndexByte(mStmt, '('); openP > 0 {
+			hdr := strings.TrimSpace(mStmt[:openP])
+			if hdr == className {
+				closeP := findMatchingDelimiter(mStmt, openP, '(', ')')
+				if closeP > openP {
+					afterP := strings.TrimSpace(mStmt[closeP+1:])
+					if strings.HasPrefix(afterP, "{") && findMatchingDelimiter(afterP, 0, '{', '}') == len(afterP)-1 {
+						ctor := &painlessUserFunc{
+							name:       className,
+							returnType: className,
+							paramNames: parseParamListNamesPainless(mStmt[openP+1 : closeP]),
+							body:       strings.TrimSpace(afterP[1 : len(afterP)-1]),
+						}
+						cls.constructors = append(cls.constructors, ctor)
+						continue
+					}
+				}
+			}
+		}
+		if fnDecl, ok := parseUserFuncDecl(mStmt); ok {
+			cls.methods[fnDecl.name] = append(cls.methods[fnDecl.name], fnDecl)
+			continue
+		}
+		// Parse field declaration(s)
+		parts := splitTopLevelCommaPainless(mStmt)
+		var sharedType string
+		for idx, part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			var declPart, initExpr string
+			if eqIdx := findTopLevelAssignOpStartPainless(part); eqIdx > 0 && part[eqIdx] == '=' {
+				declPart = strings.TrimSpace(part[:eqIdx])
+				initExpr = strings.TrimSpace(part[eqIdx+1:])
+			} else {
+				declPart = part
+			}
+			if idx == 0 {
+				lastSpace := strings.LastIndexAny(declPart, " \t\n\r>]")
+				if lastSpace > 0 {
+					if declPart[lastSpace] == '>' || declPart[lastSpace] == ']' {
+						sharedType = strings.TrimSpace(declPart[:lastSpace+1])
+						fieldName := strings.TrimSpace(declPart[lastSpace+1:])
+						if reIdentOnly.MatchString(fieldName) {
+							cls.fields = append(cls.fields, painlessUserField{
+								name:     fieldName,
+								typeName: sharedType,
+								initExpr: initExpr,
+							})
+						}
+					} else {
+						sharedType = strings.TrimSpace(declPart[:lastSpace])
+						fieldName := strings.TrimSpace(declPart[lastSpace+1:])
+						if reIdentOnly.MatchString(fieldName) {
+							cls.fields = append(cls.fields, painlessUserField{
+								name:     fieldName,
+								typeName: sharedType,
+								initExpr: initExpr,
+							})
+						}
+					}
+				}
+			} else if reIdentOnly.MatchString(declPart) && sharedType != "" {
+				cls.fields = append(cls.fields, painlessUserField{
+					name:     declPart,
+					typeName: sharedType,
+					initExpr: initExpr,
+				})
+			}
+		}
+	}
+	return cls, true
+}
+
 func parseUserFuncDecl(stmt string) (*painlessUserFunc, bool) {
 	t := strings.TrimSpace(stmt)
 	openP := strings.IndexByte(t, '(')
@@ -1409,6 +2695,9 @@ func parseUserFuncDecl(stmt string) (*painlessUserFunc, bool) {
 	if m == nil {
 		return nil, false
 	}
+	if isPainlessReservedKeyword(m[1]) || isPainlessReservedKeyword(m[2]) {
+		return nil, false
+	}
 	closeP := findMatchingDelimiter(t, openP, '(', ')')
 	if closeP < 0 {
 		return nil, false
@@ -1417,23 +2706,7 @@ func parseUserFuncDecl(stmt string) (*painlessUserFunc, bool) {
 	if !strings.HasPrefix(rest, "{") || findMatchingDelimiter(rest, 0, '{', '}') != len(rest)-1 {
 		return nil, false
 	}
-	paramStr := strings.TrimSpace(t[openP+1 : closeP])
-	var paramNames []string
-	if paramStr != "" {
-		for _, p := range splitTopLevelCommaPainless(paramStr) {
-			p = strings.TrimSpace(p)
-			if p == "" {
-				continue
-			}
-			if closeIdx := strings.LastIndexAny(p, ">]"); closeIdx >= 0 && closeIdx+1 < len(p) {
-				p = strings.TrimSpace(p[closeIdx+1:])
-			}
-			fields := strings.Fields(p)
-			if len(fields) > 0 {
-				paramNames = append(paramNames, fields[len(fields)-1])
-			}
-		}
-	}
+	paramNames := parseParamListNamesPainless(t[openP+1 : closeP])
 	return &painlessUserFunc{
 		name:       m[2],
 		returnType: m[1],
@@ -1542,9 +2815,9 @@ func Eval(sourceMap map[string]any, scriptSource string, params map[string]any) 
 		}
 		if _, hasRet := evalParams["_return_val"]; !hasRet {
 			if len(budget.emittedVals) == 1 {
-				return budget.emittedVals[0], nil
+				return unwrapEmptyOptionalPainless(budget.emittedVals[0]), nil
 			}
-			return budget.emittedVals, nil
+			return unwrapEmptyOptionalPainless(budget.emittedVals), nil
 		}
 	}
 	if retVal, hasRet := evalParams["_return_val"]; hasRet {
@@ -1840,6 +3113,13 @@ func execBlock(sourceMap map[string]any, block string, params map[string]any, ct
 			if err := execSwitchStatement(sourceMap, stmt, params, ctxOp, budget); err != nil {
 				return err
 			}
+			continue
+		}
+		if clsDecl, ok := parseUserClassDecl(stmt); ok {
+			if budget.userClasses == nil {
+				budget.userClasses = make(map[string]*painlessUserClass)
+			}
+			budget.userClasses[clsDecl.name] = clsDecl
 			continue
 		}
 		if fnDecl, ok := parseUserFuncDecl(stmt); ok {
@@ -3411,6 +4691,9 @@ func syncLocalVarAlias(sourceMap map[string]any, params map[string]any, varName 
 	if sourceMap == nil || params == nil || varName == "" {
 		return
 	}
+	if wb, ok := params["__wb_"+varName].(func(any)); ok && wb != nil {
+		wb(params[varName])
+	}
 	if aliasPath, ok := params["__alias_"+varName].(string); ok && aliasPath != "" {
 		if aliasPath == "@root" {
 			for k := range sourceMap {
@@ -3538,8 +4821,50 @@ func expandStmtTargetsOnly(stmt string, sourceMap, params map[string]any) string
 	return stmt
 }
 
+func normalizeUserClassVarDeclPainless(stmt string, budget *evalBudget) string {
+	if budget == nil || len(budget.userClasses) == 0 {
+		return stmt
+	}
+	t := strings.TrimSpace(stmt)
+	endIdent := 0
+	for endIdent < len(t) && isIdentByte(t[endIdent]) {
+		endIdent++
+	}
+	if endIdent == 0 {
+		return stmt
+	}
+	clsName := t[:endIdent]
+	if _, exists := budget.userClasses[clsName]; !exists {
+		return stmt
+	}
+	pos := endIdent
+	for pos < len(t) {
+		wsPos := pos
+		for wsPos < len(t) && (t[wsPos] == ' ' || t[wsPos] == '\t') {
+			wsPos++
+		}
+		if wsPos < len(t) && t[wsPos] == '[' {
+			closeBr := findMatchingDelimiter(t, wsPos, '[', ']')
+			if closeBr > wsPos && strings.TrimSpace(t[wsPos+1:closeBr]) == "" {
+				pos = closeBr + 1
+				continue
+			}
+		}
+		break
+	}
+	wsEnd := pos
+	for wsEnd < len(t) && (t[wsEnd] == ' ' || t[wsEnd] == '\t') {
+		wsEnd++
+	}
+	if wsEnd == pos || wsEnd >= len(t) || !isIdentByte(t[wsEnd]) {
+		return stmt
+	}
+	return "def" + t[endIdent:]
+}
+
 func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any, ctxOp *string, budget *evalBudget) error {
 	delete(params, "_last_expr_val")
+	stmt = normalizeUserClassVarDeclPainless(stmt, budget)
 	stmt = expandStmtTargetsOnly(stmt, sourceMap, params)
 	if stmt == "return" || strings.HasPrefix(stmt, "return ") || strings.HasPrefix(stmt, "return;") || strings.HasPrefix(stmt, "return(") || strings.HasPrefix(stmt, "return[") || strings.HasPrefix(stmt, "return'") || strings.HasPrefix(stmt, "return\"") || strings.HasPrefix(stmt, "return/") {
 		retExpr := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(stmt, "return")), ";"))
@@ -4004,7 +5329,12 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		if len(arrPath) > 0 {
 			rootVar := decodeBracketSeg(arrPath[0])
 			if _, ok := params[rootVar]; ok {
-				if _, isBD := resolveParamPath(params, arrPath).(*painlessBigDecimal); !isBD {
+				targetVal := resolveParamPath(params, arrPath)
+				_, isBD := targetVal.(*painlessBigDecimal)
+				_, isBI := targetVal.(*painlessBigInteger)
+				_, isSJ := targetVal.(*painlessStringJoiner)
+				_, isUO := targetVal.(*painlessUserObject)
+				if !isBD && !isBI && !isSJ && !isUO {
 					if addArgs := splitTopLevelCommaPainless(m[2]); len(addArgs) == 2 {
 						idxVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(addArgs[0]), params)
 						if err != nil {
@@ -4041,17 +5371,22 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			if len(arrPath) > 0 {
 				rootVar := decodeBracketSeg(arrPath[0])
 				if _, ok := params[rootVar]; ok {
-					idxVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(setArgs[0]), params)
-					if err != nil {
-						return err
+					targetVal := resolveParamPath(params, arrPath)
+					_, isBS := targetVal.(*painlessBitSet)
+					_, isUO := targetVal.(*painlessUserObject)
+					if !isBS && !isUO {
+						idxVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(setArgs[0]), params)
+						if err != nil {
+							return err
+						}
+						newVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(setArgs[1]), params)
+						if err != nil {
+							return err
+						}
+						params["_last_expr_val"] = setSliceElementAtPath(params, arrPath, idxVal, newVal)
+						syncLocalVarAlias(sourceMap, params, rootVar)
+						return nil
 					}
-					newVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(setArgs[1]), params)
-					if err != nil {
-						return err
-					}
-					params["_last_expr_val"] = setSliceElementAtPath(params, arrPath, idxVal, newVal)
-					syncLocalVarAlias(sourceMap, params, rootVar)
-					return nil
 				}
 			}
 		}
@@ -4181,21 +5516,24 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			_, hasRoot = params[rootVar]
 		}
 		if hasRoot {
-			if isRootParams {
-				for k := range params {
-					if !isInternalPainlessMapKey(params, k) {
-						delete(params, k)
-						unmarkExplicitParamsKey(params, k)
+			targetVal := resolveParamPath(params, targetPath)
+			if _, isUO := targetVal.(*painlessUserObject); !isUO {
+				if isRootParams {
+					for k := range params {
+						if !isInternalPainlessMapKey(params, k) {
+							delete(params, k)
+							unmarkExplicitParamsKey(params, k)
+						}
+					}
+				} else {
+					clearAtPath(params, targetPath)
+					if rootVar != "" {
+						syncLocalVarAlias(sourceMap, params, rootVar)
 					}
 				}
-			} else {
-				clearAtPath(params, targetPath)
-				if rootVar != "" {
-					syncLocalVarAlias(sourceMap, params, rootVar)
-				}
+				params["_last_expr_val"] = nil
+				return nil
 			}
-			params["_last_expr_val"] = nil
-			return nil
 		}
 	}
 	if !isTopLevelAssignmentStmt(stmt) && !strings.HasPrefix(stmt, "return ") && !strings.HasPrefix(stmt, "return(") {
@@ -4423,7 +5761,9 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 	if m := reLocalVarAssign.FindStringSubmatch(stmt); m != nil && !strings.HasPrefix(strings.TrimSpace(m[2]), "=") && !strings.HasPrefix(strings.TrimSpace(m[2]), "~") {
 		varName := m[1]
 		_, existed := params[varName]
+		var isLocalDecl bool
 		if reVarTypeDeclPrefix.MatchString(stmt) {
+			isLocalDecl = true
 			if ld, ok := params["__loop_declared"].(map[string]bool); ok {
 				ld[varName] = true
 			}
@@ -4431,16 +5771,43 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 				sl[varName] = true
 			}
 		} else if !existed {
-			if sl, ok := params["__script_locals"].(map[string]bool); ok {
-				sl[varName] = true
+			hasImplicitField := false
+			if uo, isThis := params["this"].(*painlessUserObject); isThis && uo != nil && uo.fields != nil {
+				_, hasImplicitField = uo.fields[varName]
+			}
+			if !hasImplicitField {
+				if sl, ok := params["__script_locals"].(map[string]bool); ok {
+					sl[varName] = true
+				}
 			}
 		}
 		rhsExpr := strings.TrimSpace(m[2])
-		val, err := evalRHSExpr(sourceMap, rhsExpr, params)
+		val, writeBack, err := resolveMutableReceiverPainless(sourceMap, rhsExpr, params, 0)
 		if err != nil {
 			return err
 		}
 		params[varName] = val
+		if writeBack != nil {
+			params["__wb_"+varName] = writeBack
+		} else {
+			delete(params, "__wb_"+varName)
+		}
+		if !isLocalDecl {
+			if uo, isThis := params["this"].(*painlessUserObject); isThis && uo != nil && uo.fields != nil && varName != "this" {
+				shadowed := false
+				if mp, okMP := params["__method_params"].(map[string]bool); okMP && mp[varName] {
+					shadowed = true
+				}
+				if sl, okSL := params["__script_locals"].(map[string]bool); okSL && sl[varName] {
+					shadowed = true
+				}
+				if !shadowed {
+					if _, hasField := uo.fields[varName]; hasField {
+						uo.fields[varName] = val
+					}
+				}
+			}
+		}
 		if rv, ok := params["__reassigned_vars"].(map[string]bool); ok {
 			rv[varName] = true
 		}
@@ -5105,7 +6472,7 @@ func isIntegerValuePainless(v any) (int64, bool) {
 		return tv, true
 	case uint:
 		if uint64(tv) <= math.MaxInt64 {
-			return int64(tv), true
+			return int64(tv), true // #nosec G115 -- bounded by math.MaxInt64
 		}
 		return math.MaxInt64, true
 	case uint8:
@@ -5116,7 +6483,7 @@ func isIntegerValuePainless(v any) (int64, bool) {
 		return int64(tv), true
 	case uint64:
 		if tv <= math.MaxInt64 {
-			return int64(tv), true
+			return int64(tv), true // #nosec G115 -- bounded by math.MaxInt64
 		}
 		return math.MaxInt64, true
 	case json.Number:
@@ -5125,6 +6492,11 @@ func isIntegerValuePainless(v any) (int64, bool) {
 			if iv, err := tv.Int64(); err == nil {
 				return iv, true
 			}
+		}
+		return 0, false
+	case *painlessBigInteger:
+		if tv != nil && tv.val != nil && tv.val.IsInt64() {
+			return tv.val.Int64(), true
 		}
 		return 0, false
 	case *big.Int:
@@ -5148,9 +6520,33 @@ func painlessValuesEqual(a, b any) bool {
 	if a == nil || b == nil {
 		return false
 	}
+	if bsa, okA := a.(*painlessBitSet); okA {
+		bsb, okB := b.(*painlessBitSet)
+		return okB && bsa.equals(bsb)
+	}
 	if isNumericValuePainless(a) || isNumericValuePainless(b) {
 		if !isNumericValuePainless(a) || !isNumericValuePainless(b) {
 			return false
+		}
+		if bia, okA := a.(*painlessBigInteger); okA && bia != nil && bia.val != nil {
+			if bib, okB := parsePainlessBigInteger(b); okB && bib != nil && bib.val != nil {
+				return bia.val.Cmp(bib.val) == 0
+			}
+		}
+		if bib, okB := b.(*painlessBigInteger); okB && bib != nil && bib.val != nil {
+			if bia, okA := parsePainlessBigInteger(a); okA && bia != nil && bia.val != nil {
+				return bia.val.Cmp(bib.val) == 0
+			}
+		}
+		if bda, okA := a.(*painlessBigDecimal); okA && bda != nil {
+			if bdb, okB := parsePainlessBigDecimal(b); okB && bdb != nil {
+				return compareBigDecimalPainless(bda, bdb) == 0
+			}
+		}
+		if bdb, okB := b.(*painlessBigDecimal); okB && bdb != nil {
+			if bda, okA := parsePainlessBigDecimal(a); okA && bda != nil {
+				return compareBigDecimalPainless(bda, bdb) == 0
+			}
 		}
 		if ai, aOk := isIntegerValuePainless(a); aOk {
 			if bi, bOk := isIntegerValuePainless(b); bOk {
@@ -5332,7 +6728,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			return int64(0), nil
 		case "char", "Character":
 			if f, fOk := toFloat64(innerVal); fOk {
-				return string(rune(int32(f))), nil
+				return string(rune(int64(f) & 0xFFFF)), nil // #nosec G115 -- Java 16-bit char code unit
 			}
 			if s, sOk := innerVal.(string); sOk && len(s) > 0 {
 				r, _ := utf8.DecodeRuneInString(s)
@@ -5441,6 +6837,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		".toLowerCase()", ".toUpperCase()", ".trim()", ".strip()", ".stripLeading()", ".stripTrailing()", ".isBlank()", ".toCharArray()",
 		".lines()", ".chars()", ".codePoints()", ".getBytes()", ".withoutPadding()", ".reverse()", ".capacity()", ".trimToSize()", ".clear()",
 		".intValue()", ".longValue()", ".doubleValue()", ".floatValue()", ".shortValue()", ".byteValue()",
+		".intValueExact()", ".longValueExact()", ".shortValueExact()", ".byteValueExact()",
 		".length()", ".size()", ".keySet()", ".values()", ".entrySet()", ".getKey()", ".getValue()", ".getMessage()", ".toString()",
 		".getYear()", ".getMonthValue()", ".getMonthOfYear()", ".getMonth()", ".getDayOfMonth()", ".getDayOfYear()", ".getDate()", ".getHour()", ".getHourOfDay()", ".getMinute()", ".getMinuteOfHour()", ".getSecond()", ".getSecondOfMinute()", ".getNano()",
 		".getDayOfWeek()", ".getDayOfWeekEnum()", ".getMillis()", ".toEpochMilli()", ".getEpochSecond()", ".toInstant()",
@@ -5448,6 +6845,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		".getYears()", ".getMonths()", ".getDays()", ".toTotalMonths()", ".normalized()",
 		".toDays()", ".toHours()", ".toMinutes()", ".toSeconds()", ".toMillis()", ".toNanos()", ".getSeconds()", ".isZero()", ".isNegative()", ".abs()", ".negated()",
 		".stripTrailingZeros()", ".scale()", ".precision()", ".signum()", ".negate()", ".plus()", ".toPlainString()",
+		".ulp()", ".toEngineeringString()", ".toBigInteger()", ".toBigIntegerExact()", ".unscaledValue()",
+		".not()", ".bitLength()", ".bitCount()", ".getLowestSetBit()", ".toByteArray()", ".toLongArray()", ".cardinality()",
+		".getPrecision()", ".getRoundingMode()", ".reversed()",
 		".find()", ".matches()", ".lookingAt()", ".group()", ".groupCount()", ".start()", ".end()", ".reset()", ".pattern()", ".flags()", ".regionStart()", ".regionEnd()",
 		".getCount()", ".getSum()", ".getMin()", ".getMax()", ".getAverage()",
 		".isPresent()", ".getAsInt()", ".getAsLong()", ".getAsDouble()", ".orElseThrow()", ".stream()",
@@ -5464,8 +6864,16 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(recExpr, "doc?."), "doc."), ".values")
 				return int64(len(resolveDocValuesSlice(sourceMap, docPath))), nil
 			}
-			if mSuffix == ".toString()" && (recExpr == "Arrays" || recExpr == "Objects" || recExpr == "Integer" || recExpr == "Long" || recExpr == "Short" || recExpr == "Byte" || recExpr == "Double" || recExpr == "Float" || recExpr == "Boolean") {
+			if mSuffix == ".toString()" && (recExpr == "Arrays" || recExpr == "Objects" || recExpr == "Integer" || recExpr == "Long" || recExpr == "Short" || recExpr == "Byte" || recExpr == "Double" || recExpr == "Float" || recExpr == "Boolean" || recExpr == "Character") {
 				continue
+			}
+			if b := getOrInitEvalBudget(params); b != nil && len(b.userClasses) > 0 {
+				mBare := strings.TrimSuffix(strings.TrimPrefix(mSuffix, "."), "()")
+				if uVal, uErr := evalRHSExprDepth(sourceMap, recExpr, params, depth+1); uErr == nil {
+					if uo, isUO := uVal.(*painlessUserObject); isUO && uo != nil && uo.class != nil && uo.class.methods[mBare] != nil {
+						return evalUserObjectMethodPainless(uo, mBare, "", sourceMap, params, depth+1)
+					}
+				}
 			}
 			if mSuffix == ".clear()" {
 				if (recExpr == "ctx" || recExpr == "ctx?" || recExpr == "ctx._source" || recExpr == "ctx?._source" || recExpr == "ctx._source?" || recExpr == "ctx?._source?") && params["ctx"] == nil {
@@ -5497,6 +6905,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					return nil, err
 				}
 				switch tv := recVal.(type) {
+				case *painlessBitSet:
+					if tv != nil {
+						tv.words = nil
+					}
 				case map[string]any:
 					for k := range tv {
 						if !isInternalPainlessMapKey(tv, k) {
@@ -5527,6 +6939,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			if mSuffix == ".stream()" {
 				if isEmptyOptionalOrNilPainless(recVal) {
 					return []any{}, nil
+				}
+				if bs, isBS := recVal.(*painlessBitSet); isBS {
+					return bs.streamSlice(), nil
 				}
 				if s, ok := recVal.([]any); ok {
 					return s, nil
@@ -5562,7 +6977,51 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			case ".firstKey()", ".lastKey()", ".firstEntry()", ".lastEntry()", ".pollFirstEntry()", ".pollLastEntry()", ".descendingKeySet()", ".navigableKeySet()", ".descendingMap()",
 				".first()", ".last()", ".getFirst()", ".getLast()", ".peekFirst()", ".peekLast()", ".peek()", ".element()", ".pollFirst()", ".pollLast()", ".poll()", ".removeFirst()", ".removeLast()", ".pop()", ".descendingSet()":
 				return evalCollectionZeroArgMethodPainless(mSuffix, recExpr, recVal, sourceMap, params)
-			case ".stripTrailingZeros()", ".scale()", ".precision()", ".signum()", ".negate()", ".plus()", ".toPlainString()":
+			case ".stripTrailingZeros()", ".scale()", ".precision()", ".signum()", ".negate()", ".plus()", ".toPlainString()",
+				".ulp()", ".toEngineeringString()", ".toBigInteger()", ".toBigIntegerExact()", ".unscaledValue()",
+				".not()", ".bitLength()", ".bitCount()", ".getLowestSetBit()", ".toByteArray()", ".toLongArray()", ".cardinality()",
+				".getPrecision()", ".getRoundingMode()", ".reversed()":
+				if cmp, isCmp := recVal.(*painlessComparator); isCmp && cmp != nil && mSuffix == ".reversed()" {
+					return cmp.cloneReversed(), nil
+				}
+				if mc, isMC := recVal.(painlessMathContext); isMC {
+					switch mSuffix {
+					case ".getPrecision()":
+						return int64(mc.precision), nil
+					case ".getRoundingMode()":
+						return mc.roundingMode, nil
+					}
+				}
+				if bs, isBS := recVal.(*painlessBitSet); isBS && bs != nil {
+					switch mSuffix {
+					case ".cardinality()":
+						return bs.cardinality(), nil
+					case ".toByteArray()":
+						return bs.toByteArray(), nil
+					case ".toLongArray()":
+						return bs.toLongArray(), nil
+					}
+				}
+				if bi, isBI := recVal.(*painlessBigInteger); isBI && bi != nil {
+					switch mSuffix {
+					case ".signum()":
+						return int64(bi.val.Sign()), nil
+					case ".negate()":
+						return newPainlessBigInteger(new(big.Int).Neg(bi.val)), nil
+					case ".not()":
+						return newPainlessBigInteger(new(big.Int).Not(bi.val)), nil
+					case ".bitLength()":
+						return bi.bitLength(), nil
+					case ".bitCount()":
+						return bi.bitCount(), nil
+					case ".getLowestSetBit()":
+						return bi.getLowestSetBit(), nil
+					case ".toByteArray()":
+						return bi.toByteArray(), nil
+					case ".toBigInteger()", ".toBigIntegerExact()", ".unscaledValue()":
+						return newPainlessBigInteger(bi.val), nil
+					}
+				}
 				if bd, ok := parsePainlessBigDecimal(recVal); ok {
 					switch mSuffix {
 					case ".stripTrailingZeros()":
@@ -5579,6 +7038,20 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						return newPainlessBigDecimal(bd.unscaled, bd.scale), nil
 					case ".toPlainString()":
 						return bd.toPlainString(), nil
+					case ".ulp()":
+						return newPainlessBigDecimal(big.NewInt(1), bd.scale), nil
+					case ".toEngineeringString()":
+						return bd.toEngineeringString(), nil
+					case ".toBigInteger()":
+						return newPainlessBigInteger(bd.toBigInt()), nil
+					case ".toBigIntegerExact()":
+						bi, err := bd.bigIntExact()
+						if err != nil {
+							return nil, err
+						}
+						return newPainlessBigInteger(bi), nil
+					case ".unscaledValue()":
+						return newPainlessBigInteger(bd.unscaled), nil
 					}
 				}
 				return recVal, nil
@@ -5674,6 +7147,30 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				}
 				return recVal, nil
 			case ".intValue()", ".longValue()", ".shortValue()", ".byteValue()":
+				if bd, isBD := recVal.(*painlessBigDecimal); isBD && bd != nil {
+					switch mSuffix {
+					case ".intValue()":
+						return bd.intValue(), nil
+					case ".shortValue()":
+						return bd.shortValue(), nil
+					case ".byteValue()":
+						return bd.byteValue(), nil
+					default:
+						return bd.longValue(), nil
+					}
+				}
+				if bi, isBI := recVal.(*painlessBigInteger); isBI && bi != nil {
+					switch mSuffix {
+					case ".intValue()":
+						return bi.intValue(), nil
+					case ".shortValue()":
+						return bi.shortValue(), nil
+					case ".byteValue()":
+						return bi.byteValue(), nil
+					default:
+						return bi.longValue(), nil
+					}
+				}
 				var iv int64
 				var okNum bool
 				switch tv := recVal.(type) {
@@ -5705,6 +7202,44 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				default:
 					return iv, nil
 				}
+			case ".intValueExact()", ".longValueExact()", ".shortValueExact()", ".byteValueExact()":
+				if bd, isBD := recVal.(*painlessBigDecimal); isBD && bd != nil {
+					switch mSuffix {
+					case ".intValueExact()":
+						return bd.intValueExact()
+					case ".shortValueExact()":
+						return bd.shortValueExact()
+					case ".byteValueExact()":
+						return bd.byteValueExact()
+					default:
+						return bd.longValueExact()
+					}
+				}
+				if bi, isBI := recVal.(*painlessBigInteger); isBI && bi != nil {
+					switch mSuffix {
+					case ".intValueExact()":
+						return bi.intValueExact()
+					case ".shortValueExact()":
+						return bi.shortValueExact()
+					case ".byteValueExact()":
+						return bi.byteValueExact()
+					default:
+						return bi.longValueExact()
+					}
+				}
+				if bd, ok := parsePainlessBigDecimal(recVal); ok {
+					switch mSuffix {
+					case ".intValueExact()":
+						return bd.intValueExact()
+					case ".shortValueExact()":
+						return bd.shortValueExact()
+					case ".byteValueExact()":
+						return bd.byteValueExact()
+					default:
+						return bd.longValueExact()
+					}
+				}
+				return int64(0), nil
 			case ".doubleValue()", ".floatValue()":
 				if fv, fOk := toFloat64(recVal); fOk {
 					return fv, nil
@@ -5751,6 +7286,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				if mSuffix == ".abs()" {
 					if bd, isBD := recVal.(*painlessBigDecimal); isBD && bd != nil {
 						return newPainlessBigDecimal(new(big.Int).Abs(bd.unscaled), bd.scale), nil
+					}
+					if bi, isBI := recVal.(*painlessBigInteger); isBI && bi != nil {
+						return newPainlessBigInteger(new(big.Int).Abs(bi.val)), nil
 					}
 				}
 				if per, ok := recVal.(painlessPeriod); ok {
@@ -5972,6 +7510,13 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				return nil, nil
 			case ".length()", ".size()":
 				switch tv := recVal.(type) {
+				case *painlessBitSet:
+					if mSuffix == ".size()" {
+						return tv.size(), nil
+					}
+					return tv.length(), nil
+				case *painlessStringJoiner:
+					return tv.length(), nil
 				case painlessYear:
 					return tv.length(), nil
 				case *painlessStringBuilder:
@@ -6005,6 +7550,8 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				return int64(0), nil
 			case ".clone()":
 				switch tv := recVal.(type) {
+				case *painlessBitSet:
+					return tv.clone(), nil
 				case []any:
 					out := make([]any, len(tv))
 					copy(out, tv)
@@ -6232,6 +7779,12 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			return false, nil
 		}
 		switch tv := recVal.(type) {
+		case *painlessUserObject:
+			if tv != nil && tv.class != nil && tv.class.methods["isEmpty"] != nil {
+				return evalUserObjectMethodPainless(tv, "isEmpty", "", sourceMap, params, depth+1)
+			}
+		case *painlessBitSet:
+			return tv == nil || tv.length() == 0, nil
 		case *painlessStringBuilder:
 			return tv == nil || len(tv.buf) == 0, nil
 		case string:
@@ -6265,9 +7818,21 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		".floorKey(", ".ceilingKey(", ".lowerKey(", ".higherKey(", ".floorEntry(", ".ceilingEntry(", ".lowerEntry(", ".higherEntry(", ".headMap(", ".tailMap(", ".subMap(",
 		".floor(", ".ceiling(", ".lower(", ".higher(", ".headSet(", ".tailSet(", ".subSet(",
 		".offerFirst(", ".offerLast(", ".offer(", ".addFirst(", ".addLast(", ".push(", ".removeFirstOccurrence(", ".removeLastOccurrence(",
+		".movePointLeft(", ".movePointRight(", ".scaleByPowerOfTen(", ".divideToIntegralValue(", ".divideAndRemainder(", ".round(", ".abs(", ".negate(",
+		".mod(", ".modPow(", ".modInverse(", ".gcd(", ".and(", ".xor(", ".andNot(", ".shiftLeft(", ".shiftRight(",
+		".testBit(", ".setBit(", ".clearBit(", ".flipBit(", ".isProbablePrime(", ".toString(",
+		".clear(", ".flip(", ".nextSetBit(", ".nextClearBit(", ".previousSetBit(", ".previousClearBit(", ".intersects(",
+		".setEmptyValue(",
+		".until(", ".datesUntil(", ".between(",
+		".thenComparing(", ".thenComparingInt(", ".thenComparingLong(", ".thenComparingDouble(", ".compare(",
 	} {
 		if recExpr, argExpr, ok := matchTrailingMethodCallPainless(rhs, mName); ok {
 			if (mName == ".equals(" && (recExpr == "Objects" || recExpr == "Arrays")) ||
+				(mName == ".compare(" && (recExpr == "Integer" || recExpr == "Long" || recExpr == "Short" || recExpr == "Byte" || recExpr == "Double" || recExpr == "Float" || recExpr == "Boolean" || recExpr == "Character" || recExpr == "Arrays" || recExpr == "Objects")) ||
+				(mName == ".toString(" && (recExpr == "Arrays" || recExpr == "Objects" || recExpr == "Integer" || recExpr == "Long" || recExpr == "Short" || recExpr == "Byte" || recExpr == "Double" || recExpr == "Float" || recExpr == "Boolean" || recExpr == "Character")) ||
+				(mName == ".codePointAt(" && recExpr == "Character") ||
+				(mName == ".between(" && (recExpr == "Duration" || recExpr == "Period" || strings.HasPrefix(recExpr, "ChronoUnit.") || strings.HasPrefix(recExpr, "java.time.temporal.ChronoUnit."))) ||
+				((mName == ".abs(" || mName == ".round(") && (recExpr == "Math" || recExpr == "StrictMath")) ||
 				(mName == ".replaceAll(" && recExpr == "Collections") ||
 				(mName == ".matches(" && recExpr == "Pattern") ||
 				(mName == ".format(" && recExpr == "String") ||
@@ -6277,6 +7842,14 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				((mName == ".fromHexDigits(" || mName == ".fromHexDigitsToLong(" || mName == ".isHexDigit(" || mName == ".fromHexDigit(") && (recExpr == "HexFormat" || recExpr == "java.util.HexFormat")) ||
 				((mName == ".min(" || mName == ".max(" || mName == ".pow(" || mName == ".floor(") && (recExpr == "Math" || recExpr == "StrictMath" || recExpr == "Collections" || recExpr == "Integer" || recExpr == "Long" || recExpr == "Double" || recExpr == "Float")) {
 				continue
+			}
+			if b := getOrInitEvalBudget(params); b != nil && len(b.userClasses) > 0 {
+				mBare := strings.TrimSuffix(strings.TrimPrefix(mName, "."), "(")
+				if uVal, uErr := evalRHSExprDepth(sourceMap, recExpr, params, depth+1); uErr == nil {
+					if uo, isUO := uVal.(*painlessUserObject); isUO && uo != nil && uo.class != nil && uo.class.methods[mBare] != nil {
+						return evalUserObjectMethodPainless(uo, mBare, argExpr, sourceMap, params, depth+1)
+					}
+				}
 			}
 			_, hasRawSrcRec := rawSourceFromSourceMapPainless(sourceMap)
 			if !hasRawSrcRec {
@@ -6305,6 +7878,23 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				}
 			}
 			if mName == ".compute(" || mName == ".computeIfAbsent(" || mName == ".computeIfPresent(" || mName == ".merge(" {
+				if mName == ".merge(" && len(splitTopLevelCommaPainless(argExpr)) == 1 {
+					if recVal, rErr := evalRHSExprDepth(sourceMap, recExpr, params, depth+1); rErr == nil {
+						if sj, isSJ := recVal.(*painlessStringJoiner); isSJ && sj != nil {
+							otherVal, oErr := evalRHSExprDepth(sourceMap, strings.TrimSpace(argExpr), params, depth+1)
+							if oErr != nil {
+								return nil, oErr
+							}
+							if otherSJ, isOSJ := otherVal.(*painlessStringJoiner); isOSJ && otherSJ != nil {
+								if len(otherSJ.parts) > 0 {
+									sj.parts = append(sj.parts, strings.Join(otherSJ.parts, otherSJ.delim))
+									sj.hasValue = true
+								}
+							}
+							return sj, nil
+						}
+					}
+				}
 				return evalPainlessMapCompute(mName, recExpr, argExpr, sourceMap, params, depth+1)
 			}
 			if mName == ".removeIf(" {
@@ -6524,6 +8114,54 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			}
 			if mName == ".set(" {
 				setArgs := splitTopLevelCommaPainless(argExpr)
+				if recVal, rErr := evalRHSExprDepth(sourceMap, recExpr, params, depth+1); rErr == nil {
+					if bs, isBS := recVal.(*painlessBitSet); isBS && bs != nil {
+						if len(setArgs) == 1 {
+							v0, err0 := evalRHSExprDepth(sourceMap, strings.TrimSpace(setArgs[0]), params, depth+1)
+							if err0 != nil {
+								return nil, err0
+							}
+							idx, _ := toInt64Painless(v0)
+							return nil, bs.set(int(idx))
+						} else if len(setArgs) == 2 {
+							v0, err0 := evalRHSExprDepth(sourceMap, strings.TrimSpace(setArgs[0]), params, depth+1)
+							if err0 != nil {
+								return nil, err0
+							}
+							v1, err1 := evalRHSExprDepth(sourceMap, strings.TrimSpace(setArgs[1]), params, depth+1)
+							if err1 != nil {
+								return nil, err1
+							}
+							idx0, _ := toInt64Painless(v0)
+							if bVal, isBool := v1.(bool); isBool {
+								if bVal {
+									return nil, bs.set(int(idx0))
+								}
+								return nil, bs.clearBit(int(idx0))
+							}
+							idx1, _ := toInt64Painless(v1)
+							return nil, bs.setRange(int(idx0), int(idx1), true)
+						} else if len(setArgs) >= 3 {
+							v0, err0 := evalRHSExprDepth(sourceMap, strings.TrimSpace(setArgs[0]), params, depth+1)
+							if err0 != nil {
+								return nil, err0
+							}
+							v1, err1 := evalRHSExprDepth(sourceMap, strings.TrimSpace(setArgs[1]), params, depth+1)
+							if err1 != nil {
+								return nil, err1
+							}
+							v2, err2 := evalRHSExprDepth(sourceMap, strings.TrimSpace(setArgs[2]), params, depth+1)
+							if err2 != nil {
+								return nil, err2
+							}
+							idx0, _ := toInt64Painless(v0)
+							idx1, _ := toInt64Painless(v1)
+							bVal, _ := v2.(bool)
+							return nil, bs.setRange(int(idx0), int(idx1), bVal)
+						}
+						return nil, nil
+					}
+				}
 				if len(setArgs) == 2 {
 					idxVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(setArgs[0]), params, depth+1)
 					newVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(setArgs[1]), params, depth+1)
@@ -6668,20 +8306,56 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				return false, nil
 			}
 			if mName == ".add(" {
+				addArgs := splitTopLevelCommaPainless(argExpr)
 				if bdRec, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1); err == nil {
 					if bd, isBD := bdRec.(*painlessBigDecimal); isBD && bd != nil {
-						augVal, aErr := evalRHSExprDepth(sourceMap, strings.TrimSpace(argExpr), params, depth+1)
+						if len(addArgs) == 0 {
+							return bd, nil
+						}
+						augVal, aErr := evalRHSExprDepth(sourceMap, strings.TrimSpace(addArgs[0]), params, depth+1)
 						if aErr != nil {
 							return nil, aErr
 						}
 						if bd2, ok2 := parsePainlessBigDecimal(augVal); ok2 {
 							ua, ub, sc := alignBigDecimalsPainless(bd, bd2)
-							return &painlessBigDecimal{unscaled: new(big.Int).Add(ua, ub), scale: sc}, nil
+							resBD := &painlessBigDecimal{unscaled: new(big.Int).Add(ua, ub), scale: sc}
+							if len(addArgs) >= 2 {
+								mcVal, mcErr := evalRHSExprDepth(sourceMap, strings.TrimSpace(addArgs[1]), params, depth+1)
+								if mcErr != nil {
+									return nil, mcErr
+								}
+								if mc, isMC := mcVal.(painlessMathContext); isMC {
+									return applyMathContextPainless(resBD, mc)
+								}
+							}
+							return resBD, nil
 						}
 						return bd, nil
 					}
+					if bi, isBI := bdRec.(*painlessBigInteger); isBI && bi != nil {
+						augVal, aErr := evalRHSExprDepth(sourceMap, strings.TrimSpace(argExpr), params, depth+1)
+						if aErr != nil {
+							return nil, aErr
+						}
+						if bi2, ok2 := parsePainlessBigInteger(augVal); ok2 {
+							return newPainlessBigInteger(new(big.Int).Add(bi.val, bi2.val)), nil
+						}
+						return bi, nil
+					}
+					if sj, isSJ := bdRec.(*painlessStringJoiner); isSJ && sj != nil {
+						elVal, eErr := evalRHSExprDepth(sourceMap, strings.TrimSpace(argExpr), params, depth+1)
+						if eErr != nil {
+							return nil, eErr
+						}
+						if elVal == nil {
+							sj.parts = append(sj.parts, "null")
+						} else {
+							sj.parts = append(sj.parts, fmt.Sprintf("%v", elVal))
+						}
+						sj.hasValue = true
+						return sj, nil
+					}
 				}
-				addArgs := splitTopLevelCommaPainless(argExpr)
 				if !strings.Contains(recExpr, "(") {
 					for _, pfx := range []string{"ctx?._source?.", "ctx?._source.", "ctx._source?.", "ctx._source."} {
 						if strings.HasPrefix(recExpr, pfx) {
@@ -7035,7 +8709,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				recVal, err = evalRHSExprDepth(sourceMap, recExpr, params, depth+1)
 			}
 			if err != nil {
-				if mName == ".startsWith(" || mName == ".endsWith(" || mName == ".regionMatches(" || mName == ".containsAll(" || mName == ".removeAll(" || mName == ".retainAll(" || mName == ".contains(" || mName == ".containsKey(" || mName == ".containsValue(" || mName == ".matches(" || mName == ".find(" || mName == ".equals(" || mName == ".equalsIgnoreCase(" || mName == ".isAfter(" || mName == ".isBefore(" || mName == ".isEqual(" || mName == ".isSupported(" || mName == ".isValidYear(" || mName == ".contentEquals(" {
+				if mName == ".startsWith(" || mName == ".endsWith(" || mName == ".regionMatches(" || mName == ".containsAll(" || mName == ".removeAll(" || mName == ".retainAll(" || mName == ".contains(" || mName == ".containsKey(" || mName == ".containsValue(" || mName == ".matches(" || mName == ".find(" || mName == ".equals(" || mName == ".equalsIgnoreCase(" || mName == ".isAfter(" || mName == ".isBefore(" || mName == ".isEqual(" || mName == ".isSupported(" || mName == ".isValidYear(" || mName == ".contentEquals(" || mName == ".testBit(" || mName == ".isProbablePrime(" || mName == ".intersects(" {
 					return false, err
 				}
 				return nil, err
@@ -7044,7 +8718,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				return nil, &painlessExceptionError{exType: "NoSuchElementException", message: "No value present"}
 			}
 			if isEmptyOptionalOrNilPainless(recVal) && mName != ".orElse(" && mName != ".orElseGet(" && mName != ".orElseThrow(" && mName != ".ifPresent(" && mName != ".ifPresentOrElse(" && mName != ".or(" && mName != ".filter(" && mName != ".map(" && mName != ".flatMap(" {
-				if mName == ".startsWith(" || mName == ".endsWith(" || mName == ".regionMatches(" || mName == ".containsAll(" || mName == ".removeAll(" || mName == ".retainAll(" || mName == ".contains(" || mName == ".containsKey(" || mName == ".containsValue(" || mName == ".matches(" || mName == ".find(" || mName == ".equals(" || mName == ".equalsIgnoreCase(" || mName == ".isAfter(" || mName == ".isBefore(" || mName == ".isEqual(" || mName == ".isSupported(" || mName == ".isValidYear(" || mName == ".contentEquals(" {
+				if mName == ".startsWith(" || mName == ".endsWith(" || mName == ".regionMatches(" || mName == ".containsAll(" || mName == ".removeAll(" || mName == ".retainAll(" || mName == ".contains(" || mName == ".containsKey(" || mName == ".containsValue(" || mName == ".matches(" || mName == ".find(" || mName == ".equals(" || mName == ".equalsIgnoreCase(" || mName == ".isAfter(" || mName == ".isBefore(" || mName == ".isEqual(" || mName == ".isSupported(" || mName == ".isValidYear(" || mName == ".contentEquals(" || mName == ".testBit(" || mName == ".isProbablePrime(" || mName == ".intersects(" {
 					return false, nil
 				}
 				return nil, nil
@@ -7642,8 +9316,65 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 							return evalWithChronoFieldPainless(recVal, cf, int64(nf))
 						}
 					}
+				} else if len(wArgs) == 1 {
+					adjVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(wArgs[0]), params, depth+1)
+					if err != nil {
+						return nil, err
+					}
+					return evalWithTemporalAdjusterPainless(recVal, adjVal)
 				}
 				return recVal, nil
+			case ".until(":
+				uArgs := splitTopLevelCommaPainless(argExpr)
+				if len(uArgs) == 1 {
+					endVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(uArgs[0]), params, depth+1)
+					if err != nil {
+						return nil, err
+					}
+					return evalLocalDateUntilPeriodPainless(recVal, endVal), nil
+				} else if len(uArgs) >= 2 {
+					endVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(uArgs[0]), params, depth+1)
+					if err != nil {
+						return nil, err
+					}
+					unitVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(uArgs[1]), params, depth+1)
+					if err != nil {
+						return nil, err
+					}
+					return evalTemporalBetweenUnitPainless(unitVal, recVal, endVal), nil
+				}
+				return int64(0), nil
+			case ".datesUntil(":
+				dArgs := splitTopLevelCommaPainless(argExpr)
+				if len(dArgs) >= 1 {
+					endVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(dArgs[0]), params, depth+1)
+					if err != nil {
+						return nil, err
+					}
+					var stepVal any
+					if len(dArgs) >= 2 {
+						stepVal, err = evalRHSExprDepth(sourceMap, strings.TrimSpace(dArgs[1]), params, depth+1)
+						if err != nil {
+							return nil, err
+						}
+					}
+					return evalLocalDateDatesUntilPainless(recVal, endVal, stepVal)
+				}
+				return []any{}, nil
+			case ".between(":
+				bArgs := splitTopLevelCommaPainless(argExpr)
+				if len(bArgs) >= 2 {
+					v1, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(bArgs[0]), params, depth+1)
+					if err != nil {
+						return nil, err
+					}
+					v2, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(bArgs[1]), params, depth+1)
+					if err != nil {
+						return nil, err
+					}
+					return evalTemporalBetweenUnitPainless(recVal, v1, v2), nil
+				}
+				return int64(0), nil
 			case ".atDate(":
 				if tm, ok := parsePainlessDateTime(recVal); ok {
 					dVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(argExpr), params, depth+1)
@@ -7702,152 +9433,42 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					return time.Date(dt.Year(), dt.Month(), dt.Day(), 0, 0, 0, 0, loc).Format(time.RFC3339Nano), nil
 				}
 				return nil, nil
-			case ".subtract(", ".multiply(", ".divide(", ".remainder(", ".pow(", ".setScale(", ".min(", ".max(":
-				if bd, ok := parsePainlessBigDecimal(recVal); ok {
-					bArgs := splitTopLevelCommaPainless(argExpr)
-					if len(bArgs) == 0 {
-						return bd, nil
-					}
-					arg0Val, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(bArgs[0]), params, depth+1)
-					if err != nil {
-						return nil, err
-					}
-					switch mName {
-					case ".subtract(":
-						if bd2, ok2 := parsePainlessBigDecimal(arg0Val); ok2 {
-							ua, ub, sc := alignBigDecimalsPainless(bd, bd2)
-							return &painlessBigDecimal{unscaled: new(big.Int).Sub(ua, ub), scale: sc}, nil
-						}
-					case ".multiply(":
-						if bd2, ok2 := parsePainlessBigDecimal(arg0Val); ok2 {
-							return &painlessBigDecimal{
-								unscaled: new(big.Int).Mul(bd.unscaled, bd2.unscaled),
-								scale:    bd.scale + bd2.scale,
-							}, nil
-						}
-					case ".divide(":
-						bd2, ok2 := parsePainlessBigDecimal(arg0Val)
-						if !ok2 || bd2.unscaled.Sign() == 0 {
-							return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Division by zero"}
-						}
-						targetScale := bd.scale - bd2.scale
-						mode := "HALF_UP"
-						if len(bArgs) == 2 {
-							v1, err1 := evalRHSExprDepth(sourceMap, strings.TrimSpace(bArgs[1]), params, depth+1)
-							if err1 != nil {
-								return nil, err1
-							}
-							if s1, isStr := v1.(string); isStr && !isIntegerLiteral(s1) {
-								targetScale = bd.scale
-								mode = s1
-							} else if iv1, okI := toInt64Painless(v1); okI {
-								targetScale = int(iv1)
-							}
-						} else if len(bArgs) >= 3 {
-							v1, err1 := evalRHSExprDepth(sourceMap, strings.TrimSpace(bArgs[1]), params, depth+1)
-							if err1 != nil {
-								return nil, err1
-							}
-							v2, err2 := evalRHSExprDepth(sourceMap, strings.TrimSpace(bArgs[2]), params, depth+1)
-							if err2 != nil {
-								return nil, err2
-							}
-							if iv1, okI := toInt64Painless(v1); okI {
-								targetScale = int(iv1)
-							}
-							mode = fmt.Sprintf("%v", v2)
-						} else {
-							// 1-arg divide(divisor): Java uses preferred scale max(bd.scale - bd2.scale, 0), expanding if terminating decimal
-							ua := new(big.Int).Set(bd.unscaled)
-							ub := new(big.Int).Set(bd2.unscaled)
-							sc := bd.scale - bd2.scale
-							if sc < 0 {
-								ua.Mul(ua, bigTenPowPainless(-sc))
-								sc = 0
-							}
-							for extra := 0; extra < 20; extra++ {
-								_, r := new(big.Int).QuoRem(ua, ub, new(big.Int))
-								if r.Sign() == 0 {
-									break
-								}
-								ua.Mul(ua, big.NewInt(10))
-								sc++
-							}
-							q, rErr := roundBigIntQuotientPainless(ua, ub, "HALF_UP")
-							if rErr != nil {
-								return nil, rErr
-							}
-							return &painlessBigDecimal{unscaled: q, scale: sc}, nil
-						}
-						shift := targetScale - (bd.scale - bd2.scale)
-						num := new(big.Int).Set(bd.unscaled)
-						den := new(big.Int).Set(bd2.unscaled)
-						if shift > 0 {
-							num.Mul(num, bigTenPowPainless(shift))
-						} else if shift < 0 {
-							den.Mul(den, bigTenPowPainless(-shift))
-						}
-						q, rErr := roundBigIntQuotientPainless(num, den, mode)
-						if rErr != nil {
-							return nil, rErr
-						}
-						return &painlessBigDecimal{unscaled: q, scale: targetScale}, nil
-					case ".remainder(":
-						bd2, ok2 := parsePainlessBigDecimal(arg0Val)
-						if !ok2 || bd2.unscaled.Sign() == 0 {
-							return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Division by zero"}
-						}
-						ua, ub, sc := alignBigDecimalsPainless(bd, bd2)
-						_, rem := new(big.Int).QuoRem(ua, ub, new(big.Int))
-						return &painlessBigDecimal{unscaled: rem, scale: sc}, nil
-					case ".pow(":
-						if iv, okI := toInt64Painless(arg0Val); okI && iv >= 0 && iv <= 999 {
-							if iv == 0 {
-								return newPainlessBigDecimal(big.NewInt(1), 0), nil
-							}
-							u := new(big.Int).Exp(bd.unscaled, big.NewInt(iv), nil)
-							return &painlessBigDecimal{unscaled: u, scale: bd.scale * int(iv)}, nil
-						}
-					case ".setScale(":
-						iv, okI := toInt64Painless(arg0Val)
-						if !okI {
-							return bd, nil
-						}
-						mode := "UNNECESSARY"
-						if len(bArgs) >= 2 {
-							v1, err1 := evalRHSExprDepth(sourceMap, strings.TrimSpace(bArgs[1]), params, depth+1)
-							if err1 != nil {
-								return nil, err1
-							}
-							mode = fmt.Sprintf("%v", v1)
-						} else if int(iv) < bd.scale {
-							mode = "HALF_UP"
-						}
-						return bd.setScale(int(iv), mode)
-					case ".min(":
-						if bd2, ok2 := parsePainlessBigDecimal(arg0Val); ok2 {
-							if compareBigDecimalPainless(bd, bd2) <= 0 {
-								return bd, nil
-							}
-							return bd2, nil
-						}
-					case ".max(":
-						if bd2, ok2 := parsePainlessBigDecimal(arg0Val); ok2 {
-							if compareBigDecimalPainless(bd, bd2) >= 0 {
-								return bd, nil
-							}
-							return bd2, nil
-						}
-					}
-					return bd, nil
-				}
-				return recVal, nil
+			case ".subtract(", ".multiply(", ".divide(", ".remainder(", ".pow(", ".setScale(", ".min(", ".max(",
+				".movePointLeft(", ".movePointRight(", ".scaleByPowerOfTen(", ".divideToIntegralValue(", ".divideAndRemainder(", ".round(", ".abs(", ".negate(",
+				".mod(", ".modPow(", ".modInverse(", ".gcd(", ".and(", ".xor(", ".andNot(", ".shiftLeft(", ".shiftRight(",
+				".testBit(", ".setBit(", ".clearBit(", ".flipBit(", ".isProbablePrime(", ".toString(",
+				".clear(", ".flip(", ".nextSetBit(", ".nextClearBit(", ".previousSetBit(", ".previousClearBit(", ".intersects(",
+				".setEmptyValue(",
+				".thenComparing(", ".thenComparingInt(", ".thenComparingLong(", ".thenComparingDouble(", ".compare(":
+				return evalNumericBitSetJoinerComparatorMethodPainless(mName, recVal, argExpr, sourceMap, params, depth+1)
 			case ".orElse(":
 				if !isEmptyOptionalOrNilPainless(recVal) {
 					return recVal, nil
 				}
 				return evalRHSExprDepth(sourceMap, strings.TrimSpace(argExpr), params, depth+1)
 			case ".orElseGet(", ".or(":
+				if mName == ".or(" {
+					if bs, isBS := recVal.(*painlessBitSet); isBS && bs != nil {
+						otherVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(argExpr), params, depth+1)
+						if err != nil {
+							return nil, err
+						}
+						if otherBS, okO := otherVal.(*painlessBitSet); okO {
+							bs.or(otherBS)
+						}
+						return nil, nil
+					}
+					if bi, isBI := recVal.(*painlessBigInteger); isBI && bi != nil {
+						otherVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(argExpr), params, depth+1)
+						if err != nil {
+							return nil, err
+						}
+						if bi2, ok2 := parsePainlessBigInteger(otherVal); ok2 {
+							return newPainlessBigInteger(new(big.Int).Or(bi.val, bi2.val)), nil
+						}
+						return bi, nil
+					}
+				}
 				if !isEmptyOptionalOrNilPainless(recVal) {
 					return recVal, nil
 				}
@@ -8574,6 +10195,23 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					return v, nil
 				}
 				switch tv := recVal.(type) {
+				case *painlessBitSet:
+					gArgs := splitTopLevelCommaPainless(argExpr)
+					if len(gArgs) >= 2 {
+						v0, err0 := evalRHSExprDepth(sourceMap, strings.TrimSpace(gArgs[0]), params, depth+1)
+						if err0 != nil {
+							return nil, err0
+						}
+						v1, err1 := evalRHSExprDepth(sourceMap, strings.TrimSpace(gArgs[1]), params, depth+1)
+						if err1 != nil {
+							return nil, err1
+						}
+						i0, _ := toInt64Painless(v0)
+						i1, _ := toInt64Painless(v1)
+						return tv.getRange(int(i0), int(i1))
+					}
+					idx, _ := toInt64Painless(argVal)
+					return tv.get(int(idx))
 				case map[string]any:
 					if argVal != nil {
 						kStr := fmt.Sprintf("%v", argVal)
@@ -8870,6 +10508,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						return int64(compareBigDecimalPainless(bd1, bd2)), nil
 					}
 				}
+				if bi1, isBI1 := recVal.(*painlessBigInteger); isBI1 && bi1 != nil {
+					if bi2, ok2 := parsePainlessBigInteger(argVal); ok2 {
+						return int64(bi1.val.Cmp(bi2.val)), nil
+					}
+				}
 				if fa, ok1 := toFloat64(recVal); ok1 {
 					if fb, ok2 := toFloat64(argVal); ok2 {
 						if fa < fb {
@@ -8927,6 +10570,14 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				".plusHours(", ".minusHours(", ".plusMinutes(", ".minusMinutes(", ".plusSeconds(", ".minusSeconds(", ".plusMillis(", ".minusMillis(", ".plusNanos(", ".minusNanos(",
 				".plus(", ".minus(", ".multipliedBy(",
 				".withYear(", ".withMonth(", ".withDayOfMonth(", ".withHour(", ".withMinute(", ".withSecond(", ".withNano(", ".truncatedTo(":
+				if mName == ".plus(" {
+					if bd, isBD := recVal.(*painlessBigDecimal); isBD && bd != nil {
+						if mc, isMC := argVal.(painlessMathContext); isMC {
+							return applyMathContextPainless(newPainlessBigDecimal(bd.unscaled, bd.scale), mc)
+						}
+						return newPainlessBigDecimal(bd.unscaled, bd.scale), nil
+					}
+				}
 				if yr, isYr := recVal.(painlessYear); isYr {
 					sign := int64(1)
 					if mName == ".minusYears(" || mName == ".minus(" {
@@ -9319,6 +10970,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		}
 	}
 
+	if uVal, uHandled, uErr := evalTrailingUserObjectMethodCallPainless(sourceMap, rhs, params, depth+1); uHandled {
+		return uVal, uErr
+	}
+
 	if staticVal, handled, err := evalStaticCallPainless(sourceMap, rhs, params, depth+1); handled {
 		return staticVal, err
 	}
@@ -9676,6 +11331,8 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		return map[string]any{}, nil
 	case "new StringBuilder()", "new StringBuffer()":
 		return &painlessStringBuilder{}, nil
+	case "new BitSet()":
+		return &painlessBitSet{}, nil
 	case "Year.MIN_VALUE":
 		return int64(-999999999), nil
 	case "Year.MAX_VALUE":
@@ -9694,8 +11351,28 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		return newPainlessBigDecimal(big.NewInt(0), 0), nil
 	case "BigDecimal.ONE":
 		return newPainlessBigDecimal(big.NewInt(1), 0), nil
+	case "BigDecimal.TWO":
+		return newPainlessBigDecimal(big.NewInt(2), 0), nil
 	case "BigDecimal.TEN":
 		return newPainlessBigDecimal(big.NewInt(10), 0), nil
+	case "BigInteger.ZERO":
+		return newPainlessBigInteger(big.NewInt(0)), nil
+	case "BigInteger.ONE":
+		return newPainlessBigInteger(big.NewInt(1)), nil
+	case "BigInteger.TWO":
+		return newPainlessBigInteger(big.NewInt(2)), nil
+	case "BigInteger.TEN":
+		return newPainlessBigInteger(big.NewInt(10)), nil
+	case "MathContext.UNLIMITED":
+		return painlessMathContext{precision: 0, roundingMode: "HALF_UP"}, nil
+	case "MathContext.DECIMAL32":
+		return painlessMathContext{precision: 7, roundingMode: "HALF_EVEN"}, nil
+	case "MathContext.DECIMAL64":
+		return painlessMathContext{precision: 16, roundingMode: "HALF_EVEN"}, nil
+	case "MathContext.DECIMAL128":
+		return painlessMathContext{precision: 34, roundingMode: "HALF_EVEN"}, nil
+	case "String.CASE_INSENSITIVE_ORDER":
+		return &painlessComparator{kind: "caseInsensitive"}, nil
 	case "RoundingMode.UP", "BigDecimal.ROUND_UP":
 		return "UP", nil
 	case "RoundingMode.DOWN", "BigDecimal.ROUND_DOWN":
@@ -9786,6 +11463,24 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		return int64(2), nil
 	case "Character.MAX_RADIX":
 		return int64(36), nil
+	case "Character.MIN_CODE_POINT", "Character.MIN_VALUE":
+		return int64(0), nil
+	case "Character.MAX_CODE_POINT":
+		return int64(0x10FFFF), nil
+	case "Character.MIN_SUPPLEMENTARY_CODE_POINT":
+		return int64(0x010000), nil
+	case "Character.MIN_HIGH_SURROGATE":
+		return int64(0xD800), nil
+	case "Character.MAX_HIGH_SURROGATE":
+		return int64(0xDBFF), nil
+	case "Character.MIN_LOW_SURROGATE":
+		return int64(0xDC00), nil
+	case "Character.MAX_LOW_SURROGATE", "Character.MAX_SURROGATE":
+		return int64(0xDFFF), nil
+	case "Character.MIN_SURROGATE":
+		return int64(0xD800), nil
+	case "Character.MAX_VALUE":
+		return int64(0xFFFF), nil
 	case "Pattern.UNIX_LINES":
 		return int64(1), nil
 	case "Pattern.CASE_INSENSITIVE":
@@ -10148,7 +11843,12 @@ func evalCollectionConstructorPainless(sourceMap map[string]any, rhs string, par
 	isStringBuilder := false
 	isString := false
 	isBigDecimal := false
+	isBigInteger := false
+	isMathContext := false
+	isBitSet := false
+	isStringJoiner := false
 	isUUID := false
+	var userCls *painlessUserClass
 	switch clsName {
 	case "ArrayList", "LinkedList", "ArrayDeque", "PriorityQueue":
 		isList = true
@@ -10162,10 +11862,23 @@ func evalCollectionConstructorPainless(sourceMap map[string]any, rhs string, par
 		isString = true
 	case "BigDecimal":
 		isBigDecimal = true
+	case "BigInteger":
+		isBigInteger = true
+	case "MathContext":
+		isMathContext = true
+	case "BitSet":
+		isBitSet = true
+	case "StringJoiner":
+		isStringJoiner = true
 	case "UUID":
 		isUUID = true
 	default:
-		return nil, false, nil
+		if b := getOrInitEvalBudget(params); b != nil && b.userClasses != nil {
+			userCls = b.userClasses[clsName]
+		}
+		if userCls == nil {
+			return nil, false, nil
+		}
 	}
 	rem := remAfterType
 	if !strings.HasPrefix(rem, "(") {
@@ -10404,15 +12117,176 @@ func evalCollectionConstructorPainless(sourceMap map[string]any, rhs string, par
 			if err != nil {
 				return nil, true, err
 			}
-			bd, ok := parsePainlessBigDecimal(arg0Val)
-			if !ok {
-				return nil, true, &painlessExceptionError{
-					exType:  "NumberFormatException",
-					message: fmt.Sprintf("For input string: %q", fmt.Sprintf("%v", arg0Val)),
+			if bi, isBI := arg0Val.(*painlessBigInteger); isBI && bi != nil && len(cArgs) >= 2 {
+				arg1Val, err1 := evalRHSExprDepth(sourceMap, strings.TrimSpace(cArgs[1]), params, depth+1)
+				if err1 != nil {
+					return nil, true, err1
+				}
+				if mc, isMC := arg1Val.(painlessMathContext); isMC {
+					bd, mcErr := applyMathContextPainless(newPainlessBigDecimal(bi.val, 0), mc)
+					if mcErr != nil {
+						return nil, true, mcErr
+					}
+					ctorVal = bd
+				} else if sc, okSc := toInt64Painless(arg1Val); okSc {
+					bd := newPainlessBigDecimal(bi.val, int(sc))
+					if len(cArgs) >= 3 {
+						arg2Val, err2 := evalRHSExprDepth(sourceMap, strings.TrimSpace(cArgs[2]), params, depth+1)
+						if err2 != nil {
+							return nil, true, err2
+						}
+						if mc, isMC := arg2Val.(painlessMathContext); isMC {
+							var mcErr error
+							bd, mcErr = applyMathContextPainless(bd, mc)
+							if mcErr != nil {
+								return nil, true, mcErr
+							}
+						}
+					}
+					ctorVal = bd
 				}
 			}
-			ctorVal = bd
+			if ctorVal == nil {
+				bd, ok := parsePainlessBigDecimal(arg0Val)
+				if !ok {
+					return nil, true, &painlessExceptionError{
+						exType:  "NumberFormatException",
+						message: fmt.Sprintf("For input string: %q", fmt.Sprintf("%v", arg0Val)),
+					}
+				}
+				if len(cArgs) >= 2 {
+					arg1Val, err1 := evalRHSExprDepth(sourceMap, strings.TrimSpace(cArgs[1]), params, depth+1)
+					if err1 != nil {
+						return nil, true, err1
+					}
+					if mc, isMC := arg1Val.(painlessMathContext); isMC {
+						var mcErr error
+						bd, mcErr = applyMathContextPainless(bd, mc)
+						if mcErr != nil {
+							return nil, true, mcErr
+						}
+					}
+				}
+				ctorVal = bd
+			}
 		}
+	} else if isBigInteger {
+		cArgs := splitTopLevelCommaPainless(argStr)
+		if len(cArgs) == 0 {
+			ctorVal = newPainlessBigInteger(big.NewInt(0))
+		} else {
+			arg0Val, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(cArgs[0]), params, depth+1)
+			if err != nil {
+				return nil, true, err
+			}
+			if arr, isArr := arg0Val.([]any); isArr && len(cArgs) == 1 {
+				if len(arr) == 0 {
+					return nil, true, &painlessExceptionError{exType: "NumberFormatException", message: "Zero length BigInteger"}
+				}
+				ctorVal = newPainlessBigIntegerFromBytes(toBytesPainless(arr))
+			} else {
+				radix := 10
+				if len(cArgs) >= 2 {
+					rVal, rErr := evalRHSExprDepth(sourceMap, strings.TrimSpace(cArgs[1]), params, depth+1)
+					if rErr != nil {
+						return nil, true, rErr
+					}
+					if rv, okR := toInt64Painless(rVal); okR {
+						radix = int(rv)
+					}
+				}
+				if radix < 2 || radix > 36 {
+					return nil, true, &painlessExceptionError{exType: "NumberFormatException", message: fmt.Sprintf("Radix out of range: %d", radix)}
+				}
+				s := strings.TrimSpace(fmt.Sprintf("%v", arg0Val))
+				bi := new(big.Int)
+				if s == "" {
+					return nil, true, &painlessExceptionError{exType: "NumberFormatException", message: "Zero length BigInteger"}
+				}
+				if _, ok := bi.SetString(s, radix); !ok {
+					return nil, true, &painlessExceptionError{exType: "NumberFormatException", message: fmt.Sprintf("For input string: %q", s)}
+				}
+				ctorVal = newPainlessBigInteger(bi)
+			}
+		}
+	} else if isMathContext {
+		cArgs := splitTopLevelCommaPainless(argStr)
+		prec := 0
+		mode := "HALF_UP"
+		if len(cArgs) >= 1 {
+			v0, err0 := evalRHSExprDepth(sourceMap, strings.TrimSpace(cArgs[0]), params, depth+1)
+			if err0 != nil {
+				return nil, true, err0
+			}
+			if pv, okP := toInt64Painless(v0); okP {
+				if pv < 0 {
+					return nil, true, &painlessExceptionError{exType: "IllegalArgumentException", message: "Digits < 0"}
+				}
+				prec = int(pv)
+			} else if s0, isS := v0.(string); isS {
+				for _, f := range strings.Fields(s0) {
+					if strings.HasPrefix(f, "precision=") {
+						prec, _ = strconv.Atoi(strings.TrimPrefix(f, "precision="))
+					} else if strings.HasPrefix(f, "roundingMode=") {
+						mode = normalizeRoundingModePainless(strings.TrimPrefix(f, "roundingMode="))
+					}
+				}
+			}
+		}
+		if len(cArgs) >= 2 {
+			v1, err1 := evalRHSExprDepth(sourceMap, strings.TrimSpace(cArgs[1]), params, depth+1)
+			if err1 != nil {
+				return nil, true, err1
+			}
+			mode = normalizeRoundingModePainless(fmt.Sprintf("%v", v1))
+		}
+		ctorVal = painlessMathContext{precision: prec, roundingMode: mode}
+	} else if isBitSet {
+		if argStr != "" {
+			v0, err0 := evalRHSExprDepth(sourceMap, strings.TrimSpace(argStr), params, depth+1)
+			if err0 != nil {
+				return nil, true, err0
+			}
+			if nbits, okN := toInt64Painless(v0); okN && nbits < 0 {
+				return nil, true, &painlessExceptionError{exType: "NegativeArraySizeException", message: fmt.Sprintf("nbits < 0: %d", nbits)}
+			}
+		}
+		ctorVal = &painlessBitSet{}
+	} else if isStringJoiner {
+		cArgs := splitTopLevelCommaPainless(argStr)
+		sj := &painlessStringJoiner{}
+		if len(cArgs) >= 1 {
+			v0, err0 := evalRHSExprDepth(sourceMap, strings.TrimSpace(cArgs[0]), params, depth+1)
+			if err0 != nil {
+				return nil, true, err0
+			}
+			if v0 == nil {
+				return nil, true, &painlessExceptionError{exType: "NullPointerException", message: "The delimiter must not be null"}
+			}
+			sj.delim = fmt.Sprintf("%v", v0)
+		}
+		if len(cArgs) >= 3 {
+			v1, err1 := evalRHSExprDepth(sourceMap, strings.TrimSpace(cArgs[1]), params, depth+1)
+			if err1 != nil {
+				return nil, true, err1
+			}
+			v2, err2 := evalRHSExprDepth(sourceMap, strings.TrimSpace(cArgs[2]), params, depth+1)
+			if err2 != nil {
+				return nil, true, err2
+			}
+			if v1 == nil || v2 == nil {
+				return nil, true, &painlessExceptionError{exType: "NullPointerException", message: "The prefix and suffix must not be null"}
+			}
+			sj.prefix = fmt.Sprintf("%v", v1)
+			sj.suffix = fmt.Sprintf("%v", v2)
+		}
+		ctorVal = sj
+	} else if userCls != nil {
+		uObj, err := instantiateUserClassPainless(userCls, argStr, sourceMap, params, depth+1)
+		if err != nil {
+			return nil, true, err
+		}
+		ctorVal = uObj
 	}
 
 	if tail != "" {
@@ -10896,6 +12770,11 @@ func toFloat64(v any) (float64, bool) {
 			return 0, true
 		}
 		f, ok = val.float64Value(), true
+	case *painlessBigInteger:
+		if val == nil {
+			return 0, true
+		}
+		f, ok = val.float64Value(), true
 	case int:
 		f, ok = float64(val), true
 	case int64:
@@ -10997,7 +12876,7 @@ func isControlBlockStmt(s string) bool {
 	if _, stripped, ok := stripLeadingLoopLabelPainless(t); ok {
 		t = stripped
 	}
-	for _, kw := range []string{"if", "for", "while", "try", "do", "switch"} {
+	for _, kw := range []string{"if", "for", "while", "try", "do", "switch", "class"} {
 		if strings.HasPrefix(t, kw) && (len(t) == len(kw) || t[len(kw)] == ' ' || t[len(kw)] == '\t' || t[len(kw)] == '\n' || t[len(kw)] == '(' || t[len(kw)] == '{') {
 			return true
 		}
@@ -11286,9 +13165,33 @@ func resolveParamPath(params map[string]any, path []string) any {
 				return len(strVal) == 0
 			}
 		}
+		if uo, isUO := curr.(*painlessUserObject); isUO {
+			if uo == nil || uo.fields == nil {
+				return nil
+			}
+			curr = uo.fields[seg]
+			continue
+		}
 		m, ok := curr.(map[string]any)
 		if !ok {
 			return nil
+		}
+		if i == 0 {
+			if uo, isThis := m["this"].(*painlessUserObject); isThis && uo != nil && uo.fields != nil && seg != "this" {
+				shadowed := false
+				if mp, okMP := m["__method_params"].(map[string]bool); okMP && mp[seg] {
+					shadowed = true
+				}
+				if sl, okSL := m["__script_locals"].(map[string]bool); okSL && sl[seg] {
+					shadowed = true
+				}
+				if !shadowed {
+					if fVal, hasField := uo.fields[seg]; hasField {
+						curr = fVal
+						continue
+					}
+				}
+			}
 		}
 		val, exists := m[seg]
 		if !exists {
@@ -11348,6 +13251,10 @@ func setValueAtPath(root map[string]any, path []string, val any) {
 				curr = next
 				continue
 			}
+			if _, isUO := next.(*painlessUserObject); isUO {
+				curr = next
+				continue
+			}
 			nextMap := make(map[string]any)
 			node[seg] = nextMap
 			curr = nextMap
@@ -11360,13 +13267,44 @@ func setValueAtPath(root map[string]any, path []string, val any) {
 				node[idx] = make(map[string]any)
 			}
 			curr = node[idx]
+		case *painlessUserObject:
+			if node == nil || node.fields == nil {
+				return
+			}
+			curr = node.fields[seg]
 		default:
 			return
 		}
 	}
 	lastSeg := decodeBracketSeg(path[len(path)-1])
 	switch node := curr.(type) {
+	case *painlessUserObject:
+		if node != nil && node.fields != nil {
+			node.fields[lastSeg] = val
+			if root != nil {
+				if mp, okMP := root["__method_params"].(map[string]bool); !okMP || !mp[lastSeg] {
+					if _, exists := root[lastSeg]; exists {
+						root[lastSeg] = val
+					}
+				}
+			}
+		}
 	case map[string]any:
+		if len(path) == 1 {
+			if uo, isThis := node["this"].(*painlessUserObject); isThis && uo != nil && uo.fields != nil && lastSeg != "this" {
+				shadowed := false
+				if mp, okMP := node["__method_params"].(map[string]bool); okMP && mp[lastSeg] {
+					shadowed = true
+				}
+				if !shadowed {
+					if _, hasField := uo.fields[lastSeg]; hasField {
+						uo.fields[lastSeg] = val
+						node[lastSeg] = val
+						return
+					}
+				}
+			}
+		}
 		if strings.Contains(lastSeg, ".") {
 			if _, flatExists := node[lastSeg]; !flatExists {
 				subSegs := strings.Split(lastSeg, ".")
@@ -11475,6 +13413,24 @@ func evalInstanceOfPainless(val any, typeName string) bool {
 	case "BigDecimal":
 		_, ok := val.(*painlessBigDecimal)
 		return ok
+	case "BigInteger":
+		_, ok := val.(*painlessBigInteger)
+		return ok
+	case "MathContext":
+		_, ok := val.(painlessMathContext)
+		return ok
+	case "TemporalAdjuster", "TemporalAdjusters":
+		_, ok := val.(*painlessTemporalAdjuster)
+		return ok
+	case "Comparator":
+		_, ok := val.(*painlessComparator)
+		return ok
+	case "BitSet":
+		_, ok := val.(*painlessBitSet)
+		return ok
+	case "StringJoiner":
+		_, ok := val.(*painlessStringJoiner)
+		return ok
 	case "RoundingMode":
 		_, ok := val.(string)
 		return ok
@@ -11497,7 +13453,7 @@ func evalInstanceOfPainless(val any, typeName string) bool {
 		return ok
 	case "Number":
 		switch val.(type) {
-		case int, int64, float64, json.Number, *painlessBigDecimal:
+		case int, int64, float64, json.Number, *painlessBigDecimal, *painlessBigInteger:
 			return true
 		default:
 			return false
@@ -11512,6 +13468,9 @@ func evalInstanceOfPainless(val any, typeName string) bool {
 	case "Object", "def":
 		return true
 	default:
+		if uo, ok := val.(*painlessUserObject); ok && uo != nil && uo.class != nil {
+			return uo.class.name == typeName
+		}
 		return false
 	}
 }
@@ -12145,6 +14104,10 @@ func clearAtPath(root map[string]any, path []string) {
 		}
 	case []any:
 		setValueAtPath(root, path, []any{})
+	case *painlessBitSet:
+		if target != nil {
+			target.words = nil
+		}
 	}
 }
 
@@ -12809,6 +14772,29 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			return int64(-1), true, nil
 		}
 		return int64(0), true, nil
+	case "BigInteger.valueOf":
+		if len(args) >= 1 {
+			if iv, ok := evalInt64Arg(0); ok {
+				return newPainlessBigInteger(big.NewInt(iv)), true, nil
+			}
+			v0, err0 := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err0 != nil {
+				return nil, true, err0
+			}
+			if bi, ok := parsePainlessBigInteger(v0); ok {
+				return bi, true, nil
+			}
+		}
+		return newPainlessBigInteger(big.NewInt(0)), true, nil
+	case "BitSet.valueOf":
+		if len(args) >= 1 {
+			v0, err0 := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err0 != nil {
+				return nil, true, err0
+			}
+			return newPainlessBitSetFromValueOf(v0), true, nil
+		}
+		return &painlessBitSet{}, true, nil
 	case "BigDecimal.valueOf":
 		if len(args) >= 1 {
 			v0, err0 := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
@@ -13695,6 +15681,119 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			return fmt.Sprintf("%v", v), true, nil
 		}
 		return "null", true, nil
+	case "Arrays.setAll", "Arrays.parallelSetAll":
+		if len(args) >= 2 {
+			arrVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return nil, true, err
+			}
+			if arr, ok := arrVal.([]any); ok {
+				genExpr := normalizeMethodReferenceToLambdaPainless(strings.TrimSpace(args[1]), 1)
+				if arrowIdx := findNextUnquotedSubstr(genExpr, "->", 0); arrowIdx > 0 {
+					pNames := parsePainlessLambdaHeader(genExpr[:arrowIdx])
+					if len(pNames) > 0 {
+						pName := pNames[0]
+						body := strings.TrimSpace(genExpr[arrowIdx+2:])
+						prev, hadPrev := params[pName]
+						for i := range arr {
+							params[pName] = int64(i)
+							val, lErr := evalPainlessLambdaBody(body, sourceMap, params, depth+1)
+							if lErr != nil {
+								if hadPrev {
+									params[pName] = prev
+								} else {
+									delete(params, pName)
+								}
+								return nil, true, lErr
+							}
+							arr[i] = val
+						}
+						if hadPrev {
+							params[pName] = prev
+						} else {
+							delete(params, pName)
+						}
+						syncMutatedListExprPainless(args[0], arr, sourceMap, params)
+					}
+				}
+				return arr, true, nil
+			}
+		}
+		return nil, true, nil
+	case "Arrays.parallelPrefix":
+		if len(args) >= 2 {
+			arrVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return nil, true, err
+			}
+			if arr, ok := arrVal.([]any); ok {
+				fromIdx, toIdx := 0, len(arr)
+				opArgIdx := 1
+				if len(args) >= 4 {
+					if ff, okF := evalNumArg(1); okF {
+						fromIdx = int(ff)
+					}
+					if tf, okT := evalNumArg(2); okT {
+						toIdx = int(tf)
+					}
+					opArgIdx = 3
+				}
+				if fromIdx < 0 || toIdx > len(arr) || fromIdx > toIdx {
+					return nil, true, &painlessExceptionError{
+						exType:  "ArrayIndexOutOfBoundsException",
+						message: fmt.Sprintf("Range [%d, %d) out of bounds for length %d", fromIdx, toIdx, len(arr)),
+					}
+				}
+				opExpr := normalizeMethodReferenceToLambdaPainless(strings.TrimSpace(args[opArgIdx]), 2)
+				if arrowIdx := findNextUnquotedSubstr(opExpr, "->", 0); arrowIdx > 0 {
+					pNames := parsePainlessLambdaHeader(opExpr[:arrowIdx])
+					if len(pNames) >= 2 {
+						pA, pB := pNames[0], pNames[1]
+						body := strings.TrimSpace(opExpr[arrowIdx+2:])
+						prevA, hadA := params[pA]
+						prevB, hadB := params[pB]
+						for i := fromIdx + 1; i < toIdx; i++ {
+							params[pA] = arr[i-1]
+							params[pB] = arr[i]
+							val, lErr := evalPainlessLambdaBody(body, sourceMap, params, depth+1)
+							if lErr != nil {
+								if hadA {
+									params[pA] = prevA
+								} else {
+									delete(params, pA)
+								}
+								if hadB {
+									params[pB] = prevB
+								} else {
+									delete(params, pB)
+								}
+								return nil, true, lErr
+							}
+							arr[i] = val
+						}
+						if hadA {
+							params[pA] = prevA
+						} else {
+							delete(params, pA)
+						}
+						if hadB {
+							params[pB] = prevB
+						} else {
+							delete(params, pB)
+						}
+						syncMutatedListExprPainless(args[0], arr, sourceMap, params)
+					}
+				}
+				return arr, true, nil
+			}
+		}
+		return nil, true, nil
+	case "Arrays.compare":
+		res, err := evalArraysCompareOrMismatchPainless(args, false, sourceMap, params, depth+1)
+		return res, true, err
+	case "Arrays.mismatch":
+		res, err := evalArraysCompareOrMismatchPainless(args, true, sourceMap, params, depth+1)
+		return res, true, err
 	case "Arrays.stream":
 		if len(args) >= 1 {
 			v, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
@@ -14713,46 +16812,43 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			}
 		}
 		return painlessPeriod{}, true, nil
-	case "ChronoUnit.YEARS.between", "ChronoUnit.MONTHS.between", "ChronoUnit.WEEKS.between", "ChronoUnit.DAYS.between", "ChronoUnit.HOURS.between", "ChronoUnit.MINUTES.between", "ChronoUnit.SECONDS.between", "ChronoUnit.MILLIS.between", "ChronoUnit.MICROS.between", "ChronoUnit.NANOS.between":
+	case "ChronoUnit.YEARS.between", "ChronoUnit.MONTHS.between", "ChronoUnit.WEEKS.between", "ChronoUnit.DAYS.between", "ChronoUnit.HALF_DAYS.between", "ChronoUnit.HOURS.between", "ChronoUnit.MINUTES.between", "ChronoUnit.SECONDS.between", "ChronoUnit.MILLIS.between", "ChronoUnit.MICROS.between", "ChronoUnit.NANOS.between", "ChronoUnit.DECADES.between", "ChronoUnit.CENTURIES.between", "ChronoUnit.MILLENNIA.between":
 		if len(args) >= 2 {
-			v1, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
-			v2, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
-			t1, ok1 := parsePainlessDateTime(v1)
-			t2, ok2 := parsePainlessDateTime(v2)
-			if ok1 && ok2 {
-				diffMs := t2.UnixMilli() - t1.UnixMilli()
-				switch fnName {
-				case "ChronoUnit.YEARS.between", "ChronoUnit.MONTHS.between":
-					months := int64(t2.Year()-t1.Year())*12 + int64(t2.Month()-t1.Month())
-					if months > 0 && addMonthsClampedPainless(t1, int(months)).After(t2) {
-						months--
-					} else if months < 0 && addMonthsClampedPainless(t1, int(months)).Before(t2) {
-						months++
-					}
-					if fnName == "ChronoUnit.YEARS.between" {
-						return months / 12, true, nil
-					}
-					return months, true, nil
-				case "ChronoUnit.WEEKS.between":
-					return diffMs / (7 * 86400000), true, nil
-				case "ChronoUnit.DAYS.between":
-					return diffMs / 86400000, true, nil
-				case "ChronoUnit.HOURS.between":
-					return diffMs / 3600000, true, nil
-				case "ChronoUnit.MINUTES.between":
-					return diffMs / 60000, true, nil
-				case "ChronoUnit.SECONDS.between":
-					return diffMs / 1000, true, nil
-				case "ChronoUnit.MILLIS.between":
-					return diffMs, true, nil
-				case "ChronoUnit.MICROS.between":
-					return t2.Sub(t1).Microseconds(), true, nil
-				case "ChronoUnit.NANOS.between":
-					return t2.Sub(t1).Nanoseconds(), true, nil
-				}
+			v1, err1 := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err1 != nil {
+				return int64(0), true, err1
 			}
+			v2, err2 := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+			if err2 != nil {
+				return int64(0), true, err2
+			}
+			unitName := strings.TrimSuffix(strings.TrimPrefix(fnName, "ChronoUnit."), ".between")
+			return evalTemporalBetweenUnitPainless(unitName, v1, v2), true, nil
 		}
 		return int64(0), true, nil
+	case "TemporalAdjusters.firstDayOfMonth", "TemporalAdjusters.lastDayOfMonth", "TemporalAdjusters.firstDayOfNextMonth",
+		"TemporalAdjusters.firstDayOfYear", "TemporalAdjusters.lastDayOfYear", "TemporalAdjusters.firstDayOfNextYear",
+		"TemporalAdjusters.next", "TemporalAdjusters.nextOrSame", "TemporalAdjusters.previous", "TemporalAdjusters.previousOrSame",
+		"TemporalAdjusters.firstInMonth", "TemporalAdjusters.lastInMonth", "TemporalAdjusters.dayOfWeekInMonth":
+		res, err := evalTemporalAdjustersStaticPainless(fnName, args, sourceMap, params, depth+1)
+		return res, true, err
+	case "Comparator.naturalOrder", "Comparator.reverseOrder", "Collections.reverseOrder",
+		"Comparator.nullsFirst", "Comparator.nullsLast",
+		"Comparator.comparing", "Comparator.comparingInt", "Comparator.comparingLong", "Comparator.comparingDouble":
+		res, err := evalComparatorStaticPainless(fnName, args, sourceMap, params, depth+1)
+		return res, true, err
+	case "Character.charCount", "Character.toChars", "Character.toString", "Character.valueOf",
+		"Character.isValidCodePoint", "Character.isBmpCodePoint", "Character.isSupplementaryCodePoint",
+		"Character.isHighSurrogate", "Character.isLowSurrogate", "Character.isSurrogate", "Character.isSurrogatePair",
+		"Character.toCodePoint", "Character.codePointAt", "Character.codePointBefore", "Character.codePointCount",
+		"Character.getNumericValue", "Character.getType", "Character.compare",
+		"Character.isDigit", "Character.isLetter", "Character.isLetterOrDigit", "Character.isAlphabetic",
+		"Character.isWhitespace", "Character.isSpaceChar", "Character.isUpperCase", "Character.isLowerCase",
+		"Character.isTitleCase", "Character.toUpperCase", "Character.toLowerCase", "Character.toTitleCase",
+		"Character.isIdeographic", "Character.isJavaIdentifierStart", "Character.isJavaIdentifierPart",
+		"Character.isISOControl", "Character.isDefined", "Character.digit", "Character.forDigit", "Character.reverseBytes":
+		res, err := evalCharacterStaticPainless(fnName, args, sourceMap, params, depth+1)
+		return res, true, err
 	case "UUID.randomUUID":
 		var b [16]byte
 		_, _ = rand.Read(b[:])
@@ -14857,6 +16953,12 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 		return "", true, nil
 	}
 	budget := getOrInitEvalBudget(params)
+	if params != nil {
+		if thisObj, isUO := params["this"].(*painlessUserObject); isUO && thisObj != nil && thisObj.class != nil && thisObj.class.methods[fnName] != nil {
+			res, err := evalUserObjectMethodPainless(thisObj, fnName, argStr, sourceMap, params, depth+1)
+			return res, true, err
+		}
+	}
 	if budget != nil && budget.userFuncs != nil {
 		if fn, ok := budget.userFuncs[fnName]; ok && fn != nil {
 			if err := budget.step(); err != nil {
@@ -15084,6 +17186,26 @@ func comparePainlessValues(a, b any) int {
 			return 0
 		}
 	}
+	if ba, okA := a.(*painlessBigDecimal); okA && ba != nil {
+		if bb, okB := parsePainlessBigDecimal(b); okB && bb != nil {
+			return compareBigDecimalPainless(ba, bb)
+		}
+	}
+	if bb, okB := b.(*painlessBigDecimal); okB && bb != nil {
+		if ba, okA := parsePainlessBigDecimal(a); okA && ba != nil {
+			return compareBigDecimalPainless(ba, bb)
+		}
+	}
+	if ia, okA := a.(*painlessBigInteger); okA && ia != nil && ia.val != nil {
+		if ib, okB := parsePainlessBigInteger(b); okB && ib != nil && ib.val != nil {
+			return ia.val.Cmp(ib.val)
+		}
+	}
+	if ib, okB := b.(*painlessBigInteger); okB && ib != nil && ib.val != nil {
+		if ia, okA := parsePainlessBigInteger(a); okA && ia != nil && ia.val != nil {
+			return ia.val.Cmp(ib.val)
+		}
+	}
 	fa, okA := toFloat64(a)
 	fb, okB := toFloat64(b)
 	if okA && okB {
@@ -15102,6 +17224,28 @@ func evalPainlessComparatorPair(cmpExpr string, a, b any, sourceMap, params map[
 	cmpExpr = strings.TrimSpace(cmpExpr)
 	if cmpExpr == "" || cmpExpr == "null" {
 		return comparePainlessValues(a, b), nil
+	}
+	if findNextUnquotedSubstr(cmpExpr, "->", 0) < 0 && findTopLevelSubstrPainless(cmpExpr, "::") < 0 {
+		if cmpVal, err := evalRHSExprDepth(sourceMap, cmpExpr, params, depth+1); err == nil {
+			if pc, ok := cmpVal.(*painlessComparator); ok && pc != nil {
+				return evalComparatorObjectPairPainless(pc, a, b, sourceMap, params, depth+1)
+			}
+		}
+	} else if strings.HasPrefix(cmpExpr, "Comparator.") || strings.HasPrefix(cmpExpr, "java.util.Comparator.") || strings.HasPrefix(cmpExpr, "Collections.") || strings.HasPrefix(cmpExpr, "String.CASE_INSENSITIVE_ORDER") {
+		if cmpVal, err := evalRHSExprDepth(sourceMap, cmpExpr, params, depth+1); err == nil {
+			if pc, ok := cmpVal.(*painlessComparator); ok && pc != nil {
+				return evalComparatorObjectPairPainless(pc, a, b, sourceMap, params, depth+1)
+			}
+		}
+	} else if dotIdx := strings.IndexByte(cmpExpr, '.'); dotIdx > 0 && params != nil {
+		rootIdent := strings.TrimSpace(cmpExpr[:dotIdx])
+		if _, isPC := params[rootIdent].(*painlessComparator); isPC {
+			if cmpVal, err := evalRHSExprDepth(sourceMap, cmpExpr, params, depth+1); err == nil {
+				if pc, ok := cmpVal.(*painlessComparator); ok && pc != nil {
+					return evalComparatorObjectPairPainless(pc, a, b, sourceMap, params, depth+1)
+				}
+			}
+		}
 	}
 	reversed := false
 	if strings.HasSuffix(cmpExpr, ".reversed()") {
@@ -15327,6 +17471,38 @@ func sortPainlessSliceInPlace(arr []any, cmpExpr string, sourceMap, params map[s
 		return nil
 	}
 	cmpExpr = strings.TrimSpace(cmpExpr)
+	if cmpExpr != "" && cmpExpr != "null" {
+		tryEvalCmpObj := findTopLevelSubstrPainless(cmpExpr, "->") < 0 && findTopLevelSubstrPainless(cmpExpr, "::") < 0
+		if !tryEvalCmpObj && (strings.HasPrefix(cmpExpr, "Comparator.") || strings.HasPrefix(cmpExpr, "java.util.Comparator.") || strings.HasPrefix(cmpExpr, "Collections.") || strings.HasPrefix(cmpExpr, "String.CASE_INSENSITIVE_ORDER")) {
+			tryEvalCmpObj = true
+		}
+		if !tryEvalCmpObj {
+			if dotIdx := strings.IndexByte(cmpExpr, '.'); dotIdx > 0 && params != nil {
+				if _, isPC := params[strings.TrimSpace(cmpExpr[:dotIdx])].(*painlessComparator); isPC {
+					tryEvalCmpObj = true
+				}
+			}
+		}
+		if tryEvalCmpObj {
+			if cmpVal, err := evalRHSExprDepth(sourceMap, cmpExpr, params, depth+1); err == nil {
+				if pc, ok := cmpVal.(*painlessComparator); ok && pc != nil {
+					var sortErr error
+					sort.SliceStable(arr, func(i, j int) bool {
+						if sortErr != nil {
+							return false
+						}
+						c, cErr := evalComparatorObjectPairPainless(pc, arr[i], arr[j], sourceMap, params, depth+1)
+						if cErr != nil {
+							sortErr = cErr
+							return false
+						}
+						return c < 0
+					})
+					return sortErr
+				}
+			}
+		}
+	}
 	reversed := false
 	if strings.HasSuffix(cmpExpr, ".reversed()") {
 		reversed = true
@@ -16235,7 +18411,9 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 				}
 			}
 		default:
-			if s, ok := recVal.([]any); ok {
+			if bs, isBS := recVal.(*painlessBitSet); isBS {
+				srcSlice = bs.streamSlice()
+			} else if s, ok := recVal.([]any); ok {
 				srcSlice = s
 			} else if !isEmptyOptionalOrNilPainless(recVal) {
 				srcSlice = []any{recVal}
@@ -16245,6 +18423,28 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 		}
 	} else {
 		matchedStaticStream := false
+		if duIdx := findTopLevelSubstrPainless(rhs, ".datesUntil("); duIdx > 0 {
+			openP := duIdx + len(".datesUntil(") - 1
+			closeP := findMatchingDelimiter(rhs, openP, '(', ')')
+			if closeP > openP && closeP < len(rhs)-1 {
+				chainRest := strings.TrimSpace(rhs[closeP+1:])
+				st, tr, ok := parseStreamChainStepsPainless(chainRest)
+				if ok && len(st) > 0 && isStreamStepMethodPainless(st[0].name) {
+					duVal, duErr := evalRHSExprDepth(sourceMap, rhs[:closeP+1], params, depth+1)
+					if duErr != nil {
+						return nil, true, duErr
+					}
+					if s, isSlice := duVal.([]any); isSlice {
+						srcSlice = s
+					} else {
+						srcSlice = []any{}
+					}
+					steps = st
+					tailRest = tr
+					matchedStaticStream = true
+				}
+			}
+		}
 		for _, pfx := range []string{
 			"Arrays.stream(", "Stream.of(", "IntStream.of(", "LongStream.of(", "DoubleStream.of(",
 			"Stream.empty(", "IntStream.empty(", "LongStream.empty(", "DoubleStream.empty(",
@@ -18183,7 +20383,7 @@ func parseISO8601DurationPainless(s string) (time.Duration, bool) {
 
 func isNumericValuePainless(v any) bool {
 	switch v.(type) {
-	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, json.Number, *painlessBigDecimal, *big.Float, *big.Int:
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, json.Number, *painlessBigDecimal, *painlessBigInteger, *big.Float, *big.Int:
 		return true
 	default:
 		return false
@@ -18193,6 +20393,11 @@ func isNumericValuePainless(v any) bool {
 func toInt64Painless(v any) (int64, bool) {
 	switch tv := v.(type) {
 	case *painlessBigDecimal:
+		if tv == nil {
+			return 0, false
+		}
+		return tv.longValue(), true
+	case *painlessBigInteger:
 		if tv == nil {
 			return 0, false
 		}
@@ -19579,4 +21784,2220 @@ func evalStreamIterateOrGeneratePainless(pfx, argStr string, steps []painlessStr
 		cur = nextVal
 	}
 	return out, nil
+}
+
+func evalNumericBitSetJoinerComparatorMethodPainless(mName string, recVal any, argExpr string, sourceMap, params map[string]any, depth int) (any, error) {
+	args := splitTopLevelCommaPainless(argExpr)
+	evalArg := func(idx int) (any, error) {
+		if idx < 0 || idx >= len(args) {
+			return nil, nil
+		}
+		return evalRHSExprDepth(sourceMap, strings.TrimSpace(args[idx]), params, depth+1)
+	}
+	// BigDecimal methods
+	if bd, ok := recVal.(*painlessBigDecimal); ok && bd != nil && bd.unscaled != nil {
+		switch mName {
+		case ".subtract(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			other, okO := parsePainlessBigDecimal(a0)
+			if !okO {
+				return nil, nil
+			}
+			res := bd.sub(other)
+			if len(args) >= 2 {
+				a1, err1 := evalArg(1)
+				if err1 != nil {
+					return nil, err1
+				}
+				if mc, okMC := a1.(painlessMathContext); okMC {
+					return applyMathContextPainless(res, mc)
+				}
+			}
+			return res, nil
+		case ".multiply(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			other, okO := parsePainlessBigDecimal(a0)
+			if !okO {
+				return nil, nil
+			}
+			res := bd.mul(other)
+			if len(args) >= 2 {
+				a1, err1 := evalArg(1)
+				if err1 != nil {
+					return nil, err1
+				}
+				if mc, okMC := a1.(painlessMathContext); okMC {
+					return applyMathContextPainless(res, mc)
+				}
+			}
+			return res, nil
+		case ".divide(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			other, okO := parsePainlessBigDecimal(a0)
+			if !okO {
+				return nil, nil
+			}
+			if other.unscaled.Sign() == 0 {
+				return nil, fmt.Errorf("ArithmeticException: Division by zero")
+			}
+			if len(args) == 1 {
+				return bd.div(other, bd.scale, "UNNECESSARY")
+			}
+			a1, err1 := evalArg(1)
+			if err1 != nil {
+				return nil, err1
+			}
+			if mc, okMC := a1.(painlessMathContext); okMC {
+				return divideBigDecimalWithMathContextPainless(bd, other, mc)
+			}
+			if len(args) == 2 {
+				if modeStr, isStr := a1.(string); isStr {
+					return bd.div(other, bd.scale, normalizeRoundingModePainless(modeStr))
+				}
+				scF, okSc := toFloat64(a1)
+				if okSc {
+					return bd.div(other, int(scF), "HALF_UP")
+				}
+			}
+			if len(args) >= 3 {
+				scF, _ := toFloat64(a1)
+				a2, err2 := evalArg(2)
+				if err2 != nil {
+					return nil, err2
+				}
+				return bd.div(other, int(scF), normalizeRoundingModePainless(a2))
+			}
+			return bd.div(other, bd.scale, "HALF_UP")
+		case ".remainder(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			other, okO := parsePainlessBigDecimal(a0)
+			if !okO {
+				return nil, nil
+			}
+			if other.unscaled.Sign() == 0 {
+				return nil, fmt.Errorf("ArithmeticException: Division by zero")
+			}
+			_, rem, errD := bd.divideAndRemainder(other)
+			if errD != nil {
+				return nil, errD
+			}
+			if len(args) >= 2 {
+				a1, err1 := evalArg(1)
+				if err1 != nil {
+					return nil, err1
+				}
+				if mc, okMC := a1.(painlessMathContext); okMC {
+					return applyMathContextPainless(rem, mc)
+				}
+			}
+			return rem, nil
+		case ".divideToIntegralValue(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			other, okO := parsePainlessBigDecimal(a0)
+			if !okO {
+				return nil, nil
+			}
+			q, _, errD := bd.divideAndRemainder(other)
+			if errD != nil {
+				return nil, errD
+			}
+			if len(args) >= 2 {
+				a1, err1 := evalArg(1)
+				if err1 != nil {
+					return nil, err1
+				}
+				if mc, okMC := a1.(painlessMathContext); okMC {
+					return applyMathContextPainless(q, mc)
+				}
+			}
+			return q, nil
+		case ".divideAndRemainder(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			other, okO := parsePainlessBigDecimal(a0)
+			if !okO {
+				return nil, nil
+			}
+			q, rem, errD := bd.divideAndRemainder(other)
+			if errD != nil {
+				return nil, errD
+			}
+			if len(args) >= 2 {
+				a1, err1 := evalArg(1)
+				if err1 != nil {
+					return nil, err1
+				}
+				if mc, okMC := a1.(painlessMathContext); okMC {
+					var errMC error
+					q, errMC = applyMathContextPainless(q, mc)
+					if errMC != nil {
+						return nil, errMC
+					}
+					rem, errMC = applyMathContextPainless(rem, mc)
+					if errMC != nil {
+						return nil, errMC
+					}
+				}
+			}
+			return []any{q, rem}, nil
+		case ".pow(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			nf, okN := toFloat64(a0)
+			if !okN {
+				return nil, nil
+			}
+			n := int(nf)
+			if n < 0 || n > 999999999 {
+				return nil, fmt.Errorf("ArithmeticException: Invalid operation")
+			}
+			res := &painlessBigDecimal{
+				unscaled: new(big.Int).Exp(bd.unscaled, big.NewInt(int64(n)), nil),
+				scale:    bd.scale * n,
+			}
+			if len(args) >= 2 {
+				a1, err1 := evalArg(1)
+				if err1 != nil {
+					return nil, err1
+				}
+				if mc, okMC := a1.(painlessMathContext); okMC {
+					return applyMathContextPainless(res, mc)
+				}
+			}
+			return res, nil
+		case ".setScale(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			scF, okSc := toFloat64(a0)
+			if !okSc {
+				return nil, nil
+			}
+			mode := "UNNECESSARY"
+			if len(args) >= 2 {
+				a1, err1 := evalArg(1)
+				if err1 != nil {
+					return nil, err1
+				}
+				mode = normalizeRoundingModePainless(a1)
+			}
+			return bd.setScale(int(scF), mode)
+		case ".min(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			other, okO := parsePainlessBigDecimal(a0)
+			if !okO {
+				return nil, nil
+			}
+			if bd.cmp(other) <= 0 {
+				return bd, nil
+			}
+			return other, nil
+		case ".max(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			other, okO := parsePainlessBigDecimal(a0)
+			if !okO {
+				return nil, nil
+			}
+			if bd.cmp(other) >= 0 {
+				return bd, nil
+			}
+			return other, nil
+		case ".movePointLeft(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			nf, okN := toFloat64(a0)
+			if !okN {
+				return nil, nil
+			}
+			return &painlessBigDecimal{
+				unscaled: new(big.Int).Set(bd.unscaled),
+				scale:    bd.scale + int(nf),
+			}, nil
+		case ".movePointRight(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			nf, okN := toFloat64(a0)
+			if !okN {
+				return nil, nil
+			}
+			return &painlessBigDecimal{
+				unscaled: new(big.Int).Set(bd.unscaled),
+				scale:    bd.scale - int(nf),
+			}, nil
+		case ".scaleByPowerOfTen(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			nf, okN := toFloat64(a0)
+			if !okN {
+				return nil, nil
+			}
+			return &painlessBigDecimal{
+				unscaled: new(big.Int).Set(bd.unscaled),
+				scale:    bd.scale - int(nf),
+			}, nil
+		case ".round(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if mc, okMC := a0.(painlessMathContext); okMC {
+				return applyMathContextPainless(bd, mc)
+			}
+			return bd, nil
+		case ".abs(":
+			res := &painlessBigDecimal{unscaled: new(big.Int).Abs(bd.unscaled), scale: bd.scale}
+			if len(args) >= 1 && strings.TrimSpace(argExpr) != "" {
+				a0, err := evalArg(0)
+				if err != nil {
+					return nil, err
+				}
+				if mc, okMC := a0.(painlessMathContext); okMC {
+					return applyMathContextPainless(res, mc)
+				}
+			}
+			return res, nil
+		case ".negate(":
+			res := &painlessBigDecimal{unscaled: new(big.Int).Neg(bd.unscaled), scale: bd.scale}
+			if len(args) >= 1 && strings.TrimSpace(argExpr) != "" {
+				a0, err := evalArg(0)
+				if err != nil {
+					return nil, err
+				}
+				if mc, okMC := a0.(painlessMathContext); okMC {
+					return applyMathContextPainless(res, mc)
+				}
+			}
+			return res, nil
+		case ".toString(":
+			return bd.String(), nil
+		}
+	}
+
+	// BigInteger methods
+	if bi, ok := recVal.(*painlessBigInteger); ok && bi != nil && bi.val != nil {
+		switch mName {
+		case ".subtract(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if other, okO := parsePainlessBigInteger(a0); okO {
+				return newPainlessBigInteger(new(big.Int).Sub(bi.val, other.val)), nil
+			}
+		case ".multiply(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if other, okO := parsePainlessBigInteger(a0); okO {
+				return newPainlessBigInteger(new(big.Int).Mul(bi.val, other.val)), nil
+			}
+		case ".divide(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if other, okO := parsePainlessBigInteger(a0); okO {
+				if other.val.Sign() == 0 {
+					return nil, fmt.Errorf("ArithmeticException: BigInteger divide by zero")
+				}
+				return newPainlessBigInteger(new(big.Int).Quo(bi.val, other.val)), nil
+			}
+		case ".remainder(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if other, okO := parsePainlessBigInteger(a0); okO {
+				if other.val.Sign() == 0 {
+					return nil, fmt.Errorf("ArithmeticException: BigInteger divide by zero")
+				}
+				return newPainlessBigInteger(new(big.Int).Rem(bi.val, other.val)), nil
+			}
+		case ".divideAndRemainder(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if other, okO := parsePainlessBigInteger(a0); okO {
+				if other.val.Sign() == 0 {
+					return nil, fmt.Errorf("ArithmeticException: BigInteger divide by zero")
+				}
+				q, r := new(big.Int).QuoRem(bi.val, other.val, new(big.Int))
+				return []any{newPainlessBigInteger(q), newPainlessBigInteger(r)}, nil
+			}
+		case ".mod(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if other, okO := parsePainlessBigInteger(a0); okO {
+				if other.val.Sign() <= 0 {
+					return nil, fmt.Errorf("ArithmeticException: BigInteger: modulus not positive")
+				}
+				return newPainlessBigInteger(new(big.Int).Mod(bi.val, other.val)), nil
+			}
+		case ".modPow(":
+			if len(args) >= 2 {
+				a0, err0 := evalArg(0)
+				if err0 != nil {
+					return nil, err0
+				}
+				a1, err1 := evalArg(1)
+				if err1 != nil {
+					return nil, err1
+				}
+				expBI, okE := parsePainlessBigInteger(a0)
+				modBI, okM := parsePainlessBigInteger(a1)
+				if okE && okM {
+					if modBI.val.Sign() <= 0 {
+						return nil, fmt.Errorf("ArithmeticException: BigInteger: modulus not positive")
+					}
+					if modBI.val.Cmp(big.NewInt(1)) == 0 {
+						return newPainlessBigInteger(big.NewInt(0)), nil
+					}
+					base := new(big.Int).Set(bi.val)
+					exp := new(big.Int).Set(expBI.val)
+					if exp.Sign() < 0 {
+						inv := new(big.Int).ModInverse(base, modBI.val)
+						if inv == nil {
+							return nil, fmt.Errorf("ArithmeticException: BigInteger not invertible")
+						}
+						base = inv
+						exp.Neg(exp)
+					}
+					return newPainlessBigInteger(new(big.Int).Exp(base, exp, modBI.val)), nil
+				}
+			}
+		case ".modInverse(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if modBI, okM := parsePainlessBigInteger(a0); okM {
+				if modBI.val.Sign() <= 0 {
+					return nil, fmt.Errorf("ArithmeticException: BigInteger: modulus not positive")
+				}
+				if modBI.val.Cmp(big.NewInt(1)) == 0 {
+					return newPainlessBigInteger(big.NewInt(0)), nil
+				}
+				inv := new(big.Int).ModInverse(bi.val, modBI.val)
+				if inv == nil {
+					return nil, fmt.Errorf("ArithmeticException: BigInteger not invertible")
+				}
+				return newPainlessBigInteger(inv), nil
+			}
+		case ".gcd(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if other, okO := parsePainlessBigInteger(a0); okO {
+				aAbs := new(big.Int).Abs(bi.val)
+				bAbs := new(big.Int).Abs(other.val)
+				if aAbs.Sign() == 0 {
+					return newPainlessBigInteger(bAbs), nil
+				}
+				if bAbs.Sign() == 0 {
+					return newPainlessBigInteger(aAbs), nil
+				}
+				return newPainlessBigInteger(new(big.Int).GCD(nil, nil, aAbs, bAbs)), nil
+			}
+		case ".pow(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if nf, okN := toFloat64(a0); okN {
+				exp := int64(nf)
+				if exp < 0 {
+					return nil, fmt.Errorf("ArithmeticException: Negative exponent")
+				}
+				return newPainlessBigInteger(new(big.Int).Exp(bi.val, big.NewInt(exp), nil)), nil
+			}
+		case ".min(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if other, okO := parsePainlessBigInteger(a0); okO {
+				if bi.val.Cmp(other.val) <= 0 {
+					return bi, nil
+				}
+				return other, nil
+			}
+		case ".max(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if other, okO := parsePainlessBigInteger(a0); okO {
+				if bi.val.Cmp(other.val) >= 0 {
+					return bi, nil
+				}
+				return other, nil
+			}
+		case ".and(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if other, okO := parsePainlessBigInteger(a0); okO {
+				return newPainlessBigInteger(new(big.Int).And(bi.val, other.val)), nil
+			}
+		case ".xor(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if other, okO := parsePainlessBigInteger(a0); okO {
+				return newPainlessBigInteger(new(big.Int).Xor(bi.val, other.val)), nil
+			}
+		case ".andNot(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if other, okO := parsePainlessBigInteger(a0); okO {
+				return newPainlessBigInteger(new(big.Int).AndNot(bi.val, other.val)), nil
+			}
+		case ".shiftLeft(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if nf, okN := toFloat64(a0); okN {
+				n := int(nf)
+				if n >= 0 {
+					return newPainlessBigInteger(new(big.Int).Lsh(bi.val, uint(n))), nil // #nosec G115 -- checked n >= 0
+				}
+				return newPainlessBigInteger(new(big.Int).Rsh(bi.val, uint(-n))), nil // #nosec G115 -- checked n < 0
+			}
+		case ".shiftRight(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if nf, okN := toFloat64(a0); okN {
+				n := int(nf)
+				if n >= 0 {
+					return newPainlessBigInteger(new(big.Int).Rsh(bi.val, uint(n))), nil // #nosec G115 -- checked n >= 0
+				}
+				return newPainlessBigInteger(new(big.Int).Lsh(bi.val, uint(-n))), nil // #nosec G115 -- checked n < 0
+			}
+		case ".testBit(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if nf, okN := toFloat64(a0); okN {
+				n := int(nf)
+				if n < 0 {
+					return nil, fmt.Errorf("ArithmeticException: Negative bit address")
+				}
+				return bi.val.Bit(n) == 1, nil
+			}
+		case ".setBit(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if nf, okN := toFloat64(a0); okN {
+				n := int(nf)
+				if n < 0 {
+					return nil, fmt.Errorf("ArithmeticException: Negative bit address")
+				}
+				return newPainlessBigInteger(new(big.Int).SetBit(bi.val, n, 1)), nil
+			}
+		case ".clearBit(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if nf, okN := toFloat64(a0); okN {
+				n := int(nf)
+				if n < 0 {
+					return nil, fmt.Errorf("ArithmeticException: Negative bit address")
+				}
+				return newPainlessBigInteger(new(big.Int).SetBit(bi.val, n, 0)), nil
+			}
+		case ".flipBit(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if nf, okN := toFloat64(a0); okN {
+				n := int(nf)
+				if n < 0 {
+					return nil, fmt.Errorf("ArithmeticException: Negative bit address")
+				}
+				b := uint(1)
+				if bi.val.Bit(n) == 1 {
+					b = 0
+				}
+				return newPainlessBigInteger(new(big.Int).SetBit(bi.val, n, b)), nil
+			}
+		case ".isProbablePrime(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if nf, okN := toFloat64(a0); okN {
+				certainty := int(nf)
+				if certainty <= 0 {
+					return true, nil
+				}
+				if bi.val.Sign() <= 0 {
+					return false, nil
+				}
+				reps := (certainty + 1) / 2
+				if reps < 1 {
+					reps = 1
+				}
+				if reps > 50 {
+					reps = 50
+				}
+				return bi.val.ProbablyPrime(reps), nil
+			}
+		case ".toString(":
+			if strings.TrimSpace(argExpr) == "" {
+				return bi.val.String(), nil
+			}
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if nf, okN := toFloat64(a0); okN {
+				radix := int(nf)
+				if radix < 2 || radix > 36 {
+					radix = 10
+				}
+				return bi.val.Text(radix), nil
+			}
+		}
+	}
+
+	// BitSet methods
+	if bs, ok := recVal.(*painlessBitSet); ok && bs != nil {
+		switch mName {
+		case ".and(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if other, okO := a0.(*painlessBitSet); okO {
+				bs.and(other)
+				return nil, nil
+			}
+		case ".xor(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if other, okO := a0.(*painlessBitSet); okO {
+				bs.xor(other)
+				return nil, nil
+			}
+		case ".andNot(":
+			a0, err := evalArg(0)
+			if err != nil {
+				return nil, err
+			}
+			if other, okO := a0.(*painlessBitSet); okO {
+				bs.andNot(other)
+				return nil, nil
+			}
+		case ".clear(":
+			if strings.TrimSpace(argExpr) == "" {
+				bs.words = nil
+				return nil, nil
+			}
+			a0, err0 := evalArg(0)
+			if err0 != nil {
+				return nil, err0
+			}
+			f0, _ := toFloat64(a0)
+			if len(args) == 1 {
+				if err := bs.clearBit(int(f0)); err != nil {
+					return nil, err
+				}
+				return nil, nil
+			}
+			a1, err1 := evalArg(1)
+			if err1 != nil {
+				return nil, err1
+			}
+			f1, _ := toFloat64(a1)
+			if err := bs.setRange(int(f0), int(f1), false); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		case ".flip(":
+			a0, err0 := evalArg(0)
+			if err0 != nil {
+				return nil, err0
+			}
+			f0, _ := toFloat64(a0)
+			if len(args) == 1 {
+				if err := bs.flip(int(f0)); err != nil {
+					return nil, err
+				}
+				return nil, nil
+			}
+			a1, err1 := evalArg(1)
+			if err1 != nil {
+				return nil, err1
+			}
+			f1, _ := toFloat64(a1)
+			if err := bs.flipRange(int(f0), int(f1)); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		case ".nextSetBit(":
+			a0, err0 := evalArg(0)
+			if err0 != nil {
+				return nil, err0
+			}
+			f0, _ := toFloat64(a0)
+			return bs.nextSetBit(int(f0))
+		case ".nextClearBit(":
+			a0, err0 := evalArg(0)
+			if err0 != nil {
+				return nil, err0
+			}
+			f0, _ := toFloat64(a0)
+			return bs.nextClearBit(int(f0))
+		case ".previousSetBit(":
+			a0, err0 := evalArg(0)
+			if err0 != nil {
+				return nil, err0
+			}
+			f0, _ := toFloat64(a0)
+			return bs.previousSetBit(int(f0))
+		case ".previousClearBit(":
+			a0, err0 := evalArg(0)
+			if err0 != nil {
+				return nil, err0
+			}
+			f0, _ := toFloat64(a0)
+			return bs.previousClearBit(int(f0))
+		case ".intersects(":
+			a0, err0 := evalArg(0)
+			if err0 != nil {
+				return nil, err0
+			}
+			if other, okO := a0.(*painlessBitSet); okO {
+				return bs.intersects(other), nil
+			}
+			return false, nil
+		case ".toString(":
+			return bs.String(), nil
+		}
+	}
+
+	// StringJoiner methods
+	if sj, ok := recVal.(*painlessStringJoiner); ok && sj != nil {
+		switch mName {
+		case ".setEmptyValue(":
+			a0, err0 := evalArg(0)
+			if err0 != nil {
+				return nil, err0
+			}
+			if a0 == nil {
+				return nil, fmt.Errorf("NullPointerException: The empty value must not be null")
+			}
+			ev := fmt.Sprintf("%v", a0)
+			sj.emptyVal = &ev
+			return sj, nil
+		case ".toString(":
+			return sj.String(), nil
+		}
+	}
+
+	// Comparator methods
+	if pc, ok := recVal.(*painlessComparator); ok && pc != nil {
+		switch mName {
+		case ".thenComparing(", ".thenComparingInt(", ".thenComparingLong(", ".thenComparingDouble(":
+			if len(args) == 0 {
+				return pc, nil
+			}
+			arg0Raw := strings.TrimSpace(args[0])
+			var nextCmp *painlessComparator
+			if len(args) >= 2 {
+				cVal, errC := evalArg(1)
+				if errC != nil {
+					return nil, errC
+				}
+				var keySubCmp *painlessComparator
+				if subC, okSub := cVal.(*painlessComparator); okSub {
+					keySubCmp = subC
+				} else {
+					keySubCmp = &painlessComparator{kind: "lambda", lambdaExpr: strings.TrimSpace(args[1])}
+				}
+				nextCmp = &painlessComparator{
+					kind:    "comparing",
+					keyExpr: arg0Raw,
+					keyCmp:  keySubCmp,
+				}
+			} else if mName == ".thenComparing(" {
+				// Could be a Comparator object or a key extractor lambda/method ref
+				if findTopLevelSubstrPainless(arg0Raw, "->") < 0 && findTopLevelSubstrPainless(arg0Raw, "::") < 0 {
+					if v0, err0 := evalArg(0); err0 == nil {
+						if subC, okSub := v0.(*painlessComparator); okSub {
+							nextCmp = subC
+						}
+					}
+				}
+				if nextCmp == nil {
+					nextCmp = &painlessComparator{
+						kind:    "comparing",
+						keyExpr: arg0Raw,
+					}
+				}
+			} else {
+				nextCmp = &painlessComparator{
+					kind:    "comparing",
+					keyExpr: arg0Raw,
+				}
+			}
+			cloned := pc.clone()
+			cloned.thenList = append(cloned.thenList, nextCmp)
+			return cloned, nil
+		case ".compare(":
+			if len(args) >= 2 {
+				a0, err0 := evalArg(0)
+				if err0 != nil {
+					return nil, err0
+				}
+				a1, err1 := evalArg(1)
+				if err1 != nil {
+					return nil, err1
+				}
+				cRes, errC := evalComparatorObjectPairPainless(pc, a0, a1, sourceMap, params, depth+1)
+				if errC != nil {
+					return nil, errC
+				}
+				return int64(cRes), nil
+			}
+		}
+	}
+
+	if mName == ".toString(" && strings.TrimSpace(argExpr) == "" && recVal != nil {
+		return fmt.Sprintf("%v", recVal), nil
+	}
+	return nil, nil
+}
+
+func formatDateLikeReceiverPainless(recVal any, nt time.Time) any {
+	if s, ok := recVal.(string); ok {
+		switch classifyTemporalStringKindPainless(s) {
+		case "YearMonth":
+			return fmt.Sprintf("%04d-%02d", nt.Year(), int(nt.Month()))
+		case "LocalDate":
+			return nt.Format("2006-01-02")
+		case "LocalTime":
+			return formatLocalTimePainless(nt.Hour(), nt.Minute(), nt.Second(), nt.Nanosecond())
+		case "LocalDateTime":
+			if nt.Nanosecond() > 0 {
+				return nt.Format("2006-01-02T15:04:05.999999999")
+			}
+			return nt.Format("2006-01-02T15:04:05")
+		}
+	}
+	return nt.Format(time.RFC3339Nano)
+}
+
+func setDateComponentClampedPainless(t time.Time, year, month, day int) time.Time {
+	maxD := daysInMonthPainless(year, time.Month(month))
+	if day > maxD {
+		day = maxD
+	}
+	if day < 1 {
+		day = 1
+	}
+	return time.Date(year, time.Month(month), day, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location())
+}
+
+func evalWithTemporalAdjusterPainless(recVal, adjVal any) (any, error) {
+	isDateOnly := false
+	isTimeOnly := false
+	if s, ok := recVal.(string); ok {
+		st := strings.TrimSpace(s)
+		if len(st) == 10 && st[4] == '-' && st[7] == '-' {
+			isDateOnly = true
+		} else if !strings.Contains(st, "-") && strings.Contains(st, ":") {
+			isTimeOnly = true
+		}
+	}
+	t, ok := parsePainlessDateTime(recVal)
+	if !ok {
+		return recVal, nil
+	}
+	formatResult := func(nt time.Time) any {
+		if isDateOnly {
+			return nt.Format("2006-01-02")
+		}
+		if isTimeOnly {
+			if nt.Nanosecond() == 0 {
+				return nt.Format("15:04:05")
+			}
+			return nt.Format("15:04:05.999999999")
+		}
+		return formatDateLikeReceiverPainless(recVal, nt)
+	}
+	isoDow := func(tm time.Time) int {
+		w := int(tm.Weekday())
+		if w == 0 {
+			return 7
+		}
+		return w
+	}
+	daysInMonth := func(year int, month time.Month) int {
+		return time.Date(year, month+1, 0, 0, 0, 0, 0, time.UTC).Day()
+	}
+
+	if ta, okTA := adjVal.(*painlessTemporalAdjuster); okTA && ta != nil {
+		y, m, d := t.Date()
+		hr, min, sec, nsec, loc := t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location()
+		switch ta.kind {
+		case "firstDayOfMonth":
+			return formatResult(time.Date(y, m, 1, hr, min, sec, nsec, loc)), nil
+		case "lastDayOfMonth":
+			return formatResult(time.Date(y, m, daysInMonth(y, m), hr, min, sec, nsec, loc)), nil
+		case "firstDayOfNextMonth":
+			return formatResult(time.Date(y, m+1, 1, hr, min, sec, nsec, loc)), nil
+		case "firstDayOfYear":
+			return formatResult(time.Date(y, time.January, 1, hr, min, sec, nsec, loc)), nil
+		case "lastDayOfYear":
+			return formatResult(time.Date(y, time.December, 31, hr, min, sec, nsec, loc)), nil
+		case "firstDayOfNextYear":
+			return formatResult(time.Date(y+1, time.January, 1, hr, min, sec, nsec, loc)), nil
+		case "next":
+			cur := isoDow(t)
+			diff := (ta.dow - cur + 7) % 7
+			if diff == 0 {
+				diff = 7
+			}
+			return formatResult(time.Date(y, m, d+diff, hr, min, sec, nsec, loc)), nil
+		case "nextOrSame":
+			cur := isoDow(t)
+			diff := (ta.dow - cur + 7) % 7
+			return formatResult(time.Date(y, m, d+diff, hr, min, sec, nsec, loc)), nil
+		case "previous":
+			cur := isoDow(t)
+			diff := (cur - ta.dow + 7) % 7
+			if diff == 0 {
+				diff = 7
+			}
+			return formatResult(time.Date(y, m, d-diff, hr, min, sec, nsec, loc)), nil
+		case "previousOrSame":
+			cur := isoDow(t)
+			diff := (cur - ta.dow + 7) % 7
+			return formatResult(time.Date(y, m, d-diff, hr, min, sec, nsec, loc)), nil
+		case "firstInMonth":
+			first := time.Date(y, m, 1, hr, min, sec, nsec, loc)
+			diff := (ta.dow - isoDow(first) + 7) % 7
+			return formatResult(time.Date(y, m, 1+diff, hr, min, sec, nsec, loc)), nil
+		case "lastInMonth":
+			lastDay := daysInMonth(y, m)
+			last := time.Date(y, m, lastDay, hr, min, sec, nsec, loc)
+			diff := (isoDow(last) - ta.dow + 7) % 7
+			return formatResult(time.Date(y, m, lastDay-diff, hr, min, sec, nsec, loc)), nil
+		case "dayOfWeekInMonth":
+			if ta.ordinal > 0 {
+				first := time.Date(y, m, 1, hr, min, sec, nsec, loc)
+				diff := (ta.dow - isoDow(first) + 7) % 7
+				targetDay := 1 + diff + (ta.ordinal-1)*7
+				return formatResult(time.Date(y, m, targetDay, hr, min, sec, nsec, loc)), nil
+			} else if ta.ordinal == 0 {
+				first := time.Date(y, m, 1, hr, min, sec, nsec, loc)
+				diff := (ta.dow - isoDow(first) + 7) % 7
+				targetDay := 1 + diff - 7
+				return formatResult(time.Date(y, m, targetDay, hr, min, sec, nsec, loc)), nil
+			} else {
+				lastDay := daysInMonth(y, m)
+				last := time.Date(y, m, lastDay, hr, min, sec, nsec, loc)
+				diff := (isoDow(last) - ta.dow + 7) % 7
+				targetDay := lastDay - diff + (ta.ordinal+1)*7
+				return formatResult(time.Date(y, m, targetDay, hr, min, sec, nsec, loc)), nil
+			}
+		}
+	}
+
+	if yr, okY := adjVal.(painlessYear); okY {
+		return formatResult(setDateComponentClampedPainless(t, int(yr.year), int(t.Month()), t.Day())), nil
+	}
+	if md, okMD := adjVal.(painlessMonthDay); okMD {
+		return formatResult(setDateComponentClampedPainless(t, t.Year(), md.month, md.day)), nil
+	}
+	if dow, okD := parseDayOfWeekNumberPainless(adjVal); okD {
+		cur := isoDow(t)
+		return formatResult(time.Date(t.Year(), t.Month(), t.Day()+(dow-cur), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location())), nil
+	}
+	if sAdj, okS := adjVal.(string); okS {
+		st := strings.TrimSpace(sAdj)
+		switch strings.ToUpper(st) {
+		case "JANUARY":
+			return formatResult(setDateComponentClampedPainless(t, t.Year(), 1, t.Day())), nil
+		case "FEBRUARY":
+			return formatResult(setDateComponentClampedPainless(t, t.Year(), 2, t.Day())), nil
+		case "MARCH":
+			return formatResult(setDateComponentClampedPainless(t, t.Year(), 3, t.Day())), nil
+		case "APRIL":
+			return formatResult(setDateComponentClampedPainless(t, t.Year(), 4, t.Day())), nil
+		case "MAY":
+			return formatResult(setDateComponentClampedPainless(t, t.Year(), 5, t.Day())), nil
+		case "JUNE":
+			return formatResult(setDateComponentClampedPainless(t, t.Year(), 6, t.Day())), nil
+		case "JULY":
+			return formatResult(setDateComponentClampedPainless(t, t.Year(), 7, t.Day())), nil
+		case "AUGUST":
+			return formatResult(setDateComponentClampedPainless(t, t.Year(), 8, t.Day())), nil
+		case "SEPTEMBER":
+			return formatResult(setDateComponentClampedPainless(t, t.Year(), 9, t.Day())), nil
+		case "OCTOBER":
+			return formatResult(setDateComponentClampedPainless(t, t.Year(), 10, t.Day())), nil
+		case "NOVEMBER":
+			return formatResult(setDateComponentClampedPainless(t, t.Year(), 11, t.Day())), nil
+		case "DECEMBER":
+			return formatResult(setDateComponentClampedPainless(t, t.Year(), 12, t.Day())), nil
+		}
+		// Check YearMonth "YYYY-MM"
+		if len(st) == 7 && st[4] == '-' {
+			if ymT, errYM := time.Parse("2006-01", st); errYM == nil {
+				return formatResult(setDateComponentClampedPainless(t, ymT.Year(), int(ymT.Month()), t.Day())), nil
+			}
+		}
+		// Check LocalDate "YYYY-MM-DD"
+		if len(st) == 10 && st[4] == '-' && st[7] == '-' {
+			if ldT, errLD := time.Parse("2006-01-02", st); errLD == nil {
+				return formatResult(time.Date(ldT.Year(), ldT.Month(), ldT.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location())), nil
+			}
+		}
+		// Check LocalTime "HH:mm..."
+		if !strings.Contains(st, "-") && strings.Contains(st, ":") {
+			if ltT, okLT := parsePainlessDateTime(st); okLT {
+				return formatResult(time.Date(t.Year(), t.Month(), t.Day(), ltT.Hour(), ltT.Minute(), ltT.Second(), ltT.Nanosecond(), t.Location())), nil
+			}
+		}
+	}
+	return recVal, nil
+}
+
+func parseDayOfWeekNumberPainless(v any) (int, bool) {
+	if s, ok := v.(string); ok {
+		switch strings.ToUpper(strings.TrimSpace(s)) {
+		case "MONDAY":
+			return 1, true
+		case "TUESDAY":
+			return 2, true
+		case "WEDNESDAY":
+			return 3, true
+		case "THURSDAY":
+			return 4, true
+		case "FRIDAY":
+			return 5, true
+		case "SATURDAY":
+			return 6, true
+		case "SUNDAY":
+			return 7, true
+		}
+	}
+	if f, ok := toFloat64(v); ok {
+		n := int(f)
+		if n >= 1 && n <= 7 {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
+func evalLocalDateUntilPeriodPainless(recVal, endVal any) painlessPeriod {
+	t1, ok1 := parsePainlessDateTime(recVal)
+	t2, ok2 := parsePainlessDateTime(endVal)
+	if !ok1 || !ok2 {
+		return painlessPeriod{}
+	}
+	totalMonths := (t2.Year()-t1.Year())*12 + int(t2.Month()-t1.Month())
+	days := t2.Day() - t1.Day()
+	if totalMonths > 0 && days < 0 {
+		totalMonths--
+		shifted := addMonthsClampedPainless(t1, totalMonths)
+		days = int(t2.Sub(shifted).Hours() / 24)
+	} else if totalMonths < 0 && days > 0 {
+		totalMonths++
+		shifted := addMonthsClampedPainless(t1, totalMonths)
+		days = -int(shifted.Sub(t2).Hours() / 24)
+	}
+	return painlessPeriod{
+		years:  totalMonths / 12,
+		months: totalMonths % 12,
+		days:   days,
+	}
+}
+
+func evalTemporalBetweenUnitPainless(unitVal, v1, v2 any) int64 {
+	unit := strings.ToUpper(strings.TrimSpace(fmt.Sprintf("%v", unitVal)))
+	unit = strings.TrimPrefix(unit, "CHRONOUNIT.")
+	if yr1, okY1 := v1.(painlessYear); okY1 {
+		if yr2, okY2 := v2.(painlessYear); okY2 {
+			diffY := yr2.year - yr1.year
+			switch unit {
+			case "YEARS":
+				return diffY
+			case "DECADES":
+				return diffY / 10
+			case "CENTURIES":
+				return diffY / 100
+			case "MILLENNIA":
+				return diffY / 1000
+			}
+		}
+	}
+	t1, ok1 := parsePainlessDateTime(v1)
+	t2, ok2 := parsePainlessDateTime(v2)
+	if !ok1 || !ok2 {
+		return 0
+	}
+	switch unit {
+	case "NANOS":
+		return t2.Sub(t1).Nanoseconds()
+	case "MICROS":
+		return t2.Sub(t1).Microseconds()
+	case "MILLIS":
+		return t2.Sub(t1).Milliseconds()
+	case "SECONDS":
+		return int64(t2.Sub(t1) / time.Second)
+	case "MINUTES":
+		return int64(t2.Sub(t1) / time.Minute)
+	case "HOURS":
+		return int64(t2.Sub(t1) / time.Hour)
+	case "HALF_DAYS":
+		return int64(t2.Sub(t1) / (12 * time.Hour))
+	case "DAYS":
+		d1 := time.Date(t1.Year(), t1.Month(), t1.Day(), 0, 0, 0, 0, time.UTC)
+		d2 := time.Date(t2.Year(), t2.Month(), t2.Day(), 0, 0, 0, 0, time.UTC)
+		return int64(d2.Sub(d1).Hours() / 24)
+	case "WEEKS":
+		d1 := time.Date(t1.Year(), t1.Month(), t1.Day(), 0, 0, 0, 0, time.UTC)
+		d2 := time.Date(t2.Year(), t2.Month(), t2.Day(), 0, 0, 0, 0, time.UTC)
+		return int64(d2.Sub(d1).Hours() / (24 * 7))
+	case "MONTHS", "YEARS", "DECADES", "CENTURIES", "MILLENNIA":
+		p := evalLocalDateUntilPeriodPainless(t1, t2)
+		totalM := int64(p.years*12 + p.months)
+		switch unit {
+		case "MONTHS":
+			return totalM
+		case "YEARS":
+			return totalM / 12
+		case "DECADES":
+			return totalM / 120
+		case "CENTURIES":
+			return totalM / 1200
+		case "MILLENNIA":
+			return totalM / 12000
+		}
+	}
+	return 0
+}
+
+func evalLocalDateDatesUntilPainless(recVal, endVal, stepVal any) ([]any, error) {
+	t1, ok1 := parsePainlessDateTime(recVal)
+	t2, ok2 := parsePainlessDateTime(endVal)
+	if !ok1 || !ok2 {
+		return []any{}, nil
+	}
+	d1 := time.Date(t1.Year(), t1.Month(), t1.Day(), 0, 0, 0, 0, time.UTC)
+	d2 := time.Date(t2.Year(), t2.Month(), t2.Day(), 0, 0, 0, 0, time.UTC)
+	if d2.Before(d1) {
+		return nil, fmt.Errorf("IllegalArgumentException: %s < %s", d2.Format("2006-01-02"), d1.Format("2006-01-02"))
+	}
+	const maxDates = 10000
+	if stepVal == nil {
+		out := []any{}
+		for cur := d1; cur.Before(d2) && len(out) < maxDates; cur = cur.AddDate(0, 0, 1) {
+			out = append(out, cur.Format("2006-01-02"))
+		}
+		return out, nil
+	}
+	var per painlessPeriod
+	switch p := stepVal.(type) {
+	case painlessPeriod:
+		per = p
+	case string:
+		if parsed, okP := parseISO8601PeriodPainless(p); okP {
+			per = parsed
+		}
+	}
+	totalMonths := per.years*12 + per.months
+	if (totalMonths == 0 && per.days == 0) || totalMonths < 0 || per.days < 0 {
+		return nil, fmt.Errorf("IllegalArgumentException: step is zero or negative")
+	}
+	out := []any{}
+	for stepIdx := 0; len(out) < maxDates; stepIdx++ {
+		cur := addMonthsClampedPainless(d1, totalMonths*stepIdx).AddDate(0, 0, per.days*stepIdx)
+		if !cur.Before(d2) {
+			break
+		}
+		out = append(out, cur.Format("2006-01-02"))
+	}
+	return out, nil
+}
+
+func evalTemporalAdjustersStaticPainless(fnName string, args []string, sourceMap, params map[string]any, depth int) (any, error) {
+	fnName = strings.TrimPrefix(fnName, "TemporalAdjusters.")
+	switch fnName {
+	case "firstDayOfMonth", "lastDayOfMonth", "firstDayOfNextMonth", "firstDayOfYear", "lastDayOfYear", "firstDayOfNextYear":
+		return &painlessTemporalAdjuster{kind: fnName}, nil
+	case "next", "nextOrSame", "previous", "previousOrSame", "firstInMonth", "lastInMonth":
+		if len(args) < 1 {
+			return nil, nil
+		}
+		v0, err0 := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+		if err0 != nil {
+			return nil, err0
+		}
+		dow, okD := parseDayOfWeekNumberPainless(v0)
+		if !okD {
+			return nil, nil
+		}
+		return &painlessTemporalAdjuster{kind: fnName, dow: dow}, nil
+	case "dayOfWeekInMonth":
+		if len(args) < 2 {
+			return nil, nil
+		}
+		v0, err0 := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+		if err0 != nil {
+			return nil, err0
+		}
+		v1, err1 := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+		if err1 != nil {
+			return nil, err1
+		}
+		ordF, okO := toFloat64(v0)
+		dow, okD := parseDayOfWeekNumberPainless(v1)
+		if !okO || !okD {
+			return nil, nil
+		}
+		return &painlessTemporalAdjuster{kind: fnName, ordinal: int(ordF), dow: dow}, nil
+	}
+	return nil, nil
+}
+
+func evalComparatorStaticPainless(fnName string, args []string, sourceMap, params map[string]any, depth int) (any, error) {
+	fnName = strings.TrimPrefix(strings.TrimPrefix(fnName, "Comparator."), "Collections.")
+	switch fnName {
+	case "naturalOrder":
+		return &painlessComparator{kind: "natural"}, nil
+	case "reverseOrder":
+		return &painlessComparator{kind: "reverse"}, nil
+	case "nullsFirst", "nullsLast":
+		var inner *painlessComparator
+		if len(args) >= 1 && strings.TrimSpace(args[0]) != "" {
+			arg0Raw := strings.TrimSpace(args[0])
+			if v0, err0 := evalRHSExprDepth(sourceMap, arg0Raw, params, depth+1); err0 == nil {
+				if subC, okSub := v0.(*painlessComparator); okSub {
+					inner = subC
+				}
+			}
+			if inner == nil && arg0Raw != "null" {
+				inner = &painlessComparator{kind: "lambda", lambdaExpr: arg0Raw}
+			}
+		}
+		return &painlessComparator{kind: fnName, inner: inner}, nil
+	case "comparing", "comparingInt", "comparingLong", "comparingDouble":
+		if len(args) < 1 {
+			return &painlessComparator{kind: "natural"}, nil
+		}
+		keyExpr := strings.TrimSpace(args[0])
+		var keyCmp *painlessComparator
+		if len(args) >= 2 {
+			arg1Raw := strings.TrimSpace(args[1])
+			if v1, err1 := evalRHSExprDepth(sourceMap, arg1Raw, params, depth+1); err1 == nil {
+				if subC, okSub := v1.(*painlessComparator); okSub {
+					keyCmp = subC
+				}
+			}
+			if keyCmp == nil && arg1Raw != "null" {
+				keyCmp = &painlessComparator{kind: "lambda", lambdaExpr: arg1Raw}
+			}
+		}
+		return &painlessComparator{
+			kind:    "comparing",
+			keyExpr: keyExpr,
+			keyCmp:  keyCmp,
+		}, nil
+	}
+	return nil, nil
+}
+
+func evalComparatorKeyExtractPainless(keyExpr string, item any, sourceMap, params map[string]any, depth int) (any, error) {
+	keyFn := normalizeMethodReferenceToLambdaPainless(strings.TrimSpace(keyExpr), 1)
+	if arrowIdx := findNextUnquotedSubstr(keyFn, "->", 0); arrowIdx > 0 {
+		pNames := parsePainlessLambdaHeader(keyFn[:arrowIdx])
+		if len(pNames) > 0 {
+			pName := pNames[0]
+			body := strings.TrimSpace(keyFn[arrowIdx+2:])
+			prev, hadPrev := params[pName]
+			params[pName] = item
+			kv, err := evalPainlessLambdaBody(body, sourceMap, params, depth+1)
+			if hadPrev {
+				params[pName] = prev
+			} else {
+				delete(params, pName)
+			}
+			return kv, err
+		}
+	}
+	return item, nil
+}
+
+func evalComparatorObjectPairPainless(pc *painlessComparator, a, b any, sourceMap, params map[string]any, depth int) (int, error) {
+	if pc == nil {
+		return comparePainlessValues(a, b), nil
+	}
+	var c int
+	switch pc.kind {
+	case "natural":
+		if a == nil || b == nil {
+			return 0, fmt.Errorf("NullPointerException: Cannot compare null with naturalOrder")
+		}
+		c = comparePainlessValues(a, b)
+	case "reverse":
+		if a == nil || b == nil {
+			return 0, fmt.Errorf("NullPointerException: Cannot compare null with reverseOrder")
+		}
+		c = -comparePainlessValues(a, b)
+	case "caseInsensitive":
+		if a == nil || b == nil {
+			return 0, fmt.Errorf("NullPointerException: Cannot compare null with CASE_INSENSITIVE_ORDER")
+		}
+		sa := strings.ToLower(fmt.Sprintf("%v", a))
+		sb := strings.ToLower(fmt.Sprintf("%v", b))
+		if sa < sb {
+			c = -1
+		} else if sa > sb {
+			c = 1
+		}
+	case "nullsFirst":
+		if a == nil && b == nil {
+			c = 0
+		} else if a == nil {
+			return -1, nil
+		} else if b == nil {
+			return 1, nil
+		} else if pc.inner != nil {
+			var err error
+			c, err = evalComparatorObjectPairPainless(pc.inner, a, b, sourceMap, params, depth+1)
+			if err != nil {
+				return 0, err
+			}
+		}
+	case "nullsLast":
+		if a == nil && b == nil {
+			c = 0
+		} else if a == nil {
+			return 1, nil
+		} else if b == nil {
+			return -1, nil
+		} else if pc.inner != nil {
+			var err error
+			c, err = evalComparatorObjectPairPainless(pc.inner, a, b, sourceMap, params, depth+1)
+			if err != nil {
+				return 0, err
+			}
+		}
+	case "comparing":
+		ka, errA := evalComparatorKeyExtractPainless(pc.keyExpr, a, sourceMap, params, depth+1)
+		if errA != nil {
+			return 0, errA
+		}
+		kb, errB := evalComparatorKeyExtractPainless(pc.keyExpr, b, sourceMap, params, depth+1)
+		if errB != nil {
+			return 0, errB
+		}
+		if pc.keyCmp != nil {
+			var errK error
+			c, errK = evalComparatorObjectPairPainless(pc.keyCmp, ka, kb, sourceMap, params, depth+1)
+			if errK != nil {
+				return 0, errK
+			}
+		} else {
+			c = comparePainlessValues(ka, kb)
+		}
+	case "lambda":
+		var errL error
+		c, errL = evalPainlessComparatorPair(pc.lambdaExpr, a, b, sourceMap, params, depth+1)
+		if errL != nil {
+			return 0, errL
+		}
+	default:
+		c = comparePainlessValues(a, b)
+	}
+	if pc.reversed {
+		c = -c
+	}
+	if c != 0 {
+		return c, nil
+	}
+	for _, nextCmp := range pc.thenList {
+		nc, errN := evalComparatorObjectPairPainless(nextCmp, a, b, sourceMap, params, depth+1)
+		if errN != nil {
+			return 0, errN
+		}
+		if nc != 0 {
+			return nc, nil
+		}
+	}
+	return 0, nil
+}
+
+func evalCharacterStaticPainless(fnName string, args []string, sourceMap, params map[string]any, depth int) (any, error) {
+	fnName = strings.TrimPrefix(fnName, "Character.")
+	evalArg := func(idx int) (any, error) {
+		if idx < 0 || idx >= len(args) {
+			return nil, nil
+		}
+		return evalRHSExprDepth(sourceMap, strings.TrimSpace(args[idx]), params, depth+1)
+	}
+	toCodePoint := func(v any) (int32, bool) {
+		if s, ok := v.(string); ok {
+			rs := []rune(s)
+			if len(rs) == 1 {
+				return rs[0], true
+			}
+			// UTF-16 code unit if surrogate
+			u16 := utf16.Encode(rs)
+			if len(u16) == 1 {
+				return int32(u16[0]), true
+			}
+		}
+		if f, ok := toFloat64(v); ok {
+			return int32(f), true // #nosec G115 -- code point fits int32
+		}
+		return 0, false
+	}
+	a0, err0 := evalArg(0)
+	if err0 != nil {
+		return nil, err0
+	}
+	switch fnName {
+	case "charCount":
+		cp, ok := toCodePoint(a0)
+		if !ok {
+			return nil, nil
+		}
+		if cp >= 0x10000 {
+			return int64(2), nil
+		}
+		return int64(1), nil
+	case "toChars":
+		cp, ok := toCodePoint(a0)
+		if !ok {
+			return nil, nil
+		}
+		if cp < 0 || cp > 0x10FFFF {
+			return nil, fmt.Errorf("IllegalArgumentException: Not a valid Unicode code point: 0x%X", cp)
+		}
+		if cp < 0x10000 {
+			return []any{string(rune(cp))}, nil
+		}
+		r1, r2 := utf16.EncodeRune(rune(cp))
+		return []any{fmt.Sprintf("\\u%04x", uint16(r1)), fmt.Sprintf("\\u%04x", uint16(r2))}, nil // #nosec G115 -- surrogate fits uint16
+	case "toString", "valueOf":
+		cp, ok := toCodePoint(a0)
+		if !ok {
+			return fmt.Sprintf("%v", a0), nil
+		}
+		if cp < 0 || cp > 0x10FFFF {
+			return nil, fmt.Errorf("IllegalArgumentException: Not a valid Unicode code point: 0x%X", cp)
+		}
+		return string(rune(cp)), nil
+	case "isValidCodePoint":
+		cp, ok := toCodePoint(a0)
+		if !ok {
+			return false, nil
+		}
+		return cp >= 0 && cp <= 0x10FFFF, nil
+	case "isBmpCodePoint":
+		cp, ok := toCodePoint(a0)
+		if !ok {
+			return false, nil
+		}
+		return cp >= 0 && cp <= 0xFFFF, nil
+	case "isSupplementaryCodePoint":
+		cp, ok := toCodePoint(a0)
+		if !ok {
+			return false, nil
+		}
+		return cp >= 0x10000 && cp <= 0x10FFFF, nil
+	case "isHighSurrogate":
+		cp, ok := toCodePoint(a0)
+		if !ok {
+			return false, nil
+		}
+		return cp >= 0xD800 && cp <= 0xDBFF, nil
+	case "isLowSurrogate":
+		cp, ok := toCodePoint(a0)
+		if !ok {
+			return false, nil
+		}
+		return cp >= 0xDC00 && cp <= 0xDFFF, nil
+	case "isSurrogate":
+		cp, ok := toCodePoint(a0)
+		if !ok {
+			return false, nil
+		}
+		return cp >= 0xD800 && cp <= 0xDFFF, nil
+	case "isSurrogatePair":
+		if len(args) < 2 {
+			return false, nil
+		}
+		a1, err1 := evalArg(1)
+		if err1 != nil {
+			return nil, err1
+		}
+		hi, okH := toCodePoint(a0)
+		lo, okL := toCodePoint(a1)
+		if !okH || !okL {
+			return false, nil
+		}
+		return hi >= 0xD800 && hi <= 0xDBFF && lo >= 0xDC00 && lo <= 0xDFFF, nil
+	case "toCodePoint":
+		if len(args) < 2 {
+			return int64(0), nil
+		}
+		a1, err1 := evalArg(1)
+		if err1 != nil {
+			return nil, err1
+		}
+		hi, okH := toCodePoint(a0)
+		lo, okL := toCodePoint(a1)
+		if !okH || !okL {
+			return int64(0), nil
+		}
+		return int64(utf16.DecodeRune(rune(hi), rune(lo))), nil
+	case "codePointAt":
+		if len(args) < 2 {
+			return int64(0), nil
+		}
+		a1, err1 := evalArg(1)
+		if err1 != nil {
+			return nil, err1
+		}
+		idxF, _ := toFloat64(a1)
+		idx := int(idxF)
+		u16 := utf16.Encode([]rune(fmt.Sprintf("%v", a0)))
+		if idx < 0 || idx >= len(u16) {
+			return nil, fmt.Errorf("StringIndexOutOfBoundsException: index %d, length %d", idx, len(u16))
+		}
+		c1 := u16[idx]
+		if c1 >= 0xD800 && c1 <= 0xDBFF && idx+1 < len(u16) {
+			c2 := u16[idx+1]
+			if c2 >= 0xDC00 && c2 <= 0xDFFF {
+				return int64(utf16.DecodeRune(rune(c1), rune(c2))), nil
+			}
+		}
+		return int64(c1), nil
+	case "codePointBefore":
+		if len(args) < 2 {
+			return int64(0), nil
+		}
+		a1, err1 := evalArg(1)
+		if err1 != nil {
+			return nil, err1
+		}
+		idxF, _ := toFloat64(a1)
+		idx := int(idxF)
+		u16 := utf16.Encode([]rune(fmt.Sprintf("%v", a0)))
+		if idx <= 0 || idx > len(u16) {
+			return nil, fmt.Errorf("StringIndexOutOfBoundsException: index %d, length %d", idx, len(u16))
+		}
+		c2 := u16[idx-1]
+		if c2 >= 0xDC00 && c2 <= 0xDFFF && idx-2 >= 0 {
+			c1 := u16[idx-2]
+			if c1 >= 0xD800 && c1 <= 0xDBFF {
+				return int64(utf16.DecodeRune(rune(c1), rune(c2))), nil
+			}
+		}
+		return int64(c2), nil
+	case "codePointCount":
+		if len(args) < 3 {
+			return int64(0), nil
+		}
+		a1, err1 := evalArg(1)
+		if err1 != nil {
+			return nil, err1
+		}
+		a2, err2 := evalArg(2)
+		if err2 != nil {
+			return nil, err2
+		}
+		bF, _ := toFloat64(a1)
+		eF, _ := toFloat64(a2)
+		beginIdx, endIdx := int(bF), int(eF)
+		u16 := utf16.Encode([]rune(fmt.Sprintf("%v", a0)))
+		if beginIdx < 0 || endIdx > len(u16) || beginIdx > endIdx {
+			return nil, fmt.Errorf("IndexOutOfBoundsException: beginIndex %d, endIndex %d, length %d", beginIdx, endIdx, len(u16))
+		}
+		n := endIdx - beginIdx
+		for i := beginIdx; i < endIdx; {
+			if u16[i] >= 0xD800 && u16[i] <= 0xDBFF {
+				i++
+				if i < endIdx && u16[i] >= 0xDC00 && u16[i] <= 0xDFFF {
+					n--
+					i++
+				}
+			} else {
+				i++
+			}
+		}
+		return int64(n), nil
+	case "getNumericValue":
+		cp, ok := toCodePoint(a0)
+		if !ok {
+			return int64(-1), nil
+		}
+		r := rune(cp)
+		if r >= '0' && r <= '9' {
+			return int64(r - '0'), nil
+		}
+		if r >= 'a' && r <= 'z' {
+			return int64(r - 'a' + 10), nil
+		}
+		if r >= 'A' && r <= 'Z' {
+			return int64(r - 'A' + 10), nil
+		}
+		if r >= 0xFF10 && r <= 0xFF19 {
+			return int64(r - 0xFF10), nil
+		}
+		if r >= 0xFF21 && r <= 0xFF3A {
+			return int64(r - 0xFF21 + 10), nil
+		}
+		if r >= 0xFF41 && r <= 0xFF5A {
+			return int64(r - 0xFF41 + 10), nil
+		}
+		if r >= 0x0660 && r <= 0x0669 {
+			return int64(r - 0x0660), nil
+		}
+		if unicode.IsNumber(r) {
+			return int64(-2), nil
+		}
+		return int64(-1), nil
+	case "getType":
+		cp, ok := toCodePoint(a0)
+		if !ok {
+			return int64(0), nil
+		}
+		r := rune(cp)
+		switch {
+		case unicode.Is(unicode.Lu, r):
+			return int64(1), nil // UPPERCASE_LETTER
+		case unicode.Is(unicode.Ll, r):
+			return int64(2), nil // LOWERCASE_LETTER
+		case unicode.Is(unicode.Lt, r):
+			return int64(3), nil // TITLECASE_LETTER
+		case unicode.Is(unicode.Lm, r):
+			return int64(4), nil // MODIFIER_LETTER
+		case unicode.Is(unicode.Lo, r):
+			return int64(5), nil // OTHER_LETTER
+		case unicode.Is(unicode.Mn, r):
+			return int64(6), nil // NON_SPACING_MARK
+		case unicode.Is(unicode.Me, r):
+			return int64(7), nil // ENCLOSING_MARK
+		case unicode.Is(unicode.Mc, r):
+			return int64(8), nil // COMBINING_SPACING_MARK
+		case unicode.Is(unicode.Nd, r):
+			return int64(9), nil // DECIMAL_DIGIT_NUMBER
+		case unicode.Is(unicode.Nl, r):
+			return int64(10), nil // LETTER_NUMBER
+		case unicode.Is(unicode.No, r):
+			return int64(11), nil // OTHER_NUMBER
+		case unicode.Is(unicode.Zs, r):
+			return int64(12), nil // SPACE_SEPARATOR
+		case unicode.Is(unicode.Zl, r):
+			return int64(13), nil // LINE_SEPARATOR
+		case unicode.Is(unicode.Zp, r):
+			return int64(14), nil // PARAGRAPH_SEPARATOR
+		case unicode.Is(unicode.Cc, r):
+			return int64(15), nil // CONTROL
+		case unicode.Is(unicode.Cf, r):
+			return int64(16), nil // FORMAT
+		case unicode.Is(unicode.Co, r):
+			return int64(18), nil // PRIVATE_USE
+		case unicode.Is(unicode.Cs, r):
+			return int64(19), nil // SURROGATE
+		case unicode.Is(unicode.Pd, r):
+			return int64(20), nil // DASH_PUNCTUATION
+		case unicode.Is(unicode.Ps, r):
+			return int64(21), nil // START_PUNCTUATION
+		case unicode.Is(unicode.Pe, r):
+			return int64(22), nil // END_PUNCTUATION
+		case unicode.Is(unicode.Pc, r):
+			return int64(23), nil // CONNECTOR_PUNCTUATION
+		case unicode.Is(unicode.Po, r):
+			return int64(24), nil // OTHER_PUNCTUATION
+		case unicode.Is(unicode.Sm, r):
+			return int64(25), nil // MATH_SYMBOL
+		case unicode.Is(unicode.Sc, r):
+			return int64(26), nil // CURRENCY_SYMBOL
+		case unicode.Is(unicode.Sk, r):
+			return int64(27), nil // MODIFIER_SYMBOL
+		case unicode.Is(unicode.So, r):
+			return int64(28), nil // OTHER_SYMBOL
+		case unicode.Is(unicode.Pi, r):
+			return int64(29), nil // INITIAL_QUOTE_PUNCTUATION
+		case unicode.Is(unicode.Pf, r):
+			return int64(30), nil // FINAL_QUOTE_PUNCTUATION
+		default:
+			return int64(0), nil // UNASSIGNED
+		}
+	case "compare":
+		if len(args) < 2 {
+			return int64(0), nil
+		}
+		a1, err1 := evalArg(1)
+		if err1 != nil {
+			return nil, err1
+		}
+		c1, _ := toCodePoint(a0)
+		c2, _ := toCodePoint(a1)
+		return int64(c1 - c2), nil
+	case "isDigit":
+		cp, ok := toCodePoint(a0)
+		return ok && unicode.IsDigit(rune(cp)), nil
+	case "isLetter":
+		cp, ok := toCodePoint(a0)
+		return ok && unicode.IsLetter(rune(cp)), nil
+	case "isLetterOrDigit":
+		cp, ok := toCodePoint(a0)
+		return ok && (unicode.IsLetter(rune(cp)) || unicode.IsDigit(rune(cp))), nil
+	case "isAlphabetic":
+		cp, ok := toCodePoint(a0)
+		return ok && (unicode.IsLetter(rune(cp)) || unicode.Is(unicode.Nl, rune(cp)) || unicode.Is(unicode.Other_Alphabetic, rune(cp))), nil
+	case "isWhitespace":
+		cp, ok := toCodePoint(a0)
+		if !ok {
+			return false, nil
+		}
+		r := rune(cp)
+		if r == 0x00A0 || r == 0x2007 || r == 0x202F {
+			return false, nil
+		}
+		return unicode.IsSpace(r) || r == 0x001C || r == 0x001D || r == 0x001E || r == 0x001F, nil
+	case "isSpaceChar":
+		cp, ok := toCodePoint(a0)
+		return ok && (unicode.Is(unicode.Zs, rune(cp)) || unicode.Is(unicode.Zl, rune(cp)) || unicode.Is(unicode.Zp, rune(cp))), nil
+	case "isUpperCase":
+		cp, ok := toCodePoint(a0)
+		return ok && unicode.IsUpper(rune(cp)), nil
+	case "isLowerCase":
+		cp, ok := toCodePoint(a0)
+		return ok && unicode.IsLower(rune(cp)), nil
+	case "isTitleCase":
+		cp, ok := toCodePoint(a0)
+		return ok && unicode.IsTitle(rune(cp)), nil
+	case "toUpperCase":
+		cp, ok := toCodePoint(a0)
+		if !ok {
+			return a0, nil
+		}
+		if _, isStr := a0.(string); isStr {
+			return string(unicode.ToUpper(rune(cp))), nil
+		}
+		return int64(unicode.ToUpper(rune(cp))), nil
+	case "toLowerCase":
+		cp, ok := toCodePoint(a0)
+		if !ok {
+			return a0, nil
+		}
+		if _, isStr := a0.(string); isStr {
+			return string(unicode.ToLower(rune(cp))), nil
+		}
+		return int64(unicode.ToLower(rune(cp))), nil
+	case "toTitleCase":
+		cp, ok := toCodePoint(a0)
+		if !ok {
+			return a0, nil
+		}
+		if _, isStr := a0.(string); isStr {
+			return string(unicode.ToTitle(rune(cp))), nil
+		}
+		return int64(unicode.ToTitle(rune(cp))), nil
+	case "isIdeographic":
+		cp, ok := toCodePoint(a0)
+		return ok && unicode.Is(unicode.Ideographic, rune(cp)), nil
+	case "isJavaIdentifierStart":
+		cp, ok := toCodePoint(a0)
+		if !ok {
+			return false, nil
+		}
+		r := rune(cp)
+		return unicode.IsLetter(r) || unicode.Is(unicode.Nl, r) || unicode.Is(unicode.Sc, r) || unicode.Is(unicode.Pc, r), nil
+	case "isJavaIdentifierPart":
+		cp, ok := toCodePoint(a0)
+		if !ok {
+			return false, nil
+		}
+		r := rune(cp)
+		return unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.Is(unicode.Nl, r) ||
+			unicode.Is(unicode.Sc, r) || unicode.Is(unicode.Pc, r) || unicode.Is(unicode.Mc, r) ||
+			unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Cf, r) ||
+			(r >= 0x0000 && r <= 0x0008) || (r >= 0x000E && r <= 0x001B) || (r >= 0x007F && r <= 0x009F), nil
+	case "isISOControl":
+		cp, ok := toCodePoint(a0)
+		return ok && ((cp >= 0x0000 && cp <= 0x001F) || (cp >= 0x007F && cp <= 0x009F)), nil
+	case "isDefined":
+		cp, ok := toCodePoint(a0)
+		return ok && cp >= 0 && cp <= 0x10FFFF && !unicode.Is(unicode.Co, rune(cp)), nil
+	case "digit":
+		if len(args) < 2 {
+			return int64(-1), nil
+		}
+		a1, err1 := evalArg(1)
+		if err1 != nil {
+			return nil, err1
+		}
+		cp, ok := toCodePoint(a0)
+		rf, okR := toFloat64(a1)
+		if !ok || !okR {
+			return int64(-1), nil
+		}
+		radix := int32(rf) // #nosec G115 -- radix fits int32
+		if radix < 2 || radix > 36 {
+			return int64(-1), nil
+		}
+		var d int32 = -1
+		switch {
+		case cp >= '0' && cp <= '9':
+			d = cp - '0'
+		case cp >= 'a' && cp <= 'z':
+			d = cp - 'a' + 10
+		case cp >= 'A' && cp <= 'Z':
+			d = cp - 'A' + 10
+		}
+		if d >= 0 && d < radix {
+			return int64(d), nil
+		}
+		return int64(-1), nil
+	case "forDigit":
+		if len(args) < 2 {
+			return "\x00", nil
+		}
+		a1, err1 := evalArg(1)
+		if err1 != nil {
+			return nil, err1
+		}
+		df, okD := toFloat64(a0)
+		rf, okR := toFloat64(a1)
+		if !okD || !okR {
+			return "\x00", nil
+		}
+		d, radix := int(df), int(rf)
+		if d < 0 || d >= radix || radix < 2 || radix > 36 {
+			return "\x00", nil
+		}
+		if d < 10 {
+			return string(rune('0' + d)), nil
+		}
+		return string(rune('a' + d - 10)), nil
+	case "reverseBytes":
+		cp, ok := toCodePoint(a0)
+		if !ok {
+			return int64(0), nil
+		}
+		u := uint16(cp) // #nosec G115 -- char is 16-bit
+		rev := (u >> 8) | (u << 8)
+		return int64(rev), nil
+	}
+	return nil, nil
+}
+
+func evalArraysCompareOrMismatchPainless(args []string, isMismatch bool, sourceMap, params map[string]any, depth int) (int64, error) {
+	if len(args) < 2 {
+		return 0, nil
+	}
+	evalArg := func(idx int) (any, error) {
+		return evalRHSExprDepth(sourceMap, strings.TrimSpace(args[idx]), params, depth+1)
+	}
+	v0, err0 := evalArg(0)
+	if err0 != nil {
+		return 0, err0
+	}
+	var aSlice, bSlice []any
+	var cmpArg string
+	var cmpObj *painlessComparator
+	if len(args) >= 6 {
+		// Range overload: (a, aFromIndex, aToIndex, b, bFromIndex, bToIndex[, cmp])
+		aFull, okA := v0.([]any)
+		if !okA {
+			return 0, fmt.Errorf("NullPointerException: array is null")
+		}
+		afV, err := evalArg(1)
+		if err != nil {
+			return 0, err
+		}
+		atV, err := evalArg(2)
+		if err != nil {
+			return 0, err
+		}
+		v3, err := evalArg(3)
+		if err != nil {
+			return 0, err
+		}
+		bFull, okB := v3.([]any)
+		if !okB {
+			return 0, fmt.Errorf("NullPointerException: array is null")
+		}
+		bfV, err := evalArg(4)
+		if err != nil {
+			return 0, err
+		}
+		btV, err := evalArg(5)
+		if err != nil {
+			return 0, err
+		}
+		afF, _ := toFloat64(afV)
+		atF, _ := toFloat64(atV)
+		bfF, _ := toFloat64(bfV)
+		btF, _ := toFloat64(btV)
+		af, at, bf, bt := int(afF), int(atF), int(bfF), int(btF)
+		if af > at || bf > bt {
+			return 0, fmt.Errorf("IllegalArgumentException: fromIndex > toIndex")
+		}
+		if af < 0 || at > len(aFull) || bf < 0 || bt > len(bFull) {
+			return 0, fmt.Errorf("ArrayIndexOutOfBoundsException: range out of bounds")
+		}
+		aSlice = aFull[af:at]
+		bSlice = bFull[bf:bt]
+		if len(args) >= 7 {
+			cmpArg = strings.TrimSpace(args[6])
+			if cv, errC := evalArg(6); errC == nil {
+				if pc, okPC := cv.(*painlessComparator); okPC {
+					cmpObj = pc
+				}
+			}
+		}
+	} else {
+		v1, err1 := evalArg(1)
+		if err1 != nil {
+			return 0, err1
+		}
+		if v0 == nil && v1 == nil {
+			if isMismatch {
+				return -1, nil
+			}
+			return 0, nil
+		}
+		if v0 == nil {
+			if isMismatch {
+				return 0, fmt.Errorf("NullPointerException: Cannot read the array length because \"a\" is null")
+			}
+			return -1, nil
+		}
+		if v1 == nil {
+			if isMismatch {
+				return 0, fmt.Errorf("NullPointerException: Cannot read the array length because \"b\" is null")
+			}
+			return 1, nil
+		}
+		aOk, okA := v0.([]any)
+		bOk, okB := v1.([]any)
+		if !okA || !okB {
+			return 0, nil
+		}
+		aSlice = aOk
+		bSlice = bOk
+		if len(args) >= 3 {
+			cmpArg = strings.TrimSpace(args[2])
+			if cv, errC := evalArg(2); errC == nil {
+				if pc, okPC := cv.(*painlessComparator); okPC {
+					cmpObj = pc
+				}
+			}
+		}
+	}
+
+	minLen := len(aSlice)
+	if len(bSlice) < minLen {
+		minLen = len(bSlice)
+	}
+	for i := 0; i < minLen; i++ {
+		var c int
+		var errC error
+		if cmpObj != nil {
+			c, errC = evalComparatorObjectPairPainless(cmpObj, aSlice[i], bSlice[i], sourceMap, params, depth+1)
+		} else if cmpArg != "" && cmpArg != "null" {
+			c, errC = evalPainlessComparatorPair(cmpArg, aSlice[i], bSlice[i], sourceMap, params, depth+1)
+		} else {
+			c = comparePainlessValues(aSlice[i], bSlice[i])
+		}
+		if errC != nil {
+			return 0, errC
+		}
+		if c != 0 {
+			if isMismatch {
+				return int64(i), nil
+			}
+			if c < 0 {
+				return -1, nil
+			}
+			return 1, nil
+		}
+	}
+	if len(aSlice) == len(bSlice) {
+		if isMismatch {
+			return -1, nil
+		}
+		return 0, nil
+	}
+	if isMismatch {
+		return int64(minLen), nil
+	}
+	if len(aSlice) < len(bSlice) {
+		return -1, nil
+	}
+	return 1, nil
+}
+
+func instantiateUserClassPainless(cls *painlessUserClass, argStr string, sourceMap, params map[string]any, depth int) (*painlessUserObject, error) {
+	uo := &painlessUserObject{
+		class:  cls,
+		fields: make(map[string]any, len(cls.fields)),
+	}
+	localScope := make(map[string]any, len(params)+len(cls.fields)+4)
+	for k, v := range params {
+		localScope[k] = v
+	}
+	localScope["this"] = uo
+	// Initialize fields with defaults
+	for _, f := range cls.fields {
+		if f.initExpr != "" {
+			val, err := evalRHSExprDepth(sourceMap, f.initExpr, localScope, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			uo.fields[f.name] = val
+		} else {
+			switch f.typeName {
+			case "int", "long", "short", "byte":
+				uo.fields[f.name] = int64(0)
+			case "double", "float":
+				uo.fields[f.name] = float64(0)
+			case "boolean":
+				uo.fields[f.name] = false
+			default:
+				uo.fields[f.name] = nil
+			}
+		}
+	}
+	// Evaluate constructor arguments
+	var argVals []any
+	if strings.TrimSpace(argStr) != "" {
+		rawArgs := splitTopLevelCommaPainless(argStr)
+		argVals = make([]any, 0, len(rawArgs))
+		for _, ra := range rawArgs {
+			av, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(ra), params, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			argVals = append(argVals, av)
+		}
+	}
+	// Find matching constructor by arity
+	var matchedCtor *painlessUserFunc
+	for _, ctor := range cls.constructors {
+		if len(ctor.paramNames) == len(argVals) {
+			matchedCtor = ctor
+			break
+		}
+	}
+	if matchedCtor != nil {
+		budget := getOrInitEvalBudget(params)
+		ctorScope := make(map[string]any, len(params)+len(matchedCtor.paramNames)+4)
+		for k, v := range params {
+			ctorScope[k] = v
+		}
+		ctorScope["this"] = uo
+		methodParams := make(map[string]bool, len(matchedCtor.paramNames))
+		for i, pName := range matchedCtor.paramNames {
+			ctorScope[pName] = argVals[i]
+			methodParams[pName] = true
+		}
+		ctorScope["__method_params"] = methodParams
+		ctorScope["__script_locals"] = make(map[string]bool)
+		ctxOp := ""
+		if err := execBlock(sourceMap, matchedCtor.body, ctorScope, &ctxOp, budget); err != nil && !errors.Is(err, errPainlessReturn) {
+			return nil, err
+		}
+	}
+	return uo, nil
+}
+
+func evalTrailingUserObjectMethodCallPainless(sourceMap map[string]any, rhs string, params map[string]any, depth int) (any, bool, error) {
+	if !strings.HasSuffix(rhs, ")") {
+		return nil, false, nil
+	}
+	openIdx := -1
+	inQuotes := byte(0)
+	inRegexClass := false
+	for i := 0; i < len(rhs)-1; i++ {
+		if stepQuoteState(rhs, i, &inQuotes, &inRegexClass) {
+			continue
+		}
+		if rhs[i] == '(' && findMatchingDelimiter(rhs, i, '(', ')') == len(rhs)-1 {
+			openIdx = i
+			break
+		}
+	}
+	if openIdx <= 0 {
+		return nil, false, nil
+	}
+	prefix := strings.TrimSpace(rhs[:openIdx])
+	dotIdx := -1
+	pDepth := 0
+	pQuotes := byte(0)
+	pRegex := false
+	for i := 0; i < len(prefix); i++ {
+		if stepQuoteState(prefix, i, &pQuotes, &pRegex) {
+			continue
+		}
+		switch prefix[i] {
+		case '(', '[', '{':
+			pDepth++
+		case ')', ']', '}':
+			if pDepth > 0 {
+				pDepth--
+			}
+		case '.':
+			if pDepth == 0 {
+				dotIdx = i
+			}
+		}
+	}
+	if dotIdx <= 0 {
+		return nil, false, nil
+	}
+	recExpr := strings.TrimSpace(strings.TrimSuffix(prefix[:dotIdx], "?"))
+	methodName := strings.TrimSpace(prefix[dotIdx+1:])
+	if methodName == "" {
+		return nil, false, nil
+	}
+	for i := 0; i < len(methodName); i++ {
+		if !isIdentByte(methodName[i]) {
+			return nil, false, nil
+		}
+	}
+	recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1)
+	if err != nil {
+		return nil, false, nil
+	}
+	uo, ok := recVal.(*painlessUserObject)
+	if !ok || uo == nil || uo.class == nil {
+		return nil, false, nil
+	}
+	if len(uo.class.methods[methodName]) == 0 {
+		return nil, false, nil
+	}
+	argStr := strings.TrimSpace(rhs[openIdx+1 : len(rhs)-1])
+	res, errM := evalUserObjectMethodPainless(uo, methodName, argStr, sourceMap, params, depth+1)
+	return res, true, errM
+}
+
+func evalUserObjectMethodPainless(uo *painlessUserObject, methodName, argStr string, sourceMap, params map[string]any, depth int) (any, error) {
+	if uo == nil || uo.class == nil {
+		return nil, nil
+	}
+	var argVals []any
+	if strings.TrimSpace(argStr) != "" {
+		rawArgs := splitTopLevelCommaPainless(argStr)
+		argVals = make([]any, 0, len(rawArgs))
+		for _, ra := range rawArgs {
+			av, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(ra), params, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			argVals = append(argVals, av)
+		}
+	}
+	var fn *painlessUserFunc
+	if overloads := uo.class.methods[methodName]; len(overloads) > 0 {
+		for _, cand := range overloads {
+			if len(cand.paramNames) == len(argVals) {
+				fn = cand
+				break
+			}
+		}
+		if fn == nil {
+			fn = overloads[0]
+		}
+	}
+	if fn == nil {
+		return nil, nil
+	}
+	budget := getOrInitEvalBudget(params)
+	if err := budget.step(); err != nil {
+		return nil, err
+	}
+	mScope := make(map[string]any, len(params)+len(fn.paramNames)+4)
+	for k, v := range params {
+		if k == "_return_val" || k == "_last_expr_val" {
+			continue
+		}
+		mScope[k] = v
+	}
+	mScope["this"] = uo
+	methodParams := make(map[string]bool, len(fn.paramNames))
+	for i, pName := range fn.paramNames {
+		if i < len(argVals) {
+			mScope[pName] = argVals[i]
+		}
+		methodParams[pName] = true
+	}
+	mScope["__method_params"] = methodParams
+	mScope["__script_locals"] = make(map[string]bool)
+	ctxOp := ""
+	err := execBlock(sourceMap, fn.body, mScope, &ctxOp, budget)
+	if err != nil && !errors.Is(err, errPainlessReturn) {
+		return nil, err
+	}
+	if fn.returnType == "void" {
+		return nil, nil
+	}
+	if retVal, hasRet := mScope["_return_val"]; hasRet {
+		return retVal, nil
+	}
+	return mScope["_last_expr_val"], nil
 }

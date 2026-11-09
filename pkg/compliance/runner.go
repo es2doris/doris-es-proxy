@@ -18,6 +18,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 const proxyTargetVersion = "7.10.2"
@@ -210,6 +211,17 @@ type runnerContext struct {
 	createdWatches             map[string]bool
 	createdTransforms          map[string]bool
 	createdAutoscalingPolicies map[string]bool
+	createdSynonymSets         map[string]bool
+	createdQueryRulesets       map[string]bool
+	createdRollupJobs          map[string]bool
+	createdAutoFollowPatterns  map[string]bool
+	createdLogstashPipelines   map[string]bool
+	createdSecurityUsers       map[string]bool
+	createdSecurityRoles       map[string]bool
+	createdSecurityPrivileges  map[string]map[string]bool
+	createdServiceTokens       map[string]bool
+	createdShutdownNodes       map[string]bool
+	createdVotingExclusions    bool
 	createdScripts             map[string]struct{}
 	createdRepositories        map[string]struct{}
 	createdAliases             map[string]string // alias -> index
@@ -233,6 +245,16 @@ func newRunnerContext(client *http.Client, baseURL string) *runnerContext {
 		createdWatches:             make(map[string]bool),
 		createdTransforms:          make(map[string]bool),
 		createdAutoscalingPolicies: make(map[string]bool),
+		createdSynonymSets:         make(map[string]bool),
+		createdQueryRulesets:       make(map[string]bool),
+		createdRollupJobs:          make(map[string]bool),
+		createdAutoFollowPatterns:  make(map[string]bool),
+		createdLogstashPipelines:   make(map[string]bool),
+		createdSecurityUsers:       make(map[string]bool),
+		createdSecurityRoles:       make(map[string]bool),
+		createdSecurityPrivileges:  make(map[string]map[string]bool),
+		createdServiceTokens:       make(map[string]bool),
+		createdShutdownNodes:       make(map[string]bool),
 		createdScripts:             make(map[string]struct{}),
 		createdRepositories:        make(map[string]struct{}),
 		createdAliases:             make(map[string]string),
@@ -309,6 +331,62 @@ func (c *runnerContext) cleanupAll() {
 		if polName != "" {
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/_autoscaling/policy/"+url.PathEscape(polName), nil, nil, nil)
 		}
+	}
+	for synID := range c.createdSynonymSets {
+		if synID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_synonyms/"+url.PathEscape(synID), nil, nil, nil)
+		}
+	}
+	for rulesetID := range c.createdQueryRulesets {
+		if rulesetID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_query_rules/"+url.PathEscape(rulesetID), nil, nil, nil)
+		}
+	}
+	for jobID := range c.createdRollupJobs {
+		if jobID != "" {
+			_, _, _ = c.rawHTTP(http.MethodPost, "/_rollup/job/"+url.PathEscape(jobID)+"/_stop", nil, nil, nil)
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_rollup/job/"+url.PathEscape(jobID), nil, nil, nil)
+		}
+	}
+	for patName := range c.createdAutoFollowPatterns {
+		if patName != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ccr/auto_follow/"+url.PathEscape(patName), nil, nil, nil)
+		}
+	}
+	for pipeID := range c.createdLogstashPipelines {
+		if pipeID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_logstash/pipeline/"+url.PathEscape(pipeID), nil, nil, nil)
+		}
+	}
+	for username := range c.createdSecurityUsers {
+		if username != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_security/user/"+url.PathEscape(username), nil, nil, nil)
+		}
+	}
+	for roleName := range c.createdSecurityRoles {
+		if roleName != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_security/role/"+url.PathEscape(roleName), nil, nil, nil)
+		}
+	}
+	for app, privs := range c.createdSecurityPrivileges {
+		for privName := range privs {
+			if app != "" && privName != "" {
+				_, _, _ = c.rawHTTP(http.MethodDelete, "/_security/privilege/"+url.PathEscape(app)+"/"+url.PathEscape(privName), nil, nil, nil)
+			}
+		}
+	}
+	for tokPath := range c.createdServiceTokens {
+		if tokPath != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_security/service/"+tokPath, nil, nil, nil)
+		}
+	}
+	for nodeID := range c.createdShutdownNodes {
+		if nodeID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_nodes/"+url.PathEscape(nodeID)+"/shutdown", nil, nil, nil)
+		}
+	}
+	if c.createdVotingExclusions {
+		_, _, _ = c.rawHTTP(http.MethodDelete, "/_cluster/voting_config_exclusions", nil, nil, nil)
 	}
 	for scriptID := range c.createdScripts {
 		if scriptID != "" {
@@ -872,6 +950,86 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 		if name := paramString(params, "name"); name != "" {
 			c.createdAutoscalingPolicies[name] = true
 		}
+	case "synonyms.put_synonym", "synonyms.put_synonym_rule":
+		if id := firstNonEmptyParam(params, "set_id", "synonyms_set", "id"); id != "" {
+			c.createdSynonymSets[id] = true
+		}
+	case "query_rules.put_ruleset", "query_rules.put_rule":
+		if id := firstNonEmptyParam(params, "ruleset_id", "id"); id != "" {
+			c.createdQueryRulesets[id] = true
+		}
+	case "rollup.put_job":
+		if id := firstNonEmptyParam(params, "id", "job_id"); id != "" {
+			c.createdRollupJobs[id] = true
+		}
+		if bodyMap, ok := ToNative(params["body"]).(map[string]any); ok {
+			if rIdx := paramString(bodyMap, "rollup_index"); rIdx != "" {
+				c.createdIndices[rIdx] = true
+			}
+		}
+	case "ccr.put_auto_follow_pattern":
+		if name := paramString(params, "name"); name != "" {
+			c.createdAutoFollowPatterns[name] = true
+		}
+	case "ccr.follow":
+		if idx != "" {
+			c.createdIndices[idx] = true
+		}
+	case "searchable_snapshots.mount":
+		if bodyMap, ok := ToNative(params["body"]).(map[string]any); ok {
+			if ren := paramString(bodyMap, "renamed_index"); ren != "" {
+				c.createdIndices[ren] = true
+			} else if bIdx := paramString(bodyMap, "index"); bIdx != "" {
+				c.createdIndices[bIdx] = true
+			}
+		}
+	case "logstash.put_pipeline":
+		if id := paramString(params, "id"); id != "" {
+			c.createdLogstashPipelines[id] = true
+		}
+	case "security.put_user":
+		if u := firstNonEmptyParam(params, "username", "name", "id"); u != "" {
+			c.createdSecurityUsers[u] = true
+		}
+	case "security.put_role":
+		if r := firstNonEmptyParam(params, "name", "id"); r != "" {
+			c.createdSecurityRoles[r] = true
+		}
+	case "security.put_privileges":
+		if bodyMap, ok := ToNative(params["body"]).(map[string]any); ok {
+			for app, privsRaw := range bodyMap {
+				privsMap, ok := ToNative(privsRaw).(map[string]any)
+				if !ok {
+					continue
+				}
+				if c.createdSecurityPrivileges[app] == nil {
+					c.createdSecurityPrivileges[app] = make(map[string]bool)
+				}
+				for privName := range privsMap {
+					c.createdSecurityPrivileges[app][privName] = true
+				}
+			}
+		}
+	case "security.create_service_token":
+		ns := paramString(params, "namespace")
+		svc := paramString(params, "service")
+		tok := firstNonEmptyParam(params, "token_name", "name")
+		if tok == "" {
+			if rm, ok := resp.(map[string]any); ok {
+				if tv, ok := rm["token"].(map[string]any); ok {
+					tok = paramString(tv, "name")
+				}
+			}
+		}
+		if ns != "" && svc != "" && tok != "" {
+			c.createdServiceTokens[url.PathEscape(ns)+"/"+url.PathEscape(svc)+"/credential/token/"+url.PathEscape(tok)] = true
+		}
+	case "shutdown.put_node":
+		if nodeID := paramString(params, "node_id"); nodeID != "" {
+			c.createdShutdownNodes[nodeID] = true
+		}
+	case "cluster.post_voting_config_exclusions":
+		c.createdVotingExclusions = true
 	case "put_script":
 		if id := paramString(params, "id"); id != "" {
 			c.createdScripts[id] = struct{}{}
@@ -2497,6 +2655,614 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		method = http.MethodGet
 		reqPath = "/_autoscaling/capacity"
 
+	case "transform.update_transform":
+		method = http.MethodPost
+		id := popString("transform_id", "id")
+		if id == "" {
+			return nil, fmt.Errorf("transform.update_transform requires transform_id parameter")
+		}
+		reqPath = "/_transform/" + id + "/_update"
+
+	case "synonyms.put_synonym":
+		method = http.MethodPut
+		id := popString("id", "synonyms_set", "set_id")
+		if id == "" {
+			return nil, fmt.Errorf("synonyms.put_synonym requires id parameter")
+		}
+		reqPath = "/_synonyms/" + id
+
+	case "synonyms.get_synonym":
+		method = http.MethodGet
+		id := popString("id", "synonyms_set", "set_id")
+		if id == "" {
+			return nil, fmt.Errorf("synonyms.get_synonym requires id parameter")
+		}
+		reqPath = "/_synonyms/" + id
+
+	case "synonyms.get_synonyms_sets":
+		method = http.MethodGet
+		reqPath = "/_synonyms"
+
+	case "synonyms.delete_synonym":
+		method = http.MethodDelete
+		id := popString("id", "synonyms_set", "set_id")
+		if id == "" {
+			return nil, fmt.Errorf("synonyms.delete_synonym requires id parameter")
+		}
+		reqPath = "/_synonyms/" + id
+
+	case "synonyms.put_synonym_rule":
+		method = http.MethodPut
+		setID := popString("set_id", "synonyms_set", "id")
+		ruleID := popString("rule_id")
+		if setID == "" || ruleID == "" {
+			return nil, fmt.Errorf("synonyms.put_synonym_rule requires set_id and rule_id parameters")
+		}
+		reqPath = "/_synonyms/" + setID + "/" + ruleID
+
+	case "synonyms.get_synonym_rule":
+		method = http.MethodGet
+		setID := popString("set_id", "synonyms_set", "id")
+		ruleID := popString("rule_id")
+		if setID == "" || ruleID == "" {
+			return nil, fmt.Errorf("synonyms.get_synonym_rule requires set_id and rule_id parameters")
+		}
+		reqPath = "/_synonyms/" + setID + "/" + ruleID
+
+	case "synonyms.delete_synonym_rule":
+		method = http.MethodDelete
+		setID := popString("set_id", "synonyms_set", "id")
+		ruleID := popString("rule_id")
+		if setID == "" || ruleID == "" {
+			return nil, fmt.Errorf("synonyms.delete_synonym_rule requires set_id and rule_id parameters")
+		}
+		reqPath = "/_synonyms/" + setID + "/" + ruleID
+
+	case "synonyms.reload_synonym":
+		method = http.MethodPost
+		id := popString("id", "synonyms_set", "set_id")
+		if id == "" {
+			return nil, fmt.Errorf("synonyms.reload_synonym requires id parameter")
+		}
+		reqPath = "/_synonyms/" + id + "/_reload"
+
+	case "query_rules.put_ruleset":
+		method = http.MethodPut
+		rulesetID := popString("ruleset_id", "id")
+		if rulesetID == "" {
+			return nil, fmt.Errorf("query_rules.put_ruleset requires ruleset_id parameter")
+		}
+		reqPath = "/_query_rules/" + rulesetID
+
+	case "query_rules.get_ruleset":
+		method = http.MethodGet
+		rulesetID := popString("ruleset_id", "id")
+		if rulesetID == "" {
+			return nil, fmt.Errorf("query_rules.get_ruleset requires ruleset_id parameter")
+		}
+		reqPath = "/_query_rules/" + rulesetID
+
+	case "query_rules.list_rulesets":
+		method = http.MethodGet
+		reqPath = "/_query_rules"
+
+	case "query_rules.delete_ruleset":
+		method = http.MethodDelete
+		rulesetID := popString("ruleset_id", "id")
+		if rulesetID == "" {
+			return nil, fmt.Errorf("query_rules.delete_ruleset requires ruleset_id parameter")
+		}
+		reqPath = "/_query_rules/" + rulesetID
+
+	case "query_rules.put_rule":
+		method = http.MethodPut
+		rulesetID := popString("ruleset_id", "id")
+		ruleID := popString("rule_id")
+		if rulesetID == "" || ruleID == "" {
+			return nil, fmt.Errorf("query_rules.put_rule requires ruleset_id and rule_id parameters")
+		}
+		reqPath = "/_query_rules/" + rulesetID + "/_rule/" + ruleID
+
+	case "query_rules.get_rule":
+		method = http.MethodGet
+		rulesetID := popString("ruleset_id", "id")
+		ruleID := popString("rule_id")
+		if rulesetID == "" || ruleID == "" {
+			return nil, fmt.Errorf("query_rules.get_rule requires ruleset_id and rule_id parameters")
+		}
+		reqPath = "/_query_rules/" + rulesetID + "/_rule/" + ruleID
+
+	case "query_rules.delete_rule":
+		method = http.MethodDelete
+		rulesetID := popString("ruleset_id", "id")
+		ruleID := popString("rule_id")
+		if rulesetID == "" || ruleID == "" {
+			return nil, fmt.Errorf("query_rules.delete_rule requires ruleset_id and rule_id parameters")
+		}
+		reqPath = "/_query_rules/" + rulesetID + "/_rule/" + ruleID
+
+	case "query_rules.test":
+		method = http.MethodPost
+		rulesetID := popString("ruleset_id", "id")
+		if rulesetID == "" {
+			return nil, fmt.Errorf("query_rules.test requires ruleset_id parameter")
+		}
+		reqPath = "/_query_rules/" + rulesetID + "/_test"
+
+	case "features.get_features":
+		method = http.MethodGet
+		reqPath = "/_features"
+
+	case "features.reset_features":
+		method = http.MethodPost
+		reqPath = "/_features/_reset"
+
+	case "cluster.post_voting_config_exclusions":
+		method = http.MethodPost
+		reqPath = "/_cluster/voting_config_exclusions"
+
+	case "cluster.delete_voting_config_exclusions":
+		method = http.MethodDelete
+		reqPath = "/_cluster/voting_config_exclusions"
+
+	case "migration.deprecations":
+		method = http.MethodGet
+		if idx := popString("index"); idx != "" {
+			reqPath = "/" + idx + "/_migration/deprecations"
+		} else {
+			reqPath = "/_migration/deprecations"
+		}
+
+	case "shutdown.put_node":
+		method = http.MethodPut
+		nodeID := popString("node_id")
+		if nodeID == "" {
+			return nil, fmt.Errorf("shutdown.put_node requires node_id parameter")
+		}
+		reqPath = "/_nodes/" + nodeID + "/shutdown"
+
+	case "shutdown.get_node":
+		method = http.MethodGet
+		if nodeID := popString("node_id"); nodeID != "" {
+			reqPath = "/_nodes/" + nodeID + "/shutdown"
+		} else {
+			reqPath = "/_nodes/shutdown"
+		}
+
+	case "shutdown.delete_node":
+		method = http.MethodDelete
+		nodeID := popString("node_id")
+		if nodeID == "" {
+			return nil, fmt.Errorf("shutdown.delete_node requires node_id parameter")
+		}
+		reqPath = "/_nodes/" + nodeID + "/shutdown"
+
+	case "rollup.put_job":
+		method = http.MethodPut
+		id := popString("id", "job_id")
+		if id == "" {
+			return nil, fmt.Errorf("rollup.put_job requires id parameter")
+		}
+		reqPath = "/_rollup/job/" + id
+
+	case "rollup.get_jobs":
+		method = http.MethodGet
+		if id := popString("id", "job_id"); id != "" {
+			reqPath = "/_rollup/job/" + id
+		} else {
+			reqPath = "/_rollup/job"
+		}
+
+	case "rollup.delete_job":
+		method = http.MethodDelete
+		id := popString("id", "job_id")
+		if id == "" {
+			return nil, fmt.Errorf("rollup.delete_job requires id parameter")
+		}
+		reqPath = "/_rollup/job/" + id
+
+	case "rollup.start_job":
+		method = http.MethodPost
+		id := popString("id", "job_id")
+		if id == "" {
+			return nil, fmt.Errorf("rollup.start_job requires id parameter")
+		}
+		reqPath = "/_rollup/job/" + id + "/_start"
+
+	case "rollup.stop_job":
+		method = http.MethodPost
+		id := popString("id", "job_id")
+		if id == "" {
+			return nil, fmt.Errorf("rollup.stop_job requires id parameter")
+		}
+		reqPath = "/_rollup/job/" + id + "/_stop"
+
+	case "rollup.get_rollup_caps":
+		method = http.MethodGet
+		if id := popString("id", "index"); id != "" {
+			reqPath = "/_rollup/data/" + id
+		} else {
+			reqPath = "/_rollup/data/_all"
+		}
+
+	case "rollup.get_rollup_index_caps":
+		method = http.MethodGet
+		idx := popString("index", "id")
+		if idx == "" {
+			return nil, fmt.Errorf("rollup.get_rollup_index_caps requires index parameter")
+		}
+		reqPath = "/" + idx + "/_rollup/data"
+
+	case "rollup.rollup_search":
+		if hasBody && rawBody != nil {
+			method = http.MethodPost
+		} else {
+			method = http.MethodGet
+		}
+		idx := popString("index")
+		if idx == "" {
+			return nil, fmt.Errorf("rollup.rollup_search requires index parameter")
+		}
+		reqPath = "/" + idx + "/_rollup_search"
+
+	case "ccr.put_auto_follow_pattern":
+		method = http.MethodPut
+		name := popString("name")
+		if name == "" {
+			return nil, fmt.Errorf("ccr.put_auto_follow_pattern requires name parameter")
+		}
+		reqPath = "/_ccr/auto_follow/" + name
+
+	case "ccr.get_auto_follow_pattern":
+		method = http.MethodGet
+		if name := popString("name"); name != "" {
+			reqPath = "/_ccr/auto_follow/" + name
+		} else {
+			reqPath = "/_ccr/auto_follow"
+		}
+
+	case "ccr.delete_auto_follow_pattern":
+		method = http.MethodDelete
+		name := popString("name")
+		if name == "" {
+			return nil, fmt.Errorf("ccr.delete_auto_follow_pattern requires name parameter")
+		}
+		reqPath = "/_ccr/auto_follow/" + name
+
+	case "ccr.pause_auto_follow_pattern":
+		method = http.MethodPost
+		name := popString("name")
+		if name == "" {
+			return nil, fmt.Errorf("ccr.pause_auto_follow_pattern requires name parameter")
+		}
+		reqPath = "/_ccr/auto_follow/" + name + "/_pause"
+
+	case "ccr.resume_auto_follow_pattern":
+		method = http.MethodPost
+		name := popString("name")
+		if name == "" {
+			return nil, fmt.Errorf("ccr.resume_auto_follow_pattern requires name parameter")
+		}
+		reqPath = "/_ccr/auto_follow/" + name + "/_resume"
+
+	case "ccr.follow":
+		method = http.MethodPut
+		idx := popString("index")
+		if idx == "" {
+			return nil, fmt.Errorf("ccr.follow requires index parameter")
+		}
+		reqPath = "/" + idx + "/_ccr/follow"
+
+	case "ccr.follow_info":
+		method = http.MethodGet
+		idx := popString("index")
+		if idx == "" {
+			return nil, fmt.Errorf("ccr.follow_info requires index parameter")
+		}
+		reqPath = "/" + idx + "/_ccr/info"
+
+	case "ccr.follow_stats":
+		method = http.MethodGet
+		idx := popString("index")
+		if idx == "" {
+			return nil, fmt.Errorf("ccr.follow_stats requires index parameter")
+		}
+		reqPath = "/" + idx + "/_ccr/stats"
+
+	case "ccr.pause_follow":
+		method = http.MethodPost
+		idx := popString("index")
+		if idx == "" {
+			return nil, fmt.Errorf("ccr.pause_follow requires index parameter")
+		}
+		reqPath = "/" + idx + "/_ccr/pause_follow"
+
+	case "ccr.resume_follow":
+		method = http.MethodPost
+		idx := popString("index")
+		if idx == "" {
+			return nil, fmt.Errorf("ccr.resume_follow requires index parameter")
+		}
+		reqPath = "/" + idx + "/_ccr/resume_follow"
+
+	case "ccr.unfollow":
+		method = http.MethodPost
+		idx := popString("index")
+		if idx == "" {
+			return nil, fmt.Errorf("ccr.unfollow requires index parameter")
+		}
+		reqPath = "/" + idx + "/_ccr/unfollow"
+
+	case "ccr.forget_follower":
+		method = http.MethodPost
+		idx := popString("index")
+		if idx == "" {
+			return nil, fmt.Errorf("ccr.forget_follower requires index parameter")
+		}
+		reqPath = "/" + idx + "/_ccr/forget_follower"
+
+	case "ccr.stats":
+		method = http.MethodGet
+		reqPath = "/_ccr/stats"
+
+	case "searchable_snapshots.mount":
+		method = http.MethodPost
+		repo := popString("repository")
+		snap := popString("snapshot")
+		if repo == "" || snap == "" {
+			return nil, fmt.Errorf("searchable_snapshots.mount requires repository and snapshot parameters")
+		}
+		reqPath = "/_snapshot/" + repo + "/" + snap + "/_mount"
+
+	case "searchable_snapshots.stats":
+		method = http.MethodGet
+		if idx := popString("index"); idx != "" {
+			reqPath = "/" + idx + "/_searchable_snapshots/stats"
+		} else {
+			reqPath = "/_searchable_snapshots/stats"
+		}
+
+	case "searchable_snapshots.cache_stats":
+		method = http.MethodGet
+		reqPath = "/_searchable_snapshots/cache/stats"
+
+	case "searchable_snapshots.clear_cache":
+		method = http.MethodPost
+		reqPath = "/_searchable_snapshots/cache/clear"
+
+	case "security.authenticate":
+		method = http.MethodGet
+		reqPath = "/_security/_authenticate"
+
+	case "security.put_user":
+		method = http.MethodPut
+		username := popString("username", "name", "id")
+		if username == "" {
+			return nil, fmt.Errorf("security.put_user requires username parameter")
+		}
+		reqPath = "/_security/user/" + username
+
+	case "security.get_user":
+		method = http.MethodGet
+		if username := popString("username", "name", "id"); username != "" {
+			reqPath = "/_security/user/" + username
+		} else {
+			reqPath = "/_security/user"
+		}
+
+	case "security.delete_user":
+		method = http.MethodDelete
+		username := popString("username", "name", "id")
+		if username == "" {
+			return nil, fmt.Errorf("security.delete_user requires username parameter")
+		}
+		reqPath = "/_security/user/" + username
+
+	case "security.enable_user":
+		method = http.MethodPut
+		username := popString("username", "name", "id")
+		if username == "" {
+			return nil, fmt.Errorf("security.enable_user requires username parameter")
+		}
+		reqPath = "/_security/user/" + username + "/_enable"
+
+	case "security.disable_user":
+		method = http.MethodPut
+		username := popString("username", "name", "id")
+		if username == "" {
+			return nil, fmt.Errorf("security.disable_user requires username parameter")
+		}
+		reqPath = "/_security/user/" + username + "/_disable"
+
+	case "security.change_password":
+		method = http.MethodPost
+		if username := popString("username", "name", "id"); username != "" {
+			reqPath = "/_security/user/" + username + "/_password"
+		} else {
+			reqPath = "/_security/user/_password"
+		}
+
+	case "security.has_privileges":
+		method = http.MethodPost
+		if username := popString("username", "name", "id"); username != "" {
+			reqPath = "/_security/user/" + username + "/_has_privileges"
+		} else {
+			reqPath = "/_security/user/_has_privileges"
+		}
+
+	case "security.put_role":
+		method = http.MethodPut
+		name := popString("name", "id")
+		if name == "" {
+			return nil, fmt.Errorf("security.put_role requires name parameter")
+		}
+		reqPath = "/_security/role/" + name
+
+	case "security.get_role":
+		method = http.MethodGet
+		if name := popString("name", "id"); name != "" {
+			reqPath = "/_security/role/" + name
+		} else {
+			reqPath = "/_security/role"
+		}
+
+	case "security.delete_role":
+		method = http.MethodDelete
+		name := popString("name", "id")
+		if name == "" {
+			return nil, fmt.Errorf("security.delete_role requires name parameter")
+		}
+		reqPath = "/_security/role/" + name
+
+	case "security.clear_cached_roles":
+		method = http.MethodPost
+		name := popString("name", "id")
+		if name == "" {
+			return nil, fmt.Errorf("security.clear_cached_roles requires name parameter")
+		}
+		reqPath = "/_security/role/" + name + "/_clear_cache"
+
+	case "security.create_api_key":
+		method = http.MethodPost
+		reqPath = "/_security/api_key"
+
+	case "security.get_api_key":
+		method = http.MethodGet
+		reqPath = "/_security/api_key"
+
+	case "security.invalidate_api_key":
+		method = http.MethodDelete
+		reqPath = "/_security/api_key"
+
+	case "security.grant_api_key":
+		method = http.MethodPost
+		reqPath = "/_security/api_key/_grant"
+
+	case "security.query_api_keys":
+		method = http.MethodPost
+		reqPath = "/_security/_query/api_key"
+
+	case "security.clear_api_key_cache":
+		method = http.MethodPost
+		reqPath = "/_security/_clear_api_key_cache"
+
+	case "security.get_builtin_privileges":
+		method = http.MethodGet
+		reqPath = "/_security/privilege/_builtin"
+
+	case "security.put_privileges":
+		method = http.MethodPut
+		reqPath = "/_security/privilege"
+
+	case "security.get_privileges":
+		method = http.MethodGet
+		app := popString("application")
+		name := popString("name")
+		switch {
+		case app != "" && name != "":
+			reqPath = "/_security/privilege/" + app + "/" + name
+		case app != "":
+			reqPath = "/_security/privilege/" + app
+		default:
+			reqPath = "/_security/privilege"
+		}
+
+	case "security.delete_privileges":
+		method = http.MethodDelete
+		app := popString("application")
+		name := popString("name")
+		if app == "" || name == "" {
+			return nil, fmt.Errorf("security.delete_privileges requires application and name parameters")
+		}
+		reqPath = "/_security/privilege/" + app + "/" + name
+
+	case "security.create_service_token":
+		method = http.MethodPost
+		ns := popString("namespace")
+		svc := popString("service")
+		tokenName := popString("token_name", "name")
+		if ns == "" || svc == "" {
+			return nil, fmt.Errorf("security.create_service_token requires namespace and service parameters")
+		}
+		if tokenName != "" {
+			reqPath = "/_security/service/" + ns + "/" + svc + "/credential/token/" + tokenName
+		} else {
+			reqPath = "/_security/service/" + ns + "/" + svc + "/credential/token"
+		}
+
+	case "security.delete_service_token":
+		method = http.MethodDelete
+		ns := popString("namespace")
+		svc := popString("service")
+		tokenName := popString("token_name", "name")
+		if ns == "" || svc == "" || tokenName == "" {
+			return nil, fmt.Errorf("security.delete_service_token requires namespace, service, and token_name parameters")
+		}
+		reqPath = "/_security/service/" + ns + "/" + svc + "/credential/token/" + tokenName
+
+	case "security.list_service_tokens":
+		method = http.MethodGet
+		ns := popString("namespace")
+		svc := popString("service")
+		if ns == "" || svc == "" {
+			return nil, fmt.Errorf("security.list_service_tokens requires namespace and service parameters")
+		}
+		reqPath = "/_security/service/" + ns + "/" + svc + "/credential/token"
+
+	case "security.get_service_accounts":
+		method = http.MethodGet
+		ns := popString("namespace")
+		svc := popString("service")
+		switch {
+		case ns != "" && svc != "":
+			reqPath = "/_security/service/" + ns + "/" + svc
+		case ns != "":
+			reqPath = "/_security/service/" + ns
+		default:
+			reqPath = "/_security/service"
+		}
+
+	case "security.get_service_credentials":
+		method = http.MethodGet
+		ns := popString("namespace")
+		svc := popString("service")
+		if ns == "" || svc == "" {
+			return nil, fmt.Errorf("security.get_service_credentials requires namespace and service parameters")
+		}
+		reqPath = "/_security/service/" + ns + "/" + svc + "/credential"
+
+	case "security.get_token":
+		method = http.MethodPost
+		reqPath = "/_security/oauth2/token"
+
+	case "security.invalidate_token":
+		method = http.MethodDelete
+		reqPath = "/_security/oauth2/token"
+
+	case "logstash.put_pipeline":
+		method = http.MethodPut
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("logstash.put_pipeline requires id parameter")
+		}
+		reqPath = "/_logstash/pipeline/" + id
+
+	case "logstash.get_pipeline":
+		method = http.MethodGet
+		if id := popString("id"); id != "" {
+			reqPath = "/_logstash/pipeline/" + id
+		} else {
+			reqPath = "/_logstash/pipeline"
+		}
+
+	case "logstash.delete_pipeline":
+		method = http.MethodDelete
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("logstash.delete_pipeline requires id parameter")
+		}
+		reqPath = "/_logstash/pipeline/" + id
+
 	default:
 		return nil, fmt.Errorf("unsupported rest-api-spec action %q", action)
 	}
@@ -2587,6 +3353,15 @@ func joinParamValue(v any) string {
 func paramString(m map[string]any, key string) string {
 	if v, ok := m[key]; ok && v != nil {
 		return joinParamValue(v)
+	}
+	return ""
+}
+
+func firstNonEmptyParam(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if s := paramString(m, k); s != "" {
+			return s
+		}
 	}
 	return ""
 }
@@ -2732,6 +3507,20 @@ func (c *runnerContext) expandStashString(s string) string {
 	})
 }
 
+func (c *runnerContext) expandStashPath(s string) string {
+	if !strings.Contains(s, "$") {
+		return s
+	}
+	return reStashVar.ReplaceAllStringFunc(s, func(match string) string {
+		key := match[1:]
+		if sv, ok := c.stash[key]; ok {
+			strVal := fmt.Sprintf("%v", sv)
+			return strings.ReplaceAll(strVal, ".", `\.`)
+		}
+		return match
+	})
+}
+
 func (c *runnerContext) execSkip(rawVal any) error {
 	pairs, err := extractFieldPairs("skip", rawVal)
 	if err != nil {
@@ -2837,7 +3626,7 @@ func (c *runnerContext) execSet(rawVal any) error {
 		return err
 	}
 	for _, p := range pairs {
-		fieldPath := c.expandStashString(p.Key)
+		fieldPath := c.expandStashPath(p.Key)
 		stashVar := fmt.Sprintf("%v", p.Value)
 		stashVar = strings.TrimPrefix(stashVar, "$")
 		val, found := c.lookupResponsePath(fieldPath)
@@ -2874,7 +3663,7 @@ func (c *runnerContext) execTransformAndSet(rawVal any) error {
 		m := reTransformExpr.FindStringSubmatch(exprStr)
 		fnName := m[1]
 		rawPath := strings.TrimSpace(m[2])
-		fieldPath := c.expandStashString(rawPath)
+		fieldPath := c.expandStashPath(rawPath)
 
 		val, found := c.lookupResponsePath(fieldPath)
 		if !found && strings.HasPrefix(rawPath, "$") {
@@ -2934,7 +3723,7 @@ func (c *runnerContext) execContains(rawVal any) error {
 		return err
 	}
 	for _, p := range pairs {
-		fieldPath := c.expandStashString(p.Key)
+		fieldPath := c.expandStashPath(p.Key)
 		expected := ToNative(c.expandStash(p.Value))
 		actual, found := c.lookupResponsePath(fieldPath)
 		if !found {
@@ -3007,7 +3796,7 @@ func (c *runnerContext) execMatch(rawVal any) error {
 		return err
 	}
 	for _, p := range pairs {
-		fieldPath := c.expandStashString(p.Key)
+		fieldPath := c.expandStashPath(p.Key)
 		expected := ToNative(c.expandStash(p.Value))
 		actual, found := c.lookupResponsePath(fieldPath)
 		if !found {
@@ -3110,7 +3899,7 @@ func valuesEqual(a, b any) bool {
 func (c *runnerContext) execIsTrue(rawVal any) error {
 	fieldPath := ""
 	if rawVal != nil {
-		fieldPath = c.expandStashString(fmt.Sprintf("%v", rawVal))
+		fieldPath = c.expandStashPath(fmt.Sprintf("%v", rawVal))
 	}
 	if fieldPath == "" {
 		if c.lastMethod == http.MethodHead {
@@ -3134,7 +3923,7 @@ func (c *runnerContext) execIsTrue(rawVal any) error {
 func (c *runnerContext) execIsFalse(rawVal any) error {
 	fieldPath := ""
 	if rawVal != nil {
-		fieldPath = c.expandStashString(fmt.Sprintf("%v", rawVal))
+		fieldPath = c.expandStashPath(fmt.Sprintf("%v", rawVal))
 	}
 	if fieldPath == "" {
 		if c.lastMethod == http.MethodHead {
@@ -3181,12 +3970,11 @@ func (c *runnerContext) execLength(rawVal any) error {
 		return err
 	}
 	for _, p := range pairs {
-		fieldPath := c.expandStashString(p.Key)
-		expFloat, ok := toFloat64(c.expandStash(p.Value))
+		fieldPath := c.expandStashPath(p.Key)
+		expLen, ok := toInt(c.expandStash(p.Value))
 		if !ok {
 			return fmt.Errorf("length %q: expected integer length, got %v", fieldPath, p.Value)
 		}
-		expLen := int(expFloat)
 
 		val, found := c.lookupResponsePath(fieldPath)
 		if !found {
@@ -3195,7 +3983,7 @@ func (c *runnerContext) execLength(rawVal any) error {
 		var actLen int
 		switch tv := val.(type) {
 		case string:
-			actLen = len(tv)
+			actLen = utf8.RuneCountInString(tv)
 		case []any:
 			actLen = len(tv)
 		case map[string]any:
@@ -3216,7 +4004,7 @@ func (c *runnerContext) execCompare(op string, rawVal any) error {
 		return err
 	}
 	for _, p := range pairs {
-		fieldPath := c.expandStashString(p.Key)
+		fieldPath := c.expandStashPath(p.Key)
 		threshold, ok := toFloat64(c.expandStash(p.Value))
 		if !ok {
 			return fmt.Errorf("%s %q: threshold %v is not a number", op, fieldPath, p.Value)
@@ -3245,6 +4033,36 @@ func (c *runnerContext) execCompare(op string, rawVal any) error {
 		}
 	}
 	return nil
+}
+
+func toInt(v any) (int, bool) {
+	switch val := v.(type) {
+	case int:
+		return val, true
+	case int64:
+		return int(val), true
+	case float64:
+		return int(val), true
+	case json.Number:
+		if iv, err := val.Int64(); err == nil {
+			return int(iv), true
+		}
+		if fv, err := val.Float64(); err == nil {
+			return int(fv), true
+		}
+		return 0, false
+	case string:
+		trimmed := strings.TrimSpace(val)
+		if iv, err := strconv.Atoi(trimmed); err == nil {
+			return iv, true
+		}
+		if fv, err := strconv.ParseFloat(trimmed, 64); err == nil {
+			return int(fv), true
+		}
+		return 0, false
+	default:
+		return 0, false
+	}
 }
 
 func toFloat64(v any) (float64, bool) {
@@ -3319,6 +4137,36 @@ func (c *runnerContext) lookupResponsePath(rawPath string) (any, bool) {
 		case map[string]any:
 			next, exists := node[seg]
 			if !exists {
+				if len(segments) == 1 && strings.Contains(seg, ".") {
+					subCur := any(node)
+					subFound := true
+					for _, subSeg := range strings.Split(seg, ".") {
+						switch sn := subCur.(type) {
+						case map[string]any:
+							sv, ok := sn[subSeg]
+							if !ok {
+								subFound = false
+							} else {
+								subCur = sv
+							}
+						case []any:
+							idx, err := strconv.Atoi(subSeg)
+							if err != nil || idx < 0 || idx >= len(sn) {
+								subFound = false
+							} else {
+								subCur = sn[idx]
+							}
+						default:
+							subFound = false
+						}
+						if !subFound {
+							break
+						}
+					}
+					if subFound {
+						return subCur, true
+					}
+				}
 				return nil, false
 			}
 			cur = next

@@ -4320,3 +4320,684 @@ func TestRound52F20ToF26Features(t *testing.T) {
 		}
 	})
 }
+
+func TestRound53F20ToF26Features(t *testing.T) {
+	runDoc := func(t *testing.T, script string, doc map[string]any) any {
+		t.Helper()
+		if doc == nil {
+			doc = map[string]any{}
+		}
+		if _, err := Eval(doc, script, map[string]any{"p1": 10}); err != nil {
+			t.Fatalf("unexpected error for script:\n%s\nerr: %v", script, err)
+		}
+		return doc["out"]
+	}
+
+	t.Run("F20_BigInteger_MathContext_BigDecimal", func(t *testing.T) {
+		got := runDoc(t, `
+			BigInteger b0 = BigInteger.ZERO;
+			BigInteger b1 = BigInteger.ONE;
+			BigInteger b2 = BigInteger.TWO;
+			BigInteger b10 = BigInteger.TEN;
+			BigInteger bVal = BigInteger.valueOf(255L);
+			BigInteger bHex = new BigInteger("ff", 16);
+			BigInteger bDec = new BigInteger("100");
+			byte[] rawBytes = new byte[] { (byte)1, (byte)0 };
+			BigInteger bFromBytes = new BigInteger(rawBytes);
+
+			BigInteger sum = bVal.add(b1);
+			BigInteger diff = sum.subtract(b10);
+			BigInteger prod = bDec.multiply(b2);
+			BigInteger quot = prod.divide(b10);
+			BigInteger rem = bVal.remainder(b10);
+			BigInteger[] dr = bVal.divideAndRemainder(b10);
+			BigInteger modVal = new BigInteger("-7").mod(b10);
+			BigInteger modPowVal = b2.modPow(BigInteger.valueOf(8), BigInteger.valueOf(257));
+			BigInteger modInvVal = BigInteger.valueOf(3).modInverse(b10);
+			BigInteger powVal = b2.pow(10);
+			BigInteger gcdVal = BigInteger.valueOf(48).gcd(BigInteger.valueOf(18));
+			BigInteger absVal = new BigInteger("-42").abs();
+			BigInteger negVal = b10.negate();
+			int sig = negVal.signum();
+			BigInteger minVal = b10.min(bVal);
+			BigInteger maxVal = b10.max(bVal);
+			int cmp = bVal.compareTo(bHex);
+
+			BigInteger bwAnd = bVal.and(BigInteger.valueOf(15));
+			BigInteger bwOr = BigInteger.valueOf(240).or(BigInteger.valueOf(15));
+			BigInteger bwXor = bVal.xor(BigInteger.valueOf(15));
+			BigInteger bwNot = b0.not();
+			BigInteger bwAndNot = bVal.andNot(BigInteger.valueOf(15));
+			BigInteger shl = b1.shiftLeft(8);
+			BigInteger shr = shl.shiftRight(4);
+			boolean tb = bVal.testBit(7);
+			BigInteger sb = b0.setBit(3);
+			BigInteger cb = sb.clearBit(3);
+			BigInteger fb = b0.flipBit(2);
+			int lsb = BigInteger.valueOf(12).getLowestSetBit();
+			int blen = bVal.bitLength();
+			int bcnt = bVal.bitCount();
+
+			boolean isPrime = BigInteger.valueOf(17).isProbablePrime(10);
+			BigInteger nextP = BigInteger.valueOf(14).nextProbablePrime();
+			String hexStr = bVal.toString(16);
+			byte[] toB = bFromBytes.toByteArray();
+			long lv = bVal.longValue();
+			long lve = bVal.longValueExact();
+			int ive = bVal.intValueExact();
+			short sve = bVal.shortValueExact();
+			byte bve = BigInteger.valueOf(127).byteValueExact();
+			double dv = bVal.doubleValue();
+			float fv = bVal.floatValue();
+
+			MathContext mc32 = MathContext.DECIMAL32;
+			MathContext mc64 = MathContext.DECIMAL64;
+			MathContext mc128 = MathContext.DECIMAL128;
+			MathContext mcUnl = MathContext.UNLIMITED;
+			MathContext mcCustom = new MathContext(4, RoundingMode.HALF_UP);
+			MathContext mcStr = new MathContext("precision=5 roundingMode=DOWN");
+
+			BigDecimal bd1 = new BigDecimal("123.456");
+			BigDecimal bd2 = new BigDecimal("10.0");
+			BigDecimal bdAddMc = bd1.add(bd2, mcCustom);
+			BigDecimal bdSubMc = bd1.subtract(bd2, mcCustom);
+			BigDecimal bdMulMc = bd1.multiply(bd2, mcCustom);
+			BigDecimal bdDivMc = new BigDecimal("1").divide(new BigDecimal("3"), mc32);
+			BigDecimal bdPowMc = new BigDecimal("1.5").pow(2, mcCustom);
+			BigDecimal bdPlus = bd1.plus();
+			BigDecimal bdRound = bd1.round(mcCustom);
+			int bdPrec = bd1.precision();
+			BigInteger bdUnscaled = bd1.unscaledValue();
+			BigDecimal bdMoveL = bd1.movePointLeft(1);
+			BigDecimal bdMoveR = bd1.movePointRight(1);
+			BigDecimal bdScaleP = new BigDecimal("12").scaleByPowerOfTen(2);
+			BigDecimal bdIntDiv = new BigDecimal("17").divideToIntegralValue(new BigDecimal("5"));
+			BigDecimal[] bdDr = new BigDecimal("17").divideAndRemainder(new BigDecimal("5"));
+			BigInteger bdBiExact = new BigDecimal("42.00").toBigIntegerExact();
+			long bdLongExact = new BigDecimal("9007199254740993").longValueExact();
+			int bdIntExact = new BigDecimal("42.0").intValueExact();
+			short bdShortExact = new BigDecimal("300").shortValueExact();
+			byte bdByteExact = new BigDecimal("120").byteValueExact();
+
+			boolean errBiByteOob = false;
+			try { BigInteger.valueOf(200).byteValueExact(); } catch (ArithmeticException e) { errBiByteOob = true; }
+			boolean errBdFracExact = false;
+			try { new BigDecimal("1.5").intValueExact(); } catch (ArithmeticException e) { errBdFracExact = true; }
+
+			ctx._source.out = [
+				'sum': sum.longValue(),
+				'diff': diff.longValue(),
+				'prod': prod.longValue(),
+				'quot': quot.longValue(),
+				'rem': rem.longValue(),
+				'dr0': dr[0].longValue(),
+				'dr1': dr[1].longValue(),
+				'modVal': modVal.longValue(),
+				'modPowVal': modPowVal.longValue(),
+				'modInvVal': modInvVal.longValue(),
+				'powVal': powVal.longValue(),
+				'gcdVal': gcdVal.longValue(),
+				'absVal': absVal.longValue(),
+				'negVal': negVal.longValue(),
+				'sig': sig,
+				'minVal': minVal.longValue(),
+				'maxVal': maxVal.longValue(),
+				'cmp': cmp,
+				'bw': [bwAnd.longValue(), bwOr.longValue(), bwXor.longValue(), bwNot.longValue(), bwAndNot.longValue(), shl.longValue(), shr.longValue()],
+				'bits': [tb, sb.longValue(), cb.longValue(), fb.longValue(), lsb, blen, bcnt],
+				'prime': [isPrime, nextP.longValue()],
+				'hexStr': hexStr,
+				'toBLen': toB.length,
+				'convs': [lv, lve, ive, sve, bve, dv > 254.0, fv > 254.0],
+				'mc': [mc32.getPrecision(), mc64.getPrecision(), mc128.getPrecision(), mcUnl.getPrecision(), mcCustom.getPrecision(), mcStr.getPrecision()],
+				'bd': [bdAddMc.toString(), bdSubMc.toString(), bdMulMc.toString(), bdDivMc.toString(), bdPowMc.toString(), bdPlus.toString(), bdRound.toString(), bdPrec, bdUnscaled.longValue(), bdMoveL.toString(), bdMoveR.toString(), bdScaleP.longValue(), bdIntDiv.longValue(), bdDr[0].longValue(), bdDr[1].longValue(), bdBiExact.longValue(), bdLongExact, bdIntExact, bdShortExact, bdByteExact],
+				'errs': [errBiByteOob, errBdFracExact]
+			];
+		`, map[string]any{})
+		m := got.(map[string]any)
+		if m["sum"] != int64(256) || m["gcdVal"] != int64(6) || m["modInvVal"] != int64(7) || m["hexStr"] != "ff" {
+			t.Fatalf("unexpected BigInteger results: %#v", m)
+		}
+		for i, b := range m["errs"].([]any) {
+			if b != true {
+				t.Fatalf("expected errs[%d] to be true, got %#v", i, m["errs"])
+			}
+		}
+	})
+
+	t.Run("F21_TemporalAdjusters_Until_DatesUntil_ChronoUnitBetween", func(t *testing.T) {
+		got := runDoc(t, `
+			LocalDate d = LocalDate.of(2025, 2, 15);
+			LocalDate fdom = d.with(TemporalAdjusters.firstDayOfMonth());
+			LocalDate ldom = d.with(TemporalAdjusters.lastDayOfMonth());
+			LocalDate fdonm = d.with(TemporalAdjusters.firstDayOfNextMonth());
+			LocalDate fdoy = d.with(TemporalAdjusters.firstDayOfYear());
+			LocalDate ldoy = d.with(TemporalAdjusters.lastDayOfYear());
+			LocalDate fdony = d.with(TemporalAdjusters.firstDayOfNextYear());
+			LocalDate nextMon = d.with(TemporalAdjusters.next(DayOfWeek.MONDAY));
+			LocalDate nextOrSameSat = d.with(TemporalAdjusters.nextOrSame(DayOfWeek.SATURDAY));
+			LocalDate prevFri = d.with(TemporalAdjusters.previous(DayOfWeek.FRIDAY));
+			LocalDate prevOrSameSat = d.with(TemporalAdjusters.previousOrSame(DayOfWeek.SATURDAY));
+			LocalDate firstMon = d.with(TemporalAdjusters.firstInMonth(DayOfWeek.MONDAY));
+			LocalDate lastFri = d.with(TemporalAdjusters.lastInMonth(DayOfWeek.FRIDAY));
+			LocalDate secondWed = d.with(TemporalAdjusters.dayOfWeekInMonth(2, DayOfWeek.WEDNESDAY));
+
+			LocalDate wField = d.with(ChronoField.MONTH_OF_YEAR, 5);
+			LocalDate dEnd = LocalDate.of(2025, 2, 20);
+			long daysUntil = d.until(dEnd, ChronoUnit.DAYS);
+			Period pUntil = d.until(LocalDate.of(2025, 4, 18));
+			List du1 = d.datesUntil(LocalDate.of(2025, 2, 18)).collect(Collectors.toList());
+			List du2 = d.datesUntil(LocalDate.of(2025, 5, 15), Period.ofMonths(1)).collect(Collectors.toList());
+
+			long cuDays = ChronoUnit.DAYS.between(d, dEnd);
+			long cuMonths = ChronoUnit.MONTHS.between(LocalDate.of(2025, 1, 1), LocalDate.of(2025, 6, 1));
+			long cuYears = ChronoUnit.YEARS.between(LocalDate.of(2020, 1, 1), LocalDate.of(2025, 1, 1));
+			long cuWeeks = ChronoUnit.WEEKS.between(LocalDate.of(2025, 1, 1), LocalDate.of(2025, 1, 22));
+			long cuDecades = ChronoUnit.DECADES.between(LocalDate.of(2000, 1, 1), LocalDate.of(2025, 1, 1));
+			long cuCenturies = ChronoUnit.CENTURIES.between(LocalDate.of(1800, 1, 1), LocalDate.of(2025, 1, 1));
+			long cuMillennia = ChronoUnit.MILLENNIA.between(LocalDate.of(1000, 1, 1), LocalDate.of(2025, 1, 1));
+			LocalDateTime dt1 = LocalDateTime.of(2025, 2, 15, 10, 0, 0);
+			LocalDateTime dt2 = LocalDateTime.of(2025, 2, 16, 12, 30, 45);
+			long cuNanos = ChronoUnit.NANOS.between(dt1, dt2);
+			long cuMicros = ChronoUnit.MICROS.between(dt1, dt2);
+			long cuMillis = ChronoUnit.MILLIS.between(dt1, dt2);
+			long cuSecs = ChronoUnit.SECONDS.between(dt1, dt2);
+			long cuMins = ChronoUnit.MINUTES.between(dt1, dt2);
+			long cuHours = ChronoUnit.HOURS.between(dt1, dt2);
+			long cuHalfDays = ChronoUnit.HALF_DAYS.between(dt1, dt2);
+			long yBetween1 = ChronoUnit.YEARS.between(Year.of(2000), Year.of(2025));
+			long yBetween10 = ChronoUnit.DECADES.between(Year.of(2000), Year.of(2025));
+			long yBetween100 = ChronoUnit.CENTURIES.between(Year.of(1800), Year.of(2025));
+			long yBetween1000 = ChronoUnit.MILLENNIA.between(Year.of(1000), Year.of(2025));
+
+			LocalDate dowZero = d.with(TemporalAdjusters.dayOfWeekInMonth(0, DayOfWeek.MONDAY));
+			LocalDate dowNeg = d.with(TemporalAdjusters.dayOfWeekInMonth(-1, DayOfWeek.MONDAY));
+			LocalDate wYear = d.with(Year.of(2026));
+			LocalDate wMd = d.with(MonthDay.of(3, 10));
+			LocalDate wYm = d.with(YearMonth.of(2025, 8));
+			LocalDate wLd = d.with(LocalDate.of(2025, 9, 1));
+			LocalDateTime wLt = dt1.with(LocalTime.of(14, 20, 0));
+			LocalDate wDowTue = d.with(DayOfWeek.TUESDAY);
+			LocalDate wDowWed = d.with(DayOfWeek.WEDNESDAY);
+			LocalDate wDowThu = d.with(DayOfWeek.THURSDAY);
+			LocalDate wDowFri = d.with(DayOfWeek.FRIDAY);
+			LocalDate wDowSat = d.with(DayOfWeek.SATURDAY);
+			LocalDate wDowSun = d.with(DayOfWeek.SUNDAY);
+			LocalDate wJan = d.with(Month.JANUARY);
+			LocalDate wFeb = d.with(Month.FEBRUARY);
+			LocalDate wMar = d.with(Month.MARCH);
+			LocalDate wApr = d.with(Month.APRIL);
+			LocalDate wMay = d.with(Month.MAY);
+			LocalDate wJun = d.with(Month.JUNE);
+			LocalDate wJul = d.with(Month.JULY);
+			LocalDate wAug = d.with(Month.AUGUST);
+			LocalDate wSep = d.with(Month.SEPTEMBER);
+			LocalDate wOct = d.with(Month.OCTOBER);
+			LocalDate wNov = d.with(Month.NOVEMBER);
+			LocalDate wDec = d.with(Month.DECEMBER);
+			Period pUntilBorrow = d.until(LocalDate.of(2025, 3, 10));
+			Period pUntilNeg = d.until(LocalDate.of(2025, 1, 20));
+
+			ctx._source.out = [
+				'fdom': fdom.toString(),
+				'ldom': ldom.toString(),
+				'fdonm': fdonm.toString(),
+				'fdoy': fdoy.toString(),
+				'ldoy': ldoy.toString(),
+				'fdony': fdony.toString(),
+				'nextMon': nextMon.toString(),
+				'nextOrSameSat': nextOrSameSat.toString(),
+				'prevFri': prevFri.toString(),
+				'prevOrSameSat': prevOrSameSat.toString(),
+				'firstMon': firstMon.toString(),
+				'lastFri': lastFri.toString(),
+				'secondWed': secondWed.toString(),
+				'dowZero': dowZero.toString(),
+				'dowNeg': dowNeg.toString(),
+				'wField': wField.toString(),
+				'wExtras': [wYear.toString(), wMd.toString(), wYm.toString(), wLd.toString(), wLt.toString(), wDowTue.toString(), wDowWed.toString(), wDowThu.toString(), wDowFri.toString(), wDowSat.toString(), wDowSun.toString()],
+				'wMonths': [wJan.toString(), wFeb.toString(), wMar.toString(), wApr.toString(), wMay.toString(), wJun.toString(), wJul.toString(), wAug.toString(), wSep.toString(), wOct.toString(), wNov.toString(), wDec.toString()],
+				'daysUntil': daysUntil,
+				'pUntilMonths': pUntil.getMonths(),
+				'pUntilDays': pUntil.getDays(),
+				'pBorrowDays': pUntilBorrow.getDays(),
+				'pNegDays': pUntilNeg.getDays(),
+				'du1Size': du1.size(),
+				'du2Size': du2.size(),
+				'cu': [cuDays, cuMonths, cuYears, cuWeeks, cuDecades, cuCenturies, cuMillennia, cuNanos > 0, cuMicros > 0, cuMillis > 0, cuSecs > 0, cuMins > 0, cuHours, cuHalfDays, yBetween1, yBetween10, yBetween100, yBetween1000]
+			];
+		`, map[string]any{})
+		m := got.(map[string]any)
+		if m["fdom"] != "2025-02-01" || m["ldom"] != "2025-02-28" || m["fdonm"] != "2025-03-01" || m["daysUntil"] != int64(5) || m["du1Size"] != int64(3) || m["du2Size"] != int64(3) {
+			t.Fatalf("unexpected TemporalAdjusters/until results: %#v", m)
+		}
+	})
+
+	t.Run("F22_Comparator_FirstClass", func(t *testing.T) {
+		got := runDoc(t, `
+			Comparator nat = Comparator.naturalOrder();
+			Comparator rev = Comparator.reverseOrder();
+			Comparator nf = Comparator.nullsFirst(nat);
+			Comparator nl = Comparator.nullsLast(nat);
+
+			List items = [3, null, 1, 2];
+			items.sort(nf);
+			def nfFirst = items[0];
+			def nfSecond = items[1];
+			items.sort(nl);
+			def nlLast = items[3];
+
+			List words = ["banana", "Apple", "cherry"];
+			words.sort(String.CASE_INSENSITIVE_ORDER);
+
+			List people = [
+				['name': 'Alice', 'age': 30, 'score': 95.5],
+				['name': 'Bob', 'age': 25, 'score': 88.0],
+				['name': 'Charlie', 'age': 25, 'score': 92.0]
+			];
+			Comparator byAgeThenScoreDesc = Comparator.comparingInt(p -> p.age)
+				.thenComparing(Comparator.comparingDouble(p -> p.score).reversed());
+			people.sort(byAgeThenScoreDesc);
+
+			Comparator byNameRev = Comparator.comparing(p -> p.name, Comparator.reverseOrder());
+			int directCmp = byNameRev.compare(people[0], people[1]);
+
+			ctx._source.out = [
+				'nfFirstNull': nfFirst == null,
+				'nfSecond': nfSecond,
+				'nlLastNull': nlLast == null,
+				'words': words,
+				'firstPerson': people[0].name,
+				'secondPerson': people[1].name,
+				'directCmpPos': directCmp < 0
+			];
+		`, map[string]any{})
+		m := got.(map[string]any)
+		if m["nfFirstNull"] != true || m["nfSecond"] != int64(1) || m["nlLastNull"] != true || m["firstPerson"] != "Charlie" || m["secondPerson"] != "Bob" {
+			t.Fatalf("unexpected Comparator results: %#v", m)
+		}
+	})
+
+	t.Run("F23_BitSet_StringJoiner_Character", func(t *testing.T) {
+		got := runDoc(t, `
+			BitSet bs1 = new BitSet();
+			bs1.set(1);
+			bs1.set(3, 6);
+			bs1.clear(4);
+			bs1.flip(0);
+			boolean g0 = bs1.get(0);
+			boolean g2 = bs1.get(2);
+			int card = bs1.cardinality();
+			int len = bs1.length();
+			int nsb = bs1.nextSetBit(2);
+			int ncb = bs1.nextClearBit(0);
+			int psb = bs1.previousSetBit(5);
+			int pcb = bs1.previousClearBit(5);
+
+			BitSet bs2 = BitSet.valueOf(new long[] { 7L });
+			boolean inter = bs1.intersects(bs2);
+			BitSet bsClone = bs1.clone();
+			bsClone.and(bs2);
+			int andCard = bsClone.cardinality();
+			bsClone.or(bs2);
+			int orCard = bsClone.cardinality();
+			bsClone.xor(bs1);
+			bsClone.andNot(bs2);
+			boolean emptyAfter = bsClone.isEmpty();
+			byte[] bsBytes = bs2.toByteArray();
+			long[] bsLongs = bs2.toLongArray();
+			List bsStream = bs2.stream().boxed().collect(Collectors.toList());
+			String bsStr = bs2.toString();
+
+			StringJoiner sjEmpty = new StringJoiner(", ", "[", "]");
+			sjEmpty.setEmptyValue("EMPTY");
+			String emptyStr = sjEmpty.toString();
+			StringJoiner sj = new StringJoiner(", ", "[", "]");
+			sj.add("alpha").add("beta");
+			StringJoiner sj2 = new StringJoiner("-");
+			sj2.add("gamma");
+			sj.merge(sj2);
+			String sjStr = sj.toString();
+			int sjLen = sj.length();
+
+			int cc = Character.charCount(0x1F600);
+			int cmpC = Character.compare((char)'a', (char)'b');
+			char fDig = Character.forDigit(15, 16);
+			int gNum = Character.getNumericValue((char)'9');
+			int gType = Character.getType((char)'A');
+			char highS = Character.highSurrogate(0x1F600);
+			char lowS = Character.lowSurrogate(0x1F600);
+			int cp = Character.toCodePoint(highS, lowS);
+			boolean isAlph = Character.isAlphabetic((int)'Z');
+			boolean isBmp = Character.isBmpCodePoint(65);
+			boolean isIdeog = Character.isIdeographic(0x4E00);
+			boolean isIso = Character.isISOControl(0x07);
+			boolean isJavaStart = Character.isJavaIdentifierStart((char)'$');
+			boolean isJavaPart = Character.isJavaIdentifierPart((char)'9');
+			boolean isLowS = Character.isLowSurrogate(lowS);
+			boolean isHighS = Character.isHighSurrogate(highS);
+			boolean isMirr = Character.isMirrored((char)'(');
+			boolean isSupp = Character.isSupplementaryCodePoint(0x1F600);
+			boolean isSurr = Character.isSurrogate(highS);
+			boolean isSurrPair = Character.isSurrogatePair(highS, lowS);
+			boolean isTitle = Character.isTitleCase((char)'\u01C5');
+			boolean isValidCp = Character.isValidCodePoint(0x10FFFF);
+			char revB = Character.reverseBytes((char)0x1234);
+			char[] toC = Character.toChars(0x1F600);
+			String cStr = Character.toString((char)'X');
+			int cHash = Character.hashCode((char)'A');
+			String cName = Character.getName(65);
+			int cpa0 = Character.codePointAt("A\uD83D\uDE00B", 0);
+			int cpa1 = Character.codePointAt("A\uD83D\uDE00B", 1);
+			int cpb1 = Character.codePointBefore("A\uD83D\uDE00B", 1);
+			int cpb3 = Character.codePointBefore("A\uD83D\uDE00B", 3);
+			int cpc = Character.codePointCount("A\uD83D\uDE00B", 0, 4);
+			int gn1 = Character.getNumericValue((char)'a');
+			int gn2 = Character.getNumericValue((char)'F');
+			int gn3 = Character.getNumericValue((char)'\uFF15');
+			int gn4 = Character.getNumericValue((char)'\uFF22');
+			int gn5 = Character.getNumericValue((char)'\uFF42');
+			int gn6 = Character.getNumericValue((char)'\u0663');
+			int gn7 = Character.getNumericValue((char)'\u2155');
+			int gn8 = Character.getNumericValue((char)'!');
+			List gTypes = [
+				Character.getType((char)'A'), Character.getType((char)'a'), Character.getType((char)'\u01C5'),
+				Character.getType((char)'\u02B0'), Character.getType((char)'\u4E00'), Character.getType((char)'\u0300'),
+				Character.getType((char)'\u20DD'), Character.getType((char)'\u0903'), Character.getType((char)'5'),
+				Character.getType((char)'\u2164'), Character.getType((char)'\u00B2'), Character.getType((char)' '),
+				Character.getType((char)'\u2028'), Character.getType((char)'\u2029'), Character.getType((char)'\n'),
+				Character.getType((char)'\u200B'), Character.getType((char)'\uE000'), Character.getType((char)'-'),
+				Character.getType((char)'('), Character.getType((char)')'), Character.getType((char)'_'),
+				Character.getType((char)'.'), Character.getType((char)'+'), Character.getType((char)'$'),
+				Character.getType((char)'^'), Character.getType((char)'\u00A9'), Character.getType((char)'\u00AB'),
+				Character.getType((char)'\u00BB')
+			];
+			List chPreds = [
+				Character.isDigit((char)'5'), Character.isLetter((char)'a'), Character.isLetterOrDigit((char)'5'),
+				Character.isWhitespace((char)' '), Character.isWhitespace((char)'\u00A0'), Character.isSpaceChar((char)' '),
+				Character.isUpperCase((char)'A'), Character.isLowerCase((char)'a'), Character.isDefined((char)'A'),
+				Character.toUpperCase((char)'a'), Character.toUpperCase(97),
+				Character.toLowerCase((char)'A'), Character.toLowerCase(65),
+				Character.toTitleCase((char)'a'), Character.toTitleCase(97),
+				Character.digit((char)'f', 16), Character.digit((char)'F', 16), Character.digit((char)'5', 10), Character.digit((char)'z', 10),
+				Character.forDigit(5, 10), Character.forDigit(99, 10)
+			];
+
+			ctx._source.out = [
+				'bs': [g0, g2, card, len, nsb, ncb, psb, pcb, inter, andCard, orCard, emptyAfter, bsBytes.length, bsLongs.length, bsStream.size(), bsStr],
+				'sj': [emptyStr, sjStr, sjLen],
+				'ch': [cc, cmpC < 0, String.valueOf(fDig), gNum, gType > 0, cp == 0x1F600, isAlph, isBmp, isIdeog, isIso, isJavaStart, isJavaPart, isLowS, isHighS, isMirr, isSupp, isSurr, isSurrPair, isTitle, isValidCp, (int)revB == 0x3412, toC.length, cStr, cHash == 65, cName.length() > 0, cpa0, cpa1, cpb1, cpb3, cpc, gn1, gn2, gn3, gn4, gn5, gn6, gn7, gn8, gTypes.size(), chPreds.size()]
+			];
+		`, map[string]any{})
+		m := got.(map[string]any)
+		sj := m["sj"].([]any)
+		if sj[0] != "EMPTY" || sj[1] != "[alpha, beta, gamma]" || sj[2] != int64(20) {
+			t.Fatalf("unexpected StringJoiner results: %#v", sj)
+		}
+	})
+
+	t.Run("F24_UserDefinedClasses", func(t *testing.T) {
+		got := runDoc(t, `
+			class Counter {
+				int count = 1;
+				String label;
+
+				Counter(String label) {
+					this.label = label;
+				}
+
+				Counter(String label, int initial) {
+					this.label = label;
+					this.count = initial;
+				}
+
+				int increment(int delta) {
+					this.count += delta;
+					return this.count;
+				}
+
+				int doubleCount() {
+					return this.increment(this.count);
+				}
+
+				String describe() {
+					return this.label + ":" + this.count;
+				}
+			}
+
+			Counter c1 = new Counter("first");
+			c1.increment(4);
+			c1.count++;
+			Counter c2 = new Counter("second", 10);
+			int d2 = c2.doubleCount();
+
+			ctx._source.out = [
+				'c1Desc': c1.describe(),
+				'c1Count': c1.count,
+				'c2Desc': c2.describe(),
+				'd2': d2
+			];
+		`, map[string]any{})
+		m := got.(map[string]any)
+		if m["c1Desc"] != "first:6" || m["c1Count"] != int64(6) || m["c2Desc"] != "second:20" || m["d2"] != int64(20) {
+			t.Fatalf("unexpected user class results: %#v", m)
+		}
+	})
+
+	t.Run("F25_MultiDimArrays_ArraysBulkOps", func(t *testing.T) {
+		got := runDoc(t, `
+			int[][] grid = new int[2][3];
+			grid[0][1] = 7;
+			grid[1][2] = 9;
+			int[][] litGrid = new int[][] { {1, 2}, {3, 4} };
+
+			int[] arr = new int[4];
+			Arrays.setAll(arr, i -> (i + 1) * 10);
+			int[] parr = new int[4];
+			Arrays.parallelSetAll(parr, i -> i + 1);
+			Arrays.parallelPrefix(parr, (a, b) -> a + b);
+
+			int[] a1 = new int[] {1, 2, 3};
+			int[] a2 = new int[] {1, 2, 4};
+			int cmp = Arrays.compare(a1, a2);
+			int mis = Arrays.mismatch(a1, a2);
+			int misEq = Arrays.mismatch(a1, new int[] {1, 2, 3});
+			int cmpRangeEq = Arrays.compare(a1, 0, 2, a2, 0, 2);
+			int cmpRangeRev = Arrays.compare(a1, 0, 3, a2, 0, 3, Comparator.reverseOrder());
+			int misRange = Arrays.mismatch(a1, 0, 3, a2, 0, 3);
+			int misRangePrefix = Arrays.mismatch(a1, 0, 2, a2, 0, 3, Comparator.naturalOrder());
+			int cmpNulls = Arrays.compare(null, null);
+			int cmpNullLeft = Arrays.compare(null, a1);
+			int cmpNullRight = Arrays.compare(a1, null);
+			int misNulls = Arrays.mismatch(null, null);
+
+			ctx._source.out = [
+				'g01': grid[0][1],
+				'g12': grid[1][2],
+				'lit11': litGrid[1][1],
+				'arr': [arr[0], arr[1], arr[2], arr[3]],
+				'parr': [parr[0], parr[1], parr[2], parr[3]],
+				'cmpNeg': cmp < 0,
+				'mis': mis,
+				'misEq': misEq,
+				'ranges': [cmpRangeEq, cmpRangeRev > 0, misRange, misRangePrefix, cmpNulls, cmpNullLeft < 0, cmpNullRight > 0, misNulls]
+			];
+		`, map[string]any{})
+		m := got.(map[string]any)
+		if m["g01"] != int64(7) || m["g12"] != int64(9) || m["lit11"] != int64(4) || m["mis"] != int64(2) || m["misEq"] != int64(-1) {
+			t.Fatalf("unexpected multi-dim/Arrays results: %#v", m)
+		}
+	})
+
+	t.Run("F26_CtxMapMethods_And_ChainedMutationWriteBack", func(t *testing.T) {
+		got := runDoc(t, `
+			ctx._source.tags = ['a', 'b'];
+			ctx._source.get('tags').add('c');
+			ctx._source.get('tags').add(0, 'z');
+			ctx._source.get('tags').addAll(['m', 'n']);
+			ctx._source.get('tags').addAll(1, ['p', 'q']);
+			ctx._source.get('tags').set(0, 'first');
+			ctx._source.get('tags').remove(1);
+			ctx._source.get('tags').removeAll(['p', 'q', 'm']);
+			ctx._source.get('tags').removeIf(x -> x == 'n');
+			ctx._source.get('tags').remove(0);
+
+			StringBuilder sb = new StringBuilder("abcdef");
+			sb.delete(1, 3);
+			Optional optM = Optional.of("hello").map(s -> s.toUpperCase());
+			LocalDateTime ldtAt = LocalDate.of(2025, 1, 2).atTime(10, 20, 30, 400);
+
+			ctx._source.nested = ['k1': 10, 'k2': 20];
+			boolean hasVal = ctx._source.nested.containsValue(20);
+			ctx._source.nested.replaceAll((k, v) -> v + 5);
+			def compVal = ctx._source.nested.compute('k1', (k, v) -> v * 2);
+			def ciaList = ctx._source.nested.computeIfAbsent('items', k -> new ArrayList());
+			ciaList.add('x');
+			ctx._source.nested.computeIfAbsent('items', k -> new ArrayList()).add('y');
+			def cipVal = ctx._source.nested.computeIfPresent('k2', (k, v) -> v + 100);
+			def mrgVal = ctx._source.nested.merge('k3', 50, (oldV, newV) -> oldV + newV);
+			def mrgVal2 = ctx._source.nested.merge('k3', 25, (oldV, newV) -> oldV + newV);
+
+			List seenKeys = new ArrayList();
+			ctx._source.nested.forEach((k, v) -> seenKeys.add(k));
+			int ksSize = ctx._source.nested.keySet().size();
+			int vsSize = ctx._source.nested.values().size();
+			int esSize = ctx._source.nested.entrySet().size();
+
+			Map tempMap = ['x': 1];
+			boolean beforeClear = tempMap.isEmpty();
+			tempMap.clear();
+			boolean afterClear = tempMap.isEmpty();
+
+			ctx._source.out = [
+				'tags': ctx._source.tags,
+				'hasVal': hasVal,
+				'compVal': compVal,
+				'items': ctx._source.nested.items,
+				'cipVal': cipVal,
+				'mrgVal2': mrgVal2,
+				'seenCount': seenKeys.size(),
+				'sizes': [ksSize, vsSize, esSize],
+				'clear': [!beforeClear, afterClear]
+			];
+		`, map[string]any{})
+		m := got.(map[string]any)
+		tags := m["tags"].([]any)
+		items := m["items"].([]any)
+		if len(tags) != 3 || tags[2] != "c" || len(items) != 2 || items[0] != "x" || items[1] != "y" || m["mrgVal2"] != int64(75) {
+			t.Fatalf("unexpected F26 map/chained mutation results: %#v", m)
+		}
+	})
+
+	t.Run("F20_F22_F23_ExtendedBranches", func(t *testing.T) {
+		got := runDoc(t, `
+			MathContext mc2 = new MathContext(2, RoundingMode.HALF_UP);
+			BigDecimal bd10 = new BigDecimal("10.00");
+			BigDecimal bd4 = new BigDecimal("4.00");
+			BigDecimal bdNeg = new BigDecimal("-123.45");
+			BigDecimal div1 = bd10.divide(new BigDecimal("2"));
+			BigDecimal div2Mode = bd10.divide(new BigDecimal("3"), RoundingMode.DOWN);
+			BigDecimal div2Scale = bd10.divide(new BigDecimal("4"), 2);
+			BigDecimal div3 = bd10.divide(new BigDecimal("3"), 2, RoundingMode.HALF_UP);
+			BigDecimal rem1 = bd10.remainder(new BigDecimal("3"));
+			BigDecimal remMc = bd10.remainder(new BigDecimal("3"), mc2);
+			BigDecimal sc1 = new BigDecimal("5.00").setScale(1);
+			BigDecimal sc2 = new BigDecimal("5.55").setScale(1, RoundingMode.DOWN);
+			BigDecimal min1 = bd10.min(bd4);
+			BigDecimal min2 = bd4.min(bd10);
+			BigDecimal max1 = bd10.max(bd4);
+			BigDecimal max2 = bd4.max(bd10);
+			BigDecimal absMc = bdNeg.abs(mc2);
+			BigDecimal negMc = bd10.negate(mc2);
+			boolean errBdDiv0 = false;
+			try { bd10.divide(BigDecimal.ZERO); } catch (ArithmeticException e) { errBdDiv0 = true; }
+			boolean errBdRem0 = false;
+			try { bd10.remainder(BigDecimal.ZERO); } catch (ArithmeticException e) { errBdRem0 = true; }
+			boolean errBdPowNeg = false;
+			try { bd10.pow(-1); } catch (ArithmeticException e) { errBdPowNeg = true; }
+
+			BigInteger bi10 = BigInteger.valueOf(10);
+			BigInteger bi3 = BigInteger.valueOf(3);
+			BigInteger biMin1 = bi10.min(bi3);
+			BigInteger biMin2 = bi3.min(bi10);
+			BigInteger biMax1 = bi10.max(bi3);
+			BigInteger biMax2 = bi3.max(bi10);
+			BigInteger biGcd0A = BigInteger.ZERO.gcd(bi10);
+			BigInteger biGcd0B = bi10.gcd(BigInteger.ZERO);
+			BigInteger biModPow1 = bi10.modPow(bi3, BigInteger.ONE);
+			BigInteger biModPowNeg = bi3.modPow(BigInteger.valueOf(-1), BigInteger.valueOf(10));
+			BigInteger biModInv1 = bi10.modInverse(BigInteger.ONE);
+			BigInteger biShlNeg = BigInteger.valueOf(8).shiftLeft(-1);
+			BigInteger biShrNeg = BigInteger.valueOf(4).shiftRight(-1);
+			BigInteger biFlip1 = BigInteger.valueOf(3).flipBit(0);
+			boolean pCert0 = bi10.isProbablePrime(0);
+			boolean pZero = BigInteger.ZERO.isProbablePrime(10);
+			boolean pHigh = BigInteger.valueOf(7).isProbablePrime(120);
+			String biStr10 = bi10.toString();
+			String biStrBadRadix = bi10.toString(1);
+			boolean errBiDiv0 = false;
+			try { bi10.divide(BigInteger.ZERO); } catch (ArithmeticException e) { errBiDiv0 = true; }
+			boolean errBiRem0 = false;
+			try { bi10.remainder(BigInteger.ZERO); } catch (ArithmeticException e) { errBiRem0 = true; }
+			boolean errBiDr0 = false;
+			try { bi10.divideAndRemainder(BigInteger.ZERO); } catch (ArithmeticException e) { errBiDr0 = true; }
+			boolean errBiModNeg = false;
+			try { bi10.mod(BigInteger.valueOf(-3)); } catch (ArithmeticException e) { errBiModNeg = true; }
+			boolean errBiModPowNotInv = false;
+			try { BigInteger.valueOf(4).modPow(BigInteger.valueOf(-1), BigInteger.valueOf(6)); } catch (ArithmeticException e) { errBiModPowNotInv = true; }
+			boolean errBiModInvNotInv = false;
+			try { BigInteger.valueOf(4).modInverse(BigInteger.valueOf(6)); } catch (ArithmeticException e) { errBiModInvNotInv = true; }
+			boolean errBiPowNeg = false;
+			try { bi10.pow(-2); } catch (ArithmeticException e) { errBiPowNeg = true; }
+			boolean errBiBitNeg = false;
+			try { bi10.testBit(-1); } catch (ArithmeticException e) { errBiBitNeg = true; }
+
+			BitSet bs = new BitSet();
+			bs.set(1, true);
+			bs.set(1, false);
+			bs.set(2, 5, true);
+			bs.set(3, 4, false);
+			bs.flip(1, 5);
+			bs.clear(1, 3);
+			bs.clear();
+
+			List rows = [
+				['a': 1, 'b': 'y', 'c': 20L, 'd': 1.5],
+				['a': 1, 'b': 'x', 'c': 10L, 'd': 2.5],
+				['a': 1, 'b': 'x', 'c': 10L, 'd': 0.5]
+			];
+			Comparator chainCmp = Comparator.comparingInt(r -> r.a)
+				.thenComparing(r -> r.b, Comparator.naturalOrder())
+				.thenComparing(r -> r.b, (x, y) -> x.compareTo(y))
+				.thenComparing(r -> r.b)
+				.thenComparingLong(r -> r.c)
+				.thenComparingDouble(r -> r.d);
+			rows.sort(chainCmp);
+			Comparator nfLambda = Comparator.nullsFirst((x, y) -> x - y);
+			Comparator cmpLambda = Comparator.comparing(r -> r.a, (x, y) -> y - x);
+			int cRes1 = nfLambda.compare(null, 5);
+			int cRes2 = nfLambda.compare(5, null);
+			int cRes3 = nfLambda.compare(null, null);
+			int cRes4 = nfLambda.compare(2, 5);
+			int cRes5 = cmpLambda.compare(rows[0], rows[1]);
+			int[] arrA = new int[] {1, 2};
+			int[] arrB = new int[] {1, 3};
+			int arrCmpL = Arrays.compare(arrA, arrB, (x, y) -> y - x);
+			int arrCmpObj = Arrays.compare(arrA, arrB, Comparator.reverseOrder());
+
+			ctx._source.out = [
+				'bd': [div1.toString(), div2Mode.toString(), div2Scale.toString(), div3.toString(), rem1.toString(), remMc.toString(), sc1.toString(), sc2.toString(), min1.toString(), min2.toString(), max1.toString(), max2.toString(), absMc.toString(), negMc.toString()],
+				'bdErrs': [errBdDiv0, errBdRem0, errBdPowNeg],
+				'bi': [biMin1.longValue(), biMin2.longValue(), biMax1.longValue(), biMax2.longValue(), biGcd0A.longValue(), biGcd0B.longValue(), biModPow1.longValue(), biModPowNeg.longValue(), biModInv1.longValue(), biShlNeg.longValue(), biShrNeg.longValue(), biFlip1.longValue(), pCert0, pZero, pHigh, biStr10, biStrBadRadix],
+				'biErrs': [errBiDiv0, errBiRem0, errBiDr0, errBiModNeg, errBiModPowNotInv, errBiModInvNotInv, errBiPowNeg, errBiBitNeg],
+				'bsEmpty': bs.isEmpty(),
+				'firstRowD': rows[0].d,
+				'cmp': [cRes1 < 0, cRes2 > 0, cRes3 == 0, cRes4 < 0, cRes5 == 0, arrCmpL > 0, arrCmpObj > 0]
+			];
+		`, map[string]any{})
+		m := got.(map[string]any)
+		if m["bsEmpty"] != true || m["firstRowD"] != float64(0.5) {
+			t.Fatalf("unexpected extended branch results: %#v", m)
+		}
+	})
+}

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -373,6 +374,65 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 	repo := strings.TrimSpace(r.PathValue("repository"))
 	snap := strings.TrimSpace(r.PathValue("snapshot"))
 
+	if snap == "_status" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		s.mu.RLock()
+		var targetRepos []string
+		if repo == "_all" || repo == "*" {
+			for rName := range s.snapshotRepos {
+				targetRepos = append(targetRepos, rName)
+			}
+			sort.Strings(targetRepos)
+		} else {
+			for _, pat := range strings.Split(repo, ",") {
+				pat = strings.TrimSpace(pat)
+				if pat == "" {
+					continue
+				}
+				if !strings.ContainsAny(pat, "*?") && !strings.HasPrefix(pat, "-") && pat != "_all" {
+					if _, exists := s.snapshotRepos[pat]; !exists {
+						s.mu.RUnlock()
+						writeESError(w, http.StatusNotFound, "repository_missing_exception", fmt.Sprintf("[%s] missing", pat))
+						return
+					}
+				}
+			}
+			for rName := range s.snapshotRepos {
+				if matchMultiWildcardWithExclusions(repo, rName) {
+					targetRepos = append(targetRepos, rName)
+				}
+			}
+			sort.Strings(targetRepos)
+		}
+		list := make([]any, 0)
+		for _, rName := range targetRepos {
+			bySnap := s.snapshots[rName]
+			names := make([]string, 0, len(bySnap))
+			for k := range bySnap {
+				names = append(names, k)
+			}
+			sort.Strings(names)
+			for _, k := range names {
+				list = append(list, map[string]any{
+					"snapshot":   k,
+					"repository": rName,
+					"uuid":       k + "-uuid",
+					"state":      "SUCCESS",
+					"shards_stats": map[string]any{
+						"initializing": 0,
+						"started":      0,
+						"finalizing":   0,
+						"done":         1,
+						"failed":       0,
+						"total":        1,
+					},
+				})
+			}
+		}
+		s.mu.RUnlock()
+		writeJSON(w, http.StatusOK, map[string]any{"snapshots": list})
+		return
+	}
+
 	s.mu.RLock()
 	_, repoExists := s.snapshotRepos[repo]
 	s.mu.RUnlock()
@@ -387,36 +447,6 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 				"node-1": map[string]any{"name": "doris-es-proxy-node-1"},
 			},
 		})
-		return
-	}
-
-	if snap == "_status" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
-		s.mu.RLock()
-		bySnap := s.snapshots[repo]
-		names := make([]string, 0, len(bySnap))
-		for k := range bySnap {
-			names = append(names, k)
-		}
-		sort.Strings(names)
-		list := make([]any, 0, len(names))
-		for _, k := range names {
-			list = append(list, map[string]any{
-				"snapshot":   k,
-				"repository": repo,
-				"uuid":       k + "-uuid",
-				"state":      "SUCCESS",
-				"shards_stats": map[string]any{
-					"initializing": 0,
-					"started":      0,
-					"finalizing":   0,
-					"done":         1,
-					"failed":       0,
-					"total":        1,
-				},
-			})
-		}
-		s.mu.RUnlock()
-		writeJSON(w, http.StatusOK, map[string]any{"snapshots": list})
 		return
 	}
 
@@ -577,20 +607,38 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 	case http.MethodDelete:
 		s.mu.Lock()
 		bySnap := s.snapshots[repo]
-		for _, pat := range strings.Split(snap, ",") {
-			pat = strings.TrimSpace(pat)
-			if pat == "" {
-				continue
+		var toDelete []string
+		if snap == "_all" || snap == "*" {
+			for sName := range bySnap {
+				toDelete = append(toDelete, sName)
 			}
-			if _, exists := bySnap[pat]; !exists {
-				s.mu.Unlock()
-				writeESError(w, http.StatusNotFound, "snapshot_missing_exception", fmt.Sprintf("[%s:%s] is missing", repo, pat))
-				return
+		} else {
+			for _, pat := range strings.Split(snap, ",") {
+				pat = strings.TrimSpace(pat)
+				if pat == "" {
+					continue
+				}
+				if !strings.ContainsAny(pat, "*?") && !strings.HasPrefix(pat, "-") && pat != "_all" {
+					if _, exists := bySnap[pat]; !exists {
+						s.mu.Unlock()
+						writeESError(w, http.StatusNotFound, "snapshot_missing_exception", fmt.Sprintf("[%s:%s] is missing", repo, pat))
+						return
+					}
+				}
+			}
+			for sName := range bySnap {
+				if matchMultiWildcardWithExclusions(snap, sName) {
+					toDelete = append(toDelete, sName)
+				}
 			}
 		}
-		for _, pat := range strings.Split(snap, ",") {
-			pat = strings.TrimSpace(pat)
-			delete(bySnap, pat)
+		if len(toDelete) == 0 {
+			s.mu.Unlock()
+			writeESError(w, http.StatusNotFound, "snapshot_missing_exception", fmt.Sprintf("[%s:%s] is missing", repo, snap))
+			return
+		}
+		for _, sName := range toDelete {
+			delete(bySnap, sName)
 		}
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
@@ -599,11 +647,96 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 	}
 }
 
-// handleSnapshotItemAction implements `POST /_snapshot/{repository}/{snapshot}/_restore` and `GET /_snapshot/{repository}/{snapshot}/_status` (F1).
+// handleSnapshotItemAction implements `POST /_snapshot/{repository}/{snapshot}/_restore`, `_mount`, and `GET /_snapshot/{repository}/{snapshot}/_status` (F1, F7, F9).
 func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request) {
 	repo := strings.TrimSpace(r.PathValue("repository"))
 	snap := strings.TrimSpace(r.PathValue("snapshot"))
 	action := strings.TrimSpace(r.PathValue("action"))
+
+	if action == "_status" {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
+			return
+		}
+		s.mu.RLock()
+		var targetRepos []string
+		if repo == "_all" || repo == "*" {
+			for rName := range s.snapshotRepos {
+				targetRepos = append(targetRepos, rName)
+			}
+			sort.Strings(targetRepos)
+		} else {
+			for _, pat := range strings.Split(repo, ",") {
+				pat = strings.TrimSpace(pat)
+				if pat == "" {
+					continue
+				}
+				if !strings.ContainsAny(pat, "*?") && !strings.HasPrefix(pat, "-") && pat != "_all" {
+					if _, exists := s.snapshotRepos[pat]; !exists {
+						s.mu.RUnlock()
+						writeESError(w, http.StatusNotFound, "repository_missing_exception", fmt.Sprintf("[%s] missing", pat))
+						return
+					}
+				}
+			}
+			for rName := range s.snapshotRepos {
+				if matchMultiWildcardWithExclusions(repo, rName) {
+					targetRepos = append(targetRepos, rName)
+				}
+			}
+			sort.Strings(targetRepos)
+		}
+		if snap != "_all" && snap != "*" {
+			for _, pat := range strings.Split(snap, ",") {
+				pat = strings.TrimSpace(pat)
+				if pat == "" || strings.ContainsAny(pat, "*?") || strings.HasPrefix(pat, "-") || pat == "_all" {
+					continue
+				}
+				found := false
+				for _, rName := range targetRepos {
+					if s.snapshots[rName] != nil && s.snapshots[rName][pat] != nil {
+						found = true
+						break
+					}
+				}
+				if !found {
+					s.mu.RUnlock()
+					writeESError(w, http.StatusNotFound, "snapshot_missing_exception", fmt.Sprintf("[%s:%s] is missing", repo, pat))
+					return
+				}
+			}
+		}
+		list := make([]any, 0)
+		for _, rName := range targetRepos {
+			bySnap := s.snapshots[rName]
+			names := make([]string, 0, len(bySnap))
+			for k := range bySnap {
+				if snap == "_all" || snap == "*" || matchMultiWildcardWithExclusions(snap, k) {
+					names = append(names, k)
+				}
+			}
+			sort.Strings(names)
+			for _, k := range names {
+				list = append(list, map[string]any{
+					"snapshot":   k,
+					"repository": rName,
+					"uuid":       k + "-uuid",
+					"state":      "SUCCESS",
+					"shards_stats": map[string]any{
+						"initializing": 0,
+						"started":      0,
+						"finalizing":   0,
+						"done":         1,
+						"failed":       0,
+						"total":        1,
+					},
+				})
+			}
+		}
+		s.mu.RUnlock()
+		writeJSON(w, http.StatusOK, map[string]any{"snapshots": list})
+		return
+	}
 
 	s.mu.RLock()
 	_, repoExists := s.snapshotRepos[repo]
@@ -627,6 +760,110 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 	}
 
 	switch action {
+	case "_mount":
+		if r.Method != http.MethodPost {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
+			return
+		}
+		bodyBytes, ok := readRequestBody(w, r)
+		if !ok {
+			return
+		}
+		var reqMap map[string]any
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &reqMap); err != nil {
+				writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+				return
+			}
+		}
+		var snapIndices []string
+		switch iv := snapObj["indices"].(type) {
+		case []string:
+			snapIndices = append(snapIndices, iv...)
+		case []any:
+			for _, item := range iv {
+				if sStr, okS := item.(string); okS && sStr != "" {
+					snapIndices = append(snapIndices, sStr)
+				}
+			}
+		}
+		srcIdx, _ := reqMap["index"].(string)
+		srcIdx = strings.TrimSpace(srcIdx)
+		if srcIdx == "" && len(snapIndices) > 0 {
+			srcIdx = snapIndices[0]
+		}
+		if srcIdx == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: index is missing;")
+			return
+		}
+		if len(snapIndices) > 0 {
+			inSnap := false
+			for _, si := range snapIndices {
+				if si == srcIdx {
+					inSnap = true
+					break
+				}
+			}
+			if !inSnap {
+				writeESError(w, http.StatusNotFound, "snapshot_restore_exception",
+					fmt.Sprintf("[%s:%s] index [%s] wasn't fully snapshotted", repo, snap, srcIdx))
+				return
+			}
+		}
+		targetIdx, _ := reqMap["renamed_index"].(string)
+		targetIdx = strings.TrimSpace(targetIdx)
+		if targetIdx == "" {
+			targetIdx = srcIdx
+		}
+		s.mu.Lock()
+		_, alreadyExists := s.indices[targetIdx]
+		s.mu.Unlock()
+		if !alreadyExists {
+			var restoredSchema *schema.IndexSchema
+			if savedSchemas != nil && savedSchemas[srcIdx] != nil {
+				restoredSchema = schema.CompileIndexSchema(s.dorisDB, targetIdx, savedSchemas[srcIdx].RawMapping)
+			} else {
+				restoredSchema = schema.CompileIndexSchema(s.dorisDB, targetIdx, nil)
+			}
+			if restoredSchema != nil {
+				_ = s.backend.ExecDDL(r.Context(), schema.GenerateCreateTableDDL(restoredSchema))
+				s.mu.Lock()
+				if s.indices == nil {
+					s.indices = make(map[string]*schema.IndexSchema)
+				}
+				if s.indices[targetIdx] == nil {
+					s.indices[targetIdx] = restoredSchema
+				}
+				delete(s.closedIndices, targetIdx)
+				s.mu.Unlock()
+			}
+		}
+		s.mu.Lock()
+		if s.indexCustomSettings == nil {
+			s.indexCustomSettings = make(map[string]map[string]any)
+		}
+		if s.indexCustomSettings[targetIdx] == nil {
+			s.indexCustomSettings[targetIdx] = make(map[string]any)
+		}
+		s.indexCustomSettings[targetIdx]["store.type"] = "snapshot"
+		if idxSettings, okS := reqMap["index_settings"].(map[string]any); okS {
+			for k, v := range idxSettings {
+				s.indexCustomSettings[targetIdx][strings.TrimPrefix(k, "index.")] = v
+			}
+		}
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"accepted": true,
+			"snapshot": map[string]any{
+				"snapshot": snap,
+				"indices":  []string{targetIdx},
+				"shards": map[string]any{
+					"total":      1,
+					"failed":     0,
+					"successful": 1,
+				},
+			},
+		})
 	case "_restore":
 		if r.Method != http.MethodPost {
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
@@ -2348,6 +2585,50 @@ func (s *Server) handleTransformAction(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 
+	case "_update", "update":
+		if r.Method != http.MethodPost && r.Method != http.MethodPut {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		id := strings.TrimSpace(r.PathValue("id"))
+		bodyBytes, ok := readRequestBody(w, r)
+		if !ok {
+			return
+		}
+		var body map[string]any
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &body); err != nil {
+				writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+				return
+			}
+		}
+		if body == nil {
+			writeESError(w, http.StatusBadRequest, "parse_exception", "request body is required")
+			return
+		}
+		s.mu.Lock()
+		entry, exists := s.transforms[id]
+		if !exists || entry == nil {
+			s.mu.Unlock()
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception",
+				fmt.Sprintf("Unknown transform [%s]", id))
+			return
+		}
+		if _, hasPivot := body["pivot"]; hasPivot {
+			s.mu.Unlock()
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "transform [pivot] is immutable and cannot be updated")
+			return
+		}
+		for _, k := range []string{"description", "source", "dest", "frequency", "sync", "settings", "retention_policy"} {
+			if v, has := body[k]; has {
+				entry[k] = v
+			}
+		}
+		resp := deepCloneDocMap(entry)
+		delete(resp, "state")
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, resp)
+
 	default:
 		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown transform action ["+action+"]")
 	}
@@ -2637,6 +2918,2564 @@ func (s *Server) handleAutoscaling(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		delete(s.autoscalingPolicies, name)
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+	default:
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+	}
+}
+
+func reloadAnalyzersDetailsPayload() map[string]any {
+	return map[string]any{
+		"_shards": map[string]any{
+			"total":      0,
+			"successful": 0,
+			"failed":     0,
+		},
+		"reload_details": []any{},
+	}
+}
+
+func parseFromSizePagination(r *http.Request, defaultSize int) (int, int) {
+	from := 0
+	size := defaultSize
+	if r != nil && r.URL != nil {
+		if rawFrom := strings.TrimSpace(r.URL.Query().Get("from")); rawFrom != "" {
+			if v, err := strconv.Atoi(rawFrom); err == nil && v >= 0 {
+				from = v
+			}
+		}
+		if rawSize := strings.TrimSpace(r.URL.Query().Get("size")); rawSize != "" {
+			if v, err := strconv.Atoi(rawSize); err == nil && v >= 0 {
+				size = v
+			}
+		}
+	}
+	return from, size
+}
+
+// handleSynonyms implements the Elasticsearch 8.x Synonyms Management API (`/_synonyms` and `/_synonyms/{id}/*`) (F2).
+func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []string) {
+	switch len(segs) {
+	case 1:
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		from, size := parseFromSizePagination(r, 10000)
+		s.mu.RLock()
+		setIDs := make([]string, 0, len(s.synonymSets))
+		for id := range s.synonymSets {
+			setIDs = append(setIDs, id)
+		}
+		sort.Strings(setIDs)
+		total := len(setIDs)
+		results := make([]any, 0)
+		for i := from; i < total && len(results) < size; i++ {
+			id := setIDs[i]
+			results = append(results, map[string]any{
+				"synonyms_set": id,
+				"count":        len(s.synonymSets[id]),
+			})
+		}
+		s.mu.RUnlock()
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"count":   total,
+			"results": results,
+		})
+
+	case 2:
+		setID := strings.TrimSpace(segs[1])
+		switch r.Method {
+		case http.MethodPut, http.MethodPost:
+			bodyBytes, ok := readRequestBody(w, r)
+			if !ok {
+				return
+			}
+			var body map[string]any
+			if len(bytes.TrimSpace(bodyBytes)) > 0 {
+				if err := json.Unmarshal(bodyBytes, &body); err != nil {
+					writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+					return
+				}
+			}
+			rawRules, ok := body["synonyms_set"].([]any)
+			if !ok || len(rawRules) == 0 {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[synonyms_set] required property is missing or empty")
+				return
+			}
+			seenIDs := make(map[string]bool, len(rawRules))
+			rules := make([]map[string]any, 0, len(rawRules))
+			for idx, item := range rawRules {
+				rm, ok := item.(map[string]any)
+				if !ok || rm == nil {
+					writeESError(w, http.StatusBadRequest, "parse_exception", "synonym rule must be an object")
+					return
+				}
+				synStr, _ := rm["synonyms"].(string)
+				if strings.TrimSpace(synStr) == "" {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "synonym rule [synonyms] is required")
+					return
+				}
+				ruleID, _ := rm["id"].(string)
+				ruleID = strings.TrimSpace(ruleID)
+				if ruleID == "" {
+					ruleID = fmt.Sprintf("rule-%d", idx)
+				}
+				if seenIDs[ruleID] {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("duplicate synonym rule id [%s]", ruleID))
+					return
+				}
+				seenIDs[ruleID] = true
+				rules = append(rules, map[string]any{
+					"id":       ruleID,
+					"synonyms": synStr,
+				})
+			}
+			s.mu.Lock()
+			if s.synonymSets == nil {
+				s.synonymSets = make(map[string][]map[string]any)
+			}
+			_, existed := s.synonymSets[setID]
+			s.synonymSets[setID] = rules
+			s.mu.Unlock()
+			resStr := "created"
+			if existed {
+				resStr = "updated"
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result":                   resStr,
+				"reload_analyzers_details": reloadAnalyzersDetailsPayload(),
+			})
+
+		case http.MethodGet, http.MethodHead:
+			from, size := parseFromSizePagination(r, 10000)
+			s.mu.RLock()
+			rules, exists := s.synonymSets[setID]
+			if !exists {
+				s.mu.RUnlock()
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonyms_set [%s] not found", setID))
+				return
+			}
+			total := len(rules)
+			page := make([]any, 0)
+			for i := from; i < total && len(page) < size; i++ {
+				page = append(page, deepCloneDocMap(rules[i]))
+			}
+			s.mu.RUnlock()
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"count":        total,
+				"synonyms_set": page,
+			})
+
+		case http.MethodDelete:
+			s.mu.Lock()
+			if _, exists := s.synonymSets[setID]; !exists {
+				s.mu.Unlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonyms_set [%s] not found", setID))
+				return
+			}
+			delete(s.synonymSets, setID)
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+		default:
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		}
+
+	case 3:
+		setID := strings.TrimSpace(segs[1])
+		sub := strings.TrimSpace(segs[2])
+		if sub == "_reload" {
+			if r.Method != http.MethodPost && r.Method != http.MethodPut {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			s.mu.RLock()
+			_, exists := s.synonymSets[setID]
+			s.mu.RUnlock()
+			if !exists {
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonyms_set [%s] not found", setID))
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"reload_analyzers_details": reloadAnalyzersDetailsPayload(),
+			})
+			return
+		}
+		ruleID := sub
+		switch r.Method {
+		case http.MethodPut, http.MethodPost:
+			bodyBytes, ok := readRequestBody(w, r)
+			if !ok {
+				return
+			}
+			var body map[string]any
+			if len(bytes.TrimSpace(bodyBytes)) > 0 {
+				if err := json.Unmarshal(bodyBytes, &body); err != nil {
+					writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+					return
+				}
+			}
+			synStr, _ := body["synonyms"].(string)
+			if strings.TrimSpace(synStr) == "" {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "synonym rule [synonyms] is required")
+				return
+			}
+			s.mu.Lock()
+			rules, exists := s.synonymSets[setID]
+			if !exists {
+				s.mu.Unlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonyms_set [%s] not found", setID))
+				return
+			}
+			resStr := "created"
+			foundIdx := -1
+			for idx, rm := range rules {
+				if rm["id"] == ruleID {
+					foundIdx = idx
+					break
+				}
+			}
+			newRule := map[string]any{"id": ruleID, "synonyms": synStr}
+			if foundIdx >= 0 {
+				rules[foundIdx] = newRule
+				resStr = "updated"
+			} else {
+				rules = append(rules, newRule)
+			}
+			s.synonymSets[setID] = rules
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result":                   resStr,
+				"reload_analyzers_details": reloadAnalyzersDetailsPayload(),
+			})
+
+		case http.MethodGet, http.MethodHead:
+			s.mu.RLock()
+			rules, exists := s.synonymSets[setID]
+			var found map[string]any
+			if exists {
+				for _, rm := range rules {
+					if rm["id"] == ruleID {
+						found = deepCloneDocMap(rm)
+						break
+					}
+				}
+			}
+			s.mu.RUnlock()
+			if found == nil {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonym rule [%s] not found in set [%s]", ruleID, setID))
+				return
+			}
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			writeJSON(w, http.StatusOK, found)
+
+		case http.MethodDelete:
+			s.mu.Lock()
+			rules, exists := s.synonymSets[setID]
+			if !exists {
+				s.mu.Unlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonyms_set [%s] not found", setID))
+				return
+			}
+			foundIdx := -1
+			for idx, rm := range rules {
+				if rm["id"] == ruleID {
+					foundIdx = idx
+					break
+				}
+			}
+			if foundIdx < 0 {
+				s.mu.Unlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonym rule [%s] not found in set [%s]", ruleID, setID))
+				return
+			}
+			s.synonymSets[setID] = append(rules[:foundIdx], rules[foundIdx+1:]...)
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result":                   "deleted",
+				"reload_analyzers_details": reloadAnalyzersDetailsPayload(),
+			})
+
+		default:
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		}
+
+	default:
+		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+	}
+}
+
+func validateSingleQueryRule(rm map[string]any) error {
+	if rm == nil {
+		return fmt.Errorf("rule must be an object")
+	}
+	ruleID, _ := rm["rule_id"].(string)
+	if strings.TrimSpace(ruleID) == "" {
+		return fmt.Errorf("[rule_id] required property is missing")
+	}
+	ruleType, _ := rm["type"].(string)
+	switch ruleType {
+	case "pinned", "exclude":
+	default:
+		return fmt.Errorf("unsupported query rule type [%s], must be [pinned] or [exclude]", ruleType)
+	}
+	criteria, ok := rm["criteria"].([]any)
+	if !ok || len(criteria) == 0 {
+		return fmt.Errorf("[criteria] must be a non-empty array")
+	}
+	for _, cAny := range criteria {
+		cm, ok := cAny.(map[string]any)
+		if !ok || cm == nil {
+			return fmt.Errorf("criterion must be an object")
+		}
+		cType, _ := cm["type"].(string)
+		switch cType {
+		case "always":
+		case "exact", "contains", "prefix", "suffix", "fuzzy", "lt", "lte", "gt", "gte":
+			meta, _ := cm["metadata"].(string)
+			if strings.TrimSpace(meta) == "" {
+				return fmt.Errorf("criterion [metadata] is required for type [%s]", cType)
+			}
+			vals, ok := cm["values"].([]any)
+			if !ok || len(vals) == 0 {
+				return fmt.Errorf("criterion [values] must be a non-empty array for type [%s]", cType)
+			}
+		default:
+			return fmt.Errorf("unsupported criterion type [%s]", cType)
+		}
+	}
+	actions, ok := rm["actions"].(map[string]any)
+	if !ok || actions == nil {
+		return fmt.Errorf("[actions] required property is missing")
+	}
+	ids, hasIDs := actions["ids"].([]any)
+	docs, hasDocs := actions["docs"].([]any)
+	if (!hasIDs || len(ids) == 0) && (!hasDocs || len(docs) == 0) {
+		return fmt.Errorf("actions must specify non-empty [ids] or [docs]")
+	}
+	return nil
+}
+
+func queryRuleLevenshtein(a, b string) int {
+	ra, rb := []rune(a), []rune(b)
+	la, lb := len(ra), len(rb)
+	if la == 0 {
+		return lb
+	}
+	if lb == 0 {
+		return la
+	}
+	prev := make([]int, lb+1)
+	cur := make([]int, lb+1)
+	for j := 0; j <= lb; j++ {
+		prev[j] = j
+	}
+	for i := 1; i <= la; i++ {
+		cur[0] = i
+		for j := 1; j <= lb; j++ {
+			cost := 0
+			if ra[i-1] != rb[j-1] {
+				cost = 1
+			}
+			del := prev[j] + 1
+			ins := cur[j-1] + 1
+			sub := prev[j-1] + cost
+			m := del
+			if ins < m {
+				m = ins
+			}
+			if sub < m {
+				m = sub
+			}
+			cur[j] = m
+		}
+		copy(prev, cur)
+	}
+	return prev[lb]
+}
+
+func ruleMatchesCriteria(rm map[string]any, matchCriteria map[string]any) bool {
+	criteria, _ := rm["criteria"].([]any)
+	if len(criteria) == 0 {
+		return false
+	}
+	for _, cAny := range criteria {
+		cm, ok := cAny.(map[string]any)
+		if !ok || cm == nil {
+			return false
+		}
+		cType, _ := cm["type"].(string)
+		if cType == "always" {
+			continue
+		}
+		meta, _ := cm["metadata"].(string)
+		candVal, exists := matchCriteria[meta]
+		if !exists || candVal == nil {
+			return false
+		}
+		candStr := fmt.Sprintf("%v", candVal)
+		candLower := strings.ToLower(candStr)
+		candNum, candIsNum := ingestNumericFloat64(candVal)
+		vals, _ := cm["values"].([]any)
+		matchedAnyVal := false
+		for _, v := range vals {
+			vStr := fmt.Sprintf("%v", v)
+			vLower := strings.ToLower(vStr)
+			switch cType {
+			case "exact":
+				if candStr == vStr || (candIsNum && ingestValuesEqual(candVal, v)) {
+					matchedAnyVal = true
+				}
+			case "contains":
+				if strings.Contains(candLower, vLower) {
+					matchedAnyVal = true
+				}
+			case "prefix":
+				if strings.HasPrefix(candLower, vLower) {
+					matchedAnyVal = true
+				}
+			case "suffix":
+				if strings.HasSuffix(candLower, vLower) {
+					matchedAnyVal = true
+				}
+			case "fuzzy":
+				maxDist := 2
+				if len(vLower) <= 2 {
+					maxDist = 0
+				} else if len(vLower) <= 5 {
+					maxDist = 1
+				}
+				if queryRuleLevenshtein(candLower, vLower) <= maxDist {
+					matchedAnyVal = true
+				} else {
+					for _, tok := range strings.Fields(candLower) {
+						if queryRuleLevenshtein(tok, vLower) <= maxDist {
+							matchedAnyVal = true
+							break
+						}
+					}
+				}
+			case "lt", "lte", "gt", "gte":
+				if vNum, vIsNum := ingestNumericFloat64(v); candIsNum && vIsNum {
+					switch cType {
+					case "lt":
+						matchedAnyVal = candNum < vNum
+					case "lte":
+						matchedAnyVal = candNum <= vNum
+					case "gt":
+						matchedAnyVal = candNum > vNum
+					case "gte":
+						matchedAnyVal = candNum >= vNum
+					}
+				} else {
+					switch cType {
+					case "lt":
+						matchedAnyVal = candStr < vStr
+					case "lte":
+						matchedAnyVal = candStr <= vStr
+					case "gt":
+						matchedAnyVal = candStr > vStr
+					case "gte":
+						matchedAnyVal = candStr >= vStr
+					}
+				}
+			}
+			if matchedAnyVal {
+				break
+			}
+		}
+		if !matchedAnyVal {
+			return false
+		}
+	}
+	return true
+}
+
+// handleQueryRules implements the Elasticsearch 8.x Query Rules Management API (`/_query_rules` and `/_query_rules/{ruleset_id}/*`) (F3).
+func (s *Server) handleQueryRules(w http.ResponseWriter, r *http.Request, segs []string) {
+	switch len(segs) {
+	case 1:
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		from, size := parseFromSizePagination(r, 1000)
+		s.mu.RLock()
+		ids := make([]string, 0, len(s.queryRulesets))
+		for id := range s.queryRulesets {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		total := len(ids)
+		results := make([]any, 0)
+		for i := from; i < total && len(results) < size; i++ {
+			id := ids[i]
+			results = append(results, map[string]any{
+				"ruleset_id": id,
+				"count":      len(s.queryRulesets[id]),
+			})
+		}
+		s.mu.RUnlock()
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"count":   total,
+			"results": results,
+		})
+
+	case 2:
+		rulesetID := strings.TrimSpace(segs[1])
+		switch r.Method {
+		case http.MethodPut, http.MethodPost:
+			bodyBytes, ok := readRequestBody(w, r)
+			if !ok {
+				return
+			}
+			var body map[string]any
+			if len(bytes.TrimSpace(bodyBytes)) > 0 {
+				if err := json.Unmarshal(bodyBytes, &body); err != nil {
+					writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+					return
+				}
+			}
+			rawRules, ok := body["rules"].([]any)
+			if !ok || len(rawRules) == 0 {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[rules] required property is missing or empty")
+				return
+			}
+			seenIDs := make(map[string]bool, len(rawRules))
+			rules := make([]map[string]any, 0, len(rawRules))
+			for _, item := range rawRules {
+				rm, _ := item.(map[string]any)
+				if err := validateSingleQueryRule(rm); err != nil {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+					return
+				}
+				rid, _ := rm["rule_id"].(string)
+				if seenIDs[rid] {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("duplicate rule_id [%s]", rid))
+					return
+				}
+				seenIDs[rid] = true
+				rules = append(rules, deepCloneDocMap(rm))
+			}
+			s.mu.Lock()
+			if s.queryRulesets == nil {
+				s.queryRulesets = make(map[string][]map[string]any)
+			}
+			_, existed := s.queryRulesets[rulesetID]
+			s.queryRulesets[rulesetID] = rules
+			s.mu.Unlock()
+			if existed {
+				writeJSON(w, http.StatusOK, map[string]any{"result": "updated"})
+			} else {
+				writeJSON(w, http.StatusCreated, map[string]any{"result": "created"})
+			}
+
+		case http.MethodGet, http.MethodHead:
+			s.mu.RLock()
+			rules, exists := s.queryRulesets[rulesetID]
+			if !exists {
+				s.mu.RUnlock()
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("query_ruleset [%s] not found", rulesetID))
+				return
+			}
+			cloned := make([]any, 0, len(rules))
+			for _, rm := range rules {
+				cloned = append(cloned, deepCloneDocMap(rm))
+			}
+			s.mu.RUnlock()
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ruleset_id": rulesetID,
+				"rules":      cloned,
+			})
+
+		case http.MethodDelete:
+			s.mu.Lock()
+			if _, exists := s.queryRulesets[rulesetID]; !exists {
+				s.mu.Unlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("query_ruleset [%s] not found", rulesetID))
+				return
+			}
+			delete(s.queryRulesets, rulesetID)
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+		default:
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		}
+
+	case 3:
+		rulesetID := strings.TrimSpace(segs[1])
+		action := strings.TrimSpace(segs[2])
+		if action != "_test" {
+			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+			return
+		}
+		if r.Method != http.MethodPost && r.Method != http.MethodGet {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		bodyBytes, ok := readRequestBody(w, r)
+		if !ok {
+			return
+		}
+		var body map[string]any
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &body); err != nil {
+				writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+				return
+			}
+		}
+		matchCriteria, _ := body["match_criteria"].(map[string]any)
+		if matchCriteria == nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[match_criteria] is required")
+			return
+		}
+		s.mu.RLock()
+		rules, exists := s.queryRulesets[rulesetID]
+		if !exists {
+			s.mu.RUnlock()
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("query_ruleset [%s] not found", rulesetID))
+			return
+		}
+		matched := make([]any, 0)
+		for _, rm := range rules {
+			if ruleMatchesCriteria(rm, matchCriteria) {
+				matched = append(matched, map[string]any{
+					"rule_id": rm["rule_id"],
+					"type":    rm["type"],
+					"actions": deepCloneIngestValue(rm["actions"]),
+				})
+			}
+		}
+		s.mu.RUnlock()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"matched_rules": matched,
+		})
+
+	case 4:
+		rulesetID := strings.TrimSpace(segs[1])
+		if segs[2] != "_rule" {
+			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+			return
+		}
+		ruleID := strings.TrimSpace(segs[3])
+		switch r.Method {
+		case http.MethodPut, http.MethodPost:
+			bodyBytes, ok := readRequestBody(w, r)
+			if !ok {
+				return
+			}
+			var body map[string]any
+			if len(bytes.TrimSpace(bodyBytes)) > 0 {
+				if err := json.Unmarshal(bodyBytes, &body); err != nil {
+					writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+					return
+				}
+			}
+			if body == nil {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "rule body is required")
+				return
+			}
+			if bodyRuleID, _ := body["rule_id"].(string); strings.TrimSpace(bodyRuleID) != "" && bodyRuleID != ruleID {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "rule_id in body does not match URL")
+				return
+			}
+			body["rule_id"] = ruleID
+			if err := validateSingleQueryRule(body); err != nil {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+				return
+			}
+			s.mu.Lock()
+			if s.queryRulesets == nil {
+				s.queryRulesets = make(map[string][]map[string]any)
+			}
+			rules := s.queryRulesets[rulesetID]
+			foundIdx := -1
+			for idx, rm := range rules {
+				if rm["rule_id"] == ruleID {
+					foundIdx = idx
+					break
+				}
+			}
+			cloned := deepCloneDocMap(body)
+			if foundIdx >= 0 {
+				rules[foundIdx] = cloned
+				s.queryRulesets[rulesetID] = rules
+				s.mu.Unlock()
+				writeJSON(w, http.StatusOK, map[string]any{"result": "updated"})
+			} else {
+				s.queryRulesets[rulesetID] = append(rules, cloned)
+				s.mu.Unlock()
+				writeJSON(w, http.StatusCreated, map[string]any{"result": "created"})
+			}
+
+		case http.MethodGet, http.MethodHead:
+			s.mu.RLock()
+			rules, exists := s.queryRulesets[rulesetID]
+			var found map[string]any
+			if exists {
+				for _, rm := range rules {
+					if rm["rule_id"] == ruleID {
+						found = deepCloneDocMap(rm)
+						break
+					}
+				}
+			}
+			s.mu.RUnlock()
+			if found == nil {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("rule [%s] not found in ruleset [%s]", ruleID, rulesetID))
+				return
+			}
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			writeJSON(w, http.StatusOK, found)
+
+		case http.MethodDelete:
+			s.mu.Lock()
+			rules, exists := s.queryRulesets[rulesetID]
+			if !exists {
+				s.mu.Unlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("query_ruleset [%s] not found", rulesetID))
+				return
+			}
+			foundIdx := -1
+			for idx, rm := range rules {
+				if rm["rule_id"] == ruleID {
+					foundIdx = idx
+					break
+				}
+			}
+			if foundIdx < 0 {
+				s.mu.Unlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("rule [%s] not found in ruleset [%s]", ruleID, rulesetID))
+				return
+			}
+			s.queryRulesets[rulesetID] = append(rules[:foundIdx], rules[foundIdx+1:]...)
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"result": "deleted", "acknowledged": true})
+
+		default:
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		}
+
+	default:
+		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+	}
+}
+
+func (s *Server) expandRuleQuerySpec(ruleSpec map[string]any) map[string]any {
+	organic, _ := ruleSpec["organic"].(map[string]any)
+	if organic == nil {
+		organic = map[string]any{"match_all": map[string]any{}}
+	}
+	matchCriteria, _ := ruleSpec["match_criteria"].(map[string]any)
+	var rulesetIDs []string
+	if rids, ok := ruleSpec["ruleset_ids"].([]any); ok {
+		for _, item := range rids {
+			if str, ok := item.(string); ok && strings.TrimSpace(str) != "" {
+				rulesetIDs = append(rulesetIDs, strings.TrimSpace(str))
+			}
+		}
+	} else if rid, ok := ruleSpec["ruleset_id"].(string); ok && strings.TrimSpace(rid) != "" {
+		rulesetIDs = []string{strings.TrimSpace(rid)}
+	}
+	var pinnedIDs []any
+	var excludedIDs []any
+	seenPinned := make(map[string]bool)
+	seenExcluded := make(map[string]bool)
+	extractActionIDs := func(actions map[string]any) []string {
+		var out []string
+		if ids, ok := actions["ids"].([]any); ok {
+			for _, idAny := range ids {
+				if s := strings.TrimSpace(fmt.Sprintf("%v", idAny)); s != "" {
+					out = append(out, s)
+				}
+			}
+		}
+		if docs, ok := actions["docs"].([]any); ok {
+			for _, dAny := range docs {
+				if dm, ok := dAny.(map[string]any); ok {
+					if s := strings.TrimSpace(fmt.Sprintf("%v", dm["_id"])); s != "" && s != "<nil>" {
+						out = append(out, s)
+					}
+				}
+			}
+		}
+		return out
+	}
+	s.mu.RLock()
+	for _, rsid := range rulesetIDs {
+		for _, rm := range s.queryRulesets[rsid] {
+			if ruleMatchesCriteria(rm, matchCriteria) {
+				rType, _ := rm["type"].(string)
+				actions, _ := rm["actions"].(map[string]any)
+				for _, docID := range extractActionIDs(actions) {
+					switch rType {
+					case "pinned":
+						if !seenPinned[docID] && !seenExcluded[docID] {
+							seenPinned[docID] = true
+							pinnedIDs = append(pinnedIDs, docID)
+						}
+					case "exclude":
+						if !seenExcluded[docID] {
+							seenExcluded[docID] = true
+							excludedIDs = append(excludedIDs, docID)
+						}
+					}
+				}
+			}
+		}
+	}
+	s.mu.RUnlock()
+
+	curQuery := organic
+	if len(excludedIDs) > 0 {
+		curQuery = map[string]any{
+			"bool": map[string]any{
+				"must": []any{curQuery},
+				"must_not": []any{
+					map[string]any{
+						"ids": map[string]any{"values": excludedIDs},
+					},
+				},
+			},
+		}
+	}
+	if len(pinnedIDs) > 0 {
+		curQuery = map[string]any{
+			"pinned": map[string]any{
+				"ids":     pinnedIDs,
+				"organic": curQuery,
+			},
+		}
+	}
+	return curQuery
+}
+
+func (s *Server) rewriteQueryRulesInTree(node any) (any, bool) {
+	switch v := node.(type) {
+	case map[string]any:
+		if len(v) == 1 {
+			if ruleSpec, ok := v["rule"].(map[string]any); ok && (ruleSpec["ruleset_ids"] != nil || ruleSpec["ruleset_id"] != nil || ruleSpec["organic"] != nil) {
+				return s.expandRuleQuerySpec(ruleSpec), true
+			}
+			if ruleSpec, ok := v["rule_query"].(map[string]any); ok && (ruleSpec["ruleset_ids"] != nil || ruleSpec["ruleset_id"] != nil || ruleSpec["organic"] != nil) {
+				return s.expandRuleQuerySpec(ruleSpec), true
+			}
+		}
+		changed := false
+		for k, child := range v {
+			if next, ch := s.rewriteQueryRulesInTree(child); ch {
+				v[k] = next
+				changed = true
+			}
+		}
+		return v, changed
+	case []any:
+		changed := false
+		for i, elem := range v {
+			if next, ch := s.rewriteQueryRulesInTree(elem); ch {
+				v[i] = next
+				changed = true
+			}
+		}
+		return v, changed
+	default:
+		return node, false
+	}
+}
+
+func (s *Server) rewriteSearchBodyQueryRules(bodyBytes []byte) []byte {
+	if len(bytes.TrimSpace(bodyBytes)) == 0 {
+		return bodyBytes
+	}
+	if !bytes.Contains(bodyBytes, []byte(`"rule"`)) && !bytes.Contains(bodyBytes, []byte(`"rule_query"`)) {
+		return bodyBytes
+	}
+	var root map[string]any
+	dec := json.NewDecoder(bytes.NewReader(bodyBytes))
+	dec.UseNumber()
+	if err := dec.Decode(&root); err != nil || root == nil {
+		return bodyBytes
+	}
+	changed := false
+	if retr, ok := root["retriever"].(map[string]any); ok {
+		if ruleSpec, okR := retr["rule"].(map[string]any); okR {
+			root["query"] = s.expandRuleQuerySpec(ruleSpec)
+			delete(root, "retriever")
+			changed = true
+		}
+	}
+	if q, hasQ := root["query"]; hasQ {
+		if nextQ, ch := s.rewriteQueryRulesInTree(q); ch {
+			root["query"] = nextQ
+			changed = true
+		}
+	}
+	if !changed {
+		return bodyBytes
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return bodyBytes
+	}
+	return out
+}
+
+// handleFeatures implements `GET /_features` and `POST /_features/_reset` (F4).
+func (s *Server) handleFeatures(w http.ResponseWriter, r *http.Request, segs []string) {
+	featureNames := []struct {
+		name string
+		desc string
+	}{
+		{"ingest", "Manages ingest pipelines"},
+		{"ilm", "Manages index lifecycle policies"},
+		{"slm", "Manages snapshot lifecycle policies"},
+		{"synonyms", "Manages synonym sets"},
+		{"query_rules", "Manages query rules"},
+		{"transform", "Manages transforms"},
+		{"rollup", "Manages rollup jobs"},
+		{"enrich", "Manages enrich policies"},
+	}
+	if len(segs) == 1 {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		features := make([]any, 0, len(featureNames))
+		for _, f := range featureNames {
+			features = append(features, map[string]any{
+				"name":        f.name,
+				"description": f.desc,
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"features": features})
+		return
+	}
+	if len(segs) == 2 && segs[1] == "_reset" {
+		if r.Method != http.MethodPost {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		s.mu.Lock()
+		s.pipelines = make(map[string]map[string]any)
+		s.ilmPolicies = make(map[string]map[string]any)
+		s.slmPolicies = make(map[string]map[string]any)
+		s.enrichPolicies = make(map[string]map[string]any)
+		s.transforms = make(map[string]map[string]any)
+		s.rollupJobs = make(map[string]map[string]any)
+		s.synonymSets = make(map[string][]map[string]any)
+		s.queryRulesets = make(map[string][]map[string]any)
+		s.scripts = make(map[string]map[string]any)
+		s.watches = make(map[string]map[string]any)
+		s.autoscalingPolicies = make(map[string]map[string]any)
+		s.mu.Unlock()
+		statuses := make([]any, 0, len(featureNames))
+		for _, f := range featureNames {
+			statuses = append(statuses, map[string]any{
+				"feature_name": f.name,
+				"status":       "SUCCESS",
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"features": statuses})
+		return
+	}
+	writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+}
+
+// handleVotingConfigExclusions implements `POST /_cluster/voting_config_exclusions` and `DELETE /_cluster/voting_config_exclusions` (F4).
+func (s *Server) handleVotingConfigExclusions(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost, http.MethodPut:
+		nodeIDs := strings.TrimSpace(r.URL.Query().Get("node_ids"))
+		nodeNames := strings.TrimSpace(r.URL.Query().Get("node_names"))
+		if nodeIDs == "" && nodeNames == "" {
+			bodyBytes, ok := readRequestBody(w, r)
+			if !ok {
+				return
+			}
+			if len(bytes.TrimSpace(bodyBytes)) > 0 {
+				var body map[string]any
+				if err := json.Unmarshal(bodyBytes, &body); err == nil {
+					if s, ok := body["node_ids"].(string); ok {
+						nodeIDs = strings.TrimSpace(s)
+					}
+					if s, ok := body["node_names"].(string); ok {
+						nodeNames = strings.TrimSpace(s)
+					}
+				}
+			}
+		}
+		if nodeIDs == "" && nodeNames == "" {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				"add voting config exclusions request must specify at least one of [node_ids] or [node_names]")
+			return
+		}
+		s.mu.Lock()
+		for _, id := range strings.Split(nodeIDs, ",") {
+			if id = strings.TrimSpace(id); id != "" {
+				s.votingExclusions = append(s.votingExclusions, map[string]any{
+					"node_id":   id,
+					"node_name": "doris-fe-1",
+				})
+			}
+		}
+		for _, name := range strings.Split(nodeNames, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				s.votingExclusions = append(s.votingExclusions, map[string]any{
+					"node_id":   "doris-fe-1",
+					"node_name": name,
+				})
+			}
+		}
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+	case http.MethodDelete:
+		s.mu.Lock()
+		s.votingExclusions = nil
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+	default:
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+	}
+}
+
+// handleMigrationDeprecations implements `GET /_migration/deprecations` and `GET /{index}/_migration/deprecations` (F5).
+func (s *Server) handleMigrationDeprecations(w http.ResponseWriter, r *http.Request, indexName string) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	if indexName != "" {
+		if _, _, ok := s.resolveValidatedReadTargets(w, r, indexName); !ok {
+			return
+		}
+	}
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"cluster_settings": []any{},
+		"node_settings":    []any{},
+		"index_settings":   map[string]any{},
+		"ml_settings":      []any{},
+		"templates":        []any{},
+	})
+}
+
+// handleNodesShutdown implements `PUT/GET/DELETE /_nodes/{node_id}/shutdown` and `GET /_nodes/shutdown` (F5).
+func (s *Server) handleNodesShutdown(w http.ResponseWriter, r *http.Request, nodeID string) {
+	nodeID = strings.TrimSpace(nodeID)
+	switch r.Method {
+	case http.MethodPut, http.MethodPost:
+		if nodeID == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: node_id is missing;")
+			return
+		}
+		bodyBytes, ok := readRequestBody(w, r)
+		if !ok {
+			return
+		}
+		var body map[string]any
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &body); err != nil {
+				writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+				return
+			}
+		}
+		sType, _ := body["type"].(string)
+		switch strings.ToLower(strings.TrimSpace(sType)) {
+		case "remove", "replace", "restart":
+		default:
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				fmt.Sprintf("invalid shutdown type [%s], must be one of [remove, replace, restart]", sType))
+			return
+		}
+		reason, _ := body["reason"].(string)
+		entry := map[string]any{
+			"node_id":                nodeID,
+			"type":                   strings.ToLower(strings.TrimSpace(sType)),
+			"reason":                 reason,
+			"status":                 "COMPLETE",
+			"shutdown_startedmillis": time.Now().UTC().UnixMilli(),
+		}
+		s.mu.Lock()
+		if s.nodeShutdowns == nil {
+			s.nodeShutdowns = make(map[string]map[string]any)
+		}
+		s.nodeShutdowns[nodeID] = entry
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+	case http.MethodGet, http.MethodHead:
+		s.mu.RLock()
+		nodes := make([]any, 0)
+		if nodeID != "" && nodeID != "_all" && nodeID != "*" {
+			entry, exists := s.nodeShutdowns[nodeID]
+			if !exists {
+				s.mu.RUnlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("node [%s] shutdown status not found", nodeID))
+				return
+			}
+			nodes = append(nodes, deepCloneDocMap(entry))
+		} else {
+			ids := make([]string, 0, len(s.nodeShutdowns))
+			for id := range s.nodeShutdowns {
+				ids = append(ids, id)
+			}
+			sort.Strings(ids)
+			for _, id := range ids {
+				nodes = append(nodes, deepCloneDocMap(s.nodeShutdowns[id]))
+			}
+		}
+		s.mu.RUnlock()
+		writeJSON(w, http.StatusOK, map[string]any{"nodes": nodes})
+
+	case http.MethodDelete:
+		if nodeID == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: node_id is missing;")
+			return
+		}
+		s.mu.Lock()
+		if _, exists := s.nodeShutdowns[nodeID]; !exists {
+			s.mu.Unlock()
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("node [%s] shutdown status not found", nodeID))
+			return
+		}
+		delete(s.nodeShutdowns, nodeID)
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+	default:
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+	}
+}
+
+// handleRollup implements `/_rollup/job/*`, `/_rollup/data/*`, and `/{index}/_rollup/data` (F6).
+func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []string, indexName string) {
+	if indexName != "" || (len(segs) >= 2 && segs[1] == "data") {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		target := indexName
+		if target == "" && len(segs) >= 3 {
+			target = strings.TrimSpace(segs[2])
+		}
+		s.mu.RLock()
+		out := make(map[string]any)
+		for jobID, job := range s.rollupJobs {
+			cfg, _ := job["config"].(map[string]any)
+			rIdx, _ := cfg["rollup_index"].(string)
+			iPat, _ := cfg["index_pattern"].(string)
+			if target == "" || target == "_all" || target == "*" || target == jobID || target == rIdx || matchMultiWildcardWithExclusions(target, jobID) || matchMultiWildcardWithExclusions(target, rIdx) || matchMultiWildcardWithExclusions(iPat, target) {
+				key := target
+				if key == "" || key == "_all" || key == "*" {
+					key = rIdx
+					if key == "" {
+						key = jobID
+					}
+				}
+				entry, _ := out[key].(map[string]any)
+				if entry == nil {
+					entry = map[string]any{"rollup_jobs": []any{}}
+				}
+				jobsList, _ := entry["rollup_jobs"].([]any)
+				jobsList = append(jobsList, map[string]any{
+					"job_id":        jobID,
+					"rollup_index":  rIdx,
+					"index_pattern": iPat,
+					"fields":        map[string]any{},
+				})
+				entry["rollup_jobs"] = jobsList
+				out[key] = entry
+			}
+		}
+		if len(out) == 0 && target != "" && target != "_all" && target != "*" {
+			if _, idxExists := s.indices[target]; idxExists {
+				out[target] = map[string]any{"rollup_jobs": []any{}}
+			} else {
+				s.mu.RUnlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("rollup data [%s] not found", target))
+				return
+			}
+		}
+		s.mu.RUnlock()
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+
+	if len(segs) < 2 || segs[1] != "job" {
+		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+		return
+	}
+	var jobID, action string
+	if len(segs) >= 3 {
+		jobID = strings.TrimSpace(segs[2])
+	}
+	if len(segs) >= 4 {
+		action = strings.TrimSpace(segs[3])
+	}
+
+	if action != "" {
+		if r.Method != http.MethodPost && r.Method != http.MethodPut {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		s.mu.Lock()
+		job, exists := s.rollupJobs[jobID]
+		if !exists || job == nil {
+			s.mu.Unlock()
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Rollup job [%s] does not exist", jobID))
+			return
+		}
+		switch action {
+		case "_start", "start":
+			job["state"] = "STARTED"
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"started": true})
+		case "_stop", "stop":
+			job["state"] = "STOPPED"
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"stopped": true})
+		default:
+			s.mu.Unlock()
+			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown rollup action ["+action+"]")
+		}
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPut, http.MethodPost:
+		if jobID == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: id is missing;")
+			return
+		}
+		bodyBytes, ok := readRequestBody(w, r)
+		if !ok {
+			return
+		}
+		var body map[string]any
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &body); err != nil {
+				writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+				return
+			}
+		}
+		idxPat, _ := body["index_pattern"].(string)
+		rollupIdx, _ := body["rollup_index"].(string)
+		cronStr, _ := body["cron"].(string)
+		groups, _ := body["groups"].(map[string]any)
+		pageSize, okPS := toInt64(body["page_size"])
+		if strings.TrimSpace(idxPat) == "" || strings.TrimSpace(rollupIdx) == "" || strings.TrimSpace(cronStr) == "" || groups == nil || !okPS || pageSize <= 0 {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				"rollup job requires [index_pattern], [rollup_index], [cron], positive [page_size], and [groups]")
+			return
+		}
+		s.mu.Lock()
+		if s.rollupJobs == nil {
+			s.rollupJobs = make(map[string]map[string]any)
+		}
+		if _, exists := s.rollupJobs[jobID]; exists {
+			s.mu.Unlock()
+			writeESError(w, http.StatusBadRequest, "resource_already_exists_exception",
+				fmt.Sprintf("Rollup job [%s] already exists", jobID))
+			return
+		}
+		cfg := deepCloneDocMap(body)
+		cfg["id"] = jobID
+		s.rollupJobs[jobID] = map[string]any{
+			"config": cfg,
+			"state":  "STOPPED",
+		}
+		s.mu.Unlock()
+		_ = s.ensureIndexSchema(r.Context(), rollupIdx)
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+	case http.MethodGet, http.MethodHead:
+		allowNoMatch := isTruthyBoolQueryParam(r, "allow_no_match")
+		s.mu.RLock()
+		if jobID != "" && jobID != "_all" && jobID != "*" && !strings.ContainsAny(jobID, "*?,") {
+			if _, exists := s.rollupJobs[jobID]; !exists && !allowNoMatch {
+				s.mu.RUnlock()
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Rollup job [%s] does not exist", jobID))
+				return
+			}
+		}
+		ids := make([]string, 0, len(s.rollupJobs))
+		for k := range s.rollupJobs {
+			if jobID == "" || jobID == "_all" || jobID == "*" || matchMultiWildcardWithExclusions(jobID, k) {
+				ids = append(ids, k)
+			}
+		}
+		sort.Strings(ids)
+		jobs := make([]any, 0, len(ids))
+		for _, k := range ids {
+			entry := s.rollupJobs[k]
+			state, _ := entry["state"].(string)
+			if state == "" {
+				state = "STOPPED"
+			}
+			cfg, _ := entry["config"].(map[string]any)
+			jobs = append(jobs, map[string]any{
+				"config": deepCloneDocMap(cfg),
+				"status": map[string]any{
+					"job_state": state,
+				},
+				"stats": map[string]any{
+					"pages_processed":     0,
+					"documents_processed": 0,
+					"rollups_indexed":     0,
+					"trigger_count":       0,
+				},
+			})
+		}
+		s.mu.RUnlock()
+		writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
+
+	case http.MethodDelete:
+		if jobID == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: id is missing;")
+			return
+		}
+		s.mu.Lock()
+		if _, exists := s.rollupJobs[jobID]; !exists {
+			s.mu.Unlock()
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Rollup job [%s] does not exist", jobID))
+			return
+		}
+		delete(s.rollupJobs, jobID)
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+	default:
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+	}
+}
+
+// handleRollupSearch implements `GET/POST /{index}/_rollup_search` and `GET/POST /_rollup_search` (F6).
+func (s *Server) handleRollupSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	if rawFrom := strings.TrimSpace(r.URL.Query().Get("from")); rawFrom != "" {
+		if fv, err := strconv.Atoi(rawFrom); err == nil && fv > 0 {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "From is not supported in RollupSearch")
+			return
+		}
+	}
+	bodyBytes, ok := readRequestBody(w, r)
+	if !ok {
+		return
+	}
+	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		var body map[string]any
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+			return
+		}
+		if fv, okF := toInt64(body["from"]); okF && fv > 0 {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "From is not supported in RollupSearch")
+			return
+		}
+	}
+	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	s.handleSearch(w, r)
+}
+
+// handleSearchableSnapshots implements `/_searchable_snapshots/*` and `/{index}/_searchable_snapshots/stats` (F7).
+func (s *Server) handleSearchableSnapshots(w http.ResponseWriter, r *http.Request, segs []string, indexName string) {
+	if len(segs) == 3 && segs[0] == "_searchable_snapshots" && segs[1] == "cache" && segs[2] == "clear" {
+		if r.Method != http.MethodPost {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0},
+		})
+		return
+	}
+	if len(segs) == 3 && segs[0] == "_searchable_snapshots" && segs[1] == "cache" && segs[2] == "stats" {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"nodes": map[string]any{
+				"doris-fe-1": map[string]any{
+					"shared_cache": map[string]any{
+						"reads":                0,
+						"bytes_read_in_bytes":  0,
+						"hits":                 0,
+						"misses":               0,
+						"evictions":            0,
+						"num_regions":          0,
+						"size_in_bytes":        0,
+						"region_size_in_bytes": 16777216,
+					},
+				},
+			},
+		})
+		return
+	}
+	if (len(segs) == 2 && segs[0] == "_searchable_snapshots" && segs[1] == "stats") || (indexName != "" && len(segs) == 3 && segs[2] == "stats") {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		var targets []string
+		if indexName != "" {
+			var ok bool
+			targets, _, ok = s.resolveValidatedReadTargets(w, r, indexName)
+			if !ok {
+				return
+			}
+		} else {
+			s.mu.RLock()
+			for idx, cs := range s.indexCustomSettings {
+				if cs["store.type"] == "snapshot" {
+					targets = append(targets, idx)
+				}
+			}
+			s.mu.RUnlock()
+			sort.Strings(targets)
+		}
+		indicesMap := make(map[string]any, len(targets))
+		for _, idx := range targets {
+			indicesMap[idx] = map[string]any{
+				"primaries": map[string]any{
+					"http": map[string]any{"Requests": 0},
+				},
+				"total": map[string]any{
+					"http": map[string]any{"Requests": 0},
+				},
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0},
+			"indices": indicesMap,
+		})
+		return
+	}
+	writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+}
+
+// handleCCR implements `/_ccr/*` and `/{index}/_ccr/*` (F7).
+func (s *Server) handleCCR(w http.ResponseWriter, r *http.Request, segs []string, indexName string) {
+	if indexName != "" {
+		action := ""
+		if len(segs) >= 3 {
+			action = strings.TrimSpace(segs[2])
+		}
+		switch action {
+		case "follow":
+			if r.Method != http.MethodPut && r.Method != http.MethodPost {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			bodyBytes, ok := readRequestBody(w, r)
+			if !ok {
+				return
+			}
+			var body map[string]any
+			if len(bytes.TrimSpace(bodyBytes)) > 0 {
+				if err := json.Unmarshal(bodyBytes, &body); err != nil {
+					writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+					return
+				}
+			}
+			remoteCluster, _ := body["remote_cluster"].(string)
+			leaderIndex, _ := body["leader_index"].(string)
+			if strings.TrimSpace(remoteCluster) == "" || strings.TrimSpace(leaderIndex) == "" {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					"ccr follow requires [remote_cluster] and [leader_index]")
+				return
+			}
+			_ = s.ensureIndexSchema(r.Context(), indexName)
+			s.mu.Lock()
+			if s.ccrFollowers == nil {
+				s.ccrFollowers = make(map[string]map[string]any)
+			}
+			s.ccrFollowers[indexName] = map[string]any{
+				"follower_index": indexName,
+				"remote_cluster": remoteCluster,
+				"leader_index":   leaderIndex,
+				"status":         "active",
+				"parameters":     map[string]any{},
+			}
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{
+				"follow_index_created":      true,
+				"follow_index_shards_acked": true,
+				"index_following_started":   true,
+			})
+
+		case "info":
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			s.mu.RLock()
+			info, exists := s.ccrFollowers[indexName]
+			if !exists {
+				s.mu.RUnlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("follower index [%s] not found", indexName))
+				return
+			}
+			cp := deepCloneDocMap(info)
+			s.mu.RUnlock()
+			writeJSON(w, http.StatusOK, map[string]any{
+				"follower_indices": []any{cp},
+			})
+
+		case "stats":
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			s.mu.RLock()
+			info, exists := s.ccrFollowers[indexName]
+			if !exists {
+				s.mu.RUnlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("follower index [%s] not found", indexName))
+				return
+			}
+			rc, _ := info["remote_cluster"].(string)
+			li, _ := info["leader_index"].(string)
+			s.mu.RUnlock()
+			writeJSON(w, http.StatusOK, map[string]any{
+				"indices": []any{
+					map[string]any{
+						"index": indexName,
+						"shards": []any{
+							map[string]any{
+								"remote_cluster":             rc,
+								"leader_index":               li,
+								"follower_index":             indexName,
+								"shard_id":                   0,
+								"leader_global_checkpoint":   0,
+								"leader_max_seq_no":          0,
+								"follower_global_checkpoint": 0,
+								"follower_max_seq_no":        0,
+							},
+						},
+					},
+				},
+			})
+
+		case "pause_follow":
+			if r.Method != http.MethodPost {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			s.mu.Lock()
+			info, exists := s.ccrFollowers[indexName]
+			if !exists {
+				s.mu.Unlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("follower index [%s] not found", indexName))
+				return
+			}
+			info["status"] = "paused"
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+		case "resume_follow":
+			if r.Method != http.MethodPost {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			s.mu.Lock()
+			info, exists := s.ccrFollowers[indexName]
+			if !exists {
+				s.mu.Unlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("follower index [%s] not found", indexName))
+				return
+			}
+			info["status"] = "active"
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+		case "unfollow":
+			if r.Method != http.MethodPost {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			s.mu.Lock()
+			if _, exists := s.ccrFollowers[indexName]; !exists {
+				s.mu.Unlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("follower index [%s] not found", indexName))
+				return
+			}
+			delete(s.ccrFollowers, indexName)
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+		case "forget_follower":
+			if r.Method != http.MethodPost {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0},
+			})
+
+		default:
+			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+		}
+		return
+	}
+
+	if len(segs) == 2 && segs[1] == "stats" {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"auto_follow_stats": map[string]any{
+				"number_of_failed_follow_indices":                0,
+				"number_of_failed_remote_cluster_state_requests": 0,
+				"number_of_successful_follow_indices":            0,
+				"total_read_time_millis":                         0,
+				"auto_followed_clusters":                         []any{},
+			},
+			"follow_stats": map[string]any{
+				"indices": []any{},
+			},
+		})
+		return
+	}
+
+	if len(segs) >= 2 && segs[1] == "auto_follow" {
+		var name, action string
+		if len(segs) >= 3 {
+			name = strings.TrimSpace(segs[2])
+		}
+		if len(segs) >= 4 {
+			action = strings.TrimSpace(segs[3])
+		}
+		if action != "" {
+			if r.Method != http.MethodPost {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			s.mu.Lock()
+			entry, exists := s.ccrAutoFollow[name]
+			if !exists || entry == nil {
+				s.mu.Unlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("auto_follow pattern [%s] not found", name))
+				return
+			}
+			switch action {
+			case "_pause", "pause":
+				entry["active"] = false
+			case "_resume", "resume":
+				entry["active"] = true
+			default:
+				s.mu.Unlock()
+				writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown action ["+action+"]")
+				return
+			}
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+			return
+		}
+
+		switch r.Method {
+		case http.MethodPut, http.MethodPost:
+			if name == "" {
+				writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: name is missing;")
+				return
+			}
+			bodyBytes, ok := readRequestBody(w, r)
+			if !ok {
+				return
+			}
+			var body map[string]any
+			if len(bytes.TrimSpace(bodyBytes)) > 0 {
+				if err := json.Unmarshal(bodyBytes, &body); err != nil {
+					writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+					return
+				}
+			}
+			rc, _ := body["remote_cluster"].(string)
+			pats, _ := body["leader_index_patterns"].([]any)
+			if strings.TrimSpace(rc) == "" || len(pats) == 0 {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					"auto_follow pattern requires [remote_cluster] and non-empty [leader_index_patterns]")
+				return
+			}
+			s.mu.Lock()
+			if s.ccrAutoFollow == nil {
+				s.ccrAutoFollow = make(map[string]map[string]any)
+			}
+			cp := deepCloneDocMap(body)
+			cp["active"] = true
+			s.ccrAutoFollow[name] = cp
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+		case http.MethodGet, http.MethodHead:
+			s.mu.RLock()
+			if name != "" && name != "_all" && name != "*" {
+				entry, exists := s.ccrAutoFollow[name]
+				if !exists {
+					s.mu.RUnlock()
+					writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("auto_follow pattern [%s] not found", name))
+					return
+				}
+				cp := deepCloneDocMap(entry)
+				active, _ := cp["active"].(bool)
+				delete(cp, "active")
+				s.mu.RUnlock()
+				writeJSON(w, http.StatusOK, map[string]any{
+					"patterns": []any{
+						map[string]any{
+							"name":    name,
+							"active":  active,
+							"pattern": cp,
+						},
+					},
+				})
+				return
+			}
+			names := make([]string, 0, len(s.ccrAutoFollow))
+			for k := range s.ccrAutoFollow {
+				names = append(names, k)
+			}
+			sort.Strings(names)
+			patterns := make([]any, 0, len(names))
+			for _, k := range names {
+				cp := deepCloneDocMap(s.ccrAutoFollow[k])
+				active, _ := cp["active"].(bool)
+				delete(cp, "active")
+				patterns = append(patterns, map[string]any{
+					"name":    k,
+					"active":  active,
+					"pattern": cp,
+				})
+			}
+			s.mu.RUnlock()
+			writeJSON(w, http.StatusOK, map[string]any{"patterns": patterns})
+
+		case http.MethodDelete:
+			if name == "" {
+				writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: name is missing;")
+				return
+			}
+			s.mu.Lock()
+			if _, exists := s.ccrAutoFollow[name]; !exists {
+				s.mu.Unlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("auto_follow pattern [%s] not found", name))
+				return
+			}
+			delete(s.ccrAutoFollow, name)
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+		default:
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		}
+		return
+	}
+	writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+}
+
+// handleSecurityAPI implements Elasticsearch `/_security/*` management endpoints (users, roles, privileges, API keys, OAuth2 tokens, service accounts) (F8).
+func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs []string) {
+	if len(segs) < 2 {
+		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+		return
+	}
+	switch segs[1] {
+	case "_authenticate":
+		s.handleSecurityAuthenticate(w, r)
+
+	case "user":
+		if len(segs) == 2 {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			s.mu.RLock()
+			out := make(map[string]any, len(s.securityUsers)+1)
+			out["elastic"] = map[string]any{
+				"username":  "elastic",
+				"roles":     []string{"superuser"},
+				"full_name": "Built-in Superuser",
+				"email":     "",
+				"metadata":  map[string]any{},
+				"enabled":   true,
+			}
+			for u, info := range s.securityUsers {
+				out[u] = deepCloneDocMap(info)
+			}
+			s.mu.RUnlock()
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		target := strings.TrimSpace(segs[2])
+		if target == "_has_privileges" || (len(segs) == 4 && segs[3] == "_has_privileges") {
+			bodyBytes, ok := readRequestBody(w, r)
+			if !ok {
+				return
+			}
+			var body map[string]any
+			if len(bytes.TrimSpace(bodyBytes)) > 0 {
+				_ = json.Unmarshal(bodyBytes, &body)
+			}
+			clusterOut := make(map[string]any)
+			if cList, ok := body["cluster"].([]any); ok {
+				for _, item := range cList {
+					clusterOut[fmt.Sprintf("%v", item)] = true
+				}
+			}
+			indexOut := make(map[string]any)
+			if iList, ok := body["index"].([]any); ok {
+				for _, item := range iList {
+					if im, ok := item.(map[string]any); ok {
+						names, _ := im["names"].([]any)
+						privs, _ := im["privileges"].([]any)
+						privMap := make(map[string]any, len(privs))
+						for _, p := range privs {
+							privMap[fmt.Sprintf("%v", p)] = true
+						}
+						for _, n := range names {
+							indexOut[fmt.Sprintf("%v", n)] = privMap
+						}
+					}
+				}
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"username":          "elastic",
+				"has_all_requested": true,
+				"cluster":           clusterOut,
+				"index":             indexOut,
+				"application":       map[string]any{},
+			})
+			return
+		}
+		if len(segs) == 4 {
+			action := strings.TrimSpace(segs[3])
+			if r.Method != http.MethodPut && r.Method != http.MethodPost {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			s.mu.Lock()
+			userObj, exists := s.securityUsers[target]
+			if !exists && target != "elastic" {
+				s.mu.Unlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("user [%s] not found", target))
+				return
+			}
+			switch action {
+			case "_enable":
+				if userObj != nil {
+					userObj["enabled"] = true
+				}
+				s.mu.Unlock()
+				writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+			case "_disable":
+				if userObj != nil {
+					userObj["enabled"] = false
+				}
+				s.mu.Unlock()
+				writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+			case "_password":
+				s.mu.Unlock()
+				bodyBytes, ok := readRequestBody(w, r)
+				if !ok {
+					return
+				}
+				var body map[string]any
+				_ = json.Unmarshal(bodyBytes, &body)
+				if pw, _ := body["password"].(string); strings.TrimSpace(pw) == "" {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[password] is required")
+					return
+				}
+				writeJSON(w, http.StatusOK, map[string]any{})
+			default:
+				s.mu.Unlock()
+				writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+			}
+			return
+		}
+		switch r.Method {
+		case http.MethodPut, http.MethodPost:
+			bodyBytes, ok := readRequestBody(w, r)
+			if !ok {
+				return
+			}
+			var body map[string]any
+			if len(bytes.TrimSpace(bodyBytes)) > 0 {
+				if err := json.Unmarshal(bodyBytes, &body); err != nil {
+					writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+					return
+				}
+			}
+			roles, hasRoles := body["roles"].([]any)
+			if !hasRoles || roles == nil {
+				writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: roles are missing;")
+				return
+			}
+			s.mu.Lock()
+			if s.securityUsers == nil {
+				s.securityUsers = make(map[string]map[string]any)
+			}
+			_, existed := s.securityUsers[target]
+			enabled := true
+			if b, ok := body["enabled"].(bool); ok {
+				enabled = b
+			}
+			fullName, _ := body["full_name"].(string)
+			email, _ := body["email"].(string)
+			meta, _ := body["metadata"].(map[string]any)
+			if meta == nil {
+				meta = map[string]any{}
+			}
+			s.securityUsers[target] = map[string]any{
+				"username":  target,
+				"roles":     roles,
+				"full_name": fullName,
+				"email":     email,
+				"metadata":  meta,
+				"enabled":   enabled,
+			}
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{
+				"user": map[string]any{"created": !existed},
+			})
+
+		case http.MethodGet, http.MethodHead:
+			s.mu.RLock()
+			u, exists := s.securityUsers[target]
+			if !exists && target == "elastic" {
+				u = map[string]any{
+					"username":  "elastic",
+					"roles":     []string{"superuser"},
+					"full_name": "Built-in Superuser",
+					"email":     "",
+					"metadata":  map[string]any{},
+					"enabled":   true,
+				}
+				exists = true
+			}
+			if !exists {
+				s.mu.RUnlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("user [%s] not found", target))
+				return
+			}
+			cp := deepCloneDocMap(u)
+			s.mu.RUnlock()
+			writeJSON(w, http.StatusOK, map[string]any{target: cp})
+
+		case http.MethodDelete:
+			s.mu.Lock()
+			_, exists := s.securityUsers[target]
+			if exists {
+				delete(s.securityUsers, target)
+			}
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"found": exists})
+
+		default:
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		}
+
+	case "role":
+		if len(segs) == 2 {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			s.mu.RLock()
+			out := make(map[string]any, len(s.securityRoles))
+			for k, v := range s.securityRoles {
+				out[k] = deepCloneDocMap(v)
+			}
+			s.mu.RUnlock()
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		roleName := strings.TrimSpace(segs[2])
+		if len(segs) == 4 && segs[3] == "_clear_cache" {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"_nodes": map[string]any{"total": 1, "successful": 1, "failed": 0},
+			})
+			return
+		}
+		switch r.Method {
+		case http.MethodPut, http.MethodPost:
+			bodyBytes, ok := readRequestBody(w, r)
+			if !ok {
+				return
+			}
+			var body map[string]any
+			if len(bytes.TrimSpace(bodyBytes)) > 0 {
+				if err := json.Unmarshal(bodyBytes, &body); err != nil {
+					writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+					return
+				}
+			}
+			if body == nil {
+				writeESError(w, http.StatusBadRequest, "parse_exception", "role body is required")
+				return
+			}
+			s.mu.Lock()
+			if s.securityRoles == nil {
+				s.securityRoles = make(map[string]map[string]any)
+			}
+			_, existed := s.securityRoles[roleName]
+			s.securityRoles[roleName] = deepCloneDocMap(body)
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{
+				"role": map[string]any{"created": !existed},
+			})
+
+		case http.MethodGet, http.MethodHead:
+			s.mu.RLock()
+			roleObj, exists := s.securityRoles[roleName]
+			if !exists {
+				s.mu.RUnlock()
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("role [%s] not found", roleName))
+				return
+			}
+			cp := deepCloneDocMap(roleObj)
+			s.mu.RUnlock()
+			writeJSON(w, http.StatusOK, map[string]any{roleName: cp})
+
+		case http.MethodDelete:
+			s.mu.Lock()
+			_, exists := s.securityRoles[roleName]
+			if exists {
+				delete(s.securityRoles, roleName)
+			}
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"found": exists})
+
+		default:
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		}
+
+	case "privilege":
+		if len(segs) == 3 && segs[2] == "_builtin" {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"cluster": []string{"all", "monitor", "manage", "manage_index_templates", "manage_ingest_pipelines"},
+				"index":   []string{"all", "read", "write", "create", "create_index", "delete", "delete_index", "manage", "monitor"},
+			})
+			return
+		}
+		switch r.Method {
+		case http.MethodPut, http.MethodPost:
+			bodyBytes, ok := readRequestBody(w, r)
+			if !ok {
+				return
+			}
+			var body map[string]any
+			if len(bytes.TrimSpace(bodyBytes)) > 0 {
+				if err := json.Unmarshal(bodyBytes, &body); err != nil {
+					writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+					return
+				}
+			}
+			s.mu.Lock()
+			if s.securityPrivileges == nil {
+				s.securityPrivileges = make(map[string]map[string]map[string]any)
+			}
+			out := make(map[string]any)
+			for appName, privsAny := range body {
+				privsMap, ok := privsAny.(map[string]any)
+				if !ok {
+					continue
+				}
+				if s.securityPrivileges[appName] == nil {
+					s.securityPrivileges[appName] = make(map[string]map[string]any)
+				}
+				appRes := make(map[string]any)
+				for privName, specAny := range privsMap {
+					specMap, _ := specAny.(map[string]any)
+					_, existed := s.securityPrivileges[appName][privName]
+					s.securityPrivileges[appName][privName] = deepCloneDocMap(specMap)
+					appRes[privName] = map[string]any{"created": !existed}
+				}
+				out[appName] = appRes
+			}
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, out)
+
+		case http.MethodGet, http.MethodHead:
+			s.mu.RLock()
+			out := make(map[string]any)
+			if len(segs) >= 3 {
+				appName := segs[2]
+				appPrivs, exists := s.securityPrivileges[appName]
+				if !exists {
+					s.mu.RUnlock()
+					writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("application [%s] privileges not found", appName))
+					return
+				}
+				if len(segs) >= 4 {
+					privName := segs[3]
+					privSpec, pExists := appPrivs[privName]
+					if !pExists {
+						s.mu.RUnlock()
+						writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("privilege [%s/%s] not found", appName, privName))
+						return
+					}
+					out[appName] = map[string]any{privName: deepCloneDocMap(privSpec)}
+				} else {
+					appCopy := make(map[string]any, len(appPrivs))
+					for k, v := range appPrivs {
+						appCopy[k] = deepCloneDocMap(v)
+					}
+					out[appName] = appCopy
+				}
+			} else {
+				for appName, appPrivs := range s.securityPrivileges {
+					appCopy := make(map[string]any, len(appPrivs))
+					for k, v := range appPrivs {
+						appCopy[k] = deepCloneDocMap(v)
+					}
+					out[appName] = appCopy
+				}
+			}
+			s.mu.RUnlock()
+			writeJSON(w, http.StatusOK, out)
+
+		case http.MethodDelete:
+			if len(segs) < 4 {
+				writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "application and privilege name required")
+				return
+			}
+			appName, privName := segs[2], segs[3]
+			s.mu.Lock()
+			found := false
+			if s.securityPrivileges[appName] != nil {
+				if _, exists := s.securityPrivileges[appName][privName]; exists {
+					found = true
+					delete(s.securityPrivileges[appName], privName)
+				}
+			}
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{
+				appName: map[string]any{
+					privName: map[string]any{"found": found},
+				},
+			})
+
+		default:
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		}
+
+	case "api_key":
+		switch r.Method {
+		case http.MethodPost, http.MethodPut:
+			bodyBytes, ok := readRequestBody(w, r)
+			if !ok {
+				return
+			}
+			var body map[string]any
+			if len(bytes.TrimSpace(bodyBytes)) > 0 {
+				if err := json.Unmarshal(bodyBytes, &body); err != nil {
+					writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+					return
+				}
+			}
+			if len(segs) == 3 && segs[2] == "_grant" {
+				if subKey, ok := body["api_key"].(map[string]any); ok {
+					body = subKey
+				}
+			}
+			name, _ := body["name"].(string)
+			if strings.TrimSpace(name) == "" {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "api_key [name] is required")
+				return
+			}
+			s.mu.Lock()
+			if s.securityAPIKeys == nil {
+				s.securityAPIKeys = make(map[string]map[string]any)
+			}
+			keyID := fmt.Sprintf("key-%d", len(s.securityAPIKeys)+1)
+			secret := "secret-" + keyID
+			encoded := base64EncodeStr(keyID + ":" + secret)
+			s.securityAPIKeys[keyID] = map[string]any{
+				"id":          keyID,
+				"name":        name,
+				"username":    "elastic",
+				"realm":       "default_native",
+				"invalidated": false,
+				"creation":    time.Now().UTC().UnixMilli(),
+				"metadata":    body["metadata"],
+			}
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{
+				"id":      keyID,
+				"name":    name,
+				"api_key": secret,
+				"encoded": encoded,
+			})
+
+		case http.MethodGet:
+			qID := strings.TrimSpace(r.URL.Query().Get("id"))
+			qName := strings.TrimSpace(r.URL.Query().Get("name"))
+			s.mu.RLock()
+			keys := make([]any, 0, len(s.securityAPIKeys))
+			for _, kObj := range s.securityAPIKeys {
+				if qID != "" && kObj["id"] != qID {
+					continue
+				}
+				if qName != "" && kObj["name"] != qName {
+					continue
+				}
+				keys = append(keys, deepCloneDocMap(kObj))
+			}
+			s.mu.RUnlock()
+			writeJSON(w, http.StatusOK, map[string]any{"api_keys": keys})
+
+		case http.MethodDelete:
+			bodyBytes, ok := readRequestBody(w, r)
+			if !ok {
+				return
+			}
+			var body map[string]any
+			if len(bytes.TrimSpace(bodyBytes)) > 0 {
+				_ = json.Unmarshal(bodyBytes, &body)
+			}
+			var invalidated []string
+			s.mu.Lock()
+			if ids, ok := body["ids"].([]any); ok {
+				for _, idAny := range ids {
+					idStr := fmt.Sprintf("%v", idAny)
+					if kObj, exists := s.securityAPIKeys[idStr]; exists {
+						kObj["invalidated"] = true
+						invalidated = append(invalidated, idStr)
+					}
+				}
+			} else if nameStr, ok := body["name"].(string); ok && nameStr != "" {
+				for idStr, kObj := range s.securityAPIKeys {
+					if kObj["name"] == nameStr {
+						kObj["invalidated"] = true
+						invalidated = append(invalidated, idStr)
+					}
+				}
+			}
+			s.mu.Unlock()
+			if invalidated == nil {
+				invalidated = []string{}
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"invalidated_api_keys":            invalidated,
+				"previously_invalidated_api_keys": []string{},
+				"error_count":                     0,
+			})
+
+		default:
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		}
+
+	case "_query":
+		if len(segs) == 3 && segs[2] == "api_key" {
+			s.mu.RLock()
+			hits := make([]any, 0, len(s.securityAPIKeys))
+			for _, kObj := range s.securityAPIKeys {
+				hits = append(hits, deepCloneDocMap(kObj))
+			}
+			s.mu.RUnlock()
+			writeJSON(w, http.StatusOK, map[string]any{
+				"total":    len(hits),
+				"count":    len(hits),
+				"api_keys": hits,
+			})
+			return
+		}
+		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+
+	case "_clear_api_key_cache":
+		writeJSON(w, http.StatusOK, map[string]any{
+			"_nodes": map[string]any{"total": 1, "successful": 1, "failed": 0},
+		})
+
+	case "oauth2":
+		if len(segs) == 3 && segs[2] == "token" {
+			switch r.Method {
+			case http.MethodPost, http.MethodPut:
+				bodyBytes, ok := readRequestBody(w, r)
+				if !ok {
+					return
+				}
+				var body map[string]any
+				if len(bytes.TrimSpace(bodyBytes)) > 0 {
+					if err := json.Unmarshal(bodyBytes, &body); err != nil {
+						writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+						return
+					}
+				}
+				grantType, _ := body["grant_type"].(string)
+				if strings.TrimSpace(grantType) == "" {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[grant_type] is required")
+					return
+				}
+				writeJSON(w, http.StatusOK, map[string]any{
+					"access_token":  "doris-oauth2-access-token",
+					"type":          "Bearer",
+					"expires_in":    1200,
+					"refresh_token": "doris-oauth2-refresh-token",
+				})
+			case http.MethodDelete:
+				writeJSON(w, http.StatusOK, map[string]any{
+					"invalidated_tokens": 1,
+					"error_count":        0,
+				})
+			default:
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			}
+			return
+		}
+		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+
+	case "service":
+		if len(segs) == 2 {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"elastic/fleet-server": map[string]any{"account": "elastic/fleet-server"},
+				"elastic/kibana":       map[string]any{"account": "elastic/kibana"},
+			})
+			return
+		}
+		if len(segs) >= 6 && segs[4] == "credential" && segs[5] == "token" {
+			ns, svc := segs[2], segs[3]
+			acct := ns + "/" + svc
+			tokenName := ""
+			if len(segs) >= 7 {
+				tokenName = segs[6]
+			}
+			switch r.Method {
+			case http.MethodPost, http.MethodPut:
+				if tokenName == "" {
+					tokenName = "token-1"
+				}
+				s.mu.Lock()
+				if s.securityServiceTokens == nil {
+					s.securityServiceTokens = make(map[string]map[string]any)
+				}
+				s.securityServiceTokens[acct+"/"+tokenName] = map[string]any{
+					"name":       tokenName,
+					"created_at": "2026-01-01T00:00:00.000Z",
+				}
+				s.mu.Unlock()
+				writeJSON(w, http.StatusOK, map[string]any{
+					"created": true,
+					"token": map[string]any{
+						"name":  tokenName,
+						"value": "aae_doris_service_token_" + tokenName,
+					},
+				})
+			case http.MethodGet:
+				s.mu.RLock()
+				tokens := make(map[string]any)
+				prefix := acct + "/"
+				for k, v := range s.securityServiceTokens {
+					if strings.HasPrefix(k, prefix) {
+						tName := strings.TrimPrefix(k, prefix)
+						tokens[tName] = deepCloneDocMap(v)
+					}
+				}
+				s.mu.RUnlock()
+				writeJSON(w, http.StatusOK, map[string]any{
+					"service_account": acct,
+					"count":           len(tokens),
+					"tokens":          tokens,
+				})
+			case http.MethodDelete:
+				s.mu.Lock()
+				key := acct + "/" + tokenName
+				_, existed := s.securityServiceTokens[key]
+				delete(s.securityServiceTokens, key)
+				s.mu.Unlock()
+				writeJSON(w, http.StatusOK, map[string]any{"found": existed})
+			default:
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"account": strings.Join(segs[2:], "/")})
+
+	default:
+		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+	}
+}
+
+func base64EncodeStr(s string) string {
+	const table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	b := []byte(s)
+	var out strings.Builder
+	for i := 0; i < len(b); i += 3 {
+		v := uint(b[i]) << 16
+		rem := len(b) - i
+		if rem > 1 {
+			v |= uint(b[i+1]) << 8
+		}
+		if rem > 2 {
+			v |= uint(b[i+2])
+		}
+		out.WriteByte(table[(v>>18)&0x3F])
+		out.WriteByte(table[(v>>12)&0x3F])
+		if rem > 1 {
+			out.WriteByte(table[(v>>6)&0x3F])
+		} else {
+			out.WriteByte('=')
+		}
+		if rem > 2 {
+			out.WriteByte(table[v&0x3F])
+		} else {
+			out.WriteByte('=')
+		}
+	}
+	return out.String()
+}
+
+// handleLogstashPipeline implements `PUT/GET/DELETE /_logstash/pipeline/{id}` and `GET /_logstash/pipeline` (F8).
+func (s *Server) handleLogstashPipeline(w http.ResponseWriter, r *http.Request, segs []string) {
+	if len(segs) < 2 || segs[1] != "pipeline" {
+		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+		return
+	}
+	id := ""
+	if len(segs) >= 3 {
+		id = strings.TrimSpace(segs[2])
+	}
+	switch r.Method {
+	case http.MethodPut, http.MethodPost:
+		if id == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: id is missing;")
+			return
+		}
+		bodyBytes, ok := readRequestBody(w, r)
+		if !ok {
+			return
+		}
+		var body map[string]any
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &body); err != nil {
+				writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+				return
+			}
+		}
+		pipeStr, _ := body["pipeline"].(string)
+		if strings.TrimSpace(pipeStr) == "" {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[pipeline] property is required")
+			return
+		}
+		s.mu.Lock()
+		if s.logstashPipelines == nil {
+			s.logstashPipelines = make(map[string]map[string]any)
+		}
+		cp := deepCloneDocMap(body)
+		cp["last_modified"] = "2026-01-01T00:00:00.000Z"
+		if cp["username"] == nil {
+			cp["username"] = "elastic"
+		}
+		s.logstashPipelines[id] = cp
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+	case http.MethodGet, http.MethodHead:
+		s.mu.RLock()
+		out := make(map[string]any)
+		if id == "" || id == "_all" || id == "*" {
+			for k, v := range s.logstashPipelines {
+				out[k] = deepCloneDocMap(v)
+			}
+		} else {
+			for _, pat := range strings.Split(id, ",") {
+				pat = strings.TrimSpace(pat)
+				if pat == "" {
+					continue
+				}
+				if strings.ContainsAny(pat, "*?") {
+					for k, v := range s.logstashPipelines {
+						if matchWildcardPattern(pat, k) {
+							out[k] = deepCloneDocMap(v)
+						}
+					}
+				} else if v, exists := s.logstashPipelines[pat]; exists {
+					out[pat] = deepCloneDocMap(v)
+				} else {
+					s.mu.RUnlock()
+					if r.Method == http.MethodHead {
+						w.WriteHeader(http.StatusNotFound)
+						return
+					}
+					writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("logstash pipeline [%s] not found", pat))
+					return
+				}
+			}
+		}
+		s.mu.RUnlock()
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+
+	case http.MethodDelete:
+		if id == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: id is missing;")
+			return
+		}
+		s.mu.Lock()
+		if _, exists := s.logstashPipelines[id]; !exists {
+			s.mu.Unlock()
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("logstash pipeline [%s] not found", id))
+			return
+		}
+		delete(s.logstashPipelines, id)
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 

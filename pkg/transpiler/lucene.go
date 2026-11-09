@@ -135,6 +135,12 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 			return out
 		}
 	}
+	if !isSimple && (qsq.Lenient == nil || !*qsq.Lenient) && hasUnclosedLuceneRange(raw) {
+		if t.searchErr == nil {
+			t.searchErr = fmt.Errorf("parse_exception: failed to parse query [%s]: unclosed range query", qsq.Query)
+		}
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
 	parsedAST := parseSimpleLuceneToASTWithFlags(raw, defaultField, expandedFields, defaultOp, 0, isSimple, flags)
 	if qsq.MinimumShouldMatch != nil && parsedAST.Bool != nil {
 		if len(parsedAST.Bool.Should) > 0 {
@@ -1677,6 +1683,50 @@ func sanitizeSimpleQueryInput(s string, flags simpleQueryFlags) string {
 
 func tokenizeLucene(s string) []string {
 	return tokenizeLuceneWithFlags(s, false, allSimpleQueryFlags())
+}
+
+func hasUnclosedLuceneRange(s string) bool {
+	inQuotes := false
+	inRegex := false
+	escaped := false
+	bracketDepth := 0
+	for i, r := range s {
+		if escaped {
+			escaped = false
+			continue
+		}
+		switch r {
+		case '\\':
+			escaped = true
+		case '"':
+			if !inRegex {
+				inQuotes = !inQuotes
+			}
+		case '/':
+			if !inQuotes && bracketDepth == 0 {
+				if inRegex {
+					inRegex = false
+				} else if strings.ContainsRune(s[i+1:], '/') {
+					if i == 0 || s[i-1] == ' ' || s[i-1] == '\t' || s[i-1] == '\n' || s[i-1] == ':' || s[i-1] == '(' || s[i-1] == '+' || s[i-1] == '-' || s[i-1] == '!' {
+						inRegex = true
+					}
+				}
+			}
+		case '[', '{':
+			if !inQuotes && !inRegex {
+				bracketDepth++
+			}
+		case ']', '}':
+			if !inQuotes && !inRegex && bracketDepth > 0 {
+				bracketDepth--
+			}
+		case ')':
+			if !inQuotes && !inRegex && bracketDepth > 0 {
+				return true
+			}
+		}
+	}
+	return bracketDepth > 0
 }
 
 func tokenizeLuceneWithFlags(s string, isSimple bool, flags simpleQueryFlags) []string {

@@ -313,8 +313,14 @@ func (t *Transpiler) validateAggsDocValues(aggs map[string]esast.AggSpec, nctx *
 		if spec.TTest != nil {
 			checkField(spec.TTest.A.Field, nctx)
 			t.checkScriptDocValues(spec.TTest.A.Script, nctx)
+			if spec.TTest.A.Filter != nil {
+				_ = t.CompileQuery(spec.TTest.A.Filter, false, nctx)
+			}
 			checkField(spec.TTest.B.Field, nctx)
 			t.checkScriptDocValues(spec.TTest.B.Script, nctx)
+			if spec.TTest.B.Filter != nil {
+				_ = t.CompileQuery(spec.TTest.B.Filter, false, nctx)
+			}
 		}
 		if spec.GeoBounds != nil {
 			checkField(spec.GeoBounds.Field, nctx)
@@ -338,7 +344,11 @@ func (t *Transpiler) validateAggsDocValues(aggs map[string]esast.AggSpec, nctx *
 		if spec.Nested != nil && spec.Nested.Path != "" {
 			t.validateAggsDocValues(spec.SubAggs(), &nestedCtx{nestedPath: spec.Nested.Path})
 		} else if spec.ReverseNested != nil {
-			t.validateAggsDocValues(spec.SubAggs(), nil)
+			var rnNCtx *nestedCtx
+			if rnPath, _ := spec.ReverseNested["path"].(string); strings.TrimSpace(rnPath) != "" {
+				rnNCtx = &nestedCtx{nestedPath: strings.TrimSpace(rnPath)}
+			}
+			t.validateAggsDocValues(spec.SubAggs(), rnNCtx)
 		} else {
 			t.validateAggsDocValues(spec.SubAggs(), nctx)
 		}
@@ -350,10 +360,37 @@ type nestedCtx struct {
 	elemVar    string
 }
 
+// LowerRetrieverToSearchRequest lowers an ES 8.x top-level `retriever` tree into `query`, `knn`, `sub_searches`, and `rank`.
+func LowerRetrieverToSearchRequest(req *esast.SearchRequest) {
+	esast.LowerRetrieverToSearchRequest(req)
+}
+
 // BuildSearchPlan compiles an Elasticsearch `SearchRequest` into a Doris `ExecutionPlan`.
 func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, error) {
 	t.unindexedFields = make(map[string]bool)
 	t.searchErr = nil
+	if req != nil && req.Retriever != nil {
+		esast.LowerRetrieverToSearchRequest(req)
+	}
+	if req != nil && req.Query == nil && len(req.SubSearches) > 0 {
+		var shoulds []esast.Query
+		for i := range req.SubSearches {
+			if req.SubSearches[i].Query != nil {
+				shoulds = append(shoulds, *req.SubSearches[i].Query)
+			}
+		}
+		if len(shoulds) == 1 {
+			qCopy := shoulds[0]
+			req.Query = &qCopy
+		} else if len(shoulds) > 1 {
+			req.Query = &esast.Query{
+				Bool: &esast.BoolQuery{
+					Should:             shoulds,
+					MinimumShouldMatch: 1,
+				},
+			}
+		}
+	}
 
 	mainQ := CompiledQuery{
 		WhereSQL: "TRUE",
@@ -1304,6 +1341,10 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		return t.compileParentID(q.ParentID, scoring, nctx)
 	case q.Percolate != nil:
 		return t.compilePercolate(q.Percolate, scoring, nctx)
+	case q.Rule != nil:
+		return t.compileRuleQuery(q.Rule, scoring, nctx)
+	case q.SparseVector != nil:
+		return t.compileSparseVectorQuery(q.SparseVector, scoring, nctx)
 	}
 	return CompiledQuery{WhereSQL: "TRUE", ScoreSQL: "1.0"}
 }
@@ -1671,6 +1712,9 @@ func queryContainsScript(q *esast.Query) bool {
 	if q.Pinned != nil && queryContainsScript(q.Pinned.Organic) {
 		return true
 	}
+	if q.Rule != nil && queryContainsScript(q.Rule.Organic) {
+		return true
+	}
 	if q.HasChild != nil && queryContainsScript(&q.HasChild.Query) {
 		return true
 	}
@@ -1766,6 +1810,9 @@ func queryContainsNestedScoring(q *esast.Query) bool {
 		return true
 	}
 	if q.Pinned != nil && queryContainsNestedScoring(q.Pinned.Organic) {
+		return true
+	}
+	if q.Rule != nil && queryContainsNestedScoring(q.Rule.Organic) {
 		return true
 	}
 	if q.HasChild != nil && queryContainsNestedScoring(&q.HasChild.Query) {
@@ -7342,6 +7389,337 @@ func (t *Transpiler) appendAggBranches(
 						subFromClause, subWhereCond, subAggs)
 				}
 			}
+
+		case spec.WeightedAvg != nil:
+			vCol := t.sqlNumericColumnRef(spec.WeightedAvg.Value.Field, nil)
+			if spec.WeightedAvg.Value.Missing != nil && spec.WeightedAvg.Value.Field != "" {
+				if mf, ok := resolveHistogramMissingFloat(spec.WeightedAvg.Value.Missing); ok {
+					vCol = fmt.Sprintf("COALESCE(%s, %s)", vCol, strconv.FormatFloat(mf, 'f', -1, 64))
+				}
+			}
+			if spec.WeightedAvg.Value.Script != nil {
+				if se, ok := t.compileMetricScriptExprWithOverride(spec.WeightedAvg.Value.Script, spec.WeightedAvg.Value.Field, vCol, nil); ok {
+					vCol = se
+				}
+			}
+			wCol := t.sqlNumericColumnRef(spec.WeightedAvg.Weight.Field, nil)
+			if spec.WeightedAvg.Weight.Missing != nil && spec.WeightedAvg.Weight.Field != "" {
+				if mf, ok := resolveHistogramMissingFloat(spec.WeightedAvg.Weight.Missing); ok {
+					wCol = fmt.Sprintf("COALESCE(%s, %s)", wCol, strconv.FormatFloat(mf, 'f', -1, 64))
+				}
+			}
+			if spec.WeightedAvg.Weight.Script != nil {
+				if se, ok := t.compileMetricScriptExprWithOverride(spec.WeightedAvg.Weight.Script, spec.WeightedAvg.Weight.Field, wCol, nil); ok {
+					wCol = se
+				}
+			}
+			wCond := fmt.Sprintf("%s IS NOT NULL AND %s IS NOT NULL", vCol, wCol)
+			if extraWhere != "" {
+				wCond = fmt.Sprintf("(%s) AND (%s)", extraWhere, wCond)
+			}
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT %s AS `_agg_name`, '_metric' AS `_bucket_key`, CAST(COALESCE(SUM((%s) * (%s)) / NULLIF(SUM(%s), 0), 0) AS DOUBLE) AS `_doc_count` "+
+					"FROM `base_matched` WHERE %s HAVING COUNT(%s) > 0",
+				quoteStr(fullAggName), vCol, wCol, wCol, wCond, vCol,
+			))
+
+		case spec.MedianAbsoluteDeviation != nil:
+			effField := spec.MedianAbsoluteDeviation.Field
+			if effField == "" && spec.MedianAbsoluteDeviation.Script != nil {
+				if docF, ok := extractSimpleDocFieldFromScript(spec.MedianAbsoluteDeviation.Script); ok {
+					effField = docF
+				}
+			}
+			col := t.sqlNumericColumnRef(effField, nil)
+			if spec.MedianAbsoluteDeviation.Missing != nil && effField != "" {
+				if mf, ok := resolveHistogramMissingFloat(spec.MedianAbsoluteDeviation.Missing); ok {
+					col = fmt.Sprintf("COALESCE(%s, %s)", col, strconv.FormatFloat(mf, 'f', -1, 64))
+				}
+			}
+			if spec.MedianAbsoluteDeviation.Script != nil {
+				if se, ok := t.compileMetricScriptExprWithOverride(spec.MedianAbsoluteDeviation.Script, effField, col, nil); ok {
+					col = se
+				}
+			}
+			wCond := fmt.Sprintf("%s IS NOT NULL", col)
+			if extraWhere != "" {
+				wCond = fmt.Sprintf("(%s) AND (%s)", extraWhere, wCond)
+			}
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT %s AS `_agg_name`, '_metric' AS `_bucket_key`, CAST(COALESCE(PERCENTILE_APPROX(%s, 0.5000), 0) AS DOUBLE) AS `_doc_count` "+
+					"FROM `base_matched` WHERE %s HAVING COUNT(%s) > 0",
+				quoteStr(fullAggName), col, wCond, col,
+			))
+
+		case spec.RareTerms != nil:
+			maxDocCount := 1
+			if spec.RareTerms.MaxDocCount != nil && *spec.RareTerms.MaxDocCount >= 1 {
+				maxDocCount = *spec.RareTerms.MaxDocCount
+			}
+			col := t.sqlColumnRef(spec.RareTerms.Field, true, nil)
+			wCond := fmt.Sprintf("%s IS NOT NULL", col)
+			if spec.RareTerms.Missing != nil {
+				col = fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", col, quoteStr(formatMissingScalar(spec.RareTerms.Missing)))
+				wCond = "1=1"
+			}
+			if extraWhere != "" {
+				wCond = fmt.Sprintf("(%s) AND (%s)", extraWhere, wCond)
+			}
+			*subIdx++
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
+					"SELECT %s AS `_agg_name`, CAST(%s AS STRING) AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+					"FROM `base_matched` WHERE %s "+
+					"GROUP BY `_bucket_key` HAVING COUNT(*) <= %d ORDER BY `_doc_count` ASC, `_bucket_key` ASC LIMIT %d"+
+					") `_agg_sub_%d`",
+				quoteStr(fullAggName), col, wCond, maxDocCount, t.maxAggBuckets(), *subIdx,
+			))
+			if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+				t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, fmt.Sprintf("CAST(%s AS STRING)", col), "`base_matched`", wCond, subAggs)
+			}
+
+		case spec.MultiTerms != nil && len(spec.MultiTerms.Terms) > 0:
+			size := t.capBucketSize(spec.MultiTerms.Size)
+			var termExprs, notNulls []string
+			for _, mt := range spec.MultiTerms.Terms {
+				col := t.sqlColumnRef(mt.Field, true, nil)
+				if mt.Script != nil {
+					if se, ok := t.compilePolymorphicScriptExpr(mt.Script, mt.Field, col, nil); ok {
+						col = se
+					}
+				}
+				if mt.Missing != nil {
+					col = fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", col, quoteStr(formatMissingScalar(mt.Missing)))
+				} else {
+					notNulls = append(notNulls, fmt.Sprintf("%s IS NOT NULL", col))
+				}
+				termExprs = append(termExprs, fmt.Sprintf("CAST(%s AS STRING)", col))
+			}
+			keyExpr := termExprs[0]
+			if len(termExprs) > 1 {
+				keyExpr = fmt.Sprintf("CONCAT_WS('|', %s)", strings.Join(termExprs, ", "))
+			}
+			wCond := "1=1"
+			if len(notNulls) > 0 {
+				wCond = strings.Join(notNulls, " AND ")
+			}
+			if extraWhere != "" {
+				wCond = fmt.Sprintf("(%s) AND (%s)", extraWhere, wCond)
+			}
+			*subIdx++
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+					"FROM `base_matched` WHERE %s "+
+					"GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT %d"+
+					") `_agg_sub_%d`",
+				quoteStr(fullAggName), keyExpr, wCond, size, *subIdx,
+			))
+			if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+				t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, keyExpr, "`base_matched`", wCond, subAggs)
+			}
+
+		case spec.AutoDateHistogram != nil:
+			effField := spec.AutoDateHistogram.Field
+			if effField == "" && spec.AutoDateHistogram.Script != nil {
+				if docF, ok := extractSimpleDocFieldFromScript(spec.AutoDateHistogram.Script); ok {
+					effField = docF
+				}
+			}
+			col := t.sqlNumericColumnRef(effField, nil)
+			if spec.AutoDateHistogram.Script != nil {
+				if se, ok := t.compileMetricScriptExprWithOverride(spec.AutoDateHistogram.Script, effField, col, nil); ok {
+					col = se
+				}
+			}
+			wCond := fmt.Sprintf("%s IS NOT NULL", col)
+			if extraWhere != "" {
+				wCond = fmt.Sprintf("(%s) AND (%s)", extraWhere, wCond)
+			}
+			keyExpr := fmt.Sprintf("CAST(CAST(FLOOR(%s / 3600000) * 3600000 AS BIGINT) AS STRING)", col)
+			*subIdx++
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+					"FROM `base_matched` WHERE %s "+
+					"GROUP BY `_bucket_key` ORDER BY `_bucket_key` ASC LIMIT %d"+
+					") `_agg_sub_%d`",
+				quoteStr(fullAggName), keyExpr, wCond, t.maxAggBuckets(), *subIdx,
+			))
+			if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+				t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, keyExpr, "`base_matched`", wCond, subAggs)
+			}
+
+		case spec.VariableWidthHistogram != nil:
+			effField := spec.VariableWidthHistogram.Field
+			if effField == "" && spec.VariableWidthHistogram.Script != nil {
+				if docF, ok := extractSimpleDocFieldFromScript(spec.VariableWidthHistogram.Script); ok {
+					effField = docF
+				}
+			}
+			col := t.sqlNumericColumnRef(effField, nil)
+			if spec.VariableWidthHistogram.Script != nil {
+				if se, ok := t.compileMetricScriptExprWithOverride(spec.VariableWidthHistogram.Script, effField, col, nil); ok {
+					col = se
+				}
+			}
+			wCond := fmt.Sprintf("%s IS NOT NULL", col)
+			if extraWhere != "" {
+				wCond = fmt.Sprintf("(%s) AND (%s)", extraWhere, wCond)
+			}
+			keyExpr := fmt.Sprintf("CAST(FLOOR(%s) AS STRING)", col)
+			*subIdx++
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+					"FROM `base_matched` WHERE %s "+
+					"GROUP BY `_bucket_key` ORDER BY `_bucket_key` ASC LIMIT %d"+
+					") `_agg_sub_%d`",
+				quoteStr(fullAggName), keyExpr, wCond, t.maxAggBuckets(), *subIdx,
+			))
+			if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+				t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, keyExpr, "`base_matched`", wCond, subAggs)
+			}
+
+		case spec.AdjacencyMatrix != nil && len(spec.AdjacencyMatrix.Filters) > 0:
+			sep := spec.AdjacencyMatrix.Separator
+			if sep == "" {
+				sep = "&"
+			}
+			fKeys := sortedMapKeys(spec.AdjacencyMatrix.Filters)
+			condMap := make(map[string]string, len(fKeys))
+			for _, fk := range fKeys {
+				fq := spec.AdjacencyMatrix.Filters[fk]
+				c := t.CompileQuery(&fq, false, nil)
+				wCond := c.WhereSQL
+				if extraWhere != "" {
+					wCond = fmt.Sprintf("(%s) AND (%s)", extraWhere, wCond)
+				}
+				condMap[fk] = wCond
+				*branches = append(*branches, fmt.Sprintf(
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+						"FROM `base_matched` WHERE %s",
+					quoteStr(fullAggName), quoteStr(fk), wCond,
+				))
+				if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+					t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, quoteStr(fk), "`base_matched`", wCond, subAggs)
+				}
+			}
+			for i := 0; i < len(fKeys); i++ {
+				for j := i + 1; j < len(fKeys); j++ {
+					pairKey := fKeys[i] + sep + fKeys[j]
+					pairCond := fmt.Sprintf("(%s) AND (%s)", condMap[fKeys[i]], condMap[fKeys[j]])
+					*branches = append(*branches, fmt.Sprintf(
+						"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+							"FROM `base_matched` WHERE %s",
+						quoteStr(fullAggName), quoteStr(pairKey), pairCond,
+					))
+					if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+						t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, quoteStr(pairKey), "`base_matched`", pairCond, subAggs)
+					}
+				}
+			}
+
+		case spec.GeoBounds != nil:
+			gbField, b := t.resolveFieldInNestedCtx(spec.GeoBounds.Field, false, nil)
+			latExpr, lonExpr, notNullCond := t.extractGeoPointExprs(gbField, b)
+			wCond := notNullCond
+			if extraWhere != "" {
+				wCond = fmt.Sprintf("(%s) AND (%s)", extraWhere, wCond)
+			}
+			for _, op := range []struct{ key, expr string }{
+				{"_gb_top", fmt.Sprintf("MAX(%s)", latExpr)},
+				{"_gb_bottom", fmt.Sprintf("MIN(%s)", latExpr)},
+				{"_gb_left", fmt.Sprintf("MIN(%s)", lonExpr)},
+				{"_gb_right", fmt.Sprintf("MAX(%s)", lonExpr)},
+			} {
+				*branches = append(*branches, fmt.Sprintf(
+					"SELECT %s AS `_agg_name`, '_metric' AS `_bucket_key`, CAST(COALESCE(%s, 0) AS DOUBLE) AS `_doc_count` "+
+						"FROM `base_matched` WHERE %s HAVING COUNT(%s) > 0",
+					quoteStr(fullAggName+"."+op.key), op.expr, wCond, latExpr,
+				))
+			}
+
+		case spec.GeoCentroid != nil:
+			gcField, b := t.resolveFieldInNestedCtx(spec.GeoCentroid.Field, false, nil)
+			latExpr, lonExpr, notNullCond := t.extractGeoPointExprs(gcField, b)
+			wCond := notNullCond
+			if extraWhere != "" {
+				wCond = fmt.Sprintf("(%s) AND (%s)", extraWhere, wCond)
+			}
+			for _, op := range []struct{ key, expr string }{
+				{"_gc_count", fmt.Sprintf("COUNT(%s)", latExpr)},
+				{"_gc_lat", fmt.Sprintf("AVG(%s)", latExpr)},
+				{"_gc_lon", fmt.Sprintf("AVG(%s)", lonExpr)},
+			} {
+				*branches = append(*branches, fmt.Sprintf(
+					"SELECT %s AS `_agg_name`, '_metric' AS `_bucket_key`, CAST(COALESCE(%s, 0) AS DOUBLE) AS `_doc_count` "+
+						"FROM `base_matched` WHERE %s",
+					quoteStr(fullAggName+"."+op.key), op.expr, wCond,
+				))
+			}
+
+		case spec.GeoDistance != nil && len(spec.GeoDistance.Ranges) > 0:
+			gdField, b := t.resolveFieldInNestedCtx(spec.GeoDistance.Field, false, nil)
+			origLat, origLon, _ := esast.ParseGeoPoint(spec.GeoDistance.Origin)
+			latExpr, lonExpr, notNullCond := t.extractGeoPointExprs(gdField, b)
+			distExpr := fmt.Sprintf("ST_Distance_Sphere(%s, %s, %s, %s)",
+				lonExpr, latExpr, strconv.FormatFloat(origLon, 'f', -1, 64), strconv.FormatFloat(origLat, 'f', -1, 64))
+			unitMult := 1.0
+			if mult, ok := esast.GeoDistanceUnitMultiplier(strings.TrimSpace(spec.GeoDistance.Unit)); ok && mult > 0 {
+				unitMult = mult
+			}
+			for _, rng := range spec.GeoDistance.Ranges {
+				conds := []string{notNullCond}
+				if rng.From != nil {
+					if fv, ok := parseFiniteFloatValue(rng.From); ok {
+						conds = append(conds, fmt.Sprintf("%s >= %s", distExpr, strconv.FormatFloat(fv*unitMult, 'f', -1, 64)))
+					}
+				}
+				if rng.To != nil {
+					if fv, ok := parseFiniteFloatValue(rng.To); ok {
+						conds = append(conds, fmt.Sprintf("%s < %s", distExpr, strconv.FormatFloat(fv*unitMult, 'f', -1, 64)))
+					}
+				}
+				rWhere := strings.Join(conds, " AND ")
+				if extraWhere != "" {
+					rWhere = fmt.Sprintf("(%s) AND (%s)", extraWhere, rWhere)
+				}
+				bKey := rng.EffectiveKey()
+				*branches = append(*branches, fmt.Sprintf(
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+						"FROM `base_matched` WHERE %s",
+					quoteStr(fullAggName), quoteStr(bKey), rWhere,
+				))
+				if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+					t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, quoteStr(bKey), "`base_matched`", rWhere, subAggs)
+				}
+			}
+
+		case spec.GeohashGrid != nil || spec.GeotileGrid != nil:
+			ggSpec := spec.GeohashGrid
+			if ggSpec == nil {
+				ggSpec = spec.GeotileGrid
+			}
+			ggField, b := t.resolveFieldInNestedCtx(ggSpec.Field, false, nil)
+			latExpr, lonExpr, notNullCond := t.extractGeoPointExprs(ggField, b)
+			wCond := notNullCond
+			if extraWhere != "" {
+				wCond = fmt.Sprintf("(%s) AND (%s)", extraWhere, wCond)
+			}
+			keyExpr := fmt.Sprintf("CONCAT(CAST(FLOOR(%s) AS STRING), '/', CAST(FLOOR(%s) AS STRING))", latExpr, lonExpr)
+			*subIdx++
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+					"FROM `base_matched` WHERE %s "+
+					"GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT %d"+
+					") `_agg_sub_%d`",
+				quoteStr(fullAggName), keyExpr, wCond, t.maxAggBuckets(), *subIdx,
+			))
+			if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+				t.appendGroupedBucketSubAggs(branches, subIdx, fullAggName, keyExpr, "`base_matched`", wCond, subAggs)
+			}
 		}
 	}
 }
@@ -8929,6 +9307,316 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					t.appendGroupedBucketSubAggsWithNested(branches, subIdx, subFull, nextKeyExpr, nextFrom, nextWhere, nctx, nestedSubs)
 				}
 			}
+
+		case subSpec.WeightedAvg != nil:
+			vField, _ := t.resolveFieldInNestedCtx(subSpec.WeightedAvg.Value.Field, false, nctx)
+			vCol := t.sqlNumericColumnRef(vField, nctx)
+			if subSpec.WeightedAvg.Value.Missing != nil && vField != "" {
+				if mf, ok := resolveHistogramMissingFloat(subSpec.WeightedAvg.Value.Missing); ok {
+					vCol = fmt.Sprintf("COALESCE(%s, %s)", vCol, strconv.FormatFloat(mf, 'f', -1, 64))
+				}
+			}
+			if subSpec.WeightedAvg.Value.Script != nil {
+				if se, ok := t.compileMetricScriptExprWithOverride(subSpec.WeightedAvg.Value.Script, vField, vCol, nctx); ok {
+					vCol = se
+				}
+			}
+			wField, _ := t.resolveFieldInNestedCtx(subSpec.WeightedAvg.Weight.Field, false, nctx)
+			wCol := t.sqlNumericColumnRef(wField, nctx)
+			if subSpec.WeightedAvg.Weight.Missing != nil && wField != "" {
+				if mf, ok := resolveHistogramMissingFloat(subSpec.WeightedAvg.Weight.Missing); ok {
+					wCol = fmt.Sprintf("COALESCE(%s, %s)", wCol, strconv.FormatFloat(mf, 'f', -1, 64))
+				}
+			}
+			if subSpec.WeightedAvg.Weight.Script != nil {
+				if se, ok := t.compileMetricScriptExprWithOverride(subSpec.WeightedAvg.Weight.Script, wField, wCol, nctx); ok {
+					wCol = se
+				}
+			}
+			subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL AND %s IS NOT NULL", whereClause, vCol, wCol)
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(SUM((%s) * (%s)) / NULLIF(SUM(%s), 0), 0) AS DOUBLE) AS `_doc_count` "+
+					"FROM %s WHERE %s GROUP BY `_bucket_key` HAVING COUNT(%s) > 0",
+				quoteStr(subFull), parentBucketExpr, vCol, wCol, wCol, fromClause, subWhere, vCol,
+			))
+
+		case subSpec.MedianAbsoluteDeviation != nil:
+			effField := subSpec.MedianAbsoluteDeviation.Field
+			if effField == "" && subSpec.MedianAbsoluteDeviation.Script != nil {
+				if docF, ok := extractSimpleDocFieldFromScript(subSpec.MedianAbsoluteDeviation.Script); ok {
+					effField = docF
+				}
+			}
+			effField, _ = t.resolveFieldInNestedCtx(effField, false, nctx)
+			col := t.sqlNumericColumnRef(effField, nctx)
+			if subSpec.MedianAbsoluteDeviation.Missing != nil && effField != "" {
+				if mf, ok := resolveHistogramMissingFloat(subSpec.MedianAbsoluteDeviation.Missing); ok {
+					col = fmt.Sprintf("COALESCE(%s, %s)", col, strconv.FormatFloat(mf, 'f', -1, 64))
+				}
+			}
+			if subSpec.MedianAbsoluteDeviation.Script != nil {
+				if se, ok := t.compileMetricScriptExprWithOverride(subSpec.MedianAbsoluteDeviation.Script, effField, col, nctx); ok {
+					col = se
+				}
+			}
+			subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, col)
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(PERCENTILE_APPROX(%s, 0.5000), 0) AS DOUBLE) AS `_doc_count` "+
+					"FROM %s WHERE %s GROUP BY `_bucket_key` HAVING COUNT(%s) > 0",
+				quoteStr(subFull), parentBucketExpr, col, fromClause, subWhere, col,
+			))
+
+		case subSpec.RareTerms != nil:
+			maxDocCount := 1
+			if subSpec.RareTerms.MaxDocCount != nil && *subSpec.RareTerms.MaxDocCount >= 1 {
+				maxDocCount = *subSpec.RareTerms.MaxDocCount
+			}
+			rtField, _ := t.resolveFieldInNestedCtx(subSpec.RareTerms.Field, true, nctx)
+			col := t.sqlColumnRef(rtField, true, nctx)
+			subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, col)
+			if subSpec.RareTerms.Missing != nil {
+				col = fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", col, quoteStr(formatMissingScalar(subSpec.RareTerms.Missing)))
+				subWhere = whereClause
+			}
+			childKeyExpr := fmt.Sprintf("CONCAT(%s, '\\x1f', CAST(%s AS STRING))", parentBucketExpr, col)
+			*subIdx++
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+					"FROM %s WHERE %s "+
+					"GROUP BY `_bucket_key` HAVING COUNT(*) <= %d ORDER BY `_doc_count` ASC, `_bucket_key` ASC LIMIT %d"+
+					") `_agg_sub_%d`",
+				quoteStr(subFull), childKeyExpr, fromClause, subWhere, maxDocCount, t.maxAggBuckets(), *subIdx,
+			))
+			if nestedSubs := subSpec.SubAggs(); len(nestedSubs) > 0 {
+				t.appendGroupedBucketSubAggsWithNested(branches, subIdx, subFull, childKeyExpr, fromClause, subWhere, nctx, nestedSubs)
+			}
+
+		case subSpec.MultiTerms != nil && len(subSpec.MultiTerms.Terms) > 0:
+			size := t.capBucketSize(subSpec.MultiTerms.Size)
+			var termExprs, notNulls []string
+			for _, mt := range subSpec.MultiTerms.Terms {
+				mtField, _ := t.resolveFieldInNestedCtx(mt.Field, true, nctx)
+				col := t.sqlColumnRef(mtField, true, nctx)
+				if mt.Script != nil {
+					if se, ok := t.compilePolymorphicScriptExpr(mt.Script, mtField, col, nctx); ok {
+						col = se
+					}
+				}
+				if mt.Missing != nil {
+					col = fmt.Sprintf("COALESCE(CAST(%s AS STRING), %s)", col, quoteStr(formatMissingScalar(mt.Missing)))
+				} else {
+					notNulls = append(notNulls, fmt.Sprintf("%s IS NOT NULL", col))
+				}
+				termExprs = append(termExprs, fmt.Sprintf("CAST(%s AS STRING)", col))
+			}
+			keyExpr := termExprs[0]
+			if len(termExprs) > 1 {
+				keyExpr = fmt.Sprintf("CONCAT_WS('|', %s)", strings.Join(termExprs, ", "))
+			}
+			childKeyExpr := fmt.Sprintf("CONCAT(%s, '\\x1f', %s)", parentBucketExpr, keyExpr)
+			subWhere := whereClause
+			if len(notNulls) > 0 {
+				subWhere = fmt.Sprintf("(%s) AND (%s)", whereClause, strings.Join(notNulls, " AND "))
+			}
+			*subIdx++
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+					"FROM %s WHERE %s "+
+					"GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT %d"+
+					") `_agg_sub_%d`",
+				quoteStr(subFull), childKeyExpr, fromClause, subWhere, size, *subIdx,
+			))
+			if nestedSubs := subSpec.SubAggs(); len(nestedSubs) > 0 {
+				t.appendGroupedBucketSubAggsWithNested(branches, subIdx, subFull, childKeyExpr, fromClause, subWhere, nctx, nestedSubs)
+			}
+
+		case subSpec.AutoDateHistogram != nil:
+			effField := subSpec.AutoDateHistogram.Field
+			if effField == "" && subSpec.AutoDateHistogram.Script != nil {
+				if docF, ok := extractSimpleDocFieldFromScript(subSpec.AutoDateHistogram.Script); ok {
+					effField = docF
+				}
+			}
+			effField, _ = t.resolveFieldInNestedCtx(effField, false, nctx)
+			col := t.sqlNumericColumnRef(effField, nctx)
+			if subSpec.AutoDateHistogram.Script != nil {
+				if se, ok := t.compileMetricScriptExprWithOverride(subSpec.AutoDateHistogram.Script, effField, col, nctx); ok {
+					col = se
+				}
+			}
+			subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, col)
+			childKeyExpr := fmt.Sprintf("CONCAT(%s, '\\x1f', CAST(CAST(FLOOR(%s / 3600000) * 3600000 AS BIGINT) AS STRING))", parentBucketExpr, col)
+			*subIdx++
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+					"FROM %s WHERE %s "+
+					"GROUP BY `_bucket_key` ORDER BY `_bucket_key` ASC LIMIT %d"+
+					") `_agg_sub_%d`",
+				quoteStr(subFull), childKeyExpr, fromClause, subWhere, t.maxAggBuckets(), *subIdx,
+			))
+			if nestedSubs := subSpec.SubAggs(); len(nestedSubs) > 0 {
+				t.appendGroupedBucketSubAggsWithNested(branches, subIdx, subFull, childKeyExpr, fromClause, subWhere, nctx, nestedSubs)
+			}
+
+		case subSpec.VariableWidthHistogram != nil:
+			effField := subSpec.VariableWidthHistogram.Field
+			if effField == "" && subSpec.VariableWidthHistogram.Script != nil {
+				if docF, ok := extractSimpleDocFieldFromScript(subSpec.VariableWidthHistogram.Script); ok {
+					effField = docF
+				}
+			}
+			effField, _ = t.resolveFieldInNestedCtx(effField, false, nctx)
+			col := t.sqlNumericColumnRef(effField, nctx)
+			if subSpec.VariableWidthHistogram.Script != nil {
+				if se, ok := t.compileMetricScriptExprWithOverride(subSpec.VariableWidthHistogram.Script, effField, col, nctx); ok {
+					col = se
+				}
+			}
+			subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, col)
+			childKeyExpr := fmt.Sprintf("CONCAT(%s, '\\x1f', CAST(FLOOR(%s) AS STRING))", parentBucketExpr, col)
+			*subIdx++
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+					"FROM %s WHERE %s "+
+					"GROUP BY `_bucket_key` ORDER BY `_bucket_key` ASC LIMIT %d"+
+					") `_agg_sub_%d`",
+				quoteStr(subFull), childKeyExpr, fromClause, subWhere, t.maxAggBuckets(), *subIdx,
+			))
+			if nestedSubs := subSpec.SubAggs(); len(nestedSubs) > 0 {
+				t.appendGroupedBucketSubAggsWithNested(branches, subIdx, subFull, childKeyExpr, fromClause, subWhere, nctx, nestedSubs)
+			}
+
+		case subSpec.AdjacencyMatrix != nil && len(subSpec.AdjacencyMatrix.Filters) > 0:
+			sep := subSpec.AdjacencyMatrix.Separator
+			if sep == "" {
+				sep = "&"
+			}
+			fKeys := sortedMapKeys(subSpec.AdjacencyMatrix.Filters)
+			condMap := make(map[string]string, len(fKeys))
+			for _, fk := range fKeys {
+				fq := subSpec.AdjacencyMatrix.Filters[fk]
+				c := t.CompileQuery(&fq, false, nctx)
+				subWhere := fmt.Sprintf("(%s) AND (%s)", whereClause, c.WhereSQL)
+				condMap[fk] = subWhere
+				childKeyExpr := fmt.Sprintf("CONCAT(%s, '\\x1f', %s)", parentBucketExpr, quoteStr(fk))
+				*branches = append(*branches, fmt.Sprintf(
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+						"FROM %s WHERE %s GROUP BY `_bucket_key`",
+					quoteStr(subFull), childKeyExpr, fromClause, subWhere,
+				))
+				if nestedSubs := subSpec.SubAggs(); len(nestedSubs) > 0 {
+					t.appendGroupedBucketSubAggsWithNested(branches, subIdx, subFull, childKeyExpr, fromClause, subWhere, nctx, nestedSubs)
+				}
+			}
+			for i := 0; i < len(fKeys); i++ {
+				for j := i + 1; j < len(fKeys); j++ {
+					pairKey := fKeys[i] + sep + fKeys[j]
+					pairCond := fmt.Sprintf("(%s) AND (%s)", condMap[fKeys[i]], condMap[fKeys[j]])
+					childKeyExpr := fmt.Sprintf("CONCAT(%s, '\\x1f', %s)", parentBucketExpr, quoteStr(pairKey))
+					*branches = append(*branches, fmt.Sprintf(
+						"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+							"FROM %s WHERE %s GROUP BY `_bucket_key`",
+						quoteStr(subFull), childKeyExpr, fromClause, pairCond,
+					))
+					if nestedSubs := subSpec.SubAggs(); len(nestedSubs) > 0 {
+						t.appendGroupedBucketSubAggsWithNested(branches, subIdx, subFull, childKeyExpr, fromClause, pairCond, nctx, nestedSubs)
+					}
+				}
+			}
+
+		case subSpec.GeoBounds != nil:
+			gbField, b := t.resolveFieldInNestedCtx(subSpec.GeoBounds.Field, false, nctx)
+			latExpr, lonExpr, notNullCond := t.extractGeoPointExprs(gbField, b)
+			subWhere := fmt.Sprintf("(%s) AND (%s)", whereClause, notNullCond)
+			for _, op := range []struct{ key, expr string }{
+				{"_gb_top", fmt.Sprintf("MAX(%s)", latExpr)},
+				{"_gb_bottom", fmt.Sprintf("MIN(%s)", latExpr)},
+				{"_gb_left", fmt.Sprintf("MIN(%s)", lonExpr)},
+				{"_gb_right", fmt.Sprintf("MAX(%s)", lonExpr)},
+			} {
+				*branches = append(*branches, fmt.Sprintf(
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(%s, 0) AS DOUBLE) AS `_doc_count` "+
+						"FROM %s WHERE %s GROUP BY `_bucket_key` HAVING COUNT(%s) > 0",
+					quoteStr(subFull+"."+op.key), parentBucketExpr, op.expr, fromClause, subWhere, latExpr,
+				))
+			}
+
+		case subSpec.GeoCentroid != nil:
+			gcField, b := t.resolveFieldInNestedCtx(subSpec.GeoCentroid.Field, false, nctx)
+			latExpr, lonExpr, notNullCond := t.extractGeoPointExprs(gcField, b)
+			subWhere := fmt.Sprintf("(%s) AND (%s)", whereClause, notNullCond)
+			for _, op := range []struct{ key, expr string }{
+				{"_gc_count", fmt.Sprintf("COUNT(%s)", latExpr)},
+				{"_gc_lat", fmt.Sprintf("AVG(%s)", latExpr)},
+				{"_gc_lon", fmt.Sprintf("AVG(%s)", lonExpr)},
+			} {
+				*branches = append(*branches, fmt.Sprintf(
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(%s, 0) AS DOUBLE) AS `_doc_count` "+
+						"FROM %s WHERE %s GROUP BY `_bucket_key`",
+					quoteStr(subFull+"."+op.key), parentBucketExpr, op.expr, fromClause, subWhere,
+				))
+			}
+
+		case subSpec.GeoDistance != nil && len(subSpec.GeoDistance.Ranges) > 0:
+			gdField, b := t.resolveFieldInNestedCtx(subSpec.GeoDistance.Field, false, nctx)
+			origLat, origLon, _ := esast.ParseGeoPoint(subSpec.GeoDistance.Origin)
+			latExpr, lonExpr, notNullCond := t.extractGeoPointExprs(gdField, b)
+			distExpr := fmt.Sprintf("ST_Distance_Sphere(%s, %s, %s, %s)",
+				lonExpr, latExpr, strconv.FormatFloat(origLon, 'f', -1, 64), strconv.FormatFloat(origLat, 'f', -1, 64))
+			unitMult := 1.0
+			if mult, ok := esast.GeoDistanceUnitMultiplier(strings.TrimSpace(subSpec.GeoDistance.Unit)); ok && mult > 0 {
+				unitMult = mult
+			}
+			for _, rng := range subSpec.GeoDistance.Ranges {
+				conds := []string{whereClause, notNullCond}
+				if rng.From != nil {
+					if fv, ok := parseFiniteFloatValue(rng.From); ok {
+						conds = append(conds, fmt.Sprintf("%s >= %s", distExpr, strconv.FormatFloat(fv*unitMult, 'f', -1, 64)))
+					}
+				}
+				if rng.To != nil {
+					if fv, ok := parseFiniteFloatValue(rng.To); ok {
+						conds = append(conds, fmt.Sprintf("%s < %s", distExpr, strconv.FormatFloat(fv*unitMult, 'f', -1, 64)))
+					}
+				}
+				subWhere := "(" + strings.Join(conds, ") AND (") + ")"
+				bKey := rng.EffectiveKey()
+				childKeyExpr := fmt.Sprintf("CONCAT(%s, '\\x1f', %s)", parentBucketExpr, quoteStr(bKey))
+				*branches = append(*branches, fmt.Sprintf(
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+						"FROM %s WHERE %s GROUP BY `_bucket_key`",
+					quoteStr(subFull), childKeyExpr, fromClause, subWhere,
+				))
+				if nestedSubs := subSpec.SubAggs(); len(nestedSubs) > 0 {
+					t.appendGroupedBucketSubAggsWithNested(branches, subIdx, subFull, childKeyExpr, fromClause, subWhere, nctx, nestedSubs)
+				}
+			}
+
+		case subSpec.GeohashGrid != nil || subSpec.GeotileGrid != nil:
+			ggSpec := subSpec.GeohashGrid
+			if ggSpec == nil {
+				ggSpec = subSpec.GeotileGrid
+			}
+			ggField, b := t.resolveFieldInNestedCtx(ggSpec.Field, false, nctx)
+			latExpr, lonExpr, notNullCond := t.extractGeoPointExprs(ggField, b)
+			subWhere := fmt.Sprintf("(%s) AND (%s)", whereClause, notNullCond)
+			childKeyExpr := fmt.Sprintf("CONCAT(%s, '\\x1f', CAST(FLOOR(%s) AS STRING), '/', CAST(FLOOR(%s) AS STRING))", parentBucketExpr, latExpr, lonExpr)
+			*subIdx++
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+					"FROM %s WHERE %s "+
+					"GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT %d"+
+					") `_agg_sub_%d`",
+				quoteStr(subFull), childKeyExpr, fromClause, subWhere, t.maxAggBuckets(), *subIdx,
+			))
+			if nestedSubs := subSpec.SubAggs(); len(nestedSubs) > 0 {
+				t.appendGroupedBucketSubAggsWithNested(branches, subIdx, subFull, childKeyExpr, fromClause, subWhere, nctx, nestedSubs)
+			}
 		}
 	}
 }
@@ -10174,18 +10862,65 @@ func effectiveSortESType(b schema.FieldBinding, sortType string, numericType ...
 	return st
 }
 
-func parseGeoSortMissingMeters(missing string) (float64, bool) {
+func parseGeoSortMissingMeters(missing, unit string) (float64, bool) {
 	m := strings.TrimSpace(missing)
 	if m == "" || strings.EqualFold(m, "_first") || strings.EqualFold(m, "_last") {
 		return 0, false
 	}
+	if fv, err := strconv.ParseFloat(m, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+		if mult, ok := esast.GeoDistanceUnitMultiplier(strings.TrimSpace(unit)); ok && mult > 0 {
+			return fv * mult, true
+		}
+		return fv, true
+	}
 	if _, distM, err := esast.ParseGeoDistanceMeters(m); err == nil && !math.IsNaN(distM) && !math.IsInf(distM, 0) {
 		return distM, true
 	}
-	if fv, err := strconv.ParseFloat(m, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
-		return fv, true
-	}
 	return 0, false
+}
+
+func extractGeoSortUnit(s esast.SortSpec) string {
+	if geoMap, ok := s.Entry.Script.(map[string]any); ok {
+		if uStr, okU := geoMap["unit"].(string); okU {
+			return strings.TrimSpace(uStr)
+		}
+	}
+	return ""
+}
+
+func normalizeEpochSecondSortValue(effType, effFormat string, b schema.FieldBinding, val any) any {
+	if val == nil {
+		return nil
+	}
+	if _, isStr := val.(string); isStr {
+		return val
+	}
+	if effType != "date" && effType != "date_nanos" && (effType != "" || b.DorisType != schema.DorisBigInt) {
+		return val
+	}
+	if effFormat == "" {
+		effFormat = b.Format
+	}
+	lowerFmt := strings.ToLower(effFormat)
+	if !strings.Contains(lowerFmt, "epoch_second") || strings.Contains(lowerFmt, "epoch_millis") {
+		return val
+	}
+	switch v := val.(type) {
+	case int:
+		return int64(v) * 1000
+	case int64:
+		return v * 1000
+	case float64:
+		return int64(math.Round(v * 1000.0))
+	case json.Number:
+		if iv, err := v.Int64(); err == nil {
+			return iv * 1000
+		}
+		if fv, err := v.Float64(); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+			return int64(math.Round(fv * 1000.0))
+		}
+	}
+	return val
 }
 
 func (t *Transpiler) compileOrderBy(sorts []esast.SortSpec) string {
@@ -10480,7 +11215,7 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 				}
 			}
 			if geoExpr, ok := t.compileGeoDistanceSortExpr(s); ok {
-				if missDist, okM := parseGeoSortMissingMeters(s.Entry.Missing); okM {
+				if missDist, okM := parseGeoSortMissingMeters(s.Entry.Missing, extractGeoSortUnit(s)); okM {
 					geoExpr = fmt.Sprintf("COALESCE(%s, %g)", geoExpr, missDist)
 				}
 				orderPart := geoExpr + " " + dir
@@ -10568,6 +11303,7 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 						}
 					}
 				}
+				sampleVal = normalizeEpochSecondSortValue(effType, s.Entry.Format, b, sampleVal)
 				sampleVal = normalizeDateNanosValue(effType, sampleVal)
 				sampleVal = normalizeScaledFloatValue(b, sampleVal)
 			}
@@ -10693,12 +11429,15 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 		case "_score":
 			return fmt.Sprintf("CAST(%s AS DOUBLE)", scoreExpr), val, true, nil
 		case "_id", "_doc":
+			if val != nil {
+				val = fmt.Sprintf("%v", val)
+			}
 			return "`_id`", val, true, nil
 		case "_geo_distance":
 			geoExpr, _ := t.compileGeoDistanceSortExpr(effectiveSorts[idx])
 			hasGeoMiss := false
 			var geoMissSample any
-			if missDist, okM := parseGeoSortMissingMeters(effectiveSorts[idx].Entry.Missing); okM {
+			if missDist, okM := parseGeoSortMissingMeters(effectiveSorts[idx].Entry.Missing, extractGeoSortUnit(effectiveSorts[idx])); okM {
 				geoExpr = fmt.Sprintf("COALESCE(%s, %g)", geoExpr, missDist)
 				hasGeoMiss = true
 				geoMissSample = missDist
@@ -10775,6 +11514,7 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 					}
 				}
 			}
+			val = normalizeEpochSecondSortValue(effType, effectiveSorts[idx].Entry.Format, b, val)
 			val = normalizeDateNanosValue(effType, val)
 			val = normalizeScaledFloatValue(b, val)
 			sampleForCol := val
@@ -13394,6 +14134,127 @@ func (t *Transpiler) compilePercolate(pq *esast.PercolateQuery, inScoring bool, 
 		}
 		if boost != 0 && whereSQL != "FALSE" {
 			scoreSQL = fmt.Sprintf("%g", boost)
+		}
+	}
+	return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: whereSQL, ScoreSQL: scoreSQL}
+}
+
+func (t *Transpiler) compileRuleQuery(rq *esast.RuleQuerySpec, inScoring bool, nctx *nestedCtx) CompiledQuery {
+	if rq == nil {
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
+	if rq.Organic == nil {
+		scoreSQL := "1.0"
+		if rq.Boost != nil && inScoring {
+			scoreSQL = fmt.Sprintf("%.4f", *rq.Boost)
+		}
+		return CompiledQuery{WhereSQL: "1=1", SafeWhereSQL: "1=1", ScoreSQL: scoreSQL}
+	}
+	cp := t.CompileQuery(rq.Organic, inScoring, nctx)
+	if rq.Boost != nil && inScoring {
+		if *rq.Boost == 0 {
+			cp.ScoreSQL = "0.0"
+		} else if *rq.Boost != 1.0 && cp.ScoreSQL != "" && cp.ScoreSQL != "0.0" {
+			cp.ScoreSQL = fmt.Sprintf("((%s) * %.4f)", cp.ScoreSQL, *rq.Boost)
+		}
+	}
+	return cp
+}
+
+func (t *Transpiler) compileSparseVectorQuery(sv *esast.SparseVectorQuerySpec, inScoring bool, nctx *nestedCtx) CompiledQuery {
+	if sv == nil || strings.TrimSpace(sv.Field) == "" {
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
+	resolvedField, b := t.resolveFieldInNestedCtx(sv.Field, false, nctx)
+	if !t.checkFieldSearchable(resolvedField, b) {
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
+	if t.Schema != nil && len(t.Schema.Fields) > 0 && b.ESType != "" && b.ESType != "sparse_vector" && b.ESType != "rank_features" {
+		if t.searchErr == nil {
+			t.searchErr = fmt.Errorf("query_shard_exception: cannot execute [sparse_vector] query on [%s] of type [%s]; must be [sparse_vector] or [rank_features]", resolvedField, b.ESType)
+		}
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
+	weights := make(map[string]float64)
+	if effToks := sv.EffectiveTokens(); len(effToks) > 0 {
+		for k, w := range effToks {
+			if tk := strings.TrimSpace(k); tk != "" && w > 0 && !math.IsNaN(w) && !math.IsInf(w, 0) {
+				weights[tk] = w
+			}
+		}
+	} else if qt := strings.TrimSpace(sv.EffectiveQueryText()); qt != "" {
+		for _, tok := range strings.Fields(strings.ToLower(qt)) {
+			weights[tok] += 1.0
+		}
+	}
+	if len(weights) == 0 {
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
+	toks := sortedMapKeys(weights)
+	var retrieveConds []string
+	var allConds []string
+	var scoreTerms []string
+	var prunedScoreTerms []string
+	var weightThreshold float64
+	hasThreshold := false
+	onlyScorePruned := false
+	if sv.Prune != nil && *sv.Prune && sv.PruningConfig != nil {
+		if twt, ok := parseFiniteFloatValue(sv.PruningConfig["tokens_weight_threshold"]); ok {
+			weightThreshold = twt
+			hasThreshold = true
+		}
+		if osp, ok := normalizeBooleanQueryValue(sv.PruningConfig["only_score_pruned_tokens"]); ok {
+			onlyScorePruned = osp
+		}
+	}
+	for _, tok := range toks {
+		w := weights[tok]
+		col := t.sqlTypedColumnRef(resolvedField+"."+tok, 1.0, false, nctx)
+		cond := fmt.Sprintf("(%s IS NOT NULL AND %s > 0)", col, col)
+		allConds = append(allConds, cond)
+		sTerm := fmt.Sprintf("(GREATEST(COALESCE(CAST(%s AS DOUBLE), 0.0), 0.0) * %g)", col, w)
+		scoreTerms = append(scoreTerms, sTerm)
+		if !hasThreshold || w >= weightThreshold {
+			if !hasThreshold || !onlyScorePruned {
+				retrieveConds = append(retrieveConds, cond)
+			}
+			prunedScoreTerms = append(prunedScoreTerms, sTerm)
+		}
+	}
+	if len(retrieveConds) == 0 {
+		retrieveConds = allConds
+	}
+	if len(prunedScoreTerms) == 0 {
+		prunedScoreTerms = scoreTerms
+	}
+	whereSQL := retrieveConds[0]
+	if len(retrieveConds) > 1 {
+		whereSQL = "(" + strings.Join(retrieveConds, " OR ") + ")"
+	}
+	if sv.Filter != nil {
+		fc := t.CompileQuery(sv.Filter, false, nctx)
+		whereSQL = fmt.Sprintf("(%s AND (%s))", whereSQL, fc.WhereSQL)
+	}
+	scoreSQL := "0.0"
+	if inScoring {
+		boost := 1.0
+		if sv.Boost != nil {
+			boost = *sv.Boost
+		}
+		if boost != 0 {
+			effTerms := scoreTerms
+			if hasThreshold && onlyScorePruned {
+				effTerms = prunedScoreTerms
+			}
+			sumExpr := effTerms[0]
+			if len(effTerms) > 1 {
+				sumExpr = "(" + strings.Join(effTerms, " + ") + ")"
+			}
+			if boost != 1.0 {
+				scoreSQL = fmt.Sprintf("(%g * %s)", boost, sumExpr)
+			} else {
+				scoreSQL = sumExpr
+			}
 		}
 	}
 	return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: whereSQL, ScoreSQL: scoreSQL}

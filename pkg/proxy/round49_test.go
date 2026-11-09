@@ -1659,3 +1659,623 @@ func TestRound52_ProxyAndIngestFeatures(t *testing.T) {
 		t.Fatalf("expected 404 on DELETE /_autoscaling/policy/missing_pol, got %d", c)
 	}
 }
+
+func TestRound53_ProxyAndIngestFeatures(t *testing.T) {
+	srv, handler := newTestServerWithMock(t)
+
+	// 1. F2: Synonyms Management API (/_synonyms & /_synonyms/{id}/*)
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_synonyms", `{}`); c != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 on POST /_synonyms, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_synonyms/syn1", `{}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on empty synonyms_set, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_synonyms/syn1", `{"synonyms_set":[{"synonyms":""}]}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on empty synonyms string, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_synonyms/syn1", `{"synonyms_set":[{"id":"r1","synonyms":"a, b"},{"id":"r1","synonyms":"c, d"}]}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on duplicate synonym rule id, got %d", c)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodPut, "/_synonyms/syn1", `{"synonyms_set":[{"id":"r1","synonyms":" laptop, notebook "},{"synonyms":"phone, mobile"}]}`); c != http.StatusOK || m["result"] != "created" {
+		t.Fatalf("expected 200 created on PUT /_synonyms/syn1, got %d (%v)", c, m)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodPut, "/_synonyms/syn1", `{"synonyms_set":[{"id":"r1","synonyms":"laptop, notebook"},{"id":"r2","synonyms":"phone, mobile"}]}`); c != http.StatusOK || m["result"] != "updated" {
+		t.Fatalf("expected 200 updated on PUT /_synonyms/syn1, got %d (%v)", c, m)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodGet, "/_synonyms?from=0&size=10", ``); c != http.StatusOK || m["count"] != float64(1) {
+		t.Fatalf("expected count=1 on GET /_synonyms, got %d (%v)", c, m)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodHead, "/_synonyms", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on HEAD /_synonyms, got %d", c)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodGet, "/_synonyms/syn1?from=0&size=1", ``); c != http.StatusOK || m["count"] != float64(2) {
+		t.Fatalf("expected count=2 on GET /_synonyms/syn1, got %d (%v)", c, m)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodHead, "/_synonyms/syn1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on HEAD /_synonyms/syn1, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_synonyms/missing_syn", ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 on GET /_synonyms/missing_syn, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodHead, "/_synonyms/missing_syn", ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 on HEAD /_synonyms/missing_syn, got %d", c)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodPut, "/_synonyms/syn1/r3", `{"synonyms":"tv, television"}`); c != http.StatusOK || m["result"] != "created" {
+		t.Fatalf("expected 200 created on PUT /_synonyms/syn1/r3, got %d (%v)", c, m)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodPut, "/_synonyms/syn1/r3", `{"synonyms":"tv, television, telly"}`); c != http.StatusOK || m["result"] != "updated" {
+		t.Fatalf("expected 200 updated on PUT /_synonyms/syn1/r3, got %d (%v)", c, m)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodGet, "/_synonyms/syn1/r3", ``); c != http.StatusOK || m["id"] != "r3" {
+		t.Fatalf("expected 200 on GET /_synonyms/syn1/r3, got %d (%v)", c, m)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodHead, "/_synonyms/syn1/r3", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on HEAD /_synonyms/syn1/r3, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_synonyms/syn1/missing_rule", ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 on GET /_synonyms/syn1/missing_rule, got %d", c)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodDelete, "/_synonyms/syn1/r3", ``); c != http.StatusOK || m["result"] != "deleted" {
+		t.Fatalf("expected 200 deleted on DELETE /_synonyms/syn1/r3, got %d (%v)", c, m)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_synonyms/syn1/_reload", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_synonyms/syn1/_reload, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_synonyms/missing_syn/_reload", ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 on POST /_synonyms/missing_syn/_reload, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_synonyms/syn1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE /_synonyms/syn1, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_synonyms/syn1", ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 on second DELETE /_synonyms/syn1, got %d", c)
+	}
+
+	// 2. F3: Query Rules Management API (/_query_rules & /_query_rules/{ruleset_id}/*) + Search Rule Resolution
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_query_rules/rs1", `{"rules":[]}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on empty ruleset, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_query_rules/rs1", `{"rules":[{"rule_id":"r1","type":"invalid"}]}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on invalid rule type, got %d", c)
+	}
+	rsBody := `{
+		"rules": [
+			{
+				"rule_id": "pin_rule",
+				"type": "pinned",
+				"criteria": [
+					{"type": "contains", "metadata": "q", "values": ["pugs"]},
+					{"type": "gte", "metadata": "tier", "values": [2]}
+				],
+				"actions": {"ids": ["doc-2"]}
+			},
+			{
+				"rule_id": "excl_rule",
+				"type": "exclude",
+				"criteria": [
+					{"type": "fuzzy", "metadata": "q", "values": ["pugs"]},
+					{"type": "prefix", "metadata": "cat", "values": ["dog"]},
+					{"type": "suffix", "metadata": "region", "values": ["us"]},
+					{"type": "exact", "metadata": "env", "values": ["prod"]},
+					{"type": "lt", "metadata": "age", "values": [10]},
+					{"type": "lte", "metadata": "age", "values": [5]},
+					{"type": "gt", "metadata": "score", "values": [1]},
+					{"type": "always"}
+				],
+				"actions": {"docs": [{"_index": "qr_idx", "_id": "doc-1"}]}
+			}
+		]
+	}`
+	if c, m, _ := doRound48Req(t, handler, http.MethodPut, "/_query_rules/rs1", rsBody); c != http.StatusCreated || m["result"] != "created" {
+		t.Fatalf("expected 201 created on PUT /_query_rules/rs1, got %d (%v)", c, m)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodPut, "/_query_rules/rs1", rsBody); c != http.StatusOK || m["result"] != "updated" {
+		t.Fatalf("expected 200 updated on second PUT /_query_rules/rs1, got %d (%v)", c, m)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodGet, "/_query_rules", ``); c != http.StatusOK || m["count"] != float64(1) {
+		t.Fatalf("expected count=1 on GET /_query_rules, got %d (%v)", c, m)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodGet, "/_query_rules/rs1", ``); c != http.StatusOK || m["ruleset_id"] != "rs1" {
+		t.Fatalf("expected 200 on GET /_query_rules/rs1, got %d (%v)", c, m)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodPost, "/_query_rules/rs1/_test", `{"match_criteria":{"q":"cute pugs","tier":3,"cat":"dogs","region":"east-us","env":"prod","age":5,"score":2}}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_query_rules/rs1/_test, got %d (%v)", c, m)
+	} else if mr, _ := m["matched_rules"].([]any); len(mr) != 2 {
+		t.Fatalf("expected 2 matched rules, got %v", m)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodPut, "/_query_rules/rs1/_rule/r_extra", `{"type":"pinned","criteria":[{"type":"exact","metadata":"k","values":["v"]}],"actions":{"ids":["doc-3"]}}`); c != http.StatusCreated || m["result"] != "created" {
+		t.Fatalf("expected 201 on PUT /_query_rules/rs1/_rule/r_extra, got %d (%v)", c, m)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodPut, "/_query_rules/rs1/_rule/r_extra", `{"type":"pinned","criteria":[{"type":"exact","metadata":"k","values":["v2"]}],"actions":{"ids":["doc-3"]}}`); c != http.StatusOK || m["result"] != "updated" {
+		t.Fatalf("expected 200 on update PUT /_query_rules/rs1/_rule/r_extra, got %d (%v)", c, m)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodGet, "/_query_rules/rs1/_rule/r_extra", ``); c != http.StatusOK || m["rule_id"] != "r_extra" {
+		t.Fatalf("expected 200 on GET /_query_rules/rs1/_rule/r_extra, got %d (%v)", c, m)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodDelete, "/_query_rules/rs1/_rule/r_extra", ``); c != http.StatusOK || m["result"] != "deleted" {
+		t.Fatalf("expected 200 on DELETE /_query_rules/rs1/_rule/r_extra, got %d (%v)", c, m)
+	}
+	// Test rewriteSearchBodyQueryRules
+	rewritten := srv.rewriteSearchBodyQueryRules([]byte(`{"query":{"rule":{"organic":{"match_all":{}},"ruleset_ids":["rs1"],"match_criteria":{"q":"cute pugs","tier":3,"cat":"dogs","region":"east-us","env":"prod","age":5,"score":2}}}}`))
+	if !strings.Contains(string(rewritten), `"pinned"`) || !strings.Contains(string(rewritten), `"must_not"`) {
+		t.Fatalf("expected rewritten rule query to contain pinned and must_not, got %s", string(rewritten))
+	}
+	rewrittenRetr := srv.rewriteSearchBodyQueryRules([]byte(`{"retriever":{"rule":{"organic":{"match_all":{}},"ruleset_id":"rs1","match_criteria":{"q":"cute pugs","tier":3}}}}`))
+	if !strings.Contains(string(rewrittenRetr), `"pinned"`) {
+		t.Fatalf("expected rewritten retriever.rule to contain pinned, got %s", string(rewrittenRetr))
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_query_rules/rs1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE /_query_rules/rs1, got %d", c)
+	}
+
+	// 3. F4: Features API & Cluster Voting Config Exclusions
+	if c, m, _ := doRound48Req(t, handler, http.MethodGet, "/_features", ``); c != http.StatusOK || len(m["features"].([]any)) < 8 {
+		t.Fatalf("expected >=8 features on GET /_features, got %d (%v)", c, m)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodPost, "/_features/_reset", ``); c != http.StatusOK || len(m["features"].([]any)) < 8 {
+		t.Fatalf("expected 200 on POST /_features/_reset, got %d (%v)", c, m)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_cluster/voting_config_exclusions", ``); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on POST /_cluster/voting_config_exclusions without params, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_cluster/voting_config_exclusions?node_names=node-a&node_ids=n1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_cluster/voting_config_exclusions, got %d", c)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodGet, "/_cluster/state", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_cluster/state, got %d", c)
+	} else if cc, ok := m["cluster_coordination"].(map[string]any); !ok || len(cc["voting_config_exclusions"].([]any)) != 2 {
+		t.Fatalf("expected 2 voting_config_exclusions in cluster state, got %v", m)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_cluster/voting_config_exclusions", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE /_cluster/voting_config_exclusions, got %d", c)
+	}
+
+	// 4. F5: Migration Deprecations & Nodes Shutdown
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/r53_idx", `{}`)
+	if c, m, _ := doRound48Req(t, handler, http.MethodGet, "/_migration/deprecations", ``); c != http.StatusOK || m["cluster_settings"] == nil {
+		t.Fatalf("expected 200 on GET /_migration/deprecations, got %d (%v)", c, m)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/r53_idx/_migration/deprecations", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /r53_idx/_migration/deprecations, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/nonexistent_r53/_migration/deprecations", ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 on GET /nonexistent_r53/_migration/deprecations, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_nodes/node-1/shutdown", `{"type":"invalid"}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on invalid shutdown type, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_nodes/node-1/shutdown", `{"type":"restart","reason":"upgrade"}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /_nodes/node-1/shutdown, got %d", c)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodGet, "/_nodes/shutdown", ``); c != http.StatusOK || len(m["nodes"].([]any)) != 1 {
+		t.Fatalf("expected 1 node on GET /_nodes/shutdown, got %d (%v)", c, m)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodGet, "/_nodes/node-1/shutdown", ``); c != http.StatusOK || len(m["nodes"].([]any)) != 1 {
+		t.Fatalf("expected 1 node on GET /_nodes/node-1/shutdown, got %d (%v)", c, m)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_nodes/node-1/shutdown", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE /_nodes/node-1/shutdown, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_nodes/node-1/shutdown", ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 on second DELETE /_nodes/node-1/shutdown, got %d", c)
+	}
+
+	// 5. F6: Rollup API
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_rollup/job/rj1", `{}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on invalid rollup job, got %d", c)
+	}
+	rjBody := `{"index_pattern":"r53_*","rollup_index":"r53_rollup","cron":"0 * * * * ?","page_size":100,"groups":{"date_histogram":{"field":"@timestamp","fixed_interval":"1h"}}}`
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_rollup/job/rj1", rjBody); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /_rollup/job/rj1, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_rollup/job/rj1", rjBody); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on duplicate PUT /_rollup/job/rj1, got %d", c)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodPost, "/_rollup/job/rj1/_start", ``); c != http.StatusOK || m["started"] != true {
+		t.Fatalf("expected started:true on POST /_rollup/job/rj1/_start, got %d (%v)", c, m)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodPost, "/_rollup/job/rj1/_stop", ``); c != http.StatusOK || m["stopped"] != true {
+		t.Fatalf("expected stopped:true on POST /_rollup/job/rj1/_stop, got %d (%v)", c, m)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodGet, "/_rollup/job/rj1", ``); c != http.StatusOK || len(m["jobs"].([]any)) != 1 {
+		t.Fatalf("expected 1 job on GET /_rollup/job/rj1, got %d (%v)", c, m)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_rollup/data/rj1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_rollup/data/rj1, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/r53_idx/_rollup/data", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /r53_idx/_rollup/data, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r53_idx/_rollup_search", `{"from":10}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on _rollup_search with from>0, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r53_idx/_rollup_search", `{"size":0}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on _rollup_search with size:0, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_rollup/job/rj1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE /_rollup/job/rj1, got %d", c)
+	}
+
+	// 6. F7 & F9: Snapshots (_mount, wildcard DELETE, multi-repo _status), Searchable Snapshots, CCR, Transform _update
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_snapshot/repo_a", `{"type":"fs"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_snapshot/repo_b", `{"type":"fs"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_snapshot/repo_a/snap_1", `{"indices":"r53_idx"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_snapshot/repo_a/snap_2", `{"indices":"r53_idx"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_snapshot/repo_b/snap_b1", `{"indices":"r53_idx"}`)
+	if c, m, _ := doRound48Req(t, handler, http.MethodGet, "/_snapshot/_all/_status", ``); c != http.StatusOK || len(m["snapshots"].([]any)) != 3 {
+		t.Fatalf("expected 3 snapshots on GET /_snapshot/_all/_status, got %d (%v)", c, m)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodGet, "/_snapshot/repo_*/snap_*/_status", ``); c != http.StatusOK || len(m["snapshots"].([]any)) != 3 {
+		t.Fatalf("expected 3 snapshots on GET /_snapshot/repo_*/snap_*/_status, got %d (%v)", c, m)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodPost, "/_snapshot/repo_a/snap_1/_mount", `{"index":"r53_idx","renamed_index":"mounted_r53"}`); c != http.StatusOK || m["accepted"] != true {
+		t.Fatalf("expected 200 accepted on _mount, got %d (%v)", c, m)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_searchable_snapshots/stats", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_searchable_snapshots/stats, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/mounted_r53/_searchable_snapshots/stats", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /mounted_r53/_searchable_snapshots/stats, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_searchable_snapshots/cache/stats", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_searchable_snapshots/cache/stats, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_searchable_snapshots/cache/clear", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_searchable_snapshots/cache/clear, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_snapshot/repo_a/snap_*", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on wildcard DELETE /_snapshot/repo_a/snap_*, got %d", c)
+	}
+	// CCR
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_ccr/auto_follow/af1", `{"remote_cluster":"rc1","leader_index_patterns":["leader_*"]}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /_ccr/auto_follow/af1, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_ccr/auto_follow/af1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_ccr/auto_follow/af1, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_ccr/auto_follow", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_ccr/auto_follow, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_ccr/auto_follow/af1/_pause", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_ccr/auto_follow/af1/_pause, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_ccr/auto_follow/af1/_resume", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_ccr/auto_follow/af1/_resume, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_ccr/auto_follow/af1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE /_ccr/auto_follow/af1, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_ccr/stats", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_ccr/stats, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/follower_idx/_ccr/follow", `{"remote_cluster":"rc1","leader_index":"leader_idx"}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /follower_idx/_ccr/follow, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/follower_idx/_ccr/info", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /follower_idx/_ccr/info, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/follower_idx/_ccr/stats", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /follower_idx/_ccr/stats, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/follower_idx/_ccr/pause_follow", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /follower_idx/_ccr/pause_follow, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/follower_idx/_ccr/resume_follow", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /follower_idx/_ccr/resume_follow, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/follower_idx/_ccr/unfollow", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /follower_idx/_ccr/unfollow, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/leader_idx/_ccr/forget_follower", `{}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /leader_idx/_ccr/forget_follower, got %d", c)
+	}
+	// Transform _update
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_transform/tf_r53", `{"source":{"index":["r53_idx"]},"dest":{"index":"r53_tf_dest"},"pivot":{"group_by":{},"aggregations":{}}}`)
+	if c, m, _ := doRound48Req(t, handler, http.MethodPost, "/_transform/tf_r53/_update", `{"description":"updated desc","frequency":"5m"}`); c != http.StatusOK || m["description"] != "updated desc" {
+		t.Fatalf("expected 200 on POST /_transform/tf_r53/_update, got %d (%v)", c, m)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_transform/tf_r53/_update", `{"pivot":{}}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 updating immutable transform pivot, got %d", c)
+	}
+
+	// 7. F8: Security Management API & Logstash Pipeline API
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_security/user/alice", `{"password":"secret","roles":["admin"]}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /_security/user/alice, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_security/user/alice", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_security/user/alice, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_security/user", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_security/user, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_security/user/alice/_disable", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /_security/user/alice/_disable, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_security/user/alice/_enable", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /_security/user/alice/_enable, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_security/user/alice/_password", `{"password":"newsecret"}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_security/user/alice/_password, got %d", c)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodPost, "/_security/user/_has_privileges", `{"cluster":["monitor"],"index":[{"names":["r53_idx"],"privileges":["read"]}]}`); c != http.StatusOK || m["has_all_requested"] != true {
+		t.Fatalf("expected 200 on _has_privileges, got %d (%v)", c, m)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_security/user/alice", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE /_security/user/alice, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_security/role/analyst", `{"cluster":["monitor"],"indices":[{"names":["*"],"privileges":["read"]}]}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /_security/role/analyst, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_security/role/analyst", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_security/role/analyst, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_security/role", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_security/role, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_security/role/analyst/_clear_cache", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_security/role/analyst/_clear_cache, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_security/role/analyst", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE /_security/role/analyst, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_security/privilege/_builtin", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_security/privilege/_builtin, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_security/privilege", `{"myapp":{"read":{"actions":["data:read/*"]}}}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /_security/privilege, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_security/privilege/myapp/read", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_security/privilege/myapp/read, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_security/privilege/myapp/read", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE /_security/privilege/myapp/read, got %d", c)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodPost, "/_security/api_key", `{"name":"my-key"}`); c != http.StatusOK || m["id"] == nil {
+		t.Fatalf("expected 200 on POST /_security/api_key, got %d (%v)", c, m)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_security/api_key?name=my-key", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_security/api_key, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_security/_query/api_key", `{}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_security/_query/api_key, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_security/api_key", `{"name":"my-key"}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE /_security/api_key, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_security/oauth2/token", `{"grant_type":"client_credentials"}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_security/oauth2/token, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_security/oauth2/token", `{"token":"doris-oauth2-access-token"}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE /_security/oauth2/token, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_security/service", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_security/service, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_security/service/elastic/kibana/credential/token/t1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST service token, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_security/service/elastic/kibana/credential/token", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET service tokens, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_security/service/elastic/kibana/credential/token/t1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE service token, got %d", c)
+	}
+	// Logstash
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_logstash/pipeline/ls1", `{"pipeline":"input { beats { port => 5044 } }","description":"beats pipeline"}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /_logstash/pipeline/ls1, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_logstash/pipeline/ls1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_logstash/pipeline/ls1, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_logstash/pipeline", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_logstash/pipeline, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_logstash/pipeline/ls1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE /_logstash/pipeline/ls1, got %d", c)
+	}
+
+	// 8. F26–F29: Ingest processor validation, ctx map methods, date, fingerprint, attachment, user_agent, kv
+	for _, badPipe := range []string{
+		`{}`,
+		`{"processors":"not_a_list"}`,
+		`{"processors":["not_a_map"]}`,
+		`{"processors":[{"tag":"only_tag"}]}`,
+		`{"processors":[{"set":{"field":"a","value":1},"lowercase":{"field":"a"}}]}`,
+		`{"processors":[{"unknown_proc_r53":{}}]}`,
+		`{"processors":[{"set":null}]}`,
+		`{"processors":[{"set":{"value":1}}]}`,
+		`{"processors":[{"set":{"field":"a"}}]}`,
+		`{"processors":[{"default":{}}]}`,
+		`{"processors":[{"default":{"field":"a"}}]}`,
+		`{"processors":[{"append":{"field":"a"}}]}`,
+		`{"processors":[{"remove":{}}]}`,
+		`{"processors":[{"remove":{"field":""}}]}`,
+		`{"processors":[{"remove":{"field":[]}}]}`,
+		`{"processors":[{"remove":{"field":[""]}}]}`,
+		`{"processors":[{"remove":{"field":123}}]}`,
+		`{"processors":[{"remove":{"keep":[]}}]}`,
+		`{"processors":[{"rename":{}}]}`,
+		`{"processors":[{"rename":{"field":"a"}}]}`,
+		`{"processors":[{"rename":{"field":"a","target_field":"a"}}]}`,
+		`{"processors":[{"copy":{"field":"a","target_field":"a"}}]}`,
+		`{"processors":[{"lowercase":{}}]}`,
+		`{"processors":[{"split":{}}]}`,
+		`{"processors":[{"split":{"field":"a"}}]}`,
+		`{"processors":[{"join":{}}]}`,
+		`{"processors":[{"join":{"field":"a"}}]}`,
+		`{"processors":[{"convert":{}}]}`,
+		`{"processors":[{"convert":{"field":"a"}}]}`,
+		`{"processors":[{"convert":{"field":"a","type":"bogus"}}]}`,
+		`{"processors":[{"gsub":{}}]}`,
+		`{"processors":[{"gsub":{"field":"a"}}]}`,
+		`{"processors":[{"gsub":{"field":"a","pattern":"b"}}]}`,
+		`{"processors":[{"gsub":{"field":"a","pattern":"[unclosed","replacement":"x"}}]}`,
+		`{"processors":[{"kv":{}}]}`,
+		`{"processors":[{"kv":{"field":"a"}}]}`,
+		`{"processors":[{"kv":{"field":"a","field_split":"&"}}]}`,
+		`{"processors":[{"kv":{"field":"a","field_split":"[unclosed","value_split":"="}}]}`,
+		`{"processors":[{"kv":{"field":"a","field_split":"&","value_split":"[unclosed"}}]}`,
+		`{"processors":[{"csv":{}}]}`,
+		`{"processors":[{"csv":{"field":"a"}}]}`,
+		`{"processors":[{"csv":{"field":"a","target_fields":["c1"],"separator":"::"}}]}`,
+		`{"processors":[{"csv":{"field":"a","target_fields":["c1"],"quote":"''"}}]}`,
+		`{"processors":[{"date":{}}]}`,
+		`{"processors":[{"date":{"field":"a"}}]}`,
+		`{"processors":[{"date":{"field":"a","formats":["ISO8601"],"timezone":"Invalid/Zone"}}]}`,
+		`{"processors":[{"date_index_name":{}}]}`,
+		`{"processors":[{"date_index_name":{"field":"a"}}]}`,
+		`{"processors":[{"date_index_name":{"field":"a","date_rounding":"bogus"}}]}`,
+		`{"processors":[{"date_index_name":{"field":"a","date_rounding":"d","timezone":"Invalid/Zone"}}]}`,
+		`{"processors":[{"dissect":{}}]}`,
+		`{"processors":[{"dissect":{"field":"a"}}]}`,
+		`{"processors":[{"grok":{}}]}`,
+		`{"processors":[{"grok":{"field":"a"}}]}`,
+		`{"processors":[{"grok":{"field":"a","patterns":[""]}}]}`,
+		`{"processors":[{"grok":{"field":"a","patterns":["%{NONEXISTENT_GROK_PAT_R53:x}"]}}]}`,
+		`{"processors":[{"fingerprint":{"fields":["a"],"exclude_fields":["b"]}}]}`,
+		`{"processors":[{"fingerprint":{"method":"BOGUS"}}]}`,
+		`{"processors":[{"fail":{}}]}`,
+		`{"processors":[{"pipeline":{}}]}`,
+		`{"processors":[{"script":{}}]}`,
+		`{"processors":[{"enrich":{}}]}`,
+		`{"processors":[{"enrich":{"policy_name":"p"}}]}`,
+		`{"processors":[{"enrich":{"policy_name":"p","field":"f"}}]}`,
+		`{"processors":[{"enrich":{"policy_name":"p","field":"f","target_field":"t","max_matches":200}}]}`,
+		`{"processors":[{"foreach":{}}]}`,
+		`{"processors":[{"foreach":{"field":"a"}}]}`,
+		`{"processors":[{"foreach":{"field":"a","processor":{"set":null}}}]}`,
+		`{"processors":[{"foreach":{"field":"a","processors":[{"set":null}]}}]}`,
+		`{"processors":[{"inference":{}}]}`,
+		`{"processors":[{"set":{"field":"a","value":1,"on_failure":"not_a_list"}}]}`,
+		`{"processors":[{"set":{"field":"a","value":1},"on_failure":"not_a_list"}]}`,
+		`{"processors":[{"set":{"field":"a","value":1}}],"on_failure":"not_a_list"}`,
+	} {
+		if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_ingest/pipeline/bad_pipe", badPipe); c != http.StatusBadRequest {
+			t.Fatalf("expected 400 on invalid pipeline %s, got %d", badPipe, c)
+		}
+	}
+
+	// Additional error/method branches on Round 53 endpoints
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_query_rules", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_query_rules", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_query_rules/nonexistent_rs", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_query_rules/nonexistent_rs", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodDelete, "/_query_rules/nonexistent_rs", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_query_rules/nonexistent_rs/_test", `{"match_criteria":{"q":"a"}}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_query_rules/nonexistent_rs/_test", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_query_rules/rs_err", `{"rules":[{"rule_id":"r1","type":"pinned","criteria":[{"type":"exact"}],"actions":{"ids":["1"]}}]}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_query_rules/rs_err", `{"rules":[{"rule_id":"r1","type":"pinned","criteria":[{"type":"exact","metadata":"q"}],"actions":{"ids":["1"]}}]}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_query_rules/rs_err", `{"rules":[{"rule_id":"r1","type":"pinned","criteria":[{"type":"always"}],"actions":{}}]}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_features", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_features/_reset", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_features/unknown", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_cluster/voting_config_exclusions", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_cluster/voting_config_exclusions", `{"node_ids":"n1","node_names":"nm1"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_migration/deprecations", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_migration/deprecations", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_nodes/missing_node/shutdown", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_rollup/job/missing_rj/_start", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_rollup/data/_all", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_rollup/data/nonexistent_rj", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_security/_authenticate", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_security/user/elastic", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_security/user/missing_u", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_security/role/missing_r", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_security/privilege", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_security/privilege/missing_app", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_security/_clear_api_key_cache", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_security/service/elastic/kibana", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_logstash/pipeline", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_logstash/pipeline/missing_ls", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_logstash/pipeline/missing_ls", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodDelete, "/_logstash/pipeline/missing_ls", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_logstash/pipeline/ls_w", `{"pipeline":"input {}"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_logstash/pipeline/ls_*", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_logstash/pipeline", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_logstash/pipeline/ls_empty", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPatch, "/_logstash/pipeline", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_logstash/unknown", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_rollup/job/missing_rj", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_rollup/job/missing_rj", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodDelete, "/_rollup/job/missing_rj", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_rollup/job/missing_rj?allow_no_match=true", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/r53_idx/_rollup_search?from=5", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodDelete, "/r53_idx/_rollup_search", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_searchable_snapshots/unknown", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_searchable_snapshots/cache/clear", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_searchable_snapshots/cache/stats", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_searchable_snapshots/stats", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/follower_err/_ccr/follow", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/missing_f/_ccr/info", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/missing_f/_ccr/stats", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/missing_f/_ccr/pause_follow", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/missing_f/_ccr/resume_follow", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/missing_f/_ccr/unfollow", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/missing_f/_ccr/unknown", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_ccr/auto_follow/af_err", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_ccr/auto_follow/missing_af", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodDelete, "/_ccr/auto_follow/missing_af", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_ccr/auto_follow/missing_af/_pause", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_ccr/unknown", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_security/user/no_roles", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_security/user/missing_u/_enable", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_security/user/elastic/_password", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_security/role/empty_role", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_security/api_key/_grant", `{"api_key":{"name":"granted-key"}}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_security/api_key", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodDelete, "/_security/api_key", `{"ids":["key-1"]}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_security/oauth2/token", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_security/unknown", ``)
+
+	simBody := `{
+		"pipeline": {
+			"processors": [
+				{"date": {"field": "num_epoch", "formats": ["epoch_millis"], "target_field": "ts_epoch"}},
+				{"date": {"field": "str_date", "formats": ["uuuu-MM-dd'T'HH:mm:ss,SSSZ"], "target_field": "ts_uuuu"}},
+				{"fingerprint": {"fields": ["msg"], "method": "Murmur3@2.0", "target_field": "fp_murmur"}},
+				{"fingerprint": {"fields": ["msg"], "method": "SHA-256@2.0", "target_field": "fp_sha256"}},
+				{"attachment": {"field": "b64", "indexed_chars_field": "max_chars", "properties": ["content", "content_length"]}},
+				{"user_agent": {"field": "ua", "properties": ["name", "major", "minor", "os"]}},
+				{"kv": {"field": "kv_raw", "field_split": " ", "value_split": "=", "strip_brackets": true}},
+				{"script": {"source": "ctx.replace('msg', 'updated_msg')"}}
+			]
+		},
+		"docs": [
+			{
+				"_source": {
+					"num_epoch": 1704067200000,
+					"str_date": "2026-01-02T03:04:05,678+0000",
+					"msg": "hello world",
+					"b64": "aGVsbG8gd29ybGQ=",
+					"max_chars": 5,
+					"ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.1.2",
+					"kv_raw": "[k1]=\"val\\\"1\" (k2)=[val2]"
+				}
+			}
+		]
+	}`
+	if c, m, raw := doRound48Req(t, handler, http.MethodPost, "/_ingest/pipeline/_simulate", simBody); c != http.StatusOK {
+		t.Fatalf("expected 200 on _simulate, got %d: %s", c, raw)
+	} else {
+		docs, _ := m["docs"].([]any)
+		doc0, _ := docs[0].(map[string]any)["doc"].(map[string]any)
+		src, _ := doc0["_source"].(map[string]any)
+		if src["ts_epoch"] != "2024-01-01T00:00:00Z" {
+			t.Fatalf("expected ts_epoch 2024-01-01T00:00:00Z, got %v", src["ts_epoch"])
+		}
+		if src["fp_murmur"] == nil || len(fmt.Sprintf("%v", src["fp_murmur"])) != 32 {
+			t.Fatalf("expected 32-char murmur3 hex digest, got %v", src["fp_murmur"])
+		}
+		if src["k1"] != `val"1` || src["k2"] != "val2" {
+			t.Fatalf("unexpected kv output: k1=%v k2=%v", src["k1"], src["k2"])
+		}
+		att, _ := src["attachment"].(map[string]any)
+		if att["content"] != "hello" || att["content_type"] != nil {
+			t.Fatalf("expected truncated attachment content='hello' and filtered content_type=nil, got %v", att)
+		}
+		ua, _ := src["user_agent"].(map[string]any)
+		if ua["name"] != "Chrome" || ua["major"] != "120" || ua["minor"] != "1" || ua["original"] != nil {
+			t.Fatalf("unexpected user_agent output: %v", ua)
+		}
+	}
+}

@@ -1219,3 +1219,1073 @@ func TestRound52F1Features(t *testing.T) {
 		t.Errorf("execContains on nested slice of ints failed: %v", err)
 	}
 }
+
+func TestRound53BuildActionRequestF0(t *testing.T) {
+	ctx := newRunnerContext(http.DefaultClient, "http://localhost:9200")
+
+	cases := []struct {
+		name          string
+		action        string
+		params        map[string]any
+		wantMethod    string
+		wantPath      string
+		strippedParam []string
+		wantQuery     map[string]string
+	}{
+		// synonyms.*
+		{
+			name:          "synonyms.put_synonym with id",
+			action:        "synonyms.put_synonym",
+			params:        map[string]any{"id": "my-synonyms"},
+			wantMethod:    http.MethodPut,
+			wantPath:      "/_synonyms/my-synonyms",
+			strippedParam: []string{"id"},
+		},
+		{
+			name:          "synonyms.put_synonym with synonyms_set",
+			action:        "synonyms.put_synonym",
+			params:        map[string]any{"synonyms_set": "my-synonyms-2"},
+			wantMethod:    http.MethodPut,
+			wantPath:      "/_synonyms/my-synonyms-2",
+			strippedParam: []string{"synonyms_set"},
+		},
+		{
+			name:          "synonyms.get_synonym",
+			action:        "synonyms.get_synonym",
+			params:        map[string]any{"id": "my-synonyms", "size": 10},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_synonyms/my-synonyms",
+			strippedParam: []string{"id"},
+			wantQuery:     map[string]string{"size": "10"},
+		},
+		{
+			name:       "synonyms.get_synonyms_sets",
+			action:     "synonyms.get_synonyms_sets",
+			params:     map[string]any{"from": 0, "size": 5},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_synonyms",
+			wantQuery:  map[string]string{"from": "0", "size": "5"},
+		},
+		{
+			name:          "synonyms.delete_synonym",
+			action:        "synonyms.delete_synonym",
+			params:        map[string]any{"id": "my-synonyms"},
+			wantMethod:    http.MethodDelete,
+			wantPath:      "/_synonyms/my-synonyms",
+			strippedParam: []string{"id"},
+		},
+		{
+			name:          "synonyms.put_synonym_rule",
+			action:        "synonyms.put_synonym_rule",
+			params:        map[string]any{"set_id": "my-synonyms", "rule_id": "rule-1"},
+			wantMethod:    http.MethodPut,
+			wantPath:      "/_synonyms/my-synonyms/rule-1",
+			strippedParam: []string{"set_id", "rule_id"},
+		},
+		{
+			name:          "synonyms.get_synonym_rule",
+			action:        "synonyms.get_synonym_rule",
+			params:        map[string]any{"synonyms_set": "my-synonyms", "rule_id": "rule-1"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_synonyms/my-synonyms/rule-1",
+			strippedParam: []string{"synonyms_set", "rule_id"},
+		},
+		{
+			name:          "synonyms.delete_synonym_rule",
+			action:        "synonyms.delete_synonym_rule",
+			params:        map[string]any{"id": "my-synonyms", "rule_id": "rule-1"},
+			wantMethod:    http.MethodDelete,
+			wantPath:      "/_synonyms/my-synonyms/rule-1",
+			strippedParam: []string{"id", "rule_id"},
+		},
+		{
+			name:          "synonyms.reload_synonym",
+			action:        "synonyms.reload_synonym",
+			params:        map[string]any{"id": "my-synonyms"},
+			wantMethod:    http.MethodPost,
+			wantPath:      "/_synonyms/my-synonyms/_reload",
+			strippedParam: []string{"id"},
+		},
+
+		// query_rules.*
+		{
+			name:          "query_rules.put_ruleset",
+			action:        "query_rules.put_ruleset",
+			params:        map[string]any{"ruleset_id": "rs-1"},
+			wantMethod:    http.MethodPut,
+			wantPath:      "/_query_rules/rs-1",
+			strippedParam: []string{"ruleset_id"},
+		},
+		{
+			name:          "query_rules.get_ruleset",
+			action:        "query_rules.get_ruleset",
+			params:        map[string]any{"ruleset_id": "rs-1"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_query_rules/rs-1",
+			strippedParam: []string{"ruleset_id"},
+		},
+		{
+			name:       "query_rules.list_rulesets",
+			action:     "query_rules.list_rulesets",
+			params:     map[string]any{"from": 0},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_query_rules",
+			wantQuery:  map[string]string{"from": "0"},
+		},
+		{
+			name:          "query_rules.delete_ruleset",
+			action:        "query_rules.delete_ruleset",
+			params:        map[string]any{"ruleset_id": "rs-1"},
+			wantMethod:    http.MethodDelete,
+			wantPath:      "/_query_rules/rs-1",
+			strippedParam: []string{"ruleset_id"},
+		},
+		{
+			name:          "query_rules.put_rule",
+			action:        "query_rules.put_rule",
+			params:        map[string]any{"ruleset_id": "rs-1", "rule_id": "r-1"},
+			wantMethod:    http.MethodPut,
+			wantPath:      "/_query_rules/rs-1/_rule/r-1",
+			strippedParam: []string{"ruleset_id", "rule_id"},
+		},
+		{
+			name:          "query_rules.get_rule",
+			action:        "query_rules.get_rule",
+			params:        map[string]any{"ruleset_id": "rs-1", "rule_id": "r-1"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_query_rules/rs-1/_rule/r-1",
+			strippedParam: []string{"ruleset_id", "rule_id"},
+		},
+		{
+			name:          "query_rules.delete_rule",
+			action:        "query_rules.delete_rule",
+			params:        map[string]any{"ruleset_id": "rs-1", "rule_id": "r-1"},
+			wantMethod:    http.MethodDelete,
+			wantPath:      "/_query_rules/rs-1/_rule/r-1",
+			strippedParam: []string{"ruleset_id", "rule_id"},
+		},
+		{
+			name:          "query_rules.test",
+			action:        "query_rules.test",
+			params:        map[string]any{"ruleset_id": "rs-1"},
+			wantMethod:    http.MethodPost,
+			wantPath:      "/_query_rules/rs-1/_test",
+			strippedParam: []string{"ruleset_id"},
+		},
+
+		// features.* and cluster.*_voting_config_exclusions
+		{
+			name:       "features.get_features",
+			action:     "features.get_features",
+			params:     map[string]any{},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_features",
+		},
+		{
+			name:       "features.reset_features",
+			action:     "features.reset_features",
+			params:     map[string]any{},
+			wantMethod: http.MethodPost,
+			wantPath:   "/_features/_reset",
+		},
+		{
+			name:       "cluster.post_voting_config_exclusions",
+			action:     "cluster.post_voting_config_exclusions",
+			params:     map[string]any{"node_names": "node-1"},
+			wantMethod: http.MethodPost,
+			wantPath:   "/_cluster/voting_config_exclusions",
+			wantQuery:  map[string]string{"node_names": "node-1"},
+		},
+		{
+			name:       "cluster.delete_voting_config_exclusions",
+			action:     "cluster.delete_voting_config_exclusions",
+			params:     map[string]any{"wait_for_removal": false},
+			wantMethod: http.MethodDelete,
+			wantPath:   "/_cluster/voting_config_exclusions",
+			wantQuery:  map[string]string{"wait_for_removal": "false"},
+		},
+
+		// migration.* and shutdown.*
+		{
+			name:       "migration.deprecations cluster",
+			action:     "migration.deprecations",
+			params:     map[string]any{},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_migration/deprecations",
+		},
+		{
+			name:          "migration.deprecations with index",
+			action:        "migration.deprecations",
+			params:        map[string]any{"index": "my-idx"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/my-idx/_migration/deprecations",
+			strippedParam: []string{"index"},
+		},
+		{
+			name:          "shutdown.put_node",
+			action:        "shutdown.put_node",
+			params:        map[string]any{"node_id": "node-1"},
+			wantMethod:    http.MethodPut,
+			wantPath:      "/_nodes/node-1/shutdown",
+			strippedParam: []string{"node_id"},
+		},
+		{
+			name:       "shutdown.get_node all",
+			action:     "shutdown.get_node",
+			params:     map[string]any{},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_nodes/shutdown",
+		},
+		{
+			name:          "shutdown.get_node with node_id",
+			action:        "shutdown.get_node",
+			params:        map[string]any{"node_id": "node-1"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_nodes/node-1/shutdown",
+			strippedParam: []string{"node_id"},
+		},
+		{
+			name:          "shutdown.delete_node",
+			action:        "shutdown.delete_node",
+			params:        map[string]any{"node_id": "node-1"},
+			wantMethod:    http.MethodDelete,
+			wantPath:      "/_nodes/node-1/shutdown",
+			strippedParam: []string{"node_id"},
+		},
+
+		// rollup.*
+		{
+			name:          "rollup.put_job",
+			action:        "rollup.put_job",
+			params:        map[string]any{"id": "job-1"},
+			wantMethod:    http.MethodPut,
+			wantPath:      "/_rollup/job/job-1",
+			strippedParam: []string{"id"},
+		},
+		{
+			name:       "rollup.get_jobs all",
+			action:     "rollup.get_jobs",
+			params:     map[string]any{},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_rollup/job",
+		},
+		{
+			name:          "rollup.get_jobs with id",
+			action:        "rollup.get_jobs",
+			params:        map[string]any{"id": "job-1"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_rollup/job/job-1",
+			strippedParam: []string{"id"},
+		},
+		{
+			name:          "rollup.delete_job",
+			action:        "rollup.delete_job",
+			params:        map[string]any{"id": "job-1"},
+			wantMethod:    http.MethodDelete,
+			wantPath:      "/_rollup/job/job-1",
+			strippedParam: []string{"id"},
+		},
+		{
+			name:          "rollup.start_job",
+			action:        "rollup.start_job",
+			params:        map[string]any{"id": "job-1"},
+			wantMethod:    http.MethodPost,
+			wantPath:      "/_rollup/job/job-1/_start",
+			strippedParam: []string{"id"},
+		},
+		{
+			name:          "rollup.stop_job",
+			action:        "rollup.stop_job",
+			params:        map[string]any{"id": "job-1", "wait_for_completion": true},
+			wantMethod:    http.MethodPost,
+			wantPath:      "/_rollup/job/job-1/_stop",
+			strippedParam: []string{"id"},
+			wantQuery:     map[string]string{"wait_for_completion": "true"},
+		},
+		{
+			name:       "rollup.get_rollup_caps all",
+			action:     "rollup.get_rollup_caps",
+			params:     map[string]any{},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_rollup/data/_all",
+		},
+		{
+			name:          "rollup.get_rollup_caps with id",
+			action:        "rollup.get_rollup_caps",
+			params:        map[string]any{"id": "my-idx"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_rollup/data/my-idx",
+			strippedParam: []string{"id"},
+		},
+		{
+			name:          "rollup.get_rollup_index_caps",
+			action:        "rollup.get_rollup_index_caps",
+			params:        map[string]any{"index": "rollup-idx"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/rollup-idx/_rollup/data",
+			strippedParam: []string{"index"},
+		},
+		{
+			name:          "rollup.rollup_search GET",
+			action:        "rollup.rollup_search",
+			params:        map[string]any{"index": "rollup-idx"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/rollup-idx/_rollup_search",
+			strippedParam: []string{"index"},
+		},
+		{
+			name:          "rollup.rollup_search POST",
+			action:        "rollup.rollup_search",
+			params:        map[string]any{"index": "rollup-idx", "body": map[string]any{"size": 0}},
+			wantMethod:    http.MethodPost,
+			wantPath:      "/rollup-idx/_rollup_search",
+			strippedParam: []string{"index"},
+		},
+
+		// ccr.*
+		{
+			name:          "ccr.put_auto_follow_pattern",
+			action:        "ccr.put_auto_follow_pattern",
+			params:        map[string]any{"name": "pat-1"},
+			wantMethod:    http.MethodPut,
+			wantPath:      "/_ccr/auto_follow/pat-1",
+			strippedParam: []string{"name"},
+		},
+		{
+			name:       "ccr.get_auto_follow_pattern all",
+			action:     "ccr.get_auto_follow_pattern",
+			params:     map[string]any{},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_ccr/auto_follow",
+		},
+		{
+			name:          "ccr.get_auto_follow_pattern with name",
+			action:        "ccr.get_auto_follow_pattern",
+			params:        map[string]any{"name": "pat-1"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_ccr/auto_follow/pat-1",
+			strippedParam: []string{"name"},
+		},
+		{
+			name:          "ccr.delete_auto_follow_pattern",
+			action:        "ccr.delete_auto_follow_pattern",
+			params:        map[string]any{"name": "pat-1"},
+			wantMethod:    http.MethodDelete,
+			wantPath:      "/_ccr/auto_follow/pat-1",
+			strippedParam: []string{"name"},
+		},
+		{
+			name:          "ccr.pause_auto_follow_pattern",
+			action:        "ccr.pause_auto_follow_pattern",
+			params:        map[string]any{"name": "pat-1"},
+			wantMethod:    http.MethodPost,
+			wantPath:      "/_ccr/auto_follow/pat-1/_pause",
+			strippedParam: []string{"name"},
+		},
+		{
+			name:          "ccr.resume_auto_follow_pattern",
+			action:        "ccr.resume_auto_follow_pattern",
+			params:        map[string]any{"name": "pat-1"},
+			wantMethod:    http.MethodPost,
+			wantPath:      "/_ccr/auto_follow/pat-1/_resume",
+			strippedParam: []string{"name"},
+		},
+		{
+			name:          "ccr.follow",
+			action:        "ccr.follow",
+			params:        map[string]any{"index": "follower-idx", "wait_for_active_shards": "1"},
+			wantMethod:    http.MethodPut,
+			wantPath:      "/follower-idx/_ccr/follow",
+			strippedParam: []string{"index"},
+			wantQuery:     map[string]string{"wait_for_active_shards": "1"},
+		},
+		{
+			name:          "ccr.follow_info",
+			action:        "ccr.follow_info",
+			params:        map[string]any{"index": "follower-idx"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/follower-idx/_ccr/info",
+			strippedParam: []string{"index"},
+		},
+		{
+			name:          "ccr.follow_stats",
+			action:        "ccr.follow_stats",
+			params:        map[string]any{"index": "follower-idx"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/follower-idx/_ccr/stats",
+			strippedParam: []string{"index"},
+		},
+		{
+			name:          "ccr.pause_follow",
+			action:        "ccr.pause_follow",
+			params:        map[string]any{"index": "follower-idx"},
+			wantMethod:    http.MethodPost,
+			wantPath:      "/follower-idx/_ccr/pause_follow",
+			strippedParam: []string{"index"},
+		},
+		{
+			name:          "ccr.resume_follow",
+			action:        "ccr.resume_follow",
+			params:        map[string]any{"index": "follower-idx"},
+			wantMethod:    http.MethodPost,
+			wantPath:      "/follower-idx/_ccr/resume_follow",
+			strippedParam: []string{"index"},
+		},
+		{
+			name:          "ccr.unfollow",
+			action:        "ccr.unfollow",
+			params:        map[string]any{"index": "follower-idx"},
+			wantMethod:    http.MethodPost,
+			wantPath:      "/follower-idx/_ccr/unfollow",
+			strippedParam: []string{"index"},
+		},
+		{
+			name:          "ccr.forget_follower",
+			action:        "ccr.forget_follower",
+			params:        map[string]any{"index": "leader-idx"},
+			wantMethod:    http.MethodPost,
+			wantPath:      "/leader-idx/_ccr/forget_follower",
+			strippedParam: []string{"index"},
+		},
+		{
+			name:       "ccr.stats",
+			action:     "ccr.stats",
+			params:     map[string]any{},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_ccr/stats",
+		},
+
+		// searchable_snapshots.*
+		{
+			name:          "searchable_snapshots.mount",
+			action:        "searchable_snapshots.mount",
+			params:        map[string]any{"repository": "repo-1", "snapshot": "snap-1", "storage": "full_copy"},
+			wantMethod:    http.MethodPost,
+			wantPath:      "/_snapshot/repo-1/snap-1/_mount",
+			strippedParam: []string{"repository", "snapshot"},
+			wantQuery:     map[string]string{"storage": "full_copy"},
+		},
+		{
+			name:       "searchable_snapshots.stats all",
+			action:     "searchable_snapshots.stats",
+			params:     map[string]any{},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_searchable_snapshots/stats",
+		},
+		{
+			name:          "searchable_snapshots.stats with index",
+			action:        "searchable_snapshots.stats",
+			params:        map[string]any{"index": "mounted-idx"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/mounted-idx/_searchable_snapshots/stats",
+			strippedParam: []string{"index"},
+		},
+		{
+			name:       "searchable_snapshots.cache_stats",
+			action:     "searchable_snapshots.cache_stats",
+			params:     map[string]any{},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_searchable_snapshots/cache/stats",
+		},
+		{
+			name:       "searchable_snapshots.clear_cache",
+			action:     "searchable_snapshots.clear_cache",
+			params:     map[string]any{},
+			wantMethod: http.MethodPost,
+			wantPath:   "/_searchable_snapshots/cache/clear",
+		},
+
+		// security.*
+		{
+			name:       "security.authenticate",
+			action:     "security.authenticate",
+			params:     map[string]any{},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_security/_authenticate",
+		},
+		{
+			name:          "security.put_user",
+			action:        "security.put_user",
+			params:        map[string]any{"username": "alice"},
+			wantMethod:    http.MethodPut,
+			wantPath:      "/_security/user/alice",
+			strippedParam: []string{"username"},
+		},
+		{
+			name:       "security.get_user all",
+			action:     "security.get_user",
+			params:     map[string]any{},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_security/user",
+		},
+		{
+			name:          "security.get_user with username",
+			action:        "security.get_user",
+			params:        map[string]any{"username": "alice"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_security/user/alice",
+			strippedParam: []string{"username"},
+		},
+		{
+			name:          "security.delete_user",
+			action:        "security.delete_user",
+			params:        map[string]any{"username": "alice"},
+			wantMethod:    http.MethodDelete,
+			wantPath:      "/_security/user/alice",
+			strippedParam: []string{"username"},
+		},
+		{
+			name:          "security.enable_user",
+			action:        "security.enable_user",
+			params:        map[string]any{"username": "alice"},
+			wantMethod:    http.MethodPut,
+			wantPath:      "/_security/user/alice/_enable",
+			strippedParam: []string{"username"},
+		},
+		{
+			name:          "security.disable_user",
+			action:        "security.disable_user",
+			params:        map[string]any{"username": "alice"},
+			wantMethod:    http.MethodPut,
+			wantPath:      "/_security/user/alice/_disable",
+			strippedParam: []string{"username"},
+		},
+		{
+			name:       "security.change_password self",
+			action:     "security.change_password",
+			params:     map[string]any{},
+			wantMethod: http.MethodPost,
+			wantPath:   "/_security/user/_password",
+		},
+		{
+			name:          "security.change_password with username",
+			action:        "security.change_password",
+			params:        map[string]any{"username": "alice"},
+			wantMethod:    http.MethodPost,
+			wantPath:      "/_security/user/alice/_password",
+			strippedParam: []string{"username"},
+		},
+		{
+			name:       "security.has_privileges self",
+			action:     "security.has_privileges",
+			params:     map[string]any{},
+			wantMethod: http.MethodPost,
+			wantPath:   "/_security/user/_has_privileges",
+		},
+		{
+			name:          "security.has_privileges with username",
+			action:        "security.has_privileges",
+			params:        map[string]any{"username": "alice"},
+			wantMethod:    http.MethodPost,
+			wantPath:      "/_security/user/alice/_has_privileges",
+			strippedParam: []string{"username"},
+		},
+		{
+			name:          "security.put_role",
+			action:        "security.put_role",
+			params:        map[string]any{"name": "admin_role"},
+			wantMethod:    http.MethodPut,
+			wantPath:      "/_security/role/admin_role",
+			strippedParam: []string{"name"},
+		},
+		{
+			name:       "security.get_role all",
+			action:     "security.get_role",
+			params:     map[string]any{},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_security/role",
+		},
+		{
+			name:          "security.get_role with name",
+			action:        "security.get_role",
+			params:        map[string]any{"name": "admin_role"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_security/role/admin_role",
+			strippedParam: []string{"name"},
+		},
+		{
+			name:          "security.delete_role",
+			action:        "security.delete_role",
+			params:        map[string]any{"name": "admin_role"},
+			wantMethod:    http.MethodDelete,
+			wantPath:      "/_security/role/admin_role",
+			strippedParam: []string{"name"},
+		},
+		{
+			name:          "security.clear_cached_roles",
+			action:        "security.clear_cached_roles",
+			params:        map[string]any{"name": "admin_role"},
+			wantMethod:    http.MethodPost,
+			wantPath:      "/_security/role/admin_role/_clear_cache",
+			strippedParam: []string{"name"},
+		},
+		{
+			name:       "security.create_api_key",
+			action:     "security.create_api_key",
+			params:     map[string]any{},
+			wantMethod: http.MethodPost,
+			wantPath:   "/_security/api_key",
+		},
+		{
+			name:       "security.get_api_key",
+			action:     "security.get_api_key",
+			params:     map[string]any{"id": "k1"},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_security/api_key",
+			wantQuery:  map[string]string{"id": "k1"},
+		},
+		{
+			name:       "security.invalidate_api_key",
+			action:     "security.invalidate_api_key",
+			params:     map[string]any{},
+			wantMethod: http.MethodDelete,
+			wantPath:   "/_security/api_key",
+		},
+		{
+			name:       "security.grant_api_key",
+			action:     "security.grant_api_key",
+			params:     map[string]any{},
+			wantMethod: http.MethodPost,
+			wantPath:   "/_security/api_key/_grant",
+		},
+		{
+			name:       "security.query_api_keys",
+			action:     "security.query_api_keys",
+			params:     map[string]any{},
+			wantMethod: http.MethodPost,
+			wantPath:   "/_security/_query/api_key",
+		},
+		{
+			name:       "security.clear_api_key_cache",
+			action:     "security.clear_api_key_cache",
+			params:     map[string]any{},
+			wantMethod: http.MethodPost,
+			wantPath:   "/_security/_clear_api_key_cache",
+		},
+		{
+			name:       "security.get_builtin_privileges",
+			action:     "security.get_builtin_privileges",
+			params:     map[string]any{},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_security/privilege/_builtin",
+		},
+		{
+			name:       "security.put_privileges",
+			action:     "security.put_privileges",
+			params:     map[string]any{},
+			wantMethod: http.MethodPut,
+			wantPath:   "/_security/privilege",
+		},
+		{
+			name:       "security.get_privileges all",
+			action:     "security.get_privileges",
+			params:     map[string]any{},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_security/privilege",
+		},
+		{
+			name:          "security.get_privileges app only",
+			action:        "security.get_privileges",
+			params:        map[string]any{"application": "myapp"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_security/privilege/myapp",
+			strippedParam: []string{"application"},
+		},
+		{
+			name:          "security.get_privileges app and name",
+			action:        "security.get_privileges",
+			params:        map[string]any{"application": "myapp", "name": "read"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_security/privilege/myapp/read",
+			strippedParam: []string{"application", "name"},
+		},
+		{
+			name:          "security.delete_privileges",
+			action:        "security.delete_privileges",
+			params:        map[string]any{"application": "myapp", "name": "read"},
+			wantMethod:    http.MethodDelete,
+			wantPath:      "/_security/privilege/myapp/read",
+			strippedParam: []string{"application", "name"},
+		},
+		{
+			name:          "security.create_service_token with token_name",
+			action:        "security.create_service_token",
+			params:        map[string]any{"namespace": "elastic", "service": "fleet-server", "token_name": "tok1"},
+			wantMethod:    http.MethodPost,
+			wantPath:      "/_security/service/elastic/fleet-server/credential/token/tok1",
+			strippedParam: []string{"namespace", "service", "token_name"},
+		},
+		{
+			name:          "security.create_service_token without token_name",
+			action:        "security.create_service_token",
+			params:        map[string]any{"namespace": "elastic", "service": "fleet-server"},
+			wantMethod:    http.MethodPost,
+			wantPath:      "/_security/service/elastic/fleet-server/credential/token",
+			strippedParam: []string{"namespace", "service"},
+		},
+		{
+			name:          "security.delete_service_token",
+			action:        "security.delete_service_token",
+			params:        map[string]any{"namespace": "elastic", "service": "fleet-server", "token_name": "tok1"},
+			wantMethod:    http.MethodDelete,
+			wantPath:      "/_security/service/elastic/fleet-server/credential/token/tok1",
+			strippedParam: []string{"namespace", "service", "token_name"},
+		},
+		{
+			name:          "security.list_service_tokens",
+			action:        "security.list_service_tokens",
+			params:        map[string]any{"namespace": "elastic", "service": "fleet-server"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_security/service/elastic/fleet-server/credential/token",
+			strippedParam: []string{"namespace", "service"},
+		},
+		{
+			name:       "security.get_service_accounts all",
+			action:     "security.get_service_accounts",
+			params:     map[string]any{},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_security/service",
+		},
+		{
+			name:          "security.get_service_accounts namespace only",
+			action:        "security.get_service_accounts",
+			params:        map[string]any{"namespace": "elastic"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_security/service/elastic",
+			strippedParam: []string{"namespace"},
+		},
+		{
+			name:          "security.get_service_accounts namespace and service",
+			action:        "security.get_service_accounts",
+			params:        map[string]any{"namespace": "elastic", "service": "fleet-server"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_security/service/elastic/fleet-server",
+			strippedParam: []string{"namespace", "service"},
+		},
+		{
+			name:          "security.get_service_credentials",
+			action:        "security.get_service_credentials",
+			params:        map[string]any{"namespace": "elastic", "service": "fleet-server"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_security/service/elastic/fleet-server/credential",
+			strippedParam: []string{"namespace", "service"},
+		},
+		{
+			name:       "security.get_token",
+			action:     "security.get_token",
+			params:     map[string]any{},
+			wantMethod: http.MethodPost,
+			wantPath:   "/_security/oauth2/token",
+		},
+		{
+			name:       "security.invalidate_token",
+			action:     "security.invalidate_token",
+			params:     map[string]any{},
+			wantMethod: http.MethodDelete,
+			wantPath:   "/_security/oauth2/token",
+		},
+
+		// logstash.* and transform.update_transform
+		{
+			name:          "logstash.put_pipeline",
+			action:        "logstash.put_pipeline",
+			params:        map[string]any{"id": "pipe-1"},
+			wantMethod:    http.MethodPut,
+			wantPath:      "/_logstash/pipeline/pipe-1",
+			strippedParam: []string{"id"},
+		},
+		{
+			name:       "logstash.get_pipeline all",
+			action:     "logstash.get_pipeline",
+			params:     map[string]any{},
+			wantMethod: http.MethodGet,
+			wantPath:   "/_logstash/pipeline",
+		},
+		{
+			name:          "logstash.get_pipeline with id",
+			action:        "logstash.get_pipeline",
+			params:        map[string]any{"id": "pipe-1"},
+			wantMethod:    http.MethodGet,
+			wantPath:      "/_logstash/pipeline/pipe-1",
+			strippedParam: []string{"id"},
+		},
+		{
+			name:          "logstash.delete_pipeline",
+			action:        "logstash.delete_pipeline",
+			params:        map[string]any{"id": "pipe-1"},
+			wantMethod:    http.MethodDelete,
+			wantPath:      "/_logstash/pipeline/pipe-1",
+			strippedParam: []string{"id"},
+		},
+		{
+			name:          "transform.update_transform",
+			action:        "transform.update_transform",
+			params:        map[string]any{"transform_id": "tx-1", "defer_validation": true},
+			wantMethod:    http.MethodPost,
+			wantPath:      "/_transform/tx-1/_update",
+			strippedParam: []string{"transform_id"},
+			wantQuery:     map[string]string{"defer_validation": "true"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec, err := ctx.buildActionRequest(tc.action, tc.params)
+			if err != nil {
+				t.Fatalf("buildActionRequest(%q, %v) unexpected error: %v", tc.action, tc.params, err)
+			}
+			if spec.method != tc.wantMethod {
+				t.Errorf("method: got %q, want %q", spec.method, tc.wantMethod)
+			}
+			if spec.path != tc.wantPath {
+				t.Errorf("path: got %q, want %q", spec.path, tc.wantPath)
+			}
+			for _, stripped := range tc.strippedParam {
+				if spec.query.Has(stripped) {
+					t.Errorf("expected param %q to be stripped from query, got query=%v", stripped, spec.query)
+				}
+			}
+			for k, wantV := range tc.wantQuery {
+				if gotV := spec.query.Get(k); gotV != wantV {
+					t.Errorf("query[%q]: got %q, want %q", k, gotV, wantV)
+				}
+			}
+		})
+	}
+
+	missingParamActions := []string{
+		"synonyms.put_synonym",
+		"synonyms.get_synonym",
+		"synonyms.delete_synonym",
+		"synonyms.put_synonym_rule",
+		"synonyms.get_synonym_rule",
+		"synonyms.delete_synonym_rule",
+		"synonyms.reload_synonym",
+		"query_rules.put_ruleset",
+		"query_rules.get_ruleset",
+		"query_rules.delete_ruleset",
+		"query_rules.put_rule",
+		"query_rules.get_rule",
+		"query_rules.delete_rule",
+		"query_rules.test",
+		"shutdown.put_node",
+		"shutdown.delete_node",
+		"rollup.put_job",
+		"rollup.delete_job",
+		"rollup.start_job",
+		"rollup.stop_job",
+		"rollup.get_rollup_index_caps",
+		"rollup.rollup_search",
+		"ccr.put_auto_follow_pattern",
+		"ccr.delete_auto_follow_pattern",
+		"ccr.pause_auto_follow_pattern",
+		"ccr.resume_auto_follow_pattern",
+		"ccr.follow",
+		"ccr.follow_info",
+		"ccr.follow_stats",
+		"ccr.pause_follow",
+		"ccr.resume_follow",
+		"ccr.unfollow",
+		"ccr.forget_follower",
+		"searchable_snapshots.mount",
+		"security.put_user",
+		"security.delete_user",
+		"security.enable_user",
+		"security.disable_user",
+		"security.put_role",
+		"security.delete_role",
+		"security.clear_cached_roles",
+		"security.delete_privileges",
+		"security.create_service_token",
+		"security.delete_service_token",
+		"security.list_service_tokens",
+		"security.get_service_credentials",
+		"logstash.put_pipeline",
+		"logstash.delete_pipeline",
+		"transform.update_transform",
+	}
+	for _, act := range missingParamActions {
+		if _, err := ctx.buildActionRequest(act, map[string]any{}); err == nil {
+			t.Errorf("expected error for %s with empty params", act)
+		}
+	}
+}
+
+func TestRound53TrackResourcesAndCleanupF0(t *testing.T) {
+	var mu sync.Mutex
+	seenReqs := make(map[string]bool)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seenReqs[r.Method+" "+r.URL.Path] = true
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"acknowledged":true}`))
+	}))
+	defer ts.Close()
+
+	ctx := newRunnerContext(ts.Client(), ts.URL)
+
+	ctx.trackCreatedResources("synonyms.put_synonym", map[string]any{"id": "syn-set-1"}, nil)
+	ctx.trackCreatedResources("synonyms.put_synonym_rule", map[string]any{"set_id": "syn-set-2", "rule_id": "r1"}, nil)
+	ctx.trackCreatedResources("query_rules.put_ruleset", map[string]any{"ruleset_id": "qr-1"}, nil)
+	ctx.trackCreatedResources("query_rules.put_rule", map[string]any{"ruleset_id": "qr-2", "rule_id": "r1"}, nil)
+	ctx.trackCreatedResources("rollup.put_job", map[string]any{
+		"id":   "rollup-job-1",
+		"body": map[string]any{"rollup_index": "rollup-target-idx"},
+	}, nil)
+	ctx.trackCreatedResources("ccr.put_auto_follow_pattern", map[string]any{"name": "af-pat-1"}, nil)
+	ctx.trackCreatedResources("ccr.follow", map[string]any{"index": "ccr-follower-idx"}, nil)
+	ctx.trackCreatedResources("searchable_snapshots.mount", map[string]any{
+		"repository": "repo1",
+		"snapshot":   "snap1",
+		"body":       map[string]any{"renamed_index": "mounted-snap-idx"},
+	}, nil)
+	ctx.trackCreatedResources("logstash.put_pipeline", map[string]any{"id": "ls-pipe-1"}, nil)
+	ctx.trackCreatedResources("security.put_user", map[string]any{"username": "sec_user_1"}, nil)
+	ctx.trackCreatedResources("security.put_role", map[string]any{"name": "sec_role_1"}, nil)
+	ctx.trackCreatedResources("security.put_privileges", map[string]any{
+		"body": map[string]any{
+			"app_one": map[string]any{
+				"priv_read": map[string]any{"actions": []any{"data:read/*"}},
+			},
+		},
+	}, nil)
+	ctx.trackCreatedResources("security.create_service_token", map[string]any{
+		"namespace":  "elastic",
+		"service":    "fleet-server",
+		"token_name": "tok_explicit",
+	}, nil)
+	ctx.trackCreatedResources("security.create_service_token", map[string]any{
+		"namespace": "elastic",
+		"service":   "kibana",
+	}, map[string]any{
+		"token": map[string]any{"name": "tok_from_resp"},
+	})
+	ctx.trackCreatedResources("shutdown.put_node", map[string]any{"node_id": "shut-node-1"}, nil)
+	ctx.trackCreatedResources("cluster.post_voting_config_exclusions", map[string]any{"node_names": "shut-node-1"}, nil)
+
+	ctx.cleanupAll()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	expectedReqs := []string{
+		"DELETE /_synonyms/syn-set-1",
+		"DELETE /_synonyms/syn-set-2",
+		"DELETE /_query_rules/qr-1",
+		"DELETE /_query_rules/qr-2",
+		"POST /_rollup/job/rollup-job-1/_stop",
+		"DELETE /_rollup/job/rollup-job-1",
+		"DELETE /rollup-target-idx",
+		"DELETE /_ccr/auto_follow/af-pat-1",
+		"DELETE /ccr-follower-idx",
+		"DELETE /mounted-snap-idx",
+		"DELETE /_logstash/pipeline/ls-pipe-1",
+		"DELETE /_security/user/sec_user_1",
+		"DELETE /_security/role/sec_role_1",
+		"DELETE /_security/privilege/app_one/priv_read",
+		"DELETE /_security/service/elastic/fleet-server/credential/token/tok_explicit",
+		"DELETE /_security/service/elastic/kibana/credential/token/tok_from_resp",
+		"DELETE /_nodes/shut-node-1/shutdown",
+		"DELETE /_cluster/voting_config_exclusions",
+	}
+	for _, exp := range expectedReqs {
+		if !seenReqs[exp] {
+			t.Errorf("expected cleanupAll to send %q, got seenReqs=%v", exp, seenReqs)
+		}
+	}
+}
+
+func TestRound53StashInPathAndExecLengthF1(t *testing.T) {
+	ctx := newRunnerContext(http.DefaultClient, "http://localhost:9200")
+	ctx.lastMethod = http.MethodGet
+	ctx.lastStatus = http.StatusOK
+	ctx.lastResponse = map[string]any{
+		"indices": map[string]any{
+			".ds-logs-2026.01.01-000001": map[string]any{
+				"state":     "open",
+				"active":    true,
+				"corrupted": false,
+				"doc_count": int64(42),
+				"tags":      []any{"hot", "logs"},
+				"settings": map[string]any{
+					"index.number_of_shards": "1",
+				},
+			},
+		},
+		".ds-logs-2026.01.01-000001": map[string]any{
+			"top_level": "found_literal",
+		},
+		"nested": map[string]any{
+			"arr": []any{
+				map[string]any{"val": "found_subpath"},
+			},
+		},
+		"unicode_jp":    "日本語テスト",
+		"unicode_emoji": "🚀🔥✨",
+	}
+	ctx.stash["idx"] = ".ds-logs-2026.01.01-000001"
+	ctx.stash["setting_key"] = "index.number_of_shards"
+	ctx.stash["subpath"] = "nested.arr.0.val"
+	ctx.stash["expected_tag_len"] = int64(2)
+	ctx.stash["expected_jp_len"] = "6"
+	ctx.stash["expected_emoji_len"] = 3
+
+	// 1. execSet with dotted stashed variables in path
+	if err := ctx.execSet(map[string]any{
+		"indices.$idx.state":                 "stashed_state",
+		"indices.$idx.settings.$setting_key": "stashed_shards",
+	}); err != nil {
+		t.Fatalf("execSet with dotted stash in path failed: %v", err)
+	}
+	if ctx.stash["stashed_state"] != "open" || ctx.stash["stashed_shards"] != "1" {
+		t.Fatalf("unexpected stash after execSet: %#v", ctx.stash)
+	}
+
+	// 2. execTransformAndSet with dotted stashed variable in source path
+	if err := ctx.execTransformAndSet(map[string]any{
+		"upper_state": "upper(indices.$idx.state)",
+	}); err != nil {
+		t.Fatalf("execTransformAndSet with dotted stash in path failed: %v", err)
+	}
+	if ctx.stash["upper_state"] != "OPEN" {
+		t.Fatalf("expected upper_state=OPEN, got %v", ctx.stash["upper_state"])
+	}
+
+	// 3. execMatch with multi-segment dotted stash, top-level literal dotted key, and top-level dotted subpath fallback
+	if err := ctx.execMatch(map[string]any{
+		"indices.$idx.state":                 "open",
+		"indices.$idx.settings.$setting_key": "1",
+		"$idx.top_level":                     "found_literal",
+		"$subpath":                           "found_subpath",
+	}); err != nil {
+		t.Fatalf("execMatch with dotted stash in path failed: %v", err)
+	}
+
+	// 4. execContains, execIsTrue, execIsFalse, execCompare with dotted stash in path
+	if err := ctx.execContains(map[string]any{
+		"indices.$idx.tags": "logs",
+	}); err != nil {
+		t.Fatalf("execContains with dotted stash in path failed: %v", err)
+	}
+	if err := ctx.execIsTrue("indices.$idx.active"); err != nil {
+		t.Fatalf("execIsTrue with dotted stash in path failed: %v", err)
+	}
+	if err := ctx.execIsFalse("indices.$idx.corrupted"); err != nil {
+		t.Fatalf("execIsFalse with dotted stash in path failed: %v", err)
+	}
+	if err := ctx.execCompare("gt", map[string]any{"indices.$idx.doc_count": 40}); err != nil {
+		t.Fatalf("execCompare with dotted stash in path failed: %v", err)
+	}
+
+	// 5. execLength with dotted stash in path, stashed expected length, and Unicode rune counting
+	if err := ctx.execLength(map[string]any{
+		"indices.$idx.tags": "$expected_tag_len",
+		"unicode_jp":        "$expected_jp_len",
+		"unicode_emoji":     "$expected_emoji_len",
+	}); err != nil {
+		t.Fatalf("execLength with stashed length and Unicode strings failed: %v", err)
+	}
+}
