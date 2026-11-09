@@ -5262,6 +5262,7 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[grant_type] is required")
 					return
 				}
+				// #nosec G101 -- synthetic OAuth2 token response for Elasticsearch REST API compatibility
 				writeJSON(w, http.StatusOK, map[string]any{
 					"access_token":  "doris-oauth2-access-token",
 					"type":          "Bearer",

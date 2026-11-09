@@ -23630,9 +23630,9 @@ func evalCharacterStaticPainless(fnName string, args []string, sourceMap, params
 			return "\x00", nil
 		}
 		if d < 10 {
-			return string(rune('0' + d)), nil
+			return string(rune('0' + d)), nil // #nosec G115 -- d bounded to [0, 9]
 		}
-		return string(rune('a' + d - 10)), nil
+		return string(rune('a' + d - 10)), nil // #nosec G115 -- d bounded to [10, 35]
 	case "reverseBytes":
 		cp, ok := toCodePoint(a0)
 		if !ok {
