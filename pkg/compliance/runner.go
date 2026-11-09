@@ -43,6 +43,7 @@ var supportedRunnerFeatures = map[string]bool{
 	"default_shards":         true,
 	"painless":               true,
 	"mustache":               true,
+	"clean_text":             true,
 }
 
 type errSkipSection struct {
@@ -667,22 +668,43 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 		if idx != "" {
 			c.createdIndices[idx] = true
 		}
-		if bodySlice, ok := params["body"].([]any); ok {
-			for _, item := range bodySlice {
-				if m, ok := item.(map[string]any); ok {
-					for _, opName := range []string{"index", "create", "update", "delete"} {
-						if meta, ok := m[opName].(map[string]any); ok {
-							if bIdx := paramString(meta, "_index"); bIdx != "" {
-								c.createdIndices[bIdx] = true
-							}
-						}
+		trackBulkMetaMap := func(m map[string]any) {
+			for _, opName := range []string{"index", "create", "update", "delete"} {
+				if meta, ok := ToNative(m[opName]).(map[string]any); ok {
+					if bIdx := paramString(meta, "_index"); bIdx != "" {
+						c.createdIndices[bIdx] = true
 					}
 				}
 			}
 		}
+		trackBulkNDJSONString := func(s string) {
+			for _, line := range strings.Split(s, "\n") {
+				line = strings.TrimSpace(line)
+				if !strings.HasPrefix(line, "{") {
+					continue
+				}
+				var m map[string]any
+				if err := json.Unmarshal([]byte(line), &m); err == nil {
+					trackBulkMetaMap(m)
+				}
+			}
+		}
+		switch bodyVal := ToNative(params["body"]).(type) {
+		case []any:
+			for _, item := range bodyVal {
+				switch elem := ToNative(item).(type) {
+				case map[string]any:
+					trackBulkMetaMap(elem)
+				case string:
+					trackBulkNDJSONString(elem)
+				}
+			}
+		case string:
+			trackBulkNDJSONString(bodyVal)
+		}
 	case "reindex":
-		if bodyMap, ok := params["body"].(map[string]any); ok {
-			if dest, ok := bodyMap["dest"].(map[string]any); ok {
+		if bodyMap, ok := ToNative(params["body"]).(map[string]any); ok {
+			if dest, ok := ToNative(bodyMap["dest"]).(map[string]any); ok {
 				if dIdx := paramString(dest, "index"); dIdx != "" {
 					c.createdIndices[dIdx] = true
 				}
@@ -704,12 +726,15 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 		if idx != "" {
 			c.createdIndices[idx] = true
 		}
-	case "indices.create_data_stream":
+	case "indices.create_data_stream", "indices.migrate_to_data_stream":
 		if name := paramString(params, "name"); name != "" {
 			c.createdDataStreams[name] = true
 		}
 	case "indices.put_alias":
 		name := paramString(params, "name")
+		if name == "" {
+			name = paramString(params, "alias")
+		}
 		if idx != "" && name != "" {
 			c.createdIndices[idx] = true
 			c.createdAliases[name] = idx
@@ -729,10 +754,14 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 	case "ingest.put_pipeline":
 		if id := paramString(params, "id"); id != "" {
 			c.createdPipelines[id] = true
+		} else if name := paramString(params, "name"); name != "" {
+			c.createdPipelines[name] = true
 		}
 	case "ilm.put_lifecycle":
 		if pol := paramString(params, "policy"); pol != "" {
 			c.createdILMPolicies[pol] = true
+		} else if polID := paramString(params, "policy_id"); polID != "" {
+			c.createdILMPolicies[polID] = true
 		} else if name := paramString(params, "name"); name != "" {
 			c.createdILMPolicies[name] = true
 		}
@@ -948,7 +977,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "indices.put_alias":
 		method = http.MethodPut
 		idx := popString("index")
-		name := popString("name")
+		name := popString("name", "alias")
 		if idx == "" || name == "" {
 			return nil, fmt.Errorf("indices.put_alias requires index and name parameters")
 		}
@@ -957,7 +986,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "indices.get_alias":
 		method = http.MethodGet
 		idx := popString("index")
-		name := popString("name")
+		name := popString("name", "alias")
 		switch {
 		case idx != "" && name != "":
 			reqPath = "/" + idx + "/_alias/" + name
@@ -972,7 +1001,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "indices.delete_alias":
 		method = http.MethodDelete
 		idx := popString("index")
-		name := popString("name")
+		name := popString("name", "alias")
 		if idx == "" || name == "" {
 			return nil, fmt.Errorf("indices.delete_alias requires index and name parameters")
 		}
@@ -981,7 +1010,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "indices.exists_alias":
 		method = http.MethodHead
 		idx := popString("index")
-		name := popString("name")
+		name := popString("name", "alias")
 		switch {
 		case idx != "" && name != "":
 			reqPath = "/" + idx + "/_alias/" + name
@@ -1400,7 +1429,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "cat.aliases":
 		method = http.MethodGet
-		if name := popString("name"); name != "" {
+		if name := popString("name", "alias"); name != "" {
 			reqPath = "/_cat/aliases/" + name
 		} else {
 			reqPath = "/_cat/aliases"
@@ -1466,13 +1495,21 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		}
 		reqPath = "/_data_stream/" + name
 
-	case "indices.data_stream_stats":
+	case "indices.data_stream_stats", "indices.data_streams_stats":
 		method = http.MethodGet
 		if name := popString("name"); name != "" {
 			reqPath = "/_data_stream/" + name + "/_stats"
 		} else {
 			reqPath = "/_data_stream/_stats"
 		}
+
+	case "indices.migrate_to_data_stream":
+		method = http.MethodPost
+		name := popString("name")
+		if name == "" {
+			return nil, fmt.Errorf("indices.migrate_to_data_stream requires name parameter")
+		}
+		reqPath = "/_data_stream/_migrate/" + name
 
 	case "indices.put_template":
 		method = http.MethodPut
@@ -1543,7 +1580,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "ilm.put_lifecycle":
 		method = http.MethodPut
-		pol := popString("policy", "name")
+		pol := popString("policy", "policy_id", "name")
 		if pol == "" {
 			return nil, fmt.Errorf("ilm.put_lifecycle requires policy parameter")
 		}
@@ -1551,7 +1588,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "ilm.get_lifecycle":
 		method = http.MethodGet
-		if pol := popString("policy", "name"); pol != "" {
+		if pol := popString("policy", "policy_id", "name"); pol != "" {
 			reqPath = "/_ilm/policy/" + pol
 		} else {
 			reqPath = "/_ilm/policy"
@@ -1559,7 +1596,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "ilm.delete_lifecycle":
 		method = http.MethodDelete
-		pol := popString("policy", "name")
+		pol := popString("policy", "policy_id", "name")
 		if pol == "" {
 			return nil, fmt.Errorf("ilm.delete_lifecycle requires policy parameter")
 		}
@@ -1600,6 +1637,14 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			return nil, fmt.Errorf("ilm.remove_policy requires index parameter")
 		}
 		reqPath = "/" + idx + "/_ilm/remove"
+
+	case "ilm.retry":
+		method = http.MethodPost
+		idx := popString("index")
+		if idx == "" {
+			return nil, fmt.Errorf("ilm.retry requires index parameter")
+		}
+		reqPath = "/" + idx + "/_ilm/retry"
 
 	case "enrich.put_policy":
 		method = http.MethodPut
@@ -2597,9 +2642,25 @@ func matchValues(fieldPath string, actual, expected any) error {
 	if valuesEqual(actual, expected) {
 		return nil
 	}
+	if actStr, aOk := actual.(string); aOk {
+		if expStr, eOk := expected.(string); eOk {
+			if cleanTextString(actStr) == cleanTextString(expStr) {
+				return nil
+			}
+		}
+	}
 	actJSON, _ := json.Marshal(actual)
 	expJSON, _ := json.Marshal(expected)
 	return fmt.Errorf("match %q failed: got %s, expected %s", fieldPath, string(actJSON), string(expJSON))
+}
+
+func cleanTextString(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	lines := strings.Split(strings.Trim(s, "\n"), "\n")
+	for i, line := range lines {
+		lines[i] = strings.TrimSpace(line)
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
 func valuesEqual(a, b any) bool {

@@ -1798,3 +1798,202 @@ func TestRound50ASTBoostingSpanPITSortAndSliceValidation(t *testing.T) {
 	_ = (BoostingQuery{NegativeBoost: 0.3}).EffectiveNegativeBoost()
 	_ = (BoostingQuery{}).EffectiveNegativeBoost()
 }
+
+func TestRound51ASTValidationF10ToF19(t *testing.T) {
+	// F10: rank_feature mutual exclusivity & parameter validation
+	for _, validRF := range []string{
+		`{"rank_feature":{"field":"pagerank"}}`,
+		`{"rank_feature":{"field":"pagerank","saturation":{}}}`,
+		`{"rank_feature":{"field":"pagerank","saturation":{"pivot":8}}}`,
+		`{"rank_feature":{"field":"pagerank","log":{"scaling_factor":4}}}`,
+		`{"rank_feature":{"field":"pagerank","sigmoid":{"pivot":7,"exponent":0.6}}}`,
+		`{"rank_feature":{"field":"pagerank","linear":{}}}`,
+	} {
+		var q Query
+		if err := json.Unmarshal([]byte(validRF), &q); err != nil {
+			t.Fatalf("F10 valid rank_feature %s failed: %v", validRF, err)
+		}
+	}
+	for _, badRF := range []string{
+		`{"rank_feature":{"field":"pagerank","saturation":{},"log":{"scaling_factor":2}}}`,
+		`{"rank_feature":{"field":"pagerank","saturation":{"pivot":0}}}`,
+		`{"rank_feature":{"field":"pagerank","saturation":{"pivot":-1}}}`,
+		`{"rank_feature":{"field":"pagerank","saturation":{"unknown":1}}}`,
+		`{"rank_feature":{"field":"pagerank","log":{}}}`,
+		`{"rank_feature":{"field":"pagerank","log":{"scaling_factor":0}}}`,
+		`{"rank_feature":{"field":"pagerank","log":{"scaling_factor":2,"extra":1}}}`,
+		`{"rank_feature":{"field":"pagerank","sigmoid":{"pivot":7}}}`,
+		`{"rank_feature":{"field":"pagerank","sigmoid":{"pivot":0,"exponent":0.6}}}`,
+		`{"rank_feature":{"field":"pagerank","sigmoid":{"pivot":7,"exponent":0}}}`,
+		`{"rank_feature":{"field":"pagerank","linear":{"pivot":1}}}`,
+	} {
+		var q Query
+		if err := json.Unmarshal([]byte(badRF), &q); err == nil {
+			t.Fatalf("F10 expected error for invalid rank_feature %s", badRF)
+		}
+	}
+
+	// F11: distance_feature positive pivot and valid origin
+	for _, validDF := range []string{
+		`{"distance_feature":{"field":"ts","origin":"now","pivot":"7d"}}`,
+		`{"distance_feature":{"field":"loc","origin":[-71.3,41.15],"pivot":"1000m"}}`,
+		`{"distance_feature":{"field":"loc","origin":{"lat":41.15,"lon":-71.3},"pivot":500}}`,
+	} {
+		var q Query
+		if err := json.Unmarshal([]byte(validDF), &q); err != nil {
+			t.Fatalf("F11 valid distance_feature %s failed: %v", validDF, err)
+		}
+	}
+	for _, badDF := range []string{
+		`{"distance_feature":{"field":"ts","origin":"now","pivot":0}}`,
+		`{"distance_feature":{"field":"ts","origin":"now","pivot":-5}}`,
+		`{"distance_feature":{"field":"ts","origin":"now","pivot":"0d"}}`,
+		`{"distance_feature":{"field":"ts","origin":"now","pivot":"-7d"}}`,
+		`{"distance_feature":{"field":"ts","origin":"","pivot":"7d"}}`,
+		`{"distance_feature":{"field":"ts","origin":true,"pivot":"7d"}}`,
+		`{"distance_feature":{"field":"ts","origin":[],"pivot":"7d"}}`,
+		`{"distance_feature":{"field":"ts","origin":{},"pivot":"7d"}}`,
+	} {
+		var q Query
+		if err := json.Unmarshal([]byte(badDF), &q); err == nil {
+			t.Fatalf("F11 expected error for invalid distance_feature %s", badDF)
+		}
+	}
+
+	// F12: function_score sub-specs (field_value_factor, random_score, script_score, decay)
+	for _, validFS := range []string{
+		`{"function_score":{"field_value_factor":{"field":"likes","factor":1.2,"modifier":"log1p","missing":1}}}`,
+		`{"function_score":{"random_score":{"seed":42,"field":"_seq_no"}}}`,
+		`{"function_score":{"script_score":{"script":{"source":"doc['likes'].value"}}}}`,
+		`{"function_score":{"gauss":{"price":{"origin":100,"scale":20,"offset":5,"decay":0.5},"multi_value_mode":"min"}}}`,
+	} {
+		var q Query
+		if err := json.Unmarshal([]byte(validFS), &q); err != nil {
+			t.Fatalf("F12 valid function_score %s failed: %v", validFS, err)
+		}
+	}
+	for _, badFS := range []string{
+		`{"function_score":{"field_value_factor":{}}}`,
+		`{"function_score":{"field_value_factor":{"field":"likes","factor":-1}}}`,
+		`{"function_score":{"field_value_factor":{"field":"likes","modifier":"bogus"}}}`,
+		`{"function_score":{"field_value_factor":{"field":"likes","unknown":1}}}`,
+		`{"function_score":{"random_score":{"seed":true}}}`,
+		`{"function_score":{"random_score":{"seed":""}}}`,
+		`{"function_score":{"random_score":{"unknown":1}}}`,
+		`{"function_score":{"script_score":{}}}`,
+		`{"function_score":{"script_score":{"script":{}}}}`,
+		`{"function_score":{"script_score":{"script":""}}}`,
+		`{"function_score":{"script_score":{"unknown":1}}}`,
+		`{"function_score":{"gauss":{"price":{"origin":100,"scale":0}}}}`,
+		`{"function_score":{"gauss":{"price":{"origin":100,"scale":10,"offset":-1}}}}`,
+		`{"function_score":{"gauss":{"price":{"origin":100,"scale":10,"decay":0}}}}`,
+		`{"function_score":{"gauss":{"price":{"origin":100,"scale":10,"decay":1}}}}`,
+		`{"function_score":{"gauss":{"price":{"origin":"","scale":10}}}}`,
+	} {
+		var q Query
+		if err := json.Unmarshal([]byte(badFS), &q); err == nil {
+			t.Fatalf("F12 expected error for invalid function_score %s", badFS)
+		}
+	}
+
+	// F13: intervals sub-rules validation
+	for _, validIv := range []string{
+		`{"intervals":{"title":{"match":{"query":"quick fox","max_gaps":2,"ordered":true,"use_field":"body"}}}}`,
+		`{"intervals":{"title":{"prefix":{"prefix":"qu","use_field":"body"}}}}`,
+		`{"intervals":{"title":{"wildcard":{"pattern":"qu*","use_field":"body"}}}}`,
+		`{"intervals":{"title":{"fuzzy":{"term":"quik","prefix_length":1,"use_field":"body"}}}}`,
+		`{"intervals":{"title":{"all_of":{"intervals":[{"match":{"query":"quick"}},{"prefix":{"prefix":"fo"}}],"ordered":true}}}}`,
+		`{"intervals":{"title":{"any_of":{"intervals":[{"match":{"query":"quick"}},{"wildcard":{"pattern":"fo*"}}]}}}}`,
+	} {
+		var q Query
+		if err := json.Unmarshal([]byte(validIv), &q); err != nil {
+			t.Fatalf("F13 valid intervals %s failed: %v", validIv, err)
+		}
+	}
+	for _, badIv := range []string{
+		`{"intervals":{"title":{"match":{}}}}`,
+		`{"intervals":{"title":{"match":{"query":"fox","unknown":1}}}}`,
+		`{"intervals":{"title":{"prefix":{}}}}`,
+		`{"intervals":{"title":{"prefix":{"prefix":"fo","unknown":1}}}}`,
+		`{"intervals":{"title":{"wildcard":{}}}}`,
+		`{"intervals":{"title":{"wildcard":{"pattern":"fo*","unknown":1}}}}`,
+		`{"intervals":{"title":{"fuzzy":{}}}}`,
+		`{"intervals":{"title":{"fuzzy":{"term":"fox","prefix_length":-1}}}}`,
+		`{"intervals":{"title":{"all_of":{"intervals":[]}}}}`,
+		`{"intervals":{"title":{"any_of":{"intervals":[]}}}}`,
+		`{"intervals":{"title":{"match":{"query":"fox","filter":{}}}}}`,
+		`{"intervals":{"title":{"match":{"query":"fox","filter":{"unknown":1}}}}}`,
+	} {
+		var q Query
+		if err := json.Unmarshal([]byte(badIv), &q); err == nil {
+			t.Fatalf("F13 expected error for invalid intervals %s", badIv)
+		}
+	}
+
+	// F14: has_child, parent_id, percolate validation
+	for _, badJoin := range []string{
+		`{"has_child":{"type":"child","query":{"match_all":{}},"score_mode":"bogus"}}`,
+		`{"has_child":{"type":"child","query":{"match_all":{}},"min_children":-1}}`,
+		`{"has_child":{"type":"child","query":{"match_all":{}},"min_children":5,"max_children":2}}`,
+		`{"parent_id":{"type":"child","id":""}}`,
+		`{"parent_id":{"type":"child","id":true}}`,
+		`{"parent_id":{"type":"child","id":[1,2]}}`,
+		`{"percolate":{"field":"query","document":{"a":1},"documents":[{"a":1}]}}`,
+		`{"percolate":{"field":"query","document":{"a":1},"id":"1","index":"idx"}}`,
+		`{"percolate":{"field":"query","documents":[]}}`,
+		`{"percolate":{"field":"query","id":"1"}}`,
+	} {
+		var q Query
+		if err := json.Unmarshal([]byte(badJoin), &q); err == nil {
+			t.Fatalf("F14 expected error for invalid join/percolate %s", badJoin)
+		}
+	}
+
+	// F17, F18, F19: Histogram, Composite, Terms, Collapse, InnerHits, Highlight validation
+	for _, badReq := range []string{
+		`{"aggs":{"h":{"histogram":{"field":"price"}}}}`,
+		`{"aggs":{"h":{"histogram":{"field":"price","interval":0}}}}`,
+		`{"aggs":{"h":{"histogram":{"field":"price","interval":-5}}}}`,
+		`{"aggs":{"h":{"histogram":{"field":"price","interval":10,"min_doc_count":-1}}}}`,
+		`{"aggs":{"h":{"histogram":{"field":"price","interval":10,"hard_bounds":{"min":20,"max":10}}}}}`,
+		`{"aggs":{"h":{"histogram":{"field":"price","interval":10,"extended_bounds":{"min":10}}}}}`,
+		`{"aggs":{"h":{"histogram":{"field":"price","interval":10,"unknown":1}}}}`,
+		`{"aggs":{"c":{"composite":{"size":0,"sources":[{"t":{"terms":{"field":"k"}}}]}}}}`,
+		`{"aggs":{"c":{"composite":{"sources":[]}}}}`,
+		`{"aggs":{"c":{"composite":{"sources":[{"t":{"terms":{"field":"k","order":"bogus"}}}]}}}}`,
+		`{"aggs":{"c":{"composite":{"sources":[{"t":{"terms":{"field":"k","missing_order":"bogus"}}}]}}}}`,
+		`{"aggs":{"c":{"composite":{"sources":[{"t":{"unknown_src":{"field":"k"}}}]}}}}`,
+		`{"aggs":{"c":{"composite":{"sources":[{"t":{"terms":{"field":"k","unknown":1}}}]}}}}`,
+		`{"aggs":{"t":{"terms":{}}}}`,
+		`{"aggs":{"t":{"terms":{"field":"k","size":0}}}}`,
+		`{"aggs":{"t":{"terms":{"field":"k","shard_size":0}}}}`,
+		`{"aggs":{"t":{"terms":{"field":"k","min_doc_count":-1}}}}`,
+		`{"aggs":{"t":{"terms":{"field":"k","collect_mode":"bogus"}}}}`,
+		`{"aggs":{"t":{"terms":{"field":"k","execution_hint":"bogus"}}}}`,
+		`{"aggs":{"t":{"terms":{"field":"k","include":{"partition":2,"num_partitions":2}}}}}`,
+		`{"aggs":{"t":{"terms":{"field":"k","include":{"partition":0}}}}}`,
+		`{"aggs":{"t":{"terms":{"field":"k","unknown":1}}}}`,
+		`{"collapse":{}}`,
+		`{"collapse":{"field":"k","max_concurrent_group_searches":0}}`,
+		`{"collapse":{"field":"k","unknown":1}}`,
+		`{"collapse":{"field":"k","inner_hits":{"size":-1}}}`,
+		`{"collapse":{"field":"k","inner_hits":{"from":-1}}}`,
+		`{"collapse":{"field":"k","inner_hits":{"unknown":1}}}`,
+		`{"highlight":{"fields":{"title":{}},"type":"bogus"}}`,
+		`{"highlight":{"fields":{"title":{}},"order":"bogus"}}`,
+		`{"highlight":{"fields":{"title":{}},"encoder":"bogus"}}`,
+		`{"highlight":{"fields":{"title":{}},"boundary_scanner":"bogus"}}`,
+		`{"highlight":{"fields":{"title":{}},"fragmenter":"bogus"}}`,
+		`{"highlight":{"fields":{"title":{}},"tags_schema":"bogus"}}`,
+		`{"highlight":{"fields":{"title":{}},"fragment_size":-1}}`,
+		`{"highlight":{"fields":{"title":{}},"number_of_fragments":-1}}`,
+		`{"highlight":{"fields":{"title":{}},"pre_tags":["<em>"]}}`,
+		`{"highlight":{"fields":{"title":{"unknown":1}}}}`,
+		`{"highlight":{"fields":{"title":{}},"unknown":1}}`,
+	} {
+		var sr SearchRequest
+		if err := json.Unmarshal([]byte(badReq), &sr); err == nil {
+			t.Fatalf("F17-F19 expected error for invalid SearchRequest %s", badReq)
+		}
+	}
+}

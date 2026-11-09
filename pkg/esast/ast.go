@@ -735,6 +735,39 @@ type InnerHitsSpec struct {
 	Collapse       *CollapseSpec      `json:"collapse,omitempty"`
 }
 
+func (ih *InnerHitsSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "name", "from", "size", "sort", "track_scores", "_source", "stored_fields",
+			"fields", "docvalue_fields", "script_fields", "highlight", "collapse",
+			"version", "seq_no_primary_term", "explain", "ignore_unmapped":
+		default:
+			return fmt.Errorf("parsing_exception: [inner_hits] unknown field [%s]", k)
+		}
+	}
+	type plain InnerHitsSpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if p.From < 0 {
+		return fmt.Errorf("parsing_exception: [inner_hits] [from] must be >= 0")
+	}
+	if p.Size != nil && *p.Size < 0 {
+		return fmt.Errorf("parsing_exception: [inner_hits] [size] must be >= 0")
+	}
+	*ih = InnerHitsSpec(p)
+	return nil
+}
+
 func (ih *InnerHitsSpec) HasStoredFieldsNone() bool {
 	if ih == nil {
 		return false
@@ -947,17 +980,113 @@ func (rs *RescoreSlice) UnmarshalJSON(data []byte) error {
 
 // HighlightFieldSpec models per-field highlight configuration inside `highlight.fields.<field>`.
 type HighlightFieldSpec struct {
-	PreTags           []string `json:"pre_tags,omitempty"`
-	PostTags          []string `json:"post_tags,omitempty"`
-	TagSchema         string   `json:"tag_schema,omitempty"`
-	Encoder           string   `json:"encoder,omitempty"`
-	HighlightQuery    *Query   `json:"highlight_query,omitempty"`
-	RequireFieldMatch *bool    `json:"require_field_match,omitempty"`
-	MatchedFields     []string `json:"matched_fields,omitempty"`
-	FragmentSize      *int     `json:"fragment_size,omitempty"`
-	NumberOfFragments *int     `json:"number_of_fragments,omitempty"`
-	NoMatchSize       *int     `json:"no_match_size,omitempty"`
-	Type              string   `json:"type,omitempty"`
+	PreTags               []string       `json:"pre_tags,omitempty"`
+	PostTags              []string       `json:"post_tags,omitempty"`
+	TagSchema             string         `json:"tag_schema,omitempty"`
+	TagsSchema            string         `json:"tags_schema,omitempty"`
+	Encoder               string         `json:"encoder,omitempty"`
+	HighlightQuery        *Query         `json:"highlight_query,omitempty"`
+	RequireFieldMatch     *bool          `json:"require_field_match,omitempty"`
+	MatchedFields         []string       `json:"matched_fields,omitempty"`
+	FragmentSize          *int           `json:"fragment_size,omitempty"`
+	NumberOfFragments     *int           `json:"number_of_fragments,omitempty"`
+	NoMatchSize           *int           `json:"no_match_size,omitempty"`
+	Type                  string         `json:"type,omitempty"`
+	Order                 string         `json:"order,omitempty"`
+	BoundaryScanner       string         `json:"boundary_scanner,omitempty"`
+	BoundaryScannerLocale string         `json:"boundary_scanner_locale,omitempty"`
+	BoundaryChars         string         `json:"boundary_chars,omitempty"`
+	BoundaryMaxScan       *int           `json:"boundary_max_scan,omitempty"`
+	FragmentOffset        *int           `json:"fragment_offset,omitempty"`
+	Fragmenter            string         `json:"fragmenter,omitempty"`
+	MaxAnalyzedOffset     *int           `json:"max_analyzed_offset,omitempty"`
+	PhraseLimit           *int           `json:"phrase_limit,omitempty"`
+	ForceSource           *bool          `json:"force_source,omitempty"`
+	MaxFragmentLength     *int           `json:"max_fragment_length,omitempty"`
+	Options               map[string]any `json:"options,omitempty"`
+}
+
+// HighlightField is an alias for HighlightFieldSpec.
+type HighlightField = HighlightFieldSpec
+
+func validateHighlightCommonFields(
+	rawMap map[string]json.RawMessage,
+	allowFields bool,
+	hType, order, encoder, boundaryScanner, fragmenter, tagSchema, tagsSchema string,
+	fragSize, numFrags, noMatchSize, boundaryMaxScan, fragOffset, maxAnalyzedOffset, phraseLimit *int,
+	preTags, postTags []string,
+) error {
+	for k := range rawMap {
+		if k == "fields" && allowFields {
+			continue
+		}
+		switch k {
+		case "pre_tags", "post_tags", "tag_schema", "tags_schema", "encoder", "highlight_query",
+			"require_field_match", "matched_fields", "fragment_size", "number_of_fragments",
+			"no_match_size", "type", "order", "boundary_scanner", "boundary_scanner_locale",
+			"boundary_chars", "boundary_max_scan", "fragment_offset", "fragmenter",
+			"max_analyzed_offset", "phrase_limit", "force_source", "max_fragment_length", "options":
+		default:
+			return fmt.Errorf("parsing_exception: [highlight] unknown field [%s]", k)
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(hType)) {
+	case "", "unified", "plain", "fvh", "fast-vector-highlighter":
+	default:
+		return fmt.Errorf("parsing_exception: [highlight] invalid highlighter type [%s]", hType)
+	}
+	switch strings.ToLower(strings.TrimSpace(order)) {
+	case "", "none", "score":
+	default:
+		return fmt.Errorf("parsing_exception: [highlight] invalid order [%s]", order)
+	}
+	switch strings.ToLower(strings.TrimSpace(encoder)) {
+	case "", "default", "html":
+	default:
+		return fmt.Errorf("parsing_exception: [highlight] invalid encoder [%s]", encoder)
+	}
+	switch strings.ToLower(strings.TrimSpace(boundaryScanner)) {
+	case "", "chars", "sentence", "word":
+	default:
+		return fmt.Errorf("parsing_exception: [highlight] invalid boundary_scanner [%s]", boundaryScanner)
+	}
+	switch strings.ToLower(strings.TrimSpace(fragmenter)) {
+	case "", "simple", "span":
+	default:
+		return fmt.Errorf("parsing_exception: [highlight] invalid fragmenter [%s]", fragmenter)
+	}
+	for _, ts := range []string{tagSchema, tagsSchema} {
+		switch strings.ToLower(strings.TrimSpace(ts)) {
+		case "", "styled":
+		default:
+			return fmt.Errorf("parsing_exception: [highlight] invalid tags_schema [%s]", ts)
+		}
+	}
+	if fragSize != nil && *fragSize < 0 {
+		return fmt.Errorf("parsing_exception: [highlight] [fragment_size] must be >= 0")
+	}
+	if numFrags != nil && *numFrags < 0 {
+		return fmt.Errorf("parsing_exception: [highlight] [number_of_fragments] must be >= 0")
+	}
+	if noMatchSize != nil && *noMatchSize < 0 {
+		return fmt.Errorf("parsing_exception: [highlight] [no_match_size] must be >= 0")
+	}
+	if boundaryMaxScan != nil && *boundaryMaxScan < 0 {
+		return fmt.Errorf("parsing_exception: [highlight] [boundary_max_scan] must be >= 0")
+	}
+	if fragOffset != nil && *fragOffset < 0 {
+		return fmt.Errorf("parsing_exception: [highlight] [fragment_offset] must be >= 0")
+	}
+	if maxAnalyzedOffset != nil && *maxAnalyzedOffset < 0 {
+		return fmt.Errorf("parsing_exception: [highlight] [max_analyzed_offset] must be >= 0")
+	}
+	if phraseLimit != nil && *phraseLimit < 0 {
+		return fmt.Errorf("parsing_exception: [highlight] [phrase_limit] must be >= 0")
+	}
+	if (len(preTags) > 0 || len(postTags) > 0) && len(preTags) != len(postTags) {
+		return fmt.Errorf("parsing_exception: [highlight] requires both [pre_tags] and [post_tags] to have the same number of elements")
+	}
+	return nil
 }
 
 func parseFlexibleStringSlice(v any) ([]string, error) {
@@ -1000,6 +1129,10 @@ func (hfs *HighlightFieldSpec) UnmarshalJSON(data []byte) error {
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return nil
 	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
 	type plain HighlightFieldSpec
 	var raw struct {
 		plain
@@ -1011,6 +1144,9 @@ func (hfs *HighlightFieldSpec) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*hfs = HighlightFieldSpec(raw.plain)
+	if hfs.TagSchema == "" && hfs.TagsSchema != "" {
+		hfs.TagSchema = hfs.TagsSchema
+	}
 	if raw.PreTags != nil {
 		tags, err := parseFlexibleStringSlice(raw.PreTags)
 		if err != nil {
@@ -1032,27 +1168,49 @@ func (hfs *HighlightFieldSpec) UnmarshalJSON(data []byte) error {
 		}
 		hfs.MatchedFields = mf
 	}
-	return nil
+	return validateHighlightCommonFields(
+		rawMap, false,
+		hfs.Type, hfs.Order, hfs.Encoder, hfs.BoundaryScanner, hfs.Fragmenter, hfs.TagSchema, hfs.TagsSchema,
+		hfs.FragmentSize, hfs.NumberOfFragments, hfs.NoMatchSize, hfs.BoundaryMaxScan, hfs.FragmentOffset, hfs.MaxAnalyzedOffset, hfs.PhraseLimit,
+		hfs.PreTags, hfs.PostTags,
+	)
 }
 
 type HighlightSpec struct {
-	PreTags           []string       `json:"pre_tags,omitempty"`
-	PostTags          []string       `json:"post_tags,omitempty"`
-	TagSchema         string         `json:"tag_schema,omitempty"`
-	Encoder           string         `json:"encoder,omitempty"`
-	HighlightQuery    *Query         `json:"highlight_query,omitempty"`
-	RequireFieldMatch *bool          `json:"require_field_match,omitempty"`
-	FragmentSize      *int           `json:"fragment_size,omitempty"`
-	NumberOfFragments *int           `json:"number_of_fragments,omitempty"`
-	NoMatchSize       *int           `json:"no_match_size,omitempty"`
-	Type              string         `json:"type,omitempty"`
-	Fields            map[string]any `json:"fields,omitempty"`
+	PreTags               []string       `json:"pre_tags,omitempty"`
+	PostTags              []string       `json:"post_tags,omitempty"`
+	TagSchema             string         `json:"tag_schema,omitempty"`
+	TagsSchema            string         `json:"tags_schema,omitempty"`
+	Encoder               string         `json:"encoder,omitempty"`
+	HighlightQuery        *Query         `json:"highlight_query,omitempty"`
+	RequireFieldMatch     *bool          `json:"require_field_match,omitempty"`
+	FragmentSize          *int           `json:"fragment_size,omitempty"`
+	NumberOfFragments     *int           `json:"number_of_fragments,omitempty"`
+	NoMatchSize           *int           `json:"no_match_size,omitempty"`
+	Type                  string         `json:"type,omitempty"`
+	Order                 string         `json:"order,omitempty"`
+	BoundaryScanner       string         `json:"boundary_scanner,omitempty"`
+	BoundaryScannerLocale string         `json:"boundary_scanner_locale,omitempty"`
+	BoundaryChars         string         `json:"boundary_chars,omitempty"`
+	BoundaryMaxScan       *int           `json:"boundary_max_scan,omitempty"`
+	FragmentOffset        *int           `json:"fragment_offset,omitempty"`
+	Fragmenter            string         `json:"fragmenter,omitempty"`
+	MaxAnalyzedOffset     *int           `json:"max_analyzed_offset,omitempty"`
+	PhraseLimit           *int           `json:"phrase_limit,omitempty"`
+	ForceSource           *bool          `json:"force_source,omitempty"`
+	MaxFragmentLength     *int           `json:"max_fragment_length,omitempty"`
+	Options               map[string]any `json:"options,omitempty"`
+	Fields                map[string]any `json:"fields,omitempty"`
 }
 
 func (h *HighlightSpec) UnmarshalJSON(data []byte) error {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
 	}
 	type plain HighlightSpec
 	var raw struct {
@@ -1064,6 +1222,9 @@ func (h *HighlightSpec) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*h = HighlightSpec(raw.plain)
+	if h.TagSchema == "" && h.TagsSchema != "" {
+		h.TagSchema = h.TagsSchema
+	}
 	if raw.PreTags != nil {
 		tags, err := parseFlexibleStringSlice(raw.PreTags)
 		if err != nil {
@@ -1077,6 +1238,32 @@ func (h *HighlightSpec) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		h.PostTags = tags
+	}
+	if err := validateHighlightCommonFields(
+		rawMap, true,
+		h.Type, h.Order, h.Encoder, h.BoundaryScanner, h.Fragmenter, h.TagSchema, h.TagsSchema,
+		h.FragmentSize, h.NumberOfFragments, h.NoMatchSize, h.BoundaryMaxScan, h.FragmentOffset, h.MaxAnalyzedOffset, h.PhraseLimit,
+		h.PreTags, h.PostTags,
+	); err != nil {
+		return err
+	}
+	if rawFields, hasFields := rawMap["fields"]; hasFields {
+		ft := bytes.TrimSpace(rawFields)
+		if len(ft) > 0 && !bytes.Equal(ft, []byte("null")) {
+			var fMap map[string]json.RawMessage
+			if err := json.Unmarshal(ft, &fMap); err != nil {
+				return fmt.Errorf("parsing_exception: [highlight] [fields] must be an object: %w", err)
+			}
+			for fname, fRaw := range fMap {
+				if strings.TrimSpace(fname) == "" {
+					return fmt.Errorf("parsing_exception: [highlight] field name cannot be empty")
+				}
+				var hfs HighlightFieldSpec
+				if err := json.Unmarshal(fRaw, &hfs); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -2807,16 +2994,100 @@ type IntervalsMatch struct {
 	UseField string           `json:"use_field,omitempty"`
 }
 
+func (im *IntervalsMatch) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "query", "max_gaps", "ordered", "analyzer", "filter", "use_field":
+		default:
+			return fmt.Errorf("parsing_exception: [intervals.match] unknown field [%s]", k)
+		}
+	}
+	type plain IntervalsMatch
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if strings.TrimSpace(p.Query) == "" {
+		return fmt.Errorf("parsing_exception: [intervals.match] requires non-empty [query]")
+	}
+	*im = IntervalsMatch(p)
+	return nil
+}
+
 type IntervalsPrefix struct {
 	Prefix   string `json:"prefix"`
 	Analyzer string `json:"analyzer,omitempty"`
 	UseField string `json:"use_field,omitempty"`
 }
 
+func (ip *IntervalsPrefix) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "prefix", "analyzer", "use_field":
+		default:
+			return fmt.Errorf("parsing_exception: [intervals.prefix] unknown field [%s]", k)
+		}
+	}
+	type plain IntervalsPrefix
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if strings.TrimSpace(p.Prefix) == "" {
+		return fmt.Errorf("parsing_exception: [intervals.prefix] requires non-empty [prefix]")
+	}
+	*ip = IntervalsPrefix(p)
+	return nil
+}
+
 type IntervalsWildcard struct {
 	Pattern  string `json:"pattern"`
 	Analyzer string `json:"analyzer,omitempty"`
 	UseField string `json:"use_field,omitempty"`
+}
+
+func (iw *IntervalsWildcard) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "pattern", "analyzer", "use_field":
+		default:
+			return fmt.Errorf("parsing_exception: [intervals.wildcard] unknown field [%s]", k)
+		}
+	}
+	type plain IntervalsWildcard
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if strings.TrimSpace(p.Pattern) == "" {
+		return fmt.Errorf("parsing_exception: [intervals.wildcard] requires non-empty [pattern]")
+	}
+	*iw = IntervalsWildcard(p)
+	return nil
 }
 
 type IntervalsFuzzy struct {
@@ -2828,6 +3099,37 @@ type IntervalsFuzzy struct {
 	UseField       string `json:"use_field,omitempty"`
 }
 
+func (ifz *IntervalsFuzzy) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "term", "prefix_length", "transpositions", "fuzziness", "analyzer", "use_field":
+		default:
+			return fmt.Errorf("parsing_exception: [intervals.fuzzy] unknown field [%s]", k)
+		}
+	}
+	type plain IntervalsFuzzy
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if strings.TrimSpace(p.Term) == "" {
+		return fmt.Errorf("parsing_exception: [intervals.fuzzy] requires non-empty [term]")
+	}
+	if p.PrefixLength < 0 {
+		return fmt.Errorf("parsing_exception: [intervals.fuzzy] [prefix_length] must be >= 0")
+	}
+	*ifz = IntervalsFuzzy(p)
+	return nil
+}
+
 type IntervalsAllOf struct {
 	Intervals []IntervalsRule  `json:"intervals"`
 	MaxGaps   *int             `json:"max_gaps,omitempty"`
@@ -2835,9 +3137,65 @@ type IntervalsAllOf struct {
 	Filter    *IntervalsFilter `json:"filter,omitempty"`
 }
 
+func (ia *IntervalsAllOf) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "intervals", "max_gaps", "ordered", "filter":
+		default:
+			return fmt.Errorf("parsing_exception: [intervals.all_of] unknown field [%s]", k)
+		}
+	}
+	type plain IntervalsAllOf
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if len(p.Intervals) == 0 {
+		return fmt.Errorf("parsing_exception: [intervals.all_of] requires non-empty [intervals]")
+	}
+	*ia = IntervalsAllOf(p)
+	return nil
+}
+
 type IntervalsAnyOf struct {
 	Intervals []IntervalsRule  `json:"intervals"`
 	Filter    *IntervalsFilter `json:"filter,omitempty"`
+}
+
+func (iao *IntervalsAnyOf) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "intervals", "filter":
+		default:
+			return fmt.Errorf("parsing_exception: [intervals.any_of] unknown field [%s]", k)
+		}
+	}
+	type plain IntervalsAnyOf
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if len(p.Intervals) == 0 {
+		return fmt.Errorf("parsing_exception: [intervals.any_of] requires non-empty [intervals]")
+	}
+	*iao = IntervalsAnyOf(p)
+	return nil
 }
 
 type IntervalsFilter struct {
@@ -2850,6 +3208,37 @@ type IntervalsFilter struct {
 	NotOverlapping *IntervalsRule `json:"not_overlapping,omitempty"`
 	Overlapping    *IntervalsRule `json:"overlapping,omitempty"`
 	Script         any            `json:"script,omitempty"`
+}
+
+func (ifl *IntervalsFilter) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	ruleCount := 0
+	for k := range rawMap {
+		switch k {
+		case "after", "before", "contained_by", "containing",
+			"not_contained_by", "not_containing", "not_overlapping", "overlapping", "script":
+			ruleCount++
+		default:
+			return fmt.Errorf("parsing_exception: [intervals.filter] unknown field [%s]", k)
+		}
+	}
+	if ruleCount == 0 {
+		return fmt.Errorf("parsing_exception: [intervals.filter] requires a filter rule or [script]")
+	}
+	type plain IntervalsFilter
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	*ifl = IntervalsFilter(p)
+	return nil
 }
 
 func (ir *IntervalsRule) UnmarshalJSON(data []byte) error {
@@ -3272,6 +3661,149 @@ type RankFeatureQuery struct {
 	Name       string         `json:"_name,omitempty"`
 }
 
+func parseStrictPositiveNumber(raw json.RawMessage, errCtx string) (float64, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return 0, fmt.Errorf("parsing_exception: %s must be > 0", errCtx)
+	}
+	var v float64
+	if err := json.Unmarshal(trimmed, &v); err != nil || v <= 0 || math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, fmt.Errorf("parsing_exception: %s must be > 0", errCtx)
+	}
+	return v, nil
+}
+
+func validatePositiveScaleOrPivot(val any, errCtx string) error {
+	if val == nil {
+		return fmt.Errorf("parsing_exception: %s must be > 0", errCtx)
+	}
+	switch v := val.(type) {
+	case float64:
+		if v <= 0 || math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("parsing_exception: %s must be > 0", errCtx)
+		}
+		return nil
+	case int:
+		if v <= 0 {
+			return fmt.Errorf("parsing_exception: %s must be > 0", errCtx)
+		}
+		return nil
+	case int64:
+		if v <= 0 {
+			return fmt.Errorf("parsing_exception: %s must be > 0", errCtx)
+		}
+		return nil
+	case json.Number:
+		f, err := v.Float64()
+		if err != nil || f <= 0 || math.IsNaN(f) || math.IsInf(f, 0) {
+			return fmt.Errorf("parsing_exception: %s must be > 0", errCtx)
+		}
+		return nil
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" || strings.HasPrefix(s, "-") {
+			return fmt.Errorf("parsing_exception: %s must be > 0", errCtx)
+		}
+		numEnd := 0
+		for numEnd < len(s) && ((s[numEnd] >= '0' && s[numEnd] <= '9') || s[numEnd] == '.' || s[numEnd] == '+') {
+			numEnd++
+		}
+		if numEnd == 0 {
+			return fmt.Errorf("parsing_exception: %s must be > 0", errCtx)
+		}
+		f, err := strconv.ParseFloat(s[:numEnd], 64)
+		if err != nil || f <= 0 || math.IsNaN(f) || math.IsInf(f, 0) {
+			return fmt.Errorf("parsing_exception: %s must be > 0", errCtx)
+		}
+		return nil
+	default:
+		return fmt.Errorf("parsing_exception: %s must be > 0", errCtx)
+	}
+}
+
+func validateNonNegativeOffset(val any, errCtx string) error {
+	if val == nil {
+		return nil
+	}
+	switch v := val.(type) {
+	case float64:
+		if v < 0 || math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("parsing_exception: %s must be >= 0", errCtx)
+		}
+		return nil
+	case int:
+		if v < 0 {
+			return fmt.Errorf("parsing_exception: %s must be >= 0", errCtx)
+		}
+		return nil
+	case int64:
+		if v < 0 {
+			return fmt.Errorf("parsing_exception: %s must be >= 0", errCtx)
+		}
+		return nil
+	case json.Number:
+		f, err := v.Float64()
+		if err != nil || f < 0 || math.IsNaN(f) || math.IsInf(f, 0) {
+			return fmt.Errorf("parsing_exception: %s must be >= 0", errCtx)
+		}
+		return nil
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" || strings.HasPrefix(s, "-") {
+			return fmt.Errorf("parsing_exception: %s must be >= 0", errCtx)
+		}
+		numEnd := 0
+		for numEnd < len(s) && ((s[numEnd] >= '0' && s[numEnd] <= '9') || s[numEnd] == '.' || s[numEnd] == '+') {
+			numEnd++
+		}
+		if numEnd == 0 {
+			return fmt.Errorf("parsing_exception: %s must be >= 0", errCtx)
+		}
+		f, err := strconv.ParseFloat(s[:numEnd], 64)
+		if err != nil || f < 0 || math.IsNaN(f) || math.IsInf(f, 0) {
+			return fmt.Errorf("parsing_exception: %s must be >= 0", errCtx)
+		}
+		return nil
+	default:
+		return fmt.Errorf("parsing_exception: %s must be >= 0", errCtx)
+	}
+}
+
+func validateOriginValue(origin any, errCtx string) error {
+	if origin == nil {
+		return fmt.Errorf("parsing_exception: %s [origin] cannot be null", errCtx)
+	}
+	switch ov := origin.(type) {
+	case string:
+		if strings.TrimSpace(ov) == "" {
+			return fmt.Errorf("parsing_exception: %s [origin] cannot be empty", errCtx)
+		}
+		return nil
+	case float64, int, int64, json.Number:
+		return nil
+	case bool:
+		return fmt.Errorf("parsing_exception: %s [origin] cannot be a boolean", errCtx)
+	case []any:
+		if len(ov) != 2 {
+			return fmt.Errorf("parsing_exception: %s [origin] array must have 2 elements", errCtx)
+		}
+		if _, _, err := ParseGeoPoint(ov); err != nil {
+			return fmt.Errorf("parsing_exception: %s invalid [origin]: %w", errCtx, err)
+		}
+		return nil
+	case map[string]any:
+		if len(ov) == 0 {
+			return fmt.Errorf("parsing_exception: %s [origin] object cannot be empty", errCtx)
+		}
+		if _, _, err := ParseGeoPoint(ov); err != nil {
+			return fmt.Errorf("parsing_exception: %s invalid [origin]: %w", errCtx, err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("parsing_exception: %s invalid [origin]", errCtx)
+	}
+}
+
 func (rf *RankFeatureQuery) UnmarshalJSON(data []byte) error {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -3281,11 +3813,86 @@ func (rf *RankFeatureQuery) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
 		return err
 	}
+	fnCount := 0
 	for k := range rawMap {
 		switch k {
-		case "field", "boost", "saturation", "log", "sigmoid", "linear", "_name":
+		case "saturation", "log", "sigmoid", "linear":
+			fnCount++
+		case "field", "boost", "_name":
 		default:
 			return fmt.Errorf("parsing_exception: [rank_feature] unknown field [%s]", k)
+		}
+	}
+	if fnCount > 1 {
+		return fmt.Errorf("parsing_exception: [rank_feature] cannot specify more than one function")
+	}
+	if rawSat, ok := rawMap["saturation"]; ok {
+		st := bytes.TrimSpace(rawSat)
+		if len(st) == 0 || st[0] != '{' {
+			return fmt.Errorf("parsing_exception: [rank_feature.saturation] must be an object")
+		}
+		var satMap map[string]json.RawMessage
+		if err := json.Unmarshal(st, &satMap); err != nil {
+			return err
+		}
+		for sk, sv := range satMap {
+			if sk != "pivot" {
+				return fmt.Errorf("parsing_exception: [rank_feature.saturation] unknown field [%s]", sk)
+			}
+			if _, err := parseStrictPositiveNumber(sv, "[rank_feature.saturation.pivot]"); err != nil {
+				return err
+			}
+		}
+	}
+	if rawLog, ok := rawMap["log"]; ok {
+		lt := bytes.TrimSpace(rawLog)
+		if len(lt) == 0 || lt[0] != '{' {
+			return fmt.Errorf("parsing_exception: [rank_feature.log] must be an object")
+		}
+		var logMap map[string]json.RawMessage
+		if err := json.Unmarshal(lt, &logMap); err != nil {
+			return err
+		}
+		rawSF, hasSF := logMap["scaling_factor"]
+		if !hasSF || len(logMap) != 1 {
+			return fmt.Errorf("parsing_exception: [rank_feature.log] requires only [scaling_factor]")
+		}
+		if _, err := parseStrictPositiveNumber(rawSF, "[rank_feature.log.scaling_factor]"); err != nil {
+			return err
+		}
+	}
+	if rawSig, ok := rawMap["sigmoid"]; ok {
+		st := bytes.TrimSpace(rawSig)
+		if len(st) == 0 || st[0] != '{' {
+			return fmt.Errorf("parsing_exception: [rank_feature.sigmoid] must be an object")
+		}
+		var sigMap map[string]json.RawMessage
+		if err := json.Unmarshal(st, &sigMap); err != nil {
+			return err
+		}
+		rawPivot, hasPivot := sigMap["pivot"]
+		rawExp, hasExp := sigMap["exponent"]
+		if !hasPivot || !hasExp || len(sigMap) != 2 {
+			return fmt.Errorf("parsing_exception: [rank_feature.sigmoid] requires both [pivot] and [exponent]")
+		}
+		if _, err := parseStrictPositiveNumber(rawPivot, "[rank_feature.sigmoid.pivot]"); err != nil {
+			return err
+		}
+		if _, err := parseStrictPositiveNumber(rawExp, "[rank_feature.sigmoid.exponent]"); err != nil {
+			return err
+		}
+	}
+	if rawLin, ok := rawMap["linear"]; ok {
+		lt := bytes.TrimSpace(rawLin)
+		if len(lt) == 0 || lt[0] != '{' {
+			return fmt.Errorf("parsing_exception: [rank_feature.linear] must be an object")
+		}
+		var linMap map[string]json.RawMessage
+		if err := json.Unmarshal(lt, &linMap); err != nil {
+			return err
+		}
+		if len(linMap) != 0 {
+			return fmt.Errorf("parsing_exception: [rank_feature.linear] does not accept any parameters")
 		}
 	}
 	type plain RankFeatureQuery
@@ -3346,6 +3953,12 @@ func (dfq *DistanceFeatureQuery) UnmarshalJSON(data []byte) error {
 	if strings.TrimSpace(raw.Field) == "" || raw.Origin == nil || raw.Pivot == nil {
 		return fmt.Errorf("parsing_exception: [distance_feature] requires [field], [origin], and [pivot]")
 	}
+	if err := validateOriginValue(raw.Origin, "[distance_feature]"); err != nil {
+		return err
+	}
+	if err := validatePositiveScaleOrPivot(raw.Pivot, "[distance_feature] [pivot]"); err != nil {
+		return err
+	}
 	*dfq = DistanceFeatureQuery(raw.plain)
 	if len(raw.Boost) > 0 {
 		b, err := parseOptionalNonNegativeBoost(raw.Boost)
@@ -3400,6 +4013,20 @@ func (hc *HasChildQuery) UnmarshalJSON(data []byte) error {
 	}
 	if strings.TrimSpace(raw.Type) == "" {
 		return fmt.Errorf("parsing_exception: [has_child] requires [type]")
+	}
+	switch strings.ToLower(strings.TrimSpace(raw.ScoreMode)) {
+	case "", "none", "avg", "sum", "max", "min":
+	default:
+		return fmt.Errorf("parsing_exception: [has_child] invalid score_mode [%s]", raw.ScoreMode)
+	}
+	if raw.MinChildren != nil && *raw.MinChildren < 0 {
+		return fmt.Errorf("parsing_exception: [has_child] [min_children] must be >= 0")
+	}
+	if raw.MaxChildren != nil && *raw.MaxChildren < 0 {
+		return fmt.Errorf("parsing_exception: [has_child] [max_children] must be >= 0")
+	}
+	if raw.MinChildren != nil && raw.MaxChildren != nil && *raw.MaxChildren > 0 && *raw.MinChildren > *raw.MaxChildren {
+		return fmt.Errorf("parsing_exception: [has_child] [min_children] cannot be greater than [max_children]")
 	}
 	*hc = HasChildQuery(raw.plain)
 	if raw.IgnoreUnmapped != nil {
@@ -3524,6 +4151,15 @@ func (pid *ParentIDQuery) UnmarshalJSON(data []byte) error {
 	if strings.TrimSpace(raw.Type) == "" || raw.ID == nil {
 		return fmt.Errorf("parsing_exception: [parent_id] requires [type] and [id]")
 	}
+	switch idv := raw.ID.(type) {
+	case string:
+		if strings.TrimSpace(idv) == "" {
+			return fmt.Errorf("parsing_exception: [parent_id] [id] cannot be empty")
+		}
+	case float64, int, int64, json.Number:
+	default:
+		return fmt.Errorf("parsing_exception: [parent_id] [id] must be a string or number")
+	}
 	*pid = ParentIDQuery(raw.plain)
 	if raw.IgnoreUnmapped != nil {
 		b, err := parseFlexibleBool(raw.IgnoreUnmapped)
@@ -3573,6 +4209,16 @@ func (pq *PercolateQuery) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: [percolate] unknown field [%s]", k)
 		}
 	}
+	_, hasDoc := rawMap["document"]
+	_, hasDocs := rawMap["documents"]
+	_, hasID := rawMap["id"]
+	_, hasIndex := rawMap["index"]
+	if hasDoc && hasDocs {
+		return fmt.Errorf("parsing_exception: [percolate] cannot specify both [document] and [documents]")
+	}
+	if (hasDoc || hasDocs) && (hasID || hasIndex) {
+		return fmt.Errorf("parsing_exception: [percolate] cannot specify both [document]/[documents] and [index]/[id]")
+	}
 	type plain PercolateQuery
 	var raw struct {
 		plain
@@ -3585,6 +4231,17 @@ func (pq *PercolateQuery) UnmarshalJSON(data []byte) error {
 	}
 	if strings.TrimSpace(raw.Field) == "" {
 		return fmt.Errorf("parsing_exception: [percolate] requires [field]")
+	}
+	if hasDoc && raw.Document == nil {
+		return fmt.Errorf("parsing_exception: [percolate] [document] must be a non-null object")
+	}
+	if hasDocs && len(raw.Documents) == 0 {
+		return fmt.Errorf("parsing_exception: [percolate] [documents] must be a non-empty array")
+	}
+	if !hasDoc && !hasDocs {
+		if strings.TrimSpace(raw.Index) == "" || strings.TrimSpace(raw.ID) == "" {
+			return fmt.Errorf("parsing_exception: [percolate] requires [document], [documents], or both [index] and [id]")
+		}
 	}
 	iu, err := parseFlexibleBool(raw.IgnoreUnmapped)
 	if err != nil {
@@ -5938,6 +6595,15 @@ func (df *DecayFunctionSpec) UnmarshalJSON(data []byte) error {
 	if inner.Origin == nil || inner.Scale == nil {
 		return fmt.Errorf("parsing_exception: decay function for [%s] requires non-null [origin] and [scale]", df.Field)
 	}
+	if err := validateOriginValue(inner.Origin, fmt.Sprintf("decay function for [%s]", df.Field)); err != nil {
+		return err
+	}
+	if err := validatePositiveScaleOrPivot(inner.Scale, fmt.Sprintf("decay function [%s] [scale]", df.Field)); err != nil {
+		return err
+	}
+	if err := validateNonNegativeOffset(inner.Offset, fmt.Sprintf("decay function [%s] [offset]", df.Field)); err != nil {
+		return err
+	}
 	df.Origin = inner.Origin
 	df.Scale = inner.Scale
 	df.Offset = inner.Offset
@@ -6149,8 +6815,112 @@ type RandomScoreSpec struct {
 	Field string `json:"field,omitempty"`
 }
 
+func (rs *RandomScoreSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "seed", "field":
+		default:
+			return fmt.Errorf("parsing_exception: [random_score] unknown field [%s]", k)
+		}
+	}
+	type plain RandomScoreSpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if _, hasSeed := rawMap["seed"]; hasSeed {
+		if p.Seed == nil {
+			return fmt.Errorf("parsing_exception: [random_score] [seed] cannot be null")
+		}
+		switch sv := p.Seed.(type) {
+		case string:
+			if strings.TrimSpace(sv) == "" {
+				return fmt.Errorf("parsing_exception: [random_score] [seed] cannot be empty")
+			}
+		case float64, int, int64, json.Number:
+		default:
+			return fmt.Errorf("parsing_exception: [random_score] [seed] must be a number or string")
+		}
+	}
+	*rs = RandomScoreSpec(p)
+	return nil
+}
+
 type ScriptScoreFunctionSpec struct {
 	Script any `json:"script,omitempty"`
+}
+
+func validateScriptValue(script any) error {
+	if script == nil {
+		return fmt.Errorf("parsing_exception: [script_score] requires [script]")
+	}
+	switch sv := script.(type) {
+	case string:
+		if strings.TrimSpace(sv) == "" {
+			return fmt.Errorf("parsing_exception: [script_score] [script] cannot be empty")
+		}
+		return nil
+	case map[string]any:
+		if len(sv) == 0 {
+			return fmt.Errorf("parsing_exception: [script_score] [script] requires [source] or [id]")
+		}
+		hasCode := false
+		for k, v := range sv {
+			switch k {
+			case "source", "inline", "id":
+				if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+					hasCode = true
+				}
+			case "lang", "params", "options":
+			default:
+				return fmt.Errorf("parsing_exception: [script_score] unknown field [%s] in [script]", k)
+			}
+		}
+		if !hasCode {
+			return fmt.Errorf("parsing_exception: [script_score] [script] requires non-empty [source] or [id]")
+		}
+		return nil
+	default:
+		return fmt.Errorf("parsing_exception: [script_score] [script] must be a string or object")
+	}
+}
+
+func (ssf *ScriptScoreFunctionSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		if k != "script" {
+			return fmt.Errorf("parsing_exception: [script_score] unknown field [%s]", k)
+		}
+	}
+	rawScript, hasScript := rawMap["script"]
+	if !hasScript || len(bytes.TrimSpace(rawScript)) == 0 || bytes.Equal(bytes.TrimSpace(rawScript), []byte("null")) {
+		return fmt.Errorf("parsing_exception: [script_score] requires [script]")
+	}
+	type plain ScriptScoreFunctionSpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if err := validateScriptValue(p.Script); err != nil {
+		return err
+	}
+	*ssf = ScriptScoreFunctionSpec(p)
+	return nil
 }
 
 type FieldValueFactorSpec struct {
@@ -6158,6 +6928,43 @@ type FieldValueFactorSpec struct {
 	Factor   *float64 `json:"factor,omitempty"`
 	Modifier string   `json:"modifier,omitempty"`
 	Missing  *float64 `json:"missing,omitempty"`
+}
+
+func (fvf *FieldValueFactorSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "field", "factor", "modifier", "missing":
+		default:
+			return fmt.Errorf("parsing_exception: [field_value_factor] unknown field [%s]", k)
+		}
+	}
+	type plain FieldValueFactorSpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if strings.TrimSpace(p.Field) == "" {
+		return fmt.Errorf("parsing_exception: [field_value_factor] requires non-empty [field]")
+	}
+	if p.Factor != nil && (*p.Factor < 0 || math.IsNaN(*p.Factor) || math.IsInf(*p.Factor, 0)) {
+		return fmt.Errorf("parsing_exception: [field_value_factor] [factor] must be >= 0")
+	}
+	switch strings.ToLower(strings.TrimSpace(p.Modifier)) {
+	case "", "none", "log", "log1p", "log2p", "ln", "ln1p", "ln2p", "square", "sqrt", "reciprocal":
+		p.Modifier = strings.ToLower(strings.TrimSpace(p.Modifier))
+	default:
+		return fmt.Errorf("parsing_exception: [field_value_factor] unknown modifier [%s]", p.Modifier)
+	}
+	*fvf = FieldValueFactorSpec(p)
+	return nil
 }
 
 var knownAggTypeKeys = map[string]bool{
@@ -6796,13 +7603,102 @@ type CompositeAggSpec struct {
 }
 
 func (c *CompositeAggSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return fmt.Errorf("parsing_exception: invalid [composite] aggregation: %w", err)
+	}
+	for k := range rawMap {
+		switch k {
+		case "size", "sources", "after":
+		default:
+			return fmt.Errorf("parsing_exception: [composite] unknown field [%s]", k)
+		}
+	}
 	type compositeAlias CompositeAggSpec
 	var alias compositeAlias
-	if err := json.Unmarshal(data, &alias); err != nil {
+	if err := json.Unmarshal(trimmed, &alias); err != nil {
 		return fmt.Errorf("parsing_exception: invalid [composite] aggregation: %w", err)
+	}
+	if _, hasSize := rawMap["size"]; hasSize && alias.Size <= 0 {
+		return fmt.Errorf("parsing_exception: [composite] [size] must be > 0")
 	}
 	if len(alias.Sources) == 0 {
 		return fmt.Errorf("parsing_exception: [composite] aggregation requires at least one source in [sources]")
+	}
+	var rawSources []map[string]json.RawMessage
+	if err := json.Unmarshal(rawMap["sources"], &rawSources); err != nil {
+		return fmt.Errorf("parsing_exception: [composite] invalid [sources]: %w", err)
+	}
+	for _, srcEntry := range rawSources {
+		if len(srcEntry) != 1 {
+			return fmt.Errorf("parsing_exception: [composite] each entry in [sources] must specify a single named source")
+		}
+		for srcName, rawSrcSpec := range srcEntry {
+			if strings.TrimSpace(srcName) == "" {
+				return fmt.Errorf("parsing_exception: [composite] source name cannot be empty")
+			}
+			var srcTypeMap map[string]json.RawMessage
+			if err := json.Unmarshal(rawSrcSpec, &srcTypeMap); err != nil || len(srcTypeMap) != 1 {
+				return fmt.Errorf("parsing_exception: [composite] source [%s] must specify a single source type", srcName)
+			}
+			for srcType, rawInner := range srcTypeMap {
+				switch srcType {
+				case "terms", "date_histogram", "histogram", "geotile_grid":
+				default:
+					return fmt.Errorf("parsing_exception: [composite] unknown source type [%s] for source [%s]", srcType, srcName)
+				}
+				var innerFields map[string]json.RawMessage
+				if err := json.Unmarshal(rawInner, &innerFields); err != nil {
+					return fmt.Errorf("parsing_exception: [composite] source [%s] [%s] must be an object", srcName, srcType)
+				}
+				for ik, iv := range innerFields {
+					switch ik {
+					case "field", "script", "missing_bucket", "missing_order", "missing", "order",
+						"value_type", "format", "time_zone", "calendar_interval", "fixed_interval",
+						"interval", "offset", "precision", "bounds":
+					default:
+						return fmt.Errorf("parsing_exception: [composite] unknown field [%s] in [%s] source [%s]", ik, srcType, srcName)
+					}
+					if ik == "order" {
+						var ordStr string
+						if err := json.Unmarshal(iv, &ordStr); err == nil {
+							switch strings.ToLower(strings.TrimSpace(ordStr)) {
+							case "asc", "desc":
+							default:
+								return fmt.Errorf("parsing_exception: [composite] invalid order [%s] in source [%s]", ordStr, srcName)
+							}
+						} else {
+							var ordMap map[string]string
+							if errM := json.Unmarshal(iv, &ordMap); errM != nil || len(ordMap) != 1 {
+								return fmt.Errorf("parsing_exception: [composite] invalid order in source [%s]", srcName)
+							}
+							for _, ov := range ordMap {
+								switch strings.ToLower(strings.TrimSpace(ov)) {
+								case "asc", "desc":
+								default:
+									return fmt.Errorf("parsing_exception: [composite] invalid order [%s] in source [%s]", ov, srcName)
+								}
+							}
+						}
+					}
+					if ik == "missing_order" {
+						var moStr string
+						if err := json.Unmarshal(iv, &moStr); err != nil {
+							return fmt.Errorf("parsing_exception: [composite] invalid missing_order in source [%s]", srcName)
+						}
+						switch strings.ToLower(strings.TrimSpace(moStr)) {
+						case "first", "last", "default":
+						default:
+							return fmt.Errorf("parsing_exception: [composite] invalid missing_order [%s] in source [%s]", moStr, srcName)
+						}
+					}
+				}
+			}
+		}
 	}
 	*c = CompositeAggSpec(alias)
 	return nil
@@ -6987,25 +7883,224 @@ func (a *AggSpec) SubAggs() map[string]AggSpec {
 	return a.Aggregations
 }
 
+// TermsIncludeExclude models the `include` or `exclude` filter of a `terms` aggregation
+// (a regex string, an array of exact values, or a `{"partition": p, "num_partitions": n}` object).
+type TermsIncludeExclude struct {
+	Pattern       string `json:"-"`
+	Values        []any  `json:"-"`
+	Partition     *int   `json:"partition,omitempty"`
+	NumPartitions *int   `json:"num_partitions,omitempty"`
+}
+
+func (tie *TermsIncludeExclude) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	switch trimmed[0] {
+	case '"':
+		var pat string
+		if err := json.Unmarshal(trimmed, &pat); err != nil {
+			return err
+		}
+		tie.Pattern = pat
+		return nil
+	case '[':
+		var vals []any
+		if err := json.Unmarshal(trimmed, &vals); err != nil {
+			return err
+		}
+		for _, v := range vals {
+			switch v.(type) {
+			case string, float64, int, int64, bool, json.Number:
+			default:
+				return fmt.Errorf("parsing_exception: [terms] include/exclude array elements must be scalars")
+			}
+		}
+		tie.Values = vals
+		return nil
+	case '{':
+		var rawMap map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+			return err
+		}
+		for k := range rawMap {
+			switch k {
+			case "partition", "num_partitions":
+			default:
+				return fmt.Errorf("parsing_exception: [terms] include/exclude partition unknown field [%s]", k)
+			}
+		}
+		_, hasPart := rawMap["partition"]
+		_, hasNum := rawMap["num_partitions"]
+		if !hasPart || !hasNum {
+			return fmt.Errorf("parsing_exception: [terms] include/exclude partition object requires both [partition] and [num_partitions]")
+		}
+		var obj struct {
+			Partition     int `json:"partition"`
+			NumPartitions int `json:"num_partitions"`
+		}
+		if err := json.Unmarshal(trimmed, &obj); err != nil {
+			return fmt.Errorf("parsing_exception: [terms] invalid partition object: %w", err)
+		}
+		if obj.NumPartitions <= 0 || obj.Partition < 0 || obj.Partition >= obj.NumPartitions {
+			return fmt.Errorf("parsing_exception: [terms] invalid partition configuration: partition=%d num_partitions=%d", obj.Partition, obj.NumPartitions)
+		}
+		p, np := obj.Partition, obj.NumPartitions
+		tie.Partition = &p
+		tie.NumPartitions = &np
+		return nil
+	default:
+		return fmt.Errorf("parsing_exception: [terms] include/exclude must be a string, array, or partition object")
+	}
+}
+
 type TermsAggSpec struct {
-	Field            string `json:"field"`
-	Script           any    `json:"script,omitempty"`
-	Size             int    `json:"size,omitempty"`
-	Format           string `json:"format,omitempty"`
-	Missing          any    `json:"missing,omitempty"`
-	MissingBucket    bool   `json:"missing_bucket,omitempty"`
-	MissingOrder     string `json:"missing_order,omitempty"`
-	Order            any    `json:"order,omitempty"`
-	MinDocCount      *int   `json:"min_doc_count,omitempty"`
-	Include          any    `json:"include,omitempty"`
-	Exclude          any    `json:"exclude,omitempty"`
-	ValueType        string `json:"value_type,omitempty"`
-	BackgroundFilter *Query `json:"background_filter,omitempty"`
+	Field                 string `json:"field"`
+	Script                any    `json:"script,omitempty"`
+	Size                  int    `json:"size,omitempty"`
+	ShardSize             *int   `json:"shard_size,omitempty"`
+	Format                string `json:"format,omitempty"`
+	Missing               any    `json:"missing,omitempty"`
+	MissingBucket         bool   `json:"missing_bucket,omitempty"`
+	MissingOrder          string `json:"missing_order,omitempty"`
+	Order                 any    `json:"order,omitempty"`
+	MinDocCount           *int   `json:"min_doc_count,omitempty"`
+	ShardMinDocCount      *int   `json:"shard_min_doc_count,omitempty"`
+	ShowTermDocCountError *bool  `json:"show_term_doc_count_error,omitempty"`
+	CollectMode           string `json:"collect_mode,omitempty"`
+	ExecutionHint         string `json:"execution_hint,omitempty"`
+	Include               any    `json:"include,omitempty"`
+	Exclude               any    `json:"exclude,omitempty"`
+	ValueType             string `json:"value_type,omitempty"`
+	BackgroundFilter      *Query `json:"background_filter,omitempty"`
+}
+
+func (t *TermsAggSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "field", "script", "size", "shard_size", "format", "missing", "missing_bucket", "missing_order",
+			"order", "min_doc_count", "shard_min_doc_count", "show_term_doc_count_error", "collect_mode",
+			"execution_hint", "include", "exclude", "value_type", "background_filter",
+			"chi_square", "gnd", "jlh", "mutual_information", "percentage":
+		default:
+			return fmt.Errorf("parsing_exception: [terms] unknown field [%s]", k)
+		}
+	}
+	type plain TermsAggSpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if strings.TrimSpace(p.Field) == "" && p.Script == nil {
+		return fmt.Errorf("parsing_exception: [terms] requires either [field] or [script]")
+	}
+	if _, hasSize := rawMap["size"]; hasSize && p.Size <= 0 {
+		return fmt.Errorf("parsing_exception: [terms] [size] must be > 0")
+	}
+	if p.ShardSize != nil && (*p.ShardSize == 0 || *p.ShardSize < -1) {
+		return fmt.Errorf("parsing_exception: [terms] [shard_size] must be > 0 or -1")
+	}
+	if p.MinDocCount != nil && *p.MinDocCount < 0 {
+		return fmt.Errorf("parsing_exception: [terms] [min_doc_count] must be >= 0")
+	}
+	if p.ShardMinDocCount != nil && *p.ShardMinDocCount < 0 {
+		return fmt.Errorf("parsing_exception: [terms] [shard_min_doc_count] must be >= 0")
+	}
+	switch strings.ToLower(strings.TrimSpace(p.CollectMode)) {
+	case "", "depth_first", "breadth_first":
+	default:
+		return fmt.Errorf("parsing_exception: [terms] unknown collect_mode [%s]", p.CollectMode)
+	}
+	switch strings.ToLower(strings.TrimSpace(p.ExecutionHint)) {
+	case "", "map", "global_ordinals":
+	default:
+		return fmt.Errorf("parsing_exception: [terms] unknown execution_hint [%s]", p.ExecutionHint)
+	}
+	if rawInc, hasInc := rawMap["include"]; hasInc {
+		var tie TermsIncludeExclude
+		if err := json.Unmarshal(rawInc, &tie); err != nil {
+			return err
+		}
+	}
+	if rawExc, hasExc := rawMap["exclude"]; hasExc {
+		var tie TermsIncludeExclude
+		if err := json.Unmarshal(rawExc, &tie); err != nil {
+			return err
+		}
+	}
+	*t = TermsAggSpec(p)
+	return nil
 }
 
 type HistogramBoundsSpec struct {
 	Min any `json:"min,omitempty"`
 	Max any `json:"max,omitempty"`
+}
+
+func (hb *HistogramBoundsSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "min", "max":
+		default:
+			return fmt.Errorf("parsing_exception: [histogram_bounds] unknown field [%s]", k)
+		}
+	}
+	if _, hasMin := rawMap["min"]; !hasMin {
+		return fmt.Errorf("parsing_exception: [histogram_bounds] requires [min] and [max]")
+	}
+	if _, hasMax := rawMap["max"]; !hasMax {
+		return fmt.Errorf("parsing_exception: [histogram_bounds] requires [min] and [max]")
+	}
+	type plain HistogramBoundsSpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if p.Min == nil || p.Max == nil {
+		return fmt.Errorf("parsing_exception: [histogram_bounds] [min] and [max] cannot be null")
+	}
+	minF, okMin := parseBoundFloat(p.Min)
+	maxF, okMax := parseBoundFloat(p.Max)
+	if okMin && okMax && minF > maxF {
+		return fmt.Errorf("parsing_exception: [histogram_bounds] [min] (%v) cannot be greater than [max] (%v)", p.Min, p.Max)
+	}
+	*hb = HistogramBoundsSpec(p)
+	return nil
+}
+
+func parseBoundFloat(v any) (float64, bool) {
+	switch val := v.(type) {
+	case float64:
+		return val, !math.IsNaN(val) && !math.IsInf(val, 0)
+	case int:
+		return float64(val), true
+	case int64:
+		return float64(val), true
+	case json.Number:
+		f, err := val.Float64()
+		return f, err == nil && !math.IsNaN(f) && !math.IsInf(f, 0)
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(val), 64)
+		return f, err == nil && !math.IsNaN(f) && !math.IsInf(f, 0)
+	}
+	return 0, false
 }
 
 type DateHistogramAggSpec struct {
@@ -7175,6 +8270,7 @@ type HistogramAggSpec struct {
 	Script         any                  `json:"script,omitempty"`
 	Interval       float64              `json:"interval"`
 	Offset         float64              `json:"offset,omitempty"`
+	Format         string               `json:"format,omitempty"`
 	Missing        any                  `json:"missing,omitempty"`
 	MissingBucket  bool                 `json:"missing_bucket,omitempty"`
 	MissingOrder   string               `json:"missing_order,omitempty"`
@@ -7183,6 +8279,44 @@ type HistogramAggSpec struct {
 	ExtendedBounds *HistogramBoundsSpec `json:"extended_bounds,omitempty"`
 	HardBounds     *HistogramBoundsSpec `json:"hard_bounds,omitempty"`
 	Keyed          bool                 `json:"keyed,omitempty"`
+}
+
+func (h *HistogramAggSpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "field", "script", "interval", "offset", "format", "missing", "missing_bucket",
+			"missing_order", "order", "min_doc_count", "extended_bounds", "hard_bounds", "keyed":
+		default:
+			return fmt.Errorf("parsing_exception: [histogram] unknown field [%s]", k)
+		}
+	}
+	if _, hasInterval := rawMap["interval"]; !hasInterval {
+		return fmt.Errorf("parsing_exception: [histogram] requires [interval]")
+	}
+	type plain HistogramAggSpec
+	var p plain
+	if err := json.Unmarshal(trimmed, &p); err != nil {
+		return err
+	}
+	if strings.TrimSpace(p.Field) == "" && p.Script == nil {
+		return fmt.Errorf("parsing_exception: [histogram] requires either [field] or [script]")
+	}
+	if p.Interval <= 0 || math.IsNaN(p.Interval) || math.IsInf(p.Interval, 0) {
+		return fmt.Errorf("parsing_exception: [histogram] [interval] must be > 0")
+	}
+	if p.MinDocCount != nil && *p.MinDocCount < 0 {
+		return fmt.Errorf("parsing_exception: [histogram] [min_doc_count] must be >= 0")
+	}
+	*h = HistogramAggSpec(p)
+	return nil
 }
 
 type RangeAggSpec struct {

@@ -68,6 +68,26 @@
             document:
               title: "raw_doc"
   - match: { result.status: "processed" }
+  - is_false: result.__raw_source
+
+  - do:
+      catch: bad_request
+      put_script:
+        id: "invalid_lang_script"
+        body:
+          script:
+            lang: "unsupported_lang"
+            source: "1 + 1"
+
+  - do:
+      catch: bad_request
+      put_script:
+        id: "invalid_ctx_script"
+        context: "non_existent_context"
+        body:
+          script:
+            lang: "painless"
+            source: "1 + 1"
 
   - do:
       delete_script:

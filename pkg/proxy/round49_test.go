@@ -843,3 +843,349 @@ func TestRound50ProxyAndIngestFindings(t *testing.T) {
 		}
 	}`)
 }
+
+func TestRound51_ProxyAndComplianceFeatures(t *testing.T) {
+	_, handler := newTestServerWithMock(t)
+
+	// F0: Data stream migration & GET /_data_stream/{name} 404
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_data_stream/no_such_ds", ""); c != http.StatusNotFound {
+		t.Fatalf("expected 404 for GET /_data_stream/no_such_ds, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_data_stream/_migrate/no_such_alias", ""); c != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for GET /_data_stream/_migrate/{name}, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_data_stream/_migrate/no_such_alias", ""); c != http.StatusNotFound {
+		t.Fatalf("expected 404 for POST /_data_stream/_migrate/no_such_alias, got %d", c)
+	}
+	doRound48Req(t, handler, http.MethodPut, "/r51_mig_idx_1", `{}`)
+	doRound48Req(t, handler, http.MethodPut, "/r51_mig_idx_2", `{}`)
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_data_stream/_migrate/r51_mig_idx_1", ""); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 when migrating concrete index name, got %d", c)
+	}
+	// Multi-index alias without write index -> 400
+	doRound48Req(t, handler, http.MethodPost, "/_aliases", `{
+		"actions": [
+			{"add": {"index": "r51_mig_idx_1", "alias": "r51_multi_no_write"}},
+			{"add": {"index": "r51_mig_idx_2", "alias": "r51_multi_no_write"}}
+		]
+	}`)
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_data_stream/_migrate/r51_multi_no_write", ""); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 when migrating multi-index alias without write index, got %d", c)
+	}
+	// Valid migration of alias with write index
+	doRound48Req(t, handler, http.MethodPost, "/_aliases", `{
+		"actions": [
+			{"add": {"index": "r51_mig_idx_1", "alias": "r51_mig_stream", "is_write_index": false}},
+			{"add": {"index": "r51_mig_idx_2", "alias": "r51_mig_stream", "is_write_index": true}}
+		]
+	}`)
+	code, resp, _ := doRound48Req(t, handler, http.MethodPost, "/_data_stream/_migrate/r51_mig_stream", "")
+	if code != http.StatusOK || resp["acknowledged"] != true {
+		t.Fatalf("expected 200 acknowledged for _data_stream/_migrate, got %d %v", code, resp)
+	}
+	code, resp, _ = doRound48Req(t, handler, http.MethodGet, "/_data_stream/r51_mig_stream", "")
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 for GET /_data_stream/r51_mig_stream after migrate, got %d %v", code, resp)
+	}
+
+	// F2: ILM endpoints (/start, /stop, /status, /move, /remove, /retry, /explain 404)
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_ilm/status", ""); c != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for POST /_ilm/status, got %d", c)
+	}
+	code, resp, _ = doRound48Req(t, handler, http.MethodGet, "/_ilm/status", "")
+	if code != http.StatusOK || resp["operation_mode"] != "RUNNING" {
+		t.Fatalf("expected operation_mode=RUNNING, got %d %v", code, resp)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_ilm/stop", ""); c != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for GET /_ilm/stop, got %d", c)
+	}
+	doRound48Req(t, handler, http.MethodPost, "/_ilm/stop", "")
+	_, resp, _ = doRound48Req(t, handler, http.MethodGet, "/_ilm/status", "")
+	if resp["operation_mode"] != "STOPPED" {
+		t.Fatalf("expected operation_mode=STOPPED after _ilm/stop, got %v", resp)
+	}
+	doRound48Req(t, handler, http.MethodPost, "/_ilm/start", "")
+	_, resp, _ = doRound48Req(t, handler, http.MethodGet, "/_ilm/status", "")
+	if resp["operation_mode"] != "RUNNING" {
+		t.Fatalf("expected operation_mode=RUNNING after _ilm/start, got %v", resp)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_ilm/move/no_such_idx", `{}`); c != http.StatusNotFound {
+		t.Fatalf("expected 404 for _ilm/move on missing index, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r51_mig_idx_1/_ilm/remove", ""); c != http.StatusOK {
+		t.Fatalf("expected 200 for /{index}/_ilm/remove, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r51_mig_idx_1/_ilm/retry", ""); c != http.StatusOK {
+		t.Fatalf("expected 200 for /{index}/_ilm/retry, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/no_such_ilm_idx/_ilm/explain", ""); c != http.StatusNotFound {
+		t.Fatalf("expected 404 for /{index}/_ilm/explain on missing index, got %d", c)
+	}
+
+	// F3: _cat/* 405, _cat/allocation/{node_id}, _cat/templates version
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_cat/indices", ""); c != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for POST /_cat/indices, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_cat/allocation", ""); c != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for DELETE /_cat/allocation, got %d", c)
+	}
+	_, _, rawCatAlloc := doRound48Req(t, handler, http.MethodGet, "/_cat/allocation/non_existent_node?format=json", "")
+	if strings.TrimSpace(rawCatAlloc) != "[]" {
+		t.Fatalf("expected empty array for non-matching node_id on _cat/allocation, got %s", rawCatAlloc)
+	}
+	doRound48Req(t, handler, http.MethodPut, "/_index_template/r51_ver_tpl", `{
+		"index_patterns": ["r51_ver_*"],
+		"version": 42,
+		"template": {"mappings": {"properties": {"x": {"type": "keyword"}}}}
+	}`)
+	_, _, rawCatTpl := doRound48Req(t, handler, http.MethodGet, "/_cat/templates/r51_ver_tpl?format=json", "")
+	if !strings.Contains(rawCatTpl, `"version":"42"`) {
+		t.Fatalf("expected _cat/templates to report version 42, got %s", rawCatTpl)
+	}
+
+	// F4: _tasks, _cluster/allocation/explain, _segments, _cache/clear validation
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_tasks/bad_task_id", ""); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 for malformed task_id in _tasks/{task_id}, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_tasks/node-1:notanumber", ""); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-numeric task number in _tasks/{task_id}, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_cluster/allocation/explain", `{"index": "no_such_alloc_idx", "shard": 0, "primary": true}`); c != http.StatusNotFound {
+		t.Fatalf("expected 404 for _cluster/allocation/explain on missing index, got %d", c)
+	}
+	doRound48Req(t, handler, http.MethodPost, "/r51_mig_idx_1/_close", "")
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/r51_mig_idx_1/_segments", ""); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 index_closed_exception for _segments on closed index, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r51_mig_idx_1/_cache/clear", ""); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 index_closed_exception for _cache/clear on closed index, got %d", c)
+	}
+	doRound48Req(t, handler, http.MethodPost, "/r51_mig_idx_1/_open", "")
+
+	// F5: _aliases & /{index}/_alias/{name} conflicts and 404s
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/r51_multi_no_write", `{}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 invalid_index_name_exception when creating index with existing alias name, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/r51_mig_idx_1/_alias/r51_mig_idx_2", `{}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 invalid_alias_name_exception when alias name collides with index, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/no_such_idx/_alias/r51_some_alias", `{}`); c != http.StatusNotFound {
+		t.Fatalf("expected 404 index_not_found_exception when adding alias to missing index, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_aliases", `{
+		"actions": [{"remove": {"index": "r51_mig_idx_1", "alias": "non_existent_alias*"}}]
+	}`); c != http.StatusNotFound {
+		t.Fatalf("expected 404 aliases_not_found_exception when removing non-existent wildcard alias, got %d", c)
+	}
+
+	// F6: _rollover validation & conditions map
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/no_such_rollover_target/_rollover", `{}`); c != http.StatusNotFound {
+		t.Fatalf("expected 404 for _rollover on missing alias, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r51_multi_no_write/_rollover", `{}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 for _rollover on multi-index alias without write index, got %d", c)
+	}
+	doRound48Req(t, handler, http.MethodPut, "/r51_ro_000001", `{}`)
+	doRound48Req(t, handler, http.MethodPut, "/r51_ro_000001/_alias/r51_ro_alias", `{}`)
+	code, resp, _ = doRound48Req(t, handler, http.MethodPost, "/r51_ro_alias/_rollover", `{
+		"conditions": {"max_docs": 100}
+	}`)
+	if code != http.StatusOK || resp["rolled_over"] != false {
+		t.Fatalf("expected rolled_over=false when max_docs=100 not met on empty index, got %d %v", code, resp)
+	}
+	condMap, _ := resp["conditions"].(map[string]any)
+	if condMap["[max_docs: 100]"] != false {
+		t.Fatalf("expected conditions['[max_docs: 100]']==false, got %v", condMap)
+	}
+
+	// F7: _count, _explain, _validate/query validation
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r51_ro_000001/_count", `{"unknown_top_key": 1}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unknown top-level key in _count, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r51_ro_000001/_explain/missing_doc_id", `{"query": {"match_all": {}}}`); c != http.StatusNotFound {
+		t.Fatalf("expected 404 for _explain on non-existent document, got %d", c)
+	}
+	code, resp, _ = doRound48Req(t, handler, http.MethodPost, "/r51_ro_000001/_validate/query?explain=true", `{"query": {" bogus_clause ": {}}}`)
+	if code != http.StatusOK || resp["valid"] != false {
+		t.Fatalf("expected 200 valid=false for unknown query clause in _validate/query, got %d %v", code, resp)
+	}
+
+	// F8: _resolve/index state & _search_shards closed index check
+	_, resp, _ = doRound48Req(t, handler, http.MethodGet, "/_resolve/index/r51_ro_000001", "")
+	if idxList, ok := resp["indices"].([]any); !ok || len(idxList) != 1 || idxList[0].(map[string]any)["state"] != "open" {
+		t.Fatalf("expected state='open' in _resolve/index response, got %v", resp)
+	}
+
+	// F9: _scripts & _ingest/pipeline validation
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_scripts/bad_ctx/s1", `{"script": {"lang": "painless", "source": "1"}}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unknown script context, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_scripts/s_bad_lang", `{"script": {"lang": "python", "source": "1"}}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unsupported script lang, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_ingest/pipeline/bad_pipe", `{"processors": [{"not_a_processor": {}}]}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unknown ingest processor, got %d", c)
+	}
+
+	// F15-proxy: Alias field cycle/missing/chained validation in handleCreateIndex & handlePutMapping
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/r51_bad_alias_idx", `{
+		"mappings": {"properties": {"a": {"type": "alias", "path": "missing_target"}}}
+	}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 mapper_parsing_exception for alias targeting missing field, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/r51_bad_alias_cycle", `{
+		"mappings": {"properties": {
+			"a": {"type": "alias", "path": "b"},
+			"b": {"type": "alias", "path": "a"}
+		}}
+	}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 mapper_parsing_exception for alias cycle, got %d", c)
+	}
+
+	// F27 & F28: grok nested brackets, dissect --->, kv strip_brackets {}, convert int32/short/byte bounds & yes/no/on/off, join non-array error
+	code, resp, _ = doRound48Req(t, handler, http.MethodPost, "/_ingest/pipeline/_simulate", `{
+		"pipeline": {
+			"processors": [
+				{"grok": {"field": "line", "patterns": ["%{WORD:[http][request][method]} %{NUMBER:[http][response][status]:int}"]}},
+				{"dissect": {"field": "dline", "pattern": "%{a--->}%{b}"}},
+				{"kv": {"field": "kvline", "field_split": " ", "value_split": "=", "strip_brackets": true, "target_field": "kvout"}},
+				{"convert": {"field": "flag_yes", "type": "boolean"}},
+				{"convert": {"field": "flag_off", "type": "boolean"}},
+				{"convert": {"field": "overflow_byte", "type": "byte", "on_failure": [{"set": {"field": "byte_overflow_caught", "value": true}}]}},
+				{"join": {"field": "not_an_array", "separator": ",", "on_failure": [{"set": {"field": "join_error_caught", "value": true}}]}}
+			]
+		},
+		"docs": [{
+			"_source": {
+				"line": "GET 200",
+				"dline": "hello     world",
+				"kvline": "(k1={v1}) [k2=<v2>]",
+				"flag_yes": "yes",
+				"flag_off": "off",
+				"overflow_byte": "200",
+				"not_an_array": "scalar_str"
+			}
+		}]
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("F27/F28 ingest simulate failed: %d %v", code, resp)
+	}
+	simSrc := resp["docs"].([]any)[0].(map[string]any)["doc"].(map[string]any)["_source"].(map[string]any)
+	httpMap, _ := simSrc["http"].(map[string]any)
+	if reqMap, _ := httpMap["request"].(map[string]any); reqMap["method"] != "GET" {
+		t.Fatalf("expected grok nested http.request.method='GET', got %v", simSrc["http"])
+	}
+	if simSrc["a"] != "hello" || simSrc["b"] != "world" {
+		t.Fatalf("expected dissect multi-arrow a='hello' b='world', got a=%v b=%v", simSrc["a"], simSrc["b"])
+	}
+	if kvOut, _ := simSrc["kvout"].(map[string]any); kvOut["k1"] != "v1" || kvOut["k2"] != "v2" {
+		t.Fatalf("expected kv strip_brackets k1=v1 k2=v2, got %v", simSrc["kvout"])
+	}
+	if simSrc["flag_yes"] != true || simSrc["flag_off"] != false {
+		t.Fatalf("expected boolean convert yes->true, off->false, got yes=%v off=%v", simSrc["flag_yes"], simSrc["flag_off"])
+	}
+	if simSrc["byte_overflow_caught"] != true {
+		t.Fatalf("expected byte overflow to trigger on_failure, got %v", simSrc)
+	}
+	if simSrc["join_error_caught"] != true {
+		t.Fatalf("expected join on scalar to trigger on_failure, got %v", simSrc)
+	}
+
+	// F29: bucket_script & bucket_selector multi-metric map binding & painless _execute __raw_source cleanup
+	doRound48Req(t, handler, http.MethodPut, "/r51_bs_idx", `{
+		"mappings": {"properties": {"grp": {"type": "keyword"}, "val": {"type": "double"}}}
+	}`)
+	doRound48Req(t, handler, http.MethodPut, "/r51_bs_idx/_doc/1?refresh=true", `{"grp": "g1", "val": 10}`)
+	doRound48Req(t, handler, http.MethodPut, "/r51_bs_idx/_doc/2?refresh=true", `{"grp": "g1", "val": 30}`)
+	code, resp, _ = doRound48Req(t, handler, http.MethodPost, "/r51_bs_idx/_search", `{
+		"size": 0,
+		"aggs": {
+			"by_grp": {
+				"terms": {"field": "grp"},
+				"aggs": {
+					"st": {"stats": {"field": "val"}},
+					"spread": {
+						"bucket_script": {
+							"buckets_path": {"s": "st"},
+							"script": "params.s.max - params.s.min"
+						}
+					},
+					"keep": {
+						"bucket_selector": {
+							"buckets_path": {"avg_val": "st.avg"},
+							"script": "params['avg_val'] >= 15"
+						}
+					}
+				}
+			}
+		}
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("F29 bucket_script search failed: %d %v", code, resp)
+	}
+	buckets := resp["aggregations"].(map[string]any)["by_grp"].(map[string]any)["buckets"].([]any)
+	if len(buckets) != 1 || buckets[0].(map[string]any)["spread"].(map[string]any)["value"] != float64(20) {
+		t.Fatalf("expected 1 bucket with spread=20, got %v", buckets)
+	}
+
+	// Additional branch coverage for extractBucketMetricMapByPath, bindNestedPainlessParam, ILM/DataStream/Alias validation
+	params := map[string]any{}
+	bindNestedPainlessParam(params, "a.b.c", 42.0)
+	bindNestedPainlessParam(params, "a.b.d", 99.0)
+	if params["a.b.c"] != 42.0 {
+		t.Fatalf("expected flat a.b.c=42")
+	}
+	sampleBucket := map[string]any{
+		"doc_count": 5,
+		"pct_f":     map[string]any{"values": map[string]float64{"50.0": 12.5, "95.0": 40.0}},
+		"pct_a":     map[string]any{"values": map[string]any{"50.0": 12.5, "95.0": 40.0}},
+		"sm":        map[string]any{"value": map[string]any{"total": 100.0}},
+		"scalar":    map[string]any{"value": 10.0},
+		"empty_st":  map[string]any{"count": 0, "avg": nil},
+		"by_key": map[string]any{
+			"buckets": map[string]any{
+				"k1": map[string]any{"st": map[string]any{"min": 1.0, "max": 9.0}},
+			},
+		},
+		"by_slice": map[string]any{
+			"buckets": []map[string]any{
+				{"key": "s1", "st": map[string]any{"min": 2.0, "max": 8.0}},
+			},
+		},
+	}
+	if m, ok := extractBucketMetricMapByPath(sampleBucket, "pct_f"); !ok || m["95"] != 40.0 {
+		t.Fatalf("expected pct_f map with 95=40, got %v %v", m, ok)
+	}
+	if m, ok := extractBucketMetricMapByPath(sampleBucket, "pct_a"); !ok || m["50"] != 12.5 {
+		t.Fatalf("expected pct_a map with 50=12.5, got %v %v", m, ok)
+	}
+	if m, ok := extractBucketMetricMapByPath(sampleBucket, "sm"); !ok || m["total"] != 100.0 {
+		t.Fatalf("expected sm map with total=100, got %v %v", m, ok)
+	}
+	if _, ok := extractBucketMetricMapByPath(sampleBucket, "scalar"); ok {
+		t.Fatalf("expected scalar metric not to match extractBucketMetricMapByPath")
+	}
+	if _, ok := extractBucketMetricMapByPath(sampleBucket, "empty_st"); ok {
+		t.Fatalf("expected empty_st not to match extractBucketMetricMapByPath")
+	}
+	if m, ok := extractBucketMetricMapByPath(sampleBucket, "by_key['k1']>st"); !ok || m["max"] != 9.0 {
+		t.Fatalf("expected keyed bucket path match, got %v %v", m, ok)
+	}
+	if m, ok := extractBucketMetricMapByPath(sampleBucket, "by_slice['s1']>st"); !ok || m["max"] != 8.0 {
+		t.Fatalf("expected slice bucket path match, got %v %v", m, ok)
+	}
+
+	// Alias mapping validation branches (missing path, cycle, relative path, object target)
+	code, _, _ = doRound48Req(t, handler, http.MethodPut, "/r51_alias_no_path", `{"mappings":{"properties":{"a":{"type":"alias"}}}}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on alias with missing path, got %d", code)
+	}
+	code, _, _ = doRound48Req(t, handler, http.MethodPut, "/r51_alias_cycle", `{"mappings":{"properties":{"a":{"type":"alias","path":"b"},"b":{"type":"alias","path":"a"}}}}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on alias cycle, got %d", code)
+	}
+	code, _, _ = doRound48Req(t, handler, http.MethodPut, "/r51_alias_obj", `{"mappings":{"properties":{"obj":{"type":"object","properties":{"x":{"type":"keyword"}}},"a":{"type":"alias","path":"obj"}}}}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on alias targeting object, got %d", code)
+	}
+}
