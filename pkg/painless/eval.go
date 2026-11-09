@@ -10371,10 +10371,10 @@ func evalCollectionConstructorPainless(sourceMap map[string]any, rhs string, par
 		uMsb := uint64(msb) // #nosec G115 -- intentional 64-bit UUID MSB bit pattern
 		uLsb := uint64(lsb) // #nosec G115 -- intentional 64-bit UUID LSB bit pattern
 		ctorVal = fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-			uint32(uMsb>>32),
-			uint16(uMsb>>16),
-			uint16(uMsb),
-			uint16(uLsb>>48),
+			(uMsb>>32)&0xffffffff,
+			(uMsb>>16)&0xffff,
+			uMsb&0xffff,
+			(uLsb>>48)&0xffff,
 			uLsb&0xffffffffffff,
 		)
 	} else if isMap {
