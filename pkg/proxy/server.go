@@ -228,6 +228,15 @@ type Server struct {
 	esqlAsyncQueries          map[string]map[string]any
 	watcherSettings           map[string]any
 	licenseState              map[string]any
+	sqlAsyncSearches          map[string]map[string]any
+	eqlSearches               map[string]map[string]any
+	mlJobs                    map[string]map[string]any
+	mlDatafeeds               map[string]map[string]any
+	mlTrainedModels           map[string]map[string]any
+	mlCalendars               map[string]map[string]any
+	mlFilters                 map[string]map[string]any
+	mlUpgradeMode             bool
+	securityRoleMappings      map[string]map[string]any
 }
 
 func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerOptions) *Server {
@@ -293,6 +302,14 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		esqlAsyncQueries:          make(map[string]map[string]any),
 		watcherSettings:           make(map[string]any),
 		licenseState:              make(map[string]any),
+		sqlAsyncSearches:          make(map[string]map[string]any),
+		eqlSearches:               make(map[string]map[string]any),
+		mlJobs:                    make(map[string]map[string]any),
+		mlDatafeeds:               make(map[string]map[string]any),
+		mlTrainedModels:           make(map[string]map[string]any),
+		mlCalendars:               make(map[string]map[string]any),
+		mlFilters:                 make(map[string]map[string]any),
+		securityRoleMappings:      make(map[string]map[string]any),
 	}
 	s.coalescer = newStreamLoadCoalescer(func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
 		err := s.backend.StreamLoad(ctx, table, ndjson, syncRefresh)
@@ -978,6 +995,48 @@ func (s *Server) Handler() http.Handler {
 			} else {
 				s.handleXPackAPI(w, r, segs)
 			}
+			return
+		case segs[0] == "_health_report":
+			s.handleHealthReport(w, r, segs)
+			return
+		case segs[0] == "_sql":
+			s.handleSQLAPI(w, r, segs)
+			return
+		case segs[0] == "_eql" || (len(segs) == 3 && segs[1] == "_eql" && segs[2] == "search"):
+			s.handleEQLSearchAPI(w, r, segs)
+			return
+		case (len(segs) == 1 && segs[0] == "_reload_search_analyzers") || (len(segs) == 2 && segs[1] == "_reload_search_analyzers"):
+			s.handleReloadSearchAnalyzers(w, r, segs)
+			return
+		case (len(segs) == 1 && segs[0] == "_disk_usage") || (len(segs) == 2 && segs[1] == "_disk_usage"):
+			s.handleIndexDiskUsage(w, r, segs)
+			return
+		case (len(segs) == 1 && segs[0] == "_field_usage_stats") || (len(segs) == 2 && segs[1] == "_field_usage_stats"):
+			s.handleIndexFieldUsageStats(w, r, segs)
+			return
+		case len(segs) == 5 && segs[0] == "_snapshot" && segs[3] == "_clone":
+			s.handleSnapshotClone(w, r, segs)
+			return
+		case segs[0] == "_ml":
+			s.handleMLAPI(w, r, segs)
+			return
+		case segs[0] == "_fleet" || (len(segs) == 3 && segs[1] == "_fleet"):
+			s.handleFleetAPI(w, r, segs)
+			return
+		case (len(segs) == 2 && segs[0] == "_graph" && segs[1] == "explore") || (len(segs) == 3 && segs[1] == "_graph" && segs[2] == "explore"):
+			s.handleGraphExplore(w, r, segs)
+			return
+		case len(segs) >= 2 && segs[0] == "_cluster" && segs[1] == "info":
+			s.handleClusterInfo(w, r, segs)
+			return
+		case len(segs) >= 2 && segs[0] == "_nodes" && (segs[1] == "repositories_metering" || (len(segs) >= 3 && segs[2] == "repositories_metering") || segs[1] == "clear_repositories_metering_archive" || (len(segs) >= 3 && segs[2] == "clear_repositories_metering_archive")):
+			s.handleNodesRepositoriesMetering(w, r, segs)
+			return
+		case len(segs) >= 2 && segs[0] == "_cat" && segs[1] == "component_templates":
+			s.handleCatComponentTemplates(w, r, segs)
+			return
+		case len(segs) >= 2 && segs[0] == "_cat" && (segs[1] == "ml_anomaly_detectors" || segs[1] == "ml_jobs" || segs[1] == "ml_datafeeds" || segs[1] == "ml_trained_models" || segs[1] == "ml_data_frame_analytics"):
+			s.handleCatML(w, r, segs)
 			return
 		}
 
@@ -1740,6 +1799,8 @@ func (s *Server) handleRootHandshake(w http.ResponseWriter, _ *http.Request) {
 			"build_flavor":                        "default",
 			"build_type":                          "tar",
 			"build_hash":                          "doris4x",
+			"build_date":                          "2021-01-13T00:42:12.435326Z",
+			"build_snapshot":                      false,
 			"lucene_version":                      "9.10.0",
 			"minimum_wire_compatibility_version":  "6.8.0",
 			"minimum_index_compatibility_version": "6.0.0-beta1",
@@ -2890,8 +2951,14 @@ func (s *Server) handleCatRoot(w http.ResponseWriter, r *http.Request) {
 		"/_cat/repositories",
 		"/_cat/snapshots",
 		"/_cat/templates",
+		"/_cat/component_templates",
 		"/_cat/transforms",
 		"/_cat/data_streams",
+		"/_cat/ml_anomaly_detectors",
+		"/_cat/ml_jobs",
+		"/_cat/ml_datafeeds",
+		"/_cat/ml_trained_models",
+		"/_cat/ml_data_frame_analytics",
 	}
 	if strings.EqualFold(r.URL.Query().Get("format"), "json") || strings.Contains(r.Header.Get("Accept"), "application/json") {
 		writeJSON(w, http.StatusOK, endpoints)

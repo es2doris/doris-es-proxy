@@ -374,6 +374,92 @@ func classifyTemporalStringKindPainless(s string) string {
 	return "LocalDateTime"
 }
 
+func parseChronoUnitArgPainless(argVal any, argExpr string) (string, bool) {
+	if s, ok := argVal.(string); ok {
+		u := strings.ToUpper(strings.TrimSpace(s))
+		u = strings.TrimPrefix(u, "CHRONOUNIT.")
+		switch u {
+		case "NANOS", "MICROS", "MILLIS", "SECONDS", "MINUTES", "HOURS", "HALF_DAYS",
+			"DAYS", "WEEKS", "MONTHS", "YEARS", "DECADES", "CENTURIES", "MILLENNIA", "ERAS", "FOREVER":
+			return u, true
+		}
+	}
+	ae := strings.TrimSpace(argExpr)
+	if idx := strings.LastIndex(ae, "ChronoUnit."); idx >= 0 {
+		u := strings.ToUpper(strings.TrimSpace(ae[idx+len("ChronoUnit."):]))
+		switch u {
+		case "NANOS", "MICROS", "MILLIS", "SECONDS", "MINUTES", "HOURS", "HALF_DAYS",
+			"DAYS", "WEEKS", "MONTHS", "YEARS", "DECADES", "CENTURIES", "MILLENNIA", "ERAS", "FOREVER":
+			return u, true
+		}
+	}
+	return "", false
+}
+
+func evalIsSupportedChronoUnitPainless(recVal any, recExpr, unit string) bool {
+	unit = strings.ToUpper(strings.TrimSpace(unit))
+	if unit == "FOREVER" {
+		return false
+	}
+	switch tv := recVal.(type) {
+	case painlessYear:
+		switch unit {
+		case "YEARS", "DECADES", "CENTURIES", "MILLENNIA", "ERAS":
+			return true
+		}
+		return false
+	case painlessMonthDay:
+		return false
+	case *painlessOffsetTime:
+		switch unit {
+		case "NANOS", "MICROS", "MILLIS", "SECONDS", "MINUTES", "HOURS", "HALF_DAYS":
+			return true
+		}
+		return false
+	case string:
+		if _, ok := parsePainlessDateTime(tv); !ok {
+			return false
+		}
+		reTrim := strings.TrimSpace(recExpr)
+		if strings.HasPrefix(reTrim, "Instant.") || strings.Contains(reTrim, ".toInstant(") {
+			switch unit {
+			case "NANOS", "MICROS", "MILLIS", "SECONDS", "MINUTES", "HOURS", "HALF_DAYS", "DAYS":
+				return true
+			}
+			return false
+		}
+		kind := classifyTemporalStringKindPainless(tv)
+		switch kind {
+		case "YearMonth":
+			switch unit {
+			case "MONTHS", "YEARS", "DECADES", "CENTURIES", "MILLENNIA", "ERAS":
+				return true
+			}
+			return false
+		case "LocalDate":
+			switch unit {
+			case "DAYS", "WEEKS", "MONTHS", "YEARS", "DECADES", "CENTURIES", "MILLENNIA", "ERAS":
+				return true
+			}
+			return false
+		case "LocalTime":
+			switch unit {
+			case "NANOS", "MICROS", "MILLIS", "SECONDS", "MINUTES", "HOURS", "HALF_DAYS":
+				return true
+			}
+			return false
+		default:
+			switch unit {
+			case "NANOS", "MICROS", "MILLIS", "SECONDS", "MINUTES", "HOURS", "HALF_DAYS",
+				"DAYS", "WEEKS", "MONTHS", "YEARS", "DECADES", "CENTURIES", "MILLENNIA", "ERAS":
+				return true
+			}
+			return false
+		}
+	}
+	return false
+}
+
 func evalIsSupportedChronoFieldPainless(recVal any, cf painlessChronoField) bool {
 	field := strings.ToUpper(string(cf))
 	switch tv := recVal.(type) {
@@ -386,6 +472,18 @@ func evalIsSupportedChronoFieldPainless(recVal any, cf painlessChronoField) bool
 	case painlessMonthDay:
 		switch field {
 		case "MONTH_OF_YEAR", "DAY_OF_MONTH":
+			return true
+		}
+		return false
+	case *painlessOffsetTime:
+		if tv == nil {
+			return false
+		}
+		switch field {
+		case "HOUR_OF_DAY", "CLOCK_HOUR_OF_DAY", "HOUR_OF_AMPM", "CLOCK_HOUR_OF_AMPM", "AMPM_OF_DAY",
+			"MINUTE_OF_HOUR", "MINUTE_OF_DAY", "SECOND_OF_MINUTE", "SECOND_OF_DAY",
+			"MILLI_OF_SECOND", "MILLI_OF_DAY", "MICRO_OF_SECOND", "MICRO_OF_DAY",
+			"NANO_OF_SECOND", "NANO_OF_DAY", "OFFSET_SECONDS":
 			return true
 		}
 		return false
@@ -430,6 +528,54 @@ func evalIsSupportedChronoFieldPainless(recVal any, cf painlessChronoField) bool
 
 func evalGetChronoFieldPainless(recVal any, cf painlessChronoField) (int64, error) {
 	field := strings.ToUpper(string(cf))
+	if ot, ok := recVal.(*painlessOffsetTime); ok && ot != nil {
+		switch field {
+		case "HOUR_OF_DAY":
+			return int64(ot.hour), nil
+		case "CLOCK_HOUR_OF_DAY":
+			if ot.hour == 0 {
+				return 24, nil
+			}
+			return int64(ot.hour), nil
+		case "HOUR_OF_AMPM":
+			return int64(ot.hour % 12), nil
+		case "CLOCK_HOUR_OF_AMPM":
+			h := ot.hour % 12
+			if h == 0 {
+				return 12, nil
+			}
+			return int64(h), nil
+		case "AMPM_OF_DAY":
+			if ot.hour >= 12 {
+				return 1, nil
+			}
+			return 0, nil
+		case "MINUTE_OF_HOUR":
+			return int64(ot.minute), nil
+		case "MINUTE_OF_DAY":
+			return int64(ot.hour*60 + ot.minute), nil
+		case "SECOND_OF_MINUTE":
+			return int64(ot.second), nil
+		case "SECOND_OF_DAY":
+			return int64(ot.hour*3600 + ot.minute*60 + ot.second), nil
+		case "MILLI_OF_SECOND":
+			return int64(ot.nano / 1_000_000), nil
+		case "MILLI_OF_DAY":
+			return int64(ot.hour*3600+ot.minute*60+ot.second)*1_000 + int64(ot.nano/1_000_000), nil
+		case "MICRO_OF_SECOND":
+			return int64(ot.nano / 1_000), nil
+		case "MICRO_OF_DAY":
+			return int64(ot.hour*3600+ot.minute*60+ot.second)*1_000_000 + int64(ot.nano/1_000), nil
+		case "NANO_OF_SECOND":
+			return int64(ot.nano), nil
+		case "NANO_OF_DAY":
+			return int64(ot.hour*3600+ot.minute*60+ot.second)*1_000_000_000 + int64(ot.nano), nil
+		case "OFFSET_SECONDS":
+			return int64(ot.offsetSeconds), nil
+		default:
+			return 0, &painlessExceptionError{exType: "UnsupportedTemporalTypeException", message: "Unsupported field: " + field}
+		}
+	}
 	if yr, ok := recVal.(painlessYear); ok {
 		switch field {
 		case "YEAR":
@@ -553,6 +699,67 @@ func evalGetChronoFieldPainless(recVal any, cf painlessChronoField) (int64, erro
 
 func evalWithChronoFieldPainless(recVal any, cf painlessChronoField, newVal int64) (any, error) {
 	field := strings.ToUpper(string(cf))
+	if ot, ok := recVal.(*painlessOffsetTime); ok && ot != nil {
+		h, m, s, n, off := ot.hour, ot.minute, ot.second, ot.nano, ot.offsetSeconds
+		switch field {
+		case "HOUR_OF_DAY":
+			h = int(newVal)
+		case "CLOCK_HOUR_OF_DAY":
+			if newVal == 24 {
+				h = 0
+			} else {
+				h = int(newVal)
+			}
+		case "HOUR_OF_AMPM":
+			h = (h/12)*12 + int(newVal)
+		case "CLOCK_HOUR_OF_AMPM":
+			v := int(newVal)
+			if v == 12 {
+				v = 0
+			}
+			h = (h/12)*12 + v
+		case "AMPM_OF_DAY":
+			h = (h % 12) + int(newVal)*12
+		case "MINUTE_OF_HOUR":
+			m = int(newVal)
+		case "MINUTE_OF_DAY":
+			if newVal < 0 || newVal >= 24*60 {
+				return nil, &painlessExceptionError{exType: "DateTimeException", message: fmt.Sprintf("Invalid value for MinuteOfDay: %d", newVal)}
+			}
+			h = int(newVal / 60)
+			m = int(newVal % 60)
+		case "SECOND_OF_MINUTE":
+			s = int(newVal)
+		case "SECOND_OF_DAY":
+			if newVal < 0 || newVal >= 86400 {
+				return nil, &painlessExceptionError{exType: "DateTimeException", message: fmt.Sprintf("Invalid value for SecondOfDay: %d", newVal)}
+			}
+			h = int(newVal / 3600)
+			m = int((newVal % 3600) / 60)
+			s = int(newVal % 60)
+		case "MILLI_OF_SECOND":
+			n = int(newVal) * 1_000_000
+		case "MILLI_OF_DAY":
+			return newPainlessOffsetTime(int(newVal/3_600_000), int((newVal%3_600_000)/60_000), int((newVal%60_000)/1_000), int((newVal%1_000)*1_000_000), off)
+		case "MICRO_OF_SECOND":
+			n = int(newVal) * 1_000
+		case "MICRO_OF_DAY":
+			return newPainlessOffsetTime(int(newVal/3_600_000_000), int((newVal%3_600_000_000)/60_000_000), int((newVal%60_000_000)/1_000_000), int((newVal%1_000_000)*1_000), off)
+		case "NANO_OF_SECOND":
+			n = int(newVal)
+		case "NANO_OF_DAY":
+			if newVal < 0 || newVal >= 86400*1_000_000_000 {
+				return nil, &painlessExceptionError{exType: "DateTimeException", message: fmt.Sprintf("Invalid value for NanoOfDay: %d", newVal)}
+			}
+			secOfDay := int(newVal / 1_000_000_000)
+			return newPainlessOffsetTime(secOfDay/3600, (secOfDay%3600)/60, secOfDay%60, int(newVal%1_000_000_000), off)
+		case "OFFSET_SECONDS":
+			off = int(newVal)
+		default:
+			return nil, &painlessExceptionError{exType: "UnsupportedTemporalTypeException", message: "Unsupported field: " + field}
+		}
+		return newPainlessOffsetTime(h, m, s, n, off)
+	}
 	if yr, ok := recVal.(painlessYear); ok {
 		switch field {
 		case "YEAR", "YEAR_OF_ERA":
@@ -2282,10 +2489,10 @@ var (
 	reLocalArrayRemoveIf   = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\.removeIf\(\s*\(?\s*(?:[a-zA-Z_$][a-zA-Z0-9_$<>[\]]*\s+)?([a-zA-Z0-9_$]+)\s*\)?\s*->\s*(.+)\s*\)$`)
 	reLocalCompoundAssign  = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*\??(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\s*(\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>>=|>>=)\s*(.+)$`)
 	reLocalPropAssign      = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*)\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)\s*=\s*(.+)$`)
-	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?Predicate|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
-	reNullVarDecl          = regexp.MustCompile(`^(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?Predicate|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
-	reVarTypeDeclPrefix    = regexp.MustCompile(`(?s)^((?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?Predicate|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*)\s+(.+)$`)
-	reUserFuncHeaderPrefix = regexp.MustCompile(`^(void|def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?Predicate|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics|[a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*<[^>]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
+	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?Predicate|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
+	reNullVarDecl          = regexp.MustCompile(`^(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?Predicate|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
+	reVarTypeDeclPrefix    = regexp.MustCompile(`(?s)^((?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?Predicate|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*)\s+(.+)$`)
+	reUserFuncHeaderPrefix = regexp.MustCompile(`^(void|def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?Predicate|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics|[a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*<[^>]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
 	reIdentAssign          = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
 	reIdentOnly            = regexp.MustCompile(`^[a-zA-Z_$][a-zA-Z0-9_$]*$`)
 	reSimpleFieldPath      = regexp.MustCompile(`^[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+$`)
@@ -2468,6 +2675,7 @@ type painlessUserFunc struct {
 
 type painlessMatcher struct {
 	re                      *regexp.Regexp
+	pat                     *painlessPattern
 	input                   string
 	curPos                  int
 	lastMatch               []int
@@ -2567,7 +2775,12 @@ func visiblePainlessMapKeys(m map[string]any) []string {
 		}
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	sort.Slice(keys, func(i, j int) bool {
+		if m != nil && (m["__descending"] != nil || m["__backing_map"] != nil) {
+			return comparePainlessValues(keys[i], keys[j]) < 0
+		}
+		return keys[i] < keys[j]
+	})
 	if m != nil && m["__descending"] == true {
 		for i, j := 0, len(keys)-1; i < j; i, j = i+1, j-1 {
 			keys[i], keys[j] = keys[j], keys[i]
@@ -6867,6 +7080,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		".find()", ".matches()", ".lookingAt()", ".group()", ".groupCount()", ".start()", ".end()", ".reset()", ".pattern()", ".flags()", ".regionStart()", ".regionEnd()",
 		".asPredicate()", ".asMatchPredicate()", ".results()", ".toMatchResult()", ".namedGroups()", ".hasTransparentBounds()", ".hasAnchoringBounds()", ".hitEnd()", ".requireEnd()", ".negate()",
 		".getCount()", ".getSum()", ".getMin()", ".getMax()", ".getAverage()",
+		".getMinimum()", ".getLargestMinimum()", ".getSmallestMaximum()", ".getMaximum()", ".isFixed()", ".isIntValue()", ".range()",
 		".isPresent()", ".get()", ".getAsInt()", ".getAsLong()", ".getAsDouble()", ".orElseThrow()", ".stream()",
 		".clone()", ".getClass()", ".getName()", ".getSimpleName()", ".getCanonicalName()", ".getTypeName()", ".name()", ".hashCode()",
 		".getMostSignificantBits()", ".getLeastSignificantBits()", ".version()", ".variant()", ".timestamp()", ".clockSequence()", ".node()",
@@ -7292,6 +7506,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				return fmt.Sprintf("%v", recVal), nil
 			case ".toString()":
 				if m, ok := recVal.(map[string]any); ok {
+					if _, isStats := isSummaryStatisticsMapPainless(m); isStats {
+						return formatSummaryStatisticsToStringPainless(m), nil
+					}
 					if excType, hasExc := m["__exc_type"].(string); hasExc && excType != "" {
 						msg, _ := m["message"].(string)
 						if msg != "" {
@@ -7573,8 +7790,13 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				if pp, ok := recVal.(*painlessPattern); ok && pp != nil {
 					return pp.raw, nil
 				}
-				if pm, ok := recVal.(*painlessMatcher); ok && pm != nil && pm.re != nil {
-					return pm.re.String(), nil
+				if pm, ok := recVal.(*painlessMatcher); ok && pm != nil {
+					if pm.pat != nil {
+						return pm.pat, nil
+					}
+					if pm.re != nil {
+						return &painlessPattern{re: pm.re, raw: pm.re.String()}, nil
+					}
 				}
 				pat := fmt.Sprintf("%v", recVal)
 				if isRawRegexLiteralPainless(pat) && len(pat) >= 2 && pat[0] == '/' && pat[len(pat)-1] == '/' {
@@ -7642,7 +7864,28 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						pm.lastMatch = nil
 						return false, nil
 					}
-					shifted := findSubmatchIndexFromPosPainless(pm.re, pm.input[:regEnd], pm.curPos)
+					var shifted []int
+					if pm.hasRegion && !pm.anchoringBoundsDisabled {
+						rel := findSubmatchIndexFromPosPainless(pm.re, pm.input[regStart:regEnd], pm.curPos-regStart)
+						if rel != nil {
+							shifted = make([]int, len(rel))
+							for i, v := range rel {
+								if v >= 0 {
+									shifted[i] = v + regStart
+								} else {
+									shifted[i] = -1
+								}
+							}
+						}
+					} else {
+						shifted = findSubmatchIndexFromPosPainless(pm.re, pm.input[:regEnd], pm.curPos)
+						if shifted != nil && pm.hasRegion && pm.anchoringBoundsDisabled && regEnd < len(pm.input) && shifted[1] == regEnd {
+							endAnchor, endMultiline := inspectEndAnchorPainless(pm.re.String())
+							if endAnchor == 'z' || (endAnchor == '$' && (!endMultiline || pm.input[regEnd] != '\n')) {
+								shifted = nil
+							}
+						}
+					}
 					if shifted == nil {
 						pm.lastMatch = nil
 						pm.curPos = regEnd + 1
@@ -7681,6 +7924,26 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						regStart = pm.regionStart
 						regEnd = pm.regionEnd
 					}
+					if pm.hasRegion && pm.anchoringBoundsDisabled {
+						if regStart > 0 {
+							anchor, multiline := inspectStartAnchorPainless(pm.re.String())
+							if anchor == 'A' || (anchor == '^' && (!multiline || pm.input[regStart-1] != '\n')) {
+								pm.lastMatch = nil
+								pm.lastSearchHitEnd = false
+								pm.lastSearchRequireEnd = false
+								return false, nil
+							}
+						}
+						if regEnd < len(pm.input) {
+							endAnchor, endMultiline := inspectEndAnchorPainless(pm.re.String())
+							if endAnchor == 'z' || (endAnchor == '$' && (!endMultiline || pm.input[regEnd] != '\n')) {
+								pm.lastMatch = nil
+								pm.lastSearchHitEnd = true
+								pm.lastSearchRequireEnd = false
+								return false, nil
+							}
+						}
+					}
 					fullRe, err := regexp.Compile("^(?:" + pm.re.String() + ")$")
 					if err != nil {
 						return false, nil
@@ -7717,6 +7980,15 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						regStart = pm.regionStart
 						regEnd = pm.regionEnd
 					}
+					if pm.hasRegion && pm.anchoringBoundsDisabled && regStart > 0 {
+						anchor, multiline := inspectStartAnchorPainless(pm.re.String())
+						if anchor == 'A' || (anchor == '^' && (!multiline || pm.input[regStart-1] != '\n')) {
+							pm.lastMatch = nil
+							pm.lastSearchHitEnd = false
+							pm.lastSearchRequireEnd = false
+							return false, nil
+						}
+					}
 					prefixRe, err := regexp.Compile("^(?:" + pm.re.String() + ")")
 					if err != nil {
 						return false, nil
@@ -7735,6 +8007,15 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 							}
 						}
 					}
+					if pm.hasRegion && pm.anchoringBoundsDisabled && regEnd < len(pm.input) && loc[1] == regEnd {
+						endAnchor, endMultiline := inspectEndAnchorPainless(pm.re.String())
+						if endAnchor == 'z' || (endAnchor == '$' && (!endMultiline || pm.input[regEnd] != '\n')) {
+							pm.lastMatch = nil
+							pm.lastSearchHitEnd = true
+							pm.lastSearchRequireEnd = false
+							return false, nil
+						}
+					}
 					pm.lastMatch = loc
 					pm.curPos = loc[1]
 					pm.lastSearchHitEnd = loc[1] == regEnd
@@ -7744,7 +8025,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				return false, nil
 			case ".group()":
 				if pm, ok := recVal.(*painlessMatcher); ok && pm != nil {
-					if len(pm.lastMatch) >= 2 && pm.lastMatch[0] >= 0 && pm.lastMatch[1] >= 0 {
+					if len(pm.lastMatch) < 2 || pm.lastMatch[0] < 0 {
+						return nil, &painlessExceptionError{exType: "IllegalStateException", message: "No match found"}
+					}
+					if pm.lastMatch[1] >= 0 {
 						return pm.input[pm.lastMatch[0]:pm.lastMatch[1]], nil
 					}
 				}
@@ -7755,12 +8039,18 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				}
 				return int64(0), nil
 			case ".start()":
-				if pm, ok := recVal.(*painlessMatcher); ok && pm != nil && len(pm.lastMatch) >= 2 && pm.lastMatch[0] >= 0 {
+				if pm, ok := recVal.(*painlessMatcher); ok && pm != nil {
+					if len(pm.lastMatch) < 2 || pm.lastMatch[0] < 0 {
+						return nil, &painlessExceptionError{exType: "IllegalStateException", message: "No match found"}
+					}
 					return int64(utf8.RuneCountInString(pm.input[:pm.lastMatch[0]])), nil
 				}
 				return int64(-1), nil
 			case ".end()":
-				if pm, ok := recVal.(*painlessMatcher); ok && pm != nil && len(pm.lastMatch) >= 2 && pm.lastMatch[1] >= 0 {
+				if pm, ok := recVal.(*painlessMatcher); ok && pm != nil {
+					if len(pm.lastMatch) < 2 || pm.lastMatch[0] < 0 || pm.lastMatch[1] < 0 {
+						return nil, &painlessExceptionError{exType: "IllegalStateException", message: "No match found"}
+					}
 					return int64(utf8.RuneCountInString(pm.input[:pm.lastMatch[1]])), nil
 				}
 				return int64(-1), nil
@@ -7859,7 +8149,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		".equals(", ".equalsIgnoreCase(", ".compareTo(", ".compareToIgnoreCase(", ".concat(", ".remove(", ".setValue(", ".set(", ".addAll(", ".add(", ".putAll(", ".putIfAbsent(", ".put(", ".sort(",
 		".plusYears(", ".minusYears(", ".plusMonths(", ".minusMonths(", ".plusWeeks(", ".minusWeeks(", ".plusDays(", ".minusDays(",
 		".plusHours(", ".minusHours(", ".plusMinutes(", ".minusMinutes(", ".plusSeconds(", ".minusSeconds(", ".plusMillis(", ".minusMillis(", ".plusNanos(", ".minusNanos(",
-		".plus(", ".minus(", ".multipliedBy(", ".atDay(", ".atMonthDay(", ".atMonth(", ".atYear(", ".atDate(", ".atTime(", ".atStartOfDay(", ".isValidYear(", ".isSupported(",
+		".plus(", ".minus(", ".multipliedBy(", ".atDay(", ".atMonthDay(", ".atMonth(", ".atYear(", ".atDate(", ".atTime(", ".atOffset(", ".atStartOfDay(", ".isValidYear(", ".isSupported(", ".range(", ".isValidValue(", ".isValidIntValue(",
 		".subtract(", ".multiply(", ".divide(", ".remainder(", ".pow(", ".setScale(", ".min(", ".max(",
 		".withYear(", ".withMonth(", ".withDayOfMonth(", ".withHour(", ".withMinute(", ".withSecond(", ".withNano(", ".truncatedTo(",
 		".withZoneSameInstant(", ".withZoneSameLocal(", ".withZone(", ".withLocale(", ".with(",
@@ -7893,6 +8183,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				(mName == ".format(" && recExpr == "String") ||
 				(mName == ".join(" && recExpr == "String") ||
 				(mName == ".concat(" && (recExpr == "Stream" || recExpr == "IntStream" || recExpr == "LongStream" || recExpr == "DoubleStream")) ||
+				(mName == ".range(" && (recExpr == "IntStream" || recExpr == "LongStream" || recExpr == "EnumSet" || strings.HasSuffix(recExpr, ".IntStream") || strings.HasSuffix(recExpr, ".LongStream") || strings.HasSuffix(recExpr, ".EnumSet"))) ||
 				((mName == ".decode(" || mName == ".encode(") && (recExpr == "Integer" || recExpr == "Long" || recExpr == "Short" || recExpr == "Byte" || recExpr == "URLDecoder" || recExpr == "URLEncoder")) ||
 				((mName == ".fromHexDigits(" || mName == ".fromHexDigitsToLong(" || mName == ".isHexDigit(" || mName == ".fromHexDigit(") && (recExpr == "HexFormat" || recExpr == "java.util.HexFormat")) ||
 				((mName == ".min(" || mName == ".max(" || mName == ".pow(" || mName == ".floor(") && (recExpr == "Math" || recExpr == "StrictMath" || recExpr == "Collections" || recExpr == "Integer" || recExpr == "Long" || recExpr == "Double" || recExpr == "Float")) {
@@ -9045,6 +9336,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 								out.WriteString(pm.input[lastPos:shifted[0]])
 								params[pName] = &painlessMatcher{
 									re:          pm.re,
+									pat:         pm.pat,
 									input:       pm.input,
 									curPos:      shifted[1],
 									lastMatch:   shifted,
@@ -9190,6 +9482,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				return recVal, nil
 			case ".appendReplacement(":
 				if pm, isMatcher := recVal.(*painlessMatcher); isMatcher && pm != nil {
+					if len(pm.lastMatch) < 2 || pm.lastMatch[0] < 0 {
+						return nil, &painlessExceptionError{exType: "IllegalStateException", message: "No match found"}
+					}
 					args := splitTopLevelCommaPainless(argExpr)
 					if len(args) >= 2 {
 						sbVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
@@ -9200,7 +9495,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						if err != nil {
 							return nil, err
 						}
-						if sb, isSB := sbVal.(*painlessStringBuilder); isSB && sb != nil && len(pm.lastMatch) >= 2 && pm.lastMatch[0] >= 0 {
+						if sb, isSB := sbVal.(*painlessStringBuilder); isSB && sb != nil {
 							startPos := pm.appendPos
 							if pm.hasRegion && startPos < pm.regionStart {
 								startPos = pm.regionStart
@@ -9253,24 +9548,21 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				if pm, isMatcher := recVal.(*painlessMatcher); isMatcher && pm != nil {
 					args := splitTopLevelCommaPainless(argExpr)
 					if len(args) >= 2 {
-						sVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
-						eVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+						sVal, err0 := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+						if err0 != nil {
+							return nil, err0
+						}
+						eVal, err1 := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+						if err1 != nil {
+							return nil, err1
+						}
 						sf, sOk := toFloat64(sVal)
 						ef, eOk := toFloat64(eVal)
 						if sOk && eOk {
 							runes := []rune(pm.input)
 							st, en := int(sf), int(ef)
-							if st < 0 {
-								st = 0
-							}
-							if st > len(runes) {
-								st = len(runes)
-							}
-							if en < st {
-								en = st
-							}
-							if en > len(runes) {
-								en = len(runes)
+							if st < 0 || en < 0 || st > len(runes) || en > len(runes) || st > en {
+								return nil, &painlessExceptionError{exType: "IndexOutOfBoundsException", message: "Illegal region bounds"}
 							}
 							sByte := len(string(runes[:st]))
 							eByte := len(string(runes[:en]))
@@ -9366,6 +9658,15 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					return evalGetChronoFieldPainless(recVal, cf)
 				}
 				return nil, nil
+			case ".range(":
+				cfVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(argExpr), params, depth+1)
+				if err != nil {
+					return nil, err
+				}
+				if cf, ok := parseChronoFieldArgPainless(cfVal); ok {
+					return evalTemporalRangePainless(recVal, cf)
+				}
+				return nil, &painlessExceptionError{exType: "UnsupportedTemporalTypeException", message: fmt.Sprintf("Unsupported field: %v", cfVal)}
 			case ".isSupported(":
 				cfVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(argExpr), params, depth+1)
 				if err != nil {
@@ -9373,6 +9674,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				}
 				if cf, ok := parseChronoFieldArgPainless(cfVal); ok {
 					return evalIsSupportedChronoFieldPainless(recVal, cf), nil
+				}
+				if unit, ok := parseChronoUnitArgPainless(cfVal, argExpr); ok {
+					return evalIsSupportedChronoUnitPainless(recVal, recExpr, unit), nil
 				}
 				return false, nil
 			case ".with(":
@@ -9416,7 +9720,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					if err != nil {
 						return nil, err
 					}
-					return evalTemporalBetweenUnitPainless(unitVal, recVal, endVal), nil
+					return evalTemporalBetweenUnitPainless(unitVal, recVal, endVal)
 				}
 				return int64(0), nil
 			case ".datesUntil(":
@@ -9447,9 +9751,31 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					if err != nil {
 						return nil, err
 					}
-					return evalTemporalBetweenUnitPainless(recVal, v1, v2), nil
+					return evalTemporalBetweenUnitPainless(recVal, v1, v2)
 				}
 				return int64(0), nil
+			case ".atOffset(":
+				offVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(argExpr), params, depth+1)
+				if err != nil {
+					return nil, err
+				}
+				offSec, okO := parseZoneOffsetSecondsPainless(offVal)
+				if !okO {
+					return nil, &painlessExceptionError{exType: "DateTimeException", message: fmt.Sprintf("Invalid ZoneOffset: %v", offVal)}
+				}
+				if s, isStr := recVal.(string); isStr {
+					if !strings.Contains(s, "-") {
+						if h, m, sec, n, okT := parseLocalTimeComponentsPainless(s); okT {
+							return newPainlessOffsetTime(h, m, sec, n, offSec)
+						}
+					}
+					if tm, okD := parsePainlessDateTime(s); okD {
+						loc := time.FixedZone("UTC", offSec)
+						zTm := time.Date(tm.Year(), tm.Month(), tm.Day(), tm.Hour(), tm.Minute(), tm.Second(), tm.Nanosecond(), loc)
+						return zTm.Format(time.RFC3339Nano), nil
+					}
+				}
+				return nil, nil
 			case ".atDate(":
 				if tm, ok := parsePainlessDateTime(recVal); ok {
 					dVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(argExpr), params, depth+1)
@@ -9854,24 +10180,27 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					inStr = fmt.Sprintf("%v", argVal)
 				}
 				if pp, ok := recVal.(*painlessPattern); ok && pp != nil {
-					return &painlessMatcher{re: pp.re, input: inStr}, nil
+					return &painlessMatcher{re: pp.re, pat: pp, input: inStr}, nil
 				}
 				patStr := fmt.Sprintf("%v", recVal)
 				if !isQuotedStringExprPainless(recExpr) && isRawRegexLiteralPainless(patStr) && len(patStr) >= 2 && patStr[0] == '/' && patStr[len(patStr)-1] == '/' {
 					patStr = strings.ReplaceAll(patStr[1:len(patStr)-1], `\/`, `/`)
 				}
 				re, _ := compilePainlessRegexp(patStr)
-				return &painlessMatcher{re: re, input: inStr}, nil
+				return &painlessMatcher{re: re, pat: &painlessPattern{re: re, raw: patStr}, input: inStr}, nil
 			case ".find(":
 				if pm, ok := recVal.(*painlessMatcher); ok && pm != nil && argVal != nil {
 					if f, fOk := toFloat64(argVal); fOk {
 						runeStart := int(f)
 						runes := []rune(pm.input)
+						if runeStart < 0 || runeStart > len(runes) {
+							return false, &painlessExceptionError{exType: "IndexOutOfBoundsException", message: "Illegal start index"}
+						}
 						pm.hasRegion = false
 						pm.regionStart = 0
 						pm.regionEnd = len(pm.input)
 						pm.appendPos = 0
-						if pm.re == nil || runeStart < 0 || runeStart > len(runes) {
+						if pm.re == nil {
 							pm.lastMatch = nil
 							return false, nil
 						}
@@ -9969,6 +10298,33 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				}
 				return "", nil
 			case ".format(":
+				if ot, isOT := recVal.(*painlessOffsetTime); isOT && ot != nil {
+					if argVal == nil {
+						return "", &painlessExceptionError{exType: "NullPointerException", message: "formatter"}
+					}
+					fStr := strings.TrimSpace(fmt.Sprintf("%v", argVal))
+					if fStr == "ISO_OFFSET_TIME" || fStr == "DateTimeFormatter.ISO_OFFSET_TIME" || fStr == "ISO_TIME" || fStr == "DateTimeFormatter.ISO_TIME" {
+						return ot.String(), nil
+					}
+					layout, loc := splitFormatterAndZonePainless(argVal)
+					tm := time.Date(1970, 1, 1, ot.hour, ot.minute, ot.second, ot.nano, time.FixedZone("UTC", ot.offsetSeconds))
+					if loc != nil {
+						tm = tm.In(loc)
+					}
+					return tm.Format(layout), nil
+				}
+				if ot, isOT := argVal.(*painlessOffsetTime); isOT && ot != nil {
+					fStr := strings.TrimSpace(fmt.Sprintf("%v", recVal))
+					if fStr == "ISO_OFFSET_TIME" || fStr == "DateTimeFormatter.ISO_OFFSET_TIME" || fStr == "ISO_TIME" || fStr == "DateTimeFormatter.ISO_TIME" {
+						return ot.String(), nil
+					}
+					layout, loc := splitFormatterAndZonePainless(recVal)
+					tm := time.Date(1970, 1, 1, ot.hour, ot.minute, ot.second, ot.nano, time.FixedZone("UTC", ot.offsetSeconds))
+					if loc != nil {
+						tm = tm.In(loc)
+					}
+					return tm.Format(layout), nil
+				}
 				if isGoDateTimeLayoutPainless(recVal, recExpr) {
 					if tm, ok := parsePainlessDateTime(argVal); ok {
 						layout, loc := splitFormatterAndZonePainless(recVal)
@@ -10010,21 +10366,31 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				return recVal, nil
 			case ".group(":
 				if pm, ok := recVal.(*painlessMatcher); ok && pm != nil && argVal != nil {
+					if len(pm.lastMatch) < 2 || pm.lastMatch[0] < 0 {
+						return nil, &painlessExceptionError{exType: "IllegalStateException", message: "No match found"}
+					}
 					if gName, isStr := argVal.(string); isStr {
+						idx := -1
 						if pm.re != nil {
-							idx := pm.re.SubexpIndex(gName)
-							if idx >= 0 && 2*idx+1 < len(pm.lastMatch) {
-								sIdx, eIdx := pm.lastMatch[2*idx], pm.lastMatch[2*idx+1]
-								if sIdx >= 0 && eIdx >= 0 {
-									return pm.input[sIdx:eIdx], nil
-								}
+							idx = pm.re.SubexpIndex(gName)
+						}
+						if idx < 0 {
+							return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "No group with name <" + gName + ">"}
+						}
+						if 2*idx+1 < len(pm.lastMatch) {
+							sIdx, eIdx := pm.lastMatch[2*idx], pm.lastMatch[2*idx+1]
+							if sIdx >= 0 && eIdx >= 0 {
+								return pm.input[sIdx:eIdx], nil
 							}
 						}
 						return nil, nil
 					}
 					if f, fOk := toFloat64(argVal); fOk {
 						idx := int(f)
-						if idx >= 0 && 2*idx+1 < len(pm.lastMatch) {
+						if idx < 0 || (pm.re != nil && idx > pm.re.NumSubexp()) {
+							return nil, &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("No group %d", idx)}
+						}
+						if 2*idx+1 < len(pm.lastMatch) {
 							sIdx, eIdx := pm.lastMatch[2*idx], pm.lastMatch[2*idx+1]
 							if sIdx >= 0 && eIdx >= 0 {
 								return pm.input[sIdx:eIdx], nil
@@ -10036,13 +10402,22 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				return nil, nil
 			case ".start(", ".end(":
 				if pm, ok := recVal.(*painlessMatcher); ok && pm != nil && argVal != nil {
+					if len(pm.lastMatch) < 2 || pm.lastMatch[0] < 0 {
+						return nil, &painlessExceptionError{exType: "IllegalStateException", message: "No match found"}
+					}
 					idx := -1
 					if gName, isStr := argVal.(string); isStr {
 						if pm.re != nil {
 							idx = pm.re.SubexpIndex(gName)
 						}
+						if idx < 0 {
+							return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "No group with name <" + gName + ">"}
+						}
 					} else if f, fOk := toFloat64(argVal); fOk {
 						idx = int(f)
+						if idx < 0 || (pm.re != nil && idx > pm.re.NumSubexp()) {
+							return nil, &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("No group %d", idx)}
+						}
 					}
 					if idx >= 0 && 2*idx+1 < len(pm.lastMatch) {
 						pos := pm.lastMatch[2*idx]
@@ -10263,7 +10638,17 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					return recVal, nil
 				}
 				if cf, ok := parseChronoFieldArgPainless(argVal); ok {
-					return evalGetChronoFieldPainless(recVal, cf)
+					val, err := evalGetChronoFieldPainless(recVal, cf)
+					if err != nil {
+						return nil, err
+					}
+					if vr, errR := evalChronoFieldRangePainless(cf); errR == nil && vr != nil && !vr.isIntValue() {
+						return nil, &painlessExceptionError{exType: "UnsupportedTemporalTypeException", message: fmt.Sprintf("Invalid field %s for get() method, use getLong() instead", cf)}
+					}
+					if val < math.MinInt32 || val > math.MaxInt32 {
+						return nil, &painlessExceptionError{exType: "DateTimeException", message: fmt.Sprintf("Invalid value for %s (valid values -2147483648 - 2147483647): %d", cf, val)}
+					}
+					return val, nil
 				}
 				if (recExpr == "ctx" || recExpr == "ctx?") && params["ctx"] == nil && argVal != nil {
 					v, _ := lookupCtxMapKeyPainless(fmt.Sprintf("%v", argVal), sourceMap, params)
@@ -11495,26 +11880,12 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		return "HALF_EVEN", nil
 	case "RoundingMode.UNNECESSARY", "BigDecimal.ROUND_UNNECESSARY":
 		return "UNNECESSARY", nil
-	case "ChronoUnit.YEARS":
-		return "YEARS", nil
-	case "ChronoUnit.MONTHS":
-		return "MONTHS", nil
-	case "ChronoUnit.WEEKS":
-		return "WEEKS", nil
-	case "ChronoUnit.DAYS":
-		return "DAYS", nil
-	case "ChronoUnit.HOURS":
-		return "HOURS", nil
-	case "ChronoUnit.MINUTES":
-		return "MINUTES", nil
-	case "ChronoUnit.SECONDS":
-		return "SECONDS", nil
-	case "ChronoUnit.MILLIS":
-		return "MILLIS", nil
-	case "ChronoUnit.MICROS":
-		return "MICROS", nil
-	case "ChronoUnit.NANOS":
-		return "NANOS", nil
+	case "ChronoUnit.YEARS", "ChronoUnit.MONTHS", "ChronoUnit.WEEKS", "ChronoUnit.DAYS",
+		"ChronoUnit.HALF_DAYS", "ChronoUnit.HOURS", "ChronoUnit.MINUTES", "ChronoUnit.SECONDS",
+		"ChronoUnit.MILLIS", "ChronoUnit.MICROS", "ChronoUnit.NANOS",
+		"ChronoUnit.DECADES", "ChronoUnit.CENTURIES", "ChronoUnit.MILLENNIA",
+		"ChronoUnit.ERAS", "ChronoUnit.FOREVER":
+		return strings.TrimPrefix(constRhs, "ChronoUnit."), nil
 	case "Math.PI", "StrictMath.PI":
 		return math.Pi, nil
 	case "Math.E", "StrictMath.E":
@@ -11613,6 +11984,8 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		return "15:04:05.999999999", nil
 	case "DateTimeFormatter.ISO_LOCAL_DATE_TIME":
 		return "2006-01-02T15:04:05", nil
+	case "DateTimeFormatter.ISO_OFFSET_TIME":
+		return "15:04:05Z07:00", nil
 	case "DateTimeFormatter.ISO_OFFSET_DATE_TIME", "DateTimeFormatter.ISO_ZONED_DATE_TIME", "DateTimeFormatter.ISO_INSTANT", "DateTimeFormatter.ISO_DATE_TIME":
 		return time.RFC3339Nano, nil
 	case "ZoneOffset.UTC":
@@ -15290,6 +15663,11 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 				}
 				return "null", true, nil
 			}
+			if m, okM := v1.(map[string]any); okM {
+				if _, isStats := isSummaryStatisticsMapPainless(m); isStats {
+					return formatSummaryStatisticsToStringPainless(m), true, nil
+				}
+			}
 			return fmt.Sprintf("%v", v1), true, nil
 		}
 		return "null", true, nil
@@ -15377,6 +15755,11 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 					return "", true, &painlessExceptionError{exType: "NullPointerException", message: "Cannot read the array length because \"data\" is null"}
 				}
 				return "null", true, nil
+			}
+			if m, okM := v.(map[string]any); okM {
+				if _, isStats := isSummaryStatisticsMapPainless(m); isStats {
+					return formatSummaryStatisticsToStringPainless(m), true, nil
+				}
 			}
 			return fmt.Sprintf("%v", v), true, nil
 		}
@@ -16880,8 +17263,24 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 		return nil, true, nil
 	case "Duration.between":
 		if len(args) >= 2 {
-			v1, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
-			v2, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+			v1, err1 := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err1 != nil {
+				return time.Duration(0), true, err1
+			}
+			v2, err2 := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+			if err2 != nil {
+				return time.Duration(0), true, err2
+			}
+			if ot1, okOT1 := v1.(*painlessOffsetTime); okOT1 && ot1 != nil {
+				if ot2, okOT2 := parsePainlessOffsetTime(v2); okOT2 && ot2 != nil {
+					return time.Duration(ot2.toEpochNanoOnZeroDay() - ot1.toEpochNanoOnZeroDay()), true, nil
+				}
+			}
+			if ot2, okOT2 := v2.(*painlessOffsetTime); okOT2 && ot2 != nil {
+				if ot1, okOT1 := parsePainlessOffsetTime(v1); okOT1 && ot1 != nil {
+					return time.Duration(ot2.toEpochNanoOnZeroDay() - ot1.toEpochNanoOnZeroDay()), true, nil
+				}
+			}
 			t1, ok1 := parsePainlessDateTime(v1)
 			t2, ok2 := parsePainlessDateTime(v2)
 			if ok1 && ok2 {
@@ -17007,7 +17406,8 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 				return int64(0), true, err2
 			}
 			unitName := strings.TrimSuffix(strings.TrimPrefix(fnName, "ChronoUnit."), ".between")
-			return evalTemporalBetweenUnitPainless(unitName, v1, v2), true, nil
+			res, errB := evalTemporalBetweenUnitPainless(unitName, v1, v2)
+			return res, true, errB
 		}
 		return int64(0), true, nil
 	case "TemporalAdjusters.firstDayOfMonth", "TemporalAdjusters.lastDayOfMonth", "TemporalAdjusters.firstDayOfNextMonth",
@@ -17341,6 +17741,16 @@ func comparePainlessValues(a, b any) int {
 	}
 	if b == nil {
 		return 1
+	}
+	if ua, okA := a.(*painlessURI); okA && ua != nil {
+		if ub, okB := b.(*painlessURI); okB && ub != nil {
+			return int(ua.compareTo(ub))
+		}
+	}
+	if ota, okA := a.(*painlessOffsetTime); okA && ota != nil {
+		if otb, okB := b.(*painlessOffsetTime); okB && otb != nil {
+			return int(ota.compareTo(otb))
+		}
 	}
 	if ya, okA := a.(painlessYear); okA {
 		if yb, okB := b.(painlessYear); okB {
@@ -19112,7 +19522,13 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 							}
 							return nil, true, err
 						}
-						if subArr, ok := mv.([]any); ok {
+						if opt, isOpt := mv.(*painlessOptional); isOpt {
+							if opt != nil && opt.present && len(flattened) < MaxPainlessSliceItems {
+								flattened = append(flattened, coerceElem(opt.val))
+							}
+						} else if mv == painlessEmptyOptional {
+							// Empty Optional.stream() produces no elements
+						} else if subArr, ok := mv.([]any); ok {
 							for _, el := range subArr {
 								if len(flattened) >= MaxPainlessSliceItems {
 									break
@@ -19384,7 +19800,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 				}
 			}
 			terminalVal = acc
-		case "forEach":
+		case "forEach", "forEachOrdered":
 			hasTerminal = true
 			prevTmp, hadTmp := params["__stream_items"]
 			params["__stream_items"] = items
@@ -19445,7 +19861,7 @@ func evalStreamCollectorPainless(collectorExpr string, items []any, sourceMap, p
 		}
 		return prefix + strings.Join(parts, delim) + suffix, nil
 	}
-	if cExpr == "Collectors.toSet()" {
+	if cExpr == "Collectors.toSet()" || cExpr == "Collectors.toUnmodifiableSet()" {
 		dedup := make([]any, 0, len(items))
 		for _, it := range items {
 			seen := false
@@ -19460,6 +19876,33 @@ func evalStreamCollectorPainless(collectorExpr string, items []any, sourceMap, p
 			}
 		}
 		return dedup, nil
+	}
+	if strings.HasPrefix(cExpr, "Collectors.toCollection(") && strings.HasSuffix(cExpr, ")") {
+		supArg := strings.TrimSpace(cExpr[len("Collectors.toCollection(") : len(cExpr)-1])
+		isSet := strings.Contains(supArg, "Set")
+		isTreeSet := strings.Contains(supArg, "TreeSet")
+		out := make([]any, 0, len(items))
+		for _, it := range items {
+			if isSet {
+				seen := false
+				for _, ex := range out {
+					if painlessValuesEqual(it, ex) {
+						seen = true
+						break
+					}
+				}
+				if seen {
+					continue
+				}
+			}
+			out = append(out, it)
+		}
+		if isTreeSet {
+			sort.SliceStable(out, func(i, j int) bool {
+				return comparePainlessValues(out[i], out[j]) < 0
+			})
+		}
+		return out, nil
 	}
 	if cExpr == "Collectors.counting()" {
 		return int64(len(items)), nil
@@ -19550,6 +19993,12 @@ func evalStreamCollectorPainless(collectorExpr string, items []any, sourceMap, p
 						if err != nil {
 							return nil, err
 						}
+						if isUnmod && (kVal == nil || kVal == painlessEmptyOptional) {
+							return nil, &painlessExceptionError{exType: "NullPointerException", message: "toUnmodifiableMap does not permit null keys"}
+						}
+						if vVal == nil || vVal == painlessEmptyOptional {
+							return nil, &painlessExceptionError{exType: "NullPointerException", message: "toMap does not permit null values"}
+						}
 						kStr := fmt.Sprintf("%v", kVal)
 						if prevEntry, exists := resMap[kStr]; exists {
 							if len(mapArgs) < 3 {
@@ -19630,7 +20079,9 @@ func evalStreamCollectorPainless(collectorExpr string, items []any, sourceMap, p
 		}
 		resMap := make(map[string]any, len(groups))
 		downstream := "Collectors.toList()"
-		if len(grpArgs) >= 2 {
+		if len(grpArgs) >= 3 {
+			downstream = strings.TrimSpace(grpArgs[2])
+		} else if len(grpArgs) >= 2 {
 			downstream = strings.TrimSpace(grpArgs[1])
 		}
 		for _, kStr := range keyOrder {
@@ -19837,6 +20288,9 @@ func evalStreamCollectorPainless(collectorExpr string, items []any, sourceMap, p
 				}
 			}
 		}
+		if len(redArgs) == 1 {
+			return newPainlessOptional("Optional", hasAcc && !isEmptyOptionalOrNilPainless(acc), acc), nil
+		}
 		return acc, nil
 	}
 	if strings.HasPrefix(cExpr, "Collectors.mapping(") && strings.HasSuffix(cExpr, ")") {
@@ -19936,7 +20390,13 @@ func evalStreamCollectorPainless(collectorExpr string, items []any, sourceMap, p
 							}
 							return nil, err
 						}
-						if subArr, ok := mv.([]any); ok {
+						if opt, isOpt := mv.(*painlessOptional); isOpt {
+							if opt != nil && opt.present && len(flattened) < MaxPainlessSliceItems {
+								flattened = append(flattened, opt.val)
+							}
+						} else if mv == painlessEmptyOptional {
+							// Empty Optional.stream() produces no elements
+						} else if subArr, ok := mv.([]any); ok {
 							for _, el := range subArr {
 								if len(flattened) >= MaxPainlessSliceItems {
 									break
@@ -19996,18 +20456,20 @@ func evalStreamCollectorPainless(collectorExpr string, items []any, sourceMap, p
 	for _, mmPfx := range []string{"Collectors.minBy(", "Collectors.maxBy("} {
 		if strings.HasPrefix(cExpr, mmPfx) && strings.HasSuffix(cExpr, ")") {
 			if len(items) == 0 {
-				return nil, nil
+				return newPainlessOptional("Optional", false, nil), nil
 			}
 			cmpArg := strings.TrimSpace(cExpr[len(mmPfx) : len(cExpr)-1])
-			cp := make([]any, len(items))
-			copy(cp, items)
-			if err := sortPainlessSliceInPlace(cp, cmpArg, sourceMap, params, depth+1); err != nil {
-				return nil, err
+			best := items[0]
+			for i := 1; i < len(items); i++ {
+				cmpRes, err := evalPainlessComparatorPair(cmpArg, items[i], best, sourceMap, params, depth+1)
+				if err != nil {
+					return nil, err
+				}
+				if (mmPfx == "Collectors.minBy(" && cmpRes < 0) || (mmPfx == "Collectors.maxBy(" && cmpRes > 0) {
+					best = items[i]
+				}
 			}
-			if mmPfx == "Collectors.minBy(" {
-				return cp[0], nil
-			}
-			return cp[len(cp)-1], nil
+			return newPainlessOptional("Optional", true, best), nil
 		}
 	}
 	if strings.Contains(cExpr, "toSet") {
@@ -20033,8 +20495,8 @@ func isStreamStepMethodPainless(name string) bool {
 	case "filter", "takeWhile", "dropWhile", "map", "mapToObj", "mapToInt", "mapToLong", "mapToDouble",
 		"flatMap", "flatMapToInt", "flatMapToLong", "flatMapToDouble",
 		"distinct", "sorted", "limit", "skip", "peek", "boxed", "asDoubleStream", "asLongStream",
-		"collect", "toList", "count", "sum", "average", "min", "max", "findFirst", "findAny",
-		"anyMatch", "allMatch", "noneMatch", "reduce", "summaryStatistics":
+		"collect", "toList", "toArray", "count", "sum", "average", "min", "max", "findFirst", "findAny",
+		"anyMatch", "allMatch", "noneMatch", "reduce", "summaryStatistics", "forEach", "forEachOrdered":
 		return true
 	}
 	return false
@@ -20344,6 +20806,8 @@ func resolveDateTimeFormatterLayoutPainless(fmtVal any) string {
 		return "2006-01-02"
 	case "ISO_LOCAL_TIME", "ISO_TIME", "DateTimeFormatter.ISO_LOCAL_TIME", "DateTimeFormatter.ISO_TIME":
 		return "15:04:05"
+	case "ISO_OFFSET_TIME", "DateTimeFormatter.ISO_OFFSET_TIME":
+		return "15:04:05Z07:00"
 	case "BASIC_ISO_DATE", "DateTimeFormatter.BASIC_ISO_DATE":
 		return "20060102"
 	case "ISO_LOCAL_DATE_TIME", "DateTimeFormatter.ISO_LOCAL_DATE_TIME":
@@ -20664,6 +21128,81 @@ func inspectStartAnchorPainless(pat string) (anchorType byte, multiline bool) {
 			commonAnchor = bAnchor
 		} else if commonAnchor != bAnchor {
 			commonAnchor = '^'
+		}
+	}
+	return commonAnchor, multiline
+}
+
+func inspectEndAnchorPainless(pat string) (anchorType byte, multiline bool) {
+	s := pat
+	for len(s) > 0 {
+		if strings.HasPrefix(s, "(?") {
+			idx := 2
+			neg := false
+			localM := multiline
+			validFlags := true
+			for idx < len(s) && s[idx] != ')' && s[idx] != ':' {
+				ch := s[idx]
+				switch ch {
+				case '-':
+					neg = true
+				case 'm':
+					localM = !neg
+				case 'i', 's', 'U':
+				default:
+					validFlags = false
+				}
+				if !validFlags {
+					break
+				}
+				idx++
+			}
+			if validFlags && idx < len(s) && s[idx] == ')' {
+				multiline = localM
+				s = s[idx+1:]
+				continue
+			}
+			if validFlags && idx < len(s) && s[idx] == ':' {
+				if closeIdx := findMatchingDelimiter(s, 0, '(', ')'); closeIdx == len(s)-1 {
+					multiline = localM
+					s = s[idx+1 : closeIdx]
+					continue
+				}
+			}
+		}
+		if len(s) >= 2 && s[0] == '(' && !strings.HasPrefix(s, "(?") {
+			if closeIdx := findMatchingDelimiter(s, 0, '(', ')'); closeIdx == len(s)-1 {
+				s = s[1:closeIdx]
+				continue
+			}
+		}
+		break
+	}
+	branches := splitTopLevelRegexBranchesPainless(s)
+	if len(branches) == 0 {
+		return 0, multiline
+	}
+	countTrailingBackslashes := func(str string) int {
+		n := 0
+		for i := len(str) - 1; i >= 0 && str[i] == '\\'; i-- {
+			n++
+		}
+		return n
+	}
+	var commonAnchor byte
+	for _, br := range branches {
+		var bAnchor byte
+		if (strings.HasSuffix(br, `\z`) || strings.HasSuffix(br, `\Z`)) && countTrailingBackslashes(br[:len(br)-1])%2 == 1 {
+			bAnchor = 'z'
+		} else if strings.HasSuffix(br, "$") && countTrailingBackslashes(br[:len(br)-1])%2 == 0 {
+			bAnchor = '$'
+		} else {
+			return 0, multiline
+		}
+		if commonAnchor == 0 {
+			commonAnchor = bAnchor
+		} else if commonAnchor != bAnchor {
+			commonAnchor = '$'
 		}
 	}
 	return commonAnchor, multiline
@@ -21346,10 +21885,48 @@ func evalHexFormatMethodPainless(mName string, recVal any, argExpr string, sourc
 	return recVal, nil
 }
 
+func sortedNavigableMapKeysPainless(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		if isInternalPainlessMapKey(m, k) {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	desc := m != nil && m["__descending"] == true
+	sort.Slice(keys, func(i, j int) bool {
+		cmp := comparePainlessValues(keys[i], keys[j])
+		if desc {
+			return cmp > 0
+		}
+		return cmp < 0
+	})
+	return keys
+}
+
+func syncMutatedMapExprPainless(recExpr string, sourceMap, params map[string]any) {
+	recExpr = strings.TrimSpace(recExpr)
+	if recExpr == "" {
+		return
+	}
+	for _, pfx := range []string{"ctx?._source?.", "ctx?._source.", "ctx._source?.", "ctx._source."} {
+		if strings.HasPrefix(recExpr, pfx) {
+			relPath := strings.TrimSuffix(strings.TrimPrefix(recExpr, pfx), "?")
+			syncSourceAliasToLocalVars(sourceMap, params, relPath)
+			return
+		}
+	}
+	cleanRec := strings.TrimSuffix(recExpr, "?")
+	mapPath := normalizeLocalLHSPath(strings.Split(cleanRec, "."), params)
+	if len(mapPath) > 0 {
+		syncLocalVarAlias(sourceMap, params, decodeBracketSeg(mapPath[0]))
+	}
+}
+
 func evalCollectionZeroArgMethodPainless(mSuffix, recExpr string, recVal any, sourceMap, params map[string]any) (any, error) {
 	switch tv := recVal.(type) {
 	case map[string]any:
-		keys := visiblePainlessMapKeys(tv)
+		keys := sortedNavigableMapKeysPainless(tv)
 		switch mSuffix {
 		case ".firstKey()":
 			if len(keys) == 0 {
@@ -21380,6 +21957,10 @@ func evalCollectionZeroArgMethodPainless(mSuffix, recExpr string, recVal any, so
 			k := keys[0]
 			v := tv[k]
 			delete(tv, k)
+			if bm, ok := tv["__backing_map"].(map[string]any); ok && bm != nil {
+				delete(bm, k)
+			}
+			syncMutatedMapExprPainless(recExpr, sourceMap, params)
 			return map[string]any{"key": k, "value": v}, nil
 		case ".pollLastEntry()":
 			if len(keys) == 0 {
@@ -21388,6 +21969,10 @@ func evalCollectionZeroArgMethodPainless(mSuffix, recExpr string, recVal any, so
 			k := keys[len(keys)-1]
 			v := tv[k]
 			delete(tv, k)
+			if bm, ok := tv["__backing_map"].(map[string]any); ok && bm != nil {
+				delete(bm, k)
+			}
+			syncMutatedMapExprPainless(recExpr, sourceMap, params)
 			return map[string]any{"key": k, "value": v}, nil
 		case ".navigableKeySet()":
 			out := make([]any, len(keys))
@@ -21402,7 +21987,7 @@ func evalCollectionZeroArgMethodPainless(mSuffix, recExpr string, recVal any, so
 			}
 			return out, nil
 		case ".descendingMap()":
-			cp := make(map[string]any, len(tv)+1)
+			cp := make(map[string]any, len(tv)+2)
 			for k, v := range tv {
 				if !isInternalPainlessMapKey(tv, k) {
 					cp[k] = v
@@ -21410,6 +21995,11 @@ func evalCollectionZeroArgMethodPainless(mSuffix, recExpr string, recVal any, so
 			}
 			desc, _ := tv["__descending"].(bool)
 			cp["__descending"] = !desc
+			if bm, ok := tv["__backing_map"].(map[string]any); ok && bm != nil {
+				cp["__backing_map"] = bm
+			} else {
+				cp["__backing_map"] = tv
+			}
 			return cp, nil
 		}
 	case []any:
@@ -21491,7 +22081,8 @@ func evalNavigableOrDequeMethodPainless(mName, recExpr string, recVal any, argEx
 	}
 	switch tv := recVal.(type) {
 	case map[string]any:
-		keys := visiblePainlessMapKeys(tv)
+		keys := sortedNavigableMapKeysPainless(tv)
+		desc := tv != nil && tv["__descending"] == true
 		switch mName {
 		case ".floorKey(", ".ceilingKey(", ".lowerKey(", ".higherKey(",
 			".floorEntry(", ".ceilingEntry(", ".lowerEntry(", ".higherEntry(":
@@ -21504,6 +22095,9 @@ func evalNavigableOrDequeMethodPainless(mName, recExpr string, recVal any, argEx
 			found := false
 			for _, k := range keys {
 				cmp := comparePainlessValues(k, targetVal)
+				if desc {
+					cmp = -cmp
+				}
 				switch mName {
 				case ".lowerKey(", ".lowerEntry(":
 					if cmp < 0 {
@@ -21548,8 +22142,14 @@ func evalNavigableOrDequeMethodPainless(mName, recExpr string, recVal any, argEx
 				inclusive, _ = incVal.(bool)
 			}
 			out := map[string]any{}
+			if desc {
+				out["__descending"] = true
+			}
 			for _, k := range keys {
 				cmp := comparePainlessValues(k, toKey)
+				if desc {
+					cmp = -cmp
+				}
 				if cmp < 0 || (inclusive && cmp == 0) {
 					out[k] = tv[k]
 				}
@@ -21569,8 +22169,14 @@ func evalNavigableOrDequeMethodPainless(mName, recExpr string, recVal any, argEx
 				inclusive, _ = incVal.(bool)
 			}
 			out := map[string]any{}
+			if desc {
+				out["__descending"] = true
+			}
 			for _, k := range keys {
 				cmp := comparePainlessValues(k, fromKey)
+				if desc {
+					cmp = -cmp
+				}
 				if cmp > 0 || (inclusive && cmp == 0) {
 					out[k] = tv[k]
 				}
@@ -21607,9 +22213,16 @@ func evalNavigableOrDequeMethodPainless(mName, recExpr string, recVal any, argEx
 				}
 			}
 			out := map[string]any{}
+			if desc {
+				out["__descending"] = true
+			}
 			for _, k := range keys {
 				cFrom := comparePainlessValues(k, fromKey)
 				cTo := comparePainlessValues(k, toKey)
+				if desc {
+					cFrom = -cFrom
+					cTo = -cTo
+				}
 				okFrom := cFrom > 0 || (fromInc && cFrom == 0)
 				okTo := cTo < 0 || (toInc && cTo == 0)
 				if okFrom && okTo {
@@ -22793,6 +23406,29 @@ func setDateComponentClampedPainless(t time.Time, year, month, day int) time.Tim
 }
 
 func evalWithTemporalAdjusterPainless(recVal, adjVal any) (any, error) {
+	if ot, isOT := recVal.(*painlessOffsetTime); isOT && ot != nil {
+		if adjOT, isAdjOT := adjVal.(*painlessOffsetTime); isAdjOT && adjOT != nil {
+			return &painlessOffsetTime{
+				hour:          adjOT.hour,
+				minute:        adjOT.minute,
+				second:        adjOT.second,
+				nano:          adjOT.nano,
+				offsetSeconds: adjOT.offsetSeconds,
+			}, nil
+		}
+		if sAdj, isStr := adjVal.(string); isStr {
+			st := strings.TrimSpace(sAdj)
+			if !strings.Contains(st, "-") && strings.Contains(st, ":") && !strings.HasPrefix(st, "+") {
+				if h, m, sec, n, okT := parseLocalTimeComponentsPainless(st); okT {
+					return newPainlessOffsetTime(h, m, sec, n, ot.offsetSeconds)
+				}
+			}
+			if offSec, okO := parseZoneOffsetSecondsPainless(st); okO {
+				return newPainlessOffsetTime(ot.hour, ot.minute, ot.second, ot.nano, offSec)
+			}
+		}
+		return nil, &painlessExceptionError{exType: "UnsupportedTemporalTypeException", message: "Unsupported adjuster for OffsetTime"}
+	}
 	isDateOnly := false
 	isTimeOnly := false
 	if s, ok := recVal.(string); ok {
@@ -23010,69 +23646,97 @@ func evalLocalDateUntilPeriodPainless(recVal, endVal any) painlessPeriod {
 	}
 }
 
-func evalTemporalBetweenUnitPainless(unitVal, v1, v2 any) int64 {
+func evalTemporalBetweenUnitPainless(unitVal, v1, v2 any) (int64, error) {
 	unit := strings.ToUpper(strings.TrimSpace(fmt.Sprintf("%v", unitVal)))
 	unit = strings.TrimPrefix(unit, "CHRONOUNIT.")
+	_, isOT1 := v1.(*painlessOffsetTime)
+	_, isOT2 := v2.(*painlessOffsetTime)
+	if isOT1 || isOT2 {
+		ot1, ok1 := parsePainlessOffsetTime(v1)
+		ot2, ok2 := parsePainlessOffsetTime(v2)
+		if !ok1 || !ok2 {
+			return 0, &painlessExceptionError{exType: "DateTimeException", message: "Unable to obtain OffsetTime from TemporalAccessor"}
+		}
+		diffNanos := ot2.toEpochNanoOnZeroDay() - ot1.toEpochNanoOnZeroDay()
+		switch unit {
+		case "NANOS":
+			return diffNanos, nil
+		case "MICROS":
+			return diffNanos / 1_000, nil
+		case "MILLIS":
+			return diffNanos / 1_000_000, nil
+		case "SECONDS":
+			return diffNanos / 1_000_000_000, nil
+		case "MINUTES":
+			return diffNanos / (60 * 1_000_000_000), nil
+		case "HOURS":
+			return diffNanos / (3600 * 1_000_000_000), nil
+		case "HALF_DAYS":
+			return diffNanos / (12 * 3600 * 1_000_000_000), nil
+		default:
+			return 0, &painlessExceptionError{exType: "UnsupportedTemporalTypeException", message: "Unsupported unit: " + unit}
+		}
+	}
 	if yr1, okY1 := v1.(painlessYear); okY1 {
 		if yr2, okY2 := v2.(painlessYear); okY2 {
 			diffY := yr2.year - yr1.year
 			switch unit {
 			case "YEARS":
-				return diffY
+				return diffY, nil
 			case "DECADES":
-				return diffY / 10
+				return diffY / 10, nil
 			case "CENTURIES":
-				return diffY / 100
+				return diffY / 100, nil
 			case "MILLENNIA":
-				return diffY / 1000
+				return diffY / 1000, nil
 			}
 		}
 	}
 	t1, ok1 := parsePainlessDateTime(v1)
 	t2, ok2 := parsePainlessDateTime(v2)
 	if !ok1 || !ok2 {
-		return 0
+		return 0, nil
 	}
 	switch unit {
 	case "NANOS":
-		return t2.Sub(t1).Nanoseconds()
+		return t2.Sub(t1).Nanoseconds(), nil
 	case "MICROS":
-		return t2.Sub(t1).Microseconds()
+		return t2.Sub(t1).Microseconds(), nil
 	case "MILLIS":
-		return t2.Sub(t1).Milliseconds()
+		return t2.Sub(t1).Milliseconds(), nil
 	case "SECONDS":
-		return int64(t2.Sub(t1) / time.Second)
+		return int64(t2.Sub(t1) / time.Second), nil
 	case "MINUTES":
-		return int64(t2.Sub(t1) / time.Minute)
+		return int64(t2.Sub(t1) / time.Minute), nil
 	case "HOURS":
-		return int64(t2.Sub(t1) / time.Hour)
+		return int64(t2.Sub(t1) / time.Hour), nil
 	case "HALF_DAYS":
-		return int64(t2.Sub(t1) / (12 * time.Hour))
+		return int64(t2.Sub(t1) / (12 * time.Hour)), nil
 	case "DAYS":
 		d1 := time.Date(t1.Year(), t1.Month(), t1.Day(), 0, 0, 0, 0, time.UTC)
 		d2 := time.Date(t2.Year(), t2.Month(), t2.Day(), 0, 0, 0, 0, time.UTC)
-		return int64(d2.Sub(d1).Hours() / 24)
+		return int64(d2.Sub(d1).Hours() / 24), nil
 	case "WEEKS":
 		d1 := time.Date(t1.Year(), t1.Month(), t1.Day(), 0, 0, 0, 0, time.UTC)
 		d2 := time.Date(t2.Year(), t2.Month(), t2.Day(), 0, 0, 0, 0, time.UTC)
-		return int64(d2.Sub(d1).Hours() / (24 * 7))
+		return int64(d2.Sub(d1).Hours() / (24 * 7)), nil
 	case "MONTHS", "YEARS", "DECADES", "CENTURIES", "MILLENNIA":
 		p := evalLocalDateUntilPeriodPainless(t1, t2)
 		totalM := int64(p.years*12 + p.months)
 		switch unit {
 		case "MONTHS":
-			return totalM
+			return totalM, nil
 		case "YEARS":
-			return totalM / 12
+			return totalM / 12, nil
 		case "DECADES":
-			return totalM / 120
+			return totalM / 120, nil
 		case "CENTURIES":
-			return totalM / 1200
+			return totalM / 1200, nil
 		case "MILLENNIA":
-			return totalM / 12000
+			return totalM / 12000, nil
 		}
 	}
-	return 0
+	return 0, nil
 }
 
 func evalLocalDateDatesUntilPainless(recVal, endVal, stepVal any) ([]any, error) {

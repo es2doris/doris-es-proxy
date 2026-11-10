@@ -654,15 +654,41 @@ func ShredDocumentWithNow(
 	}
 
 	// Propagate `copy_to` field values to target bindings (supporting transitive A -> B -> C chains)
+	copyToFields := fieldsToVisit
+	if s != nil && len(s.Fields) > 0 {
+		visitedPaths := make(map[string]bool, len(fieldsToVisit))
+		for _, b := range fieldsToVisit {
+			visitedPaths[b.ESFieldPath] = true
+		}
+		var extraCopyToKeys []string
+		for k, b := range s.Fields {
+			if !visitedPaths[k] && b.AliasTarget == "" && !b.EnabledFalse && len(b.CopyTo) > 0 {
+				extraCopyToKeys = append(extraCopyToKeys, k)
+			}
+		}
+		if len(extraCopyToKeys) > 0 {
+			sort.Strings(extraCopyToKeys)
+			copyToFields = make([]FieldBinding, 0, len(fieldsToVisit)+len(extraCopyToKeys))
+			copyToFields = append(copyToFields, fieldsToVisit...)
+			for _, k := range extraCopyToKeys {
+				copyToFields = append(copyToFields, s.Fields[k])
+			}
+		}
+	}
 	copiedRawVals := make(map[string][]any)
-	for _, b := range fieldsToVisit {
+	for _, b := range copyToFields {
 		if len(b.CopyTo) > 0 {
 			basePath := strings.TrimSuffix(b.ESFieldPath, ".keyword")
 			srcDot := strings.Join(b.SourceJSONPath, ".")
 			if ignoredSeen[b.ESFieldPath] || ignoredSeen[basePath] || (srcDot != "" && ignoredSeen[srcDot]) {
 				continue
 			}
-			vals := extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
+			var vals []any
+			if b.ESType == "flattened" {
+				vals = extractFlattenedLeafValues(parsedDoc, b.SourceJSONPath)
+			} else {
+				vals = extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
+			}
 			if b.ESType == "constant_keyword" && len(vals) == 0 && b.ConstantValue != nil {
 				vals = []any{b.ConstantValue}
 			}
@@ -683,7 +709,7 @@ func ShredDocumentWithNow(
 	forwardedCount := make(map[string]int)
 	for pass := 0; pass < 4; pass++ {
 		progressed := false
-		for _, b := range fieldsToVisit {
+		for _, b := range copyToFields {
 			if len(b.CopyTo) == 0 {
 				continue
 			}
@@ -859,6 +885,12 @@ func ShredDocumentWithNow(
 							if tb.ESType == "date_nanos" {
 								if iv, ok := coerced.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
 									coerced = iv / 1_000_000
+								}
+							}
+							if tb.ESType == "unsigned_long" {
+								if u, okU := parseExactUint64(rv); okU && u > uint64(math.MaxInt64) {
+									cur = append(cur, strconv.FormatUint(u, 10))
+									continue
 								}
 							}
 							sv = formatCoercedArrayElement(coerced)
@@ -1219,6 +1251,55 @@ func extractRawLeafValuesWithNull(node any, path []string, nullVal any) []any {
 	var out []any
 	collectRawLeafsAtPathWithNull(node, path, nullVal, &out)
 	return out
+}
+
+func extractFlattenedLeafValues(node any, path []string) []any {
+	var out []any
+	collectFlattenedLeafsAtPath(node, path, &out)
+	return out
+}
+
+func collectFlattenedLeafsAtPath(node any, path []string, out *[]any) {
+	if node == nil {
+		return
+	}
+	if len(path) == 0 {
+		switch v := node.(type) {
+		case map[string]any:
+			keys := make([]string, 0, len(v))
+			for k := range v {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				collectFlattenedLeafsAtPath(v[k], nil, out)
+			}
+		case []any:
+			for _, item := range v {
+				collectFlattenedLeafsAtPath(item, nil, out)
+			}
+		default:
+			*out = append(*out, v)
+		}
+		return
+	}
+	switch curr := node.(type) {
+	case map[string]any:
+		if next, ok := curr[path[0]]; ok {
+			collectFlattenedLeafsAtPath(next, path[1:], out)
+			return
+		}
+		for i := len(path); i > 1; i-- {
+			if next, ok := curr[strings.Join(path[:i], ".")]; ok {
+				collectFlattenedLeafsAtPath(next, path[i:], out)
+				return
+			}
+		}
+	case []any:
+		for _, elem := range curr {
+			collectFlattenedLeafsAtPath(elem, path, out)
+		}
+	}
 }
 
 func collectRawLeafsAtPathWithNull(node any, path []string, nullVal any, out *[]any) {
@@ -2772,6 +2853,12 @@ func propagateCopyToCustomMultiFields(s *IndexSchema, row map[string]any, target
 							coerced = iv / 1_000_000
 						}
 					}
+					if subB.ESType == "unsigned_long" {
+						if u, okU := parseExactUint64(rv); okU && u > uint64(math.MaxInt64) {
+							cur = append(cur, strconv.FormatUint(u, 10))
+							continue
+						}
+					}
 					sv = formatCoercedArrayElement(coerced)
 				} else if subB.LowercaseNormalizer {
 					sv = strings.ToLower(sv)
@@ -3949,12 +4036,74 @@ func IPToSortableFloat(ipStr string) (float64, bool) {
 	return val, true
 }
 
-func validateAndNormalizeSparseVectorFieldInDoc(curr map[string]any, path []string, b FieldBinding) (bool, error) {
-	if curr == nil || len(path) == 0 {
+func traverseFieldInDocMap(curr map[string]any, path []string, leafFn func(m map[string]any, key string) (bool, error)) (bool, error) {
+	if curr == nil {
 		return false, nil
 	}
+	if len(path) == 0 {
+		return false, nil
+	}
+	head := path[0] // #nosec G602 -- len(path) > 0 checked above
 	if len(path) == 1 {
-		raw, exists := curr[path[0]]
+		return leafFn(curr, head)
+	}
+	rest := path[1:] // #nosec G602 -- len(path) >= 2 checked above
+	if next, exists := curr[head]; exists {
+		switch tv := next.(type) {
+		case map[string]any:
+			return traverseFieldInDocMap(tv, rest, leafFn)
+		case []any:
+			anyMod := false
+			for _, elem := range tv {
+				if em, ok := elem.(map[string]any); ok {
+					mod, err := traverseFieldInDocMap(em, rest, leafFn)
+					if err != nil {
+						return false, err
+					}
+					if mod {
+						anyMod = true
+					}
+				}
+			}
+			return anyMod, nil
+		}
+	}
+	for i := len(path); i >= 2; i-- {
+		if i > len(path) {
+			continue
+		}
+		joined := strings.Join(path[:i], ".") // #nosec G602 -- 2 <= i <= len(path)
+		if next, ok := curr[joined]; ok {
+			if i == len(path) {
+				return leafFn(curr, joined)
+			}
+			tail := path[i:] // #nosec G602 -- 2 <= i < len(path)
+			switch tv := next.(type) {
+			case map[string]any:
+				return traverseFieldInDocMap(tv, tail, leafFn)
+			case []any:
+				anyMod := false
+				for _, elem := range tv {
+					if em, ok := elem.(map[string]any); ok {
+						mod, err := traverseFieldInDocMap(em, tail, leafFn)
+						if err != nil {
+							return false, err
+						}
+						if mod {
+							anyMod = true
+						}
+					}
+				}
+				return anyMod, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func validateAndNormalizeSparseVectorFieldInDoc(curr map[string]any, path []string, b FieldBinding) (bool, error) {
+	return traverseFieldInDocMap(curr, path, func(m map[string]any, key string) (bool, error) {
+		raw, exists := m[key]
 		if !exists || raw == nil {
 			return false, nil
 		}
@@ -3995,39 +4144,15 @@ func validateAndNormalizeSparseVectorFieldInDoc(curr map[string]any, path []stri
 			}
 		}
 		return modified, nil
-	}
-	if next, exists := curr[path[0]]; exists {
-		switch tv := next.(type) {
-		case map[string]any:
-			return validateAndNormalizeSparseVectorFieldInDoc(tv, path[1:], b)
-		case []any:
-			anyMod := false
-			for _, elem := range tv {
-				if em, ok := elem.(map[string]any); ok {
-					mod, err := validateAndNormalizeSparseVectorFieldInDoc(em, path[1:], b)
-					if err != nil {
-						return false, err
-					}
-					if mod {
-						anyMod = true
-					}
-				}
-			}
-			return anyMod, nil
-		}
-	}
-	return false, nil
+	})
 }
 
 func validateAndNormalizeFlattenedFieldInDoc(curr map[string]any, path []string, b FieldBinding, recordIgnored func(string)) (bool, error) {
-	if curr == nil || len(path) == 0 {
-		return false, nil
-	}
-	if len(path) == 1 {
-		raw, exists := curr[path[0]]
+	return traverseFieldInDocMap(curr, path, func(m map[string]any, key string) (bool, error) {
+		raw, exists := m[key]
 		if !exists || raw == nil {
 			if exists && raw == nil {
-				delete(curr, path[0])
+				delete(m, key)
 				return true, nil
 			}
 			return false, nil
@@ -4037,35 +4162,14 @@ func validateAndNormalizeFlattenedFieldInDoc(curr map[string]any, path []string,
 			return false, err
 		}
 		if norm == nil {
-			delete(curr, path[0])
+			delete(m, key)
 			return true, nil
 		}
 		if modified {
-			curr[path[0]] = norm
+			m[key] = norm
 		}
 		return modified, nil
-	}
-	if next, exists := curr[path[0]]; exists {
-		switch tv := next.(type) {
-		case map[string]any:
-			return validateAndNormalizeFlattenedFieldInDoc(tv, path[1:], b, recordIgnored)
-		case []any:
-			anyMod := false
-			for _, elem := range tv {
-				if em, ok := elem.(map[string]any); ok {
-					mod, err := validateAndNormalizeFlattenedFieldInDoc(em, path[1:], b, recordIgnored)
-					if err != nil {
-						return false, err
-					}
-					if mod {
-						anyMod = true
-					}
-				}
-			}
-			return anyMod, nil
-		}
-	}
-	return false, nil
+	})
 }
 
 func validateAndNormalizeFlattenedValue(raw any, b FieldBinding, recordIgnored func(string)) (any, bool, error) {
@@ -4236,11 +4340,8 @@ func mergeFlattenedObjectMaps(dst, src map[string]any) {
 }
 
 func validateAndNormalizeRangeFieldInDoc(curr map[string]any, path []string, b FieldBinding, getNow func() time.Time) (bool, error) {
-	if curr == nil || len(path) == 0 {
-		return false, nil
-	}
-	if len(path) == 1 {
-		raw, exists := curr[path[0]]
+	return traverseFieldInDocMap(curr, path, func(m map[string]any, key string) (bool, error) {
+		raw, exists := m[key]
 		if !exists || raw == nil {
 			return false, nil
 		}
@@ -4249,31 +4350,10 @@ func validateAndNormalizeRangeFieldInDoc(curr map[string]any, path []string, b F
 			return false, err
 		}
 		if modified {
-			curr[path[0]] = norm
+			m[key] = norm
 		}
 		return modified, nil
-	}
-	if next, exists := curr[path[0]]; exists {
-		switch tv := next.(type) {
-		case map[string]any:
-			return validateAndNormalizeRangeFieldInDoc(tv, path[1:], b, getNow)
-		case []any:
-			anyMod := false
-			for _, elem := range tv {
-				if em, ok := elem.(map[string]any); ok {
-					mod, err := validateAndNormalizeRangeFieldInDoc(em, path[1:], b, getNow)
-					if err != nil {
-						return false, err
-					}
-					if mod {
-						anyMod = true
-					}
-				}
-			}
-			return anyMod, nil
-		}
-	}
-	return false, nil
+	})
 }
 
 func validateAndNormalizeRangeValue(raw any, b FieldBinding, getNow func() time.Time) (any, bool, error) {

@@ -4231,3 +4231,98 @@ func TestRound54TranspilerF11AndF15ToF19(t *testing.T) {
 		t.Fatalf("F19 expected direct compileHasParent to constrain join role to 'answer'/'comment' with parent IS NOT NULL, got %s", wHPRole)
 	}
 }
+
+func TestRound55TranspilerAndLuceneF15ToF19(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"title":     {"type": "text"},
+			"status":    {"type": "keyword", "ignore_above": 5},
+			"active":    {"type": "boolean"},
+			"num_range": {"type": "double_range"}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("unmarshal mapping failed: %v", err)
+	}
+	sc := schema.CompileIndexSchema("db", "r55_tr_idx", &spec)
+	tr := NewTranspiler(sc, TranspilerOptions{})
+
+	// F15: Unmatched wildcard field patterns in match, match_phrase, fuzzy, prefix, wildcard, and regexp return FALSE
+	for _, rawQ := range []string{
+		`{"match":{"nonexistent_*":"hello"}}`,
+		`{"match_phrase":{"nonexistent_*":"hello world"}}`,
+		`{"fuzzy":{"nonexistent_*":{"value":"hello"}}}`,
+		`{"prefix":{"nonexistent_*":{"value":"hel"}}}`,
+		`{"wildcard":{"nonexistent_*":{"value":"hel*"}}}`,
+		`{"regexp":{"nonexistent_*":{"value":"hel.*"}}}`,
+	} {
+		var q esast.Query
+		if err := json.Unmarshal([]byte(rawQ), &q); err != nil {
+			t.Fatalf("F15 unmarshal %s failed: %v", rawQ, err)
+		}
+		cq := tr.CompileQuery(&q, true, nil)
+		if cq.WhereSQL != "FALSE" || cq.EffectiveSafeWhere() != "FALSE" {
+			t.Fatalf("F15 expected FALSE for unmatched wildcard pattern in %s, got WhereSQL=%s SafeWhereSQL=%s", rawQ, cq.WhereSQL, cq.EffectiveSafeWhere())
+		}
+	}
+
+	// F16: compileTermsPredicateWithCI enforces b.IgnoreAbove
+	var qTermsMixed, qTermsAllTooLong esast.Query
+	_ = json.Unmarshal([]byte(`{"terms":{"status":["ok","toolongval"]}}`), &qTermsMixed)
+	wMixed := tr.CompileQuery(&qTermsMixed, false, nil).WhereSQL
+	if !strings.Contains(wMixed, "'ok'") || strings.Contains(wMixed, "toolongval") {
+		t.Fatalf("F16 expected terms query to keep 'ok' and skip 'toolongval' (> ignore_above=5), got %s", wMixed)
+	}
+	_ = json.Unmarshal([]byte(`{"terms":{"status":["toolong1","toolong2"]}}`), &qTermsAllTooLong)
+	if wAllLong := tr.CompileQuery(&qTermsAllTooLong, false, nil).WhereSQL; wAllLong != "FALSE" {
+		t.Fatalf("F16 expected FALSE when all terms exceed ignore_above, got %s", wAllLong)
+	}
+
+	// F17: rangeFieldBoundsSQL and compileRangeOnRangeField coalesce open-ended bounds, include _gt/gt and _lt/lt, and guard with IS NOT NULL
+	var qRangeOnRange esast.Query
+	_ = json.Unmarshal([]byte(`{"range":{"num_range":{"gte":10.5,"lte":20.5}}}`), &qRangeOnRange)
+	wRange := tr.CompileQuery(&qRangeOnRange, false, nil).WhereSQL
+	if !strings.Contains(wRange, "['_gt']") || !strings.Contains(wRange, "['gt']") || !strings.Contains(wRange, "['_lt']") || !strings.Contains(wRange, "['lt']") {
+		t.Fatalf("F17 expected range on range field SQL to include _gt/gt and _lt/lt, got %s", wRange)
+	}
+	if !strings.Contains(wRange, "-1e100") || !strings.Contains(wRange, "1e100") || !strings.Contains(wRange, "IS NOT NULL") {
+		t.Fatalf("F17 expected range on range field SQL to coalesce open-ended bounds and guard with IS NOT NULL, got %s", wRange)
+	}
+
+	// F18: Unquoted field:true/false on text fields and fuzzy boolean tokens (title:true~1) compile as full-text Match, while boolean field compiles as Term
+	var qsTextTrue, qsFuzzyTrue, qsBoolTrue esast.Query
+	_ = json.Unmarshal([]byte(`{"query_string":{"query":"title:true"}}`), &qsTextTrue)
+	wTextTrue := tr.CompileQuery(&qsTextTrue, false, nil).WhereSQL
+	if !strings.Contains(wTextTrue, "MATCH_ANY 'true'") {
+		t.Fatalf("F18 expected title:true on text field to use MATCH_ANY, got %s", wTextTrue)
+	}
+	_ = json.Unmarshal([]byte(`{"query_string":{"query":"title:true~1"}}`), &qsFuzzyTrue)
+	wFuzzyTrue := tr.CompileQuery(&qsFuzzyTrue, false, nil).WhereSQL
+	if !strings.Contains(wFuzzyTrue, "REGEXP") {
+		t.Fatalf("F18 expected title:true~1 to compile as fuzzy regex match, got %s", wFuzzyTrue)
+	}
+	_ = json.Unmarshal([]byte(`{"query_string":{"query":"active:true"}}`), &qsBoolTrue)
+	wBoolTrue := tr.CompileQuery(&qsBoolTrue, false, nil).WhereSQL
+	if !strings.Contains(wBoolTrue, "`f__active` = TRUE") {
+		t.Fatalf("F18 expected active:true on boolean field to use boolean equality, got %s", wBoolTrue)
+	}
+
+	// F19: allow_leading_wildcard:false rejects standalone "*" and grouped "title:(foo OR *)" while allowing "*:*"
+	for _, badWild := range []string{
+		`{"query":{"query_string":{"query":"*","allow_leading_wildcard":false}}}`,
+		`{"query":{"query_string":{"query":"title:(foo OR *)","allow_leading_wildcard":false}}}`,
+	} {
+		var sr esast.SearchRequest
+		if err := json.Unmarshal([]byte(badWild), &sr); err != nil {
+			t.Fatalf("F19 unmarshal %s failed: %v", badWild, err)
+		}
+		if _, err := tr.BuildSearchPlan(&sr); err == nil {
+			t.Fatalf("F19 expected query_shard_exception for %s", badWild)
+		}
+	}
+	var srStarColonStar esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"query_string":{"query":"*:*","allow_leading_wildcard":false}}}`), &srStarColonStar)
+	if _, err := tr.BuildSearchPlan(&srStarColonStar); err != nil {
+		t.Fatalf("F19 expected *:* to be allowed when allow_leading_wildcard=false, got %v", err)
+	}
+}

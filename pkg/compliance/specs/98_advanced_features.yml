@@ -601,4 +601,256 @@
       ssl.certificates: {}
   - match: { 0.alias: "http" }
 
+---
+"Round 55 health_report, sql, eql, ml, security, fleet, graph, cat, cluster, nodes, and F1 runner operators":
+  - do:
+      info: {}
+  - gt: { version.number: "7.0.0" }
+  - lt: { version.number: "9.0.0" }
+  - gt: { version.build_date: "2020-01-01T00:00:00Z" }
+  - not_contains: { tagline: "NotElasticsearch" }
+  - is_empty: nonexistent_optional_field
+  - transform_and_set:
+      ver_parts: 'split(version.number, ".")'
+      ver_joined: 'concat(version.number, "-", version.build_flavor)'
+      ver_underscored: 'replace(version.number, ".", "_")'
+      major_int: 'toInt($ver_parts.0)'
+      major_str: 'toString($major_int)'
+  - match: { version.number: "7.10.2" }
+
+  - do:
+      health_report: {}
+  - match: { status: "green" }
+  - is_true: indicators.shards_availability
+
+  - do:
+      health_report:
+        indicator: shards_availability
+  - is_true: status
+
+  - do:
+      indices.create:
+        index: r55_adv_idx
+        body:
+          mappings:
+            properties:
+              host: { type: keyword }
+              latency: { type: integer }
+              "@timestamp": { type: date }
+  - do:
+      index:
+        index: r55_adv_idx
+        id: "1"
+        refresh: true
+        body:
+          host: "web-01"
+          latency: 25
+          "@timestamp": "2024-05-01T00:00:00Z"
+
+  - do:
+      sql.query:
+        body:
+          query: "SELECT host, latency FROM r55_adv_idx"
+  - is_true: columns
+  - is_true: rows
+
+  - do:
+      sql.translate:
+        body:
+          query: "SELECT * FROM r55_adv_idx WHERE latency > 10"
+  - is_true: query
+
+  - do:
+      sql.clear_cursor:
+        body:
+          cursor: "r55_cursor_1"
+  - match: { succeeded: true }
+
+  - do:
+      eql.search:
+        index: r55_adv_idx
+        body:
+          query: "any where true"
+  - is_true: hits
+
+  - do:
+      indices.reload_search_analyzers:
+        index: r55_adv_idx
+  - is_true: reload_details
+
+  - do:
+      indices.disk_usage:
+        index: r55_adv_idx
+  - is_true: _shards
+
+  - do:
+      indices.field_usage_stats:
+        index: r55_adv_idx
+  - is_true: _shards
+
+  - do:
+      ml.info: {}
+  - is_true: ''
+
+  - do:
+      ml.get_memory_stats: {}
+  - is_true: ''
+
+  - do:
+      ml.set_upgrade_mode:
+        enabled: false
+  - match: { acknowledged: true }
+
+  - do:
+      ml.put_job:
+        job_id: r55_job
+        body:
+          analysis_config:
+            bucket_span: "15m"
+            detectors:
+              - function: "count"
+          data_description:
+            time_field: "@timestamp"
+  - match: { job_id: "r55_job" }
+
+  - do:
+      ml.open_job:
+        job_id: r55_job
+  - match: { opened: true }
+
+  - do:
+      ml.get_jobs:
+        job_id: r55_job
+  - is_true: jobs
+
+  - do:
+      ml.get_job_stats:
+        job_id: r55_job
+  - is_true: jobs
+
+  - do:
+      cat.ml_anomaly_detectors:
+        job_id: r55_job
+        format: json
+  - is_true: ''
+
+  - do:
+      ml.close_job:
+        job_id: r55_job
+  - match: { closed: true }
+
+  - do:
+      ml.delete_job:
+        job_id: r55_job
+  - match: { acknowledged: true }
+
+  - do:
+      ml.put_calendar:
+        calendar_id: r55_cal
+        body:
+          description: "Maintenance window"
+  - match: { calendar_id: "r55_cal" }
+
+  - do:
+      ml.delete_calendar:
+        calendar_id: r55_cal
+  - match: { acknowledged: true }
+
+  - do:
+      ml.put_filter:
+        filter_id: r55_flt
+        body:
+          description: "Allowed hosts"
+          items: ["web-01"]
+  - match: { filter_id: "r55_flt" }
+
+  - do:
+      ml.delete_filter:
+        filter_id: r55_flt
+  - match: { acknowledged: true }
+
+  - do:
+      security.put_role_mapping:
+        name: r55_rm
+        body:
+          roles: ["superuser"]
+          enabled: true
+          rules:
+            field:
+              username: "*"
+  - is_true: role_mapping
+
+  - do:
+      security.get_role_mapping:
+        name: r55_rm
+  - is_true: r55_rm
+
+  - do:
+      security.delete_role_mapping:
+        name: r55_rm
+  - match: { found: true }
+
+  - do:
+      security.get_builtin_privileges: {}
+  - is_true: cluster
+
+  - do:
+      security.clear_cached_roles:
+        name: superuser
+  - is_true: _nodes
+
+  - do:
+      security.clear_cached_realms:
+        username: elastic
+  - is_true: _nodes
+
+  - do:
+      security.enroll_kibana: {}
+  - is_true: ''
+
+  - do:
+      security.enroll_node: {}
+  - is_true: ''
+
+  - do:
+      fleet.search:
+        index: r55_adv_idx
+        body:
+          query:
+            match_all: {}
+  - is_true: hits
+
+  - do:
+      fleet.global_checkpoints:
+        index: r55_adv_idx
+  - is_true: ''
+
+  - do:
+      graph.explore:
+        index: r55_adv_idx
+        body:
+          query:
+            match_all: {}
+          vertices:
+            - field: "host"
+  - is_true: vertices
+
+  - do:
+      cluster.info: {}
+  - is_true: ''
+
+  - do:
+      nodes.reload_secure_settings: {}
+  - is_true: _nodes
+
+  - do:
+      nodes.get_repositories_metering_info: {}
+  - is_true: _nodes
+
+  - do:
+      nodes.clear_repositories_metering_archive:
+        max_archive_version: 1
+  - is_true: _nodes
+
+
 

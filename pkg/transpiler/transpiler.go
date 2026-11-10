@@ -980,7 +980,7 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 			if strings.ContainsAny(cleanField, "*?") && t.Schema != nil {
 				exp := t.expandFieldPatternForContext(cleanField, nctx)
 				if len(exp) == 0 {
-					if nctx != nil {
+					if nctx != nil || (cleanField != "*" && len(t.Schema.Fields) > 0) {
 						preds = append(preds, "FALSE")
 						safePreds = append(safePreds, "FALSE")
 						if scoring {
@@ -2395,7 +2395,7 @@ func (t *Transpiler) compileFuzzyFieldWithOpts(
 	if strings.ContainsAny(field, "*?") && t.Schema != nil {
 		exp := t.expandFieldPatternForContext(field, nctx)
 		if len(exp) == 0 {
-			if nctx != nil {
+			if nctx != nil || (field != "*" && len(t.Schema.Fields) > 0) {
 				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 			}
 			return t.compileFuzzyFieldWithOpts("_all_text", queryVal, operator, fuzziness, caseInsensitive, prefixLength, transpositions, boost, scoring, nctx)
@@ -2563,7 +2563,7 @@ func (t *Transpiler) compileMatchField(
 	if strings.ContainsAny(field, "*?") && t.Schema != nil {
 		exp := t.expandFieldPatternForContext(field, nctx)
 		if len(exp) == 0 {
-			if nctx != nil {
+			if nctx != nil || (field != "*" && len(t.Schema.Fields) > 0) {
 				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 			}
 			return t.compileMatchField("_all_text", queryVal, operator, boost, scoring, nctx)
@@ -2766,7 +2766,7 @@ func (t *Transpiler) compileMatchPhraseField(
 	if strings.ContainsAny(field, "*?") && t.Schema != nil {
 		exp := t.expandFieldPatternForContext(field, nctx)
 		if len(exp) == 0 {
-			if nctx != nil {
+			if nctx != nil || (field != "*" && len(t.Schema.Fields) > 0) {
 				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 			}
 			return t.compileMatchPhraseField("_all_text", queryStr, slop, boost, isPrefix, scoring, nctx)
@@ -4317,9 +4317,9 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 		if !ok {
 			return "FALSE"
 		}
-		lowerSQL, upperSQL := t.rangeFieldBoundsSQL(field, b, nctx)
+		lowerSQL, upperSQL, rawLower, rawUpper := t.rangeFieldBoundsAndRawSQL(field, b, nctx)
 		qLit := strconv.FormatFloat(qf, 'f', -1, 64)
-		return fmt.Sprintf("(%s <= %s AND %s >= %s)", lowerSQL, qLit, upperSQL, qLit)
+		return fmt.Sprintf("((%s IS NOT NULL OR %s IS NOT NULL) AND %s <= %s AND %s >= %s)", rawLower, rawUpper, lowerSQL, qLit, upperSQL, qLit)
 	}
 	if b.ESType == "ip" {
 		if strVal, ok := val.(string); ok {
@@ -4627,6 +4627,9 @@ func (t *Transpiler) compileTermsPredicateWithCI(field string, vals []any, caseI
 	quoted := make([]string, 0, len(vals))
 	normalizedVals := make([]any, 0, len(vals))
 	for _, v := range vals {
+		if b.IgnoreAbove > 0 && v != nil && len([]rune(fmt.Sprintf("%v", v))) > b.IgnoreAbove {
+			continue
+		}
 		if effDT == schema.DorisBoolean {
 			if bv, ok := normalizeBooleanQueryValue(v); ok {
 				v = bv
@@ -4733,7 +4736,7 @@ func (t *Transpiler) compilePrefixPredicate(field, val string, caseInsensitive b
 	if strings.ContainsAny(field, "*?") && t.Schema != nil {
 		exp := t.expandFieldPatternForContext(field, nctx)
 		if len(exp) == 0 {
-			if nctx != nil {
+			if nctx != nil || (field != "*" && len(t.Schema.Fields) > 0) {
 				return "FALSE"
 			}
 			return t.compilePrefixSingleField("_all_text", val, caseInsensitive, nctx)
@@ -4799,7 +4802,7 @@ func (t *Transpiler) compileWildcardPredicate(field, val string, caseInsensitive
 	if strings.ContainsAny(field, "*?") && t.Schema != nil {
 		exp := t.expandFieldPatternForContext(field, nctx)
 		if len(exp) == 0 {
-			if nctx != nil {
+			if nctx != nil || (field != "*" && len(t.Schema.Fields) > 0) {
 				return "FALSE"
 			}
 			return t.compileWildcardSingleField("_all_text", val, caseInsensitive, nctx)
@@ -12282,18 +12285,24 @@ func coerceRangeFieldQueryScalar(v any, b schema.FieldBinding, format string, tz
 	return 0, false
 }
 
-func (t *Transpiler) rangeFieldBoundsSQL(field string, b schema.FieldBinding, nctx *nestedCtx) (string, string) {
+func (t *Transpiler) rangeFieldBoundsAndRawSQL(field string, b schema.FieldBinding, nctx *nestedCtx) (string, string, string, string) {
 	if nctx != nil && nctx.elemVar != "" && (b.Kind == schema.StorageNestedSubfield || b.NestedPath == nctx.nestedPath) && nctx.nestedPath == b.NestedPath {
 		relPath := t.nestedRelativeJSONPath(field, false, b.NestedPath)
 		gtePath := strings.TrimSuffix(relPath, "") + "._gte"
 		ltePath := strings.TrimSuffix(relPath, "") + "._lte"
 		rawGtePath := strings.TrimSuffix(relPath, "") + ".gte"
 		rawLtePath := strings.TrimSuffix(relPath, "") + ".lte"
-		lower := fmt.Sprintf("COALESCE(CAST(json_extract_string(%s, %s) AS DOUBLE), CAST(json_extract_string(%s, %s) AS DOUBLE), -1e100)",
-			nctx.elemVar, quoteStr(gtePath), nctx.elemVar, quoteStr(rawGtePath))
-		upper := fmt.Sprintf("COALESCE(CAST(json_extract_string(%s, %s) AS DOUBLE), CAST(json_extract_string(%s, %s) AS DOUBLE), 1e100)",
-			nctx.elemVar, quoteStr(ltePath), nctx.elemVar, quoteStr(rawLtePath))
-		return lower, upper
+		gtPath := strings.TrimSuffix(relPath, "") + "._gt"
+		ltPath := strings.TrimSuffix(relPath, "") + "._lt"
+		rawGtPath := strings.TrimSuffix(relPath, "") + ".gt"
+		rawLtPath := strings.TrimSuffix(relPath, "") + ".lt"
+		rawLower := fmt.Sprintf("COALESCE(CAST(json_extract_string(%s, %s) AS DOUBLE), CAST(json_extract_string(%s, %s) AS DOUBLE), CAST(json_extract_string(%s, %s) AS DOUBLE), CAST(json_extract_string(%s, %s) AS DOUBLE))",
+			nctx.elemVar, quoteStr(gtePath), nctx.elemVar, quoteStr(rawGtePath), nctx.elemVar, quoteStr(gtPath), nctx.elemVar, quoteStr(rawGtPath))
+		rawUpper := fmt.Sprintf("COALESCE(CAST(json_extract_string(%s, %s) AS DOUBLE), CAST(json_extract_string(%s, %s) AS DOUBLE), CAST(json_extract_string(%s, %s) AS DOUBLE), CAST(json_extract_string(%s, %s) AS DOUBLE))",
+			nctx.elemVar, quoteStr(ltePath), nctx.elemVar, quoteStr(rawLtePath), nctx.elemVar, quoteStr(ltPath), nctx.elemVar, quoteStr(rawLtPath))
+		lower := fmt.Sprintf("COALESCE(%s, -1e100)", rawLower)
+		upper := fmt.Sprintf("COALESCE(%s, 1e100)", rawUpper)
+		return lower, upper, rawLower, rawUpper
 	}
 	parts := b.SourceJSONPath
 	if len(parts) == 0 {
@@ -12306,9 +12315,11 @@ func (t *Transpiler) rangeFieldBoundsSQL(field string, b schema.FieldBinding, nc
 		base.WriteString("['" + escaped + "']")
 	}
 	baseExpr := base.String()
-	lower := fmt.Sprintf("COALESCE(CAST(%s['_gte'] AS DOUBLE), CAST(%s['gte'] AS DOUBLE))", baseExpr, baseExpr)
-	upper := fmt.Sprintf("COALESCE(CAST(%s['_lte'] AS DOUBLE), CAST(%s['lte'] AS DOUBLE))", baseExpr, baseExpr)
-	return lower, upper
+	rawLower := fmt.Sprintf("COALESCE(CAST(%s['_gte'] AS DOUBLE), CAST(%s['gte'] AS DOUBLE), CAST(%s['_gt'] AS DOUBLE), CAST(%s['gt'] AS DOUBLE))", baseExpr, baseExpr, baseExpr, baseExpr)
+	rawUpper := fmt.Sprintf("COALESCE(CAST(%s['_lte'] AS DOUBLE), CAST(%s['lte'] AS DOUBLE), CAST(%s['_lt'] AS DOUBLE), CAST(%s['lt'] AS DOUBLE))", baseExpr, baseExpr, baseExpr, baseExpr)
+	lower := fmt.Sprintf("COALESCE(%s, -1e100)", rawLower)
+	upper := fmt.Sprintf("COALESCE(%s, 1e100)", rawUpper)
+	return lower, upper, rawLower, rawUpper
 }
 
 func (t *Transpiler) compileRangeOnRangeField(field string, b schema.FieldBinding, rc esast.RangeCond, nctx *nestedCtx) string {
@@ -12365,7 +12376,8 @@ func (t *Transpiler) compileRangeOnRangeField(field string, b schema.FieldBindin
 		}
 	}
 
-	lowerSQL, upperSQL := t.rangeFieldBoundsSQL(field, b, nctx)
+	lowerSQL, upperSQL, rawLower, rawUpper := t.rangeFieldBoundsAndRawSQL(field, b, nctx)
+	existsCond := fmt.Sprintf("(%s IS NOT NULL OR %s IS NOT NULL)", rawLower, rawUpper)
 	rel := strings.ToUpper(strings.TrimSpace(rc.Relation))
 	if rel == "" {
 		rel = "INTERSECTS"
@@ -12421,8 +12433,9 @@ func (t *Transpiler) compileRangeOnRangeField(field string, b schema.FieldBindin
 		}
 	}
 	if len(conds) == 0 {
-		return fmt.Sprintf("(%s IS NOT NULL OR %s IS NOT NULL)", lowerSQL, upperSQL)
+		return existsCond
 	}
+	conds = append([]string{existsCond}, conds...)
 	return "(" + strings.Join(conds, " AND ") + ")"
 }
 

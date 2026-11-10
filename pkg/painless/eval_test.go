@@ -5740,3 +5740,448 @@ func TestRound54F20ToF26Features(t *testing.T) {
 		}
 	})
 }
+
+func TestRound55_F20_To_F26(t *testing.T) {
+	evalOut := func(t *testing.T, script string, params map[string]any) any {
+		t.Helper()
+		doc := map[string]any{}
+		if _, err := Eval(doc, script, params); err != nil {
+			t.Fatalf("Eval failed for script:\n%s\nerr: %v", script, err)
+		}
+		return doc["out"]
+	}
+
+	t.Run("F20_OffsetTime_Temporal_ValueRange_And_IsSupported", func(t *testing.T) {
+		got := evalOut(t, `
+			OffsetTime ot = OffsetTime.of(14, 30, 15, 123456789, ZoneOffset.ofHours(2));
+			boolean supField1 = ot.isSupported(ChronoField.HOUR_OF_DAY);
+			boolean supField2 = ot.isSupported(ChronoField.OFFSET_SECONDS);
+			boolean supField3 = ot.isSupported(ChronoField.YEAR);
+			boolean supUnit1 = ot.isSupported(ChronoUnit.HOURS);
+			boolean supUnit2 = ot.isSupported(ChronoUnit.HALF_DAYS);
+			boolean supUnit3 = ot.isSupported(ChronoUnit.DAYS);
+
+			boolean ldSupDays = LocalDate.of(2025, 3, 15).isSupported(ChronoUnit.DAYS);
+			boolean ldSupHours = LocalDate.of(2025, 3, 15).isSupported(ChronoUnit.HOURS);
+			boolean ltSupMinutes = LocalTime.of(10, 20).isSupported(ChronoUnit.MINUTES);
+			boolean ltSupDays = LocalTime.of(10, 20).isSupported(ChronoUnit.DAYS);
+			boolean instSupSec = Instant.parse("2025-03-15T10:00:00Z").isSupported(ChronoUnit.SECONDS);
+			boolean instSupMonths = Instant.parse("2025-03-15T10:00:00Z").isSupported(ChronoUnit.MONTHS);
+			boolean ymSupMonths = YearMonth.of(2025, 3).isSupported(ChronoUnit.MONTHS);
+			boolean ymSupDays = YearMonth.of(2025, 3).isSupported(ChronoUnit.DAYS);
+			boolean yrSupYears = Year.of(2025).isSupported(ChronoUnit.YEARS);
+			boolean yrSupMonths = Year.of(2025).isSupported(ChronoUnit.MONTHS);
+
+			int getHr = ot.get(ChronoField.HOUR_OF_DAY);
+			long getLongNano = ot.getLong(ChronoField.NANO_OF_DAY);
+			long getOffSec = ot.getLong(ChronoField.OFFSET_SECONDS);
+			long getFieldsSum = ot.getLong(ChronoField.NANO_OF_SECOND) +
+				ot.getLong(ChronoField.MICRO_OF_SECOND) +
+				ot.getLong(ChronoField.MICRO_OF_DAY) +
+				ot.getLong(ChronoField.MILLI_OF_SECOND) +
+				ot.getLong(ChronoField.MILLI_OF_DAY) +
+				ot.getLong(ChronoField.SECOND_OF_MINUTE) +
+				ot.getLong(ChronoField.SECOND_OF_DAY) +
+				ot.getLong(ChronoField.MINUTE_OF_HOUR) +
+				ot.getLong(ChronoField.MINUTE_OF_DAY) +
+				ot.getLong(ChronoField.HOUR_OF_AMPM) +
+				ot.getLong(ChronoField.CLOCK_HOUR_OF_AMPM) +
+				ot.getLong(ChronoField.CLOCK_HOUR_OF_DAY) +
+				ot.getLong(ChronoField.AMPM_OF_DAY);
+			boolean errGetYear = false;
+			try { ot.get(ChronoField.YEAR); } catch (UnsupportedTemporalTypeException e) { errGetYear = true; }
+			boolean errGetLongNanoAsInt = false;
+			try { ot.get(ChronoField.NANO_OF_DAY); } catch (UnsupportedTemporalTypeException e) { errGetLongNanoAsInt = true; }
+
+			OffsetTime withHr = ot.with(ChronoField.HOUR_OF_DAY, 9);
+			OffsetTime withOff = ot.with(ChronoField.OFFSET_SECONDS, -3600);
+			OffsetTime withChain = ot
+				.with(ChronoField.MINUTE_OF_HOUR, 45)
+				.with(ChronoField.SECOND_OF_MINUTE, 30)
+				.with(ChronoField.NANO_OF_SECOND, 500)
+				.with(ChronoField.MILLI_OF_SECOND, 10)
+				.with(ChronoField.MICRO_OF_SECOND, 20)
+				.with(ChronoField.NANO_OF_DAY, 3600000000000L)
+				.with(ChronoField.SECOND_OF_DAY, 7200)
+				.with(ChronoField.MINUTE_OF_DAY, 180)
+				.with(ChronoField.HOUR_OF_AMPM, 4)
+				.with(ChronoField.AMPM_OF_DAY, 1);
+			OffsetTime withLt = ot.with(LocalTime.of(8, 15, 0));
+			OffsetTime withZo = ot.with(ZoneOffset.ofHours(-5));
+			boolean errWithDateAdj = false;
+			try { ot.with(TemporalAdjusters.firstDayOfMonth()); } catch (UnsupportedTemporalTypeException e) { errWithDateAdj = true; }
+
+			ValueRange vrHour = ot.range(ChronoField.HOUR_OF_DAY);
+			ValueRange vrDomFebLeap = LocalDate.of(2024, 2, 10).range(ChronoField.DAY_OF_MONTH);
+			ValueRange vrDomApr = LocalDate.of(2024, 4, 10).range(ChronoField.DAY_OF_MONTH);
+			ValueRange vrDoyLeap = LocalDate.of(2024, 2, 10).range(ChronoField.DAY_OF_YEAR);
+			ValueRange vrWom = LocalDate.of(2024, 2, 10).range(ChronoField.ALIGNED_WEEK_OF_MONTH);
+			ValueRange vrYmMonth = YearMonth.of(2023, 2).range(ChronoField.MONTH_OF_YEAR);
+			ValueRange vrLtSec = LocalTime.of(10, 0).range(ChronoField.SECOND_OF_MINUTE);
+			ValueRange vrCfMonth = ChronoField.MONTH_OF_YEAR.range();
+			boolean vrValidInt = vrHour.isValidIntValue(12);
+			boolean vrEqSelf = vrHour.equals(vrHour);
+			String vrStr = vrHour.toString();
+			boolean errRangeYearOnOt = false;
+			try { ot.range(ChronoField.YEAR); } catch (UnsupportedTemporalTypeException e) { errRangeYearOnOt = true; }
+
+			OffsetTime ot1 = OffsetTime.parse("10:00:00+02:00");
+			OffsetTime ot2 = OffsetTime.parse("11:30:00+01:00");
+			long untilMins = ot1.until(ot2, ChronoUnit.MINUTES);
+			long untilUnitsSum = ot1.until(ot2, ChronoUnit.NANOS) +
+				ot1.until(ot2, ChronoUnit.MICROS) +
+				ot1.until(ot2, ChronoUnit.MILLIS) +
+				ot1.until(ot2, ChronoUnit.SECONDS) +
+				ot1.until(ot2, ChronoUnit.HOURS) +
+				ot1.until(ot2, ChronoUnit.HALF_DAYS);
+			long betweenHours = ChronoUnit.HOURS.between(ot1, ot2);
+			Duration durBetween = Duration.between(ot1, ot2);
+			boolean errUntilDays = false;
+			try { ot1.until(ot2, ChronoUnit.DAYS); } catch (UnsupportedTemporalTypeException e) { errUntilDays = true; }
+
+			DateTimeFormatter fmt = DateTimeFormatter.ofPattern("HH:mm:ssXXX");
+			String formatted1 = ot1.format(fmt);
+			String formatted2 = fmt.format(ot1);
+			OffsetTime parsed2Arg = OffsetTime.parse("16:45:30+03:00", fmt);
+			OffsetTime fromLtAtOffset = LocalTime.of(12, 0, 0).atOffset(ZoneOffset.ofHours(4));
+			OffsetTime plusHalfDay = ot1.plus(1, ChronoUnit.HALF_DAYS);
+			OffsetTime minusHalfDay = ot1.minus(1, ChronoUnit.HALF_DAYS);
+			OffsetTime truncHalfDay = OffsetTime.of(15, 20, 10, 0, ZoneOffset.UTC).truncatedTo(ChronoUnit.HALF_DAYS);
+			OffsetTime truncDays = OffsetTime.of(15, 20, 10, 0, ZoneOffset.UTC).truncatedTo(ChronoUnit.DAYS);
+
+			ctx._source.out = [
+				'sup': [supField1, supField2, supField3, supUnit1, supUnit2, supUnit3, ldSupDays, ldSupHours, ltSupMinutes, ltSupDays, instSupSec, instSupMonths, ymSupMonths, ymSupDays, yrSupYears, yrSupMonths],
+				'gets': [getHr, getLongNano, getOffSec, errGetYear, errGetLongNanoAsInt, getFieldsSum > 0],
+				'withs': [withHr.getHour(), withOff.getOffset(), withLt.toLocalTime(), withZo.getOffset(), errWithDateAdj, withChain.getHour()],
+				'ranges': [
+					vrHour.getMinimum(), vrHour.getMaximum(), vrHour.isFixed(), vrHour.isIntValue(), vrHour.isValidValue(23), vrHour.isValidValue(24),
+					vrDomFebLeap.getMinimum(), vrDomFebLeap.getMaximum(),
+					vrCfMonth.getMinimum(), vrCfMonth.getMaximum(),
+					errRangeYearOnOt,
+					vrDomApr.getMaximum(), vrDoyLeap.getMaximum(), vrWom.getMaximum(), vrYmMonth.getMaximum(), vrLtSec.getMaximum(),
+					vrValidInt, vrEqSelf, vrStr == "0 - 23"
+				],
+				'untilBetween': [untilMins, betweenHours, durBetween.toMinutes(), errUntilDays, untilUnitsSum > 0],
+				'fmtAndAtOffset': [formatted1, formatted2, parsed2Arg.toString(), fromLtAtOffset.toString(), plusHalfDay.getHour(), truncHalfDay.toString(), minusHalfDay.getHour(), truncDays.toString()]
+			];
+		`, nil)
+		m := got.(map[string]any)
+		if !reflect.DeepEqual(m["sup"], []any{
+			true, true, false, true, true, false,
+			true, false, true, false, true, false, true, false, true, false,
+		}) {
+			t.Fatalf("unexpected isSupported results: %#v", m["sup"])
+		}
+		expectedNano := int64((14*3600+30*60+15)*1_000_000_000 + 123456789)
+		if !reflect.DeepEqual(m["gets"], []any{int64(14), expectedNano, int64(7200), true, true, true}) {
+			t.Fatalf("unexpected OffsetTime get/getLong results: %#v", m["gets"])
+		}
+		if !reflect.DeepEqual(m["withs"], []any{int64(9), "-01:00", "08:15", "-05:00", true, int64(16)}) {
+			t.Fatalf("unexpected OffsetTime with results: %#v", m["withs"])
+		}
+		if !reflect.DeepEqual(m["ranges"], []any{
+			int64(0), int64(23), true, true, true, false,
+			int64(1), int64(29),
+			int64(1), int64(12),
+			true,
+			int64(30), int64(366), int64(5), int64(12), int64(59),
+			true, true, true,
+		}) {
+			t.Fatalf("unexpected ValueRange results: %#v", m["ranges"])
+		}
+		// 10:00+02:00 is 08:00Z; 11:30+01:00 is 10:30Z -> diff is 150 minutes (2 hours)
+		if !reflect.DeepEqual(m["untilBetween"], []any{int64(150), int64(2), int64(150), true, true}) {
+			t.Fatalf("unexpected OffsetTime until/between/Duration.between results: %#v", m["untilBetween"])
+		}
+		if !reflect.DeepEqual(m["fmtAndAtOffset"], []any{
+			"10:00:00+02:00", "10:00:00+02:00", "16:45:30+03:00", "12:00+04:00", int64(22), "12:00Z", int64(22), "00:00Z",
+		}) {
+			t.Fatalf("unexpected OffsetTime format/parse/atOffset results: %#v", m["fmtAndAtOffset"])
+		}
+	})
+
+	t.Run("F21_URI_PlusPreservation_CompareTo_And_MultiArgEncoding", func(t *testing.T) {
+		got := evalOut(t, `
+			URI uPlus = URI.create("http://example.com/a+b%20c?x=1+2%203");
+			String ssp = uPlus.getSchemeSpecificPart();
+			String rawSsp = uPlus.getRawSchemeSpecificPart();
+
+			URI uAuth = URI.create("http://us%20er@example.com:8080/p");
+			String decAuth = uAuth.getAuthority();
+			String rawAuth = uAuth.getRawAuthority();
+
+			URI u4Space = new URI("http", "example.com", "/hello world/a+b", "frag ment");
+			URI u7Space = new URI("https", "us er", "example.com", 8443, "/pa th", "q=a b", "fr ag");
+			boolean errRelPathWithHost = false;
+			try { new URI("http", "example.com", "rel/path", null); } catch (URISyntaxException e) { errRelPathWithHost = true; }
+
+			URI c1 = URI.create("HTTP://EXAMPLE.COM/a");
+			URI c2 = URI.create("http://example.com/b");
+			int cmpSchemeCase = c1.compareTo(c2);
+			URI cNoScheme = URI.create("/a");
+			int cmpUndefScheme = cNoScheme.compareTo(c1);
+			URI cFrag1 = URI.create("http://example.com/a#b");
+			URI cFrag2 = URI.create("http://example.com/a#a");
+			int cmpFrag = cFrag1.compareTo(cFrag2);
+
+			ctx._source.out = [
+				'ssp': [ssp, rawSsp],
+				'auth': [decAuth, rawAuth],
+				'u4': [u4Space.toString(), u4Space.getPath(), u4Space.getRawPath(), u4Space.getFragment(), u4Space.getRawFragment()],
+				'u7': [u7Space.toString(), u7Space.getUserInfo(), u7Space.getRawUserInfo(), u7Space.getQuery(), u7Space.getRawQuery()],
+				'errRel': errRelPathWithHost,
+				'cmp': [cmpSchemeCase < 0, cmpUndefScheme < 0, cmpFrag > 0]
+			];
+		`, nil)
+		m := got.(map[string]any)
+		if !reflect.DeepEqual(m["ssp"], []any{"//example.com/a+b c?x=1+2 3", "//example.com/a+b%20c?x=1+2%203"}) {
+			t.Fatalf("unexpected URI getSchemeSpecificPart '+' preservation: %#v", m["ssp"])
+		}
+		if !reflect.DeepEqual(m["auth"], []any{"us er@example.com:8080", "us%20er@example.com:8080"}) {
+			t.Fatalf("unexpected URI getAuthority vs getRawAuthority: %#v", m["auth"])
+		}
+		if !reflect.DeepEqual(m["u4"], []any{
+			"http://example.com/hello%20world/a+b#frag%20ment",
+			"/hello world/a+b",
+			"/hello%20world/a+b",
+			"frag ment",
+			"frag%20ment",
+		}) {
+			t.Fatalf("unexpected 4-arg URI encoding: %#v", m["u4"])
+		}
+		if m["errRel"] != true {
+			t.Fatalf("expected URISyntaxException for relative path with host: %#v", m)
+		}
+		if !reflect.DeepEqual(m["cmp"], []any{true, true, true}) {
+			t.Fatalf("unexpected URI.compareTo results: %#v", m["cmp"])
+		}
+	})
+
+	t.Run("F22_SummaryStatistics_ToString_CountZero_And_DoubleNaN", func(t *testing.T) {
+		got := evalOut(t, `
+			IntSummaryStatistics iss = new IntSummaryStatistics(2L, 3, 7, 10L);
+			String issStr1 = iss.toString();
+			String issStr2 = String.valueOf(iss);
+			String issStr3 = Objects.toString(iss);
+
+			IntSummaryStatistics zeroCount = new IntSummaryStatistics(0L, 100, -50, 999L);
+			DoubleSummaryStatistics zeroDss = new DoubleSummaryStatistics(0L, Double.NaN, Double.NaN, Double.NaN);
+
+			DoubleSummaryStatistics dssNan = new DoubleSummaryStatistics();
+			dssNan.accept(10.0);
+			dssNan.accept(Double.NaN);
+			boolean sumNan = Double.isNaN(dssNan.getSum());
+			boolean minNan = Double.isNaN(dssNan.getMin());
+			boolean maxNan = Double.isNaN(dssNan.getMax());
+			boolean avgNan = Double.isNaN(dssNan.getAverage());
+
+			DoubleSummaryStatistics dssA = new DoubleSummaryStatistics();
+			dssA.accept(5.0);
+			DoubleSummaryStatistics dssB = new DoubleSummaryStatistics();
+			dssB.accept(Double.NaN);
+			dssA.combine(dssB);
+			boolean combSumNan = Double.isNaN(dssA.getSum());
+			boolean combAvgNan = Double.isNaN(dssA.getAverage());
+
+			ctx._source.out = [
+				'strs': [issStr1, issStr2 == issStr1, issStr3 == issStr1],
+				'zeroCount': [zeroCount.getCount(), zeroCount.getSum(), zeroCount.getMin(), zeroCount.getMax(), zeroCount.getAverage()],
+				'zeroDssCount': zeroDss.getCount(),
+				'nanAccept': [dssNan.getCount(), sumNan, minNan, maxNan, avgNan],
+				'nanCombine': [dssA.getCount(), combSumNan, combAvgNan]
+			];
+		`, nil)
+		m := got.(map[string]any)
+		if !reflect.DeepEqual(m["strs"], []any{
+			"IntSummaryStatistics{count=2, sum=10, min=3, average=5.000000, max=7}",
+			true,
+			true,
+		}) {
+			t.Fatalf("unexpected IntSummaryStatistics.toString(): %#v", m["strs"])
+		}
+		if !reflect.DeepEqual(m["zeroCount"], []any{
+			int64(0), int64(0), int64(math.MaxInt32), int64(math.MinInt32), float64(0),
+		}) {
+			t.Fatalf("unexpected 4-arg count==0 IntSummaryStatistics: %#v", m["zeroCount"])
+		}
+		if !reflect.DeepEqual(m["nanAccept"], []any{int64(2), true, true, true, true}) {
+			t.Fatalf("expected DoubleSummaryStatistics.accept(NaN) to propagate NaN: %#v", m["nanAccept"])
+		}
+		if !reflect.DeepEqual(m["nanCombine"], []any{int64(2), true, true}) {
+			t.Fatalf("expected DoubleSummaryStatistics.combine(NaN) to propagate NaN: %#v", m["nanCombine"])
+		}
+	})
+
+	t.Run("F23_F24_Collectors_Composition_3ArgGroupingBy_ToCollection_NullToMap_And_FlatMapOptional", func(t *testing.T) {
+		got := evalOut(t, `
+			List words = ["apple", "apricot", "banana", "blueberry", "avocado"];
+			Map grpMax = words.stream().collect(Collectors.groupingBy(
+				w -> w.substring(0, 1),
+				Collectors.collectingAndThen(Collectors.maxBy(Comparator.comparingInt(String::length)), Optional::get)
+			));
+			Map grp3Arg = words.stream().collect(Collectors.groupingBy(
+				w -> w.substring(0, 1),
+				TreeMap::new,
+				Collectors.counting()
+			));
+			Set unmodSet = Stream.of(3, 1, 2, 3, 1).collect(Collectors.toUnmodifiableSet());
+			Collection treeSetCol = Stream.of(30, 10, 20, 10).collect(Collectors.toCollection(TreeSet::new));
+
+			boolean errNullToMapVal = false;
+			try {
+				Stream.of("a").collect(Collectors.toMap(x -> x, x -> null));
+			} catch (NullPointerException e) {
+				errNullToMapVal = true;
+			}
+			boolean errNullUnmodMapKey = false;
+			try {
+				Stream.of("a").collect(Collectors.toUnmodifiableMap(x -> null, x -> x));
+			} catch (NullPointerException e) {
+				errNullUnmodMapKey = true;
+			}
+
+			List flatOpt = Stream.of("a", "", "b").flatMap(s -> s.isEmpty() ? Optional.empty().stream() : Optional.of(s.toUpperCase()).stream()).collect(Collectors.toList());
+			List orderedOut = new ArrayList();
+			Stream.of("x", "y", "z").map(String::toUpperCase).forEachOrdered(v -> orderedOut.add(v));
+			Object[] arrOut = Stream.of("p", "q").filter(s -> !s.isEmpty()).toArray();
+
+			ctx._source.out = [
+				'grpMax': grpMax,
+				'grp3Arg': grp3Arg,
+				'unmodSetSize': unmodSet.size(),
+				'treeSetCol': treeSetCol,
+				'nullErrs': [errNullToMapVal, errNullUnmodMapKey],
+				'flatOpt': flatOpt,
+				'orderedOut': orderedOut,
+				'arrOut': arrOut
+			];
+		`, nil)
+		m := got.(map[string]any)
+		if !reflect.DeepEqual(m["grpMax"], map[string]any{"a": "apricot", "b": "blueberry"}) {
+			t.Fatalf("unexpected groupingBy + collectingAndThen(maxBy, Optional::get): %#v", m["grpMax"])
+		}
+		if !reflect.DeepEqual(m["grp3Arg"], map[string]any{"a": int64(3), "b": int64(2)}) {
+			t.Fatalf("unexpected 3-arg groupingBy: %#v", m["grp3Arg"])
+		}
+		if m["unmodSetSize"] != int64(3) {
+			t.Fatalf("unexpected toUnmodifiableSet size: %#v", m["unmodSetSize"])
+		}
+		if !reflect.DeepEqual(m["treeSetCol"], []any{int64(10), int64(20), int64(30)}) {
+			t.Fatalf("unexpected toCollection(TreeSet::new): %#v", m["treeSetCol"])
+		}
+		if !reflect.DeepEqual(m["nullErrs"], []any{true, true}) {
+			t.Fatalf("expected NullPointerException on null value in toMap/toUnmodifiableMap: %#v", m["nullErrs"])
+		}
+		if !reflect.DeepEqual(m["flatOpt"], []any{"A", "B"}) {
+			t.Fatalf("unexpected flatMap with Optional.stream(): %#v", m["flatOpt"])
+		}
+		if !reflect.DeepEqual(m["orderedOut"], []any{"X", "Y", "Z"}) {
+			t.Fatalf("unexpected forEachOrdered: %#v", m["orderedOut"])
+		}
+		if !reflect.DeepEqual(m["arrOut"], []any{"p", "q"}) {
+			t.Fatalf("unexpected stream.filter().toArray(): %#v", m["arrOut"])
+		}
+	})
+
+	t.Run("F25_Matcher_PatternReturn_AnchoringBounds_And_Exceptions", func(t *testing.T) {
+		got := evalOut(t, `
+			Pattern p = Pattern.compile("^(?<word>[a-z]+)$");
+			Matcher m = p.matcher("hello");
+			boolean patSame = (m.pattern() instanceof Pattern) && m.pattern().pattern().equals("^(?<word>[a-z]+)$");
+
+			boolean errNoMatchGroup = false;
+			try { m.group(); } catch (IllegalStateException e) { errNoMatchGroup = true; }
+			boolean errNoMatchStart = false;
+			try { m.start(); } catch (IllegalStateException e) { errNoMatchStart = true; }
+			boolean errNoMatchEnd = false;
+			try { m.end(); } catch (IllegalStateException e) { errNoMatchEnd = true; }
+
+			boolean matched = m.matches();
+			boolean errOobGroup = false;
+			try { m.group(2); } catch (IndexOutOfBoundsException e) { errOobGroup = true; }
+			boolean errBadName = false;
+			try { m.group("nonexistent"); } catch (IllegalArgumentException e) { errBadName = true; }
+			boolean errBadRegion = false;
+			try { m.region(4, 2); } catch (IndexOutOfBoundsException e) { errBadRegion = true; }
+			boolean errBadFind = false;
+			try { m.find(99); } catch (IndexOutOfBoundsException e) { errBadFind = true; }
+
+			Matcher mBounds = Pattern.compile("^bcd$").matcher("abcdef");
+			mBounds.region(1, 4);
+			boolean findAnchored = mBounds.find();
+			mBounds.reset();
+			mBounds.region(1, 4);
+			mBounds.useAnchoringBounds(false);
+			boolean findUnanchored = mBounds.find();
+
+			ctx._source.out = [
+				'patSame': patSame,
+				'matched': matched,
+				'errs': [errNoMatchGroup, errNoMatchStart, errNoMatchEnd, errOobGroup, errBadName, errBadRegion, errBadFind],
+				'bounds': [findAnchored, findUnanchored]
+			];
+		`, nil)
+		m := got.(map[string]any)
+		if m["patSame"] != true || m["matched"] != true {
+			t.Fatalf("unexpected Matcher.pattern() or matches(): %#v", m)
+		}
+		if !reflect.DeepEqual(m["errs"], []any{true, true, true, true, true, true, true}) {
+			t.Fatalf("unexpected Matcher exception checks: %#v", m["errs"])
+		}
+		if !reflect.DeepEqual(m["bounds"], []any{true, false}) {
+			t.Fatalf("unexpected Matcher useAnchoringBounds results: %#v", m["bounds"])
+		}
+	})
+
+	t.Run("F26_TreeMap_NumericKeyOrder_DescendingMap_And_PollEntry", func(t *testing.T) {
+		got := evalOut(t, `
+			TreeMap tm = new TreeMap();
+			tm.put(10, "ten");
+			tm.put(2, "two");
+			tm.put(1, "one");
+			tm.put(20, "twenty");
+
+			def fk = tm.firstKey();
+			def lk = tm.lastKey();
+			def higher2 = tm.higherKey(2);
+			def floor5 = tm.floorKey(5);
+
+			def desc = tm.descendingMap();
+			def descFk = desc.firstKey();
+			def descLk = desc.lastKey();
+			def descHigher10 = desc.higherKey(10);
+			def descLower10 = desc.lowerKey(10);
+			def descFloor10 = desc.floorKey(10);
+			def descCeil10 = desc.ceilingKey(10);
+			def descFe = desc.firstEntry();
+			def descLe = desc.lastEntry();
+			def descAsc = desc.descendingMap();
+			def descNks = desc.navigableKeySet();
+			def descDks = desc.descendingKeySet();
+			def polledDescFirst = desc.pollFirstEntry();
+			int tmSizeAfterDescPoll = tm.size();
+			boolean tmHas20 = tm.containsKey(20);
+
+			URI u3 = new URI("mailto", "u s@example.com", "fr ag");
+			URI u5 = new URI("http", "example.com", "/p a", "q=1 2", "f r");
+			LongSummaryStatistics zLss = new LongSummaryStatistics(0L, 10L, -10L, 50L);
+			DoubleSummaryStatistics dssStrObj = new DoubleSummaryStatistics(2L, 1.5, 3.5, 5.0);
+
+			ctx._source.out = [
+				'order': [fk, lk, higher2, floor5],
+				'desc': [descFk, descHigher10, polledDescFirst.getKey(), polledDescFirst.getValue(), tmSizeAfterDescPoll, tmHas20],
+				'extra': [descLk, descLower10, descFloor10, descCeil10, descFe.getKey(), descLe.getKey(), descAsc.firstKey(), descNks.size(), descDks.size(), u3.isOpaque(), u5.getRawPath(), zLss.getCount(), dssStrObj.toString().startsWith("DoubleSummaryStatistics{")]
+			];
+		`, nil)
+		m := got.(map[string]any)
+		if !reflect.DeepEqual(m["order"], []any{"1", "20", "10", "2"}) {
+			t.Fatalf("unexpected numeric TreeMap key ordering: %#v", m["order"])
+		}
+		if !reflect.DeepEqual(m["desc"], []any{"20", "2", "20", "twenty", int64(3), false}) {
+			t.Fatalf("unexpected descendingMap navigation and pollFirstEntry backing map mutation: %#v", m["desc"])
+		}
+		if m["extra"] == nil {
+			t.Fatalf("expected extra coverage results")
+		}
+	})
+}

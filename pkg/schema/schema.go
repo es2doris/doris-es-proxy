@@ -278,6 +278,7 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 		if tb, ok := s.Fields[target]; ok {
 			if tb.Kind == StoragePromotedScalar && !IsTextLikeESType(tb.ESType) {
 				tb.Kind = StoragePromotedArray
+				tb.DorisType = DorisString
 				tb.IsMultiValued = true
 				s.Fields[target] = tb
 			} else if tb.Kind == StorageNestedSubfield && !IsTextLikeESType(tb.ESType) {
@@ -289,6 +290,7 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 					switch kwB.Kind {
 					case StoragePromotedScalar:
 						kwB.Kind = StoragePromotedArray
+						kwB.DorisType = DorisString
 						kwB.IsMultiValued = true
 						s.Fields[target+".keyword"] = kwB
 					case StorageNestedSubfield:
@@ -304,6 +306,7 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 						switch subB.Kind {
 						case StoragePromotedScalar:
 							subB.Kind = StoragePromotedArray
+							subB.DorisType = DorisString
 							subB.IsMultiValued = true
 							s.Fields[subK] = subB
 						case StorageNestedSubfield:

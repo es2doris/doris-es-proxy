@@ -29,7 +29,6 @@ import (
 	"crypto/sha512"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -1560,11 +1559,30 @@ func validateIngestPipelineProcessors(procs []any) error {
 				if !ok || len(tfs) == 0 {
 					return fmt.Errorf("[target_fields] required property is missing")
 				}
-				if sep, ok := specMap["separator"].(string); ok && utf8.RuneCountInString(sep) > 1 {
-					return fmt.Errorf("illegal_argument_exception: separator must be a single character")
+				for _, tfAny := range tfs {
+					tfStr, ok := tfAny.(string)
+					if !ok || strings.TrimSpace(tfStr) == "" {
+						return fmt.Errorf("illegal_argument_exception: [target_fields] must contain only non-empty strings")
+					}
 				}
-				if q, ok := specMap["quote"].(string); ok && utf8.RuneCountInString(q) > 1 {
-					return fmt.Errorf("illegal_argument_exception: quote must be a single character")
+				effSep := ","
+				if rawSep, hasSep := specMap["separator"]; hasSep && rawSep != nil {
+					sep, ok := rawSep.(string)
+					if !ok || utf8.RuneCountInString(sep) != 1 {
+						return fmt.Errorf("illegal_argument_exception: separator must be a single character")
+					}
+					effSep = sep
+				}
+				effQuote := `"`
+				if rawQ, hasQ := specMap["quote"]; hasQ && rawQ != nil {
+					q, ok := rawQ.(string)
+					if !ok || utf8.RuneCountInString(q) != 1 {
+						return fmt.Errorf("illegal_argument_exception: quote must be a single character")
+					}
+					effQuote = q
+				}
+				if effSep == effQuote {
+					return fmt.Errorf("illegal_argument_exception: separator and quote character cannot be the same [%s]", effSep)
 				}
 			case "date":
 				if _, err := reqStr("field"); err != nil {
@@ -1601,8 +1619,30 @@ func validateIngestPipelineProcessors(procs []any) error {
 				if _, err := reqStr("field"); err != nil {
 					return err
 				}
-				if _, ok := specMap["pattern"].(string); !ok {
-					return fmt.Errorf("[pattern] required property is missing")
+				pat, err := reqStr("pattern")
+				if err != nil {
+					return err
+				}
+				if strings.Count(pat, "%{") != strings.Count(pat, "}") {
+					return fmt.Errorf("illegal_argument_exception: invalid dissect pattern [%s]: unclosed token", pat)
+				}
+				for rem := pat; ; {
+					openIdx := strings.Index(rem, "%{")
+					if openIdx < 0 {
+						break
+					}
+					afterOpen := rem[openIdx+2:]
+					closeIdx := strings.IndexByte(afterOpen, '}')
+					nextOpen := strings.Index(afterOpen, "%{")
+					if closeIdx < 0 || (nextOpen >= 0 && nextOpen < closeIdx) {
+						return fmt.Errorf("illegal_argument_exception: invalid dissect pattern [%s]: unclosed token", pat)
+					}
+					rem = afterOpen[closeIdx+1:]
+				}
+				if rawSep, hasSep := specMap["append_separator"]; hasSep && rawSep != nil {
+					if _, ok := rawSep.(string); !ok {
+						return fmt.Errorf("illegal_argument_exception: [append_separator] must be a string")
+					}
 				}
 			case "grok", "redact":
 				if _, err := reqStr("field"); err != nil {
@@ -1722,6 +1762,56 @@ func validateIngestPipelineProcessors(procs []any) error {
 				}
 			case "terminate":
 				// Optional if/tag/description/ignore_failure/on_failure
+			case "community_id":
+				if rawSeed, hasSeed := specMap["seed"]; hasSeed && rawSeed != nil {
+					var seedInt int64
+					validSeed := false
+					switch sv := rawSeed.(type) {
+					case int:
+						seedInt = int64(sv)
+						validSeed = true
+					case int64:
+						seedInt = sv
+						validSeed = true
+					case float64:
+						if sv == math.Trunc(sv) {
+							seedInt = int64(sv)
+							validSeed = true
+						}
+					}
+					if !validSeed || seedInt < 0 || seedInt > 65535 {
+						return fmt.Errorf("illegal_argument_exception: [seed] must be an integer between 0 and 65535, got [%v]", rawSeed)
+					}
+				}
+			case "network_direction":
+				if rawNets, hasNets := specMap["internal_networks"]; hasNets && rawNets != nil {
+					netsArr, ok := rawNets.([]any)
+					if !ok || len(netsArr) == 0 {
+						return fmt.Errorf("illegal_argument_exception: [internal_networks] must be a non-empty list of network ranges or CIDRs")
+					}
+					for _, el := range netsArr {
+						ns, ok := el.(string)
+						if !ok || strings.TrimSpace(ns) == "" {
+							return fmt.Errorf("illegal_argument_exception: [internal_networks] entries must be non-empty strings")
+						}
+						norm := strings.ToLower(strings.TrimSpace(ns))
+						switch norm {
+						case "private", "loopback", "link_local", "multicast", "unspecified",
+							"iana_private", "rfc1918", "rfc6598", "carrier_grade_nat":
+						default:
+							if strings.Contains(norm, "{{") {
+								continue
+							}
+							if _, cidr, err := net.ParseCIDR(norm); err == nil && cidr != nil {
+								continue
+							}
+							if ip := net.ParseIP(norm); ip != nil {
+								continue
+							}
+							return fmt.Errorf("illegal_argument_exception: invalid network range or CIDR [%s] in [internal_networks]", ns)
+						}
+					}
+				}
 			}
 			if rawOnFail, hasOnFail := specMap["on_failure"]; hasOnFail && rawOnFail != nil {
 				onFail, ok := rawOnFail.([]any)
@@ -3152,6 +3242,15 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 			} else {
 				val = ""
 			}
+		} else if isLast {
+			if !strings.HasSuffix(cur, tok.nextLit) {
+				return nil, fmt.Errorf("unable to dissect [%s] with pattern [%s]: missing delimiter [%s]", input, pattern, tok.nextLit)
+			}
+			val = cur[:len(cur)-len(tok.nextLit)]
+			for tok.padRight && tok.nextLit != "" && strings.HasSuffix(val, tok.nextLit) {
+				val = val[:len(val)-len(tok.nextLit)]
+			}
+			cur = ""
 		} else {
 			idx := strings.Index(cur, tok.nextLit)
 			if idx < 0 {
@@ -3163,9 +3262,6 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 				for strings.HasPrefix(cur, tok.nextLit) {
 					cur = cur[len(tok.nextLit):]
 				}
-			}
-			if isLast && cur != "" {
-				return nil, fmt.Errorf("unable to dissect [%s] with pattern [%s]: trailing characters [%s]", input, pattern, cur)
 			}
 		}
 		captured[i] = val
@@ -5255,49 +5351,17 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						comma = rune(sepStr[0])
 					}
 				}
-				customQuote := rune(0)
-				if len(quoteStr) > 0 && quoteStr != `"` {
+				quoteChar := '"'
+				if len(quoteStr) > 0 {
 					if r, sz := utf8.DecodeRuneInString(quoteStr); sz > 0 && r != utf8.RuneError {
-						customQuote = r
+						quoteChar = r
 					} else {
-						customQuote = rune(quoteStr[0])
+						quoteChar = rune(quoteStr[0])
 					}
-					strVal = strings.Map(func(r rune) rune {
-						switch r {
-						case customQuote:
-							return '"'
-						case '"':
-							return customQuote
-						default:
-							return r
-						}
-					}, strVal)
 				}
-				if trimFlag {
-					reTrailingQuoteSpace := regexp.MustCompile(`"\s*(` + regexp.QuoteMeta(string(comma)) + `|$)`)
-					strVal = reTrailingQuoteSpace.ReplaceAllString(strVal, `"$1`)
-				}
-				cr := csv.NewReader(strings.NewReader(strVal))
-				cr.Comma = comma
-				cr.TrimLeadingSpace = trimFlag
-				cr.LazyQuotes = false
-				record, err := cr.Read()
+				record, quotedFlags, err := parseIngestCSVLine(strVal, comma, quoteChar, trimFlag)
 				if err != nil {
 					return false, false, procType, procTag, specMap, err
-				}
-				if customQuote != 0 {
-					for i, c := range record {
-						record[i] = strings.Map(func(r rune) rune {
-							switch r {
-							case customQuote:
-								return '"'
-							case '"':
-								return customQuote
-							default:
-								return r
-							}
-						}, c)
-					}
 				}
 				for idx, tfAny := range targetFields {
 					tfName, ok := tfAny.(string)
@@ -5306,10 +5370,12 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					}
 					tfName = expandIngestFieldName(tfName, doc)
 					var cell string
+					isQuoted := false
 					if idx < len(record) {
 						cell = record[idx]
+						isQuoted = quotedFlags[idx]
 					}
-					if trimFlag {
+					if trimFlag && !isQuoted {
 						cell = strings.TrimSpace(cell)
 					}
 					if cell == "" {
@@ -5511,7 +5577,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		ignoreMissing, _ := specMap["ignore_missing"].(bool)
 		if field != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				rawURI := fmt.Sprintf("%v", val)
+				rawURI, isStr := val.(string)
+				if !isStr {
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
+				}
 				parseInput := rawURI
 				syntheticScheme := false
 				if !strings.Contains(rawURI, "://") {
@@ -5520,12 +5589,21 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					if slashIdx >= 0 {
 						authority = rawURI[:slashIdx]
 					}
-					if atIdx := strings.IndexByte(authority, '@'); atIdx > 0 {
-						parseInput = "http://" + rawURI
-						syntheticScheme = true
-					} else if colonIdx := strings.IndexByte(authority, ':'); colonIdx > 0 && colonIdx+1 < len(authority) && authority[colonIdx+1] >= '0' && authority[colonIdx+1] <= '9' {
-						parseInput = "http://" + rawURI
-						syntheticScheme = true
+					opaqueScheme := false
+					if cIdx := strings.IndexByte(rawURI, ':'); cIdx > 0 {
+						switch strings.ToLower(rawURI[:cIdx]) {
+						case "mailto", "urn", "tel", "data", "sip", "sips", "xmpp", "news", "about", "javascript", "magnet", "geo", "sms", "blob":
+							opaqueScheme = true
+						}
+					}
+					if !opaqueScheme {
+						if strings.Contains(authority, "@") {
+							parseInput = "http://" + rawURI
+							syntheticScheme = true
+						} else if colonIdx := strings.IndexByte(authority, ':'); colonIdx > 0 && colonIdx+1 < len(authority) && authority[colonIdx+1] >= '0' && authority[colonIdx+1] <= '9' {
+							parseInput = "http://" + rawURI
+							syntheticScheme = true
+						}
 					}
 				}
 				u, err := url.Parse(parseInput)
@@ -5555,6 +5633,14 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					lastSlash := strings.LastIndexByte(u.Path, '/')
 					if dotIdx := strings.LastIndexByte(u.Path, '.'); dotIdx > lastSlash+1 && dotIdx+1 < len(u.Path) {
 						parts["extension"] = u.Path[dotIdx+1:]
+					}
+				} else if u.Opaque != "" {
+					parts["path"] = u.Opaque
+					if strings.EqualFold(u.Scheme, "mailto") {
+						if atIdx := strings.IndexByte(u.Opaque, '@'); atIdx > 0 && atIdx+1 < len(u.Opaque) {
+							parts["username"] = u.Opaque[:atIdx]
+							parts["domain"] = u.Opaque[atIdx+1:]
+						}
 					}
 				}
 				if u.RawQuery != "" {
@@ -9729,6 +9815,79 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, outResp)
 }
 
+func parseIngestCSVLine(line string, sep, quote rune, trim bool) ([]string, []bool, error) {
+	runes := []rune(line)
+	n := len(runes)
+	var fields []string
+	var quoted []bool
+	i := 0
+	for {
+		if trim {
+			for i < n && (runes[i] == ' ' || runes[i] == '\t') && runes[i] != sep && runes[i] != quote {
+				i++
+			}
+		}
+		if i < n && runes[i] == quote {
+			i++
+			var sb strings.Builder
+			closed := false
+			for i < n {
+				if runes[i] == quote {
+					if i+1 < n && runes[i+1] == quote {
+						sb.WriteRune(quote)
+						i += 2
+						continue
+					}
+					i++
+					closed = true
+					break
+				}
+				sb.WriteRune(runes[i])
+				i++
+			}
+			if !closed {
+				return nil, nil, fmt.Errorf("parse_exception: unterminated quoted field in csv")
+			}
+			if trim {
+				for i < n && (runes[i] == ' ' || runes[i] == '\t') && runes[i] != sep {
+					i++
+				}
+			}
+			if i < n && runes[i] != sep && runes[i] != '\r' && runes[i] != '\n' {
+				return nil, nil, fmt.Errorf("parse_exception: unexpected character after closing quote in csv")
+			}
+			fields = append(fields, sb.String())
+			quoted = append(quoted, true)
+		} else {
+			start := i
+			for i < n && runes[i] != sep && runes[i] != '\r' && runes[i] != '\n' {
+				if runes[i] == quote {
+					return nil, nil, fmt.Errorf("parse_exception: bare quote in unquoted csv field")
+				}
+				i++
+			}
+			val := string(runes[start:i])
+			if trim {
+				val = strings.TrimSpace(val)
+			}
+			fields = append(fields, val)
+			quoted = append(quoted, false)
+		}
+		if i >= n || runes[i] == '\r' || runes[i] == '\n' {
+			break
+		}
+		if runes[i] == sep {
+			i++
+			if i == n {
+				fields = append(fields, "")
+				quoted = append(quoted, false)
+				break
+			}
+		}
+	}
+	return fields, quoted, nil
+}
+
 func isIPInNetworkDirectionNets(ip net.IP, nets []string) bool {
 	if len(nets) == 0 {
 		nets = []string{"private"}
@@ -9736,8 +9895,19 @@ func isIPInNetworkDirectionNets(ip net.IP, nets []string) bool {
 	for _, entry := range nets {
 		entry = strings.ToLower(strings.TrimSpace(entry))
 		switch entry {
-		case "private":
+		case "private", "iana_private":
 			if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+				return true
+			}
+			if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+				return true
+			}
+		case "rfc1918":
+			if ip.IsPrivate() {
+				return true
+			}
+		case "rfc6598", "carrier_grade_nat":
+			if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
 				return true
 			}
 		case "loopback":
@@ -9750,6 +9920,10 @@ func isIPInNetworkDirectionNets(ip net.IP, nets []string) bool {
 			}
 		case "multicast":
 			if ip.IsMulticast() {
+				return true
+			}
+		case "unspecified":
+			if ip.IsUnspecified() {
 				return true
 			}
 		default:
@@ -9832,6 +10006,62 @@ func executeNetworkDirectionProcessor(doc map[string]any, specMap map[string]any
 	return true, nil
 }
 
+func communityIDICMPEquiv(proto uint8, icmpType uint16) (uint16, bool) {
+	switch proto {
+	case 1:
+		switch icmpType {
+		case 8:
+			return 0, true
+		case 0:
+			return 8, true
+		case 13:
+			return 14, true
+		case 14:
+			return 13, true
+		case 15:
+			return 16, true
+		case 16:
+			return 15, true
+		case 17:
+			return 18, true
+		case 18:
+			return 17, true
+		}
+	case 58:
+		switch icmpType {
+		case 128:
+			return 129, true
+		case 129:
+			return 128, true
+		case 130:
+			return 131, true
+		case 131:
+			return 130, true
+		case 133:
+			return 134, true
+		case 134:
+			return 133, true
+		case 135:
+			return 136, true
+		case 136:
+			return 135, true
+		case 139:
+			return 140, true
+		case 140:
+			return 139, true
+		case 144:
+			return 145, true
+		case 145:
+			return 144, true
+		case 146:
+			return 147, true
+		case 147:
+			return 146, true
+		}
+	}
+	return 0, false
+}
+
 func executeCommunityIDProcessor(doc map[string]any, specMap map[string]any) (bool, error) {
 	srcIPField := "source.ip"
 	if v, _ := specMap["source_ip"].(string); v != "" {
@@ -9894,12 +10124,17 @@ func executeCommunityIDProcessor(doc map[string]any, specMap map[string]any) (bo
 	if ip2 == nil {
 		ip2 = rawDstIP.To16()
 	}
+	if len(ip1) != len(ip2) {
+		return false, fmt.Errorf("illegal_argument_exception: source IP [%v] and destination IP [%v] must be of the same IP version", srcIPVal, dstIPVal)
+	}
 	var proto uint8 = 6
 	hasExplicitProto := false
 	if ianaVal, ok := getIngestPath(doc, ianaField); ok && ianaVal != nil {
 		if iv, okI := toInt64(ianaVal); okI && iv >= 0 && iv <= 255 {
 			proto = uint8(iv)
 			hasExplicitProto = true
+		} else {
+			return false, fmt.Errorf("illegal_argument_exception: invalid iana_number [%v]", ianaVal)
 		}
 	}
 	if !hasExplicitProto {
@@ -9925,31 +10160,90 @@ func executeCommunityIDProcessor(doc map[string]any, specMap map[string]any) (bo
 			}
 		}
 	}
+	parsePortInRange := func(raw any, maxVal int64, label string) (uint16, error) {
+		v, ok := toInt64(raw)
+		if !ok || v < 0 || v > maxVal {
+			return 0, fmt.Errorf("illegal_argument_exception: invalid %s [%v], must be between 0 and %d", label, raw, maxVal)
+		}
+		// #nosec G115 -- v is bounded to [0, maxVal] where maxVal <= 65535
+		return uint16(v), nil
+	}
 	var p1, p2 uint16
 	hasPorts := false
+	isOneWay := false
 	if proto == 1 || proto == 58 {
 		tVal, hasT := getIngestPath(doc, icmpTypeField)
 		cVal, hasC := getIngestPath(doc, icmpCodeField)
-		if hasT && tVal != nil && hasC && cVal != nil {
-			tv, ok1 := toInt64(tVal)
-			cv, ok2 := toInt64(cVal)
-			if ok1 && ok2 {
-				p1 = uint16(tv & 0xff)
-				p2 = uint16(cv & 0xff)
-				hasPorts = true
+		spVal, hasSP := getIngestPath(doc, srcPortField)
+		dpVal, hasDP := getIngestPath(doc, dstPortField)
+		var hasType, hasCode bool
+		if hasT && tVal != nil {
+			tv, err := parsePortInRange(tVal, 255, icmpTypeField)
+			if err != nil {
+				return false, err
 			}
+			p1 = tv
+			hasType = true
+		} else if hasSP && spVal != nil {
+			tv, err := parsePortInRange(spVal, 255, srcPortField)
+			if err != nil {
+				return false, err
+			}
+			p1 = tv
+			hasType = true
+		}
+		if hasC && cVal != nil {
+			cv, err := parsePortInRange(cVal, 255, icmpCodeField)
+			if err != nil {
+				return false, err
+			}
+			p2 = cv
+			hasCode = true
+		} else if hasDP && dpVal != nil {
+			cv, err := parsePortInRange(dpVal, 255, dstPortField)
+			if err != nil {
+				return false, err
+			}
+			p2 = cv
+			hasCode = true
+		}
+		if hasType {
+			hasPorts = true
+			if mirror, equiv := communityIDICMPEquiv(proto, p1); equiv {
+				p2 = mirror
+			} else if !hasCode {
+				p2 = 0
+				isOneWay = true
+			} else {
+				isOneWay = true
+			}
+		} else if hasCode {
+			return false, fmt.Errorf("illegal_argument_exception: icmp type / source_port is required when icmp code / destination_port is present")
 		}
 	} else {
 		spVal, hasSP := getIngestPath(doc, srcPortField)
 		dpVal, hasDP := getIngestPath(doc, dstPortField)
-		if hasSP && spVal != nil && hasDP && dpVal != nil {
-			sp, ok1 := toInt64(spVal)
-			dp, ok2 := toInt64(dpVal)
-			if ok1 && ok2 && sp >= 0 && sp <= 65535 && dp >= 0 && dp <= 65535 {
-				p1 = uint16(sp)
-				p2 = uint16(dp)
-				hasPorts = true
+		var okSP, okDP bool
+		if hasSP && spVal != nil {
+			sp, err := parsePortInRange(spVal, 65535, srcPortField)
+			if err != nil {
+				return false, err
 			}
+			p1 = sp
+			okSP = true
+		}
+		if hasDP && dpVal != nil {
+			dp, err := parsePortInRange(dpVal, 65535, dstPortField)
+			if err != nil {
+				return false, err
+			}
+			p2 = dp
+			okDP = true
+		}
+		if okSP && okDP {
+			hasPorts = true
+		} else if okSP || okDP {
+			return false, fmt.Errorf("illegal_argument_exception: both source_port and destination_port must be present")
 		}
 	}
 	if !hasExplicitProto && !hasPorts {
@@ -9958,10 +10252,12 @@ func executeCommunityIDProcessor(doc map[string]any, specMap map[string]any) (bo
 		}
 		return false, nil
 	}
-	cmp := bytes.Compare(ip1, ip2)
-	if cmp > 0 || (cmp == 0 && hasPorts && p1 > p2) {
-		ip1, ip2 = ip2, ip1
-		p1, p2 = p2, p1
+	if !isOneWay {
+		cmp := bytes.Compare(ip1, ip2)
+		if cmp > 0 || (cmp == 0 && hasPorts && p1 > p2) {
+			ip1, ip2 = ip2, ip1
+			p1, p2 = p2, p1
+		}
 	}
 	buf := make([]byte, 0, 48)
 	buf = append(buf, byte(seed>>8), byte(seed))

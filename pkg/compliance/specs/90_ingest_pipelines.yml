@@ -465,6 +465,73 @@
   - is_false: docs.0.doc._source.after_terminate
   - match: { docs.0.doc._source.area_poly: /^POLYGON \(\(.+\)\)$/ }
 
+---
+"Round 55 dissect suffix matching, community_id ICMP equivalence, csv quoted trim preservation, and uri_parts opaque URI":
+  - do:
+      catch: bad_request
+      ingest.put_pipeline:
+        id: r55_bad_dissect
+        body:
+          processors:
+            - dissect:
+                field: "msg"
+                pattern: ""
+
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - dissect:
+                  field: "bracketed"
+                  pattern: "[%{inner}]"
+              - csv:
+                  field: "csv_line"
+                  target_fields: ["c1", "c2"]
+                  trim: true
+              - uri_parts:
+                  field: "mailto_uri"
+                  target_field: "parsed_uri"
+              - community_id:
+                  source_ip: "src_ip"
+                  destination_ip: "dst_ip"
+                  transport: "proto"
+                  icmp_type: "icmp_t"
+                  icmp_code: "icmp_c"
+                  target_field: "cid"
+              - network_direction:
+                  source_ip: "src_ip"
+                  destination_ip: "dst_ip"
+                  internal_networks: ["private"]
+                  target_field: "net_dir"
+          docs:
+            - _source:
+                bracketed: "[hello]world]"
+                csv_line: '  "  keep_inner_spaces  " ,  trim_outer  '
+                mailto_uri: "mailto:alice@example.com"
+                src_ip: "192.168.1.10"
+                dst_ip: "8.8.8.8"
+                proto: "icmp"
+                icmp_t: 8
+                icmp_c: 0
+            - _source:
+                bracketed: "[x]"
+                csv_line: "a,b"
+                mailto_uri: "mailto:bob@example.com"
+                src_ip: "8.8.8.8"
+                dst_ip: "192.168.1.10"
+                proto: "icmp"
+                icmp_t: 0
+                icmp_c: 0
+  - match: { docs.0.doc._source.inner: "hello]world" }
+  - match: { docs.0.doc._source.c1: "  keep_inner_spaces  " }
+  - match: { docs.0.doc._source.c2: "trim_outer" }
+  - match: { docs.0.doc._source.parsed_uri.scheme: "mailto" }
+  - match: { docs.0.doc._source.net_dir: "outbound" }
+  - set: { docs.0.doc._source.cid: icmp_req_cid }
+  - match: { docs.1.doc._source.cid: $icmp_req_cid }
+
+
 
 
 
