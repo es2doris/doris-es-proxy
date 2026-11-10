@@ -2643,3 +2643,428 @@ func TestRound54AllNewEndpointsAndProcessors(t *testing.T) {
 		}
 	}
 }
+
+func TestRound55ProxyEndpointsAndIngestProcessors(t *testing.T) {
+	t.Parallel()
+	_, handler := newTestServerWithMock(t)
+
+	// Seed index and documents for SQL, EQL, Fleet, Graph, and Index Maintenance
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/r55_logs", `{"mappings":{"properties":{"host":{"type":"keyword"},"status":{"type":"integer"},"msg":{"type":"text"}}}}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/r55_logs/_doc/1", `{"host":"web-1","status":200,"msg":"ok"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/r55_logs/_doc/2", `{"host":"web-2","status":500,"msg":"error"}`)
+
+	// F2: Cluster Health Report API
+	if c, m, raw := doRound48Req(t, handler, http.MethodGet, "/_health_report", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_health_report, got %d: %s", c, raw)
+	} else if m["status"] != "green" || m["indicators"] == nil {
+		t.Fatalf("unexpected /_health_report payload: %v", m)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodHead, "/_health_report", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on HEAD /_health_report, got %d", c)
+	}
+	if c, m, _ := doRound48Req(t, handler, http.MethodGet, "/_health_report/disk", ``); c != http.StatusOK || m["indicators"] == nil {
+		t.Fatalf("expected 200 on GET /_health_report/disk, got %d: %v", c, m)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodHead, "/_health_report/disk", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on HEAD /_health_report/disk, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_health_report/unknown_ind", ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 on unknown health indicator, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodHead, "/_health_report/unknown_ind", ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 on HEAD unknown health indicator, got %d", c)
+	}
+
+	// F3: SQL REST API
+	c, sqlResp, raw := doRound48Req(t, handler, http.MethodPost, "/_sql", `{"query":"SELECT host, status FROM r55_logs WHERE host = 'web-1' ORDER BY status DESC LIMIT 5","fetch_size":1}`)
+	if c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_sql, got %d: %s", c, raw)
+	}
+	sqlID, _ := sqlResp["id"].(string)
+	if len(sqlResp["columns"].([]any)) != 2 || len(sqlResp["rows"].([]any)) != 1 || sqlID == "" {
+		t.Fatalf("unexpected /_sql response: %v", sqlResp)
+	}
+	// Pagination cursor &SHOW tables & literal SELECT
+	_, sqlCurResp, _ := doRound48Req(t, handler, http.MethodPost, "/_sql", `{"query":"SELECT * FROM r55_logs ORDER BY host ASC","fetch_size":1}`)
+	if curStr, _ := sqlCurResp["cursor"].(string); curStr != "" {
+		if c2, _, _ := doRound48Req(t, handler, http.MethodPost, "/_sql", `{"cursor":"`+curStr+`"}`); c2 != http.StatusOK {
+			t.Fatalf("expected 200 on /_sql cursor continuation, got %d", c2)
+		}
+		if c3, _, _ := doRound48Req(t, handler, http.MethodPost, "/_sql/close", `{"cursor":"`+curStr+`"}`); c3 != http.StatusOK {
+			t.Fatalf("expected 200 on /_sql/close, got %d", c3)
+		}
+	}
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_sql", `{"query":"SELECT 42 AS answer"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_sql", `{"query":"SELECT 3.14 AS pi"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_sql", `{"query":"SELECT 'hello' AS greeting"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_sql", `{"query":"SELECT host AS h, status FROM r55_logs WHERE host = 'web-1' ORDER BY host DESC LIMIT 1"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_sql", `{"query":"SELECT * FROM missing_r55_table"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_sql", `{"query":"SHOW TABLES"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_sql?format=csv", `{"query":"SELECT host, status FROM r55_logs"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_sql?format=tsv", `{"query":"SELECT host, status FROM r55_logs"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_sql?format=txt", `{"query":"SELECT host, status FROM r55_logs"}`)
+	if c, trResp, _ := doRound48Req(t, handler, http.MethodPost, "/_sql/translate", `{"query":"SELECT * FROM r55_logs WHERE host = 'web-1' ORDER BY status DESC LIMIT 5","fetch_size":25,"filter":{"term":{"host":"web-1"}}}`); c != http.StatusOK || trResp["query"] == nil {
+		t.Fatalf("expected 200 on /_sql/translate, got %d: %v", c, trResp)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_sql/async/"+sqlID, ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_sql/async/%s, got %d", sqlID, c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodHead, "/_sql/async/"+sqlID, ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on HEAD /_sql/async/%s, got %d", sqlID, c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_sql/async/status/"+sqlID, ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_sql/async/status/%s, got %d", sqlID, c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodHead, "/_sql/async/status/"+sqlID, ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on HEAD /_sql/async/status/%s, got %d", sqlID, c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_sql/async/"+sqlID, ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE /_sql/async/%s, got %d", sqlID, c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_sql/async/"+sqlID, ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 after DELETE /_sql/async/%s, got %d", sqlID, c)
+	}
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_sql/async/"+sqlID, ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_sql/async/status/"+sqlID, ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_sql/async/status/"+sqlID, ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_sql/close", `{}`)
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_sql", `{}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on empty /_sql query, got %d", c)
+	}
+
+	// F4: EQL Search API
+	c, eqlResp, raw := doRound48Req(t, handler, http.MethodPost, "/r55_logs/_eql/search", `{"query":"any where true","size":5,"filter":{"term":{"host":"web-1"}}}`)
+	if c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /r55_logs/_eql/search, got %d: %s", c, raw)
+	}
+	eqlID, _ := eqlResp["id"].(string)
+	eqlHits, _ := eqlResp["hits"].(map[string]any)
+	if eqlID == "" || eqlHits == nil || len(eqlHits["events"].([]any)) != 1 {
+		t.Fatalf("unexpected EQL search response: %v", eqlResp)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_eql/search/"+eqlID, ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_eql/search/%s, got %d", eqlID, c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodHead, "/_eql/search/"+eqlID, ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on HEAD /_eql/search/%s, got %d", eqlID, c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_eql/search/status/"+eqlID, ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_eql/search/status/%s, got %d", eqlID, c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodHead, "/_eql/search/status/"+eqlID, ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on HEAD /_eql/search/status/%s, got %d", eqlID, c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_eql/search/"+eqlID, ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE /_eql/search/%s, got %d", eqlID, c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_eql/search/"+eqlID, ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 after DELETE /_eql/search/%s, got %d", eqlID, c)
+	}
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_eql/search/"+eqlID, ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_eql/search/status/"+eqlID, ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_eql/search/status/"+eqlID, ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodDelete, "/_eql/search/delete/"+eqlID, ``)
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/r55_logs/_eql/search", `{}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on empty EQL query, got %d", c)
+	}
+
+	// F5: Index Maintenance & Snapshot Lifecycle
+	for _, ep := range []struct{ method, path string }{
+		{http.MethodPost, "/r55_logs/_reload_search_analyzers"},
+		{http.MethodGet, "/_reload_search_analyzers"},
+		{http.MethodPost, "/r55_logs/_disk_usage"},
+		{http.MethodGet, "/_disk_usage"},
+		{http.MethodGet, "/r55_logs/_field_usage_stats"},
+		{http.MethodHead, "/r55_logs/_field_usage_stats"},
+		{http.MethodGet, "/_field_usage_stats"},
+	} {
+		if c, _, raw := doRound48Req(t, handler, ep.method, ep.path, ``); c != http.StatusOK {
+			t.Fatalf("expected 200 on %s %s, got %d: %s", ep.method, ep.path, c, raw)
+		}
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/missing_idx/_disk_usage", ``); c != http.StatusNotFound {
+		t.Fatalf("expected 404 on missing index _disk_usage, got %d", c)
+	}
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/missing_idx/_reload_search_analyzers", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/missing_idx/_field_usage_stats", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_snapshot/r55_repo", `{"type":"fs","settings":{"location":"/tmp/r55_repo"}}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_snapshot/r55_repo/snap_1", `{"indices":"r55_logs"}`)
+	if c, m, raw := doRound48Req(t, handler, http.MethodPost, "/_snapshot/r55_repo/_cleanup", ``); c != http.StatusOK || m["results"] == nil {
+		t.Fatalf("expected 200 on POST /_snapshot/r55_repo/_cleanup, got %d: %s", c, raw)
+	}
+	if c, m, raw := doRound48Req(t, handler, http.MethodPost, "/_snapshot/r55_repo/snap_1/_clone/snap_2", `{"indices":"r55_logs"}`); c != http.StatusOK || m["snapshot"] == nil {
+		t.Fatalf("expected 200 on snapshot _clone, got %d: %s", c, raw)
+	}
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_snapshot/r55_repo/snap_1/_clone/snap_3", `{"indices":["r55_logs"]}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_snapshot/r55_repo/snap_1/_clone/snap_2", `{"indices":"r55_logs"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_snapshot/missing_repo/snap_1/_clone/snap_x", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_snapshot/r55_repo/missing_snap/_clone/snap_x", `{}`)
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_snapshot/r55_repo/snap_2", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on cloned snapshot GET, got %d", c)
+	}
+
+	// F6: Machine Learning API
+	for _, step := range []struct{ method, path, body string }{
+		{http.MethodGet, "/_ml/info", ``},
+		{http.MethodHead, "/_ml/info", ``},
+		{http.MethodGet, "/_ml/memory_stats", ``},
+		{http.MethodHead, "/_ml/memory_stats", ``},
+		{http.MethodPost, "/_ml/set_upgrade_mode?enabled=true", ``},
+		{http.MethodPut, "/_ml/anomaly_detectors/job_1", `{"analysis_config":{"bucket_span":"15m","detectors":[{"function":"count"}]},"data_description":{"time_field":"@timestamp"}}`},
+		{http.MethodGet, "/_ml/anomaly_detectors/job_1", ``},
+		{http.MethodHead, "/_ml/anomaly_detectors/job_1", ``},
+		{http.MethodGet, "/_ml/anomaly_detectors", ``},
+		{http.MethodPost, "/_ml/anomaly_detectors/job_1/_open", ``},
+		{http.MethodPost, "/_ml/anomaly_detectors/job_1/_flush", ``},
+		{http.MethodPost, "/_ml/anomaly_detectors/job_1/_update", `{"description":"updated job"}`},
+		{http.MethodGet, "/_ml/anomaly_detectors/job_1/_stats", ``},
+		{http.MethodHead, "/_ml/anomaly_detectors/job_1/_stats", ``},
+		{http.MethodGet, "/_ml/anomaly_detectors/_stats", ``},
+		{http.MethodPost, "/_ml/anomaly_detectors/job_1/_close", ``},
+		{http.MethodPut, "/_ml/datafeeds/df_1", `{"job_id":"job_1","indices":["r55_logs"]}`},
+		{http.MethodGet, "/_ml/datafeeds/df_1", ``},
+		{http.MethodHead, "/_ml/datafeeds/df_1", ``},
+		{http.MethodGet, "/_ml/datafeeds", ``},
+		{http.MethodPost, "/_ml/datafeeds/df_1/_start", ``},
+		{http.MethodPost, "/_ml/datafeeds/df_1/_update", `{"scroll_size":500}`},
+		{http.MethodGet, "/_ml/datafeeds/df_1/_preview", ``},
+		{http.MethodGet, "/_ml/datafeeds/df_1/_stats", ``},
+		{http.MethodHead, "/_ml/datafeeds/df_1/_stats", ``},
+		{http.MethodGet, "/_ml/datafeeds/_stats", ``},
+		{http.MethodPost, "/_ml/datafeeds/df_1/_stop", ``},
+		{http.MethodPut, "/_ml/trained_models/model_1", `{"description":"test model","input":{"field_names":["msg"]}}`},
+		{http.MethodGet, "/_ml/trained_models/model_1", ``},
+		{http.MethodHead, "/_ml/trained_models/model_1", ``},
+		{http.MethodGet, "/_ml/trained_models", ``},
+		{http.MethodGet, "/_ml/trained_models/model_1/_stats", ``},
+		{http.MethodHead, "/_ml/trained_models/model_1/_stats", ``},
+		{http.MethodGet, "/_ml/trained_models/_stats", ``},
+		{http.MethodPut, "/_ml/calendars/cal_1", `{"description":"maint"}`},
+		{http.MethodGet, "/_ml/calendars/cal_1", ``},
+		{http.MethodHead, "/_ml/calendars/cal_1", ``},
+		{http.MethodGet, "/_ml/calendars", ``},
+		{http.MethodPut, "/_ml/calendars/cal_1/jobs/job_1", ``},
+		{http.MethodPost, "/_ml/calendars/cal_1/events", `{"events":[{"description":"outage","start_time":1700000000000,"end_time":1700003600000,"event_id":"ev_1"}]}`},
+		{http.MethodGet, "/_ml/calendars/cal_1/events", ``},
+		{http.MethodHead, "/_ml/calendars/cal_1/events", ``},
+		{http.MethodDelete, "/_ml/calendars/cal_1/events/ev_1", ``},
+		{http.MethodDelete, "/_ml/calendars/cal_1/jobs/job_1", ``},
+		{http.MethodPut, "/_ml/filters/f_1", `{"description":"safe hosts","items":["web-1"]}`},
+		{http.MethodPost, "/_ml/filters/f_1/_update", `{"add_items":["web-2"],"remove_items":["web-1"]}`},
+		{http.MethodGet, "/_ml/filters/f_1", ``},
+		{http.MethodHead, "/_ml/filters/f_1", ``},
+		{http.MethodGet, "/_ml/filters", ``},
+	} {
+		if c, _, raw := doRound48Req(t, handler, step.method, step.path, step.body); c != http.StatusOK {
+			t.Fatalf("expected 200 on %s %s, got %d: %s", step.method, step.path, c, raw)
+		}
+	}
+	// Exercise ML 404 branches
+	for _, nf := range []struct{ method, path string }{
+		{http.MethodGet, "/_ml/anomaly_detectors/missing"},
+		{http.MethodHead, "/_ml/anomaly_detectors/missing"},
+		{http.MethodDelete, "/_ml/anomaly_detectors/missing"},
+		{http.MethodPost, "/_ml/anomaly_detectors/missing/_open"},
+		{http.MethodGet, "/_ml/anomaly_detectors/missing/_stats"},
+		{http.MethodGet, "/_ml/datafeeds/missing"},
+		{http.MethodHead, "/_ml/datafeeds/missing"},
+		{http.MethodDelete, "/_ml/datafeeds/missing"},
+		{http.MethodPost, "/_ml/datafeeds/missing/_start"},
+		{http.MethodGet, "/_ml/datafeeds/missing/_stats"},
+		{http.MethodGet, "/_ml/trained_models/missing"},
+		{http.MethodHead, "/_ml/trained_models/missing"},
+		{http.MethodDelete, "/_ml/trained_models/missing"},
+		{http.MethodGet, "/_ml/trained_models/missing/_stats"},
+		{http.MethodGet, "/_ml/calendars/missing"},
+		{http.MethodHead, "/_ml/calendars/missing"},
+		{http.MethodDelete, "/_ml/calendars/missing"},
+		{http.MethodGet, "/_ml/calendars/missing/events"},
+		{http.MethodGet, "/_ml/filters/missing"},
+		{http.MethodHead, "/_ml/filters/missing"},
+		{http.MethodDelete, "/_ml/filters/missing"},
+		{http.MethodPost, "/_ml/filters/missing/_update"},
+	} {
+		if c, _, _ := doRound48Req(t, handler, nf.method, nf.path, `{}`); c != http.StatusNotFound {
+			t.Fatalf("expected 404 on %s %s, got %d", nf.method, nf.path, c)
+		}
+	}
+
+	// F7: Security Role Mappings, Builtin Privileges, Enrollment, and Cache Clearing
+	for _, step := range []struct{ method, path, body string }{
+		{http.MethodPut, "/_security/role_mapping/rm_1", `{"roles":["superuser"],"enabled":true,"rules":{"field":{"username":"*"}}}`},
+		{http.MethodGet, "/_security/role_mapping/rm_1", ``},
+		{http.MethodHead, "/_security/role_mapping/rm_1", ``},
+		{http.MethodGet, "/_security/role_mapping", ``},
+		{http.MethodHead, "/_security/role_mapping", ``},
+		{http.MethodDelete, "/_security/role_mapping/rm_1", ``},
+		{http.MethodGet, "/_security/privilege/_builtin", ``},
+		{http.MethodHead, "/_security/privilege/_builtin", ``},
+		{http.MethodPost, "/_security/enroll/kibana", ``},
+		{http.MethodPost, "/_security/enroll/node", ``},
+		{http.MethodPut, "/_security/role/r55_role", `{"cluster":["all"]}`},
+		{http.MethodPost, "/_security/role/r55_role/_clear_cache", ``},
+		{http.MethodPost, "/_security/user/elastic/_clear_cache", ``},
+		{http.MethodPost, "/_security/realm/default_native/_clear_cache", ``},
+	} {
+		if c, _, raw := doRound48Req(t, handler, step.method, step.path, step.body); c != http.StatusOK {
+			t.Fatalf("expected 200 on %s %s, got %d: %s", step.method, step.path, c, raw)
+		}
+	}
+
+	// F8: Fleet & Graph Explore
+	for _, step := range []struct{ method, path, body string }{
+		{http.MethodPost, "/r55_logs/_fleet/search", `{"query":{"match_all":{}}}`},
+		{http.MethodPost, "/_fleet/search", `{"query":{"match_all":{}}}`},
+		{http.MethodPost, "/r55_logs/_fleet/msearch", "{}\n{\"query\":{\"match_all\":{}}}\n"},
+		{http.MethodPost, "/_fleet/msearch", "{}\n{\"query\":{\"match_all\":{}}}\n"},
+		{http.MethodGet, "/r55_logs/_fleet/global_checkpoints", ``},
+		{http.MethodHead, "/r55_logs/_fleet/global_checkpoints", ``},
+		{http.MethodGet, "/_fleet/global_checkpoints", ``},
+		{http.MethodPost, "/r55_logs/_graph/explore", `{"query":{"match_all":{}}}`},
+		{http.MethodPost, "/_graph/explore", `{"query":{"match_all":{}}}`},
+	} {
+		if c, _, raw := doRound48Req(t, handler, step.method, step.path, step.body); c != http.StatusOK {
+			t.Fatalf("expected 200 on %s %s, got %d: %s", step.method, step.path, c, raw)
+		}
+	}
+
+	// F9: _cat/component_templates, _cat/ml_*, _cluster/info, _nodes/repositories_metering
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_component_template/ct_r55", `{"template":{"settings":{"number_of_shards":1},"mappings":{"properties":{"f":{"type":"keyword"}}}}}`)
+	for _, step := range []struct{ method, path string }{
+		{http.MethodHead, "/_component_template/ct_r55"},
+		{http.MethodGet, "/_cat/component_templates"},
+		{http.MethodGet, "/_cat/component_templates?format=json"},
+		{http.MethodGet, "/_cat/component_templates/ct_r55?format=json"},
+		{http.MethodHead, "/_cat/component_templates/ct_r55"},
+		{http.MethodGet, "/_cat/ml_anomaly_detectors"},
+		{http.MethodGet, "/_cat/ml_anomaly_detectors?format=json"},
+		{http.MethodGet, "/_cat/ml_jobs/job_1?format=json"},
+		{http.MethodGet, "/_cat/ml_datafeeds"},
+		{http.MethodGet, "/_cat/ml_datafeeds?format=json"},
+		{http.MethodGet, "/_cat/ml_trained_models"},
+		{http.MethodGet, "/_cat/ml_trained_models?format=json"},
+		{http.MethodGet, "/_cat/ml_data_frame_analytics"},
+		{http.MethodGet, "/_cat/ml_data_frame_analytics?format=json"},
+		{http.MethodHead, "/_cat/ml_jobs"},
+		{http.MethodGet, "/_cluster/info"},
+		{http.MethodHead, "/_cluster/info"},
+		{http.MethodGet, "/_cluster/info/*"},
+		{http.MethodGet, "/_cluster/info/http,ingest,aggregations"},
+		{http.MethodGet, "/_nodes/repositories_metering"},
+		{http.MethodHead, "/_nodes/repositories_metering"},
+		{http.MethodGet, "/_nodes/doris-fe-1/repositories_metering"},
+		{http.MethodDelete, "/_nodes/clear_repositories_metering_archive/1"},
+		{http.MethodDelete, "/_nodes/doris-fe-1/clear_repositories_metering_archive/1"},
+	} {
+		if c, _, raw := doRound48Req(t, handler, step.method, step.path, ``); c != http.StatusOK {
+			t.Fatalf("expected 200 on %s %s, got %d: %s", step.method, step.path, c, raw)
+		}
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_cluster/info/invalid_target", ``); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on /_cluster/info/invalid_target, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_nodes/clear_repositories_metering_archive/not_an_int", ``); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on /_nodes/clear_repositories_metering_archive/not_an_int, got %d", c)
+	}
+	// Clean up ML resources & verify reset
+	for _, delPath := range []string{
+		"/_ml/datafeeds/df_1",
+		"/_ml/anomaly_detectors/job_1",
+		"/_ml/trained_models/model_1",
+		"/_ml/calendars/cal_1",
+		"/_ml/filters/f_1",
+	} {
+		if c, _, raw := doRound48Req(t, handler, http.MethodDelete, delPath, ``); c != http.StatusOK {
+			t.Fatalf("expected 200 on DELETE %s, got %d: %s", delPath, c, raw)
+		}
+	}
+
+	// F27-F29: Ingest Pipeline Validation & Processor Execution
+	for _, badPipe := range []string{
+		`{"processors":[{"dissect":{"field":"msg","pattern":"   "}}]}`,
+		`{"processors":[{"dissect":{"field":"msg","pattern":"%{unclosed"}}]}`,
+		`{"processors":[{"dissect":{"field":"msg","pattern":"%{a} %{b","append_separator":","}}]}`,
+		`{"processors":[{"dissect":{"field":"msg","pattern":"%{a}","append_separator":123}}]}`,
+		`{"processors":[{"community_id":{"seed":-1}}]}`,
+		`{"processors":[{"community_id":{"seed":70000}}]}`,
+		`{"processors":[{"community_id":{"seed":"not_an_int"}}]}`,
+		`{"processors":[{"network_direction":{"internal_networks":["not_a_cidr_or_range"]}}]}`,
+		`{"processors":[{"network_direction":{"internal_networks":[]}}]}`,
+		`{"processors":[{"csv":{"field":"f","target_fields":["a",""]}}]}`,
+		`{"processors":[{"csv":{"field":"f","target_fields":["a"],"separator":",","quote":","}}]}`,
+		`{"processors":[{"csv":{"field":"f","target_fields":["a"],"separator":""}}]}`,
+		`{"processors":[{"csv":{"field":"f","target_fields":["a"],"quote":""}}]}`,
+	} {
+		if c, _, raw := doRound48Req(t, handler, http.MethodPut, "/_ingest/pipeline/bad_r55", badPipe); c != http.StatusBadRequest {
+			t.Fatalf("expected 400 for invalid pipeline %s, got %d: %s", badPipe, c, raw)
+		}
+	}
+
+	// Simulate F27 (dissect trailing delimiter with interior occurrences), F28 (community_id ICMP request/reply equivalence & network_direction named ranges), F29 (csv quoted whitespace with trim:true & uri_parts opaque URI)
+	simR55 := `{
+		"pipeline": {
+			"processors": [
+				{"dissect": {"field": "bracket_msg", "pattern": "[%{inner}]"}},
+				{"csv": {"field": "csv_line", "target_fields": ["col_q", "col_u"], "trim": true}},
+				{"uri_parts": {"field": "mailto_uri", "target_field": "parsed_mailto"}},
+				{"network_direction": {"source_ip": "cgn_ip", "destination_ip": "pub_ip", "target_field": "cgn_dir", "internal_networks": ["rfc6598"]}},
+				{"community_id": {"source_ip": "icmp_req_src", "destination_ip": "icmp_req_dst", "icmp_type": "icmp_req_type", "icmp_code": "icmp_req_code", "transport": "icmp_proto", "target_field": "cid_req"}},
+				{"community_id": {"source_ip": "icmp_rep_src", "destination_ip": "icmp_rep_dst", "icmp_type": "icmp_rep_type", "icmp_code": "icmp_rep_code", "transport": "icmp_proto", "target_field": "cid_rep"}}
+			]
+		},
+		"docs": [
+			{
+				"_source": {
+					"bracket_msg": "[a]b]",
+					"csv_line": "  \"  keep_spaces  \"  ,  trim_me  ",
+					"mailto_uri": "mailto:alice@example.com",
+					"cgn_ip": "100.64.1.1",
+					"pub_ip": "8.8.8.8",
+					"icmp_proto": "icmp",
+					"icmp_req_src": "10.0.0.1",
+					"icmp_req_dst": "10.0.0.2",
+					"icmp_req_type": 8,
+					"icmp_req_code": 0,
+					"icmp_rep_src": "10.0.0.2",
+					"icmp_rep_dst": "10.0.0.1",
+					"icmp_rep_type": 0,
+					"icmp_rep_code": 0
+				}
+			}
+		]
+	}`
+	c, simMap, raw := doRound48Req(t, handler, http.MethodPost, "/_ingest/pipeline/_simulate", simR55)
+	if c != http.StatusOK {
+		t.Fatalf("expected 200 on R55 _simulate, got %d: %s", c, raw)
+	}
+	simSrc := simMap["docs"].([]any)[0].(map[string]any)["doc"].(map[string]any)["_source"].(map[string]any)
+	if simSrc["inner"] != "a]b" {
+		t.Fatalf("expected dissect inner='a]b', got %v", simSrc["inner"])
+	}
+	if simSrc["col_q"] != "  keep_spaces  " || simSrc["col_u"] != "trim_me" {
+		t.Fatalf("expected csv col_q='  keep_spaces  ' and col_u='trim_me', got col_q=%q col_u=%q", simSrc["col_q"], simSrc["col_u"])
+	}
+	mailtoMap, _ := simSrc["parsed_mailto"].(map[string]any)
+	if mailtoMap["scheme"] != "mailto" || mailtoMap["path"] != "alice@example.com" || mailtoMap["username"] != "alice" || mailtoMap["domain"] != "example.com" {
+		t.Fatalf("unexpected uri_parts mailto result: %v", mailtoMap)
+	}
+	if simSrc["cgn_dir"] != "outbound" {
+		t.Fatalf("expected rfc6598 cgn_dir='outbound', got %v", simSrc["cgn_dir"])
+	}
+	if simSrc["cid_req"] == nil || simSrc["cid_req"] != simSrc["cid_rep"] {
+		t.Fatalf("expected ICMP Echo Request and Echo Reply community_id to match, got req=%v rep=%v", simSrc["cid_req"], simSrc["cid_rep"])
+	}
+
+	// Verify runtime errors for mixed IPv4/IPv6 in community_id, out-of-range port, and non-string uri_parts
+	for _, errSim := range []string{
+		`{"pipeline":{"processors":[{"community_id":{}}]},"docs":[{"_source":{"source":{"ip":"10.0.0.1","port":80},"destination":{"ip":"2001:db8::1","port":80}}}]}`,
+		`{"pipeline":{"processors":[{"community_id":{}}]},"docs":[{"_source":{"source":{"ip":"10.0.0.1","port":99999},"destination":{"ip":"10.0.0.2","port":80}}}]}`,
+		`{"pipeline":{"processors":[{"uri_parts":{"field":"bad_uri"}}]},"docs":[{"_source":{"bad_uri":12345}}]}`,
+	} {
+		_, errMap, _ := doRound48Req(t, handler, http.MethodPost, "/_ingest/pipeline/_simulate", errSim)
+		docEntry, _ := errMap["docs"].([]any)[0].(map[string]any)
+		if docEntry["error"] == nil {
+			t.Fatalf("expected processor error in _simulate for %s, got %v", errSim, docEntry)
+		}
+	}
+}

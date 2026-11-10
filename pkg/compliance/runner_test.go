@@ -2455,3 +2455,279 @@ func TestRound54ActionBuildersAndRunnerFeatures(t *testing.T) {
 
 	ctx.cleanupAll()
 }
+
+func TestRound55BuildActionRequestAndOperatorsF0F1(t *testing.T) {
+	cases := []struct {
+		name       string
+		action     string
+		params     map[string]any
+		wantMethod string
+		wantPath   string
+		wantQuery  string
+	}{
+		{"health_report all", "health_report", map[string]any{}, http.MethodGet, "/_health_report", ""},
+		{"health_report indicator", "health_report", map[string]any{"indicator": "shards_availability"}, http.MethodGet, "/_health_report/shards_availability", ""},
+		{"sql.query", "sql.query", map[string]any{"format": "txt"}, http.MethodPost, "/_sql", "format=txt"},
+		{"sql.translate", "sql.translate", map[string]any{}, http.MethodPost, "/_sql/translate", ""},
+		{"sql.clear_cursor", "sql.clear_cursor", map[string]any{}, http.MethodPost, "/_sql/close", ""},
+		{"sql.close", "sql.close", map[string]any{}, http.MethodPost, "/_sql/close", ""},
+		{"sql.get_async", "sql.get_async", map[string]any{"id": "sq1"}, http.MethodGet, "/_sql/async/sq1", ""},
+		{"sql.get_async_status", "sql.get_async_status", map[string]any{"id": "sq1"}, http.MethodGet, "/_sql/async/status/sq1", ""},
+		{"sql.delete_async", "sql.delete_async", map[string]any{"id": "sq1"}, http.MethodDelete, "/_sql/async/sq1", ""},
+		{"eql.search with index", "eql.search", map[string]any{"index": "logs-1"}, http.MethodPost, "/logs-1/_eql/search", ""},
+		{"eql.search without index", "eql.search", map[string]any{}, http.MethodPost, "/_eql/search", ""},
+		{"eql.get", "eql.get", map[string]any{"id": "eq1"}, http.MethodGet, "/_eql/search/eq1", ""},
+		{"eql.get_status", "eql.get_status", map[string]any{"id": "eq1"}, http.MethodGet, "/_eql/search/status/eq1", ""},
+		{"eql.delete", "eql.delete", map[string]any{"id": "eq1"}, http.MethodDelete, "/_eql/search/eq1", ""},
+		{"fleet.msearch with index", "fleet.msearch", map[string]any{"index": "fl-idx"}, http.MethodPost, "/fl-idx/_fleet/msearch", ""},
+		{"fleet.msearch without index", "fleet.msearch", map[string]any{}, http.MethodPost, "/_fleet/msearch", ""},
+		{"fleet.search with index", "fleet.search", map[string]any{"index": "fl-idx"}, http.MethodPost, "/fl-idx/_fleet/search", ""},
+		{"fleet.search without index", "fleet.search", map[string]any{}, http.MethodPost, "/_fleet/search", ""},
+		{"fleet.global_checkpoints", "fleet.global_checkpoints", map[string]any{"index": "fl-idx"}, http.MethodGet, "/fl-idx/_fleet/global_checkpoints", ""},
+		{"graph.explore with index", "graph.explore", map[string]any{"index": "gr-idx"}, http.MethodPost, "/gr-idx/_graph/explore", ""},
+		{"graph.explore without index", "graph.explore", map[string]any{}, http.MethodPost, "/_graph/explore", ""},
+		{"ml.info", "ml.info", map[string]any{}, http.MethodGet, "/_ml/info", ""},
+		{"ml.get_memory_stats", "ml.get_memory_stats", map[string]any{}, http.MethodGet, "/_ml/memory_stats", ""},
+		{"ml.set_upgrade_mode", "ml.set_upgrade_mode", map[string]any{"enabled": true}, http.MethodPost, "/_ml/set_upgrade_mode", "enabled=true"},
+		{"ml.put_job", "ml.put_job", map[string]any{"job_id": "j1"}, http.MethodPut, "/_ml/anomaly_detectors/j1", ""},
+		{"ml.get_jobs specific", "ml.get_jobs", map[string]any{"job_id": "j1"}, http.MethodGet, "/_ml/anomaly_detectors/j1", ""},
+		{"ml.get_jobs all", "ml.get_jobs", map[string]any{}, http.MethodGet, "/_ml/anomaly_detectors", ""},
+		{"ml.get_job_stats specific", "ml.get_job_stats", map[string]any{"job_id": "j1"}, http.MethodGet, "/_ml/anomaly_detectors/j1/_stats", ""},
+		{"ml.get_job_stats all", "ml.get_job_stats", map[string]any{}, http.MethodGet, "/_ml/anomaly_detectors/_stats", ""},
+		{"ml.update_job", "ml.update_job", map[string]any{"job_id": "j1"}, http.MethodPost, "/_ml/anomaly_detectors/j1/_update", ""},
+		{"ml.delete_job", "ml.delete_job", map[string]any{"job_id": "j1"}, http.MethodDelete, "/_ml/anomaly_detectors/j1", ""},
+		{"ml.open_job", "ml.open_job", map[string]any{"job_id": "j1"}, http.MethodPost, "/_ml/anomaly_detectors/j1/_open", ""},
+		{"ml.close_job", "ml.close_job", map[string]any{"job_id": "j1"}, http.MethodPost, "/_ml/anomaly_detectors/j1/_close", ""},
+		{"ml.put_datafeed", "ml.put_datafeed", map[string]any{"datafeed_id": "df1"}, http.MethodPut, "/_ml/datafeeds/df1", ""},
+		{"ml.get_datafeeds specific", "ml.get_datafeeds", map[string]any{"datafeed_id": "df1"}, http.MethodGet, "/_ml/datafeeds/df1", ""},
+		{"ml.get_datafeeds all", "ml.get_datafeeds", map[string]any{}, http.MethodGet, "/_ml/datafeeds", ""},
+		{"ml.get_datafeed_stats specific", "ml.get_datafeed_stats", map[string]any{"datafeed_id": "df1"}, http.MethodGet, "/_ml/datafeeds/df1/_stats", ""},
+		{"ml.get_datafeed_stats all", "ml.get_datafeed_stats", map[string]any{}, http.MethodGet, "/_ml/datafeeds/_stats", ""},
+		{"ml.update_datafeed", "ml.update_datafeed", map[string]any{"datafeed_id": "df1"}, http.MethodPost, "/_ml/datafeeds/df1/_update", ""},
+		{"ml.delete_datafeed", "ml.delete_datafeed", map[string]any{"datafeed_id": "df1"}, http.MethodDelete, "/_ml/datafeeds/df1", ""},
+		{"ml.start_datafeed", "ml.start_datafeed", map[string]any{"datafeed_id": "df1"}, http.MethodPost, "/_ml/datafeeds/df1/_start", ""},
+		{"ml.stop_datafeed", "ml.stop_datafeed", map[string]any{"datafeed_id": "df1"}, http.MethodPost, "/_ml/datafeeds/df1/_stop", ""},
+		{"ml.preview_datafeed", "ml.preview_datafeed", map[string]any{"datafeed_id": "df1"}, http.MethodGet, "/_ml/datafeeds/df1/_preview", ""},
+		{"ml.put_trained_model", "ml.put_trained_model", map[string]any{"model_id": "tm1"}, http.MethodPut, "/_ml/trained_models/tm1", ""},
+		{"ml.get_trained_models specific", "ml.get_trained_models", map[string]any{"model_id": "tm1"}, http.MethodGet, "/_ml/trained_models/tm1", ""},
+		{"ml.get_trained_models all", "ml.get_trained_models", map[string]any{}, http.MethodGet, "/_ml/trained_models", ""},
+		{"ml.get_trained_models_stats specific", "ml.get_trained_models_stats", map[string]any{"model_id": "tm1"}, http.MethodGet, "/_ml/trained_models/tm1/_stats", ""},
+		{"ml.get_trained_models_stats all", "ml.get_trained_models_stats", map[string]any{}, http.MethodGet, "/_ml/trained_models/_stats", ""},
+		{"ml.delete_trained_model", "ml.delete_trained_model", map[string]any{"model_id": "tm1"}, http.MethodDelete, "/_ml/trained_models/tm1", ""},
+		{"ml.put_calendar", "ml.put_calendar", map[string]any{"calendar_id": "cal1"}, http.MethodPut, "/_ml/calendars/cal1", ""},
+		{"ml.get_calendars specific", "ml.get_calendars", map[string]any{"calendar_id": "cal1"}, http.MethodGet, "/_ml/calendars/cal1", ""},
+		{"ml.get_calendars all", "ml.get_calendars", map[string]any{}, http.MethodGet, "/_ml/calendars", ""},
+		{"ml.delete_calendar", "ml.delete_calendar", map[string]any{"calendar_id": "cal1"}, http.MethodDelete, "/_ml/calendars/cal1", ""},
+		{"ml.put_calendar_job", "ml.put_calendar_job", map[string]any{"calendar_id": "cal1", "job_id": "j1"}, http.MethodPut, "/_ml/calendars/cal1/jobs/j1", ""},
+		{"ml.delete_calendar_job", "ml.delete_calendar_job", map[string]any{"calendar_id": "cal1", "job_id": "j1"}, http.MethodDelete, "/_ml/calendars/cal1/jobs/j1", ""},
+		{"ml.put_calendar_event", "ml.put_calendar_event", map[string]any{"calendar_id": "cal1"}, http.MethodPost, "/_ml/calendars/cal1/events", ""},
+		{"ml.post_calendar_events", "ml.post_calendar_events", map[string]any{"calendar_id": "cal1"}, http.MethodPost, "/_ml/calendars/cal1/events", ""},
+		{"ml.get_calendar_events", "ml.get_calendar_events", map[string]any{"calendar_id": "cal1"}, http.MethodGet, "/_ml/calendars/cal1/events", ""},
+		{"ml.delete_calendar_event", "ml.delete_calendar_event", map[string]any{"calendar_id": "cal1", "event_id": "ev1"}, http.MethodDelete, "/_ml/calendars/cal1/events/ev1", ""},
+		{"ml.put_filter", "ml.put_filter", map[string]any{"filter_id": "f1"}, http.MethodPut, "/_ml/filters/f1", ""},
+		{"ml.get_filters specific", "ml.get_filters", map[string]any{"filter_id": "f1"}, http.MethodGet, "/_ml/filters/f1", ""},
+		{"ml.get_filters all", "ml.get_filters", map[string]any{}, http.MethodGet, "/_ml/filters", ""},
+		{"ml.update_filter", "ml.update_filter", map[string]any{"filter_id": "f1"}, http.MethodPost, "/_ml/filters/f1/_update", ""},
+		{"ml.delete_filter", "ml.delete_filter", map[string]any{"filter_id": "f1"}, http.MethodDelete, "/_ml/filters/f1", ""},
+		{"security.put_role_mapping", "security.put_role_mapping", map[string]any{"name": "rm1"}, http.MethodPut, "/_security/role_mapping/rm1", ""},
+		{"security.get_role_mapping specific", "security.get_role_mapping", map[string]any{"name": "rm1"}, http.MethodGet, "/_security/role_mapping/rm1", ""},
+		{"security.get_role_mapping all", "security.get_role_mapping", map[string]any{}, http.MethodGet, "/_security/role_mapping", ""},
+		{"security.delete_role_mapping", "security.delete_role_mapping", map[string]any{"name": "rm1"}, http.MethodDelete, "/_security/role_mapping/rm1", ""},
+		{"security.get_builtin_privileges", "security.get_builtin_privileges", map[string]any{}, http.MethodGet, "/_security/privilege/_builtin", ""},
+		{"security.enroll_kibana", "security.enroll_kibana", map[string]any{}, http.MethodPost, "/_security/enroll/kibana", ""},
+		{"security.enroll_node", "security.enroll_node", map[string]any{}, http.MethodPost, "/_security/enroll/node", ""},
+		{"security.clear_cached_roles", "security.clear_cached_roles", map[string]any{"name": "admin"}, http.MethodPost, "/_security/role/admin/_clear_cache", ""},
+		{"security.clear_cached_realms with username", "security.clear_cached_realms", map[string]any{"username": "u1"}, http.MethodPost, "/_security/user/u1/_clear_cache", ""},
+		{"security.clear_cached_realms with realms", "security.clear_cached_realms", map[string]any{"realms": "native1"}, http.MethodPost, "/_security/realm/native1/_clear_cache", ""},
+		{"security.clear_cached_realms empty", "security.clear_cached_realms", map[string]any{}, http.MethodPost, "/_security/user/_clear_cache", ""},
+		{"indices.reload_search_analyzers with index", "indices.reload_search_analyzers", map[string]any{"index": "idx1"}, http.MethodPost, "/idx1/_reload_search_analyzers", ""},
+		{"indices.reload_search_analyzers all", "indices.reload_search_analyzers", map[string]any{}, http.MethodPost, "/_reload_search_analyzers", ""},
+		{"indices.disk_usage with index", "indices.disk_usage", map[string]any{"index": "idx1"}, http.MethodPost, "/idx1/_disk_usage", ""},
+		{"indices.disk_usage all", "indices.disk_usage", map[string]any{}, http.MethodPost, "/_disk_usage", ""},
+		{"indices.field_usage_stats with index", "indices.field_usage_stats", map[string]any{"index": "idx1"}, http.MethodGet, "/idx1/_field_usage_stats", ""},
+		{"indices.field_usage_stats all", "indices.field_usage_stats", map[string]any{}, http.MethodGet, "/_field_usage_stats", ""},
+		{"snapshot.clone", "snapshot.clone", map[string]any{"repository": "repo1", "snapshot": "snap1", "target_snapshot": "snap2"}, http.MethodPut, "/_snapshot/repo1/snap1/_clone/snap2", ""},
+		{"snapshot.cleanup_repository", "snapshot.cleanup_repository", map[string]any{"repository": "repo1"}, http.MethodPost, "/_snapshot/repo1/_cleanup", ""},
+		{"cat.component_templates specific", "cat.component_templates", map[string]any{"name": "ct1"}, http.MethodGet, "/_cat/component_templates/ct1", ""},
+		{"cat.component_templates all", "cat.component_templates", map[string]any{}, http.MethodGet, "/_cat/component_templates", ""},
+		{"cat.ml_anomaly_detectors specific", "cat.ml_anomaly_detectors", map[string]any{"job_id": "j1"}, http.MethodGet, "/_cat/ml_anomaly_detectors/j1", ""},
+		{"cat.ml_jobs all", "cat.ml_jobs", map[string]any{}, http.MethodGet, "/_cat/ml_anomaly_detectors", ""},
+		{"cat.ml_datafeeds specific", "cat.ml_datafeeds", map[string]any{"datafeed_id": "df1"}, http.MethodGet, "/_cat/ml_datafeeds/df1", ""},
+		{"cat.ml_datafeeds all", "cat.ml_datafeeds", map[string]any{}, http.MethodGet, "/_cat/ml_datafeeds", ""},
+		{"cat.ml_trained_models specific", "cat.ml_trained_models", map[string]any{"model_id": "tm1"}, http.MethodGet, "/_cat/ml_trained_models/tm1", ""},
+		{"cat.ml_trained_models all", "cat.ml_trained_models", map[string]any{}, http.MethodGet, "/_cat/ml_trained_models", ""},
+		{"cat.ml_data_frame_analytics specific", "cat.ml_data_frame_analytics", map[string]any{"id": "dfa1"}, http.MethodGet, "/_cat/ml_data_frame_analytics/dfa1", ""},
+		{"cat.ml_data_frame_analytics all", "cat.ml_data_frame_analytics", map[string]any{}, http.MethodGet, "/_cat/ml_data_frame_analytics", ""},
+		{"cluster.info specific", "cluster.info", map[string]any{"target": "settings,http"}, http.MethodGet, "/_cluster/info/settings,http", ""},
+		{"cluster.info all", "cluster.info", map[string]any{}, http.MethodGet, "/_cluster/info", ""},
+		{"cluster.exists_component_template", "cluster.exists_component_template", map[string]any{"name": "ct1"}, http.MethodHead, "/_component_template/ct1", ""},
+		{"nodes.reload_secure_settings specific", "nodes.reload_secure_settings", map[string]any{"node_id": "n1"}, http.MethodPost, "/_nodes/n1/reload_secure_settings", ""},
+		{"nodes.reload_secure_settings all", "nodes.reload_secure_settings", map[string]any{}, http.MethodPost, "/_nodes/reload_secure_settings", ""},
+		{"nodes.get_repositories_metering_info specific", "nodes.get_repositories_metering_info", map[string]any{"node_id": "n1"}, http.MethodGet, "/_nodes/n1/repositories_metering", ""},
+		{"nodes.get_repositories_metering_info all", "nodes.get_repositories_metering_info", map[string]any{}, http.MethodGet, "/_nodes/repositories_metering", ""},
+		{"nodes.clear_repositories_metering_archive specific", "nodes.clear_repositories_metering_archive", map[string]any{"node_id": "n1", "max_archive_version": 5}, http.MethodDelete, "/_nodes/n1/clear_repositories_metering_archive/5", ""},
+		{"nodes.clear_repositories_metering_archive all", "nodes.clear_repositories_metering_archive", map[string]any{"max_archive_version": 5}, http.MethodDelete, "/_nodes/clear_repositories_metering_archive/5", ""},
+	}
+
+	var deletedPaths []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deletedPaths = append(deletedPaths, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"acknowledged": true,
+			"ts_early": "2024-01-01T00:00:00Z",
+			"ts_late": "2024-06-15T12:30:45.123Z",
+			"date_only_early": "2024-01-01",
+			"date_only_late": "2024-12-31",
+			"ver_old": "8.9.2",
+			"ver_new": "8.11.0",
+			"str_a": "alpha",
+			"str_b": "beta",
+			"empty_str": "",
+			"empty_arr": [],
+			"empty_map": {},
+			"null_val": null,
+			"non_empty_arr": ["a", "b", "c"],
+			"non_empty_str": "hello-world-2026",
+			"num_str": "42",
+			"num_val": 99
+		}`))
+	}))
+	defer ts.Close()
+	ctx := newRunnerContext(ts.Client(), ts.URL)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec, err := ctx.buildActionRequest(tc.action, tc.params)
+			if err != nil {
+				t.Fatalf("buildActionRequest(%q) failed: %v", tc.action, err)
+			}
+			if spec.method != tc.wantMethod || spec.path != tc.wantPath {
+				t.Fatalf("buildActionRequest(%q) = (%s, %s), want (%s, %s)", tc.action, spec.method, spec.path, tc.wantMethod, tc.wantPath)
+			}
+			if tc.wantQuery != "" && spec.query.Encode() != tc.wantQuery {
+				t.Fatalf("buildActionRequest(%q) query = %q, want %q", tc.action, spec.query.Encode(), tc.wantQuery)
+			}
+		})
+	}
+
+	// Test resource tracking and cleanup for Round 55 ML and security actions
+	for _, item := range []struct {
+		action string
+		params map[string]any
+	}{
+		{"ml.put_job", map[string]any{"job_id": "job-r55"}},
+		{"ml.put_datafeed", map[string]any{"datafeed_id": "df-r55"}},
+		{"ml.put_trained_model", map[string]any{"model_id": "tm-r55"}},
+		{"ml.put_calendar", map[string]any{"calendar_id": "cal-r55"}},
+		{"ml.put_filter", map[string]any{"filter_id": "flt-r55"}},
+		{"security.put_role_mapping", map[string]any{"name": "rm-r55"}},
+	} {
+		step := &OrderedMap{
+			Fields: []YAMLField{
+				{Key: item.action, Value: item.params},
+			},
+		}
+		if err := ctx.execDo(step, false); err != nil {
+			t.Fatalf("execDo(%s) failed: %v", item.action, err)
+		}
+	}
+
+	// F1: Compare timestamps, semvers, and lexicographical strings
+	for _, opTest := range []struct {
+		op      string
+		payload map[string]any
+		wantErr bool
+	}{
+		{"gt", map[string]any{"ts_late": "2024-01-01T00:00:00Z"}, false},
+		{"lt", map[string]any{"ts_early": "2024-06-15T12:30:45.123Z"}, false},
+		{"gte", map[string]any{"date_only_late": "2024-01-01"}, false},
+		{"lte", map[string]any{"date_only_early": "2024-01-01"}, false},
+		{"gt", map[string]any{"ver_new": "8.9.2"}, false},
+		{"lt", map[string]any{"ver_old": "8.11.0"}, false},
+		{"gt", map[string]any{"str_b": "alpha"}, false},
+		{"lt", map[string]any{"str_a": "beta"}, false},
+		{"gt", map[string]any{"ts_early": "2025-01-01T00:00:00Z"}, true},
+	} {
+		err := ctx.execCompare(opTest.op, opTest.payload)
+		if (err != nil) != opTest.wantErr {
+			t.Fatalf("execCompare(%s, %v) err=%v, wantErr=%v", opTest.op, opTest.payload, err, opTest.wantErr)
+		}
+	}
+
+	// F1: is_empty operator
+	for _, emptyField := range []string{"empty_str", "empty_arr", "empty_map", "null_val", "non_existent_path"} {
+		if err := ctx.execStep(SpecStep{Op: "is_empty", Value: emptyField}, false); err != nil {
+			t.Fatalf("is_empty(%q) failed: %v", emptyField, err)
+		}
+	}
+	if err := ctx.execStep(SpecStep{Op: "is_empty", Value: "non_empty_arr"}, false); err == nil {
+		t.Fatalf("expected is_empty(non_empty_arr) to fail")
+	}
+
+	// F1: not_contains operator
+	if err := ctx.execStep(SpecStep{Op: "not_contains", Value: map[string]any{
+		"non_empty_arr": "z",
+		"non_empty_str": "missing",
+	}}, false); err != nil {
+		t.Fatalf("not_contains failed: %v", err)
+	}
+	if err := ctx.execStep(SpecStep{Op: "not_contains", Value: map[string]any{
+		"non_empty_arr": "b",
+	}}, false); err == nil {
+		t.Fatalf("expected not_contains to fail when element is present")
+	}
+
+	// F1: transform_and_set with concat, split, replace, toString, toInt + negative slice indices
+	if err := ctx.execTransformAndSet(map[string]any{
+		"joined":   `concat(str_a, "-", str_b)`,
+		"parts":    `split(non_empty_str, "-")`,
+		"replaced": `replace(non_empty_str, "-", "_")`,
+		"str_num":  `toString(num_val)`,
+		"int_num":  `toInt(num_str)`,
+	}); err != nil {
+		t.Fatalf("execTransformAndSet F1 failed: %v", err)
+	}
+	if ctx.stash["joined"] != "alpha-beta" {
+		t.Fatalf("expected joined='alpha-beta', got %v", ctx.stash["joined"])
+	}
+	if ctx.stash["replaced"] != "hello_world_2026" {
+		t.Fatalf("expected replaced='hello_world_2026', got %v", ctx.stash["replaced"])
+	}
+	if ctx.stash["str_num"] != "99" {
+		t.Fatalf("expected str_num='99', got %v (%T)", ctx.stash["str_num"], ctx.stash["str_num"])
+	}
+	if ctx.stash["int_num"] != 42 {
+		t.Fatalf("expected int_num=42, got %v (%T)", ctx.stash["int_num"], ctx.stash["int_num"])
+	}
+	if val, ok := ctx.lookupResponsePath("$parts.-1"); !ok || val != "2026" {
+		t.Fatalf("expected $parts.-1='2026', got (%v, %v)", val, ok)
+	}
+	if val, ok := ctx.lookupResponsePath("non_empty_arr.-1"); !ok || val != "c" {
+		t.Fatalf("expected non_empty_arr.-1='c', got (%v, %v)", val, ok)
+	}
+
+	ctx.cleanupAll()
+	wantDeletes := []string{
+		"/_ml/datafeeds/df-r55",
+		"/_ml/anomaly_detectors/job-r55",
+		"/_ml/trained_models/tm-r55",
+		"/_ml/calendars/cal-r55",
+		"/_ml/filters/flt-r55",
+		"/_security/role_mapping/rm-r55",
+	}
+	for _, wd := range wantDeletes {
+		found := false
+		for _, dp := range deletedPaths {
+			if dp == wd {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected cleanupAll to DELETE %s, got %v", wd, deletedPaths)
+		}
+	}
+}

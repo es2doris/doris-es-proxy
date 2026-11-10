@@ -136,6 +136,13 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 	flags.zeroTermsQuery = strings.TrimSpace(qsq.ZeroTermsQuery)
 	flags.lenient = qsq.Lenient
 	if t.Schema != nil {
+		flags.isTextField = func(fname string) bool {
+			if fname == "_all_text" {
+				return true
+			}
+			_, b := t.resolveFieldInNestedCtx(fname, false, nctx)
+			return schema.IsTextLikeESType(b.ESType)
+		}
 		flags.expandFields = func(pat string) []string {
 			exp := t.expandFieldPatternForContext(pat, nctx)
 			out := make([]string, 0, len(exp))
@@ -441,6 +448,7 @@ type simpleQueryFlags struct {
 	zeroTermsQuery       string
 	lenient              *bool
 	expandFields         func(string) []string
+	isTextField          func(string) bool
 }
 
 func allSimpleQueryFlags() simpleQueryFlags {
@@ -1326,7 +1334,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 		} else if !isQuoted && !explicitZeroFuzzy && flags.fuzziness != nil {
 			fuzzAny = flags.fuzziness
 		}
-		if !isQuoted && (strings.EqualFold(val, "true") || strings.EqualFold(val, "false")) {
+		if !isQuoted && !isFuzzy && (strings.EqualFold(val, "true") || strings.EqualFold(val, "false")) && (flags.isTextField == nil || !flags.isTextField(field)) {
 			boolVal := strings.EqualFold(val, "true")
 			if strings.ContainsAny(field, "*?") && flags.expandFields != nil {
 				expFields := flags.expandFields(field)
@@ -1336,11 +1344,31 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 				var shoulds []esast.Query
 				for _, ef := range expFields {
 					fname, fBoost := splitLuceneBoost(ef)
-					shoulds = append(shoulds, esast.Query{
-						Term: map[string]esast.TermEntry{
-							fname: {Value: boolVal, Boost: boost * fBoost, HasBoost: true},
-						},
-					})
+					if flags.isTextField != nil && flags.isTextField(fname) {
+						shoulds = append(shoulds, esast.Query{
+							Match: map[string]esast.MatchEntry{
+								fname: {
+									Query:               val,
+									Operator:            strings.ToLower(defaultOp),
+									Analyzer:            flags.analyzer,
+									ZeroTermsQuery:      flags.zeroTermsQuery,
+									Fuzziness:           fuzzAny,
+									PrefixLength:        flags.fuzzyPrefixLength,
+									MaxExpansions:       flags.fuzzyMaxExpansions,
+									FuzzyTranspositions: flags.fuzzyTranspositions,
+									Lenient:             flags.lenient,
+									Boost:               boost * fBoost,
+									HasBoost:            true,
+								},
+							},
+						})
+					} else {
+						shoulds = append(shoulds, esast.Query{
+							Term: map[string]esast.TermEntry{
+								fname: {Value: boolVal, Boost: boost * fBoost, HasBoost: true},
+							},
+						})
+					}
 				}
 				if len(shoulds) == 1 {
 					return shoulds[0]

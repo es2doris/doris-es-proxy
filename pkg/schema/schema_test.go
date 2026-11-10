@@ -2540,3 +2540,102 @@ func TestRound54SchemaAndShredderF12F13F14(t *testing.T) {
 		t.Fatalf("F14 expected MaxFieldNameLength error in ShredDocument, got %v", err)
 	}
 }
+
+func TestRound55SchemaAndShredderF12ToF14(t *testing.T) {
+	// F12 & F13: finalizeCompiledSlices sets DorisType=DorisString on copy_to StoragePromotedArray targets,
+	// visits flattened copy_to sources, and preserves exact uint64 (> math.MaxInt64) on unsigned_long copy_to targets.
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"labels": {
+				"type": "flattened",
+				"copy_to": "all_tags"
+			},
+			"all_tags": {
+				"type": "keyword"
+			},
+			"src_num": {
+				"type": "long",
+				"copy_to": "dst_num"
+			},
+			"dst_num": {
+				"type": "long"
+			},
+			"src_u64": {
+				"type": "unsigned_long",
+				"copy_to": ["dst_u64", "dst_parent"]
+			},
+			"dst_u64": {
+				"type": "unsigned_long"
+			},
+			"dst_parent": {
+				"type": "keyword",
+				"fields": {
+					"u64": {
+						"type": "unsigned_long"
+					}
+				}
+			},
+			"outer": {
+				"properties": {
+					"my_range": {"type": "integer_range"},
+					"my_flat":  {"type": "flattened", "normalizer": "lowercase"},
+					"my_vec":   {"type": "rank_features"}
+				}
+			}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("Round 55 mapping unmarshal failed: %v", err)
+	}
+	sc := CompileIndexSchema("db", "r55_idx", &spec)
+
+	// F12(1): dst_num and dst_u64 and dst_parent.u64 upgraded to StoragePromotedArray must have DorisType == DorisString
+	for _, fieldName := range []string{"dst_num", "dst_u64", "dst_parent.u64"} {
+		b, ok := sc.Fields[fieldName]
+		if !ok {
+			t.Fatalf("F12 missing field %s", fieldName)
+		}
+		if b.Kind != StoragePromotedArray || b.DorisType != DorisString {
+			t.Fatalf("F12 expected %s to have Kind=StoragePromotedArray and DorisType=DorisString, got Kind=%v DorisType=%v", fieldName, b.Kind, b.DorisType)
+		}
+	}
+
+	// F12(2) & F13: Shred document with flattened copy_to and unsigned_long > math.MaxInt64 copy_to
+	rowBytes, err := ShredDocument(sc, "doc1", 1, false, []byte(`{
+		"labels": {"env": "prod", "team": ["core", "search"]},
+		"src_u64": 18446744073709551610
+	}`))
+	if err != nil {
+		t.Fatalf("F12/F13 ShredDocument failed: %v", err)
+	}
+	rowStr := string(rowBytes)
+	if !strings.Contains(rowStr, `"prod"`) || !strings.Contains(rowStr, `"core"`) || !strings.Contains(rowStr, `"search"`) {
+		t.Fatalf("F12 expected flattened copy_to values in all_tags, got %s", rowStr)
+	}
+	if strings.Contains(rowStr, `"9223372036854775807"`) || !strings.Contains(rowStr, `"18446744073709551610"`) {
+		t.Fatalf("F13 expected unsigned_long > MaxInt64 to preserve 18446744073709551610 in copy_to array, got %s", rowStr)
+	}
+
+	// F14: Flat dotted keys in _source for sub-object range, flattened, and sparse_vector/rank_features
+	if _, err := ShredDocument(sc, "bad_range", 1, false, []byte(`{"outer.my_range": {"gte": 20, "lte": 10}}`)); err == nil {
+		t.Fatalf("F14 expected error for flat dotted key outer.my_range with gte > lte")
+	}
+	if _, err := ShredDocument(sc, "bad_flat", 1, false, []byte(`{"outer.my_flat": "not_an_object"}`)); err == nil {
+		t.Fatalf("F14 expected error for flat dotted key outer.my_flat with scalar value")
+	}
+	if _, err := ShredDocument(sc, "bad_vec", 1, false, []byte(`{"outer.my_vec": {"tok": -1.5}}`)); err == nil {
+		t.Fatalf("F14 expected error for flat dotted key outer.my_vec with non-positive rank_features weight")
+	}
+	validDottedBytes, err := ShredDocument(sc, "ok_dotted", 1, false, []byte(`{
+		"outer.my_range": {"gte": 5, "lte": 15},
+		"outer.my_flat": {"Key": "UPPER_VAL"},
+		"outer.my_vec": {"tok": "2.5"}
+	}`))
+	if err != nil {
+		t.Fatalf("F14 expected valid flat dotted keys to shred cleanly, got %v", err)
+	}
+	validDottedStr := string(validDottedBytes)
+	if !strings.Contains(validDottedStr, `"_gte":5`) || !strings.Contains(validDottedStr, `"upper_val"`) {
+		t.Fatalf("F14 expected normalized _gte and lowercased flattened value in _doc, got %s", validDottedStr)
+	}
+}

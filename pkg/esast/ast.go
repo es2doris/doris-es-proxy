@@ -6437,11 +6437,16 @@ func (f *FuzzyEntry) UnmarshalJSON(data []byte) error {
 		if isNonScalarOrNullValue(full.Value) {
 			return fmt.Errorf("parsing_exception: [fuzzy] query does not support non-scalar or null value")
 		}
+		if full.Fuzziness != nil {
+			if err := validateFuzzinessValue(full.Fuzziness, "fuzzy"); err != nil {
+				return err
+			}
+		}
 		if full.PrefixLength < 0 {
 			return fmt.Errorf("parsing_exception: [fuzzy] prefix_length must be non-negative, got [%d]", full.PrefixLength)
 		}
-		if full.MaxExpansions < 0 {
-			return fmt.Errorf("parsing_exception: [fuzzy] max_expansions must be non-negative, got [%d]", full.MaxExpansions)
+		if _, hasMaxExp := rawMap["max_expansions"]; (hasMaxExp && full.MaxExpansions <= 0) || full.MaxExpansions < 0 {
+			return fmt.Errorf("parsing_exception: [fuzzy] max_expansions must be positive, got [%d]", full.MaxExpansions)
 		}
 		ci, err := parseFlexibleBool(full.CaseInsensitive)
 		if err != nil {
@@ -7401,6 +7406,17 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 		if err := validateZeroTermsQuery(full.ZeroTermsQuery, "match"); err != nil {
 			return err
 		}
+		if full.Fuzziness != nil {
+			if err := validateFuzzinessValue(full.Fuzziness, "match"); err != nil {
+				return err
+			}
+		}
+		if full.PrefixLength < 0 {
+			return fmt.Errorf("parsing_exception: [match] prefix_length must be non-negative, got [%d]", full.PrefixLength)
+		}
+		if _, hasMaxExp := rawMap["max_expansions"]; (hasMaxExp && full.MaxExpansions <= 0) || full.MaxExpansions < 0 {
+			return fmt.Errorf("parsing_exception: [match] max_expansions must be positive, got [%d]", full.MaxExpansions)
+		}
 		m.ZeroTermsQuery = full.ZeroTermsQuery
 		m.MinimumShouldMatch = full.MinimumShouldMatch
 		m.Fuzziness = full.Fuzziness
@@ -7634,8 +7650,13 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 		if full.Slop < 0 {
 			return fmt.Errorf("parsing_exception: [match_phrase] slop must be non-negative, got [%d]", full.Slop)
 		}
-		if full.MaxExpansions < 0 {
-			return fmt.Errorf("parsing_exception: [match_phrase] max_expansions must be non-negative, got [%d]", full.MaxExpansions)
+		if full.Fuzziness != nil {
+			if err := validateFuzzinessValue(full.Fuzziness, "match_phrase"); err != nil {
+				return err
+			}
+		}
+		if _, hasMaxExp := rawMap["max_expansions"]; (hasMaxExp && full.MaxExpansions <= 0) || full.MaxExpansions < 0 {
+			return fmt.Errorf("parsing_exception: [match_phrase] max_expansions must be positive, got [%d]", full.MaxExpansions)
 		}
 		if full.PrefixLength < 0 {
 			return fmt.Errorf("parsing_exception: [match_phrase] prefix_length must be non-negative, got [%d]", full.PrefixLength)
@@ -7775,6 +7796,17 @@ func (mmq *MultiMatchQuery) UnmarshalJSON(data []byte) error {
 	}
 	if mmq.Slop < 0 {
 		return fmt.Errorf("parsing_exception: [multi_match] slop must be non-negative, got [%d]", mmq.Slop)
+	}
+	if mmq.Fuzziness != nil {
+		if err := validateFuzzinessValue(mmq.Fuzziness, "multi_match"); err != nil {
+			return err
+		}
+	}
+	if mmq.PrefixLength < 0 {
+		return fmt.Errorf("parsing_exception: [multi_match] prefix_length must be non-negative, got [%d]", mmq.PrefixLength)
+	}
+	if _, hasMaxExp := rawMap["max_expansions"]; (hasMaxExp && mmq.MaxExpansions <= 0) || mmq.MaxExpansions < 0 {
+		return fmt.Errorf("parsing_exception: [multi_match] max_expansions must be positive, got [%d]", mmq.MaxExpansions)
 	}
 	if mmq.TieBreaker != nil && (*mmq.TieBreaker < 0 || *mmq.TieBreaker > 1.0 || math.IsNaN(*mmq.TieBreaker)) {
 		return fmt.Errorf("parsing_exception: [multi_match] tie_breaker must be in [0.0, 1.0], got [%v]", *mmq.TieBreaker)
@@ -10845,22 +10877,21 @@ func (c *CompositeAggSpec) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: [composite] unknown field [%s]", k)
 		}
 	}
-	type compositeAlias CompositeAggSpec
-	var alias compositeAlias
-	if err := json.Unmarshal(trimmed, &alias); err != nil {
-		return fmt.Errorf("parsing_exception: invalid [composite] aggregation: %w", err)
-	}
-	if _, hasSize := rawMap["size"]; hasSize && alias.Size <= 0 {
-		return fmt.Errorf("parsing_exception: [composite] [size] must be > 0")
-	}
-	if len(alias.Sources) == 0 {
-		return fmt.Errorf("parsing_exception: [composite] aggregation requires at least one source in [sources]")
-	}
 	var rawSources []map[string]json.RawMessage
 	if err := json.Unmarshal(rawMap["sources"], &rawSources); err != nil {
 		return fmt.Errorf("parsing_exception: [composite] invalid [sources]: %w", err)
 	}
-	for _, srcEntry := range rawSources {
+	if len(rawSources) == 0 {
+		return fmt.Errorf("parsing_exception: [composite] aggregation requires at least one source in [sources]")
+	}
+	type sourceOrderRestore struct {
+		idx     int
+		srcName string
+		srcType string
+		order   string
+	}
+	var orderRestores []sourceOrderRestore
+	for srcIdx, srcEntry := range rawSources {
 		if len(srcEntry) != 1 {
 			return fmt.Errorf("parsing_exception: [composite] each entry in [sources] must specify a single named source")
 		}
@@ -10882,6 +10913,7 @@ func (c *CompositeAggSpec) UnmarshalJSON(data []byte) error {
 				if err := json.Unmarshal(rawInner, &innerFields); err != nil {
 					return fmt.Errorf("parsing_exception: [composite] source [%s] [%s] must be an object", srcName, srcType)
 				}
+				rewroteOrder := false
 				for ik, iv := range innerFields {
 					switch ik {
 					case "field", "script", "missing_bucket", "missing_order", "missing", "order",
@@ -10895,6 +10927,10 @@ func (c *CompositeAggSpec) UnmarshalJSON(data []byte) error {
 						if err := json.Unmarshal(iv, &ordStr); err == nil {
 							switch strings.ToLower(strings.TrimSpace(ordStr)) {
 							case "asc", "desc":
+								orderRestores = append(orderRestores, sourceOrderRestore{idx: srcIdx, srcName: srcName, srcType: srcType, order: ordStr})
+								wrapped, _ := json.Marshal(map[string]string{"_key": ordStr})
+								innerFields["order"] = wrapped
+								rewroteOrder = true
 							default:
 								return fmt.Errorf("parsing_exception: [composite] invalid order [%s] in source [%s]", ordStr, srcName)
 							}
@@ -10924,6 +10960,49 @@ func (c *CompositeAggSpec) UnmarshalJSON(data []byte) error {
 						}
 					}
 				}
+				if rewroteOrder {
+					newInner, _ := json.Marshal(innerFields)
+					srcTypeMap[srcType] = newInner
+					newSrcSpec, _ := json.Marshal(srcTypeMap)
+					rawSources[srcIdx][srcName] = newSrcSpec
+				}
+			}
+		}
+	}
+	if len(orderRestores) > 0 {
+		newSourcesRaw, _ := json.Marshal(rawSources)
+		rawMap["sources"] = newSourcesRaw
+		trimmed, _ = json.Marshal(rawMap)
+	}
+	type compositeAlias CompositeAggSpec
+	var alias compositeAlias
+	if err := json.Unmarshal(trimmed, &alias); err != nil {
+		return fmt.Errorf("parsing_exception: invalid [composite] aggregation: %w", err)
+	}
+	if _, hasSize := rawMap["size"]; hasSize && alias.Size <= 0 {
+		return fmt.Errorf("parsing_exception: [composite] [size] must be > 0")
+	}
+	if len(alias.Sources) == 0 {
+		return fmt.Errorf("parsing_exception: [composite] aggregation requires at least one source in [sources]")
+	}
+	for _, r := range orderRestores {
+		if r.idx < len(alias.Sources) {
+			if spec, ok := alias.Sources[r.idx][r.srcName]; ok {
+				switch r.srcType {
+				case "terms":
+					if spec.Terms != nil {
+						spec.Terms.Order = r.order
+					}
+				case "date_histogram":
+					if spec.DateHistogram != nil {
+						spec.DateHistogram.Order = r.order
+					}
+				case "histogram":
+					if spec.Histogram != nil {
+						spec.Histogram.Order = r.order
+					}
+				}
+				alias.Sources[r.idx][r.srcName] = spec
 			}
 		}
 	}
@@ -11086,6 +11165,11 @@ func (p *PercentilesAggSpec) UnmarshalJSON(data []byte) error {
 	}
 	if strings.TrimSpace(pl.Field) == "" && pl.Script == nil {
 		return fmt.Errorf("parsing_exception: [percentiles] requires either [field] or [script]")
+	}
+	if pl.Script != nil {
+		if err := validateScriptValue(pl.Script); err != nil {
+			return err
+		}
 	}
 	if _, hasPercents := rawMap["percents"]; hasPercents {
 		if len(pl.Percents) == 0 {
@@ -11323,6 +11407,70 @@ type TermsAggSpec struct {
 	BackgroundFilter      *Query `json:"background_filter,omitempty"`
 }
 
+func validateBucketAggOrderSpec(order any, aggType string) error {
+	if order == nil {
+		return nil
+	}
+	validateMap := func(m map[string]any, requireSingle bool) error {
+		if len(m) == 0 || (requireSingle && len(m) != 1) {
+			return fmt.Errorf("parsing_exception: [%s] order map must contain at least one entry", aggType)
+		}
+		for k, v := range m {
+			if strings.TrimSpace(k) == "" {
+				return fmt.Errorf("parsing_exception: [%s] order key cannot be empty", aggType)
+			}
+			switch dir := v.(type) {
+			case string:
+				switch strings.ToLower(strings.TrimSpace(dir)) {
+				case "asc", "desc":
+				default:
+					return fmt.Errorf("parsing_exception: [%s] invalid sort direction [%s] in [order]", aggType, dir)
+				}
+			case map[string]any:
+				if len(dir) != 1 {
+					return fmt.Errorf("parsing_exception: [%s] invalid [order] specification for [%s]", aggType, k)
+				}
+				rawDir, hasOrder := dir["order"]
+				if !hasOrder {
+					return fmt.Errorf("parsing_exception: [%s] invalid [order] specification for [%s]", aggType, k)
+				}
+				dirStr, ok := rawDir.(string)
+				if !ok {
+					return fmt.Errorf("parsing_exception: [%s] invalid [order] direction type for [%s]", aggType, k)
+				}
+				switch strings.ToLower(strings.TrimSpace(dirStr)) {
+				case "asc", "desc":
+				default:
+					return fmt.Errorf("parsing_exception: [%s] invalid sort direction [%s] in [order]", aggType, dirStr)
+				}
+			default:
+				return fmt.Errorf("parsing_exception: [%s] invalid [order] value for [%s]", aggType, k)
+			}
+		}
+		return nil
+	}
+	switch v := order.(type) {
+	case map[string]any:
+		return validateMap(v, false)
+	case []any:
+		if len(v) == 0 {
+			return fmt.Errorf("parsing_exception: [%s] [order] array cannot be empty", aggType)
+		}
+		for _, elem := range v {
+			em, ok := elem.(map[string]any)
+			if !ok {
+				return fmt.Errorf("parsing_exception: [%s] [order] array elements must be single-entry objects", aggType)
+			}
+			if err := validateMap(em, true); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("parsing_exception: [%s] [order] must be an object or array of objects", aggType)
+	}
+}
+
 func (t *TermsAggSpec) UnmarshalJSON(data []byte) error {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -11349,6 +11497,21 @@ func (t *TermsAggSpec) UnmarshalJSON(data []byte) error {
 	}
 	if strings.TrimSpace(p.Field) == "" && p.Script == nil {
 		return fmt.Errorf("parsing_exception: [terms] requires either [field] or [script]")
+	}
+	if p.Script != nil {
+		if err := validateScriptValue(p.Script); err != nil {
+			return err
+		}
+	}
+	if p.Order != nil {
+		if err := validateBucketAggOrderSpec(p.Order, "terms"); err != nil {
+			return err
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(p.MissingOrder)) {
+	case "", "first", "last", "default":
+	default:
+		return fmt.Errorf("parsing_exception: [terms] unknown [missing_order] [%s]", p.MissingOrder)
 	}
 	if _, hasSize := rawMap["size"]; hasSize && p.Size <= 0 {
 		return fmt.Errorf("parsing_exception: [terms] [size] must be > 0")
@@ -11559,6 +11722,16 @@ func (d *DateHistogramAggSpec) UnmarshalJSON(data []byte) error {
 	}
 	if strings.TrimSpace(p.Field) == "" && p.Script == nil {
 		return fmt.Errorf("parsing_exception: [date_histogram] requires either [field] or [script]")
+	}
+	if p.Script != nil {
+		if err := validateScriptValue(p.Script); err != nil {
+			return err
+		}
+	}
+	if p.Order != nil {
+		if err := validateBucketAggOrderSpec(p.Order, "date_histogram"); err != nil {
+			return err
+		}
 	}
 	intervalCount := 0
 	if strings.TrimSpace(p.CalendarInterval) != "" {
@@ -11784,6 +11957,21 @@ func (h *HistogramAggSpec) UnmarshalJSON(data []byte) error {
 	if strings.TrimSpace(p.Field) == "" && p.Script == nil {
 		return fmt.Errorf("parsing_exception: [histogram] requires either [field] or [script]")
 	}
+	if p.Script != nil {
+		if err := validateScriptValue(p.Script); err != nil {
+			return err
+		}
+	}
+	if p.Order != nil {
+		if err := validateBucketAggOrderSpec(p.Order, "histogram"); err != nil {
+			return err
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(p.MissingOrder)) {
+	case "", "first", "last", "default":
+	default:
+		return fmt.Errorf("parsing_exception: [histogram] unknown [missing_order] [%s]", p.MissingOrder)
+	}
 	if p.Interval <= 0 || math.IsNaN(p.Interval) || math.IsInf(p.Interval, 0) {
 		return fmt.Errorf("parsing_exception: [histogram] [interval] must be > 0")
 	}
@@ -11828,6 +12016,11 @@ func (r *RangeAggSpec) UnmarshalJSON(data []byte) error {
 	if strings.TrimSpace(p.Field) == "" && p.Script == nil {
 		return fmt.Errorf("parsing_exception: [range] requires either [field] or [script]")
 	}
+	if p.Script != nil {
+		if err := validateScriptValue(p.Script); err != nil {
+			return err
+		}
+	}
 	if len(p.Ranges) == 0 && (len(rawMap) != 1 || p.Field != "f") {
 		return fmt.Errorf("parsing_exception: [range] requires non-empty [ranges]")
 	}
@@ -11869,8 +12062,16 @@ func (b *RangeAggBucket) UnmarshalJSON(data []byte) error {
 	if p.From != nil && p.To != nil {
 		fromF, okFrom := parseBoundFloat(p.From)
 		toF, okTo := parseBoundFloat(p.To)
-		if okFrom && okTo && fromF > toF {
-			return fmt.Errorf("parsing_exception: [range.ranges] [from] (%v) cannot be greater than [to] (%v)", p.From, p.To)
+		if okFrom && okTo {
+			if fromF > toF {
+				return fmt.Errorf("parsing_exception: [range.ranges] [from] (%v) cannot be greater than [to] (%v)", p.From, p.To)
+			}
+		} else {
+			fromT, okFromT := parseBoundDateTime(p.From)
+			toT, okToT := parseBoundDateTime(p.To)
+			if okFromT && okToT && toT.Before(fromT) {
+				return fmt.Errorf("parsing_exception: [range.ranges] [from] (%v) cannot be greater than [to] (%v)", p.From, p.To)
+			}
 		}
 	}
 	*b = RangeAggBucket(p)

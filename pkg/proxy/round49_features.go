@@ -374,6 +374,27 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 	repo := strings.TrimSpace(r.PathValue("repository"))
 	snap := strings.TrimSpace(r.PathValue("snapshot"))
 
+	if snap == "_cleanup" {
+		if r.Method != http.MethodPost {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		s.mu.RLock()
+		_, repoExists := s.snapshotRepos[repo]
+		s.mu.RUnlock()
+		if !repoExists {
+			writeESError(w, http.StatusNotFound, "repository_missing_exception", fmt.Sprintf("[%s] missing", repo))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"results": map[string]any{
+				"deleted_bytes": 0,
+				"deleted_keys":  0,
+			},
+		})
+		return
+	}
+
 	if snap == "_status" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
 		s.mu.RLock()
 		var targetRepos []string
@@ -3974,6 +3995,15 @@ func (s *Server) handleFeatures(w http.ResponseWriter, r *http.Request, segs []s
 		s.esqlAsyncQueries = make(map[string]map[string]any)
 		s.watcherSettings = make(map[string]any)
 		s.licenseState = nil
+		s.sqlAsyncSearches = make(map[string]map[string]any)
+		s.eqlSearches = make(map[string]map[string]any)
+		s.mlJobs = make(map[string]map[string]any)
+		s.mlDatafeeds = make(map[string]map[string]any)
+		s.mlTrainedModels = make(map[string]map[string]any)
+		s.mlCalendars = make(map[string]map[string]any)
+		s.mlFilters = make(map[string]map[string]any)
+		s.mlUpgradeMode = false
+		s.securityRoleMappings = make(map[string]map[string]any)
 		s.mu.Unlock()
 		statuses := make([]any, 0, len(featureNames))
 		for _, f := range featureNames {
@@ -4906,6 +4936,13 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 					return
 				}
 				writeJSON(w, http.StatusOK, map[string]any{})
+			case "_clear_cache":
+				s.mu.Unlock()
+				writeJSON(w, http.StatusOK, map[string]any{
+					"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+					"cluster_name": "apache-doris-search-cluster",
+					"nodes":        map[string]any{"doris-fe-1": map[string]any{"name": "doris-fe-1"}},
+				})
 			default:
 				s.mu.Unlock()
 				writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
@@ -5011,8 +5048,14 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 		}
 		roleName := strings.TrimSpace(segs[2])
 		if len(segs) == 4 && segs[3] == "_clear_cache" {
+			if r.Method != http.MethodPost && r.Method != http.MethodPut {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
 			writeJSON(w, http.StatusOK, map[string]any{
-				"_nodes": map[string]any{"total": 1, "successful": 1, "failed": 0},
+				"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+				"cluster_name": "apache-doris-search-cluster",
+				"nodes":        map[string]any{"doris-fe-1": map[string]any{"name": "doris-fe-1"}},
 			})
 			return
 		}
@@ -5071,9 +5114,19 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 
 	case "privilege":
 		if len(segs) == 3 && segs[2] == "_builtin" {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			idxPrivs := []string{"all", "read", "write", "create", "create_index", "delete", "delete_index", "manage", "monitor"}
 			writeJSON(w, http.StatusOK, map[string]any{
 				"cluster": []string{"all", "monitor", "manage", "manage_index_templates", "manage_ingest_pipelines"},
-				"index":   []string{"all", "read", "write", "create", "create_index", "delete", "delete_index", "manage", "monitor"},
+				"index":   idxPrivs,
+				"indices": idxPrivs,
 			})
 			return
 		}
@@ -5411,6 +5464,146 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"account": strings.Join(segs[2:], "/")})
+
+	case "role_mapping":
+		if len(segs) == 2 {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			s.mu.RLock()
+			out := make(map[string]any, len(s.securityRoleMappings))
+			for k, v := range s.securityRoleMappings {
+				out[k] = deepCloneDocMap(v)
+			}
+			s.mu.RUnlock()
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		mappingName := strings.TrimSpace(segs[2])
+		switch r.Method {
+		case http.MethodPut, http.MethodPost:
+			body, ok := parseJSONBody(w, r)
+			if !ok {
+				return
+			}
+			roles, hasRoles := body["roles"].([]any)
+			if !hasRoles || len(roles) == 0 {
+				writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: [roles] is required;")
+				return
+			}
+			enabled := true
+			if b, ok := body["enabled"].(bool); ok {
+				enabled = b
+			}
+			rules, _ := body["rules"].(map[string]any)
+			if rules == nil {
+				rules = map[string]any{}
+			}
+			meta, _ := body["metadata"].(map[string]any)
+			if meta == nil {
+				meta = map[string]any{}
+			}
+			entry := map[string]any{
+				"enabled":  enabled,
+				"roles":    roles,
+				"rules":    rules,
+				"metadata": meta,
+			}
+			if rls, ok := body["role_templates"].([]any); ok {
+				entry["role_templates"] = rls
+			}
+			s.mu.Lock()
+			if s.securityRoleMappings == nil {
+				s.securityRoleMappings = make(map[string]map[string]any)
+			}
+			_, existed := s.securityRoleMappings[mappingName]
+			s.securityRoleMappings[mappingName] = deepCloneDocMap(entry)
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{
+				"role_mapping": map[string]any{"created": !existed},
+			})
+		case http.MethodGet, http.MethodHead:
+			s.mu.RLock()
+			out := make(map[string]any)
+			if mappingName == "_all" || mappingName == "*" {
+				for k, v := range s.securityRoleMappings {
+					out[k] = deepCloneDocMap(v)
+				}
+			} else {
+				for _, pat := range strings.Split(mappingName, ",") {
+					pat = strings.TrimSpace(pat)
+					if pat == "" {
+						continue
+					}
+					if strings.ContainsAny(pat, "*?") {
+						for k, v := range s.securityRoleMappings {
+							if matchSimpleWildcard(pat, k) {
+								out[k] = deepCloneDocMap(v)
+							}
+						}
+					} else if v, exists := s.securityRoleMappings[pat]; exists {
+						out[pat] = deepCloneDocMap(v)
+					} else {
+						s.mu.RUnlock()
+						if r.Method == http.MethodHead {
+							w.WriteHeader(http.StatusNotFound)
+							return
+						}
+						writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("role_mapping [%s] not found", pat))
+						return
+					}
+				}
+			}
+			s.mu.RUnlock()
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			writeJSON(w, http.StatusOK, out)
+		case http.MethodDelete:
+			s.mu.Lock()
+			_, exists := s.securityRoleMappings[mappingName]
+			if exists {
+				delete(s.securityRoleMappings, mappingName)
+			}
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"found": exists})
+		default:
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		}
+
+	case "enroll":
+		if len(segs) == 3 && (segs[2] == "kibana" || segs[2] == "node") {
+			if r.Method != http.MethodPost {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"token": "doris-enrollment-" + segs[2],
+			})
+			return
+		}
+		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+
+	case "realm":
+		if len(segs) == 4 && segs[3] == "_clear_cache" {
+			if r.Method != http.MethodPost && r.Method != http.MethodPut {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+				"cluster_name": "apache-doris-search-cluster",
+				"nodes":        map[string]any{"doris-fe-1": map[string]any{"name": "doris-fe-1"}},
+			})
+			return
+		}
+		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
 
 	default:
 		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
@@ -7509,6 +7702,2274 @@ func (s *Server) handleSSLCertificates(w http.ResponseWriter, r *http.Request) {
 			"serial_number":   "1",
 			"has_private_key": true,
 			"expiry":          "2036-01-01T00:00:00.000Z",
+		},
+	})
+}
+
+// handleHealthReport implements `GET/HEAD /_health_report` and `/_health_report/{indicator}` (Round 55 F2).
+func (s *Server) handleHealthReport(w http.ResponseWriter, r *http.Request, segs []string) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	mkInd := func(symptom string, details map[string]any) map[string]any {
+		if details == nil {
+			details = map[string]any{}
+		}
+		return map[string]any{
+			"status":    "green",
+			"symptom":   symptom,
+			"details":   details,
+			"impacts":   []any{},
+			"diagnosis": []any{},
+		}
+	}
+	s.mu.RLock()
+	idxCount := len(s.indices)
+	ilmState := s.ilmMode
+	slmState := s.slmMode
+	s.mu.RUnlock()
+	if ilmState == "" {
+		ilmState = "RUNNING"
+	}
+	if slmState == "" {
+		slmState = "RUNNING"
+	}
+	indicators := map[string]any{
+		"master_is_stable": mkInd("The cluster has a stable master node", map[string]any{
+			"current_master": map[string]any{"node_id": "doris-fe-1", "name": "doris-fe-1"},
+			"recent_masters": []any{map[string]any{"node_id": "doris-fe-1", "name": "doris-fe-1"}},
+		}),
+		"repository_integrity": mkInd("No corrupted repositories found.", map[string]any{
+			"total_repositories": 0,
+		}),
+		"shards_availability": mkInd(fmt.Sprintf("This cluster has all shards available for %d indices.", idxCount), map[string]any{
+			"primaries": map[string]any{"started": idxCount, "unassigned": 0, "initializing": 0},
+			"replicas":  map[string]any{"started": 0, "unassigned": 0, "initializing": 0},
+		}),
+		"shards_capacity": mkInd("The cluster has enough room to add new shards.", map[string]any{
+			"data": map[string]any{"max_shards_in_cluster": 1000, "current_used_shards": idxCount},
+		}),
+		"disk": mkInd("The cluster has enough available disk space.", map[string]any{
+			"indices_with_readonly_block": 0,
+			"nodes_with_enough_disk":      1,
+			"nodes_over_high_watermark":   0,
+			"nodes_over_flood_stage":      0,
+		}),
+		"ilm": mkInd("Index Lifecycle Management is running", map[string]any{
+			"policies":       0,
+			"stagnant_steps": 0,
+			"ilm_status":     ilmState,
+		}),
+		"slm": mkInd("Snapshot Lifecycle Management is running", map[string]any{
+			"slm_status": slmState,
+			"policies":   0,
+		}),
+		"data_stream_lifecycle": mkInd("Data stream lifecycle is running", map[string]any{
+			"stagnant_data_streams_count": 0,
+			"total_Error_count":           0,
+		}),
+	}
+	if len(segs) >= 2 && strings.TrimSpace(segs[1]) != "" {
+		indName := strings.TrimSpace(segs[1])
+		indObj, exists := indicators[indName]
+		if !exists {
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("unknown health indicator [%s]", indName))
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"cluster_name": "apache-doris-search-cluster",
+			"status":       "green",
+			"indicators": map[string]any{
+				indName: indObj,
+			},
+		})
+		return
+	}
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"cluster_name": "apache-doris-search-cluster",
+		"status":       "green",
+		"indicators":   indicators,
+	})
+}
+
+// handleSQLAPI implements `/_sql`, `/_sql/translate`, `/_sql/close`, and `/_sql/async/*` (Round 55 F3).
+func (s *Server) handleSQLAPI(w http.ResponseWriter, r *http.Request, segs []string) {
+	if len(segs) >= 2 && segs[1] == "close" {
+		if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		body, ok := parseJSONBody(w, r)
+		if !ok {
+			return
+		}
+		cursor, _ := body["cursor"].(string)
+		if strings.TrimSpace(cursor) == "" {
+			writeESError(w, http.StatusBadRequest, "verification_exception", "cursor is required")
+			return
+		}
+		s.mu.Lock()
+		delete(s.sqlAsyncSearches, cursor)
+		delete(s.sqlAsyncSearches, cursor+"_cursor")
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"succeeded": true})
+		return
+	}
+
+	if len(segs) >= 2 && segs[1] == "translate" {
+		if r.Method != http.MethodPost && r.Method != http.MethodGet {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		body, ok := parseJSONBody(w, r)
+		if !ok {
+			return
+		}
+		queryStr, _ := body["query"].(string)
+		if strings.TrimSpace(queryStr) == "" {
+			writeESError(w, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: [query] cannot be empty")
+			return
+		}
+		fetchSize := 1000
+		if fs, ok := toInt64(body["fetch_size"]); ok && fs > 0 {
+			fetchSize = int(fs)
+		}
+		dslQuery := map[string]any{"match_all": map[string]any{}}
+		if filterMap, ok := body["filter"].(map[string]any); ok && len(filterMap) > 0 {
+			dslQuery = filterMap
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"size":  fetchSize,
+			"query": dslQuery,
+		})
+		return
+	}
+
+	if len(segs) >= 3 && segs[1] == "async" {
+		if segs[2] == "status" && len(segs) >= 4 {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			id := strings.TrimSpace(segs[3])
+			s.mu.RLock()
+			_, exists := s.sqlAsyncSearches[id]
+			s.mu.RUnlock()
+			if !exists {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("sql async search [%s] not found", id))
+				return
+			}
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"id":                        id,
+				"is_running":                false,
+				"is_partial":                false,
+				"expiration_time_in_millis": time.Now().Add(24 * time.Hour).UnixMilli(),
+				"completion_status":         200,
+			})
+			return
+		}
+		id := strings.TrimSpace(segs[2])
+		if len(segs) == 4 && segs[2] == "delete" {
+			id = strings.TrimSpace(segs[3])
+		}
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+			s.mu.RLock()
+			resp, exists := s.sqlAsyncSearches[id]
+			s.mu.RUnlock()
+			if !exists {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("sql async search [%s] not found", id))
+				return
+			}
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			writeJSON(w, http.StatusOK, resp)
+		case http.MethodDelete:
+			s.mu.Lock()
+			_, exists := s.sqlAsyncSearches[id]
+			delete(s.sqlAsyncSearches, id)
+			s.mu.Unlock()
+			if !exists {
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("sql async search [%s] not found", id))
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+		default:
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		}
+		return
+	}
+
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	body, ok := parseJSONBody(w, r)
+	if !ok {
+		return
+	}
+	if cursorStr, _ := body["cursor"].(string); strings.TrimSpace(cursorStr) != "" {
+		s.mu.Lock()
+		curEntry, exists := s.sqlAsyncSearches[cursorStr+"_cursor"]
+		delete(s.sqlAsyncSearches, cursorStr+"_cursor")
+		s.mu.Unlock()
+		if !exists {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"columns": []any{},
+				"rows":    []any{},
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, curEntry)
+		return
+	}
+	queryStr, _ := body["query"].(string)
+	queryStr = strings.TrimSpace(queryStr)
+	if queryStr == "" {
+		writeESError(w, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: [query] cannot be empty")
+		return
+	}
+	upperQ := strings.ToUpper(queryStr)
+	if !strings.HasPrefix(upperQ, "SELECT ") && !strings.HasPrefix(upperQ, "SHOW ") && !strings.HasPrefix(upperQ, "DESCRIBE ") && !strings.HasPrefix(upperQ, "DESC ") {
+		writeESError(w, http.StatusBadRequest, "parsing_exception", "line 1:1: mismatched input; expected SELECT, SHOW, or DESCRIBE")
+		return
+	}
+	fetchSize := 1000
+	if fs, ok := toInt64(body["fetch_size"]); ok && fs > 0 {
+		fetchSize = int(fs)
+	}
+	var columns []any
+	var rows []any
+	if strings.HasPrefix(upperQ, "SHOW ") {
+		columns = []any{
+			map[string]any{"name": "name", "type": "keyword"},
+			map[string]any{"name": "type", "type": "keyword"},
+		}
+		s.mu.RLock()
+		names := make([]string, 0, len(s.indices))
+		for idx := range s.indices {
+			names = append(names, idx)
+		}
+		s.mu.RUnlock()
+		sort.Strings(names)
+		for _, idx := range names {
+			rows = append(rows, []any{idx, "TABLE"})
+		}
+	} else {
+		fromIdx := strings.Index(upperQ, " FROM ")
+		if fromIdx < 0 {
+			selExpr := strings.TrimSpace(queryStr[len("SELECT "):])
+			colName := selExpr
+			valStr := selExpr
+			if asIdx := strings.Index(strings.ToUpper(selExpr), " AS "); asIdx > 0 {
+				valStr = strings.TrimSpace(selExpr[:asIdx])
+				colName = strings.Trim(strings.TrimSpace(selExpr[asIdx+4:]), `"'`)
+			}
+			var cellVal any = strings.Trim(valStr, `"'`)
+			colType := "keyword"
+			if iv, err := strconv.ParseInt(valStr, 10, 64); err == nil {
+				cellVal = iv
+				colType = "long"
+			} else if fv, err := strconv.ParseFloat(valStr, 64); err == nil {
+				cellVal = fv
+				colType = "double"
+			}
+			columns = []any{map[string]any{"name": colName, "type": colType}}
+			rows = []any{[]any{cellVal}}
+		} else {
+			selPart := strings.TrimSpace(queryStr[len("SELECT "):fromIdx])
+			afterFrom := strings.TrimSpace(queryStr[fromIdx+len(" FROM "):])
+			afterUpper := strings.ToUpper(afterFrom)
+			limitVal := -1
+			if limIdx := strings.Index(afterUpper, " LIMIT "); limIdx >= 0 {
+				limStr := strings.TrimSpace(afterFrom[limIdx+len(" LIMIT "):])
+				if lv, err := strconv.Atoi(strings.Fields(limStr)[0]); err == nil && lv >= 0 {
+					limitVal = lv
+				}
+				afterFrom = strings.TrimSpace(afterFrom[:limIdx])
+				afterUpper = strings.ToUpper(afterFrom)
+			}
+			var orderField string
+			orderDesc := false
+			if ordIdx := strings.Index(afterUpper, " ORDER BY "); ordIdx >= 0 {
+				ordPart := strings.TrimSpace(afterFrom[ordIdx+len(" ORDER BY "):])
+				ordTokens := strings.Fields(ordPart)
+				if len(ordTokens) >= 1 {
+					orderField = strings.Trim(ordTokens[0], `"'`)
+				}
+				if len(ordTokens) >= 2 && strings.EqualFold(ordTokens[1], "DESC") {
+					orderDesc = true
+				}
+				afterFrom = strings.TrimSpace(afterFrom[:ordIdx])
+				afterUpper = strings.ToUpper(afterFrom)
+			}
+			var whereCol, whereVal string
+			if whIdx := strings.Index(afterUpper, " WHERE "); whIdx >= 0 {
+				whPart := strings.TrimSpace(afterFrom[whIdx+len(" WHERE "):])
+				if eqIdx := strings.IndexByte(whPart, '='); eqIdx > 0 {
+					whereCol = strings.Trim(strings.TrimSpace(whPart[:eqIdx]), `"'`)
+					whereVal = strings.Trim(strings.TrimSpace(whPart[eqIdx+1:]), `"'`)
+				}
+				afterFrom = strings.TrimSpace(afterFrom[:whIdx])
+			}
+			tableName := strings.Trim(strings.Fields(afterFrom)[0], `"'`)
+			searchDSL := map[string]any{"size": 1000}
+			if filterMap, ok := body["filter"].(map[string]any); ok && len(filterMap) > 0 {
+				searchDSL["query"] = filterMap
+			} else if whereCol != "" {
+				searchDSL["query"] = map[string]any{"match": map[string]any{whereCol: whereVal}}
+			} else {
+				searchDSL["query"] = map[string]any{"match_all": map[string]any{}}
+			}
+			dslBytes, _ := json.Marshal(searchDSL)
+			subReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, "/_search", bytes.NewReader(dslBytes))
+			if err != nil {
+				writeESError(w, http.StatusInternalServerError, "internal_server_error", err.Error())
+				return
+			}
+			subReq.SetPathValue("index", tableName)
+			capW := &asyncCaptureResponseWriter{}
+			s.handleSearch(capW, subReq)
+			if capW.code >= 400 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(capW.code)
+				_, _ = w.Write(capW.body.Bytes())
+				return
+			}
+			var searchResp map[string]any
+			_ = json.Unmarshal(capW.body.Bytes(), &searchResp)
+			hitsWrapper, _ := searchResp["hits"].(map[string]any)
+			rawHits, _ := hitsWrapper["hits"].([]any)
+			docs := make([]map[string]any, 0, len(rawHits))
+			for _, h := range rawHits {
+				if hm, ok := h.(map[string]any); ok {
+					if src, ok := hm["_source"].(map[string]any); ok {
+						if whereCol != "" && fmt.Sprintf("%v", src[whereCol]) != whereVal {
+							continue
+						}
+						docs = append(docs, src)
+					}
+				}
+			}
+			if orderField != "" {
+				sort.SliceStable(docs, func(i, j int) bool {
+					vi := fmt.Sprintf("%v", docs[i][orderField])
+					vj := fmt.Sprintf("%v", docs[j][orderField])
+					if orderDesc {
+						return vi > vj
+					}
+					return vi < vj
+				})
+			}
+			if limitVal >= 0 && limitVal < len(docs) {
+				docs = docs[:limitVal]
+			}
+			var colNames []string
+			if selPart == "*" {
+				colSet := make(map[string]bool)
+				for _, d := range docs {
+					for k := range d {
+						colSet[k] = true
+					}
+				}
+				if len(colSet) == 0 {
+					s.mu.RLock()
+					if sch, exists := s.indices[tableName]; exists && sch != nil {
+						for k := range sch.Fields {
+							colSet[k] = true
+						}
+					}
+					s.mu.RUnlock()
+				}
+				for k := range colSet {
+					colNames = append(colNames, k)
+				}
+				sort.Strings(colNames)
+			} else {
+				for _, part := range strings.Split(selPart, ",") {
+					p := strings.TrimSpace(part)
+					if asIdx := strings.Index(strings.ToUpper(p), " AS "); asIdx > 0 {
+						p = strings.TrimSpace(p[:asIdx])
+					}
+					colNames = append(colNames, strings.Trim(p, `"'`))
+				}
+			}
+			for _, cn := range colNames {
+				colType := "keyword"
+				for _, d := range docs {
+					if v, ok := d[cn]; ok && v != nil {
+						switch v.(type) {
+						case float64, int, int64:
+							colType = "long"
+						case bool:
+							colType = "boolean"
+						}
+						break
+					}
+				}
+				columns = append(columns, map[string]any{"name": cn, "type": colType})
+			}
+			for _, d := range docs {
+				row := make([]any, len(colNames))
+				for idx, cn := range colNames {
+					row[idx] = d[cn]
+				}
+				rows = append(rows, row)
+			}
+		}
+	}
+	if columns == nil {
+		columns = []any{}
+	}
+	if rows == nil {
+		rows = []any{}
+	}
+	s.mu.Lock()
+	if s.sqlAsyncSearches == nil {
+		s.sqlAsyncSearches = make(map[string]map[string]any)
+	}
+	sqlID := fmt.Sprintf("sql_%d", len(s.sqlAsyncSearches)+1)
+	var cursorID string
+	if fetchSize > 0 && len(rows) > fetchSize {
+		cursorID = sqlID + "_cur"
+		remRows := rows[fetchSize:]
+		rows = rows[:fetchSize]
+		s.sqlAsyncSearches[cursorID+"_cursor"] = map[string]any{
+			"columns": columns,
+			"rows":    remRows,
+		}
+	}
+	resp := map[string]any{
+		"id":         sqlID,
+		"is_partial": false,
+		"is_running": false,
+		"columns":    columns,
+		"rows":       rows,
+	}
+	if cursorID != "" {
+		resp["cursor"] = cursorID
+	}
+	s.sqlAsyncSearches[sqlID] = resp
+	s.mu.Unlock()
+
+	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
+	if format == "csv" || format == "tsv" || format == "txt" {
+		sep := ","
+		contentType := "text/csv; charset=UTF-8"
+		switch format {
+		case "tsv":
+			sep = "\t"
+			contentType = "text/tab-separated-values; charset=UTF-8"
+		case "txt":
+			sep = " | "
+			contentType = "text/plain; charset=UTF-8"
+		}
+		var sb strings.Builder
+		colHeaders := make([]string, len(columns))
+		for i, c := range columns {
+			cm, _ := c.(map[string]any)
+			colHeaders[i] = fmt.Sprintf("%v", cm["name"])
+		}
+		sb.WriteString(strings.Join(colHeaders, sep) + "\n")
+		for _, rAny := range rows {
+			rSlice, _ := rAny.([]any)
+			cells := make([]string, len(rSlice))
+			for i, v := range rSlice {
+				if v == nil {
+					cells[i] = ""
+				} else {
+					cells[i] = fmt.Sprintf("%v", v)
+				}
+			}
+			sb.WriteString(strings.Join(cells, sep) + "\n")
+		}
+		w.Header().Set("Content-Type", contentType)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(sb.String()))
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleEQLSearchAPI implements `/{index}/_eql/search`, `/_eql/search`, `/_eql/search/{id}`, `/_eql/search/status/{id}`, and `DELETE /_eql/search/{id}` (Round 55 F4).
+func (s *Server) handleEQLSearchAPI(w http.ResponseWriter, r *http.Request, segs []string) {
+	if segs[0] == "_eql" && len(segs) >= 3 && segs[1] == "search" {
+		if segs[2] == "status" && len(segs) >= 4 {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			id := strings.TrimSpace(segs[3])
+			s.mu.RLock()
+			_, exists := s.eqlSearches[id]
+			s.mu.RUnlock()
+			if !exists {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("eql search [%s] not found", id))
+				return
+			}
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"id":                id,
+				"is_running":        false,
+				"is_partial":        false,
+				"completion_status": 200,
+			})
+			return
+		}
+		id := strings.TrimSpace(segs[2])
+		if len(segs) == 4 && segs[2] == "delete" {
+			id = strings.TrimSpace(segs[3])
+		}
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+			s.mu.RLock()
+			resp, exists := s.eqlSearches[id]
+			s.mu.RUnlock()
+			if !exists {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("eql search [%s] not found", id))
+				return
+			}
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			writeJSON(w, http.StatusOK, resp)
+		case http.MethodDelete:
+			s.mu.Lock()
+			_, exists := s.eqlSearches[id]
+			delete(s.eqlSearches, id)
+			s.mu.Unlock()
+			if !exists {
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("eql search [%s] not found", id))
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+		default:
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		}
+		return
+	}
+
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	targetIndex := "_all"
+	if len(segs) == 3 && segs[1] == "_eql" && segs[2] == "search" {
+		targetIndex = strings.TrimSpace(segs[0])
+	}
+	body, ok := parseJSONBody(w, r)
+	if !ok {
+		return
+	}
+	queryStr, _ := body["query"].(string)
+	if strings.TrimSpace(queryStr) == "" {
+		writeESError(w, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: [query] cannot be empty")
+		return
+	}
+	sizeVal := 10
+	if sz, ok := toInt64(body["size"]); ok && sz >= 0 {
+		sizeVal = int(sz)
+	}
+	searchDSL := map[string]any{"size": sizeVal}
+	if filterMap, ok := body["filter"].(map[string]any); ok && len(filterMap) > 0 {
+		searchDSL["query"] = filterMap
+	} else {
+		searchDSL["query"] = map[string]any{"match_all": map[string]any{}}
+	}
+	dslBytes, _ := json.Marshal(searchDSL)
+	subReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, "/_search", bytes.NewReader(dslBytes))
+	if err != nil {
+		writeESError(w, http.StatusInternalServerError, "internal_server_error", err.Error())
+		return
+	}
+	if targetIndex != "" && targetIndex != "_all" {
+		subReq.SetPathValue("index", targetIndex)
+	}
+	capW := &asyncCaptureResponseWriter{}
+	s.handleSearch(capW, subReq)
+	if capW.code >= 400 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(capW.code)
+		_, _ = w.Write(capW.body.Bytes())
+		return
+	}
+	var searchResp map[string]any
+	_ = json.Unmarshal(capW.body.Bytes(), &searchResp)
+	hitsWrapper, _ := searchResp["hits"].(map[string]any)
+	events, _ := hitsWrapper["hits"].([]any)
+	if events == nil {
+		events = []any{}
+	}
+	s.mu.Lock()
+	if s.eqlSearches == nil {
+		s.eqlSearches = make(map[string]map[string]any)
+	}
+	eqlID := fmt.Sprintf("eql_%d", len(s.eqlSearches)+1)
+	resp := map[string]any{
+		"id":         eqlID,
+		"is_partial": false,
+		"is_running": false,
+		"took":       1,
+		"timed_out":  false,
+		"hits": map[string]any{
+			"total": map[string]any{
+				"value":    len(events),
+				"relation": "eq",
+			},
+			"events":    events,
+			"sequences": []any{},
+		},
+	}
+	s.eqlSearches[eqlID] = resp
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) resolveMaintenanceTargetIndices(w http.ResponseWriter, rawIndex string) ([]string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if rawIndex == "" || rawIndex == "_all" || rawIndex == "*" {
+		names := make([]string, 0, len(s.indices))
+		for idx := range s.indices {
+			names = append(names, idx)
+		}
+		sort.Strings(names)
+		return names, true
+	}
+	var matched []string
+	seen := make(map[string]bool)
+	for _, pat := range strings.Split(rawIndex, ",") {
+		pat = strings.TrimSpace(pat)
+		if pat == "" {
+			continue
+		}
+		if strings.ContainsAny(pat, "*?") {
+			for idx := range s.indices {
+				if matchSimpleWildcard(pat, idx) && !seen[idx] {
+					seen[idx] = true
+					matched = append(matched, idx)
+				}
+			}
+		} else if _, exists := s.indices[pat]; exists {
+			if !seen[pat] {
+				seen[pat] = true
+				matched = append(matched, pat)
+			}
+		} else if targets, isAlias := s.aliases[pat]; isAlias && len(targets) > 0 {
+			for _, t := range targets {
+				if !seen[t] {
+					seen[t] = true
+					matched = append(matched, t)
+				}
+			}
+		} else {
+			writeESError(w, http.StatusNotFound, "index_not_found_exception", fmt.Sprintf("no such index [%s]", pat))
+			return nil, false
+		}
+	}
+	sort.Strings(matched)
+	return matched, true
+}
+
+// handleReloadSearchAnalyzers implements `POST/GET /_reload_search_analyzers` and `/{index}/_reload_search_analyzers` (Round 55 F5).
+func (s *Server) handleReloadSearchAnalyzers(w http.ResponseWriter, r *http.Request, segs []string) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	rawIndex := ""
+	if len(segs) == 2 {
+		rawIndex = segs[0]
+	}
+	indices, ok := s.resolveMaintenanceTargetIndices(w, rawIndex)
+	if !ok {
+		return
+	}
+	details := make([]any, 0, len(indices))
+	for _, idx := range indices {
+		details = append(details, map[string]any{
+			"index":              idx,
+			"reloaded_analyzers": []any{},
+			"reloaded_node_ids":  []any{"doris-fe-1"},
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"_shards": map[string]any{
+			"total":      len(indices),
+			"successful": len(indices),
+			"failed":     0,
+		},
+		"reload_details": details,
+	})
+}
+
+// handleIndexDiskUsage implements `POST/GET /{index}/_disk_usage` and `/_disk_usage` (Round 55 F5).
+func (s *Server) handleIndexDiskUsage(w http.ResponseWriter, r *http.Request, segs []string) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	rawIndex := ""
+	if len(segs) == 2 {
+		rawIndex = segs[0]
+	}
+	indices, ok := s.resolveMaintenanceTargetIndices(w, rawIndex)
+	if !ok {
+		return
+	}
+	resp := map[string]any{
+		"_shards": map[string]any{
+			"total":      len(indices),
+			"successful": len(indices),
+			"failed":     0,
+		},
+	}
+	for _, idx := range indices {
+		resp[idx] = map[string]any{
+			"store_size":          "0b",
+			"store_size_in_bytes": 0,
+			"all_fields": map[string]any{
+				"total":                  "0b",
+				"total_in_bytes":         0,
+				"inverted_index":         map[string]any{"total": "0b", "total_in_bytes": 0},
+				"stored_fields":          "0b",
+				"stored_fields_in_bytes": 0,
+				"doc_values":             "0b",
+				"doc_values_in_bytes":    0,
+				"points":                 "0b",
+				"points_in_bytes":        0,
+				"norms":                  "0b",
+				"norms_in_bytes":         0,
+				"term_vectors":           "0b",
+				"term_vectors_in_bytes":  0,
+				"knn_vectors":            "0b",
+				"knn_vectors_in_bytes":   0,
+			},
+			"fields": map[string]any{},
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleIndexFieldUsageStats implements `GET /{index}/_field_usage_stats` and `/_field_usage_stats` (Round 55 F5).
+func (s *Server) handleIndexFieldUsageStats(w http.ResponseWriter, r *http.Request, segs []string) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	rawIndex := ""
+	if len(segs) == 2 {
+		rawIndex = segs[0]
+	}
+	indices, ok := s.resolveMaintenanceTargetIndices(w, rawIndex)
+	if !ok {
+		return
+	}
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	resp := map[string]any{
+		"_shards": map[string]any{
+			"total":      len(indices),
+			"successful": len(indices),
+			"failed":     0,
+		},
+	}
+	for _, idx := range indices {
+		resp[idx] = map[string]any{
+			"shards": []any{
+				map[string]any{
+					"fields":      map[string]any{},
+					"field_usage": map[string]any{},
+				},
+			},
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleSnapshotClone implements `POST/PUT /_snapshot/{repository}/{snapshot}/_clone/{target_snapshot}` (Round 55 F5).
+func (s *Server) handleSnapshotClone(w http.ResponseWriter, r *http.Request, segs []string) {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	repo := strings.TrimSpace(segs[1])
+	srcSnap := strings.TrimSpace(segs[2])
+	targetSnap := strings.TrimSpace(segs[4])
+	body, ok := parseJSONBody(w, r)
+	if !ok {
+		return
+	}
+	s.mu.Lock()
+	if _, repoExists := s.snapshotRepos[repo]; !repoExists {
+		s.mu.Unlock()
+		writeESError(w, http.StatusNotFound, "repository_missing_exception", fmt.Sprintf("[%s] missing", repo))
+		return
+	}
+	srcEntry, snapExists := s.snapshots[repo][srcSnap]
+	if !snapExists {
+		s.mu.Unlock()
+		writeESError(w, http.StatusNotFound, "snapshot_missing_exception", fmt.Sprintf("[%s:%s] is missing", repo, srcSnap))
+		return
+	}
+	if _, targetExists := s.snapshots[repo][targetSnap]; targetExists {
+		s.mu.Unlock()
+		writeESError(w, http.StatusBadRequest, "invalid_snapshot_name_exception", fmt.Sprintf("[%s:%s] Invalid snapshot name [%s], snapshot with the same name already exists", repo, targetSnap, targetSnap))
+		return
+	}
+	cloned := deepCloneDocMap(srcEntry)
+	cloned["snapshot"] = targetSnap
+	cloned["uuid"] = targetSnap + "-uuid"
+	if rawIndices, hasIndices := body["indices"]; hasIndices && rawIndices != nil {
+		switch iv := rawIndices.(type) {
+		case string:
+			var parts []string
+			for _, p := range strings.Split(iv, ",") {
+				if p = strings.TrimSpace(p); p != "" && p != "*" && p != "_all" {
+					parts = append(parts, p)
+				}
+			}
+			if len(parts) > 0 {
+				cloned["indices"] = parts
+			}
+		case []any:
+			var parts []string
+			for _, el := range iv {
+				if p := strings.TrimSpace(fmt.Sprintf("%v", el)); p != "" {
+					parts = append(parts, p)
+				}
+			}
+			cloned["indices"] = parts
+		}
+	}
+	s.snapshots[repo][targetSnap] = cloned
+	respSnap := deepCloneDocMap(cloned)
+	delete(respSnap, "index_docs")
+	delete(respSnap, "index_schemas")
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accepted": true,
+		"snapshot": respSnap,
+	})
+}
+
+// handleMLAPI implements `/_ml/*` endpoints (Round 55 F6).
+func (s *Server) handleMLAPI(w http.ResponseWriter, r *http.Request, segs []string) {
+	if len(segs) < 2 {
+		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+		return
+	}
+	sub := segs[1]
+	switch sub {
+	case "info":
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		s.mu.RLock()
+		upMode := s.mlUpgradeMode
+		s.mu.RUnlock()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"defaults": map[string]any{
+				"anomaly_detectors": map[string]any{
+					"model_memory_limit":                        "1gb",
+					"categorization_examples_limit":             4,
+					"model_snapshot_retention_days":             10,
+					"daily_model_snapshot_retention_after_days": 1,
+				},
+				"datafeeds": map[string]any{
+					"scroll_size": 1000,
+				},
+			},
+			"limits": map[string]any{
+				"max_model_memory_limit": "0b",
+			},
+			"upgrade_mode": upMode,
+		})
+
+	case "memory_stats":
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+			"cluster_name": "apache-doris-search-cluster",
+			"nodes": map[string]any{
+				"doris-fe-1": map[string]any{
+					"name": "doris-fe-1",
+					"jvm": map[string]any{
+						"heap_max":                "1gb",
+						"heap_max_in_bytes":       1073741824,
+						"java_inference":          "0b",
+						"java_inference_in_bytes": 0,
+					},
+					"mem": map[string]any{
+						"total":                   "8gb",
+						"total_in_bytes":          8589934592,
+						"adjusted_total":          "8gb",
+						"adjusted_total_in_bytes": 8589934592,
+						"ml": map[string]any{
+							"max":                           "2gb",
+							"max_in_bytes":                  2147483648,
+							"native_code_overhead":          "0b",
+							"native_code_overhead_in_bytes": 0,
+							"anomaly_detectors":             "0b",
+							"anomaly_detectors_in_bytes":    0,
+							"data_frame_analytics":          "0b",
+							"data_frame_analytics_in_bytes": 0,
+							"native_inference":              "0b",
+							"native_inference_in_bytes":     0,
+						},
+					},
+				},
+			},
+		})
+
+	case "set_upgrade_mode":
+		if r.Method != http.MethodPost && r.Method != http.MethodPut {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		enabled := isTruthyBoolQueryParam(r, "enabled")
+		if body, ok := parseJSONBody(w, r); ok {
+			if b, hasB := body["enabled"].(bool); hasB {
+				enabled = b
+			}
+		}
+		s.mu.Lock()
+		s.mlUpgradeMode = enabled
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+	case "anomaly_detectors":
+		s.handleMLAnomalyDetectors(w, r, segs)
+
+	case "datafeeds":
+		s.handleMLDatafeeds(w, r, segs)
+
+	case "trained_models":
+		s.handleMLTrainedModels(w, r, segs)
+
+	case "calendars":
+		s.handleMLCalendars(w, r, segs)
+
+	case "filters":
+		s.handleMLFilters(w, r, segs)
+
+	default:
+		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+	}
+}
+
+func (s *Server) handleMLAnomalyDetectors(w http.ResponseWriter, r *http.Request, segs []string) {
+	if (len(segs) == 3 && segs[2] == "_stats") || (len(segs) == 4 && segs[3] == "_stats") {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		targetID := "_all"
+		if len(segs) == 4 {
+			targetID = strings.TrimSpace(segs[2])
+		}
+		s.mu.RLock()
+		var statsList []any
+		for id, job := range s.mlJobs {
+			if targetID != "_all" && targetID != "*" && !matchSimpleWildcard(targetID, id) {
+				continue
+			}
+			state, _ := job["state"].(string)
+			if state == "" {
+				state = "closed"
+			}
+			statsList = append(statsList, map[string]any{
+				"job_id": id,
+				"state":  state,
+				"data_counts": map[string]any{
+					"job_id":                       id,
+					"processed_record_count":       0,
+					"processed_field_count":        0,
+					"input_bytes":                  0,
+					"input_field_count":            0,
+					"invalid_date_count":           0,
+					"missing_field_count":          0,
+					"out_of_order_timestamp_count": 0,
+					"empty_bucket_count":           0,
+					"sparse_bucket_count":          0,
+					"bucket_count":                 0,
+					"input_record_count":           0,
+				},
+				"model_size_stats": map[string]any{
+					"job_id":                           id,
+					"result_type":                      "model_size_stats",
+					"model_bytes":                      0,
+					"total_by_field_count":             0,
+					"total_over_field_count":           0,
+					"total_partition_field_count":      0,
+					"bucket_allocation_failures_count": 0,
+					"memory_status":                    "ok",
+				},
+			})
+		}
+		s.mu.RUnlock()
+		if targetID != "_all" && targetID != "*" && !strings.ContainsAny(targetID, "*?") && len(statsList) == 0 {
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Unknown job [%s]", targetID))
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if statsList == nil {
+			statsList = []any{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"count": len(statsList),
+			"jobs":  statsList,
+		})
+		return
+	}
+
+	if len(segs) == 4 {
+		jobID := strings.TrimSpace(segs[2])
+		action := strings.TrimSpace(segs[3])
+		if r.Method != http.MethodPost {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		s.mu.Lock()
+		job, exists := s.mlJobs[jobID]
+		if !exists {
+			s.mu.Unlock()
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Unknown job [%s]", jobID))
+			return
+		}
+		switch action {
+		case "_open":
+			job["state"] = "opened"
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"opened": true})
+		case "_close":
+			job["state"] = "closed"
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"closed": true})
+		case "_update":
+			s.mu.Unlock()
+			body, ok := parseJSONBody(w, r)
+			if !ok {
+				return
+			}
+			s.mu.Lock()
+			for k, v := range body {
+				job[k] = v
+			}
+			cp := deepCloneDocMap(job)
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, cp)
+		case "_flush":
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"flushed": true})
+		default:
+			s.mu.Unlock()
+			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+		}
+		return
+	}
+
+	jobID := ""
+	if len(segs) >= 3 {
+		jobID = strings.TrimSpace(segs[2])
+	}
+	switch r.Method {
+	case http.MethodPut:
+		if jobID == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: job_id is missing;")
+			return
+		}
+		body, ok := parseJSONBody(w, r)
+		if !ok {
+			return
+		}
+		ac, _ := body["analysis_config"].(map[string]any)
+		if ac == nil {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: [analysis_config] is required;")
+			return
+		}
+		dc, _ := body["data_description"].(map[string]any)
+		if dc == nil {
+			dc = map[string]any{"time_field": "@timestamp", "time_format": "epoch_ms"}
+		}
+		entry := deepCloneDocMap(body)
+		entry["job_id"] = jobID
+		entry["job_type"] = "anomaly_detector"
+		entry["create_time"] = time.Now().UTC().UnixMilli()
+		entry["state"] = "closed"
+		entry["analysis_config"] = ac
+		entry["data_description"] = dc
+		s.mu.Lock()
+		if s.mlJobs == nil {
+			s.mlJobs = make(map[string]map[string]any)
+		}
+		s.mlJobs[jobID] = entry
+		cp := deepCloneDocMap(entry)
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, cp)
+
+	case http.MethodGet, http.MethodHead:
+		s.mu.RLock()
+		var jobs []any
+		for id, job := range s.mlJobs {
+			if jobID != "" && jobID != "_all" && jobID != "*" && !matchSimpleWildcard(jobID, id) {
+				continue
+			}
+			jobs = append(jobs, deepCloneDocMap(job))
+		}
+		s.mu.RUnlock()
+		if jobID != "" && jobID != "_all" && jobID != "*" && !strings.ContainsAny(jobID, "*?") && len(jobs) == 0 {
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Unknown job [%s]", jobID))
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if jobs == nil {
+			jobs = []any{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"count": len(jobs),
+			"jobs":  jobs,
+		})
+
+	case http.MethodDelete:
+		if jobID == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: job_id is missing;")
+			return
+		}
+		s.mu.Lock()
+		_, exists := s.mlJobs[jobID]
+		delete(s.mlJobs, jobID)
+		s.mu.Unlock()
+		if !exists {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Unknown job [%s]", jobID))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+	default:
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+	}
+}
+
+func (s *Server) handleMLDatafeeds(w http.ResponseWriter, r *http.Request, segs []string) {
+	if (len(segs) == 3 && segs[2] == "_stats") || (len(segs) == 4 && segs[3] == "_stats") {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		targetID := "_all"
+		if len(segs) == 4 {
+			targetID = strings.TrimSpace(segs[2])
+		}
+		s.mu.RLock()
+		var statsList []any
+		for id, df := range s.mlDatafeeds {
+			if targetID != "_all" && targetID != "*" && !matchSimpleWildcard(targetID, id) {
+				continue
+			}
+			state, _ := df["state"].(string)
+			if state == "" {
+				state = "stopped"
+			}
+			statsList = append(statsList, map[string]any{
+				"datafeed_id": id,
+				"state":       state,
+			})
+		}
+		s.mu.RUnlock()
+		if targetID != "_all" && targetID != "*" && !strings.ContainsAny(targetID, "*?") && len(statsList) == 0 {
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Unknown datafeed [%s]", targetID))
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if statsList == nil {
+			statsList = []any{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"count":     len(statsList),
+			"datafeeds": statsList,
+		})
+		return
+	}
+
+	if len(segs) == 4 {
+		dfID := strings.TrimSpace(segs[2])
+		action := strings.TrimSpace(segs[3])
+		s.mu.Lock()
+		df, exists := s.mlDatafeeds[dfID]
+		if !exists {
+			s.mu.Unlock()
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Unknown datafeed [%s]", dfID))
+			return
+		}
+		switch action {
+		case "_start":
+			if r.Method != http.MethodPost {
+				s.mu.Unlock()
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			df["state"] = "started"
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"started": true})
+		case "_stop":
+			if r.Method != http.MethodPost {
+				s.mu.Unlock()
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			df["state"] = "stopped"
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"stopped": true})
+		case "_update":
+			s.mu.Unlock()
+			if r.Method != http.MethodPost {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			body, ok := parseJSONBody(w, r)
+			if !ok {
+				return
+			}
+			s.mu.Lock()
+			for k, v := range body {
+				df[k] = v
+			}
+			cp := deepCloneDocMap(df)
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, cp)
+		case "_preview":
+			s.mu.Unlock()
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			writeJSON(w, http.StatusOK, []any{})
+		default:
+			s.mu.Unlock()
+			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+		}
+		return
+	}
+
+	dfID := ""
+	if len(segs) >= 3 {
+		dfID = strings.TrimSpace(segs[2])
+	}
+	switch r.Method {
+	case http.MethodPut:
+		if dfID == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: datafeed_id is missing;")
+			return
+		}
+		body, ok := parseJSONBody(w, r)
+		if !ok {
+			return
+		}
+		jobID, _ := body["job_id"].(string)
+		if strings.TrimSpace(jobID) == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: [job_id] is required;")
+			return
+		}
+		entry := deepCloneDocMap(body)
+		entry["datafeed_id"] = dfID
+		entry["state"] = "stopped"
+		if entry["indices"] == nil {
+			entry["indices"] = []any{"*"}
+		}
+		if entry["query"] == nil {
+			entry["query"] = map[string]any{"match_all": map[string]any{}}
+		}
+		s.mu.Lock()
+		if s.mlDatafeeds == nil {
+			s.mlDatafeeds = make(map[string]map[string]any)
+		}
+		s.mlDatafeeds[dfID] = entry
+		cp := deepCloneDocMap(entry)
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, cp)
+
+	case http.MethodGet, http.MethodHead:
+		s.mu.RLock()
+		var list []any
+		for id, df := range s.mlDatafeeds {
+			if dfID != "" && dfID != "_all" && dfID != "*" && !matchSimpleWildcard(dfID, id) {
+				continue
+			}
+			list = append(list, deepCloneDocMap(df))
+		}
+		s.mu.RUnlock()
+		if dfID != "" && dfID != "_all" && dfID != "*" && !strings.ContainsAny(dfID, "*?") && len(list) == 0 {
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Unknown datafeed [%s]", dfID))
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if list == nil {
+			list = []any{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"count":     len(list),
+			"datafeeds": list,
+		})
+
+	case http.MethodDelete:
+		if dfID == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: datafeed_id is missing;")
+			return
+		}
+		s.mu.Lock()
+		_, exists := s.mlDatafeeds[dfID]
+		delete(s.mlDatafeeds, dfID)
+		s.mu.Unlock()
+		if !exists {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Unknown datafeed [%s]", dfID))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+	default:
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+	}
+}
+
+func (s *Server) handleMLTrainedModels(w http.ResponseWriter, r *http.Request, segs []string) {
+	if (len(segs) == 3 && segs[2] == "_stats") || (len(segs) == 4 && segs[3] == "_stats") {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		targetID := "_all"
+		if len(segs) == 4 {
+			targetID = strings.TrimSpace(segs[2])
+		}
+		s.mu.RLock()
+		var statsList []any
+		for id := range s.mlTrainedModels {
+			if targetID != "_all" && targetID != "*" && !matchSimpleWildcard(targetID, id) {
+				continue
+			}
+			statsList = append(statsList, map[string]any{
+				"model_id":       id,
+				"pipeline_count": 0,
+				"ingest":         map[string]any{"total": map[string]any{"count": 0}},
+			})
+		}
+		s.mu.RUnlock()
+		if targetID != "_all" && targetID != "*" && !strings.ContainsAny(targetID, "*?") && len(statsList) == 0 {
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("No trained models matched [%s]", targetID))
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if statsList == nil {
+			statsList = []any{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"count":               len(statsList),
+			"trained_model_stats": statsList,
+		})
+		return
+	}
+
+	modelID := ""
+	if len(segs) >= 3 {
+		modelID = strings.TrimSpace(segs[2])
+	}
+	switch r.Method {
+	case http.MethodPut:
+		if modelID == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: model_id is missing;")
+			return
+		}
+		body, ok := parseJSONBody(w, r)
+		if !ok {
+			return
+		}
+		entry := deepCloneDocMap(body)
+		entry["model_id"] = modelID
+		entry["create_time"] = time.Now().UTC().UnixMilli()
+		entry["version"] = "8.15.0"
+		s.mu.Lock()
+		if s.mlTrainedModels == nil {
+			s.mlTrainedModels = make(map[string]map[string]any)
+		}
+		s.mlTrainedModels[modelID] = entry
+		cp := deepCloneDocMap(entry)
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, cp)
+
+	case http.MethodGet, http.MethodHead:
+		s.mu.RLock()
+		var list []any
+		for id, m := range s.mlTrainedModels {
+			if modelID != "" && modelID != "_all" && modelID != "*" && !matchSimpleWildcard(modelID, id) {
+				continue
+			}
+			list = append(list, deepCloneDocMap(m))
+		}
+		s.mu.RUnlock()
+		if modelID != "" && modelID != "_all" && modelID != "*" && !strings.ContainsAny(modelID, "*?") && len(list) == 0 {
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("No trained models matched [%s]", modelID))
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if list == nil {
+			list = []any{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"count":                 len(list),
+			"trained_model_configs": list,
+		})
+
+	case http.MethodDelete:
+		if modelID == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: model_id is missing;")
+			return
+		}
+		s.mu.Lock()
+		_, exists := s.mlTrainedModels[modelID]
+		delete(s.mlTrainedModels, modelID)
+		s.mu.Unlock()
+		if !exists {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("No trained models matched [%s]", modelID))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+	default:
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+	}
+}
+
+func (s *Server) handleMLCalendars(w http.ResponseWriter, r *http.Request, segs []string) {
+	if len(segs) >= 4 {
+		calID := strings.TrimSpace(segs[2])
+		sub := strings.TrimSpace(segs[3])
+		s.mu.Lock()
+		cal, exists := s.mlCalendars[calID]
+		if !exists {
+			s.mu.Unlock()
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Unknown calendar [%s]", calID))
+			return
+		}
+		switch sub {
+		case "jobs":
+			if len(segs) < 5 {
+				s.mu.Unlock()
+				writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "job_id is required")
+				return
+			}
+			jobID := strings.TrimSpace(segs[4])
+			jobIDs, _ := cal["job_ids"].([]any)
+			switch r.Method {
+			case http.MethodPut, http.MethodPost:
+				for _, j := range strings.Split(jobID, ",") {
+					j = strings.TrimSpace(j)
+					if j != "" {
+						jobIDs = append(jobIDs, j)
+					}
+				}
+				cal["job_ids"] = jobIDs
+				cp := deepCloneDocMap(cal)
+				delete(cp, "_events")
+				s.mu.Unlock()
+				writeJSON(w, http.StatusOK, cp)
+			case http.MethodDelete:
+				var filtered []any
+				for _, existing := range jobIDs {
+					if fmt.Sprintf("%v", existing) != jobID {
+						filtered = append(filtered, existing)
+					}
+				}
+				if filtered == nil {
+					filtered = []any{}
+				}
+				cal["job_ids"] = filtered
+				cp := deepCloneDocMap(cal)
+				delete(cp, "_events")
+				s.mu.Unlock()
+				writeJSON(w, http.StatusOK, cp)
+			default:
+				s.mu.Unlock()
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			}
+			return
+
+		case "events":
+			events, _ := cal["_events"].([]any)
+			switch r.Method {
+			case http.MethodPost, http.MethodPut:
+				s.mu.Unlock()
+				body, ok := parseJSONBody(w, r)
+				if !ok {
+					return
+				}
+				newEvents, _ := body["events"].([]any)
+				s.mu.Lock()
+				var added []any
+				for idx, evAny := range newEvents {
+					if evMap, ok := evAny.(map[string]any); ok {
+						cp := deepCloneDocMap(evMap)
+						cp["calendar_id"] = calID
+						if cp["event_id"] == nil {
+							cp["event_id"] = fmt.Sprintf("ev_%d", len(events)+idx+1)
+						}
+						events = append(events, cp)
+						added = append(added, cp)
+					}
+				}
+				cal["_events"] = events
+				s.mu.Unlock()
+				if added == nil {
+					added = []any{}
+				}
+				writeJSON(w, http.StatusOK, map[string]any{"events": added})
+			case http.MethodGet, http.MethodHead:
+				s.mu.Unlock()
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				if events == nil {
+					events = []any{}
+				}
+				writeJSON(w, http.StatusOK, map[string]any{
+					"count":  len(events),
+					"events": events,
+				})
+			case http.MethodDelete:
+				eventID := ""
+				if len(segs) >= 5 {
+					eventID = strings.TrimSpace(segs[4])
+				}
+				var filtered []any
+				for _, evAny := range events {
+					if evMap, ok := evAny.(map[string]any); ok {
+						if eventID != "" && fmt.Sprintf("%v", evMap["event_id"]) == eventID {
+							continue
+						}
+						filtered = append(filtered, evMap)
+					}
+				}
+				cal["_events"] = filtered
+				s.mu.Unlock()
+				writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+			default:
+				s.mu.Unlock()
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			}
+			return
+		default:
+			s.mu.Unlock()
+			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+			return
+		}
+	}
+
+	calID := ""
+	if len(segs) >= 3 {
+		calID = strings.TrimSpace(segs[2])
+	}
+	switch r.Method {
+	case http.MethodPut, http.MethodPost:
+		if calID == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: calendar_id is missing;")
+			return
+		}
+		body, ok := parseJSONBody(w, r)
+		if !ok {
+			return
+		}
+		jobIDs, _ := body["job_ids"].([]any)
+		if jobIDs == nil {
+			jobIDs = []any{}
+		}
+		desc, _ := body["description"].(string)
+		entry := map[string]any{
+			"calendar_id": calID,
+			"job_ids":     jobIDs,
+			"description": desc,
+			"_events":     []any{},
+		}
+		s.mu.Lock()
+		if s.mlCalendars == nil {
+			s.mlCalendars = make(map[string]map[string]any)
+		}
+		s.mlCalendars[calID] = entry
+		cp := deepCloneDocMap(entry)
+		delete(cp, "_events")
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, cp)
+
+	case http.MethodGet, http.MethodHead:
+		s.mu.RLock()
+		var list []any
+		for id, cal := range s.mlCalendars {
+			if calID != "" && calID != "_all" && calID != "*" && !matchSimpleWildcard(calID, id) {
+				continue
+			}
+			cp := deepCloneDocMap(cal)
+			delete(cp, "_events")
+			list = append(list, cp)
+		}
+		s.mu.RUnlock()
+		if calID != "" && calID != "_all" && calID != "*" && !strings.ContainsAny(calID, "*?") && len(list) == 0 {
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Unknown calendar [%s]", calID))
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if list == nil {
+			list = []any{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"count":     len(list),
+			"calendars": list,
+		})
+
+	case http.MethodDelete:
+		if calID == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: calendar_id is missing;")
+			return
+		}
+		s.mu.Lock()
+		_, exists := s.mlCalendars[calID]
+		delete(s.mlCalendars, calID)
+		s.mu.Unlock()
+		if !exists {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Unknown calendar [%s]", calID))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+	default:
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+	}
+}
+
+func (s *Server) handleMLFilters(w http.ResponseWriter, r *http.Request, segs []string) {
+	filterID := ""
+	if len(segs) >= 3 {
+		filterID = strings.TrimSpace(segs[2])
+	}
+	if len(segs) == 4 && segs[3] == "_update" {
+		if r.Method != http.MethodPost {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		body, ok := parseJSONBody(w, r)
+		if !ok {
+			return
+		}
+		s.mu.Lock()
+		fObj, exists := s.mlFilters[filterID]
+		if !exists {
+			s.mu.Unlock()
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Unknown filter [%s]", filterID))
+			return
+		}
+		items, _ := fObj["items"].([]any)
+		if addItems, ok := body["add_items"].([]any); ok {
+			items = append(items, addItems...)
+		}
+		if removeItems, ok := body["remove_items"].([]any); ok {
+			remSet := make(map[string]bool, len(removeItems))
+			for _, rm := range removeItems {
+				remSet[fmt.Sprintf("%v", rm)] = true
+			}
+			var kept []any
+			for _, it := range items {
+				if !remSet[fmt.Sprintf("%v", it)] {
+					kept = append(kept, it)
+				}
+			}
+			items = kept
+		}
+		if items == nil {
+			items = []any{}
+		}
+		fObj["items"] = items
+		if desc, ok := body["description"].(string); ok {
+			fObj["description"] = desc
+		}
+		cp := deepCloneDocMap(fObj)
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, cp)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPut, http.MethodPost:
+		if filterID == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: filter_id is missing;")
+			return
+		}
+		body, ok := parseJSONBody(w, r)
+		if !ok {
+			return
+		}
+		items, _ := body["items"].([]any)
+		if items == nil {
+			items = []any{}
+		}
+		desc, _ := body["description"].(string)
+		entry := map[string]any{
+			"filter_id":   filterID,
+			"items":       items,
+			"description": desc,
+		}
+		s.mu.Lock()
+		if s.mlFilters == nil {
+			s.mlFilters = make(map[string]map[string]any)
+		}
+		s.mlFilters[filterID] = entry
+		cp := deepCloneDocMap(entry)
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, cp)
+
+	case http.MethodGet, http.MethodHead:
+		s.mu.RLock()
+		var list []any
+		for id, fObj := range s.mlFilters {
+			if filterID != "" && filterID != "_all" && filterID != "*" && !matchSimpleWildcard(filterID, id) {
+				continue
+			}
+			list = append(list, deepCloneDocMap(fObj))
+		}
+		s.mu.RUnlock()
+		if filterID != "" && filterID != "_all" && filterID != "*" && !strings.ContainsAny(filterID, "*?") && len(list) == 0 {
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Unknown filter [%s]", filterID))
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if list == nil {
+			list = []any{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"count":   len(list),
+			"filters": list,
+		})
+
+	case http.MethodDelete:
+		if filterID == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: filter_id is missing;")
+			return
+		}
+		s.mu.Lock()
+		_, exists := s.mlFilters[filterID]
+		delete(s.mlFilters, filterID)
+		s.mu.Unlock()
+		if !exists {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Unknown filter [%s]", filterID))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+	default:
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+	}
+}
+
+// handleFleetAPI implements `/_fleet/*` and `/{index}/_fleet/*` (Round 55 F8).
+func (s *Server) handleFleetAPI(w http.ResponseWriter, r *http.Request, segs []string) {
+	action := ""
+	if segs[0] == "_fleet" && len(segs) >= 2 {
+		action = segs[1]
+	} else if len(segs) == 3 && segs[1] == "_fleet" {
+		r.SetPathValue("index", segs[0])
+		action = segs[2]
+	}
+	switch action {
+	case "msearch":
+		s.handleMSearch(w, r)
+	case "search":
+		s.handleSearch(w, r)
+	case "global_checkpoints":
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		if idx := strings.TrimSpace(r.PathValue("index")); idx != "" && idx != "_all" && idx != "*" {
+			if _, ok := s.resolveMaintenanceTargetIndices(w, idx); !ok {
+				return
+			}
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"global_checkpoints":            []int{0},
+			"last_KNOWN_global_checkpoints": []int{0},
+		})
+	default:
+		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+	}
+}
+
+// handleGraphExplore implements `POST/GET /_graph/explore` and `/{index}/_graph/explore` (Round 55 F8).
+func (s *Server) handleGraphExplore(w http.ResponseWriter, r *http.Request, segs []string) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	if len(segs) == 3 {
+		if _, ok := s.resolveMaintenanceTargetIndices(w, segs[0]); !ok {
+			return
+		}
+	}
+	if _, ok := parseJSONBody(w, r); !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"took":        1,
+		"timed_out":   false,
+		"failures":    []any{},
+		"connections": []any{},
+		"vertices":    []any{},
+	})
+}
+
+// handleCatComponentTemplates implements `GET/HEAD /_cat/component_templates` and `/_cat/component_templates/{name}` (Round 55 F9).
+func (s *Server) handleCatComponentTemplates(w http.ResponseWriter, r *http.Request, segs []string) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	namePat := ""
+	if len(segs) >= 3 {
+		namePat = strings.TrimSpace(segs[2])
+	}
+	_ = s.syncCatalogFromBackend(r.Context())
+	s.mu.RLock()
+	var names []string
+	for k := range s.componentTemplates {
+		if namePat != "" && namePat != "_all" && namePat != "*" && !matchSimpleWildcard(namePat, k) {
+			continue
+		}
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	rows := make([]map[string]any, 0, len(names))
+	for _, k := range names {
+		ct := s.componentTemplates[k]
+		ver := "0"
+		if v, ok := ct["version"]; ok && v != nil {
+			ver = fmt.Sprintf("%v", v)
+		}
+		tpl, _ := ct["template"].(map[string]any)
+		aliasCount, mappingCount, settingsCount, metaCount := 0, 0, 0, 0
+		if tpl != nil {
+			if am, ok := tpl["aliases"].(map[string]any); ok {
+				aliasCount = len(am)
+			}
+			if mm, ok := tpl["mappings"].(map[string]any); ok && len(mm) > 0 {
+				mappingCount = 1
+			}
+			if sm, ok := tpl["settings"].(map[string]any); ok {
+				settingsCount = len(sm)
+			}
+		}
+		if meta, ok := ct["_meta"].(map[string]any); ok {
+			metaCount = len(meta)
+		}
+		var includedIn []string
+		for tplName, idxTpl := range s.templates {
+			for _, comp := range idxTpl.ComposedOf {
+				if comp == k {
+					includedIn = append(includedIn, tplName)
+					break
+				}
+			}
+		}
+		sort.Strings(includedIn)
+		rows = append(rows, map[string]any{
+			"name":           k,
+			"version":        ver,
+			"alias_count":    fmt.Sprintf("%d", aliasCount),
+			"mapping_count":  fmt.Sprintf("%d", mappingCount),
+			"settings_count": fmt.Sprintf("%d", settingsCount),
+			"metadata_count": fmt.Sprintf("%d", metaCount),
+			"included_in":    "[" + strings.Join(includedIn, ", ") + "]",
+		})
+	}
+	s.mu.RUnlock()
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	writeCatResponse(w, r, []string{"name", "version", "alias_count", "mapping_count", "settings_count", "metadata_count", "included_in"}, rows)
+}
+
+// handleCatML implements `/_cat/ml_anomaly_detectors*`, `/_cat/ml_jobs*`, `/_cat/ml_datafeeds*`, `/_cat/ml_trained_models*`, and `/_cat/ml_data_frame_analytics*` (Round 55 F9).
+func (s *Server) handleCatML(w http.ResponseWriter, r *http.Request, segs []string) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	kind := segs[1]
+	idPat := ""
+	if len(segs) >= 3 {
+		idPat = strings.TrimSpace(segs[2])
+	}
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	s.mu.RLock()
+	switch kind {
+	case "ml_anomaly_detectors", "ml_jobs":
+		var ids []string
+		for id := range s.mlJobs {
+			if idPat != "" && idPat != "_all" && idPat != "*" && !matchSimpleWildcard(idPat, id) {
+				continue
+			}
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		rows := make([]map[string]any, 0, len(ids))
+		for _, id := range ids {
+			job := s.mlJobs[id]
+			state, _ := job["state"].(string)
+			if state == "" {
+				state = "closed"
+			}
+			rows = append(rows, map[string]any{
+				"id":                     id,
+				"state":                  state,
+				"opened_time":            "",
+				"assignment_explanation": "",
+				"data.processed_records": "0",
+				"data.processed_fields":  "0",
+				"data.input_bytes":       "0b",
+				"model.bytes":            "0b",
+			})
+		}
+		s.mu.RUnlock()
+		writeCatResponse(w, r, []string{"id", "state", "opened_time", "assignment_explanation", "data.processed_records", "data.processed_fields", "data.input_bytes", "model.bytes"}, rows)
+	case "ml_datafeeds":
+		var ids []string
+		for id := range s.mlDatafeeds {
+			if idPat != "" && idPat != "_all" && idPat != "*" && !matchSimpleWildcard(idPat, id) {
+				continue
+			}
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		rows := make([]map[string]any, 0, len(ids))
+		for _, id := range ids {
+			df := s.mlDatafeeds[id]
+			state, _ := df["state"].(string)
+			if state == "" {
+				state = "stopped"
+			}
+			rows = append(rows, map[string]any{
+				"id":           id,
+				"state":        state,
+				"search.count": "0",
+				"search.time":  "0s",
+			})
+		}
+		s.mu.RUnlock()
+		writeCatResponse(w, r, []string{"id", "state", "search.count", "search.time"}, rows)
+	case "ml_trained_models":
+		var ids []string
+		for id := range s.mlTrainedModels {
+			if idPat != "" && idPat != "_all" && idPat != "*" && !matchSimpleWildcard(idPat, id) {
+				continue
+			}
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		rows := make([]map[string]any, 0, len(ids))
+		for _, id := range ids {
+			rows = append(rows, map[string]any{
+				"id":          id,
+				"model_type":  "tree_ensemble",
+				"create_time": "2026-01-01T00:00:00.000Z",
+				"version":     "8.15.0",
+			})
+		}
+		s.mu.RUnlock()
+		writeCatResponse(w, r, []string{"id", "model_type", "create_time", "version"}, rows)
+	default:
+		s.mu.RUnlock()
+		writeCatResponse(w, r, []string{"id", "state", "progress", "create_time"}, []map[string]any{})
+	}
+}
+
+// handleClusterInfo implements `GET/HEAD /_cluster/info` and `/_cluster/info/{target}` (Round 55 F9).
+func (s *Server) handleClusterInfo(w http.ResponseWriter, r *http.Request, segs []string) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	allInfo := map[string]any{
+		"http": map[string]any{
+			"publish_address":             "127.0.0.1:9200",
+			"bound_address":               []string{"127.0.0.1:9200"},
+			"max_content_length_in_bytes": DefaultMaxRequestBodyBytes,
+		},
+		"ingest": map[string]any{
+			"processors": []map[string]any{
+				{"type": "append"},
+				{"type": "bytes"},
+				{"type": "circle"},
+				{"type": "community_id"},
+				{"type": "compact"},
+				{"type": "convert"},
+				{"type": "csv"},
+				{"type": "date"},
+				{"type": "date_index_name"},
+				{"type": "dissect"},
+				{"type": "dot_expander"},
+				{"type": "drop"},
+				{"type": "enrich"},
+				{"type": "fail"},
+				{"type": "fingerprint"},
+				{"type": "foreach"},
+				{"type": "geoip"},
+				{"type": "grok"},
+				{"type": "gsub"},
+				{"type": "html_strip"},
+				{"type": "inference"},
+				{"type": "join"},
+				{"type": "json"},
+				{"type": "kv"},
+				{"type": "lowercase"},
+				{"type": "network_direction"},
+				{"type": "pipeline"},
+				{"type": "redact"},
+				{"type": "registered_domain"},
+				{"type": "remove"},
+				{"type": "rename"},
+				{"type": "reroute"},
+				{"type": "script"},
+				{"type": "set"},
+				{"type": "set_security_user"},
+				{"type": "sort"},
+				{"type": "split"},
+				{"type": "terminate"},
+				{"type": "trim"},
+				{"type": "uppercase"},
+				{"type": "uri_parts"},
+				{"type": "urldecode"},
+				{"type": "urlencode"},
+				{"type": "user_agent"},
+			},
+		},
+		"thread_pool": map[string]any{
+			"generic": map[string]any{"type": "scaling", "min": 4, "max": 128, "keep_alive": "30s"},
+			"search":  map[string]any{"type": "fixed_auto_queue_size", "size": 7, "queue_size": 1000},
+			"write":   map[string]any{"type": "fixed", "size": 4, "queue_size": 10000},
+		},
+		"aggregations": map[string]any{
+			"avg":            map[string]any{"types": []string{"numeric", "boolean", "date"}},
+			"cardinality":    map[string]any{"types": []string{"numeric", "keyword", "ip", "date", "boolean"}},
+			"date_histogram": map[string]any{"types": []string{"date", "numeric"}},
+			"histogram":      map[string]any{"types": []string{"numeric", "date"}},
+			"max":            map[string]any{"types": []string{"numeric", "boolean", "date"}},
+			"min":            map[string]any{"types": []string{"numeric", "boolean", "date"}},
+			"sum":            map[string]any{"types": []string{"numeric", "boolean", "date"}},
+			"terms":          map[string]any{"types": []string{"keyword", "numeric", "ip", "boolean", "date"}},
+			"value_count":    map[string]any{"types": []string{"object", "keyword", "numeric", "ip", "boolean", "date"}},
+		},
+	}
+	targetRaw := "_all"
+	if len(segs) >= 3 && strings.TrimSpace(segs[2]) != "" {
+		targetRaw = strings.TrimSpace(segs[2])
+	}
+	outInfo := make(map[string]any)
+	if targetRaw == "_all" || targetRaw == "*" {
+		for k, v := range allInfo {
+			outInfo[k] = v
+		}
+	} else {
+		for _, t := range strings.Split(targetRaw, ",") {
+			t = strings.TrimSpace(t)
+			if t == "" {
+				continue
+			}
+			if t == "_all" || t == "*" {
+				for k, v := range allInfo {
+					outInfo[k] = v
+				}
+				continue
+			}
+			val, exists := allInfo[t]
+			if !exists {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("No enum constant org.elasticsearch.action.support.nodes.info.ClusterInfoTarget.%s", strings.ToUpper(t)))
+				return
+			}
+			outInfo[t] = val
+		}
+	}
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+		"cluster_name": "apache-doris-search-cluster",
+		"info":         outInfo,
+	})
+}
+
+// handleNodesRepositoriesMetering implements `GET/HEAD /_nodes/repositories_metering`, `/_nodes/{node_id}/repositories_metering`, and `DELETE /_nodes/clear_repositories_metering_archive/{max_archive_version}` (Round 55 F9).
+func (s *Server) handleNodesRepositoriesMetering(w http.ResponseWriter, r *http.Request, segs []string) {
+	isClear := segs[1] == "clear_repositories_metering_archive" || (len(segs) >= 3 && segs[2] == "clear_repositories_metering_archive")
+	if isClear {
+		if r.Method != http.MethodDelete {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		verIdx := 2
+		if segs[2] == "clear_repositories_metering_archive" {
+			verIdx = 3
+		}
+		if len(segs) <= verIdx || strings.TrimSpace(segs[verIdx]) == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: max_archive_version is missing;")
+			return
+		}
+		if _, err := strconv.ParseInt(strings.TrimSpace(segs[verIdx]), 10, 64); err != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("invalid max_archive_version [%s]", segs[verIdx]))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+			"cluster_name": "apache-doris-search-cluster",
+			"nodes": map[string]any{
+				"doris-fe-1": map[string]any{"name": "doris-fe-1"},
+			},
+		})
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+		"cluster_name": "apache-doris-search-cluster",
+		"nodes": map[string]any{
+			"doris-fe-1": map[string]any{
+				"repositories_metering": []any{},
+			},
 		},
 	})
 }

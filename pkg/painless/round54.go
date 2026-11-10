@@ -302,6 +302,34 @@ func newSummaryStatisticsMapPainless(statType string, hasArgs bool, count int64,
 			message: "Minimum greater than maximum",
 		}
 	}
+	if statType == "DoubleSummaryStatistics" {
+		nanCount := 0
+		if math.IsNaN(minVal) {
+			nanCount++
+		}
+		if math.IsNaN(maxVal) {
+			nanCount++
+		}
+		if math.IsNaN(sumVal) {
+			nanCount++
+		}
+		if nanCount > 0 && nanCount < 3 {
+			return nil, &painlessExceptionError{
+				exType:  "IllegalArgumentException",
+				message: "Some, not all, of the minimum, maximum, or sum is NaN",
+			}
+		}
+		if nanCount == 3 {
+			return map[string]any{
+				"__type":  "DoubleSummaryStatistics",
+				"count":   count,
+				"sum":     math.NaN(),
+				"min":     math.NaN(),
+				"max":     math.NaN(),
+				"average": math.NaN(),
+			}, nil
+		}
+	}
 	avg := sumVal / float64(count)
 	switch statType {
 	case "IntSummaryStatistics":
@@ -347,12 +375,19 @@ func isSummaryStatisticsMapPainless(m map[string]any) (string, bool) {
 	return "", false
 }
 
+func toFloat64AllowNonFinitePainless(v any) (float64, bool) {
+	if f, ok := v.(float64); ok {
+		return f, true
+	}
+	return toFloat64(v)
+}
+
 func summaryStatisticsAcceptPainless(m map[string]any, val any) error {
 	statType, ok := isSummaryStatisticsMapPainless(m)
 	if !ok {
 		return nil
 	}
-	fv, fOk := toFloat64(val)
+	fv, fOk := toFloat64AllowNonFinitePainless(val)
 	if !fOk {
 		return &painlessExceptionError{exType: "IllegalArgumentException", message: "SummaryStatistics.accept requires numeric argument"}
 	}
@@ -360,10 +395,17 @@ func summaryStatisticsAcceptPainless(m map[string]any, val any) error {
 	newCount := count + 1
 	m["count"] = newCount
 	if statType == "DoubleSummaryStatistics" {
-		sum, _ := toFloat64(m["sum"])
-		minV, _ := toFloat64(m["min"])
-		maxV, _ := toFloat64(m["max"])
+		sum, _ := toFloat64AllowNonFinitePainless(m["sum"])
+		minV, _ := toFloat64AllowNonFinitePainless(m["min"])
+		maxV, _ := toFloat64AllowNonFinitePainless(m["max"])
 		newSum := sum + fv
+		if math.IsNaN(fv) || math.IsNaN(sum) || math.IsNaN(newSum) || (count > 0 && (math.IsNaN(minV) || math.IsNaN(maxV))) {
+			m["sum"] = math.NaN()
+			m["min"] = math.NaN()
+			m["max"] = math.NaN()
+			m["average"] = math.NaN()
+			return nil
+		}
 		if count == 0 || fv < minV {
 			minV = fv
 		}
@@ -417,13 +459,20 @@ func summaryStatisticsCombinePainless(m map[string]any, other any) error {
 	newCount := count + oCount
 	m["count"] = newCount
 	if statType == "DoubleSummaryStatistics" {
-		sum, _ := toFloat64(m["sum"])
-		oSum, _ := toFloat64(om["sum"])
-		minV, _ := toFloat64(m["min"])
-		oMin, _ := toFloat64(om["min"])
-		maxV, _ := toFloat64(m["max"])
-		oMax, _ := toFloat64(om["max"])
+		sum, _ := toFloat64AllowNonFinitePainless(m["sum"])
+		oSum, _ := toFloat64AllowNonFinitePainless(om["sum"])
+		minV, _ := toFloat64AllowNonFinitePainless(m["min"])
+		oMin, _ := toFloat64AllowNonFinitePainless(om["min"])
+		maxV, _ := toFloat64AllowNonFinitePainless(m["max"])
+		oMax, _ := toFloat64AllowNonFinitePainless(om["max"])
 		newSum := sum + oSum
+		if math.IsNaN(sum) || math.IsNaN(oSum) || math.IsNaN(newSum) || math.IsNaN(oMin) || math.IsNaN(oMax) || (count > 0 && (math.IsNaN(minV) || math.IsNaN(maxV))) {
+			m["sum"] = math.NaN()
+			m["min"] = math.NaN()
+			m["max"] = math.NaN()
+			m["average"] = math.NaN()
+			return nil
+		}
 		if count == 0 || oMin < minV {
 			minV = oMin
 		}
@@ -462,12 +511,12 @@ func formatSummaryStatisticsToStringPainless(m map[string]any) string {
 		return fmt.Sprintf("%v", m)
 	}
 	count, _ := toInt64Painless(m["count"])
-	avg, _ := toFloat64(m["average"])
+	avg, _ := toFloat64AllowNonFinitePainless(m["average"])
 	avgStr := fmt.Sprintf("%.6f", avg)
 	if statType == "DoubleSummaryStatistics" {
-		sum, _ := toFloat64(m["sum"])
-		minV, _ := toFloat64(m["min"])
-		maxV, _ := toFloat64(m["max"])
+		sum, _ := toFloat64AllowNonFinitePainless(m["sum"])
+		minV, _ := toFloat64AllowNonFinitePainless(m["min"])
+		maxV, _ := toFloat64AllowNonFinitePainless(m["max"])
 		return fmt.Sprintf("%s{count=%d, sum=%f, min=%f, average=%s, max=%f}",
 			statType, count, sum, minV, avgStr, maxV)
 	}
@@ -890,6 +939,211 @@ func (ot *painlessOffsetTime) hashCode() int64 {
 	}
 	nod := int64(ot.hour*3600+ot.minute*60+ot.second)*1_000_000_000 + int64(ot.nano)
 	return int64(int32(nod^(nod>>32))) ^ int64(int32(ot.offsetSeconds)) // #nosec G115 -- Java OffsetTime.hashCode
+}
+
+// painlessValueRange represents java.time.temporal.ValueRange in Painless.
+type painlessValueRange struct {
+	minSmallest int64
+	minLargest  int64
+	maxSmallest int64
+	maxLargest  int64
+}
+
+func newFixedValueRangePainless(minV, maxV int64) *painlessValueRange {
+	return &painlessValueRange{
+		minSmallest: minV,
+		minLargest:  minV,
+		maxSmallest: maxV,
+		maxLargest:  maxV,
+	}
+}
+
+func (vr *painlessValueRange) isFixed() bool {
+	return vr != nil && vr.minSmallest == vr.minLargest && vr.maxSmallest == vr.maxLargest
+}
+
+func (vr *painlessValueRange) isIntValue() bool {
+	return vr != nil && vr.minSmallest >= math.MinInt32 && vr.maxLargest <= math.MaxInt32
+}
+
+func (vr *painlessValueRange) isValidValue(v int64) bool {
+	return vr != nil && v >= vr.minSmallest && v <= vr.maxLargest
+}
+
+func (vr *painlessValueRange) isValidIntValue(v int64) bool {
+	return vr.isIntValue() && vr.isValidValue(v)
+}
+
+func (vr *painlessValueRange) String() string {
+	if vr == nil {
+		return "0 - 0"
+	}
+	var sb strings.Builder
+	_, _ = fmt.Fprintf(&sb, "%d", vr.minSmallest)
+	if vr.minSmallest != vr.minLargest {
+		_, _ = fmt.Fprintf(&sb, "/%d", vr.minLargest)
+	}
+	sb.WriteString(" - ")
+	_, _ = fmt.Fprintf(&sb, "%d", vr.maxSmallest)
+	if vr.maxSmallest != vr.maxLargest {
+		_, _ = fmt.Fprintf(&sb, "/%d", vr.maxLargest)
+	}
+	return sb.String()
+}
+
+func (vr *painlessValueRange) equals(other any) bool {
+	o, ok := other.(*painlessValueRange)
+	if !ok || vr == nil || o == nil {
+		return false
+	}
+	return vr.minSmallest == o.minSmallest && vr.minLargest == o.minLargest &&
+		vr.maxSmallest == o.maxSmallest && vr.maxLargest == o.maxLargest
+}
+
+func (vr *painlessValueRange) hashCode() int64 {
+	if vr == nil {
+		return 0
+	}
+	return computeJavaHashCodePainless(vr.String())
+}
+
+func evalChronoFieldRangePainless(cf painlessChronoField) (*painlessValueRange, error) {
+	field := strings.ToUpper(string(cf))
+	switch field {
+	case "NANO_OF_SECOND":
+		return newFixedValueRangePainless(0, 999_999_999), nil
+	case "NANO_OF_DAY":
+		return newFixedValueRangePainless(0, 86400*1_000_000_000-1), nil
+	case "MICRO_OF_SECOND":
+		return newFixedValueRangePainless(0, 999_999), nil
+	case "MICRO_OF_DAY":
+		return newFixedValueRangePainless(0, 86400*1_000_000-1), nil
+	case "MILLI_OF_SECOND":
+		return newFixedValueRangePainless(0, 999), nil
+	case "MILLI_OF_DAY":
+		return newFixedValueRangePainless(0, 86400*1_000-1), nil
+	case "SECOND_OF_MINUTE":
+		return newFixedValueRangePainless(0, 59), nil
+	case "SECOND_OF_DAY":
+		return newFixedValueRangePainless(0, 86400-1), nil
+	case "MINUTE_OF_HOUR":
+		return newFixedValueRangePainless(0, 59), nil
+	case "MINUTE_OF_DAY":
+		return newFixedValueRangePainless(0, 24*60-1), nil
+	case "HOUR_OF_AMPM":
+		return newFixedValueRangePainless(0, 11), nil
+	case "CLOCK_HOUR_OF_AMPM":
+		return newFixedValueRangePainless(1, 12), nil
+	case "HOUR_OF_DAY":
+		return newFixedValueRangePainless(0, 23), nil
+	case "CLOCK_HOUR_OF_DAY":
+		return newFixedValueRangePainless(1, 24), nil
+	case "AMPM_OF_DAY":
+		return newFixedValueRangePainless(0, 1), nil
+	case "DAY_OF_WEEK", "ALIGNED_DAY_OF_WEEK_IN_MONTH", "ALIGNED_DAY_OF_WEEK_IN_YEAR":
+		return newFixedValueRangePainless(1, 7), nil
+	case "DAY_OF_MONTH":
+		return &painlessValueRange{minSmallest: 1, minLargest: 1, maxSmallest: 28, maxLargest: 31}, nil
+	case "DAY_OF_YEAR":
+		return &painlessValueRange{minSmallest: 1, minLargest: 1, maxSmallest: 365, maxLargest: 366}, nil
+	case "EPOCH_DAY":
+		return newFixedValueRangePainless(-365243219162, 365241780471), nil
+	case "ALIGNED_WEEK_OF_MONTH":
+		return &painlessValueRange{minSmallest: 1, minLargest: 1, maxSmallest: 4, maxLargest: 5}, nil
+	case "ALIGNED_WEEK_OF_YEAR":
+		return newFixedValueRangePainless(1, 53), nil
+	case "MONTH_OF_YEAR":
+		return newFixedValueRangePainless(1, 12), nil
+	case "PROLEPTIC_MONTH":
+		return newFixedValueRangePainless(-11999999988, 11999999999), nil
+	case "YEAR_OF_ERA":
+		return &painlessValueRange{minSmallest: 1, minLargest: 1, maxSmallest: 999_999_999, maxLargest: 1_000_000_000}, nil
+	case "YEAR":
+		return newFixedValueRangePainless(-999_999_999, 999_999_999), nil
+	case "ERA":
+		return newFixedValueRangePainless(0, 1), nil
+	case "INSTANT_SECONDS":
+		return newFixedValueRangePainless(math.MinInt64, math.MaxInt64), nil
+	case "OFFSET_SECONDS":
+		return newFixedValueRangePainless(-18*3600, 18*3600), nil
+	default:
+		return nil, &painlessExceptionError{
+			exType:  "UnsupportedTemporalTypeException",
+			message: "Unsupported field: " + field,
+		}
+	}
+}
+
+func evalTemporalRangePainless(recVal any, cf painlessChronoField) (*painlessValueRange, error) {
+	field := strings.ToUpper(string(cf))
+	if !evalIsSupportedChronoFieldPainless(recVal, cf) {
+		return nil, &painlessExceptionError{
+			exType:  "UnsupportedTemporalTypeException",
+			message: "Unsupported field: " + field,
+		}
+	}
+	base, err := evalChronoFieldRangePainless(cf)
+	if err != nil {
+		return nil, err
+	}
+	switch field {
+	case "DAY_OF_MONTH":
+		if md, ok := recVal.(painlessMonthDay); ok {
+			maxD := int64(31)
+			switch md.month {
+			case 2:
+				return &painlessValueRange{minSmallest: 1, minLargest: 1, maxSmallest: 28, maxLargest: 29}, nil
+			case 4, 6, 9, 11:
+				maxD = 30
+			}
+			return newFixedValueRangePainless(1, maxD), nil
+		}
+		if s, ok := recVal.(string); ok {
+			if tm, okT := parsePainlessDateTime(s); okT {
+				return newFixedValueRangePainless(1, int64(daysInMonthPainless(tm.Year(), tm.Month()))), nil
+			}
+		}
+	case "DAY_OF_YEAR":
+		if yr, ok := recVal.(painlessYear); ok {
+			if yr.isLeap() {
+				return newFixedValueRangePainless(1, 366), nil
+			}
+			return newFixedValueRangePainless(1, 365), nil
+		}
+		if s, ok := recVal.(string); ok {
+			if tm, okT := parsePainlessDateTime(s); okT {
+				if isLeapYearPainless(tm.Year()) {
+					return newFixedValueRangePainless(1, 366), nil
+				}
+				return newFixedValueRangePainless(1, 365), nil
+			}
+		}
+	case "ALIGNED_WEEK_OF_MONTH":
+		if s, ok := recVal.(string); ok {
+			if tm, okT := parsePainlessDateTime(s); okT {
+				if tm.Month() == time.February && !isLeapYearPainless(tm.Year()) {
+					return newFixedValueRangePainless(1, 4), nil
+				}
+				return newFixedValueRangePainless(1, 5), nil
+			}
+		}
+	case "YEAR_OF_ERA":
+		if yr, ok := recVal.(painlessYear); ok {
+			if yr.year <= 0 {
+				return newFixedValueRangePainless(1, 1_000_000_000), nil
+			}
+			return newFixedValueRangePainless(1, 999_999_999), nil
+		}
+		if s, ok := recVal.(string); ok {
+			if tm, okT := parsePainlessDateTime(s); okT {
+				if tm.Year() <= 0 {
+					return newFixedValueRangePainless(1, 1_000_000_000), nil
+				}
+				return newFixedValueRangePainless(1, 999_999_999), nil
+			}
+		}
+	}
+	return base, nil
 }
 
 // ============================================================================
@@ -1449,10 +1703,36 @@ func compareUUIDSignedPainless(s1, s2 string) (int64, bool) {
 
 // painlessURI represents a java.net.URI in Painless.
 type painlessURI struct {
-	u      *url.URL
-	raw    string
-	opaque bool
-	ssp    string
+	u            *url.URL
+	raw          string
+	opaque       bool
+	ssp          string
+	hasAuthority bool
+}
+
+func isHexBytePainless(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
+}
+
+func quoteURIComponentPainless(s string, extraDisallow string) string {
+	var sb strings.Builder
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b == '%' {
+			if i+2 < len(s) && isHexBytePainless(s[i+1]) && isHexBytePainless(s[i+2]) {
+				sb.WriteByte(b)
+				continue
+			}
+			sb.WriteString("%25")
+			continue
+		}
+		if b <= 0x20 || b >= 0x7f || strings.IndexByte("<>\"`{}\\^|", b) >= 0 || (extraDisallow != "" && strings.IndexByte(extraDisallow, b) >= 0) {
+			_, _ = fmt.Fprintf(&sb, "%%%02X", b)
+		} else {
+			sb.WriteByte(b)
+		}
+	}
+	return sb.String()
 }
 
 func newPainlessURIFromString(raw string) (*painlessURI, error) {
@@ -1478,11 +1758,110 @@ func newPainlessURIFromString(raw string) (*painlessURI, error) {
 		ssp = afterScheme
 	}
 	return &painlessURI{
-		u:      u,
-		raw:    raw,
-		opaque: opaque,
-		ssp:    ssp,
+		u:            u,
+		raw:          raw,
+		opaque:       opaque,
+		ssp:          ssp,
+		hasAuthority: !opaque && strings.HasPrefix(ssp, "//"),
 	}, nil
+}
+
+func (uri *painlessURI) rawAuthority() (string, bool) {
+	if uri == nil || uri.u == nil || uri.opaque {
+		return "", false
+	}
+	if uri.u.Host == "" && uri.u.User == nil && !uri.hasAuthority {
+		return "", false
+	}
+	if strings.HasPrefix(uri.ssp, "//") {
+		rest := uri.ssp[2:]
+		end := len(rest)
+		if idx := strings.IndexAny(rest, "/?"); idx >= 0 {
+			end = idx
+		}
+		return rest[:end], true
+	}
+	if uri.u.User != nil {
+		return uri.u.User.String() + "@" + uri.u.Host, true
+	}
+	return uri.u.Host, true
+}
+
+func (uri *painlessURI) compareTo(o *painlessURI) int64 {
+	if uri == nil || o == nil {
+		return 0
+	}
+	cmpOptStr := func(a string, aDef bool, b string, bDef bool, ignoreCase bool) int64 {
+		if !aDef && !bDef {
+			return 0
+		}
+		if !aDef {
+			return -1
+		}
+		if !bDef {
+			return 1
+		}
+		if ignoreCase {
+			a = strings.ToLower(a)
+			b = strings.ToLower(b)
+		}
+		return int64(strings.Compare(a, b))
+	}
+	if c := cmpOptStr(uri.u.Scheme, uri.u.Scheme != "", o.u.Scheme, o.u.Scheme != "", true); c != 0 {
+		return c
+	}
+	uFrag, uHasFrag := "", false
+	if uri.u.Fragment != "" || strings.Contains(uri.raw, "#") {
+		uFrag = uri.u.EscapedFragment()
+		uHasFrag = true
+	}
+	oFrag, oHasFrag := "", false
+	if o.u.Fragment != "" || strings.Contains(o.raw, "#") {
+		oFrag = o.u.EscapedFragment()
+		oHasFrag = true
+	}
+	if uri.opaque || o.opaque {
+		if c := int64(strings.Compare(uri.ssp, o.ssp)); c != 0 {
+			return c
+		}
+		return cmpOptStr(uFrag, uHasFrag, oFrag, oHasFrag, false)
+	}
+	h1 := uri.getHost()
+	h2 := o.getHost()
+	if h1 != nil && h2 != nil {
+		u1, u1Def := "", uri.u.User != nil
+		if u1Def {
+			u1 = uri.u.User.String()
+		}
+		u2, u2Def := "", o.u.User != nil
+		if u2Def {
+			u2 = o.u.User.String()
+		}
+		if c := cmpOptStr(u1, u1Def, u2, u2Def, false); c != 0 {
+			return c
+		}
+		if c := cmpOptStr(fmt.Sprintf("%v", h1), true, fmt.Sprintf("%v", h2), true, true); c != 0 {
+			return c
+		}
+		if pDiff := uri.getPort() - o.getPort(); pDiff != 0 {
+			return pDiff
+		}
+	} else {
+		a1, a1Def := uri.rawAuthority()
+		a2, a2Def := o.rawAuthority()
+		if c := cmpOptStr(a1, a1Def, a2, a2Def, false); c != 0 {
+			return c
+		}
+	}
+	if c := cmpOptStr(uri.u.EscapedPath(), true, o.u.EscapedPath(), true, false); c != 0 {
+		return c
+	}
+	q1Def := uri.u.RawQuery != "" || uri.u.ForceQuery
+	q2Def := o.u.RawQuery != "" || o.u.ForceQuery
+	if c := cmpOptStr(uri.u.RawQuery, q1Def, o.u.RawQuery, q2Def, false); c != 0 {
+		return c
+	}
+	return cmpOptStr(uFrag, uHasFrag, oFrag, oHasFrag, false)
 }
 
 func (uri *painlessURI) String() string {
@@ -1801,6 +2180,34 @@ func evalRound54ZeroArgMethodPainless(mSuffix, recExpr string, recVal any, sourc
 		}
 	}
 
+	// F20: ValueRange and ChronoField.range() zero-arg methods
+	if vr, isVR := recVal.(*painlessValueRange); isVR && vr != nil {
+		switch mSuffix {
+		case ".getMinimum()":
+			return vr.minSmallest, true, nil
+		case ".getLargestMinimum()":
+			return vr.minLargest, true, nil
+		case ".getSmallestMaximum()":
+			return vr.maxSmallest, true, nil
+		case ".getMaximum()":
+			return vr.maxLargest, true, nil
+		case ".isFixed()":
+			return vr.isFixed(), true, nil
+		case ".isIntValue()":
+			return vr.isIntValue(), true, nil
+		case ".toString()":
+			return vr.String(), true, nil
+		case ".hashCode()":
+			return vr.hashCode(), true, nil
+		}
+	}
+	if mSuffix == ".range()" {
+		if field, ok := parseChronoFieldArgPainless(recVal); ok {
+			vr, err := evalChronoFieldRangePainless(field)
+			return vr, true, err
+		}
+	}
+
 	// F23: OffsetTime zero-arg methods
 	if ot, isOT := recVal.(*painlessOffsetTime); isOT && ot != nil {
 		switch mSuffix {
@@ -1930,6 +2337,7 @@ func evalRound54ZeroArgMethodPainless(mSuffix, recExpr string, recVal any, sourc
 				}
 				out = append(out, &painlessMatcher{
 					re:                      pm.re,
+					pat:                     pm.pat,
 					input:                   pm.input,
 					curPos:                  shifted[1],
 					lastMatch:               shifted,
@@ -1949,6 +2357,7 @@ func evalRound54ZeroArgMethodPainless(mSuffix, recExpr string, recVal any, sourc
 			copy(cpMatch, pm.lastMatch)
 			return &painlessMatcher{
 				re:                      pm.re,
+				pat:                     pm.pat,
 				input:                   pm.input,
 				curPos:                  pm.curPos,
 				lastMatch:               cpMatch,
@@ -2011,20 +2420,23 @@ func evalRound54ZeroArgMethodPainless(mSuffix, recExpr string, recVal any, sourc
 			}
 			return uri.u.Scheme, true, nil
 		case ".getSchemeSpecificPart()":
-			if d, err := url.QueryUnescape(uri.ssp); err == nil {
+			if d, err := url.PathUnescape(uri.ssp); err == nil {
 				return d, true, nil
 			}
 			return uri.ssp, true, nil
 		case ".getRawSchemeSpecificPart()":
 			return uri.ssp, true, nil
 		case ".getAuthority()", ".getRawAuthority()":
-			if uri.opaque || uri.u.Host == "" && uri.u.User == nil {
+			rawAuth, okA := uri.rawAuthority()
+			if !okA {
 				return nil, true, nil
 			}
-			if uri.u.User != nil {
-				return uri.u.User.String() + "@" + uri.u.Host, true, nil
+			if mSuffix == ".getAuthority()" {
+				if d, err := url.PathUnescape(rawAuth); err == nil {
+					return d, true, nil
+				}
 			}
-			return uri.u.Host, true, nil
+			return rawAuth, true, nil
 		case ".getUserInfo()", ".getRawUserInfo()":
 			if uri.opaque || uri.u.User == nil {
 				return nil, true, nil
@@ -2196,6 +2608,39 @@ func evalRound54ParamMethodPreArgPainless(mName, recExpr string, recVal any, arg
 				return false, true, err
 			}
 			return uVal.equals(otherVal), true, nil
+		}
+		if vr, isVR := recVal.(*painlessValueRange); isVR && vr != nil {
+			otherVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(argExpr), params, depth+1)
+			if err != nil {
+				return false, true, err
+			}
+			return vr.equals(otherVal), true, nil
+		}
+	}
+
+	// F20: ValueRange parameterized methods
+	if vr, isVR := recVal.(*painlessValueRange); isVR && vr != nil {
+		switch mName {
+		case ".isValidValue(":
+			v0, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(argExpr), params, depth+1)
+			if err != nil {
+				return false, true, err
+			}
+			iv, ok := toInt64Painless(v0)
+			if !ok {
+				return false, true, nil
+			}
+			return vr.isValidValue(iv), true, nil
+		case ".isValidIntValue(":
+			v0, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(argExpr), params, depth+1)
+			if err != nil {
+				return false, true, err
+			}
+			iv, ok := toInt64Painless(v0)
+			if !ok {
+				return false, true, nil
+			}
+			return vr.isValidIntValue(iv), true, nil
 		}
 	}
 
@@ -2541,7 +2986,7 @@ func evalRound54ParamMethodPreArgPainless(mName, recExpr string, recVal any, arg
 					return nil, true, errU
 				}
 				amt, _ := toInt64Painless(v0)
-				uStr := strings.ToUpper(strings.TrimSpace(fmt.Sprintf("%v", uVal)))
+				uStr := strings.TrimPrefix(strings.ToUpper(strings.TrimSpace(fmt.Sprintf("%v", uVal))), "CHRONOUNIT.")
 				switch uStr {
 				case "HOURS":
 					return ot.addNanos(sign * amt * 3600 * 1_000_000_000), true, nil
@@ -2566,10 +3011,12 @@ func evalRound54ParamMethodPreArgPainless(mName, recExpr string, recVal any, arg
 			if err != nil {
 				return nil, true, err
 			}
-			uStr := strings.ToUpper(strings.TrimSpace(fmt.Sprintf("%v", uVal)))
+			uStr := strings.TrimPrefix(strings.ToUpper(strings.TrimSpace(fmt.Sprintf("%v", uVal))), "CHRONOUNIT.")
 			switch uStr {
 			case "DAYS":
 				return &painlessOffsetTime{offsetSeconds: ot.offsetSeconds}, true, nil
+			case "HALF_DAYS":
+				return &painlessOffsetTime{hour: (ot.hour / 12) * 12, offsetSeconds: ot.offsetSeconds}, true, nil
 			case "HOURS":
 				return &painlessOffsetTime{hour: ot.hour, offsetSeconds: ot.offsetSeconds}, true, nil
 			case "MINUTES":
@@ -2699,11 +3146,16 @@ func evalRound54ParamMethodPreArgPainless(mName, recExpr string, recVal any, arg
 			if v0 == nil {
 				return nil, true, &painlessExceptionError{exType: "IllegalArgumentException", message: "Pattern cannot be null"}
 			}
-			newRe, _, errP := extractPatternRegexpPainless(v0)
+			newRe, patRaw, errP := extractPatternRegexpPainless(v0)
 			if errP != nil || newRe == nil {
 				return nil, true, &painlessExceptionError{exType: "IllegalArgumentException", message: "Invalid Pattern"}
 			}
 			pm.re = newRe
+			if pp, ok := v0.(*painlessPattern); ok && pp != nil {
+				pm.pat = pp
+			} else {
+				pm.pat = &painlessPattern{re: newRe, raw: patRaw}
+			}
 			pm.lastMatch = nil
 			return pm, true, nil
 		case ".useTransparentBounds(":
@@ -2746,7 +3198,7 @@ func evalRound54ParamMethodPreArgPainless(mName, recExpr string, recVal any, arg
 			if !ok || o == nil {
 				return nil, true, &painlessExceptionError{exType: "ClassCastException", message: "Cannot compare URI to non-URI"}
 			}
-			return int64(strings.Compare(uri.raw, o.raw)), true, nil
+			return uri.compareTo(o), true, nil
 		}
 	}
 
@@ -2845,9 +3297,9 @@ func evalRound54ConstructorPainless(clsName, argStr string, sourceMap, params ma
 				return nil, true, err3
 			}
 			cnt, _ := toInt64Painless(v0)
-			minF, _ := toFloat64(v1)
-			maxF, _ := toFloat64(v2)
-			sumF, _ := toFloat64(v3)
+			minF, _ := toFloat64AllowNonFinitePainless(v1)
+			maxF, _ := toFloat64AllowNonFinitePainless(v2)
+			sumF, _ := toFloat64AllowNonFinitePainless(v3)
 			stats, err := newSummaryStatisticsMapPainless(clsName, true, cnt, minF, maxF, sumF)
 			return stats, true, err
 		}
@@ -2884,20 +3336,38 @@ func evalRound54ConstructorPainless(clsName, argStr string, sourceMap, params ma
 				sb.WriteByte(':')
 			}
 			if sspVal != nil {
-				_, _ = fmt.Fprintf(&sb, "%v", sspVal)
+				sb.WriteString(quoteURIComponentPainless(fmt.Sprintf("%v", sspVal), "#"))
 			}
 			if fragVal != nil {
 				sb.WriteByte('#')
-				_, _ = fmt.Fprintf(&sb, "%v", fragVal)
+				sb.WriteString(quoteURIComponentPainless(fmt.Sprintf("%v", fragVal), ""))
 			}
 			uri, uErr := newPainlessURIFromString(sb.String())
 			return uri, true, uErr
 		case 4:
 			// URI(scheme, host, path, fragment)
-			sVal, _ := evalArg(0)
-			hVal, _ := evalArg(1)
-			pVal, _ := evalArg(2)
-			fVal, _ := evalArg(3)
+			sVal, err0 := evalArg(0)
+			if err0 != nil {
+				return nil, true, err0
+			}
+			hVal, err1 := evalArg(1)
+			if err1 != nil {
+				return nil, true, err1
+			}
+			pVal, err2 := evalArg(2)
+			if err2 != nil {
+				return nil, true, err2
+			}
+			fVal, err3 := evalArg(3)
+			if err3 != nil {
+				return nil, true, err3
+			}
+			if pVal != nil {
+				pStr := fmt.Sprintf("%v", pVal)
+				if pStr != "" && !strings.HasPrefix(pStr, "/") && hVal != nil && fmt.Sprintf("%v", hVal) != "" {
+					return nil, true, &painlessExceptionError{exType: "URISyntaxException", message: fmt.Sprintf("Relative path in absolute URI: %s", pStr)}
+				}
+			}
 			var sb strings.Builder
 			if sVal != nil {
 				_, _ = fmt.Fprintf(&sb, "%v:", sVal)
@@ -2906,47 +3376,99 @@ func evalRound54ConstructorPainless(clsName, argStr string, sourceMap, params ma
 				_, _ = fmt.Fprintf(&sb, "//%v", hVal)
 			}
 			if pVal != nil {
-				_, _ = fmt.Fprintf(&sb, "%v", pVal)
+				sb.WriteString(quoteURIComponentPainless(fmt.Sprintf("%v", pVal), "?#"))
 			}
 			if fVal != nil {
-				_, _ = fmt.Fprintf(&sb, "#%v", fVal)
+				sb.WriteByte('#')
+				sb.WriteString(quoteURIComponentPainless(fmt.Sprintf("%v", fVal), ""))
 			}
 			uri, uErr := newPainlessURIFromString(sb.String())
 			return uri, true, uErr
 		case 5:
 			// URI(scheme, authority, path, query, fragment)
-			sVal, _ := evalArg(0)
-			aVal, _ := evalArg(1)
-			pVal, _ := evalArg(2)
-			qVal, _ := evalArg(3)
-			fVal, _ := evalArg(4)
+			sVal, err0 := evalArg(0)
+			if err0 != nil {
+				return nil, true, err0
+			}
+			aVal, err1 := evalArg(1)
+			if err1 != nil {
+				return nil, true, err1
+			}
+			pVal, err2 := evalArg(2)
+			if err2 != nil {
+				return nil, true, err2
+			}
+			qVal, err3 := evalArg(3)
+			if err3 != nil {
+				return nil, true, err3
+			}
+			fVal, err4 := evalArg(4)
+			if err4 != nil {
+				return nil, true, err4
+			}
+			if pVal != nil {
+				pStr := fmt.Sprintf("%v", pVal)
+				if pStr != "" && !strings.HasPrefix(pStr, "/") && aVal != nil && fmt.Sprintf("%v", aVal) != "" {
+					return nil, true, &painlessExceptionError{exType: "URISyntaxException", message: fmt.Sprintf("Relative path in absolute URI: %s", pStr)}
+				}
+			}
 			var sb strings.Builder
 			if sVal != nil {
 				_, _ = fmt.Fprintf(&sb, "%v:", sVal)
 			}
 			if aVal != nil {
-				_, _ = fmt.Fprintf(&sb, "//%v", aVal)
+				sb.WriteString("//")
+				sb.WriteString(quoteURIComponentPainless(fmt.Sprintf("%v", aVal), "/?#"))
 			}
 			if pVal != nil {
-				_, _ = fmt.Fprintf(&sb, "%v", pVal)
+				sb.WriteString(quoteURIComponentPainless(fmt.Sprintf("%v", pVal), "?#"))
 			}
 			if qVal != nil {
-				_, _ = fmt.Fprintf(&sb, "?%v", qVal)
+				sb.WriteByte('?')
+				sb.WriteString(quoteURIComponentPainless(fmt.Sprintf("%v", qVal), "#"))
 			}
 			if fVal != nil {
-				_, _ = fmt.Fprintf(&sb, "#%v", fVal)
+				sb.WriteByte('#')
+				sb.WriteString(quoteURIComponentPainless(fmt.Sprintf("%v", fVal), ""))
 			}
 			uri, uErr := newPainlessURIFromString(sb.String())
 			return uri, true, uErr
 		case 7:
 			// URI(scheme, userInfo, host, port, path, query, fragment)
-			sVal, _ := evalArg(0)
-			uVal, _ := evalArg(1)
-			hVal, _ := evalArg(2)
-			portVal, _ := evalArg(3)
-			pVal, _ := evalArg(4)
-			qVal, _ := evalArg(5)
-			fVal, _ := evalArg(6)
+			sVal, err0 := evalArg(0)
+			if err0 != nil {
+				return nil, true, err0
+			}
+			uVal, err1 := evalArg(1)
+			if err1 != nil {
+				return nil, true, err1
+			}
+			hVal, err2 := evalArg(2)
+			if err2 != nil {
+				return nil, true, err2
+			}
+			portVal, err3 := evalArg(3)
+			if err3 != nil {
+				return nil, true, err3
+			}
+			pVal, err4 := evalArg(4)
+			if err4 != nil {
+				return nil, true, err4
+			}
+			qVal, err5 := evalArg(5)
+			if err5 != nil {
+				return nil, true, err5
+			}
+			fVal, err6 := evalArg(6)
+			if err6 != nil {
+				return nil, true, err6
+			}
+			if pVal != nil {
+				pStr := fmt.Sprintf("%v", pVal)
+				if pStr != "" && !strings.HasPrefix(pStr, "/") && hVal != nil && fmt.Sprintf("%v", hVal) != "" {
+					return nil, true, &painlessExceptionError{exType: "URISyntaxException", message: fmt.Sprintf("Relative path in absolute URI: %s", pStr)}
+				}
+			}
 			var sb strings.Builder
 			if sVal != nil {
 				_, _ = fmt.Fprintf(&sb, "%v:", sVal)
@@ -2954,7 +3476,8 @@ func evalRound54ConstructorPainless(clsName, argStr string, sourceMap, params ma
 			if hVal != nil {
 				sb.WriteString("//")
 				if uVal != nil {
-					_, _ = fmt.Fprintf(&sb, "%v@", uVal)
+					sb.WriteString(quoteURIComponentPainless(fmt.Sprintf("%v", uVal), "@/?#"))
+					sb.WriteByte('@')
 				}
 				_, _ = fmt.Fprintf(&sb, "%v", hVal)
 				if port, ok := toInt64Painless(portVal); ok && port >= 0 {
@@ -2962,13 +3485,15 @@ func evalRound54ConstructorPainless(clsName, argStr string, sourceMap, params ma
 				}
 			}
 			if pVal != nil {
-				_, _ = fmt.Fprintf(&sb, "%v", pVal)
+				sb.WriteString(quoteURIComponentPainless(fmt.Sprintf("%v", pVal), "?#"))
 			}
 			if qVal != nil {
-				_, _ = fmt.Fprintf(&sb, "?%v", qVal)
+				sb.WriteByte('?')
+				sb.WriteString(quoteURIComponentPainless(fmt.Sprintf("%v", qVal), "#"))
 			}
 			if fVal != nil {
-				_, _ = fmt.Fprintf(&sb, "#%v", fVal)
+				sb.WriteByte('#')
+				sb.WriteString(quoteURIComponentPainless(fmt.Sprintf("%v", fVal), ""))
 			}
 			uri, uErr := newPainlessURIFromString(sb.String())
 			return uri, true, uErr
@@ -3600,6 +4125,17 @@ func evalRound54StaticCallPainless(fnName string, args []string, argStr string, 
 		}
 		if v0 == nil {
 			return nil, true, &painlessExceptionError{exType: "NullPointerException", message: "text"}
+		}
+		if len(args) >= 2 {
+			fVal, err1 := evalArg(1)
+			if err1 != nil {
+				return nil, true, err1
+			}
+			if tm, ok := parseDateTimeWithFormatterPainless(v0, fVal); ok {
+				_, offSec := tm.Zone()
+				res, err := newPainlessOffsetTime(tm.Hour(), tm.Minute(), tm.Second(), tm.Nanosecond(), offSec)
+				return res, true, err
+			}
 		}
 		ot, ok := parsePainlessOffsetTime(v0)
 		if !ok {

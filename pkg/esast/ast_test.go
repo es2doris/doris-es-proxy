@@ -2464,3 +2464,66 @@ func TestRound54ESASTF10F11F15F16F18F19(t *testing.T) {
 		}
 	}
 }
+
+func TestRound55ASTF10AndF11Validations(t *testing.T) {
+	// Valid F10 & F11 cases
+	validReqs := []string{
+		`{"query":{"match":{"title":{"query":"hello","fuzziness":"AUTO:3,6","prefix_length":2,"max_expansions":50}}}}`,
+		`{"query":{"multi_match":{"query":"hello","fields":["title"],"fuzziness":1,"prefix_length":0,"max_expansions":10}}}`,
+		`{"query":{"fuzzy":{"title":{"value":"hello","fuzziness":"2","prefix_length":1,"max_expansions":25}}}}`,
+		`{"query":{"match_phrase":{"title":{"query":"hello world","fuzziness":"1","prefix_length":0,"max_expansions":10}}}}`,
+		`{"size":0,"aggs":{"t":{"terms":{"field":"status","order":{"_count":"desc"},"missing_order":"last"}}}}`,
+		`{"size":0,"aggs":{"t":{"terms":{"field":"status","order":[{"_count":"desc"},{"_key":{"order":"asc"}}],"missing_order":"first"}}}}`,
+		`{"size":0,"aggs":{"dh":{"date_histogram":{"field":"ts","calendar_interval":"1d","order":{"_key":"asc"},"script":{"source":"doc['ts'].value"}}}}}`,
+		`{"size":0,"aggs":{"h":{"histogram":{"field":"price","interval":10,"order":{"_count":"desc"},"missing_order":"default","script":"doc['price'].value"}}}}`,
+		`{"size":0,"aggs":{"r":{"range":{"script":{"source":"doc['price'].value"},"ranges":[{"from":"2024-01-01","to":"2024-12-31"}]}}}}`,
+		`{"size":0,"aggs":{"p":{"percentiles":{"script":"doc['price'].value","percents":[50,95]}}}}`,
+		`{"size":0,"aggs":{"c":{"composite":{"sources":[{"s1":{"terms":{"field":"status","order":"desc"}}}]}}}}`,
+	}
+	for _, raw := range validReqs {
+		var sr SearchRequest
+		if err := json.Unmarshal([]byte(raw), &sr); err != nil {
+			t.Fatalf("Round 55 expected valid SearchRequest %s, got error: %v", raw, err)
+		}
+	}
+
+	// Invalid F10 & F11 cases
+	invalidReqs := []string{
+		// F10: match, multi_match, fuzzy, match_phrase fuzziness / prefix_length / max_expansions
+		`{"query":{"match":{"title":{"query":"hello","fuzziness":"INVALID"}}}}`,
+		`{"query":{"match":{"title":{"query":"hello","fuzziness":5}}}}`,
+		`{"query":{"match":{"title":{"query":"hello","prefix_length":-1}}}}`,
+		`{"query":{"match":{"title":{"query":"hello","max_expansions":0}}}}`,
+		`{"query":{"match":{"title":{"query":"hello","max_expansions":-5}}}}`,
+		`{"query":{"multi_match":{"query":"hello","fields":["title"],"fuzziness":"BAD"}}}`,
+		`{"query":{"multi_match":{"query":"hello","fields":["title"],"prefix_length":-2}}}`,
+		`{"query":{"multi_match":{"query":"hello","fields":["title"],"max_expansions":0}}}`,
+		`{"query":{"fuzzy":{"title":{"value":"hello","fuzziness":"3"}}}}`,
+		`{"query":{"fuzzy":{"title":{"value":"hello","prefix_length":-1}}}}`,
+		`{"query":{"fuzzy":{"title":{"value":"hello","max_expansions":0}}}}`,
+		`{"query":{"match_phrase":{"title":{"query":"hello","fuzziness":"BAD"}}}}`,
+		`{"query":{"match_phrase":{"title":{"query":"hello","max_expansions":0}}}}`,
+		// F11: bucket agg order, missing_order, script, and range date bounds
+		`{"size":0,"aggs":{"t":{"terms":{"field":"status","order":{"_count":"upwards"}}}}}`,
+		`{"size":0,"aggs":{"t":{"terms":{"field":"status","order":{}}}}}`,
+		`{"size":0,"aggs":{"t":{"terms":{"field":"status","order":[]}}}}`,
+		`{"size":0,"aggs":{"t":{"terms":{"field":"status","order":"desc"}}}}`,
+		`{"size":0,"aggs":{"t":{"terms":{"field":"status","order":{"_count":123}}}}}`,
+		`{"size":0,"aggs":{"t":{"terms":{"field":"status","missing_order":"middle"}}}}`,
+		`{"size":0,"aggs":{"t":{"terms":{"script":{}}}}}`,
+		`{"size":0,"aggs":{"dh":{"date_histogram":{"field":"ts","calendar_interval":"1d","order":{"_key":"sideways"}}}}}`,
+		`{"size":0,"aggs":{"dh":{"date_histogram":{"calendar_interval":"1d","script":{"lang":"painless"}}}}}`,
+		`{"size":0,"aggs":{"h":{"histogram":{"field":"price","interval":10,"order":{"_key":"invalid"}}}}}`,
+		`{"size":0,"aggs":{"h":{"histogram":{"field":"price","interval":10,"missing_order":"invalid"}}}}`,
+		`{"size":0,"aggs":{"h":{"histogram":{"interval":10,"script":{}}}}}`,
+		`{"size":0,"aggs":{"r":{"range":{"script":{},"ranges":[{"from":0,"to":10}]}}}}`,
+		`{"size":0,"aggs":{"p":{"percentiles":{"script":{}}}}}`,
+		`{"size":0,"aggs":{"r":{"range":{"field":"ts","ranges":[{"from":"2025-06-01","to":"2025-01-01"}]}}}}`,
+	}
+	for _, raw := range invalidReqs {
+		var sr SearchRequest
+		if err := json.Unmarshal([]byte(raw), &sr); err == nil {
+			t.Fatalf("Round 55 expected error for invalid SearchRequest %s", raw)
+		}
+	}
+}
