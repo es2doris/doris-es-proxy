@@ -4036,12 +4036,74 @@ func IPToSortableFloat(ipStr string) (float64, bool) {
 	return val, true
 }
 
-func validateAndNormalizeSparseVectorFieldInDoc(curr map[string]any, path []string, b FieldBinding) (bool, error) {
-	if curr == nil || len(path) == 0 {
+func traverseFieldInDocMap(curr map[string]any, path []string, leafFn func(m map[string]any, key string) (bool, error)) (bool, error) {
+	if curr == nil {
 		return false, nil
 	}
+	if len(path) == 0 {
+		return false, nil
+	}
+	head := path[0] // #nosec G602 -- len(path) > 0 checked above
 	if len(path) == 1 {
-		raw, exists := curr[path[0]]
+		return leafFn(curr, head)
+	}
+	rest := path[1:] // #nosec G602 -- len(path) >= 2 checked above
+	if next, exists := curr[head]; exists {
+		switch tv := next.(type) {
+		case map[string]any:
+			return traverseFieldInDocMap(tv, rest, leafFn)
+		case []any:
+			anyMod := false
+			for _, elem := range tv {
+				if em, ok := elem.(map[string]any); ok {
+					mod, err := traverseFieldInDocMap(em, rest, leafFn)
+					if err != nil {
+						return false, err
+					}
+					if mod {
+						anyMod = true
+					}
+				}
+			}
+			return anyMod, nil
+		}
+	}
+	for i := len(path); i >= 2; i-- {
+		if i > len(path) {
+			continue
+		}
+		joined := strings.Join(path[:i], ".") // #nosec G602 -- 2 <= i <= len(path)
+		if next, ok := curr[joined]; ok {
+			if i == len(path) {
+				return leafFn(curr, joined)
+			}
+			tail := path[i:] // #nosec G602 -- 2 <= i < len(path)
+			switch tv := next.(type) {
+			case map[string]any:
+				return traverseFieldInDocMap(tv, tail, leafFn)
+			case []any:
+				anyMod := false
+				for _, elem := range tv {
+					if em, ok := elem.(map[string]any); ok {
+						mod, err := traverseFieldInDocMap(em, tail, leafFn)
+						if err != nil {
+							return false, err
+						}
+						if mod {
+							anyMod = true
+						}
+					}
+				}
+				return anyMod, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func validateAndNormalizeSparseVectorFieldInDoc(curr map[string]any, path []string, b FieldBinding) (bool, error) {
+	return traverseFieldInDocMap(curr, path, func(m map[string]any, key string) (bool, error) {
+		raw, exists := m[key]
 		if !exists || raw == nil {
 			return false, nil
 		}
@@ -4082,65 +4144,15 @@ func validateAndNormalizeSparseVectorFieldInDoc(curr map[string]any, path []stri
 			}
 		}
 		return modified, nil
-	}
-	if next, exists := curr[path[0]]; exists {
-		switch tv := next.(type) {
-		case map[string]any:
-			return validateAndNormalizeSparseVectorFieldInDoc(tv, path[1:], b)
-		case []any:
-			anyMod := false
-			for _, elem := range tv {
-				if em, ok := elem.(map[string]any); ok {
-					mod, err := validateAndNormalizeSparseVectorFieldInDoc(em, path[1:], b)
-					if err != nil {
-						return false, err
-					}
-					if mod {
-						anyMod = true
-					}
-				}
-			}
-			return anyMod, nil
-		}
-	}
-	for i := len(path); i >= 2; i-- {
-		joined := strings.Join(path[:i], ".")
-		if next, ok := curr[joined]; ok {
-			if i == len(path) {
-				return validateAndNormalizeSparseVectorFieldInDoc(curr, []string{joined}, b)
-			}
-			switch tv := next.(type) {
-			case map[string]any:
-				return validateAndNormalizeSparseVectorFieldInDoc(tv, path[i:], b)
-			case []any:
-				anyMod := false
-				for _, elem := range tv {
-					if em, ok := elem.(map[string]any); ok {
-						mod, err := validateAndNormalizeSparseVectorFieldInDoc(em, path[i:], b)
-						if err != nil {
-							return false, err
-						}
-						if mod {
-							anyMod = true
-						}
-					}
-				}
-				return anyMod, nil
-			}
-		}
-	}
-	return false, nil
+	})
 }
 
 func validateAndNormalizeFlattenedFieldInDoc(curr map[string]any, path []string, b FieldBinding, recordIgnored func(string)) (bool, error) {
-	if curr == nil || len(path) == 0 {
-		return false, nil
-	}
-	if len(path) == 1 {
-		raw, exists := curr[path[0]]
+	return traverseFieldInDocMap(curr, path, func(m map[string]any, key string) (bool, error) {
+		raw, exists := m[key]
 		if !exists || raw == nil {
 			if exists && raw == nil {
-				delete(curr, path[0])
+				delete(m, key)
 				return true, nil
 			}
 			return false, nil
@@ -4150,61 +4162,14 @@ func validateAndNormalizeFlattenedFieldInDoc(curr map[string]any, path []string,
 			return false, err
 		}
 		if norm == nil {
-			delete(curr, path[0])
+			delete(m, key)
 			return true, nil
 		}
 		if modified {
-			curr[path[0]] = norm
+			m[key] = norm
 		}
 		return modified, nil
-	}
-	if next, exists := curr[path[0]]; exists {
-		switch tv := next.(type) {
-		case map[string]any:
-			return validateAndNormalizeFlattenedFieldInDoc(tv, path[1:], b, recordIgnored)
-		case []any:
-			anyMod := false
-			for _, elem := range tv {
-				if em, ok := elem.(map[string]any); ok {
-					mod, err := validateAndNormalizeFlattenedFieldInDoc(em, path[1:], b, recordIgnored)
-					if err != nil {
-						return false, err
-					}
-					if mod {
-						anyMod = true
-					}
-				}
-			}
-			return anyMod, nil
-		}
-	}
-	for i := len(path); i >= 2; i-- {
-		joined := strings.Join(path[:i], ".")
-		if next, ok := curr[joined]; ok {
-			if i == len(path) {
-				return validateAndNormalizeFlattenedFieldInDoc(curr, []string{joined}, b, recordIgnored)
-			}
-			switch tv := next.(type) {
-			case map[string]any:
-				return validateAndNormalizeFlattenedFieldInDoc(tv, path[i:], b, recordIgnored)
-			case []any:
-				anyMod := false
-				for _, elem := range tv {
-					if em, ok := elem.(map[string]any); ok {
-						mod, err := validateAndNormalizeFlattenedFieldInDoc(em, path[i:], b, recordIgnored)
-						if err != nil {
-							return false, err
-						}
-						if mod {
-							anyMod = true
-						}
-					}
-				}
-				return anyMod, nil
-			}
-		}
-	}
-	return false, nil
+	})
 }
 
 func validateAndNormalizeFlattenedValue(raw any, b FieldBinding, recordIgnored func(string)) (any, bool, error) {
@@ -4375,11 +4340,8 @@ func mergeFlattenedObjectMaps(dst, src map[string]any) {
 }
 
 func validateAndNormalizeRangeFieldInDoc(curr map[string]any, path []string, b FieldBinding, getNow func() time.Time) (bool, error) {
-	if curr == nil || len(path) == 0 {
-		return false, nil
-	}
-	if len(path) == 1 {
-		raw, exists := curr[path[0]]
+	return traverseFieldInDocMap(curr, path, func(m map[string]any, key string) (bool, error) {
+		raw, exists := m[key]
 		if !exists || raw == nil {
 			return false, nil
 		}
@@ -4388,57 +4350,10 @@ func validateAndNormalizeRangeFieldInDoc(curr map[string]any, path []string, b F
 			return false, err
 		}
 		if modified {
-			curr[path[0]] = norm
+			m[key] = norm
 		}
 		return modified, nil
-	}
-	if next, exists := curr[path[0]]; exists {
-		switch tv := next.(type) {
-		case map[string]any:
-			return validateAndNormalizeRangeFieldInDoc(tv, path[1:], b, getNow)
-		case []any:
-			anyMod := false
-			for _, elem := range tv {
-				if em, ok := elem.(map[string]any); ok {
-					mod, err := validateAndNormalizeRangeFieldInDoc(em, path[1:], b, getNow)
-					if err != nil {
-						return false, err
-					}
-					if mod {
-						anyMod = true
-					}
-				}
-			}
-			return anyMod, nil
-		}
-	}
-	for i := len(path); i >= 2; i-- {
-		joined := strings.Join(path[:i], ".")
-		if next, ok := curr[joined]; ok {
-			if i == len(path) {
-				return validateAndNormalizeRangeFieldInDoc(curr, []string{joined}, b, getNow)
-			}
-			switch tv := next.(type) {
-			case map[string]any:
-				return validateAndNormalizeRangeFieldInDoc(tv, path[i:], b, getNow)
-			case []any:
-				anyMod := false
-				for _, elem := range tv {
-					if em, ok := elem.(map[string]any); ok {
-						mod, err := validateAndNormalizeRangeFieldInDoc(em, path[i:], b, getNow)
-						if err != nil {
-							return false, err
-						}
-						if mod {
-							anyMod = true
-						}
-					}
-				}
-				return anyMod, nil
-			}
-		}
-	}
-	return false, nil
+	})
 }
 
 func validateAndNormalizeRangeValue(raw any, b FieldBinding, getNow func() time.Time) (any, bool, error) {
