@@ -538,7 +538,7 @@ func ShredDocumentWithNow(
 					if rv == nil {
 						continue
 					}
-					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && (b.Coerce == nil || *b.Coerce) {
+					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && b.ESType != "version" && (b.Coerce == nil || *b.Coerce) {
 						continue
 					}
 					coerced := coerceScalarBindingForDoris(rv, b, getNow())
@@ -773,7 +773,7 @@ func ShredDocumentWithNow(
 							if tb.IgnoreAbove > 0 && len([]rune(fmt.Sprintf("%v", rv))) > tb.IgnoreAbove {
 								continue
 							}
-							if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && (tb.Coerce == nil || *tb.Coerce) {
+							if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && tb.ESType != "version" && (tb.Coerce == nil || *tb.Coerce) {
 								continue
 							}
 							coerced := coerceScalarBindingForDoris(rv, tb, getNow())
@@ -871,7 +871,7 @@ func ShredDocumentWithNow(
 							continue
 						}
 						if isTypedNonStringBinding(tb) {
-							if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && (tb.Coerce == nil || *tb.Coerce) {
+							if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && tb.ESType != "version" && (tb.Coerce == nil || *tb.Coerce) {
 								continue
 							}
 							coerced := coerceScalarBindingForDoris(rv, tb, getNow())
@@ -1008,7 +1008,7 @@ func ShredDocumentWithNow(
 
 func isTypedNonStringBinding(b FieldBinding) bool {
 	switch b.ESType {
-	case "long", "unsigned_long", "integer", "short", "byte", "token_count", "double", "float", "half_float", "scaled_float", "date", "date_nanos", "boolean", "ip", "geo_point":
+	case "long", "unsigned_long", "integer", "short", "byte", "token_count", "double", "float", "half_float", "scaled_float", "date", "date_nanos", "boolean", "ip", "geo_point", "version":
 		return true
 	}
 	switch b.DorisType {
@@ -1061,12 +1061,10 @@ func collectGeoPointCandidatesWithNull(node any, path []string, nullVal any, out
 	case map[string]any:
 		if next, ok := curr[path[0]]; ok {
 			collectGeoPointCandidatesWithNull(next, path[1:], nullVal, out)
-			return
 		}
-		for i := len(path); i > 1; i-- {
+		for i := 2; i <= len(path); i++ {
 			if next, ok := curr[strings.Join(path[:i], ".")]; ok {
 				collectGeoPointCandidatesWithNull(next, path[i:], nullVal, out)
-				return
 			}
 		}
 	case []any:
@@ -1287,12 +1285,10 @@ func collectFlattenedLeafsAtPath(node any, path []string, out *[]any) {
 	case map[string]any:
 		if next, ok := curr[path[0]]; ok {
 			collectFlattenedLeafsAtPath(next, path[1:], out)
-			return
 		}
-		for i := len(path); i > 1; i-- {
+		for i := 2; i <= len(path); i++ {
 			if next, ok := curr[strings.Join(path[:i], ".")]; ok {
 				collectFlattenedLeafsAtPath(next, path[i:], out)
-				return
 			}
 		}
 	case []any:
@@ -1329,12 +1325,10 @@ func collectRawLeafsAtPathWithNull(node any, path []string, nullVal any, out *[]
 	case map[string]any:
 		if next, ok := curr[path[0]]; ok {
 			collectRawLeafsAtPathWithNull(next, path[1:], nullVal, out)
-			return
 		}
-		for i := len(path); i > 1; i-- {
+		for i := 2; i <= len(path); i++ {
 			if next, ok := curr[strings.Join(path[:i], ".")]; ok {
 				collectRawLeafsAtPathWithNull(next, path[i:], nullVal, out)
-				return
 			}
 		}
 	case []any:
@@ -1556,10 +1550,18 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 			return nil
 		}
 		trimmed := strings.TrimSpace(strVal)
-		if net.ParseIP(trimmed) == nil {
+		ip := net.ParseIP(trimmed)
+		if ip == nil {
 			return nil
 		}
-		return trimmed
+		return ip.String()
+	}
+	if b.ESType == "version" {
+		strVal, ok := val.(string)
+		if !ok || !ValidateSemver(strVal) {
+			return nil
+		}
+		return strVal
 	}
 	if b.ESType == "geo_point" {
 		formatted, _, _, ok := parseAndFormatGeoPointValue(val)
@@ -2009,8 +2011,25 @@ func normalizeDynamicMode(dyn any) string {
 	}
 }
 
+func isObjectAcceptingLeafProperty(prop esast.FieldProperty) bool {
+	if prop.Enabled != nil && !*prop.Enabled {
+		return true
+	}
+	t := strings.ToLower(strings.TrimSpace(prop.Type))
+	if IsRangeFieldType(t) {
+		return true
+	}
+	switch t {
+	case "flattened", "geo_point", "geo_shape", "shape", "point", "percolator", "sparse_vector", "rank_features", "completion", "histogram", "aggregate_metric_double", "join":
+		return true
+	default:
+		return false
+	}
+}
+
 func validateStrictDynamicObject(obj map[string]any, props map[string]esast.FieldProperty, parentDynamic any, parentSubobjects *bool, pathPrefix string) (bool, error) {
 	mode := normalizeDynamicMode(parentDynamic)
+	currentSubobjects := parentSubobjects == nil || *parentSubobjects
 	pruned := false
 	scope := "_doc"
 	if pathPrefix != "" {
@@ -2027,7 +2046,7 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 			pruned = true
 			continue
 		}
-		if (!exists || prop.Type == "" || strings.EqualFold(prop.Type, "object")) && len(props) > 0 {
+		if currentSubobjects && (!exists || prop.Type == "" || strings.EqualFold(prop.Type, "object")) && len(props) > 0 {
 			prefix := k + "."
 			var synthProps map[string]esast.FieldProperty
 			for pk, pv := range props {
@@ -2050,16 +2069,13 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 				}
 			}
 		}
-		if parentSubobjects != nil && !*parentSubobjects {
-			if strings.Contains(k, ".") {
-				return false, fmt.Errorf("mapper_parsing_exception: object mapping for [%s] tried to parse field [%s] as object, but subobjects is set to false", scope, k)
-			}
-			isAllowedObjectProp := exists && (strings.EqualFold(prop.Type, "flattened") || strings.EqualFold(prop.Type, "sparse_vector") || strings.EqualFold(prop.Type, "rank_features") || strings.EqualFold(prop.Type, "percolator") || strings.EqualFold(prop.Type, "join") || strings.EqualFold(prop.Type, "geo_point") || strings.EqualFold(prop.Type, "geo_shape") || strings.EqualFold(prop.Type, "completion") || IsRangeFieldType(prop.Type) || (prop.Enabled != nil && !*prop.Enabled))
+		if !currentSubobjects {
+			isAllowedObjectProp := exists && isObjectAcceptingLeafProperty(prop)
 			if !isAllowedObjectProp && hasObjectValueAtPath(v, nil) {
 				return false, fmt.Errorf("mapper_parsing_exception: object mapping for [%s] tried to parse field [%s] as object, but subobjects is set to false", scope, k)
 			}
 		}
-		if !exists && strings.Contains(k, ".") {
+		if currentSubobjects && !exists && strings.Contains(k, ".") {
 			parts := strings.SplitN(k, ".", 2)
 			if p0, ok := props[parts[0]]; ok {
 				subObj := map[string]any{parts[1]: v}
@@ -2182,30 +2198,35 @@ func validateStrictDynamicSlice(slice []any, props map[string]esast.FieldPropert
 }
 
 func hasExplicitNullAtPath(node any, path []string) bool {
-	if len(path) == 0 || node == nil {
+	if len(path) == 0 {
+		return false
+	}
+	if node == nil {
 		return false
 	}
 	switch v := node.(type) {
 	case map[string]any:
-		child, exists := v[path[0]]
-		if !exists {
-			if len(path) > 1 {
-				for i := len(path); i >= 2; i-- {
-					joined := strings.Join(path[:i], ".")
-					if c, ok := v[joined]; ok {
-						if i == len(path) {
-							return isNullOrNullSlice(c)
-						}
-						return hasExplicitNullAtPath(c, path[i:])
+		if child, exists := v[path[0]]; exists {
+			if len(path) == 1 {
+				if isNullOrNullSlice(child) {
+					return true
+				}
+			} else if hasExplicitNullAtPath(child, path[1:]) {
+				return true
+			}
+		}
+		for i := 2; i <= len(path); i++ {
+			if c, ok := v[strings.Join(path[:i], ".")]; ok {
+				if i == len(path) {
+					if isNullOrNullSlice(c) {
+						return true
 					}
+				} else if hasExplicitNullAtPath(c, path[i:]) {
+					return true
 				}
 			}
-			return false
 		}
-		if len(path) == 1 {
-			return isNullOrNullSlice(child)
-		}
-		return hasExplicitNullAtPath(child, path[1:])
+		return false
 	case []any:
 		for _, elem := range v {
 			if hasExplicitNullAtPath(elem, path) {
@@ -2624,17 +2645,24 @@ func roundTimeToUnit(t time.Time, roundUnit byte, roundUp bool) time.Time {
 }
 
 func extractScalarValue(node any, path []string) any {
-	if len(path) == 0 || node == nil {
+	if len(path) == 0 {
 		return normalizeScalar(node)
+	}
+	if node == nil {
+		return nil
 	}
 	switch curr := node.(type) {
 	case map[string]any:
 		if next, exists := curr[path[0]]; exists {
-			return extractScalarValue(next, path[1:])
+			if v := extractScalarValue(next, path[1:]); v != nil {
+				return v
+			}
 		}
-		for i := len(path); i > 1; i-- {
+		for i := 2; i <= len(path); i++ {
 			if next, exists := curr[strings.Join(path[:i], ".")]; exists {
-				return extractScalarValue(next, path[i:])
+				if v := extractScalarValue(next, path[i:]); v != nil {
+					return v
+				}
 			}
 		}
 		return nil
@@ -2719,12 +2747,10 @@ func collectStringsAtPathWithNull(node any, path []string, lowercase bool, nullV
 	case map[string]any:
 		if next, ok := curr[path[0]]; ok {
 			collectStringsAtPathWithNull(next, path[1:], lowercase, nullVal, out)
-			return
 		}
-		for i := len(path); i > 1; i-- {
+		for i := 2; i <= len(path); i++ {
 			if next, ok := curr[strings.Join(path[:i], ".")]; ok {
 				collectStringsAtPathWithNull(next, path[i:], lowercase, nullVal, out)
-				return
 			}
 		}
 	case []any:
@@ -2835,7 +2861,7 @@ func propagateCopyToCustomMultiFields(s *IndexSchema, row map[string]any, target
 					continue
 				}
 				if isTypedNonStringBinding(subB) {
-					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && (subB.Coerce == nil || *subB.Coerce) {
+					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && subB.ESType != "version" && (subB.Coerce == nil || *subB.Coerce) {
 						continue
 					}
 					coerced := coerceScalarBindingForDoris(rv, subB, getNow())
@@ -2877,7 +2903,7 @@ func propagateCopyToCustomMultiFields(s *IndexSchema, row map[string]any, target
 					if subB.IgnoreAbove > 0 && len([]rune(fmt.Sprintf("%v", rv))) > subB.IgnoreAbove {
 						continue
 					}
-					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && (subB.Coerce == nil || *subB.Coerce) {
+					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && subB.ESType != "version" && (subB.Coerce == nil || *subB.Coerce) {
 						continue
 					}
 					coerced := coerceScalarBindingForDoris(rv, subB, getNow())
@@ -3218,11 +3244,15 @@ func hasObjectValueAtPath(node any, path []string) bool {
 	switch curr := node.(type) {
 	case map[string]any:
 		if next, exists := curr[path[0]]; exists {
-			return hasObjectValueAtPath(next, path[1:])
+			if hasObjectValueAtPath(next, path[1:]) {
+				return true
+			}
 		}
-		for i := len(path); i > 1; i-- {
+		for i := 2; i <= len(path); i++ {
 			if next, exists := curr[strings.Join(path[:i], ".")]; exists {
-				return hasObjectValueAtPath(next, path[i:])
+				if hasObjectValueAtPath(next, path[i:]) {
+					return true
+				}
 			}
 		}
 	case []any:
@@ -3898,7 +3928,7 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 		if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
 			return nil
 		}
-		if (b.Coerce != nil && !*b.Coerce) || b.ESType == "float" || b.ESType == "half_float" {
+		if (b.Coerce != nil && !*b.Coerce) || b.ESType == "float" || b.ESType == "half_float" || b.ESType == "version" || b.ESType == "ip" {
 			return nil
 		}
 	} else if b.LowercaseNormalizer {
@@ -3997,11 +4027,15 @@ func collectCompletionStringsAtPath(node any, path []string, lowercase bool, nul
 	switch curr := node.(type) {
 	case map[string]any:
 		if next, ok := curr[path[0]]; ok {
-			return collectCompletionStringsAtPath(next, path[1:], lowercase, nullVal, out)
+			if err := collectCompletionStringsAtPath(next, path[1:], lowercase, nullVal, out); err != nil {
+				return err
+			}
 		}
-		for i := len(path); i > 1; i-- {
+		for i := 2; i <= len(path); i++ {
 			if next, ok := curr[strings.Join(path[:i], ".")]; ok {
-				return collectCompletionStringsAtPath(next, path[i:], lowercase, nullVal, out)
+				if err := collectCompletionStringsAtPath(next, path[i:], lowercase, nullVal, out); err != nil {
+					return err
+				}
 			}
 		}
 	case []any:

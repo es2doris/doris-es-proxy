@@ -2527,3 +2527,116 @@ func TestRound55ASTF10AndF11Validations(t *testing.T) {
 		}
 	}
 }
+
+func TestRound56ASTValidationF10F11F19(t *testing.T) {
+	validReqs := []string{
+		// F10: script_score, intervals.filter.script, auto_date_histogram, sampler, percentile_ranks
+		`{"query":{"script_score":{"query":{"match_all":{}},"script":{"source":"_score * 2"}}}}`,
+		`{"query":{"script_score":{"query":{"match_all":{}},"script":"_score * 2"}}}`,
+		`{"query":{"intervals":{"title":{"match":{"query":"foo","filter":{"script":{"source":"true"}}}}}}}`,
+		`{"size":0,"aggs":{"adh":{"auto_date_histogram":{"script":"doc['ts'].value","buckets":5}}}}`,
+		`{"size":0,"aggs":{"s":{"sampler":{"shard_size":100,"script":{"source":"doc['cat'].value"}}}}}`,
+		`{"size":0,"aggs":{"pr":{"percentile_ranks":{"script":"doc['lat'].value","values":[10,50]}}}}`,
+		// F10: script query (string shorthand, inner script, legacy direct fields with boost & _name)
+		`{"query":{"script":"doc['x'].value > 5"}}`,
+		`{"query":{"script":{"script":"doc['x'].value > 5"}}}`,
+		`{"query":{"script":{"script":{"source":"doc['x'].value > 5","params":{"lim":5}}}}}`,
+		`{"query":{"script":{"source":"doc['x'].value > 5","lang":"painless","params":{"k":1},"boost":1.5,"_name":"sq1"}}}`,
+		// F10: script_fields in SearchRequest, InnerHitsSpec, TopHitsAggSpec
+		`{"script_fields":{"sf1":{"script":"doc['a'].value * 2","ignore_failure":true},"sf2":{"script":{"source":"1"},"ignore_failure":"false"}}}`,
+		`{"query":{"nested":{"path":"items","query":{"match_all":{}},"inner_hits":{"script_fields":{"sf":{"script":"1","ignore_failure":false}}}}}}`,
+		`{"size":0,"aggs":{"th":{"top_hits":{"script_fields":{"sf":{"script":{"source":"1"},"ignore_failure":true}}}}}}`,
+		// F11: multi_terms.order, intervals, regexp, query_string, _source
+		`{"size":0,"aggs":{"mt":{"multi_terms":{"terms":[{"field":"a"},{"field":"b"}],"order":{"_count":"desc"}}}}}`,
+		`{"size":0,"aggs":{"mt":{"multi_terms":{"terms":[{"field":"a"},{"field":"b"}],"order":[{"_key":"asc"}]}}}}`,
+		`{"query":{"intervals":{"title":{"fuzzy":{"term":"hello","fuzziness":"AUTO:3,6"}}}}}`,
+		`{"query":{"intervals":{"title":{"match":{"query":"a b","max_gaps":-1}}}}}`,
+		`{"query":{"intervals":{"title":{"all_of":{"intervals":[{"match":{"query":"a"}}],"max_gaps":0}}}}}`,
+		`{"query":{"regexp":{"status":{"value":"ab.*","flags":"ALL|COMPLEMENT|NONE","max_determinized_states":10000}}}}`,
+		`{"query":{"regexp":{"status":{"regexp":"ab.*","flags":"INTERVAL|INTERSECTION|ANYSTRING"}}}}`,
+		`{"query":{"query_string":{"query":"foo","max_determinized_states":5000}}}`,
+		`{"_source":null}`,
+		`{"_source":false}`,
+		`{"_source":true}`,
+		`{"_source":"obj.*"}`,
+		`{"_source":["a","b"]}`,
+		`{"_source":{"includes":["a"],"excludes":"b"}}`,
+		`{"_source":{"include":"a","exclude":["b"]}}`,
+		// F19.1: query_string split_on_whitespace
+		`{"query":{"query_string":{"query":"new york","split_on_whitespace":false}}}`,
+	}
+	for _, raw := range validReqs {
+		var sr SearchRequest
+		if err := json.Unmarshal([]byte(raw), &sr); err != nil {
+			t.Fatalf("Round 56 expected valid SearchRequest %s, got error: %v", raw, err)
+		}
+	}
+
+	// Verify F19.1 SplitOnWhitespace field unmarshaling
+	var srSplit SearchRequest
+	if err := json.Unmarshal([]byte(`{"query":{"query_string":{"query":"new york","split_on_whitespace":false}}}`), &srSplit); err != nil {
+		t.Fatalf("Round 56 split_on_whitespace unmarshal failed: %v", err)
+	}
+	if srSplit.Query == nil || srSplit.Query.QueryString == nil || srSplit.Query.QueryString.SplitOnWhitespace == nil || *srSplit.Query.QueryString.SplitOnWhitespace {
+		t.Fatalf("Round 56 expected SplitOnWhitespace=false to be populated, got %+v", srSplit.Query)
+	}
+
+	invalidReqs := []string{
+		// F10: script validation across queries & aggs
+		`{"query":{"script_score":{"query":{"match_all":{}},"script":{}}}}`,
+		`{"query":{"script_score":{"query":{"match_all":{}},"script":{"source":"1","id":"stored_1"}}}}`,
+		`{"query":{"script_score":{"query":{"match_all":{}},"script":{"source":"1","unknown_opt":true}}}}`,
+		`{"query":{"script_score":{"query":{"match_all":{}},"script":123}}}`,
+		`{"query":{"intervals":{"title":{"match":{"query":"foo","filter":{"script":{}}}}}}}`,
+		`{"query":{"intervals":{"title":{"match":{"query":"foo","filter":{"script":42}}}}}}`,
+		`{"size":0,"aggs":{"adh":{"auto_date_histogram":{"script":{},"buckets":5}}}}`,
+		`{"size":0,"aggs":{"s":{"sampler":{"shard_size":100,"script":{"lang":"painless"}}}}}`,
+		`{"size":0,"aggs":{"pr":{"percentile_ranks":{"script":{},"values":[10,50]}}}}`,
+		`{"query":{"script":"   "}}`,
+		`{"query":{"script":{"script":{}}}}`,
+		`{"query":{"script":{"boost":1.5,"_name":"sq1"}}}`,
+		`{"query":{"script":{"source":"true","bogus":1}}}`,
+		// F10: script_fields validation across SearchRequest, InnerHitsSpec, TopHitsAggSpec
+		`{"script_fields":{"":{"script":"1"}}}`,
+		`{"script_fields":{"sf":"doc['a'].value"}}`,
+		`{"script_fields":{"sf":{"ignore_failure":true}}}`,
+		`{"script_fields":{"sf":{"script":{}}}}`,
+		`{"script_fields":{"sf":{"script":"1","extra":true}}}`,
+		`{"script_fields":{"sf":{"script":"1","ignore_failure":"maybe"}}}`,
+		`{"query":{"nested":{"path":"items","query":{"match_all":{}},"inner_hits":{"script_fields":{"":{"script":"1"}}}}}}`,
+		`{"query":{"nested":{"path":"items","query":{"match_all":{}},"inner_hits":{"script_fields":{"sf":{"script":{}}}}}}}`,
+		`{"query":{"nested":{"path":"items","query":{"match_all":{}},"inner_hits":{"script_fields":{"sf":{"script":"1","unknown":1}}}}}}`,
+		`{"size":0,"aggs":{"th":{"top_hits":{"script_fields":{"":{"script":"1"}}}}}}`,
+		`{"size":0,"aggs":{"th":{"top_hits":{"script_fields":{"sf":{"script":{}}}}}}}`,
+		`{"size":0,"aggs":{"th":{"top_hits":{"script_fields":{"sf":{"script":"1","bad_key":1}}}}}}`,
+		// F11: multi_terms.order
+		`{"size":0,"aggs":{"mt":{"multi_terms":{"terms":[{"field":"a"},{"field":"b"}],"order":{"_count":"sideways"}}}}}`,
+		`{"size":0,"aggs":{"mt":{"multi_terms":{"terms":[{"field":"a"},{"field":"b"}],"order":{}}}}}`,
+		`{"size":0,"aggs":{"mt":{"multi_terms":{"terms":[{"field":"a"},{"field":"b"}],"order":"desc"}}}}`,
+		// F11: intervals fuzziness & max_gaps
+		`{"query":{"intervals":{"title":{"fuzzy":{"term":"hello","fuzziness":"INVALID"}}}}}`,
+		`{"query":{"intervals":{"title":{"fuzzy":{"term":"hello","fuzziness":5}}}}}`,
+		`{"query":{"intervals":{"title":{"match":{"query":"a b","max_gaps":-2}}}}}`,
+		`{"query":{"intervals":{"title":{"all_of":{"intervals":[{"match":{"query":"a"}}],"max_gaps":-5}}}}}`,
+		// F11: regexp & query_string
+		`{"query":{"regexp":{"status":{"value":"a","regexp":"b"}}}}`,
+		`{"query":{"regexp":{"status":{"value":"a","max_determinized_states":0}}}}`,
+		`{"query":{"regexp":{"status":{"value":"a","max_determinized_states":-10}}}}`,
+		`{"query":{"regexp":{"status":{"value":"a","max_determinized_states":1.5}}}}`,
+		`{"query":{"regexp":{"status":{"value":"a","flags":"ALL|BOGUS"}}}}`,
+		`{"query":{"regexp":{"status":{"value":"a","flags":123}}}}`,
+		`{"query":{"query_string":{"query":"foo","max_determinized_states":0}}}`,
+		`{"query":{"query_string":{"query":"foo","max_determinized_states":-5}}}`,
+		// F11: _source
+		`{"_source":{"includes":["a"],"unknown":1}}`,
+		`{"_source":[123]}`,
+		`{"_source":{"includes":[123]}}`,
+		`{"_source":123}`,
+	}
+	for _, raw := range invalidReqs {
+		var sr SearchRequest
+		if err := json.Unmarshal([]byte(raw), &sr); err == nil {
+			t.Fatalf("Round 56 expected error for invalid SearchRequest %s", raw)
+		}
+	}
+}

@@ -30,6 +30,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
@@ -237,6 +238,14 @@ type Server struct {
 	mlFilters                 map[string]map[string]any
 	mlUpgradeMode             bool
 	securityRoleMappings      map[string]map[string]any
+	mlDataFrameAnalytics      map[string]map[string]any
+	mlModelDeployments        map[string]map[string]any
+	mlModelAliases            map[string]string
+	securityProfiles          map[string]map[string]any
+	securitySettings          map[string]any
+	geoipDatabases            map[string]map[string]any
+	templateLifecycles        map[string]map[string]any
+	remoteClusters            map[string]map[string]any
 }
 
 func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerOptions) *Server {
@@ -310,6 +319,14 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		mlCalendars:               make(map[string]map[string]any),
 		mlFilters:                 make(map[string]map[string]any),
 		securityRoleMappings:      make(map[string]map[string]any),
+		mlDataFrameAnalytics:      make(map[string]map[string]any),
+		mlModelDeployments:        make(map[string]map[string]any),
+		mlModelAliases:            make(map[string]string),
+		securityProfiles:          make(map[string]map[string]any),
+		securitySettings:          make(map[string]any),
+		geoipDatabases:            make(map[string]map[string]any),
+		templateLifecycles:        make(map[string]map[string]any),
+		remoteClusters:            make(map[string]map[string]any),
 	}
 	s.coalescer = newStreamLoadCoalescer(func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
 		err := s.backend.StreamLoad(ctx, table, ndjson, syncRefresh)
@@ -891,8 +908,11 @@ func (s *Server) deleteCatalogEntity(ctx context.Context, entityType, entityKey 
 // without `http.ServeMux` wildcard ambiguity between `/_alias/{name}` and `/{index}/_search`.
 func (s *Server) Handler() http.Handler {
 	return s.withWireMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		trimmed := strings.Trim(r.URL.Path, "/")
-		if trimmed == "" {
+		rawTrimmed := strings.Trim(r.URL.EscapedPath(), "/")
+		if rawTrimmed == "" && strings.Trim(r.URL.Path, "/") != "" {
+			rawTrimmed = strings.Trim(r.URL.Path, "/")
+		}
+		if rawTrimmed == "" {
 			if r.Method == http.MethodHead {
 				w.WriteHeader(http.StatusOK)
 				return
@@ -900,7 +920,15 @@ func (s *Server) Handler() http.Handler {
 			s.handleRootHandshake(w, r)
 			return
 		}
-		segs := strings.Split(trimmed, "/")
+		rawSegs := strings.Split(rawTrimmed, "/")
+		segs := make([]string, len(rawSegs))
+		for i, rs := range rawSegs {
+			if unesc, err := url.PathUnescape(rs); err == nil {
+				segs[i] = unesc
+			} else {
+				segs[i] = rs
+			}
+		}
 
 		switch {
 		case segs[0] == "_synonyms":
@@ -1035,8 +1063,11 @@ func (s *Server) Handler() http.Handler {
 		case len(segs) >= 2 && segs[0] == "_cat" && segs[1] == "component_templates":
 			s.handleCatComponentTemplates(w, r, segs)
 			return
-		case len(segs) >= 2 && segs[0] == "_cat" && (segs[1] == "ml_anomaly_detectors" || segs[1] == "ml_jobs" || segs[1] == "ml_datafeeds" || segs[1] == "ml_trained_models" || segs[1] == "ml_data_frame_analytics"):
+		case len(segs) >= 2 && segs[0] == "_cat" && (segs[1] == "ml_anomaly_detectors" || segs[1] == "ml_jobs" || segs[1] == "ml_datafeeds" || segs[1] == "ml_trained_models" || segs[1] == "ml_data_frame_analytics" || (segs[1] == "ml" && len(segs) >= 3)):
 			s.handleCatML(w, r, segs)
+			return
+		case (len(segs) == 3 || len(segs) == 4) && segs[0] == "_ingest" && segs[1] == "geoip" && segs[2] == "database":
+			s.handleIngestGeoIPDatabase(w, r, segs)
 			return
 		}
 
@@ -1271,6 +1302,11 @@ func (s *Server) Handler() http.Handler {
 			case segs[0] == "_resolve" && segs[1] == "index":
 				r.SetPathValue("name", "*")
 				s.handleResolveIndex(w, r)
+			case segs[0] == "_resolve" && segs[1] == "cluster":
+				r.SetPathValue("name", "*")
+				s.handleResolveCluster(w, r)
+			case segs[0] == "_ilm" && segs[1] == "migrate_to_data_tiers":
+				s.handleILMMigrateToDataTiers(w, r)
 			case segs[0] == "_ingest" && segs[1] == "pipeline":
 				s.handleIngestPipeline(w, r)
 			case segs[0] == "_enrich" && (segs[1] == "policy" || segs[1] == "_stats" || segs[1] == "stats"):
@@ -1357,7 +1393,7 @@ func (s *Server) Handler() http.Handler {
 					}
 				case "_create":
 					writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: id is missing;")
-				case "_clone", "_shrink", "_split":
+				case "_clone", "_shrink", "_split", "_downsample":
 					writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: target index is missing;")
 				default:
 					writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
@@ -1365,6 +1401,23 @@ func (s *Server) Handler() http.Handler {
 			}
 
 		case 3:
+			if segs[0] == "_resolve" && segs[1] == "cluster" {
+				r.SetPathValue("name", segs[2])
+				s.handleResolveCluster(w, r)
+				return
+			}
+			if segs[0] == "_data_stream" && segs[2] == "_lifecycle" {
+				s.handleDataStreamLifecycle(w, r, segs[1])
+				return
+			}
+			if segs[1] == "_lifecycle" && segs[2] == "explain" {
+				s.handleExplainDataLifecycle(w, r, segs[0])
+				return
+			}
+			if segs[1] == "_downsample" {
+				s.handleDownsampleIndex(w, r, segs[0], segs[2])
+				return
+			}
 			if segs[0] == "_cluster" && segs[1] == "health" {
 				r.SetPathValue("index", segs[2])
 				s.handleClusterHealth(w, r)
@@ -1535,6 +1588,9 @@ func (s *Server) Handler() http.Handler {
 			if segs[0] == "_cat" {
 				r.SetPathValue("index", segs[2])
 				r.SetPathValue("name", segs[2])
+				r.SetPathValue("node_id", segs[2])
+				r.SetPathValue("fields", segs[2])
+				r.SetPathValue("thread_pool_patterns", segs[2])
 				switch segs[1] {
 				case "data_streams":
 					s.handleCatDataStreams(w, r)
@@ -1573,6 +1629,18 @@ func (s *Server) Handler() http.Handler {
 					return
 				case "thread_pool":
 					s.handleCatThreadPool(w, r)
+					return
+				case "nodes":
+					s.handleCatNodes(w, r)
+					return
+				case "master":
+					s.handleCatMaster(w, r)
+					return
+				case "nodeattrs":
+					s.handleCatNodeattrs(w, r)
+					return
+				case "plugins":
+					s.handleCatPlugins(w, r)
 					return
 				case "templates", "index_templates":
 					s.handleCatTemplates(w, r)
@@ -2672,6 +2740,28 @@ func (s *Server) handleDataStream(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusBadRequest, "resource_already_exists_exception", "index or alias ["+name+"] already exists")
 			return
 		}
+		var explicitLifecycle map[string]any
+		if r.Body != nil && r.ContentLength != 0 {
+			if bodyBytes, ok := readRequestBody(w, r); ok {
+				if len(bytes.TrimSpace(bodyBytes)) > 0 {
+					var reqMap map[string]any
+					if err := json.Unmarshal(bodyBytes, &reqMap); err != nil {
+						writeESError(w, http.StatusBadRequest, "x_content_parse_exception", err.Error())
+						return
+					}
+					if lcRaw, okLC := reqMap["lifecycle"].(map[string]any); okLC {
+						lcNorm, err := normalizeAndValidateDataStreamLifecycle(lcRaw)
+						if err != nil {
+							writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+							return
+						}
+						explicitLifecycle = lcNorm
+					}
+				}
+			} else {
+				return
+			}
+		}
 		_ = s.ensureIndexSchema(r.Context(), name)
 		s.mu.Lock()
 		if s.dataStreams == nil {
@@ -2691,6 +2781,11 @@ func (s *Server) handleDataStream(w http.ResponseWriter, r *http.Request) {
 			"hidden":     false,
 			"system":     false,
 			"replicated": false,
+		}
+		if explicitLifecycle != nil {
+			dsObj["lifecycle"] = explicitLifecycle
+		} else if tplLC := s.extractMatchingTemplateLifecycleLocked(name); len(tplLC) > 0 {
+			dsObj["lifecycle"] = tplLC
 		}
 		s.dataStreams[name] = dsObj
 		s.mu.Unlock()
@@ -3448,12 +3543,26 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return
 		}
+		var parsedTemplateLifecycle map[string]any
 		if len(bytes.TrimSpace(bodyBytes)) > 0 {
 			if err := json.Unmarshal(bodyBytes, &tpl); err != nil {
 				writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 				return
 			}
 			_ = json.Unmarshal(bodyBytes, &verHolder)
+			var rawTplMap map[string]any
+			if err := json.Unmarshal(bodyBytes, &rawTplMap); err == nil {
+				if innerTpl, okT := rawTplMap["template"].(map[string]any); okT {
+					if lcRaw, okLC := innerTpl["lifecycle"].(map[string]any); okLC {
+						lcNorm, err := normalizeAndValidateDataStreamLifecycle(lcRaw)
+						if err != nil {
+							writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+							return
+						}
+						parsedTemplateLifecycle = lcNorm
+					}
+				}
+			}
 		}
 		if len(tpl.EffectivePatterns()) == 0 {
 			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: index_patterns is missing;")
@@ -3481,6 +3590,14 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 		s.mu.RUnlock()
 		s.mu.Lock()
 		s.templates[name] = tpl
+		if s.templateLifecycles == nil {
+			s.templateLifecycles = make(map[string]map[string]any)
+		}
+		if parsedTemplateLifecycle != nil {
+			s.templateLifecycles[name] = parsedTemplateLifecycle
+		} else {
+			delete(s.templateLifecycles, name)
+		}
 		if verHolder.Version != nil {
 			s.templateVersions[name] = *verHolder.Version
 		} else {
@@ -3592,6 +3709,7 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 		for _, k := range toDelete {
 			delete(s.templates, k)
 			delete(s.templateVersions, k)
+			delete(s.templateLifecycles, k)
 		}
 		s.mu.Unlock()
 		if len(toDelete) == 0 {

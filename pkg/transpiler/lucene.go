@@ -118,6 +118,9 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 	}
 
 	flags := parseSimpleQueryFlags(qsq.Flags, isSimple)
+	if !isSimple && qsq.SplitOnWhitespace != nil && !*qsq.SplitOnWhitespace {
+		flags.whitespace = false
+	}
 	if !isSimple && qsq.Escape != nil && *qsq.Escape {
 		raw = escapeAllLuceneSpecialChars(raw)
 	}
@@ -170,6 +173,14 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 		}
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
+	if !isSimple && (qsq.Lenient == nil || !*qsq.Lenient) && (qsq.Escape == nil || !*qsq.Escape) {
+		if syntaxErr := validateStrictLuceneQuery(raw); syntaxErr != nil {
+			if t.searchErr == nil {
+				t.searchErr = syntaxErr
+			}
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+	}
 	parsedAST := parseSimpleLuceneToASTWithFlags(raw, defaultField, expandedFields, defaultOp, 0, isSimple, flags)
 	if qsq.MinimumShouldMatch != nil && parsedAST.Bool != nil {
 		if len(parsedAST.Bool.Should) > 0 {
@@ -182,11 +193,16 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 			parsedAST.Bool.Must[0].Bool.MinimumShouldMatch = qsq.MinimumShouldMatch
 		}
 	}
+	prevLenient := t.inLenientQuery
+	if qsq.Lenient != nil && *qsq.Lenient {
+		t.inLenientQuery = true
+	}
 	compiled := t.CompileQuery(&parsedAST, scoring, nctx)
+	t.inLenientQuery = prevLenient
 	if scoring && qsq.Boost != nil && *qsq.Boost != 1.0 && compiled.ScoreSQL != "" && compiled.ScoreSQL != "0.0" {
 		compiled.ScoreSQL = fmt.Sprintf("((%s) * %.4f)", compiled.ScoreSQL, *qsq.Boost)
 	}
-	if !isSimple && (flags.queryType == "" || flags.queryType == "best_fields" || flags.queryType == "most_fields") && flags.quoteFieldSuffix == "" && flags.timeZone == "" && flags.phraseSlop == 0 && flags.fuzziness == nil && flags.fuzzyPrefixLength == 0 && flags.fuzzyMaxExpansions == 0 && flags.analyzer == "" && flags.quoteAnalyzer == "" && flags.zeroTermsQuery == "" && flags.escape && (flags.lenient == nil || !*flags.lenient) && compiled.WhereSQL != "FALSE" {
+	if !isSimple && flags.whitespace && (flags.queryType == "" || flags.queryType == "best_fields" || flags.queryType == "most_fields") && flags.quoteFieldSuffix == "" && flags.timeZone == "" && flags.phraseSlop == 0 && flags.fuzziness == nil && flags.fuzzyPrefixLength == 0 && flags.fuzzyMaxExpansions == 0 && flags.analyzer == "" && flags.quoteAnalyzer == "" && flags.zeroTermsQuery == "" && flags.escape && (flags.lenient == nil || !*flags.lenient) && compiled.WhereSQL != "FALSE" {
 		if rewrittenRaw, ok := t.rewriteDoris4SearchQuery(raw); ok && t.Opts.UseDoris4SearchFunc && nctx == nil && qsq.MinimumShouldMatch == nil && defaultField != "__unmatched_wildcard__" && !strings.ContainsAny(raw, "[{><~/^\\") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, "`n__") && !strings.Contains(compiled.WhereSQL, " IS NOT NULL") && !strings.Contains(compiled.WhereSQL, "array_size(") {
 			if len(expandedFields) > 1 {
 				if canEmitMultiFieldDoris4SearchDisjunction(rewrittenRaw, defaultOp) {
@@ -1445,6 +1461,30 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 		if isQuoted && flags.quoteAnalyzer != "" {
 			effAnalyzer = flags.quoteAnalyzer
 		}
+		if isQuoted && val == "" {
+			if strings.ContainsAny(field, "*?") && flags.expandFields != nil {
+				expFields := flags.expandFields(field)
+				if len(expFields) == 0 {
+					return esast.Query{MatchNone: map[string]any{}}
+				}
+				var shoulds []esast.Query
+				for _, ef := range expFields {
+					fname, fBoost := splitLuceneBoost(ef)
+					q := buildEmptyQuotedFieldQuery(fname, boost*fBoost, flags)
+					if q.MatchNone == nil {
+						shoulds = append(shoulds, q)
+					}
+				}
+				if len(shoulds) == 0 {
+					return esast.Query{MatchNone: map[string]any{}}
+				}
+				if len(shoulds) == 1 {
+					return shoulds[0]
+				}
+				return esast.Query{Bool: &esast.BoolQuery{Should: shoulds}}
+			}
+			return buildEmptyQuotedFieldQuery(field, boost, flags)
+		}
 		if strings.ContainsAny(field, "*?") {
 			b := boost
 			qType := "best_fields"
@@ -1689,6 +1729,26 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 	effAnalyzer := flags.analyzer
 	if isQuoted && flags.quoteAnalyzer != "" {
 		effAnalyzer = flags.quoteAnalyzer
+	}
+	if isQuoted && cleanVal == "" {
+		if len(targetFields) > 0 {
+			var shoulds []esast.Query
+			for _, fpat := range targetFields {
+				fname, fBoost := splitLuceneBoost(fpat)
+				q := buildEmptyQuotedFieldQuery(fname, boost*fBoost, flags)
+				if q.MatchNone == nil {
+					shoulds = append(shoulds, q)
+				}
+			}
+			if len(shoulds) == 0 {
+				return esast.Query{MatchNone: map[string]any{}}
+			}
+			if len(shoulds) == 1 {
+				return shoulds[0]
+			}
+			return esast.Query{Bool: &esast.BoolQuery{Should: shoulds}}
+		}
+		return buildEmptyQuotedFieldQuery(targetDefaultField, boost, flags)
 	}
 	if isQuoted && cleanVal != "" {
 		if len(targetFields) > 0 {
@@ -2032,5 +2092,249 @@ func tokenizeLuceneWithFlags(s string, isSimple bool, flags simpleQueryFlags) []
 	if curr.Len() > 0 {
 		out = append(out, curr.String())
 	}
+	if !isSimple && !flags.whitespace && len(out) > 1 {
+		out = mergeQueryStringUnquotedWhitespaceTokens(out)
+	}
 	return out
+}
+
+func buildEmptyQuotedFieldQuery(fname string, effBoost float64, flags simpleQueryFlags) esast.Query {
+	if flags.isTextField != nil && fname != "_all_text" && fname != "*" && fname != "__unmatched_wildcard__" && !flags.isTextField(fname) {
+		return esast.Query{
+			Term: map[string]esast.TermEntry{
+				fname: {Value: "", Boost: effBoost, HasBoost: true},
+			},
+		}
+	}
+	if strings.EqualFold(flags.zeroTermsQuery, "all") && fname != "__unmatched_wildcard__" {
+		if effBoost != 1.0 {
+			b := effBoost
+			return esast.Query{ConstantScore: &esast.ConstantScoreQuery{Filter: esast.Query{MatchAll: map[string]any{}}, Boost: &b}}
+		}
+		return esast.Query{MatchAll: map[string]any{}}
+	}
+	return esast.Query{MatchNone: map[string]any{}}
+}
+
+func isExplicitLuceneBoolToken(tok string) bool {
+	return tok == "AND" || tok == "OR" || tok == "NOT" || tok == "&&" || tok == "||" || tok == "|"
+}
+
+func canAcceptTrailingWSChunk(prev string) bool {
+	if prev == "" || isExplicitLuceneBoolToken(prev) {
+		return false
+	}
+	trimmed := strings.TrimLeft(prev, "+-!")
+	if trimmed == "" || strings.HasPrefix(trimmed, "(") || strings.HasPrefix(trimmed, `"`) || strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, ">") || strings.HasPrefix(trimmed, "<") {
+		return false
+	}
+	if colonIdx := findLuceneFieldColon(trimmed); colonIdx > 0 {
+		rhs := strings.TrimLeft(trimmed[colonIdx+1:], "+-!")
+		if rhs == "" || strings.HasPrefix(rhs, "(") || strings.HasPrefix(rhs, `"`) || strings.HasPrefix(rhs, "/") || strings.HasPrefix(rhs, "[") || strings.HasPrefix(rhs, "{") || strings.HasPrefix(rhs, ">") || strings.HasPrefix(rhs, "<") {
+			return false
+		}
+	}
+	last := prev[len(prev)-1]
+	if last == ')' || last == '"' || last == ']' || last == '}' || last == '/' {
+		return false
+	}
+	for i := 0; i < len(prev); i++ {
+		if prev[i] == '\\' {
+			i++
+			continue
+		}
+		if prev[i] == '~' || prev[i] == '^' {
+			return false
+		}
+	}
+	return true
+}
+
+func canMergeAsTrailingWSChunk(tok string) bool {
+	if tok == "" || isExplicitLuceneBoolToken(tok) {
+		return false
+	}
+	c := tok[0]
+	if c == '+' || c == '-' || c == '!' || c == '(' || c == ')' || c == '"' || c == '/' || c == '[' || c == '{' || c == '>' || c == '<' {
+		return false
+	}
+	if findLuceneFieldColon(tok) >= 0 {
+		return false
+	}
+	return true
+}
+
+func mergeQueryStringUnquotedWhitespaceTokens(tokens []string) []string {
+	merged := make([]string, 0, len(tokens))
+	for _, tok := range tokens {
+		if len(merged) > 0 && canAcceptTrailingWSChunk(merged[len(merged)-1]) && canMergeAsTrailingWSChunk(tok) {
+			merged[len(merged)-1] = merged[len(merged)-1] + " " + tok
+		} else {
+			merged = append(merged, tok)
+		}
+	}
+	return merged
+}
+
+func isValidLuceneFuzzySuffix(sub string) bool {
+	if sub == "" || strings.EqualFold(sub, "auto") {
+		return true
+	}
+	lower := strings.ToLower(sub)
+	if strings.HasPrefix(lower, "auto:") {
+		parts := strings.Split(lower[len("auto:"):], ",")
+		if len(parts) != 2 {
+			return false
+		}
+		lo, err1 := strconv.Atoi(parts[0])
+		hi, err2 := strconv.Atoi(parts[1])
+		return err1 == nil && err2 == nil && lo >= 0 && hi >= lo
+	}
+	if sub == "0" || sub == "1" || sub == "2" {
+		return true
+	}
+	if sub[0] == '+' || sub[0] == '-' {
+		return false
+	}
+	f, err := strconv.ParseFloat(sub, 64)
+	return err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) && f >= 0.0 && f <= 2.0
+}
+
+func validateStrictLuceneQuery(s string) error {
+	inQuotes := false
+	inRegex := false
+	escaped := false
+	bracketDepth := 0
+	parenDepth := 0
+	justClosedQuoteIdx := -2
+
+	isSuffixStop := func(b byte) bool {
+		switch b {
+		case ' ', '\t', '\n', '\r', '(', ')', '^', '|', '&':
+			return true
+		default:
+			return false
+		}
+	}
+	isBoostStop := func(b byte) bool {
+		switch b {
+		case ' ', '\t', '\n', '\r', '(', ')', ':', '|', '&', '~':
+			return true
+		default:
+			return false
+		}
+	}
+	isTermBreak := func(b byte) bool {
+		switch b {
+		case ' ', '\t', '\n', '\r', '(', ')', ':', '+', '-', '!', '|', '&', '^', '~':
+			return true
+		default:
+			return false
+		}
+	}
+
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if ch == '"' && !inRegex {
+			if inQuotes {
+				inQuotes = false
+				justClosedQuoteIdx = i
+			} else {
+				inQuotes = true
+			}
+			continue
+		}
+		if inQuotes {
+			continue
+		}
+		if ch == '/' && bracketDepth == 0 {
+			if inRegex {
+				inRegex = false
+				continue
+			}
+			if strings.ContainsRune(s[i+1:], '/') {
+				if i == 0 || s[i-1] == ' ' || s[i-1] == '\t' || s[i-1] == '\n' || s[i-1] == '\r' ||
+					s[i-1] == ':' || s[i-1] == '(' || s[i-1] == '+' || s[i-1] == '-' || s[i-1] == '!' {
+					inRegex = true
+					continue
+				}
+			}
+		}
+		if inRegex {
+			continue
+		}
+		if ch == '[' || ch == '{' {
+			bracketDepth++
+			continue
+		}
+		if ch == ']' || ch == '}' {
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+			continue
+		}
+		if bracketDepth > 0 {
+			continue
+		}
+		switch ch {
+		case '(':
+			parenDepth++
+		case ')':
+			if parenDepth == 0 {
+				return fmt.Errorf("parse_exception: cannot parse query [%s]: unbalanced parentheses", s)
+			}
+			parenDepth--
+		case '~':
+			isSlop := justClosedQuoteIdx == i-1
+			if !isSlop && (i == 0 || isTermBreak(s[i-1])) {
+				return fmt.Errorf("parse_exception: cannot parse query [%s]: invalid fuzzy operator", s)
+			}
+			j := i + 1
+			for j < len(s) && !isSuffixStop(s[j]) {
+				j++
+			}
+			sub := s[i+1 : j]
+			if isSlop {
+				if sub != "" && !isPureDigitsASCII(sub) {
+					return fmt.Errorf("parse_exception: cannot parse query [%s]: invalid phrase slop [%s]", s, sub)
+				}
+			} else if !isValidLuceneFuzzySuffix(sub) {
+				return fmt.Errorf("parse_exception: cannot parse query [%s]: invalid fuzzy edit distance [%s]", s, sub)
+			}
+			i = j - 1
+		case '^':
+			if i == 0 || s[i-1] == ' ' || s[i-1] == '\t' || s[i-1] == '\n' || s[i-1] == '\r' ||
+				s[i-1] == '(' || s[i-1] == ':' || s[i-1] == '|' || s[i-1] == '&' {
+				return fmt.Errorf("parse_exception: cannot parse query [%s]: invalid boost operator", s)
+			}
+			j := i + 1
+			for j < len(s) && !isBoostStop(s[j]) {
+				j++
+			}
+			sub := s[i+1 : j]
+			if sub == "" || sub[0] == '-' || sub[0] == '+' {
+				return fmt.Errorf("parse_exception: cannot parse query [%s]: invalid or negative boost [%s]", s, sub)
+			}
+			f, err := strconv.ParseFloat(sub, 64)
+			if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
+				return fmt.Errorf("parse_exception: cannot parse query [%s]: invalid boost [%s]", s, sub)
+			}
+			i = j - 1
+		}
+	}
+	if inQuotes {
+		return fmt.Errorf("parse_exception: cannot parse query [%s]: unclosed double quote", s)
+	}
+	if parenDepth != 0 {
+		return fmt.Errorf("parse_exception: cannot parse query [%s]: unbalanced parentheses", s)
+	}
+	return nil
 }

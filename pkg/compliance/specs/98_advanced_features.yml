@@ -852,5 +852,581 @@
         max_archive_version: 1
   - is_true: _nodes
 
+---
+"Round 56 Data Stream Lifecycle, Index Downsampling, Braced Stash, Arbitrary Key, and Escaped Doc IDs":
+  - do:
+      indices.put_index_template:
+        name: r56_ds_tmpl
+        body:
+          index_patterns: ["r56-ds-*"]
+          data_stream: {}
+  - match: { acknowledged: true }
 
+  - do:
+      indices.create_data_stream:
+        name: r56-ds-logs
+  - match: { acknowledged: true }
+
+  - do:
+      indices.put_data_lifecycle:
+        name: r56-ds-logs
+        body:
+          data_retention: "7d"
+  - match: { acknowledged: true }
+
+  - do:
+      indices.get_data_lifecycle:
+        name: r56-ds-logs
+  - match: { data_streams.0.name: "r56-ds-logs" }
+  - match: { data_streams.0.lifecycle.data_retention: "7d" }
+
+  - do:
+      indices.explain_data_lifecycle:
+        index: r56-ds-logs
+  - match: { indices._arbitrary_key_.managed_by_lifecycle: true }
+
+  - do:
+      indices.delete_data_lifecycle:
+        name: r56-ds-logs
+  - match: { acknowledged: true }
+
+  - do:
+      indices.create:
+        index: r56_ts_src
+        body:
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              host: { type: keyword }
+              cpu: { type: double }
+  - match: { acknowledged: true }
+
+  - do:
+      index:
+        index: r56_ts_src
+        id: "doc#1?tag=alpha 2"
+        refresh: true
+        body:
+          "@timestamp": "2026-01-01T00:15:00Z"
+          host: "web-01"
+          cpu: 42.5
+  - set: { _index: "${src_idx}", _id: "${special_doc_id}" }
+
+  - do:
+      get:
+        index: "${src_idx}"
+        id: "${special_doc_id}"
+  - match: { found: true }
+  - match: { _source.host: "web-01" }
+  - is_unset: _source.nonexistent_field
+
+  - do:
+      indices.downsample:
+        index: "${src_idx}"
+        target_index: "${src_idx}_downsampled"
+        body:
+          fixed_interval: "1h"
+  - match: { acknowledged: true }
+
+  - do:
+      count:
+        index: "${src_idx}_downsampled"
+  - gte: { count: 1 }
+
+---
+"Round 56 ML Data Frame Analytics, Trained Model Deployments, and Anomaly Detection Workflows":
+  - do:
+      indices.create:
+        index: r56_ml_src
+        body:
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              host: { type: keyword }
+              latency: { type: double }
+              pred_latency: { type: double }
+  - match: { acknowledged: true }
+
+  - do:
+      bulk:
+        index: r56_ml_src
+        refresh: true
+        body:
+          - { index: { _id: "1" } }
+          - { "@timestamp": "2026-01-01T00:00:00Z", host: "web-01", latency: 10.0, pred_latency: 11.0 }
+          - { index: { _id: "2" } }
+          - { "@timestamp": "2026-01-01T00:05:00Z", host: "web-02", latency: 20.0, pred_latency: 19.0 }
+  - match: { errors: false }
+
+  # F3: ML Data Frame Analytics & _evaluate + cat.ml_data_frame_analytics
+  - do:
+      ml.put_data_frame_analytics:
+        id: r56_dfa
+        body:
+          source:
+            index: ["r56_ml_src"]
+          dest:
+            index: "r56_dfa_dest"
+          analysis:
+            regression:
+              dependent_variable: "latency"
+  - match: { id: "r56_dfa" }
+
+  - do:
+      ml.get_data_frame_analytics:
+        id: r56_dfa
+  - match: { data_frame_analytics.0.id: "r56_dfa" }
+
+  - do:
+      ml.update_data_frame_analytics:
+        id: r56_dfa
+        body:
+          description: "Updated regression job"
+  - match: { id: "r56_dfa" }
+
+  - do:
+      ml.start_data_frame_analytics:
+        id: r56_dfa
+  - is_true: ''
+
+  - do:
+      ml.get_data_frame_analytics_stats:
+        id: r56_dfa
+  - is_true: data_frame_analytics
+
+  - do:
+      cat.ml_data_frame_analytics:
+        id: r56_dfa
+        format: json
+  - match: { 0.id: "r56_dfa" }
+
+  - do:
+      ml.preview_data_frame_analytics:
+        id: r56_dfa
+  - is_true: ''
+
+  - do:
+      ml.explain_data_frame_analytics:
+        id: r56_dfa
+  - is_true: ''
+
+  - do:
+      ml.stop_data_frame_analytics:
+        id: r56_dfa
+  - is_true: ''
+
+  - do:
+      ml.delete_data_frame_analytics:
+        id: r56_dfa
+  - match: { acknowledged: true }
+
+  - do:
+      ml.evaluate_data_frame:
+        body:
+          index: "r56_ml_src"
+          evaluation:
+            regression:
+              actual_field: "latency"
+              predicted_field: "pred_latency"
+  - is_true: regression
+
+  # F4: ML Trained Models deployments, inference, aliases, definition parts & vocabulary
+  - do:
+      ml.put_trained_model:
+        model_id: r56_tm
+        body:
+          input:
+            field_names: ["text_field"]
+          inference_config:
+            regression:
+              results_field: "predicted_value"
+  - match: { model_id: "r56_tm" }
+
+  - do:
+      ml.put_trained_model_definition_part:
+        model_id: r56_tm
+        part: 0
+        body:
+          definition: "e30="
+          total_definition_length: 2
+  - match: { acknowledged: true }
+
+  - do:
+      ml.put_trained_model_vocabulary:
+        model_id: r56_tm
+        body:
+          vocabulary: ["hello", "world"]
+  - match: { acknowledged: true }
+
+  - do:
+      ml.put_trained_model_alias:
+        model_id: r56_tm
+        model_alias: r56_tm_prod
+  - match: { acknowledged: true }
+
+  - do:
+      ml.start_trained_model_deployment:
+        model_id: r56_tm
+  - is_true: assignment
+
+  - do:
+      ml.update_trained_model_deployment:
+        model_id: r56_tm
+        body:
+          number_of_allocations: 1
+  - is_true: ''
+
+  - do:
+      ml.infer_trained_model:
+        model_id: r56_tm
+        body:
+          docs:
+            - { text_field: "hello world" }
+  - is_true: inference_results
+
+  - do:
+      ml.infer_trained_model_deployment:
+        model_id: r56_tm
+        body:
+          docs:
+            - { text_field: "hello world" }
+  - is_true: inference_results
+
+  - do:
+      ml.stop_trained_model_deployment:
+        model_id: r56_tm
+        force: true
+  - is_true: ''
+
+  - do:
+      ml.delete_trained_model_alias:
+        model_id: r56_tm
+        model_alias: r56_tm_prod
+  - match: { acknowledged: true }
+
+  - do:
+      ml.delete_trained_model:
+        model_id: r56_tm
+  - match: { acknowledged: true }
+
+  # F5: ML Anomaly Detection validation, data, results, forecasts, snapshots & reset
+  - do:
+      ml.validate:
+        body:
+          analysis_config:
+            bucket_span: "15m"
+            detectors:
+              - function: "count"
+          data_description:
+            time_field: "@timestamp"
+  - match: { acknowledged: true }
+
+  - do:
+      ml.validate_detector:
+        body:
+          function: "count"
+  - match: { acknowledged: true }
+
+  - do:
+      ml.estimate_model_memory:
+        body:
+          analysis_config:
+            bucket_span: "15m"
+            detectors:
+              - function: "count"
+  - is_true: model_memory_estimate
+
+  - do:
+      ml.put_job:
+        job_id: r56_anom_job
+        body:
+          analysis_config:
+            bucket_span: "15m"
+            detectors:
+              - function: "count"
+          data_description:
+            time_field: "@timestamp"
+  - match: { job_id: "r56_anom_job" }
+
+  - do:
+      ml.open_job:
+        job_id: r56_anom_job
+  - match: { opened: true }
+
+  - do:
+      ml.post_data:
+        job_id: r56_anom_job
+        body:
+          - { "@timestamp": "2026-01-01T00:00:00Z", value: 15 }
+  - is_true: ''
+
+  - do:
+      ml.flush_job:
+        job_id: r56_anom_job
+        body:
+          calc_interim: true
+  - match: { flushed: true }
+
+  - do:
+      ml.get_buckets:
+        job_id: r56_anom_job
+  - gte: { count: 0 }
+
+  - do:
+      ml.get_overall_buckets:
+        job_id: r56_anom_job
+        body:
+          top_n: 1
+  - gte: { count: 0 }
+
+  - do:
+      ml.get_records:
+        job_id: r56_anom_job
+  - gte: { count: 0 }
+
+  - do:
+      ml.get_categories:
+        job_id: r56_anom_job
+  - gte: { count: 0 }
+
+  - do:
+      ml.get_influencers:
+        job_id: r56_anom_job
+  - gte: { count: 0 }
+
+  - do:
+      ml.forecast:
+        job_id: r56_anom_job
+        body:
+          duration: "1d"
+  - match: { acknowledged: true }
+  - set: { forecast_id: "${fc_id}" }
+
+  - do:
+      ml.delete_forecast:
+        job_id: r56_anom_job
+        forecast_id: "${fc_id}"
+  - match: { acknowledged: true }
+
+  - do:
+      ml.get_model_snapshots:
+        job_id: r56_anom_job
+  - gte: { count: 0 }
+
+  - do:
+      ml.delete_expired_data:
+        job_id: r56_anom_job
+  - is_true: ''
+
+  - do:
+      ml.close_job:
+        job_id: r56_anom_job
+  - match: { closed: true }
+
+  - do:
+      ml.reset_job:
+        job_id: r56_anom_job
+  - match: { acknowledged: true }
+
+  - do:
+      ml.delete_job:
+        job_id: r56_anom_job
+  - match: { acknowledged: true }
+
+---
+"Round 56 Security Profiles/Settings/Cross-Cluster Keys, ES|QL STATS/EVAL/Columnar, Transform, GeoIP, ILM, and Resolve":
+  # F6: Security User Profiles, Dynamic Settings & Cross-Cluster API Keys
+  - do:
+      security.activate_profile:
+        body:
+          grant_type: "password"
+          username: "elastic"
+          password: "changeme"
+  - set: { uid: "${prof_uid}" }
+  - match: { enabled: true }
+
+  - do:
+      security.get_profile:
+        uid: "${prof_uid}"
+  - match: { profiles.0.uid: "${prof_uid}" }
+
+  - do:
+      security.update_profile_data:
+        uid: "${prof_uid}"
+        body:
+          labels:
+            team: "platform"
+          application:
+            theme: "dark"
+  - match: { acknowledged: true }
+
+  - do:
+      security.disable_profile:
+        uid: "${prof_uid}"
+  - match: { acknowledged: true }
+
+  - do:
+      security.enable_profile:
+        uid: "${prof_uid}"
+  - match: { acknowledged: true }
+
+  - do:
+      security.has_privileges_profile:
+        uid: "${prof_uid}"
+        body:
+          cluster: ["monitor"]
+  - is_true: ''
+
+  - do:
+      security.suggest_profiles:
+        body:
+          name: "el"
+  - is_true: ''
+
+  - do:
+      security.update_settings:
+        body:
+          index:
+            number_of_replicas: "0"
+  - match: { acknowledged: true }
+
+  - do:
+      security.get_settings: {}
+  - is_true: ''
+
+  - do:
+      security.create_cross_cluster_api_key:
+        body:
+          name: "r56_cc_key"
+          access:
+            search:
+              - names: ["logs-*"]
+  - set: { id: "${cc_key_id}" }
+  - is_true: api_key
+
+  - do:
+      security.update_cross_cluster_api_key:
+        id: "${cc_key_id}"
+        body:
+          access:
+            search:
+              - names: ["metrics-*"]
+  - is_true: ''
+
+  # F7: ES|QL STATS ... BY, EVAL, WHERE, numeric SORT, RENAME, DROP, params, and columnar: true
+  - do:
+      indices.create:
+        index: r56_esql_idx
+        body:
+          mappings:
+            properties:
+              host: { type: keyword }
+              env: { type: keyword }
+              latency: { type: integer }
+  - match: { acknowledged: true }
+
+  - do:
+      bulk:
+        index: r56_esql_idx
+        refresh: true
+        body:
+          - { index: { _id: "1" } }
+          - { host: "h1", env: "prod", latency: 20 }
+          - { index: { _id: "2" } }
+          - { host: "h1", env: "prod", latency: 35 }
+          - { index: { _id: "3" } }
+          - { host: "h2", env: "prod", latency: 10 }
+          - { index: { _id: "4" } }
+          - { host: "h3", env: "dev", latency: 99 }
+  - match: { errors: false }
+
+  - do:
+      esql.query:
+        body:
+          query: "FROM r56_esql_idx | WHERE env == ? AND latency >= ? | EVAL doubled = latency * 2 | STATS total_doubled = SUM(doubled), cnt = COUNT(*) BY host | SORT total_doubled DESC | RENAME host AS server | DROP cnt"
+          params: ["prod", 10]
+          columnar: true
+  - length: { columns: 2, values: 2 }
+  - contains: { values: ["h1", "h2"] }
+  - contains: { values: [110, 20] }
+
+  # F8 & F9: Transform sub-actions, GeoIP database CRUD, ILM migrate_to_data_tiers, resolve_cluster, and cat.help
+  - do:
+      transform.put_transform:
+        transform_id: r56_tx
+        body:
+          source:
+            index: ["r56_esql_idx"]
+          dest:
+            index: "r56_tx_dest"
+          pivot:
+            group_by:
+              host:
+                terms:
+                  field: "host"
+            aggregations:
+              avg_lat:
+                avg:
+                  field: "latency"
+  - match: { acknowledged: true }
+
+  - do:
+      transform.start_transform:
+        transform_id: r56_tx
+  - match: { acknowledged: true }
+
+  - do:
+      transform.schedule_now_transform:
+        transform_id: r56_tx
+  - match: { acknowledged: true }
+
+  - do:
+      transform.stop_transform:
+        transform_id: r56_tx
+  - match: { acknowledged: true }
+
+  - do:
+      transform.reset_transform:
+        transform_id: r56_tx
+  - match: { acknowledged: true }
+
+  - do:
+      transform.upgrade_transforms: {}
+  - is_true: ''
+
+  - do:
+      ingest.put_geoip_database:
+        id: r56-geoip-city
+        body:
+          name: "GeoLite2-City"
+          config:
+            max_mind:
+              database_file: "GeoLite2-City.mmdb"
+  - match: { acknowledged: true }
+
+  - do:
+      ingest.get_geoip_database:
+        id: r56-geoip-city
+  - is_true: databases
+
+  - do:
+      ingest.geo_ip_stats: {}
+  - gte: { stats.databases_count: 1 }
+
+  - do:
+      ingest.delete_geoip_database:
+        id: r56-geoip-city
+  - match: { acknowledged: true }
+
+  - do:
+      ilm.migrate_to_data_tiers: {}
+  - match: { acknowledged: true }
+
+  - do:
+      cluster.resolve_cluster: {}
+  - is_true: ''
+
+  - do:
+      cat.help: {}
+  - is_true: ''
 

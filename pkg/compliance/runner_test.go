@@ -1,8 +1,11 @@
 package compliance
 
 import (
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -2729,5 +2732,651 @@ func TestRound55BuildActionRequestAndOperatorsF0F1(t *testing.T) {
 		if !found {
 			t.Fatalf("expected cleanupAll to DELETE %s, got %v", wd, deletedPaths)
 		}
+	}
+}
+
+func TestRound56_ActionBuildersAndCleanup(t *testing.T) {
+	t.Parallel()
+
+	ctx := newRunnerContext(http.DefaultClient, "http://localhost:9200")
+
+	cases := []struct {
+		name          string
+		action        string
+		params        map[string]any
+		wantMethod    string
+		wantPath      string
+		strippedParam []string
+		wantQuery     map[string]string
+	}{
+		// Data Stream Lifecycle & Downsampling
+		{"indices.put_data_lifecycle", "indices.put_data_lifecycle", map[string]any{"name": "ds-1"}, http.MethodPut, "/_data_stream/ds-1/_lifecycle", []string{"name"}, nil},
+		{"indices.get_data_lifecycle", "indices.get_data_lifecycle", map[string]any{"name": "ds-1", "include_defaults": true}, http.MethodGet, "/_data_stream/ds-1/_lifecycle", []string{"name"}, map[string]string{"include_defaults": "true"}},
+		{"indices.delete_data_lifecycle", "indices.delete_data_lifecycle", map[string]any{"name": "ds-1"}, http.MethodDelete, "/_data_stream/ds-1/_lifecycle", []string{"name"}, nil},
+		{"indices.explain_data_lifecycle", "indices.explain_data_lifecycle", map[string]any{"index": "ds-1"}, http.MethodGet, "/ds-1/_lifecycle/explain", []string{"index"}, nil},
+		{"indices.downsample", "indices.downsample", map[string]any{"index": "src-idx", "target_index": "dst-idx"}, http.MethodPost, "/src-idx/_downsample/dst-idx", []string{"index", "target_index"}, nil},
+
+		// ML Data Frame Analytics & Evaluation
+		{"ml.put_data_frame_analytics", "ml.put_data_frame_analytics", map[string]any{"id": "dfa-1"}, http.MethodPut, "/_ml/data_frame/analytics/dfa-1", []string{"id"}, nil},
+		{"ml.get_data_frame_analytics specific", "ml.get_data_frame_analytics", map[string]any{"id": "dfa-1"}, http.MethodGet, "/_ml/data_frame/analytics/dfa-1", []string{"id"}, nil},
+		{"ml.get_data_frame_analytics all", "ml.get_data_frame_analytics", map[string]any{}, http.MethodGet, "/_ml/data_frame/analytics", nil, nil},
+		{"ml.get_data_frame_analytics_stats specific", "ml.get_data_frame_analytics_stats", map[string]any{"id": "dfa-1"}, http.MethodGet, "/_ml/data_frame/analytics/dfa-1/_stats", []string{"id"}, nil},
+		{"ml.get_data_frame_analytics_stats all", "ml.get_data_frame_analytics_stats", map[string]any{}, http.MethodGet, "/_ml/data_frame/analytics/_stats", nil, nil},
+		{"ml.update_data_frame_analytics", "ml.update_data_frame_analytics", map[string]any{"id": "dfa-1"}, http.MethodPost, "/_ml/data_frame/analytics/dfa-1/_update", []string{"id"}, nil},
+		{"ml.delete_data_frame_analytics", "ml.delete_data_frame_analytics", map[string]any{"id": "dfa-1", "force": true}, http.MethodDelete, "/_ml/data_frame/analytics/dfa-1", []string{"id"}, map[string]string{"force": "true"}},
+		{"ml.start_data_frame_analytics", "ml.start_data_frame_analytics", map[string]any{"id": "dfa-1"}, http.MethodPost, "/_ml/data_frame/analytics/dfa-1/_start", []string{"id"}, nil},
+		{"ml.stop_data_frame_analytics", "ml.stop_data_frame_analytics", map[string]any{"id": "dfa-1"}, http.MethodPost, "/_ml/data_frame/analytics/dfa-1/_stop", []string{"id"}, nil},
+		{"ml.preview_data_frame_analytics GET", "ml.preview_data_frame_analytics", map[string]any{"id": "dfa-1"}, http.MethodGet, "/_ml/data_frame/analytics/dfa-1/_preview", []string{"id"}, nil},
+		{"ml.preview_data_frame_analytics POST adhoc", "ml.preview_data_frame_analytics", map[string]any{"body": map[string]any{"config": map[string]any{}}}, http.MethodPost, "/_ml/data_frame/analytics/_preview", nil, nil},
+		{"ml.explain_data_frame_analytics GET", "ml.explain_data_frame_analytics", map[string]any{"id": "dfa-1"}, http.MethodGet, "/_ml/data_frame/analytics/dfa-1/_explain", []string{"id"}, nil},
+		{"ml.explain_data_frame_analytics POST adhoc", "ml.explain_data_frame_analytics", map[string]any{"body": map[string]any{"source": map[string]any{}}}, http.MethodPost, "/_ml/data_frame/analytics/_explain", nil, nil},
+		{"ml.evaluate_data_frame", "ml.evaluate_data_frame", map[string]any{}, http.MethodPost, "/_ml/data_frame/_evaluate", nil, nil},
+
+		// ML Trained Models
+		{"ml.start_trained_model_deployment", "ml.start_trained_model_deployment", map[string]any{"model_id": "tm-1", "wait_for": "started"}, http.MethodPost, "/_ml/trained_models/tm-1/deployment/_start", []string{"model_id"}, map[string]string{"wait_for": "started"}},
+		{"ml.stop_trained_model_deployment", "ml.stop_trained_model_deployment", map[string]any{"model_id": "tm-1", "force": true}, http.MethodPost, "/_ml/trained_models/tm-1/deployment/_stop", []string{"model_id"}, map[string]string{"force": "true"}},
+		{"ml.update_trained_model_deployment", "ml.update_trained_model_deployment", map[string]any{"model_id": "tm-1"}, http.MethodPost, "/_ml/trained_models/tm-1/deployment/_update", []string{"model_id"}, nil},
+		{"ml.infer_trained_model", "ml.infer_trained_model", map[string]any{"model_id": "tm-1"}, http.MethodPost, "/_ml/trained_models/tm-1/_infer", []string{"model_id"}, nil},
+		{"ml.infer_trained_model_deployment", "ml.infer_trained_model_deployment", map[string]any{"id": "tm-1"}, http.MethodPost, "/_ml/trained_models/tm-1/deployment/_infer", []string{"id"}, nil},
+		{"ml.put_trained_model_alias", "ml.put_trained_model_alias", map[string]any{"model_id": "tm-1", "model_alias": "prod"}, http.MethodPut, "/_ml/trained_models/tm-1/model_aliases/prod", []string{"model_id", "model_alias"}, nil},
+		{"ml.delete_trained_model_alias", "ml.delete_trained_model_alias", map[string]any{"model_id": "tm-1", "model_alias": "prod"}, http.MethodDelete, "/_ml/trained_models/tm-1/model_aliases/prod", []string{"model_id", "model_alias"}, nil},
+		{"ml.put_trained_model_definition_part", "ml.put_trained_model_definition_part", map[string]any{"model_id": "tm-1", "part": 0}, http.MethodPut, "/_ml/trained_models/tm-1/definition/0", []string{"model_id", "part"}, nil},
+		{"ml.put_trained_model_vocabulary", "ml.put_trained_model_vocabulary", map[string]any{"model_id": "tm-1"}, http.MethodPut, "/_ml/trained_models/tm-1/vocabulary", []string{"model_id"}, nil},
+
+		// ML Anomaly Detection
+		{"ml.flush_job", "ml.flush_job", map[string]any{"job_id": "j-1"}, http.MethodPost, "/_ml/anomaly_detectors/j-1/_flush", []string{"job_id"}, nil},
+		{"ml.post_data", "ml.post_data", map[string]any{"job_id": "j-1", "body": []any{map[string]any{"v": 1}}}, http.MethodPost, "/_ml/anomaly_detectors/j-1/_data", []string{"job_id"}, nil},
+		{"ml.reset_job", "ml.reset_job", map[string]any{"job_id": "j-1"}, http.MethodPost, "/_ml/anomaly_detectors/j-1/_reset", []string{"job_id"}, nil},
+		{"ml.forecast", "ml.forecast", map[string]any{"job_id": "j-1"}, http.MethodPost, "/_ml/anomaly_detectors/j-1/_forecast", []string{"job_id"}, nil},
+		{"ml.delete_forecast specific", "ml.delete_forecast", map[string]any{"job_id": "j-1", "forecast_id": "fc-1"}, http.MethodDelete, "/_ml/anomaly_detectors/j-1/_forecast/fc-1", []string{"job_id", "forecast_id"}, nil},
+		{"ml.delete_forecast all", "ml.delete_forecast", map[string]any{"job_id": "j-1"}, http.MethodDelete, "/_ml/anomaly_detectors/j-1/_forecast", []string{"job_id"}, nil},
+		{"ml.delete_expired_data", "ml.delete_expired_data", map[string]any{"job_id": "j-1"}, http.MethodPost, "/_ml/anomaly_detectors/j-1/_delete_expired_data", []string{"job_id"}, nil},
+		{"ml.validate", "ml.validate", map[string]any{}, http.MethodPost, "/_ml/anomaly_detectors/_validate", nil, nil},
+		{"ml.validate_detector", "ml.validate_detector", map[string]any{}, http.MethodPost, "/_ml/anomaly_detectors/_validate/detector", nil, nil},
+		{"ml.estimate_model_memory", "ml.estimate_model_memory", map[string]any{}, http.MethodPost, "/_ml/anomaly_detectors/_estimate_model_memory", nil, nil},
+		{"ml.get_buckets GET all", "ml.get_buckets", map[string]any{"job_id": "j-1"}, http.MethodGet, "/_ml/anomaly_detectors/j-1/results/buckets", []string{"job_id"}, nil},
+		{"ml.get_buckets POST ts", "ml.get_buckets", map[string]any{"job_id": "j-1", "timestamp": "1700000000", "body": map[string]any{"expand": true}}, http.MethodPost, "/_ml/anomaly_detectors/j-1/results/buckets/1700000000", []string{"job_id", "timestamp"}, nil},
+		{"ml.get_overall_buckets GET", "ml.get_overall_buckets", map[string]any{"job_id": "j-1"}, http.MethodGet, "/_ml/anomaly_detectors/j-1/results/overall_buckets", []string{"job_id"}, nil},
+		{"ml.get_overall_buckets POST", "ml.get_overall_buckets", map[string]any{"job_id": "j-1", "body": map[string]any{"top_n": 2}}, http.MethodPost, "/_ml/anomaly_detectors/j-1/results/overall_buckets", []string{"job_id"}, nil},
+		{"ml.get_records GET", "ml.get_records", map[string]any{"job_id": "j-1"}, http.MethodGet, "/_ml/anomaly_detectors/j-1/results/records", []string{"job_id"}, nil},
+		{"ml.get_records POST", "ml.get_records", map[string]any{"job_id": "j-1", "body": map[string]any{"record_score": 50}}, http.MethodPost, "/_ml/anomaly_detectors/j-1/results/records", []string{"job_id"}, nil},
+		{"ml.get_categories all", "ml.get_categories", map[string]any{"job_id": "j-1"}, http.MethodGet, "/_ml/anomaly_detectors/j-1/results/categories", []string{"job_id"}, nil},
+		{"ml.get_categories specific POST", "ml.get_categories", map[string]any{"job_id": "j-1", "category_id": 3, "body": map[string]any{}}, http.MethodPost, "/_ml/anomaly_detectors/j-1/results/categories/3", []string{"job_id", "category_id"}, nil},
+		{"ml.get_influencers GET", "ml.get_influencers", map[string]any{"job_id": "j-1"}, http.MethodGet, "/_ml/anomaly_detectors/j-1/results/influencers", []string{"job_id"}, nil},
+		{"ml.get_influencers POST", "ml.get_influencers", map[string]any{"job_id": "j-1", "body": map[string]any{}}, http.MethodPost, "/_ml/anomaly_detectors/j-1/results/influencers", []string{"job_id"}, nil},
+		{"ml.get_model_snapshots all", "ml.get_model_snapshots", map[string]any{"job_id": "j-1"}, http.MethodGet, "/_ml/anomaly_detectors/j-1/model_snapshots", []string{"job_id"}, nil},
+		{"ml.get_model_snapshots specific POST", "ml.get_model_snapshots", map[string]any{"job_id": "j-1", "snapshot_id": "s-1", "body": map[string]any{}}, http.MethodPost, "/_ml/anomaly_detectors/j-1/model_snapshots/s-1", []string{"job_id", "snapshot_id"}, nil},
+		{"ml.update_model_snapshot", "ml.update_model_snapshot", map[string]any{"job_id": "j-1", "snapshot_id": "s-1"}, http.MethodPost, "/_ml/anomaly_detectors/j-1/model_snapshots/s-1/_update", []string{"job_id", "snapshot_id"}, nil},
+		{"ml.delete_model_snapshot", "ml.delete_model_snapshot", map[string]any{"job_id": "j-1", "snapshot_id": "s-1"}, http.MethodDelete, "/_ml/anomaly_detectors/j-1/model_snapshots/s-1", []string{"job_id", "snapshot_id"}, nil},
+		{"ml.revert_model_snapshot", "ml.revert_model_snapshot", map[string]any{"job_id": "j-1", "snapshot_id": "s-1"}, http.MethodPost, "/_ml/anomaly_detectors/j-1/model_snapshots/s-1/_revert", []string{"job_id", "snapshot_id"}, nil},
+
+		// Security Profiles, Settings & Cross-Cluster API Keys
+		{"security.activate_profile", "security.activate_profile", map[string]any{}, http.MethodPost, "/_security/profile/_activate", nil, nil},
+		{"security.get_profile", "security.get_profile", map[string]any{"uid": "u_1", "data": "*"}, http.MethodGet, "/_security/profile/u_1", []string{"uid"}, map[string]string{"data": "*"}},
+		{"security.update_profile_data", "security.update_profile_data", map[string]any{"uid": "u_1"}, http.MethodPost, "/_security/profile/u_1/_data", []string{"uid"}, nil},
+		{"security.enable_profile", "security.enable_profile", map[string]any{"uid": "u_1"}, http.MethodPut, "/_security/profile/u_1/_enable", []string{"uid"}, nil},
+		{"security.disable_profile", "security.disable_profile", map[string]any{"uid": "u_1"}, http.MethodPut, "/_security/profile/u_1/_disable", []string{"uid"}, nil},
+		{"security.suggest_profiles", "security.suggest_profiles", map[string]any{}, http.MethodPost, "/_security/_suggest_profiles", nil, nil},
+		{"security.has_privileges_profile GET", "security.has_privileges_profile", map[string]any{"uid": "u_1"}, http.MethodGet, "/_security/profile/u_1/_has_privileges", []string{"uid"}, nil},
+		{"security.has_privileges_profile POST", "security.has_privileges_profile", map[string]any{"uid": "u_1", "body": map[string]any{"cluster": []any{"all"}}}, http.MethodPost, "/_security/profile/u_1/_has_privileges", []string{"uid"}, nil},
+		{"security.get_settings", "security.get_settings", map[string]any{}, http.MethodGet, "/_security/settings", nil, nil},
+		{"security.update_settings", "security.update_settings", map[string]any{}, http.MethodPut, "/_security/settings", nil, nil},
+		{"security.create_cross_cluster_api_key", "security.create_cross_cluster_api_key", map[string]any{}, http.MethodPost, "/_security/cross_cluster/api_key", nil, nil},
+		{"security.update_cross_cluster_api_key", "security.update_cross_cluster_api_key", map[string]any{"id": "cck-1"}, http.MethodPut, "/_security/cross_cluster/api_key/cck-1", []string{"id"}, nil},
+
+		// Transform, GeoIP, ILM, Cross-Cluster Resolve & Cat
+		{"transform.reset_transform", "transform.reset_transform", map[string]any{"transform_id": "tx-1", "force": true}, http.MethodPost, "/_transform/tx-1/_reset", []string{"transform_id"}, map[string]string{"force": "true"}},
+		{"transform.upgrade_transforms", "transform.upgrade_transforms", map[string]any{"dry_run": true}, http.MethodPost, "/_transform/_upgrade", nil, map[string]string{"dry_run": "true"}},
+		{"transform.schedule_now_transform", "transform.schedule_now_transform", map[string]any{"transform_id": "tx-1"}, http.MethodPost, "/_transform/tx-1/_schedule_now", []string{"transform_id"}, nil},
+		{"ingest.put_geoip_database", "ingest.put_geoip_database", map[string]any{"id": "db-1"}, http.MethodPut, "/_ingest/geoip/database/db-1", []string{"id"}, nil},
+		{"ingest.get_geoip_database specific", "ingest.get_geoip_database", map[string]any{"id": "db-1"}, http.MethodGet, "/_ingest/geoip/database/db-1", []string{"id"}, nil},
+		{"ingest.get_geoip_database all", "ingest.get_geoip_database", map[string]any{}, http.MethodGet, "/_ingest/geoip/database", nil, nil},
+		{"ingest.delete_geoip_database", "ingest.delete_geoip_database", map[string]any{"id": "db-1"}, http.MethodDelete, "/_ingest/geoip/database/db-1", []string{"id"}, nil},
+		{"ilm.migrate_to_data_tiers", "ilm.migrate_to_data_tiers", map[string]any{"dry_run": true}, http.MethodPost, "/_ilm/migrate_to_data_tiers", nil, map[string]string{"dry_run": "true"}},
+		{"cluster.resolve_cluster all", "cluster.resolve_cluster", map[string]any{}, http.MethodGet, "/_resolve/cluster", nil, nil},
+		{"indices.resolve_cluster named", "indices.resolve_cluster", map[string]any{"name": "remote*"}, http.MethodGet, "/_resolve/cluster/remote*", []string{"name"}, nil},
+		{"cat.help", "cat.help", map[string]any{}, http.MethodGet, "/_cat", nil, map[string]string{"help": ""}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec, err := ctx.buildActionRequest(tc.action, tc.params)
+			if err != nil {
+				t.Fatalf("buildActionRequest(%q, %v) unexpected error: %v", tc.action, tc.params, err)
+			}
+			if spec.method != tc.wantMethod {
+				t.Errorf("method: got %q, want %q", spec.method, tc.wantMethod)
+			}
+			if spec.path != tc.wantPath {
+				t.Errorf("path: got %q, want %q", spec.path, tc.wantPath)
+			}
+			for _, stripped := range tc.strippedParam {
+				if spec.query.Has(stripped) {
+					t.Errorf("expected param %q stripped from query, got %v", stripped, spec.query)
+				}
+			}
+			for k, wantV := range tc.wantQuery {
+				if !spec.query.Has(k) || spec.query.Get(k) != wantV {
+					t.Errorf("query[%q]: got %q (has=%v), want %q", k, spec.query.Get(k), spec.query.Has(k), wantV)
+				}
+			}
+			if tc.action == "ml.post_data" && !strings.HasSuffix(string(spec.body), "\n") {
+				t.Errorf("expected ml.post_data NDJSON body to end with newline, got %q", string(spec.body))
+			}
+		})
+	}
+
+	missingParamActions := []string{
+		"indices.put_data_lifecycle",
+		"indices.get_data_lifecycle",
+		"indices.delete_data_lifecycle",
+		"indices.explain_data_lifecycle",
+		"indices.downsample",
+		"ml.put_data_frame_analytics",
+		"ml.update_data_frame_analytics",
+		"ml.delete_data_frame_analytics",
+		"ml.start_data_frame_analytics",
+		"ml.stop_data_frame_analytics",
+		"ml.start_trained_model_deployment",
+		"ml.stop_trained_model_deployment",
+		"ml.update_trained_model_deployment",
+		"ml.infer_trained_model",
+		"ml.infer_trained_model_deployment",
+		"ml.put_trained_model_alias",
+		"ml.delete_trained_model_alias",
+		"ml.put_trained_model_definition_part",
+		"ml.put_trained_model_vocabulary",
+		"ml.flush_job",
+		"ml.post_data",
+		"ml.reset_job",
+		"ml.forecast",
+		"ml.delete_forecast",
+		"ml.delete_expired_data",
+		"ml.get_buckets",
+		"ml.get_overall_buckets",
+		"ml.get_records",
+		"ml.get_categories",
+		"ml.get_influencers",
+		"ml.get_model_snapshots",
+		"ml.update_model_snapshot",
+		"ml.delete_model_snapshot",
+		"ml.revert_model_snapshot",
+		"security.get_profile",
+		"security.update_profile_data",
+		"security.enable_profile",
+		"security.disable_profile",
+		"security.has_privileges_profile",
+		"security.update_cross_cluster_api_key",
+		"transform.reset_transform",
+		"transform.schedule_now_transform",
+		"ingest.put_geoip_database",
+		"ingest.delete_geoip_database",
+	}
+	for _, act := range missingParamActions {
+		if _, err := ctx.buildActionRequest(act, map[string]any{}); err == nil {
+			t.Errorf("expected error for %s with empty params", act)
+		}
+	}
+
+	// Test dependency-ordered cleanupAll via httptest.Server
+	type recordedCall struct {
+		method string
+		path   string
+		query  string
+		body   string
+	}
+	var mu sync.Mutex
+	var calls []recordedCall
+	keySeq := 0
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		calls = append(calls, recordedCall{
+			method: r.Method,
+			path:   r.URL.Path,
+			query:  r.URL.RawQuery,
+			body:   string(bodyBytes),
+		})
+		var resp string
+		switch r.URL.Path {
+		case "/_security/api_key", "/_security/api_key/_grant", "/_security/cross_cluster/api_key":
+			if r.Method == http.MethodPost {
+				keySeq++
+				resp = fmt.Sprintf(`{"id":"ak-%d","api_key":"secret"}`, keySeq)
+			}
+		}
+		mu.Unlock()
+		if resp == "" {
+			resp = `{"acknowledged":true}`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(resp))
+	}))
+	defer ts.Close()
+
+	cleanCtx := newRunnerContext(ts.Client(), ts.URL)
+	setupActions := []struct {
+		action string
+		params map[string]any
+	}{
+		{"ml.put_data_frame_analytics", map[string]any{
+			"id":   "dfa-job-1",
+			"body": map[string]any{"dest": map[string]any{"index": "dfa-dest-idx"}},
+		}},
+		{"ml.put_trained_model", map[string]any{"model_id": "tm-order-1"}},
+		{"ml.start_trained_model_deployment", map[string]any{"model_id": "tm-order-1"}},
+		{"ml.put_trained_model_alias", map[string]any{"model_id": "tm-order-1", "model_alias": "tm-alias-1"}},
+		{"indices.downsample", map[string]any{"index": "ds-src-idx", "target_index": "ds-target-idx"}},
+		{"ingest.put_geoip_database", map[string]any{"id": "geo-db-1"}},
+		{"security.create_api_key", map[string]any{"body": map[string]any{"name": "k1"}}},
+		{"security.grant_api_key", map[string]any{"body": map[string]any{"grant_type": "password"}}},
+		{"security.create_cross_cluster_api_key", map[string]any{"body": map[string]any{"name": "k3"}}},
+		{"security.update_settings", map[string]any{"body": map[string]any{"index.number_of_replicas": "0"}}},
+	}
+	for _, sa := range setupActions {
+		step := &OrderedMap{
+			Fields: []YAMLField{
+				{Key: sa.action, Value: sa.params},
+			},
+		}
+		if err := cleanCtx.execDo(step, false); err != nil {
+			t.Fatalf("execDo(%s) failed: %v", sa.action, err)
+		}
+	}
+
+	mu.Lock()
+	calls = nil
+	mu.Unlock()
+
+	cleanCtx.cleanupAll()
+
+	mu.Lock()
+	recorded := append([]recordedCall(nil), calls...)
+	mu.Unlock()
+
+	indexOfCall := func(method, path string) int {
+		for i, rc := range recorded {
+			if rc.method == method && rc.path == path {
+				return i
+			}
+		}
+		return -1
+	}
+
+	dfaStopIdx := indexOfCall(http.MethodPost, "/_ml/data_frame/analytics/dfa-job-1/_stop")
+	dfaDelIdx := indexOfCall(http.MethodDelete, "/_ml/data_frame/analytics/dfa-job-1")
+	dfaDestDelIdx := indexOfCall(http.MethodDelete, "/dfa-dest-idx")
+	if dfaStopIdx < 0 || dfaDelIdx < 0 || dfaStopIdx >= dfaDelIdx {
+		t.Fatalf("expected DFA stop before DFA delete, got stop=%d del=%d calls=%+v", dfaStopIdx, dfaDelIdx, recorded)
+	}
+	if dfaDelIdx >= dfaDestDelIdx {
+		t.Fatalf("expected DFA delete before dest.index delete, got dfaDel=%d destDel=%d", dfaDelIdx, dfaDestDelIdx)
+	}
+
+	depStopIdx := indexOfCall(http.MethodPost, "/_ml/trained_models/tm-order-1/deployment/_stop")
+	aliasDelIdx := indexOfCall(http.MethodDelete, "/_ml/trained_models/tm-order-1/model_aliases/tm-alias-1")
+	modelDelIdx := indexOfCall(http.MethodDelete, "/_ml/trained_models/tm-order-1")
+	if depStopIdx < 0 || aliasDelIdx < 0 || modelDelIdx < 0 {
+		t.Fatalf("missing trained model teardown calls: depStop=%d aliasDel=%d modelDel=%d", depStopIdx, aliasDelIdx, modelDelIdx)
+	}
+	if depStopIdx >= modelDelIdx || aliasDelIdx >= modelDelIdx {
+		t.Fatalf("expected deployment stop (%d) and alias delete (%d) strictly before model delete (%d)", depStopIdx, aliasDelIdx, modelDelIdx)
+	}
+
+	if indexOfCall(http.MethodDelete, "/ds-target-idx") < 0 {
+		t.Fatalf("expected downsampled target_index to be deleted in cleanupAll")
+	}
+	if indexOfCall(http.MethodDelete, "/_ingest/geoip/database/geo-db-1") < 0 {
+		t.Fatalf("expected geoip database to be deleted in cleanupAll")
+	}
+	apiKeyDelIdx := indexOfCall(http.MethodDelete, "/_security/api_key")
+	if apiKeyDelIdx < 0 || !strings.Contains(recorded[apiKeyDelIdx].body, `"ak-1"`) || !strings.Contains(recorded[apiKeyDelIdx].body, `"ak-2"`) || !strings.Contains(recorded[apiKeyDelIdx].body, `"ak-3"`) {
+		t.Fatalf("expected DELETE /_security/api_key with ak-1..ak-3, got idx=%d calls=%+v", apiKeyDelIdx, recorded)
+	}
+	if indexOfCall(http.MethodPut, "/_security/settings") < 0 {
+		t.Fatalf("expected PUT /_security/settings reset in cleanupAll")
+	}
+
+	// Verify embedded Round 56 YAML specs parse cleanly and every Round 56 `do` action builds without errors
+	dryCtx := newRunnerContext(http.DefaultClient, "http://localhost:9200")
+	dryCtx.stash["src_idx"] = "r56_ts_src"
+	dryCtx.stash["special_doc_id"] = "doc#1?tag=alpha 2"
+	dryCtx.stash["fc_id"] = "fc-1"
+	dryCtx.stash["prof_uid"] = "u_elastic"
+	dryCtx.stash["cc_key_id"] = "cck-1"
+
+	for _, specPath := range []string{"specs/90_ingest_pipelines.yml", "specs/98_advanced_features.yml"} {
+		rawBytes, readErr := EmbeddedSpecsFS.ReadFile(specPath)
+		if readErr != nil {
+			t.Fatalf("failed reading embedded %s: %v", specPath, readErr)
+		}
+		doc, parseErr := ParseSpecFile(string(rawBytes))
+		if parseErr != nil {
+			t.Fatalf("failed parsing embedded %s: %v", specPath, parseErr)
+		}
+		if len(doc.Sections) == 0 {
+			t.Fatalf("expected non-empty sections in %s", specPath)
+		}
+		for _, sec := range doc.Sections {
+			if !strings.Contains(sec.Name, "Round 56") {
+				continue
+			}
+			for si, st := range sec.Steps {
+				if st.Op != "do" {
+					continue
+				}
+				om, ok := st.Value.(*OrderedMap)
+				if !ok {
+					t.Fatalf("%s [%s] step %d: expected OrderedMap for do step", specPath, sec.Name, si+1)
+				}
+				var actName string
+				var actParams any
+				for _, f := range om.Fields {
+					switch f.Key {
+					case "catch", "headers", "ignore", "warnings", "warning_headers", "warnings_regex", "allowed_warnings", "allowed_warnings_regex", "node_selector":
+					default:
+						actName = f.Key
+						actParams = f.Value
+					}
+				}
+				pm, _ := ToNative(dryCtx.expandStash(actParams)).(map[string]any)
+				if pm == nil {
+					pm = map[string]any{}
+				}
+				if _, bErr := dryCtx.buildActionRequest(actName, pm); bErr != nil {
+					t.Fatalf("%s [%s] step %d (%s): buildActionRequest failed: %v", specPath, sec.Name, si+1, actName, bErr)
+				}
+			}
+		}
+	}
+}
+
+func TestRound56_RunnerFeaturesArbitraryKeyBracedStashVersionCatchAndEscaping(t *testing.T) {
+	t.Parallel()
+
+	// 1. Verify _arbitrary_key_ in lookupResponsePath, set, match, contains, and not_contains
+	ctx := newRunnerContext(http.DefaultClient, "http://localhost:9200")
+	ctx.lastMethod = http.MethodGet
+	ctx.lastStatus = http.StatusOK
+	ctx.lastResponse = map[string]any{
+		"nodes": map[string]any{
+			"node-alpha": map[string]any{
+				"name": "es-alpha",
+				"role": "master",
+			},
+			"node-beta": map[string]any{
+				"name": "es-beta",
+				"role": "data",
+			},
+		},
+		"single_wrap": map[string]any{
+			"explicit": "fixed",
+			"dyn_uuid": map[string]any{
+				"status": "green",
+			},
+		},
+		"bucket_list": []any{
+			map[string]any{
+				"by_host": map[string]any{
+					"host-99": map[string]any{"count": int64(42)},
+				},
+			},
+		},
+		"empty_obj":  map[string]any{},
+		"false_bool": false,
+		"null_field": nil,
+		"true_bool":  true,
+	}
+
+	if err := ctx.execSet(map[string]any{
+		"nodes._arbitrary_key_.name": "${first_node_name}",
+	}); err != nil {
+		t.Fatalf("execSet with _arbitrary_key_ and braced target failed: %v", err)
+	}
+	if ctx.stash["first_node_name"] != "es-alpha" {
+		t.Fatalf("expected deterministic sorted first key 'es-alpha', got %v", ctx.stash["first_node_name"])
+	}
+
+	// Multi-entry _arbitrary_key_ match should succeed even when matching the second sorted key ("data")
+	if err := ctx.execMatch(map[string]any{
+		"nodes._arbitrary_key_.role": "data",
+		"single_wrap": map[string]any{
+			"explicit":        "fixed",
+			"_arbitrary_key_": map[string]any{"status": "green"},
+		},
+	}); err != nil {
+		t.Fatalf("execMatch with _arbitrary_key_ failed: %v", err)
+	}
+	if err := ctx.execMatch(map[string]any{
+		"empty_obj": map[string]any{"_arbitrary_key_": "anything"},
+	}); err == nil {
+		t.Fatalf("expected _arbitrary_key_ match against empty map to fail")
+	}
+
+	if err := ctx.execContains(map[string]any{
+		"bucket_list": map[string]any{
+			"by_host": map[string]any{
+				"_arbitrary_key_": map[string]any{"count": int64(42)},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("execContains with _arbitrary_key_ failed: %v", err)
+	}
+	if err := ctx.execNotContains(map[string]any{
+		"bucket_list": map[string]any{
+			"by_host": map[string]any{
+				"_arbitrary_key_": map[string]any{"count": int64(999)},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("execNotContains with _arbitrary_key_ failed: %v", err)
+	}
+
+	// 2. Braced ${var} stash preservation, string interpolation, dotted stash, and transform_and_set
+	ctx.stash["num_val"] = int64(77)
+	ctx.stash["bool_val"] = true
+	ctx.stash["idx"] = "r56.logs"
+	ctx.stash["nested_cfg"] = map[string]any{"env": "staging"}
+	ctx.stash["arr_items"] = []any{"x", "y", "z"}
+
+	if got := ctx.expandStash("${num_val}"); got != int64(77) {
+		t.Fatalf("expected whole-string ${num_val} to preserve int64(77), got %v (%T)", got, got)
+	}
+	if got := ctx.expandStash("${bool_val}"); got != true {
+		t.Fatalf("expected whole-string ${bool_val} to preserve bool(true), got %v (%T)", got, got)
+	}
+	if got := ctx.expandStash("${idx}_downsampled_${nested_cfg.env}"); got != "r56.logs_downsampled_staging" {
+		t.Fatalf("unexpected braced string interpolation: %v", got)
+	}
+	if val, ok := ctx.lookupResponsePath("${arr_items}.-1"); !ok || val != "z" {
+		t.Fatalf("expected ${arr_items}.-1 = 'z', got (%v, %v)", val, ok)
+	}
+	if err := ctx.execTransformAndSet(map[string]any{
+		"${upper_env}": "upper(${nested_cfg.env})",
+		"${joined_id}": `concat("${idx}", "-", "${upper_env}")`,
+	}); err != nil {
+		t.Fatalf("execTransformAndSet with braced vars failed: %v", err)
+	}
+	if ctx.stash["upper_env"] != "STAGING" {
+		t.Fatalf("expected upper_env='STAGING', got %v", ctx.stash["upper_env"])
+	}
+
+	// 3. Multi-range and exact single-version skip.version
+	if !versionInRange("7.10.2", "6.0.0 - 6.8.99, 7.10.0 - 7.10.99, 8.0.0 - 8.3.0") {
+		t.Fatalf("expected multi-range versionInRange to match middle range")
+	}
+	if !versionInRange("7.10.2", "8.0.0 - 8.2.0, 7.10.2") {
+		t.Fatalf("expected multi-range versionInRange to match exact single version")
+	}
+	if versionInRange("7.10.2", " - 7.9.99, 7.11.0 - 8.5.0") {
+		t.Fatalf("expected multi-range versionInRange not to match disjoint ranges")
+	}
+	skipErr := ctx.execStep(SpecStep{
+		Op: "skip",
+		Value: map[string]any{
+			"version":  "6.0.0 - 6.8.99, 7.10.2",
+			"reason":   "skip exact target",
+			"features": "is_unset",
+		},
+	}, false)
+	if skipErr == nil {
+		t.Fatalf("expected skip step to skip when comma-separated version matches proxyTargetVersion")
+	}
+
+	// 4. is_unset step
+	for _, p := range []string{"missing_path", "null_field", "false_bool"} {
+		if err := ctx.execStep(SpecStep{Op: "is_unset", Value: p}, false); err != nil {
+			t.Fatalf("expected is_unset(%q) to pass, got %v", p, err)
+		}
+	}
+	if err := ctx.execStep(SpecStep{Op: "is_unset", Value: "true_bool"}, false); err == nil {
+		t.Fatalf("expected is_unset(true_bool) to fail")
+	}
+
+	// 5. Named catch HTTP status tokens + URL path escaping for '#', '?', '%', space, and '/' in document IDs
+	var mu sync.Mutex
+	var gotPath, gotRawPath, gotRawQuery string
+	statusOverride := 0
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotPath = r.URL.Path
+		gotRawPath = r.URL.RawPath
+		gotRawQuery = r.URL.RawQuery
+		code := statusOverride
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if code != 0 {
+			w.WriteHeader(code)
+			_, _ = w.Write([]byte(`{"error":{"type":"test_err","reason":"forced"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"_id":"ok","found":true}`))
+	}))
+	defer ts.Close()
+
+	httpCtx := newRunnerContext(ts.Client(), ts.URL)
+
+	catchCases := []struct {
+		token string
+		code  int
+	}{
+		{"not_acceptable", http.StatusNotAcceptable},
+		{"request_entity_too_large", http.StatusRequestEntityTooLarge},
+		{"payload_too_large", http.StatusRequestEntityTooLarge},
+		{"unsupported_media_type", http.StatusUnsupportedMediaType},
+		{"unprocessable_entity", http.StatusUnprocessableEntity},
+		{"too_many_requests", http.StatusTooManyRequests},
+		{"not_implemented", http.StatusNotImplemented},
+	}
+	for _, cc := range catchCases {
+		mu.Lock()
+		statusOverride = cc.code
+		mu.Unlock()
+		step := &OrderedMap{
+			Fields: []YAMLField{
+				{Key: "catch", Value: cc.token},
+				{Key: "info", Value: map[string]any{}},
+			},
+		}
+		if err := httpCtx.execDo(step, false); err != nil {
+			t.Fatalf("catch %q (HTTP %d) unexpectedly failed: %v", cc.token, cc.code, err)
+		}
+		mu.Lock()
+		statusOverride = http.StatusInternalServerError
+		mu.Unlock()
+		if err := httpCtx.execDo(step, false); err == nil {
+			t.Fatalf("expected catch %q to fail when server returns 500", cc.token)
+		}
+	}
+
+	mu.Lock()
+	statusOverride = 0
+	mu.Unlock()
+
+	trickyID := "doc#1?a=b 2%z/sub"
+	for _, docAction := range []string{"index", "get", "delete", "update", "explain", "termvectors"} {
+		step := &OrderedMap{
+			Fields: []YAMLField{
+				{Key: docAction, Value: map[string]any{
+					"index":   "r56_esc_idx",
+					"id":      trickyID,
+					"refresh": "true",
+					"body":    map[string]any{"x": 1},
+				}},
+			},
+		}
+		if err := httpCtx.execDo(step, false); err != nil {
+			t.Fatalf("execDo(%s) with tricky ID failed: %v", docAction, err)
+		}
+		mu.Lock()
+		p, rp, rq := gotPath, gotRawPath, gotRawQuery
+		mu.Unlock()
+		if !strings.HasSuffix(p, "/"+trickyID) {
+			t.Fatalf("%s decoded URL.Path = %q, expected suffix /%s", docAction, p, trickyID)
+		}
+		if !strings.Contains(rp, "doc%231%3Fa=b%202%25z%2Fsub") {
+			t.Fatalf("%s RawPath = %q, expected percent-encoded tricky ID", docAction, rp)
+		}
+		if rq != "refresh=true" {
+			t.Fatalf("%s RawQuery = %q, expected 'refresh=true' without leaked ID query", docAction, rq)
+		}
+	}
+
+	// Ensure multi-index commas and wildcards stay unescaped in path
+	multiStep := &OrderedMap{
+		Fields: []YAMLField{
+			{Key: "search", Value: map[string]any{"index": "idx1,logs-*"}},
+		},
+	}
+	if err := httpCtx.execDo(multiStep, false); err != nil {
+		t.Fatalf("search with multi-index wildcard failed: %v", err)
+	}
+	mu.Lock()
+	finalPath := gotPath
+	mu.Unlock()
+	if finalPath != "/idx1,logs-*/_search" {
+		t.Fatalf("expected /idx1,logs-*/_search, got %q", finalPath)
+	}
+
+	// Exercise _arbitrary_key_ across is_empty, not_contains, is_false, and array index traversal
+	ctx.lastResponse = map[string]any{
+		"nodes": map[string]any{
+			"nodeA": map[string]any{
+				"roles":   []any{"data", "ingest"},
+				"empty_a": []any{},
+				"empty_m": map[string]any{},
+				"empty_s": "",
+				"flag":    false,
+			},
+			"nodeB": map[string]any{
+				"roles":   []any{"master"},
+				"empty_a": []any{},
+				"empty_m": map[string]any{},
+				"empty_s": "",
+				"flag":    false,
+			},
+		},
+		"dotted.key": "dval",
+	}
+	for _, k := range []string{"nodes._arbitrary_key_.empty_a", "nodes._arbitrary_key_.empty_m", "nodes._arbitrary_key_.empty_s", "nodes._arbitrary_key_.missing_field"} {
+		if err := ctx.execIsEmpty(k); err != nil {
+			t.Fatalf("execIsEmpty(%s) failed: %v", k, err)
+		}
+	}
+	if err := ctx.execIsFalse("nodes._arbitrary_key_.flag"); err != nil {
+		t.Fatalf("execIsFalse wildcard failed: %v", err)
+	}
+	ncStep := NewOrderedMap()
+	ncStep.Set("nodes._arbitrary_key_.roles", "ml")
+	if err := ctx.execNotContains(ncStep); err != nil {
+		t.Fatalf("execNotContains wildcard failed: %v", err)
+	}
+	matchDotted := NewOrderedMap()
+	matchDotted.Set(`dotted\.key`, "dval")
+	if err := ctx.execMatch(matchDotted); err != nil {
+		t.Fatalf("execMatch dotted fallback failed: %v", err)
 	}
 }
