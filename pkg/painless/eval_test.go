@@ -19,6 +19,8 @@ package painless
 
 import (
 	"encoding/json"
+	"math"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -4998,6 +5000,743 @@ func TestRound53F20ToF26Features(t *testing.T) {
 		m := got.(map[string]any)
 		if m["bsEmpty"] != true || m["firstRowD"] != float64(0.5) {
 			t.Fatalf("unexpected extended branch results: %#v", m)
+		}
+	})
+}
+
+func TestRound54F20ToF26Features(t *testing.T) {
+	evalOut := func(t *testing.T, script string, params map[string]any) any {
+		t.Helper()
+		doc := map[string]any{}
+		if _, err := Eval(doc, script, params); err != nil {
+			t.Fatalf("Eval failed for script:\n%s\nerr: %v", script, err)
+		}
+		return doc["out"]
+	}
+
+	t.Run("F20_Optional_FirstClass_TypeFidelity_And_Methods", func(t *testing.T) {
+		got := evalOut(t, `
+			Optional oStr = Optional.of("abc");
+			Optional oEmpty = Optional.empty();
+			Optional oNull = Optional.ofNullable(null);
+			Optional oPres = Optional.ofNullable("xyz");
+			OptionalInt oiPres = OptionalInt.of(42);
+			OptionalInt oiEmpty = OptionalInt.empty();
+			OptionalLong olPres = OptionalLong.of(10000000000L);
+			OptionalLong olEmpty = OptionalLong.empty();
+			OptionalDouble odPres = OptionalDouble.of(3.5);
+			OptionalDouble odEmpty = OptionalDouble.empty();
+
+			boolean instStr = "abc" instanceof Optional;
+			boolean instOpt = oStr instanceof Optional;
+			boolean instOptEmpty = oEmpty instanceof Optional;
+			boolean instOi = oiPres instanceof OptionalInt;
+			boolean instOiWrong = oStr instanceof OptionalInt;
+			boolean instOl = olPres instanceof OptionalLong;
+			boolean instOd = odPres instanceof OptionalDouble;
+
+			boolean eqOptRaw = oStr.equals("abc");
+			boolean eqOptSame = oStr.equals(Optional.of("abc"));
+			boolean eqOptDiff = oStr.equals(Optional.of("def"));
+			boolean eqEmptySame = oEmpty.equals(oNull);
+			boolean eqEmptyDiffKind = oEmpty.equals(oiEmpty);
+			boolean eqOiSame = oiPres.equals(OptionalInt.of(42));
+
+			int hcPres = oStr.hashCode();
+			int hcEmpty = oEmpty.hashCode();
+			int hcOi = oiPres.hashCode();
+
+			List sideEffects = new ArrayList();
+			oStr.ifPresent(v -> sideEffects.add("ifp:" + v));
+			oEmpty.ifPresent(v -> sideEffects.add("never"));
+			oStr.ifPresentOrElse(v -> sideEffects.add("ifpe1:" + v), () -> sideEffects.add("never"));
+			oEmpty.ifPresentOrElse(v -> sideEffects.add("never"), () -> sideEffects.add("ifpe2:empty"));
+			oiPres.ifPresent(v -> sideEffects.add("oi:" + v));
+			olEmpty.ifPresentOrElse(v -> sideEffects.add("never"), () -> sideEffects.add("ol:empty"));
+
+			Optional mapped = oStr.map(s -> s.toUpperCase());
+			Optional mappedNull = oStr.map(s -> null);
+			Optional mappedEmpty = oEmpty.map(s -> s.toUpperCase());
+			Optional flatMapped = oStr.flatMap(s -> Optional.of(s + "!"));
+			Optional filteredKeep = oStr.filter(s -> s.length() == 3);
+			Optional filteredDrop = oStr.filter(s -> s.length() > 10);
+			Optional orPres = oStr.or(() -> Optional.of("fallback"));
+			Optional orEmp = oEmpty.or(() -> Optional.of("fallback"));
+
+			boolean errOptNull = false;
+			try { Optional.of(null); } catch (NullPointerException e) { errOptNull = true; }
+			boolean errFlatMapNull = false;
+			try { oStr.flatMap(s -> null); } catch (NullPointerException e) { errFlatMapNull = true; }
+			boolean errOrNull = false;
+			try { oEmpty.or(() -> null); } catch (NullPointerException e) { errOrNull = true; }
+			boolean errOiGet = false;
+			try { oiEmpty.getAsInt(); } catch (NoSuchElementException e) { errOiGet = true; }
+			boolean errOlGet = false;
+			try { olEmpty.getAsLong(); } catch (NoSuchElementException e) { errOlGet = true; }
+			boolean errOdGet = false;
+			try { odEmpty.getAsDouble(); } catch (NoSuchElementException e) { errOdGet = true; }
+
+			Optional stFirst = Stream.of("a", "b").findFirst();
+			Optional stEmpty = Stream.empty().findAny();
+			OptionalInt stMaxInt = IntStream.of(3, 9, 1).max();
+			OptionalDouble stAvg = IntStream.of(2, 4).average();
+			Optional stRed = Stream.of(1, 2, 3).reduce((a, b) -> a + b);
+
+			ctx._source.out = [
+				'str_oStr': oStr.toString(),
+				'str_oEmpty': oEmpty.toString(),
+				'str_oiPres': oiPres.toString(),
+				'str_oiEmpty': oiEmpty.toString(),
+				'str_olPres': olPres.toString(),
+				'str_olEmpty': olEmpty.toString(),
+				'str_odPres': odPres.toString(),
+				'str_odEmpty': odEmpty.toString(),
+				'inst': [instStr, instOpt, instOptEmpty, instOi, instOiWrong, instOl, instOd],
+				'eq': [eqOptRaw, eqOptSame, eqOptDiff, eqEmptySame, eqEmptyDiffKind, eqOiSame],
+				'hc': [hcPres != 0, hcEmpty == 0, hcOi == 42],
+				'sideEffects': sideEffects,
+				'mapped': [mapped.toString(), mappedNull.toString(), mappedEmpty.toString(), flatMapped.toString()],
+				'filtered': [filteredKeep.isPresent(), filteredDrop.isEmpty(), orPres.get(), orEmp.get()],
+				'primVals': [oPres.get(), oiPres.getAsInt(), olPres.getAsLong(), odPres.getAsDouble(), oiEmpty.orElse(7), olEmpty.orElseGet(() -> 9L), odEmpty.orElse(1.25)],
+				'streamCnt': [oStr.stream().count(), oEmpty.stream().count(), oiPres.stream().count(), oiEmpty.stream().count()],
+				'errs': [errOptNull, errFlatMapNull, errOrNull, errOiGet, errOlGet, errOdGet],
+				'streams': [stFirst.toString(), stEmpty.toString(), stMaxInt.toString(), stAvg.toString(), stRed.toString()],
+				'cls': [oStr.getClass().getSimpleName(), oiPres.getClass().getSimpleName(), olPres.getClass().getSimpleName(), odPres.getClass().getSimpleName()]
+			];
+		`, nil)
+		m := got.(map[string]any)
+		if m["str_oStr"] != "Optional[abc]" || m["str_oEmpty"] != "Optional.empty" ||
+			m["str_oiPres"] != "OptionalInt[42]" || m["str_oiEmpty"] != "OptionalInt.empty" ||
+			m["str_olPres"] != "OptionalLong[10000000000]" || m["str_olEmpty"] != "OptionalLong.empty" ||
+			m["str_odPres"] != "OptionalDouble[3.5]" || m["str_odEmpty"] != "OptionalDouble.empty" {
+			t.Fatalf("unexpected Optional strings: %#v", m)
+		}
+		if !reflect.DeepEqual(m["inst"], []any{false, true, true, true, false, true, true}) {
+			t.Fatalf("unexpected instanceof results: %#v", m["inst"])
+		}
+		if !reflect.DeepEqual(m["eq"], []any{false, true, false, true, false, true}) {
+			t.Fatalf("unexpected equals results: %#v", m["eq"])
+		}
+		if !reflect.DeepEqual(m["errs"], []any{true, true, true, true, true, true}) {
+			t.Fatalf("unexpected exception flags: %#v", m["errs"])
+		}
+		if !reflect.DeepEqual(m["streams"], []any{"Optional[a]", "Optional.empty", "OptionalInt[9]", "OptionalDouble[3.0]", "Optional[6]"}) {
+			t.Fatalf("unexpected stream Optional results: %#v", m["streams"])
+		}
+	})
+
+	t.Run("F21_SummaryStatistics_Constructors_Accept_Combine_And_Streams", func(t *testing.T) {
+		got := evalOut(t, `
+			IntSummaryStatistics is0 = new IntSummaryStatistics();
+			long is0Min = is0.getMin();
+			long is0Max = is0.getMax();
+			is0.accept(10);
+			is0.accept(20);
+			IntSummaryStatistics is1 = new IntSummaryStatistics(2L, 5, 15, 20L);
+			is0.combine(is1);
+
+			LongSummaryStatistics ls0 = new LongSummaryStatistics();
+			long ls0Min = ls0.getMin();
+			long ls0Max = ls0.getMax();
+			ls0.accept(100L);
+			LongSummaryStatistics ls1 = new LongSummaryStatistics(1L, 50L, 50L, 50L);
+			ls0.combine(ls1);
+
+			DoubleSummaryStatistics ds0 = new DoubleSummaryStatistics();
+			boolean ds0MinInf = Double.isInfinite(ds0.getMin()) && ds0.getMin() > 0;
+			boolean ds0MaxInf = Double.isInfinite(ds0.getMax()) && ds0.getMax() < 0;
+			ds0.accept(1.5);
+			ds0.accept(2.5);
+			DoubleSummaryStatistics ds1 = new DoubleSummaryStatistics(1L, 0.5, 0.5, 0.5);
+			ds0.combine(ds1);
+
+			DoubleSummaryStatistics dStreamStats = IntStream.of(1, 2, 3).asDoubleStream().summaryStatistics();
+			LongSummaryStatistics lStreamStats = LongStream.of(10L, 30L).summaryStatistics();
+
+			boolean errNegCnt = false;
+			try { new IntSummaryStatistics(-1L, 0, 0, 0L); } catch (IllegalArgumentException e) { errNegCnt = true; }
+			boolean errMinGtMax = false;
+			try { new LongSummaryStatistics(2L, 10L, 5L, 15L); } catch (IllegalArgumentException e) { errMinGtMax = true; }
+
+			ctx._source.out = [
+				'is0Min': is0Min,
+				'is0Max': is0Max,
+				'is0': [is0.getCount(), is0.getSum(), is0.getMin(), is0.getMax(), is0.getAverage()],
+				'ls0Min': ls0Min,
+				'ls0Max': ls0Max,
+				'ls0': [ls0.getCount(), ls0.getSum(), ls0.getMin(), ls0.getMax(), ls0.getAverage()],
+				'ds0Inf': [ds0MinInf, ds0MaxInf],
+				'ds0': [ds0.getCount(), ds0.getSum(), ds0.getMin(), ds0.getMax(), ds0.getAverage()],
+				'dStream': [dStreamStats instanceof DoubleSummaryStatistics, dStreamStats.getCount(), dStreamStats.getSum()],
+				'lStream': [lStreamStats instanceof LongSummaryStatistics, lStreamStats.getCount(), lStreamStats.getSum()],
+				'inst': [is0 instanceof IntSummaryStatistics, ls0 instanceof LongSummaryStatistics, ds0 instanceof DoubleSummaryStatistics],
+				'str': is0.toString().startsWith("IntSummaryStatistics{count=4,"),
+				'errs': [errNegCnt, errMinGtMax]
+			];
+		`, nil)
+		m := got.(map[string]any)
+		if m["is0Min"] != int64(math.MaxInt32) || m["is0Max"] != int64(math.MinInt32) {
+			t.Fatalf("unexpected IntSummaryStatistics empty min/max: %#v", m)
+		}
+		if m["ls0Min"] != int64(math.MaxInt64) || m["ls0Max"] != int64(math.MinInt64) {
+			t.Fatalf("unexpected LongSummaryStatistics empty min/max: %#v", m)
+		}
+		if !reflect.DeepEqual(m["is0"], []any{int64(4), int64(50), int64(5), int64(20), float64(12.5)}) {
+			t.Fatalf("unexpected is0 stats: %#v", m["is0"])
+		}
+		if !reflect.DeepEqual(m["dStream"], []any{true, int64(3), float64(6.0)}) {
+			t.Fatalf("unexpected DoubleStream summaryStatistics: %#v", m["dStream"])
+		}
+		if !reflect.DeepEqual(m["errs"], []any{true, true}) {
+			t.Fatalf("unexpected SummaryStatistics constructor errors: %#v", m["errs"])
+		}
+	})
+
+	t.Run("F22_Objects_And_Collections_Static_Methods", func(t *testing.T) {
+		got := evalOut(t, `
+			int cmpSame = Objects.compare("a", "a", Comparator.naturalOrder());
+			int cmpNulls = Objects.compare(null, null, Comparator.naturalOrder());
+			int cmpDiff = Objects.compare(2, 5, (a, b) -> a - b);
+			String rneg1 = Objects.requireNonNullElseGet("present", () -> "fallback");
+			String rneg2 = Objects.requireNonNullElseGet(null, () -> "computed");
+			int ci = Objects.checkIndex(2, 5);
+			int cfti = Objects.checkFromToIndex(1, 4, 5);
+			int cfis = Objects.checkFromIndexSize(1, 3, 5);
+			String idStr = Objects.toIdentityString("hello");
+
+			boolean errRnegSupNull = false;
+			try { Objects.requireNonNullElseGet(null, null); } catch (NullPointerException e) { errRnegSupNull = true; }
+			boolean errRnegResNull = false;
+			try { Objects.requireNonNullElseGet(null, () -> null); } catch (NullPointerException e) { errRnegResNull = true; }
+			boolean errCi = false;
+			try { Objects.checkIndex(5, 5); } catch (IndexOutOfBoundsException e) { errCi = true; }
+			boolean errCfti = false;
+			try { Objects.checkFromToIndex(3, 2, 5); } catch (IndexOutOfBoundsException e) { errCfti = true; }
+			boolean errCfis = false;
+			try { Objects.checkFromIndexSize(3, 4, 5); } catch (IndexOutOfBoundsException e) { errCfis = true; }
+			boolean errIdNull = false;
+			try { Objects.toIdentityString(null); } catch (NullPointerException e) { errIdNull = true; }
+
+			List src = [1, 2, 3, 2, 3, 4];
+			int idxSub = Collections.indexOfSubList(src, [2, 3]);
+			int lastIdxSub = Collections.lastIndexOfSubList(src, [2, 3]);
+			int idxEmpty = Collections.indexOfSubList(src, []);
+			int idxNone = Collections.indexOfSubList(src, [9, 9]);
+
+			List target = new ArrayList([10]);
+			boolean added = Collections.addAll(target, 20, 30);
+			Collections.addAll(target, 40);
+
+			List dest = [1, 2, 3, 4];
+			Collections.copy(dest, [8, 9]);
+			boolean errCopyOob = false;
+			try { Collections.copy([1], [1, 2, 3]); } catch (IndexOutOfBoundsException e) { errCopyOob = true; }
+
+			List ul = Collections.unmodifiableList(dest);
+			Set us = Collections.unmodifiableSet(new HashSet([1, 2]));
+			Map um = Collections.unmodifiableMap(['k': 'v']);
+			List sl = Collections.synchronizedList(ul);
+			List cl = Collections.checkedList(sl, Object.class);
+
+			ctx._source.out = [
+				'cmp': [cmpSame, cmpNulls, cmpDiff < 0],
+				'rneg': [rneg1, rneg2],
+				'checks': [ci, cfti, cfis],
+				'idOk': idStr.startsWith("java.lang.String@"),
+				'errs': [errRnegSupNull, errRnegResNull, errCi, errCfti, errCfis, errIdNull, errCopyOob],
+				'sub': [idxSub, lastIdxSub, idxEmpty, idxNone],
+				'target': target,
+				'added': added,
+				'dest': dest,
+				'wrappers': [cl.size(), us.size(), um.size()]
+			];
+		`, nil)
+		m := got.(map[string]any)
+		if !reflect.DeepEqual(m["cmp"], []any{int64(0), int64(0), true}) {
+			t.Fatalf("unexpected Objects.compare: %#v", m["cmp"])
+		}
+		if !reflect.DeepEqual(m["rneg"], []any{"present", "computed"}) {
+			t.Fatalf("unexpected Objects.requireNonNullElseGet: %#v", m["rneg"])
+		}
+		if !reflect.DeepEqual(m["errs"], []any{true, true, true, true, true, true, true}) {
+			t.Fatalf("unexpected Objects/Collections error flags: %#v", m["errs"])
+		}
+		if !reflect.DeepEqual(m["sub"], []any{int64(1), int64(3), int64(0), int64(-1)}) {
+			t.Fatalf("unexpected indexOfSubList/lastIndexOfSubList: %#v", m["sub"])
+		}
+		if !reflect.DeepEqual(m["target"], []any{int64(10), int64(20), int64(30), int64(40)}) {
+			t.Fatalf("unexpected Collections.addAll target: %#v", m["target"])
+		}
+		if !reflect.DeepEqual(m["dest"], []any{int64(8), int64(9), int64(3), int64(4)}) {
+			t.Fatalf("unexpected Collections.copy dest: %#v", m["dest"])
+		}
+	})
+
+	t.Run("F23_ZoneOffset_ZoneId_Clock_And_OffsetTime", func(t *testing.T) {
+		got := evalOut(t, `
+			ZoneOffset zoMin = ZoneOffset.MIN;
+			ZoneOffset zoMax = ZoneOffset.MAX;
+			ZoneOffset zoUtc = ZoneOffset.UTC;
+			ZoneOffset zoHm = ZoneOffset.ofHoursMinutes(5, 30);
+			ZoneOffset zoHms = ZoneOffset.ofHoursMinutesSeconds(-2, -15, -30);
+			ZoneOffset zoSec = ZoneOffset.ofTotalSeconds(3600);
+			ZoneId zOfOff = ZoneId.ofOffset("UTC", zoHm);
+			Set availZones = ZoneId.getAvailableZoneIds();
+			ZoneId sysZone = ZoneId.systemDefault();
+
+			boolean errZoRange = false;
+			try { ZoneOffset.ofTotalSeconds(70000); } catch (DateTimeException e) { errZoRange = true; }
+			boolean errZoSign = false;
+			try { ZoneOffset.ofHoursMinutes(2, -10); } catch (DateTimeException e) { errZoSign = true; }
+
+			Instant baseInst = Instant.parse("2025-03-15T10:20:30Z");
+			Clock fixedClk = Clock.fixed(baseInst, ZoneOffset.UTC);
+			Clock offsetClk = Clock.offset(fixedClk, Duration.ofMinutes(5));
+			Clock tickMinClk = Clock.tick(fixedClk, Duration.ofMinutes(1));
+			Clock withZoneClk = fixedClk.withZone(ZoneId.of("+02:00"));
+			Clock sysUtcClk = Clock.systemUTC();
+			Clock sysDefClk = Clock.systemDefaultZone();
+			Clock tickSecClk = Clock.tickSeconds(ZoneOffset.UTC);
+			Clock tickMsClk = Clock.tickMillis(ZoneOffset.UTC);
+
+			String instFromClk = Instant.now(fixedClk).toString();
+			String ldFromClk = LocalDate.now(fixedClk).toString();
+			String ltFromClk = LocalTime.now(fixedClk).toString();
+			String ldtFromClk = LocalDateTime.now(fixedClk).toString();
+
+			OffsetTime ot1 = OffsetTime.of(10, 20, 30, 0, zoHm);
+			OffsetTime ot2 = OffsetTime.parse("12:00:00+02:00");
+			OffsetTime otNow = OffsetTime.now(withZoneClk);
+			OffsetTime otInst = OffsetTime.ofInstant(baseInst, ZoneId.of("+02:00"));
+			OffsetTime otPlus = ot1.plusHours(1).plusMinutes(10).plusSeconds(5).plusNanos(100).minusHours(1).minusMinutes(10).minusSeconds(5).minusNanos(100);
+			OffsetTime otWith = ot1.withHour(14).withMinute(30).withSecond(0).withNano(0);
+			OffsetTime otSameLocal = otWith.withOffsetSameLocal(ZoneOffset.UTC);
+			OffsetTime otSameInst = ot2.withOffsetSameInstant(ZoneOffset.UTC);
+			String otAtDate = otSameInst.atDate(LocalDate.of(2025, 3, 15)).toString();
+			long otEpochSec = otSameInst.toEpochSecond(LocalDate.of(1970, 1, 1));
+
+			ctx._source.out = [
+				'zo': [zoMin.getId(), zoMax.getId(), zoUtc.getId(), zoHm.getId(), zoHms.getId(), zoSec.getId(), zoHm.getTotalSeconds(), zOfOff.getId(), availZones.size() > 3, sysZone.getId().length() > 0],
+				'zoErrs': [errZoRange, errZoSign],
+				'clk': [fixedClk instanceof Clock, fixedClk.millis(), offsetClk.millis() - fixedClk.millis(), tickMinClk.instant().toString(), withZoneClk.getZone(), fixedClk.equals(Clock.fixed(baseInst, ZoneOffset.UTC)), sysUtcClk.getZone(), sysDefClk != null, tickSecClk != null, tickMsClk != null],
+				'nowClk': [instFromClk, ldFromClk, ltFromClk, ldtFromClk],
+				'ot': [
+					ot1 instanceof OffsetTime,
+					OffsetTime.MIN.toString(),
+					OffsetTime.MAX.toString(),
+					ot1.getHour(), ot1.getMinute(), ot1.getSecond(), ot1.getNano(), ot1.getOffset(),
+					ot1.toLocalTime(),
+					otNow.toString(),
+					otInst.toString(),
+					otPlus.equals(ot1),
+					otSameLocal.toString(),
+					otSameInst.toString(),
+					otAtDate,
+					otEpochSec,
+					ot1.isBefore(ot2),
+					ot2.isAfter(ot1),
+					ot2.isEqual(otSameInst),
+					ot1.compareTo(ot2) < 0
+				]
+			];
+		`, nil)
+		m := got.(map[string]any)
+		if !reflect.DeepEqual(m["zo"], []any{"-18:00", "+18:00", "Z", "+05:30", "-02:15:30", "+01:00", int64(19800), "UTC+05:30", true, true}) {
+			t.Fatalf("unexpected ZoneOffset/ZoneId results: %#v", m["zo"])
+		}
+		if !reflect.DeepEqual(m["zoErrs"], []any{true, true}) {
+			t.Fatalf("unexpected ZoneOffset error flags: %#v", m["zoErrs"])
+		}
+		if !reflect.DeepEqual(m["nowClk"], []any{"2025-03-15T10:20:30Z", "2025-03-15", "10:20:30", "2025-03-15T10:20:30"}) {
+			t.Fatalf("unexpected *.now(clock) results: %#v", m["nowClk"])
+		}
+		otSlice := m["ot"].([]any)
+		if otSlice[0] != true || otSlice[1] != "00:00-18:00" || otSlice[2] != "23:59:59.999999999+18:00" ||
+			otSlice[9] != "12:20:30+02:00" || otSlice[10] != "12:20:30+02:00" || otSlice[11] != true ||
+			otSlice[12] != "14:30Z" || otSlice[13] != "10:00Z" || otSlice[15] != int64(36000) {
+			t.Fatalf("unexpected OffsetTime results: %#v", otSlice)
+		}
+	})
+
+	t.Run("F24_Pattern_And_Matcher_Advanced_Methods", func(t *testing.T) {
+		got := evalOut(t, `
+			Pattern p = Pattern.compile("[a-z]+");
+			List splitStream = p.splitAsStream("123abc456def").collect(Collectors.toList());
+			def pred = p.asPredicate();
+			def matchPred = p.asMatchPredicate();
+			boolean p1 = pred.test("123abc456");
+			boolean p2 = pred.test("123456");
+			boolean mp1 = matchPred.test("abc");
+			boolean mp2 = matchPred.test("123abc");
+			boolean negMp1 = matchPred.negate().test("123abc");
+			List filteredByPred = Stream.of("123", "abc", "a1").filter(p.asMatchPredicate()).collect(Collectors.toList());
+
+			Pattern pNamed = Pattern.compile("(?<word>[a-z]+)(?<num>[0-9]+)");
+			Matcher m = pNamed.matcher("abc12 def34");
+			Map ng = m.namedGroups();
+			List resGroups = m.results().stream().map(mr -> mr.group(1) + ":" + mr.group(2)).collect(Collectors.toList());
+
+			m.reset("xy99");
+			boolean found = m.find();
+			def mr = m.toMatchResult();
+			int sNamed = m.start("num");
+			int eNamed = m.end("num");
+			boolean tb0 = m.hasTransparentBounds();
+			boolean ab0 = m.hasAnchoringBounds();
+			m.useTransparentBounds(true);
+			m.useAnchoringBounds(false);
+			boolean tb1 = m.hasTransparentBounds();
+			boolean ab1 = m.hasAnchoringBounds();
+			boolean he = m.hitEnd();
+			boolean re = m.requireEnd();
+
+			m.usePattern(Pattern.compile("[0-9]+"));
+			m.reset("abc42def");
+			boolean foundNew = m.find();
+			String grpNew = m.group();
+
+			boolean errUnmatchedMr = false;
+			try {
+				Matcher m2 = p.matcher("123");
+				m2.toMatchResult();
+			} catch (IllegalStateException e) {
+				errUnmatchedMr = true;
+			}
+			boolean errNullPat = false;
+			try { m.usePattern(null); } catch (IllegalArgumentException e) { errNullPat = true; }
+
+			ctx._source.out = [
+				'splitStream': splitStream,
+				'preds': [p1, p2, mp1, mp2, negMp1],
+				'filteredByPred': filteredByPred,
+				'ng': ng,
+				'resGroups': resGroups,
+				'mr': [found, mr.group(1), mr.group(2), sNamed, eNamed],
+				'bounds': [tb0, ab0, tb1, ab1, he, re],
+				'newPat': [foundNew, grpNew],
+				'errs': [errUnmatchedMr, errNullPat]
+			];
+		`, nil)
+		m := got.(map[string]any)
+		if !reflect.DeepEqual(m["splitStream"], []any{"123", "456"}) {
+			t.Fatalf("unexpected splitAsStream: %#v", m["splitStream"])
+		}
+		if !reflect.DeepEqual(m["preds"], []any{true, false, true, false, true}) {
+			t.Fatalf("unexpected Pattern predicates: %#v", m["preds"])
+		}
+		if !reflect.DeepEqual(m["filteredByPred"], []any{"abc"}) {
+			t.Fatalf("unexpected Stream.filter(Pattern.asMatchPredicate()): %#v", m["filteredByPred"])
+		}
+		if !reflect.DeepEqual(m["resGroups"], []any{"abc:12", "def:34"}) {
+			t.Fatalf("unexpected Matcher.results(): %#v", m["resGroups"])
+		}
+		if !reflect.DeepEqual(m["mr"], []any{true, "xy", "99", int64(2), int64(4)}) {
+			t.Fatalf("unexpected MatchResult & named start/end: %#v", m["mr"])
+		}
+		if !reflect.DeepEqual(m["newPat"], []any{true, "42"}) {
+			t.Fatalf("unexpected Matcher.usePattern: %#v", m["newPat"])
+		}
+		if !reflect.DeepEqual(m["errs"], []any{true, true}) {
+			t.Fatalf("unexpected Matcher exception flags: %#v", m["errs"])
+		}
+	})
+
+	t.Run("F25_UserDefined_Classes_Inheritance_Static_ToString_Equals_HashCode", func(t *testing.T) {
+		got := evalOut(t, `
+			class Base {
+				static int counter = 10;
+				int x;
+				Base(int x) {
+					this.x = x;
+					Base.counter = Base.counter + 1;
+				}
+				static int nextCount() {
+					Base.counter = Base.counter + 1;
+					return Base.counter;
+				}
+				int compute() {
+					return this.x * 2;
+				}
+				int baseOnly() {
+					return this.x + 100;
+				}
+			}
+			class Child extends Base {
+				int y;
+				Child(int x, int y) {
+					super(x);
+					this.y = y;
+				}
+				Child(int both) {
+					this(both, both * 10);
+				}
+				int compute() {
+					return super.compute() + this.y;
+				}
+				String toString() {
+					return "Child(" + this.x + "," + this.y + ")";
+				}
+				boolean equals(Object other) {
+					if (!(other instanceof Child)) {
+						return false;
+					}
+					return this.x == other.x && this.y == other.y;
+				}
+				int hashCode() {
+					return this.x * 31 + this.y;
+				}
+			}
+
+			Child c1 = new Child(3, 4);
+			Child c2 = new Child(3, 4);
+			Child c3 = new Child(5);
+			int sc1 = Base.counter;
+			int sc2 = Base.nextCount();
+			int sc3 = Child.nextCount();
+
+			Set set = new HashSet();
+			set.add(c1);
+			boolean containsC2 = set.contains(c2);
+
+			ctx._source.out = [
+				'compute1': c1.compute(),
+				'baseOnly1': c1.baseOnly(),
+				'c3': [c3.x, c3.y, c3.compute()],
+				'inst': [c1 instanceof Child, c1 instanceof Base, c1 instanceof Object],
+				'str': [c1.toString(), "" + c1, String.valueOf(c1)],
+				'eq': [c1.equals(c2), c1.equals(c3), Objects.equals(c1, c2)],
+				'hc': [c1.hashCode(), Objects.hashCode(c1)],
+				'static': [sc1, sc2, sc3],
+				'containsC2': containsC2
+			];
+		`, nil)
+		m := got.(map[string]any)
+		if m["compute1"] != int64(10) || m["baseOnly1"] != int64(103) {
+			t.Fatalf("unexpected inherited/super method results: %#v", m)
+		}
+		if !reflect.DeepEqual(m["c3"], []any{int64(5), int64(50), int64(60)}) {
+			t.Fatalf("unexpected this(...) constructor delegation: %#v", m["c3"])
+		}
+		if !reflect.DeepEqual(m["inst"], []any{true, true, true}) {
+			t.Fatalf("unexpected instanceof inheritance results: %#v", m["inst"])
+		}
+		if !reflect.DeepEqual(m["str"], []any{"Child(3,4)", "Child(3,4)", "Child(3,4)"}) {
+			t.Fatalf("unexpected user class toString results: %#v", m["str"])
+		}
+		if !reflect.DeepEqual(m["eq"], []any{true, false, true}) {
+			t.Fatalf("unexpected user class equals results: %#v", m["eq"])
+		}
+		if !reflect.DeepEqual(m["hc"], []any{int64(97), int64(97)}) {
+			t.Fatalf("unexpected user class hashCode results: %#v", m["hc"])
+		}
+		if !reflect.DeepEqual(m["static"], []any{int64(13), int64(14), int64(15)}) {
+			t.Fatalf("unexpected static field/method results: %#v", m["static"])
+		}
+		if m["containsC2"] != true {
+			t.Fatalf("expected HashSet.contains(c2) to use user equals: %#v", m)
+		}
+	})
+
+	t.Run("F26_UUID_Constructor_V1Methods_SignedCompareTo_And_URI_URL", func(t *testing.T) {
+		got := evalOut(t, `
+			UUID u1 = new UUID(0x0123456789abcdefL, 0x1122334455667788L);
+			UUID uHighBit = UUID.fromString("80000000-0000-4000-8000-000000000000");
+			UUID uLowBit  = UUID.fromString("7fffffff-ffff-4000-8000-000000000000");
+			int signedCmp = uHighBit.compareTo(uLowBit);
+
+			UUID uV1 = UUID.fromString("58e0a7d7-eebc-11d8-9669-0800200c9a66");
+			long v1Ts = uV1.timestamp();
+			int v1Cs = uV1.clockSequence();
+			long v1Node = uV1.node();
+
+			boolean errV4Ts = false;
+			try { uHighBit.timestamp(); } catch (UnsupportedOperationException e) { errV4Ts = true; }
+			boolean errV4Cs = false;
+			try { uHighBit.clockSequence(); } catch (UnsupportedOperationException e) { errV4Cs = true; }
+			boolean errV4Node = false;
+			try { uHighBit.node(); } catch (UnsupportedOperationException e) { errV4Node = true; }
+
+			URI uri = URI.create("https://user:pass@example.com:8443/a/b/../c?q=1&x=2#frag");
+			URI normUri = uri.normalize();
+			URI resolvedUri = uri.resolve("sub/page.html");
+			URI baseUri = new URI("https://example.com/a/");
+			URI relUri = baseUri.relativize(new URI("https://example.com/a/b/c.txt"));
+			URL urlObj = normUri.toURL();
+			URI backToUri = urlObj.toURI();
+			URL directUrl = new URL("http://example.com/test?p=1#sec");
+
+			ctx._source.out = [
+				'u1': [u1.toString(), u1.getMostSignificantBits(), u1.getLeastSignificantBits()],
+				'signedCmpNeg': signedCmp < 0,
+				'v1': [uV1.version(), v1Ts > 0, v1Cs, v1Node],
+				'v4Errs': [errV4Ts, errV4Cs, errV4Node],
+				'uri': [
+					uri instanceof URI,
+					uri.getScheme(),
+					uri.getUserInfo(),
+					uri.getHost(),
+					uri.getPort(),
+					uri.getPath(),
+					normUri.getPath(),
+					uri.getQuery(),
+					uri.getFragment(),
+					uri.isAbsolute(),
+					uri.isOpaque(),
+					resolvedUri.getPath(),
+					relUri.toString()
+				],
+				'url': [
+					urlObj instanceof URL,
+					urlObj.getProtocol(),
+					urlObj.getHost(),
+					urlObj.getPort(),
+					urlObj.getDefaultPort(),
+					urlObj.getPath(),
+					urlObj.getFile(),
+					urlObj.getRef(),
+					backToUri.equals(normUri),
+					directUrl.getDefaultPort()
+				]
+			];
+		`, nil)
+		m := got.(map[string]any)
+		if !reflect.DeepEqual(m["u1"], []any{"01234567-89ab-cdef-1122-334455667788", int64(0x0123456789abcdef), int64(0x1122334455667788)}) {
+			t.Fatalf("unexpected new UUID(msb, lsb): %#v", m["u1"])
+		}
+		if m["signedCmpNeg"] != true {
+			t.Fatalf("expected Java signed MSB UUID.compareTo to be negative when MSB sign bit is set: %#v", m)
+		}
+		if !reflect.DeepEqual(m["v4Errs"], []any{true, true, true}) {
+			t.Fatalf("expected v4 UUID timestamp/clockSequence/node to throw UnsupportedOperationException: %#v", m["v4Errs"])
+		}
+		if !reflect.DeepEqual(m["uri"], []any{
+			true, "https", "user:pass", "example.com", int64(8443),
+			"/a/b/../c", "/a/c", "q=1&x=2", "frag", true, false,
+			"/a/sub/page.html", "b/c.txt",
+		}) {
+			t.Fatalf("unexpected URI results: %#v", m["uri"])
+		}
+		if !reflect.DeepEqual(m["url"], []any{
+			true, "https", "example.com", int64(8443), int64(443),
+			"/a/c", "/a/c?q=1&x=2", "frag", true, int64(80),
+		}) {
+			t.Fatalf("unexpected URL results: %#v", m["url"])
+		}
+	})
+
+	t.Run("Extended_Round54_Branch_Coverage", func(t *testing.T) {
+		got := evalOut(t, `
+			URI u3 = new URI("mailto", "user@example.com", "sec");
+			URI u4 = new URI("https", "example.com", "/docs/index.html", "top");
+			URI u5 = new URI("https", "example.com:8080", "/api/v1", "k=v", "f1");
+			URI u7 = new URI("https", "admin", "example.com", 9200, "/_search", "q=*", "hit");
+			URI uSrv = u7.parseServerAuthority();
+			String uAscii = u7.toASCIIString();
+			int uCmp = u4.compareTo(u5);
+			int uHc = u7.hashCode();
+			String uRawP = u7.getRawPath();
+			String uRawQ = u7.getRawQuery();
+			String uRawF = u7.getRawFragment();
+			String uRawA = u7.getRawAuthority();
+			String uRawU = u7.getRawUserInfo();
+			String uSsp = u3.getSchemeSpecificPart();
+			String uRawSsp = u3.getRawSchemeSpecificPart();
+			URI relOther = u4.relativize(new URI("http://other.com/a"));
+
+			URL url2 = new URL(new URL("https://example.com/dir/index.html"), "sub.html");
+			URL url3 = new URL("http", "example.com", "/hello?a=1#b");
+			URL url4 = new URL("https", "example.com", 8443, "/secure");
+			boolean sf1 = url3.sameFile(new URL("http://example.com:80/hello?a=1#other"));
+			boolean sf2 = url3.sameFile(url4);
+			String extForm = url3.toExternalForm();
+			int urlHc = url3.hashCode();
+			String urlQ = url3.getQuery();
+			String urlAuth = url4.getAuthority();
+			String urlUser = new URL("https://bob@example.com/p").getUserInfo();
+
+			boolean errBadUri = false;
+			try { URI.create("://bad uri"); } catch (IllegalArgumentException e) { errBadUri = true; }
+			boolean errRelToUrl = false;
+			try { new URI("/relative/path").toURL(); } catch (IllegalArgumentException e) { errRelToUrl = true; }
+
+			Pattern patA = Pattern.compile("[a-z]+");
+			Pattern patB = Pattern.compile("[0-9]+");
+			def predAnd = patA.asPredicate().and(patB.asPredicate());
+			def predOr = patA.asPredicate().or(patB.asPredicate());
+			boolean pa1 = predAnd.test("abc123");
+			boolean pa2 = predAnd.test("abc");
+			boolean po1 = predOr.test("abc");
+			boolean po2 = predOr.test("!!!");
+
+			Instant inst = Instant.parse("2025-03-15T10:20:30Z");
+			Clock cFixed = Clock.fixed(inst, ZoneOffset.UTC);
+			Clock cOff = Clock.offset(cFixed, Duration.ofHours(2));
+			Clock cTick = Clock.tickMinutes(ZoneOffset.UTC);
+			Clock cSys = Clock.system(ZoneOffset.ofHours(1));
+			String cFixedStr = cFixed.toString();
+			String cOffStr = cOff.toString();
+			String cTickStr = cTick.toString();
+			String cSysStr = cSys.toString();
+			int cHc = cFixed.hashCode();
+			String zdtClk = ZonedDateTime.now(cFixed).toString();
+			String odtClk = OffsetDateTime.now(cFixed).toString();
+
+			OffsetTime otLt = OffsetTime.of(LocalTime.of(8, 15, 0), ZoneOffset.ofHours(2));
+			OffsetTime otNow0 = OffsetTime.now();
+			OffsetTime otNowZone = OffsetTime.now(ZoneOffset.UTC);
+			int otHc = otLt.hashCode();
+			ZoneOffset zoNorm = ZoneOffset.ofHours(0).normalized();
+			Map zRules = ZoneOffset.ofHours(2).getRules();
+
+			Optional streamChain = Stream.of("hello", "world")
+				.findFirst()
+				.filter(s -> s.length() == 5)
+				.map(s -> s.toUpperCase())
+				.flatMap(s -> Optional.of(s + "!"))
+				.or(() -> Optional.of("fallback"));
+			long streamOptCnt = Stream.of("a", "b").findFirst().stream().count();
+			String streamOrElse = Stream.empty().findFirst().orElse("def");
+			String streamOrElseGet = Stream.empty().findFirst().orElseGet(() -> "comp");
+
+			DoubleSummaryStatistics dss = new DoubleSummaryStatistics();
+			String dssEmptyStr = dss.toString();
+			dss.accept(10.0);
+			String dssOneStr = dss.toString();
+
+			int objHash = Objects.hash("a", 1, true);
+			int objHcNull = Objects.hashCode(null);
+
+			ctx._source.out = [
+				'u3_opaque': u3.isOpaque(),
+				'uSsp': uSsp,
+				'uRawSsp': uRawSsp,
+				'u4': u4.toString(),
+				'u5': u5.toString(),
+				'u7': u7.toString(),
+				'uSrv': uSrv.getHost(),
+				'uAscii': uAscii,
+				'uCmp': uCmp != 0,
+				'uHc': uHc != 0,
+				'uRaws': [uRawP, uRawQ, uRawF, uRawA, uRawU, relOther.toString()],
+				'urls': [url2.toString(), url3.toString(), url4.toString(), sf1, sf2, extForm, urlHc != 0, urlQ, urlAuth, urlUser],
+				'uriErrs': [errBadUri, errRelToUrl],
+				'preds': [pa1, pa2, po1, po2],
+				'clks': [cFixedStr.startsWith("FixedClock["), cOffStr.startsWith("OffsetClock["), cTickStr.startsWith("TickClock["), cSysStr.startsWith("SystemClock["), cHc != 0, zdtClk.startsWith("2025-03-15"), odtClk.startsWith("2025-03-15")],
+				'ot': [otLt.toString(), otNow0 != null, otNowZone != null, otHc != 0, zoNorm, zRules.isFixedOffset],
+				'streamOpt': [streamChain.toString(), streamOptCnt, streamOrElse, streamOrElseGet],
+				'dss': [dssEmptyStr.startsWith("DoubleSummaryStatistics{"), dssOneStr.startsWith("DoubleSummaryStatistics{")],
+				'objHash': [objHash != 0, objHcNull == 0]
+			];
+		`, nil)
+		m := got.(map[string]any)
+		if m["u3_opaque"] != true || m["u7"] != "https://admin@example.com:9200/_search?q=*#hit" {
+			t.Fatalf("unexpected URI constructor results: %#v", m)
+		}
+		if !reflect.DeepEqual(m["preds"], []any{true, false, true, false}) {
+			t.Fatalf("unexpected Predicate.and/or results: %#v", m["preds"])
+		}
+		if !reflect.DeepEqual(m["streamOpt"], []any{"Optional[HELLO!]", int64(1), "def", "comp"}) {
+			t.Fatalf("unexpected Stream Optional chain results: %#v", m["streamOpt"])
 		}
 	})
 }

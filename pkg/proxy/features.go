@@ -1349,7 +1349,7 @@ func isSupportedIngestProcessorType(procType string) bool {
 		"dedup", "dedupe", "fingerprint", "redact", "attachment", "csv", "user_agent",
 		"uri_parts", "registered_domain", "network_direction", "community_id",
 		"geoip", "enrich", "foreach", "script", "inference", "set_security_user",
-		"circle", "reroute":
+		"circle", "reroute", "terminate":
 		return true
 	}
 	return false
@@ -1546,6 +1546,12 @@ func validateIngestPipelineProcessors(procs []any) error {
 						return fmt.Errorf("illegal_argument_exception: invalid value_split [%s]: %v", vs, err)
 					}
 				}
+				if rawTK, hasTK := specMap["transform_key"]; hasTK && rawTK != nil {
+					tkStr, ok := rawTK.(string)
+					if !ok || (tkStr != "lowercase" && tkStr != "uppercase") {
+						return fmt.Errorf("illegal_argument_exception: [transform_key] must be [lowercase] or [uppercase], got [%v]", rawTK)
+					}
+				}
 			case "csv":
 				if _, err := reqStr("field"); err != nil {
 					return err
@@ -1605,6 +1611,17 @@ func validateIngestPipelineProcessors(procs []any) error {
 				pats, ok := specMap["patterns"].([]any)
 				if !ok || len(pats) == 0 {
 					return fmt.Errorf("[patterns] required property is missing")
+				}
+				if rawECS, hasECS := specMap["ecs_compatibility"]; hasECS && rawECS != nil {
+					ecsStr, ok := rawECS.(string)
+					if !ok || (ecsStr != "disabled" && ecsStr != "v1") {
+						return fmt.Errorf("illegal_argument_exception: invalid ecs_compatibility [%v], must be [disabled] or [v1]", rawECS)
+					}
+				}
+				if rawKEC, hasKEC := specMap["keep_empty_captures"]; hasKEC && rawKEC != nil {
+					if _, ok := rawKEC.(bool); !ok {
+						return fmt.Errorf("illegal_argument_exception: [keep_empty_captures] must be a boolean")
+					}
 				}
 				customDefs, _ := specMap["pattern_definitions"].(map[string]any)
 				for _, patAny := range pats {
@@ -1684,6 +1701,27 @@ func validateIngestPipelineProcessors(procs []any) error {
 				if _, err := reqStr("model_id"); err != nil {
 					return err
 				}
+			case "circle":
+				if _, err := reqStr("field"); err != nil {
+					return err
+				}
+				rawED, hasED := specMap["error_distance"]
+				if !hasED || rawED == nil {
+					return fmt.Errorf("[error_distance] required property is missing")
+				}
+				edVal, ok := toFloat64(rawED)
+				if !ok || edVal <= 0 {
+					return fmt.Errorf("illegal_argument_exception: [error_distance] must be a positive number")
+				}
+				st, err := reqStr("shape_type")
+				if err != nil {
+					return err
+				}
+				if st != "geo_shape" && st != "shape" {
+					return fmt.Errorf("illegal_argument_exception: invalid shape_type [%s], must be [geo_shape] or [shape]", st)
+				}
+			case "terminate":
+				// Optional if/tag/description/ignore_failure/on_failure
 			}
 			if rawOnFail, hasOnFail := specMap["on_failure"]; hasOnFail && rawOnFail != nil {
 				onFail, ok := rawOnFail.([]any)
@@ -2308,13 +2346,24 @@ var defaultGrokPatterns = map[string]string{
 	"URIPROTO":          `[A-Za-z]+(?:\+[A-Za-z+]+)?`,
 	"URIHOST":           `[0-9A-Za-z._-]+(?::[0-9]+)?`,
 	"URIPATH":           `(?:/[A-Za-z0-9$.+!*'(){},~:;=@#%&_\-]*)+`,
-	"PATH":              `(?:/[A-Za-z0-9$.+!*'(){},~:;=@#%&_\-]*)+`,
+	"UNIXPATH":          `(?:/[\w_%!$@:.,+~-]+|\\.)+`,
+	"WINPATH":           `(?:[A-Za-z]+:|\\)(?:\\[^\\?*]*)+`,
+	"PATH":              `(?:(?:/[\w_%!$@:.,+~-]+|\\.)+|(?:[A-Za-z]+:|\\)(?:\\[^\\?*]*)+)`,
+	"HOSTPORT":          `%{IPORHOST}:%{POSINT}`,
+	"TTY":               `(?:/dev/(?:pts|tty(?:[pq])?)(?:\w+)?/?(?:[0-9]+))`,
+	"BASE16NUM":         `\b0[xX][0-9a-fA-F]+\b`,
+	"BASE16FLOAT":       `\b(?:[+-]?(?:0[xX])?(?:(?:[0-9A-Fa-f]+(?:\.[0-9A-Fa-f]*)?)|(?:\.[0-9A-Fa-f]+)))\b`,
 	"URIPARAM":          `\?[A-Za-z0-9$.+!*'|(){},~@#%&/=:;_?\-\[\]<>]*`,
 	"URIPATHPARAM":      `%{URIPATH}(?:%{URIPARAM})?`,
 	"URI":               `%{URIPROTO}://(?:%{USER}(?::[^@]*)?@)?(?:%{URIHOST})?(?:%{URIPATHPARAM})?`,
 	"COMMONAPACHELOG":   `%{IPORHOST:clientip} %{USER:ident} %{USER:auth} \[%{HTTPDATE:timestamp}\] "(?:%{WORD:verb} %{NOTSPACE:request}(?: HTTP/%{NUMBER:httpversion})?|%{DATA:rawrequest})" %{NUMBER:response} (?:%{NUMBER:bytes}|-)`,
 	"COMBINEDAPACHELOG": `%{COMMONAPACHELOG} %{QS:referrer} %{QS:agent}`,
 	"EMAILADDRESS":      `[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+`,
+}
+
+var ecsGrokPatterns = map[string]string{
+	"COMMONAPACHELOG":   `%{IPORHOST:[client][address]} %{USER:[user][id]} %{USER:[user][name]} \[%{HTTPDATE:timestamp}\] "(?:%{WORD:[http][request][method]} %{NOTSPACE:[url][original]}(?: HTTP/%{NUMBER:[http][version]})?|%{DATA})" %{NUMBER:[http][response][status_code]:int} (?:%{NUMBER:[http][response][body][bytes]:long}|-)`,
+	"COMBINEDAPACHELOG": `%{COMMONAPACHELOG} %{QS:[http][request][referrer]} %{QS:[user_agent][original]}`,
 }
 
 var (
@@ -4047,6 +4096,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		prefix = expandIngestFieldName(prefix, doc)
 		trimKey, _ := specMap["trim_key"].(string)
 		trimVal, _ := specMap["trim_value"].(string)
+		transformKey, _ := specMap["transform_key"].(string)
 		stripBrackets, _ := specMap["strip_brackets"].(bool)
 		var includeSet, excludeSet map[string]bool
 		if incArr, ok := specMap["include_keys"].([]any); ok && len(incArr) > 0 {
@@ -4166,6 +4216,12 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						}
 						if trimKey != "" {
 							k = strings.Trim(k, trimKey)
+						}
+						switch transformKey {
+						case "lowercase":
+							k = strings.ToLower(k)
+						case "uppercase":
+							k = strings.ToUpper(k)
 						}
 						if includeSet != nil && !includeSet[k] {
 							continue
@@ -4656,6 +4712,18 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		field = expandIngestFieldName(field, doc)
 		patterns, _ := specMap["patterns"].([]any)
 		customDefs, _ := specMap["pattern_definitions"].(map[string]any)
+		ecsCompat, _ := specMap["ecs_compatibility"].(string)
+		if ecsCompat == "v1" {
+			mergedDefs := make(map[string]any, len(ecsGrokPatterns)+len(customDefs))
+			for k, v := range ecsGrokPatterns {
+				mergedDefs[k] = v
+			}
+			for k, v := range customDefs {
+				mergedDefs[k] = v
+			}
+			customDefs = mergedDefs
+		}
+		keepEmptyCaptures, _ := specMap["keep_empty_captures"].(bool)
 		targetField, _ := specMap["target_field"].(string)
 		targetField = expandIngestFieldName(targetField, doc)
 		if field != "" && len(patterns) > 0 {
@@ -4713,7 +4781,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					}
 					names := re.SubexpNames()
 					for i, grpID := range names {
-						if i == 0 || grpID == "" || i >= len(m) || 2*i >= len(loc) || loc[2*i] < 0 {
+						if i == 0 || grpID == "" || i >= len(m) || 2*i >= len(loc) {
 							continue
 						}
 						fieldName := grpMap[grpID]
@@ -4723,13 +4791,20 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						if strings.HasPrefix(fieldName, "[") && strings.HasSuffix(fieldName, "]") {
 							fieldName = strings.ReplaceAll(strings.Trim(fieldName, "[]"), "][", ".")
 						}
-						var finalVal any = m[i]
-						if convT := grpTypes[grpID]; convT != "" {
-							cv, err := convertSingleIngestValue(m[i], convT)
-							if err != nil {
-								return false, false, procType, procTag, specMap, err
+						isEmptyCapture := loc[2*i] < 0 || m[i] == ""
+						if isEmptyCapture && !keepEmptyCaptures {
+							continue
+						}
+						var finalVal any
+						if !isEmptyCapture {
+							finalVal = m[i]
+							if convT := grpTypes[grpID]; convT != "" {
+								cv, err := convertSingleIngestValue(m[i], convT)
+								if err != nil {
+									return false, false, procType, procTag, specMap, err
+								}
+								finalVal = cv
 							}
-							finalVal = cv
 						}
 						if prev, hasPrev := extracted[fieldName]; hasPrev {
 							if prevArr, isArr := prev.([]any); isArr {
@@ -5976,7 +6051,37 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		setIngestPath(doc, field, userObj)
 		mutated = true
 	case "circle":
-		// Supported compatibility processor
+		field, _ := specMap["field"].(string)
+		field = strings.TrimSpace(expandIngestFieldName(field, doc))
+		targetField, _ := specMap["target_field"].(string)
+		targetField = strings.TrimSpace(expandIngestFieldName(targetField, doc))
+		if targetField == "" {
+			targetField = field
+		}
+		shapeType, _ := specMap["shape_type"].(string)
+		if shapeType == "" {
+			shapeType = "geo_shape"
+		}
+		errorDist, okED := toFloat64(specMap["error_distance"])
+		if !okED || errorDist <= 0 {
+			errorDist = 10.0
+		}
+		val, exists := getIngestPath(doc, field)
+		if !exists || val == nil {
+			ignoreMissing, _ := specMap["ignore_missing"].(bool)
+			if !ignoreMissing {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+			}
+			return false, false, procType, procTag, specMap, nil
+		}
+		polyVal, err := convertIngestCircleToPolygon(val, shapeType, errorDist)
+		if err != nil {
+			return false, false, procType, procTag, specMap, err
+		}
+		setIngestPath(doc, targetField, polyVal)
+		mutated = true
+	case "terminate":
+		doc["__internal_ingest_terminated"] = true
 	case "reroute":
 		dest, _ := specMap["destination"].(string)
 		if dest != "" {
@@ -6043,6 +6148,145 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		return false, false, procType, procTag, specMap, fmt.Errorf("no processor type exists with name [%s]", procType)
 	}
 	return mutated, false, procType, procTag, specMap, nil
+}
+
+func parseIngestCircleRadius(raw any, shapeType string) (float64, error) {
+	if fv, ok := toFloat64(raw); ok {
+		if fv <= 0 {
+			return 0, fmt.Errorf("circle radius must be positive")
+		}
+		if shapeType == "geo_shape" {
+			return fv / 111320.0, nil
+		}
+		return fv, nil
+	}
+	s := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", raw)))
+	if s == "" {
+		return 0, fmt.Errorf("circle radius is empty")
+	}
+	mult := 1.0
+	numPart := s
+	switch {
+	case strings.HasSuffix(s, "km"):
+		mult = 1000.0
+		numPart = strings.TrimSpace(strings.TrimSuffix(s, "km"))
+	case strings.HasSuffix(s, "mi"):
+		mult = 1609.344
+		numPart = strings.TrimSpace(strings.TrimSuffix(s, "mi"))
+	case strings.HasSuffix(s, "yd"):
+		mult = 0.9144
+		numPart = strings.TrimSpace(strings.TrimSuffix(s, "yd"))
+	case strings.HasSuffix(s, "ft"):
+		mult = 0.3048
+		numPart = strings.TrimSpace(strings.TrimSuffix(s, "ft"))
+	case strings.HasSuffix(s, "cm"):
+		mult = 0.01
+		numPart = strings.TrimSpace(strings.TrimSuffix(s, "cm"))
+	case strings.HasSuffix(s, "mm"):
+		mult = 0.001
+		numPart = strings.TrimSpace(strings.TrimSuffix(s, "mm"))
+	case strings.HasSuffix(s, "m"):
+		mult = 1.0
+		numPart = strings.TrimSpace(strings.TrimSuffix(s, "m"))
+	}
+	fv, err := strconv.ParseFloat(numPart, 64)
+	if err != nil || fv <= 0 {
+		return 0, fmt.Errorf("invalid circle radius [%v]", raw)
+	}
+	distMeters := fv * mult
+	if shapeType == "geo_shape" {
+		return distMeters / 111320.0, nil
+	}
+	return distMeters, nil
+}
+
+func convertIngestCircleToPolygon(val any, shapeType string, errorDist float64) (any, error) {
+	steps := 16
+	if errorDist > 0 && errorDist < 1.0 {
+		steps = 32
+	}
+	switch v := val.(type) {
+	case string:
+		trimmed := strings.TrimSpace(v)
+		upper := strings.ToUpper(trimmed)
+		if !strings.HasPrefix(upper, "CIRCLE") {
+			return nil, fmt.Errorf("illegal_argument_exception: invalid WKT circle [%s]", v)
+		}
+		openIdx := strings.IndexByte(trimmed, '(')
+		closeIdx := strings.LastIndexByte(trimmed, ')')
+		if openIdx < 0 || closeIdx <= openIdx {
+			return nil, fmt.Errorf("illegal_argument_exception: invalid WKT circle [%s]", v)
+		}
+		inner := strings.TrimSpace(trimmed[openIdx+1 : closeIdx])
+		inner = strings.ReplaceAll(inner, ",", " ")
+		parts := strings.Fields(inner)
+		if len(parts) < 3 {
+			return nil, fmt.Errorf("illegal_argument_exception: WKT circle requires (x y radius), got [%s]", v)
+		}
+		cx, err1 := strconv.ParseFloat(parts[0], 64)
+		cy, err2 := strconv.ParseFloat(parts[1], 64)
+		if err1 != nil || err2 != nil {
+			return nil, fmt.Errorf("illegal_argument_exception: invalid circle center coordinates in [%s]", v)
+		}
+		radStr := strings.Join(parts[2:], "")
+		degRad, err := parseIngestCircleRadius(radStr, shapeType)
+		if err != nil {
+			return nil, fmt.Errorf("illegal_argument_exception: %v", err)
+		}
+		coords := make([]string, 0, steps+1)
+		var firstPt string
+		for i := 0; i < steps; i++ {
+			angle := 2.0 * math.Pi * float64(i) / float64(steps)
+			px := cx + degRad*math.Cos(angle)
+			py := cy + degRad*math.Sin(angle)
+			pt := fmt.Sprintf("%.6f %.6f", px, py)
+			if i == 0 {
+				firstPt = pt
+			}
+			coords = append(coords, pt)
+		}
+		coords = append(coords, firstPt)
+		return "POLYGON ((" + strings.Join(coords, ", ") + "))", nil
+
+	case map[string]any:
+		tStr, _ := v["type"].(string)
+		if !strings.EqualFold(strings.TrimSpace(tStr), "circle") {
+			return nil, fmt.Errorf("illegal_argument_exception: expected GeoJSON Circle, got [%s]", tStr)
+		}
+		rawCoords, ok := v["coordinates"].([]any)
+		if !ok || len(rawCoords) < 2 {
+			return nil, fmt.Errorf("illegal_argument_exception: circle coordinates must be [lon, lat]")
+		}
+		cx, ok1 := toFloat64(rawCoords[0])
+		cy, ok2 := toFloat64(rawCoords[1])
+		if !ok1 || !ok2 {
+			return nil, fmt.Errorf("illegal_argument_exception: invalid circle coordinates")
+		}
+		degRad, err := parseIngestCircleRadius(v["radius"], shapeType)
+		if err != nil {
+			return nil, fmt.Errorf("illegal_argument_exception: %v", err)
+		}
+		ring := make([]any, 0, steps+1)
+		var firstCoord []any
+		for i := 0; i < steps; i++ {
+			angle := 2.0 * math.Pi * float64(i) / float64(steps)
+			px := math.Round((cx+degRad*math.Cos(angle))*1e6) / 1e6
+			py := math.Round((cy+degRad*math.Sin(angle))*1e6) / 1e6
+			pt := []any{px, py}
+			if i == 0 {
+				firstCoord = pt
+			}
+			ring = append(ring, pt)
+		}
+		ring = append(ring, firstCoord)
+		return map[string]any{
+			"type":        "Polygon",
+			"coordinates": []any{ring},
+		}, nil
+
+	default:
+		return nil, fmt.Errorf("illegal_argument_exception: unsupported circle value type")
+	}
 }
 
 func compactIngestMap(v map[string]any) map[string]any {
@@ -6134,6 +6378,7 @@ func snapshotIngestDoc(doc map[string]any) map[string]any {
 		}
 	}
 	delete(cp, "__internal_ingest_orig")
+	delete(cp, "__internal_ingest_terminated")
 	delete(cp, "_ingest")
 	if cp == nil {
 		cp = map[string]any{}
@@ -6222,6 +6467,10 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 		}
 		if dropped {
 			return mutated, true, nil
+		}
+		if terminated, _ := doc["__internal_ingest_terminated"].(bool); terminated {
+			delete(doc, "__internal_ingest_terminated")
+			return mutated, false, nil
 		}
 		if procErr != nil {
 			ignoreFail, _ := specMap["ignore_failure"].(bool)

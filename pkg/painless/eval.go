@@ -71,7 +71,13 @@ func (painlessEmptyOptionalType) String() string {
 var painlessEmptyOptional = painlessEmptyOptionalType{}
 
 func isEmptyOptionalOrNilPainless(v any) bool {
-	return v == nil || v == painlessEmptyOptional
+	if v == nil || v == painlessEmptyOptional {
+		return true
+	}
+	if opt, ok := v.(*painlessOptional); ok {
+		return opt == nil || !opt.present
+	}
+	return false
 }
 
 func unwrapPainlessInternalValue(v any) any {
@@ -79,6 +85,26 @@ func unwrapPainlessInternalValue(v any) any {
 		return nil
 	}
 	switch tv := v.(type) {
+	case *painlessOptional:
+		if tv == nil || !tv.present {
+			return nil
+		}
+		return unwrapPainlessInternalValue(tv.val)
+	case *painlessOffsetTime:
+		if tv == nil {
+			return nil
+		}
+		return tv.String()
+	case *painlessURI:
+		if tv == nil {
+			return nil
+		}
+		return tv.String()
+	case *painlessURL:
+		if tv == nil {
+			return nil
+		}
+		return tv.String()
 	case *painlessBigInteger:
 		if tv == nil || tv.val == nil {
 			return int64(0)
@@ -94,8 +120,11 @@ func unwrapPainlessInternalValue(v any) any {
 				changed = true
 				break
 			}
-			if _, isBI := elem.(*painlessBigInteger); isBI {
+			switch elem.(type) {
+			case *painlessBigInteger, *painlessOptional, *painlessOffsetTime, *painlessURI, *painlessURL:
 				changed = true
+			}
+			if changed {
 				break
 			}
 		}
@@ -631,11 +660,31 @@ func painlessClassForValuePainless(val any) painlessClassObject {
 				return painlessClassObject{fullName: "java.util.NoSuchElementException", simpleName: excType}
 			case "PatternSyntaxException":
 				return painlessClassObject{fullName: "java.util.regex.PatternSyntaxException", simpleName: excType}
+			case "URISyntaxException", "MalformedURLException":
+				return painlessClassObject{fullName: "java.net." + excType, simpleName: excType}
 			default:
 				return painlessClassObject{fullName: "java.lang." + excType, simpleName: excType}
 			}
 		}
+		if statType, isStats := isSummaryStatisticsMapPainless(tv); isStats {
+			return painlessClassObject{fullName: "java.util." + statType, simpleName: statType}
+		}
 		return painlessClassObject{fullName: "java.util.HashMap", simpleName: "HashMap"}
+	case *painlessOptional:
+		if tv != nil && tv.kind != "" {
+			return painlessClassObject{fullName: "java.util." + tv.kind, simpleName: tv.kind}
+		}
+		return painlessClassObject{fullName: "java.util.Optional", simpleName: "Optional"}
+	case *painlessClock:
+		return painlessClassObject{fullName: "java.time.Clock", simpleName: "Clock"}
+	case *painlessOffsetTime:
+		return painlessClassObject{fullName: "java.time.OffsetTime", simpleName: "OffsetTime"}
+	case *painlessURI:
+		return painlessClassObject{fullName: "java.net.URI", simpleName: "URI"}
+	case *painlessURL:
+		return painlessClassObject{fullName: "java.net.URL", simpleName: "URL"}
+	case *painlessPredicate:
+		return painlessClassObject{fullName: "java.util.function.Predicate", simpleName: "Predicate"}
 	case []any:
 		return painlessClassObject{fullName: "java.util.ArrayList", simpleName: "ArrayList"}
 	case string:
@@ -2152,10 +2201,15 @@ type painlessUserField struct {
 
 // painlessUserClass represents a user-defined class (`class Foo { ... }`) in Painless.
 type painlessUserClass struct {
-	name         string
-	fields       []painlessUserField
-	constructors []*painlessUserFunc
-	methods      map[string][]*painlessUserFunc
+	name          string
+	parentName    string
+	parent        *painlessUserClass
+	fields        []painlessUserField
+	staticFields  []painlessUserField
+	staticValues  map[string]any
+	constructors  []*painlessUserFunc
+	methods       map[string][]*painlessUserFunc
+	staticMethods map[string][]*painlessUserFunc
 }
 
 // painlessUserObject represents an instantiated user-defined class object in Painless.
@@ -2167,6 +2221,11 @@ type painlessUserObject struct {
 func (uo *painlessUserObject) String() string {
 	if uo == nil || uo.class == nil {
 		return "Object"
+	}
+	if uo.class.findMethod("toString") != nil {
+		if res, err := evalUserClassMethodWithArgsPainless(uo, uo.class, "toString", nil, false, nil, nil, 0); err == nil && res != nil {
+			return fmt.Sprintf("%v", res)
+		}
 	}
 	return fmt.Sprintf("%s@%p", uo.class.name, uo)
 }
@@ -2223,10 +2282,10 @@ var (
 	reLocalArrayRemoveIf   = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\.removeIf\(\s*\(?\s*(?:[a-zA-Z_$][a-zA-Z0-9_$<>[\]]*\s+)?([a-zA-Z0-9_$]+)\s*\)?\s*->\s*(.+)\s*\)$`)
 	reLocalCompoundAssign  = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*\??(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\s*(\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>>=|>>=)\s*(.+)$`)
 	reLocalPropAssign      = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*)\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)\s*=\s*(.+)$`)
-	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
-	reNullVarDecl          = regexp.MustCompile(`^(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
-	reVarTypeDeclPrefix    = regexp.MustCompile(`(?s)^((?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*)\s+(.+)$`)
-	reUserFuncHeaderPrefix = regexp.MustCompile(`^(void|def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics|[a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*<[^>]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
+	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?Predicate|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
+	reNullVarDecl          = regexp.MustCompile(`^(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?Predicate|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
+	reVarTypeDeclPrefix    = regexp.MustCompile(`(?s)^((?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?Predicate|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*)\s+(.+)$`)
+	reUserFuncHeaderPrefix = regexp.MustCompile(`^(void|def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?Predicate|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics|[a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*<[^>]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
 	reIdentAssign          = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
 	reIdentOnly            = regexp.MustCompile(`^[a-zA-Z_$][a-zA-Z0-9_$]*$`)
 	reSimpleFieldPath      = regexp.MustCompile(`^[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+$`)
@@ -2408,14 +2467,18 @@ type painlessUserFunc struct {
 }
 
 type painlessMatcher struct {
-	re          *regexp.Regexp
-	input       string
-	curPos      int
-	lastMatch   []int
-	appendPos   int
-	regionStart int
-	regionEnd   int
-	hasRegion   bool
+	re                      *regexp.Regexp
+	input                   string
+	curPos                  int
+	lastMatch               []int
+	appendPos               int
+	regionStart             int
+	regionEnd               int
+	hasRegion               bool
+	transparentBounds       bool
+	anchoringBoundsDisabled bool
+	lastSearchHitEnd        bool
+	lastSearchRequireEnd    bool
 }
 
 type evalBudget struct {
@@ -2580,108 +2643,7 @@ func parseParamListNamesPainless(paramStr string) []string {
 }
 
 func parseUserClassDecl(stmt string) (*painlessUserClass, bool) {
-	t := strings.TrimSpace(stmt)
-	if !strings.HasPrefix(t, "class ") && !strings.HasPrefix(t, "class\t") && !strings.HasPrefix(t, "class\n") {
-		return nil, false
-	}
-	rest := strings.TrimSpace(t[len("class"):])
-	openBrace := strings.IndexByte(rest, '{')
-	if openBrace <= 0 {
-		return nil, false
-	}
-	className := strings.TrimSpace(rest[:openBrace])
-	if !reIdentOnly.MatchString(className) || isPainlessReservedKeyword(className) {
-		return nil, false
-	}
-	bodyPart := strings.TrimSpace(rest[openBrace:])
-	if !strings.HasPrefix(bodyPart, "{") || findMatchingDelimiter(bodyPart, 0, '{', '}') != len(bodyPart)-1 {
-		return nil, false
-	}
-	classBody := strings.TrimSpace(bodyPart[1 : len(bodyPart)-1])
-	cls := &painlessUserClass{
-		name:    className,
-		methods: make(map[string][]*painlessUserFunc),
-	}
-	memberStmts := splitTopLevelStatements(classBody)
-	for _, mStmt := range memberStmts {
-		mStmt = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(mStmt), ";"))
-		if mStmt == "" {
-			continue
-		}
-		// Check constructor: <ClassName>(...) { ... }
-		if openP := strings.IndexByte(mStmt, '('); openP > 0 {
-			hdr := strings.TrimSpace(mStmt[:openP])
-			if hdr == className {
-				closeP := findMatchingDelimiter(mStmt, openP, '(', ')')
-				if closeP > openP {
-					afterP := strings.TrimSpace(mStmt[closeP+1:])
-					if strings.HasPrefix(afterP, "{") && findMatchingDelimiter(afterP, 0, '{', '}') == len(afterP)-1 {
-						ctor := &painlessUserFunc{
-							name:       className,
-							returnType: className,
-							paramNames: parseParamListNamesPainless(mStmt[openP+1 : closeP]),
-							body:       strings.TrimSpace(afterP[1 : len(afterP)-1]),
-						}
-						cls.constructors = append(cls.constructors, ctor)
-						continue
-					}
-				}
-			}
-		}
-		if fnDecl, ok := parseUserFuncDecl(mStmt); ok {
-			cls.methods[fnDecl.name] = append(cls.methods[fnDecl.name], fnDecl)
-			continue
-		}
-		// Parse field declaration(s)
-		parts := splitTopLevelCommaPainless(mStmt)
-		var sharedType string
-		for idx, part := range parts {
-			part = strings.TrimSpace(part)
-			if part == "" {
-				continue
-			}
-			var declPart, initExpr string
-			if eqIdx := findTopLevelAssignOpStartPainless(part); eqIdx > 0 && part[eqIdx] == '=' {
-				declPart = strings.TrimSpace(part[:eqIdx])
-				initExpr = strings.TrimSpace(part[eqIdx+1:])
-			} else {
-				declPart = part
-			}
-			if idx == 0 {
-				lastSpace := strings.LastIndexAny(declPart, " \t\n\r>]")
-				if lastSpace > 0 {
-					if declPart[lastSpace] == '>' || declPart[lastSpace] == ']' {
-						sharedType = strings.TrimSpace(declPart[:lastSpace+1])
-						fieldName := strings.TrimSpace(declPart[lastSpace+1:])
-						if reIdentOnly.MatchString(fieldName) {
-							cls.fields = append(cls.fields, painlessUserField{
-								name:     fieldName,
-								typeName: sharedType,
-								initExpr: initExpr,
-							})
-						}
-					} else {
-						sharedType = strings.TrimSpace(declPart[:lastSpace])
-						fieldName := strings.TrimSpace(declPart[lastSpace+1:])
-						if reIdentOnly.MatchString(fieldName) {
-							cls.fields = append(cls.fields, painlessUserField{
-								name:     fieldName,
-								typeName: sharedType,
-								initExpr: initExpr,
-							})
-						}
-					}
-				}
-			} else if reIdentOnly.MatchString(declPart) && sharedType != "" {
-				cls.fields = append(cls.fields, painlessUserField{
-					name:     declPart,
-					typeName: sharedType,
-					initExpr: initExpr,
-				})
-			}
-		}
-	}
-	return cls, true
+	return parseUserClassDeclRound54(stmt)
 }
 
 func parseUserFuncDecl(stmt string) (*painlessUserFunc, bool) {
@@ -3116,10 +3078,7 @@ func execBlock(sourceMap map[string]any, block string, params map[string]any, ct
 			continue
 		}
 		if clsDecl, ok := parseUserClassDecl(stmt); ok {
-			if budget.userClasses == nil {
-				budget.userClasses = make(map[string]*painlessUserClass)
-			}
-			budget.userClasses[clsDecl.name] = clsDecl
+			registerUserClassRound54(budget, clsDecl, sourceMap, params)
 			continue
 		}
 		if fnDecl, ok := parseUserFuncDecl(stmt); ok {
@@ -5537,6 +5496,9 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		}
 	}
 	if !isTopLevelAssignmentStmt(stmt) && !strings.HasPrefix(stmt, "return ") && !strings.HasPrefix(stmt, "return(") {
+		if handled, err := execRound54StatementCallPainless(sourceMap, stmt, params, budget); handled {
+			return err
+		}
 		if recExpr, argExpr, ok := matchTrailingMethodCallPainless(stmt, ".setValue("); ok {
 			recVal, err := evalRHSExpr(sourceMap, recExpr, params)
 			if err != nil {
@@ -5671,6 +5633,21 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		val, err := evalRHSExpr(sourceMap, rhsExpr, params)
 		if err != nil {
 			return err
+		}
+		if varName == "super" && len(propPath) == 1 {
+			if uo, isThis := params["this"].(*painlessUserObject); isThis && uo != nil && uo.fields != nil {
+				uo.fields[propPath[0]] = val
+				params["_last_expr_val"] = val
+				return nil
+			}
+		}
+		if budget != nil && len(budget.userClasses) > 0 && len(propPath) == 1 {
+			if uCls := budget.userClasses[varName]; uCls != nil {
+				if uCls.setStaticField(propPath[0], val) {
+					params["_last_expr_val"] = val
+					return nil
+				}
+			}
 		}
 		if decodeBracketSeg(varName) == "ctx" && len(propPath) == 1 && decodeBracketSeg(propPath[0]) == "_source" && params["ctx"] == nil {
 			if _, err := mutateCtxDirectMapKey("_source", val, false, false, sourceMap, params); err != nil {
@@ -6512,6 +6489,32 @@ func isIntegerValuePainless(v any) (int64, bool) {
 // painlessValuesEqual performs type-safe Java/Painless Object.equals semantics:
 // numbers compare equal across numeric types if numerically equal, strings only equal strings, etc.
 func painlessValuesEqual(a, b any) bool {
+	if optA, okA := a.(*painlessOptional); okA {
+		return optA.equals(b)
+	}
+	if optB, okB := b.(*painlessOptional); okB {
+		return optB.equals(a)
+	}
+	if otA, okA := a.(*painlessOffsetTime); okA {
+		return otA.equals(b)
+	}
+	if clkA, okA := a.(*painlessClock); okA {
+		return clkA.equals(b)
+	}
+	if uriA, okA := a.(*painlessURI); okA {
+		return uriA.equals(b)
+	}
+	if urlA, okA := a.(*painlessURL); okA {
+		return urlA.equals(b)
+	}
+	if uoA, okA := a.(*painlessUserObject); okA && uoA != nil && uoA.class != nil && uoA.class.findMethod("equals") != nil {
+		res, err := evalUserClassMethodWithArgsPainless(uoA, uoA.class, "equals", []any{b}, false, nil, nil, 0)
+		if err == nil {
+			if bv, isB := res.(bool); isB {
+				return bv
+			}
+		}
+	}
 	a = unwrapEmptyOptionalPainless(a)
 	b = unwrapEmptyOptionalPainless(b)
 	if a == nil && b == nil {
@@ -6594,6 +6597,19 @@ func painlessDeepEquals(a, b any) bool {
 }
 
 func valuesEqual(a, b any) bool {
+	if optA, okA := a.(*painlessOptional); okA {
+		if optB, okB := b.(*painlessOptional); okB {
+			return optA.equals(optB)
+		}
+		if optA.present {
+			return optA.equals(b)
+		}
+	}
+	if optB, okB := b.(*painlessOptional); okB {
+		if optB.present {
+			return optB.equals(a)
+		}
+	}
 	a = unwrapEmptyOptionalPainless(a)
 	b = unwrapEmptyOptionalPainless(b)
 	if a == nil && b == nil {
@@ -6849,10 +6865,13 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		".not()", ".bitLength()", ".bitCount()", ".getLowestSetBit()", ".toByteArray()", ".toLongArray()", ".cardinality()",
 		".getPrecision()", ".getRoundingMode()", ".reversed()",
 		".find()", ".matches()", ".lookingAt()", ".group()", ".groupCount()", ".start()", ".end()", ".reset()", ".pattern()", ".flags()", ".regionStart()", ".regionEnd()",
+		".asPredicate()", ".asMatchPredicate()", ".results()", ".toMatchResult()", ".namedGroups()", ".hasTransparentBounds()", ".hasAnchoringBounds()", ".hitEnd()", ".requireEnd()", ".negate()",
 		".getCount()", ".getSum()", ".getMin()", ".getMax()", ".getAverage()",
-		".isPresent()", ".getAsInt()", ".getAsLong()", ".getAsDouble()", ".orElseThrow()", ".stream()",
-		".clone()", ".getClass()", ".getName()", ".getSimpleName()", ".getCanonicalName()", ".getTypeName()", ".name()",
-		".getMostSignificantBits()", ".getLeastSignificantBits()", ".version()", ".variant()",
+		".isPresent()", ".get()", ".getAsInt()", ".getAsLong()", ".getAsDouble()", ".orElseThrow()", ".stream()",
+		".clone()", ".getClass()", ".getName()", ".getSimpleName()", ".getCanonicalName()", ".getTypeName()", ".name()", ".hashCode()",
+		".getMostSignificantBits()", ".getLeastSignificantBits()", ".version()", ".variant()", ".timestamp()", ".clockSequence()", ".node()",
+		".getId()", ".getTotalSeconds()", ".getRules()", ".instant()", ".millis()", ".getZone()", ".getOffset()",
+		".getScheme()", ".getProtocol()", ".getHost()", ".getPort()", ".getDefaultPort()", ".getPath()", ".getRawPath()", ".getQuery()", ".getRawQuery()", ".getFragment()", ".getRawFragment()", ".getRef()", ".getAuthority()", ".getRawAuthority()", ".getUserInfo()", ".getRawUserInfo()", ".getSchemeSpecificPart()", ".getRawSchemeSpecificPart()", ".getFile()", ".isAbsolute()", ".isOpaque()", ".normalize()", ".toASCIIString()", ".toExternalForm()", ".toURI()", ".toURL()",
 		".withUpperCase()", ".withLowerCase()", ".translateEscapes()",
 		".firstKey()", ".lastKey()", ".firstEntry()", ".lastEntry()", ".pollFirstEntry()", ".pollLastEntry()", ".descendingKeySet()", ".navigableKeySet()", ".descendingMap()",
 		".first()", ".last()", ".getFirst()", ".getLast()", ".peekFirst()", ".peekLast()", ".peek()", ".element()", ".pollFirst()", ".pollLast()", ".poll()", ".removeFirst()", ".removeLast()", ".pop()", ".descendingSet()",
@@ -6869,8 +6888,24 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			}
 			if b := getOrInitEvalBudget(params); b != nil && len(b.userClasses) > 0 {
 				mBare := strings.TrimSuffix(strings.TrimPrefix(mSuffix, "."), "()")
+				if recExpr == "super" {
+					if uo, isUO := params["this"].(*painlessUserObject); isUO && uo != nil && uo.class != nil {
+						curCls := uo.class
+						if cc, ok := params["__current_class"].(*painlessUserClass); ok && cc != nil {
+							curCls = cc
+						}
+						if curCls.parent != nil && curCls.parent.findMethod(mBare) != nil {
+							return evalUserClassMethodOnClassPainless(uo, curCls.parent, mBare, "", false, sourceMap, params, depth+1)
+						}
+					}
+				}
+				if uCls := b.userClasses[recExpr]; uCls != nil {
+					if ov, _ := uCls.findStaticMethodWithOwner(mBare); len(ov) > 0 {
+						return evalUserClassMethodOnClassPainless(nil, uCls, mBare, "", true, sourceMap, params, depth+1)
+					}
+				}
 				if uVal, uErr := evalRHSExprDepth(sourceMap, recExpr, params, depth+1); uErr == nil {
-					if uo, isUO := uVal.(*painlessUserObject); isUO && uo != nil && uo.class != nil && uo.class.methods[mBare] != nil {
+					if uo, isUO := uVal.(*painlessUserObject); isUO && uo != nil && uo.class != nil && uo.class.findMethod(mBare) != nil {
 						return evalUserObjectMethodPainless(uo, mBare, "", sourceMap, params, depth+1)
 					}
 				}
@@ -6933,6 +6968,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			if err != nil {
 				return nil, err
 			}
+			if res, handled, errR := evalRound54ZeroArgMethodPainless(mSuffix, recExpr, recVal, sourceMap, params, depth+1); handled {
+				return res, errR
+			}
 			if mSuffix == ".isPresent()" {
 				return !isEmptyOptionalOrNilPainless(recVal), nil
 			}
@@ -6958,7 +6996,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				if mSuffix == ".getAsInt()" || mSuffix == ".getAsLong()" || mSuffix == ".getAsDouble()" {
 					return nil, &painlessExceptionError{exType: "NoSuchElementException", message: "No value present"}
 				}
-				if mSuffix == ".getClass()" && recVal == painlessEmptyOptional {
+				if mSuffix == ".getClass()" && recVal != nil {
 					return painlessClassForValuePainless(recVal), nil
 				}
 				return nil, nil
@@ -7608,9 +7646,13 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					if shifted == nil {
 						pm.lastMatch = nil
 						pm.curPos = regEnd + 1
+						pm.lastSearchHitEnd = true
+						pm.lastSearchRequireEnd = false
 						return false, nil
 					}
 					pm.lastMatch = shifted
+					pm.lastSearchHitEnd = shifted[1] == regEnd
+					pm.lastSearchRequireEnd = false
 					if shifted[0] == shifted[1] {
 						pm.curPos = shifted[1]
 						if pm.curPos < regEnd {
@@ -7646,6 +7688,8 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					loc := fullRe.FindStringSubmatchIndex(pm.input[regStart:regEnd])
 					if loc == nil {
 						pm.lastMatch = nil
+						pm.lastSearchHitEnd = true
+						pm.lastSearchRequireEnd = false
 						return false, nil
 					}
 					if regStart > 0 {
@@ -7657,6 +7701,8 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					}
 					pm.lastMatch = loc
 					pm.curPos = regEnd
+					pm.lastSearchHitEnd = true
+					pm.lastSearchRequireEnd = false
 					return true, nil
 				}
 				return false, nil
@@ -7678,6 +7724,8 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					loc := prefixRe.FindStringSubmatchIndex(pm.input[regStart:regEnd])
 					if loc == nil {
 						pm.lastMatch = nil
+						pm.lastSearchHitEnd = true
+						pm.lastSearchRequireEnd = false
 						return false, nil
 					}
 					if regStart > 0 {
@@ -7689,6 +7737,8 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					}
 					pm.lastMatch = loc
 					pm.curPos = loc[1]
+					pm.lastSearchHitEnd = loc[1] == regEnd
+					pm.lastSearchRequireEnd = false
 					return true, nil
 				}
 				return false, nil
@@ -7779,8 +7829,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			return false, nil
 		}
 		switch tv := recVal.(type) {
+		case *painlessOptional:
+			return tv == nil || !tv.present, nil
 		case *painlessUserObject:
-			if tv != nil && tv.class != nil && tv.class.methods["isEmpty"] != nil {
+			if tv != nil && tv.class != nil && tv.class.findMethod("isEmpty") != nil {
 				return evalUserObjectMethodPainless(tv, "isEmpty", "", sourceMap, params, depth+1)
 			}
 		case *painlessBitSet:
@@ -7825,6 +7877,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		".setEmptyValue(",
 		".until(", ".datesUntil(", ".between(",
 		".thenComparing(", ".thenComparingInt(", ".thenComparingLong(", ".thenComparingDouble(", ".compare(",
+		".accept(", ".combine(", ".withOffsetSameLocal(", ".withOffsetSameInstant(", ".toEpochSecond(",
+		".splitAsStream(", ".usePattern(", ".useTransparentBounds(", ".useAnchoringBounds(", ".test(",
+		".resolve(", ".relativize(",
 	} {
 		if recExpr, argExpr, ok := matchTrailingMethodCallPainless(rhs, mName); ok {
 			if (mName == ".equals(" && (recExpr == "Objects" || recExpr == "Arrays")) ||
@@ -7833,7 +7888,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				(mName == ".codePointAt(" && recExpr == "Character") ||
 				(mName == ".between(" && (recExpr == "Duration" || recExpr == "Period" || strings.HasPrefix(recExpr, "ChronoUnit.") || strings.HasPrefix(recExpr, "java.time.temporal.ChronoUnit."))) ||
 				((mName == ".abs(" || mName == ".round(") && (recExpr == "Math" || recExpr == "StrictMath")) ||
-				(mName == ".replaceAll(" && recExpr == "Collections") ||
+				((mName == ".replaceAll(" || mName == ".addAll(") && recExpr == "Collections") ||
 				(mName == ".matches(" && recExpr == "Pattern") ||
 				(mName == ".format(" && recExpr == "String") ||
 				(mName == ".join(" && recExpr == "String") ||
@@ -7845,8 +7900,24 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			}
 			if b := getOrInitEvalBudget(params); b != nil && len(b.userClasses) > 0 {
 				mBare := strings.TrimSuffix(strings.TrimPrefix(mName, "."), "(")
+				if recExpr == "super" {
+					if uo, isUO := params["this"].(*painlessUserObject); isUO && uo != nil && uo.class != nil {
+						curCls := uo.class
+						if cc, ok := params["__current_class"].(*painlessUserClass); ok && cc != nil {
+							curCls = cc
+						}
+						if curCls.parent != nil && curCls.parent.findMethod(mBare) != nil {
+							return evalUserClassMethodOnClassPainless(uo, curCls.parent, mBare, argExpr, false, sourceMap, params, depth+1)
+						}
+					}
+				}
+				if uCls := b.userClasses[recExpr]; uCls != nil {
+					if ov, _ := uCls.findStaticMethodWithOwner(mBare); len(ov) > 0 {
+						return evalUserClassMethodOnClassPainless(nil, uCls, mBare, argExpr, true, sourceMap, params, depth+1)
+					}
+				}
 				if uVal, uErr := evalRHSExprDepth(sourceMap, recExpr, params, depth+1); uErr == nil {
-					if uo, isUO := uVal.(*painlessUserObject); isUO && uo != nil && uo.class != nil && uo.class.methods[mBare] != nil {
+					if uo, isUO := uVal.(*painlessUserObject); isUO && uo != nil && uo.class != nil && uo.class.findMethod(mBare) != nil {
 						return evalUserObjectMethodPainless(uo, mBare, argExpr, sourceMap, params, depth+1)
 					}
 				}
@@ -8717,6 +8788,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			if mName == ".get(" && strings.TrimSpace(argExpr) == "" && isEmptyOptionalOrNilPainless(recVal) {
 				return nil, &painlessExceptionError{exType: "NoSuchElementException", message: "No value present"}
 			}
+			if res, handled, errR := evalRound54ParamMethodPreArgPainless(mName, recExpr, recVal, argExpr, sourceMap, params, depth+1); handled {
+				return res, errR
+			}
 			if isEmptyOptionalOrNilPainless(recVal) && mName != ".orElse(" && mName != ".orElseGet(" && mName != ".orElseThrow(" && mName != ".ifPresent(" && mName != ".ifPresentOrElse(" && mName != ".or(" && mName != ".filter(" && mName != ".map(" && mName != ".flatMap(" {
 				if mName == ".startsWith(" || mName == ".endsWith(" || mName == ".regionMatches(" || mName == ".containsAll(" || mName == ".removeAll(" || mName == ".retainAll(" || mName == ".contains(" || mName == ".containsKey(" || mName == ".containsValue(" || mName == ".matches(" || mName == ".find(" || mName == ".equals(" || mName == ".equalsIgnoreCase(" || mName == ".isAfter(" || mName == ".isBefore(" || mName == ".isEqual(" || mName == ".isSupported(" || mName == ".isValidYear(" || mName == ".contentEquals(" || mName == ".testBit(" || mName == ".isProbablePrime(" || mName == ".intersects(" {
 					return false, nil
@@ -8939,11 +9013,12 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					pm.curPos = 0
 					pm.lastMatch = nil
 					pm.appendPos = 0
-					if arrowIdx := findNextUnquotedSubstr(args[0], "->", 0); arrowIdx > 0 {
-						pNames := parsePainlessLambdaHeader(args[0][:arrowIdx])
+					normReplArg := normalizeMethodReferenceToLambdaPainless(args[0], 1)
+					if arrowIdx := findNextUnquotedSubstr(normReplArg, "->", 0); arrowIdx > 0 {
+						pNames := parsePainlessLambdaHeader(normReplArg[:arrowIdx])
 						if len(pNames) > 0 && pm.re != nil {
 							pName := pNames[0]
-							body := args[0][arrowIdx+2:]
+							body := normReplArg[arrowIdx+2:]
 							var locs [][]int
 							if mName == ".replaceFirst(" {
 								if loc := pm.re.FindStringSubmatchIndex(pm.input[regStart:regEnd]); loc != nil {
@@ -11308,8 +11383,39 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 	if val, ok := params[decodeBracketSeg(rhs)]; ok {
 		return val, nil
 	}
+	if uo, isThis := params["this"].(*painlessUserObject); isThis && uo != nil && uo.fields != nil {
+		if fVal, hasF := uo.fields[rhs]; hasF {
+			return fVal, nil
+		}
+		if uo.class != nil {
+			if sVal, hasS := uo.class.getStaticField(rhs); hasS {
+				return sVal, nil
+			}
+		}
+	}
+	if curCls, isCC := params["__current_class"].(*painlessUserClass); isCC && curCls != nil {
+		if sVal, hasS := curCls.getStaticField(rhs); hasS {
+			return sVal, nil
+		}
+	}
 	if dotIdx := strings.IndexByte(rhs, '.'); dotIdx > 0 {
 		firstSeg := decodeBracketSeg(rhs[:dotIdx])
+		if firstSeg == "super" {
+			if uo, isThis := params["this"].(*painlessUserObject); isThis && uo != nil && uo.fields != nil {
+				fieldName := strings.TrimSpace(rhs[dotIdx+1:])
+				if fVal, hasF := uo.fields[fieldName]; hasF {
+					return fVal, nil
+				}
+			}
+		}
+		if b := getOrInitEvalBudget(params); b != nil && len(b.userClasses) > 0 {
+			if uCls := b.userClasses[firstSeg]; uCls != nil {
+				fieldName := strings.TrimSpace(rhs[dotIdx+1:])
+				if sVal, hasS := uCls.getStaticField(fieldName); hasS {
+					return sVal, nil
+				}
+			}
+		}
 		if _, ok := params[firstSeg]; ok {
 			return resolveParamPath(params, strings.Split(rhs, ".")), nil
 		}
@@ -11318,7 +11424,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		return nil, nil
 	}
 	constRhs := rhs
-	for _, pkgPfx := range []string{"java.time.format.", "java.time.temporal.", "java.time.", "java.math.", "java.lang.", "java.util.regex.", "java.nio.charset."} {
+	for _, pkgPfx := range []string{"java.time.format.", "java.time.temporal.", "java.time.", "java.math.", "java.lang.", "java.util.regex.", "java.util.function.", "java.util.", "java.net.", "java.nio.charset."} {
 		if strings.HasPrefix(constRhs, pkgPfx) {
 			constRhs = strings.TrimPrefix(constRhs, pkgPfx)
 			break
@@ -11510,7 +11616,17 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 	case "DateTimeFormatter.ISO_OFFSET_DATE_TIME", "DateTimeFormatter.ISO_ZONED_DATE_TIME", "DateTimeFormatter.ISO_INSTANT", "DateTimeFormatter.ISO_DATE_TIME":
 		return time.RFC3339Nano, nil
 	case "ZoneOffset.UTC":
-		return "UTC", nil
+		return "Z", nil
+	case "ZoneOffset.MIN":
+		return "-18:00", nil
+	case "ZoneOffset.MAX":
+		return "+18:00", nil
+	case "OffsetTime.MIN":
+		ot, _ := newPainlessOffsetTime(0, 0, 0, 0, -18*3600)
+		return ot, nil
+	case "OffsetTime.MAX":
+		ot, _ := newPainlessOffsetTime(23, 59, 59, 999999999, 18*3600)
+		return ot, nil
 	case "DayOfWeek.MONDAY", "DayOfWeek.TUESDAY", "DayOfWeek.WEDNESDAY", "DayOfWeek.THURSDAY", "DayOfWeek.FRIDAY", "DayOfWeek.SATURDAY", "DayOfWeek.SUNDAY":
 		return strings.TrimPrefix(constRhs, "DayOfWeek."), nil
 	case "Month.JANUARY", "Month.FEBRUARY", "Month.MARCH", "Month.APRIL", "Month.MAY", "Month.JUNE", "Month.JULY", "Month.AUGUST", "Month.SEPTEMBER", "Month.OCTOBER", "Month.NOVEMBER", "Month.DECEMBER":
@@ -11848,6 +11964,7 @@ func evalCollectionConstructorPainless(sourceMap map[string]any, rhs string, par
 	isBitSet := false
 	isStringJoiner := false
 	isUUID := false
+	isRound54Ctor := false
 	var userCls *painlessUserClass
 	switch clsName {
 	case "ArrayList", "LinkedList", "ArrayDeque", "PriorityQueue":
@@ -11872,6 +11989,8 @@ func evalCollectionConstructorPainless(sourceMap map[string]any, rhs string, par
 		isStringJoiner = true
 	case "UUID":
 		isUUID = true
+	case "IntSummaryStatistics", "LongSummaryStatistics", "DoubleSummaryStatistics", "URI", "URL":
+		isRound54Ctor = true
 	default:
 		if b := getOrInitEvalBudget(params); b != nil && b.userClasses != nil {
 			userCls = b.userClasses[clsName]
@@ -11895,7 +12014,16 @@ func evalCollectionConstructorPainless(sourceMap map[string]any, rhs string, par
 	}
 
 	var ctorVal any
-	if isString {
+	if isRound54Ctor {
+		v, handled, err := evalRound54ConstructorPainless(clsName, argStr, sourceMap, params, depth+1)
+		if err != nil {
+			return nil, true, err
+		}
+		if !handled {
+			return nil, false, nil
+		}
+		ctorVal = v
+	} else if isString {
 		if argStr == "" {
 			ctorVal = ""
 		} else {
@@ -13355,11 +13483,11 @@ func evalInstanceOfPainless(val any, typeName string) bool {
 		return false
 	}
 	typeName = strings.TrimSpace(typeName)
-	for _, pfx := range []string{"java.time.temporal.", "java.time.", "java.math.", "java.lang.", "java.util.regex.", "java.util."} {
+	for _, pfx := range []string{"java.time.temporal.", "java.time.", "java.math.", "java.lang.", "java.util.regex.", "java.util.function.", "java.util.", "java.net."} {
 		typeName = strings.TrimPrefix(typeName, pfx)
 	}
 	if val == painlessEmptyOptional {
-		return typeName == "Optional" || typeName == "OptionalInt" || typeName == "OptionalLong" || typeName == "OptionalDouble" || typeName == "Object" || typeName == "def"
+		return typeName == "Optional" || typeName == "Object" || typeName == "def"
 	}
 	if strings.HasSuffix(typeName, "]") {
 		_, ok := val.([]any)
@@ -13370,8 +13498,17 @@ func evalInstanceOfPainless(val any, typeName string) bool {
 		_, ok := val.([]any)
 		return ok
 	case "Map", "HashMap", "LinkedHashMap", "TreeMap", "NavigableMap", "SortedMap":
-		_, ok := val.(map[string]any)
-		return ok
+		if m, ok := val.(map[string]any); ok {
+			_, isStats := isSummaryStatisticsMapPainless(m)
+			return !isStats
+		}
+		return false
+	case "IntSummaryStatistics", "LongSummaryStatistics", "DoubleSummaryStatistics":
+		if m, ok := val.(map[string]any); ok {
+			st, isStats := isSummaryStatisticsMapPainless(m)
+			return isStats && st == typeName
+		}
+		return false
 	case "UUID":
 		s, ok := val.(string)
 		if !ok {
@@ -13383,7 +13520,35 @@ func evalInstanceOfPainless(val any, typeName string) bool {
 		_, ok := val.(painlessHexFormat)
 		return ok
 	case "Optional", "OptionalInt", "OptionalLong", "OptionalDouble":
-		return true
+		opt, ok := val.(*painlessOptional)
+		return ok && opt != nil && opt.kind == typeName
+	case "Clock":
+		_, ok := val.(*painlessClock)
+		return ok
+	case "OffsetTime":
+		_, ok := parsePainlessOffsetTime(val)
+		return ok
+	case "ZoneOffset":
+		_, ok := parseZoneOffsetSecondsPainless(val)
+		return ok
+	case "ZoneId":
+		if _, ok := parseZoneOffsetSecondsPainless(val); ok {
+			return true
+		}
+		if s, ok := val.(string); ok && s != "" {
+			_, err := time.LoadLocation(s)
+			return err == nil
+		}
+		return false
+	case "URI":
+		_, ok := val.(*painlessURI)
+		return ok
+	case "URL":
+		_, ok := val.(*painlessURL)
+		return ok
+	case "Predicate":
+		_, ok := val.(*painlessPredicate)
+		return ok
 	case "String", "CharSequence":
 		_, ok := val.(string)
 		return ok
@@ -13396,7 +13561,7 @@ func evalInstanceOfPainless(val any, typeName string) bool {
 	case "Duration":
 		_, ok := val.(time.Duration)
 		return ok
-	case "Matcher":
+	case "Matcher", "MatchResult":
 		_, ok := val.(*painlessMatcher)
 		return ok
 	case "Pattern":
@@ -13469,7 +13634,7 @@ func evalInstanceOfPainless(val any, typeName string) bool {
 		return true
 	default:
 		if uo, ok := val.(*painlessUserObject); ok && uo != nil && uo.class != nil {
-			return uo.class.name == typeName
+			return uo.class.isInstanceOf(typeName)
 		}
 		return false
 	}
@@ -14117,7 +14282,7 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 		return nil, false, nil
 	}
 	fnName := strings.TrimSpace(rhs[:openParen])
-	for _, pfx := range []string{"java.time.format.", "java.time.temporal.", "java.time.", "java.math.", "java.lang.", "java.util.stream.", "java.util.regex.", "java.util.", "java.nio.charset."} {
+	for _, pfx := range []string{"java.time.format.", "java.time.temporal.", "java.time.", "java.math.", "java.lang.", "java.util.stream.", "java.util.regex.", "java.util.function.", "java.util.", "java.net.", "java.nio.charset."} {
 		if strings.HasPrefix(fnName, pfx) {
 			fnName = strings.TrimPrefix(fnName, pfx)
 			break
@@ -14128,6 +14293,9 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 	}
 	argStr := strings.TrimSpace(rhs[openParen+1 : len(rhs)-1])
 	args := splitTopLevelCommaPainless(argStr)
+	if res, handled, err := evalRound54StaticCallPainless(fnName, args, argStr, sourceMap, params, depth+1); handled {
+		return res, true, err
+	}
 
 	evalNumArg := func(idx int) (float64, bool) {
 		if idx >= len(args) {
@@ -16341,18 +16509,34 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 		if b := getOrInitEvalBudget(params); b != nil && b.nowMillis > 0 {
 			nowMs = b.nowMillis
 		}
+		if len(args) >= 1 && strings.TrimSpace(args[0]) != "" {
+			cVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return nil, true, err
+			}
+			if clk, isClk := cVal.(*painlessClock); isClk && clk != nil {
+				return clk.currentTime(nowMs).UTC().Format(time.RFC3339Nano), true, nil
+			}
+		}
 		return time.UnixMilli(nowMs).UTC().Format(time.RFC3339Nano), true, nil
 	case "ZonedDateTime.now", "OffsetDateTime.now", "LocalDateTime.now", "LocalDate.now", "LocalTime.now", "YearMonth.now", "Year.now", "MonthDay.now":
 		nowMs := time.Now().UTC().UnixMilli()
 		if b := getOrInitEvalBudget(params); b != nil && b.nowMillis > 0 {
 			nowMs = b.nowMillis
 		}
-		loc := time.UTC
+		tm := time.UnixMilli(nowMs).UTC()
 		if len(args) >= 1 && strings.TrimSpace(args[0]) != "" {
-			zVal, _ := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
-			loc = parseZoneLocationPainless(zVal)
+			zVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return nil, true, err
+			}
+			if clk, isClk := zVal.(*painlessClock); isClk && clk != nil {
+				tm = clk.currentTime(nowMs)
+			} else {
+				loc := parseZoneLocationPainless(zVal)
+				tm = time.UnixMilli(nowMs).In(loc)
+			}
 		}
-		tm := time.UnixMilli(nowMs).In(loc)
 		switch fnName {
 		case "LocalDate.now":
 			return tm.Format("2006-01-02"), true, nil
@@ -17454,12 +17638,14 @@ func normalizeMethodReferenceToLambdaPainless(expr string, arity int) string {
 	switch target {
 	case "String", "CharSequence", "Object", "Number", "Integer", "Long", "Double", "Float", "Short", "Byte", "Boolean",
 		"BigDecimal", "Collection", "List", "ArrayList", "Set", "HashSet", "Map", "HashMap", "Map.Entry", "Entry", "Optional",
-		"LocalDate", "LocalTime", "LocalDateTime", "ZonedDateTime", "OffsetDateTime", "Instant", "YearMonth":
+		"LocalDate", "LocalTime", "LocalDateTime", "ZonedDateTime", "OffsetDateTime", "Instant", "YearMonth",
+		"MatchResult", "Matcher", "URI", "URL", "OffsetTime", "ZoneId", "ZoneOffset":
 		switch method {
 		case "toLowerCase", "toUpperCase", "trim", "strip", "stripLeading", "stripTrailing", "length", "isEmpty", "isBlank",
 			"toString", "toPlainString", "getKey", "getValue", "stream", "size", "intValue", "longValue", "doubleValue", "floatValue",
 			"shortValue", "byteValue", "get", "getAsInt", "getAsLong", "getAsDouble", "isPresent", "abs", "negate", "plus",
-			"stripTrailingZeros", "scale", "precision", "signum", "toLocalDate", "toLocalTime", "toEpochDay", "toSecondOfDay", "toNanoOfDay", "toEpochMilli":
+			"stripTrailingZeros", "scale", "precision", "signum", "toLocalDate", "toLocalTime", "toEpochDay", "toSecondOfDay", "toNanoOfDay", "toEpochMilli",
+			"group", "start", "end", "getId", "getOffset", "toASCIIString", "toExternalForm":
 			return "__mr0 -> __mr0." + method + "()"
 		}
 	}
@@ -18352,7 +18538,7 @@ func parseStreamChainStepsPainless(chain string) ([]painlessStreamStep, string, 
 func findStreamStartOutsideQuotesPainless(s string) (int, string) {
 	bestIdx := -1
 	bestSub := ""
-	for _, sub := range []string{".stream()", ".lines()", ".chars()", ".codePoints()"} {
+	for _, sub := range []string{".stream()", ".lines()", ".chars()", ".codePoints()", ".results()"} {
 		idx := findTopLevelSubstrPainless(s, sub)
 		if idx > 0 {
 			rest := strings.TrimSpace(s[idx+len(sub):])
@@ -18372,6 +18558,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 	var steps []painlessStreamStep
 	var tailRest string
 	var srcSlice []any
+	streamKind := "Stream"
 	if streamIdx > 0 {
 		recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:streamIdx], "?"))
 		chainRest := strings.TrimSpace(rhs[streamIdx+len(streamSub):])
@@ -18403,6 +18590,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 				srcSlice = splitLinesPainless(fmt.Sprintf("%v", recVal))
 			}
 		case ".chars()", ".codePoints()":
+			streamKind = "IntStream"
 			if recVal != nil {
 				runes := []rune(fmt.Sprintf("%v", recVal))
 				srcSlice = make([]any, len(runes))
@@ -18410,9 +18598,34 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 					srcSlice[i] = int64(r)
 				}
 			}
+		case ".results()":
+			res, handled, err := evalRound54ZeroArgMethodPainless(".results()", recExpr, recVal, sourceMap, params, depth+1)
+			if err != nil {
+				return nil, true, err
+			}
+			if handled {
+				if s, isSlice := res.([]any); isSlice {
+					srcSlice = s
+				}
+			}
 		default:
 			if bs, isBS := recVal.(*painlessBitSet); isBS {
+				streamKind = "IntStream"
 				srcSlice = bs.streamSlice()
+			} else if opt, isOpt := recVal.(*painlessOptional); isOpt {
+				switch opt.kind {
+				case "OptionalInt":
+					streamKind = "IntStream"
+				case "OptionalLong":
+					streamKind = "LongStream"
+				case "OptionalDouble":
+					streamKind = "DoubleStream"
+				}
+				if opt.present {
+					srcSlice = []any{opt.val}
+				} else {
+					srcSlice = []any{}
+				}
 			} else if s, ok := recVal.([]any); ok {
 				srcSlice = s
 			} else if !isEmptyOptionalOrNilPainless(recVal) {
@@ -18423,25 +18636,28 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 		}
 	} else {
 		matchedStaticStream := false
-		if duIdx := findTopLevelSubstrPainless(rhs, ".datesUntil("); duIdx > 0 {
-			openP := duIdx + len(".datesUntil(") - 1
-			closeP := findMatchingDelimiter(rhs, openP, '(', ')')
-			if closeP > openP && closeP < len(rhs)-1 {
-				chainRest := strings.TrimSpace(rhs[closeP+1:])
-				st, tr, ok := parseStreamChainStepsPainless(chainRest)
-				if ok && len(st) > 0 && isStreamStepMethodPainless(st[0].name) {
-					duVal, duErr := evalRHSExprDepth(sourceMap, rhs[:closeP+1], params, depth+1)
-					if duErr != nil {
-						return nil, true, duErr
+		for _, subCall := range []string{".datesUntil(", ".splitAsStream("} {
+			if duIdx := findTopLevelSubstrPainless(rhs, subCall); duIdx > 0 {
+				openP := duIdx + len(subCall) - 1
+				closeP := findMatchingDelimiter(rhs, openP, '(', ')')
+				if closeP > openP && closeP < len(rhs)-1 {
+					chainRest := strings.TrimSpace(rhs[closeP+1:])
+					st, tr, ok := parseStreamChainStepsPainless(chainRest)
+					if ok && len(st) > 0 && isStreamStepMethodPainless(st[0].name) {
+						duVal, duErr := evalRHSExprDepth(sourceMap, rhs[:closeP+1], params, depth+1)
+						if duErr != nil {
+							return nil, true, duErr
+						}
+						if s, isSlice := duVal.([]any); isSlice {
+							srcSlice = s
+						} else {
+							srcSlice = []any{}
+						}
+						steps = st
+						tailRest = tr
+						matchedStaticStream = true
+						break
 					}
-					if s, isSlice := duVal.([]any); isSlice {
-						srcSlice = s
-					} else {
-						srcSlice = []any{}
-					}
-					steps = st
-					tailRest = tr
-					matchedStaticStream = true
 				}
 			}
 		}
@@ -18454,6 +18670,14 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 			"Stream.generate(", "IntStream.generate(", "LongStream.generate(", "DoubleStream.generate(",
 		} {
 			if strings.HasPrefix(rhs, pfx) {
+				switch {
+				case strings.HasPrefix(pfx, "IntStream."):
+					streamKind = "IntStream"
+				case strings.HasPrefix(pfx, "LongStream."):
+					streamKind = "LongStream"
+				case strings.HasPrefix(pfx, "DoubleStream."):
+					streamKind = "DoubleStream"
+				}
 				openP := len(pfx) - 1
 				closeP := findMatchingDelimiter(rhs, openP, '(', ')')
 				if closeP > openP && closeP < len(rhs)-1 {
@@ -18516,6 +18740,33 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 	var terminalVal any
 	hasTerminal := false
 	isOptional := false
+	optKind := "Optional"
+	streamKindToOptKind := func(sk string) string {
+		switch sk {
+		case "IntStream":
+			return "OptionalInt"
+		case "LongStream":
+			return "OptionalLong"
+		case "DoubleStream":
+			return "OptionalDouble"
+		default:
+			return "Optional"
+		}
+	}
+	wrapTerminalOptional := func(v any, kind string) *painlessOptional {
+		if o, ok := v.(*painlessOptional); ok {
+			return o
+		}
+		if isEmptyOptionalOrNilPainless(v) {
+			return newPainlessOptional(kind, false, nil)
+		}
+		if kind != "Optional" {
+			if coerced, err := coerceOptionalPrimitivePainless(kind, v); err == nil {
+				return newPainlessOptional(kind, true, coerced)
+			}
+		}
+		return newPainlessOptional(kind, true, v)
+	}
 
 	for idx, step := range steps {
 		if hasTerminal {
@@ -18523,6 +18774,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 				switch step.name {
 				case "map", "flatMap":
 					if isEmptyOptionalOrNilPainless(terminalVal) {
+						optKind = "Optional"
 						continue
 					}
 					normArg := normalizeMethodReferenceToLambdaPainless(step.args, 1)
@@ -18531,7 +18783,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 						if len(pNames) > 0 {
 							pName := pNames[0]
 							prev, hadPrev := params[pName]
-							params[pName] = terminalVal
+							params[pName] = unwrapPainlessInternalValue(terminalVal)
 							mv, err := evalPainlessLambdaBody(normArg[arrowIdx+2:], sourceMap, params, depth+1)
 							if hadPrev {
 								params[pName] = prev
@@ -18542,6 +18794,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 								return nil, true, err
 							}
 							terminalVal = mv
+							optKind = "Optional"
 						}
 					}
 					continue
@@ -18549,26 +18802,12 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 					if isEmptyOptionalOrNilPainless(terminalVal) {
 						continue
 					}
-					normArg := normalizeMethodReferenceToLambdaPainless(step.args, 1)
-					if arrowIdx := findNextUnquotedSubstr(normArg, "->", 0); arrowIdx > 0 {
-						pNames := parsePainlessLambdaHeader(normArg[:arrowIdx])
-						if len(pNames) > 0 {
-							pName := pNames[0]
-							prev, hadPrev := params[pName]
-							params[pName] = terminalVal
-							matched, err := evalPainlessPredicateLambda(normArg[arrowIdx+2:], sourceMap, params, depth+1)
-							if hadPrev {
-								params[pName] = prev
-							} else {
-								delete(params, pName)
-							}
-							if err != nil {
-								return nil, true, err
-							}
-							if !matched {
-								terminalVal = painlessEmptyOptional
-							}
-						}
+					matched, err := evalPredicateArgOnItemPainless(step.args, unwrapPainlessInternalValue(terminalVal), sourceMap, params, depth+1)
+					if err != nil {
+						return nil, true, err
+					}
+					if !matched {
+						terminalVal = newPainlessOptional(optKind, false, nil)
 					}
 					continue
 				case "ifPresent":
@@ -18579,7 +18818,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 							if len(pNames) > 0 {
 								pName := pNames[0]
 								prev, hadPrev := params[pName]
-								params[pName] = terminalVal
+								params[pName] = unwrapPainlessInternalValue(terminalVal)
 								_, err := evalPainlessLambdaBody(normArg[arrowIdx+2:], sourceMap, params, depth+1)
 								if hadPrev {
 									params[pName] = prev
@@ -18605,7 +18844,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 								if len(pNames) > 0 {
 									pName := pNames[0]
 									prev, hadPrev := params[pName]
-									params[pName] = terminalVal
+									params[pName] = unwrapPainlessInternalValue(terminalVal)
 									_, err := evalPainlessLambdaBody(normArg[arrowIdx+2:], sourceMap, params, depth+1)
 									if hadPrev {
 										params[pName] = prev
@@ -18645,7 +18884,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 					if isEmptyOptionalOrNilPainless(terminalVal) {
 						items = []any{}
 					} else {
-						items = []any{terminalVal}
+						items = []any{unwrapPainlessInternalValue(terminalVal)}
 					}
 					hasTerminal = false
 					isOptional = false
@@ -18658,10 +18897,12 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 						}
 						return nil, true, &painlessExceptionError{exType: "NoSuchElementException", message: "No value present"}
 					}
+					terminalVal = unwrapPainlessInternalValue(terminalVal)
 					isOptional = false
 					continue
 				case "orElse":
 					if !isEmptyOptionalOrNilPainless(terminalVal) {
+						terminalVal = unwrapPainlessInternalValue(terminalVal)
 						isOptional = false
 						continue
 					}
@@ -18674,6 +18915,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 					continue
 				case "orElseGet":
 					if !isEmptyOptionalOrNilPainless(terminalVal) {
+						terminalVal = unwrapPainlessInternalValue(terminalVal)
 						isOptional = false
 						continue
 					}
@@ -18691,6 +18933,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 					if isEmptyOptionalOrNilPainless(terminalVal) {
 						return nil, true, &painlessExceptionError{exType: "NoSuchElementException", message: "No value present"}
 					}
+					terminalVal = unwrapPainlessInternalValue(terminalVal)
 					isOptional = false
 					continue
 				case "isPresent":
@@ -18702,6 +18945,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 					isOptional = false
 					continue
 				}
+				terminalVal = wrapTerminalOptional(terminalVal, optKind)
 			}
 			// Delegate remaining chained method calls on `terminalVal` via a temporary param
 			var sb strings.Builder
@@ -18726,68 +18970,63 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 		}
 
 		switch step.name {
-		case "filter", "takeWhile", "dropWhile":
-			normArg := normalizeMethodReferenceToLambdaPainless(step.args, 1)
-			arrowIdx := findNextUnquotedSubstr(normArg, "->", 0)
-			if arrowIdx > 0 {
-				pNames := parsePainlessLambdaHeader(normArg[:arrowIdx])
-				if len(pNames) > 0 {
-					pName := pNames[0]
-					rawBody := strings.TrimSpace(normArg[arrowIdx+2:])
-					budget := getOrInitEvalBudget(params)
-					prev, hadPrev := params[pName]
-					filtered := make([]any, 0, len(items))
-					dropping := step.name == "dropWhile"
-				filterLoop:
-					for _, it := range items {
-						if err := budget.step(); err != nil {
-							if hadPrev {
-								params[pName] = prev
-							} else {
-								delete(params, pName)
-							}
-							return nil, true, err
-						}
-						if step.name == "dropWhile" && !dropping {
-							filtered = append(filtered, it)
-							continue
-						}
-						params[pName] = it
-						matched, err := evalPainlessPredicateLambda(rawBody, sourceMap, params, depth+1)
-						if err != nil {
-							if hadPrev {
-								params[pName] = prev
-							} else {
-								delete(params, pName)
-							}
-							return nil, true, err
-						}
-						switch step.name {
-						case "filter":
-							if matched {
-								filtered = append(filtered, it)
-							}
-						case "takeWhile":
-							if !matched {
-								break filterLoop
-							}
-							filtered = append(filtered, it)
-						case "dropWhile":
-							if !matched {
-								dropping = false
-								filtered = append(filtered, it)
-							}
-						}
-					}
-					if hadPrev {
-						params[pName] = prev
-					} else {
-						delete(params, pName)
-					}
-					items = filtered
+		case "boxed":
+			streamKind = "Stream"
+		case "asLongStream":
+			streamKind = "LongStream"
+		case "asDoubleStream":
+			streamKind = "DoubleStream"
+			for i, it := range items {
+				if f, ok := toFloat64(it); ok {
+					items[i] = f
 				}
 			}
+		case "filter", "takeWhile", "dropWhile":
+			budget := getOrInitEvalBudget(params)
+			filtered := make([]any, 0, len(items))
+			dropping := step.name == "dropWhile"
+		filterLoop:
+			for _, it := range items {
+				if err := budget.step(); err != nil {
+					return nil, true, err
+				}
+				if step.name == "dropWhile" && !dropping {
+					filtered = append(filtered, it)
+					continue
+				}
+				matched, err := evalPredicateArgOnItemPainless(step.args, it, sourceMap, params, depth+1)
+				if err != nil {
+					return nil, true, err
+				}
+				switch step.name {
+				case "filter":
+					if matched {
+						filtered = append(filtered, it)
+					}
+				case "takeWhile":
+					if !matched {
+						break filterLoop
+					}
+					filtered = append(filtered, it)
+				case "dropWhile":
+					if !matched {
+						dropping = false
+						filtered = append(filtered, it)
+					}
+				}
+			}
+			items = filtered
 		case "map", "mapToObj", "mapToInt", "mapToLong", "mapToDouble":
+			switch step.name {
+			case "map", "mapToObj":
+				streamKind = "Stream"
+			case "mapToInt":
+				streamKind = "IntStream"
+			case "mapToLong":
+				streamKind = "LongStream"
+			case "mapToDouble":
+				streamKind = "DoubleStream"
+			}
 			normArg := normalizeMethodReferenceToLambdaPainless(step.args, 1)
 			arrowIdx := findNextUnquotedSubstr(normArg, "->", 0)
 			if arrowIdx > 0 {
@@ -18829,6 +19068,16 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 				}
 			}
 		case "flatMap", "flatMapToInt", "flatMapToLong", "flatMapToDouble":
+			switch step.name {
+			case "flatMap":
+				streamKind = "Stream"
+			case "flatMapToInt":
+				streamKind = "IntStream"
+			case "flatMapToLong":
+				streamKind = "LongStream"
+			case "flatMapToDouble":
+				streamKind = "DoubleStream"
+			}
 			normArg := normalizeMethodReferenceToLambdaPainless(step.args, 1)
 			arrowIdx := findNextUnquotedSubstr(normArg, "->", 0)
 			if arrowIdx > 0 {
@@ -18927,7 +19176,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 					}
 				}
 			}
-		case "boxed", "asDoubleStream", "asLongStream", "stream":
+		case "stream":
 			// No-op intermediate stream conversion
 		case "peek":
 			normArg := normalizeMethodReferenceToLambdaPainless(step.args, 1)
@@ -18963,11 +19212,19 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 			}
 			if isOptionalCollectorExprPainless(step.args) {
 				isOptional = true
+				optKind = "Optional"
 			}
 			terminalVal = cVal
 		case "summaryStatistics":
 			hasTerminal = true
-			stats, sErr := computeSummaryStatsPainless(items, "", false, sourceMap, params, depth+1)
+			statType := "IntSummaryStatistics"
+			switch streamKind {
+			case "LongStream":
+				statType = "LongSummaryStatistics"
+			case "DoubleStream":
+				statType = "DoubleSummaryStatistics"
+			}
+			stats, sErr := computeSummaryStatsWithKindPainless(items, "", statType, sourceMap, params, depth+1)
 			if sErr != nil {
 				return nil, true, sErr
 			}
@@ -18981,7 +19238,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 		case "sum":
 			hasTerminal = true
 			sum := 0.0
-			allInt := true
+			allInt := streamKind != "DoubleStream"
 			for _, it := range items {
 				if f, ok := toFloat64(it); ok {
 					sum += f
@@ -18998,6 +19255,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 		case "average":
 			hasTerminal = true
 			isOptional = true
+			optKind = "OptionalDouble"
 			if len(items) == 0 {
 				terminalVal = nil
 			} else {
@@ -19012,6 +19270,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 		case "min", "max":
 			hasTerminal = true
 			isOptional = true
+			optKind = streamKindToOptKind(streamKind)
 			if len(items) == 0 {
 				terminalVal = nil
 			} else {
@@ -19029,6 +19288,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 		case "findFirst", "findAny":
 			hasTerminal = true
 			isOptional = true
+			optKind = streamKindToOptKind(streamKind)
 			if len(items) > 0 {
 				terminalVal = items[0]
 			} else {
@@ -19036,39 +19296,14 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 			}
 		case "anyMatch", "allMatch", "noneMatch":
 			hasTerminal = true
-			normArg := normalizeMethodReferenceToLambdaPainless(step.args, 1)
-			arrowIdx := findNextUnquotedSubstr(normArg, "->", 0)
-			if arrowIdx <= 0 {
-				terminalVal = step.name != "anyMatch"
-				continue
-			}
-			pNames := parsePainlessLambdaHeader(normArg[:arrowIdx])
-			if len(pNames) == 0 {
-				terminalVal = step.name != "anyMatch"
-				continue
-			}
-			pName := pNames[0]
-			rawBody := strings.TrimSpace(normArg[arrowIdx+2:])
 			budget := getOrInitEvalBudget(params)
-			prev, hadPrev := params[pName]
 			resBool := step.name != "anyMatch"
 			for _, it := range items {
 				if err := budget.step(); err != nil {
-					if hadPrev {
-						params[pName] = prev
-					} else {
-						delete(params, pName)
-					}
 					return nil, true, err
 				}
-				params[pName] = it
-				matched, err := evalPainlessPredicateLambda(rawBody, sourceMap, params, depth+1)
+				matched, err := evalPredicateArgOnItemPainless(step.args, it, sourceMap, params, depth+1)
 				if err != nil {
-					if hadPrev {
-						params[pName] = prev
-					} else {
-						delete(params, pName)
-					}
 					return nil, true, err
 				}
 				if step.name == "anyMatch" && matched {
@@ -19083,11 +19318,6 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 					resBool = false
 					break
 				}
-			}
-			if hadPrev {
-				params[pName] = prev
-			} else {
-				delete(params, pName)
 			}
 			terminalVal = resBool
 		case "reduce":
@@ -19106,6 +19336,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 				fnExpr = strings.TrimSpace(rArgs[1])
 			} else {
 				isOptional = true
+				optKind = streamKindToOptKind(streamKind)
 			}
 			fnExpr = normalizeMethodReferenceToLambdaPainless(fnExpr, 2)
 			arrowIdx := findNextUnquotedSubstr(fnExpr, "->", 0)
@@ -19172,8 +19403,8 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 
 	if !hasTerminal {
 		terminalVal = items
-	} else if isOptional && isEmptyOptionalOrNilPainless(terminalVal) {
-		terminalVal = painlessEmptyOptional
+	} else if isOptional {
+		terminalVal = wrapTerminalOptional(terminalVal, optKind)
 	}
 	if tailRest != "" {
 		prevTmp, hadTmp := params["__stream_res"]
@@ -19465,7 +19696,14 @@ func evalStreamCollectorPainless(collectorExpr string, items []any, sourceMap, p
 	for _, statPfx := range []string{"Collectors.summarizingInt(", "Collectors.summarizingLong(", "Collectors.summarizingDouble("} {
 		if strings.HasPrefix(cExpr, statPfx) && strings.HasSuffix(cExpr, ")") {
 			fnExpr := strings.TrimSpace(cExpr[len(statPfx) : len(cExpr)-1])
-			return computeSummaryStatsPainless(items, fnExpr, statPfx == "Collectors.summarizingDouble(", sourceMap, params, depth+1)
+			statType := "IntSummaryStatistics"
+			switch statPfx {
+			case "Collectors.summarizingLong(":
+				statType = "LongSummaryStatistics"
+			case "Collectors.summarizingDouble(":
+				statType = "DoubleSummaryStatistics"
+			}
+			return computeSummaryStatsWithKindPainless(items, fnExpr, statType, sourceMap, params, depth+1)
 		}
 	}
 	if strings.HasPrefix(cExpr, "Collectors.collectingAndThen(") && strings.HasSuffix(cExpr, ")") {
@@ -19800,102 +20038,6 @@ func isStreamStepMethodPainless(name string) bool {
 		return true
 	}
 	return false
-}
-
-func computeSummaryStatsPainless(items []any, fnExpr string, forceDouble bool, sourceMap, params map[string]any, depth int) (map[string]any, error) {
-	allInt := !forceDouble
-	var vals []float64
-	if fnExpr != "" {
-		fnExpr = normalizeMethodReferenceToLambdaPainless(fnExpr, 1)
-		arrowIdx := findNextUnquotedSubstr(fnExpr, "->", 0)
-		if arrowIdx > 0 {
-			pNames := parsePainlessLambdaHeader(fnExpr[:arrowIdx])
-			if len(pNames) > 0 {
-				pName := pNames[0]
-				body := fnExpr[arrowIdx+2:]
-				prev, hadPrev := params[pName]
-				for _, it := range items {
-					params[pName] = it
-					mv, err := evalPainlessLambdaBody(body, sourceMap, params, depth+1)
-					if err != nil {
-						if hadPrev {
-							params[pName] = prev
-						} else {
-							delete(params, pName)
-						}
-						return nil, err
-					}
-					if f, ok := toFloat64(mv); ok {
-						vals = append(vals, f)
-					}
-				}
-				if hadPrev {
-					params[pName] = prev
-				} else {
-					delete(params, pName)
-				}
-			}
-		}
-	} else {
-		for _, it := range items {
-			if f, ok := toFloat64(it); ok {
-				vals = append(vals, f)
-			}
-		}
-	}
-	var count int64
-	var sum, minVal, maxVal float64
-	for i, f := range vals {
-		count++
-		sum += f
-		if f != float64(int64(f)) {
-			allInt = false
-		}
-		if i == 0 || f < minVal {
-			minVal = f
-		}
-		if i == 0 || f > maxVal {
-			maxVal = f
-		}
-	}
-	avg := 0.0
-	if count > 0 {
-		avg = sum / float64(count)
-	}
-	if allInt {
-		if count == 0 {
-			return map[string]any{
-				"count":   int64(0),
-				"sum":     int64(0),
-				"min":     int64(math.MaxInt32),
-				"max":     int64(math.MinInt32),
-				"average": float64(0),
-			}, nil
-		}
-		return map[string]any{
-			"count":   count,
-			"sum":     int64(sum),
-			"min":     int64(minVal),
-			"max":     int64(maxVal),
-			"average": avg,
-		}, nil
-	}
-	if count == 0 {
-		return map[string]any{
-			"count":   int64(0),
-			"sum":     float64(0),
-			"min":     math.Inf(1),
-			"max":     math.Inf(-1),
-			"average": float64(0),
-		}, nil
-	}
-	return map[string]any{
-		"count":   count,
-		"sum":     sum,
-		"min":     minVal,
-		"max":     maxVal,
-		"average": avg,
-	}, nil
 }
 
 func splitLinesPainless(s string) []any {
@@ -23793,17 +23935,18 @@ func evalArraysCompareOrMismatchPainless(args []string, isMismatch bool, sourceM
 }
 
 func instantiateUserClassPainless(cls *painlessUserClass, argStr string, sourceMap, params map[string]any, depth int) (*painlessUserObject, error) {
+	allFields := cls.allInstanceFields()
 	uo := &painlessUserObject{
 		class:  cls,
-		fields: make(map[string]any, len(cls.fields)),
+		fields: make(map[string]any, len(allFields)),
 	}
-	localScope := make(map[string]any, len(params)+len(cls.fields)+4)
+	localScope := make(map[string]any, len(params)+len(allFields)+4)
 	for k, v := range params {
 		localScope[k] = v
 	}
 	localScope["this"] = uo
-	// Initialize fields with defaults
-	for _, f := range cls.fields {
+	// Initialize fields with defaults (parent fields first, then child fields)
+	for _, f := range allFields {
 		if f.initExpr != "" {
 			val, err := evalRHSExprDepth(sourceMap, f.initExpr, localScope, depth+1)
 			if err != nil {
@@ -23836,32 +23979,8 @@ func instantiateUserClassPainless(cls *painlessUserClass, argStr string, sourceM
 			argVals = append(argVals, av)
 		}
 	}
-	// Find matching constructor by arity
-	var matchedCtor *painlessUserFunc
-	for _, ctor := range cls.constructors {
-		if len(ctor.paramNames) == len(argVals) {
-			matchedCtor = ctor
-			break
-		}
-	}
-	if matchedCtor != nil {
-		budget := getOrInitEvalBudget(params)
-		ctorScope := make(map[string]any, len(params)+len(matchedCtor.paramNames)+4)
-		for k, v := range params {
-			ctorScope[k] = v
-		}
-		ctorScope["this"] = uo
-		methodParams := make(map[string]bool, len(matchedCtor.paramNames))
-		for i, pName := range matchedCtor.paramNames {
-			ctorScope[pName] = argVals[i]
-			methodParams[pName] = true
-		}
-		ctorScope["__method_params"] = methodParams
-		ctorScope["__script_locals"] = make(map[string]bool)
-		ctxOp := ""
-		if err := execBlock(sourceMap, matchedCtor.body, ctorScope, &ctxOp, budget); err != nil && !errors.Is(err, errPainlessReturn) {
-			return nil, err
-		}
+	if err := runUserClassConstructorChainPainless(uo, cls, argVals, sourceMap, params, depth+1); err != nil {
+		return nil, err
 	}
 	return uo, nil
 }
@@ -23928,7 +24047,7 @@ func evalTrailingUserObjectMethodCallPainless(sourceMap map[string]any, rhs stri
 	if !ok || uo == nil || uo.class == nil {
 		return nil, false, nil
 	}
-	if len(uo.class.methods[methodName]) == 0 {
+	if len(uo.class.findMethod(methodName)) == 0 {
 		return nil, false, nil
 	}
 	argStr := strings.TrimSpace(rhs[openIdx+1 : len(rhs)-1])
@@ -23940,64 +24059,5 @@ func evalUserObjectMethodPainless(uo *painlessUserObject, methodName, argStr str
 	if uo == nil || uo.class == nil {
 		return nil, nil
 	}
-	var argVals []any
-	if strings.TrimSpace(argStr) != "" {
-		rawArgs := splitTopLevelCommaPainless(argStr)
-		argVals = make([]any, 0, len(rawArgs))
-		for _, ra := range rawArgs {
-			av, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(ra), params, depth+1)
-			if err != nil {
-				return nil, err
-			}
-			argVals = append(argVals, av)
-		}
-	}
-	var fn *painlessUserFunc
-	if overloads := uo.class.methods[methodName]; len(overloads) > 0 {
-		for _, cand := range overloads {
-			if len(cand.paramNames) == len(argVals) {
-				fn = cand
-				break
-			}
-		}
-		if fn == nil {
-			fn = overloads[0]
-		}
-	}
-	if fn == nil {
-		return nil, nil
-	}
-	budget := getOrInitEvalBudget(params)
-	if err := budget.step(); err != nil {
-		return nil, err
-	}
-	mScope := make(map[string]any, len(params)+len(fn.paramNames)+4)
-	for k, v := range params {
-		if k == "_return_val" || k == "_last_expr_val" {
-			continue
-		}
-		mScope[k] = v
-	}
-	mScope["this"] = uo
-	methodParams := make(map[string]bool, len(fn.paramNames))
-	for i, pName := range fn.paramNames {
-		if i < len(argVals) {
-			mScope[pName] = argVals[i]
-		}
-		methodParams[pName] = true
-	}
-	mScope["__method_params"] = methodParams
-	mScope["__script_locals"] = make(map[string]bool)
-	ctxOp := ""
-	err := execBlock(sourceMap, fn.body, mScope, &ctxOp, budget)
-	if err != nil && !errors.Is(err, errPainlessReturn) {
-		return nil, err
-	}
-	if fn.returnType == "void" {
-		return nil, nil
-	}
-	if retVal, hasRet := mScope["_return_val"]; hasRet {
-		return retVal, nil
-	}
-	return mScope["_last_expr_val"], nil
+	return evalUserClassMethodOnClassPainless(uo, uo.class, methodName, argStr, false, sourceMap, params, depth)
 }

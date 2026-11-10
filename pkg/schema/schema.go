@@ -148,16 +148,19 @@ type NestedRootSpec struct {
 
 // IndexSchema holds the compiled schema registry for an Elasticsearch index.
 type IndexSchema struct {
-	IndexName       string
-	DorisDB         string
-	DorisTable      string
-	Buckets         int
-	Fields          map[string]FieldBinding
-	OrderedFields   []FieldBinding
-	NestedRoots     map[string]string // Maps ES nested path (e.g. "columns") -> Doris column ("n__columns")
-	nestedRootPaths map[string][]string
-	NestedRootSpecs []NestedRootSpec
-	RawMapping      *esast.MappingSpec
+	IndexName          string
+	DorisDB            string
+	DorisTable         string
+	Buckets            int
+	Fields             map[string]FieldBinding
+	OrderedFields      []FieldBinding
+	NestedRoots        map[string]string // Maps ES nested path (e.g. "columns") -> Doris column ("n__columns")
+	nestedRootPaths    map[string][]string
+	NestedRootSpecs    []NestedRootSpec
+	RawMapping         *esast.MappingSpec
+	MaxNestedObjects   int
+	MaxDepth           int
+	MaxFieldNameLength int
 }
 
 // DefaultMultiValuedPaths lists common OpenMetadata & DataHub paths that hold arrays of objects/strings
@@ -685,6 +688,194 @@ func validateSingleFieldProperty(fullPath, fType string, prop esast.FieldPropert
 			}
 		}
 	}
+	if prop.CopyTo != nil {
+		switch fType {
+		case "object", "nested", "alias", "join":
+			return fmt.Errorf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters: [copy_to] is not supported on [%s]", fullPath, fType)
+		}
+		var targets []string
+		switch cv := prop.CopyTo.(type) {
+		case string:
+			t := strings.TrimSpace(cv)
+			if t == "" {
+				return fmt.Errorf("mapper_parsing_exception: [copy_to] on field [%s] cannot be empty", fullPath)
+			}
+			targets = []string{t}
+		case []string:
+			if len(cv) == 0 {
+				return fmt.Errorf("mapper_parsing_exception: [copy_to] on field [%s] cannot be empty", fullPath)
+			}
+			for _, elem := range cv {
+				t := strings.TrimSpace(elem)
+				if t == "" {
+					return fmt.Errorf("mapper_parsing_exception: [copy_to] on field [%s] cannot contain empty strings", fullPath)
+				}
+				targets = append(targets, t)
+			}
+		case []any:
+			if len(cv) == 0 {
+				return fmt.Errorf("mapper_parsing_exception: [copy_to] on field [%s] cannot be empty", fullPath)
+			}
+			for _, elem := range cv {
+				s, ok := elem.(string)
+				if !ok || strings.TrimSpace(s) == "" {
+					return fmt.Errorf("mapper_parsing_exception: [copy_to] on field [%s] must be a string or array of non-empty strings", fullPath)
+				}
+				targets = append(targets, strings.TrimSpace(s))
+			}
+		default:
+			return fmt.Errorf("mapper_parsing_exception: [copy_to] on field [%s] must be a string or array of strings", fullPath)
+		}
+		shortName := fullPath
+		if dot := strings.LastIndex(fullPath, "."); dot >= 0 {
+			shortName = fullPath[dot+1:]
+		}
+		for _, target := range targets {
+			if target == fullPath || target == shortName {
+				return fmt.Errorf("mapper_parsing_exception: Cannot copy field [%s] to itself", fullPath)
+			}
+		}
+	}
+	return nil
+}
+
+var validRuntimeFieldTypes = map[string]bool{
+	"boolean":   true,
+	"composite": true,
+	"date":      true,
+	"double":    true,
+	"geo_point": true,
+	"ip":        true,
+	"keyword":   true,
+	"long":      true,
+	"lookup":    true,
+}
+
+var validDynamicMatchMappingTypes = map[string]bool{
+	"*":       true,
+	"boolean": true,
+	"date":    true,
+	"double":  true,
+	"long":    true,
+	"object":  true,
+	"string":  true,
+	"binary":  true,
+}
+
+func validateDynamicTemplatesSpec(templates []map[string]any) error {
+	for i, tmplEntry := range templates {
+		if len(tmplEntry) != 1 {
+			return fmt.Errorf("mapper_parsing_exception: dynamic_templates[%d] must have exactly 1 named template entry, got %d", i, len(tmplEntry))
+		}
+		for tmplName, rawDef := range tmplEntry {
+			if strings.TrimSpace(tmplName) == "" {
+				return fmt.Errorf("mapper_parsing_exception: dynamic template name cannot be empty")
+			}
+			defMap, ok := rawDef.(map[string]any)
+			if !ok || len(defMap) == 0 {
+				return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] definition must be an object", tmplName)
+			}
+			for k := range defMap {
+				switch k {
+				case "mapping", "match", "unmatch", "match_pattern", "path_match", "path_unmatch", "match_mapping_type":
+				default:
+					return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] has unknown parameter [%s]", tmplName, k)
+				}
+			}
+			if rawMMT, hasMMT := defMap["match_mapping_type"]; hasMMT && rawMMT != nil {
+				validateMMT := func(s string) error {
+					norm := strings.ToLower(strings.TrimSpace(s))
+					if !validDynamicMatchMappingTypes[norm] {
+						return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] has invalid [match_mapping_type] [%s]", tmplName, s)
+					}
+					return nil
+				}
+				switch v := rawMMT.(type) {
+				case string:
+					if err := validateMMT(v); err != nil {
+						return err
+					}
+				case []string:
+					if len(v) == 0 {
+						return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] [match_mapping_type] cannot be empty", tmplName)
+					}
+					for _, item := range v {
+						if err := validateMMT(item); err != nil {
+							return err
+						}
+					}
+				case []any:
+					if len(v) == 0 {
+						return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] [match_mapping_type] cannot be empty", tmplName)
+					}
+					for _, item := range v {
+						s, ok := item.(string)
+						if !ok {
+							return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] [match_mapping_type] elements must be strings", tmplName)
+						}
+						if err := validateMMT(s); err != nil {
+							return err
+						}
+					}
+				default:
+					return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] [match_mapping_type] must be a string or array of strings", tmplName)
+				}
+			}
+			isRegex := false
+			if rawMP, hasMP := defMap["match_pattern"]; hasMP && rawMP != nil {
+				mpStr, ok := rawMP.(string)
+				if !ok {
+					return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] [match_pattern] must be a string", tmplName)
+				}
+				switch strings.ToLower(strings.TrimSpace(mpStr)) {
+				case "simple":
+				case "regex":
+					isRegex = true
+				default:
+					return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] has invalid [match_pattern] [%s]", tmplName, mpStr)
+				}
+			}
+			if isRegex {
+				for _, patKey := range []string{"match", "unmatch"} {
+					if rawPat, hasPat := defMap[patKey]; hasPat && rawPat != nil {
+						patStr, ok := rawPat.(string)
+						if !ok {
+							return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] [%s] must be a string", tmplName, patKey)
+						}
+						if _, err := regexp.Compile(patStr); err != nil {
+							return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] has invalid regex in [%s]: %w", tmplName, patKey, err)
+						}
+					}
+				}
+			}
+			rawMapping, hasMapping := defMap["mapping"]
+			mappingMap, ok := rawMapping.(map[string]any)
+			if !hasMapping || !ok {
+				return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] requires a [mapping] object", tmplName)
+			}
+			if rawType, hasType := mappingMap["type"]; hasType && rawType != nil {
+				typeStr, ok := rawType.(string)
+				if !ok || strings.TrimSpace(typeStr) == "" {
+					return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] [mapping.type] must be a non-empty string", tmplName)
+				}
+				if strings.TrimSpace(typeStr) != "{dynamic_type}" {
+					b, err := json.Marshal(mappingMap)
+					if err != nil {
+						return err
+					}
+					var fp esast.FieldProperty
+					if err := json.Unmarshal(b, &fp); err != nil {
+						return err
+					}
+					// Replace `{name}` / `{dynamic_type}` placeholders in copy_to before single-field validation
+					substituteDynamicTemplatePlaceholders(&fp, tmplName, "keyword")
+					if err := validateSingleFieldProperty(tmplName, strings.ToLower(strings.TrimSpace(fp.Type)), fp); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -697,12 +888,46 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 	if err := validateDynamicModeVal(m.Dynamic, "_root"); err != nil {
 		return err
 	}
+	for rtName, rtProp := range m.Runtime {
+		if strings.TrimSpace(rtName) == "" {
+			return fmt.Errorf("mapper_parsing_exception: runtime field name cannot be empty")
+		}
+		rtType := strings.ToLower(strings.TrimSpace(rtProp.Type))
+		if !validRuntimeFieldTypes[rtType] {
+			return fmt.Errorf("mapper_parsing_exception: No handler for runtime type [%s] declared on field [%s]", rtProp.Type, rtName)
+		}
+		if rtProp.Script != nil {
+			switch sv := rtProp.Script.(type) {
+			case string:
+				if strings.TrimSpace(sv) == "" {
+					return fmt.Errorf("mapper_parsing_exception: runtime field [%s] script cannot be empty", rtName)
+				}
+			case map[string]any:
+				src, hasSrc := sv["source"]
+				id, hasID := sv["id"]
+				if (!hasSrc && !hasID) || (hasSrc && strings.TrimSpace(fmt.Sprintf("%v", src)) == "") || (hasID && strings.TrimSpace(fmt.Sprintf("%v", id)) == "") {
+					return fmt.Errorf("mapper_parsing_exception: runtime field [%s] script requires non-empty [source] or [id]", rtName)
+				}
+			default:
+				return fmt.Errorf("mapper_parsing_exception: runtime field [%s] invalid [script]", rtName)
+			}
+		}
+	}
+	if err := validateDynamicTemplatesSpec(m.DynamicTemplates); err != nil {
+		return err
+	}
 	if len(m.Properties) == 0 {
 		return nil
 	}
 	allTypes := make(map[string]string)
 	aliasTargets := make(map[string]string)
 	aliasPrefixes := make(map[string]string)
+	type copyToRef struct {
+		source string
+		prefix string
+		target string
+	}
+	var copyToRefs []copyToRef
 
 	var collect func(props map[string]esast.FieldProperty, prefix string) error
 	collect = func(props map[string]esast.FieldProperty, prefix string) error {
@@ -718,6 +943,9 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 			allTypes[fullPath] = fType
 			if err := validateSingleFieldProperty(fullPath, fType, prop); err != nil {
 				return err
+			}
+			for _, ct := range prop.CopyToSlice() {
+				copyToRefs = append(copyToRefs, copyToRef{source: fullPath, prefix: prefix, target: strings.TrimSpace(ct)})
 			}
 			if fType == "alias" {
 				target := strings.TrimSpace(prop.Path)
@@ -740,6 +968,9 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 					allTypes[subFull] = sfType
 					if err := validateSingleFieldProperty(subFull, sfType, fprop); err != nil {
 						return err
+					}
+					for _, ct := range fprop.CopyToSlice() {
+						copyToRefs = append(copyToRefs, copyToRef{source: subFull, prefix: prefix, target: strings.TrimSpace(ct)})
 					}
 					if sfType == "alias" {
 						target := strings.TrimSpace(fprop.Path)
@@ -764,6 +995,19 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 	}
 	if err := collect(m.Properties, ""); err != nil {
 		return err
+	}
+
+	for _, ref := range copyToRefs {
+		targetType, exists := allTypes[ref.target]
+		if !exists && ref.prefix != "" {
+			targetType, exists = allTypes[ref.prefix+"."+ref.target]
+		}
+		if exists {
+			switch targetType {
+			case "object", "nested", "alias", "join":
+				return fmt.Errorf("mapper_parsing_exception: [copy_to] on field [%s] cannot target [%s] field [%s]", ref.source, targetType, ref.target)
+			}
+		}
 	}
 
 	resolveTarget := func(aliasPath, target string) string {

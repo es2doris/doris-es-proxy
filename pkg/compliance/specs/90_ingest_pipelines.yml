@@ -424,6 +424,48 @@
   - match: { docs.0.doc._source.env: "prod\"1" }
   - match: { docs.0.doc._source.tier: "backend" }
 
+---
+"Round 54 terminate, circle, grok keep_empty_captures/ecs_compatibility, and kv transform_key":
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - kv:
+                  field: "raw_kv"
+                  field_split: "[&,]"
+                  value_split: "[=:]"
+                  transform_key: "lowercase"
+              - grok:
+                  field: "raw_log"
+                  patterns: ["%{HOSTPORT:hp} %{UNIXPATH:path}(?: %{WORD:opt})?"]
+                  keep_empty_captures: true
+              - circle:
+                  field: "area"
+                  target_field: "area_poly"
+                  shape_type: "shape"
+                  error_distance: 10.0
+              - terminate:
+                  if: "ctx.skip_rest == true"
+              - set:
+                  field: "after_terminate"
+                  value: "should_not_run"
+          docs:
+            - _source:
+                raw_kv: "TAG=alpha&tag:beta,Env=Prod"
+                raw_log: "10.0.0.1:8080 /var/log/syslog"
+                area: "CIRCLE (0 0 10)"
+                skip_rest: true
+  - match: { docs.0.doc._source.tag.0: "alpha" }
+  - match: { docs.0.doc._source.tag.1: "beta" }
+  - match: { docs.0.doc._source.env: "Prod" }
+  - match: { docs.0.doc._source.hp: "10.0.0.1:8080" }
+  - match: { docs.0.doc._source.path: "/var/log/syslog" }
+  - is_false: docs.0.doc._source.opt
+  - is_false: docs.0.doc._source.after_terminate
+  - match: { docs.0.doc._source.area_poly: /^POLYGON \(\(.+\)\)$/ }
+
+
 
 
 

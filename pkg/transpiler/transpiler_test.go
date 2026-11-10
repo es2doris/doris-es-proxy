@@ -3580,12 +3580,12 @@ func TestRound50TranspilerGeoPolygonRangeContainsNestedSpanSortAndTermsSet(t *te
 		t.Fatalf("F16 expected _geo_distance with missing='500km' to wrap in COALESCE(..., 500000), got plan=%+v err=%v", planMG, err)
 	}
 
-	// F19: terms_set minimum_should_match_field clamped to >= 1 via GREATEST(1, ...)
+	// F19: terms_set minimum_should_match_field requires IS NOT NULL and GREATEST(0, col)
 	var tsFieldQ esast.Query
 	_ = json.Unmarshal([]byte(`{"terms_set": {"tags": {"terms": ["a", "b"], "minimum_should_match_field": "req_matches"}}}`), &tsFieldQ)
 	cqTSF := tr.CompileQuery(&tsFieldQ, false, nil)
-	if !strings.Contains(cqTSF.WhereSQL, "GREATEST(1, COALESCE(`f__req_matches`, 1))") {
-		t.Fatalf("F19 expected terms_set minimum_should_match_field to be wrapped in GREATEST(1, ...), got %s", cqTSF.WhereSQL)
+	if !strings.Contains(cqTSF.WhereSQL, "`f__req_matches` IS NOT NULL") || !strings.Contains(cqTSF.WhereSQL, "GREATEST(0, `f__req_matches`)") {
+		t.Fatalf("F19 expected terms_set minimum_should_match_field to check IS NOT NULL and GREATEST(0, ...), got %s", cqTSF.WhereSQL)
 	}
 
 	// Additional wrapper and distance_feature branch coverage
@@ -4081,5 +4081,153 @@ func TestRound53TranspilerF14AndF17ToF19(t *testing.T) {
 	_ = json.Unmarshal([]byte(`{"query":{"query_string":{"query":"price:[10 TO 20","lenient":true}}}`), &lenientQS)
 	if _, err := tr.BuildSearchPlan(&lenientQS); err != nil {
 		t.Fatalf("F19 expected lenient:true query_string with unclosed range not to error, got %v", err)
+	}
+}
+
+func TestRound54TranspilerF11AndF15ToF19(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"title":      {"type": "text", "analyzer": "stop"},
+			"body":       {"type": "text", "analyzer": "stop"},
+			"status":     {"type": "keyword"},
+			"tags":       {"type": "keyword"},
+			"req_num":    {"type": "integer"},
+			"no_dv_num":  {"type": "integer", "doc_values": false},
+			"loc":        {"type": "geo_point"},
+			"labels":     {"type": "flattened"},
+			"my_join": {
+				"type": "join",
+				"relations": {
+					"question": ["answer", "comment"]
+				}
+			}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("mapping unmarshal failed: %v", err)
+	}
+	sch := schema.CompileIndexSchema("db", "r54_tr_idx", &spec)
+	tr := NewTranspiler(sch, TranspilerOptions{UseDoris4SearchFunc: true})
+
+	// F11: terms_set minimum_should_match_field rejects non-numeric field and doc_values:false field
+	for _, badTS := range []string{
+		`{"query":{"terms_set":{"tags":{"terms":["a","b"],"minimum_should_match_field":"status"}}}}`,
+		`{"query":{"terms_set":{"tags":{"terms":["a","b"],"minimum_should_match_field":"no_dv_num"}}}}`,
+	} {
+		var sr esast.SearchRequest
+		if err := json.Unmarshal([]byte(badTS), &sr); err != nil {
+			t.Fatalf("F11 unmarshal %s failed: %v", badTS, err)
+		}
+		if _, err := tr.BuildSearchPlan(&sr); err == nil {
+			t.Fatalf("F11 expected BuildSearchPlan error for %s", badTS)
+		}
+	}
+
+	// F15: query_string allow_leading_wildcard:false rejects leading * or ?
+	for _, badLW := range []string{
+		`{"query":{"query_string":{"default_field":"title","query":"*fox","allow_leading_wildcard":false}}}`,
+		`{"query":{"query_string":{"default_field":"title","query":"?fox","allow_leading_wildcard":false}}}`,
+		`{"query":{"query_string":{"query":"title:*fox","allow_leading_wildcard":false}}}`,
+	} {
+		var sr esast.SearchRequest
+		if err := json.Unmarshal([]byte(badLW), &sr); err != nil {
+			t.Fatalf("F15 unmarshal %s failed: %v", badLW, err)
+		}
+		if _, err := tr.BuildSearchPlan(&sr); err == nil || !strings.Contains(err.Error(), "Leading wildcard is not allowed") {
+			t.Fatalf("F15 expected leading wildcard error for %s, got %v", badLW, err)
+		}
+	}
+	// Escaped leading \* with allow_leading_wildcard:false is allowed
+	var escapedLWSR esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"query_string":{"default_field":"title","query":"\\*fox","allow_leading_wildcard":false}}}`), &escapedLWSR)
+	if _, err := tr.BuildSearchPlan(&escapedLWSR); err != nil {
+		t.Fatalf("F15 expected escaped leading wildcard \\*fox to succeed with allow_leading_wildcard:false, got %v", err)
+	}
+
+	// F15 & F16: query_string / simple_query_string fuzzy_prefix_length, escape:true, flags:NONE, flags without WHITESPACE/ESCAPE
+	var qsFuzzyPrefix, qsEscape, sqsNone, sqsNoWS esast.Query
+	_ = json.Unmarshal([]byte(`{"query_string":{"default_field":"status","query":"abcdef~1","fuzzy_prefix_length":4}}`), &qsFuzzyPrefix)
+	wQSFP := tr.CompileQuery(&qsFuzzyPrefix, false, nil).WhereSQL
+	if !strings.Contains(wQSFP, "abcd") || strings.Contains(wQSFP, ".?bcdef") {
+		t.Fatalf("F15 expected fuzzy_prefix_length=4 to lock prefix 'abcd', got %s", wQSFP)
+	}
+	_ = json.Unmarshal([]byte(`{"query_string":{"default_field":"status","query":"a*b","escape":true}}`), &qsEscape)
+	wQSEsc := tr.CompileQuery(&qsEscape, false, nil).WhereSQL
+	if strings.Contains(wQSEsc, "LIKE") {
+		t.Fatalf("F15 expected escape:true query_string to treat '*' as literal rather than wildcard LIKE, got %s", wQSEsc)
+	}
+	_ = json.Unmarshal([]byte(`{"simple_query_string":{"fields":["status"],"query":"foo*","flags":"NONE"}}`), &sqsNone)
+	wSQSNone := tr.CompileQuery(&sqsNone, false, nil).WhereSQL
+	if strings.Contains(wSQSNone, "LIKE 'foo%'") {
+		t.Fatalf("F16 expected simple_query_string with flags=NONE not to treat trailing * as prefix operator, got %s", wSQSNone)
+	}
+	_ = json.Unmarshal([]byte(`{"simple_query_string":{"fields":["status"],"query":"hello world","flags":"OR"}}`), &sqsNoWS)
+	wSQSNoWS := tr.CompileQuery(&sqsNoWS, false, nil).WhereSQL
+	if !strings.Contains(wSQSNoWS, "'hello world'") {
+		t.Fatalf("F16 expected simple_query_string with flags=OR (no WHITESPACE flag) to keep 'hello world' as single token, got %s", wSQSNoWS)
+	}
+
+	// F17: multi_match cross_fields on stop-analyzed fields with operator:and strips stopwords before token conjunction
+	var mmCrossStop, mmZeroAll esast.Query
+	_ = json.Unmarshal([]byte(`{"multi_match":{"query":"quick the fox","fields":["title","body"],"type":"cross_fields","operator":"and"}}`), &mmCrossStop)
+	wMMCross := tr.CompileQuery(&mmCrossStop, false, nil).WhereSQL
+	if wMMCross == "FALSE" || strings.Contains(wMMCross, "'the'") {
+		t.Fatalf("F17 expected multi_match cross_fields on stop-analyzed fields to strip 'the' and not evaluate to FALSE, got %s", wMMCross)
+	}
+	_ = json.Unmarshal([]byte(`{"multi_match":{"query":"the and of","fields":["title","body"],"zero_terms_query":"all","boost":2.5}}`), &mmZeroAll)
+	cqMMZero := tr.CompileQuery(&mmZeroAll, true, nil)
+	if cqMMZero.WhereSQL != "TRUE" || !strings.Contains(cqMMZero.ScoreSQL, "2.5000") {
+		t.Fatalf("F17 expected multi_match zero_terms_query='all' on stopword-only query to return TRUE with boost 2.5000, got where=%s score=%s", cqMMZero.WhereSQL, cqMMZero.ScoreSQL)
+	}
+
+	// F18: geo_distance, geo_bounding_box, geo_polygon, and geo_shape reject non-geo mapped fields (including flattened) and honor ignore_unmapped:true
+	for _, badGeo := range []string{
+		`{"query":{"geo_distance":{"distance":"5km","status":[0,0]}}}`,
+		`{"query":{"geo_distance":{"distance":"5km","labels":[0,0]}}}`,
+		`{"query":{"geo_bounding_box":{"status":{"top_left":[0,10],"bottom_right":[10,0]}}}}`,
+		`{"query":{"geo_bounding_box":{"labels":{"top_left":[0,10],"bottom_right":[10,0]}}}}`,
+		`{"query":{"geo_polygon":{"status":{"points":[[0,0],[0,10],[10,10]]}}}}`,
+		`{"query":{"geo_shape":{"status":{"shape":{"type":"point","coordinates":[0,0]}}}}}`,
+	} {
+		var sr esast.SearchRequest
+		if err := json.Unmarshal([]byte(badGeo), &sr); err != nil {
+			t.Fatalf("F18 unmarshal %s failed: %v", badGeo, err)
+		}
+		if _, err := tr.BuildSearchPlan(&sr); err == nil {
+			t.Fatalf("F18 expected error for geo query on non-geo field: %s", badGeo)
+		}
+	}
+	for _, ignoredGeo := range []string{
+		`{"query":{"geo_distance":{"distance":"5km","unmapped_geo":[0,0],"ignore_unmapped":true}}}`,
+		`{"query":{"geo_bounding_box":{"unmapped_geo":{"top_left":[0,10],"bottom_right":[10,0]},"ignore_unmapped":true}}}`,
+		`{"query":{"geo_polygon":{"unmapped_geo":{"points":[[0,0],[0,10],[10,10]]},"ignore_unmapped":true}}}`,
+		`{"query":{"geo_shape":{"unmapped_geo":{"shape":{"type":"point","coordinates":[0,0]}},"ignore_unmapped":true}}}`,
+	} {
+		var q esast.Query
+		var sr esast.SearchRequest
+		if err := json.Unmarshal([]byte(ignoredGeo), &sr); err != nil {
+			t.Fatalf("F18 unmarshal %s failed: %v", ignoredGeo, err)
+		}
+		q = *sr.Query
+		if w := tr.CompileQuery(&q, false, nil).WhereSQL; w != "FALSE" {
+			t.Fatalf("F18 expected FALSE for ignore_unmapped=true on unmapped field %s, got %s", ignoredGeo, w)
+		}
+	}
+
+	// F19: compileHasChild max_children:0 returns FALSE, and compileHasChild / compileHasParent filter by join relation role
+	var hcMaxZero, hcRole, hpRole esast.Query
+	_ = json.Unmarshal([]byte(`{"has_child":{"type":"answer","query":{"match_all":{}},"max_children":0}}`), &hcMaxZero)
+	if w := tr.CompileQuery(&hcMaxZero, false, nil).WhereSQL; w != "FALSE" {
+		t.Fatalf("F19 expected has_child with max_children=0 to return FALSE, got %s", w)
+	}
+	_ = json.Unmarshal([]byte(`{"has_child":{"type":"answer","query":{"term":{"status":"active"}}}}`), &hcRole)
+	wHCRole := tr.CompileQuery(&hcRole, false, nil).WhereSQL
+	if !strings.Contains(wHCRole, "'question'") {
+		t.Fatalf("F19 expected direct compileHasChild to constrain join role to 'question', got %s", wHCRole)
+	}
+	_ = json.Unmarshal([]byte(`{"has_parent":{"parent_type":"question","query":{"term":{"status":"active"}}}}`), &hpRole)
+	wHPRole := tr.CompileQuery(&hpRole, false, nil).WhereSQL
+	if !strings.Contains(wHPRole, "'answer'") || !strings.Contains(wHPRole, "'comment'") || !strings.Contains(wHPRole, "['parent'] IS NOT NULL") {
+		t.Fatalf("F19 expected direct compileHasParent to constrain join role to 'answer'/'comment' with parent IS NOT NULL, got %s", wHPRole)
 	}
 }

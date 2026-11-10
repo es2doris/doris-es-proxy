@@ -221,6 +221,12 @@ type runnerContext struct {
 	createdSecurityPrivileges  map[string]map[string]bool
 	createdServiceTokens       map[string]bool
 	createdShutdownNodes       map[string]bool
+	createdInferenceEndpoints  map[string]bool
+	createdConnectors          map[string]bool
+	createdConnectorSyncJobs   map[string]bool
+	createdSearchApps          map[string]bool
+	createdAnalyticsColls      map[string]bool
+	createdAsyncSearches       map[string]bool
 	createdVotingExclusions    bool
 	createdScripts             map[string]struct{}
 	createdRepositories        map[string]struct{}
@@ -255,6 +261,12 @@ func newRunnerContext(client *http.Client, baseURL string) *runnerContext {
 		createdSecurityPrivileges:  make(map[string]map[string]bool),
 		createdServiceTokens:       make(map[string]bool),
 		createdShutdownNodes:       make(map[string]bool),
+		createdInferenceEndpoints:  make(map[string]bool),
+		createdConnectors:          make(map[string]bool),
+		createdConnectorSyncJobs:   make(map[string]bool),
+		createdSearchApps:          make(map[string]bool),
+		createdAnalyticsColls:      make(map[string]bool),
+		createdAsyncSearches:       make(map[string]bool),
 		createdScripts:             make(map[string]struct{}),
 		createdRepositories:        make(map[string]struct{}),
 		createdAliases:             make(map[string]string),
@@ -385,6 +397,36 @@ func (c *runnerContext) cleanupAll() {
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/_nodes/"+url.PathEscape(nodeID)+"/shutdown", nil, nil, nil)
 		}
 	}
+	for infID := range c.createdInferenceEndpoints {
+		if infID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_inference/"+url.PathEscape(infID), nil, nil, nil)
+		}
+	}
+	for jobID := range c.createdConnectorSyncJobs {
+		if jobID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_connector/_sync_job/"+url.PathEscape(jobID), nil, nil, nil)
+		}
+	}
+	for connID := range c.createdConnectors {
+		if connID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_connector/"+url.PathEscape(connID), nil, nil, nil)
+		}
+	}
+	for appName := range c.createdSearchApps {
+		if appName != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_application/search_application/"+url.PathEscape(appName), nil, nil, nil)
+		}
+	}
+	for collName := range c.createdAnalyticsColls {
+		if collName != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_application/analytics/"+url.PathEscape(collName), nil, nil, nil)
+		}
+	}
+	for asyncID := range c.createdAsyncSearches {
+		if asyncID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_async_search/"+url.PathEscape(asyncID), nil, nil, nil)
+		}
+	}
 	if c.createdVotingExclusions {
 		_, _, _ = c.rawHTTP(http.MethodDelete, "/_cluster/voting_config_exclusions", nil, nil, nil)
 	}
@@ -466,8 +508,8 @@ func (c *runnerContext) execDo(rawVal any, isTeardown bool) error {
 			expectedWarnings = append(expectedWarnings, extractStringSlice(c.expandStash(f.Value))...)
 		case "warnings_regex":
 			expectedWarningsRegex = append(expectedWarningsRegex, extractStringSlice(c.expandStash(f.Value))...)
-		case "allowed_warnings", "allowed_warnings_regex":
-			// Allowed warning metadata directives from upstream rest-api-spec
+		case "allowed_warnings", "allowed_warnings_regex", "node_selector":
+			// Allowed warning and node selector metadata directives from upstream rest-api-spec
 		default:
 			actionName = f.Key
 			actionParams = f.Value
@@ -512,6 +554,7 @@ func (c *runnerContext) execDo(rawVal any, isTeardown bool) error {
 			delete(paramMap, "headers")
 		}
 	}
+	delete(paramMap, "node_selector")
 
 	reqSpec, err := c.buildActionRequest(actionName, paramMap)
 	if err != nil {
@@ -1027,6 +1070,40 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 	case "shutdown.put_node":
 		if nodeID := paramString(params, "node_id"); nodeID != "" {
 			c.createdShutdownNodes[nodeID] = true
+		}
+	case "inference.put", "inference.put_model":
+		if infID := firstNonEmptyParam(params, "inference_id", "id"); infID != "" {
+			c.createdInferenceEndpoints[infID] = true
+		}
+	case "connector.put":
+		if connID := firstNonEmptyParam(params, "connector_id", "id"); connID != "" {
+			c.createdConnectors[connID] = true
+		}
+	case "connector.post":
+		if rm, ok := resp.(map[string]any); ok {
+			if connID := paramString(rm, "connector_id"); connID != "" {
+				c.createdConnectors[connID] = true
+			}
+		}
+	case "connector.sync_job_post":
+		if rm, ok := resp.(map[string]any); ok {
+			if jobID := firstNonEmptyParam(rm, "id", "connector_sync_job_id"); jobID != "" {
+				c.createdConnectorSyncJobs[jobID] = true
+			}
+		}
+	case "search_application.put":
+		if name := firstNonEmptyParam(params, "name", "id"); name != "" {
+			c.createdSearchApps[name] = true
+		}
+	case "behavioral_analytics.put_collection":
+		if coll := firstNonEmptyParam(params, "collection_name", "name"); coll != "" {
+			c.createdAnalyticsColls[coll] = true
+		}
+	case "async_search.submit":
+		if rm, ok := resp.(map[string]any); ok {
+			if id := paramString(rm, "id"); id != "" {
+				c.createdAsyncSearches[id] = true
+			}
 		}
 	case "cluster.post_voting_config_exclusions":
 		c.createdVotingExclusions = true
@@ -3263,6 +3340,398 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		}
 		reqPath = "/_logstash/pipeline/" + id
 
+	case "inference.put", "inference.put_model":
+		method = http.MethodPut
+		taskType := popString("task_type")
+		infID := popString("inference_id", "id")
+		if infID == "" {
+			return nil, fmt.Errorf("%s requires inference_id parameter", action)
+		}
+		if taskType != "" {
+			reqPath = "/_inference/" + taskType + "/" + infID
+		} else {
+			reqPath = "/_inference/" + infID
+		}
+
+	case "inference.get", "inference.get_model":
+		method = http.MethodGet
+		taskType := popString("task_type")
+		infID := popString("inference_id", "id")
+		switch {
+		case taskType != "" && infID != "":
+			reqPath = "/_inference/" + taskType + "/" + infID
+		case infID != "":
+			reqPath = "/_inference/" + infID
+		case taskType != "":
+			reqPath = "/_inference/" + taskType
+		default:
+			reqPath = "/_inference"
+		}
+
+	case "inference.delete", "inference.delete_model":
+		method = http.MethodDelete
+		taskType := popString("task_type")
+		infID := popString("inference_id", "id")
+		if infID == "" {
+			return nil, fmt.Errorf("%s requires inference_id parameter", action)
+		}
+		if taskType != "" {
+			reqPath = "/_inference/" + taskType + "/" + infID
+		} else {
+			reqPath = "/_inference/" + infID
+		}
+
+	case "inference.inference", "inference.post":
+		method = http.MethodPost
+		taskType := popString("task_type")
+		infID := popString("inference_id", "id")
+		if infID == "" {
+			return nil, fmt.Errorf("%s requires inference_id parameter", action)
+		}
+		if taskType != "" {
+			reqPath = "/_inference/" + taskType + "/" + infID
+		} else {
+			reqPath = "/_inference/" + infID
+		}
+
+	case "connector.put":
+		method = http.MethodPut
+		connID := popString("connector_id", "id")
+		if connID == "" {
+			return nil, fmt.Errorf("connector.put requires connector_id parameter")
+		}
+		reqPath = "/_connector/" + connID
+
+	case "connector.post":
+		method = http.MethodPost
+		reqPath = "/_connector"
+
+	case "connector.get":
+		method = http.MethodGet
+		connID := popString("connector_id", "id")
+		if connID == "" {
+			return nil, fmt.Errorf("connector.get requires connector_id parameter")
+		}
+		reqPath = "/_connector/" + connID
+
+	case "connector.list":
+		method = http.MethodGet
+		reqPath = "/_connector"
+
+	case "connector.delete":
+		method = http.MethodDelete
+		connID := popString("connector_id", "id")
+		if connID == "" {
+			return nil, fmt.Errorf("connector.delete requires connector_id parameter")
+		}
+		reqPath = "/_connector/" + connID
+
+	case "connector.update_name", "connector.update_native", "connector.update_service_type",
+		"connector.update_status", "connector.update_error", "connector.update_filtering",
+		"connector.update_configuration", "connector.update_pipeline", "connector.last_sync":
+		method = http.MethodPut
+		connID := popString("connector_id", "id")
+		if connID == "" {
+			return nil, fmt.Errorf("%s requires connector_id parameter", action)
+		}
+		suffixMap := map[string]string{
+			"connector.update_name":          "/_name",
+			"connector.update_native":        "/_native",
+			"connector.update_service_type":  "/_service_type",
+			"connector.update_status":        "/_status",
+			"connector.update_error":         "/_error",
+			"connector.update_filtering":     "/_filtering",
+			"connector.update_configuration": "/_configuration",
+			"connector.update_pipeline":      "/_pipeline",
+			"connector.last_sync":            "/_last_sync",
+		}
+		reqPath = "/_connector/" + connID + suffixMap[action]
+
+	case "connector.sync_job_post":
+		method = http.MethodPost
+		reqPath = "/_connector/_sync_job"
+
+	case "connector.sync_job_get":
+		method = http.MethodGet
+		jobID := popString("connector_sync_job_id", "id")
+		if jobID == "" {
+			return nil, fmt.Errorf("connector.sync_job_get requires connector_sync_job_id parameter")
+		}
+		reqPath = "/_connector/_sync_job/" + jobID
+
+	case "connector.sync_job_list":
+		method = http.MethodGet
+		reqPath = "/_connector/_sync_job"
+
+	case "connector.sync_job_delete":
+		method = http.MethodDelete
+		jobID := popString("connector_sync_job_id", "id")
+		if jobID == "" {
+			return nil, fmt.Errorf("connector.sync_job_delete requires connector_sync_job_id parameter")
+		}
+		reqPath = "/_connector/_sync_job/" + jobID
+
+	case "connector.sync_job_cancel":
+		method = http.MethodPost
+		jobID := popString("connector_sync_job_id", "id")
+		if jobID == "" {
+			return nil, fmt.Errorf("connector.sync_job_cancel requires connector_sync_job_id parameter")
+		}
+		reqPath = "/_connector/_sync_job/" + jobID + "/_cancel"
+
+	case "connector.sync_job_check_in":
+		method = http.MethodPost
+		jobID := popString("connector_sync_job_id", "id")
+		if jobID == "" {
+			return nil, fmt.Errorf("connector.sync_job_check_in requires connector_sync_job_id parameter")
+		}
+		reqPath = "/_connector/_sync_job/" + jobID + "/_check_in"
+
+	case "connector.sync_job_error":
+		method = http.MethodPut
+		jobID := popString("connector_sync_job_id", "id")
+		if jobID == "" {
+			return nil, fmt.Errorf("connector.sync_job_error requires connector_sync_job_id parameter")
+		}
+		reqPath = "/_connector/_sync_job/" + jobID + "/_error"
+
+	case "connector.sync_job_update_stats":
+		method = http.MethodPut
+		jobID := popString("connector_sync_job_id", "id")
+		if jobID == "" {
+			return nil, fmt.Errorf("connector.sync_job_update_stats requires connector_sync_job_id parameter")
+		}
+		reqPath = "/_connector/_sync_job/" + jobID + "/_stats"
+
+	case "search_application.put":
+		method = http.MethodPut
+		name := popString("name", "id")
+		if name == "" {
+			return nil, fmt.Errorf("search_application.put requires name parameter")
+		}
+		reqPath = "/_application/search_application/" + name
+
+	case "search_application.get":
+		method = http.MethodGet
+		name := popString("name", "id")
+		if name == "" {
+			return nil, fmt.Errorf("search_application.get requires name parameter")
+		}
+		reqPath = "/_application/search_application/" + name
+
+	case "search_application.delete":
+		method = http.MethodDelete
+		name := popString("name", "id")
+		if name == "" {
+			return nil, fmt.Errorf("search_application.delete requires name parameter")
+		}
+		reqPath = "/_application/search_application/" + name
+
+	case "search_application.list":
+		method = http.MethodGet
+		reqPath = "/_application/search_application"
+
+	case "search_application.search":
+		method = http.MethodPost
+		name := popString("name", "id")
+		if name == "" {
+			return nil, fmt.Errorf("search_application.search requires name parameter")
+		}
+		reqPath = "/_application/search_application/" + name + "/_search"
+
+	case "search_application.render_query":
+		method = http.MethodPost
+		name := popString("name", "id")
+		if name == "" {
+			return nil, fmt.Errorf("search_application.render_query requires name parameter")
+		}
+		reqPath = "/_application/search_application/" + name + "/_render_query"
+
+	case "behavioral_analytics.put_collection":
+		method = http.MethodPut
+		coll := popString("collection_name", "name")
+		if coll == "" {
+			return nil, fmt.Errorf("behavioral_analytics.put_collection requires collection_name parameter")
+		}
+		reqPath = "/_application/analytics/" + coll
+
+	case "behavioral_analytics.get_collections":
+		method = http.MethodGet
+		if coll := popString("collection_name", "name"); coll != "" {
+			reqPath = "/_application/analytics/" + coll
+		} else {
+			reqPath = "/_application/analytics"
+		}
+
+	case "behavioral_analytics.delete_collection":
+		method = http.MethodDelete
+		coll := popString("collection_name", "name")
+		if coll == "" {
+			return nil, fmt.Errorf("behavioral_analytics.delete_collection requires collection_name parameter")
+		}
+		reqPath = "/_application/analytics/" + coll
+
+	case "behavioral_analytics.post_event":
+		method = http.MethodPost
+		coll := popString("collection_name", "name")
+		evType := popString("event_type", "type")
+		if coll == "" || evType == "" {
+			return nil, fmt.Errorf("behavioral_analytics.post_event requires collection_name and event_type parameters")
+		}
+		reqPath = "/_application/analytics/" + coll + "/event/" + evType
+
+	case "text_structure.find_structure":
+		method = http.MethodPost
+		reqPath = "/_text_structure/find_structure"
+
+	case "text_structure.find_field_structure":
+		method = http.MethodPost
+		reqPath = "/_text_structure/find_field_structure"
+
+	case "text_structure.find_message_structure":
+		method = http.MethodPost
+		reqPath = "/_text_structure/find_message_structure"
+
+	case "text_structure.test_grok_pattern":
+		method = http.MethodPost
+		reqPath = "/_text_structure/test_grok_pattern"
+
+	case "profiling.status":
+		method = http.MethodGet
+		reqPath = "/_profiling/status"
+
+	case "profiling.flamegraph":
+		method = http.MethodPost
+		reqPath = "/_profiling/flamegraph"
+
+	case "profiling.stacktraces":
+		method = http.MethodPost
+		reqPath = "/_profiling/stacktraces"
+
+	case "profiling.topn_functions":
+		method = http.MethodPost
+		reqPath = "/_profiling/topn_functions"
+
+	case "async_search.submit":
+		method = http.MethodPost
+		if idx := popString("index"); idx != "" {
+			reqPath = "/" + idx + "/_async_search"
+		} else {
+			reqPath = "/_async_search"
+		}
+
+	case "async_search.get":
+		method = http.MethodGet
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("async_search.get requires id parameter")
+		}
+		reqPath = "/_async_search/" + id
+
+	case "async_search.status":
+		method = http.MethodGet
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("async_search.status requires id parameter")
+		}
+		reqPath = "/_async_search/status/" + id
+
+	case "async_search.delete":
+		method = http.MethodDelete
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("async_search.delete requires id parameter")
+		}
+		reqPath = "/_async_search/" + id
+
+	case "esql.query":
+		method = http.MethodPost
+		reqPath = "/_query"
+
+	case "esql.async_query":
+		method = http.MethodPost
+		reqPath = "/_query/async"
+
+	case "esql.async_query_get":
+		method = http.MethodGet
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("esql.async_query_get requires id parameter")
+		}
+		reqPath = "/_query/async/" + id
+
+	case "esql.async_query_stop":
+		method = http.MethodPost
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("esql.async_query_stop requires id parameter")
+		}
+		reqPath = "/_query/async/" + id + "/_stop"
+
+	case "esql.async_query_delete":
+		method = http.MethodDelete
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("esql.async_query_delete requires id parameter")
+		}
+		reqPath = "/_query/async/" + id
+
+	case "watcher.query_watches":
+		method = http.MethodPost
+		reqPath = "/_watcher/_query/watches"
+
+	case "watcher.get_settings":
+		method = http.MethodGet
+		reqPath = "/_watcher/settings"
+
+	case "watcher.update_settings":
+		method = http.MethodPut
+		reqPath = "/_watcher/settings"
+
+	case "cat.transforms":
+		method = http.MethodGet
+		if id := popString("transform_id", "id"); id != "" {
+			reqPath = "/_cat/transforms/" + id
+		} else {
+			reqPath = "/_cat/transforms"
+		}
+
+	case "license.get":
+		method = http.MethodGet
+		reqPath = "/_license"
+
+	case "license.delete":
+		method = http.MethodDelete
+		reqPath = "/_license"
+
+	case "license.post_start_basic":
+		method = http.MethodPost
+		reqPath = "/_license/start_basic"
+
+	case "license.get_basic_status":
+		method = http.MethodGet
+		reqPath = "/_license/basic_status"
+
+	case "license.post_start_trial":
+		method = http.MethodPost
+		reqPath = "/_license/start_trial"
+
+	case "license.get_trial_status":
+		method = http.MethodGet
+		reqPath = "/_license/trial_status"
+
+	case "xpack.info":
+		method = http.MethodGet
+		reqPath = "/_xpack"
+
+	case "xpack.usage":
+		method = http.MethodGet
+		reqPath = "/_xpack/usage"
+
+	case "ssl.certificates":
+		method = http.MethodGet
+		reqPath = "/_ssl/certificates"
+
 	default:
 		return nil, fmt.Errorf("unsupported rest-api-spec action %q", action)
 	}
@@ -3677,7 +4146,7 @@ func (c *runnerContext) execTransformAndSet(rawVal any) error {
 		if !ok {
 			strVal = fmt.Sprintf("%v", val)
 		}
-		var transformed string
+		var transformed any
 		switch fnName {
 		case "base64Encode":
 			transformed = base64.StdEncoding.EncodeToString([]byte(strVal))
@@ -3687,6 +4156,28 @@ func (c *runnerContext) execTransformAndSet(rawVal any) error {
 				return fmt.Errorf("transform_and_set: base64Decode failed: %w", decErr)
 			}
 			transformed = decoded
+		case "base64UrlEncode":
+			transformed = base64.RawURLEncoding.EncodeToString([]byte(strVal))
+		case "base64UrlDecode":
+			decodedBytes, decErr := base64.RawURLEncoding.DecodeString(strVal)
+			if decErr != nil {
+				decodedBytes, decErr = base64.URLEncoding.DecodeString(strVal)
+			}
+			if decErr != nil {
+				return fmt.Errorf("transform_and_set: base64UrlDecode failed: %w", decErr)
+			}
+			transformed = string(decodedBytes)
+		case "length", "size":
+			switch tv := val.(type) {
+			case []any:
+				transformed = len(tv)
+			case map[string]any:
+				transformed = len(tv)
+			case string:
+				transformed = len(tv)
+			default:
+				transformed = len(strVal)
+			}
 		case "lower":
 			transformed = strings.ToLower(strVal)
 		case "upper":
@@ -4108,6 +4599,7 @@ func (c *runnerContext) lookupResponsePath(rawPath string) (any, bool) {
 	if rawPath == "" || rawPath == "$body" {
 		return c.lastResponse, c.lastResponse != nil
 	}
+	rawPath = strings.TrimPrefix(rawPath, "$body.")
 	if rawPath == "$headers" {
 		return c.lastHeaders, c.lastHeaders != nil
 	}
@@ -4151,6 +4643,9 @@ func (c *runnerContext) lookupResponsePath(rawPath string) (any, bool) {
 							}
 						case []any:
 							idx, err := strconv.Atoi(subSeg)
+							if err == nil && idx < 0 {
+								idx = len(sn) + idx
+							}
 							if err != nil || idx < 0 || idx >= len(sn) {
 								subFound = false
 							} else {
@@ -4172,6 +4667,9 @@ func (c *runnerContext) lookupResponsePath(rawPath string) (any, bool) {
 			cur = next
 		case []any:
 			idx, err := strconv.Atoi(seg)
+			if err == nil && idx < 0 {
+				idx = len(node) + idx
+			}
 			if err != nil || idx < 0 || idx >= len(node) {
 				return nil, false
 			}

@@ -219,6 +219,15 @@ type Server struct {
 	securityAPIKeys           map[string]map[string]any
 	securityServiceTokens     map[string]map[string]any
 	logstashPipelines         map[string]map[string]any
+	inferenceEndpoints        map[string]map[string]any
+	connectors                map[string]map[string]any
+	connectorSyncJobs         map[string]map[string]any
+	searchApplications        map[string]map[string]any
+	analyticsCollections      map[string]map[string]any
+	asyncSearches             map[string]map[string]any
+	esqlAsyncQueries          map[string]map[string]any
+	watcherSettings           map[string]any
+	licenseState              map[string]any
 }
 
 func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerOptions) *Server {
@@ -275,6 +284,15 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		securityAPIKeys:           make(map[string]map[string]any),
 		securityServiceTokens:     make(map[string]map[string]any),
 		logstashPipelines:         make(map[string]map[string]any),
+		inferenceEndpoints:        make(map[string]map[string]any),
+		connectors:                make(map[string]map[string]any),
+		connectorSyncJobs:         make(map[string]map[string]any),
+		searchApplications:        make(map[string]map[string]any),
+		analyticsCollections:      make(map[string]map[string]any),
+		asyncSearches:             make(map[string]map[string]any),
+		esqlAsyncQueries:          make(map[string]map[string]any),
+		watcherSettings:           make(map[string]any),
+		licenseState:              make(map[string]any),
 	}
 	s.coalescer = newStreamLoadCoalescer(func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
 		err := s.backend.StreamLoad(ctx, table, ndjson, syncRefresh)
@@ -923,6 +941,44 @@ func (s *Server) Handler() http.Handler {
 		case segs[0] == "_logstash":
 			s.handleLogstashPipeline(w, r, segs)
 			return
+		case segs[0] == "_inference":
+			s.handleInferenceAPI(w, r, segs)
+			return
+		case segs[0] == "_connector":
+			s.handleConnectorAPI(w, r, segs)
+			return
+		case segs[0] == "_application":
+			s.handleApplicationAPI(w, r, segs)
+			return
+		case segs[0] == "_text_structure":
+			s.handleTextStructureAPI(w, r, segs)
+			return
+		case segs[0] == "_profiling":
+			s.handleProfilingAPI(w, r, segs)
+			return
+		case segs[0] == "_async_search":
+			s.handleAsyncSearch(w, r, segs)
+			return
+		case len(segs) == 2 && segs[1] == "_async_search":
+			r.SetPathValue("index", segs[0])
+			s.handleAsyncSearch(w, r, segs)
+			return
+		case segs[0] == "_query":
+			s.handleESQLQuery(w, r, segs)
+			return
+		case len(segs) == 3 && segs[0] == "_watcher" && segs[1] == "_query" && segs[2] == "watches":
+			s.handleWatcherQueryWatches(w, r)
+			return
+		case segs[0] == "_ssl" || (len(segs) >= 2 && segs[0] == "_xpack" && segs[1] == "ssl"):
+			s.handleSSLCertificates(w, r)
+			return
+		case segs[0] == "_license" || segs[0] == "_xpack":
+			if segs[0] == "_license" || (len(segs) >= 2 && segs[1] == "license") {
+				s.handleLicenseAPI(w, r, segs)
+			} else {
+				s.handleXPackAPI(w, r, segs)
+			}
+			return
 		}
 
 		switch len(segs) {
@@ -1099,6 +1155,8 @@ func (s *Server) Handler() http.Handler {
 				s.handleDataStream(w, r)
 			case segs[0] == "_cat" && segs[1] == "data_streams":
 				s.handleCatDataStreams(w, r)
+			case segs[0] == "_cat" && segs[1] == "transforms":
+				s.handleCatTransforms(w, r)
 			case segs[0] == "_cat" && segs[1] == "snapshots":
 				s.handleCatSnapshots(w, r)
 			case segs[0] == "_cat" && segs[1] == "indices":
@@ -1421,6 +1479,10 @@ func (s *Server) Handler() http.Handler {
 				switch segs[1] {
 				case "data_streams":
 					s.handleCatDataStreams(w, r)
+					return
+				case "transforms":
+					r.SetPathValue("transform_id", segs[2])
+					s.handleCatTransforms(w, r)
 					return
 				case "snapshots":
 					r.SetPathValue("repository", segs[2])
@@ -2828,6 +2890,8 @@ func (s *Server) handleCatRoot(w http.ResponseWriter, r *http.Request) {
 		"/_cat/repositories",
 		"/_cat/snapshots",
 		"/_cat/templates",
+		"/_cat/transforms",
+		"/_cat/data_streams",
 	}
 	if strings.EqualFold(r.URL.Query().Get("format"), "json") || strings.Contains(r.Header.Get("Accept"), "application/json") {
 		writeJSON(w, http.StatusOK, endpoints)

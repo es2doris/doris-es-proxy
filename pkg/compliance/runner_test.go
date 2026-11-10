@@ -2289,3 +2289,169 @@ func TestRound53StashInPathAndExecLengthF1(t *testing.T) {
 		t.Fatalf("execLength with stashed length and Unicode strings failed: %v", err)
 	}
 }
+
+func TestRound54ActionBuildersAndRunnerFeatures(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		action     string
+		params     map[string]any
+		wantMethod string
+		wantPath   string
+	}{
+		{"inference.put with task_type", "inference.put", map[string]any{"task_type": "text_embedding", "inference_id": "m1"}, http.MethodPut, "/_inference/text_embedding/m1"},
+		{"inference.put_model without task_type", "inference.put_model", map[string]any{"inference_id": "m1"}, http.MethodPut, "/_inference/m1"},
+		{"inference.get with task_type and id", "inference.get", map[string]any{"task_type": "rerank", "inference_id": "m2"}, http.MethodGet, "/_inference/rerank/m2"},
+		{"inference.get_model with id only", "inference.get_model", map[string]any{"inference_id": "m2"}, http.MethodGet, "/_inference/m2"},
+		{"inference.get with task_type only", "inference.get", map[string]any{"task_type": "rerank"}, http.MethodGet, "/_inference/rerank"},
+		{"inference.get all", "inference.get", map[string]any{}, http.MethodGet, "/_inference"},
+		{"inference.delete with task_type", "inference.delete", map[string]any{"task_type": "rerank", "inference_id": "m2"}, http.MethodDelete, "/_inference/rerank/m2"},
+		{"inference.delete_model id only", "inference.delete_model", map[string]any{"inference_id": "m2"}, http.MethodDelete, "/_inference/m2"},
+		{"inference.inference with task_type", "inference.inference", map[string]any{"task_type": "text_embedding", "inference_id": "m1"}, http.MethodPost, "/_inference/text_embedding/m1"},
+		{"inference.post without task_type", "inference.post", map[string]any{"inference_id": "m1"}, http.MethodPost, "/_inference/m1"},
+		{"connector.put", "connector.put", map[string]any{"connector_id": "c1"}, http.MethodPut, "/_connector/c1"},
+		{"connector.post", "connector.post", map[string]any{}, http.MethodPost, "/_connector"},
+		{"connector.get", "connector.get", map[string]any{"connector_id": "c1"}, http.MethodGet, "/_connector/c1"},
+		{"connector.list", "connector.list", map[string]any{}, http.MethodGet, "/_connector"},
+		{"connector.delete", "connector.delete", map[string]any{"connector_id": "c1"}, http.MethodDelete, "/_connector/c1"},
+		{"connector.update_name", "connector.update_name", map[string]any{"connector_id": "c1"}, http.MethodPut, "/_connector/c1/_name"},
+		{"connector.update_native", "connector.update_native", map[string]any{"connector_id": "c1"}, http.MethodPut, "/_connector/c1/_native"},
+		{"connector.update_service_type", "connector.update_service_type", map[string]any{"connector_id": "c1"}, http.MethodPut, "/_connector/c1/_service_type"},
+		{"connector.update_status", "connector.update_status", map[string]any{"connector_id": "c1"}, http.MethodPut, "/_connector/c1/_status"},
+		{"connector.update_error", "connector.update_error", map[string]any{"connector_id": "c1"}, http.MethodPut, "/_connector/c1/_error"},
+		{"connector.update_filtering", "connector.update_filtering", map[string]any{"connector_id": "c1"}, http.MethodPut, "/_connector/c1/_filtering"},
+		{"connector.update_configuration", "connector.update_configuration", map[string]any{"connector_id": "c1"}, http.MethodPut, "/_connector/c1/_configuration"},
+		{"connector.update_pipeline", "connector.update_pipeline", map[string]any{"connector_id": "c1"}, http.MethodPut, "/_connector/c1/_pipeline"},
+		{"connector.last_sync", "connector.last_sync", map[string]any{"connector_id": "c1"}, http.MethodPut, "/_connector/c1/_last_sync"},
+		{"connector.sync_job_post", "connector.sync_job_post", map[string]any{}, http.MethodPost, "/_connector/_sync_job"},
+		{"connector.sync_job_get", "connector.sync_job_get", map[string]any{"connector_sync_job_id": "j1"}, http.MethodGet, "/_connector/_sync_job/j1"},
+		{"connector.sync_job_list", "connector.sync_job_list", map[string]any{}, http.MethodGet, "/_connector/_sync_job"},
+		{"connector.sync_job_delete", "connector.sync_job_delete", map[string]any{"connector_sync_job_id": "j1"}, http.MethodDelete, "/_connector/_sync_job/j1"},
+		{"connector.sync_job_cancel", "connector.sync_job_cancel", map[string]any{"connector_sync_job_id": "j1"}, http.MethodPost, "/_connector/_sync_job/j1/_cancel"},
+		{"connector.sync_job_check_in", "connector.sync_job_check_in", map[string]any{"connector_sync_job_id": "j1"}, http.MethodPost, "/_connector/_sync_job/j1/_check_in"},
+		{"connector.sync_job_error", "connector.sync_job_error", map[string]any{"connector_sync_job_id": "j1"}, http.MethodPut, "/_connector/_sync_job/j1/_error"},
+		{"connector.sync_job_update_stats", "connector.sync_job_update_stats", map[string]any{"connector_sync_job_id": "j1"}, http.MethodPut, "/_connector/_sync_job/j1/_stats"},
+		{"search_application.put", "search_application.put", map[string]any{"name": "app1"}, http.MethodPut, "/_application/search_application/app1"},
+		{"search_application.get", "search_application.get", map[string]any{"name": "app1"}, http.MethodGet, "/_application/search_application/app1"},
+		{"search_application.delete", "search_application.delete", map[string]any{"name": "app1"}, http.MethodDelete, "/_application/search_application/app1"},
+		{"search_application.list", "search_application.list", map[string]any{}, http.MethodGet, "/_application/search_application"},
+		{"search_application.search", "search_application.search", map[string]any{"name": "app1"}, http.MethodPost, "/_application/search_application/app1/_search"},
+		{"search_application.render_query", "search_application.render_query", map[string]any{"name": "app1"}, http.MethodPost, "/_application/search_application/app1/_render_query"},
+		{"behavioral_analytics.put_collection", "behavioral_analytics.put_collection", map[string]any{"collection_name": "col1"}, http.MethodPut, "/_application/analytics/col1"},
+		{"behavioral_analytics.get_collections specific", "behavioral_analytics.get_collections", map[string]any{"collection_name": "col1"}, http.MethodGet, "/_application/analytics/col1"},
+		{"behavioral_analytics.get_collections all", "behavioral_analytics.get_collections", map[string]any{}, http.MethodGet, "/_application/analytics"},
+		{"behavioral_analytics.delete_collection", "behavioral_analytics.delete_collection", map[string]any{"collection_name": "col1"}, http.MethodDelete, "/_application/analytics/col1"},
+		{"behavioral_analytics.post_event", "behavioral_analytics.post_event", map[string]any{"collection_name": "col1", "event_type": "click"}, http.MethodPost, "/_application/analytics/col1/event/click"},
+		{"text_structure.find_structure", "text_structure.find_structure", map[string]any{}, http.MethodPost, "/_text_structure/find_structure"},
+		{"text_structure.find_field_structure", "text_structure.find_field_structure", map[string]any{}, http.MethodPost, "/_text_structure/find_field_structure"},
+		{"text_structure.find_message_structure", "text_structure.find_message_structure", map[string]any{}, http.MethodPost, "/_text_structure/find_message_structure"},
+		{"text_structure.test_grok_pattern", "text_structure.test_grok_pattern", map[string]any{}, http.MethodPost, "/_text_structure/test_grok_pattern"},
+		{"profiling.status", "profiling.status", map[string]any{}, http.MethodGet, "/_profiling/status"},
+		{"profiling.flamegraph", "profiling.flamegraph", map[string]any{}, http.MethodPost, "/_profiling/flamegraph"},
+		{"profiling.stacktraces", "profiling.stacktraces", map[string]any{}, http.MethodPost, "/_profiling/stacktraces"},
+		{"profiling.topn_functions", "profiling.topn_functions", map[string]any{}, http.MethodPost, "/_profiling/topn_functions"},
+		{"async_search.submit index", "async_search.submit", map[string]any{"index": "idx1"}, http.MethodPost, "/idx1/_async_search"},
+		{"async_search.submit cluster", "async_search.submit", map[string]any{}, http.MethodPost, "/_async_search"},
+		{"async_search.get", "async_search.get", map[string]any{"id": "as1"}, http.MethodGet, "/_async_search/as1"},
+		{"async_search.status", "async_search.status", map[string]any{"id": "as1"}, http.MethodGet, "/_async_search/status/as1"},
+		{"async_search.delete", "async_search.delete", map[string]any{"id": "as1"}, http.MethodDelete, "/_async_search/as1"},
+		{"esql.query", "esql.query", map[string]any{}, http.MethodPost, "/_query"},
+		{"esql.async_query", "esql.async_query", map[string]any{}, http.MethodPost, "/_query/async"},
+		{"esql.async_query_get", "esql.async_query_get", map[string]any{"id": "q1"}, http.MethodGet, "/_query/async/q1"},
+		{"esql.async_query_stop", "esql.async_query_stop", map[string]any{"id": "q1"}, http.MethodPost, "/_query/async/q1/_stop"},
+		{"esql.async_query_delete", "esql.async_query_delete", map[string]any{"id": "q1"}, http.MethodDelete, "/_query/async/q1"},
+		{"watcher.query_watches", "watcher.query_watches", map[string]any{}, http.MethodPost, "/_watcher/_query/watches"},
+		{"watcher.get_settings", "watcher.get_settings", map[string]any{}, http.MethodGet, "/_watcher/settings"},
+		{"watcher.update_settings", "watcher.update_settings", map[string]any{}, http.MethodPut, "/_watcher/settings"},
+		{"cat.transforms specific", "cat.transforms", map[string]any{"transform_id": "tr1"}, http.MethodGet, "/_cat/transforms/tr1"},
+		{"cat.transforms all", "cat.transforms", map[string]any{}, http.MethodGet, "/_cat/transforms"},
+		{"license.get", "license.get", map[string]any{}, http.MethodGet, "/_license"},
+		{"license.delete", "license.delete", map[string]any{}, http.MethodDelete, "/_license"},
+		{"license.post_start_basic", "license.post_start_basic", map[string]any{}, http.MethodPost, "/_license/start_basic"},
+		{"license.get_basic_status", "license.get_basic_status", map[string]any{}, http.MethodGet, "/_license/basic_status"},
+		{"license.post_start_trial", "license.post_start_trial", map[string]any{}, http.MethodPost, "/_license/start_trial"},
+		{"license.get_trial_status", "license.get_trial_status", map[string]any{}, http.MethodGet, "/_license/trial_status"},
+		{"xpack.info", "xpack.info", map[string]any{}, http.MethodGet, "/_xpack"},
+		{"xpack.usage", "xpack.usage", map[string]any{}, http.MethodGet, "/_xpack/usage"},
+		{"ssl.certificates", "ssl.certificates", map[string]any{}, http.MethodGet, "/_ssl/certificates"},
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"created-id","acknowledged":true,"items":["first","second","last"],"raw_text":"hello+world/test"}`))
+	}))
+	defer ts.Close()
+	ctx := newRunnerContext(ts.Client(), ts.URL)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec, err := ctx.buildActionRequest(tc.action, tc.params)
+			if err != nil {
+				t.Fatalf("buildActionRequest(%q) failed: %v", tc.action, err)
+			}
+			if spec.method != tc.wantMethod || spec.path != tc.wantPath {
+				t.Fatalf("buildActionRequest(%q) = (%s, %s), want (%s, %s)", tc.action, spec.method, spec.path, tc.wantMethod, tc.wantPath)
+			}
+		})
+	}
+
+	// Test node_selector in execDo and resource tracking + cleanupAll
+	for _, action := range []string{
+		"inference.put",
+		"connector.put",
+		"connector.post",
+		"connector.sync_job_post",
+		"search_application.put",
+		"behavioral_analytics.put_collection",
+		"async_search.submit",
+	} {
+		step := &OrderedMap{
+			Fields: []YAMLField{
+				{Key: "node_selector", Value: map[string]any{"version": "8.0.0"}},
+				{Key: action, Value: map[string]any{
+					"inference_id":    "inf1",
+					"connector_id":    "conn1",
+					"name":            "app1",
+					"collection_name": "coll1",
+				}},
+			},
+		}
+		if err := ctx.execDo(step, false); err != nil {
+			t.Fatalf("execDo(%s) failed: %v", action, err)
+		}
+	}
+
+	// Test lookupResponsePath with $body. prefix and negative array index
+	if val, ok := ctx.lookupResponsePath("$body.items.-1"); !ok || val != "last" {
+		t.Fatalf("expected $body.items.-1 = 'last', got (%v, %v)", val, ok)
+	}
+	if val, ok := ctx.lookupResponsePath("$body.items.-2"); !ok || val != "second" {
+		t.Fatalf("expected $body.items.-2 = 'second', got (%v, %v)", val, ok)
+	}
+	if _, ok := ctx.lookupResponsePath("$body.items.-99"); ok {
+		t.Fatalf("expected out-of-bounds negative index to return false")
+	}
+
+	// Test execTransformAndSet with base64UrlEncode, base64UrlDecode, and length/size
+	if err := ctx.execTransformAndSet(map[string]any{
+		"b64u":     "base64UrlEncode(raw_text)",
+		"arr_len":  "length(items)",
+		"str_size": "size(raw_text)",
+	}); err != nil {
+		t.Fatalf("execTransformAndSet failed: %v", err)
+	}
+	if err := ctx.execTransformAndSet(map[string]any{
+		"decoded": "base64UrlDecode($b64u)",
+	}); err != nil {
+		t.Fatalf("execTransformAndSet base64UrlDecode failed: %v", err)
+	}
+	if ctx.stash["decoded"] != "hello+world/test" {
+		t.Fatalf("expected decoded='hello+world/test', got %v", ctx.stash["decoded"])
+	}
+	if ctx.stash["arr_len"] != 3 || ctx.stash["str_size"] != 16 {
+		t.Fatalf("unexpected lengths: arr_len=%v str_size=%v", ctx.stash["arr_len"], ctx.stash["str_size"])
+	}
+
+	ctx.cleanupAll()
+}
