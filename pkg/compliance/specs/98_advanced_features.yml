@@ -396,3 +396,209 @@
         id: r53_ls_pipe
   - match: { acknowledged: true }
 
+---
+"Round 54 inference, connector, search_application, text_structure, profiling, async_search, esql, watcher, and license APIs":
+  - do:
+      node_selector:
+        attribute: "data"
+      inference.put:
+        task_type: text_embedding
+        inference_id: r54_embed
+        body:
+          service: "elasticsearch"
+          service_settings:
+            model_id: ".elser_model_2"
+  - match: { inference_id: "r54_embed" }
+  - match: { task_type: "text_embedding" }
+
+  - do:
+      inference.get:
+        inference_id: r54_embed
+  - match: { endpoints.0.inference_id: "r54_embed" }
+  - match: { $body.endpoints.-1.service: "elasticsearch" }
+
+  - do:
+      inference.inference:
+        task_type: text_embedding
+        inference_id: r54_embed
+        body:
+          input: ["hello world", "doris proxy"]
+  - match: { inference_id: "r54_embed" }
+  - is_true: text_embedding.0.embedding
+
+  - do:
+      inference.delete:
+        inference_id: r54_embed
+  - match: { acknowledged: true }
+
+  - do:
+      connector.put:
+        connector_id: r54_conn
+        body:
+          name: "My S3 Connector"
+          service_type: "s3"
+          index_name: "search-s3"
+  - match: { acknowledged: true }
+
+  - do:
+      connector.update_status:
+        connector_id: r54_conn
+        body:
+          status: "connected"
+  - match: { acknowledged: true }
+
+  - do:
+      connector.get:
+        connector_id: r54_conn
+  - match: { id: "r54_conn" }
+  - match: { status: "connected" }
+
+  - do:
+      connector.sync_job_post:
+        body:
+          id: "r54_job_1"
+          connector_id: "r54_conn"
+          job_type: "full"
+  - match: { id: "r54_job_1" }
+
+  - do:
+      connector.sync_job_check_in:
+        connector_sync_job_id: "r54_job_1"
+  - match: { acknowledged: true }
+
+  - do:
+      connector.sync_job_cancel:
+        connector_sync_job_id: "r54_job_1"
+  - match: { acknowledged: true }
+
+  - do:
+      connector.sync_job_delete:
+        connector_sync_job_id: "r54_job_1"
+  - match: { acknowledged: true }
+
+  - do:
+      connector.delete:
+        connector_id: r54_conn
+  - match: { acknowledged: true }
+
+  - do:
+      search_application.put:
+        name: r54_app
+        body:
+          indices: ["idx_advanced"]
+          template:
+            script:
+              source: '{"query":{"match":{"title":"{{query_string}}"}}}'
+              params:
+                query_string: "default"
+  - match: { acknowledged: true }
+
+  - do:
+      search_application.render_query:
+        name: r54_app
+        body:
+          params:
+            query_string: "hello"
+  - match: { query.match.title: "hello" }
+
+  - do:
+      search_application.delete:
+        name: r54_app
+  - match: { acknowledged: true }
+
+  - do:
+      behavioral_analytics.put_collection:
+        collection_name: r54_analytics
+  - match: { acknowledged: true }
+
+  - do:
+      behavioral_analytics.post_event:
+        collection_name: r54_analytics
+        event_type: page_view
+        body:
+          page:
+            url: "https://example.com"
+  - match: { ok: true }
+
+  - do:
+      behavioral_analytics.delete_collection:
+        collection_name: r54_analytics
+  - match: { acknowledged: true }
+
+  - do:
+      text_structure.find_structure:
+        body:
+          lines:
+            - '{"host":"web01","status":200}'
+            - '{"host":"web02","status":404}'
+  - match: { format: "ndjson" }
+  - is_true: mappings.properties.host
+
+  - do:
+      text_structure.test_grok_pattern:
+        body:
+          grok_pattern: "%{WORD:verb} %{INT:code:int}"
+          messages:
+            - "GET 200"
+  - match: { matches.0.matched: true }
+  - match: { matches.0.captures.verb: "GET" }
+  - match: { matches.0.captures.code: 200 }
+
+  - do:
+      profiling.status: {}
+  - match: { status: "ok" }
+  - match: { enabled: true }
+
+  - do:
+      profiling.flamegraph:
+        body: {}
+  - is_true: flamegraph
+
+  - do:
+      esql.query:
+        body:
+          query: 'ROW a = 42, b = "hello" | EVAL c = 99 | KEEP a, b, c'
+  - match: { columns.0.name: "a" }
+  - match: { values.0.0: 42 }
+  - match: { values.0.-1: 99 }
+
+  - do:
+      watcher.update_settings:
+        body:
+          xpack.watcher.encrypt_sensitive_data: true
+  - match: { acknowledged: true }
+
+  - do:
+      watcher.get_settings: {}
+  - match: { acknowledged: true }
+
+  - do:
+      watcher.query_watches:
+        body: {}
+  - is_true: hits
+
+  - do:
+      license.get: {}
+  - match: { license.status: "active" }
+
+  - do:
+      license.get_basic_status: {}
+  - match: { eligible_to_start_basic: true }
+
+  - do:
+      license.get_trial_status: {}
+  - match: { eligible_to_start_trial: true }
+
+  - do:
+      xpack.info: {}
+  - match: { tagline: "You Know, for X" }
+
+  - do:
+      xpack.usage: {}
+  - match: { watcher.available: true }
+
+  - do:
+      ssl.certificates: {}
+  - match: { 0.alias: "http" }
+
+

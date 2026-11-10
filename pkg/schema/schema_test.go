@@ -2400,3 +2400,143 @@ func TestRound53SchemaAndShredderF15F16(t *testing.T) {
 		}
 	}
 }
+
+func TestRound54SchemaAndShredderF12F13F14(t *testing.T) {
+	// F12: ValidateMappingSpec validates runtime and dynamic_templates even when properties is empty, plus copy_to validation
+	for _, badMapping := range []string{
+		`{"runtime":{"bad_rt":{"type":"nonexistent_rt_type"}}}`,
+		`{"dynamic_templates":[{"t1":{"mapping":{"type":"keyword"}},"t2":{"mapping":{"type":"text"}}}]}`,
+		`{"dynamic_templates":[{"t1":"not_an_object"}]}`,
+		`{"dynamic_templates":[{"t1":{"unknown_key":1,"mapping":{"type":"keyword"}}}]}`,
+		`{"dynamic_templates":[{"t1":{"match":"*"}}]}`,
+		`{"dynamic_templates":[{"t1":{"match_mapping_type":"bogus_type","mapping":{"type":"keyword"}}}]}`,
+		`{"dynamic_templates":[{"t1":{"match_pattern":"glob","mapping":{"type":"keyword"}}}]}`,
+		`{"dynamic_templates":[{"t1":{"match_pattern":"regex","match":"[unclosed","mapping":{"type":"keyword"}}}]}`,
+		`{"dynamic_templates":[{"t1":{"match_pattern":"regex","unmatch":"[unclosed","mapping":{"type":"keyword"}}}]}`,
+		`{"dynamic_templates":[{"t1":{"match":"*","mapping":{"type":"nonexistent_type"}}}]}`,
+		`{"properties":{"obj":{"type":"object","copy_to":"dest"},"dest":{"type":"text"}}}`,
+		`{"properties":{"nest":{"type":"nested","copy_to":"dest"},"dest":{"type":"text"}}}`,
+		`{"properties":{"al":{"type":"alias","path":"dest","copy_to":"dest"},"dest":{"type":"text"}}}`,
+		`{"properties":{"f":{"type":"keyword","copy_to":""}}}`,
+		`{"properties":{"f":{"type":"keyword","copy_to":123}}}`,
+		`{"properties":{"f":{"type":"keyword","copy_to":["ok",""]}}}`,
+		`{"properties":{"f":{"type":"keyword","copy_to":"f"}}}`,
+		`{"properties":{"f":{"type":"keyword","copy_to":"obj"},"obj":{"type":"object"}}}`,
+		`{"properties":{"f":{"type":"keyword","copy_to":"nest"},"nest":{"type":"nested"}}}`,
+		`{"properties":{"f":{"type":"keyword","copy_to":"al"},"al":{"type":"alias","path":"f"}}}`,
+	} {
+		var ms esast.MappingSpec
+		if err := json.Unmarshal([]byte(badMapping), &ms); err != nil {
+			t.Fatalf("F12 unmarshal %s failed: %v", badMapping, err)
+		}
+		if err := ValidateMappingSpec(&ms); err == nil {
+			t.Fatalf("F12 expected ValidateMappingSpec error for %s", badMapping)
+		}
+	}
+
+	var validDTAndCopySpec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"dynamic_templates": [
+			{
+				"strings_as_kw": {
+					"match_mapping_type": "string",
+					"match_pattern": "regex",
+					"match": "^kw_.*",
+					"unmatch": ".*_ignore$",
+					"mapping": {"type": "{dynamic_type}"}
+				}
+			}
+		],
+		"properties": {
+			"src": {"type": "keyword", "copy_to": ["full_text"]},
+			"full_text": {"type": "text"}
+		}
+	}`), &validDTAndCopySpec); err != nil {
+		t.Fatalf("F12 valid unmarshal failed: %v", err)
+	}
+	if err := ValidateMappingSpec(&validDTAndCopySpec); err != nil {
+		t.Fatalf("F12 expected valid dynamic_templates and copy_to to pass, got %v", err)
+	}
+
+	// F13: coerce:false decimal JSON tokens on integer/nested integer, nested date coerce:false, float/half_float overflow, and constant_keyword ignore_malformed
+	var f13Spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"int_no_coerce": {"type": "integer", "coerce": false},
+			"flt":           {"type": "float"},
+			"hflt":          {"type": "half_float"},
+			"ck_ignore":     {"type": "constant_keyword", "value": "prod"},
+			"items": {
+				"type": "nested",
+				"properties": {
+					"n_int": {"type": "integer", "coerce": false},
+					"n_dt":  {"type": "date", "format": "strict_date", "coerce": false},
+					"n_flt": {"type": "half_float"},
+					"n_ck":  {"type": "constant_keyword", "value": "v1"}
+				}
+			}
+		}
+	}`), &f13Spec); err != nil {
+		t.Fatalf("F13 unmarshal failed: %v", err)
+	}
+	f13Schema := CompileIndexSchema("db", "r54_f13_idx", &f13Spec)
+	for _, badDoc := range []string{
+		`{"int_no_coerce": 5.0}`,
+		`{"int_no_coerce": 1e2}`,
+		`{"flt": 1e39}`,
+		`{"hflt": 70000}`,
+		`{"items": [{"n_int": 5.0}]}`,
+		`{"items": [{"n_dt": 1700000000000}]}`,
+		`{"items": [{"n_flt": 70000}]}`,
+		`{"items": [{"n_ck": "v2"}]}`,
+	} {
+		if _, err := ShredDocument(f13Schema, "1", 1, false, []byte(badDoc)); err == nil {
+			t.Fatalf("F13 expected ShredDocument error for %s", badDoc)
+		}
+	}
+	// constant_keyword with ignore_malformed=true and mismatched value should NOT populate f__ck_ignore
+	rowCKMalformed, err := ShredDocument(f13Schema, "2", 1, true, []byte(`{"ck_ignore": "staging"}`))
+	if err != nil {
+		t.Fatalf("F13 expected ignore_malformed=true on constant_keyword not to return error, got %v", err)
+	}
+	if strings.Contains(string(rowCKMalformed), `"f__ck_ignore":"prod"`) {
+		t.Fatalf("F13 expected mismatched constant_keyword with ignore_malformed=true not to populate f__ck_ignore, got %s", string(rowCKMalformed))
+	}
+
+	// F14: dotted/multi-level nested_objects.limit, MaxDepth, and MaxFieldNameLength in ShredDocumentWithNow
+	var f14Spec esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{
+		"properties": {
+			"group": {
+				"properties": {
+					"items": {
+						"type": "nested",
+						"properties": {
+							"replies": {
+								"type": "nested",
+								"properties": {
+									"msg": {"type": "keyword"}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}`), &f14Spec)
+	f14Schema := CompileIndexSchema("db", "r54_f14_idx", &f14Spec)
+	f14Schema.MaxNestedObjects = 2
+	if _, err := ShredDocument(f14Schema, "1", 1, false, []byte(`{"group":{"items":[{"replies":[{"msg":"a"},{"msg":"b"}]}]}}`)); err == nil || !strings.Contains(err.Error(), "nested documents") {
+		t.Fatalf("F14 expected nested_objects.limit error on multi-level nested doc (1 item + 2 replies = 3 > 2), got %v", err)
+	}
+	f14Schema.MaxNestedObjects = 100
+	f14Schema.MaxDepth = 2
+	if _, err := ShredDocument(f14Schema, "2", 1, false, []byte(`{"a":{"b":{"c":"too_deep"}}}`)); err == nil || !strings.Contains(err.Error(), "depth [2]") {
+		t.Fatalf("F14 expected MaxDepth error in ShredDocument, got %v", err)
+	}
+	f14Schema.MaxDepth = 20
+	f14Schema.MaxFieldNameLength = 5
+	if _, err := ShredDocument(f14Schema, "3", 1, false, []byte(`{"toolongname":"val"}`)); err == nil || !strings.Contains(err.Error(), "longer than the limit of [5]") {
+		t.Fatalf("F14 expected MaxFieldNameLength error in ShredDocument, got %v", err)
+	}
+}

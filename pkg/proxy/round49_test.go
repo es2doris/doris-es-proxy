@@ -2279,3 +2279,367 @@ func TestRound53_ProxyAndIngestFeatures(t *testing.T) {
 		}
 	}
 }
+
+func TestRound54AllNewEndpointsAndProcessors(t *testing.T) {
+	t.Parallel()
+	_, handler := newTestServerWithMock(t)
+
+	// F2: Inference API (text_embedding, sparse_embedding, rerank, completion)
+	if c, _, raw := doRound48Req(t, handler, http.MethodPut, "/_inference/text_embedding/emb_1", `{"service":"elasticsearch","service_settings":{"model_id":"m1"}}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT inference text_embedding, got %d: %s", c, raw)
+	}
+	if c, _, raw := doRound48Req(t, handler, http.MethodPut, "/_inference/sparse_embedding/sparse_1", `{"service":"elasticsearch"}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT inference sparse_embedding, got %d: %s", c, raw)
+	}
+	if c, _, raw := doRound48Req(t, handler, http.MethodPut, "/_inference/rerank/rerank_1", `{"service":"cohere"}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT inference rerank, got %d: %s", c, raw)
+	}
+	if c, _, raw := doRound48Req(t, handler, http.MethodPut, "/_inference/completion/comp_1", `{"service":"openai","chunking_settings":{"strategy":"sentence"}}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT inference completion, got %d: %s", c, raw)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_inference", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_inference, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_inference/text_embedding", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_inference/text_embedding, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_inference/text_embedding/emb_1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_inference/text_embedding/emb_1, got %d", c)
+	}
+	if c, _, raw := doRound48Req(t, handler, http.MethodPost, "/_inference/text_embedding/emb_1", `{"input":["hello","world"]}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST inference text_embedding, got %d: %s", c, raw)
+	}
+	if c, _, raw := doRound48Req(t, handler, http.MethodPost, "/_inference/sparse_embedding/sparse_1", `{"input":"elastic search test"}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST inference sparse_embedding, got %d: %s", c, raw)
+	}
+	if c, _, raw := doRound48Req(t, handler, http.MethodPost, "/_inference/rerank/rerank_1", `{"query":"doris","input":["unrelated doc","doris search engine"]}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST inference rerank, got %d: %s", c, raw)
+	}
+	if c, _, raw := doRound48Req(t, handler, http.MethodPost, "/_inference/completion/comp_1", `{"input":"write a query"}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST inference completion, got %d: %s", c, raw)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_inference/completion/comp_1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE /_inference/completion/comp_1, got %d", c)
+	}
+
+	// F3: Connector & Sync Job API
+	if c, _, raw := doRound48Req(t, handler, http.MethodPut, "/_connector/conn_1", `{"name":"c1","service_type":"s3","index_name":"idx_s3"}`); c != http.StatusCreated {
+		t.Fatalf("expected 201 on PUT /_connector/conn_1, got %d: %s", c, raw)
+	}
+	if c, _, raw := doRound48Req(t, handler, http.MethodPost, "/_connector", `{"id":"conn_2","name":"c2","service_type":"github"}`); c != http.StatusCreated {
+		t.Fatalf("expected 201 on POST /_connector, got %d: %s", c, raw)
+	}
+	for _, sub := range []struct{ path, body string }{
+		{"/_connector/conn_1/_name", `{"name":"c1_new","description":"desc"}`},
+		{"/_connector/conn_1/_native", `{"is_native":true}`},
+		{"/_connector/conn_1/_service_type", `{"service_type":"s3"}`},
+		{"/_connector/conn_1/_status", `{"status":"connected"}`},
+		{"/_connector/conn_1/_error", `{"error":null}`},
+		{"/_connector/conn_1/_filtering", `{"filtering":[]}`},
+		{"/_connector/conn_1/_configuration", `{"configuration":{}}`},
+		{"/_connector/conn_1/_pipeline", `{"pipeline":{"name":"p1"}}`},
+		{"/_connector/conn_1/_last_sync", `{"last_sync_status":"completed"}`},
+	} {
+		if c, _, raw := doRound48Req(t, handler, http.MethodPut, sub.path, sub.body); c != http.StatusOK {
+			t.Fatalf("expected 200 on PUT %s, got %d: %s", sub.path, c, raw)
+		}
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_connector", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_connector, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_connector/conn_1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_connector/conn_1, got %d", c)
+	}
+	if c, _, raw := doRound48Req(t, handler, http.MethodPost, "/_connector/_sync_job", `{"id":"job_1","connector_id":"conn_1"}`); c != http.StatusCreated {
+		t.Fatalf("expected 201 on POST /_connector/_sync_job, got %d: %s", c, raw)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_connector/_sync_job?connector_id=conn_1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_connector/_sync_job, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_connector/_sync_job/job_1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_connector/_sync_job/job_1, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_connector/_sync_job/job_1/_check_in", `{}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on _check_in, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_connector/_sync_job/job_1/_stats", `{"indexed_document_count":10}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on _stats, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_connector/_sync_job/job_1/_error", `{"error":"boom"}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on _error, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_connector/_sync_job/job_1/_cancel", `{}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on _cancel, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_connector/_sync_job/job_1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE sync_job, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_connector/conn_1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE connector, got %d", c)
+	}
+
+	// F4: Search Application & Behavioral Analytics
+	if c, _, raw := doRound48Req(t, handler, http.MethodPut, "/_application/search_application/app_1", `{"indices":["idx_r49"],"template":{"script":{"source":"{\"query\":{\"match\":{\"title\":\"{{q}}\"}}}","params":{"q":"default"}}}}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT search_application, got %d: %s", c, raw)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_application/search_application", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET search_application list, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_application/search_application/app_1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET search_application/app_1, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_application/search_application/app_1/_render_query", `{"params":{"q":"test"}}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST _render_query, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_application/search_application/app_1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE search_application/app_1, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_application/analytics/coll_1", `{}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT analytics collection, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_application/analytics", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET analytics collections, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_application/analytics/coll_1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET analytics/coll_1, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_application/analytics/coll_1/event/page_view", `{"session_id":"s1"}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST analytics event, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_application/analytics/coll_1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE analytics/coll_1, got %d", c)
+	}
+
+	// F5: Text Structure
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_text_structure/find_structure", `{"lines":["a,b,c","1,2,3"]}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on find_structure delimited, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_text_structure/find_message_structure", `{"messages":["2026-01-01 INFO hello"]}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on find_message_structure, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_text_structure/test_grok_pattern", `{"grok_pattern":"%{WORD:w}","messages":["hello",""]}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on test_grok_pattern, got %d", c)
+	}
+
+	// F6: Profiling
+	for _, path := range []string{"/_profiling/status", "/_profiling/flamegraph", "/_profiling/stacktraces", "/_profiling/topn_functions"} {
+		if c, _, _ := doRound48Req(t, handler, http.MethodGet, path, ``); c != http.StatusOK {
+			t.Fatalf("expected 200 on GET %s, got %d", path, c)
+		}
+	}
+
+	// F7: ES|QL & Async Search
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/r54_esql_idx", `{"mappings":{"properties":{"title":{"type":"keyword"},"val":{"type":"long"}}}}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/r54_esql_idx/_doc/1?refresh=true", `{"title":"shoes","val":10,"flag":true}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/r54_esql_idx/_doc/2?refresh=true", `{"title":"boots","val":20,"flag":false}`)
+
+	if c, m, raw := doRound48Req(t, handler, http.MethodPost, "/r54_esql_idx/_async_search", `{"query":{"match_all":{}}}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /r54_esql_idx/_async_search, got %d: %s", c, raw)
+	} else {
+		aid, _ := m["id"].(string)
+		if c2, _, _ := doRound48Req(t, handler, http.MethodGet, "/_async_search/"+aid, ``); c2 != http.StatusOK {
+			t.Fatalf("expected 200 on GET /_async_search/%s, got %d", aid, c2)
+		}
+		if c2, _, _ := doRound48Req(t, handler, http.MethodHead, "/_async_search/"+aid, ``); c2 != http.StatusOK {
+			t.Fatalf("expected 200 on HEAD /_async_search/%s, got %d", aid, c2)
+		}
+		if c2, _, _ := doRound48Req(t, handler, http.MethodGet, "/_async_search/status/"+aid, ``); c2 != http.StatusOK {
+			t.Fatalf("expected 200 on GET /_async_search/status/%s, got %d", aid, c2)
+		}
+		if c2, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_async_search/"+aid, ``); c2 != http.StatusOK {
+			t.Fatalf("expected 200 on DELETE /_async_search/%s, got %d", aid, c2)
+		}
+	}
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_async_search", `{"query":{"match_all":{}}}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/nonexistent_idx_r54/_async_search", `{"query":{"match_all":{}}}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_async_search/missing_id", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodDelete, "/_async_search/missing_id", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_async_search", `{}`)
+
+	if c, m, raw := doRound48Req(t, handler, http.MethodPost, "/_query/async", `{"query":"ROW x = 10, y = \"ab\", true, 3.14, null | EVAL z = 20 | WHERE x == 10 | SORT x DESC | KEEP x, y, z, missing_col | LIMIT 5"}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_query/async, got %d: %s", c, raw)
+	} else {
+		qid, _ := m["id"].(string)
+		if c2, _, _ := doRound48Req(t, handler, http.MethodGet, "/_query/async/"+qid, ``); c2 != http.StatusOK {
+			t.Fatalf("expected 200 on GET /_query/async/%s, got %d", qid, c2)
+		}
+		if c2, _, _ := doRound48Req(t, handler, http.MethodHead, "/_query/async/"+qid, ``); c2 != http.StatusOK {
+			t.Fatalf("expected 200 on HEAD /_query/async/%s, got %d", qid, c2)
+		}
+		if c2, _, _ := doRound48Req(t, handler, http.MethodPost, "/_query/async/"+qid+"/_stop", `{}`); c2 != http.StatusOK {
+			t.Fatalf("expected 200 on POST /_query/async/%s/_stop, got %d", qid, c2)
+		}
+		if c2, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_query/async/"+qid, ``); c2 != http.StatusOK {
+			t.Fatalf("expected 200 on DELETE /_query/async/%s, got %d", qid, c2)
+		}
+	}
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_query/async/missing", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodDelete, "/_query/async/missing", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_query/async/missing", `{}`)
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_query?format=csv", `{"query":"ROW x = 1, y = null"}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_query?format=csv, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_query", `{"query":"FROM r54_esql_idx | WHERE title == \"shoes\" | EVAL bonus = 1.5 | SORT title ASC | LIMIT 1","format":"tsv"}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_query FROM r54_esql_idx tsv, got %d", c)
+	}
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_query?format=txt", `{"query":"FROM r54_esql_idx"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_query", `{"query":"FROM nonexistent_idx_r54"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_query", `{"query":"UNKNOWN_CMD x"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_query", `{"query":""}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodDelete, "/_query", ``)
+
+	// Extra coverage for F2, F3, F4, F5, F8, F9 branches
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_inference", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_inference/text_embedding/emb_1", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_inference/emb_*", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_inference/missing_ep", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_inference/emb_direct", `{"task_type":"text_embedding","service":"es"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_inference/bad_task/ep1", `{"service":"es"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_inference/text_embedding/ep1", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_inference/text_embedding/missing_ep", `{"input":"x"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_inference/rerank/emb_1", `{"input":"x"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_inference/text_embedding/emb_1", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_inference/text_embedding/emb_1", `{"input":123}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_inference/sparse_embedding/sparse_1", `{"input":"..."}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodDelete, "/_inference/text_embedding/missing_ep", ``)
+
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_connector", `{"name":"auto_c","service_type":"s3","configuration":{"a":1}}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_connector/conn_2", `{"name":"c2_updated","service_type":"github"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_connector", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_connector/conn_2", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_connector/missing_c", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodDelete, "/_connector/missing_c", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_connector/conn_2/_filtering", `{"rules":[]}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_connector/conn_2/_configuration", `{"k":"v"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_connector/conn_2/_pipeline", `{"name":"p"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_connector/conn_2/_unknown", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_connector/_sync_job", `{"connector_id":"conn_2"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_connector/_sync_job", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_connector/_sync_job", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_connector/_sync_job?connector_id=other&job_type=incremental", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_connector/_sync_job/missing_j", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodDelete, "/_connector/_sync_job/missing_j", ``)
+
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_application/search_application/app_2", `{"indices":"r54_esql_idx","analytics_collection_name":"coll_1","template":{"script":{"source":"{\"query\":{\"match\":{\"title\":\"{{q}}\"}}}","params":{"q":"shoes"}}}}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_application/search_application/app_2", `{"indices":["r54_esql_idx"]}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_application/search_application/app_bad", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_application/search_application", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_application/search_application/app_2", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_application/search_application/app_2/_search", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_application/search_application/missing_app", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodDelete, "/_application/search_application/missing_app", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_application/analytics/coll_2", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_application/analytics", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_application/analytics/coll_2", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_application/analytics/missing_coll", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodDelete, "/_application/analytics/missing_coll", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_application/analytics/missing_coll/event/click", `{}`)
+
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_text_structure/find_structure", `{"text":"{\"k\":\"v\",\"n\":1,\"b\":true}"}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_text_structure/find_structure", `{}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPost, "/_text_structure/find_structure", "plain text line 1\nplain text line 2")
+
+	// F8 & F9: Watcher, Cat Transforms, License, XPack, SSL
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_watcher/watch/w_r54", `{"trigger":{"schedule":{"interval":"10m"}},"input":{"simple":{}},"actions":{}}`)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_transform/tr_r54", `{"source":{"index":["r54_esql_idx"]},"dest":{"index":"r54_tr_dest"},"pivot":{"group_by":{"t":{"terms":{"field":"title"}}},"aggregations":{"c":{"value_count":{"field":"val"}}}}}`)
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_watcher/settings", `{"persistent":{"xpack.watcher.enabled":true},"top_setting":"v"}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /_watcher/settings, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_watcher/settings", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_watcher/settings, got %d", c)
+	}
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_watcher/settings", ``)
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_watcher/_query/watches", `{}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_watcher/_query/watches, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_cat/transforms?format=json", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on GET /_cat/transforms, got %d", c)
+	}
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_cat/transforms/tr_r54", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodHead, "/_cat/transforms/tr_r54", ``)
+	_, _, _ = doRound48Req(t, handler, http.MethodGet, "/_cat/transforms/missing_tr", ``)
+	for _, ep := range []struct{ method, path, body string }{
+		{http.MethodGet, "/_license", ``},
+		{http.MethodHead, "/_license", ``},
+		{http.MethodPut, "/_license", `{"type":"platinum"}`},
+		{http.MethodPost, "/_license/start_basic", ``},
+		{http.MethodGet, "/_license/basic_status", ``},
+		{http.MethodHead, "/_license/basic_status", ``},
+		{http.MethodPost, "/_license/start_trial", ``},
+		{http.MethodGet, "/_license/trial_status", ``},
+		{http.MethodHead, "/_license/trial_status", ``},
+		{http.MethodDelete, "/_license", ``},
+		{http.MethodGet, "/_xpack", ``},
+		{http.MethodHead, "/_xpack", ``},
+		{http.MethodGet, "/_xpack/usage", ``},
+		{http.MethodHead, "/_xpack/usage", ``},
+		{http.MethodGet, "/_ssl/certificates", ``},
+		{http.MethodHead, "/_ssl/certificates", ``},
+	} {
+		if c, _, raw := doRound48Req(t, handler, ep.method, ep.path, ep.body); c != http.StatusOK {
+			t.Fatalf("expected 200 on %s %s, got %d: %s", ep.method, ep.path, c, raw)
+		}
+	}
+	for _, neg := range []struct{ method, path, body string }{
+		{http.MethodPost, "/_connector/_sync_job/missing_job/_cancel", ``},
+		{http.MethodPost, "/_connector/missing_conn/_name", `{"name":"x"}`},
+		{http.MethodPost, "/_application/search_application/missing_app/_render_query", `{}`},
+		{http.MethodDelete, "/_text_structure/test_grok_pattern", ``},
+		{http.MethodPost, "/_text_structure/test_grok_pattern", `{`},
+		{http.MethodPost, "/_text_structure/test_grok_pattern", `{}`},
+		{http.MethodPost, "/_text_structure/test_grok_pattern", `{"grok_pattern":"%{WORD:w}"}`},
+		{http.MethodPost, "/_text_structure/test_grok_pattern", `{"grok_pattern":"(?P<bad","messages":["a"]}`},
+		{http.MethodPost, "/_profiling/status", ``},
+		{http.MethodHead, "/_profiling/status", ``},
+		{http.MethodDelete, "/_profiling/flamegraph", ``},
+		{http.MethodDelete, "/_profiling/stacktraces", ``},
+		{http.MethodDelete, "/_profiling/topn_functions", ``},
+		{http.MethodPost, "/_query", `{"query":"FROM r54_esql_idx | SORT title DESC"}`},
+		{http.MethodPost, "/_query", `{"query":"FROM missing_esql_idx"}`},
+		{http.MethodDelete, "/_watcher/_query/watches", ``},
+		{http.MethodPost, "/_cat/transforms", ``},
+		{http.MethodGet, "/_license/start_basic", ``},
+		{http.MethodPost, "/_license/basic_status", ``},
+		{http.MethodGet, "/_license/start_trial", ``},
+		{http.MethodPost, "/_license/trial_status", ``},
+		{http.MethodGet, "/_license/unknown_sub", ``},
+		{http.MethodPost, "/_xpack", ``},
+		{http.MethodPost, "/_ssl/certificates", ``},
+	} {
+		_, _, _ = doRound48Req(t, handler, neg.method, neg.path, neg.body)
+	}
+
+	// F27-F29: Circle GeoJSON & WKT, Terminate, Grok ECS & keep_empty_captures, KV transform_key
+	simR54 := `{
+		"pipeline": {
+			"processors": [
+				{"circle": {"field": "geo_c", "target_field": "geo_poly", "shape_type": "geo_shape", "error_distance": 5.0}},
+				{"circle": {"field": "wkt_c", "target_field": "wkt_poly", "shape_type": "shape", "error_distance": 1.0}},
+				{"grok": {"field": "apache_line", "patterns": ["%{COMMONAPACHELOG}"], "ecs_compatibility": "v1"}},
+				{"kv": {"field": "kv_upper", "field_split": "&", "value_split": "=", "transform_key": "uppercase"}},
+				{"terminate": {"if": "ctx.stop_now == true"}},
+				{"set": {"field": "unreachable", "value": true}}
+			]
+		},
+		"docs": [
+			{
+				"_source": {
+					"geo_c": {"type": "circle", "coordinates": [-73.98, 40.75], "radius": "100m"},
+					"wkt_c": "CIRCLE (10 20 5)",
+					"apache_line": "127.0.0.1 - frank [10/Oct/2000:13:55:36 -0700] \"GET /apache_pb.gif HTTP/1.0\" 200 2326",
+					"kv_upper": "foo=1&foo=2&bar=baz",
+					"stop_now": true
+				}
+			}
+		]
+	}`
+	if c, m, raw := doRound48Req(t, handler, http.MethodPost, "/_ingest/pipeline/_simulate?verbose=true", simR54); c != http.StatusOK {
+		t.Fatalf("expected 200 on R54 _simulate, got %d: %s", c, raw)
+	} else {
+		docs, _ := m["docs"].([]any)
+		res0, _ := docs[0].(map[string]any)["processor_results"].([]any)
+		if len(res0) != 5 {
+			t.Fatalf("expected 5 processor_results (terminated before 6th), got %d", len(res0))
+		}
+	}
+}

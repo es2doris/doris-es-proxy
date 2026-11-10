@@ -84,6 +84,31 @@ func ShredDocumentWithNow(
 		return nil, fmt.Errorf("invalid document JSON for _id=%q: %w", id, err)
 	}
 	prunedDynamic := false
+	if s != nil {
+		if s.MaxDepth > 0 || s.MaxFieldNameLength > 0 {
+			if err := validateDocumentLimits(parsedDoc, 1, s.MaxDepth, s.MaxFieldNameLength); err != nil {
+				return nil, err
+			}
+		}
+		if s.MaxNestedObjects > 0 && (len(s.NestedRootSpecs) > 0 || len(s.NestedRoots) > 0) {
+			nestedPaths := make(map[string][]string, len(s.NestedRootSpecs)+len(s.NestedRoots))
+			for _, nr := range s.NestedRootSpecs {
+				nestedPaths[nr.Path] = nr.PathParts
+			}
+			for np := range s.NestedRoots {
+				if _, exists := nestedPaths[np]; !exists {
+					nestedPaths[np] = strings.Split(np, ".")
+				}
+			}
+			totalNestedObjs := 0
+			for _, parts := range nestedPaths {
+				totalNestedObjs += len(extractNestedElementMapsWithIDs(parsedDoc, parts, ""))
+			}
+			if totalNestedObjs > s.MaxNestedObjects {
+				return nil, fmt.Errorf("illegal_argument_exception: The number of nested documents has exceeded the allowed limit of [%d]", s.MaxNestedObjects)
+			}
+		}
+	}
 	if s != nil && s.RawMapping != nil {
 		var err error
 		prunedDynamic, err = validateStrictDynamicObject(parsedDoc, s.RawMapping.Properties, s.RawMapping.Dynamic, s.RawMapping.Subobjects, "")
@@ -238,20 +263,26 @@ func ShredDocumentWithNow(
 				}
 				validLeafs = append(validLeafs, rv)
 			}
-			if b.Kind == StoragePromotedArray {
-				row[b.ColumnName] = []string{expectedStr}
-			} else if b.Kind == StorageNestedSubfield {
-				if len(extractNestedElementMapsWithIDs(parsedDoc, strings.Split(b.NestedPath, "."), "")) > 0 {
+			if !hadMalformed || len(validLeafs) > 0 {
+				if b.Kind == StoragePromotedArray {
 					row[b.ColumnName] = []string{expectedStr}
+				} else if b.Kind == StorageNestedSubfield {
+					if len(extractNestedElementMapsWithIDs(parsedDoc, strings.Split(b.NestedPath, "."), "")) > 0 {
+						row[b.ColumnName] = []string{expectedStr}
+					}
+				} else if b.ColumnName != "" {
+					row[b.ColumnName] = expectedStr
+				} else if b.Kind == StorageDynamicVariant && b.NestedPath == "" && len(b.SourceJSONPath) > 0 && len(rawLeafs) == 0 && !hadMalformed {
+					deferReplacePath(b.SourceJSONPath, []any{expectedStr})
 				}
-			} else if b.ColumnName != "" {
-				row[b.ColumnName] = expectedStr
-			} else if b.Kind == StorageDynamicVariant && b.NestedPath == "" && len(b.SourceJSONPath) > 0 && len(rawLeafs) == 0 && !hadMalformed {
-				deferReplacePath(b.SourceJSONPath, []any{expectedStr})
 			}
 			if hadMalformed && isPrimaryFieldBinding(b) {
 				if len(validLeafs) > 0 {
-					deferReplacePath(b.SourceJSONPath, validLeafs)
+					if b.Kind == StorageNestedSubfield {
+						deferCleanNestedPath(b.SourceJSONPath, b)
+					} else {
+						deferReplacePath(b.SourceJSONPath, validLeafs)
+					}
 				} else {
 					deferDeletePath(b.SourceJSONPath)
 				}
@@ -1266,9 +1297,65 @@ func countTokensForBinding(sv string, b FieldBinding) int64 {
 	return cnt
 }
 
+func validateDocumentLimits(obj map[string]any, depth, maxDepth, maxFieldNameLength int) error {
+	if obj == nil {
+		return nil
+	}
+	if maxDepth > 0 && depth > maxDepth {
+		return fmt.Errorf("illegal_argument_exception: Limit of mapping depth [%d] has been exceeded", maxDepth)
+	}
+	for k, v := range obj {
+		if maxFieldNameLength > 0 {
+			if len(k) > maxFieldNameLength {
+				return fmt.Errorf("illegal_argument_exception: Field name [%s] is longer than the limit of [%d] characters", k, maxFieldNameLength)
+			}
+			for _, seg := range strings.Split(k, ".") {
+				if len(seg) > maxFieldNameLength {
+					return fmt.Errorf("illegal_argument_exception: Field name [%s] is longer than the limit of [%d] characters", seg, maxFieldNameLength)
+				}
+			}
+		}
+		effDepth := depth + strings.Count(k, ".")
+		if maxDepth > 0 && effDepth > maxDepth {
+			return fmt.Errorf("illegal_argument_exception: Limit of mapping depth [%d] has been exceeded", maxDepth)
+		}
+		switch tv := v.(type) {
+		case map[string]any:
+			if err := validateDocumentLimits(tv, effDepth+1, maxDepth, maxFieldNameLength); err != nil {
+				return err
+			}
+		case []any:
+			for _, elem := range tv {
+				if em, ok := elem.(map[string]any); ok {
+					if err := validateDocumentLimits(em, effDepth+1, maxDepth, maxFieldNameLength); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func dateFormatAllowsNumericWithNoCoerce(format string) bool {
+	if strings.TrimSpace(format) == "" {
+		return true
+	}
+	for _, part := range strings.Split(format, "||") {
+		switch strings.TrimSpace(part) {
+		case "epoch_millis", "epoch_second":
+			return true
+		}
+	}
+	return false
+}
+
 func parseUnsignedLongString(s string, allowCoerce bool) (uint64, bool) {
 	s = strings.TrimSpace(s)
 	if s == "" || strings.HasPrefix(s, "-") {
+		return 0, false
+	}
+	if !allowCoerce && strings.ContainsAny(s, ".eE") {
 		return 0, false
 	}
 	if u, err := strconv.ParseUint(strings.TrimPrefix(s, "+"), 10, 64); err == nil {
@@ -1362,10 +1449,9 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 					}
 				case json.Number:
 					if strings.ContainsAny(v.String(), ".eE") {
-						if f, err := v.Float64(); err != nil || math.Trunc(f) != f {
-							return nil
-						}
-					} else if _, err := v.Int64(); err != nil {
+						return nil
+					}
+					if _, err := v.Int64(); err != nil {
 						if _, uerr := strconv.ParseUint(v.String(), 10, 64); uerr != nil {
 							return nil
 						}
@@ -1544,6 +1630,12 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 		}
 	}
 	if (b.ESType == "date" || b.ESType == "date_nanos") && b.Format != "" {
+		if b.Coerce != nil && !*b.Coerce && !dateFormatAllowsNumericWithNoCoerce(b.Format) {
+			switch val.(type) {
+			case int, int64, float64, json.Number:
+				return nil
+			}
+		}
 		normalizeNanos := func(ms int64) int64 {
 			if b.ESType == "date_nanos" && (ms > 1_000_000_000_000_000 || ms < -1_000_000_000_000_000) {
 				return ms / 1_000_000
@@ -1584,6 +1676,14 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 		}
 	case "byte":
 		if iv, ok := coerced.(int); ok && (iv < math.MinInt8 || iv > math.MaxInt8) {
+			return nil
+		}
+	case "float":
+		if fv, ok := coerced.(float64); ok && !math.IsNaN(fv) && !math.IsInf(fv, 0) && math.Abs(fv) > math.MaxFloat32 {
+			return nil
+		}
+	case "half_float":
+		if fv, ok := coerced.(float64); ok && !math.IsNaN(fv) && !math.IsInf(fv, 0) && math.Abs(fv) > 65504.0 {
 			return nil
 		}
 	case "date_nanos":
@@ -3547,6 +3647,27 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 		if b.LowercaseNormalizer {
 			expectedStr = strings.ToLower(expectedStr)
 		}
+		if val != nil {
+			if arr, ok := val.([]any); ok {
+				var out []any
+				for _, item := range arr {
+					if norm := normalizeNestedLeafValue(item, b, getNow); norm != nil {
+						out = append(out, norm)
+					}
+				}
+				if len(out) == 0 && len(arr) > 0 {
+					return nil
+				}
+				return out
+			}
+			sv := fmt.Sprintf("%v", val)
+			if b.LowercaseNormalizer {
+				sv = strings.ToLower(sv)
+			}
+			if sv != expectedStr {
+				return nil
+			}
+		}
 		return expectedStr
 	}
 	if val == nil {
@@ -3616,6 +3737,12 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 		}
 	}
 	if b.ESType == "date" || b.ESType == "date_nanos" {
+		if b.Coerce != nil && !*b.Coerce && b.Format != "" && !dateFormatAllowsNumericWithNoCoerce(b.Format) {
+			switch val.(type) {
+			case int, int64, float64, json.Number:
+				return nil
+			}
+		}
 		str := strings.TrimSpace(fmt.Sprintf("%v", val))
 		if b.Format != "" {
 			if ms, ok := ParseESDateWithFormatToEpochMillis(str, b.Format, getNow()); ok {
@@ -3668,6 +3795,9 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 		if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
 			return nil
 		}
+		if b.Coerce != nil && !*b.Coerce {
+			return nil
+		}
 	} else if isTypedNonStringBinding(b) {
 		coerced := coerceScalarBindingForDoris(val, b, getNow())
 		if coerced != nil {
@@ -3679,6 +3809,9 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 			return coerced
 		}
 		if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+			return nil
+		}
+		if (b.Coerce != nil && !*b.Coerce) || b.ESType == "float" || b.ESType == "half_float" {
 			return nil
 		}
 	} else if b.LowercaseNormalizer {

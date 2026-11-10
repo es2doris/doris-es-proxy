@@ -2368,3 +2368,99 @@ func TestRound53_F10_F11_F12_F13_F14_F19_ASTValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestRound54ESASTF10F11F15F16F18F19(t *testing.T) {
+	// Valid F10, F11, F15, F16, F18, F19 cases
+	validReqs := []string{
+		`{"sub_searches":[{"query":{"match_all":{}},"_name":"s1"},{"query":{"term":{"status":"ok"}}}],"rank":{"rrf":{"window_size":50,"rank_constant":20}},"size":10}`,
+		`{"sub_searches":[{"query":{"match_all":{}}}],"rank":{"rrf":{"rank_window_size":25}}}`,
+		`{"retriever":{"rule":{"retriever":{"standard":{"query":{"match_all":{}},"rank_window_size":15}},"ruleset_ids":["r1","r2"],"match_criteria":{"q":"x"}}}}`,
+		`{"retriever":{"text_similarity_reranker":{"retriever":{"standard":{"query":{"match_all":{}}}},"field":"title","inference_id":"rerank","inference_text":"shoes","rank_window_size":10,"min_score":0.25}}}`,
+		`{"size":0,"aggs":{"ct":{"categorize_text":{"field":"msg","size":5}},"fis":{"frequent_item_sets":{"minimum_set_size":2,"support":0.1,"fields":[{"field":"tags"},{"field":"cat"}]}},"mp":{"moving_percentiles":{"buckets_path":"p","window":5}},"cb":{"cartesian_bounds":{"field":"pt"}},"cc":{"cartesian_centroid":{"field":"pt"}},"gl":{"geo_line":{"point":{"field":"loc"},"sort":{"field":"ts"}}},"rs":{"random_sampler":{"probability":0.5,"seed":42},"aggs":{"c":{"value_count":{"field":"id"}}}}}}`,
+		`{"query":{"terms_set":{"tags":{"terms":["a","b"],"minimum_should_match_field":"req"}}}}`,
+		`{"query":{"terms_set":{"tags":{"terms":["a","b"],"minimum_should_match_script":{"source":"params.num_terms"}}}}}`,
+		`{"query":{"query_string":{"query":"foo~1","analyzer":"stop","quote_analyzer":"standard","fuzzy_prefix_length":2,"fuzzy_max_expansions":25,"escape":true}}}`,
+		`{"query":{"simple_query_string":{"query":"foo~1","flags":"OR|FUZZY","fuzzy_prefix_length":2,"fuzzy_max_expansions":25,"fuzzy_transpositions":false}}}`,
+		`{"query":{"geo_distance":{"distance":"10km","loc":[0,0],"ignore_unmapped":true}}}`,
+		`{"query":{"geo_bounding_box":{"loc":{"top_left":[0,10],"bottom_right":[10,0]},"ignore_unmapped":true}}}`,
+		`{"query":{"has_child":{"type":"c","query":{"match_all":{}},"min_children":0,"max_children":0}}}`,
+	}
+	for _, raw := range validReqs {
+		var sr SearchRequest
+		if err := json.Unmarshal([]byte(raw), &sr); err != nil {
+			t.Fatalf("Round 54 expected valid SearchRequest %s, got err=%v", raw, err)
+		}
+	}
+
+	// Verify F15/F16/F18 persisted fields
+	var qsSR SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"query_string":{"query":"foo","analyzer":"stop","quote_analyzer":"standard","fuzzy_prefix_length":3,"fuzzy_max_expansions":15,"escape":true}}}`), &qsSR)
+	if qsSR.Query.QueryString.Analyzer != "stop" || qsSR.Query.QueryString.QuoteAnalyzer != "standard" || qsSR.Query.QueryString.FuzzyPrefixLength != 3 || qsSR.Query.QueryString.FuzzyMaxExpansions != 15 || qsSR.Query.QueryString.Escape == nil || !*qsSR.Query.QueryString.Escape {
+		t.Fatalf("F15 expected QueryStringQuery fields persisted, got %+v", qsSR.Query.QueryString)
+	}
+	var gdSR, gbSR SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"geo_distance":{"distance":"5km","loc":[0,0],"ignore_unmapped":true}}}`), &gdSR)
+	_ = json.Unmarshal([]byte(`{"query":{"geo_bounding_box":{"loc":{"top_left":[0,10],"bottom_right":[10,0]},"ignore_unmapped":true}}}`), &gbSR)
+	if !gdSR.Query.GeoDistance.IgnoreUnmapped || !gbSR.Query.GeoBoundingBox.IgnoreUnmapped {
+		t.Fatalf("F18 expected IgnoreUnmapped=true on GeoDistance and GeoBoundingBox")
+	}
+	if bGD, err := json.Marshal(gdSR.Query.GeoDistance); err != nil || !strings.Contains(string(bGD), `"ignore_unmapped":true`) {
+		t.Fatalf("F18 expected GeoDistance MarshalJSON to include ignore_unmapped, got %s (%v)", string(bGD), err)
+	}
+	if bGB, err := json.Marshal(gbSR.Query.GeoBoundingBox); err != nil || !strings.Contains(string(bGB), `"ignore_unmapped":true`) {
+		t.Fatalf("F18 expected GeoBoundingBox MarshalJSON to include ignore_unmapped, got %s (%v)", string(bGB), err)
+	}
+
+	// Invalid F10, F11, F19 cases
+	invalidReqs := []string{
+		// F10: sub_searches & rank
+		`{"sub_searches":[]}`,
+		`{"sub_searches":[{"_name":"s1"}]}`,
+		`{"sub_searches":[{"query":null}]}`,
+		`{"sub_searches":[{"query":{"match_all":{}},"unknown":1}]}`,
+		`{"rank":{}}`,
+		`{"rank":{"rrf":null}}`,
+		`{"rank":{"unknown":{}}}`,
+		`{"rank":{"rrf":{"unknown":1}}}`,
+		`{"rank":{"rrf":{"window_size":0}}}`,
+		`{"rank":{"rrf":{"rank_window_size":0}}}`,
+		`{"rank":{"rrf":{"rank_constant":0}}}`,
+		`{"size":20,"rank":{"rrf":{"window_size":10}}}`,
+		// F10: retriever validations
+		`{"retriever":{"standard":{"query":{"match_all":{}},"rank_window_size":0}}}`,
+		`{"retriever":{"rrf":{"retrievers":[{"standard":{"query":{"match_all":{}}}},{"standard":{"query":{"match_all":{}}}}],"rank_window_size":0}}}`,
+		`{"retriever":{"text_similarity_reranker":{"retriever":{"standard":{"query":{"match_all":{}}}},"field":"f","inference_id":"id","inference_text":"txt","rank_window_size":0}}}`,
+		`{"retriever":{"text_similarity_reranker":{"retriever":{"standard":{"query":{"match_all":{}}}},"field":"f","inference_id":"id","inference_text":"txt","min_score":-0.5}}}`,
+		`{"retriever":{"rule":{"retriever":{"standard":{"query":{"match_all":{}}}},"ruleset_id":"r1","ruleset_ids":["r2"]}}}`,
+		`{"retriever":{"rule":{"retriever":{"standard":{"query":{"match_all":{}}}},"ruleset_ids":[""]}}}`,
+		// F10: new ES 8.x aggs validations
+		`{"size":0,"aggs":{"a":{"categorize_text":{}}}}`,
+		`{"size":0,"aggs":{"a":{"categorize_text":{"field":"msg","size":0}}}}`,
+		`{"size":0,"aggs":{"a":{"frequent_item_sets":{"fields":[]}}}}`,
+		`{"size":0,"aggs":{"a":{"frequent_item_sets":{"fields":[{"field":""}]}}}}`,
+		`{"size":0,"aggs":{"a":{"frequent_item_sets":{"fields":[{"field":"f"}],"minimum_set_size":0}}}}`,
+		`{"size":0,"aggs":{"a":{"frequent_item_sets":{"fields":[{"field":"f"}],"support":0}}}}`,
+		`{"size":0,"aggs":{"a":{"frequent_item_sets":{"fields":[{"field":"f"}],"support":1.5}}}}`,
+		`{"size":0,"aggs":{"a":{"moving_percentiles":{"buckets_path":""}}}}`,
+		`{"size":0,"aggs":{"a":{"moving_percentiles":{"buckets_path":"p","window":0}}}}`,
+		`{"size":0,"aggs":{"a":{"cartesian_bounds":{}}}}`,
+		`{"size":0,"aggs":{"a":{"cartesian_centroid":{}}}}`,
+		`{"size":0,"aggs":{"a":{"geo_line":{}}}}`,
+		`{"size":0,"aggs":{"a":{"geo_line":{"point":{"field":"loc"},"size":0}}}}`,
+		`{"size":0,"aggs":{"a":{"random_sampler":{"probability":0}}}}`,
+		`{"size":0,"aggs":{"a":{"random_sampler":{"probability":1}}}}`,
+		// F11: terms_set validations
+		`{"query":{"terms_set":{"tags":{"terms":[],"minimum_should_match_field":"req"}}}}`,
+		`{"query":{"terms_set":{"tags":{"terms":["a"]}}}}`,
+		`{"query":{"terms_set":{"tags":{"terms":["a"],"minimum_should_match_field":"req","minimum_should_match_script":{"source":"1"}}}}}`,
+		`{"query":{"terms_set":{"tags":{"terms":["a"],"minimum_should_match_script":{}}}}}`,
+		// F19: has_child min_children > max_children when max_children == 0
+		`{"query":{"has_child":{"type":"c","query":{"match_all":{}},"min_children":2,"max_children":0}}}`,
+	}
+	for _, raw := range invalidReqs {
+		var sr SearchRequest
+		if err := json.Unmarshal([]byte(raw), &sr); err == nil {
+			t.Fatalf("Round 54 expected error for invalid SearchRequest %s", raw)
+		}
+	}
+}

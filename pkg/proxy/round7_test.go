@@ -144,7 +144,7 @@ func TestRound7_TermsSetScriptASTSecurityAndSelfCorruption(t *testing.T) {
 			"bool": {
 				"must": [
 					{"terms_set": {"_id": {"terms": ["doc-1", "doc-2"], "minimum_should_match_script": {"source": "1"}}}},
-					{"terms_set": {"vec": {"terms": ["1.0"]}}}
+					{"terms_set": {"vec": {"terms": ["1.0"], "minimum_should_match_script": {"source": "1"}}}}
 				]
 			}
 		}
