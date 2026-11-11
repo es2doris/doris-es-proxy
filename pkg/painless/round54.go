@@ -34,30 +34,39 @@ func formatDurationISO8601Painless(d time.Duration) string {
 		return "PT0S"
 	}
 	neg := d < 0
+	var mag uint64
 	if neg {
-		d = -d
+		mag = uint64(-(d + 1)) + 1 // #nosec G115 -- d < 0 so -(d+1) >= 0
+	} else {
+		mag = uint64(d) // #nosec G115 -- d > 0
 	}
 	var b strings.Builder
 	b.WriteString("PT")
-	if neg {
-		b.WriteByte('-')
-	}
-	hours := int64(d / time.Hour)
-	rem := d % time.Hour
-	mins := int64(rem / time.Minute)
-	rem %= time.Minute
-	secs := int64(rem / time.Second)
-	nanos := int64(rem % time.Second)
+	hours := mag / uint64(time.Hour)
+	rem := mag % uint64(time.Hour)
+	mins := rem / uint64(time.Minute)
+	rem %= uint64(time.Minute)
+	secs := rem / uint64(time.Second)
+	nanos := rem % uint64(time.Second)
 	if hours > 0 {
-		b.WriteString(strconv.FormatInt(hours, 10))
+		if neg {
+			b.WriteByte('-')
+		}
+		b.WriteString(strconv.FormatUint(hours, 10))
 		b.WriteByte('H')
 	}
 	if mins > 0 {
-		b.WriteString(strconv.FormatInt(mins, 10))
+		if neg {
+			b.WriteByte('-')
+		}
+		b.WriteString(strconv.FormatUint(mins, 10))
 		b.WriteByte('M')
 	}
 	if secs > 0 || nanos > 0 || (hours == 0 && mins == 0) {
-		b.WriteString(strconv.FormatInt(secs, 10))
+		if neg {
+			b.WriteByte('-')
+		}
+		b.WriteString(strconv.FormatUint(secs, 10))
 		if nanos > 0 {
 			frac := strings.TrimRight(fmt.Sprintf("%09d", nanos), "0")
 			b.WriteByte('.')
@@ -158,6 +167,9 @@ func coerceOptionalPrimitivePainless(kind string, val any) (any, error) {
 		}
 		return nil, &painlessExceptionError{exType: "ClassCastException", message: fmt.Sprintf("Cannot cast %T to long", val)}
 	case "OptionalDouble":
+		if fv, ok := toFloat64RawPainless(val); ok {
+			return fv, nil
+		}
 		if fv, ok := toFloat64(val); ok {
 			return fv, nil
 		}
@@ -176,11 +188,14 @@ func (o *painlessOptional) String() string {
 		return k + ".empty"
 	}
 	if o.kind == "OptionalDouble" {
+		if fv, ok := toFloat64RawPainless(o.val); ok {
+			return fmt.Sprintf("OptionalDouble[%s]", formatJavaFloatingToStringPainless(fv, false))
+		}
 		if fv, ok := toFloat64(o.val); ok {
 			return fmt.Sprintf("OptionalDouble[%s]", formatJavaFloatingToStringPainless(fv, false))
 		}
 	}
-	return fmt.Sprintf("%s[%v]", o.kind, o.val)
+	return fmt.Sprintf("%s[%s]", o.kind, formatValueForStringPainless(o.val))
 }
 
 func (o *painlessOptional) equals(other any) bool {
@@ -376,10 +391,7 @@ func isSummaryStatisticsMapPainless(m map[string]any) (string, bool) {
 }
 
 func toFloat64AllowNonFinitePainless(v any) (float64, bool) {
-	if f, ok := v.(float64); ok {
-		return f, true
-	}
-	return toFloat64(v)
+	return toFloat64RawPainless(v)
 }
 
 func summaryStatisticsAcceptPainless(m map[string]any, val any) error {
@@ -1550,6 +1562,10 @@ func evalUserClassMethodOnClassPainless(uo *painlessUserObject, targetCls *painl
 		rawArgs := splitTopLevelCommaPainless(argStr)
 		argVals = make([]any, 0, len(rawArgs))
 		for _, ra := range rawArgs {
+			if pred, okPred := tryBuildLambdaPredicateArgPainless(ra, params); okPred {
+				argVals = append(argVals, pred)
+				continue
+			}
 			av, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(ra), params, depth+1)
 			if err != nil {
 				return nil, err
@@ -3813,6 +3829,9 @@ func evalRound54StaticCallPainless(fnName string, args []string, argStr string, 
 		if !ok {
 			return nil, true, &painlessExceptionError{exType: "NullPointerException", message: "Collection is null"}
 		}
+		if errU := checkMutableContainerPainless(getOrInitEvalBudget(params), slice); errU != nil {
+			return nil, true, errU
+		}
 		if len(args) == 1 {
 			return false, true, nil
 		}
@@ -3861,10 +3880,42 @@ func evalRound54StaticCallPainless(fnName string, args []string, argStr string, 
 		if len(src) > len(dest) {
 			return nil, true, &painlessExceptionError{exType: "IndexOutOfBoundsException", message: "Source does not fit in dest"}
 		}
+		if errU := checkMutableContainerPainless(getOrInitEvalBudget(params), dest); errU != nil {
+			return nil, true, errU
+		}
 		copy(dest, src)
 		return nil, true, nil
-	case "Collections.unmodifiableList", "Collections.unmodifiableSet", "Collections.unmodifiableMap", "Collections.unmodifiableCollection",
-		"Collections.synchronizedList", "Collections.synchronizedSet", "Collections.synchronizedMap", "Collections.synchronizedCollection",
+	case "Collections.unmodifiableList", "Collections.unmodifiableSet", "Collections.unmodifiableCollection":
+		if len(args) >= 1 {
+			v0, err0 := evalArg(0)
+			if err0 != nil {
+				return nil, true, err0
+			}
+			if v0 == nil {
+				return nil, true, &painlessExceptionError{exType: "NullPointerException", message: fnName + "(null)"}
+			}
+			if arr, ok := v0.([]any); ok {
+				return shallowCopyUnmodSlicePainless(getOrInitEvalBudget(params), arr), true, nil
+			}
+			return v0, true, nil
+		}
+		return nil, true, nil
+	case "Collections.unmodifiableMap":
+		if len(args) >= 1 {
+			v0, err0 := evalArg(0)
+			if err0 != nil {
+				return nil, true, err0
+			}
+			if v0 == nil {
+				return nil, true, &painlessExceptionError{exType: "NullPointerException", message: fnName + "(null)"}
+			}
+			if m, ok := v0.(map[string]any); ok {
+				return shallowCopyUnmodMapPainless(getOrInitEvalBudget(params), m), true, nil
+			}
+			return v0, true, nil
+		}
+		return nil, true, nil
+	case "Collections.synchronizedList", "Collections.synchronizedSet", "Collections.synchronizedMap", "Collections.synchronizedCollection",
 		"Collections.checkedList", "Collections.checkedSet", "Collections.checkedMap", "Collections.checkedCollection":
 		if len(args) >= 1 {
 			v0, err0 := evalArg(0)
@@ -4123,7 +4174,7 @@ func evalRound54StaticCallPainless(fnName string, args []string, argStr string, 
 		if err0 != nil {
 			return nil, true, err0
 		}
-		if v0 == nil {
+		if v0 == nil || v0 == painlessEmptyOptional {
 			return nil, true, &painlessExceptionError{exType: "NullPointerException", message: "text"}
 		}
 		if len(args) >= 2 {
@@ -4131,11 +4182,16 @@ func evalRound54StaticCallPainless(fnName string, args []string, argStr string, 
 			if err1 != nil {
 				return nil, true, err1
 			}
-			if tm, ok := parseDateTimeWithFormatterPainless(v0, fVal); ok {
-				_, offSec := tm.Zone()
-				res, err := newPainlessOffsetTime(tm.Hour(), tm.Minute(), tm.Second(), tm.Nanosecond(), offSec)
-				return res, true, err
+			if fVal == nil || fVal == painlessEmptyOptional {
+				return nil, true, &painlessExceptionError{exType: "NullPointerException", message: "formatter"}
 			}
+			tm, ok := parseDateTimeWithFormatterStrictPainless(fmt.Sprintf("%v", v0), fVal)
+			if !ok {
+				return nil, true, &painlessExceptionError{exType: "DateTimeParseException", message: fmt.Sprintf("Text %q could not be parsed as OffsetTime", fmt.Sprintf("%v", v0))}
+			}
+			_, offSec := tm.Zone()
+			res, err := newPainlessOffsetTime(tm.Hour(), tm.Minute(), tm.Second(), tm.Nanosecond(), offSec)
+			return res, true, err
 		}
 		ot, ok := parsePainlessOffsetTime(v0)
 		if !ok {

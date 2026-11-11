@@ -2639,3 +2639,293 @@ func TestRound55SchemaAndShredderF12ToF14(t *testing.T) {
 		t.Fatalf("F14 expected normalized _gte and lowercased flattened value in _doc, got %s", validDottedStr)
 	}
 }
+
+func TestRound56SchemaAndShredderF12ToF16(t *testing.T) {
+	// --- F12: subobjects: false in ValidateMappingSpec & ShredDocument ---
+	invalidSubobjMappings := []string{
+		`{"properties":{"k":{"type":"keyword","subobjects":false}}}`,
+		`{"properties":{"n":{"type":"nested","subobjects":false}}}`,
+		`{"subobjects":false,"properties":{"obj":{"type":"object"}}}`,
+		`{"subobjects":false,"properties":{"obj":{"properties":{"a":{"type":"keyword"}}}}}`,
+		`{"subobjects":false,"properties":{"items":{"type":"nested","properties":{"a":{"type":"keyword"}}}}}`,
+		`{"properties":{"metrics":{"type":"object","subobjects":false,"properties":{"child":{"type":"object"}}}}}`,
+		`{"properties":{"metrics":{"type":"object","subobjects":false,"properties":{"child":{"properties":{"x":{"type":"long"}}}}}}}`,
+		`{"properties":{"metrics":{"type":"object","subobjects":false,"properties":{"items":{"type":"nested"}}}}}`,
+	}
+	for _, raw := range invalidSubobjMappings {
+		var spec esast.MappingSpec
+		if err := json.Unmarshal([]byte(raw), &spec); err != nil {
+			t.Fatalf("F12 unmarshal %s failed: %v", raw, err)
+		}
+		if err := ValidateMappingSpec(&spec); err == nil || !strings.Contains(err.Error(), "mapper_parsing_exception") {
+			t.Fatalf("F12 expected mapper_parsing_exception for %s, got %v", raw, err)
+		}
+	}
+
+	var subobjSpec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"dynamic": "strict",
+		"properties": {
+			"metrics": {
+				"type": "object",
+				"subobjects": false,
+				"properties": {
+					"time":     {"type": "long"},
+					"time.min": {"type": "long"},
+					"labels":   {"type": "flattened"},
+					"loc":      {"type": "geo_point"},
+					"raw_blob": {"type": "object", "enabled": false}
+				}
+			},
+			"tag":      {"type": "keyword"},
+			"tag.sub":  {"type": "keyword"},
+			"geo":      {"type": "geo_point"},
+			"geo.alt":  {"type": "geo_point"},
+			"flat":     {"type": "flattened"},
+			"flat.sub": {"type": "flattened"},
+			"nv.leaf":  {"type": "keyword", "null_value": "WAS_NULL"},
+			"nv":       {"type": "keyword"}
+		}
+	}`), &subobjSpec); err != nil {
+		t.Fatalf("F12 valid mapping unmarshal failed: %v", err)
+	}
+	if err := ValidateMappingSpec(&subobjSpec); err != nil {
+		t.Fatalf("F12 expected valid subobjects:false mapping, got %v", err)
+	}
+	subobjSchema := CompileIndexSchema("db", "r56_subobj", &subobjSpec)
+
+	// Flat dotted keys + object-accepting leaf types + scalar/dotted coexistence succeed without data loss
+	coexistBytes, err := ShredDocument(subobjSchema, "d1", 1, false, []byte(`{
+		"metrics": {
+			"time": 100,
+			"time.min": 10,
+			"labels": {"env": "prod"},
+			"loc": {"lat": 40.7, "lon": -74.0},
+			"raw_blob": {"nested": {"anything": true}}
+		},
+		"tag": "parent_tag",
+		"tag.sub": "child_tag",
+		"geo": "40.0,-70.0",
+		"geo.alt": "41.0,-71.0",
+		"flat": {"k1": "v1"},
+		"flat.sub": {"k2": "v2"},
+		"nv": "parent_nv",
+		"nv.leaf": null
+	}`))
+	if err != nil {
+		t.Fatalf("F12 ShredDocument valid subobjects:false & scalar+dotted coexistence failed: %v", err)
+	}
+	var coexistRow map[string]any
+	if err := json.Unmarshal(coexistBytes, &coexistRow); err != nil {
+		t.Fatalf("F12 unmarshal shredded row failed: %v", err)
+	}
+	if coexistRow["f__metrics__time"] != float64(100) || coexistRow["f__metrics__time__min"] != float64(10) {
+		t.Fatalf("F12 lost scalar/dotted numeric values: %+v", coexistRow)
+	}
+	if coexistRow["f__tag"] != "parent_tag" || coexistRow["f__tag__sub"] != "child_tag" {
+		t.Fatalf("F12 lost scalar/dotted string values: %+v", coexistRow)
+	}
+	if coexistRow["f__geo"] != "40,-70" || coexistRow["f__geo__alt"] != "41,-71" {
+		t.Fatalf("F12 lost scalar/dotted geo_point values: %+v", coexistRow)
+	}
+	if coexistRow["f__nv"] != "parent_nv" || coexistRow["f__nv__leaf"] != "WAS_NULL" {
+		t.Fatalf("F12 lost scalar/dotted explicit null_value handling: %+v", coexistRow)
+	}
+
+	// Reject nested sub-object or array-of-objects inside subobjects:false
+	for _, badDoc := range []string{
+		`{"metrics":{"time":{"min":10}}}`,
+		`{"metrics":{"time":[{"min":10}]}}`,
+	} {
+		if _, err := ShredDocument(subobjSchema, "bad", 1, false, []byte(badDoc)); err == nil {
+			t.Fatalf("F12 expected subobjects:false to reject nested object in %s", badDoc)
+		}
+	}
+
+	// --- F13: ValidateMappingUpdateCompatibility root validation & subobjects immutability ---
+	var oldCompat esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{
+		"properties": {
+			"grp": {
+				"type": "object",
+				"properties": {"a": {"type": "keyword"}}
+			},
+			"flat_grp": {
+				"type": "object",
+				"subobjects": false,
+				"properties": {"b.c": {"type": "keyword"}}
+			}
+		}
+	}`), &oldCompat)
+
+	// Valid idempotent updates (default true -> explicit true; false -> false)
+	for _, okUpd := range []string{
+		`{"subobjects":true,"properties":{"grp":{"type":"object","subobjects":true},"flat_grp":{"type":"object","subobjects":false}}}`,
+	} {
+		var upd esast.MappingSpec
+		_ = json.Unmarshal([]byte(okUpd), &upd)
+		if err := ValidateMappingUpdateCompatibility(&oldCompat, &upd); err != nil {
+			t.Fatalf("F13 expected idempotent subobjects update to succeed, got %v", err)
+		}
+	}
+
+	// Invalid updates: root dynamic invalid, root runtime invalid, root subobjects flip, field subobjects flip
+	invalidUpdates := []struct {
+		raw     string
+		wantSub string
+	}{
+		{`{"dynamic":"invalid_mode"}`, "dynamic"},
+		{`{"runtime":{"bad_rt":{"type":"not_a_runtime_type"}}}`, "mapper_parsing_exception"},
+		{`{"subobjects":false}`, "Cannot update parameter [subobjects]"},
+		{`{"properties":{"grp":{"type":"object","subobjects":false}}}`, "Cannot update parameter [subobjects]"},
+		{`{"properties":{"flat_grp":{"type":"object","subobjects":true}}}`, "Cannot update parameter [subobjects]"},
+	}
+	for _, tc := range invalidUpdates {
+		var upd esast.MappingSpec
+		if err := json.Unmarshal([]byte(tc.raw), &upd); err != nil {
+			t.Fatalf("F13 unmarshal %s failed: %v", tc.raw, err)
+		}
+		err := ValidateMappingUpdateCompatibility(&oldCompat, &upd)
+		if err == nil || !strings.Contains(err.Error(), tc.wantSub) {
+			t.Fatalf("F13 expected error containing %q for %s, got %v", tc.wantSub, tc.raw, err)
+		}
+	}
+
+	// --- F14: ValidateMappingSpec null_value validation ---
+	validNullValueMappings := []string{
+		`{"properties":{"gp1":{"type":"geo_point","null_value":"40.7128,-74.0060"},"gp2":{"type":"geo_point","null_value":{"lat":40.7,"lon":-74.0}},"gp3":{"type":"geo_point","null_value":[-74.0,40.7]}}}`,
+		`{"properties":{"pt1":{"type":"point","null_value":"POINT (1.5 2.5)"},"pt2":{"type":"point","null_value":[1.5,2.5]},"pt3":{"type":"point","null_value":{"x":1.5,"y":2.5}}}}`,
+		`{"properties":{"b":{"type":"boolean","null_value":"false"},"ip":{"type":"ip","null_value":"2001:db8::1"},"v":{"type":"version","null_value":"1.2.3-rc.1+b2"}}}`,
+		`{"properties":{"by":{"type":"byte","null_value":127},"u64":{"type":"unsigned_long","null_value":"18446744073709551615"},"sf":{"type":"scaled_float","scaling_factor":100,"null_value":12.34}}}`,
+		`{"properties":{"d1":{"type":"date","null_value":"2025-01-15"},"d2":{"type":"date","format":"yyyy/MM/dd","null_value":"2025/01/15"},"dn":{"type":"date_nanos","null_value":"2025-01-15T00:00:00.123456789Z"}}}`,
+	}
+	for _, raw := range validNullValueMappings {
+		var spec esast.MappingSpec
+		if err := json.Unmarshal([]byte(raw), &spec); err != nil {
+			t.Fatalf("F14 unmarshal valid %s failed: %v", raw, err)
+		}
+		if err := ValidateMappingSpec(&spec); err != nil {
+			t.Fatalf("F14 expected valid null_value mapping %s, got %v", raw, err)
+		}
+	}
+
+	invalidNullValueMappings := []string{
+		// Unsupported types
+		`{"properties":{"x":{"type":"keyword"},"a":{"type":"alias","path":"x","null_value":"v"}}}`,
+		`{"properties":{"f":{"type":"binary","null_value":"YWJj"}}}`,
+		`{"properties":{"f":{"type":"wildcard","null_value":"v"}}}`,
+		`{"properties":{"f":{"type":"completion","null_value":"v"}}}`,
+		`{"properties":{"f":{"type":"token_count","null_value":0}}}`,
+		`{"properties":{"f":{"type":"murmur3","null_value":0}}}`,
+		`{"properties":{"f":{"type":"histogram","null_value":"v"}}}`,
+		`{"properties":{"f":{"type":"aggregate_metric_double","metrics":["min"],"default_metric":"min","null_value":0}}}`,
+		`{"properties":{"f":{"type":"geo_shape","null_value":"POINT (0 0)"}}}`,
+		`{"properties":{"f":{"type":"shape","null_value":"POINT (0 0)"}}}`,
+		`{"properties":{"f":{"type":"constant_keyword","value":"k","null_value":"k"}}}`,
+		// Invalid geo_point / point null_value
+		`{"properties":{"f":{"type":"geo_point","null_value":"not_a_geo"}}}`,
+		`{"properties":{"f":{"type":"geo_point","null_value":{"lat":200,"lon":0}}}}`,
+		`{"properties":{"f":{"type":"geo_point","null_value":[1]}}}`,
+		`{"properties":{"f":{"type":"point","null_value":"NOT_A_POINT"}}}`,
+		// Invalid scalar/bounds/format null_value
+		`{"properties":{"f":{"type":"keyword","null_value":{"a":1}}}}`,
+		`{"properties":{"f":{"type":"keyword","null_value":["a"]}}}`,
+		`{"properties":{"f":{"type":"boolean","null_value":"maybe"}}}`,
+		`{"properties":{"f":{"type":"boolean","null_value":123}}}`,
+		`{"properties":{"f":{"type":"ip","null_value":"999.999.999.999"}}}`,
+		`{"properties":{"f":{"type":"version","null_value":"01.2.3"}}}`,
+		`{"properties":{"f":{"type":"byte","null_value":128}}}`,
+		`{"properties":{"f":{"type":"short","null_value":40000}}}`,
+		`{"properties":{"f":{"type":"integer","null_value":3000000000}}}`,
+		`{"properties":{"f":{"type":"integer","coerce":false,"null_value":"42"}}}`,
+		`{"properties":{"f":{"type":"unsigned_long","null_value":-1}}}`,
+		`{"properties":{"f":{"type":"unsigned_long","null_value":"18446744073709551616"}}}`,
+		`{"properties":{"f":{"type":"scaled_float","scaling_factor":100,"null_value":"abc"}}}`,
+		`{"properties":{"f":{"type":"date","null_value":"not-a-date"}}}`,
+		`{"properties":{"f":{"type":"date","format":"yyyy/MM/dd","null_value":"2025-01-15"}}}`,
+		`{"properties":{"f":{"type":"date_nanos","null_value":"bad-nanos"}}}`,
+	}
+	for _, raw := range invalidNullValueMappings {
+		var spec esast.MappingSpec
+		if err := json.Unmarshal([]byte(raw), &spec); err != nil {
+			t.Fatalf("F14 unmarshal invalid %s failed: %v", raw, err)
+		}
+		if err := ValidateMappingSpec(&spec); err == nil || !strings.Contains(err.Error(), "mapper_parsing_exception") {
+			t.Fatalf("F14 expected mapper_parsing_exception for %s, got %v", raw, err)
+		}
+	}
+
+	// --- F15.1-2 & F16.1: ValidateSemver, version shredding validation, and ip canonicalization ---
+	for _, okVer := range []string{"0.0.0", "1.2.3", "1.2.3-alpha.1", "1.2.3-0a", "1.2.3+20130313", "1.2.3-rc.10+exp.sha.5114f85"} {
+		if !ValidateSemver(okVer) {
+			t.Fatalf("F15 expected ValidateSemver(%q)=true", okVer)
+		}
+	}
+	for _, badVer := range []string{"", "1.2", "1.2.3.4", "v1.2.3", "01.2.3", "1.02.3", "1.2.03", "1.2.3-01", "1.2.3-", "1.2.3+", "1.2.3-rc..1"} {
+		if ValidateSemver(badVer) {
+			t.Fatalf("F15 expected ValidateSemver(%q)=false", badVer)
+		}
+	}
+
+	var verIPSpec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"ver_scalar": {"type": "version"},
+			"ver":        {"type": "version"},
+			"ver_lenient":{"type": "version", "ignore_malformed": true},
+			"src_str":    {"type": "keyword", "copy_to": "ver"},
+			"items": {
+				"type": "nested",
+				"properties": {
+					"nver": {"type": "version"}
+				}
+			},
+			"client_ip":  {"type": "ip"}
+		}
+	}`), &verIPSpec); err != nil {
+		t.Fatalf("F15/F16 mapping unmarshal failed: %v", err)
+	}
+	verIPSchema := CompileIndexSchema("db", "r56_ver_ip", &verIPSpec)
+
+	// Invalid SemVer rejected across scalar, array, copy_to, and nested
+	for _, badDoc := range []string{
+		`{"ver_scalar":"01.2.3"}`,
+		`{"ver_scalar":123}`,
+		`{"ver":["1.0.0","1.0.0-01"]}`,
+		`{"src_str":"not_semver"}`,
+		`{"items":[{"nver":"bad_nested_ver"}]}`,
+	} {
+		if _, err := ShredDocument(verIPSchema, "bad", 1, false, []byte(badDoc)); err == nil {
+			t.Fatalf("F15 expected invalid version error for %s", badDoc)
+		}
+	}
+
+	// ignore_malformed: true skips malformed SemVer while keeping valid SemVer, and ip canonicalizes IPv6
+	okVerIPBytes, err := ShredDocument(verIPSchema, "ok1", 1, false, []byte(`{
+		"ver_scalar": "1.2.3-rc.2+build.7",
+		"src_str": "3.0.0+copy",
+		"ver_lenient": "01.2.3",
+		"items": [{"nver": "2.0.0-alpha.1"}],
+		"client_ip": "2001:0db8:0000:0000:0000:0000:0000:0001"
+	}`))
+	if err != nil {
+		t.Fatalf("F15/F16 ShredDocument failed: %v", err)
+	}
+	var verIPRow map[string]any
+	if err := json.Unmarshal(okVerIPBytes, &verIPRow); err != nil {
+		t.Fatalf("F15/F16 unmarshal row failed: %v", err)
+	}
+	if verIPRow["f__ver_scalar"] != "1.2.3-rc.2+build.7" {
+		t.Fatalf("F15 expected f__ver_scalar='1.2.3-rc.2+build.7', got %v", verIPRow["f__ver_scalar"])
+	}
+	verArr, okArr := verIPRow["f__ver"].([]any)
+	if !okArr || len(verArr) != 1 || verArr[0] != "3.0.0+copy" {
+		t.Fatalf("F15 expected f__ver=['3.0.0+copy'], got %v", verIPRow["f__ver"])
+	}
+	if _, exists := verIPRow["f__ver_lenient"]; exists && verIPRow["f__ver_lenient"] != nil {
+		t.Fatalf("F15 expected malformed ver_lenient to be omitted/null, got %v", verIPRow["f__ver_lenient"])
+	}
+	if verIPRow["f__client_ip"] != "2001:db8::1" {
+		t.Fatalf("F16 expected canonicalized IPv6 '2001:db8::1', got %v", verIPRow["f__client_ip"])
+	}
+}

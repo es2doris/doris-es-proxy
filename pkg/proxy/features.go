@@ -1515,13 +1515,38 @@ func validateIngestPipelineProcessors(procs []any) error {
 					return fmt.Errorf("illegal_argument_exception: invalid pattern [%s]: %v", pat, err)
 				}
 			case "json":
+				for k := range specMap {
+					switch k {
+					case "field", "target_field", "add_to_root", "add_to_root_conflict_strategy",
+						"allow_duplicate_keys", "strict_json_parsing", "ignore_missing",
+						"if", "tag", "description", "ignore_failure", "on_failure":
+					default:
+						return fmt.Errorf("[json] property [%s] isn't a configuration property", k)
+					}
+				}
 				if _, err := reqStr("field"); err != nil {
 					return err
+				}
+				for _, bKey := range []string{"add_to_root", "allow_duplicate_keys", "strict_json_parsing", "ignore_missing"} {
+					if rawB, hasB := specMap[bKey]; hasB && rawB != nil {
+						if _, ok := rawB.(bool); !ok {
+							return fmt.Errorf("illegal_argument_exception: [%s] must be a boolean", bKey)
+						}
+					}
 				}
 				addToRoot, _ := specMap["add_to_root"].(bool)
 				tf, _ := specMap["target_field"].(string)
 				if addToRoot && strings.TrimSpace(tf) != "" {
 					return fmt.Errorf("cannot specify both [target_field] and [add_to_root]")
+				}
+				if rawStrat, hasStrat := specMap["add_to_root_conflict_strategy"]; hasStrat && rawStrat != nil {
+					if !addToRoot {
+						return fmt.Errorf("illegal_argument_exception: cannot specify [add_to_root_conflict_strategy] when [add_to_root] is false")
+					}
+					stratStr, ok := rawStrat.(string)
+					if !ok || (stratStr != "replace" && stratStr != "merge") {
+						return fmt.Errorf("illegal_argument_exception: [add_to_root_conflict_strategy] must be [replace] or [merge], got [%v]", rawStrat)
+					}
 				}
 			case "kv":
 				if _, err := reqStr("field"); err != nil {
@@ -1762,6 +1787,68 @@ func validateIngestPipelineProcessors(procs []any) error {
 				}
 			case "terminate":
 				// Optional if/tag/description/ignore_failure/on_failure
+			case "reroute":
+				for k := range specMap {
+					switch k {
+					case "destination", "dataset", "namespace", "ignore_missing", "remove_fields",
+						"if", "tag", "description", "ignore_failure", "on_failure":
+					default:
+						return fmt.Errorf("[reroute] property [%s] isn't a configuration property", k)
+					}
+				}
+				rawDest, hasDest := specMap["destination"]
+				rawDS, hasDS := specMap["dataset"]
+				rawNS, hasNS := specMap["namespace"]
+				if hasDest && rawDest != nil {
+					destStr, ok := rawDest.(string)
+					if !ok || strings.TrimSpace(destStr) == "" {
+						return fmt.Errorf("illegal_argument_exception: [destination] must be a non-empty string")
+					}
+					if (hasDS && rawDS != nil) || (hasNS && rawNS != nil) {
+						return fmt.Errorf("illegal_argument_exception: cannot specify both [destination] and [dataset]/[namespace]")
+					}
+				}
+				validateReroutePartSpec := func(propName string, raw any) error {
+					switch v := raw.(type) {
+					case string:
+						if !strings.Contains(v, "{{") && strings.Contains(v, "-") {
+							return fmt.Errorf("illegal_argument_exception: [%s] cannot contain '-'", propName)
+						}
+					case []any:
+						if len(v) == 0 {
+							return fmt.Errorf("illegal_argument_exception: [%s] cannot be an empty list", propName)
+						}
+						for _, item := range v {
+							sItem, ok := item.(string)
+							if !ok || strings.TrimSpace(sItem) == "" {
+								return fmt.Errorf("illegal_argument_exception: [%s] entries must be non-empty strings", propName)
+							}
+							if !strings.Contains(sItem, "{{") && strings.Contains(sItem, "-") {
+								return fmt.Errorf("illegal_argument_exception: [%s] cannot contain '-'", propName)
+							}
+						}
+					default:
+						return fmt.Errorf("illegal_argument_exception: [%s] must be a string or list of strings", propName)
+					}
+					return nil
+				}
+				if hasDS && rawDS != nil {
+					if err := validateReroutePartSpec("dataset", rawDS); err != nil {
+						return err
+					}
+				}
+				if hasNS && rawNS != nil {
+					if err := validateReroutePartSpec("namespace", rawNS); err != nil {
+						return err
+					}
+				}
+				for _, bKey := range []string{"ignore_missing", "remove_fields"} {
+					if rawB, hasB := specMap[bKey]; hasB && rawB != nil {
+						if _, ok := rawB.(bool); !ok {
+							return fmt.Errorf("illegal_argument_exception: [%s] must be a boolean", bKey)
+						}
+					}
+				}
 			case "community_id":
 				if rawSeed, hasSeed := specMap["seed"]; hasSeed && rawSeed != nil {
 					var seedInt int64
@@ -1890,7 +1977,7 @@ func (s *Server) applyIngestPipelineForWriteWithRoutingAndIngestMeta(pipelineID,
 	if !ok || pipe == nil {
 		return raw, indexName, docID, initialRouting, false, initialIngestMeta, fmt.Errorf("pipeline with id [%s] does not exist", pipelineID)
 	}
-	out, outIdx, outID, _, outRouting, dropped, _, outIngestMeta, err := applyIngestPipelineSpecWithRoutingAndIngestMeta(s, pipe, indexName, docID, initialRouting, raw, false, initialIngestMeta)
+	out, outIdx, outID, _, outRouting, dropped, _, outIngestMeta, err := applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s, pipe, pipelineID, indexName, docID, initialRouting, raw, false, initialIngestMeta)
 	return out, outIdx, outID, outRouting, dropped, outIngestMeta, err
 }
 
@@ -2316,7 +2403,10 @@ func evalIngestIfCondition(cond string, doc map[string]any) bool {
 	cleanDoc := make(map[string]any, len(doc))
 	for k, v := range doc {
 		switch k {
-		case "__internal_ingest_orig", "_version", "_ingest":
+		case "__internal_ingest_orig", "__internal_ingest_terminated", "__internal_ingest_rerouted", "_version":
+			continue
+		case "_ingest":
+			cleanDoc["_ingest"] = deepCloneIngestValue(v)
 			continue
 		case "_index":
 			if !hadUserIndex {
@@ -3467,12 +3557,32 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			}
 			return false, false, procType, procTag, specMap, fmt.Errorf("pipeline [%s] is missing", subName)
 		}
-		var prevMsg, prevType, prevTag any
-		var hadPrevMsg, hadPrevType, hadPrevTag bool
+		var prevMsg, prevType, prevTag, prevPipe any
+		var hadPrevMsg, hadPrevType, hadPrevTag, hadPrevPipe bool
 		if preIngest, ok := doc["_ingest"].(map[string]any); ok && preIngest != nil {
 			prevMsg, hadPrevMsg = preIngest["on_failure_message"]
 			prevType, hadPrevType = preIngest["on_failure_processor_type"]
 			prevTag, hadPrevTag = preIngest["on_failure_processor_tag"]
+			prevPipe, hadPrevPipe = preIngest["on_failure_pipeline"]
+		}
+		origMeta, _ := doc["__internal_ingest_orig"].(map[string]any)
+		var savedActivePipe any
+		var hadSavedActivePipe bool
+		if origMeta != nil {
+			savedActivePipe, hadSavedActivePipe = origMeta["_active_pipeline"]
+			origMeta["_active_pipeline"] = subName
+		} else {
+			origMeta = map[string]any{"_active_pipeline": subName}
+			doc["__internal_ingest_orig"] = origMeta
+		}
+		restoreActivePipe := func() {
+			if om, ok := doc["__internal_ingest_orig"].(map[string]any); ok && om != nil {
+				if hadSavedActivePipe {
+					om["_active_pipeline"] = savedActivePipe
+				} else {
+					delete(om, "_active_pipeline")
+				}
+			}
 		}
 		subProcs, _ := subPipe["processors"].([]any)
 		subMut, subDropped, subErr := runIngestProcessorList(s, doc, subProcs, depth+1, trace)
@@ -3483,6 +3593,9 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					ingestMeta = make(map[string]any)
 				}
 				ingestMeta["on_failure_message"] = subErr.Error()
+				if _, hasFP := ingestMeta["on_failure_pipeline"]; !hasFP && subName != "" {
+					ingestMeta["on_failure_pipeline"] = subName
+				}
 				doc["_ingest"] = ingestMeta
 				subMut = true
 				fMut, fDrop, fErr := runIngestProcessorList(s, doc, pipeOnFail, depth+1, trace)
@@ -3490,6 +3603,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					subMut = true
 				}
 				if fDrop {
+					restoreActivePipe()
 					return subMut, true, procType, procTag, specMap, nil
 				}
 				if fErr == nil {
@@ -3509,11 +3623,17 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						} else {
 							delete(curIngest, "on_failure_processor_tag")
 						}
+						if hadPrevPipe {
+							curIngest["on_failure_pipeline"] = prevPipe
+						} else {
+							delete(curIngest, "on_failure_pipeline")
+						}
 					}
 				}
 				subErr = fErr
 			}
 		}
+		restoreActivePipe()
 		return subMut, subDropped, procType, procTag, specMap, subErr
 	case "dissect":
 		field, _ := specMap["field"].(string)
@@ -4103,6 +4223,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			target = expandIngestFieldName(rawTF, doc)
 		}
 		conflictStrategy, _ := specMap["add_to_root_conflict_strategy"].(string)
+		allowDup, _ := specMap["allow_duplicate_keys"].(bool)
 		strictParsing := true
 		if sp, ok := specMap["strict_json_parsing"].(bool); ok {
 			strictParsing = sp
@@ -4111,6 +4232,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
 				switch v := val.(type) {
 				case string:
+					if !allowDup {
+						if err := validateJSONNoDuplicateKeys(v, strictParsing); err != nil {
+							return false, false, procType, procTag, specMap, err
+						}
+					}
 					dec := json.NewDecoder(strings.NewReader(v))
 					dec.UseNumber()
 					var parsed any
@@ -4131,7 +4257,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						cleanM := make(map[string]any, len(m))
 						for k, mv := range m {
 							switch k {
-							case "_ingest", "__internal_ingest_orig", "_index", "_id", "_routing", "_version":
+							case "_ingest", "__internal_ingest_orig", "__internal_ingest_terminated", "__internal_ingest_rerouted", "_index", "_id", "_routing", "_version":
 								continue
 							}
 							cleanM[k] = mv
@@ -4157,6 +4283,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						sElem, ok := elem.(string)
 						if !ok {
 							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
+						}
+						if !allowDup {
+							if err := validateJSONNoDuplicateKeys(sElem, strictParsing); err != nil {
+								return false, false, procType, procTag, specMap, err
+							}
 						}
 						dec := json.NewDecoder(strings.NewReader(sElem))
 						dec.UseNumber()
@@ -6169,51 +6300,67 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 	case "terminate":
 		doc["__internal_ingest_terminated"] = true
 	case "reroute":
+		prevIdx, _ := doc["_index"].(string)
+		removeFieldsExplicit, hasRemoveFields := specMap["remove_fields"].(bool)
 		dest, _ := specMap["destination"].(string)
 		if dest != "" {
 			dest = strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(dest, doc)))
 		} else {
 			dsType := "logs"
 			if v, ok := getIngestPath(doc, "data_stream.type"); ok && v != nil {
-				if s := strings.TrimSpace(fmt.Sprintf("%v", v)); s != "" {
-					dsType = s
+				if sVal := strings.TrimSpace(fmt.Sprintf("%v", v)); sVal != "" {
+					dsType = strings.ReplaceAll(sVal, "-", "_")
 				}
 			}
 			resolveReroutePart := func(rawSpec any, docPath string, defaultVal string) string {
 				switch rv := rawSpec.(type) {
 				case string:
 					if rv != "" {
-						if exp := strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(rv, doc))); exp != "" {
-							return exp
+						if strings.Contains(rv, "{{") {
+							if exp := strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(rv, doc))); exp != "" {
+								return strings.ReplaceAll(exp, "-", "_")
+							}
+						} else {
+							return strings.ReplaceAll(strings.TrimSpace(rv), "-", "_")
 						}
 					}
 				case []any:
 					for _, item := range rv {
-						s := strings.TrimSpace(fmt.Sprintf("%v", item))
-						if s == "" {
+						sItem, okS := item.(string)
+						if !okS {
+							sItem = fmt.Sprintf("%v", item)
+						}
+						sItem = strings.TrimSpace(sItem)
+						if sItem == "" {
 							continue
 						}
-						if strings.Contains(s, "{{") {
-							if exp := strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(s, doc))); exp != "" {
-								return exp
+						if strings.Contains(sItem, "{{") {
+							if exp := strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(sItem, doc))); exp != "" {
+								return strings.ReplaceAll(exp, "-", "_")
 							}
 							continue
 						}
-						if v, ok := getIngestPath(doc, s); ok && v != nil {
-							if vs := strings.TrimSpace(fmt.Sprintf("%v", v)); vs != "" {
-								return vs
+						if v, ok := getIngestPath(doc, sItem); ok {
+							if v != nil {
+								if vs := strings.TrimSpace(fmt.Sprintf("%v", v)); vs != "" {
+									if hasRemoveFields && removeFieldsExplicit {
+										deleteIngestPath(doc, sItem)
+									}
+									return strings.ReplaceAll(vs, "-", "_")
+								}
 							}
-						} else {
-							return s
+							continue
 						}
 					}
 				}
 				out := defaultVal
 				if v, ok := getIngestPath(doc, docPath); ok && v != nil {
-					if s := strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(fmt.Sprintf("%v", v), doc))); s != "" {
-						out = s
+					if sVal := strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(fmt.Sprintf("%v", v), doc))); sVal != "" {
+						out = strings.ReplaceAll(sVal, "-", "_")
 					}
-					deleteIngestPath(doc, docPath)
+					if !hasRemoveFields || removeFieldsExplicit {
+						deleteIngestPath(doc, docPath)
+					}
 				}
 				return out
 			}
@@ -6229,6 +6376,9 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		if dest != "" {
 			doc["_index"] = dest
 			mutated = true
+			if dest != prevIdx {
+				doc["__internal_ingest_rerouted"] = true
+			}
 		}
 	default:
 		return false, false, procType, procTag, specMap, fmt.Errorf("no processor type exists with name [%s]", procType)
@@ -6424,6 +6574,65 @@ func shredErrorType(err error) string {
 	return "mapper_parsing_exception"
 }
 
+func validateJSONNoDuplicateKeys(input string, strict bool) error {
+	dec := json.NewDecoder(strings.NewReader(input))
+	dec.UseNumber()
+	var checkValue func() error
+	checkValue = func() error {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if delim, ok := tok.(json.Delim); ok {
+			switch delim {
+			case '{':
+				seen := make(map[string]bool)
+				for dec.More() {
+					kt, kErr := dec.Token()
+					if kErr != nil {
+						return kErr
+					}
+					keyStr, isStr := kt.(string)
+					if !isStr {
+						return fmt.Errorf("expected string key in json object")
+					}
+					if seen[keyStr] {
+						return fmt.Errorf("duplicate field '%s'", keyStr)
+					}
+					seen[keyStr] = true
+					if vErr := checkValue(); vErr != nil {
+						return vErr
+					}
+				}
+				endTok, endErr := dec.Token()
+				if endErr != nil || endTok != json.Delim('}') {
+					return fmt.Errorf("malformed json object")
+				}
+			case '[':
+				for dec.More() {
+					if vErr := checkValue(); vErr != nil {
+						return vErr
+					}
+				}
+				endTok, endErr := dec.Token()
+				if endErr != nil || endTok != json.Delim(']') {
+					return fmt.Errorf("malformed json array")
+				}
+			}
+		}
+		return nil
+	}
+	if err := checkValue(); err != nil {
+		return err
+	}
+	if strict {
+		if _, err := dec.Token(); err != io.EOF {
+			return fmt.Errorf("unexpected trailing token in json")
+		}
+	}
+	return nil
+}
+
 func snapshotIngestDoc(doc map[string]any) map[string]any {
 	raw, err := json.Marshal(doc)
 	if err != nil {
@@ -6465,6 +6674,7 @@ func snapshotIngestDoc(doc map[string]any) map[string]any {
 	}
 	delete(cp, "__internal_ingest_orig")
 	delete(cp, "__internal_ingest_terminated")
+	delete(cp, "__internal_ingest_rerouted")
 	delete(cp, "_ingest")
 	if cp == nil {
 		cp = map[string]any{}
@@ -6479,12 +6689,13 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 		if !ok {
 			continue
 		}
-		var prevMsg, prevType, prevTag any
-		var hadPrevMsg, hadPrevType, hadPrevTag bool
+		var prevMsg, prevType, prevTag, prevPipe any
+		var hadPrevMsg, hadPrevType, hadPrevTag, hadPrevPipe bool
 		if preIngest, ok := doc["_ingest"].(map[string]any); ok && preIngest != nil {
 			prevMsg, hadPrevMsg = preIngest["on_failure_message"]
 			prevType, hadPrevType = preIngest["on_failure_processor_type"]
 			prevTag, hadPrevTag = preIngest["on_failure_processor_tag"]
+			prevPipe, hadPrevPipe = preIngest["on_failure_pipeline"]
 		}
 		traceLenBefore := 0
 		if trace != nil {
@@ -6558,7 +6769,17 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 			delete(doc, "__internal_ingest_terminated")
 			return mutated, false, nil
 		}
+		if rerouted, _ := doc["__internal_ingest_rerouted"].(bool); rerouted {
+			if depth == 0 {
+				delete(doc, "__internal_ingest_rerouted")
+			}
+			return mutated, false, nil
+		}
 		if procErr != nil {
+			activePipeName := ""
+			if om, ok := doc["__internal_ingest_orig"].(map[string]any); ok && om != nil {
+				activePipeName, _ = om["_active_pipeline"].(string)
+			}
 			ignoreFail, _ := specMap["ignore_failure"].(bool)
 			if !ignoreFail {
 				ignoreFail, _ = pMap["ignore_failure"].(bool)
@@ -6584,6 +6805,11 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 					} else {
 						delete(curIngest, "on_failure_processor_tag")
 					}
+					if hadPrevPipe {
+						curIngest["on_failure_pipeline"] = prevPipe
+					} else {
+						delete(curIngest, "on_failure_pipeline")
+					}
 				}
 				continue
 			}
@@ -6603,6 +6829,9 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 				if (procType != "pipeline" && procType != "foreach") || !innerUpdated {
 					ingestMeta["on_failure_processor_type"] = procType
 					ingestMeta["on_failure_processor_tag"] = procTag
+					if activePipeName != "" {
+						ingestMeta["on_failure_pipeline"] = activePipeName
+					}
 				}
 				doc["_ingest"] = ingestMeta
 				mutated = true
@@ -6638,6 +6867,11 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 					} else {
 						delete(curIngest, "on_failure_processor_tag")
 					}
+					if hadPrevPipe {
+						curIngest["on_failure_pipeline"] = prevPipe
+					} else {
+						delete(curIngest, "on_failure_pipeline")
+					}
 				}
 				continue
 			}
@@ -6660,6 +6894,9 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 					ingestMeta["on_failure_processor_type"] = procType
 				}
 				ingestMeta["on_failure_processor_tag"] = procTag
+				if activePipeName != "" {
+					ingestMeta["on_failure_pipeline"] = activePipeName
+				}
 			}
 			doc["_ingest"] = ingestMeta
 			return mutated, false, procErr
@@ -6668,7 +6905,7 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 	return mutated, false, nil
 }
 
-func applyIngestPipelineSpecWithRoutingAndIngestMeta(s *Server, pipe map[string]any, indexName, docID, initialRouting string, raw json.RawMessage, verbose bool, initialIngestMeta map[string]any) (json.RawMessage, string, string, string, string, bool, []map[string]any, map[string]any, error) {
+func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[string]any, pipelineName, indexName, docID, initialRouting string, raw json.RawMessage, verbose bool, initialIngestMeta map[string]any) (json.RawMessage, string, string, string, string, bool, []map[string]any, map[string]any, error) {
 	if pipe == nil || len(bytes.TrimSpace(raw)) == 0 {
 		return raw, indexName, docID, "", initialRouting, false, nil, initialIngestMeta, nil
 	}
@@ -6726,6 +6963,7 @@ func applyIngestPipelineSpecWithRoutingAndIngestMeta(s *Server, pipe map[string]
 		"_orig_routing_val": origRoutingVal,
 		"_had_orig_version": hadOrigVersion,
 		"_orig_version_val": origVersionVal,
+		"_active_pipeline":  pipelineName,
 	}
 
 	var trace []map[string]any
@@ -6735,6 +6973,7 @@ func applyIngestPipelineSpecWithRoutingAndIngestMeta(s *Server, pipe map[string]
 		tracePtr = &trace
 	}
 	mutated, dropped, procErr := runIngestProcessorList(s, doc, procs, 0, tracePtr)
+	delete(doc, "__internal_ingest_rerouted")
 	if dropped {
 		return json.RawMessage(`{}`), indexName, docID, "", initialRouting, true, trace, nil, nil
 	}
@@ -6745,6 +6984,9 @@ func applyIngestPipelineSpecWithRoutingAndIngestMeta(s *Server, pipe map[string]
 				ingestMeta = make(map[string]any)
 			}
 			ingestMeta["on_failure_message"] = procErr.Error()
+			if _, hasFP := ingestMeta["on_failure_pipeline"]; !hasFP && pipelineName != "" {
+				ingestMeta["on_failure_pipeline"] = pipelineName
+			}
 			doc["_ingest"] = ingestMeta
 			doc["__internal_ingest_orig"] = map[string]any{
 				"_had_orig_index":   hadOrigIndex,
@@ -6755,9 +6997,11 @@ func applyIngestPipelineSpecWithRoutingAndIngestMeta(s *Server, pipe map[string]
 				"_orig_routing_val": origRoutingVal,
 				"_had_orig_version": hadOrigVersion,
 				"_orig_version_val": origVersionVal,
+				"_active_pipeline":  pipelineName,
 			}
 			mutated = true
 			subMut, subDropped, subErr := runIngestProcessorList(s, doc, pipeOnFail, 1, tracePtr)
+			delete(doc, "__internal_ingest_rerouted")
 			if subMut {
 				mutated = true
 			}
@@ -6769,6 +7013,7 @@ func applyIngestPipelineSpecWithRoutingAndIngestMeta(s *Server, pipe map[string]
 					delete(curIngest, "on_failure_message")
 					delete(curIngest, "on_failure_processor_type")
 					delete(curIngest, "on_failure_processor_tag")
+					delete(curIngest, "on_failure_pipeline")
 				}
 			}
 			procErr = subErr
@@ -6949,7 +7194,11 @@ func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Req
 		if err != nil {
 			rawSrc = []byte(`{}`)
 		}
-		outBytes, outIdx, outID, outIngestTS, outRouting, dropped, trace, outIngestMeta, procErr := applyIngestPipelineSpecWithRoutingAndIngestMeta(s, pipe, idx, id, inRouting, rawSrc, verbose, nil)
+		simPipeName := strings.TrimSpace(r.PathValue("id"))
+		if simPipeName == "" {
+			simPipeName = "_simulate"
+		}
+		outBytes, outIdx, outID, outIngestTS, outRouting, dropped, trace, outIngestMeta, procErr := applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s, pipe, simPipeName, idx, id, inRouting, rawSrc, verbose, nil)
 		if outIngestTS != "" {
 			docIngestTS = outIngestTS
 		}
@@ -7477,7 +7726,7 @@ func deleteIngestPath(doc map[string]any, path string) {
 	}
 }
 
-// handleCatNodes implements `GET /_cat/nodes` for Elasticvue & Cerebro.
+// handleCatNodes implements `GET /_cat/nodes` and `GET /_cat/nodes/{node_id}` for Elasticvue & Cerebro.
 func (s *Server) handleCatNodes(w http.ResponseWriter, r *http.Request) {
 	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
@@ -7494,7 +7743,93 @@ func (s *Server) handleCatNodes(w http.ResponseWriter, r *http.Request) {
 			"name":         "doris-fe-1",
 		},
 	}
+	nodePat := strings.TrimSpace(r.PathValue("node_id"))
+	if nodePat == "" {
+		nodePat = strings.TrimSpace(r.PathValue("name"))
+	}
+	if nodePat != "" && nodePat != "*" && nodePat != "_all" {
+		if !matchMultiWildcardWithExclusions(nodePat, "doris-fe-1") &&
+			!matchMultiWildcardWithExclusions(nodePat, "doris-node-1") &&
+			!matchMultiWildcardWithExclusions(nodePat, "local-node-1") &&
+			!matchMultiWildcardWithExclusions(nodePat, "127.0.0.1") &&
+			nodePat != "_local" && nodePat != "_master" {
+			rows = []map[string]any{}
+		}
+	}
 	writeCatResponse(w, r, []string{"ip", "heap.percent", "ram.percent", "cpu", "node.role", "master", "name"}, rows)
+}
+
+// handleResolveCluster implements `GET /_resolve/cluster` and `GET /_resolve/cluster/{name}` (Round 56 F9).
+func (s *Server) handleResolveCluster(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	pat := strings.TrimSpace(r.PathValue("name"))
+	if pat == "" {
+		pat = "*"
+	}
+	s.mu.RLock()
+	clusters := map[string]bool{"local": false}
+	for alias, cfg := range s.remoteClusters {
+		skip, _ := cfg["skip_unavailable"].(bool)
+		clusters[alias] = skip
+	}
+	extractRemotesFromSettings := func(settings map[string]any) {
+		for k, v := range settings {
+			if strings.HasPrefix(k, "cluster.remote.") {
+				rest := strings.TrimPrefix(k, "cluster.remote.")
+				if dot := strings.IndexByte(rest, '.'); dot > 0 {
+					alias := rest[:dot]
+					prop := rest[dot+1:]
+					if _, exists := clusters[alias]; !exists {
+						clusters[alias] = false
+					}
+					if prop == "skip_unavailable" {
+						if bv, ok := v.(bool); ok {
+							clusters[alias] = bv
+						} else if sv, ok := v.(string); ok {
+							clusters[alias] = strings.EqualFold(sv, "true")
+						}
+					}
+				}
+			}
+		}
+		if clMap, ok := settings["cluster"].(map[string]any); ok {
+			if remMap, ok := clMap["remote"].(map[string]any); ok {
+				for alias, rawCfg := range remMap {
+					if _, exists := clusters[alias]; !exists {
+						clusters[alias] = false
+					}
+					if cfgMap, ok := rawCfg.(map[string]any); ok {
+						if bv, ok := cfgMap["skip_unavailable"].(bool); ok {
+							clusters[alias] = bv
+						}
+					}
+				}
+			}
+		}
+	}
+	extractRemotesFromSettings(s.clusterPersistentSettings)
+	extractRemotesFromSettings(s.clusterTransientSettings)
+	s.mu.RUnlock()
+
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	out := make(map[string]any)
+	for alias, skipUnavail := range clusters {
+		if pat == "*" || pat == "_all" || matchMultiWildcardWithExclusions(pat, alias) {
+			out[alias] = map[string]any{
+				"connected":        true,
+				"skip_unavailable": skipUnavail,
+				"matching":         true,
+				"version":          map[string]any{"number": "8.15.0"},
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // handleCatShards implements `GET /_cat/shards` for Elasticvue & Cerebro.

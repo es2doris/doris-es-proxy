@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"math"
+	"net"
 	"regexp"
 	"sort"
 	"strconv"
@@ -572,9 +573,260 @@ func parseIntOption(raw any, optName, fieldPath string) (int, error) {
 	}
 }
 
+// ValidateSemver reports whether s is a valid SemVer 2.0.0 version string
+// (MAJOR.MINOR.PATCH[-prerelease][+build], with no leading zeros on multi-digit
+// numeric core parts or purely-numeric pre-release identifiers).
+func ValidateSemver(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	isIdentChar := func(c byte) bool {
+		return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '-'
+	}
+	isAllDigits := func(part string) bool {
+		if len(part) == 0 {
+			return false
+		}
+		for i := 0; i < len(part); i++ {
+			if part[i] < '0' || part[i] > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	if plusIdx := strings.IndexByte(s, '+'); plusIdx >= 0 {
+		build := s[plusIdx+1:]
+		s = s[:plusIdx]
+		if len(build) == 0 {
+			return false
+		}
+		for _, ident := range strings.Split(build, ".") {
+			if len(ident) == 0 {
+				return false
+			}
+			for i := 0; i < len(ident); i++ {
+				if !isIdentChar(ident[i]) {
+					return false
+				}
+			}
+		}
+	}
+	if dashIdx := strings.IndexByte(s, '-'); dashIdx >= 0 {
+		pre := s[dashIdx+1:]
+		s = s[:dashIdx]
+		if len(pre) == 0 {
+			return false
+		}
+		for _, ident := range strings.Split(pre, ".") {
+			if len(ident) == 0 {
+				return false
+			}
+			for i := 0; i < len(ident); i++ {
+				if !isIdentChar(ident[i]) {
+					return false
+				}
+			}
+			if isAllDigits(ident) && len(ident) > 1 && ident[0] == '0' {
+				return false
+			}
+		}
+	}
+	parts := strings.Split(s, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	for _, part := range parts {
+		if !isAllDigits(part) {
+			return false
+		}
+		if len(part) > 1 && part[0] == '0' {
+			return false
+		}
+		if n, err := strconv.ParseInt(part, 10, 64); err != nil || n < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func isValidCartesianPointValue(val any) bool {
+	checkFinite := func(x, y float64) bool {
+		return !math.IsNaN(x) && !math.IsInf(x, 0) && !math.IsNaN(y) && !math.IsInf(y, 0)
+	}
+	switch tv := val.(type) {
+	case map[string]any:
+		if coords, hasCoords := tv["coordinates"]; hasCoords {
+			if tStr, _ := tv["type"].(string); strings.EqualFold(strings.TrimSpace(tStr), "Point") {
+				if arr, okArr := coords.([]any); okArr && len(arr) == 2 {
+					x, okX := parseGeoFloatElem(arr[0])
+					y, okY := parseGeoFloatElem(arr[1])
+					return okX && okY && checkFinite(x, y)
+				}
+			}
+			return false
+		}
+		rawX, hasX := tv["x"]
+		rawY, hasY := tv["y"]
+		if !hasX || !hasY {
+			return false
+		}
+		for k := range tv {
+			if k != "x" && k != "y" {
+				return false
+			}
+		}
+		x, okX := parseGeoFloatElem(rawX)
+		y, okY := parseGeoFloatElem(rawY)
+		return okX && okY && checkFinite(x, y)
+	case []any:
+		if len(tv) != 2 {
+			return false
+		}
+		if !isGeoNumericElem(tv[0]) || !isGeoNumericElem(tv[1]) {
+			return false
+		}
+		x, okX := parseGeoFloatElem(tv[0])
+		y, okY := parseGeoFloatElem(tv[1])
+		return okX && okY && checkFinite(x, y)
+	case string:
+		str := strings.TrimSpace(tv)
+		if str == "" {
+			return false
+		}
+		if strings.HasPrefix(strings.ToUpper(str), "POINT") {
+			openIdx := strings.IndexByte(str, '(')
+			closeIdx := strings.LastIndexByte(str, ')')
+			if openIdx > 0 && closeIdx > openIdx && strings.TrimSpace(str[closeIdx+1:]) == "" {
+				fields := strings.Fields(str[openIdx+1 : closeIdx])
+				if len(fields) == 2 {
+					x, err1 := strconv.ParseFloat(fields[0], 64)
+					y, err2 := strconv.ParseFloat(fields[1], 64)
+					return err1 == nil && err2 == nil && checkFinite(x, y)
+				}
+			}
+			return false
+		}
+		if strings.Contains(str, ",") {
+			parts := strings.Split(str, ",")
+			if len(parts) != 2 {
+				return false
+			}
+			x, err1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+			y, err2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+			return err1 == nil && err2 == nil && checkFinite(x, y)
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func validateNullValueForField(fullPath, fType string, prop esast.FieldProperty) error {
+	switch fType {
+	case "", "text", "match_only_text", "annotated-text", "annotated_text", "search_as_you_type",
+		"nested", "object", "flattened", "percolator", "join", "dense_vector", "knn_vector", "sparse_vector",
+		"rank_feature", "rank_features", "rank_vector",
+		"alias", "binary", "wildcard", "completion", "token_count", "murmur3",
+		"histogram", "aggregate_metric_double", "geo_shape", "shape", "constant_keyword":
+		return fmt.Errorf("mapper_parsing_exception:Mapping definition for [%s] has unsupported parameters: [null_value] is not supported on [%s]", fullPath, fType)
+	}
+	if IsRangeFieldType(fType) {
+		return fmt.Errorf("mapper_parsing_exception:Mapping definition for [%s] has unsupported parameters: [null_value] is not supported on [%s]", fullPath, fType)
+	}
+	if fType == "geo_point" {
+		if _, _, _, ok := parseAndFormatGeoPointValue(prop.NullValue); !ok {
+			return fmt.Errorf("mapper_parsing_exception: failed to parse [null_value] on [geo_point] field [%s]", fullPath)
+		}
+		return nil
+	}
+	if fType == "point" {
+		if !isValidCartesianPointValue(prop.NullValue) {
+			return fmt.Errorf("mapper_parsing_exception: failed to parse [null_value] on [point] field [%s]", fullPath)
+		}
+		return nil
+	}
+	switch prop.NullValue.(type) {
+	case map[string]any, []any, []string:
+		return fmt.Errorf("mapper_parsing_exception: [null_value] on field [%s] must be a scalar value", fullPath)
+	}
+	switch fType {
+	case "keyword", "passthrough":
+		return nil
+	case "boolean":
+		if prop.Coerce != nil && !*prop.Coerce {
+			if _, ok := prop.NullValue.(bool); !ok {
+				return fmt.Errorf("mapper_parsing_exception: failed to parse [null_value] on [boolean] field [%s]", fullPath)
+			}
+			return nil
+		}
+		switch v := prop.NullValue.(type) {
+		case bool:
+			return nil
+		case string:
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "true", "false":
+				return nil
+			}
+		}
+		return fmt.Errorf("mapper_parsing_exception: failed to parse [null_value] on [boolean] field [%s]", fullPath)
+	case "ip":
+		s, ok := prop.NullValue.(string)
+		if !ok || net.ParseIP(strings.TrimSpace(s)) == nil {
+			return fmt.Errorf("mapper_parsing_exception: failed to parse [null_value] on [ip] field [%s]", fullPath)
+		}
+		return nil
+	case "version":
+		s, ok := prop.NullValue.(string)
+		if !ok || !ValidateSemver(s) {
+			return fmt.Errorf("mapper_parsing_exception: failed to parse [null_value] on [version] field [%s]", fullPath)
+		}
+		return nil
+	case "date", "date_nanos":
+		if _, isBool := prop.NullValue.(bool); isBool {
+			return fmt.Errorf("mapper_parsing_exception: failed to parse [null_value] on [%s] field [%s]", fType, fullPath)
+		}
+		if s, isStr := prop.NullValue.(string); isStr {
+			if strings.TrimSpace(s) == "" {
+				return fmt.Errorf("mapper_parsing_exception: failed to parse [null_value] on [%s] field [%s]", fType, fullPath)
+			}
+			if strings.TrimSpace(prop.Format) == "" {
+				if _, ok := ParseESDateToEpochMillis(s, time.Now().UTC()); !ok {
+					return fmt.Errorf("mapper_parsing_exception: failed to parse [null_value] on [%s] field [%s]", fType, fullPath)
+				}
+				return nil
+			}
+		}
+	case "long":
+		if s, isStr := prop.NullValue.(string); isStr {
+			trimmed := strings.TrimSpace(s)
+			if trimmed == "" || (!strings.ContainsAny(trimmed, ".eE") && func() bool {
+				_, err := strconv.ParseInt(trimmed, 10, 64)
+				return err != nil
+			}()) {
+				return fmt.Errorf("mapper_parsing_exception: failed to parse [null_value] on [long] field [%s]", fullPath)
+			}
+		}
+	}
+	tmpB := FieldBinding{
+		ESFieldPath:   fullPath,
+		ESType:        fType,
+		DorisType:     mapESTypeToDoris(fType),
+		Format:        prop.Format,
+		Coerce:        prop.Coerce,
+		ScalingFactor: prop.ScalingFactor,
+	}
+	if coerceScalarBindingForDoris(prop.NullValue, tmpB, time.Now().UTC()) == nil {
+		return fmt.Errorf("mapper_parsing_exception: failed to parse [null_value] on [%s] field [%s]", fType, fullPath)
+	}
+	return nil
+}
+
 func validateSingleFieldProperty(fullPath, fType string, prop esast.FieldProperty) error {
 	if fType != "" && !knownESFieldTypes[fType] {
 		return fmt.Errorf("mapper_parsing_exception: No handler for type [%s] declared on field [%s]", prop.Type, fullPath)
+	}
+	if prop.Subobjects != nil && fType != "" && fType != "object" {
+		return fmt.Errorf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters: [subobjects : %v]", fullPath, *prop.Subobjects)
 	}
 	if err := validateDynamicModeVal(prop.Dynamic, fullPath); err != nil {
 		return err
@@ -602,14 +854,8 @@ func validateSingleFieldProperty(fullPath, fType string, prop esast.FieldPropert
 		}
 	}
 	if prop.NullValue != nil {
-		switch fType {
-		case "text", "match_only_text", "annotated-text", "annotated_text", "search_as_you_type",
-			"nested", "object", "flattened", "percolator", "join", "dense_vector", "knn_vector", "sparse_vector", "rank_feature", "rank_features":
-			return fmt.Errorf("mapper_parsing_exception:Mapping definition for [%s] has unsupported parameters: [null_value] is not supported on [%s]", fullPath, fType)
-		}
-		switch prop.NullValue.(type) {
-		case map[string]any, []any:
-			return fmt.Errorf("mapper_parsing_exception: [null_value] on field [%s] must be a scalar value", fullPath)
+		if err := validateNullValueForField(fullPath, fType, prop); err != nil {
+			return err
 		}
 	}
 	if prop.IgnoreAbove < 0 {
@@ -932,16 +1178,25 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 	}
 	var copyToRefs []copyToRef
 
-	var collect func(props map[string]esast.FieldProperty, prefix string) error
-	collect = func(props map[string]esast.FieldProperty, prefix string) error {
+	var collect func(props map[string]esast.FieldProperty, prefix string, inSubobjectsFalse bool) error
+	collect = func(props map[string]esast.FieldProperty, prefix string, inSubobjectsFalse bool) error {
 		for k, prop := range props {
 			fullPath := k
 			if prefix != "" {
 				fullPath = prefix + "." + k
 			}
 			fType := strings.ToLower(strings.TrimSpace(prop.Type))
-			if fType == "" && len(prop.Properties) > 0 {
+			if fType == "" && (len(prop.Properties) > 0 || prop.Enabled != nil || prop.Dynamic != nil || prop.Subobjects != nil) {
 				fType = "object"
+			}
+			if inSubobjectsFalse {
+				isDisabledObj := (fType == "" || fType == "object") && prop.Enabled != nil && !*prop.Enabled
+				if len(prop.Properties) > 0 {
+					return fmt.Errorf("mapper_parsing_exception: Field [%s] cannot have sub-properties because parent has [subobjects: false]", fullPath)
+				}
+				if fType == "nested" || ((fType == "" || fType == "object") && !isDisabledObj) {
+					return fmt.Errorf("mapper_parsing_exception: Field [%s] of type [%s] is not allowed inside [subobjects: false]", fullPath, fType)
+				}
 			}
 			allTypes[fullPath] = fType
 			if err := validateSingleFieldProperty(fullPath, fType, prop); err != nil {
@@ -989,14 +1244,16 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 				}
 			}
 			if len(prop.Properties) > 0 {
-				if err := collect(prop.Properties, fullPath); err != nil {
+				childSubobjectsFalse := inSubobjectsFalse || (prop.Subobjects != nil && !*prop.Subobjects)
+				if err := collect(prop.Properties, fullPath, childSubobjectsFalse); err != nil {
 					return err
 				}
 			}
 		}
 		return nil
 	}
-	if err := collect(m.Properties, ""); err != nil {
+	rootSubobjectsFalse := m.Subobjects != nil && !*m.Subobjects
+	if err := collect(m.Properties, "", rootSubobjectsFalse); err != nil {
 		return err
 	}
 
@@ -1069,12 +1326,38 @@ func ValidateMappingUpdateCompatibility(oldSpec, newSpec *esast.MappingSpec) err
 	if oldSpec == nil || newSpec == nil {
 		return nil
 	}
+	if newSpec.Subobjects != nil {
+		oldEffectiveSub := true
+		if oldSpec.Subobjects != nil {
+			oldEffectiveSub = *oldSpec.Subobjects
+		}
+		if *newSpec.Subobjects != oldEffectiveSub {
+			return fmt.Errorf("illegal_argument_exception: Mapper for [_doc] conflicts with existing mapper: Cannot update parameter [subobjects] from [%v] to [%v]", oldEffectiveSub, *newSpec.Subobjects)
+		}
+	}
 	if err := validatePropertiesCompatibility(oldSpec.Properties, newSpec.Properties, ""); err != nil {
 		return err
 	}
-	return ValidateMappingSpec(&esast.MappingSpec{
-		Properties: DeepMergeMappingProperties(oldSpec.Properties, newSpec.Properties),
-	})
+	mergedDynamic := newSpec.Dynamic
+	if mergedDynamic == nil {
+		mergedDynamic = oldSpec.Dynamic
+	}
+	mergedSubobjects := newSpec.Subobjects
+	if mergedSubobjects == nil {
+		mergedSubobjects = oldSpec.Subobjects
+	}
+	mergedDynTemplates := newSpec.DynamicTemplates
+	if mergedDynTemplates == nil {
+		mergedDynTemplates = oldSpec.DynamicTemplates
+	}
+	merged := &esast.MappingSpec{
+		Dynamic:          mergedDynamic,
+		Subobjects:       mergedSubobjects,
+		Runtime:          DeepMergeMappingProperties(oldSpec.Runtime, newSpec.Runtime),
+		DynamicTemplates: mergedDynTemplates,
+		Properties:       DeepMergeMappingProperties(oldSpec.Properties, newSpec.Properties),
+	}
+	return ValidateMappingSpec(merged)
 }
 
 func validatePropertiesCompatibility(oldProps, newProps map[string]esast.FieldProperty, prefix string) error {
@@ -1088,11 +1371,11 @@ func validatePropertiesCompatibility(oldProps, newProps map[string]esast.FieldPr
 			continue
 		}
 		oldType := strings.ToLower(strings.TrimSpace(oldProp.Type))
-		if oldType == "" && (len(oldProp.Properties) > 0 || oldProp.Enabled != nil || oldProp.Dynamic != nil) {
+		if oldType == "" && (len(oldProp.Properties) > 0 || oldProp.Enabled != nil || oldProp.Dynamic != nil || oldProp.Subobjects != nil) {
 			oldType = "object"
 		}
 		newType := strings.ToLower(strings.TrimSpace(newProp.Type))
-		if newType == "" && (len(newProp.Properties) > 0 || newProp.Enabled != nil || newProp.Dynamic != nil) {
+		if newType == "" && (len(newProp.Properties) > 0 || newProp.Enabled != nil || newProp.Dynamic != nil || newProp.Subobjects != nil) {
 			if oldType == "nested" && newProp.Enabled == nil {
 				newType = "nested"
 			} else {
@@ -1101,6 +1384,15 @@ func validatePropertiesCompatibility(oldProps, newProps map[string]esast.FieldPr
 		}
 		if oldType != "" && newType != "" && oldType != newType {
 			return fmt.Errorf("mapper [%s] cannot be changed from type [%s] to [%s]", fullPath, oldType, newType)
+		}
+		if newProp.Subobjects != nil {
+			oldEffectiveSub := true
+			if oldProp.Subobjects != nil {
+				oldEffectiveSub = *oldProp.Subobjects
+			}
+			if *newProp.Subobjects != oldEffectiveSub {
+				return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: Cannot update parameter [subobjects] from [%v] to [%v]", fullPath, oldEffectiveSub, *newProp.Subobjects)
+			}
 		}
 		if newProp.Enabled != nil && (oldType == "object" || oldProp.Enabled != nil) {
 			oldEnabled := true
@@ -1275,6 +1567,9 @@ func DeepMergeMappingProperties(
 			}
 			if v.Dynamic != nil {
 				merged.Dynamic = v.Dynamic
+			}
+			if v.Subobjects != nil {
+				merged.Subobjects = v.Subobjects
 			}
 			if v.Script != nil {
 				merged.Script = v.Script
@@ -1861,6 +2156,7 @@ const (
 type inferOptions struct {
 	dateDetection      bool
 	numericDetection   bool
+	subobjects         bool
 	dynamicDateFormats []string
 	dynamicTemplates   []map[string]any
 	dynamicMode        string
@@ -1870,6 +2166,7 @@ func newInferOptions(existing *esast.MappingSpec) inferOptions {
 	opts := inferOptions{
 		dateDetection:    true,
 		numericDetection: false,
+		subobjects:       true,
 		dynamicMode:      "true",
 	}
 	if existing != nil {
@@ -1878,6 +2175,9 @@ func newInferOptions(existing *esast.MappingSpec) inferOptions {
 		}
 		if existing.NumericDetection != nil {
 			opts.numericDetection = *existing.NumericDetection
+		}
+		if existing.Subobjects != nil {
+			opts.subobjects = *existing.Subobjects
 		}
 		opts.dynamicDateFormats = existing.DynamicDateFormats
 		opts.dynamicTemplates = existing.DynamicTemplates
@@ -1999,6 +2299,9 @@ func inferObjectPropertiesWithOpts(obj map[string]any, dst map[string]esast.Fiel
 			childOpts := opts
 			if existing.Dynamic != nil {
 				childOpts.dynamicMode = normalizeDynamicMode(existing.Dynamic)
+			}
+			if existing.Subobjects != nil {
+				childOpts.subobjects = *existing.Subobjects
 			}
 			if existing.Properties == nil {
 				existing.Properties = make(map[string]esast.FieldProperty)
@@ -2328,6 +2631,9 @@ func inferValuePropertyWithOpts(val any, fieldName, fullPath string, depth int, 
 					(tmplProp.Type != "" && !strings.EqualFold(tmplProp.Type, "object") && !strings.EqualFold(tmplProp.Type, "nested")) {
 					return tmplProp, true
 				}
+				if !opts.subobjects {
+					return esast.FieldProperty{}, false
+				}
 				if depth+1 < maxInferredDepth {
 					childProps := make(map[string]esast.FieldProperty)
 					inferObjectPropertiesWithOpts(v, childProps, fullPath, depth+1, totalFields, opts)
@@ -2338,7 +2644,7 @@ func inferValuePropertyWithOpts(val any, fieldName, fullPath string, depth int, 
 				return tmplProp, true
 			}
 		}
-		if depth+1 >= maxInferredDepth {
+		if !opts.subobjects || depth+1 >= maxInferredDepth {
 			return esast.FieldProperty{}, false
 		}
 		childProps := make(map[string]esast.FieldProperty)

@@ -761,8 +761,46 @@ func (r *SearchRequest) UnmarshalJSON(data []byte) error {
 		}
 		r.IndicesBoost = ib
 	}
+	if err := validateScriptFieldsMap(r.ScriptFields, "search"); err != nil {
+		return err
+	}
 	if err := validateSearchRequestAggMap(r.EffectiveAggs()); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateScriptFieldsMap(sf map[string]any, ctx string) error {
+	for fieldName, entryRaw := range sf {
+		if strings.TrimSpace(fieldName) == "" {
+			return fmt.Errorf("parsing_exception: [%s] [script_fields] field name cannot be empty", ctx)
+		}
+		entryMap, ok := entryRaw.(map[string]any)
+		if !ok || entryMap == nil {
+			return fmt.Errorf("parsing_exception: [%s] [script_fields] [%s] must be an object", ctx, fieldName)
+		}
+		for k := range entryMap {
+			switch k {
+			case "script", "ignore_failure":
+			default:
+				return fmt.Errorf("parsing_exception: [%s] [script_fields] unknown field [%s] in [%s]", ctx, k, fieldName)
+			}
+		}
+		scriptVal, hasScript := entryMap["script"]
+		if !hasScript {
+			return fmt.Errorf("parsing_exception: [%s] [script_fields] [%s] requires [script]", ctx, fieldName)
+		}
+		if err := validateScriptValue(scriptVal); err != nil {
+			return err
+		}
+		if igVal, hasIG := entryMap["ignore_failure"]; hasIG {
+			if igVal == nil {
+				return fmt.Errorf("parsing_exception: [%s] [script_fields] [%s] [ignore_failure] cannot be null", ctx, fieldName)
+			}
+			if _, err := parseFlexibleBool(igVal); err != nil {
+				return fmt.Errorf("parsing_exception: [%s] [script_fields] [%s] [ignore_failure] %w", ctx, fieldName, err)
+			}
+		}
 	}
 	return nil
 }
@@ -1736,6 +1774,9 @@ func (ih *InnerHitsSpec) UnmarshalJSON(data []byte) error {
 	}
 	if p.Size != nil && *p.Size < 0 {
 		return fmt.Errorf("parsing_exception: [inner_hits] [size] must be >= 0")
+	}
+	if err := validateScriptFieldsMap(p.ScriptFields, "inner_hits"); err != nil {
+		return err
 	}
 	*ih = InnerHitsSpec(p)
 	return nil
@@ -4438,6 +4479,9 @@ func (im *IntervalsMatch) UnmarshalJSON(data []byte) error {
 	if strings.TrimSpace(p.Query) == "" {
 		return fmt.Errorf("parsing_exception: [intervals.match] requires non-empty [query]")
 	}
+	if p.MaxGaps != nil && *p.MaxGaps < -1 {
+		return fmt.Errorf("illegal_argument_exception: [intervals.match] [max_gaps] must be >= -1, got [%d]", *p.MaxGaps)
+	}
 	*im = IntervalsMatch(p)
 	return nil
 }
@@ -4546,6 +4590,9 @@ func (ifz *IntervalsFuzzy) UnmarshalJSON(data []byte) error {
 	if p.PrefixLength < 0 {
 		return fmt.Errorf("parsing_exception: [intervals.fuzzy] [prefix_length] must be >= 0")
 	}
+	if err := validateFuzzinessValue(p.Fuzziness, "intervals.fuzzy"); err != nil {
+		return err
+	}
 	*ifz = IntervalsFuzzy(p)
 	return nil
 }
@@ -4580,6 +4627,9 @@ func (ia *IntervalsAllOf) UnmarshalJSON(data []byte) error {
 	}
 	if len(p.Intervals) == 0 {
 		return fmt.Errorf("parsing_exception: [intervals.all_of] requires non-empty [intervals]")
+	}
+	if p.MaxGaps != nil && *p.MaxGaps < -1 {
+		return fmt.Errorf("illegal_argument_exception: [intervals.all_of] [max_gaps] must be >= -1, got [%d]", *p.MaxGaps)
 	}
 	*ia = IntervalsAllOf(p)
 	return nil
@@ -4656,6 +4706,14 @@ func (ifl *IntervalsFilter) UnmarshalJSON(data []byte) error {
 	var p plain
 	if err := json.Unmarshal(trimmed, &p); err != nil {
 		return err
+	}
+	if _, hasScript := rawMap["script"]; hasScript && p.Script == nil {
+		return fmt.Errorf("parsing_exception: [intervals.filter] [script] cannot be null")
+	}
+	if p.Script != nil {
+		if err := validateScriptValue(p.Script); err != nil {
+			return err
+		}
 	}
 	*ifl = IntervalsFilter(p)
 	return nil
@@ -6586,6 +6644,9 @@ func (ssq *ScriptScoreQuery) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(trimmed, &full); err != nil {
 		return err
 	}
+	if err := validateScriptValue(full.Script); err != nil {
+		return err
+	}
 	ssq.Query = full.Query
 	ssq.Script = full.Script
 	if len(full.MinScore) > 0 {
@@ -6619,6 +6680,9 @@ func (sq *ScriptQuery) UnmarshalJSON(data []byte) error {
 	if trimmed[0] == '"' {
 		var s string
 		if err := json.Unmarshal(trimmed, &s); err != nil {
+			return err
+		}
+		if err := validateScriptValue(s); err != nil {
 			return err
 		}
 		sq.Script = s
@@ -6659,9 +6723,22 @@ func (sq *ScriptQuery) UnmarshalJSON(data []byte) error {
 		if inner == nil {
 			return fmt.Errorf("parsing_exception: [script] script cannot be null")
 		}
+		if err := validateScriptValue(inner); err != nil {
+			return err
+		}
 		sq.Script = inner
 	} else {
-		sq.Script = m
+		scriptMap := make(map[string]any, len(m))
+		for k, v := range m {
+			if k == "boost" || k == "_name" {
+				continue
+			}
+			scriptMap[k] = v
+		}
+		if err := validateScriptValue(scriptMap); err != nil {
+			return err
+		}
+		sq.Script = scriptMap
 	}
 	return nil
 }
@@ -7226,6 +7303,24 @@ func (r RegexpEntry) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func validateMaxDeterminizedStates(raw json.RawMessage, queryName string) error {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil
+	}
+	if bytes.Equal(trimmed, []byte("null")) {
+		return fmt.Errorf("parsing_exception: [%s] [max_determinized_states] cannot be null", queryName)
+	}
+	var v int
+	if err := json.Unmarshal(trimmed, &v); err != nil {
+		return fmt.Errorf("parsing_exception: [%s] [max_determinized_states] must be an integer: %w", queryName, err)
+	}
+	if v <= 0 {
+		return fmt.Errorf("illegal_argument_exception: [%s] [max_determinized_states] must be > 0, got [%d]", queryName, v)
+	}
+	return nil
+}
+
 func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
 	r.Boost = 1.0
 	r.HasBoost = false
@@ -7246,6 +7341,36 @@ func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
 		_, hasRx := rawMap["regexp"]
 		if !hasVal && !hasRx {
 			return fmt.Errorf("parsing_exception: [regexp] missing required [value] field")
+		}
+		if hasVal && hasRx {
+			return fmt.Errorf("parsing_exception: [regexp] cannot specify both [value] and [regexp]")
+		}
+		if rawMDS, hasMDS := rawMap["max_determinized_states"]; hasMDS {
+			if err := validateMaxDeterminizedStates(rawMDS, "regexp"); err != nil {
+				return err
+			}
+		}
+		if rawFlags, hasFlags := rawMap["flags"]; hasFlags {
+			ftTrim := bytes.TrimSpace(rawFlags)
+			if bytes.Equal(ftTrim, []byte("null")) {
+				return fmt.Errorf("parsing_exception: [regexp] [flags] cannot be null")
+			}
+			var flagsStr string
+			if err := json.Unmarshal(ftTrim, &flagsStr); err != nil {
+				return fmt.Errorf("parsing_exception: [regexp] [flags] must be a string: %w", err)
+			}
+			if strings.TrimSpace(flagsStr) != "" {
+				validRegexpFlags := map[string]bool{
+					"ALL": true, "COMPLEMENT": true, "INTERVAL": true,
+					"INTERSECTION": true, "ANYSTRING": true, "NONE": true,
+				}
+				for _, tok := range strings.Split(flagsStr, "|") {
+					ft := strings.ToUpper(strings.TrimSpace(tok))
+					if !validRegexpFlags[ft] {
+						return fmt.Errorf("illegal_argument_exception: [regexp] unknown flag [%s] in [flags]", tok)
+					}
+				}
+			}
 		}
 		var full struct {
 			Value           any             `json:"value"`
@@ -7845,6 +7970,7 @@ type QueryStringQuery struct {
 	AnalyzeWildcard                 *bool    `json:"analyze_wildcard,omitempty"`
 	AllowLeadingWildcard            *bool    `json:"allow_leading_wildcard,omitempty"`
 	AutoGenerateSynonymsPhraseQuery *bool    `json:"auto_generate_synonyms_phrase_query,omitempty"`
+	SplitOnWhitespace               *bool    `json:"split_on_whitespace,omitempty"`
 	Escape                          *bool    `json:"escape,omitempty"`
 	Boost                           *float64 `json:"boost,omitempty"`
 }
@@ -7902,6 +8028,11 @@ func (qsq *QueryStringQuery) UnmarshalJSON(data []byte) error {
 	}
 	if _, hasQ := rawMap["query"]; !hasQ {
 		return fmt.Errorf("parsing_exception: [query_string] must be provided with a [query]")
+	}
+	if rawMDS, hasMDS := rawMap["max_determinized_states"]; hasMDS {
+		if err := validateMaxDeterminizedStates(rawMDS, "query_string"); err != nil {
+			return err
+		}
 	}
 	type plain QueryStringQuery
 	var raw struct {
@@ -7990,14 +8121,16 @@ func (qsq *QueryStringQuery) UnmarshalJSON(data []byte) error {
 		}
 		qsq.Escape = &b
 	}
-	for name, val := range map[string]any{
-		"enable_position_increments": raw.EnablePositionIncrements,
-		"split_on_whitespace":        raw.SplitOnWhitespace,
-	} {
-		if val != nil {
-			if _, err := parseFlexibleBool(val); err != nil {
-				return fmt.Errorf("parsing_exception: [query_string] [%s] %w", name, err)
-			}
+	if raw.SplitOnWhitespace != nil {
+		b, err := parseFlexibleBool(raw.SplitOnWhitespace)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [query_string] [split_on_whitespace] %w", err)
+		}
+		qsq.SplitOnWhitespace = &b
+	}
+	if raw.EnablePositionIncrements != nil {
+		if _, err := parseFlexibleBool(raw.EnablePositionIncrements); err != nil {
+			return fmt.Errorf("parsing_exception: [query_string] [enable_position_increments] %w", err)
 		}
 	}
 	switch strings.ToLower(strings.TrimSpace(qsq.Type)) {
@@ -8535,16 +8668,35 @@ func validateScriptValue(script any) error {
 			return fmt.Errorf("parsing_exception: [script_score] [script] requires [source] or [id]")
 		}
 		hasCode := false
+		hasInlineSrc := false
+		hasStoredID := false
 		for k, v := range sv {
 			switch k {
-			case "source", "inline", "id":
-				if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+			case "source", "inline":
+				s, ok := v.(string)
+				if !ok {
+					return fmt.Errorf("parsing_exception: [script_score] [%s] must be a string", k)
+				}
+				if strings.TrimSpace(s) != "" {
 					hasCode = true
+					hasInlineSrc = true
+				}
+			case "id":
+				s, ok := v.(string)
+				if !ok {
+					return fmt.Errorf("parsing_exception: [script_score] [id] must be a string")
+				}
+				if strings.TrimSpace(s) != "" {
+					hasCode = true
+					hasStoredID = true
 				}
 			case "lang", "params", "options":
 			default:
 				return fmt.Errorf("parsing_exception: [script_score] unknown field [%s] in [script]", k)
 			}
+		}
+		if hasInlineSrc && hasStoredID {
+			return fmt.Errorf("illegal_argument_exception: [script] cannot specify both [source] and [id]")
 		}
 		if !hasCode {
 			return fmt.Errorf("parsing_exception: [script_score] [script] requires non-empty [source] or [id]")
@@ -9127,6 +9279,11 @@ func (a *AutoDateHistogramAggSpec) UnmarshalJSON(data []byte) error {
 	if strings.TrimSpace(p.Field) == "" && p.Script == nil {
 		return fmt.Errorf("parsing_exception: [auto_date_histogram] requires either [field] or [script]")
 	}
+	if p.Script != nil {
+		if err := validateScriptValue(p.Script); err != nil {
+			return err
+		}
+	}
 	if raw.Buckets != nil {
 		if *raw.Buckets <= 0 {
 			return fmt.Errorf("parsing_exception: [auto_date_histogram] [buckets] must be > 0")
@@ -9678,6 +9835,11 @@ func (m *MultiTermsAggSpec) UnmarshalJSON(data []byte) error {
 	if len(p.Terms) == 0 {
 		return fmt.Errorf("parsing_exception: [multi_terms] requires non-empty [terms]")
 	}
+	if p.Order != nil {
+		if err := validateBucketAggOrderSpec(p.Order, "multi_terms"); err != nil {
+			return err
+		}
+	}
 	if raw.Size != nil {
 		if *raw.Size <= 0 {
 			return fmt.Errorf("illegal_argument_exception: [multi_terms] [size] must be > 0")
@@ -10005,6 +10167,11 @@ func (s *SamplerAggSpec) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	p := raw.plain
+	if p.Script != nil {
+		if err := validateScriptValue(p.Script); err != nil {
+			return err
+		}
+	}
 	if raw.ShardSize != nil {
 		if *raw.ShardSize <= 0 {
 			return fmt.Errorf("parsing_exception: [sampler] [shard_size] must be > 0")
@@ -10106,6 +10273,11 @@ func (pr *PercentileRanksAggSpec) UnmarshalJSON(data []byte) error {
 	}
 	if strings.TrimSpace(p.Field) == "" && p.Script == nil {
 		return fmt.Errorf("parsing_exception: [percentile_ranks] requires either [field] or [script]")
+	}
+	if p.Script != nil {
+		if err := validateScriptValue(p.Script); err != nil {
+			return err
+		}
 	}
 	if len(p.Values) == 0 {
 		return fmt.Errorf("parsing_exception: [percentile_ranks] requires non-empty [values]")
@@ -11240,6 +11412,9 @@ func (th *TopHitsAggSpec) UnmarshalJSON(data []byte) error {
 	}
 	if p.Size != nil && *p.Size < 0 {
 		return fmt.Errorf("parsing_exception: [top_hits] [size] must be >= 0")
+	}
+	if err := validateScriptFieldsMap(p.ScriptFields, "top_hits"); err != nil {
+		return err
 	}
 	*th = TopHitsAggSpec(p)
 	return nil
@@ -13114,10 +13289,37 @@ func (sf SourceFilter) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func parseStrictSourceStringSlice(v any, field string) ([]string, error) {
+	if v == nil {
+		return nil, nil
+	}
+	switch val := v.(type) {
+	case string:
+		return []string{val}, nil
+	case []string:
+		return val, nil
+	case []any:
+		out := make([]string, 0, len(val))
+		for _, el := range val {
+			s, ok := el.(string)
+			if !ok {
+				return nil, fmt.Errorf("parsing_exception: [_source] [%s] array elements must be strings", field)
+			}
+			out = append(out, s)
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("parsing_exception: [_source] [%s] expected string or array of strings, got %T", field, v)
+	}
+}
+
 func (sf *SourceFilter) UnmarshalJSON(data []byte) error {
 	sf.Fetch = true
 	sf.Disabled = false
 	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
 	if bytes.Equal(trimmed, []byte("false")) {
 		sf.Fetch = false
 		sf.Disabled = true
@@ -13126,7 +13328,7 @@ func (sf *SourceFilter) UnmarshalJSON(data []byte) error {
 	if bytes.Equal(trimmed, []byte("true")) {
 		return nil
 	}
-	if len(trimmed) > 0 && trimmed[0] == '"' {
+	if trimmed[0] == '"' {
 		var single string
 		if err := json.Unmarshal(trimmed, &single); err != nil {
 			return err
@@ -13134,10 +13336,34 @@ func (sf *SourceFilter) UnmarshalJSON(data []byte) error {
 		sf.Includes = []string{single}
 		return nil
 	}
-	if len(trimmed) > 0 && trimmed[0] == '[' {
-		return json.Unmarshal(trimmed, &sf.Includes)
+	if trimmed[0] == '[' {
+		var rawArr []any
+		if err := json.Unmarshal(trimmed, &rawArr); err != nil {
+			return fmt.Errorf("parsing_exception: [_source] invalid array: %w", err)
+		}
+		out := make([]string, 0, len(rawArr))
+		for _, el := range rawArr {
+			s, ok := el.(string)
+			if !ok {
+				return fmt.Errorf("parsing_exception: [_source] array elements must be strings")
+			}
+			out = append(out, s)
+		}
+		sf.Includes = out
+		return nil
 	}
-	if len(trimmed) > 0 && trimmed[0] == '{' {
+	if trimmed[0] == '{' {
+		var rawMap map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+			return err
+		}
+		for k := range rawMap {
+			switch k {
+			case "includes", "excludes", "include", "exclude":
+			default:
+				return fmt.Errorf("parsing_exception: [_source] unknown field [%s]", k)
+			}
+		}
 		var obj struct {
 			Includes any `json:"includes"`
 			Excludes any `json:"excludes"`
@@ -13147,26 +13373,27 @@ func (sf *SourceFilter) UnmarshalJSON(data []byte) error {
 		if err := json.Unmarshal(trimmed, &obj); err != nil {
 			return err
 		}
-		inc1, err := parseFlexibleStringSlice(obj.Includes)
+		inc1, err := parseStrictSourceStringSlice(obj.Includes, "includes")
 		if err != nil {
 			return err
 		}
-		inc2, err := parseFlexibleStringSlice(obj.Include)
+		inc2, err := parseStrictSourceStringSlice(obj.Include, "include")
 		if err != nil {
 			return err
 		}
-		exc1, err := parseFlexibleStringSlice(obj.Excludes)
+		exc1, err := parseStrictSourceStringSlice(obj.Excludes, "excludes")
 		if err != nil {
 			return err
 		}
-		exc2, err := parseFlexibleStringSlice(obj.Exclude)
+		exc2, err := parseStrictSourceStringSlice(obj.Exclude, "exclude")
 		if err != nil {
 			return err
 		}
 		sf.Includes = append(inc1, inc2...)
 		sf.Excludes = append(exc1, exc2...)
+		return nil
 	}
-	return nil
+	return fmt.Errorf("parsing_exception: [_source] must be a boolean, string, array of strings, or object")
 }
 
 // IndexCreateRequest models `PUT /<index>` with `settings`, `mappings`, and `aliases`.

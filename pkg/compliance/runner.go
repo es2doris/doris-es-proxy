@@ -47,6 +47,7 @@ var supportedRunnerFeatures = map[string]bool{
 	"mustache":               true,
 	"clean_text":             true,
 	"is_empty":               true,
+	"is_unset":               true,
 	"not_contains":           true,
 }
 
@@ -231,9 +232,15 @@ type runnerContext struct {
 	createdAsyncSearches        map[string]bool
 	createdMLJobs               map[string]bool
 	createdMLDatafeeds          map[string]bool
+	createdMLDataFrameAnalytics map[string]bool
 	createdMLTrainedModels      map[string]bool
+	createdMLModelDeployments   map[string]bool
+	createdMLModelAliases       map[string]string // alias -> model_id
 	createdMLCalendars          map[string]bool
 	createdMLFilters            map[string]bool
+	createdGeoIPDatabases       map[string]bool
+	createdAPIKeys              map[string]bool
+	updatedSecuritySettings     bool
 	createdSecurityRoleMappings map[string]bool
 	createdVotingExclusions     bool
 	createdScripts              map[string]struct{}
@@ -277,9 +284,14 @@ func newRunnerContext(client *http.Client, baseURL string) *runnerContext {
 		createdAsyncSearches:        make(map[string]bool),
 		createdMLJobs:               make(map[string]bool),
 		createdMLDatafeeds:          make(map[string]bool),
+		createdMLDataFrameAnalytics: make(map[string]bool),
 		createdMLTrainedModels:      make(map[string]bool),
+		createdMLModelDeployments:   make(map[string]bool),
+		createdMLModelAliases:       make(map[string]string),
 		createdMLCalendars:          make(map[string]bool),
 		createdMLFilters:            make(map[string]bool),
+		createdGeoIPDatabases:       make(map[string]bool),
+		createdAPIKeys:              make(map[string]bool),
 		createdSecurityRoleMappings: make(map[string]bool),
 		createdScripts:              make(map[string]struct{}),
 		createdRepositories:         make(map[string]struct{}),
@@ -288,6 +300,12 @@ func newRunnerContext(client *http.Client, baseURL string) *runnerContext {
 }
 
 func (c *runnerContext) cleanupAll() {
+	for dfaID := range c.createdMLDataFrameAnalytics {
+		if dfaID != "" {
+			_, _, _ = c.rawHTTP(http.MethodPost, "/_ml/data_frame/analytics/"+url.PathEscape(dfaID)+"/_stop", url.Values{"force": []string{"true"}}, nil, nil)
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ml/data_frame/analytics/"+url.PathEscape(dfaID), url.Values{"force": []string{"true"}}, nil, nil)
+		}
+	}
 	for alias, idx := range c.createdAliases {
 		if idx != "" && alias != "" {
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/"+url.PathEscape(idx)+"/_alias/"+url.PathEscape(alias), nil, nil, nil)
@@ -453,6 +471,16 @@ func (c *runnerContext) cleanupAll() {
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ml/anomaly_detectors/"+url.PathEscape(jobID), url.Values{"force": []string{"true"}}, nil, nil)
 		}
 	}
+	for modelID := range c.createdMLModelDeployments {
+		if modelID != "" {
+			_, _, _ = c.rawHTTP(http.MethodPost, "/_ml/trained_models/"+url.PathEscape(modelID)+"/deployment/_stop", url.Values{"force": []string{"true"}}, nil, nil)
+		}
+	}
+	for alias, modelID := range c.createdMLModelAliases {
+		if alias != "" && modelID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ml/trained_models/"+url.PathEscape(modelID)+"/model_aliases/"+url.PathEscape(alias), nil, nil, nil)
+		}
+	}
 	for modelID := range c.createdMLTrainedModels {
 		if modelID != "" {
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ml/trained_models/"+url.PathEscape(modelID), nil, nil, nil)
@@ -467,6 +495,27 @@ func (c *runnerContext) cleanupAll() {
 		if filterID != "" {
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ml/filters/"+url.PathEscape(filterID), nil, nil, nil)
 		}
+	}
+	for dbID := range c.createdGeoIPDatabases {
+		if dbID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ingest/geoip/database/"+url.PathEscape(dbID), nil, nil, nil)
+		}
+	}
+	if len(c.createdAPIKeys) > 0 {
+		ids := make([]string, 0, len(c.createdAPIKeys))
+		for id := range c.createdAPIKeys {
+			if id != "" {
+				ids = append(ids, id)
+			}
+		}
+		sort.Strings(ids)
+		if len(ids) > 0 {
+			bodyBytes, _ := json.Marshal(map[string]any{"ids": ids})
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_security/api_key", nil, bodyBytes, nil)
+		}
+	}
+	if c.updatedSecuritySettings {
+		_, _, _ = c.rawHTTP(http.MethodPut, "/_security/settings", nil, []byte(`{}`), nil)
 	}
 	for rmName := range c.createdSecurityRoleMappings {
 		if rmName != "" {
@@ -506,7 +555,7 @@ func (c *runnerContext) execStep(step SpecStep, isTeardown bool) error {
 		return c.execNotContains(step.Value)
 	case "is_true":
 		return c.execIsTrue(step.Value)
-	case "is_false":
+	case "is_false", "is_unset":
 		return c.execIsFalse(step.Value)
 	case "is_empty":
 		return c.execIsEmpty(step.Value)
@@ -781,6 +830,36 @@ func (c *runnerContext) verifyCatch(catchSpec, actionName string, status int, bo
 	case "method_not_allowed":
 		if status != http.StatusMethodNotAllowed {
 			return fmt.Errorf("action %s expected catch: method_not_allowed (HTTP 405), got HTTP %d: %s", actionName, status, bodyStr)
+		}
+		return nil
+	case "not_acceptable":
+		if status != http.StatusNotAcceptable {
+			return fmt.Errorf("action %s expected catch: not_acceptable (HTTP 406), got HTTP %d: %s", actionName, status, bodyStr)
+		}
+		return nil
+	case "request_entity_too_large", "payload_too_large":
+		if status != http.StatusRequestEntityTooLarge {
+			return fmt.Errorf("action %s expected catch: %s (HTTP 413), got HTTP %d: %s", actionName, catchSpec, status, bodyStr)
+		}
+		return nil
+	case "unsupported_media_type":
+		if status != http.StatusUnsupportedMediaType {
+			return fmt.Errorf("action %s expected catch: unsupported_media_type (HTTP 415), got HTTP %d: %s", actionName, status, bodyStr)
+		}
+		return nil
+	case "unprocessable_entity":
+		if status != http.StatusUnprocessableEntity {
+			return fmt.Errorf("action %s expected catch: unprocessable_entity (HTTP 422), got HTTP %d: %s", actionName, status, bodyStr)
+		}
+		return nil
+	case "too_many_requests":
+		if status != http.StatusTooManyRequests {
+			return fmt.Errorf("action %s expected catch: too_many_requests (HTTP 429), got HTTP %d: %s", actionName, status, bodyStr)
+		}
+		return nil
+	case "not_implemented":
+		if status != http.StatusNotImplemented {
+			return fmt.Errorf("action %s expected catch: not_implemented (HTTP 501), got HTTP %d: %s", actionName, status, bodyStr)
 		}
 		return nil
 	}
@@ -1167,6 +1246,48 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 		if id := firstNonEmptyParam(params, "model_id", "id"); id != "" {
 			c.createdMLTrainedModels[id] = true
 		}
+	case "ml.put_data_frame_analytics":
+		if id := paramString(params, "id"); id != "" {
+			c.createdMLDataFrameAnalytics[id] = true
+		}
+		if bodyMap, ok := ToNative(params["body"]).(map[string]any); ok {
+			if destMap, ok := ToNative(bodyMap["dest"]).(map[string]any); ok {
+				if destIdx := paramString(destMap, "index"); destIdx != "" {
+					c.createdIndices[destIdx] = true
+				}
+			}
+		}
+	case "ml.start_trained_model_deployment":
+		if modelID := firstNonEmptyParam(params, "model_id", "id"); modelID != "" {
+			c.createdMLModelDeployments[modelID] = true
+		}
+	case "ml.put_trained_model_alias":
+		modelID := firstNonEmptyParam(params, "model_id", "id")
+		alias := firstNonEmptyParam(params, "model_alias", "alias")
+		if alias != "" && modelID != "" {
+			c.createdMLModelAliases[alias] = modelID
+		}
+	case "indices.downsample":
+		if target := firstNonEmptyParam(params, "target_index", "target"); target != "" {
+			c.createdIndices[target] = true
+		}
+		if idx != "" && !strings.ContainsAny(idx, "*?,") {
+			c.createdIndices[idx] = true
+		}
+	case "ingest.put_geoip_database":
+		if id := paramString(params, "id"); id != "" {
+			c.createdGeoIPDatabases[id] = true
+		}
+	case "security.create_api_key", "security.grant_api_key", "security.create_cross_cluster_api_key":
+		if rm, ok := ToNative(resp).(map[string]any); ok {
+			if _, hasErr := rm["error"]; !hasErr {
+				if id := paramString(rm, "id"); id != "" {
+					c.createdAPIKeys[id] = true
+				}
+			}
+		}
+	case "security.update_settings":
+		c.updatedSecuritySettings = true
 	case "ml.put_calendar":
 		if id := firstNonEmptyParam(params, "calendar_id", "id"); id != "" {
 			c.createdMLCalendars[id] = true
@@ -1591,7 +1712,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		}
 		if id != "" {
 			method = http.MethodPut
-			reqPath = "/" + idx + "/_doc/" + id
+			reqPath = "/" + idx + "/_doc/" + escapeIDSeg(id)
 		} else {
 			method = http.MethodPost
 			reqPath = "/" + idx + "/_doc"
@@ -1604,7 +1725,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("create requires index and id parameters")
 		}
-		reqPath = "/" + idx + "/_create/" + id
+		reqPath = "/" + idx + "/_create/" + escapeIDSeg(id)
 
 	case "get":
 		method = http.MethodGet
@@ -1613,7 +1734,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("get requires index and id parameters")
 		}
-		reqPath = "/" + idx + "/_doc/" + id
+		reqPath = "/" + idx + "/_doc/" + escapeIDSeg(id)
 
 	case "get_source":
 		method = http.MethodGet
@@ -1622,7 +1743,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("get_source requires index and id parameters")
 		}
-		reqPath = "/" + idx + "/_source/" + id
+		reqPath = "/" + idx + "/_source/" + escapeIDSeg(id)
 
 	case "exists":
 		method = http.MethodHead
@@ -1631,7 +1752,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("exists requires index and id parameters")
 		}
-		reqPath = "/" + idx + "/_doc/" + id
+		reqPath = "/" + idx + "/_doc/" + escapeIDSeg(id)
 
 	case "exists_source":
 		method = http.MethodHead
@@ -1640,7 +1761,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("exists_source requires index and id parameters")
 		}
-		reqPath = "/" + idx + "/_source/" + id
+		reqPath = "/" + idx + "/_source/" + escapeIDSeg(id)
 
 	case "delete":
 		method = http.MethodDelete
@@ -1649,7 +1770,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("delete requires index and id parameters")
 		}
-		reqPath = "/" + idx + "/_doc/" + id
+		reqPath = "/" + idx + "/_doc/" + escapeIDSeg(id)
 
 	case "update":
 		method = http.MethodPost
@@ -1658,7 +1779,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("update requires index and id parameters")
 		}
-		reqPath = "/" + idx + "/_update/" + id
+		reqPath = "/" + idx + "/_update/" + escapeIDSeg(id)
 
 	case "mget":
 		method = http.MethodPost
@@ -1709,7 +1830,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("explain requires index and id parameters")
 		}
-		reqPath = "/" + idx + "/_explain/" + id
+		reqPath = "/" + idx + "/_explain/" + escapeIDSeg(id)
 
 	case "field_caps":
 		if hasBody {
@@ -2207,7 +2328,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			return nil, fmt.Errorf("%s requires index parameter", action)
 		}
 		if id := popString("id"); id != "" {
-			reqPath = "/" + idx + "/_termvectors/" + id
+			reqPath = "/" + idx + "/_termvectors/" + escapeIDSeg(id)
 		} else {
 			reqPath = "/" + idx + "/_termvectors"
 		}
@@ -4336,6 +4457,517 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			reqPath = "/_nodes/clear_repositories_metering_archive/" + maxVer
 		}
 
+	case "indices.put_data_lifecycle", "data_stream.put_data_lifecycle":
+		method = http.MethodPut
+		name := popString("name")
+		if name == "" {
+			return nil, fmt.Errorf("%s requires name parameter", action)
+		}
+		reqPath = "/_data_stream/" + name + "/_lifecycle"
+
+	case "indices.get_data_lifecycle", "data_stream.get_data_lifecycle":
+		method = http.MethodGet
+		name := popString("name")
+		if name == "" {
+			return nil, fmt.Errorf("%s requires name parameter", action)
+		}
+		reqPath = "/_data_stream/" + name + "/_lifecycle"
+
+	case "indices.delete_data_lifecycle", "data_stream.delete_data_lifecycle":
+		method = http.MethodDelete
+		name := popString("name")
+		if name == "" {
+			return nil, fmt.Errorf("%s requires name parameter", action)
+		}
+		reqPath = "/_data_stream/" + name + "/_lifecycle"
+
+	case "indices.explain_data_lifecycle", "data_stream.explain_data_lifecycle":
+		method = http.MethodGet
+		idx := popString("index")
+		if idx == "" {
+			return nil, fmt.Errorf("%s requires index parameter", action)
+		}
+		reqPath = "/" + idx + "/_lifecycle/explain"
+
+	case "indices.downsample":
+		method = http.MethodPost
+		idx := popString("index")
+		targetIdx := popString("target_index", "target")
+		if idx == "" || targetIdx == "" {
+			return nil, fmt.Errorf("indices.downsample requires index and target_index parameters")
+		}
+		reqPath = "/" + idx + "/_downsample/" + targetIdx
+
+	case "ml.put_data_frame_analytics":
+		method = http.MethodPut
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("ml.put_data_frame_analytics requires id parameter")
+		}
+		reqPath = "/_ml/data_frame/analytics/" + id
+
+	case "ml.get_data_frame_analytics":
+		method = http.MethodGet
+		if id := popString("id"); id != "" {
+			reqPath = "/_ml/data_frame/analytics/" + id
+		} else {
+			reqPath = "/_ml/data_frame/analytics"
+		}
+
+	case "ml.get_data_frame_analytics_stats":
+		method = http.MethodGet
+		if id := popString("id"); id != "" {
+			reqPath = "/_ml/data_frame/analytics/" + id + "/_stats"
+		} else {
+			reqPath = "/_ml/data_frame/analytics/_stats"
+		}
+
+	case "ml.update_data_frame_analytics":
+		method = http.MethodPost
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("ml.update_data_frame_analytics requires id parameter")
+		}
+		reqPath = "/_ml/data_frame/analytics/" + id + "/_update"
+
+	case "ml.delete_data_frame_analytics":
+		method = http.MethodDelete
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("ml.delete_data_frame_analytics requires id parameter")
+		}
+		reqPath = "/_ml/data_frame/analytics/" + id
+
+	case "ml.start_data_frame_analytics":
+		method = http.MethodPost
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("ml.start_data_frame_analytics requires id parameter")
+		}
+		reqPath = "/_ml/data_frame/analytics/" + id + "/_start"
+
+	case "ml.stop_data_frame_analytics":
+		method = http.MethodPost
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("ml.stop_data_frame_analytics requires id parameter")
+		}
+		reqPath = "/_ml/data_frame/analytics/" + id + "/_stop"
+
+	case "ml.preview_data_frame_analytics":
+		if hasBody && rawBody != nil {
+			method = http.MethodPost
+		} else {
+			method = http.MethodGet
+		}
+		if id := popString("id"); id != "" {
+			reqPath = "/_ml/data_frame/analytics/" + id + "/_preview"
+		} else {
+			reqPath = "/_ml/data_frame/analytics/_preview"
+		}
+
+	case "ml.explain_data_frame_analytics":
+		if hasBody && rawBody != nil {
+			method = http.MethodPost
+		} else {
+			method = http.MethodGet
+		}
+		if id := popString("id"); id != "" {
+			reqPath = "/_ml/data_frame/analytics/" + id + "/_explain"
+		} else {
+			reqPath = "/_ml/data_frame/analytics/_explain"
+		}
+
+	case "ml.evaluate_data_frame":
+		method = http.MethodPost
+		reqPath = "/_ml/data_frame/_evaluate"
+
+	case "ml.start_trained_model_deployment":
+		method = http.MethodPost
+		modelID := popString("model_id", "id")
+		if modelID == "" {
+			return nil, fmt.Errorf("ml.start_trained_model_deployment requires model_id parameter")
+		}
+		reqPath = "/_ml/trained_models/" + modelID + "/deployment/_start"
+
+	case "ml.stop_trained_model_deployment":
+		method = http.MethodPost
+		modelID := popString("model_id", "id")
+		if modelID == "" {
+			return nil, fmt.Errorf("ml.stop_trained_model_deployment requires model_id parameter")
+		}
+		reqPath = "/_ml/trained_models/" + modelID + "/deployment/_stop"
+
+	case "ml.update_trained_model_deployment":
+		method = http.MethodPost
+		modelID := popString("model_id", "id")
+		if modelID == "" {
+			return nil, fmt.Errorf("ml.update_trained_model_deployment requires model_id parameter")
+		}
+		reqPath = "/_ml/trained_models/" + modelID + "/deployment/_update"
+
+	case "ml.infer_trained_model":
+		method = http.MethodPost
+		modelID := popString("model_id", "id")
+		if modelID == "" {
+			return nil, fmt.Errorf("ml.infer_trained_model requires model_id parameter")
+		}
+		reqPath = "/_ml/trained_models/" + modelID + "/_infer"
+
+	case "ml.infer_trained_model_deployment":
+		method = http.MethodPost
+		modelID := popString("model_id", "id")
+		if modelID == "" {
+			return nil, fmt.Errorf("ml.infer_trained_model_deployment requires model_id parameter")
+		}
+		reqPath = "/_ml/trained_models/" + modelID + "/deployment/_infer"
+
+	case "ml.put_trained_model_alias":
+		method = http.MethodPut
+		modelID := popString("model_id", "id")
+		modelAlias := popString("model_alias", "alias")
+		if modelID == "" || modelAlias == "" {
+			return nil, fmt.Errorf("ml.put_trained_model_alias requires model_id and model_alias parameters")
+		}
+		reqPath = "/_ml/trained_models/" + modelID + "/model_aliases/" + modelAlias
+
+	case "ml.delete_trained_model_alias":
+		method = http.MethodDelete
+		modelID := popString("model_id", "id")
+		modelAlias := popString("model_alias", "alias")
+		if modelID == "" || modelAlias == "" {
+			return nil, fmt.Errorf("ml.delete_trained_model_alias requires model_id and model_alias parameters")
+		}
+		reqPath = "/_ml/trained_models/" + modelID + "/model_aliases/" + modelAlias
+
+	case "ml.put_trained_model_definition_part":
+		method = http.MethodPut
+		modelID := popString("model_id", "id")
+		part := popString("part")
+		if modelID == "" || part == "" {
+			return nil, fmt.Errorf("ml.put_trained_model_definition_part requires model_id and part parameters")
+		}
+		reqPath = "/_ml/trained_models/" + modelID + "/definition/" + part
+
+	case "ml.put_trained_model_vocabulary":
+		method = http.MethodPut
+		modelID := popString("model_id", "id")
+		if modelID == "" {
+			return nil, fmt.Errorf("ml.put_trained_model_vocabulary requires model_id parameter")
+		}
+		reqPath = "/_ml/trained_models/" + modelID + "/vocabulary"
+
+	case "ml.flush_job":
+		method = http.MethodPost
+		jobID := popString("job_id", "id")
+		if jobID == "" {
+			return nil, fmt.Errorf("ml.flush_job requires job_id parameter")
+		}
+		reqPath = "/_ml/anomaly_detectors/" + jobID + "/_flush"
+
+	case "ml.post_data":
+		method = http.MethodPost
+		isNDJSON = true
+		jobID := popString("job_id", "id")
+		if jobID == "" {
+			return nil, fmt.Errorf("ml.post_data requires job_id parameter")
+		}
+		reqPath = "/_ml/anomaly_detectors/" + jobID + "/_data"
+
+	case "ml.reset_job":
+		method = http.MethodPost
+		jobID := popString("job_id", "id")
+		if jobID == "" {
+			return nil, fmt.Errorf("ml.reset_job requires job_id parameter")
+		}
+		reqPath = "/_ml/anomaly_detectors/" + jobID + "/_reset"
+
+	case "ml.forecast":
+		method = http.MethodPost
+		jobID := popString("job_id", "id")
+		if jobID == "" {
+			return nil, fmt.Errorf("ml.forecast requires job_id parameter")
+		}
+		reqPath = "/_ml/anomaly_detectors/" + jobID + "/_forecast"
+
+	case "ml.delete_forecast":
+		method = http.MethodDelete
+		jobID := popString("job_id", "id")
+		if jobID == "" {
+			return nil, fmt.Errorf("ml.delete_forecast requires job_id parameter")
+		}
+		if forecastID := popString("forecast_id"); forecastID != "" {
+			reqPath = "/_ml/anomaly_detectors/" + jobID + "/_forecast/" + forecastID
+		} else {
+			reqPath = "/_ml/anomaly_detectors/" + jobID + "/_forecast"
+		}
+
+	case "ml.delete_expired_data":
+		method = http.MethodPost
+		jobID := popString("job_id", "id")
+		if jobID == "" {
+			return nil, fmt.Errorf("ml.delete_expired_data requires job_id parameter")
+		}
+		reqPath = "/_ml/anomaly_detectors/" + jobID + "/_delete_expired_data"
+
+	case "ml.validate":
+		method = http.MethodPost
+		reqPath = "/_ml/anomaly_detectors/_validate"
+
+	case "ml.validate_detector":
+		method = http.MethodPost
+		reqPath = "/_ml/anomaly_detectors/_validate/detector"
+
+	case "ml.estimate_model_memory":
+		method = http.MethodPost
+		reqPath = "/_ml/anomaly_detectors/_estimate_model_memory"
+
+	case "ml.get_buckets":
+		if hasBody && rawBody != nil {
+			method = http.MethodPost
+		} else {
+			method = http.MethodGet
+		}
+		jobID := popString("job_id", "id")
+		if jobID == "" {
+			return nil, fmt.Errorf("ml.get_buckets requires job_id parameter")
+		}
+		if ts := popString("timestamp"); ts != "" {
+			reqPath = "/_ml/anomaly_detectors/" + jobID + "/results/buckets/" + ts
+		} else {
+			reqPath = "/_ml/anomaly_detectors/" + jobID + "/results/buckets"
+		}
+
+	case "ml.get_overall_buckets":
+		if hasBody && rawBody != nil {
+			method = http.MethodPost
+		} else {
+			method = http.MethodGet
+		}
+		jobID := popString("job_id", "id")
+		if jobID == "" {
+			return nil, fmt.Errorf("ml.get_overall_buckets requires job_id parameter")
+		}
+		reqPath = "/_ml/anomaly_detectors/" + jobID + "/results/overall_buckets"
+
+	case "ml.get_records":
+		if hasBody && rawBody != nil {
+			method = http.MethodPost
+		} else {
+			method = http.MethodGet
+		}
+		jobID := popString("job_id", "id")
+		if jobID == "" {
+			return nil, fmt.Errorf("ml.get_records requires job_id parameter")
+		}
+		reqPath = "/_ml/anomaly_detectors/" + jobID + "/results/records"
+
+	case "ml.get_categories":
+		if hasBody && rawBody != nil {
+			method = http.MethodPost
+		} else {
+			method = http.MethodGet
+		}
+		jobID := popString("job_id", "id")
+		if jobID == "" {
+			return nil, fmt.Errorf("ml.get_categories requires job_id parameter")
+		}
+		if catID := popString("category_id"); catID != "" {
+			reqPath = "/_ml/anomaly_detectors/" + jobID + "/results/categories/" + catID
+		} else {
+			reqPath = "/_ml/anomaly_detectors/" + jobID + "/results/categories"
+		}
+
+	case "ml.get_influencers":
+		if hasBody && rawBody != nil {
+			method = http.MethodPost
+		} else {
+			method = http.MethodGet
+		}
+		jobID := popString("job_id", "id")
+		if jobID == "" {
+			return nil, fmt.Errorf("ml.get_influencers requires job_id parameter")
+		}
+		reqPath = "/_ml/anomaly_detectors/" + jobID + "/results/influencers"
+
+	case "ml.get_model_snapshots":
+		if hasBody && rawBody != nil {
+			method = http.MethodPost
+		} else {
+			method = http.MethodGet
+		}
+		jobID := popString("job_id", "id")
+		if jobID == "" {
+			return nil, fmt.Errorf("ml.get_model_snapshots requires job_id parameter")
+		}
+		if snapID := popString("snapshot_id"); snapID != "" {
+			reqPath = "/_ml/anomaly_detectors/" + jobID + "/model_snapshots/" + snapID
+		} else {
+			reqPath = "/_ml/anomaly_detectors/" + jobID + "/model_snapshots"
+		}
+
+	case "ml.update_model_snapshot":
+		method = http.MethodPost
+		jobID := popString("job_id", "id")
+		snapID := popString("snapshot_id")
+		if jobID == "" || snapID == "" {
+			return nil, fmt.Errorf("ml.update_model_snapshot requires job_id and snapshot_id parameters")
+		}
+		reqPath = "/_ml/anomaly_detectors/" + jobID + "/model_snapshots/" + snapID + "/_update"
+
+	case "ml.delete_model_snapshot":
+		method = http.MethodDelete
+		jobID := popString("job_id", "id")
+		snapID := popString("snapshot_id")
+		if jobID == "" || snapID == "" {
+			return nil, fmt.Errorf("ml.delete_model_snapshot requires job_id and snapshot_id parameters")
+		}
+		reqPath = "/_ml/anomaly_detectors/" + jobID + "/model_snapshots/" + snapID
+
+	case "ml.revert_model_snapshot":
+		method = http.MethodPost
+		jobID := popString("job_id", "id")
+		snapID := popString("snapshot_id")
+		if jobID == "" || snapID == "" {
+			return nil, fmt.Errorf("ml.revert_model_snapshot requires job_id and snapshot_id parameters")
+		}
+		reqPath = "/_ml/anomaly_detectors/" + jobID + "/model_snapshots/" + snapID + "/_revert"
+
+	case "security.activate_profile":
+		method = http.MethodPost
+		reqPath = "/_security/profile/_activate"
+
+	case "security.get_profile":
+		method = http.MethodGet
+		uid := popString("uid")
+		if uid == "" {
+			return nil, fmt.Errorf("security.get_profile requires uid parameter")
+		}
+		reqPath = "/_security/profile/" + uid
+
+	case "security.update_profile_data":
+		method = http.MethodPost
+		uid := popString("uid")
+		if uid == "" {
+			return nil, fmt.Errorf("security.update_profile_data requires uid parameter")
+		}
+		reqPath = "/_security/profile/" + uid + "/_data"
+
+	case "security.enable_profile":
+		method = http.MethodPut
+		uid := popString("uid")
+		if uid == "" {
+			return nil, fmt.Errorf("security.enable_profile requires uid parameter")
+		}
+		reqPath = "/_security/profile/" + uid + "/_enable"
+
+	case "security.disable_profile":
+		method = http.MethodPut
+		uid := popString("uid")
+		if uid == "" {
+			return nil, fmt.Errorf("security.disable_profile requires uid parameter")
+		}
+		reqPath = "/_security/profile/" + uid + "/_disable"
+
+	case "security.suggest_profiles":
+		method = http.MethodPost
+		reqPath = "/_security/_suggest_profiles"
+
+	case "security.has_privileges_profile":
+		if hasBody && rawBody != nil {
+			method = http.MethodPost
+		} else {
+			method = http.MethodGet
+		}
+		uid := popString("uid")
+		if uid == "" {
+			return nil, fmt.Errorf("security.has_privileges_profile requires uid parameter")
+		}
+		reqPath = "/_security/profile/" + uid + "/_has_privileges"
+
+	case "security.get_settings":
+		method = http.MethodGet
+		reqPath = "/_security/settings"
+
+	case "security.update_settings":
+		method = http.MethodPut
+		reqPath = "/_security/settings"
+
+	case "security.create_cross_cluster_api_key":
+		method = http.MethodPost
+		reqPath = "/_security/cross_cluster/api_key"
+
+	case "security.update_cross_cluster_api_key":
+		method = http.MethodPut
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("security.update_cross_cluster_api_key requires id parameter")
+		}
+		reqPath = "/_security/cross_cluster/api_key/" + id
+
+	case "transform.reset_transform":
+		method = http.MethodPost
+		id := popString("transform_id", "id")
+		if id == "" {
+			return nil, fmt.Errorf("transform.reset_transform requires transform_id parameter")
+		}
+		reqPath = "/_transform/" + id + "/_reset"
+
+	case "transform.upgrade_transforms":
+		method = http.MethodPost
+		reqPath = "/_transform/_upgrade"
+
+	case "transform.schedule_now_transform":
+		method = http.MethodPost
+		id := popString("transform_id", "id")
+		if id == "" {
+			return nil, fmt.Errorf("transform.schedule_now_transform requires transform_id parameter")
+		}
+		reqPath = "/_transform/" + id + "/_schedule_now"
+
+	case "ingest.put_geoip_database":
+		method = http.MethodPut
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("ingest.put_geoip_database requires id parameter")
+		}
+		reqPath = "/_ingest/geoip/database/" + id
+
+	case "ingest.get_geoip_database":
+		method = http.MethodGet
+		if id := popString("id"); id != "" {
+			reqPath = "/_ingest/geoip/database/" + id
+		} else {
+			reqPath = "/_ingest/geoip/database"
+		}
+
+	case "ingest.delete_geoip_database":
+		method = http.MethodDelete
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("ingest.delete_geoip_database requires id parameter")
+		}
+		reqPath = "/_ingest/geoip/database/" + id
+
+	case "ilm.migrate_to_data_tiers":
+		method = http.MethodPost
+		reqPath = "/_ilm/migrate_to_data_tiers"
+
+	case "cluster.resolve_cluster", "indices.resolve_cluster":
+		method = http.MethodGet
+		if name := popString("name"); name != "" {
+			reqPath = "/_resolve/cluster/" + name
+		} else {
+			reqPath = "/_resolve/cluster"
+		}
+
+	case "cat.help":
+		method = http.MethodGet
+		reqPath = "/_cat"
+		if _, ok := remaining["help"]; !ok {
+			remaining["help"] = ""
+		}
+
 	default:
 		return nil, fmt.Errorf("unsupported rest-api-spec action %q", action)
 	}
@@ -4439,8 +5071,47 @@ func firstNonEmptyParam(m map[string]any, keys ...string) string {
 	return ""
 }
 
+func isHexByte(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
+}
+
+func sanitizeRawReqPath(reqPath string) string {
+	if reqPath == "" {
+		return ""
+	}
+	var sb strings.Builder
+	sb.Grow(len(reqPath))
+	for i := 0; i < len(reqPath); i++ {
+		b := reqPath[i]
+		if b == '%' {
+			if i+2 < len(reqPath) && isHexByte(reqPath[i+1]) && isHexByte(reqPath[i+2]) {
+				sb.WriteByte('%')
+				sb.WriteByte(reqPath[i+1])
+				sb.WriteByte(reqPath[i+2])
+				i += 2
+				continue
+			}
+			sb.WriteString("%25")
+			continue
+		}
+		if b <= 0x20 || b >= 0x7f || b == '#' || b == '?' || b == '"' || b == '<' || b == '>' || b == '\\' || b == '^' || b == '`' || b == '{' || b == '|' || b == '}' || b == '[' || b == ']' {
+			_, _ = fmt.Fprintf(&sb, "%%%02X", b)
+			continue
+		}
+		sb.WriteByte(b)
+	}
+	return sb.String()
+}
+
+func escapeIDSeg(id string) string {
+	if id == "" {
+		return ""
+	}
+	return strings.ReplaceAll(sanitizeRawReqPath(id), "/", "%2F")
+}
+
 func (c *runnerContext) rawHTTP(method, reqPath string, query url.Values, body []byte, headers map[string]string) (int, string, error) {
-	fullURL := c.baseURL + reqPath
+	fullURL := c.baseURL + sanitizeRawReqPath(reqPath)
 	if len(query) > 0 {
 		fullURL += "?" + query.Encode()
 	}
@@ -4553,9 +5224,8 @@ func (c *runnerContext) expandStash(v any) any {
 		}
 		return out
 	case string:
-		if strings.HasPrefix(val, "$") && !strings.ContainsAny(val[1:], " $./\\:") {
-			stashKey := val[1:]
-			if sv, ok := c.stash[stashKey]; ok {
+		if val != "" && reStashVar.FindString(val) == val {
+			if sv, ok := c.lookupStashVar(normalizeStashKey(val)); ok {
 				return sv
 			}
 		}
@@ -4565,15 +5235,43 @@ func (c *runnerContext) expandStash(v any) any {
 	}
 }
 
-var reStashVar = regexp.MustCompile(`\$([A-Za-z_][A-Za-z0-9_]*)`)
+var reStashVar = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_.]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)`)
+
+func normalizeStashKey(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if inner, ok := strings.CutPrefix(trimmed, "${"); ok {
+		if key, ok2 := strings.CutSuffix(inner, "}"); ok2 && key != "" {
+			return key
+		}
+	}
+	return strings.TrimPrefix(trimmed, "$")
+}
+
+func (c *runnerContext) lookupStashVar(key string) (any, bool) {
+	if key == "" {
+		return nil, false
+	}
+	if sv, ok := c.stash[key]; ok {
+		return sv, true
+	}
+	if strings.Contains(key, ".") {
+		segs := splitEscapedPath(key)
+		if len(segs) >= 2 {
+			if root, ok := c.stash[segs[0]]; ok {
+				return lookupSegments(root, segs[1:])
+			}
+		}
+	}
+	return nil, false
+}
 
 func (c *runnerContext) expandStashString(s string) string {
 	if !strings.Contains(s, "$") {
 		return s
 	}
 	return reStashVar.ReplaceAllStringFunc(s, func(match string) string {
-		key := match[1:]
-		if sv, ok := c.stash[key]; ok {
+		key := normalizeStashKey(match)
+		if sv, ok := c.lookupStashVar(key); ok {
 			return fmt.Sprintf("%v", sv)
 		}
 		return match
@@ -4585,8 +5283,8 @@ func (c *runnerContext) expandStashPath(s string) string {
 		return s
 	}
 	return reStashVar.ReplaceAllStringFunc(s, func(match string) string {
-		key := match[1:]
-		if sv, ok := c.stash[key]; ok {
+		key := normalizeStashKey(match)
+		if sv, ok := c.lookupStashVar(key); ok {
 			switch sv.(type) {
 			case []any, map[string]any:
 				return match
@@ -4646,6 +5344,15 @@ func (c *runnerContext) execSkip(rawVal any) error {
 }
 
 func versionInRange(target, versionRange string) bool {
+	for _, part := range strings.Split(versionRange, ",") {
+		if singleVersionInRange(target, part) {
+			return true
+		}
+	}
+	return false
+}
+
+func singleVersionInRange(target, versionRange string) bool {
 	vr := strings.TrimSpace(versionRange)
 	if vr == "" {
 		return false
@@ -4657,6 +5364,9 @@ func versionInRange(target, versionRange string) bool {
 		return compareSemver(target, vr) == 0
 	}
 	parts := strings.SplitN(vr, "-", 2)
+	if len(parts) < 2 {
+		return false
+	}
 	minVer := strings.TrimSpace(parts[0])
 	maxVer := strings.TrimSpace(parts[1])
 	if minVer != "" && compareSemver(target, minVer) < 0 {
@@ -4704,8 +5414,7 @@ func (c *runnerContext) execSet(rawVal any) error {
 	}
 	for _, p := range pairs {
 		fieldPath := c.expandStashPath(p.Key)
-		stashVar := fmt.Sprintf("%v", p.Value)
-		stashVar = strings.TrimPrefix(stashVar, "$")
+		stashVar := normalizeStashKey(fmt.Sprintf("%v", p.Value))
 		val, found := c.lookupResponsePath(fieldPath)
 		if !found {
 			return fmt.Errorf("set: response path %q not found in %s", fieldPath, c.lastBodyRaw)
@@ -4776,7 +5485,7 @@ func (c *runnerContext) resolveTransformValue(rawArg string) (any, bool) {
 		return val, true
 	}
 	if strings.HasPrefix(trimmed, "$") {
-		if val, found := c.stash[strings.TrimPrefix(trimmed, "$")]; found && val != nil {
+		if val, found := c.lookupStashVar(normalizeStashKey(trimmed)); found && val != nil {
 			return val, true
 		}
 	}
@@ -4869,7 +5578,7 @@ func (c *runnerContext) execTransformAndSet(rawVal any) error {
 			fieldPath := c.expandStashPath(rawPath)
 			val, found := c.lookupResponsePath(fieldPath)
 			if !found && strings.HasPrefix(rawPath, "$") {
-				val, found = c.stash[strings.TrimPrefix(rawPath, "$")]
+				val, found = c.lookupStashVar(normalizeStashKey(rawPath))
 			}
 			if !found || val == nil {
 				return fmt.Errorf("transform_and_set: response path %q not found in %s", fieldPath, c.lastBodyRaw)
@@ -4929,7 +5638,7 @@ func (c *runnerContext) execTransformAndSet(rawVal any) error {
 			}
 		}
 
-		varName = strings.TrimPrefix(varName, "$")
+		varName = normalizeStashKey(varName)
 		c.stash[varName] = transformed
 	}
 	return nil
@@ -5037,6 +5746,29 @@ func containsElementMatch(elem, expected any) bool {
 		if !ok {
 			return false
 		}
+		if arbExp, hasArb := expVal["_arbitrary_key_"]; hasArb {
+			if len(actMap) == 0 {
+				return false
+			}
+			for k, v := range expVal {
+				if k == "_arbitrary_key_" {
+					continue
+				}
+				actVal, exists := actMap[k]
+				if !exists || !containsElementMatch(actVal, v) {
+					return false
+				}
+			}
+			for ak, av := range actMap {
+				if _, isExplicit := expVal[ak]; isExplicit {
+					continue
+				}
+				if containsElementMatch(av, arbExp) {
+					return true
+				}
+			}
+			return false
+		}
 		for k, v := range expVal {
 			actVal, exists := actMap[k]
 			if !exists || !containsElementMatch(actVal, v) {
@@ -5073,6 +5805,18 @@ func (c *runnerContext) execMatch(rawVal any) error {
 			return fmt.Errorf("match: path %q not found in response: %s", fieldPath, c.lastBodyRaw)
 		}
 		if err := matchValues(fieldPath, actual, expected); err != nil {
+			if strings.Contains(fieldPath, "_arbitrary_key_") {
+				matchedAny := false
+				for _, cand := range c.lookupAllResponsePaths(fieldPath) {
+					if matchValues(fieldPath, cand, expected) == nil {
+						matchedAny = true
+						break
+					}
+				}
+				if matchedAny {
+					continue
+				}
+			}
 			return err
 		}
 	}
@@ -5140,7 +5884,33 @@ func valuesEqual(a, b any) bool {
 	switch av := a.(type) {
 	case map[string]any:
 		bv, ok := b.(map[string]any)
-		if !ok || len(av) != len(bv) {
+		if !ok {
+			return false
+		}
+		if arbExp, hasArb := bv["_arbitrary_key_"]; hasArb {
+			if len(av) == 0 {
+				return false
+			}
+			for k, bElem := range bv {
+				if k == "_arbitrary_key_" {
+					continue
+				}
+				aElem, exists := av[k]
+				if !exists || !valuesEqual(aElem, bElem) {
+					return false
+				}
+			}
+			for ak, aElem := range av {
+				if _, isExplicit := bv[ak]; isExplicit {
+					continue
+				}
+				if valuesEqual(aElem, arbExp) {
+					return true
+				}
+			}
+			return false
+		}
+		if len(av) != len(bv) {
 			return false
 		}
 		for k, aElem := range av {
@@ -5489,18 +6259,18 @@ func extractFieldPairs(op string, raw any) ([]YAMLField, error) {
 	}
 }
 
-func (c *runnerContext) lookupResponsePath(rawPath string) (any, bool) {
+func (c *runnerContext) resolveResponseRootAndSegments(rawPath string) (any, []string, bool) {
 	if rawPath == "" || rawPath == "$body" {
-		return c.lastResponse, c.lastResponse != nil
+		return c.lastResponse, nil, c.lastResponse != nil
 	}
 	rawPath = strings.TrimPrefix(rawPath, "$body.")
 	if rawPath == "$headers" {
-		return c.lastHeaders, c.lastHeaders != nil
+		return c.lastHeaders, nil, c.lastHeaders != nil
 	}
 	if strings.HasPrefix(rawPath, "$headers.") {
 		hdrKey := strings.ToLower(strings.TrimPrefix(rawPath, "$headers."))
 		val, ok := c.lastHeaders[hdrKey]
-		return val, ok
+		return val, nil, ok
 	}
 	if strings.HasPrefix(rawPath, "headers.") {
 		hasBodyHeaders := false
@@ -5510,7 +6280,7 @@ func (c *runnerContext) lookupResponsePath(rawPath string) (any, bool) {
 		if !hasBodyHeaders {
 			hdrKey := strings.ToLower(strings.TrimPrefix(rawPath, "headers."))
 			val, ok := c.lastHeaders[hdrKey]
-			return val, ok
+			return val, nil, ok
 		}
 	}
 	segments := splitEscapedPath(rawPath)
@@ -5521,83 +6291,197 @@ func (c *runnerContext) lookupResponsePath(rawPath string) (any, bool) {
 			_, hasLiteralKey = bodyMap[segments[0]]
 		}
 		if !hasLiteralKey {
-			if sv, ok := c.stash[strings.TrimPrefix(segments[0], "$")]; ok {
+			if sv, ok := c.lookupStashVar(normalizeStashKey(segments[0])); ok {
 				cur = sv
 				segments = segments[1:]
 			}
 		}
 	}
-	for _, seg := range segments {
-		if cur == nil {
+	return cur, segments, true
+}
+
+func (c *runnerContext) lookupResponsePath(rawPath string) (any, bool) {
+	root, segments, ok := c.resolveResponseRootAndSegments(rawPath)
+	if !ok {
+		return nil, false
+	}
+	if len(segments) == 0 {
+		return root, root != nil
+	}
+	return lookupSegments(root, segments)
+}
+
+func (c *runnerContext) lookupAllResponsePaths(rawPath string) []any {
+	root, segments, ok := c.resolveResponseRootAndSegments(rawPath)
+	if !ok {
+		return nil
+	}
+	if len(segments) == 0 {
+		if root == nil {
+			return nil
+		}
+		return []any{root}
+	}
+	return lookupAllSegments(root, segments)
+}
+
+func lookupSegments(cur any, segments []string) (any, bool) {
+	if len(segments) == 0 {
+		return cur, true
+	}
+	if cur == nil {
+		return nil, false
+	}
+	seg := segments[0]
+	rest := segments[1:]
+	switch node := cur.(type) {
+	case map[string]any:
+		if seg == "_arbitrary_key_" {
+			if len(node) == 0 {
+				return nil, false
+			}
+			keys := make([]string, 0, len(node))
+			for k := range node {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			if len(keys) == 0 {
+				return nil, false
+			}
+			if len(rest) == 0 {
+				return node[keys[0]], true
+			}
+			for _, k := range keys {
+				if val, ok := lookupSegments(node[k], rest); ok {
+					return val, true
+				}
+			}
 			return nil, false
 		}
-		switch node := cur.(type) {
-		case map[string]any:
-			next, exists := node[seg]
-			if !exists {
-				if strings.Contains(seg, ".") {
-					subCur := any(node)
-					subFound := true
-					for _, subSeg := range strings.Split(seg, ".") {
-						switch sn := subCur.(type) {
-						case map[string]any:
-							sv, ok := sn[subSeg]
-							if !ok {
-								subFound = false
-							} else {
-								subCur = sv
-							}
-						case []any:
-							idx, err := strconv.Atoi(subSeg)
-							if err == nil && idx < 0 {
-								idx = len(sn) + idx
-							}
-							if err != nil || idx < 0 || idx >= len(sn) {
-								subFound = false
-							} else {
-								subCur = sn[idx]
-							}
-						default:
-							subFound = false
-						}
-						if !subFound {
-							break
-						}
-					}
-					if subFound {
-						cur = subCur
-						continue
-					}
+		next, exists := node[seg]
+		if !exists {
+			if strings.Contains(seg, ".") {
+				subCur, subFound := lookupDottedFallback(node, seg)
+				if subFound {
+					return lookupSegments(subCur, rest)
 				}
+			}
+			return nil, false
+		}
+		return lookupSegments(next, rest)
+	case []any:
+		idx, err := strconv.Atoi(seg)
+		if err == nil && idx < 0 {
+			idx = len(node) + idx
+		}
+		if err != nil || idx < 0 || idx >= len(node) {
+			return nil, false
+		}
+		return lookupSegments(node[idx], rest)
+	default:
+		return nil, false
+	}
+}
+
+func lookupAllSegments(cur any, segments []string) []any {
+	if len(segments) == 0 {
+		return []any{cur}
+	}
+	if cur == nil {
+		return nil
+	}
+	seg := segments[0]
+	rest := segments[1:]
+	switch node := cur.(type) {
+	case map[string]any:
+		if seg == "_arbitrary_key_" {
+			if len(node) == 0 {
+				return nil
+			}
+			keys := make([]string, 0, len(node))
+			for k := range node {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			var out []any
+			for _, k := range keys {
+				out = append(out, lookupAllSegments(node[k], rest)...)
+			}
+			return out
+		}
+		next, exists := node[seg]
+		if !exists {
+			if strings.Contains(seg, ".") {
+				if subCur, subFound := lookupDottedFallback(node, seg); subFound {
+					return lookupAllSegments(subCur, rest)
+				}
+			}
+			return nil
+		}
+		return lookupAllSegments(next, rest)
+	case []any:
+		idx, err := strconv.Atoi(seg)
+		if err == nil && idx < 0 {
+			idx = len(node) + idx
+		}
+		if err != nil || idx < 0 || idx >= len(node) {
+			return nil
+		}
+		return lookupAllSegments(node[idx], rest)
+	default:
+		return nil
+	}
+}
+
+func lookupDottedFallback(node map[string]any, seg string) (any, bool) {
+	subCur := any(node)
+	for _, subSeg := range strings.Split(seg, ".") {
+		switch sn := subCur.(type) {
+		case map[string]any:
+			sv, ok := sn[subSeg]
+			if !ok {
 				return nil, false
 			}
-			cur = next
+			subCur = sv
 		case []any:
-			idx, err := strconv.Atoi(seg)
+			idx, err := strconv.Atoi(subSeg)
 			if err == nil && idx < 0 {
-				idx = len(node) + idx
+				idx = len(sn) + idx
 			}
-			if err != nil || idx < 0 || idx >= len(node) {
+			if err != nil || idx < 0 || idx >= len(sn) {
 				return nil, false
 			}
-			cur = node[idx]
+			subCur = sn[idx]
 		default:
 			return nil, false
 		}
 	}
-	return cur, true
+	return subCur, true
 }
 
 func splitEscapedPath(rawPath string) []string {
 	var segments []string
 	var sb strings.Builder
+	braceDepth := 0
 	for i := 0; i < len(rawPath); i++ {
 		if rawPath[i] == '\\' && i+1 < len(rawPath) && rawPath[i+1] == '.' {
 			sb.WriteByte('.')
 			i++
 			continue
 		}
-		if rawPath[i] == '.' {
+		if rawPath[i] == '$' && i+1 < len(rawPath) && rawPath[i+1] == '{' {
+			braceDepth++
+			sb.WriteByte('$')
+			sb.WriteByte('{')
+			i++
+			continue
+		}
+		if rawPath[i] == '}' && braceDepth > 0 {
+			braceDepth--
+			sb.WriteByte('}')
+			continue
+		}
+		if rawPath[i] == '.' && braceDepth == 0 {
 			segments = append(segments, sb.String())
 			sb.Reset()
 			continue

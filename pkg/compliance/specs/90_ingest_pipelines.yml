@@ -531,8 +531,150 @@
   - set: { docs.0.doc._source.cid: icmp_req_cid }
   - match: { docs.1.doc._source.cid: $icmp_req_cid }
 
+---
+"Round 56 foreach/on_failure ctx._ingest metadata, reroute validation/fallback/short-circuiting, and json duplicate keys":
+  # F28: reroute processor validation errors
+  - do:
+      catch: bad_request
+      ingest.put_pipeline:
+        id: r56_bad_reroute_dest_and_dataset
+        body:
+          processors:
+            - reroute:
+                destination: "logs-custom"
+                dataset: "app"
 
+  - do:
+      catch: bad_request
+      ingest.put_pipeline:
+        id: r56_bad_reroute_static_hyphen
+        body:
+          processors:
+            - reroute:
+                dataset: "bad-dataset"
 
+  # F29: json processor validation errors
+  - do:
+      catch: bad_request
+      ingest.put_pipeline:
+        id: r56_bad_json_conflict_strategy
+        body:
+          processors:
+            - json:
+                field: "payload"
+                add_to_root: true
+                add_to_root_conflict_strategy: "invalid_strategy"
 
+  - do:
+      catch: bad_request
+      ingest.put_pipeline:
+        id: r56_bad_json_strategy_without_root
+        body:
+          processors:
+            - json:
+                field: "payload"
+                add_to_root_conflict_strategy: "merge"
 
+  # F27: foreach if reading ctx._ingest._value & ctx._ingest.timestamp, plus nested on_failure_pipeline propagation
+  - do:
+      ingest.put_pipeline:
+        id: r56_child_fail_pipe
+        body:
+          processors:
+            - fail:
+                message: "child pipeline failure"
+  - match: { acknowledged: true }
+
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - foreach:
+                  field: "scores"
+                  processor:
+                    script:
+                      if: "ctx._ingest._value >= 10 && ctx._ingest.timestamp != null"
+                      source: "ctx._ingest._value = ctx._ingest._value * 10"
+              - pipeline:
+                  name: "r56_child_fail_pipe"
+            on_failure:
+              - set:
+                  if: "ctx._ingest.on_failure_pipeline == 'r56_child_fail_pipe'"
+                  field: "caught_from_pipeline"
+                  value: "{{_ingest.on_failure_pipeline}}"
+              - set:
+                  if: "ctx._ingest.on_failure_processor_type == 'fail'"
+                  field: "caught_proc_type"
+                  value: "{{_ingest.on_failure_processor_type}}"
+          docs:
+            - _source:
+                scores: [5, 10, 25]
+  - match: { docs.0.doc._source.scores: [5, 100, 250] }
+  - match: { docs.0.doc._source.caught_from_pipeline: "r56_child_fail_pipe" }
+  - match: { docs.0.doc._source.caught_proc_type: "fail" }
+  - is_unset: docs.0.doc._source._ingest
+
+  # F28: reroute array fallback (skipping missing/null), dynamic '-' -> '_' sanitization, and pipeline short-circuiting
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - set:
+                  field: "before_reroute"
+                  value: true
+              - reroute:
+                  dataset: ["missing_ds", "null_ds", "svc_ds"]
+                  namespace: ["missing_ns", "env_ns"]
+              - set:
+                  field: "after_reroute"
+                  value: "continued"
+          docs:
+            - _index: "logs-generic-default"
+              _source:
+                null_ds: null
+                svc_ds: "billing-api"
+                env_ns: "prod-east"
+            - _index: "logs-billing_api-prod_east"
+              _source:
+                svc_ds: "billing-api"
+                env_ns: "prod-east"
+  - match: { docs.0.doc._index: "logs-billing_api-prod_east" }
+  - match: { docs.0.doc._source.before_reroute: true }
+  - is_unset: docs.0.doc._source.after_reroute
+  - match: { docs.1.doc._index: "logs-billing_api-prod_east" }
+  - match: { docs.1.doc._source.after_reroute: "continued" }
+
+  # F29: json allow_duplicate_keys default false rejection vs allow_duplicate_keys: true + add_to_root_conflict_strategy: merge
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - json:
+                  field: "dup_payload"
+                  target_field: "parsed_dup"
+                  on_failure:
+                    - set:
+                        field: "dup_rejected"
+                        value: true
+              - json:
+                  field: "merge_payload"
+                  allow_duplicate_keys: true
+                  add_to_root: true
+                  add_to_root_conflict_strategy: "merge"
+          docs:
+            - _source:
+                dup_payload: '{"user":"alice","user":"admin"}'
+                merge_payload: '{"role":"viewer","role":"editor","meta":{"shared":"new","added":7}}'
+                meta:
+                  keep: "preserved"
+                  shared: "old"
+  - match: { docs.0.doc._source.dup_rejected: true }
+  - is_unset: docs.0.doc._source.parsed_dup
+  - match: { docs.0.doc._source.role: "editor" }
+  - match: { docs.0.doc._source.meta.keep: "preserved" }
+  - match: { docs.0.doc._source.meta.shared: "new" }
+  - match: { docs.0.doc._source.meta.added: 7 }
 

@@ -4326,3 +4326,236 @@ func TestRound55TranspilerAndLuceneF15ToF19(t *testing.T) {
 		t.Fatalf("F19 expected *:* to be allowed when allow_leading_wildcard=false, got %v", err)
 	}
 }
+
+func TestRound56TranspilerAndLuceneF15ToF19(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"title":   {"type": "text"},
+			"code":    {"type": "keyword"},
+			"ver":     {"type": "version"},
+			"ip_addr": {"type": "ip"},
+			"active":  {"type": "boolean"},
+			"tags":    {"type": "keyword"},
+			"flags":   {"type": "boolean"},
+			"src_tag": {"type": "keyword", "copy_to": "tags"},
+			"src_flg": {"type": "boolean", "copy_to": "flags"},
+			"items": {
+				"type": "nested",
+				"properties": {
+					"nip":   {"type": "ip"},
+					"nver":  {"type": "version"},
+					"nbool": {"type": "boolean"}
+				}
+			}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("Round 56 mapping unmarshal failed: %v", err)
+	}
+	sc := schema.CompileIndexSchema("db", "r56_tr_idx", &spec)
+	tr := NewTranspiler(sc, TranspilerOptions{UseDoris4SearchFunc: true})
+
+	// --- F15.3: SemVer range validation, numeric pre-release 10-digit padding, and +build stripping in term/terms ---
+	var badVerRange esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"range":{"ver":{"gte":"01.0.0"}}}}`), &badVerRange)
+	if _, err := tr.BuildSearchPlan(&badVerRange); err == nil || !strings.Contains(err.Error(), "illegal_argument_exception") {
+		t.Fatalf("F15 expected illegal_argument_exception on invalid version range bound, got %v", err)
+	}
+
+	kRc2 := formatSemverBoundKey("1.0.0-rc.2")
+	kRc10 := formatSemverBoundKey("1.0.0-rc.10")
+	kRel := formatSemverBoundKey("1.0.0")
+	if kRc2 >= kRc10 || kRc10 >= kRel {
+		t.Fatalf("F15 expected SemVer sort keys 1.0.0-rc.2 (%q) < 1.0.0-rc.10 (%q) < 1.0.0 (%q)", kRc2, kRc10, kRel)
+	}
+	var okVerRange esast.Query
+	_ = json.Unmarshal([]byte(`{"range":{"ver":{"gte":"1.0.0-rc.2","lt":"1.0.0-rc.10"}}}`), &okVerRange)
+	wVerRange := tr.CompileQuery(&okVerRange, false, nil).WhereSQL
+	if !strings.Contains(wVerRange, "0000000001.0000000000.0000000000-rc.0000000002") || !strings.Contains(wVerRange, "0000000001.0000000000.0000000000-rc.0000000010") {
+		t.Fatalf("F15 expected 10-digit padded numeric pre-release keys in SQL, got %s", wVerRange)
+	}
+
+	var qVerTermBuild, qVerTermBad, qVerTerms esast.Query
+	_ = json.Unmarshal([]byte(`{"term":{"ver":"1.2.3-rc.1+build.42"}}`), &qVerTermBuild)
+	wVerTerm := tr.CompileQuery(&qVerTermBuild, false, nil).WhereSQL
+	if !strings.Contains(wVerTerm, "SPLIT_PART(`f__ver`, '+', 1) = '1.2.3-rc.1'") {
+		t.Fatalf("F15 expected SPLIT_PART +build stripping in version term query, got %s", wVerTerm)
+	}
+	_ = json.Unmarshal([]byte(`{"term":{"ver":"not_semver"}}`), &qVerTermBad)
+	if w := tr.CompileQuery(&qVerTermBad, false, nil).WhereSQL; w != "FALSE" {
+		t.Fatalf("F15 expected FALSE for invalid SemVer in term query, got %s", w)
+	}
+	_ = json.Unmarshal([]byte(`{"terms":{"ver":["1.2.3+b1","01.2.3","2.0.0+b2"]}}`), &qVerTerms)
+	wVerTerms := tr.CompileQuery(&qVerTerms, false, nil).WhereSQL
+	if !strings.Contains(wVerTerms, "'1.2.3'") || !strings.Contains(wVerTerms, "'2.0.0'") || strings.Contains(wVerTerms, "01.2.3") {
+		t.Fatalf("F15 expected terms on version to strip +build and skip invalid SemVer, got %s", wVerTerms)
+	}
+
+	// --- F16.2-3: ip canonicalization, IPv4 & IPv6 CIDRs, and 128-bit IPv6 range ordering ---
+	var qIPTerms, qIPTermsAllBad, qIPv6Range, qNestedIP esast.Query
+	_ = json.Unmarshal([]byte(`{"terms":{"ip_addr":["2001:0db8:0000:0000:0000:0000:0000:0001","10.0.0.0/8","2001:db8::/32","invalid_ip"]}}`), &qIPTerms)
+	wIPTerms := tr.CompileQuery(&qIPTerms, false, nil).WhereSQL
+	if !strings.Contains(wIPTerms, "'2001:db8::1'") || !strings.Contains(wIPTerms, "IPV4_STRING_TO_NUM_OR_NULL") || !strings.Contains(wIPTerms, "HEX(IPV6_STRING_TO_NUM_OR_NULL") || strings.Contains(wIPTerms, "invalid_ip") {
+		t.Fatalf("F16 expected canonical IPv6, IPv4 CIDR, IPv6 CIDR, and skipped invalid IP in terms SQL, got %s", wIPTerms)
+	}
+	_ = json.Unmarshal([]byte(`{"terms":{"ip_addr":["bad1","bad2"]}}`), &qIPTermsAllBad)
+	if w := tr.CompileQuery(&qIPTermsAllBad, false, nil).WhereSQL; w != "FALSE" {
+		t.Fatalf("F16 expected FALSE when all IP terms are invalid, got %s", w)
+	}
+	_ = json.Unmarshal([]byte(`{"range":{"ip_addr":{"gte":"2001:db8::2","lte":"2001:db8::10"}}}`), &qIPv6Range)
+	wIPv6Range := tr.CompileQuery(&qIPv6Range, false, nil).WhereSQL
+	if !strings.Contains(wIPv6Range, "HEX(IPV6_STRING_TO_NUM_OR_NULL(`f__ip_addr`)) >= '20010DB8000000000000000000000002'") ||
+		!strings.Contains(wIPv6Range, "HEX(IPV6_STRING_TO_NUM_OR_NULL(`f__ip_addr`)) <= '20010DB8000000000000000000000010'") {
+		t.Fatalf("F16 expected 32-char uppercase hex IPv6 range SQL, got %s", wIPv6Range)
+	}
+	_ = json.Unmarshal([]byte(`{"nested":{"path":"items","query":{"term":{"items.nip":"2001:0db8:0:0:0:0:0:1"}}}}`), &qNestedIP)
+	wNestedIP := tr.CompileQuery(&qNestedIP, false, nil).WhereSQL
+	if !strings.Contains(wNestedIP, "'2001:db8::1'") {
+		t.Fatalf("F16 expected nested IP prefilter canonicalization to '2001:db8::1', got %s", wNestedIP)
+	}
+
+	var srIPRangeAgg esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{
+		"size": 0,
+		"aggs": {
+			"v6_ranges": {
+				"ip_range": {
+					"field": "ip_addr",
+					"ranges": [
+						{"mask": "2001:db8::/32"},
+						{"from": "2001:db8::1", "to": "2001:db8::ff"}
+					]
+				}
+			}
+		}
+	}`), &srIPRangeAgg)
+	planIPAgg, err := tr.BuildSearchPlan(&srIPRangeAgg)
+	if err != nil {
+		t.Fatalf("F16 ip_range agg BuildSearchPlan failed: %v", err)
+	}
+	if !strings.Contains(planIPAgg.AggsSQL, "HEX(IPV6_STRING_TO_NUM_OR_NULL") || !strings.Contains(planIPAgg.AggsSQL, "20010DB8FFFFFFFFFFFFFFFFFFFFFFFF") {
+		t.Fatalf("F16 expected IPv6 HEX bounds in ip_range AggsSQL, got %s", planIPAgg.AggsSQL)
+	}
+
+	// --- F17: DorisBoolean range queries across scalar, promoted array, nested, and _doc variant ---
+	for _, rawBoolQ := range []string{
+		`{"range":{"active":{"gt":false,"lte":true}}}`,
+		`{"range":{"flags":{"gte":"false","lt":"true"}}}`,
+		`{"nested":{"path":"items","query":{"range":{"items.nbool":{"gte":true}}}}}`,
+		`{"range":{"unmapped_bool":{"gt":false,"lte":true}}}`,
+	} {
+		var q esast.Query
+		if err := json.Unmarshal([]byte(rawBoolQ), &q); err != nil {
+			t.Fatalf("F17 unmarshal %s failed: %v", rawBoolQ, err)
+		}
+		w := tr.CompileQuery(&q, false, nil).WhereSQL
+		if w == "" || w == "FALSE" || w == "TRUE" {
+			t.Fatalf("F17 expected non-trivial boolean range SQL for %s, got %s", rawBoolQ, w)
+		}
+	}
+	var badBoolRange esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"range":{"active":{"gte":"maybe"}}}}`), &badBoolRange)
+	if _, err := tr.BuildSearchPlan(&badBoolRange); err == nil || !strings.Contains(err.Error(), "illegal_argument_exception") {
+		t.Fatalf("F17 expected illegal_argument_exception on invalid boolean range bound, got %v", err)
+	}
+
+	// --- F18: RareTerms & MultiTerms array explosion (top-level and sub-agg) ---
+	var srExplodeAggs esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"size": 0,
+		"aggs": {
+			"rare_tags": {
+				"rare_terms": {"field": "tags", "max_doc_count": 2, "missing": "N/A"}
+			},
+			"mt_combo": {
+				"multi_terms": {
+					"terms": [{"field": "tags", "missing": "MISSING"}, {"field": "flags"}]
+				}
+			},
+			"by_code": {
+				"terms": {"field": "code"},
+				"aggs": {
+					"sub_rare": {"rare_terms": {"field": "tags", "max_doc_count": 3}},
+					"sub_mt":   {"multi_terms": {"terms": [{"field": "tags"}, {"field": "active"}]}}
+				}
+			}
+		}
+	}`), &srExplodeAggs); err != nil {
+		t.Fatalf("F18 unmarshal failed: %v", err)
+	}
+	planExplode, err := tr.BuildSearchPlan(&srExplodeAggs)
+	if err != nil {
+		t.Fatalf("F18 BuildSearchPlan failed: %v", err)
+	}
+	if !strings.Contains(planExplode.AggsSQL, "LATERAL VIEW EXPLODE") || !strings.Contains(planExplode.AggsSQL, "COUNT(DISTINCT `_id`)") || !strings.Contains(planExplode.AggsSQL, "`_mt_elem_0`") {
+		t.Fatalf("F18 expected LATERAL VIEW EXPLODE and COUNT(DISTINCT `_id`) in AggsSQL, got %s", planExplode.AggsSQL)
+	}
+	if !strings.Contains(planExplode.AggsSQL, "'by_code.sub_rare'") || !strings.Contains(planExplode.AggsSQL, "'by_code.sub_mt'") || !strings.Contains(planExplode.AggsSQL, "`_sub_elem`") {
+		t.Fatalf("F18 expected sub-agg branches by_code.sub_rare and by_code.sub_mt in AggsSQL, got %s", planExplode.AggsSQL)
+	}
+
+	// --- F19: query_string split_on_whitespace, strict syntax validation, and empty quoted "" ---
+	var srNoSplit esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"query_string":{"default_field":"title","query":"new york AND code:abc","split_on_whitespace":false}}}`), &srNoSplit)
+	planNoSplit, err := tr.BuildSearchPlan(&srNoSplit)
+	if err != nil {
+		t.Fatalf("F19 split_on_whitespace:false BuildSearchPlan failed: %v", err)
+	}
+	if strings.Contains(planNoSplit.HitsSQL, "SEARCH(") || !strings.Contains(planNoSplit.HitsSQL, "'new york'") {
+		t.Fatalf("F19 expected split_on_whitespace:false to bypass SEARCH() and keep 'new york' chunk together, got %s", planNoSplit.HitsSQL)
+	}
+
+	strictBadQueries := []string{
+		`{"query":{"query_string":{"query":"\"unclosed quote"}}}`,
+		`{"query":{"query_string":{"query":"(foo AND bar"}}}`,
+		`{"query":{"query_string":{"query":"foo AND bar)"}}}`,
+		`{"query":{"query_string":{"query":"foo~3"}}}`,
+		`{"query":{"query_string":{"query":"foo~-1"}}}`,
+		`{"query":{"query_string":{"query":"foo~abc"}}}`,
+		`{"query":{"query_string":{"query":"foo~2.5"}}}`,
+		`{"query":{"query_string":{"query":"foo^-2"}}}`,
+		`{"query":{"query_string":{"query":"foo^-0.5"}}}`,
+	}
+	for _, rawBad := range strictBadQueries {
+		var sr esast.SearchRequest
+		if err := json.Unmarshal([]byte(rawBad), &sr); err != nil {
+			t.Fatalf("F19 unmarshal %s failed: %v", rawBad, err)
+		}
+		if _, err := tr.BuildSearchPlan(&sr); err == nil || !strings.Contains(err.Error(), "parse_exception") {
+			t.Fatalf("F19 expected parse_exception for %s, got %v", rawBad, err)
+		}
+	}
+
+	strictValidQueries := []string{
+		`{"query":{"query_string":{"default_field":"title","query":"\"foo bar\"~10"}}}`,
+		`{"query":{"query_string":{"default_field":"title","query":"foo~2 OR bar~0.8 OR baz~auto OR qux~"}}}`,
+		`{"query":{"query_string":{"default_field":"code","query":"/ab(c~3/"}}}`,
+		`{"query":{"query_string":{"query":"\"unclosed","lenient":true}}}`,
+		`{"query":{"query_string":{"query":"foo~9","escape":true}}}`,
+	}
+	for _, rawValid := range strictValidQueries {
+		var sr esast.SearchRequest
+		if err := json.Unmarshal([]byte(rawValid), &sr); err != nil {
+			t.Fatalf("F19 unmarshal valid %s failed: %v", rawValid, err)
+		}
+		if _, err := tr.BuildSearchPlan(&sr); err != nil {
+			t.Fatalf("F19 expected valid query_string %s, got %v", rawValid, err)
+		}
+	}
+
+	// Empty quoted "" on keyword vs text (default vs zero_terms_query: "all")
+	var qEmptyKw, qEmptyTextNone, qEmptyTextAll esast.Query
+	_ = json.Unmarshal([]byte(`{"query_string":{"query":"code:\"\""}}`), &qEmptyKw)
+	wEmptyKw := tr.CompileQuery(&qEmptyKw, false, nil).WhereSQL
+	if !strings.Contains(wEmptyKw, "`f__code` = ''") {
+		t.Fatalf("F19 expected code:\"\" on keyword field to match empty string (`f__code` = ''), got %s", wEmptyKw)
+	}
+	_ = json.Unmarshal([]byte(`{"query_string":{"query":"title:\"\""}}`), &qEmptyTextNone)
+	if w := tr.CompileQuery(&qEmptyTextNone, false, nil).WhereSQL; w != "FALSE" {
+		t.Fatalf("F19 expected title:\"\" on text field with default zero_terms_query to be FALSE, got %s", w)
+	}
+	_ = json.Unmarshal([]byte(`{"query_string":{"query":"title:\"\"","zero_terms_query":"all"}}`), &qEmptyTextAll)
+	if w := tr.CompileQuery(&qEmptyTextAll, false, nil).WhereSQL; strings.Trim(w, "()") != "TRUE" {
+		t.Fatalf("F19 expected title:\"\" on text field with zero_terms_query='all' to be TRUE, got %s", w)
+	}
+}

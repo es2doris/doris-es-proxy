@@ -1978,21 +1978,48 @@ func (s *Server) handleIngestProcessorGrok(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, map[string]any{"patterns": patterns})
 }
 
-// handleIngestGeoIPStats implements `GET/HEAD /_ingest/geoip/stats` (F6).
+// handleIngestGeoIPStats implements `GET/HEAD /_ingest/geoip/stats` (F6/Round 56 F8).
 func (s *Server) handleIngestGeoIPStats(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
+	s.mu.RLock()
+	dbCount := len(s.geoipDatabases)
+	var dbNames []string
+	for id, entry := range s.geoipDatabases {
+		if df, ok := entry["database_file"].(string); ok && df != "" {
+			dbNames = append(dbNames, df)
+		} else {
+			dbNames = append(dbNames, id)
+		}
+	}
+	s.mu.RUnlock()
+	sort.Strings(dbNames)
+	nodesMap := map[string]any{}
+	if len(dbNames) > 0 {
+		dbObjs := make([]any, 0, len(dbNames))
+		for _, dn := range dbNames {
+			dbObjs = append(dbObjs, map[string]any{"name": dn})
+		}
+		nodesMap["doris-node-1"] = map[string]any{
+			"databases":     dbObjs,
+			"files_in_temp": []any{},
+		}
+	}
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"stats": map[string]any{
-			"successful_downloads": 0,
+			"successful_downloads": dbCount,
 			"failed_downloads":     0,
 			"total_download_time":  0,
-			"databases_count":      0,
+			"databases_count":      dbCount,
 			"skipped_updates":      0,
 		},
-		"nodes": map[string]any{},
+		"nodes": nodesMap,
 	})
 }
 
@@ -2450,6 +2477,14 @@ func (s *Server) handleWatcherRoot(w http.ResponseWriter, r *http.Request) {
 // handleTransform implements `PUT/GET/DELETE /_transform/{id}`, `GET /_transform`, `POST /_transform/_preview` (F7).
 func (s *Server) handleTransform(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "_upgrade" {
+		if r.Method != http.MethodPost {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true, "updated": []any{}, "pending_transforms": []any{}})
+		return
+	}
 	if id == "_preview" {
 		s.handleTransformPreview(w, r)
 		return
@@ -2705,6 +2740,48 @@ func (s *Server) handleTransformAction(w http.ResponseWriter, r *http.Request) {
 		delete(resp, "state")
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, resp)
+
+	case "_reset", "reset":
+		if r.Method != http.MethodPost && r.Method != http.MethodPut {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		id := strings.TrimSpace(r.PathValue("id"))
+		force := isTruthyBoolQueryParam(r, "force")
+		s.mu.Lock()
+		entry, exists := s.transforms[id]
+		if !exists || entry == nil {
+			s.mu.Unlock()
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception",
+				fmt.Sprintf("Unknown transform [%s]", id))
+			return
+		}
+		if st, _ := entry["state"].(string); st == "started" && !force {
+			s.mu.Unlock()
+			writeESError(w, http.StatusConflict, "status_exception",
+				fmt.Sprintf("Cannot reset transform [%s] because it is started; stop the transform first or use force=true", id))
+			return
+		}
+		entry["state"] = "stopped"
+		delete(entry, "checkpoint")
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+	case "_schedule_now", "schedule_now":
+		if r.Method != http.MethodPost && r.Method != http.MethodPut {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		id := strings.TrimSpace(r.PathValue("id"))
+		s.mu.RLock()
+		entry, exists := s.transforms[id]
+		s.mu.RUnlock()
+		if !exists || entry == nil {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception",
+				fmt.Sprintf("Unknown transform [%s]", id))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 
 	default:
 		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown transform action ["+action+"]")
@@ -4002,8 +4079,16 @@ func (s *Server) handleFeatures(w http.ResponseWriter, r *http.Request, segs []s
 		s.mlTrainedModels = make(map[string]map[string]any)
 		s.mlCalendars = make(map[string]map[string]any)
 		s.mlFilters = make(map[string]map[string]any)
+		s.mlDataFrameAnalytics = make(map[string]map[string]any)
+		s.mlModelDeployments = make(map[string]map[string]any)
+		s.mlModelAliases = make(map[string]string)
 		s.mlUpgradeMode = false
 		s.securityRoleMappings = make(map[string]map[string]any)
+		s.securityProfiles = make(map[string]map[string]any)
+		s.securitySettings = make(map[string]any)
+		s.geoipDatabases = make(map[string]map[string]any)
+		s.templateLifecycles = make(map[string]map[string]any)
+		s.remoteClusters = make(map[string]map[string]any)
 		s.mu.Unlock()
 		statuses := make([]any, 0, len(featureNames))
 		for _, f := range featureNames {
@@ -4827,6 +4912,9 @@ func (s *Server) handleCCR(w http.ResponseWriter, r *http.Request, segs []string
 func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs []string) {
 	if len(segs) < 2 {
 		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+		return
+	}
+	if s.handleSecurityRound56(w, r, segs) {
 		return
 	}
 	switch segs[1] {
@@ -7059,29 +7147,6 @@ func inferESQLValueType(v any) string {
 	}
 }
 
-func parseESQLLiteral(raw string) any {
-	s := strings.TrimSpace(raw)
-	if len(s) >= 2 && ((s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'')) {
-		return s[1 : len(s)-1]
-	}
-	if strings.EqualFold(s, "true") {
-		return true
-	}
-	if strings.EqualFold(s, "false") {
-		return false
-	}
-	if strings.EqualFold(s, "null") {
-		return nil
-	}
-	if iv, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return iv
-	}
-	if fv, err := strconv.ParseFloat(s, 64); err == nil {
-		return fv
-	}
-	return s
-}
-
 // handleESQLQuery implements `/_query` and `/_query/async*` (Round 54 F7).
 func (s *Server) handleESQLQuery(w http.ResponseWriter, r *http.Request, segs []string) {
 	if len(segs) >= 3 && segs[1] == "async" {
@@ -7132,244 +7197,7 @@ func (s *Server) handleESQLQuery(w http.ResponseWriter, r *http.Request, segs []
 		return
 	}
 
-	stages := strings.Split(queryStr, "|")
-	var rows []map[string]any
-	var colOrder []string
-	colTypes := make(map[string]string)
-	limit := 100
-
-	for idx, rawStage := range stages {
-		st := strings.TrimSpace(rawStage)
-		if st == "" {
-			continue
-		}
-		upper := strings.ToUpper(st)
-		switch {
-		case idx == 0 && strings.HasPrefix(upper, "ROW "):
-			assigns := strings.Split(strings.TrimSpace(st[4:]), ",")
-			row := make(map[string]any)
-			for _, a := range assigns {
-				parts := strings.SplitN(a, "=", 2)
-				if len(parts) == 2 {
-					col := strings.TrimSpace(parts[0])
-					val := parseESQLLiteral(parts[1])
-					row[col] = val
-					colOrder = append(colOrder, col)
-					colTypes[col] = inferESQLValueType(val)
-				} else if strings.TrimSpace(a) != "" {
-					val := parseESQLLiteral(a)
-					col := fmt.Sprintf("col_%d", len(colOrder)+1)
-					row[col] = val
-					colOrder = append(colOrder, col)
-					colTypes[col] = inferESQLValueType(val)
-				}
-			}
-			rows = []map[string]any{row}
-
-		case idx == 0 && strings.HasPrefix(upper, "FROM "):
-			idxTarget := strings.TrimSpace(st[5:])
-			if sp := strings.Fields(idxTarget); len(sp) > 0 {
-				idxTarget = sp[0]
-			}
-			searchBody := []byte(`{"size":1000,"query":{"match_all":{}}}`)
-			r2 := r.Clone(r.Context())
-			r2.Method = http.MethodPost
-			r2.URL.RawQuery = ""
-			r2.SetPathValue("index", idxTarget)
-			r2.Body = io.NopCloser(bytes.NewReader(searchBody))
-			r2.ContentLength = int64(len(searchBody))
-			rec := &asyncCaptureResponseWriter{}
-			s.handleSearch(rec, r2)
-			if rec.code >= 400 {
-				for k, vals := range rec.Header() {
-					for _, v := range vals {
-						w.Header().Add(k, v)
-					}
-				}
-				w.WriteHeader(rec.code)
-				_, _ = w.Write(rec.body.Bytes())
-				return
-			}
-			var sr map[string]any
-			dec := json.NewDecoder(bytes.NewReader(rec.body.Bytes()))
-			dec.UseNumber()
-			_ = dec.Decode(&sr)
-			seenCols := make(map[string]bool)
-			if hitsMap, ok := sr["hits"].(map[string]any); ok {
-				if hitList, ok := hitsMap["hits"].([]any); ok {
-					for _, hAny := range hitList {
-						if hMap, ok := hAny.(map[string]any); ok {
-							if srcMap, ok := hMap["_source"].(map[string]any); ok {
-								row := make(map[string]any, len(srcMap))
-								for k, v := range srcMap {
-									row[k] = v
-									if !seenCols[k] {
-										seenCols[k] = true
-										colOrder = append(colOrder, k)
-										colTypes[k] = inferESQLValueType(v)
-									}
-								}
-								rows = append(rows, row)
-							}
-						}
-					}
-				}
-			}
-			sort.Strings(colOrder)
-
-		case idx == 0:
-			writeESError(w, http.StatusBadRequest, "verification_exception", fmt.Sprintf("Found 1 problem\nline 1:1: unsupported ES|QL source command [%s]", st))
-			return
-
-		case strings.HasPrefix(upper, "LIMIT "):
-			if n, err := strconv.Atoi(strings.TrimSpace(st[6:])); err == nil && n >= 0 {
-				limit = n
-			}
-
-		case strings.HasPrefix(upper, "KEEP "):
-			keepRaw := strings.Split(strings.TrimSpace(st[5:]), ",")
-			var nextCols []string
-			for _, kc := range keepRaw {
-				cn := strings.TrimSpace(kc)
-				if cn != "" {
-					nextCols = append(nextCols, cn)
-					if colTypes[cn] == "" {
-						colTypes[cn] = "keyword"
-					}
-				}
-			}
-			if len(nextCols) > 0 {
-				colOrder = nextCols
-			}
-
-		case strings.HasPrefix(upper, "EVAL "):
-			assigns := strings.Split(strings.TrimSpace(st[5:]), ",")
-			for _, a := range assigns {
-				parts := strings.SplitN(a, "=", 2)
-				if len(parts) == 2 {
-					col := strings.TrimSpace(parts[0])
-					val := parseESQLLiteral(parts[1])
-					for _, row := range rows {
-						row[col] = val
-					}
-					hasCol := false
-					for _, c := range colOrder {
-						if c == col {
-							hasCol = true
-							break
-						}
-					}
-					if !hasCol {
-						colOrder = append(colOrder, col)
-					}
-					colTypes[col] = inferESQLValueType(val)
-				}
-			}
-
-		case strings.HasPrefix(upper, "WHERE "):
-			cond := strings.TrimSpace(st[6:])
-			if parts := strings.SplitN(cond, "==", 2); len(parts) == 2 {
-				col := strings.TrimSpace(parts[0])
-				target := fmt.Sprintf("%v", parseESQLLiteral(parts[1]))
-				var filtered []map[string]any
-				for _, row := range rows {
-					if fmt.Sprintf("%v", row[col]) == target {
-						filtered = append(filtered, row)
-					}
-				}
-				rows = filtered
-			}
-
-		case strings.HasPrefix(upper, "SORT "):
-			sortSpec := strings.Fields(strings.TrimSpace(st[5:]))
-			if len(sortSpec) > 0 {
-				sortCol := strings.TrimSuffix(sortSpec[0], ",")
-				desc := len(sortSpec) > 1 && strings.EqualFold(sortSpec[1], "DESC")
-				sort.SliceStable(rows, func(i, j int) bool {
-					vi := fmt.Sprintf("%v", rows[i][sortCol])
-					vj := fmt.Sprintf("%v", rows[j][sortCol])
-					if desc {
-						return vi > vj
-					}
-					return vi < vj
-				})
-			}
-		}
-	}
-
-	if len(rows) > limit {
-		rows = rows[:limit]
-	}
-
-	columns := make([]any, 0, len(colOrder))
-	for _, c := range colOrder {
-		t := colTypes[c]
-		if t == "" {
-			t = "keyword"
-		}
-		columns = append(columns, map[string]any{
-			"name": c,
-			"type": t,
-		})
-	}
-	values := make([]any, 0, len(rows))
-	for _, row := range rows {
-		vals := make([]any, 0, len(colOrder))
-		for _, c := range colOrder {
-			vals = append(vals, row[c])
-		}
-		values = append(values, vals)
-	}
-
-	s.mu.Lock()
-	if s.esqlAsyncQueries == nil {
-		s.esqlAsyncQueries = make(map[string]map[string]any)
-	}
-	queryID := fmt.Sprintf("esql-query-%d", len(s.esqlAsyncQueries)+1)
-	respObj := map[string]any{
-		"id":         queryID,
-		"is_running": false,
-		"is_partial": false,
-		"columns":    columns,
-		"values":     values,
-	}
-	s.esqlAsyncQueries[queryID] = respObj
-	s.mu.Unlock()
-
-	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
-	if format == "" {
-		if fStr, ok := body["format"].(string); ok {
-			format = strings.ToLower(strings.TrimSpace(fStr))
-		}
-	}
-	if format == "csv" || format == "tsv" || format == "txt" {
-		sep := ","
-		switch format {
-		case "tsv":
-			sep = "\t"
-		case "txt":
-			sep = " | "
-		}
-		var b strings.Builder
-		b.WriteString(strings.Join(colOrder, sep) + "\n")
-		for _, row := range rows {
-			parts := make([]string, 0, len(colOrder))
-			for _, c := range colOrder {
-				if row[c] == nil {
-					parts = append(parts, "")
-				} else {
-					parts = append(parts, fmt.Sprintf("%v", row[c]))
-				}
-			}
-			b.WriteString(strings.Join(parts, sep) + "\n")
-		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(b.String()))
-		return
-	}
-
-	writeJSON(w, http.StatusOK, respObj)
+	s.executeESQLQueryEngine(w, r, body, queryStr)
 }
 
 // handleWatcherQueryWatches implements `POST/GET /_watcher/_query/watches` (Round 54 F8).
@@ -8706,12 +8534,18 @@ func (s *Server) handleMLAPI(w http.ResponseWriter, r *http.Request, segs []stri
 	case "filters":
 		s.handleMLFilters(w, r, segs)
 
+	case "data_frame":
+		s.handleMLDataFrame(w, r, segs)
+
 	default:
 		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
 	}
 }
 
 func (s *Server) handleMLAnomalyDetectors(w http.ResponseWriter, r *http.Request, segs []string) {
+	if s.handleMLAnomalySubRoutes(w, r, segs) {
+		return
+	}
 	if (len(segs) == 3 && segs[2] == "_stats") || (len(segs) == 4 && segs[3] == "_stats") {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
@@ -8731,22 +8565,26 @@ func (s *Server) handleMLAnomalyDetectors(w http.ResponseWriter, r *http.Request
 			if state == "" {
 				state = "closed"
 			}
+			procRecs, _ := toInt64(job["_processed_record_count"])
+			procFields, _ := toInt64(job["_processed_field_count"])
+			inBytes, _ := toInt64(job["_input_bytes"])
+			bucketCnt, _ := toInt64(job["_bucket_count"])
 			statsList = append(statsList, map[string]any{
 				"job_id": id,
 				"state":  state,
 				"data_counts": map[string]any{
 					"job_id":                       id,
-					"processed_record_count":       0,
-					"processed_field_count":        0,
-					"input_bytes":                  0,
-					"input_field_count":            0,
+					"processed_record_count":       procRecs,
+					"processed_field_count":        procFields,
+					"input_bytes":                  inBytes,
+					"input_field_count":            procFields,
 					"invalid_date_count":           0,
 					"missing_field_count":          0,
 					"out_of_order_timestamp_count": 0,
 					"empty_bucket_count":           0,
 					"sparse_bucket_count":          0,
-					"bucket_count":                 0,
-					"input_record_count":           0,
+					"bucket_count":                 bucketCnt,
+					"input_record_count":           procRecs,
 				},
 				"model_size_stats": map[string]any{
 					"job_id":                           id,
@@ -8816,7 +8654,7 @@ func (s *Server) handleMLAnomalyDetectors(w http.ResponseWriter, r *http.Request
 			for k, v := range body {
 				job[k] = v
 			}
-			cp := deepCloneDocMap(job)
+			cp := stripInternalUnderscoreKeys(job)
 			s.mu.Unlock()
 			writeJSON(w, http.StatusOK, cp)
 		case "_flush":
@@ -8864,7 +8702,7 @@ func (s *Server) handleMLAnomalyDetectors(w http.ResponseWriter, r *http.Request
 			s.mlJobs = make(map[string]map[string]any)
 		}
 		s.mlJobs[jobID] = entry
-		cp := deepCloneDocMap(entry)
+		cp := stripInternalUnderscoreKeys(entry)
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, cp)
 
@@ -8875,7 +8713,7 @@ func (s *Server) handleMLAnomalyDetectors(w http.ResponseWriter, r *http.Request
 			if jobID != "" && jobID != "_all" && jobID != "*" && !matchSimpleWildcard(jobID, id) {
 				continue
 			}
-			jobs = append(jobs, deepCloneDocMap(job))
+			jobs = append(jobs, stripInternalUnderscoreKeys(job))
 		}
 		s.mu.RUnlock()
 		if jobID != "" && jobID != "_all" && jobID != "*" && !strings.ContainsAny(jobID, "*?") && len(jobs) == 0 {
@@ -9128,16 +8966,55 @@ func (s *Server) handleMLTrainedModels(w http.ResponseWriter, r *http.Request, s
 			targetID = strings.TrimSpace(segs[2])
 		}
 		s.mu.RLock()
-		var statsList []any
+		resolvedTarget := targetID
+		if realID, ok := s.mlModelAliases[targetID]; ok && realID != "" {
+			resolvedTarget = realID
+		}
+		var modelIDs []string
 		for id := range s.mlTrainedModels {
-			if targetID != "_all" && targetID != "*" && !matchSimpleWildcard(targetID, id) {
+			if resolvedTarget != "_all" && resolvedTarget != "*" && !matchSimpleWildcard(resolvedTarget, id) {
 				continue
 			}
-			statsList = append(statsList, map[string]any{
+			modelIDs = append(modelIDs, id)
+		}
+		sort.Strings(modelIDs)
+		var statsList []any
+		for _, id := range modelIDs {
+			m := s.mlTrainedModels[id]
+			infCnt, _ := toInt64(m["_inference_count"])
+			statObj := map[string]any{
 				"model_id":       id,
 				"pipeline_count": 0,
-				"ingest":         map[string]any{"total": map[string]any{"count": 0}},
-			})
+				"ingest":         map[string]any{"total": map[string]any{"count": infCnt}},
+			}
+			if depID, dep := s.findDeploymentForModelLocked(id); dep != nil {
+				allocs, _ := toInt64(dep["number_of_allocations"])
+				threads, _ := toInt64(dep["threads_per_allocation"])
+				qCap, _ := toInt64(dep["queue_capacity"])
+				depInf, _ := toInt64(dep["inference_count"])
+				startMS, _ := toInt64(dep["start_time"])
+				statObj["deployment_stats"] = map[string]any{
+					"model_id":               id,
+					"deployment_id":          depID,
+					"state":                  "started",
+					"number_of_allocations":  allocs,
+					"threads_per_allocation": threads,
+					"queue_capacity":         qCap,
+					"inference_count":        depInf,
+					"start_time":             startMS,
+					"nodes": []any{
+						map[string]any{
+							"node": map[string]any{
+								"id":   "local-node-1",
+								"name": "doris-es-proxy-node-1",
+							},
+							"routing_state":   map[string]any{"routing_state": "started"},
+							"inference_count": depInf,
+						},
+					},
+				}
+			}
+			statsList = append(statsList, statObj)
 		}
 		s.mu.RUnlock()
 		if targetID != "_all" && targetID != "*" && !strings.ContainsAny(targetID, "*?") && len(statsList) == 0 {
@@ -9159,6 +9036,11 @@ func (s *Server) handleMLTrainedModels(w http.ResponseWriter, r *http.Request, s
 			"count":               len(statsList),
 			"trained_model_stats": statsList,
 		})
+		return
+	}
+
+	if len(segs) >= 4 {
+		s.handleMLTrainedModelSubRoute(w, r, segs)
 		return
 	}
 
@@ -9185,18 +9067,27 @@ func (s *Server) handleMLTrainedModels(w http.ResponseWriter, r *http.Request, s
 			s.mlTrainedModels = make(map[string]map[string]any)
 		}
 		s.mlTrainedModels[modelID] = entry
-		cp := deepCloneDocMap(entry)
+		cp := s.formatTrainedModelConfigLocked(modelID, entry)
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, cp)
 
 	case http.MethodGet, http.MethodHead:
 		s.mu.RLock()
-		var list []any
-		for id, m := range s.mlTrainedModels {
-			if modelID != "" && modelID != "_all" && modelID != "*" && !matchSimpleWildcard(modelID, id) {
+		resolvedID := modelID
+		if realID, ok := s.mlModelAliases[modelID]; ok && realID != "" {
+			resolvedID = realID
+		}
+		var ids []string
+		for id := range s.mlTrainedModels {
+			if resolvedID != "" && resolvedID != "_all" && resolvedID != "*" && !matchSimpleWildcard(resolvedID, id) {
 				continue
 			}
-			list = append(list, deepCloneDocMap(m))
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		var list []any
+		for _, id := range ids {
+			list = append(list, s.formatTrainedModelConfigLocked(id, s.mlTrainedModels[id]))
 		}
 		s.mu.RUnlock()
 		if modelID != "" && modelID != "_all" && modelID != "*" && !strings.ContainsAny(modelID, "*?") && len(list) == 0 {
@@ -9224,14 +9115,42 @@ func (s *Server) handleMLTrainedModels(w http.ResponseWriter, r *http.Request, s
 			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: model_id is missing;")
 			return
 		}
+		force := isTruthyBoolQueryParam(r, "force")
 		s.mu.Lock()
 		_, exists := s.mlTrainedModels[modelID]
-		delete(s.mlTrainedModels, modelID)
-		s.mu.Unlock()
 		if !exists {
+			s.mu.Unlock()
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("No trained models matched [%s]", modelID))
 			return
 		}
+		if !force {
+			if depID, dep := s.findDeploymentForModelLocked(modelID); dep != nil {
+				s.mu.Unlock()
+				writeESError(w, http.StatusConflict, "status_exception",
+					fmt.Sprintf("Cannot delete trained model [%s] as it is referenced by active deployment [%s]; stop deployment or set force=true", modelID, depID))
+				return
+			}
+			for alias, target := range s.mlModelAliases {
+				if target == modelID {
+					s.mu.Unlock()
+					writeESError(w, http.StatusConflict, "status_exception",
+						fmt.Sprintf("Cannot delete trained model [%s] as it is referenced by model_alias [%s]; remove alias or set force=true", modelID, alias))
+					return
+				}
+			}
+		}
+		for depID, dep := range s.mlModelDeployments {
+			if mid, _ := dep["model_id"].(string); mid == modelID {
+				delete(s.mlModelDeployments, depID)
+			}
+		}
+		for alias, target := range s.mlModelAliases {
+			if target == modelID {
+				delete(s.mlModelAliases, alias)
+			}
+		}
+		delete(s.mlTrainedModels, modelID)
+		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 
 	default:
@@ -9720,7 +9639,25 @@ func (s *Server) handleCatML(w http.ResponseWriter, r *http.Request, segs []stri
 	}
 	kind := segs[1]
 	idPat := ""
-	if len(segs) >= 3 {
+	if kind == "ml" {
+		if len(segs) >= 4 && segs[2] == "data_frame" && segs[3] == "analytics" {
+			kind = "ml_data_frame_analytics"
+			if len(segs) >= 5 {
+				idPat = strings.TrimSpace(segs[4])
+			}
+		} else if len(segs) >= 3 {
+			switch segs[2] {
+			case "anomaly_detectors", "jobs", "datafeeds", "trained_models", "data_frame_analytics":
+				kind = "ml_" + segs[2]
+				if len(segs) >= 4 {
+					idPat = strings.TrimSpace(segs[3])
+				}
+			default:
+				writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "no handler found for uri ["+r.URL.Path+"]")
+				return
+			}
+		}
+	} else if len(segs) >= 3 {
 		idPat = strings.TrimSpace(segs[2])
 	}
 	if r.Method == http.MethodHead {
@@ -9804,8 +9741,54 @@ func (s *Server) handleCatML(w http.ResponseWriter, r *http.Request, segs []stri
 		s.mu.RUnlock()
 		writeCatResponse(w, r, []string{"id", "model_type", "create_time", "version"}, rows)
 	default:
+		var ids []string
+		for id := range s.mlDataFrameAnalytics {
+			if idPat != "" && idPat != "_all" && idPat != "*" && !matchMultiWildcardWithExclusions(idPat, id) {
+				continue
+			}
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		rows := make([]map[string]any, 0, len(ids))
+		for _, id := range ids {
+			job := s.mlDataFrameAnalytics[id]
+			anType := "outlier_detection"
+			if anMap, ok := job["analysis"].(map[string]any); ok {
+				for _, k := range []string{"outlier_detection", "regression", "classification"} {
+					if _, exists := anMap[k]; exists {
+						anType = k
+						break
+					}
+				}
+			}
+			state, _ := job["_state"].(string)
+			if state == "" {
+				state = "stopped"
+			}
+			desc, _ := job["description"].(string)
+			ctStr := "2026-01-01T00:00:00.000Z"
+			if ctMS, ok := toInt64(job["create_time"]); ok && ctMS > 0 {
+				ctStr = time.UnixMilli(ctMS).UTC().Format("2006-01-02T15:04:05.000Z")
+			}
+			progStr := "start:0%"
+			if state == "started" || state == "stopped" {
+				if recs, ok := toInt64(job["_docs_processed"]); ok && recs > 0 {
+					progStr = "finalize:100%"
+				}
+			}
+			rows = append(rows, map[string]any{
+				"id":                     id,
+				"type":                   anType,
+				"create_time":            ctStr,
+				"state":                  state,
+				"failure_reason":         "",
+				"progress":               progStr,
+				"assignment_explanation": "",
+				"description":            desc,
+			})
+		}
 		s.mu.RUnlock()
-		writeCatResponse(w, r, []string{"id", "state", "progress", "create_time"}, []map[string]any{})
+		writeCatResponse(w, r, []string{"id", "type", "create_time", "state", "failure_reason", "progress", "assignment_explanation", "description"}, rows)
 	}
 }
 
