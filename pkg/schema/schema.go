@@ -825,6 +825,30 @@ func validateSingleFieldProperty(fullPath, fType string, prop esast.FieldPropert
 	if fType != "" && !knownESFieldTypes[fType] {
 		return fmt.Errorf("mapper_parsing_exception: No handler for type [%s] declared on field [%s]", prop.Type, fullPath)
 	}
+	if fType == "alias" {
+		if len(prop.Properties) > 0 || len(prop.Fields) > 0 {
+			return fmt.Errorf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters (cannot have sub-properties or multi-fields)", fullPath)
+		}
+		if prop.CopyTo != nil {
+			return fmt.Errorf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters: [copy_to] is not supported on [alias]", fullPath)
+		}
+		if prop.Dynamic != nil || prop.Subobjects != nil || prop.Enabled != nil ||
+			prop.Index != nil || prop.DocValues != nil || prop.Store != nil ||
+			prop.Value != nil || prop.Script != nil ||
+			prop.Analyzer != "" || prop.SearchAnalyzer != "" || prop.Normalizer != "" ||
+			prop.Format != "" || prop.TimeZone != "" ||
+			prop.Dims != 0 || prop.Dimension != 0 || prop.Similarity != "" ||
+			prop.MultiValued || prop.UpgradedArray ||
+			prop.NullValue != nil || prop.IgnoreAbove != 0 ||
+			prop.IgnoreMalformed != nil || prop.Coerce != nil || prop.ScalingFactor != 0 ||
+			prop.Meta != nil || prop.IndexPrefixes != nil || prop.IndexPhrases != nil ||
+			prop.IndexOptions != nil || prop.Norms != nil || prop.Boost != nil ||
+			prop.EagerGlobalOrdinals != nil || prop.Fielddata != nil ||
+			prop.SplitQueriesOnWhitespace != nil || prop.EnablePositionIncrements != nil ||
+			prop.Relations != nil {
+			return fmt.Errorf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters", fullPath)
+		}
+	}
 	if prop.Subobjects != nil && fType != "" && fType != "object" {
 		return fmt.Errorf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters: [subobjects : %v]", fullPath, *prop.Subobjects)
 	}
@@ -834,6 +858,13 @@ func validateSingleFieldProperty(fullPath, fType string, prop esast.FieldPropert
 	if fType == "scaled_float" {
 		if prop.ScalingFactor <= 0.0 || math.IsNaN(prop.ScalingFactor) || math.IsInf(prop.ScalingFactor, 0) {
 			return fmt.Errorf("mapper_parsing_exception: [scaling_factor] must be > 0.0 for [scaled_float] field [%s]", fullPath)
+		}
+	} else if prop.ScalingFactor != 0 {
+		if prop.ScalingFactor < 0 || math.IsNaN(prop.ScalingFactor) || math.IsInf(prop.ScalingFactor, 0) {
+			return fmt.Errorf("mapper_parsing_exception: [scaling_factor] must be > 0.0 for field [%s]", fullPath)
+		}
+		if fType != "" {
+			return fmt.Errorf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters: [scaling_factor : %v]", fullPath, prop.ScalingFactor)
 		}
 	}
 	if fType == "constant_keyword" && prop.Value != nil {
@@ -1031,11 +1062,19 @@ func validateDynamicTemplatesSpec(templates []map[string]any) error {
 					return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] has unknown parameter [%s]", tmplName, k)
 				}
 			}
+			mmtFirst := ""
+			mmtIsObjectOrWildcard := false
 			if rawMMT, hasMMT := defMap["match_mapping_type"]; hasMMT && rawMMT != nil {
 				validateMMT := func(s string) error {
 					norm := strings.ToLower(strings.TrimSpace(s))
 					if !validDynamicMatchMappingTypes[norm] {
 						return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] has invalid [match_mapping_type] [%s]", tmplName, s)
+					}
+					if mmtFirst == "" {
+						mmtFirst = norm
+					}
+					if norm == "object" || norm == "*" {
+						mmtIsObjectOrWildcard = true
 					}
 					return nil
 				}
@@ -1084,13 +1123,13 @@ func validateDynamicTemplatesSpec(templates []map[string]any) error {
 					return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] has invalid [match_pattern] [%s]", tmplName, mpStr)
 				}
 			}
-			if isRegex {
-				for _, patKey := range []string{"match", "unmatch"} {
-					if rawPat, hasPat := defMap[patKey]; hasPat && rawPat != nil {
-						patStr, ok := rawPat.(string)
-						if !ok {
-							return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] [%s] must be a string", tmplName, patKey)
-						}
+			for _, patKey := range []string{"match", "unmatch", "path_match", "path_unmatch"} {
+				if rawPat, hasPat := defMap[patKey]; hasPat && rawPat != nil {
+					patStr, ok := rawPat.(string)
+					if !ok {
+						return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] [%s] must be a string", tmplName, patKey)
+					}
+					if isRegex {
 						if _, err := regexp.Compile(patStr); err != nil {
 							return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] has invalid regex in [%s]: %w", tmplName, patKey, err)
 						}
@@ -1102,26 +1141,50 @@ func validateDynamicTemplatesSpec(templates []map[string]any) error {
 			if !hasMapping || !ok {
 				return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] requires a [mapping] object", tmplName)
 			}
-			if rawType, hasType := mappingMap["type"]; hasType && rawType != nil {
+			repType := "keyword"
+			switch mmtFirst {
+			case "double":
+				repType = "double"
+			case "long":
+				repType = "long"
+			case "boolean":
+				repType = "boolean"
+			case "date":
+				repType = "date"
+			case "object":
+				repType = "object"
+			case "binary":
+				repType = "binary"
+			}
+			clonedMapping := make(map[string]any, len(mappingMap))
+			for mk, mv := range mappingMap {
+				clonedMapping[mk] = mv
+			}
+			rawType, hasType := clonedMapping["type"]
+			if hasType && rawType != nil {
 				typeStr, ok := rawType.(string)
 				if !ok || strings.TrimSpace(typeStr) == "" {
 					return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] [mapping.type] must be a non-empty string", tmplName)
 				}
-				if strings.TrimSpace(typeStr) != "{dynamic_type}" {
-					b, err := json.Marshal(mappingMap)
-					if err != nil {
-						return err
-					}
-					var fp esast.FieldProperty
-					if err := json.Unmarshal(b, &fp); err != nil {
-						return err
-					}
-					// Replace `{name}` / `{dynamic_type}` placeholders in copy_to before single-field validation
-					substituteDynamicTemplatePlaceholders(&fp, tmplName, "keyword")
-					if err := validateSingleFieldProperty(tmplName, strings.ToLower(strings.TrimSpace(fp.Type)), fp); err != nil {
-						return err
-					}
+				if strings.TrimSpace(typeStr) == "{dynamic_type}" {
+					clonedMapping["type"] = repType
 				}
+			} else if clonedMapping["properties"] == nil && !mmtIsObjectOrWildcard {
+				return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] [mapping] requires a [type]", tmplName)
+			}
+			b, err := json.Marshal(clonedMapping)
+			if err != nil {
+				return fmt.Errorf("mapper_parsing_exception: invalid mapping in dynamic template [%s]: %w", tmplName, err)
+			}
+			var fp esast.FieldProperty
+			dec := json.NewDecoder(bytes.NewReader(b))
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&fp); err != nil {
+				return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] has unsupported or invalid mapping parameter: %w", tmplName, err)
+			}
+			substituteDynamicTemplatePlaceholders(&fp, tmplName, repType)
+			if err := validateSingleFieldProperty(tmplName, strings.ToLower(strings.TrimSpace(fp.Type)), fp); err != nil {
+				return err
 			}
 		}
 	}
@@ -1169,6 +1232,9 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 		return nil
 	}
 	allTypes := make(map[string]string)
+	for rtName, rtProp := range m.Runtime {
+		allTypes[rtName] = strings.ToLower(strings.TrimSpace(rtProp.Type))
+	}
 	aliasTargets := make(map[string]string)
 	aliasPrefixes := make(map[string]string)
 	type copyToRef struct {
@@ -1423,13 +1489,43 @@ func validatePropertiesCompatibility(oldProps, newProps map[string]esast.FieldPr
 			(newProp.DocValues != nil && oldProp.DocValues == nil && !*newProp.DocValues) {
 			return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: cannot update parameter [doc_values]", fullPath)
 		}
+		if oldType == "constant_keyword" && newProp.Value != nil {
+			if oldProp.Value == nil || fmt.Sprintf("%v", oldProp.Value) != fmt.Sprintf("%v", newProp.Value) {
+				return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: Cannot update parameter [value]", fullPath)
+			}
+		}
+		if newProp.Store != nil {
+			oldStore := oldProp.Store != nil && *oldProp.Store
+			if *newProp.Store != oldStore {
+				return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: Cannot update parameter [store]", fullPath)
+			}
+		}
+		if newProp.Format != "" && (oldType == "date" || oldType == "date_nanos" || oldType == "date_range") {
+			oldFormat := oldProp.Format
+			if oldFormat == "" {
+				if oldType == "date_nanos" {
+					oldFormat = "strict_date_optional_time_nanos||epoch_millis"
+				} else {
+					oldFormat = "strict_date_optional_time||epoch_millis"
+				}
+			}
+			if newProp.Format != oldFormat {
+				return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: Cannot update parameter [format]", fullPath)
+			}
+		}
 		oldDims := oldProp.EffectiveDims()
 		newDims := newProp.EffectiveDims()
 		if oldDims > 0 && newDims > 0 && oldDims != newDims {
 			return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: cannot update parameter [dims] from [%d] to [%d] for field [%s]", fullPath, oldDims, newDims, fullPath)
 		}
-		if newProp.Similarity != "" && oldProp.Similarity != "" && !strings.EqualFold(newProp.Similarity, oldProp.Similarity) {
-			return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: cannot update parameter [similarity] from [%s] to [%s]", fullPath, oldProp.Similarity, newProp.Similarity)
+		if newProp.Similarity != "" {
+			oldSim := oldProp.Similarity
+			if oldSim == "" && (oldType == "dense_vector" || oldType == "knn_vector") {
+				oldSim = "cosine"
+			}
+			if oldSim != "" && !strings.EqualFold(newProp.Similarity, oldSim) {
+				return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: Cannot update parameter [similarity] from [%s] to [%s]", fullPath, oldSim, newProp.Similarity)
+			}
 		}
 		if len(oldProp.Fields) > 0 && len(newProp.Fields) > 0 {
 			if err := validatePropertiesCompatibility(oldProp.Fields, newProp.Fields, fullPath); err != nil {
@@ -1584,7 +1680,28 @@ func DeepMergeMappingProperties(
 				merged.IndexPhrases = v.IndexPhrases
 			}
 			if v.Store != nil {
-				merged.Store = v.Store
+				b := *v.Store
+				merged.Store = &b
+			}
+			if v.Value != nil {
+				merged.Value = v.Value
+			}
+			if v.IndexOptions != nil {
+				merged.IndexOptions = v.IndexOptions
+			}
+			if v.Norms != nil {
+				b := *v.Norms
+				merged.Norms = &b
+			}
+			if v.Boost != nil {
+				merged.Boost = v.Boost
+			}
+			if v.EagerGlobalOrdinals != nil {
+				b := *v.EagerGlobalOrdinals
+				merged.EagerGlobalOrdinals = &b
+			}
+			if v.Fielddata != nil {
+				merged.Fielddata = v.Fielddata
 			}
 			if v.TimeZone != "" {
 				merged.TimeZone = v.TimeZone
@@ -1607,6 +1724,10 @@ func DeepMergeMappingProperties(
 			out[k] = merged
 		} else {
 			copied := v
+			if v.Store != nil {
+				b := *v.Store
+				copied.Store = &b
+			}
 			if len(v.Properties) > 0 {
 				copied.Properties = DeepMergeMappingProperties(nil, v.Properties)
 			}

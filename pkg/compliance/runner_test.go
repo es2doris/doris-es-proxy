@@ -1,6 +1,8 @@
 package compliance
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -1163,6 +1165,7 @@ func TestRound52F1Features(t *testing.T) {
 
 	doMap := NewOrderedMap()
 	doMap.Set("warning_headers", []any{`299 Elasticsearch-7.10.2 "first warning"`})
+	doMap.Set("allowed_warnings", []any{"second warning"})
 	doMap.Set("search", searchParams)
 
 	if err := ctx.execDo(doMap, false); err != nil {
@@ -3378,5 +3381,798 @@ func TestRound56_RunnerFeaturesArbitraryKeyBracedStashVersionCatchAndEscaping(t 
 	matchDotted.Set(`dotted\.key`, "dval")
 	if err := ctx.execMatch(matchDotted); err != nil {
 		t.Fatalf("execMatch dotted fallback failed: %v", err)
+	}
+}
+
+func TestRound57_ActionBuildersAndCleanup(t *testing.T) {
+	t.Parallel()
+	ctx := newRunnerContext(http.DefaultClient, "http://localhost:9200")
+
+	cases := []struct {
+		name         string
+		action       string
+		params       map[string]any
+		wantMethod   string
+		wantPath     string
+		wantStripped []string
+		wantQuery    map[string]string
+	}{
+		// 1. Inference Streaming & Task-Typed Actions (6)
+		{"inference.stream with task_type", "inference.stream", map[string]any{"task_type": "completion", "inference_id": "inf-1", "body": map[string]any{"input": "hi"}}, http.MethodPost, "/_inference/completion/inf-1/_stream", []string{"task_type", "inference_id"}, nil},
+		{"inference.stream without task_type", "inference.stream", map[string]any{"model_id": "inf-2", "body": map[string]any{"input": "hi"}}, http.MethodPost, "/_inference/inf-2/_stream", []string{"model_id"}, nil},
+		{"inference.text_embedding", "inference.text_embedding", map[string]any{"inference_id": "emb-1", "body": map[string]any{"input": "hello"}}, http.MethodPost, "/_inference/text_embedding/emb-1", []string{"inference_id"}, nil},
+		{"inference.sparse_embedding", "inference.sparse_embedding", map[string]any{"model_id": "sparse-1", "body": map[string]any{"input": "hello"}}, http.MethodPost, "/_inference/sparse_embedding/sparse-1", []string{"model_id"}, nil},
+		{"inference.completion", "inference.completion", map[string]any{"id": "comp-1", "body": map[string]any{"input": "hello"}}, http.MethodPost, "/_inference/completion/comp-1", []string{"id"}, nil},
+		{"inference.rerank", "inference.rerank", map[string]any{"inference_id": "rerank-1", "body": map[string]any{"query": "q"}}, http.MethodPost, "/_inference/rerank/rerank-1", []string{"inference_id"}, nil},
+		{"inference.chat_completion", "inference.chat_completion", map[string]any{"inference_id": "chat-1", "body": map[string]any{"messages": []any{}}}, http.MethodPost, "/_inference/chat_completion/chat-1", []string{"inference_id"}, nil},
+
+		// 2. Connectors & Sync Jobs Sub-Actions (6)
+		{"connector.update_index_name", "connector.update_index_name", map[string]any{"connector_id": "c-1", "body": map[string]any{"index_name": "idx"}}, http.MethodPut, "/_connector/c-1/_index_name", []string{"connector_id"}, nil},
+		{"connector.update_scheduling", "connector.update_scheduling", map[string]any{"connector_id": "c-1", "body": map[string]any{}}, http.MethodPut, "/_connector/c-1/_scheduling", []string{"connector_id"}, nil},
+		{"connector.update_custom_scheduling", "connector.update_custom_scheduling", map[string]any{"id": "c-2", "body": map[string]any{}}, http.MethodPut, "/_connector/c-2/_custom_scheduling", []string{"id"}, nil},
+		{"connector.update_api_key_id", "connector.update_api_key_id", map[string]any{"connector_id": "c-1", "body": map[string]any{"api_key_id": "k1"}}, http.MethodPut, "/_connector/c-1/_api_key_id", []string{"connector_id"}, nil},
+		{"connector.update_active_filtering", "connector.update_active_filtering", map[string]any{"connector_id": "c-1", "filtering_validation_state": "valid", "body": map[string]any{}}, http.MethodPost, "/_connector/c-1/_filtering/valid", []string{"connector_id", "filtering_validation_state"}, nil},
+		{"connector.sync_job_claim", "connector.sync_job_claim", map[string]any{"body": map[string]any{"job_types": []any{"full"}}}, http.MethodPost, "/_connector/_sync_job/_claim", nil, nil},
+
+		// 3. Search Application Canonical Behavioral Analytics (4)
+		{"search_application.put_behavioral_analytics", "search_application.put_behavioral_analytics", map[string]any{"collection_name": "coll-1"}, http.MethodPut, "/_application/analytics/coll-1", []string{"collection_name"}, nil},
+		{"search_application.get_behavioral_analytics all", "search_application.get_behavioral_analytics", map[string]any{}, http.MethodGet, "/_application/analytics", nil, nil},
+		{"search_application.get_behavioral_analytics one", "search_application.get_behavioral_analytics", map[string]any{"collection_name": "coll-1"}, http.MethodGet, "/_application/analytics/coll-1", []string{"collection_name"}, nil},
+		{"search_application.delete_behavioral_analytics", "search_application.delete_behavioral_analytics", map[string]any{"collection_name": "coll-1"}, http.MethodDelete, "/_application/analytics/coll-1", []string{"collection_name"}, nil},
+		{"search_application.post_behavioral_analytics_event", "search_application.post_behavioral_analytics_event", map[string]any{"collection_name": "coll-1", "event_type": "page_view", "debug": true}, http.MethodPost, "/_application/analytics/coll-1/event/page_view", []string{"collection_name", "event_type"}, map[string]string{"debug": "true"}},
+
+		// 4. Fleet Secrets (3)
+		{"fleet.post_secret", "fleet.post_secret", map[string]any{"body": map[string]any{"value": "s3cr3t"}}, http.MethodPost, "/_fleet/secrets", nil, nil},
+		{"fleet.get_secret", "fleet.get_secret", map[string]any{"id": "sec-1"}, http.MethodGet, "/_fleet/secrets/sec-1", []string{"id"}, nil},
+		{"fleet.delete_secret", "fleet.delete_secret", map[string]any{"id": "sec-1"}, http.MethodDelete, "/_fleet/secrets/sec-1", []string{"id"}, nil},
+
+		// 5. Security API Key Update, Query DSL, Privileges, Cache, OIDC, SAML & PKI/SSL (18)
+		{"security.put_api_key", "security.put_api_key", map[string]any{"id": "ak-9", "body": map[string]any{}}, http.MethodPut, "/_security/api_key/ak-9", []string{"id"}, nil},
+		{"security.bulk_update_api_keys", "security.bulk_update_api_keys", map[string]any{"body": map[string]any{"ids": []any{"ak-9"}}}, http.MethodPost, "/_security/api_key/_bulk_update", nil, nil},
+		{"security.query_user", "security.query_user", map[string]any{"body": map[string]any{}}, http.MethodPost, "/_security/_query/user", nil, nil},
+		{"security.query_role", "security.query_role", map[string]any{"body": map[string]any{}}, http.MethodPost, "/_security/_query/role", nil, nil},
+		{"security.get_user_privileges", "security.get_user_privileges", map[string]any{}, http.MethodGet, "/_security/user/_privileges", nil, nil},
+		{"security.clear_cached_privileges", "security.clear_cached_privileges", map[string]any{"application": "app1,app2"}, http.MethodPost, "/_security/privilege/app1,app2/_clear_cache", []string{"application"}, nil},
+		{"security.clear_cached_service_tokens", "security.clear_cached_service_tokens", map[string]any{"namespace": "elastic", "service": "fleet-server", "token_name": "tok1"}, http.MethodPost, "/_security/service/elastic/fleet-server/credential/token/tok1/_clear_cache", []string{"namespace", "service", "token_name"}, nil},
+		{"security.oidc_prepare_authentication", "security.oidc_prepare_authentication", map[string]any{"body": map[string]any{"realm": "oidc1"}}, http.MethodPost, "/_security/oidc/prepare", nil, nil},
+		{"security.oidc_authenticate", "security.oidc_authenticate", map[string]any{"body": map[string]any{}}, http.MethodPost, "/_security/oidc/authenticate", nil, nil},
+		{"security.oidc_logout", "security.oidc_logout", map[string]any{"body": map[string]any{}}, http.MethodPost, "/_security/oidc/logout", nil, nil},
+		{"security.saml_prepare_authentication", "security.saml_prepare_authentication", map[string]any{"body": map[string]any{}}, http.MethodPost, "/_security/saml/prepare", nil, nil},
+		{"security.saml_authenticate", "security.saml_authenticate", map[string]any{"body": map[string]any{}}, http.MethodPost, "/_security/saml/authenticate", nil, nil},
+		{"security.saml_logout", "security.saml_logout", map[string]any{"body": map[string]any{}}, http.MethodPost, "/_security/saml/logout", nil, nil},
+		{"security.saml_invalidate", "security.saml_invalidate", map[string]any{"body": map[string]any{}}, http.MethodPost, "/_security/saml/invalidate", nil, nil},
+		{"security.saml_complete_logout", "security.saml_complete_logout", map[string]any{"body": map[string]any{}}, http.MethodPost, "/_security/saml/complete_logout", nil, nil},
+		{"security.saml_service_provider_metadata GET", "security.saml_service_provider_metadata", map[string]any{"realm_name": "saml1"}, http.MethodGet, "/_security/saml/metadata", nil, map[string]string{"realm_name": "saml1"}},
+		{"security.saml_service_provider_metadata POST", "security.saml_service_provider_metadata", map[string]any{"body": map[string]any{"realm_name": "saml1"}}, http.MethodPost, "/_security/saml/metadata", nil, nil},
+		{"security.delegate_pki", "security.delegate_pki", map[string]any{"body": map[string]any{}}, http.MethodPost, "/_security/delegate_pki", nil, nil},
+		{"security.get_certificates", "security.get_certificates", map[string]any{}, http.MethodGet, "/_security/ssl/certificates", nil, nil},
+
+		// 6. Machine Learning & Canonical CAT ML (9)
+		{"ml.get_trained_model_vocabulary", "ml.get_trained_model_vocabulary", map[string]any{"model_id": "tm-1"}, http.MethodGet, "/_ml/trained_models/tm-1/vocabulary", []string{"model_id"}, nil},
+		{"ml.clear_trained_model_deployment_cache", "ml.clear_trained_model_deployment_cache", map[string]any{"model_id": "tm-1"}, http.MethodPost, "/_ml/trained_models/tm-1/deployment/_cache/_clear", []string{"model_id"}, nil},
+		{"ml.find_file_structure", "ml.find_file_structure", map[string]any{"lines_to_sample": 100, "body": "a,b\n1,2\n"}, http.MethodPost, "/_ml/find_file_structure", nil, map[string]string{"lines_to_sample": "100"}},
+		{"ml.upgrade_job_snapshot", "ml.upgrade_job_snapshot", map[string]any{"job_id": "j-1", "snapshot_id": "s-1"}, http.MethodPost, "/_ml/anomaly_detectors/j-1/model_snapshots/s-1/_upgrade", []string{"job_id", "snapshot_id"}, nil},
+		{"ml.get_model_snapshot_upgrade_stats", "ml.get_model_snapshot_upgrade_stats", map[string]any{"job_id": "j-1", "snapshot_id": "s-1"}, http.MethodGet, "/_ml/anomaly_detectors/j-1/model_snapshots/s-1/_upgrade/_stats", []string{"job_id", "snapshot_id"}, nil},
+		{"cat.anomaly_detectors", "cat.anomaly_detectors", map[string]any{"job_id": "j-1"}, http.MethodGet, "/_cat/ml_anomaly_detectors/j-1", []string{"job_id"}, nil},
+		{"cat.datafeeds", "cat.datafeeds", map[string]any{"datafeed_id": "df-1"}, http.MethodGet, "/_cat/ml_datafeeds/df-1", []string{"datafeed_id"}, nil},
+		{"cat.trained_models", "cat.trained_models", map[string]any{"model_id": "tm-1"}, http.MethodGet, "/_cat/ml_trained_models/tm-1", []string{"model_id"}, nil},
+		{"cat.data_frame_analytics", "cat.data_frame_analytics", map[string]any{"id": "dfa-1"}, http.MethodGet, "/_cat/ml_data_frame_analytics/dfa-1", []string{"id"}, nil},
+
+		// 7. Capabilities, Simulate Ingest & Script Introspection (4)
+		{"capabilities GET", "capabilities", map[string]any{}, http.MethodGet, "/_capabilities", nil, nil},
+		{"capabilities POST", "capabilities", map[string]any{"body": map[string]any{"method": "GET"}}, http.MethodPost, "/_capabilities", nil, nil},
+		{"simulate.ingest cluster", "simulate.ingest", map[string]any{"body": map[string]any{"docs": []any{}}}, http.MethodPost, "/_ingest/_simulate", nil, nil},
+		{"simulate.ingest index", "simulate.ingest", map[string]any{"index": "my-idx", "body": map[string]any{"docs": []any{}}}, http.MethodPost, "/my-idx/_ingest/_simulate", []string{"index"}, nil},
+		{"get_script_context", "get_script_context", map[string]any{}, http.MethodGet, "/_scripts/_context", nil, nil},
+		{"get_script_languages", "get_script_languages", map[string]any{}, http.MethodGet, "/_scripts/_languages", nil, nil},
+
+		// 8. Snapshot, Logstash, Indices, Rethrottle & Migration (10 + aliases)
+		{"snapshot.repository_analyze", "snapshot.repository_analyze", map[string]any{"repository": "repo-1", "blob_count": 10}, http.MethodPost, "/_snapshot/repo-1/_analyze", []string{"repository"}, map[string]string{"blob_count": "10"}},
+		{"logstash.exists_pipeline", "logstash.exists_pipeline", map[string]any{"id": "pipe-1"}, http.MethodHead, "/_logstash/pipeline/pipe-1", []string{"id"}, nil},
+		{"indices.flush_synced all", "indices.flush_synced", map[string]any{}, http.MethodPost, "/_flush/synced", nil, nil},
+		{"indices.flush_synced index", "indices.flush_synced", map[string]any{"index": "idx-1"}, http.MethodPost, "/idx-1/_flush/synced", []string{"index"}, nil},
+		{"indices.freeze", "indices.freeze", map[string]any{"index": "idx-1"}, http.MethodPost, "/idx-1/_freeze", []string{"index"}, nil},
+		{"indices.unfreeze", "indices.unfreeze", map[string]any{"index": "idx-1"}, http.MethodPost, "/idx-1/_unfreeze", []string{"index"}, nil},
+		{"reindex_rethrottle", "reindex_rethrottle", map[string]any{"task_id": "node1:42", "requests_per_second": 500}, http.MethodPost, "/_reindex/node1:42/_rethrottle", []string{"task_id"}, map[string]string{"requests_per_second": "500"}},
+		{"update_by_query_rethrottle cluster", "update_by_query_rethrottle", map[string]any{"task_id": "node1:43"}, http.MethodPost, "/_update_by_query/node1:43/_rethrottle", []string{"task_id"}, nil},
+		{"indices.update_by_query_rethrottle index", "indices.update_by_query_rethrottle", map[string]any{"index": "idx-1", "task_id": "node1:43"}, http.MethodPost, "/idx-1/_update_by_query/node1:43/_rethrottle", []string{"index", "task_id"}, nil},
+		{"delete_by_query_rethrottle cluster", "delete_by_query_rethrottle", map[string]any{"task_id": "node1:44"}, http.MethodPost, "/_delete_by_query/node1:44/_rethrottle", []string{"task_id"}, nil},
+		{"indices.delete_by_query_rethrottle index", "indices.delete_by_query_rethrottle", map[string]any{"index": "idx-1", "task_id": "node1:44"}, http.MethodPost, "/idx-1/_delete_by_query/node1:44/_rethrottle", []string{"index", "task_id"}, nil},
+		{"migration.get_feature_upgrade_status", "migration.get_feature_upgrade_status", map[string]any{}, http.MethodGet, "/_migration/system_features", nil, nil},
+		{"migration.post_feature_upgrade", "migration.post_feature_upgrade", map[string]any{}, http.MethodPost, "/_migration/system_features", nil, nil},
+
+		// 9. Fixed 3 Existing Action Path Builders
+		{"searchable_snapshots.clear_cache cluster", "searchable_snapshots.clear_cache", map[string]any{}, http.MethodPost, "/_searchable_snapshots/cache/clear", nil, nil},
+		{"searchable_snapshots.clear_cache index", "searchable_snapshots.clear_cache", map[string]any{"index": "mounted-1"}, http.MethodPost, "/mounted-1/_searchable_snapshots/cache/clear", []string{"index"}, nil},
+		{"cluster.stats cluster", "cluster.stats", map[string]any{}, http.MethodGet, "/_cluster/stats", nil, nil},
+		{"cluster.stats nodes", "cluster.stats", map[string]any{"node_id": "n1,n2"}, http.MethodGet, "/_cluster/stats/nodes/n1,n2", []string{"node_id"}, nil},
+		{"ml.delete_expired_data _all DELETE", "ml.delete_expired_data", map[string]any{"job_id": "_all"}, http.MethodDelete, "/_ml/_delete_expired_data", []string{"job_id"}, nil},
+		{"ml.delete_expired_data _all POST body", "ml.delete_expired_data", map[string]any{"job_id": "_all", "body": map[string]any{"requests_per_second": 100}}, http.MethodPost, "/_ml/_delete_expired_data", []string{"job_id"}, nil},
+		{"ml.delete_expired_data body without job_id", "ml.delete_expired_data", map[string]any{"body": map[string]any{"requests_per_second": 50}}, http.MethodPost, "/_ml/_delete_expired_data", nil, nil},
+		{"ml.delete_expired_data query without job_id", "ml.delete_expired_data", map[string]any{"timeout": "10s"}, http.MethodDelete, "/_ml/_delete_expired_data", nil, map[string]string{"timeout": "10s"}},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := ctx.buildActionRequest(tc.action, tc.params)
+			if err != nil {
+				t.Fatalf("buildActionRequest(%q) failed: %v", tc.action, err)
+			}
+			if req.method != tc.wantMethod {
+				t.Errorf("%s method = %s, want %s", tc.action, req.method, tc.wantMethod)
+			}
+			if req.path != tc.wantPath {
+				t.Errorf("%s path = %s, want %s", tc.action, req.path, tc.wantPath)
+			}
+			for _, stripped := range tc.wantStripped {
+				if req.query.Has(stripped) {
+					t.Errorf("%s query still contains path param %q: %v", tc.action, stripped, req.query)
+				}
+			}
+			for qk, qv := range tc.wantQuery {
+				if got := req.query.Get(qk); got != qv {
+					t.Errorf("%s query[%q] = %q, want %q", tc.action, qk, got, qv)
+				}
+			}
+		})
+	}
+
+	// Verify missing required parameter errors on new actions
+	missingParamActions := []string{
+		"inference.stream",
+		"inference.text_embedding",
+		"inference.sparse_embedding",
+		"inference.completion",
+		"inference.rerank",
+		"inference.chat_completion",
+		"connector.update_index_name",
+		"connector.update_scheduling",
+		"connector.update_custom_scheduling",
+		"connector.update_api_key_id",
+		"connector.update_active_filtering",
+		"search_application.put_behavioral_analytics",
+		"search_application.delete_behavioral_analytics",
+		"search_application.post_behavioral_analytics_event",
+		"fleet.get_secret",
+		"fleet.delete_secret",
+		"security.put_api_key",
+		"security.clear_cached_privileges",
+		"security.clear_cached_service_tokens",
+		"ml.get_trained_model_vocabulary",
+		"ml.clear_trained_model_deployment_cache",
+		"ml.upgrade_job_snapshot",
+		"ml.get_model_snapshot_upgrade_stats",
+		"snapshot.repository_analyze",
+		"logstash.exists_pipeline",
+		"indices.freeze",
+		"indices.unfreeze",
+		"reindex_rethrottle",
+		"update_by_query_rethrottle",
+		"indices.update_by_query_rethrottle",
+		"delete_by_query_rethrottle",
+		"indices.delete_by_query_rethrottle",
+	}
+	for _, act := range missingParamActions {
+		if _, err := ctx.buildActionRequest(act, map[string]any{}); err == nil {
+			t.Errorf("expected error for %s with empty params", act)
+		}
+	}
+
+	// Verify 2xx-gated resource tracking & top-down dependency-ordered cleanupAll
+	type recordedCall struct {
+		method string
+		path   string
+		query  string
+		body   string
+	}
+	var mu sync.Mutex
+	var calls []recordedCall
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		calls = append(calls, recordedCall{
+			method: r.Method,
+			path:   r.URL.Path,
+			query:  r.URL.RawQuery,
+			body:   string(bodyBytes),
+		})
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "fail-bad-idx") {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"type":"illegal_argument_exception","reason":"invalid index"},"status":400}`))
+			return
+		}
+		switch r.URL.Path {
+		case "/_connector":
+			if r.Method == http.MethodPost {
+				_, _ = w.Write([]byte(`{"id":"conn-from-id"}`))
+				return
+			}
+		case "/_fleet/secrets":
+			if r.Method == http.MethodPost {
+				_, _ = w.Write([]byte(`{"id":"fleet-sec-1"}`))
+				return
+			}
+		case "/_query/async":
+			if r.Method == http.MethodPost {
+				_, _ = w.Write([]byte(`{"id":"esql-async-1","is_running":true}`))
+				return
+			}
+		case "/_eql/search":
+			if r.Method == http.MethodPost {
+				_, _ = w.Write([]byte(`{"id":"eql-async-1","is_running":true}`))
+				return
+			}
+		case "/_slm/policy/slm-pol-1/_execute":
+			_, _ = w.Write([]byte(`{"snapshot_name":"slm-snap-0001"}`))
+			return
+		case "/_snapshot/repo-main/snap-1/_restore":
+			_, _ = w.Write([]byte(`{"snapshot":{"snapshot":"snap-1","indices":["restored-resp-idx"]}}`))
+			return
+		case "/_snapshot/repo-main/snap-1/_mount":
+			_, _ = w.Write([]byte(`{"snapshot":{"snapshot":"snap-1","indices":["mounted-resp-idx"]}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"acknowledged":true}`))
+	}))
+	defer ts.Close()
+
+	cleanCtx := newRunnerContext(ts.Client(), ts.URL)
+
+	// Negative 400 step with catch: bad_request MUST NOT track resources
+	negStep := &OrderedMap{
+		Fields: []YAMLField{
+			{Key: "catch", Value: "bad_request"},
+			{Key: "indices.create", Value: map[string]any{"index": "fail-bad-idx"}},
+		},
+	}
+	if err := cleanCtx.execDo(negStep, false); err != nil {
+		t.Fatalf("expected caught 400 step to succeed, got: %v", err)
+	}
+	if cleanCtx.createdIndices["fail-bad-idx"] {
+		t.Fatalf("expected 400 response NOT to record fail-bad-idx in createdIndices")
+	}
+
+	setupActions := []struct {
+		action string
+		params map[string]any
+	}{
+		{"synonyms.put_synonym", map[string]any{"id": "syn-1", "body": map[string]any{}}},
+		{"query_rules.put_ruleset", map[string]any{"ruleset_id": "qr-1", "body": map[string]any{}}},
+		{"indices.create", map[string]any{"index": "src-idx"}},
+		{"ccr.follow", map[string]any{"index": "ccr-follower-idx", "body": map[string]any{}}},
+		{"enrich.put_policy", map[string]any{"name": "enr-pol-1", "body": map[string]any{}}},
+		{"transform.put_transform", map[string]any{"transform_id": "tr-1", "body": map[string]any{}}},
+		{"rollup.put_job", map[string]any{"id": "ru-1", "body": map[string]any{"rollup_index": "ru-idx"}}},
+		{"connector.post", map[string]any{"body": map[string]any{"name": "my-conn"}}},
+		{"search_application.put_behavioral_analytics", map[string]any{"collection_name": "ba-coll-1"}},
+		{"fleet.post_secret", map[string]any{"body": map[string]any{"value": "topsecret"}}},
+		{"esql.async_query", map[string]any{"body": map[string]any{"query": "FROM src-idx"}}},
+		{"eql.search", map[string]any{"body": map[string]any{"query": "any where true"}}},
+		{"snapshot.create_repository", map[string]any{"repository": "repo-main", "body": map[string]any{"type": "fs"}}},
+		{"snapshot.create", map[string]any{"repository": "repo-main", "snapshot": "snap-1"}},
+		{"snapshot.clone", map[string]any{"repository": "repo-main", "snapshot": "snap-1", "target_snapshot": "snap-1-clone"}},
+		{"slm.put_lifecycle", map[string]any{"policy_id": "slm-pol-1", "body": map[string]any{"repository": "repo-main"}}},
+		{"slm.execute_lifecycle", map[string]any{"policy_id": "slm-pol-1"}},
+		{"snapshot.restore", map[string]any{
+			"repository": "repo-main",
+			"snapshot":   "snap-1",
+			"body": map[string]any{
+				"indices":            "orig_logs",
+				"rename_pattern":     "orig_(.+)",
+				"rename_replacement": "restored_$1",
+			},
+		}},
+		{"searchable_snapshots.mount", map[string]any{"repository": "repo-main", "snapshot": "snap-1"}},
+		{"watcher.update_settings", map[string]any{"body": map[string]any{"index.auto_reload": true}}},
+		{"cluster.put_settings", map[string]any{
+			"body": map[string]any{
+				"persistent": map[string]any{"cluster": map[string]any{"max_shards_per_node": 2000}},
+				"transient":  map[string]any{"indices.recovery.max_bytes_per_sec": "50mb"},
+			},
+		}},
+	}
+
+	for _, sa := range setupActions {
+		step := &OrderedMap{
+			Fields: []YAMLField{{Key: sa.action, Value: sa.params}},
+		}
+		if err := cleanCtx.execDo(step, false); err != nil {
+			t.Fatalf("execDo(%s) failed: %v", sa.action, err)
+		}
+	}
+
+	mu.Lock()
+	calls = nil
+	mu.Unlock()
+
+	cleanCtx.cleanupAll()
+
+	mu.Lock()
+	recorded := append([]recordedCall(nil), calls...)
+	mu.Unlock()
+
+	indexOfCall := func(method, path string) int {
+		for i, rc := range recorded {
+			if rc.method == method && rc.path == path {
+				return i
+			}
+		}
+		return -1
+	}
+
+	// 1. Transform stop before transform delete, and transform/rollup/enrich/CCR before index deletion
+	trStop := indexOfCall(http.MethodPost, "/_transform/tr-1/_stop")
+	trDel := indexOfCall(http.MethodDelete, "/_transform/tr-1")
+	ruStop := indexOfCall(http.MethodPost, "/_rollup/job/ru-1/_stop")
+	ruDel := indexOfCall(http.MethodDelete, "/_rollup/job/ru-1")
+	ccrPause := indexOfCall(http.MethodPost, "/ccr-follower-idx/_ccr/pause_follow")
+	ccrUnfollow := indexOfCall(http.MethodPost, "/ccr-follower-idx/_ccr/unfollow")
+	enrDel := indexOfCall(http.MethodDelete, "/_enrich/policy/enr-pol-1")
+	srcIdxDel := indexOfCall(http.MethodDelete, "/src-idx")
+	ccrIdxDel := indexOfCall(http.MethodDelete, "/ccr-follower-idx")
+	synDel := indexOfCall(http.MethodDelete, "/_synonyms/syn-1")
+	qrDel := indexOfCall(http.MethodDelete, "/_query_rules/qr-1")
+
+	if trStop < 0 || trDel < 0 || trStop >= trDel {
+		t.Fatalf("expected transform _stop before delete: stop=%d del=%d", trStop, trDel)
+	}
+	if trDel >= srcIdxDel || ruStop < 0 || ruDel >= srcIdxDel || enrDel < 0 || enrDel >= srcIdxDel {
+		t.Fatalf("expected transform (%d), rollup (%d), and enrich (%d) deleted before index (%d)", trDel, ruDel, enrDel, srcIdxDel)
+	}
+	if ccrPause < 0 || ccrUnfollow < 0 || ccrPause >= ccrUnfollow || ccrUnfollow >= ccrIdxDel {
+		t.Fatalf("expected CCR pause (%d) -> unfollow (%d) -> index delete (%d)", ccrPause, ccrUnfollow, ccrIdxDel)
+	}
+	if srcIdxDel >= synDel || srcIdxDel >= qrDel {
+		t.Fatalf("expected index delete (%d) strictly before synonym (%d) and query ruleset (%d) delete", srcIdxDel, synDel, qrDel)
+	}
+
+	// 2. Snapshots (create, clone, slm execute) deleted strictly before repository delete
+	snap1Del := indexOfCall(http.MethodDelete, "/_snapshot/repo-main/snap-1")
+	snapCloneDel := indexOfCall(http.MethodDelete, "/_snapshot/repo-main/snap-1-clone")
+	slmSnapDel := indexOfCall(http.MethodDelete, "/_snapshot/repo-main/slm-snap-0001")
+	repoDel := indexOfCall(http.MethodDelete, "/_snapshot/repo-main")
+	if snap1Del < 0 || snapCloneDel < 0 || slmSnapDel < 0 || repoDel < 0 {
+		t.Fatalf("missing snapshot/repo teardown calls: snap1=%d clone=%d slm=%d repo=%d", snap1Del, snapCloneDel, slmSnapDel, repoDel)
+	}
+	if snap1Del >= repoDel || snapCloneDel >= repoDel || slmSnapDel >= repoDel {
+		t.Fatalf("expected all snapshots (%d, %d, %d) deleted before repository (%d)", snap1Del, snapCloneDel, slmSnapDel, repoDel)
+	}
+
+	// 3. Restored/mounted indices, connector.post id, behavioral analytics, Fleet secret, ESQL/EQL async, and settings resets
+	for _, wantDel := range []string{
+		"/restored-resp-idx",
+		"/restored_logs",
+		"/mounted-resp-idx",
+		"/_connector/conn-from-id",
+		"/_application/analytics/ba-coll-1",
+		"/_fleet/secrets/fleet-sec-1",
+		"/_query/async/esql-async-1",
+		"/_eql/search/eql-async-1",
+	} {
+		if indexOfCall(http.MethodDelete, wantDel) < 0 {
+			t.Errorf("expected DELETE %s during cleanupAll, got calls=%+v", wantDel, recorded)
+		}
+	}
+	if indexOfCall(http.MethodPut, "/_watcher/settings") < 0 {
+		t.Errorf("expected PUT /_watcher/settings reset during cleanupAll")
+	}
+	csIdx := indexOfCall(http.MethodPut, "/_cluster/settings")
+	if csIdx < 0 || !strings.Contains(recorded[csIdx].body, `"cluster.max_shards_per_node":null`) || !strings.Contains(recorded[csIdx].body, `"indices.recovery.max_bytes_per_sec":null`) {
+		t.Errorf("expected PUT /_cluster/settings resetting persistent & transient keys to null, got idx=%d calls=%+v", csIdx, recorded)
+	}
+}
+
+func TestRound57_RunnerWarningsArbitraryKeyStashAndNestedTransforms(t *testing.T) {
+	t.Parallel()
+
+	// 1. RFC-7234 warnings, 1-to-1 multiplicity, allowed_warnings, allowed_warnings_regex, and unexpected warning rejection
+	var mode string
+	var mu sync.Mutex
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		curMode := mode
+		mu.Unlock()
+		switch curMode {
+		case "escaped_and_allowed":
+			w.Header().Add("Warning", `299 Elasticsearch-8.15.0 "escaped \"quote\" and \\slash"`)
+			w.Header().Add("Warning", `299 Elasticsearch-8.15.0 "benign allowed notice"`)
+			w.Header().Add("Warning", `299 Elasticsearch-8.15.0 "beta feature 42 enabled"`)
+		case "single_warning":
+			w.Header().Add("Warning", `299 Elasticsearch-8.15.0 "only once"`)
+		case "unexpected":
+			w.Header().Add("Warning", `299 Elasticsearch-8.15.0 "surprise deprecation"`)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"acknowledged":true}`))
+	}))
+	defer ts.Close()
+
+	wCtx := newRunnerContext(ts.Client(), ts.URL)
+
+	mu.Lock()
+	mode = "escaped_and_allowed"
+	mu.Unlock()
+	okWarnStep := &OrderedMap{
+		Fields: []YAMLField{
+			{Key: "warnings", Value: []any{`escaped "quote" and \slash`}},
+			{Key: "allowed_warnings", Value: []any{"benign allowed notice"}},
+			{Key: "allowed_warnings_regex", Value: []any{`/^beta feature \d+ enabled$/`}},
+			{Key: "cluster.health", Value: map[string]any{}},
+		},
+	}
+	if err := wCtx.execDo(okWarnStep, false); err != nil {
+		t.Fatalf("expected RFC-7234 warnings + allowed_warnings + allowed_warnings_regex to pass, got: %v", err)
+	}
+
+	// 1-to-1 multiplicity: expecting 2 identical warnings when only 1 was returned must fail
+	mu.Lock()
+	mode = "single_warning"
+	mu.Unlock()
+	dupWarnStep := &OrderedMap{
+		Fields: []YAMLField{
+			{Key: "warnings", Value: []any{"only once", "only once"}},
+			{Key: "cluster.health", Value: map[string]any{}},
+		},
+	}
+	if err := wCtx.execDo(dupWarnStep, false); err == nil {
+		t.Fatalf("expected duplicate warnings multiplicity mismatch to fail")
+	}
+
+	dupRegexStep := &OrderedMap{
+		Fields: []YAMLField{
+			{Key: "warnings_regex", Value: []any{"/only once/", "/only once/"}},
+			{Key: "cluster.health", Value: map[string]any{}},
+		},
+	}
+	if err := wCtx.execDo(dupRegexStep, false); err == nil {
+		t.Fatalf("expected duplicate warnings_regex multiplicity mismatch to fail")
+	}
+
+	// Invalid allowed_warnings_regex must fail cleanly
+	badRegexStep := &OrderedMap{
+		Fields: []YAMLField{
+			{Key: "allowed_warnings_regex", Value: []any{"/[unclosed/"}},
+			{Key: "cluster.health", Value: map[string]any{}},
+		},
+	}
+	if err := wCtx.execDo(badRegexStep, false); err == nil {
+		t.Fatalf("expected invalid allowed_warnings_regex to fail")
+	}
+
+	// Unexpected Warning header without warnings/allowed_warnings must fail
+	mu.Lock()
+	mode = "unexpected"
+	mu.Unlock()
+	unexpStep := &OrderedMap{
+		Fields: []YAMLField{
+			{Key: "cluster.health", Value: map[string]any{}},
+		},
+	}
+	if err := wCtx.execDo(unexpStep, false); err == nil || !strings.Contains(err.Error(), "unexpected warning header") {
+		t.Fatalf("expected unexpected warning header failure, got: %v", err)
+	}
+
+	// 2. Terminal _arbitrary_key_ in execSet & multi-path _arbitrary_key_ assertions
+	ctx := newRunnerContext(http.DefaultClient, "http://localhost:9200")
+	ctx.lastMethod = http.MethodGet
+	ctx.lastStatus = http.StatusOK
+	ctx.lastResponse = map[string]any{
+		"nodes": map[string]any{
+			"node-alpha": map[string]any{
+				"name":   "es-alpha",
+				"roles":  []any{"master"},
+				"shards": int64(2),
+				"ready":  false,
+				"empty":  []any{},
+			},
+			"node-beta": map[string]any{
+				"name":   "es-beta",
+				"roles":  []any{"data", "ingest", "ml"},
+				"shards": int64(15),
+				"ready":  true,
+				"empty":  []any{},
+			},
+		},
+		"clusters": map[string]any{
+			"c1_empty": map[string]any{"nodes": map[string]any{}},
+			"c2_live":  map[string]any{"nodes": map[string]any{"live-node-7": map[string]any{"ok": true}}},
+		},
+		"empty_map":           map[string]any{},
+		"foo._arbitrary_key_": "literal_dot_val",
+	}
+
+	if err := ctx.execSet(map[string]any{
+		"nodes._arbitrary_key_":                          "picked_node_id",
+		"_arbitrary_key_":                                "picked_root_key",
+		"clusters._arbitrary_key_.nodes._arbitrary_key_": "picked_nested_node_id",
+		`foo\._arbitrary_key_`:                           "picked_literal",
+	}); err != nil {
+		t.Fatalf("execSet terminal _arbitrary_key_ failed: %v", err)
+	}
+	if ctx.stash["picked_node_id"] != "node-alpha" {
+		t.Fatalf("expected picked_node_id='node-alpha', got %v (%T)", ctx.stash["picked_node_id"], ctx.stash["picked_node_id"])
+	}
+	if ctx.stash["picked_root_key"] != "clusters" {
+		t.Fatalf("expected sorted first root key 'clusters', got %v", ctx.stash["picked_root_key"])
+	}
+	if ctx.stash["picked_nested_node_id"] != "live-node-7" {
+		t.Fatalf("expected picked_nested_node_id='live-node-7', got %v", ctx.stash["picked_nested_node_id"])
+	}
+	if ctx.stash["picked_literal"] != "literal_dot_val" {
+		t.Fatalf("expected escaped literal key lookup 'literal_dot_val', got %v", ctx.stash["picked_literal"])
+	}
+	if err := ctx.execSet(map[string]any{"empty_map._arbitrary_key_": "bad"}); err == nil {
+		t.Fatalf("expected terminal _arbitrary_key_ on empty map to fail")
+	}
+
+	// Existential multi-entry _arbitrary_key_ assertions (satisfied by node-beta, not node-alpha)
+	if err := ctx.execLength(map[string]any{"nodes._arbitrary_key_.roles": 3}); err != nil {
+		t.Fatalf("execLength with multi-entry _arbitrary_key_ failed: %v", err)
+	}
+	if err := ctx.execLength(map[string]any{"nodes._arbitrary_key_.roles": 99}); err == nil {
+		t.Fatalf("expected execLength with unmatched length across all candidates to fail")
+	}
+	if err := ctx.execCompare("gt", map[string]any{"nodes._arbitrary_key_.shards": 10}); err != nil {
+		t.Fatalf("execCompare gt with multi-entry _arbitrary_key_ failed: %v", err)
+	}
+	if err := ctx.execCompare("gt", map[string]any{"nodes._arbitrary_key_.shards": 100}); err == nil {
+		t.Fatalf("expected execCompare gt with no matching candidate to fail")
+	}
+	if err := ctx.execIsTrue("nodes._arbitrary_key_.ready"); err != nil {
+		t.Fatalf("execIsTrue with multi-entry _arbitrary_key_ failed: %v", err)
+	}
+	if err := ctx.execContains(map[string]any{"nodes._arbitrary_key_.roles": "ml"}); err != nil {
+		t.Fatalf("execContains with multi-entry _arbitrary_key_ failed: %v", err)
+	}
+
+	// Universal multi-entry _arbitrary_key_ assertions (node-beta violates ready=false and roles not_contains "ml")
+	if err := ctx.execIsFalse("nodes._arbitrary_key_.ready"); err == nil {
+		t.Fatalf("expected execIsFalse to fail when second node has ready=true")
+	}
+	if err := ctx.execNotContains(map[string]any{"nodes._arbitrary_key_.roles": "ml"}); err == nil {
+		t.Fatalf("expected execNotContains to fail when second node contains 'ml'")
+	}
+	if err := ctx.execIsEmpty(map[string]any{"nodes._arbitrary_key_.empty": nil}); err != nil {
+		t.Fatalf("expected mapping-form execIsEmpty on empty slices to pass, got: %v", err)
+	}
+	if err := ctx.execIsEmpty(map[string]any{"nodes._arbitrary_key_.roles": nil}); err == nil {
+		t.Fatalf("expected mapping-form execIsEmpty on non-empty slices to fail")
+	}
+
+	// 3. Unbraced dotted & negative-index stash paths ($obj.field, $arr.0, $arr.-1, ${arr.-1})
+	ctx.stash["obj"] = map[string]any{"id": "doc-77", "count": int64(42), "dotted_idx": "logs.2026"}
+	ctx.stash["arr"] = []any{int64(10), int64(20), int64(30)}
+	ctx.stash["str_arr"] = []any{"alpha", "beta", "gamma"}
+	ctx.stash["idx"] = "plain_idx"
+
+	if got := ctx.expandStash("$obj.count"); got != int64(42) {
+		t.Fatalf("expected whole-string $obj.count = int64(42), got %v (%T)", got, got)
+	}
+	if got := ctx.expandStash("$arr.0"); got != int64(10) {
+		t.Fatalf("expected whole-string $arr.0 = int64(10), got %v (%T)", got, got)
+	}
+	if got := ctx.expandStash("$arr.-1"); got != int64(30) {
+		t.Fatalf("expected whole-string $arr.-1 = int64(30), got %v (%T)", got, got)
+	}
+	if got := ctx.expandStash("${arr.-1}"); got != int64(30) {
+		t.Fatalf("expected whole-string ${arr.-1} = int64(30), got %v (%T)", got, got)
+	}
+	if got := ctx.expandStash("prefix_${str_arr.-1}_$obj.id"); got != "prefix_gamma_doc-77" {
+		t.Fatalf("unexpected interpolated string: %v", got)
+	}
+	if got := ctx.expandStash("$idx."); got != "plain_idx." {
+		t.Fatalf("expected trailing dot to remain intact on $idx., got %q", got)
+	}
+	if got := ctx.expandStash("$obj.id."); got != "doc-77." {
+		t.Fatalf("expected trailing dot to remain intact on $obj.id., got %q", got)
+	}
+	if gotPath := ctx.expandStashPath("indices.$obj.dotted_idx.state"); gotPath != `indices.logs\.2026.state` {
+		t.Fatalf("unexpected expandStashPath for unbraced dotted stash with suffix: %q", gotPath)
+	}
+
+	// 4. Nested transform_and_set calls + sha256 + join
+	ctx.stash["id"] = "key-id-1"
+	ctx.stash["api_key"] = "secret-xyz"
+	ctx.stash["name"] = "My-Mixed-Name"
+
+	trMap := NewOrderedMap()
+	trMap.Set("encoded_creds", "base64Encode(concat($id, ':', $api_key))")
+	trMap.Set("norm_name", "lower(replace($name, '-', '_'))")
+	trMap.Set("digest_hex", "sha256(concat($id, ':', $api_key))")
+	trMap.Set("joined_pipe", "join($str_arr, '|')")
+	trMap.Set("joined_default", "join($str_arr)")
+	trMap.Set("roundtrip_join", "join(split('x:y:z', ':'), '-')")
+
+	if err := ctx.execTransformAndSet(trMap); err != nil {
+		t.Fatalf("nested execTransformAndSet failed: %v", err)
+	}
+
+	wantB64 := base64.StdEncoding.EncodeToString([]byte("key-id-1:secret-xyz"))
+	if ctx.stash["encoded_creds"] != wantB64 {
+		t.Fatalf("encoded_creds = %v, want %s", ctx.stash["encoded_creds"], wantB64)
+	}
+	if ctx.stash["norm_name"] != "my_mixed_name" {
+		t.Fatalf("norm_name = %v, want my_mixed_name", ctx.stash["norm_name"])
+	}
+	wantSHA := fmt.Sprintf("%x", sha256.Sum256([]byte("key-id-1:secret-xyz")))
+	if ctx.stash["digest_hex"] != wantSHA {
+		t.Fatalf("digest_hex = %v, want %s", ctx.stash["digest_hex"], wantSHA)
+	}
+	if ctx.stash["joined_pipe"] != "alpha|beta|gamma" {
+		t.Fatalf("joined_pipe = %v, want alpha|beta|gamma", ctx.stash["joined_pipe"])
+	}
+	if ctx.stash["joined_default"] != "alpha,beta,gamma" {
+		t.Fatalf("joined_default = %v, want alpha,beta,gamma", ctx.stash["joined_default"])
+	}
+	if ctx.stash["roundtrip_join"] != "x-y-z" {
+		t.Fatalf("roundtrip_join = %v, want x-y-z", ctx.stash["roundtrip_join"])
+	}
+	if err := ctx.execTransformAndSet(map[string]any{"bad_join": "join($id, ',')"}); err == nil {
+		t.Fatalf("expected join on non-slice value to fail")
+	}
+
+	// Additional edge cases for transforms, stash fallback, slash-wrapped warning regexes, and assertions
+	ctx.stash["native_strs"] = []string{"s1", "s2"}
+	ctx.stash["num_str"] = "123"
+	extraTr := NewOrderedMap()
+	extraTr.Set("joined_native", "join($native_strs, '/')")
+	extraTr.Set("url_rt", "base64UrlDecode(base64UrlEncode('hello+world/test'))")
+	extraTr.Set("b64_rt", "base64Decode(base64Encode('plain-val'))")
+	extraTr.Set("trimmed_upper", "upper(trim('  hi  '))")
+	extraTr.Set("as_int", "toInt($num_str)")
+	extraTr.Set("as_str", "toString($arr.0)")
+	extraTr.Set("arr_len", "length($str_arr)")
+	extraTr.Set("str_len", "size('abcd')")
+	extraTr.Set("lower('INV')", "inv_out")
+	if err := ctx.execTransformAndSet(extraTr); err != nil {
+		t.Fatalf("extra transforms failed: %v", err)
+	}
+	if ctx.stash["joined_native"] != "s1/s2" || ctx.stash["url_rt"] != "hello+world/test" ||
+		ctx.stash["b64_rt"] != "plain-val" || ctx.stash["trimmed_upper"] != "HI" ||
+		ctx.stash["as_int"] != 123 || ctx.stash["as_str"] != "10" ||
+		ctx.stash["arr_len"] != 3 || ctx.stash["str_len"] != 4 || ctx.stash["inv_out"] != "inv" {
+		t.Fatalf("unexpected extra transform results: %+v", ctx.stash)
+	}
+	if err := ctx.execTransformAndSet(map[string]any{"bad": "not_an_expr"}); err == nil {
+		t.Fatalf("expected invalid transform expression error")
+	}
+	if err := ctx.execTransformAndSet(map[string]any{"bad_fn": "unknownFn('x')"}); err == nil {
+		t.Fatalf("expected unsupported transform function error")
+	}
+	if got := ctx.expandStash("keep_$unresolved_var_here"); got != "keep_$unresolved_var_here" {
+		t.Fatalf("expected unresolved stash variable to stay intact, got %v", got)
+	}
+
+	// Slash-wrapped and plain regexes + raw non-RFC7234 warning in validateResponseWarnings
+	if err := validateResponseWarnings(
+		"search",
+		http.MethodGet,
+		true,
+		[]string{`299 Elasticsearch-8.15.0 "Deprecated [foo] parameter"`, `299 Elasticsearch-8.15.0 "Allowed extra notice"`, `plain warning text`},
+		nil,
+		[]string{`/Deprecated \[foo\]/`, `plain warning`},
+		nil,
+		[]string{`/Allowed extra/`},
+	); err != nil {
+		t.Fatalf("expected slash-wrapped and plain warnings_regex + allowed_warnings_regex to pass: %v", err)
+	}
+
+	// Non-wildcard & HEAD / empty-path branches across assertion helpers
+	ctx.lastResponse = map[string]any{
+		"msg":      "hello world",
+		"meta":     map[string]any{"env": "prod", "tier": "gold"},
+		"flag_on":  true,
+		"flag_off": false,
+		"empty_m":  map[string]any{},
+		"num":      int64(50),
+		"ver":      "8.15.0",
+	}
+	if err := ctx.execContains(map[string]any{"msg": "world", "meta": map[string]any{"env": "prod"}}); err != nil {
+		t.Fatalf("execContains string/map failed: %v", err)
+	}
+	if err := ctx.execContains(map[string]any{"msg": "missing"}); err == nil {
+		t.Fatalf("expected execContains string mismatch error")
+	}
+	if err := ctx.execContains(map[string]any{"flag_on": "x"}); err == nil {
+		t.Fatalf("expected execContains unsupported type error")
+	}
+	if err := ctx.execNotContains(map[string]any{"msg": "absent", "meta": map[string]any{"env": "dev"}}); err != nil {
+		t.Fatalf("execNotContains string/map failed: %v", err)
+	}
+	if err := ctx.execNotContains(map[string]any{"msg": "world"}); err == nil {
+		t.Fatalf("expected execNotContains string match error")
+	}
+	if err := ctx.execNotContains(map[string]any{"meta": map[string]any{"env": "prod"}}); err == nil {
+		t.Fatalf("expected execNotContains map match error")
+	}
+	if err := ctx.execIsTrue("flag_on"); err != nil {
+		t.Fatalf("execIsTrue(flag_on) failed: %v", err)
+	}
+	if err := ctx.execIsTrue("flag_off"); err == nil {
+		t.Fatalf("expected execIsTrue(flag_off) error")
+	}
+	if err := ctx.execIsFalse("flag_off"); err != nil {
+		t.Fatalf("execIsFalse(flag_off) failed: %v", err)
+	}
+	if err := ctx.execIsFalse("flag_on"); err == nil {
+		t.Fatalf("expected execIsFalse(flag_on) error")
+	}
+	if err := ctx.execIsEmpty(map[string]any{"empty_m": nil}); err != nil {
+		t.Fatalf("execIsEmpty map form failed: %v", err)
+	}
+	if err := ctx.execIsEmpty("msg"); err == nil {
+		t.Fatalf("expected execIsEmpty(msg) error")
+	}
+	if err := ctx.execLength(map[string]any{"msg": 11, "meta": 2}); err != nil {
+		t.Fatalf("execLength string/map failed: %v", err)
+	}
+	if err := ctx.execLength(map[string]any{"flag_on": 1}); err == nil {
+		t.Fatalf("expected execLength unsupported type error")
+	}
+	if err := ctx.execCompare("gte", map[string]any{"num": 50, "ver": "8.10.0"}); err != nil {
+		t.Fatalf("execCompare gte failed: %v", err)
+	}
+	if err := ctx.execCompare("lte", map[string]any{"num": 50, "ver": "8.15.0"}); err != nil {
+		t.Fatalf("execCompare lte failed: %v", err)
+	}
+	if err := ctx.execCompare("lt", map[string]any{"ver": "9.0.0"}); err != nil {
+		t.Fatalf("execCompare lt string failed: %v", err)
+	}
+
+	ctx.lastMethod = http.MethodHead
+	ctx.lastStatus = http.StatusOK
+	if err := ctx.execIsTrue(""); err != nil {
+		t.Fatalf("expected HEAD 200 execIsTrue('') to pass: %v", err)
+	}
+	if err := ctx.execIsFalse(""); err == nil {
+		t.Fatalf("expected HEAD 200 execIsFalse('') to fail")
+	}
+	ctx.lastStatus = http.StatusNotFound
+	if err := ctx.execIsFalse(""); err != nil {
+		t.Fatalf("expected HEAD 404 execIsFalse('') to pass: %v", err)
+	}
+	if err := ctx.execIsTrue(""); err == nil {
+		t.Fatalf("expected HEAD 404 execIsTrue('') to fail")
+	}
+
+	ctx.lastMethod = http.MethodGet
+	if err := ctx.execIsTrue(""); err != nil {
+		t.Fatalf("expected non-HEAD map response execIsTrue('') to pass: %v", err)
+	}
+	if err := ctx.execIsEmpty(""); err == nil {
+		t.Fatalf("expected non-empty map execIsEmpty('') to fail")
+	}
+	if err := ctx.execContains(map[string]any{"missing_field": "x"}); err == nil {
+		t.Fatalf("expected execContains missing path to fail")
+	}
+	if err := ctx.execContains(map[string]any{"meta": map[string]any{"env": "wrong"}}); err == nil {
+		t.Fatalf("expected execContains map mismatch to fail")
+	}
+	ctx.lastResponse = map[string]any{}
+	if err := ctx.execIsEmpty(""); err != nil {
+		t.Fatalf("expected empty map execIsEmpty('') to pass: %v", err)
+	}
+	if err := ctx.execTransformAndSet(map[string]any{"obj_len": "length($obj)"}); err != nil || ctx.stash["obj_len"] != 3 {
+		t.Fatalf("expected length($obj) = 3, got %v (err=%v)", ctx.stash["obj_len"], err)
+	}
+	for _, badExpr := range []string{
+		"concat(missing_resp_path)",
+		"split(missing_resp_path, ':')",
+		"join(missing_resp_path, ',')",
+		"replace($name, '-')",
+		"replace(missing_resp_path, 'a', 'b')",
+		"toInt('not_an_int')",
+		"base64Decode('%%%')",
+		"base64UrlDecode('%%%')",
+	} {
+		if err := ctx.execTransformAndSet(map[string]any{"err_out": badExpr}); err == nil {
+			t.Fatalf("expected transform error for %q", badExpr)
+		}
 	}
 }

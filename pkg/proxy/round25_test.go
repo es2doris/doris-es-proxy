@@ -841,7 +841,6 @@ func TestRound25_P0_7_IngestAttachmentCSVKVgsubAndUpdateByQueryMetadata(t *testi
 						"field_split":  "&",
 						"value_split":  "=",
 						"include_keys": []any{"env", "ver"},
-						"exclude_keys": []any{"secret"},
 						"prefix":       "meta_",
 					},
 				},

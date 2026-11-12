@@ -1005,6 +1005,10 @@ func parseLuceneQuotedOrFuzzyExWithFlags(raw string, escape bool) (clean string,
 			s = s[:tildeIdx]
 			isFuzzy = true
 			fuzzyDist = "AUTO"
+		} else if strings.HasPrefix(strings.ToLower(suffix), "auto:") && isValidLuceneFuzzySuffix(suffix) {
+			s = s[:tildeIdx]
+			isFuzzy = true
+			fuzzyDist = strings.ToUpper(suffix)
 		} else if n, err := strconv.Atoi(suffix); err == nil && n >= 0 {
 			s = s[:tildeIdx]
 			isFuzzy = n > 0
@@ -1021,7 +1025,7 @@ func parseLuceneQuotedOrFuzzyExWithFlags(raw string, escape bool) (clean string,
 }
 
 func findLuceneFieldColon(s string) int {
-	if len(s) == 0 || s[0] == '"' || s[0] == '(' || s[0] == '[' || s[0] == '{' || s[0] == '/' {
+	if len(s) == 0 || s[0] == '"' || s[0] == '(' || s[0] == '[' || s[0] == '{' || s[0] == '/' || s[0] == '~' {
 		return -1
 	}
 	for i := 0; i < len(s); i++ {
@@ -1030,7 +1034,7 @@ func findLuceneFieldColon(s string) int {
 			i++
 			continue
 		}
-		if c == '"' || c == '(' || c == '[' || c == '{' {
+		if c == '"' || c == '(' || c == '[' || c == '{' || c == '~' {
 			return -1
 		}
 		if c == ':' && i > 0 && i < len(s)-1 {
@@ -2183,7 +2187,7 @@ func isValidLuceneFuzzySuffix(sub string) bool {
 	lower := strings.ToLower(sub)
 	if strings.HasPrefix(lower, "auto:") {
 		parts := strings.Split(lower[len("auto:"):], ",")
-		if len(parts) != 2 {
+		if len(parts) != 2 || !isPureDigitsASCII(parts[0]) || !isPureDigitsASCII(parts[1]) {
 			return false
 		}
 		lo, err1 := strconv.Atoi(parts[0])
@@ -2205,6 +2209,7 @@ func validateStrictLuceneQuery(s string) error {
 	inRegex := false
 	escaped := false
 	bracketDepth := 0
+	bracketStart := -1
 	parenDepth := 0
 	justClosedQuoteIdx := -2
 
@@ -2272,12 +2277,25 @@ func validateStrictLuceneQuery(s string) error {
 			continue
 		}
 		if ch == '[' || ch == '{' {
+			if bracketDepth > 0 {
+				return fmt.Errorf("parse_exception: cannot parse query [%s]: nested range bracket", s)
+			}
 			bracketDepth++
+			bracketStart = i
 			continue
 		}
 		if ch == ']' || ch == '}' {
-			if bracketDepth > 0 {
-				bracketDepth--
+			if bracketDepth == 0 {
+				return fmt.Errorf("parse_exception: cannot parse query [%s]: unmatched closing range bracket", s)
+			}
+			bracketDepth--
+			if bracketDepth == 0 && bracketStart >= 0 {
+				inner := strings.TrimSpace(s[bracketStart+1 : i])
+				rawLo, rawHi, ok := splitLuceneRangeBounds(inner)
+				if !ok || rawLo == "" || rawHi == "" {
+					return fmt.Errorf("parse_exception: cannot parse query [%s]: invalid range query [%s]", s, s[bracketStart:i+1])
+				}
+				bracketStart = -1
 			}
 			continue
 		}
@@ -2335,6 +2353,9 @@ func validateStrictLuceneQuery(s string) error {
 	}
 	if parenDepth != 0 {
 		return fmt.Errorf("parse_exception: cannot parse query [%s]: unbalanced parentheses", s)
+	}
+	if bracketDepth != 0 {
+		return fmt.Errorf("parse_exception: cannot parse query [%s]: unclosed range bracket", s)
 	}
 	return nil
 }

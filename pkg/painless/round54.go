@@ -215,7 +215,7 @@ func (o *painlessOptional) equals(other any) bool {
 	if !o.present {
 		return true
 	}
-	return painlessValuesEqual(o.val, o2.val)
+	return painlessJavaObjectEquals(o.val, o2.val)
 }
 
 func (o *painlessOptional) hashCode() int64 {
@@ -1456,12 +1456,16 @@ func runUserClassConstructorChainPainless(uo *painlessUserObject, cls *painlessU
 	}
 	// Check if first statement in constructor body is `this(...)` or `super(...)`
 	calledSuper := false
+	delegatedToThis := false
 	stmts := splitTopLevelStatements(body)
 	if len(stmts) > 0 {
 		first := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(stmts[0]), ";"))
 		if strings.HasPrefix(first, "this(") && strings.HasSuffix(first, ")") && findMatchingDelimiter(first, 4, '(', ')') == len(first)-1 {
 			ctorScope := make(map[string]any, len(params)+8)
 			for k, v := range params {
+				if strings.HasPrefix(k, "__var_type_") || strings.HasPrefix(k, "__user_var_class_") {
+					continue
+				}
 				ctorScope[k] = v
 			}
 			ctorScope["this"] = uo
@@ -1488,11 +1492,15 @@ func runUserClassConstructorChainPainless(uo *painlessUserObject, cls *painlessU
 				return err
 			}
 			calledSuper = true
+			delegatedToThis = true
 			body = strings.Join(stmts[1:], "; ")
 		} else if strings.HasPrefix(first, "super(") && strings.HasSuffix(first, ")") && findMatchingDelimiter(first, 5, '(', ')') == len(first)-1 {
 			if cls.parent != nil {
 				ctorScope := make(map[string]any, len(params)+8)
 				for k, v := range params {
+					if strings.HasPrefix(k, "__var_type_") || strings.HasPrefix(k, "__user_var_class_") {
+						continue
+					}
 					ctorScope[k] = v
 				}
 				ctorScope["this"] = uo
@@ -1528,10 +1536,22 @@ func runUserClassConstructorChainPainless(uo *painlessUserObject, cls *painlessU
 			return err
 		}
 	}
+	// JLS §12.5: evaluate this class's declared instance field initializers AFTER
+	// the superclass constructor returns (and BEFORE this constructor's body runs),
+	// unless this constructor delegated via `this(...)` (in which case the target
+	// constructor in `this(...)` already initialized `cls`'s declared fields).
+	if !delegatedToThis {
+		if err := initDeclaredClassFieldsRound57Painless(uo, cls, sourceMap, params, depth+1); err != nil {
+			return err
+		}
+	}
 	if matchedCtor != nil && strings.TrimSpace(body) != "" {
 		budget := getOrInitEvalBudget(params)
 		ctorScope := make(map[string]any, len(params)+len(matchedCtor.paramNames)+4)
 		for k, v := range params {
+			if strings.HasPrefix(k, "__var_type_") || strings.HasPrefix(k, "__user_var_class_") {
+				continue
+			}
 			ctorScope[k] = v
 		}
 		ctorScope["this"] = uo
@@ -1611,7 +1631,7 @@ func evalUserClassMethodWithArgsPainless(uo *painlessUserObject, targetCls *pain
 	}
 	mScope := make(map[string]any, len(params)+len(fn.paramNames)+4)
 	for k, v := range params {
-		if k == "_return_val" || k == "_last_expr_val" {
+		if k == "_return_val" || k == "_last_expr_val" || strings.HasPrefix(k, "__var_type_") || strings.HasPrefix(k, "__user_var_class_") {
 			continue
 		}
 		mScope[k] = v
@@ -3792,7 +3812,7 @@ func evalRound54StaticCallPainless(fnName string, args []string, argStr string, 
 			for i := limit; i >= 0; i-- {
 				match := true
 				for j := 0; j < len(tgt); j++ {
-					if !painlessValuesEqual(src[i+j], tgt[j]) {
+					if !painlessJavaObjectEquals(src[i+j], tgt[j]) {
 						match = false
 						break
 					}
@@ -3806,7 +3826,7 @@ func evalRound54StaticCallPainless(fnName string, args []string, argStr string, 
 		for i := 0; i <= limit; i++ {
 			match := true
 			for j := 0; j < len(tgt); j++ {
-				if !painlessValuesEqual(src[i+j], tgt[j]) {
+				if !painlessJavaObjectEquals(src[i+j], tgt[j]) {
 					match = false
 					break
 				}

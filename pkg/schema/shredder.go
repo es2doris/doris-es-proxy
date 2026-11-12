@@ -174,6 +174,21 @@ func ShredDocumentWithNow(
 		})
 	}
 	if s != nil && len(s.Fields) > 0 {
+		aliasFieldKeys := make([]string, 0)
+		for k, b := range s.Fields {
+			if b.AliasTarget != "" && b.ESFieldPath != "" {
+				aliasFieldKeys = append(aliasFieldKeys, k)
+			}
+		}
+		if len(aliasFieldKeys) > 0 {
+			sort.Strings(aliasFieldKeys)
+			for _, k := range aliasFieldKeys {
+				b := s.Fields[k]
+				if docHasExplicitFieldPath(parsedDoc, strings.Split(b.ESFieldPath, ".")) {
+					return nil, fmt.Errorf("mapper_parsing_exception: Cannot write to a field alias [%s]", b.ESFieldPath)
+				}
+			}
+		}
 		flattenedFieldKeys := make([]string, 0)
 		for k, b := range s.Fields {
 			if b.ESType == "flattened" && b.AliasTarget == "" && !b.EnabledFalse {
@@ -620,6 +635,22 @@ func ShredDocumentWithNow(
 						continue
 					}
 					return nil, fmt.Errorf("mapper_parsing_exception: failed to parse vector field [%s] of type [%s]", b.ESFieldPath, b.ESType)
+				}
+				if (b.ESType == "dense_vector" || b.ESType == "knn_vector") && (b.VectorMetric == "" || strings.EqualFold(b.VectorMetric, "cosine")) {
+					var sumSq float64
+					for _, fv := range vec {
+						sumSq += fv * fv
+					}
+					if sumSq == 0 {
+						if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+							recordIgnored(b.ESFieldPath)
+							if isPrimaryFieldBinding(b) {
+								deferDeletePath(b.SourceJSONPath)
+							}
+							continue
+						}
+						return nil, fmt.Errorf("mapper_parsing_exception: Zero-magnitude vectors are not supported when using [cosine] similarity on field [%s]", b.ESFieldPath)
+					}
 				}
 				row[b.ColumnName] = vec
 			}
@@ -3328,6 +3359,52 @@ func collectAllTextWithSchema(node any, s *IndexSchema, curPath []string, sb *st
 			collectAllTextWithSchema(child, s, curPath, sb)
 		}
 	}
+}
+
+func docHasExplicitFieldPath(doc map[string]any, segs []string) bool {
+	if len(doc) == 0 || len(segs) == 0 {
+		return false
+	}
+	if val, exists := doc[segs[0]]; exists {
+		if len(segs) == 1 {
+			return true
+		}
+		if docValueHasExplicitFieldPath(val, segs[1:]) {
+			return true
+		}
+	}
+	if len(segs) > 1 {
+		full := strings.Join(segs, ".")
+		if _, exists := doc[full]; exists {
+			return true
+		}
+		for k := 2; k < len(segs); k++ {
+			prefix := strings.Join(segs[:k], ".")
+			if val, exists := doc[prefix]; exists {
+				if docValueHasExplicitFieldPath(val, segs[k:]) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func docValueHasExplicitFieldPath(val any, segs []string) bool {
+	if len(segs) == 0 {
+		return true
+	}
+	switch v := val.(type) {
+	case map[string]any:
+		return docHasExplicitFieldPath(v, segs)
+	case []any:
+		for _, elem := range v {
+			if docValueHasExplicitFieldPath(elem, segs) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func extractAndValidateVectorValues(node any, path []string, dims int) ([]float64, bool, bool) {

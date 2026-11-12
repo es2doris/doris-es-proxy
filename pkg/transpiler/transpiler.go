@@ -1563,6 +1563,18 @@ func (t *Transpiler) compileKNN(kq *esast.KNNQuery, scoring bool, nctx *nestedCt
 	} else if strings.EqualFold(b.VectorMetric, "dot_product") || strings.EqualFold(b.VectorMetric, "max_inner_product") {
 		distFn = "INNER_PRODUCT"
 	}
+	if distFn == "COSINE_DISTANCE" && len(kq.QueryVector) > 0 {
+		var sumSq float64
+		for _, fv := range kq.QueryVector {
+			sumSq += fv * fv
+		}
+		if sumSq == 0 {
+			if t.searchErr == nil {
+				t.searchErr = fmt.Errorf("illegal_argument_exception: Zero-magnitude vectors are not supported when using [cosine] similarity")
+			}
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+	}
 	safeColExpr := fmt.Sprintf("IF(array_size(%s) = %d, %s, %s)", colExpr, dim, colExpr, vecLit)
 	distExpr := fmt.Sprintf("%s(%s, %s)", distFn, safeColExpr, vecLit)
 	if kq.Similarity != nil {
@@ -2123,6 +2135,9 @@ func isZeroFuzziness(fuzz any) bool {
 func resolveFuzzyMaxEdits(fuzz any, wordRuneLen int) int {
 	switch v := fuzz.(type) {
 	case nil:
+		if wordRuneLen < 3 {
+			return 0
+		}
 		if wordRuneLen >= 6 {
 			return 2
 		}
@@ -2192,9 +2207,9 @@ func resolveFuzzyMaxEdits(fuzz any, wordRuneLen int) int {
 						high = h
 					}
 				}
-				if wordRuneLen < low {
-					return 0
-				}
+			}
+			if wordRuneLen < low {
+				return 0
 			}
 			if wordRuneLen >= high {
 				return 2
@@ -5559,6 +5574,9 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 				elemExpr = "CAST(_x AS DOUBLE)"
 			}
 		}
+		if b.ESType == "unsigned_long" && elemExpr == "CAST(_x AS BIGINT)" {
+			elemExpr = "CAST(_x AS LARGEINT)"
+		}
 		var elemParts []string
 		if gt != nil {
 			elemParts = append(elemParts, fmt.Sprintf("%s > %s", elemExpr, quoteValue(gt)))
@@ -5912,6 +5930,9 @@ func (t *Transpiler) appendAggBranches(
 				}
 			} else {
 				col := t.sqlColumnRef(effField, true, nil)
+				if b.Kind == schema.StoragePromotedScalar && b.ESType == "unsigned_long" && effField != "" {
+					col = t.sqlTypedColumnRef(effField, uint64(math.MaxUint64), true, nil)
+				}
 				rawCol := col
 				if termsSpec.Script != nil {
 					if scriptExpr, ok := t.compilePolymorphicScriptExpr(termsSpec.Script, effField, col, nil); ok {
@@ -8998,6 +9019,9 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 				}
 			} else {
 				col := t.sqlColumnRef(effSubField, true, nctx)
+				if (nctx == nil || nctx.elemVar == "") && b.Kind == schema.StoragePromotedScalar && b.ESType == "unsigned_long" && effSubField != "" {
+					col = t.sqlTypedColumnRef(effSubField, uint64(math.MaxUint64), true, nctx)
+				}
 				if subTerms.Script == nil && effSubField != "" {
 					if effectiveDorisScalarType(b) == schema.DorisBoolean {
 						col = fmt.Sprintf("CASE WHEN %s IS NULL THEN NULL WHEN LOWER(CAST(%s AS STRING)) IN ('true', '1') THEN 'true' ELSE 'false' END", col, col)
@@ -11897,7 +11921,17 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 					} else if b.DorisType == schema.DorisBigInt || b.DorisType == schema.DorisInt {
 						if iv, err := strconv.ParseInt(strings.TrimSpace(strVal), 10, 64); err == nil {
 							sampleVal = iv
+						} else if b.ESType == "unsigned_long" {
+							if uv, errU := strconv.ParseUint(strings.TrimSpace(strVal), 10, 64); errU == nil {
+								sampleVal = uv
+							}
 						}
+					}
+				} else if nv, ok := sampleVal.(json.Number); ok && b.ESType == "unsigned_long" {
+					if iv, err := nv.Int64(); err == nil {
+						sampleVal = iv
+					} else if uv, errU := strconv.ParseUint(nv.String(), 10, 64); errU == nil {
+						sampleVal = uv
 					}
 				}
 				sampleVal = normalizeEpochSecondSortValue(effType, s.Entry.Format, b, sampleVal)
@@ -11908,7 +11942,9 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 			if b.ESType != "" && s.Entry.NumericType != "" && b.Kind == schema.StoragePromotedScalar {
 				switch strings.ToLower(s.Entry.NumericType) {
 				case "long", "date", "date_nanos":
-					col = fmt.Sprintf("CAST(%s AS BIGINT)", col)
+					if b.ESType != "unsigned_long" {
+						col = fmt.Sprintf("CAST(%s AS BIGINT)", col)
+					}
 				case "double":
 					col = fmt.Sprintf("CAST(%s AS DOUBLE)", col)
 				}
@@ -12104,11 +12140,21 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 				} else if b.DorisType == schema.DorisBigInt || b.DorisType == schema.DorisInt {
 					if iv, err := strconv.ParseInt(strings.TrimSpace(strVal), 10, 64); err == nil {
 						val = iv
+					} else if b.ESType == "unsigned_long" {
+						if uv, errU := strconv.ParseUint(strings.TrimSpace(strVal), 10, 64); errU == nil {
+							val = uv
+						}
 					}
 				} else if b.DorisType == schema.DorisDouble {
 					if fv, err := strconv.ParseFloat(strings.TrimSpace(strVal), 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
 						val = fv
 					}
+				}
+			} else if nv, ok := val.(json.Number); ok && b.ESType == "unsigned_long" {
+				if iv, err := nv.Int64(); err == nil {
+					val = iv
+				} else if uv, errU := strconv.ParseUint(nv.String(), 10, 64); errU == nil {
+					val = uv
 				}
 			}
 			val = normalizeEpochSecondSortValue(effType, effectiveSorts[idx].Entry.Format, b, val)
@@ -12125,7 +12171,9 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 			if b.ESType != "" && effectiveSorts[idx].Entry.NumericType != "" && b.Kind == schema.StoragePromotedScalar {
 				switch strings.ToLower(effectiveSorts[idx].Entry.NumericType) {
 				case "long", "date", "date_nanos":
-					col = fmt.Sprintf("CAST(%s AS BIGINT)", col)
+					if b.ESType != "unsigned_long" {
+						col = fmt.Sprintf("CAST(%s AS BIGINT)", col)
+					}
 				case "double":
 					col = fmt.Sprintf("CAST(%s AS DOUBLE)", col)
 				}
@@ -12267,6 +12315,9 @@ func (t *Transpiler) sqlSortColumnRefWithType(field string, sampleVal any, desc 
 		}
 		switch fn {
 		case "array_min", "array_max":
+			if effType == "unsigned_long" || b.ESType == "unsigned_long" {
+				return fmt.Sprintf("%s(array_map(_x -> CAST(_x AS LARGEINT), %s))", fn, arrRef)
+			}
 			if effDT == schema.DorisBigInt || effDT == schema.DorisInt {
 				return fmt.Sprintf("%s(array_map(_x -> CAST(_x AS BIGINT), %s))", fn, arrRef)
 			}
@@ -12331,6 +12382,9 @@ func (t *Transpiler) sqlSortColumnRefWithType(field string, sampleVal any, desc 
 	}
 	if effType == "version" || b.ESType == "version" {
 		return sqlSemverSortKeyExpr(t.sqlColumnRef(field, true, nil))
+	}
+	if (effType == "unsigned_long" || b.ESType == "unsigned_long") && sampleVal == nil {
+		sampleVal = uint64(math.MaxUint64)
 	}
 	return t.sqlTypedColumnRef(field, sampleVal, true, nil)
 }
@@ -12475,7 +12529,9 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 	}
 
 	field, b := t.resolveFieldInNestedCtx(field, preferKeyword, nctx)
-	if effectiveDorisScalarType(b) == schema.DorisDouble && castType == "BIGINT" {
+	if b.ESType == "unsigned_long" && (castType == "BIGINT" || castType == "LARGEINT") {
+		castType = "LARGEINT"
+	} else if effectiveDorisScalarType(b) == schema.DorisDouble && castType == "BIGINT" {
 		castType = "DOUBLE"
 	}
 	effField := field
@@ -12500,7 +12556,7 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 
 	switch b.Kind {
 	case schema.StoragePromotedScalar:
-		if b.ESType == "unsigned_long" && castType == "LARGEINT" && effField != "" {
+		if b.ESType == "unsigned_long" && (castType == "LARGEINT" || castType == "DOUBLE") && effField != "" {
 			break
 		}
 		if preferKeyword && b.KeywordCompanion != "" {
@@ -12839,6 +12895,28 @@ func coerceRangeFieldQueryScalar(v any, b schema.FieldBinding, format string, tz
 	return 0, false
 }
 
+func rangeObjectBoundsSQLFromBase(baseExpr string) (string, string, string, string) {
+	rawLower := fmt.Sprintf("COALESCE(CAST(%s['_gte'] AS DOUBLE), CAST(%s['gte'] AS DOUBLE), CAST(%s['_gt'] AS DOUBLE), CAST(%s['gt'] AS DOUBLE))", baseExpr, baseExpr, baseExpr, baseExpr)
+	rawUpper := fmt.Sprintf("COALESCE(CAST(%s['_lte'] AS DOUBLE), CAST(%s['lte'] AS DOUBLE), CAST(%s['_lt'] AS DOUBLE), CAST(%s['lt'] AS DOUBLE))", baseExpr, baseExpr, baseExpr, baseExpr)
+	lower := fmt.Sprintf("COALESCE(%s, -1e100)", rawLower)
+	upper := fmt.Sprintf("COALESCE(%s, 1e100)", rawUpper)
+	return lower, upper, rawLower, rawUpper
+}
+
+func rangeDocBaseExpr(field string, b schema.FieldBinding) string {
+	parts := b.SourceJSONPath
+	if len(parts) == 0 {
+		parts = strings.Split(field, ".")
+	}
+	var base strings.Builder
+	base.WriteString("`_doc`")
+	for _, p := range parts {
+		escaped := strings.ReplaceAll(p, `'`, `''`)
+		base.WriteString("['" + escaped + "']")
+	}
+	return base.String()
+}
+
 func (t *Transpiler) rangeFieldBoundsAndRawSQL(field string, b schema.FieldBinding, nctx *nestedCtx) (string, string, string, string) {
 	if nctx != nil && nctx.elemVar != "" && (b.Kind == schema.StorageNestedSubfield || b.NestedPath == nctx.nestedPath) && nctx.nestedPath == b.NestedPath {
 		relPath := t.nestedRelativeJSONPath(field, false, b.NestedPath)
@@ -12858,22 +12936,7 @@ func (t *Transpiler) rangeFieldBoundsAndRawSQL(field string, b schema.FieldBindi
 		upper := fmt.Sprintf("COALESCE(%s, 1e100)", rawUpper)
 		return lower, upper, rawLower, rawUpper
 	}
-	parts := b.SourceJSONPath
-	if len(parts) == 0 {
-		parts = strings.Split(field, ".")
-	}
-	var base strings.Builder
-	base.WriteString("`_doc`")
-	for _, p := range parts {
-		escaped := strings.ReplaceAll(p, `'`, `''`)
-		base.WriteString("['" + escaped + "']")
-	}
-	baseExpr := base.String()
-	rawLower := fmt.Sprintf("COALESCE(CAST(%s['_gte'] AS DOUBLE), CAST(%s['gte'] AS DOUBLE), CAST(%s['_gt'] AS DOUBLE), CAST(%s['gt'] AS DOUBLE))", baseExpr, baseExpr, baseExpr, baseExpr)
-	rawUpper := fmt.Sprintf("COALESCE(CAST(%s['_lte'] AS DOUBLE), CAST(%s['lte'] AS DOUBLE), CAST(%s['_lt'] AS DOUBLE), CAST(%s['lt'] AS DOUBLE))", baseExpr, baseExpr, baseExpr, baseExpr)
-	lower := fmt.Sprintf("COALESCE(%s, -1e100)", rawLower)
-	upper := fmt.Sprintf("COALESCE(%s, 1e100)", rawUpper)
-	return lower, upper, rawLower, rawUpper
+	return rangeObjectBoundsSQLFromBase(rangeDocBaseExpr(field, b))
 }
 
 func (t *Transpiler) compileRangeOnRangeField(field string, b schema.FieldBinding, rc esast.RangeCond, nctx *nestedCtx) string {
@@ -12930,8 +12993,6 @@ func (t *Transpiler) compileRangeOnRangeField(field string, b schema.FieldBindin
 		}
 	}
 
-	lowerSQL, upperSQL, rawLower, rawUpper := t.rangeFieldBoundsAndRawSQL(field, b, nctx)
-	existsCond := fmt.Sprintf("(%s IS NOT NULL OR %s IS NOT NULL)", rawLower, rawUpper)
 	rel := strings.ToUpper(strings.TrimSpace(rc.Relation))
 	if rel == "" {
 		rel = "INTERSECTS"
@@ -12939,58 +13000,82 @@ func (t *Transpiler) compileRangeOnRangeField(field string, b schema.FieldBindin
 
 	qLowLit := strconv.FormatFloat(qLower, 'f', -1, 64)
 	qUpLit := strconv.FormatFloat(qUpper, 'f', -1, 64)
+	containsLow := qLower
+	if qLowerExclusive && (b.ESType == "float_range" || b.ESType == "double_range") {
+		containsLow = math.Nextafter(qLower, math.Inf(1))
+	}
+	containsUp := qUpper
+	if qUpperExclusive && (b.ESType == "float_range" || b.ESType == "double_range") {
+		containsUp = math.Nextafter(qUpper, math.Inf(-1))
+	}
+	containsLowLit := strconv.FormatFloat(containsLow, 'f', -1, 64)
+	containsUpLit := strconv.FormatFloat(containsUp, 'f', -1, 64)
 
-	var conds []string
-	switch rel {
-	case "CONTAINS":
-		if hasLower || hasUpper {
+	buildPred := func(lowerSQL, upperSQL, rawLower, rawUpper string) string {
+		existsCond := fmt.Sprintf("(%s IS NOT NULL OR %s IS NOT NULL)", rawLower, rawUpper)
+		var conds []string
+		switch rel {
+		case "CONTAINS":
+			if hasLower || hasUpper {
+				if hasLower {
+					conds = append(conds, fmt.Sprintf("%s <= %s", lowerSQL, containsLowLit))
+				} else {
+					conds = append(conds, fmt.Sprintf("%s <= -1e99", lowerSQL))
+				}
+				if hasUpper {
+					conds = append(conds, fmt.Sprintf("%s >= %s", upperSQL, containsUpLit))
+				} else {
+					conds = append(conds, fmt.Sprintf("%s >= 1e99", upperSQL))
+				}
+			}
+		case "WITHIN":
 			if hasLower {
-				conds = append(conds, fmt.Sprintf("%s <= %s", lowerSQL, qLowLit))
-			} else {
-				conds = append(conds, fmt.Sprintf("%s <= -1e99", lowerSQL))
+				if qLowerExclusive {
+					conds = append(conds, fmt.Sprintf("%s > %s", lowerSQL, qLowLit))
+				} else {
+					conds = append(conds, fmt.Sprintf("%s >= %s", lowerSQL, qLowLit))
+				}
 			}
 			if hasUpper {
-				conds = append(conds, fmt.Sprintf("%s >= %s", upperSQL, qUpLit))
-			} else {
-				conds = append(conds, fmt.Sprintf("%s >= 1e99", upperSQL))
+				if qUpperExclusive {
+					conds = append(conds, fmt.Sprintf("%s < %s", upperSQL, qUpLit))
+				} else {
+					conds = append(conds, fmt.Sprintf("%s <= %s", upperSQL, qUpLit))
+				}
+			}
+		default: // INTERSECTS
+			if hasUpper {
+				if qUpperExclusive {
+					conds = append(conds, fmt.Sprintf("%s < %s", lowerSQL, qUpLit))
+				} else {
+					conds = append(conds, fmt.Sprintf("%s <= %s", lowerSQL, qUpLit))
+				}
+			}
+			if hasLower {
+				if qLowerExclusive {
+					conds = append(conds, fmt.Sprintf("%s > %s", upperSQL, qLowLit))
+				} else {
+					conds = append(conds, fmt.Sprintf("%s >= %s", upperSQL, qLowLit))
+				}
 			}
 		}
-	case "WITHIN":
-		if hasLower {
-			if qLowerExclusive {
-				conds = append(conds, fmt.Sprintf("%s > %s", lowerSQL, qLowLit))
-			} else {
-				conds = append(conds, fmt.Sprintf("%s >= %s", lowerSQL, qLowLit))
-			}
+		if len(conds) == 0 {
+			return existsCond
 		}
-		if hasUpper {
-			if qUpperExclusive {
-				conds = append(conds, fmt.Sprintf("%s < %s", upperSQL, qUpLit))
-			} else {
-				conds = append(conds, fmt.Sprintf("%s <= %s", upperSQL, qUpLit))
-			}
-		}
-	default: // INTERSECTS
-		if hasUpper {
-			if qUpperExclusive {
-				conds = append(conds, fmt.Sprintf("%s < %s", lowerSQL, qUpLit))
-			} else {
-				conds = append(conds, fmt.Sprintf("%s <= %s", lowerSQL, qUpLit))
-			}
-		}
-		if hasLower {
-			if qLowerExclusive {
-				conds = append(conds, fmt.Sprintf("%s > %s", upperSQL, qLowLit))
-			} else {
-				conds = append(conds, fmt.Sprintf("%s >= %s", upperSQL, qLowLit))
-			}
-		}
+		conds = append([]string{existsCond}, conds...)
+		return "(" + strings.Join(conds, " AND ") + ")"
 	}
-	if len(conds) == 0 {
-		return existsCond
+
+	lowerSQL, upperSQL, rawLower, rawUpper := t.rangeFieldBoundsAndRawSQL(field, b, nctx)
+	singlePred := buildPred(lowerSQL, upperSQL, rawLower, rawUpper)
+	if nctx != nil && nctx.elemVar != "" && (b.Kind == schema.StorageNestedSubfield || b.NestedPath == nctx.nestedPath) && nctx.nestedPath == b.NestedPath {
+		return singlePred
 	}
-	conds = append([]string{existsCond}, conds...)
-	return "(" + strings.Join(conds, " AND ") + ")"
+	baseExpr := rangeDocBaseExpr(field, b)
+	arrExpr := fmt.Sprintf("CAST(%s AS ARRAY<STRING>)", baseExpr)
+	elemLower, elemUpper, elemRawLower, elemRawUpper := rangeObjectBoundsSQLFromBase("CAST(_x AS JSON)")
+	elemPred := buildPred(elemLower, elemUpper, elemRawLower, elemRawUpper)
+	return fmt.Sprintf("((%s IS NOT NULL AND array_exists(_x -> %s, %s)) OR (%s IS NULL AND %s))", arrExpr, elemPred, arrExpr, arrExpr, singlePred)
 }
 
 func (t *Transpiler) compileGeoPolygon(gp *esast.GeoPolygonQuery, scoring bool, nctx *nestedCtx) CompiledQuery {
@@ -13540,9 +13625,34 @@ func (t *Transpiler) compilePinnedQuery(p *esast.PinnedQuery, inScoring bool, nc
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
 	var pinnedIDs []any
-	for _, id := range p.EffectiveIDs() {
-		if id != "" {
-			pinnedIDs = append(pinnedIDs, id)
+	var pinnedRanks []int
+	if len(p.Docs) > 0 && t.Schema != nil && t.Schema.IndexName != "" {
+		rankIdx := 0
+		for _, id := range p.IDs {
+			if id != "" {
+				pinnedIDs = append(pinnedIDs, id)
+				pinnedRanks = append(pinnedRanks, rankIdx)
+			}
+			rankIdx++
+		}
+		for _, d := range p.Docs {
+			idxVal, okIdx := d["_index"]
+			if okIdx && idxVal != nil && strings.TrimSpace(fmt.Sprintf("%v", idxVal)) == t.Schema.IndexName {
+				if idVal, okID := d["_id"]; okID && idVal != nil {
+					if s := strings.TrimSpace(fmt.Sprintf("%v", idVal)); s != "" {
+						pinnedIDs = append(pinnedIDs, s)
+						pinnedRanks = append(pinnedRanks, rankIdx)
+					}
+				}
+			}
+			rankIdx++
+		}
+	} else {
+		for idx, id := range p.EffectiveIDs() {
+			if id != "" {
+				pinnedIDs = append(pinnedIDs, id)
+				pinnedRanks = append(pinnedRanks, idx)
+			}
 		}
 	}
 	pinnedPred := "FALSE"
@@ -13579,7 +13689,7 @@ func (t *Transpiler) compilePinnedQuery(p *esast.PinnedQuery, inScoring bool, nc
 		} else if pinnedPred != "FALSE" {
 			var rankCases []string
 			for i, id := range pinnedIDs {
-				rankWeight := 1000000.0 - float64(i)*1000.0
+				rankWeight := 1000000.0 - float64(pinnedRanks[i])*1000.0
 				if rankWeight < 1000.0 {
 					rankWeight = 1000.0
 				}
@@ -14873,11 +14983,10 @@ func (t *Transpiler) compileRuleQuery(rq *esast.RuleQuerySpec, inScoring bool, n
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
 	if rq.Organic == nil {
-		scoreSQL := "1.0"
-		if rq.Boost != nil && inScoring {
-			scoreSQL = fmt.Sprintf("%.4f", *rq.Boost)
+		if t.searchErr == nil {
+			t.searchErr = fmt.Errorf("parsing_exception: [rule] requires [organic] query")
 		}
-		return CompiledQuery{WhereSQL: "1=1", SafeWhereSQL: "1=1", ScoreSQL: scoreSQL}
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
 	cp := t.CompileQuery(rq.Organic, inScoring, nctx)
 	if rq.Boost != nil && inScoring {

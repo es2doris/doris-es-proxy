@@ -3946,7 +3946,7 @@ func TestRound53TranspilerF14AndF17ToF19(t *testing.T) {
 		wantSub string
 	}{
 		{`{"rule":{"ruleset_ids":["r1"],"match_criteria":{"q":"shoes"},"organic":{"term":{"status":"active"}},"boost":2.0}}`, "`f__status` = 'active'"},
-		{`{"rule":{"ruleset_ids":["r1"],"match_criteria":{"q":"shoes"}}}`, "1=1"},
+		{`{"rule":{"ruleset_ids":["r1"],"match_criteria":{"q":"shoes"},"organic":{"match_all":{}}}}`, "TRUE"},
 		{`{"sparse_vector":{"field":"ml_tokens","query_vector":{"shoes":1.5,"low":0.05},"prune":true,"pruning_config":{"tokens_weight_threshold":0.5,"only_score_pruned_tokens":true},"filter":{"term":{"status":"active"}},"boost":2.0}}`, "ml_tokens"},
 		{`{"sparse_vector":{"field":"ml_tokens","inference_id":"elser","query":"running shoes"}}`, "ml_tokens"},
 		{`{"text_expansion":{"ml_tokens":{"model_id":"elser","model_text":"running shoes","boost":1.5}}}`, "ml_tokens"},
@@ -4557,5 +4557,200 @@ func TestRound56TranspilerAndLuceneF15ToF19(t *testing.T) {
 	_ = json.Unmarshal([]byte(`{"query_string":{"query":"title:\"\"","zero_terms_query":"all"}}`), &qEmptyTextAll)
 	if w := tr.CompileQuery(&qEmptyTextAll, false, nil).WhereSQL; strings.Trim(w, "()") != "TRUE" {
 		t.Fatalf("F19 expected title:\"\" on text field with zero_terms_query='all' to be TRUE, got %s", w)
+	}
+}
+
+func TestRound57TranspilerAndLuceneCompliance(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"title": {"type": "text"},
+			"status": {"type": "keyword"},
+			"u_val": {"type": "unsigned_long"},
+			"f_win": {"type": "float_range"},
+			"d_win": {"type": "double_range"},
+			"i_win": {"type": "integer_range"},
+			"cos_vec": {"type": "dense_vector", "dims": 3},
+			"l2_vec": {"type": "dense_vector", "dims": 3, "similarity": "l2_norm"}
+		}
+	}`), &spec); err != nil {
+		t.Fatalf("Round 57 mapping unmarshal failed: %v", err)
+	}
+	sch := schema.CompileIndexSchema("es_db", "orders_r57", &spec)
+	tr := NewTranspiler(sch, TranspilerOptions{})
+
+	// F11: pinned.docs per-index filtering
+	var pinnedMixed esast.Query
+	if err := json.Unmarshal([]byte(`{
+		"pinned": {
+			"docs": [
+				{"_index": "other_idx", "_id": "foreign_1"},
+				{"_index": "orders_r57", "_id": "local_2"}
+			],
+			"organic": {"term": {"status": "open"}}
+		}
+	}`), &pinnedMixed); err != nil {
+		t.Fatalf("F11 unmarshal pinnedMixed failed: %v", err)
+	}
+	cpMixed := tr.CompileQuery(&pinnedMixed, true, nil)
+	if strings.Contains(cpMixed.WhereSQL, "foreign_1") || !strings.Contains(cpMixed.WhereSQL, "local_2") {
+		t.Fatalf("F11 expected only local_2 in WhereSQL, got %s", cpMixed.WhereSQL)
+	}
+	if !strings.Contains(cpMixed.ScoreSQL, "999000") || strings.Contains(cpMixed.ScoreSQL, "foreign_1") {
+		t.Fatalf("F11 expected preserved cross-index rank weight 999000 for local_2, got %s", cpMixed.ScoreSQL)
+	}
+
+	var pinnedNoneMatch esast.Query
+	if err := json.Unmarshal([]byte(`{
+		"pinned": {
+			"docs": [{"_index": "other_idx", "_id": "foreign_1"}],
+			"organic": {"term": {"status": "open"}}
+		}
+	}`), &pinnedNoneMatch); err != nil {
+		t.Fatalf("F11 unmarshal pinnedNoneMatch failed: %v", err)
+	}
+	cpNone := tr.CompileQuery(&pinnedNoneMatch, true, nil)
+	if strings.Contains(cpNone.WhereSQL, "foreign_1") || !strings.Contains(cpNone.WhereSQL, "`f__status` = 'open'") {
+		t.Fatalf("F11 expected purely organic WhereSQL when no pinned.docs match index, got %s", cpNone.WhereSQL)
+	}
+
+	// F11: direct compileRuleQuery without organic sets parsing_exception
+	trRule := NewTranspiler(sch, TranspilerOptions{})
+	cpRuleNil := trRule.CompileQuery(&esast.Query{Rule: &esast.RuleQuerySpec{RulesetID: "r1"}}, true, nil)
+	if cpRuleNil.WhereSQL != "FALSE" || trRule.searchErr == nil || !strings.Contains(trRule.searchErr.Error(), "[rule] requires [organic]") {
+		t.Fatalf("F11 expected compileRuleQuery error when Organic==nil, got where=%s err=%v", cpRuleNil.WhereSQL, trRule.searchErr)
+	}
+
+	// F12: resolveFuzzyMaxEdits returns 0 for terms shorter than low runes (default low=3 for AUTO / nil)
+	if got := resolveFuzzyMaxEdits("AUTO", 1); got != 0 {
+		t.Fatalf("F12 expected 0 edits for 1-rune AUTO, got %d", got)
+	}
+	if got := resolveFuzzyMaxEdits("auto", 2); got != 0 {
+		t.Fatalf("F12 expected 0 edits for 2-rune auto, got %d", got)
+	}
+	if got := resolveFuzzyMaxEdits(nil, 2); got != 0 {
+		t.Fatalf("F12 expected 0 edits for 2-rune nil fuzziness, got %d", got)
+	}
+	if got := resolveFuzzyMaxEdits("AUTO", 3); got != 1 {
+		t.Fatalf("F12 expected 1 edit for 3-rune AUTO, got %d", got)
+	}
+	if got := resolveFuzzyMaxEdits("AUTO", 6); got != 2 {
+		t.Fatalf("F12 expected 2 edits for 6-rune AUTO, got %d", got)
+	}
+	if got := resolveFuzzyMaxEdits("AUTO:4,7", 3); got != 0 {
+		t.Fatalf("F12 expected 0 edits for 3-rune AUTO:4,7, got %d", got)
+	}
+
+	// F16: compileKNN rejects zero-magnitude query_vector on cosine similarity, allows on l2_norm
+	var zeroCosSR esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{"knn":{"field":"cos_vec","query_vector":[0,0,0],"k":5,"num_candidates":10}}`), &zeroCosSR); err != nil {
+		t.Fatalf("F16 unmarshal zeroCosSR failed: %v", err)
+	}
+	if _, err := tr.BuildSearchPlan(&zeroCosSR); err == nil || !strings.Contains(err.Error(), "Zero-magnitude vectors are not supported when using [cosine] similarity") {
+		t.Fatalf("F16 expected cosine zero-vector search error, got %v", err)
+	}
+	var zeroL2SR esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{"knn":{"field":"l2_vec","query_vector":[0,0,0],"k":5,"num_candidates":10}}`), &zeroL2SR); err != nil {
+		t.Fatalf("F16 unmarshal zeroL2SR failed: %v", err)
+	}
+	if _, err := tr.BuildSearchPlan(&zeroL2SR); err != nil {
+		t.Fatalf("F16 expected l2_norm zero-vector search to succeed, got %v", err)
+	}
+
+	// F17: unsigned_long routes term, terms, range, sort, and terms aggs through LARGEINT / _doc (never clamped BIGINT f__u_val)
+	uQueries := []string{
+		`{"query":{"term":{"u_val":9223372036854775807}},"sort":[{"u_val":"asc"}],"search_after":["18446744073709551614"]}`,
+		`{"query":{"terms":{"u_val":[42,"18446744073709551615"]}}}`,
+		`{"query":{"range":{"u_val":{"lte":9223372036854775807}}}}`,
+	}
+	for _, rawU := range uQueries {
+		var sr esast.SearchRequest
+		if err := json.Unmarshal([]byte(rawU), &sr); err != nil {
+			t.Fatalf("F17 unmarshal %s failed: %v", rawU, err)
+		}
+		plan, err := tr.BuildSearchPlan(&sr)
+		if err != nil {
+			t.Fatalf("F17 BuildSearchPlan %s failed: %v", rawU, err)
+		}
+		if strings.Contains(plan.HitsSQL, "`f__u_val`") || !strings.Contains(plan.HitsSQL, "CAST(`_doc`['u_val'] AS LARGEINT)") {
+			t.Fatalf("F17 expected LARGEINT _doc cast without f__u_val for %s, got %s", rawU, plan.HitsSQL)
+		}
+	}
+	var uAggSR esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"size": 0,
+		"aggs": {
+			"by_u": {"terms": {"field": "u_val"}},
+			"by_status": {
+				"terms": {"field": "status"},
+				"aggs": {"sub_u": {"terms": {"field": "u_val"}}}
+			}
+		}
+	}`), &uAggSR); err != nil {
+		t.Fatalf("F17 unmarshal uAggSR failed: %v", err)
+	}
+	uAggPlan, err := tr.BuildSearchPlan(&uAggSR)
+	if err != nil {
+		t.Fatalf("F17 BuildSearchPlan uAggSR failed: %v", err)
+	}
+	if strings.Contains(uAggPlan.AggsSQL, "`f__u_val`") || !strings.Contains(uAggPlan.AggsSQL, "CAST(`_doc`['u_val'] AS LARGEINT)") {
+		t.Fatalf("F17 expected terms agg & sub-agg to use LARGEINT _doc cast, got %s", uAggPlan.AggsSQL)
+	}
+
+	// F18: float_range/double_range CONTAINS exclusive gt/lt uses Nextafter & multi-valued array_exists
+	var fContainsQ esast.Query
+	if err := json.Unmarshal([]byte(`{"range":{"f_win":{"gt":10.0,"lt":20.0,"relation":"contains"}}}`), &fContainsQ); err != nil {
+		t.Fatalf("F18 unmarshal fContainsQ failed: %v", err)
+	}
+	cpFContains := tr.CompileQuery(&fContainsQ, false, nil)
+	if !strings.Contains(cpFContains.WhereSQL, "10.000000000000002") || !strings.Contains(cpFContains.WhereSQL, "19.999999999999996") {
+		t.Fatalf("F18 expected Nextafter bounds in CONTAINS WhereSQL, got %s", cpFContains.WhereSQL)
+	}
+	if !strings.Contains(cpFContains.WhereSQL, "array_exists(_x ->") || !strings.Contains(cpFContains.WhereSQL, "CAST(_x AS JSON)['_gte']") {
+		t.Fatalf("F18 expected per-element array_exists range predicate, got %s", cpFContains.WhereSQL)
+	}
+
+	// F19: query_string ~AUTO:low,high (unfielded & fielded) + strict malformed range brackets
+	validQS := []string{
+		`{"query":{"query_string":{"default_field":"title","query":"quikc~AUTO:3,6"}}}`,
+		`{"query":{"query_string":{"query":"title:quikc~auto:3,6"}}}`,
+		`{"query":{"query_string":{"query":"u_val:[10 TO *] AND u_val:[* TO 20] AND u_val:[* TO *]"}}}`,
+		`{"query":{"query_string":{"query":"status:{\"a b\" TO \"c d\"}"}}}`,
+		`{"query":{"query_string":{"query":"u_val:[10 TO]","lenient":true}}}`,
+	}
+	for _, rawQS := range validQS {
+		var sr esast.SearchRequest
+		if err := json.Unmarshal([]byte(rawQS), &sr); err != nil {
+			t.Fatalf("F19 unmarshal %s failed: %v", rawQS, err)
+		}
+		plan, err := tr.BuildSearchPlan(&sr)
+		if err != nil {
+			t.Fatalf("F19 expected valid query_string %s, got err=%v", rawQS, err)
+		}
+		if strings.Contains(rawQS, "quikc~") && strings.Contains(plan.HitsSQL, "quikc~AUTO") {
+			t.Fatalf("F19 expected quikc~AUTO:3,6 not to split on colon into field name, got %s", plan.HitsSQL)
+		}
+	}
+
+	badQS := []string{
+		`{"query":{"query_string":{"query":"u_val:10]"}}}`,
+		`{"query":{"query_string":{"query":"u_val:10}"}}}`,
+		`{"query":{"query_string":{"query":"u_val:[10 TO 20"}}}`,
+		`{"query":{"query_string":{"query":"u_val:[10 TO]"}}}`,
+		`{"query":{"query_string":{"query":"u_val:[TO 20]"}}}`,
+		`{"query":{"query_string":{"query":"u_val:[10 20]"}}}`,
+		`{"query":{"query_string":{"query":"u_val:[]"}}}`,
+		`{"query":{"query_string":{"query":"u_val:[TO]"}}}`,
+		`{"query":{"query_string":{"query":"quikc~AUTO:6,3"}}}`,
+		`{"query":{"query_string":{"query":"quikc~AUTO:abc"}}}`,
+	}
+	for _, rawBad := range badQS {
+		var sr esast.SearchRequest
+		if err := json.Unmarshal([]byte(rawBad), &sr); err != nil {
+			t.Fatalf("F19 unmarshal bad %s failed: %v", rawBad, err)
+		}
+		if _, err := tr.BuildSearchPlan(&sr); err == nil || !strings.Contains(err.Error(), "parse_exception") {
+			t.Fatalf("F19 expected parse_exception for %s, got %v", rawBad, err)
+		}
 	}
 }

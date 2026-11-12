@@ -2184,7 +2184,7 @@ func TestRound53_F10_F11_F12_F13_F14_F19_ASTValidation(t *testing.T) {
 		`{"retriever":{"rule":{"retriever":{"standard":{"query":{"match":{"title":"shoes"}}}},"ruleset_ids":["rs1"],"match_criteria":{"q":"shoes"}}}}`,
 		`{"retriever":{"text_similarity_reranker":{"retriever":{"standard":{"query":{"match":{"title":"shoes"}}}},"field":"body","inference_id":"rerank-model","inference_text":"comfortable shoes","rank_window_size":20,"min_score":0.1}}}`,
 		`{"query":{"rule":{"ruleset_ids":["rs1"],"match_criteria":{"category":"books"},"organic":{"match":{"title":"go"}}}}}`,
-		`{"query":{"rule":{"ruleset_id":"rs1","match_criteria":{"category":"books"}}}}`,
+		`{"query":{"rule":{"ruleset_id":"rs1","match_criteria":{"category":"books"},"organic":{"match_all":{}}}}}`,
 		`{"query":{"sparse_vector":{"field":"ml.tokens","query_vector":{"shoes":1.5,"running":0.8},"prune":true,"pruning_config":{"tokens_freq_ratio_threshold":5,"tokens_weight_threshold":0.4,"only_score_pruned_tokens":false},"boost":1.2}}}`,
 		`{"query":{"sparse_vector":{"field":"ml.tokens","inference_id":"elser","query":"running shoes"}}}`,
 		`{"query":{"text_expansion":{"ml.tokens":{"model_id":"elser","model_text":"running shoes","boost":1.5}}}}`,
@@ -2637,6 +2637,101 @@ func TestRound56ASTValidationF10F11F19(t *testing.T) {
 		var sr SearchRequest
 		if err := json.Unmarshal([]byte(raw), &sr); err == nil {
 			t.Fatalf("Round 56 expected error for invalid SearchRequest %s", raw)
+		}
+	}
+}
+
+func TestRound57ASTValidation(t *testing.T) {
+	validReqs := []string{
+		// F10: fixed_interval SI/fixed units + deprecated interval calendar/fixed + composite unique sources & matching after
+		`{"size":0,"aggs":{"dh":{"date_histogram":{"field":"ts","fixed_interval":"500ms"}}}}`,
+		`{"size":0,"aggs":{"dh":{"date_histogram":{"field":"ts","fixed_interval":"30s"}}}}`,
+		`{"size":0,"aggs":{"dh":{"date_histogram":{"field":"ts","fixed_interval":"15m"}}}}`,
+		`{"size":0,"aggs":{"dh":{"date_histogram":{"field":"ts","fixed_interval":"6h"}}}}`,
+		`{"size":0,"aggs":{"dh":{"date_histogram":{"field":"ts","fixed_interval":"7d"}}}}`,
+		`{"size":0,"aggs":{"dh":{"date_histogram":{"field":"ts","interval":"1M"}}}}`,
+		`{"size":0,"aggs":{"dh":{"date_histogram":{"field":"ts","interval":"2h"}}}}`,
+		`{"size":0,"aggs":{"comp":{"composite":{"size":10,"sources":[{"s1":{"terms":{"field":"k"}}},{"s2":{"date_histogram":{"field":"ts","fixed_interval":"1d"}}}],"after":{"s1":"abc","s2":1700000000000}}}}}`,
+		`{"size":0,"aggs":{"comp":{"composite":{"sources":[{"s1":{"terms":{"field":"k"}}}],"after":null}}}}`,
+		// F11: pinned.docs with non-empty _index + rule with organic
+		`{"query":{"pinned":{"docs":[{"_index":"orders","_id":"42"}],"organic":{"match_all":{}}}}}`,
+		`{"query":{"rule":{"ruleset_id":"rs1","match_criteria":{"cat":"books"},"organic":{"match_all":{}}}}}`,
+		`{"query":{"rule":{"ruleset_ids":["rs1","rs2"],"match_criteria":{"cat":"books"},"organic":{"term":{"status":"ok"}}}}}`,
+		// F12: valid AUTO and AUTO:low,high fuzziness
+		`{"query":{"fuzzy":{"title":{"value":"quick","fuzziness":"AUTO"}}}}`,
+		`{"query":{"fuzzy":{"title":{"value":"quick","fuzziness":"auto"}}}}`,
+		`{"query":{"fuzzy":{"title":{"value":"quick","fuzziness":"AUTO:3,6"}}}}`,
+		`{"query":{"fuzzy":{"title":{"value":"quick","fuzziness":"auto:0,2"}}}}`,
+		`{"query":{"match":{"title":{"query":"quick","fuzziness":"AUTO:4,7"}}}}`,
+		// F16: k and num_candidates <= 10000
+		`{"knn":{"field":"vec","query_vector":[0.1,0.2],"k":10000,"num_candidates":10000}}`,
+		`{"query":{"knn":{"field":"vec","query_vector":[0.1,0.2],"k":10000,"num_candidates":10000}}}`,
+		`{"query":{"knn":{"vec":{"vector":[0.1,0.2],"k":10000,"num_candidates":10000}}}}`,
+		`{"retriever":{"knn":{"field":"vec","query_vector":[0.1,0.2],"k":10000,"num_candidates":10000}}}`,
+	}
+	for _, raw := range validReqs {
+		var sr SearchRequest
+		if err := json.Unmarshal([]byte(raw), &sr); err != nil {
+			t.Fatalf("Round 57 expected valid SearchRequest %s, got err=%v", raw, err)
+		}
+	}
+
+	invalidReqs := []struct {
+		raw     string
+		wantSub string
+	}{
+		// F10: calendar units in fixed_interval
+		{`{"size":0,"aggs":{"dh":{"date_histogram":{"field":"ts","fixed_interval":"1w"}}}}`, "fixed_interval"},
+		{`{"size":0,"aggs":{"dh":{"date_histogram":{"field":"ts","fixed_interval":"1M"}}}}`, "fixed_interval"},
+		{`{"size":0,"aggs":{"dh":{"date_histogram":{"field":"ts","fixed_interval":"1q"}}}}`, "fixed_interval"},
+		{`{"size":0,"aggs":{"dh":{"date_histogram":{"field":"ts","fixed_interval":"1y"}}}}`, "fixed_interval"},
+		{`{"size":0,"aggs":{"dh":{"date_histogram":{"field":"ts","fixed_interval":"+1d"}}}}`, "fixed_interval"},
+		{`{"size":0,"aggs":{"dh":{"date_histogram":{"field":"ts","fixed_interval":"0d"}}}}`, "fixed_interval"},
+		{`{"size":0,"aggs":{"dh":{"date_histogram":{"field":"ts","fixed_interval":"ms"}}}}`, "fixed_interval"},
+		{`{"size":0,"aggs":{"dh":{"date_histogram":{"field":"ts","fixed_interval":""}}}}`, "requires one of"},
+		{`{"size":0,"aggs":{"comp":{"composite":{"sources":[{"s1":{"date_histogram":{"field":"ts","fixed_interval":"1M"}}}]}}}}`, "fixed_interval"},
+		// F10: composite duplicate source names & mismatched/non-object after
+		{`{"size":0,"aggs":{"comp":{"composite":{"sources":[{"dup":{"terms":{"field":"a"}}},{"dup":{"terms":{"field":"b"}}}]}}}}`, "duplicate source name"},
+		{`{"size":0,"aggs":{"comp":{"composite":{"sources":[{"s1":{"terms":{"field":"a"}}}],"after":"cursor"}}}}`, "after"},
+		{`{"size":0,"aggs":{"comp":{"composite":{"sources":[{"s1":{"terms":{"field":"a"}}}],"after":[1]}}}}`, "after"},
+		{`{"size":0,"aggs":{"comp":{"composite":{"sources":[{"s1":{"terms":{"field":"a"}}},{"s2":{"terms":{"field":"b"}}}],"after":{"s1":"x"}}}}}`, "after"},
+		{`{"size":0,"aggs":{"comp":{"composite":{"sources":[{"s1":{"terms":{"field":"a"}}}],"after":{"s1":"x","extra":"y"}}}}}`, "after"},
+		{`{"size":0,"aggs":{"comp":{"composite":{"sources":[{"s1":{"terms":{"field":"a"}}}],"after":{"wrong":"x"}}}}}`, "after"},
+		// F11: pinned.docs missing/blank/null _index + rule validation
+		{`{"query":{"pinned":{"docs":[{"_id":"1"}],"organic":{"match_all":{}}}}}`, "[_index]"},
+		{`{"query":{"pinned":{"docs":[{"_index":"","_id":"1"}],"organic":{"match_all":{}}}}}`, "[_index]"},
+		{`{"query":{"pinned":{"docs":[{"_index":"   ","_id":"1"}],"organic":{"match_all":{}}}}}`, "[_index]"},
+		{`{"query":{"pinned":{"docs":[{"_index":null,"_id":"1"}],"organic":{"match_all":{}}}}}`, "[_index]"},
+		{`{"query":{"rule":{"ruleset_id":"r1","ruleset_ids":["r2"],"match_criteria":{"a":1},"organic":{"match_all":{}}}}}`, "cannot specify both"},
+		{`{"query":{"rule":{"ruleset_ids":[],"match_criteria":{"a":1},"organic":{"match_all":{}}}}}`, "ruleset_ids"},
+		{`{"query":{"rule":{"ruleset_ids":["r1","  "],"match_criteria":{"a":1},"organic":{"match_all":{}}}}}`, "ruleset_ids"},
+		{`{"query":{"rule":{"ruleset_id":"r1","match_criteria":{"a":1}}}}`, "requires [organic]"},
+		{`{"query":{"rule":{"ruleset_id":"r1","match_criteria":{"a":1},"organic":null}}}`, "requires [organic]"},
+		// F12: malformed AUTO:low,high fuzziness
+		{`{"query":{"fuzzy":{"title":{"value":"quick","fuzziness":"AUTO:"}}}}`, "illegal_argument_exception"},
+		{`{"query":{"fuzzy":{"title":{"value":"quick","fuzziness":"AUTO:abc"}}}}`, "illegal_argument_exception"},
+		{`{"query":{"fuzzy":{"title":{"value":"quick","fuzziness":"AUTO:3,abc"}}}}`, "illegal_argument_exception"},
+		{`{"query":{"fuzzy":{"title":{"value":"quick","fuzziness":"AUTO:6,3"}}}}`, "illegal_argument_exception"},
+		{`{"query":{"fuzzy":{"title":{"value":"quick","fuzziness":"AUTO:-1,5"}}}}`, "illegal_argument_exception"},
+		{`{"query":{"fuzzy":{"title":{"value":"quick","fuzziness":"AUTO:+3,6"}}}}`, "illegal_argument_exception"},
+		{`{"query":{"fuzzy":{"title":{"value":"quick","fuzziness":"AUTO:,5"}}}}`, "illegal_argument_exception"},
+		{`{"query":{"fuzzy":{"title":{"value":"quick","fuzziness":"AUTO:3,"}}}}`, "illegal_argument_exception"},
+		{`{"query":{"fuzzy":{"title":{"value":"quick","fuzziness":"AUTO:1,2,3"}}}}`, "illegal_argument_exception"},
+		// F16: k > 10000 and num_candidates > 10000
+		{`{"knn":{"field":"vec","query_vector":[0.1,0.2],"k":10001}}`, "10000"},
+		{`{"knn":{"field":"vec","query_vector":[0.1,0.2],"k":10,"num_candidates":10001}}`, "10000"},
+		{`{"query":{"knn":{"field":"vec","query_vector":[0.1,0.2],"k":10001}}}`, "10000"},
+		{`{"query":{"knn":{"field":"vec","query_vector":[0.1,0.2],"k":10,"num_candidates":10001}}}`, "10000"},
+		{`{"query":{"knn":{"vec":{"vector":[0.1,0.2],"k":10001}}}}`, "10000"},
+		{`{"query":{"knn":{"vec":{"vector":[0.1,0.2],"k":10,"num_candidates":10001}}}}`, "10000"},
+		{`{"retriever":{"knn":{"field":"vec","query_vector":[0.1,0.2],"k":10001,"num_candidates":10000}}}`, "10000"},
+		{`{"retriever":{"knn":{"field":"vec","query_vector":[0.1,0.2],"k":10,"num_candidates":10001}}}`, "10000"},
+	}
+	for _, tc := range invalidReqs {
+		var sr SearchRequest
+		err := json.Unmarshal([]byte(tc.raw), &sr)
+		if err == nil || !strings.Contains(err.Error(), tc.wantSub) {
+			t.Fatalf("Round 57 expected error containing %q for %s, got err=%v", tc.wantSub, tc.raw, err)
 		}
 	}
 }

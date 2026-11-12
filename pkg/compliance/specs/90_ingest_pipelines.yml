@@ -678,3 +678,199 @@
   - match: { docs.0.doc._source.meta.shared: "new" }
   - match: { docs.0.doc._source.meta.added: 7 }
 
+---
+"Round 57 Ingest Processor Validation, Java Named Regex Groups, TAI64N/Ordinal Date & Strict Convert Compliance":
+  # F27: Pipeline processor configuration validation rejections (sort, split, kv, date, fingerprint)
+  - do:
+      catch: bad_request
+      ingest.put_pipeline:
+        id: r57_bad_sort_order
+        body:
+          processors:
+            - sort:
+                field: "arr"
+                order: "sideways"
+
+  - do:
+      catch: bad_request
+      ingest.put_pipeline:
+        id: r57_bad_split_regex
+        body:
+          processors:
+            - split:
+                field: "raw"
+                separator: "[unclosed"
+
+  - do:
+      catch: bad_request
+      ingest.put_pipeline:
+        id: r57_bad_kv_inc_exc
+        body:
+          processors:
+            - kv:
+                field: "raw"
+                field_split: " "
+                value_split: "="
+                include_keys: ["a"]
+                exclude_keys: ["b"]
+
+  - do:
+      catch: bad_request
+      ingest.put_pipeline:
+        id: r57_bad_date_formats
+        body:
+          processors:
+            - date:
+                field: "ts"
+                formats: [""]
+
+  - do:
+      catch: bad_request
+      ingest.put_pipeline:
+        id: r57_bad_fingerprint_fields
+        body:
+          processors:
+            - fingerprint:
+                fields: []
+
+  # F27: date processor TAI64N, ordinal day (DDD / ordinal_date_no_millis), and NaN/Infinity rejection
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - date:
+                  field: "tai_ts"
+                  formats: ["TAI64N"]
+                  target_field: "parsed_tai"
+              - date:
+                  field: "ord_ts"
+                  formats: ["uuuu-DDD'T'HH:mm:ssZ"]
+                  target_field: "parsed_ord"
+              - date:
+                  field: "builtin_ord"
+                  formats: ["ordinal_date_no_millis"]
+                  target_field: "parsed_builtin_ord"
+              - date:
+                  field: "nan_epoch"
+                  formats: ["UNIX"]
+                  on_failure:
+                    - set:
+                        field: "nan_rejected"
+                        value: true
+              - date:
+                  field: "inf_epoch"
+                  formats: ["UNIX_MS"]
+                  on_failure:
+                    - set:
+                        field: "inf_rejected"
+                        value: true
+          docs:
+            - _source:
+                tai_ts: "@400000006592008a00000000"
+                ord_ts: "2024-032T00:00:00+0000"
+                builtin_ord: "2024-060T12:30:00Z"
+                nan_epoch: "NaN"
+                inf_epoch: "Infinity"
+  - match: { docs.0.doc._source.parsed_tai: '/^2024-01-01T00:00:00/' }
+  - match: { docs.0.doc._source.parsed_ord: '/^2024-02-01/' }
+  - match: { docs.0.doc._source.parsed_builtin_ord: '/^2024-02-29T12:30:00/' }
+  - match: { docs.0.doc._source.nan_rejected: true }
+  - match: { docs.0.doc._source.inf_rejected: true }
+
+  # F28: gsub/split Java named capture groups (?<name>...), ${name}, literal escapes, and invalid replacement on_failure
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - gsub:
+                  field: "named_src"
+                  pattern: "(?<dept>[a-z]+)-(?<code>\\d+)"
+                  replacement: "${code}\\-${dept}\\$\\\\[$0]"
+              - split:
+                  field: "pipe_str"
+                  separator: "|"
+              - gsub:
+                  field: "bad_group"
+                  pattern: "(\\w+)"
+                  replacement: "$9"
+                  on_failure:
+                    - set:
+                        field: "bad_group_caught"
+                        value: true
+              - gsub:
+                  field: "bad_dollar"
+                  pattern: "(\\w+)"
+                  replacement: "$unknown"
+                  on_failure:
+                    - set:
+                        field: "bad_dollar_caught"
+                        value: true
+          docs:
+            - _source:
+                named_src: "eng-404"
+                pipe_str: "x|y|z"
+                bad_group: "abc"
+                bad_dollar: "abc"
+  - match: { docs.0.doc._source.named_src: '404-eng$\[eng-404]' }
+  - length: { docs.0.doc._source.pipe_str: 3 }
+  - match: { docs.0.doc._source.bad_group_caught: true }
+  - match: { docs.0.doc._source.bad_dollar_caught: true }
+
+  # F29: convert strict numeric vs string parsing, non-trimming auto preservation, and IPv6 canonicalization
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - convert:
+                  field: "sci_int"
+                  type: "integer"
+                  on_failure:
+                    - set: { field: "sci_int_err", value: true }
+              - convert:
+                  field: "pad_int"
+                  type: "integer"
+                  on_failure:
+                    - set: { field: "pad_int_err", value: true }
+              - convert:
+                  field: "int_bool"
+                  type: "boolean"
+                  on_failure:
+                    - set: { field: "int_bool_err", value: true }
+              - convert:
+                  field: "yes_bool"
+                  type: "boolean"
+              - convert:
+                  field: "ip_v6"
+                  type: "ip"
+              - convert:
+                  field: "auto_float"
+                  type: "auto"
+              - convert:
+                  field: "auto_str_int"
+                  type: "auto"
+              - convert:
+                  field: "auto_padded"
+                  type: "auto"
+          docs:
+            - _source:
+                sci_int: "1e2"
+                pad_int: " 42 "
+                int_bool: 1
+                yes_bool: "yes"
+                ip_v6: "2001:0db8:0000:0000:0000:0000:0000:0001"
+                auto_float: 2.5
+                auto_str_int: "77"
+                auto_padded: " 77 "
+  - match: { docs.0.doc._source.sci_int_err: true }
+  - match: { docs.0.doc._source.pad_int_err: true }
+  - match: { docs.0.doc._source.int_bool_err: true }
+  - match: { docs.0.doc._source.yes_bool: true }
+  - match: { docs.0.doc._source.ip_v6: "2001:db8::1" }
+  - match: { docs.0.doc._source.auto_float: 2.5 }
+  - match: { docs.0.doc._source.auto_str_int: 77 }
+  - match: { docs.0.doc._source.auto_padded: " 77 " }
+
+

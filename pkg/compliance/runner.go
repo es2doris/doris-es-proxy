@@ -2,6 +2,7 @@ package compliance
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -193,272 +194,131 @@ func RunSuiteFS(t *testing.T, fsys fs.FS, baseURL string) SuiteReport {
 }
 
 type runnerContext struct {
-	client                      *http.Client
-	baseURL                     string
-	stash                       map[string]any
-	lastStatus                  int
-	lastMethod                  string
-	lastBodyRaw                 string
-	lastResponse                any
-	lastHeaders                 map[string]any
-	lastWarnings                []string
-	createdIndices              map[string]bool
-	createdDataStreams          map[string]bool
-	createdTemplates            map[string]bool
-	createdLegacyTmpls          map[string]bool
-	createdCompTmpls            map[string]bool
-	createdPipelines            map[string]bool
-	createdILMPolicies          map[string]bool
-	createdSLMPolicies          map[string]bool
-	createdEnrichPols           map[string]bool
-	createdWatches              map[string]bool
-	createdTransforms           map[string]bool
-	createdAutoscalingPolicies  map[string]bool
-	createdSynonymSets          map[string]bool
-	createdQueryRulesets        map[string]bool
-	createdRollupJobs           map[string]bool
-	createdAutoFollowPatterns   map[string]bool
-	createdLogstashPipelines    map[string]bool
-	createdSecurityUsers        map[string]bool
-	createdSecurityRoles        map[string]bool
-	createdSecurityPrivileges   map[string]map[string]bool
-	createdServiceTokens        map[string]bool
-	createdShutdownNodes        map[string]bool
-	createdInferenceEndpoints   map[string]bool
-	createdConnectors           map[string]bool
-	createdConnectorSyncJobs    map[string]bool
-	createdSearchApps           map[string]bool
-	createdAnalyticsColls       map[string]bool
-	createdAsyncSearches        map[string]bool
-	createdMLJobs               map[string]bool
-	createdMLDatafeeds          map[string]bool
-	createdMLDataFrameAnalytics map[string]bool
-	createdMLTrainedModels      map[string]bool
-	createdMLModelDeployments   map[string]bool
-	createdMLModelAliases       map[string]string // alias -> model_id
-	createdMLCalendars          map[string]bool
-	createdMLFilters            map[string]bool
-	createdGeoIPDatabases       map[string]bool
-	createdAPIKeys              map[string]bool
-	updatedSecuritySettings     bool
-	createdSecurityRoleMappings map[string]bool
-	createdVotingExclusions     bool
-	createdScripts              map[string]struct{}
-	createdRepositories         map[string]struct{}
-	createdAliases              map[string]string // alias -> index
+	client                       *http.Client
+	baseURL                      string
+	stash                        map[string]any
+	lastStatus                   int
+	lastMethod                   string
+	lastBodyRaw                  string
+	lastResponse                 any
+	lastHeaders                  map[string]any
+	lastWarnings                 []string
+	createdIndices               map[string]bool
+	createdDataStreams           map[string]bool
+	createdTemplates             map[string]bool
+	createdLegacyTmpls           map[string]bool
+	createdCompTmpls             map[string]bool
+	createdPipelines             map[string]bool
+	createdILMPolicies           map[string]bool
+	createdSLMPolicies           map[string]bool
+	createdEnrichPols            map[string]bool
+	createdWatches               map[string]bool
+	createdTransforms            map[string]bool
+	createdAutoscalingPolicies   map[string]bool
+	createdSynonymSets           map[string]bool
+	createdQueryRulesets         map[string]bool
+	createdRollupJobs            map[string]bool
+	createdAutoFollowPatterns    map[string]bool
+	createdLogstashPipelines     map[string]bool
+	createdSecurityUsers         map[string]bool
+	createdSecurityRoles         map[string]bool
+	createdSecurityPrivileges    map[string]map[string]bool
+	createdServiceTokens         map[string]bool
+	createdShutdownNodes         map[string]bool
+	createdInferenceEndpoints    map[string]bool
+	createdConnectors            map[string]bool
+	createdConnectorSyncJobs     map[string]bool
+	createdSearchApps            map[string]bool
+	createdAnalyticsColls        map[string]bool
+	createdAsyncSearches         map[string]bool
+	createdMLJobs                map[string]bool
+	createdMLDatafeeds           map[string]bool
+	createdMLDataFrameAnalytics  map[string]bool
+	createdMLTrainedModels       map[string]bool
+	createdMLModelDeployments    map[string]bool
+	createdMLModelAliases        map[string]string // alias -> model_id
+	createdMLCalendars           map[string]bool
+	createdMLFilters             map[string]bool
+	createdGeoIPDatabases        map[string]bool
+	createdAPIKeys               map[string]bool
+	updatedSecuritySettings      bool
+	updatedWatcherSettings       bool
+	updatedClusterPersistentKeys map[string]bool
+	updatedClusterTransientKeys  map[string]bool
+	createdSecurityRoleMappings  map[string]bool
+	createdVotingExclusions      bool
+	createdScripts               map[string]struct{}
+	createdRepositories          map[string]struct{}
+	createdSnapshots             map[string]map[string]bool // repo -> snapshot -> true
+	createdSLMPolicyRepos        map[string]string          // policy_id -> repo
+	createdAliases               map[string]string          // alias -> index
+	createdFleetSecrets          map[string]bool
+	createdESQLAsyncQueries      map[string]bool
+	createdEQLSearches           map[string]bool
+	createdCCRFollowers          map[string]bool
 }
 
 func newRunnerContext(client *http.Client, baseURL string) *runnerContext {
 	return &runnerContext{
-		client:                      client,
-		baseURL:                     baseURL,
-		stash:                       make(map[string]any),
-		lastHeaders:                 make(map[string]any),
-		createdIndices:              make(map[string]bool),
-		createdDataStreams:          make(map[string]bool),
-		createdTemplates:            make(map[string]bool),
-		createdLegacyTmpls:          make(map[string]bool),
-		createdCompTmpls:            make(map[string]bool),
-		createdPipelines:            make(map[string]bool),
-		createdILMPolicies:          make(map[string]bool),
-		createdSLMPolicies:          make(map[string]bool),
-		createdEnrichPols:           make(map[string]bool),
-		createdWatches:              make(map[string]bool),
-		createdTransforms:           make(map[string]bool),
-		createdAutoscalingPolicies:  make(map[string]bool),
-		createdSynonymSets:          make(map[string]bool),
-		createdQueryRulesets:        make(map[string]bool),
-		createdRollupJobs:           make(map[string]bool),
-		createdAutoFollowPatterns:   make(map[string]bool),
-		createdLogstashPipelines:    make(map[string]bool),
-		createdSecurityUsers:        make(map[string]bool),
-		createdSecurityRoles:        make(map[string]bool),
-		createdSecurityPrivileges:   make(map[string]map[string]bool),
-		createdServiceTokens:        make(map[string]bool),
-		createdShutdownNodes:        make(map[string]bool),
-		createdInferenceEndpoints:   make(map[string]bool),
-		createdConnectors:           make(map[string]bool),
-		createdConnectorSyncJobs:    make(map[string]bool),
-		createdSearchApps:           make(map[string]bool),
-		createdAnalyticsColls:       make(map[string]bool),
-		createdAsyncSearches:        make(map[string]bool),
-		createdMLJobs:               make(map[string]bool),
-		createdMLDatafeeds:          make(map[string]bool),
-		createdMLDataFrameAnalytics: make(map[string]bool),
-		createdMLTrainedModels:      make(map[string]bool),
-		createdMLModelDeployments:   make(map[string]bool),
-		createdMLModelAliases:       make(map[string]string),
-		createdMLCalendars:          make(map[string]bool),
-		createdMLFilters:            make(map[string]bool),
-		createdGeoIPDatabases:       make(map[string]bool),
-		createdAPIKeys:              make(map[string]bool),
-		createdSecurityRoleMappings: make(map[string]bool),
-		createdScripts:              make(map[string]struct{}),
-		createdRepositories:         make(map[string]struct{}),
-		createdAliases:              make(map[string]string),
+		client:                       client,
+		baseURL:                      baseURL,
+		stash:                        make(map[string]any),
+		lastHeaders:                  make(map[string]any),
+		createdIndices:               make(map[string]bool),
+		createdDataStreams:           make(map[string]bool),
+		createdTemplates:             make(map[string]bool),
+		createdLegacyTmpls:           make(map[string]bool),
+		createdCompTmpls:             make(map[string]bool),
+		createdPipelines:             make(map[string]bool),
+		createdILMPolicies:           make(map[string]bool),
+		createdSLMPolicies:           make(map[string]bool),
+		createdEnrichPols:            make(map[string]bool),
+		createdWatches:               make(map[string]bool),
+		createdTransforms:            make(map[string]bool),
+		createdAutoscalingPolicies:   make(map[string]bool),
+		createdSynonymSets:           make(map[string]bool),
+		createdQueryRulesets:         make(map[string]bool),
+		createdRollupJobs:            make(map[string]bool),
+		createdAutoFollowPatterns:    make(map[string]bool),
+		createdLogstashPipelines:     make(map[string]bool),
+		createdSecurityUsers:         make(map[string]bool),
+		createdSecurityRoles:         make(map[string]bool),
+		createdSecurityPrivileges:    make(map[string]map[string]bool),
+		createdServiceTokens:         make(map[string]bool),
+		createdShutdownNodes:         make(map[string]bool),
+		createdInferenceEndpoints:    make(map[string]bool),
+		createdConnectors:            make(map[string]bool),
+		createdConnectorSyncJobs:     make(map[string]bool),
+		createdSearchApps:            make(map[string]bool),
+		createdAnalyticsColls:        make(map[string]bool),
+		createdAsyncSearches:         make(map[string]bool),
+		createdMLJobs:                make(map[string]bool),
+		createdMLDatafeeds:           make(map[string]bool),
+		createdMLDataFrameAnalytics:  make(map[string]bool),
+		createdMLTrainedModels:       make(map[string]bool),
+		createdMLModelDeployments:    make(map[string]bool),
+		createdMLModelAliases:        make(map[string]string),
+		createdMLCalendars:           make(map[string]bool),
+		createdMLFilters:             make(map[string]bool),
+		createdGeoIPDatabases:        make(map[string]bool),
+		createdAPIKeys:               make(map[string]bool),
+		updatedClusterPersistentKeys: make(map[string]bool),
+		updatedClusterTransientKeys:  make(map[string]bool),
+		createdSecurityRoleMappings:  make(map[string]bool),
+		createdScripts:               make(map[string]struct{}),
+		createdRepositories:          make(map[string]struct{}),
+		createdSnapshots:             make(map[string]map[string]bool),
+		createdSLMPolicyRepos:        make(map[string]string),
+		createdAliases:               make(map[string]string),
+		createdFleetSecrets:          make(map[string]bool),
+		createdESQLAsyncQueries:      make(map[string]bool),
+		createdEQLSearches:           make(map[string]bool),
+		createdCCRFollowers:          make(map[string]bool),
 	}
 }
 
 func (c *runnerContext) cleanupAll() {
-	for dfaID := range c.createdMLDataFrameAnalytics {
-		if dfaID != "" {
-			_, _, _ = c.rawHTTP(http.MethodPost, "/_ml/data_frame/analytics/"+url.PathEscape(dfaID)+"/_stop", url.Values{"force": []string{"true"}}, nil, nil)
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ml/data_frame/analytics/"+url.PathEscape(dfaID), url.Values{"force": []string{"true"}}, nil, nil)
-		}
-	}
-	for alias, idx := range c.createdAliases {
-		if idx != "" && alias != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/"+url.PathEscape(idx)+"/_alias/"+url.PathEscape(alias), nil, nil, nil)
-		}
-		if alias != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_all/_alias/"+url.PathEscape(alias), nil, nil, nil)
-		}
-	}
-	for ds := range c.createdDataStreams {
-		if ds != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_data_stream/"+url.PathEscape(ds), nil, nil, nil)
-		}
-	}
-	unblockBody := []byte(`{"index.blocks.read_only":null,"index.blocks.read_only_allow_delete":null,"index.blocks.metadata":null,"index.blocks.write":null,"index.blocks.read":null}`)
-	for idx := range c.createdIndices {
-		if idx != "" && !strings.HasPrefix(idx, "_") {
-			_, _, _ = c.rawHTTP(http.MethodPut, "/"+url.PathEscape(idx)+"/_settings", nil, unblockBody, nil)
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/"+url.PathEscape(idx), nil, nil, nil)
-		}
-	}
-	for tmpl := range c.createdTemplates {
-		if tmpl != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_index_template/"+url.PathEscape(tmpl), nil, nil, nil)
-		}
-	}
-	for tmpl := range c.createdLegacyTmpls {
-		if tmpl != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_template/"+url.PathEscape(tmpl), nil, nil, nil)
-		}
-	}
-	for comp := range c.createdCompTmpls {
-		if comp != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_component_template/"+url.PathEscape(comp), nil, nil, nil)
-		}
-	}
-	for pipe := range c.createdPipelines {
-		if pipe != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ingest/pipeline/"+url.PathEscape(pipe), nil, nil, nil)
-		}
-	}
-	for pol := range c.createdILMPolicies {
-		if pol != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ilm/policy/"+url.PathEscape(pol), nil, nil, nil)
-		}
-	}
-	for pol := range c.createdSLMPolicies {
-		if pol != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_slm/policy/"+url.PathEscape(pol), nil, nil, nil)
-		}
-	}
-	for pol := range c.createdEnrichPols {
-		if pol != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_enrich/policy/"+url.PathEscape(pol), nil, nil, nil)
-		}
-	}
-	for watchID := range c.createdWatches {
-		if watchID != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_watcher/watch/"+url.PathEscape(watchID), nil, nil, nil)
-		}
-	}
-	for transformID := range c.createdTransforms {
-		if transformID != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_transform/"+url.PathEscape(transformID), url.Values{"force": []string{"true"}}, nil, nil)
-		}
-	}
-	for polName := range c.createdAutoscalingPolicies {
-		if polName != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_autoscaling/policy/"+url.PathEscape(polName), nil, nil, nil)
-		}
-	}
-	for synID := range c.createdSynonymSets {
-		if synID != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_synonyms/"+url.PathEscape(synID), nil, nil, nil)
-		}
-	}
-	for rulesetID := range c.createdQueryRulesets {
-		if rulesetID != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_query_rules/"+url.PathEscape(rulesetID), nil, nil, nil)
-		}
-	}
-	for jobID := range c.createdRollupJobs {
-		if jobID != "" {
-			_, _, _ = c.rawHTTP(http.MethodPost, "/_rollup/job/"+url.PathEscape(jobID)+"/_stop", nil, nil, nil)
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_rollup/job/"+url.PathEscape(jobID), nil, nil, nil)
-		}
-	}
-	for patName := range c.createdAutoFollowPatterns {
-		if patName != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ccr/auto_follow/"+url.PathEscape(patName), nil, nil, nil)
-		}
-	}
-	for pipeID := range c.createdLogstashPipelines {
-		if pipeID != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_logstash/pipeline/"+url.PathEscape(pipeID), nil, nil, nil)
-		}
-	}
-	for username := range c.createdSecurityUsers {
-		if username != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_security/user/"+url.PathEscape(username), nil, nil, nil)
-		}
-	}
-	for roleName := range c.createdSecurityRoles {
-		if roleName != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_security/role/"+url.PathEscape(roleName), nil, nil, nil)
-		}
-	}
-	for app, privs := range c.createdSecurityPrivileges {
-		for privName := range privs {
-			if app != "" && privName != "" {
-				_, _, _ = c.rawHTTP(http.MethodDelete, "/_security/privilege/"+url.PathEscape(app)+"/"+url.PathEscape(privName), nil, nil, nil)
-			}
-		}
-	}
-	for tokPath := range c.createdServiceTokens {
-		if tokPath != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_security/service/"+tokPath, nil, nil, nil)
-		}
-	}
-	for nodeID := range c.createdShutdownNodes {
-		if nodeID != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_nodes/"+url.PathEscape(nodeID)+"/shutdown", nil, nil, nil)
-		}
-	}
-	for infID := range c.createdInferenceEndpoints {
-		if infID != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_inference/"+url.PathEscape(infID), nil, nil, nil)
-		}
-	}
-	for jobID := range c.createdConnectorSyncJobs {
-		if jobID != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_connector/_sync_job/"+url.PathEscape(jobID), nil, nil, nil)
-		}
-	}
-	for connID := range c.createdConnectors {
-		if connID != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_connector/"+url.PathEscape(connID), nil, nil, nil)
-		}
-	}
-	for appName := range c.createdSearchApps {
-		if appName != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_application/search_application/"+url.PathEscape(appName), nil, nil, nil)
-		}
-	}
-	for collName := range c.createdAnalyticsColls {
-		if collName != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_application/analytics/"+url.PathEscape(collName), nil, nil, nil)
-		}
-	}
-	for asyncID := range c.createdAsyncSearches {
-		if asyncID != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_async_search/"+url.PathEscape(asyncID), nil, nil, nil)
-		}
-	}
+	// 1. Stop & delete ML jobs/datafeeds/analytics/models, transforms, rollups, sync jobs & connectors, watches, async searches, SLM policies
 	for dfID := range c.createdMLDatafeeds {
 		if dfID != "" {
 			_, _, _ = c.rawHTTP(http.MethodPost, "/_ml/datafeeds/"+url.PathEscape(dfID)+"/_stop", nil, nil, nil)
@@ -469,6 +329,12 @@ func (c *runnerContext) cleanupAll() {
 		if jobID != "" {
 			_, _, _ = c.rawHTTP(http.MethodPost, "/_ml/anomaly_detectors/"+url.PathEscape(jobID)+"/_close", nil, nil, nil)
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ml/anomaly_detectors/"+url.PathEscape(jobID), url.Values{"force": []string{"true"}}, nil, nil)
+		}
+	}
+	for dfaID := range c.createdMLDataFrameAnalytics {
+		if dfaID != "" {
+			_, _, _ = c.rawHTTP(http.MethodPost, "/_ml/data_frame/analytics/"+url.PathEscape(dfaID)+"/_stop", url.Values{"force": []string{"true"}}, nil, nil)
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ml/data_frame/analytics/"+url.PathEscape(dfaID), url.Values{"force": []string{"true"}}, nil, nil)
 		}
 	}
 	for modelID := range c.createdMLModelDeployments {
@@ -496,9 +362,222 @@ func (c *runnerContext) cleanupAll() {
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ml/filters/"+url.PathEscape(filterID), nil, nil, nil)
 		}
 	}
+	for transformID := range c.createdTransforms {
+		if transformID != "" {
+			_, _, _ = c.rawHTTP(http.MethodPost, "/_transform/"+url.PathEscape(transformID)+"/_stop", url.Values{"force": []string{"true"}}, nil, nil)
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_transform/"+url.PathEscape(transformID), url.Values{"force": []string{"true"}}, nil, nil)
+		}
+	}
+	for jobID := range c.createdRollupJobs {
+		if jobID != "" {
+			_, _, _ = c.rawHTTP(http.MethodPost, "/_rollup/job/"+url.PathEscape(jobID)+"/_stop", nil, nil, nil)
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_rollup/job/"+url.PathEscape(jobID), nil, nil, nil)
+		}
+	}
+	for jobID := range c.createdConnectorSyncJobs {
+		if jobID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_connector/_sync_job/"+url.PathEscape(jobID), nil, nil, nil)
+		}
+	}
+	for connID := range c.createdConnectors {
+		if connID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_connector/"+url.PathEscape(connID), nil, nil, nil)
+		}
+	}
+	for infID := range c.createdInferenceEndpoints {
+		if infID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_inference/"+url.PathEscape(infID), nil, nil, nil)
+		}
+	}
+	for watchID := range c.createdWatches {
+		if watchID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_watcher/watch/"+url.PathEscape(watchID), nil, nil, nil)
+		}
+	}
+	for asyncID := range c.createdAsyncSearches {
+		if asyncID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_async_search/"+url.PathEscape(asyncID), nil, nil, nil)
+		}
+	}
+	for queryID := range c.createdESQLAsyncQueries {
+		if queryID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_query/async/"+url.PathEscape(queryID), nil, nil, nil)
+		}
+	}
+	for eqlID := range c.createdEQLSearches {
+		if eqlID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_eql/search/"+url.PathEscape(eqlID), nil, nil, nil)
+		}
+	}
+	for pol := range c.createdSLMPolicies {
+		if pol != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_slm/policy/"+url.PathEscape(pol), nil, nil, nil)
+		}
+	}
+
+	// 2. Pause & unfollow CCR auto-follow patterns and follower indices before deleting indices
+	for patName := range c.createdAutoFollowPatterns {
+		if patName != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ccr/auto_follow/"+url.PathEscape(patName), nil, nil, nil)
+		}
+	}
+	for idx := range c.createdCCRFollowers {
+		if idx != "" && !strings.HasPrefix(idx, "_") {
+			_, _, _ = c.rawHTTP(http.MethodPost, "/"+url.PathEscape(idx)+"/_ccr/pause_follow", nil, nil, nil)
+			_, _, _ = c.rawHTTP(http.MethodPost, "/"+url.PathEscape(idx)+"/_ccr/unfollow", nil, nil, nil)
+		}
+	}
+
+	// 3. Delete enrich policies before source/enrich indices
+	for pol := range c.createdEnrichPols {
+		if pol != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_enrich/policy/"+url.PathEscape(pol), nil, nil, nil)
+		}
+	}
+
+	// 4. Delete aliases, data streams, and indices, then synonym sets and query rulesets that indices may reference
+	for alias, idx := range c.createdAliases {
+		if idx != "" && alias != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/"+url.PathEscape(idx)+"/_alias/"+url.PathEscape(alias), nil, nil, nil)
+		}
+		if alias != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_all/_alias/"+url.PathEscape(alias), nil, nil, nil)
+		}
+	}
+	for ds := range c.createdDataStreams {
+		if ds != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_data_stream/"+url.PathEscape(ds), nil, nil, nil)
+		}
+	}
+	unblockBody := []byte(`{"index.blocks.read_only":null,"index.blocks.read_only_allow_delete":null,"index.blocks.metadata":null,"index.blocks.write":null,"index.blocks.read":null}`)
+	for idx := range c.createdIndices {
+		if idx != "" && !strings.HasPrefix(idx, "_") {
+			_, _, _ = c.rawHTTP(http.MethodPut, "/"+url.PathEscape(idx)+"/_settings", nil, unblockBody, nil)
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/"+url.PathEscape(idx), nil, nil, nil)
+		}
+	}
+	for synID := range c.createdSynonymSets {
+		if synID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_synonyms/"+url.PathEscape(synID), nil, nil, nil)
+		}
+	}
+	for rulesetID := range c.createdQueryRulesets {
+		if rulesetID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_query_rules/"+url.PathEscape(rulesetID), nil, nil, nil)
+		}
+	}
+
+	// 5. Delete tracked snapshots before deleting snapshot repositories
+	for repo, snaps := range c.createdSnapshots {
+		if repo == "" {
+			continue
+		}
+		for snap := range snaps {
+			if snap != "" {
+				_, _, _ = c.rawHTTP(http.MethodDelete, "/_snapshot/"+url.PathEscape(repo)+"/"+url.PathEscape(snap), nil, nil, nil)
+			}
+		}
+	}
+	for repo := range c.createdRepositories {
+		if repo != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_snapshot/"+url.PathEscape(repo), nil, nil, nil)
+		}
+	}
+
+	// 6. Delete scripts, pipelines, GeoIP DBs, templates, ILM/autoscaling, Logstash, apps/analytics, Fleet secrets, security, and reset settings
+	for scriptID := range c.createdScripts {
+		if scriptID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_scripts/"+url.PathEscape(scriptID), nil, nil, nil)
+		}
+	}
+	for pipe := range c.createdPipelines {
+		if pipe != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ingest/pipeline/"+url.PathEscape(pipe), nil, nil, nil)
+		}
+	}
 	for dbID := range c.createdGeoIPDatabases {
 		if dbID != "" {
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ingest/geoip/database/"+url.PathEscape(dbID), nil, nil, nil)
+		}
+	}
+	for tmpl := range c.createdTemplates {
+		if tmpl != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_index_template/"+url.PathEscape(tmpl), nil, nil, nil)
+		}
+	}
+	for tmpl := range c.createdLegacyTmpls {
+		if tmpl != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_template/"+url.PathEscape(tmpl), nil, nil, nil)
+		}
+	}
+	for comp := range c.createdCompTmpls {
+		if comp != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_component_template/"+url.PathEscape(comp), nil, nil, nil)
+		}
+	}
+	for pol := range c.createdILMPolicies {
+		if pol != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_ilm/policy/"+url.PathEscape(pol), nil, nil, nil)
+		}
+	}
+	for polName := range c.createdAutoscalingPolicies {
+		if polName != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_autoscaling/policy/"+url.PathEscape(polName), nil, nil, nil)
+		}
+	}
+	for pipeID := range c.createdLogstashPipelines {
+		if pipeID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_logstash/pipeline/"+url.PathEscape(pipeID), nil, nil, nil)
+		}
+	}
+	for appName := range c.createdSearchApps {
+		if appName != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_application/search_application/"+url.PathEscape(appName), nil, nil, nil)
+		}
+	}
+	for collName := range c.createdAnalyticsColls {
+		if collName != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_application/analytics/"+url.PathEscape(collName), nil, nil, nil)
+		}
+	}
+	for secretID := range c.createdFleetSecrets {
+		if secretID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_fleet/secrets/"+url.PathEscape(secretID), nil, nil, nil)
+		}
+	}
+	for nodeID := range c.createdShutdownNodes {
+		if nodeID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_nodes/"+url.PathEscape(nodeID)+"/shutdown", nil, nil, nil)
+		}
+	}
+	if c.createdVotingExclusions {
+		_, _, _ = c.rawHTTP(http.MethodDelete, "/_cluster/voting_config_exclusions", nil, nil, nil)
+	}
+	for username := range c.createdSecurityUsers {
+		if username != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_security/user/"+url.PathEscape(username), nil, nil, nil)
+		}
+	}
+	for rmName := range c.createdSecurityRoleMappings {
+		if rmName != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_security/role_mapping/"+url.PathEscape(rmName), nil, nil, nil)
+		}
+	}
+	for roleName := range c.createdSecurityRoles {
+		if roleName != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_security/role/"+url.PathEscape(roleName), nil, nil, nil)
+		}
+	}
+	for app, privs := range c.createdSecurityPrivileges {
+		for privName := range privs {
+			if app != "" && privName != "" {
+				_, _, _ = c.rawHTTP(http.MethodDelete, "/_security/privilege/"+url.PathEscape(app)+"/"+url.PathEscape(privName), nil, nil, nil)
+			}
+		}
+	}
+	for tokPath := range c.createdServiceTokens {
+		if tokPath != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_security/service/"+tokPath, nil, nil, nil)
 		}
 	}
 	if len(c.createdAPIKeys) > 0 {
@@ -517,23 +596,27 @@ func (c *runnerContext) cleanupAll() {
 	if c.updatedSecuritySettings {
 		_, _, _ = c.rawHTTP(http.MethodPut, "/_security/settings", nil, []byte(`{}`), nil)
 	}
-	for rmName := range c.createdSecurityRoleMappings {
-		if rmName != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_security/role_mapping/"+url.PathEscape(rmName), nil, nil, nil)
-		}
+	if c.updatedWatcherSettings {
+		_, _, _ = c.rawHTTP(http.MethodPut, "/_watcher/settings", nil, []byte(`{}`), nil)
 	}
-	if c.createdVotingExclusions {
-		_, _, _ = c.rawHTTP(http.MethodDelete, "/_cluster/voting_config_exclusions", nil, nil, nil)
-	}
-	for scriptID := range c.createdScripts {
-		if scriptID != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_scripts/"+url.PathEscape(scriptID), nil, nil, nil)
+	if len(c.updatedClusterPersistentKeys) > 0 || len(c.updatedClusterTransientKeys) > 0 {
+		resetPayload := make(map[string]any)
+		if len(c.updatedClusterPersistentKeys) > 0 {
+			pMap := make(map[string]any, len(c.updatedClusterPersistentKeys))
+			for k := range c.updatedClusterPersistentKeys {
+				pMap[k] = nil
+			}
+			resetPayload["persistent"] = pMap
 		}
-	}
-	for repo := range c.createdRepositories {
-		if repo != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_snapshot/"+url.PathEscape(repo), nil, nil, nil)
+		if len(c.updatedClusterTransientKeys) > 0 {
+			tMap := make(map[string]any, len(c.updatedClusterTransientKeys))
+			for k := range c.updatedClusterTransientKeys {
+				tMap[k] = nil
+			}
+			resetPayload["transient"] = tMap
 		}
+		bodyBytes, _ := json.Marshal(resetPayload)
+		_, _, _ = c.rawHTTP(http.MethodPut, "/_cluster/settings", nil, bodyBytes, nil)
 	}
 }
 
@@ -585,6 +668,9 @@ func (c *runnerContext) execDo(rawVal any, isTeardown bool) error {
 	var ignoreStatuses map[int]bool
 	var expectedWarnings []string
 	var expectedWarningsRegex []string
+	var allowedWarnings []string
+	var allowedWarningsRegex []string
+	hasWarningDirective := false
 	var actionName string
 	var actionParams any
 
@@ -604,11 +690,19 @@ func (c *runnerContext) execDo(rawVal any, isTeardown bool) error {
 		case "ignore":
 			ignoreStatuses = parseIgnoreStatuses(c.expandStash(f.Value))
 		case "warnings", "warning_headers":
+			hasWarningDirective = true
 			expectedWarnings = append(expectedWarnings, extractStringSlice(c.expandStash(f.Value))...)
 		case "warnings_regex":
+			hasWarningDirective = true
 			expectedWarningsRegex = append(expectedWarningsRegex, extractStringSlice(c.expandStash(f.Value))...)
-		case "allowed_warnings", "allowed_warnings_regex", "node_selector":
-			// Allowed warning and node selector metadata directives from upstream rest-api-spec
+		case "allowed_warnings":
+			hasWarningDirective = true
+			allowedWarnings = append(allowedWarnings, extractStringSlice(c.expandStash(f.Value))...)
+		case "allowed_warnings_regex":
+			hasWarningDirective = true
+			allowedWarningsRegex = append(allowedWarningsRegex, extractStringSlice(c.expandStash(f.Value))...)
+		case "node_selector":
+			// Node selector metadata directive from upstream rest-api-spec
 		default:
 			actionName = f.Key
 			actionParams = f.Value
@@ -678,40 +772,22 @@ func (c *runnerContext) execDo(rawVal any, isTeardown bool) error {
 	c.lastBodyRaw = bodyStr
 	c.lastResponse = parseResponsePayload(bodyStr)
 
-	// Record resources created during this section for automatic post-section cleanup
-	c.trackCreatedResources(actionName, paramMap, c.lastResponse)
-
-	for _, expWarn := range expectedWarnings {
-		matched := false
-		for _, actualWarn := range c.lastWarnings {
-			if actualWarn == expWarn || strings.Contains(actualWarn, expWarn) {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			return fmt.Errorf("action %s expected warning %q, got %v", actionName, expWarn, c.lastWarnings)
-		}
+	// Record resources created during this section only on 2xx responses
+	if status >= 200 && status < 300 {
+		c.trackCreatedResources(actionName, paramMap, c.lastResponse)
 	}
-	for _, expRegex := range expectedWarningsRegex {
-		pattern := expRegex
-		if len(pattern) >= 2 && strings.HasPrefix(pattern, "/") && strings.HasSuffix(pattern, "/") {
-			pattern = pattern[1 : len(pattern)-1]
-		}
-		re, compErr := regexp.Compile(pattern)
-		if compErr != nil {
-			return fmt.Errorf("action %s invalid warnings_regex %q: %w", actionName, expRegex, compErr)
-		}
-		matched := false
-		for _, actualWarn := range c.lastWarnings {
-			if re.MatchString(actualWarn) {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			return fmt.Errorf("action %s expected warning matching %q, got %v", actionName, expRegex, c.lastWarnings)
-		}
+
+	if err := validateResponseWarnings(
+		actionName,
+		reqSpec.method,
+		hasWarningDirective,
+		c.lastWarnings,
+		expectedWarnings,
+		expectedWarningsRegex,
+		allowedWarnings,
+		allowedWarningsRegex,
+	); err != nil {
+		return err
 	}
 
 	if isTeardown && catchSpec == "" && (status == http.StatusNotFound || status == http.StatusBadRequest) {
@@ -911,6 +987,183 @@ func extractErrorText(parsed any, raw string) string {
 	return raw
 }
 
+var reRFC7234Warning = regexp.MustCompile(`^299\s+\S+\s+"((?:\\.|[^"\\])*)"`)
+
+func extractWarningMessageRFC7234(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if m := reRFC7234Warning.FindStringSubmatch(trimmed); len(m) == 2 {
+		inner := m[1]
+		var sb strings.Builder
+		sb.Grow(len(inner))
+		for i := 0; i < len(inner); i++ {
+			if inner[i] == '\\' && i+1 < len(inner) {
+				i++
+				sb.WriteByte(inner[i])
+				continue
+			}
+			sb.WriteByte(inner[i])
+		}
+		return sb.String()
+	}
+	return trimmed
+}
+
+func stripOptionalRegexSlashes(pattern string) string {
+	if len(pattern) >= 2 && strings.HasPrefix(pattern, "/") && strings.HasSuffix(pattern, "/") {
+		return pattern[1 : len(pattern)-1]
+	}
+	return pattern
+}
+
+func validateResponseWarnings(
+	actionName string,
+	httpMethod string,
+	hasWarningDirective bool,
+	actualWarnings []string,
+	expectedWarnings []string,
+	expectedWarningsRegex []string,
+	allowedWarnings []string,
+	allowedWarningsRegex []string,
+) error {
+	decoded := make([]string, len(actualWarnings))
+	for i, raw := range actualWarnings {
+		decoded[i] = extractWarningMessageRFC7234(raw)
+	}
+
+	covered := make([]bool, len(actualWarnings))
+	usedExpected := make([]bool, len(actualWarnings))
+	for _, expWarn := range expectedWarnings {
+		matchedIdx := -1
+		// Pass 1: exact match preferring uncovered warnings
+		for _, preferUncovered := range []bool{true, false} {
+			for i, dec := range decoded {
+				if usedExpected[i] || (preferUncovered && covered[i]) {
+					continue
+				}
+				if dec == expWarn || strings.TrimSpace(actualWarnings[i]) == expWarn {
+					matchedIdx = i
+					break
+				}
+			}
+			if matchedIdx >= 0 {
+				break
+			}
+		}
+		// Pass 2: substring match preferring uncovered warnings
+		if matchedIdx < 0 {
+			for _, preferUncovered := range []bool{true, false} {
+				for i, dec := range decoded {
+					if usedExpected[i] || (preferUncovered && covered[i]) {
+						continue
+					}
+					if strings.Contains(dec, expWarn) || strings.Contains(actualWarnings[i], expWarn) {
+						matchedIdx = i
+						break
+					}
+				}
+				if matchedIdx >= 0 {
+					break
+				}
+			}
+		}
+		if matchedIdx < 0 {
+			return fmt.Errorf("action %s expected warning %q, got %v", actionName, expWarn, actualWarnings)
+		}
+		usedExpected[matchedIdx] = true
+		covered[matchedIdx] = true
+	}
+
+	usedExpectedRegex := make([]bool, len(actualWarnings))
+	for _, expRegex := range expectedWarningsRegex {
+		re, compErr := regexp.Compile(stripOptionalRegexSlashes(expRegex))
+		if compErr != nil {
+			return fmt.Errorf("action %s invalid warnings_regex %q: %w", actionName, expRegex, compErr)
+		}
+		matchedIdx := -1
+		for _, preferUncovered := range []bool{true, false} {
+			for i, dec := range decoded {
+				if usedExpectedRegex[i] || (preferUncovered && covered[i]) {
+					continue
+				}
+				if re.MatchString(dec) || re.MatchString(actualWarnings[i]) {
+					matchedIdx = i
+					break
+				}
+			}
+			if matchedIdx >= 0 {
+				break
+			}
+		}
+		if matchedIdx < 0 {
+			return fmt.Errorf("action %s expected warning matching %q, got %v", actionName, expRegex, actualWarnings)
+		}
+		usedExpectedRegex[matchedIdx] = true
+		covered[matchedIdx] = true
+	}
+
+	compiledAllowedRegex := make([]*regexp.Regexp, 0, len(allowedWarningsRegex))
+	for _, allowRegex := range allowedWarningsRegex {
+		re, compErr := regexp.Compile(stripOptionalRegexSlashes(allowRegex))
+		if compErr != nil {
+			return fmt.Errorf("action %s invalid allowed_warnings_regex %q: %w", actionName, allowRegex, compErr)
+		}
+		compiledAllowedRegex = append(compiledAllowedRegex, re)
+	}
+
+	for i, dec := range decoded {
+		if covered[i] {
+			continue
+		}
+		for _, aw := range allowedWarnings {
+			if dec == aw || strings.TrimSpace(actualWarnings[i]) == aw || strings.Contains(dec, aw) || strings.Contains(actualWarnings[i], aw) {
+				covered[i] = true
+				break
+			}
+		}
+		if covered[i] {
+			continue
+		}
+		for _, re := range compiledAllowedRegex {
+			if re.MatchString(dec) || re.MatchString(actualWarnings[i]) {
+				covered[i] = true
+				break
+			}
+		}
+	}
+
+	if httpMethod == http.MethodHead && !hasWarningDirective {
+		return nil
+	}
+
+	var unexpected []string
+	for i, raw := range actualWarnings {
+		if !covered[i] {
+			unexpected = append(unexpected, raw)
+		}
+	}
+	if len(unexpected) > 0 {
+		return fmt.Errorf("action %s returned unexpected warning header(s): %v", actionName, unexpected)
+	}
+	return nil
+}
+
+func collectFlatSettingKeys(prefix string, m map[string]any, dst map[string]bool) {
+	for k, v := range m {
+		if k == "" || v == nil {
+			continue
+		}
+		fullKey := k
+		if prefix != "" {
+			fullKey = prefix + "." + k
+		}
+		if subMap, ok := ToNative(v).(map[string]any); ok {
+			collectFlatSettingKeys(fullKey, subMap, dst)
+			continue
+		}
+		dst[fullKey] = true
+	}
+}
+
 func (c *runnerContext) trackCreatedResources(action string, params map[string]any, resp any) {
 	idx := paramString(params, "index")
 	switch action {
@@ -1093,14 +1346,33 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 			c.createdILMPolicies[name] = true
 		}
 	case "slm.put_lifecycle":
-		if pol := paramString(params, "policy_id"); pol != "" {
+		pol := firstNonEmptyParam(params, "policy_id", "policy", "id", "name")
+		if pol != "" {
 			c.createdSLMPolicies[pol] = true
-		} else if pol := paramString(params, "policy"); pol != "" {
-			c.createdSLMPolicies[pol] = true
-		} else if pol := paramString(params, "id"); pol != "" {
-			c.createdSLMPolicies[pol] = true
-		} else if pol := paramString(params, "name"); pol != "" {
-			c.createdSLMPolicies[pol] = true
+			if bodyMap, ok := ToNative(params["body"]).(map[string]any); ok {
+				if repo := paramString(bodyMap, "repository"); repo != "" {
+					c.createdSLMPolicyRepos[pol] = repo
+				}
+			}
+		}
+	case "slm.execute_lifecycle":
+		if rm, ok := ToNative(resp).(map[string]any); ok {
+			if snap := paramString(rm, "snapshot_name"); snap != "" {
+				pol := firstNonEmptyParam(params, "policy_id", "policy", "id", "name")
+				if repo := c.createdSLMPolicyRepos[pol]; repo != "" {
+					if c.createdSnapshots[repo] == nil {
+						c.createdSnapshots[repo] = make(map[string]bool)
+					}
+					c.createdSnapshots[repo][snap] = true
+				} else {
+					for r := range c.createdRepositories {
+						if c.createdSnapshots[r] == nil {
+							c.createdSnapshots[r] = make(map[string]bool)
+						}
+						c.createdSnapshots[r][snap] = true
+					}
+				}
+			}
 		}
 	case "enrich.put_policy":
 		if name := paramString(params, "name"); name != "" {
@@ -1145,6 +1417,7 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 		}
 	case "ccr.follow":
 		if idx != "" {
+			c.createdCCRFollowers[idx] = true
 			c.createdIndices[idx] = true
 		}
 	case "searchable_snapshots.mount":
@@ -1153,6 +1426,64 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 				c.createdIndices[ren] = true
 			} else if bIdx := paramString(bodyMap, "index"); bIdx != "" {
 				c.createdIndices[bIdx] = true
+			}
+		}
+		if rm, ok := ToNative(resp).(map[string]any); ok {
+			if snapMap, ok := ToNative(rm["snapshot"]).(map[string]any); ok {
+				for _, rIdx := range extractStringSlice(snapMap["indices"]) {
+					if rIdx != "" && !strings.ContainsAny(rIdx, "*?,") {
+						c.createdIndices[rIdx] = true
+					}
+				}
+			}
+		}
+	case "snapshot.create":
+		repo := paramString(params, "repository")
+		snap := paramString(params, "snapshot")
+		if repo != "" && snap != "" {
+			if c.createdSnapshots[repo] == nil {
+				c.createdSnapshots[repo] = make(map[string]bool)
+			}
+			c.createdSnapshots[repo][snap] = true
+		}
+	case "snapshot.clone":
+		repo := paramString(params, "repository")
+		targetSnap := firstNonEmptyParam(params, "target_snapshot", "target")
+		if repo != "" && targetSnap != "" {
+			if c.createdSnapshots[repo] == nil {
+				c.createdSnapshots[repo] = make(map[string]bool)
+			}
+			c.createdSnapshots[repo][targetSnap] = true
+		}
+	case "snapshot.restore":
+		if rm, ok := ToNative(resp).(map[string]any); ok {
+			if snapMap, ok := ToNative(rm["snapshot"]).(map[string]any); ok {
+				for _, rIdx := range extractStringSlice(snapMap["indices"]) {
+					if rIdx != "" && !strings.ContainsAny(rIdx, "*?,") {
+						c.createdIndices[rIdx] = true
+					}
+				}
+			}
+		}
+		if bodyMap, ok := ToNative(params["body"]).(map[string]any); ok {
+			var reRename *regexp.Regexp
+			renameRepl := paramString(bodyMap, "rename_replacement")
+			if pat := paramString(bodyMap, "rename_pattern"); pat != "" && renameRepl != "" {
+				reRename, _ = regexp.Compile(pat)
+			}
+			for _, rawIdx := range extractStringSlice(bodyMap["indices"]) {
+				for _, part := range strings.Split(rawIdx, ",") {
+					cand := strings.TrimSpace(part)
+					if cand == "" || strings.ContainsAny(cand, "*?") {
+						continue
+					}
+					if reRename != nil {
+						cand = reRename.ReplaceAllString(cand, renameRepl)
+					}
+					if cand != "" && !strings.ContainsAny(cand, "*?") {
+						c.createdIndices[cand] = true
+					}
+				}
 			}
 		}
 	case "logstash.put_pipeline":
@@ -1209,13 +1540,13 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 			c.createdConnectors[connID] = true
 		}
 	case "connector.post":
-		if rm, ok := resp.(map[string]any); ok {
-			if connID := paramString(rm, "connector_id"); connID != "" {
+		if rm, ok := ToNative(resp).(map[string]any); ok {
+			if connID := firstNonEmptyParam(rm, "id", "connector_id"); connID != "" {
 				c.createdConnectors[connID] = true
 			}
 		}
 	case "connector.sync_job_post":
-		if rm, ok := resp.(map[string]any); ok {
+		if rm, ok := ToNative(resp).(map[string]any); ok {
 			if jobID := firstNonEmptyParam(rm, "id", "connector_sync_job_id"); jobID != "" {
 				c.createdConnectorSyncJobs[jobID] = true
 			}
@@ -1224,14 +1555,32 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 		if name := firstNonEmptyParam(params, "name", "id"); name != "" {
 			c.createdSearchApps[name] = true
 		}
-	case "behavioral_analytics.put_collection":
+	case "behavioral_analytics.put_collection", "search_application.put_behavioral_analytics":
 		if coll := firstNonEmptyParam(params, "collection_name", "name"); coll != "" {
 			c.createdAnalyticsColls[coll] = true
 		}
+	case "fleet.post_secret":
+		if rm, ok := ToNative(resp).(map[string]any); ok {
+			if id := paramString(rm, "id"); id != "" {
+				c.createdFleetSecrets[id] = true
+			}
+		}
 	case "async_search.submit":
-		if rm, ok := resp.(map[string]any); ok {
+		if rm, ok := ToNative(resp).(map[string]any); ok {
 			if id := paramString(rm, "id"); id != "" {
 				c.createdAsyncSearches[id] = true
+			}
+		}
+	case "esql.async_query":
+		if rm, ok := ToNative(resp).(map[string]any); ok {
+			if id := paramString(rm, "id"); id != "" {
+				c.createdESQLAsyncQueries[id] = true
+			}
+		}
+	case "eql.search":
+		if rm, ok := ToNative(resp).(map[string]any); ok {
+			if id := paramString(rm, "id"); id != "" {
+				c.createdEQLSearches[id] = true
 			}
 		}
 	case "ml.put_job":
@@ -1288,6 +1637,17 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 		}
 	case "security.update_settings":
 		c.updatedSecuritySettings = true
+	case "watcher.update_settings":
+		c.updatedWatcherSettings = true
+	case "cluster.put_settings":
+		if bodyMap, ok := ToNative(params["body"]).(map[string]any); ok {
+			if pMap, ok := ToNative(bodyMap["persistent"]).(map[string]any); ok {
+				collectFlatSettingKeys("", pMap, c.updatedClusterPersistentKeys)
+			}
+			if tMap, ok := ToNative(bodyMap["transient"]).(map[string]any); ok {
+				collectFlatSettingKeys("", tMap, c.updatedClusterTransientKeys)
+			}
+		}
 	case "ml.put_calendar":
 		if id := firstNonEmptyParam(params, "calendar_id", "id"); id != "" {
 			c.createdMLCalendars[id] = true
@@ -1374,7 +1734,11 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "cluster.stats":
 		method = http.MethodGet
-		reqPath = "/_cluster/stats"
+		if nodeID := popString("node_id"); nodeID != "" {
+			reqPath = "/_cluster/stats/nodes/" + nodeID
+		} else {
+			reqPath = "/_cluster/stats"
+		}
 
 	case "cluster.get_settings":
 		method = http.MethodGet
@@ -1920,6 +2284,38 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		method = http.MethodPost
 		reqPath = "/_reindex"
 
+	case "reindex_rethrottle":
+		method = http.MethodPost
+		taskID := popString("task_id")
+		if taskID == "" {
+			return nil, fmt.Errorf("reindex_rethrottle requires task_id parameter")
+		}
+		reqPath = "/_reindex/" + taskID + "/_rethrottle"
+
+	case "update_by_query_rethrottle", "indices.update_by_query_rethrottle":
+		method = http.MethodPost
+		taskID := popString("task_id")
+		if taskID == "" {
+			return nil, fmt.Errorf("%s requires task_id parameter", action)
+		}
+		if idx := popString("index"); idx != "" {
+			reqPath = "/" + idx + "/_update_by_query/" + taskID + "/_rethrottle"
+		} else {
+			reqPath = "/_update_by_query/" + taskID + "/_rethrottle"
+		}
+
+	case "delete_by_query_rethrottle", "indices.delete_by_query_rethrottle":
+		method = http.MethodPost
+		taskID := popString("task_id")
+		if taskID == "" {
+			return nil, fmt.Errorf("%s requires task_id parameter", action)
+		}
+		if idx := popString("index"); idx != "" {
+			reqPath = "/" + idx + "/_delete_by_query/" + taskID + "/_rethrottle"
+		} else {
+			reqPath = "/_delete_by_query/" + taskID + "/_rethrottle"
+		}
+
 	case "ingest.put_pipeline":
 		method = http.MethodPut
 		id := popString("id")
@@ -1950,6 +2346,14 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			reqPath = "/_ingest/pipeline/" + id + "/_simulate"
 		} else {
 			reqPath = "/_ingest/pipeline/_simulate"
+		}
+
+	case "simulate.ingest":
+		method = http.MethodPost
+		if idx := popString("index"); idx != "" {
+			reqPath = "/" + idx + "/_ingest/_simulate"
+		} else {
+			reqPath = "/_ingest/_simulate"
 		}
 
 	case "cat.indices":
@@ -2271,6 +2675,14 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		}
 		reqPath = "/_scripts/" + id
 
+	case "get_script_context":
+		method = http.MethodGet
+		reqPath = "/_scripts/_context"
+
+	case "get_script_languages":
+		method = http.MethodGet
+		reqPath = "/_scripts/_languages"
+
 	case "execute_painless_execute", "scripts_painless_execute":
 		method = http.MethodPost
 		reqPath = "/_scripts/painless/_execute"
@@ -2481,6 +2893,30 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		}
 		reqPath = "/" + idx + "/_close"
 
+	case "indices.flush_synced":
+		method = http.MethodPost
+		if idx := popString("index"); idx != "" {
+			reqPath = "/" + idx + "/_flush/synced"
+		} else {
+			reqPath = "/_flush/synced"
+		}
+
+	case "indices.freeze":
+		method = http.MethodPost
+		idx := popString("index")
+		if idx == "" {
+			return nil, fmt.Errorf("indices.freeze requires index parameter")
+		}
+		reqPath = "/" + idx + "/_freeze"
+
+	case "indices.unfreeze":
+		method = http.MethodPost
+		idx := popString("index")
+		if idx == "" {
+			return nil, fmt.Errorf("indices.unfreeze requires index parameter")
+		}
+		reqPath = "/" + idx + "/_unfreeze"
+
 	case "tasks.list":
 		method = http.MethodGet
 		reqPath = "/_tasks"
@@ -2587,6 +3023,14 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			return nil, fmt.Errorf("snapshot.verify_repository requires repository parameter")
 		}
 		reqPath = "/_snapshot/" + repo + "/_verify"
+
+	case "snapshot.repository_analyze":
+		method = http.MethodPost
+		repo := popString("repository")
+		if repo == "" {
+			return nil, fmt.Errorf("snapshot.repository_analyze requires repository parameter")
+		}
+		reqPath = "/_snapshot/" + repo + "/_analyze"
 
 	case "snapshot.create":
 		method = http.MethodPut
@@ -3085,6 +3529,14 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			reqPath = "/_migration/deprecations"
 		}
 
+	case "migration.get_feature_upgrade_status":
+		method = http.MethodGet
+		reqPath = "/_migration/system_features"
+
+	case "migration.post_feature_upgrade":
+		method = http.MethodPost
+		reqPath = "/_migration/system_features"
+
 	case "shutdown.put_node":
 		method = http.MethodPut
 		nodeID := popString("node_id")
@@ -3300,7 +3752,11 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "searchable_snapshots.clear_cache":
 		method = http.MethodPost
-		reqPath = "/_searchable_snapshots/cache/clear"
+		if idx := popString("index"); idx != "" {
+			reqPath = "/" + idx + "/_searchable_snapshots/cache/clear"
+		} else {
+			reqPath = "/_searchable_snapshots/cache/clear"
+		}
 
 	case "security.authenticate":
 		method = http.MethodGet
@@ -3405,6 +3861,96 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "security.invalidate_api_key":
 		method = http.MethodDelete
 		reqPath = "/_security/api_key"
+
+	case "security.put_api_key":
+		method = http.MethodPut
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("security.put_api_key requires id parameter")
+		}
+		reqPath = "/_security/api_key/" + id
+
+	case "security.bulk_update_api_keys":
+		method = http.MethodPost
+		reqPath = "/_security/api_key/_bulk_update"
+
+	case "security.query_user":
+		method = http.MethodPost
+		reqPath = "/_security/_query/user"
+
+	case "security.query_role":
+		method = http.MethodPost
+		reqPath = "/_security/_query/role"
+
+	case "security.get_user_privileges":
+		method = http.MethodGet
+		reqPath = "/_security/user/_privileges"
+
+	case "security.clear_cached_privileges":
+		method = http.MethodPost
+		app := popString("application")
+		if app == "" {
+			return nil, fmt.Errorf("security.clear_cached_privileges requires application parameter")
+		}
+		reqPath = "/_security/privilege/" + app + "/_clear_cache"
+
+	case "security.clear_cached_service_tokens":
+		method = http.MethodPost
+		ns := popString("namespace")
+		svc := popString("service")
+		tokenName := popString("token_name", "name")
+		if ns == "" || svc == "" || tokenName == "" {
+			return nil, fmt.Errorf("security.clear_cached_service_tokens requires namespace, service, and token_name parameters")
+		}
+		reqPath = "/_security/service/" + ns + "/" + svc + "/credential/token/" + tokenName + "/_clear_cache"
+
+	case "security.oidc_prepare_authentication":
+		method = http.MethodPost
+		reqPath = "/_security/oidc/prepare"
+
+	case "security.oidc_authenticate":
+		method = http.MethodPost
+		reqPath = "/_security/oidc/authenticate"
+
+	case "security.oidc_logout":
+		method = http.MethodPost
+		reqPath = "/_security/oidc/logout"
+
+	case "security.saml_prepare_authentication":
+		method = http.MethodPost
+		reqPath = "/_security/saml/prepare"
+
+	case "security.saml_authenticate":
+		method = http.MethodPost
+		reqPath = "/_security/saml/authenticate"
+
+	case "security.saml_logout":
+		method = http.MethodPost
+		reqPath = "/_security/saml/logout"
+
+	case "security.saml_invalidate":
+		method = http.MethodPost
+		reqPath = "/_security/saml/invalidate"
+
+	case "security.saml_complete_logout":
+		method = http.MethodPost
+		reqPath = "/_security/saml/complete_logout"
+
+	case "security.saml_service_provider_metadata":
+		if hasBody && rawBody != nil {
+			method = http.MethodPost
+		} else {
+			method = http.MethodGet
+		}
+		reqPath = "/_security/saml/metadata"
+
+	case "security.delegate_pki":
+		method = http.MethodPost
+		reqPath = "/_security/delegate_pki"
+
+	case "security.get_certificates":
+		method = http.MethodGet
+		reqPath = "/_security/ssl/certificates"
 
 	case "security.grant_api_key":
 		method = http.MethodPost
@@ -3535,6 +4081,14 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		}
 		reqPath = "/_logstash/pipeline/" + id
 
+	case "logstash.exists_pipeline":
+		method = http.MethodHead
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("logstash.exists_pipeline requires id parameter")
+		}
+		reqPath = "/_logstash/pipeline/" + id
+
 	case "inference.put", "inference.put_model":
 		method = http.MethodPut
 		taskType := popString("task_type")
@@ -3589,6 +4143,29 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			reqPath = "/_inference/" + infID
 		}
 
+	case "inference.stream":
+		method = http.MethodPost
+		taskType := popString("task_type")
+		infID := popString("inference_id", "model_id", "id")
+		if infID == "" {
+			return nil, fmt.Errorf("inference.stream requires inference_id parameter")
+		}
+		if taskType != "" {
+			reqPath = "/_inference/" + taskType + "/" + infID + "/_stream"
+		} else {
+			reqPath = "/_inference/" + infID + "/_stream"
+		}
+
+	case "inference.text_embedding", "inference.sparse_embedding", "inference.completion",
+		"inference.rerank", "inference.chat_completion":
+		method = http.MethodPost
+		infID := popString("inference_id", "model_id", "id")
+		if infID == "" {
+			return nil, fmt.Errorf("%s requires inference_id parameter", action)
+		}
+		taskType := strings.TrimPrefix(action, "inference.")
+		reqPath = "/_inference/" + taskType + "/" + infID
+
 	case "connector.put":
 		method = http.MethodPut
 		connID := popString("connector_id", "id")
@@ -3623,24 +4200,43 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "connector.update_name", "connector.update_native", "connector.update_service_type",
 		"connector.update_status", "connector.update_error", "connector.update_filtering",
-		"connector.update_configuration", "connector.update_pipeline", "connector.last_sync":
+		"connector.update_configuration", "connector.update_pipeline", "connector.last_sync",
+		"connector.update_index_name", "connector.update_scheduling",
+		"connector.update_custom_scheduling", "connector.update_api_key_id":
 		method = http.MethodPut
 		connID := popString("connector_id", "id")
 		if connID == "" {
 			return nil, fmt.Errorf("%s requires connector_id parameter", action)
 		}
 		suffixMap := map[string]string{
-			"connector.update_name":          "/_name",
-			"connector.update_native":        "/_native",
-			"connector.update_service_type":  "/_service_type",
-			"connector.update_status":        "/_status",
-			"connector.update_error":         "/_error",
-			"connector.update_filtering":     "/_filtering",
-			"connector.update_configuration": "/_configuration",
-			"connector.update_pipeline":      "/_pipeline",
-			"connector.last_sync":            "/_last_sync",
+			"connector.update_name":              "/_name",
+			"connector.update_native":            "/_native",
+			"connector.update_service_type":      "/_service_type",
+			"connector.update_status":            "/_status",
+			"connector.update_error":             "/_error",
+			"connector.update_filtering":         "/_filtering",
+			"connector.update_configuration":     "/_configuration",
+			"connector.update_pipeline":          "/_pipeline",
+			"connector.last_sync":                "/_last_sync",
+			"connector.update_index_name":        "/_index_name",
+			"connector.update_scheduling":        "/_scheduling",
+			"connector.update_custom_scheduling": "/_custom_scheduling",
+			"connector.update_api_key_id":        "/_api_key_id",
 		}
 		reqPath = "/_connector/" + connID + suffixMap[action]
+
+	case "connector.update_active_filtering":
+		method = http.MethodPost
+		connID := popString("connector_id", "id")
+		state := popString("filtering_validation_state", "state")
+		if connID == "" || state == "" {
+			return nil, fmt.Errorf("connector.update_active_filtering requires connector_id and filtering_validation_state parameters")
+		}
+		reqPath = "/_connector/" + connID + "/_filtering/" + state
+
+	case "connector.sync_job_claim":
+		method = http.MethodPost
+		reqPath = "/_connector/_sync_job/_claim"
 
 	case "connector.sync_job_post":
 		method = http.MethodPost
@@ -3742,15 +4338,15 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		}
 		reqPath = "/_application/search_application/" + name + "/_render_query"
 
-	case "behavioral_analytics.put_collection":
+	case "behavioral_analytics.put_collection", "search_application.put_behavioral_analytics":
 		method = http.MethodPut
 		coll := popString("collection_name", "name")
 		if coll == "" {
-			return nil, fmt.Errorf("behavioral_analytics.put_collection requires collection_name parameter")
+			return nil, fmt.Errorf("%s requires collection_name parameter", action)
 		}
 		reqPath = "/_application/analytics/" + coll
 
-	case "behavioral_analytics.get_collections":
+	case "behavioral_analytics.get_collections", "search_application.get_behavioral_analytics":
 		method = http.MethodGet
 		if coll := popString("collection_name", "name"); coll != "" {
 			reqPath = "/_application/analytics/" + coll
@@ -3758,20 +4354,20 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			reqPath = "/_application/analytics"
 		}
 
-	case "behavioral_analytics.delete_collection":
+	case "behavioral_analytics.delete_collection", "search_application.delete_behavioral_analytics":
 		method = http.MethodDelete
 		coll := popString("collection_name", "name")
 		if coll == "" {
-			return nil, fmt.Errorf("behavioral_analytics.delete_collection requires collection_name parameter")
+			return nil, fmt.Errorf("%s requires collection_name parameter", action)
 		}
 		reqPath = "/_application/analytics/" + coll
 
-	case "behavioral_analytics.post_event":
+	case "behavioral_analytics.post_event", "search_application.post_behavioral_analytics_event":
 		method = http.MethodPost
 		coll := popString("collection_name", "name")
 		evType := popString("event_type", "type")
 		if coll == "" || evType == "" {
-			return nil, fmt.Errorf("behavioral_analytics.post_event requires collection_name and event_type parameters")
+			return nil, fmt.Errorf("%s requires collection_name and event_type parameters", action)
 		}
 		reqPath = "/_application/analytics/" + coll + "/event/" + evType
 
@@ -4033,6 +4629,26 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			return nil, fmt.Errorf("fleet.global_checkpoints requires index parameter")
 		}
 		reqPath = "/" + idx + "/_fleet/global_checkpoints"
+
+	case "fleet.post_secret":
+		method = http.MethodPost
+		reqPath = "/_fleet/secrets"
+
+	case "fleet.get_secret":
+		method = http.MethodGet
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("fleet.get_secret requires id parameter")
+		}
+		reqPath = "/_fleet/secrets/" + id
+
+	case "fleet.delete_secret":
+		method = http.MethodDelete
+		id := popString("id")
+		if id == "" {
+			return nil, fmt.Errorf("fleet.delete_secret requires id parameter")
+		}
+		reqPath = "/_fleet/secrets/" + id
 
 	case "graph.explore":
 		method = http.MethodPost
@@ -4397,7 +5013,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			reqPath = "/_cat/component_templates"
 		}
 
-	case "cat.ml_anomaly_detectors", "cat.ml_jobs":
+	case "cat.ml_anomaly_detectors", "cat.ml_jobs", "cat.anomaly_detectors":
 		method = http.MethodGet
 		if jobID := popString("job_id", "id"); jobID != "" {
 			reqPath = "/_cat/ml_anomaly_detectors/" + jobID
@@ -4405,7 +5021,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			reqPath = "/_cat/ml_anomaly_detectors"
 		}
 
-	case "cat.ml_datafeeds":
+	case "cat.ml_datafeeds", "cat.datafeeds":
 		method = http.MethodGet
 		if dfID := popString("datafeed_id", "id"); dfID != "" {
 			reqPath = "/_cat/ml_datafeeds/" + dfID
@@ -4413,7 +5029,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			reqPath = "/_cat/ml_datafeeds"
 		}
 
-	case "cat.ml_trained_models":
+	case "cat.ml_trained_models", "cat.trained_models":
 		method = http.MethodGet
 		if modelID := popString("model_id", "id"); modelID != "" {
 			reqPath = "/_cat/ml_trained_models/" + modelID
@@ -4421,7 +5037,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			reqPath = "/_cat/ml_trained_models"
 		}
 
-	case "cat.ml_data_frame_analytics":
+	case "cat.ml_data_frame_analytics", "cat.data_frame_analytics":
 		method = http.MethodGet
 		if id := popString("id"); id != "" {
 			reqPath = "/_cat/ml_data_frame_analytics/" + id
@@ -4657,6 +5273,26 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		}
 		reqPath = "/_ml/trained_models/" + modelID + "/vocabulary"
 
+	case "ml.get_trained_model_vocabulary":
+		method = http.MethodGet
+		modelID := popString("model_id", "id")
+		if modelID == "" {
+			return nil, fmt.Errorf("ml.get_trained_model_vocabulary requires model_id parameter")
+		}
+		reqPath = "/_ml/trained_models/" + modelID + "/vocabulary"
+
+	case "ml.clear_trained_model_deployment_cache":
+		method = http.MethodPost
+		modelID := popString("model_id", "id")
+		if modelID == "" {
+			return nil, fmt.Errorf("ml.clear_trained_model_deployment_cache requires model_id parameter")
+		}
+		reqPath = "/_ml/trained_models/" + modelID + "/deployment/_cache/_clear"
+
+	case "ml.find_file_structure":
+		method = http.MethodPost
+		reqPath = "/_ml/find_file_structure"
+
 	case "ml.flush_job":
 		method = http.MethodPost
 		jobID := popString("job_id", "id")
@@ -4703,12 +5339,29 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		}
 
 	case "ml.delete_expired_data":
-		method = http.MethodPost
 		jobID := popString("job_id", "id")
-		if jobID == "" {
-			return nil, fmt.Errorf("ml.delete_expired_data requires job_id parameter")
+		switch jobID {
+		case "":
+			if !hasBody && len(remaining) == 0 {
+				return nil, fmt.Errorf("ml.delete_expired_data requires job_id parameter")
+			}
+			if hasBody && rawBody != nil {
+				method = http.MethodPost
+			} else {
+				method = http.MethodDelete
+			}
+			reqPath = "/_ml/_delete_expired_data"
+		case "_all":
+			if hasBody && rawBody != nil {
+				method = http.MethodPost
+			} else {
+				method = http.MethodDelete
+			}
+			reqPath = "/_ml/_delete_expired_data"
+		default:
+			method = http.MethodPost
+			reqPath = "/_ml/anomaly_detectors/" + jobID + "/_delete_expired_data"
 		}
-		reqPath = "/_ml/anomaly_detectors/" + jobID + "/_delete_expired_data"
 
 	case "ml.validate":
 		method = http.MethodPost
@@ -4832,6 +5485,24 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			return nil, fmt.Errorf("ml.revert_model_snapshot requires job_id and snapshot_id parameters")
 		}
 		reqPath = "/_ml/anomaly_detectors/" + jobID + "/model_snapshots/" + snapID + "/_revert"
+
+	case "ml.upgrade_job_snapshot":
+		method = http.MethodPost
+		jobID := popString("job_id", "id")
+		snapID := popString("snapshot_id")
+		if jobID == "" || snapID == "" {
+			return nil, fmt.Errorf("ml.upgrade_job_snapshot requires job_id and snapshot_id parameters")
+		}
+		reqPath = "/_ml/anomaly_detectors/" + jobID + "/model_snapshots/" + snapID + "/_upgrade"
+
+	case "ml.get_model_snapshot_upgrade_stats":
+		method = http.MethodGet
+		jobID := popString("job_id", "id")
+		snapID := popString("snapshot_id")
+		if jobID == "" || snapID == "" {
+			return nil, fmt.Errorf("ml.get_model_snapshot_upgrade_stats requires job_id and snapshot_id parameters")
+		}
+		reqPath = "/_ml/anomaly_detectors/" + jobID + "/model_snapshots/" + snapID + "/_upgrade/_stats"
 
 	case "security.activate_profile":
 		method = http.MethodPost
@@ -4967,6 +5638,14 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if _, ok := remaining["help"]; !ok {
 			remaining["help"] = ""
 		}
+
+	case "capabilities":
+		if hasBody && rawBody != nil {
+			method = http.MethodPost
+		} else {
+			method = http.MethodGet
+		}
+		reqPath = "/_capabilities"
 
 	default:
 		return nil, fmt.Errorf("unsupported rest-api-spec action %q", action)
@@ -5235,7 +5914,7 @@ func (c *runnerContext) expandStash(v any) any {
 	}
 }
 
-var reStashVar = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_.]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)`)
+var reStashVar = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_.\-]*)\}|\$([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_\-]+)*)`)
 
 func normalizeStashKey(s string) string {
 	trimmed := strings.TrimSpace(s)
@@ -5265,14 +5944,36 @@ func (c *runnerContext) lookupStashVar(key string) (any, bool) {
 	return nil, false
 }
 
+func (c *runnerContext) resolveStashMatch(match string) (any, string, bool) {
+	key := normalizeStashKey(match)
+	if sv, ok := c.lookupStashVar(key); ok {
+		return sv, "", true
+	}
+	if !strings.HasPrefix(match, "${") && strings.Contains(key, ".") {
+		cur := key
+		for {
+			dotIdx := strings.LastIndexByte(cur, '.')
+			if dotIdx <= 0 {
+				break
+			}
+			prefix := cur[:dotIdx]
+			suffix := key[dotIdx:]
+			if sv, ok := c.lookupStashVar(prefix); ok {
+				return sv, suffix, true
+			}
+			cur = prefix
+		}
+	}
+	return nil, "", false
+}
+
 func (c *runnerContext) expandStashString(s string) string {
 	if !strings.Contains(s, "$") {
 		return s
 	}
 	return reStashVar.ReplaceAllStringFunc(s, func(match string) string {
-		key := normalizeStashKey(match)
-		if sv, ok := c.lookupStashVar(key); ok {
-			return fmt.Sprintf("%v", sv)
+		if sv, suffix, ok := c.resolveStashMatch(match); ok {
+			return fmt.Sprintf("%v", sv) + suffix
 		}
 		return match
 	})
@@ -5283,14 +5984,13 @@ func (c *runnerContext) expandStashPath(s string) string {
 		return s
 	}
 	return reStashVar.ReplaceAllStringFunc(s, func(match string) string {
-		key := normalizeStashKey(match)
-		if sv, ok := c.lookupStashVar(key); ok {
+		if sv, suffix, ok := c.resolveStashMatch(match); ok {
 			switch sv.(type) {
 			case []any, map[string]any:
 				return match
 			}
 			strVal := fmt.Sprintf("%v", sv)
-			return strings.ReplaceAll(strVal, ".", `\.`)
+			return strings.ReplaceAll(strVal, ".", `\.`) + suffix
 		}
 		return match
 	})
@@ -5407,6 +6107,18 @@ func parseSemverParts(v string) [3]int {
 	return out
 }
 
+func hasUnescapedArbitraryKeySuffix(fieldPath string) bool {
+	if !strings.HasSuffix(fieldPath, "._arbitrary_key_") {
+		return false
+	}
+	dotIdx := len(fieldPath) - len("._arbitrary_key_")
+	backslashes := 0
+	for i := dotIdx - 1; i >= 0 && fieldPath[i] == '\\'; i-- {
+		backslashes++
+	}
+	return backslashes%2 == 0
+}
+
 func (c *runnerContext) execSet(rawVal any) error {
 	pairs, err := extractFieldPairs("set", rawVal)
 	if err != nil {
@@ -5415,6 +6127,41 @@ func (c *runnerContext) execSet(rawVal any) error {
 	for _, p := range pairs {
 		fieldPath := c.expandStashPath(p.Key)
 		stashVar := normalizeStashKey(fmt.Sprintf("%v", p.Value))
+		if fieldPath == "_arbitrary_key_" || hasUnescapedArbitraryKeySuffix(fieldPath) {
+			var cands []any
+			if fieldPath == "_arbitrary_key_" {
+				if c.lastResponse != nil {
+					cands = []any{c.lastResponse}
+				}
+			} else {
+				parentPath := strings.TrimSuffix(fieldPath, "._arbitrary_key_")
+				cands = c.lookupAllResponsePaths(parentPath)
+			}
+			if len(cands) == 0 {
+				return fmt.Errorf("set: response path %q not found in %s", fieldPath, c.lastBodyRaw)
+			}
+			var chosenKey string
+			foundNonEmptyMap := false
+			for _, cand := range cands {
+				pm, ok := cand.(map[string]any)
+				if !ok || len(pm) == 0 {
+					continue
+				}
+				keys := make([]string, 0, len(pm))
+				for k := range pm {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+				chosenKey = keys[0]
+				foundNonEmptyMap = true
+				break
+			}
+			if !foundNonEmptyMap {
+				return fmt.Errorf("set: response path %q requires a non-empty object in %s", fieldPath, c.lastBodyRaw)
+			}
+			c.stash[stashVar] = chosenKey
+			continue
+		}
 		val, found := c.lookupResponsePath(fieldPath)
 		if !found {
 			return fmt.Errorf("set: response path %q not found in %s", fieldPath, c.lastBodyRaw)
@@ -5430,6 +6177,7 @@ func splitTransformArgs(raw string) []string {
 	var args []string
 	var sb strings.Builder
 	var quote byte
+	parenDepth := 0
 	for i := 0; i < len(raw); i++ {
 		ch := raw[i]
 		if quote != 0 {
@@ -5450,7 +6198,17 @@ func splitTransformArgs(raw string) []string {
 			sb.WriteByte(ch)
 			continue
 		}
-		if ch == ',' {
+		if ch == '(' {
+			parenDepth++
+			sb.WriteByte(ch)
+			continue
+		}
+		if ch == ')' && parenDepth > 0 {
+			parenDepth--
+			sb.WriteByte(ch)
+			continue
+		}
+		if ch == ',' && parenDepth == 0 {
 			args = append(args, strings.TrimSpace(sb.String()))
 			sb.Reset()
 			continue
@@ -5480,6 +6238,13 @@ func (c *runnerContext) resolveTransformValue(rawArg string) (any, bool) {
 	if lit, isQuoted := unquoteTransformLiteral(trimmed); isQuoted {
 		return c.expandStashString(lit), true
 	}
+	if reTransformExpr.MatchString(trimmed) {
+		val, err := c.evalTransformExpr(trimmed)
+		if err == nil && val != nil {
+			return val, true
+		}
+		return nil, false
+	}
 	fieldPath := c.expandStashPath(trimmed)
 	if val, found := c.lookupResponsePath(fieldPath); found && val != nil {
 		return val, true
@@ -5490,6 +6255,183 @@ func (c *runnerContext) resolveTransformValue(rawArg string) (any, bool) {
 		}
 	}
 	return nil, false
+}
+
+func (c *runnerContext) evalTransformExpr(exprStr string) (any, error) {
+	m := reTransformExpr.FindStringSubmatch(strings.TrimSpace(exprStr))
+	if len(m) != 3 {
+		return nil, fmt.Errorf("transform_and_set: invalid transform expression %q", exprStr)
+	}
+	fnName := m[1]
+	rawPath := strings.TrimSpace(m[2])
+
+	switch fnName {
+	case "concat":
+		args := splitTransformArgs(rawPath)
+		if len(args) == 0 {
+			return nil, fmt.Errorf("transform_and_set: concat requires at least 1 argument")
+		}
+		var sb strings.Builder
+		resolvedAny := false
+		for _, arg := range args {
+			if val, ok := c.resolveTransformValue(arg); ok {
+				resolvedAny = true
+				_, _ = fmt.Fprintf(&sb, "%v", val)
+			} else if len(args) > 1 {
+				sb.WriteString(c.expandStashString(arg))
+			}
+		}
+		if !resolvedAny {
+			return nil, fmt.Errorf("transform_and_set: response path %q not found in %s", rawPath, c.lastBodyRaw)
+		}
+		return sb.String(), nil
+
+	case "split":
+		args := splitTransformArgs(rawPath)
+		if len(args) == 0 {
+			return nil, fmt.Errorf("transform_and_set: split requires at least 1 argument")
+		}
+		val, ok := c.resolveTransformValue(args[0])
+		if !ok {
+			return nil, fmt.Errorf("transform_and_set: response path %q not found in %s", args[0], c.lastBodyRaw)
+		}
+		sep := ","
+		if len(args) >= 2 {
+			lit, _ := unquoteTransformLiteral(args[1])
+			sep = c.expandStashString(lit)
+		}
+		parts := strings.Split(fmt.Sprintf("%v", val), sep)
+		out := make([]any, len(parts))
+		for i, part := range parts {
+			out[i] = part
+		}
+		return out, nil
+
+	case "join":
+		args := splitTransformArgs(rawPath)
+		if len(args) == 0 {
+			return nil, fmt.Errorf("transform_and_set: join requires at least 1 argument")
+		}
+		val, ok := c.resolveTransformValue(args[0])
+		if !ok {
+			return nil, fmt.Errorf("transform_and_set: response path %q not found in %s", args[0], c.lastBodyRaw)
+		}
+		sep := ","
+		if len(args) >= 2 {
+			lit, _ := unquoteTransformLiteral(args[1])
+			sep = c.expandStashString(lit)
+		}
+		var strParts []string
+		switch tv := ToNative(val).(type) {
+		case []any:
+			strParts = make([]string, len(tv))
+			for i, elem := range tv {
+				strParts[i] = fmt.Sprintf("%v", elem)
+			}
+		case []string:
+			strParts = tv
+		default:
+			return nil, fmt.Errorf("transform_and_set: join expected slice, got %T (%v)", val, val)
+		}
+		return strings.Join(strParts, sep), nil
+
+	case "replace":
+		args := splitTransformArgs(rawPath)
+		if len(args) < 3 {
+			return nil, fmt.Errorf("transform_and_set: replace requires 3 arguments (source, old, new)")
+		}
+		val, ok := c.resolveTransformValue(args[0])
+		if !ok {
+			return nil, fmt.Errorf("transform_and_set: response path %q not found in %s", args[0], c.lastBodyRaw)
+		}
+		oldLit, _ := unquoteTransformLiteral(args[1])
+		newLit, _ := unquoteTransformLiteral(args[2])
+		oldStr := c.expandStashString(oldLit)
+		newStr := c.expandStashString(newLit)
+		return strings.ReplaceAll(fmt.Sprintf("%v", val), oldStr, newStr), nil
+
+	default:
+		var val any
+		var found bool
+		if reTransformExpr.MatchString(rawPath) {
+			nestedVal, nestedErr := c.evalTransformExpr(rawPath)
+			if nestedErr != nil {
+				return nil, nestedErr
+			}
+			val = nestedVal
+			found = nestedVal != nil
+		} else if lit, isQuoted := unquoteTransformLiteral(rawPath); isQuoted {
+			val = c.expandStashString(lit)
+			found = true
+		} else {
+			fieldPath := c.expandStashPath(rawPath)
+			val, found = c.lookupResponsePath(fieldPath)
+			if !found && strings.HasPrefix(rawPath, "$") {
+				val, found = c.lookupStashVar(normalizeStashKey(rawPath))
+			}
+			if !found || val == nil {
+				return nil, fmt.Errorf("transform_and_set: response path %q not found in %s", fieldPath, c.lastBodyRaw)
+			}
+		}
+		if !found || val == nil {
+			return nil, fmt.Errorf("transform_and_set: response path %q not found in %s", rawPath, c.lastBodyRaw)
+		}
+
+		strVal, ok := val.(string)
+		if !ok {
+			strVal = fmt.Sprintf("%v", val)
+		}
+		switch fnName {
+		case "base64Encode":
+			return base64.StdEncoding.EncodeToString([]byte(strVal)), nil
+		case "base64Decode":
+			decoded, decErr := decodeBase64String(strVal)
+			if decErr != nil {
+				return nil, fmt.Errorf("transform_and_set: base64Decode failed: %w", decErr)
+			}
+			return decoded, nil
+		case "base64UrlEncode":
+			return base64.RawURLEncoding.EncodeToString([]byte(strVal)), nil
+		case "base64UrlDecode":
+			decodedBytes, decErr := base64.RawURLEncoding.DecodeString(strVal)
+			if decErr != nil {
+				decodedBytes, decErr = base64.URLEncoding.DecodeString(strVal)
+			}
+			if decErr != nil {
+				return nil, fmt.Errorf("transform_and_set: base64UrlDecode failed: %w", decErr)
+			}
+			return string(decodedBytes), nil
+		case "sha256":
+			return fmt.Sprintf("%x", sha256.Sum256([]byte(strVal))), nil
+		case "length", "size":
+			switch tv := val.(type) {
+			case []any:
+				return len(tv), nil
+			case map[string]any:
+				return len(tv), nil
+			case string:
+				return len(tv), nil
+			default:
+				return len(strVal), nil
+			}
+		case "lower":
+			return strings.ToLower(strVal), nil
+		case "upper":
+			return strings.ToUpper(strVal), nil
+		case "trim":
+			return strings.TrimSpace(strVal), nil
+		case "toString":
+			return strVal, nil
+		case "toInt":
+			iv, intOk := toInt(val)
+			if !intOk {
+				return nil, fmt.Errorf("transform_and_set: toInt failed on %v", val)
+			}
+			return iv, nil
+		default:
+			return nil, fmt.Errorf("transform_and_set: unsupported transform function %q", fnName)
+		}
+	}
 }
 
 func (c *runnerContext) execTransformAndSet(rawVal any) error {
@@ -5512,130 +6454,9 @@ func (c *runnerContext) execTransformAndSet(rawVal any) error {
 			return fmt.Errorf("transform_and_set: invalid transform expression in %q: %q", keyStr, valStr)
 		}
 
-		m := reTransformExpr.FindStringSubmatch(exprStr)
-		fnName := m[1]
-		rawPath := strings.TrimSpace(m[2])
-
-		var transformed any
-		switch fnName {
-		case "concat":
-			args := splitTransformArgs(rawPath)
-			if len(args) == 0 {
-				return fmt.Errorf("transform_and_set: concat requires at least 1 argument")
-			}
-			var sb strings.Builder
-			resolvedAny := false
-			for _, arg := range args {
-				if val, ok := c.resolveTransformValue(arg); ok {
-					resolvedAny = true
-					_, _ = fmt.Fprintf(&sb, "%v", val)
-				} else if len(args) > 1 {
-					sb.WriteString(c.expandStashString(arg))
-				}
-			}
-			if !resolvedAny {
-				return fmt.Errorf("transform_and_set: response path %q not found in %s", rawPath, c.lastBodyRaw)
-			}
-			transformed = sb.String()
-
-		case "split":
-			args := splitTransformArgs(rawPath)
-			if len(args) == 0 {
-				return fmt.Errorf("transform_and_set: split requires at least 1 argument")
-			}
-			val, ok := c.resolveTransformValue(args[0])
-			if !ok {
-				return fmt.Errorf("transform_and_set: response path %q not found in %s", args[0], c.lastBodyRaw)
-			}
-			sep := ","
-			if len(args) >= 2 {
-				lit, _ := unquoteTransformLiteral(args[1])
-				sep = c.expandStashString(lit)
-			}
-			parts := strings.Split(fmt.Sprintf("%v", val), sep)
-			out := make([]any, len(parts))
-			for i, part := range parts {
-				out[i] = part
-			}
-			transformed = out
-
-		case "replace":
-			args := splitTransformArgs(rawPath)
-			if len(args) < 3 {
-				return fmt.Errorf("transform_and_set: replace requires 3 arguments (source, old, new)")
-			}
-			val, ok := c.resolveTransformValue(args[0])
-			if !ok {
-				return fmt.Errorf("transform_and_set: response path %q not found in %s", args[0], c.lastBodyRaw)
-			}
-			oldLit, _ := unquoteTransformLiteral(args[1])
-			newLit, _ := unquoteTransformLiteral(args[2])
-			oldStr := c.expandStashString(oldLit)
-			newStr := c.expandStashString(newLit)
-			transformed = strings.ReplaceAll(fmt.Sprintf("%v", val), oldStr, newStr)
-
-		default:
-			fieldPath := c.expandStashPath(rawPath)
-			val, found := c.lookupResponsePath(fieldPath)
-			if !found && strings.HasPrefix(rawPath, "$") {
-				val, found = c.lookupStashVar(normalizeStashKey(rawPath))
-			}
-			if !found || val == nil {
-				return fmt.Errorf("transform_and_set: response path %q not found in %s", fieldPath, c.lastBodyRaw)
-			}
-
-			strVal, ok := val.(string)
-			if !ok {
-				strVal = fmt.Sprintf("%v", val)
-			}
-			switch fnName {
-			case "base64Encode":
-				transformed = base64.StdEncoding.EncodeToString([]byte(strVal))
-			case "base64Decode":
-				decoded, decErr := decodeBase64String(strVal)
-				if decErr != nil {
-					return fmt.Errorf("transform_and_set: base64Decode failed: %w", decErr)
-				}
-				transformed = decoded
-			case "base64UrlEncode":
-				transformed = base64.RawURLEncoding.EncodeToString([]byte(strVal))
-			case "base64UrlDecode":
-				decodedBytes, decErr := base64.RawURLEncoding.DecodeString(strVal)
-				if decErr != nil {
-					decodedBytes, decErr = base64.URLEncoding.DecodeString(strVal)
-				}
-				if decErr != nil {
-					return fmt.Errorf("transform_and_set: base64UrlDecode failed: %w", decErr)
-				}
-				transformed = string(decodedBytes)
-			case "length", "size":
-				switch tv := val.(type) {
-				case []any:
-					transformed = len(tv)
-				case map[string]any:
-					transformed = len(tv)
-				case string:
-					transformed = len(tv)
-				default:
-					transformed = len(strVal)
-				}
-			case "lower":
-				transformed = strings.ToLower(strVal)
-			case "upper":
-				transformed = strings.ToUpper(strVal)
-			case "trim":
-				transformed = strings.TrimSpace(strVal)
-			case "toString":
-				transformed = strVal
-			case "toInt":
-				iv, intOk := toInt(val)
-				if !intOk {
-					return fmt.Errorf("transform_and_set: toInt failed on %v", val)
-				}
-				transformed = iv
-			default:
-				return fmt.Errorf("transform_and_set: unsupported transform function %q", fnName)
-			}
+		transformed, evalErr := c.evalTransformExpr(exprStr)
+		if evalErr != nil {
+			return evalErr
 		}
 
 		varName = normalizeStashKey(varName)
@@ -5658,6 +6479,34 @@ func decodeBase64String(s string) (string, error) {
 	return "", fmt.Errorf("invalid base64 input %q", s)
 }
 
+func checkSingleContains(fieldPath string, actual, expected any) error {
+	switch actVal := actual.(type) {
+	case []any:
+		for _, elem := range actVal {
+			if containsElementMatch(elem, expected) {
+				return nil
+			}
+		}
+		actJSON, _ := json.Marshal(actual)
+		expJSON, _ := json.Marshal(expected)
+		return fmt.Errorf("contains %q failed: no element in %s matched %s", fieldPath, string(actJSON), string(expJSON))
+	case string:
+		if !strings.Contains(actVal, fmt.Sprintf("%v", expected)) && matchValues("", actVal, expected) != nil {
+			return fmt.Errorf("contains %q failed: string %q does not contain %v", fieldPath, actVal, expected)
+		}
+		return nil
+	case map[string]any:
+		if !containsElementMatch(actVal, expected) {
+			actJSON, _ := json.Marshal(actual)
+			expJSON, _ := json.Marshal(expected)
+			return fmt.Errorf("contains %q failed: map %s did not match %s", fieldPath, string(actJSON), string(expJSON))
+		}
+		return nil
+	default:
+		return fmt.Errorf("contains %q: expected slice, string, or map in response, got %T (%v)", fieldPath, actual, actual)
+	}
+}
+
 func (c *runnerContext) execContains(rawVal any) error {
 	pairs, err := extractFieldPairs("contains", rawVal)
 	if err != nil {
@@ -5666,39 +6515,63 @@ func (c *runnerContext) execContains(rawVal any) error {
 	for _, p := range pairs {
 		fieldPath := c.expandStashPath(p.Key)
 		expected := ToNative(c.expandStash(p.Value))
+		if strings.Contains(fieldPath, "_arbitrary_key_") {
+			cands := c.lookupAllResponsePaths(fieldPath)
+			if len(cands) == 0 {
+				return fmt.Errorf("contains: path %q not found in response: %s", fieldPath, c.lastBodyRaw)
+			}
+			var lastErr error
+			matchedAny := false
+			for _, cand := range cands {
+				if cErr := checkSingleContains(fieldPath, cand, expected); cErr == nil {
+					matchedAny = true
+					break
+				} else {
+					lastErr = cErr
+				}
+			}
+			if !matchedAny {
+				return lastErr
+			}
+			continue
+		}
 		actual, found := c.lookupResponsePath(fieldPath)
 		if !found {
 			return fmt.Errorf("contains: path %q not found in response: %s", fieldPath, c.lastBodyRaw)
 		}
-		switch actVal := actual.(type) {
-		case []any:
-			matched := false
-			for _, elem := range actVal {
-				if containsElementMatch(elem, expected) {
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				actJSON, _ := json.Marshal(actual)
-				expJSON, _ := json.Marshal(expected)
-				return fmt.Errorf("contains %q failed: no element in %s matched %s", fieldPath, string(actJSON), string(expJSON))
-			}
-		case string:
-			if !strings.Contains(actVal, fmt.Sprintf("%v", expected)) && matchValues("", actVal, expected) != nil {
-				return fmt.Errorf("contains %q failed: string %q does not contain %v", fieldPath, actVal, expected)
-			}
-		case map[string]any:
-			if !containsElementMatch(actVal, expected) {
-				actJSON, _ := json.Marshal(actual)
-				expJSON, _ := json.Marshal(expected)
-				return fmt.Errorf("contains %q failed: map %s did not match %s", fieldPath, string(actJSON), string(expJSON))
-			}
-		default:
-			return fmt.Errorf("contains %q: expected slice, string, or map in response, got %T (%v)", fieldPath, actual, actual)
+		if err := checkSingleContains(fieldPath, actual, expected); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func checkSingleNotContains(fieldPath string, actual, expected any) error {
+	switch actVal := actual.(type) {
+	case []any:
+		for _, elem := range actVal {
+			if containsElementMatch(elem, expected) {
+				actJSON, _ := json.Marshal(actual)
+				expJSON, _ := json.Marshal(expected)
+				return fmt.Errorf("not_contains %q failed: element in %s matched %s", fieldPath, string(actJSON), string(expJSON))
+			}
+		}
+		return nil
+	case string:
+		if strings.Contains(actVal, fmt.Sprintf("%v", expected)) || matchValues("", actVal, expected) == nil {
+			return fmt.Errorf("not_contains %q failed: string %q contains %v", fieldPath, actVal, expected)
+		}
+		return nil
+	case map[string]any:
+		if containsElementMatch(actVal, expected) {
+			actJSON, _ := json.Marshal(actual)
+			expJSON, _ := json.Marshal(expected)
+			return fmt.Errorf("not_contains %q failed: map %s matched %s", fieldPath, string(actJSON), string(expJSON))
+		}
+		return nil
+	default:
+		return fmt.Errorf("not_contains %q: expected slice, string, or map in response, got %T (%v)", fieldPath, actual, actual)
+	}
 }
 
 func (c *runnerContext) execNotContains(rawVal any) error {
@@ -5709,31 +6582,24 @@ func (c *runnerContext) execNotContains(rawVal any) error {
 	for _, p := range pairs {
 		fieldPath := c.expandStashPath(p.Key)
 		expected := ToNative(c.expandStash(p.Value))
+		if strings.Contains(fieldPath, "_arbitrary_key_") {
+			cands := c.lookupAllResponsePaths(fieldPath)
+			if len(cands) == 0 {
+				return fmt.Errorf("not_contains: path %q not found in response: %s", fieldPath, c.lastBodyRaw)
+			}
+			for _, cand := range cands {
+				if err := checkSingleNotContains(fieldPath, cand, expected); err != nil {
+					return err
+				}
+			}
+			continue
+		}
 		actual, found := c.lookupResponsePath(fieldPath)
 		if !found {
 			return fmt.Errorf("not_contains: path %q not found in response: %s", fieldPath, c.lastBodyRaw)
 		}
-		switch actVal := actual.(type) {
-		case []any:
-			for _, elem := range actVal {
-				if containsElementMatch(elem, expected) {
-					actJSON, _ := json.Marshal(actual)
-					expJSON, _ := json.Marshal(expected)
-					return fmt.Errorf("not_contains %q failed: element in %s matched %s", fieldPath, string(actJSON), string(expJSON))
-				}
-			}
-		case string:
-			if strings.Contains(actVal, fmt.Sprintf("%v", expected)) || matchValues("", actVal, expected) == nil {
-				return fmt.Errorf("not_contains %q failed: string %q contains %v", fieldPath, actVal, expected)
-			}
-		case map[string]any:
-			if containsElementMatch(actVal, expected) {
-				actJSON, _ := json.Marshal(actual)
-				expJSON, _ := json.Marshal(expected)
-				return fmt.Errorf("not_contains %q failed: map %s matched %s", fieldPath, string(actJSON), string(expJSON))
-			}
-		default:
-			return fmt.Errorf("not_contains %q: expected slice, string, or map in response, got %T (%v)", fieldPath, actual, actual)
+		if err := checkSingleNotContains(fieldPath, actual, expected); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -5953,6 +6819,14 @@ func (c *runnerContext) execIsTrue(rawVal any) error {
 		}
 		return fmt.Errorf("is_true '': response is not truthy: %s", c.lastBodyRaw)
 	}
+	if strings.Contains(fieldPath, "_arbitrary_key_") {
+		for _, cand := range c.lookupAllResponsePaths(fieldPath) {
+			if isTruthy(cand) {
+				return nil
+			}
+		}
+		return fmt.Errorf("is_true %q failed: no truthy candidate in response: %s", fieldPath, c.lastBodyRaw)
+	}
 	val, found := c.lookupResponsePath(fieldPath)
 	if !found || !isTruthy(val) {
 		return fmt.Errorf("is_true %q failed: found=%v, val=%v (response: %s)", fieldPath, found, val, c.lastBodyRaw)
@@ -5977,9 +6851,33 @@ func (c *runnerContext) execIsFalse(rawVal any) error {
 		}
 		return fmt.Errorf("is_false '': response is truthy: %s", c.lastBodyRaw)
 	}
+	if strings.Contains(fieldPath, "_arbitrary_key_") {
+		for _, cand := range c.lookupAllResponsePaths(fieldPath) {
+			if isTruthy(cand) {
+				return fmt.Errorf("is_false %q failed: got truthy value %v (response: %s)", fieldPath, cand, c.lastBodyRaw)
+			}
+		}
+		return nil
+	}
 	val, found := c.lookupResponsePath(fieldPath)
 	if found && isTruthy(val) {
 		return fmt.Errorf("is_false %q failed: got truthy value %v (response: %s)", fieldPath, val, c.lastBodyRaw)
+	}
+	return nil
+}
+
+func (c *runnerContext) checkPathIsEmpty(fieldPath string) error {
+	if strings.Contains(fieldPath, "_arbitrary_key_") {
+		for _, cand := range c.lookupAllResponsePaths(fieldPath) {
+			if !isEmptyValue(cand) {
+				return fmt.Errorf("is_empty %q failed: got non-empty value %v (response: %s)", fieldPath, cand, c.lastBodyRaw)
+			}
+		}
+		return nil
+	}
+	val, found := c.lookupResponsePath(fieldPath)
+	if found && !isEmptyValue(val) {
+		return fmt.Errorf("is_empty %q failed: got non-empty value %v (response: %s)", fieldPath, val, c.lastBodyRaw)
 	}
 	return nil
 }
@@ -5993,9 +6891,8 @@ func (c *runnerContext) execIsEmpty(rawVal any) error {
 		}
 		for _, p := range pairs {
 			fieldPath := c.expandStashPath(p.Key)
-			val, found := c.lookupResponsePath(fieldPath)
-			if found && !isEmptyValue(val) {
-				return fmt.Errorf("is_empty %q failed: got non-empty value %v (response: %s)", fieldPath, val, c.lastBodyRaw)
+			if err := c.checkPathIsEmpty(fieldPath); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -6010,11 +6907,7 @@ func (c *runnerContext) execIsEmpty(rawVal any) error {
 		}
 		return fmt.Errorf("is_empty '': response is not empty: %s", c.lastBodyRaw)
 	}
-	val, found := c.lookupResponsePath(fieldPath)
-	if found && !isEmptyValue(val) {
-		return fmt.Errorf("is_empty %q failed: got non-empty value %v (response: %s)", fieldPath, val, c.lastBodyRaw)
-	}
-	return nil
+	return c.checkPathIsEmpty(fieldPath)
 }
 
 func isEmptyValue(v any) bool {
@@ -6057,6 +6950,24 @@ func isTruthy(v any) bool {
 	}
 }
 
+func checkSingleLength(fieldPath string, val any, expLen int) error {
+	var actLen int
+	switch tv := val.(type) {
+	case string:
+		actLen = utf8.RuneCountInString(tv)
+	case []any:
+		actLen = len(tv)
+	case map[string]any:
+		actLen = len(tv)
+	default:
+		return fmt.Errorf("length %q: unsupported value type %T (%v)", fieldPath, val, val)
+	}
+	if actLen != expLen {
+		return fmt.Errorf("length %q failed: got %d, expected %d (value: %v)", fieldPath, actLen, expLen, val)
+	}
+	return nil
+}
+
 func (c *runnerContext) execLength(rawVal any) error {
 	pairs, err := extractFieldPairs("length", rawVal)
 	if err != nil {
@@ -6069,23 +6980,33 @@ func (c *runnerContext) execLength(rawVal any) error {
 			return fmt.Errorf("length %q: expected integer length, got %v", fieldPath, p.Value)
 		}
 
+		if strings.Contains(fieldPath, "_arbitrary_key_") {
+			cands := c.lookupAllResponsePaths(fieldPath)
+			if len(cands) == 0 {
+				return fmt.Errorf("length: path %q not found in response: %s", fieldPath, c.lastBodyRaw)
+			}
+			var lastErr error
+			matchedAny := false
+			for _, cand := range cands {
+				if lErr := checkSingleLength(fieldPath, cand, expLen); lErr == nil {
+					matchedAny = true
+					break
+				} else {
+					lastErr = lErr
+				}
+			}
+			if !matchedAny {
+				return lastErr
+			}
+			continue
+		}
+
 		val, found := c.lookupResponsePath(fieldPath)
 		if !found {
 			return fmt.Errorf("length: path %q not found in response: %s", fieldPath, c.lastBodyRaw)
 		}
-		var actLen int
-		switch tv := val.(type) {
-		case string:
-			actLen = utf8.RuneCountInString(tv)
-		case []any:
-			actLen = len(tv)
-		case map[string]any:
-			actLen = len(tv)
-		default:
-			return fmt.Errorf("length %q: unsupported value type %T (%v)", fieldPath, val, val)
-		}
-		if actLen != expLen {
-			return fmt.Errorf("length %q failed: got %d, expected %d (value: %v)", fieldPath, actLen, expLen, val)
+		if err := checkSingleLength(fieldPath, val, expLen); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -6130,6 +7051,53 @@ func compareStringValues(a, b string) int {
 	return strings.Compare(a, b)
 }
 
+func checkSingleCompare(op, fieldPath string, val, expectedVal, rawExpected any) error {
+	actualNum, aNumOk := toFloat64(val)
+	thresholdNum, tNumOk := toFloat64(expectedVal)
+	var pass bool
+	if aNumOk && tNumOk {
+		switch op {
+		case "gt":
+			pass = actualNum > thresholdNum
+		case "gte":
+			pass = actualNum >= thresholdNum
+		case "lt":
+			pass = actualNum < thresholdNum
+		case "lte":
+			pass = actualNum <= thresholdNum
+		}
+		if !pass {
+			return fmt.Errorf("%s %q failed: actual %v is not %s %v", op, fieldPath, actualNum, op, thresholdNum)
+		}
+		return nil
+	}
+
+	actStr, aStrOk := val.(string)
+	expStr, eStrOk := expectedVal.(string)
+	if !aStrOk || !eStrOk {
+		if !tNumOk {
+			return fmt.Errorf("%s %q: threshold %v is not comparable with %v", op, fieldPath, rawExpected, val)
+		}
+		return fmt.Errorf("%s %q: actual value %v (%T) is not a number", op, fieldPath, val, val)
+	}
+
+	cmp := compareStringValues(actStr, expStr)
+	switch op {
+	case "gt":
+		pass = cmp > 0
+	case "gte":
+		pass = cmp >= 0
+	case "lt":
+		pass = cmp < 0
+	case "lte":
+		pass = cmp <= 0
+	}
+	if !pass {
+		return fmt.Errorf("%s %q failed: actual %q is not %s %q", op, fieldPath, actStr, op, expStr)
+	}
+	return nil
+}
+
 func (c *runnerContext) execCompare(op string, rawVal any) error {
 	pairs, err := extractFieldPairs(op, rawVal)
 	if err != nil {
@@ -6138,53 +7106,33 @@ func (c *runnerContext) execCompare(op string, rawVal any) error {
 	for _, p := range pairs {
 		fieldPath := c.expandStashPath(p.Key)
 		expectedVal := c.expandStash(p.Value)
-		val, found := c.lookupResponsePath(fieldPath)
-		if !found {
-			return fmt.Errorf("%s: path %q not found in response: %s", op, fieldPath, c.lastBodyRaw)
-		}
-
-		actualNum, aNumOk := toFloat64(val)
-		thresholdNum, tNumOk := toFloat64(expectedVal)
-		var pass bool
-		if aNumOk && tNumOk {
-			switch op {
-			case "gt":
-				pass = actualNum > thresholdNum
-			case "gte":
-				pass = actualNum >= thresholdNum
-			case "lt":
-				pass = actualNum < thresholdNum
-			case "lte":
-				pass = actualNum <= thresholdNum
+		if strings.Contains(fieldPath, "_arbitrary_key_") {
+			cands := c.lookupAllResponsePaths(fieldPath)
+			if len(cands) == 0 {
+				return fmt.Errorf("%s: path %q not found in response: %s", op, fieldPath, c.lastBodyRaw)
 			}
-			if !pass {
-				return fmt.Errorf("%s %q failed: actual %v is not %s %v", op, fieldPath, actualNum, op, thresholdNum)
+			var lastErr error
+			matchedAny := false
+			for _, cand := range cands {
+				if cErr := checkSingleCompare(op, fieldPath, cand, expectedVal, p.Value); cErr == nil {
+					matchedAny = true
+					break
+				} else {
+					lastErr = cErr
+				}
+			}
+			if !matchedAny {
+				return lastErr
 			}
 			continue
 		}
 
-		actStr, aStrOk := val.(string)
-		expStr, eStrOk := expectedVal.(string)
-		if !aStrOk || !eStrOk {
-			if !tNumOk {
-				return fmt.Errorf("%s %q: threshold %v is not comparable with %v", op, fieldPath, p.Value, val)
-			}
-			return fmt.Errorf("%s %q: actual value %v (%T) is not a number", op, fieldPath, val, val)
+		val, found := c.lookupResponsePath(fieldPath)
+		if !found {
+			return fmt.Errorf("%s: path %q not found in response: %s", op, fieldPath, c.lastBodyRaw)
 		}
-
-		cmp := compareStringValues(actStr, expStr)
-		switch op {
-		case "gt":
-			pass = cmp > 0
-		case "gte":
-			pass = cmp >= 0
-		case "lt":
-			pass = cmp < 0
-		case "lte":
-			pass = cmp <= 0
-		}
-		if !pass {
-			return fmt.Errorf("%s %q failed: actual %q is not %s %q", op, fieldPath, actStr, op, expStr)
+		if err := checkSingleCompare(op, fieldPath, val, expectedVal, p.Value); err != nil {
+			return err
 		}
 	}
 	return nil
