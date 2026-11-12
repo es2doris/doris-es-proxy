@@ -322,6 +322,21 @@ func TestRound57MemBackendMultiValuedAndOpenFloatRangeFields(t *testing.T) {
 	if ids := extractRound57HitIDs(t, resDoubleContains); !reflect.DeepEqual(ids, []string{"r1", "r3"}) {
 		t.Fatalf("expected [r1 r3] for double_range open CONTAINS (10.0, 20.0), got %v (raw=%s)", ids, raw)
 	}
+
+	// 5. term & exists queries on multi-valued integer_range field
+	_, raw, resTermHit := doRound57MemReq(t, srv, http.MethodPost, "/r57_ranges/_search", `{
+		"query": {"term": {"avail": 15}}
+	}`)
+	if ids := extractRound57HitIDs(t, resTermHit); !reflect.DeepEqual(ids, []string{"r1"}) {
+		t.Fatalf("expected [r1] for term avail=15 on multi-valued range array, got %v (raw=%s)", ids, raw)
+	}
+	_, raw, resExistsHit := doRound57MemReq(t, srv, http.MethodPost, "/r57_ranges/_search", `{
+		"query": {"exists": {"field": "avail"}},
+		"sort": [{"_id": "asc"}]
+	}`)
+	if ids := extractRound57HitIDs(t, resExistsHit); !reflect.DeepEqual(ids, []string{"r1", "r2"}) {
+		t.Fatalf("expected [r1 r2] for exists on avail, got %v (raw=%s)", ids, raw)
+	}
 }
 
 func TestRound57MemBackendLargeIntAndArrayCoercionUnit(t *testing.T) {

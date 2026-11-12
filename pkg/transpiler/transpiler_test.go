@@ -4729,7 +4729,7 @@ func TestRound57TranspilerAndLuceneCompliance(t *testing.T) {
 		t.Fatalf("F17 expected terms agg & sub-agg to use LARGEINT _doc cast, got %s", uAggPlan.AggsSQL)
 	}
 
-	// F18: float_range/double_range CONTAINS exclusive gt/lt uses Nextafter & multi-valued array_exists
+	// F18: float_range/double_range CONTAINS exclusive gt/lt uses Nextafter & multi-valued array_exists on _r subcolumn
 	var fContainsQ esast.Query
 	if err := json.Unmarshal([]byte(`{"range":{"f_win":{"gt":10.0,"lt":20.0,"relation":"contains"}}}`), &fContainsQ); err != nil {
 		t.Fatalf("F18 unmarshal fContainsQ failed: %v", err)
@@ -4738,8 +4738,8 @@ func TestRound57TranspilerAndLuceneCompliance(t *testing.T) {
 	if !strings.Contains(cpFContains.WhereSQL, "10.000000000000002") || !strings.Contains(cpFContains.WhereSQL, "19.999999999999996") {
 		t.Fatalf("F18 expected Nextafter bounds in CONTAINS WhereSQL, got %s", cpFContains.WhereSQL)
 	}
-	if !strings.Contains(cpFContains.WhereSQL, "array_exists(_x ->") || !strings.Contains(cpFContains.WhereSQL, "CAST(_x AS JSON)['_gte']") {
-		t.Fatalf("F18 expected per-element array_exists range predicate, got %s", cpFContains.WhereSQL)
+	if !strings.Contains(cpFContains.WhereSQL, "array_exists(_x ->") || !strings.Contains(cpFContains.WhereSQL, "CAST(`_doc`['f_win']['_r'] AS ARRAY<STRING>)") || !strings.Contains(cpFContains.WhereSQL, "SPLIT_PART(_x, ',', 1)") {
+		t.Fatalf("F18 expected per-element array_exists range predicate on _r subcolumn, got %s", cpFContains.WhereSQL)
 	}
 
 	// F19: query_string ~AUTO:low,high (unfielded & fielded) + strict malformed range brackets

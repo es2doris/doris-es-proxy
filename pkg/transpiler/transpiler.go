@@ -4378,9 +4378,13 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 		if !ok {
 			return "FALSE"
 		}
-		lowerSQL, upperSQL, rawLower, rawUpper := t.rangeFieldBoundsAndRawSQL(field, b, nctx)
 		qLit := strconv.FormatFloat(qf, 'f', -1, 64)
-		return fmt.Sprintf("((%s IS NOT NULL OR %s IS NOT NULL) AND %s <= %s AND %s >= %s)", rawLower, rawUpper, lowerSQL, qLit, upperSQL, qLit)
+		return t.compileRangePredOnRangeField(field, b, nctx, func(lowerSQL, upperSQL string) []string {
+			return []string{
+				fmt.Sprintf("%s <= %s", lowerSQL, qLit),
+				fmt.Sprintf("%s >= %s", upperSQL, qLit),
+			}
+		})
 	}
 	if b.ESType == "ip" {
 		if strVal, ok := val.(string); ok {
@@ -5740,7 +5744,7 @@ func (t *Transpiler) compileExistsPredicate(field string, nctx *nestedCtx) strin
 	}
 	col := t.sqlColumnRef(field, preferKw, nctx)
 	basePred := fmt.Sprintf("%s IS NOT NULL", col)
-	if b.ESType == "flattened" {
+	if b.ESType == "flattened" || schema.IsRangeFieldType(b.ESType) {
 		basePred = fmt.Sprintf("(%s IS NOT NULL AND %s != '{}' AND %s != 'null')", col, col, col)
 	}
 	if b.Kind == schema.StorageDynamicVariant && t.Schema != nil && nctx == nil && !strings.ContainsAny(field, "*?") {
@@ -13119,8 +13123,7 @@ func (t *Transpiler) compileRangeOnRangeField(field string, b schema.FieldBindin
 	containsLowLit := strconv.FormatFloat(containsLow, 'f', -1, 64)
 	containsUpLit := strconv.FormatFloat(containsUp, 'f', -1, 64)
 
-	buildPred := func(lowerSQL, upperSQL, rawLower, rawUpper string) string {
-		existsCond := fmt.Sprintf("(%s IS NOT NULL OR %s IS NOT NULL)", rawLower, rawUpper)
+	buildConds := func(lowerSQL, upperSQL string) []string {
 		var conds []string
 		switch rel {
 		case "CONTAINS":
@@ -13167,23 +13170,33 @@ func (t *Transpiler) compileRangeOnRangeField(field string, b schema.FieldBindin
 				}
 			}
 		}
-		if len(conds) == 0 {
-			return existsCond
-		}
-		conds = append([]string{existsCond}, conds...)
-		return "(" + strings.Join(conds, " AND ") + ")"
+		return conds
 	}
 
+	return t.compileRangePredOnRangeField(field, b, nctx, buildConds)
+}
+
+func (t *Transpiler) compileRangePredOnRangeField(field string, b schema.FieldBinding, nctx *nestedCtx, buildConds func(lowerSQL, upperSQL string) []string) string {
 	lowerSQL, upperSQL, rawLower, rawUpper := t.rangeFieldBoundsAndRawSQL(field, b, nctx)
-	singlePred := buildPred(lowerSQL, upperSQL, rawLower, rawUpper)
-	if nctx != nil && nctx.elemVar != "" && (b.Kind == schema.StorageNestedSubfield || b.NestedPath == nctx.nestedPath) && nctx.nestedPath == b.NestedPath {
-		return singlePred
+	existsCond := fmt.Sprintf("(%s IS NOT NULL OR %s IS NOT NULL)", rawLower, rawUpper)
+	singleConds := buildConds(lowerSQL, upperSQL)
+	singlePred := existsCond
+	if len(singleConds) > 0 {
+		singlePred = "(" + strings.Join(append([]string{existsCond}, singleConds...), " AND ") + ")"
 	}
-	baseExpr := rangeDocBaseExpr(field, b)
-	arrExpr := fmt.Sprintf("CAST(%s AS ARRAY<STRING>)", baseExpr)
-	elemLower, elemUpper, elemRawLower, elemRawUpper := rangeObjectBoundsSQLFromBase("CAST(_x AS JSON)")
-	elemPred := buildPred(elemLower, elemUpper, elemRawLower, elemRawUpper)
-	return fmt.Sprintf("((%s IS NOT NULL AND array_exists(_x -> %s, %s)) OR (%s IS NULL AND %s))", arrExpr, elemPred, arrExpr, arrExpr, singlePred)
+	var rArrExpr string
+	if nctx != nil && nctx.elemVar != "" && (b.Kind == schema.StorageNestedSubfield || b.NestedPath == nctx.nestedPath) && nctx.nestedPath == b.NestedPath {
+		relPath := t.nestedRelativeJSONPath(field, false, b.NestedPath)
+		rArrExpr = fmt.Sprintf("CAST(json_extract_string(%s, %s) AS ARRAY<STRING>)", nctx.elemVar, quoteStr(relPath+"._r"))
+	} else {
+		baseExpr := rangeDocBaseExpr(field, b)
+		rArrExpr = fmt.Sprintf("CAST(%s['_r'] AS ARRAY<STRING>)", baseExpr)
+	}
+	elemLower := "CAST(SPLIT_PART(_x, ',', 1) AS DOUBLE)"
+	elemUpper := "CAST(SPLIT_PART(_x, ',', 2) AS DOUBLE)"
+	elemConds := append([]string{"_x IS NOT NULL", "_x != ''"}, buildConds(elemLower, elemUpper)...)
+	elemPred := "(" + strings.Join(elemConds, " AND ") + ")"
+	return fmt.Sprintf("(array_exists(_x -> %s, %s) OR %s)", elemPred, rArrExpr, singlePred)
 }
 
 func (t *Transpiler) compileGeoPolygon(gp *esast.GeoPolygonQuery, scoring bool, nctx *nestedCtx) CompiledQuery {

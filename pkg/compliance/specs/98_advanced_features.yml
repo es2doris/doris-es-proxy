@@ -2648,6 +2648,18 @@
         body:
           query:
             range:
+              int_ranges:
+                gte: 6
+                lte: 9
+                relation: "intersects"
+  - match: { hits.total.value: 0 }
+
+  - do:
+      search:
+        index: r57_schema_idx
+        body:
+          query:
+            range:
               flt_ranges:
                 gt: 10.0
                 lt: 20.0

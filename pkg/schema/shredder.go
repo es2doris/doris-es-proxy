@@ -3319,6 +3319,9 @@ func collectAllTextWithSchema(node any, s *IndexSchema, curPath []string, sb *st
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
+			if k == "_r" && len(curPath) > 0 && s != nil && IsRangeFieldType(s.ResolveField(strings.Join(curPath, ".")).ESType) {
+				continue
+			}
 			nextPath := append(append([]string(nil), curPath...), k)
 			var b FieldBinding
 			if s != nil && len(s.Fields) > 0 {
@@ -4461,7 +4464,11 @@ func validateAndNormalizeRangeFieldInDoc(curr map[string]any, path []string, b F
 			return false, err
 		}
 		if modified {
-			m[key] = norm
+			if norm == nil {
+				delete(m, key)
+			} else {
+				m[key] = norm
+			}
 		}
 		return modified, nil
 	})
@@ -4478,7 +4485,8 @@ func validateAndNormalizeRangeValue(raw any, b FieldBinding, getNow func() time.
 		}
 		return v, true, nil
 	case []any:
-		for i, elem := range v {
+		pairs := make([]any, 0, len(v))
+		for _, elem := range v {
 			if elem == nil {
 				continue
 			}
@@ -4489,16 +4497,25 @@ func validateAndNormalizeRangeValue(raw any, b FieldBinding, getNow func() time.
 					if err != nil {
 						return nil, false, err
 					}
-					v[i] = cidrMap
+					if rArr, okR := cidrMap["_r"].([]any); okR {
+						pairs = append(pairs, rArr...)
+					}
 					continue
 				}
 				return nil, false, fmt.Errorf("mapper_parsing_exception: failed to parse range field [%s] of type [%s]: expected range object", b.ESFieldPath, b.ESType)
 			}
-			if err := validateAndPopulateSingleRangeMap(em, b, getNow); err != nil {
+			elemCopy := cloneNestedMap(em)
+			if err := validateAndPopulateSingleRangeMap(elemCopy, b, getNow); err != nil {
 				return nil, false, err
 			}
+			if rArr, okR := elemCopy["_r"].([]any); okR {
+				pairs = append(pairs, rArr...)
+			}
 		}
-		return v, true, nil
+		if len(pairs) == 0 {
+			return nil, true, nil
+		}
+		return map[string]any{"_r": pairs}, true, nil
 	case string:
 		if b.ESType == "ip_range" {
 			cidrMap, err := parseCIDRRangeMap(v, b.ESFieldPath)
@@ -4529,11 +4546,13 @@ func parseCIDRRangeMap(cidrStr, fieldPath string) (map[string]any, error) {
 	if !ok1 || !ok2 {
 		return nil, fmt.Errorf("mapper_parsing_exception: failed to parse ip_range field [%s]", fieldPath)
 	}
+	pairStr := strconv.FormatFloat(lo, 'g', -1, 64) + "," + strconv.FormatFloat(hi, 'g', -1, 64)
 	return map[string]any{
 		"gte":  startIP.String(),
 		"lte":  endIP.String(),
 		"_gte": lo,
 		"_lte": hi,
+		"_r":   []any{pairStr},
 	}, nil
 }
 
@@ -4633,10 +4652,16 @@ func parseRangeBoundValue(raw any, b FieldBinding, getNow func() time.Time, roun
 
 func validateAndPopulateSingleRangeMap(m map[string]any, b FieldBinding, getNow func() time.Time) error {
 	hasGt, hasGte, hasLt, hasLte := false, false, false, false
+	hasExistingR := false
 	var rawLower, rawUpper any
 	for k, v := range m {
 		switch k {
 		case "_gte", "_lte":
+			continue
+		case "_r":
+			if v != nil {
+				hasExistingR = true
+			}
 			continue
 		case "gt":
 			if v != nil {
@@ -4661,6 +4686,9 @@ func validateAndPopulateSingleRangeMap(m map[string]any, b FieldBinding, getNow 
 		default:
 			return fmt.Errorf("mapper_parsing_exception: range field [%s] unknown bound key [%s]", b.ESFieldPath, k)
 		}
+	}
+	if !hasGt && !hasGte && !hasLt && !hasLte && hasExistingR {
+		return nil
 	}
 	if (hasGt && hasGte) || (hasLt && hasLte) || (!hasGt && !hasGte && !hasLt && !hasLte) {
 		return fmt.Errorf("mapper_parsing_exception: invalid range bounds for field [%s]", b.ESFieldPath)
@@ -4722,23 +4750,30 @@ func validateAndPopulateSingleRangeMap(m map[string]any, b FieldBinding, getNow 
 			}
 		}
 	}
+	loStr := "-1e100"
 	if hasLower {
 		if isIntRange {
 			m["_gte"] = lowerInt
+			loStr = strconv.FormatInt(lowerInt, 10)
 		} else {
 			m["_gte"] = lowerFloat
+			loStr = strconv.FormatFloat(lowerFloat, 'g', -1, 64)
 		}
 	} else {
 		m["_gte"] = -1e100
 	}
+	hiStr := "1e100"
 	if hasUpper {
 		if isIntRange {
 			m["_lte"] = upperInt
+			hiStr = strconv.FormatInt(upperInt, 10)
 		} else {
 			m["_lte"] = upperFloat
+			hiStr = strconv.FormatFloat(upperFloat, 'g', -1, 64)
 		}
 	} else {
 		m["_lte"] = 1e100
 	}
+	m["_r"] = []any{loStr + "," + hiStr}
 	return nil
 }
