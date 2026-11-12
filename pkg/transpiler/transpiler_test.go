@@ -19,6 +19,7 @@ package transpiler
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 
@@ -4657,23 +4658,54 @@ func TestRound57TranspilerAndLuceneCompliance(t *testing.T) {
 		t.Fatalf("F16 expected l2_norm zero-vector search to succeed, got %v", err)
 	}
 
-	// F17: unsigned_long routes term, terms, range, sort, and terms aggs through LARGEINT / _doc (never clamped BIGINT f__u_val)
-	uQueries := []string{
-		`{"query":{"term":{"u_val":9223372036854775807}},"sort":[{"u_val":"asc"}],"search_after":["18446744073709551614"]}`,
-		`{"query":{"terms":{"u_val":[42,"18446744073709551615"]}}}`,
-		`{"query":{"range":{"u_val":{"lte":9223372036854775807}}}}`,
+	// F17: unsigned_long routes term, terms, range, sort, and terms aggs through LARGEINT / _doc (never clamped BIGINT f__u_val),
+	// preserves unquoted 64-bit JSON integers (> 2^53) verbatim, and never wraps float64(math.MaxInt64) (2^63) to negative int64.
+	if got := quoteValue(float64(math.MaxInt64)); got != "9223372036854775808" {
+		t.Fatalf("F17 expected quoteValue(float64(math.MaxInt64)) == 9223372036854775808, got %q", got)
 	}
-	for _, rawU := range uQueries {
+	if got := formatMissingScalar(float64(math.MaxInt64)); got != "9223372036854775808" {
+		t.Fatalf("F17 expected formatMissingScalar(float64(math.MaxInt64)) == 9223372036854775808, got %q", got)
+	}
+	uQueries := []struct {
+		raw      string
+		mustHave []string
+	}{
+		{
+			raw:      `{"query":{"term":{"u_val":9223372036854775806}},"sort":[{"u_val":{"order":"asc","missing":18446744073709551615}}],"search_after":[18446744073709551614]}`,
+			mustHave: []string{"9223372036854775806", "18446744073709551614", "18446744073709551615"},
+		},
+		{
+			raw:      `{"query":{"term":{"u_val":9223372036854775807}},"sort":[{"u_val":"asc"}],"search_after":["18446744073709551614"]}`,
+			mustHave: []string{"9223372036854775807", "18446744073709551614"},
+		},
+		{
+			raw:      `{"query":{"terms":{"u_val":[42,9223372036854775807,18446744073709551614,18446744073709551615]}}}`,
+			mustHave: []string{"9223372036854775807", "18446744073709551614", "18446744073709551615"},
+		},
+		{
+			raw:      `{"query":{"range":{"u_val":{"gt":9223372036854775806,"lte":18446744073709551614}}}}`,
+			mustHave: []string{"9223372036854775806", "18446744073709551614"},
+		},
+	}
+	for _, uq := range uQueries {
 		var sr esast.SearchRequest
-		if err := json.Unmarshal([]byte(rawU), &sr); err != nil {
-			t.Fatalf("F17 unmarshal %s failed: %v", rawU, err)
+		if err := json.Unmarshal([]byte(uq.raw), &sr); err != nil {
+			t.Fatalf("F17 unmarshal %s failed: %v", uq.raw, err)
 		}
 		plan, err := tr.BuildSearchPlan(&sr)
 		if err != nil {
-			t.Fatalf("F17 BuildSearchPlan %s failed: %v", rawU, err)
+			t.Fatalf("F17 BuildSearchPlan %s failed: %v", uq.raw, err)
 		}
 		if strings.Contains(plan.HitsSQL, "`f__u_val`") || !strings.Contains(plan.HitsSQL, "CAST(`_doc`['u_val'] AS LARGEINT)") {
-			t.Fatalf("F17 expected LARGEINT _doc cast without f__u_val for %s, got %s", rawU, plan.HitsSQL)
+			t.Fatalf("F17 expected LARGEINT _doc cast without f__u_val for %s, got %s", uq.raw, plan.HitsSQL)
+		}
+		if strings.Contains(plan.HitsSQL, "-9223372036854775808") {
+			t.Fatalf("F17 unexpected signed wraparound -9223372036854775808 for %s: %s", uq.raw, plan.HitsSQL)
+		}
+		for _, wantLit := range uq.mustHave {
+			if !strings.Contains(plan.HitsSQL, wantLit) {
+				t.Fatalf("F17 expected exact literal %s in HitsSQL for %s, got %s", wantLit, uq.raw, plan.HitsSQL)
+			}
 		}
 	}
 	var uAggSR esast.SearchRequest

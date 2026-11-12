@@ -4718,7 +4718,10 @@ func toInt64(v any) (int64, bool) {
 		}
 		return 0, false
 	case float64:
-		return int64(val), true
+		if !math.IsNaN(val) && !math.IsInf(val, 0) && val >= -9223372036854775808.0 && val < 9223372036854775808.0 {
+			return int64(val), true
+		}
+		return 0, false
 	case json.Number:
 		i, err := val.Int64()
 		return i, err == nil

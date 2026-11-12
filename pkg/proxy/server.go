@@ -14651,13 +14651,20 @@ func buildCompositeAggObjectWithSchema(
 					}
 				} else if sm.entry.Terms != nil && strings.TrimSpace(sm.entry.Terms.ValueType) != "" {
 					switch strings.ToLower(strings.TrimSpace(sm.entry.Terms.ValueType)) {
-					case "long", "integer", "short", "byte", "date":
-						if iv, err := strconv.ParseInt(parts[i], 10, 64); err == nil {
+					case "long", "integer", "short", "byte", "date", "unsigned_long":
+						trimmedPart := strings.TrimSpace(parts[i])
+						if iv, err := strconv.ParseInt(trimmedPart, 10, 64); err == nil {
 							partVal = iv
-						} else if fv, ok := parseFiniteFloat(parts[i]); ok {
+						} else if strings.EqualFold(strings.TrimSpace(sm.entry.Terms.ValueType), "unsigned_long") {
+							if uv, errU := strconv.ParseUint(trimmedPart, 10, 64); errU == nil {
+								partVal = uv
+							} else if fv, ok := parseFiniteFloat(parts[i]); ok && fv >= 0 && fv < 18446744073709551616.0 {
+								partVal = uint64(fv)
+							}
+						} else if fv, ok := parseFiniteFloat(parts[i]); ok && fv >= -9223372036854775808.0 && fv < 9223372036854775808.0 {
 							partVal = int64(fv)
 						} else if strings.EqualFold(strings.TrimSpace(sm.entry.Terms.ValueType), "date") {
-							if ms, ok := schema.ParseESDateToEpochMillis(strings.TrimSpace(parts[i]), time.Now().UTC()); ok {
+							if ms, ok := schema.ParseESDateToEpochMillis(trimmedPart, time.Now().UTC()); ok {
 								partVal = ms
 							}
 						}
@@ -15662,7 +15669,7 @@ func filterAndSortTermsRowsWithSubAggs(
 		criteria = []termsOrderCriterion{{field: "_count", desc: true}}
 	}
 	vt := strings.ToLower(strings.TrimSpace(spec.ValueType))
-	isNumericValueType := vt == "long" || vt == "integer" || vt == "short" || vt == "byte" ||
+	isNumericValueType := vt == "long" || vt == "integer" || vt == "short" || vt == "byte" || vt == "unsigned_long" ||
 		vt == "double" || vt == "float" || vt == "half_float" || vt == "scaled_float" ||
 		vt == "number" || vt == "date"
 	if !isNumericValueType && vt == "" && idxSchema != nil && spec.Field != "" {
@@ -15698,7 +15705,14 @@ func filterAndSortTermsRowsWithSubAggs(
 							return !missingFirst
 						}
 						if isNumericValueType {
-							if fi, okI := parseFiniteFloat(cpRows[i].BucketKey); okI {
+							if cmpInt, okInt := compareBucketKeyExact64(cpRows[i].BucketKey, cpRows[j].BucketKey); okInt {
+								if cmpInt != 0 {
+									if c.desc {
+										return cmpInt > 0
+									}
+									return cmpInt < 0
+								}
+							} else if fi, okI := parseFiniteFloat(cpRows[i].BucketKey); okI {
 								if fj, okJ := parseFiniteFloat(cpRows[j].BucketKey); okJ && fi != fj {
 									if c.desc {
 										return fi > fj
@@ -15752,6 +15766,59 @@ func filterAndSortTermsRowsWithSubAggs(
 		cpRows = cpRows[:limit]
 	}
 	return cpRows, sumOtherDocCount
+}
+
+func compareBucketKeyExact64(a, b string) (int, bool) {
+	sa := strings.TrimSpace(a)
+	sb := strings.TrimSpace(b)
+	ia, errA := strconv.ParseInt(sa, 10, 64)
+	ib, errB := strconv.ParseInt(sb, 10, 64)
+	if errA == nil && errB == nil {
+		if ia < ib {
+			return -1, true
+		}
+		if ia > ib {
+			return 1, true
+		}
+		return 0, true
+	}
+	if errA == nil {
+		ub, errUB := strconv.ParseUint(sb, 10, 64)
+		if errUB != nil {
+			return 0, false
+		}
+		if ia < 0 || uint64(ia) < ub {
+			return -1, true
+		}
+		if uint64(ia) > ub {
+			return 1, true
+		}
+		return 0, true
+	}
+	ua, errUA := strconv.ParseUint(sa, 10, 64)
+	if errUA != nil {
+		return 0, false
+	}
+	if errB == nil {
+		if ib < 0 || ua > uint64(ib) {
+			return 1, true
+		}
+		if ua < uint64(ib) {
+			return -1, true
+		}
+		return 0, true
+	}
+	ub, errUB := strconv.ParseUint(sb, 10, 64)
+	if errUB != nil {
+		return 0, false
+	}
+	if ua < ub {
+		return -1, true
+	}
+	if ua > ub {
+		return 1, true
+	}
+	return 0, true
 }
 
 func matchesTermsFilterPrecompiled(key string, filter any, precompiled *regexp.Regexp) bool {
@@ -22200,8 +22267,54 @@ func (s *Server) evalRuntimeMappingsOnHitRows(idxSchema *schema.IndexSchema, req
 					continue
 				}
 				switch esType {
-				case "long", "integer", "short", "byte", "unsigned_long":
-					if f, ok := toFloat64(rv); ok {
+				case "unsigned_long":
+					switch uv := rv.(type) {
+					case uint64:
+						coercedVals = append(coercedVals, uv)
+					case int:
+						if uv >= 0 {
+							coercedVals = append(coercedVals, int64(uv))
+						}
+					case int64:
+						if uv >= 0 {
+							coercedVals = append(coercedVals, uv)
+						}
+					case json.Number:
+						if i, err := uv.Int64(); err == nil && i >= 0 {
+							coercedVals = append(coercedVals, i)
+						} else if u, err := strconv.ParseUint(strings.TrimSpace(uv.String()), 10, 64); err == nil {
+							coercedVals = append(coercedVals, u)
+						} else if f, ok := toFloat64(rv); ok && f >= 0 && f < 18446744073709551616.0 {
+							coercedVals = append(coercedVals, uint64(f))
+						}
+					case string:
+						trimmedU := strings.TrimSpace(uv)
+						if i, err := strconv.ParseInt(trimmedU, 10, 64); err == nil && i >= 0 {
+							coercedVals = append(coercedVals, i)
+						} else if u, err := strconv.ParseUint(trimmedU, 10, 64); err == nil {
+							coercedVals = append(coercedVals, u)
+						} else if f, ok := toFloat64(rv); ok && f >= 0 && f < 18446744073709551616.0 {
+							coercedVals = append(coercedVals, uint64(f))
+						}
+					default:
+						if f, ok := toFloat64(rv); ok && f >= 0 && f < 18446744073709551616.0 {
+							if f < 9223372036854775808.0 {
+								coercedVals = append(coercedVals, int64(f))
+							} else {
+								coercedVals = append(coercedVals, uint64(f))
+							}
+						}
+					}
+				case "long", "integer", "short", "byte":
+					if iv, okI := rv.(int64); okI {
+						coercedVals = append(coercedVals, iv)
+					} else if nv, okN := rv.(json.Number); okN {
+						if iv, err := nv.Int64(); err == nil {
+							coercedVals = append(coercedVals, iv)
+						} else if f, ok := toFloat64(rv); ok && f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
+							coercedVals = append(coercedVals, int64(f))
+						}
+					} else if f, ok := toFloat64(rv); ok && f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
 						coercedVals = append(coercedVals, int64(f))
 					}
 				case "double", "float", "half_float", "scaled_float":
@@ -22220,7 +22333,15 @@ func (s *Server) evalRuntimeMappingsOnHitRows(idxSchema *schema.IndexSchema, req
 						}
 					}
 				case "date", "date_nanos":
-					if f, ok := toFloat64(rv); ok {
+					if iv, okI := rv.(int64); okI {
+						coercedVals = append(coercedVals, iv)
+					} else if nv, okN := rv.(json.Number); okN {
+						if iv, err := nv.Int64(); err == nil {
+							coercedVals = append(coercedVals, iv)
+						} else if f, ok := toFloat64(rv); ok && f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
+							coercedVals = append(coercedVals, int64(f))
+						}
+					} else if f, ok := toFloat64(rv); ok && f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
 						coercedVals = append(coercedVals, int64(f))
 					} else if sv, ok := rv.(string); ok {
 						if ms, ok := schema.ParseESDateWithFormatToEpochMillis(sv, prop.Format, nowUTC); ok {
@@ -25805,14 +25926,35 @@ func emitRuntimeMultiTermsAggRows(
 				} else {
 					strParts[i] = fmt.Sprintf("%v", kv)
 				}
-				if fv, ok := toFloat64(v); ok {
-					if fv == math.Trunc(fv) {
-						normParts[i] = int64(fv)
-					} else {
+				switch nv := v.(type) {
+				case int, int64, uint64:
+					normParts[i] = nv
+				case json.Number:
+					if iv, err := nv.Int64(); err == nil {
+						normParts[i] = iv
+					} else if uv, errU := strconv.ParseUint(nv.String(), 10, 64); errU == nil {
+						normParts[i] = uv
+					} else if fv, ok := toFloat64(v); ok {
 						normParts[i] = fv
+					} else {
+						normParts[i] = v
 					}
-				} else {
-					normParts[i] = v
+				default:
+					if fv, ok := toFloat64(v); ok {
+						if fv == math.Trunc(fv) {
+							if fv >= -9223372036854775808.0 && fv < 9223372036854775808.0 {
+								normParts[i] = int64(fv)
+							} else if fv >= 9223372036854775808.0 && fv < 18446744073709551616.0 {
+								normParts[i] = uint64(fv)
+							} else {
+								normParts[i] = fv
+							}
+						} else {
+							normParts[i] = fv
+						}
+					} else {
+						normParts[i] = v
+					}
 				}
 			}
 			joined := strings.Join(strParts, "|")

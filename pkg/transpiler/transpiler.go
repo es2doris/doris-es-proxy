@@ -4512,14 +4512,42 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 			sv = strings.ToLower(sv)
 		}
 		val = sv
-	} else if nv, ok := val.(json.Number); ok && b.ESType == "unsigned_long" {
-		if iv, err := nv.Int64(); err == nil {
-			if iv < 0 {
+	} else if b.ESType == "unsigned_long" {
+		switch nv := val.(type) {
+		case int:
+			if nv < 0 {
 				return "FALSE"
 			}
+		case int64:
+			if nv < 0 {
+				return "FALSE"
+			}
+		case float64:
+			if math.IsNaN(nv) || math.IsInf(nv, 0) || nv < 0 || nv != math.Trunc(nv) || nv >= 18446744073709551616.0 {
+				return "FALSE"
+			}
+			if nv >= 9223372036854775808.0 {
+				val = uint64(nv)
+			} else {
+				val = int64(nv)
+			}
+		case json.Number:
+			if iv, err := nv.Int64(); err == nil {
+				if iv < 0 {
+					return "FALSE"
+				}
+				val = iv
+			} else if u, err := strconv.ParseUint(nv.String(), 10, 64); err == nil {
+				val = u
+			} else {
+				return "FALSE"
+			}
+		}
+	} else if nv, ok := val.(json.Number); ok && (effDT == schema.DorisBigInt || effDT == schema.DorisInt) {
+		if iv, err := nv.Int64(); err == nil {
 			val = iv
-		} else if u, err := strconv.ParseUint(nv.String(), 10, 64); err == nil {
-			val = u
+		} else if b.ESType != "" {
+			return "FALSE"
 		}
 	}
 	val = normalizeScaledFloatValue(b, val)
@@ -4850,14 +4878,42 @@ func (t *Transpiler) compileTermsPredicateWithCI(field string, vals []any, caseI
 				sv = strings.ToLower(sv)
 			}
 			v = sv
-		} else if nv, ok := v.(json.Number); ok && b.ESType == "unsigned_long" {
-			if iv, err := nv.Int64(); err == nil {
-				if iv < 0 {
+		} else if b.ESType == "unsigned_long" {
+			switch nv := v.(type) {
+			case int:
+				if nv < 0 {
 					continue
 				}
+			case int64:
+				if nv < 0 {
+					continue
+				}
+			case float64:
+				if math.IsNaN(nv) || math.IsInf(nv, 0) || nv < 0 || nv != math.Trunc(nv) || nv >= 18446744073709551616.0 {
+					continue
+				}
+				if nv >= 9223372036854775808.0 {
+					v = uint64(nv)
+				} else {
+					v = int64(nv)
+				}
+			case json.Number:
+				if iv, err := nv.Int64(); err == nil {
+					if iv < 0 {
+						continue
+					}
+					v = iv
+				} else if u, err := strconv.ParseUint(nv.String(), 10, 64); err == nil {
+					v = u
+				} else {
+					continue
+				}
+			}
+		} else if nv, ok := v.(json.Number); ok && (effDT == schema.DorisBigInt || effDT == schema.DorisInt) {
+			if iv, err := nv.Int64(); err == nil {
 				v = iv
-			} else if u, err := strconv.ParseUint(nv.String(), 10, 64); err == nil {
-				v = u
+			} else if b.ESType != "" {
+				continue
 			}
 		}
 		v = normalizeScaledFloatValue(b, v)
@@ -5334,7 +5390,7 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 		case schema.DorisBigInt:
 			if effFormat != "" && (b.ESType == "date" || b.ESType == "date_nanos" || rc.Format != "") && (!strings.Contains(strings.ToLower(effFormat), "epoch") || strings.Contains(strings.ToLower(effFormat), "basic_date")) {
 				switch iv := v.(type) {
-				case int, int64:
+				case int, int64, json.Number:
 					if ms, ok := schema.ParseESDateBoundWithFormatToEpochMillis(fmt.Sprintf("%v", iv), effFormat, now, roundUp); ok {
 						if tzOffsetMs != 0 && !strings.Contains(strings.ToLower(effFormat), "epoch") {
 							ms -= tzOffsetMs
@@ -5429,12 +5485,17 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 					}
 				}
 			}
-			if nv, ok := v.(json.Number); ok && b.ESType == "unsigned_long" && !isEpochSecond {
+			if nv, ok := v.(json.Number); ok && !isEpochSecond {
 				if iv, err := nv.Int64(); err == nil {
+					if norm, okN := normalizeDateNanosValue(b.ESType, iv).(int64); okN {
+						return norm
+					}
 					return iv
 				}
-				if u, err := strconv.ParseUint(nv.String(), 10, 64); err == nil {
-					return u
+				if b.ESType == "unsigned_long" {
+					if u, err := strconv.ParseUint(nv.String(), 10, 64); err == nil {
+						return u
+					}
 				}
 			}
 			if b.ESType == "date_nanos" && !isEpochSecond {
@@ -7696,8 +7757,16 @@ func (t *Transpiler) appendAggBranches(
 					var afterParts []string
 					for _, sn := range srcNames {
 						if av, ok := spec.Composite.After[sn]; ok && av != nil {
-							if fv, ok := av.(float64); ok && fv == math.Trunc(fv) {
-								afterParts = append(afterParts, strconv.FormatInt(int64(fv), 10))
+							if nv, ok := av.(json.Number); ok {
+								afterParts = append(afterParts, nv.String())
+							} else if fv, ok := av.(float64); ok && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) {
+								if fv >= -9223372036854775808.0 && fv < 9223372036854775808.0 {
+									afterParts = append(afterParts, strconv.FormatInt(int64(fv), 10))
+								} else if fv >= 9223372036854775808.0 && fv < 18446744073709551616.0 {
+									afterParts = append(afterParts, strconv.FormatUint(uint64(fv), 10))
+								} else {
+									afterParts = append(afterParts, strconv.FormatFloat(fv, 'f', -1, 64))
+								}
 							} else {
 								afterParts = append(afterParts, fmt.Sprintf("%v", av))
 							}
@@ -10196,8 +10265,13 @@ func formatMissingScalar(v any) string {
 		if math.IsNaN(val) || math.IsInf(val, 0) {
 			return "0"
 		}
-		if val == math.Trunc(val) && val >= math.MinInt64 && val <= math.MaxInt64 {
-			return strconv.FormatInt(int64(val), 10)
+		if val == math.Trunc(val) {
+			if val >= -9223372036854775808.0 && val < 9223372036854775808.0 {
+				return strconv.FormatInt(int64(val), 10)
+			}
+			if val >= 9223372036854775808.0 && val < 18446744073709551616.0 {
+				return strconv.FormatUint(uint64(val), 10)
+			}
 		}
 		return strconv.FormatFloat(val, 'f', -1, 64)
 	case json.Number:
@@ -11073,16 +11147,26 @@ func (t *Transpiler) parseMetricScriptExpr(s string, params map[string]any, defa
 				return strconv.Itoa(v), true
 			case int64:
 				return strconv.FormatInt(v, 10), true
+			case uint64:
+				return strconv.FormatUint(v, 10), true
 			case float64:
 				if !math.IsNaN(v) && !math.IsInf(v, 0) {
 					if v == math.Trunc(v) {
-						return strconv.FormatInt(int64(v), 10), true
+						if v >= -9223372036854775808.0 && v < 9223372036854775808.0 {
+							return strconv.FormatInt(int64(v), 10), true
+						}
+						if v >= 9223372036854775808.0 && v < 18446744073709551616.0 {
+							return strconv.FormatUint(uint64(v), 10), true
+						}
 					}
 					return strconv.FormatFloat(v, 'f', -1, 64), true
 				}
 			case json.Number:
 				if i, err := v.Int64(); err == nil {
 					return strconv.FormatInt(i, 10), true
+				}
+				if u, err := strconv.ParseUint(v.String(), 10, 64); err == nil {
+					return strconv.FormatUint(u, 10), true
 				}
 				if f, err := v.Float64(); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
 					return strconv.FormatFloat(f, 'f', -1, 64), true
@@ -11375,16 +11459,26 @@ func (t *Transpiler) parseSafeThresholdExpr(s string, params map[string]any, num
 				return strconv.Itoa(v), true
 			case int64:
 				return strconv.FormatInt(v, 10), true
+			case uint64:
+				return strconv.FormatUint(v, 10), true
 			case float64:
 				if !math.IsNaN(v) && !math.IsInf(v, 0) {
 					if v == math.Trunc(v) {
-						return strconv.FormatInt(int64(v), 10), true
+						if v >= -9223372036854775808.0 && v < 9223372036854775808.0 {
+							return strconv.FormatInt(int64(v), 10), true
+						}
+						if v >= 9223372036854775808.0 && v < 18446744073709551616.0 {
+							return strconv.FormatUint(uint64(v), 10), true
+						}
 					}
 					return strconv.FormatFloat(v, 'f', -1, 64), true
 				}
 			case json.Number:
 				if i, err := v.Int64(); err == nil {
 					return strconv.FormatInt(i, 10), true
+				}
+				if u, err := strconv.ParseUint(v.String(), 10, 64); err == nil {
+					return strconv.FormatUint(u, 10), true
 				}
 				if f, err := v.Float64(); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
 					return strconv.FormatFloat(f, 'f', -1, 64), true
@@ -11586,6 +11680,11 @@ func (t *Transpiler) resolveSortMissing(s esast.SortSpec, b schema.FieldBinding)
 				return niv, strconv.FormatInt(niv, 10)
 			}
 			return iv, strconv.FormatInt(iv, 10)
+		}
+		if effType == "unsigned_long" || b.ESType == "unsigned_long" {
+			if uv, errU := strconv.ParseUint(mStr, 10, 64); errU == nil {
+				return uv, strconv.FormatUint(uv, 10)
+			}
 		}
 	}
 	if fv, err := strconv.ParseFloat(mStr, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
@@ -11927,11 +12026,13 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 							}
 						}
 					}
-				} else if nv, ok := sampleVal.(json.Number); ok && b.ESType == "unsigned_long" {
+				} else if nv, ok := sampleVal.(json.Number); ok {
 					if iv, err := nv.Int64(); err == nil {
 						sampleVal = iv
-					} else if uv, errU := strconv.ParseUint(nv.String(), 10, 64); errU == nil {
-						sampleVal = uv
+					} else if b.ESType == "unsigned_long" || effType == "unsigned_long" {
+						if uv, errU := strconv.ParseUint(nv.String(), 10, 64); errU == nil {
+							sampleVal = uv
+						}
 					}
 				}
 				sampleVal = normalizeEpochSecondSortValue(effType, s.Entry.Format, b, sampleVal)
@@ -12150,11 +12251,13 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 						val = fv
 					}
 				}
-			} else if nv, ok := val.(json.Number); ok && b.ESType == "unsigned_long" {
+			} else if nv, ok := val.(json.Number); ok {
 				if iv, err := nv.Int64(); err == nil {
 					val = iv
-				} else if uv, errU := strconv.ParseUint(nv.String(), 10, 64); errU == nil {
-					val = uv
+				} else if b.ESType == "unsigned_long" || effType == "unsigned_long" {
+					if uv, errU := strconv.ParseUint(nv.String(), 10, 64); errU == nil {
+						val = uv
+					}
 				}
 			}
 			val = normalizeEpochSecondSortValue(effType, effectiveSorts[idx].Entry.Format, b, val)
@@ -12700,8 +12803,13 @@ func quoteValue(v any) string {
 		if math.IsNaN(val) || math.IsInf(val, 0) {
 			return "NULL"
 		}
-		if val == math.Trunc(val) && val >= math.MinInt64 && val <= math.MaxInt64 {
-			return strconv.FormatInt(int64(val), 10)
+		if val == math.Trunc(val) {
+			if val >= -9223372036854775808.0 && val < 9223372036854775808.0 {
+				return strconv.FormatInt(int64(val), 10)
+			}
+			if val >= 9223372036854775808.0 && val < 18446744073709551616.0 {
+				return strconv.FormatUint(uint64(val), 10)
+			}
 		}
 		return strconv.FormatFloat(val, 'f', -1, 64)
 	case json.Number:

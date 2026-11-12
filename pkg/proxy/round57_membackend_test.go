@@ -110,18 +110,29 @@ func TestRound57MemBackendUnsignedLongExactPrecision(t *testing.T) {
 		t.Fatalf("expected [d1] for term MaxInt64, got %v (raw=%s)", ids, raw)
 	}
 
-	// 2. term: MaxUint64 - 1 vs MaxUint64 (verifies 64-bit integer comparison without float64 53-bit truncation)
-	code, raw, res = doRound57MemReq(t, srv, http.MethodPost, "/r57_ulong/_search", `{"query":{"term":{"u_val":"18446744073709551614"}}}`)
-	if code != http.StatusOK {
-		t.Fatalf("search term MaxUint64-1 failed (%d): %s", code, raw)
+	// 2. term: MaxUint64 - 1 vs MaxUint64 (both quoted and unquoted JSON integers, verifying exact 64-bit precision)
+	for _, qBody := range []string{
+		`{"query":{"term":{"u_val":"18446744073709551614"}}}`,
+		`{"query":{"term":{"u_val":18446744073709551614}}}`,
+		`{"query":{"term":{"u_val":{"value":18446744073709551614}}}}`,
+	} {
+		code, raw, res = doRound57MemReq(t, srv, http.MethodPost, "/r57_ulong/_search", qBody)
+		if code != http.StatusOK {
+			t.Fatalf("search term MaxUint64-1 (%s) failed (%d): %s", qBody, code, raw)
+		}
+		if ids := extractRound57HitIDs(t, res); !reflect.DeepEqual(ids, []string{"d3"}) {
+			t.Fatalf("expected [d3] for term MaxUint64-1 (%s), got %v (raw=%s)", qBody, ids, raw)
+		}
 	}
-	if ids := extractRound57HitIDs(t, res); !reflect.DeepEqual(ids, []string{"d3"}) {
-		t.Fatalf("expected [d3] for term MaxUint64-1, got %v (raw=%s)", ids, raw)
+	// Negative query on unsigned_long must match nothing
+	_, _, resNeg := doRound57MemReq(t, srv, http.MethodPost, "/r57_ulong/_search", `{"query":{"term":{"u_val":-1}}}`)
+	if ids := extractRound57HitIDs(t, resNeg); len(ids) != 0 {
+		t.Fatalf("expected [] for negative term on unsigned_long, got %v", ids)
 	}
 
-	// 3. terms query across signed/unsigned boundary
+	// 3. terms query across signed/unsigned boundary (both unquoted and quoted)
 	code, raw, res = doRound57MemReq(t, srv, http.MethodPost, "/r57_ulong/_search", `{
-		"query": {"terms": {"u_val": ["9223372036854775808", "18446744073709551615"]}},
+		"query": {"terms": {"u_val": [9223372036854775808, 18446744073709551615]}},
 		"sort": [{"u_val": "asc"}]
 	}`)
 	if code != http.StatusOK {
@@ -131,7 +142,7 @@ func TestRound57MemBackendUnsignedLongExactPrecision(t *testing.T) {
 		t.Fatalf("expected [d2 d4] for terms query, got %v", ids)
 	}
 
-	// 4. range lte: MaxInt64 and gt: MaxUint64 - 1 (scalar & multi-valued array)
+	// 4. range lte: MaxInt64 and gt: MaxUint64 - 1 (unquoted & quoted, scalar & multi-valued array)
 	_, _, resLte := doRound57MemReq(t, srv, http.MethodPost, "/r57_ulong/_search", `{
 		"query": {"range": {"u_val": {"lte": 9223372036854775807}}},
 		"sort": [{"u_val": "asc"}]
@@ -140,19 +151,19 @@ func TestRound57MemBackendUnsignedLongExactPrecision(t *testing.T) {
 		t.Fatalf("expected [d0 d1] for range lte MaxInt64, got %v", ids)
 	}
 	_, _, resGt := doRound57MemReq(t, srv, http.MethodPost, "/r57_ulong/_search", `{
-		"query": {"range": {"u_val": {"gt": "18446744073709551614"}}}
+		"query": {"range": {"u_val": {"gt": 18446744073709551614}}}
 	}`)
 	if ids := extractRound57HitIDs(t, resGt); !reflect.DeepEqual(ids, []string{"d4"}) {
 		t.Fatalf("expected [d4] for range gt MaxUint64-1, got %v", ids)
 	}
 	_, _, resArrRange := doRound57MemReq(t, srv, http.MethodPost, "/r57_ulong/_search", `{
-		"query": {"range": {"u_arr": {"gt": "18446744073709551614"}}}
+		"query": {"range": {"u_arr": {"gt": 18446744073709551614}}}
 	}`)
 	if ids := extractRound57HitIDs(t, resArrRange); !reflect.DeepEqual(ids, []string{"d4"}) {
 		t.Fatalf("expected [d4] for multi-valued u_arr range gt MaxUint64-1, got %v", ids)
 	}
 
-	// 5. sort ASC, sort DESC, sort on multi-valued u_arr, and search_after at MaxUint64-1
+	// 5. sort ASC, sort DESC, sort on multi-valued u_arr, and search_after at MaxUint64-1 (unquoted)
 	_, _, resSortAsc := doRound57MemReq(t, srv, http.MethodPost, "/r57_ulong/_search", `{"sort":[{"u_val":"asc"}]}`)
 	if ids := extractRound57HitIDs(t, resSortAsc); !reflect.DeepEqual(ids, []string{"d0", "d1", "d2", "d3", "d4"}) {
 		t.Fatalf("expected ASC order [d0 d1 d2 d3 d4], got %v", ids)
@@ -163,7 +174,7 @@ func TestRound57MemBackendUnsignedLongExactPrecision(t *testing.T) {
 	}
 	_, _, resAfter := doRound57MemReq(t, srv, http.MethodPost, "/r57_ulong/_search", `{
 		"sort": [{"u_val": "asc"}],
-		"search_after": ["18446744073709551614"]
+		"search_after": [18446744073709551614]
 	}`)
 	if ids := extractRound57HitIDs(t, resAfter); !reflect.DeepEqual(ids, []string{"d4"}) {
 		t.Fatalf("expected [d4] after 18446744073709551614, got %v", ids)
@@ -173,11 +184,11 @@ func TestRound57MemBackendUnsignedLongExactPrecision(t *testing.T) {
 		t.Fatalf("expected u_arr max DESC order [d4 d3 d2 d1 d0], got %v", ids)
 	}
 
-	// 6. Top-level and sub-aggregation terms preserve exact 20-digit unsigned_long bucket keys
+	// 6. Top-level and sub-aggregation terms preserve exact 20-digit unsigned_long bucket keys & numeric _key ordering
 	code, raw, resAgg := doRound57MemReq(t, srv, http.MethodPost, "/r57_ulong/_search", `{
 		"size": 0,
 		"aggs": {
-			"u_buckets": {"terms": {"field": "u_val", "size": 10}},
+			"u_buckets": {"terms": {"field": "u_val", "size": 10, "order": {"_key": "asc"}}},
 			"by_grp": {
 				"terms": {"field": "grp"},
 				"aggs": {"sub_u": {"terms": {"field": "u_val", "size": 10}}}
@@ -193,15 +204,14 @@ func TestRound57MemBackendUnsignedLongExactPrecision(t *testing.T) {
 	if len(uBuckets) != 5 {
 		t.Fatalf("expected 5 distinct u_val buckets (no MaxInt64 clamping collision), got %d: %s", len(uBuckets), raw)
 	}
-	seenKeys := make(map[string]bool)
+	var gotKeyOrder []string
 	for _, b := range uBuckets {
 		bm, _ := b.(map[string]any)
-		seenKeys[strings.TrimSpace(jsonStringifyKey(bm["key"]))] = true
+		gotKeyOrder = append(gotKeyOrder, strings.TrimSpace(jsonStringifyKey(bm["key"])))
 	}
-	for _, wantK := range []string{"0", "9223372036854775807", "9223372036854775808", "18446744073709551614", "18446744073709551615"} {
-		if !seenKeys[wantK] {
-			t.Fatalf("missing expected unsigned_long bucket key %s in %v (raw=%s)", wantK, seenKeys, raw)
-		}
+	wantKeyOrder := []string{"0", "9223372036854775807", "9223372036854775808", "18446744073709551614", "18446744073709551615"}
+	if !reflect.DeepEqual(gotKeyOrder, wantKeyOrder) {
+		t.Fatalf("expected exact numeric _key ASC order %v, got %v (raw=%s)", wantKeyOrder, gotKeyOrder, raw)
 	}
 
 	byGrpObj, _ := aggsMap["by_grp"].(map[string]any)

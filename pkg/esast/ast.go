@@ -701,6 +701,15 @@ func (r *SearchRequest) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*r = SearchRequest(raw.plain)
+	if rawSA, hasSA := rawMap["search_after"]; hasSA {
+		saTrim := bytes.TrimSpace(rawSA)
+		if len(saTrim) > 0 && !bytes.Equal(saTrim, []byte("null")) {
+			var saVals []any
+			if err := unmarshalPreservingLargeInts(saTrim, &saVals); err == nil {
+				r.SearchAfter = normalizeDecodedNumbersPreservingLargeInts(saVals).([]any)
+			}
+		}
+	}
 	if rawSub, hasSub := rawMap["sub_searches"]; hasSub {
 		subTrim := bytes.TrimSpace(rawSub)
 		if !bytes.Equal(subTrim, []byte("null")) && len(r.SubSearches) == 0 {
@@ -2147,6 +2156,73 @@ func parseFlexibleStringSlice(v any) ([]string, error) {
 	}
 }
 
+func formatExactFloatInt(fv float64) (string, bool) {
+	if math.IsNaN(fv) || math.IsInf(fv, 0) || fv != math.Trunc(fv) {
+		return "", false
+	}
+	if fv >= -9223372036854775808.0 && fv < 9223372036854775808.0 {
+		return strconv.FormatInt(int64(fv), 10), true
+	}
+	if fv >= 9223372036854775808.0 && fv < 18446744073709551616.0 {
+		return strconv.FormatUint(uint64(fv), 10), true
+	}
+	return "", false
+}
+
+func normalizeDecodedNumbersPreservingLargeInts(v any) any {
+	switch tv := v.(type) {
+	case json.Number:
+		s := tv.String()
+		if strings.ContainsAny(s, ".eE") {
+			if f, err := tv.Float64(); err == nil {
+				return f
+			}
+			return tv
+		}
+		if iv, err := tv.Int64(); err == nil {
+			if iv >= -9007199254740992 && iv <= 9007199254740992 {
+				return float64(iv)
+			}
+			return tv
+		}
+		if _, err := strconv.ParseUint(s, 10, 64); err == nil {
+			return tv
+		}
+		if f, err := tv.Float64(); err == nil {
+			return f
+		}
+		return tv
+	case []any:
+		for i, el := range tv {
+			tv[i] = normalizeDecodedNumbersPreservingLargeInts(el)
+		}
+		return tv
+	case map[string]any:
+		for k, el := range tv {
+			tv[k] = normalizeDecodedNumbersPreservingLargeInts(el)
+		}
+		return tv
+	default:
+		return v
+	}
+}
+
+func unmarshalPreservingLargeInts(data []byte, dst any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("parsing_exception: unexpected trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
 func formatFlexibleScalarString(v any) string {
 	if v == nil {
 		return ""
@@ -2154,8 +2230,13 @@ func formatFlexibleScalarString(v any) string {
 	if s, ok := v.(string); ok {
 		return s
 	}
-	if fv, ok := v.(float64); ok && fv == math.Trunc(fv) && !math.IsInf(fv, 0) && !math.IsNaN(fv) {
-		return strconv.FormatInt(int64(fv), 10)
+	if nv, ok := v.(json.Number); ok {
+		return nv.String()
+	}
+	if fv, ok := v.(float64); ok {
+		if s, okInt := formatExactFloatInt(fv); okInt {
+			return s
+		}
 	}
 	return fmt.Sprintf("%v", v)
 }
@@ -6331,10 +6412,10 @@ func (tq *TermsQuery) UnmarshalJSON(data []byte) error {
 		}
 		if len(trimmed) > 0 && trimmed[0] == '[' {
 			var arr []any
-			if err := json.Unmarshal(trimmed, &arr); err != nil {
+			if err := unmarshalPreservingLargeInts(trimmed, &arr); err != nil {
 				return fmt.Errorf("parsing_exception: [terms] invalid terms array for [%s]: %w", k, err)
 			}
-			tq.Fields[k] = arr
+			tq.Fields[k] = normalizeDecodedNumbersPreservingLargeInts(arr).([]any)
 			continue
 		}
 		if len(trimmed) > 0 && trimmed[0] == '{' {
@@ -6387,17 +6468,17 @@ func (tse *TermsSetEntry) UnmarshalJSON(data []byte) error {
 		MinimumShouldMatchScript any             `json:"minimum_should_match_script"`
 		Boost                    json.RawMessage `json:"boost"`
 	}
-	if err := json.Unmarshal(trimmed, &full); err != nil {
+	if err := unmarshalPreservingLargeInts(trimmed, &full); err != nil {
 		return err
 	}
 	if len(full.Terms) == 0 {
 		return fmt.Errorf("parsing_exception: [terms_set] requires a non-empty [terms] array")
 	}
-	tse.Terms = full.Terms
+	tse.Terms = normalizeDecodedNumbersPreservingLargeInts(full.Terms).([]any)
 	tse.MinimumShouldMatchField = full.MinimumShouldMatchField
-	tse.MinimumShouldMatchScript = full.MinimumShouldMatchScript
+	tse.MinimumShouldMatchScript = normalizeDecodedNumbersPreservingLargeInts(full.MinimumShouldMatchScript)
 	if tse.MinimumShouldMatchScript == nil && full.MinimumShouldMatch != nil {
-		tse.MinimumShouldMatchScript = full.MinimumShouldMatch
+		tse.MinimumShouldMatchScript = normalizeDecodedNumbersPreservingLargeInts(full.MinimumShouldMatch)
 	}
 	hasMSMField := strings.TrimSpace(tse.MinimumShouldMatchField) != ""
 	hasMSMScript := tse.MinimumShouldMatchScript != nil
@@ -6890,9 +6971,11 @@ func (t *TermEntry) UnmarshalJSON(data []byte) error {
 			Boost           json.RawMessage `json:"boost"`
 			CaseInsensitive any             `json:"case_insensitive"`
 		}
-		if err := json.Unmarshal(trimmed, &full); err != nil {
+		if err := unmarshalPreservingLargeInts(trimmed, &full); err != nil {
 			return err
 		}
+		full.Value = normalizeDecodedNumbersPreservingLargeInts(full.Value)
+		full.CaseInsensitive = normalizeDecodedNumbersPreservingLargeInts(full.CaseInsensitive)
 		if isNonScalarOrNullValue(full.Value) {
 			return fmt.Errorf("parsing_exception: [term] query does not support non-scalar or null value")
 		}
@@ -6914,9 +6997,10 @@ func (t *TermEntry) UnmarshalJSON(data []byte) error {
 		t.CaseInsensitive = ci
 		return nil
 	}
-	if err := json.Unmarshal(trimmed, &t.Value); err != nil {
+	if err := unmarshalPreservingLargeInts(trimmed, &t.Value); err != nil {
 		return err
 	}
+	t.Value = normalizeDecodedNumbersPreservingLargeInts(t.Value)
 	if isNonScalarOrNullValue(t.Value) {
 		return fmt.Errorf("parsing_exception: [term] query does not support non-scalar or null value")
 	}
@@ -7080,7 +7164,7 @@ func (rc *RangeCond) UnmarshalJSON(data []byte) error {
 		TimeZone     string          `json:"time_zone"`
 		Relation     string          `json:"relation"`
 	}
-	if err := json.Unmarshal(trimmed, &full); err != nil {
+	if err := unmarshalPreservingLargeInts(trimmed, &full); err != nil {
 		return err
 	}
 	if strings.TrimSpace(full.Relation) != "" {
@@ -7092,12 +7176,12 @@ func (rc *RangeCond) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: [range] relation [%s] is not supported; must be INTERSECTS, CONTAINS, or WITHIN", full.Relation)
 		}
 	}
-	rc.GT = full.GT
-	rc.GTE = full.GTE
-	rc.LT = full.LT
-	rc.LTE = full.LTE
-	rc.From = full.From
-	rc.To = full.To
+	rc.GT = normalizeDecodedNumbersPreservingLargeInts(full.GT)
+	rc.GTE = normalizeDecodedNumbersPreservingLargeInts(full.GTE)
+	rc.LT = normalizeDecodedNumbersPreservingLargeInts(full.LT)
+	rc.LTE = normalizeDecodedNumbersPreservingLargeInts(full.LTE)
+	rc.From = normalizeDecodedNumbersPreservingLargeInts(full.From)
+	rc.To = normalizeDecodedNumbersPreservingLargeInts(full.To)
 	rc.IncludeLower = full.IncludeLower
 	rc.IncludeUpper = full.IncludeUpper
 	rc.Format = full.Format
@@ -13187,12 +13271,8 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 	}
 	if rawMissing, hasMissing := m["missing"]; hasMissing && field != "missing" {
 		var mv any
-		if json.Unmarshal(rawMissing, &mv) == nil && mv != nil {
-			if fv, ok := mv.(float64); ok && fv == math.Trunc(fv) && !math.IsInf(fv, 0) && !math.IsNaN(fv) {
-				missing = strconv.FormatInt(int64(fv), 10)
-			} else {
-				missing = fmt.Sprintf("%v", mv)
-			}
+		if unmarshalPreservingLargeInts(bytes.TrimSpace(rawMissing), &mv) == nil && mv != nil {
+			missing = formatFlexibleScalarString(normalizeDecodedNumbersPreservingLargeInts(mv))
 		}
 	}
 	if rawUT, hasUT := m["unmapped_type"]; hasUT && field != "unmapped_type" {
@@ -13324,12 +13404,13 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 			}
 			ignoreUnmapped = bv
 		}
-		if obj.Missing != nil {
-			if fv, ok := obj.Missing.(float64); ok && fv == math.Trunc(fv) && !math.IsInf(fv, 0) && !math.IsNaN(fv) {
-				missing = strconv.FormatInt(int64(fv), 10)
-			} else {
-				missing = fmt.Sprintf("%v", obj.Missing)
+		if rawInnerMissing, hasInnerMissing := innerMap["missing"]; hasInnerMissing {
+			var mv any
+			if unmarshalPreservingLargeInts(bytes.TrimSpace(rawInnerMissing), &mv) == nil && mv != nil {
+				missing = formatFlexibleScalarString(normalizeDecodedNumbersPreservingLargeInts(mv))
 			}
+		} else if obj.Missing != nil {
+			missing = formatFlexibleScalarString(obj.Missing)
 		}
 		if obj.Nested != nil {
 			nestedSpec = obj.Nested
