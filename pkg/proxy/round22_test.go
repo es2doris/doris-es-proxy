@@ -26,7 +26,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/es2doris/doris-es-proxy/pkg/esast"
 	"github.com/es2doris/doris-es-proxy/pkg/painless"
+	"github.com/es2doris/doris-es-proxy/pkg/schema"
 )
 
 func r22Req(t *testing.T, srv *Server, method, path string, body any) *httptest.ResponseRecorder {
@@ -181,12 +183,12 @@ func TestRound22QueryDSLKeywordMatchSimpleQueryStringAndMultiMatch(t *testing.T)
 
 func TestRound22SchemaCopyToKeywordArrayAliasChainsIgnoreAboveAndNestedKeyword(t *testing.T) {
 	srv, _ := newTestServer()
-	r22Req(t, srv, http.MethodPut, "/r22_schema", `{
+	wCreate := r22Req(t, srv, http.MethodPut, "/r22_schema", `{
 		"mappings": {
 			"properties": {
 				"first_name": {
 					"type": "keyword",
-					"copy_to": "full_search_alias"
+					"copy_to": "full_search"
 				},
 				"last_name": {
 					"type": "keyword",
@@ -201,14 +203,6 @@ func TestRound22SchemaCopyToKeywordArrayAliasChainsIgnoreAboveAndNestedKeyword(t
 				"full_search_alias": {
 					"type": "alias",
 					"path": "full_search"
-				},
-				"chained_alias": {
-					"type": "alias",
-					"path": "full_search_alias"
-				},
-				"dyn_alias": {
-					"type": "alias",
-					"path": "unmapped_dyn_field"
 				},
 				"logs_msg": {
 					"type": "match_only_text"
@@ -235,13 +229,35 @@ func TestRound22SchemaCopyToKeywordArrayAliasChainsIgnoreAboveAndNestedKeyword(t
 			}
 		}
 	}`)
+	if wCreate.Code != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /r22_schema, got %d: %s", wCreate.Code, wCreate.Body.String())
+	}
+
+	// ES 8.x strict validation rejects chained or dangling aliases on HTTP PUT, while CompileIndexSchema remains defensive.
+	if wBad := r22Req(t, srv, http.MethodPut, "/r22_bad_chained_alias", `{"mappings":{"properties":{"a":{"type":"keyword"},"b":{"type":"alias","path":"a"},"c":{"type":"alias","path":"b"}}}}`); wBad.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for chained alias, got %d", wBad.Code)
+	}
+	legacySchema := schema.CompileIndexSchema("db", "r22_legacy", &esast.MappingSpec{
+		Properties: map[string]esast.FieldProperty{
+			"full_search":       {Type: "text"},
+			"full_search_alias": {Type: "alias", Path: "full_search"},
+			"chained_alias":     {Type: "alias", Path: "full_search_alias"},
+			"dyn_alias":         {Type: "alias", Path: "unmapped_dyn_field"},
+		},
+	})
+	if b := legacySchema.ResolveField("chained_alias"); b.ColumnName == "" {
+		t.Fatalf("expected defensive CompileIndexSchema to resolve chained_alias, got %+v", b)
+	}
+	if b := legacySchema.ResolveField("dyn_alias"); len(b.SourceJSONPath) != 1 || b.SourceJSONPath[0] != "unmapped_dyn_field" {
+		t.Fatalf("expected defensive CompileIndexSchema to resolve dyn_alias to SourceJSONPath [unmapped_dyn_field], got %+v", b)
+	}
 
 	long1050 := strings.Repeat("X", 1050)
 	r22Req(t, srv, http.MethodPost, "/r22_schema/_bulk?refresh=true",
 		`{"index":{"_id":"1"}}`+"\n"+fmt.Sprintf(`{"first_name":"Alice","last_name":"Smith","unmapped_dyn_field":"dyn_val","logs_msg":"hello world","long_code":%q,"items":[{"label":"MixedCaseLongLabel"}]}`, long1050)+"\n")
 
-	// 1. Chained alias + copy_to via alias + term query on full_search (whose .keyword companion was promoted to ARRAY<STRING> by copy_to)
-	for _, fieldName := range []string{"full_search", "full_search.keyword", "full_search_alias", "chained_alias"} {
+	// 1. Alias + copy_to + term query on full_search (whose .keyword companion was promoted to ARRAY<STRING> by copy_to)
+	for _, fieldName := range []string{"full_search", "full_search.keyword", "full_search_alias"} {
 		w := r22Req(t, srv, http.MethodPost, "/r22_schema/_search", fmt.Sprintf(`{
 			"query": {"term": {%q: "Alice"}}
 		}`, fieldName))
@@ -254,12 +270,12 @@ func TestRound22SchemaCopyToKeywordArrayAliasChainsIgnoreAboveAndNestedKeyword(t
 		}
 	}
 
-	// 2. Alias targeting unmapped dynamic field works without emitting empty column backticks
+	// 2. Unmapped dynamic field works cleanly
 	wDyn := r22Req(t, srv, http.MethodPost, "/r22_schema/_search", `{
-		"query": {"term": {"dyn_alias": "dyn_val"}}
+		"query": {"term": {"unmapped_dyn_field": "dyn_val"}}
 	}`)
 	if wDyn.Code != http.StatusOK || len(r22JSON(t, wDyn)["hits"].(map[string]any)["hits"].([]any)) != 1 {
-		t.Fatalf("expected 1 hit for term query on dyn_alias, got %d: %s", wDyn.Code, wDyn.Body.String())
+		t.Fatalf("expected 1 hit for term query on unmapped_dyn_field, got %d: %s", wDyn.Code, wDyn.Body.String())
 	}
 
 	// 3. ignore_above: 1024 drops 1050-byte string before VARCHAR(1024) truncation

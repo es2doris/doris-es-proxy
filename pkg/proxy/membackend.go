@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/big"
 	"math/rand"
 	"net"
 	"regexp"
@@ -3123,6 +3124,11 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 				best = e
 			}
 		}
+		if strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS LARGEINT), ") {
+			if bi, ok := memParseExactBigInt(best); ok {
+				return memNormalizeExactIntValue(bi)
+			}
+		}
 		if strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS BIGINT), ") {
 			if iv, ok := toInt64(best); ok {
 				return iv
@@ -3140,15 +3146,20 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		args := splitTopLevelArgs(inner)
 		for i, rawArg := range args {
 			arg := strings.TrimSpace(rawArg)
+			if strings.EqualFold(arg, "NULL") {
+				continue
+			}
 			if v := resolveColumnValue(row, arg); v != nil && fmt.Sprintf("%v", v) != "" {
 				return v
 			}
-			if i == len(args)-1 || strings.HasPrefix(arg, "'") {
-				if lit := parseSQLLiteralValue(arg); lit != nil && fmt.Sprintf("%v", lit) != "" {
+			if strings.HasPrefix(arg, "'") && strings.HasSuffix(arg, "'") {
+				if lit := unquoteSQLLiteral(arg); lit != "" {
 					return lit
 				}
 			} else if f, err := strconv.ParseFloat(arg, 64); err == nil {
 				return f
+			} else if i == len(args)-1 && (strings.EqualFold(arg, "TRUE") || strings.EqualFold(arg, "FALSE")) {
+				return strings.EqualFold(arg, "TRUE")
 			}
 		}
 		return nil
@@ -3267,7 +3278,9 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 				res = row["_ignored"]
 			}
 			if res != nil {
-				if strings.HasSuffix(colExpr, " AS BIGINT)") {
+				if strings.HasSuffix(colExpr, " AS LARGEINT)") {
+					return memCoerceSQLLargeInt(res)
+				} else if strings.HasSuffix(colExpr, " AS BIGINT)") {
 					if iv, ok := toInt64(res); ok {
 						return iv
 					}
@@ -3280,6 +3293,8 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 					if fv, ok := toFloat(res); ok {
 						return fv
 					}
+				} else if strings.HasSuffix(colExpr, " AS ARRAY<STRING>)") {
+					return memCoerceVariantToArrayOfString(res)
 				} else if strings.HasSuffix(colExpr, " AS BOOLEAN)") {
 					switch res.(type) {
 					case []any, []string:
@@ -3663,6 +3678,43 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		return nil
 	}
 	if strings.HasPrefix(colExpr, "CAST(") && !strings.HasPrefix(colExpr, "CAST(`_doc`") {
+		if asJSONIdx := strings.Index(colExpr, " AS JSON)["); asJSONIdx > len("CAST(") && strings.HasSuffix(colExpr, "]") && findTopLevelOp(colExpr, " AS ") < 0 {
+			innerVar := strings.TrimSpace(colExpr[len("CAST("):asJSONIdx])
+			pathPart := colExpr[asJSONIdx+len(" AS JSON)"):]
+			rawVal := resolveColumnValue(row, innerVar)
+			if rawVal == nil {
+				return nil
+			}
+			var rawStr string
+			switch rv := rawVal.(type) {
+			case string:
+				rawStr = rv
+			default:
+				if jb, err := json.Marshal(rv); err == nil {
+					rawStr = string(jb)
+				}
+			}
+			var segs []string
+			for _, p := range strings.Split(pathPart, "['") {
+				p = strings.TrimSuffix(p, "']")
+				if p != "" {
+					p = strings.ReplaceAll(p, "''", "'")
+					p = strings.ReplaceAll(p, `\\`, `\`)
+					segs = append(segs, p)
+				}
+			}
+			return extractJSONPathFromStr(rawStr, segs)
+		}
+		if strings.HasSuffix(colExpr, " AS LARGEINT)") {
+			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS LARGEINT)")])
+			if bi, ok := memParseExactBigInt(inner); ok {
+				return memNormalizeExactIntValue(bi)
+			}
+			if v := resolveColumnValue(row, inner); v != nil {
+				return memCoerceSQLLargeInt(v)
+			}
+			return nil
+		}
 		if strings.HasSuffix(colExpr, " AS DOUBLE)") {
 			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS DOUBLE)")])
 			if f, err := strconv.ParseFloat(inner, 64); err == nil {
@@ -4376,6 +4428,14 @@ func parseSQLLiteralValue(s string) any {
 	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
 		return i
 	}
+	if u, err := strconv.ParseUint(s, 10, 64); err == nil {
+		return u
+	}
+	if memIsSignedASCIIDigits(s) {
+		if bi, ok := new(big.Int).SetString(s, 10); ok {
+			return memNormalizeExactIntValue(bi)
+		}
+	}
 	if f, err := strconv.ParseFloat(s, 64); err == nil {
 		return f
 	}
@@ -4433,7 +4493,14 @@ func toStringSlice(v any) []string {
 	case []any:
 		out := make([]string, 0, len(s))
 		for _, item := range s {
-			out = append(out, fmt.Sprintf("%v", item))
+			switch tv := item.(type) {
+			case map[string]any, []any:
+				if jb, err := json.Marshal(tv); err == nil {
+					out = append(out, string(jb))
+				}
+			default:
+				out = append(out, fmt.Sprintf("%v", item))
+			}
 		}
 		return out
 	default:
@@ -4513,14 +4580,148 @@ func computeInnerProduct(a, b []float64) float64 {
 	return dot
 }
 
+func memIsSignedASCIIDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	if s[0] == '-' || s[0] == '+' {
+		s = s[1:]
+	}
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func memNormalizeExactIntValue(bi *big.Int) any {
+	if bi == nil {
+		return nil
+	}
+	if bi.IsInt64() {
+		return bi.Int64()
+	}
+	if bi.IsUint64() {
+		return bi.Uint64()
+	}
+	return bi
+}
+
+func memParseExactBigInt(v any) (*big.Int, bool) {
+	switch val := v.(type) {
+	case int:
+		return big.NewInt(int64(val)), true
+	case int64:
+		return big.NewInt(val), true
+	case uint64:
+		return new(big.Int).SetUint64(val), true
+	case *big.Int:
+		if val == nil {
+			return nil, false
+		}
+		return val, true
+	case json.Number:
+		s := strings.TrimSpace(val.String())
+		if !memIsSignedASCIIDigits(s) {
+			return nil, false
+		}
+		bi, ok := new(big.Int).SetString(s, 10)
+		return bi, ok
+	case string:
+		s := strings.TrimSpace(val)
+		if !memIsSignedASCIIDigits(s) {
+			return nil, false
+		}
+		bi, ok := new(big.Int).SetString(s, 10)
+		return bi, ok
+	default:
+		return nil, false
+	}
+}
+
+func memCoerceSQLLargeInt(res any) any {
+	switch res.(type) {
+	case []any, []string:
+		var out []any
+		for _, elem := range asSliceOrSingle(res) {
+			if bi, ok := memParseExactBigInt(elem); ok {
+				out = append(out, memNormalizeExactIntValue(bi))
+			} else if f, okF := toFloat(elem); okF && !math.IsNaN(f) && !math.IsInf(f, 0) && f == math.Trunc(f) {
+				biF, _ := new(big.Float).SetFloat64(f).Int(nil)
+				out = append(out, memNormalizeExactIntValue(biF))
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	default:
+		if bi, ok := memParseExactBigInt(res); ok {
+			return memNormalizeExactIntValue(bi)
+		}
+		if f, okF := toFloat(res); okF && !math.IsNaN(f) && !math.IsInf(f, 0) && f == math.Trunc(f) {
+			biF, _ := new(big.Float).SetFloat64(f).Int(nil)
+			return memNormalizeExactIntValue(biF)
+		}
+		return nil
+	}
+}
+
+func memCoerceVariantToArrayOfString(res any) any {
+	switch tv := res.(type) {
+	case nil, map[string]any:
+		return nil
+	case []string:
+		return tv
+	case []any:
+		var out []string
+		var appendElem func(item any)
+		appendElem = func(item any) {
+			if item == nil {
+				return
+			}
+			switch sub := item.(type) {
+			case []any:
+				for _, child := range sub {
+					appendElem(child)
+				}
+			case map[string]any:
+				if jb, err := json.Marshal(sub); err == nil {
+					out = append(out, string(jb))
+				}
+			default:
+				out = append(out, fmt.Sprintf("%v", sub))
+			}
+		}
+		for _, item := range tv {
+			appendElem(item)
+		}
+		return out
+	default:
+		return toStringSlice(fmt.Sprintf("%v", tv))
+	}
+}
+
 func toInt64(v any) (int64, bool) {
 	switch val := v.(type) {
 	case int:
 		return int64(val), true
 	case int64:
 		return val, true
+	case uint64:
+		if val <= math.MaxInt64 {
+			return int64(val), true
+		}
+		return 0, false
 	case float64:
-		return int64(val), true
+		if !math.IsNaN(val) && !math.IsInf(val, 0) && val >= -9223372036854775808.0 && val < 9223372036854775808.0 {
+			return int64(val), true
+		}
+		return 0, false
 	case json.Number:
 		i, err := val.Int64()
 		return i, err == nil
@@ -4540,6 +4741,14 @@ func toFloat(v any) (float64, bool) {
 		return float64(val), true
 	case int64:
 		return float64(val), true
+	case uint64:
+		return float64(val), true
+	case *big.Int:
+		if val == nil {
+			return 0, false
+		}
+		f, _ := new(big.Float).SetInt(val).Float64()
+		return f, true
 	case json.Number:
 		f, err := val.Float64()
 		return f, err == nil
@@ -4613,6 +4822,11 @@ func compareAny(a, b any) int {
 	} else if bb, bOk := b.(bool); bOk {
 		if ab2, aOk2 := coerceSQLBool(a); aOk2 {
 			return compareBools(ab2, bb)
+		}
+	}
+	if biA, okA := memParseExactBigInt(a); okA {
+		if biB, okB := memParseExactBigInt(b); okB {
+			return biA.Cmp(biB)
 		}
 	}
 	fa, aNum := toFloat(a)

@@ -1634,6 +1634,33 @@ func (s *Server) handleMLTrainedModelSubRoute(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// POST /_ml/trained_models/{model_id}/deployment/_cache/_clear
+	if len(segs) == 6 && segs[3] == "deployment" && segs[4] == "_cache" && segs[5] == "_clear" {
+		if r.Method != http.MethodPost {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		if r.ContentLength != 0 {
+			if _, ok := parseJSONBody(w, r); !ok {
+				return
+			}
+		}
+		s.mu.RLock()
+		_, _, modelExists := s.resolveTrainedModelLocked(rawTarget)
+		_, dep := s.findDeploymentForModelLocked(rawTarget)
+		s.mu.RUnlock()
+		if !modelExists {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "No trained models matched ["+rawTarget+"]")
+			return
+		}
+		if dep == nil {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "No deployment matched ["+rawTarget+"]")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+		return
+	}
+
 	// POST /_ml/trained_models/{model_id}/_infer
 	if len(segs) == 4 && segs[3] == "_infer" {
 		s.handleMLTrainedModelInfer(w, r, rawTarget, false)
@@ -1954,9 +1981,9 @@ func (s *Server) handleMLAnomalySubRoutes(w http.ResponseWriter, r *http.Request
 		return true
 	}
 
-	// 4-segment POST actions not handled by legacy switch: _data, _reset, _forecast, _delete_expired_data
+	// 4-segment POST/DELETE actions not handled by legacy switch: _data, _reset, _forecast, _delete_expired_data
 	if len(segs) == 4 && (sub == "_data" || sub == "_reset" || sub == "_forecast" || sub == "_delete_expired_data") {
-		if r.Method != http.MethodPost {
+		if r.Method != http.MethodPost && (sub != "_delete_expired_data" || r.Method != http.MethodDelete) {
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 			return true
 		}
@@ -2104,12 +2131,14 @@ func (s *Server) handleMLAnomalySubRoutes(w http.ResponseWriter, r *http.Request
 			if _, ok := parseJSONBody(w, r); !ok {
 				return true
 			}
-			s.mu.RLock()
-			_, exists := s.mlJobs[jobID]
-			s.mu.RUnlock()
-			if !exists {
-				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "Unknown job ["+jobID+"]")
-				return true
+			if jobID != "_all" && jobID != "*" && !strings.Contains(jobID, "*") {
+				s.mu.RLock()
+				_, exists := s.mlJobs[jobID]
+				s.mu.RUnlock()
+				if !exists {
+					writeESError(w, http.StatusNotFound, "resource_not_found_exception", "Unknown job ["+jobID+"]")
+					return true
+				}
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
 			return true
@@ -2196,8 +2225,57 @@ func (s *Server) handleMLAnomalySubRoutes(w http.ResponseWriter, r *http.Request
 		return true
 	}
 
-	// Model snapshots: /_ml/anomaly_detectors/{job_id}/model_snapshots[/{snapshot_id}[/_update|_revert]]
+	// Model snapshots: /_ml/anomaly_detectors/{job_id}/model_snapshots[/{snapshot_id}[/_update|_revert|_upgrade[/_stats]]]
 	if len(segs) >= 4 && sub == "model_snapshots" {
+		if len(segs) == 7 && strings.TrimSpace(segs[5]) == "_upgrade" && strings.TrimSpace(segs[6]) == "_stats" {
+			snapID := strings.TrimSpace(segs[4])
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return true
+			}
+			s.mu.RLock()
+			job, exists := s.mlJobs[jobID]
+			if !exists || job == nil {
+				s.mu.RUnlock()
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusNotFound)
+					return true
+				}
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "Unknown job ["+jobID+"]")
+				return true
+			}
+			snaps, _ := job["_snapshots"].(map[string]any)
+			snap, okS := snaps[snapID].(map[string]any)
+			s.mu.RUnlock()
+			if snapID != "_all" && snapID != "*" && (!okS || snap == nil) {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusNotFound)
+					return true
+				}
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "Unknown snapshot ["+snapID+"]")
+				return true
+			}
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return true
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"count": 1,
+				"model_snapshot_upgrades": []any{
+					map[string]any{
+						"job_id":      jobID,
+						"snapshot_id": snapID,
+						"node": map[string]any{
+							"id":   "doris-fe-1",
+							"name": "doris-fe-1",
+						},
+						"upgrade_state": "stopped",
+					},
+				},
+			})
+			return true
+		}
+
 		if len(segs) == 6 {
 			snapID := strings.TrimSpace(segs[4])
 			act := strings.TrimSpace(segs[5])
@@ -2239,6 +2317,11 @@ func (s *Server) handleMLAnomalySubRoutes(w http.ResponseWriter, r *http.Request
 				cp := deepCloneDocMap(snap)
 				s.mu.Unlock()
 				writeJSON(w, http.StatusOK, map[string]any{"model": cp})
+				return true
+			case "_upgrade":
+				snap["upgraded"] = true
+				s.mu.Unlock()
+				writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 				return true
 			}
 			s.mu.Unlock()
@@ -2986,10 +3069,10 @@ func splitESQLTopLevel(s string, sep byte) []string {
 		case '`':
 			inB = true
 			cur.WriteByte(ch)
-		case '(':
+		case '(', '[':
 			depth++
 			cur.WriteByte(ch)
-		case ')':
+		case ')', ']':
 			if depth > 0 {
 				depth--
 			}
@@ -3041,9 +3124,9 @@ func splitESQLAssignment(s string) (string, string, bool) {
 			inD = true
 		case '`':
 			inB = true
-		case '(':
+		case '(', '[':
 			depth++
-		case ')':
+		case ')', ']':
 			if depth > 0 {
 				depth--
 			}
@@ -3163,6 +3246,8 @@ const (
 	esqlTokOp
 	esqlTokLParen
 	esqlTokRParen
+	esqlTokLBracket
+	esqlTokRBracket
 	esqlTokComma
 )
 
@@ -3233,6 +3318,16 @@ func tokenizeESQLExpr(expr string) []esqlTok {
 		}
 		if ch == ')' {
 			toks = append(toks, esqlTok{kind: esqlTokRParen, str: ")"})
+			i++
+			continue
+		}
+		if ch == '[' {
+			toks = append(toks, esqlTok{kind: esqlTokLBracket, str: "["})
+			i++
+			continue
+		}
+		if ch == ']' {
+			toks = append(toks, esqlTok{kind: esqlTokRBracket, str: "]"})
 			i++
 			continue
 		}
@@ -3583,6 +3678,21 @@ func (p *esqlParser) parsePrimary() any {
 			p.next()
 		}
 		return val
+	case esqlTokLBracket:
+		p.next()
+		items := make([]any, 0)
+		for p.peek().kind != esqlTokEOF && p.peek().kind != esqlTokRBracket {
+			items = append(items, p.parseOr())
+			if p.peek().kind == esqlTokComma {
+				p.next()
+			} else {
+				break
+			}
+		}
+		if p.peek().kind == esqlTokRBracket {
+			p.next()
+		}
+		return items
 	case esqlTokIdent:
 		p.next()
 		if p.peek().kind == esqlTokLParen {
@@ -3810,6 +3920,10 @@ func evalESQLFunc(name string, args []any) any {
 			return math.Abs(fv)
 		}
 		return nil
+	default:
+		if v, ok := evalESQLFuncRound57(name, args); ok {
+			return v
+		}
 	}
 	return nil
 }
@@ -3933,9 +4047,9 @@ func splitESQLStatsByClause(s string) (string, string) {
 			inD = true
 		case '`':
 			inB = true
-		case '(':
+		case '(', '[':
 			depth++
-		case ')':
+		case ')', ']':
 			if depth > 0 {
 				depth--
 			}
@@ -4072,6 +4186,11 @@ func computeESQLAggregate(fn, arg string, grpRows []map[string]any) (any, string
 			}
 		}
 		return vals, elemType
+
+	case "MEDIAN", "PERCENTILE":
+		if v, t, ok := computeESQLMedianOrPercentile(fn, arg, grpRows); ok {
+			return v, t
+		}
 	}
 	return nil, "keyword"
 }
@@ -4095,7 +4214,15 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 		upper := strings.ToUpper(st)
 
 		switch {
-		case idx == 0 && (upper == "ROW" || strings.HasPrefix(upper, "ROW ")):
+		case idx == 0 && esqlStageHasKeyword(upper, "SHOW"):
+			if f := strings.Fields(upper); len(f) == 2 && f[0] == "SHOW" && f[1] == "INFO" {
+				rows, colOrder, colTypes = executeESQLShowInfo()
+			} else {
+				writeESError(w, http.StatusBadRequest, "verification_exception", fmt.Sprintf("Found 1 problem\nline 1:1: Unknown command [%s]", st))
+				return
+			}
+
+		case idx == 0 && esqlStageHasKeyword(upper, "ROW"):
 			rest := ""
 			if len(st) > 3 {
 				rest = strings.TrimSpace(st[3:])
@@ -4122,8 +4249,8 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 			}
 			rows = []map[string]any{row}
 
-		case idx == 0 && strings.HasPrefix(upper, "FROM "):
-			rest := strings.TrimSpace(st[5:])
+		case idx == 0 && esqlStageHasKeyword(upper, "FROM") && len(st) > 4:
+			rest := strings.TrimSpace(st[4:])
 			idxTarget := rest
 			var metaCols []string
 			if upIdx := strings.Index(strings.ToUpper(rest), " METADATA "); upIdx >= 0 {
@@ -4212,13 +4339,13 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 			writeESError(w, http.StatusBadRequest, "verification_exception", fmt.Sprintf("Found 1 problem\nline 1:1: unsupported ES|QL source command [%s]", st))
 			return
 
-		case strings.HasPrefix(upper, "LIMIT "):
-			if n, err := strconv.Atoi(strings.TrimSpace(st[6:])); err == nil && n >= 0 {
+		case esqlStageHasKeyword(upper, "LIMIT") && len(st) > 5:
+			if n, err := strconv.Atoi(strings.TrimSpace(st[5:])); err == nil && n >= 0 {
 				limit = n
 			}
 
-		case strings.HasPrefix(upper, "WHERE "):
-			cond := strings.TrimSpace(st[6:])
+		case esqlStageHasKeyword(upper, "WHERE") && len(st) > 5:
+			cond := strings.TrimSpace(st[5:])
 			filtered := make([]map[string]any, 0, len(rows))
 			for _, row := range rows {
 				if evalESQLCond(cond, row) {
@@ -4227,8 +4354,8 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 			}
 			rows = filtered
 
-		case strings.HasPrefix(upper, "EVAL "):
-			assigns := splitESQLTopLevel(strings.TrimSpace(st[5:]), ',')
+		case esqlStageHasKeyword(upper, "EVAL") && len(st) > 4:
+			assigns := splitESQLTopLevel(strings.TrimSpace(st[4:]), ',')
 			for _, a := range assigns {
 				a = strings.TrimSpace(a)
 				if a == "" {
@@ -4264,8 +4391,12 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 				}
 			}
 
-		case strings.HasPrefix(upper, "STATS "):
-			aggPart, byPart := splitESQLStatsByClause(strings.TrimSpace(st[6:]))
+		case esqlStageHasKeyword(upper, "STATS"):
+			statsRest := ""
+			if len(st) > 5 {
+				statsRest = strings.TrimSpace(st[5:])
+			}
+			aggPart, byPart := splitESQLStatsByClause(statsRest)
 			var aggSpecs []esqlAggSpec
 			if aggPart != "" {
 				for _, rawA := range splitESQLTopLevel(aggPart, ',') {
@@ -4362,10 +4493,10 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 			colOrder = newColOrder
 			colTypes = newColTypes
 
-		case strings.HasPrefix(upper, "KEEP "):
+		case esqlStageHasKeyword(upper, "KEEP") && len(st) > 4:
 			var nextCols []string
 			seenKeep := make(map[string]bool)
-			for _, kc := range splitESQLTopLevel(strings.TrimSpace(st[5:]), ',') {
+			for _, kc := range splitESQLTopLevel(strings.TrimSpace(st[4:]), ',') {
 				pat := unquoteESQLIdent(kc)
 				if pat == "" {
 					continue
@@ -4389,9 +4520,9 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 				colOrder = nextCols
 			}
 
-		case strings.HasPrefix(upper, "DROP "):
+		case esqlStageHasKeyword(upper, "DROP") && len(st) > 4:
 			var patterns []string
-			for _, dc := range splitESQLTopLevel(strings.TrimSpace(st[5:]), ',') {
+			for _, dc := range splitESQLTopLevel(strings.TrimSpace(st[4:]), ',') {
 				p := unquoteESQLIdent(dc)
 				if p != "" {
 					patterns = append(patterns, p)
@@ -4420,8 +4551,8 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 			}
 			colOrder = nextCols
 
-		case strings.HasPrefix(upper, "RENAME "):
-			for _, spec := range splitESQLTopLevel(strings.TrimSpace(st[7:]), ',') {
+		case esqlStageHasKeyword(upper, "RENAME") && len(st) > 6:
+			for _, spec := range splitESQLTopLevel(strings.TrimSpace(st[6:]), ',') {
 				spec = strings.TrimSpace(spec)
 				upSpec := strings.ToUpper(spec)
 				asIdx := strings.Index(upSpec, " AS ")
@@ -4451,14 +4582,14 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 				}
 			}
 
-		case strings.HasPrefix(upper, "SORT "):
+		case esqlStageHasKeyword(upper, "SORT") && len(st) > 4:
 			type sortClause struct {
 				col        string
 				desc       bool
 				nullsFirst bool
 			}
 			var clauses []sortClause
-			for _, rawS := range splitESQLTopLevel(strings.TrimSpace(st[5:]), ',') {
+			for _, rawS := range splitESQLTopLevel(strings.TrimSpace(st[4:]), ',') {
 				toks := strings.Fields(strings.TrimSpace(rawS))
 				if len(toks) == 0 {
 					continue
@@ -4510,6 +4641,22 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 					return false
 				})
 			}
+
+		default:
+			var handled, okStage bool
+			rows, colOrder, colTypes, handled, okStage = s.executeESQLExtraStage(w, r, st, upper, rows, colOrder, colTypes)
+			if handled {
+				if !okStage {
+					return
+				}
+				continue
+			}
+			cmd := st
+			if fields := strings.Fields(st); len(fields) > 0 {
+				cmd = fields[0]
+			}
+			writeESError(w, http.StatusBadRequest, "verification_exception", fmt.Sprintf("Found 1 problem\nline 1:1: Unknown command [%s]", cmd))
+			return
 		}
 	}
 
@@ -4554,6 +4701,13 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
+	keepOnComp := true
+	if rawKeep, hasK := body["keep_on_completion"].(bool); hasK {
+		keepOnComp = rawKeep
+	} else if r.URL.Query().Has("keep_on_completion") {
+		keepOnComp = isTruthyBoolQueryParam(r, "keep_on_completion")
+	}
+
 	s.mu.Lock()
 	if s.esqlAsyncQueries == nil {
 		s.esqlAsyncQueries = make(map[string]map[string]any)
@@ -4566,7 +4720,11 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 		"columns":    columns,
 		"values":     values,
 	}
-	s.esqlAsyncQueries[queryID] = respObj
+	storedObj := deepCloneDocMap(respObj)
+	if !keepOnComp {
+		storedObj["__delete_on_get"] = true
+	}
+	s.esqlAsyncQueries[queryID] = storedObj
 	s.mu.Unlock()
 
 	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))

@@ -188,7 +188,7 @@ func TestRound23SchemaEffectiveFieldTransitiveCopyToAndNestedAlias(t *testing.T)
 	r23Req(t, srv, http.MethodPut, "/r23_schema", `{
 		"mappings": {
 			"properties": {
-				"raw_code":   {"type": "keyword", "copy_to": "code_alias"},
+				"raw_code":   {"type": "keyword", "copy_to": "mid_code"},
 				"code_alias": {"type": "alias", "path": "mid_code"},
 				"mid_code":   {"type": "keyword", "copy_to": "final_bucket"},
 				"final_bucket": {

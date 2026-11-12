@@ -768,6 +768,11 @@ func parseScalar(s string) (any, error) {
 	if iv, err := strconv.ParseInt(s, 10, 64); err == nil {
 		return iv, nil
 	}
+	if !strings.ContainsAny(s, ".eE") {
+		if uv, err := strconv.ParseUint(s, 10, 64); err == nil {
+			return uv, nil
+		}
+	}
 	if fv, err := strconv.ParseFloat(s, 64); err == nil {
 		return fv, nil
 	}

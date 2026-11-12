@@ -246,6 +246,10 @@ type Server struct {
 	geoipDatabases            map[string]map[string]any
 	templateLifecycles        map[string]map[string]any
 	remoteClusters            map[string]map[string]any
+	slmPolicyStats            map[string]map[string]int64
+	fleetSecrets              map[string]map[string]any
+	securitySessions          map[string]map[string]any
+	migrationSystemFeatures   map[string]bool
 }
 
 func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerOptions) *Server {
@@ -327,6 +331,10 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		geoipDatabases:            make(map[string]map[string]any),
 		templateLifecycles:        make(map[string]map[string]any),
 		remoteClusters:            make(map[string]map[string]any),
+		slmPolicyStats:            make(map[string]map[string]int64),
+		fleetSecrets:              make(map[string]map[string]any),
+		securitySessions:          make(map[string]map[string]any),
+		migrationSystemFeatures:   make(map[string]bool),
 	}
 	s.coalescer = newStreamLoadCoalescer(func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
 		err := s.backend.StreamLoad(ctx, table, ndjson, syncRefresh)
@@ -946,6 +954,9 @@ func (s *Server) Handler() http.Handler {
 		case len(segs) == 2 && segs[0] == "_migration" && segs[1] == "deprecations":
 			s.handleMigrationDeprecations(w, r, "")
 			return
+		case len(segs) == 2 && segs[0] == "_migration" && segs[1] == "system_features":
+			s.handleMigrationSystemFeaturesRound57(w, r)
+			return
 		case len(segs) == 3 && segs[1] == "_migration" && segs[2] == "deprecations":
 			s.handleMigrationDeprecations(w, r, segs[0])
 			return
@@ -973,6 +984,15 @@ func (s *Server) Handler() http.Handler {
 			return
 		case len(segs) == 3 && segs[1] == "_searchable_snapshots" && segs[2] == "stats":
 			s.handleSearchableSnapshots(w, r, segs, segs[0])
+			return
+		case len(segs) == 4 && segs[1] == "_searchable_snapshots" && segs[2] == "cache" && segs[3] == "clear":
+			s.handleSearchableSnapshots(w, r, segs, segs[0])
+			return
+		case len(segs) == 3 && (segs[0] == "_reindex" || segs[0] == "_update_by_query" || segs[0] == "_delete_by_query") && segs[2] == "_rethrottle":
+			s.handleTaskRethrottleRound57(w, r, "", segs[1])
+			return
+		case len(segs) == 4 && (segs[1] == "_update_by_query" || segs[1] == "_delete_by_query") && segs[3] == "_rethrottle":
+			s.handleTaskRethrottleRound57(w, r, segs[0], segs[2])
 			return
 		case segs[0] == "_ccr":
 			s.handleCCR(w, r, segs, "")
@@ -1152,6 +1172,8 @@ func (s *Server) Handler() http.Handler {
 				s.handleTransform(w, r)
 			case "_dangling":
 				s.handleDanglingIndices(w, r)
+			case "_capabilities":
+				s.handleCapabilitiesRound57(w, r)
 			default:
 				r.SetPathValue("index", segs[0])
 				switch r.Method {
@@ -1309,6 +1331,10 @@ func (s *Server) Handler() http.Handler {
 				s.handleILMMigrateToDataTiers(w, r)
 			case segs[0] == "_ingest" && segs[1] == "pipeline":
 				s.handleIngestPipeline(w, r)
+			case segs[0] == "_ingest" && segs[1] == "_simulate":
+				s.handleSimulateIndexIngestRound57(w, r)
+			case segs[0] == "_flush" && segs[1] == "synced":
+				s.handleFlushSyncedRound57(w, r, "")
 			case segs[0] == "_enrich" && (segs[1] == "policy" || segs[1] == "_stats" || segs[1] == "stats"):
 				s.handleEnrichAPI(w, r)
 			case segs[0] == "_security" && segs[1] == "_authenticate":
@@ -1383,6 +1409,10 @@ func (s *Server) Handler() http.Handler {
 					s.handleIndexOpen(w, r)
 				case "_close":
 					s.handleIndexClose(w, r)
+				case "_freeze":
+					s.handleFreezeIndexRound57(w, r, segs[0], true)
+				case "_unfreeze":
+					s.handleFreezeIndexRound57(w, r, segs[0], false)
 				case "_downgrade":
 					s.handleIndexDowngrade(w, r)
 				case "_doc":
@@ -1488,6 +1518,10 @@ func (s *Server) Handler() http.Handler {
 			if segs[1] == "_cache" && segs[2] == "clear" {
 				r.SetPathValue("index", segs[0])
 				s.handleCacheClear(w, r)
+				return
+			}
+			if segs[1] == "_flush" && segs[2] == "synced" {
+				s.handleFlushSyncedRound57(w, r, segs[0])
 				return
 			}
 			if segs[0] == "_ilm" && segs[1] == "policy" {
@@ -2284,7 +2318,7 @@ func (s *Server) handleIndexSettings(w http.ResponseWriter, r *http.Request) {
 					if v == nil {
 						delete(s.indexCustomSettings[indexName], k)
 					} else {
-						s.indexCustomSettings[indexName][k] = fmt.Sprintf("%v", v)
+						s.indexCustomSettings[indexName][k] = normalizeCustomSettingValue(v)
 					}
 				}
 				if hasDef {
@@ -4052,7 +4086,7 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	effectiveMappings := schema.MergeMappingSpecs(tplMappings, req.Mappings)
-	if err := validateAliasFieldsInMapping(effectiveMappings); err != nil {
+	if err := schema.ValidateMappingSpec(effectiveMappings); err != nil {
 		writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 		return
 	}
@@ -4111,7 +4145,7 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 			if k == "default_pipeline" || k == "final_pipeline" || v == nil {
 				continue
 			}
-			s.indexCustomSettings[indexName][k] = fmt.Sprintf("%v", v)
+			s.indexCustomSettings[indexName][k] = normalizeCustomSettingValue(v)
 		}
 	}
 	for alias, rawMeta := range tplAliases {
@@ -8823,6 +8857,10 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	bodyBytes = s.rewriteSearchBodyQueryRules(bodyBytes)
+	bodyBytes, ok = s.preprocessSearchBodyRound57(w, r.PathValue("index"), bodyBytes)
+	if !ok {
+		return
+	}
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
 		if err := json.Unmarshal(bodyBytes, &req); err != nil {
 			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
@@ -14613,13 +14651,20 @@ func buildCompositeAggObjectWithSchema(
 					}
 				} else if sm.entry.Terms != nil && strings.TrimSpace(sm.entry.Terms.ValueType) != "" {
 					switch strings.ToLower(strings.TrimSpace(sm.entry.Terms.ValueType)) {
-					case "long", "integer", "short", "byte", "date":
-						if iv, err := strconv.ParseInt(parts[i], 10, 64); err == nil {
+					case "long", "integer", "short", "byte", "date", "unsigned_long":
+						trimmedPart := strings.TrimSpace(parts[i])
+						if iv, err := strconv.ParseInt(trimmedPart, 10, 64); err == nil {
 							partVal = iv
-						} else if fv, ok := parseFiniteFloat(parts[i]); ok {
+						} else if strings.EqualFold(strings.TrimSpace(sm.entry.Terms.ValueType), "unsigned_long") {
+							if uv, errU := strconv.ParseUint(trimmedPart, 10, 64); errU == nil {
+								partVal = uv
+							} else if fv, ok := parseFiniteFloat(parts[i]); ok && fv >= 0 && fv < 18446744073709551616.0 {
+								partVal = uint64(fv)
+							}
+						} else if fv, ok := parseFiniteFloat(parts[i]); ok && fv >= -9223372036854775808.0 && fv < 9223372036854775808.0 {
 							partVal = int64(fv)
 						} else if strings.EqualFold(strings.TrimSpace(sm.entry.Terms.ValueType), "date") {
-							if ms, ok := schema.ParseESDateToEpochMillis(strings.TrimSpace(parts[i]), time.Now().UTC()); ok {
+							if ms, ok := schema.ParseESDateToEpochMillis(trimmedPart, time.Now().UTC()); ok {
 								partVal = ms
 							}
 						}
@@ -15624,7 +15669,7 @@ func filterAndSortTermsRowsWithSubAggs(
 		criteria = []termsOrderCriterion{{field: "_count", desc: true}}
 	}
 	vt := strings.ToLower(strings.TrimSpace(spec.ValueType))
-	isNumericValueType := vt == "long" || vt == "integer" || vt == "short" || vt == "byte" ||
+	isNumericValueType := vt == "long" || vt == "integer" || vt == "short" || vt == "byte" || vt == "unsigned_long" ||
 		vt == "double" || vt == "float" || vt == "half_float" || vt == "scaled_float" ||
 		vt == "number" || vt == "date"
 	if !isNumericValueType && vt == "" && idxSchema != nil && spec.Field != "" {
@@ -15660,7 +15705,14 @@ func filterAndSortTermsRowsWithSubAggs(
 							return !missingFirst
 						}
 						if isNumericValueType {
-							if fi, okI := parseFiniteFloat(cpRows[i].BucketKey); okI {
+							if cmpInt, okInt := compareBucketKeyExact64(cpRows[i].BucketKey, cpRows[j].BucketKey); okInt {
+								if cmpInt != 0 {
+									if c.desc {
+										return cmpInt > 0
+									}
+									return cmpInt < 0
+								}
+							} else if fi, okI := parseFiniteFloat(cpRows[i].BucketKey); okI {
 								if fj, okJ := parseFiniteFloat(cpRows[j].BucketKey); okJ && fi != fj {
 									if c.desc {
 										return fi > fj
@@ -15714,6 +15766,59 @@ func filterAndSortTermsRowsWithSubAggs(
 		cpRows = cpRows[:limit]
 	}
 	return cpRows, sumOtherDocCount
+}
+
+func compareBucketKeyExact64(a, b string) (int, bool) {
+	sa := strings.TrimSpace(a)
+	sb := strings.TrimSpace(b)
+	ia, errA := strconv.ParseInt(sa, 10, 64)
+	ib, errB := strconv.ParseInt(sb, 10, 64)
+	if errA == nil && errB == nil {
+		if ia < ib {
+			return -1, true
+		}
+		if ia > ib {
+			return 1, true
+		}
+		return 0, true
+	}
+	if errA == nil {
+		ub, errUB := strconv.ParseUint(sb, 10, 64)
+		if errUB != nil {
+			return 0, false
+		}
+		if ia < 0 || uint64(ia) < ub {
+			return -1, true
+		}
+		if uint64(ia) > ub {
+			return 1, true
+		}
+		return 0, true
+	}
+	ua, errUA := strconv.ParseUint(sa, 10, 64)
+	if errUA != nil {
+		return 0, false
+	}
+	if errB == nil {
+		if ib < 0 || ua > uint64(ib) {
+			return 1, true
+		}
+		if ua < uint64(ib) {
+			return -1, true
+		}
+		return 0, true
+	}
+	ub, errUB := strconv.ParseUint(sb, 10, 64)
+	if errUB != nil {
+		return 0, false
+	}
+	if ua < ub {
+		return -1, true
+	}
+	if ua > ub {
+		return 1, true
+	}
+	return 0, true
 }
 
 func matchesTermsFilterPrecompiled(key string, filter any, precompiled *regexp.Regexp) bool {
@@ -22162,8 +22267,54 @@ func (s *Server) evalRuntimeMappingsOnHitRows(idxSchema *schema.IndexSchema, req
 					continue
 				}
 				switch esType {
-				case "long", "integer", "short", "byte", "unsigned_long":
-					if f, ok := toFloat64(rv); ok {
+				case "unsigned_long":
+					switch uv := rv.(type) {
+					case uint64:
+						coercedVals = append(coercedVals, uv)
+					case int:
+						if uv >= 0 {
+							coercedVals = append(coercedVals, int64(uv))
+						}
+					case int64:
+						if uv >= 0 {
+							coercedVals = append(coercedVals, uv)
+						}
+					case json.Number:
+						if i, err := uv.Int64(); err == nil && i >= 0 {
+							coercedVals = append(coercedVals, i)
+						} else if u, err := strconv.ParseUint(strings.TrimSpace(uv.String()), 10, 64); err == nil {
+							coercedVals = append(coercedVals, u)
+						} else if f, ok := toFloat64(rv); ok && f >= 0 && f < 18446744073709551616.0 {
+							coercedVals = append(coercedVals, uint64(f))
+						}
+					case string:
+						trimmedU := strings.TrimSpace(uv)
+						if i, err := strconv.ParseInt(trimmedU, 10, 64); err == nil && i >= 0 {
+							coercedVals = append(coercedVals, i)
+						} else if u, err := strconv.ParseUint(trimmedU, 10, 64); err == nil {
+							coercedVals = append(coercedVals, u)
+						} else if f, ok := toFloat64(rv); ok && f >= 0 && f < 18446744073709551616.0 {
+							coercedVals = append(coercedVals, uint64(f))
+						}
+					default:
+						if f, ok := toFloat64(rv); ok && f >= 0 && f < 18446744073709551616.0 {
+							if f < 9223372036854775808.0 {
+								coercedVals = append(coercedVals, int64(f))
+							} else {
+								coercedVals = append(coercedVals, uint64(f))
+							}
+						}
+					}
+				case "long", "integer", "short", "byte":
+					if iv, okI := rv.(int64); okI {
+						coercedVals = append(coercedVals, iv)
+					} else if nv, okN := rv.(json.Number); okN {
+						if iv, err := nv.Int64(); err == nil {
+							coercedVals = append(coercedVals, iv)
+						} else if f, ok := toFloat64(rv); ok && f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
+							coercedVals = append(coercedVals, int64(f))
+						}
+					} else if f, ok := toFloat64(rv); ok && f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
 						coercedVals = append(coercedVals, int64(f))
 					}
 				case "double", "float", "half_float", "scaled_float":
@@ -22182,7 +22333,15 @@ func (s *Server) evalRuntimeMappingsOnHitRows(idxSchema *schema.IndexSchema, req
 						}
 					}
 				case "date", "date_nanos":
-					if f, ok := toFloat64(rv); ok {
+					if iv, okI := rv.(int64); okI {
+						coercedVals = append(coercedVals, iv)
+					} else if nv, okN := rv.(json.Number); okN {
+						if iv, err := nv.Int64(); err == nil {
+							coercedVals = append(coercedVals, iv)
+						} else if f, ok := toFloat64(rv); ok && f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
+							coercedVals = append(coercedVals, int64(f))
+						}
+					} else if f, ok := toFloat64(rv); ok && f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
 						coercedVals = append(coercedVals, int64(f))
 					} else if sv, ok := rv.(string); ok {
 						if ms, ok := schema.ParseESDateWithFormatToEpochMillis(sv, prop.Format, nowUTC); ok {
@@ -23757,10 +23916,64 @@ func evalQueryScriptFilterOnDocWithScore(idxSchema *schema.IndexSchema, doc map[
 	if q.Wrapper != nil && q.Wrapper.Decoded != nil {
 		return evalQueryScriptFilterOnDocWithScore(idxSchema, doc, q.Wrapper.Decoded, baseScore)
 	}
-	if q.Pinned != nil && q.Pinned.Organic != nil {
-		return evalQueryScriptFilterOnDocWithScore(idxSchema, doc, q.Pinned.Organic, baseScore)
+	if q.Pinned != nil {
+		if _, ok := pinnedRankForDoc(idxSchema, doc, q.Pinned); ok {
+			return true
+		}
+		if q.Pinned.Organic != nil {
+			return evalQueryScriptFilterOnDocWithScore(idxSchema, doc, q.Pinned.Organic, baseScore)
+		}
+		return false
 	}
 	return true
+}
+
+func pinnedRankForDoc(idxSchema *schema.IndexSchema, doc map[string]any, p *esast.PinnedQuery) (int, bool) {
+	if p == nil || doc == nil {
+		return 0, false
+	}
+	docID, _ := doc["__meta_id"].(string)
+	if docID == "" {
+		docID, _ = doc["_id"].(string)
+	}
+	if docID == "" {
+		return 0, false
+	}
+	targetIdx := ""
+	if idxSchema != nil && idxSchema.IndexName != "" {
+		targetIdx = idxSchema.IndexName
+	} else if s, ok := doc["__meta_index"].(string); ok && s != "" {
+		targetIdx = s
+	} else if s, ok := doc["_index"].(string); ok && s != "" {
+		targetIdx = s
+	}
+	if len(p.Docs) > 0 && targetIdx != "" {
+		rank := 0
+		for _, id := range p.IDs {
+			if id != "" && id == docID {
+				return rank, true
+			}
+			rank++
+		}
+		for _, d := range p.Docs {
+			idxVal, okIdx := d["_index"]
+			if okIdx && idxVal != nil && strings.TrimSpace(fmt.Sprintf("%v", idxVal)) == targetIdx {
+				if idVal, okID := d["_id"]; okID && idVal != nil {
+					if s := strings.TrimSpace(fmt.Sprintf("%v", idVal)); s != "" && s == docID {
+						return rank, true
+					}
+				}
+			}
+			rank++
+		}
+		return 0, false
+	}
+	for idx, pid := range p.EffectiveIDs() {
+		if pid != "" && pid == docID {
+			return idx, true
+		}
+	}
+	return 0, false
 }
 
 func evalFieldValueFactorOnDoc(idxSchema *schema.IndexSchema, doc map[string]any, fvf *esast.FieldValueFactorSpec) (float64, bool) {
@@ -24025,26 +24238,30 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 		return evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q.Wrapper.Decoded, baseScore)
 	}
 	if q.Pinned != nil {
-		if !evalBranchMatchesDoc(idxSchema, doc, q.Pinned.Organic) {
+		boost := 1.0
+		if q.Pinned.Boost != nil {
+			boost = *q.Pinned.Boost
+		}
+		if rankIdx, ok := pinnedRankForDoc(idxSchema, doc, q.Pinned); ok {
+			if boost == 0 {
+				return 0.0
+			}
+			rankWeight := 1000000.0 - float64(rankIdx)*1000.0
+			if rankWeight < 1000.0 {
+				rankWeight = 1000.0
+			}
+			return rankWeight * boost
+		}
+		if q.Pinned.Organic == nil || !evalBranchMatchesDoc(idxSchema, doc, q.Pinned.Organic) {
 			return 0.0
 		}
-		ids := q.Pinned.EffectiveIDs()
-		docID, _ := doc["__meta_id"].(string)
-		if docID == "" {
-			docID, _ = doc["_id"].(string)
+		var sc float64
+		if queryHasRuntimeScript(q.Pinned.Organic) || queryHasNestedScoring(q.Pinned.Organic) || q.Pinned.Organic.FunctionScore != nil {
+			sc = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q.Pinned.Organic, baseScore)
+		} else {
+			sc = scoreNonScriptClauseOnDoc(idxSchema, doc, q.Pinned.Organic)
 		}
-		for idx, pid := range ids {
-			if pid == docID {
-				return 1.0e6 + float64(len(ids)-idx)
-			}
-		}
-		if q.Pinned.Organic != nil {
-			if queryHasRuntimeScript(q.Pinned.Organic) || queryHasNestedScoring(q.Pinned.Organic) || q.Pinned.Organic.FunctionScore != nil {
-				return evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q.Pinned.Organic, baseScore)
-			}
-			return scoreNonScriptClauseOnDoc(idxSchema, doc, q.Pinned.Organic)
-		}
-		return baseScore
+		return sc * boost
 	}
 	if q.MoreLikeThis != nil {
 		ok, sc := evalMoreLikeThisOnDoc(idxSchema, doc, q.MoreLikeThis)
@@ -25709,14 +25926,35 @@ func emitRuntimeMultiTermsAggRows(
 				} else {
 					strParts[i] = fmt.Sprintf("%v", kv)
 				}
-				if fv, ok := toFloat64(v); ok {
-					if fv == math.Trunc(fv) {
-						normParts[i] = int64(fv)
-					} else {
+				switch nv := v.(type) {
+				case int, int64, uint64:
+					normParts[i] = nv
+				case json.Number:
+					if iv, err := nv.Int64(); err == nil {
+						normParts[i] = iv
+					} else if uv, errU := strconv.ParseUint(nv.String(), 10, 64); errU == nil {
+						normParts[i] = uv
+					} else if fv, ok := toFloat64(v); ok {
 						normParts[i] = fv
+					} else {
+						normParts[i] = v
 					}
-				} else {
-					normParts[i] = v
+				default:
+					if fv, ok := toFloat64(v); ok {
+						if fv == math.Trunc(fv) {
+							if fv >= -9223372036854775808.0 && fv < 9223372036854775808.0 {
+								normParts[i] = int64(fv)
+							} else if fv >= 9223372036854775808.0 && fv < 18446744073709551616.0 {
+								normParts[i] = uint64(fv)
+							} else {
+								normParts[i] = fv
+							}
+						} else {
+							normParts[i] = fv
+						}
+					} else {
+						normParts[i] = v
+					}
 				}
 			}
 			joined := strings.Join(strParts, "|")

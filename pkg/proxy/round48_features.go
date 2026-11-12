@@ -82,6 +82,14 @@ func (s *Server) handleScriptsAPI(w http.ResponseWriter, r *http.Request) {
 		id = ctxOrId
 		ctxOrId = ""
 	}
+	if ctxOrId == "" && id == "_context" {
+		s.handleScriptsContextRound57(w, r)
+		return
+	}
+	if ctxOrId == "" && id == "_languages" {
+		s.handleScriptsLanguagesRound57(w, r)
+		return
+	}
 	if id == "" {
 		if r.Method == http.MethodHead {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -3493,80 +3501,7 @@ func (s *Server) handleMigrateToDataStream(w http.ResponseWriter, r *http.Reques
 }
 
 func validateAliasFieldsInMapping(spec *esast.MappingSpec) error {
-	if spec == nil || len(spec.Properties) == 0 {
-		return nil
-	}
-	allFields := make(map[string]esast.FieldProperty)
-	var collect func(prefix string, props map[string]esast.FieldProperty)
-	collect = func(prefix string, props map[string]esast.FieldProperty) {
-		for name, prop := range props {
-			full := name
-			if prefix != "" {
-				full = prefix + "." + name
-			}
-			allFields[full] = prop
-			for mfName, mfProp := range prop.Fields {
-				allFields[full+"."+mfName] = mfProp
-			}
-			if len(prop.Properties) > 0 {
-				collect(full, prop.Properties)
-			}
-		}
-	}
-	collect("", spec.Properties)
-	for name, prop := range spec.Runtime {
-		allFields[name] = prop
-	}
-	for fieldPath, prop := range allFields {
-		if !strings.EqualFold(prop.Type, "alias") {
-			continue
-		}
-		target := strings.TrimSpace(prop.Path)
-		if target == "" {
-			return fmt.Errorf("failed to parse mapping: [path] is required for [alias] field [%s]", fieldPath)
-		}
-		if target == fieldPath {
-			return fmt.Errorf("failed to parse mapping: Invalid [path] value [%s] for field alias [%s]: an alias cannot refer to itself", target, fieldPath)
-		}
-		visited := map[string]bool{fieldPath: true}
-		curr := target
-		for hop := 0; hop < 32 && curr != ""; hop++ {
-			if visited[curr] {
-				return fmt.Errorf("failed to parse mapping: cycle detected for field alias [%s]", fieldPath)
-			}
-			visited[curr] = true
-			tp, exists := allFields[curr]
-			if !exists || !strings.EqualFold(tp.Type, "alias") {
-				break
-			}
-			curr = strings.TrimSpace(tp.Path)
-		}
-		tp, exists := allFields[target]
-		if !exists && strings.Contains(fieldPath, ".") {
-			parentPrefix := fieldPath[:strings.LastIndex(fieldPath, ".")]
-			if relTP, relOK := allFields[parentPrefix+"."+target]; relOK {
-				tp = relTP
-				exists = true
-				target = parentPrefix + "." + target
-			}
-		}
-		if !exists {
-			if target == "unmapped_dyn_field" {
-				continue
-			}
-			return fmt.Errorf("failed to parse mapping: Invalid [path] value [%s] for field alias [%s]: a field alias must refer to an existing field in the mappings", prop.Path, fieldPath)
-		}
-		if strings.EqualFold(tp.Type, "alias") {
-			if fieldPath == "chained_alias" && target == "full_search_alias" {
-				continue
-			}
-			return fmt.Errorf("failed to parse mapping: Invalid [path] value [%s] for field alias [%s]: an alias cannot refer to another alias", prop.Path, fieldPath)
-		}
-		if strings.EqualFold(tp.Type, "object") || strings.EqualFold(tp.Type, "nested") || (tp.Type == "" && len(tp.Properties) > 0) {
-			return fmt.Errorf("failed to parse mapping: Invalid [path] value [%s] for field alias [%s]: target must be a concrete field, not an object or nested field", prop.Path, fieldPath)
-		}
-	}
-	return nil
+	return schema.ValidateMappingSpec(spec)
 }
 
 func (s *Server) handleIndexOpen(w http.ResponseWriter, r *http.Request) {

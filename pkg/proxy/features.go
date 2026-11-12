@@ -1466,17 +1466,38 @@ func validateIngestPipelineProcessors(procs []any) error {
 				}
 			case "lowercase", "uppercase", "trim", "bytes", "html_strip", "dot_expander",
 				"urlencode", "url_encode", "URLEncode", "urldecode", "url_decode", "URLDecode",
-				"sort", "compact", "dedup", "dedupe", "attachment", "user_agent", "uri_parts",
+				"compact", "dedup", "dedupe", "attachment", "user_agent", "uri_parts",
 				"registered_domain", "geoip", "set_security_user":
 				if _, err := reqStr("field"); err != nil {
 					return err
+				}
+			case "sort":
+				if _, err := reqStr("field"); err != nil {
+					return err
+				}
+				if rawOrd, hasOrd := specMap["order"]; hasOrd && rawOrd != nil {
+					ordStr, ok := rawOrd.(string)
+					if !ok || (!strings.EqualFold(ordStr, "asc") && !strings.EqualFold(ordStr, "desc")) {
+						return fmt.Errorf("illegal_argument_exception: sort order [%v] is invalid, must be [asc] or [desc]", rawOrd)
+					}
 				}
 			case "split":
 				if _, err := reqStr("field"); err != nil {
 					return err
 				}
-				if sep, ok := specMap["separator"].(string); !ok || sep == "" {
+				sep, ok := specMap["separator"].(string)
+				if !ok || sep == "" {
 					return fmt.Errorf("[separator] required property is missing")
+				}
+				if sep != "|" && sep != "." && !strings.Contains(sep, "{{") {
+					if _, err := compileIngestJavaRegex(sep); err != nil {
+						return fmt.Errorf("illegal_argument_exception: invalid separator [%s]: %v", sep, err)
+					}
+				}
+				if rawPT, hasPT := specMap["preserve_trailing"]; hasPT && rawPT != nil {
+					if _, ok := rawPT.(bool); !ok {
+						return fmt.Errorf("illegal_argument_exception: [preserve_trailing] must be a boolean")
+					}
 				}
 			case "join":
 				if _, err := reqStr("field"); err != nil {
@@ -1511,8 +1532,10 @@ func validateIngestPipelineProcessors(procs []any) error {
 				if _, ok := specMap["replacement"].(string); !ok {
 					return fmt.Errorf("[replacement] required property is missing")
 				}
-				if _, err := regexp.Compile(pat); err != nil {
-					return fmt.Errorf("illegal_argument_exception: invalid pattern [%s]: %v", pat, err)
+				if !strings.Contains(pat, "{{") {
+					if _, err := compileIngestJavaRegex(pat); err != nil {
+						return fmt.Errorf("illegal_argument_exception: invalid pattern [%s]: %v", pat, err)
+					}
 				}
 			case "json":
 				for k := range specMap {
@@ -1560,14 +1583,41 @@ func validateIngestPipelineProcessors(procs []any) error {
 				if !okVS || vs == "" {
 					return fmt.Errorf("[value_split] required property is missing")
 				}
-				if fs != "|" && fs != "." && fs != " " && fs != "," && fs != ";" && fs != "&" {
-					if _, err := regexp.Compile(fs); err != nil {
+				if fs != "|" && fs != "." && fs != " " && fs != "," && fs != ";" && fs != "&" && !strings.Contains(fs, "{{") {
+					if _, err := compileIngestJavaRegex(fs); err != nil {
 						return fmt.Errorf("illegal_argument_exception: invalid field_split [%s]: %v", fs, err)
 					}
 				}
-				if vs != "=" && vs != ":" && vs != "|" && vs != "." {
-					if _, err := regexp.Compile(vs); err != nil {
+				if vs != "=" && vs != ":" && vs != "|" && vs != "." && !strings.Contains(vs, "{{") {
+					if _, err := compileIngestJavaRegex(vs); err != nil {
 						return fmt.Errorf("illegal_argument_exception: invalid value_split [%s]: %v", vs, err)
+					}
+				}
+				rawInc, hasInc := specMap["include_keys"]
+				rawExc, hasExc := specMap["exclude_keys"]
+				if hasInc && rawInc != nil && hasExc && rawExc != nil {
+					return fmt.Errorf("illegal_argument_exception: cannot specify both [include_keys] and [exclude_keys]")
+				}
+				if hasInc && rawInc != nil {
+					incArr, ok := rawInc.([]any)
+					if !ok {
+						return fmt.Errorf("illegal_argument_exception: [include_keys] must be a list of strings")
+					}
+					for _, el := range incArr {
+						if s, ok := el.(string); !ok || s == "" {
+							return fmt.Errorf("illegal_argument_exception: [include_keys] must contain only non-empty strings")
+						}
+					}
+				}
+				if hasExc && rawExc != nil {
+					excArr, ok := rawExc.([]any)
+					if !ok {
+						return fmt.Errorf("illegal_argument_exception: [exclude_keys] must be a list of strings")
+					}
+					for _, el := range excArr {
+						if s, ok := el.(string); !ok || s == "" {
+							return fmt.Errorf("illegal_argument_exception: [exclude_keys] must contain only non-empty strings")
+						}
 					}
 				}
 				if rawTK, hasTK := specMap["transform_key"]; hasTK && rawTK != nil {
@@ -1617,6 +1667,12 @@ func validateIngestPipelineProcessors(procs []any) error {
 				if !ok || len(fmts) == 0 {
 					return fmt.Errorf("[formats] required property is missing")
 				}
+				for _, fAny := range fmts {
+					fStr, ok := fAny.(string)
+					if !ok || strings.TrimSpace(fStr) == "" {
+						return fmt.Errorf("illegal_argument_exception: [formats] must contain only non-empty strings")
+					}
+				}
 				if tz, ok := specMap["timezone"].(string); ok && tz != "" && !strings.Contains(tz, "{{") {
 					if _, err := parseIngestTimezone(tz); err != nil {
 						return err
@@ -1634,6 +1690,20 @@ func validateIngestPipelineProcessors(procs []any) error {
 				case "y", "M", "w", "d", "h", "m", "s":
 				default:
 					return fmt.Errorf("invalid date rounding [%s], valid values are [y, M, w, d, h, m, s]", rounding)
+				}
+				for _, fmtKey := range []string{"date_formats", "formats"} {
+					if rawDF, hasDF := specMap[fmtKey]; hasDF && rawDF != nil {
+						dfArr, ok := rawDF.([]any)
+						if !ok || len(dfArr) == 0 {
+							return fmt.Errorf("illegal_argument_exception: [%s] must be a non-empty list of strings", fmtKey)
+						}
+						for _, fAny := range dfArr {
+							fStr, ok := fAny.(string)
+							if !ok || strings.TrimSpace(fStr) == "" {
+								return fmt.Errorf("illegal_argument_exception: [%s] must contain only non-empty strings", fmtKey)
+							}
+						}
+					}
 				}
 				if tz, ok := specMap["timezone"].(string); ok && tz != "" && !strings.Contains(tz, "{{") {
 					if _, err := parseIngestTimezone(tz); err != nil {
@@ -1699,9 +1769,34 @@ func validateIngestPipelineProcessors(procs []any) error {
 					}
 				}
 			case "fingerprint":
-				fieldsAny, hasFields := specMap["fields"].([]any)
-				exclAny, hasExcl := specMap["exclude_fields"].([]any)
-				if (hasFields && hasExcl) && (len(fieldsAny) > 0 || len(exclAny) > 0) {
+				rawFields, hasFields := specMap["fields"]
+				rawExcl, hasExcl := specMap["exclude_fields"]
+				var fieldsAny, exclAny []any
+				if hasFields && rawFields != nil {
+					var ok bool
+					fieldsAny, ok = rawFields.([]any)
+					if !ok || len(fieldsAny) == 0 {
+						return fmt.Errorf("illegal_argument_exception: [fields] must not be empty")
+					}
+					for _, el := range fieldsAny {
+						if s, ok := el.(string); !ok || strings.TrimSpace(s) == "" {
+							return fmt.Errorf("illegal_argument_exception: [fields] must contain only non-empty strings")
+						}
+					}
+				}
+				if hasExcl && rawExcl != nil {
+					var ok bool
+					exclAny, ok = rawExcl.([]any)
+					if !ok {
+						return fmt.Errorf("illegal_argument_exception: [exclude_fields] must be a list of strings")
+					}
+					for _, el := range exclAny {
+						if s, ok := el.(string); !ok || strings.TrimSpace(s) == "" {
+							return fmt.Errorf("illegal_argument_exception: [exclude_fields] must contain only non-empty strings")
+						}
+					}
+				}
+				if (hasFields && rawFields != nil && hasExcl && rawExcl != nil) && (len(fieldsAny) > 0 || len(exclAny) > 0) {
 					return fmt.Errorf("cannot specify both [fields] and [exclude_fields]")
 				}
 				if rawMethod, ok := specMap["method"].(string); ok && strings.TrimSpace(rawMethod) != "" {
@@ -2551,53 +2646,171 @@ var (
 	reGrokNamedCapture = regexp.MustCompile(`\(\?P?<([A-Za-z0-9_.\-\[\]@]+)(?::(int|integer|long|float|double|boolean|bool|string))?>`)
 )
 
-func normalizeGsubReplacement(repl string) string {
+func compileIngestJavaRegex(pattern string) (*regexp.Regexp, error) {
 	var b strings.Builder
-	b.Grow(len(repl) + 8)
-	for i := 0; i < len(repl); i++ {
-		c := repl[i]
-		if c == '\\' && i+1 < len(repl) {
-			next := repl[i+1]
-			if next == '$' {
-				b.WriteString("$$")
-				i++
-				continue
-			}
-			if next == '\\' {
+	b.Grow(len(pattern) + 8)
+	inClass := false
+	classStart := 0
+	for i := 0; i < len(pattern); {
+		ch := pattern[i]
+		if ch == '\\' {
+			if i+1 < len(pattern) {
 				b.WriteByte('\\')
-				i++
+				b.WriteByte(pattern[i+1])
+				i += 2
 				continue
 			}
-		}
-		if c == '$' {
-			if i+1 < len(repl) {
-				next := repl[i+1]
-				if next >= '0' && next <= '9' {
-					j := i + 1
-					for j < len(repl) && repl[j] >= '0' && repl[j] <= '9' {
-						j++
-					}
-					b.WriteString("${")
-					b.WriteString(repl[i+1 : j])
-					b.WriteByte('}')
-					i = j - 1
-					continue
-				}
-				if next == '{' {
-					end := strings.IndexByte(repl[i+2:], '}')
-					if end >= 0 {
-						b.WriteString(repl[i : i+2+end+1])
-						i = i + 2 + end
-						continue
-					}
-				}
-			}
-			b.WriteString("$$")
+			b.WriteByte('\\')
+			i++
 			continue
 		}
-		b.WriteByte(c)
+		if inClass {
+			if ch == ']' && (i > classStart+1 || (i == classStart+1 && pattern[classStart] != '^')) {
+				// Note: '[]' or '[^]' at the start of a character class keeps ']' literal.
+				if i != classStart+1 && (i != classStart+2 || pattern[classStart+1] != '^') {
+					inClass = false
+				}
+			}
+			b.WriteByte(ch)
+			i++
+			continue
+		}
+		if ch == '[' {
+			inClass = true
+			classStart = i
+			b.WriteByte('[')
+			i++
+			continue
+		}
+		if ch == '(' && i+3 < len(pattern) && pattern[i+1] == '?' && pattern[i+2] == '<' && pattern[i+3] != '=' && pattern[i+3] != '!' {
+			b.WriteString("(?P<")
+			i += 3
+			continue
+		}
+		b.WriteByte(ch)
+		i++
 	}
-	return b.String()
+	return regexp.Compile(b.String())
+}
+
+func applyIngestGsubReplacement(re *regexp.Regexp, src, repl string) (string, error) {
+	type replToken struct {
+		lit      string
+		groupIdx int // -1 for literal
+	}
+	numGroups := re.NumSubexp()
+	nameToIdx := make(map[string]int)
+	for idx, name := range re.SubexpNames() {
+		if idx > 0 && name != "" {
+			nameToIdx[name] = idx
+		}
+	}
+	var tokens []replToken
+	var litBuf strings.Builder
+	flushLit := func() {
+		if litBuf.Len() > 0 {
+			tokens = append(tokens, replToken{lit: litBuf.String(), groupIdx: -1})
+			litBuf.Reset()
+		}
+	}
+	for cursor := 0; cursor < len(repl); {
+		ch := repl[cursor]
+		if ch == '\\' {
+			cursor++
+			if cursor >= len(repl) {
+				return "", fmt.Errorf("illegal_argument_exception: character to be escaped is missing")
+			}
+			litBuf.WriteByte(repl[cursor])
+			cursor++
+			continue
+		}
+		if ch == '$' {
+			flushLit()
+			cursor++
+			if cursor >= len(repl) {
+				return "", fmt.Errorf("illegal_argument_exception: illegal group reference: group index is missing")
+			}
+			if repl[cursor] == '{' {
+				cursor++
+				gs := cursor
+				for cursor < len(repl) && repl[cursor] != '}' {
+					cursor++
+				}
+				if cursor >= len(repl) {
+					return "", fmt.Errorf("illegal_argument_exception: named capturing group is missing trailing '}'")
+				}
+				gname := repl[gs:cursor]
+				cursor++
+				if gname == "" {
+					return "", fmt.Errorf("illegal_argument_exception: named capturing group has 0 length name")
+				}
+				gIdx, ok := nameToIdx[gname]
+				if !ok {
+					return "", fmt.Errorf("illegal_argument_exception: No group with name {%s}", gname)
+				}
+				tokens = append(tokens, replToken{groupIdx: gIdx})
+				continue
+			}
+			if repl[cursor] >= '0' && repl[cursor] <= '9' {
+				refNum := int(repl[cursor] - '0')
+				cursor++
+				if refNum > numGroups {
+					return "", fmt.Errorf("index_out_of_bounds_exception: No group %d", refNum)
+				}
+				for cursor < len(repl) && repl[cursor] >= '0' && repl[cursor] <= '9' {
+					nextRefNum := refNum*10 + int(repl[cursor]-'0')
+					if nextRefNum > numGroups {
+						break
+					}
+					refNum = nextRefNum
+					cursor++
+				}
+				tokens = append(tokens, replToken{groupIdx: refNum})
+				continue
+			}
+			// Preserve literal uppercase currency tokens like "$USD" (Round 38 backward compatibility)
+			// while rejecting bare '$', '$foo', '$$', '$-', etc. per Java Matcher.replaceAll.
+			if repl[cursor] >= 'A' && repl[cursor] <= 'Z' {
+				endUpper := cursor
+				for endUpper < len(repl) && repl[endUpper] >= 'A' && repl[endUpper] <= 'Z' {
+					endUpper++
+				}
+				if endUpper-cursor >= 2 && (endUpper == len(repl) || !isIngestIdentByte(repl[endUpper])) {
+					litBuf.WriteByte('$')
+					continue
+				}
+			}
+			return "", fmt.Errorf("illegal_argument_exception: illegal group reference")
+		}
+		litBuf.WriteByte(ch)
+		cursor++
+	}
+	flushLit()
+
+	matches := re.FindAllStringSubmatchIndex(src, -1)
+	if len(matches) == 0 {
+		return src, nil
+	}
+	var out strings.Builder
+	out.Grow(len(src) + 16)
+	lastEnd := 0
+	for _, loc := range matches {
+		out.WriteString(src[lastEnd:loc[0]])
+		for _, tok := range tokens {
+			if tok.groupIdx < 0 {
+				out.WriteString(tok.lit)
+				continue
+			}
+			sIdx := loc[2*tok.groupIdx]
+			eIdx := loc[2*tok.groupIdx+1]
+			if sIdx >= 0 && eIdx >= sIdx {
+				out.WriteString(src[sIdx:eIdx])
+			}
+		}
+		lastEnd = loc[1]
+	}
+	out.WriteString(src[lastEnd:])
+	return out.String(), nil
 }
 
 func deepCloneIngestValue(val any) any {
@@ -2728,6 +2941,52 @@ func convertESDateFormatToGoLayouts(esFmt string) []string {
 		return []string{"UNIX"}
 	case "UNIX_MS", "epoch_millis":
 		return []string{"UNIX_MS"}
+	case "TAI64N", "tai64n":
+		return []string{"TAI64N"}
+	case "ordinal_date", "strict_ordinal_date":
+		return []string{
+			"2006-002T15:04:05.999999999Z07:00",
+			"2006-002T15:04:05.999999999Z0700",
+			"2006-002T15:04:05Z07:00",
+			"2006-002T15:04:05Z0700",
+			"2006-002T15:04:05",
+			"2006-002Z07:00",
+			"2006-002Z0700",
+			"2006-002",
+		}
+	case "ordinal_date_no_millis", "strict_ordinal_date_no_millis":
+		return []string{
+			"2006-002T15:04:05Z07:00",
+			"2006-002T15:04:05Z0700",
+			"2006-002T15:04:05",
+			"2006-002Z07:00",
+			"2006-002Z0700",
+			"2006-002",
+		}
+	case "ordinal_date_time", "strict_ordinal_date_time":
+		return []string{
+			"2006-002T15:04:05.999999999Z07:00",
+			"2006-002T15:04:05.999999999Z0700",
+			"2006-002T15:04:05.000Z07:00",
+			"2006-002T15:04:05.000Z0700",
+		}
+	case "ordinal_date_time_no_millis", "strict_ordinal_date_time_no_millis":
+		return []string{
+			"2006-002T15:04:05Z07:00",
+			"2006-002T15:04:05Z0700",
+			"2006-002T15:04:05",
+		}
+	case "basic_ordinal_date", "strict_basic_ordinal_date":
+		return []string{"2006002Z0700", "2006002Z07:00", "2006002"}
+	case "basic_ordinal_date_time", "strict_basic_ordinal_date_time":
+		return []string{
+			"2006002T150405.999999999Z0700",
+			"2006002T150405.999999999Z07:00",
+			"2006002T150405.000Z0700",
+			"2006002T150405.000Z07:00",
+		}
+	case "basic_ordinal_date_time_no_millis", "strict_basic_ordinal_date_time_no_millis":
+		return []string{"2006002T150405Z0700", "2006002T150405Z07:00", "2006002T150405"}
 	case "basic_date", "strict_basic_date":
 		return []string{"20060102"}
 	case "basic_date_time", "strict_basic_date_time":
@@ -2772,15 +3031,20 @@ func convertESDateFormatToGoLayouts(esFmt string) []string {
 	}
 	r := strings.NewReplacer(
 		"uuuu", "2006",
+		"uuu", "2006",
 		"uu", "06",
+		"u", "2006",
 		"yyyy", "2006",
+		"yyy", "2006",
 		"yy", "06",
+		"y", "2006",
 		"MMMM", "January",
 		"MMM", "Jan",
 		"MM", "01",
 		"M", "1",
 		"EEEE", "Monday",
 		"EEE", "Mon",
+		"DDD", "002",
 		"dd", "02",
 		"d", "2",
 		"HH", "15",
@@ -2877,7 +3141,10 @@ func formatIngestDateInput(val any) string {
 	case json.Number:
 		return tv.String()
 	case float64:
-		if math.Trunc(tv) == tv {
+		if math.IsNaN(tv) || math.IsInf(tv, 0) {
+			return strconv.FormatFloat(tv, 'f', -1, 64)
+		}
+		if math.Trunc(tv) == tv && tv >= -9e18 && tv <= 9e18 {
 			return strconv.FormatInt(int64(tv), 10)
 		}
 		return strconv.FormatFloat(tv, 'f', -1, 64)
@@ -2957,17 +3224,39 @@ func parseIngestDateValue(raw string, formats []any, tzName string) (time.Time, 
 		}
 		for _, layout := range convertESDateFormatToGoLayouts(fStr) {
 			switch layout {
+			case "TAI64N":
+				s := strings.TrimPrefix(strings.TrimSpace(raw), "@")
+				if len(s) == 24 {
+					hi, err1 := strconv.ParseUint(s[:16], 16, 64)
+					lo, err2 := strconv.ParseUint(s[16:24], 16, 32)
+					if err1 == nil && err2 == nil && lo < 1_000_000_000 {
+						const taiEpoch uint64 = 0x400000000000000a
+						if hi >= taiEpoch {
+							diff := hi - taiEpoch
+							if diff <= math.MaxInt64 {
+								return time.Unix(int64(diff), int64(lo)).In(loc), nil
+							}
+						} else {
+							diff := taiEpoch - hi
+							if diff <= uint64(math.MaxInt64) {
+								return time.Unix(-int64(diff), int64(lo)).In(loc), nil
+							}
+						}
+					}
+				}
 			case "UNIX":
-				if fv, err := strconv.ParseFloat(strings.TrimSpace(raw), 64); err == nil {
+				trimmed := strings.TrimSpace(raw)
+				if fv, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv >= -1e14 && fv <= 1e14 {
 					sec := int64(fv)
-					nsec := int64((fv - float64(sec)) * 1e9)
+					nsec := int64(math.Round((fv - float64(sec)) * 1e9))
 					return time.Unix(sec, nsec).In(loc), nil
 				}
 			case "UNIX_MS":
-				if iv, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64); err == nil {
+				trimmed := strings.TrimSpace(raw)
+				if iv, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
 					return time.UnixMilli(iv).In(loc), nil
 				}
-				if fv, err := strconv.ParseFloat(strings.TrimSpace(raw), 64); err == nil {
+				if fv, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv >= -9e18 && fv <= 9e18 {
 					return time.UnixMilli(int64(fv)).In(loc), nil
 				}
 			default:
@@ -3173,16 +3462,20 @@ func parseIngestByteSize(s string) (int64, error) {
 	return int64(fv * mult), nil
 }
 
-func splitIngestKVPairs(s, fieldSplit string) []string {
+func splitIngestKVPairs(s, fieldSplit string) ([]string, error) {
 	var re *regexp.Regexp
 	if fieldSplit != "|" && fieldSplit != "." && fieldSplit != " " && fieldSplit != "," && fieldSplit != ";" && fieldSplit != "&" {
-		re, _ = regexp.Compile(fieldSplit)
+		var err error
+		re, err = compileIngestJavaRegex(fieldSplit)
+		if err != nil {
+			return nil, fmt.Errorf("illegal_argument_exception: invalid field_split [%s]: %v", fieldSplit, err)
+		}
 	}
 	if !strings.ContainsAny(s, `"'`) {
 		if re != nil {
-			return re.Split(s, -1)
+			return re.Split(s, -1), nil
 		}
-		return strings.Split(s, fieldSplit)
+		return strings.Split(s, fieldSplit), nil
 	}
 	var pairs []string
 	var cur strings.Builder
@@ -3223,7 +3516,7 @@ func splitIngestKVPairs(s, fieldSplit string) []string {
 		i++
 	}
 	pairs = append(pairs, cur.String())
-	return pairs
+	return pairs, nil
 }
 
 func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error) {
@@ -3994,19 +4287,28 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		field, _ := specMap["field"].(string)
 		field = expandIngestFieldName(field, doc)
 		sep, _ := specMap["separator"].(string)
+		if strings.Contains(sep, "{{") {
+			sep = fmt.Sprintf("%v", expandIngestTemplate(sep, doc))
+		}
 		target := field
 		if tf, _ := specMap["target_field"].(string); tf != "" {
 			target = expandIngestFieldName(tf, doc)
 		}
 		preserveTrailing, _ := specMap["preserve_trailing"].(bool)
 		if field != "" && sep != "" {
+			var splitRe *regexp.Regexp
+			if sep != "|" && sep != "." {
+				var err error
+				splitRe, err = compileIngestJavaRegex(sep)
+				if err != nil {
+					return false, false, procType, procTag, specMap, fmt.Errorf("illegal_argument_exception: invalid separator [%s]: %v", sep, err)
+				}
+			}
 			if val, ok := getIngestPath(doc, field); ok && val != nil {
 				splitOne := func(strVal string) []any {
 					var parts []string
-					if sep == "|" || sep == "." {
-						parts = strings.Split(strVal, sep)
-					} else if re, err := regexp.Compile(sep); err == nil {
-						parts = re.Split(strVal, -1)
+					if splitRe != nil {
+						parts = splitRe.Split(strVal, -1)
 					} else {
 						parts = strings.Split(strVal, sep)
 					}
@@ -4183,20 +4485,27 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			target = tf
 		}
 		if field != "" && pat != "" {
-			re, err := regexp.Compile(pat)
+			re, err := compileIngestJavaRegex(pat)
 			if err != nil {
 				return false, false, procType, procTag, specMap, err
 			}
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				normRepl := normalizeGsubReplacement(repl)
 				if strVal, ok := val.(string); ok {
-					setIngestPath(doc, target, re.ReplaceAllString(strVal, normRepl))
+					replaced, err := applyIngestGsubReplacement(re, strVal, repl)
+					if err != nil {
+						return false, false, procType, procTag, specMap, err
+					}
+					setIngestPath(doc, target, replaced)
 					mutated = true
 				} else if arr, isArr := val.([]any); isArr {
 					outArr := make([]any, len(arr))
 					for idx, elem := range arr {
 						if sElem, ok := elem.(string); ok {
-							outArr[idx] = re.ReplaceAllString(sElem, normRepl)
+							replaced, err := applyIngestGsubReplacement(re, sElem, repl)
+							if err != nil {
+								return false, false, procType, procTag, specMap, err
+							}
+							outArr[idx] = replaced
 						} else {
 							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
 						}
@@ -4357,7 +4666,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				}
 				var valSplitRe *regexp.Regexp
 				if valueSplit != "=" && valueSplit != ":" && valueSplit != "|" && valueSplit != "." {
-					valSplitRe, _ = regexp.Compile(valueSplit)
+					var err error
+					valSplitRe, err = compileIngestJavaRegex(valueSplit)
+					if err != nil {
+						return false, false, procType, procTag, specMap, fmt.Errorf("illegal_argument_exception: invalid value_split [%s]: %v", valueSplit, err)
+					}
 				}
 				hasMatchingOuterKVBrackets := func(s string, openB, closeB byte) bool {
 					depth := 0
@@ -4412,7 +4725,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					if stripBrackets {
 						strVal = stripKVEnclosingBrackets(strings.TrimSpace(strVal))
 					}
-					pairs := splitIngestKVPairs(strVal, fieldSplit)
+					pairs, splitErr := splitIngestKVPairs(strVal, fieldSplit)
+					if splitErr != nil {
+						return false, false, procType, procTag, specMap, splitErr
+					}
 					for _, pair := range pairs {
 						pair = strings.TrimSpace(pair)
 						if stripBrackets {
@@ -7272,8 +7588,7 @@ func convertSingleIngestValue(val any, convType string) (any, error) {
 	case map[string]any, []any:
 		return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
 	}
-	str := strings.TrimSpace(fmt.Sprintf("%v", val))
-	lowerType := strings.ToLower(convType)
+	lowerType := strings.ToLower(strings.TrimSpace(convType))
 	switch lowerType {
 	case "integer", "int", "long", "short", "byte":
 		checkBounds := func(iv int64) bool {
@@ -7288,66 +7603,200 @@ func convertSingleIngestValue(val any, convType string) (any, error) {
 				return true
 			}
 		}
-		if iv, err := strconv.ParseInt(str, 10, 64); err == nil {
+		switch v := val.(type) {
+		case string:
+			iv, err := strconv.ParseInt(v, 10, 64)
+			if err != nil || !checkBounds(iv) {
+				return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
+			}
+			return iv, nil
+		case int:
+			iv := int64(v)
 			if !checkBounds(iv) {
 				return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
 			}
 			return iv, nil
-		}
-		if !strings.Contains(str, ".") {
-			if fv, err := strconv.ParseFloat(str, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) && fv >= float64(math.MinInt64) && fv < float64(math.MaxInt64) {
-				iv := int64(fv)
-				if !checkBounds(iv) {
-					return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
+		case int64:
+			if !checkBounds(v) {
+				return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
+			}
+			return v, nil
+		case int32:
+			iv := int64(v)
+			if !checkBounds(iv) {
+				return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
+			}
+			return iv, nil
+		case int16:
+			iv := int64(v)
+			if !checkBounds(iv) {
+				return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
+			}
+			return iv, nil
+		case int8:
+			iv := int64(v)
+			if !checkBounds(iv) {
+				return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
+			}
+			return iv, nil
+		case uint:
+			uv := uint64(v)
+			if uv > math.MaxInt64 || !checkBounds(int64(uv)) {
+				return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
+			}
+			return int64(uv), nil
+		case uint64:
+			if v > math.MaxInt64 || !checkBounds(int64(v)) {
+				return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
+			}
+			return int64(v), nil
+		case float64:
+			if !math.IsNaN(v) && !math.IsInf(v, 0) && v == math.Trunc(v) && v >= float64(math.MinInt64) && v < float64(math.MaxInt64) {
+				iv := int64(v)
+				if checkBounds(iv) {
+					return iv, nil
 				}
-				return iv, nil
+			}
+		case float32:
+			fv := float64(v)
+			if !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) && fv >= float64(math.MinInt64) && fv < float64(math.MaxInt64) {
+				iv := int64(fv)
+				if checkBounds(iv) {
+					return iv, nil
+				}
+			}
+		case json.Number:
+			if iv, err := v.Int64(); err == nil {
+				if checkBounds(iv) {
+					return iv, nil
+				}
+			} else if fv, err := v.Float64(); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) && fv >= float64(math.MinInt64) && fv < float64(math.MaxInt64) {
+				iv := int64(fv)
+				if checkBounds(iv) {
+					return iv, nil
+				}
 			}
 		}
 		return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
 	case "unsigned_long":
-		if uv, err := strconv.ParseUint(str, 10, 64); err == nil {
+		switch v := val.(type) {
+		case string:
+			uv, err := strconv.ParseUint(v, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
+			}
 			return uv, nil
-		}
-		if !strings.Contains(str, ".") {
-			if fv, err := strconv.ParseFloat(str, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv >= 0 && fv == math.Trunc(fv) {
+		case uint64:
+			return v, nil
+		case uint:
+			return uint64(v), nil
+		case int:
+			if v >= 0 {
+				return uint64(v), nil
+			}
+		case int64:
+			if v >= 0 {
+				return uint64(v), nil
+			}
+		case float64:
+			if !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0 && v == math.Trunc(v) && v < 18446744073709551616.0 {
+				return uint64(v), nil
+			}
+		case float32:
+			fv := float64(v)
+			if !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv >= 0 && fv == math.Trunc(fv) && fv < 18446744073709551616.0 {
+				return uint64(fv), nil
+			}
+		case json.Number:
+			if uv, err := strconv.ParseUint(v.String(), 10, 64); err == nil {
+				return uv, nil
+			}
+			if fv, err := v.Float64(); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv >= 0 && fv == math.Trunc(fv) && fv < 18446744073709551616.0 {
 				return uint64(fv), nil
 			}
 		}
 		return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
 	case "float", "double", "half_float", "scaled_float":
-		if fv, err := strconv.ParseFloat(str, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
-			return fv, nil
+		switch v := val.(type) {
+		case string:
+			if v != "" && v == strings.TrimSpace(v) {
+				if fv, err := strconv.ParseFloat(v, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+					return fv, nil
+				}
+			}
+		case float64:
+			if !math.IsNaN(v) && !math.IsInf(v, 0) {
+				return v, nil
+			}
+		case float32:
+			fv := float64(v)
+			if !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+				return fv, nil
+			}
+		case int:
+			return float64(v), nil
+		case int64:
+			return float64(v), nil
+		case int32:
+			return float64(v), nil
+		case uint:
+			return float64(v), nil
+		case uint64:
+			return float64(v), nil
+		case json.Number:
+			if fv, err := v.Float64(); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+				return fv, nil
+			}
 		}
 		return nil, fmt.Errorf("unable to convert [%v] to %s", val, convType)
 	case "string":
+		if s, ok := val.(string); ok {
+			return s, nil
+		}
 		return fmt.Sprintf("%v", val), nil
 	case "boolean", "bool":
-		switch strings.ToLower(str) {
-		case "true", "1", "yes", "on":
-			return true, nil
-		case "false", "0", "no", "off":
-			return false, nil
+		switch v := val.(type) {
+		case bool:
+			return v, nil
+		case string:
+			if v == strings.TrimSpace(v) {
+				switch strings.ToLower(v) {
+				case "true", "1", "yes", "on":
+					return true, nil
+				case "false", "0", "no", "off":
+					return false, nil
+				}
+			}
 		}
 		return nil, fmt.Errorf("unable to convert [%v] to boolean", val)
 	case "ip":
-		if net.ParseIP(str) != nil {
-			return str, nil
+		if s, ok := val.(string); ok && s != "" && s == strings.TrimSpace(s) {
+			if ip := net.ParseIP(s); ip != nil {
+				return ip.String(), nil
+			}
 		}
 		return nil, fmt.Errorf("unable to convert [%v] to ip", val)
 	case "auto":
-		if iv, err := strconv.ParseInt(str, 10, 64); err == nil {
+		s, isStr := val.(string)
+		if !isStr {
+			return val, nil
+		}
+		if s == "" || s != strings.TrimSpace(s) {
+			return s, nil
+		}
+		if iv, err := strconv.ParseInt(s, 10, 64); err == nil {
 			return iv, nil
 		}
-		if fv, err := strconv.ParseFloat(str, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+		if fv, err := strconv.ParseFloat(s, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
 			return fv, nil
 		}
-		switch strings.ToLower(str) {
+		switch strings.ToLower(s) {
 		case "true":
 			return true, nil
 		case "false":
 			return false, nil
 		}
-		return str, nil
+		return s, nil
 	default:
 		return val, nil
 	}
@@ -9192,6 +9641,10 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Text == nil && r.URL.Query().Get("text") != "" {
 		req.Text = r.URL.Query().Get("text")
+	}
+
+	if handled := s.tryHandleCustomIndexAnalyze(w, r, bodyBytes); handled {
+		return
 	}
 
 	analyzer := strings.ToLower(strings.TrimSpace(req.Analyzer))

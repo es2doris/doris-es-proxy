@@ -658,11 +658,11 @@ func TestRound17_PainlessEngineHardening(t *testing.T) {
 		"text": "abracadabra",
 	}
 
-	// 1. Regex literals in .replaceAll(/.../, ...) and .split(/.../, limit) + 2-arg .split("|", limit)
+	// 1. Regex literals in .replaceAll(/.../, ...) and .split(/.../, limit) + 2-arg .split("\\|", limit)
 	scriptRegex := `
 		ctx._source.clean_path = ctx._source.path.replaceAll(/\/+/, '-');
 		ctx._source.parts = ctx._source.csv.split(/[,;]/, 2);
-		ctx._source.pipes = ctx._source.pipe.split("|", 2);
+		ctx._source.pipes = ctx._source.pipe.split("\\|", 2);
 	`
 	if err := painless.EvalPainless(doc, scriptRegex, nil); err != nil {
 		t.Fatalf("EvalPainless regex failed: %v", err)

@@ -1430,3 +1430,1292 @@
       cat.help: {}
   - is_true: ''
 
+---
+"Round 57 Runner Stash/Transforms, Security, Capabilities, Simulate Ingest, Scripts, Fleet, ML & Index Ops":
+  # F1: Terminal _arbitrary_key_ key-name stashing + $obj.field expansion + nested transform_and_set (base64Encode(concat(...)), sha256, join)
+  - do:
+      nodes.info: {}
+  - set: { nodes._arbitrary_key_: r57_node_id }
+  - is_true: nodes.$r57_node_id.name
+
+  - do:
+      security.create_api_key:
+        body:
+          name: "r57-yaml-key"
+          metadata:
+            env: "dev"
+  - set: { '': r57_key_obj }
+  - transform_and_set:
+      r57_basic_creds: "base64Encode(concat($r57_key_obj.id, ':', $r57_key_obj.api_key))"
+      r57_name_sha: "sha256($r57_key_obj.name)"
+      r57_joined_tags: "join(split('alpha|beta|gamma', '|'), ',')"
+
+  # F0 & F8: Security API key update/bulk_update/query, user/role Query DSL, _privileges, cache clear, OIDC/SAML/PKI/SSL
+  - do:
+      security.put_api_key:
+        id: $r57_key_obj.id
+        body:
+          metadata:
+            env: "staging"
+            tag_list: $r57_joined_tags
+  - match: { updated: true }
+
+  - do:
+      security.bulk_update_api_keys:
+        body:
+          ids: [$r57_key_obj.id]
+          metadata:
+            env: "prod"
+  - length: { updated: 1 }
+
+  - do:
+      security.query_api_keys:
+        body:
+          query:
+            match:
+              name: "r57-yaml-key"
+  - gte: { total: 1 }
+
+  - do:
+      security.put_user:
+        username: r57_yaml_user
+        body:
+          password: "secretPassword123"
+          roles: ["admin"]
+          email: "r57@example.com"
+  - match: { user.created: true }
+
+  - do:
+      security.query_user:
+        body:
+          query:
+            prefix:
+              username: "r57_yaml"
+  - gte: { total: 1 }
+
+  - do:
+      security.put_role:
+        name: r57_yaml_role
+        body:
+          cluster: ["monitor"]
+  - is_true: role
+
+  - do:
+      security.query_role:
+        body:
+          query:
+            wildcard:
+              name: "r57_yaml_*"
+  - gte: { total: 1 }
+
+  - do:
+      security.get_user_privileges: {}
+  - is_true: cluster
+
+  - do:
+      security.put_privileges:
+        body:
+          r57_app:
+            reader:
+              actions: ["data:read/*"]
+  - is_true: r57_app
+
+  - do:
+      security.clear_cached_privileges:
+        application: r57_app
+  - is_true: _nodes
+
+  - do:
+      security.create_service_token:
+        namespace: elastic
+        service: fleet-server
+        token_name: r57_svc_tok
+  - is_true: token.value
+
+  - do:
+      security.clear_cached_service_tokens:
+        namespace: elastic
+        service: fleet-server
+        token_name: r57_svc_tok
+  - is_true: _nodes
+
+  - do:
+      security.oidc_prepare_authentication:
+        body:
+          realm: "oidc1"
+  - set: { state: r57_oidc_state }
+  - is_true: redirect
+
+  - do:
+      security.oidc_authenticate:
+        body:
+          redirect_uri: "https://app.example/cb?code=123"
+          state: $r57_oidc_state
+  - set: { access_token: r57_oidc_tok }
+  - is_true: access_token
+
+  - do:
+      security.oidc_logout:
+        body:
+          token: $r57_oidc_tok
+  - is_true: redirect
+
+  - do:
+      security.saml_prepare_authentication:
+        body:
+          realm: "saml1"
+  - is_true: id
+
+  - do:
+      security.saml_authenticate:
+        body:
+          content: "PHNhbWw+..."
+          ids: ["req1"]
+  - set: { access_token: r57_saml_tok }
+
+  - do:
+      security.saml_invalidate:
+        body:
+          query_string: "SAMLRequest=xyz"
+  - is_true: ''
+
+  - do:
+      security.saml_logout:
+        body:
+          token: $r57_saml_tok
+  - is_true: ''
+
+  - do:
+      security.saml_complete_logout:
+        body: {}
+  - is_true: ''
+
+  - do:
+      security.saml_service_provider_metadata:
+        body:
+          realm_name: "saml1"
+  - is_true: ''
+
+  - do:
+      security.delegate_pki:
+        body:
+          subject_dn: "CN=r57_pki_svc,OU=Eng"
+  - match: { username: "r57_pki_svc" }
+
+  - do:
+      security.get_certificates: {}
+  - is_true: ''
+
+  # F0 & F9: Capabilities, Script Introspection, System Features Migration, End-to-End Simulate Ingest
+  - do:
+      capabilities: {}
+  - is_true: capabilities
+
+  - do:
+      get_script_context: {}
+  - is_true: contexts
+
+  - do:
+      get_script_languages: {}
+  - is_true: language_contexts
+
+  - do:
+      migration.get_feature_upgrade_status: {}
+  - is_true: features
+
+  - do:
+      migration.post_feature_upgrade:
+        body:
+          feature_name: "kibana"
+  - match: { acknowledged: true }
+
+  - do:
+      ingest.put_pipeline:
+        id: r57_sim_def_pipe
+        body:
+          processors:
+            - set:
+                field: "piped_env"
+                value: "prod"
+  - match: { acknowledged: true }
+
+  - do:
+      indices.put_index_template:
+        name: r57_sim_tpl
+        body:
+          index_patterns: ["r57-sim-*"]
+          template:
+            settings:
+              index.default_pipeline: "r57_sim_def_pipe"
+            mappings:
+              properties:
+                host:
+                  type: keyword
+  - match: { acknowledged: true }
+
+  - do:
+      simulate.ingest:
+        body:
+          index: "r57-sim-logs-01"
+          docs:
+            - _source:
+                host: "web-1"
+                dyn_metric: 99
+  - match: { pipeline_simulation.0.doc._source.piped_env: "prod" }
+  - is_true: mapping_addition.properties.dyn_metric
+
+  # F0 & F9: Fleet global_checkpoints & secrets, Index ops (_flush/synced, _freeze, _unfreeze), Rethrottle, Logstash HEAD, ML & CAT ML
+  - do:
+      indices.create:
+        index: r57_ops_idx
+  - match: { acknowledged: true }
+
+  - do:
+      fleet.global_checkpoints:
+        index: r57_ops_idx
+  - is_true: last_known_global_checkpoints
+
+  - do:
+      fleet.post_secret:
+        body:
+          value: "s3cr3t-value"
+  - set: { id: r57_fsec_id }
+
+  - do:
+      fleet.get_secret:
+        id: $r57_fsec_id
+  - match: { id: $r57_fsec_id }
+
+  - do:
+      fleet.delete_secret:
+        id: $r57_fsec_id
+  - match: { acknowledged: true }
+
+  - do:
+      indices.flush_synced:
+        index: r57_ops_idx
+  - is_true: _shards
+
+  - do:
+      indices.freeze:
+        index: r57_ops_idx
+  - match: { acknowledged: true }
+
+  - do:
+      indices.unfreeze:
+        index: r57_ops_idx
+  - match: { acknowledged: true }
+
+  - do:
+      reindex_rethrottle:
+        task_id: "nodeA:301"
+        requests_per_second: 100
+  - is_true: nodes
+
+  - do:
+      update_by_query_rethrottle:
+        task_id: "nodeA:302"
+        requests_per_second: 100
+  - is_true: nodes
+
+  - do:
+      delete_by_query_rethrottle:
+        task_id: "nodeA:303"
+        requests_per_second: -1
+  - is_true: nodes
+
+  - do:
+      logstash.put_pipeline:
+        id: r57_ls_pipe
+        body:
+          pipeline: "input { stdin {} }"
+          description: "r57 test"
+  - is_true: ''
+
+  - do:
+      logstash.exists_pipeline:
+        id: r57_ls_pipe
+
+  - do:
+      ml.find_file_structure:
+        body: "a,b\n1,2\n3,4\n"
+  - is_true: format
+
+  - do:
+      ml.put_trained_model:
+        model_id: r57_ml_model
+        body:
+          input:
+            field_names: ["text"]
+  - match: { model_id: "r57_ml_model" }
+
+  - do:
+      ml.put_trained_model_vocabulary:
+        model_id: r57_ml_model
+        body:
+          vocabulary: ["hello", "world"]
+  - is_true: ''
+
+  - do:
+      ml.get_trained_model_vocabulary:
+        model_id: r57_ml_model
+  - length: { vocabulary: 2 }
+
+  - do:
+      ml.start_trained_model_deployment:
+        model_id: r57_ml_model
+  - is_true: assignment
+
+  - do:
+      ml.clear_trained_model_deployment_cache:
+        model_id: r57_ml_model
+  - match: { acknowledged: true }
+
+  - do:
+      ml.stop_trained_model_deployment:
+        model_id: r57_ml_model
+  - match: { stopped: true }
+
+  - do:
+      ml.put_job:
+        job_id: r57_ml_job
+        body:
+          analysis_config:
+            bucket_span: "15m"
+            detectors:
+              - function: "count"
+          data_description:
+            time_field: "@timestamp"
+  - match: { job_id: "r57_ml_job" }
+
+  - do:
+      ml.open_job:
+        job_id: r57_ml_job
+  - match: { opened: true }
+
+  - do:
+      ml.post_data:
+        job_id: r57_ml_job
+        body:
+          - "@timestamp": 1700000000000
+  - is_true: ''
+
+  - do:
+      ml.close_job:
+        job_id: r57_ml_job
+  - match: { closed: true }
+
+  - do:
+      ml.upgrade_job_snapshot:
+        job_id: r57_ml_job
+        snapshot_id: "1"
+  - match: { acknowledged: true }
+
+  - do:
+      ml.get_model_snapshot_upgrade_stats:
+        job_id: r57_ml_job
+        snapshot_id: "1"
+  - is_true: ''
+
+  - do:
+      ml.delete_expired_data:
+        job_id: "_all"
+  - is_true: ''
+
+  - do:
+      cat.anomaly_detectors: {}
+  - is_true: ''
+
+  - do:
+      cat.datafeeds: {}
+  - is_true: ''
+
+  - do:
+      cat.trained_models: {}
+  - is_true: ''
+
+  - do:
+      cat.data_frame_analytics: {}
+  - is_true: ''
+
+---
+"Round 57 SQL, ES|QL, EQL, Stateful Snapshot/Mount/SLM, Synonyms, Inference, Connectors & Search Applications":
+  # F2: SQL Engine DESCRIBE, SHOW COLUMNS/FUNCTIONS, aliases, GROUP BY/HAVING, columnar + ? params, and /_sql/translate
+  - do:
+      indices.create:
+        index: r57_sql_idx
+        body:
+          mappings:
+            properties:
+              dept: { type: keyword }
+              name: { type: keyword }
+              age: { type: integer }
+              salary: { type: double }
+  - match: { acknowledged: true }
+
+  - do:
+      bulk:
+        index: r57_sql_idx
+        refresh: true
+        body:
+          - index: { _id: "1" }
+          - { dept: "eng", name: "Alice", age: 30, salary: 120.0 }
+          - index: { _id: "2" }
+          - { dept: "eng", name: "Bob", age: 9, salary: 90.0 }
+          - index: { _id: "3" }
+          - { dept: "sales", name: "Carol", age: 100, salary: 150.0 }
+  - match: { errors: false }
+
+  - do:
+      sql.query:
+        body:
+          query: "DESCRIBE r57_sql_idx"
+  - match: { columns.0.name: "column" }
+  - length: { rows: 4 }
+
+  - do:
+      sql.query:
+        body:
+          query: "SHOW COLUMNS IN r57_sql_idx"
+  - match: { columns.0.name: "column" }
+
+  - do:
+      sql.query:
+        body:
+          query: "SHOW FUNCTIONS LIKE 'CON%'"
+  - match: { columns.0.name: "name" }
+
+  - do:
+      sql.query:
+        body:
+          query: "SELECT dept, COUNT(*) AS cnt, SUM(age) AS total_age FROM r57_sql_idx GROUP BY dept HAVING COUNT(*) >= 2"
+  - match: { columns.1.name: "cnt" }
+  - length: { rows: 1 }
+  - match: { rows.0.0: "eng" }
+  - match: { rows.0.1: 2 }
+  - match: { rows.0.2: 39 }
+
+  - do:
+      sql.query:
+        body:
+          query: "SELECT name, age FROM r57_sql_idx WHERE dept IN (?, ?) ORDER BY age ASC"
+          params: ["eng", "sales"]
+          columnar: true
+  - match: { values.1.0: 9 }
+  - match: { values.1.1: 30 }
+  - match: { values.1.2: 100 }
+
+  - do:
+      sql.translate:
+        body:
+          query: "SELECT dept, COUNT(*) AS c FROM r57_sql_idx GROUP BY dept"
+  - match: { size: 0 }
+  - is_true: aggs
+
+  # F3: ES|QL SHOW INFO, DISSECT, GROK, MV_EXPAND, MV_*/DATE_*, unknown stage 400, and async _stop
+  - do:
+      esql.query:
+        body:
+          query: "SHOW INFO"
+  - length: { values: 1 }
+
+  - do:
+      catch: bad_request
+      esql.query:
+        body:
+          query: "FROM r57_sql_idx | UNKNOWN_CMD_XYZ foo"
+
+  - do:
+      esql.query:
+        body:
+          query: "ROW msg = \"eng|api\", line = \"GET 200\", nums = [20, 10] | DISSECT msg \"%{d_dept}|%{d_svc}\" | GROK line \"%{WORD:verb} %{NUMBER:code:int}\" | EVAL s = MV_SUM(nums), yr = DATE_EXTRACT(\"year\", \"2026-05-15T00:00:00Z\") | MV_EXPAND nums | SORT nums ASC | KEEP d_dept, verb, code, s, yr, nums"
+  - length: { values: 2 }
+  - match: { values.0.0: "eng" }
+  - match: { values.0.1: "GET" }
+  - match: { values.0.2: 200 }
+  - match: { values.0.3: 30 }
+  - match: { values.0.4: 2026 }
+  - match: { values.0.5: 10 }
+
+  - do:
+      esql.async_query:
+        body:
+          query: "SHOW INFO"
+          keep_on_completion: true
+  - set: { id: r57_esql_aid }
+
+  - do:
+      esql.async_query_stop:
+        id: $r57_esql_aid
+  - match: { is_running: false }
+
+  # F4: EQL single-event & multi-stage sequence engine + syntax validation
+  - do:
+      indices.create:
+        index: r57_eql_idx
+        body:
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              event:
+                properties:
+                  category: { type: keyword }
+              host:
+                properties:
+                  name: { type: keyword }
+              process:
+                properties:
+                  name: { type: keyword }
+  - match: { acknowledged: true }
+
+  - do:
+      bulk:
+        index: r57_eql_idx
+        refresh: true
+        body:
+          - index: { _id: "1" }
+          - { "@timestamp": "2026-06-01T10:00:00Z", event: { category: "process" }, host: { name: "h1" }, process: { name: "cmd.exe" } }
+          - index: { _id: "2" }
+          - { "@timestamp": "2026-06-01T10:01:00Z", event: { category: "network" }, host: { name: "h1" }, process: { name: "cmd.exe" } }
+  - match: { errors: false }
+
+  - do:
+      catch: bad_request
+      eql.search:
+        index: r57_eql_idx
+        body:
+          query: "process where ("
+
+  - do:
+      eql.search:
+        index: r57_eql_idx
+        body:
+          query: "sequence by host.name with maxspan=5m [process where process.name == \"cmd.exe\"] [network where true]"
+  - length: { hits.sequences: 1 }
+
+  # F5: Stateful Snapshot/Restore, _mount, cache/clear, repository _analyze & SLM retention pruning
+  - do:
+      snapshot.create_repository:
+        repository: r57_snap_repo
+        body:
+          type: fs
+          settings:
+            location: "/tmp/r57_snap_repo"
+  - match: { acknowledged: true }
+
+  - do:
+      snapshot.repository_analyze:
+        repository: r57_snap_repo
+        blob_count: 2
+  - match: { blob_count: 2 }
+
+  - do:
+      indices.create:
+        index: r57_snap_src
+        body:
+          mappings:
+            properties:
+              tag: { type: keyword }
+  - match: { acknowledged: true }
+
+  - do:
+      index:
+        index: r57_snap_src
+        id: "doc-1"
+        refresh: true
+        body:
+          tag: "persisted"
+
+  - do:
+      snapshot.create:
+        repository: r57_snap_repo
+        snapshot: snap_base
+        wait_for_completion: true
+        body:
+          indices: "r57_snap_src"
+  - match: { accepted: true }
+
+  - do:
+      indices.delete:
+        index: r57_snap_src
+  - match: { acknowledged: true }
+
+  - do:
+      snapshot.restore:
+        repository: r57_snap_repo
+        snapshot: snap_base
+        body:
+          indices: "r57_snap_src"
+  - match: { accepted: true }
+
+  - do:
+      get:
+        index: r57_snap_src
+        id: "doc-1"
+  - match: { found: true }
+  - match: { _source.tag: "persisted" }
+
+  - do:
+      searchable_snapshots.mount:
+        repository: r57_snap_repo
+        snapshot: snap_base
+        storage: shared_cache
+        body:
+          index: "r57_snap_src"
+          renamed_index: "r57_mounted_src"
+  - match: { accepted: true }
+
+  - do:
+      get:
+        index: r57_mounted_src
+        id: "doc-1"
+  - match: { found: true }
+
+  - do:
+      searchable_snapshots.clear_cache:
+        index: r57_mounted_src
+  - is_true: _shards
+
+  - do:
+      slm.put_lifecycle:
+        policy_id: r57_slm_pol
+        body:
+          schedule: "0 30 1 * * ?"
+          name: "<r57-slm>"
+          repository: "r57_snap_repo"
+          config:
+            indices: ["r57_snap_src"]
+          retention:
+            max_count: 1
+            min_count: 1
+  - match: { acknowledged: true }
+
+  - do:
+      slm.execute_lifecycle:
+        policy_id: r57_slm_pol
+  - is_true: snapshot_name
+
+  - do:
+      slm.execute_lifecycle:
+        policy_id: r57_slm_pol
+  - is_true: snapshot_name
+
+  - do:
+      slm.execute_retention: {}
+  - match: { acknowledged: true }
+
+  - do:
+      slm.get_stats: {}
+  - gte: { total_snapshots_deleted: 1 }
+
+  # F6: Synonyms analyzer reload/in-use protection/query expansion & Inference streaming + task endpoints
+  - do:
+      synonyms.put_synonym:
+        id: r57_syn_set
+        body:
+          synonyms_set:
+            - id: "s1"
+              synonyms: "laptop, notebook"
+  - match: { result: "created" }
+
+  - do:
+      indices.create:
+        index: r57_syn_idx
+        body:
+          settings:
+            analysis:
+              filter:
+                my_syn:
+                  type: synonym_graph
+                  synonyms_set: "r57_syn_set"
+                  updateable: true
+              analyzer:
+                my_syn_an:
+                  tokenizer: standard
+                  filter: ["lowercase", "my_syn"]
+          mappings:
+            properties:
+              title:
+                type: text
+                search_analyzer: my_syn_an
+  - match: { acknowledged: true }
+
+  - do:
+      index:
+        index: r57_syn_idx
+        id: "1"
+        refresh: true
+        body:
+          title: "ultralight notebook"
+
+  - do:
+      catch: bad_request
+      synonyms.delete_synonym:
+        id: r57_syn_set
+
+  - do:
+      synonyms.reload_synonym:
+        id: r57_syn_set
+  - length: { reload_details: 1 }
+
+  - do:
+      indices.reload_search_analyzers:
+        index: r57_syn_idx
+  - length: { reload_details: 1 }
+
+  - do:
+      search:
+        index: r57_syn_idx
+        body:
+          query:
+            match:
+              title: "laptop"
+  - match: { hits.total.value: 1 }
+
+  - do:
+      inference.put:
+        task_type: chat_completion
+        inference_id: r57_chat_inf
+        body:
+          service: openai
+          service_settings:
+            api_key: "sk-test"
+            model: "gpt-4o"
+  - match: { inference_id: "r57_chat_inf" }
+
+  - do:
+      inference.chat_completion:
+        inference_id: r57_chat_inf
+        body:
+          messages:
+            - role: "user"
+              content: "hello"
+  - is_true: chat_completion
+
+  - do:
+      inference.stream:
+        task_type: chat_completion
+        inference_id: r57_chat_inf
+        body:
+          messages:
+            - role: "user"
+              content: "stream hi"
+  - is_true: ''
+
+  - do:
+      inference.put:
+        task_type: text_embedding
+        inference_id: r57_emb_inf
+        body:
+          service: openai
+          service_settings:
+            api_key: "sk-test"
+  - match: { inference_id: "r57_emb_inf" }
+
+  - do:
+      inference.text_embedding:
+        inference_id: r57_emb_inf
+        body:
+          input: ["hello world"]
+  - is_true: text_embedding
+
+  - do:
+      inference.put:
+        task_type: sparse_embedding
+        inference_id: r57_sparse_inf
+        body:
+          service: elser
+          service_settings: {}
+  - match: { inference_id: "r57_sparse_inf" }
+
+  - do:
+      inference.sparse_embedding:
+        inference_id: r57_sparse_inf
+        body:
+          input: ["hello world"]
+  - is_true: sparse_embedding
+
+  - do:
+      inference.put:
+        task_type: completion
+        inference_id: r57_comp_inf
+        body:
+          service: openai
+          service_settings:
+            api_key: "sk-test"
+  - match: { inference_id: "r57_comp_inf" }
+
+  - do:
+      inference.completion:
+        inference_id: r57_comp_inf
+        body:
+          input: "complete this"
+  - is_true: completion
+
+  - do:
+      inference.put:
+        task_type: rerank
+        inference_id: r57_rerank_inf
+        body:
+          service: cohere
+          service_settings:
+            api_key: "sk-test"
+  - match: { inference_id: "r57_rerank_inf" }
+
+  - do:
+      inference.rerank:
+        inference_id: r57_rerank_inf
+        body:
+          query: "fast search"
+          input: ["doc a", "doc b"]
+  - is_true: rerank
+
+  # F7: Connectors sub-routes & _claim + Search Application dictionary validation & Behavioral Analytics
+  - do:
+      connector.put:
+        connector_id: r57_conn
+        body:
+          name: "PG Connector"
+          service_type: "postgresql"
+          index_name: "search-pg-v1"
+  - is_true: ''
+
+  - do:
+      connector.update_index_name:
+        connector_id: r57_conn
+        body:
+          index_name: "search-pg-v2"
+  - is_true: ''
+
+  - do:
+      connector.update_scheduling:
+        connector_id: r57_conn
+        body:
+          scheduling:
+            full:
+              enabled: true
+              interval: "0 0 * * *"
+  - is_true: ''
+
+  - do:
+      connector.update_custom_scheduling:
+        connector_id: r57_conn
+        body:
+          custom_scheduling:
+            incremental:
+              enabled: true
+  - is_true: ''
+
+  - do:
+      connector.update_api_key_id:
+        connector_id: r57_conn
+        body:
+          api_key_id: "ak-1"
+  - is_true: ''
+
+  - do:
+      connector.update_active_filtering:
+        connector_id: r57_conn
+        filtering_validation_state: valid
+        body: {}
+  - is_true: ''
+
+  - do:
+      connector.sync_job_post:
+        body:
+          connector_id: "r57_conn"
+          job_type: "full"
+  - set: { id: r57_sync_jid }
+
+  - do:
+      connector.sync_job_claim:
+        body:
+          connector_id: "r57_conn"
+          worker_hostname: "worker-1"
+  - match: { id: $r57_sync_jid }
+  - match: { status: "in_progress" }
+  - match: { index_name: "search-pg-v2" }
+
+  - do:
+      search_application.put:
+        name: r57_sapp
+        body:
+          indices: ["r57_sql_idx"]
+          template:
+            script:
+              lang: mustache
+              source: '{"query":{"term":{"dept":"{{dept}}"}}}'
+            dictionary:
+              required: ["dept"]
+              properties:
+                dept:
+                  type: string
+                  enum: ["eng", "sales"]
+  - is_true: ''
+
+  - do:
+      catch: bad_request
+      search_application.search:
+        name: r57_sapp
+        body:
+          params:
+            dept: "marketing"
+
+  - do:
+      search_application.search:
+        name: r57_sapp
+        body:
+          params:
+            dept: "eng"
+  - match: { hits.total.value: 2 }
+
+  - do:
+      search_application.put_behavioral_analytics:
+        collection_name: r57_ba_coll
+  - match: { acknowledged: true }
+
+  - do:
+      search_application.post_behavioral_analytics_event:
+        collection_name: r57_ba_coll
+        event_type: page_view
+        body:
+          page:
+            url: "https://example.com/docs"
+  - match: { ok: true }
+
+  - do:
+      search_application.get_behavioral_analytics:
+        collection_name: r57_ba_coll
+  - is_true: r57_ba_coll
+
+  - do:
+      search_application.delete_behavioral_analytics:
+        collection_name: r57_ba_coll
+  - match: { acknowledged: true }
+
+---
+"Round 57 AST, Schema, Shredder, Transpiler, Lucene & Painless JLS Compliance":
+  # F13, F14, F15, F16, F17, F18: Schema validation, immutability, cosine zero-vector, unsigned_long, and multi-valued range arrays
+  - do:
+      catch: bad_request
+      indices.create:
+        index: r57_bad_alias_idx
+        body:
+          mappings:
+            properties:
+              real_f: { type: keyword }
+              alias_f: { type: alias, path: "real_f", store: true }
+
+  - do:
+      catch: bad_request
+      indices.create:
+        index: r57_bad_dyntpl_idx
+        body:
+          mappings:
+            dynamic_templates:
+              - bad_re:
+                  match_pattern: regex
+                  path_match: "[unclosed"
+                  mapping:
+                    type: keyword
+
+  - do:
+      indices.create:
+        index: r57_schema_idx
+        body:
+          mappings:
+            properties:
+              title: { type: text }
+              code: { type: keyword }
+              code_alias: { type: alias, path: "code" }
+              env_const: { type: constant_keyword, value: "prod" }
+              ts: { type: date, format: "strict_date_optional_time" }
+              vec: { type: dense_vector, dims: 3 }
+              u64: { type: unsigned_long }
+              int_ranges: { type: integer_range }
+              flt_ranges: { type: float_range }
+  - match: { acknowledged: true }
+
+  # F14: PUT _mapping immutability rejections
+  - do:
+      catch: bad_request
+      indices.put_mapping:
+        index: r57_schema_idx
+        body:
+          properties:
+            env_const: { type: constant_keyword, value: "staging" }
+
+  - do:
+      catch: bad_request
+      indices.put_mapping:
+        index: r57_schema_idx
+        body:
+          properties:
+            code: { type: keyword, store: true }
+
+  - do:
+      catch: bad_request
+      indices.put_mapping:
+        index: r57_schema_idx
+        body:
+          properties:
+            ts: { type: date, format: "epoch_millis" }
+
+  - do:
+      catch: bad_request
+      indices.put_mapping:
+        index: r57_schema_idx
+        body:
+          properties:
+            vec: { type: dense_vector, dims: 3, similarity: "dot_product" }
+
+  # F13: Read-only write rejection on alias field
+  - do:
+      catch: bad_request
+      index:
+        index: r57_schema_idx
+        id: "bad-alias-write"
+        body:
+          code_alias: "forbidden"
+
+  # F16: cosine zero-magnitude vector rejected on ingest & kNN search + k > 10000 rejected
+  - do:
+      catch: bad_request
+      index:
+        index: r57_schema_idx
+        id: "bad-zero-vec"
+        body:
+          vec: [0.0, 0.0, 0.0]
+
+  - do:
+      bulk:
+        index: r57_schema_idx
+        refresh: true
+        body:
+          - index: { _id: "1" }
+          - title: "to"
+            code: "A"
+            ts: "2026-01-01T00:00:00Z"
+            vec: [1.0, 0.0, 0.0]
+            u64: 9223372036854775807
+            int_ranges: [{ gte: 1, lte: 5 }, { gte: 20, lte: 30 }]
+            flt_ranges: { gt: 10.0, lt: 20.0 }
+          - index: { _id: "2" }
+          - title: "quick"
+            code: "B"
+            ts: "2026-01-02T00:00:00Z"
+            vec: [0.0, 1.0, 0.0]
+            u64: 18446744073709551615
+            int_ranges: [{ gte: 10, lte: 15 }]
+  - match: { errors: false }
+
+  - do:
+      catch: bad_request
+      search:
+        index: r57_schema_idx
+        body:
+          knn:
+            field: "vec"
+            query_vector: [0.0, 0.0, 0.0]
+            k: 1
+            num_candidates: 5
+
+  - do:
+      catch: bad_request
+      search:
+        index: r57_schema_idx
+        body:
+          knn:
+            field: "vec"
+            query_vector: [1.0, 0.0, 0.0]
+            k: 10001
+            num_candidates: 10001
+
+  # F10: fixed_interval calendar unit & composite duplicate source rejected
+  - do:
+      catch: bad_request
+      search:
+        index: r57_schema_idx
+        body:
+          size: 0
+          aggs:
+            by_month:
+              date_histogram:
+                field: "ts"
+                fixed_interval: "1M"
+
+  - do:
+      catch: bad_request
+      search:
+        index: r57_schema_idx
+        body:
+          size: 0
+          aggs:
+            dup_comp:
+              composite:
+                sources:
+                  - k1: { terms: { field: "code" } }
+                  - k1: { terms: { field: "code" } }
+
+  # F11: PinnedQuery _index filtering & RuleQuerySpec missing organic rejected
+  - do:
+      search:
+        index: r57_schema_idx
+        body:
+          query:
+            pinned:
+              docs:
+                - { _index: "other_unrelated_idx", _id: "2" }
+                - { _index: "r57_schema_idx", _id: "1" }
+              organic:
+                term: { code: "B" }
+  - match: { hits.hits.0._id: "1" }
+
+  - do:
+      catch: bad_request
+      search:
+        index: r57_schema_idx
+        body:
+          query:
+            rule_query:
+              ruleset_id: "rs1"
+              match_criteria: { q: "test" }
+
+  # F12: Malformed AUTO:6,3 rejected & 2-char "go" with AUTO has 0 edits (does not match "to")
+  - do:
+      catch: bad_request
+      search:
+        index: r57_schema_idx
+        body:
+          query:
+            match:
+              title:
+                query: "quick"
+                fuzziness: "AUTO:6,3"
+
+  - do:
+      search:
+        index: r57_schema_idx
+        body:
+          query:
+            match:
+              title:
+                query: "go"
+                fuzziness: "AUTO"
+  - match: { hits.total.value: 0 }
+
+  # F17: unsigned_long exact precision above MaxInt64
+  - do:
+      search:
+        index: r57_schema_idx
+        body:
+          query:
+            term:
+              u64: 9223372036854775807
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+
+  - do:
+      search:
+        index: r57_schema_idx
+        body:
+          sort:
+            - u64: { order: "desc" }
+          aggs:
+            u_terms:
+              terms:
+                field: "u64"
+  - match: { hits.hits.0._id: "2" }
+  - length: { aggregations.u_terms.buckets: 2 }
+
+  # F18: Multi-valued integer_range per-element correlation & float_range CONTAINS exclusive gt/lt
+  - do:
+      search:
+        index: r57_schema_idx
+        body:
+          query:
+            range:
+              int_ranges:
+                gte: 22
+                lte: 25
+                relation: "intersects"
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+
+  - do:
+      search:
+        index: r57_schema_idx
+        body:
+          query:
+            range:
+              int_ranges:
+                gte: 6
+                lte: 9
+                relation: "intersects"
+  - match: { hits.total.value: 0 }
+
+  - do:
+      search:
+        index: r57_schema_idx
+        body:
+          query:
+            range:
+              flt_ranges:
+                gt: 10.0
+                lt: 20.0
+                relation: "contains"
+  - match: { hits.total.value: 1 }
+
+  # F19: query_string ~AUTO:3,6 fuzzy suffix & malformed range bracket rejection
+  - do:
+      search:
+        index: r57_schema_idx
+        body:
+          query:
+            query_string:
+              query: "title:quikc~AUTO:3,6"
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "2" }
+
+  - do:
+      catch: bad_request
+      search:
+        index: r57_schema_idx
+        body:
+          query:
+            query_string:
+              query: "u64:[10 TO]"
+
+  # F20-F26: Painless JLS shifts, narrowing/overflow, Math.*Exact, BigDecimal.divide/equals, String.split regex, exception hierarchy & typed Map.computeIfAbsent
+  - do:
+      scripts_painless_execute:
+        body:
+          script:
+            source: |
+              int shInt = 1 << 32;
+              long shLong = 1L << 32;
+              byte satByte = (byte) 5e9;
+              int ovf = 2147483647;
+              ovf++;
+              boolean exactCaught = false;
+              try {
+                Math.addExact(2147483647, 1);
+              } catch (ArithmeticException e) {
+                exactCaught = true;
+              }
+              BigDecimal q = new BigDecimal("1").divide(new BigDecimal("8"));
+              boolean bdScaleStrict = !new BigDecimal("1.0").equals(new BigDecimal("1.00"));
+              int splitEsc = "a.b.c".split("\\.").length;
+              int splitMeta = "a.b".split(".").length;
+              boolean hierCaught = false;
+              try {
+                Integer.parseInt("not_num");
+              } catch (IllegalArgumentException e) {
+                hierCaught = true;
+              }
+              Map m = new HashMap();
+              def compVal = m.computeIfAbsent(5, k -> k + 1);
+              return shInt + "|" + shLong + "|" + satByte + "|" + ovf + "|" + exactCaught + "|" + q.toString() + "|" + bdScaleStrict + "|" + splitEsc + "|" + splitMeta + "|" + hierCaught + "|" + compVal;
+  - match: { result: "1|4294967296|-1|-2147483648|true|0.125|true|3|0|true|6" }
+
+

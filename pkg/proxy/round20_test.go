@@ -909,7 +909,7 @@ func TestRound20_PainlessListMapOperatorsEntrySetAndIngestRenameSplitKvParity(t 
 					"preserve_trailing": true,
 				},
 			},
-			// 2. kv with strip_brackets, trim_key, trim_value, include_keys, exclude_keys, prefix, target_field
+			// 2. kv with strip_brackets, trim_key, trim_value, include_keys / exclude_keys, prefix, target_field
 			map[string]any{
 				"kv": map[string]any{
 					"field":          "kv_str",
@@ -918,10 +918,22 @@ func TestRound20_PainlessListMapOperatorsEntrySetAndIngestRenameSplitKvParity(t 
 					"strip_brackets": true,
 					"trim_key":       " ",
 					"trim_value":     "\"'",
-					"include_keys":   []any{"host", "env", "secret"},
-					"exclude_keys":   []any{"secret"},
+					"include_keys":   []any{"host", "env"},
 					"prefix":         "meta_",
 					"target_field":   "parsed",
+				},
+			},
+			map[string]any{
+				"kv": map[string]any{
+					"field":          "kv_str",
+					"field_split":    " ",
+					"value_split":    "=",
+					"strip_brackets": true,
+					"trim_key":       " ",
+					"trim_value":     "\"'",
+					"exclude_keys":   []any{"secret", "ignored"},
+					"prefix":         "meta_",
+					"target_field":   "parsed_excl",
 				},
 			},
 			// 3. rename with override: false (should NOT overwrite existing keep_me)
@@ -993,7 +1005,14 @@ func TestRound20_PainlessListMapOperatorsEntrySetAndIngestRenameSplitKvParity(t 
 		t.Fatalf("expected meta_host=web01 and meta_env=prod in parsed kv, got %v", parsed)
 	}
 	if _, hasSecret := parsed["meta_secret"]; hasSecret {
-		t.Fatalf("expected excluded key 'secret' to be omitted, got %v", parsed)
+		t.Fatalf("expected non-included key 'secret' to be omitted, got %v", parsed)
+	}
+	parsedExcl := doc["parsed_excl"].(map[string]any)
+	if parsedExcl["meta_host"] != "web01" || parsedExcl["meta_env"] != "prod" {
+		t.Fatalf("expected meta_host=web01 and meta_env=prod in parsed_excl kv, got %v", parsedExcl)
+	}
+	if _, hasSecret := parsedExcl["meta_secret"]; hasSecret {
+		t.Fatalf("expected excluded key 'secret' to be omitted, got %v", parsedExcl)
 	}
 
 	// Verify rename override: false preserved keep_me="orig_val" and left candidate_val intact

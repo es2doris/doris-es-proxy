@@ -2929,3 +2929,219 @@ func TestRound56SchemaAndShredderF12ToF16(t *testing.T) {
 		t.Fatalf("F16 expected canonicalized IPv6 '2001:db8::1', got %v", verIPRow["f__client_ip"])
 	}
 }
+
+func TestRound57SchemaAndShredderValidation(t *testing.T) {
+	// F13: alias mapping rejects any parameter other than type and path
+	badAliasMappings := []string{
+		`{"properties":{"real":{"type":"keyword"},"al":{"type":"alias","path":"real","index":true}}}`,
+		`{"properties":{"real":{"type":"keyword"},"al":{"type":"alias","path":"real","doc_values":false}}}`,
+		`{"properties":{"real":{"type":"keyword"},"al":{"type":"alias","path":"real","store":true}}}`,
+		`{"properties":{"real":{"type":"text"},"al":{"type":"alias","path":"real","analyzer":"standard"}}}`,
+		`{"properties":{"real":{"type":"keyword"},"al":{"type":"alias","path":"real","normalizer":"lowercase"}}}`,
+		`{"properties":{"real":{"type":"date"},"al":{"type":"alias","path":"real","format":"epoch_millis"}}}`,
+		`{"properties":{"real":{"type":"keyword"},"al":{"type":"alias","path":"real","ignore_above":256}}}`,
+		`{"properties":{"real":{"type":"long"},"al":{"type":"alias","path":"real","coerce":false}}}`,
+		`{"properties":{"real":{"type":"text"},"al":{"type":"alias","path":"real","boost":2.0}}}`,
+		`{"properties":{"real":{"type":"text"},"al":{"type":"alias","path":"real","norms":false}}}`,
+		`{"properties":{"real":{"type":"text"},"al":{"type":"alias","path":"real","index_options":"freqs"}}}`,
+		`{"properties":{"real":{"type":"keyword"},"al":{"type":"alias","path":"real","eager_global_ordinals":true}}}`,
+		`{"properties":{"real":{"type":"text"},"al":{"type":"alias","path":"real","fielddata":true}}}`,
+		`{"properties":{"real":{"type":"keyword"},"al":{"type":"alias","path":"real","meta":{"unit":"ms"}}}}`,
+		`{"properties":{"real":{"type":"keyword"},"al":{"type":"alias","path":"real","copy_to":"other"}}}`,
+	}
+	for _, raw := range badAliasMappings {
+		var spec esast.MappingSpec
+		if err := json.Unmarshal([]byte(raw), &spec); err != nil {
+			t.Fatalf("F13 unmarshal %s failed: %v", raw, err)
+		}
+		err := ValidateMappingSpec(&spec)
+		if err == nil || !strings.Contains(err.Error(), "mapper_parsing_exception: Mapping definition for [al] has unsupported parameters") {
+			t.Fatalf("F13 expected unsupported parameters error for %s, got %v", raw, err)
+		}
+	}
+
+	// F13: ShredDocument rejects writes to top-level, nested, array-of-maps, null, and dotted alias paths
+	var aliasSpec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"real_name": {"type": "keyword"},
+			"name_alias": {"type": "alias", "path": "real_name"},
+			"obj": {
+				"properties": {
+					"sub": {
+						"properties": {
+							"leaf": {"type": "keyword"},
+							"leaf_alias": {"type": "alias", "path": "obj.sub.leaf"}
+						}
+					}
+				}
+			}
+		}
+	}`), &aliasSpec); err != nil {
+		t.Fatalf("F13 unmarshal valid alias failed: %v", err)
+	}
+	if err := ValidateMappingSpec(&aliasSpec); err != nil {
+		t.Fatalf("F13 ValidateMappingSpec valid alias failed: %v", err)
+	}
+	aliasSchema := CompileIndexSchema("es_db", "r57_alias_idx", &aliasSpec)
+	if _, err := ShredDocument(aliasSchema, "ok1", 1, false, []byte(`{"real_name":"alice","obj":{"sub":{"leaf":"v"}}}`)); err != nil {
+		t.Fatalf("F13 expected write to real target fields to succeed, got %v", err)
+	}
+	if _, err := ShredDocument(aliasSchema, "ok2", 1, false, []byte(`{"real_name":"bob","obj":[{"sub":{"leaf":"v"}},{"other":"x"}]}`)); err != nil {
+		t.Fatalf("F13 expected write to array of real target objects to succeed, got %v", err)
+	}
+	badAliasDocs := []struct {
+		doc       string
+		wantAlias string
+	}{
+		{`{"name_alias":"alice"}`, "name_alias"},
+		{`{"name_alias":null}`, "name_alias"},
+		{`{"obj":{"sub":{"leaf_alias":"v"}}}`, "obj.sub.leaf_alias"},
+		{`{"obj":[{"sub":{"leaf_alias":"v"}}]}`, "obj.sub.leaf_alias"},
+		{`{"obj.sub.leaf_alias":"v"}`, "obj.sub.leaf_alias"},
+		{`{"obj.sub":{"leaf_alias":"v"}}`, "obj.sub.leaf_alias"},
+	}
+	for _, tc := range badAliasDocs {
+		_, err := ShredDocument(aliasSchema, "bad1", 1, false, []byte(tc.doc))
+		if err == nil || !strings.Contains(err.Error(), "mapper_parsing_exception: Cannot write to a field alias ["+tc.wantAlias+"]") {
+			t.Fatalf("F13 expected alias write rejection for %s on %s, got %v", tc.wantAlias, tc.doc, err)
+		}
+	}
+
+	// F14: PUT _mapping immutability for constant_keyword.value, store, format, and default dense_vector.similarity
+	var baseSpec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"env": {"type": "constant_keyword", "value": "prod"},
+			"title": {"type": "keyword"},
+			"stored_kw": {"type": "keyword", "store": true},
+			"created_at": {"type": "date"},
+			"nano_ts": {"type": "date_nanos"},
+			"win": {"type": "date_range"},
+			"emb": {"type": "dense_vector", "dims": 3}
+		}
+	}`), &baseSpec); err != nil {
+		t.Fatalf("F14 unmarshal base mapping failed: %v", err)
+	}
+
+	incompatibleUpdates := []struct {
+		raw     string
+		wantSub string
+	}{
+		{`{"properties":{"env":{"type":"constant_keyword","value":"staging"}}}`, "Cannot update parameter [value]"},
+		{`{"properties":{"title":{"type":"keyword","store":true}}}`, "Cannot update parameter [store]"},
+		{`{"properties":{"stored_kw":{"type":"keyword","store":false}}}`, "Cannot update parameter [store]"},
+		{`{"properties":{"created_at":{"type":"date","format":"yyyy-MM-dd"}}}`, "Cannot update parameter [format]"},
+		{`{"properties":{"nano_ts":{"type":"date_nanos","format":"epoch_millis"}}}`, "Cannot update parameter [format]"},
+		{`{"properties":{"win":{"type":"date_range","format":"yyyy-MM-dd"}}}`, "Cannot update parameter [format]"},
+		{`{"properties":{"emb":{"type":"dense_vector","dims":3,"similarity":"dot_product"}}}`, "Cannot update parameter [similarity]"},
+	}
+	for _, tc := range incompatibleUpdates {
+		var upd esast.MappingSpec
+		if err := json.Unmarshal([]byte(tc.raw), &upd); err != nil {
+			t.Fatalf("F14 unmarshal update %s failed: %v", tc.raw, err)
+		}
+		err := validatePropertiesCompatibility(baseSpec.Properties, upd.Properties, "")
+		if err == nil || !strings.Contains(err.Error(), tc.wantSub) {
+			t.Fatalf("F14 expected %q for %s, got %v", tc.wantSub, tc.raw, err)
+		}
+	}
+
+	// Idempotent updates with explicit defaults must succeed, and DeepMergeMappingProperties preserves Store
+	var idemUpd esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"env": {"type": "constant_keyword", "value": "prod"},
+			"title": {"type": "keyword", "store": false},
+			"stored_kw": {"type": "keyword", "store": true},
+			"created_at": {"type": "date", "format": "strict_date_optional_time||epoch_millis"},
+			"nano_ts": {"type": "date_nanos", "format": "strict_date_optional_time_nanos||epoch_millis"},
+			"win": {"type": "date_range", "format": "strict_date_optional_time||epoch_millis"},
+			"emb": {"type": "dense_vector", "dims": 3, "similarity": "cosine"},
+			"new_stored": {"type": "keyword", "store": true}
+		}
+	}`), &idemUpd); err != nil {
+		t.Fatalf("F14 unmarshal idempotent update failed: %v", err)
+	}
+	if err := validatePropertiesCompatibility(baseSpec.Properties, idemUpd.Properties, ""); err != nil {
+		t.Fatalf("F14 expected idempotent mapping update to succeed, got %v", err)
+	}
+	mergedProps := DeepMergeMappingProperties(baseSpec.Properties, idemUpd.Properties)
+	if mergedProps["new_stored"].Store == nil || !*mergedProps["new_stored"].Store {
+		t.Fatalf("F14 expected DeepMergeMappingProperties to copy Store=true, got %+v", mergedProps["new_stored"].Store)
+	}
+
+	// F15: dynamic_templates validation
+	badDynTemplates := []string{
+		`{"dynamic_templates":[{"t1":{"match":123,"mapping":{"type":"keyword"}}}]}`,
+		`{"dynamic_templates":[{"t1":{"unmatch":["a"],"mapping":{"type":"keyword"}}}]}`,
+		`{"dynamic_templates":[{"t1":{"path_match":true,"mapping":{"type":"keyword"}}}]}`,
+		`{"dynamic_templates":[{"t1":{"path_unmatch":{},"mapping":{"type":"keyword"}}}]}`,
+		`{"dynamic_templates":[{"t1":{"match_pattern":"regex","path_match":"[unclosed","mapping":{"type":"keyword"}}}]}`,
+		`{"dynamic_templates":[{"t1":{"match_pattern":"regex","path_unmatch":"(unclosed","mapping":{"type":"keyword"}}}]}`,
+		`{"dynamic_templates":[{"t1":{"match":"*","mapping":{"type":"keyword","unknown_field":true}}}]}`,
+		`{"dynamic_templates":[{"t1":{"match_mapping_type":"double","mapping":{"type":"{dynamic_type}","scaling_factor":-5}}}]}`,
+		`{"dynamic_templates":[{"t1":{"match_mapping_type":"string","mapping":{"type":"{dynamic_type}","ignore_above":-1}}}]}`,
+		`{"dynamic_templates":[{"t1":{"match_mapping_type":"long","mapping":{"type":"{dynamic_type}","null_value":"not_a_long"}}}]}`,
+		`{"dynamic_templates":[{"t1":{"match_mapping_type":"long","mapping":{"type":"{dynamic_type}","scaling_factor":10}}}]}`,
+		`{"dynamic_templates":[{"t1":{"match_mapping_type":"object","mapping":{"type":"{dynamic_type}","copy_to":"other"}}}]}`,
+		`{"dynamic_templates":[{"t1":{"match_mapping_type":"string","mapping":{"doc_values":true}}}]}`,
+	}
+	for _, raw := range badDynTemplates {
+		var spec esast.MappingSpec
+		if err := json.Unmarshal([]byte(raw), &spec); err != nil {
+			t.Fatalf("F15 unmarshal %s failed: %v", raw, err)
+		}
+		err := ValidateMappingSpec(&spec)
+		if err == nil || !strings.Contains(err.Error(), "mapper_parsing_exception") {
+			t.Fatalf("F15 expected mapper_parsing_exception for %s, got %v", raw, err)
+		}
+	}
+
+	var okDTSpec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{"dynamic_templates":[
+		{"r1":{"match_pattern":"regex","path_match":"^metrics\\..*","path_unmatch":"^metrics\\.raw$","match_mapping_type":"double","mapping":{"type":"{dynamic_type}"}}},
+		{"r2":{"match_mapping_type":"object","mapping":{"enabled":true}}},
+		{"r3":{"match_mapping_type":"*","mapping":{"doc_values":true}}},
+		{"r4":{"match_mapping_type":"boolean","mapping":{"type":"{dynamic_type}"}}},
+		{"r5":{"match_mapping_type":"date","mapping":{"type":"{dynamic_type}"}}}
+	]}`), &okDTSpec); err != nil {
+		t.Fatalf("F15 unmarshal valid dynamic_templates failed: %v", err)
+	}
+	if err := ValidateMappingSpec(&okDTSpec); err != nil {
+		t.Fatalf("F15 expected valid dynamic_templates to succeed, got %v", err)
+	}
+
+	// F16: cosine zero-magnitude vector rejection on ingest (respecting ignore_malformed and non-cosine metrics)
+	var vecSpec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"cos_vec": {"type": "dense_vector", "dims": 3},
+			"cos_lenient": {"type": "dense_vector", "dims": 3, "ignore_malformed": true},
+			"l2_vec": {"type": "dense_vector", "dims": 3, "similarity": "l2_norm"},
+			"dot_vec": {"type": "dense_vector", "dims": 3, "similarity": "dot_product"}
+		}
+	}`), &vecSpec); err != nil {
+		t.Fatalf("F16 unmarshal vecSpec failed: %v", err)
+	}
+	vecSchema := CompileIndexSchema("es_db", "r57_vec_idx", &vecSpec)
+	if _, err := ShredDocument(vecSchema, "z1", 1, false, []byte(`{"cos_vec":[0,0,0]}`)); err == nil || !strings.Contains(err.Error(), "Zero-magnitude vectors are not supported when using [cosine] similarity") {
+		t.Fatalf("F16 expected zero-magnitude cosine vector rejection, got %v", err)
+	}
+	okVecBytes, err := ShredDocument(vecSchema, "z2", 1, false, []byte(`{
+		"cos_vec": [0, 1, 0],
+		"cos_lenient": [0, 0, 0],
+		"l2_vec": [0, 0, 0],
+		"dot_vec": [2.0, 3.0, 4.0]
+	}`))
+	if err != nil {
+		t.Fatalf("F16 expected lenient cosine + l2 zero + non-unit dot_product to succeed, got %v", err)
+	}
+	var okVecRow map[string]any
+	if err := json.Unmarshal(okVecBytes, &okVecRow); err != nil {
+		t.Fatalf("F16 unmarshal row failed: %v", err)
+	}
+	if _, exists := okVecRow["v__cos_lenient"]; exists && okVecRow["v__cos_lenient"] != nil {
+		t.Fatalf("F16 expected cos_lenient zero vector to be skipped when ignore_malformed=true, got %v", okVecRow["v__cos_lenient"])
+	}
+}

@@ -335,11 +335,17 @@ func (r *RetrieverSpec) UnmarshalJSON(data []byte) error {
 				if *rawKNN.K <= 0 {
 					return fmt.Errorf("illegal_argument_exception: [knn] retriever [k] must be > 0")
 				}
+				if *rawKNN.K > 10000 {
+					return fmt.Errorf("illegal_argument_exception: [k] cannot be greater than [10000]")
+				}
 				knn.K = *rawKNN.K
 			} else {
 				knn.K = 10
 			}
 			if rawKNN.NumCandidates != nil {
+				if *rawKNN.NumCandidates > 10000 {
+					return fmt.Errorf("illegal_argument_exception: [num_candidates] cannot be greater than [10000]")
+				}
 				if *rawKNN.NumCandidates <= 0 || *rawKNN.NumCandidates < knn.K {
 					return fmt.Errorf("illegal_argument_exception: [knn] retriever [num_candidates] must be >= [k]")
 				}
@@ -695,6 +701,15 @@ func (r *SearchRequest) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*r = SearchRequest(raw.plain)
+	if rawSA, hasSA := rawMap["search_after"]; hasSA {
+		saTrim := bytes.TrimSpace(rawSA)
+		if len(saTrim) > 0 && !bytes.Equal(saTrim, []byte("null")) {
+			var saVals []any
+			if err := unmarshalPreservingLargeInts(saTrim, &saVals); err == nil {
+				r.SearchAfter = normalizeDecodedNumbersPreservingLargeInts(saVals).([]any)
+			}
+		}
+	}
 	if rawSub, hasSub := rawMap["sub_searches"]; hasSub {
 		subTrim := bytes.TrimSpace(rawSub)
 		if !bytes.Equal(subTrim, []byte("null")) && len(r.SubSearches) == 0 {
@@ -1523,10 +1538,18 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 		if len(kq.QueryVector) == 0 {
 			return fmt.Errorf("parsing_exception: [knn] requires non-empty [query_vector]")
 		}
-		if hasK && kq.K <= 0 {
-			return fmt.Errorf("parsing_exception: [knn] [k] must be greater than 0")
+		if hasK {
+			if kq.K <= 0 {
+				return fmt.Errorf("parsing_exception: [knn] [k] must be greater than 0")
+			}
+			if kq.K > 10000 {
+				return fmt.Errorf("illegal_argument_exception: [k] cannot be greater than [10000]")
+			}
 		}
 		if hasNC {
+			if kq.NumCandidates > 10000 {
+				return fmt.Errorf("illegal_argument_exception: [num_candidates] cannot be greater than [10000]")
+			}
 			if kq.NumCandidates <= 0 || (kq.K > 0 && kq.NumCandidates < kq.K) {
 				return fmt.Errorf("parsing_exception: [knn] [num_candidates] must be >= [k] and > 0")
 			}
@@ -1589,10 +1612,18 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 			kq.Boost = mapBoost
 		}
 		kq.Filter = spec.Filter
-		if _, okK := specMap["k"]; okK && kq.K <= 0 {
-			return fmt.Errorf("parsing_exception: [knn] [k] must be greater than 0")
+		if _, okK := specMap["k"]; okK {
+			if kq.K <= 0 {
+				return fmt.Errorf("parsing_exception: [knn] [k] must be greater than 0")
+			}
+			if kq.K > 10000 {
+				return fmt.Errorf("illegal_argument_exception: [k] cannot be greater than [10000]")
+			}
 		}
 		if _, okNC := specMap["num_candidates"]; okNC {
+			if kq.NumCandidates > 10000 {
+				return fmt.Errorf("illegal_argument_exception: [num_candidates] cannot be greater than [10000]")
+			}
 			if kq.NumCandidates <= 0 || (kq.K > 0 && kq.NumCandidates < kq.K) {
 				return fmt.Errorf("parsing_exception: [knn] [num_candidates] must be >= [k] and > 0")
 			}
@@ -2125,6 +2156,73 @@ func parseFlexibleStringSlice(v any) ([]string, error) {
 	}
 }
 
+func formatExactFloatInt(fv float64) (string, bool) {
+	if math.IsNaN(fv) || math.IsInf(fv, 0) || fv != math.Trunc(fv) {
+		return "", false
+	}
+	if fv >= -9223372036854775808.0 && fv < 9223372036854775808.0 {
+		return strconv.FormatInt(int64(fv), 10), true
+	}
+	if fv >= 9223372036854775808.0 && fv < 18446744073709551616.0 {
+		return strconv.FormatUint(uint64(fv), 10), true
+	}
+	return "", false
+}
+
+func normalizeDecodedNumbersPreservingLargeInts(v any) any {
+	switch tv := v.(type) {
+	case json.Number:
+		s := tv.String()
+		if strings.ContainsAny(s, ".eE") {
+			if f, err := tv.Float64(); err == nil {
+				return f
+			}
+			return tv
+		}
+		if iv, err := tv.Int64(); err == nil {
+			if iv >= -9007199254740992 && iv <= 9007199254740992 {
+				return float64(iv)
+			}
+			return tv
+		}
+		if _, err := strconv.ParseUint(s, 10, 64); err == nil {
+			return tv
+		}
+		if f, err := tv.Float64(); err == nil {
+			return f
+		}
+		return tv
+	case []any:
+		for i, el := range tv {
+			tv[i] = normalizeDecodedNumbersPreservingLargeInts(el)
+		}
+		return tv
+	case map[string]any:
+		for k, el := range tv {
+			tv[k] = normalizeDecodedNumbersPreservingLargeInts(el)
+		}
+		return tv
+	default:
+		return v
+	}
+}
+
+func unmarshalPreservingLargeInts(data []byte, dst any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("parsing_exception: unexpected trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
 func formatFlexibleScalarString(v any) string {
 	if v == nil {
 		return ""
@@ -2132,8 +2230,13 @@ func formatFlexibleScalarString(v any) string {
 	if s, ok := v.(string); ok {
 		return s
 	}
-	if fv, ok := v.(float64); ok && fv == math.Trunc(fv) && !math.IsInf(fv, 0) && !math.IsNaN(fv) {
-		return strconv.FormatInt(int64(fv), 10)
+	if nv, ok := v.(json.Number); ok {
+		return nv.String()
+	}
+	if fv, ok := v.(float64); ok {
+		if s, okInt := formatExactFloatInt(fv); okInt {
+			return s
+		}
 	}
 	return fmt.Sprintf("%v", v)
 }
@@ -2392,6 +2495,11 @@ func (rq *RuleQuerySpec) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: [rule] unknown field [%s]", k)
 		}
 	}
+	_, hasSingle := rawMap["ruleset_id"]
+	_, hasMulti := rawMap["ruleset_ids"]
+	if hasSingle && hasMulti {
+		return fmt.Errorf("parsing_exception: [rule] cannot specify both [ruleset_id] and [ruleset_ids]")
+	}
 	type plain RuleQuerySpec
 	var raw struct {
 		plain
@@ -2400,18 +2508,23 @@ func (rq *RuleQuerySpec) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
-	hasRuleset := strings.TrimSpace(raw.RulesetID) != ""
-	for _, id := range raw.RulesetIDs {
-		if strings.TrimSpace(id) != "" {
-			hasRuleset = true
-			break
+	if hasMulti {
+		if len(raw.RulesetIDs) == 0 {
+			return fmt.Errorf("parsing_exception: [rule] [ruleset_ids] must not be empty")
 		}
-	}
-	if !hasRuleset {
+		for _, id := range raw.RulesetIDs {
+			if strings.TrimSpace(id) == "" {
+				return fmt.Errorf("parsing_exception: [rule] [ruleset_ids] cannot contain empty or blank strings")
+			}
+		}
+	} else if strings.TrimSpace(raw.RulesetID) == "" {
 		return fmt.Errorf("parsing_exception: [rule] requires [ruleset_ids] or [ruleset_id]")
 	}
 	if len(raw.MatchCriteria) == 0 {
 		return fmt.Errorf("parsing_exception: [rule] requires non-empty [match_criteria]")
+	}
+	if raw.Organic == nil {
+		return fmt.Errorf("parsing_exception: [rule] requires [organic] query")
 	}
 	*rq = RuleQuerySpec(raw.plain)
 	if len(raw.Boost) > 0 {
@@ -4118,6 +4231,9 @@ func (d *PinnedDoc) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
+	if strings.TrimSpace(raw.Index) == "" {
+		return fmt.Errorf("parsing_exception: [pinned.docs] [_index] must not be null or empty")
+	}
 	if raw.ID == nil {
 		return fmt.Errorf("parsing_exception: [pinned.docs] [_id] must not be null or empty")
 	}
@@ -4132,7 +4248,7 @@ func (d *PinnedDoc) UnmarshalJSON(data []byte) error {
 	if d.ID == "" {
 		return fmt.Errorf("parsing_exception: [pinned.docs] [_id] must not be empty")
 	}
-	d.Index = raw.Index
+	d.Index = strings.TrimSpace(raw.Index)
 	d.Type = raw.Type
 	return nil
 }
@@ -6296,10 +6412,10 @@ func (tq *TermsQuery) UnmarshalJSON(data []byte) error {
 		}
 		if len(trimmed) > 0 && trimmed[0] == '[' {
 			var arr []any
-			if err := json.Unmarshal(trimmed, &arr); err != nil {
+			if err := unmarshalPreservingLargeInts(trimmed, &arr); err != nil {
 				return fmt.Errorf("parsing_exception: [terms] invalid terms array for [%s]: %w", k, err)
 			}
-			tq.Fields[k] = arr
+			tq.Fields[k] = normalizeDecodedNumbersPreservingLargeInts(arr).([]any)
 			continue
 		}
 		if len(trimmed) > 0 && trimmed[0] == '{' {
@@ -6352,17 +6468,17 @@ func (tse *TermsSetEntry) UnmarshalJSON(data []byte) error {
 		MinimumShouldMatchScript any             `json:"minimum_should_match_script"`
 		Boost                    json.RawMessage `json:"boost"`
 	}
-	if err := json.Unmarshal(trimmed, &full); err != nil {
+	if err := unmarshalPreservingLargeInts(trimmed, &full); err != nil {
 		return err
 	}
 	if len(full.Terms) == 0 {
 		return fmt.Errorf("parsing_exception: [terms_set] requires a non-empty [terms] array")
 	}
-	tse.Terms = full.Terms
+	tse.Terms = normalizeDecodedNumbersPreservingLargeInts(full.Terms).([]any)
 	tse.MinimumShouldMatchField = full.MinimumShouldMatchField
-	tse.MinimumShouldMatchScript = full.MinimumShouldMatchScript
+	tse.MinimumShouldMatchScript = normalizeDecodedNumbersPreservingLargeInts(full.MinimumShouldMatchScript)
 	if tse.MinimumShouldMatchScript == nil && full.MinimumShouldMatch != nil {
-		tse.MinimumShouldMatchScript = full.MinimumShouldMatch
+		tse.MinimumShouldMatchScript = normalizeDecodedNumbersPreservingLargeInts(full.MinimumShouldMatch)
 	}
 	hasMSMField := strings.TrimSpace(tse.MinimumShouldMatchField) != ""
 	hasMSMScript := tse.MinimumShouldMatchScript != nil
@@ -6855,9 +6971,11 @@ func (t *TermEntry) UnmarshalJSON(data []byte) error {
 			Boost           json.RawMessage `json:"boost"`
 			CaseInsensitive any             `json:"case_insensitive"`
 		}
-		if err := json.Unmarshal(trimmed, &full); err != nil {
+		if err := unmarshalPreservingLargeInts(trimmed, &full); err != nil {
 			return err
 		}
+		full.Value = normalizeDecodedNumbersPreservingLargeInts(full.Value)
+		full.CaseInsensitive = normalizeDecodedNumbersPreservingLargeInts(full.CaseInsensitive)
 		if isNonScalarOrNullValue(full.Value) {
 			return fmt.Errorf("parsing_exception: [term] query does not support non-scalar or null value")
 		}
@@ -6879,9 +6997,10 @@ func (t *TermEntry) UnmarshalJSON(data []byte) error {
 		t.CaseInsensitive = ci
 		return nil
 	}
-	if err := json.Unmarshal(trimmed, &t.Value); err != nil {
+	if err := unmarshalPreservingLargeInts(trimmed, &t.Value); err != nil {
 		return err
 	}
+	t.Value = normalizeDecodedNumbersPreservingLargeInts(t.Value)
 	if isNonScalarOrNullValue(t.Value) {
 		return fmt.Errorf("parsing_exception: [term] query does not support non-scalar or null value")
 	}
@@ -7045,7 +7164,7 @@ func (rc *RangeCond) UnmarshalJSON(data []byte) error {
 		TimeZone     string          `json:"time_zone"`
 		Relation     string          `json:"relation"`
 	}
-	if err := json.Unmarshal(trimmed, &full); err != nil {
+	if err := unmarshalPreservingLargeInts(trimmed, &full); err != nil {
 		return err
 	}
 	if strings.TrimSpace(full.Relation) != "" {
@@ -7057,12 +7176,12 @@ func (rc *RangeCond) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: [range] relation [%s] is not supported; must be INTERSECTS, CONTAINS, or WITHIN", full.Relation)
 		}
 	}
-	rc.GT = full.GT
-	rc.GTE = full.GTE
-	rc.LT = full.LT
-	rc.LTE = full.LTE
-	rc.From = full.From
-	rc.To = full.To
+	rc.GT = normalizeDecodedNumbersPreservingLargeInts(full.GT)
+	rc.GTE = normalizeDecodedNumbersPreservingLargeInts(full.GTE)
+	rc.LT = normalizeDecodedNumbersPreservingLargeInts(full.LT)
+	rc.LTE = normalizeDecodedNumbersPreservingLargeInts(full.LTE)
+	rc.From = normalizeDecodedNumbersPreservingLargeInts(full.From)
+	rc.To = normalizeDecodedNumbersPreservingLargeInts(full.To)
 	rc.IncludeLower = full.IncludeLower
 	rc.IncludeUpper = full.IncludeUpper
 	rc.Format = full.Format
@@ -7975,6 +8094,18 @@ type QueryStringQuery struct {
 	Boost                           *float64 `json:"boost,omitempty"`
 }
 
+func isPureASCIIDigits(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func validateFuzzinessValue(v any, queryName string) error {
 	if v == nil {
 		return nil
@@ -7998,8 +8129,18 @@ func validateFuzzinessValue(v any, queryName string) error {
 		}
 	case string:
 		s := strings.ToUpper(strings.TrimSpace(val))
-		if s == "0" || s == "1" || s == "2" || s == "AUTO" || strings.HasPrefix(s, "AUTO:") {
+		if s == "0" || s == "1" || s == "2" || s == "AUTO" {
 			return nil
+		}
+		if strings.HasPrefix(s, "AUTO:") {
+			parts := strings.Split(s[len("AUTO:"):], ",")
+			if len(parts) == 2 && isPureASCIIDigits(parts[0]) && isPureASCIIDigits(parts[1]) {
+				low, err1 := strconv.Atoi(parts[0])
+				high, err2 := strconv.Atoi(parts[1])
+				if err1 == nil && err2 == nil && low >= 0 && low <= high {
+					return nil
+				}
+			}
 		}
 	}
 	return fmt.Errorf("illegal_argument_exception: [%s] invalid fuzziness [%v]", queryName, v)
@@ -11063,6 +11204,7 @@ func (c *CompositeAggSpec) UnmarshalJSON(data []byte) error {
 		order   string
 	}
 	var orderRestores []sourceOrderRestore
+	seenSourceNames := make(map[string]bool, len(rawSources))
 	for srcIdx, srcEntry := range rawSources {
 		if len(srcEntry) != 1 {
 			return fmt.Errorf("parsing_exception: [composite] each entry in [sources] must specify a single named source")
@@ -11071,6 +11213,10 @@ func (c *CompositeAggSpec) UnmarshalJSON(data []byte) error {
 			if strings.TrimSpace(srcName) == "" {
 				return fmt.Errorf("parsing_exception: [composite] source name cannot be empty")
 			}
+			if seenSourceNames[srcName] {
+				return fmt.Errorf("parsing_exception: [composite] duplicate source name [%s]", srcName)
+			}
+			seenSourceNames[srcName] = true
 			var srcTypeMap map[string]json.RawMessage
 			if err := json.Unmarshal(rawSrcSpec, &srcTypeMap); err != nil || len(srcTypeMap) != 1 {
 				return fmt.Errorf("parsing_exception: [composite] source [%s] must specify a single source type", srcName)
@@ -11146,10 +11292,31 @@ func (c *CompositeAggSpec) UnmarshalJSON(data []byte) error {
 		rawMap["sources"] = newSourcesRaw
 		trimmed, _ = json.Marshal(rawMap)
 	}
+	if rawAfter, hasAfter := rawMap["after"]; hasAfter {
+		trimmedAfter := bytes.TrimSpace(rawAfter)
+		if len(trimmedAfter) > 0 && !bytes.Equal(trimmedAfter, []byte("null")) {
+			if trimmedAfter[0] != '{' {
+				return fmt.Errorf("parsing_exception: [composite] [after] must be an object")
+			}
+		}
+	}
 	type compositeAlias CompositeAggSpec
 	var alias compositeAlias
 	if err := json.Unmarshal(trimmed, &alias); err != nil {
 		return fmt.Errorf("parsing_exception: invalid [composite] aggregation: %w", err)
+	}
+	if rawAfter, hasAfter := rawMap["after"]; hasAfter {
+		trimmedAfter := bytes.TrimSpace(rawAfter)
+		if len(trimmedAfter) > 0 && !bytes.Equal(trimmedAfter, []byte("null")) {
+			if len(alias.After) != len(seenSourceNames) {
+				return fmt.Errorf("parsing_exception: [composite] [after] keys must match declared [sources]")
+			}
+			for srcName := range seenSourceNames {
+				if _, ok := alias.After[srcName]; !ok {
+					return fmt.Errorf("parsing_exception: [composite] [after] missing key for source [%s]", srcName)
+				}
+			}
+		}
 	}
 	if _, hasSize := rawMap["size"]; hasSize && alias.Size <= 0 {
 		return fmt.Errorf("parsing_exception: [composite] [size] must be > 0")
@@ -11857,14 +12024,22 @@ func isValidFixedInterval(s string) bool {
 		return false
 	}
 	if strings.HasSuffix(s, "ms") {
-		n, err := strconv.ParseInt(strings.TrimSuffix(s, "ms"), 10, 64)
+		numPart := strings.TrimSuffix(s, "ms")
+		if !isPureASCIIDigits(numPart) {
+			return false
+		}
+		n, err := strconv.ParseInt(numPart, 10, 64)
 		return err == nil && n > 0
 	}
 	if len(s) >= 2 {
 		unit := s[len(s)-1]
 		switch unit {
-		case 's', 'm', 'h', 'd', 'w', 'M', 'y':
-			n, err := strconv.ParseInt(s[:len(s)-1], 10, 64)
+		case 's', 'm', 'h', 'd':
+			numPart := s[:len(s)-1]
+			if !isPureASCIIDigits(numPart) {
+				return false
+			}
+			n, err := strconv.ParseInt(numPart, 10, 64)
 			return err == nil && n > 0
 		}
 	}
@@ -13096,12 +13271,8 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 	}
 	if rawMissing, hasMissing := m["missing"]; hasMissing && field != "missing" {
 		var mv any
-		if json.Unmarshal(rawMissing, &mv) == nil && mv != nil {
-			if fv, ok := mv.(float64); ok && fv == math.Trunc(fv) && !math.IsInf(fv, 0) && !math.IsNaN(fv) {
-				missing = strconv.FormatInt(int64(fv), 10)
-			} else {
-				missing = fmt.Sprintf("%v", mv)
-			}
+		if unmarshalPreservingLargeInts(bytes.TrimSpace(rawMissing), &mv) == nil && mv != nil {
+			missing = formatFlexibleScalarString(normalizeDecodedNumbersPreservingLargeInts(mv))
 		}
 	}
 	if rawUT, hasUT := m["unmapped_type"]; hasUT && field != "unmapped_type" {
@@ -13233,12 +13404,13 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 			}
 			ignoreUnmapped = bv
 		}
-		if obj.Missing != nil {
-			if fv, ok := obj.Missing.(float64); ok && fv == math.Trunc(fv) && !math.IsInf(fv, 0) && !math.IsNaN(fv) {
-				missing = strconv.FormatInt(int64(fv), 10)
-			} else {
-				missing = fmt.Sprintf("%v", obj.Missing)
+		if rawInnerMissing, hasInnerMissing := innerMap["missing"]; hasInnerMissing {
+			var mv any
+			if unmarshalPreservingLargeInts(bytes.TrimSpace(rawInnerMissing), &mv) == nil && mv != nil {
+				missing = formatFlexibleScalarString(normalizeDecodedNumbersPreservingLargeInts(mv))
 			}
+		} else if obj.Missing != nil {
+			missing = formatFlexibleScalarString(obj.Missing)
 		}
 		if obj.Nested != nil {
 			nestedSpec = obj.Nested
@@ -13504,6 +13676,11 @@ type FieldProperty struct {
 	Meta                     map[string]any           `json:"meta,omitempty"`
 	IndexPrefixes            map[string]any           `json:"index_prefixes,omitempty"`
 	IndexPhrases             *bool                    `json:"index_phrases,omitempty"`
+	IndexOptions             any                      `json:"index_options,omitempty"`
+	Norms                    *bool                    `json:"norms,omitempty"`
+	Boost                    any                      `json:"boost,omitempty"`
+	EagerGlobalOrdinals      *bool                    `json:"eager_global_ordinals,omitempty"`
+	Fielddata                any                      `json:"fielddata,omitempty"`
 	SplitQueriesOnWhitespace *bool                    `json:"split_queries_on_whitespace,omitempty"`
 	EnablePositionIncrements *bool                    `json:"enable_position_increments,omitempty"`
 	Relations                map[string]any           `json:"relations,omitempty"`
