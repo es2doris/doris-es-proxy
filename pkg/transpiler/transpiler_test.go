@@ -4379,8 +4379,8 @@ func TestRound56TranspilerAndLuceneF15ToF19(t *testing.T) {
 	var qVerTermBuild, qVerTermBad, qVerTerms esast.Query
 	_ = json.Unmarshal([]byte(`{"term":{"ver":"1.2.3-rc.1+build.42"}}`), &qVerTermBuild)
 	wVerTerm := tr.CompileQuery(&qVerTermBuild, false, nil).WhereSQL
-	if !strings.Contains(wVerTerm, "SPLIT_PART(`f__ver`, '+', 1) = '1.2.3-rc.1'") {
-		t.Fatalf("F15 expected SPLIT_PART +build stripping in version term query, got %s", wVerTerm)
+	if !strings.Contains(wVerTerm, "COALESCE(SPLIT_PART(`f__ver`, '+', 1), `f__ver`) = '1.2.3-rc.1'") {
+		t.Fatalf("F15 expected COALESCE(SPLIT_PART(...)) +build stripping in version term query, got %s", wVerTerm)
 	}
 	_ = json.Unmarshal([]byte(`{"term":{"ver":"not_semver"}}`), &qVerTermBad)
 	if w := tr.CompileQuery(&qVerTermBad, false, nil).WhereSQL; w != "FALSE" {
@@ -5073,7 +5073,7 @@ func TestRound59_TranspilerCompliance(t *testing.T) {
 	var srVerTerms esast.SearchRequest
 	_ = json.Unmarshal([]byte(`{"query":{"terms":{"vers":["1.0.0+build1","2.0.0"]}}}`), &srVerTerms)
 	planVer, err := tr.BuildSearchPlan(&srVerTerms)
-	if err != nil || !strings.Contains(planVer.HitsSQL, "SPLIT_PART(_x, '+', 1) IN ('1.0.0', '2.0.0')") {
+	if err != nil || !strings.Contains(planVer.HitsSQL, "COALESCE(SPLIT_PART(_x, '+', 1), _x) IN ('1.0.0', '2.0.0')") {
 		t.Fatalf("F15 expected IN ('1.0.0', '2.0.0') inside array_exists, got %s (err=%v)", planVer.HitsSQL, err)
 	}
 	orderedVers := []string{
@@ -5141,11 +5141,16 @@ func TestRound59_TranspilerCompliance(t *testing.T) {
 		t.Fatalf("F18 expected 1.0 / x (not 1/(1+x)) for reciprocal, got %s (err=%v)", planFVF.HitsSQL, err)
 	}
 
-	// F19: date_histogram calendar interval + IANA DST timezone SQL
+	// F19: date_histogram calendar interval + IANA DST & fixed-offset timezone SQL
 	var srCalDH esast.SearchRequest
-	_ = json.Unmarshal([]byte(`{"size":0,"aggs":{"by_month":{"date_histogram":{"field":"ts","calendar_interval":"1M","time_zone":"America/New_York"}}}}`), &srCalDH)
+	_ = json.Unmarshal([]byte(`{"size":0,"aggs":{
+		"by_month":{"date_histogram":{"field":"ts","calendar_interval":"1M","time_zone":"America/New_York","offset":"+15m"}},
+		"by_month_pos":{"date_histogram":{"field":"ts","calendar_interval":"1q","time_zone":"+05:30"}},
+		"by_month_neg":{"date_histogram":{"field":"ts","calendar_interval":"1y","time_zone":"-04:00"}},
+		"by_fixed_ny":{"date_histogram":{"field":"ts","fixed_interval":"6h","time_zone":"America/New_York","offset":"+10m"}}
+	}}`), &srCalDH)
 	planCalDH, err := tr.BuildSearchPlan(&srCalDH)
-	if err != nil || !strings.Contains(planCalDH.AggsSQL, "CONVERT_TZ(") || !strings.Contains(planCalDH.AggsSQL, "DATE_TRUNC(") || !strings.Contains(planCalDH.AggsSQL, "'month'") {
-		t.Fatalf("F19 expected CONVERT_TZ + DATE_TRUNC('month') SQL, got %s (err=%v)", planCalDH.AggsSQL, err)
+	if err != nil || !strings.Contains(planCalDH.AggsSQL, "CONVERT_TZ(") || !strings.Contains(planCalDH.AggsSQL, "DATE_TRUNC(") || !strings.Contains(planCalDH.AggsSQL, "'month'") || !strings.Contains(planCalDH.AggsSQL, "SECONDS_ADD(") || !strings.Contains(planCalDH.AggsSQL, "TIMESTAMPDIFF(SECOND,") || !strings.Contains(planCalDH.AggsSQL, "'+05:30'") || !strings.Contains(planCalDH.AggsSQL, "'-04:00'") {
+		t.Fatalf("F19 expected SECONDS_ADD + CONVERT_TZ + DATE_TRUNC + TIMESTAMPDIFF SQL, got %s (err=%v)", planCalDH.AggsSQL, err)
 	}
 }

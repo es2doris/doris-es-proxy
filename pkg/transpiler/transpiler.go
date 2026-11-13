@@ -4188,7 +4188,7 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 				if b.ESType == "version" {
 					if strVal, ok := entry.Value.(string); ok && schema.ValidateSemver(strVal) {
 						cleanVer := strings.SplitN(strings.TrimSpace(strVal), "+", 2)[0]
-						parts = append(parts, fmt.Sprintf("array_exists(_x -> SPLIT_PART(_x, '+', 1) = %s, `%s`)", quoteStr(cleanVer), arrCol))
+						parts = append(parts, fmt.Sprintf("array_exists(_x -> %s = %s, `%s`)", sqlStripSemverBuildExpr("_x"), quoteStr(cleanVer), arrCol))
 					}
 					continue
 				}
@@ -4219,7 +4219,7 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 						}
 					}
 					if len(verQuoted) > 0 {
-						parts = append(parts, fmt.Sprintf("array_exists(_x -> SPLIT_PART(_x, '+', 1) IN (%s), `%s`)", strings.Join(verQuoted, ", "), arrCol))
+						parts = append(parts, fmt.Sprintf("array_exists(_x -> %s IN (%s), `%s`)", sqlStripSemverBuildExpr("_x"), strings.Join(verQuoted, ", "), arrCol))
 					}
 					continue
 				}
@@ -5094,21 +5094,21 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 		case schema.StoragePromotedVector:
 			return "FALSE"
 		case schema.StoragePromotedArray:
-			return fmt.Sprintf("array_exists(_x -> SPLIT_PART(_x, '+', 1) = %s, `%s`)", qVer, b.EffectiveArrayColumn(true))
+			return fmt.Sprintf("array_exists(_x -> %s = %s, `%s`)", sqlStripSemverBuildExpr("_x"), qVer, b.EffectiveArrayColumn(true))
 		case schema.StorageNestedSubfield:
 			if nctx != nil && nctx.nestedPath == b.NestedPath {
 				rawCol := t.sqlColumnRef(field, true, nctx)
 				if b.IsMultiValued {
-					return fmt.Sprintf("array_exists(_x -> SPLIT_PART(_x, '+', 1) = %s, CAST(%s AS ARRAY<STRING>))", qVer, rawCol)
+					return fmt.Sprintf("array_exists(_x -> %s = %s, CAST(%s AS ARRAY<STRING>))", sqlStripSemverBuildExpr("_x"), qVer, rawCol)
 				}
-				return fmt.Sprintf("SPLIT_PART(%s, '+', 1) = %s", rawCol, qVer)
+				return fmt.Sprintf("%s = %s", sqlStripSemverBuildExpr(rawCol), qVer)
 			}
 			if b.PrefilterArrayCol != "" {
-				return fmt.Sprintf("array_exists(_x -> SPLIT_PART(_x, '+', 1) = %s, `%s`)", qVer, b.EffectiveArrayColumn(true))
+				return fmt.Sprintf("array_exists(_x -> %s = %s, `%s`)", sqlStripSemverBuildExpr("_x"), qVer, b.EffectiveArrayColumn(true))
 			}
 		}
 		rawCol := t.sqlColumnRef(field, true, nctx)
-		return fmt.Sprintf("SPLIT_PART(%s, '+', 1) = %s", rawCol, qVer)
+		return fmt.Sprintf("%s = %s", sqlStripSemverBuildExpr(rawCol), qVer)
 	}
 	if b.ESType == "text" && b.KeywordCompanion == "" && !strings.HasSuffix(field, ".keyword") {
 		if _, isBool := val.(bool); isBool {
@@ -5436,21 +5436,21 @@ func (t *Transpiler) compileTermsPredicateWithCI(field string, vals []any, caseI
 		case schema.StoragePromotedVector:
 			return "FALSE"
 		case schema.StoragePromotedArray:
-			return fmt.Sprintf("array_exists(_x -> SPLIT_PART(_x, '+', 1) IN (%s), `%s`)", inList, b.EffectiveArrayColumn(true))
+			return fmt.Sprintf("array_exists(_x -> %s IN (%s), `%s`)", sqlStripSemverBuildExpr("_x"), inList, b.EffectiveArrayColumn(true))
 		case schema.StorageNestedSubfield:
 			if nctx != nil && nctx.nestedPath == b.NestedPath {
 				rawCol := t.sqlColumnRef(field, true, nctx)
 				if b.IsMultiValued {
-					return fmt.Sprintf("array_exists(_x -> SPLIT_PART(_x, '+', 1) IN (%s), CAST(%s AS ARRAY<STRING>))", inList, rawCol)
+					return fmt.Sprintf("array_exists(_x -> %s IN (%s), CAST(%s AS ARRAY<STRING>))", sqlStripSemverBuildExpr("_x"), inList, rawCol)
 				}
-				return fmt.Sprintf("SPLIT_PART(%s, '+', 1) IN (%s)", rawCol, inList)
+				return fmt.Sprintf("%s IN (%s)", sqlStripSemverBuildExpr(rawCol), inList)
 			}
 			if b.PrefilterArrayCol != "" {
-				return fmt.Sprintf("array_exists(_x -> SPLIT_PART(_x, '+', 1) IN (%s), `%s`)", inList, b.EffectiveArrayColumn(true))
+				return fmt.Sprintf("array_exists(_x -> %s IN (%s), `%s`)", sqlStripSemverBuildExpr("_x"), inList, b.EffectiveArrayColumn(true))
 			}
 		}
 		rawCol := t.sqlColumnRef(field, true, nctx)
-		return fmt.Sprintf("SPLIT_PART(%s, '+', 1) IN (%s)", rawCol, inList)
+		return fmt.Sprintf("%s IN (%s)", sqlStripSemverBuildExpr(rawCol), inList)
 	}
 	if b.ESType == "ip" {
 		var canonIPs []any
@@ -5876,10 +5876,14 @@ func CompareSemverStrings(a, b string) int {
 	return strings.Compare(ka, kb)
 }
 
+func sqlStripSemverBuildExpr(expr string) string {
+	return fmt.Sprintf("COALESCE(SPLIT_PART(%s, '+', 1), %s)", expr, expr)
+}
+
 func sqlSemverSortKeyExpr(colExpr string) string {
-	noBuild := fmt.Sprintf("COALESCE(SPLIT_PART(%s, '+', 1), '')", colExpr)
-	core := fmt.Sprintf("COALESCE(SPLIT_PART(%s, '-', 1), '')", noBuild)
-	c1 := fmt.Sprintf("COALESCE(SPLIT_PART(%s, '.', 1), '')", core)
+	noBuild := fmt.Sprintf("COALESCE(SPLIT_PART(%s, '+', 1), %s, '')", colExpr, colExpr)
+	core := fmt.Sprintf("COALESCE(SPLIT_PART(%s, '-', 1), %s, '')", noBuild, noBuild)
+	c1 := fmt.Sprintf("COALESCE(SPLIT_PART(%s, '.', 1), %s, '')", core, core)
 	c2 := fmt.Sprintf("COALESCE(SPLIT_PART(%s, '.', 2), '')", core)
 	c3 := fmt.Sprintf("COALESCE(SPLIT_PART(%s, '.', 3), '')", core)
 	maj := fmt.Sprintf("LPAD(IF(%s = '', '0', %s), 20, '0')", c1, c1)
@@ -5888,7 +5892,12 @@ func sqlSemverSortKeyExpr(colExpr string) string {
 	preRaw := fmt.Sprintf("COALESCE(SUBSTRING(%s, LOCATE('-', %s) + 1), '')", noBuild, noBuild)
 	var preParts []string
 	for k := 1; k <= 8; k++ {
-		seg := fmt.Sprintf("COALESCE(SPLIT_PART(%s, '.', %d), '')", preRaw, k)
+		var seg string
+		if k == 1 {
+			seg = fmt.Sprintf("COALESCE(SPLIT_PART(%s, '.', 1), %s, '')", preRaw, preRaw)
+		} else {
+			seg = fmt.Sprintf("COALESCE(SPLIT_PART(%s, '.', %d), '')", preRaw, k)
+		}
 		padded := fmt.Sprintf("IF(%s REGEXP '^[0-9]+$', CONCAT('0:', LPAD(%s, 20, '0')), CONCAT('1:', %s))", seg, seg, seg)
 		if k == 1 {
 			preParts = append(preParts, padded)
@@ -14317,12 +14326,13 @@ func (t *Transpiler) buildDateHistogramBucketKeySQL(dh *esast.DateHistogramAggSp
 			if offsetMs != 0 {
 				shiftedMs = fmt.Sprintf("((%s) - %d)", colMillisExpr, offsetMs)
 			}
+			const epoch0 = "CAST('1970-01-01 00:00:00' AS DATETIME)"
 			secExpr := fmt.Sprintf("CAST(FLOOR((%s) / 1000) AS BIGINT)", shiftedMs)
-			utcDt := fmt.Sprintf("FROM_UNIXTIME(%s)", secExpr)
+			utcDt := fmt.Sprintf("SECONDS_ADD(%s, %s)", epoch0, secExpr)
 			var epochMsExpr string
 			if isFixed && fixedOffMs == 0 {
 				truncDt := fmt.Sprintf("DATE_TRUNC(%s, %s)", utcDt, quoteStr(unit))
-				epochMsExpr = fmt.Sprintf("(UNIX_TIMESTAMP(%s) * 1000)", truncDt)
+				epochMsExpr = fmt.Sprintf("(TIMESTAMPDIFF(SECOND, %s, %s) * 1000)", epoch0, truncDt)
 			} else {
 				dorisTZ := tzRaw
 				if isFixed {
@@ -14331,7 +14341,7 @@ func (t *Transpiler) buildDateHistogramBucketKeySQL(dh *esast.DateHistogramAggSp
 				localDt := fmt.Sprintf("CONVERT_TZ(%s, '+00:00', %s)", utcDt, quoteStr(dorisTZ))
 				truncLocal := fmt.Sprintf("DATE_TRUNC(%s, %s)", localDt, quoteStr(unit))
 				backToUTC := fmt.Sprintf("CONVERT_TZ(%s, %s, '+00:00')", truncLocal, quoteStr(dorisTZ))
-				epochMsExpr = fmt.Sprintf("(UNIX_TIMESTAMP(%s) * 1000)", backToUTC)
+				epochMsExpr = fmt.Sprintf("(TIMESTAMPDIFF(SECOND, %s, %s) * 1000)", epoch0, backToUTC)
 			}
 			if offsetMs != 0 {
 				epochMsExpr = fmt.Sprintf("(%s + %d)", epochMsExpr, offsetMs)
@@ -14341,8 +14351,10 @@ func (t *Transpiler) buildDateHistogramBucketKeySQL(dh *esast.DateHistogramAggSp
 	}
 
 	if !isFixed {
+		const epoch0 = "CAST('1970-01-01 00:00:00' AS DATETIME)"
 		secExpr := fmt.Sprintf("CAST(FLOOR((%s) / 1000) AS BIGINT)", colMillisExpr)
-		dynOffMs := fmt.Sprintf("((UNIX_TIMESTAMP(CONVERT_TZ(FROM_UNIXTIME(%s), '+00:00', %s)) - (%s)) * 1000)", secExpr, quoteStr(tzRaw), secExpr)
+		utcDt := fmt.Sprintf("SECONDS_ADD(%s, %s)", epoch0, secExpr)
+		dynOffMs := fmt.Sprintf("(TIMESTAMPDIFF(SECOND, %s, CONVERT_TZ(%s, '+00:00', %s)) * 1000)", utcDt, utcDt, quoteStr(tzRaw))
 		shiftExpr := dynOffMs
 		if offsetMs != 0 {
 			shiftExpr = fmt.Sprintf("(%s - %d)", dynOffMs, offsetMs)

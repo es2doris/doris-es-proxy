@@ -3372,11 +3372,20 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 		}
 	}
 
-	for _, fn := range []string{"GREATEST", "LEAST", "COALESCE", "POW", "LOG10", "LN", "SQRT", "FLOOR", "CEIL", "ROUND", "TRUNCATE", "ABS", "UNIX_TIMESTAMP"} {
+	for _, fn := range []string{"GREATEST", "LEAST", "COALESCE", "POW", "LOG10", "LN", "SQRT", "FLOOR", "CEIL", "ROUND", "TRUNCATE", "ABS", "UNIX_TIMESTAMP", "TIMESTAMPDIFF"} {
 		if strings.HasPrefix(expr, fn+"(") && strings.HasSuffix(expr, ")") {
 			inner := expr[len(fn)+1 : len(expr)-1]
 			args := splitTopLevelArgs(inner)
 			switch fn {
+			case "TIMESTAMPDIFF":
+				if len(args) == 3 {
+					if v := memEvalTimestampDiff(row, args[0], args[1], args[2]); v != nil {
+						if fv, ok := toFloat(v); ok {
+							return fv
+						}
+					}
+				}
+				return 0
 			case "UNIX_TIMESTAMP":
 				if len(args) == 1 {
 					if v := memEvalUnixTimestamp(row, args[0]); v != nil {
@@ -3967,7 +3976,11 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			delim := unquoteSQLLiteral(strings.TrimSpace(args[1]))
 			idx, err := strconv.Atoi(strings.TrimSpace(args[2]))
 			if strVal != nil && err == nil && idx >= 1 {
-				parts := strings.Split(fmt.Sprintf("%v", strVal), delim)
+				rawStr := fmt.Sprintf("%v", strVal)
+				if delim != "" && !strings.Contains(rawStr, delim) {
+					return nil
+				}
+				parts := strings.Split(rawStr, delim)
 				if idx <= len(parts) {
 					return strings.TrimSpace(parts[idx-1])
 				}
@@ -4223,6 +4236,22 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 		return nil
 	}
+	if (strings.HasPrefix(colExpr, "SECONDS_ADD(") || strings.HasPrefix(colExpr, "seconds_add(")) && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("SECONDS_ADD")) {
+		inner := strings.TrimSpace(colExpr[len("SECONDS_ADD(") : len(colExpr)-1])
+		args := splitTopLevelArgs(inner)
+		if len(args) == 2 {
+			return memEvalSecondsAdd(row, args[0], args[1])
+		}
+		return nil
+	}
+	if (strings.HasPrefix(colExpr, "TIMESTAMPDIFF(") || strings.HasPrefix(colExpr, "timestampdiff(")) && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("TIMESTAMPDIFF")) {
+		inner := strings.TrimSpace(colExpr[len("TIMESTAMPDIFF(") : len(colExpr)-1])
+		args := splitTopLevelArgs(inner)
+		if len(args) == 3 {
+			return memEvalTimestampDiff(row, args[0], args[1], args[2])
+		}
+		return nil
+	}
 	if (strings.HasPrefix(colExpr, "UNIX_TIMESTAMP(") || strings.HasPrefix(colExpr, "unix_timestamp(")) && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("UNIX_TIMESTAMP")) {
 		inner := strings.TrimSpace(colExpr[len("UNIX_TIMESTAMP(") : len(colExpr)-1])
 		args := splitTopLevelArgs(inner)
@@ -4374,6 +4403,10 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 	}
 	if strings.HasPrefix(colExpr, "CAST(") && !strings.HasPrefix(colExpr, "CAST(`_doc`") && hasMatchingOuterParens(colExpr, 4) {
+		if strings.HasSuffix(colExpr, " AS DATETIME)") {
+			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS DATETIME)")])
+			return resolveColumnValue(row, inner)
+		}
 		if strings.HasSuffix(colExpr, " AS LARGEINT)") {
 			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS LARGEINT)")])
 			if bi, ok := memParseExactBigInt(inner); ok {
@@ -4442,7 +4475,7 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 						return iv
 					}
 					if f, ok := toFloat(v); ok {
-						if strings.Contains(inner, "UNIX_TIMESTAMP(") {
+						if strings.Contains(inner, "UNIX_TIMESTAMP(") || strings.Contains(inner, "TIMESTAMPDIFF(") {
 							return int64(math.Round(f))
 						}
 						return int64(f)
@@ -4459,7 +4492,7 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 					return nil
 				}
 				num := evalNumericExpr(row, inner)
-				if strings.Contains(inner, "UNIX_TIMESTAMP(") {
+				if strings.Contains(inner, "UNIX_TIMESTAMP(") || strings.Contains(inner, "TIMESTAMPDIFF(") {
 					return int64(math.Round(num))
 				}
 				return int64(num)
@@ -4737,7 +4770,7 @@ func hasUnwrappedNullColumnRef(row map[string]any, expr string) bool {
 
 func isArithmeticSQLExpr(expr string) bool {
 	trimmed := trimOuterParens(strings.TrimSpace(expr))
-	for _, fn := range []string{"CASE ", "ST_Distance_Sphere(", "GREATEST(", "LEAST(", "POW(", "LOG10(", "LN(", "SQRT(", "FLOOR(", "CEIL(", "ROUND(", "TRUNCATE(", "ABS(", "UNIX_TIMESTAMP("} {
+	for _, fn := range []string{"CASE ", "ST_Distance_Sphere(", "GREATEST(", "LEAST(", "POW(", "LOG10(", "LN(", "SQRT(", "FLOOR(", "CEIL(", "ROUND(", "TRUNCATE(", "ABS(", "UNIX_TIMESTAMP(", "TIMESTAMPDIFF("} {
 		if strings.HasPrefix(trimmed, fn) {
 			return true
 		}
@@ -5815,4 +5848,72 @@ func memEvalUnixTimestamp(row map[string]any, dtExpr string) any {
 	}
 	t := time.Date(y, m, d, hh, mm, ss, ns, time.UTC)
 	return float64(t.Unix()) + float64(t.Nanosecond())/1e9
+}
+
+func memEvalSecondsAdd(row map[string]any, dtExpr, secExpr string) any {
+	dtExpr = strings.TrimSpace(dtExpr)
+	secExpr = strings.TrimSpace(secExpr)
+	if hasUnwrappedNullColumnRef(row, dtExpr) || hasUnwrappedNullColumnRef(row, secExpr) {
+		return nil
+	}
+	dtVal := resolveColumnValue(row, dtExpr)
+	if dtVal == nil {
+		return nil
+	}
+	y, m, d, hh, mm, ss, ns, ok := memParseDateTimeWallClock(dtVal)
+	if !ok {
+		return nil
+	}
+	var sec int64
+	if rv := resolveColumnValue(row, secExpr); rv != nil {
+		if iv, okI := toInt64(rv); okI {
+			sec = iv
+		} else if fv, okF := toFloat(rv); okF && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+			sec = int64(math.Round(fv))
+		} else {
+			return nil
+		}
+	} else if isArithmeticSQLExpr(secExpr) {
+		fv := evalNumericExpr(row, secExpr)
+		if math.IsNaN(fv) || math.IsInf(fv, 0) {
+			return nil
+		}
+		sec = int64(math.Round(fv))
+	} else {
+		return nil
+	}
+	base := time.Date(y, m, d, hh, mm, ss, ns, time.UTC)
+	return base.Add(time.Duration(sec) * time.Second).UTC().Format("2006-01-02 15:04:05.000000")
+}
+
+func memEvalTimestampDiff(row map[string]any, unitExpr, startExpr, endExpr string) any {
+	startExpr = strings.TrimSpace(startExpr)
+	endExpr = strings.TrimSpace(endExpr)
+	if hasUnwrappedNullColumnRef(row, startExpr) || hasUnwrappedNullColumnRef(row, endExpr) {
+		return nil
+	}
+	v1 := resolveColumnValue(row, startExpr)
+	v2 := resolveColumnValue(row, endExpr)
+	if v1 == nil || v2 == nil {
+		return nil
+	}
+	y1, m1, d1, h1, min1, s1, ns1, ok1 := memParseDateTimeWallClock(v1)
+	y2, m2, d2, h2, min2, s2, ns2, ok2 := memParseDateTimeWallClock(v2)
+	if !ok1 || !ok2 {
+		return nil
+	}
+	t1 := time.Date(y1, m1, d1, h1, min1, s1, ns1, time.UTC)
+	t2 := time.Date(y2, m2, d2, h2, min2, s2, ns2, time.UTC)
+	switch strings.ToUpper(strings.TrimSpace(unquoteSQLLiteral(strings.TrimSpace(unitExpr)))) {
+	case "SECOND":
+		return t2.Unix() - t1.Unix()
+	case "MINUTE":
+		return (t2.Unix() - t1.Unix()) / 60
+	case "HOUR":
+		return (t2.Unix() - t1.Unix()) / 3600
+	case "DAY":
+		return (t2.Unix() - t1.Unix()) / 86400
+	default:
+		return nil
+	}
 }

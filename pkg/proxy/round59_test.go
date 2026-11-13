@@ -1759,4 +1759,18 @@ func TestRound59_TranspilerHooksUnitCoverage(t *testing.T) {
 		mappingOrShredErrorTypeRound59(fmt.Errorf("Limit of total fields [10] has been exceeded")) != "illegal_argument_exception" {
 		t.Fatalf("unexpected mappingOrShredErrorTypeRound59 classification")
 	}
+
+	dtRow := map[string]any{"sec_col": float64(3661), "dt_col": "1970-01-02 01:01:01"}
+	if got := resolveColumnValue(dtRow, "SECONDS_ADD(CAST('1970-01-01 00:00:00' AS DATETIME), `sec_col`)"); got != "1970-01-01 01:01:01.000000" {
+		t.Fatalf("expected SECONDS_ADD result, got %v", got)
+	}
+	if got := resolveColumnValue(dtRow, "SECONDS_ADD('1970-01-01 00:00:00', 30 + 30)"); got != "1970-01-01 00:01:00.000000" {
+		t.Fatalf("expected arithmetic SECONDS_ADD result, got %v", got)
+	}
+	for _, unit := range []string{"SECOND", "MINUTE", "HOUR", "DAY", "UNKNOWN"} {
+		_ = resolveColumnValue(dtRow, fmt.Sprintf("TIMESTAMPDIFF(%s, '1970-01-01 00:00:00', `dt_col`)", unit))
+	}
+	_ = resolveColumnValue(dtRow, "FROM_UNIXTIME(`sec_col`)")
+	_ = resolveColumnValue(dtRow, "FROM_UNIXTIME(30 + 30)")
+	_ = resolveColumnValue(dtRow, "UNIX_TIMESTAMP(`dt_col`)")
 }
