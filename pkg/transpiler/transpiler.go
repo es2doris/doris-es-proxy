@@ -5877,15 +5877,18 @@ func CompareSemverStrings(a, b string) int {
 }
 
 func sqlSemverSortKeyExpr(colExpr string) string {
-	noBuild := fmt.Sprintf("SPLIT_PART(%s, '+', 1)", colExpr)
-	core := fmt.Sprintf("SPLIT_PART(%s, '-', 1)", noBuild)
-	maj := fmt.Sprintf("LPAD(IF(SPLIT_PART(%s, '.', 1) = '', '0', SPLIT_PART(%s, '.', 1)), 20, '0')", core, core)
-	minV := fmt.Sprintf("LPAD(IF(SPLIT_PART(%s, '.', 2) = '', '0', SPLIT_PART(%s, '.', 2)), 20, '0')", core, core)
-	pat := fmt.Sprintf("LPAD(IF(SPLIT_PART(%s, '.', 3) = '', '0', SPLIT_PART(%s, '.', 3)), 20, '0')", core, core)
-	preRaw := fmt.Sprintf("SUBSTRING(%s, LOCATE('-', %s) + 1)", noBuild, noBuild)
+	noBuild := fmt.Sprintf("COALESCE(SPLIT_PART(%s, '+', 1), '')", colExpr)
+	core := fmt.Sprintf("COALESCE(SPLIT_PART(%s, '-', 1), '')", noBuild)
+	c1 := fmt.Sprintf("COALESCE(SPLIT_PART(%s, '.', 1), '')", core)
+	c2 := fmt.Sprintf("COALESCE(SPLIT_PART(%s, '.', 2), '')", core)
+	c3 := fmt.Sprintf("COALESCE(SPLIT_PART(%s, '.', 3), '')", core)
+	maj := fmt.Sprintf("LPAD(IF(%s = '', '0', %s), 20, '0')", c1, c1)
+	minV := fmt.Sprintf("LPAD(IF(%s = '', '0', %s), 20, '0')", c2, c2)
+	pat := fmt.Sprintf("LPAD(IF(%s = '', '0', %s), 20, '0')", c3, c3)
+	preRaw := fmt.Sprintf("COALESCE(SUBSTRING(%s, LOCATE('-', %s) + 1), '')", noBuild, noBuild)
 	var preParts []string
 	for k := 1; k <= 8; k++ {
-		seg := fmt.Sprintf("SPLIT_PART(%s, '.', %d)", preRaw, k)
+		seg := fmt.Sprintf("COALESCE(SPLIT_PART(%s, '.', %d), '')", preRaw, k)
 		padded := fmt.Sprintf("IF(%s REGEXP '^[0-9]+$', CONCAT('0:', LPAD(%s, 20, '0')), CONCAT('1:', %s))", seg, seg, seg)
 		if k == 1 {
 			preParts = append(preParts, padded)
@@ -5895,7 +5898,37 @@ func sqlSemverSortKeyExpr(colExpr string) string {
 	}
 	preJoined := fmt.Sprintf("CONCAT(%s)", strings.Join(preParts, ", "))
 	pre := fmt.Sprintf("IF(LOCATE('-', %s) > 0, CONCAT('-', %s), '~')", noBuild, preJoined)
-	return fmt.Sprintf("CONCAT(%s, '.', %s, '.', %s, %s)", maj, minV, pat, pre)
+	return fmt.Sprintf("IF(%s IS NULL, NULL, CONCAT(%s, '.', %s, '.', %s, %s))", colExpr, maj, minV, pat, pre)
+}
+
+func sqlExactHistogramPercentileBranch(fullAggName, pctKey, hVal, hCnt, hArrExpr, wCond string, q float64) string {
+	return fmt.Sprintf(
+		"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, "+
+			"CAST(COALESCE(MIN(CASE WHEN `_cum_w` + 0.000000001 >= %.6f * `_tot_w` THEN "+
+			"CASE WHEN ABS(`_cum_w` - %.6f * `_tot_w`) <= 0.000000001 THEN (`_hv` + COALESCE(`_next_hv`, `_hv`)) / 2.0 ELSE `_hv` END "+
+			"ELSE NULL END), MAX(`_hv`), 0) AS DOUBLE) AS `_doc_count` "+
+			"FROM (SELECT `_hv`, "+
+			"SUM(`_hw`) OVER (ORDER BY `_hv` ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS `_cum_w`, "+
+			"SUM(`_hw`) OVER () AS `_tot_w`, "+
+			"LEAD(`_hv`) OVER (ORDER BY `_hv` ASC) AS `_next_hv` "+
+			"FROM (SELECT %s AS `_hv`, SUM(%s) AS `_hw` FROM `base_matched` LATERAL VIEW EXPLODE(%s) `_ht` AS `_helem`%s GROUP BY `_hv`) `_hbins`) `_hwcum` HAVING COUNT(`_hv`) > 0",
+		quoteStr(fullAggName), quoteStr(pctKey), q, q, hVal, hCnt, hArrExpr, wCond,
+	)
+}
+
+func sqlExactHistogramSubPercentileBranch(subFullPctKey, parentBucketExpr, hVal, hCnt, subFrom, subWhere string, q float64) string {
+	return fmt.Sprintf(
+		"SELECT %s AS `_agg_name`, `_bucket_key`, "+
+			"CAST(COALESCE(MIN(CASE WHEN `_cum_w` + 0.000000001 >= %.6f * `_tot_w` THEN "+
+			"CASE WHEN ABS(`_cum_w` - %.6f * `_tot_w`) <= 0.000000001 THEN (`_hv` + COALESCE(`_next_hv`, `_hv`)) / 2.0 ELSE `_hv` END "+
+			"ELSE NULL END), MAX(`_hv`), 0) AS DOUBLE) AS `_doc_count` "+
+			"FROM (SELECT `_bucket_key`, `_hv`, "+
+			"SUM(`_hw`) OVER (PARTITION BY `_bucket_key` ORDER BY `_hv` ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS `_cum_w`, "+
+			"SUM(`_hw`) OVER (PARTITION BY `_bucket_key`) AS `_tot_w`, "+
+			"LEAD(`_hv`) OVER (PARTITION BY `_bucket_key` ORDER BY `_hv` ASC) AS `_next_hv` "+
+			"FROM (SELECT %s AS `_bucket_key`, %s AS `_hv`, SUM(%s) AS `_hw` FROM %s WHERE %s GROUP BY `_bucket_key`, `_hv`) `_hbins`) `_hwcum` GROUP BY `_bucket_key` HAVING COUNT(`_hv`) > 0",
+		quoteStr(subFullPctKey), q, q, parentBucketExpr, hVal, hCnt, subFrom, subWhere,
+	)
 }
 
 func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, nctx *nestedCtx) string {
@@ -7698,11 +7731,7 @@ func (t *Transpiler) appendAggBranches(
 					{"75.0", 0.75},
 					{"100.0", 1.0},
 				} {
-					*branches = append(*branches, fmt.Sprintf(
-						"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(PERCENTILE_APPROX_WEIGHTED(%s, %s, %.4f), 0) AS DOUBLE) AS `_doc_count` "+
-							"FROM `base_matched` LATERAL VIEW EXPLODE(%s) `_ht` AS `_helem`%s HAVING SUM(%s) > 0",
-						quoteStr(fullAggName), quoteStr(bp.key), hVal, hCnt, bp.q, hArrExpr, wCond, hCnt,
-					))
+					*branches = append(*branches, sqlExactHistogramPercentileBranch(fullAggName, bp.key, hVal, hCnt, hArrExpr, wCond, bp.q))
 				}
 				continue
 			}
@@ -7798,11 +7827,7 @@ func (t *Transpiler) appendAggBranches(
 					if !strings.Contains(pctKey, ".") {
 						pctKey += ".0"
 					}
-					*branches = append(*branches, fmt.Sprintf(
-						"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(PERCENTILE_APPROX_WEIGHTED(%s, %s, %.4f), 0) AS DOUBLE) AS `_doc_count` "+
-							"FROM `base_matched` LATERAL VIEW EXPLODE(%s) `_ht` AS `_helem`%s HAVING SUM(%s) > 0",
-						quoteStr(fullAggName), quoteStr(pctKey), hVal, hCnt, q, hArrExpr, wCond, hCnt,
-					))
+					*branches = append(*branches, sqlExactHistogramPercentileBranch(fullAggName, pctKey, hVal, hCnt, hArrExpr, wCond, q))
 				}
 				continue
 			}
@@ -9398,11 +9423,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					if !strings.Contains(pctKey, ".") {
 						pctKey += ".0"
 					}
-					*branches = append(*branches, fmt.Sprintf(
-						"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(PERCENTILE_APPROX_WEIGHTED(%s, %s, %.4f), 0) AS DOUBLE) AS `_doc_count` "+
-							"FROM %s WHERE %s GROUP BY `_bucket_key` HAVING SUM(%s) > 0",
-						quoteStr(subFull+"."+pctKey), parentBucketExpr, hVal, hCnt, q, subFrom, subWhere, hCnt,
-					))
+					*branches = append(*branches, sqlExactHistogramSubPercentileBranch(subFull+"."+pctKey, parentBucketExpr, hVal, hCnt, subFrom, subWhere, q))
 				}
 				continue
 			}
@@ -9493,11 +9514,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 				for _, pct := range []float64{0.0, 25.0, 50.0, 75.0, 100.0} {
 					q := pct / 100.0
 					pctKey := fmt.Sprintf("%.1f", pct)
-					*branches = append(*branches, fmt.Sprintf(
-						"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(PERCENTILE_APPROX_WEIGHTED(%s, %s, %.4f), 0) AS DOUBLE) AS `_doc_count` "+
-							"FROM %s WHERE %s GROUP BY `_bucket_key` HAVING SUM(%s) > 0",
-						quoteStr(subFull+"."+pctKey), parentBucketExpr, hVal, hCnt, q, subFrom, subWhere, hCnt,
-					))
+					*branches = append(*branches, sqlExactHistogramSubPercentileBranch(subFull+"."+pctKey, parentBucketExpr, hVal, hCnt, subFrom, subWhere, q))
 				}
 				continue
 			}

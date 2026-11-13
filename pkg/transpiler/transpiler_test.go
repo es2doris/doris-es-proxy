@@ -4894,8 +4894,8 @@ func TestRound58Transpiler_F10ToF19(t *testing.T) {
 	if err != nil {
 		t.Fatalf("F13 BuildSearchPlan failed: %v", err)
 	}
-	if !strings.Contains(planF13.HitsSQL, "['_h']") || !strings.Contains(planF13.AggsSQL, "PERCENTILE_APPROX_WEIGHTED") {
-		t.Fatalf("F13 expected _h range and PERCENTILE_APPROX_WEIGHTED aggs, got hits=%s aggs=%s", planF13.HitsSQL, planF13.AggsSQL)
+	if !strings.Contains(planF13.HitsSQL, "['_h']") || !strings.Contains(planF13.AggsSQL, "_hwcum") {
+		t.Fatalf("F13 expected _h range and exact _hwcum weighted quantile aggs, got hits=%s aggs=%s", planF13.HitsSQL, planF13.AggsSQL)
 	}
 	for _, badHistReq := range []string{
 		`{"query":{"term":{"lat_hist":10}}}`,
