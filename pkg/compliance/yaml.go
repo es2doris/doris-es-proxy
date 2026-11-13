@@ -3,6 +3,7 @@ package compliance
 import (
 	"embed"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -100,22 +101,34 @@ type SpecSection struct {
 	Steps []SpecStep
 }
 
+// SkipSpec represents a rest-api-spec skip directive (file-level or section-level).
+type SkipSpec struct {
+	Version  string
+	Reason   string
+	Features []string
+}
+
 // SpecDocument represents a parsed multi-document rest-api-spec YAML file.
 type SpecDocument struct {
+	Skip     *SkipSpec
 	Setup    []SpecStep
 	Teardown []SpecStep
 	Sections []SpecSection
 }
 
+// SpecFile is an alias for SpecDocument representing a parsed rest-api-spec YAML file.
+type SpecFile = SpecDocument
+
 // ParseSpecFile parses a rest-api-spec YAML file (potentially containing multiple
-// YAML documents separated by `---`) into a SpecDocument with setup, teardown, and test sections.
+// YAML documents separated by `---`) into a SpecDocument with optional file-level skip,
+// setup, teardown, and test sections.
 func ParseSpecFile(content string) (*SpecDocument, error) {
 	docs, err := ParseYAMLDocuments(content)
 	if err != nil {
 		return nil, err
 	}
 	spec := &SpecDocument{}
-	for _, doc := range docs {
+	for docIdx, doc := range docs {
 		if doc == nil {
 			continue
 		}
@@ -124,6 +137,16 @@ func ParseSpecFile(content string) (*SpecDocument, error) {
 			return nil, fmt.Errorf("expected top-level YAML mapping in spec document, got %T", doc)
 		}
 		for _, field := range om.Fields {
+			if docIdx == 0 && field.Key == "skip" {
+				if _, isSeq := field.Value.([]any); !isSeq {
+					skipSpec, err := parseSkipSpec(field.Value)
+					if err != nil {
+						return nil, err
+					}
+					spec.Skip = skipSpec
+					continue
+				}
+			}
 			steps, err := extractSteps(field.Key, field.Value)
 			if err != nil {
 				return nil, err
@@ -142,6 +165,47 @@ func ParseSpecFile(content string) (*SpecDocument, error) {
 		}
 	}
 	return spec, nil
+}
+
+func parseSkipSpec(raw any) (*SkipSpec, error) {
+	var fields []YAMLField
+	switch val := raw.(type) {
+	case *OrderedMap:
+		if val == nil {
+			return nil, fmt.Errorf("skip directive requires a non-empty mapping")
+		}
+		fields = val.Fields
+	case OrderedMap:
+		fields = val.Fields
+	case map[string]any:
+		for k, v := range val {
+			fields = append(fields, YAMLField{Key: k, Value: v})
+		}
+	default:
+		return nil, fmt.Errorf("skip directive requires a mapping, got %T", raw)
+	}
+	out := &SkipSpec{}
+	for _, f := range fields {
+		switch f.Key {
+		case "version":
+			if f.Value != nil {
+				out.Version = strings.TrimSpace(fmt.Sprintf("%v", f.Value))
+			}
+		case "reason":
+			if f.Value != nil {
+				out.Reason = strings.TrimSpace(fmt.Sprintf("%v", f.Value))
+			}
+		case "features":
+			for _, item := range extractStringSlice(f.Value) {
+				for _, part := range strings.Split(item, ",") {
+					if trimmed := strings.TrimSpace(part); trimmed != "" {
+						out.Features = append(out.Features, trimmed)
+					}
+				}
+			}
+		}
+	}
+	return out, nil
 }
 
 func extractSteps(sectionName string, raw any) ([]SpecStep, error) {
@@ -248,13 +312,50 @@ func isBlockScalarHeaderLine(trimmed string) bool {
 	return false
 }
 
-func isBlockScalarIndicator(s string) bool {
-	switch s {
-	case "|", "|-", "|+", ">", ">-", ">+":
-		return true
-	default:
-		return false
+func parseBlockScalarHeader(s string) (folded bool, chomp string, explicitIndent int, ok bool) {
+	if len(s) == 0 || len(s) > 3 {
+		return false, "", 0, false
 	}
+	switch s[0] {
+	case '|':
+		folded = false
+	case '>':
+		folded = true
+	default:
+		return false, "", 0, false
+	}
+	chomp = "clip"
+	hasChomp := false
+	hasIndent := false
+	for i := 1; i < len(s); i++ {
+		ch := s[i]
+		switch {
+		case ch == '-' || ch == '+':
+			if hasChomp {
+				return false, "", 0, false
+			}
+			hasChomp = true
+			if ch == '-' {
+				chomp = "strip"
+			} else {
+				chomp = "keep"
+			}
+		case ch >= '1' && ch <= '9':
+			if hasIndent {
+				return false, "", 0, false
+			}
+			hasIndent = true
+			explicitIndent = int(ch - '0')
+		default:
+			return false, "", 0, false
+		}
+	}
+	return folded, chomp, explicitIndent, true
+}
+
+func isBlockScalarIndicator(s string) bool {
+	_, _, _, ok := parseBlockScalarHeader(s)
+	return ok
 }
 
 type yamlParser struct {
@@ -305,6 +406,10 @@ func (p *yamlParser) parseNode(minIndent int) (any, error) {
 	}
 	if _, _, ok := splitKeyValue(trimmed); ok {
 		return p.parseMapping(indent)
+	}
+	if isBlockScalarIndicator(trimmed) {
+		p.pos++
+		return p.parseBlockScalar(trimmed, indent-1)
 	}
 	p.pos++
 	return parseScalar(trimmed)
@@ -556,16 +661,20 @@ func (p *yamlParser) parseMapping(mapIndent int) (*OrderedMap, error) {
 }
 
 func (p *yamlParser) parseBlockScalar(indicator string, parentIndent int) (string, error) {
-	folded := strings.HasPrefix(indicator, ">")
-	chomp := "clip"
-	if strings.HasSuffix(indicator, "-") {
-		chomp = "strip"
-	} else if strings.HasSuffix(indicator, "+") {
-		chomp = "keep"
+	folded, chomp, explicitIndent, ok := parseBlockScalarHeader(indicator)
+	if !ok {
+		return "", fmt.Errorf("invalid block scalar indicator %q", indicator)
 	}
 
 	var blockLines []string
 	contentIndent := -1
+	if explicitIndent > 0 {
+		baseIndent := parentIndent
+		if baseIndent < 0 {
+			baseIndent = 0
+		}
+		contentIndent = baseIndent + explicitIndent
+	}
 
 	for p.pos < len(p.rawLines) {
 		raw := p.rawLines[p.pos]
@@ -598,6 +707,10 @@ func (p *yamlParser) parseBlockScalar(indicator string, parentIndent int) (strin
 		trailingNewlines++
 	}
 
+	isMoreIndented := func(s string) bool {
+		return len(s) > 0 && (s[0] == ' ' || s[0] == '\t')
+	}
+
 	var result string
 	if !folded {
 		result = strings.Join(blockLines, "\n")
@@ -605,7 +718,7 @@ func (p *yamlParser) parseBlockScalar(indicator string, parentIndent int) (strin
 		var sb strings.Builder
 		for i, l := range blockLines {
 			if i > 0 {
-				if l == "" || blockLines[i-1] == "" {
+				if l == "" || blockLines[i-1] == "" || isMoreIndented(l) || isMoreIndented(blockLines[i-1]) {
 					sb.WriteByte('\n')
 				} else {
 					sb.WriteByte(' ')
@@ -747,6 +860,16 @@ func parseKey(raw string) (string, error) {
 	return raw, nil
 }
 
+func isBareInfOrNaN(s string) bool {
+	if s == "" {
+		return false
+	}
+	if s[0] == '+' || s[0] == '-' {
+		s = s[1:]
+	}
+	return strings.EqualFold(s, "inf") || strings.EqualFold(s, "infinity") || strings.EqualFold(s, "nan")
+}
+
 func parseScalar(s string) (any, error) {
 	s = strings.TrimSpace(s)
 	if s == "" || s == "null" || s == "Null" || s == "NULL" || s == "~" {
@@ -765,15 +888,21 @@ func parseScalar(s string) (any, error) {
 	case "false", "False", "FALSE":
 		return false, nil
 	}
+	if strings.ContainsRune(s, '_') || isBareInfOrNaN(s) {
+		return s, nil
+	}
 	if iv, err := strconv.ParseInt(s, 10, 64); err == nil {
 		return iv, nil
 	}
 	if !strings.ContainsAny(s, ".eE") {
-		if uv, err := strconv.ParseUint(s, 10, 64); err == nil {
-			return uv, nil
+		unsignedCand := strings.TrimPrefix(s, "+")
+		if unsignedCand != "" {
+			if uv, err := strconv.ParseUint(unsignedCand, 10, 64); err == nil {
+				return uv, nil
+			}
 		}
 	}
-	if fv, err := strconv.ParseFloat(s, 64); err == nil {
+	if fv, err := strconv.ParseFloat(s, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
 		return fv, nil
 	}
 	return s, nil

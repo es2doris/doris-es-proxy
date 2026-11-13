@@ -26,7 +26,7 @@
       indices.get_alias:
         index: comp_alias_idx_1
         name: comp_alias_view
-  - is_true: comp_alias_idx_1.aliases.comp_alias_view
+  - match: { comp_alias_idx_1.aliases.comp_alias_view: {} }
   - do:
       indices.delete_alias:
         index: comp_alias_idx_1
@@ -260,5 +260,5 @@
   - do:
       search_shards:
         index: comp_r51_idx_1
-  - is_true: indices.comp_r51_idx_1
+  - match: { indices.comp_r51_idx_1: {} }
   - is_true: shards

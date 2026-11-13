@@ -2673,24 +2673,19 @@ func (s *Server) handleTransformAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		id := strings.TrimSpace(r.PathValue("id"))
-		s.mu.Lock()
+		s.mu.RLock()
 		entry, exists := s.transforms[id]
+		s.mu.RUnlock()
 		if !exists || entry == nil {
-			s.mu.Unlock()
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception",
 				fmt.Sprintf("Unknown transform [%s]", id))
 			return
 		}
-		entry["state"] = "started"
-		var destIdx string
-		if destMap, okD := entry["dest"].(map[string]any); okD {
-			destIdx, _ = destMap["index"].(string)
+		if err := s.executeTransformStartRound58(r.Context(), id); err != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+			return
 		}
-		s.mu.Unlock()
-		if destIdx != "" {
-			_ = s.ensureIndexSchema(r.Context(), destIdx)
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"acknowledged": true})
 
 	case "_stop", "stop":
 		if r.Method != http.MethodPost && r.Method != http.MethodPut {
@@ -2837,6 +2832,22 @@ func (s *Server) handleTransformStats(w http.ResponseWriter, r *http.Request) {
 		if state == "" {
 			state = "stopped"
 		}
+		pagesProc := int64(1)
+		if v, ok := toFloat64(entry["pages_processed"]); ok {
+			pagesProc = int64(v)
+		}
+		docsProc := int64(0)
+		if v, ok := toFloat64(entry["documents_processed"]); ok {
+			docsProc = int64(v)
+		}
+		docsIdx := int64(0)
+		if v, ok := toFloat64(entry["documents_indexed"]); ok {
+			docsIdx = int64(v)
+		}
+		trigCnt := int64(1)
+		if v, ok := toFloat64(entry["trigger_count"]); ok && int64(v) > 0 {
+			trigCnt = int64(v)
+		}
 		list = append(list, map[string]any{
 			"id":    k,
 			"state": state,
@@ -2845,23 +2856,23 @@ func (s *Server) handleTransformStats(w http.ResponseWriter, r *http.Request) {
 				"name": "doris-fe-1",
 			},
 			"stats": map[string]any{
-				"pages_processed":                        1,
-				"documents_processed":                    0,
-				"documents_indexed":                      0,
+				"pages_processed":                        pagesProc,
+				"documents_processed":                    docsProc,
+				"documents_indexed":                      docsIdx,
 				"documents_deleted":                      0,
-				"trigger_count":                          1,
+				"trigger_count":                          trigCnt,
 				"index_time_in_ms":                       0,
-				"index_total":                            0,
+				"index_total":                            docsIdx,
 				"index_failures":                         0,
 				"search_time_in_ms":                      0,
-				"search_total":                           1,
+				"search_total":                           trigCnt,
 				"search_failures":                        0,
 				"processing_time_in_ms":                  0,
-				"processing_total":                       1,
+				"processing_total":                       trigCnt,
 				"delete_time_in_ms":                      0,
 				"exponential_avg_checkpoint_duration_ms": 0.0,
-				"exponential_avg_documents_indexed":      0.0,
-				"exponential_avg_documents_processed":    0.0,
+				"exponential_avg_documents_indexed":      float64(docsIdx),
+				"exponential_avg_documents_processed":    float64(docsProc),
 			},
 			"checkpointing": map[string]any{
 				"last": map[string]any{
@@ -2914,10 +2925,22 @@ func (s *Server) handleTransformPreview(w http.ResponseWriter, r *http.Request) 
 			"transform preview requires [source] and either [pivot] or [latest]")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"preview": []any{},
+	matDocs, inferredProps, _, err := s.materializeTransformConfig(r.Context(), cfg)
+	if err != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+		return
+	}
+	previewList := make([]any, 0, len(matDocs))
+	for _, md := range matDocs {
+		previewList = append(previewList, md.Source)
+	}
+	if inferredProps == nil {
+		inferredProps = map[string]any{}
+	}
+	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
+		"preview": previewList,
 		"generated_dest_index": map[string]any{
-			"mappings": map[string]any{"properties": map[string]any{}},
+			"mappings": map[string]any{"properties": inferredProps},
 			"settings": map[string]any{"index": map[string]any{"number_of_shards": "1", "number_of_replicas": "0"}},
 			"aliases":  map[string]any{},
 		},
@@ -4346,7 +4369,7 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 					"job_id":        jobID,
 					"rollup_index":  rIdx,
 					"index_pattern": iPat,
-					"fields":        map[string]any{},
+					"fields":        buildRollupCapabilitiesFields(cfg),
 				})
 				entry["rollup_jobs"] = jobsList
 				out[key] = entry
@@ -4394,7 +4417,11 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 		case "_start", "start":
 			job["state"] = "STARTED"
 			s.mu.Unlock()
-			writeJSON(w, http.StatusOK, map[string]any{"started": true})
+			if err := s.executeRollupStartRound58(r.Context(), jobID); err != nil {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+				return
+			}
+			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"started": true})
 		case "_stop", "stop":
 			job["state"] = "STOPPED"
 			s.mu.Unlock()
@@ -4482,16 +4509,23 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 				state = "STOPPED"
 			}
 			cfg, _ := entry["config"].(map[string]any)
+			var pagesProc, docsProc, rollupsIdx, trigCnt int64
+			if stMap, okSt := entry["stats"].(map[string]any); okSt {
+				pagesProc, _ = toInt64(stMap["pages_processed"])
+				docsProc, _ = toInt64(stMap["documents_processed"])
+				rollupsIdx, _ = toInt64(stMap["rollups_indexed"])
+				trigCnt, _ = toInt64(stMap["trigger_count"])
+			}
 			jobs = append(jobs, map[string]any{
 				"config": deepCloneDocMap(cfg),
 				"status": map[string]any{
 					"job_state": state,
 				},
 				"stats": map[string]any{
-					"pages_processed":     0,
-					"documents_processed": 0,
-					"rollups_indexed":     0,
-					"trigger_count":       0,
+					"pages_processed":     pagesProc,
+					"documents_processed": docsProc,
+					"rollups_indexed":     rollupsIdx,
+					"trigger_count":       trigCnt,
 				},
 			})
 		}
@@ -4530,12 +4564,19 @@ func (s *Server) handleRollupSearch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if rawSize := strings.TrimSpace(r.URL.Query().Get("size")); rawSize != "" {
+		sv, err := strconv.Atoi(rawSize)
+		if err != nil || sv != 0 {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Size is not supported in RollupSearch, must be 0")
+			return
+		}
+	}
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
 		return
 	}
+	var body map[string]any
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
-		var body map[string]any
 		if err := json.Unmarshal(bodyBytes, &body); err != nil {
 			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
 			return
@@ -4544,8 +4585,26 @@ func (s *Server) handleRollupSearch(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "From is not supported in RollupSearch")
 			return
 		}
+		if rawBodySize, hasSize := body["size"]; hasSize && rawBodySize != nil {
+			sv, okS := toInt64(rawBodySize)
+			if !okS || sv != 0 {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Size is not supported in RollupSearch, must be 0")
+				return
+			}
+		}
+	} else {
+		body = make(map[string]any)
 	}
-	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	body["size"] = 0
+	mutatedBytes, _ := json.Marshal(body)
+	var sReq esast.SearchRequest
+	if err := json.Unmarshal(mutatedBytes, &sReq); err == nil {
+		if rollupResp, evaluated := s.tryEvaluateRollupSearchAggs(r.Context(), strings.TrimSpace(r.PathValue("index")), &sReq); evaluated {
+			writeJSONWithRequest(w, r, http.StatusOK, rollupResp)
+			return
+		}
+	}
+	r.Body = io.NopCloser(bytes.NewReader(mutatedBytes))
 	s.handleSearch(w, r)
 }
 
@@ -6078,7 +6137,8 @@ func (s *Server) handleInferenceAPI(w http.ResponseWriter, r *http.Request, segs
 			return
 		}
 		epTaskType, _ := ep["task_type"].(string)
-		if taskType != "" && taskType != "_inference" && taskType != epTaskType {
+		isChunkingAction := taskType == "chunking" && (epTaskType == "text_embedding" || epTaskType == "sparse_embedding")
+		if taskType != "" && taskType != "_inference" && taskType != epTaskType && !isChunkingAction {
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("Inference endpoint [%s] is for task [%s], not [%s]", inferenceID, epTaskType, taskType))
 			return
 		}
@@ -6097,6 +6157,24 @@ func (s *Server) handleInferenceAPI(w http.ResponseWriter, r *http.Request, segs
 			}
 		default:
 			inputs = []string{fmt.Sprintf("%v", iv)}
+		}
+		if isChunkingAction {
+			results := make([]any, 0, len(inputs))
+			for _, inp := range inputs {
+				var chunks []any
+				for _, part := range strings.Split(strings.ReplaceAll(inp, "\n", ". "), ". ") {
+					trimmed := strings.TrimSpace(part)
+					if trimmed != "" {
+						chunks = append(chunks, trimmed)
+					}
+				}
+				if len(chunks) == 0 {
+					chunks = []any{inp}
+				}
+				results = append(results, map[string]any{"chunks": chunks})
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"results": results})
+			return
 		}
 		switch epTaskType {
 		case "text_embedding":
@@ -7439,7 +7517,7 @@ func (s *Server) handleCatTransforms(w http.ResponseWriter, r *http.Request) {
 	}
 	transformID := strings.TrimSpace(r.PathValue("transform_id"))
 	s.mu.RLock()
-	if transformID != "" && transformID != "_all" && !strings.Contains(transformID, "*") {
+	if transformID != "" && transformID != "_all" && !strings.ContainsAny(transformID, "*?,") && !strings.HasPrefix(transformID, "-") {
 		if _, exists := s.transforms[transformID]; !exists {
 			s.mu.RUnlock()
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Transform [%s] not found", transformID))
@@ -7448,7 +7526,7 @@ func (s *Server) handleCatTransforms(w http.ResponseWriter, r *http.Request) {
 	}
 	ids := make([]string, 0, len(s.transforms))
 	for id := range s.transforms {
-		if transformID == "" || transformID == "_all" || matchSimpleWildcard(transformID, id) {
+		if transformID == "" || transformID == "_all" || matchMultiWildcardWithExclusions(transformID, id) {
 			ids = append(ids, id)
 		}
 	}
@@ -7476,22 +7554,25 @@ func (s *Server) handleCatTransforms(w http.ResponseWriter, r *http.Request) {
 		if freq == "" {
 			freq = "1m"
 		}
+		st, _ := tr["state"].(string)
+		if st == "" {
+			st = "stopped"
+		}
+		docsProc, _ := toInt64(tr["documents_processed"])
+		docsIdx, _ := toInt64(tr["documents_indexed"])
+		pagesProc, _ := toInt64(tr["pages_processed"])
 		rows = append(rows, map[string]any{
 			"id":                  id,
-			"state":               "started",
-			"checkpoint":          "1",
-			"documents_processed": "0",
-			"documents_indexed":   "0",
+			"state":               st,
+			"checkpoint":          fmt.Sprintf("%d", pagesProc),
+			"documents_processed": fmt.Sprintf("%d", docsProc),
+			"documents_indexed":   fmt.Sprintf("%d", docsIdx),
 			"source_index":        srcIdx,
 			"dest_index":          destIdx,
 			"frequency":           freq,
 		})
 	}
 	s.mu.RUnlock()
-	if r.Method == http.MethodHead {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
 	writeCatResponse(w, r, headers, rows)
 }
 
@@ -8625,7 +8706,7 @@ func (s *Server) handleMLDatafeeds(w http.ResponseWriter, r *http.Request, segs 
 			writeJSON(w, http.StatusOK, cp)
 		case "_preview":
 			s.mu.Unlock()
-			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			if r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodHead {
 				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 				return
 			}
@@ -8644,6 +8725,18 @@ func (s *Server) handleMLDatafeeds(w http.ResponseWriter, r *http.Request, segs 
 	dfID := ""
 	if len(segs) >= 3 {
 		dfID = strings.TrimSpace(segs[2])
+	}
+	if dfID == "_preview" {
+		if r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodHead {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		writeJSON(w, http.StatusOK, []any{})
+		return
 	}
 	switch r.Method {
 	case http.MethodPut:

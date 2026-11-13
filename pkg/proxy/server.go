@@ -124,17 +124,18 @@ type CatalogBackend interface {
 	LoadCatalogEntries(ctx context.Context, db string) ([]CatalogEntry, error)
 }
 
-// AliasMetadata stores optional Elasticsearch alias filter, write-index flag, and routing metadata.
+// AliasMetadata stores optional Elasticsearch alias filter, write-index flag, hidden flag, and routing metadata.
 type AliasMetadata struct {
 	Filter        *esast.Query `json:"filter,omitempty"`
 	IsWriteIndex  *bool        `json:"is_write_index,omitempty"`
+	IsHidden      *bool        `json:"is_hidden,omitempty"`
 	Routing       string       `json:"routing,omitempty"`
 	IndexRouting  string       `json:"index_routing,omitempty"`
 	SearchRouting string       `json:"search_routing,omitempty"`
 }
 
 func (m AliasMetadata) isEmpty() bool {
-	return m.Filter == nil && m.IsWriteIndex == nil && m.Routing == "" && m.IndexRouting == "" && m.SearchRouting == ""
+	return m.Filter == nil && m.IsWriteIndex == nil && m.IsHidden == nil && m.Routing == "" && m.IndexRouting == "" && m.SearchRouting == ""
 }
 
 func (m AliasMetadata) toMap() map[string]any {
@@ -144,6 +145,9 @@ func (m AliasMetadata) toMap() map[string]any {
 	}
 	if m.IsWriteIndex != nil {
 		out["is_write_index"] = *m.IsWriteIndex
+	}
+	if m.IsHidden != nil {
+		out["is_hidden"] = *m.IsHidden
 	}
 	if m.Routing != "" {
 		out["routing"] = m.Routing
@@ -250,6 +254,12 @@ type Server struct {
 	fleetSecrets              map[string]map[string]any
 	securitySessions          map[string]map[string]any
 	migrationSystemFeatures   map[string]bool
+	legacyTemplates           map[string]esast.IndexTemplateRequest
+	pits                      map[string]*pitContextEntry
+	pitSeq                    int64
+	scrollContexts            map[string]*scrollContextEntry
+	invalidatedScrollSessions map[string]bool
+	scrollSeq                 int64
 }
 
 func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerOptions) *Server {
@@ -335,6 +345,10 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		fleetSecrets:              make(map[string]map[string]any),
 		securitySessions:          make(map[string]map[string]any),
 		migrationSystemFeatures:   make(map[string]bool),
+		legacyTemplates:           make(map[string]esast.IndexTemplateRequest),
+		pits:                      make(map[string]*pitContextEntry),
+		scrollContexts:            make(map[string]*scrollContextEntry),
+		invalidatedScrollSessions: make(map[string]bool),
 	}
 	s.coalescer = newStreamLoadCoalescer(func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
 		err := s.backend.StreamLoad(ctx, table, ndjson, syncRefresh)
@@ -558,6 +572,19 @@ func (s *Server) syncCatalogFromBackend(ctx context.Context) error {
 			if err := json.Unmarshal([]byte(e.PayloadJSON), &tpl); err == nil {
 				s.templates[e.EntityKey] = tpl
 			}
+		case "legacy_template":
+			if isDeleted {
+				delete(s.legacyTemplates, e.EntityKey)
+				continue
+			}
+			var tpl esast.IndexTemplateRequest
+			if err := json.Unmarshal([]byte(e.PayloadJSON), &tpl); err == nil {
+				tpl.Legacy = true
+				if s.legacyTemplates == nil {
+					s.legacyTemplates = make(map[string]esast.IndexTemplateRequest)
+				}
+				s.legacyTemplates[e.EntityKey] = tpl
+			}
 		case "component_template":
 			if isDeleted {
 				delete(s.componentTemplates, e.EntityKey)
@@ -739,7 +766,7 @@ func (s *Server) deleteILMPolicyCatalog(ctx context.Context, name string) {
 
 func (s *Server) persistTemplate(ctx context.Context, name string, tpl esast.IndexTemplateRequest) {
 	if cb, ok := s.backend.(CatalogBackend); ok {
-		if raw, err := json.Marshal(tpl); err == nil {
+		if raw, err := marshalTemplatePreservingEmptyMaps(tpl); err == nil {
 			_ = cb.UpsertCatalogEntry(ctx, s.dorisDB, CatalogEntry{
 				EntityType:     "template",
 				EntityKey:      name,
@@ -1131,6 +1158,10 @@ func (s *Server) Handler() http.Handler {
 			case "_nodes":
 				s.handleNodes(w, r)
 			case "_mapping", "_mappings":
+				if r.Method != http.MethodGet {
+					writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+					return
+				}
 				s.handleGetAllMappings(w, r)
 			case "_field_caps":
 				s.handleFieldCaps(w, r)
@@ -1306,7 +1337,10 @@ func (s *Server) Handler() http.Handler {
 			case segs[0] == "_cat" && segs[1] == "thread_pool":
 				s.handleCatThreadPool(w, r)
 			case segs[0] == "_cat" && (segs[1] == "templates" || segs[1] == "index_templates"):
-				s.handleCatTemplates(w, r)
+				s.handleCatTemplatesRound58(w, r)
+			case segs[0] == "_pit" && segs[1] == "_all":
+				r.SetPathValue("pit_all", "true")
+				s.handlePIT(w, r)
 			case segs[0] == "_search" && segs[1] == "scroll":
 				s.handleScroll(w, r)
 			case segs[0] == "_doris" && segs[1] == "explain":
@@ -1351,10 +1385,13 @@ func (s *Server) Handler() http.Handler {
 				r.SetPathValue("index", segs[0])
 				switch segs[1] {
 				case "_mapping", "_mappings":
-					if r.Method == http.MethodGet {
+					switch r.Method {
+					case http.MethodGet:
 						s.handleGetMapping(w, r)
-					} else {
+					case http.MethodPut, http.MethodPost:
 						s.handlePutMapping(w, r)
+					default:
+						writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 					}
 				case "_settings":
 					s.handleIndexSettings(w, r)
@@ -1677,7 +1714,7 @@ func (s *Server) Handler() http.Handler {
 					s.handleCatPlugins(w, r)
 					return
 				case "templates", "index_templates":
-					s.handleCatTemplates(w, r)
+					s.handleCatTemplatesRound58(w, r)
 					return
 				}
 			}
@@ -1736,10 +1773,13 @@ func (s *Server) Handler() http.Handler {
 				return
 			}
 			if segs[1] == "_mapping" || segs[1] == "_mappings" {
-				if r.Method == http.MethodGet {
+				switch r.Method {
+				case http.MethodGet:
 					s.handleGetMapping(w, r)
-				} else {
+				case http.MethodPut, http.MethodPost:
 					s.handlePutMapping(w, r)
+				default:
+					writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 				}
 				return
 			}
@@ -2929,6 +2969,7 @@ func (s *Server) handleDataStream(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.RUnlock()
 		if r.Method == http.MethodHead {
+			ensureESCompatHeaders(w, r)
 			if missingConcrete != "" || len(list) == 0 {
 				w.WriteHeader(http.StatusNotFound)
 				return
@@ -2977,6 +3018,14 @@ func (s *Server) handleCatIndices(w http.ResponseWriter, r *http.Request) {
 		if s.isIndexClosed(name) {
 			idxStatus = "close"
 		}
+		docsCount := "0"
+		if r != nil && r.Method != http.MethodHead && !isTruthyBoolQueryParam(r, "help") && idxStatus == "open" {
+			zero := 0
+			if resp, status, _, _ := s.executeSearchRequest(r.Context(), name, &esast.SearchRequest{Size: &zero}); status == http.StatusOK {
+				total, _ := extractTotalAndHitIDs(resp)
+				docsCount = strconv.FormatInt(total, 10)
+			}
+		}
 		list = append(list, map[string]any{
 			"health":         "green",
 			"status":         idxStatus,
@@ -2984,7 +3033,7 @@ func (s *Server) handleCatIndices(w http.ResponseWriter, r *http.Request) {
 			"uuid":           name,
 			"pri":            "1",
 			"rep":            "0",
-			"docs.count":     "0",
+			"docs.count":     docsCount,
 			"docs.deleted":   "0",
 			"store.size":     "0b",
 			"pri.store.size": "0b",
@@ -3093,6 +3142,7 @@ func (s *Server) handleCatRoot(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, endpoints)
 		return
 	}
+	ensureESCompatHeaders(w, r)
 	w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("=^.^=\n" + strings.Join(endpoints, "\n") + "\n"))
@@ -3177,79 +3227,146 @@ func decodeScrollCursor(token string) (*scrollCursor, bool) {
 }
 
 func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodDelete {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
 		return
 	}
 	if r.Method == http.MethodDelete {
-		numFreed := 1
-		if pathScrollID := strings.TrimSpace(r.PathValue("scroll_id")); pathScrollID != "" && pathScrollID != "_all" {
-			parts := strings.Split(pathScrollID, ",")
-			cnt := 0
-			for _, p := range parts {
-				if strings.TrimSpace(p) != "" {
-					cnt++
+		pathScrollID := strings.TrimSpace(r.PathValue("scroll_id"))
+		queryScrollID := strings.TrimSpace(r.URL.Query().Get("scroll_id"))
+		clearAll := pathScrollID == "_all" || queryScrollID == "_all"
+		var ids []string
+		appendSplitIDs := func(raw string) {
+			for _, p := range strings.Split(raw, ",") {
+				p = strings.TrimSpace(p)
+				if p == "_all" {
+					clearAll = true
+				} else if p != "" {
+					ids = append(ids, p)
 				}
 			}
-			if cnt > 0 {
-				numFreed = cnt
-			}
 		}
-		if len(bytes.TrimSpace(bodyBytes)) > 0 {
-			var body struct {
-				ScrollID any `json:"scroll_id"`
-			}
-			if err := json.Unmarshal(bodyBytes, &body); err == nil {
+		if pathScrollID != "" && pathScrollID != "_all" {
+			appendSplitIDs(pathScrollID)
+		}
+		if queryScrollID != "" && queryScrollID != "_all" {
+			appendSplitIDs(queryScrollID)
+		}
+		if trimmedBody := bytes.TrimSpace(bodyBytes); len(trimmedBody) > 0 {
+			switch trimmedBody[0] {
+			case '{':
+				var body struct {
+					ScrollID any `json:"scroll_id"`
+				}
+				if err := json.Unmarshal(trimmedBody, &body); err != nil {
+					writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+					return
+				}
 				switch sid := body.ScrollID.(type) {
-				case []any:
-					if len(sid) > 0 {
-						numFreed = len(sid)
-					}
 				case string:
-					if strings.Contains(sid, ",") {
-						cnt := 0
-						for _, p := range strings.Split(sid, ",") {
-							if strings.TrimSpace(p) != "" {
-								cnt++
-							}
+					appendSplitIDs(sid)
+				case []any:
+					for _, elem := range sid {
+						sVal, okS := elem.(string)
+						if !okS {
+							writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[scroll_id] elements must be strings")
+							return
 						}
-						if cnt > 0 {
-							numFreed = cnt
-						}
+						appendSplitIDs(sVal)
 					}
+				case nil:
+				default:
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[scroll_id] must be a string or array of strings")
+					return
+				}
+			case '[':
+				var arr []string
+				if err := json.Unmarshal(trimmedBody, &arr); err != nil {
+					writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+					return
+				}
+				for _, elem := range arr {
+					appendSplitIDs(elem)
+				}
+			default:
+				var rawStr string
+				if err := json.Unmarshal(trimmedBody, &rawStr); err == nil {
+					appendSplitIDs(rawStr)
+				} else {
+					appendSplitIDs(strings.Trim(string(trimmedBody), "\"'"))
 				}
 			}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"succeeded": true, "num_freed": numFreed})
+		if !clearAll && len(ids) == 0 {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: no scroll ids specified;")
+			return
+		}
+		succeeded, numFreed := s.clearScrollTokens(ids, clearAll)
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"succeeded": succeeded, "num_freed": numFreed})
 		return
 	}
-	scrollID := r.URL.Query().Get("scroll_id")
+
+	rawScrollTTL := strings.TrimSpace(r.URL.Query().Get("scroll"))
+	scrollID := strings.TrimSpace(r.URL.Query().Get("scroll_id"))
 	if scrollID == "" {
 		scrollID = strings.TrimSpace(r.PathValue("scroll_id"))
 	}
 	if trimmedBody := bytes.TrimSpace(bodyBytes); len(trimmedBody) > 0 {
-		var body struct {
-			ScrollID any `json:"scroll_id"`
-		}
-		if err := json.Unmarshal(trimmedBody, &body); err == nil {
+		switch trimmedBody[0] {
+		case '{':
+			var body struct {
+				ScrollID any    `json:"scroll_id"`
+				Scroll   string `json:"scroll"`
+			}
+			if err := json.Unmarshal(trimmedBody, &body); err != nil {
+				writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+				return
+			}
+			if strings.TrimSpace(body.Scroll) != "" && rawScrollTTL == "" {
+				rawScrollTTL = strings.TrimSpace(body.Scroll)
+			}
 			switch v := body.ScrollID.(type) {
 			case string:
-				if v != "" {
-					scrollID = v
+				if strings.TrimSpace(v) != "" {
+					scrollID = strings.TrimSpace(v)
 				}
 			case []any:
 				if len(v) > 0 {
-					scrollID = fmt.Sprintf("%v", v[0])
+					scrollID = strings.TrimSpace(fmt.Sprintf("%v", v[0]))
 				}
+			case nil:
+			default:
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[scroll_id] must be a string")
+				return
 			}
-		} else {
+		case '[':
+			writeESError(w, http.StatusBadRequest, "parsing_exception", "scroll request body must be a JSON object or raw scroll_id string")
+			return
+		default:
 			var rawStr string
 			if errStr := json.Unmarshal(trimmedBody, &rawStr); errStr == nil && rawStr != "" {
-				scrollID = rawStr
-			} else if trimmedBody[0] != '{' && trimmedBody[0] != '[' {
-				scrollID = strings.Trim(string(trimmedBody), "\"'")
+				scrollID = strings.TrimSpace(rawStr)
+			} else {
+				scrollID = strings.TrimSpace(strings.Trim(string(trimmedBody), "\"'"))
 			}
 		}
+	}
+	var extendTTL time.Duration
+	if rawScrollTTL != "" {
+		ttl, err := parseESPositiveDuration(rawScrollTTL)
+		if err != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("failed to parse [scroll] value [%s]: %v", rawScrollTTL, err))
+			return
+		}
+		extendTTL = ttl
+	}
+	if scrollID == "" {
+		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: scrollId is missing;")
+		return
 	}
 	cursor, ok := decodeScrollCursor(scrollID)
 	if !ok {
@@ -3257,6 +3374,11 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cursor.Exhausted || len(cursor.LastSort) == 0 {
+		eofScrollID := encodeScrollCursorWithState(cursor.Index, &cursor.Req, nil, cursor.Total, true)
+		if !s.validateAndAdvanceScrollToken(scrollID, eofScrollID, extendTTL) {
+			writeESError(w, http.StatusNotFound, "search_context_missing_exception", "No search context found for id ["+scrollID+"]")
+			return
+		}
 		eofRel := "eq"
 		if thresh, okT := trackTotalHitsThreshold(&cursor.Req); okT && thresh > 0 && cursor.Total >= thresh {
 			eofRel = "gte"
@@ -3279,13 +3401,17 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 		if eofTotal != nil {
 			hitsMap["total"] = eofTotal
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"_scroll_id": encodeScrollCursorWithState(cursor.Index, &cursor.Req, nil, cursor.Total, true),
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
+			"_scroll_id": eofScrollID,
 			"took":       1,
 			"timed_out":  false,
 			"_shards":    map[string]any{"total": 1, "successful": 1, "skipped": 0, "failed": 0},
 			"hits":       hitsMap,
 		})
+		return
+	}
+	if !s.validateAndAdvanceScrollToken(scrollID, "", 0) {
+		writeESError(w, http.StatusNotFound, "search_context_missing_exception", "No search context found for id ["+scrollID+"]")
 		return
 	}
 	req := cursor.Req
@@ -3314,6 +3440,7 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 	}
 	lastSort := extractLastHitSort(resp)
 	nextScrollID := encodeScrollCursorWithState(cursor.Index, &req, lastSort, total, len(lastSort) == 0)
+	_ = s.validateAndAdvanceScrollToken(scrollID, nextScrollID, extendTTL)
 	resp["_scroll_id"] = nextScrollID
 	if isTruthyBoolQueryParam(r, "typed_keys") {
 		if aggsMap, ok := resp["aggregations"].(map[string]any); ok {
@@ -3326,7 +3453,7 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 	if isTruthyBoolQueryParam(r, "rest_total_hits_as_int") {
 		applyRestTotalHitsAsInt(resp, &req)
 	}
-	writeJSON(w, http.StatusOK, resp)
+	writeJSONWithRequest(w, r, http.StatusOK, resp)
 }
 
 func isTruthyBoolQueryParam(r *http.Request, key string) bool {
@@ -3447,6 +3574,7 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 			s.queryCache.InvalidateAll()
 			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 		case http.MethodHead:
+			ensureESCompatHeaders(w, r)
 			_ = s.syncCatalogFromBackend(r.Context())
 			patterns := []string{"*"}
 			if name != "" && name != "_all" {
@@ -3563,201 +3691,7 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	switch r.Method {
-	case http.MethodPut, http.MethodPost:
-		if name == "" {
-			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: name is missing;")
-			return
-		}
-		var tpl esast.IndexTemplateRequest
-		var verHolder struct {
-			Version *int `json:"version"`
-		}
-		bodyBytes, ok := readRequestBody(w, r)
-		if !ok {
-			return
-		}
-		var parsedTemplateLifecycle map[string]any
-		if len(bytes.TrimSpace(bodyBytes)) > 0 {
-			if err := json.Unmarshal(bodyBytes, &tpl); err != nil {
-				writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
-				return
-			}
-			_ = json.Unmarshal(bodyBytes, &verHolder)
-			var rawTplMap map[string]any
-			if err := json.Unmarshal(bodyBytes, &rawTplMap); err == nil {
-				if innerTpl, okT := rawTplMap["template"].(map[string]any); okT {
-					if lcRaw, okLC := innerTpl["lifecycle"].(map[string]any); okLC {
-						lcNorm, err := normalizeAndValidateDataStreamLifecycle(lcRaw)
-						if err != nil {
-							writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
-							return
-						}
-						parsedTemplateLifecycle = lcNorm
-					}
-				}
-			}
-		}
-		if len(tpl.EffectivePatterns()) == 0 {
-			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: index_patterns is missing;")
-			return
-		}
-		_ = s.syncCatalogFromBackend(r.Context())
-		if isTruthyBoolQueryParam(r, "create") {
-			s.mu.RLock()
-			_, exists := s.templates[name]
-			s.mu.RUnlock()
-			if exists {
-				writeESError(w, http.StatusBadRequest, "resource_already_exists_exception", "index_template ["+name+"] already exists")
-				return
-			}
-		}
-		s.mu.RLock()
-		for _, compName := range tpl.ComposedOf {
-			if _, exists := s.componentTemplates[compName]; !exists {
-				s.mu.RUnlock()
-				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
-					fmt.Sprintf("index_template [%s] invalid, cause [Validation Failed: 1: component template [%s] not found;]", name, compName))
-				return
-			}
-		}
-		s.mu.RUnlock()
-		s.mu.Lock()
-		s.templates[name] = tpl
-		if s.templateLifecycles == nil {
-			s.templateLifecycles = make(map[string]map[string]any)
-		}
-		if parsedTemplateLifecycle != nil {
-			s.templateLifecycles[name] = parsedTemplateLifecycle
-		} else {
-			delete(s.templateLifecycles, name)
-		}
-		if verHolder.Version != nil {
-			s.templateVersions[name] = *verHolder.Version
-		} else {
-			delete(s.templateVersions, name)
-		}
-		s.mu.Unlock()
-		s.persistTemplate(r.Context(), name, tpl)
-		s.queryCache.InvalidateAll()
-		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
-	case http.MethodHead:
-		_ = s.syncCatalogFromBackend(r.Context())
-		patterns := []string{"*"}
-		if name != "" && name != "_all" {
-			patterns = strings.Split(name, ",")
-			for i := range patterns {
-				patterns[i] = strings.TrimSpace(patterns[i])
-			}
-		}
-		s.mu.RLock()
-		ok := false
-		if name != "" && name != "_all" && !strings.ContainsAny(name, "*?") && !strings.HasPrefix(name, "-") {
-			ok = true
-			for _, p := range patterns {
-				if p == "" {
-					continue
-				}
-				if _, exists := s.templates[p]; !exists {
-					ok = false
-					break
-				}
-			}
-		} else {
-			for k := range s.templates {
-				if matchesTemplateNamePatterns(k, patterns) {
-					ok = true
-					break
-				}
-			}
-		}
-		s.mu.RUnlock()
-		if !ok {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	case http.MethodGet:
-		_ = s.syncCatalogFromBackend(r.Context())
-		trimmedPath := strings.Trim(r.URL.Path, "/")
-		isLegacy := strings.HasPrefix(trimmedPath, "_template")
-		patterns := []string{"*"}
-		if name != "" && name != "_all" {
-			patterns = strings.Split(name, ",")
-			for i := range patterns {
-				patterns[i] = strings.TrimSpace(patterns[i])
-			}
-		}
-		s.mu.RLock()
-		var matchedNames []string
-		for k := range s.templates {
-			if matchesTemplateNamePatterns(k, patterns) {
-				matchedNames = append(matchedNames, k)
-			}
-		}
-		sort.Strings(matchedNames)
-		if name != "" && !strings.ContainsAny(name, "*?,") && !strings.HasPrefix(name, "-") && name != "_all" && len(matchedNames) == 0 {
-			s.mu.RUnlock()
-			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "index_template ["+name+"] missing")
-			return
-		}
-		if isLegacy {
-			legacyOut := make(map[string]any, len(matchedNames))
-			for _, k := range matchedNames {
-				legacyOut[k] = s.templates[k]
-			}
-			s.mu.RUnlock()
-			writeJSON(w, http.StatusOK, legacyOut)
-			return
-		}
-		list := make([]map[string]any, 0, len(matchedNames))
-		for _, k := range matchedNames {
-			list = append(list, map[string]any{"name": k, "index_template": s.templates[k]})
-		}
-		s.mu.RUnlock()
-		writeJSON(w, http.StatusOK, map[string]any{"index_templates": list})
-	case http.MethodDelete:
-		if name == "" {
-			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: name is missing;")
-			return
-		}
-		_ = s.syncCatalogFromBackend(r.Context())
-		patterns := []string{"*"}
-		if name != "_all" {
-			patterns = strings.Split(name, ",")
-			for i := range patterns {
-				patterns[i] = strings.TrimSpace(patterns[i])
-			}
-		}
-		s.mu.Lock()
-		var toDelete []string
-		if strings.ContainsAny(name, "*?,") || strings.HasPrefix(name, "-") || name == "_all" {
-			for k := range s.templates {
-				if matchesTemplateNamePatterns(k, patterns) {
-					toDelete = append(toDelete, k)
-				}
-			}
-		} else if _, existed := s.templates[name]; existed {
-			toDelete = []string{name}
-		}
-		for _, k := range toDelete {
-			delete(s.templates, k)
-			delete(s.templateVersions, k)
-			delete(s.templateLifecycles, k)
-		}
-		s.mu.Unlock()
-		if len(toDelete) == 0 {
-			writeESError(w, http.StatusNotFound, "index_template_missing_exception", "index_template ["+name+"] missing")
-			return
-		}
-		for _, k := range toDelete {
-			s.deleteCatalogEntity(r.Context(), "template", k)
-		}
-		s.queryCache.InvalidateAll()
-		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
-	default:
-		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
-	}
+	s.handleComposableOrLegacyTemplateRound58(w, r, name)
 }
 
 func (s *Server) matchingTemplateMappingsLocked(indexName string) *esast.MappingSpec {
@@ -3766,70 +3700,8 @@ func (s *Server) matchingTemplateMappingsLocked(indexName string) *esast.Mapping
 }
 
 func (s *Server) matchingTemplateConfigLocked(indexName string) (*esast.MappingSpec, string, bool, string, bool, map[string]map[string]any) {
-	var merged *esast.MappingSpec
-	var defaultPipeline string
-	var hasDefaultPipeline bool
-	var finalPipeline string
-	var hasFinalPipeline bool
-	var mergedAliases map[string]map[string]any
-
-	var matchedNames []string
-	for k, tpl := range s.templates {
-		for _, pat := range tpl.EffectivePatterns() {
-			if matchWildcardPattern(pat, indexName) {
-				matchedNames = append(matchedNames, k)
-				break
-			}
-		}
-	}
-	sort.Slice(matchedNames, func(i, j int) bool {
-		pi := s.templates[matchedNames[i]].EffectivePriority()
-		pj := s.templates[matchedNames[j]].EffectivePriority()
-		if pi != pj {
-			return pi < pj
-		}
-		return matchedNames[i] < matchedNames[j]
-	})
-
-	applyTemplateSpec := func(t esast.IndexTemplateRequest) {
-		if m := t.EffectiveMappings(); m != nil {
-			merged = schema.MergeMappingSpecs(merged, m)
-		}
-		if ts := t.EffectiveSettings(); len(ts) > 0 {
-			if p, found := extractDefaultPipelineFromSettings(ts); found {
-				defaultPipeline = p
-				hasDefaultPipeline = true
-			}
-			if fp, found := extractFinalPipelineFromSettings(ts); found {
-				finalPipeline = fp
-				hasFinalPipeline = true
-			}
-		}
-		if ta := t.EffectiveAliases(); len(ta) > 0 {
-			if mergedAliases == nil {
-				mergedAliases = make(map[string]map[string]any, len(ta))
-			}
-			for al, meta := range ta {
-				mergedAliases[al] = meta
-			}
-		}
-	}
-
-	for _, name := range matchedNames {
-		tpl := s.templates[name]
-		for _, compName := range tpl.ComposedOf {
-			if compRaw, ok := s.componentTemplates[compName]; ok && len(compRaw) > 0 {
-				if rawBytes, err := json.Marshal(compRaw); err == nil {
-					var compTpl esast.IndexTemplateRequest
-					if err := json.Unmarshal(rawBytes, &compTpl); err == nil {
-						applyTemplateSpec(compTpl)
-					}
-				}
-			}
-		}
-		applyTemplateSpec(tpl)
-	}
-	return merged, defaultPipeline, hasDefaultPipeline, finalPipeline, hasFinalPipeline, mergedAliases
+	merged, defP, hasDefP, finP, hasFinP, aliases, _, _ := s.matchingTemplateFullConfigLocked(indexName)
+	return merged, defP, hasDefP, finP, hasFinP, aliases
 }
 
 func validateESIndexName(name string) (string, bool) {
@@ -3918,9 +3790,19 @@ func (s *Server) findClosedTargetIndex(r *http.Request, rawIndex string) string 
 func (s *Server) resolveValidatedReadTargets(w http.ResponseWriter, r *http.Request, rawIndex string) ([]string, map[string]*esast.Query, bool) {
 	_ = s.syncCatalogFromBackend(r.Context())
 	rawIndex = strings.TrimSpace(rawIndex)
-	ew := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("expand_wildcards")))
-	if ew == "none" && (strings.ContainsAny(rawIndex, "*?") || rawIndex == "_all") {
+	ewOpen, ewClosed, ewHidden, ewNone, ewErr := parseExpandWildcardsFlags(r.URL.Query().Get("expand_wildcards"))
+	if ewErr != nil {
 		if r.Method == http.MethodHead {
+			ensureESCompatHeaders(w, r)
+			w.WriteHeader(http.StatusBadRequest)
+			return nil, nil, false
+		}
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", ewErr.Error())
+		return nil, nil, false
+	}
+	if ewNone && (strings.ContainsAny(rawIndex, "*?") || rawIndex == "_all") {
+		if r.Method == http.MethodHead {
+			ensureESCompatHeaders(w, r)
 			w.WriteHeader(http.StatusNotFound)
 			return nil, nil, false
 		}
@@ -3951,6 +3833,11 @@ func (s *Server) resolveValidatedReadTargets(w http.ResponseWriter, r *http.Requ
 			_, isIdx := s.indices[part]
 			_, isAlias := s.aliases[part]
 			_, isDS := s.dataStreams[part]
+			if isDS {
+				for _, bi := range extractDataStreamBackingIndexNames(s.dataStreams[part]) {
+					concreteTargets[bi] = true
+				}
+			}
 			if !isIdx && !isAlias && !isDS && strings.HasPrefix(part, ".ds-") && strings.HasSuffix(part, "-000001") {
 				dsName := strings.TrimSuffix(strings.TrimPrefix(part, ".ds-"), "-000001")
 				if _, okDS := s.dataStreams[dsName]; okDS {
@@ -3966,6 +3853,7 @@ func (s *Server) resolveValidatedReadTargets(w http.ResponseWriter, r *http.Requ
 
 	if missingConcrete != "" && !ignoreUnavailable {
 		if r.Method == http.MethodHead {
+			ensureESCompatHeaders(w, r)
 			w.WriteHeader(http.StatusNotFound)
 			return nil, nil, false
 		}
@@ -3973,7 +3861,7 @@ func (s *Server) resolveValidatedReadTargets(w http.ResponseWriter, r *http.Requ
 		return nil, nil, false
 	}
 
-	targets, aliasFilters := s.resolveTargetIndicesWithFilters(rawIndex)
+	targets, aliasFilters := s.resolveTargetIndicesWithOptions(rawIndex, ewHidden)
 	s.mu.RLock()
 	var validTargets []string
 	for _, t := range targets {
@@ -3993,10 +3881,10 @@ func (s *Server) resolveValidatedReadTargets(w http.ResponseWriter, r *http.Requ
 		}
 		isClosed := s.closedIndices[t]
 		if !concreteTargets[t] {
-			if ew == "closed" && !isClosed {
+			if (isClosed && !ewClosed) || (!isClosed && !ewOpen) {
 				continue
 			}
-			if ew == "open" && isClosed {
+			if s.isIndexExplicitlyHiddenLocked(t) && !ewHidden {
 				continue
 			}
 		}
@@ -4007,6 +3895,7 @@ func (s *Server) resolveValidatedReadTargets(w http.ResponseWriter, r *http.Requ
 	if len(validTargets) == 0 && rawIndex != "" {
 		if !allowNoIndices || (!hasExplicitAllowNoIndices && !ignoreUnavailable && !strings.ContainsAny(rawIndex, "*?,") && !strings.HasPrefix(rawIndex, "-") && rawIndex != "_all") {
 			if r.Method == http.MethodHead {
+				ensureESCompatHeaders(w, r)
 				w.WriteHeader(http.StatusNotFound)
 				return nil, nil, false
 			}
@@ -4051,7 +3940,7 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	tplMappings, tplDefPipe, hasTplDefPipe, tplFinPipe, hasTplFinPipe, tplAliases := s.matchingTemplateConfigLocked(indexName)
+	tplMappings, tplDefPipe, hasTplDefPipe, tplFinPipe, hasTplFinPipe, tplAliases, tplCustomSettings, _ := s.matchingTemplateFullConfigLocked(indexName)
 	s.mu.RUnlock()
 	if hasAliasCollision {
 		writeESError(w, http.StatusBadRequest, "invalid_index_name_exception",
@@ -4134,6 +4023,20 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 			s.indexFinalPipelines[indexName] = fp
 		}
 	}
+	if len(tplCustomSettings) > 0 {
+		if s.indexCustomSettings == nil {
+			s.indexCustomSettings = make(map[string]map[string]any)
+		}
+		if s.indexCustomSettings[indexName] == nil {
+			s.indexCustomSettings[indexName] = make(map[string]any)
+		}
+		for k, v := range tplCustomSettings {
+			if k == "default_pipeline" || k == "final_pipeline" || v == nil {
+				continue
+			}
+			s.indexCustomSettings[indexName][k] = normalizeCustomSettingValue(v)
+		}
+	}
 	if customFlat := extractCustomIndexSettings(req.Settings); len(customFlat) > 0 {
 		if s.indexCustomSettings == nil {
 			s.indexCustomSettings = make(map[string]map[string]any)
@@ -4207,26 +4110,30 @@ func (s *Server) handleGetIndex(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		idxSettings := map[string]any{"number_of_shards": "1", "number_of_replicas": "0"}
-		if defPipe := s.indexDefaultPipelines[indexName]; defPipe != "" {
-			idxSettings["default_pipeline"] = defPipe
-		}
-		if finPipe := s.indexFinalPipelines[indexName]; finPipe != "" {
-			idxSettings["final_pipeline"] = finPipe
-		}
+		shortFlat := s.buildIndexSettingsMapLocked(indexName)
 		resp[indexName] = map[string]any{
 			"aliases":  idxAliases,
 			"mappings": mappings,
-			"settings": map[string]any{"index": idxSettings},
+			"settings": formatIndexSettingsOutput(shortFlat, isTruthyBoolQueryParam(r, "flat_settings")),
 		}
 	}
-	writeJSON(w, http.StatusOK, resp)
+	writeJSONWithRequest(w, r, http.StatusOK, resp)
 }
 
 func (s *Server) handleHeadIndex(w http.ResponseWriter, r *http.Request) {
+	ensureESCompatHeaders(w, r)
 	_ = s.syncCatalogFromBackend(r.Context())
 	raw := strings.TrimSpace(r.PathValue("index"))
 	if raw == "" {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	ewOpen, ewClosed, ewHidden, ewNone, ewErr := parseExpandWildcardsFlags(r.URL.Query().Get("expand_wildcards"))
+	if ewErr != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if ewNone && (strings.ContainsAny(raw, "*?") || raw == "_all") {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -4244,7 +4151,7 @@ func (s *Server) handleHeadIndex(w http.ResponseWriter, r *http.Request) {
 		return false
 	}
 
-	if !strings.ContainsAny(raw, "*,") && raw != "_all" {
+	if !strings.ContainsAny(raw, "*?,") && !strings.HasPrefix(raw, "-") && raw != "_all" {
 		s.mu.RLock()
 		exists := checkExistsLocked(raw)
 		s.mu.RUnlock()
@@ -4262,29 +4169,42 @@ func (s *Server) handleHeadIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !ignoreUnavailable {
-		for _, part := range strings.Split(raw, ",") {
-			part = strings.TrimSpace(part)
-			if part == "" || strings.HasPrefix(part, "-") || strings.Contains(part, "*") || part == "_all" {
-				continue
-			}
-			s.mu.RLock()
-			exists := checkExistsLocked(part)
-			s.mu.RUnlock()
-			if !exists {
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
+	concreteTargets := make(map[string]bool)
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" || strings.HasPrefix(part, "-") || strings.ContainsAny(part, "*?") || part == "_all" {
+			continue
+		}
+		concreteTargets[part] = true
+		s.mu.RLock()
+		exists := checkExistsLocked(part)
+		for _, at := range s.aliases[part] {
+			concreteTargets[at] = true
+		}
+		s.mu.RUnlock()
+		if !exists && !ignoreUnavailable {
+			w.WriteHeader(http.StatusNotFound)
+			return
 		}
 	}
 
-	targets := s.resolveTargetIndices(raw)
+	targets, _ := s.resolveTargetIndicesWithOptions(raw, ewHidden)
 	s.mu.RLock()
 	matched := 0
 	for _, t := range targets {
-		if checkExistsLocked(t) {
-			matched++
+		if !checkExistsLocked(t) {
+			continue
 		}
+		if !concreteTargets[t] {
+			isClosed := s.closedIndices[t]
+			if (isClosed && !ewClosed) || (!isClosed && !ewOpen) {
+				continue
+			}
+			if s.isIndexExplicitlyHiddenLocked(t) && !ewHidden {
+				continue
+			}
+		}
+		matched++
 	}
 	s.mu.RUnlock()
 	if matched == 0 {
@@ -4429,11 +4349,31 @@ func (s *Server) handleDeleteIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetAllMappings(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	ewOpen, ewClosed, ewHidden, ewNone, ewErr := parseExpandWildcardsFlags(r.URL.Query().Get("expand_wildcards"))
+	if ewErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", ewErr.Error())
+		return
+	}
+	if ewNone {
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{})
+		return
+	}
 	_ = s.syncCatalogFromBackend(r.Context())
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make(map[string]any, len(s.indices))
 	for indexName, idx := range s.indices {
+		isClosed := s.closedIndices[indexName]
+		if (isClosed && !ewClosed) || (!isClosed && !ewOpen) {
+			continue
+		}
+		if s.isIndexExplicitlyHiddenLocked(indexName) && !ewHidden {
+			continue
+		}
 		props := map[string]esast.FieldProperty{}
 		if idx.RawMapping != nil {
 			props = idx.RawMapping.Properties
@@ -4452,7 +4392,7 @@ func (s *Server) handleGetAllMappings(w http.ResponseWriter, r *http.Request) {
 			"mappings": mappings,
 		}
 	}
-	writeJSON(w, http.StatusOK, out)
+	writeJSONWithRequest(w, r, http.StatusOK, out)
 }
 
 func (s *Server) handleGetMapping(w http.ResponseWriter, r *http.Request) {
@@ -4524,7 +4464,7 @@ func (s *Server) handleGetFieldMapping(w http.ResponseWriter, r *http.Request) {
 		augSchema := s.augmentSchemaWithRuntimeMappings(idxSchema, nil)
 		mappingsOut := make(map[string]any)
 		for esPath, fb := range augSchema.Fields {
-			if matchesAnyGlob(esPath, fieldPatterns) {
+			if matchesFieldCapsPatterns(esPath, fieldPatterns) {
 				esType := fb.ESType
 				if esType == "" {
 					esType = "keyword"
@@ -4561,7 +4501,7 @@ func (s *Server) handleGetFieldMapping(w http.ResponseWriter, r *http.Request) {
 			}
 			if fb.KeywordCompanion != "" && fb.AliasTarget == "" {
 				kwPath := esPath + ".keyword"
-				if _, explicitKW := augSchema.Fields[kwPath]; !explicitKW && matchesAnyGlob(kwPath, fieldPatterns) {
+				if _, explicitKW := augSchema.Fields[kwPath]; !explicitKW && matchesFieldCapsPatterns(kwPath, fieldPatterns) {
 					mappingsOut[kwPath] = map[string]any{
 						"full_name": kwPath,
 						"mapping": map[string]any{
@@ -4570,8 +4510,22 @@ func (s *Server) handleGetFieldMapping(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
+			if fb.ESType == "search_as_you_type" && fb.AliasTarget == "" {
+				for _, suffix := range searchAsYouTypeSubfieldsRound58(fb) {
+					subPath := esPath + suffix
+					subName := strings.TrimPrefix(suffix, ".")
+					if _, explicitSub := augSchema.Fields[subPath]; !explicitSub && matchesFieldCapsPatterns(subPath, fieldPatterns) {
+						mappingsOut[subPath] = map[string]any{
+							"full_name": subPath,
+							"mapping": map[string]any{
+								subName: map[string]any{"type": "search_as_you_type"},
+							},
+						}
+					}
+				}
+			}
 		}
-		if matchesAnyGlob("@timestamp", fieldPatterns) && mappingsOut["@timestamp"] == nil {
+		if matchesFieldCapsPatterns("@timestamp", fieldPatterns) && mappingsOut["@timestamp"] == nil && s.isDataStreamOrBackingIndexLocked(idxName) {
 			mappingsOut["@timestamp"] = map[string]any{
 				"full_name": "@timestamp",
 				"mapping": map[string]any{
@@ -4613,7 +4567,7 @@ func (s *Server) handlePutMapping(w http.ResponseWriter, r *http.Request) {
 	var missingConcrete string
 	for _, part := range strings.Split(rawIndex, ",") {
 		part = strings.TrimSpace(part)
-		if part == "" || strings.HasPrefix(part, "-") || strings.Contains(part, "*") || part == "_all" {
+		if part == "" || strings.HasPrefix(part, "-") || strings.ContainsAny(part, "*?") || part == "_all" {
 			continue
 		}
 		if _, isAlias := s.aliases[part]; !isAlias {
@@ -5038,6 +4992,8 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 			Aliases       []string     `json:"aliases"`
 			Filter        *esast.Query `json:"filter,omitempty"`
 			IsWriteIndex  *bool        `json:"is_write_index,omitempty"`
+			IsHidden      *bool        `json:"is_hidden,omitempty"`
+			MustExist     *bool        `json:"must_exist,omitempty"`
 			Routing       string       `json:"routing,omitempty"`
 			IndexRouting  string       `json:"index_routing,omitempty"`
 			SearchRouting string       `json:"search_routing,omitempty"`
@@ -5052,71 +5008,26 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 	var removedIndices []string
 	var tablesToDrop []*schema.IndexSchema
 	s.mu.Lock()
-	expandIndexListLocked := func(rawList []string) []string {
-		var out []string
-		seen := make(map[string]bool)
-		for _, pat := range rawList {
-			pat = strings.TrimSpace(pat)
-			if pat == "" {
-				continue
-			}
-			if pat == "*" || pat == "_all" {
-				for idxName := range s.indices {
-					if !seen[idxName] {
-						seen[idxName] = true
-						out = append(out, idxName)
-					}
-				}
-				continue
-			}
-			if strings.ContainsAny(pat, "*?") {
-				for idxName := range s.indices {
-					if matchWildcardPattern(pat, idxName) && !seen[idxName] {
-						seen[idxName] = true
-						out = append(out, idxName)
-					}
-				}
-				continue
-			}
-			if !seen[pat] {
-				seen[pat] = true
-				out = append(out, pat)
-			}
+	expandIndexListFromSet := func(rawList []string, idxSet map[string]bool) []string {
+		universe := make([]string, 0, len(idxSet))
+		for idxName := range idxSet {
+			universe = append(universe, idxName)
 		}
-		return out
+		return expandNamesWithExclusions(rawList, universe)
+	}
+	expandIndexListLocked := func(rawList []string) []string {
+		universe := make([]string, 0, len(s.indices))
+		for idxName := range s.indices {
+			universe = append(universe, idxName)
+		}
+		return expandNamesWithExclusions(rawList, universe)
 	}
 	expandAliasListLocked := func(rawList []string) []string {
-		var out []string
-		seen := make(map[string]bool)
-		for _, pat := range rawList {
-			pat = strings.TrimSpace(pat)
-			if pat == "" {
-				continue
-			}
-			if pat == "*" || pat == "_all" {
-				for alName := range s.aliases {
-					if !seen[alName] {
-						seen[alName] = true
-						out = append(out, alName)
-					}
-				}
-				continue
-			}
-			if strings.ContainsAny(pat, "*?") {
-				for alName := range s.aliases {
-					if matchWildcardPattern(pat, alName) && !seen[alName] {
-						seen[alName] = true
-						out = append(out, alName)
-					}
-				}
-				continue
-			}
-			if !seen[pat] {
-				seen[pat] = true
-				out = append(out, pat)
-			}
+		universe := make([]string, 0, len(s.aliases))
+		for alName := range s.aliases {
+			universe = append(universe, alName)
 		}
-		return out
+		return expandNamesWithExclusions(rawList, universe)
 	}
 	simulatedIndices := make(map[string]bool, len(s.indices))
 	for k := range s.indices {
@@ -5145,28 +5056,29 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if add, ok := action["add"]; ok {
-			rawIndices := add.Indices
+			rawIndices := append([]string(nil), add.Indices...)
 			if add.Index != "" {
 				rawIndices = append(rawIndices, add.Index)
 			}
-			rawAliases := add.Aliases
+			rawIndices = splitCommaTrimmedTokens(rawIndices)
+			rawAliases := append([]string(nil), add.Aliases...)
 			if add.Alias != "" {
 				rawAliases = append(rawAliases, add.Alias)
 			}
+			rawAliases = splitCommaTrimmedTokens(rawAliases)
 			if len(rawIndices) == 0 || len(rawAliases) == 0 {
 				s.mu.Unlock()
 				writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: index and alias are required for [add];")
 				return
 			}
 			for _, pat := range rawIndices {
-				pat = strings.TrimSpace(pat)
-				if pat != "" && !strings.ContainsAny(pat, "*?") && pat != "_all" && !simulatedIndices[pat] {
+				if pat != "" && !strings.HasPrefix(pat, "-") && !strings.ContainsAny(pat, "*?") && pat != "_all" && !simulatedIndices[pat] {
 					s.mu.Unlock()
 					writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+pat+"]")
 					return
 				}
 			}
-			indices := expandIndexListLocked(rawIndices)
+			indices := expandIndexListFromSet(rawIndices, simulatedIndices)
 			if len(indices) == 0 {
 				s.mu.Unlock()
 				writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+strings.Join(rawIndices, ",")+"]")
@@ -5180,6 +5092,9 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			for _, al := range rawAliases {
+				if strings.HasPrefix(al, "-") {
+					continue
+				}
 				if simulatedIndices[al] {
 					s.mu.Unlock()
 					writeESError(w, http.StatusBadRequest, "invalid_alias_name_exception", fmt.Sprintf("Invalid alias name [%s], an index exists with the same name as the alias", al))
@@ -5212,28 +5127,30 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if rem, ok := action["remove"]; ok {
-			rawIndices := rem.Indices
+			rawIndices := append([]string(nil), rem.Indices...)
 			if rem.Index != "" {
 				rawIndices = append(rawIndices, rem.Index)
 			}
-			rawAliases := rem.Aliases
+			rawIndices = splitCommaTrimmedTokens(rawIndices)
+			rawAliases := append([]string(nil), rem.Aliases...)
 			if rem.Alias != "" {
 				rawAliases = append(rawAliases, rem.Alias)
 			}
+			rawAliases = splitCommaTrimmedTokens(rawAliases)
 			if len(rawIndices) == 0 || len(rawAliases) == 0 {
 				s.mu.Unlock()
 				writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: index and alias are required for [remove];")
 				return
 			}
+			mustExist := rem.MustExist == nil || *rem.MustExist
 			for _, pat := range rawIndices {
-				pat = strings.TrimSpace(pat)
-				if pat != "" && !strings.ContainsAny(pat, "*?") && pat != "_all" && !simulatedIndices[pat] {
+				if pat != "" && !strings.HasPrefix(pat, "-") && !strings.ContainsAny(pat, "*?") && pat != "_all" && !simulatedIndices[pat] {
 					s.mu.Unlock()
 					writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+pat+"]")
 					return
 				}
 			}
-			indices := expandIndexListLocked(rawIndices)
+			indices := expandIndexListFromSet(rawIndices, simulatedIndices)
 			for _, idx := range indices {
 				if blocked, reason := s.isIndexMetadataBlockedLocked(idx, false); blocked {
 					s.mu.Unlock()
@@ -5241,57 +5158,107 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+			hasAliasExclusion := false
 			for _, al := range rawAliases {
-				al = strings.TrimSpace(al)
-				if al == "" {
-					continue
+				if strings.HasPrefix(al, "-") && len(al) > 1 {
+					hasAliasExclusion = true
+					break
 				}
-				foundOnTarget := false
-				if strings.ContainsAny(al, "*?") || al == "_all" {
-					for simAl, idxMap := range simulatedAliases {
-						if al == "_all" || al == "*" || matchWildcardPattern(al, simAl) {
+			}
+			if hasAliasExclusion {
+				var simUniv []string
+				for simAl, idxMap := range simulatedAliases {
+					if len(idxMap) > 0 {
+						simUniv = append(simUniv, simAl)
+					}
+				}
+				for _, tok := range rawAliases {
+					if !strings.HasPrefix(tok, "-") && !strings.ContainsAny(tok, "*?") && tok != "_all" {
+						hasMatch := false
+						if idxMap := simulatedAliases[tok]; idxMap != nil {
 							for _, idx := range indices {
 								if idxMap[idx] {
-									foundOnTarget = true
-									delete(idxMap, idx)
+									hasMatch = true
+									break
 								}
 							}
 						}
-					}
-				} else if idxMap := simulatedAliases[al]; idxMap != nil {
-					for _, idx := range indices {
-						if idxMap[idx] {
-							foundOnTarget = true
-							delete(idxMap, idx)
+						if !hasMatch && mustExist {
+							s.mu.Unlock()
+							writeESError(w, http.StatusNotFound, "aliases_not_found_exception", fmt.Sprintf("aliases [%s] missing", tok))
+							return
 						}
 					}
 				}
-				if !foundOnTarget {
+				expandedAliases := expandNamesWithExclusions(rawAliases, simUniv)
+				foundAny := false
+				for _, simAl := range expandedAliases {
+					if idxMap := simulatedAliases[simAl]; idxMap != nil {
+						for _, idx := range indices {
+							if idxMap[idx] {
+								foundAny = true
+								delete(idxMap, idx)
+							}
+						}
+					}
+				}
+				if !foundAny && mustExist {
 					s.mu.Unlock()
-					writeESError(w, http.StatusNotFound, "aliases_not_found_exception", fmt.Sprintf("aliases [%s] missing", al))
+					writeESError(w, http.StatusNotFound, "aliases_not_found_exception", fmt.Sprintf("aliases [%s] missing", strings.Join(rawAliases, ",")))
 					return
+				}
+			} else {
+				for _, al := range rawAliases {
+					if al == "" {
+						continue
+					}
+					foundOnTarget := false
+					if strings.ContainsAny(al, "*?") || al == "_all" {
+						for simAl, idxMap := range simulatedAliases {
+							if al == "_all" || al == "*" || matchWildcardPattern(al, simAl) {
+								for _, idx := range indices {
+									if idxMap[idx] {
+										foundOnTarget = true
+										delete(idxMap, idx)
+									}
+								}
+							}
+						}
+					} else if idxMap := simulatedAliases[al]; idxMap != nil {
+						for _, idx := range indices {
+							if idxMap[idx] {
+								foundOnTarget = true
+								delete(idxMap, idx)
+							}
+						}
+					}
+					if !foundOnTarget && mustExist {
+						s.mu.Unlock()
+						writeESError(w, http.StatusNotFound, "aliases_not_found_exception", fmt.Sprintf("aliases [%s] missing", al))
+						return
+					}
 				}
 			}
 		}
 		if remIdx, ok := action["remove_index"]; ok {
-			rawIndices := remIdx.Indices
+			rawIndices := append([]string(nil), remIdx.Indices...)
 			if remIdx.Index != "" {
 				rawIndices = append(rawIndices, remIdx.Index)
 			}
+			rawIndices = splitCommaTrimmedTokens(rawIndices)
 			if len(rawIndices) == 0 {
 				s.mu.Unlock()
 				writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: index is required for [remove_index];")
 				return
 			}
 			for _, pat := range rawIndices {
-				pat = strings.TrimSpace(pat)
-				if pat != "" && !strings.ContainsAny(pat, "*?") && pat != "_all" && !simulatedIndices[pat] {
+				if pat != "" && !strings.HasPrefix(pat, "-") && !strings.ContainsAny(pat, "*?") && pat != "_all" && !simulatedIndices[pat] {
 					s.mu.Unlock()
 					writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+pat+"]")
 					return
 				}
 			}
-			for _, indexName := range expandIndexListLocked(rawIndices) {
+			for _, indexName := range expandIndexListFromSet(rawIndices, simulatedIndices) {
 				if blocked, reason := s.isIndexMetadataBlockedLocked(indexName, true); blocked {
 					s.mu.Unlock()
 					writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
@@ -5306,23 +5273,28 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, action := range payload.Actions {
 		if add, ok := action["add"]; ok {
-			rawIndices := add.Indices
+			rawIndices := append([]string(nil), add.Indices...)
 			if add.Index != "" {
 				rawIndices = append(rawIndices, add.Index)
 			}
 			indices := expandIndexListLocked(rawIndices)
-			aliases := add.Aliases
+			rawAliases := append([]string(nil), add.Aliases...)
 			if add.Alias != "" {
-				aliases = append(aliases, add.Alias)
+				rawAliases = append(rawAliases, add.Alias)
 			}
+			aliases := splitCommaTrimmedTokens(rawAliases)
 			meta := AliasMetadata{
 				Filter:        add.Filter,
 				IsWriteIndex:  add.IsWriteIndex,
+				IsHidden:      add.IsHidden,
 				Routing:       add.Routing,
 				IndexRouting:  add.IndexRouting,
 				SearchRouting: add.SearchRouting,
 			}
 			for _, al := range aliases {
+				if strings.HasPrefix(al, "-") {
+					continue
+				}
 				for _, idx := range indices {
 					s.addAliasWithMetaLocked(al, idx, meta)
 				}
@@ -5330,23 +5302,18 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if rem, ok := action["remove"]; ok {
-			rawIndices := rem.Indices
+			rawIndices := append([]string(nil), rem.Indices...)
 			if rem.Index != "" {
 				rawIndices = append(rawIndices, rem.Index)
 			}
-			rawAliases := rem.Aliases
+			rawIndicesNorm := splitCommaTrimmedTokens(rawIndices)
+			rawAliases := append([]string(nil), rem.Aliases...)
 			if rem.Alias != "" {
 				rawAliases = append(rawAliases, rem.Alias)
 			}
 			aliases := expandAliasListLocked(rawAliases)
-			hasAllIdx := false
-			for _, ri := range rawIndices {
-				if ri == "*" || ri == "_all" {
-					hasAllIdx = true
-					break
-				}
-			}
-			indices := expandIndexListLocked(rawIndices)
+			hasAllIdx := len(rawIndicesNorm) == 1 && (rawIndicesNorm[0] == "*" || rawIndicesNorm[0] == "_all")
+			indices := expandIndexListLocked(rawIndicesNorm)
 			for _, al := range aliases {
 				if hasAllIdx {
 					delete(s.aliases, al)
@@ -5360,7 +5327,7 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if remIdx, ok := action["remove_index"]; ok {
-			rawIndices := remIdx.Indices
+			rawIndices := append([]string(nil), remIdx.Indices...)
 			if remIdx.Index != "" {
 				rawIndices = append(rawIndices, remIdx.Index)
 			}
@@ -5675,6 +5642,15 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusNotFound, "index_not_found_exception", fmt.Sprintf("no such alias [%s] (require_alias=true)", rawReqIndex))
 		return
 	}
+	docID := r.PathValue("id")
+	rawOpType := strings.TrimSpace(r.URL.Query().Get("op_type"))
+	isExplicitIndexOp := strings.EqualFold(rawOpType, "index")
+	isCreate := strings.Contains(r.URL.Path, "/_create/") || strings.EqualFold(rawOpType, "create")
+	isCreateForTarget := isCreate || (docID == "" && !isExplicitIndexOp)
+	if st, et, er := s.prepareAutoCreateTargetRound58(r.Context(), rawReqIndex, isCreateForTarget); st != 0 {
+		writeESError(w, st, et, er)
+		return
+	}
 	indexName, aliasFilter, writeErr := s.resolveWriteIndexWithFilter(rawReqIndex)
 	if writeErr != nil {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", writeErr.Error())
@@ -5693,8 +5669,6 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", occParseErr)
 		return
 	}
-	docID := r.PathValue("id")
-	isCreate := strings.Contains(r.URL.Path, "/_create/") || strings.EqualFold(r.URL.Query().Get("op_type"), "create")
 	if s.isDataStream(rawReqIndex) && !isCreate && docID != "" {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "only write ops with an op_type of create are allowed in data streams")
 		return
@@ -5741,6 +5715,11 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 	}
 	effRawIndex := rawReqIndex
 	if nextIndex != "" && nextIndex != pipeInputIdx {
+		rerouteIsCreate := isCreateForTarget
+		if st, et, er := s.prepareAutoCreateTargetRound58(r.Context(), nextIndex, rerouteIsCreate); st != 0 {
+			writeESError(w, st, et, er)
+			return
+		}
 		resolvedIdx, resolvedFilter, rErr := s.resolveWriteIndexWithFilter(nextIndex)
 		if rErr != nil {
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", rErr.Error())
@@ -5862,6 +5841,7 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHeadDoc(w http.ResponseWriter, r *http.Request) {
+	ensureESCompatHeaders(w, r)
 	rawReqIndex := r.PathValue("index")
 	indexName, aliasFilter, readErr := s.resolveReadDocIndexWithFilter(rawReqIndex)
 	if readErr != nil {
@@ -5903,6 +5883,9 @@ func (s *Server) handleHeadDoc(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method == http.MethodHead {
+		ensureESCompatHeaders(w, r)
+	}
 	rawReqIndex := r.PathValue("index")
 	indexName, aliasFilter, readErr := s.resolveReadDocIndexWithFilter(rawReqIndex)
 	if readErr != nil {
@@ -6405,6 +6388,10 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 	rawReqIndex := r.PathValue("index")
+	if s.isDataStream(rawReqIndex) {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "only write ops with an op_type of create are allowed in data streams")
+		return
+	}
 	indexName, aliasFilter, writeErr := s.resolveWriteIndexWithFilter(rawReqIndex)
 	if writeErr != nil {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", writeErr.Error())
@@ -6536,6 +6523,10 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	rawReqIndex := r.PathValue("index")
 	if isTruthyBoolQueryParam(r, "require_alias") && !s.isTargetAliasOrDataStream(rawReqIndex) {
 		writeESError(w, http.StatusNotFound, "index_not_found_exception", fmt.Sprintf("no such alias [%s] (require_alias=true)", rawReqIndex))
+		return
+	}
+	if s.isDataStream(rawReqIndex) {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "only write ops with an op_type of create are allowed in data streams")
 		return
 	}
 	indexName, aliasFilter, writeErr := s.resolveWriteIndexWithFilter(rawReqIndex)
@@ -6996,6 +6987,10 @@ func docMatchesSlice(docID string, sliceField string, docSource json.RawMessage,
 }
 
 func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodPost {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	start := time.Now()
 	rawIndex := r.PathValue("index")
 	ew := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("expand_wildcards")))
@@ -7003,17 +6998,27 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
 		return
 	}
-	targets, aliasFilters := s.resolveTargetIndicesWithFilters(rawIndex)
-	if len(targets) == 0 && strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("allow_no_indices")), "false") {
-		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
-		return
-	}
-	if len(targets) == 0 && !hasExclusionOrWildcard(rawIndex) {
-		targets = []string{s.resolveIndexName(rawIndex)}
-	}
 	if closedIdx := s.findClosedTargetIndex(r, rawIndex); closedIdx != "" {
 		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
 		return
+	}
+	var targets []string
+	var aliasFilters map[string]*esast.Query
+	if s.hasAuthoritativeIndexCatalog() {
+		var ok bool
+		targets, aliasFilters, ok = s.resolveValidatedReadTargets(w, r, rawIndex)
+		if !ok {
+			return
+		}
+	} else {
+		targets, aliasFilters = s.resolveTargetIndicesWithFilters(rawIndex)
+		if len(targets) == 0 && strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("allow_no_indices")), "false") {
+			writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
+			return
+		}
+		if len(targets) == 0 && !hasExclusionOrWildcard(rawIndex) {
+			targets = []string{s.resolveIndexName(rawIndex)}
+		}
 	}
 	for _, idx := range targets {
 		if s.isIndexClosed(idx) {
@@ -7074,7 +7079,10 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Query == nil && r.URL.Query().Get("q") != "" {
 		tmpReq := esast.SearchRequest{}
-		applyURISearchParams(r, &tmpReq)
+		if err := applyAndValidateURISearchParamsRound58(r, &tmpReq); err != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+			return
+		}
 		body.Query = tmpReq.Query
 	}
 
@@ -7525,6 +7533,10 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodPost {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	start := time.Now()
 	rawIndex := r.PathValue("index")
 	ew := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("expand_wildcards")))
@@ -7532,17 +7544,27 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
 		return
 	}
-	targets, aliasFilters := s.resolveTargetIndicesWithFilters(rawIndex)
-	if len(targets) == 0 && strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("allow_no_indices")), "false") {
-		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
-		return
-	}
-	if len(targets) == 0 && !hasExclusionOrWildcard(rawIndex) {
-		targets = []string{s.resolveIndexName(rawIndex)}
-	}
 	if closedIdx := s.findClosedTargetIndex(r, rawIndex); closedIdx != "" {
 		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
 		return
+	}
+	var targets []string
+	var aliasFilters map[string]*esast.Query
+	if s.hasAuthoritativeIndexCatalog() {
+		var ok bool
+		targets, aliasFilters, ok = s.resolveValidatedReadTargets(w, r, rawIndex)
+		if !ok {
+			return
+		}
+	} else {
+		targets, aliasFilters = s.resolveTargetIndicesWithFilters(rawIndex)
+		if len(targets) == 0 && strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("allow_no_indices")), "false") {
+			writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
+			return
+		}
+		if len(targets) == 0 && !hasExclusionOrWildcard(rawIndex) {
+			targets = []string{s.resolveIndexName(rawIndex)}
+		}
 	}
 	for _, idx := range targets {
 		if s.isIndexClosed(idx) {
@@ -7590,7 +7612,10 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Query == nil && r.URL.Query().Get("q") != "" {
 		tmpReq := esast.SearchRequest{}
-		applyURISearchParams(r, &tmpReq)
+		if err := applyAndValidateURISearchParamsRound58(r, &tmpReq); err != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+			return
+		}
 		body.Query = tmpReq.Query
 	}
 
@@ -7827,6 +7852,9 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 	urlRouting := r.URL.Query().Get("routing")
 	droppedOps := make([]bool, len(ops))
 	pipeErrs := make([]string, len(ops))
+	opErrStatus := make([]int, len(ops))
+	opErrType := make([]string, len(ops))
+	opErrReason := make([]string, len(ops))
 	origOpIndices := make([]string, len(ops))
 	pipeRoutings := make([]string, len(ops))
 	pipedOps := make([]bool, len(ops))
@@ -7840,9 +7868,17 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		origOpIndex := op.Index
+		if st, et, er := s.prepareAutoCreateTargetRound58(r.Context(), origOpIndex, op.Action == "create"); st != 0 {
+			opErrStatus[idx] = st
+			opErrType[idx] = et
+			opErrReason[idx] = er
+			continue
+		}
 		idxName, _, writeErr := s.resolveWriteIndexWithFilter(op.Index)
 		if writeErr != nil {
-			op.ParseErr = writeErr.Error()
+			opErrStatus[idx] = http.StatusBadRequest
+			opErrType[idx] = "illegal_argument_exception"
+			opErrReason[idx] = writeErr.Error()
 			continue
 		}
 		if s.isIndexClosed(idxName) {
@@ -7883,9 +7919,17 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			pipeRoutings[idx] = nextRouting
 			if nextIdx != "" && nextIdx != origOpIndex {
 				op.Index = nextIdx
+				if st, et, er := s.prepareAutoCreateTargetRound58(r.Context(), op.Index, op.Action == "create"); st != 0 {
+					opErrStatus[idx] = st
+					opErrType[idx] = et
+					opErrReason[idx] = er
+					continue
+				}
 				resolvedIdx, _, rErr := s.resolveWriteIndexWithFilter(op.Index)
 				if rErr != nil {
-					op.ParseErr = rErr.Error()
+					opErrStatus[idx] = http.StatusBadRequest
+					opErrType[idx] = "illegal_argument_exception"
+					opErrReason[idx] = rErr.Error()
 					continue
 				}
 				idxName = resolvedIdx
@@ -8006,6 +8050,21 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 					"error": map[string]any{
 						"type":   "index_not_found_exception",
 						"reason": fmt.Sprintf("no such alias [%s] (require_alias=true)", origOpIdx),
+					},
+				},
+			})
+			continue
+		}
+		if opErrStatus[opIdx] != 0 {
+			hasErrors = true
+			items = append(items, map[string]any{
+				op.Action: map[string]any{
+					"_index": op.Index,
+					"_id":    op.ID,
+					"status": opErrStatus[opIdx],
+					"error": map[string]any{
+						"type":   opErrType[opIdx],
+						"reason": opErrReason[opIdx],
 					},
 				},
 			})
@@ -8867,8 +8926,33 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	applyURISearchParams(r, &req)
-	if r.URL.Query().Get("scroll") != "" {
+	if err := applyAndValidateURISearchParamsRound58(r, &req); err != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+		return
+	}
+	rawEW := r.URL.Query().Get("expand_wildcards")
+	ewOpen, ewClosed, ewHidden, ewNone, ewErr := parseExpandWildcardsFlags(rawEW)
+	if ewErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", ewErr.Error())
+		return
+	}
+	hasScroll := r.URL.Query().Has("scroll")
+	var scrollTTL time.Duration
+	if hasScroll {
+		var sErr error
+		scrollTTL, sErr = parseESPositiveDuration(r.URL.Query().Get("scroll"))
+		if sErr != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("failed to parse scroll duration [%s]: %v", r.URL.Query().Get("scroll"), sErr))
+			return
+		}
+		if req.From != nil && *req.From > 0 {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Cannot use `from` parameter in conjunction with `scroll`")
+			return
+		}
+		if req.PIT != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[scroll] cannot be used in conjunction with [pit]")
+			return
+		}
 		if len(req.Sort) == 0 {
 			req.Sort = append(req.Sort, esast.SortSpec{Entry: esast.SortFieldSpec{Field: "_score", Order: "desc"}})
 		}
@@ -8884,7 +8968,56 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	rawIndex := extractPITIndex(r.PathValue("index"), req.PIT)
+	rawIndex := r.PathValue("index")
+	if req.PIT != nil {
+		pitIdx, pStatus, pType, pReason := s.validateAndResolvePITRequest(rawIndex, &req)
+		if pStatus != 0 {
+			writeESError(w, pStatus, pType, pReason)
+			return
+		}
+		rawIndex = pitIdx
+	} else if rawEW != "" && (rawIndex == "" || hasExclusionOrWildcard(rawIndex) || rawIndex == "_all") {
+		allowNoIndices := !r.URL.Query().Has("allow_no_indices") || isTruthyBoolQueryParam(r, "allow_no_indices")
+		if ewNone {
+			if !allowNoIndices {
+				writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
+				return
+			}
+			resp := buildESResponse(rawIndex, nil, &req, nil, nil, 1, nil)
+			if hasScroll {
+				tok := encodeScrollCursorWithState(rawIndex, &req, nil, 0, true)
+				resp["_scroll_id"] = tok
+				s.registerInitialScrollContext(tok, scrollTTL)
+			}
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
+		expTargets, expFilters := s.resolveTargetIndicesWithOptions(rawIndex, ewHidden)
+		var stateFiltered []string
+		for _, t := range expTargets {
+			isClosed := s.isIndexClosed(t)
+			if (isClosed && ewClosed) || (!isClosed && ewOpen) {
+				stateFiltered = append(stateFiltered, t)
+			}
+		}
+		if len(stateFiltered) == 0 {
+			if !allowNoIndices {
+				writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
+				return
+			}
+			resp := buildESResponse(rawIndex, nil, &req, nil, nil, 1, nil)
+			if hasScroll {
+				tok := encodeScrollCursorWithState(rawIndex, &req, nil, 0, true)
+				resp["_scroll_id"] = tok
+				s.registerInitialScrollContext(tok, scrollTTL)
+			}
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
+		if ewHidden && len(expFilters) == 0 {
+			rawIndex = strings.Join(stateFiltered, ",")
+		}
+	}
 	if closedIdx := s.findClosedTargetIndex(r, rawIndex); closedIdx != "" {
 		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
 		return
@@ -8902,10 +9035,12 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		resp["pit_id"] = req.PIT.ID
 	}
 
-	if r.URL.Query().Get("scroll") != "" {
+	if hasScroll {
 		lastSort := extractLastHitSort(resp)
 		total := extractRespTotalHits(resp)
-		resp["_scroll_id"] = encodeScrollCursorWithState(rawIndex, &req, lastSort, total, len(lastSort) == 0)
+		tok := encodeScrollCursorWithState(rawIndex, &req, lastSort, total, len(lastSort) == 0)
+		resp["_scroll_id"] = tok
+		s.registerInitialScrollContext(tok, scrollTTL)
 	}
 	if r.URL.Query().Get("doris_explain") == "true" || r.URL.Query().Get("doris_explain") == "1" ||
 		r.URL.Query().Get("_doris_explain") == "true" || r.URL.Query().Get("_doris_explain") == "1" {
@@ -9029,7 +9164,10 @@ func (s *Server) handleDorisExplain(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	applyURISearchParams(r, &req)
+	if err := applyAndValidateURISearchParamsRound58(r, &req); err != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, s.buildDorisExplainObject(r.Context(), r.PathValue("index"), &req))
 }
 
@@ -9038,6 +9176,7 @@ func (s *Server) handleDorisDDL(w http.ResponseWriter, r *http.Request) {
 	idxSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
 	ddl := schema.GenerateCreateTableDDL(idxSchema)
 	if r.URL.Query().Get("format") == "txt" || r.URL.Query().Get("format") == "sql" {
+		ensureESCompatHeaders(w, r)
 		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.WriteHeader(http.StatusOK)
@@ -9122,6 +9261,10 @@ func (s *Server) buildDorisExplainObject(ctx context.Context, rawIndexPattern st
 }
 
 func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	_ = s.syncCatalogFromBackend(r.Context())
 	rawIndex := strings.TrimSpace(r.PathValue("index"))
 	var targets []string
@@ -9133,12 +9276,48 @@ func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		targets, aliasFilters = s.resolveTargetIndicesWithFilters("")
+		ewOpen, ewClosed, ewHidden, ewNone, ewErr := parseExpandWildcardsFlags(r.URL.Query().Get("expand_wildcards"))
+		if ewErr != nil {
+			if r != nil && r.Method == http.MethodHead {
+				ensureESCompatHeaders(w, r)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", ewErr.Error())
+			return
+		}
+		if !ewNone {
+			rawTargets, af := s.resolveTargetIndicesWithOptions("", ewHidden)
+			aliasFilters = af
+			for _, t := range rawTargets {
+				isClosed := s.isIndexClosed(t)
+				if (isClosed && ewClosed) || (!isClosed && ewOpen) {
+					targets = append(targets, t)
+				}
+			}
+		}
+	}
+	if r != nil && r.Method == http.MethodHead {
+		ensureESCompatHeaders(w, r)
+		w.WriteHeader(http.StatusOK)
+		return
 	}
 	var filterPatterns []string
-	if fieldsFilter := r.URL.Query().Get("fields"); fieldsFilter != "" {
-		filterPatterns = append(filterPatterns, strings.Split(fieldsFilter, ",")...)
+	if fieldsVals := r.URL.Query()["fields"]; len(fieldsVals) > 0 {
+		for _, fv := range fieldsVals {
+			filterPatterns = append(filterPatterns, strings.Split(fv, ",")...)
+		}
 	}
+	var rawTypeTokens []string
+	if typeVals := r.URL.Query()["types"]; len(typeVals) > 0 {
+		rawTypeTokens = append(rawTypeTokens, typeVals...)
+	}
+	var rawFilterTokens []string
+	if fltVals := r.URL.Query()["filters"]; len(fltVals) > 0 {
+		rawFilterTokens = append(rawFilterTokens, fltVals...)
+	}
+	includeUnmapped := isTruthyBoolQueryParam(r, "include_unmapped")
+
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
 		return
@@ -9146,8 +9325,11 @@ func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 	var indexFilter *esast.Query
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
 		var body struct {
-			Fields      []string     `json:"fields"`
-			IndexFilter *esast.Query `json:"index_filter"`
+			Fields          []string     `json:"fields"`
+			Types           []string     `json:"types"`
+			Filters         []string     `json:"filters"`
+			IncludeUnmapped *bool        `json:"include_unmapped"`
+			IndexFilter     *esast.Query `json:"index_filter"`
 		}
 		if err := json.Unmarshal(bodyBytes, &body); err != nil {
 			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
@@ -9160,7 +9342,29 @@ func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 				filterPatterns = append(filterPatterns, body.Fields...)
 			}
 		}
+		if len(body.Types) > 0 {
+			rawTypeTokens = append(rawTypeTokens, body.Types...)
+		}
+		if len(body.Filters) > 0 {
+			rawFilterTokens = append(rawFilterTokens, body.Filters...)
+		}
+		if body.IncludeUnmapped != nil {
+			includeUnmapped = *body.IncludeUnmapped
+		}
 		indexFilter = body.IndexFilter
+	}
+	fcFilters, fErr := parseFieldCapsFilters(rawFilterTokens)
+	if fErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fErr.Error())
+		return
+	}
+	typeAllowSet := make(map[string]bool)
+	for _, rt := range rawTypeTokens {
+		for _, part := range strings.Split(rt, ",") {
+			if t := strings.ToLower(strings.TrimSpace(part)); t != "" {
+				typeAllowSet[t] = true
+			}
+		}
 	}
 	if len(filterPatterns) == 0 {
 		filterPatterns = []string{"*"}
@@ -9208,8 +9412,26 @@ func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 		}
 		m[field][esType] = append(m[field][esType], idxName)
 	}
-	addCap := func(idxName, field, esType string, searchable, aggregatable bool) {
-		if !matchesAnyGlob(field, filterPatterns) {
+	addCap := func(idxName, field, esType string, searchable, aggregatable, isMeta, isMultifield, isNested, isParent bool) {
+		if !matchesFieldCapsPatterns(field, filterPatterns) {
+			return
+		}
+		if fcFilters.onlyMetadata && !isMeta {
+			return
+		}
+		if fcFilters.noMetadata && isMeta {
+			return
+		}
+		if fcFilters.noMultifield && isMultifield {
+			return
+		}
+		if fcFilters.noNested && isNested {
+			return
+		}
+		if fcFilters.noParent && isParent {
+			return
+		}
+		if len(typeAllowSet) > 0 && !typeAllowSet[strings.ToLower(esType)] {
 			return
 		}
 		if caps[field] == nil {
@@ -9242,20 +9464,48 @@ func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 		targets = []string{}
 	}
 	if len(targets) > 0 {
-		addCap("", "_id", "_id", true, true)
-		addCap("", "_index", "_index", true, true)
+		addCap("", "_id", "_id", true, true, true, false, false, false)
+		addCap("", "_index", "_index", true, true, true, false, false, false)
 	}
 
 	s.mu.RLock()
 	for _, idxName := range targets {
 		idxSchema, ok := s.indices[idxName]
 		if !ok {
-			addCap(idxName, "@timestamp", "date", true, true)
+			if s.isDataStreamOrBackingIndexLocked(idxName) {
+				addCap(idxName, "@timestamp", "date", true, true, false, false, false, false)
+			}
 			continue
 		}
 		augSchema := s.augmentSchemaWithRuntimeMappings(idxSchema, nil)
-		if _, hasTS := augSchema.Fields["@timestamp"]; !hasTS {
-			addCap(idxName, "@timestamp", "date", true, true)
+		if _, hasTS := augSchema.Fields["@timestamp"]; !hasTS && s.isDataStreamOrBackingIndexLocked(idxName) {
+			addCap(idxName, "@timestamp", "date", true, true, false, false, false, false)
+		}
+		if idxSchema.RawMapping != nil && len(idxSchema.RawMapping.Properties) > 0 {
+			var addObjectParents func(props map[string]esast.FieldProperty, prefix string, underNested bool)
+			addObjectParents = func(props map[string]esast.FieldProperty, prefix string, underNested bool) {
+				for pName, prop := range props {
+					full := pName
+					if prefix != "" {
+						full = prefix + "." + pName
+					}
+					pType := strings.ToLower(strings.TrimSpace(prop.Type))
+					if pType == "nested" {
+						addCap(idxName, full, "nested", false, false, false, false, true, true)
+						if len(prop.Properties) > 0 {
+							addObjectParents(prop.Properties, full, true)
+						}
+						continue
+					}
+					if (pType == "object" || (pType == "" && len(prop.Properties) > 0)) && len(prop.Properties) > 0 {
+						if _, alreadyInFields := augSchema.Fields[full]; !alreadyInFields {
+							addCap(idxName, full, "object", false, false, false, false, underNested, true)
+						}
+						addObjectParents(prop.Properties, full, underNested)
+					}
+				}
+			}
+			addObjectParents(idxSchema.RawMapping.Properties, "", false)
 		}
 		for esPath, fb := range augSchema.Fields {
 			if fb.ESType == "alias" {
@@ -9272,13 +9522,30 @@ func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 			}
+			isMulti := false
+			if dot := strings.LastIndexByte(esPath, '.'); dot > 0 {
+				if pBind, hasP := augSchema.Fields[esPath[:dot]]; hasP && pBind.ESType != "" && pBind.ESType != "object" && pBind.ESType != "nested" && pBind.ESType != "flattened" {
+					isMulti = true
+				}
+			}
+			isNested := fb.ESType == "nested" || fb.NestedPath != ""
+			if !isNested && len(augSchema.NestedRoots) > 0 {
+				for _, nr := range augSchema.NestedRoots {
+					if esPath == nr || strings.HasPrefix(esPath, nr+".") {
+						isNested = true
+						break
+					}
+				}
+			}
+			isParent := fb.ESType == "object" || fb.ESType == "nested" || fb.ESType == "join"
+			isMeta := strings.HasPrefix(esPath, "_") && !strings.Contains(esPath, ".")
 			isSearchable := !fb.NotIndexed && !fb.EnabledFalse && fb.ESType != "nested" && fb.ESType != "object"
 			isAggregatableForType := func(esType string) bool {
 				if fb.DocValuesFalse || fb.EnabledFalse {
 					return false
 				}
 				switch esType {
-				case "text", "match_only_text", "nested", "object", "dense_vector", "knn_vector", "geo_shape":
+				case "text", "match_only_text", "search_as_you_type", "rank_feature", "rank_features", "nested", "object", "dense_vector", "knn_vector", "geo_shape":
 					return false
 				default:
 					return true
@@ -9286,7 +9553,7 @@ func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 			}
 			switch {
 			case fb.ESType != "":
-				addCap(idxName, esPath, fb.ESType, isSearchable, isAggregatableForType(fb.ESType))
+				addCap(idxName, esPath, fb.ESType, isSearchable, isAggregatableForType(fb.ESType), isMeta, isMulti, isNested, isParent)
 				if fb.KeywordCompanion != "" && fb.AliasTarget == "" {
 					kwSearchable := !fb.EnabledFalse
 					kwAggregatable := !fb.EnabledFalse
@@ -9294,29 +9561,66 @@ func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 						kwSearchable = !kwB.NotIndexed && !kwB.EnabledFalse
 						kwAggregatable = !kwB.DocValuesFalse && !kwB.EnabledFalse
 					}
-					addCap(idxName, esPath+".keyword", "keyword", kwSearchable, kwAggregatable)
+					addCap(idxName, esPath+".keyword", "keyword", kwSearchable, kwAggregatable, false, true, isNested, false)
+				}
+				if fb.ESType == "search_as_you_type" && fb.AliasTarget == "" {
+					for _, suffix := range searchAsYouTypeSubfieldsRound58(fb) {
+						subPath := esPath + suffix
+						if _, okSub := augSchema.Fields[subPath]; !okSub {
+							addCap(idxName, subPath, "search_as_you_type", isSearchable, false, false, true, isNested, false)
+						}
+					}
 				}
 			case fb.DorisType == schema.DorisBigInt:
 				if strings.Contains(strings.ToLower(esPath), "time") || strings.Contains(strings.ToLower(esPath), "date") || strings.HasSuffix(esPath, "At") {
-					addCap(idxName, esPath, "date", isSearchable, isAggregatableForType("date"))
+					addCap(idxName, esPath, "date", isSearchable, isAggregatableForType("date"), isMeta, isMulti, isNested, false)
 				} else {
-					addCap(idxName, esPath, "long", isSearchable, isAggregatableForType("long"))
+					addCap(idxName, esPath, "long", isSearchable, isAggregatableForType("long"), isMeta, isMulti, isNested, false)
 				}
 			case fb.DorisType == schema.DorisDouble:
-				addCap(idxName, esPath, "double", isSearchable, isAggregatableForType("double"))
+				addCap(idxName, esPath, "double", isSearchable, isAggregatableForType("double"), isMeta, isMulti, isNested, false)
 			case fb.DorisType == schema.DorisBoolean:
-				addCap(idxName, esPath, "boolean", isSearchable, isAggregatableForType("boolean"))
+				addCap(idxName, esPath, "boolean", isSearchable, isAggregatableForType("boolean"), isMeta, isMulti, isNested, false)
 			case fb.DorisType == schema.DorisString:
-				addCap(idxName, esPath, "text", isSearchable, false)
+				addCap(idxName, esPath, "text", isSearchable, false, isMeta, isMulti, isNested, false)
 				if fb.KeywordCompanion != "" && fb.AliasTarget == "" {
-					addCap(idxName, esPath+".keyword", "keyword", !fb.EnabledFalse, !fb.EnabledFalse)
+					addCap(idxName, esPath+".keyword", "keyword", !fb.EnabledFalse, !fb.EnabledFalse, false, true, isNested, false)
 				}
 			default:
-				addCap(idxName, esPath, "keyword", isSearchable, isAggregatableForType("keyword"))
+				addCap(idxName, esPath, "keyword", isSearchable, isAggregatableForType("keyword"), isMeta, isMulti, isNested, false)
 			}
 		}
 	}
 	s.mu.RUnlock()
+
+	if includeUnmapped && len(targets) > 0 {
+		for _, rawPat := range filterPatterns {
+			f := strings.TrimSpace(rawPat)
+			if f == "" || strings.HasPrefix(f, "-") || strings.ContainsAny(f, "*?") {
+				continue
+			}
+			if caps[f] != nil {
+				continue
+			}
+			if !matchesFieldCapsPatterns(f, filterPatterns) {
+				continue
+			}
+			isMeta := strings.HasPrefix(f, "_")
+			if (fcFilters.onlyMetadata && !isMeta) || (fcFilters.noMetadata && isMeta) {
+				continue
+			}
+			if len(typeAllowSet) > 0 && !typeAllowSet["unmapped"] {
+				continue
+			}
+			caps[f] = map[string]map[string]any{
+				"unmapped": {
+					"type":         "unmapped",
+					"searchable":   false,
+					"aggregatable": false,
+				},
+			}
+		}
+	}
 
 	for field, byType := range caps {
 		for esType, entry := range byType {
@@ -9426,7 +9730,13 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
-		applyURISearchParams(r, &req)
+		if err := applyAndValidateURISearchParamsRound58(r, &req); err != nil {
+			responses = append(responses, map[string]any{
+				"status": http.StatusBadRequest,
+				"error":  map[string]any{"type": "illegal_argument_exception", "reason": err.Error()},
+			})
+			continue
+		}
 		switch rv := hdr.Routing.(type) {
 		case string:
 			if strings.TrimSpace(rv) != "" {
@@ -9451,10 +9761,27 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if hdr.TerminateAfter != nil {
+			if *hdr.TerminateAfter <= 0 {
+				responses = append(responses, map[string]any{
+					"status": http.StatusBadRequest,
+					"error":  map[string]any{"type": "illegal_argument_exception", "reason": fmt.Sprintf("[terminate_after] must be greater than 0, got [%d]", *hdr.TerminateAfter)},
+				})
+				continue
+			}
 			req.TerminateAfter = hdr.TerminateAfter
 		}
 
-		targetIdx = extractPITIndex(targetIdx, req.PIT)
+		if req.PIT != nil {
+			pitIdx, pStatus, pType, pReason := s.validateAndResolvePITRequest(targetIdx, &req)
+			if pStatus != 0 {
+				responses = append(responses, map[string]any{
+					"status": pStatus,
+					"error":  map[string]any{"type": pType, "reason": pReason},
+				})
+				continue
+			}
+			targetIdx = pitIdx
+		}
 		if closedIdx := s.findClosedTargetIndex(r, targetIdx); closedIdx != "" {
 			responses = append(responses, map[string]any{
 				"status": http.StatusBadRequest,
@@ -11111,7 +11438,11 @@ func hitIsAfterSearchAfter(h HitRow, sorts []esast.SortSpec, searchAfter []any, 
 					}
 				} else if b.EffectiveLowercase(true) {
 					vb = strings.ToLower(strVal)
-				} else if b.ESType == "date" || b.ESType == "date_nanos" || b.DorisType == schema.DorisBigInt {
+				} else if b.ESType == "date_nanos" {
+					if ns, ok := parseDateNanosValueRound58(strVal, b.Format); ok {
+						vb = ns
+					}
+				} else if b.ESType == "date" || b.DorisType == schema.DorisBigInt {
 					if ms, ok := schema.ParseESDateToEpochMillis(strVal, time.Now().UTC()); ok {
 						vb = ms
 					}
@@ -11122,17 +11453,9 @@ func hitIsAfterSearchAfter(h HitRow, sorts []esast.SortSpec, searchAfter []any, 
 			b := idxSchema.ResolveField(resolvedSortField)
 			if b.ESType == "boolean" || b.DorisType == schema.DorisBoolean || strings.EqualFold(s.Entry.Type, "boolean") {
 				vb = iv != 0
-			}
-		}
-		if idxSchema != nil {
-			resolvedSortField := resolveSortEntryField(s, idxSchema)
-			b := idxSchema.ResolveField(resolvedSortField)
-			if b.ESType == "date_nanos" {
-				if fa, ok := toFloat64(va); ok && math.Abs(fa) > 1e15 {
-					va = math.Trunc(fa / 1e6)
-				}
-				if fb, ok := toFloat64(vb); ok && math.Abs(fb) > 1e15 {
-					vb = math.Trunc(fb / 1e6)
+			} else if b.ESType == "date_nanos" {
+				if ns, ok := parseDateNanosValueRound58(iv, b.Format); ok {
+					vb = ns
 				}
 			}
 		}
@@ -11147,7 +11470,9 @@ func hitIsAfterSearchAfter(h HitRow, sorts []esast.SortSpec, searchAfter []any, 
 			return missingFirst
 		}
 		var cmp int
-		if ipA, okA := parseIPv4SortUint32(va); okA {
+		if cmpIP, okIP := compareCanonicalIPValuesRound58(va, vb); okIP {
+			cmp = cmpIP
+		} else if ipA, okA := parseIPv4SortUint32(va); okA {
 			if ipB, okB := parseIPv4SortUint32(vb); okB {
 				if ipA < ipB {
 					cmp = -1
@@ -11196,7 +11521,9 @@ func compareHitRowsBySortWithSchemas(a, b HitRow, sorts []esast.SortSpec, schema
 			return -1
 		}
 		var cmp int
-		if ipA, okA := parseIPv4SortUint32(va); okA {
+		if cmpIP, okIP := compareCanonicalIPValuesRound58(va, vb); okIP {
+			cmp = cmpIP
+		} else if ipA, okA := parseIPv4SortUint32(va); okA {
 			if ipB, okB := parseIPv4SortUint32(vb); okB {
 				if ipA < ipB {
 					cmp = -1
@@ -11533,20 +11860,34 @@ func (s *Server) handleCount(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	applyURISearchParams(r, &req)
+	if err := applyAndValidateURISearchParamsRound58(r, &req); err != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+		return
+	}
 	zero := 0
 	req.Size = &zero
 	req.TrackTotalHits = true
 
-	if closedIdx := s.findClosedTargetIndex(r, r.PathValue("index")); closedIdx != "" {
+	countIdx := r.PathValue("index")
+	if req.PIT != nil {
+		pitIdx, pStatus, pType, pReason := s.validateAndResolvePITRequest(countIdx, &req)
+		if pStatus != 0 {
+			writeESError(w, pStatus, pType, pReason)
+			return
+		}
+		req.Sort = nil
+		countIdx = pitIdx
+	}
+
+	if closedIdx := s.findClosedTargetIndex(r, countIdx); closedIdx != "" {
 		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
 		return
 	}
-	if _, blockReason := s.findReadBlockedTargetIndex(r, r.PathValue("index")); blockReason != "" {
+	if _, blockReason := s.findReadBlockedTargetIndex(r, countIdx); blockReason != "" {
 		writeESError(w, http.StatusForbidden, "cluster_block_exception", blockReason)
 		return
 	}
-	resp, status, errType, errReason := s.executeSearchRequest(r.Context(), r.PathValue("index"), &req)
+	resp, status, errType, errReason := s.executeSearchRequest(r.Context(), countIdx, &req)
 	if errType != "" {
 		writeESError(w, status, errType, errReason)
 		return
@@ -11596,164 +11937,6 @@ func (s *Server) resolveIndexBoostFactor(indexName string, boosts map[string]flo
 		}
 	}
 	return 1.0, false
-}
-
-func applyURISearchParams(r *http.Request, req *esast.SearchRequest) {
-	q := r.URL.Query()
-	if qStr := q.Get("q"); qStr != "" && req.Query == nil {
-		qs := &esast.QueryStringQuery{
-			Query:            qStr,
-			DefaultField:     q.Get("df"),
-			DefaultOperator:  q.Get("default_operator"),
-			QuoteFieldSuffix: q.Get("quote_field_suffix"),
-		}
-		if q.Has("analyze_wildcard") {
-			aw := isTruthyBoolQueryParam(r, "analyze_wildcard")
-			qs.AnalyzeWildcard = &aw
-		}
-		if q.Has("lenient") {
-			ln := isTruthyBoolQueryParam(r, "lenient")
-			qs.Lenient = &ln
-		}
-		req.Query = &esast.Query{
-			QueryString: qs,
-		}
-	}
-	if q.Has("version") {
-		req.Version = isTruthyBoolQueryParam(r, "version")
-	}
-	if q.Has("seq_no_primary_term") {
-		req.SeqNoPrimaryTerm = isTruthyBoolQueryParam(r, "seq_no_primary_term")
-	}
-	if q.Has("explain") {
-		req.Explain = isTruthyBoolQueryParam(r, "explain")
-	}
-	if msStr := q.Get("min_score"); msStr != "" && req.MinScore == nil {
-		if ms, err := strconv.ParseFloat(msStr, 64); err == nil {
-			req.MinScore = &ms
-		}
-	}
-	if sizeStr := q.Get("size"); sizeStr != "" {
-		if sz, err := strconv.Atoi(sizeStr); err == nil {
-			req.Size = &sz
-		}
-	}
-	if fromStr := q.Get("from"); fromStr != "" {
-		if fr, err := strconv.Atoi(fromStr); err == nil {
-			req.From = &fr
-		}
-	}
-	if taStr := q.Get("terminate_after"); taStr != "" && req.TerminateAfter == nil {
-		if ta, err := strconv.Atoi(taStr); err == nil && ta > 0 {
-			req.TerminateAfter = &ta
-		}
-	}
-	if tth := q.Get("track_total_hits"); tth != "" && req.TrackTotalHits == nil {
-		if strings.EqualFold(tth, "false") {
-			req.TrackTotalHits = false
-		} else if strings.EqualFold(tth, "true") {
-			req.TrackTotalHits = true
-		} else if n, err := strconv.ParseInt(tth, 10, 64); err == nil {
-			req.TrackTotalHits = n
-		}
-	}
-	if ts := q.Get("track_scores"); ts != "" && req.TrackScores == nil {
-		b := strings.EqualFold(ts, "true") || ts == "1"
-		req.TrackScores = &b
-	}
-	if sortVals := q["sort"]; len(sortVals) > 0 && len(req.Sort) == 0 {
-		for _, sortParam := range sortVals {
-			for _, part := range strings.Split(sortParam, ",") {
-				part = strings.TrimSpace(part)
-				if part == "" {
-					continue
-				}
-				field := part
-				order := "asc"
-				if idx := strings.IndexByte(part, ':'); idx > 0 {
-					field = part[:idx]
-					order = part[idx+1:]
-				}
-				req.Sort = append(req.Sort, esast.SortSpec{
-					Entry: esast.SortEntry{Field: field, Order: order},
-				})
-			}
-		}
-	}
-	if srcVals := q["_source"]; len(srcVals) > 0 && req.Source == nil {
-		for _, srcParam := range srcVals {
-			if srcParam == "false" {
-				req.Source = &esast.SourceFilter{Disabled: true}
-			} else if srcParam != "true" && srcParam != "" {
-				if req.Source == nil {
-					req.Source = &esast.SourceFilter{}
-				}
-				req.Source.Disabled = false
-				req.Source.Includes = append(req.Source.Includes, strings.Split(srcParam, ",")...)
-			}
-		}
-	}
-	for _, key := range []string{"_source_includes", "_source_include"} {
-		for _, inc := range q[key] {
-			if inc != "" {
-				if req.Source == nil {
-					req.Source = &esast.SourceFilter{}
-				}
-				req.Source.Disabled = false
-				req.Source.Includes = append(req.Source.Includes, strings.Split(inc, ",")...)
-			}
-		}
-	}
-	for _, key := range []string{"_source_excludes", "_source_exclude"} {
-		for _, exc := range q[key] {
-			if exc != "" {
-				if req.Source == nil {
-					req.Source = &esast.SourceFilter{}
-				}
-				req.Source.Disabled = false
-				req.Source.Excludes = append(req.Source.Excludes, strings.Split(exc, ",")...)
-			}
-		}
-	}
-	if sfVals := q["stored_fields"]; len(sfVals) > 0 && req.StoredFields == nil {
-		req.StoredFields = strings.Join(sfVals, ",")
-	}
-	if fVals := q["fields"]; len(fVals) > 0 && len(req.Fields) == 0 {
-		for _, fv := range fVals {
-			for _, part := range strings.Split(fv, ",") {
-				if p := strings.TrimSpace(part); p != "" {
-					req.Fields = append(req.Fields, esast.FieldRequestSpec{Field: p})
-				}
-			}
-		}
-	}
-	if dvVals := q["docvalue_fields"]; len(dvVals) > 0 && len(req.DocvalueFields) == 0 {
-		for _, dvv := range dvVals {
-			for _, part := range strings.Split(dvv, ",") {
-				if p := strings.TrimSpace(part); p != "" {
-					req.DocvalueFields = append(req.DocvalueFields, esast.FieldRequestSpec{Field: p})
-				}
-			}
-		}
-	}
-	if strings.EqualFold(q.Get("search_type"), "count") {
-		zero := 0
-		req.Size = &zero
-		if req.TrackTotalHits == nil {
-			req.TrackTotalHits = true
-		}
-	}
-	if rtVals := q["routing"]; len(rtVals) > 0 {
-		var rts []string
-		for _, rv := range rtVals {
-			if t := strings.TrimSpace(rv); t != "" {
-				rts = append(rts, t)
-			}
-		}
-		if len(rts) > 0 {
-			req.Routing = strings.Join(rts, ",")
-		}
-	}
 }
 
 func aggTypePrefix(spec esast.AggSpec) string {
@@ -13148,10 +13331,14 @@ func collectCollapseCandidateValues(h HitRow, field string, idxSchema *schema.In
 				case float64:
 					v = tv != 0
 				}
+			} else if b.ESType == "date_nanos" {
+				if ns, ok := parseDateNanosValueRound58(v, b.Format); ok {
+					v = ns
+				}
 			} else if strVal, ok := v.(string); ok {
 				if b.EffectiveLowercase(true) {
 					v = strings.ToLower(strVal)
-				} else if b.ESType == "date" || b.ESType == "date_nanos" || b.DorisType == schema.DorisBigInt {
+				} else if b.ESType == "date" || b.DorisType == schema.DorisBigInt {
 					if ms, ok := schema.ParseESDateToEpochMillis(strVal, time.Now().UTC()); ok {
 						v = ms
 					}
@@ -13177,6 +13364,8 @@ func normalizeCollapseGroupKey(val any, field string, primarySchema, hitSchema *
 		return ""
 	}
 	isDate := false
+	isDateNanos := false
+	var dateNanosFmt string
 	isLower := false
 	isBool := false
 	for _, sc := range []*schema.IndexSchema{hitSchema, primarySchema} {
@@ -13187,7 +13376,12 @@ func normalizeCollapseGroupKey(val any, field string, primarySchema, hitSchema *
 		if b.ESType == "boolean" || b.DorisType == schema.DorisBoolean {
 			isBool = true
 		}
-		if b.ESType == "date" || b.ESType == "date_nanos" || b.DorisType == schema.DorisBigInt {
+		if b.ESType == "date_nanos" {
+			isDateNanos = true
+			if dateNanosFmt == "" {
+				dateNanosFmt = b.Format
+			}
+		} else if b.ESType == "date" || b.DorisType == schema.DorisBigInt {
 			isDate = true
 		}
 		if b.EffectiveLowercase(true) {
@@ -13215,6 +13409,11 @@ func normalizeCollapseGroupKey(val any, field string, primarySchema, hitSchema *
 				}
 				return "false"
 			}
+		}
+	}
+	if isDateNanos {
+		if ns, ok := parseDateNanosValueRound58(val, dateNanosFmt); ok {
+			return strconv.FormatInt(ns, 10)
 		}
 	}
 	if strVal, ok := val.(string); ok {
@@ -19481,12 +19680,14 @@ func extractHitFieldsMap(h HitRow, hitIdx string, req *esast.SearchRequest, idxS
 func formatFieldValues(field string, vals []any, format string, idxSchema *schema.IndexSchema) []any {
 	cleanField := strings.TrimSuffix(strings.TrimSuffix(field, ".keyword"), ".ngram")
 	isDateField := cleanField == "@timestamp"
+	isDateNanosField := false
 	isBoolField := false
 	var mappedFormat string
 	if idxSchema != nil {
 		b := idxSchema.ResolveField(field)
 		if b.ESType == "date" || b.ESType == "date_nanos" {
 			isDateField = true
+			isDateNanosField = b.ESType == "date_nanos"
 			mappedFormat = b.Format
 		}
 		if b.ESType == "boolean" || b.DorisType == schema.DorisBoolean {
@@ -19504,6 +19705,12 @@ func formatFieldValues(field string, vals []any, format string, idxSchema *schem
 				v = iv
 			} else if fv, err := jsonNum.Float64(); err == nil {
 				v = fv
+			}
+		}
+		if isDateNanosField {
+			if ns, ok := parseDateNanosValueRound58(v, mappedFormat); ok {
+				formatted = append(formatted, formatDateNanosWithFormatRound58(ns, effFormat))
+				continue
 			}
 		}
 		switch typed := v.(type) {
@@ -20043,10 +20250,14 @@ func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.In
 						case float64:
 							v = tv != 0
 						}
+					} else if b.ESType == "date_nanos" {
+						if ns, ok := parseDateNanosValueRound58(v, b.Format); ok {
+							v = ns
+						}
 					} else if strVal, ok := v.(string); ok {
 						if b.EffectiveLowercase(true) {
 							v = strings.ToLower(strVal)
-						} else if b.ESType == "date" || b.ESType == "date_nanos" || b.DorisType == schema.DorisBigInt {
+						} else if b.ESType == "date" || b.DorisType == schema.DorisBigInt {
 							if ms, ok := schema.ParseESDateToEpochMillis(strVal, time.Now().UTC()); ok {
 								v = ms
 							} else if iv, err := strconv.ParseInt(strings.TrimSpace(strVal), 10, 64); err == nil {
@@ -20056,13 +20267,6 @@ func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.In
 							if fv, ok := parseFiniteFloat(strings.TrimSpace(strVal)); ok {
 								v = fv
 							}
-						}
-					}
-					if b.ESType == "date_nanos" {
-						if iv, ok := v.(int64); ok && iv > 1_000_000_000_000_000 {
-							v = iv / 1_000_000
-						} else if fv, ok := v.(float64); ok && fv > 1_000_000_000_000_000 {
-							v = int64(fv) / 1_000_000
 						}
 					}
 				}
@@ -20097,7 +20301,11 @@ func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.In
 							case "false", "0":
 								val = false
 							}
-						} else if b.ESType == "date" || b.ESType == "date_nanos" || b.DorisType == schema.DorisBigInt {
+						} else if b.ESType == "date_nanos" {
+							if ns, ok := parseDateNanosValueRound58(mStr, b.Format); ok {
+								val = ns
+							}
+						} else if b.ESType == "date" || b.DorisType == schema.DorisBigInt {
 							if ms, ok := schema.ParseESDateToEpochMillis(mStr, time.Now().UTC()); ok {
 								val = ms
 							}
@@ -20539,8 +20747,8 @@ func buildHighlightMapWithSchema(raw json.RawMessage, req *esast.SearchRequest, 
 		fieldNames = append(fieldNames, field)
 	}
 	sort.Slice(fieldNames, func(i, j int) bool {
-		wi := strings.Contains(fieldNames[i], "*")
-		wj := strings.Contains(fieldNames[j], "*")
+		wi := strings.ContainsAny(fieldNames[i], "*?")
+		wj := strings.ContainsAny(fieldNames[j], "*?")
 		if wi != wj {
 			return !wi
 		}
@@ -20621,7 +20829,7 @@ func buildHighlightMapWithSchema(raw json.RawMessage, req *esast.SearchRequest, 
 		}
 
 		cleanField := strings.TrimSuffix(strings.TrimSuffix(field, ".keyword"), ".ngram")
-		if strings.Contains(cleanField, "*") {
+		if strings.ContainsAny(cleanField, "*?") {
 			if allLeafPaths == nil {
 				allLeafPaths = make(map[string][]string)
 				collectAllLeafStringPaths(doc, "", allLeafPaths)
@@ -21515,10 +21723,14 @@ func (s *Server) resolveTargetIndices(pattern string) []string {
 }
 
 func (s *Server) resolveTargetIndicesWithFilters(pattern string) ([]string, map[string]*esast.Query) {
-	out, filters := s.resolveTargetIndicesWithFiltersOnce(pattern)
+	return s.resolveTargetIndicesWithOptions(pattern, false)
+}
+
+func (s *Server) resolveTargetIndicesWithOptions(pattern string, includeHidden bool) ([]string, map[string]*esast.Query) {
+	out, filters := s.resolveTargetIndicesWithOptionsOnce(pattern, includeHidden)
 	if len(out) == 0 {
 		_ = s.syncCatalogFromBackend(context.Background())
-		out, filters = s.resolveTargetIndicesWithFiltersOnce(pattern)
+		out, filters = s.resolveTargetIndicesWithOptionsOnce(pattern, includeHidden)
 	}
 	return out, filters
 }
@@ -21704,12 +21916,15 @@ func (s *Server) applySearchRoutingToAliasFilters(rawIndexPattern string, target
 	return aliasFilters
 }
 
-func (s *Server) resolveTargetIndicesWithFiltersOnce(pattern string) ([]string, map[string]*esast.Query) {
+func (s *Server) resolveTargetIndicesWithOptionsOnce(pattern string, includeHidden bool) ([]string, map[string]*esast.Query) {
 	if pattern == "" || pattern == "_all" || pattern == "*" {
 		s.mu.RLock()
 		defer s.mu.RUnlock()
 		var all []string
 		for name := range s.indices {
+			if !includeHidden && s.isIndexExplicitlyHiddenLocked(name) {
+				continue
+			}
 			all = append(all, name)
 		}
 		sort.Strings(all)
@@ -21809,17 +22024,23 @@ func (s *Server) resolveTargetIndicesWithFiltersOnce(pattern string) ([]string, 
 			}
 			if part == "_all" || part == "*" {
 				for idxName := range s.indices {
+					if !includeHidden && s.isIndexExplicitlyHiddenLocked(idxName) {
+						continue
+					}
 					if !isIndexExcluded(idxName) {
 						addTarget(idxName, nil)
 					}
 				}
 				continue
 			}
-			if strings.Contains(part, "*") {
+			if strings.ContainsAny(part, "*?") {
 				matchedAny := false
 				for idxName := range s.indices {
 					if matchWildcardPattern(part, idxName) {
 						matchedAny = true
+						if !includeHidden && s.isIndexExplicitlyHiddenLocked(idxName) {
+							continue
+						}
 						if !isIndexExcluded(idxName) {
 							addTarget(idxName, nil)
 						}
@@ -21836,6 +22057,14 @@ func (s *Server) resolveTargetIndicesWithFiltersOnce(pattern string) ([]string, 
 							if isExcluded(t) {
 								continue
 							}
+							if !includeHidden {
+								if metaByIdx != nil && metaByIdx[t].IsHidden != nil && *metaByIdx[t].IsHidden {
+									continue
+								}
+								if s.isIndexExplicitlyHiddenLocked(t) && (metaByIdx == nil || metaByIdx[t].IsHidden == nil) {
+									continue
+								}
+							}
 							var f *esast.Query
 							if metaByIdx != nil {
 								f = metaByIdx[t].Filter
@@ -21849,6 +22078,11 @@ func (s *Server) resolveTargetIndicesWithFiltersOnce(pattern string) ([]string, 
 						matchedAny = true
 						if isExcluded(dsName) {
 							continue
+						}
+						if !includeHidden && ds != nil {
+							if hv, okH := ds["hidden"].(bool); okH && hv {
+								continue
+							}
 						}
 						if rawIndices, ok := ds["indices"].([]any); ok {
 							for _, item := range rawIndices {
@@ -21996,9 +22230,11 @@ func (s *Server) resolveWriteIndexWithFilter(nameOrAlias string) (string, *esast
 	if nameOrAlias == "" {
 		return "default_index", nil, nil
 	}
-	if idx := strings.IndexByte(nameOrAlias, ','); idx > 0 {
-		nameOrAlias = nameOrAlias[:idx]
+	validated, vErr := validateSingleDocTargetName(nameOrAlias)
+	if vErr != nil {
+		return "", nil, vErr
 	}
+	nameOrAlias = validated
 	resolveLocked := func() (string, *esast.Query, bool, error) {
 		if targets, ok := s.aliases[nameOrAlias]; ok && len(targets) > 0 {
 			metaByIdx := s.aliasMeta[nameOrAlias]
@@ -22065,9 +22301,11 @@ func (s *Server) resolveReadDocIndexWithFilter(nameOrAlias string) (string, *esa
 	if nameOrAlias == "" {
 		return "default_index", nil, nil
 	}
-	if idx := strings.IndexByte(nameOrAlias, ','); idx > 0 {
-		nameOrAlias = nameOrAlias[:idx]
+	validated, vErr := validateSingleDocTargetName(nameOrAlias)
+	if vErr != nil {
+		return "", nil, vErr
 	}
+	nameOrAlias = validated
 	resolveLocked := func() (string, *esast.Query, bool, error) {
 		if targets, ok := s.aliases[nameOrAlias]; ok && len(targets) > 0 {
 			if len(targets) > 1 {
@@ -22332,7 +22570,13 @@ func (s *Server) evalRuntimeMappingsOnHitRows(idxSchema *schema.IndexSchema, req
 							coercedVals = append(coercedVals, false)
 						}
 					}
-				case "date", "date_nanos":
+				case "date_nanos":
+					if ns, ok := parseDateNanosValueRound58(rv, prop.Format); ok {
+						coercedVals = append(coercedVals, ns)
+					} else if sv, ok := rv.(string); ok {
+						coercedVals = append(coercedVals, sv)
+					}
+				case "date":
 					if iv, okI := rv.(int64); okI {
 						coercedVals = append(coercedVals, iv)
 					} else if nv, okN := rv.(json.Number); okN {
@@ -22581,9 +22825,17 @@ func (s *Server) ensureWritableIndexSchemaWithDocs(ctx context.Context, indexNam
 	if ok {
 		existingEmptySchema = idx
 	}
-	tplMappings, tplDefPipe, hasTplDefPipe, tplFinPipe, hasTplFinPipe, tplAliases := s.matchingTemplateConfigLocked(indexName)
+	tplMappings, tplDefPipe, hasTplDefPipe, tplFinPipe, hasTplFinPipe, tplAliases, tplCustomSettings, _ := s.matchingTemplateFullConfigLocked(indexName)
 	if existingEmptySchema != nil && existingEmptySchema.RawMapping != nil {
 		tplMappings = schema.MergeMappingSpecs(tplMappings, existingEmptySchema.RawMapping)
+	}
+	if s.isDataStreamOrBackingIndexLocked(indexName) {
+		tsSpec := &esast.MappingSpec{
+			Properties: map[string]esast.FieldProperty{
+				"@timestamp": {Type: "date"},
+			},
+		}
+		tplMappings = schema.MergeMappingSpecs(tsSpec, tplMappings)
 	}
 	s.mu.RUnlock()
 
@@ -22622,6 +22874,22 @@ func (s *Server) ensureWritableIndexSchemaWithDocs(ctx context.Context, indexNam
 		if hasTplFinPipe && tplFinPipe != "" {
 			if _, hasCur := s.indexFinalPipelines[indexName]; !hasCur {
 				s.indexFinalPipelines[indexName] = tplFinPipe
+			}
+		}
+		if len(tplCustomSettings) > 0 {
+			if s.indexCustomSettings == nil {
+				s.indexCustomSettings = make(map[string]map[string]any)
+			}
+			if s.indexCustomSettings[indexName] == nil {
+				s.indexCustomSettings[indexName] = make(map[string]any)
+			}
+			for k, v := range tplCustomSettings {
+				if k == "default_pipeline" || k == "final_pipeline" || v == nil {
+					continue
+				}
+				if _, exists := s.indexCustomSettings[indexName][k]; !exists {
+					s.indexCustomSettings[indexName][k] = normalizeCustomSettingValue(v)
+				}
 			}
 		}
 		for alias, rawMeta := range tplAliases {
@@ -22800,18 +23068,7 @@ func setFieldPropertyAtPath(props map[string]esast.FieldProperty, path []string,
 }
 
 func (s *Server) handlePIT(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodDelete {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"succeeded": true,
-			"num_freed": 1,
-		})
-		return
-	}
-	rawIndex := r.PathValue("index")
-	pitID := base64.RawURLEncoding.EncodeToString([]byte("pit:" + rawIndex))
-	writeJSON(w, http.StatusOK, map[string]any{
-		"id": pitID,
-	})
+	s.handlePITRound58(w, r)
 }
 
 func extractPITIndex(rawIndex string, pit *esast.PITSpec) string {
@@ -22830,7 +23087,11 @@ func decodePITIndex(pitID string) (string, bool) {
 	}
 	s := string(raw)
 	if strings.HasPrefix(s, "pit:") {
-		return strings.TrimPrefix(s, "pit:"), true
+		rest := strings.TrimPrefix(s, "pit:")
+		if hash := strings.LastIndexByte(rest, '#'); hash >= 0 {
+			rest = rest[:hash]
+		}
+		return rest, true
 	}
 	return "", false
 }
@@ -26875,9 +27136,11 @@ func extractDocNumericValuesForBucket(md runtimeMatchedDoc, field string, missin
 
 func extractDocDateMillisForBucket(idxSchema *schema.IndexSchema, md runtimeMatchedDoc, field string, missing any, script any, nowUTC time.Time) []int64 {
 	isDateNanos := false
+	var dateNanosFmt string
 	if idxSchema != nil && field != "" {
 		if b := idxSchema.ResolveField(field); b.ESType == "date_nanos" {
 			isDateNanos = true
+			dateNanosFmt = b.Format
 		}
 	}
 	rawVals := extractDocRawValuesForMetric(md, &esast.MetricAggSpec{
@@ -26888,13 +27151,27 @@ func extractDocDateMillisForBucket(idxSchema *schema.IndexSchema, md runtimeMatc
 	var out []int64
 	for _, rv := range rawVals {
 		if s, ok := rv.(string); ok {
+			if isDateNanos && script == nil {
+				if ns, hasNS := parseDateNanosValueRound58(s, dateNanosFmt); hasNS {
+					ms := ns / 1_000_000
+					if ns < 0 && ns%1_000_000 != 0 {
+						ms--
+					}
+					out = append(out, ms)
+					continue
+				}
+			}
 			if ts, hasTS := schema.ParseESDateToEpochMillis(s, nowUTC); hasTS {
 				out = append(out, ts)
 			}
 		} else if f, ok := toFloat64(rv); ok {
 			ts := int64(f)
 			if (isDateNanos && script == nil) || math.Abs(f) >= 1e15 {
-				ts /= 1_000_000
+				if ts < 0 && ts%1_000_000 != 0 {
+					ts = ts/1_000_000 - 1
+				} else {
+					ts /= 1_000_000
+				}
 			}
 			out = append(out, ts)
 		}
@@ -26913,6 +27190,32 @@ func emitRuntimeHistogramAggRows(
 	hSpec := aggSpec.Histogram
 	if hSpec == nil {
 		return
+	}
+	if hSpec.Script == nil && isHistogramFieldInSchemaRound58(idxSchema, hSpec.Field) && len(aggSpec.SubAggs()) == 0 {
+		sources := make([]json.RawMessage, 0, len(docs))
+		for _, md := range docs {
+			sources = append(sources, md.hit.EffectiveSource())
+		}
+		if res, ok := evaluateHistogramAggFromSourcesRound58(aggSpec, hSpec.Field, sources); ok {
+			if rawBuckets, okB := res["buckets"].([]map[string]any); okB {
+				for _, bMap := range rawBuckets {
+					kf, _ := toFloat64(bMap["key"])
+					dc, _ := toInt64(bMap["doc_count"])
+					k := strconv.FormatFloat(kf, 'f', -1, 64)
+					rowKey := k
+					if parentBucketKey != "" {
+						rowKey = parentBucketKey + "\x1f" + k
+					}
+					*out = append(*out, AggRow{
+						AggName:   fullAggName,
+						BucketKey: rowKey,
+						DocCount:  dc,
+						Value:     float64(dc),
+					})
+				}
+				return
+			}
+		}
 	}
 	interval := hSpec.Interval
 	if interval <= 0 {

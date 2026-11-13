@@ -147,12 +147,12 @@ func TestRound18_DateNanosBoundsDateMathAndPlusZeroOffset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(plan.HitsSQL, "1700000000000000000") || !strings.Contains(plan.HitsSQL, "1700000000000") {
-		t.Fatalf("expected HitsSQL to normalize nanosecond sort missing & search_after to epoch millis, got:\n%s", plan.HitsSQL)
+	if !strings.Contains(plan.HitsSQL, "1700000000000000000") {
+		t.Fatalf("expected HitsSQL to preserve full nanosecond precision for date_nanos sort missing & search_after, got:\n%s", plan.HitsSQL)
 	}
-	if !strings.Contains(plan.AggsSQL, "COALESCE(`f__ts_ns`, 1700000000000)") ||
-		!strings.Contains(plan.AggsSQL, "`f__ts_ns` >= 1700000000000 AND `f__ts_ns` < 1700003600000") {
-		t.Fatalf("expected AggsSQL to normalize nanosecond date_histogram missing & date_range bounds to epoch millis, got:\n%s", plan.AggsSQL)
+	if !strings.Contains(plan.AggsSQL, "COALESCE((CAST(`f__ts_ns` AS DOUBLE) / 1000000.0), 1700000000000)") ||
+		!strings.Contains(plan.AggsSQL, "(CAST(`f__ts_ns` AS DOUBLE) / 1000000.0) >= 1700000000000 AND (CAST(`f__ts_ns` AS DOUBLE) / 1000000.0) < 1700003600000") {
+		t.Fatalf("expected AggsSQL to scale nanosecond column to epoch millis for date_histogram missing & date_range bounds, got:\n%s", plan.AggsSQL)
 	}
 }
 

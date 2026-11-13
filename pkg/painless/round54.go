@@ -2526,6 +2526,8 @@ func evalRound54ZeroArgMethodPainless(mSuffix, recExpr string, recVal any, sourc
 			return uri.opaque, true, nil
 		case ".normalize()":
 			return uri.normalize(), true, nil
+		case ".parseServerAuthority()":
+			return uri, true, nil
 		case ".toASCIIString()":
 			return uri.toASCIIString(), true, nil
 		case ".toURL()":
@@ -4332,10 +4334,18 @@ func execRound54StatementCallPainless(sourceMap map[string]any, stmt string, par
 		}
 	}
 	for _, mName := range []string{".accept(", ".combine("} {
-		if recExpr, argExpr, ok := matchTrailingMethodCallPainless(stmt, mName); ok {
+		if recExpr, argExpr, isNullSafe, ok := matchTrailingMethodCallWithNullSafePainless(stmt, mName); ok {
 			recVal, err := evalRHSExpr(sourceMap, recExpr, params)
 			if err != nil {
 				return true, err
+			}
+			if recVal == nil {
+				if isNullSafe {
+					params["_last_expr_val"] = nil
+					return true, nil
+				}
+				mBare := strings.TrimSuffix(strings.TrimPrefix(mName, "."), "(")
+				return true, &painlessExceptionError{exType: "NullPointerException", message: "Cannot invoke method " + mBare + "() on null object"}
 			}
 			if m, isMap := recVal.(map[string]any); isMap {
 				if _, isStats := isSummaryStatisticsMapPainless(m); isStats {

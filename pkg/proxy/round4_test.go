@@ -482,8 +482,11 @@ func TestRound4_P1_P2_Queries_Lucene_Painless_Auth_And_ClientRoutes(t *testing.T
 	if code, body := doAuthReq(http.MethodPost, "/q_idx/_search", `{"query":{"fuzzy":{"code":{"value":"spark-1","fuzziness":"AUTO"}}}}`, authHdr); code != http.StatusOK || !strings.Contains(body, `"_id":"d2"`) {
 		t.Fatalf("expected fuzzy query to match d2, got %d %s", code, body)
 	}
-	if code, body := doAuthReq(http.MethodPost, "/q_idx/_search", `{"query":{"combined_fields":{"query":"doris","fields":["title","code"]}}}`, authHdr); code != http.StatusOK || !strings.Contains(body, `"_id":"d1"`) {
-		t.Fatalf("expected combined_fields query to match d1, got %d %s", code, body)
+	if code, body := doAuthReq(http.MethodPost, "/q_idx/_search", `{"query":{"combined_fields":{"query":"doris","fields":["title"]}}}`, authHdr); code != http.StatusOK || !strings.Contains(body, `"_id":"d1"`) {
+		t.Fatalf("expected combined_fields query on text field to match d1, got %d %s", code, body)
+	}
+	if code, body := doAuthReq(http.MethodPost, "/q_idx/_search", `{"query":{"combined_fields":{"query":"doris","fields":["title","code"]}}}`, authHdr); code != http.StatusBadRequest {
+		t.Fatalf("expected combined_fields query with keyword field to return 400, got %d %s", code, body)
 	}
 	if code, body := doAuthReq(http.MethodPost, "/q_idx/_search", `{"query":{"script_score":{"query":{"match_all":{}},"script":{"source":"_score * 2"}}}}`, authHdr); code != http.StatusOK || !strings.Contains(body, `"value":2`) {
 		t.Fatalf("expected script_score query to succeed, got %d %s", code, body)

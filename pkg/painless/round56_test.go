@@ -75,9 +75,9 @@ func TestRound56_F20_IEEE754NaNAndInfinity(t *testing.T) {
 			boolean neOppInf = (pinf != ninf);
 			boolean negZeroEqPosZero = (-0.0 == 0.0);
 
-			// Regression guard: finite 1.0 / 0.0 remains 0.0 per eval_test.go:3283-3294
+			// IEEE-754 float division by zero produces +Infinity (Round 58 F21)
 			double finiteDivZero = 1.0 / 0.0;
-			boolean regDivZeroFinite = !Double.isInfinite(finiteDivZero) && finiteDivZero == 0.0;
+			boolean regDivZeroFinite = Double.isInfinite(finiteDivZero) && finiteDivZero == Double.POSITIVE_INFINITY;
 
 			// Relational operators with NaN -> all false
 			boolean relNaN = (nan < 1.0) || (nan <= 1.0) || (nan > 1.0) || (nan >= 1.0) ||
@@ -884,9 +884,9 @@ func TestRound56_F25_UserDefinedClassCollectionAndMapStatementDispatch(t *testin
 func TestRound56_F26_UnmodifiableCollectionsAndMaps(t *testing.T) {
 	t.Run("NullRejectionDuplicateKeyChecksAndRegressionGuards", func(t *testing.T) {
 		got := evalRound56Out(t, `
-			// Regression guards: Set.of deduplicates, Arrays.asList & Stream.of allow null
-			int setDedup1 = Set.of("a", "b", "a").size();
-			int setDedup2 = Set.of(1, "1", 1L).size();
+			// Regression guards: Set.copyOf deduplicates, Arrays.asList & Stream.of allow null
+			int setDedup1 = Set.copyOf(["a", "b", "a"]).size();
+			int setDedup2 = Set.copyOf([1, "1", 1L]).size();
 			int asListNull = Arrays.asList(null, "x").size();
 			long streamNull = Stream.of(null, "x").count();
 
@@ -920,6 +920,7 @@ func TestRound56_F26_UnmodifiableCollectionsAndMaps(t *testing.T) {
 			try { Map.of("k", 1, "k", 2); } catch (IllegalArgumentException e) { iae++; }
 			try { Map.of("oddOnly"); } catch (IllegalArgumentException e) { iae++; }
 			try { Map.ofEntries(Map.entry("k", 1), Map.entry("k", 2)); } catch (IllegalArgumentException e) { iae++; }
+			try { Set.of("a", "b", "a"); } catch (IllegalArgumentException e) { iae++; }
 
 			ctx._source.out = [
 				'reg': [setDedup1, setDedup2, asListNull, streamNull],
@@ -934,8 +935,8 @@ func TestRound56_F26_UnmodifiableCollectionsAndMaps(t *testing.T) {
 		if m["npe"] != int64(16) {
 			t.Fatalf("expected 16 NullPointerExceptions from unmodifiable factories, got %#v", m["npe"])
 		}
-		if m["iae"] != int64(3) {
-			t.Fatalf("expected 3 IllegalArgumentExceptions from Map.of / Map.ofEntries, got %#v", m["iae"])
+		if m["iae"] != int64(4) {
+			t.Fatalf("expected 4 IllegalArgumentExceptions from Map.of / Map.ofEntries / Set.of, got %#v", m["iae"])
 		}
 	})
 

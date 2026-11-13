@@ -1657,7 +1657,7 @@ func TestRound47PainlessEvaluatorFindings(t *testing.T) {
 		def sm = StrictMath.abs(-5) + (StrictMath.PI > 3.14 ? 1 : 0) + (StrictMath.E > 2.71 ? 1 : 0);
 		def asL = Arrays.asList(10, 20);
 		def lOf = List.of("x", "y");
-		def sOf = Set.of("a", "b", "a");
+		def sOf = Set.of("a", "b");
 		def mOf = Map.of("k1", 1, "k2", 2);
 		def eList = Collections.emptyList();
 		def eSet = Collections.emptySet();
@@ -3291,7 +3291,7 @@ func TestRound51F20ToF26Features(t *testing.T) {
 			t.Fatalf("F23 Eval failed: %v", err)
 		}
 		want := []any{
-			"/ by zero", "java.lang.ArithmeticException", "ArithmeticException", "ArithmeticException", false,
+			"/ by zero", "java.lang.ArithmeticException", "ArithmeticException", "ArithmeticException", true,
 			"String", "java.lang.Long", "ArrayList", "HashMap",
 		}
 		arr, ok := res.([]any)
@@ -3439,7 +3439,7 @@ func TestRound51F20ToF26Features(t *testing.T) {
 			List retTest = new ArrayList([1, "1", 2]);
 			retTest.retainAll([1]);
 
-			Set s1 = Set.of(1, "1", 1L);
+			Set s1 = Set.of(1, "1");
 			Set s2 = Set.copyOf([1, 1, "1", 2, 2L]);
 
 			Map mOrig = new HashMap();
@@ -3704,7 +3704,7 @@ func TestRound52F20ToF26Features(t *testing.T) {
 		if m["e1"] != true || m["p1"] != false || m["e2"] != true || m["e3"] != true || m["e4"] != true {
 			t.Fatalf("unexpected Optional emptiness flags: %#v", m)
 		}
-		if m["null_eq"] != true || m["obj_null"] != true || m["obj_non_null"] != false {
+		if m["null_eq"] != false || m["obj_null"] != true || m["obj_non_null"] != false {
 			t.Fatalf("unexpected Optional null equality checks: %#v", m)
 		}
 		if m["or_else"] != "fallback" || m["or_else_get"] != "computed" || m["or_present"] != "ok" || m["stream_cnt"] != int64(0) {

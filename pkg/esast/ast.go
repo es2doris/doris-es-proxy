@@ -42,41 +42,42 @@ func NextAutoID() string {
 
 // SearchRequest models an Elasticsearch / OpenSearch `/_search` request payload.
 type SearchRequest struct {
-	Query            *Query                   `json:"query,omitempty"`
-	Retriever        *RetrieverSpec           `json:"-"`
-	SubSearches      []SubSearchSpec          `json:"sub_searches,omitempty"`
-	Rank             *RankSpec                `json:"rank,omitempty"`
-	retrieverLowered bool                     `json:"-"`
-	AliasFilter      *Query                   `json:"-"`
-	Routing          string                   `json:"-"`
-	KNN              KNNSlice                 `json:"knn,omitempty"`
-	PostFilter       *Query                   `json:"post_filter,omitempty"`
-	From             *int                     `json:"from,omitempty"`
-	Size             *int                     `json:"size,omitempty"`
-	TerminateAfter   *int                     `json:"terminate_after,omitempty"`
-	MinScore         *float64                 `json:"min_score,omitempty"`
-	Aggs             map[string]AggSpec       `json:"aggs,omitempty"`
-	Aggregations     map[string]AggSpec       `json:"aggregations,omitempty"`
-	Sort             SortSlice                `json:"sort,omitempty"`
-	SearchAfter      []any                    `json:"search_after,omitempty"`
-	Source           *SourceFilter            `json:"_source,omitempty"`
-	TrackTotalHits   any                      `json:"track_total_hits,omitempty"`
-	TrackScores      *bool                    `json:"track_scores,omitempty"`
-	Version          bool                     `json:"version,omitempty"`
-	SeqNoPrimaryTerm bool                     `json:"seq_no_primary_term,omitempty"`
-	Explain          bool                     `json:"explain,omitempty"`
-	IndicesBoost     map[string]float64       `json:"-"`
-	Highlight        *HighlightSpec           `json:"highlight,omitempty"`
-	Collapse         *CollapseSpec            `json:"collapse,omitempty"`
-	Rescore          RescoreSlice             `json:"rescore,omitempty"`
-	PIT              *PITSpec                 `json:"pit,omitempty"`
-	Slice            *SliceSpec               `json:"slice,omitempty"`
-	Fields           []FieldRequestSpec       `json:"fields,omitempty"`
-	DocvalueFields   []FieldRequestSpec       `json:"docvalue_fields,omitempty"`
-	StoredFields     any                      `json:"stored_fields,omitempty"`
-	ScriptFields     map[string]any           `json:"script_fields,omitempty"`
-	RuntimeMappings  map[string]FieldProperty `json:"runtime_mappings,omitempty"`
-	Suggest          map[string]SuggestSpec   `json:"suggest,omitempty"`
+	Query             *Query                   `json:"query,omitempty"`
+	Retriever         *RetrieverSpec           `json:"-"`
+	SubSearches       []SubSearchSpec          `json:"sub_searches,omitempty"`
+	Rank              *RankSpec                `json:"rank,omitempty"`
+	retrieverLowered  bool                     `json:"-"`
+	AliasFilter       *Query                   `json:"-"`
+	Routing           string                   `json:"-"`
+	KNN               KNNSlice                 `json:"knn,omitempty"`
+	PostFilter        *Query                   `json:"post_filter,omitempty"`
+	From              *int                     `json:"from,omitempty"`
+	Size              *int                     `json:"size,omitempty"`
+	TerminateAfter    *int                     `json:"terminate_after,omitempty"`
+	BatchedReduceSize *int                     `json:"batched_reduce_size,omitempty"`
+	MinScore          *float64                 `json:"min_score,omitempty"`
+	Aggs              map[string]AggSpec       `json:"aggs,omitempty"`
+	Aggregations      map[string]AggSpec       `json:"aggregations,omitempty"`
+	Sort              SortSlice                `json:"sort,omitempty"`
+	SearchAfter       []any                    `json:"search_after,omitempty"`
+	Source            *SourceFilter            `json:"_source,omitempty"`
+	TrackTotalHits    any                      `json:"track_total_hits,omitempty"`
+	TrackScores       *bool                    `json:"track_scores,omitempty"`
+	Version           bool                     `json:"version,omitempty"`
+	SeqNoPrimaryTerm  bool                     `json:"seq_no_primary_term,omitempty"`
+	Explain           bool                     `json:"explain,omitempty"`
+	IndicesBoost      map[string]float64       `json:"-"`
+	Highlight         *HighlightSpec           `json:"highlight,omitempty"`
+	Collapse          *CollapseSpec            `json:"collapse,omitempty"`
+	Rescore           RescoreSlice             `json:"rescore,omitempty"`
+	PIT               *PITSpec                 `json:"pit,omitempty"`
+	Slice             *SliceSpec               `json:"slice,omitempty"`
+	Fields            []FieldRequestSpec       `json:"fields,omitempty"`
+	DocvalueFields    []FieldRequestSpec       `json:"docvalue_fields,omitempty"`
+	StoredFields      any                      `json:"stored_fields,omitempty"`
+	ScriptFields      map[string]any           `json:"script_fields,omitempty"`
+	RuntimeMappings   map[string]FieldProperty `json:"runtime_mappings,omitempty"`
+	Suggest           map[string]SuggestSpec   `json:"suggest,omitempty"`
 }
 
 // SubSearchSpec models an entry in `sub_searches`.
@@ -566,6 +567,7 @@ var knownSearchRequestKeys = map[string]bool{
 	"from":                true,
 	"size":                true,
 	"terminate_after":     true,
+	"batched_reduce_size": true,
 	"min_score":           true,
 	"aggs":                true,
 	"aggregations":        true,
@@ -691,16 +693,76 @@ func (r *SearchRequest) UnmarshalJSON(data []byte) error {
 	type plain SearchRequest
 	var raw struct {
 		plain
-		TrackScores      any             `json:"track_scores"`
-		Version          any             `json:"version"`
-		SeqNoPrimaryTerm any             `json:"seq_no_primary_term"`
-		Explain          any             `json:"explain"`
-		IndicesBoost     json.RawMessage `json:"indices_boost"`
+		From              json.RawMessage `json:"from"`
+		Size              json.RawMessage `json:"size"`
+		TerminateAfter    json.RawMessage `json:"terminate_after"`
+		BatchedReduceSize json.RawMessage `json:"batched_reduce_size"`
+		MinScore          json.RawMessage `json:"min_score"`
+		TrackTotalHits    json.RawMessage `json:"track_total_hits"`
+		TrackScores       any             `json:"track_scores"`
+		Version           any             `json:"version"`
+		SeqNoPrimaryTerm  any             `json:"seq_no_primary_term"`
+		Explain           any             `json:"explain"`
+		IndicesBoost      json.RawMessage `json:"indices_boost"`
 	}
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
 	*r = SearchRequest(raw.plain)
+	if len(raw.From) > 0 {
+		fr, err := parseStrictSearchIntJSON(raw.From, "from")
+		if err != nil {
+			return err
+		}
+		if fr != nil && *fr < 0 {
+			return fmt.Errorf("illegal_argument_exception: [from] parameter cannot be negative, found [%d]", *fr)
+		}
+		r.From = fr
+	}
+	if len(raw.Size) > 0 {
+		sz, err := parseStrictSearchIntJSON(raw.Size, "size")
+		if err != nil {
+			return err
+		}
+		if sz != nil && *sz < 0 {
+			return fmt.Errorf("illegal_argument_exception: [size] parameter cannot be negative, found [%d]", *sz)
+		}
+		r.Size = sz
+	}
+	if len(raw.TerminateAfter) > 0 {
+		ta, err := parseStrictSearchIntJSON(raw.TerminateAfter, "terminate_after")
+		if err != nil {
+			return err
+		}
+		if ta != nil && *ta <= 0 {
+			return fmt.Errorf("illegal_argument_exception: [terminate_after] must be greater than 0, found [%d]", *ta)
+		}
+		r.TerminateAfter = ta
+	}
+	if len(raw.BatchedReduceSize) > 0 {
+		brs, err := parseStrictSearchIntJSON(raw.BatchedReduceSize, "batched_reduce_size")
+		if err != nil {
+			return err
+		}
+		if brs != nil && *brs <= 0 {
+			return fmt.Errorf("illegal_argument_exception: [batched_reduce_size] must be >= 1, found [%d]", *brs)
+		}
+		r.BatchedReduceSize = brs
+	}
+	if len(raw.MinScore) > 0 {
+		ms, err := parseStrictSearchFloatJSON(raw.MinScore, "min_score")
+		if err != nil {
+			return err
+		}
+		r.MinScore = ms
+	}
+	if len(raw.TrackTotalHits) > 0 {
+		tth, err := parseTrackTotalHitsJSON(raw.TrackTotalHits)
+		if err != nil {
+			return err
+		}
+		r.TrackTotalHits = tth
+	}
 	if rawSA, hasSA := rawMap["search_after"]; hasSA {
 		saTrim := bytes.TrimSpace(rawSA)
 		if len(saTrim) > 0 && !bytes.Equal(saTrim, []byte("null")) {
@@ -783,6 +845,92 @@ func (r *SearchRequest) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	return nil
+}
+
+func parseStrictSearchIntJSON(raw json.RawMessage, field string) (*int, error) {
+	trim := bytes.TrimSpace(raw)
+	if len(trim) == 0 || bytes.Equal(trim, []byte("null")) {
+		return nil, nil
+	}
+	if trim[0] == '"' {
+		var s string
+		if err := json.Unmarshal(trim, &s); err != nil {
+			return nil, fmt.Errorf("illegal_argument_exception: failed to parse int parameter [%s] with value [%s]", field, string(trim))
+		}
+		s = strings.TrimSpace(s)
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return nil, fmt.Errorf("illegal_argument_exception: failed to parse int parameter [%s] with value [%s]", field, s)
+		}
+		return &n, nil
+	}
+	n, err := strconv.Atoi(string(trim))
+	if err != nil {
+		return nil, fmt.Errorf("illegal_argument_exception: failed to parse int parameter [%s] with value [%s]", field, string(trim))
+	}
+	return &n, nil
+}
+
+func parseStrictSearchFloatJSON(raw json.RawMessage, field string) (*float64, error) {
+	trim := bytes.TrimSpace(raw)
+	if len(trim) == 0 || bytes.Equal(trim, []byte("null")) {
+		return nil, nil
+	}
+	if trim[0] == '"' {
+		var s string
+		if err := json.Unmarshal(trim, &s); err != nil {
+			return nil, fmt.Errorf("illegal_argument_exception: failed to parse float parameter [%s]", field)
+		}
+		f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+			return nil, fmt.Errorf("illegal_argument_exception: failed to parse float parameter [%s] with value [%s]", field, s)
+		}
+		return &f, nil
+	}
+	if trim[0] == '{' || trim[0] == '[' || bytes.Equal(trim, []byte("true")) || bytes.Equal(trim, []byte("false")) {
+		return nil, fmt.Errorf("illegal_argument_exception: failed to parse float parameter [%s] with value [%s]", field, string(trim))
+	}
+	var f float64
+	if err := json.Unmarshal(trim, &f); err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		return nil, fmt.Errorf("illegal_argument_exception: failed to parse float parameter [%s] with value [%s]", field, string(trim))
+	}
+	return &f, nil
+}
+
+func parseTrackTotalHitsJSON(raw json.RawMessage) (any, error) {
+	trim := bytes.TrimSpace(raw)
+	if len(trim) == 0 || bytes.Equal(trim, []byte("null")) {
+		return nil, nil
+	}
+	if bytes.Equal(trim, []byte("true")) {
+		return true, nil
+	}
+	if bytes.Equal(trim, []byte("false")) {
+		return false, nil
+	}
+	if trim[0] == '"' {
+		var s string
+		if err := json.Unmarshal(trim, &s); err != nil {
+			return nil, fmt.Errorf("illegal_argument_exception: failed to parse [track_total_hits]")
+		}
+		st := strings.TrimSpace(s)
+		if strings.EqualFold(st, "true") {
+			return true, nil
+		}
+		if strings.EqualFold(st, "false") {
+			return false, nil
+		}
+		n, err := strconv.ParseInt(st, 10, 64)
+		if err != nil || n < -1 {
+			return nil, fmt.Errorf("illegal_argument_exception: failed to parse [track_total_hits] value [%s]", s)
+		}
+		return float64(n), nil
+	}
+	n, err := strconv.ParseInt(string(trim), 10, 64)
+	if err != nil || n < -1 {
+		return nil, fmt.Errorf("illegal_argument_exception: failed to parse [track_total_hits] value [%s]", string(trim))
+	}
+	return float64(n), nil
 }
 
 func validateScriptFieldsMap(sf map[string]any, ctx string) error {
@@ -4548,6 +4696,9 @@ func (mlt *MoreLikeThisQuery) UnmarshalJSON(data []byte) error {
 		}
 		mlt.Boost = b
 	}
+	if err := ValidateMinimumShouldMatch(mlt.MinimumShouldMatch); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -6686,6 +6837,9 @@ func (cfq *CombinedFieldsQuery) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: [combined_fields] unknown field [%s]", k)
 		}
 	}
+	if _, hasQ := rawMap["query"]; !hasQ {
+		return fmt.Errorf("parsing_exception: [combined_fields] missing required [query] field")
+	}
 	type plain CombinedFieldsQuery
 	var raw struct {
 		plain
@@ -6696,6 +6850,9 @@ func (cfq *CombinedFieldsQuery) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*cfq = CombinedFieldsQuery(raw.plain)
+	if isNonScalarOrNullValue(cfq.Query) {
+		return fmt.Errorf("parsing_exception: [combined_fields] query does not support non-scalar or null value")
+	}
 	if len(raw.Boost) > 0 {
 		b, err := parseOptionalNonNegativeBoost(raw.Boost)
 		if err != nil {
@@ -6709,9 +6866,15 @@ func (cfq *CombinedFieldsQuery) UnmarshalJSON(data []byte) error {
 	if err := validateZeroTermsQuery(cfq.ZeroTermsQuery, "combined_fields"); err != nil {
 		return err
 	}
+	if err := ValidateMinimumShouldMatch(cfq.MinimumShouldMatch); err != nil {
+		return err
+	}
 	if raw.Fields != nil {
 		fields, err := parseFlexibleStringSlice(raw.Fields)
 		if err != nil {
+			return err
+		}
+		if err := validateQueryFieldWeights(fields, "combined_fields"); err != nil {
 			return err
 		}
 		cfq.Fields = fields
@@ -6866,6 +7029,7 @@ type BoolQuery struct {
 	Should             QuerySlice `json:"should,omitempty"`
 	MustNot            QuerySlice `json:"must_not,omitempty"`
 	MinimumShouldMatch any        `json:"minimum_should_match,omitempty"`
+	AdjustPureNegative *bool      `json:"adjust_pure_negative,omitempty"`
 	Boost              *float64   `json:"boost,omitempty"`
 }
 
@@ -6886,11 +7050,128 @@ func (bq *BoolQuery) UnmarshalJSON(data []byte) error {
 		}
 	}
 	type plain BoolQuery
-	var p plain
-	if err := json.Unmarshal(trimmed, &p); err != nil {
+	var dec struct {
+		plain
+		AdjustPureNegative any             `json:"adjust_pure_negative"`
+		Boost              json.RawMessage `json:"boost"`
+	}
+	if err := json.Unmarshal(trimmed, &dec); err != nil {
 		return err
 	}
-	*bq = BoolQuery(p)
+	*bq = BoolQuery(dec.plain)
+	if len(dec.Boost) > 0 {
+		b, err := parseOptionalNonNegativeBoost(dec.Boost)
+		if err != nil {
+			return err
+		}
+		bq.Boost = b
+	}
+	if dec.AdjustPureNegative != nil {
+		apn, err := parseFlexibleBool(dec.AdjustPureNegative)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [bool] [adjust_pure_negative] %w", err)
+		}
+		bq.AdjustPureNegative = &apn
+	}
+	if err := ValidateMinimumShouldMatch(bq.MinimumShouldMatch); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ValidateMinimumShouldMatch validates an Elasticsearch `minimum_should_match` specification.
+func ValidateMinimumShouldMatch(v any) error {
+	if v == nil {
+		return nil
+	}
+	switch val := v.(type) {
+	case int, int32, int64:
+		return nil
+	case json.Number:
+		if _, err := val.Int64(); err == nil {
+			return nil
+		}
+		return fmt.Errorf("illegal_argument_exception: invalid [minimum_should_match] value [%s]", val.String())
+	case float64:
+		if !math.IsNaN(val) && !math.IsInf(val, 0) && val == math.Trunc(val) && val >= math.MinInt32 && val <= math.MaxInt32 {
+			return nil
+		}
+		return fmt.Errorf("illegal_argument_exception: invalid [minimum_should_match] value [%v]", val)
+	case string:
+		s := strings.TrimSpace(val)
+		if s == "" {
+			return fmt.Errorf("illegal_argument_exception: [minimum_should_match] cannot be empty")
+		}
+		if !strings.Contains(s, "<") && !strings.ContainsAny(s, " \t\n\r") {
+			if isValidSingleMSMSpec(s) {
+				return nil
+			}
+			return fmt.Errorf("illegal_argument_exception: invalid [minimum_should_match] specification [%s]", val)
+		}
+		parts := strings.Fields(s)
+		if len(parts) == 0 {
+			return fmt.Errorf("illegal_argument_exception: [minimum_should_match] cannot be empty")
+		}
+		prevK := 0
+		for _, part := range parts {
+			ltIdx := strings.IndexByte(part, '<')
+			if ltIdx <= 0 || strings.IndexByte(part[ltIdx+1:], '<') >= 0 {
+				return fmt.Errorf("illegal_argument_exception: invalid [minimum_should_match] clause [%s]", part)
+			}
+			kStr := part[:ltIdx]
+			spec := part[ltIdx+1:]
+			if !isPureASCIIDigits(kStr) {
+				return fmt.Errorf("illegal_argument_exception: invalid [minimum_should_match] condition [%s]", part)
+			}
+			k, err := strconv.Atoi(kStr)
+			if err != nil || k < 1 || k <= prevK {
+				return fmt.Errorf("illegal_argument_exception: [minimum_should_match] conditions must have strictly ascending positive counts, got [%s]", val)
+			}
+			if !isValidSingleMSMSpec(spec) {
+				return fmt.Errorf("illegal_argument_exception: invalid [minimum_should_match] spec [%s] in [%s]", spec, val)
+			}
+			prevK = k
+		}
+		return nil
+	default:
+		return fmt.Errorf("illegal_argument_exception: invalid [minimum_should_match] value [%v]", v)
+	}
+}
+
+func isValidSingleMSMSpec(spec string) bool {
+	if spec == "" {
+		return false
+	}
+	spec = strings.TrimPrefix(spec, "-")
+	spec = strings.TrimSuffix(spec, "%")
+	if !isPureASCIIDigits(spec) {
+		return false
+	}
+	_, err := strconv.Atoi(spec)
+	return err == nil
+}
+
+func validateQueryFieldWeights(fields []string, clause string) error {
+	for _, rawEntry := range fields {
+		entry := strings.TrimSpace(rawEntry)
+		if entry == "" {
+			return fmt.Errorf("illegal_argument_exception: [%s] field name cannot be empty", clause)
+		}
+		if caretIdx := strings.IndexByte(rawEntry, '^'); caretIdx >= 0 {
+			fieldName := strings.TrimSpace(rawEntry[:caretIdx])
+			weightStr := strings.TrimSpace(rawEntry[caretIdx+1:])
+			if fieldName == "" {
+				return fmt.Errorf("illegal_argument_exception: [%s] field name cannot be empty in [%s]", clause, rawEntry)
+			}
+			if weightStr == "" || strings.Contains(weightStr, "^") {
+				return fmt.Errorf("parsing_exception: [%s] invalid field boost in [%s]", clause, rawEntry)
+			}
+			w, err := strconv.ParseFloat(weightStr, 64)
+			if err != nil || math.IsNaN(w) || math.IsInf(w, 0) || w < 0 {
+				return fmt.Errorf("illegal_argument_exception: [%s] field boost must be a finite non-negative number in [%s]", clause, rawEntry)
+			}
+		}
+	}
 	return nil
 }
 
@@ -7662,6 +7943,9 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: [match] max_expansions must be positive, got [%d]", full.MaxExpansions)
 		}
 		m.ZeroTermsQuery = full.ZeroTermsQuery
+		if err := ValidateMinimumShouldMatch(full.MinimumShouldMatch); err != nil {
+			return err
+		}
 		m.MinimumShouldMatch = full.MinimumShouldMatch
 		m.Fuzziness = full.Fuzziness
 		m.PrefixLength = full.PrefixLength
@@ -7770,6 +8054,26 @@ func (c *CommonTermsEntry) UnmarshalJSON(data []byte) error {
 				return err
 			}
 			c.HighFreqOperator = strings.ToLower(strings.TrimSpace(full.HighFreqOperator))
+		}
+		if msmMap, isMap := full.MinimumShouldMatch.(map[string]any); isMap {
+			if len(msmMap) == 0 {
+				return fmt.Errorf("parsing_exception: [common] [minimum_should_match] object cannot be empty")
+			}
+			for mk, mv := range msmMap {
+				switch mk {
+				case "low_freq", "high_freq":
+					if mv == nil {
+						return fmt.Errorf("illegal_argument_exception: invalid [minimum_should_match] [%s] value [null]", mk)
+					}
+					if err := ValidateMinimumShouldMatch(mv); err != nil {
+						return err
+					}
+				default:
+					return fmt.Errorf("parsing_exception: [common] unknown [minimum_should_match] field [%s]", mk)
+				}
+			}
+		} else if err := ValidateMinimumShouldMatch(full.MinimumShouldMatch); err != nil {
+			return err
 		}
 		c.MinimumShouldMatch = full.MinimumShouldMatch
 		if len(full.Boost) > 0 {
@@ -7927,6 +8231,9 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		p.Operator = strings.ToLower(strings.TrimSpace(full.Operator))
+		if err := ValidateMinimumShouldMatch(full.MinimumShouldMatch); err != nil {
+			return err
+		}
 		p.MinimumShouldMatch = full.MinimumShouldMatch
 		if err := validateZeroTermsQuery(full.ZeroTermsQuery, "match_phrase"); err != nil {
 			return err
@@ -7993,6 +8300,9 @@ func (mmq *MultiMatchQuery) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: [multi_match] unknown field [%s]", k)
 		}
 	}
+	if _, hasQ := rawMap["query"]; !hasQ {
+		return fmt.Errorf("parsing_exception: [multi_match] missing required [query] field")
+	}
 	type plain MultiMatchQuery
 	var raw struct {
 		plain
@@ -8005,6 +8315,9 @@ func (mmq *MultiMatchQuery) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*mmq = MultiMatchQuery(raw.plain)
+	if isNonScalarOrNullValue(mmq.Query) {
+		return fmt.Errorf("parsing_exception: [multi_match] query does not support non-scalar or null value")
+	}
 	if raw.FuzzyTranspositions != nil {
 		ft, err := parseFlexibleBool(raw.FuzzyTranspositions)
 		if err != nil {
@@ -8055,9 +8368,15 @@ func (mmq *MultiMatchQuery) UnmarshalJSON(data []byte) error {
 	if mmq.TieBreaker != nil && (*mmq.TieBreaker < 0 || *mmq.TieBreaker > 1.0 || math.IsNaN(*mmq.TieBreaker)) {
 		return fmt.Errorf("parsing_exception: [multi_match] tie_breaker must be in [0.0, 1.0], got [%v]", *mmq.TieBreaker)
 	}
+	if err := ValidateMinimumShouldMatch(mmq.MinimumShouldMatch); err != nil {
+		return err
+	}
 	if raw.Fields != nil {
 		fields, err := parseFlexibleStringSlice(raw.Fields)
 		if err != nil {
+			return err
+		}
+		if err := validateQueryFieldWeights(fields, "multi_match"); err != nil {
 			return err
 		}
 		mmq.Fields = fields
@@ -8307,12 +8626,19 @@ func (qsq *QueryStringQuery) UnmarshalJSON(data []byte) error {
 	if qsq.TieBreaker != nil && (*qsq.TieBreaker < 0 || *qsq.TieBreaker > 1.0 || math.IsNaN(*qsq.TieBreaker)) {
 		return fmt.Errorf("parsing_exception: [query_string] tie_breaker must be in [0.0, 1.0], got [%v]", *qsq.TieBreaker)
 	}
-	if raw.Query != nil {
-		qsq.Query = formatFlexibleScalarString(raw.Query)
+	if isNonScalarOrNullValue(raw.Query) {
+		return fmt.Errorf("parsing_exception: [query_string] query does not support non-scalar or null value")
 	}
+	if err := ValidateMinimumShouldMatch(qsq.MinimumShouldMatch); err != nil {
+		return err
+	}
+	qsq.Query = formatFlexibleScalarString(raw.Query)
 	if raw.Fields != nil {
 		fields, err := parseFlexibleStringSlice(raw.Fields)
 		if err != nil {
+			return err
+		}
+		if err := validateQueryFieldWeights(fields, "query_string"); err != nil {
 			return err
 		}
 		qsq.Fields = fields
@@ -13577,15 +13903,20 @@ type IndexCreateRequest struct {
 
 // IndexTemplateRequest models `PUT /_index_template/<name>` and `PUT /_template/<name>`.
 type IndexTemplateRequest struct {
-	IndexPatterns []string                  `json:"index_patterns,omitempty"`
-	Patterns      []string                  `json:"patterns,omitempty"`
-	Priority      *int                      `json:"priority,omitempty"`
-	Order         *int                      `json:"order,omitempty"`
-	ComposedOf    []string                  `json:"composed_of,omitempty"`
-	Template      *IndexCreateRequest       `json:"template,omitempty"`
-	Mappings      *MappingSpec              `json:"mappings,omitempty"`
-	Settings      map[string]any            `json:"settings,omitempty"`
-	Aliases       map[string]map[string]any `json:"aliases,omitempty"`
+	IndexPatterns   []string                  `json:"index_patterns,omitempty"`
+	Patterns        []string                  `json:"patterns,omitempty"`
+	Priority        *int                      `json:"priority,omitempty"`
+	Order           *int                      `json:"order,omitempty"`
+	Version         *int                      `json:"version,omitempty"`
+	ComposedOf      []string                  `json:"composed_of,omitempty"`
+	Template        *IndexCreateRequest       `json:"template,omitempty"`
+	Mappings        *MappingSpec              `json:"mappings,omitempty"`
+	Settings        map[string]any            `json:"settings,omitempty"`
+	Aliases         map[string]map[string]any `json:"aliases,omitempty"`
+	Meta            map[string]any            `json:"_meta,omitempty"`
+	DataStream      map[string]any            `json:"data_stream,omitempty"`
+	AllowAutoCreate *bool                     `json:"allow_auto_create,omitempty"`
+	Legacy          bool                      `json:"-"`
 }
 
 func (t *IndexTemplateRequest) EffectivePatterns() []string {
@@ -13683,6 +14014,9 @@ type FieldProperty struct {
 	Fielddata                any                      `json:"fielddata,omitempty"`
 	SplitQueriesOnWhitespace *bool                    `json:"split_queries_on_whitespace,omitempty"`
 	EnablePositionIncrements *bool                    `json:"enable_position_increments,omitempty"`
+	PositiveScoreImpact      *bool                    `json:"positive_score_impact,omitempty"`
+	MaxShingleSize           *int                     `json:"max_shingle_size,omitempty"`
+	DepthLimit               *int                     `json:"depth_limit,omitempty"`
 	Relations                map[string]any           `json:"relations,omitempty"`
 	Fields                   map[string]FieldProperty `json:"fields,omitempty"`
 	Properties               map[string]FieldProperty `json:"properties,omitempty"`

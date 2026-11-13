@@ -58,8 +58,8 @@
 "Cluster settings get and put":
   - do:
       cluster.get_settings: {}
-  - is_true: persistent
-  - is_true: transient
+  - match: { persistent: {} }
+  - match: { transient: {} }
   - do:
       cluster.put_settings:
         body:
