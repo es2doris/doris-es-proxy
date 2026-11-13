@@ -5018,15 +5018,69 @@ func (s *Server) restoreSnapshotIndexArtifacts(
 		for k, v := range idxOverrides {
 			if subMap, isMap := v.(map[string]any); isMap && k == "index" {
 				for sk, sv := range subMap {
-					s.indexCustomSettings[targetIdx][strings.TrimPrefix(sk, "index.")] = deepCloneIngestValue(sv)
+					cleanSK := strings.TrimPrefix(sk, "index.")
+					s.indexCustomSettings[targetIdx][cleanSK] = deepCloneIngestValue(sv)
 				}
 			} else {
-				s.indexCustomSettings[targetIdx][strings.TrimPrefix(k, "index.")] = deepCloneIngestValue(v)
+				cleanK := strings.TrimPrefix(k, "index.")
+				s.indexCustomSettings[targetIdx][cleanK] = deepCloneIngestValue(v)
 			}
 		}
 	}
+	if !ignoredSettings["default_pipeline"] && !ignoredSettings["index.default_pipeline"] {
+		var savedDP string
+		switch dpMap := rawSnap["__default_pipelines"].(type) {
+		case map[string]string:
+			savedDP = dpMap[srcIdx]
+		case map[string]any:
+			savedDP, _ = dpMap[srcIdx].(string)
+		}
+		if savedDP != "" {
+			if s.indexDefaultPipelines == nil {
+				s.indexDefaultPipelines = make(map[string]string)
+			}
+			s.indexDefaultPipelines[targetIdx] = savedDP
+		}
+	}
+	if !ignoredSettings["final_pipeline"] && !ignoredSettings["index.final_pipeline"] {
+		var savedFP string
+		switch fpMap := rawSnap["__final_pipelines"].(type) {
+		case map[string]string:
+			savedFP = fpMap[srcIdx]
+		case map[string]any:
+			savedFP, _ = fpMap[srcIdx].(string)
+		}
+		if savedFP != "" {
+			if s.indexFinalPipelines == nil {
+				s.indexFinalPipelines = make(map[string]string)
+			}
+			s.indexFinalPipelines[targetIdx] = savedFP
+		}
+	}
+	if dpOver, okDP := s.indexCustomSettings[targetIdx]["default_pipeline"].(string); okDP {
+		if s.indexDefaultPipelines == nil {
+			s.indexDefaultPipelines = make(map[string]string)
+		}
+		if dpOver == "" || dpOver == "_none" {
+			delete(s.indexDefaultPipelines, targetIdx)
+		} else {
+			s.indexDefaultPipelines[targetIdx] = dpOver
+		}
+	}
+	if fpOver, okFP := s.indexCustomSettings[targetIdx]["final_pipeline"].(string); okFP {
+		if s.indexFinalPipelines == nil {
+			s.indexFinalPipelines = make(map[string]string)
+		}
+		if fpOver == "" || fpOver == "_none" {
+			delete(s.indexFinalPipelines, targetIdx)
+		} else {
+			s.indexFinalPipelines[targetIdx] = fpOver
+		}
+	}
+	s.setFreshIndexCreationDateLocked(targetIdx)
 
 	// 2. Restore aliases when include_aliases != false (default true for _restore, default false for _mount unless include_aliases: true)
+	aliasesToPersist := make(map[string][]string)
 	includeAliases := !isMount
 	if ia, hasIA := reqMap["include_aliases"].(bool); hasIA {
 		includeAliases = ia
@@ -5077,6 +5131,7 @@ func (s *Server) restoreSnapshotIndexArtifacts(
 						}
 						s.aliasMeta[aliasName][targetIdx] = am
 					}
+					aliasesToPersist[aliasName] = append([]string(nil), s.aliases[aliasName]...)
 				}
 			}
 		}
@@ -5085,6 +5140,13 @@ func (s *Server) restoreSnapshotIndexArtifacts(
 		restoredSchema = s.indices[targetIdx]
 	}
 	s.mu.Unlock()
+
+	if restoredSchema != nil {
+		s.persistIndex(ctx, targetIdx, restoredSchema)
+	}
+	for aName, aTargets := range aliasesToPersist {
+		s.persistAlias(ctx, aName, aTargets)
+	}
 
 	if restoredSchema == nil {
 		return
@@ -8669,6 +8731,9 @@ func (s *Server) handleFlushSyncedRound57(w http.ResponseWriter, r *http.Request
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
+	if !s.ensureNoExplicitClosedTargetRound59(w, r, rawIndex) {
+		return
+	}
 	var targets []string
 	if rawIndex != "" && rawIndex != "*" && rawIndex != "_all" {
 		var ok bool
@@ -8740,6 +8805,7 @@ func (s *Server) handleFreezeIndexRound57(w http.ResponseWriter, r *http.Request
 		}
 	}
 	s.mu.Unlock()
+	s.persistIndexBatchRound59(r.Context(), targets)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"acknowledged":        true,
 		"shards_acknowledged": true,

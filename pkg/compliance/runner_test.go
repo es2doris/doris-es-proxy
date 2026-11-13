@@ -3230,13 +3230,15 @@ func TestRound56_RunnerFeaturesArbitraryKeyBracedStashVersionCatchAndEscaping(t 
 	}
 
 	// 4. is_unset step
-	for _, p := range []string{"missing_path", "null_field", "false_bool"} {
+	for _, p := range []string{"missing_path", "null_field"} {
 		if err := ctx.execStep(SpecStep{Op: "is_unset", Value: p}, false); err != nil {
 			t.Fatalf("expected is_unset(%q) to pass, got %v", p, err)
 		}
 	}
-	if err := ctx.execStep(SpecStep{Op: "is_unset", Value: "true_bool"}, false); err == nil {
-		t.Fatalf("expected is_unset(true_bool) to fail")
+	for _, p := range []string{"false_bool", "true_bool"} {
+		if err := ctx.execStep(SpecStep{Op: "is_unset", Value: p}, false); err == nil {
+			t.Fatalf("expected is_unset(%q) to fail", p)
+		}
 	}
 
 	// 5. Named catch HTTP status tokens + URL path escaping for '#', '?', '%', space, and '/' in document IDs

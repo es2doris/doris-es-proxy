@@ -516,12 +516,12 @@ func TestRound11CompositeDescPaginationAndMissingFormatting(t *testing.T) {
 	tBuckets := mRes["aggregations"].(map[string]any)["t_epoch"].(map[string]any)["buckets"].([]any)
 	foundLargeInt := false
 	for _, tb := range tBuckets {
-		if tb.(map[string]any)["key"].(string) == "1704067200000" {
+		if kv, ok := tb.(map[string]any)["key"].(float64); ok && kv == 1704067200000 {
 			foundLargeInt = true
 		}
 	}
 	if !foundLargeInt {
-		t.Fatalf("expected large integer missing key '1704067200000' without scientific notation, got %+v", tBuckets)
+		t.Fatalf("expected large integer missing key 1704067200000, got %+v", tBuckets)
 	}
 }
 

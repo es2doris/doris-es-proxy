@@ -2796,6 +2796,7 @@ const (
 type painlessUserFunc struct {
 	name       string
 	returnType string
+	paramTypes []string
 	paramNames []string
 	body       string
 }
@@ -2817,24 +2818,27 @@ type painlessMatcher struct {
 }
 
 type evalBudget struct {
-	steps         int
-	depth         int
-	nowMillis     int64
-	ctxOp         string
-	hasCtxOp      bool
-	ctxID         any
-	hasCtxID      bool
-	ctxIndex      any
-	hasCtxIndex   bool
-	ctxRouting    any
-	hasCtxRouting bool
-	ctxVersion    any
-	hasCtxVersion bool
-	emittedVals   []any
-	userFuncs     map[string]*painlessUserFunc
-	userClasses   map[string]*painlessUserClass
-	unmodSlices   map[uintptr]bool
-	unmodMaps     map[uintptr]bool
+	steps             int
+	depth             int
+	nowMillis         int64
+	ctxOp             string
+	hasCtxOp          bool
+	ctxID             any
+	hasCtxID          bool
+	ctxIndex          any
+	hasCtxIndex       bool
+	ctxRouting        any
+	hasCtxRouting     bool
+	ctxVersion        any
+	hasCtxVersion     bool
+	emittedVals       []any
+	userFuncs         map[string]*painlessUserFunc
+	userFuncOverloads map[string]map[int]*painlessUserFunc
+	userClasses       map[string]*painlessUserClass
+	unmodSlices       map[uintptr]bool
+	unmodMaps         map[uintptr]bool
+	setSlices         map[uintptr]bool
+	arrayTypes        map[uintptr]string
 }
 
 func latchCtxMetaOnBudget(budget *evalBudget, path []string, val any) {
@@ -3010,10 +3014,11 @@ func parseUserFuncDecl(stmt string) (*painlessUserFunc, bool) {
 	if !strings.HasPrefix(rest, "{") || findMatchingDelimiter(rest, 0, '{', '}') != len(rest)-1 {
 		return nil, false
 	}
-	paramNames := parseParamListNamesPainless(t[openP+1 : closeP])
+	paramTypes, paramNames := parseParamListTypesAndNamesRound59(t[openP+1 : closeP])
 	return &painlessUserFunc{
 		name:       m[2],
 		returnType: m[1],
+		paramTypes: paramTypes,
 		paramNames: paramNames,
 		body:       strings.TrimSpace(rest[1 : len(rest)-1]),
 	}, true
@@ -3434,10 +3439,9 @@ func execBlock(sourceMap map[string]any, block string, params map[string]any, ct
 			continue
 		}
 		if fnDecl, ok := parseUserFuncDecl(stmt); ok {
-			if budget.userFuncs == nil {
-				budget.userFuncs = make(map[string]*painlessUserFunc)
+			if err := registerUserFuncRound59(budget, fnDecl); err != nil {
+				return err
 			}
-			budget.userFuncs[fnDecl.name] = fnDecl
 			continue
 		}
 		if err := execSimpleStmt(sourceMap, stmt, params, ctxOp, budget); err != nil {
@@ -3610,40 +3614,8 @@ func parseSwitchClauses(body string) []painlessSwitchClause {
 	return clauses
 }
 
-func matchSwitchClauseIndexPainless(sourceMap map[string]any, switchVal any, clauses []painlessSwitchClause, params map[string]any) (int, error) {
-	matchIdx := -1
-	defaultIdx := -1
-	for idx, cl := range clauses {
-		if cl.isDefault {
-			if defaultIdx < 0 {
-				defaultIdx = idx
-			}
-			continue
-		}
-		for _, ce := range cl.caseExprs {
-			cVal, cErr := evalRHSExpr(sourceMap, ce, params)
-			if cErr != nil {
-				return -1, cErr
-			}
-			if painlessValuesEqual(switchVal, cVal) || valuesEqual(switchVal, cVal) {
-				matchIdx = idx
-				break
-			}
-			if f1, ok1 := toFloat64(switchVal); ok1 && switchVal != nil {
-				if f2, ok2 := toFloat64(cVal); ok2 && cVal != nil && f1 == f2 {
-					matchIdx = idx
-					break
-				}
-			}
-		}
-		if matchIdx >= 0 {
-			break
-		}
-	}
-	if matchIdx < 0 {
-		matchIdx = defaultIdx
-	}
-	return matchIdx, nil
+func matchSwitchClauseIndexPainless(sourceMap map[string]any, switchVal any, switchExpr string, clauses []painlessSwitchClause, params map[string]any, depth int) (int, error) {
+	return matchSwitchClauseIndexRound59(sourceMap, switchVal, switchExpr, clauses, params, depth)
 }
 
 func execSwitchStatement(sourceMap map[string]any, stmt string, params map[string]any, ctxOp *string, budget *evalBudget) error {
@@ -3665,17 +3637,22 @@ func execSwitchStatement(sourceMap map[string]any, stmt string, params map[strin
 	if err != nil {
 		return err
 	}
+	if switchVal == nil {
+		return &painlessExceptionError{exType: "NullPointerException", message: "Cannot switch on null value"}
+	}
 	clauses := parseSwitchClauses(rest[1:closeBrace])
 	if len(clauses) == 0 {
 		return nil
 	}
-	matchIdx, err := matchSwitchClauseIndexPainless(sourceMap, switchVal, clauses, params)
+	matchIdx, err := matchSwitchClauseIndexPainless(sourceMap, switchVal, switchExpr, clauses, params, 0)
 	if err != nil {
 		return err
 	}
 	if matchIdx < 0 {
 		return nil
 	}
+	snap := captureSwitchScopeRound59(params)
+	defer restoreSwitchScopeRound59(params, snap)
 	if clauses[matchIdx].isArrow {
 		if clauses[matchIdx].body == "" {
 			return nil
@@ -3723,11 +3700,14 @@ func evalSwitchExprPainless(sourceMap map[string]any, rhs string, params map[str
 	if err != nil {
 		return nil, true, err
 	}
+	if switchVal == nil {
+		return nil, true, &painlessExceptionError{exType: "NullPointerException", message: "Cannot switch on null value"}
+	}
 	clauses := parseSwitchClauses(rest[1 : len(rest)-1])
 	if len(clauses) == 0 {
 		return nil, true, nil
 	}
-	matchIdx, err := matchSwitchClauseIndexPainless(sourceMap, switchVal, clauses, params)
+	matchIdx, err := matchSwitchClauseIndexPainless(sourceMap, switchVal, switchExpr, clauses, params, depth+1)
 	if err != nil {
 		return nil, true, err
 	}
@@ -3737,6 +3717,8 @@ func evalSwitchExprPainless(sourceMap map[string]any, rhs string, params map[str
 	if params == nil {
 		params = make(map[string]any)
 	}
+	snap := captureSwitchScopeRound59(params)
+	defer restoreSwitchScopeRound59(params, snap)
 	prevYield, hadPrevYield := params["__switch_yield_val"]
 	delete(params, "__switch_yield_val")
 	defer func() {
@@ -3796,7 +3778,7 @@ func syncLoopScopeBack(params, loopParams map[string]any, preExistingKeys, exclu
 		if k == "__loop_declared" {
 			continue
 		}
-		if (((ep != nil && ep[k]) || preExistingKeys[k]) && !excludedVars[k] && !loopDeclared[k]) || k == "_return_val" || k == "_ctx_op" || k == "_ctx_id" || k == "_ctx_index" || k == "_ctx_routing" || k == "_ctx_version" {
+		if (((ep != nil && ep[k]) || preExistingKeys[k]) && !excludedVars[k] && !loopDeclared[k]) || k == "_return_val" || k == "__has_value_return" || k == "__has_empty_return" || k == "_ctx_op" || k == "_ctx_id" || k == "_ctx_index" || k == "_ctx_routing" || k == "_ctx_version" {
 			params[k] = v
 		} else if strings.HasPrefix(k, "__alias_") {
 			baseVar := strings.TrimPrefix(k, "__alias_")
@@ -5240,6 +5222,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		retExpr := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(stmt, "return")), ";"))
 		if retExpr == "" {
 			params["_return_val"] = nil
+			params["__has_empty_return"] = true
 			return errPainlessReturn
 		}
 		val, err := evalRHSExpr(sourceMap, retExpr, params)
@@ -5247,6 +5230,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			return err
 		}
 		params["_return_val"] = val
+		params["__has_value_return"] = true
 		return errPainlessReturn
 	}
 	if stmt == "break" {
@@ -5449,8 +5433,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			if err != nil {
 				return err
 			}
-			items, _ := valToAdd.([]any)
-			changed, err := insertAllIntoSliceAtPath(sourceMap, arrPath, idxVal, items, budget)
+			changed, err := insertAllIntoSliceAtPathRound59(sourceMap, arrPath, idxVal, valToAdd, budget)
 			if err != nil {
 				return err
 			}
@@ -5462,20 +5445,22 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		if err != nil {
 			return err
 		}
+		items, err := requireNonNullCollectionArgRound59(valToAdd, "addAll")
+		if err != nil {
+			return err
+		}
 		changed := false
-		if items, ok := valToAdd.([]any); ok {
-			// Snapshot items before appending to prevent self-aliasing issues
-			itemsCopy := make([]any, len(items))
-			copy(itemsCopy, items)
-			for _, item := range itemsCopy {
-				if err := budget.step(); err != nil {
-					return err
-				}
-				if err := appendToSlice(sourceMap, arrPath, item); err != nil {
-					return err
-				}
-				changed = true
+		// Snapshot items before appending to prevent self-aliasing issues
+		itemsCopy := make([]any, len(items))
+		copy(itemsCopy, items)
+		for _, item := range itemsCopy {
+			if err := budget.step(); err != nil {
+				return err
 			}
+			if err := appendToSlice(sourceMap, arrPath, item); err != nil {
+				return err
+			}
+			changed = true
 		}
 		syncSourceAliasToLocalVars(sourceMap, params, cleanM1)
 		params["_last_expr_val"] = changed
@@ -5501,7 +5486,11 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		if err != nil {
 			return err
 		}
-		params["_last_expr_val"] = mutateSliceRemoveOrRetainAtPath(sourceMap, arrPath, argVal, false)
+		changed, err := mutateSliceRemoveOrRetainAtPathRound59(sourceMap, arrPath, argVal, false, budget)
+		if err != nil {
+			return err
+		}
+		params["_last_expr_val"] = changed
 		syncSourceAliasToLocalVars(sourceMap, params, cleanM1)
 		return nil
 	}
@@ -5524,7 +5513,11 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		if err != nil {
 			return err
 		}
-		params["_last_expr_val"] = mutateSliceRemoveOrRetainAtPath(sourceMap, arrPath, argVal, true)
+		changed, err := mutateSliceRemoveOrRetainAtPathRound59(sourceMap, arrPath, argVal, true, budget)
+		if err != nil {
+			return err
+		}
+		params["_last_expr_val"] = changed
 		syncSourceAliasToLocalVars(sourceMap, params, cleanM1)
 		return nil
 	}
@@ -5554,7 +5547,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			if err != nil {
 				return err
 			}
-			if err := insertIntoSliceAtPath(sourceMap, arrPath, idxVal, valToAdd); err != nil {
+			if err := insertIntoSliceAtPathRound59(sourceMap, arrPath, idxVal, valToAdd, budget); err != nil {
 				return err
 			}
 			syncSourceAliasToLocalVars(sourceMap, params, cleanM1)
@@ -5596,7 +5589,11 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			if err != nil {
 				return err
 			}
-			params["_last_expr_val"] = setSliceElementAtPath(sourceMap, arrPath, idxVal, newVal)
+			prev, err := setSliceElementAtPathRound59(sourceMap, arrPath, idxVal, newVal, budget)
+			if err != nil {
+				return err
+			}
+			params["_last_expr_val"] = prev
 			syncSourceAliasToLocalVars(sourceMap, params, cleanM1)
 			return nil
 		}
@@ -5627,17 +5624,19 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		if err != nil {
 			return err
 		}
-		if subMap, ok := mapVal.(map[string]any); ok {
-			putAllAtPath(sourceMap, targetPath, subMap)
-			if cleanM1 != "" {
-				syncSourceAliasToLocalVars(sourceMap, params, cleanM1)
-				for k := range subMap {
-					syncSourceAliasToLocalVars(sourceMap, params, cleanM1+"."+k)
-				}
-			} else {
-				for k := range subMap {
-					syncSourceAliasToLocalVars(sourceMap, params, k)
-				}
+		subMap, err := requireNonNullMapArgRound59(mapVal, "putAll")
+		if err != nil {
+			return err
+		}
+		putAllAtPath(sourceMap, targetPath, subMap)
+		if cleanM1 != "" {
+			syncSourceAliasToLocalVars(sourceMap, params, cleanM1)
+			for k := range subMap {
+				syncSourceAliasToLocalVars(sourceMap, params, cleanM1+"."+k)
+			}
+		} else {
+			for k := range subMap {
+				syncSourceAliasToLocalVars(sourceMap, params, k)
 			}
 		}
 		params["_last_expr_val"] = nil
@@ -5726,7 +5725,11 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		if err != nil {
 			return err
 		}
-		params["_last_expr_val"] = removeKeyOrIndexAtPath(sourceMap, parentPath, argVal)
+		removed, err := removeKeyOrIndexAtPathRound59(sourceMap, parentPath, argVal, m[2], params, budget)
+		if err != nil {
+			return err
+		}
+		params["_last_expr_val"] = removed
 		if cleanM1 != "" {
 			syncSourceAliasToLocalVars(sourceMap, params, cleanM1)
 		}
@@ -5823,8 +5826,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 						if err != nil {
 							return err
 						}
-						items, _ := valToAdd.([]any)
-						changed, err := insertAllIntoSliceAtPath(params, arrPath, idxVal, items, budget)
+						changed, err := insertAllIntoSliceAtPathRound59(params, arrPath, idxVal, valToAdd, budget)
 						if err != nil {
 							return err
 						}
@@ -5836,19 +5838,21 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 					if err != nil {
 						return err
 					}
+					items, err := requireNonNullCollectionArgRound59(valToAdd, "addAll")
+					if err != nil {
+						return err
+					}
 					changed := false
-					if items, ok := valToAdd.([]any); ok {
-						itemsCopy := make([]any, len(items))
-						copy(itemsCopy, items)
-						for _, item := range itemsCopy {
-							if err := budget.step(); err != nil {
-								return err
-							}
-							if err := appendToSlice(params, arrPath, item); err != nil {
-								return err
-							}
-							changed = true
+					itemsCopy := make([]any, len(items))
+					copy(itemsCopy, items)
+					for _, item := range itemsCopy {
+						if err := budget.step(); err != nil {
+							return err
 						}
+						if err := appendToSlice(params, arrPath, item); err != nil {
+							return err
+						}
+						changed = true
 					}
 					params["_last_expr_val"] = changed
 					syncLocalVarAlias(sourceMap, params, rootVar)
@@ -5882,7 +5886,11 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 					if err != nil {
 						return err
 					}
-					params["_last_expr_val"] = mutateSliceRemoveOrRetainAtPath(params, arrPath, argVal, false)
+					changed, err := mutateSliceRemoveOrRetainAtPathRound59(params, arrPath, argVal, false, budget)
+					if err != nil {
+						return err
+					}
+					params["_last_expr_val"] = changed
 					syncLocalVarAlias(sourceMap, params, rootVar)
 					return nil
 				}
@@ -5914,7 +5922,11 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 					if err != nil {
 						return err
 					}
-					params["_last_expr_val"] = mutateSliceRemoveOrRetainAtPath(params, arrPath, argVal, true)
+					changed, err := mutateSliceRemoveOrRetainAtPathRound59(params, arrPath, argVal, true, budget)
+					if err != nil {
+						return err
+					}
+					params["_last_expr_val"] = changed
 					syncLocalVarAlias(sourceMap, params, rootVar)
 					return nil
 				}
@@ -5952,7 +5964,7 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 						if err != nil {
 							return err
 						}
-						if err := insertIntoSliceAtPath(params, arrPath, idxVal, valToAdd); err != nil {
+						if err := insertIntoSliceAtPathRound59(params, arrPath, idxVal, valToAdd, budget); err != nil {
 							return err
 						}
 						params["_last_expr_val"] = true
@@ -6002,7 +6014,11 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 						if err != nil {
 							return err
 						}
-						params["_last_expr_val"] = setSliceElementAtPath(params, arrPath, idxVal, newVal)
+						prev, err := setSliceElementAtPathRound59(params, arrPath, idxVal, newVal, budget)
+						if err != nil {
+							return err
+						}
+						params["_last_expr_val"] = prev
 						syncLocalVarAlias(sourceMap, params, rootVar)
 						return nil
 					}
@@ -6041,16 +6057,18 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 				if err != nil {
 					return err
 				}
-				if subMap, ok := mapVal.(map[string]any); ok {
-					putAllAtPath(params, targetPath, subMap)
-					if isRootParams {
-						for k := range subMap {
-							markExplicitParamsKey(params, k)
-						}
+				subMap, err := requireNonNullMapArgRound59(mapVal, "putAll")
+				if err != nil {
+					return err
+				}
+				putAllAtPath(params, targetPath, subMap)
+				if isRootParams {
+					for k := range subMap {
+						markExplicitParamsKey(params, k)
 					}
-					if rootVar != "" {
-						syncLocalVarAlias(sourceMap, params, rootVar)
-					}
+				}
+				if rootVar != "" {
+					syncLocalVarAlias(sourceMap, params, rootVar)
 				}
 				params["_last_expr_val"] = nil
 				return nil
@@ -6167,7 +6185,11 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 				if err != nil {
 					return err
 				}
-				params["_last_expr_val"] = removeKeyOrIndexAtPath(params, parentPath, argVal)
+				removed, err := removeKeyOrIndexAtPathRound59(params, parentPath, argVal, m[2], params, budget)
+				if err != nil {
+					return err
+				}
+				params["_last_expr_val"] = removed
 				if isRootParams && argVal != nil {
 					unmarkExplicitParamsKey(params, fmt.Sprintf("%v", argVal))
 				}
@@ -6264,13 +6286,13 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		if err := checkMutableParentAtPathPainless(budget, sourceMap, lhsPath); err != nil {
 			return err
 		}
+		curVal := resolveParamPath(sourceMap, lhsPath)
 		op := m[2]
 		rhsExpr := strings.TrimSpace(m[3])
 		rhsVal, err := evalRHSExpr(sourceMap, rhsExpr, params)
 		if err != nil {
 			return err
 		}
-		curVal := resolveParamPath(sourceMap, lhsPath)
 		nextVal, err := evalCompoundAssignRound57Painless(curVal, rhsVal, op, "ctx._source."+m[1], rhsExpr, "", params)
 		if err != nil {
 			return err
@@ -6320,10 +6342,6 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		if _, err := checkCtxMetaLHS(rawPath, sourceMap, params); err != nil {
 			return err
 		}
-		rhsVal, err := evalRHSExpr(sourceMap, strings.TrimSpace(m[3]), params)
-		if err != nil {
-			return err
-		}
 		path := normalizeLocalLHSPath(rawPath, params)
 		if len(path) == 0 {
 			return nil
@@ -6348,6 +6366,10 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		}
 		curVal := resolveParamPath(params, path)
 		rhsExpr := strings.TrimSpace(m[3])
+		rhsVal, err := evalRHSExpr(sourceMap, rhsExpr, params)
+		if err != nil {
+			return err
+		}
 		nextVal, err := evalCompoundAssignRound57Painless(curVal, rhsVal, op, lhs, rhsExpr, declType, params)
 		if err != nil {
 			return err
@@ -6522,20 +6544,31 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		var isLocalDecl bool
 		if reVarTypeDeclPrefix.MatchString(stmt) {
 			isLocalDecl = true
+			if oos, ok := params["__out_of_scope_vars"].(map[string]bool); ok {
+				delete(oos, varName)
+			}
 			if ld, ok := params["__loop_declared"].(map[string]bool); ok {
 				ld[varName] = true
 			}
 			if sl, ok := params["__script_locals"].(map[string]bool); ok && !existed {
 				sl[varName] = true
 			}
-		} else if !existed {
-			hasImplicitField := false
-			if uo, isThis := params["this"].(*painlessUserObject); isThis && uo != nil && uo.fields != nil {
-				_, hasImplicitField = uo.fields[varName]
+		} else {
+			if oos, ok := params["__out_of_scope_vars"].(map[string]bool); ok && oos[varName] {
+				return &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("Variable [%s] is not defined", varName)}
 			}
-			if !hasImplicitField {
-				if sl, ok := params["__script_locals"].(map[string]bool); ok {
-					sl[varName] = true
+			if !existed {
+				hasImplicitField := false
+				if uo, isThis := params["this"].(*painlessUserObject); isThis && uo != nil && uo.fields != nil {
+					_, hasImplicitField = uo.fields[varName]
+				}
+				if !hasImplicitField {
+					if params["__in_user_func"] == true {
+						return &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("Variable [%s] is not defined", varName)}
+					}
+					if sl, ok := params["__script_locals"].(map[string]bool); ok {
+						sl[varName] = true
+					}
 				}
 			}
 		}
@@ -6556,11 +6589,20 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 				delete(params, "__user_var_class_"+varName)
 			}
 		}
+		if err := validateUserClassVarValueRound59(varName, val, params, budget); err != nil {
+			return err
+		}
 		if declType := getLocalVarPrimitiveTypeRound57(params, varName); declType != "" {
-			val = coerceTypedVarRound57Painless(declType, val)
+			val, err = coerceAndValidateLocalAssignRound59(declType, rhsExpr, val, params)
+			if err != nil {
+				return err
+			}
 		} else if !isLocalDecl {
 			if _, ft := resolveUnshadowedThisFieldTypeRound57(params, varName); ft != "" {
-				val = coerceTypedVarRound57Painless(ft, val)
+				val, err = coerceAndValidateLocalAssignRound59(ft, rhsExpr, val, params)
+				if err != nil {
+					return err
+				}
 			}
 		}
 		params[varName] = val
@@ -6656,6 +6698,9 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		return nil
 	}
 	if m := reNullVarDecl.FindStringSubmatch(stmt); m != nil {
+		if oos, ok := params["__out_of_scope_vars"].(map[string]bool); ok {
+			delete(oos, m[1])
+		}
 		if ld, ok := params["__loop_declared"].(map[string]bool); ok {
 			ld[m[1]] = true
 		}
@@ -6680,6 +6725,18 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		}
 		delete(params, "__alias_"+m[1])
 		return nil
+	}
+
+	// Fallback for compound / chained / dynamic-bracket assignment expressions (`a += b += 4`, `m[k] += 1`, `(x = 5)`)
+	if !reVarTypeDeclPrefix.MatchString(stmt) {
+		if aLHS, aOp, aRHS, aOk := findFirstTopLevelAssignOpRound59(stmt); aOk {
+			val, err := evalAssignExprRound59Painless(sourceMap, aLHS, aOp, aRHS, params, 0)
+			if err != nil {
+				return err
+			}
+			params["_last_expr_val"] = val
+			return nil
+		}
 	}
 
 	if strings.HasSuffix(stmt, ")") {
@@ -6874,6 +6931,12 @@ func findTopLevelOpPainless(s, op string) int {
 		default:
 			if depth == 0 && s[i:i+len(op)] == op {
 				if op == "==" && ((i+2 < len(s) && (s[i+2] == '~' || s[i+2] == '=')) || (i > 0 && (s[i-1] == '=' || s[i-1] == '!'))) {
+					continue
+				}
+				if op == ">=" && i > 0 && s[i-1] == '>' {
+					continue
+				}
+				if op == "<=" && i > 0 && s[i-1] == '<' {
 					continue
 				}
 				if op == "=~" && i > 0 && s[i-1] == '=' {
@@ -7259,6 +7322,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		return swVal, swErr
 	}
 
+	// Lowest-precedence tier (JLS §15.26): right-associative `=` and compound assignments (`+=`, `-=`, `*=`, etc.)
+	if aLHS, aOp, aRHS, aOk := findFirstTopLevelAssignOpRound59(rhs); aOk {
+		return evalAssignExprRound59Painless(sourceMap, aLHS, aOp, aRHS, params, depth+1)
+	}
+
 	// Check Elvis operator `?:` and ternary `cond ? trueExpr : falseExpr` in left-to-right order
 	elvisIdx := findTopLevelOpPainless(rhs, "?:")
 	qIdx := findTopLevelOpPainless(rhs, "?")
@@ -7324,28 +7392,12 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		}
 		return applyMulDiv(leftVal, rightVal, opCh), nil
 	}
-	if castType, castRest, ok := splitLeadingTypeCastPainless(rhs); ok {
+	if castType, castRest, ok := splitLeadingTypeCastRound59(rhs, params); ok {
 		innerVal, err := evalRHSExprDepth(sourceMap, castRest, params, depth+1)
-		if err != nil || innerVal == nil {
+		if err != nil {
 			return nil, err
 		}
-		if castedVal, handledCast := evalPrimitiveCastRound57Painless(castType, innerVal); handledCast {
-			return castedVal, nil
-		}
-		switch castType {
-		case "String":
-			return formatValueForStringPainless(innerVal), nil
-		case "boolean", "Boolean":
-			if b, bOk := innerVal.(bool); bOk {
-				return b, nil
-			}
-			if f, fOk := toFloat64(innerVal); fOk {
-				return f != 0, nil
-			}
-			return strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", innerVal)), "true"), nil
-		case "def", "Object", "List", "Map":
-			return innerVal, nil
-		}
+		return evalExplicitCastRound59Painless(castType, castRest, innerVal, params)
 	}
 	rhs = trimBalancedParens(expandDynamicBrackets(rhs, sourceMap, params, depth+1))
 	if m := reCtxIncDec.FindStringSubmatch(rhs); m != nil {
@@ -7660,6 +7712,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				}
 			}
 			if res, handled, errR := evalRound54ZeroArgMethodPainless(mSuffix, recExpr, recVal, sourceMap, params, depth+1); handled {
+				if mSuffix == ".toArray()" && errR == nil {
+					if s, ok := res.([]any); ok {
+						res = markTypedArraySliceRound59(getOrInitEvalBudget(params), s, "Object[]")
+					}
+				}
 				return res, errR
 			}
 			if mSuffix == ".isPresent()" {
@@ -7667,6 +7724,12 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			}
 			if mSuffix == ".stream()" {
 				if isEmptyOptionalOrNilPainless(recVal) {
+					return newEmptyPainlessSlice(), nil
+				}
+				if opt, isOpt := recVal.(*painlessOptional); isOpt {
+					if opt != nil && opt.present {
+						return []any{opt.val}, nil
+					}
 					return newEmptyPainlessSlice(), nil
 				}
 				if bs, isBS := recVal.(*painlessBitSet); isBS {
@@ -7849,7 +7912,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				for i, r := range runes {
 					out[i] = string(r)
 				}
-				return out, nil
+				return markTypedArraySliceRound59(getOrInitEvalBudget(params), out, "char[]"), nil
 			case ".lines()":
 				return splitLinesPainless(fmt.Sprintf("%v", recVal)), nil
 			case ".chars()", ".codePoints()":
@@ -7866,7 +7929,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				for i := 0; i < len(s); i++ {
 					out[i] = int64(s[i])
 				}
-				return out, nil
+				return markTypedArraySliceRound59(getOrInitEvalBudget(params), out, "byte[]"), nil
 			case ".withoutPadding()":
 				if s, ok := recVal.(string); ok && strings.HasPrefix(s, "__base64_encoder:") {
 					if !strings.HasSuffix(s, ":nopad") {
@@ -8116,9 +8179,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					for i, k := range keys {
 						out[i] = decodePainlessMapKeyRound57(k)
 					}
-					return out, nil
+					return markSetSliceRound59(getOrInitEvalBudget(params), out), nil
 				}
-				return []any{}, nil
+				return markSetSliceRound59(getOrInitEvalBudget(params), []any{}), nil
 			case ".values()":
 				if tv, ok := recVal.(map[string]any); ok {
 					keys := visiblePainlessMapKeys(tv)
@@ -8139,9 +8202,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					for i, k := range keys {
 						out[i] = map[string]any{"key": decodePainlessMapKeyRound57(k), "value": tv[k], "__parent_map": tv}
 					}
-					return out, nil
+					return markSetSliceRound59(getOrInitEvalBudget(params), out), nil
 				}
-				return []any{}, nil
+				return markSetSliceRound59(getOrInitEvalBudget(params), []any{}), nil
 			case ".getKey()":
 				if tv, ok := recVal.(map[string]any); ok {
 					return tv["key"], nil
@@ -8590,7 +8653,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		".thenComparing(", ".thenComparingInt(", ".thenComparingLong(", ".thenComparingDouble(", ".compare(",
 		".accept(", ".combine(", ".withOffsetSameLocal(", ".withOffsetSameInstant(", ".toEpochSecond(",
 		".splitAsStream(", ".usePattern(", ".useTransparentBounds(", ".useAnchoringBounds(", ".test(",
-		".resolve(", ".relativize(",
+		".resolve(", ".relativize(", ".sameFile(",
 	} {
 		if recExpr, argExpr, isNullSafe, ok := matchTrailingMethodCallWithNullSafePainless(rhs, mName); ok {
 			if isKnownStaticClassIdentifierRound58(recExpr, params) ||
@@ -8758,7 +8821,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 							if err := checkMutableAtPathPainless(budget, sourceMap, arrPath); err != nil {
 								return nil, err
 							}
-							changed := mutateSliceRemoveOrRetainAtPath(sourceMap, arrPath, argVal, isRetain)
+							changed, err := mutateSliceRemoveOrRetainAtPathRound59(sourceMap, arrPath, argVal, isRetain, budget)
+							if err != nil {
+								return nil, err
+							}
 							syncSourceAliasToLocalVars(sourceMap, params, relPath)
 							return changed, nil
 						}
@@ -8771,7 +8837,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 							if err := checkMutableAtPathPainless(budget, params, arrPath); err != nil {
 								return nil, err
 							}
-							changed := mutateSliceRemoveOrRetainAtPath(params, arrPath, argVal, isRetain)
+							changed, err := mutateSliceRemoveOrRetainAtPathRound59(params, arrPath, argVal, isRetain, budget)
+							if err != nil {
+								return nil, err
+							}
 							syncLocalVarAlias(sourceMap, params, rootVar)
 							return changed, nil
 						}
@@ -8782,7 +8851,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				}
 				if arr, ok := preRecVal.([]any); ok {
 					tmpMap := map[string]any{"_arr": arr}
-					changed := mutateSliceRemoveOrRetainAtPath(tmpMap, []string{"_arr"}, argVal, isRetain)
+					changed, err := mutateSliceRemoveOrRetainAtPathRound59(tmpMap, []string{"_arr"}, argVal, isRetain, budget)
+					if err != nil {
+						return nil, err
+					}
 					if changed && preWriteBack != nil {
 						if updated, okUp := tmpMap["_arr"].([]any); okUp {
 							preWriteBack(updated)
@@ -8893,7 +8965,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 							if err := checkMutableAtPathPainless(budget, sourceMap, parentPath); err != nil {
 								return nil, err
 							}
-							removed := removeKeyOrIndexAtPath(sourceMap, parentPath, argVal)
+							removed, err := removeKeyOrIndexAtPathRound59(sourceMap, parentPath, argVal, argExpr, params, budget)
+							if err != nil {
+								return nil, err
+							}
 							syncSourceAliasToLocalVars(sourceMap, params, relPath)
 							return removed, nil
 						}
@@ -8914,7 +8989,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 							if err := checkMutableAtPathPainless(budget, params, parentPath); err != nil {
 								return nil, err
 							}
-							removed := removeKeyOrIndexAtPath(params, parentPath, argVal)
+							removed, err := removeKeyOrIndexAtPathRound59(params, parentPath, argVal, argExpr, params, budget)
+							if err != nil {
+								return nil, err
+							}
 							syncLocalVarAlias(sourceMap, params, rootVar)
 							return removed, nil
 						}
@@ -8928,7 +9006,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					return removeKeyOrIndexAtPath(tv, nil, argVal), nil
 				case []any:
 					tmpMap := map[string]any{"_arr": tv}
-					removed := removeKeyOrIndexAtPath(tmpMap, []string{"_arr"}, argVal)
+					removed, err := removeKeyOrIndexAtPathRound59(tmpMap, []string{"_arr"}, argVal, argExpr, params, budget)
+					if err != nil {
+						return nil, err
+					}
 					if preWriteBack != nil {
 						if updated, okUp := tmpMap["_arr"].([]any); okUp {
 							preWriteBack(updated)
@@ -9004,7 +9085,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 								if err := checkMutableAtPathPainless(budget, sourceMap, arrPath); err != nil {
 									return nil, err
 								}
-								prev := setSliceElementAtPath(sourceMap, arrPath, idxVal, newVal)
+								prev, err := setSliceElementAtPathRound59(sourceMap, arrPath, idxVal, newVal, budget)
+								if err != nil {
+									return nil, err
+								}
 								syncSourceAliasToLocalVars(sourceMap, params, relPath)
 								return prev, nil
 							}
@@ -9017,7 +9101,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 								if err := checkMutableAtPathPainless(budget, params, arrPath); err != nil {
 									return nil, err
 								}
-								prev := setSliceElementAtPath(params, arrPath, idxVal, newVal)
+								prev, err := setSliceElementAtPathRound59(params, arrPath, idxVal, newVal, budget)
+								if err != nil {
+									return nil, err
+								}
 								syncLocalVarAlias(sourceMap, params, rootVar)
 								return prev, nil
 							}
@@ -9028,7 +9115,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					}
 					if arr, ok := preRecVal.([]any); ok {
 						tmpMap := map[string]any{"_arr": arr}
-						prev := setSliceElementAtPath(tmpMap, []string{"_arr"}, idxVal, newVal)
+						prev, err := setSliceElementAtPathRound59(tmpMap, []string{"_arr"}, idxVal, newVal, budget)
+						if err != nil {
+							return nil, err
+						}
 						if preWriteBack != nil {
 							if updated, okUp := tmpMap["_arr"].([]any); okUp {
 								preWriteBack(updated)
@@ -9049,7 +9139,6 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					if aErr != nil {
 						return nil, aErr
 					}
-					items, _ := argVal.([]any)
 					if !strings.Contains(recExpr, "(") {
 						for _, pfx := range []string{"ctx?._source?.", "ctx?._source.", "ctx._source?.", "ctx._source."} {
 							if strings.HasPrefix(recExpr, pfx) {
@@ -9058,7 +9147,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 								if err := checkMutableAtPathPainless(budget, sourceMap, arrPath); err != nil {
 									return nil, err
 								}
-								changed, err := insertAllIntoSliceAtPath(sourceMap, arrPath, idxVal, items, budget)
+								changed, err := insertAllIntoSliceAtPathRound59(sourceMap, arrPath, idxVal, argVal, budget)
 								if err != nil {
 									return nil, err
 								}
@@ -9074,7 +9163,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 								if err := checkMutableAtPathPainless(budget, params, arrPath); err != nil {
 									return nil, err
 								}
-								changed, err := insertAllIntoSliceAtPath(params, arrPath, idxVal, items, budget)
+								changed, err := insertAllIntoSliceAtPathRound59(params, arrPath, idxVal, argVal, budget)
 								if err != nil {
 									return nil, err
 								}
@@ -9088,7 +9177,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					}
 					if arr, ok := preRecVal.([]any); ok {
 						tmpMap := map[string]any{"_arr": arr}
-						changed, err := insertAllIntoSliceAtPath(tmpMap, []string{"_arr"}, idxVal, items, budget)
+						changed, err := insertAllIntoSliceAtPathRound59(tmpMap, []string{"_arr"}, idxVal, argVal, budget)
 						if err != nil {
 							return nil, err
 						}
@@ -9105,7 +9194,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				if aErr != nil {
 					return nil, aErr
 				}
-				items, _ := argVal.([]any)
+				items, cErr := requireNonNullCollectionArgRound59(argVal, "addAll")
+				if cErr != nil {
+					return nil, cErr
+				}
 				if !strings.Contains(recExpr, "(") {
 					for _, pfx := range []string{"ctx?._source?.", "ctx?._source.", "ctx._source?.", "ctx._source."} {
 						if strings.HasPrefix(recExpr, pfx) {
@@ -9233,7 +9325,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 								if vErr != nil {
 									return nil, vErr
 								}
-								if err := insertIntoSliceAtPath(sourceMap, arrPath, idxVal, valToAdd); err != nil {
+								if err := insertIntoSliceAtPathRound59(sourceMap, arrPath, idxVal, valToAdd, budget); err != nil {
 									return nil, err
 								}
 								syncSourceAliasToLocalVars(sourceMap, params, relPath)
@@ -9267,7 +9359,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 								if vErr != nil {
 									return nil, vErr
 								}
-								if err := insertIntoSliceAtPath(params, arrPath, idxVal, valToAdd); err != nil {
+								if err := insertIntoSliceAtPathRound59(params, arrPath, idxVal, valToAdd, budget); err != nil {
 									return nil, err
 								}
 								syncLocalVarAlias(sourceMap, params, rootVar)
@@ -9299,7 +9391,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						if vErr != nil {
 							return nil, vErr
 						}
-						if err := insertIntoSliceAtPath(tmpMap, []string{"_arr"}, idxVal, valToAdd); err != nil {
+						if err := insertIntoSliceAtPathRound59(tmpMap, []string{"_arr"}, idxVal, valToAdd, budget); err != nil {
 							return nil, err
 						}
 					} else {
@@ -9326,7 +9418,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				if aErr != nil {
 					return nil, aErr
 				}
-				subMap, isSubMap := argVal.(map[string]any)
+				subMap, mErr := requireNonNullMapArgRound59(argVal, "putAll")
+				if mErr != nil {
+					return nil, mErr
+				}
+				isSubMap := true
 				if !strings.Contains(recExpr, "(") {
 					if (recExpr == "ctx" || recExpr == "ctx?") && params["ctx"] == nil {
 						if isSubMap {
@@ -9638,6 +9734,8 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				return nil, nil
 			}
 			switch mName {
+			case ".sameFile(":
+				return evalURLSameFileRound59(recVal, argExpr, sourceMap, params, depth+1)
 			case ".subList(":
 				args := splitTopLevelCommaPainless(argExpr)
 				if tv, ok := recVal.([]any); ok {
@@ -10807,7 +10905,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				for i := 0; i < len(s); i++ {
 					out[i] = int64(s[i])
 				}
-				return out, nil
+				return markTypedArraySliceRound59(getOrInitEvalBudget(params), out, "byte[]"), nil
 			case ".encodeToString(", ".encode(":
 				if s, ok := recVal.(string); ok && strings.HasPrefix(s, "__base64_encoder:") {
 					rawBytes := toBytesPainless(argVal)
@@ -11052,43 +11150,47 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				return "", nil
 			case ".containsAll(":
 				if tv, ok := recVal.([]any); ok {
-					if needles, ok2 := argVal.([]any); ok2 {
-						for _, needle := range needles {
-							found := false
-							for _, item := range tv {
-								if painlessJavaObjectEquals(item, needle) {
-									found = true
-									break
-								}
-							}
-							if !found {
-								return false, nil
+					needles, err := requireNonNullCollectionArgRound59(argVal, "containsAll")
+					if err != nil {
+						return false, err
+					}
+					for _, needle := range needles {
+						found := false
+						for _, item := range tv {
+							if painlessJavaObjectEquals(item, needle) {
+								found = true
+								break
 							}
 						}
-						return true, nil
+						if !found {
+							return false, nil
+						}
 					}
+					return true, nil
 				}
 				return false, nil
 			case ".removeAll(", ".retainAll(":
 				if tv, ok := recVal.([]any); ok {
-					if needles, ok2 := argVal.([]any); ok2 {
-						isRetain := mName == ".retainAll("
-						changed := false
-						for _, item := range tv {
-							inNeedles := false
-							for _, needle := range needles {
-								if painlessJavaObjectEquals(item, needle) {
-									inNeedles = true
-									break
-								}
-							}
-							if (isRetain && !inNeedles) || (!isRetain && inNeedles) {
-								changed = true
+					needles, err := requireNonNullCollectionArgRound59(argVal, strings.TrimSuffix(strings.TrimPrefix(mName, "."), "("))
+					if err != nil {
+						return false, err
+					}
+					isRetain := mName == ".retainAll("
+					changed := false
+					for _, item := range tv {
+						inNeedles := false
+						for _, needle := range needles {
+							if painlessJavaObjectEquals(item, needle) {
+								inNeedles = true
 								break
 							}
 						}
-						return changed, nil
+						if (isRetain && !inNeedles) || (!isRetain && inNeedles) {
+							changed = true
+							break
+						}
 					}
+					return changed, nil
 				}
 				return false, nil
 			case ".join(":
@@ -11213,13 +11315,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					}
 					return tv[kStr], nil
 				case []any:
-					if argVal != nil {
-						if f, ok := toFloat64(argVal); ok {
-							if idx, okIdx := parseSliceIndex(strconv.Itoa(int(f)), len(tv)); okIdx {
-								return tv[idx], nil
-							}
-						}
+					idx, err := parseStrictListIndexRound59(argVal, len(tv), false)
+					if err != nil {
+						return nil, err
 					}
+					return tv[idx], nil
 				}
 				return nil, nil
 			case ".indexOf(":
@@ -11369,9 +11469,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						}
 					}
 					if pp.raw == "" {
-						return javaSplitEmptyPatternRound57(inStr, limit), nil
+						return markTypedArraySliceRound59(getOrInitEvalBudget(params), javaSplitEmptyPatternRound57(inStr, limit), "String[]"), nil
 					}
-					return javaRegexSplitRound57(pp.re, inStr, limit), nil
+					return markTypedArraySliceRound59(getOrInitEvalBudget(params), javaRegexSplitRound57(pp.re, inStr, limit), "String[]"), nil
 				}
 				if s, ok := recVal.(string); ok {
 					args := splitTopLevelCommaPainless(argExpr)
@@ -11402,13 +11502,13 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						patStr := strings.ReplaceAll(s[1:len(s)-1], `\/`, `/`)
 						inputStr := fmt.Sprintf("%v", sepVal)
 						if patStr == "" {
-							return javaSplitEmptyPatternRound57(inputStr, limit), nil
+							return markTypedArraySliceRound59(getOrInitEvalBudget(params), javaSplitEmptyPatternRound57(inputStr, limit), "String[]"), nil
 						}
 						re, compErr := compileJavaSplitOrReplaceRegexRound57(patStr)
 						if compErr != nil {
 							return nil, compErr
 						}
-						return javaRegexSplitRound57(re, inputStr, limit), nil
+						return markTypedArraySliceRound59(getOrInitEvalBudget(params), javaRegexSplitRound57(re, inputStr, limit), "String[]"), nil
 					}
 					if isEmptyOptionalOrNilPainless(sepVal) {
 						return nil, &painlessExceptionError{exType: "NullPointerException", message: "Cannot invoke String.length() because regex is null"}
@@ -11419,13 +11519,13 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						sepStr = strings.ReplaceAll(sepStr[1:len(sepStr)-1], `\/`, `/`)
 					}
 					if sepStr == "" {
-						return javaSplitEmptyPatternRound57(s, limit), nil
+						return markTypedArraySliceRound59(getOrInitEvalBudget(params), javaSplitEmptyPatternRound57(s, limit), "String[]"), nil
 					}
 					re, compErr := compileJavaSplitOrReplaceRegexRound57(sepStr)
 					if compErr != nil {
 						return nil, compErr
 					}
-					return javaRegexSplitRound57(re, s, limit), nil
+					return markTypedArraySliceRound59(getOrInitEvalBudget(params), javaRegexSplitRound57(re, s, limit), "String[]"), nil
 				}
 				return []any{}, nil
 			case ".equals(":
@@ -11518,7 +11618,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				}
 				if arr, ok := recVal.([]any); ok {
 					tmp := map[string]any{"_arr": arr}
-					return removeKeyOrIndexAtPath(tmp, []string{"_arr"}, argVal), nil
+					return removeKeyOrIndexAtPathRound59(tmp, []string{"_arr"}, argVal, argExpr, params, getOrInitEvalBudget(params))
 				}
 				return nil, nil
 			case ".plusYears(", ".minusYears(", ".plusMonths(", ".minusMonths(", ".plusWeeks(", ".minusWeeks(", ".plusDays(", ".minusDays(",
@@ -12312,8 +12412,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		}
 	}
 	switch constRhs {
-	case "[]", "new ArrayList()", "new LinkedList()", "new ArrayDeque()", "new PriorityQueue()", "new HashSet()", "new LinkedHashSet()", "new TreeSet()":
+	case "[]", "new ArrayList()", "new LinkedList()", "new ArrayDeque()", "new PriorityQueue()":
 		return newEmptyPainlessSlice(), nil
+	case "new HashSet()", "new LinkedHashSet()", "new TreeSet()":
+		return markSetSliceRound59(getOrInitEvalBudget(params), newEmptyPainlessSlice()), nil
 	case "[:]", "{}", "new HashMap()", "new LinkedHashMap()", "new TreeMap()":
 		return map[string]any{}, nil
 	case "new StringBuilder()", "new StringBuffer()":
@@ -12603,6 +12705,14 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		}
 		return parsed, nil
 	}
+	if reIdentOnly.MatchString(rhs) && params != nil && rhs != "params" && rhs != "ctx" && rhs != "doc" && rhs != "_source" {
+		if oos, ok := params["__out_of_scope_vars"].(map[string]bool); ok && oos[rhs] {
+			return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("Variable [%s] is not defined", rhs)}
+		}
+		if params["__in_user_func"] == true {
+			return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("Variable [%s] is not defined", rhs)}
+		}
+	}
 	return rhs, nil
 }
 
@@ -12663,6 +12773,14 @@ func unescapePainlessString(s string) string {
 				sb.WriteByte('"')
 			case '\\':
 				sb.WriteByte('\\')
+			case 'u':
+				if dec, nextIdx, ok := tryDecodeUnicodeEscapeRound59(s, i); ok {
+					sb.WriteString(dec)
+					i = nextIdx
+				} else {
+					sb.WriteByte('\\')
+					sb.WriteByte('u')
+				}
 			default:
 				sb.WriteByte('\\')
 				sb.WriteByte(s[i])
@@ -13043,6 +13161,9 @@ func evalCollectionConstructorPainless(sourceMap map[string]any, rhs string, par
 		}
 		if (clsName == "TreeSet" || clsName == "PriorityQueue") && len(outSlice) > 1 {
 			_ = sortPainlessSliceInPlace(outSlice, "", sourceMap, params, depth+1)
+		}
+		if isSet {
+			outSlice = markSetSliceRound59(getOrInitEvalBudget(params), outSlice)
 		}
 		ctorVal = outSlice
 	} else if isUUID {
@@ -13430,7 +13551,7 @@ func evalNewArrayConstructorPainless(sourceMap map[string]any, clsName string, r
 		if err != nil {
 			return nil, true, err
 		}
-		arrVal = initList
+		arrVal = tagMultiDimArraySliceRound59(getOrInitEvalBudget(params), initList, clsName, totalDims)
 		tail = strings.TrimSpace(afterDims[closeBrace+1:])
 	} else {
 		if len(dimExprs) == 0 {
@@ -13453,7 +13574,7 @@ func evalNewArrayConstructorPainless(sourceMap map[string]any, clsName string, r
 		if err != nil {
 			return nil, true, err
 		}
-		arrVal = allocSlice
+		arrVal = tagMultiDimArraySliceRound59(budget, allocSlice, clsName, totalDims)
 		tail = afterDims
 	}
 	if tail != "" {
@@ -13492,10 +13613,14 @@ func hasTopLevelBooleanOrRegexOp(s string) bool {
 }
 
 func isPrimitiveTypeCastKeyword(s string) bool {
+	s = strings.TrimSpace(s)
+	for strings.HasSuffix(s, "[]") {
+		s = strings.TrimSpace(strings.TrimSuffix(s, "[]"))
+	}
 	switch s {
 	case "int", "long", "double", "float", "short", "byte", "char", "String", "boolean",
 		"Integer", "Long", "Double", "Float", "Short", "Byte", "Character", "Boolean",
-		"def", "Object", "List", "Map":
+		"def", "Object", "List", "Map", "Set", "Collection", "Number":
 		return true
 	}
 	return false
@@ -14552,44 +14677,6 @@ func removeKeyValueAtPath(root map[string]any, parentPath []string, keyVal, expe
 	return true
 }
 
-func insertAllIntoSliceAtPath(root map[string]any, path []string, idxVal any, items []any, budget *evalBudget) (bool, error) {
-	if len(items) == 0 {
-		return false, nil
-	}
-	existing, ok := resolveParamPath(root, path).([]any)
-	if !ok {
-		existing = []any{}
-	}
-	if len(existing)+len(items) > MaxPainlessSliceItems {
-		return false, fmt.Errorf("painless array at %q exceeded maximum size (%d)", strings.Join(path, "."), MaxPainlessSliceItems)
-	}
-	if budget != nil {
-		for range items {
-			if err := budget.step(); err != nil {
-				return false, err
-			}
-		}
-	}
-	f, fOk := toFloat64(idxVal)
-	idx := len(existing)
-	if fOk {
-		idx = int(f)
-		if idx < 0 {
-			idx = 0
-		} else if idx > len(existing) {
-			idx = len(existing)
-		}
-	}
-	itemsCopy := make([]any, len(items))
-	copy(itemsCopy, items)
-	next := make([]any, 0, len(existing)+len(itemsCopy))
-	next = append(next, existing[:idx]...)
-	next = append(next, itemsCopy...)
-	next = append(next, existing[idx:]...)
-	setValueAtPath(root, path, next)
-	return true, nil
-}
-
 func removeKeyOrIndexAtPath(root map[string]any, parentPath []string, keyOrIdx any) any {
 	if len(parentPath) == 0 {
 		if root == nil || keyOrIdx == nil {
@@ -14639,56 +14726,6 @@ func removeKeyOrIndexAtPath(root map[string]any, parentPath []string, keyOrIdx a
 	return nil
 }
 
-func setSliceElementAtPath(root map[string]any, arrPath []string, idxVal any, newVal any) any {
-	if idxVal == nil {
-		return nil
-	}
-	existing, ok := resolveParamPath(root, arrPath).([]any)
-	if !ok {
-		return nil
-	}
-	f, fOk := toFloat64(idxVal)
-	if !fOk {
-		return nil
-	}
-	idx, okIdx := parseSliceIndex(strconv.Itoa(int(f)), len(existing))
-	if !okIdx {
-		return nil
-	}
-	prev := existing[idx]
-	next := make([]any, len(existing))
-	copy(next, existing)
-	next[idx] = newVal
-	setValueAtPath(root, arrPath, next)
-	return prev
-}
-
-func insertIntoSliceAtPath(root map[string]any, path []string, idxVal any, val any) error {
-	existing, ok := resolveParamPath(root, path).([]any)
-	if !ok {
-		existing = []any{}
-	}
-	if len(existing) >= MaxPainlessSliceItems {
-		return fmt.Errorf("painless array at %q exceeded maximum size (%d)", strings.Join(path, "."), MaxPainlessSliceItems)
-	}
-	f, fOk := toFloat64(idxVal)
-	idx := len(existing)
-	if fOk {
-		idx = int(f)
-		if idx < 0 {
-			idx = 0
-		} else if idx > len(existing) {
-			idx = len(existing)
-		}
-	}
-	next := make([]any, 0, len(existing)+1)
-	next = append(next, existing[:idx]...)
-	next = append(next, val)
-	next = append(next, existing[idx:]...)
-	setValueAtPath(root, path, next)
-	return nil
-}
-
 func appendToSlice(root map[string]any, path []string, val any) error {
 	existing, ok := resolveParamPath(root, path).([]any)
 	if !ok {
@@ -14712,6 +14749,7 @@ func appendToSlice(root map[string]any, path []string, val any) error {
 	if (colKind == "TreeSet" || colKind == "PriorityQueue") && len(next) > 1 {
 		_ = sortPainlessSliceInPlace(next, "", nil, root, 1)
 	}
+	next = propagateSliceTagsRound59(getOrInitEvalBudget(root), existing, next)
 	setValueAtPath(root, path, next)
 	return nil
 }
@@ -14914,33 +14952,6 @@ func isLocalTimeOnlyStringPainless(v any) bool {
 	return false
 }
 
-func mutateSliceRemoveOrRetainAtPath(root map[string]any, arrPath []string, argVal any, isRetain bool) bool {
-	existing, ok := resolveParamPath(root, arrPath).([]any)
-	if !ok {
-		return false
-	}
-	needles, ok2 := argVal.([]any)
-	if !ok2 {
-		return false
-	}
-	filtered := make([]any, 0, len(existing))
-	for _, elem := range existing {
-		inNeedles := false
-		for _, needle := range needles {
-			if painlessJavaObjectEquals(elem, needle) {
-				inNeedles = true
-				break
-			}
-		}
-		if (isRetain && inNeedles) || (!isRetain && !inNeedles) {
-			filtered = append(filtered, elem)
-		}
-	}
-	changed := len(filtered) != len(existing)
-	setValueAtPath(root, arrPath, filtered)
-	return changed
-}
-
 func evalBitwiseOrShiftPainless(sourceMap map[string]any, rhs string, params map[string]any, depth int) (any, bool, error) {
 	tiers := [][]string{
 		{"|"},
@@ -15041,7 +15052,7 @@ func clearAtPath(root map[string]any, path []string) {
 			}
 		}
 	case []any:
-		setValueAtPath(root, path, []any{})
+		setValueAtPath(root, path, propagateSliceTagsRound59(getOrInitEvalBudget(root), target, []any{}))
 	case *painlessBitSet:
 		if target != nil {
 			target.words = nil
@@ -15070,6 +15081,11 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 		return res, true, err
 	}
 	if res, handled, err := evalRound54StaticCallPainless(fnName, args, argStr, sourceMap, params, depth+1); handled {
+		if err == nil && strings.HasSuffix(fnName, "Set") {
+			if s, ok := res.([]any); ok {
+				res = markSetSliceRound59(getOrInitEvalBudget(params), s)
+			}
+		}
 		return res, true, err
 	}
 	if res, handled, err := evalMathStaticCallRound58(fnName, args, sourceMap, params, depth+1); handled {
@@ -15095,6 +15111,23 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			return 0, false
 		}
 		return toInt64Painless(v)
+	}
+	evalRequiredInt64Arg := func(idx int) (int64, error) {
+		if idx >= len(args) {
+			return 0, &painlessExceptionError{exType: "IllegalArgumentException", message: "missing integer argument"}
+		}
+		v, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[idx]), params, depth+1)
+		if err != nil {
+			return 0, err
+		}
+		if v == nil || v == painlessEmptyOptional {
+			return 0, &painlessExceptionError{exType: "NullPointerException", message: "Cannot unbox null integer argument"}
+		}
+		iv, ok := toInt64Painless(v)
+		if !ok {
+			return 0, &painlessExceptionError{exType: "ClassCastException", message: fmt.Sprintf("Cannot cast %T to integer", v)}
+		}
+		return iv, nil
 	}
 	formatMathResult := func(res float64) any {
 		if math.IsNaN(res) || math.IsInf(res, 0) {
@@ -16163,12 +16196,37 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 		if argStr == "" {
 			return newEmptyPainlessSlice(), true, nil
 		}
+		budget := getOrInitEvalBudget(params)
 		out := make([]any, 0, len(args))
-		for _, a := range args {
-			av, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(a), params, depth+1)
+		for i, a := range args {
+			rawArg := strings.TrimSpace(a)
+			av, err := evalRHSExprDepth(sourceMap, rawArg, params, depth+1)
 			if err != nil {
 				return nil, true, err
 			}
+			if fnName == "Arrays.asList" && len(args) == 1 {
+				if av == nil || av == painlessEmptyOptional {
+					castType, _, hasCast := splitLeadingTypeCastRound59(rawArg, params)
+					if !hasCast || strings.HasSuffix(castType, "[]") {
+						return nil, true, &painlessExceptionError{
+							exType:  "NullPointerException",
+							message: "Arrays.asList: array is null",
+						}
+					}
+					return []any{nil}, true, nil
+				}
+				if arrSlice, isArrSlice := av.([]any); isArrSlice {
+					if arrType, isTypedArr := getTypedArraySliceRound59(budget, arrSlice); isTypedArr {
+						baseT, dims := splitArrayBaseAndDimsRound59(arrType)
+						if dims > 1 || (dims == 1 && !isJavaPrimitiveCastTypeRound59(baseT)) {
+							cp := make([]any, len(arrSlice))
+							copy(cp, arrSlice)
+							return cp, true, nil
+						}
+					}
+				}
+			}
+			_ = i
 			out = append(out, av)
 		}
 		return out, true, nil
@@ -16177,6 +16235,9 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 		if argStr == "" {
 			out := allocUnmodSlicePainless(0)
 			markUnmodSlicePainless(budget, out)
+			if fnName == "Set.of" {
+				out = markSetSliceRound59(budget, out)
+			}
 			return out, true, nil
 		}
 		out := allocUnmodSlicePainless(len(args))
@@ -16204,6 +16265,9 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			out = append(out, av)
 		}
 		markUnmodSlicePainless(budget, out)
+		if fnName == "Set.of" {
+			out = markSetSliceRound59(budget, out)
+		}
 		return out, true, nil
 	case "List.copyOf", "Set.copyOf":
 		if len(args) == 0 {
@@ -16244,6 +16308,9 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			out = append(out, item)
 		}
 		markUnmodSlicePainless(budget, out)
+		if fnName == "Set.copyOf" {
+			out = markSetSliceRound59(budget, out)
+		}
 		return out, true, nil
 	case "Map.copyOf":
 		if len(args) == 0 {
@@ -16281,43 +16348,42 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			if err != nil {
 				return nil, true, err
 			}
-			if arr, ok := listVal.([]any); ok {
-				if err := checkMutableContainerPainless(getOrInitEvalBudget(params), arr); err != nil {
-					return nil, true, err
-				}
-				fromIdx, toIdx := 0, len(arr)
-				cmpExpr := ""
-				if len(args) == 2 {
-					cmpExpr = strings.TrimSpace(args[1])
-				} else if len(args) >= 3 {
-					if ff, okF := evalNumArg(1); okF {
-						fromIdx = int(ff)
-					}
-					if tf, okT := evalNumArg(2); okT {
-						toIdx = int(tf)
-					}
-					if len(args) >= 4 {
-						cmpExpr = strings.TrimSpace(args[3])
-					}
-				}
-				if fromIdx < 0 {
-					fromIdx = 0
-				}
-				if fromIdx > len(arr) {
-					fromIdx = len(arr)
-				}
-				if toIdx < fromIdx {
-					toIdx = fromIdx
-				}
-				if toIdx > len(arr) {
-					toIdx = len(arr)
-				}
-				if err := sortPainlessSliceInPlace(arr[fromIdx:toIdx], cmpExpr, sourceMap, params, depth+1); err != nil {
-					return nil, true, err
-				}
-				syncMutatedListExprPainless(args[0], arr, sourceMap, params)
-				return arr, true, nil
+			arr, err := requireNonNullArrayArgRound59(listVal, "sort")
+			if err != nil {
+				return nil, true, err
 			}
+			if err := checkMutableContainerPainless(getOrInitEvalBudget(params), arr); err != nil {
+				return nil, true, err
+			}
+			fromIdx, toIdx := 0, len(arr)
+			cmpExpr := ""
+			if len(args) == 2 {
+				cmpExpr = strings.TrimSpace(args[1])
+			} else if len(args) >= 3 {
+				fi, fErr := evalRequiredInt64Arg(1)
+				if fErr != nil {
+					return nil, true, fErr
+				}
+				ti, tErr := evalRequiredInt64Arg(2)
+				if tErr != nil {
+					return nil, true, tErr
+				}
+				fromIdx, toIdx = int(fi), int(ti)
+				if err := checkArraysRangeBoundsRound59(len(arr), fromIdx, toIdx); err != nil {
+					return nil, true, err
+				}
+				if len(args) >= 4 {
+					cmpExpr = strings.TrimSpace(args[3])
+				}
+			}
+			if cmpExpr == "null" {
+				cmpExpr = ""
+			}
+			if err := sortPainlessSliceInPlace(arr[fromIdx:toIdx], cmpExpr, sourceMap, params, depth+1); err != nil {
+				return nil, true, err
+			}
+			syncMutatedListExprPainless(args[0], arr, sourceMap, params)
+			return arr, true, nil
 		}
 		return nil, true, nil
 	case "Arrays.binarySearch":
@@ -16326,33 +16392,37 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			if err != nil {
 				return int64(-1), true, err
 			}
-			arr, ok := listVal.([]any)
-			if !ok {
-				return int64(-1), true, nil
+			arr, err := requireNonNullArrayArgRound59(listVal, "binarySearch")
+			if err != nil {
+				return int64(-1), true, err
 			}
-			low, high := 0, len(arr)-1
+			fromIdx, toIdx := 0, len(arr)
 			keyIdx := 1
 			cmpExpr := ""
 			if len(args) == 3 {
 				cmpExpr = strings.TrimSpace(args[2])
 			} else if len(args) >= 4 {
-				if ff, okF := evalNumArg(1); okF {
-					low = int(ff)
+				fi, fErr := evalRequiredInt64Arg(1)
+				if fErr != nil {
+					return int64(-1), true, fErr
 				}
-				if tf, okT := evalNumArg(2); okT {
-					high = int(tf) - 1
+				ti, tErr := evalRequiredInt64Arg(2)
+				if tErr != nil {
+					return int64(-1), true, tErr
+				}
+				fromIdx, toIdx = int(fi), int(ti)
+				if err := checkArraysRangeBoundsRound59(len(arr), fromIdx, toIdx); err != nil {
+					return int64(-1), true, err
 				}
 				keyIdx = 3
 				if len(args) >= 5 {
 					cmpExpr = strings.TrimSpace(args[4])
 				}
 			}
-			if low < 0 {
-				low = 0
+			if cmpExpr == "null" {
+				cmpExpr = ""
 			}
-			if high >= len(arr) {
-				high = len(arr) - 1
-			}
+			low, high := fromIdx, toIdx-1
 			keyVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[keyIdx]), params, depth+1)
 			if err != nil {
 				return int64(-1), true, err
@@ -16386,43 +16456,39 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			if err != nil {
 				return nil, true, err
 			}
-			if arr, ok := listVal.([]any); ok {
-				if err := checkMutableContainerPainless(getOrInitEvalBudget(params), arr); err != nil {
-					return nil, true, err
-				}
-				fromIdx, toIdx := 0, len(arr)
-				valIdx := 1
-				if len(args) >= 4 {
-					if ff, okF := evalNumArg(1); okF {
-						fromIdx = int(ff)
-					}
-					if tf, okT := evalNumArg(2); okT {
-						toIdx = int(tf)
-					}
-					valIdx = 3
-				}
-				if fromIdx < 0 {
-					fromIdx = 0
-				}
-				if fromIdx > len(arr) {
-					fromIdx = len(arr)
-				}
-				if toIdx < fromIdx {
-					toIdx = fromIdx
-				}
-				if toIdx > len(arr) {
-					toIdx = len(arr)
-				}
-				fillVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[valIdx]), params, depth+1)
-				if err != nil {
-					return nil, true, err
-				}
-				for i := fromIdx; i < toIdx; i++ {
-					arr[i] = fillVal
-				}
-				syncMutatedListExprPainless(args[0], arr, sourceMap, params)
-				return arr, true, nil
+			arr, err := requireNonNullArrayArgRound59(listVal, "fill")
+			if err != nil {
+				return nil, true, err
 			}
+			if err := checkMutableContainerPainless(getOrInitEvalBudget(params), arr); err != nil {
+				return nil, true, err
+			}
+			fromIdx, toIdx := 0, len(arr)
+			valIdx := 1
+			if len(args) >= 4 {
+				fi, fErr := evalRequiredInt64Arg(1)
+				if fErr != nil {
+					return nil, true, fErr
+				}
+				ti, tErr := evalRequiredInt64Arg(2)
+				if tErr != nil {
+					return nil, true, tErr
+				}
+				fromIdx, toIdx = int(fi), int(ti)
+				if err := checkArraysRangeBoundsRound59(len(arr), fromIdx, toIdx); err != nil {
+					return nil, true, err
+				}
+				valIdx = 3
+			}
+			fillVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[valIdx]), params, depth+1)
+			if err != nil {
+				return nil, true, err
+			}
+			for i := fromIdx; i < toIdx; i++ {
+				arr[i] = fillVal
+			}
+			syncMutatedListExprPainless(args[0], arr, sourceMap, params)
+			return arr, true, nil
 		}
 		return nil, true, nil
 	case "Arrays.copyOf":
@@ -16431,19 +16497,12 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			if err != nil {
 				return nil, true, err
 			}
-			nf, okN := evalNumArg(1)
-			if arr, ok := listVal.([]any); ok && okN {
-				newLen := int(nf)
-				if newLen < 0 {
-					newLen = 0
-				}
-				if newLen > MaxPainlessSliceItems {
-					newLen = MaxPainlessSliceItems
-				}
-				out := make([]any, newLen)
-				copy(out, arr)
-				return out, true, nil
+			ni, nErr := evalRequiredInt64Arg(1)
+			if nErr != nil {
+				return nil, true, nErr
 			}
+			out, cErr := evalArraysCopyOfRound59(listVal, int(ni), getOrInitEvalBudget(params))
+			return out, true, cErr
 		}
 		return []any{}, true, nil
 	case "Arrays.copyOfRange":
@@ -16452,29 +16511,16 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			if err != nil {
 				return nil, true, err
 			}
-			ff, okF := evalNumArg(1)
-			tf, okT := evalNumArg(2)
-			if arr, ok := listVal.([]any); ok && okF && okT {
-				fromIdx, toIdx := int(ff), int(tf)
-				if fromIdx < 0 {
-					fromIdx = 0
-				}
-				if fromIdx > len(arr) {
-					fromIdx = len(arr)
-				}
-				if toIdx < fromIdx {
-					toIdx = fromIdx
-				}
-				newLen := toIdx - fromIdx
-				if newLen > MaxPainlessSliceItems {
-					newLen = MaxPainlessSliceItems
-				}
-				out := make([]any, newLen)
-				if fromIdx < len(arr) {
-					copy(out, arr[fromIdx:])
-				}
-				return out, true, nil
+			fi, fErr := evalRequiredInt64Arg(1)
+			if fErr != nil {
+				return nil, true, fErr
 			}
+			ti, tErr := evalRequiredInt64Arg(2)
+			if tErr != nil {
+				return nil, true, tErr
+			}
+			out, cErr := evalArraysCopyOfRangeRound59(listVal, int(fi), int(ti), getOrInitEvalBudget(params))
+			return out, true, cErr
 		}
 		return []any{}, true, nil
 	case "Arrays.equals", "Arrays.deepEquals":
@@ -16521,46 +16567,60 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			return formatValueForStringPainless(v), true, nil
 		}
 		return "null", true, nil
+	case "Arrays.hashCode", "Arrays.deepHashCode":
+		if len(args) >= 1 {
+			v, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+			if err != nil {
+				return int64(0), true, err
+			}
+			return evalArraysHashCodeRound59(v, fnName == "Arrays.deepHashCode", sourceMap, params, depth+1), true, nil
+		}
+		return int64(0), true, nil
 	case "Arrays.setAll", "Arrays.parallelSetAll":
 		if len(args) >= 2 {
 			arrVal, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
 			if err != nil {
 				return nil, true, err
 			}
-			if arr, ok := arrVal.([]any); ok {
-				if err := checkMutableContainerPainless(getOrInitEvalBudget(params), arr); err != nil {
-					return nil, true, err
-				}
-				genExpr := normalizeMethodReferenceToLambdaPainless(strings.TrimSpace(args[1]), 1)
-				if arrowIdx := findNextUnquotedSubstr(genExpr, "->", 0); arrowIdx > 0 {
-					pNames := parsePainlessLambdaHeader(genExpr[:arrowIdx])
-					if len(pNames) > 0 {
-						pName := pNames[0]
-						body := strings.TrimSpace(genExpr[arrowIdx+2:])
-						prev, hadPrev := params[pName]
-						for i := range arr {
-							params[pName] = int64(i)
-							val, lErr := evalPainlessLambdaBody(body, sourceMap, params, depth+1)
-							if lErr != nil {
-								if hadPrev {
-									params[pName] = prev
-								} else {
-									delete(params, pName)
-								}
-								return nil, true, lErr
-							}
-							arr[i] = val
-						}
-						if hadPrev {
-							params[pName] = prev
-						} else {
-							delete(params, pName)
-						}
-						syncMutatedListExprPainless(args[0], arr, sourceMap, params)
-					}
-				}
-				return arr, true, nil
+			arr, err := requireNonNullArrayArgRound59(arrVal, strings.TrimPrefix(fnName, "Arrays."))
+			if err != nil {
+				return nil, true, err
 			}
+			if err := checkMutableContainerPainless(getOrInitEvalBudget(params), arr); err != nil {
+				return nil, true, err
+			}
+			genExpr := normalizeMethodReferenceToLambdaPainless(strings.TrimSpace(args[1]), 1)
+			if genExpr == "null" {
+				return nil, true, &painlessExceptionError{exType: "NullPointerException", message: "generator is null"}
+			}
+			if arrowIdx := findNextUnquotedSubstr(genExpr, "->", 0); arrowIdx > 0 {
+				pNames := parsePainlessLambdaHeader(genExpr[:arrowIdx])
+				if len(pNames) > 0 {
+					pName := pNames[0]
+					body := strings.TrimSpace(genExpr[arrowIdx+2:])
+					prev, hadPrev := params[pName]
+					for i := range arr {
+						params[pName] = int64(i)
+						val, lErr := evalPainlessLambdaBody(body, sourceMap, params, depth+1)
+						if lErr != nil {
+							if hadPrev {
+								params[pName] = prev
+							} else {
+								delete(params, pName)
+							}
+							return nil, true, lErr
+						}
+						arr[i] = val
+					}
+					if hadPrev {
+						params[pName] = prev
+					} else {
+						delete(params, pName)
+					}
+					syncMutatedListExprPainless(args[0], arr, sourceMap, params)
+				}
+			}
+			return arr, true, nil
 		}
 		return nil, true, nil
 	case "Arrays.parallelPrefix":
@@ -16569,69 +16629,74 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			if err != nil {
 				return nil, true, err
 			}
-			if arr, ok := arrVal.([]any); ok {
-				if err := checkMutableContainerPainless(getOrInitEvalBudget(params), arr); err != nil {
+			arr, err := requireNonNullArrayArgRound59(arrVal, "parallelPrefix")
+			if err != nil {
+				return nil, true, err
+			}
+			if err := checkMutableContainerPainless(getOrInitEvalBudget(params), arr); err != nil {
+				return nil, true, err
+			}
+			fromIdx, toIdx := 0, len(arr)
+			opArgIdx := 1
+			if len(args) >= 4 {
+				fi, fErr := evalRequiredInt64Arg(1)
+				if fErr != nil {
+					return nil, true, fErr
+				}
+				ti, tErr := evalRequiredInt64Arg(2)
+				if tErr != nil {
+					return nil, true, tErr
+				}
+				fromIdx, toIdx = int(fi), int(ti)
+				if err := checkArraysRangeBoundsRound59(len(arr), fromIdx, toIdx); err != nil {
 					return nil, true, err
 				}
-				fromIdx, toIdx := 0, len(arr)
-				opArgIdx := 1
-				if len(args) >= 4 {
-					if ff, okF := evalNumArg(1); okF {
-						fromIdx = int(ff)
-					}
-					if tf, okT := evalNumArg(2); okT {
-						toIdx = int(tf)
-					}
-					opArgIdx = 3
-				}
-				if fromIdx < 0 || toIdx > len(arr) || fromIdx > toIdx {
-					return nil, true, &painlessExceptionError{
-						exType:  "ArrayIndexOutOfBoundsException",
-						message: fmt.Sprintf("Range [%d, %d) out of bounds for length %d", fromIdx, toIdx, len(arr)),
-					}
-				}
-				opExpr := normalizeMethodReferenceToLambdaPainless(strings.TrimSpace(args[opArgIdx]), 2)
-				if arrowIdx := findNextUnquotedSubstr(opExpr, "->", 0); arrowIdx > 0 {
-					pNames := parsePainlessLambdaHeader(opExpr[:arrowIdx])
-					if len(pNames) >= 2 {
-						pA, pB := pNames[0], pNames[1]
-						body := strings.TrimSpace(opExpr[arrowIdx+2:])
-						prevA, hadA := params[pA]
-						prevB, hadB := params[pB]
-						for i := fromIdx + 1; i < toIdx; i++ {
-							params[pA] = arr[i-1]
-							params[pB] = arr[i]
-							val, lErr := evalPainlessLambdaBody(body, sourceMap, params, depth+1)
-							if lErr != nil {
-								if hadA {
-									params[pA] = prevA
-								} else {
-									delete(params, pA)
-								}
-								if hadB {
-									params[pB] = prevB
-								} else {
-									delete(params, pB)
-								}
-								return nil, true, lErr
-							}
-							arr[i] = val
-						}
-						if hadA {
-							params[pA] = prevA
-						} else {
-							delete(params, pA)
-						}
-						if hadB {
-							params[pB] = prevB
-						} else {
-							delete(params, pB)
-						}
-						syncMutatedListExprPainless(args[0], arr, sourceMap, params)
-					}
-				}
-				return arr, true, nil
+				opArgIdx = 3
 			}
+			opExpr := normalizeMethodReferenceToLambdaPainless(strings.TrimSpace(args[opArgIdx]), 2)
+			if opExpr == "null" {
+				return nil, true, &painlessExceptionError{exType: "NullPointerException", message: "op is null"}
+			}
+			if arrowIdx := findNextUnquotedSubstr(opExpr, "->", 0); arrowIdx > 0 {
+				pNames := parsePainlessLambdaHeader(opExpr[:arrowIdx])
+				if len(pNames) >= 2 {
+					pA, pB := pNames[0], pNames[1]
+					body := strings.TrimSpace(opExpr[arrowIdx+2:])
+					prevA, hadA := params[pA]
+					prevB, hadB := params[pB]
+					for i := fromIdx + 1; i < toIdx; i++ {
+						params[pA] = arr[i-1]
+						params[pB] = arr[i]
+						val, lErr := evalPainlessLambdaBody(body, sourceMap, params, depth+1)
+						if lErr != nil {
+							if hadA {
+								params[pA] = prevA
+							} else {
+								delete(params, pA)
+							}
+							if hadB {
+								params[pB] = prevB
+							} else {
+								delete(params, pB)
+							}
+							return nil, true, lErr
+						}
+						arr[i] = val
+					}
+					if hadA {
+						params[pA] = prevA
+					} else {
+						delete(params, pA)
+					}
+					if hadB {
+						params[pB] = prevB
+					} else {
+						delete(params, pB)
+					}
+					syncMutatedListExprPainless(args[0], arr, sourceMap, params)
+				}
+			}
+			return arr, true, nil
 		}
 		return nil, true, nil
 	case "Arrays.compare":
@@ -16646,55 +16711,41 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			if err != nil {
 				return nil, true, err
 			}
-			if arr, ok := v.([]any); ok {
-				fromIdx, toIdx := 0, len(arr)
-				if len(args) >= 3 {
-					if ff, okF := evalNumArg(1); okF {
-						fromIdx = int(ff)
-					}
-					if tf, okT := evalNumArg(2); okT {
-						toIdx = int(tf)
-					}
-				}
-				if fromIdx < 0 {
-					fromIdx = 0
-				}
-				if fromIdx > len(arr) {
-					fromIdx = len(arr)
-				}
-				if toIdx < fromIdx {
-					toIdx = fromIdx
-				}
-				if toIdx > len(arr) {
-					toIdx = len(arr)
-				}
-				out := make([]any, toIdx-fromIdx)
-				copy(out, arr[fromIdx:toIdx])
-				return out, true, nil
+			arr, err := requireNonNullArrayArgRound59(v, "stream")
+			if err != nil {
+				return nil, true, err
 			}
+			fromIdx, toIdx := 0, len(arr)
+			if len(args) >= 3 {
+				fi, fErr := evalRequiredInt64Arg(1)
+				if fErr != nil {
+					return nil, true, fErr
+				}
+				ti, tErr := evalRequiredInt64Arg(2)
+				if tErr != nil {
+					return nil, true, tErr
+				}
+				fromIdx, toIdx = int(fi), int(ti)
+				if err := checkArraysRangeBoundsRound59(len(arr), fromIdx, toIdx); err != nil {
+					return nil, true, err
+				}
+			}
+			out := make([]any, toIdx-fromIdx)
+			copy(out, arr[fromIdx:toIdx])
+			return out, true, nil
 		}
 		return []any{}, true, nil
 	case "IntStream.range", "IntStream.rangeClosed", "LongStream.range", "LongStream.rangeClosed":
 		if len(args) >= 2 {
-			start, ok1 := evalInt64Arg(0)
-			end, ok2 := evalInt64Arg(1)
-			if ok1 && ok2 {
-				if strings.HasSuffix(fnName, "Closed") {
-					end++
-				}
-				if end <= start {
-					return []any{}, true, nil
-				}
-				count := end - start
-				if count > int64(MaxPainlessSliceItems) {
-					count = int64(MaxPainlessSliceItems)
-				}
-				out := make([]any, int(count))
-				for i := int64(0); i < count; i++ {
-					out[i] = start + i
-				}
-				return out, true, nil
+			start, err1 := evalRequiredInt64Arg(0)
+			if err1 != nil {
+				return nil, true, err1
 			}
+			end, err2 := evalRequiredInt64Arg(1)
+			if err2 != nil {
+				return nil, true, err2
+			}
+			return newPainlessRangeStreamRound59(fnName, start, end), true, nil
 		}
 		return []any{}, true, nil
 	case "IntStream.of", "LongStream.of":
@@ -16763,26 +16814,17 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			if err2 != nil {
 				return nil, true, err2
 			}
-			a1, _ := v1.([]any)
-			a2, _ := v2.([]any)
-			total := len(a1) + len(a2)
-			if total > MaxPainlessSliceItems {
-				total = MaxPainlessSliceItems
-			}
-			out := make([]any, 0, total)
-			for _, it := range a1 {
-				if len(out) >= MaxPainlessSliceItems {
-					break
+			if v1 == nil || v1 == painlessEmptyOptional || v2 == nil || v2 == painlessEmptyOptional {
+				return nil, true, &painlessExceptionError{
+					exType:  "NullPointerException",
+					message: fnName + ": stream is null",
 				}
-				out = append(out, it)
 			}
-			for _, it := range a2 {
-				if len(out) >= MaxPainlessSliceItems {
-					break
-				}
-				out = append(out, it)
-			}
-			return out, true, nil
+			return &painlessConcatStream{
+				kind:  strings.Split(fnName, ".")[0],
+				left:  v1,
+				right: v2,
+			}, true, nil
 		}
 		return []any{}, true, nil
 	case "Map.of":
@@ -16968,8 +17010,12 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 	case "Charset.defaultCharset":
 		return "UTF-8", true, nil
 	case "Collections.emptyList", "Collections.emptySet":
+		budget := getOrInitEvalBudget(params)
 		out := allocUnmodSlicePainless(0)
-		markUnmodSlicePainless(getOrInitEvalBudget(params), out)
+		markUnmodSlicePainless(budget, out)
+		if fnName == "Collections.emptySet" {
+			out = markSetSliceRound59(budget, out)
+		}
 		return out, true, nil
 	case "Collections.emptyMap":
 		out := make(map[string]any)
@@ -16985,10 +17031,16 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			out := allocUnmodSlicePainless(1)
 			out = append(out, v)
 			markUnmodSlicePainless(budget, out)
+			if fnName == "Collections.singleton" {
+				out = markSetSliceRound59(budget, out)
+			}
 			return out, true, nil
 		}
 		out := allocUnmodSlicePainless(0)
 		markUnmodSlicePainless(budget, out)
+		if fnName == "Collections.singleton" {
+			out = markSetSliceRound59(budget, out)
+		}
 		return out, true, nil
 	case "Collections.singletonMap":
 		budget := getOrInitEvalBudget(params)
@@ -17756,7 +17808,8 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 		"Character.isWhitespace", "Character.isSpaceChar", "Character.isUpperCase", "Character.isLowerCase",
 		"Character.isTitleCase", "Character.toUpperCase", "Character.toLowerCase", "Character.toTitleCase",
 		"Character.isIdeographic", "Character.isJavaIdentifierStart", "Character.isJavaIdentifierPart",
-		"Character.isISOControl", "Character.isDefined", "Character.digit", "Character.forDigit", "Character.reverseBytes":
+		"Character.isISOControl", "Character.isDefined", "Character.digit", "Character.forDigit", "Character.reverseBytes",
+		"Character.highSurrogate", "Character.lowSurrogate", "Character.isMirrored", "Character.hashCode", "Character.getName":
 		res, err := evalCharacterStaticPainless(fnName, args, sourceMap, params, depth+1)
 		return res, true, err
 	case "UUID.randomUUID":
@@ -17861,153 +17914,8 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			return res, true, err
 		}
 	}
-	if budget != nil && budget.userFuncs != nil {
-		if fn, ok := budget.userFuncs[fnName]; ok && fn != nil {
-			if err := budget.step(); err != nil {
-				return nil, true, err
-			}
-			var argVals []any
-			if argStr != "" {
-				argVals = make([]any, len(args))
-				for i, a := range args {
-					av, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(a), params, depth+1)
-					if err != nil {
-						return nil, true, err
-					}
-					argVals[i] = av
-				}
-			}
-			fnParams := make(map[string]any, len(params)+len(fn.paramNames)+4)
-			for k, v := range params {
-				if k == "_return_val" || k == "_last_expr_val" || k == "__loop_declared" || k == "__reassigned_vars" {
-					continue
-				}
-				fnParams[k] = v
-			}
-			fnLocals := make(map[string]bool)
-			if sl, ok := params["__script_locals"].(map[string]bool); ok {
-				for k, v := range sl {
-					fnLocals[k] = v
-				}
-			}
-			fnParams["__script_locals"] = fnLocals
-			reassignedVars := make(map[string]bool)
-			fnParams["__reassigned_vars"] = reassignedVars
-			fnParams["__eval_budget"] = budget
-			preCallEp := make(map[string]bool)
-			if ep, ok := params["__explicit_params_keys"].(map[string]bool); ok {
-				for k, v := range ep {
-					if v {
-						preCallEp[k] = true
-					}
-				}
-			}
-			paramNamesSet := make(map[string]bool, len(fn.paramNames))
-			callerVarBindings := make(map[string]string, len(fn.paramNames))
-			for i, pName := range fn.paramNames {
-				paramNamesSet[pName] = true
-				if i < len(argVals) {
-					fnParams[pName] = argVals[i]
-				} else {
-					fnParams[pName] = nil
-				}
-				fnLocals[pName] = true
-				delete(fnParams, "__alias_"+pName)
-				delete(fnParams, "__var_type_"+pName)
-				delete(fnParams, "__user_var_class_"+pName)
-				if i < len(args) {
-					argExpr := strings.TrimSpace(expandDynamicBrackets(strings.TrimSpace(args[i]), sourceMap, params, depth+1))
-					matchedAlias := false
-					for _, pfx := range []string{"ctx?._source?.", "ctx?._source.", "ctx._source?.", "ctx._source."} {
-						if strings.HasPrefix(argExpr, pfx) {
-							tail := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(argExpr, pfx)), "?")
-							if reSimpleFieldPath.MatchString(tail) && !strings.HasSuffix(tail, ".size()") && !strings.HasSuffix(tail, ".length()") {
-								switch argVals[i].(type) {
-								case []any, map[string]any:
-									fnParams["__alias_"+pName] = tail
-									matchedAlias = true
-								}
-							}
-							break
-						}
-					}
-					if !matchedAlias && reSimpleFieldPath.MatchString(argExpr) && !strings.Contains(argExpr, ".") {
-						callerVar := decodeBracketSeg(argExpr)
-						if _, exists := params[callerVar]; exists {
-							if _, isSlice := argVals[i].([]any); isSlice {
-								callerVarBindings[pName] = callerVar
-							}
-							if aliasPath, ok := params["__alias_"+callerVar].(string); ok && aliasPath != "" {
-								fnParams["__alias_"+pName] = aliasPath
-							}
-						}
-					} else if !matchedAlias && reSimpleFieldPath.MatchString(argExpr) && !strings.HasSuffix(argExpr, ".size()") && !strings.HasSuffix(argExpr, ".length()") {
-						rhsParts := normalizeLocalLHSPath(strings.Split(argExpr, "."), params)
-						if len(rhsParts) > 0 {
-							rootVar := decodeBracketSeg(rhsParts[0])
-							if baseAlias, ok := params["__alias_"+rootVar].(string); ok && baseAlias != "" {
-								switch argVals[i].(type) {
-								case []any, map[string]any:
-									fnParams["__alias_"+pName] = strings.Join(append([]string{baseAlias}, rhsParts[1:]...), ".")
-								}
-							}
-						}
-					}
-				}
-			}
-			fnCtxOp := ""
-			err := execBlock(sourceMap, fn.body, fnParams, &fnCtxOp, budget)
-			for _, pName := range fn.paramNames {
-				if !reassignedVars[pName] {
-					syncLocalVarAlias(sourceMap, fnParams, pName)
-					if callerVar, bound := callerVarBindings[pName]; bound && params != nil {
-						params[callerVar] = fnParams[pName]
-						syncLocalVarAlias(sourceMap, params, callerVar)
-					}
-				}
-			}
-			if params != nil {
-				if ep, ok := fnParams["__explicit_params_keys"].(map[string]bool); ok {
-					for k := range ep {
-						if paramNamesSet[k] {
-							continue
-						}
-						if v, exists := fnParams[k]; exists {
-							params[k] = v
-						}
-					}
-					for k := range preCallEp {
-						if !ep[k] && !paramNamesSet[k] {
-							delete(params, k)
-						}
-					}
-				}
-			}
-			if fnCtxOp != "" {
-				budget.ctxOp = fnCtxOp
-				budget.hasCtxOp = true
-				if params != nil {
-					params["_ctx_op"] = fnCtxOp
-				}
-			}
-			if params != nil {
-				for _, metaKey := range []string{"_ctx_id", "_ctx_index", "_ctx_routing", "_ctx_version"} {
-					if v, exists := fnParams[metaKey]; exists {
-						params[metaKey] = v
-					}
-				}
-			}
-			if err != nil && !errors.Is(err, errPainlessReturn) {
-				return nil, true, err
-			}
-			if fn.returnType == "void" {
-				return nil, true, nil
-			}
-			if retVal, hasRet := fnParams["_return_val"]; hasRet {
-				return retVal, true, nil
-			}
-			return fnParams["_last_expr_val"], true, nil
-		}
+	if res, handled, err := evalUserFuncCallRound59(fnName, argStr, args, sourceMap, params, budget, depth); handled {
+		return res, true, err
 	}
 	return nil, false, nil
 }
@@ -18583,7 +18491,7 @@ func evalPainlessLambdaBody(body string, sourceMap, params map[string]any, depth
 		preExistingKeys := make(map[string]bool, len(params))
 		lambdaParams := make(map[string]any, len(params)+2)
 		for k, v := range params {
-			if k == "_return_val" || k == "_last_expr_val" {
+			if k == "_return_val" || k == "_last_expr_val" || k == "__has_value_return" || k == "__has_empty_return" {
 				continue
 			}
 			preExistingKeys[k] = true
@@ -18604,6 +18512,8 @@ func evalPainlessLambdaBody(body string, sourceMap, params map[string]any, depth
 		}
 		delete(lambdaParams, "_return_val")
 		delete(lambdaParams, "_last_expr_val")
+		delete(lambdaParams, "__has_value_return")
+		delete(lambdaParams, "__has_empty_return")
 		syncLoopScopeBack(params, lambdaParams, preExistingKeys, nil, loopDeclared)
 		if ctxOp != "" {
 			params["_ctx_op"] = ctxOp
@@ -18764,10 +18674,6 @@ func execPainlessListReplaceAllWithRec(recExpr, argExpr string, preRecVal any, h
 		syncLocalVarAlias(sourceMap, params, decodeBracketSeg(arrPath[0]))
 	}
 	return true, nil
-}
-
-func execPainlessForEach(recExpr, argExpr string, sourceMap, params map[string]any, depth int) error {
-	return execPainlessForEachWithRec(recExpr, argExpr, nil, false, sourceMap, params, depth)
 }
 
 func execPainlessForEachWithRec(recExpr, argExpr string, preRecVal any, hasPreRec bool, sourceMap, params map[string]any, depth int) error {
@@ -19346,7 +19252,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 	streamIdx, streamSub := findStreamStartOutsideQuotesPainless(rhs)
 	var steps []painlessStreamStep
 	var tailRest string
-	var srcSlice []any
+	var srcStream any
 	streamKind := "Stream"
 	if streamIdx > 0 {
 		recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:streamIdx], "?"))
@@ -19376,16 +19282,17 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 		switch streamSub {
 		case ".lines()":
 			if recVal != nil {
-				srcSlice = splitLinesPainless(fmt.Sprintf("%v", recVal))
+				srcStream = splitLinesPainless(fmt.Sprintf("%v", recVal))
 			}
 		case ".chars()", ".codePoints()":
 			streamKind = "IntStream"
 			if recVal != nil {
 				runes := []rune(fmt.Sprintf("%v", recVal))
-				srcSlice = make([]any, len(runes))
+				out := make([]any, len(runes))
 				for i, r := range runes {
-					srcSlice[i] = int64(r)
+					out[i] = int64(r)
 				}
+				srcStream = out
 			}
 		case ".results()":
 			res, handled, err := evalRound54ZeroArgMethodPainless(".results()", recExpr, recVal, sourceMap, params, depth+1)
@@ -19394,13 +19301,13 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 			}
 			if handled {
 				if s, isSlice := res.([]any); isSlice {
-					srcSlice = s
+					srcStream = s
 				}
 			}
 		default:
 			if bs, isBS := recVal.(*painlessBitSet); isBS {
 				streamKind = "IntStream"
-				srcSlice = bs.streamSlice()
+				srcStream = bs.streamSlice()
 			} else if opt, isOpt := recVal.(*painlessOptional); isOpt {
 				switch opt.kind {
 				case "OptionalInt":
@@ -19411,16 +19318,20 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 					streamKind = "DoubleStream"
 				}
 				if opt.present {
-					srcSlice = []any{opt.val}
+					srcStream = []any{opt.val}
 				} else {
-					srcSlice = []any{}
+					srcStream = []any{}
 				}
+			} else if rs, isRS := recVal.(*painlessRangeStream); isRS {
+				srcStream = rs
+			} else if cs, isCS := recVal.(*painlessConcatStream); isCS {
+				srcStream = cs
 			} else if s, ok := recVal.([]any); ok {
-				srcSlice = s
+				srcStream = s
 			} else if !isEmptyOptionalOrNilPainless(recVal) {
-				srcSlice = []any{recVal}
+				srcStream = []any{recVal}
 			} else {
-				srcSlice = []any{}
+				srcStream = []any{}
 			}
 		}
 	} else {
@@ -19438,9 +19349,9 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 							return nil, true, duErr
 						}
 						if s, isSlice := duVal.([]any); isSlice {
-							srcSlice = s
+							srcStream = s
 						} else {
-							srcSlice = []any{}
+							srcStream = []any{}
 						}
 						steps = st
 						tailRest = tr
@@ -19479,7 +19390,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 							if gErr != nil {
 								return nil, true, gErr
 							}
-							srcSlice = genSlice
+							srcStream = genSlice
 							matchedStaticStream = true
 						} else {
 							initVal, sOk, sErr := evalStaticCallPainless(sourceMap, rhs[:closeP+1], params, depth+1)
@@ -19487,11 +19398,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 								return nil, true, sErr
 							}
 							if sOk {
-								if s, isSlice := initVal.([]any); isSlice {
-									srcSlice = s
-								} else {
-									srcSlice = []any{}
-								}
+								srcStream = initVal
 								matchedStaticStream = true
 							}
 						}
@@ -19506,12 +19413,13 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 				varIdent := strings.TrimSuffix(strings.TrimSpace(rhs[:dotIdx]), "?")
 				if params != nil {
 					if vVal, exists := params[varIdent]; exists {
-						if vSlice, isSlice := vVal.([]any); isSlice {
+						switch vVal.(type) {
+						case []any, *painlessRangeStream, *painlessConcatStream:
 							st, tr, ok := parseStreamChainStepsPainless(rhs[dotIdx:])
 							if ok && len(st) > 0 && isStreamStepMethodPainless(st[0].name) && (st[0].name != "peek" || strings.TrimSpace(st[0].args) != "") {
 								steps = st
 								tailRest = tr
-								srcSlice = vSlice
+								srcStream = vVal
 								matchedStaticStream = true
 							}
 						}
@@ -19523,8 +19431,11 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 			return nil, false, nil
 		}
 	}
-	items := make([]any, len(srcSlice))
-	copy(items, srcSlice)
+	budget := getOrInitEvalBudget(params)
+	curIter, inferredKind := streamSourceToIterRound59(srcStream, budget)
+	if streamKind == "Stream" && inferredKind != "" && inferredKind != "Stream" {
+		streamKind = inferredKind
+	}
 
 	var terminalVal any
 	hasTerminal := false
@@ -19670,11 +19581,11 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 					}
 					continue
 				case "stream":
-					if isEmptyOptionalOrNilPainless(terminalVal) {
-						items = []any{}
-					} else {
-						items = []any{unwrapPainlessInternalValue(terminalVal)}
+					var nextItems []any
+					if !isEmptyOptionalOrNilPainless(terminalVal) {
+						nextItems = []any{unwrapPainlessInternalValue(terminalVal)}
 					}
+					curIter = sliceStreamIterRound59(nextItems, budget)
 					hasTerminal = false
 					isOptional = false
 					continue
@@ -19758,253 +19669,21 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 			return res, true, err
 		}
 
+		if nextIter, handledStep, stepErr := applyLazyStreamIntermediateRound59(curIter, step, &streamKind, sourceMap, params, budget, depth); handledStep {
+			if stepErr != nil {
+				return nil, true, stepErr
+			}
+			curIter = nextIter
+			continue
+		}
+
 		switch step.name {
-		case "boxed":
-			streamKind = "Stream"
-		case "asLongStream":
-			streamKind = "LongStream"
-		case "asDoubleStream":
-			streamKind = "DoubleStream"
-			for i, it := range items {
-				if f, ok := toFloat64WithRawPainless(it); ok {
-					items[i] = f
-				}
-			}
-		case "filter", "takeWhile", "dropWhile":
-			budget := getOrInitEvalBudget(params)
-			filtered := make([]any, 0, len(items))
-			dropping := step.name == "dropWhile"
-		filterLoop:
-			for _, it := range items {
-				if err := budget.step(); err != nil {
-					return nil, true, err
-				}
-				if step.name == "dropWhile" && !dropping {
-					filtered = append(filtered, it)
-					continue
-				}
-				matched, err := evalPredicateArgOnItemPainless(step.args, it, sourceMap, params, depth+1)
-				if err != nil {
-					return nil, true, err
-				}
-				switch step.name {
-				case "filter":
-					if matched {
-						filtered = append(filtered, it)
-					}
-				case "takeWhile":
-					if !matched {
-						break filterLoop
-					}
-					filtered = append(filtered, it)
-				case "dropWhile":
-					if !matched {
-						dropping = false
-						filtered = append(filtered, it)
-					}
-				}
-			}
-			items = filtered
-		case "map", "mapToObj", "mapToInt", "mapToLong", "mapToDouble":
-			switch step.name {
-			case "map", "mapToObj":
-				streamKind = "Stream"
-			case "mapToInt":
-				streamKind = "IntStream"
-			case "mapToLong":
-				streamKind = "LongStream"
-			case "mapToDouble":
-				streamKind = "DoubleStream"
-			}
-			normArg := normalizeMethodReferenceToLambdaPainless(step.args, 1)
-			arrowIdx := findNextUnquotedSubstr(normArg, "->", 0)
-			if arrowIdx > 0 {
-				pNames := parsePainlessLambdaHeader(normArg[:arrowIdx])
-				if len(pNames) > 0 {
-					pName := pNames[0]
-					body := normArg[arrowIdx+2:]
-					prev, hadPrev := params[pName]
-					mapped := make([]any, 0, len(items))
-					for _, it := range items {
-						params[pName] = it
-						mv, err := evalPainlessLambdaBody(body, sourceMap, params, depth+1)
-						if err != nil {
-							if hadPrev {
-								params[pName] = prev
-							} else {
-								delete(params, pName)
-							}
-							return nil, true, err
-						}
-						switch step.name {
-						case "mapToInt", "mapToLong":
-							if f, ok := toFloat64(mv); ok {
-								mv = int64(f)
-							}
-						case "mapToDouble":
-							if f, ok := toFloat64WithRawPainless(mv); ok {
-								mv = f
-							}
-						}
-						mapped = append(mapped, mv)
-					}
-					if hadPrev {
-						params[pName] = prev
-					} else {
-						delete(params, pName)
-					}
-					items = mapped
-				}
-			}
-		case "flatMap", "flatMapToInt", "flatMapToLong", "flatMapToDouble":
-			switch step.name {
-			case "flatMap":
-				streamKind = "Stream"
-			case "flatMapToInt":
-				streamKind = "IntStream"
-			case "flatMapToLong":
-				streamKind = "LongStream"
-			case "flatMapToDouble":
-				streamKind = "DoubleStream"
-			}
-			normArg := normalizeMethodReferenceToLambdaPainless(step.args, 1)
-			arrowIdx := findNextUnquotedSubstr(normArg, "->", 0)
-			if arrowIdx > 0 {
-				pNames := parsePainlessLambdaHeader(normArg[:arrowIdx])
-				if len(pNames) > 0 {
-					pName := pNames[0]
-					body := strings.TrimSpace(normArg[arrowIdx+2:])
-					body = strings.TrimSuffix(body, ".stream()")
-					prev, hadPrev := params[pName]
-					var flattened []any
-					coerceElem := func(el any) any {
-						switch step.name {
-						case "flatMapToInt", "flatMapToLong":
-							if f, ok := toFloat64(el); ok {
-								return int64(f)
-							}
-						case "flatMapToDouble":
-							if f, ok := toFloat64WithRawPainless(el); ok {
-								return f
-							}
-						}
-						return el
-					}
-					for _, it := range items {
-						params[pName] = it
-						mv, err := evalPainlessLambdaBody(body, sourceMap, params, depth+1)
-						if err != nil {
-							if hadPrev {
-								params[pName] = prev
-							} else {
-								delete(params, pName)
-							}
-							return nil, true, err
-						}
-						if opt, isOpt := mv.(*painlessOptional); isOpt {
-							if opt != nil && opt.present && len(flattened) < MaxPainlessSliceItems {
-								flattened = append(flattened, coerceElem(opt.val))
-							}
-						} else if mv == painlessEmptyOptional {
-							// Empty Optional.stream() produces no elements
-						} else if subArr, ok := mv.([]any); ok {
-							for _, el := range subArr {
-								if len(flattened) >= MaxPainlessSliceItems {
-									break
-								}
-								flattened = append(flattened, coerceElem(el))
-							}
-						} else if mv != nil && len(flattened) < MaxPainlessSliceItems {
-							flattened = append(flattened, coerceElem(mv))
-						}
-					}
-					if hadPrev {
-						params[pName] = prev
-					} else {
-						delete(params, pName)
-					}
-					items = flattened
-				}
-			}
-		case "distinct":
-			dedup := make([]any, 0, len(items))
-			for _, it := range items {
-				seen := false
-				for _, ex := range dedup {
-					if painlessValuesEqual(it, ex) {
-						seen = true
-						break
-					}
-				}
-				if !seen {
-					dedup = append(dedup, it)
-				}
-			}
-			items = dedup
-		case "sorted":
-			if err := sortPainlessSliceInPlace(items, step.args, sourceMap, params, depth+1); err != nil {
-				return nil, true, err
-			}
-		case "limit":
-			lv, err := evalRHSExprDepth(sourceMap, step.args, params, depth+1)
-			if err != nil {
-				return nil, true, err
-			}
-			if f, ok := toFloat64(lv); ok {
-				lim := int(f)
-				if lim < 0 {
-					return nil, true, &painlessExceptionError{exType: "IllegalArgumentException", message: strconv.Itoa(lim)}
-				}
-				if lim < len(items) {
-					items = items[:lim]
-				}
-			}
-		case "skip":
-			sv, err := evalRHSExprDepth(sourceMap, step.args, params, depth+1)
-			if err != nil {
-				return nil, true, err
-			}
-			if f, ok := toFloat64(sv); ok {
-				sk := int(f)
-				if sk < 0 {
-					return nil, true, &painlessExceptionError{exType: "IllegalArgumentException", message: strconv.Itoa(sk)}
-				}
-				if sk >= len(items) {
-					items = newEmptyPainlessSlice()
-				} else {
-					items = items[sk:]
-				}
-			}
-		case "stream":
-			// No-op intermediate stream conversion
-		case "peek":
-			normArg := normalizeMethodReferenceToLambdaPainless(step.args, 1)
-			if arrowIdx := findNextUnquotedSubstr(normArg, "->", 0); arrowIdx > 0 {
-				pNames := parsePainlessLambdaHeader(normArg[:arrowIdx])
-				if len(pNames) > 0 {
-					pName := pNames[0]
-					body := normArg[arrowIdx+2:]
-					prev, hadPrev := params[pName]
-					for _, it := range items {
-						params[pName] = it
-						if _, err := evalPainlessLambdaBody(body, sourceMap, params, depth+1); err != nil {
-							if hadPrev {
-								params[pName] = prev
-							} else {
-								delete(params, pName)
-							}
-							return nil, true, err
-						}
-					}
-					if hadPrev {
-						params[pName] = prev
-					} else {
-						delete(params, pName)
-					}
-				}
-			}
 		case "collect":
 			hasTerminal = true
+			items, dErr := drainStreamIterBoundedRound59(curIter, MaxPainlessSliceItems)
+			if dErr != nil {
+				return nil, true, dErr
+			}
 			cVal, cErr := evalStreamCollectorPainless(step.args, items, sourceMap, params, depth+1)
 			if cErr != nil {
 				return nil, true, cErr
@@ -20023,40 +19702,100 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 			case "DoubleStream":
 				statType = "DoubleSummaryStatistics"
 			}
-			stats, sErr := computeSummaryStatsWithKindPainless(items, "", statType, sourceMap, params, depth+1)
+			stats, sErr := newSummaryStatisticsMapPainless(statType, false, 0, 0, 0, 0)
 			if sErr != nil {
 				return nil, true, sErr
+			}
+			for {
+				it, ok, err := curIter()
+				if err != nil {
+					return nil, true, err
+				}
+				if !ok {
+					break
+				}
+				if aErr := summaryStatisticsAcceptPainless(stats, it); aErr != nil {
+					return nil, true, aErr
+				}
 			}
 			terminalVal = stats
 		case "toList":
 			hasTerminal = true
-			terminalVal = shallowCopyUnmodSlicePainless(getOrInitEvalBudget(params), items)
+			items, dErr := drainStreamIterBoundedRound59(curIter, MaxPainlessSliceItems)
+			if dErr != nil {
+				return nil, true, dErr
+			}
+			terminalVal = shallowCopyUnmodSlicePainless(budget, items)
 		case "toArray":
 			hasTerminal = true
-			if len(items) == 0 {
-				terminalVal = newEmptyPainlessSlice()
-			} else {
-				cp := make([]any, len(items))
-				copy(cp, items)
-				terminalVal = cp
+			items, dErr := drainStreamIterBoundedRound59(curIter, MaxPainlessSliceItems)
+			if dErr != nil {
+				return nil, true, dErr
 			}
+			arrType := "Object[]"
+			switch streamKind {
+			case "IntStream":
+				arrType = "int[]"
+			case "LongStream":
+				arrType = "long[]"
+			case "DoubleStream":
+				arrType = "double[]"
+			}
+			if sArg := strings.TrimSpace(step.args); strings.HasSuffix(sArg, "::new") {
+				candArr := strings.TrimSpace(strings.TrimSuffix(sArg, "::new"))
+				if normArr, valid := normalizeCastTypeCandidateRound59(candArr, budget); valid && strings.HasSuffix(normArr, "[]") {
+					arrType = normArr
+				}
+			}
+			cp := make([]any, len(items), max(1, len(items)))
+			copy(cp, items)
+			terminalVal = markTypedArraySliceRound59(budget, cp, arrType)
 		case "count":
 			hasTerminal = true
-			terminalVal = int64(len(items))
+			var cnt int64
+			for {
+				_, ok, err := curIter()
+				if err != nil {
+					return nil, true, err
+				}
+				if !ok {
+					break
+				}
+				cnt++
+			}
+			terminalVal = cnt
 		case "sum":
 			hasTerminal = true
+			var intSum int64
 			sum := 0.0
 			allInt := streamKind != "DoubleStream"
-			for _, it := range items {
-				if f, ok := toFloat64WithRawPainless(it); ok {
+			for {
+				it, ok, err := curIter()
+				if err != nil {
+					return nil, true, err
+				}
+				if !ok {
+					break
+				}
+				if allInt {
+					if iv, okI := extractExactIntegralPainless(it, true); okI {
+						intSum += iv
+						sum += float64(iv)
+						continue
+					}
+					allInt = false
+				}
+				if f, okF := toFloat64WithRawPainless(it); okF {
 					sum += f
 					if math.IsNaN(f) || math.IsInf(f, 0) || f != float64(int64(f)) {
 						allInt = false
+					} else {
+						intSum += int64(f)
 					}
 				}
 			}
 			if allInt && !math.IsNaN(sum) && !math.IsInf(sum, 0) {
-				terminalVal = int64(sum)
+				terminalVal = intSum
 			} else {
 				terminalVal = sum
 			}
@@ -20064,52 +19803,99 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 			hasTerminal = true
 			isOptional = true
 			optKind = "OptionalDouble"
-			if len(items) == 0 {
+			sum := 0.0
+			var cnt int64
+			for {
+				it, ok, err := curIter()
+				if err != nil {
+					return nil, true, err
+				}
+				if !ok {
+					break
+				}
+				cnt++
+				if f, okF := toFloat64WithRawPainless(it); okF {
+					sum += f
+				}
+			}
+			if cnt == 0 {
 				terminalVal = nil
 			} else {
-				sum := 0.0
-				for _, it := range items {
-					if f, ok := toFloat64WithRawPainless(it); ok {
-						sum += f
-					}
-				}
-				terminalVal = sum / float64(len(items))
+				terminalVal = sum / float64(cnt)
 			}
 		case "min", "max":
 			hasTerminal = true
 			isOptional = true
 			optKind = streamKindToOptKind(streamKind)
-			if len(items) == 0 {
-				terminalVal = nil
-			} else {
-				cp := make([]any, len(items))
-				copy(cp, items)
-				if err := sortPainlessSliceInPlace(cp, step.args, sourceMap, params, depth+1); err != nil {
+			hasBest := false
+			var best any
+			cmpArg := strings.TrimSpace(step.args)
+			for {
+				it, ok, err := curIter()
+				if err != nil {
 					return nil, true, err
 				}
-				if step.name == "min" {
-					terminalVal = cp[0]
-				} else {
-					terminalVal = cp[len(cp)-1]
+				if !ok {
+					break
 				}
+				if !hasBest {
+					best = it
+					hasBest = true
+					continue
+				}
+				if cmpArg == "" {
+					cmp := comparePainlessValues(it, best)
+					if (step.name == "min" && cmp < 0) || (step.name == "max" && cmp >= 0) {
+						best = it
+					}
+				} else {
+					pair := []any{best, it}
+					if err := sortPainlessSliceInPlace(pair, cmpArg, sourceMap, params, depth+1); err != nil {
+						return nil, true, err
+					}
+					if step.name == "min" {
+						best = pair[0]
+					} else {
+						best = pair[1]
+					}
+				}
+			}
+			if !hasBest {
+				terminalVal = nil
+			} else {
+				terminalVal = best
 			}
 		case "findFirst", "findAny":
 			hasTerminal = true
 			isOptional = true
 			optKind = streamKindToOptKind(streamKind)
-			if len(items) > 0 {
-				terminalVal = items[0]
+			firstVal, ok, err := curIter()
+			if err != nil {
+				return nil, true, err
+			}
+			if ok {
+				terminalVal = firstVal
 			} else {
 				terminalVal = nil
 			}
 		case "anyMatch", "allMatch", "noneMatch":
 			hasTerminal = true
-			budget := getOrInitEvalBudget(params)
 			resBool := step.name != "anyMatch"
-			for _, it := range items {
-				if err := budget.step(); err != nil {
+			predSteps := 0
+			for {
+				it, ok, err := curIter()
+				if err != nil {
 					return nil, true, err
 				}
+				if !ok {
+					break
+				}
+				if budget != nil && (predSteps&63) == 0 {
+					if err := budget.step(); err != nil {
+						return nil, true, err
+					}
+				}
+				predSteps++
 				matched, err := evalPredicateArgOnItemPainless(step.args, it, sourceMap, params, depth+1)
 				if err != nil {
 					return nil, true, err
@@ -20155,7 +19941,24 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 					body := fnExpr[arrowIdx+2:]
 					prev1, had1 := params[p1]
 					prev2, had2 := params[p2]
-					for _, it := range items {
+					for {
+						it, ok, err := curIter()
+						if err != nil {
+							if had1 {
+								params[p1] = prev1
+							} else {
+								delete(params, p1)
+							}
+							if had2 {
+								params[p2] = prev2
+							} else {
+								delete(params, p2)
+							}
+							return nil, true, err
+						}
+						if !ok {
+							break
+						}
 						if !hasAcc {
 							acc = it
 							hasAcc = true
@@ -20194,15 +19997,7 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 			terminalVal = acc
 		case "forEach", "forEachOrdered":
 			hasTerminal = true
-			prevTmp, hadTmp := params["__stream_items"]
-			params["__stream_items"] = items
-			err := execPainlessForEach("__stream_items", step.args, sourceMap, params, depth+1)
-			if hadTmp {
-				params["__stream_items"] = prevTmp
-			} else {
-				delete(params, "__stream_items")
-			}
-			if err != nil {
+			if err := execStreamIterForEachRound59(curIter, step.args, sourceMap, params, budget, depth); err != nil {
 				return nil, true, err
 			}
 			terminalVal = nil
@@ -20210,7 +20005,11 @@ func evalStreamPipelinePainless(sourceMap map[string]any, rhs string, params map
 	}
 
 	if !hasTerminal {
-		terminalVal = items
+		drained, dErr := drainStreamIterBoundedRound59(curIter, MaxPainlessSliceItems)
+		if dErr != nil {
+			return nil, true, dErr
+		}
+		terminalVal = drained
 	} else if isOptional {
 		terminalVal = wrapTerminalOptional(terminalVal, optKind)
 	}
@@ -20296,6 +20095,7 @@ func evalStreamCollectorPainless(collectorExpr string, items []any, sourceMap, p
 		if isUnmodSet {
 			markUnmodSlicePainless(getOrInitEvalBudget(params), dedup)
 		}
+		dedup = markSetSliceRound59(getOrInitEvalBudget(params), dedup)
 		return dedup, nil
 	}
 	if strings.HasPrefix(cExpr, "Collectors.toCollection(") && strings.HasSuffix(cExpr, ")") {
@@ -20322,6 +20122,9 @@ func evalStreamCollectorPainless(collectorExpr string, items []any, sourceMap, p
 			sort.SliceStable(out, func(i, j int) bool {
 				return comparePainlessValues(out[i], out[j]) < 0
 			})
+		}
+		if isSet {
+			out = markSetSliceRound59(getOrInitEvalBudget(params), out)
 		}
 		return out, nil
 	}
@@ -22504,6 +22307,7 @@ func evalCollectionZeroArgMethodPainless(mSuffix, recExpr string, recVal any, so
 			for i, el := range tv {
 				out[len(tv)-1-i] = el
 			}
+			out = markSetSliceRound59(getOrInitEvalBudget(params), out)
 			return out, nil
 		}
 	}
@@ -24451,6 +24255,9 @@ func evalCharacterStaticPainless(fnName string, args []string, sourceMap, params
 	}
 	toCodePoint := func(v any) (int32, bool) {
 		if s, ok := v.(string); ok {
+			if u, okS := parseSurrogateCharStringRound59(s); okS {
+				return int32(u), true
+			}
 			rs := []rune(s)
 			if len(rs) == 1 {
 				return rs[0], true
@@ -24898,6 +24705,9 @@ func evalCharacterStaticPainless(fnName string, args []string, sourceMap, params
 		u := uint16(cp) // #nosec G115 -- char is 16-bit
 		rev := (u >> 8) | (u << 8)
 		return int64(rev), nil
+	}
+	if res, handled, err := evalCharacterExtraStaticRound59(fnName, a0, toCodePoint); handled {
+		return res, err
 	}
 	return nil, nil
 }

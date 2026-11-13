@@ -140,11 +140,15 @@ func parseESResponseFormatOptions(r *http.Request) (esResponseFormatOptions, boo
 	}
 	q := r.URL.Query()
 	var opts esResponseFormatOptions
-	if q.Has("pretty") && strings.ToLower(q.Get("pretty")) != "false" {
-		opts.pretty = true
+	if q.Has("pretty") {
+		if pv := strings.ToLower(q.Get("pretty")); pv == "" || pv == "true" {
+			opts.pretty = true
+		}
 	}
-	if q.Has("error_trace") && strings.ToLower(q.Get("error_trace")) != "false" {
-		opts.errorTrace = true
+	if q.Has("error_trace") {
+		if ev := strings.ToLower(q.Get("error_trace")); ev == "" || ev == "true" {
+			opts.errorTrace = true
+		}
 	}
 	if fp := strings.TrimSpace(q.Get("filter_path")); fp != "" {
 		opts.filterPaths = append(opts.filterPaths, splitFilterPathExpressions(fp)...)
@@ -349,6 +353,10 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 			w = &esFormatResponseWriter{ResponseWriter: w, opts: fmtOpts}
 		}
 
+		if !validateGlobalWireQueryParamsRound59(w, r) {
+			return
+		}
+
 		if !s.checkInboundAuth(w, r) {
 			return
 		}
@@ -399,6 +407,10 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 		default:
 			writeESError(w, http.StatusUnsupportedMediaType, "illegal_argument_exception",
 				"unsupported Content-Encoding: "+r.Header.Get("Content-Encoding"))
+			return
+		}
+
+		if !validateRequestContentTypeRound59(w, r) {
 			return
 		}
 
@@ -945,6 +957,9 @@ func (s *Server) handleIndexStats(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return
 		}
+		if !s.ensureNoExplicitClosedTargetRound59(w, r, rawIndex) {
+			return
+		}
 	}
 
 	indicesMap := make(map[string]any, len(targets))
@@ -1289,10 +1304,8 @@ func validateIngestPipelineProcessors(procs []any) error {
 				if _, err := reqStr("field"); err != nil {
 					return err
 				}
-				_, hasVal := specMap["value"]
-				copyFrom, _ := specMap["copy_from"].(string)
-				if !hasVal && strings.TrimSpace(copyFrom) == "" {
-					return fmt.Errorf("either [value] or [copy_from] must be present")
+				if err := validateIngestSetSpecRound59(specMap); err != nil {
+					return err
 				}
 			case "default", "append":
 				if _, err := reqStr("field"); err != nil {
@@ -1340,6 +1353,9 @@ func validateIngestPipelineProcessors(procs []any) error {
 				if err != nil {
 					return err
 				}
+				if err := validateIngestRenameOrCopySpecRound59(procType, specMap); err != nil {
+					return err
+				}
 				if f == tf && pm["on_failure"] == nil && specMap["on_failure"] == nil {
 					return fmt.Errorf("illegal_argument_exception: source and target_field are the same: [%s]", f)
 				}
@@ -1349,6 +1365,11 @@ func validateIngestPipelineProcessors(procs []any) error {
 				"registered_domain", "geoip", "set_security_user":
 				if _, err := reqStr("field"); err != nil {
 					return err
+				}
+				if rawIM, hasIM := specMap["ignore_missing"]; hasIM && rawIM != nil {
+					if _, ok := rawIM.(bool); !ok {
+						return fmt.Errorf("illegal_argument_exception: [ignore_missing] must be a boolean")
+					}
 				}
 			case "sort":
 				if _, err := reqStr("field"); err != nil {
@@ -1556,11 +1577,19 @@ func validateIngestPipelineProcessors(procs []any) error {
 					if !ok || strings.TrimSpace(fStr) == "" {
 						return fmt.Errorf("illegal_argument_exception: [formats] must contain only non-empty strings")
 					}
+					if !strings.Contains(fStr, "{{") {
+						if err := validateESDateFormatPatternRound59(fStr); err != nil {
+							return err
+						}
+					}
 				}
 				if tz, ok := specMap["timezone"].(string); ok && tz != "" && !strings.Contains(tz, "{{") {
 					if _, err := parseIngestTimezone(tz); err != nil {
 						return err
 					}
+				}
+				if err := validateIngestDateCommonOptionsRound59(specMap, "output_format"); err != nil {
+					return err
 				}
 			case "date_index_name":
 				if _, err := reqStr("field"); err != nil {
@@ -1586,6 +1615,11 @@ func validateIngestPipelineProcessors(procs []any) error {
 							if !ok || strings.TrimSpace(fStr) == "" {
 								return fmt.Errorf("illegal_argument_exception: [%s] must contain only non-empty strings", fmtKey)
 							}
+							if !strings.Contains(fStr, "{{") {
+								if err := validateESDateFormatPatternRound59(fStr); err != nil {
+									return err
+								}
+							}
 						}
 					}
 				}
@@ -1593,6 +1627,9 @@ func validateIngestPipelineProcessors(procs []any) error {
 					if _, err := parseIngestTimezone(tz); err != nil {
 						return err
 					}
+				}
+				if err := validateIngestDateCommonOptionsRound59(specMap, "index_name_format"); err != nil {
+					return err
 				}
 			case "dissect":
 				if _, err := reqStr("field"); err != nil {
@@ -1618,24 +1655,16 @@ func validateIngestPipelineProcessors(procs []any) error {
 				if !ok || len(pats) == 0 {
 					return fmt.Errorf("[patterns] required property is missing")
 				}
-				if rawECS, hasECS := specMap["ecs_compatibility"]; hasECS && rawECS != nil {
-					ecsStr, ok := rawECS.(string)
-					if !ok || (ecsStr != "disabled" && ecsStr != "v1") {
-						return fmt.Errorf("illegal_argument_exception: invalid ecs_compatibility [%v], must be [disabled] or [v1]", rawECS)
-					}
+				effectiveDefs, defsErr := buildEffectiveGrokDefs(procType, specMap)
+				if defsErr != nil {
+					return defsErr
 				}
-				if rawKEC, hasKEC := specMap["keep_empty_captures"]; hasKEC && rawKEC != nil {
-					if _, ok := rawKEC.(bool); !ok {
-						return fmt.Errorf("illegal_argument_exception: [keep_empty_captures] must be a boolean")
-					}
-				}
-				customDefs, _ := specMap["pattern_definitions"].(map[string]any)
 				for _, patAny := range pats {
 					patStr, ok := patAny.(string)
 					if !ok || patStr == "" {
 						return fmt.Errorf("illegal_argument_exception: pattern must be a non-empty string")
 					}
-					if _, _, _, err := compileGrokRegex(patStr, customDefs); err != nil {
+					if _, _, _, err := compileGrokRegex(patStr, effectiveDefs); err != nil {
 						return fmt.Errorf("illegal_argument_exception: %v", err)
 					}
 				}
@@ -1707,6 +1736,15 @@ func validateIngestPipelineProcessors(procs []any) error {
 					mm, ok := toInt64(rawMM)
 					if !ok || mm < 1 || mm > 128 {
 						return fmt.Errorf("[max_matches] must be between 1 and 128")
+					}
+				}
+				if rawSR, hasSR := specMap["shape_relation"]; hasSR && rawSR != nil {
+					srStr, ok := rawSR.(string)
+					if !ok {
+						return fmt.Errorf("illegal_argument_exception: [shape_relation] must be a string")
+					}
+					if err := validateEnrichShapeRelationRound59(srStr); err != nil {
+						return err
 					}
 				}
 			case "foreach":
@@ -2484,7 +2522,7 @@ var defaultGrokPatterns = map[string]string{
 	"IPV6":              `(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}`,
 	"IP":                `(?:(?:[0-9]{1,3}\.){3}[0-9]{1,3}|(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4})`,
 	"HOSTNAME":          `\b(?:[0-9A-Za-z][0-9A-Za-z-]{0,62})(?:\.(?:[0-9A-Za-z][0-9A-Za-z-]{0,62}))*(?:\.?|\b)`,
-	"IPORHOST":          `(?:(?:[0-9]{1,3}\.){3}[0-9]{1,3}|\b(?:[0-9A-Za-z][0-9A-Za-z-]{0,62})(?:\.(?:[0-9A-Za-z][0-9A-Za-z-]{0,62}))*)`,
+	"IPORHOST":          `(?:%{IP}|%{HOSTNAME})`,
 	"POSINT":            `\b(?:[1-9][0-9]*)\b`,
 	"NONNEGINT":         `\b(?:[0-9]+)\b`,
 	"LOGLEVEL":          `(?:[Aa]lert|ALERT|[Tt]race|TRACE|[Dd]ebug|DEBUG|[Nn]otice|NOTICE|[Ii]nfo|INFO|[Ww]arn?(?:ing)?|WARN?(?:ING)?|[Ee]rr?(?:or)?|ERR?(?:OR)?|[Cc]rit?(?:ical)?|CRIT?(?:ICAL)?|[Ff]atal|FATAL|[Ss]evere|SEVERE|EMERG(?:ENCY)?|[Ee]merg(?:ency)?)`,
@@ -2515,12 +2553,32 @@ var defaultGrokPatterns = map[string]string{
 	"URI":               `%{URIPROTO}://(?:%{USER}(?::[^@]*)?@)?(?:%{URIHOST})?(?:%{URIPATHPARAM})?`,
 	"COMMONAPACHELOG":   `%{IPORHOST:clientip} %{USER:ident} %{USER:auth} \[%{HTTPDATE:timestamp}\] "(?:%{WORD:verb} %{NOTSPACE:request}(?: HTTP/%{NUMBER:httpversion})?|%{DATA:rawrequest})" %{NUMBER:response} (?:%{NUMBER:bytes}|-)`,
 	"COMBINEDAPACHELOG": `%{COMMONAPACHELOG} %{QS:referrer} %{QS:agent}`,
+	"HTTPDUSER":         `%{EMAILADDRESS}|%{USER}`,
+	"HTTPDERROR_DATE":   `%{DAY} %{MONTH} %{MONTHDAY} %{TIME} %{YEAR}`,
+	"HTTPD_COMMONLOG":   `%{IPORHOST:clientip} %{HTTPDUSER:ident} %{HTTPDUSER:auth} \[%{HTTPDATE:timestamp}\] "(?:%{WORD:verb} %{NOTSPACE:request}(?: HTTP/%{NUMBER:httpversion})?|%{DATA:rawrequest})" (?:%{NUMBER:response}|-) (?:%{NUMBER:bytes}|-)`,
+	"HTTPD_COMBINEDLOG": `%{HTTPD_COMMONLOG} %{QS:referrer} %{QS:agent}`,
+	"HTTPD20_ERRORLOG":  `\[%{HTTPDERROR_DATE:timestamp}\] \[%{LOGLEVEL:loglevel}\] (?:\[client %{IPORHOST:clientip}\] )?%{GREEDYDATA:errormsg}`,
+	"HTTPD24_ERRORLOG":  `\[%{HTTPDERROR_DATE:timestamp}\] \[%{WORD:module}:%{LOGLEVEL:loglevel}\] \[pid %{POSINT:pid}(?::tid %{NUMBER:tid})?\](?: \(%{POSINT:proxy_errorcode}\)%{DATA:proxy_errormessage}:)?(?: \[client %{IPORHOST:client}:%{POSINT:clientport}\])?(?: %{DATA:errorcode}:)? %{GREEDYDATA:message}`,
+	"HTTPD_ERRORLOG":    `(?:%{HTTPD20_ERRORLOG}|%{HTTPD24_ERRORLOG})`,
+	"PROG":              `[\x21-\x5a\x5c\x5e-\x7e]+`,
+	"SYSLOGPROG":        `%{PROG:program}(?:\[%{POSINT:pid}\])?`,
+	"SYSLOGHOST":        `%{IPORHOST}`,
+	"SYSLOGFACILITY":    `<%{NONNEGINT:facility}\.%{NONNEGINT:priority}>`,
+	"SYSLOGBASE":        `%{SYSLOGTIMESTAMP:timestamp} (?:%{SYSLOGFACILITY} )?%{SYSLOGHOST:logsource} %{SYSLOGPROG}:`,
 	"EMAILADDRESS":      `[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+`,
 }
 
 var ecsGrokPatterns = map[string]string{
 	"COMMONAPACHELOG":   `%{IPORHOST:[client][address]} %{USER:[user][id]} %{USER:[user][name]} \[%{HTTPDATE:timestamp}\] "(?:%{WORD:[http][request][method]} %{NOTSPACE:[url][original]}(?: HTTP/%{NUMBER:[http][version]})?|%{DATA})" %{NUMBER:[http][response][status_code]:int} (?:%{NUMBER:[http][response][body][bytes]:long}|-)`,
 	"COMBINEDAPACHELOG": `%{COMMONAPACHELOG} %{QS:[http][request][referrer]} %{QS:[user_agent][original]}`,
+	"HTTPD_COMMONLOG":   `%{IPORHOST:[client][address]} (?:-|%{HTTPDUSER:[user][id]}) (?:-|%{HTTPDUSER:[user][name]}) \[%{HTTPDATE:timestamp}\] "(?:%{WORD:[http][request][method]} %{NOTSPACE:[url][original]}(?: HTTP/%{NUMBER:[http][version]})?|%{DATA})" (?:-|%{INT:[http][response][status_code]:int}) (?:-|%{INT:[http][response][body][bytes]:long})`,
+	"HTTPD_COMBINEDLOG": `%{HTTPD_COMMONLOG} %{QS:[http][request][referrer]} %{QS:[user_agent][original]}`,
+	"HTTPD20_ERRORLOG":  `\[%{HTTPDERROR_DATE:timestamp}\] \[%{LOGLEVEL:[log][level]}\] (?:\[client %{IPORHOST:[client][address]}\] )?%{GREEDYDATA:message}`,
+	"HTTPD24_ERRORLOG":  `\[%{HTTPDERROR_DATE:timestamp}\] \[%{WORD:[apache][error][module]}:%{LOGLEVEL:[log][level]}\] \[pid %{POSINT:[process][pid]:long}(?::tid %{NUMBER:[process][thread][id]:long})?\](?: \(%{POSINT:[apache][error][proxy][code]:long}\)%{DATA:[apache][error][proxy][message]}:)?(?: \[client %{IPORHOST:[client][address]}:%{POSINT:[client][port]:long}\])?(?: %{DATA:[error][code]}:)? %{GREEDYDATA:message}`,
+	"HTTPD_ERRORLOG":    `(?:%{HTTPD20_ERRORLOG}|%{HTTPD24_ERRORLOG})`,
+	"SYSLOGPROG":        `%{PROG:[process][name]}(?:\[%{POSINT:[process][pid]:long}\])?`,
+	"SYSLOGFACILITY":    `<%{NONNEGINT:[log][syslog][facility][code]:long}\.%{NONNEGINT:[log][syslog][priority]:long}>`,
+	"SYSLOGBASE":        `%{SYSLOGTIMESTAMP:timestamp} (?:%{SYSLOGFACILITY} )?%{SYSLOGHOST:[host][hostname]} %{SYSLOGPROG}:`,
 }
 
 var (
@@ -2735,7 +2793,7 @@ func compileGrokRegex(pat string, customDefs map[string]any) (*regexp.Regexp, ma
 	groupTypes := make(map[string]string)
 	groupSeq := 0
 	expanded := pat
-	for pass := 0; pass < 8; pass++ {
+	for pass := 0; pass < 16; pass++ {
 		if !strings.Contains(expanded, "%{") {
 			break
 		}
@@ -2776,6 +2834,9 @@ func compileGrokRegex(pat string, customDefs map[string]any) (*regexp.Regexp, ma
 			return nil, nil, nil, resolveErr
 		}
 	}
+	if reGrokToken.MatchString(expanded) {
+		return nil, nil, nil, fmt.Errorf("illegal_argument_exception: cyclic or unresolved grok pattern in [%s]", pat)
+	}
 	expanded = reGrokNamedCapture.ReplaceAllStringFunc(expanded, func(m string) string {
 		sub := reGrokNamedCapture.FindStringSubmatch(m)
 		if len(sub) < 2 {
@@ -2792,7 +2853,7 @@ func compileGrokRegex(pat string, customDefs map[string]any) (*regexp.Regexp, ma
 		}
 		return fmt.Sprintf("(?P<%s>", grpID)
 	})
-	re, err := regexp.Compile(expanded)
+	re, err := compileIngestJavaRegex(expanded)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -3339,9 +3400,16 @@ func parseIngestByteSize(s string) (int64, error) {
 	}
 	fv, err := strconv.ParseFloat(numPart, 64)
 	if err != nil || math.IsNaN(fv) || math.IsInf(fv, 0) || fv < 0 {
-		return 0, fmt.Errorf("unable to convert [%s] to bytes", s)
+		return 0, fmt.Errorf("illegal_argument_exception: unable to convert [%s] to bytes", s)
 	}
-	return int64(fv * mult), nil
+	if mult == 1 && math.Trunc(fv) != fv {
+		return 0, fmt.Errorf("illegal_argument_exception: fractional bytes cannot be represented: [%s]", s)
+	}
+	scaled := fv * mult
+	if math.IsNaN(scaled) || math.IsInf(scaled, 0) || scaled < 0 || (fv > 0 && scaled < 1) || scaled >= math.Ldexp(1, 63) {
+		return 0, fmt.Errorf("illegal_argument_exception: unable to convert [%s] to bytes", s)
+	}
+	return int64(scaled), nil
 }
 
 func splitIngestKVPairs(s, fieldSplit string) ([]string, error) {
@@ -3900,6 +3968,13 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					}
 				}
 				expandedVal := expandIngestTemplate(val, doc)
+				if mt, ok := specMap["media_type"].(string); ok && strings.TrimSpace(mt) != "" {
+					decodedVal, err := decodeIngestSetMediaTypeValueRound59(expandedVal, mt)
+					if err != nil {
+						return false, false, procType, procTag, specMap, err
+					}
+					expandedVal = decodedVal
+				}
 				if ignoreEmpty && isEmptyIngestSetValue(expandedVal) {
 					return false, false, procType, procTag, specMap, nil
 				}
@@ -3931,12 +4006,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				}
 				return false, false, procType, procTag, specMap, nil
 			}
-			if override, hasOverride := specMap["override"].(bool); hasOverride && !override {
+			override, _ := specMap["override"].(bool)
+			if !override {
 				if existing, exOk := getIngestPath(doc, dstField); exOk && existing != nil {
-					return false, false, procType, procTag, specMap, nil
-				}
-				if anc, hasScalarAnc := hasIngestScalarAncestor(doc, dstField); hasScalarAnc && srcField != anc && !strings.HasPrefix(srcField, anc+".") {
-					return false, false, procType, procTag, specMap, nil
+					return false, false, procType, procTag, specMap, fmt.Errorf("illegal_argument_exception: target_field [%s] already exists", dstField)
 				}
 			}
 			if anc, hasScalarAnc := hasIngestScalarAncestor(doc, dstField); hasScalarAnc && srcField != anc && !strings.HasPrefix(srcField, anc+".") && !strings.HasPrefix(dstField, srcField+".") {
@@ -4894,33 +4967,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 		if field != "" {
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				parseByteElem := func(el any) (int64, error) {
-					switch ev := el.(type) {
-					case string:
-						return parseIngestByteSize(ev)
-					case int:
-						return int64(ev), nil
-					case int64:
-						return ev, nil
-					case float64:
-						return int64(ev), nil
-					case json.Number:
-						if iv, err := ev.Int64(); err == nil {
-							return iv, nil
-						}
-						if fv, err := ev.Float64(); err == nil {
-							return int64(fv), nil
-						}
-						return parseIngestByteSize(ev.String())
-					default:
-						return 0, fmt.Errorf("field [%s] is not a string", field)
-					}
-				}
 				switch v := val.(type) {
 				case []any:
 					outArr := make([]any, len(v))
 					for idx, el := range v {
-						bVal, err := parseByteElem(el)
+						bVal, err := parseStrictIngestBytesElementRound59(field, el)
 						if err != nil {
 							return false, false, procType, procTag, specMap, err
 						}
@@ -4929,7 +4980,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					setIngestPath(doc, target, outArr)
 					mutated = true
 				default:
-					bVal, err := parseByteElem(v)
+					bVal, err := parseStrictIngestBytesElementRound59(field, v)
 					if err != nil {
 						return false, false, procType, procTag, specMap, err
 					}
@@ -5013,9 +5064,19 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		if tzName != "" {
 			tzName = fmt.Sprintf("%v", expandIngestTemplate(tzName, doc))
 		}
+		rawLocale, _ := specMap["locale"].(string)
+		if rawLocale != "" {
+			rawLocale = fmt.Sprintf("%v", expandIngestTemplate(rawLocale, doc))
+		}
 		outFmt, _ := specMap["output_format"].(string)
+		if outFmt != "" {
+			outFmt = fmt.Sprintf("%v", expandIngestTemplate(outFmt, doc))
+			if err := validateESDateFormatPatternRound59(outFmt); err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
+		}
 		formatOneDate := func(rawVal any) (string, error) {
-			parsedTime, err := parseIngestDateValue(formatIngestDateInput(rawVal), formats, tzName)
+			parsedTime, lang, err := parseIngestDateValueWithLocaleRound59(formatIngestDateInput(rawVal), formats, tzName, rawLocale)
 			if err != nil {
 				return "", err
 			}
@@ -5027,7 +5088,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				case "UNIX":
 					return strconv.FormatInt(parsedTime.Unix(), 10), nil
 				default:
-					return parsedTime.Format(layouts[0]), nil
+					return localizeFormattedDateOutputRound59(parsedTime.Format(layouts[0]), outFmt, lang, parsedTime), nil
 				}
 			}
 			return parsedTime.Format(time.RFC3339Nano), nil
@@ -5066,7 +5127,12 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 		dateRounding, _ := specMap["date_rounding"].(string)
 		idxFmt, _ := specMap["index_name_format"].(string)
-		if idxFmt == "" {
+		if idxFmt != "" {
+			idxFmt = fmt.Sprintf("%v", expandIngestTemplate(idxFmt, doc))
+			if err := validateESDateFormatPatternRound59(idxFmt); err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
+		} else {
 			idxFmt = "yyyy-MM-dd"
 		}
 		formats, _ := specMap["formats"].([]any)
@@ -5079,6 +5145,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		if tzName != "" {
 			tzName = fmt.Sprintf("%v", expandIngestTemplate(tzName, doc))
 		}
+		rawLocale, _ := specMap["locale"].(string)
+		if rawLocale != "" {
+			rawLocale = fmt.Sprintf("%v", expandIngestTemplate(rawLocale, doc))
+		}
 		if field != "" {
 			field = fmt.Sprintf("%v", expandIngestTemplate(field, doc))
 			if val, exists := getIngestPath(doc, field); exists && val != nil {
@@ -5086,7 +5156,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				if len(effFormats) == 0 && isNumericIngestDateValue(val) {
 					effFormats = []any{"ISO8601", "UNIX_MS", "UNIX"}
 				}
-				parsedTime, err := parseIngestDateValue(formatIngestDateInput(val), effFormats, tzName)
+				parsedTime, lang, err := parseIngestDateValueWithLocaleRound59(formatIngestDateInput(val), effFormats, tzName, rawLocale)
 				if err != nil {
 					return false, false, procType, procTag, specMap, err
 				}
@@ -5118,7 +5188,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				case "UNIX":
 					formattedDate = strconv.FormatInt(parsedTime.Unix(), 10)
 				default:
-					formattedDate = parsedTime.Format(layouts[0])
+					formattedDate = localizeFormattedDateOutputRound59(parsedTime.Format(layouts[0]), idxFmt, lang, parsedTime)
 				}
 				target := "_index"
 				if tf, _ := specMap["target_field"].(string); tf != "" {
@@ -5134,17 +5204,9 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		field, _ := specMap["field"].(string)
 		field = expandIngestFieldName(field, doc)
 		patterns, _ := specMap["patterns"].([]any)
-		customDefs, _ := specMap["pattern_definitions"].(map[string]any)
-		ecsCompat, _ := specMap["ecs_compatibility"].(string)
-		if ecsCompat == "v1" {
-			mergedDefs := make(map[string]any, len(ecsGrokPatterns)+len(customDefs))
-			for k, v := range ecsGrokPatterns {
-				mergedDefs[k] = v
-			}
-			for k, v := range customDefs {
-				mergedDefs[k] = v
-			}
-			customDefs = mergedDefs
+		customDefs, defsErr := buildEffectiveGrokDefs("grok", specMap)
+		if defsErr != nil {
+			return false, false, procType, procTag, specMap, defsErr
 		}
 		keepEmptyCaptures, _ := specMap["keep_empty_captures"].(bool)
 		targetField, _ := specMap["target_field"].(string)
@@ -5469,7 +5531,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			target = expandIngestFieldName(tf, doc)
 		}
 		patterns, _ := specMap["patterns"].([]any)
-		customDefs, _ := specMap["pattern_definitions"].(map[string]any)
+		customDefs, defsErr := buildEffectiveGrokDefs("redact", specMap)
+		if defsErr != nil {
+			return false, false, procType, procTag, specMap, defsErr
+		}
 		prefix := "<"
 		if p, ok := specMap["prefix"].(string); ok {
 			prefix = p
@@ -5567,7 +5632,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				default:
 					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] of type [%T] is not supported for redact processor", field, val)
 				}
-			} else if isExplicitIgnoreMissingFalse(specMap) {
+			} else if ignoreMissing, _ := specMap["ignore_missing"].(bool); !ignoreMissing {
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
 		}
@@ -9249,8 +9314,22 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
+	explainVal, _, err := parseStrictQueryBoolParamRound59(r, "explain")
+	if err != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+		return
+	}
+	rewriteVal, _, err := parseStrictQueryBoolParamRound59(r, "rewrite")
+	if err != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+		return
+	}
+	if _, _, err := parseStrictQueryBoolParamRound59(r, "all_shards"); err != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+		return
+	}
 	rawIndex := strings.TrimSpace(r.PathValue("index"))
-	wantsExplain := r.URL.Query().Get("explain") == "true" || r.URL.Query().Has("explain") || r.URL.Query().Get("rewrite") == "true"
+	wantsExplain := explainVal || rewriteVal
 	writeInvalidResp := func(errMsg string, targetList []string) {
 		nShards := len(targetList)
 		if nShards == 0 {
@@ -9376,7 +9455,7 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 		"valid":   true,
 		"_shards": map[string]any{"total": len(targets), "successful": len(targets), "failed": 0},
 	}
-	if r.URL.Query().Get("explain") == "true" || r.URL.Query().Has("explain") || r.URL.Query().Get("rewrite") == "true" {
+	if wantsExplain {
 		resp["explanations"] = explanations
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -9556,7 +9635,12 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	dryRun := strings.EqualFold(r.URL.Query().Get("dry_run"), "true") || (req.DryRun != nil && *req.DryRun)
+	dryRunQuery, hasDryRunQuery, dryErr := parseStrictQueryBoolParamRound59(r, "dry_run")
+	if dryErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", dryErr.Error())
+		return
+	}
+	dryRun := (hasDryRunQuery && dryRunQuery) || (req.DryRun != nil && *req.DryRun)
 	alias := strings.TrimSpace(r.PathValue("alias"))
 	newIdx := strings.TrimSpace(r.PathValue("new_index"))
 	if alias == "" {
@@ -9571,6 +9655,10 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_ = s.syncCatalogFromBackend(r.Context())
+	if _, _, settingsErr := s.validateIndexCreateOrResizeSettingsRound59(req.Settings); settingsErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", settingsErr.Error())
+		return
+	}
 	s.mu.RLock()
 	_, isConcreteIndex := s.indices[alias]
 	_, newIdxExists := s.indices[newIdx]
@@ -9648,6 +9736,13 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	_, autoNewExists := s.indices[newIdx]
 	newAliasCollision := len(s.aliases[newIdx]) > 0 || s.dataStreams[newIdx] != nil
+	var badExtraAlias string
+	for extraAlias := range req.Aliases {
+		if extraAlias == newIdx || s.indices[extraAlias] != nil || s.dataStreams[extraAlias] != nil {
+			badExtraAlias = extraAlias
+			break
+		}
+	}
 	s.mu.RUnlock()
 	if autoNewExists {
 		writeESError(w, http.StatusBadRequest, "resource_already_exists_exception",
@@ -9659,62 +9754,30 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("Invalid index name [%s], already exists as alias", newIdx))
 		return
 	}
+	if badExtraAlias != "" {
+		writeESError(w, http.StatusBadRequest, "invalid_alias_name_exception",
+			fmt.Sprintf("Invalid alias name [%s], an index or data stream exists with the same name as the alias", badExtraAlias))
+		return
+	}
 
-	condResults := make(map[string]bool)
-	shouldRollover := true
-	if len(req.Conditions) > 0 {
-		anyMet := false
-		if rawMD, hasMD := req.Conditions["max_docs"]; hasMD {
-			maxDocs, _ := toInt64(rawMD)
-			var docCount int64
-			zero := 0
-			if resp, _, errType, _ := s.executeSearchRequest(r.Context(), oldIdx, &esast.SearchRequest{Size: &zero, TrackTotalHits: true}); errType == "" {
-				if hitsObj, ok := resp["hits"].(map[string]any); ok {
-					if totalObj, ok := hitsObj["total"].(map[string]any); ok {
-						docCount, _ = toInt64(totalObj["value"])
-					}
-				}
-			}
-			met := docCount >= maxDocs
-			condResults[fmt.Sprintf("[max_docs: %d]", maxDocs)] = met
-			if met {
-				anyMet = true
-			}
-		}
-		if rawMA, hasMA := req.Conditions["max_age"]; hasMA {
-			ageStr := strings.TrimSpace(fmt.Sprintf("%v", rawMA))
-			met := strings.HasPrefix(ageStr, "0")
-			condResults[fmt.Sprintf("[max_age: %s]", ageStr)] = met
-			if met {
-				anyMet = true
-			}
-		}
-		if rawMS, hasMS := req.Conditions["max_size"]; hasMS {
-			sizeStr := strings.TrimSpace(fmt.Sprintf("%v", rawMS))
-			met := strings.HasPrefix(sizeStr, "0")
-			condResults[fmt.Sprintf("[max_size: %s]", sizeStr)] = met
-			if met {
-				anyMet = true
-			}
-		}
-		if rawMPSS, hasMPSS := req.Conditions["max_primary_shard_size"]; hasMPSS {
-			sizeStr := strings.TrimSpace(fmt.Sprintf("%v", rawMPSS))
-			met := strings.HasPrefix(sizeStr, "0")
-			condResults[fmt.Sprintf("[max_primary_shard_size: %s]", sizeStr)] = met
-			if met {
-				anyMet = true
-			}
-		}
-		shouldRollover = anyMet
+	condResults, shouldRollover, condErr := s.evaluateRolloverConditionsRound59(r.Context(), oldIdx, req.Conditions)
+	if condErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", condErr.Error())
+		return
 	}
 
 	rolledOver := shouldRollover && !dryRun
 	if rolledOver {
 		var baseMapping *esast.MappingSpec
 		s.mu.RLock()
-		tplMapping, tplDefPipe, hasTplDefPipe, tplFinPipe, hasTplFinPipe, tplAliases := s.matchingTemplateConfigLocked(newIdx)
+		tplMapping, tplDefPipe, hasTplDefPipe, tplFinPipe, hasTplFinPipe, tplAliases, tplCustomSettings, _ := s.matchingTemplateFullConfigLocked(newIdx)
+		var dsTplCustom map[string]any
 		if isDataStream {
-			dsTplMap, dsDefPipe, hasDSDef, dsFinPipe, hasDSFin, dsAliases := s.matchingTemplateConfigLocked(alias)
+			var dsTplMap *esast.MappingSpec
+			var dsDefPipe, dsFinPipe string
+			var hasDSDef, hasDSFin bool
+			var dsAliases map[string]map[string]any
+			dsTplMap, dsDefPipe, hasDSDef, dsFinPipe, hasDSFin, dsAliases, dsTplCustom, _ = s.matchingTemplateFullConfigLocked(alias)
 			tplMapping = schema.MergeMappingSpecs(dsTplMap, tplMapping)
 			if !hasTplDefPipe && hasDSDef {
 				tplDefPipe, hasTplDefPipe = dsDefPipe, true
@@ -9745,6 +9808,31 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 		var persistedDS map[string]any
 		s.mu.Lock()
 		s.indices[newIdx] = compiled
+		if s.indexCustomSettings == nil {
+			s.indexCustomSettings = make(map[string]map[string]any)
+		}
+		if s.indexCustomSettings[newIdx] == nil {
+			s.indexCustomSettings[newIdx] = make(map[string]any)
+		}
+		for k, v := range dsTplCustom {
+			if k == "default_pipeline" || k == "final_pipeline" || v == nil {
+				continue
+			}
+			s.indexCustomSettings[newIdx][k] = normalizeCustomSettingValue(v)
+		}
+		for k, v := range tplCustomSettings {
+			if k == "default_pipeline" || k == "final_pipeline" || v == nil {
+				continue
+			}
+			s.indexCustomSettings[newIdx][k] = normalizeCustomSettingValue(v)
+		}
+		for k, v := range extractCustomIndexSettings(req.Settings) {
+			if k == "default_pipeline" || k == "final_pipeline" || v == nil {
+				continue
+			}
+			s.indexCustomSettings[newIdx][k] = normalizeCustomSettingValue(v)
+		}
+		s.setFreshIndexCreationDateLocked(newIdx)
 		if hasTplDefPipe && tplDefPipe != "" {
 			s.indexDefaultPipelines[newIdx] = tplDefPipe
 		}
@@ -9962,8 +10050,18 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(sb.String()))
 }
 
-// handleTermsEnum implements `POST /{index}/_terms_enum` for Kibana / Grafana autocomplete.
+// handleTermsEnum implements `GET/POST /{index}/_terms_enum` for Kibana / Grafana autocomplete.
 func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodPost {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	if r != nil && r.URL != nil && r.URL.Query().Has("timeout") {
+		if _, err := parseESDurationMillisRound59(r.URL.Query().Get("timeout")); err != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+			return
+		}
+	}
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
 		return
@@ -9990,6 +10088,17 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if rawTO, hasTO := rawMap["timeout"]; hasTO && rawTO != nil {
+			toStr, okS := rawTO.(string)
+			if !okS {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[timeout] must be a duration string")
+				return
+			}
+			if _, err := parseESDurationMillisRound59(toStr); err != nil {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+				return
+			}
+		}
 		if rawSize, hasSize := rawMap["size"]; hasSize {
 			if sz, ok := toInt64(rawSize); !ok || sz <= 0 {
 				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "size must be greater than 0")
@@ -10006,8 +10115,10 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rawIndex := strings.TrimSpace(r.PathValue("index"))
+	var targets []string
 	if rawIndex != "" {
-		targets, _, ok := s.resolveValidatedReadTargets(w, r, rawIndex)
+		var ok bool
+		targets, _, ok = s.resolveValidatedReadTargets(w, r, rawIndex)
 		if !ok {
 			return
 		}
@@ -10027,6 +10138,8 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		s.mu.RUnlock()
+	} else {
+		targets = s.resolveTargetIndices("")
 	}
 	limit := req.Size
 	if limit <= 0 {
@@ -10127,8 +10240,9 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	numShards := len(targets)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"_shards":  map[string]any{"total": 1, "successful": 1, "skipped": 0, "failed": 0},
+		"_shards":  map[string]any{"total": numShards, "successful": numShards, "skipped": 0, "failed": 0},
 		"terms":    termsOut,
 		"complete": complete,
 	})
@@ -10911,9 +11025,15 @@ func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
 			return
 		}
+		if r.Method == http.MethodHead {
+			ensureESCompatHeaders(w, r)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"executing_policies": []any{},
 			"coordinator_stats":  []any{},
+			"cache_stats":        []any{},
 		})
 		return
 	}
@@ -10931,7 +11051,7 @@ func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		pIdx, _, _, _, pQuery := extractEnrichPolicyMeta(pol)
-		var snapshotDocs []map[string]any
+		snapshotDocs := make([]map[string]any, 0)
 		for _, idxPat := range pIdx {
 			for _, targetIdx := range s.resolveTargetIndices(idxPat) {
 				scanLimit := 10000
@@ -10970,12 +11090,17 @@ func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		var persistedPol map[string]any
 		s.mu.Lock()
 		if curPol := s.enrichPolicies[name]; curPol != nil {
 			curPol["__snapshot_docs"] = snapshotDocs
 			curPol["__executed"] = true
+			persistedPol = deepCloneDocMap(curPol)
 		}
 		s.mu.Unlock()
+		if persistedPol != nil {
+			s.persistEnrichPolicy(r.Context(), name, persistedPol)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status": map[string]any{"phase": "COMPLETE"},
 		})
@@ -11035,6 +11160,19 @@ func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusBadRequest, "parse_exception", "enrich policy must specify one of [match, geo_match, range]")
 			return
 		}
+		if matchedType == "geo_match" {
+			if rawSR, hasSR := innerMap["shape_relation"]; hasSR && rawSR != nil {
+				srStr, okS := rawSR.(string)
+				if !okS {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[shape_relation] must be a string")
+					return
+				}
+				if err := validateEnrichShapeRelationRound59(srStr); err != nil {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+					return
+				}
+			}
+		}
 		pIdx, pMF, pEF, _, _ := extractEnrichPolicyMeta(map[string]any{matchedType: innerMap})
 		if len(pIdx) == 0 {
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[indices] must not be empty")
@@ -11065,13 +11203,65 @@ func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
 		s.persistEnrichPolicy(r.Context(), name, stored)
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 
+	case http.MethodHead:
+		ensureESCompatHeaders(w, r)
+		s.mu.RLock()
+		if name == "" || name == "*" || name == "_all" {
+			found := len(s.enrichPolicies) > 0 || name == ""
+			s.mu.RUnlock()
+			if found {
+				w.WriteHeader(http.StatusOK)
+			} else {
+				w.WriteHeader(http.StatusNotFound)
+			}
+			return
+		}
+		patterns := strings.Split(name, ",")
+		for _, pat := range patterns {
+			pat = strings.TrimSpace(pat)
+			if pat == "" {
+				continue
+			}
+			if !strings.ContainsAny(pat, "*?") && pat != "_all" {
+				if _, ok := s.enrichPolicies[pat]; !ok {
+					s.mu.RUnlock()
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+			}
+		}
+		anyMatched := false
+		for k := range s.enrichPolicies {
+			for _, pat := range patterns {
+				pat = strings.TrimSpace(pat)
+				if pat == "*" || pat == "_all" || (pat != "" && matchWildcardPattern(pat, k)) {
+					anyMatched = true
+					break
+				}
+			}
+			if anyMatched {
+				break
+			}
+		}
+		s.mu.RUnlock()
+		if anyMatched {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+		}
+
 	case http.MethodGet:
 		s.mu.RLock()
-		if name != "" && !strings.ContainsAny(name, "*?,") && name != "_all" {
-			if _, ok := s.enrichPolicies[name]; !ok {
-				s.mu.RUnlock()
-				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "enrich policy ["+name+"] not found")
-				return
+		if name != "" {
+			for _, pat := range strings.Split(name, ",") {
+				pat = strings.TrimSpace(pat)
+				if pat != "" && !strings.ContainsAny(pat, "*?") && pat != "_all" {
+					if _, ok := s.enrichPolicies[pat]; !ok {
+						s.mu.RUnlock()
+						writeESError(w, http.StatusNotFound, "resource_not_found_exception", "enrich policy ["+pat+"] not found")
+						return
+					}
+				}
 			}
 		}
 		names := make([]string, 0, len(s.enrichPolicies))
@@ -11112,15 +11302,40 @@ func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "enrich policy name is required")
 			return
 		}
+		patterns := strings.Split(name, ",")
 		s.mu.Lock()
-		_, existed := s.enrichPolicies[name]
-		delete(s.enrichPolicies, name)
-		s.mu.Unlock()
-		if !existed {
+		for _, pat := range patterns {
+			pat = strings.TrimSpace(pat)
+			if pat != "" && !strings.ContainsAny(pat, "*?") && pat != "_all" {
+				if _, ok := s.enrichPolicies[pat]; !ok {
+					s.mu.Unlock()
+					writeESError(w, http.StatusNotFound, "resource_not_found_exception", "enrich policy ["+pat+"] not found")
+					return
+				}
+			}
+		}
+		var toDelete []string
+		for k := range s.enrichPolicies {
+			for _, pat := range patterns {
+				pat = strings.TrimSpace(pat)
+				if pat == "*" || pat == "_all" || (pat != "" && matchWildcardPattern(pat, k)) {
+					toDelete = append(toDelete, k)
+					break
+				}
+			}
+		}
+		if len(toDelete) == 0 {
+			s.mu.Unlock()
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "enrich policy ["+name+"] not found")
 			return
 		}
-		s.deleteEnrichPolicyCatalog(r.Context(), name)
+		for _, k := range toDelete {
+			delete(s.enrichPolicies, k)
+		}
+		s.mu.Unlock()
+		for _, k := range toDelete {
+			s.deleteEnrichPolicyCatalog(r.Context(), k)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 
 	default:
@@ -11383,6 +11598,15 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 			return false, nil
 		}
 	}
+	if rawSR, hasSR := specMap["shape_relation"]; hasSR && rawSR != nil {
+		srStr, okS := rawSR.(string)
+		if !okS {
+			return false, fmt.Errorf("illegal_argument_exception: [shape_relation] must be a string")
+		}
+		if err := validateEnrichShapeRelationRound59(srStr); err != nil {
+			return false, err
+		}
+	}
 	policyName, _ := specMap["policy_name"].(string)
 	matchField, _ := specMap["match_field"].(string)
 	var policyIndices []string
@@ -11390,6 +11614,8 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 	var policyType string
 	var policyQuery *esast.Query
 	var snapshotDocs []map[string]any
+	var policyExecuted bool
+	var polRef map[string]any
 	hadConfiguredSource := false
 	if s != nil && policyName != "" {
 		s.mu.RLock()
@@ -11402,6 +11628,7 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 			s.mu.RUnlock()
 		}
 		if pol != nil {
+			polRef = pol
 			hadConfiguredSource = true
 			pIdx, pMF, pEF, pType, pQuery := extractEnrichPolicyMeta(pol)
 			policyIndices = pIdx
@@ -11411,11 +11638,10 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 			enrichFields = pEF
 			policyType = pType
 			policyQuery = pQuery
-			if snap, ok := pol["__snapshot_docs"].([]map[string]any); ok {
-				snapshotDocs = snap
-			}
+			snapshotDocs, policyExecuted = extractEnrichSnapshotDocsRound59(pol)
 		}
 	}
+	shapeRel := resolveEnrichShapeRelationRound59(specMap, polRef)
 	if len(enrichFields) == 0 {
 		switch rawEF := specMap["enrich_fields"].(type) {
 		case []any:
@@ -11462,16 +11688,23 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 			if len(matches) >= maxMatches {
 				break
 			}
-			if policyType == "range" {
+			switch policyType {
+			case "range":
 				if enrichDocMatchesRangeValue(srcMap, matchField, val) {
 					matches = append(matches, srcMap)
 				}
-			} else if enrichDocMatchesExactValue(srcMap, matchField, val) {
-				matches = append(matches, srcMap)
+			case "geo_match":
+				if enrichDocMatchesGeoValueRound59(srcMap, matchField, val, shapeRel) {
+					matches = append(matches, srcMap)
+				}
+			default:
+				if enrichDocMatchesExactValue(srcMap, matchField, val) {
+					matches = append(matches, srcMap)
+				}
 			}
 		}
 	}
-	if len(matches) == 0 && s != nil && (policyName != "" || len(policyIndices) > 0) {
+	if len(matches) == 0 && !policyExecuted && s != nil && (policyName != "" || len(policyIndices) > 0) {
 		candIndices := append([]string(nil), policyIndices...)
 		if srcIdx, _ := specMap["source_index"].(string); srcIdx != "" {
 			candIndices = append(candIndices, srcIdx)
@@ -11490,7 +11723,7 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 				continue
 			}
 			hadConfiguredSource = true
-			if policyType == "range" {
+			if policyType == "range" || policyType == "geo_match" {
 				scanLimit := 1000
 				resp, _, errType, _ := s.executeSearchRequest(context.Background(), cIdx, &esast.SearchRequest{
 					Query: policyQuery,
@@ -11498,7 +11731,7 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 				})
 				if errType == "" {
 					if hitsEnv, ok := resp["hits"].(map[string]any); ok {
-						extractRangeHit := func(h map[string]any) {
+						extractScanHit := func(h map[string]any) {
 							if len(matches) >= maxMatches {
 								return
 							}
@@ -11510,19 +11743,26 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 							} else if sm, ok := h["_source"].(map[string]any); ok {
 								srcMap = sm
 							}
-							if srcMap != nil && enrichDocMatchesRangeValue(srcMap, matchField, val) {
+							if srcMap == nil {
+								return
+							}
+							if policyType == "geo_match" {
+								if enrichDocMatchesGeoValueRound59(srcMap, matchField, val, shapeRel) {
+									matches = append(matches, srcMap)
+								}
+							} else if enrichDocMatchesRangeValue(srcMap, matchField, val) {
 								matches = append(matches, srcMap)
 							}
 						}
 						switch hitsList := hitsEnv["hits"].(type) {
 						case []map[string]any:
 							for _, h := range hitsList {
-								extractRangeHit(h)
+								extractScanHit(h)
 							}
 						case []any:
 							for _, item := range hitsList {
 								if h, ok := item.(map[string]any); ok {
-									extractRangeHit(h)
+									extractScanHit(h)
 								}
 							}
 						}
@@ -11660,7 +11900,11 @@ func executeEnrichProcessor(s *Server, doc map[string]any, specMap map[string]an
 // index with the source index's mappings and settings (plus any request overrides)
 // and copying all documents from the source index into the target index.
 func (s *Server) handleResizeOrCloneIndex(w http.ResponseWriter, r *http.Request) {
-	srcIndex := s.resolveIndexName(r.PathValue("index"))
+	if r != nil && r.Method != "" && r.Method != http.MethodPut && r.Method != http.MethodPost {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	rawSrcIndex := strings.TrimSpace(r.PathValue("index"))
 	targetIndex := strings.TrimSpace(r.PathValue("target"))
 	if targetIndex == "" {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "target index name is required")
@@ -11683,8 +11927,16 @@ func (s *Server) handleResizeOrCloneIndex(w http.ResponseWriter, r *http.Request
 	}
 
 	_ = s.syncCatalogFromBackend(r.Context())
+	if s.isDataStream(rawSrcIndex) {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+			fmt.Sprintf("Data stream [%s] cannot be resized or cloned directly", rawSrcIndex))
+		return
+	}
+	srcIndex := s.resolveIndexName(rawSrcIndex)
 	s.mu.RLock()
 	srcSchema := s.indices[srcIndex]
+	srcIsClosed := s.closedIndices[srcIndex]
+	srcShards := s.getIndexShardCountLocked(srcIndex)
 	_, targetExists := s.indices[targetIndex]
 	hasTargetAliasCollision := len(s.aliases[targetIndex]) > 0 || s.dataStreams[targetIndex] != nil
 	var badAliasName string
@@ -11699,7 +11951,11 @@ func (s *Server) handleResizeOrCloneIndex(w http.ResponseWriter, r *http.Request
 	s.mu.RUnlock()
 
 	if srcSchema == nil {
-		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+srcIndex+"]")
+		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawSrcIndex+"]")
+		return
+	}
+	if srcIsClosed {
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", "closed ["+srcIndex+"]")
 		return
 	}
 	if targetExists || srcIndex == targetIndex {
@@ -11714,21 +11970,14 @@ func (s *Server) handleResizeOrCloneIndex(w http.ResponseWriter, r *http.Request
 		writeESError(w, http.StatusBadRequest, "invalid_alias_name_exception", "Invalid alias name ["+badAliasName+"], an index or data stream exists with the same name as the alias")
 		return
 	}
-	if p, found := extractDefaultPipelineFromSettings(req.Settings); found && p != "" && p != "_none" && p != "none" {
-		s.mu.RLock()
-		_, pipeExists := s.pipelines[p]
-		s.mu.RUnlock()
-		if !pipeExists {
-			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("pipeline with id [%s] does not exist", p))
-			return
-		}
+	targetShards, hasTargetShards, settingsErr := s.validateIndexCreateOrResizeSettingsRound59(req.Settings)
+	if settingsErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", settingsErr.Error())
+		return
 	}
-	if fp, found := extractFinalPipelineFromSettings(req.Settings); found && fp != "" && fp != "_none" && fp != "none" {
-		s.mu.RLock()
-		_, pipeExists := s.pipelines[fp]
-		s.mu.RUnlock()
-		if !pipeExists {
-			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("pipeline with id [%s] does not exist", fp))
+	if r != nil && r.URL != nil {
+		if shardErr := validateResizeShardFactorRound59(r.URL.Path, srcShards, targetShards, hasTargetShards); shardErr != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", shardErr.Error())
 			return
 		}
 	}
@@ -11744,6 +11993,7 @@ func (s *Server) handleResizeOrCloneIndex(w http.ResponseWriter, r *http.Request
 	aliasesToPersist := make(map[string][]string)
 	s.mu.Lock()
 	s.indices[targetIndex] = compiled
+	s.copyAndOverlayResizeIndexSettingsLocked(srcIndex, targetIndex, req.Settings)
 	if srcRouting := s.docRouting[srcIndex]; len(srcRouting) > 0 {
 		if s.docRouting == nil {
 			s.docRouting = make(map[string]map[string]string)

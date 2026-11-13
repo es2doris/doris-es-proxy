@@ -936,12 +936,13 @@ func TestRound20_PainlessListMapOperatorsEntrySetAndIngestRenameSplitKvParity(t 
 					"target_field":   "parsed_excl",
 				},
 			},
-			// 3. rename with override: false (should NOT overwrite existing keep_me)
+			// 3. rename with override: false (throws illegal_argument_exception on existing keep_me; ignore_failure preserves keep_me & candidate_val)
 			map[string]any{
 				"rename": map[string]any{
-					"field":        "candidate_val",
-					"target_field": "keep_me",
-					"override":     false,
+					"field":          "candidate_val",
+					"target_field":   "keep_me",
+					"override":       false,
+					"ignore_failure": true,
 				},
 			},
 			// 4. Painless script testing List + scalar, List + List, Map + Map, list.add(idx, val), entrySet(), Elvis ?:

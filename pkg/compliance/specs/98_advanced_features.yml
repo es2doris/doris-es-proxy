@@ -3665,5 +3665,1042 @@
               return crossEq + "|" + refDiff + "|" + optVal + "|" + infOk + "|" + nanOk + "|" + safeNav + "|" + npeCaught + "|" + rxCase + "|" + leapCaught + "|" + dupSetCaught + "|" + immutCaught;
   - match: { result: "false|true|fallback|true|true|null|true|true|true|true|true" }
 
+---
+"Round 59 REST APIs, Runner YAML/Regex/PIT, Multi-Percolate, Lifecycle, Rollover, Resize, Enrich Geo, Snapshot & Ingest":
+  # F0-F1: YAML anchors/aliases/merge keys, open_point_in_time keep_alive validation, is_unset, $body on HEAD, DOTALL regex, and wire strictness (F9)
+  - do:
+      indices.create:
+        index: &r59_base_idx r59_crud_idx
+        body: &r59_base_mapping
+          settings: &r59_base_settings
+            number_of_shards: 4
+            number_of_replicas: 0
+          mappings:
+            properties:
+              title: { type: keyword }
+              count: { type: long }
+
+  - do:
+      indices.exists:
+        index: *r59_base_idx
+  - is_true: $body
+  - is_true: ''
+
+  - do:
+      indices.exists:
+        index: no_such_r59_idx
+  - is_false: $body
+  - is_unset: $body
+
+  - do:
+      catch: bad_request
+      open_point_in_time:
+        index: *r59_base_idx
+
+  - do:
+      open_point_in_time:
+        index: *r59_base_idx
+        keep_alive: 1m
+  - is_true: id
+
+  - do:
+      catch: bad_request
+      info:
+        pretty: bogus
+
+  - do:
+      catch: request
+      headers:
+        Content-Type: text/plain
+      search:
+        index: *r59_base_idx
+        body:
+          query:
+            match_all: {}
+
+  # F2: Missing-index 404 on single-doc GET/_source/DELETE, invalid op_type 400, and _update get.fields extraction
+  - do:
+      catch: missing
+      get:
+        index: no_such_r59_idx
+        id: "1"
+
+  - do:
+      catch: missing
+      get_source:
+        index: no_such_r59_idx
+        id: "1"
+
+  - do:
+      catch: missing
+      delete:
+        index: no_such_r59_idx
+        id: "1"
+
+  - do:
+      catch: bad_request
+      index:
+        index: *r59_base_idx
+        id: "1"
+        op_type: bogus
+        body:
+          title: "x"
+
+  - do:
+      index:
+        index: *r59_base_idx
+        id: "1"
+        refresh: true
+        body:
+          title: "initial"
+          count: 5
+
+  - do:
+      update:
+        index: *r59_base_idx
+        id: "1"
+        refresh: true
+        body:
+          doc:
+            title: "updated_title"
+            count: 42
+          _source: true
+          fields:
+            - "title"
+            - { field: "count" }
+  - match: { get.fields.title.0: "updated_title" }
+  - match: { get.fields.count.0: 42 }
+  - is_unset: get.fields.non_existent
+
+  # F9: _validate/query?explain=false omits explanations + _terms_enum multi-index _shards & timeout validation
+  - do:
+      indices.validate_query:
+        index: *r59_base_idx
+        explain: false
+        body:
+          query:
+            term:
+              title: "updated_title"
+  - is_true: valid
+  - is_unset: explanations
+
+  - do:
+      indices.create:
+        index: r59_crud_idx_2
+        body:
+          <<: *r59_base_mapping
+          settings:
+            <<: *r59_base_settings
+            number_of_shards: 2
+
+  - do:
+      index:
+        index: r59_crud_idx_2
+        id: "2"
+        refresh: true
+        body:
+          title: "updated_two"
+          count: 10
+
+  - do:
+      catch: bad_request
+      terms_enum:
+        index: *r59_base_idx
+        timeout: bogus
+        body:
+          field: "title"
+
+  - do:
+      terms_enum:
+        index: "r59_crud_idx,r59_crud_idx_2"
+        timeout: 5s
+        body:
+          field: "title"
+          string: "upd"
+  - match: { _shards.total: 2 }
+  - match: { _shards.successful: 2 }
+
+  # F3: Multi-Percolate API (/_mpercolate & /{index}/_mpercolate) with percolate, count, stored-doc lookup & error isolation
+  - do:
+      indices.create:
+        index: r59_perc_idx
+        body:
+          mappings:
+            properties:
+              query: { type: percolator }
+              message: { type: text }
+              env: { type: keyword }
+
+  - do:
+      index:
+        index: r59_perc_idx
+        id: "q1"
+        refresh: true
+        body:
+          env: "prod"
+          query:
+            match:
+              message: "fox"
+
+  - do:
+      indices.create:
+        index: r59_perc_docs
+        body:
+          mappings:
+            properties:
+              message: { type: text }
+
+  - do:
+      index:
+        index: r59_perc_docs
+        id: "d1"
+        refresh: true
+        body:
+          message: "quick brown fox"
+
+  - do:
+      mpercolate:
+        index: r59_perc_idx
+        body:
+          - '{"percolate":{}}'
+          - '{"doc":{"message":"the brown fox"}}'
+          - '{"count":{"index":"r59_perc_idx"}}'
+          - '{"doc":{"message":"quick fox"}}'
+          - '{"percolate":{"index":"r59_perc_idx","percolate_index":"r59_perc_docs","id":"d1"}}'
+          - '{"query":{"term":{"env":"prod"}}}'
+          - '{"percolate":{"index":"no_such_perc_r59"}}'
+          - '{"doc":{"message":"fox"}}'
+          - '{"percolate":{"index":"r59_perc_idx"}}'
+          - '{}'
+  - match: { responses.0.status: 200 }
+  - match: { responses.0.hits.total.value: 1 }
+  - match: { responses.1.status: 200 }
+  - length: { responses.1.hits.hits: 0 }
+  - match: { responses.1.hits.total.value: 1 }
+  - match: { responses.2.status: 200 }
+  - match: { responses.2.hits.total.value: 1 }
+  - match: { responses.3.status: 404 }
+  - match: { responses.4.status: 400 }
+
+  # F4: Open/Close lifecycle guards on _stats/_refresh + wildcard _open default expand_wildcards=open,closed
+  - do:
+      indices.create:
+        index: r59_lc_001
+
+  - do:
+      indices.close:
+        index: r59_lc_001
+  - is_true: acknowledged
+
+  - do:
+      catch: bad_request
+      indices.stats:
+        index: r59_lc_001
+
+  - do:
+      catch: bad_request
+      indices.refresh:
+        index: r59_lc_001
+
+  - do:
+      indices.open:
+        index: "r59_lc_*"
+  - is_true: acknowledged
+  - is_true: shook_acknowledged
+
+  - do:
+      indices.stats:
+        index: r59_lc_001
+  - match: { _shards.failed: 0 }
+
+  # F5: _rollover min_*/max_* condition engine, dry_run, real creation_date & settings propagation
+  - do:
+      indices.create:
+        index: r59-roll-000001
+        body:
+          settings:
+            number_of_shards: 2
+          aliases:
+            r59_roll_alias:
+              is_write_index: true
+          mappings:
+            properties:
+              msg: { type: keyword }
+
+  - do:
+      index:
+        index: r59-roll-000001
+        id: "1"
+        refresh: true
+        body:
+          msg: "hello_rollover_one"
+
+  - do:
+      index:
+        index: r59-roll-000001
+        id: "2"
+        refresh: true
+        body:
+          msg: "hello_rollover_two"
+
+  - do:
+      indices.rollover:
+        alias: r59_roll_alias
+        body:
+          conditions:
+            max_docs: 2
+            min_docs: 5
+  - is_false: rolled_over
+
+  - do:
+      indices.rollover:
+        alias: r59_roll_alias
+        dry_run: true
+        body:
+          conditions:
+            max_primary_shard_docs: 1
+            min_docs: 2
+  - is_false: rolled_over
+  - is_true: dry_run
+
+  - do:
+      indices.rollover:
+        alias: r59_roll_alias
+        body:
+          conditions:
+            max_primary_shard_docs: 1
+            min_docs: 2
+          settings:
+            index.number_of_replicas: 1
+  - is_true: rolled_over
+  - match: { new_index: "r59-roll-000002" }
+
+  - do:
+      indices.get_settings:
+        index: r59-roll-000002
+        prefix: "index.number_of_*"
+  - match: { r59-roll-000002.settings.index.number_of_replicas: "1" }
+
+  - do:
+      indices.delete:
+        index: r59-roll-000002
+
+  # F6: _split / _shrink shard-factor validation & settings/version copy
+  - do:
+      catch: bad_request
+      indices.split:
+        index: *r59_base_idx
+        target: r59_bad_split
+        body:
+          settings:
+            index.number_of_shards: 6
+
+  - do:
+      catch: bad_request
+      indices.shrink:
+        index: *r59_base_idx
+        target: r59_bad_shrink
+        body:
+          settings:
+            index.number_of_shards: 3
+
+  - do:
+      indices.shrink:
+        index: *r59_base_idx
+        target: r59_shrunk_idx
+        body:
+          settings:
+            index.number_of_shards: 2
+            index.number_of_replicas: 0
+  - is_true: acknowledged
+
+  - do:
+      get:
+        index: r59_shrunk_idx
+        id: "1"
+  - is_true: found
+  - match: { _source.title: "updated_title" }
+
+  - do:
+      indices.delete:
+        index: r59_shrunk_idx
+
+  # F7: Enrich snapshot isolation after _execute, spatial geo_match, and /_enrich/_stats cache_stats
+  - do:
+      enrich.stats: {}
+  - match: { cache_stats: [] }
+
+  - do:
+      indices.create:
+        index: r59_geo_zones
+        body:
+          mappings:
+            properties:
+              zone_name: { type: keyword }
+              geom: { type: geo_shape }
+
+  - do:
+      index:
+        index: r59_geo_zones
+        id: "z1"
+        refresh: true
+        body:
+          zone_name: "downtown"
+          geom:
+            type: "Polygon"
+            coordinates:
+              - [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]]
+
+  - do:
+      enrich.put_policy:
+        name: r59_geo_pol
+        body:
+          geo_match:
+            indices: "r59_geo_zones"
+            match_field: "geom"
+            enrich_fields: ["zone_name"]
+
+  - do:
+      enrich.execute_policy:
+        name: r59_geo_pol
+  - match: { status.phase: "COMPLETE" }
+
+  # Post-_execute live write must NOT leak into executed enrich snapshot
+  - do:
+      index:
+        index: r59_geo_zones
+        id: "z2"
+        refresh: true
+        body:
+          zone_name: "post_exec_leak"
+          geom:
+            type: "Polygon"
+            coordinates:
+              - [[40.0, 40.0], [60.0, 40.0], [60.0, 60.0], [40.0, 60.0], [40.0, 40.0]]
+
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - enrich:
+                  policy_name: "r59_geo_pol"
+                  field: "loc"
+                  target_field: "inter_zone"
+              - enrich:
+                  policy_name: "r59_geo_pol"
+                  field: "loc"
+                  target_field: "disjoint_zone"
+                  shape_relation: "disjoint"
+          docs:
+            - _source:
+                loc: "POINT (5 5)"
+            - _source:
+                loc: [50.0, 50.0]
+  - match: { docs.0.doc._source.inter_zone.zone_name: "downtown" }
+  - is_unset: docs.0.doc._source.disjoint_zone
+  - is_unset: docs.1.doc._source.inter_zone
+  - match: { docs.1.doc._source.disjoint_zone.zone_name: "downtown" }
+
+  # F8: Snapshot missing repo type 400, open-index _restore 400, and closed-index drop/recreate/reopen
+  - do:
+      catch: bad_request
+      snapshot.create_repository:
+        repository: r59_bad_repo
+        body:
+          settings:
+            location: "/tmp/r59_bad"
+
+  - do:
+      snapshot.create_repository:
+        repository: r59_snap_repo
+        body:
+          type: "fs"
+          settings:
+            location: "/tmp/r59_snap"
+
+  - do:
+      indices.create:
+        index: r59_snap_idx
+        body:
+          mappings:
+            properties:
+              v: { type: keyword }
+
+  - do:
+      index:
+        index: r59_snap_idx
+        id: "orig"
+        refresh: true
+        body:
+          v: "snapshotted"
+
+  - do:
+      snapshot.create:
+        repository: r59_snap_repo
+        snapshot: snap_r59
+        body:
+          indices: "r59_snap_idx"
+          include_global_state: false
+
+  - do:
+      catch: bad_request
+      snapshot.restore:
+        repository: r59_snap_repo
+        snapshot: snap_r59
+        body:
+          indices: "r59_snap_idx"
+
+  - do:
+      index:
+        index: r59_snap_idx
+        id: "post_snap"
+        refresh: true
+        body:
+          v: "ephemeral"
+
+  - do:
+      indices.close:
+        index: r59_snap_idx
+
+  - do:
+      snapshot.restore:
+        repository: r59_snap_repo
+        snapshot: snap_r59
+        body:
+          indices: "r59_snap_idx"
+  - match: { snapshot.shards.successful: 1 }
+
+  - do:
+      get:
+        index: r59_snap_idx
+        id: "orig"
+  - is_true: found
+
+  - do:
+      catch: missing
+      get:
+        index: r59_snap_idx
+        id: "post_snap"
+
+  # F27-F29: Ingest set (media_type & mutual exclusion), rename (override:false default), grok/redact (IPv6 & ECS v1), date/date_index_name (locales & templated format), and bytes
+  - do:
+      catch: bad_request
+      ingest.put_pipeline:
+        id: r59_bad_pipe
+        body:
+          processors:
+            - set:
+                field: "a"
+                value: 1
+                copy_from: "b"
+
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - set:
+                  field: "json_obj"
+                  value: "{\"n\":{{num}},\"ok\":true}"
+                  media_type: "application/json"
+              - rename:
+                  field: "src_f"
+                  target_field: "existing_f"
+                  on_failure:
+                    - set:
+                        field: "rename_err"
+                        value: "conflict_caught"
+              - rename:
+                  field: "src_f"
+                  target_field: "existing_f"
+                  override: true
+              - grok:
+                  field: "host_line"
+                  patterns: ["%{IPORHOST:h}"]
+              - redact:
+                  field: "secret_line"
+                  ecs_compatibility: "v1"
+                  patterns: ["%{IP:client_ip}"]
+                  prefix: "<"
+                  suffix: ">"
+              - date:
+                  field: "fr_date"
+                  formats: ["EEEE dd MMMM yyyy HH:mm:ss"]
+                  locale: "fr-FR"
+                  timezone: "UTC"
+                  output_format: "{{fmt_out}}"
+                  target_field: "parsed_fr"
+              - date_index_name:
+                  field: "de_date"
+                  date_formats: ["dd. MMMM yyyy"]
+                  locale: "de_DE"
+                  index_name_prefix: "events-"
+                  date_rounding: "M"
+                  index_name_format: "{{idx_fmt}}"
+              - bytes:
+                  field: "good_bytes"
+                  target_field: "parsed_bytes"
+              - bytes:
+                  field: "frac_bytes"
+                  on_failure:
+                    - set:
+                        field: "frac_err"
+                        value: "rejected"
+          docs:
+            - _source:
+                num: 7
+                src_f: "winner"
+                existing_f: "occupied"
+                host_line: "2001:db8::ff00:42:8329"
+                secret_line: "from 203.0.113.9 now"
+                fr_date: "mercredi 15 octobre 2025 14:30:00"
+                fmt_out: "yyyy/MM/dd HH:mm"
+                de_date: "15. Oktober 2025"
+                idx_fmt: "yyyy-MM"
+                good_bytes: "2kb"
+                frac_bytes: "1.5b"
+  - match: { docs.0.doc._source.json_obj.n: 7 }
+  - match: { docs.0.doc._source.rename_err: "conflict_caught" }
+  - match: { docs.0.doc._source.existing_f: "winner" }
+  - match: { docs.0.doc._source.h: "2001:db8::ff00:42:8329" }
+  - match: { docs.0.doc._source.secret_line: "from <client_ip> now" }
+  - match: { docs.0.doc._source.parsed_fr: "2025/10/15 14:30" }
+  - match: { docs.0.doc._index: "events-2025-10" }
+  - match: { docs.0.doc._source.parsed_bytes: 2048 }
+  - match: { docs.0.doc._source.frac_err: "rejected" }
+
+---
+"Round 59 Schema, Shredder, Transpiler (UnsignedLong, SourceFiltering, SemVer, RegexpAutomaton, CalendarDST) & Painless":
+  # F10: unsigned_long > MaxInt64 exact 64-bit terms & composite bucket keys + signed long overflow 400
+  - do:
+      indices.create:
+        index: r59_ul_idx
+        body:
+          mappings:
+            properties:
+              ul: { type: unsigned_long }
+              sl: { type: long }
+
+  - do:
+      catch: bad_request
+      index:
+        index: r59_ul_idx
+        id: "bad_sl"
+        body:
+          sl: 9223372036854775808
+
+  - do:
+      index:
+        index: r59_ul_idx
+        id: "1"
+        refresh: true
+        body:
+          ul: 18446744073709551600
+          sl: 42
+
+  - do:
+      index:
+        index: r59_ul_idx
+        id: "2"
+        refresh: true
+        body:
+          ul: 18446744073709551615
+          sl: 99
+
+  - do:
+      search:
+        index: r59_ul_idx
+        body:
+          size: 0
+          aggs:
+            ul_terms:
+              terms:
+                field: "ul"
+                order: { _key: "asc" }
+            ul_comp:
+              composite:
+                sources:
+                  - u:
+                      terms:
+                        field: "ul"
+  - match: { aggregations.ul_terms.buckets.0.key: 18446744073709551600 }
+  - match: { aggregations.ul_terms.buckets.1.key: 18446744073709551615 }
+  - match: { aggregations.ul_comp.buckets.0.key.u: 18446744073709551600 }
+  - match: { aggregations.ul_comp.buckets.1.key.u: 18446744073709551615 }
+
+  # F11: _source disabled (get_source & update 400, docvalue_fields 200) + _source includes/excludes & GET _mapping root metadata
+  - do:
+      indices.create:
+        index: r59_nosrc_idx
+        body:
+          mappings:
+            _source:
+              enabled: false
+            properties:
+              tag: { type: keyword }
+              cnt: { type: long }
+
+  - do:
+      index:
+        index: r59_nosrc_idx
+        id: "1"
+        refresh: true
+        body:
+          tag: "alpha"
+          cnt: 7
+
+  - do:
+      catch: bad_request
+      get_source:
+        index: r59_nosrc_idx
+        id: "1"
+
+  - do:
+      catch: bad_request
+      update:
+        index: r59_nosrc_idx
+        id: "1"
+        body:
+          doc:
+            cnt: 8
+
+  - do:
+      search:
+        index: r59_nosrc_idx
+        body:
+          docvalue_fields: ["tag", "cnt"]
+  - match: { hits.total.value: 1 }
+  - is_unset: hits.hits.0._source
+
+  - do:
+      indices.create:
+        index: r59_src_meta_idx
+        body:
+          mappings:
+            dynamic: "runtime"
+            _source:
+              includes: ["keep_*"]
+              excludes: ["keep_secret"]
+            _meta:
+              owner: "platform"
+            properties:
+              keep_pub: { type: keyword }
+              keep_secret: { type: keyword }
+              drop_me: { type: keyword }
+
+  - do:
+      indices.get_mapping:
+        index: r59_src_meta_idx
+  - match: { r59_src_meta_idx.mappings.dynamic: "runtime" }
+  - match: { r59_src_meta_idx.mappings._meta.owner: "platform" }
+  - match: { r59_src_meta_idx.mappings._source.includes.0: "keep_*" }
+
+  - do:
+      index:
+        index: r59_src_meta_idx
+        id: "1"
+        refresh: true
+        body:
+          keep_pub: "visible"
+          keep_secret: "hidden"
+          drop_me: "omitted"
+
+  - do:
+      get:
+        index: r59_src_meta_idx
+        id: "1"
+  - match: { _source.keep_pub: "visible" }
+  - is_unset: _source.keep_secret
+  - is_unset: _source.drop_me
+
+  # F12-F14: index.mapping.* limits & coerce:false, constant_keyword auto-adoption, and dense_vector dot_product/bit knn
+  - do:
+      indices.create:
+        index: r59_limits_idx
+        body:
+          settings:
+            index.mapping.depth.limit: 2
+            index.mapping.coerce: false
+          mappings:
+            properties:
+              num: { type: integer }
+
+  - do:
+      catch: bad_request
+      index:
+        index: r59_limits_idx
+        id: "bad_coerce"
+        body:
+          num: "42"
+
+  - do:
+      catch: bad_request
+      index:
+        index: r59_limits_idx
+        id: "bad_depth"
+        body:
+          a:
+            b:
+              c: 1
+
+  - do:
+      indices.create:
+        index: r59_ck_vec_idx
+        body:
+          mappings:
+            properties:
+              env: { type: constant_keyword }
+              dp: { type: dense_vector, dims: 2, similarity: dot_product }
+              bits: { type: dense_vector, dims: 8, element_type: bit }
+
+  - do:
+      index:
+        index: r59_ck_vec_idx
+        id: "1"
+        refresh: true
+        body:
+          dp: [1.0, 0.0]
+          bits: "f0"
+
+  - do:
+      index:
+        index: r59_ck_vec_idx
+        id: "2"
+        refresh: true
+        body:
+          env: "staging"
+          dp: [0.0, 1.0]
+          bits: "0f"
+
+  - do:
+      catch: bad_request
+      index:
+        index: r59_ck_vec_idx
+        id: "bad_ck"
+        body:
+          env: "prod"
+
+  - do:
+      catch: bad_request
+      index:
+        index: r59_ck_vec_idx
+        id: "bad_dp"
+        body:
+          dp: [3.0, 4.0]
+
+  - do:
+      search:
+        index: r59_ck_vec_idx
+        body:
+          query:
+            term:
+              env: "staging"
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "2" }
+
+  - do:
+      search:
+        index: r59_ck_vec_idx
+        body:
+          knn:
+            field: "bits"
+            query_vector: "f0"
+            k: 1
+            num_candidates: 5
+  - match: { hits.hits.0._id: "1" }
+
+  # F15-F19: SemVer 2.0.0 sort, Lucene regexp automaton, max_terms_count & null term 400, negative/reciprocal score, and calendar/DST date_histogram
+  - do:
+      indices.create:
+        index: r59_semver_dh_idx
+        body:
+          settings:
+            index.max_terms_count: 3
+          mappings:
+            properties:
+              ver: { type: version }
+              code: { type: keyword }
+              val: { type: double }
+              ts: { type: date }
+
+  - do:
+      bulk:
+        index: r59_semver_dh_idx
+        refresh: true
+        body:
+          - '{"index":{"_id":"1"}}'
+          - '{"ver":"1.10.0","code":"v9","val":2.0,"ts":"2026-01-15T12:00:00Z"}'
+          - '{"index":{"_id":"2"}}'
+          - '{"ver":"1.2.0","code":"v12","val":4.0,"ts":"2026-02-10T12:00:00Z"}'
+          - '{"index":{"_id":"3"}}'
+          - '{"ver":"1.0.0-alpha","code":"v5","val":8.0,"ts":"2026-03-08T06:30:00Z"}'
+          - '{"index":{"_id":"4"}}'
+          - '{"ver":"1.0.0-alpha.1","code":"v105","val":10.0,"ts":"2026-03-08T07:30:00Z"}'
+          - '{"index":{"_id":"5"}}'
+          - '{"ver":"1.0.0","code":"other","val":5.0,"ts":"2026-03-09T04:30:00Z"}'
+  - is_false: errors
+
+  - do:
+      search:
+        index: r59_semver_dh_idx
+        body:
+          sort:
+            - ver: "asc"
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "4" }
+  - match: { hits.hits.2._id: "5" }
+  - match: { hits.hits.3._id: "2" }
+  - match: { hits.hits.4._id: "1" }
+
+  - do:
+      search:
+        index: r59_semver_dh_idx
+        body:
+          query:
+            regexp:
+              code:
+                value: "v<1-20>&~(v5)"
+                flags: "ALL"
+          sort:
+            - _id: "asc"
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+
+  - do:
+      catch: bad_request
+      search:
+        index: r59_semver_dh_idx
+        body:
+          query:
+            terms:
+              code: ["a", null]
+
+  - do:
+      catch: bad_request
+      search:
+        index: r59_semver_dh_idx
+        body:
+          query:
+            terms:
+              code: ["a", "b", "c", "d"]
+
+  - do:
+      catch: bad_request
+      search:
+        index: r59_semver_dh_idx
+        body:
+          query:
+            script_score:
+              query:
+                match_all: {}
+              script:
+                source: "-1.0"
+
+  - do:
+      search:
+        index: r59_semver_dh_idx
+        body:
+          query:
+            function_score:
+              query:
+                term:
+                  _id: "1"
+              field_value_factor:
+                field: "val"
+                modifier: "reciprocal"
+  - match: { hits.hits.0._score: 0.5 }
+
+  - do:
+      catch: bad_request
+      search:
+        index: r59_semver_dh_idx
+        body:
+          size: 0
+          aggs:
+            dh:
+              date_histogram:
+                field: "ts"
+                calendar_interval: "1d"
+                time_zone: "Invalid/Zone"
+
+  - do:
+      search:
+        index: r59_semver_dh_idx
+        body:
+          size: 0
+          aggs:
+            by_month:
+              date_histogram:
+                field: "ts"
+                calendar_interval: "1M"
+            by_ny_day:
+              date_histogram:
+                field: "ts"
+                calendar_interval: "1d"
+                time_zone: "America/New_York"
+                min_doc_count: 1
+  - length: { aggregations.by_month.buckets: 3 }
+  - match: { aggregations.by_ny_day.buckets.2.key_as_string: "/^2026-03-08/" }
+  - match: { aggregations.by_ny_day.buckets.2.doc_count: 2 }
+  - match: { aggregations.by_ny_day.buckets.3.key_as_string: "/^2026-03-09/" }
+  - match: { aggregations.by_ny_day.buckets.3.doc_count: 1 }
+
+  # F20-F26: Painless right-associative assignments, casts/CCE/NPE, switch(null)/non-coercive/scope, arity overloading, Arrays/List bounds & lazy Streams
+  - do:
+      scripts_painless_execute:
+        body:
+          script:
+            source: |
+              int compute(int a) { return a * 2; }
+              int compute(int a, int b) { return a + b; }
+              int a = 0;
+              int b = 0;
+              int chain = (a = b = 5);
+              int p1 = 2;
+              int p2 = 3;
+              int comp = (p1 += p2 += 4);
+              boolean eqChain = (1 == 1 == true) && (1 != 2 == false) == false;
+              String nullCast = (String) null;
+              boolean cceCaught = false;
+              try {
+                def bad = (List) ['k': 1];
+              } catch (ClassCastException e) {
+                cceCaught = true;
+              }
+              boolean swNpe = false;
+              try {
+                def sel = null;
+                switch (sel) { default: break; }
+              } catch (NullPointerException e) {
+                swNpe = true;
+              }
+              String swExact = switch ("01") {
+                case "1" -> "wrong";
+                case "01" -> "exact";
+                default -> "miss";
+              };
+              int overSum = compute(4) + compute(3, 7);
+              boolean arrRangeCaught = false;
+              try {
+                int[] arr = new int[] { 1, 2, 3 };
+                def sub = Arrays.copyOfRange(arr, 3, 1);
+              } catch (IllegalArgumentException e) {
+                arrRangeCaught = true;
+              }
+              boolean listBoundsCaught = false;
+              try {
+                List l = [10, 20];
+                def badIdx = l.get(-1);
+              } catch (IndexOutOfBoundsException e) {
+                listBoundsCaught = true;
+              }
+              int lazyFirst = [2, 0].stream().map(x -> 10 / x).findFirst().get();
+              long lazyRange = LongStream.range(0L, 1000000000L).limit(4).sum();
+              return chain + "|" + comp + "|" + eqChain + "|" + nullCast + "|" + cceCaught + "|" + swNpe + "|" + swExact + "|" + overSum + "|" + arrRangeCaught + "|" + listBoundsCaught + "|" + lazyFirst + "|" + lazyRange;
+  - match: { result: "5|9|true|null|true|true|exact|18|true|true|5|6" }
+
+
 
 

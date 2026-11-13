@@ -371,7 +371,11 @@ func buildColumnAndIndexDDL(b FieldBinding) (string, string) {
 		return colDef, ""
 
 	case StoragePromotedArray, StorageNestedSubfield:
-		colDef := fmt.Sprintf("`%s` ARRAY<STRING> NULL", b.ColumnName)
+		arrColType := "ARRAY<STRING>"
+		if b.Kind == StoragePromotedArray && (b.DorisType == DorisLargeInt || b.DorisType == DorisLargeIntArray) {
+			arrColType = "ARRAY<LARGEINT>"
+		}
+		colDef := fmt.Sprintf("`%s` %s NULL", b.ColumnName, arrColType)
 		if b.NotIndexed {
 			return colDef, ""
 		}

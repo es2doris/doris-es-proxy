@@ -485,10 +485,10 @@ func TestRound18_RuntimeFunctionScoreBoolBoostAndCollapseInnerHits(t *testing.T)
 		}
 	}`)
 	doJSON(t, srv, http.MethodPost, "/r18_score/_bulk?refresh=true",
-		`{"index":{"_id":"1"}}`+"\n"+`{"group":"g1","tag":"match","x":-0.5}`+"\n"+
+		`{"index":{"_id":"1"}}`+"\n"+`{"group":"g1","tag":"match","x":1.5}`+"\n"+
 			`{"index":{"_id":"2"}}`+"\n"+`{"group":"g1","tag":"match","x":-2.0}`+"\n")
 
-	// 1. field_value_factor with log1p on x = -0.5 -> log10(-0.5 + 1) = log10(0.5) != 0,
+	// 1. field_value_factor with log1p on x = 1.5 -> log10(1.5 + 1) = log10(2.5) > 0,
 	//    top-level weight = 2.0 multiplying the function score, and bool.boost = 1.5
 	res := doJSON(t, srv, http.MethodPost, "/r18_score_alias/_search", `{
 		"query": {
@@ -510,7 +510,7 @@ func TestRound18_RuntimeFunctionScoreBoolBoostAndCollapseInnerHits(t *testing.T)
 				"filter": [
 					{
 						"script": {
-							"script": "def v = doc['x'].value; return v < 0;"
+							"script": "def v = doc['x'].value; return v > 0;"
 						}
 					}
 				]
@@ -529,10 +529,10 @@ func TestRound18_RuntimeFunctionScoreBoolBoostAndCollapseInnerHits(t *testing.T)
 		t.Fatalf("expected 1 hit through alias script filter, got %d", len(hits))
 	}
 	hit0 := hits[0].(map[string]any)
-	wantScore := 1.5 * 2.0 * math.Log10(0.5)
+	wantScore := 1.5 * 2.0 * math.Log10(2.5)
 	gotScore, _ := hit0["_score"].(float64)
 	if math.Abs(gotScore-wantScore) > 1e-4 {
-		t.Fatalf("expected score=%v (2.0 * log10(1 + -0.5)), got %v", wantScore, gotScore)
+		t.Fatalf("expected score=%v (1.5 * 2.0 * log10(1 + 1.5)), got %v", wantScore, gotScore)
 	}
 	// Collapse inner_hits must also enforce the alias runtime script filter (excluding doc 2 where x=-2.0)
 	innerHits := hit0["inner_hits"].(map[string]any)["group_docs"].(map[string]any)["hits"].(map[string]any)["hits"].([]any)

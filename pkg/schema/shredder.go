@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -70,6 +71,9 @@ func ShredDocumentWithNow(
 		return json.Marshal(tombstone)
 	}
 
+	if s == nil {
+		s = &IndexSchema{}
+	}
 	trimmed := bytes.TrimSpace(rawSource)
 	if len(trimmed) == 0 {
 		trimmed = []byte("{}")
@@ -85,32 +89,30 @@ func ShredDocumentWithNow(
 		return nil, fmt.Errorf("invalid document JSON for _id=%q: %w", id, err)
 	}
 	prunedDynamic := false
-	if s != nil {
-		if s.MaxDepth > 0 || s.MaxFieldNameLength > 0 {
-			if err := validateDocumentLimits(parsedDoc, 1, s.MaxDepth, s.MaxFieldNameLength); err != nil {
-				return nil, err
-			}
-		}
-		if s.MaxNestedObjects > 0 && (len(s.NestedRootSpecs) > 0 || len(s.NestedRoots) > 0) {
-			nestedPaths := make(map[string][]string, len(s.NestedRootSpecs)+len(s.NestedRoots))
-			for _, nr := range s.NestedRootSpecs {
-				nestedPaths[nr.Path] = nr.PathParts
-			}
-			for np := range s.NestedRoots {
-				if _, exists := nestedPaths[np]; !exists {
-					nestedPaths[np] = strings.Split(np, ".")
-				}
-			}
-			totalNestedObjs := 0
-			for _, parts := range nestedPaths {
-				totalNestedObjs += len(extractNestedElementMapsWithIDs(parsedDoc, parts, ""))
-			}
-			if totalNestedObjs > s.MaxNestedObjects {
-				return nil, fmt.Errorf("illegal_argument_exception: The number of nested documents has exceeded the allowed limit of [%d]", s.MaxNestedObjects)
-			}
+	if s.MaxDepth > 0 || s.MaxFieldNameLength > 0 {
+		if err := validateDocumentLimits(parsedDoc, 1, s.MaxDepth, s.MaxFieldNameLength); err != nil {
+			return nil, err
 		}
 	}
-	if s != nil && s.RawMapping != nil {
+	if s.MaxNestedObjects > 0 && (len(s.NestedRootSpecs) > 0 || len(s.NestedRoots) > 0) {
+		nestedPaths := make(map[string][]string, len(s.NestedRootSpecs)+len(s.NestedRoots))
+		for _, nr := range s.NestedRootSpecs {
+			nestedPaths[nr.Path] = nr.PathParts
+		}
+		for np := range s.NestedRoots {
+			if _, exists := nestedPaths[np]; !exists {
+				nestedPaths[np] = strings.Split(np, ".")
+			}
+		}
+		totalNestedObjs := 0
+		for _, parts := range nestedPaths {
+			totalNestedObjs += len(extractNestedElementMapsWithIDs(parsedDoc, parts, ""))
+		}
+		if totalNestedObjs > s.MaxNestedObjects {
+			return nil, fmt.Errorf("illegal_argument_exception: The number of nested documents has exceeded the allowed limit of [%d]", s.MaxNestedObjects)
+		}
+	}
+	if s.RawMapping != nil {
 		var err error
 		prunedDynamic, err = validateStrictDynamicObject(parsedDoc, s.RawMapping.Properties, s.RawMapping.Dynamic, s.RawMapping.Subobjects, "")
 		if err != nil {
@@ -122,7 +124,13 @@ func ShredDocumentWithNow(
 	row["_id"] = id
 	row["_version"] = version
 	row["__DORIS_DELETE_SIGN__"] = 0
-	row["_source"] = string(trimmed)
+	if s.SourceDisabled() {
+		row["_source"] = ""
+	} else if inc, exc := s.SourceIncludesExcludes(); len(inc) > 0 || len(exc) > 0 {
+		row["_source"] = string(FilterSourceBytesIncludesExcludes(trimmed, inc, exc))
+	} else {
+		row["_source"] = string(trimmed)
+	}
 
 	getNow := func() time.Time {
 		if now.IsZero() {
@@ -198,7 +206,7 @@ func ShredDocumentWithNow(
 		}
 		sort.Strings(flattenedFieldKeys)
 		for _, k := range flattenedFieldKeys {
-			b := s.Fields[k]
+			b := s.withEffectiveDefaults(s.Fields[k])
 			modified, err := validateAndNormalizeFlattenedFieldInDoc(parsedDoc, b.SourceJSONPath, b, recordIgnored)
 			if err != nil {
 				if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
@@ -222,7 +230,7 @@ func ShredDocumentWithNow(
 		}
 		sort.Strings(sparseFieldKeys)
 		for _, k := range sparseFieldKeys {
-			b := s.Fields[k]
+			b := s.withEffectiveDefaults(s.Fields[k])
 			modified, err := validateAndNormalizeSparseVectorFieldInDoc(parsedDoc, b.SourceJSONPath, b)
 			if err != nil {
 				if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
@@ -246,7 +254,7 @@ func ShredDocumentWithNow(
 		}
 		sort.Strings(histogramFieldKeys)
 		for _, k := range histogramFieldKeys {
-			b := s.Fields[k]
+			b := s.withEffectiveDefaults(s.Fields[k])
 			modified, err := validateAndNormalizeHistogramFieldInDoc(parsedDoc, b.SourceJSONPath, b)
 			if err != nil {
 				if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
@@ -265,6 +273,7 @@ func ShredDocumentWithNow(
 	}
 
 	for _, b := range fieldsToVisit {
+		b = s.withEffectiveDefaults(b)
 		if b.EnabledFalse {
 			continue
 		}
@@ -287,14 +296,20 @@ func ShredDocumentWithNow(
 				return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", b.ESFieldPath, b.ESType)
 			}
 		}
-		if b.ESType == "constant_keyword" && b.ConstantValue != nil {
-			expectedStr := fmt.Sprintf("%v", b.ConstantValue)
-			if b.LowercaseNormalizer {
-				expectedStr = strings.ToLower(expectedStr)
+		if b.ESType == "constant_keyword" {
+			hasConst := b.HasConstantValue || b.ConstantValue != nil
+			expectedStr := ""
+			if hasConst && b.ConstantValue != nil {
+				expectedStr = fmt.Sprintf("%v", b.ConstantValue)
+				if b.LowercaseNormalizer {
+					expectedStr = strings.ToLower(expectedStr)
+				}
 			}
 			rawLeafs := extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
 			var validLeafs []any
 			hadMalformed := hasObjAtPath
+			adoptedStr := ""
+			hasAdopted := false
 			for _, rv := range rawLeafs {
 				if rv == nil {
 					continue
@@ -303,27 +318,45 @@ func ShredDocumentWithNow(
 				if b.LowercaseNormalizer {
 					sv = strings.ToLower(sv)
 				}
-				if sv != expectedStr {
-					if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
-						recordIgnored(b.ESFieldPath)
-						hadMalformed = true
-						continue
+				if hasConst {
+					if sv != expectedStr {
+						if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+							recordIgnored(b.ESFieldPath)
+							hadMalformed = true
+							continue
+						}
+						return nil, fmt.Errorf("mapper_parsing_exception: [constant_keyword] field [%s] only accepts value [%s]", b.ESFieldPath, expectedStr)
 					}
-					return nil, fmt.Errorf("mapper_parsing_exception: [constant_keyword] field [%s] only accepts value [%s]", b.ESFieldPath, expectedStr)
+				} else {
+					if !hasAdopted {
+						adoptedStr = sv
+						hasAdopted = true
+					} else if sv != adoptedStr {
+						if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+							recordIgnored(b.ESFieldPath)
+							hadMalformed = true
+							continue
+						}
+						return nil, fmt.Errorf("mapper_parsing_exception: [constant_keyword] field [%s] only accepts value [%s]", b.ESFieldPath, adoptedStr)
+					}
 				}
 				validLeafs = append(validLeafs, rv)
 			}
-			if !hadMalformed || len(validLeafs) > 0 {
-				if b.Kind == StoragePromotedArray {
-					row[b.ColumnName] = []string{expectedStr}
-				} else if b.Kind == StorageNestedSubfield {
+			storeStr := expectedStr
+			if !hasConst {
+				storeStr = adoptedStr
+			}
+			if b.Kind == StorageNestedSubfield {
+				if (hasConst || hasAdopted) && (!hadMalformed || len(validLeafs) > 0) {
 					if len(extractNestedElementMapsWithIDs(parsedDoc, strings.Split(b.NestedPath, "."), "")) > 0 {
-						row[b.ColumnName] = []string{expectedStr}
+						row[b.ColumnName] = []string{storeStr}
 					}
+				}
+			} else if len(validLeafs) > 0 {
+				if b.Kind == StoragePromotedArray {
+					row[b.ColumnName] = []string{storeStr}
 				} else if b.ColumnName != "" {
-					row[b.ColumnName] = expectedStr
-				} else if b.Kind == StorageDynamicVariant && b.NestedPath == "" && len(b.SourceJSONPath) > 0 && len(rawLeafs) == 0 && !hadMalformed {
-					deferReplacePath(b.SourceJSONPath, []any{expectedStr})
+					row[b.ColumnName] = storeStr
 				}
 			}
 			if hadMalformed && isPrimaryFieldBinding(b) {
@@ -639,9 +672,9 @@ func ShredDocumentWithNow(
 				}
 			}
 		case StoragePromotedVector:
-			vec, present, valid := extractAndValidateVectorValues(parsedDoc, b.SourceJSONPath, b.VectorDims)
+			vec, present, vecErr := extractAndValidateTypedVectorValues(parsedDoc, b.SourceJSONPath, b)
 			if present {
-				if !valid {
+				if vecErr != nil {
 					if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
 						recordIgnored(b.ESFieldPath)
 						if isPrimaryFieldBinding(b) {
@@ -649,25 +682,11 @@ func ShredDocumentWithNow(
 						}
 						continue
 					}
-					return nil, fmt.Errorf("mapper_parsing_exception: failed to parse vector field [%s] of type [%s]", b.ESFieldPath, b.ESType)
+					return nil, vecErr
 				}
-				if (b.ESType == "dense_vector" || b.ESType == "knn_vector") && (b.VectorMetric == "" || strings.EqualFold(b.VectorMetric, "cosine")) {
-					var sumSq float64
-					for _, fv := range vec {
-						sumSq += fv * fv
-					}
-					if sumSq == 0 {
-						if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
-							recordIgnored(b.ESFieldPath)
-							if isPrimaryFieldBinding(b) {
-								deferDeletePath(b.SourceJSONPath)
-							}
-							continue
-						}
-						return nil, fmt.Errorf("mapper_parsing_exception: Zero-magnitude vectors are not supported when using [cosine] similarity on field [%s]", b.ESFieldPath)
-					}
+				if len(vec) > 0 {
+					row[b.ColumnName] = vec
 				}
-				row[b.ColumnName] = vec
 			}
 		}
 	}
@@ -681,7 +700,7 @@ func ShredDocumentWithNow(
 		}
 		sort.Strings(rangeFieldKeys)
 		for _, k := range rangeFieldKeys {
-			b := s.Fields[k]
+			b := s.withEffectiveDefaults(s.Fields[k])
 			modified, err := validateAndNormalizeRangeFieldInDoc(parsedDoc, b.SourceJSONPath, b, getNow)
 			if err != nil {
 				if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
@@ -735,9 +754,6 @@ func ShredDocumentWithNow(
 			} else {
 				vals = extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
 			}
-			if b.ESType == "constant_keyword" && len(vals) == 0 && b.ConstantValue != nil {
-				vals = []any{b.ConstantValue}
-			}
 			if b.IgnoreAbove > 0 && len(vals) > 0 {
 				filtered := make([]any, 0, len(vals))
 				for _, v := range vals {
@@ -786,6 +802,9 @@ func ShredDocumentWithNow(
 						targetField = tb.AliasTarget
 						tb = resolvedTB
 					}
+				}
+				if ok {
+					tb = s.withEffectiveDefaults(tb)
 				}
 				if ok && tb.EnabledFalse {
 					continue
@@ -1048,7 +1067,7 @@ func isTypedNonStringBinding(b FieldBinding) bool {
 		return true
 	}
 	switch b.DorisType {
-	case DorisBigInt, DorisInt, DorisDouble, DorisBoolean:
+	case DorisBigInt, DorisLargeInt, DorisInt, DorisDouble, DorisBoolean:
 		return true
 	}
 	return false
@@ -1265,6 +1284,8 @@ func parseAndFormatGeoPointValue(val any) (formatted string, lat, lon float64, o
 
 func formatCoercedArrayElement(v any) string {
 	switch tv := v.(type) {
+	case uint64:
+		return strconv.FormatUint(tv, 10)
 	case int64:
 		return strconv.FormatInt(tv, 10)
 	case int:
@@ -1549,7 +1570,7 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 	}
 	if b.Coerce != nil && !*b.Coerce {
 		switch effDorisType {
-		case DorisBigInt, DorisInt:
+		case DorisBigInt, DorisLargeInt, DorisInt:
 			if b.ESType != "date" && b.ESType != "date_nanos" {
 				switch v := val.(type) {
 				case string, bool:
@@ -1635,12 +1656,6 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 	}
 	if b.ESType == "unsigned_long" {
 		allowCoerce := b.Coerce == nil || *b.Coerce
-		clampUintToInt64 := func(u uint64) int64 {
-			if u > uint64(math.MaxInt64) {
-				return int64(math.MaxInt64)
-			}
-			return int64(u)
-		}
 		checkFloatUint := func(f float64) any {
 			if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f >= 18446744073709551616.0 {
 				return nil
@@ -1648,29 +1663,26 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 			if !allowCoerce && math.Trunc(f) != f {
 				return nil
 			}
-			if f >= float64(math.MaxInt64) {
-				return int64(math.MaxInt64)
-			}
-			return int64(f)
+			return uint64(f)
 		}
 		switch v := val.(type) {
 		case int64:
 			if v < 0 {
 				return nil
 			}
-			return v
+			return uint64(v)
 		case int:
 			if v < 0 {
 				return nil
 			}
-			return int64(v)
+			return uint64(v)
 		case uint64:
-			return clampUintToInt64(v)
+			return v
 		case float64:
 			return checkFloatUint(v)
 		case json.Number:
 			if u, ok := parseUnsignedLongString(v.String(), allowCoerce); ok {
-				return clampUintToInt64(u)
+				return u
 			}
 			return nil
 		case string:
@@ -1678,7 +1690,7 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 				return nil
 			}
 			if u, ok := parseUnsignedLongString(v, allowCoerce); ok {
-				return clampUintToInt64(u)
+				return u
 			}
 			return nil
 		default:
@@ -1686,6 +1698,7 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 		}
 	}
 	if b.ESType == "long" || b.ESType == "integer" || b.ESType == "short" || b.ESType == "byte" {
+		allowCoerce := b.Coerce == nil || *b.Coerce
 		minBound := int64(math.MinInt64)
 		maxBound := int64(math.MaxInt64)
 		switch b.ESType {
@@ -1708,6 +1721,49 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 			}
 			return f >= float64(minBound) && f <= float64(maxBound)
 		}
+		parseSignedIntString := func(s string) (int64, bool) {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				return 0, false
+			}
+			if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+				return i, checkIntBounds(i)
+			}
+			if !allowCoerce {
+				return 0, false
+			}
+			if !strings.ContainsAny(s, "eE") && strings.Count(s, ".") == 1 {
+				parts := strings.SplitN(s, ".", 2)
+				intPart, fracPart := parts[0], parts[1]
+				if len(fracPart) == 0 {
+					return 0, false
+				}
+				for idx := 0; idx < len(fracPart); idx++ {
+					if fracPart[idx] < '0' || fracPart[idx] > '9' {
+						return 0, false
+					}
+				}
+				switch intPart {
+				case "", "+":
+					intPart = "0"
+				case "-":
+					intPart = "-0"
+				}
+				i, err := strconv.ParseInt(intPart, 10, 64)
+				if err != nil {
+					return 0, false
+				}
+				return i, checkIntBounds(i)
+			}
+			if strings.ContainsAny(s, "eE") {
+				f, ferr := strconv.ParseFloat(s, 64)
+				if ferr != nil || !checkFloatBounds(f) {
+					return 0, false
+				}
+				return int64(f), checkIntBounds(int64(f))
+			}
+			return 0, false
+		}
 		switch v := val.(type) {
 		case int:
 			if !checkIntBounds(int64(v)) {
@@ -1718,7 +1774,7 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 				return nil
 			}
 		case uint64:
-			if b.ESType != "long" && (v > uint64(math.MaxInt64) || !checkIntBounds(int64(v))) {
+			if v > uint64(math.MaxInt64) || !checkIntBounds(int64(v)) {
 				return nil
 			}
 		case float64:
@@ -1726,51 +1782,26 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 				return nil
 			}
 		case json.Number:
-			s := v.String()
-			if i, err := v.Int64(); err == nil {
-				if !checkIntBounds(i) {
-					return nil
-				}
-			} else if b.ESType == "long" {
-				if _, uerr := strconv.ParseUint(s, 10, 64); uerr != nil {
-					if strings.ContainsAny(s, ".eE") {
-						if f, ferr := v.Float64(); ferr != nil || !checkFloatBounds(f) {
-							return nil
-						}
-					} else {
-						return nil
-					}
-				}
-			} else if strings.ContainsAny(s, ".eE") {
-				if f, ferr := v.Float64(); ferr != nil || !checkFloatBounds(f) {
-					return nil
-				}
-			} else {
+			parsed, ok := parseSignedIntString(v.String())
+			if !ok {
 				return nil
 			}
+			if b.ESType == "long" {
+				return parsed
+			}
+			return int(parsed)
 		case string:
-			trimmed := strings.TrimSpace(v)
-			if i, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
-				if !checkIntBounds(i) {
-					return nil
-				}
-			} else if b.ESType == "long" {
-				if _, uerr := strconv.ParseUint(trimmed, 10, 64); uerr != nil {
-					if strings.ContainsAny(trimmed, ".eE") {
-						if f, ferr := strconv.ParseFloat(trimmed, 64); ferr != nil || !checkFloatBounds(f) {
-							return nil
-						}
-					} else {
-						return nil
-					}
-				}
-			} else if strings.ContainsAny(trimmed, ".eE") {
-				if f, ferr := strconv.ParseFloat(trimmed, 64); ferr != nil || !checkFloatBounds(f) {
-					return nil
-				}
-			} else {
+			if !allowCoerce {
 				return nil
 			}
+			parsed, ok := parseSignedIntString(v)
+			if !ok {
+				return nil
+			}
+			if b.ESType == "long" {
+				return parsed
+			}
+			return int(parsed)
 		default:
 			return nil
 		}
@@ -1874,6 +1905,38 @@ func coerceScalarForDoris(val any, dorisType DorisScalarType, lowercase bool, no
 		return nil
 	}
 	switch dorisType {
+	case DorisLargeInt:
+		switch v := val.(type) {
+		case uint64:
+			return v
+		case int64:
+			if v < 0 {
+				return nil
+			}
+			return uint64(v)
+		case int:
+			if v < 0 {
+				return nil
+			}
+			return uint64(v)
+		case float64:
+			if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v >= 18446744073709551616.0 {
+				return nil
+			}
+			return uint64(v)
+		case json.Number:
+			if u, ok := parseUnsignedLongString(v.String(), true); ok {
+				return u
+			}
+			return nil
+		case string:
+			if u, ok := parseUnsignedLongString(v, true); ok {
+				return u
+			}
+			return nil
+		default:
+			return nil
+		}
 	case DorisBigInt:
 		clamp64 := func(f float64) any {
 			if math.IsNaN(f) || math.IsInf(f, 0) {
@@ -3301,6 +3364,7 @@ func propagateCopyToCustomMultiFields(s *IndexSchema, row map[string]any, target
 		if strings.Join(subB.SourceJSONPath, ".") != targetField || subB.ColumnName == "" {
 			continue
 		}
+		subB = s.withEffectiveDefaults(subB)
 		switch subB.Kind {
 		case StoragePromotedArray, StorageNestedSubfield:
 			var cur []string
@@ -3859,6 +3923,297 @@ func docValueHasExplicitFieldPath(val any, segs []string) bool {
 	return false
 }
 
+func parseExactVectorSignedByte(elem any) (int64, bool) {
+	switch v := elem.(type) {
+	case int:
+		return int64(v), v >= -128 && v <= 127
+	case int64:
+		return v, v >= -128 && v <= 127
+	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) || math.Trunc(v) != v || v < -128 || v > 127 {
+			return 0, false
+		}
+		return int64(v), true
+	case json.Number:
+		s := v.String()
+		if !strings.ContainsAny(s, ".eE") {
+			iv, err := v.Int64()
+			return iv, err == nil && iv >= -128 && iv <= 127
+		}
+		f, err := v.Float64()
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || math.Trunc(f) != f || f < -128 || f > 127 {
+			return 0, false
+		}
+		return int64(f), true
+	default:
+		return 0, false
+	}
+}
+
+func extractAndValidateTypedVectorValues(node any, path []string, b FieldBinding) ([]float64, bool, error) {
+	if node == nil {
+		return nil, false, nil
+	}
+	if len(path) == 0 {
+		elemType := strings.ToLower(strings.TrimSpace(b.VectorElementType))
+		if elemType == "" {
+			elemType = "float"
+		}
+		dims := b.VectorDims
+		var out []float64
+		switch elemType {
+		case "bit":
+			if hexStr, isStr := node.(string); isStr {
+				bits, err := esast.ExpandHexBitVector(hexStr)
+				if err != nil {
+					return nil, true, fmt.Errorf("mapper_parsing_exception: failed to parse bit vector field [%s]: %w", b.ESFieldPath, err)
+				}
+				if dims > 0 && len(bits) != dims {
+					return nil, true, fmt.Errorf("mapper_parsing_exception: vector field [%s] expected [%d] bit dimensions, got [%d]", b.ESFieldPath, dims, len(bits))
+				}
+				out = bits
+			} else if arr, isArr := node.([]any); isArr {
+				if len(arr) == 0 {
+					return nil, true, fmt.Errorf("mapper_parsing_exception: failed to parse bit vector field [%s]: empty array", b.ESFieldPath)
+				}
+				if dims > 0 && len(arr)*8 != dims {
+					return nil, true, fmt.Errorf("mapper_parsing_exception: bit vector field [%s] with dims [%d] expects [%d] byte elements, got [%d]", b.ESFieldPath, dims, dims/8, len(arr))
+				}
+				out = make([]float64, 0, len(arr)*8)
+				for _, elem := range arr {
+					iv, ok := parseExactVectorSignedByte(elem)
+					if !ok {
+						return nil, true, fmt.Errorf("mapper_parsing_exception: bit vector field [%s] byte elements must be integers in [-128, 127]", b.ESFieldPath)
+					}
+					ub := uint8(int8(iv)) // #nosec G115 -- validated in [-128, 127] above
+					for bit := 7; bit >= 0; bit-- {
+						if (ub & (1 << uint(bit))) != 0 {
+							out = append(out, 1.0)
+						} else {
+							out = append(out, 0.0)
+						}
+					}
+				}
+			} else {
+				return nil, true, fmt.Errorf("mapper_parsing_exception: failed to parse bit vector field [%s] of type [%s]", b.ESFieldPath, b.ESType)
+			}
+		case "byte":
+			arr, ok := node.([]any)
+			if !ok || len(arr) == 0 {
+				return nil, true, fmt.Errorf("mapper_parsing_exception: failed to parse byte vector field [%s] of type [%s]", b.ESFieldPath, b.ESType)
+			}
+			if dims > 0 && len(arr) != dims {
+				return nil, true, fmt.Errorf("mapper_parsing_exception: vector field [%s] expected [%d] dimensions, got [%d]", b.ESFieldPath, dims, len(arr))
+			}
+			out = make([]float64, 0, len(arr))
+			for _, elem := range arr {
+				iv, okByte := parseExactVectorSignedByte(elem)
+				if !okByte {
+					return nil, true, fmt.Errorf("mapper_parsing_exception: byte vector field [%s] elements must be integers in [-128, 127]", b.ESFieldPath)
+				}
+				out = append(out, float64(iv))
+			}
+		default:
+			vec, present, valid := extractAndValidateVectorValues(node, nil, dims)
+			if !present {
+				return nil, false, nil
+			}
+			if !valid {
+				return nil, true, fmt.Errorf("mapper_parsing_exception: failed to parse vector field [%s] of type [%s]", b.ESFieldPath, b.ESType)
+			}
+			out = vec
+		}
+		if !b.NotIndexed && (b.ESType == "dense_vector" || b.ESType == "knn_vector") {
+			metric := strings.ToLower(strings.TrimSpace(b.VectorMetric))
+			if metric == "" && elemType != "bit" {
+				metric = "cosine"
+			}
+			if metric == "cosine" {
+				var sumSq float64
+				for _, fv := range out {
+					sumSq += fv * fv
+				}
+				if sumSq == 0 {
+					return nil, true, fmt.Errorf("mapper_parsing_exception: Zero-magnitude vectors are not supported when using [cosine] similarity on field [%s]", b.ESFieldPath)
+				}
+			} else if metric == "dot_product" && elemType == "float" {
+				var sumSq float64
+				for _, fv := range out {
+					sumSq += fv * fv
+				}
+				if math.Abs(sumSq-1.0) > 1e-4 {
+					return nil, true, fmt.Errorf("illegal_argument_exception: The [dot_product] similarity can only be used with unit-length vectors on field [%s]", b.ESFieldPath)
+				}
+			}
+		}
+		return out, true, nil
+	}
+	m, ok := node.(map[string]any)
+	if !ok {
+		return nil, false, nil
+	}
+	if next, exists := m[path[0]]; exists {
+		return extractAndValidateTypedVectorValues(next, path[1:], b)
+	}
+	for i := len(path); i > 1; i-- {
+		if next, exists := m[strings.Join(path[:i], ".")]; exists {
+			return extractAndValidateTypedVectorValues(next, path[i:], b)
+		}
+	}
+	return nil, false, nil
+}
+
+// FilterSourceBytesIncludesExcludes filters a JSON document's fields according to Elasticsearch
+// `_source` `includes` and `excludes` wildcard/dot-path patterns.
+func FilterSourceBytesIncludesExcludes(raw []byte, includes, excludes []string) []byte {
+	if len(includes) == 0 && len(excludes) == 0 {
+		return raw
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return raw
+	}
+	var m map[string]any
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.UseNumber()
+	if err := dec.Decode(&m); err != nil || m == nil {
+		return raw
+	}
+	filtered := filterSourceObjectMap(m, "", includes, excludes)
+	if filtered == nil {
+		filtered = map[string]any{}
+	}
+	out, err := json.Marshal(filtered)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+func matchSourceFilterGlob(pattern, candidate string) bool {
+	if pattern == "" {
+		return false
+	}
+	if pattern == "*" || pattern == candidate {
+		return true
+	}
+	reStr := "^" + strings.ReplaceAll(strings.ReplaceAll(regexp.QuoteMeta(pattern), `\*`, ".*"), `\?`, ".") + "$"
+	re, err := regexp.Compile(reStr)
+	if err != nil {
+		return false
+	}
+	return re.MatchString(candidate)
+}
+
+func sourcePathMatchesPatterns(fullPath string, patterns []string) (direct bool, ancestorOrDescendant bool) {
+	for _, p := range patterns {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if matchSourceFilterGlob(p, fullPath) {
+			return true, true
+		}
+		if strings.HasPrefix(fullPath, p+".") || matchSourceFilterGlob(p+".*", fullPath) {
+			return true, true
+		}
+		// Check if fullPath is a parent prefix of pattern p (so we must descend into object)
+		pSegs := strings.Split(p, ".")
+		fSegs := strings.Split(fullPath, ".")
+		if len(fSegs) < len(pSegs) {
+			prefixMatch := true
+			for i := range fSegs {
+				if !matchSourceFilterGlob(pSegs[i], fSegs[i]) {
+					prefixMatch = false
+					break
+				}
+			}
+			if prefixMatch {
+				ancestorOrDescendant = true
+			}
+		}
+	}
+	return false, ancestorOrDescendant
+}
+
+func sourcePathExcluded(fullPath string, excludes []string) bool {
+	for _, p := range excludes {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if matchSourceFilterGlob(p, fullPath) || strings.HasPrefix(fullPath, p+".") || matchSourceFilterGlob(p+".*", fullPath) {
+			return true
+		}
+	}
+	return false
+}
+
+func filterSourceObjectMap(m map[string]any, prefix string, includes, excludes []string) map[string]any {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		fullPath := k
+		if prefix != "" {
+			fullPath = prefix + "." + k
+		}
+		if len(excludes) > 0 && sourcePathExcluded(fullPath, excludes) {
+			continue
+		}
+		if len(includes) > 0 {
+			direct, needDescend := sourcePathMatchesPatterns(fullPath, includes)
+			if !direct && !needDescend {
+				continue
+			}
+			if !direct && needDescend {
+				switch tv := v.(type) {
+				case map[string]any:
+					sub := filterSourceObjectMap(tv, fullPath, includes, excludes)
+					if len(sub) > 0 {
+						out[k] = sub
+					}
+				case []any:
+					var newArr []any
+					for _, elem := range tv {
+						if em, ok := elem.(map[string]any); ok {
+							sub := filterSourceObjectMap(em, fullPath, includes, excludes)
+							if len(sub) > 0 {
+								newArr = append(newArr, sub)
+							}
+						}
+					}
+					if len(newArr) > 0 {
+						out[k] = newArr
+					}
+				}
+				continue
+			}
+		}
+		if len(excludes) > 0 {
+			switch tv := v.(type) {
+			case map[string]any:
+				out[k] = filterSourceObjectMap(tv, fullPath, nil, excludes)
+				continue
+			case []any:
+				newArr := make([]any, 0, len(tv))
+				for _, elem := range tv {
+					if em, ok := elem.(map[string]any); ok {
+						newArr = append(newArr, filterSourceObjectMap(em, fullPath, nil, excludes))
+					} else {
+						newArr = append(newArr, elem)
+					}
+				}
+				out[k] = newArr
+				continue
+			}
+		}
+		out[k] = v
+	}
+	return out
+}
+
 func extractAndValidateVectorValues(node any, path []string, dims int) ([]float64, bool, bool) {
 	if node == nil {
 		return nil, false, true
@@ -3977,11 +4332,15 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 	}
 	cloned := cloneNestedMap(elemMap)
 	expandFlatDottedKeysInMap(cloned)
-	fields := s.OrderedFields
-	if len(fields) == 0 {
+	rawFields := s.OrderedFields
+	if len(rawFields) == 0 {
 		for _, b := range s.Fields {
-			fields = append(fields, b)
+			rawFields = append(rawFields, b)
 		}
+	}
+	fields := make([]FieldBinding, len(rawFields))
+	for i, b := range rawFields {
+		fields[i] = s.withEffectiveDefaults(b)
 	}
 
 	copiedNestedVals := make(map[string][]string)

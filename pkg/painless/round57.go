@@ -97,9 +97,14 @@ func extractExactIntegralPainless(val any, allowCharString bool) (int64, bool) {
 		}
 		return 0, false
 	case string:
-		if allowCharString && utf8.RuneCountInString(tv) == 1 {
-			r, _ := utf8.DecodeRuneInString(tv)
-			return int64(uint16(r)), true // #nosec G115 -- Java 16-bit unsigned char promotion
+		if allowCharString {
+			if u, ok := parseSurrogateCharStringRound59(tv); ok {
+				return int64(u), true
+			}
+			if utf8.RuneCountInString(tv) == 1 {
+				r, _ := utf8.DecodeRuneInString(tv)
+				return int64(uint16(r)), true // #nosec G115 -- Java 16-bit unsigned char promotion
+			}
 		}
 		return 0, false
 	}
@@ -454,8 +459,16 @@ func isLongExprPainless(expr string, val any, params map[string]any) bool {
 		if strings.HasPrefix(fnName, "Integer.") || strings.HasPrefix(fnName, "Short.") || strings.HasPrefix(fnName, "Byte.") || strings.HasPrefix(fnName, "Character.") {
 			return false
 		}
-		if b := getOrInitEvalBudget(params); b != nil && b.userFuncs != nil {
-			if uFn := b.userFuncs[fnName]; uFn != nil {
+		if b := getOrInitEvalBudget(params); b != nil {
+			arity := 0
+			if argStr != "" {
+				arity = len(callArgs)
+			}
+			uFn := lookupUserFuncRound59(b, fnName, arity)
+			if uFn == nil && b.userFuncs != nil && len(b.userFuncOverloads[fnName]) == 0 {
+				uFn = b.userFuncs[fnName]
+			}
+			if uFn != nil {
 				switch uFn.returnType {
 				case "long", "Long":
 					return true
@@ -677,6 +690,9 @@ func extractExactIntOrFloatForNarrowRound57(val any) (iv int64, fv float64, kind
 	case float32:
 		return 0, float64(tv), 'f'
 	case string:
+		if u, ok := parseSurrogateCharStringRound59(tv); ok {
+			return int64(u), 0, 'i'
+		}
 		if utf8.RuneCountInString(tv) == 1 {
 			r, _ := utf8.DecodeRuneInString(tv)
 			return int64(uint16(r)), 0, 'i' // #nosec G115 -- Java 16-bit char code unit
@@ -715,11 +731,14 @@ func evalPrimitiveCastRound57Painless(castType string, innerVal any) (any, bool)
 		iv, fv, kind := extractExactIntOrFloatForNarrowRound57(innerVal)
 		switch kind {
 		case 'i':
-			return string(rune(uint16(iv))), true // #nosec G115 -- JLS §5.1.3 narrowing to 16-bit char
+			return formatJavaCharUnitRound59(uint16(iv)), true // #nosec G115 -- JLS §5.1.3 narrowing to 16-bit char
 		case 'f':
-			return string(rune(uint16(doubleToInt32JLS(fv)))), true // #nosec G115 -- JLS §5.1.3 two-step float->int->char
+			return formatJavaCharUnitRound59(uint16(doubleToInt32JLS(fv))), true // #nosec G115 -- JLS §5.1.3 two-step float->int->char
 		default:
 			if s, ok := innerVal.(string); ok && len(s) > 0 {
+				if u, okS := parseSurrogateCharStringRound59(s); okS {
+					return formatJavaCharUnitRound59(u), true
+				}
 				r, _ := utf8.DecodeRuneInString(s)
 				return string(r), true
 			}

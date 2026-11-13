@@ -813,7 +813,7 @@ func TestRound15_RegexpCaseInsensitiveAndDoris4SearchFunc(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildSearchPlan regexp: %v", err)
 	}
-	if strings.Contains(rePlan.HitsSQL, "MATCH_REGEXP") || !strings.Contains(rePlan.HitsSQL, "REGEXP '(?i)web-[0-9]+'") {
+	if strings.Contains(rePlan.HitsSQL, "MATCH_REGEXP") || !strings.Contains(rePlan.HitsSQL, "REGEXP '(?i)^(?:web-[0-9]+)$'") {
 		t.Fatalf("expected case-insensitive regexp to use REGEXP '(?i)...' instead of MATCH_REGEXP, got %s", rePlan.HitsSQL)
 	}
 

@@ -217,6 +217,16 @@ func runSpecDocument(t *testing.T, client *http.Client, baseURL, fileName string
 	return fileRep
 }
 
+type responseBodyKind uint8
+
+const (
+	bodyKindUnset responseBodyKind = iota
+	bodyKindNone
+	bodyKindEmptyText
+	bodyKindJSONNull
+	bodyKindParsed
+)
+
 type runnerContext struct {
 	client                       *http.Client
 	baseURL                      string
@@ -225,6 +235,7 @@ type runnerContext struct {
 	lastMethod                   string
 	lastBodyRaw                  string
 	lastResponse                 any
+	lastBodyKind                 responseBodyKind
 	lastHeaders                  map[string]any
 	lastWarnings                 []string
 	createdIndices               map[string]bool
@@ -281,6 +292,8 @@ type runnerContext struct {
 	createdSQLCursors            map[string]bool
 	createdSQLAsyncIDs           map[string]bool
 	createdEQLSearches           map[string]bool
+	createdPITs                  map[string]bool
+	createdScrolls               map[string]bool
 	createdCCRFollowers          map[string]bool
 }
 
@@ -341,6 +354,8 @@ func newRunnerContext(client *http.Client, baseURL string) *runnerContext {
 		createdSQLCursors:            make(map[string]bool),
 		createdSQLAsyncIDs:           make(map[string]bool),
 		createdEQLSearches:           make(map[string]bool),
+		createdPITs:                  make(map[string]bool),
+		createdScrolls:               make(map[string]bool),
 		createdCCRFollowers:          make(map[string]bool),
 	}
 }
@@ -459,6 +474,34 @@ func (c *runnerContext) cleanupAll() {
 			_, _, _ = c.rawHTTP(http.MethodDelete, "/_eql/search/"+escapeIDSeg(eqlID), nil, nil, nil)
 		}
 		delete(c.createdEQLSearches, eqlID)
+	}
+	if len(c.createdPITs) > 0 {
+		pits := make([]string, 0, len(c.createdPITs))
+		for pitID := range c.createdPITs {
+			if pitID != "" {
+				pits = append(pits, pitID)
+			}
+			delete(c.createdPITs, pitID)
+		}
+		sort.Strings(pits)
+		for _, pitID := range pits {
+			bodyBytes, _ := json.Marshal(map[string]any{"id": pitID})
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_pit", nil, bodyBytes, nil)
+		}
+	}
+	if len(c.createdScrolls) > 0 {
+		scrolls := make([]string, 0, len(c.createdScrolls))
+		for scrollID := range c.createdScrolls {
+			if scrollID != "" {
+				scrolls = append(scrolls, scrollID)
+			}
+			delete(c.createdScrolls, scrollID)
+		}
+		sort.Strings(scrolls)
+		for _, scrollID := range scrolls {
+			bodyBytes, _ := json.Marshal(map[string]any{"scroll_id": scrollID})
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_search/scroll", nil, bodyBytes, nil)
+		}
 	}
 	for pol := range c.createdSLMPolicies {
 		if pol != "" {
@@ -689,8 +732,10 @@ func (c *runnerContext) execStep(step SpecStep, isTeardown bool) error {
 		return c.execNotContains(step.Value)
 	case "is_true":
 		return c.execIsTrue(step.Value)
-	case "is_false", "is_unset":
+	case "is_false":
 		return c.execIsFalse(step.Value)
+	case "is_unset":
+		return c.execIsUnset(step.Value)
 	case "is_empty":
 		return c.execIsEmpty(step.Value)
 	case "length":
@@ -805,15 +850,15 @@ func (c *runnerContext) execDo(rawVal any, isTeardown bool) error {
 		if catchSpec == "param" || catchSpec == "bad_request" {
 			return nil
 		}
-		if len(catchSpec) >= 2 && strings.HasPrefix(catchSpec, "/") && strings.HasSuffix(catchSpec, "/") {
-			if re, compErr := regexp.Compile(catchSpec[1 : len(catchSpec)-1]); compErr == nil && re.MatchString(err.Error()) {
+		if re, isRegex, compErr := compileComplianceRegex(catchSpec); isRegex {
+			if compErr == nil && re.MatchString(err.Error()) {
 				return nil
 			}
 		}
 		return err
 	}
 
-	status, bodyStr, err := c.rawHTTP(reqSpec.method, reqSpec.path, reqSpec.query, reqSpec.body, headers)
+	status, bodyStr, err := c.rawHTTPWithContentType(reqSpec.method, reqSpec.path, reqSpec.query, reqSpec.body, headers, reqSpec.isNDJSON)
 	if err != nil {
 		return fmt.Errorf("HTTP request %s %s failed: %w", reqSpec.method, reqSpec.path, err)
 	}
@@ -821,7 +866,25 @@ func (c *runnerContext) execDo(rawVal any, isTeardown bool) error {
 	c.lastStatus = status
 	c.lastMethod = reqSpec.method
 	c.lastBodyRaw = bodyStr
-	c.lastResponse = parseResponsePayload(bodyStr)
+	contentType, _ := c.lastHeaders["content-type"].(string)
+	if reqSpec.method == http.MethodHead {
+		c.lastResponse = nil
+		c.lastBodyKind = bodyKindNone
+	} else {
+		parsed, kind := parseResponsePayloadWithContentType(bodyStr, contentType)
+		if kind == bodyKindEmptyText {
+			if status >= 200 && status < 300 && status != http.StatusNoContent {
+				c.lastResponse = ""
+				c.lastBodyKind = bodyKindEmptyText
+			} else {
+				c.lastResponse = nil
+				c.lastBodyKind = bodyKindNone
+			}
+		} else {
+			c.lastResponse = parsed
+			c.lastBodyKind = kind
+		}
+	}
 
 	// Record resources created during this section only on 2xx responses
 	if status >= 200 && status < 300 {
@@ -913,7 +976,13 @@ func parseIgnoreStatuses(v any) map[int]bool {
 }
 
 func (c *runnerContext) verifyCatch(catchSpec, actionName string, status int, bodyStr string, parsed any) error {
+	catchSpec = c.expandStashString(catchSpec)
 	switch catchSpec {
+	case "request":
+		if status < 400 {
+			return fmt.Errorf("action %s expected catch: request (HTTP >= 400), got HTTP %d: %s", actionName, status, bodyStr)
+		}
+		return nil
 	case "missing":
 		if status != http.StatusNotFound {
 			return fmt.Errorf("action %s expected catch: missing (HTTP 404), got HTTP %d: %s", actionName, status, bodyStr)
@@ -998,12 +1067,10 @@ func (c *runnerContext) verifyCatch(catchSpec, actionName string, status int, bo
 		return nil
 	}
 
-	if strings.HasPrefix(catchSpec, "/") && strings.HasSuffix(catchSpec, "/") && len(catchSpec) >= 2 {
-		pattern := catchSpec[1 : len(catchSpec)-1]
+	if re, isRegex, err := compileComplianceRegex(catchSpec); isRegex {
 		if status < 400 {
 			return fmt.Errorf("action %s expected error matching %s (HTTP >= 400), got HTTP %d: %s", actionName, catchSpec, status, bodyStr)
 		}
-		re, err := regexp.Compile(pattern)
 		if err != nil {
 			return fmt.Errorf("invalid catch regex %q: %w", catchSpec, err)
 		}
@@ -1126,7 +1193,10 @@ func validateResponseWarnings(
 
 	usedExpectedRegex := make([]bool, len(actualWarnings))
 	for _, expRegex := range expectedWarningsRegex {
-		re, compErr := regexp.Compile(stripOptionalRegexSlashes(expRegex))
+		re, isRegex, compErr := compileComplianceRegex(expRegex)
+		if !isRegex {
+			re, compErr = regexp.Compile("(?s)" + stripOptionalRegexSlashes(expRegex))
+		}
 		if compErr != nil {
 			return fmt.Errorf("action %s invalid warnings_regex %q: %w", actionName, expRegex, compErr)
 		}
@@ -1154,7 +1224,10 @@ func validateResponseWarnings(
 
 	compiledAllowedRegex := make([]*regexp.Regexp, 0, len(allowedWarningsRegex))
 	for _, allowRegex := range allowedWarningsRegex {
-		re, compErr := regexp.Compile(stripOptionalRegexSlashes(allowRegex))
+		re, isRegex, compErr := compileComplianceRegex(allowRegex)
+		if !isRegex {
+			re, compErr = regexp.Compile("(?s)" + stripOptionalRegexSlashes(allowRegex))
+		}
 		if compErr != nil {
 			return fmt.Errorf("action %s invalid allowed_warnings_regex %q: %w", actionName, allowRegex, compErr)
 		}
@@ -1671,6 +1744,47 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 				c.createdEQLSearches[id] = true
 			}
 		}
+	case "open_point_in_time":
+		if rm, ok := ToNative(resp).(map[string]any); ok {
+			if id := paramString(rm, "id"); id != "" {
+				c.createdPITs[id] = true
+			}
+		}
+	case "close_point_in_time":
+		removePIT := func(id string) {
+			if id == "_all" {
+				clear(c.createdPITs)
+			} else if id != "" {
+				delete(c.createdPITs, id)
+			}
+		}
+		removePIT(paramString(params, "id"))
+		if bodyMap, ok := ToNative(params["body"]).(map[string]any); ok {
+			removePIT(paramString(bodyMap, "id"))
+		}
+	case "search", "scroll":
+		if rm, ok := ToNative(resp).(map[string]any); ok {
+			if sid := paramString(rm, "_scroll_id"); sid != "" {
+				c.createdScrolls[sid] = true
+			}
+		}
+	case "clear_scroll":
+		removeScrollIDs := func(raw any) {
+			for _, item := range extractStringSlice(ToNative(raw)) {
+				for _, part := range strings.Split(item, ",") {
+					sid := strings.TrimSpace(part)
+					if sid == "_all" {
+						clear(c.createdScrolls)
+					} else if sid != "" {
+						delete(c.createdScrolls, sid)
+					}
+				}
+			}
+		}
+		removeScrollIDs(params["scroll_id"])
+		if bodyMap, ok := ToNative(params["body"]).(map[string]any); ok {
+			removeScrollIDs(bodyMap["scroll_id"])
+		}
 	case "ml.put_job":
 		if id := firstNonEmptyParam(params, "job_id", "id"); id != "" {
 			c.createdMLJobs[id] = true
@@ -1762,10 +1876,11 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 }
 
 type httpRequestSpec struct {
-	method string
-	path   string
-	query  url.Values
-	body   []byte
+	method   string
+	path     string
+	query    url.Values
+	body     []byte
+	isNDJSON bool
 }
 
 func (c *runnerContext) buildActionRequest(action string, params map[string]any) (*httpRequestSpec, error) {
@@ -1944,6 +2059,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if fields == "" {
 			return nil, fmt.Errorf("indices.get_field_mapping requires fields parameter")
 		}
+		fields = escapeCommaIDSegs(fields)
 		if idx != "" {
 			reqPath = "/" + idx + "/_mapping/field/" + fields
 		} else {
@@ -1957,6 +2073,8 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			name = paramString(params, "prefix")
 		}
+		delete(remaining, "prefix")
+		name = escapeCommaIDSegs(name)
 		switch {
 		case idx != "" && name != "":
 			reqPath = "/" + idx + "/_settings/" + name
@@ -2116,12 +2234,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("indices.put_index_template requires name parameter")
 		}
-		reqPath = "/_index_template/" + name
+		reqPath = "/_index_template/" + escapeIDSeg(name)
 
 	case "indices.get_index_template":
 		method = http.MethodGet
 		if name := popString("name"); name != "" {
-			reqPath = "/_index_template/" + name
+			reqPath = "/_index_template/" + escapeCommaIDSegs(name)
 		} else {
 			reqPath = "/_index_template"
 		}
@@ -2132,7 +2250,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("indices.delete_index_template requires name parameter")
 		}
-		reqPath = "/_index_template/" + name
+		reqPath = "/_index_template/" + escapeCommaIDSegs(name)
 
 	case "indices.exists_index_template":
 		method = http.MethodHead
@@ -2140,7 +2258,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("indices.exists_index_template requires name parameter")
 		}
-		reqPath = "/_index_template/" + name
+		reqPath = "/_index_template/" + escapeIDSeg(name)
 
 	case "cluster.put_component_template":
 		method = http.MethodPut
@@ -2148,12 +2266,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("cluster.put_component_template requires name parameter")
 		}
-		reqPath = "/_component_template/" + name
+		reqPath = "/_component_template/" + escapeIDSeg(name)
 
 	case "cluster.get_component_template":
 		method = http.MethodGet
 		if name := popString("name"); name != "" {
-			reqPath = "/_component_template/" + name
+			reqPath = "/_component_template/" + escapeCommaIDSegs(name)
 		} else {
 			reqPath = "/_component_template"
 		}
@@ -2164,7 +2282,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("cluster.delete_component_template requires name parameter")
 		}
-		reqPath = "/_component_template/" + name
+		reqPath = "/_component_template/" + escapeCommaIDSegs(name)
 
 	case "cluster.exists_component_template":
 		method = http.MethodHead
@@ -2172,7 +2290,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("cluster.exists_component_template requires name parameter")
 		}
-		reqPath = "/_component_template/" + name
+		reqPath = "/_component_template/" + escapeIDSeg(name)
 
 	case "index":
 		idx := popPath("index")
@@ -2400,9 +2518,6 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			return nil, fmt.Errorf("open_point_in_time requires index parameter")
 		}
 		reqPath = "/" + idx + "/_pit"
-		if _, ok := remaining["keep_alive"]; !ok {
-			remaining["keep_alive"] = "1m"
-		}
 
 	case "close_point_in_time":
 		method = http.MethodDelete
@@ -2616,12 +2731,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("indices.put_template requires name parameter")
 		}
-		reqPath = "/_template/" + name
+		reqPath = "/_template/" + escapeIDSeg(name)
 
 	case "indices.get_template":
 		method = http.MethodGet
 		if name := popString("name"); name != "" {
-			reqPath = "/_template/" + name
+			reqPath = "/_template/" + escapeCommaIDSegs(name)
 		} else {
 			reqPath = "/_template"
 		}
@@ -2632,7 +2747,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("indices.delete_template requires name parameter")
 		}
-		reqPath = "/_template/" + name
+		reqPath = "/_template/" + escapeCommaIDSegs(name)
 
 	case "indices.exists_template":
 		method = http.MethodHead
@@ -2640,7 +2755,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("indices.exists_template requires name parameter")
 		}
-		reqPath = "/_template/" + name
+		reqPath = "/_template/" + escapeIDSeg(name)
 
 	case "indices.clone":
 		method = http.MethodPost
@@ -2683,12 +2798,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if pol == "" {
 			return nil, fmt.Errorf("ilm.put_lifecycle requires policy parameter")
 		}
-		reqPath = "/_ilm/policy/" + pol
+		reqPath = "/_ilm/policy/" + escapeIDSeg(pol)
 
 	case "ilm.get_lifecycle":
 		method = http.MethodGet
 		if pol := popString("policy", "policy_id", "name"); pol != "" {
-			reqPath = "/_ilm/policy/" + pol
+			reqPath = "/_ilm/policy/" + escapeCommaIDSegs(pol)
 		} else {
 			reqPath = "/_ilm/policy"
 		}
@@ -2699,7 +2814,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if pol == "" {
 			return nil, fmt.Errorf("ilm.delete_lifecycle requires policy parameter")
 		}
-		reqPath = "/_ilm/policy/" + pol
+		reqPath = "/_ilm/policy/" + escapeIDSeg(pol)
 
 	case "ilm.explain_lifecycle":
 		method = http.MethodGet
@@ -2751,12 +2866,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("enrich.put_policy requires name parameter")
 		}
-		reqPath = "/_enrich/policy/" + name
+		reqPath = "/_enrich/policy/" + escapeIDSeg(name)
 
 	case "enrich.get_policy":
 		method = http.MethodGet
 		if name := popString("name"); name != "" {
-			reqPath = "/_enrich/policy/" + name
+			reqPath = "/_enrich/policy/" + escapeCommaIDSegs(name)
 		} else {
 			reqPath = "/_enrich/policy"
 		}
@@ -2767,7 +2882,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("enrich.delete_policy requires name parameter")
 		}
-		reqPath = "/_enrich/policy/" + name
+		reqPath = "/_enrich/policy/" + escapeCommaIDSegs(name)
 
 	case "enrich.execute_policy":
 		method = http.MethodPut
@@ -2775,7 +2890,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("enrich.execute_policy requires name parameter")
 		}
-		reqPath = "/_enrich/policy/" + name + "/_execute"
+		reqPath = "/_enrich/policy/" + escapeIDSeg(name) + "/_execute"
 
 	case "enrich.stats":
 		method = http.MethodGet
@@ -3152,12 +3267,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if repo == "" {
 			return nil, fmt.Errorf("%s requires repository parameter", action)
 		}
-		reqPath = "/_snapshot/" + repo
+		reqPath = "/_snapshot/" + escapeIDSeg(repo)
 
 	case "snapshot.get_repository":
 		method = http.MethodGet
 		if repo := popString("repository"); repo != "" {
-			reqPath = "/_snapshot/" + repo
+			reqPath = "/_snapshot/" + escapeCommaIDSegs(repo)
 		} else {
 			reqPath = "/_snapshot"
 		}
@@ -3168,7 +3283,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if repo == "" {
 			return nil, fmt.Errorf("snapshot.delete_repository requires repository parameter")
 		}
-		reqPath = "/_snapshot/" + repo
+		reqPath = "/_snapshot/" + escapeCommaIDSegs(repo)
 
 	case "snapshot.verify_repository":
 		method = http.MethodPost
@@ -3176,7 +3291,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if repo == "" {
 			return nil, fmt.Errorf("snapshot.verify_repository requires repository parameter")
 		}
-		reqPath = "/_snapshot/" + repo + "/_verify"
+		reqPath = "/_snapshot/" + escapeIDSeg(repo) + "/_verify"
 
 	case "snapshot.repository_analyze":
 		method = http.MethodPost
@@ -3184,7 +3299,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if repo == "" {
 			return nil, fmt.Errorf("snapshot.repository_analyze requires repository parameter")
 		}
-		reqPath = "/_snapshot/" + repo + "/_analyze"
+		reqPath = "/_snapshot/" + escapeIDSeg(repo) + "/_analyze"
 
 	case "snapshot.create":
 		method = http.MethodPut
@@ -3193,7 +3308,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if repo == "" || snap == "" {
 			return nil, fmt.Errorf("snapshot.create requires repository and snapshot parameters")
 		}
-		reqPath = "/_snapshot/" + repo + "/" + snap
+		reqPath = "/_snapshot/" + escapeIDSeg(repo) + "/" + escapeIDSeg(snap)
 
 	case "snapshot.get":
 		method = http.MethodGet
@@ -3202,7 +3317,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if repo == "" || snap == "" {
 			return nil, fmt.Errorf("snapshot.get requires repository and snapshot parameters")
 		}
-		reqPath = "/_snapshot/" + repo + "/" + snap
+		reqPath = "/_snapshot/" + escapeCommaIDSegs(repo) + "/" + escapeCommaIDSegs(snap)
 
 	case "snapshot.delete":
 		method = http.MethodDelete
@@ -3211,7 +3326,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if repo == "" || snap == "" {
 			return nil, fmt.Errorf("snapshot.delete requires repository and snapshot parameters")
 		}
-		reqPath = "/_snapshot/" + repo + "/" + snap
+		reqPath = "/_snapshot/" + escapeIDSeg(repo) + "/" + escapeCommaIDSegs(snap)
 
 	case "snapshot.status":
 		method = http.MethodGet
@@ -3219,9 +3334,9 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		snap := popString("snapshot")
 		switch {
 		case repo != "" && snap != "":
-			reqPath = "/_snapshot/" + repo + "/" + snap + "/_status"
+			reqPath = "/_snapshot/" + escapeCommaIDSegs(repo) + "/" + escapeCommaIDSegs(snap) + "/_status"
 		case repo != "":
-			reqPath = "/_snapshot/" + repo + "/_status"
+			reqPath = "/_snapshot/" + escapeCommaIDSegs(repo) + "/_status"
 		default:
 			reqPath = "/_snapshot/_status"
 		}
@@ -3233,12 +3348,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if repo == "" || snap == "" {
 			return nil, fmt.Errorf("snapshot.restore requires repository and snapshot parameters")
 		}
-		reqPath = "/_snapshot/" + repo + "/" + snap + "/_restore"
+		reqPath = "/_snapshot/" + escapeIDSeg(repo) + "/" + escapeIDSeg(snap) + "/_restore"
 
 	case "cat.snapshots":
 		method = http.MethodGet
 		if repo := popString("repository"); repo != "" {
-			reqPath = "/_cat/snapshots/" + repo
+			reqPath = "/_cat/snapshots/" + escapeCommaIDSegs(repo)
 		} else {
 			reqPath = "/_cat/snapshots"
 		}
@@ -3258,7 +3373,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "indices.simulate_template":
 		method = http.MethodPost
 		if name := popString("name"); name != "" {
-			reqPath = "/_index_template/_simulate/" + name
+			reqPath = "/_index_template/_simulate/" + escapeIDSeg(name)
 		} else {
 			reqPath = "/_index_template/_simulate"
 		}
@@ -3269,7 +3384,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("indices.simulate_index_template requires name parameter")
 		}
-		reqPath = "/_index_template/_simulate_index/" + name
+		reqPath = "/_index_template/_simulate_index/" + escapeIDSeg(name)
 
 	case "indices.add_block":
 		method = http.MethodPut
@@ -3294,12 +3409,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if pol == "" {
 			return nil, fmt.Errorf("slm.put_lifecycle requires policy_id parameter")
 		}
-		reqPath = "/_slm/policy/" + pol
+		reqPath = "/_slm/policy/" + escapeIDSeg(pol)
 
 	case "slm.get_lifecycle":
 		method = http.MethodGet
 		if pol := popString("policy_id", "policy", "id", "name"); pol != "" {
-			reqPath = "/_slm/policy/" + pol
+			reqPath = "/_slm/policy/" + escapeCommaIDSegs(pol)
 		} else {
 			reqPath = "/_slm/policy"
 		}
@@ -3310,7 +3425,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if pol == "" {
 			return nil, fmt.Errorf("slm.delete_lifecycle requires policy_id parameter")
 		}
-		reqPath = "/_slm/policy/" + pol
+		reqPath = "/_slm/policy/" + escapeIDSeg(pol)
 
 	case "slm.execute_lifecycle":
 		method = http.MethodPost
@@ -3318,7 +3433,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if pol == "" {
 			return nil, fmt.Errorf("slm.execute_lifecycle requires policy_id parameter")
 		}
-		reqPath = "/_slm/policy/" + pol + "/_execute"
+		reqPath = "/_slm/policy/" + escapeIDSeg(pol) + "/_execute"
 
 	case "slm.execute_retention":
 		method = http.MethodPost
@@ -3354,7 +3469,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("watcher.put_watch requires id parameter")
 		}
-		reqPath = "/_watcher/watch/" + id
+		reqPath = "/_watcher/watch/" + escapeIDSeg(id)
 
 	case "watcher.get_watch":
 		method = http.MethodGet
@@ -3362,7 +3477,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("watcher.get_watch requires id parameter")
 		}
-		reqPath = "/_watcher/watch/" + id
+		reqPath = "/_watcher/watch/" + escapeIDSeg(id)
 
 	case "watcher.delete_watch":
 		method = http.MethodDelete
@@ -3370,12 +3485,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("watcher.delete_watch requires id parameter")
 		}
-		reqPath = "/_watcher/watch/" + id
+		reqPath = "/_watcher/watch/" + escapeIDSeg(id)
 
 	case "watcher.execute_watch":
 		method = http.MethodPost
 		if id := popString("id", "watch_id"); id != "" {
-			reqPath = "/_watcher/watch/" + id + "/_execute"
+			reqPath = "/_watcher/watch/" + escapeIDSeg(id) + "/_execute"
 		} else {
 			reqPath = "/_watcher/watch/_execute"
 		}
@@ -3388,9 +3503,9 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			return nil, fmt.Errorf("watcher.ack_watch requires watch_id parameter")
 		}
 		if actionID != "" {
-			reqPath = "/_watcher/watch/" + watchID + "/_ack/" + actionID
+			reqPath = "/_watcher/watch/" + escapeIDSeg(watchID) + "/_ack/" + escapeCommaIDSegs(actionID)
 		} else {
-			reqPath = "/_watcher/watch/" + watchID + "/_ack"
+			reqPath = "/_watcher/watch/" + escapeIDSeg(watchID) + "/_ack"
 		}
 
 	case "watcher.activate_watch":
@@ -3399,7 +3514,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if watchID == "" {
 			return nil, fmt.Errorf("watcher.activate_watch requires watch_id parameter")
 		}
-		reqPath = "/_watcher/watch/" + watchID + "/_activate"
+		reqPath = "/_watcher/watch/" + escapeIDSeg(watchID) + "/_activate"
 
 	case "watcher.deactivate_watch":
 		method = http.MethodPut
@@ -3407,12 +3522,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if watchID == "" {
 			return nil, fmt.Errorf("watcher.deactivate_watch requires watch_id parameter")
 		}
-		reqPath = "/_watcher/watch/" + watchID + "/_deactivate"
+		reqPath = "/_watcher/watch/" + escapeIDSeg(watchID) + "/_deactivate"
 
 	case "watcher.stats":
 		method = http.MethodGet
 		if metric := popString("metric"); metric != "" {
-			reqPath = "/_watcher/stats/" + metric
+			reqPath = "/_watcher/stats/" + escapeCommaIDSegs(metric)
 		} else {
 			reqPath = "/_watcher/stats"
 		}
@@ -3431,12 +3546,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("transform.put_transform requires transform_id parameter")
 		}
-		reqPath = "/_transform/" + id
+		reqPath = "/_transform/" + escapeIDSeg(id)
 
 	case "transform.get_transform":
 		method = http.MethodGet
 		if id := popString("transform_id", "id"); id != "" {
-			reqPath = "/_transform/" + id
+			reqPath = "/_transform/" + escapeCommaIDSegs(id)
 		} else {
 			reqPath = "/_transform"
 		}
@@ -3447,7 +3562,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("transform.delete_transform requires transform_id parameter")
 		}
-		reqPath = "/_transform/" + id
+		reqPath = "/_transform/" + escapeIDSeg(id)
 
 	case "transform.start_transform":
 		method = http.MethodPost
@@ -3455,7 +3570,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("transform.start_transform requires transform_id parameter")
 		}
-		reqPath = "/_transform/" + id + "/_start"
+		reqPath = "/_transform/" + escapeIDSeg(id) + "/_start"
 
 	case "transform.stop_transform":
 		method = http.MethodPost
@@ -3463,19 +3578,26 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("transform.stop_transform requires transform_id parameter")
 		}
-		reqPath = "/_transform/" + id + "/_stop"
+		reqPath = "/_transform/" + escapeCommaIDSegs(id) + "/_stop"
 
 	case "transform.get_transform_stats":
 		method = http.MethodGet
 		if id := popString("transform_id", "id"); id != "" {
-			reqPath = "/_transform/" + id + "/_stats"
+			reqPath = "/_transform/" + escapeCommaIDSegs(id) + "/_stats"
 		} else {
 			reqPath = "/_transform/_stats"
 		}
 
 	case "transform.preview_transform":
 		method = http.MethodPost
-		reqPath = "/_transform/_preview"
+		id := firstNonEmptyParam(params, "transform_id", "id")
+		delete(remaining, "transform_id")
+		delete(remaining, "id")
+		if id != "" {
+			reqPath = "/_transform/" + escapeIDSeg(id) + "/_preview"
+		} else {
+			reqPath = "/_transform/_preview"
+		}
 
 	case "dangling_indices.list_dangling_indices":
 		method = http.MethodGet
@@ -3487,7 +3609,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if uuid == "" {
 			return nil, fmt.Errorf("dangling_indices.import_dangling_index requires index_uuid parameter")
 		}
-		reqPath = "/_dangling/" + uuid
+		reqPath = "/_dangling/" + escapeIDSeg(uuid)
 
 	case "dangling_indices.delete_dangling_index":
 		method = http.MethodDelete
@@ -3495,7 +3617,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if uuid == "" {
 			return nil, fmt.Errorf("dangling_indices.delete_dangling_index requires index_uuid parameter")
 		}
-		reqPath = "/_dangling/" + uuid
+		reqPath = "/_dangling/" + escapeIDSeg(uuid)
 
 	case "autoscaling.put_autoscaling_policy":
 		method = http.MethodPut
@@ -3503,12 +3625,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("autoscaling.put_autoscaling_policy requires name parameter")
 		}
-		reqPath = "/_autoscaling/policy/" + name
+		reqPath = "/_autoscaling/policy/" + escapeIDSeg(name)
 
 	case "autoscaling.get_autoscaling_policy":
 		method = http.MethodGet
 		if name := popString("name"); name != "" {
-			reqPath = "/_autoscaling/policy/" + name
+			reqPath = "/_autoscaling/policy/" + escapeCommaIDSegs(name)
 		} else {
 			reqPath = "/_autoscaling/policy"
 		}
@@ -3519,7 +3641,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("autoscaling.delete_autoscaling_policy requires name parameter")
 		}
-		reqPath = "/_autoscaling/policy/" + name
+		reqPath = "/_autoscaling/policy/" + escapeIDSeg(name)
 
 	case "autoscaling.get_autoscaling_capacity":
 		method = http.MethodGet
@@ -3531,7 +3653,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("transform.update_transform requires transform_id parameter")
 		}
-		reqPath = "/_transform/" + id + "/_update"
+		reqPath = "/_transform/" + escapeIDSeg(id) + "/_update"
 
 	case "synonyms.put_synonym":
 		method = http.MethodPut
@@ -3697,12 +3819,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if nodeID == "" {
 			return nil, fmt.Errorf("shutdown.put_node requires node_id parameter")
 		}
-		reqPath = "/_nodes/" + nodeID + "/shutdown"
+		reqPath = "/_nodes/" + escapeIDSeg(nodeID) + "/shutdown"
 
 	case "shutdown.get_node":
 		method = http.MethodGet
 		if nodeID := popString("node_id"); nodeID != "" {
-			reqPath = "/_nodes/" + nodeID + "/shutdown"
+			reqPath = "/_nodes/" + escapeCommaIDSegs(nodeID) + "/shutdown"
 		} else {
 			reqPath = "/_nodes/shutdown"
 		}
@@ -3713,7 +3835,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if nodeID == "" {
 			return nil, fmt.Errorf("shutdown.delete_node requires node_id parameter")
 		}
-		reqPath = "/_nodes/" + nodeID + "/shutdown"
+		reqPath = "/_nodes/" + escapeIDSeg(nodeID) + "/shutdown"
 
 	case "rollup.put_job":
 		method = http.MethodPut
@@ -3721,12 +3843,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("rollup.put_job requires id parameter")
 		}
-		reqPath = "/_rollup/job/" + id
+		reqPath = "/_rollup/job/" + escapeIDSeg(id)
 
 	case "rollup.get_jobs":
 		method = http.MethodGet
 		if id := popString("id", "job_id"); id != "" {
-			reqPath = "/_rollup/job/" + id
+			reqPath = "/_rollup/job/" + escapeCommaIDSegs(id)
 		} else {
 			reqPath = "/_rollup/job"
 		}
@@ -3737,7 +3859,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("rollup.delete_job requires id parameter")
 		}
-		reqPath = "/_rollup/job/" + id
+		reqPath = "/_rollup/job/" + escapeIDSeg(id)
 
 	case "rollup.start_job":
 		method = http.MethodPost
@@ -3745,7 +3867,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("rollup.start_job requires id parameter")
 		}
-		reqPath = "/_rollup/job/" + id + "/_start"
+		reqPath = "/_rollup/job/" + escapeIDSeg(id) + "/_start"
 
 	case "rollup.stop_job":
 		method = http.MethodPost
@@ -3753,7 +3875,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("rollup.stop_job requires id parameter")
 		}
-		reqPath = "/_rollup/job/" + id + "/_stop"
+		reqPath = "/_rollup/job/" + escapeIDSeg(id) + "/_stop"
 
 	case "rollup.get_rollup_caps":
 		method = http.MethodGet
@@ -3890,7 +4012,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if repo == "" || snap == "" {
 			return nil, fmt.Errorf("searchable_snapshots.mount requires repository and snapshot parameters")
 		}
-		reqPath = "/_snapshot/" + repo + "/" + snap + "/_mount"
+		reqPath = "/_snapshot/" + escapeIDSeg(repo) + "/" + escapeIDSeg(snap) + "/_mount"
 
 	case "searchable_snapshots.stats":
 		method = http.MethodGet
@@ -3978,12 +4100,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("security.put_role requires name parameter")
 		}
-		reqPath = "/_security/role/" + name
+		reqPath = "/_security/role/" + escapeIDSeg(name)
 
 	case "security.get_role":
 		method = http.MethodGet
 		if name := popString("name", "id"); name != "" {
-			reqPath = "/_security/role/" + name
+			reqPath = "/_security/role/" + escapeCommaIDSegs(name)
 		} else {
 			reqPath = "/_security/role"
 		}
@@ -3994,7 +4116,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("security.delete_role requires name parameter")
 		}
-		reqPath = "/_security/role/" + name
+		reqPath = "/_security/role/" + escapeIDSeg(name)
 
 	case "security.clear_cached_roles":
 		method = http.MethodPost
@@ -4002,7 +4124,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("security.clear_cached_roles requires name parameter")
 		}
-		reqPath = "/_security/role/" + name + "/_clear_cache"
+		reqPath = "/_security/role/" + escapeCommaIDSegs(name) + "/_clear_cache"
 
 	case "security.create_api_key":
 		method = http.MethodPost
@@ -4022,7 +4144,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("security.put_api_key requires id parameter")
 		}
-		reqPath = "/_security/api_key/" + id
+		reqPath = "/_security/api_key/" + escapeIDSeg(id)
 
 	case "security.bulk_update_api_keys":
 		method = http.MethodPost
@@ -4046,7 +4168,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if app == "" {
 			return nil, fmt.Errorf("security.clear_cached_privileges requires application parameter")
 		}
-		reqPath = "/_security/privilege/" + app + "/_clear_cache"
+		reqPath = "/_security/privilege/" + escapeCommaIDSegs(app) + "/_clear_cache"
 
 	case "security.clear_cached_service_tokens":
 		method = http.MethodPost
@@ -4056,7 +4178,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if ns == "" || svc == "" || tokenName == "" {
 			return nil, fmt.Errorf("security.clear_cached_service_tokens requires namespace, service, and token_name parameters")
 		}
-		reqPath = "/_security/service/" + ns + "/" + svc + "/credential/token/" + tokenName + "/_clear_cache"
+		reqPath = "/_security/service/" + escapeIDSeg(ns) + "/" + escapeIDSeg(svc) + "/credential/token/" + escapeCommaIDSegs(tokenName) + "/_clear_cache"
 
 	case "security.oidc_prepare_authentication":
 		method = http.MethodPost
@@ -4132,9 +4254,9 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		name := popString("name")
 		switch {
 		case app != "" && name != "":
-			reqPath = "/_security/privilege/" + app + "/" + name
+			reqPath = "/_security/privilege/" + escapeCommaIDSegs(app) + "/" + escapeCommaIDSegs(name)
 		case app != "":
-			reqPath = "/_security/privilege/" + app
+			reqPath = "/_security/privilege/" + escapeCommaIDSegs(app)
 		default:
 			reqPath = "/_security/privilege"
 		}
@@ -4146,7 +4268,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if app == "" || name == "" {
 			return nil, fmt.Errorf("security.delete_privileges requires application and name parameters")
 		}
-		reqPath = "/_security/privilege/" + app + "/" + name
+		reqPath = "/_security/privilege/" + escapeIDSeg(app) + "/" + escapeCommaIDSegs(name)
 
 	case "security.create_service_token":
 		method = http.MethodPost
@@ -4157,9 +4279,9 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			return nil, fmt.Errorf("security.create_service_token requires namespace and service parameters")
 		}
 		if tokenName != "" {
-			reqPath = "/_security/service/" + ns + "/" + svc + "/credential/token/" + tokenName
+			reqPath = "/_security/service/" + escapeIDSeg(ns) + "/" + escapeIDSeg(svc) + "/credential/token/" + escapeIDSeg(tokenName)
 		} else {
-			reqPath = "/_security/service/" + ns + "/" + svc + "/credential/token"
+			reqPath = "/_security/service/" + escapeIDSeg(ns) + "/" + escapeIDSeg(svc) + "/credential/token"
 		}
 
 	case "security.delete_service_token":
@@ -4170,7 +4292,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if ns == "" || svc == "" || tokenName == "" {
 			return nil, fmt.Errorf("security.delete_service_token requires namespace, service, and token_name parameters")
 		}
-		reqPath = "/_security/service/" + ns + "/" + svc + "/credential/token/" + tokenName
+		reqPath = "/_security/service/" + escapeIDSeg(ns) + "/" + escapeIDSeg(svc) + "/credential/token/" + escapeIDSeg(tokenName)
 
 	case "security.list_service_tokens":
 		method = http.MethodGet
@@ -4179,7 +4301,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if ns == "" || svc == "" {
 			return nil, fmt.Errorf("security.list_service_tokens requires namespace and service parameters")
 		}
-		reqPath = "/_security/service/" + ns + "/" + svc + "/credential/token"
+		reqPath = "/_security/service/" + escapeIDSeg(ns) + "/" + escapeIDSeg(svc) + "/credential/token"
 
 	case "security.get_service_accounts":
 		method = http.MethodGet
@@ -4187,9 +4309,9 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		svc := popString("service")
 		switch {
 		case ns != "" && svc != "":
-			reqPath = "/_security/service/" + ns + "/" + svc
+			reqPath = "/_security/service/" + escapeIDSeg(ns) + "/" + escapeIDSeg(svc)
 		case ns != "":
-			reqPath = "/_security/service/" + ns
+			reqPath = "/_security/service/" + escapeIDSeg(ns)
 		default:
 			reqPath = "/_security/service"
 		}
@@ -4201,7 +4323,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if ns == "" || svc == "" {
 			return nil, fmt.Errorf("security.get_service_credentials requires namespace and service parameters")
 		}
-		reqPath = "/_security/service/" + ns + "/" + svc + "/credential"
+		reqPath = "/_security/service/" + escapeIDSeg(ns) + "/" + escapeIDSeg(svc) + "/credential"
 
 	case "security.get_token":
 		method = http.MethodPost
@@ -4217,12 +4339,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("logstash.put_pipeline requires id parameter")
 		}
-		reqPath = "/_logstash/pipeline/" + id
+		reqPath = "/_logstash/pipeline/" + escapeIDSeg(id)
 
 	case "logstash.get_pipeline":
 		method = http.MethodGet
 		if id := popString("id"); id != "" {
-			reqPath = "/_logstash/pipeline/" + id
+			reqPath = "/_logstash/pipeline/" + escapeCommaIDSegs(id)
 		} else {
 			reqPath = "/_logstash/pipeline"
 		}
@@ -4233,7 +4355,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("logstash.delete_pipeline requires id parameter")
 		}
-		reqPath = "/_logstash/pipeline/" + id
+		reqPath = "/_logstash/pipeline/" + escapeCommaIDSegs(id)
 
 	case "logstash.exists_pipeline":
 		method = http.MethodHead
@@ -4241,7 +4363,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("logstash.exists_pipeline requires id parameter")
 		}
-		reqPath = "/_logstash/pipeline/" + id
+		reqPath = "/_logstash/pipeline/" + escapeIDSeg(id)
 
 	case "inference.put", "inference.put_model":
 		method = http.MethodPut
@@ -4326,7 +4448,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if connID == "" {
 			return nil, fmt.Errorf("connector.put requires connector_id parameter")
 		}
-		reqPath = "/_connector/" + connID
+		reqPath = "/_connector/" + escapeIDSeg(connID)
 
 	case "connector.post":
 		method = http.MethodPost
@@ -4338,7 +4460,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if connID == "" {
 			return nil, fmt.Errorf("connector.get requires connector_id parameter")
 		}
-		reqPath = "/_connector/" + connID
+		reqPath = "/_connector/" + escapeIDSeg(connID)
 
 	case "connector.list":
 		method = http.MethodGet
@@ -4350,7 +4472,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if connID == "" {
 			return nil, fmt.Errorf("connector.delete requires connector_id parameter")
 		}
-		reqPath = "/_connector/" + connID
+		reqPath = "/_connector/" + escapeIDSeg(connID)
 
 	case "connector.update_name", "connector.update_native", "connector.update_service_type",
 		"connector.update_status", "connector.update_error", "connector.update_filtering",
@@ -4377,7 +4499,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			"connector.update_custom_scheduling": "/_custom_scheduling",
 			"connector.update_api_key_id":        "/_api_key_id",
 		}
-		reqPath = "/_connector/" + connID + suffixMap[action]
+		reqPath = "/_connector/" + escapeIDSeg(connID) + suffixMap[action]
 
 	case "connector.update_active_filtering":
 		method = http.MethodPost
@@ -4386,7 +4508,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if connID == "" || state == "" {
 			return nil, fmt.Errorf("connector.update_active_filtering requires connector_id and filtering_validation_state parameters")
 		}
-		reqPath = "/_connector/" + connID + "/_filtering/" + state
+		reqPath = "/_connector/" + escapeIDSeg(connID) + "/_filtering/" + escapeIDSeg(state)
 
 	case "connector.sync_job_claim":
 		method = http.MethodPost
@@ -4402,7 +4524,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" {
 			return nil, fmt.Errorf("connector.sync_job_get requires connector_sync_job_id parameter")
 		}
-		reqPath = "/_connector/_sync_job/" + jobID
+		reqPath = "/_connector/_sync_job/" + escapeIDSeg(jobID)
 
 	case "connector.sync_job_list":
 		method = http.MethodGet
@@ -4414,7 +4536,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" {
 			return nil, fmt.Errorf("connector.sync_job_delete requires connector_sync_job_id parameter")
 		}
-		reqPath = "/_connector/_sync_job/" + jobID
+		reqPath = "/_connector/_sync_job/" + escapeIDSeg(jobID)
 
 	case "connector.sync_job_cancel":
 		method = http.MethodPost
@@ -4422,7 +4544,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" {
 			return nil, fmt.Errorf("connector.sync_job_cancel requires connector_sync_job_id parameter")
 		}
-		reqPath = "/_connector/_sync_job/" + jobID + "/_cancel"
+		reqPath = "/_connector/_sync_job/" + escapeIDSeg(jobID) + "/_cancel"
 
 	case "connector.sync_job_check_in":
 		method = http.MethodPost
@@ -4430,7 +4552,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" {
 			return nil, fmt.Errorf("connector.sync_job_check_in requires connector_sync_job_id parameter")
 		}
-		reqPath = "/_connector/_sync_job/" + jobID + "/_check_in"
+		reqPath = "/_connector/_sync_job/" + escapeIDSeg(jobID) + "/_check_in"
 
 	case "connector.sync_job_error":
 		method = http.MethodPut
@@ -4438,7 +4560,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" {
 			return nil, fmt.Errorf("connector.sync_job_error requires connector_sync_job_id parameter")
 		}
-		reqPath = "/_connector/_sync_job/" + jobID + "/_error"
+		reqPath = "/_connector/_sync_job/" + escapeIDSeg(jobID) + "/_error"
 
 	case "connector.sync_job_update_stats":
 		method = http.MethodPut
@@ -4446,7 +4568,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" {
 			return nil, fmt.Errorf("connector.sync_job_update_stats requires connector_sync_job_id parameter")
 		}
-		reqPath = "/_connector/_sync_job/" + jobID + "/_stats"
+		reqPath = "/_connector/_sync_job/" + escapeIDSeg(jobID) + "/_stats"
 
 	case "search_application.put":
 		method = http.MethodPut
@@ -4454,7 +4576,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("search_application.put requires name parameter")
 		}
-		reqPath = "/_application/search_application/" + name
+		reqPath = "/_application/search_application/" + escapeIDSeg(name)
 
 	case "search_application.get":
 		method = http.MethodGet
@@ -4462,7 +4584,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("search_application.get requires name parameter")
 		}
-		reqPath = "/_application/search_application/" + name
+		reqPath = "/_application/search_application/" + escapeIDSeg(name)
 
 	case "search_application.delete":
 		method = http.MethodDelete
@@ -4470,7 +4592,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("search_application.delete requires name parameter")
 		}
-		reqPath = "/_application/search_application/" + name
+		reqPath = "/_application/search_application/" + escapeIDSeg(name)
 
 	case "search_application.list":
 		method = http.MethodGet
@@ -4482,7 +4604,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("search_application.search requires name parameter")
 		}
-		reqPath = "/_application/search_application/" + name + "/_search"
+		reqPath = "/_application/search_application/" + escapeIDSeg(name) + "/_search"
 
 	case "search_application.render_query":
 		method = http.MethodPost
@@ -4490,7 +4612,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("search_application.render_query requires name parameter")
 		}
-		reqPath = "/_application/search_application/" + name + "/_render_query"
+		reqPath = "/_application/search_application/" + escapeIDSeg(name) + "/_render_query"
 
 	case "behavioral_analytics.put_collection", "search_application.put_behavioral_analytics":
 		method = http.MethodPut
@@ -4498,12 +4620,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if coll == "" {
 			return nil, fmt.Errorf("%s requires collection_name parameter", action)
 		}
-		reqPath = "/_application/analytics/" + coll
+		reqPath = "/_application/analytics/" + escapeIDSeg(coll)
 
 	case "behavioral_analytics.get_collections", "search_application.get_behavioral_analytics":
 		method = http.MethodGet
 		if coll := popString("collection_name", "name"); coll != "" {
-			reqPath = "/_application/analytics/" + coll
+			reqPath = "/_application/analytics/" + escapeCommaIDSegs(coll)
 		} else {
 			reqPath = "/_application/analytics"
 		}
@@ -4514,7 +4636,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if coll == "" {
 			return nil, fmt.Errorf("%s requires collection_name parameter", action)
 		}
-		reqPath = "/_application/analytics/" + coll
+		reqPath = "/_application/analytics/" + escapeIDSeg(coll)
 
 	case "behavioral_analytics.post_event", "search_application.post_behavioral_analytics_event":
 		method = http.MethodPost
@@ -4523,7 +4645,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if coll == "" || evType == "" {
 			return nil, fmt.Errorf("%s requires collection_name and event_type parameters", action)
 		}
-		reqPath = "/_application/analytics/" + coll + "/event/" + evType
+		reqPath = "/_application/analytics/" + escapeIDSeg(coll) + "/event/" + escapeIDSeg(evType)
 
 	case "text_structure.find_structure":
 		method = http.MethodPost
@@ -4636,7 +4758,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "cat.transforms":
 		method = http.MethodGet
 		if id := popString("transform_id", "id"); id != "" {
-			reqPath = "/_cat/transforms/" + id
+			reqPath = "/_cat/transforms/" + escapeCommaIDSegs(id)
 		} else {
 			reqPath = "/_cat/transforms"
 		}
@@ -4847,12 +4969,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" {
 			return nil, fmt.Errorf("ml.put_job requires job_id parameter")
 		}
-		reqPath = "/_ml/anomaly_detectors/" + jobID
+		reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID)
 
 	case "ml.get_jobs":
 		method = http.MethodGet
 		if jobID := popString("job_id", "id"); jobID != "" {
-			reqPath = "/_ml/anomaly_detectors/" + jobID
+			reqPath = "/_ml/anomaly_detectors/" + escapeCommaIDSegs(jobID)
 		} else {
 			reqPath = "/_ml/anomaly_detectors"
 		}
@@ -4860,7 +4982,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "ml.get_job_stats":
 		method = http.MethodGet
 		if jobID := popString("job_id", "id"); jobID != "" {
-			reqPath = "/_ml/anomaly_detectors/" + jobID + "/_stats"
+			reqPath = "/_ml/anomaly_detectors/" + escapeCommaIDSegs(jobID) + "/_stats"
 		} else {
 			reqPath = "/_ml/anomaly_detectors/_stats"
 		}
@@ -4871,7 +4993,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" {
 			return nil, fmt.Errorf("ml.update_job requires job_id parameter")
 		}
-		reqPath = "/_ml/anomaly_detectors/" + jobID + "/_update"
+		reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/_update"
 
 	case "ml.delete_job":
 		method = http.MethodDelete
@@ -4879,7 +5001,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" {
 			return nil, fmt.Errorf("ml.delete_job requires job_id parameter")
 		}
-		reqPath = "/_ml/anomaly_detectors/" + jobID
+		reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID)
 
 	case "ml.open_job":
 		method = http.MethodPost
@@ -4887,7 +5009,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" {
 			return nil, fmt.Errorf("ml.open_job requires job_id parameter")
 		}
-		reqPath = "/_ml/anomaly_detectors/" + jobID + "/_open"
+		reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/_open"
 
 	case "ml.close_job":
 		method = http.MethodPost
@@ -4895,7 +5017,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" {
 			return nil, fmt.Errorf("ml.close_job requires job_id parameter")
 		}
-		reqPath = "/_ml/anomaly_detectors/" + jobID + "/_close"
+		reqPath = "/_ml/anomaly_detectors/" + escapeCommaIDSegs(jobID) + "/_close"
 
 	case "ml.put_datafeed":
 		method = http.MethodPut
@@ -4903,12 +5025,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if dfID == "" {
 			return nil, fmt.Errorf("ml.put_datafeed requires datafeed_id parameter")
 		}
-		reqPath = "/_ml/datafeeds/" + dfID
+		reqPath = "/_ml/datafeeds/" + escapeIDSeg(dfID)
 
 	case "ml.get_datafeeds":
 		method = http.MethodGet
 		if dfID := popString("datafeed_id", "id"); dfID != "" {
-			reqPath = "/_ml/datafeeds/" + dfID
+			reqPath = "/_ml/datafeeds/" + escapeCommaIDSegs(dfID)
 		} else {
 			reqPath = "/_ml/datafeeds"
 		}
@@ -4916,7 +5038,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "ml.get_datafeed_stats":
 		method = http.MethodGet
 		if dfID := popString("datafeed_id", "id"); dfID != "" {
-			reqPath = "/_ml/datafeeds/" + dfID + "/_stats"
+			reqPath = "/_ml/datafeeds/" + escapeCommaIDSegs(dfID) + "/_stats"
 		} else {
 			reqPath = "/_ml/datafeeds/_stats"
 		}
@@ -4927,7 +5049,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if dfID == "" {
 			return nil, fmt.Errorf("ml.update_datafeed requires datafeed_id parameter")
 		}
-		reqPath = "/_ml/datafeeds/" + dfID + "/_update"
+		reqPath = "/_ml/datafeeds/" + escapeIDSeg(dfID) + "/_update"
 
 	case "ml.delete_datafeed":
 		method = http.MethodDelete
@@ -4935,7 +5057,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if dfID == "" {
 			return nil, fmt.Errorf("ml.delete_datafeed requires datafeed_id parameter")
 		}
-		reqPath = "/_ml/datafeeds/" + dfID
+		reqPath = "/_ml/datafeeds/" + escapeIDSeg(dfID)
 
 	case "ml.start_datafeed":
 		method = http.MethodPost
@@ -4943,7 +5065,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if dfID == "" {
 			return nil, fmt.Errorf("ml.start_datafeed requires datafeed_id parameter")
 		}
-		reqPath = "/_ml/datafeeds/" + dfID + "/_start"
+		reqPath = "/_ml/datafeeds/" + escapeIDSeg(dfID) + "/_start"
 
 	case "ml.stop_datafeed":
 		method = http.MethodPost
@@ -4951,7 +5073,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if dfID == "" {
 			return nil, fmt.Errorf("ml.stop_datafeed requires datafeed_id parameter")
 		}
-		reqPath = "/_ml/datafeeds/" + dfID + "/_stop"
+		reqPath = "/_ml/datafeeds/" + escapeCommaIDSegs(dfID) + "/_stop"
 
 	case "ml.preview_datafeed":
 		dfID := popString("datafeed_id", "id")
@@ -4972,12 +5094,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if modelID == "" {
 			return nil, fmt.Errorf("ml.put_trained_model requires model_id parameter")
 		}
-		reqPath = "/_ml/trained_models/" + modelID
+		reqPath = "/_ml/trained_models/" + escapeIDSeg(modelID)
 
 	case "ml.get_trained_models":
 		method = http.MethodGet
 		if modelID := popString("model_id", "id"); modelID != "" {
-			reqPath = "/_ml/trained_models/" + modelID
+			reqPath = "/_ml/trained_models/" + escapeCommaIDSegs(modelID)
 		} else {
 			reqPath = "/_ml/trained_models"
 		}
@@ -4985,7 +5107,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "ml.get_trained_models_stats":
 		method = http.MethodGet
 		if modelID := popString("model_id", "id"); modelID != "" {
-			reqPath = "/_ml/trained_models/" + modelID + "/_stats"
+			reqPath = "/_ml/trained_models/" + escapeCommaIDSegs(modelID) + "/_stats"
 		} else {
 			reqPath = "/_ml/trained_models/_stats"
 		}
@@ -4996,7 +5118,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if modelID == "" {
 			return nil, fmt.Errorf("ml.delete_trained_model requires model_id parameter")
 		}
-		reqPath = "/_ml/trained_models/" + modelID
+		reqPath = "/_ml/trained_models/" + escapeIDSeg(modelID)
 
 	case "ml.put_calendar":
 		method = http.MethodPut
@@ -5004,12 +5126,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if calID == "" {
 			return nil, fmt.Errorf("ml.put_calendar requires calendar_id parameter")
 		}
-		reqPath = "/_ml/calendars/" + calID
+		reqPath = "/_ml/calendars/" + escapeIDSeg(calID)
 
 	case "ml.get_calendars":
 		method = http.MethodGet
 		if calID := popString("calendar_id", "id"); calID != "" {
-			reqPath = "/_ml/calendars/" + calID
+			reqPath = "/_ml/calendars/" + escapeCommaIDSegs(calID)
 		} else {
 			reqPath = "/_ml/calendars"
 		}
@@ -5020,7 +5142,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if calID == "" {
 			return nil, fmt.Errorf("ml.delete_calendar requires calendar_id parameter")
 		}
-		reqPath = "/_ml/calendars/" + calID
+		reqPath = "/_ml/calendars/" + escapeIDSeg(calID)
 
 	case "ml.put_calendar_job":
 		method = http.MethodPut
@@ -5029,7 +5151,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if calID == "" || jobID == "" {
 			return nil, fmt.Errorf("ml.put_calendar_job requires calendar_id and job_id parameters")
 		}
-		reqPath = "/_ml/calendars/" + calID + "/jobs/" + jobID
+		reqPath = "/_ml/calendars/" + escapeIDSeg(calID) + "/jobs/" + escapeCommaIDSegs(jobID)
 
 	case "ml.delete_calendar_job":
 		method = http.MethodDelete
@@ -5038,7 +5160,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if calID == "" || jobID == "" {
 			return nil, fmt.Errorf("ml.delete_calendar_job requires calendar_id and job_id parameters")
 		}
-		reqPath = "/_ml/calendars/" + calID + "/jobs/" + jobID
+		reqPath = "/_ml/calendars/" + escapeIDSeg(calID) + "/jobs/" + escapeCommaIDSegs(jobID)
 
 	case "ml.put_calendar_event", "ml.post_calendar_events":
 		method = http.MethodPost
@@ -5046,7 +5168,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if calID == "" {
 			return nil, fmt.Errorf("%s requires calendar_id parameter", action)
 		}
-		reqPath = "/_ml/calendars/" + calID + "/events"
+		reqPath = "/_ml/calendars/" + escapeIDSeg(calID) + "/events"
 
 	case "ml.get_calendar_events":
 		method = http.MethodGet
@@ -5054,7 +5176,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if calID == "" {
 			return nil, fmt.Errorf("ml.get_calendar_events requires calendar_id parameter")
 		}
-		reqPath = "/_ml/calendars/" + calID + "/events"
+		reqPath = "/_ml/calendars/" + escapeIDSeg(calID) + "/events"
 
 	case "ml.delete_calendar_event":
 		method = http.MethodDelete
@@ -5063,7 +5185,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if calID == "" || eventID == "" {
 			return nil, fmt.Errorf("ml.delete_calendar_event requires calendar_id and event_id parameters")
 		}
-		reqPath = "/_ml/calendars/" + calID + "/events/" + eventID
+		reqPath = "/_ml/calendars/" + escapeIDSeg(calID) + "/events/" + escapeIDSeg(eventID)
 
 	case "ml.put_filter":
 		method = http.MethodPut
@@ -5071,12 +5193,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if filterID == "" {
 			return nil, fmt.Errorf("ml.put_filter requires filter_id parameter")
 		}
-		reqPath = "/_ml/filters/" + filterID
+		reqPath = "/_ml/filters/" + escapeIDSeg(filterID)
 
 	case "ml.get_filters":
 		method = http.MethodGet
 		if filterID := popString("filter_id", "id"); filterID != "" {
-			reqPath = "/_ml/filters/" + filterID
+			reqPath = "/_ml/filters/" + escapeCommaIDSegs(filterID)
 		} else {
 			reqPath = "/_ml/filters"
 		}
@@ -5087,7 +5209,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if filterID == "" {
 			return nil, fmt.Errorf("ml.update_filter requires filter_id parameter")
 		}
-		reqPath = "/_ml/filters/" + filterID + "/_update"
+		reqPath = "/_ml/filters/" + escapeIDSeg(filterID) + "/_update"
 
 	case "ml.delete_filter":
 		method = http.MethodDelete
@@ -5095,7 +5217,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if filterID == "" {
 			return nil, fmt.Errorf("ml.delete_filter requires filter_id parameter")
 		}
-		reqPath = "/_ml/filters/" + filterID
+		reqPath = "/_ml/filters/" + escapeIDSeg(filterID)
 
 	case "security.put_role_mapping":
 		method = http.MethodPut
@@ -5103,12 +5225,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("security.put_role_mapping requires name parameter")
 		}
-		reqPath = "/_security/role_mapping/" + name
+		reqPath = "/_security/role_mapping/" + escapeIDSeg(name)
 
 	case "security.get_role_mapping":
 		method = http.MethodGet
 		if name := popString("name", "id"); name != "" {
-			reqPath = "/_security/role_mapping/" + name
+			reqPath = "/_security/role_mapping/" + escapeCommaIDSegs(name)
 		} else {
 			reqPath = "/_security/role_mapping"
 		}
@@ -5119,7 +5241,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("security.delete_role_mapping requires name parameter")
 		}
-		reqPath = "/_security/role_mapping/" + name
+		reqPath = "/_security/role_mapping/" + escapeIDSeg(name)
 
 	case "security.enroll_kibana":
 		method = http.MethodPost
@@ -5169,7 +5291,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if repo == "" || snap == "" || targetSnap == "" {
 			return nil, fmt.Errorf("snapshot.clone requires repository, snapshot, and target_snapshot parameters")
 		}
-		reqPath = "/_snapshot/" + repo + "/" + snap + "/_clone/" + targetSnap
+		reqPath = "/_snapshot/" + escapeIDSeg(repo) + "/" + escapeIDSeg(snap) + "/_clone/" + escapeIDSeg(targetSnap)
 
 	case "snapshot.cleanup_repository":
 		method = http.MethodPost
@@ -5177,12 +5299,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if repo == "" {
 			return nil, fmt.Errorf("snapshot.cleanup_repository requires repository parameter")
 		}
-		reqPath = "/_snapshot/" + repo + "/_cleanup"
+		reqPath = "/_snapshot/" + escapeIDSeg(repo) + "/_cleanup"
 
 	case "cat.component_templates":
 		method = http.MethodGet
 		if name := popString("name"); name != "" {
-			reqPath = "/_cat/component_templates/" + name
+			reqPath = "/_cat/component_templates/" + escapeCommaIDSegs(name)
 		} else {
 			reqPath = "/_cat/component_templates"
 		}
@@ -5190,7 +5312,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "cat.ml_anomaly_detectors", "cat.ml_jobs", "cat.anomaly_detectors":
 		method = http.MethodGet
 		if jobID := popString("job_id", "id"); jobID != "" {
-			reqPath = "/_cat/ml_anomaly_detectors/" + jobID
+			reqPath = "/_cat/ml_anomaly_detectors/" + escapeCommaIDSegs(jobID)
 		} else {
 			reqPath = "/_cat/ml_anomaly_detectors"
 		}
@@ -5198,7 +5320,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "cat.ml_datafeeds", "cat.datafeeds":
 		method = http.MethodGet
 		if dfID := popString("datafeed_id", "id"); dfID != "" {
-			reqPath = "/_cat/ml_datafeeds/" + dfID
+			reqPath = "/_cat/ml_datafeeds/" + escapeCommaIDSegs(dfID)
 		} else {
 			reqPath = "/_cat/ml_datafeeds"
 		}
@@ -5206,7 +5328,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "cat.ml_trained_models", "cat.trained_models":
 		method = http.MethodGet
 		if modelID := popString("model_id", "id"); modelID != "" {
-			reqPath = "/_cat/ml_trained_models/" + modelID
+			reqPath = "/_cat/ml_trained_models/" + escapeCommaIDSegs(modelID)
 		} else {
 			reqPath = "/_cat/ml_trained_models"
 		}
@@ -5214,7 +5336,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "cat.ml_data_frame_analytics", "cat.data_frame_analytics":
 		method = http.MethodGet
 		if id := popString("id"); id != "" {
-			reqPath = "/_cat/ml_data_frame_analytics/" + id
+			reqPath = "/_cat/ml_data_frame_analytics/" + escapeCommaIDSegs(id)
 		} else {
 			reqPath = "/_cat/ml_data_frame_analytics"
 		}
@@ -5294,12 +5416,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("ml.put_data_frame_analytics requires id parameter")
 		}
-		reqPath = "/_ml/data_frame/analytics/" + id
+		reqPath = "/_ml/data_frame/analytics/" + escapeIDSeg(id)
 
 	case "ml.get_data_frame_analytics":
 		method = http.MethodGet
 		if id := popString("id"); id != "" {
-			reqPath = "/_ml/data_frame/analytics/" + id
+			reqPath = "/_ml/data_frame/analytics/" + escapeCommaIDSegs(id)
 		} else {
 			reqPath = "/_ml/data_frame/analytics"
 		}
@@ -5307,7 +5429,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "ml.get_data_frame_analytics_stats":
 		method = http.MethodGet
 		if id := popString("id"); id != "" {
-			reqPath = "/_ml/data_frame/analytics/" + id + "/_stats"
+			reqPath = "/_ml/data_frame/analytics/" + escapeCommaIDSegs(id) + "/_stats"
 		} else {
 			reqPath = "/_ml/data_frame/analytics/_stats"
 		}
@@ -5318,7 +5440,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("ml.update_data_frame_analytics requires id parameter")
 		}
-		reqPath = "/_ml/data_frame/analytics/" + id + "/_update"
+		reqPath = "/_ml/data_frame/analytics/" + escapeIDSeg(id) + "/_update"
 
 	case "ml.delete_data_frame_analytics":
 		method = http.MethodDelete
@@ -5326,7 +5448,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("ml.delete_data_frame_analytics requires id parameter")
 		}
-		reqPath = "/_ml/data_frame/analytics/" + id
+		reqPath = "/_ml/data_frame/analytics/" + escapeIDSeg(id)
 
 	case "ml.start_data_frame_analytics":
 		method = http.MethodPost
@@ -5334,7 +5456,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("ml.start_data_frame_analytics requires id parameter")
 		}
-		reqPath = "/_ml/data_frame/analytics/" + id + "/_start"
+		reqPath = "/_ml/data_frame/analytics/" + escapeIDSeg(id) + "/_start"
 
 	case "ml.stop_data_frame_analytics":
 		method = http.MethodPost
@@ -5342,7 +5464,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("ml.stop_data_frame_analytics requires id parameter")
 		}
-		reqPath = "/_ml/data_frame/analytics/" + id + "/_stop"
+		reqPath = "/_ml/data_frame/analytics/" + escapeIDSeg(id) + "/_stop"
 
 	case "ml.preview_data_frame_analytics":
 		if hasBody && rawBody != nil {
@@ -5351,7 +5473,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			method = http.MethodGet
 		}
 		if id := popString("id"); id != "" {
-			reqPath = "/_ml/data_frame/analytics/" + id + "/_preview"
+			reqPath = "/_ml/data_frame/analytics/" + escapeIDSeg(id) + "/_preview"
 		} else {
 			reqPath = "/_ml/data_frame/analytics/_preview"
 		}
@@ -5363,7 +5485,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			method = http.MethodGet
 		}
 		if id := popString("id"); id != "" {
-			reqPath = "/_ml/data_frame/analytics/" + id + "/_explain"
+			reqPath = "/_ml/data_frame/analytics/" + escapeIDSeg(id) + "/_explain"
 		} else {
 			reqPath = "/_ml/data_frame/analytics/_explain"
 		}
@@ -5378,7 +5500,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if modelID == "" {
 			return nil, fmt.Errorf("ml.start_trained_model_deployment requires model_id parameter")
 		}
-		reqPath = "/_ml/trained_models/" + modelID + "/deployment/_start"
+		reqPath = "/_ml/trained_models/" + escapeIDSeg(modelID) + "/deployment/_start"
 
 	case "ml.stop_trained_model_deployment":
 		method = http.MethodPost
@@ -5386,7 +5508,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if modelID == "" {
 			return nil, fmt.Errorf("ml.stop_trained_model_deployment requires model_id parameter")
 		}
-		reqPath = "/_ml/trained_models/" + modelID + "/deployment/_stop"
+		reqPath = "/_ml/trained_models/" + escapeIDSeg(modelID) + "/deployment/_stop"
 
 	case "ml.update_trained_model_deployment":
 		method = http.MethodPost
@@ -5394,7 +5516,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if modelID == "" {
 			return nil, fmt.Errorf("ml.update_trained_model_deployment requires model_id parameter")
 		}
-		reqPath = "/_ml/trained_models/" + modelID + "/deployment/_update"
+		reqPath = "/_ml/trained_models/" + escapeIDSeg(modelID) + "/deployment/_update"
 
 	case "ml.infer_trained_model":
 		method = http.MethodPost
@@ -5402,7 +5524,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if modelID == "" {
 			return nil, fmt.Errorf("ml.infer_trained_model requires model_id parameter")
 		}
-		reqPath = "/_ml/trained_models/" + modelID + "/_infer"
+		reqPath = "/_ml/trained_models/" + escapeIDSeg(modelID) + "/_infer"
 
 	case "ml.infer_trained_model_deployment":
 		method = http.MethodPost
@@ -5410,7 +5532,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if modelID == "" {
 			return nil, fmt.Errorf("ml.infer_trained_model_deployment requires model_id parameter")
 		}
-		reqPath = "/_ml/trained_models/" + modelID + "/deployment/_infer"
+		reqPath = "/_ml/trained_models/" + escapeIDSeg(modelID) + "/deployment/_infer"
 
 	case "ml.put_trained_model_alias":
 		method = http.MethodPut
@@ -5419,7 +5541,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if modelID == "" || modelAlias == "" {
 			return nil, fmt.Errorf("ml.put_trained_model_alias requires model_id and model_alias parameters")
 		}
-		reqPath = "/_ml/trained_models/" + modelID + "/model_aliases/" + modelAlias
+		reqPath = "/_ml/trained_models/" + escapeIDSeg(modelID) + "/model_aliases/" + escapeIDSeg(modelAlias)
 
 	case "ml.delete_trained_model_alias":
 		method = http.MethodDelete
@@ -5428,7 +5550,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if modelID == "" || modelAlias == "" {
 			return nil, fmt.Errorf("ml.delete_trained_model_alias requires model_id and model_alias parameters")
 		}
-		reqPath = "/_ml/trained_models/" + modelID + "/model_aliases/" + modelAlias
+		reqPath = "/_ml/trained_models/" + escapeIDSeg(modelID) + "/model_aliases/" + escapeIDSeg(modelAlias)
 
 	case "ml.put_trained_model_definition_part":
 		method = http.MethodPut
@@ -5437,7 +5559,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if modelID == "" || part == "" {
 			return nil, fmt.Errorf("ml.put_trained_model_definition_part requires model_id and part parameters")
 		}
-		reqPath = "/_ml/trained_models/" + modelID + "/definition/" + part
+		reqPath = "/_ml/trained_models/" + escapeIDSeg(modelID) + "/definition/" + escapeIDSeg(part)
 
 	case "ml.put_trained_model_vocabulary":
 		method = http.MethodPut
@@ -5445,7 +5567,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if modelID == "" {
 			return nil, fmt.Errorf("ml.put_trained_model_vocabulary requires model_id parameter")
 		}
-		reqPath = "/_ml/trained_models/" + modelID + "/vocabulary"
+		reqPath = "/_ml/trained_models/" + escapeIDSeg(modelID) + "/vocabulary"
 
 	case "ml.get_trained_model_vocabulary":
 		method = http.MethodGet
@@ -5453,7 +5575,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if modelID == "" {
 			return nil, fmt.Errorf("ml.get_trained_model_vocabulary requires model_id parameter")
 		}
-		reqPath = "/_ml/trained_models/" + modelID + "/vocabulary"
+		reqPath = "/_ml/trained_models/" + escapeIDSeg(modelID) + "/vocabulary"
 
 	case "ml.clear_trained_model_deployment_cache":
 		method = http.MethodPost
@@ -5461,7 +5583,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if modelID == "" {
 			return nil, fmt.Errorf("ml.clear_trained_model_deployment_cache requires model_id parameter")
 		}
-		reqPath = "/_ml/trained_models/" + modelID + "/deployment/_cache/_clear"
+		reqPath = "/_ml/trained_models/" + escapeIDSeg(modelID) + "/deployment/_cache/_clear"
 
 	case "ml.find_file_structure":
 		method = http.MethodPost
@@ -5473,7 +5595,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" {
 			return nil, fmt.Errorf("ml.flush_job requires job_id parameter")
 		}
-		reqPath = "/_ml/anomaly_detectors/" + jobID + "/_flush"
+		reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/_flush"
 
 	case "ml.post_data":
 		method = http.MethodPost
@@ -5482,7 +5604,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" {
 			return nil, fmt.Errorf("ml.post_data requires job_id parameter")
 		}
-		reqPath = "/_ml/anomaly_detectors/" + jobID + "/_data"
+		reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/_data"
 
 	case "ml.reset_job":
 		method = http.MethodPost
@@ -5490,7 +5612,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" {
 			return nil, fmt.Errorf("ml.reset_job requires job_id parameter")
 		}
-		reqPath = "/_ml/anomaly_detectors/" + jobID + "/_reset"
+		reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/_reset"
 
 	case "ml.forecast":
 		method = http.MethodPost
@@ -5498,7 +5620,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" {
 			return nil, fmt.Errorf("ml.forecast requires job_id parameter")
 		}
-		reqPath = "/_ml/anomaly_detectors/" + jobID + "/_forecast"
+		reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/_forecast"
 
 	case "ml.delete_forecast":
 		method = http.MethodDelete
@@ -5507,9 +5629,9 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			return nil, fmt.Errorf("ml.delete_forecast requires job_id parameter")
 		}
 		if forecastID := popString("forecast_id"); forecastID != "" {
-			reqPath = "/_ml/anomaly_detectors/" + jobID + "/_forecast/" + forecastID
+			reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/_forecast/" + escapeCommaIDSegs(forecastID)
 		} else {
-			reqPath = "/_ml/anomaly_detectors/" + jobID + "/_forecast"
+			reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/_forecast"
 		}
 
 	case "ml.delete_expired_data":
@@ -5534,7 +5656,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			reqPath = "/_ml/_delete_expired_data"
 		default:
 			method = http.MethodPost
-			reqPath = "/_ml/anomaly_detectors/" + jobID + "/_delete_expired_data"
+			reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/_delete_expired_data"
 		}
 
 	case "ml.validate":
@@ -5560,9 +5682,9 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			return nil, fmt.Errorf("ml.get_buckets requires job_id parameter")
 		}
 		if ts := popString("timestamp"); ts != "" {
-			reqPath = "/_ml/anomaly_detectors/" + jobID + "/results/buckets/" + ts
+			reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/results/buckets/" + escapeIDSeg(ts)
 		} else {
-			reqPath = "/_ml/anomaly_detectors/" + jobID + "/results/buckets"
+			reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/results/buckets"
 		}
 
 	case "ml.get_overall_buckets":
@@ -5575,7 +5697,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" {
 			return nil, fmt.Errorf("ml.get_overall_buckets requires job_id parameter")
 		}
-		reqPath = "/_ml/anomaly_detectors/" + jobID + "/results/overall_buckets"
+		reqPath = "/_ml/anomaly_detectors/" + escapeCommaIDSegs(jobID) + "/results/overall_buckets"
 
 	case "ml.get_records":
 		if hasBody && rawBody != nil {
@@ -5587,7 +5709,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" {
 			return nil, fmt.Errorf("ml.get_records requires job_id parameter")
 		}
-		reqPath = "/_ml/anomaly_detectors/" + jobID + "/results/records"
+		reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/results/records"
 
 	case "ml.get_categories":
 		if hasBody && rawBody != nil {
@@ -5600,9 +5722,9 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			return nil, fmt.Errorf("ml.get_categories requires job_id parameter")
 		}
 		if catID := popString("category_id"); catID != "" {
-			reqPath = "/_ml/anomaly_detectors/" + jobID + "/results/categories/" + catID
+			reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/results/categories/" + escapeIDSeg(catID)
 		} else {
-			reqPath = "/_ml/anomaly_detectors/" + jobID + "/results/categories"
+			reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/results/categories"
 		}
 
 	case "ml.get_influencers":
@@ -5615,7 +5737,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" {
 			return nil, fmt.Errorf("ml.get_influencers requires job_id parameter")
 		}
-		reqPath = "/_ml/anomaly_detectors/" + jobID + "/results/influencers"
+		reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/results/influencers"
 
 	case "ml.get_model_snapshots":
 		if hasBody && rawBody != nil {
@@ -5628,9 +5750,9 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			return nil, fmt.Errorf("ml.get_model_snapshots requires job_id parameter")
 		}
 		if snapID := popString("snapshot_id"); snapID != "" {
-			reqPath = "/_ml/anomaly_detectors/" + jobID + "/model_snapshots/" + snapID
+			reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/model_snapshots/" + escapeIDSeg(snapID)
 		} else {
-			reqPath = "/_ml/anomaly_detectors/" + jobID + "/model_snapshots"
+			reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/model_snapshots"
 		}
 
 	case "ml.update_model_snapshot":
@@ -5640,7 +5762,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" || snapID == "" {
 			return nil, fmt.Errorf("ml.update_model_snapshot requires job_id and snapshot_id parameters")
 		}
-		reqPath = "/_ml/anomaly_detectors/" + jobID + "/model_snapshots/" + snapID + "/_update"
+		reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/model_snapshots/" + escapeIDSeg(snapID) + "/_update"
 
 	case "ml.delete_model_snapshot":
 		method = http.MethodDelete
@@ -5649,7 +5771,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" || snapID == "" {
 			return nil, fmt.Errorf("ml.delete_model_snapshot requires job_id and snapshot_id parameters")
 		}
-		reqPath = "/_ml/anomaly_detectors/" + jobID + "/model_snapshots/" + snapID
+		reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/model_snapshots/" + escapeIDSeg(snapID)
 
 	case "ml.revert_model_snapshot":
 		method = http.MethodPost
@@ -5658,7 +5780,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" || snapID == "" {
 			return nil, fmt.Errorf("ml.revert_model_snapshot requires job_id and snapshot_id parameters")
 		}
-		reqPath = "/_ml/anomaly_detectors/" + jobID + "/model_snapshots/" + snapID + "/_revert"
+		reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/model_snapshots/" + escapeIDSeg(snapID) + "/_revert"
 
 	case "ml.upgrade_job_snapshot":
 		method = http.MethodPost
@@ -5667,7 +5789,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" || snapID == "" {
 			return nil, fmt.Errorf("ml.upgrade_job_snapshot requires job_id and snapshot_id parameters")
 		}
-		reqPath = "/_ml/anomaly_detectors/" + jobID + "/model_snapshots/" + snapID + "/_upgrade"
+		reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/model_snapshots/" + escapeIDSeg(snapID) + "/_upgrade"
 
 	case "ml.get_model_snapshot_upgrade_stats":
 		method = http.MethodGet
@@ -5676,7 +5798,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if jobID == "" || snapID == "" {
 			return nil, fmt.Errorf("ml.get_model_snapshot_upgrade_stats requires job_id and snapshot_id parameters")
 		}
-		reqPath = "/_ml/anomaly_detectors/" + jobID + "/model_snapshots/" + snapID + "/_upgrade/_stats"
+		reqPath = "/_ml/anomaly_detectors/" + escapeIDSeg(jobID) + "/model_snapshots/" + escapeIDSeg(snapID) + "/_upgrade/_stats"
 
 	case "security.activate_profile", "security.activate_user_profile":
 		method = http.MethodPost
@@ -5748,7 +5870,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("security.update_cross_cluster_api_key requires id parameter")
 		}
-		reqPath = "/_security/cross_cluster/api_key/" + id
+		reqPath = "/_security/cross_cluster/api_key/" + escapeIDSeg(id)
 
 	case "transform.reset_transform":
 		method = http.MethodPost
@@ -5756,7 +5878,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("transform.reset_transform requires transform_id parameter")
 		}
-		reqPath = "/_transform/" + id + "/_reset"
+		reqPath = "/_transform/" + escapeIDSeg(id) + "/_reset"
 
 	case "transform.upgrade_transforms":
 		method = http.MethodPost
@@ -5768,7 +5890,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("transform.schedule_now_transform requires transform_id parameter")
 		}
-		reqPath = "/_transform/" + id + "/_schedule_now"
+		reqPath = "/_transform/" + escapeIDSeg(id) + "/_schedule_now"
 
 	case "ingest.put_geoip_database":
 		method = http.MethodPut
@@ -5852,10 +5974,11 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	}
 
 	return &httpRequestSpec{
-		method: method,
-		path:   reqPath,
-		query:  query,
-		body:   bodyBytes,
+		method:   method,
+		path:     reqPath,
+		query:    query,
+		body:     bodyBytes,
+		isNDJSON: isNDJSON,
 	}, nil
 }
 
@@ -6027,6 +6150,7 @@ func escapeIDSeg(raw string) string {
 		return ""
 	}
 	escaped := url.PathEscape(raw)
+	escaped = strings.ReplaceAll(escaped, "%2A", "*")
 	escaped = strings.ReplaceAll(escaped, "#", "%23")
 	escaped = strings.ReplaceAll(escaped, "?", "%3F")
 	return escaped
@@ -6047,6 +6171,10 @@ func escapeCommaIDSegs(raw string) string {
 }
 
 func (c *runnerContext) rawHTTP(method, reqPath string, query url.Values, body []byte, headers map[string]string) (int, string, error) {
+	return c.rawHTTPWithContentType(method, reqPath, query, body, headers, false)
+}
+
+func (c *runnerContext) rawHTTPWithContentType(method, reqPath string, query url.Values, body []byte, headers map[string]string, isNDJSON bool) (int, string, error) {
 	fullURL := c.baseURL + sanitizeRawReqPath(reqPath)
 	if len(query) > 0 {
 		fullURL += "?" + query.Encode()
@@ -6059,7 +6187,9 @@ func (c *runnerContext) rawHTTP(method, reqPath string, query url.Values, body [
 	if err != nil {
 		return 0, "", err
 	}
-	if len(body) > 0 {
+	if isNDJSON {
+		req.Header.Set("Content-Type", "application/x-ndjson")
+	} else if len(body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	for k, v := range headers {
@@ -6087,19 +6217,45 @@ func (c *runnerContext) rawHTTP(method, reqPath string, query url.Values, body [
 }
 
 func parseResponsePayload(bodyStr string) any {
+	parsed, _ := parseResponsePayloadWithContentType(bodyStr, "")
+	return parsed
+}
+
+func parseResponsePayloadWithContentType(bodyStr, contentType string) (any, responseBodyKind) {
 	trimmed := strings.TrimSpace(bodyStr)
 	if trimmed == "" {
-		return nil
+		return nil, bodyKindEmptyText
+	}
+	ctLower := strings.ToLower(contentType)
+	isYAML := strings.Contains(ctLower, "yaml") ||
+		trimmed == "---" ||
+		strings.HasPrefix(trimmed, "---\n") ||
+		strings.HasPrefix(trimmed, "---\r\n") ||
+		strings.HasPrefix(trimmed, "--- ")
+	if isYAML {
+		if docs, err := ParseYAMLDocuments(bodyStr); err == nil {
+			if len(docs) == 0 {
+				return nil, bodyKindJSONNull
+			}
+			native := ToNative(docs[0])
+			if native == nil {
+				return nil, bodyKindJSONNull
+			}
+			return native, bodyKindParsed
+		}
+	}
+	if trimmed == "null" && !strings.Contains(ctLower, "text/plain") {
+		return nil, bodyKindJSONNull
 	}
 	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
 		var parsed any
 		dec := json.NewDecoder(strings.NewReader(trimmed))
 		dec.UseNumber()
 		if err := dec.Decode(&parsed); err == nil {
-			return normalizeJSONNumbers(parsed)
+			return normalizeJSONNumbers(parsed), bodyKindParsed
 		}
 	}
-	return bodyStr
+	return bodyStr, bodyKindParsed
 }
 
 func normalizeJSONNumbers(v any) any {
@@ -6944,6 +7100,13 @@ func (c *runnerContext) execMatch(rawVal any) error {
 		if !found {
 			return fmt.Errorf("match: path %q not found in response: %s", fieldPath, c.lastBodyRaw)
 		}
+		if (fieldPath == "$body" || fieldPath == "") && c.lastBodyRaw != "" {
+			if _, expIsStr := expected.(string); expIsStr {
+				if _, actIsStr := actual.(string); !actIsStr && actual != nil {
+					actual = c.lastBodyRaw
+				}
+			}
+		}
 		if err := matchValues(fieldPath, actual, expected); err != nil {
 			if strings.Contains(fieldPath, "_arbitrary_key_") {
 				matchedAny := false
@@ -6963,18 +7126,68 @@ func (c *runnerContext) execMatch(rawVal any) error {
 	return nil
 }
 
+func compileComplianceRegex(spec string) (*regexp.Regexp, bool, error) {
+	if len(spec) < 2 || spec[0] != '/' {
+		return nil, false, nil
+	}
+	lastSlash := strings.LastIndexByte(spec, '/')
+	if lastSlash <= 0 {
+		return nil, false, nil
+	}
+	backslashes := 0
+	for i := lastSlash - 1; i >= 1 && spec[i] == '\\'; i-- {
+		backslashes++
+	}
+	if backslashes%2 == 1 {
+		return nil, false, nil
+	}
+	rawFlags := spec[lastSlash+1:]
+	hasI := false
+	hasM := false
+	for i := 0; i < len(rawFlags); i++ {
+		switch rawFlags[i] {
+		case 'i':
+			hasI = true
+		case 'm':
+			hasM = true
+		case 's':
+			// DOTALL is enabled by default in rest-api-spec regexes.
+		default:
+			return nil, false, nil
+		}
+	}
+	pattern := spec[1:lastSlash]
+	var flagBuf strings.Builder
+	flagBuf.WriteString("(?s")
+	if hasI {
+		flagBuf.WriteByte('i')
+	}
+	if hasM {
+		flagBuf.WriteByte('m')
+	}
+	flagBuf.WriteByte(')')
+	re, err := regexp.Compile(flagBuf.String() + pattern)
+	if err != nil {
+		return nil, true, err
+	}
+	return re, true, nil
+}
+
 func matchValues(fieldPath string, actual, expected any) error {
-	if expStr, ok := expected.(string); ok && strings.HasPrefix(expStr, "/") && strings.HasSuffix(expStr, "/") && len(expStr) >= 2 {
-		pattern := expStr[1 : len(expStr)-1]
-		re, err := regexp.Compile(pattern)
-		if err != nil {
-			return fmt.Errorf("match %q: invalid regex %q: %w", fieldPath, expStr, err)
+	if expStr, ok := expected.(string); ok {
+		if re, isRegex, err := compileComplianceRegex(expStr); isRegex {
+			if err != nil {
+				return fmt.Errorf("match %q: invalid regex %q: %w", fieldPath, expStr, err)
+			}
+			if actual == nil {
+				return fmt.Errorf("match %q: value is null, expected regex %s", fieldPath, expStr)
+			}
+			actStr := fmt.Sprintf("%v", actual)
+			if !re.MatchString(actStr) {
+				return fmt.Errorf("match %q: value %q did not match regex %s", fieldPath, actStr, expStr)
+			}
+			return nil
 		}
-		actStr := fmt.Sprintf("%v", actual)
-		if !re.MatchString(actStr) {
-			return fmt.Errorf("match %q: value %q did not match regex %s", fieldPath, actStr, expStr)
-		}
-		return nil
 	}
 
 	if valuesEqual(actual, expected) {
@@ -7124,13 +7337,13 @@ func valuesEqual(a, b any) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	if bs, ok := b.(string); ok && len(bs) >= 2 && strings.HasPrefix(bs, "/") && strings.HasSuffix(bs, "/") {
-		pattern := bs[1 : len(bs)-1]
-		re, err := regexp.Compile(pattern)
-		if err != nil {
-			return false
+	if bs, ok := b.(string); ok {
+		if re, isRegex, err := compileComplianceRegex(bs); isRegex {
+			if err != nil {
+				return false
+			}
+			return re.MatchString(fmt.Sprintf("%v", a))
 		}
-		return re.MatchString(fmt.Sprintf("%v", a))
 	}
 	if as, ok := a.(string); ok {
 		bs, bOk := b.(string)
@@ -7222,17 +7435,17 @@ func (c *runnerContext) execIsTrue(rawVal any) error {
 	if rawVal != nil {
 		fieldPath = c.expandStashPath(fmt.Sprintf("%v", rawVal))
 	}
-	if fieldPath == "" {
+	if fieldPath == "" || fieldPath == "$body" {
 		if c.lastMethod == http.MethodHead {
 			if c.lastStatus == http.StatusOK {
 				return nil
 			}
-			return fmt.Errorf("is_true '': expected HEAD HTTP 200, got %d", c.lastStatus)
+			return fmt.Errorf("is_true %q: expected HEAD HTTP 200, got %d", fieldPath, c.lastStatus)
 		}
 		if isTruthy(c.lastResponse) {
 			return nil
 		}
-		return fmt.Errorf("is_true '': response is not truthy: %s", c.lastBodyRaw)
+		return fmt.Errorf("is_true %q: response is not truthy: %s", fieldPath, c.lastBodyRaw)
 	}
 	if strings.Contains(fieldPath, "_arbitrary_key_") {
 		for _, cand := range c.lookupAllResponsePaths(fieldPath) {
@@ -7254,17 +7467,17 @@ func (c *runnerContext) execIsFalse(rawVal any) error {
 	if rawVal != nil {
 		fieldPath = c.expandStashPath(fmt.Sprintf("%v", rawVal))
 	}
-	if fieldPath == "" {
+	if fieldPath == "" || fieldPath == "$body" {
 		if c.lastMethod == http.MethodHead {
 			if c.lastStatus == http.StatusNotFound {
 				return nil
 			}
-			return fmt.Errorf("is_false '': expected HEAD HTTP 404, got %d", c.lastStatus)
+			return fmt.Errorf("is_false %q: expected HEAD HTTP 404, got %d", fieldPath, c.lastStatus)
 		}
 		if !isTruthy(c.lastResponse) {
 			return nil
 		}
-		return fmt.Errorf("is_false '': response is truthy: %s", c.lastBodyRaw)
+		return fmt.Errorf("is_false %q: response is truthy: %s", fieldPath, c.lastBodyRaw)
 	}
 	if strings.Contains(fieldPath, "_arbitrary_key_") {
 		for _, cand := range c.lookupAllResponsePaths(fieldPath) {
@@ -7277,6 +7490,36 @@ func (c *runnerContext) execIsFalse(rawVal any) error {
 	val, found := c.lookupResponsePath(fieldPath)
 	if found && isTruthy(val) {
 		return fmt.Errorf("is_false %q failed: got truthy value %v (response: %s)", fieldPath, val, c.lastBodyRaw)
+	}
+	return nil
+}
+
+func (c *runnerContext) execIsUnset(rawVal any) error {
+	fieldPath := ""
+	if rawVal != nil {
+		fieldPath = c.expandStashPath(fmt.Sprintf("%v", rawVal))
+	}
+	if fieldPath == "" || fieldPath == "$body" {
+		if c.lastMethod == http.MethodHead ||
+			c.lastBodyKind == bodyKindNone ||
+			(c.lastBodyKind == bodyKindUnset && c.lastStatus != 0 && c.lastResponse == nil && c.lastBodyRaw == "") {
+			if c.lastStatus == http.StatusNotFound {
+				return nil
+			}
+			return fmt.Errorf("is_unset %q: expected HTTP 404, got %d", fieldPath, c.lastStatus)
+		}
+	}
+	if strings.Contains(fieldPath, "_arbitrary_key_") {
+		for _, cand := range c.lookupAllResponsePaths(fieldPath) {
+			if cand != nil {
+				return fmt.Errorf("is_unset %q failed: got non-null value %v (response: %s)", fieldPath, cand, c.lastBodyRaw)
+			}
+		}
+		return nil
+	}
+	val, exists := c.lookupResponsePath(fieldPath)
+	if exists && val != nil {
+		return fmt.Errorf("is_unset %q failed: got non-null value %v (response: %s)", fieldPath, val, c.lastBodyRaw)
 	}
 	return nil
 }
@@ -7733,7 +7976,16 @@ func extractFieldPairs(op string, raw any) ([]YAMLField, error) {
 
 func (c *runnerContext) resolveResponseRootAndSegments(rawPath string) (any, []string, bool) {
 	if rawPath == "" || rawPath == "$body" {
-		return c.lastResponse, nil, c.lastResponse != nil
+		switch c.lastBodyKind {
+		case bodyKindNone:
+			return nil, nil, false
+		case bodyKindEmptyText:
+			return "", nil, true
+		case bodyKindJSONNull:
+			return nil, nil, true
+		case bodyKindParsed, bodyKindUnset:
+			return c.lastResponse, nil, c.lastResponse != nil
+		}
 	}
 	rawPath = strings.TrimPrefix(rawPath, "$body.")
 	if rawPath == "$headers" {
@@ -7778,7 +8030,7 @@ func (c *runnerContext) lookupResponsePath(rawPath string) (any, bool) {
 		return nil, false
 	}
 	if len(segments) == 0 {
-		return root, root != nil
+		return root, true
 	}
 	return lookupSegments(root, segments)
 }

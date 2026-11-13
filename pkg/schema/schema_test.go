@@ -19,6 +19,7 @@ package schema
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -2048,14 +2049,30 @@ func TestRound50ShredderNestedRangeArrayNullValueAndCopyToGuards(t *testing.T) {
 		t.Fatalf("F18 expected f__age == -1 for [null] with null_value=-1, got %v", row1["f__age"])
 	}
 	copied1, _ := row1["f__all_copied"].([]any)
-	hasProd := false
 	for _, v := range copied1 {
+		if v == "production" {
+			t.Fatalf("F13 expected omitted constant_keyword NOT to copy 'production' to f__all_copied, got %v", row1["f__all_copied"])
+		}
+	}
+	shredded1b, err := ShredDocument(idxSchema, "1b", 1, false, []byte(`{
+		"const_env": "production"
+	}`))
+	if err != nil {
+		t.Fatalf("ShredDocument 1b failed: %v", err)
+	}
+	var row1b map[string]any
+	if err := json.Unmarshal(shredded1b, &row1b); err != nil {
+		t.Fatalf("unmarshal row1b failed: %v", err)
+	}
+	copied1b, _ := row1b["f__all_copied"].([]any)
+	hasProd := false
+	for _, v := range copied1b {
 		if v == "production" {
 			hasProd = true
 		}
 	}
 	if !hasProd {
-		t.Fatalf("F18 expected omitted constant_keyword to copy 'production' to f__all_copied, got %v", row1["f__all_copied"])
+		t.Fatalf("F13 expected present constant_keyword to copy 'production' to f__all_copied, got %v", row1b["f__all_copied"])
 	}
 	// F12: nested range subfield normalized with _gte and _lte in nested JSON element
 	nestedItems, _ := row1["n__items"].([]any)
@@ -2074,7 +2091,8 @@ func TestRound50ShredderNestedRangeArrayNullValueAndCopyToGuards(t *testing.T) {
 	if err := json.Unmarshal(shredded2, &row2); err != nil {
 		t.Fatalf("unmarshal row2 failed: %v", err)
 	}
-	for _, v := range row2["f__all_copied"].([]any) {
+	copied2, _ := row2["f__all_copied"].([]any)
+	for _, v := range copied2 {
 		if v == "not_an_int" {
 			t.Fatalf("F18 expected malformed age not to be copied to f__all_copied, got %v", row2["f__all_copied"])
 		}
@@ -2294,8 +2312,8 @@ func TestRound52SchemaAndShredderF15ToF17(t *testing.T) {
 	if err != nil {
 		t.Fatalf("F17 expected MaxUint64 decimal string '18446744073709551615.0' to succeed, got %v", err)
 	}
-	if !strings.Contains(string(rowMaxUL), `"f__u":9223372036854775807`) {
-		t.Fatalf("F17 expected MaxUint64 clamped to MaxInt64 in f__u, got %s", string(rowMaxUL))
+	if !strings.Contains(string(rowMaxUL), `"f__u":18446744073709551615`) {
+		t.Fatalf("F10 expected exact MaxUint64 18446744073709551615 in f__u, got %s", string(rowMaxUL))
 	}
 }
 
@@ -2375,7 +2393,7 @@ func TestRound53SchemaAndShredderF15F16(t *testing.T) {
 	shredOK, err := ShredDocument(sch, "1", 1, false, []byte(`{
 		"ml_tokens": {"shoes": 1.5, "running": "0.75"},
 		"topics": {"sports": 2.5},
-		"vec": [0.1, 0.2, 0.3],
+		"vec": [0.6, 0.8, 0.0],
 		"title": "running shoes",
 		"rel": "question",
 		"items": [{"sub_tokens": {"boots": 1.2}}]
@@ -3130,14 +3148,17 @@ func TestRound57SchemaAndShredderValidation(t *testing.T) {
 	if _, err := ShredDocument(vecSchema, "z1", 1, false, []byte(`{"cos_vec":[0,0,0]}`)); err == nil || !strings.Contains(err.Error(), "Zero-magnitude vectors are not supported when using [cosine] similarity") {
 		t.Fatalf("F16 expected zero-magnitude cosine vector rejection, got %v", err)
 	}
+	if _, err := ShredDocument(vecSchema, "z_nonunit", 1, false, []byte(`{"dot_vec":[2.0,3.0,4.0]}`)); err == nil || !strings.Contains(err.Error(), "illegal_argument_exception") {
+		t.Fatalf("F14 expected non-unit dot_product vector rejection, got %v", err)
+	}
 	okVecBytes, err := ShredDocument(vecSchema, "z2", 1, false, []byte(`{
 		"cos_vec": [0, 1, 0],
 		"cos_lenient": [0, 0, 0],
 		"l2_vec": [0, 0, 0],
-		"dot_vec": [2.0, 3.0, 4.0]
+		"dot_vec": [0.6, 0.8, 0.0]
 	}`))
 	if err != nil {
-		t.Fatalf("F16 expected lenient cosine + l2 zero + non-unit dot_product to succeed, got %v", err)
+		t.Fatalf("F16/F14 expected lenient cosine + l2 zero + unit dot_product to succeed, got %v", err)
 	}
 	var okVecRow map[string]any
 	if err := json.Unmarshal(okVecBytes, &okVecRow); err != nil {
@@ -3377,4 +3398,252 @@ func TestRound58SchemaAndShredder_F10ToF15(t *testing.T) {
 		t.Fatalf("F15 expected depth 3 flattened object to fail depth_limit=2, got %v", err)
 	}
 	_ = math.MaxFloat32
+}
+
+func TestRound59_SchemaDDLShredderCompliance(t *testing.T) {
+	// F10: unsigned_long DorisLargeInt DDL & exact uint64 shredding + signed long overflow rejection
+	var f10Spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"ul": {"type": "unsigned_long"},
+			"sl": {"type": "long"},
+			"sl_lenient": {"type": "long", "ignore_malformed": true}
+		}
+	}`), &f10Spec); err != nil {
+		t.Fatal(err)
+	}
+	f10Schema := CompileIndexSchema("es_db", "r59_f10", &f10Spec)
+	if f10Schema.Fields["ul"].DorisType != DorisLargeInt {
+		t.Fatalf("F10 expected ul DorisLargeInt, got %s", f10Schema.Fields["ul"].DorisType)
+	}
+	ddl := GenerateCreateTableDDL(f10Schema)
+	if !strings.Contains(ddl, "`f__ul` LARGEINT NULL") || !strings.Contains(ddl, "USING INVERTED") {
+		t.Fatalf("F10 expected LARGEINT with USING INVERTED in DDL, got:\n%s", ddl)
+	}
+	decodeShredRow := func(raw []byte) map[string]any {
+		t.Helper()
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		var m map[string]any
+		if err := dec.Decode(&m); err != nil {
+			t.Fatalf("decodeShredRow failed: %v", err)
+		}
+		return m
+	}
+	rowULBytes, err := ShredDocument(f10Schema, "1", 1, false, []byte(`{"ul": 18446744073709551615, "sl": 9223372036854775807}`))
+	if err != nil {
+		t.Fatalf("F10 valid max uint64/int64 shred failed: %v", err)
+	}
+	rowUL := decodeShredRow(rowULBytes)
+	if fmt.Sprint(rowUL["f__ul"]) != "18446744073709551615" {
+		t.Fatalf("F10 expected exact MaxUint64 18446744073709551615, got %T %v", rowUL["f__ul"], rowUL["f__ul"])
+	}
+	if _, err := ShredDocument(f10Schema, "2", 1, false, []byte(`{"sl": 9223372036854775808}`)); err == nil || !strings.Contains(err.Error(), "mapper_parsing_exception") {
+		t.Fatalf("F10 expected signed long overflow > MaxInt64 to fail with mapper_parsing_exception, got %v", err)
+	}
+	if _, err := ShredDocument(f10Schema, "3", 1, false, []byte(`{"sl": -9223372036854775809}`)); err == nil || !strings.Contains(err.Error(), "mapper_parsing_exception") {
+		t.Fatalf("F10 expected signed long underflow < MinInt64 to fail, got %v", err)
+	}
+	if _, err := ShredDocument(f10Schema, "4", 1, false, []byte(`{"sl_lenient": 18446744073709551615}`)); err != nil {
+		t.Fatalf("F10 expected ignore_malformed=true on signed long overflow to succeed, got %v", err)
+	}
+	if _, err := ShredDocument(f10Schema, "5", 1, false, []byte(`{"ul": -1}`)); err == nil {
+		t.Fatalf("F10 expected negative unsigned_long to fail")
+	}
+
+	// F11: _source validation, immutability, shredding (disabled + includes/excludes), custom dynamic_date_formats & dynamic: "runtime"
+	for _, badSrc := range []string{
+		`{"_source":{"enabled":false,"includes":["a"]}}`,
+		`{"_source":{"bogus":true}}`,
+		`{"_source":{"enabled":"not_a_bool"}}`,
+	} {
+		var bad esast.MappingSpec
+		_ = json.Unmarshal([]byte(badSrc), &bad)
+		if err := ValidateMappingSpec(&bad); err == nil || !strings.Contains(err.Error(), "mapper_parsing_exception") {
+			t.Fatalf("F11 expected invalid _source %s to fail, got %v", badSrc, err)
+		}
+	}
+	var srcDisabledSpec, srcEnabledSpec, srcFilteredSpec esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{"_source":{"enabled":false},"properties":{"k":{"type":"keyword"}}}`), &srcDisabledSpec)
+	_ = json.Unmarshal([]byte(`{"_source":{"enabled":true},"properties":{"k":{"type":"keyword"}}}`), &srcEnabledSpec)
+	_ = json.Unmarshal([]byte(`{"_source":{"includes":["keep*"],"excludes":["keep_secret"]},"properties":{"keep_ok":{"type":"keyword"}}}`), &srcFilteredSpec)
+	if err := ValidateMappingSpec(&srcDisabledSpec); err != nil {
+		t.Fatalf("F11 valid disabled _source failed: %v", err)
+	}
+	if err := ValidateMappingUpdateCompatibility(&srcDisabledSpec, &srcEnabledSpec); err == nil || !strings.Contains(err.Error(), "illegal_argument_exception") {
+		t.Fatalf("F11 expected _source mutation to fail with illegal_argument_exception, got %v", err)
+	}
+	disSchema := CompileIndexSchema("es_db", "r59_src_dis", &srcDisabledSpec)
+	if !disSchema.SourceDisabled() {
+		t.Fatalf("F11 expected SourceDisabled()=true")
+	}
+	disRowBytes, err := ShredDocument(disSchema, "d1", 1, false, []byte(`{"k":"v","extra":123}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	disRow := decodeShredRow(disRowBytes)
+	if disRow["_source"] != "" || disRow["_doc"] == nil {
+		t.Fatalf("F11 expected empty _source and populated _doc when _source disabled, got _source=%q _doc=%v", disRow["_source"], disRow["_doc"])
+	}
+	filtSchema := CompileIndexSchema("es_db", "r59_src_filt", &srcFilteredSpec)
+	filtRowBytes, err := ShredDocument(filtSchema, "f1", 1, false, []byte(`{"keep_ok":"yes","keep_secret":"no","drop_me":"bye"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	filtRow := decodeShredRow(filtRowBytes)
+	filtSrc, _ := filtRow["_source"].(string)
+	if !strings.Contains(filtSrc, "keep_ok") || strings.Contains(filtSrc, "keep_secret") || strings.Contains(filtSrc, "drop_me") {
+		t.Fatalf("F11 expected filtered _source, got %s", filtSrc)
+	}
+
+	var dynDateBase esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{"dynamic_date_formats":["yyyy/MM/dd"]}`), &dynDateBase)
+	inferredSpec := InferMappingFromSampleDocs([]json.RawMessage{json.RawMessage(`{"dt":"2026/05/20"}`)}, &dynDateBase)
+	if inferredSpec == nil || inferredSpec.Properties["dt"].Type != "date" || inferredSpec.Properties["dt"].Format != "yyyy/MM/dd" {
+		t.Fatalf("F11 expected inferred date with Format='yyyy/MM/dd', got %+v", inferredSpec)
+	}
+	dynDateSchema := CompileIndexSchema("es_db", "r59_dyndate", inferredSpec)
+	if _, err := ShredDocument(dynDateSchema, "dd1", 1, false, []byte(`{"dt":"2026/05/20"}`)); err != nil {
+		t.Fatalf("F11 ShredDocument with inferred custom dynamic_date_formats failed: %v", err)
+	}
+
+	var dynRtBase esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{"dynamic":"runtime","properties":{"id":{"type":"keyword"}}}`), &dynRtBase)
+	rtMap, rtAdded := InferDynamicRuntimeFieldsFromDocs([]json.RawMessage{
+		json.RawMessage(`{"id":"1","cnt":42,"ratio":3.5,"flag":true,"ip_addr":"10.0.0.1","ts":"2026-03-01T00:00:00Z","tag":"hello"}`),
+	}, &dynRtBase)
+	if !rtAdded || rtMap["cnt"].Type != "long" || rtMap["ratio"].Type != "double" || rtMap["flag"].Type != "boolean" || rtMap["ip_addr"].Type != "ip" || rtMap["ts"].Type != "date" || rtMap["tag"].Type != "keyword" {
+		t.Fatalf("F11 unexpected dynamic runtime inference: %+v", rtMap)
+	}
+	if _, hasID := rtMap["id"]; hasID {
+		t.Fatalf("F11 expected mapped property 'id' not to be duplicated into runtime")
+	}
+
+	// F12: Mapping limits & index-level coerce / ignore_malformed defaults
+	var limSpec esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{"properties":{"a":{"type":"keyword"},"b":{"type":"keyword"},"n":{"type":"nested","properties":{"c":{"type":"keyword"}}}}}`), &limSpec)
+	limSchema := CompileIndexSchema("es_db", "r59_lim", &limSpec)
+	limSchema.MaxTotalFields = 2
+	if err := ValidateMappingLimits(limSchema, &limSpec); err == nil || !strings.Contains(err.Error(), "total fields") {
+		t.Fatalf("F12 expected total_fields.limit error, got %v", err)
+	}
+	limSchema.MaxTotalFields = 100
+	limSchema.MaxNestedFields = 0
+	limSchema.HasExplicitNestedLimit = true
+	if err := ValidateMappingLimits(limSchema, &limSpec); err == nil || !strings.Contains(err.Error(), "nested fields") {
+		t.Fatalf("F12 expected nested_fields.limit error, got %v", err)
+	}
+	limSchema.MaxNestedFields = 50
+	limSchema.MaxDepth = 1
+	if err := ValidateMappingLimits(limSchema, &limSpec); err == nil || !strings.Contains(err.Error(), "maximumMappingDepth") && !strings.Contains(err.Error(), "depth") {
+		t.Fatalf("F12 expected depth.limit error, got %v", err)
+	}
+
+	var defSpec esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{"properties":{"n_def":{"type":"integer"},"n_coerce":{"type":"integer","coerce":true},"n_strict":{"type":"integer","ignore_malformed":false},"nest":{"type":"nested"}}}`), &defSpec)
+	defSchema := CompileIndexSchema("es_db", "r59_def", &defSpec)
+	fBool, tBool := false, true
+	defSchema.DefaultCoerce = &fBool
+	if _, err := ShredDocument(defSchema, "c1", 1, false, []byte(`{"n_def":"42"}`)); err == nil {
+		t.Fatalf("F12 expected DefaultCoerce=false to reject string '42'")
+	}
+	if _, err := ShredDocument(defSchema, "c2", 1, false, []byte(`{"n_coerce":"42"}`)); err != nil {
+		t.Fatalf("F12 expected field coerce=true to override DefaultCoerce=false, got %v", err)
+	}
+	defSchema.DefaultIgnoreMalformed = &tBool
+	if _, err := ShredDocument(defSchema, "c3", 1, false, []byte(`{"n_def":"not_int"}`)); err != nil {
+		t.Fatalf("F12 expected DefaultIgnoreMalformed=true to ignore malformed n_def, got %v", err)
+	}
+	if _, err := ShredDocument(defSchema, "c4", 1, false, []byte(`{"n_strict":"not_int"}`)); err == nil {
+		t.Fatalf("F12 expected explicit ignore_malformed=false to override DefaultIgnoreMalformed=true")
+	}
+	defSchema.MaxNestedObjects = 1
+	if _, err := ShredDocument(defSchema, "c5", 1, false, []byte(`{"nest":[{"x":1},{"x":2}]}`)); err == nil || !strings.Contains(err.Error(), "nested") {
+		t.Fatalf("F12 expected MaxNestedObjects=1 to reject 2 nested objects, got %v", err)
+	}
+	defSchema.MaxFieldNameLength = 4
+	if _, err := ShredDocument(defSchema, "c6", 1, false, []byte(`{"very_long_field":1}`)); err == nil {
+		t.Fatalf("F12 expected MaxFieldNameLength=4 to reject 'very_long_field'")
+	}
+
+	// F13: constant_keyword HasConstantValue & non-injection on missing/null/[]
+	var ckSpec esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{"properties":{"env":{"type":"constant_keyword","value":"prod"},"empty_ck":{"type":"constant_keyword","value":""},"auto_ck":{"type":"constant_keyword"},"title":{"type":"keyword"}}}`), &ckSpec)
+	ckSchema := CompileIndexSchema("es_db", "r59_ck", &ckSpec)
+	if !ckSchema.Fields["env"].HasConstantValue || !ckSchema.Fields["empty_ck"].HasConstantValue || ckSchema.Fields["auto_ck"].HasConstantValue {
+		t.Fatalf("F13 unexpected HasConstantValue flags: env=%v empty=%v auto=%v",
+			ckSchema.Fields["env"].HasConstantValue, ckSchema.Fields["empty_ck"].HasConstantValue, ckSchema.Fields["auto_ck"].HasConstantValue)
+	}
+	ckMissingBytes, err := ShredDocument(ckSchema, "ck1", 1, false, []byte(`{"title":"hello"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ckMissingRow := decodeShredRow(ckMissingBytes)
+	if ckMissingRow["f__env"] != nil {
+		t.Fatalf("F13 expected missing constant_keyword to stay nil, got %v", ckMissingRow["f__env"])
+	}
+	ckNullBytes, err := ShredDocument(ckSchema, "ck2", 1, false, []byte(`{"env":null,"title":"hello"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ckNullRow := decodeShredRow(ckNullBytes)
+	if ckNullRow["f__env"] != nil {
+		t.Fatalf("F13 expected null constant_keyword to stay nil, got %v", ckNullRow["f__env"])
+	}
+	ckEmptyArrBytes, err := ShredDocument(ckSchema, "ck3", 1, false, []byte(`{"env":[],"title":"hello"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ckEmptyArrRow := decodeShredRow(ckEmptyArrBytes)
+	if ckEmptyArrRow["f__env"] != nil {
+		t.Fatalf("F13 expected [] constant_keyword to stay nil, got %v", ckEmptyArrRow["f__env"])
+	}
+
+	// F14: dense_vector dot_product unit-length, element_type (float/byte/bit), and index: false
+	for _, badVec := range []string{
+		`{"properties":{"v":{"type":"dense_vector","index":false,"similarity":"cosine"}}}`,
+		`{"properties":{"v":{"type":"dense_vector","dims":8,"element_type":"bit","similarity":"cosine"}}}`,
+		`{"properties":{"v":{"type":"dense_vector","dims":4,"element_type":"byte","similarity":"dot_product"}}}`,
+		`{"properties":{"v":{"type":"dense_vector","dims":10,"element_type":"bit"}}}`,
+		`{"properties":{"v":{"type":"dense_vector","dims":4,"element_type":"uint16"}}}`,
+	} {
+		var bad esast.MappingSpec
+		_ = json.Unmarshal([]byte(badVec), &bad)
+		if err := ValidateMappingSpec(&bad); err == nil {
+			t.Fatalf("F14 expected invalid dense_vector mapping %s to fail", badVec)
+		}
+	}
+	var vecSpec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"dp": {"type": "dense_vector", "dims": 2, "similarity": "dot_product"},
+			"bv": {"type": "dense_vector", "dims": 4, "element_type": "byte"},
+			"bitv": {"type": "dense_vector", "dims": 16, "element_type": "bit"},
+			"unidx": {"type": "dense_vector", "index": false}
+		}
+	}`), &vecSpec); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateMappingSpec(&vecSpec); err != nil {
+		t.Fatalf("F14 valid dense_vector spec failed: %v", err)
+	}
+	vecSchema := CompileIndexSchema("es_db", "r59_vec", &vecSpec)
+	if _, err := ShredDocument(vecSchema, "v_bad_dp", 1, false, []byte(`{"dp":[3.0, 4.0]}`)); err == nil || !strings.Contains(err.Error(), "illegal_argument_exception") {
+		t.Fatalf("F14 expected non-unit dot_product vector to fail with illegal_argument_exception, got %v", err)
+	}
+	if _, err := ShredDocument(vecSchema, "v_bad_byte", 1, false, []byte(`{"bv":[200, 0, 0, 0]}`)); err == nil {
+		t.Fatalf("F14 expected out-of-range byte vector element 200 to fail")
+	}
+	if _, err := ShredDocument(vecSchema, "v_bad_byte_frac", 1, false, []byte(`{"bv":[1.5, 0, 0, 0]}`)); err == nil {
+		t.Fatalf("F14 expected fractional byte vector element 1.5 to fail")
+	}
+	vecRowBytes, err := ShredDocument(vecSchema, "v_ok", 1, false, []byte(`{"dp":[0.6, 0.8],"bv":[-128, 0, 64, 127],"bitv":"800f","unidx":[1,2,3,4,5]}`))
+	if err != nil {
+		t.Fatalf("F14 valid vector document failed: %v", err)
+	}
+	vecRow := decodeShredRow(vecRowBytes)
+	bitSlice, ok := vecRow["f__bitv"].([]any)
+	if !ok || len(bitSlice) != 16 || fmt.Sprint(bitSlice[0]) != "1" || fmt.Sprint(bitSlice[15]) != "1" || fmt.Sprint(bitSlice[1]) != "0" {
+		t.Fatalf("F14 unexpected expanded bit vector: %T %v", vecRow["f__bitv"], vecRow["f__bitv"])
+	}
 }

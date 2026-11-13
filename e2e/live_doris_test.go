@@ -47,7 +47,7 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 		t.Skip("Skipping live Apache Doris container E2E test (set DORIS_E2E_DSN and DORIS_E2E_HTTP to run)")
 	}
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("mysql", proxy.ApplyDSNAuth(dsn, "", ""))
 	if err != nil {
 		t.Fatalf("failed to open Doris MySQL connection: %v", err)
 	}

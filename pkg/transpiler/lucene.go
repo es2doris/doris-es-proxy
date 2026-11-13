@@ -20,8 +20,10 @@ package transpiler
 import (
 	"fmt"
 	"math"
+	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
@@ -1287,7 +1289,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 					fname, fBoost := splitLuceneBoost(ef)
 					shoulds = append(shoulds, esast.Query{
 						Regexp: map[string]esast.RegexpEntry{
-							fname: {Value: pat, Boost: boost * fBoost, HasBoost: true},
+							fname: {Value: pat, Flags: "ALL", Boost: boost * fBoost, HasBoost: true},
 						},
 					})
 				}
@@ -1298,7 +1300,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			}
 			return esast.Query{
 				Regexp: map[string]esast.RegexpEntry{
-					field: {Value: pat, Boost: boost, HasBoost: true},
+					field: {Value: pat, Flags: "ALL", Boost: boost, HasBoost: true},
 				},
 			}
 		}
@@ -1624,7 +1626,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 					fname, fBoost := splitLuceneBoost(fpat)
 					shoulds = append(shoulds, esast.Query{
 						Regexp: map[string]esast.RegexpEntry{
-							fname: {Value: pat, Boost: boost * fBoost, HasBoost: true},
+							fname: {Value: pat, Flags: "ALL", Boost: boost * fBoost, HasBoost: true},
 						},
 					})
 				}
@@ -1637,7 +1639,7 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			}
 			return esast.Query{
 				Regexp: map[string]esast.RegexpEntry{
-					defaultField: {Value: pat, Boost: boost, HasBoost: true},
+					defaultField: {Value: pat, Flags: "ALL", Boost: boost, HasBoost: true},
 				},
 			}
 		}
@@ -2358,4 +2360,1044 @@ func validateStrictLuceneQuery(s string) error {
 		return fmt.Errorf("parse_exception: cannot parse query [%s]: unclosed range bracket", s)
 	}
 	return nil
+}
+
+type luceneRegexpFlags struct {
+	intersection bool
+	complement   bool
+	empty        bool
+	anystring    bool
+	automaton    bool
+	interval     bool
+}
+
+func parseLuceneRegexpFlags(flags string) (luceneRegexpFlags, error) {
+	trimmed := strings.TrimSpace(flags)
+	if trimmed == "" {
+		return luceneRegexpFlags{
+			intersection: true,
+			complement:   true,
+			empty:        true,
+			anystring:    true,
+			automaton:    true,
+			interval:     true,
+		}, nil
+	}
+	var out luceneRegexpFlags
+	for _, rawTok := range strings.Split(trimmed, "|") {
+		tok := strings.ToUpper(strings.TrimSpace(rawTok))
+		if tok == "" {
+			continue
+		}
+		switch tok {
+		case "ALL":
+			out.intersection = true
+			out.complement = true
+			out.empty = true
+			out.anystring = true
+			out.automaton = true
+			out.interval = true
+		case "NONE":
+			// Enables no optional syntax flags.
+		case "INTERSECTION":
+			out.intersection = true
+		case "COMPLEMENT", "DEPRECATED_COMPLEMENT":
+			out.complement = true
+		case "EMPTY":
+			out.empty = true
+		case "ANYSTRING":
+			out.anystring = true
+		case "AUTOMATON":
+			out.automaton = true
+		case "INTERVAL":
+			out.interval = true
+		default:
+			return luceneRegexpFlags{}, fmt.Errorf("illegal_argument_exception: Unknown regexp flag [%s]", strings.TrimSpace(rawTok))
+		}
+	}
+	return out, nil
+}
+
+type luceneAutoNodeKind int
+
+const (
+	luceneNodeRE2 luceneAutoNodeKind = iota
+	luceneNodeEmpty
+	luceneNodeUnion
+	luceneNodeInter
+	luceneNodeCompl
+)
+
+type luceneAutoNode struct {
+	kind       luceneAutoNodeKind
+	re2        string
+	hasLiteral bool
+	literal    string
+	isAnyStr   bool
+	children   []*luceneAutoNode
+	child      *luceneAutoNode
+	complRE2   string // optional pure-RE2 lowering for complement of finite literal / single char class
+}
+
+// LuceneRegexpCompiled holds a compiled Lucene automaton regular expression ready to render
+// full-term anchored SQL predicates (`^(?:...)$`) for both scalar columns and array elements.
+type LuceneRegexpCompiled struct {
+	IsEmpty      bool
+	NeedsNotNull bool
+	root         *luceneAutoNode
+	caseInsens   bool
+}
+
+func complementOfLiteralRE2(lit string) string {
+	runes := []rune(lit)
+	k := len(runes)
+	if k == 0 {
+		return "(?s:.+)"
+	}
+	var alts []string
+	if k == 1 {
+		alts = append(alts, "")
+	} else {
+		alts = append(alts, fmt.Sprintf("(?s:.){0,%d}", k-1))
+	}
+	var prefix strings.Builder
+	for i, r := range runes {
+		notR := fmt.Sprintf("[^%s]", escapeRE2CharClassMember(r))
+		rem := k - 1 - i
+		switch rem {
+		case 0:
+			alts = append(alts, prefix.String()+notR)
+		case 1:
+			alts = append(alts, prefix.String()+notR+"(?s:.)")
+		default:
+			alts = append(alts, fmt.Sprintf("%s%s(?s:.){%d}", prefix.String(), notR, rem))
+		}
+		prefix.WriteString(regexp.QuoteMeta(string(r)))
+	}
+	alts = append(alts, fmt.Sprintf("(?s:.){%d,}", k+1))
+	return "(?:" + strings.Join(alts, "|") + ")"
+}
+
+func escapeRE2CharClassMember(r rune) string {
+	switch r {
+	case '\\', ']', '-', '^':
+		return `\` + string(r)
+	case '\n':
+		return `\n`
+	case '\r':
+		return `\r`
+	case '\t':
+		return `\t`
+	default:
+		return string(r)
+	}
+}
+
+func buildNumericIntervalRE2(minVal, maxVal uint64, fixedWidth int) string {
+	var rangeFixed func(a, b string) string
+	charRange := func(lo, hi byte) string {
+		if lo == hi {
+			return string(lo)
+		}
+		if lo == '0' && hi == '9' {
+			return "[0-9]"
+		}
+		return fmt.Sprintf("[%c-%c]", lo, hi)
+	}
+	repeatDigits := func(n int) string {
+		if n <= 0 {
+			return ""
+		}
+		if n == 1 {
+			return "[0-9]"
+		}
+		return fmt.Sprintf("[0-9]{%d}", n)
+	}
+	allZeros := func(s string) bool {
+		for i := 0; i < len(s); i++ {
+			if s[i] != '0' {
+				return false
+			}
+		}
+		return true
+	}
+	allNines := func(s string) bool {
+		for i := 0; i < len(s); i++ {
+			if s[i] != '9' {
+				return false
+			}
+		}
+		return true
+	}
+	rangeFixed = func(a, b string) string {
+		if a == b {
+			return a
+		}
+		w := len(a)
+		if allZeros(a) && allNines(b) {
+			return repeatDigits(w)
+		}
+		cp := 0
+		for cp < w && a[cp] == b[cp] {
+			cp++
+		}
+		if cp > 0 {
+			return a[:cp] + rangeFixed(a[cp:], b[cp:])
+		}
+		if w == 1 {
+			return charRange(a[0], b[0])
+		}
+		var parts []string
+		midLo := a[0]
+		midHi := b[0]
+		if !allZeros(a[1:]) {
+			parts = append(parts, string(a[0])+rangeFixed(a[1:], strings.Repeat("9", w-1)))
+			midLo++
+		}
+		var rightPart string
+		if !allNines(b[1:]) {
+			rightPart = string(b[0]) + rangeFixed(strings.Repeat("0", w-1), b[1:])
+			midHi--
+		}
+		if midLo <= midHi {
+			parts = append(parts, charRange(midLo, midHi)+repeatDigits(w-1))
+		}
+		if rightPart != "" {
+			parts = append(parts, rightPart)
+		}
+		if len(parts) == 1 {
+			return parts[0]
+		}
+		return "(?:" + strings.Join(parts, "|") + ")"
+	}
+
+	minStr := strconv.FormatUint(minVal, 10)
+	maxStr := strconv.FormatUint(maxVal, 10)
+	if fixedWidth > 0 {
+		if len(minStr) < fixedWidth {
+			minStr = strings.Repeat("0", fixedWidth-len(minStr)) + minStr
+		}
+		if len(maxStr) < fixedWidth {
+			maxStr = strings.Repeat("0", fixedWidth-len(maxStr)) + maxStr
+		}
+		if len(minStr) == len(maxStr) {
+			return rangeFixed(minStr, maxStr)
+		}
+	}
+	var branches []string
+	curLo := minStr
+	for w := len(minStr); w <= len(maxStr); w++ {
+		if w < len(maxStr) {
+			hiW := strings.Repeat("9", w)
+			branches = append(branches, rangeFixed(curLo, hiW))
+			curLo = "1" + strings.Repeat("0", w)
+		} else {
+			branches = append(branches, rangeFixed(curLo, maxStr))
+		}
+	}
+	if len(branches) == 1 {
+		return branches[0]
+	}
+	return "(?:" + strings.Join(branches, "|") + ")"
+}
+
+type luceneRegexpParser struct {
+	runes []rune
+	pos   int
+	flags luceneRegexpFlags
+	raw   string
+}
+
+func (p *luceneRegexpParser) parseUnion() (*luceneAutoNode, error) {
+	first, err := p.parseIntersection()
+	if err != nil {
+		return nil, err
+	}
+	branches := []*luceneAutoNode{first}
+	for p.pos < len(p.runes) && p.runes[p.pos] == '|' {
+		p.pos++
+		next, err := p.parseIntersection()
+		if err != nil {
+			return nil, err
+		}
+		branches = append(branches, next)
+	}
+	if len(branches) == 1 {
+		return branches[0], nil
+	}
+	var nonEmpty []*luceneAutoNode
+	allPureRE2 := true
+	for _, br := range branches {
+		if br.kind == luceneNodeEmpty {
+			continue
+		}
+		if br.kind != luceneNodeRE2 {
+			allPureRE2 = false
+		}
+		nonEmpty = append(nonEmpty, br)
+	}
+	if len(nonEmpty) == 0 {
+		return &luceneAutoNode{kind: luceneNodeEmpty}, nil
+	}
+	if len(nonEmpty) == 1 {
+		return nonEmpty[0], nil
+	}
+	if allPureRE2 {
+		parts := make([]string, len(nonEmpty))
+		for i, br := range nonEmpty {
+			parts[i] = br.re2
+		}
+		return &luceneAutoNode{
+			kind: luceneNodeRE2,
+			re2:  "(?:" + strings.Join(parts, "|") + ")",
+		}, nil
+	}
+	return &luceneAutoNode{
+		kind:     luceneNodeUnion,
+		children: nonEmpty,
+	}, nil
+}
+
+func (p *luceneRegexpParser) parseIntersection() (*luceneAutoNode, error) {
+	first, err := p.parseConcat()
+	if err != nil {
+		return nil, err
+	}
+	if !p.flags.intersection {
+		return first, nil
+	}
+	conjuncts := []*luceneAutoNode{first}
+	for p.pos < len(p.runes) && p.runes[p.pos] == '&' {
+		p.pos++
+		next, err := p.parseConcat()
+		if err != nil {
+			return nil, err
+		}
+		conjuncts = append(conjuncts, next)
+	}
+	if len(conjuncts) == 1 {
+		return conjuncts[0], nil
+	}
+	var filtered []*luceneAutoNode
+	for _, c := range conjuncts {
+		if c.kind == luceneNodeEmpty {
+			return &luceneAutoNode{kind: luceneNodeEmpty}, nil
+		}
+		if c.kind == luceneNodeRE2 && c.isAnyStr {
+			continue
+		}
+		filtered = append(filtered, c)
+	}
+	if len(filtered) == 0 {
+		return &luceneAutoNode{kind: luceneNodeRE2, re2: "(?s:.*)", isAnyStr: true}, nil
+	}
+	if len(filtered) == 1 {
+		return filtered[0], nil
+	}
+	return &luceneAutoNode{
+		kind:     luceneNodeInter,
+		children: filtered,
+	}, nil
+}
+
+func (p *luceneRegexpParser) isConcatStop(r rune) bool {
+	if r == ')' || r == '|' {
+		return true
+	}
+	if p.flags.intersection && r == '&' {
+		return true
+	}
+	return false
+}
+
+func (p *luceneRegexpParser) parseConcat() (*luceneAutoNode, error) {
+	var items []*luceneAutoNode
+	for p.pos < len(p.runes) && !p.isConcatStop(p.runes[p.pos]) {
+		rep, err := p.parseRepeat()
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, rep)
+	}
+	if len(items) == 0 {
+		return &luceneAutoNode{kind: luceneNodeRE2, re2: "", hasLiteral: true, literal: ""}, nil
+	}
+	if len(items) == 1 {
+		return items[0], nil
+	}
+	var re2Builder strings.Builder
+	var litBuilder strings.Builder
+	allLit := true
+	for _, it := range items {
+		if it.kind == luceneNodeEmpty {
+			return &luceneAutoNode{kind: luceneNodeEmpty}, nil
+		}
+		subRE2, ok := it.asSubRE2()
+		if !ok {
+			return nil, fmt.Errorf("regexp_syntax_exception: unsupported nested automaton operator inside concatenation in [%s]", p.raw)
+		}
+		re2Builder.WriteString(subRE2)
+		if it.kind == luceneNodeRE2 && it.hasLiteral {
+			litBuilder.WriteString(it.literal)
+		} else {
+			allLit = false
+		}
+	}
+	out := &luceneAutoNode{
+		kind: luceneNodeRE2,
+		re2:  re2Builder.String(),
+	}
+	if allLit {
+		out.hasLiteral = true
+		out.literal = litBuilder.String()
+	}
+	return out, nil
+}
+
+func (n *luceneAutoNode) asSubRE2() (string, bool) {
+	switch n.kind {
+	case luceneNodeRE2:
+		return n.re2, true
+	case luceneNodeCompl:
+		if n.complRE2 != "" {
+			return n.complRE2, true
+		}
+		return "", false
+	case luceneNodeUnion:
+		var parts []string
+		for _, ch := range n.children {
+			s, ok := ch.asSubRE2()
+			if !ok {
+				return "", false
+			}
+			parts = append(parts, s)
+		}
+		return "(?:" + strings.Join(parts, "|") + ")", true
+	default:
+		return "", false
+	}
+}
+
+func isAtomicRE2Unit(s string) bool {
+	if s == "" {
+		return false
+	}
+	if len(s) == 2 && s[0] == '\\' {
+		return true
+	}
+	if utf8.RuneCountInString(s) == 1 {
+		switch s {
+		case "|", "*", "+", "?", "(", ")", "[", "]", "{", "}", "^", "$", `\`:
+			return false
+		default:
+			return true
+		}
+	}
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		depth := 0
+		for i := 0; i < len(s); i++ {
+			if s[i] == '\\' {
+				i++
+				continue
+			}
+			if s[i] == '[' {
+				if depth == 0 && i > 0 {
+					return false
+				}
+				if i+1 < len(s) && s[i+1] == ':' {
+					depth++
+					continue
+				}
+				if i == 0 {
+					depth = 1
+				}
+			} else if s[i] == ']' {
+				if i == 1 || (i == 2 && s[1] == '^') {
+					continue
+				}
+				depth--
+				if depth == 0 && i < len(s)-1 {
+					return false
+				}
+			}
+		}
+		return depth == 0
+	}
+	if strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
+		depth := 0
+		inClass := false
+		for i := 0; i < len(s); i++ {
+			if s[i] == '\\' {
+				i++
+				continue
+			}
+			if inClass {
+				if s[i] == ']' {
+					inClass = false
+				}
+				continue
+			}
+			switch s[i] {
+			case '[':
+				inClass = true
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 && i < len(s)-1 {
+					return false
+				}
+			}
+		}
+		return depth == 0
+	}
+	return false
+}
+
+func (p *luceneRegexpParser) parseRepeat() (*luceneAutoNode, error) {
+	base, err := p.parseCompl()
+	if err != nil {
+		return nil, err
+	}
+	for p.pos < len(p.runes) {
+		r := p.runes[p.pos]
+		if r != '?' && r != '*' && r != '+' && r != '{' {
+			break
+		}
+		var qStr string
+		minRep := 0
+		maxRep := -1
+		switch r {
+		case '?':
+			p.pos++
+			qStr = "?"
+			minRep, maxRep = 0, 1
+		case '*':
+			p.pos++
+			qStr = "*"
+			minRep, maxRep = 0, -1
+		case '+':
+			p.pos++
+			qStr = "+"
+			minRep, maxRep = 1, -1
+		case '{':
+			qParsed, lo, hi, errQ := p.parseBracedQuantifier()
+			if errQ != nil {
+				return nil, errQ
+			}
+			qStr = qParsed
+			minRep, maxRep = lo, hi
+		}
+		if base.kind == luceneNodeEmpty {
+			if minRep == 0 {
+				base = &luceneAutoNode{kind: luceneNodeRE2, re2: "", hasLiteral: true, literal: ""}
+			}
+			continue
+		}
+		subRE2, ok := base.asSubRE2()
+		if !ok {
+			return nil, fmt.Errorf("regexp_syntax_exception: unsupported quantifier over complex automaton expression in [%s]", p.raw)
+		}
+		_ = maxRep
+		wrapped := subRE2
+		if !isAtomicRE2Unit(subRE2) {
+			wrapped = "(?:" + subRE2 + ")"
+		}
+		base = &luceneAutoNode{
+			kind: luceneNodeRE2,
+			re2:  wrapped + qStr,
+		}
+	}
+	return base, nil
+}
+
+func (p *luceneRegexpParser) parseBracedQuantifier() (string, int, int, error) {
+	start := p.pos
+	p.pos++ // consume '{'
+	closeIdx := -1
+	for i := p.pos; i < len(p.runes); i++ {
+		if p.runes[i] == '}' {
+			closeIdx = i
+			break
+		}
+	}
+	if closeIdx < 0 {
+		return "", 0, 0, fmt.Errorf("regexp_syntax_exception: expected '}' in quantifier in [%s]", p.raw)
+	}
+	body := string(p.runes[p.pos:closeIdx])
+	p.pos = closeIdx + 1
+	if body == "" {
+		return "", 0, 0, fmt.Errorf("regexp_syntax_exception: empty quantifier '{}' in [%s]", p.raw)
+	}
+	if comma := strings.IndexByte(body, ','); comma >= 0 {
+		loPart := body[:comma]
+		hiPart := body[comma+1:]
+		if !isPureDigitsASCII(loPart) {
+			return "", 0, 0, fmt.Errorf("regexp_syntax_exception: invalid quantifier '{%s}' in [%s]", body, p.raw)
+		}
+		lo, errLo := strconv.Atoi(loPart)
+		if errLo != nil || lo < 0 {
+			return "", 0, 0, fmt.Errorf("regexp_syntax_exception: invalid quantifier '{%s}' in [%s]", body, p.raw)
+		}
+		if hiPart == "" {
+			return "{" + body + "}", lo, -1, nil
+		}
+		if !isPureDigitsASCII(hiPart) {
+			return "", 0, 0, fmt.Errorf("regexp_syntax_exception: invalid quantifier '{%s}' in [%s]", body, p.raw)
+		}
+		hi, errHi := strconv.Atoi(hiPart)
+		if errHi != nil || hi < lo {
+			return "", 0, 0, fmt.Errorf("regexp_syntax_exception: out-of-order quantifier '{%s}' in [%s]", body, p.raw)
+		}
+		return "{" + body + "}", lo, hi, nil
+	}
+	if !isPureDigitsASCII(body) {
+		_ = start
+		return "", 0, 0, fmt.Errorf("regexp_syntax_exception: invalid quantifier '{%s}' in [%s]", body, p.raw)
+	}
+	n, errN := strconv.Atoi(body)
+	if errN != nil || n < 0 {
+		return "", 0, 0, fmt.Errorf("regexp_syntax_exception: invalid quantifier '{%s}' in [%s]", body, p.raw)
+	}
+	return "{" + body + "}", n, n, nil
+}
+
+func (p *luceneRegexpParser) parseCompl() (*luceneAutoNode, error) {
+	if p.flags.complement && p.pos < len(p.runes) && p.runes[p.pos] == '~' {
+		p.pos++
+		inner, err := p.parseCompl()
+		if err != nil {
+			return nil, err
+		}
+		switch inner.kind {
+		case luceneNodeEmpty:
+			return &luceneAutoNode{kind: luceneNodeRE2, re2: "(?s:.*)", isAnyStr: true}, nil
+		case luceneNodeCompl:
+			return inner.child, nil
+		case luceneNodeRE2:
+			if inner.isAnyStr {
+				return &luceneAutoNode{kind: luceneNodeEmpty}, nil
+			}
+			cNode := &luceneAutoNode{
+				kind:  luceneNodeCompl,
+				child: inner,
+			}
+			if inner.hasLiteral {
+				cNode.complRE2 = complementOfLiteralRE2(inner.literal)
+			}
+			return cNode, nil
+		default:
+			return &luceneAutoNode{
+				kind:  luceneNodeCompl,
+				child: inner,
+			}, nil
+		}
+	}
+	return p.parseAtom()
+}
+
+func (p *luceneRegexpParser) parseAtom() (*luceneAutoNode, error) {
+	if p.pos >= len(p.runes) {
+		return &luceneAutoNode{kind: luceneNodeRE2, re2: "", hasLiteral: true, literal: ""}, nil
+	}
+	r := p.runes[p.pos]
+	switch r {
+	case '?', '*', '+', '{', ')':
+		return nil, fmt.Errorf("regexp_syntax_exception: unexpected '%c' at position %d in [%s]", r, p.pos, p.raw)
+	case '.':
+		p.pos++
+		return &luceneAutoNode{kind: luceneNodeRE2, re2: "(?s:.)"}, nil
+	case '^':
+		p.pos++
+		return &luceneAutoNode{kind: luceneNodeRE2, re2: `\^`, hasLiteral: true, literal: "^"}, nil
+	case '$':
+		p.pos++
+		return &luceneAutoNode{kind: luceneNodeRE2, re2: `\$`, hasLiteral: true, literal: "$"}, nil
+	case '#':
+		p.pos++
+		if p.flags.empty {
+			return &luceneAutoNode{kind: luceneNodeEmpty}, nil
+		}
+		return &luceneAutoNode{kind: luceneNodeRE2, re2: `#`, hasLiteral: true, literal: "#"}, nil
+	case '@':
+		p.pos++
+		if p.flags.anystring {
+			return &luceneAutoNode{kind: luceneNodeRE2, re2: "(?s:.*)", isAnyStr: true}, nil
+		}
+		return &luceneAutoNode{kind: luceneNodeRE2, re2: `@`, hasLiteral: true, literal: "@"}, nil
+	case '"':
+		p.pos++
+		var lit strings.Builder
+		var re2 strings.Builder
+		closed := false
+		for p.pos < len(p.runes) {
+			ch := p.runes[p.pos]
+			p.pos++
+			if ch == '"' {
+				closed = true
+				break
+			}
+			lit.WriteRune(ch)
+			re2.WriteString(regexp.QuoteMeta(string(ch)))
+		}
+		if !closed {
+			return nil, fmt.Errorf("regexp_syntax_exception: unclosed double quote in [%s]", p.raw)
+		}
+		return &luceneAutoNode{
+			kind:       luceneNodeRE2,
+			re2:        re2.String(),
+			hasLiteral: true,
+			literal:    lit.String(),
+		}, nil
+	case '(':
+		p.pos++
+		if p.pos+1 < len(p.runes) && p.runes[p.pos] == '?' && p.runes[p.pos+1] == ':' {
+			p.pos += 2
+		}
+		inner, err := p.parseUnion()
+		if err != nil {
+			return nil, err
+		}
+		if p.pos >= len(p.runes) || p.runes[p.pos] != ')' {
+			return nil, fmt.Errorf("regexp_syntax_exception: expected ')' at position %d in [%s]", p.pos, p.raw)
+		}
+		p.pos++
+		if inner.kind == luceneNodeRE2 && !inner.hasLiteral && !inner.isAnyStr {
+			return &luceneAutoNode{
+				kind: luceneNodeRE2,
+				re2:  "(?:" + inner.re2 + ")",
+			}, nil
+		}
+		return inner, nil
+	case '[':
+		return p.parseCharClass()
+	case '<':
+		if p.flags.interval || p.flags.automaton {
+			if node, consumed, err := p.tryParseAngleBracket(); consumed || err != nil {
+				return node, err
+			}
+		}
+		p.pos++
+		return &luceneAutoNode{kind: luceneNodeRE2, re2: "<", hasLiteral: true, literal: "<"}, nil
+	case '\\':
+		p.pos++
+		if p.pos >= len(p.runes) {
+			return nil, fmt.Errorf("regexp_syntax_exception: trailing backslash in [%s]", p.raw)
+		}
+		esc := p.runes[p.pos]
+		p.pos++
+		switch esc {
+		case 'd', 'D', 's', 'S', 'w', 'W':
+			return &luceneAutoNode{kind: luceneNodeRE2, re2: `\` + string(esc)}, nil
+		case 'n':
+			return &luceneAutoNode{kind: luceneNodeRE2, re2: `\n`, hasLiteral: true, literal: "\n"}, nil
+		case 'r':
+			return &luceneAutoNode{kind: luceneNodeRE2, re2: `\r`, hasLiteral: true, literal: "\r"}, nil
+		case 't':
+			return &luceneAutoNode{kind: luceneNodeRE2, re2: `\t`, hasLiteral: true, literal: "\t"}, nil
+		default:
+			return &luceneAutoNode{
+				kind:       luceneNodeRE2,
+				re2:        regexp.QuoteMeta(string(esc)),
+				hasLiteral: true,
+				literal:    string(esc),
+			}, nil
+		}
+	default:
+		p.pos++
+		return &luceneAutoNode{
+			kind:       luceneNodeRE2,
+			re2:        regexp.QuoteMeta(string(r)),
+			hasLiteral: true,
+			literal:    string(r),
+		}, nil
+	}
+}
+
+func (p *luceneRegexpParser) parseCharClass() (*luceneAutoNode, error) {
+	p.pos++ // consume '['
+	var sb strings.Builder
+	sb.WriteByte('[')
+	if p.pos < len(p.runes) && p.runes[p.pos] == '^' {
+		sb.WriteByte('^')
+		p.pos++
+	}
+	first := true
+	closed := false
+	for p.pos < len(p.runes) {
+		r := p.runes[p.pos]
+		if r == ']' && !first {
+			sb.WriteByte(']')
+			p.pos++
+			closed = true
+			break
+		}
+		first = false
+		if r == '[' && p.pos+1 < len(p.runes) && p.runes[p.pos+1] == ':' {
+			endPos := -1
+			for k := p.pos + 2; k+1 < len(p.runes); k++ {
+				if p.runes[k] == ':' && p.runes[k+1] == ']' {
+					endPos = k + 2
+					break
+				}
+			}
+			if endPos > 0 {
+				sb.WriteString(string(p.runes[p.pos:endPos]))
+				p.pos = endPos
+				continue
+			}
+		}
+		if r == '\\' {
+			p.pos++
+			if p.pos >= len(p.runes) {
+				return nil, fmt.Errorf("regexp_syntax_exception: trailing backslash in character class in [%s]", p.raw)
+			}
+			esc := p.runes[p.pos]
+			p.pos++
+			switch esc {
+			case 'd', 'D', 's', 'S', 'w', 'W', 'n', 'r', 't', '\\', '-', ']', '[', '^':
+				sb.WriteByte('\\')
+				sb.WriteRune(esc)
+			default:
+				sb.WriteString(escapeRE2CharClassMember(esc))
+			}
+			continue
+		}
+		if r == ']' {
+			sb.WriteString(`\]`)
+			p.pos++
+			continue
+		}
+		sb.WriteRune(r)
+		p.pos++
+	}
+	if !closed {
+		return nil, fmt.Errorf("regexp_syntax_exception: unclosed character class '[' in [%s]", p.raw)
+	}
+	cls := sb.String()
+	if _, err := regexp.Compile(cls); err != nil {
+		return nil, fmt.Errorf("regexp_syntax_exception: invalid character class %s in [%s]: %w", cls, p.raw, err)
+	}
+	return &luceneAutoNode{kind: luceneNodeRE2, re2: cls}, nil
+}
+
+func (p *luceneRegexpParser) tryParseAngleBracket() (*luceneAutoNode, bool, error) {
+	closeIdx := -1
+	for i := p.pos + 1; i < len(p.runes); i++ {
+		if p.runes[i] == '>' {
+			closeIdx = i
+			break
+		}
+		if p.runes[i] == '<' || p.runes[i] == '\\' {
+			break
+		}
+	}
+	if closeIdx < 0 {
+		return nil, false, nil
+	}
+	inner := string(p.runes[p.pos+1 : closeIdx])
+	if p.flags.interval {
+		if dash := strings.IndexByte(inner, '-'); dash > 0 && dash < len(inner)-1 {
+			loStr := inner[:dash]
+			hiStr := inner[dash+1:]
+			if isPureDigitsASCII(loStr) && isPureDigitsASCII(hiStr) {
+				loVal, errLo := strconv.ParseUint(loStr, 10, 64)
+				hiVal, errHi := strconv.ParseUint(hiStr, 10, 64)
+				if errLo != nil || errHi != nil {
+					return nil, true, fmt.Errorf("illegal_argument_exception: numeric interval out of range [<%s>] in [%s]", inner, p.raw)
+				}
+				if loVal > hiVal {
+					return nil, true, fmt.Errorf("illegal_argument_exception: invalid numeric interval [<%s>]: min > max in [%s]", inner, p.raw)
+				}
+				fixedWidth := 0
+				if len(loStr) == len(hiStr) {
+					fixedWidth = len(loStr)
+				}
+				p.pos = closeIdx + 1
+				return &luceneAutoNode{
+					kind: luceneNodeRE2,
+					re2:  buildNumericIntervalRE2(loVal, hiVal, fixedWidth),
+				}, true, nil
+			}
+		}
+	}
+	return nil, false, nil
+}
+
+func nodeContainsCompl(n *luceneAutoNode) bool {
+	if n == nil {
+		return false
+	}
+	if n.kind == luceneNodeCompl {
+		return true
+	}
+	for _, ch := range n.children {
+		if nodeContainsCompl(ch) {
+			return true
+		}
+	}
+	return nodeContainsCompl(n.child)
+}
+
+func validateNodeRE2(n *luceneAutoNode, ci bool, raw string) error {
+	if n == nil {
+		return nil
+	}
+	switch n.kind {
+	case luceneNodeRE2:
+		anchored := fullTermAnchorRE2(n.re2, ci)
+		if _, err := regexp.Compile(anchored); err != nil {
+			return fmt.Errorf("regexp_syntax_exception: invalid regular expression [%s]: %w", raw, err)
+		}
+	case luceneNodeCompl:
+		return validateNodeRE2(n.child, ci, raw)
+	case luceneNodeUnion, luceneNodeInter:
+		for _, ch := range n.children {
+			if err := validateNodeRE2(ch, ci, raw); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func fullTermAnchorRE2(re2Body string, caseInsensitive bool) string {
+	if caseInsensitive {
+		return "(?i)^(?:" + re2Body + ")$"
+	}
+	return "^(?:" + re2Body + ")$"
+}
+
+// CompileLuceneRegexpToSQLPredicates parses a Lucene automaton regular expression with the
+// specified ES `flags` (`ALL`, `NONE`, `INTERSECTION`, `COMPLEMENT`, `EMPTY`, `ANYSTRING`,
+// `INTERVAL`, `AUTOMATON`) and builds full-term anchored RE2 / SQL predicates.
+func CompileLuceneRegexpToSQLPredicates(pattern, flags string, caseInsensitive bool) (*LuceneRegexpCompiled, error) {
+	parsedFlags, err := parseLuceneRegexpFlags(flags)
+	if err != nil {
+		return nil, err
+	}
+	raw := pattern
+	if strings.HasPrefix(pattern, "(?i)") {
+		caseInsensitive = true
+		pattern = pattern[4:]
+	}
+	parser := &luceneRegexpParser{
+		runes: []rune(pattern),
+		flags: parsedFlags,
+		raw:   raw,
+	}
+	root, err := parser.parseUnion()
+	if err != nil {
+		return nil, err
+	}
+	if parser.pos < len(parser.runes) {
+		return nil, fmt.Errorf("regexp_syntax_exception: unexpected '%c' at position %d in [%s]", parser.runes[parser.pos], parser.pos, raw)
+	}
+	if err := validateNodeRE2(root, caseInsensitive, raw); err != nil {
+		return nil, err
+	}
+	return &LuceneRegexpCompiled{
+		IsEmpty:      root.kind == luceneNodeEmpty,
+		NeedsNotNull: nodeContainsCompl(root),
+		root:         root,
+		caseInsens:   caseInsensitive,
+	}, nil
+}
+
+func renderLuceneAutoNodeSQL(n *luceneAutoNode, targetExpr string, ci bool) string {
+	switch n.kind {
+	case luceneNodeEmpty:
+		return "FALSE"
+	case luceneNodeRE2:
+		pat := fullTermAnchorRE2(n.re2, ci)
+		return fmt.Sprintf("%s REGEXP %s", targetExpr, quoteStr(pat))
+	case luceneNodeCompl:
+		innerSQL := renderLuceneAutoNodeSQL(n.child, targetExpr, ci)
+		return fmt.Sprintf("NOT (%s)", innerSQL)
+	case luceneNodeInter:
+		parts := make([]string, 0, len(n.children))
+		for _, ch := range n.children {
+			sub := renderLuceneAutoNodeSQL(ch, targetExpr, ci)
+			parts = append(parts, "("+sub+")")
+		}
+		return "(" + strings.Join(parts, " AND ") + ")"
+	case luceneNodeUnion:
+		parts := make([]string, 0, len(n.children))
+		for _, ch := range n.children {
+			sub := renderLuceneAutoNodeSQL(ch, targetExpr, ci)
+			parts = append(parts, "("+sub+")")
+		}
+		return "(" + strings.Join(parts, " OR ") + ")"
+	default:
+		return "FALSE"
+	}
+}
+
+func tokenAnchorRE2(re2Body string) string {
+	return "(?i)(?:^|[^[:alnum:]_])(?:" + re2Body + ")(?:$|[^[:alnum:]_])"
+}
+
+func renderLuceneAutoNodeTokenSQL(n *luceneAutoNode, targetExpr string) string {
+	switch n.kind {
+	case luceneNodeEmpty:
+		return "FALSE"
+	case luceneNodeRE2:
+		if n.isAnyStr {
+			return fmt.Sprintf("%s REGEXP '(?i)[[:alnum:]_]'", targetExpr)
+		}
+		pat := tokenAnchorRE2(n.re2)
+		return fmt.Sprintf("%s REGEXP %s", targetExpr, quoteStr(pat))
+	case luceneNodeCompl:
+		innerSQL := renderLuceneAutoNodeTokenSQL(n.child, targetExpr)
+		return fmt.Sprintf("NOT (%s)", innerSQL)
+	case luceneNodeInter:
+		parts := make([]string, 0, len(n.children))
+		for _, ch := range n.children {
+			parts = append(parts, "("+renderLuceneAutoNodeTokenSQL(ch, targetExpr)+")")
+		}
+		return "(" + strings.Join(parts, " AND ") + ")"
+	case luceneNodeUnion:
+		parts := make([]string, 0, len(n.children))
+		for _, ch := range n.children {
+			parts = append(parts, "("+renderLuceneAutoNodeTokenSQL(ch, targetExpr)+")")
+		}
+		return "(" + strings.Join(parts, " OR ") + ")"
+	default:
+		return "FALSE"
+	}
+}
+
+// ScalarSQL renders `(whereSQL, safeWhereSQL, usesFulltext)` for a scalar SQL column expression.
+// RE2 predicates always use Apache Doris's `REGEXP` (Google RE2) rather than `MATCH_REGEXP`
+// (CLucene Automaton, which rejects `(?:...)` / `(?i)` / `(?s:.)` and treats `^` / `$` literally).
+func (c *LuceneRegexpCompiled) ScalarSQL(colExpr string, _ bool, isTokenizedText bool) (string, string, bool) {
+	if c == nil || c.IsEmpty {
+		return "FALSE", "FALSE", false
+	}
+	if isTokenizedText {
+		tokCore := renderLuceneAutoNodeTokenSQL(c.root, colExpr)
+		safePred := fmt.Sprintf("(%s IS NOT NULL AND %s)", colExpr, tokCore)
+		if c.NeedsNotNull {
+			return safePred, safePred, false
+		}
+		return tokCore, safePred, false
+	}
+	safeCore := renderLuceneAutoNodeSQL(c.root, colExpr, c.caseInsens)
+	safePred := fmt.Sprintf("(%s IS NOT NULL AND %s)", colExpr, safeCore)
+	if c.NeedsNotNull {
+		return safePred, safePred, false
+	}
+	return safeCore, safePred, false
+}
+
+// ArrayElemSQL renders the predicate body for an array element variable (e.g., `_x`) inside `array_exists`.
+func (c *LuceneRegexpCompiled) ArrayElemSQL(elemVar string) string {
+	if c == nil || c.IsEmpty {
+		return "FALSE"
+	}
+	core := renderLuceneAutoNodeSQL(c.root, elemVar, c.caseInsens)
+	if c.NeedsNotNull {
+		return fmt.Sprintf("(%s IS NOT NULL AND %s)", elemVar, core)
+	}
+	return core
 }

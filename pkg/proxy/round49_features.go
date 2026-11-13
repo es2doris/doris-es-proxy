@@ -334,9 +334,12 @@ func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		repoType := "fs"
-		if t, ok := reqMap["type"].(string); ok && strings.TrimSpace(t) != "" {
-			repoType = strings.TrimSpace(t)
+		rawRepoType, okType := reqMap["type"].(string)
+		repoType := strings.TrimSpace(rawRepoType)
+		if !okType || repoType == "" {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception",
+				"Validation Failed: 1: repository type is missing;")
+			return
 		}
 		settings := map[string]any{}
 		if st, ok := reqMap["settings"].(map[string]any); ok && st != nil {
@@ -568,6 +571,7 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 		snapObj["__docs"] = savedDocs
 		snapObj["__settings"] = savedSettings
 		snapObj["__aliases"] = savedAliases
+		s.captureSnapshotExtraGlobalAndIndexStateLocked(snapObj, indices, includeGlobalState)
 		if includeGlobalState {
 			if len(s.pipelines) > 0 {
 				savedPipes := make(map[string]any, len(s.pipelines))
@@ -877,29 +881,36 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 		if targetIdx == "" {
 			targetIdx = srcIdx
 		}
-		s.mu.Lock()
-		restoredSchema := s.indices[targetIdx]
-		alreadyExists := restoredSchema != nil
-		s.mu.Unlock()
-		if !alreadyExists {
-			if savedSchemas != nil && savedSchemas[srcIdx] != nil {
-				restoredSchema = schema.CompileIndexSchema(s.dorisDB, targetIdx, savedSchemas[srcIdx].RawMapping)
-			} else {
-				restoredSchema = schema.CompileIndexSchema(s.dorisDB, targetIdx, nil)
+		if reason, ok := validateESIndexName(targetIdx); !ok {
+			writeESError(w, http.StatusBadRequest, "invalid_index_name_exception", reason)
+			return
+		}
+		_ = s.syncCatalogFromBackend(r.Context())
+		s.mu.RLock()
+		alreadyExists := s.indices[targetIdx] != nil
+		s.mu.RUnlock()
+		if alreadyExists {
+			writeESError(w, http.StatusBadRequest, "snapshot_restore_exception",
+				fmt.Sprintf("[%s:%s] cannot mount index [%s] because an index with the same name already exists in the cluster", repo, snap, targetIdx))
+			return
+		}
+		var restoredSchema *schema.IndexSchema
+		if savedSchemas != nil && savedSchemas[srcIdx] != nil {
+			restoredSchema = schema.CompileIndexSchema(s.dorisDB, targetIdx, savedSchemas[srcIdx].RawMapping)
+		} else {
+			restoredSchema = schema.CompileIndexSchema(s.dorisDB, targetIdx, nil)
+		}
+		if restoredSchema != nil {
+			_ = s.backend.ExecDDL(r.Context(), schema.GenerateCreateTableDDL(restoredSchema))
+			s.mu.Lock()
+			if s.indices == nil {
+				s.indices = make(map[string]*schema.IndexSchema)
 			}
-			if restoredSchema != nil {
-				_ = s.backend.ExecDDL(r.Context(), schema.GenerateCreateTableDDL(restoredSchema))
-				s.mu.Lock()
-				if s.indices == nil {
-					s.indices = make(map[string]*schema.IndexSchema)
-				}
-				if s.indices[targetIdx] == nil {
-					s.indices[targetIdx] = restoredSchema
-				}
-				delete(s.closedIndices, targetIdx)
-				s.mu.Unlock()
-				s.persistIndex(r.Context(), targetIdx, restoredSchema)
-			}
+			s.indices[targetIdx] = restoredSchema
+			delete(s.closedIndices, targetIdx)
+			s.ensureIndexCreationDateLocked(targetIdx)
+			s.mu.Unlock()
+			s.persistIndex(r.Context(), targetIdx, restoredSchema)
 		}
 		s.restoreSnapshotIndexArtifacts(r.Context(), rawSnapRef, srcIdx, targetIdx, restoredSchema, reqMap, true)
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -980,38 +991,38 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 				return
 			}
 		}
-		restoredIndices := make([]string, 0, len(sourceIndices))
-		for _, srcIdx := range sourceIndices {
-			targetIdx := srcIdx
-			if renameRe != nil {
-				targetIdx = applyJavaRegexSimpleReplacement(renameRe, srcIdx, renameReplacement)
+		pairs, errSt, errType, errReason := s.preValidateAndResolveRestoreTargetsRound59(
+			r.Context(), repo, snap, sourceIndices, renameRe, renameReplacement,
+		)
+		if errSt != 0 {
+			writeESError(w, errSt, errType, errReason)
+			return
+		}
+		restoredIndices := make([]string, 0, len(pairs))
+		for _, pair := range pairs {
+			srcIdx := pair.srcIdx
+			targetIdx := pair.targetIdx
+			s.dropAndResetClosedTargetIndexForRestoreRound59(r.Context(), targetIdx)
+			var restoredSchema *schema.IndexSchema
+			if savedSchemas != nil && savedSchemas[srcIdx] != nil {
+				restoredSchema = schema.CompileIndexSchema(s.dorisDB, targetIdx, savedSchemas[srcIdx].RawMapping)
+			} else {
+				restoredSchema = schema.CompileIndexSchema(s.dorisDB, targetIdx, nil)
 			}
-			restoredIndices = append(restoredIndices, targetIdx)
-			s.mu.Lock()
-			restoredSchema := s.indices[targetIdx]
-			alreadyExists := restoredSchema != nil
-			s.mu.Unlock()
-			if !alreadyExists {
-				if savedSchemas != nil && savedSchemas[srcIdx] != nil {
-					restoredSchema = schema.CompileIndexSchema(s.dorisDB, targetIdx, savedSchemas[srcIdx].RawMapping)
-				} else {
-					restoredSchema = schema.CompileIndexSchema(s.dorisDB, targetIdx, nil)
+			if restoredSchema != nil {
+				_ = s.backend.ExecDDL(r.Context(), schema.GenerateCreateTableDDL(restoredSchema))
+				s.mu.Lock()
+				if s.indices == nil {
+					s.indices = make(map[string]*schema.IndexSchema)
 				}
-				if restoredSchema != nil {
-					_ = s.backend.ExecDDL(r.Context(), schema.GenerateCreateTableDDL(restoredSchema))
-					s.mu.Lock()
-					if s.indices == nil {
-						s.indices = make(map[string]*schema.IndexSchema)
-					}
-					if s.indices[targetIdx] == nil {
-						s.indices[targetIdx] = restoredSchema
-					}
-					delete(s.closedIndices, targetIdx)
-					s.mu.Unlock()
-					s.persistIndex(r.Context(), targetIdx, restoredSchema)
-				}
+				s.indices[targetIdx] = restoredSchema
+				delete(s.closedIndices, targetIdx)
+				s.ensureIndexCreationDateLocked(targetIdx)
+				s.mu.Unlock()
+				s.persistIndex(r.Context(), targetIdx, restoredSchema)
 			}
 			s.restoreSnapshotIndexArtifacts(r.Context(), rawSnapRef, srcIdx, targetIdx, restoredSchema, reqMap, false)
+			restoredIndices = append(restoredIndices, targetIdx)
 		}
 		if restoreGlobal, _ := reqMap["include_global_state"].(bool); restoreGlobal && rawSnapRef != nil {
 			if snapHasGlobal, _ := rawSnapRef["include_global_state"].(bool); snapHasGlobal {
@@ -1059,17 +1070,19 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 				for ck, cm := range restoredCTs {
 					s.persistComponentTemplate(r.Context(), ck, cm)
 				}
+				s.restoreSnapshotExtraGlobalStateRound59(r.Context(), rawSnapRef)
 			}
 		}
+		shardCount := len(restoredIndices)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"accepted": true,
 			"snapshot": map[string]any{
 				"snapshot": snap,
 				"indices":  restoredIndices,
 				"shards": map[string]any{
-					"total":      1,
+					"total":      shardCount,
 					"failed":     0,
-					"successful": 1,
+					"successful": shardCount,
 				},
 			},
 		})
@@ -1532,6 +1545,7 @@ func (s *Server) handleAddIndexBlock(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	s.mu.Unlock()
+	s.persistIndexBatchRound59(r.Context(), validTargets)
 	s.queryCache.InvalidateAll()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"acknowledged":        true,

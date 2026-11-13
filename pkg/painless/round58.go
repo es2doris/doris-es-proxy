@@ -550,6 +550,27 @@ func evalMathStaticCallRound58(fnName string, args []string, sourceMap, params m
 			return float64(0), true, err2
 		}
 		return applyBinaryMathDoubleRound58(fnName, f1, f2), true, nil
+	case "Math.fma":
+		v1, f1, ok1, err1 := evalRawArg(0)
+		if err1 != nil {
+			return float64(0), true, err1
+		}
+		v2, f2, ok2, err2 := evalRawArg(1)
+		if err2 != nil {
+			return float64(0), true, err2
+		}
+		v3, f3, ok3, err3 := evalRawArg(2)
+		if err3 != nil || !ok1 || !ok2 || !ok3 {
+			return float64(0), true, err3
+		}
+		res := math.FMA(f1, f2, f3)
+		_, isF1 := v1.(float32)
+		_, isF2 := v2.(float32)
+		_, isF3 := v3.(float32)
+		if isF1 && isF2 && isF3 {
+			return float32(res), true, nil
+		}
+		return res, true, nil
 	case "Math.getExponent":
 		v0, f, ok, err := evalRawArg(0)
 		if err != nil || !ok {
@@ -686,6 +707,25 @@ func evalConditionDepthErr(sourceMap map[string]any, cond string, params map[str
 	if cond == "true" {
 		return true, nil
 	}
+	if aLHS, aOp, aRHS, aOk := findFirstTopLevelAssignOpRound59(cond); aOk {
+		val, err := evalAssignExprRound59Painless(sourceMap, aLHS, aOp, aRHS, params, depth+1)
+		if err != nil {
+			return false, err
+		}
+		if b, ok := val.(bool); ok {
+			return b, nil
+		}
+		if val == nil {
+			return false, nil
+		}
+		if f, ok := toFloat64WithRawPainless(val); ok {
+			return f != 0 && !math.IsNaN(f), nil
+		}
+		if f, ok := toFloat64(val); ok {
+			return f != 0, nil
+		}
+		return true, nil
+	}
 	elvisIdx := findTopLevelOpPainless(cond, "?:")
 	qIdx := findTopLevelOpPainless(cond, "?")
 	if qIdx > 0 && (elvisIdx < 0 || qIdx < elvisIdx) {
@@ -765,49 +805,25 @@ func evalConditionDepthErr(sourceMap map[string]any, cond string, params map[str
 			}
 		}
 	}
-	if idx := findTopLevelOpPainless(cond, "!=="); idx > 0 {
+	if idx, eqOp := findLastTopLevelAnyOpPainless(cond, []string{"!==", "===", "!=", "=="}); idx > 0 {
 		lhs, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
 		if err != nil {
 			return false, err
 		}
-		rhs, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+3:]), params, depth+1)
+		rhs, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+len(eqOp):]), params, depth+1)
 		if err != nil {
 			return false, err
 		}
-		return !painlessRefEqual(lhs, rhs), nil
-	}
-	if idx := findTopLevelOpPainless(cond, "==="); idx > 0 {
-		lhs, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
-		if err != nil {
-			return false, err
+		switch eqOp {
+		case "!==":
+			return !painlessRefEqual(lhs, rhs), nil
+		case "===":
+			return painlessRefEqual(lhs, rhs), nil
+		case "!=":
+			return !valuesEqual(lhs, rhs), nil
+		default: // "=="
+			return valuesEqual(lhs, rhs), nil
 		}
-		rhs, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+3:]), params, depth+1)
-		if err != nil {
-			return false, err
-		}
-		return painlessRefEqual(lhs, rhs), nil
-	}
-	if idx := findTopLevelOpPainless(cond, "!="); idx > 0 {
-		lhs, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
-		if err != nil {
-			return false, err
-		}
-		rhs, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+2:]), params, depth+1)
-		if err != nil {
-			return false, err
-		}
-		return !valuesEqual(lhs, rhs), nil
-	}
-	if idx := findTopLevelOpPainless(cond, "=="); idx > 0 {
-		lhs, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
-		if err != nil {
-			return false, err
-		}
-		rhs, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+2:]), params, depth+1)
-		if err != nil {
-			return false, err
-		}
-		return valuesEqual(lhs, rhs), nil
 	}
 	if idx := findTopLevelOpPainless(cond, "==~"); idx > 0 {
 		lhs, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
@@ -846,24 +862,22 @@ func evalConditionDepthErr(sourceMap map[string]any, cond string, params map[str
 		matched, err := evalRegexMatchPainlessErr(lhs, rhs, isRawRegexLiteralPainless(rhsRaw), false)
 		return !matched, err
 	}
-	for _, op := range []string{">=", "<=", ">", "<"} {
-		if idx := findTopLevelOpPainless(cond, op); idx > 0 {
-			lhs, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
-			if err != nil {
-				return false, err
-			}
-			rhs, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+len(op):]), params, depth+1)
-			if err != nil {
-				return false, err
-			}
-			if lhs == nil || rhs == nil {
-				return false, &painlessExceptionError{
-					exType:  "NullPointerException",
-					message: fmt.Sprintf("Cannot apply relational operator %s to null operand", op),
-				}
-			}
-			return compareOrderedValues(lhs, rhs, op), nil
+	if idx, op := findLastTopLevelAnyOpPainless(cond, []string{">=", "<=", ">", "<"}); idx > 0 {
+		lhs, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[:idx]), params, depth+1)
+		if err != nil {
+			return false, err
 		}
+		rhs, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(cond[idx+len(op):]), params, depth+1)
+		if err != nil {
+			return false, err
+		}
+		if lhs == nil || rhs == nil {
+			return false, &painlessExceptionError{
+				exType:  "NullPointerException",
+				message: fmt.Sprintf("Cannot apply relational operator %s to null operand", op),
+			}
+		}
+		return compareOrderedValues(lhs, rhs, op), nil
 	}
 	if strings.HasPrefix(cond, "!") && !strings.HasPrefix(cond, "!=") {
 		ok, err := evalConditionDepthErr(sourceMap, cond[1:], params, depth+1)
