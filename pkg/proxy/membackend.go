@@ -498,7 +498,13 @@ var (
 	reAggScalarTermsMissing    = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\(CAST\\((.+?) AS STRING\\), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggNestedTerms           = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (?:json_extract_string\\(`_nel`, '\\$\\.([^']+)'\\)|CAST\\((.+?) AS STRING\\)) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_nt` AS `_nel` WHERE (?:\\((.+)\\) AND )?(?:json_extract_string\\(`_nel`, '\\$\\.[^']+'\\)|CAST\\(.+? AS STRING\\)) IS NOT NULL GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggNestedTermsMissing    = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\((?:json_extract_string\\(`_nel`, '\\$\\.([^']+)'\\)|CAST\\((.+?) AS STRING\\)), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\((?:CASE WHEN )?`([^`]+)`(?: IS NULL.+?)?\\) `_nt` AS `_nel`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
-	reAggNestedMetric          = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_metric|_nested_doc_count|_stats_[a-z_]+)' AS `_bucket_key`, CAST\\((?:COALESCE\\((AVG|SUM|MIN|MAX|COUNT|STDDEV_POP)\\((.+?)\\), 0\\)|(COUNT)\\((DISTINCT )?(.+?)\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched` LATERAL VIEW EXPLODE\\(.+?\\) `_(?:nt|t)` AS `_(?:nel|elem)`)(?: WHERE (.+))?$")
+	reAggNestedMetric          = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_metric|_nested_doc_count|_stats_[a-z_]+)' AS `_bucket_key`, CAST\\((?:COALESCE\\((AVG|SUM|MIN|MAX|COUNT|STDDEV_POP)\\((.+?)\\), 0\\)|(COUNT)\\((DISTINCT )?(.+?)\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched` LATERAL VIEW EXPLODE\\(.+?\\) `_(?:nt|t|ht)` AS `_(?:nel|elem|helem)`)(?: WHERE (.+))?$")
+	reAggWeightedAvg           = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_metric|_stats_avg)' AS `_bucket_key`, CAST\\(COALESCE\\(SUM\\(\\((.+?)\\) \\* \\((.+?)\\)\\) / NULLIF\\(SUM\\((.+?)\\), 0\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched` LATERAL VIEW EXPLODE\\(.+?\\) `_ht` AS `_helem`)(?: WHERE (.+))?$")
+	reAggPercentileWeighted    = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(PERCENTILE_APPROX_WEIGHTED\\((.+?)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched` LATERAL VIEW EXPLODE\\(.+?\\) `_ht` AS `_helem`)(?: WHERE (.+))?$")
+	reAggPercentileRankWeight  = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(100\\.0 \\* SUM\\(CASE WHEN (.+?) <= ([0-9.eE+-]+) THEN (.+?) ELSE 0\\.0 END\\) / NULLIF\\(SUM\\((.+?)\\), 0\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched` LATERAL VIEW EXPLODE\\(.+?\\) `_ht` AS `_helem`)(?: WHERE (.+))?$")
+	reAggSubWeightedAvg        = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\(COALESCE\\(SUM\\(\\((.+?)\\) \\* \\((.+?)\\)\\) / NULLIF\\(SUM\\((.+?)\\), 0\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key`$")
+	reAggSubPercentileWeighted = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\(COALESCE\\(PERCENTILE_APPROX_WEIGHTED\\((.+?)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key`$")
+	reAggSubPercentileRankWgt  = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\(COALESCE\\(100\\.0 \\* SUM\\(CASE WHEN (.+?) <= ([0-9.eE+-]+) THEN (.+?) ELSE 0\\.0 END\\) / NULLIF\\(SUM\\((.+?)\\), 0\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key`$")
 	reAggFilter                = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_filter|_global|_reverse_nested|_sampler)' AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
 	reAggMissing               = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_missing' AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (?:\\((.+)\\) AND )?NOT \\((.+)\\)$")
 	reAggCardArray             = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_metric' AS `_bucket_key`, CAST\\(COUNT\\(DISTINCT `_elem`\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_t` AS `_elem` WHERE (?:\\((.+)\\) AND )?`_elem` IS NOT NULL$")
@@ -509,7 +515,7 @@ var (
 	reAggPercentile            = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(PERCENTILE_APPROX\\((.+?), ([0-9.]+)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:nt|t)` AS `_(?:nel|elem)`)?)(?: WHERE (.+))?$")
 	reAggPercentileRank        = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(AVG\\(CASE WHEN (.+?) <= ([0-9.eE+-]+) THEN 100\\.0 ELSE 0\\.0 END\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:nt|t)` AS `_(?:nel|elem)`)?)(?: WHERE (.+))?$")
 	reAggDateHist              = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(CAST\\(FLOOR\\((?:\\((.+?) \\+ (-?\\d+)\\)|(.+?)) / (\\d+)\\) \\* \\d+(?: - -?\\d+)? AS BIGINT\\) AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\((?:CASE WHEN .+ END|`[^`]+`)\\) `_t` AS `_elem`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|CAST\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS BIGINT\\) ASC")
-	reAggHist                  = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(FLOOR\\(\\((.+?) - ([^)]+)\\) / ([^)]+)\\) \\* [^)]+ \\+ [^)]+ AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\((?:CASE WHEN .+ END|`[^`]+`)\\) `_t` AS `_elem`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|CAST\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS DOUBLE\\) ASC")
+	reAggHist                  = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(FLOOR\\(\\((.+?) - ([^)]+)\\) / ([^)]+)\\) \\* [^)]+ \\+ [^)]+ AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)|COALESCE\\(SUM\\((.+?)\\), 0\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:t|ht)` AS `_(?:elem|helem)`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|CAST\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS DOUBLE\\) ASC")
 	reAggRange                 = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(`[^`]+`\\) `_t` AS `_elem`)?) WHERE (.+)$")
 	reAggSubMetric             = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\((?:COALESCE\\((AVG|SUM|MIN|MAX|COUNT|STDDEV_POP)\\((.+?)\\), 0\\)|(COUNT)\\((DISTINCT )?(.+?)\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key`$")
 	reAggSubPercentile         = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\(COALESCE\\(PERCENTILE_APPROX\\((.+?), ([0-9.]+)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key`$")
@@ -538,10 +544,45 @@ func computePopStdDev(nums []float64) float64 {
 	return math.Sqrt(sqDiff / float64(len(nums)))
 }
 
+type memWeightedVal struct {
+	v float64
+	w float64
+}
+
+func computeWeightedQuantile(pairs []memWeightedVal, totalW, q float64) float64 {
+	if len(pairs) == 0 || totalW <= 0 {
+		return 0
+	}
+	if q <= 0 {
+		return pairs[0].v
+	}
+	if q >= 1 {
+		return pairs[len(pairs)-1].v
+	}
+	target := q * totalW
+	var cumW float64
+	for i, p := range pairs {
+		cumW += p.w
+		if cumW > target {
+			return p.v
+		}
+		if cumW == target {
+			if i+1 < len(pairs) {
+				return (p.v + pairs[i+1].v) / 2.0
+			}
+			return p.v
+		}
+	}
+	return pairs[len(pairs)-1].v
+}
+
 func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 	hasHavingCountGtZero := false
 	havingExpr := ""
 	if hIdx := strings.LastIndex(branch, " HAVING COUNT("); hIdx > 0 && strings.HasSuffix(branch, ") > 0") {
+		hasHavingCountGtZero = true
+		branch = branch[:hIdx]
+	} else if hIdx := strings.LastIndex(branch, " HAVING SUM("); hIdx > 0 && strings.HasSuffix(branch, ") > 0") {
 		hasHavingCountGtZero = true
 		branch = branch[:hIdx]
 	} else if hIdx := strings.LastIndex(branch, " HAVING "); hIdx > 0 {
@@ -796,6 +837,79 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 	}
 
 	if !strings.HasSuffix(branch, " GROUP BY `_bucket_key`") {
+		if m := reAggWeightedAvg.FindStringSubmatch(branch); m != nil {
+			aggName, bKey, valExpr, cntExpr, _, fromClause, extraWhere := m[1], m[2], m[3], m[4], m[5], m[6], m[7]
+			expanded := expandFromClauseRows(baseRows, fromClause, extraWhere)
+			var weightedSum, totalWeight float64
+			for _, row := range expanded {
+				v, okV := toFloat(resolveColumnValue(row, valExpr))
+				w, okW := toFloat(resolveColumnValue(row, cntExpr))
+				if okV && okW && w > 0 {
+					weightedSum += v * w
+					totalWeight += w
+				}
+			}
+			if totalWeight <= 0 {
+				if bKey == "_metric" || hasHavingCountGtZero {
+					return nil
+				}
+				return []AggRow{{AggName: aggName, BucketKey: bKey, DocCount: 0, Value: 0, Weight: -1}}
+			}
+			res := weightedSum / totalWeight
+			return []AggRow{{AggName: aggName, BucketKey: bKey, DocCount: int64(res), Value: res, Weight: int64(totalWeight)}}
+		}
+		if m := reAggPercentileWeighted.FindStringSubmatch(branch); m != nil {
+			aggName, pctKey, rawArgs, fromClause, extraWhere := m[1], m[2], m[3], m[4], m[5]
+			args := splitTopLevelArgs(rawArgs)
+			if len(args) == 3 {
+				valExpr, cntExpr, qStr := strings.TrimSpace(args[0]), strings.TrimSpace(args[1]), strings.TrimSpace(args[2])
+				q, _ := strconv.ParseFloat(qStr, 64)
+				expanded := expandFromClauseRows(baseRows, fromClause, extraWhere)
+				var pairs []memWeightedVal
+				var totalW float64
+				for _, row := range expanded {
+					v, okV := toFloat(resolveColumnValue(row, valExpr))
+					w, okW := toFloat(resolveColumnValue(row, cntExpr))
+					if okV && okW && w > 0 {
+						pairs = append(pairs, memWeightedVal{v: v, w: w})
+						totalW += w
+					}
+				}
+				if totalW <= 0 {
+					if hasHavingCountGtZero {
+						return nil
+					}
+					return []AggRow{{AggName: aggName, BucketKey: pctKey, DocCount: 0, Value: 0, Weight: -1}}
+				}
+				sort.Slice(pairs, func(i, j int) bool { return pairs[i].v < pairs[j].v })
+				res := computeWeightedQuantile(pairs, totalW, q)
+				return []AggRow{{AggName: aggName, BucketKey: pctKey, DocCount: int64(res), Value: res, Weight: int64(totalW)}}
+			}
+		}
+		if m := reAggPercentileRankWeight.FindStringSubmatch(branch); m != nil {
+			aggName, valKey, valExpr, threshStr, cntExpr, _, fromClause, extraWhere := m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]
+			thresh, _ := strconv.ParseFloat(threshStr, 64)
+			expanded := expandFromClauseRows(baseRows, fromClause, extraWhere)
+			var leWeight, totalWeight float64
+			for _, row := range expanded {
+				v, okV := toFloat(resolveColumnValue(row, valExpr))
+				w, okW := toFloat(resolveColumnValue(row, cntExpr))
+				if okV && okW && w > 0 {
+					totalWeight += w
+					if v <= thresh {
+						leWeight += w
+					}
+				}
+			}
+			if totalWeight <= 0 {
+				if hasHavingCountGtZero {
+					return nil
+				}
+				return []AggRow{{AggName: aggName, BucketKey: valKey, DocCount: 0, Value: 0, Weight: -1}}
+			}
+			res := 100.0 * leWeight / totalWeight
+			return []AggRow{{AggName: aggName, BucketKey: valKey, DocCount: int64(res), Value: res, Weight: int64(totalWeight)}}
+		}
 		if m := reAggNestedMetric.FindStringSubmatch(branch); m != nil {
 			aggName, bKey := m[1], m[2]
 			fn := m[3]
@@ -832,8 +946,8 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				}
 			}
 			w := int64(len(nums))
-			if len(nums) == 0 && (fn == "AVG" || fn == "MIN" || fn == "MAX" || fn == "STDDEV_POP") {
-				if bKey == "_metric" {
+			if len(nums) == 0 && (hasHavingCountGtZero || fn == "AVG" || fn == "MIN" || fn == "MAX" || fn == "STDDEV_POP") {
+				if bKey == "_metric" || hasHavingCountGtZero {
 					return nil
 				}
 				w = -1
@@ -1308,9 +1422,9 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 	}
 
 	if m := reAggHist.FindStringSubmatch(branch); m != nil {
-		aggName, colExpr, offsetStr, intervalStr, fromClause, extraWhere := m[1], m[2], m[3], m[4], m[5], m[6]
+		aggName, colExpr, offsetStr, intervalStr, sumExpr, fromClause, extraWhere := m[1], m[2], m[3], m[4], m[5], m[6], m[7]
 		if extraWhere == "" {
-			extraWhere = m[7]
+			extraWhere = m[8]
 		}
 		offset, _ := strconv.ParseFloat(offsetStr, 64)
 		interval, _ := strconv.ParseFloat(intervalStr, 64)
@@ -1322,6 +1436,17 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		seenDocBucket := make(map[string]bool)
 		isDistinctDoc := strings.Contains(branch, "COUNT(DISTINCT `_id`)")
 		for _, row := range expanded {
+			if sumExpr != "" {
+				if val := resolveColumnValue(row, colExpr); val != nil {
+					if f, ok := toFloat(val); ok {
+						if wf, okW := toFloat(resolveColumnValue(row, sumExpr)); okW {
+							b := math.Round((math.Floor((f-offset)/interval+1e-9)*interval+offset)*1e12) / 1e12
+							counts[b] += int64(math.Round(wf))
+						}
+					}
+				}
+				continue
+			}
 			if val := resolveColumnValue(row, colExpr); val != nil {
 				seenRowBucket := make(map[float64]bool)
 				for _, elem := range asSliceOrSingle(val) {
@@ -1529,6 +1654,156 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		return topFilteredBuckets(aggName, counts, limit)
 	}
 
+	if m := reAggSubWeightedAvg.FindStringSubmatch(branch); m != nil {
+		aggName, parentBucketExpr, valExpr, cntExpr, _, fromClause, whereClause := m[1], m[2], m[3], m[4], m[5], m[6], m[7]
+		expanded := expandFromClauseRows(baseRows, fromClause, whereClause)
+		type wAcc struct {
+			wSum float64
+			wTot float64
+		}
+		byBucket := make(map[string]*wAcc)
+		var bucketOrder []string
+		for _, row := range expanded {
+			v, okV := toFloat(resolveColumnValue(row, valExpr))
+			w, okW := toFloat(resolveColumnValue(row, cntExpr))
+			for _, bKey := range evalBucketKeyExprs(row, parentBucketExpr) {
+				if bKey == "" {
+					continue
+				}
+				acc, exists := byBucket[bKey]
+				if !exists {
+					acc = &wAcc{}
+					byBucket[bKey] = acc
+					bucketOrder = append(bucketOrder, bKey)
+				}
+				if okV && okW && w > 0 {
+					acc.wSum += v * w
+					acc.wTot += w
+				}
+			}
+		}
+		sort.Strings(bucketOrder)
+		var out []AggRow
+		for _, bKey := range bucketOrder {
+			acc := byBucket[bKey]
+			if acc.wTot <= 0 {
+				continue
+			}
+			res := acc.wSum / acc.wTot
+			out = append(out, AggRow{
+				AggName:   aggName,
+				BucketKey: bKey,
+				DocCount:  int64(res),
+				Value:     res,
+				Weight:    int64(acc.wTot),
+			})
+		}
+		return out
+	}
+
+	if m := reAggSubPercentileWeighted.FindStringSubmatch(branch); m != nil {
+		aggName, parentBucketExpr, rawArgs, fromClause, whereClause := m[1], m[2], m[3], m[4], m[5]
+		args := splitTopLevelArgs(rawArgs)
+		if len(args) == 3 {
+			valExpr, cntExpr, qStr := strings.TrimSpace(args[0]), strings.TrimSpace(args[1]), strings.TrimSpace(args[2])
+			q, _ := strconv.ParseFloat(qStr, 64)
+			expanded := expandFromClauseRows(baseRows, fromClause, whereClause)
+			type wpAcc struct {
+				pairs  []memWeightedVal
+				totalW float64
+			}
+			byBucket := make(map[string]*wpAcc)
+			var bucketOrder []string
+			for _, row := range expanded {
+				v, okV := toFloat(resolveColumnValue(row, valExpr))
+				w, okW := toFloat(resolveColumnValue(row, cntExpr))
+				for _, bKey := range evalBucketKeyExprs(row, parentBucketExpr) {
+					if bKey == "" {
+						continue
+					}
+					acc, exists := byBucket[bKey]
+					if !exists {
+						acc = &wpAcc{}
+						byBucket[bKey] = acc
+						bucketOrder = append(bucketOrder, bKey)
+					}
+					if okV && okW && w > 0 {
+						acc.pairs = append(acc.pairs, memWeightedVal{v: v, w: w})
+						acc.totalW += w
+					}
+				}
+			}
+			sort.Strings(bucketOrder)
+			var out []AggRow
+			for _, bKey := range bucketOrder {
+				acc := byBucket[bKey]
+				if acc.totalW <= 0 {
+					continue
+				}
+				sort.Slice(acc.pairs, func(i, j int) bool { return acc.pairs[i].v < acc.pairs[j].v })
+				res := computeWeightedQuantile(acc.pairs, acc.totalW, q)
+				out = append(out, AggRow{
+					AggName:   aggName,
+					BucketKey: bKey,
+					DocCount:  int64(res),
+					Value:     res,
+					Weight:    int64(acc.totalW),
+				})
+			}
+			return out
+		}
+	}
+
+	if m := reAggSubPercentileRankWgt.FindStringSubmatch(branch); m != nil {
+		aggName, parentBucketExpr, valExpr, threshStr, cntExpr, _, fromClause, whereClause := m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]
+		thresh, _ := strconv.ParseFloat(threshStr, 64)
+		expanded := expandFromClauseRows(baseRows, fromClause, whereClause)
+		type wrAcc struct {
+			leW  float64
+			totW float64
+		}
+		byBucket := make(map[string]*wrAcc)
+		var bucketOrder []string
+		for _, row := range expanded {
+			v, okV := toFloat(resolveColumnValue(row, valExpr))
+			w, okW := toFloat(resolveColumnValue(row, cntExpr))
+			for _, bKey := range evalBucketKeyExprs(row, parentBucketExpr) {
+				if bKey == "" {
+					continue
+				}
+				acc, exists := byBucket[bKey]
+				if !exists {
+					acc = &wrAcc{}
+					byBucket[bKey] = acc
+					bucketOrder = append(bucketOrder, bKey)
+				}
+				if okV && okW && w > 0 {
+					acc.totW += w
+					if v <= thresh {
+						acc.leW += w
+					}
+				}
+			}
+		}
+		sort.Strings(bucketOrder)
+		var out []AggRow
+		for _, bKey := range bucketOrder {
+			acc := byBucket[bKey]
+			if acc.totW <= 0 {
+				continue
+			}
+			res := 100.0 * acc.leW / acc.totW
+			out = append(out, AggRow{
+				AggName:   aggName,
+				BucketKey: bKey,
+				DocCount:  int64(res),
+				Value:     res,
+				Weight:    int64(acc.totW),
+			})
+		}
+		return out
+	}
+
 	if m := reAggSubMetric.FindStringSubmatch(branch); m != nil {
 		aggName, parentBucketExpr := m[1], m[2]
 		fn := m[3]
@@ -1704,10 +1979,76 @@ func sortRowsByOrderClause(rows []map[string]any, orderByClause string) {
 }
 
 var (
-	reLateralViewExplode = regexp.MustCompile("LATERAL VIEW EXPLODE\\((?:(CASE WHEN )`([^`]+)` IS NULL.+?END|`([^`]+)`)\\) `[^`]+` AS `([^`]+)`")
+	reCaseWhenExplodeCol = regexp.MustCompile("^CASE WHEN `([^`]+)` IS NULL.+END$")
 	reDedupSelectInner   = regexp.MustCompile("^SELECT DISTINCT `_id` AS `_rn_id(?:_\\d+)?`, (.+?) AS `(_rn_bkey(?:_\\d+)?)` FROM (.+)$")
 	reDedupJoinTail      = regexp.MustCompile("^\\s*`_rn_dedup(?:_\\d+)?` ON `base_matched`\\.`_id` = `_rn_dedup(?:_\\d+)?`\\.`_rn_id(?:_\\d+)?`(.*)$")
 )
+
+type parsedLateralExplode struct {
+	innerExpr string
+	aliasName string
+}
+
+func parseLateralViewExplodes(fromClause string) []parsedLateralExplode {
+	const marker = "LATERAL VIEW EXPLODE("
+	var out []parsedLateralExplode
+	rest := fromClause
+	for {
+		idx := strings.Index(rest, marker)
+		if idx < 0 {
+			break
+		}
+		openIdx := idx + len("LATERAL VIEW EXPLODE")
+		depth := 0
+		inSingleQuote := false
+		inBacktick := false
+		closeIdx := -1
+		for i := openIdx; i < len(rest); i++ {
+			ch := rest[i]
+			if ch == '\'' && !inBacktick {
+				inSingleQuote = !inSingleQuote
+				continue
+			}
+			if ch == '`' && !inSingleQuote {
+				inBacktick = !inBacktick
+				continue
+			}
+			if inSingleQuote || inBacktick {
+				continue
+			}
+			if ch == '(' {
+				depth++
+			} else if ch == ')' {
+				depth--
+				if depth == 0 {
+					closeIdx = i
+					break
+				}
+			}
+		}
+		if closeIdx <= openIdx {
+			break
+		}
+		innerExpr := strings.TrimSpace(rest[openIdx+1 : closeIdx])
+		afterClose := rest[closeIdx+1:]
+		asMarker := " AS `"
+		asPos := strings.Index(afterClose, asMarker)
+		if asPos < 0 {
+			rest = afterClose
+			continue
+		}
+		afterAs := afterClose[asPos+len(asMarker):]
+		endTick := strings.IndexByte(afterAs, '`')
+		if endTick < 0 {
+			rest = afterClose
+			continue
+		}
+		aliasName := afterAs[:endTick]
+		out = append(out, parsedLateralExplode{innerExpr: innerExpr, aliasName: aliasName})
+		rest = afterAs[endTick+1:]
+	}
+	return out
+}
 
 func parseLeadingDedupJoin(fromClause string) (innerBucketExpr, bkeyAlias, innerFrom, innerWhere, tailFrom string, ok bool) {
 	const prefix = "`base_matched` INNER JOIN ("
@@ -1825,17 +2166,25 @@ func expandFromClauseRows(baseRows []map[string]any, fromClause, whereClause str
 		currRows = deduped
 		fromClause = tailFrom
 	}
-	explodes := reLateralViewExplode.FindAllStringSubmatch(fromClause, -1)
-	for _, m := range explodes {
-		isCaseNull := m[1] != ""
-		explodeCol := m[2]
-		if explodeCol == "" {
-			explodeCol = m[3]
+	explodes := parseLateralViewExplodes(fromClause)
+	for _, exp := range explodes {
+		isCaseNull := false
+		explodeCol := ""
+		if cm := reCaseWhenExplodeCol.FindStringSubmatch(exp.innerExpr); cm != nil {
+			isCaseNull = true
+			explodeCol = cm[1]
+		} else if strings.HasPrefix(exp.innerExpr, "`") && strings.HasSuffix(exp.innerExpr, "`") && strings.Count(exp.innerExpr, "`") == 2 {
+			explodeCol = strings.Trim(exp.innerExpr, "`")
 		}
-		aliasName := m[4]
+		aliasName := exp.aliasName
 		var nextRows []map[string]any
 		for _, row := range currRows {
-			elems := toStringSlice(row[explodeCol])
+			var elems []string
+			if explodeCol != "" {
+				elems = toStringSlice(row[explodeCol])
+			} else {
+				elems = toStringSlice(resolveColumnValue(row, exp.innerExpr))
+			}
 			if len(elems) == 0 && isCaseNull {
 				cp := make(map[string]any, len(row)+1)
 				for k, v := range row {
@@ -3063,21 +3412,62 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 	if strings.HasPrefix(colExpr, "array_median(") && strings.HasSuffix(colExpr, ")") {
 		inner := strings.TrimSpace(colExpr[len("array_median(") : len(colExpr)-1])
 		elems := toStringSlice(resolveColumnValue(row, inner))
+		hasHex32 := false
+		for _, e := range elems {
+			if isHex32String(e) {
+				hasHex32 = true
+				break
+			}
+		}
+		if hasHex32 {
+			var hexes []string
+			for _, e := range elems {
+				if e != "" {
+					hexes = append(hexes, strings.ToUpper(e))
+				}
+			}
+			if len(hexes) == 0 {
+				return nil
+			}
+			sort.Strings(hexes)
+			mid := len(hexes) / 2
+			if len(hexes)%2 == 1 {
+				return hexes[mid]
+			}
+			biA, okA := new(big.Int).SetString(hexes[mid-1], 16)
+			biB, okB := new(big.Int).SetString(hexes[mid], 16)
+			if okA && okB {
+				avg := new(big.Int).Rsh(new(big.Int).Add(biA, biB), 1)
+				s := strings.ToUpper(avg.Text(16))
+				if len(s) < 32 {
+					s = strings.Repeat("0", 32-len(s)) + s
+				}
+				return s
+			}
+			return hexes[mid-1]
+		}
 		var nums []float64
+		var strs []string
 		for _, e := range elems {
 			if f, ok := toFloat(e); ok {
 				nums = append(nums, f)
+			} else if e != "" {
+				strs = append(strs, e)
 			}
 		}
-		if len(nums) == 0 {
-			return nil
+		if len(nums) > 0 {
+			sort.Float64s(nums)
+			mid := len(nums) / 2
+			if len(nums)%2 == 1 {
+				return nums[mid]
+			}
+			return (nums[mid-1] + nums[mid]) / 2.0
 		}
-		sort.Float64s(nums)
-		mid := len(nums) / 2
-		if len(nums)%2 == 1 {
-			return nums[mid]
+		if len(strs) > 0 {
+			sort.Strings(strs)
+			return strs[len(strs)/2]
 		}
-		return (nums[mid-1] + nums[mid]) / 2.0
+		return nil
 	}
 	if (strings.HasPrefix(colExpr, "array_min(") || strings.HasPrefix(colExpr, "array_max(") || strings.HasPrefix(colExpr, "array_avg(") || strings.HasPrefix(colExpr, "array_sum(")) && strings.HasSuffix(colExpr, ")") {
 		fn := colExpr[:len("array_min")]
@@ -3164,16 +3554,19 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 		return nil
 	}
-	if strings.HasPrefix(colExpr, "HEX(IPV6_STRING_TO_NUM_OR_NULL(") && strings.HasSuffix(colExpr, "))") {
+	if strings.HasPrefix(colExpr, "HEX(IPV6_STRING_TO_NUM_OR_NULL(") && strings.HasSuffix(colExpr, "))") && hasMatchingOuterParens(colExpr, 3) {
 		inner := colExpr[len("HEX(IPV6_STRING_TO_NUM_OR_NULL(") : len(colExpr)-2]
 		if v := resolveColumnValue(row, inner); v != nil {
 			switch sliceVal := v.(type) {
 			case []any, []string:
 				var out []any
 				for _, elem := range asSliceOrSingle(sliceVal) {
-					if ip := net.ParseIP(strings.TrimSpace(fmt.Sprintf("%v", elem))); ip != nil {
-						if ip16 := ip.To16(); len(ip16) == 16 {
-							out = append(out, strings.ToUpper(hex.EncodeToString(ip16)))
+					s := strings.TrimSpace(fmt.Sprintf("%v", elem))
+					if strings.Contains(s, ":") {
+						if ip := net.ParseIP(s); ip != nil {
+							if ip16 := ip.To16(); len(ip16) == 16 {
+								out = append(out, strings.ToUpper(hex.EncodeToString(ip16)))
+							}
 						}
 					}
 				}
@@ -3182,25 +3575,61 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 				}
 				return out
 			default:
-				if ip := net.ParseIP(strings.TrimSpace(fmt.Sprintf("%v", v))); ip != nil {
-					if ip16 := ip.To16(); len(ip16) == 16 {
-						return strings.ToUpper(hex.EncodeToString(ip16))
+				s := strings.TrimSpace(fmt.Sprintf("%v", v))
+				if strings.Contains(s, ":") {
+					if ip := net.ParseIP(s); ip != nil {
+						if ip16 := ip.To16(); len(ip16) == 16 {
+							return strings.ToUpper(hex.EncodeToString(ip16))
+						}
 					}
 				}
 			}
 		}
 		return nil
 	}
-	if strings.HasPrefix(colExpr, "IPV4_STRING_TO_NUM_OR_NULL(") && strings.HasSuffix(colExpr, ")") {
+	if (strings.HasPrefix(colExpr, "HEX(") || strings.HasPrefix(colExpr, "hex(")) && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, 3) {
+		inner := colExpr[len("HEX(") : len(colExpr)-1]
+		formatHexInt := func(iv int64) string {
+			if iv >= 0 {
+				return strings.ToUpper(strconv.FormatInt(iv, 16))
+			}
+			twoPow64 := new(big.Int).Lsh(big.NewInt(1), 64)
+			return strings.ToUpper(new(big.Int).Add(big.NewInt(iv), twoPow64).Text(16))
+		}
+		if v := resolveColumnValue(row, inner); v != nil {
+			switch sliceVal := v.(type) {
+			case []any, []string:
+				var out []any
+				for _, elem := range asSliceOrSingle(sliceVal) {
+					if iv, ok := toInt64(elem); ok {
+						out = append(out, formatHexInt(iv))
+					}
+				}
+				if len(out) == 0 {
+					return nil
+				}
+				return out
+			default:
+				if iv, ok := toInt64(v); ok {
+					return formatHexInt(iv)
+				}
+			}
+		}
+		return nil
+	}
+	if strings.HasPrefix(colExpr, "IPV4_STRING_TO_NUM_OR_NULL(") && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("IPV4_STRING_TO_NUM_OR_NULL")) {
 		inner := colExpr[len("IPV4_STRING_TO_NUM_OR_NULL(") : len(colExpr)-1]
 		if v := resolveColumnValue(row, inner); v != nil {
 			switch sliceVal := v.(type) {
 			case []any, []string:
 				var out []any
 				for _, elem := range asSliceOrSingle(sliceVal) {
-					if ip := net.ParseIP(strings.TrimSpace(fmt.Sprintf("%v", elem))); ip != nil {
-						if ip4 := ip.To4(); ip4 != nil {
-							out = append(out, int64(uint32(ip4[0])<<24|uint32(ip4[1])<<16|uint32(ip4[2])<<8|uint32(ip4[3])))
+					s := strings.TrimSpace(fmt.Sprintf("%v", elem))
+					if !strings.Contains(s, ":") {
+						if ip := net.ParseIP(s); ip != nil {
+							if ip4 := ip.To4(); ip4 != nil {
+								out = append(out, int64(uint32(ip4[0])<<24|uint32(ip4[1])<<16|uint32(ip4[2])<<8|uint32(ip4[3])))
+							}
 						}
 					}
 				}
@@ -3209,9 +3638,12 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 				}
 				return out
 			default:
-				if ip := net.ParseIP(strings.TrimSpace(fmt.Sprintf("%v", v))); ip != nil {
-					if ip4 := ip.To4(); ip4 != nil {
-						return int64(uint32(ip4[0])<<24 | uint32(ip4[1])<<16 | uint32(ip4[2])<<8 | uint32(ip4[3]))
+				s := strings.TrimSpace(fmt.Sprintf("%v", v))
+				if !strings.Contains(s, ":") {
+					if ip := net.ParseIP(s); ip != nil {
+						if ip4 := ip.To4(); ip4 != nil {
+							return int64(uint32(ip4[0])<<24 | uint32(ip4[1])<<16 | uint32(ip4[2])<<8 | uint32(ip4[3]))
+						}
 					}
 				}
 			}
@@ -3252,7 +3684,7 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			return res
 		}
 	}
-	if strings.HasPrefix(colExpr, "CAST(`_doc`") {
+	if strings.HasPrefix(colExpr, "CAST(`_doc`") && hasMatchingOuterParens(colExpr, 4) {
 		asIdx := strings.LastIndex(colExpr, " AS ")
 		if asIdx > 0 {
 			pathPart := colExpr[len("CAST(`_doc`"):asIdx]
@@ -3705,6 +4137,8 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			}
 			return extractJSONPathFromStr(rawStr, segs)
 		}
+	}
+	if strings.HasPrefix(colExpr, "CAST(") && !strings.HasPrefix(colExpr, "CAST(`_doc`") && hasMatchingOuterParens(colExpr, 4) {
 		if strings.HasSuffix(colExpr, " AS LARGEINT)") {
 			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS LARGEINT)")])
 			if bi, ok := memParseExactBigInt(inner); ok {
@@ -4814,7 +5248,58 @@ func compareBools(a, b bool) int {
 	return 1
 }
 
+func hasMatchingOuterParens(expr string, openIdx int) bool {
+	if openIdx < 0 || openIdx >= len(expr) || expr[openIdx] != '(' || expr[len(expr)-1] != ')' {
+		return false
+	}
+	depth := 0
+	inSingleQuote := false
+	inBacktick := false
+	for i := openIdx; i < len(expr); i++ {
+		ch := expr[i]
+		if ch == '\'' && !inBacktick {
+			inSingleQuote = !inSingleQuote
+			continue
+		}
+		if ch == '`' && !inSingleQuote {
+			inBacktick = !inBacktick
+			continue
+		}
+		if inSingleQuote || inBacktick {
+			continue
+		}
+		switch ch {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i == len(expr)-1
+			}
+		}
+	}
+	return false
+}
+
+func isHex32String(s string) bool {
+	if len(s) != 32 {
+		return false
+	}
+	for i := 0; i < 32; i++ {
+		ch := s[i]
+		if (ch < '0' || ch > '9') && (ch < 'A' || ch > 'F') && (ch < 'a' || ch > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func compareAny(a, b any) int {
+	if sa, okA := a.(string); okA && isHex32String(sa) {
+		if sb, okB := b.(string); okB && isHex32String(sb) {
+			return strings.Compare(strings.ToUpper(sa), strings.ToUpper(sb))
+		}
+	}
 	if ab, aOk := a.(bool); aOk {
 		if bb, bOk := coerceSQLBool(b); bOk {
 			return compareBools(ab, bb)

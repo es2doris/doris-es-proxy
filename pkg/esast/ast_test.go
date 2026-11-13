@@ -2735,3 +2735,130 @@ func TestRound57ASTValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestRound58ASTCompliance_F14ToF18(t *testing.T) {
+	// F14 & F15: FieldProperty PositiveScoreImpact, MaxShingleSize, DepthLimit
+	var ms MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"pagerank": {"type": "rank_feature", "positive_score_impact": false},
+			"suggest_title": {"type": "search_as_you_type", "max_shingle_size": 4},
+			"attrs": {"type": "flattened", "depth_limit": 5}
+		}
+	}`), &ms); err != nil {
+		t.Fatalf("F14/F15 unmarshal mapping failed: %v", err)
+	}
+	if ms.Properties["pagerank"].PositiveScoreImpact == nil || *ms.Properties["pagerank"].PositiveScoreImpact {
+		t.Fatalf("F14 expected positive_score_impact=false, got %+v", ms.Properties["pagerank"].PositiveScoreImpact)
+	}
+	if ms.Properties["suggest_title"].MaxShingleSize == nil || *ms.Properties["suggest_title"].MaxShingleSize != 4 {
+		t.Fatalf("F15 expected max_shingle_size=4, got %+v", ms.Properties["suggest_title"].MaxShingleSize)
+	}
+	if ms.Properties["attrs"].DepthLimit == nil || *ms.Properties["attrs"].DepthLimit != 5 {
+		t.Fatalf("F15 expected depth_limit=5, got %+v", ms.Properties["attrs"].DepthLimit)
+	}
+
+	// Valid SearchRequest & query combinations for F16, F17, F18
+	validReqs := []string{
+		`{"from":0,"size":0,"terminate_after":100,"batched_reduce_size":64,"track_total_hits":true,"query":{"match_all":{}}}`,
+		`{"track_total_hits":false,"query":{"match_all":{}}}`,
+		`{"track_total_hits":1000,"query":{"match_all":{}}}`,
+		`{"track_total_hits":-1,"query":{"match_all":{}}}`,
+		`{"query":{"bool":{"should":[{"term":{"a":"1"}},{"term":{"a":"2"}}],"minimum_should_match":1,"boost":0,"adjust_pure_negative":false}}}`,
+		`{"query":{"bool":{"should":[{"term":{"a":"1"}},{"term":{"a":"2"}}],"minimum_should_match":"75%"}}}`,
+		`{"query":{"bool":{"should":[{"term":{"a":"1"}},{"term":{"a":"2"}}],"minimum_should_match":"-25%"}}}`,
+		`{"query":{"bool":{"should":[{"term":{"a":"1"}},{"term":{"a":"2"}}],"minimum_should_match":"-1"}}}`,
+		`{"query":{"bool":{"should":[{"term":{"a":"1"}},{"term":{"a":"2"}}],"minimum_should_match":"2<-25% 5<3 9<-3"}}}`,
+		`{"query":{"match":{"title":{"query":"hello world","minimum_should_match":"2<75%"}}}}`,
+		`{"query":{"match_phrase":{"title":{"query":"hello world"}}}}`,
+		`{"query":{"multi_match":{"query":123,"fields":["title^2.5","body^0","tags*^2"],"minimum_should_match":1}}}`,
+		`{"query":{"combined_fields":{"query":"database engine","fields":["title^2","body"],"minimum_should_match":"50%"}}}`,
+		`{"query":{"query_string":{"query":"status:active","fields":["title^1.5","body"],"minimum_should_match":"1"}}}`,
+		`{"query":{"simple_query_string":{"query":"quick fox","fields":["title^3"],"minimum_should_match":"2<-1"}}}`,
+		`{"query":{"more_like_this":{"like":"some text","fields":["title"],"minimum_should_match":"60%"}}}`,
+		`{"query":{"common":{"body":{"query":"the quick brown","minimum_should_match":2}}}}`,
+		`{"query":{"common":{"body":{"query":"the quick brown","minimum_should_match":{"low_freq":"50%","high_freq":"2<75%"}}}}}`,
+	}
+	for _, raw := range validReqs {
+		var sr SearchRequest
+		if err := json.Unmarshal([]byte(raw), &sr); err != nil {
+			t.Fatalf("Round 58 expected valid SearchRequest for %s, got err=%v", raw, err)
+		}
+	}
+
+	invalidReqs := []struct {
+		raw     string
+		wantSub string
+	}{
+		// F16: top-level SearchRequest validation
+		{`{"from":-1}`, "from"},
+		{`{"size":-5}`, "size"},
+		{`{"from":1.5}`, "from"},
+		{`{"size":2.5}`, "size"},
+		{`{"from":"abc"}`, "from"},
+		{`{"size":"abc"}`, "size"},
+		{`{"terminate_after":0}`, "terminate_after"},
+		{`{"terminate_after":-10}`, "terminate_after"},
+		{`{"terminate_after":1.5}`, "terminate_after"},
+		{`{"batched_reduce_size":0}`, "batched_reduce_size"},
+		{`{"batched_reduce_size":-2}`, "batched_reduce_size"},
+		{`{"batched_reduce_size":2.5}`, "batched_reduce_size"},
+		{`{"track_total_hits":"abc"}`, "track_total_hits"},
+		{`{"track_total_hits":1.5}`, "track_total_hits"},
+		{`{"track_total_hits":-2}`, "track_total_hits"},
+		{`{"explain":"notabool"}`, "explain"},
+		{`{"version":"notabool"}`, "version"},
+		{`{"seq_no_primary_term":"notabool"}`, "seq_no_primary_term"},
+		{`{"track_scores":"notabool"}`, "track_scores"},
+
+		// F17: minimum_should_match grammar & ascending pivot checks across all 9 query types + bool boost/adjust_pure_negative
+		{`{"query":{"bool":{"should":[{"term":{"a":"1"}}],"minimum_should_match":"bogus"}}}`, "minimum_should_match"},
+		{`{"query":{"bool":{"should":[{"term":{"a":"1"}}],"minimum_should_match":""}}}`, "minimum_should_match"},
+		{`{"query":{"bool":{"should":[{"term":{"a":"1"}}],"minimum_should_match":true}}}`, "minimum_should_match"},
+		{`{"query":{"bool":{"should":[{"term":{"a":"1"}}],"minimum_should_match":1.5}}}`, "minimum_should_match"},
+		{`{"query":{"bool":{"should":[{"term":{"a":"1"}}],"minimum_should_match":[1]}}}`, "minimum_should_match"},
+		{`{"query":{"bool":{"should":[{"term":{"a":"1"}}],"minimum_should_match":"75%%"}}}`, "minimum_should_match"},
+		{`{"query":{"bool":{"should":[{"term":{"a":"1"}}],"minimum_should_match":"2<bogus"}}}`, "minimum_should_match"},
+		{`{"query":{"bool":{"should":[{"term":{"a":"1"}}],"minimum_should_match":"0<50%"}}}`, "minimum_should_match"},
+		{`{"query":{"bool":{"should":[{"term":{"a":"1"}}],"minimum_should_match":"-2<50%"}}}`, "minimum_should_match"},
+		{`{"query":{"bool":{"should":[{"term":{"a":"1"}}],"minimum_should_match":"3<50% 2<75%"}}}`, "minimum_should_match"},
+		{`{"query":{"bool":{"should":[{"term":{"a":"1"}}],"minimum_should_match":"2<50% 2<75%"}}}`, "minimum_should_match"},
+		{`{"query":{"match":{"title":{"query":"hi","minimum_should_match":"bogus"}}}}`, "minimum_should_match"},
+		{`{"query":{"match_phrase":{"title":{"query":"hi","minimum_should_match":"bogus"}}}}`, "minimum_should_match"},
+		{`{"query":{"multi_match":{"query":"hi","minimum_should_match":"3<50% 1<80%"}}}`, "minimum_should_match"},
+		{`{"query":{"combined_fields":{"query":"hi","minimum_should_match":"bogus"}}}`, "minimum_should_match"},
+		{`{"query":{"query_string":{"query":"hi","minimum_should_match":"bogus"}}}`, "minimum_should_match"},
+		{`{"query":{"simple_query_string":{"query":"hi","minimum_should_match":"bogus"}}}`, "minimum_should_match"},
+		{`{"query":{"more_like_this":{"like":"hi","minimum_should_match":"bogus"}}}`, "minimum_should_match"},
+		{`{"query":{"common":{"body":{"query":"hi","minimum_should_match":"bogus"}}}}`, "minimum_should_match"},
+		{`{"query":{"common":{"body":{"query":"hi","minimum_should_match":{"low_freq":"bogus"}}}}}`, "minimum_should_match"},
+		{`{"query":{"bool":{"must":[{"match_all":{}}],"boost":-1.5}}}`, "boost"},
+		{`{"query":{"bool":{"must":[{"match_all":{}}],"adjust_pure_negative":"yes"}}}`, "adjust_pure_negative"},
+
+		// F18: required scalar query & fields ^boost validation
+		{`{"query":{"multi_match":{"fields":["title"]}}}`, "[multi_match]"},
+		{`{"query":{"multi_match":{"query":null,"fields":["title"]}}}`, "[multi_match]"},
+		{`{"query":{"multi_match":{"query":["a"],"fields":["title"]}}}`, "[multi_match]"},
+		{`{"query":{"multi_match":{"query":{"a":1},"fields":["title"]}}}`, "[multi_match]"},
+		{`{"query":{"combined_fields":{"fields":["title"]}}}`, "[combined_fields]"},
+		{`{"query":{"combined_fields":{"query":null,"fields":["title"]}}}`, "[combined_fields]"},
+		{`{"query":{"combined_fields":{"query":["a"],"fields":["title"]}}}`, "[combined_fields]"},
+		{`{"query":{"query_string":{}}}`, "[query_string]"},
+		{`{"query":{"query_string":{"query":null}}}`, "[query_string]"},
+		{`{"query":{"query_string":{"query":["a"]}}}`, "[query_string]"},
+		{`{"query":{"multi_match":{"query":"hi","fields":["title^-2"]}}}`, "boost"},
+		{`{"query":{"multi_match":{"query":"hi","fields":["title^abc"]}}}`, "boost"},
+		{`{"query":{"multi_match":{"query":"hi","fields":["title^"]}}}`, "boost"},
+		{`{"query":{"multi_match":{"query":"hi","fields":[""]}}}`, "field"},
+		{`{"query":{"combined_fields":{"query":"hi","fields":["title^-1"]}}}`, "boost"},
+		{`{"query":{"query_string":{"query":"hi","fields":["^2"]}}}`, "field"},
+		{`{"query":{"simple_query_string":{"query":"hi","fields":["title^NaN"]}}}`, "boost"},
+	}
+	for _, tc := range invalidReqs {
+		var sr SearchRequest
+		err := json.Unmarshal([]byte(tc.raw), &sr)
+		if err == nil || !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(tc.wantSub)) {
+			t.Fatalf("Round 58 expected error containing %q for %s, got err=%v", tc.wantSub, tc.raw, err)
+		}
+	}
+}

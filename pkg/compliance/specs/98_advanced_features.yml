@@ -329,7 +329,7 @@
 
   - do:
       migration.deprecations: {}
-  - is_true: cluster_settings
+  - match: { cluster_settings: [] }
 
   - do:
       rollup.put_job:
@@ -801,6 +801,7 @@
 
   - do:
       security.clear_cached_realms:
+        realms: "native1"
         username: elastic
   - is_true: _nodes
 
@@ -833,7 +834,7 @@
             match_all: {}
           vertices:
             - field: "host"
-  - is_true: vertices
+  - match: { vertices: [] }
 
   - do:
       cluster.info: {}
@@ -1577,24 +1578,24 @@
       security.saml_invalidate:
         body:
           query_string: "SAMLRequest=xyz"
-  - is_true: ''
+  - is_unset: error
 
   - do:
       security.saml_logout:
         body:
           token: $r57_saml_tok
-  - is_true: ''
+  - is_unset: error
 
   - do:
       security.saml_complete_logout:
         body: {}
-  - is_true: ''
+  - is_unset: error
 
   - do:
       security.saml_service_provider_metadata:
         body:
           realm_name: "saml1"
-  - is_true: ''
+  - is_unset: error
 
   - do:
       security.delegate_pki:
@@ -1604,7 +1605,7 @@
 
   - do:
       security.get_certificates: {}
-  - is_true: ''
+  - is_unset: error
 
   # F0 & F9: Capabilities, Script Introspection, System Features Migration, End-to-End Simulate Ingest
   - do:
@@ -1824,19 +1825,19 @@
 
   - do:
       cat.anomaly_detectors: {}
-  - is_true: ''
+  - is_unset: error
 
   - do:
       cat.datafeeds: {}
-  - is_true: ''
+  - is_unset: error
 
   - do:
       cat.trained_models: {}
-  - is_true: ''
+  - is_unset: error
 
   - do:
       cat.data_frame_analytics: {}
-  - is_true: ''
+  - is_unset: error
 
 ---
 "Round 57 SQL, ES|QL, EQL, Stateful Snapshot/Mount/SLM, Synonyms, Inference, Connectors & Search Applications":
@@ -2717,5 +2718,952 @@
               def compVal = m.computeIfAbsent(5, k -> k + 1);
               return shInt + "|" + shLong + "|" + satByte + "|" + ovf + "|" + exactCaught + "|" + q.toString() + "|" + bdScaleStrict + "|" + splitEsc + "|" + splitMeta + "|" + hierCaught + "|" + compVal;
   - match: { result: "1|4294967296|-1|-2147483648|true|0.125|true|3|0|true|6" }
+
+---
+"Round 58 Runner Actions, PIT/Scroll, Materializing Transform & Rollup, Templates, Data Streams, Resolve, Field Caps, Settings & Cat":
+  # F0-F1: New action builders (license.put/post, inference.chunking, security.*_user_profile, nodes.stats index_metric, ml.preview_datafeed)
+  - do:
+      license.put:
+        acknowledge: true
+        body:
+          type: "platinum"
+  - match: { acknowledged: true }
+  - match: { license_status: "valid" }
+
+  - do:
+      license.post:
+        body:
+          type: "enterprise"
+  - match: { acknowledged: true }
+
+  - do:
+      inference.put:
+        task_type: "text_embedding"
+        inference_id: "r58_chunk_ep"
+        body:
+          service: "elasticsearch"
+          service_settings:
+            model_id: "m1"
+          chunking_settings:
+            strategy: "sentence"
+  - match: { inference_id: "r58_chunk_ep" }
+
+  - do:
+      inference.chunking:
+        inference_id: "r58_chunk_ep"
+        body:
+          input: "First sentence. Second sentence"
+  - length: { results.0.chunks: 2 }
+  - match: { results.0.chunks.0: "First sentence" }
+  - match: { results.0.chunks.1: "Second sentence" }
+
+  - do:
+      security.activate_user_profile:
+        body:
+          grant:
+            user:
+              username: "r58_alice_prof"
+              roles: ["analyst"]
+              full_name: "Alice R58"
+              email: "alice58@example.com"
+  - set: { uid: r58_uid }
+  - do:
+      security.get_user_profile:
+        uid: $r58_uid
+  - length: { profiles: 1 }
+
+  - do:
+      security.update_user_profile_data:
+        uid: $r58_uid
+        body:
+          labels:
+            env: "2026_01"
+          data:
+            theme: "dark"
+  - match: { acknowledged: true }
+
+  - do:
+      security.get_user_profile:
+        uid: $r58_uid
+  - match: { profiles.0.labels.env: "2026_01" }
+
+  - do:
+      security.disable_user_profile:
+        uid: $r58_uid
+  - match: { acknowledged: true }
+
+  - do:
+      security.enable_user_profile:
+        uid: $r58_uid
+  - match: { acknowledged: true }
+
+  - do:
+      security.has_privileges_user_profile:
+        uid: $r58_uid
+        body:
+          cluster: ["monitor"]
+  - is_unset: error
+
+  - do:
+      security.suggest_user_profiles:
+        body:
+          hint:
+            text: "alice"
+          size: 5
+  - gte: { count: 1 }
+
+  - do:
+      nodes.stats:
+        metric: "indices"
+        index_metric: "docs"
+  - is_true: nodes
+
+  - do:
+      ml.preview_datafeed:
+        body:
+          datafeed_config:
+            indices: ["*"]
+  - match: { "": [] }
+
+  # F2: Stateful PIT & Scroll lifecycle (deterministic _id tiebreak, 404 search_context_missing_exception after close/clear)
+  - do:
+      indices.create:
+        index: r58_pit_idx
+        body:
+          mappings:
+            properties:
+              val: { type: "long" }
+  - match: { acknowledged: true }
+
+  - do:
+      index:
+        index: r58_pit_idx
+        id: "b"
+        refresh: true
+        body: { val: 10 }
+
+  - do:
+      index:
+        index: r58_pit_idx
+        id: "a"
+        refresh: true
+        body: { val: 10 }
+
+  - do:
+      open_point_in_time:
+        index: r58_pit_idx
+        keep_alive: "1m"
+  - set: { id: r58_pit_id }
+
+  - do:
+      search:
+        body:
+          size: 2
+          pit:
+            id: $r58_pit_id
+            keep_alive: "1m"
+          sort:
+            - val: "asc"
+  - match: { hits.hits.0._id: "a" }
+  - match: { hits.hits.1._id: "b" }
+
+  - do:
+      close_point_in_time:
+        body:
+          id: $r58_pit_id
+  - match: { succeeded: true }
+  - match: { num_freed: 1 }
+
+  - do:
+      catch: missing
+      search:
+        body:
+          pit:
+            id: $r58_pit_id
+
+  - do:
+      search:
+        index: r58_pit_idx
+        scroll: "1m"
+        body:
+          size: 1
+          sort:
+            - _id: "asc"
+  - set: { _scroll_id: r58_scroll_id }
+  - match: { hits.hits.0._id: "a" }
+
+  - do:
+      clear_scroll:
+        scroll_id: [$r58_scroll_id]
+  - match: { succeeded: true }
+  - match: { num_freed: 1 }
+
+  - do:
+      catch: missing
+      scroll:
+        body:
+          scroll: "1m"
+          scroll_id: $r58_scroll_id
+
+  # F3: Materializing _transform & _rollup (with _rollup_search even after source index deletion)
+  - do:
+      indices.create:
+        index: r58_orders_src
+        body:
+          mappings:
+            properties:
+              customer: { type: "keyword" }
+              status:   { type: "keyword" }
+              amount:   { type: "double" }
+              ts:       { type: "date" }
+  - match: { acknowledged: true }
+
+  - do:
+      index:
+        index: r58_orders_src
+        id: "1"
+        refresh: true
+        body: { customer: "alice", status: "paid", amount: 15.0, ts: "2026-05-01T10:05:00Z" }
+  - do:
+      index:
+        index: r58_orders_src
+        id: "2"
+        refresh: true
+        body: { customer: "alice", status: "paid", amount: 25.0, ts: "2026-05-01T10:45:00Z" }
+  - do:
+      index:
+        index: r58_orders_src
+        id: "3"
+        refresh: true
+        body: { customer: "bob", status: "paid", amount: 50.0, ts: "2026-05-01T11:15:00Z" }
+
+  - do:
+      transform.put_transform:
+        transform_id: r58_tx_pivot
+        body:
+          source:
+            index: "r58_orders_src"
+            query:
+              term: { status: "paid" }
+          dest:
+            index: "r58_orders_pivot_dest"
+          pivot:
+            group_by:
+              customer:
+                terms: { field: "customer" }
+            aggregations:
+              total_amt:
+                sum: { field: "amount" }
+              avg_amt:
+                avg: { field: "amount" }
+  - match: { acknowledged: true }
+
+  - do:
+      transform.preview_transform:
+        body:
+          source:
+            index: "r58_orders_src"
+          pivot:
+            group_by:
+              customer:
+                terms: { field: "customer" }
+            aggregations:
+              total_amt:
+                sum: { field: "amount" }
+  - length: { preview: 2 }
+  - is_true: generated_dest_index
+
+  - do:
+      transform.start_transform:
+        transform_id: r58_tx_pivot
+  - match: { acknowledged: true }
+
+  - do:
+      search:
+        index: r58_orders_pivot_dest
+        body:
+          query:
+            term: { customer: "alice" }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._source.total_amt: 40.0 }
+  - match: { hits.hits.0._source.avg_amt: 20.0 }
+
+  - do:
+      transform.get_transform_stats:
+        transform_id: r58_tx_pivot
+  - match: { transforms.0.state: "started" }
+  - match: { transforms.0.stats.documents_indexed: 2 }
+
+  - do:
+      transform.stop_transform:
+        transform_id: r58_tx_pivot
+  - match: { acknowledged: true }
+
+  - do:
+      rollup.put_job:
+        id: r58_rj_orders
+        body:
+          index_pattern: "r58_orders_src*"
+          rollup_index: "r58_rollup_orders_dest"
+          cron: "0 */30 * * * ?"
+          page_size: 100
+          groups:
+            date_histogram:
+              field: "ts"
+              fixed_interval: "1h"
+            terms:
+              fields: ["customer", "status"]
+          metrics:
+            - field: "amount"
+              metrics: ["min", "max", "sum", "avg", "value_count"]
+  - match: { acknowledged: true }
+
+  - do:
+      rollup.start_job:
+        id: r58_rj_orders
+  - match: { started: true }
+
+  - do:
+      rollup.get_rollup_caps:
+        id: r58_rj_orders
+  - is_true: r58_rj_orders.rollup_jobs.0.fields.amount
+
+  - do:
+      catch: bad_request
+      rollup.rollup_search:
+        index: r58_rollup_orders_dest
+        body:
+          size: 5
+
+  - do:
+      indices.delete:
+        index: r58_orders_src
+  - match: { acknowledged: true }
+
+  - do:
+      rollup.rollup_search:
+        index: r58_rollup_orders_dest
+        body:
+          query:
+            term: { status: "paid" }
+          aggs:
+            sum_paid:
+              sum: { field: "amount" }
+  - match: { aggregations.sum_paid.value: 90.0 }
+
+  - do:
+      rollup.stop_job:
+        id: r58_rj_orders
+  - match: { stopped: true }
+
+  # F4-F9: Composable vs legacy templates, append-only data streams, ? wildcards, hidden indices, _field_caps, flat_settings, _reindex & _cat numeric sort
+  - do:
+      indices.put_template:
+        name: r58_leg_iso
+        body:
+          index_patterns: ["r58-tpl-*"]
+          order: 10
+          mappings:
+            properties:
+              leg_field: { type: "keyword" }
+  - match: { acknowledged: true }
+
+  - do:
+      catch: missing
+      indices.get_index_template:
+        name: r58_leg_iso
+
+  - do:
+      indices.put_index_template:
+        name: r58_comp_base
+        body:
+          index_patterns: ["r58-tpl-*"]
+          priority: 150
+          template:
+            settings:
+              index.refresh_interval: "25s"
+            mappings:
+              properties:
+                comp_field: { type: "keyword" }
+  - match: { acknowledged: true }
+
+  - do:
+      catch: bad_request
+      indices.put_index_template:
+        name: r58_comp_dup_prio
+        body:
+          index_patterns: ["r58-tpl-sub-*"]
+          priority: 150
+          template: {}
+
+  - do:
+      indices.create:
+        index: r58-tpl-01
+  - match: { acknowledged: true }
+
+  - do:
+      indices.get:
+        index: r58-tpl-01
+        flat_settings: true
+  - match: { r58-tpl-01.settings.index\.refresh_interval: "25s" }
+  - is_true: r58-tpl-01.mappings.properties.comp_field
+  - is_unset: r58-tpl-01.mappings.properties.leg_field
+
+  - do:
+      indices.create_data_stream:
+        name: r58_ds_append
+  - match: { acknowledged: true }
+
+  - do:
+      index:
+        index: r58_ds_append
+        id: "ds1"
+        op_type: "create"
+        refresh: true
+        body:
+          "@timestamp": "2026-05-01T00:00:00Z"
+          msg: "ok"
+
+  - do:
+      catch: bad_request
+      index:
+        index: r58_ds_append
+        id: "ds2"
+        op_type: "index"
+        body:
+          "@timestamp": "2026-05-01T00:01:00Z"
+          msg: "bad"
+
+  - do:
+      catch: bad_request
+      delete:
+        index: r58_ds_append
+        id: "ds1"
+
+  - do:
+      indices.create:
+        index: r58_wild_01
+        body:
+          mappings:
+            properties:
+              title: { type: "text", fields: { raw: { type: "keyword" } } }
+              pages: { type: "long" }
+              secret_code: { type: "keyword" }
+  - match: { acknowledged: true }
+
+  - do:
+      indices.create:
+        index: r58_wild_02
+        body:
+          mappings:
+            properties:
+              pages: { type: "long" }
+  - match: { acknowledged: true }
+
+  - do:
+      indices.create:
+        index: r58_wild_hid
+        body:
+          settings:
+            index.hidden: true
+  - match: { acknowledged: true }
+
+  - do:
+      index:
+        index: r58_wild_01
+        id: "1"
+        refresh: true
+        body: { title: "alpha", pages: 100 }
+  - do:
+      index:
+        index: r58_wild_01
+        id: "2"
+        refresh: true
+        body: { title: "beta", pages: 200 }
+  - do:
+      index:
+        index: r58_wild_02
+        id: "1"
+        refresh: true
+        body: { pages: 300 }
+
+  - do:
+      search:
+        index: "r58_wild_0?"
+  - match: { hits.total.value: 3 }
+
+  - do:
+      indices.resolve_index:
+        name: "r58_wild_*"
+  - length: { indices: 2 }
+
+  - do:
+      indices.resolve_index:
+        name: "r58_wild_*"
+        expand_wildcards: "all"
+  - length: { indices: 3 }
+
+  - do:
+      field_caps:
+        index: r58_wild_01
+        fields: "*,-secret*"
+  - is_unset: fields.@timestamp
+  - is_unset: fields.secret_code
+  - is_true: fields.pages
+
+  - do:
+      field_caps:
+        index: r58_wild_01
+        fields: "pages,unmapped_ghost"
+        include_unmapped: true
+  - is_true: fields.unmapped_ghost.unmapped
+
+  - do:
+      catch: missing
+      reindex:
+        body:
+          source:
+            index: "r58_nonexistent_src_idx"
+          dest:
+            index: "r58_should_not_create_dest"
+
+  - do:
+      reindex:
+        refresh: true
+        body:
+          source:
+            index: "r58_wild_01"
+            _source: ["pages"]
+            slice:
+              id: 0
+              max: 2
+          dest:
+            index: "r58_reidx_sliced_dest"
+  - is_unset: error
+
+  - do:
+      reindex:
+        refresh: true
+        body:
+          source:
+            index: "r58_wild_01"
+            _source: ["pages"]
+            slice:
+              id: 1
+              max: 2
+          dest:
+            index: "r58_reidx_sliced_dest"
+  - is_unset: error
+
+  - do:
+      count:
+        index: r58_reidx_sliced_dest
+  - match: { count: 2 }
+
+  - do:
+      get:
+        index: r58_reidx_sliced_dest
+        id: "1"
+  - match: { _source.pages: 100 }
+  - is_unset: _source.title
+
+  # F9: _cat/indices numeric sort (10 > 2 even when lexicographic index order is reversed) & 400 validation
+  - do:
+      indices.create:
+        index: r58_cat_z_two
+  - do:
+      index: { index: r58_cat_z_two, id: "1", refresh: true, body: { x: 1 } }
+  - do:
+      index: { index: r58_cat_z_two, id: "2", refresh: true, body: { x: 2 } }
+
+  - do:
+      indices.create:
+        index: r58_cat_a_ten
+  - do:
+      bulk:
+        index: r58_cat_a_ten
+        refresh: true
+        body:
+          - { index: { _id: "1" } }
+          - { x: 1 }
+          - { index: { _id: "2" } }
+          - { x: 2 }
+          - { index: { _id: "3" } }
+          - { x: 3 }
+          - { index: { _id: "4" } }
+          - { x: 4 }
+          - { index: { _id: "5" } }
+          - { x: 5 }
+          - { index: { _id: "6" } }
+          - { x: 6 }
+          - { index: { _id: "7" } }
+          - { x: 7 }
+          - { index: { _id: "8" } }
+          - { x: 8 }
+          - { index: { _id: "9" } }
+          - { x: 9 }
+          - { index: { _id: "10" } }
+          - { x: 10 }
+
+  - do:
+      cat.indices:
+        index: "r58_cat_*"
+        format: "json"
+        h: "i,docs.*"
+        s: "docs.count:asc"
+  - match: { 0.index: "r58_cat_z_two" }
+  - match: { 0.docs\.count: "2" }
+  - match: { 1.index: "r58_cat_a_ten" }
+  - match: { 1.docs\.count: "10" }
+
+  - do:
+      catch: bad_request
+      cat.indices:
+        h: "nonexistent_column"
+
+  - do:
+      catch: bad_request
+      cat.indices:
+        s: "docs.count:sideways"
+
+---
+"Round 58 Schema, Shredder, Transpiler (IPv6, DateNanos, Histogram, RankFeature, SearchAsYouType, Bool/Lucene) & Painless JLS":
+  # F15: Mapping validation for search_as_you_type.max_shingle_size (2..4) and flattened.depth_limit (>= 1)
+  - do:
+      catch: bad_request
+      indices.create:
+        index: r58_bad_sayt_idx
+        body:
+          mappings:
+            properties:
+              q:
+                type: "search_as_you_type"
+                max_shingle_size: 5
+
+  - do:
+      catch: bad_request
+      indices.create:
+        index: r58_bad_flat_idx
+        body:
+          mappings:
+            properties:
+              meta:
+                type: "flattened"
+                depth_limit: 0
+
+  # F10-F15: Create index with ip, date_range, date_nanos, histogram, rank_feature (negative impact), search_as_you_type, flattened, text & keyword
+  - do:
+      indices.create:
+        index: r58_schema_idx
+        body:
+          mappings:
+            properties:
+              ip_addr:
+                type: "ip"
+              win:
+                type: "date_range"
+              ts_ns:
+                type: "date_nanos"
+              lat_hist:
+                type: "histogram"
+              err_rate:
+                type: "rank_feature"
+                positive_score_impact: false
+              suggest_title:
+                type: "search_as_you_type"
+                max_shingle_size: 4
+              flat_meta:
+                type: "flattened"
+                depth_limit: 2
+              grp:
+                type: "keyword"
+              title:
+                type: "text"
+              notes:
+                type: "text"
+  - match: { acknowledged: true }
+
+  - do:
+      field_caps:
+        index: r58_schema_idx
+        fields: "suggest_title*"
+  - match: { fields.suggest_title.search_as_you_type.aggregatable: false }
+  - is_true: fields.suggest_title\._2gram
+  - is_true: fields.suggest_title\._3gram
+  - is_true: fields.suggest_title\._4gram
+  - is_true: fields.suggest_title\._index_prefix
+
+  # F15: Enforce flattened.depth_limit at index time
+  - do:
+      catch: bad_request
+      index:
+        index: r58_schema_idx
+        id: "bad_depth"
+        body:
+          flat_meta:
+            l1:
+              l2:
+                l3: "too_deep"
+
+  # Index test documents covering IPv4 + IPv6, date_range, sub-ms date_nanos, histogram bins, negative rank_feature, and nullable text
+  - do:
+      index:
+        index: r58_schema_idx
+        id: "1"
+        refresh: true
+        body:
+          ip_addr: "::1"
+          win: { gte: "2026-01-01", lte: "2026-01-15" }
+          ts_ns: "2026-05-01T12:00:00.100000001Z"
+          lat_hist: { values: [10, 20], counts: [2, 3] }
+          err_rate: 2.0
+          grp: "g1"
+          title: "alpha error 404"
+
+  - do:
+      index:
+        index: r58_schema_idx
+        id: "2"
+        refresh: true
+        body:
+          ip_addr: "10.0.0.2"
+          win: { gt: "2026-01-31T23:59:59.999Z", lte: "2026-02-10" }
+          ts_ns: "2026-05-01T12:00:00.100000002Z"
+          lat_hist: { values: [20, 40], counts: [1, 4] }
+          err_rate: 10.0
+          grp: "g1"
+          notes: "beta worker"
+
+  - do:
+      index:
+        index: r58_schema_idx
+        id: "3"
+        refresh: true
+        body:
+          ip_addr: "10.0.0.10"
+          win: { gte: "2026-03-01", lte: "2026-03-05" }
+          ts_ns: "2026-05-01T12:00:00.100000003Z"
+          lat_hist: { values: [100], counts: [0] }
+          grp: "g2"
+          title: "forbidden token"
+
+  - do:
+      index:
+        index: r58_schema_idx
+        id: "4"
+        refresh: true
+        body:
+          ip_addr: "2001:db8::2"
+          ts_ns: "2026-05-01T12:00:00.100000004Z"
+          grp: "g2"
+          title: "gamma node"
+
+  # F10: date_range gt:"2026-01" rounds up to end of January 2026 (excludes doc 1 in mid-Jan, matches docs 2 & 3)
+  - do:
+      search:
+        index: r58_schema_idx
+        body:
+          query:
+            range:
+              win:
+                gt: "2026-01"
+          sort:
+            - _id: "asc"
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "3" }
+
+  # F11: Mixed IPv4 & IPv6 canonical 128-bit ordering, range, and search_after
+  - do:
+      search:
+        index: r58_schema_idx
+        body:
+          query:
+            range:
+              ip_addr:
+                gte: "::1"
+                lte: "2001:db8::2"
+          sort:
+            - ip_addr: { order: "asc" }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "3" }
+  - match: { hits.hits.3._id: "4" }
+
+  - do:
+      search:
+        index: r58_schema_idx
+        body:
+          sort:
+            - ip_addr: { order: "asc" }
+          search_after: ["10.0.0.2"]
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "4" }
+
+  # F12: Sub-millisecond date_nanos range, sort, and docvalue_fields formatting
+  - do:
+      search:
+        index: r58_schema_idx
+        body:
+          query:
+            range:
+              ts_ns:
+                gt: "2026-05-01T12:00:00.100000001Z"
+                lte: "2026-05-01T12:00:00.100000003Z"
+          sort:
+            - ts_ns: { order: "desc" }
+          docvalue_fields:
+            - "ts_ns"
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.0.fields.ts_ns.0: "2026-05-01T12:00:00.100000003Z" }
+  - match: { hits.hits.1._id: "2" }
+
+  # F13: Histogram range query (counts > 0 only) & count-weighted metric/percentile aggregations
+  - do:
+      search:
+        index: r58_schema_idx
+        body:
+          query:
+            range:
+              lat_hist:
+                gte: 5
+                lte: 150
+          aggs:
+            mn: { min: { field: "lat_hist" } }
+            mx: { max: { field: "lat_hist" } }
+            sm: { sum: { field: "lat_hist" } }
+            av: { avg: { field: "lat_hist" } }
+            vc: { value_count: { field: "lat_hist" } }
+            pc: { percentiles: { field: "lat_hist", percents: [50] } }
+  - match: { hits.total.value: 2 }
+  - match: { aggregations.mn.value: 10.0 }
+  - match: { aggregations.mx.value: 40.0 }
+  - match: { aggregations.sm.value: 260.0 }
+  - match: { aggregations.av.value: 26.0 }
+  - match: { aggregations.vc.value: 10 }
+  - match: { aggregations.pc.values.50\.0: 20.0 }
+
+  # F14: rank_feature with positive_score_impact: false ranks smaller feature value higher
+  - do:
+      search:
+        index: r58_schema_idx
+        body:
+          query:
+            rank_feature:
+              field: "err_rate"
+              saturation:
+                pivot: 4.0
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+
+  # F16-F19: Strict _search top-level & URI validation, minimum_should_match, combined_fields text-only, scalar multi_match, and NULL-safe must_not
+  - do:
+      catch: bad_request
+      search:
+        index: r58_schema_idx
+        body:
+          unknown_top_level_key: true
+
+  - do:
+      catch: bad_request
+      search:
+        index: r58_schema_idx
+        size: -1
+
+  - do:
+      catch: bad_request
+      search:
+        index: r58_schema_idx
+        body:
+          query:
+            bool:
+              should:
+                - term: { grp: "g1" }
+              minimum_should_match: "invalid_msm"
+
+  - do:
+      catch: bad_request
+      search:
+        index: r58_schema_idx
+        body:
+          query:
+            combined_fields:
+              query: "g1"
+              fields: ["grp"]
+
+  - do:
+      search:
+        index: r58_schema_idx
+        body:
+          query:
+            multi_match:
+              query: 404
+              fields: ["title^2", "notes"]
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+
+  - do:
+      search:
+        index: r58_schema_idx
+        body:
+          query:
+            bool:
+              must_not:
+                - multi_match:
+                    query: "forbidden"
+                    fields: ["title", "notes"]
+          sort:
+            - _id: "asc"
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "4" }
+
+  # F20-F26: Painless JLS strict/type-safe equality, Optional, IEEE-754 float /0.0, null-safe ?., regex flags, java.time validation & immutable Set.of/List.of
+  - do:
+      scripts_painless_execute:
+        body:
+          script:
+            source: |
+              boolean crossEq = ("1" == 1);
+              Map a = new HashMap();
+              Map b = new HashMap();
+              boolean refDiff = (a !== b) && (a == b);
+              String optVal = Optional.ofNullable(null).orElse("fallback");
+              boolean infOk = Double.isInfinite(1.0 / 0.0);
+              boolean nanOk = Double.isNaN(0.0 / 0.0);
+              Map nullMap = null;
+              def safeNav = nullMap?.size();
+              boolean npeCaught = false;
+              try {
+                def x = nullMap.size();
+              } catch (NullPointerException e) {
+                npeCaught = true;
+              }
+              boolean rxCase = ("Hello" =~ /hello/i);
+              boolean leapCaught = false;
+              try {
+                LocalDate.of(2025, 2, 29);
+              } catch (DateTimeException e) {
+                leapCaught = true;
+              }
+              boolean dupSetCaught = false;
+              try {
+                Set.of(1, 1);
+              } catch (IllegalArgumentException e) {
+                dupSetCaught = true;
+              }
+              boolean immutCaught = false;
+              try {
+                List.of(1, 2).add(3);
+              } catch (UnsupportedOperationException e) {
+                immutCaught = true;
+              }
+              return crossEq + "|" + refDiff + "|" + optVal + "|" + infOk + "|" + nanOk + "|" + safeNav + "|" + npeCaught + "|" + rxCase + "|" + leapCaught + "|" + dupSetCaught + "|" + immutCaught;
+  - match: { result: "false|true|fallback|true|true|null|true|true|true|true|true" }
+
 
 

@@ -89,6 +89,7 @@ type FieldBinding struct {
 	ESType              string // Declared Elasticsearch field type (e.g. "date", "long", "keyword")
 	Format              string // Optional ES date/number format
 	Analyzer            string
+	SearchAnalyzer      string
 	LowercaseNormalizer bool
 	KeywordCompanion    string // Optional untokenized `.keyword` column for `text` fields
 	KeywordNormalizer   bool   // Whether `KeywordCompanion` has a lowercase normalizer
@@ -110,10 +111,43 @@ type FieldBinding struct {
 	Coerce                   *bool
 	IgnoreMalformed          *bool
 	EnablePositionIncrements *bool
+	PositiveScoreImpact      *bool
+	MaxShingleSize           int
+	DepthLimit               int
 	Relations                map[string]any
 	NotIndexed               bool
 	EnabledFalse             bool
 	DocValuesFalse           bool
+}
+
+// EffectivePositiveScoreImpact returns true unless `positive_score_impact` was explicitly set to false.
+func (b FieldBinding) EffectivePositiveScoreImpact() bool {
+	return b.PositiveScoreImpact == nil || *b.PositiveScoreImpact
+}
+
+// SearchAsYouTypeSubfields returns the active synthetic sub-field suffixes (e.g. `._2gram`, `._3gram`, `._index_prefix`)
+// for a `search_as_you_type` field based on its `max_shingle_size` (default 3).
+func (b FieldBinding) SearchAsYouTypeSubfields() []string {
+	ms := b.MaxShingleSize
+	if ms <= 0 {
+		ms = 3
+	}
+	switch ms {
+	case 2:
+		return []string{"._2gram", "._index_prefix"}
+	case 4:
+		return []string{"._2gram", "._3gram", "._4gram", "._index_prefix"}
+	default:
+		return []string{"._2gram", "._3gram", "._index_prefix"}
+	}
+}
+
+// EffectiveDepthLimit returns the maximum object nesting depth for a `flattened` field (default 20).
+func (b FieldBinding) EffectiveDepthLimit() int {
+	if b.DepthLimit > 0 {
+		return b.DepthLimit
+	}
+	return 20
 }
 
 // EffectiveLowercase returns true if this field (or its `.keyword` companion when `preferKeyword` is true)
@@ -790,6 +824,12 @@ func validateNullValueForField(fullPath, fType string, prop esast.FieldProperty)
 				return fmt.Errorf("mapper_parsing_exception: failed to parse [null_value] on [%s] field [%s]", fType, fullPath)
 			}
 			if strings.TrimSpace(prop.Format) == "" {
+				if fType == "date_nanos" {
+					if _, ok := ParseESDateWithFormatToEpochNanos(s, "", time.Now().UTC()); !ok {
+						return fmt.Errorf("mapper_parsing_exception: failed to parse [null_value] on [%s] field [%s]", fType, fullPath)
+					}
+					return nil
+				}
 				if _, ok := ParseESDateToEpochMillis(s, time.Now().UTC()); !ok {
 					return fmt.Errorf("mapper_parsing_exception: failed to parse [null_value] on [%s] field [%s]", fType, fullPath)
 				}
@@ -845,8 +885,28 @@ func validateSingleFieldProperty(fullPath, fType string, prop esast.FieldPropert
 			prop.IndexOptions != nil || prop.Norms != nil || prop.Boost != nil ||
 			prop.EagerGlobalOrdinals != nil || prop.Fielddata != nil ||
 			prop.SplitQueriesOnWhitespace != nil || prop.EnablePositionIncrements != nil ||
+			prop.PositiveScoreImpact != nil || prop.MaxShingleSize != nil || prop.DepthLimit != nil ||
 			prop.Relations != nil {
 			return fmt.Errorf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters", fullPath)
+		}
+	}
+	if prop.PositiveScoreImpact != nil && fType != "rank_feature" {
+		return fmt.Errorf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters: [positive_score_impact : %v]", fullPath, *prop.PositiveScoreImpact)
+	}
+	if prop.MaxShingleSize != nil {
+		if fType != "search_as_you_type" {
+			return fmt.Errorf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters: [max_shingle_size : %d]", fullPath, *prop.MaxShingleSize)
+		}
+		if *prop.MaxShingleSize < 2 || *prop.MaxShingleSize > 4 {
+			return fmt.Errorf("mapper_parsing_exception: [max_shingle_size] must be between 2 and 4 inclusive for field [%s], got [%d]", fullPath, *prop.MaxShingleSize)
+		}
+	}
+	if prop.DepthLimit != nil {
+		if fType != "flattened" {
+			return fmt.Errorf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters: [depth_limit : %d]", fullPath, *prop.DepthLimit)
+		}
+		if *prop.DepthLimit < 1 {
+			return fmt.Errorf("mapper_parsing_exception: [depth_limit] must be >= 1 for field [%s], got [%d]", fullPath, *prop.DepthLimit)
 		}
 	}
 	if prop.Subobjects != nil && fType != "" && fType != "object" {
@@ -1527,6 +1587,30 @@ func validatePropertiesCompatibility(oldProps, newProps map[string]esast.FieldPr
 				return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: Cannot update parameter [similarity] from [%s] to [%s]", fullPath, oldSim, newProp.Similarity)
 			}
 		}
+		if newProp.PositiveScoreImpact != nil && oldType == "rank_feature" {
+			oldPSI := oldProp.PositiveScoreImpact == nil || *oldProp.PositiveScoreImpact
+			if *newProp.PositiveScoreImpact != oldPSI {
+				return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: Cannot update parameter [positive_score_impact] from [%v] to [%v]", fullPath, oldPSI, *newProp.PositiveScoreImpact)
+			}
+		}
+		if newProp.MaxShingleSize != nil && oldType == "search_as_you_type" {
+			oldMSS := 3
+			if oldProp.MaxShingleSize != nil {
+				oldMSS = *oldProp.MaxShingleSize
+			}
+			if *newProp.MaxShingleSize != oldMSS {
+				return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: Cannot update parameter [max_shingle_size] from [%d] to [%d]", fullPath, oldMSS, *newProp.MaxShingleSize)
+			}
+		}
+		if newProp.DepthLimit != nil && oldType == "flattened" {
+			oldDL := 20
+			if oldProp.DepthLimit != nil {
+				oldDL = *oldProp.DepthLimit
+			}
+			if *newProp.DepthLimit != oldDL {
+				return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: Cannot update parameter [depth_limit] from [%d] to [%d]", fullPath, oldDL, *newProp.DepthLimit)
+			}
+		}
 		if len(oldProp.Fields) > 0 && len(newProp.Fields) > 0 {
 			if err := validatePropertiesCompatibility(oldProp.Fields, newProp.Fields, fullPath); err != nil {
 				return err
@@ -1547,8 +1631,19 @@ func (s *IndexSchema) IsDynamicFalseUnmappedField(esFieldPath string) bool {
 		return false
 	}
 	cleanPath := strings.TrimSuffix(strings.TrimSuffix(esFieldPath, ".keyword"), ".ngram")
-	for _, saytSuffix := range []string{"._index_prefix", "._2gram", "._3gram"} {
-		cleanPath = strings.TrimSuffix(cleanPath, saytSuffix)
+	for _, saytSuffix := range []string{"._index_prefix", "._2gram", "._3gram", "._4gram"} {
+		if strings.HasSuffix(cleanPath, saytSuffix) {
+			candBase := strings.TrimSuffix(cleanPath, saytSuffix)
+			if b, ok := s.Fields[candBase]; ok && strings.EqualFold(b.ESType, "search_as_you_type") {
+				for _, allowed := range b.SearchAsYouTypeSubfields() {
+					if allowed == saytSuffix {
+						cleanPath = candBase
+						break
+					}
+				}
+			}
+			break
+		}
 	}
 	if cleanPath == "" || strings.HasPrefix(cleanPath, "_") {
 		return false
@@ -1712,6 +1807,18 @@ func DeepMergeMappingProperties(
 			if v.EnablePositionIncrements != nil {
 				merged.EnablePositionIncrements = v.EnablePositionIncrements
 			}
+			if v.PositiveScoreImpact != nil {
+				b := *v.PositiveScoreImpact
+				merged.PositiveScoreImpact = &b
+			}
+			if v.MaxShingleSize != nil {
+				ms := *v.MaxShingleSize
+				merged.MaxShingleSize = &ms
+			}
+			if v.DepthLimit != nil {
+				dl := *v.DepthLimit
+				merged.DepthLimit = &dl
+			}
 			if v.Relations != nil {
 				merged.Relations = v.Relations
 			}
@@ -1727,6 +1834,18 @@ func DeepMergeMappingProperties(
 			if v.Store != nil {
 				b := *v.Store
 				copied.Store = &b
+			}
+			if v.PositiveScoreImpact != nil {
+				b := *v.PositiveScoreImpact
+				copied.PositiveScoreImpact = &b
+			}
+			if v.MaxShingleSize != nil {
+				ms := *v.MaxShingleSize
+				copied.MaxShingleSize = &ms
+			}
+			if v.DepthLimit != nil {
+				dl := *v.DepthLimit
+				copied.DepthLimit = &dl
 			}
 			if len(v.Properties) > 0 {
 				copied.Properties = DeepMergeMappingProperties(nil, v.Properties)
@@ -1888,8 +2007,22 @@ func (s *IndexSchema) registerLeafField(
 	if esType == "search_as_you_type" && prop.Analyzer == "" {
 		prop.Analyzer = "standard"
 	}
+	maxShingle := 0
+	if esType == "search_as_you_type" {
+		maxShingle = 3
+		if prop.MaxShingleSize != nil {
+			maxShingle = *prop.MaxShingleSize
+		}
+	}
+	depthLimit := 0
+	if esType == "flattened" {
+		depthLimit = 20
+		if prop.DepthLimit != nil {
+			depthLimit = *prop.DepthLimit
+		}
+	}
 
-	if IsRangeFieldType(esType) || esType == "flattened" || esType == "sparse_vector" || esType == "rank_features" || esType == "percolator" || esType == "geo_shape" {
+	if IsRangeFieldType(esType) || esType == "histogram" || esType == "flattened" || esType == "sparse_vector" || esType == "rank_features" || esType == "percolator" || esType == "geo_shape" {
 		s.Fields[dotPath] = FieldBinding{
 			ESFieldPath:              dotPath,
 			SourceJSONPath:           sourceJSONPath,
@@ -1899,6 +2032,7 @@ func (s *IndexSchema) registerLeafField(
 			ESType:                   esType,
 			Format:                   prop.Format,
 			Analyzer:                 prop.Analyzer,
+			SearchAnalyzer:           prop.SearchAnalyzer,
 			LowercaseNormalizer:      lowerNorm,
 			NestedPath:               activeNestedRoot,
 			CopyTo:                   copyTo,
@@ -1907,6 +2041,9 @@ func (s *IndexSchema) registerLeafField(
 			Coerce:                   prop.Coerce,
 			IgnoreMalformed:          prop.IgnoreMalformed,
 			EnablePositionIncrements: prop.EnablePositionIncrements,
+			PositiveScoreImpact:      prop.PositiveScoreImpact,
+			MaxShingleSize:           maxShingle,
+			DepthLimit:               depthLimit,
 			Relations:                prop.Relations,
 			NotIndexed:               notIndexed,
 			DocValuesFalse:           docValuesFalse,
@@ -1931,12 +2068,13 @@ func (s *IndexSchema) registerLeafField(
 			ESType:                   esType,
 			Format:                   prop.Format,
 			Analyzer:                 prop.Analyzer,
+			SearchAnalyzer:           prop.SearchAnalyzer,
 			LowercaseNormalizer:      lowerNorm,
 			NestedPath:               activeNestedRoot,
 			CorrelatedArrayCol:       corrCol,
 			RelativeJSONPath:         relJSONPath,
 			PrefilterArrayCol:        prefilterCol,
-			IsMultiValued:            prop.MultiValued || len(relJSONPath) > 1 || DefaultMultiValuedPaths[dotPath],
+			IsMultiValued:            (prop.MultiValued || len(relJSONPath) > 1 || DefaultMultiValuedPaths[dotPath]) && esType != "rank_feature",
 			CopyTo:                   copyTo,
 			NullValue:                prop.NullValue,
 			ConstantValue:            prop.Value,
@@ -1945,6 +2083,9 @@ func (s *IndexSchema) registerLeafField(
 			Coerce:                   prop.Coerce,
 			IgnoreMalformed:          prop.IgnoreMalformed,
 			EnablePositionIncrements: prop.EnablePositionIncrements,
+			PositiveScoreImpact:      prop.PositiveScoreImpact,
+			MaxShingleSize:           maxShingle,
+			DepthLimit:               depthLimit,
 			Relations:                prop.Relations,
 			NotIndexed:               notIndexed,
 			DocValuesFalse:           docValuesFalse,
@@ -1973,7 +2114,7 @@ func (s *IndexSchema) registerLeafField(
 		}
 		return
 	}
-	if (prop.MultiValued || DefaultMultiValuedPaths[dotPath]) && !IsTextLikeESType(esType) {
+	if (prop.MultiValued || DefaultMultiValuedPaths[dotPath]) && !IsTextLikeESType(esType) && esType != "rank_feature" {
 		arrColName := colName
 		if prop.UpgradedArray {
 			arrColName = "f__arr__" + SanitizeDorisIdentifier(dotPath)
@@ -1987,6 +2128,7 @@ func (s *IndexSchema) registerLeafField(
 			ESType:                   esType,
 			Format:                   prop.Format,
 			Analyzer:                 prop.Analyzer,
+			SearchAnalyzer:           prop.SearchAnalyzer,
 			LowercaseNormalizer:      lowerNorm,
 			IsMultiValued:            true,
 			CopyTo:                   copyTo,
@@ -1997,6 +2139,9 @@ func (s *IndexSchema) registerLeafField(
 			Coerce:                   prop.Coerce,
 			IgnoreMalformed:          prop.IgnoreMalformed,
 			EnablePositionIncrements: prop.EnablePositionIncrements,
+			PositiveScoreImpact:      prop.PositiveScoreImpact,
+			MaxShingleSize:           maxShingle,
+			DepthLimit:               depthLimit,
 			Relations:                prop.Relations,
 			NotIndexed:               notIndexed,
 			DocValuesFalse:           docValuesFalse,
@@ -2013,6 +2158,7 @@ func (s *IndexSchema) registerLeafField(
 		ESType:                   esType,
 		Format:                   prop.Format,
 		Analyzer:                 prop.Analyzer,
+		SearchAnalyzer:           prop.SearchAnalyzer,
 		LowercaseNormalizer:      lowerNorm,
 		CopyTo:                   copyTo,
 		NullValue:                prop.NullValue,
@@ -2022,6 +2168,9 @@ func (s *IndexSchema) registerLeafField(
 		Coerce:                   prop.Coerce,
 		IgnoreMalformed:          prop.IgnoreMalformed,
 		EnablePositionIncrements: prop.EnablePositionIncrements,
+		PositiveScoreImpact:      prop.PositiveScoreImpact,
+		MaxShingleSize:           maxShingle,
+		DepthLimit:               depthLimit,
 		Relations:                prop.Relations,
 		NotIndexed:               notIndexed,
 		DocValuesFalse:           docValuesFalse,
@@ -2059,12 +2208,16 @@ func (s *IndexSchema) ResolveField(esFieldPath string) FieldBinding {
 		}
 		return b
 	}
-	for _, saytSuffix := range []string{"._index_prefix", "._2gram", "._3gram"} {
+	for _, saytSuffix := range []string{"._index_prefix", "._2gram", "._3gram", "._4gram"} {
 		if strings.HasSuffix(esFieldPath, saytSuffix) {
 			basePath := strings.TrimSuffix(esFieldPath, saytSuffix)
 			if b, ok := s.Fields[basePath]; ok && strings.EqualFold(b.ESType, "search_as_you_type") {
-				b.ESFieldPath = esFieldPath
-				return b
+				for _, allowed := range b.SearchAsYouTypeSubfields() {
+					if allowed == saytSuffix {
+						b.ESFieldPath = esFieldPath
+						return b
+					}
+				}
 			}
 		}
 	}
@@ -2189,14 +2342,17 @@ func (s *IndexSchema) ExpandFieldPattern(patternWithBoost string) []BoostedField
 		if b.Kind == StoragePromotedVector || b.NotIndexed || b.EnabledFalse {
 			continue
 		}
+		if b.ESType == "histogram" || b.ESType == "rank_feature" || b.ESType == "rank_features" || b.ESType == "sparse_vector" || b.ESType == "percolator" {
+			continue
+		}
 		if b.ESType == "alias" && b.ColumnName == "" && b.Kind != StorageDynamicVariant {
 			continue
 		}
 		if re.MatchString(k) {
 			matchedSet[k] = true
 		}
-		if b.ESType == "search_as_you_type" && (strings.Contains(pattern, "_2gram") || strings.Contains(pattern, "_3gram") || strings.Contains(pattern, "_index_prefix") || strings.HasPrefix(pattern, k+".")) {
-			for _, sub := range []string{"._2gram", "._3gram", "._index_prefix"} {
+		if b.ESType == "search_as_you_type" && (strings.Contains(pattern, "_2gram") || strings.Contains(pattern, "_3gram") || strings.Contains(pattern, "_4gram") || strings.Contains(pattern, "_index_prefix") || strings.HasPrefix(pattern, k+".")) {
+			for _, sub := range b.SearchAsYouTypeSubfields() {
 				cand := k + sub
 				if re.MatchString(cand) {
 					matchedSet[cand] = true
@@ -2222,7 +2378,7 @@ func (s *IndexSchema) ExpandFieldPattern(patternWithBoost string) []BoostedField
 
 func mapESTypeToDoris(esType string) DorisScalarType {
 	switch strings.ToLower(strings.TrimSpace(esType)) {
-	case "integer_range", "long_range", "float_range", "double_range", "date_range", "ip_range", "flattened", "percolator", "geo_shape":
+	case "integer_range", "long_range", "float_range", "double_range", "date_range", "ip_range", "histogram", "flattened", "percolator", "geo_shape":
 		return DorisVariant
 	case "keyword", "constant_keyword", "wildcard", "ip", "version":
 		return DorisVarchar
@@ -2232,7 +2388,7 @@ func mapESTypeToDoris(esType string) DorisScalarType {
 		return DorisBigInt
 	case "integer", "short", "byte", "token_count":
 		return DorisInt
-	case "double", "float", "half_float", "scaled_float":
+	case "double", "float", "half_float", "scaled_float", "rank_feature":
 		return DorisDouble
 	case "boolean":
 		return DorisBoolean

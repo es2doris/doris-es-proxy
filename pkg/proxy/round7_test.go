@@ -308,10 +308,10 @@ func TestRound7_PipelineAggValidationOverflowAndScientificNotation(t *testing.T)
 		t.Fatalf("expected overflowing inf_script to be omitted, got %+v", firstB["inf_script"])
 	}
 
-	// 5. Painless scientific notation and overflow protection
+	// 5. Painless scientific notation and IEEE-754 float64 overflow semantics
 	updatedJSON, err := painless.ApplyUpdate(json.RawMessage(`{"v":100.0}`), &painless.UpdateRequest{
 		Script: &painless.ScriptSpec{
-			Source: "ctx._source.scaled = 1e-2 * 50 + -0.1; ctx._source.overflow = 1e308 * 10;",
+			Source: "ctx._source.scaled = 1e-2 * 50 + -0.1; ctx._source.is_inf = Double.isInfinite(1e308 * 10);",
 		},
 	})
 	if err != nil {
@@ -322,8 +322,15 @@ func TestRound7_PipelineAggValidationOverflowAndScientificNotation(t *testing.T)
 	if updatedDoc["scaled"] != 0.4 {
 		t.Fatalf("expected 0.4 from scientific notation, got %v", updatedDoc["scaled"])
 	}
-	if updatedDoc["overflow"] != float64(0) {
-		t.Fatalf("expected overflow to clamp to 0, got %v", updatedDoc["overflow"])
+	if updatedDoc["is_inf"] != true {
+		t.Fatalf("expected IEEE-754 +Inf from 1e308 * 10, got %v", updatedDoc["is_inf"])
+	}
+	if _, infErr := painless.ApplyUpdate(json.RawMessage(`{"v":100.0}`), &painless.UpdateRequest{
+		Script: &painless.ScriptSpec{
+			Source: "ctx._source.overflow = 1e308 * 10;",
+		},
+	}); infErr == nil {
+		t.Fatalf("expected storing raw +Inf in ctx._source JSON to return error")
 	}
 }
 

@@ -3,13 +3,16 @@ package compliance
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 )
 
 func TestBuildActionRequest(t *testing.T) {
@@ -2543,9 +2546,8 @@ func TestRound55BuildActionRequestAndOperatorsF0F1(t *testing.T) {
 		{"security.enroll_kibana", "security.enroll_kibana", map[string]any{}, http.MethodPost, "/_security/enroll/kibana", ""},
 		{"security.enroll_node", "security.enroll_node", map[string]any{}, http.MethodPost, "/_security/enroll/node", ""},
 		{"security.clear_cached_roles", "security.clear_cached_roles", map[string]any{"name": "admin"}, http.MethodPost, "/_security/role/admin/_clear_cache", ""},
-		{"security.clear_cached_realms with username", "security.clear_cached_realms", map[string]any{"username": "u1"}, http.MethodPost, "/_security/user/u1/_clear_cache", ""},
+		{"security.clear_cached_realms with realms and usernames", "security.clear_cached_realms", map[string]any{"realms": "native1", "usernames": "u1"}, http.MethodPost, "/_security/realm/native1/_clear_cache", "usernames=u1"},
 		{"security.clear_cached_realms with realms", "security.clear_cached_realms", map[string]any{"realms": "native1"}, http.MethodPost, "/_security/realm/native1/_clear_cache", ""},
-		{"security.clear_cached_realms empty", "security.clear_cached_realms", map[string]any{}, http.MethodPost, "/_security/user/_clear_cache", ""},
 		{"indices.reload_search_analyzers with index", "indices.reload_search_analyzers", map[string]any{"index": "idx1"}, http.MethodPost, "/idx1/_reload_search_analyzers", ""},
 		{"indices.reload_search_analyzers all", "indices.reload_search_analyzers", map[string]any{}, http.MethodPost, "/_reload_search_analyzers", ""},
 		{"indices.disk_usage with index", "indices.disk_usage", map[string]any{"index": "idx1"}, http.MethodPost, "/idx1/_disk_usage", ""},
@@ -4174,5 +4176,776 @@ func TestRound57_RunnerWarningsArbitraryKeyStashAndNestedTransforms(t *testing.T
 		if err := ctx.execTransformAndSet(map[string]any{"err_out": badExpr}); err == nil {
 			t.Fatalf("expected transform error for %q", badExpr)
 		}
+	}
+}
+
+func TestRound58_F0_EscapeIDSegAndDateMathPaths(t *testing.T) {
+	if got := escapeIDSeg(""); got != "" {
+		t.Fatalf("escapeIDSeg empty: got %q", got)
+	}
+	if got := escapeIDSeg("a%2Fb"); got != "a%252Fb" {
+		t.Fatalf("escapeIDSeg literal percent: got %q, want %q", got, "a%252Fb")
+	}
+	if got := escapeIDSeg("a/b"); got != "a%2Fb" {
+		t.Fatalf("escapeIDSeg slash: got %q, want %q", got, "a%2Fb")
+	}
+	if got := escapeIDSeg("id#1?x=2 y"); got != "id%231%3Fx=2%20y" {
+		t.Fatalf("escapeIDSeg specials: got %q, want %q", got, "id%231%3Fx=2%20y")
+	}
+	if got := escapeCommaIDSegs("p/1,p%2F2"); got != "p%2F1,p%252F2" {
+		t.Fatalf("escapeCommaIDSegs: got %q, want %q", got, "p%2F1,p%252F2")
+	}
+
+	dateMathCases := []struct {
+		name string
+		in   any
+		want string
+	}{
+		{"single date math", "<logs-{now/d}>", "%3Clogs-%7Bnow%2Fd%7D%3E"},
+		{"date math with plus and colon", "<logs-{now/d+1h{YYYY.MM.dd|+01:00}}>", "%3Clogs-%7Bnow%2Fd%2B1h%7BYYYY.MM.dd%7C%2B01%3A00%7D%7D%3E"},
+		{"slice date math", []any{"<logs-{now/d}>", "<metrics-{now/h}>"}, "%3Clogs-%7Bnow%2Fd%7D%3E,%3Cmetrics-%7Bnow%2Fh%7D%3E"},
+		{"string slice date math", []string{"<logs-{now/d}>", "plain-idx"}, "%3Clogs-%7Bnow%2Fd%7D%3E,plain-idx"},
+		{"ccs prefix date math", "remote:<logs-{now/d}>,plain*", "remote:%3Clogs-%7Bnow%2Fd%7D%3E,plain*"},
+		{"plain slash outside date math preserved", "seg1/seg2", "seg1/seg2"},
+		{"unclosed angle bracket", "<unclosed", "<unclosed"},
+	}
+	for _, tc := range dateMathCases {
+		if got := joinParamPath(tc.in); got != tc.want {
+			t.Fatalf("%s: joinParamPath(%v) = %q, want %q", tc.name, tc.in, got, tc.want)
+		}
+	}
+
+	ctx := newRunnerContext(http.DefaultClient, "http://localhost:9200")
+	idCases := []struct {
+		action   string
+		params   map[string]any
+		wantPath string
+	}{
+		{"put_script", map[string]any{"id": "s/1%2F2"}, "/_scripts/s%2F1%252F2"},
+		{"get_script", map[string]any{"id": "s/1#2"}, "/_scripts/s%2F1%232"},
+		{"delete_script", map[string]any{"id": "s?1"}, "/_scripts/s%3F1"},
+		{"render_search_template", map[string]any{"id": "tpl/1"}, "/_render/template/tpl%2F1"},
+		{"ingest.put_pipeline", map[string]any{"id": "pip/1"}, "/_ingest/pipeline/pip%2F1"},
+		{"ingest.get_pipeline", map[string]any{"id": "pip/1,pip%2F2"}, "/_ingest/pipeline/pip%2F1,pip%252F2"},
+		{"ingest.delete_pipeline", map[string]any{"id": "pip/1"}, "/_ingest/pipeline/pip%2F1"},
+		{"ingest.simulate", map[string]any{"id": "pip/1"}, "/_ingest/pipeline/pip%2F1/_simulate"},
+		{"synonyms.put_synonym", map[string]any{"id": "syn/1"}, "/_synonyms/syn%2F1"},
+		{"synonyms.put_synonym_rule", map[string]any{"set_id": "set/1", "rule_id": "r#1"}, "/_synonyms/set%2F1/r%231"},
+		{"synonyms.get_synonym_rule", map[string]any{"set_id": "set/1", "rule_id": "r?1"}, "/_synonyms/set%2F1/r%3F1"},
+		{"synonyms.delete_synonym_rule", map[string]any{"set_id": "set/1", "rule_id": "r%2F1"}, "/_synonyms/set%2F1/r%252F1"},
+		{"query_rules.put_rule", map[string]any{"ruleset_id": "rs/1", "rule_id": "rl#1"}, "/_query_rules/rs%2F1/_rule/rl%231"},
+		{"query_rules.get_rule", map[string]any{"ruleset_id": "rs/1", "rule_id": "rl/1"}, "/_query_rules/rs%2F1/_rule/rl%2F1"},
+		{"query_rules.delete_rule", map[string]any{"ruleset_id": "rs/1", "rule_id": "rl/1"}, "/_query_rules/rs%2F1/_rule/rl%2F1"},
+		{"security.put_user", map[string]any{"username": "u/1"}, "/_security/user/u%2F1"},
+		{"security.get_user", map[string]any{"username": "u/1,u#2"}, "/_security/user/u%2F1,u%232"},
+		{"security.delete_user", map[string]any{"username": "u%2F1"}, "/_security/user/u%252F1"},
+		{"security.enable_user", map[string]any{"username": "u/1"}, "/_security/user/u%2F1/_enable"},
+		{"security.disable_user", map[string]any{"username": "u/1"}, "/_security/user/u%2F1/_disable"},
+		{"security.change_password", map[string]any{"username": "u/1"}, "/_security/user/u%2F1/_password"},
+		{"security.has_privileges", map[string]any{"username": "u/1"}, "/_security/user/u%2F1/_has_privileges"},
+		{"security.get_user_profile", map[string]any{"uid": "u/1,u#2"}, "/_security/profile/u%2F1,u%232"},
+		{"security.update_user_profile_data", map[string]any{"uid": "u/1"}, "/_security/profile/u%2F1/_data"},
+		{"security.enable_user_profile", map[string]any{"uid": "u/1"}, "/_security/profile/u%2F1/_enable"},
+		{"security.disable_user_profile", map[string]any{"uid": "u/1"}, "/_security/profile/u%2F1/_disable"},
+		{"security.has_privileges_user_profile", map[string]any{"uid": "u/1"}, "/_security/profile/u%2F1/_has_privileges"},
+		{"async_search.get", map[string]any{"id": "as/1"}, "/_async_search/as%2F1"},
+		{"async_search.status", map[string]any{"id": "as/1"}, "/_async_search/status/as%2F1"},
+		{"async_search.delete", map[string]any{"id": "as/1"}, "/_async_search/as%2F1"},
+		{"inference.put", map[string]any{"task_type": "rerank", "inference_id": "m/1"}, "/_inference/rerank/m%2F1"},
+		{"inference.get", map[string]any{"inference_id": "m%2F1"}, "/_inference/m%252F1"},
+		{"inference.delete", map[string]any{"inference_id": "m/1"}, "/_inference/m%2F1"},
+		{"inference.post", map[string]any{"inference_id": "m/1"}, "/_inference/m%2F1"},
+		{"inference.stream", map[string]any{"inference_id": "m/1"}, "/_inference/m%2F1/_stream"},
+		{"inference.chunking", map[string]any{"inference_id": "m/1"}, "/_inference/chunking/m%2F1"},
+		{"search", map[string]any{"index": "<logs-{now/d}>"}, "/%3Clogs-%7Bnow%2Fd%7D%3E/_search"},
+		{"indices.create", map[string]any{"index": "<logs-{now/d}>"}, "/%3Clogs-%7Bnow%2Fd%7D%3E"},
+	}
+	for _, tc := range idCases {
+		spec, err := ctx.buildActionRequest(tc.action, tc.params)
+		if err != nil {
+			t.Fatalf("%s: unexpected buildActionRequest error: %v", tc.action, err)
+		}
+		if spec.path != tc.wantPath {
+			t.Fatalf("%s: got path %q, want %q", tc.action, spec.path, tc.wantPath)
+		}
+	}
+
+	var gotWireURIs []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotWireURIs = append(gotWireURIs, r.RequestURI)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"acknowledged":true}`))
+	}))
+	defer srv.Close()
+
+	liveCtx := newRunnerContext(srv.Client(), srv.URL)
+	for _, call := range []struct {
+		action string
+		params map[string]any
+	}{
+		{"get_script", map[string]any{"id": "a%2Fb"}},
+		{"get_script", map[string]any{"id": "a/b"}},
+		{"search", map[string]any{"index": "<logs-{now/d}>"}},
+	} {
+		spec, err := liveCtx.buildActionRequest(call.action, call.params)
+		if err != nil {
+			t.Fatalf("live buildActionRequest %s: %v", call.action, err)
+		}
+		if _, _, err := liveCtx.rawHTTP(spec.method, spec.path, spec.query, spec.body, nil); err != nil {
+			t.Fatalf("live rawHTTP %s: %v", call.action, err)
+		}
+	}
+	wantWireURIs := []string{
+		"/_scripts/a%252Fb",
+		"/_scripts/a%2Fb",
+		"/%3Clogs-%7Bnow%2Fd%7D%3E/_search",
+	}
+	if strings.Join(gotWireURIs, "|") != strings.Join(wantWireURIs, "|") {
+		t.Fatalf("wire URIs mismatch: got %v, want %v", gotWireURIs, wantWireURIs)
+	}
+}
+
+func TestRound58_F0_ActionBuildersAndFixes(t *testing.T) {
+	ctx := newRunnerContext(http.DefaultClient, "http://localhost:9200")
+
+	// 1. mpercolate & monitoring.bulk NDJSON builders
+	mpRoot, err := ctx.buildActionRequest("mpercolate", map[string]any{
+		"body": []any{map[string]any{"percolate": map[string]any{"index": "idx1"}}, map[string]any{"doc": map[string]any{"msg": "hi"}}},
+	})
+	if err != nil || mpRoot.method != http.MethodPost || mpRoot.path != "/_mpercolate" {
+		t.Fatalf("mpercolate root mismatch: %+v, err=%v", mpRoot, err)
+	}
+	if strings.Count(string(mpRoot.body), "\n") != 2 {
+		t.Fatalf("mpercolate expected 2 NDJSON lines, got %q", string(mpRoot.body))
+	}
+
+	mpIdx, err := ctx.buildActionRequest("mpercolate", map[string]any{
+		"index": "<perc-{now/d}>",
+		"body":  "{}\n{\"doc\":{}}\n",
+	})
+	if err != nil || mpIdx.method != http.MethodPost || mpIdx.path != "/%3Cperc-%7Bnow%2Fd%7D%3E/_mpercolate" {
+		t.Fatalf("mpercolate with index mismatch: %+v, err=%v", mpIdx, err)
+	}
+
+	monRoot, err := ctx.buildActionRequest("monitoring.bulk", map[string]any{
+		"body": []any{map[string]any{"index": map[string]any{"_type": "cluster_stats"}}, map[string]any{"ok": true}},
+	})
+	if err != nil || monRoot.method != http.MethodPost || monRoot.path != "/_monitoring/bulk" || strings.Count(string(monRoot.body), "\n") != 2 {
+		t.Fatalf("monitoring.bulk root mismatch: %+v, err=%v", monRoot, err)
+	}
+
+	monTyped, err := ctx.buildActionRequest("monitoring.bulk", map[string]any{
+		"type": "beats/1",
+		"body": "{}",
+	})
+	if err != nil || monTyped.method != http.MethodPost || monTyped.path != "/_monitoring/beats%2F1/bulk" || !strings.HasSuffix(string(monTyped.body), "\n") {
+		t.Fatalf("monitoring.bulk typed mismatch: %+v, err=%v", monTyped, err)
+	}
+
+	// 2. license.put, license.post, inference.chunking, and canonical security.*_user_profile* actions
+	newActionCases := []struct {
+		name       string
+		action     string
+		params     map[string]any
+		wantMethod string
+		wantPath   string
+	}{
+		{"license.put", "license.put", map[string]any{"acknowledge": true}, http.MethodPut, "/_license"},
+		{"license.post", "license.post", map[string]any{}, http.MethodPost, "/_license"},
+		{"inference.chunking", "inference.chunking", map[string]any{"inference_id": "chunker-1"}, http.MethodPost, "/_inference/chunking/chunker-1"},
+		{"security.activate_user_profile", "security.activate_user_profile", map[string]any{}, http.MethodPost, "/_security/profile/_activate"},
+		{"security.get_user_profile", "security.get_user_profile", map[string]any{"uid": "u1"}, http.MethodGet, "/_security/profile/u1"},
+		{"security.update_user_profile_data", "security.update_user_profile_data", map[string]any{"uid": "u1"}, http.MethodPost, "/_security/profile/u1/_data"},
+		{"security.enable_user_profile", "security.enable_user_profile", map[string]any{"uid": "u1"}, http.MethodPut, "/_security/profile/u1/_enable"},
+		{"security.disable_user_profile", "security.disable_user_profile", map[string]any{"uid": "u1"}, http.MethodPut, "/_security/profile/u1/_disable"},
+		{"security.suggest_user_profiles", "security.suggest_user_profiles", map[string]any{}, http.MethodPost, "/_security/profile_check"},
+		{"security.has_privileges_user_profile GET", "security.has_privileges_user_profile", map[string]any{"uid": "u1"}, http.MethodGet, "/_security/profile/u1/_has_privileges"},
+		{"security.has_privileges_user_profile POST", "security.has_privileges_user_profile", map[string]any{"uid": "u1", "body": map[string]any{"cluster": []any{"monitor"}}}, http.MethodPost, "/_security/profile/u1/_has_privileges"},
+	}
+	for _, tc := range newActionCases {
+		wantPath := tc.wantPath
+		if tc.action == "security.suggest_user_profiles" {
+			wantPath = "/_security/_suggest_profiles"
+		}
+		spec, bErr := ctx.buildActionRequest(tc.action, tc.params)
+		if bErr != nil {
+			t.Fatalf("%s: unexpected error: %v", tc.name, bErr)
+		}
+		if spec.method != tc.wantMethod || spec.path != wantPath {
+			t.Fatalf("%s: got %s %s, want %s %s", tc.name, spec.method, spec.path, tc.wantMethod, wantPath)
+		}
+	}
+	for _, reqUIDAction := range []string{
+		"security.get_user_profile",
+		"security.update_user_profile_data",
+		"security.enable_user_profile",
+		"security.disable_user_profile",
+		"security.has_privileges_user_profile",
+		"inference.chunking",
+	} {
+		if _, bErr := ctx.buildActionRequest(reqUIDAction, map[string]any{}); bErr == nil {
+			t.Fatalf("expected error for %s with missing required ID", reqUIDAction)
+		}
+	}
+
+	// 3. 5 existing action builder fixes
+	// 3a. clear_scroll: _all and slice scroll_id
+	csAll, err := ctx.buildActionRequest("clear_scroll", map[string]any{"scroll_id": "_all"})
+	if err != nil || csAll.method != http.MethodDelete || csAll.path != "/_search/scroll/_all" || len(csAll.body) != 0 {
+		t.Fatalf("clear_scroll _all mismatch: %+v, body=%q, err=%v", csAll, string(csAll.body), err)
+	}
+	csSliceAny, err := ctx.buildActionRequest("clear_scroll", map[string]any{"scroll_id": []any{"sid1", "sid2"}})
+	if err != nil || csSliceAny.method != http.MethodDelete || csSliceAny.path != "/_search/scroll" {
+		t.Fatalf("clear_scroll []any mismatch: %+v, err=%v", csSliceAny, err)
+	}
+	var csParsed map[string]any
+	if uErr := json.Unmarshal(csSliceAny.body, &csParsed); uErr != nil {
+		t.Fatalf("clear_scroll body unmarshal failed: %v", uErr)
+	}
+	arr, ok := csParsed["scroll_id"].([]any)
+	if !ok || len(arr) != 2 || arr[0] != "sid1" || arr[1] != "sid2" {
+		t.Fatalf("clear_scroll expected JSON array [sid1, sid2], got %T (%v)", csParsed["scroll_id"], csParsed["scroll_id"])
+	}
+	csSliceStr, err := ctx.buildActionRequest("clear_scroll", map[string]any{"scroll_id": []string{"sA", "sB"}})
+	if err != nil || string(csSliceStr.body) != `{"scroll_id":["sA","sB"]}` {
+		t.Fatalf("clear_scroll []string mismatch: body=%s, err=%v", string(csSliceStr.body), err)
+	}
+
+	// 3b. nodes.stats index_metric
+	ns1, err := ctx.buildActionRequest("nodes.stats", map[string]any{"metric": "indices", "index_metric": "docs,store"})
+	if err != nil || ns1.path != "/_nodes/stats/indices/docs,store" {
+		t.Fatalf("nodes.stats metric+index_metric mismatch: %+v, err=%v", ns1, err)
+	}
+	ns2, err := ctx.buildActionRequest("nodes.stats", map[string]any{"node_id": "n1", "metric": "indices", "index_metric": "fielddata"})
+	if err != nil || ns2.path != "/_nodes/n1/stats/indices/fielddata" {
+		t.Fatalf("nodes.stats node_id+metric+index_metric mismatch: %+v, err=%v", ns2, err)
+	}
+	ns3, err := ctx.buildActionRequest("nodes.stats", map[string]any{"index_metric": "docs"})
+	if err != nil || ns3.path != "/_nodes/stats/_all/docs" {
+		t.Fatalf("nodes.stats index_metric only mismatch: %+v, err=%v", ns3, err)
+	}
+
+	// 3c. search_mvt GET vs POST
+	mvtGet, err := ctx.buildActionRequest("search_mvt", map[string]any{"index": "geo", "field": "loc/1", "zoom": 4, "x": 2, "y": 3})
+	if err != nil || mvtGet.method != http.MethodGet || mvtGet.path != "/geo/_mvt/loc%2F1/4/2/3" {
+		t.Fatalf("search_mvt GET mismatch: %+v, err=%v", mvtGet, err)
+	}
+	mvtPost, err := ctx.buildActionRequest("search_mvt", map[string]any{
+		"index": "geo", "field": "loc", "zoom": 4, "x": 2, "y": 3,
+		"body": map[string]any{"query": map[string]any{"match_all": map[string]any{}}},
+	})
+	if err != nil || mvtPost.method != http.MethodPost || mvtPost.path != "/geo/_mvt/loc/4/2/3" {
+		t.Fatalf("search_mvt POST mismatch: %+v, err=%v", mvtPost, err)
+	}
+
+	// 3d. ml.preview_datafeed optional datafeed_id + GET/POST
+	dfNoID, err := ctx.buildActionRequest("ml.preview_datafeed", map[string]any{"body": map[string]any{"datafeed_config": map[string]any{}}})
+	if err != nil || dfNoID.method != http.MethodPost || dfNoID.path != "/_ml/datafeeds/_preview" {
+		t.Fatalf("ml.preview_datafeed without id mismatch: %+v, err=%v", dfNoID, err)
+	}
+	dfNoIDNoBody, err := ctx.buildActionRequest("ml.preview_datafeed", map[string]any{})
+	if err != nil || dfNoIDNoBody.method != http.MethodPost || dfNoIDNoBody.path != "/_ml/datafeeds/_preview" {
+		t.Fatalf("ml.preview_datafeed empty mismatch: %+v, err=%v", dfNoIDNoBody, err)
+	}
+	dfGet, err := ctx.buildActionRequest("ml.preview_datafeed", map[string]any{"datafeed_id": "df/1"})
+	if err != nil || dfGet.method != http.MethodGet || dfGet.path != "/_ml/datafeeds/df%2F1/_preview" {
+		t.Fatalf("ml.preview_datafeed GET mismatch: %+v, err=%v", dfGet, err)
+	}
+	dfPost, err := ctx.buildActionRequest("ml.preview_datafeed", map[string]any{"datafeed_id": "df1", "body": map[string]any{"start": "now-1h"}})
+	if err != nil || dfPost.method != http.MethodPost || dfPost.path != "/_ml/datafeeds/df1/_preview" {
+		t.Fatalf("ml.preview_datafeed POST mismatch: %+v, err=%v", dfPost, err)
+	}
+
+	// 3e. security.clear_cached_realms requires realms
+	if _, err := ctx.buildActionRequest("security.clear_cached_realms", map[string]any{}); err == nil {
+		t.Fatalf("expected error for security.clear_cached_realms without realms")
+	}
+	if _, err := ctx.buildActionRequest("security.clear_cached_realms", map[string]any{"usernames": "u1"}); err == nil {
+		t.Fatalf("expected error for security.clear_cached_realms with only usernames")
+	}
+	ccrSpec, err := ctx.buildActionRequest("security.clear_cached_realms", map[string]any{"realms": "native/1,ldap1", "usernames": "u1"})
+	if err != nil || ccrSpec.method != http.MethodPost || ccrSpec.path != "/_security/realm/native%2F1,ldap1/_clear_cache" || ccrSpec.query.Get("usernames") != "u1" {
+		t.Fatalf("security.clear_cached_realms valid mismatch: %+v, err=%v", ccrSpec, err)
+	}
+}
+
+func TestRound58_F0_AsyncAndCursorTrackingCleanup(t *testing.T) {
+	type recordedReq struct {
+		method string
+		uri    string
+		body   string
+	}
+	var mu sync.Mutex
+	var reqs []recordedReq
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		reqs = append(reqs, recordedReq{method: r.Method, uri: r.RequestURI, body: string(b)})
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/_async_search":
+			if strings.Contains(string(b), "keep") {
+				_, _ = w.Write([]byte(`{"id":"as/keep","is_running":true}`))
+			} else {
+				_, _ = w.Write([]byte(`{"id":"as/del","is_running":true}`))
+			}
+		case r.Method == http.MethodPost && r.URL.Path == "/_query/async":
+			if strings.Contains(string(b), "keep") {
+				_, _ = w.Write([]byte(`{"id":"esql/keep","is_running":true}`))
+			} else {
+				_, _ = w.Write([]byte(`{"id":"esql/del","is_running":true}`))
+			}
+		case r.Method == http.MethodPost && r.URL.Path == "/_sql":
+			if strings.Contains(string(b), "keep") {
+				_, _ = w.Write([]byte(`{"cursor":"cur_keep","rows":[]}`))
+			} else {
+				_, _ = w.Write([]byte(`{"cursor":"cur_del","rows":[]}`))
+			}
+		default:
+			_, _ = w.Write([]byte(`{"acknowledged":true}`))
+		}
+	}))
+	defer srv.Close()
+
+	specYAML := `---
+"Async and cursor cleanup test":
+  - do:
+      async_search.submit:
+        body: { query: { match: { f: "keep" } } }
+  - do:
+      async_search.submit:
+        body: { query: { match: { f: "del" } } }
+  - do:
+      async_search.delete:
+        id: "as/del"
+  - do:
+      esql.async_query:
+        body: { query: "FROM keep" }
+  - do:
+      esql.async_query:
+        body: { query: "FROM del" }
+  - do:
+      esql.async_query_delete:
+        id: "esql/del"
+  - do:
+      sql.query:
+        body: { query: "SELECT keep" }
+  - do:
+      sql.query:
+        body: { query: "SELECT del" }
+  - do:
+      sql.close:
+        cursor: "cur_del"
+`
+	doc, err := ParseSpecFile(specYAML)
+	if err != nil {
+		t.Fatalf("ParseSpecFile failed: %v", err)
+	}
+	var rep SuiteReport
+	runSpecDocument(t, srv.Client(), srv.URL, "cleanup.yml", doc, &rep)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	var cleanupASKeep, cleanupASDel, cleanupESQLKeep, cleanupESQLDel, cleanupCurKeep, cleanupCurDel int
+	for _, r := range reqs {
+		switch {
+		case r.method == http.MethodDelete && r.uri == "/_async_search/as%2Fkeep":
+			cleanupASKeep++
+		case r.method == http.MethodDelete && r.uri == "/_async_search/as%2Fdel":
+			cleanupASDel++
+		case r.method == http.MethodDelete && r.uri == "/_query/async/esql%2Fkeep":
+			cleanupESQLKeep++
+		case r.method == http.MethodDelete && r.uri == "/_query/async/esql%2Fdel":
+			cleanupESQLDel++
+		case r.method == http.MethodPost && r.uri == "/_sql/close" && strings.Contains(r.body, `"cur_keep"`):
+			cleanupCurKeep++
+		case r.method == http.MethodPost && r.uri == "/_sql/close" && strings.Contains(r.body, `"cur_del"`):
+			cleanupCurDel++
+		}
+	}
+	if cleanupASKeep != 1 || cleanupASDel != 1 {
+		t.Fatalf("async_search cleanup counts: keep=%d (want 1), del=%d (want 1 explicit only)", cleanupASKeep, cleanupASDel)
+	}
+	if cleanupESQLKeep != 1 || cleanupESQLDel != 1 {
+		t.Fatalf("esql.async_query cleanup counts: keep=%d (want 1), del=%d (want 1 explicit only)", cleanupESQLKeep, cleanupESQLDel)
+	}
+	if cleanupCurKeep != 1 || cleanupCurDel != 1 {
+		t.Fatalf("sql cursor cleanup counts: keep=%d (want 1), del=%d (want 1 explicit only)", cleanupCurKeep, cleanupCurDel)
+	}
+}
+
+func TestRound58_F1_FileLevelSkipAndYAMLParser(t *testing.T) {
+	// 1. File-level skip: standalone and alongside setup/teardown (proxyTargetVersion is 7.10.2)
+	skippedFileYAML := `---
+skip:
+  version: "7.0.0 - 7.99.99"
+  reason: "skipped on 7.x target"
+setup:
+  - do:
+      indices.create:
+        index: should_never_run
+---
+"Test that must be skipped":
+  - do:
+      ping: {}
+`
+	sf, err := ParseSpecFile(skippedFileYAML)
+	if err != nil {
+		t.Fatalf("ParseSpecFile with file-level skip failed: %v", err)
+	}
+	if sf.Skip == nil || sf.Skip.Version != "7.0.0 - 7.99.99" || sf.Skip.Reason != "skipped on 7.x target" {
+		t.Fatalf("unexpected sf.Skip: %+v", sf.Skip)
+	}
+	if len(sf.Setup) != 1 || len(sf.Sections) != 1 {
+		t.Fatalf("expected 1 setup step and 1 test section, got setup=%d sections=%d", len(sf.Setup), len(sf.Sections))
+	}
+
+	var hitCount int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"acknowledged":true}`))
+	}))
+	defer srv.Close()
+
+	suiteFS := fstest.MapFS{
+		"specs/10_skipped_ver.yml": &fstest.MapFile{Data: []byte(skippedFileYAML)},
+		"specs/20_skipped_feat.yml": &fstest.MapFile{Data: []byte(`---
+skip:
+  features: [nonexistent_feature_xyz]
+---
+"Skipped feature test":
+  - do:
+      ping: {}
+`)},
+		"specs/30_active.yml": &fstest.MapFile{Data: []byte(`---
+skip:
+  version: "6.0.0 - 6.8.99"
+  features: [headers]
+---
+"Active test":
+  - do:
+      info: {}
+  - is_true: acknowledged
+`)},
+	}
+	RunSuiteFS(t, suiteFS, srv.URL)
+	if hitCount != 1 {
+		t.Fatalf("expected only active spec to hit server once, got hitCount=%d", hitCount)
+	}
+	RunSpecFile(t, "skipped_single.yml", skippedFileYAML, srv.URL)
+	if hitCount != 1 {
+		t.Fatalf("expected RunSpecFile on skipped file not to hit server, got hitCount=%d", hitCount)
+	}
+
+	// Invalid file-level skip must return parse error
+	if _, err := ParseSpecFile("---\nskip: 123\n---\n\"t\":\n  - do:\n      ping: {}\n"); err == nil {
+		t.Fatalf("expected error for non-mapping file-level skip")
+	}
+	if _, err := parseSkipSpec((*OrderedMap)(nil)); err == nil {
+		t.Fatalf("expected error for nil *OrderedMap in parseSkipSpec")
+	}
+	if sp, err := parseSkipSpec(OrderedMap{Fields: []YAMLField{{Key: "version", Value: "all"}, {Key: "reason", Value: "r"}, {Key: "features", Value: "a, b"}}}); err != nil || len(sp.Features) != 2 {
+		t.Fatalf("parseSkipSpec OrderedMap value failed: %+v, err=%v", sp, err)
+	}
+	if sp, err := parseSkipSpec(map[string]any{"version": "all", "features": []any{"f1,f2"}}); err != nil || len(sp.Features) != 2 {
+		t.Fatalf("parseSkipSpec map[string]any failed: %+v, err=%v", sp, err)
+	}
+	if isBareInfOrNaN("") || !isBareInfOrNaN("inf") || !isBareInfOrNaN("-infinity") {
+		t.Fatalf("isBareInfOrNaN check failed")
+	}
+
+	// 2. parseScalar: underscores, inf/nan, and 64-bit integers above 2^53
+	scalarYAML := `---
+u_date: 2026_01
+u_pair: 1_2
+inf_low: inf
+inf_plus: +inf
+inf_minus: -inf
+infinity_full: Infinity
+infinity_neg: -INFINITY
+nan_bare: nan
+nan_plus: +NaN
+nan_minus: -nan
+int_exact: 9007199254740993
+int_neg_exact: -9007199254740993
+uint_exact: 18446744073709551615
+uint_mid: 9223372036854775808
+`
+	docs, err := ParseYAMLDocuments(scalarYAML)
+	if err != nil || len(docs) != 1 {
+		t.Fatalf("ParseYAMLDocuments scalarYAML failed: %v", err)
+	}
+	m, ok := ToNative(docs[0]).(map[string]any)
+	if !ok {
+		t.Fatalf("expected map, got %T", docs[0])
+	}
+	for _, k := range []string{"u_date", "u_pair", "inf_low", "inf_plus", "inf_minus", "infinity_full", "infinity_neg", "nan_bare", "nan_plus", "nan_minus"} {
+		if _, isStr := m[k].(string); !isStr {
+			t.Fatalf("expected key %q to remain string, got %T (%v)", k, m[k], m[k])
+		}
+	}
+	if m["int_exact"] != int64(9007199254740993) {
+		t.Fatalf("int_exact lost precision: got %T (%v)", m["int_exact"], m["int_exact"])
+	}
+	if m["int_neg_exact"] != int64(-9007199254740993) {
+		t.Fatalf("int_neg_exact lost precision: got %T (%v)", m["int_neg_exact"], m["int_neg_exact"])
+	}
+	if m["uint_exact"] != uint64(18446744073709551615) {
+		t.Fatalf("uint_exact lost precision: got %T (%v)", m["uint_exact"], m["uint_exact"])
+	}
+	if m["uint_mid"] != uint64(9223372036854775808) {
+		t.Fatalf("uint_mid lost precision: got %T (%v)", m["uint_mid"], m["uint_mid"])
+	}
+
+	// 3. YAML 1.2 block scalar explicit indentation indicators
+	blockYAML := strings.Join([]string{
+		"---",
+		"lit_2: |2",
+		"    leading2",
+		"  base",
+		"lit_2_strip: |2-",
+		"    leading2",
+		"  base",
+		"lit_strip_2: |-2",
+		"    leading2",
+		"  base",
+		"lit_2_keep: |2+",
+		"  keepme",
+		"",
+		"lit_keep_2: |+2",
+		"  keepme",
+		"",
+		"fold_2: >2",
+		"  hello",
+		"  world",
+		"fold_2_strip: >2-",
+		"  hello",
+		"  world",
+		"fold_strip_2: >-2",
+		"  hello",
+		"  world",
+		"fold_2_keep: >2+",
+		"  hello",
+		"",
+		"fold_keep_2: >+2",
+		"  hello",
+		"",
+		"end_marker: done",
+	}, "\n") + "\n"
+	bDocs, err := ParseYAMLDocuments(blockYAML)
+	if err != nil || len(bDocs) != 1 {
+		t.Fatalf("ParseYAMLDocuments blockYAML failed: %v", err)
+	}
+	bm := ToNative(bDocs[0]).(map[string]any)
+	if bm["lit_2"] != "  leading2\nbase\n" {
+		t.Fatalf("lit_2 mismatch: %q", bm["lit_2"])
+	}
+	if bm["lit_2_strip"] != "  leading2\nbase" || bm["lit_strip_2"] != "  leading2\nbase" {
+		t.Fatalf("lit strip mismatch: %q vs %q", bm["lit_2_strip"], bm["lit_strip_2"])
+	}
+	if bm["lit_2_keep"] != "keepme\n\n" || bm["lit_keep_2"] != "keepme\n\n" {
+		t.Fatalf("lit keep mismatch: %q vs %q", bm["lit_2_keep"], bm["lit_keep_2"])
+	}
+	if bm["fold_2"] != "hello world\n" {
+		t.Fatalf("fold_2 mismatch: %q", bm["fold_2"])
+	}
+	if bm["fold_2_strip"] != "hello world" || bm["fold_strip_2"] != "hello world" {
+		t.Fatalf("fold strip mismatch: %q vs %q", bm["fold_2_strip"], bm["fold_strip_2"])
+	}
+	if bm["fold_2_keep"] != "hello\n\n" || bm["fold_keep_2"] != "hello\n\n" {
+		t.Fatalf("fold keep mismatch: %q vs %q", bm["fold_2_keep"], bm["fold_keep_2"])
+	}
+}
+
+func TestRound58_F1_ExactNumbersNonCoercingStringsAndTruthiness(t *testing.T) {
+	// 1. normalizeJSONNumbers preserves uint64 > MaxInt64 and int64 > 2^53
+	parsed := parseResponsePayload(`{"u":18446744073709551615,"i":9007199254740993,"n":-9007199254740993,"s":"001"}`)
+	pm, ok := parsed.(map[string]any)
+	if !ok {
+		t.Fatalf("expected parsed map, got %T", parsed)
+	}
+	if pm["u"] != uint64(18446744073709551615) {
+		t.Fatalf("expected uint64 max, got %T (%v)", pm["u"], pm["u"])
+	}
+	if pm["i"] != int64(9007199254740993) {
+		t.Fatalf("expected exact int64, got %T (%v)", pm["i"], pm["i"])
+	}
+	if pm["n"] != int64(-9007199254740993) {
+		t.Fatalf("expected exact negative int64, got %T (%v)", pm["n"], pm["n"])
+	}
+
+	// 2. valuesEqual: non-coercing strings and exact 64-bit integer comparisons
+	if valuesEqual("001", "1") {
+		t.Fatalf(`valuesEqual("001", "1") must be false`)
+	}
+	if valuesEqual("1e2", "100") {
+		t.Fatalf(`valuesEqual("1e2", "100") must be false`)
+	}
+	if valuesEqual("2026_01", "202601") {
+		t.Fatalf(`valuesEqual("2026_01", "202601") must be false`)
+	}
+	if valuesEqual("1", int64(1)) || valuesEqual(int64(1), "1") {
+		t.Fatalf("valuesEqual must not coerce string and int64")
+	}
+	if !valuesEqual("001", "/^0+1$/") {
+		t.Fatalf("valuesEqual regex pattern should still match")
+	}
+	if valuesEqual(int64(9007199254740992), int64(9007199254740993)) {
+		t.Fatalf("valuesEqual must distinguish 2^53 and 2^53+1")
+	}
+	if !valuesEqual(uint64(18446744073709551615), uint64(18446744073709551615)) {
+		t.Fatalf("valuesEqual uint64 max must equal itself")
+	}
+	if valuesEqual(uint64(18446744073709551615), uint64(18446744073709551614)) {
+		t.Fatalf("valuesEqual must distinguish uint64 max and max-1")
+	}
+	if valuesEqual(int64(-1), uint64(math.MaxUint64)) {
+		t.Fatalf("valuesEqual must sign-check int64(-1) vs uint64(MaxUint64)")
+	}
+	if !valuesEqual(int64(math.MinInt64), int64(math.MinInt64)) || valuesEqual(int64(math.MinInt64), uint64(1)<<63) {
+		t.Fatalf("valuesEqual MinInt64 sign check failed")
+	}
+	if !valuesEqual(int64(42), uint64(42)) || !valuesEqual(int64(42), float64(42.0)) {
+		t.Fatalf("valuesEqual numeric equality failed")
+	}
+
+	// 3. compareAsNumbers & execCompare above 2^53
+	if cmp, ok := compareAsNumbers(int64(9007199254740993), int64(9007199254740992)); !ok || cmp != 1 {
+		t.Fatalf("compareAsNumbers 2^53+1 vs 2^53: got (%d, %v)", cmp, ok)
+	}
+	if cmp, ok := compareAsNumbers(uint64(18446744073709551614), uint64(18446744073709551615)); !ok || cmp != -1 {
+		t.Fatalf("compareAsNumbers uint64 max-1 vs max: got (%d, %v)", cmp, ok)
+	}
+	if cmp, ok := compareAsNumbers(int64(-1), uint64(18446744073709551615)); !ok || cmp != -1 {
+		t.Fatalf("compareAsNumbers -1 vs MaxUint64: got (%d, %v)", cmp, ok)
+	}
+	if cmp, ok := compareAsNumbers("9007199254740993", "9007199254740992"); !ok || cmp != 1 {
+		t.Fatalf("compareAsNumbers numeric strings >2^53: got (%d, %v)", cmp, ok)
+	}
+	if cmp, ok := compareAsNumbers(int64(9007199254740993), float64(9007199254740992.0)); !ok || cmp != 1 {
+		t.Fatalf("compareAsNumbers mixed int64(2^53+1) vs float64(2^53): got (%d, %v)", cmp, ok)
+	}
+	if _, ok := compareAsNumbers("2026_10", "2026_2"); ok {
+		t.Fatalf("compareAsNumbers must not treat underscore strings as numbers")
+	}
+
+	ctx := newRunnerContext(http.DefaultClient, "http://localhost:9200")
+	ctx.lastResponse = map[string]any{
+		"big_i":     int64(9007199254740993),
+		"big_u":     uint64(18446744073709551615),
+		"str_pad":   "001",
+		"idx_name":  "2026_10",
+		"empty_arr": []any{},
+		"full_arr":  []any{"x"},
+		"empty_map": map[string]any{},
+		"full_map":  map[string]any{"a": int64(1)},
+	}
+	if err := ctx.execMatch(map[string]any{"big_i": int64(9007199254740992)}); err == nil {
+		t.Fatalf("execMatch must fail when 2^53+1 != 2^53")
+	}
+	if err := ctx.execMatch(map[string]any{"big_u": uint64(18446744073709551615)}); err != nil {
+		t.Fatalf("execMatch uint64 max failed: %v", err)
+	}
+	if err := ctx.execMatch(map[string]any{"str_pad": "1"}); err == nil {
+		t.Fatalf(`execMatch must fail for "001" vs "1"`)
+	}
+	if err := ctx.execCompare("gt", map[string]any{"big_i": int64(9007199254740992)}); err != nil {
+		t.Fatalf("execCompare gt 2^53+1 > 2^53 failed: %v", err)
+	}
+	if err := ctx.execCompare("gt", map[string]any{"big_u": uint64(18446744073709551614)}); err != nil {
+		t.Fatalf("execCompare gt uint64 max > max-1 failed: %v", err)
+	}
+	if err := ctx.execCompare("lt", map[string]any{"idx_name": "2026_2"}); err != nil {
+		t.Fatalf("execCompare lt on underscore strings should compare lexicographically: %v", err)
+	}
+
+	// 4. Empty collection is_false / is_true
+	emptyOM := NewOrderedMap()
+	nonEmptyOM := NewOrderedMap()
+	nonEmptyOM.Set("k", "v")
+	if isTruthy([]any{}) || isTruthy(map[string]any{}) || isTruthy(emptyOM) || isTruthy(*emptyOM) || isTruthy(uint64(0)) {
+		t.Fatalf("expected empty collections and uint64(0) to be falsy")
+	}
+	if !isTruthy([]any{1}) || !isTruthy(map[string]any{"k": 1}) || !isTruthy(nonEmptyOM) || !isTruthy(*nonEmptyOM) || !isTruthy(uint64(1)) {
+		t.Fatalf("expected non-empty collections and uint64(1) to be truthy")
+	}
+	for _, fField := range []string{"empty_arr", "empty_map", "missing_field"} {
+		if err := ctx.execIsFalse(fField); err != nil {
+			t.Fatalf("execIsFalse(%q) failed: %v", fField, err)
+		}
+		if err := ctx.execIsTrue(fField); err == nil {
+			t.Fatalf("execIsTrue(%q) should have failed", fField)
+		}
+	}
+	for _, tField := range []string{"full_arr", "full_map"} {
+		if err := ctx.execIsTrue(tField); err != nil {
+			t.Fatalf("execIsTrue(%q) failed: %v", tField, err)
+		}
+		if err := ctx.execIsFalse(tField); err == nil {
+			t.Fatalf("execIsFalse(%q) should have failed", tField)
+		}
+	}
+
+	// 5. Additional numeric/type branch coverage for exact integers, floats, and truthiness
+	_ = normalizeJSONNumbers([]any{json.Number("3.14"), json.Number("bad_num")})
+	for _, tc := range []struct {
+		a, b any
+		want int
+		ok   bool
+	}{
+		{int64(0), uint64(0), 0, true},
+		{int64(-10), int64(-5), -1, true},
+		{int64(-5), int64(-10), 1, true},
+		{int64(5), int64(-5), 1, true},
+		{uint(7), json.Number("7"), 0, true},
+		{float64(9007199254740992.0), int64(9007199254740993), -1, true},
+		{int64(-9007199254740993), float64(-9007199254740992.0), -1, true},
+		{float64(1.5), float64(2.5), -1, true},
+		{float64(3.5), float64(2.5), 1, true},
+		{float64(2.5), float64(2.5), 0, true},
+		{int64(5), "not_num", 0, false},
+		{"not_num", int64(5), 0, false},
+		{math.NaN(), float64(1.0), 0, false},
+	} {
+		if got, ok := compareAsNumbers(tc.a, tc.b); ok != tc.ok || (ok && got != tc.want) {
+			t.Fatalf("compareAsNumbers(%v, %v) = (%d, %v), want (%d, %v)", tc.a, tc.b, got, ok, tc.want, tc.ok)
+		}
+	}
+	for _, v := range []any{int(1), int64(2), uint(3), uint64(4), float32(1.5), float64(2.5), json.Number("3.5")} {
+		if _, ok := toNumericFloat64(v); !ok {
+			t.Fatalf("toNumericFloat64(%T) expected ok", v)
+		}
+		if _, ok := toFloat64(v); !ok {
+			t.Fatalf("toFloat64(%T) expected ok", v)
+		}
+	}
+	if _, ok := toNumericFloat64(true); ok {
+		t.Fatalf("toNumericFloat64(bool) expected false")
+	}
+	if valuesEqual(math.NaN(), math.NaN()) || !valuesEqual(math.Inf(1), math.Inf(1)) || valuesEqual(float64(1.5), true) || valuesEqual(true, float64(1.5)) {
+		t.Fatalf("valuesEqual float/NaN/Inf/bool checks failed")
+	}
+	if !valuesEqual(true, true) || valuesEqual(true, false) {
+		t.Fatalf("valuesEqual bool checks failed")
+	}
+	for _, tv := range []any{int(5), int64(5), uint(5), uint64(5), float64(5.0), json.Number("5"), json.Number("5.0"), "5", "5.0"} {
+		if iv, ok := toInt(tv); !ok || iv != 5 {
+			t.Fatalf("toInt(%T:%v) = (%d, %v), want (5, true)", tv, tv, iv, ok)
+		}
+	}
+	for _, badInt := range []any{uint64(math.MaxUint64), json.Number("18446744073709551615"), math.NaN(), math.Inf(1), "2026_01", "inf", "abc", true} {
+		if _, ok := toInt(badInt); ok {
+			t.Fatalf("toInt(%T:%v) expected false", badInt, badInt)
+		}
+	}
+	if isTruthy(nil) || isTruthy(false) || !isTruthy(true) || isTruthy(0) || !isTruthy(1) || isTruthy(int64(0)) || !isTruthy(int64(1)) || isTruthy(uint(0)) || !isTruthy(uint(1)) || isTruthy(float64(0)) || !isTruthy(float64(1.5)) || isTruthy("false") || !isTruthy("yes") || !isTruthy(struct{}{}) {
+		t.Fatalf("isTruthy primitive branch check failed")
 	}
 }

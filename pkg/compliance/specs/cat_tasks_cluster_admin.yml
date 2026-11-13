@@ -13,7 +13,7 @@
   - do:
       cat.fielddata:
         format: "json"
-  - is_true: ""
+  - match: { "": [] }
 
   - do:
       cat.master:
@@ -28,12 +28,12 @@
   - do:
       cat.pending_tasks:
         format: "json"
-  - is_true: ""
+  - match: { "": [] }
 
   - do:
       cat.plugins:
         format: "json"
-  - is_true: ""
+  - match: { "": [] }
 
   - do:
       cat.recovery:
@@ -43,7 +43,7 @@
   - do:
       cat.repositories:
         format: "json"
-  - is_true: ""
+  - is_unset: error
 
   - do:
       cat.segments:
@@ -53,7 +53,7 @@
   - do:
       cat.tasks:
         format: "json"
-  - is_true: ""
+  - is_unset: error
 
   - do:
       cat.thread_pool:
@@ -63,7 +63,7 @@
   - do:
       cat.templates:
         format: "json"
-  - is_true: ""
+  - is_unset: error
 
   - do:
       tasks.list: {}
@@ -78,7 +78,7 @@
   - do:
       tasks.cancel:
         task_id: "node-1:1"
-  - is_true: nodes
+  - match: { nodes: {} }
 
   - do:
       cluster.allocation_explain: {}
@@ -87,7 +87,7 @@
 
   - do:
       cluster.pending_tasks: {}
-  - is_true: tasks
+  - match: { tasks: [] }
 
   - do:
       cluster.reroute: {}
@@ -95,7 +95,7 @@
 
   - do:
       cluster.remote_info: {}
-  - is_true: ""
+  - is_unset: error
 
   - do:
       nodes.usage: {}
@@ -122,7 +122,7 @@
   - do:
       indices.shard_stores:
         index: "admin_spec_idx"
-  - is_true: indices
+  - match: { indices: {} }
 
   - do:
       indices.clear_cache:

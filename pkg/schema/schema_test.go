@@ -942,12 +942,12 @@ func TestRound34FlatDottedKeysDateNanosEpochNanosAndAliasKeyword(t *testing.T) {
 		t.Fatalf("expected f__vec__emb == [0.25 0.75], got %v", row["f__vec__emb"])
 	}
 	nanosSlice, _ := row["f__ts_nanos"].([]any)
-	if len(nanosSlice) != 1 || nanosSlice[0] != "1700000000123" {
-		t.Fatalf("expected f__ts_nanos == ['1700000000123'], got %v", row["f__ts_nanos"])
+	if len(nanosSlice) != 1 || nanosSlice[0] != "1700000000123456789" {
+		t.Fatalf("expected f__ts_nanos == ['1700000000123456789'], got %v", row["f__ts_nanos"])
 	}
 	copySlice, _ := row["f__ts_copy"].([]any)
-	if len(copySlice) != 1 || copySlice[0] != "1700000000123" {
-		t.Fatalf("expected f__ts_copy == ['1700000000123'], got %v", row["f__ts_copy"])
+	if len(copySlice) != 1 || copySlice[0] != "1700000000123456789" {
+		t.Fatalf("expected f__ts_copy == ['1700000000123456789'], got %v", row["f__ts_copy"])
 	}
 }
 
@@ -1142,7 +1142,9 @@ func TestRound42ShredderNestedEnabledFalseMultiFieldIgnoreMalformedMappingCompat
 		t.Fatalf("ShredDocument failed: %v", err)
 	}
 	var row map[string]any
-	if err := json.Unmarshal(shredded, &row); err != nil {
+	dec := json.NewDecoder(strings.NewReader(string(shredded)))
+	dec.UseNumber()
+	if err := dec.Decode(&row); err != nil {
 		t.Fatalf("unmarshal shredded row failed: %v", err)
 	}
 	if row["f__raw_val"] != "hello" {
@@ -1151,8 +1153,8 @@ func TestRound42ShredderNestedEnabledFalseMultiFieldIgnoreMalformedMappingCompat
 	if row["f__raw_val__num"] != nil {
 		t.Fatalf("F2 expected f__raw_val__num == nil for malformed integer, got %v", row["f__raw_val__num"])
 	}
-	if row["f__ts_nano"] != float64(1700000000123) {
-		t.Fatalf("F8 expected f__ts_nano normalized to epoch millis 1700000000123, got %v", row["f__ts_nano"])
+	if num, ok := row["f__ts_nano"].(json.Number); !ok || num.String() != "1700000000123456789" {
+		t.Fatalf("F8 expected f__ts_nano preserved as exact epoch nanos 1700000000123456789, got %T %v", row["f__ts_nano"], row["f__ts_nano"])
 	}
 	docVariant, ok := row["_doc"].(map[string]any)
 	if !ok {
@@ -3144,4 +3146,235 @@ func TestRound57SchemaAndShredderValidation(t *testing.T) {
 	if _, exists := okVecRow["v__cos_lenient"]; exists && okVecRow["v__cos_lenient"] != nil {
 		t.Fatalf("F16 expected cos_lenient zero vector to be skipped when ignore_malformed=true, got %v", okVecRow["v__cos_lenient"])
 	}
+}
+
+func TestRound58SchemaAndShredder_F10ToF15(t *testing.T) {
+	// F10: date_range exclusive gt date-only & rounded date-math roundUp
+	var drSpec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{"properties":{"dr":{"type":"date_range"}}}`), &drSpec); err != nil {
+		t.Fatal(err)
+	}
+	drSchema := CompileIndexSchema("es_db", "r58_dr", &drSpec)
+	// Inverted {"gt": "2025-01-02", "lte": "2025-01-02"} -> gt rounds up to 2025-01-02T23:59:59.999 + 1ms = 2025-01-03T00:00:00.000 > lte (2025-01-02T23:59:59.999)
+	if _, err := ShredDocument(drSchema, "1", 1, false, []byte(`{"dr":{"gt":"2025-01-02","lte":"2025-01-02"}}`)); err == nil {
+		t.Fatalf("F10 expected inverted date_range {gt:2025-01-02, lte:2025-01-02} to fail")
+	}
+	drBytes, err := ShredDocument(drSchema, "2", 1, false, []byte(`{"dr":{"gt":"2025-01-02","lte":"2025-01-03"}}`))
+	if err != nil {
+		t.Fatalf("F10 expected valid date_range {gt:2025-01-02, lte:2025-01-03}, got %v", err)
+	}
+	var drRow map[string]any
+	if err := json.Unmarshal(drBytes, &drRow); err != nil {
+		t.Fatal(err)
+	}
+	docMap := drRow["_doc"].(map[string]any)["dr"].(map[string]any)
+	// 2025-01-03T00:00:00Z = 1735862400000
+	if gteF, _ := docMap["_gte"].(float64); int64(gteF) != 1735862400000 {
+		t.Fatalf("F10 expected gt:2025-01-02 to round up +1ms to 1735862400000, got %v", docMap["_gte"])
+	}
+
+	// F11: CanonicalIPToUpperHex16
+	h4, ok4 := CanonicalIPToUpperHex16("10.0.0.1")
+	hMapped, okM := CanonicalIPToUpperHex16("::ffff:10.0.0.1")
+	h6Lo, ok6Lo := CanonicalIPToUpperHex16("::1")
+	h6Hi, ok6Hi := CanonicalIPToUpperHex16("2001:db8::1")
+	if !ok4 || !okM || !ok6Lo || !ok6Hi {
+		t.Fatalf("F11 expected valid canonical IPs")
+	}
+	if h4 != "00000000000000000000FFFF0A000001" || h4 != hMapped {
+		t.Fatalf("F11 expected IPv4 and ::ffff:IPv4 canonical hex equality, got %s vs %s", h4, hMapped)
+	}
+	if h6Lo >= h4 || h4 >= h6Hi {
+		t.Fatalf("F11 expected ::1 (%s) < 10.0.0.1 (%s) < 2001:db8::1 (%s)", h6Lo, h4, h6Hi)
+	}
+	if _, okBad := CanonicalIPToUpperHex16("not-an-ip"); okBad {
+		t.Fatalf("F11 expected invalid IP to return false")
+	}
+
+	// F12: date_nanos exact epoch-nanosecond shredding + strict_date_optional_time_nanos + roundUp
+	var dnSpec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"ts_default": {"type": "date_nanos"},
+			"ts_strict": {"type": "date_nanos", "format": "strict_date_optional_time_nanos||epoch_nanos"},
+			"d_strict": {"type": "date", "format": "strict_date_optional_time_nanos"}
+		}
+	}`), &dnSpec); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateMappingSpec(&dnSpec); err != nil {
+		t.Fatalf("F12 ValidateMappingSpec failed: %v", err)
+	}
+	dnSchema := CompileIndexSchema("es_db", "r58_dn", &dnSpec)
+	dnBytes, err := ShredDocument(dnSchema, "dn1", 1, false, []byte(`{
+		"ts_default": "2025-01-02T03:04:05.123456789Z",
+		"ts_strict": "2025-01-02T03:04:05.987654321Z",
+		"d_strict": "2025-01-02T03:04:05.123456789Z"
+	}`))
+	if err != nil {
+		t.Fatalf("F12 ShredDocument failed: %v", err)
+	}
+	var dnRow map[string]any
+	dec := json.NewDecoder(strings.NewReader(string(dnBytes)))
+	dec.UseNumber()
+	if err := dec.Decode(&dnRow); err != nil {
+		t.Fatal(err)
+	}
+	wantNs1 := time.Date(2025, 1, 2, 3, 4, 5, 123456789, time.UTC).UnixNano()
+	tsCol := dnSchema.ResolveField("ts_default").ColumnName
+	gotNs1, err := dnRow[tsCol].(json.Number).Int64()
+	if err != nil || gotNs1 != wantNs1 {
+		t.Fatalf("F12 expected exact epoch nanos %d, got %v (err=%v)", wantNs1, dnRow[tsCol], err)
+	}
+	nowUTC := time.Date(2025, 5, 1, 0, 0, 0, 0, time.UTC)
+	loNs, okLo := ParseESDateBoundWithFormatToEpochNanos("2025-01-02", "strict_date_optional_time_nanos", nowUTC, false)
+	hiNs, okHi := ParseESDateBoundWithFormatToEpochNanos("2025-01-02", "strict_date_optional_time_nanos", nowUTC, true)
+	if !okLo || !okHi || hiNs-loNs != 24*int64(time.Hour)-1 {
+		t.Fatalf("F12 expected date-only roundUp to add 86399_999_999_999ns, got lo=%d hi=%d", loNs, hiNs)
+	}
+
+	// F13: histogram routing to StorageDynamicVariant, validation, ignore_malformed, _h subcolumn, untouched _source, _all_text exclusion
+	var histSpec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"lat": {"type": "histogram"},
+			"lat_lenient": {"type": "histogram", "ignore_malformed": true}
+		}
+	}`), &histSpec); err != nil {
+		t.Fatal(err)
+	}
+	histSchema := CompileIndexSchema("es_db", "r58_hist", &histSpec)
+	if b := histSchema.ResolveField("lat"); b.Kind != StorageDynamicVariant || b.ESType != "histogram" {
+		t.Fatalf("F13 expected histogram to route to StorageDynamicVariant, got %+v", b)
+	}
+	badHists := []string{
+		`{"lat": 42}`,
+		`{"lat": {"values": [1, 2]}}`,
+		`{"lat": {"values": [1, 2], "counts": [1]}}`,
+		`{"lat": {"values": [2, 1], "counts": [1, 1]}}`,
+		`{"lat": {"values": [1, 2], "counts": [1, -1]}}`,
+		`{"lat": {"values": [1, 2], "counts": [1, 1.5]}}`,
+		`{"lat": {"values": [1, 2], "counts": [true, 1]}}`,
+		`{"lat": {"values": ["bad"], "counts": [1]}}`,
+		`{"lat": {"values": [1], "counts": [1], "extra": 1}}`,
+	}
+	for _, bad := range badHists {
+		if _, err := ShredDocument(histSchema, "bh", 1, false, []byte(bad)); err == nil {
+			t.Fatalf("F13 expected malformed histogram %s to fail", bad)
+		}
+	}
+	origHistSrc := `{"lat":{"values":[10.5,20,30],"counts":[0,3,7]},"lat_lenient":{"values":[5,1],"counts":[1,1]}}`
+	hBytes, err := ShredDocument(histSchema, "h1", 1, false, []byte(origHistSrc))
+	if err != nil {
+		t.Fatalf("F13 valid histogram + lenient malformed failed: %v", err)
+	}
+	var hRow map[string]any
+	if err := json.Unmarshal(hBytes, &hRow); err != nil {
+		t.Fatal(err)
+	}
+	if hRow["_source"].(string) != origHistSrc {
+		t.Fatalf("F13 expected _source untouched, got %s", hRow["_source"])
+	}
+	hDocLat := hRow["_doc"].(map[string]any)["lat"].(map[string]any)
+	hPairs := hDocLat["_h"].([]any)
+	if len(hPairs) != 2 || hPairs[0] != "20,3" || hPairs[1] != "30,7" {
+		t.Fatalf("F13 expected _h=[20,3 30,7], got %+v", hPairs)
+	}
+	if allText, _ := hRow["_all_text"].(string); strings.Contains(allText, "20,3") {
+		t.Fatalf("F13 expected synthetic _h pairs excluded from _all_text, got %q", allText)
+	}
+
+	// F14: rank_feature DorisDouble, positive_score_impact validation/immutability/merge, strict > 0 float32 shredding
+	var badRFType esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{"properties":{"k":{"type":"keyword","positive_score_impact":false}}}`), &badRFType)
+	if err := ValidateMappingSpec(&badRFType); err == nil {
+		t.Fatalf("F14 expected positive_score_impact on keyword to fail")
+	}
+	var rfSpec1, rfSpecMut esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{"properties":{"pr":{"type":"rank_feature","positive_score_impact":false},"pr_lenient":{"type":"rank_feature","ignore_malformed":true,"coerce":false}}}`), &rfSpec1)
+	_ = json.Unmarshal([]byte(`{"properties":{"pr":{"type":"rank_feature","positive_score_impact":true}}}`), &rfSpecMut)
+	if err := ValidateMappingSpec(&rfSpec1); err != nil {
+		t.Fatalf("F14 expected valid rank_feature mapping, got %v", err)
+	}
+	if err := ValidateMappingUpdateCompatibility(&rfSpec1, &rfSpecMut); err == nil {
+		t.Fatalf("F14 expected mutating positive_score_impact to fail compatibility check")
+	}
+	rfSchema := CompileIndexSchema("es_db", "r58_rf", &rfSpec1)
+	rfBind := rfSchema.ResolveField("pr")
+	if rfBind.DorisType != DorisDouble || rfBind.EffectivePositiveScoreImpact() {
+		t.Fatalf("F14 expected DorisDouble & EffectivePositiveScoreImpact()=false, got %+v", rfBind)
+	}
+	for _, badRF := range []string{`{"pr":0}`, `{"pr":-1.5}`, `{"pr":true}`, `{"pr":"abc"}`, `{"pr":[1,2]}`, `{"pr_lenient":"2.5"}`} {
+		if strings.Contains(badRF, "pr_lenient") {
+			// coerce:false + ignore_malformed:true should succeed and ignore
+			b, err := ShredDocument(rfSchema, "rf_ok", 1, false, []byte(badRF))
+			if err != nil {
+				t.Fatalf("F14 expected ignore_malformed=true to skip non-coerced string, got %v", err)
+			}
+			var r map[string]any
+			_ = json.Unmarshal(b, &r)
+			if prLenCol := rfSchema.ResolveField("pr_lenient").ColumnName; r[prLenCol] != nil {
+				t.Fatalf("F14 expected pr_lenient nil, got %v", r[prLenCol])
+			}
+			continue
+		}
+		if _, err := ShredDocument(rfSchema, "rf_bad", 1, false, []byte(badRF)); err == nil {
+			t.Fatalf("F14 expected invalid rank_feature %s to fail", badRF)
+		}
+	}
+	if _, err := ShredDocument(rfSchema, "rf_over", 1, false, []byte(`{"pr":1e300}`)); err == nil {
+		t.Fatalf("F14 expected > MaxFloat32 rank_feature to fail")
+	}
+	if _, err := ShredDocument(rfSchema, "rf_good", 1, false, []byte(`{"pr":4.25}`)); err != nil {
+		t.Fatalf("F14 expected positive float rank_feature to succeed, got %v", err)
+	}
+
+	// F15: search_as_you_type.max_shingle_size (2..4) & flattened.depth_limit (>=1)
+	for _, badM := range []string{
+		`{"properties":{"s":{"type":"search_as_you_type","max_shingle_size":1}}}`,
+		`{"properties":{"s":{"type":"search_as_you_type","max_shingle_size":5}}}`,
+		`{"properties":{"s":{"type":"text","max_shingle_size":3}}}`,
+		`{"properties":{"f":{"type":"flattened","depth_limit":0}}}`,
+		`{"properties":{"f":{"type":"flattened","depth_limit":-1}}}`,
+		`{"properties":{"f":{"type":"keyword","depth_limit":5}}}`,
+	} {
+		var sp esast.MappingSpec
+		_ = json.Unmarshal([]byte(badM), &sp)
+		if err := ValidateMappingSpec(&sp); err == nil {
+			t.Fatalf("F15 expected invalid mapping %s to fail", badM)
+		}
+	}
+	var f15Spec, f15Mut1, f15Mut2 esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{
+		"properties": {
+			"s2": {"type": "search_as_you_type", "max_shingle_size": 2},
+			"s4": {"type": "search_as_you_type", "max_shingle_size": 4},
+			"flat2": {"type": "flattened", "depth_limit": 2}
+		}
+	}`), &f15Spec)
+	_ = json.Unmarshal([]byte(`{"properties":{"s2":{"type":"search_as_you_type","max_shingle_size":3}}}`), &f15Mut1)
+	_ = json.Unmarshal([]byte(`{"properties":{"flat2":{"type":"flattened","depth_limit":3}}}`), &f15Mut2)
+	if err := ValidateMappingSpec(&f15Spec); err != nil {
+		t.Fatalf("F15 valid spec failed: %v", err)
+	}
+	if err := ValidateMappingUpdateCompatibility(&f15Spec, &f15Mut1); err == nil {
+		t.Fatalf("F15 expected max_shingle_size mutation to fail")
+	}
+	if err := ValidateMappingUpdateCompatibility(&f15Spec, &f15Mut2); err == nil {
+		t.Fatalf("F15 expected depth_limit mutation to fail")
+	}
+	f15Schema := CompileIndexSchema("es_db", "r58_f15", &f15Spec)
+	if b3 := f15Schema.ResolveField("s2._3gram"); b3.Kind != StorageDynamicVariant {
+		t.Fatalf("F15 expected s2._3gram not to resolve as search_as_you_type subfield when max_shingle_size=2, got %+v", b3)
+	}
+	if b4 := f15Schema.ResolveField("s4._4gram"); b4.Kind == StorageDynamicVariant {
+		t.Fatalf("F15 expected s4._4gram to resolve as search_as_you_type subfield when max_shingle_size=4, got %+v", b4)
+	}
+	if _, err := ShredDocument(f15Schema, "fl_ok", 1, false, []byte(`{"flat2":{"a":{"b":"ok"}}}`)); err != nil {
+		t.Fatalf("F15 expected depth 2 flattened object to succeed, got %v", err)
+	}
+	if _, err := ShredDocument(f15Schema, "fl_deep", 1, false, []byte(`{"flat2":{"a":{"b":{"c":"too_deep"}}}}`)); err == nil || !strings.Contains(err.Error(), "depth") {
+		t.Fatalf("F15 expected depth 3 flattened object to fail depth_limit=2, got %v", err)
+	}
+	_ = math.MaxFloat32
 }

@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"math"
+	"math/big"
 	"net/http"
 	"net/url"
 	"path"
@@ -115,82 +116,105 @@ func RunSuiteFS(t *testing.T, fsys fs.FS, baseURL string) SuiteReport {
 			t.Fatalf("failed parsing spec file %s: %v", file, parseErr)
 		}
 
-		fileRep := FileReport{File: path.Base(file)}
-		t.Run(path.Base(file), func(t *testing.T) {
-			probeCtx := newRunnerContext(client, strings.TrimRight(baseURL, "/"))
-			for _, step := range specDoc.Setup {
-				if step.Op == "skip" {
-					fileRep.StepsRun++
-					report.StepsRun++
-					if err := probeCtx.execStep(step, false); err != nil {
-						var skipErr *errSkipSection
-						if errors.As(err, &skipErr) {
-							t.Skipf("setup skipped: %s", skipErr.reason)
-						}
-						t.Fatalf("[setup skip] %v", err)
-					}
-				}
-			}
-
-			for _, sec := range specDoc.Sections {
-				sec := sec
-				fileRep.SectionsRun++
-				report.SectionsRun++
-				t.Run(sec.Name, func(t *testing.T) {
-					ctx := newRunnerContext(client, strings.TrimRight(baseURL, "/"))
-					defer ctx.cleanupAll()
-
-					for i, step := range specDoc.Setup {
-						fileRep.StepsRun++
-						report.StepsRun++
-						if err := ctx.execStep(step, false); err != nil {
-							var skipErr *errSkipSection
-							if errors.As(err, &skipErr) {
-								t.Skipf("setup skipped: %s", skipErr.reason)
-							}
-							t.Fatalf("[setup step %d (%s)] %v", i+1, step.Op, err)
-						}
-					}
-
-					var testErr error
-					var skipErr *errSkipSection
-					for i, step := range sec.Steps {
-						fileRep.StepsRun++
-						report.StepsRun++
-						if err := ctx.execStep(step, false); err != nil {
-							if errors.As(err, &skipErr) {
-								break
-							}
-							testErr = fmt.Errorf("[step %d (%s)] %w", i+1, step.Op, err)
-							break
-						}
-					}
-
-					for i, step := range specDoc.Teardown {
-						fileRep.StepsRun++
-						report.StepsRun++
-						if err := ctx.execStep(step, true); err != nil && testErr == nil && skipErr == nil {
-							var tdSkip *errSkipSection
-							if !errors.As(err, &tdSkip) {
-								testErr = fmt.Errorf("[teardown step %d (%s)] %w", i+1, step.Op, err)
-							}
-						}
-					}
-
-					if skipErr != nil {
-						t.Skipf("skipped: %s", skipErr.reason)
-					}
-					if testErr != nil {
-						t.Fatal(testErr)
-					}
-				})
-			}
-		})
+		fileRep := runSpecDocument(t, client, baseURL, path.Base(file), specDoc, &report)
 		report.FilesRun++
 		report.FileReports = append(report.FileReports, fileRep)
 	}
 
 	return report
+}
+
+// RunSpecFile parses and executes a single rest-api-spec YAML file against baseURL.
+func RunSpecFile(t *testing.T, name, content, baseURL string) FileReport {
+	t.Helper()
+	specDoc, err := ParseSpecFile(content)
+	if err != nil {
+		t.Fatalf("failed parsing spec file %s: %v", name, err)
+	}
+	client := &http.Client{Timeout: 30 * time.Second}
+	var dummy SuiteReport
+	return runSpecDocument(t, client, baseURL, name, specDoc, &dummy)
+}
+
+func runSpecDocument(t *testing.T, client *http.Client, baseURL, fileName string, specDoc *SpecDocument, report *SuiteReport) FileReport {
+	t.Helper()
+	fileRep := FileReport{File: fileName}
+	trimmedBase := strings.TrimRight(baseURL, "/")
+	t.Run(fileName, func(t *testing.T) {
+		if reason, skip := shouldSkipSection(specDoc.Skip); skip {
+			t.Skipf("file skipped: %s", reason)
+		}
+
+		probeCtx := newRunnerContext(client, trimmedBase)
+		for _, step := range specDoc.Setup {
+			if step.Op == "skip" {
+				fileRep.StepsRun++
+				report.StepsRun++
+				if err := probeCtx.execStep(step, false); err != nil {
+					var skipErr *errSkipSection
+					if errors.As(err, &skipErr) {
+						t.Skipf("setup skipped: %s", skipErr.reason)
+					}
+					t.Fatalf("[setup skip] %v", err)
+				}
+			}
+		}
+
+		for _, sec := range specDoc.Sections {
+			sec := sec
+			fileRep.SectionsRun++
+			report.SectionsRun++
+			t.Run(sec.Name, func(t *testing.T) {
+				ctx := newRunnerContext(client, trimmedBase)
+				defer ctx.cleanupAll()
+
+				for i, step := range specDoc.Setup {
+					fileRep.StepsRun++
+					report.StepsRun++
+					if err := ctx.execStep(step, false); err != nil {
+						var skipErr *errSkipSection
+						if errors.As(err, &skipErr) {
+							t.Skipf("setup skipped: %s", skipErr.reason)
+						}
+						t.Fatalf("[setup step %d (%s)] %v", i+1, step.Op, err)
+					}
+				}
+
+				var testErr error
+				var skipErr *errSkipSection
+				for i, step := range sec.Steps {
+					fileRep.StepsRun++
+					report.StepsRun++
+					if err := ctx.execStep(step, false); err != nil {
+						if errors.As(err, &skipErr) {
+							break
+						}
+						testErr = fmt.Errorf("[step %d (%s)] %w", i+1, step.Op, err)
+						break
+					}
+				}
+
+				for i, step := range specDoc.Teardown {
+					fileRep.StepsRun++
+					report.StepsRun++
+					if err := ctx.execStep(step, true); err != nil && testErr == nil && skipErr == nil {
+						var tdSkip *errSkipSection
+						if !errors.As(err, &tdSkip) {
+							testErr = fmt.Errorf("[teardown step %d (%s)] %w", i+1, step.Op, err)
+						}
+					}
+				}
+
+				if skipErr != nil {
+					t.Skipf("skipped: %s", skipErr.reason)
+				}
+				if testErr != nil {
+					t.Fatal(testErr)
+				}
+			})
+		}
+	})
+	return fileRep
 }
 
 type runnerContext struct {
@@ -254,6 +278,8 @@ type runnerContext struct {
 	createdAliases               map[string]string          // alias -> index
 	createdFleetSecrets          map[string]bool
 	createdESQLAsyncQueries      map[string]bool
+	createdSQLCursors            map[string]bool
+	createdSQLAsyncIDs           map[string]bool
 	createdEQLSearches           map[string]bool
 	createdCCRFollowers          map[string]bool
 }
@@ -312,6 +338,8 @@ func newRunnerContext(client *http.Client, baseURL string) *runnerContext {
 		createdAliases:               make(map[string]string),
 		createdFleetSecrets:          make(map[string]bool),
 		createdESQLAsyncQueries:      make(map[string]bool),
+		createdSQLCursors:            make(map[string]bool),
+		createdSQLAsyncIDs:           make(map[string]bool),
 		createdEQLSearches:           make(map[string]bool),
 		createdCCRFollowers:          make(map[string]bool),
 	}
@@ -396,18 +424,41 @@ func (c *runnerContext) cleanupAll() {
 	}
 	for asyncID := range c.createdAsyncSearches {
 		if asyncID != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_async_search/"+url.PathEscape(asyncID), nil, nil, nil)
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_async_search/"+escapeIDSeg(asyncID), nil, nil, nil)
 		}
+		delete(c.createdAsyncSearches, asyncID)
 	}
 	for queryID := range c.createdESQLAsyncQueries {
 		if queryID != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_query/async/"+url.PathEscape(queryID), nil, nil, nil)
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_query/async/"+escapeIDSeg(queryID), nil, nil, nil)
+		}
+		delete(c.createdESQLAsyncQueries, queryID)
+	}
+	for sqlID := range c.createdSQLAsyncIDs {
+		if sqlID != "" {
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_sql/async/"+escapeIDSeg(sqlID), nil, nil, nil)
+		}
+		delete(c.createdSQLAsyncIDs, sqlID)
+	}
+	if len(c.createdSQLCursors) > 0 {
+		cursors := make([]string, 0, len(c.createdSQLCursors))
+		for cur := range c.createdSQLCursors {
+			if cur != "" {
+				cursors = append(cursors, cur)
+			}
+			delete(c.createdSQLCursors, cur)
+		}
+		sort.Strings(cursors)
+		for _, cur := range cursors {
+			bodyBytes, _ := json.Marshal(map[string]any{"cursor": cur})
+			_, _, _ = c.rawHTTP(http.MethodPost, "/_sql/close", nil, bodyBytes, nil)
 		}
 	}
 	for eqlID := range c.createdEQLSearches {
 		if eqlID != "" {
-			_, _, _ = c.rawHTTP(http.MethodDelete, "/_eql/search/"+url.PathEscape(eqlID), nil, nil, nil)
+			_, _, _ = c.rawHTTP(http.MethodDelete, "/_eql/search/"+escapeIDSeg(eqlID), nil, nil, nil)
 		}
+		delete(c.createdEQLSearches, eqlID)
 	}
 	for pol := range c.createdSLMPolicies {
 		if pol != "" {
@@ -1390,6 +1441,13 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 		} else if id := paramString(params, "id"); id != "" {
 			c.createdTransforms[id] = true
 		}
+		if bodyMap, ok := ToNative(params["body"]).(map[string]any); ok {
+			if destMap, ok := bodyMap["dest"].(map[string]any); ok {
+				if dIdx := paramString(destMap, "index"); dIdx != "" {
+					c.createdIndices[dIdx] = true
+				}
+			}
+		}
 	case "autoscaling.put_autoscaling_policy":
 		if name := paramString(params, "name"); name != "" {
 			c.createdAutoscalingPolicies[name] = true
@@ -1571,11 +1629,41 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 				c.createdAsyncSearches[id] = true
 			}
 		}
+	case "async_search.delete":
+		if id := paramString(params, "id"); id != "" {
+			delete(c.createdAsyncSearches, id)
+		}
 	case "esql.async_query":
 		if rm, ok := ToNative(resp).(map[string]any); ok {
 			if id := paramString(rm, "id"); id != "" {
 				c.createdESQLAsyncQueries[id] = true
 			}
+		}
+	case "esql.async_query_delete":
+		if id := paramString(params, "id"); id != "" {
+			delete(c.createdESQLAsyncQueries, id)
+		}
+	case "sql.query":
+		if rm, ok := ToNative(resp).(map[string]any); ok {
+			if cursor := paramString(rm, "cursor"); cursor != "" {
+				c.createdSQLCursors[cursor] = true
+			}
+			if id := paramString(rm, "id"); id != "" {
+				c.createdSQLAsyncIDs[id] = true
+			}
+		}
+	case "sql.clear_cursor", "sql.close":
+		if cur := paramString(params, "cursor"); cur != "" {
+			delete(c.createdSQLCursors, cur)
+		}
+		if bodyMap, ok := ToNative(params["body"]).(map[string]any); ok {
+			if cur := paramString(bodyMap, "cursor"); cur != "" {
+				delete(c.createdSQLCursors, cur)
+			}
+		}
+	case "sql.delete_async":
+		if id := paramString(params, "id"); id != "" {
+			delete(c.createdSQLAsyncIDs, id)
 		}
 	case "eql.search":
 		if rm, ok := ToNative(resp).(map[string]any); ok {
@@ -1697,6 +1785,16 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		return ""
 	}
 
+	popPath := func(keys ...string) string {
+		for _, k := range keys {
+			if v, exists := remaining[k]; exists {
+				delete(remaining, k)
+				return joinParamPath(v)
+			}
+		}
+		return ""
+	}
+
 	rawBody, hasBody := remaining["body"]
 	delete(remaining, "body")
 
@@ -1711,7 +1809,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "cluster.health":
 		method = http.MethodGet
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/_cluster/health/" + idx
 		} else {
 			reqPath = "/_cluster/health"
@@ -1720,7 +1818,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "cluster.state":
 		method = http.MethodGet
 		metric := popString("metric")
-		idx := popString("index")
+		idx := popPath("index")
 		switch {
 		case metric != "" && idx != "":
 			reqPath = "/_cluster/state/" + metric + "/" + idx
@@ -1767,11 +1865,19 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		method = http.MethodGet
 		nodeID := popString("node_id")
 		metric := popString("metric")
+		indexMetric := popString("index_metric")
+		if indexMetric != "" && metric == "" {
+			metric = "_all"
+		}
 		switch {
+		case nodeID != "" && metric != "" && indexMetric != "":
+			reqPath = "/_nodes/" + nodeID + "/stats/" + metric + "/" + indexMetric
 		case nodeID != "" && metric != "":
 			reqPath = "/_nodes/" + nodeID + "/stats/" + metric
 		case nodeID != "":
 			reqPath = "/_nodes/" + nodeID + "/stats"
+		case metric != "" && indexMetric != "":
+			reqPath = "/_nodes/stats/" + metric + "/" + indexMetric
 		case metric != "":
 			reqPath = "/_nodes/stats/" + metric
 		default:
@@ -1780,7 +1886,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.create":
 		method = http.MethodPut
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("indices.create requires index parameter")
 		}
@@ -1788,7 +1894,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.delete":
 		method = http.MethodDelete
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("indices.delete requires index parameter")
 		}
@@ -1796,7 +1902,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.exists":
 		method = http.MethodHead
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("indices.exists requires index parameter")
 		}
@@ -1804,7 +1910,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.get":
 		method = http.MethodGet
-		idx := popString("index")
+		idx := popPath("index")
 		feature := popString("feature")
 		if idx == "" {
 			return nil, fmt.Errorf("indices.get requires index parameter")
@@ -1817,7 +1923,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.get_mapping":
 		method = http.MethodGet
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_mapping"
 		} else {
 			reqPath = "/_mapping"
@@ -1825,7 +1931,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.put_mapping":
 		method = http.MethodPut
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("indices.put_mapping requires index parameter")
 		}
@@ -1833,7 +1939,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.get_field_mapping":
 		method = http.MethodGet
-		idx := popString("index")
+		idx := popPath("index")
 		fields := popString("fields", "field")
 		if fields == "" {
 			return nil, fmt.Errorf("indices.get_field_mapping requires fields parameter")
@@ -1846,7 +1952,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.get_settings":
 		method = http.MethodGet
-		idx := popString("index")
+		idx := popPath("index")
 		name := popString("name")
 		if name == "" {
 			name = paramString(params, "prefix")
@@ -1864,7 +1970,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.put_settings":
 		method = http.MethodPut
-		idx := popString("index")
+		idx := popPath("index")
 		if idx != "" {
 			reqPath = "/" + idx + "/_settings"
 		} else {
@@ -1873,8 +1979,8 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.put_alias":
 		method = http.MethodPut
-		idx := popString("index")
-		name := popString("name", "alias")
+		idx := popPath("index")
+		name := popPath("name", "alias")
 		if idx == "" || name == "" {
 			return nil, fmt.Errorf("indices.put_alias requires index and name parameters")
 		}
@@ -1882,8 +1988,8 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.get_alias":
 		method = http.MethodGet
-		idx := popString("index")
-		name := popString("name", "alias")
+		idx := popPath("index")
+		name := popPath("name", "alias")
 		switch {
 		case idx != "" && name != "":
 			reqPath = "/" + idx + "/_alias/" + name
@@ -1897,8 +2003,8 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.delete_alias":
 		method = http.MethodDelete
-		idx := popString("index")
-		name := popString("name", "alias")
+		idx := popPath("index")
+		name := popPath("name", "alias")
 		if idx == "" || name == "" {
 			return nil, fmt.Errorf("indices.delete_alias requires index and name parameters")
 		}
@@ -1906,8 +2012,8 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.exists_alias":
 		method = http.MethodHead
-		idx := popString("index")
-		name := popString("name", "alias")
+		idx := popPath("index")
+		name := popPath("name", "alias")
 		switch {
 		case idx != "" && name != "":
 			reqPath = "/" + idx + "/_alias/" + name
@@ -1925,7 +2031,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.refresh":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_refresh"
 		} else {
 			reqPath = "/_refresh"
@@ -1933,7 +2039,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.flush":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_flush"
 		} else {
 			reqPath = "/_flush"
@@ -1941,7 +2047,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.forcemerge":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_forcemerge"
 		} else {
 			reqPath = "/_forcemerge"
@@ -1949,7 +2055,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.stats":
 		method = http.MethodGet
-		idx := popString("index")
+		idx := popPath("index")
 		metric := popString("metric")
 		switch {
 		case idx != "" && metric != "":
@@ -1964,7 +2070,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.validate_query":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_validate/query"
 		} else {
 			reqPath = "/_validate/query"
@@ -1972,7 +2078,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.analyze":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_analyze"
 		} else {
 			reqPath = "/_analyze"
@@ -1993,8 +2099,8 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.rollover":
 		method = http.MethodPost
-		alias := popString("alias")
-		newIdx := popString("new_index")
+		alias := popPath("alias")
+		newIdx := popPath("new_index")
 		if alias == "" {
 			return nil, fmt.Errorf("indices.rollover requires alias parameter")
 		}
@@ -2069,7 +2175,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		reqPath = "/_component_template/" + name
 
 	case "index":
-		idx := popString("index")
+		idx := popPath("index")
 		id := popString("id")
 		if idx == "" {
 			return nil, fmt.Errorf("index requires index parameter")
@@ -2084,7 +2190,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "create":
 		method = http.MethodPut
-		idx := popString("index")
+		idx := popPath("index")
 		id := popString("id")
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("create requires index and id parameters")
@@ -2093,7 +2199,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "get":
 		method = http.MethodGet
-		idx := popString("index")
+		idx := popPath("index")
 		id := popString("id")
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("get requires index and id parameters")
@@ -2102,7 +2208,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "get_source":
 		method = http.MethodGet
-		idx := popString("index")
+		idx := popPath("index")
 		id := popString("id")
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("get_source requires index and id parameters")
@@ -2111,7 +2217,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "exists":
 		method = http.MethodHead
-		idx := popString("index")
+		idx := popPath("index")
 		id := popString("id")
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("exists requires index and id parameters")
@@ -2120,7 +2226,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "exists_source":
 		method = http.MethodHead
-		idx := popString("index")
+		idx := popPath("index")
 		id := popString("id")
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("exists_source requires index and id parameters")
@@ -2129,7 +2235,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "delete":
 		method = http.MethodDelete
-		idx := popString("index")
+		idx := popPath("index")
 		id := popString("id")
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("delete requires index and id parameters")
@@ -2138,7 +2244,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "update":
 		method = http.MethodPost
-		idx := popString("index")
+		idx := popPath("index")
 		id := popString("id")
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("update requires index and id parameters")
@@ -2147,7 +2253,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "mget":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_mget"
 		} else {
 			reqPath = "/_mget"
@@ -2156,7 +2262,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "bulk":
 		method = http.MethodPost
 		isNDJSON = true
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_bulk"
 		} else {
 			reqPath = "/_bulk"
@@ -2164,7 +2270,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "search":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_search"
 		} else {
 			reqPath = "/_search"
@@ -2173,15 +2279,24 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "msearch":
 		method = http.MethodPost
 		isNDJSON = true
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_msearch"
 		} else {
 			reqPath = "/_msearch"
 		}
 
+	case "mpercolate":
+		method = http.MethodPost
+		isNDJSON = true
+		if idx := popPath("index"); idx != "" {
+			reqPath = "/" + idx + "/_mpercolate"
+		} else {
+			reqPath = "/_mpercolate"
+		}
+
 	case "count":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_count"
 		} else {
 			reqPath = "/_count"
@@ -2189,7 +2304,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "explain":
 		method = http.MethodPost
-		idx := popString("index")
+		idx := popPath("index")
 		id := popString("id")
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("explain requires index and id parameters")
@@ -2202,7 +2317,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		} else {
 			method = http.MethodGet
 		}
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_field_caps"
 		} else {
 			reqPath = "/_field_caps"
@@ -2210,7 +2325,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "terms_enum":
 		method = http.MethodPost
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("terms_enum requires index parameter")
 		}
@@ -2236,16 +2351,51 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "clear_scroll":
 		method = http.MethodDelete
 		reqPath = "/_search/scroll"
-		if !hasBody {
-			if sid := popString("scroll_id"); sid != "" {
-				rawBody = map[string]any{"scroll_id": sid}
-				hasBody = true
+		if rawSID, exists := remaining["scroll_id"]; exists {
+			delete(remaining, "scroll_id")
+			switch sidVal := ToNative(rawSID).(type) {
+			case string:
+				if sidVal == "_all" {
+					reqPath = "/_search/scroll/_all"
+					rawBody = nil
+					hasBody = false
+				} else if !hasBody && sidVal != "" {
+					rawBody = map[string]any{"scroll_id": sidVal}
+					hasBody = true
+				}
+			case []string:
+				if len(sidVal) == 1 && sidVal[0] == "_all" {
+					reqPath = "/_search/scroll/_all"
+					rawBody = nil
+					hasBody = false
+				} else if !hasBody && len(sidVal) > 0 {
+					rawBody = map[string]any{"scroll_id": sidVal}
+					hasBody = true
+				}
+			case []any:
+				if len(sidVal) == 1 && fmt.Sprintf("%v", sidVal[0]) == "_all" {
+					reqPath = "/_search/scroll/_all"
+					rawBody = nil
+					hasBody = false
+				} else if !hasBody && len(sidVal) > 0 {
+					rawBody = map[string]any{"scroll_id": sidVal}
+					hasBody = true
+				}
+			default:
+				if sidStr := joinParamValue(sidVal); sidStr == "_all" {
+					reqPath = "/_search/scroll/_all"
+					rawBody = nil
+					hasBody = false
+				} else if !hasBody && sidStr != "" {
+					rawBody = map[string]any{"scroll_id": sidStr}
+					hasBody = true
+				}
 			}
 		}
 
 	case "open_point_in_time":
 		method = http.MethodPost
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("open_point_in_time requires index parameter")
 		}
@@ -2266,7 +2416,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "update_by_query":
 		method = http.MethodPost
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("update_by_query requires index parameter")
 		}
@@ -2274,7 +2424,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "delete_by_query":
 		method = http.MethodPost
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("delete_by_query requires index parameter")
 		}
@@ -2298,7 +2448,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if taskID == "" {
 			return nil, fmt.Errorf("%s requires task_id parameter", action)
 		}
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_update_by_query/" + taskID + "/_rethrottle"
 		} else {
 			reqPath = "/_update_by_query/" + taskID + "/_rethrottle"
@@ -2310,7 +2460,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if taskID == "" {
 			return nil, fmt.Errorf("%s requires task_id parameter", action)
 		}
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_delete_by_query/" + taskID + "/_rethrottle"
 		} else {
 			reqPath = "/_delete_by_query/" + taskID + "/_rethrottle"
@@ -2322,12 +2472,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("ingest.put_pipeline requires id parameter")
 		}
-		reqPath = "/_ingest/pipeline/" + id
+		reqPath = "/_ingest/pipeline/" + escapeIDSeg(id)
 
 	case "ingest.get_pipeline":
 		method = http.MethodGet
 		if id := popString("id"); id != "" {
-			reqPath = "/_ingest/pipeline/" + id
+			reqPath = "/_ingest/pipeline/" + escapeCommaIDSegs(id)
 		} else {
 			reqPath = "/_ingest/pipeline"
 		}
@@ -2338,19 +2488,19 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("ingest.delete_pipeline requires id parameter")
 		}
-		reqPath = "/_ingest/pipeline/" + id
+		reqPath = "/_ingest/pipeline/" + escapeIDSeg(id)
 
 	case "ingest.simulate":
 		method = http.MethodPost
 		if id := popString("id"); id != "" {
-			reqPath = "/_ingest/pipeline/" + id + "/_simulate"
+			reqPath = "/_ingest/pipeline/" + escapeIDSeg(id) + "/_simulate"
 		} else {
 			reqPath = "/_ingest/pipeline/_simulate"
 		}
 
 	case "simulate.ingest":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_ingest/_simulate"
 		} else {
 			reqPath = "/_ingest/_simulate"
@@ -2358,7 +2508,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "cat.indices":
 		method = http.MethodGet
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/_cat/indices/" + idx
 		} else {
 			reqPath = "/_cat/indices"
@@ -2366,7 +2516,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "cat.aliases":
 		method = http.MethodGet
-		if name := popString("name", "alias"); name != "" {
+		if name := popPath("name", "alias"); name != "" {
 			reqPath = "/_cat/aliases/" + name
 		} else {
 			reqPath = "/_cat/aliases"
@@ -2374,7 +2524,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "cat.count":
 		method = http.MethodGet
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/_cat/count/" + idx
 		} else {
 			reqPath = "/_cat/count"
@@ -2390,7 +2540,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "cat.shards":
 		method = http.MethodGet
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/_cat/shards/" + idx
 		} else {
 			reqPath = "/_cat/shards"
@@ -2402,7 +2552,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.resolve_index":
 		method = http.MethodGet
-		if name := popString("name"); name != "" {
+		if name := popPath("name"); name != "" {
 			reqPath = "/_resolve/index/" + name
 		} else {
 			reqPath = "/_resolve/index"
@@ -2410,7 +2560,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.create_data_stream", "data_stream.create_data_stream":
 		method = http.MethodPut
-		name := popString("name")
+		name := popPath("name")
 		if name == "" {
 			return nil, fmt.Errorf("%s requires name parameter", action)
 		}
@@ -2418,7 +2568,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.get_data_stream", "data_stream.get_data_stream":
 		method = http.MethodGet
-		if name := popString("name"); name != "" {
+		if name := popPath("name"); name != "" {
 			reqPath = "/_data_stream/" + name
 		} else {
 			reqPath = "/_data_stream"
@@ -2426,7 +2576,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.delete_data_stream", "data_stream.delete_data_stream":
 		method = http.MethodDelete
-		name := popString("name")
+		name := popPath("name")
 		if name == "" {
 			return nil, fmt.Errorf("%s requires name parameter", action)
 		}
@@ -2434,7 +2584,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.data_stream_stats", "indices.data_streams_stats", "data_stream.data_stream_stats":
 		method = http.MethodGet
-		if name := popString("name"); name != "" {
+		if name := popPath("name"); name != "" {
 			reqPath = "/_data_stream/" + name + "/_stats"
 		} else {
 			reqPath = "/_data_stream/_stats"
@@ -2442,7 +2592,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.migrate_to_data_stream", "data_stream.migrate_to_data_stream":
 		method = http.MethodPost
-		name := popString("name")
+		name := popPath("name")
 		if name == "" {
 			return nil, fmt.Errorf("%s requires name parameter", action)
 		}
@@ -2454,7 +2604,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.promote_data_stream", "data_stream.promote_data_stream":
 		method = http.MethodPost
-		name := popString("name")
+		name := popPath("name")
 		if name == "" {
 			return nil, fmt.Errorf("%s requires name parameter", action)
 		}
@@ -2494,8 +2644,8 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.clone":
 		method = http.MethodPost
-		idx := popString("index")
-		target := popString("target")
+		idx := popPath("index")
+		target := popPath("target")
 		if idx == "" || target == "" {
 			return nil, fmt.Errorf("indices.clone requires index and target parameters")
 		}
@@ -2503,8 +2653,8 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.shrink":
 		method = http.MethodPost
-		idx := popString("index")
-		target := popString("target")
+		idx := popPath("index")
+		target := popPath("target")
 		if idx == "" || target == "" {
 			return nil, fmt.Errorf("indices.shrink requires index and target parameters")
 		}
@@ -2512,8 +2662,8 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.split":
 		method = http.MethodPost
-		idx := popString("index")
-		target := popString("target")
+		idx := popPath("index")
+		target := popPath("target")
 		if idx == "" || target == "" {
 			return nil, fmt.Errorf("indices.split requires index and target parameters")
 		}
@@ -2521,7 +2671,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "search_shards":
 		method = http.MethodGet
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_search_shards"
 		} else {
 			reqPath = "/_search_shards"
@@ -2553,7 +2703,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "ilm.explain_lifecycle":
 		method = http.MethodGet
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_ilm/explain"
 		} else {
 			reqPath = "/_ilm/explain"
@@ -2573,7 +2723,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "ilm.move_to_step":
 		method = http.MethodPost
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("ilm.move_to_step requires index parameter")
 		}
@@ -2581,7 +2731,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "ilm.remove_policy":
 		method = http.MethodPost
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("ilm.remove_policy requires index parameter")
 		}
@@ -2589,7 +2739,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "ilm.retry":
 		method = http.MethodPost
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("ilm.retry requires index parameter")
 		}
@@ -2637,7 +2787,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("ingest.exists_pipeline requires id parameter")
 		}
-		reqPath = "/_ingest/pipeline/" + id
+		reqPath = "/_ingest/pipeline/" + escapeIDSeg(id)
 
 	case "put_script":
 		method = http.MethodPut
@@ -2646,9 +2796,9 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			return nil, fmt.Errorf("put_script requires id parameter")
 		}
 		if ctxName := popString("context"); ctxName != "" {
-			reqPath = "/_scripts/" + id + "/" + ctxName
+			reqPath = "/_scripts/" + escapeIDSeg(id) + "/" + escapeIDSeg(ctxName)
 		} else {
-			reqPath = "/_scripts/" + id
+			reqPath = "/_scripts/" + escapeIDSeg(id)
 		}
 
 	case "get_script":
@@ -2657,7 +2807,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("get_script requires id parameter")
 		}
-		reqPath = "/_scripts/" + id
+		reqPath = "/_scripts/" + escapeIDSeg(id)
 
 	case "delete_script":
 		method = http.MethodDelete
@@ -2665,7 +2815,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("delete_script requires id parameter")
 		}
-		reqPath = "/_scripts/" + id
+		reqPath = "/_scripts/" + escapeIDSeg(id)
 
 	case "exists_script":
 		method = http.MethodHead
@@ -2673,7 +2823,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("exists_script requires id parameter")
 		}
-		reqPath = "/_scripts/" + id
+		reqPath = "/_scripts/" + escapeIDSeg(id)
 
 	case "get_script_context":
 		method = http.MethodGet
@@ -2702,7 +2852,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "search_template":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_search/template"
 		} else {
 			reqPath = "/_search/template"
@@ -2715,7 +2865,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			method = http.MethodGet
 		}
 		if id := popString("id"); id != "" {
-			reqPath = "/_render/template/" + id
+			reqPath = "/_render/template/" + escapeIDSeg(id)
 		} else {
 			reqPath = "/_render/template"
 		}
@@ -2723,7 +2873,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "msearch_template":
 		method = http.MethodPost
 		isNDJSON = true
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_msearch/template"
 		} else {
 			reqPath = "/_msearch/template"
@@ -2735,7 +2885,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		} else {
 			method = http.MethodGet
 		}
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("%s requires index parameter", action)
 		}
@@ -2747,7 +2897,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "mtermvectors":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_mtermvectors"
 		} else {
 			reqPath = "/_mtermvectors"
@@ -2755,15 +2905,19 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "rank_eval":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_rank_eval"
 		} else {
 			reqPath = "/_rank_eval"
 		}
 
 	case "search_mvt":
-		method = http.MethodGet
-		idx := popString("index")
+		if hasBody && rawBody != nil {
+			method = http.MethodPost
+		} else {
+			method = http.MethodGet
+		}
+		idx := popPath("index")
 		field := popString("field")
 		zoom := popString("zoom")
 		x := popString("x")
@@ -2771,7 +2925,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if idx == "" || field == "" || zoom == "" || x == "" || y == "" {
 			return nil, fmt.Errorf("search_mvt requires index, field, zoom, x, and y parameters")
 		}
-		reqPath = "/" + idx + "/_mvt/" + field + "/" + zoom + "/" + x + "/" + y
+		reqPath = "/" + idx + "/_mvt/" + escapeIDSeg(field) + "/" + zoom + "/" + x + "/" + y
 
 	case "cat.allocation":
 		method = http.MethodGet
@@ -2807,7 +2961,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "cat.recovery":
 		method = http.MethodGet
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/_cat/recovery/" + idx
 		} else {
 			reqPath = "/_cat/recovery"
@@ -2819,7 +2973,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "cat.segments":
 		method = http.MethodGet
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/_cat/segments/" + idx
 		} else {
 			reqPath = "/_cat/segments"
@@ -2839,7 +2993,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "cat.templates":
 		method = http.MethodGet
-		if name := popString("name"); name != "" {
+		if name := popPath("name"); name != "" {
 			reqPath = "/_cat/templates/" + name
 		} else {
 			reqPath = "/_cat/templates"
@@ -2847,7 +3001,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.recovery":
 		method = http.MethodGet
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_recovery"
 		} else {
 			reqPath = "/_recovery"
@@ -2855,7 +3009,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.segments":
 		method = http.MethodGet
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_segments"
 		} else {
 			reqPath = "/_segments"
@@ -2863,7 +3017,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.shard_stores":
 		method = http.MethodGet
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_shard_stores"
 		} else {
 			reqPath = "/_shard_stores"
@@ -2871,7 +3025,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.clear_cache":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_cache/clear"
 		} else {
 			reqPath = "/_cache/clear"
@@ -2879,7 +3033,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.open":
 		method = http.MethodPost
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("indices.open requires index parameter")
 		}
@@ -2887,7 +3041,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.close":
 		method = http.MethodPost
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("indices.close requires index parameter")
 		}
@@ -2895,7 +3049,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.flush_synced":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_flush/synced"
 		} else {
 			reqPath = "/_flush/synced"
@@ -2903,7 +3057,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.freeze":
 		method = http.MethodPost
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("indices.freeze requires index parameter")
 		}
@@ -2911,7 +3065,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.unfreeze":
 		method = http.MethodPost
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("indices.unfreeze requires index parameter")
 		}
@@ -2978,7 +3132,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "knn_search":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_knn_search"
 		} else {
 			reqPath = "/_knn_search"
@@ -2986,7 +3140,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "cat.data_streams":
 		method = http.MethodGet
-		if name := popString("name"); name != "" {
+		if name := popPath("name"); name != "" {
 			reqPath = "/_cat/data_streams/" + name
 		} else {
 			reqPath = "/_cat/data_streams"
@@ -3119,16 +3273,16 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.add_block":
 		method = http.MethodPut
-		idx := popString("index")
+		idx := popPath("index")
 		block := popString("block")
 		if idx == "" || block == "" {
 			return nil, fmt.Errorf("indices.add_block requires index and block parameters")
 		}
-		reqPath = "/" + idx + "/_block/" + block
+		reqPath = "/" + idx + "/_block/" + escapeIDSeg(block)
 
 	case "indices.downgrade":
 		method = http.MethodPost
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("indices.downgrade requires index parameter")
 		}
@@ -3385,7 +3539,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("synonyms.put_synonym requires id parameter")
 		}
-		reqPath = "/_synonyms/" + id
+		reqPath = "/_synonyms/" + escapeIDSeg(id)
 
 	case "synonyms.get_synonym":
 		method = http.MethodGet
@@ -3393,7 +3547,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("synonyms.get_synonym requires id parameter")
 		}
-		reqPath = "/_synonyms/" + id
+		reqPath = "/_synonyms/" + escapeIDSeg(id)
 
 	case "synonyms.get_synonyms_sets":
 		method = http.MethodGet
@@ -3405,7 +3559,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("synonyms.delete_synonym requires id parameter")
 		}
-		reqPath = "/_synonyms/" + id
+		reqPath = "/_synonyms/" + escapeIDSeg(id)
 
 	case "synonyms.put_synonym_rule":
 		method = http.MethodPut
@@ -3414,7 +3568,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if setID == "" || ruleID == "" {
 			return nil, fmt.Errorf("synonyms.put_synonym_rule requires set_id and rule_id parameters")
 		}
-		reqPath = "/_synonyms/" + setID + "/" + ruleID
+		reqPath = "/_synonyms/" + escapeIDSeg(setID) + "/" + escapeIDSeg(ruleID)
 
 	case "synonyms.get_synonym_rule":
 		method = http.MethodGet
@@ -3423,7 +3577,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if setID == "" || ruleID == "" {
 			return nil, fmt.Errorf("synonyms.get_synonym_rule requires set_id and rule_id parameters")
 		}
-		reqPath = "/_synonyms/" + setID + "/" + ruleID
+		reqPath = "/_synonyms/" + escapeIDSeg(setID) + "/" + escapeIDSeg(ruleID)
 
 	case "synonyms.delete_synonym_rule":
 		method = http.MethodDelete
@@ -3432,7 +3586,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if setID == "" || ruleID == "" {
 			return nil, fmt.Errorf("synonyms.delete_synonym_rule requires set_id and rule_id parameters")
 		}
-		reqPath = "/_synonyms/" + setID + "/" + ruleID
+		reqPath = "/_synonyms/" + escapeIDSeg(setID) + "/" + escapeIDSeg(ruleID)
 
 	case "synonyms.reload_synonym":
 		method = http.MethodPost
@@ -3440,7 +3594,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("synonyms.reload_synonym requires id parameter")
 		}
-		reqPath = "/_synonyms/" + id + "/_reload"
+		reqPath = "/_synonyms/" + escapeIDSeg(id) + "/_reload"
 
 	case "query_rules.put_ruleset":
 		method = http.MethodPut
@@ -3448,7 +3602,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if rulesetID == "" {
 			return nil, fmt.Errorf("query_rules.put_ruleset requires ruleset_id parameter")
 		}
-		reqPath = "/_query_rules/" + rulesetID
+		reqPath = "/_query_rules/" + escapeIDSeg(rulesetID)
 
 	case "query_rules.get_ruleset":
 		method = http.MethodGet
@@ -3456,7 +3610,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if rulesetID == "" {
 			return nil, fmt.Errorf("query_rules.get_ruleset requires ruleset_id parameter")
 		}
-		reqPath = "/_query_rules/" + rulesetID
+		reqPath = "/_query_rules/" + escapeIDSeg(rulesetID)
 
 	case "query_rules.list_rulesets":
 		method = http.MethodGet
@@ -3468,7 +3622,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if rulesetID == "" {
 			return nil, fmt.Errorf("query_rules.delete_ruleset requires ruleset_id parameter")
 		}
-		reqPath = "/_query_rules/" + rulesetID
+		reqPath = "/_query_rules/" + escapeIDSeg(rulesetID)
 
 	case "query_rules.put_rule":
 		method = http.MethodPut
@@ -3477,7 +3631,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if rulesetID == "" || ruleID == "" {
 			return nil, fmt.Errorf("query_rules.put_rule requires ruleset_id and rule_id parameters")
 		}
-		reqPath = "/_query_rules/" + rulesetID + "/_rule/" + ruleID
+		reqPath = "/_query_rules/" + escapeIDSeg(rulesetID) + "/_rule/" + escapeIDSeg(ruleID)
 
 	case "query_rules.get_rule":
 		method = http.MethodGet
@@ -3486,7 +3640,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if rulesetID == "" || ruleID == "" {
 			return nil, fmt.Errorf("query_rules.get_rule requires ruleset_id and rule_id parameters")
 		}
-		reqPath = "/_query_rules/" + rulesetID + "/_rule/" + ruleID
+		reqPath = "/_query_rules/" + escapeIDSeg(rulesetID) + "/_rule/" + escapeIDSeg(ruleID)
 
 	case "query_rules.delete_rule":
 		method = http.MethodDelete
@@ -3495,7 +3649,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if rulesetID == "" || ruleID == "" {
 			return nil, fmt.Errorf("query_rules.delete_rule requires ruleset_id and rule_id parameters")
 		}
-		reqPath = "/_query_rules/" + rulesetID + "/_rule/" + ruleID
+		reqPath = "/_query_rules/" + escapeIDSeg(rulesetID) + "/_rule/" + escapeIDSeg(ruleID)
 
 	case "query_rules.test":
 		method = http.MethodPost
@@ -3503,7 +3657,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if rulesetID == "" {
 			return nil, fmt.Errorf("query_rules.test requires ruleset_id parameter")
 		}
-		reqPath = "/_query_rules/" + rulesetID + "/_test"
+		reqPath = "/_query_rules/" + escapeIDSeg(rulesetID) + "/_test"
 
 	case "features.get_features":
 		method = http.MethodGet
@@ -3523,7 +3677,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "migration.deprecations":
 		method = http.MethodGet
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_migration/deprecations"
 		} else {
 			reqPath = "/_migration/deprecations"
@@ -3603,7 +3757,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "rollup.get_rollup_caps":
 		method = http.MethodGet
-		if id := popString("id", "index"); id != "" {
+		if id := popPath("id", "index"); id != "" {
 			reqPath = "/_rollup/data/" + id
 		} else {
 			reqPath = "/_rollup/data/_all"
@@ -3611,7 +3765,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "rollup.get_rollup_index_caps":
 		method = http.MethodGet
-		idx := popString("index", "id")
+		idx := popPath("index", "id")
 		if idx == "" {
 			return nil, fmt.Errorf("rollup.get_rollup_index_caps requires index parameter")
 		}
@@ -3623,7 +3777,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		} else {
 			method = http.MethodGet
 		}
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("rollup.rollup_search requires index parameter")
 		}
@@ -3635,12 +3789,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("ccr.put_auto_follow_pattern requires name parameter")
 		}
-		reqPath = "/_ccr/auto_follow/" + name
+		reqPath = "/_ccr/auto_follow/" + escapeIDSeg(name)
 
 	case "ccr.get_auto_follow_pattern":
 		method = http.MethodGet
 		if name := popString("name"); name != "" {
-			reqPath = "/_ccr/auto_follow/" + name
+			reqPath = "/_ccr/auto_follow/" + escapeCommaIDSegs(name)
 		} else {
 			reqPath = "/_ccr/auto_follow"
 		}
@@ -3651,7 +3805,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("ccr.delete_auto_follow_pattern requires name parameter")
 		}
-		reqPath = "/_ccr/auto_follow/" + name
+		reqPath = "/_ccr/auto_follow/" + escapeIDSeg(name)
 
 	case "ccr.pause_auto_follow_pattern":
 		method = http.MethodPost
@@ -3659,7 +3813,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("ccr.pause_auto_follow_pattern requires name parameter")
 		}
-		reqPath = "/_ccr/auto_follow/" + name + "/_pause"
+		reqPath = "/_ccr/auto_follow/" + escapeIDSeg(name) + "/_pause"
 
 	case "ccr.resume_auto_follow_pattern":
 		method = http.MethodPost
@@ -3667,11 +3821,11 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if name == "" {
 			return nil, fmt.Errorf("ccr.resume_auto_follow_pattern requires name parameter")
 		}
-		reqPath = "/_ccr/auto_follow/" + name + "/_resume"
+		reqPath = "/_ccr/auto_follow/" + escapeIDSeg(name) + "/_resume"
 
 	case "ccr.follow":
 		method = http.MethodPut
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("ccr.follow requires index parameter")
 		}
@@ -3679,7 +3833,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "ccr.follow_info":
 		method = http.MethodGet
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("ccr.follow_info requires index parameter")
 		}
@@ -3687,7 +3841,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "ccr.follow_stats":
 		method = http.MethodGet
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("ccr.follow_stats requires index parameter")
 		}
@@ -3695,7 +3849,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "ccr.pause_follow":
 		method = http.MethodPost
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("ccr.pause_follow requires index parameter")
 		}
@@ -3703,7 +3857,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "ccr.resume_follow":
 		method = http.MethodPost
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("ccr.resume_follow requires index parameter")
 		}
@@ -3711,7 +3865,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "ccr.unfollow":
 		method = http.MethodPost
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("ccr.unfollow requires index parameter")
 		}
@@ -3719,7 +3873,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "ccr.forget_follower":
 		method = http.MethodPost
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("ccr.forget_follower requires index parameter")
 		}
@@ -3740,7 +3894,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "searchable_snapshots.stats":
 		method = http.MethodGet
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_searchable_snapshots/stats"
 		} else {
 			reqPath = "/_searchable_snapshots/stats"
@@ -3752,7 +3906,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "searchable_snapshots.clear_cache":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_searchable_snapshots/cache/clear"
 		} else {
 			reqPath = "/_searchable_snapshots/cache/clear"
@@ -3768,12 +3922,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if username == "" {
 			return nil, fmt.Errorf("security.put_user requires username parameter")
 		}
-		reqPath = "/_security/user/" + username
+		reqPath = "/_security/user/" + escapeIDSeg(username)
 
 	case "security.get_user":
 		method = http.MethodGet
 		if username := popString("username", "name", "id"); username != "" {
-			reqPath = "/_security/user/" + username
+			reqPath = "/_security/user/" + escapeCommaIDSegs(username)
 		} else {
 			reqPath = "/_security/user"
 		}
@@ -3784,7 +3938,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if username == "" {
 			return nil, fmt.Errorf("security.delete_user requires username parameter")
 		}
-		reqPath = "/_security/user/" + username
+		reqPath = "/_security/user/" + escapeIDSeg(username)
 
 	case "security.enable_user":
 		method = http.MethodPut
@@ -3792,7 +3946,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if username == "" {
 			return nil, fmt.Errorf("security.enable_user requires username parameter")
 		}
-		reqPath = "/_security/user/" + username + "/_enable"
+		reqPath = "/_security/user/" + escapeIDSeg(username) + "/_enable"
 
 	case "security.disable_user":
 		method = http.MethodPut
@@ -3800,12 +3954,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if username == "" {
 			return nil, fmt.Errorf("security.disable_user requires username parameter")
 		}
-		reqPath = "/_security/user/" + username + "/_disable"
+		reqPath = "/_security/user/" + escapeIDSeg(username) + "/_disable"
 
 	case "security.change_password":
 		method = http.MethodPost
 		if username := popString("username", "name", "id"); username != "" {
-			reqPath = "/_security/user/" + username + "/_password"
+			reqPath = "/_security/user/" + escapeIDSeg(username) + "/_password"
 		} else {
 			reqPath = "/_security/user/_password"
 		}
@@ -3813,7 +3967,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "security.has_privileges":
 		method = http.MethodPost
 		if username := popString("username", "name", "id"); username != "" {
-			reqPath = "/_security/user/" + username + "/_has_privileges"
+			reqPath = "/_security/user/" + escapeIDSeg(username) + "/_has_privileges"
 		} else {
 			reqPath = "/_security/user/_has_privileges"
 		}
@@ -4097,9 +4251,9 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			return nil, fmt.Errorf("%s requires inference_id parameter", action)
 		}
 		if taskType != "" {
-			reqPath = "/_inference/" + taskType + "/" + infID
+			reqPath = "/_inference/" + escapeIDSeg(taskType) + "/" + escapeIDSeg(infID)
 		} else {
-			reqPath = "/_inference/" + infID
+			reqPath = "/_inference/" + escapeIDSeg(infID)
 		}
 
 	case "inference.get", "inference.get_model":
@@ -4108,11 +4262,11 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		infID := popString("inference_id", "id")
 		switch {
 		case taskType != "" && infID != "":
-			reqPath = "/_inference/" + taskType + "/" + infID
+			reqPath = "/_inference/" + escapeIDSeg(taskType) + "/" + escapeIDSeg(infID)
 		case infID != "":
-			reqPath = "/_inference/" + infID
+			reqPath = "/_inference/" + escapeIDSeg(infID)
 		case taskType != "":
-			reqPath = "/_inference/" + taskType
+			reqPath = "/_inference/" + escapeIDSeg(taskType)
 		default:
 			reqPath = "/_inference"
 		}
@@ -4125,9 +4279,9 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			return nil, fmt.Errorf("%s requires inference_id parameter", action)
 		}
 		if taskType != "" {
-			reqPath = "/_inference/" + taskType + "/" + infID
+			reqPath = "/_inference/" + escapeIDSeg(taskType) + "/" + escapeIDSeg(infID)
 		} else {
-			reqPath = "/_inference/" + infID
+			reqPath = "/_inference/" + escapeIDSeg(infID)
 		}
 
 	case "inference.inference", "inference.post":
@@ -4138,9 +4292,9 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			return nil, fmt.Errorf("%s requires inference_id parameter", action)
 		}
 		if taskType != "" {
-			reqPath = "/_inference/" + taskType + "/" + infID
+			reqPath = "/_inference/" + escapeIDSeg(taskType) + "/" + escapeIDSeg(infID)
 		} else {
-			reqPath = "/_inference/" + infID
+			reqPath = "/_inference/" + escapeIDSeg(infID)
 		}
 
 	case "inference.stream":
@@ -4151,20 +4305,20 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			return nil, fmt.Errorf("inference.stream requires inference_id parameter")
 		}
 		if taskType != "" {
-			reqPath = "/_inference/" + taskType + "/" + infID + "/_stream"
+			reqPath = "/_inference/" + escapeIDSeg(taskType) + "/" + escapeIDSeg(infID) + "/_stream"
 		} else {
-			reqPath = "/_inference/" + infID + "/_stream"
+			reqPath = "/_inference/" + escapeIDSeg(infID) + "/_stream"
 		}
 
 	case "inference.text_embedding", "inference.sparse_embedding", "inference.completion",
-		"inference.rerank", "inference.chat_completion":
+		"inference.rerank", "inference.chat_completion", "inference.chunking":
 		method = http.MethodPost
 		infID := popString("inference_id", "model_id", "id")
 		if infID == "" {
 			return nil, fmt.Errorf("%s requires inference_id parameter", action)
 		}
 		taskType := strings.TrimPrefix(action, "inference.")
-		reqPath = "/_inference/" + taskType + "/" + infID
+		reqPath = "/_inference/" + taskType + "/" + escapeIDSeg(infID)
 
 	case "connector.put":
 		method = http.MethodPut
@@ -4405,7 +4559,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "async_search.submit":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_async_search"
 		} else {
 			reqPath = "/_async_search"
@@ -4417,7 +4571,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("async_search.get requires id parameter")
 		}
-		reqPath = "/_async_search/" + id
+		reqPath = "/_async_search/" + escapeIDSeg(id)
 
 	case "async_search.status":
 		method = http.MethodGet
@@ -4425,7 +4579,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("async_search.status requires id parameter")
 		}
-		reqPath = "/_async_search/status/" + id
+		reqPath = "/_async_search/status/" + escapeIDSeg(id)
 
 	case "async_search.delete":
 		method = http.MethodDelete
@@ -4433,7 +4587,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("async_search.delete requires id parameter")
 		}
-		reqPath = "/_async_search/" + id
+		reqPath = "/_async_search/" + escapeIDSeg(id)
 
 	case "esql.query":
 		method = http.MethodPost
@@ -4449,7 +4603,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("esql.async_query_get requires id parameter")
 		}
-		reqPath = "/_query/async/" + id
+		reqPath = "/_query/async/" + escapeIDSeg(id)
 
 	case "esql.async_query_stop":
 		method = http.MethodPost
@@ -4457,7 +4611,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("esql.async_query_stop requires id parameter")
 		}
-		reqPath = "/_query/async/" + id + "/_stop"
+		reqPath = "/_query/async/" + escapeIDSeg(id) + "/_stop"
 
 	case "esql.async_query_delete":
 		method = http.MethodDelete
@@ -4465,7 +4619,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("esql.async_query_delete requires id parameter")
 		}
-		reqPath = "/_query/async/" + id
+		reqPath = "/_query/async/" + escapeIDSeg(id)
 
 	case "watcher.query_watches":
 		method = http.MethodPost
@@ -4491,9 +4645,26 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		method = http.MethodGet
 		reqPath = "/_license"
 
+	case "license.put":
+		method = http.MethodPut
+		reqPath = "/_license"
+
+	case "license.post":
+		method = http.MethodPost
+		reqPath = "/_license"
+
 	case "license.delete":
 		method = http.MethodDelete
 		reqPath = "/_license"
+
+	case "monitoring.bulk":
+		method = http.MethodPost
+		isNDJSON = true
+		if typ := popString("type"); typ != "" {
+			reqPath = "/_monitoring/" + escapeIDSeg(typ) + "/bulk"
+		} else {
+			reqPath = "/_monitoring/bulk"
+		}
 
 	case "license.post_start_basic":
 		method = http.MethodPost
@@ -4555,7 +4726,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("sql.get_async requires id parameter")
 		}
-		reqPath = "/_sql/async/" + id
+		reqPath = "/_sql/async/" + escapeIDSeg(id)
 
 	case "sql.get_async_status":
 		method = http.MethodGet
@@ -4563,7 +4734,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("sql.get_async_status requires id parameter")
 		}
-		reqPath = "/_sql/async/status/" + id
+		reqPath = "/_sql/async/status/" + escapeIDSeg(id)
 
 	case "sql.delete_async":
 		method = http.MethodDelete
@@ -4571,11 +4742,11 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("sql.delete_async requires id parameter")
 		}
-		reqPath = "/_sql/async/" + id
+		reqPath = "/_sql/async/" + escapeIDSeg(id)
 
 	case "eql.search":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_eql/search"
 		} else {
 			reqPath = "/_eql/search"
@@ -4587,7 +4758,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("eql.get requires id parameter")
 		}
-		reqPath = "/_eql/search/" + id
+		reqPath = "/_eql/search/" + escapeIDSeg(id)
 
 	case "eql.get_status":
 		method = http.MethodGet
@@ -4595,7 +4766,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("eql.get_status requires id parameter")
 		}
-		reqPath = "/_eql/search/status/" + id
+		reqPath = "/_eql/search/status/" + escapeIDSeg(id)
 
 	case "eql.delete":
 		method = http.MethodDelete
@@ -4603,12 +4774,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("eql.delete requires id parameter")
 		}
-		reqPath = "/_eql/search/" + id
+		reqPath = "/_eql/search/" + escapeIDSeg(id)
 
 	case "fleet.msearch":
 		method = http.MethodPost
 		isNDJSON = true
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_fleet/msearch"
 		} else {
 			reqPath = "/_fleet/msearch"
@@ -4616,7 +4787,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "fleet.search":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_fleet/search"
 		} else {
 			reqPath = "/_fleet/search"
@@ -4624,7 +4795,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "fleet.global_checkpoints":
 		method = http.MethodGet
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("fleet.global_checkpoints requires index parameter")
 		}
@@ -4640,7 +4811,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("fleet.get_secret requires id parameter")
 		}
-		reqPath = "/_fleet/secrets/" + id
+		reqPath = "/_fleet/secrets/" + escapeIDSeg(id)
 
 	case "fleet.delete_secret":
 		method = http.MethodDelete
@@ -4648,11 +4819,11 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("fleet.delete_secret requires id parameter")
 		}
-		reqPath = "/_fleet/secrets/" + id
+		reqPath = "/_fleet/secrets/" + escapeIDSeg(id)
 
 	case "graph.explore":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_graph/explore"
 		} else {
 			reqPath = "/_graph/explore"
@@ -4783,12 +4954,17 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		reqPath = "/_ml/datafeeds/" + dfID + "/_stop"
 
 	case "ml.preview_datafeed":
-		method = http.MethodGet
 		dfID := popString("datafeed_id", "id")
-		if dfID == "" {
-			return nil, fmt.Errorf("ml.preview_datafeed requires datafeed_id parameter")
+		if (hasBody && rawBody != nil) || dfID == "" {
+			method = http.MethodPost
+		} else {
+			method = http.MethodGet
 		}
-		reqPath = "/_ml/datafeeds/" + dfID + "/_preview"
+		if dfID != "" {
+			reqPath = "/_ml/datafeeds/" + escapeIDSeg(dfID) + "/_preview"
+		} else {
+			reqPath = "/_ml/datafeeds/_preview"
+		}
 
 	case "ml.put_trained_model":
 		method = http.MethodPut
@@ -4955,17 +5131,15 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "security.clear_cached_realms":
 		method = http.MethodPost
-		if realms := popString("realms", "realm"); realms != "" {
-			reqPath = "/_security/realm/" + realms + "/_clear_cache"
-		} else if username := popString("username", "name", "id"); username != "" {
-			reqPath = "/_security/user/" + username + "/_clear_cache"
-		} else {
-			reqPath = "/_security/user/_clear_cache"
+		realms := popString("realms", "realm")
+		if realms == "" {
+			return nil, fmt.Errorf("security.clear_cached_realms requires realms parameter")
 		}
+		reqPath = "/_security/realm/" + escapeCommaIDSegs(realms) + "/_clear_cache"
 
 	case "indices.reload_search_analyzers":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_reload_search_analyzers"
 		} else {
 			reqPath = "/_reload_search_analyzers"
@@ -4973,7 +5147,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.disk_usage":
 		method = http.MethodPost
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_disk_usage"
 		} else {
 			reqPath = "/_disk_usage"
@@ -4981,7 +5155,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.field_usage_stats":
 		method = http.MethodGet
-		if idx := popString("index"); idx != "" {
+		if idx := popPath("index"); idx != "" {
 			reqPath = "/" + idx + "/_field_usage_stats"
 		} else {
 			reqPath = "/_field_usage_stats"
@@ -5047,7 +5221,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "cluster.info":
 		method = http.MethodGet
-		if target := popString("target"); target != "" {
+		if target := popPath("target"); target != "" {
 			reqPath = "/_cluster/info/" + target
 		} else {
 			reqPath = "/_cluster/info"
@@ -5075,7 +5249,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.put_data_lifecycle", "data_stream.put_data_lifecycle":
 		method = http.MethodPut
-		name := popString("name")
+		name := popPath("name")
 		if name == "" {
 			return nil, fmt.Errorf("%s requires name parameter", action)
 		}
@@ -5083,7 +5257,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.get_data_lifecycle", "data_stream.get_data_lifecycle":
 		method = http.MethodGet
-		name := popString("name")
+		name := popPath("name")
 		if name == "" {
 			return nil, fmt.Errorf("%s requires name parameter", action)
 		}
@@ -5091,7 +5265,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.delete_data_lifecycle", "data_stream.delete_data_lifecycle":
 		method = http.MethodDelete
-		name := popString("name")
+		name := popPath("name")
 		if name == "" {
 			return nil, fmt.Errorf("%s requires name parameter", action)
 		}
@@ -5099,7 +5273,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.explain_data_lifecycle", "data_stream.explain_data_lifecycle":
 		method = http.MethodGet
-		idx := popString("index")
+		idx := popPath("index")
 		if idx == "" {
 			return nil, fmt.Errorf("%s requires index parameter", action)
 		}
@@ -5107,8 +5281,8 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.downsample":
 		method = http.MethodPost
-		idx := popString("index")
-		targetIdx := popString("target_index", "target")
+		idx := popPath("index")
+		targetIdx := popPath("target_index", "target")
 		if idx == "" || targetIdx == "" {
 			return nil, fmt.Errorf("indices.downsample requires index and target_index parameters")
 		}
@@ -5504,47 +5678,47 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		}
 		reqPath = "/_ml/anomaly_detectors/" + jobID + "/model_snapshots/" + snapID + "/_upgrade/_stats"
 
-	case "security.activate_profile":
+	case "security.activate_profile", "security.activate_user_profile":
 		method = http.MethodPost
 		reqPath = "/_security/profile/_activate"
 
-	case "security.get_profile":
+	case "security.get_profile", "security.get_user_profile":
 		method = http.MethodGet
 		uid := popString("uid")
 		if uid == "" {
-			return nil, fmt.Errorf("security.get_profile requires uid parameter")
+			return nil, fmt.Errorf("%s requires uid parameter", action)
 		}
-		reqPath = "/_security/profile/" + uid
+		reqPath = "/_security/profile/" + escapeCommaIDSegs(uid)
 
-	case "security.update_profile_data":
+	case "security.update_profile_data", "security.update_user_profile_data":
 		method = http.MethodPost
 		uid := popString("uid")
 		if uid == "" {
-			return nil, fmt.Errorf("security.update_profile_data requires uid parameter")
+			return nil, fmt.Errorf("%s requires uid parameter", action)
 		}
-		reqPath = "/_security/profile/" + uid + "/_data"
+		reqPath = "/_security/profile/" + escapeIDSeg(uid) + "/_data"
 
-	case "security.enable_profile":
+	case "security.enable_profile", "security.enable_user_profile":
 		method = http.MethodPut
 		uid := popString("uid")
 		if uid == "" {
-			return nil, fmt.Errorf("security.enable_profile requires uid parameter")
+			return nil, fmt.Errorf("%s requires uid parameter", action)
 		}
-		reqPath = "/_security/profile/" + uid + "/_enable"
+		reqPath = "/_security/profile/" + escapeIDSeg(uid) + "/_enable"
 
-	case "security.disable_profile":
+	case "security.disable_profile", "security.disable_user_profile":
 		method = http.MethodPut
 		uid := popString("uid")
 		if uid == "" {
-			return nil, fmt.Errorf("security.disable_profile requires uid parameter")
+			return nil, fmt.Errorf("%s requires uid parameter", action)
 		}
-		reqPath = "/_security/profile/" + uid + "/_disable"
+		reqPath = "/_security/profile/" + escapeIDSeg(uid) + "/_disable"
 
-	case "security.suggest_profiles":
+	case "security.suggest_profiles", "security.suggest_user_profiles":
 		method = http.MethodPost
 		reqPath = "/_security/_suggest_profiles"
 
-	case "security.has_privileges_profile":
+	case "security.has_privileges_profile", "security.has_privileges_user_profile":
 		if hasBody && rawBody != nil {
 			method = http.MethodPost
 		} else {
@@ -5552,9 +5726,9 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		}
 		uid := popString("uid")
 		if uid == "" {
-			return nil, fmt.Errorf("security.has_privileges_profile requires uid parameter")
+			return nil, fmt.Errorf("%s requires uid parameter", action)
 		}
-		reqPath = "/_security/profile/" + uid + "/_has_privileges"
+		reqPath = "/_security/profile/" + escapeIDSeg(uid) + "/_has_privileges"
 
 	case "security.get_settings":
 		method = http.MethodGet
@@ -5602,12 +5776,12 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("ingest.put_geoip_database requires id parameter")
 		}
-		reqPath = "/_ingest/geoip/database/" + id
+		reqPath = "/_ingest/geoip/database/" + escapeIDSeg(id)
 
 	case "ingest.get_geoip_database":
 		method = http.MethodGet
 		if id := popString("id"); id != "" {
-			reqPath = "/_ingest/geoip/database/" + id
+			reqPath = "/_ingest/geoip/database/" + escapeCommaIDSegs(id)
 		} else {
 			reqPath = "/_ingest/geoip/database"
 		}
@@ -5618,7 +5792,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		if id == "" {
 			return nil, fmt.Errorf("ingest.delete_geoip_database requires id parameter")
 		}
-		reqPath = "/_ingest/geoip/database/" + id
+		reqPath = "/_ingest/geoip/database/" + escapeIDSeg(id)
 
 	case "ilm.migrate_to_data_tiers":
 		method = http.MethodPost
@@ -5626,7 +5800,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "cluster.resolve_cluster", "indices.resolve_cluster":
 		method = http.MethodGet
-		if name := popString("name"); name != "" {
+		if name := popPath("name"); name != "" {
 			reqPath = "/_resolve/cluster/" + name
 		} else {
 			reqPath = "/_resolve/cluster"
@@ -5723,6 +5897,8 @@ func joinParamValue(v any) string {
 	switch val := v.(type) {
 	case string:
 		return val
+	case []string:
+		return strings.Join(val, ",")
 	case []any:
 		parts := make([]string, 0, len(val))
 		for _, item := range val {
@@ -5732,6 +5908,70 @@ func joinParamValue(v any) string {
 	default:
 		return fmt.Sprintf("%v", val)
 	}
+}
+
+func isDateMathSafeByte(b byte) bool {
+	return (b >= 'A' && b <= 'Z') ||
+		(b >= 'a' && b <= 'z') ||
+		(b >= '0' && b <= '9') ||
+		b == '-' || b == '.' || b == '_' || b == '~' || b == '*'
+}
+
+func encodeDateMathSpan(span string) string {
+	var sb strings.Builder
+	sb.Grow(len(span) * 2)
+	for i := 0; i < len(span); i++ {
+		b := span[i]
+		if isDateMathSafeByte(b) {
+			sb.WriteByte(b)
+		} else {
+			_, _ = fmt.Fprintf(&sb, "%%%02X", b)
+		}
+	}
+	return sb.String()
+}
+
+func joinParamPath(v any) string {
+	raw := joinParamValue(v)
+	if !strings.Contains(raw, "<") {
+		return raw
+	}
+	var sb strings.Builder
+	sb.Grow(len(raw))
+	for i := 0; i < len(raw); {
+		if raw[i] != '<' {
+			sb.WriteByte(raw[i])
+			i++
+			continue
+		}
+		braceDepth := 0
+		end := -1
+		for j := i + 1; j < len(raw); j++ {
+			switch raw[j] {
+			case '{':
+				braceDepth++
+			case '}':
+				if braceDepth > 0 {
+					braceDepth--
+				}
+			case '>':
+				if braceDepth == 0 {
+					end = j
+				}
+			}
+			if end >= 0 {
+				break
+			}
+		}
+		if end < 0 {
+			sb.WriteByte(raw[i])
+			i++
+			continue
+		}
+		sb.WriteString(encodeDateMathSpan(raw[i : end+1]))
+		i = end + 1
+	}
+	return sb.String()
 }
 
 func paramString(m map[string]any, key string) string {
@@ -5782,11 +6022,28 @@ func sanitizeRawReqPath(reqPath string) string {
 	return sb.String()
 }
 
-func escapeIDSeg(id string) string {
-	if id == "" {
+func escapeIDSeg(raw string) string {
+	if raw == "" {
 		return ""
 	}
-	return strings.ReplaceAll(sanitizeRawReqPath(id), "/", "%2F")
+	escaped := url.PathEscape(raw)
+	escaped = strings.ReplaceAll(escaped, "#", "%23")
+	escaped = strings.ReplaceAll(escaped, "?", "%3F")
+	return escaped
+}
+
+func escapeCommaIDSegs(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	if !strings.Contains(raw, ",") {
+		return escapeIDSeg(raw)
+	}
+	parts := strings.Split(raw, ",")
+	for i, part := range parts {
+		parts[i] = escapeIDSeg(part)
+	}
+	return strings.Join(parts, ",")
 }
 
 func (c *runnerContext) rawHTTP(method, reqPath string, query url.Values, body []byte, headers map[string]string) (int, string, error) {
@@ -5850,6 +6107,9 @@ func normalizeJSONNumbers(v any) any {
 	case json.Number:
 		if iv, err := val.Int64(); err == nil {
 			return iv
+		}
+		if uv, err := strconv.ParseUint(val.String(), 10, 64); err == nil {
+			return uv
 		}
 		if fv, err := val.Float64(); err == nil {
 			return fv
@@ -5996,6 +6256,29 @@ func (c *runnerContext) expandStashPath(s string) string {
 	})
 }
 
+func shouldSkipSection(skip *SkipSpec) (string, bool) {
+	if skip == nil {
+		return "", false
+	}
+	for _, feat := range skip.Features {
+		if !supportedRunnerFeatures[feat] {
+			r := skip.Reason
+			if r == "" {
+				r = fmt.Sprintf("unsupported feature %s", feat)
+			}
+			return r, true
+		}
+	}
+	if skip.Version != "" && versionInRange(proxyTargetVersion, skip.Version) {
+		r := skip.Reason
+		if r == "" {
+			r = fmt.Sprintf("version %s in skip range %s", proxyTargetVersion, skip.Version)
+		}
+		return r, true
+	}
+	return "", false
+}
+
 func (c *runnerContext) execSkip(rawVal any) error {
 	pairs, err := extractFieldPairs("skip", rawVal)
 	if err != nil {
@@ -6024,20 +6307,11 @@ func (c *runnerContext) execSkip(rawVal any) error {
 			}
 		}
 	}
-	for _, feat := range features {
-		if !supportedRunnerFeatures[feat] {
-			r := reason
-			if r == "" {
-				r = fmt.Sprintf("unsupported feature %s", feat)
-			}
-			return &errSkipSection{reason: r}
-		}
-	}
-	if versionSpec != "" && versionInRange(proxyTargetVersion, versionSpec) {
-		r := reason
-		if r == "" {
-			r = fmt.Sprintf("version %s in skip range %s", proxyTargetVersion, versionSpec)
-		}
+	if r, skipped := shouldSkipSection(&SkipSpec{
+		Version:  versionSpec,
+		Reason:   reason,
+		Features: features,
+	}); skipped {
 		return &errSkipSection{reason: r}
 	}
 	return nil
@@ -6727,7 +7001,123 @@ func cleanTextString(s string) string {
 	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
+type exactInt struct {
+	neg bool
+	mag uint64
+}
+
+func int64ToExactInt(v int64) exactInt {
+	if v >= 0 {
+		return exactInt{mag: uint64(v)}
+	}
+	if v == math.MinInt64 {
+		return exactInt{neg: true, mag: uint64(1) << 63}
+	}
+	pos := -v
+	if pos >= 0 {
+		return exactInt{neg: true, mag: uint64(pos)}
+	}
+	return exactInt{}
+}
+
+func parseExactIntString(s string) (exactInt, bool) {
+	if s == "" || strings.ContainsRune(s, '_') || strings.ContainsAny(s, ".eE") {
+		return exactInt{}, false
+	}
+	if iv, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return int64ToExactInt(iv), true
+	}
+	if s[0] != '-' {
+		unsignedCand := strings.TrimPrefix(s, "+")
+		if unsignedCand != "" {
+			if uv, err := strconv.ParseUint(unsignedCand, 10, 64); err == nil {
+				return exactInt{mag: uv}, true
+			}
+		}
+	}
+	return exactInt{}, false
+}
+
+func toExactInt(v any, allowString bool) (exactInt, bool) {
+	switch val := v.(type) {
+	case int:
+		return int64ToExactInt(int64(val)), true
+	case int64:
+		return int64ToExactInt(val), true
+	case uint:
+		return exactInt{mag: uint64(val)}, true
+	case uint64:
+		return exactInt{mag: val}, true
+	case json.Number:
+		return parseExactIntString(val.String())
+	case string:
+		if !allowString {
+			return exactInt{}, false
+		}
+		return parseExactIntString(strings.TrimSpace(val))
+	default:
+		return exactInt{}, false
+	}
+}
+
+func compareExactInt(a, b exactInt) int {
+	if a.mag == 0 && b.mag == 0 {
+		return 0
+	}
+	if a.neg != b.neg {
+		if a.neg {
+			return -1
+		}
+		return 1
+	}
+	if a.mag == b.mag {
+		return 0
+	}
+	if a.neg {
+		if a.mag > b.mag {
+			return -1
+		}
+		return 1
+	}
+	if a.mag < b.mag {
+		return -1
+	}
+	return 1
+}
+
+func exactIntToRat(v exactInt) *big.Rat {
+	bi := new(big.Int).SetUint64(v.mag)
+	if v.neg {
+		bi.Neg(bi)
+	}
+	return new(big.Rat).SetInt(bi)
+}
+
+func toNumericFloat64(v any) (float64, bool) {
+	switch val := v.(type) {
+	case int:
+		return float64(val), true
+	case int64:
+		return float64(val), true
+	case uint:
+		return float64(val), true
+	case uint64:
+		return float64(val), true
+	case float32:
+		return float64(val), true
+	case float64:
+		return val, true
+	case json.Number:
+		f, err := val.Float64()
+		return f, err == nil
+	default:
+		return 0, false
+	}
+}
+
 func valuesEqual(a, b any) bool {
+	a = ToNative(a)
+	b = ToNative(b)
 	if a == nil && b == nil {
 		return true
 	}
@@ -6742,12 +7132,37 @@ func valuesEqual(a, b any) bool {
 		}
 		return re.MatchString(fmt.Sprintf("%v", a))
 	}
-	if af, aOk := toFloat64(a); aOk {
-		if bf, bOk := toFloat64(b); bOk {
-			return math.Abs(af-bf) <= 1e-6
+	if as, ok := a.(string); ok {
+		bs, bOk := b.(string)
+		return bOk && as == bs
+	}
+	if _, ok := b.(string); ok {
+		return false
+	}
+	if ai, aIntOk := toExactInt(a, false); aIntOk {
+		if bi, bIntOk := toExactInt(b, false); bIntOk {
+			return compareExactInt(ai, bi) == 0
 		}
 	}
+	if af, aOk := toNumericFloat64(a); aOk {
+		if bf, bOk := toNumericFloat64(b); bOk {
+			if math.IsNaN(af) || math.IsNaN(bf) {
+				return false
+			}
+			if math.IsInf(af, 0) || math.IsInf(bf, 0) {
+				return af == bf
+			}
+			return math.Abs(af-bf) <= 1e-6
+		}
+		return false
+	}
+	if _, bOk := toNumericFloat64(b); bOk {
+		return false
+	}
 	switch av := a.(type) {
+	case bool:
+		bv, ok := b.(bool)
+		return ok && av == bv
 	case map[string]any:
 		bv, ok := b.(map[string]any)
 		if !ok {
@@ -6941,10 +7356,22 @@ func isTruthy(v any) bool {
 		return val != 0
 	case int64:
 		return val != 0
-	case float64:
+	case uint:
 		return val != 0
+	case uint64:
+		return val != 0
+	case float64:
+		return val != 0 && !math.IsNaN(val)
 	case string:
 		return val != "" && val != "false" && val != "0"
+	case []any:
+		return len(val) > 0
+	case map[string]any:
+		return len(val) > 0
+	case *OrderedMap:
+		return val != nil && len(val.Fields) > 0
+	case OrderedMap:
+		return len(val.Fields) > 0
 	default:
 		return true
 	}
@@ -7051,23 +7478,76 @@ func compareStringValues(a, b string) int {
 	return strings.Compare(a, b)
 }
 
+func compareAsNumbers(a, b any) (int, bool) {
+	aInt, aIntOk := toExactInt(a, true)
+	bInt, bIntOk := toExactInt(b, true)
+	if aIntOk && bIntOk {
+		return compareExactInt(aInt, bInt), true
+	}
+	if aIntOk {
+		bf, bFloatOk := toFloat64(b)
+		if !bFloatOk || math.IsNaN(bf) {
+			return 0, false
+		}
+		if math.IsInf(bf, 1) {
+			return -1, true
+		}
+		if math.IsInf(bf, -1) {
+			return 1, true
+		}
+		rb := new(big.Rat).SetFloat64(bf)
+		if rb == nil {
+			return 0, false
+		}
+		return exactIntToRat(aInt).Cmp(rb), true
+	}
+	if bIntOk {
+		af, aFloatOk := toFloat64(a)
+		if !aFloatOk || math.IsNaN(af) {
+			return 0, false
+		}
+		if math.IsInf(af, 1) {
+			return 1, true
+		}
+		if math.IsInf(af, -1) {
+			return -1, true
+		}
+		ra := new(big.Rat).SetFloat64(af)
+		if ra == nil {
+			return 0, false
+		}
+		return ra.Cmp(exactIntToRat(bInt)), true
+	}
+	af, aOk := toFloat64(a)
+	bf, bOk := toFloat64(b)
+	if !aOk || !bOk || math.IsNaN(af) || math.IsNaN(bf) {
+		return 0, false
+	}
+	switch {
+	case af < bf:
+		return -1, true
+	case af > bf:
+		return 1, true
+	default:
+		return 0, true
+	}
+}
+
 func checkSingleCompare(op, fieldPath string, val, expectedVal, rawExpected any) error {
-	actualNum, aNumOk := toFloat64(val)
-	thresholdNum, tNumOk := toFloat64(expectedVal)
 	var pass bool
-	if aNumOk && tNumOk {
+	if cmp, ok := compareAsNumbers(val, expectedVal); ok {
 		switch op {
 		case "gt":
-			pass = actualNum > thresholdNum
+			pass = cmp > 0
 		case "gte":
-			pass = actualNum >= thresholdNum
+			pass = cmp >= 0
 		case "lt":
-			pass = actualNum < thresholdNum
+			pass = cmp < 0
 		case "lte":
-			pass = actualNum <= thresholdNum
+			pass = cmp <= 0
 		}
 		if !pass {
-			return fmt.Errorf("%s %q failed: actual %v is not %s %v", op, fieldPath, actualNum, op, thresholdNum)
+			return fmt.Errorf("%s %q failed: actual %v is not %s %v", op, fieldPath, val, op, expectedVal)
 		}
 		return nil
 	}
@@ -7075,7 +7555,7 @@ func checkSingleCompare(op, fieldPath string, val, expectedVal, rawExpected any)
 	actStr, aStrOk := val.(string)
 	expStr, eStrOk := expectedVal.(string)
 	if !aStrOk || !eStrOk {
-		if !tNumOk {
+		if _, tNumOk := toFloat64(expectedVal); !tNumOk {
 			return fmt.Errorf("%s %q: threshold %v is not comparable with %v", op, fieldPath, rawExpected, val)
 		}
 		return fmt.Errorf("%s %q: actual value %v (%T) is not a number", op, fieldPath, val, val)
@@ -7143,23 +7623,57 @@ func toInt(v any) (int, bool) {
 	case int:
 		return val, true
 	case int64:
+		if val < int64(math.MinInt) || val > int64(math.MaxInt) {
+			return 0, false
+		}
+		return int(val), true
+	case uint:
+		if val > uint(math.MaxInt) {
+			return 0, false
+		}
+		return int(val), true
+	case uint64:
+		if val > uint64(math.MaxInt) {
+			return 0, false
+		}
 		return int(val), true
 	case float64:
+		if math.IsNaN(val) || math.IsInf(val, 0) || val < float64(math.MinInt) || val > float64(math.MaxInt) {
+			return 0, false
+		}
 		return int(val), true
 	case json.Number:
 		if iv, err := val.Int64(); err == nil {
+			if iv < int64(math.MinInt) || iv > int64(math.MaxInt) {
+				return 0, false
+			}
 			return int(iv), true
 		}
+		if uv, err := strconv.ParseUint(val.String(), 10, 64); err == nil {
+			if uv > uint64(math.MaxInt) {
+				return 0, false
+			}
+			return int(uv), true
+		}
 		if fv, err := val.Float64(); err == nil {
+			if math.IsNaN(fv) || math.IsInf(fv, 0) || fv < float64(math.MinInt) || fv > float64(math.MaxInt) {
+				return 0, false
+			}
 			return int(fv), true
 		}
 		return 0, false
 	case string:
 		trimmed := strings.TrimSpace(val)
+		if strings.ContainsRune(trimmed, '_') || isBareInfOrNaN(trimmed) {
+			return 0, false
+		}
 		if iv, err := strconv.Atoi(trimmed); err == nil {
 			return iv, true
 		}
 		if fv, err := strconv.ParseFloat(trimmed, 64); err == nil {
+			if math.IsNaN(fv) || math.IsInf(fv, 0) || fv < float64(math.MinInt) || fv > float64(math.MaxInt) {
+				return 0, false
+			}
 			return int(fv), true
 		}
 		return 0, false
@@ -7174,14 +7688,24 @@ func toFloat64(v any) (float64, bool) {
 		return float64(val), true
 	case int64:
 		return float64(val), true
+	case uint:
+		return float64(val), true
+	case uint64:
+		return float64(val), true
+	case float32:
+		return float64(val), true
 	case float64:
-		return val, true
+		return val, !math.IsNaN(val)
 	case json.Number:
 		f, err := val.Float64()
-		return f, err == nil
+		return f, err == nil && !math.IsNaN(f) && !math.IsInf(f, 0)
 	case string:
-		f, err := strconv.ParseFloat(strings.TrimSpace(val), 64)
-		return f, err == nil
+		trimmed := strings.TrimSpace(val)
+		if trimmed == "" || strings.ContainsRune(trimmed, '_') || isBareInfOrNaN(trimmed) {
+			return 0, false
+		}
+		f, err := strconv.ParseFloat(trimmed, 64)
+		return f, err == nil && !math.IsNaN(f) && !math.IsInf(f, 0)
 	default:
 		return 0, false
 	}

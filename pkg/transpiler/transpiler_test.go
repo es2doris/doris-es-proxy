@@ -949,7 +949,7 @@ func TestTranspilerRound28ComprehensiveCoverage(t *testing.T) {
 			"bool": {
 				"must": [
 					{"simple_query_string": {"query": "\"error\" + (timeout | retry) -fatal*", "fields": ["title^2", "service"]}},
-					{"combined_fields": {"query": "checkout prod", "fields": ["title", "service"], "operator": "and"}},
+					{"combined_fields": {"query": "checkout prod", "fields": ["title"], "operator": "and"}},
 					{"match_bool_prefix": {"title": {"query": "quick brown fox", "operator": "and"}}},
 					{"match_phrase_prefix": {"title": {"query": "quick br", "slop": 1}}},
 					{"terms_set": {"tags": {"terms": ["go", "doris"], "minimum_should_match_script": {"source": "Math.min(params.num_terms, 1)"}}}}
@@ -1699,7 +1699,7 @@ func TestRound31BugFixesAndUntestedSubsystems(t *testing.T) {
 					{"multi_match": {"query": "payment gateway", "fields": ["svc_name", "svc_region"], "type": "phrase", "slop": 1}},
 					{"multi_match": {"query": "payment gateway", "fields": ["svc_name", "svc_region"], "type": "phrase_prefix"}},
 					{"multi_match": {"query": "payment gateway", "fields": ["svc_name", "svc_region"], "type": "bool_prefix"}},
-					{"combined_fields": {"query": "payment api", "fields": ["svc_name", "svc_region"], "operator": "or"}},
+					{"combined_fields": {"query": "payment api", "fields": ["svc_name"], "operator": "or"}},
 					{"simple_query_string": {"query": "\"payment api\" +gateway -legacy | status:(ok|warn) pay* ~2", "fields": ["svc_name^2", "status"]}},
 					{"constant_score": {"filter": {"term": {"status": "ok"}}, "boost": 2.5}},
 					{
@@ -3556,8 +3556,8 @@ func TestRound50TranspilerGeoPolygonRangeContainsNestedSpanSortAndTermsSet(t *te
 		}
 	}`), &spanNotQ)
 	cqSNot := tr.CompileQuery(&spanNotQ, false, nil)
-	if !strings.Contains(cqSNot.WhereSQL, "NOT COALESCE(") {
-		t.Fatalf("F14 expected span_not to use NOT COALESCE(..., FALSE), got %s", cqSNot.WhereSQL)
+	if !strings.Contains(cqSNot.WhereSQL, "(`f__title` IS NULL OR NOT (`f__title` MATCH_ALL 'lazy'))") {
+		t.Fatalf("F14 expected span_not to use NULL-safe (`f__title` IS NULL OR NOT (...)), got %s", cqSNot.WhereSQL)
 	}
 
 	// F16: Sort numeric_type cast and _geo_distance validation / missing
@@ -4405,8 +4405,9 @@ func TestRound56TranspilerAndLuceneF15ToF19(t *testing.T) {
 	}
 	_ = json.Unmarshal([]byte(`{"range":{"ip_addr":{"gte":"2001:db8::2","lte":"2001:db8::10"}}}`), &qIPv6Range)
 	wIPv6Range := tr.CompileQuery(&qIPv6Range, false, nil).WhereSQL
-	if !strings.Contains(wIPv6Range, "HEX(IPV6_STRING_TO_NUM_OR_NULL(`f__ip_addr`)) >= '20010DB8000000000000000000000002'") ||
-		!strings.Contains(wIPv6Range, "HEX(IPV6_STRING_TO_NUM_OR_NULL(`f__ip_addr`)) <= '20010DB8000000000000000000000010'") {
+	expectedIPHexCol := "IF(IPV4_STRING_TO_NUM_OR_NULL(`f__ip_addr`) IS NOT NULL, CONCAT('00000000000000000000FFFF', LPAD(HEX(IPV4_STRING_TO_NUM_OR_NULL(`f__ip_addr`)), 8, '0')), HEX(IPV6_STRING_TO_NUM_OR_NULL(`f__ip_addr`)))"
+	if !strings.Contains(wIPv6Range, expectedIPHexCol+" >= '20010DB8000000000000000000000002'") ||
+		!strings.Contains(wIPv6Range, expectedIPHexCol+" <= '20010DB8000000000000000000000010'") {
 		t.Fatalf("F16 expected 32-char uppercase hex IPv6 range SQL, got %s", wIPv6Range)
 	}
 	_ = json.Unmarshal([]byte(`{"nested":{"path":"items","query":{"term":{"items.nip":"2001:0db8:0:0:0:0:0:1"}}}}`), &qNestedIP)
@@ -4784,5 +4785,208 @@ func TestRound57TranspilerAndLuceneCompliance(t *testing.T) {
 		if _, err := tr.BuildSearchPlan(&sr); err == nil || !strings.Contains(err.Error(), "parse_exception") {
 			t.Fatalf("F19 expected parse_exception for %s, got %v", rawBad, err)
 		}
+	}
+}
+
+func TestRound58Transpiler_F10ToF19(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"dr": {"type": "date_range"},
+			"client_ip": {"type": "ip"},
+			"ts_nano": {"type": "date_nanos"},
+			"lat_hist": {"type": "histogram"},
+			"pr_pos": {"type": "rank_feature", "positive_score_impact": true},
+			"pr_neg": {"type": "rank_feature", "positive_score_impact": false},
+			"topics": {"type": "rank_features"},
+			"sayt2": {"type": "search_as_you_type", "max_shingle_size": 2},
+			"sayt4": {"type": "search_as_you_type", "max_shingle_size": 4},
+			"title": {"type": "text", "analyzer": "standard"},
+			"summary": {"type": "text", "analyzer": "standard"},
+			"ws_body": {"type": "text", "analyzer": "whitespace"},
+			"kw": {"type": "keyword"},
+			"num": {"type": "long"}
+		}
+	}`), &spec); err != nil {
+		t.Fatal(err)
+	}
+	idxSchema := schema.CompileIndexSchema("es_db", "r58_tr", &spec)
+	tr := NewTranspiler(idxSchema, TranspilerOptions{})
+
+	// F10: date_range exclusive gt query bound rounds up to end-of-day before > comparison
+	var qF10 esast.Query
+	if err := json.Unmarshal([]byte(`{"range":{"dr":{"gt":"2025-01-02"}}}`), &qF10); err != nil {
+		t.Fatal(err)
+	}
+	cpF10 := tr.CompileQuery(&qF10, false, nil)
+	// 2025-01-02T23:59:59.999Z + 1ms = 2025-01-03T00:00:00.000Z = 1735862400000
+	if !strings.Contains(cpF10.WhereSQL, "1735862400000") {
+		t.Fatalf("F10 expected gt:2025-01-02 to round up +1ms to 1735862400000, got %s", cpF10.WhereSQL)
+	}
+
+	// F11: ip canonical 128-bit SQL expression across range, ip_range, sort, missing, search_after
+	var srF11 esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {"range": {"client_ip": {"gte": "::1", "lte": "2001:db8::1"}}},
+		"sort": [{"client_ip": {"order": "asc", "missing": "10.0.0.1"}}],
+		"search_after": ["192.168.1.1"],
+		"aggs": {"ip_buckets": {"ip_range": {"field": "client_ip", "ranges": [{"from": "::1", "to": "10.0.0.255"}]}}}
+	}`), &srF11); err != nil {
+		t.Fatal(err)
+	}
+	planF11, err := tr.BuildSearchPlan(&srF11)
+	if err != nil {
+		t.Fatalf("F11 BuildSearchPlan failed: %v", err)
+	}
+	if !strings.Contains(planF11.HitsSQL, "00000000000000000000FFFF") || !strings.Contains(planF11.AggsSQL, "00000000000000000000FFFF") {
+		t.Fatalf("F11 expected canonical IPv4-mapped 128-bit hex in HitsSQL and AggsSQL, got hits=%s aggs=%s", planF11.HitsSQL, planF11.AggsSQL)
+	}
+	var srBadIPMissing esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"sort":[{"client_ip":{"order":"asc","missing":"not_an_ip"}}]}`), &srBadIPMissing)
+	if _, err := tr.BuildSearchPlan(&srBadIPMissing); err == nil || !strings.Contains(err.Error(), "illegal_argument_exception") {
+		t.Fatalf("F11 expected invalid ip sort missing to fail with illegal_argument_exception, got %v", err)
+	}
+
+	// F12: date_nanos nanosecond precision in term, range, sort, search_after, date_histogram (/ 1000000)
+	var srF12 esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {"bool": {"filter": [
+			{"term": {"ts_nano": "2025-01-02T03:04:05.123456789Z"}},
+			{"range": {"ts_nano": {"gt": "2025-01-02T03:04:05.123456000Z"}}}
+		]}},
+		"sort": [{"ts_nano": {"order": "asc"}}],
+		"search_after": ["2025-01-02T03:04:05.123456100Z"],
+		"aggs": {"per_sec": {"date_histogram": {"field": "ts_nano", "fixed_interval": "1s"}}}
+	}`), &srF12); err != nil {
+		t.Fatal(err)
+	}
+	planF12, err := tr.BuildSearchPlan(&srF12)
+	if err != nil {
+		t.Fatalf("F12 BuildSearchPlan failed: %v", err)
+	}
+	if !strings.Contains(planF12.HitsSQL, "123456789") || !strings.Contains(planF12.HitsSQL, "123456100") {
+		t.Fatalf("F12 expected exact nanosecond literals in HitsSQL, got %s", planF12.HitsSQL)
+	}
+	if !strings.Contains(planF12.AggsSQL, "1000000") {
+		t.Fatalf("F12 expected date_histogram on date_nanos to scale by 1000000, got %s", planF12.AggsSQL)
+	}
+
+	// F13: histogram range query + count-weighted aggs + disallowed query/sort/agg rejection
+	var srF13 esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {"range": {"lat_hist": {"gte": 10, "lt": 50}}},
+		"aggs": {
+			"mn": {"min": {"field": "lat_hist"}},
+			"mx": {"max": {"field": "lat_hist"}},
+			"sm": {"sum": {"field": "lat_hist"}},
+			"av": {"avg": {"field": "lat_hist"}},
+			"vc": {"value_count": {"field": "lat_hist"}},
+			"st": {"stats": {"field": "lat_hist"}},
+			"pc": {"percentiles": {"field": "lat_hist"}},
+			"pr": {"percentile_ranks": {"field": "lat_hist", "values": [20, 40]}},
+			"bp": {"boxplot": {"field": "lat_hist"}},
+			"hb": {"histogram": {"field": "lat_hist", "interval": 10}}
+		}
+	}`), &srF13); err != nil {
+		t.Fatal(err)
+	}
+	planF13, err := tr.BuildSearchPlan(&srF13)
+	if err != nil {
+		t.Fatalf("F13 BuildSearchPlan failed: %v", err)
+	}
+	if !strings.Contains(planF13.HitsSQL, "['_h']") || !strings.Contains(planF13.AggsSQL, "PERCENTILE_APPROX_WEIGHTED") {
+		t.Fatalf("F13 expected _h range and PERCENTILE_APPROX_WEIGHTED aggs, got hits=%s aggs=%s", planF13.HitsSQL, planF13.AggsSQL)
+	}
+	for _, badHistReq := range []string{
+		`{"query":{"term":{"lat_hist":10}}}`,
+		`{"query":{"prefix":{"lat_hist":"1"}}}`,
+		`{"sort":[{"lat_hist":"asc"}]}`,
+		`{"size":0,"aggs":{"t":{"terms":{"field":"lat_hist"}}}}`,
+		`{"size":0,"aggs":{"c":{"cardinality":{"field":"lat_hist"}}}}`,
+		`{"size":0,"aggs":{"es":{"extended_stats":{"field":"lat_hist"}}}}`,
+	} {
+		var badSR esast.SearchRequest
+		_ = json.Unmarshal([]byte(badHistReq), &badSR)
+		if _, err := tr.BuildSearchPlan(&badSR); err == nil {
+			t.Fatalf("F13 expected disallowed histogram operation %s to fail", badHistReq)
+		}
+	}
+
+	// F14: rank_feature inverse scoring + log rejection when positive_score_impact=false + disallowed term/range/sort/agg
+	for _, okRF := range []string{
+		`{"query":{"rank_feature":{"field":"pr_pos","log":{"scaling_factor":2}}}}`,
+		`{"query":{"rank_feature":{"field":"pr_neg"}}}`,
+		`{"query":{"rank_feature":{"field":"pr_neg","saturation":{"pivot":5}}}}`,
+		`{"query":{"rank_feature":{"field":"pr_neg","sigmoid":{"pivot":5,"exponent":0.6}}}}`,
+		`{"query":{"rank_feature":{"field":"pr_neg","linear":{}}}}`,
+	} {
+		var sr esast.SearchRequest
+		_ = json.Unmarshal([]byte(okRF), &sr)
+		if _, err := tr.BuildSearchPlan(&sr); err != nil {
+			t.Fatalf("F14 expected %s to succeed, got %v", okRF, err)
+		}
+	}
+	for _, badRF := range []string{
+		`{"query":{"rank_feature":{"field":"pr_neg","log":{"scaling_factor":2}}}}`,
+		`{"query":{"term":{"pr_pos":1.0}}}`,
+		`{"query":{"range":{"pr_pos":{"gt":1.0}}}}`,
+		`{"sort":[{"pr_pos":"desc"}]}`,
+		`{"size":0,"aggs":{"a":{"avg":{"field":"pr_pos"}}}}`,
+		`{"query":{"term":{"topics.math":1.0}}}`,
+		`{"sort":[{"topics.math":"desc"}]}`,
+		`{"size":0,"aggs":{"a":{"avg":{"field":"topics.math"}}}}`,
+	} {
+		var sr esast.SearchRequest
+		_ = json.Unmarshal([]byte(badRF), &sr)
+		if _, err := tr.BuildSearchPlan(&sr); err == nil {
+			t.Fatalf("F14 expected %s to fail", badRF)
+		}
+	}
+
+	// F15: multi_match bool_prefix auto-subfield expansion respects max_shingle_size
+	var srSayt2, srSayt4 esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"multi_match":{"query":"quick br","type":"bool_prefix","fields":["sayt2"]}}}`), &srSayt2)
+	_ = json.Unmarshal([]byte(`{"query":{"multi_match":{"query":"quick br","type":"bool_prefix","fields":["sayt4"]}}}`), &srSayt4)
+	if _, err := tr.BuildSearchPlan(&srSayt2); err != nil {
+		t.Fatalf("F15 bool_prefix sayt2 failed: %v", err)
+	}
+	if _, err := tr.BuildSearchPlan(&srSayt4); err != nil {
+		t.Fatalf("F15 bool_prefix sayt4 failed: %v", err)
+	}
+
+	// F18: combined_fields text-only & compatible search analyzer enforcement
+	var okCF esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"combined_fields":{"query":"rust engine","fields":["title^2","summary"]}}}`), &okCF)
+	if _, err := tr.BuildSearchPlan(&okCF); err != nil {
+		t.Fatalf("F18 expected valid combined_fields on compatible text fields, got %v", err)
+	}
+	for _, badCF := range []string{
+		`{"query":{"combined_fields":{"query":"rust","fields":["title","kw"]}}}`,
+		`{"query":{"combined_fields":{"query":"rust","fields":["num"]}}}`,
+		`{"query":{"combined_fields":{"query":"rust","fields":["title","ws_body"]}}}`,
+	} {
+		var sr esast.SearchRequest
+		_ = json.Unmarshal([]byte(badCF), &sr)
+		if _, err := tr.BuildSearchPlan(&sr); err == nil || !strings.Contains(err.Error(), "illegal_argument_exception") {
+			t.Fatalf("F18 expected %s to fail with illegal_argument_exception, got %v", badCF, err)
+		}
+	}
+
+	// F19: must_not De Morgan NULL-safe negation on multi_match, match_bool_prefix, compound AND/OR, and dynamic _doc MATCH_*
+	var srF19 esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {"bool": {"must_not": [
+			{"multi_match": {"query": "forbidden", "fields": ["title", "summary", "dyn_text"]}},
+			{"match_bool_prefix": {"title": "alpha beta"}}
+		]}}
+	}`), &srF19); err != nil {
+		t.Fatal(err)
+	}
+	planF19, err := tr.BuildSearchPlan(&srF19)
+	if err != nil {
+		t.Fatalf("F19 BuildSearchPlan failed: %v", err)
+	}
+	if !strings.Contains(planF19.HitsSQL, "IS NULL OR NOT") || strings.Contains(planF19.HitsSQL, "COALESCE(`title` MATCH") {
+		t.Fatalf("F19 expected De Morgan NULL-safe IS NULL OR NOT without COALESCE around MATCH_*, got %s", planF19.HitsSQL)
 	}
 }

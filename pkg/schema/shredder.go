@@ -19,6 +19,7 @@ package schema
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -237,11 +238,45 @@ func ShredDocumentWithNow(
 				prunedDynamic = true
 			}
 		}
+		histogramFieldKeys := make([]string, 0)
+		for k, b := range s.Fields {
+			if b.ESType == "histogram" && b.AliasTarget == "" && !b.EnabledFalse {
+				histogramFieldKeys = append(histogramFieldKeys, k)
+			}
+		}
+		sort.Strings(histogramFieldKeys)
+		for _, k := range histogramFieldKeys {
+			b := s.Fields[k]
+			modified, err := validateAndNormalizeHistogramFieldInDoc(parsedDoc, b.SourceJSONPath, b)
+			if err != nil {
+				if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+					recordIgnored(b.ESFieldPath)
+					if deletePathInMap(parsedDoc, b.SourceJSONPath) {
+						prunedDynamic = true
+					}
+					continue
+				}
+				return nil, err
+			}
+			if modified {
+				prunedDynamic = true
+			}
+		}
 	}
 
 	for _, b := range fieldsToVisit {
 		if b.EnabledFalse {
 			continue
+		}
+		if b.ESType == "rank_feature" && hasArrayValueAtPath(parsedDoc, b.SourceJSONPath) {
+			if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+				recordIgnored(b.ESFieldPath)
+				if isPrimaryFieldBinding(b) {
+					deferDeletePath(b.SourceJSONPath)
+				}
+				continue
+			}
+			return nil, fmt.Errorf("mapper_parsing_exception: [rank_feature] field [%s] does not support arrays of values", b.ESFieldPath)
 		}
 		hasObjAtPath := false
 		if isStrictLeafFieldWithoutSubprops(s, b) && hasObjectValueAtPath(parsedDoc, b.SourceJSONPath) {
@@ -445,7 +480,7 @@ func ShredDocumentWithNow(
 							continue
 						}
 					}
-					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && (b.Coerce == nil || *b.Coerce) && (b.ESType == "ip" || b.ESType == "geo_point" || (b.DorisType != DorisString && b.DorisType != DorisVarchar)) {
+					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && b.ESType != "rank_feature" && (b.Coerce == nil || *b.Coerce) && (b.ESType == "ip" || b.ESType == "geo_point" || (b.DorisType != DorisString && b.DorisType != DorisVarchar)) {
 						continue
 					}
 					coerced := coerceScalarBindingForDoris(rv, b, getNow())
@@ -456,11 +491,6 @@ func ShredDocumentWithNow(
 							continue
 						}
 						return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", b.ESFieldPath, b.ESType)
-					}
-					if b.ESType == "date_nanos" {
-						if iv, ok := coerced.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
-							coerced = iv / 1_000_000
-						}
 					}
 					validLeafs = append(validLeafs, rv)
 					if firstVal == nil {
@@ -481,11 +511,6 @@ func ShredDocumentWithNow(
 					}
 					if nvAllowed {
 						firstVal = coerceScalarBindingForDoris(b.NullValue, b, getNow())
-						if b.ESType == "date_nanos" {
-							if iv, ok := firstVal.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
-								firstVal = iv / 1_000_000
-							}
-						}
 					}
 				}
 				if firstVal != nil {
@@ -513,7 +538,7 @@ func ShredDocumentWithNow(
 				}
 			}
 			if val != nil {
-				if strVal, isStr := val.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && (b.Coerce == nil || *b.Coerce) && (b.ESType == "ip" || b.ESType == "geo_point" || (b.DorisType != DorisString && b.DorisType != DorisVarchar)) {
+				if strVal, isStr := val.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && b.ESType != "rank_feature" && (b.Coerce == nil || *b.Coerce) && (b.ESType == "ip" || b.ESType == "geo_point" || (b.DorisType != DorisString && b.DorisType != DorisVarchar)) {
 					val = nil
 				} else {
 					coerced := coerceScalarBindingForDoris(val, b, getNow())
@@ -528,11 +553,6 @@ func ShredDocumentWithNow(
 						}
 					}
 					val = coerced
-				}
-			}
-			if b.ESType == "date_nanos" {
-				if iv, ok := val.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
-					val = iv / 1_000_000
 				}
 			}
 			if val != nil {
@@ -553,7 +573,7 @@ func ShredDocumentWithNow(
 					if rv == nil {
 						continue
 					}
-					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && b.ESType != "version" && (b.Coerce == nil || *b.Coerce) {
+					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && b.ESType != "version" && b.ESType != "rank_feature" && (b.Coerce == nil || *b.Coerce) {
 						continue
 					}
 					coerced := coerceScalarBindingForDoris(rv, b, getNow())
@@ -564,11 +584,6 @@ func ShredDocumentWithNow(
 							continue
 						}
 						return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", b.ESFieldPath, b.ESType)
-					}
-					if b.ESType == "date_nanos" {
-						if iv, ok := coerced.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
-							coerced = iv / 1_000_000
-						}
 					}
 					validLeafs = append(validLeafs, rv)
 					if b.ESType == "unsigned_long" {
@@ -815,11 +830,6 @@ func ShredDocumentWithNow(
 								}
 								return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", targetField, tb.ESType)
 							}
-							if tb.ESType == "date_nanos" {
-								if iv, ok := coerced.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
-									coerced = iv / 1_000_000
-								}
-							}
 							if existing, exists := row[tb.ColumnName]; !exists || existing == nil {
 								row[tb.ColumnName] = coerced
 							}
@@ -912,11 +922,6 @@ func ShredDocumentWithNow(
 									continue
 								}
 								return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", targetField, tb.ESType)
-							}
-							if tb.ESType == "date_nanos" {
-								if iv, ok := coerced.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
-									coerced = iv / 1_000_000
-								}
 							}
 							if tb.ESType == "unsigned_long" {
 								if u, okU := parseExactUint64(rv); okU && u > uint64(math.MaxInt64) {
@@ -1039,7 +1044,7 @@ func ShredDocumentWithNow(
 
 func isTypedNonStringBinding(b FieldBinding) bool {
 	switch b.ESType {
-	case "long", "unsigned_long", "integer", "short", "byte", "token_count", "double", "float", "half_float", "scaled_float", "date", "date_nanos", "boolean", "ip", "geo_point", "version":
+	case "long", "unsigned_long", "integer", "short", "byte", "token_count", "double", "float", "half_float", "scaled_float", "rank_feature", "date", "date_nanos", "boolean", "ip", "geo_point", "version":
 		return true
 	}
 	switch b.DorisType {
@@ -1601,6 +1606,33 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 		}
 		return formatted
 	}
+	if b.ESType == "rank_feature" {
+		allowCoerce := b.Coerce == nil || *b.Coerce
+		var fv float64
+		var ok bool
+		switch v := val.(type) {
+		case float64:
+			fv, ok = v, true
+		case int:
+			fv, ok = float64(v), true
+		case int64:
+			fv, ok = float64(v), true
+		case uint64:
+			fv, ok = float64(v), true
+		case json.Number:
+			f, err := v.Float64()
+			fv, ok = f, err == nil
+		case string:
+			if allowCoerce {
+				f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+				fv, ok = f, err == nil
+			}
+		}
+		if !ok || math.IsNaN(fv) || math.IsInf(fv, 0) || fv <= 0 || fv > math.MaxFloat32 || float32(fv) <= 0 {
+			return nil
+		}
+		return fv
+	}
 	if b.ESType == "unsigned_long" {
 		allowCoerce := b.Coerce == nil || *b.Coerce
 		clampUintToInt64 := func(u uint64) int64 {
@@ -1743,41 +1775,68 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 			return nil
 		}
 	}
-	if (b.ESType == "date" || b.ESType == "date_nanos") && b.Format != "" {
+	if b.ESType == "date_nanos" {
+		if b.Coerce != nil && !*b.Coerce && b.Format != "" && !dateFormatAllowsNumericWithNoCoerce(b.Format) {
+			switch val.(type) {
+			case int, int64, float64, json.Number:
+				return nil
+			}
+		}
+		switch v := val.(type) {
+		case string:
+			if ns, ok := ParseESDateWithFormatToEpochNanos(v, b.Format, now); ok {
+				return ns
+			}
+		case int64:
+			if ns, ok := ParseESDateWithFormatToEpochNanos(strconv.FormatInt(v, 10), b.Format, now); ok {
+				return ns
+			}
+		case int:
+			if ns, ok := ParseESDateWithFormatToEpochNanos(strconv.Itoa(v), b.Format, now); ok {
+				return ns
+			}
+		case float64:
+			if !math.IsNaN(v) && !math.IsInf(v, 0) {
+				if ns, ok := ParseESDateWithFormatToEpochNanos(strconv.FormatFloat(v, 'f', -1, 64), b.Format, now); ok {
+					return ns
+				}
+			}
+		case json.Number:
+			if ns, ok := ParseESDateWithFormatToEpochNanos(v.String(), b.Format, now); ok {
+				return ns
+			}
+		}
+		return nil
+	}
+	if b.ESType == "date" && b.Format != "" {
 		if b.Coerce != nil && !*b.Coerce && !dateFormatAllowsNumericWithNoCoerce(b.Format) {
 			switch val.(type) {
 			case int, int64, float64, json.Number:
 				return nil
 			}
 		}
-		normalizeNanos := func(ms int64) int64 {
-			if b.ESType == "date_nanos" && (ms > 1_000_000_000_000_000 || ms < -1_000_000_000_000_000) {
-				return ms / 1_000_000
-			}
-			return ms
-		}
 		switch v := val.(type) {
 		case string:
 			if ms, ok := ParseESDateWithFormatToEpochMillis(v, b.Format, now); ok {
-				return normalizeNanos(ms)
+				return ms
 			}
 		case int64:
 			if ms, ok := ParseESDateWithFormatToEpochMillis(strconv.FormatInt(v, 10), b.Format, now); ok {
-				return normalizeNanos(ms)
+				return ms
 			}
 		case int:
 			if ms, ok := ParseESDateWithFormatToEpochMillis(strconv.Itoa(v), b.Format, now); ok {
-				return normalizeNanos(ms)
+				return ms
 			}
 		case float64:
 			if !math.IsNaN(v) && !math.IsInf(v, 0) {
 				if ms, ok := ParseESDateWithFormatToEpochMillis(strconv.FormatFloat(v, 'f', -1, 64), b.Format, now); ok {
-					return normalizeNanos(ms)
+					return ms
 				}
 			}
 		case json.Number:
 			if ms, ok := ParseESDateWithFormatToEpochMillis(v.String(), b.Format, now); ok {
-				return normalizeNanos(ms)
+				return ms
 			}
 		}
 		return nil
@@ -1799,10 +1858,6 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 	case "half_float":
 		if fv, ok := coerced.(float64); ok && !math.IsNaN(fv) && !math.IsInf(fv, 0) && math.Abs(fv) > 65504.0 {
 			return nil
-		}
-	case "date_nanos":
-		if iv, ok := coerced.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
-			coerced = iv / 1_000_000
 		}
 	case "scaled_float":
 		if b.ScalingFactor > 0 {
@@ -2431,8 +2486,13 @@ func ParseESDateBoundWithFormatToEpochMillis(input, format string, now time.Time
 						return finalizeFormatMatch(t, false)
 					}
 				}
-			case "strict_date_optional_time", "date_optional_time", "strict_date", "date", "strict_date_hour_minute_second", "date_hour_minute_second":
+			case "strict_date_optional_time", "date_optional_time", "strict_date_optional_time_nanos", "date_optional_time_nanos", "strict_date", "date", "strict_date_hour_minute_second", "date_hour_minute_second":
 				if t, ok := parseISODateString(prefix); ok {
+					if roundUp && (!hasMath || mathExpr == "") {
+						if rt, rounded := roundUpPartialISODate(t, prefix, time.Millisecond); rounded {
+							return rt.UnixMilli(), true
+						}
+					}
 					return finalizeFormatMatch(t, isDateOnlyString(prefix))
 				}
 			default:
@@ -2448,6 +2508,347 @@ func ParseESDateBoundWithFormatToEpochMillis(input, format string, now time.Time
 		return 0, false
 	}
 	return ParseESDateBoundToEpochMillis(s, now, roundUp)
+}
+
+// ParseESDateWithFormatToEpochNanos parses a date string, integer epoch value, or date math expression
+// into signed Unix epoch nanoseconds (`int64`) for `date_nanos` fields.
+func ParseESDateWithFormatToEpochNanos(input, format string, now time.Time) (int64, bool) {
+	return ParseESDateBoundWithFormatToEpochNanos(input, format, now, false)
+}
+
+// ParseESDateBoundWithFormatToEpochNanos parses a `date_nanos` bound using an optional ES date format,
+// rounding date-only or `/unit` expressions up to `.999999999` when `roundUp` is true.
+func ParseESDateBoundWithFormatToEpochNanos(input, format string, now time.Time, roundUp bool) (int64, bool) {
+	s := strings.TrimSpace(input)
+	if s == "" {
+		return 0, false
+	}
+	if strings.HasPrefix(s, "now") {
+		return ParseESDateBoundToEpochNanos(s, now, roundUp)
+	}
+	if strings.TrimSpace(format) != "" {
+		prefix := s
+		mathExpr := ""
+		hasMath := false
+		if idx := strings.Index(s, "||"); idx >= 0 {
+			prefix = strings.TrimSpace(s[:idx])
+			mathExpr = strings.TrimSpace(s[idx+2:])
+			hasMath = true
+		}
+		finalizeFormatMatchNanos := func(base time.Time, dateOnly bool) (int64, bool) {
+			base = base.UTC()
+			if !hasMath || mathExpr == "" {
+				if roundUp && dateOnly {
+					base = base.AddDate(0, 0, 1).Add(-time.Nanosecond)
+				}
+				return safeTimeToEpochNanos(base)
+			}
+			mt, ok := applyESDateMathWithRoundNanos(base, mathExpr, roundUp)
+			if !ok {
+				return 0, false
+			}
+			if roundUp && dateOnly && !strings.Contains(mathExpr, "/") && hasOnlyCalendarDayOrLargerOffsets(mathExpr) {
+				mt = mt.AddDate(0, 0, 1).Add(-time.Nanosecond)
+			}
+			return safeTimeToEpochNanos(mt)
+		}
+		for _, rawFmt := range strings.Split(format, "||") {
+			fmtPart := strings.TrimSpace(rawFmt)
+			if fmtPart == "" {
+				continue
+			}
+			switch fmtPart {
+			case "epoch_nanos":
+				if iv, err := strconv.ParseInt(prefix, 10, 64); err == nil {
+					if !hasMath || mathExpr == "" {
+						return iv, true
+					}
+					return finalizeFormatMatchNanos(time.Unix(0, iv).UTC(), false)
+				}
+			case "epoch_millis":
+				if ns, ok := parseScaledDecimalEpochToNanos(prefix, 6, true); ok {
+					if !hasMath || mathExpr == "" {
+						return ns, true
+					}
+					return finalizeFormatMatchNanos(time.Unix(0, ns).UTC(), false)
+				}
+			case "epoch_second":
+				if ns, ok := parseScaledDecimalEpochToNanos(prefix, 9, false); ok {
+					if !hasMath || mathExpr == "" {
+						return ns, true
+					}
+					return finalizeFormatMatchNanos(time.Unix(0, ns).UTC(), false)
+				}
+			case "basic_date", "strict_basic_date":
+				if len(prefix) == 8 {
+					if t, err := time.Parse("20060102", prefix); err == nil {
+						return finalizeFormatMatchNanos(t, true)
+					}
+				}
+			case "basic_date_time", "strict_basic_date_time":
+				for _, l := range []string{"20060102T150405.999999999Z0700", "20060102T150405.000Z0700", "20060102T150405.000Z", "20060102T150405.999999999Z07:00"} {
+					if t, err := time.Parse(l, prefix); err == nil {
+						return finalizeFormatMatchNanos(t, false)
+					}
+				}
+			case "basic_date_time_no_millis", "strict_basic_date_time_no_millis":
+				for _, l := range []string{"20060102T150405Z0700", "20060102T150405Z", "20060102T150405Z07:00"} {
+					if t, err := time.Parse(l, prefix); err == nil {
+						return finalizeFormatMatchNanos(t, false)
+					}
+				}
+			case "strict_date_optional_time", "date_optional_time", "strict_date_optional_time_nanos", "date_optional_time_nanos", "strict_date", "date", "strict_date_hour_minute_second", "date_hour_minute_second":
+				if t, ok := parseISODateString(prefix); ok {
+					if roundUp && (!hasMath || mathExpr == "") {
+						if rt, rounded := roundUpPartialISODate(t, prefix, time.Nanosecond); rounded {
+							return safeTimeToEpochNanos(rt)
+						}
+					}
+					return finalizeFormatMatchNanos(t, isDateOnlyString(prefix))
+				}
+			default:
+				layout := ESDateFormatToGoLayout(fmtPart)
+				if layout != "" {
+					if t, err := time.Parse(layout, prefix); err == nil {
+						dateOnly := !strings.ContainsAny(fmtPart, "HhmsS")
+						return finalizeFormatMatchNanos(t, dateOnly)
+					}
+				}
+			}
+		}
+		return 0, false
+	}
+	return ParseESDateBoundToEpochNanos(s, now, roundUp)
+}
+
+// ParseESDateBoundToEpochNanos parses default-format `date_nanos` inputs (`strict_date_optional_time_nanos||epoch_millis`,
+// plus 19-digit epoch nanoseconds) and date math expressions into signed Unix epoch nanoseconds.
+func ParseESDateBoundToEpochNanos(input string, now time.Time, roundUp bool) (int64, bool) {
+	s := strings.TrimSpace(input)
+	if s == "" {
+		return 0, false
+	}
+	if len(s) == 4 && (strings.HasPrefix(s, "19") || strings.HasPrefix(s, "20") || strings.HasPrefix(s, "21")) {
+		if t, err := time.Parse("2006", s); err == nil {
+			t = t.UTC()
+			if roundUp {
+				t = t.AddDate(1, 0, 0).Add(-time.Nanosecond)
+			}
+			return safeTimeToEpochNanos(t)
+		}
+	}
+	if iv, err := strconv.ParseInt(s, 10, 64); err == nil {
+		if iv <= math.MaxInt64/1_000_000 && iv >= math.MinInt64/1_000_000 {
+			return iv * 1_000_000, true
+		}
+		return iv, true
+	}
+
+	var baseTime time.Time
+	var mathExpr string
+	dateOnlyPrefix := false
+
+	if strings.HasPrefix(s, "now") {
+		mathExpr = s[3:]
+		if mathExpr != "" && mathExpr[0] != '+' && mathExpr[0] != '-' && mathExpr[0] != '/' {
+			return 0, false
+		}
+		baseTime = now.UTC()
+	} else if idx := strings.Index(s, "||"); idx >= 0 {
+		prefix := strings.TrimSpace(s[:idx])
+		mathExpr = strings.TrimSpace(s[idx+2:])
+		if iv, err := strconv.ParseInt(prefix, 10, 64); err == nil {
+			if iv <= math.MaxInt64/1_000_000 && iv >= math.MinInt64/1_000_000 {
+				baseTime = time.Unix(0, iv*1_000_000).UTC()
+			} else {
+				baseTime = time.Unix(0, iv).UTC()
+			}
+		} else if t, ok := parseISODateString(prefix); ok {
+			dateOnlyPrefix = isDateOnlyString(prefix)
+			if roundUp && mathExpr == "" {
+				if rt, rounded := roundUpPartialISODate(t, prefix, time.Nanosecond); rounded {
+					t = rt
+				}
+			}
+			baseTime = t
+		} else {
+			return 0, false
+		}
+	} else {
+		t, ok := parseISODateString(s)
+		if !ok {
+			return 0, false
+		}
+		if roundUp {
+			if rt, rounded := roundUpPartialISODate(t, s, time.Nanosecond); rounded {
+				t = rt
+			}
+		}
+		return safeTimeToEpochNanos(t)
+	}
+
+	t, ok := applyESDateMathWithRoundNanos(baseTime, mathExpr, roundUp)
+	if !ok {
+		return 0, false
+	}
+	if roundUp && dateOnlyPrefix && mathExpr != "" && !strings.Contains(mathExpr, "/") && hasOnlyCalendarDayOrLargerOffsets(mathExpr) {
+		t = t.AddDate(0, 0, 1).Add(-time.Nanosecond)
+	}
+	return safeTimeToEpochNanos(t)
+}
+
+func safeTimeToEpochNanos(t time.Time) (int64, bool) {
+	t = t.UTC()
+	sec := t.Unix()
+	nsec := int64(t.Nanosecond())
+	if sec < -9223372037 || sec > 9223372036 {
+		return 0, false
+	}
+	if sec == 9223372036 && nsec > 854775807 {
+		return 0, false
+	}
+	if sec == -9223372037 {
+		if nsec < 145224192 {
+			return 0, false
+		}
+		return (sec+1)*1_000_000_000 + (nsec - 1_000_000_000), true
+	}
+	return sec*1_000_000_000 + nsec, true
+}
+
+func parseScaledDecimalEpochToNanos(s string, scalePow10 int, allowAlreadyNanos bool) (int64, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, false
+	}
+	scale := int64(1)
+	for i := 0; i < scalePow10; i++ {
+		scale *= 10
+	}
+	if iv, err := strconv.ParseInt(s, 10, 64); err == nil {
+		if iv <= math.MaxInt64/scale && iv >= math.MinInt64/scale {
+			return iv * scale, true
+		}
+		if allowAlreadyNanos && (iv > 100_000_000_000_000 || iv < -100_000_000_000_000) {
+			return iv, true
+		}
+		return 0, false
+	}
+	neg := false
+	rest := s
+	if strings.HasPrefix(rest, "-") {
+		neg = true
+		rest = rest[1:]
+	} else if strings.HasPrefix(rest, "+") {
+		rest = rest[1:]
+	}
+	if dot := strings.IndexByte(rest, '.'); dot >= 0 && !strings.ContainsAny(rest, "eE") {
+		intPartStr := rest[:dot]
+		fracPartStr := rest[dot+1:]
+		if intPartStr == "" && fracPartStr == "" {
+			return 0, false
+		}
+		var intPart int64
+		if intPartStr != "" {
+			var err error
+			intPart, err = strconv.ParseInt(intPartStr, 10, 64)
+			if err != nil || intPart < 0 || intPart > math.MaxInt64/scale {
+				return 0, false
+			}
+		}
+		for i := 0; i < len(fracPartStr); i++ {
+			if fracPartStr[i] < '0' || fracPartStr[i] > '9' {
+				return 0, false
+			}
+		}
+		if len(fracPartStr) > scalePow10 {
+			fracPartStr = fracPartStr[:scalePow10]
+		} else {
+			fracPartStr += strings.Repeat("0", scalePow10-len(fracPartStr))
+		}
+		fracVal, err := strconv.ParseInt(fracPartStr, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		total := intPart*scale + fracVal
+		if neg {
+			return -total, true
+		}
+		return total, true
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+		scaled := f * float64(scale)
+		if scaled >= float64(math.MinInt64) && scaled < float64(math.MaxInt64) {
+			return int64(math.Round(scaled)), true
+		}
+	}
+	return 0, false
+}
+
+func applyESDateMathWithRoundNanos(base time.Time, expr string, roundUp bool) (time.Time, bool) {
+	t := base.UTC()
+	i := 0
+	for i < len(expr) {
+		if expr[i] == '/' {
+			i++
+			if i >= len(expr) {
+				return time.Time{}, false
+			}
+			switch expr[i] {
+			case 'y', 'Y', 'M', 'w', 'W', 'd', 'D', 'h', 'H', 'm', 's':
+				unit := expr[i]
+				i++
+				t = roundTimeToUnitWithDelta(t, unit, roundUp && i == len(expr), time.Nanosecond)
+			default:
+				return time.Time{}, false
+			}
+			continue
+		}
+		var sign int
+		switch expr[i] {
+		case '+':
+			sign = 1
+			i++
+		case '-':
+			sign = -1
+			i++
+		default:
+			return time.Time{}, false
+		}
+		numStart := i
+		for i < len(expr) && expr[i] >= '0' && expr[i] <= '9' {
+			i++
+		}
+		if numStart == i || i >= len(expr) {
+			return time.Time{}, false
+		}
+		n, err := strconv.Atoi(expr[numStart:i])
+		if err != nil || n > 100000 {
+			return time.Time{}, false
+		}
+		unit := expr[i]
+		i++
+		val := sign * n
+		switch unit {
+		case 'y', 'Y':
+			t = t.AddDate(val, 0, 0)
+		case 'M':
+			t = t.AddDate(0, val, 0)
+		case 'w', 'W':
+			t = t.AddDate(0, 0, val*7)
+		case 'd', 'D':
+			t = t.AddDate(0, 0, val)
+		case 'h', 'H':
+			t = t.Add(time.Duration(val) * time.Hour)
+		case 'm':
+			t = t.Add(time.Duration(val) * time.Minute)
+		case 's':
+			t = t.Add(time.Duration(val) * time.Second)
+		default:
+			return time.Time{}, false
+		}
+	}
+	return t, true
 }
 
 // ParseESDateBoundToEpochMillis parses ISO-8601 / RFC3339 date strings, epoch strings,
@@ -2492,8 +2893,10 @@ func ParseESDateBoundToEpochMillis(input string, now time.Time, roundUp bool) (i
 			baseTime = time.UnixMilli(ms).UTC()
 		} else if t, ok := parseISODateString(prefix); ok {
 			dateOnlyPrefix = isDateOnlyString(prefix)
-			if roundUp && mathExpr == "" && dateOnlyPrefix {
-				t = t.AddDate(0, 0, 1).Add(-time.Millisecond)
+			if roundUp && mathExpr == "" {
+				if rt, rounded := roundUpPartialISODate(t, prefix, time.Millisecond); rounded {
+					t = rt
+				}
 			}
 			baseTime = t
 		} else {
@@ -2504,8 +2907,10 @@ func ParseESDateBoundToEpochMillis(input string, now time.Time, roundUp bool) (i
 		if !ok {
 			return 0, false
 		}
-		if roundUp && isDateOnlyString(s) {
-			t = t.AddDate(0, 0, 1).Add(-time.Millisecond)
+		if roundUp {
+			if rt, rounded := roundUpPartialISODate(t, s, time.Millisecond); rounded {
+				t = rt
+			}
 		}
 		return t.UnixMilli(), true
 	}
@@ -2539,6 +2944,19 @@ func isDateOnlyString(s string) bool {
 	return len(s) == 10 && (s[4] == '-' || s[4] == '/') && (s[7] == '-' || s[7] == '/')
 }
 
+func roundUpPartialISODate(t time.Time, s string, unitDelta time.Duration) (time.Time, bool) {
+	if len(s) == 4 {
+		return t.AddDate(1, 0, 0).Add(-unitDelta), true
+	}
+	if len(s) == 7 && (s[4] == '-' || s[4] == '/') {
+		return t.AddDate(0, 1, 0).Add(-unitDelta), true
+	}
+	if isDateOnlyString(s) {
+		return t.AddDate(0, 0, 1).Add(-unitDelta), true
+	}
+	return t, false
+}
+
 func parseISODateString(s string) (time.Time, bool) {
 	layouts := []string{
 		time.RFC3339Nano,
@@ -2555,6 +2973,8 @@ func parseISODateString(s string) (time.Time, bool) {
 		"2006-01-02 15:04:05",
 		"2006-01-02",
 		"2006/01/02",
+		"2006-01",
+		"2006/01",
 	}
 	for _, layout := range layouts {
 		if t, err := time.Parse(layout, s); err == nil {
@@ -2631,16 +3051,20 @@ func applyESDateMathWithRound(base time.Time, expr string, roundUp bool) (time.T
 }
 
 func roundTimeToUnit(t time.Time, roundUnit byte, roundUp bool) time.Time {
+	return roundTimeToUnitWithDelta(t, roundUnit, roundUp, time.Millisecond)
+}
+
+func roundTimeToUnitWithDelta(t time.Time, roundUnit byte, roundUp bool, eps time.Duration) time.Time {
 	switch roundUnit {
 	case 'y', 'Y':
 		t = time.Date(t.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
 		if roundUp {
-			t = t.AddDate(1, 0, 0).Add(-time.Millisecond)
+			t = t.AddDate(1, 0, 0).Add(-eps)
 		}
 	case 'M':
 		t = time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
 		if roundUp {
-			t = t.AddDate(0, 1, 0).Add(-time.Millisecond)
+			t = t.AddDate(0, 1, 0).Add(-eps)
 		}
 	case 'w', 'W':
 		weekday := int(t.Weekday())
@@ -2649,27 +3073,27 @@ func roundTimeToUnit(t time.Time, roundUnit byte, roundUp bool) time.Time {
 		}
 		t = time.Date(t.Year(), t.Month(), t.Day()-(weekday-1), 0, 0, 0, 0, time.UTC)
 		if roundUp {
-			t = t.AddDate(0, 0, 7).Add(-time.Millisecond)
+			t = t.AddDate(0, 0, 7).Add(-eps)
 		}
 	case 'd', 'D':
 		t = time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 		if roundUp {
-			t = t.AddDate(0, 0, 1).Add(-time.Millisecond)
+			t = t.AddDate(0, 0, 1).Add(-eps)
 		}
 	case 'h', 'H':
 		t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, time.UTC)
 		if roundUp {
-			t = t.Add(time.Hour - time.Millisecond)
+			t = t.Add(time.Hour - eps)
 		}
 	case 'm':
 		t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), 0, 0, time.UTC)
 		if roundUp {
-			t = t.Add(time.Minute - time.Millisecond)
+			t = t.Add(time.Minute - eps)
 		}
 	case 's':
 		t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.UTC)
 		if roundUp {
-			t = t.Add(time.Second - time.Millisecond)
+			t = t.Add(time.Second - eps)
 		}
 	}
 	return t
@@ -2905,11 +3329,6 @@ func propagateCopyToCustomMultiFields(s *IndexSchema, row map[string]any, target
 						}
 						return fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", subK, subB.ESType)
 					}
-					if subB.ESType == "date_nanos" {
-						if iv, ok := coerced.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
-							coerced = iv / 1_000_000
-						}
-					}
 					if subB.ESType == "unsigned_long" {
 						if u, okU := parseExactUint64(rv); okU && u > uint64(math.MaxInt64) {
 							cur = append(cur, strconv.FormatUint(u, 10))
@@ -2946,11 +3365,6 @@ func propagateCopyToCustomMultiFields(s *IndexSchema, row map[string]any, target
 							continue
 						}
 						return fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", subK, subB.ESType)
-					}
-					if subB.ESType == "date_nanos" {
-						if iv, ok := coerced.(int64); ok && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
-							coerced = iv / 1_000_000
-						}
 					}
 					if existing, exists := row[subB.ColumnName]; !exists || existing == nil {
 						row[subB.ColumnName] = coerced
@@ -3228,12 +3642,44 @@ func isStrictLeafESType(esType string) bool {
 	switch strings.ToLower(strings.TrimSpace(esType)) {
 	case "text", "match_only_text", "keyword", "constant_keyword", "wildcard", "ip",
 		"long", "unsigned_long", "integer", "short", "byte", "token_count",
-		"double", "float", "half_float", "scaled_float", "boolean", "date", "date_nanos",
+		"double", "float", "half_float", "scaled_float", "rank_feature", "boolean", "date", "date_nanos",
 		"version", "search_as_you_type", "annotated-text", "annotated_text":
 		return true
 	default:
 		return false
 	}
+}
+
+func hasArrayValueAtPath(node any, path []string) bool {
+	if node == nil {
+		return false
+	}
+	if len(path) == 0 {
+		_, isArr := node.([]any)
+		return isArr
+	}
+	switch curr := node.(type) {
+	case map[string]any:
+		if next, exists := curr[path[0]]; exists {
+			if hasArrayValueAtPath(next, path[1:]) {
+				return true
+			}
+		}
+		for i := 2; i <= len(path); i++ {
+			if next, exists := curr[strings.Join(path[:i], ".")]; exists {
+				if hasArrayValueAtPath(next, path[i:]) {
+					return true
+				}
+			}
+		}
+	case []any:
+		for _, elem := range curr {
+			if hasArrayValueAtPath(elem, path) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isStrictLeafFieldWithoutSubprops(s *IndexSchema, b FieldBinding) bool {
@@ -3320,6 +3766,9 @@ func collectAllTextWithSchema(node any, s *IndexSchema, curPath []string, sb *st
 		sort.Strings(keys)
 		for _, k := range keys {
 			if k == "_r" && len(curPath) > 0 && s != nil && IsRangeFieldType(s.ResolveField(strings.Join(curPath, ".")).ESType) {
+				continue
+			}
+			if k == "_h" && len(curPath) > 0 && s != nil && s.ResolveField(strings.Join(curPath, ".")).ESType == "histogram" {
 				continue
 			}
 			nextPath := append(append([]string(nil), curPath...), k)
@@ -3915,6 +4364,16 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 		}
 		return norm
 	}
+	if b.ESType == "histogram" {
+		norm, _, err := validateAndNormalizeHistogramValue(val, b)
+		if err != nil {
+			if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+				return nil
+			}
+			return val
+		}
+		return norm
+	}
 	if _, isMap := val.(map[string]any); isMap && b.ESType != "geo_point" && b.ESType != "object" && b.ESType != "flattened" && b.ESType != "sparse_vector" && b.ESType != "rank_features" {
 		return nil
 	}
@@ -3929,11 +4388,25 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 		}
 	}
 	if isTypedNonStringBinding(b) {
-		if strVal, isStr := val.(string); isStr && strings.TrimSpace(strVal) == "" && (b.Coerce == nil || *b.Coerce) {
+		if strVal, isStr := val.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "rank_feature" && (b.Coerce == nil || *b.Coerce) {
 			return nil
 		}
 	}
-	if b.ESType == "date" || b.ESType == "date_nanos" {
+	if b.ESType == "date_nanos" {
+		if b.Coerce != nil && !*b.Coerce && b.Format != "" && !dateFormatAllowsNumericWithNoCoerce(b.Format) {
+			switch val.(type) {
+			case int, int64, float64, json.Number:
+				return nil
+			}
+		}
+		str := strings.TrimSpace(fmt.Sprintf("%v", val))
+		if ns, ok := ParseESDateWithFormatToEpochNanos(str, b.Format, getNow()); ok {
+			return ns
+		}
+		if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+			return nil
+		}
+	} else if b.ESType == "date" {
 		if b.Coerce != nil && !*b.Coerce && b.Format != "" && !dateFormatAllowsNumericWithNoCoerce(b.Format) {
 			switch val.(type) {
 			case int, int64, float64, json.Number:
@@ -3943,9 +4416,6 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 		str := strings.TrimSpace(fmt.Sprintf("%v", val))
 		if b.Format != "" {
 			if ms, ok := ParseESDateWithFormatToEpochMillis(str, b.Format, getNow()); ok {
-				if b.ESType == "date_nanos" && (ms > 1_000_000_000_000_000 || ms < -1_000_000_000_000_000) {
-					return ms / 1_000_000
-				}
 				return ms
 			}
 			if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
@@ -3953,9 +4423,6 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 			}
 		} else {
 			if iv, err := strconv.ParseInt(str, 10, 64); err == nil {
-				if b.ESType == "date_nanos" && (iv > 1_000_000_000_000_000 || iv < -1_000_000_000_000_000) {
-					return iv / 1_000_000
-				}
 				return iv
 			}
 			if ms, ok := ParseESDateToEpochMillis(str, getNow()); ok {
@@ -4008,7 +4475,7 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 		if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
 			return nil
 		}
-		if (b.Coerce != nil && !*b.Coerce) || b.ESType == "float" || b.ESType == "half_float" || b.ESType == "version" || b.ESType == "ip" {
+		if (b.Coerce != nil && !*b.Coerce) || b.ESType == "float" || b.ESType == "half_float" || b.ESType == "rank_feature" || b.ESType == "version" || b.ESType == "ip" {
 			return nil
 		}
 	} else if b.LowercaseNormalizer {
@@ -4126,6 +4593,24 @@ func collectCompletionStringsAtPath(node any, path []string, lowercase bool, nul
 		}
 	}
 	return nil
+}
+
+// CanonicalIPToUpperHex16 converts an IPv4 or IPv6 address string into its canonical 32-char
+// uppercase hexadecimal 128-bit RFC 4291 representation (`00000000000000000000FFFF` + 8-hex IPv4,
+// or 32-hex IPv6).
+func CanonicalIPToUpperHex16(ipStr string) (string, bool) {
+	ip := net.ParseIP(strings.TrimSpace(ipStr))
+	if ip == nil {
+		return "", false
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return fmt.Sprintf("00000000000000000000FFFF%02X%02X%02X%02X", ip4[0], ip4[1], ip4[2], ip4[3]), true
+	}
+	ip16 := ip.To16()
+	if len(ip16) != 16 {
+		return "", false
+	}
+	return strings.ToUpper(hex.EncodeToString(ip16)), true
 }
 
 // IPToSortableFloat converts an IPv4 or IPv6 address string into an order-preserving float64.
@@ -4286,13 +4771,150 @@ func validateAndNormalizeFlattenedFieldInDoc(curr map[string]any, path []string,
 	})
 }
 
+func validateAndNormalizeHistogramFieldInDoc(curr map[string]any, path []string, b FieldBinding) (bool, error) {
+	return traverseFieldInDocMap(curr, path, func(m map[string]any, key string) (bool, error) {
+		raw, exists := m[key]
+		if !exists {
+			return false, nil
+		}
+		if raw == nil {
+			delete(m, key)
+			return true, nil
+		}
+		norm, modified, err := validateAndNormalizeHistogramValue(raw, b)
+		if err != nil {
+			return false, err
+		}
+		if modified {
+			m[key] = norm
+		}
+		return modified, nil
+	})
+}
+
+func validateAndNormalizeHistogramValue(raw any, b FieldBinding) (any, bool, error) {
+	if raw == nil {
+		return nil, true, nil
+	}
+	hm, ok := raw.(map[string]any)
+	if !ok {
+		return nil, false, fmt.Errorf("mapper_parsing_exception: failed to parse histogram field [%s]: expected object with [values] and [counts]", b.ESFieldPath)
+	}
+	for k := range hm {
+		switch k {
+		case "values", "counts", "_h":
+		default:
+			return nil, false, fmt.Errorf("mapper_parsing_exception: [histogram] field [%s] unknown field [%s]", b.ESFieldPath, k)
+		}
+	}
+	rawValues, hasValues := hm["values"]
+	rawCounts, hasCounts := hm["counts"]
+	if !hasValues || !hasCounts {
+		return nil, false, fmt.Errorf("mapper_parsing_exception: [histogram] field [%s] requires both [values] and [counts] arrays", b.ESFieldPath)
+	}
+	valArr, okV := rawValues.([]any)
+	cntArr, okC := rawCounts.([]any)
+	if !okV || !okC {
+		return nil, false, fmt.Errorf("mapper_parsing_exception: [histogram] field [%s] [values] and [counts] must be arrays", b.ESFieldPath)
+	}
+	if len(valArr) != len(cntArr) {
+		return nil, false, fmt.Errorf("mapper_parsing_exception: [histogram] field [%s] [values] length (%d) must equal [counts] length (%d)", b.ESFieldPath, len(valArr), len(cntArr))
+	}
+	hPairs := make([]any, 0, len(valArr))
+	var prevVal float64
+	for i := 0; i < len(valArr); i++ {
+		fv, okVal := parseStrictHistogramFloat(valArr[i])
+		if !okVal {
+			return nil, false, fmt.Errorf("mapper_parsing_exception: [histogram] field [%s] [values] element at index %d must be a finite number", b.ESFieldPath, i)
+		}
+		if i > 0 && fv < prevVal {
+			return nil, false, fmt.Errorf("mapper_parsing_exception: [histogram] field [%s] [values] must be in ascending order", b.ESFieldPath)
+		}
+		prevVal = fv
+
+		cnt, okCnt := parseStrictHistogramCount(cntArr[i])
+		if !okCnt {
+			return nil, false, fmt.Errorf("mapper_parsing_exception: [histogram] field [%s] [counts] element at index %d must be a non-negative integer", b.ESFieldPath, i)
+		}
+		if cnt > 0 {
+			hPairs = append(hPairs, strconv.FormatFloat(fv, 'g', -1, 64)+","+strconv.FormatInt(cnt, 10))
+		}
+	}
+	if len(hPairs) == 0 {
+		hPairs = []any{""}
+	}
+	out := make(map[string]any, len(hm)+1)
+	for k, v := range hm {
+		out[k] = v
+	}
+	out["_h"] = hPairs
+	return out, true, nil
+}
+
+func parseStrictHistogramFloat(v any) (float64, bool) {
+	switch tv := v.(type) {
+	case float64:
+		if math.IsNaN(tv) || math.IsInf(tv, 0) {
+			return 0, false
+		}
+		return tv, true
+	case int:
+		return float64(tv), true
+	case int64:
+		return float64(tv), true
+	case json.Number:
+		f, err := tv.Float64()
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+			return 0, false
+		}
+		return f, true
+	default:
+		return 0, false
+	}
+}
+
+func parseStrictHistogramCount(v any) (int64, bool) {
+	switch tv := v.(type) {
+	case int:
+		if tv < 0 {
+			return 0, false
+		}
+		return int64(tv), true
+	case int64:
+		if tv < 0 {
+			return 0, false
+		}
+		return tv, true
+	case float64:
+		if math.IsNaN(tv) || math.IsInf(tv, 0) || math.Trunc(tv) != tv || tv < 0 || tv > float64(math.MaxInt64/2) {
+			return 0, false
+		}
+		return int64(tv), true
+	case json.Number:
+		s := tv.String()
+		if strings.ContainsAny(s, ".eE") {
+			return 0, false
+		}
+		iv, err := tv.Int64()
+		if err != nil || iv < 0 {
+			return 0, false
+		}
+		return iv, true
+	default:
+		return 0, false
+	}
+}
+
 func validateAndNormalizeFlattenedValue(raw any, b FieldBinding, recordIgnored func(string)) (any, bool, error) {
 	if raw == nil {
 		return nil, true, nil
 	}
 	switch v := raw.(type) {
 	case map[string]any:
-		normMap, mod := normalizeFlattenedObjectMap(v, b, recordIgnored)
+		normMap, mod, err := normalizeFlattenedObjectMap(v, b, recordIgnored, 1)
+		if err != nil {
+			return nil, false, err
+		}
 		if len(normMap) == 0 {
 			return nil, true, nil
 		}
@@ -4307,7 +4929,10 @@ func validateAndNormalizeFlattenedValue(raw any, b FieldBinding, recordIgnored f
 			if !ok {
 				return nil, false, fmt.Errorf("mapper_parsing_exception: object mapping for [%s] tried to parse field [%s] as object, but found a concrete value", b.ESFieldPath, b.ESFieldPath)
 			}
-			normMap, _ := normalizeFlattenedObjectMap(em, b, recordIgnored)
+			normMap, _, err := normalizeFlattenedObjectMap(em, b, recordIgnored, 1)
+			if err != nil {
+				return nil, false, err
+			}
 			if len(normMap) == 0 {
 				continue
 			}
@@ -4325,11 +4950,18 @@ func validateAndNormalizeFlattenedValue(raw any, b FieldBinding, recordIgnored f
 	}
 }
 
-func normalizeFlattenedObjectMap(m map[string]any, b FieldBinding, recordIgnored func(string)) (map[string]any, bool) {
+func normalizeFlattenedObjectMap(m map[string]any, b FieldBinding, recordIgnored func(string), depth int) (map[string]any, bool, error) {
+	limit := b.EffectiveDepthLimit()
+	if depth > limit {
+		return nil, false, fmt.Errorf("mapper_parsing_exception: Field [%s] has exceeded max depth limit of [%d]", b.ESFieldPath, limit)
+	}
 	out := make(map[string]any, len(m))
 	modified := false
 	for k, v := range m {
-		normV, mod := normalizeFlattenedInnerValue(v, b, recordIgnored)
+		normV, mod, err := normalizeFlattenedInnerValue(v, b, recordIgnored, depth)
+		if err != nil {
+			return nil, false, err
+		}
 		if mod {
 			modified = true
 		}
@@ -4339,10 +4971,10 @@ func normalizeFlattenedObjectMap(m map[string]any, b FieldBinding, recordIgnored
 		}
 		out[k] = normV
 	}
-	return out, modified
+	return out, modified, nil
 }
 
-func normalizeFlattenedInnerValue(v any, b FieldBinding, recordIgnored func(string)) (any, bool) {
+func normalizeFlattenedInnerValue(v any, b FieldBinding, recordIgnored func(string), depth int) (any, bool, error) {
 	if v == nil {
 		if b.NullValue != nil {
 			nv := fmt.Sprintf("%v", b.NullValue)
@@ -4353,25 +4985,31 @@ func normalizeFlattenedInnerValue(v any, b FieldBinding, recordIgnored func(stri
 				if recordIgnored != nil {
 					recordIgnored(b.ESFieldPath)
 				}
-				return nil, true
+				return nil, true, nil
 			}
-			return nv, true
+			return nv, true, nil
 		}
-		return nil, true
+		return nil, true, nil
 	}
 	switch tv := v.(type) {
 	case map[string]any:
-		normMap, mod := normalizeFlattenedObjectMap(tv, b, recordIgnored)
-		if len(normMap) == 0 {
-			return nil, true
+		normMap, mod, err := normalizeFlattenedObjectMap(tv, b, recordIgnored, depth+1)
+		if err != nil {
+			return nil, false, err
 		}
-		return normMap, mod
+		if len(normMap) == 0 {
+			return nil, true, nil
+		}
+		return normMap, mod, nil
 	case []any:
 		var scalarOut []any
 		var mergedObj map[string]any
 		modified := false
 		for _, elem := range tv {
-			normElem, mod := normalizeFlattenedInnerValue(elem, b, recordIgnored)
+			normElem, mod, err := normalizeFlattenedInnerValue(elem, b, recordIgnored, depth)
+			if err != nil {
+				return nil, false, err
+			}
 			if mod {
 				modified = true
 			}
@@ -4390,12 +5028,12 @@ func normalizeFlattenedInnerValue(v any, b FieldBinding, recordIgnored func(stri
 			}
 		}
 		if len(mergedObj) > 0 && len(scalarOut) == 0 {
-			return mergedObj, true
+			return mergedObj, true, nil
 		}
 		if len(scalarOut) == 0 {
-			return nil, true
+			return nil, true, nil
 		}
-		return scalarOut, modified
+		return scalarOut, modified, nil
 	case string:
 		sv := tv
 		mod := false
@@ -4409,18 +5047,18 @@ func normalizeFlattenedInnerValue(v any, b FieldBinding, recordIgnored func(stri
 			if recordIgnored != nil {
 				recordIgnored(b.ESFieldPath)
 			}
-			return nil, true
+			return nil, true, nil
 		}
-		return sv, mod
+		return sv, mod, nil
 	default:
 		sv := fmt.Sprintf("%v", tv)
 		if b.IgnoreAbove > 0 && len([]rune(sv)) > b.IgnoreAbove {
 			if recordIgnored != nil {
 				recordIgnored(b.ESFieldPath)
 			}
-			return nil, true
+			return nil, true, nil
 		}
-		return tv, false
+		return tv, false, nil
 	}
 }
 
@@ -4700,7 +5338,7 @@ func validateAndPopulateSingleRangeMap(m map[string]any, b FieldBinding, getNow 
 	var lowerFloat, upperFloat float64
 	var lowerInt, upperInt int64
 	if hasLower {
-		lf, li, ok := parseRangeBoundValue(rawLower, b, getNow, false)
+		lf, li, ok := parseRangeBoundValue(rawLower, b, getNow, hasGt)
 		if !ok {
 			return fmt.Errorf("mapper_parsing_exception: failed to parse lower bound of range field [%s] of type [%s]", b.ESFieldPath, b.ESType)
 		}

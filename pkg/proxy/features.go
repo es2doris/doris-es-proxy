@@ -147,11 +147,7 @@ func parseESResponseFormatOptions(r *http.Request) (esResponseFormatOptions, boo
 		opts.errorTrace = true
 	}
 	if fp := strings.TrimSpace(q.Get("filter_path")); fp != "" {
-		for _, p := range strings.Split(fp, ",") {
-			if p = strings.TrimSpace(p); p != "" {
-				opts.filterPaths = append(opts.filterPaths, p)
-			}
-		}
+		opts.filterPaths = append(opts.filterPaths, splitFilterPathExpressions(fp)...)
 	}
 	if !opts.pretty && !opts.errorTrace && len(opts.filterPaths) == 0 {
 		return esResponseFormatOptions{}, false
@@ -178,10 +174,10 @@ func applyESFilterPath(v any, filterPaths []string) any {
 		if strings.HasPrefix(fp, "-") {
 			trimmed := strings.TrimPrefix(fp, "-")
 			if trimmed != "" {
-				negPatterns = append(negPatterns, strings.Split(trimmed, "."))
+				negPatterns = append(negPatterns, parseFilterPathSegments(trimmed))
 			}
 		} else {
-			posPatterns = append(posPatterns, strings.Split(fp, "."))
+			posPatterns = append(posPatterns, parseFilterPathSegments(fp))
 		}
 	}
 	out := generic
@@ -265,8 +261,16 @@ func filterIncludeNode(node any, patterns [][]string) (any, bool) {
 		return out, true
 	case []any:
 		var out []any
-		for _, elem := range typed {
-			if child, ok := filterIncludeNode(elem, patterns); ok {
+		for idx, elem := range typed {
+			elemPatterns, matchedLeaf := advanceArrayFilterPatterns(patterns, idx)
+			if matchedLeaf {
+				out = append(out, elem)
+				continue
+			}
+			if len(elemPatterns) == 0 {
+				continue
+			}
+			if child, ok := filterIncludeNode(elem, elemPatterns); ok {
 				out = append(out, child)
 			}
 		}
@@ -309,9 +313,17 @@ func filterExcludeNode(node any, negPatterns [][]string) any {
 		}
 		return out
 	case []any:
-		out := make([]any, len(typed))
+		out := make([]any, 0, len(typed))
 		for i, elem := range typed {
-			out[i] = filterExcludeNode(elem, negPatterns)
+			elemPatterns, matchedLeaf := advanceArrayFilterPatterns(negPatterns, i)
+			if matchedLeaf {
+				continue
+			}
+			if len(elemPatterns) > 0 {
+				out = append(out, filterExcludeNode(elem, elemPatterns))
+			} else {
+				out = append(out, elem)
+			}
 		}
 		return out
 	default:
@@ -893,146 +905,7 @@ func matchMultiWildcardWithExclusions(rawPattern, candidate string) bool {
 }
 
 func (s *Server) handleResolveIndex(w http.ResponseWriter, r *http.Request) {
-	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
-		return
-	}
-	pattern := r.PathValue("name")
-	if pattern == "" {
-		pattern = "*"
-	}
-	_ = s.syncCatalogFromBackend(r.Context())
-
-	s.mu.RLock()
-	backingToDS := make(map[string]string)
-	for dsName, ds := range s.dataStreams {
-		if ds == nil {
-			continue
-		}
-		for _, biName := range extractDataStreamBackingIndexNames(ds) {
-			backingToDS[biName] = dsName
-		}
-	}
-
-	var indicesOut []map[string]any
-	idxNames := make([]string, 0, len(s.indices))
-	for name := range s.indices {
-		idxNames = append(idxNames, name)
-	}
-	sort.Strings(idxNames)
-	ew := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("expand_wildcards")))
-	concreteParts := make(map[string]bool)
-	for _, rawPart := range strings.Split(pattern, ",") {
-		part := strings.TrimSpace(rawPart)
-		if part != "" && !strings.HasPrefix(part, "-") && !strings.ContainsAny(part, "*?") && part != "_all" {
-			concreteParts[part] = true
-		}
-	}
-	for _, name := range idxNames {
-		if ew == "none" && !concreteParts[name] {
-			continue
-		}
-		if matchMultiWildcardWithExclusions(pattern, name) {
-			isClosed := s.closedIndices[name]
-			if ew != "" {
-				if ew == "open" && isClosed {
-					continue
-				}
-				if ew == "closed" && !isClosed {
-					continue
-				}
-			}
-			var idxAliases []string
-			for al, targets := range s.aliases {
-				for _, t := range targets {
-					if t == name {
-						idxAliases = append(idxAliases, al)
-					}
-				}
-			}
-			sort.Strings(idxAliases)
-			attrs := []string{"open"}
-			stateStr := "open"
-			isOpen := true
-			if isClosed {
-				attrs = []string{"close"}
-				stateStr = "close"
-				isOpen = false
-			}
-			entry := map[string]any{
-				"name":       name,
-				"attributes": attrs,
-				"state":      stateStr,
-				"open":       isOpen,
-			}
-			if len(idxAliases) > 0 {
-				entry["aliases"] = idxAliases
-			}
-			if dsName, ok := backingToDS[name]; ok {
-				entry["data_stream"] = dsName
-			}
-			indicesOut = append(indicesOut, entry)
-		}
-	}
-
-	var aliasesOut []map[string]any
-	alNames := make([]string, 0, len(s.aliases))
-	for al := range s.aliases {
-		alNames = append(alNames, al)
-	}
-	sort.Strings(alNames)
-	for _, al := range alNames {
-		if matchMultiWildcardWithExclusions(pattern, al) {
-			aliasesOut = append(aliasesOut, map[string]any{
-				"name":    al,
-				"indices": append([]string(nil), s.aliases[al]...),
-			})
-		}
-	}
-
-	var dataStreamsOut []map[string]any
-	dsNames := make([]string, 0, len(s.dataStreams))
-	for dsName := range s.dataStreams {
-		dsNames = append(dsNames, dsName)
-	}
-	sort.Strings(dsNames)
-	for _, dsName := range dsNames {
-		if matchMultiWildcardWithExclusions(pattern, dsName) {
-			ds := s.dataStreams[dsName]
-			if ds == nil {
-				continue
-			}
-			backing := extractDataStreamBackingIndexNames(ds)
-			tsField := "@timestamp"
-			if tfMap, ok := ds["timestamp_field"].(map[string]any); ok {
-				if nameStr, ok := tfMap["name"].(string); ok && nameStr != "" {
-					tsField = nameStr
-				}
-			}
-			dataStreamsOut = append(dataStreamsOut, map[string]any{
-				"name":            dsName,
-				"backing_indices": backing,
-				"timestamp_field": tsField,
-			})
-		}
-	}
-	s.mu.RUnlock()
-
-	if indicesOut == nil {
-		indicesOut = []map[string]any{}
-	}
-	if aliasesOut == nil {
-		aliasesOut = []map[string]any{}
-	}
-	if dataStreamsOut == nil {
-		dataStreamsOut = []map[string]any{}
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"indices":      indicesOut,
-		"aliases":      aliasesOut,
-		"data_streams": dataStreamsOut,
-	})
+	s.handleResolveIndexRound58(w, r)
 }
 
 func extractDataStreamBackingIndexNames(ds map[string]any) []string {
@@ -1200,9 +1073,15 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusBadRequest, ingestSpecValidationErrorType(err), err.Error())
 			return
 		}
+		_ = s.syncCatalogFromBackend(r.Context())
 		s.mu.Lock()
 		if s.pipelines == nil {
 			s.pipelines = make(map[string]map[string]any)
+		}
+		if cycErr := validateNoIngestPipelineCycleLocked(id, body, s.pipelines); cycErr != nil {
+			s.mu.Unlock()
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", cycErr.Error())
+			return
 		}
 		s.pipelines[id] = body
 		s.mu.Unlock()
@@ -1232,7 +1111,7 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 				}
 				continue
 			}
-			if strings.Contains(pat, "*") {
+			if strings.ContainsAny(pat, "*?") {
 				matchedAny := false
 				for k := range s.pipelines {
 					if matchWildcardPattern(pat, k) {
@@ -1634,11 +1513,16 @@ func validateIngestPipelineProcessors(procs []any) error {
 				if !ok || len(tfs) == 0 {
 					return fmt.Errorf("[target_fields] required property is missing")
 				}
+				seenTF := make(map[string]bool, len(tfs))
 				for _, tfAny := range tfs {
 					tfStr, ok := tfAny.(string)
 					if !ok || strings.TrimSpace(tfStr) == "" {
 						return fmt.Errorf("illegal_argument_exception: [target_fields] must contain only non-empty strings")
 					}
+					if seenTF[tfStr] {
+						return fmt.Errorf("illegal_argument_exception: duplicate target_field [%s] in csv processor", tfStr)
+					}
+					seenTF[tfStr] = true
 				}
 				effSep := ","
 				if rawSep, hasSep := specMap["separator"]; hasSep && rawSep != nil {
@@ -1718,21 +1602,8 @@ func validateIngestPipelineProcessors(procs []any) error {
 				if err != nil {
 					return err
 				}
-				if strings.Count(pat, "%{") != strings.Count(pat, "}") {
-					return fmt.Errorf("illegal_argument_exception: invalid dissect pattern [%s]: unclosed token", pat)
-				}
-				for rem := pat; ; {
-					openIdx := strings.Index(rem, "%{")
-					if openIdx < 0 {
-						break
-					}
-					afterOpen := rem[openIdx+2:]
-					closeIdx := strings.IndexByte(afterOpen, '}')
-					nextOpen := strings.Index(afterOpen, "%{")
-					if closeIdx < 0 || (nextOpen >= 0 && nextOpen < closeIdx) {
-						return fmt.Errorf("illegal_argument_exception: invalid dissect pattern [%s]: unclosed token", pat)
-					}
-					rem = afterOpen[closeIdx+1:]
+				if err := validateDissectPatternGrammar(pat); err != nil {
+					return err
 				}
 				if rawSep, hasSep := specMap["append_separator"]; hasSep && rawSep != nil {
 					if _, ok := rawSep.(string); !ok {
@@ -2484,6 +2355,8 @@ func ingestMetaParamsFromDoc(doc map[string]any) map[string]any {
 	return params
 }
 
+var reIngestCtxRegexExpr = regexp.MustCompile(`(ctx(?:\?)?\._source\.[A-Za-z0-9_]+)\s*(==~|=~)\s*(/(?:\\.|[^/\\])*/[a-zA-Z]*|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*")`)
+
 func evalIngestIfCondition(cond string, doc map[string]any) bool {
 	cond = strings.TrimSpace(cond)
 	if cond == "" {
@@ -2526,6 +2399,15 @@ func evalIngestIfCondition(cond string, doc map[string]any) bool {
 	script := "if (" + normCond + "\n) { ctx.op = 'index' } else { ctx.op = 'noop' }"
 	opRes, err := painless.EvalPainlessWithOp(cleanDoc, script, metaParams)
 	if err != nil {
+		if strings.Contains(normCond, "=~") && strings.Contains(strings.ToLower(err.Error()), "null") {
+			guarded := reIngestCtxRegexExpr.ReplaceAllString(normCond, "($1 != null && $1 $2 $3)")
+			if guarded != normCond {
+				gScript := "if (" + guarded + "\n) { ctx.op = 'index' } else { ctx.op = 'noop' }"
+				if gOpRes, gErr := painless.EvalPainlessWithOp(cleanDoc, gScript, metaParams); gErr == nil {
+					return gOpRes == "index"
+				}
+			}
+		}
 		ok, fErr := painless.EvalFilter(cleanDoc, normCond, metaParams)
 		return fErr == nil && ok
 	}
@@ -3630,8 +3512,8 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 				return nil, fmt.Errorf("unable to dissect [%s] with pattern [%s]: missing delimiter [%s]", input, pattern, tok.nextLit)
 			}
 			val = cur[:len(cur)-len(tok.nextLit)]
-			for tok.padRight && tok.nextLit != "" && strings.HasSuffix(val, tok.nextLit) {
-				val = val[:len(val)-len(tok.nextLit)]
+			if tok.padRight && tok.nextLit != "" {
+				val = stripDissectRightPadding(val, tok.nextLit, false)
 			}
 			cur = ""
 		} else {
@@ -3642,9 +3524,7 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 			val = cur[:idx]
 			cur = cur[idx+len(tok.nextLit):]
 			if tok.padRight && tok.nextLit != "" {
-				for strings.HasPrefix(cur, tok.nextLit) {
-					cur = cur[len(tok.nextLit):]
-				}
+				cur = stripDissectRightPadding(cur, tok.nextLit, true)
 			}
 		}
 		captured[i] = val
@@ -5777,16 +5657,17 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				if !isStr {
 					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 				}
-				if strings.TrimSpace(strVal) == "" {
+				if strVal == "\n" || strVal == "\r\n" {
+					return false, false, procType, procTag, specMap, nil
+				}
+				if strVal == "" {
 					if hasEmptyVal {
-						for _, tfAny := range targetFields {
-							if tfName, ok := tfAny.(string); ok && tfName != "" {
-								tfName = expandIngestFieldName(tfName, doc)
-								setIngestPath(doc, tfName, emptyVal)
+						for _, tf := range targetFields {
+							if tfName, ok := tf.(string); ok && tfName != "" {
+								setIngestPath(doc, expandIngestFieldName(tfName, doc), emptyVal)
 							}
 						}
-						mutated = true
-						return mutated, false, procType, procTag, specMap, nil
+						return true, false, procType, procTag, specMap, nil
 					}
 					return false, false, procType, procTag, specMap, nil
 				}
@@ -5810,24 +5691,22 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				if err != nil {
 					return false, false, procType, procTag, specMap, err
 				}
-				for idx, tfAny := range targetFields {
-					tfName, ok := tfAny.(string)
+				for idx := 0; idx < len(targetFields) && idx < len(record); idx++ {
+					tfName, ok := targetFields[idx].(string)
 					if !ok || tfName == "" {
 						continue
 					}
 					tfName = expandIngestFieldName(tfName, doc)
-					var cell string
-					isQuoted := false
-					if idx < len(record) {
-						cell = record[idx]
-						isQuoted = quotedFlags[idx]
-					}
+					cell := record[idx]
+					isQuoted := quotedFlags[idx]
 					if trimFlag && !isQuoted {
 						cell = strings.TrimSpace(cell)
 					}
 					if cell == "" {
 						if hasEmptyVal {
 							setIngestPath(doc, tfName, emptyVal)
+						} else if isQuoted {
+							setIngestPath(doc, tfName, "")
 						}
 						continue
 					}
@@ -6281,6 +6160,12 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 								mutated = true
 							}
 						}
+						if term, _ := doc["__internal_ingest_terminated"].(bool); term {
+							break
+						}
+						if rer, _ := doc["__internal_ingest_rerouted"].(bool); rer {
+							break
+						}
 					}
 					restoreIngestVal()
 					if elemChanged {
@@ -6333,6 +6218,12 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 									changedEntries[k] = newVal
 								}
 							}
+						}
+						if term, _ := doc["__internal_ingest_terminated"].(bool); term {
+							break
+						}
+						if rer, _ := doc["__internal_ingest_rerouted"].(bool); rer {
+							break
 						}
 					}
 					restoreIngestVal()
@@ -6616,85 +6507,12 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 	case "terminate":
 		doc["__internal_ingest_terminated"] = true
 	case "reroute":
-		prevIdx, _ := doc["_index"].(string)
-		removeFieldsExplicit, hasRemoveFields := specMap["remove_fields"].(bool)
-		dest, _ := specMap["destination"].(string)
-		if dest != "" {
-			dest = strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(dest, doc)))
-		} else {
-			dsType := "logs"
-			if v, ok := getIngestPath(doc, "data_stream.type"); ok && v != nil {
-				if sVal := strings.TrimSpace(fmt.Sprintf("%v", v)); sVal != "" {
-					dsType = strings.ReplaceAll(sVal, "-", "_")
-				}
-			}
-			resolveReroutePart := func(rawSpec any, docPath string, defaultVal string) string {
-				switch rv := rawSpec.(type) {
-				case string:
-					if rv != "" {
-						if strings.Contains(rv, "{{") {
-							if exp := strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(rv, doc))); exp != "" {
-								return strings.ReplaceAll(exp, "-", "_")
-							}
-						} else {
-							return strings.ReplaceAll(strings.TrimSpace(rv), "-", "_")
-						}
-					}
-				case []any:
-					for _, item := range rv {
-						sItem, okS := item.(string)
-						if !okS {
-							sItem = fmt.Sprintf("%v", item)
-						}
-						sItem = strings.TrimSpace(sItem)
-						if sItem == "" {
-							continue
-						}
-						if strings.Contains(sItem, "{{") {
-							if exp := strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(sItem, doc))); exp != "" {
-								return strings.ReplaceAll(exp, "-", "_")
-							}
-							continue
-						}
-						if v, ok := getIngestPath(doc, sItem); ok {
-							if v != nil {
-								if vs := strings.TrimSpace(fmt.Sprintf("%v", v)); vs != "" {
-									if hasRemoveFields && removeFieldsExplicit {
-										deleteIngestPath(doc, sItem)
-									}
-									return strings.ReplaceAll(vs, "-", "_")
-								}
-							}
-							continue
-						}
-					}
-				}
-				out := defaultVal
-				if v, ok := getIngestPath(doc, docPath); ok && v != nil {
-					if sVal := strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(fmt.Sprintf("%v", v), doc))); sVal != "" {
-						out = strings.ReplaceAll(sVal, "-", "_")
-					}
-					if !hasRemoveFields || removeFieldsExplicit {
-						deleteIngestPath(doc, docPath)
-					}
-				}
-				return out
-			}
-			dataset := resolveReroutePart(specMap["dataset"], "data_stream.dataset", "generic")
-			namespace := resolveReroutePart(specMap["namespace"], "data_stream.namespace", "default")
-			if dsObj, ok := getIngestPath(doc, "data_stream"); ok {
-				if dsMap, isMap := dsObj.(map[string]any); isMap && len(dsMap) == 0 {
-					deleteIngestPath(doc, "data_stream")
-				}
-			}
-			dest = fmt.Sprintf("%s-%s-%s", dsType, dataset, namespace)
+		rMut, rErr := executeRerouteProcessorRound58(doc, specMap)
+		if rErr != nil {
+			return false, false, procType, procTag, specMap, rErr
 		}
-		if dest != "" {
-			doc["_index"] = dest
+		if rMut {
 			mutated = true
-			if dest != prevIdx {
-				doc["__internal_ingest_rerouted"] = true
-			}
 		}
 	default:
 		return false, false, procType, procTag, specMap, fmt.Errorf("no processor type exists with name [%s]", procType)
@@ -7007,11 +6825,30 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 		}
 		var prevMsg, prevType, prevTag, prevPipe any
 		var hadPrevMsg, hadPrevType, hadPrevTag, hadPrevPipe bool
+		var prevForeachVal, prevForeachKey any
+		var hadPrevForeachVal, hadPrevForeachKey bool
 		if preIngest, ok := doc["_ingest"].(map[string]any); ok && preIngest != nil {
 			prevMsg, hadPrevMsg = preIngest["on_failure_message"]
 			prevType, hadPrevType = preIngest["on_failure_processor_type"]
 			prevTag, hadPrevTag = preIngest["on_failure_processor_tag"]
 			prevPipe, hadPrevPipe = preIngest["on_failure_pipeline"]
+			prevForeachVal, hadPrevForeachVal = preIngest["_value"]
+			prevForeachKey, hadPrevForeachKey = preIngest["_key"]
+		}
+		restoreOuterForeachBindings := func(curIngest map[string]any) {
+			if curIngest == nil {
+				return
+			}
+			if hadPrevForeachVal {
+				curIngest["_value"] = prevForeachVal
+			} else {
+				delete(curIngest, "_value")
+			}
+			if hadPrevForeachKey {
+				curIngest["_key"] = prevForeachKey
+			} else {
+				delete(curIngest, "_key")
+			}
 		}
 		traceLenBefore := 0
 		if trace != nil {
@@ -7082,7 +6919,9 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 			return mutated, true, nil
 		}
 		if terminated, _ := doc["__internal_ingest_terminated"].(bool); terminated {
-			delete(doc, "__internal_ingest_terminated")
+			if depth == 0 {
+				delete(doc, "__internal_ingest_terminated")
+			}
 			return mutated, false, nil
 		}
 		if rerouted, _ := doc["__internal_ingest_rerouted"].(bool); rerouted {
@@ -7103,8 +6942,7 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 			if ignoreFail {
 				if curIngest, ok := doc["_ingest"].(map[string]any); ok {
 					if procType == "foreach" {
-						delete(curIngest, "_value")
-						delete(curIngest, "_key")
+						restoreOuterForeachBindings(curIngest)
 					}
 					if hadPrevMsg {
 						curIngest["on_failure_message"] = prevMsg
@@ -7157,8 +6995,7 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 				}
 				if procType == "foreach" {
 					if curIngest, ok := doc["_ingest"].(map[string]any); ok {
-						delete(curIngest, "_value")
-						delete(curIngest, "_key")
+						restoreOuterForeachBindings(curIngest)
 					}
 				}
 				if subDropped {
@@ -7189,12 +7026,23 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 						delete(curIngest, "on_failure_pipeline")
 					}
 				}
+				if terminated, _ := doc["__internal_ingest_terminated"].(bool); terminated {
+					if depth == 0 {
+						delete(doc, "__internal_ingest_terminated")
+					}
+					return mutated, false, nil
+				}
+				if rerouted, _ := doc["__internal_ingest_rerouted"].(bool); rerouted {
+					if depth == 0 {
+						delete(doc, "__internal_ingest_rerouted")
+					}
+					return mutated, false, nil
+				}
 				continue
 			}
 			if procType == "foreach" {
 				if curIngest, ok := doc["_ingest"].(map[string]any); ok {
-					delete(curIngest, "_value")
-					delete(curIngest, "_key")
+					restoreOuterForeachBindings(curIngest)
 				}
 			}
 			ingestMeta, _ := doc["_ingest"].(map[string]any)
@@ -7318,6 +7166,7 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 			mutated = true
 			subMut, subDropped, subErr := runIngestProcessorList(s, doc, pipeOnFail, 1, tracePtr)
 			delete(doc, "__internal_ingest_rerouted")
+			delete(doc, "__internal_ingest_terminated")
 			if subMut {
 				mutated = true
 			}
@@ -8306,10 +8155,13 @@ func (s *Server) handleCatShards(w http.ResponseWriter, r *http.Request) {
 			"shard":  "0",
 			"prirep": "p",
 			"state":  "STARTED",
+			"docs":   "0",
+			"store":  "0b",
+			"ip":     "127.0.0.1",
 			"node":   "doris-fe-1",
 		})
 	}
-	writeCatResponse(w, r, []string{"index", "shard", "prirep", "state", "node"}, rows)
+	writeCatResponse(w, r, []string{"index", "shard", "prirep", "state", "docs", "store", "ip", "node"}, rows)
 }
 
 // handleCatCount implements `GET /_cat/count`.
@@ -8376,118 +8228,15 @@ func (s *Server) handleCatHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeCatResponse(w http.ResponseWriter, r *http.Request, headers []string, rows []map[string]any) {
-	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
-		return
-	}
-	if isTruthyBoolQueryParam(r, "help") {
-		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.WriteHeader(http.StatusOK)
-		for _, h := range headers {
-			// #nosec G705 -- Content-Type is text/plain with X-Content-Type-Options: nosniff
-			_, _ = fmt.Fprintf(w, "%-20s |   | %s\n", h, h)
-		}
-		return
-	}
-
-	if rawSort := strings.TrimSpace(r.URL.Query().Get("s")); rawSort != "" && len(rows) > 1 {
-		type sortCol struct {
-			col  string
-			desc bool
-		}
-		var scols []sortCol
-		for _, part := range strings.Split(rawSort, ",") {
-			part = strings.TrimSpace(part)
-			if part == "" {
-				continue
-			}
-			col := part
-			desc := false
-			if colonIdx := strings.IndexByte(part, ':'); colonIdx > 0 {
-				col = strings.TrimSpace(part[:colonIdx])
-				ord := strings.ToLower(strings.TrimSpace(part[colonIdx+1:]))
-				desc = ord == "desc" || ord == "d"
-			}
-			scols = append(scols, sortCol{col: col, desc: desc})
-		}
-		if len(scols) > 0 {
-			sort.SliceStable(rows, func(i, j int) bool {
-				for _, sc := range scols {
-					cmp := compareAny(rows[i][sc.col], rows[j][sc.col])
-					if cmp != 0 {
-						if sc.desc {
-							return cmp > 0
-						}
-						return cmp < 0
-					}
-				}
-				return false
-			})
-		}
-	}
-
-	effHeaders := headers
-	hasCustomH := false
-	if rawH := strings.TrimSpace(r.URL.Query().Get("h")); rawH != "" {
-		var custom []string
-		for _, part := range strings.Split(rawH, ",") {
-			col := strings.TrimSpace(part)
-			if col != "" {
-				custom = append(custom, col)
-			}
-		}
-		if len(custom) > 0 {
-			effHeaders = custom
-			hasCustomH = true
-		}
-	}
-
-	format := strings.ToLower(r.URL.Query().Get("format"))
-	if format == "text" || format == "txt" {
-		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.WriteHeader(http.StatusOK)
-		if isTruthyBoolQueryParam(r, "v") {
-			// #nosec G705 -- Content-Type is text/plain with X-Content-Type-Options: nosniff
-			_, _ = fmt.Fprintln(w, strings.Join(effHeaders, "\t"))
-		}
-		for _, row := range rows {
-			vals := make([]string, 0, len(effHeaders))
-			for _, h := range effHeaders {
-				v, exists := row[h]
-				if !exists || v == nil {
-					vals = append(vals, "")
-				} else {
-					vals = append(vals, fmt.Sprintf("%v", v))
-				}
-			}
-			// #nosec G705 -- Content-Type is text/plain with X-Content-Type-Options: nosniff
-			_, _ = fmt.Fprintln(w, strings.Join(vals, "\t"))
-		}
-		return
-	}
-	if hasCustomH {
-		projected := make([]map[string]any, len(rows))
-		for i, row := range rows {
-			m := make(map[string]any, len(effHeaders))
-			for _, h := range effHeaders {
-				if v, ok := row[h]; ok {
-					m[h] = v
-				} else {
-					m[h] = nil
-				}
-			}
-			projected[i] = m
-		}
-		writeJSON(w, http.StatusOK, projected)
-		return
-	}
-	writeJSON(w, http.StatusOK, rows)
+	writeCatResponseRound58(w, r, headers, rows)
 }
 
 // handleReindex implements `POST /_reindex` to copy documents between indices with optional query filtering and Painless script mutation.
 func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodPost {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
 	start := time.Now()
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
@@ -8615,6 +8364,46 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "source.index and dest.index are required")
 		return
 	}
+	if closedIdx := s.findClosedTargetIndex(r, srcPattern); closedIdx != "" {
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
+		return
+	}
+	if _, reason := s.findReadBlockedTargetIndex(r, srcPattern); reason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
+	var srcTargets []string
+	var aliasFilters map[string]*esast.Query
+	if s.hasAuthoritativeIndexCatalog() {
+		var okSrc bool
+		srcTargets, aliasFilters, okSrc = s.resolveValidatedReadTargets(w, r, srcPattern)
+		if !okSrc {
+			return
+		}
+	} else {
+		srcTargets, aliasFilters = s.resolveTargetIndicesWithFilters(srcPattern)
+		if len(srcTargets) == 0 && !hasExclusionOrWildcard(srcPattern) {
+			srcTargets = []string{s.resolveIndexName(srcPattern)}
+		}
+	}
+	for _, srcIdx := range srcTargets {
+		if s.isIndexClosed(srcIdx) {
+			writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", srcIdx))
+			return
+		}
+		if blocked, reason := s.isIndexReadBlocked(srcIdx); blocked {
+			writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+			return
+		}
+	}
+	if stCode, stType, stReason := s.prepareAutoCreateTargetRound58(r.Context(), body.Dest.Index, destOpType == "create"); stCode != 0 {
+		writeESError(w, stCode, stType, stReason)
+		return
+	}
+	if s.isDataStream(strings.TrimSpace(body.Dest.Index)) && destOpType != "create" {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "only write ops with an op_type of create are allowed in data streams")
+		return
+	}
 	destIndex, destAliasFilter, writeErr := s.resolveWriteIndexWithFilter(body.Dest.Index)
 	if writeErr != nil {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", writeErr.Error())
@@ -8646,30 +8435,6 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var destSchema *schema.IndexSchema
-	srcTargets, aliasFilters := s.resolveTargetIndicesWithFilters(srcPattern)
-	if len(srcTargets) == 0 && !hasExclusionOrWildcard(srcPattern) {
-		srcTargets = []string{s.resolveIndexName(srcPattern)}
-	}
-	if closedIdx := s.findClosedTargetIndex(r, srcPattern); closedIdx != "" {
-		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
-		return
-	}
-	for _, srcIdx := range srcTargets {
-		if s.isIndexClosed(srcIdx) {
-			writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", srcIdx))
-			return
-		}
-	}
-	if _, reason := s.findReadBlockedTargetIndex(r, srcPattern); reason != "" {
-		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
-		return
-	}
-	for _, srcIdx := range srcTargets {
-		if blocked, reason := s.isIndexReadBlocked(srcIdx); blocked {
-			writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
-			return
-		}
-	}
 	aliasFilters = s.resolveTermsLookupsInAliasFilters(r.Context(), aliasFilters)
 
 	var totalMatched, totalCreated, totalUpdated, totalDeleted, totalNoops, versionConflicts, batches int
@@ -9546,10 +9311,13 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	applyURISearchParams(r, &req)
+	if err := applyAndValidateURISearchParamsRound58(r, &req); err != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+		return
+	}
 	if req.PIT != nil && req.PIT.ID != "" {
 		pitIdx, ok := decodePITIndex(req.PIT.ID)
-		if !ok || pitIdx == "" {
+		if !ok || pitIdx == "" || !s.isPITActive(req.PIT.ID) {
 			writeInvalidResp("invalid pit id ["+req.PIT.ID+"]", targets)
 			return
 		}
@@ -10420,7 +10188,10 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	applyURISearchParams(r, &req)
+	if err := applyAndValidateURISearchParamsRound58(r, &req); err != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+		return
+	}
 
 	idxSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
 	reqRouting := strings.TrimSpace(r.URL.Query().Get("routing"))

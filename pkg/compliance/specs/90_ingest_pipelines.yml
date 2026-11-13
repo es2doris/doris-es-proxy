@@ -873,4 +873,265 @@
   - match: { docs.0.doc._source.auto_str_int: 77 }
   - match: { docs.0.doc._source.auto_padded: " 77 " }
 
+---
+"Round 58 Ingest Pipeline Cycles, Terminate Scope, Nested Foreach, CSV, Dissect & Reroute":
+  # F27: Direct & indirect pipeline cycle detection at PUT time
+  - do:
+      catch: bad_request
+      ingest.put_pipeline:
+        id: r58_pipe_self
+        body:
+          processors:
+            - pipeline:
+                name: "r58_pipe_self"
+
+  - do:
+      ingest.put_pipeline:
+        id: r58_pipe_cycle_b
+        body:
+          processors:
+            - pipeline:
+                name: "r58_pipe_cycle_a"
+  - match: { acknowledged: true }
+
+  - do:
+      catch: bad_request
+      ingest.put_pipeline:
+        id: r58_pipe_cycle_a
+        body:
+          processors:
+            - pipeline:
+                name: "r58_pipe_cycle_b"
+
+  # F27: Sub-pipeline terminate halts outer pipeline while index.final_pipeline still runs
+  - do:
+      ingest.put_pipeline:
+        id: r58_pipe_sub_term
+        body:
+          processors:
+            - set:
+                field: "from_sub"
+                value: "yes"
+            - terminate: {}
+            - set:
+                field: "sub_after_term"
+                value: "should_not_run"
+  - match: { acknowledged: true }
+
+  - do:
+      ingest.put_pipeline:
+        id: r58_pipe_outer_term
+        body:
+          processors:
+            - pipeline:
+                name: "r58_pipe_sub_term"
+            - set:
+                field: "outer_after_sub"
+                value: "should_not_run"
+  - match: { acknowledged: true }
+
+  - do:
+      ingest.put_pipeline:
+        id: r58_pipe_final_term
+        body:
+          processors:
+            - set:
+                field: "from_final"
+                value: "ran"
+  - match: { acknowledged: true }
+
+  - do:
+      indices.create:
+        index: r58_ingest_term_idx
+        body:
+          settings:
+            index:
+              default_pipeline: "r58_pipe_outer_term"
+              final_pipeline: "r58_pipe_final_term"
+  - match: { acknowledged: true }
+
+  - do:
+      index:
+        index: r58_ingest_term_idx
+        id: "1"
+        refresh: true
+        body:
+          seed: "ok"
+
+  - do:
+      get:
+        index: r58_ingest_term_idx
+        id: "1"
+  - match: { _source.from_sub: "yes" }
+  - is_unset: _source.sub_after_term
+  - is_unset: _source.outer_after_sub
+  - match: { _source.from_final: "ran" }
+
+  # F27: Nested foreach restores outer _ingest._value when inner foreach fails with ignore_failure: true
+  - do:
+      ingest.put_pipeline:
+        id: r58_nested_foreach_inner
+        body:
+          processors:
+            - foreach:
+                field: "missing_inner_array"
+                ignore_failure: true
+                processor:
+                  uppercase:
+                    field: "_ingest._value"
+            - script:
+                source: "ctx.restored = ctx.restored == null ? [] : ctx.restored; ctx.restored.add(ctx._ingest._value.name)"
+  - match: { acknowledged: true }
+
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - foreach:
+                  field: "groups"
+                  processor:
+                    pipeline:
+                      name: "r58_nested_foreach_inner"
+          docs:
+            - _source:
+                groups:
+                  - { name: "g1" }
+                  - { name: "g2" }
+  - length: { docs.0.doc._source.restored: 2 }
+  - match: { docs.0.doc._source.restored.0: "g1" }
+  - match: { docs.0.doc._source.restored.1: "g2" }
+
+  # F28: CSV duplicate target_fields rejection, empty line, short row, TSV empty cells, and quoted empty string
+  - do:
+      catch: bad_request
+      ingest.put_pipeline:
+        id: r58_csv_dup
+        body:
+          processors:
+            - csv:
+                field: "line"
+                target_fields: ["a", "b", "a"]
+
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - csv:
+                  if: "ctx.mode == 'csv_emp'"
+                  field: "raw"
+                  target_fields: ["c1", "c2", "c3", "c4"]
+                  empty_value: "NA"
+              - csv:
+                  if: "ctx.mode == 'tsv'"
+                  field: "raw"
+                  separator: "\t"
+                  target_fields: ["t1", "t2", "t3"]
+                  empty_value: "EMPTY"
+              - csv:
+                  if: "ctx.mode == 'quoted'"
+                  field: "raw"
+                  target_fields: ["q1", "q2", "q3"]
+          docs:
+            - _source: { mode: "csv_emp", raw: "\n" }
+            - _source: { mode: "csv_emp", raw: "x,y" }
+            - _source: { mode: "tsv", raw: "\t\t" }
+            - _source: { mode: "quoted", raw: 'a,"",c' }
+  - is_unset: docs.0.doc._source.c1
+  - match: { docs.1.doc._source.c1: "x" }
+  - match: { docs.1.doc._source.c2: "y" }
+  - is_unset: docs.1.doc._source.c3
+  - is_unset: docs.1.doc._source.c4
+  - match: { docs.2.doc._source.t1: "EMPTY" }
+  - match: { docs.2.doc._source.t2: "EMPTY" }
+  - match: { docs.2.doc._source.t3: "EMPTY" }
+  - match: { docs.3.doc._source.q1: "a" }
+  - match: { docs.3.doc._source.q2: "" }
+  - match: { docs.3.doc._source.q3: "c" }
+
+  # F29: Dissect grammar validation, right-padding ->, and reroute ignore_missing / processor halt
+  - do:
+      catch: bad_request
+      ingest.put_pipeline:
+        id: r58_bad_dissect_ref
+        body:
+          processors:
+            - dissect:
+                field: "msg"
+                pattern: "%{&dangling}"
+
+  - do:
+      catch: bad_request
+      ingest.put_pipeline:
+        id: r58_bad_dissect_adj
+        body:
+          processors:
+            - dissect:
+                field: "msg"
+                pattern: "%{a}%{b}"
+
+  - do:
+      ingest.put_pipeline:
+        id: r58_good_dissect
+        body:
+          processors:
+            - dissect:
+                field: "msg"
+                pattern: "%{} %{?ignored->} %{col1->} %{*k} %{&k}"
+  - match: { acknowledged: true }
+
+  - do:
+      ingest.simulate:
+        id: r58_good_dissect
+        body:
+          docs:
+            - _source:
+                msg: "DROP SKIP     val_one      dyn_key dyn_val"
+  - match: { docs.0.doc._source.col1: "val_one" }
+  - match: { docs.0.doc._source.dyn_key: "dyn_val" }
+  - is_unset: docs.0.doc._source.ignored
+
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - reroute:
+                  destination: "logs-{{missing_target}}"
+                  ignore_missing: false
+          docs:
+            - _index: "logs-generic-default"
+              _source: { msg: "hello" }
+  - is_true: docs.0.error
+
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - reroute:
+                  destination: "logs-{{missing_target}}"
+          docs:
+            - _index: "logs-generic-default"
+              _source: { msg: "hello" }
+  - is_unset: docs.0.error
+  - match: { docs.0.doc._index: "logs-generic-default" }
+
+  - do:
+      ingest.simulate:
+        body:
+          pipeline:
+            processors:
+              - reroute:
+                  destination: "logs-generic-default"
+              - set:
+                  field: "after_reroute"
+                  value: true
+          docs:
+            - _index: "logs-generic-default"
+              _source: { msg: "hello" }
+  - is_unset: docs.0.doc._source.after_reroute
+
+
 
