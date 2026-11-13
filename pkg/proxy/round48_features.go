@@ -3513,7 +3513,8 @@ func (s *Server) handleIndexOpen(w http.ResponseWriter, r *http.Request) {
 	var targets []string
 	if rawIndex != "" {
 		var ok bool
-		targets, _, ok = s.resolveValidatedReadTargets(w, r, rawIndex)
+		rOpen := withDefaultExpandWildcardsRound59(r, "open,closed")
+		targets, _, ok = s.resolveValidatedReadTargets(w, rOpen, rawIndex)
 		if !ok {
 			return
 		}
@@ -3523,9 +3524,11 @@ func (s *Server) handleIndexOpen(w http.ResponseWriter, r *http.Request) {
 		delete(s.closedIndices, idx)
 	}
 	s.mu.Unlock()
+	s.persistIndexBatchRound59(r.Context(), targets)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"acknowledged":        true,
 		"shards_acknowledged": true,
+		"shook_acknowledged":  true,
 	})
 }
 
@@ -3535,6 +3538,9 @@ func (s *Server) handleIndexClose(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rawIndex := strings.TrimSpace(r.PathValue("index"))
+	if !s.checkCloseDataStreamTargetRound59(w, rawIndex) {
+		return
+	}
 	var targets []string
 	if rawIndex != "" {
 		var ok bool
@@ -3551,6 +3557,7 @@ func (s *Server) handleIndexClose(w http.ResponseWriter, r *http.Request) {
 		s.closedIndices[idx] = true
 	}
 	s.mu.Unlock()
+	s.persistIndexBatchRound59(r.Context(), targets)
 	indicesOut := make(map[string]any, len(targets))
 	for _, idx := range targets {
 		indicesOut[idx] = map[string]any{"closed": true}

@@ -818,7 +818,7 @@ func TestRound8_LuceneParserBoostRegexDanglingOpsAndDoris4Pushdown(t *testing.T)
 	if strings.Contains(planQS.HitsSQL, "'NOT'") {
 		t.Fatalf("dangling NOT was parsed as a literal term: %s", planQS.HitsSQL)
 	}
-	if !strings.Contains(planQS.HitsSQL, "REGEXP 'err/5[0-9]+'") || !strings.Contains(planQS.HitsSQL, "2.5") {
+	if !strings.Contains(planQS.HitsSQL, "REGEXP '^(?:err/5[0-9]+)$'") || !strings.Contains(planQS.HitsSQL, "2.5") {
 		t.Fatalf("expected unescaped regex pattern and boost 2.5 in SQL, got: %s", planQS.HitsSQL)
 	}
 

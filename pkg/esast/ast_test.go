@@ -2862,3 +2862,113 @@ func TestRound58ASTCompliance_F14ToF18(t *testing.T) {
 		}
 	}
 }
+
+func TestRound59_ASTValidationAndHelpers(t *testing.T) {
+	// F14: ExpandHexBitVector & hex query_vector on KNNQuery / KNNRetrieverSpec + FieldProperty.ElementType
+	bits, err := ExpandHexBitVector("800f")
+	if err != nil || len(bits) != 16 {
+		t.Fatalf("ExpandHexBitVector('800f') failed: bits=%v err=%v", bits, err)
+	}
+	wantBits := []float64{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1}
+	for i := range wantBits {
+		if bits[i] != wantBits[i] {
+			t.Fatalf("bit[%d] = %v, want %v", i, bits[i], wantBits[i])
+		}
+	}
+	if _, err := ExpandHexBitVector("abc"); err == nil {
+		t.Fatalf("expected odd-length hex string to fail")
+	}
+	if _, err := ExpandHexBitVector("zz"); err == nil {
+		t.Fatalf("expected non-hex string to fail")
+	}
+
+	var srKNNHex SearchRequest
+	if err := json.Unmarshal([]byte(`{"knn":{"field":"bv","query_vector":"a5","k":5,"num_candidates":10}}`), &srKNNHex); err != nil {
+		t.Fatalf("KNN hex query_vector unmarshal failed: %v", err)
+	}
+	if len(srKNNHex.KNN) != 1 || !srKNNHex.KNN[0].QueryVectorFromHex || len(srKNNHex.KNN[0].QueryVector) != 8 {
+		t.Fatalf("unexpected KNN hex result: %+v", srKNNHex.KNN)
+	}
+	var srKNNBad SearchRequest
+	if err := json.Unmarshal([]byte(`{"knn":{"field":"bv","query_vector":"xyz","k":5}}`), &srKNNBad); err == nil {
+		t.Fatalf("expected invalid hex query_vector on knn to fail")
+	}
+	var srRetHex SearchRequest
+	if err := json.Unmarshal([]byte(`{"retriever":{"knn":{"field":"bv","query_vector":"f0","k":3,"num_candidates":5}}}`), &srRetHex); err != nil {
+		t.Fatalf("KNNRetriever hex query_vector unmarshal failed: %v", err)
+	}
+	if srRetHex.Retriever == nil || srRetHex.Retriever.KNN == nil || !srRetHex.Retriever.KNN.QueryVectorFromHex || len(srRetHex.Retriever.KNN.QueryVector) != 8 {
+		t.Fatalf("unexpected KNNRetriever hex result: %+v", srRetHex.Retriever)
+	}
+
+	var ms MappingSpec
+	if err := json.Unmarshal([]byte(`{"properties":{"v":{"type":"dense_vector","dims":16,"element_type":"bit"}}}`), &ms); err != nil {
+		t.Fatalf("MappingSpec element_type unmarshal failed: %v", err)
+	}
+	if ms.Properties["v"].ElementType != "bit" {
+		t.Fatalf("expected ElementType='bit', got %q", ms.Properties["v"].ElementType)
+	}
+
+	// F16: RegexpEntry preserves Flags (default "ALL" vs explicit)
+	var srReg1, srReg2 SearchRequest
+	if err := json.Unmarshal([]byte(`{"query":{"regexp":{"tag":"ab.*"}}}`), &srReg1); err != nil {
+		t.Fatalf("shorthand regexp unmarshal failed: %v", err)
+	}
+	if srReg1.Query.Regexp["tag"].Flags != "ALL" {
+		t.Fatalf("expected default Flags='ALL', got %q", srReg1.Query.Regexp["tag"].Flags)
+	}
+	if err := json.Unmarshal([]byte(`{"query":{"regexp":{"tag":{"value":"ab.*","flags":"NONE","case_insensitive":true}}}}`), &srReg2); err != nil {
+		t.Fatalf("full regexp unmarshal failed: %v", err)
+	}
+	if srReg2.Query.Regexp["tag"].Flags != "NONE" || !srReg2.Query.Regexp["tag"].CaseInsensitive {
+		t.Fatalf("expected Flags='NONE' and CaseInsensitive=true, got %+v", srReg2.Query.Regexp["tag"])
+	}
+
+	// F17: TermsQuery rejects null and nested array/object elements
+	for _, tc := range []struct {
+		raw     string
+		wantSub string
+	}{
+		{`{"query":{"terms":{"tag":["a", null]}}}`, "illegal_argument_exception"},
+		{`{"query":{"terms":{"tag":[["nested"]]}}}`, "parsing_exception"},
+		{`{"query":{"terms":{"tag":[{"obj":1}]}}}`, "parsing_exception"},
+	} {
+		var sr SearchRequest
+		err := json.Unmarshal([]byte(tc.raw), &sr)
+		if err == nil || !strings.Contains(err.Error(), tc.wantSub) {
+			t.Fatalf("F17 expected %q error for %s, got %v", tc.wantSub, tc.raw, err)
+		}
+	}
+
+	// F19: HistogramBoundsSpec min <= max validation, ParseESTimeZone, EffectiveCalendarUnit
+	for _, badAgg := range []string{
+		`{"aggs":{"dh":{"date_histogram":{"field":"ts","calendar_interval":"1M","extended_bounds":{"min":200,"max":100}}}}}`,
+		`{"aggs":{"dh":{"date_histogram":{"field":"ts","calendar_interval":"1M","hard_bounds":{"min":"2026-06-01","max":"2026-01-01"}}}}}`,
+		`{"aggs":{"dh":{"date_histogram":{"field":"ts","calendar_interval":"1d","time_zone":"Mars/Phobos"}}}}`,
+		`{"aggs":{"dh":{"date_histogram":{"field":"ts","calendar_interval":"1d","time_zone":"+25:99"}}}}`,
+	} {
+		var sr SearchRequest
+		if err := json.Unmarshal([]byte(badAgg), &sr); err == nil {
+			t.Fatalf("F19 expected error for %s, got nil", badAgg)
+		}
+	}
+
+	var srDH SearchRequest
+	if err := json.Unmarshal([]byte(`{"aggs":{"dh":{"date_histogram":{"field":"ts","calendar_interval":"1q","time_zone":"America/New_York","extended_bounds":{"min":"2026-01-01","max":"2026-12-31"}}}}}`), &srDH); err != nil {
+		t.Fatalf("valid date_histogram failed: %v", err)
+	}
+	dh := srDH.Aggs["dh"].DateHistogram
+	if !dh.IsCalendarInterval() || dh.EffectiveCalendarUnit() != "quarter" {
+		t.Fatalf("expected quarter calendar unit, got %q", dh.EffectiveCalendarUnit())
+	}
+	fixedDH := &DateHistogramAggSpec{FixedInterval: "2h"}
+	if fixedDH.IsCalendarInterval() || fixedDH.EffectiveCalendarUnit() != "" {
+		t.Fatalf("expected fixed_interval not to be calendar interval")
+	}
+	if loc, _, isFixed, err := ParseESTimeZone("America/New_York"); err != nil || loc == nil || isFixed {
+		t.Fatalf("ParseESTimeZone('America/New_York') failed: loc=%v isFixed=%v err=%v", loc, isFixed, err)
+	}
+	if _, offMs, isFixed, err := ParseESTimeZone("-05:30"); err != nil || !isFixed || offMs != -19800000 {
+		t.Fatalf("ParseESTimeZone('-05:30') failed: offMs=%d isFixed=%v err=%v", offMs, isFixed, err)
+	}
+}

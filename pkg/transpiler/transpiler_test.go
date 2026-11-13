@@ -158,7 +158,7 @@ func TestTranspileOpenMetadataSearchAndFacetAggregations(t *testing.T) {
 		"array_exists(_el -> (json_extract_string(_el, '$.name') = 'user_id') AND (json_extract_string(_el, '$.dataType') = 'INT'), `n__columns`)",
 		"array_contains(`f__tags__tagFQN`, 'PII.Sensitive')",
 		"`f__serviceType` IN ('BigQuery', 'Snowflake')",
-		"LOG10(1.0 + GREATEST(0.0, (0.0500 * COALESCE(`f__usageSummary__weeklyStats__count`, 0.0000))))",
+		"LOG10(GREATEST(1e-300, 1.0 + (0.0500 * COALESCE(`f__usageSummary__weeklyStats__count`, 0.0000))))",
 		"ORDER BY `_score` DESC, `f__updatedAt` DESC",
 		"LIMIT 20 OFFSET 0",
 	}
@@ -404,7 +404,7 @@ func TestCriticalBug2_FulltextInSelect_MinimumShouldMatch_LuceneRangeAndExists_D
 	knnJSON := `{
 		"knn": {
 			"field": "embedding",
-			"query_vector": [0.5, 0.5, 0.0],
+			"query_vector": [0.6, 0.8, 0.0],
 			"k": 5,
 			"filter": {"match": {"title": "orders"}}
 		}
@@ -1545,7 +1545,7 @@ func TestRound31BugFixesAndUntestedSubsystems(t *testing.T) {
 				"must": [
 					{"knn": {"field": "vec_cos", "query_vector": [0.1, 0.2], "k": 5, "similarity": 0.8, "filter": [{"term": {"status": "ok"}}], "boost": 1.5}},
 					{"knn": {"field": "vec_l2", "query_vector": [0.3, 0.4], "k": 5, "similarity": 1.5}},
-					{"knn": {"field": "vec_dot", "query_vector": [0.5, 0.6], "k": 5, "similarity": 0.5}},
+					{"knn": {"field": "vec_dot", "query_vector": [0.6, 0.8], "k": 5, "similarity": 0.5}},
 					{"knn": {"field": "unmapped_vec", "query_vector": [0.7, 0.8], "k": 5}},
 					{"term": {"client_ip": "10.0.0.0/8"}},
 					{"term": {"ip_list": "192.168.1.0/24"}},
@@ -3366,15 +3366,15 @@ func TestRound49TranspilerSpecCompliance(t *testing.T) {
 		t.Fatalf("F12 expected MLT to use item fields=['title'] and filter min_term_freq=2 (keeping only 'alpha'), got %s", cqMLT.WhereSQL)
 	}
 
-	// F13: unsigned_long in (math.MaxInt64, math.MaxUint64] uses CAST(`_doc`['u_val'] AS LARGEINT) and exact uint64 literal
+	// F13 (updated in Round 59 F10): unsigned_long in (math.MaxInt64, math.MaxUint64] uses physical LARGEINT column f__u_val and exact uint64 literal
 	var uTermQ, uRangeQ esast.Query
 	_ = json.Unmarshal([]byte(`{"term": {"u_val": "18446744073709551615"}}`), &uTermQ)
 	_ = json.Unmarshal([]byte(`{"range": {"u_val": {"gt": "9223372036854775807", "lte": "18446744073709551615"}}}`), &uRangeQ)
-	if w := tr.CompileQuery(&uTermQ, false, nil).WhereSQL; !strings.Contains(w, "LARGEINT") || !strings.Contains(w, "18446744073709551615") || strings.Contains(w, "-9223372036854775808") {
-		t.Fatalf("F13 expected LARGEINT and exact uint64 literal in term query, got %s", w)
+	if w := tr.CompileQuery(&uTermQ, false, nil).WhereSQL; !strings.Contains(w, "`f__u_val`") || !strings.Contains(w, "18446744073709551615") || strings.Contains(w, "-9223372036854775808") {
+		t.Fatalf("F13 expected physical LARGEINT f__u_val and exact uint64 literal in term query, got %s", w)
 	}
-	if w := tr.CompileQuery(&uRangeQ, false, nil).WhereSQL; !strings.Contains(w, "LARGEINT") || !strings.Contains(w, "9223372036854775807") || !strings.Contains(w, "18446744073709551615") || strings.Contains(w, "-9223372036854775808") {
-		t.Fatalf("F13 expected LARGEINT and no int64 overflow in range query, got %s", w)
+	if w := tr.CompileQuery(&uRangeQ, false, nil).WhereSQL; !strings.Contains(w, "`f__u_val`") || !strings.Contains(w, "9223372036854775807") || !strings.Contains(w, "18446744073709551615") || strings.Contains(w, "-9223372036854775808") {
+		t.Fatalf("F13 expected physical LARGEINT f__u_val and no int64 overflow in range query, got %s", w)
 	}
 
 	// F14: parent_id does not emit bare OR `_routing` = '...' when join field is mapped; unmapped child type errors unless ignore_unmapped:true; percolate validates field type
@@ -3435,7 +3435,7 @@ func TestRound49TranspilerSpecCompliance(t *testing.T) {
 	var verRangeQ esast.Query
 	_ = json.Unmarshal([]byte(`{"range": {"ver": {"gt": "1.2.0", "lte": "1.10.0"}}}`), &verRangeQ)
 	wVer := tr.CompileQuery(&verRangeQ, false, nil).WhereSQL
-	if !strings.Contains(wVer, "LPAD") || !strings.Contains(wVer, "0000000001.0000000002.0000000000~") || !strings.Contains(wVer, "0000000001.0000000010.0000000000~") {
+	if !strings.Contains(wVer, "LPAD") || !strings.Contains(wVer, "00000000000000000001.00000000000000000002.00000000000000000000~") || !strings.Contains(wVer, "00000000000000000001.00000000000000000010.00000000000000000000~") {
 		t.Fatalf("F18 expected semver padded sort key comparison in range query on version field, got %s", wVer)
 	}
 
@@ -3818,11 +3818,11 @@ func TestRound52TranspilerF12AndF15ToF19(t *testing.T) {
 		t.Fatalf("F12 expected date_histogram hard_bounds SQL filter, got %s", planDH.AggsSQL)
 	}
 
-	// F15: dynamic variant constant_keyword coalesces with ConstantValue
+	// F15 (updated in Round 59 F13): dynamic variant constant_keyword does NOT inject ConstantValue via COALESCE on null/missing fields
 	var ckQ esast.Query
 	_ = json.Unmarshal([]byte(`{"term":{"dyn_env":"production"}}`), &ckQ)
-	if w := tr.CompileQuery(&ckQ, false, nil).WhereSQL; !strings.Contains(w, "COALESCE(") || !strings.Contains(w, "'production'") {
-		t.Fatalf("F15 expected COALESCE with 'production' for dynamic variant constant_keyword, got %s", w)
+	if w := tr.CompileQuery(&ckQ, false, nil).WhereSQL; strings.Contains(w, "COALESCE(") || !strings.Contains(w, "'production'") {
+		t.Fatalf("F13 expected no COALESCE injection on dynamic variant constant_keyword, got %s", w)
 	}
 
 	// F16: exists on flattened field excludes '{}' and 'null'
@@ -4372,15 +4372,15 @@ func TestRound56TranspilerAndLuceneF15ToF19(t *testing.T) {
 	var okVerRange esast.Query
 	_ = json.Unmarshal([]byte(`{"range":{"ver":{"gte":"1.0.0-rc.2","lt":"1.0.0-rc.10"}}}`), &okVerRange)
 	wVerRange := tr.CompileQuery(&okVerRange, false, nil).WhereSQL
-	if !strings.Contains(wVerRange, "0000000001.0000000000.0000000000-rc.0000000002") || !strings.Contains(wVerRange, "0000000001.0000000000.0000000000-rc.0000000010") {
-		t.Fatalf("F15 expected 10-digit padded numeric pre-release keys in SQL, got %s", wVerRange)
+	if !strings.Contains(wVerRange, "00000000000000000001.00000000000000000000.00000000000000000000-1:rc 0:00000000000000000002") || !strings.Contains(wVerRange, "00000000000000000001.00000000000000000000.00000000000000000000-1:rc 0:00000000000000000010") {
+		t.Fatalf("F15 expected 20-digit SemVer 2.0.0 tagged pre-release keys in SQL, got %s", wVerRange)
 	}
 
 	var qVerTermBuild, qVerTermBad, qVerTerms esast.Query
 	_ = json.Unmarshal([]byte(`{"term":{"ver":"1.2.3-rc.1+build.42"}}`), &qVerTermBuild)
 	wVerTerm := tr.CompileQuery(&qVerTermBuild, false, nil).WhereSQL
-	if !strings.Contains(wVerTerm, "SPLIT_PART(`f__ver`, '+', 1) = '1.2.3-rc.1'") {
-		t.Fatalf("F15 expected SPLIT_PART +build stripping in version term query, got %s", wVerTerm)
+	if !strings.Contains(wVerTerm, "COALESCE(SPLIT_PART(`f__ver`, '+', 1), `f__ver`) = '1.2.3-rc.1'") {
+		t.Fatalf("F15 expected COALESCE(SPLIT_PART(...)) +build stripping in version term query, got %s", wVerTerm)
 	}
 	_ = json.Unmarshal([]byte(`{"term":{"ver":"not_semver"}}`), &qVerTermBad)
 	if w := tr.CompileQuery(&qVerTermBad, false, nil).WhereSQL; w != "FALSE" {
@@ -4531,7 +4531,7 @@ func TestRound56TranspilerAndLuceneF15ToF19(t *testing.T) {
 	strictValidQueries := []string{
 		`{"query":{"query_string":{"default_field":"title","query":"\"foo bar\"~10"}}}`,
 		`{"query":{"query_string":{"default_field":"title","query":"foo~2 OR bar~0.8 OR baz~auto OR qux~"}}}`,
-		`{"query":{"query_string":{"default_field":"code","query":"/ab(c~3/"}}}`,
+		`{"query":{"query_string":{"default_field":"code","query":"/ab(c)~3/"}}}`,
 		`{"query":{"query_string":{"query":"\"unclosed","lenient":true}}}`,
 		`{"query":{"query_string":{"query":"foo~9","escape":true}}}`,
 	}
@@ -4697,8 +4697,8 @@ func TestRound57TranspilerAndLuceneCompliance(t *testing.T) {
 		if err != nil {
 			t.Fatalf("F17 BuildSearchPlan %s failed: %v", uq.raw, err)
 		}
-		if strings.Contains(plan.HitsSQL, "`f__u_val`") || !strings.Contains(plan.HitsSQL, "CAST(`_doc`['u_val'] AS LARGEINT)") {
-			t.Fatalf("F17 expected LARGEINT _doc cast without f__u_val for %s, got %s", uq.raw, plan.HitsSQL)
+		if !strings.Contains(plan.HitsSQL, "`f__u_val`") || strings.Contains(plan.HitsSQL, "CAST(`_doc`['u_val'] AS LARGEINT)") {
+			t.Fatalf("F10 expected physical LARGEINT column f__u_val for %s, got %s", uq.raw, plan.HitsSQL)
 		}
 		if strings.Contains(plan.HitsSQL, "-9223372036854775808") {
 			t.Fatalf("F17 unexpected signed wraparound -9223372036854775808 for %s: %s", uq.raw, plan.HitsSQL)
@@ -4726,8 +4726,8 @@ func TestRound57TranspilerAndLuceneCompliance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("F17 BuildSearchPlan uAggSR failed: %v", err)
 	}
-	if strings.Contains(uAggPlan.AggsSQL, "`f__u_val`") || !strings.Contains(uAggPlan.AggsSQL, "CAST(`_doc`['u_val'] AS LARGEINT)") {
-		t.Fatalf("F17 expected terms agg & sub-agg to use LARGEINT _doc cast, got %s", uAggPlan.AggsSQL)
+	if !strings.Contains(uAggPlan.AggsSQL, "`f__u_val`") || strings.Contains(uAggPlan.AggsSQL, "CAST(`_doc`['u_val'] AS LARGEINT)") {
+		t.Fatalf("F10 expected terms agg & sub-agg to use physical LARGEINT column f__u_val, got %s", uAggPlan.AggsSQL)
 	}
 
 	// F18: float_range/double_range CONTAINS exclusive gt/lt uses Nextafter & multi-valued array_exists on _r subcolumn
@@ -4894,8 +4894,8 @@ func TestRound58Transpiler_F10ToF19(t *testing.T) {
 	if err != nil {
 		t.Fatalf("F13 BuildSearchPlan failed: %v", err)
 	}
-	if !strings.Contains(planF13.HitsSQL, "['_h']") || !strings.Contains(planF13.AggsSQL, "PERCENTILE_APPROX_WEIGHTED") {
-		t.Fatalf("F13 expected _h range and PERCENTILE_APPROX_WEIGHTED aggs, got hits=%s aggs=%s", planF13.HitsSQL, planF13.AggsSQL)
+	if !strings.Contains(planF13.HitsSQL, "['_h']") || !strings.Contains(planF13.AggsSQL, "_hwcum") {
+		t.Fatalf("F13 expected _h range and exact _hwcum weighted quantile aggs, got hits=%s aggs=%s", planF13.HitsSQL, planF13.AggsSQL)
 	}
 	for _, badHistReq := range []string{
 		`{"query":{"term":{"lat_hist":10}}}`,
@@ -4987,6 +4987,170 @@ func TestRound58Transpiler_F10ToF19(t *testing.T) {
 		t.Fatalf("F19 BuildSearchPlan failed: %v", err)
 	}
 	if !strings.Contains(planF19.HitsSQL, "IS NULL OR NOT") || strings.Contains(planF19.HitsSQL, "COALESCE(`title` MATCH") {
-		t.Fatalf("F19 expected De Morgan NULL-safe IS NULL OR NOT without COALESCE around MATCH_*, got %s", planF19.HitsSQL)
+		t.Fatalf("F19 expected De Morgan NULL-safe negation without COALESCE around MATCH_*, got %s", planF19.HitsSQL)
+	}
+}
+
+func TestRound59_TranspilerCompliance(t *testing.T) {
+	var spec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"ul": {"type": "unsigned_long"},
+			"env": {"type": "constant_keyword", "value": "prod"},
+			"dp_vec": {"type": "dense_vector", "dims": 2, "similarity": "dot_product"},
+			"bit_vec": {"type": "dense_vector", "dims": 8, "element_type": "bit"},
+			"unidx_vec": {"type": "dense_vector", "index": false},
+			"ver": {"type": "version"},
+			"vers": {"type": "version"},
+			"tag": {"type": "keyword"},
+			"tags": {"type": "keyword"},
+			"score_num": {"type": "double"},
+			"ts": {"type": "date"}
+		}
+	}`), &spec); err != nil {
+		t.Fatal(err)
+	}
+	idxSchema := schema.CompileIndexSchema("es_db", "r59_tr", &spec)
+	versBinding := idxSchema.Fields["vers"]
+	versBinding.Kind = schema.StoragePromotedArray
+	versBinding.ColumnName = "arr__vers"
+	idxSchema.Fields["vers"] = versBinding
+	tagsBinding := idxSchema.Fields["tags"]
+	tagsBinding.Kind = schema.StoragePromotedArray
+	tagsBinding.ColumnName = "arr__tags"
+	idxSchema.Fields["tags"] = tagsBinding
+	idxSchema.MaxTermsCount = 3
+
+	tr := &Transpiler{Schema: idxSchema}
+
+	// F10: unsigned_long negative short-circuiting, clamping, and MaxUint64 LARGEINT cast
+	for _, negReq := range []string{
+		`{"query":{"term":{"ul":-1}}}`,
+		`{"query":{"range":{"ul":{"lt":0}}}}`,
+		`{"query":{"range":{"ul":{"lte":-5}}}}`,
+	} {
+		var sr esast.SearchRequest
+		_ = json.Unmarshal([]byte(negReq), &sr)
+		plan, err := tr.BuildSearchPlan(&sr)
+		if err != nil || !strings.Contains(plan.HitsSQL, "FALSE") {
+			t.Fatalf("F10 expected FALSE for %s, got sql=%s err=%v", negReq, plan.HitsSQL, err)
+		}
+	}
+	var srULClamp esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"bool":{"must":[{"range":{"ul":{"gt":-10}}},{"term":{"ul":18446744073709551615}}]}}}`), &srULClamp)
+	planUL, err := tr.BuildSearchPlan(&srULClamp)
+	if err != nil || !strings.Contains(planUL.HitsSQL, ">= 0") || !strings.Contains(planUL.HitsSQL, "18446744073709551615") {
+		t.Fatalf("F10 unexpected unsigned_long clamp/max SQL: %s (err=%v)", planUL.HitsSQL, err)
+	}
+
+	// F13: constant_keyword must NOT wrap column in COALESCE(..., 'prod')
+	var srCK esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"term":{"env":"prod"}}}`), &srCK)
+	planCK, err := tr.BuildSearchPlan(&srCK)
+	if err != nil || strings.Contains(planCK.HitsSQL, "COALESCE(`env`, 'prod')") {
+		t.Fatalf("F13 expected no COALESCE injection on constant_keyword, got %s (err=%v)", planCK.HitsSQL, err)
+	}
+
+	// F14: dense_vector dot_product unit-length check, index:false rejection, and bit Hamming scoring
+	for _, badKNN := range []string{
+		`{"knn":{"field":"dp_vec","query_vector":[3.0,4.0],"k":5,"num_candidates":10}}`,
+		`{"knn":{"field":"unidx_vec","query_vector":[1.0,0.0],"k":5,"num_candidates":10}}`,
+	} {
+		var sr esast.SearchRequest
+		_ = json.Unmarshal([]byte(badKNN), &sr)
+		if _, err := tr.BuildSearchPlan(&sr); err == nil {
+			t.Fatalf("F14 expected error for %s", badKNN)
+		}
+	}
+	var srBitKNN esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"knn":{"field":"bit_vec","query_vector":"f0","k":5,"num_candidates":10}}`), &srBitKNN)
+	planBit, err := tr.BuildSearchPlan(&srBitKNN)
+	if err != nil || !strings.Contains(planBit.HitsSQL, "POW(L2_DISTANCE(") {
+		t.Fatalf("F14 expected Hamming L2_DISTANCE score SQL for bit dense_vector, got %s (err=%v)", planBit.HitsSQL, err)
+	}
+
+	// F15: multi-valued version terms IN (...) & SemVer 2.0.0 pre-release precedence
+	var srVerTerms esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"terms":{"vers":["1.0.0+build1","2.0.0"]}}}`), &srVerTerms)
+	planVer, err := tr.BuildSearchPlan(&srVerTerms)
+	if err != nil || !strings.Contains(planVer.HitsSQL, "COALESCE(SPLIT_PART(_x, '+', 1), _x) IN ('1.0.0', '2.0.0')") {
+		t.Fatalf("F15 expected IN ('1.0.0', '2.0.0') inside array_exists, got %s (err=%v)", planVer.HitsSQL, err)
+	}
+	orderedVers := []string{
+		"1.0.0-1",
+		"1.0.0-2",
+		"1.0.0-10",
+		"1.0.0-alpha",
+		"1.0.0-alpha.1",
+		"1.0.0-alpha.beta",
+		"1.0.0-beta",
+		"1.0.0-beta.2",
+		"1.0.0-beta.11",
+		"1.0.0-rc.1",
+		"1.0.0",
+		"1.2.0",
+		"1.10.0",
+		"100000000000.0.0",
+	}
+	for i := 0; i+1 < len(orderedVers); i++ {
+		if CompareSemverStrings(orderedVers[i], orderedVers[i+1]) >= 0 {
+			t.Fatalf("F15 SemVer order failed: expected %q < %q", orderedVers[i], orderedVers[i+1])
+		}
+	}
+
+	// F16: Lucene regexp full-term anchoring, literal ^/$, @, #, <min-max>, &, ~, and flags="NONE"
+	var srReg esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"bool":{"must":[
+		{"regexp":{"tag":"foo"}},
+		{"regexp":{"tag":"v<1-12>&~(v5)"}},
+		{"regexp":{"tags":"ab.*&~(abc)"}},
+		{"regexp":{"tag":"ab~cd"}},
+		{"regexp":{"tag":{"value":"a^b$c@","flags":"NONE"}}}
+	]}}}`), &srReg)
+	planReg, err := tr.BuildSearchPlan(&srReg)
+	if err != nil {
+		t.Fatalf("F16 BuildSearchPlan failed: %v", err)
+	}
+	if !strings.Contains(planReg.HitsSQL, "^(?:foo)$") || !strings.Contains(planReg.HitsSQL, "NOT (") || !strings.Contains(planReg.HitsSQL, `\\^b\\$c@`) {
+		t.Fatalf("F16 unexpected regexp SQL: %s", planReg.HitsSQL)
+	}
+	var srRegEmpty esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"regexp":{"tag":"#"}}}`), &srRegEmpty)
+	planEmpty, err := tr.BuildSearchPlan(&srRegEmpty)
+	if err != nil || !strings.Contains(planEmpty.HitsSQL, "FALSE") {
+		t.Fatalf("F16 expected '#' empty language to compile to FALSE, got %s (err=%v)", planEmpty.HitsSQL, err)
+	}
+	var srRegBad esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"regexp":{"tag":"[unclosed"}}}`), &srRegBad)
+	if _, err := tr.BuildSearchPlan(&srRegBad); err == nil {
+		t.Fatalf("F16 expected invalid regexp '[unclosed' to return error")
+	}
+
+	// F17: MaxTermsCount enforcement (limit = 3)
+	var srTooManyTerms esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"terms":{"tag":["t1","t2","t3","t4"]}}}`), &srTooManyTerms)
+	if _, err := tr.BuildSearchPlan(&srTooManyTerms); err == nil || !strings.Contains(err.Error(), "max_terms_count") {
+		t.Fatalf("F17 expected max_terms_count error, got %v", err)
+	}
+
+	// F18: field_value_factor reciprocal (1/x), missing-field 0.0, and domain error sentinel
+	var srFVF esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"query":{"function_score":{"field_value_factor":{"field":"score_num","modifier":"reciprocal"}}}}`), &srFVF)
+	planFVF, err := tr.BuildSearchPlan(&srFVF)
+	if err != nil || !strings.Contains(planFVF.HitsSQL, "1.0 / ") || strings.Contains(planFVF.HitsSQL, "1.0 / (1.0 +") {
+		t.Fatalf("F18 expected 1.0 / x (not 1/(1+x)) for reciprocal, got %s (err=%v)", planFVF.HitsSQL, err)
+	}
+
+	// F19: date_histogram calendar interval + IANA DST & fixed-offset timezone SQL
+	var srCalDH esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"size":0,"aggs":{
+		"by_month":{"date_histogram":{"field":"ts","calendar_interval":"1M","time_zone":"America/New_York","offset":"+15m"}},
+		"by_month_pos":{"date_histogram":{"field":"ts","calendar_interval":"1q","time_zone":"+05:30"}},
+		"by_month_neg":{"date_histogram":{"field":"ts","calendar_interval":"1y","time_zone":"-04:00"}},
+		"by_fixed_ny":{"date_histogram":{"field":"ts","fixed_interval":"6h","time_zone":"America/New_York","offset":"+10m"}}
+	}}`), &srCalDH)
+	planCalDH, err := tr.BuildSearchPlan(&srCalDH)
+	if err != nil || !strings.Contains(planCalDH.AggsSQL, "CONVERT_TZ(") || !strings.Contains(planCalDH.AggsSQL, "DATE_TRUNC(") || !strings.Contains(planCalDH.AggsSQL, "'month'") || !strings.Contains(planCalDH.AggsSQL, "SECONDS_ADD(") || !strings.Contains(planCalDH.AggsSQL, "TIMESTAMPDIFF(SECOND,") || !strings.Contains(planCalDH.AggsSQL, "'+05:30'") || !strings.Contains(planCalDH.AggsSQL, "'-04:00'") {
+		t.Fatalf("F19 expected SECONDS_ADD + CONVERT_TZ + DATE_TRUNC + TIMESTAMPDIFF SQL, got %s (err=%v)", planCalDH.AggsSQL, err)
 	}
 }

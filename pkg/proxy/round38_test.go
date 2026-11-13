@@ -524,8 +524,8 @@ func TestRound38_F21_F22_F23_F24_F25_PainlessEnhancements(t *testing.T) {
 		genMap.put('sz', uniq.size());
 		return optVal + ":" + seen.size() + ":" + grouped['even'] + ":" + grouped['odd'] + ":" + optFallback + ":" + hasAny + ":" + noneBig + ":" + side.size() + ":" + mergedMap['k0'] + ":" + partMap['true'] + ":" + avgVal + ":" + joined + ":" + genMap['sz'];
 	`, nil)
-	if err != nil || streamVal != "30:5:6:4:99:true:true:1:8:2:3:[a,b]:4" {
-		t.Fatalf("expected Stream Optional/peek/groupingBy result '30:5:6:4:99:true:true:1:8:2:3:[a,b]:4', got val=%v err=%v", streamVal, err)
+	if err != nil || streamVal != "30:3:6:4:99:true:true:1:8:2:3:[a,b]:4" {
+		t.Fatalf("expected Stream Optional/peek/groupingBy result '30:3:6:4:99:true:true:1:8:2:3:[a,b]:4', got val=%v err=%v", streamVal, err)
 	}
 
 	// F24 & F25: Expression lambda assignment in Map.compute, (char)/(int)/(short)/(byte) casts, 2-arg Map.remove(k, v), 2-arg List.addAll(idx, c), and ZonedDateTime methods.

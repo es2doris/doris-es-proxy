@@ -458,7 +458,9 @@ func TestRound17_SortUnmappedTypeAndScriptSortMissing(t *testing.T) {
 			`{"index":{"_id":"2"}}`+"\n"+`{"name":"beta","rank":20,"dyn_num":25}`+"\n"+
 			`{"index":{"_id":"3"}}`+"\n"+`{"name":"gamma"}`+"\n")
 
-	// 1. unmapped_type: "long" sorts dynamic variant field numerically (25 before 100, not lexicographically "100" < "25")
+	// 1. Under ES 8.x dynamic:false, unmapped fields are pruned from indexed doc values (_doc), so unmapped_type="long"
+	//    coalesces every unmapped hit to missing=500; across mixed mapped+unmapped indices, unmapped_type="long" sorts
+	//    mapped values numerically (25 before 100) and unmapped index docs with missing=500.
 	resUnmapped := doJSON(t, srv, http.MethodPost, "/r17_sort/_search", `{
 		"sort": [
 			{"dyn_num": {"order": "asc", "unmapped_type": "long", "missing": 500}},
@@ -466,8 +468,38 @@ func TestRound17_SortUnmappedTypeAndScriptSortMissing(t *testing.T) {
 		]
 	}`)
 	hitsU := resUnmapped["hits"].(map[string]any)["hits"].([]any)
-	if len(hitsU) != 3 || hitsU[0].(map[string]any)["_id"] != "2" || hitsU[1].(map[string]any)["_id"] != "1" || hitsU[2].(map[string]any)["_id"] != "3" {
-		t.Fatalf("expected order [2, 1, 3] with unmapped_type=long and missing=500, got %+v", hitsU)
+	if len(hitsU) != 3 || hitsU[0].(map[string]any)["sort"].([]any)[0] != float64(500) {
+		t.Fatalf("expected unmapped field under dynamic:false to coalesce to missing=500, got %+v", hitsU)
+	}
+	doJSON(t, srv, http.MethodPut, "/r17_sort_mapped", `{
+		"mappings": {
+			"properties": {
+				"name": {"type": "keyword"},
+				"dyn_num": {"type": "long"}
+			}
+		}
+	}`)
+	doJSON(t, srv, http.MethodPost, "/r17_sort_mapped/_bulk?refresh=true",
+		`{"index":{"_id":"1"}}`+"\n"+`{"name":"alpha","dyn_num":100}`+"\n"+
+			`{"index":{"_id":"2"}}`+"\n"+`{"name":"beta","dyn_num":25}`+"\n")
+	doJSON(t, srv, http.MethodPut, "/r17_sort_unmapped", `{
+		"mappings": {
+			"dynamic": false,
+			"properties": {
+				"name": {"type": "keyword"}
+			}
+		}
+	}`)
+	doJSON(t, srv, http.MethodPut, "/r17_sort_unmapped/_doc/3?refresh=true", `{"name":"gamma","dyn_num":999}`)
+	resMixed := doJSON(t, srv, http.MethodPost, "/r17_sort_mapped,r17_sort_unmapped/_search", `{
+		"sort": [
+			{"dyn_num": {"order": "asc", "unmapped_type": "long", "missing": 500}},
+			{"_id": {"order": "asc"}}
+		]
+	}`)
+	hitsM := resMixed["hits"].(map[string]any)["hits"].([]any)
+	if len(hitsM) != 3 || hitsM[0].(map[string]any)["_id"] != "2" || hitsM[1].(map[string]any)["_id"] != "1" || hitsM[2].(map[string]any)["_id"] != "3" {
+		t.Fatalf("expected multi-index order [2, 1, 3] with unmapped_type=long and missing=500, got %+v", hitsM)
 	}
 
 	// Verify search_after with missing tie-breaker on rank

@@ -199,7 +199,7 @@ func TestRound43_F1_F2_F8_F9_F15_F16_F17_F18_F19_F20_SearchSortGeoAggsAndCollaps
 		t.Fatalf("F9 expected missing_bucket with key=nil and doc_count=1, got %+v", envBuckets)
 	}
 	valKeyBuckets := aggsMap["by_val_key"].(map[string]any)["buckets"].([]any)
-	if len(valKeyBuckets) != 2 || valKeyBuckets[0].(map[string]any)["key"] != "10" {
+	if len(valKeyBuckets) != 2 || valKeyBuckets[0].(map[string]any)["key"] != float64(10) {
 		t.Fatalf("F15 expected numeric _key asc order (10 then 30), got %+v", valKeyBuckets)
 	}
 	rngBuckets := valKeyBuckets[0].(map[string]any)["rng"].(map[string]any)["buckets"].([]any)
@@ -207,7 +207,7 @@ func TestRound43_F1_F2_F8_F9_F15_F16_F17_F18_F19_F20_SearchSortGeoAggsAndCollaps
 		t.Fatalf("F17 expected range sub-agg string bounds normalized to float64(5)/float64(20), got %+v", rngBuckets)
 	}
 	scriptOrderBuckets := aggsMap["by_val_script_order"].(map[string]any)["buckets"].([]any)
-	if len(scriptOrderBuckets) != 2 || scriptOrderBuckets[0].(map[string]any)["key"] != "30" {
+	if len(scriptOrderBuckets) != 2 || scriptOrderBuckets[0].(map[string]any)["key"] != float64(30) {
 		t.Fatalf("F16 expected terms ordered by scripted stats.avg desc (30 first), got %+v", scriptOrderBuckets)
 	}
 	hourBuckets := aggsMap["by_hour"].(map[string]any)["buckets"].([]any)

@@ -19,7 +19,6 @@ package proxy
 
 import (
 	"encoding/json"
-	"math"
 	"net/http"
 	"strings"
 	"testing"
@@ -553,23 +552,29 @@ func TestRound19_UpdateScriptedUpsertIngestDotExpanderReindexAndTerminateAfter(t
 		t.Fatalf("expected _msearch with terminate_after=1 to cap total=1 and set terminated_early=true, got %+v", msItem)
 	}
 
-	// 5. Shredder uint64 overflow clamping and float-formatted integer string coercion
+	// 5. Shredder signed long overflow rejection, unsigned_long exact precision, and float-formatted integer string coercion
+	var ovfSpec esast.MappingSpec
+	_ = json.Unmarshal([]byte(`{"properties":{"big":{"type":"long"}}}`), &ovfSpec)
+	ovfSchema := schema.CompileIndexSchema("es_compat", "r19_shred_ovf", &ovfSpec)
+	if _, err := schema.ShredDocument(ovfSchema, "u0", 1, false, json.RawMessage(`{"big":18446744073709551615}`)); err == nil {
+		t.Fatalf("expected ShredDocument to reject MaxUint64 overflow on signed long field")
+	}
+
 	var sSpec esast.MappingSpec
-	_ = json.Unmarshal([]byte(`{"properties":{"big":{"type":"long"},"small":{"type":"integer"}}}`), &sSpec)
+	_ = json.Unmarshal([]byte(`{"properties":{"big":{"type":"unsigned_long"},"small":{"type":"integer"}}}`), &sSpec)
 	sSchema := schema.CompileIndexSchema("es_compat", "r19_shred", &sSpec)
 	shredded, err := schema.ShredDocument(sSchema, "u1", 1, false, json.RawMessage(`{"big":18446744073709551615,"small":"42.9"}`))
 	if err != nil {
 		t.Fatalf("unexpected ShredDocument error: %v", err)
 	}
 	var shreddedMap map[string]any
-	_ = json.Unmarshal(shredded, &shreddedMap)
-	if shreddedMap["f__big"] != float64(math.MaxInt64) && shreddedMap["f__big"] != int64(math.MaxInt64) {
-		// Check via int64 conversion that it is positive (clamped to MaxInt64, not negative -1)
-		if fv, ok := toFloat64(shreddedMap["f__big"]); !ok || fv <= 0 {
-			t.Fatalf("expected uint64 > MaxInt64 to clamp to positive MaxInt64, got %v", shreddedMap["f__big"])
-		}
+	dec := json.NewDecoder(strings.NewReader(string(shredded)))
+	dec.UseNumber()
+	_ = dec.Decode(&shreddedMap)
+	if n, ok := shreddedMap["f__big"].(json.Number); !ok || n.String() != "18446744073709551615" {
+		t.Fatalf("expected exact uint64 18446744073709551615 for unsigned_long, got %v (%T)", shreddedMap["f__big"], shreddedMap["f__big"])
 	}
-	if shreddedMap["f__small"] != float64(42) {
+	if n, ok := shreddedMap["f__small"].(json.Number); !ok || n.String() != "42" {
 		t.Fatalf("expected float-formatted integer string '42.9' to coerce to 42, got %v", shreddedMap["f__small"])
 	}
 }

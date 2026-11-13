@@ -602,12 +602,16 @@ func (s *Server) syncCatalogFromBackend(ctx context.Context) error {
 				delete(s.indices, e.EntityKey)
 				delete(s.indexDefaultPipelines, e.EntityKey)
 				delete(s.indexFinalPipelines, e.EntityKey)
+				delete(s.indexCustomSettings, e.EntityKey)
+				delete(s.closedIndices, e.EntityKey)
 				continue
 			}
 			var spec esast.MappingSpec
 			var metaEnv struct {
-				DefaultPipeline string `json:"_default_pipeline,omitempty"`
-				FinalPipeline   string `json:"_final_pipeline,omitempty"`
+				DefaultPipeline string         `json:"_default_pipeline,omitempty"`
+				FinalPipeline   string         `json:"_final_pipeline,omitempty"`
+				CustomSettings  map[string]any `json:"_custom_settings,omitempty"`
+				Closed          bool           `json:"_closed,omitempty"`
 			}
 			if len(strings.TrimSpace(e.PayloadJSON)) > 0 && e.PayloadJSON != "null" {
 				_ = json.Unmarshal([]byte(e.PayloadJSON), &spec)
@@ -629,6 +633,23 @@ func (s *Server) syncCatalogFromBackend(ctx context.Context) error {
 				s.indexFinalPipelines[e.EntityKey] = metaEnv.FinalPipeline
 			} else {
 				delete(s.indexFinalPipelines, e.EntityKey)
+			}
+			if len(metaEnv.CustomSettings) > 0 {
+				if s.indexCustomSettings == nil {
+					s.indexCustomSettings = make(map[string]map[string]any)
+				}
+				s.indexCustomSettings[e.EntityKey] = metaEnv.CustomSettings
+				_ = parseAndApplyIndexMappingSettingsRound59(metaEnv.CustomSettings, s.indices[e.EntityKey])
+			} else {
+				delete(s.indexCustomSettings, e.EntityKey)
+			}
+			if metaEnv.Closed {
+				if s.closedIndices == nil {
+					s.closedIndices = make(map[string]bool)
+				}
+				s.closedIndices[e.EntityKey] = true
+			} else {
+				delete(s.closedIndices, e.EntityKey)
 			}
 		case "pipeline":
 			if isDeleted {
@@ -829,6 +850,11 @@ func (s *Server) persistIndex(ctx context.Context, indexName string, idxSchema *
 		s.mu.RLock()
 		defPipe := s.indexDefaultPipelines[indexName]
 		finPipe := s.indexFinalPipelines[indexName]
+		var customSettingsCopy map[string]any
+		if cs := s.indexCustomSettings[indexName]; len(cs) > 0 {
+			customSettingsCopy = deepCloneDocMap(cs)
+		}
+		isClosed := s.closedIndices[indexName]
 		s.mu.RUnlock()
 
 		payloadMap := make(map[string]any)
@@ -872,6 +898,12 @@ func (s *Server) persistIndex(ctx context.Context, indexName string, idxSchema *
 		}
 		if finPipe != "" {
 			payloadMap["_final_pipeline"] = finPipe
+		}
+		if len(customSettingsCopy) > 0 {
+			payloadMap["_custom_settings"] = customSettingsCopy
+		}
+		if isClosed {
+			payloadMap["_closed"] = true
 		}
 		payload := "{}"
 		if len(payloadMap) > 0 {
@@ -1131,6 +1163,8 @@ func (s *Server) Handler() http.Handler {
 				s.handleSnapshotRoot(w, r)
 			case "_msearch":
 				s.handleMSearch(w, r)
+			case "_mpercolate":
+				s.handleMPercolate(w, r)
 			case "_mget":
 				s.handleMGet(w, r)
 			case "_count":
@@ -1403,6 +1437,8 @@ func (s *Server) Handler() http.Handler {
 					s.handleKNNSearch(w, r)
 				case "_msearch":
 					s.handleMSearch(w, r)
+				case "_mpercolate":
+					s.handleMPercolate(w, r)
 				case "_mget":
 					s.handleMGet(w, r)
 				case "_count":
@@ -2343,6 +2379,13 @@ func (s *Server) handleIndexSettings(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+			if len(customFlat) > 0 {
+				probe := schema.CompileIndexSchema(s.dorisDB, "_probe", nil)
+				if err := parseAndApplyIndexMappingSettingsRound59(settings, probe); err != nil {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+					return
+				}
+			}
 			for _, indexName := range validTargets {
 				s.mu.Lock()
 				if s.indexCustomSettings == nil {
@@ -2376,8 +2419,17 @@ func (s *Server) handleIndexSettings(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 				idxSchema := s.indices[indexName]
+				if idxSchema != nil {
+					var resetSpec *esast.MappingSpec
+					if idxSchema.RawMapping != nil {
+						resetSpec = idxSchema.RawMapping
+					}
+					freshDefaults := schema.CompileIndexSchema(s.dorisDB, indexName, resetSpec)
+					idxSchema.CopyIndexMappingSettingsFrom(freshDefaults)
+					_ = parseAndApplyIndexMappingSettingsRound59(s.indexCustomSettings[indexName], idxSchema)
+				}
 				s.mu.Unlock()
-				if hasDef || hasFin {
+				if idxSchema != nil {
 					s.persistIndex(r.Context(), indexName, idxSchema)
 				}
 			}
@@ -3152,6 +3204,9 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	rawIndex := strings.TrimSpace(r.PathValue("index"))
 	if rawIndex != "" {
 		if _, _, ok := s.resolveValidatedReadTargets(w, r, rawIndex); !ok {
+			return
+		}
+		if !s.ensureNoExplicitClosedTargetRound59(w, r, rawIndex) {
 			return
 		}
 	}
@@ -3980,6 +4035,22 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	compiled := schema.CompileIndexSchema(s.dorisDB, indexName, effectiveMappings)
+	if len(tplCustomSettings) > 0 {
+		if err := parseAndApplyIndexMappingSettingsRound59(tplCustomSettings, compiled); err != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+			return
+		}
+	}
+	if len(req.Settings) > 0 {
+		if err := parseAndApplyIndexMappingSettingsRound59(req.Settings, compiled); err != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+			return
+		}
+	}
+	if err := schema.ValidateMappingLimits(compiled, effectiveMappings); err != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+		return
+	}
 	ddl := schema.GenerateCreateTableDDL(compiled)
 	if err := s.backend.ExecDDL(r.Context(), ddl); err != nil {
 		writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", err.Error())
@@ -4051,6 +4122,7 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 			s.indexCustomSettings[indexName][k] = normalizeCustomSettingValue(v)
 		}
 	}
+	s.ensureIndexCreationDateLocked(indexName)
 	for alias, rawMeta := range tplAliases {
 		meta := parseAliasMetadata(rawMeta)
 		s.addAliasWithMetaLocked(alias, indexName, meta)
@@ -4089,19 +4161,7 @@ func (s *Server) handleGetIndex(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			continue
 		}
-		mappings := map[string]any{}
-		if idx.RawMapping != nil {
-			mappings["properties"] = idx.RawMapping.Properties
-			if len(idx.RawMapping.Runtime) > 0 {
-				mappings["runtime"] = idx.RawMapping.Runtime
-			}
-			if idx.RawMapping.Dynamic != nil {
-				mappings["dynamic"] = idx.RawMapping.Dynamic
-			}
-			if idx.RawMapping.Routing != nil && idx.RawMapping.Routing.Required {
-				mappings["_routing"] = map[string]any{"required": true}
-			}
-		}
+		mappings := buildMappingResponseMapRound59(idx)
 		idxAliases := make(map[string]any)
 		for alias, aliasTargets := range s.aliases {
 			for _, t := range aliasTargets {
@@ -4374,19 +4434,9 @@ func (s *Server) handleGetAllMappings(w http.ResponseWriter, r *http.Request) {
 		if s.isIndexExplicitlyHiddenLocked(indexName) && !ewHidden {
 			continue
 		}
-		props := map[string]esast.FieldProperty{}
-		if idx.RawMapping != nil {
-			props = idx.RawMapping.Properties
-		}
-		mappings := map[string]any{"properties": props}
-		if idx.RawMapping != nil && len(idx.RawMapping.Runtime) > 0 {
-			mappings["runtime"] = idx.RawMapping.Runtime
-		}
-		if idx.RawMapping != nil && idx.RawMapping.Dynamic != nil {
-			mappings["dynamic"] = idx.RawMapping.Dynamic
-		}
-		if idx.RawMapping != nil && idx.RawMapping.Routing != nil && idx.RawMapping.Routing.Required {
-			mappings["_routing"] = map[string]any{"required": true}
+		mappings := buildMappingResponseMapRound59(idx)
+		if _, hasProps := mappings["properties"]; !hasProps {
+			mappings["properties"] = map[string]esast.FieldProperty{}
 		}
 		out[indexName] = map[string]any{
 			"mappings": mappings,
@@ -4412,19 +4462,9 @@ func (s *Server) handleGetMapping(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if exists {
-			props := map[string]esast.FieldProperty{}
-			if idx.RawMapping != nil {
-				props = idx.RawMapping.Properties
-			}
-			mappings := map[string]any{"properties": props}
-			if idx.RawMapping != nil && len(idx.RawMapping.Runtime) > 0 {
-				mappings["runtime"] = idx.RawMapping.Runtime
-			}
-			if idx.RawMapping != nil && idx.RawMapping.Dynamic != nil {
-				mappings["dynamic"] = idx.RawMapping.Dynamic
-			}
-			if idx.RawMapping != nil && idx.RawMapping.Routing != nil && idx.RawMapping.Routing.Required {
-				mappings["_routing"] = map[string]any{"required": true}
+			mappings := buildMappingResponseMapRound59(idx)
+			if _, hasProps := mappings["properties"]; !hasProps {
+				mappings["properties"] = map[string]esast.FieldProperty{}
 			}
 			out[indexName] = map[string]any{
 				"mappings": mappings,
@@ -4469,6 +4509,8 @@ func (s *Server) handleGetFieldMapping(w http.ResponseWriter, r *http.Request) {
 				if esType == "" {
 					esType = "keyword"
 					switch fb.DorisType {
+					case schema.DorisLargeInt:
+						esType = "unsigned_long"
 					case schema.DorisBigInt:
 						if strings.Contains(strings.ToLower(esPath), "time") || strings.Contains(strings.ToLower(esPath), "date") || strings.HasSuffix(esPath, "At") {
 							esType = "date"
@@ -4609,6 +4651,11 @@ func (s *Server) handlePutMapping(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := schema.ValidateMappingSpec(&spec); err != nil {
+		writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+		return
+	}
+
 	// Validate mapping compatibility on all target indices before mutating any index.
 	s.mu.RLock()
 	for _, indexName := range validTargets {
@@ -4628,6 +4675,11 @@ func (s *Server) handlePutMapping(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 			return
 		}
+		if err := schema.ValidateMappingLimits(oldSchema, mergedPreview); err != nil {
+			s.mu.RUnlock()
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+			return
+		}
 	}
 	s.mu.RUnlock()
 
@@ -4640,6 +4692,11 @@ func (s *Server) handlePutMapping(w http.ResponseWriter, r *http.Request) {
 		}
 		mergedSpec := schema.MergeMappingSpecs(oldRaw, &spec)
 		newSchema := schema.CompileIndexSchema(s.dorisDB, indexName, mergedSpec)
+		if oldSchema != nil {
+			newSchema.CopyIndexMappingSettingsFrom(oldSchema)
+		} else if custom := s.indexCustomSettings[indexName]; len(custom) > 0 {
+			_ = parseAndApplyIndexMappingSettingsRound59(custom, newSchema)
+		}
 		s.indices[indexName] = newSchema
 		s.mu.Unlock()
 		s.persistIndex(r.Context(), indexName, newSchema)
@@ -5643,9 +5700,10 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	docID := r.PathValue("id")
-	rawOpType := strings.TrimSpace(r.URL.Query().Get("op_type"))
-	isExplicitIndexOp := strings.EqualFold(rawOpType, "index")
-	isCreate := strings.Contains(r.URL.Path, "/_create/") || strings.EqualFold(rawOpType, "create")
+	isCreate, isExplicitIndexOp, validPutOp := validatePutDocRound59(w, r, docID)
+	if !validPutOp {
+		return
+	}
 	isCreateForTarget := isCreate || (docID == "" && !isExplicitIndexOp)
 	if st, et, er := s.prepareAutoCreateTargetRound58(r.Context(), rawReqIndex, isCreateForTarget); st != 0 {
 		writeESError(w, st, et, er)
@@ -5754,7 +5812,7 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusConflict, "version_conflict_engine_exception", fmt.Sprintf("[%s]: version conflict, document already exists", docID))
 			return
 		}
-		if aliasFilter != nil && existing != nil && !s.docMatchesAliasFilter(r.Context(), indexName, docID, existing.Source, aliasFilter) {
+		if aliasFilter != nil && existing != nil && !s.docMatchesAliasFilter(r.Context(), indexName, docID, existing.EffectiveSource(), aliasFilter) {
 			writeESError(w, http.StatusConflict, "version_conflict_engine_exception", fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", docID))
 			return
 		}
@@ -5788,7 +5846,11 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idxSchema := s.ensureWritableIndexSchemaWithDocs(r.Context(), indexName, []json.RawMessage{docPayload})
+	idxSchema, mErr := s.ensureWritableIndexSchemaWithDocsErr(r.Context(), indexName, []json.RawMessage{docPayload})
+	if mErr != nil {
+		writeESError(w, http.StatusBadRequest, mappingOrShredErrorTypeRound59(mErr), mErr.Error())
+		return
+	}
 	nextVer := s.allocVersion(minVer)
 	if minVer > 0 && minVer < 1_000_000_000_000 {
 		nextVer = minVer
@@ -5848,6 +5910,9 @@ func (s *Server) handleHeadDoc(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	if !s.ensureConcreteIndexExists(w, r, rawReqIndex, indexName) {
+		return
+	}
 	if s.isIndexClosed(indexName) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -5871,7 +5936,7 @@ func (s *Server) handleHeadDoc(w http.ResponseWriter, r *http.Request) {
 	_ = s.coalescer.FlushTable(r.Context(), idxSchema.DorisTable)
 
 	hit, found, err := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, docID)
-	if err != nil || !found || !s.docMatchesRequestRouting(indexName, docID, effRouting) || (hit != nil && !s.docMatchesAliasFilter(r.Context(), indexName, docID, hit.Source, aliasFilter)) {
+	if err != nil || !found || !s.docMatchesRequestRouting(indexName, docID, effRouting) || (hit != nil && !s.docMatchesAliasFilter(r.Context(), indexName, docID, hit.EffectiveSource(), aliasFilter)) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -5894,6 +5959,9 @@ func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", readErr.Error())
+		return
+	}
+	if !s.ensureConcreteIndexExists(w, r, rawReqIndex, indexName) {
 		return
 	}
 	if s.isIndexClosed(indexName) {
@@ -5922,6 +5990,14 @@ func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	idxSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
+	if isIndexSourceDisabledRound59(idxSchema) {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("unable to fetch _source as _source is disabled in the mappings for index [%s]", indexName))
+		return
+	}
 	reqRouting := strings.TrimSpace(r.URL.Query().Get("routing"))
 	effRouting := s.resolveEffectiveReadRouting(rawReqIndex, indexName, reqRouting)
 	if s.isRoutingRequired(idxSchema) && effRouting == "" {
@@ -5939,7 +6015,7 @@ func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
 		return
 	}
-	if found && (!s.docMatchesRequestRouting(indexName, docID, effRouting) || (hit != nil && !s.docMatchesAliasFilter(r.Context(), indexName, docID, hit.Source, aliasFilter))) {
+	if found && (!s.docMatchesRequestRouting(indexName, docID, effRouting) || (hit != nil && !s.docMatchesAliasFilter(r.Context(), indexName, docID, hit.EffectiveSource(), aliasFilter))) {
 		found = false
 	}
 	if !found {
@@ -5967,7 +6043,7 @@ func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "unable to fetch _source when _source is disabled")
 		return
 	}
-	filteredSrc := filterSourceJSON(hit.Source, urlSF)
+	filteredSrc, _ := filterDocumentSourceRound59(hit.Source, idxSchema, urlSF)
 	if opts, ok := extractESResponseFormatOptions(w); ok && (opts.pretty || len(opts.filterPaths) > 0) {
 		dec := json.NewDecoder(bytes.NewReader(filteredSrc))
 		dec.UseNumber()
@@ -5991,6 +6067,9 @@ func (s *Server) handleGetDoc(w http.ResponseWriter, r *http.Request) {
 	indexName, aliasFilter, readErr := s.resolveReadDocIndexWithFilter(rawReqIndex)
 	if readErr != nil {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", readErr.Error())
+		return
+	}
+	if !s.ensureConcreteIndexExists(w, r, rawReqIndex, indexName) {
 		return
 	}
 	if s.isIndexClosed(indexName) {
@@ -6020,7 +6099,7 @@ func (s *Server) handleGetDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
 		return
 	}
-	if found && (!s.docMatchesRequestRouting(indexName, docID, effRouting) || (hit != nil && !s.docMatchesAliasFilter(r.Context(), indexName, docID, hit.Source, aliasFilter))) {
+	if found && (!s.docMatchesRequestRouting(indexName, docID, effRouting) || (hit != nil && !s.docMatchesAliasFilter(r.Context(), indexName, docID, hit.EffectiveSource(), aliasFilter))) {
 		found = false
 	}
 	if !found {
@@ -6037,6 +6116,11 @@ func (s *Server) handleGetDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	urlSF := extractURLSourceFilter(r)
+	if isIndexSourceDisabledRound59(idxSchema) && urlSF != nil && !urlSF.Disabled {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+			fmt.Sprintf("unable to fetch fields from _source field: _source is disabled in the mappings for index [%s]", indexName))
+		return
+	}
 	urlStoredFields := esast.StoredFieldsSlice(strings.Join(r.URL.Query()["stored_fields"], ","))
 	hasStoredNone := false
 	var sfSpecs []esast.FieldRequestSpec
@@ -6064,7 +6148,9 @@ func (s *Server) handleGetDoc(w http.ResponseWriter, r *http.Request) {
 		hit.Routing = reqRt
 	}
 	if (urlSF == nil || !urlSF.Disabled) && (!hasStoredNone || urlSF != nil) {
-		resp["_source"] = filterSourceJSON(hit.Source, urlSF)
+		if filteredSrc, ok := filterDocumentSourceRound59(hit.Source, idxSchema, urlSF); ok {
+			resp["_source"] = filteredSrc
+		}
 	}
 	if len(sfSpecs) > 0 {
 		if fm := extractHitFieldsMap(*hit, indexName, &esast.SearchRequest{Fields: sfSpecs}, idxSchema); len(fm) > 0 {
@@ -6290,7 +6376,7 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		hit, found := prefetched[idxName][spec.ID]
-		if found && (!s.docMatchesRequestRouting(idxName, spec.ID, effRouting) || !s.docMatchesAliasFilter(r.Context(), idxName, spec.ID, hit.Source, aliasFilter)) {
+		if found && (!s.docMatchesRequestRouting(idxName, spec.ID, effRouting) || !s.docMatchesAliasFilter(r.Context(), idxName, spec.ID, hit.EffectiveSource(), aliasFilter)) {
 			found = false
 		}
 		rawSpecVer := r.URL.Query().Get("version")
@@ -6372,11 +6458,29 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 				sfSpecs = append(sfSpecs, esast.FieldRequestSpec{Field: sf})
 			}
 		}
+		if isIndexSourceDisabledRound59(idxSchema) && effSF != nil && !effSF.Disabled {
+			errReason := fmt.Sprintf("unable to fetch fields from _source field: _source is disabled in the mappings for index [%s]", idxName)
+			docsOut = append(docsOut, map[string]any{
+				"_index": idxName,
+				"_type":  "_doc",
+				"_id":    spec.ID,
+				"error": map[string]any{
+					"root_cause": []map[string]any{
+						{"type": "illegal_argument_exception", "reason": errReason, "index": idxName},
+					},
+					"type":   "illegal_argument_exception",
+					"reason": errReason,
+					"index":  idxName,
+				},
+			})
+			continue
+		}
 		if (effSF == nil || !effSF.Disabled) && (!hasStoredNone || effSF != nil) {
-			docItem["_source"] = filterSourceJSON(hit.Source, effSF)
+			if filteredSrc, ok := filterDocumentSourceRound59(hit.Source, idxSchema, effSF); ok {
+				docItem["_source"] = filteredSrc
+			}
 		}
 		if len(sfSpecs) > 0 {
-			idxSchema := s.getOrCompileReadOnlySchema(r.Context(), idxName)
 			if fm := extractHitFieldsMap(hit, idxName, &esast.SearchRequest{Fields: sfSpecs}, idxSchema); len(fm) > 0 {
 				docItem["fields"] = fm
 			}
@@ -6395,6 +6499,9 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 	indexName, aliasFilter, writeErr := s.resolveWriteIndexWithFilter(rawReqIndex)
 	if writeErr != nil {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", writeErr.Error())
+		return
+	}
+	if !s.ensureConcreteIndexExists(w, r, rawReqIndex, indexName) {
 		return
 	}
 	if s.isIndexClosed(indexName) {
@@ -6419,15 +6526,20 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = s.coalescer.FlushTable(r.Context(), roSchema.DorisTable)
-	existingHit, found, err := s.backend.GetDocByID(r.Context(), roSchema.DorisDB, roSchema.DorisTable, docID)
-	if err != nil {
-		writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
-		return
+	var existingHit *HitRow
+	var found bool
+	if s.indexExistsRound59(r.Context(), indexName) {
+		_ = s.coalescer.FlushTable(r.Context(), roSchema.DorisTable)
+		var err error
+		existingHit, found, err = s.backend.GetDocByID(r.Context(), roSchema.DorisDB, roSchema.DorisTable, docID)
+		if err != nil {
+			writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
+			return
+		}
 	}
 	docFound := found && existingHit != nil &&
 		s.docMatchesRequestRouting(indexName, docID, effRouting) &&
-		(aliasFilter == nil || s.docMatchesAliasFilter(r.Context(), indexName, docID, existingHit.Source, aliasFilter))
+		(aliasFilter == nil || s.docMatchesAliasFilter(r.Context(), indexName, docID, existingHit.EffectiveSource(), aliasFilter))
 	var curVer int64
 	occFound := docFound
 	if docFound {
@@ -6560,19 +6672,9 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var updReq painless.UpdateRequest
-	if err := json.Unmarshal(bodyBytes, &updReq); err != nil {
-		writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+	updFieldSpecs, validUpd := validateAndParseUpdateDocRound59(w, r, bodyBytes, &updReq)
+	if !validUpd {
 		return
-	}
-	if qDocAsUpsert := r.URL.Query().Get("doc_as_upsert"); qDocAsUpsert != "" {
-		if b, err := strconv.ParseBool(qDocAsUpsert); err == nil {
-			updReq.DocAsUpsert = b
-		}
-	}
-	if qDetectNoop := r.URL.Query().Get("detect_noop"); qDetectNoop != "" {
-		if b, err := strconv.ParseBool(qDetectNoop); err == nil {
-			updReq.DetectNoop = &b
-		}
 	}
 	if missingID := s.findMissingStoredScriptInRawBody(bodyBytes); missingID != "" {
 		writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("cannot execute stored script [%s] because it does not exist", missingID))
@@ -6596,16 +6698,25 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	effUpdateSF = mergeMGetSourceFilter(effUpdateSF, updBodyMeta.SourceIncludes, updBodyMeta.SourceExcludes)
 
 	roSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
+	if isIndexSourceDisabledRound59(roSchema) {
+		writeESError(w, http.StatusBadRequest, "document_source_missing_exception", fmt.Sprintf("_source is disabled for [%s]", indexName))
+		return
+	}
 	initEffRouting := s.resolveEffectiveWriteRouting(rawReqIndex, indexName, reqRouting, "")
 	if s.isRoutingRequired(roSchema) && initEffRouting == "" && (updReq.Script == nil || !strings.Contains(updReq.Script.Source, "_routing")) {
 		writeESError(w, http.StatusBadRequest, "routing_missing_exception", fmt.Sprintf("routing is required for [%s]/[_doc]/[%s]", indexName, docID))
 		return
 	}
-	_ = s.coalescer.FlushTable(r.Context(), roSchema.DorisTable)
-	existingHit, found, err := s.backend.GetDocByID(r.Context(), roSchema.DorisDB, roSchema.DorisTable, docID)
-	if err != nil {
-		writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
-		return
+	var existingHit *HitRow
+	var found bool
+	if s.indexExistsRound59(r.Context(), indexName) {
+		_ = s.coalescer.FlushTable(r.Context(), roSchema.DorisTable)
+		var err error
+		existingHit, found, err = s.backend.GetDocByID(r.Context(), roSchema.DorisDB, roSchema.DorisTable, docID)
+		if err != nil {
+			writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
+			return
+		}
 	}
 	if found && initEffRouting != "" && !s.docMatchesRequestRouting(indexName, docID, initEffRouting) {
 		found = false
@@ -6745,17 +6856,12 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 					"_seq_no":       dropVer,
 					"_primary_term": 1,
 				}
-				if effUpdateSF != nil && !effUpdateSF.Disabled {
-					if found && len(existingHit.Source) > 0 {
-						dropResp["get"] = map[string]any{
-							"found":   true,
-							"_source": filterSourceJSON(existingHit.Source, effUpdateSF),
-						}
-					} else {
-						dropResp["get"] = map[string]any{
-							"found": false,
-						}
-					}
+				var dropSrc json.RawMessage
+				if found && existingHit != nil {
+					dropSrc = existingHit.Source
+				}
+				if getObj := s.buildUpdateGetResultRound59(r.Context(), indexName, docID, effRouting, dropVer, dropSrc, found && len(dropSrc) > 0, effUpdateSF, updFieldSpecs); getObj != nil {
+					dropResp["get"] = getObj
 				}
 				writeJSON(w, http.StatusOK, dropResp)
 				return
@@ -6813,7 +6919,11 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 		if !isDelete && len(mutatedSource) > 0 {
 			sampleDocs = []json.RawMessage{mutatedSource}
 		}
-		idxSchema := s.ensureWritableIndexSchemaWithDocs(r.Context(), indexName, sampleDocs)
+		idxSchema, mErr := s.ensureWritableIndexSchemaWithDocsErr(r.Context(), indexName, sampleDocs)
+		if mErr != nil {
+			writeESError(w, http.StatusBadRequest, mappingOrShredErrorTypeRound59(mErr), mErr.Error())
+			return
+		}
 		if s.isRoutingRequired(idxSchema) && effRouting == "" {
 			writeESError(w, http.StatusBadRequest, "routing_missing_exception", fmt.Sprintf("routing is required for [%s]/[_doc]/[%s]", indexName, docID))
 			return
@@ -6898,15 +7008,11 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	if effRouting != "" {
 		respPayload["_routing"] = effRouting
 	}
-	if effUpdateSF != nil && !effUpdateSF.Disabled && opResult != "deleted" {
-		if (found || opResult == "created" || opResult == "updated") && len(mutatedSource) > 0 {
-			respPayload["get"] = map[string]any{
-				"found":   true,
-				"_source": filterSourceJSON(mutatedSource, effUpdateSF),
-			}
-		} else if !found && opResult == "noop" {
-			respPayload["get"] = map[string]any{
-				"found": false,
+	if opResult != "deleted" {
+		hasDoc := (found || opResult == "created" || opResult == "updated") && len(mutatedSource) > 0
+		if hasDoc || (!found && opResult == "noop") {
+			if getObj := s.buildUpdateGetResultRound59(r.Context(), indexName, docID, effRouting, reportedVer, mutatedSource, hasDoc, effUpdateSF, updFieldSpecs); getObj != nil {
+				respPayload["get"] = getObj
 			}
 		}
 	}
@@ -8335,6 +8441,18 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		var bulkUpdateSF *esast.SourceFilter
 
 		if op.Action == "update" {
+			if isIndexSourceDisabledRound59(roSchema) {
+				hasErrors = true
+				items = append(items, map[string]any{
+					op.Action: map[string]any{
+						"_index": targetIndex,
+						"_id":    op.ID,
+						"status": http.StatusBadRequest,
+						"error":  map[string]any{"type": "document_source_missing_exception", "reason": fmt.Sprintf("_source is disabled for [%s]", targetIndex)},
+					},
+				})
+				continue
+			}
 			var upd painless.UpdateRequest
 			if err := json.Unmarshal(op.Source, &upd); err != nil {
 				hasErrors = true
@@ -8544,10 +8662,11 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 				}
 				if bulkUpdateSF != nil && !bulkUpdateSF.Disabled {
 					if found && len(merged) > 0 {
-						noopEntry["get"] = map[string]any{
-							"found":   true,
-							"_source": filterSourceJSON(merged, bulkUpdateSF),
+						noopGet := map[string]any{"found": true}
+						if filteredSrc, ok := filterDocumentSourceRound59(merged, roSchema, bulkUpdateSF); ok {
+							noopGet["_source"] = filteredSrc
 						}
+						noopEntry["get"] = noopGet
 					} else {
 						noopEntry["get"] = map[string]any{
 							"found": false,
@@ -8609,10 +8728,11 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 						}
 						if bulkUpdateSF != nil && !bulkUpdateSF.Disabled {
 							if found && len(existingHit.Source) > 0 {
-								dropEntry["get"] = map[string]any{
-									"found":   true,
-									"_source": filterSourceJSON(existingHit.Source, bulkUpdateSF),
+								dropGet := map[string]any{"found": true}
+								if filteredSrc, ok := filterDocumentSourceRound59(existingHit.Source, roSchema, bulkUpdateSF); ok {
+									dropGet["_source"] = filteredSrc
 								}
+								dropEntry["get"] = dropGet
 							} else {
 								dropEntry["get"] = map[string]any{
 									"found": false,
@@ -8745,7 +8865,23 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		var idxSchema *schema.IndexSchema
 		if !deleted && len(sourceToShred) > 0 {
 			samples := append(append([]json.RawMessage(nil), sampleDocsByIndex[targetIndex]...), sourceToShred)
-			idxSchema = s.ensureWritableIndexSchemaWithDocs(r.Context(), targetIndex, samples)
+			var mErr error
+			idxSchema, mErr = s.ensureWritableIndexSchemaWithDocsErr(r.Context(), targetIndex, samples)
+			if mErr != nil {
+				idxSchema, mErr = s.ensureWritableIndexSchemaWithDocsErr(r.Context(), targetIndex, []json.RawMessage{sourceToShred})
+			}
+			if mErr != nil {
+				hasErrors = true
+				items = append(items, map[string]any{
+					op.Action: map[string]any{
+						"_index": targetIndex,
+						"_id":    op.ID,
+						"status": http.StatusBadRequest,
+						"error":  map[string]any{"type": mappingOrShredErrorTypeRound59(mErr), "reason": mErr.Error()},
+					},
+				})
+				continue
+			}
 		} else {
 			idxSchema = s.ensureIndexSchema(r.Context(), targetIndex)
 		}
@@ -8865,10 +9001,11 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			itemMap["_routing"] = effRouting
 		}
 		if op.Action == "update" && bulkUpdateSF != nil && !bulkUpdateSF.Disabled && !deleted && len(sourceToShred) > 0 {
-			itemMap["get"] = map[string]any{
-				"found":   true,
-				"_source": filterSourceJSON(sourceToShred, bulkUpdateSF),
+			updGet := map[string]any{"found": true}
+			if filteredSrc, ok := filterDocumentSourceRound59(sourceToShred, idxSchema, bulkUpdateSF); ok {
+				updGet["_source"] = filteredSrc
 			}
+			itemMap["get"] = updGet
 		}
 		items = append(items, map[string]any{
 			op.Action: itemMap,
@@ -9974,6 +10111,10 @@ func (s *Server) executeSearchRequest(
 
 	for _, indexName := range targets {
 		rawIdxSchema := s.getOrCompileReadOnlySchema(ctx, indexName)
+		if req != nil && req.Source != nil && !req.Source.Disabled && isIndexSourceDisabledRound59(rawIdxSchema) {
+			return nil, http.StatusBadRequest, "illegal_argument_exception",
+				fmt.Sprintf("unable to fetch fields from _source field: _source is disabled in the mappings for index [%s]", indexName)
+		}
 		idxSchema := s.augmentSchemaWithRuntimeMappings(rawIdxSchema, req.RuntimeMappings)
 		hasRuntimeMappings := len(effectiveRuntimeMappings(rawIdxSchema, req.RuntimeMappings)) > 0
 		schemasByIndex[indexName] = idxSchema
@@ -10195,6 +10336,9 @@ func (s *Server) executeSearchRequest(
 				cp.IndicesBoost = map[string]float64{"__current_index__": idxBoost}
 				evalReq = &cp
 			}
+			if err := validateCustomSearchScoresOnRuntimeHitsRound59(idxSchema, evalReq.Query, hits); err != nil {
+				return nil, http.StatusBadRequest, "search_phase_execution_exception", err.Error()
+			}
 			hits, aggRows, idxTotal, matchedQueryHits, postFilteredHits = applyRuntimeSearchScriptsWithMatchedAndGlobal(hits, globalHits, aggRows, idxTotal, evalReq, idxSchema, len(targets) > 1)
 			allFetchedHits = append(allFetchedHits, matchedQueryHits...)
 			allPostFilterHits = append(allPostFilterHits, postFilteredHits...)
@@ -10227,6 +10371,26 @@ func (s *Server) executeSearchRequest(
 				}
 			}
 		} else {
+			if queryProducesCustomScoreRound59(subReqPtr.Query) {
+				if len(hits) == 0 && size == 0 {
+					zero := 0
+					chkSize := 1000
+					chkReq := *subReqPtr
+					chkReq.From = &zero
+					chkReq.Size = &chkSize
+					chkReq.Aggs = nil
+					chkReq.Aggregations = nil
+					if chkPlan, cErr := tr.BuildSearchPlan(&chkReq); cErr == nil && chkPlan.HitsSQL != "" {
+						if chkHits, qErr := s.backend.QueryHits(ctx, chkPlan.HitsSQL); qErr == nil {
+							if err := validateCustomSearchScoresOnSQLHitsRound59(subReqPtr.Query, chkHits); err != nil {
+								return nil, http.StatusBadRequest, "search_phase_execution_exception", err.Error()
+							}
+						}
+					}
+				} else if err := validateCustomSearchScoresOnSQLHitsRound59(subReqPtr.Query, hits); err != nil {
+					return nil, http.StatusBadRequest, "search_phase_execution_exception", err.Error()
+				}
+			}
 			if req != nil && queryHasNestedScoring(req.Query) {
 				for i := range hits {
 					var docMap map[string]any
@@ -10240,6 +10404,9 @@ func (s *Server) executeSearchRequest(
 					}
 					docMap["__meta_id"] = hits[i].ID
 					hits[i].Score = evalQueryScriptScoreOnDocWithSchema(idxSchema, docMap, req.Query, hits[i].Score)
+				}
+				if err := validateCustomSearchScoresOnSQLHitsRound59(req.Query, hits); err != nil {
+					return nil, http.StatusBadRequest, "search_phase_execution_exception", err.Error()
 				}
 				if len(targets) == 1 && len(req.SearchAfter) == 0 && (len(req.Sort) == 0 || sortSpecsUseScore(req.Sort)) && len(hits) > 1 {
 					sort.SliceStable(hits, func(i, j int) bool {
@@ -12620,7 +12787,9 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 			}
 		}
 		if (req.Source == nil || !req.Source.Disabled) && (!req.HasStoredFieldsNone() || req.Source != nil) {
-			hitMap["_source"] = filterSourceJSON(h.Source, req.Source)
+			if filteredSrc, ok := filterDocumentSourceRound59(h.Source, hitSchema, req.Source); ok {
+				hitMap["_source"] = filteredSrc
+			}
 		}
 		if req.Highlight != nil && len(req.Highlight.Fields) > 0 {
 			if hl := buildHighlightMapWithSchema(h.EffectiveSource(), req, hitSchema); len(hl) > 0 {
@@ -13961,11 +14130,9 @@ func (s *Server) populateCollapseInnerHits(
 					ghMap["_routing"] = gh.Routing
 				}
 				if (ihSpec.Source == nil || !ihSpec.Source.Disabled) && (!ihSpec.HasStoredFieldsNone() || ihSpec.Source != nil) {
-					ghSrc := gh.Source
-					if len(ghSrc) == 0 {
-						ghSrc = gh.EffectiveSource()
+					if filteredSrc, ok := filterDocumentSourceRound59(gh.Source, gSchema, ihSpec.Source); ok {
+						ghMap["_source"] = filteredSrc
 					}
-					ghMap["_source"] = filterSourceJSON(ghSrc, ihSpec.Source)
 				}
 				if len(activeSort) > 0 {
 					ghMap["sort"] = extractHitSortValues(gh, activeSort, gSchema)
@@ -14564,7 +14731,7 @@ func buildAggsMapWithSchema(
 			subAggs := spec.SubAggs()
 			for _, r := range rows {
 				epochMs, _ := strconv.ParseInt(r.BucketKey, 10, 64)
-				keyStr := formatDateHistogramKeyAsString(epochMs, spec.DateHistogram)
+				keyStr := formatDateHistogramKeyAsStringRound59(epochMs, spec.DateHistogram)
 				bucketMap := map[string]any{
 					"key_as_string": keyStr,
 					"key":           epochMs,
@@ -14694,7 +14861,7 @@ func buildAggsMapWithSchema(
 					if isDateRange {
 						if ms, ok := parseRuntimeDateRangeBoundMillis(rng.From, rngSpec, nowUTC); ok {
 							entry["from"] = float64(ms)
-							entry["from_as_string"] = formatDateHistogramKeyAsString(ms, &esast.DateHistogramAggSpec{
+							entry["from_as_string"] = formatDateHistogramKeyAsStringRound59(ms, &esast.DateHistogramAggSpec{
 								Format:   rngSpec.Format,
 								TimeZone: rngSpec.TimeZone,
 							})
@@ -14710,7 +14877,7 @@ func buildAggsMapWithSchema(
 					if isDateRange {
 						if ms, ok := parseRuntimeDateRangeBoundMillis(rng.To, rngSpec, nowUTC); ok {
 							entry["to"] = float64(ms)
-							entry["to_as_string"] = formatDateHistogramKeyAsString(ms, &esast.DateHistogramAggSpec{
+							entry["to_as_string"] = formatDateHistogramKeyAsStringRound59(ms, &esast.DateHistogramAggSpec{
 								Format:   rngSpec.Format,
 								TimeZone: rngSpec.TimeZone,
 							})
@@ -14791,7 +14958,9 @@ func buildCompositeAggObjectWithSchema(
 				if b.Kind != schema.StorageDynamicVariant || b.ESType != "" {
 					tCopy := *entry.Terms
 					switch b.ESType {
-					case "long", "integer", "short", "byte", "unsigned_long":
+					case "unsigned_long":
+						tCopy.ValueType = "unsigned_long"
+					case "long", "integer", "short", "byte":
 						tCopy.ValueType = "long"
 					case "date", "date_nanos":
 						tCopy.ValueType = "date"
@@ -14803,6 +14972,8 @@ func buildCompositeAggObjectWithSchema(
 						tCopy.ValueType = "ip"
 					default:
 						switch b.DorisType {
+						case schema.DorisLargeInt:
+							tCopy.ValueType = "unsigned_long"
 						case schema.DorisBigInt, schema.DorisInt:
 							tCopy.ValueType = "long"
 						case schema.DorisDouble:
@@ -14837,7 +15008,7 @@ func buildCompositeAggObjectWithSchema(
 				if sm.entry.DateHistogram != nil {
 					if iv, err := strconv.ParseInt(parts[i], 10, 64); err == nil {
 						if strings.TrimSpace(sm.entry.DateHistogram.Format) != "" {
-							partVal = formatDateHistogramKeyAsString(iv, sm.entry.DateHistogram)
+							partVal = formatDateHistogramKeyAsStringRound59(iv, sm.entry.DateHistogram)
 						} else {
 							partVal = iv
 						}
@@ -14850,16 +15021,19 @@ func buildCompositeAggObjectWithSchema(
 					}
 				} else if sm.entry.Terms != nil && strings.TrimSpace(sm.entry.Terms.ValueType) != "" {
 					switch strings.ToLower(strings.TrimSpace(sm.entry.Terms.ValueType)) {
-					case "long", "integer", "short", "byte", "date", "unsigned_long":
+					case "unsigned_long":
+						trimmedPart := strings.TrimSpace(parts[i])
+						if uv, errU := strconv.ParseUint(trimmedPart, 10, 64); errU == nil {
+							partVal = uv
+						} else if iv, errI := strconv.ParseInt(trimmedPart, 10, 64); errI == nil {
+							partVal = iv
+						} else if fv, ok := parseFiniteFloat(parts[i]); ok && fv >= 0 && fv < 18446744073709551616.0 {
+							partVal = uint64(fv)
+						}
+					case "long", "integer", "short", "byte", "date":
 						trimmedPart := strings.TrimSpace(parts[i])
 						if iv, err := strconv.ParseInt(trimmedPart, 10, 64); err == nil {
 							partVal = iv
-						} else if strings.EqualFold(strings.TrimSpace(sm.entry.Terms.ValueType), "unsigned_long") {
-							if uv, errU := strconv.ParseUint(trimmedPart, 10, 64); errU == nil {
-								partVal = uv
-							} else if fv, ok := parseFiniteFloat(parts[i]); ok && fv >= 0 && fv < 18446744073709551616.0 {
-								partVal = uint64(fv)
-							}
 						} else if fv, ok := parseFiniteFloat(parts[i]); ok && fv >= -9223372036854775808.0 && fv < 9223372036854775808.0 {
 							partVal = int64(fv)
 						} else if strings.EqualFold(strings.TrimSpace(sm.entry.Terms.ValueType), "date") {
@@ -14890,7 +15064,7 @@ func buildCompositeAggObjectWithSchema(
 				if !ok {
 					continue
 				}
-				cmpAfter = compareCompositeSourceVal(keyObj[sm.name], afterVal, sm.entry)
+				cmpAfter = compareCompositeSourceValWithSchema(keyObj[sm.name], afterVal, sm.entry, idxSchema)
 				if cmpAfter != 0 {
 					break
 				}
@@ -14904,7 +15078,7 @@ func buildCompositeAggObjectWithSchema(
 	if len(decoded) > 1 {
 		sort.SliceStable(decoded, func(i, j int) bool {
 			for _, sm := range srcMetas {
-				cmp := compareCompositeSourceVal(decoded[i].keyObj[sm.name], decoded[j].keyObj[sm.name], sm.entry)
+				cmp := compareCompositeSourceValWithSchema(decoded[i].keyObj[sm.name], decoded[j].keyObj[sm.name], sm.entry, idxSchema)
 				if cmp != 0 {
 					return cmp < 0
 				}
@@ -14964,7 +15138,7 @@ func extractCompositeSourceOrder(order any) string {
 	return ""
 }
 
-func compareCompositeSourceVal(a, b any, entry esast.AggSpec) int {
+func compareCompositeSourceValWithSchema(a, b any, entry esast.AggSpec, idxSchema *schema.IndexSchema) int {
 	if a == nil && b == nil {
 		return 0
 	}
@@ -15003,6 +15177,17 @@ func compareCompositeSourceVal(a, b any, entry esast.AggSpec) int {
 			return 1
 		}
 		return -1
+	}
+	if cmpVer, okVer := compareCompositeVersionValuesRound59(a, b, entry, desc, idxSchema); okVer {
+		return cmpVer
+	}
+	if entry.Terms != nil && strings.EqualFold(strings.TrimSpace(entry.Terms.ValueType), "unsigned_long") {
+		if cmpInt, okInt := compareBucketKeyExact64(fmt.Sprintf("%v", a), fmt.Sprintf("%v", b)); okInt {
+			if desc {
+				return -cmpInt
+			}
+			return cmpInt
+		}
 	}
 	if entry.DateHistogram != nil {
 		rngSpec := &esast.RangeAggSpec{
@@ -15879,7 +16064,7 @@ func filterAndSortTermsRowsWithSubAggs(
 			"date", "date_nanos":
 			isNumericValueType = true
 		}
-		if b.DorisType == schema.DorisBigInt || b.DorisType == schema.DorisInt || b.DorisType == schema.DorisDouble {
+		if b.DorisType == schema.DorisLargeInt || b.DorisType == schema.DorisBigInt || b.DorisType == schema.DorisInt || b.DorisType == schema.DorisDouble {
 			isNumericValueType = true
 		}
 	}
@@ -18347,153 +18532,7 @@ func parseFiniteFloat(s string) (float64, bool) {
 }
 
 func synthesizeDateHistogramBuckets(rows []AggRow, spec *esast.DateHistogramAggSpec) []AggRow {
-	if spec == nil {
-		return rows
-	}
-	intervalMs := spec.EffectiveIntervalMs()
-	if intervalMs <= 0 {
-		intervalMs = 86400000
-	}
-	nowUTC := time.Now().UTC()
-	tzShiftMs := spec.EffectiveTimeZoneOffsetMs() - spec.EffectiveOffsetMs()
-	floorDateBucket := func(ms int64) int64 {
-		return int64(math.Floor(float64(ms+tzShiftMs)/float64(intervalMs)))*intervalMs - tzShiftMs
-	}
-	var hardMin, hardMax int64
-	hasHardMin, hasHardMax := false, false
-	boundRngSpec := &esast.RangeAggSpec{
-		Format:   spec.Format,
-		TimeZone: spec.TimeZone,
-	}
-	if spec.HardBounds != nil {
-		if spec.HardBounds.Min != nil {
-			if ms, ok := parseRuntimeDateRangeBoundMillis(spec.HardBounds.Min, boundRngSpec, nowUTC); ok {
-				hardMin = floorDateBucket(ms)
-				hasHardMin = true
-			} else if ms, ok := schema.ParseESDateBoundToEpochMillis(fmt.Sprintf("%v", spec.HardBounds.Min), nowUTC, false); ok {
-				hardMin = floorDateBucket(ms)
-				hasHardMin = true
-			}
-		}
-		if spec.HardBounds.Max != nil {
-			if ms, ok := parseRuntimeDateRangeBoundMillis(spec.HardBounds.Max, boundRngSpec, nowUTC); ok {
-				hardMax = floorDateBucket(ms)
-				hasHardMax = true
-			} else if ms, ok := schema.ParseESDateBoundToEpochMillis(fmt.Sprintf("%v", spec.HardBounds.Max), nowUTC, true); ok {
-				hardMax = floorDateBucket(ms)
-				hasHardMax = true
-			}
-		}
-	}
-	if hasHardMin || hasHardMax {
-		filtered := rows[:0]
-		for _, r := range rows {
-			k, err := strconv.ParseInt(r.BucketKey, 10, 64)
-			if err != nil {
-				continue
-			}
-			if (hasHardMin && k < hardMin) || (hasHardMax && k > hardMax) {
-				continue
-			}
-			filtered = append(filtered, r)
-		}
-		rows = filtered
-	}
-	if spec.MinDocCount == nil || *spec.MinDocCount > 0 {
-		if spec.MinDocCount != nil && *spec.MinDocCount > 0 {
-			minCnt := int64(*spec.MinDocCount)
-			filtered := make([]AggRow, 0, len(rows))
-			for _, r := range rows {
-				if r.effectiveCount() >= minCnt {
-					filtered = append(filtered, r)
-				}
-			}
-			return filtered
-		}
-		return rows
-	}
-
-	byKey := make(map[int64]AggRow, len(rows))
-	var minKey, maxKey int64
-	hasObserved := false
-	hasMinKey, hasMaxKey := false, false
-	for _, r := range rows {
-		if k, err := strconv.ParseInt(r.BucketKey, 10, 64); err == nil {
-			byKey[k] = r
-			if !hasMinKey || k < minKey {
-				minKey = k
-				hasMinKey = true
-			}
-			if !hasMaxKey || k > maxKey {
-				maxKey = k
-				hasMaxKey = true
-			}
-			hasObserved = true
-		}
-	}
-	if spec.ExtendedBounds != nil {
-		if spec.ExtendedBounds.Min != nil {
-			if ms, ok := parseRuntimeDateRangeBoundMillis(spec.ExtendedBounds.Min, boundRngSpec, nowUTC); ok {
-				extMin := floorDateBucket(ms)
-				if !hasMinKey || extMin < minKey {
-					minKey = extMin
-					hasMinKey = true
-				}
-			} else if ms, ok := schema.ParseESDateBoundToEpochMillis(fmt.Sprintf("%v", spec.ExtendedBounds.Min), nowUTC, false); ok {
-				extMin := floorDateBucket(ms)
-				if !hasMinKey || extMin < minKey {
-					minKey = extMin
-					hasMinKey = true
-				}
-			}
-		}
-		if spec.ExtendedBounds.Max != nil {
-			if ms, ok := parseRuntimeDateRangeBoundMillis(spec.ExtendedBounds.Max, boundRngSpec, nowUTC); ok {
-				extMax := floorDateBucket(ms)
-				if !hasMaxKey || extMax > maxKey {
-					maxKey = extMax
-					hasMaxKey = true
-				}
-			} else if ms, ok := schema.ParseESDateBoundToEpochMillis(fmt.Sprintf("%v", spec.ExtendedBounds.Max), nowUTC, true); ok {
-				extMax := floorDateBucket(ms)
-				if !hasMaxKey || extMax > maxKey {
-					maxKey = extMax
-					hasMaxKey = true
-				}
-			}
-		}
-	}
-	if hasMinKey && hasMaxKey {
-		hasObserved = true
-	}
-	if !hasObserved && hasHardMin && hasHardMax {
-		minKey = hardMin
-		maxKey = hardMax
-		hasObserved = true
-	}
-	if hasHardMin && (!hasObserved || minKey < hardMin) {
-		minKey = hardMin
-	}
-	if hasHardMax && (!hasObserved || maxKey > hardMax) {
-		maxKey = hardMax
-	}
-	if !hasObserved || maxKey < minKey {
-		return rows
-	}
-
-	var out []AggRow
-	for k := minKey; k <= maxKey && len(out) < transpiler.DefaultMaxAggBuckets; k += intervalMs {
-		if existing, ok := byKey[k]; ok {
-			out = append(out, existing)
-		} else {
-			out = append(out, AggRow{
-				BucketKey: strconv.FormatInt(k, 10),
-				DocCount:  0,
-				Value:     0,
-			})
-		}
-	}
-	return out
+	return synthesizeDateHistogramBucketsRound59(rows, spec)
 }
 
 func synthesizeHistogramBuckets(rows []AggRow, spec *esast.HistogramAggSpec) []AggRow {
@@ -18830,11 +18869,9 @@ func buildTopHitsList(
 				cSchema = fallbackSchema
 			}
 			if (spec.Source == nil || !spec.Source.Disabled) && (!spec.HasStoredFieldsNone() || spec.Source != nil) {
-				thSrc := c.hit.Source
-				if len(thSrc) == 0 {
-					thSrc = c.hit.EffectiveSource()
+				if filteredSrc, ok := filterDocumentSourceRound59(c.hit.EffectiveSource(), cSchema, spec.Source); ok {
+					hitMap["_source"] = filteredSrc
 				}
-				hitMap["_source"] = filterSourceJSON(thSrc, spec.Source)
 			}
 			if len(spec.Sort) > 0 {
 				hitMap["sort"] = extractHitSortValues(*c.hit, spec.Sort, cSchema)
@@ -19332,7 +19369,7 @@ func attachSubAggsToBucketWithSchema(
 					if isDateRange {
 						if ms, ok := parseRuntimeDateRangeBoundMillis(rng.From, rngSpec, nowUTC); ok {
 							entry["from"] = float64(ms)
-							entry["from_as_string"] = formatDateHistogramKeyAsString(ms, &esast.DateHistogramAggSpec{
+							entry["from_as_string"] = formatDateHistogramKeyAsStringRound59(ms, &esast.DateHistogramAggSpec{
 								Format:   rngSpec.Format,
 								TimeZone: rngSpec.TimeZone,
 							})
@@ -19348,7 +19385,7 @@ func attachSubAggsToBucketWithSchema(
 					if isDateRange {
 						if ms, ok := parseRuntimeDateRangeBoundMillis(rng.To, rngSpec, nowUTC); ok {
 							entry["to"] = float64(ms)
-							entry["to_as_string"] = formatDateHistogramKeyAsString(ms, &esast.DateHistogramAggSpec{
+							entry["to_as_string"] = formatDateHistogramKeyAsStringRound59(ms, &esast.DateHistogramAggSpec{
 								Format:   rngSpec.Format,
 								TimeZone: rngSpec.TimeZone,
 							})
@@ -22787,129 +22824,14 @@ func (s *Server) ensureIndexSchema(ctx context.Context, indexName string) *schem
 }
 
 func (s *Server) ensureWritableIndexSchemaWithDocs(ctx context.Context, indexName string, sampleDocs []json.RawMessage) *schema.IndexSchema {
-	s.mu.RLock()
-	if targets, ok := s.aliases[indexName]; ok && len(targets) > 0 {
-		indexName = targets[0]
-	}
-	idx, ok := s.indices[indexName]
-	if ok {
-		if len(idx.Fields) > 0 || len(idx.NestedRoots) > 0 || len(sampleDocs) == 0 {
-			s.mu.RUnlock()
-			if len(sampleDocs) > 0 {
-				if delta := detectArrayPromotions(idx, sampleDocs); delta != nil {
-					return s.applyArrayPromotionDelta(ctx, indexName, idx, delta)
-				}
-			}
-			return idx
-		}
-	}
-	s.mu.RUnlock()
-
-	_ = s.syncCatalogFromBackend(ctx)
-
-	s.mu.RLock()
-	if targets, ok := s.aliases[indexName]; ok && len(targets) > 0 {
-		indexName = targets[0]
-	}
-	idx, ok = s.indices[indexName]
-	if ok && (len(idx.Fields) > 0 || len(idx.NestedRoots) > 0 || len(sampleDocs) == 0) {
-		s.mu.RUnlock()
-		if len(sampleDocs) > 0 {
-			if delta := detectArrayPromotions(idx, sampleDocs); delta != nil {
-				return s.applyArrayPromotionDelta(ctx, indexName, idx, delta)
-			}
-		}
-		return idx
-	}
-	var existingEmptySchema *schema.IndexSchema
-	if ok {
-		existingEmptySchema = idx
-	}
-	tplMappings, tplDefPipe, hasTplDefPipe, tplFinPipe, hasTplFinPipe, tplAliases, tplCustomSettings, _ := s.matchingTemplateFullConfigLocked(indexName)
-	if existingEmptySchema != nil && existingEmptySchema.RawMapping != nil {
-		tplMappings = schema.MergeMappingSpecs(tplMappings, existingEmptySchema.RawMapping)
-	}
-	if s.isDataStreamOrBackingIndexLocked(indexName) {
-		tsSpec := &esast.MappingSpec{
-			Properties: map[string]esast.FieldProperty{
-				"@timestamp": {Type: "date"},
-			},
-		}
-		tplMappings = schema.MergeMappingSpecs(tsSpec, tplMappings)
-	}
-	s.mu.RUnlock()
-
-	effectiveMappings := tplMappings
-	if len(sampleDocs) > 0 && (tplMappings == nil || tplMappings.Dynamic == nil || tplMappings.Dynamic == true || tplMappings.Dynamic == "true") {
-		inferred := schema.InferMappingFromSampleDocs(sampleDocs, tplMappings)
-		effectiveMappings = schema.MergeMappingSpecs(inferred, tplMappings)
-	}
-
-	compiled := schema.CompileIndexSchema(s.dorisDB, indexName, effectiveMappings)
-	if len(sampleDocs) > 0 {
-		if delta := detectArrayPromotions(compiled, sampleDocs); delta != nil {
-			effectiveMappings = schema.MergeMappingSpecs(effectiveMappings, delta)
-			compiled = schema.CompileIndexSchema(s.dorisDB, indexName, effectiveMappings)
-		}
-	}
-	_ = s.backend.ExecDDL(ctx, schema.GenerateCreateTableDDL(compiled))
-	if existingEmptySchema != nil {
-		for _, stmt := range schema.GenerateAlterTableDDL(existingEmptySchema, compiled) {
-			_ = s.backend.ExecDDL(ctx, stmt)
-		}
-	}
-	aliasesToPersist := make(map[string][]string)
-	s.mu.Lock()
-	if existing, exists := s.indices[indexName]; exists && (len(existing.Fields) > 0 || len(existing.NestedRoots) > 0) {
-		s.mu.Unlock()
-		return existing
-	}
-	s.indices[indexName] = compiled
-	if existingEmptySchema == nil {
-		if hasTplDefPipe && tplDefPipe != "" {
-			if _, hasCur := s.indexDefaultPipelines[indexName]; !hasCur {
-				s.indexDefaultPipelines[indexName] = tplDefPipe
-			}
-		}
-		if hasTplFinPipe && tplFinPipe != "" {
-			if _, hasCur := s.indexFinalPipelines[indexName]; !hasCur {
-				s.indexFinalPipelines[indexName] = tplFinPipe
-			}
-		}
-		if len(tplCustomSettings) > 0 {
-			if s.indexCustomSettings == nil {
-				s.indexCustomSettings = make(map[string]map[string]any)
-			}
-			if s.indexCustomSettings[indexName] == nil {
-				s.indexCustomSettings[indexName] = make(map[string]any)
-			}
-			for k, v := range tplCustomSettings {
-				if k == "default_pipeline" || k == "final_pipeline" || v == nil {
-					continue
-				}
-				if _, exists := s.indexCustomSettings[indexName][k]; !exists {
-					s.indexCustomSettings[indexName][k] = normalizeCustomSettingValue(v)
-				}
-			}
-		}
-		for alias, rawMeta := range tplAliases {
-			meta := parseAliasMetadata(rawMeta)
-			s.addAliasWithMetaLocked(alias, indexName, meta)
-			aliasesToPersist[alias] = append([]string(nil), s.aliases[alias]...)
-		}
-	}
-	s.mu.Unlock()
-	s.persistIndex(ctx, indexName, compiled)
-	for alias, targets := range aliasesToPersist {
-		s.persistAlias(ctx, alias, targets)
-	}
-	s.queryCache.InvalidateAll()
-	return compiled
+	idx, _ := s.ensureWritableIndexSchemaWithDocsErr(ctx, indexName, sampleDocs)
+	return idx
 }
 
 func (s *Server) applyArrayPromotionDelta(ctx context.Context, indexName string, oldSchema *schema.IndexSchema, delta *esast.MappingSpec) *schema.IndexSchema {
 	merged := schema.MergeMappingSpecs(oldSchema.RawMapping, delta)
 	newSchema := schema.CompileIndexSchema(s.dorisDB, indexName, merged)
+	newSchema.CopyIndexMappingSettingsFrom(oldSchema)
 	for _, stmt := range schema.GenerateAlterTableDDL(oldSchema, newSchema) {
 		_ = s.backend.ExecDDL(ctx, stmt)
 	}
@@ -22963,6 +22885,8 @@ func detectArrayPromotions(idx *schema.IndexSchema, sampleDocs []json.RawMessage
 		esType := fb.ESType
 		if esType == "" {
 			switch fb.DorisType {
+			case schema.DorisLargeInt:
+				esType = "unsigned_long"
 			case schema.DorisBigInt:
 				esType = "long"
 			case schema.DorisDouble:
@@ -24238,70 +24162,11 @@ func pinnedRankForDoc(idxSchema *schema.IndexSchema, doc map[string]any, p *esas
 }
 
 func evalFieldValueFactorOnDoc(idxSchema *schema.IndexSchema, doc map[string]any, fvf *esast.FieldValueFactorSpec) (float64, bool) {
-	if fvf == nil || fvf.Field == "" {
-		return 0, false
+	v, ok, err := evalFieldValueFactorOnDocRound59(idxSchema, doc, fvf)
+	if err != nil {
+		return -1, true
 	}
-	clean := strings.TrimSuffix(strings.TrimSuffix(fvf.Field, ".keyword"), ".ngram")
-	pathSegs := strings.Split(clean, ".")
-	if idxSchema != nil {
-		if b := idxSchema.ResolveField(fvf.Field); len(b.SourceJSONPath) > 0 {
-			pathSegs = b.SourceJSONPath
-		}
-	}
-	rawVals := collectSchemaAwareScalarValues(doc, fvf.Field, pathSegs, idxSchema)
-	var rawNum float64
-	found := false
-	for _, rv := range rawVals {
-		if f, ok := toFloat64(rv); ok {
-			rawNum = f
-			found = true
-			break
-		}
-	}
-	if !found {
-		if fvf.Missing != nil {
-			if f, ok := toFloat64(fvf.Missing); ok {
-				rawNum = f
-				found = true
-			}
-		}
-		if !found {
-			return 0, true
-		}
-	}
-	factor := 1.0
-	if fvf.Factor != nil {
-		factor = *fvf.Factor
-	}
-	v := rawNum * factor
-	switch strings.ToLower(strings.TrimSpace(fvf.Modifier)) {
-	case "", "none":
-	case "log":
-		v = math.Log10(math.Max(0, v))
-	case "log1p":
-		v = math.Log10(math.Max(0, 1.0+v))
-	case "log2p":
-		v = math.Log10(math.Max(0, 2.0+v))
-	case "ln":
-		v = math.Log(math.Max(0, v))
-	case "ln1p":
-		v = math.Log(math.Max(0, 1.0+v))
-	case "ln2p":
-		v = math.Log(math.Max(0, 2.0+v))
-	case "square":
-		v = v * v
-	case "sqrt":
-		v = math.Sqrt(math.Max(0, v))
-	case "reciprocal":
-		if 1.0+v == 0 {
-			return 0, true
-		}
-		v = 1.0 / (1.0 + v)
-	}
-	if math.IsNaN(v) || math.IsInf(v, 0) {
-		return 0, true
-	}
-	return v, true
+	return v, ok
 }
 
 func combineFunctionScoreValues(vals []float64, scoreMode string) float64 {
@@ -26105,6 +25970,9 @@ func formatTermsBucketKeyAndString(rawKey string, termsSpec *esast.TermsAggSpec,
 			return rawKey, keyAsStr, true
 		}
 	}
+	if kv, ks, hasKS, handled := formatUnsignedLongOrNumericTermsKeyRound59(rawKey, termsSpec, idxSchema); handled {
+		return kv, ks, hasKS
+	}
 	if termsSpec != nil && strings.TrimSpace(termsSpec.Format) != "" {
 		if fv, ok := parseFiniteFloat(rawKey); ok {
 			keyAsStr := formatTermsNumericPattern(fv, termsSpec.Format)
@@ -27279,11 +27147,6 @@ func emitRuntimeDateHistogramAggRows(
 	if dh == nil {
 		return
 	}
-	intervalMs := dh.EffectiveIntervalMs()
-	if intervalMs <= 0 {
-		intervalMs = 86400000
-	}
-	tzShiftMs := dh.EffectiveTimeZoneOffsetMs() - dh.EffectiveOffsetMs()
 	nowUTC := time.Now().UTC()
 	byBucket := make(map[string][]runtimeMatchedDoc)
 	bucketTS := make(map[string]int64)
@@ -27291,7 +27154,7 @@ func emitRuntimeDateHistogramAggRows(
 		tsList := extractDocDateMillisForBucket(idxSchema, md, dh.Field, dh.Missing, dh.Script, nowUTC)
 		seenDocB := make(map[string]bool, len(tsList))
 		for _, ts := range tsList {
-			b := int64(math.Floor(float64(ts+tzShiftMs)/float64(intervalMs)))*intervalMs - tzShiftMs
+			b := floorDateHistogramBucketMillisRound59(ts, dh)
 			k := strconv.FormatInt(b, 10)
 			if !seenDocB[k] {
 				seenDocB[k] = true
@@ -28017,11 +27880,6 @@ func emitRuntimeCompositeAggRows(
 			return keys
 		case src.DateHistogram != nil:
 			dh := src.DateHistogram
-			intervalMs := dh.EffectiveIntervalMs()
-			if intervalMs <= 0 {
-				intervalMs = 86400000
-			}
-			tzShiftMs := dh.EffectiveTimeZoneOffsetMs() - dh.EffectiveOffsetMs()
 			tsList := extractDocDateMillisForBucket(idxSchema, md, dh.Field, dh.Missing, dh.Script, nowUTC)
 			if len(tsList) == 0 && dh.MissingBucket {
 				return []string{"__ES_MISSING_BUCKET__"}
@@ -28029,7 +27887,7 @@ func emitRuntimeCompositeAggRows(
 			var keys []string
 			seen := make(map[string]bool, len(tsList))
 			for _, ts := range tsList {
-				b := int64(math.Floor(float64(ts+tzShiftMs)/float64(intervalMs)))*intervalMs - tzShiftMs
+				b := floorDateHistogramBucketMillisRound59(ts, dh)
 				ks := strconv.FormatInt(b, 10)
 				if !seen[ks] {
 					seen[ks] = true
@@ -28185,11 +28043,6 @@ func partitionDocsByParentBucket(idxSchema *schema.IndexSchema, docs []runtimeMa
 		return out
 	case spec.DateHistogram != nil:
 		dh := spec.DateHistogram
-		intervalMs := dh.EffectiveIntervalMs()
-		if intervalMs <= 0 {
-			intervalMs = 86400000
-		}
-		tzShiftMs := dh.EffectiveTimeZoneOffsetMs() - dh.EffectiveOffsetMs()
 		nowUTC := time.Now().UTC()
 		var out []runtimeMatchedDoc
 		for _, md := range docs {
@@ -28201,7 +28054,7 @@ func partitionDocsByParentBucket(idxSchema *schema.IndexSchema, docs []runtimeMa
 				continue
 			}
 			for _, ts := range tsList {
-				b := int64(math.Floor(float64(ts+tzShiftMs)/float64(intervalMs)))*intervalMs - tzShiftMs
+				b := floorDateHistogramBucketMillisRound59(ts, dh)
 				if strconv.FormatInt(b, 10) == leafKey {
 					out = append(out, md)
 					break

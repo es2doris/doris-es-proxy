@@ -21,6 +21,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -231,6 +232,7 @@ type StandardRetrieverSpec struct {
 type KNNRetrieverSpec struct {
 	Field              string         `json:"field"`
 	QueryVector        []float64      `json:"query_vector,omitempty"`
+	QueryVectorFromHex bool           `json:"-"`
 	QueryVectorBuilder map[string]any `json:"query_vector_builder,omitempty"`
 	K                  int            `json:"k,omitempty"`
 	NumCandidates      int            `json:"num_candidates,omitempty"`
@@ -313,17 +315,34 @@ func (r *RetrieverSpec) UnmarshalJSON(data []byte) error {
 					return fmt.Errorf("parsing_exception: [knn] retriever unknown field [%s]", sk)
 				}
 			}
-			type plainKNN KNNRetrieverSpec
 			var rawKNN struct {
-				plainKNN
-				K             *int            `json:"k"`
-				NumCandidates *int            `json:"num_candidates"`
-				Boost         json.RawMessage `json:"boost"`
+				Field              string          `json:"field"`
+				QueryVectorRaw     json.RawMessage `json:"query_vector"`
+				QueryVectorBuilder map[string]any  `json:"query_vector_builder,omitempty"`
+				K                  *int            `json:"k"`
+				NumCandidates      *int            `json:"num_candidates"`
+				Filter             QuerySlice      `json:"filter,omitempty"`
+				Similarity         *float64        `json:"similarity,omitempty"`
+				Boost              json.RawMessage `json:"boost"`
+				Name               string          `json:"_name,omitempty"`
 			}
 			if err := json.Unmarshal(v, &rawKNN); err != nil {
 				return err
 			}
-			knn := rawKNN.plainKNN
+			var knn KNNRetrieverSpec
+			knn.Field = rawKNN.Field
+			knn.QueryVectorBuilder = rawKNN.QueryVectorBuilder
+			knn.Filter = rawKNN.Filter
+			knn.Similarity = rawKNN.Similarity
+			knn.Name = rawKNN.Name
+			if len(bytes.TrimSpace(rawKNN.QueryVectorRaw)) > 0 && !bytes.Equal(bytes.TrimSpace(rawKNN.QueryVectorRaw), []byte("null")) {
+				qv, fromHex, err := parseKNNQueryVectorRaw(rawKNN.QueryVectorRaw)
+				if err != nil {
+					return err
+				}
+				knn.QueryVector = qv
+				knn.QueryVectorFromHex = fromHex
+			}
 			if strings.TrimSpace(knn.Field) == "" {
 				return fmt.Errorf("parsing_exception: [knn] retriever requires [field]")
 			}
@@ -364,8 +383,7 @@ func (r *RetrieverSpec) UnmarshalJSON(data []byte) error {
 				}
 				knn.Boost = b
 			}
-			knnOut := KNNRetrieverSpec(knn)
-			r.KNN = &knnOut
+			r.KNN = &knn
 		case "rrf":
 			var subMap map[string]json.RawMessage
 			if err := json.Unmarshal(v, &subMap); err != nil {
@@ -508,6 +526,7 @@ func lowerRetrieverNode(ret *RetrieverSpec, req *SearchRequest) {
 		knnSpec := KNNQuery{
 			Field:              k.Field,
 			QueryVector:        k.QueryVector,
+			QueryVectorFromHex: k.QueryVectorFromHex,
 			QueryVectorBuilder: k.QueryVectorBuilder,
 			K:                  k.K,
 			NumCandidates:      k.NumCandidates,
@@ -1623,10 +1642,61 @@ func (r *SearchRequest) ShouldTrackTotalHits() bool {
 	return true
 }
 
+// ExpandHexBitVector decodes an even-length hexadecimal string into MSB-first {0.0, 1.0} bit values.
+func ExpandHexBitVector(hexStr string) ([]float64, error) {
+	if len(hexStr) == 0 || len(hexStr)%2 != 0 {
+		return nil, fmt.Errorf("illegal_argument_exception: bit vector hex string must have a positive even length, got [%d]", len(hexStr))
+	}
+	rawBytes, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return nil, fmt.Errorf("illegal_argument_exception: invalid hexadecimal bit vector [%s]: %w", hexStr, err)
+	}
+	out := make([]float64, 0, len(rawBytes)*8)
+	for _, b := range rawBytes {
+		for bit := 7; bit >= 0; bit-- {
+			if (b>>uint(bit))&1 == 1 {
+				out = append(out, 1.0)
+			} else {
+				out = append(out, 0.0)
+			}
+		}
+	}
+	return out, nil
+}
+
+func parseKNNQueryVectorRaw(raw json.RawMessage) ([]float64, bool, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, false, nil
+	}
+	if trimmed[0] == '"' {
+		var hexStr string
+		if err := json.Unmarshal(trimmed, &hexStr); err != nil {
+			return nil, false, err
+		}
+		bits, err := ExpandHexBitVector(hexStr)
+		if err != nil {
+			return nil, false, err
+		}
+		return bits, true, nil
+	}
+	var vec []float64
+	if err := json.Unmarshal(trimmed, &vec); err != nil {
+		return nil, false, err
+	}
+	for _, v := range vec {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return nil, false, fmt.Errorf("illegal_argument_exception: [knn] [query_vector] cannot contain NaN or Infinity")
+		}
+	}
+	return vec, false, nil
+}
+
 // KNNQuery represents an Elasticsearch 8/9 or OpenSearch `knn` vector search clause.
 type KNNQuery struct {
 	Field              string         `json:"field,omitempty"`
 	QueryVector        []float64      `json:"query_vector,omitempty"`
+	QueryVectorFromHex bool           `json:"-"`
 	QueryVectorBuilder map[string]any `json:"query_vector_builder,omitempty"`
 	K                  int            `json:"k,omitempty"`
 	NumCandidates      int            `json:"num_candidates,omitempty"`
@@ -1660,19 +1730,40 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 				return fmt.Errorf("parsing_exception: [knn] unknown field [%s]", k)
 			}
 		}
-		type knnPlain KNNQuery
 		var std struct {
-			knnPlain
-			Vector []float64       `json:"vector,omitempty"`
-			Boost  json.RawMessage `json:"boost,omitempty"`
+			Field              string          `json:"field,omitempty"`
+			QueryVectorRaw     json.RawMessage `json:"query_vector,omitempty"`
+			VectorRaw          json.RawMessage `json:"vector,omitempty"`
+			QueryVectorBuilder map[string]any  `json:"query_vector_builder,omitempty"`
+			K                  int             `json:"k,omitempty"`
+			NumCandidates      int             `json:"num_candidates,omitempty"`
+			Similarity         *float64        `json:"similarity,omitempty"`
+			Boost              json.RawMessage `json:"boost,omitempty"`
+			Filter             QuerySlice      `json:"filter,omitempty"`
+			Name               string          `json:"_name,omitempty"`
 		}
 		if err := json.Unmarshal(trimmed, &std); err != nil {
 			return err
 		}
-		if len(std.QueryVector) == 0 && len(std.Vector) > 0 {
-			std.QueryVector = std.Vector
+		vecRaw := std.QueryVectorRaw
+		if len(bytes.TrimSpace(vecRaw)) == 0 {
+			vecRaw = std.VectorRaw
 		}
-		*kq = KNNQuery(std.knnPlain)
+		qv, fromHex, err := parseKNNQueryVectorRaw(vecRaw)
+		if err != nil {
+			return err
+		}
+		*kq = KNNQuery{
+			Field:              std.Field,
+			QueryVector:        qv,
+			QueryVectorFromHex: fromHex,
+			QueryVectorBuilder: std.QueryVectorBuilder,
+			K:                  std.K,
+			NumCandidates:      std.NumCandidates,
+			Similarity:         std.Similarity,
+			Filter:             std.Filter,
+			Name:               std.Name,
+		}
 		if len(std.Boost) > 0 {
 			b, err := parseOptionalNonNegativeBoost(std.Boost)
 			if err != nil {
@@ -1730,23 +1821,28 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 			}
 		}
 		var spec struct {
-			Vector        []float64       `json:"vector"`
-			QueryVector   []float64       `json:"query_vector"`
-			K             int             `json:"k"`
-			NumCandidates int             `json:"num_candidates"`
-			Similarity    *float64        `json:"similarity"`
-			Boost         json.RawMessage `json:"boost"`
-			Filter        QuerySlice      `json:"filter"`
+			VectorRaw      json.RawMessage `json:"vector"`
+			QueryVectorRaw json.RawMessage `json:"query_vector"`
+			K              int             `json:"k"`
+			NumCandidates  int             `json:"num_candidates"`
+			Similarity     *float64        `json:"similarity"`
+			Boost          json.RawMessage `json:"boost"`
+			Filter         QuerySlice      `json:"filter"`
 		}
 		if err := json.Unmarshal(rawSpec, &spec); err != nil {
 			return err
 		}
-		vec := spec.Vector
-		if len(vec) == 0 {
-			vec = spec.QueryVector
+		vecRaw := spec.VectorRaw
+		if len(bytes.TrimSpace(vecRaw)) == 0 {
+			vecRaw = spec.QueryVectorRaw
+		}
+		vec, fromHex, err := parseKNNQueryVectorRaw(vecRaw)
+		if err != nil {
+			return err
 		}
 		kq.Field = field
 		kq.QueryVector = vec
+		kq.QueryVectorFromHex = fromHex
 		kq.K = spec.K
 		kq.NumCandidates = spec.NumCandidates
 		kq.Similarity = spec.Similarity
@@ -6566,6 +6662,15 @@ func (tq *TermsQuery) UnmarshalJSON(data []byte) error {
 			if err := unmarshalPreservingLargeInts(trimmed, &arr); err != nil {
 				return fmt.Errorf("parsing_exception: [terms] invalid terms array for [%s]: %w", k, err)
 			}
+			for _, elem := range arr {
+				if elem == nil {
+					return fmt.Errorf("illegal_argument_exception: Terms cannot contain null")
+				}
+				switch elem.(type) {
+				case []any, map[string]any:
+					return fmt.Errorf("parsing_exception: [terms] query does not support non-scalar element in terms array for [%s]", k)
+				}
+			}
 			tq.Fields[k] = normalizeDecodedNumbersPreservingLargeInts(arr).([]any)
 			continue
 		}
@@ -7681,6 +7786,7 @@ func (w *WildcardEntry) UnmarshalJSON(data []byte) error {
 
 type RegexpEntry struct {
 	Value           string  `json:"value"`
+	Flags           string  `json:"flags,omitempty"`
 	CaseInsensitive bool    `json:"case_insensitive,omitempty"`
 	Boost           float64 `json:"boost,omitempty"`
 	HasBoost        bool    `json:"-"`
@@ -7692,12 +7798,18 @@ func (r RegexpEntry) MarshalJSON() ([]byte, error) {
 		b := r.Boost
 		boostPtr = &b
 	}
+	flagsOut := r.Flags
+	if strings.EqualFold(flagsOut, "ALL") {
+		flagsOut = ""
+	}
 	return json.Marshal(struct {
 		Value           string   `json:"value"`
+		Flags           string   `json:"flags,omitempty"`
 		CaseInsensitive bool     `json:"case_insensitive,omitempty"`
 		Boost           *float64 `json:"boost,omitempty"`
 	}{
 		Value:           r.Value,
+		Flags:           flagsOut,
 		CaseInsensitive: r.CaseInsensitive,
 		Boost:           boostPtr,
 	})
@@ -7724,6 +7836,7 @@ func validateMaxDeterminizedStates(raw json.RawMessage, queryName string) error 
 func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
 	r.Boost = 1.0
 	r.HasBoost = false
+	r.Flags = "ALL"
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		var rawMap map[string]json.RawMessage
@@ -7770,6 +7883,9 @@ func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
 						return fmt.Errorf("illegal_argument_exception: [regexp] unknown flag [%s] in [flags]", tok)
 					}
 				}
+				r.Flags = strings.TrimSpace(flagsStr)
+			} else {
+				r.Flags = "NONE"
 			}
 		}
 		var full struct {
@@ -12258,13 +12374,13 @@ func (hb *HistogramBoundsSpec) UnmarshalJSON(data []byte) error {
 	maxF, okMax := parseBoundFloat(p.Max)
 	if okMin && okMax {
 		if minF > maxF {
-			return fmt.Errorf("parsing_exception: [histogram_bounds] [min] (%v) cannot be greater than [max] (%v)", p.Min, p.Max)
+			return fmt.Errorf("illegal_argument_exception: [histogram_bounds] [min] (%v) cannot be greater than [max] (%v)", p.Min, p.Max)
 		}
 	} else {
 		minT, okMinT := parseBoundDateTime(p.Min)
 		maxT, okMaxT := parseBoundDateTime(p.Max)
 		if okMinT && okMaxT && minT.After(maxT) {
-			return fmt.Errorf("parsing_exception: [histogram_bounds] [min] (%v) cannot be greater than [max] (%v)", p.Min, p.Max)
+			return fmt.Errorf("illegal_argument_exception: [histogram_bounds] [min] (%v) cannot be greater than [max] (%v)", p.Min, p.Max)
 		}
 	}
 	*hb = HistogramBoundsSpec(p)
@@ -12434,6 +12550,11 @@ func (d *DateHistogramAggSpec) UnmarshalJSON(data []byte) error {
 	if strings.TrimSpace(p.Interval) != "" && !isValidCalendarInterval(p.Interval) && !isValidFixedInterval(p.Interval) {
 		return fmt.Errorf("parsing_exception: [date_histogram] invalid [interval] [%s]", p.Interval)
 	}
+	if strings.TrimSpace(p.TimeZone) != "" {
+		if _, _, _, err := ParseESTimeZone(strings.TrimSpace(p.TimeZone)); err != nil {
+			return err
+		}
+	}
 	if p.MinDocCount != nil && *p.MinDocCount < 0 {
 		return fmt.Errorf("parsing_exception: [date_histogram] [min_doc_count] must be >= 0")
 	}
@@ -12444,6 +12565,93 @@ func (d *DateHistogramAggSpec) UnmarshalJSON(data []byte) error {
 	}
 	*d = DateHistogramAggSpec(p)
 	return nil
+}
+
+// EffectiveCalendarUnit returns the canonical Doris/Go calendar truncation unit
+// ("minute", "hour", "day", "week", "month", "quarter", "year") when this
+// date_histogram uses a calendar interval, or "" when it uses a fixed interval.
+func (d *DateHistogramAggSpec) EffectiveCalendarUnit() string {
+	if d == nil || strings.TrimSpace(d.FixedInterval) != "" {
+		return ""
+	}
+	raw := strings.TrimSpace(d.CalendarInterval)
+	if raw == "" {
+		raw = strings.TrimSpace(d.Interval)
+	}
+	switch raw {
+	case "1m", "minute":
+		return "minute"
+	case "1h", "hour":
+		return "hour"
+	case "1d", "day":
+		return "day"
+	case "1w", "week":
+		return "week"
+	case "1M", "month":
+		return "month"
+	case "1q", "quarter":
+		return "quarter"
+	case "1y", "year":
+		return "year"
+	default:
+		return ""
+	}
+}
+
+// IsCalendarInterval reports whether this date_histogram uses calendar-aware bucketing.
+func (d *DateHistogramAggSpec) IsCalendarInterval() bool {
+	return d.EffectiveCalendarUnit() != ""
+}
+
+// ParseESTimeZone validates an Elasticsearch time_zone string ("Z", "UTC", fixed offset "+HH:MM" / "-HHMM" / "+HH",
+// or IANA zone name like "America/New_York") and returns its *time.Location, fixed offset in ms (when fixed),
+// whether it is a fixed offset, or a parsing_exception error.
+func ParseESTimeZone(tz string) (*time.Location, int64, bool, error) {
+	tz = strings.TrimSpace(tz)
+	if tz == "" || tz == "Z" || strings.EqualFold(tz, "UTC") {
+		return time.UTC, 0, true, nil
+	}
+	if strings.HasPrefix(tz, "+") || strings.HasPrefix(tz, "-") {
+		sign := int64(1)
+		if tz[0] == '-' {
+			sign = -1
+		}
+		rest := tz[1:]
+		var h, m int64
+		var ok bool
+		if parts := strings.Split(rest, ":"); len(parts) == 2 {
+			if isPureASCIIDigits(parts[0]) && len(parts[0]) >= 1 && len(parts[0]) <= 2 &&
+				isPureASCIIDigits(parts[1]) && len(parts[1]) == 2 {
+				h1, err1 := strconv.ParseInt(parts[0], 10, 64)
+				m1, err2 := strconv.ParseInt(parts[1], 10, 64)
+				if err1 == nil && err2 == nil && h1 >= 0 && h1 <= 23 && m1 >= 0 && m1 < 60 {
+					h, m, ok = h1, m1, true
+				}
+			}
+		} else if len(rest) == 4 && isPureASCIIDigits(rest) {
+			h1, err1 := strconv.ParseInt(rest[:2], 10, 64)
+			m1, err2 := strconv.ParseInt(rest[2:], 10, 64)
+			if err1 == nil && err2 == nil && h1 >= 0 && h1 <= 23 && m1 >= 0 && m1 < 60 {
+				h, m, ok = h1, m1, true
+			}
+		} else if (len(rest) == 1 || len(rest) == 2) && isPureASCIIDigits(rest) {
+			h1, err1 := strconv.ParseInt(rest, 10, 64)
+			if err1 == nil && h1 >= 0 && h1 <= 23 {
+				h, m, ok = h1, 0, true
+			}
+		}
+		if !ok {
+			return nil, 0, false, fmt.Errorf("parsing_exception: [date_histogram] invalid [time_zone] offset [%s]", tz)
+		}
+		sec := int(sign * (h*3600 + m*60))
+		canon := fmt.Sprintf("%+03d:%02d", int(sign*h), m)
+		return time.FixedZone(canon, sec), int64(sec) * 1000, true, nil
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		return nil, 0, false, fmt.Errorf("parsing_exception: [date_histogram] invalid [time_zone] [%s]: %w", tz, err)
+	}
+	return loc, 0, false, nil
 }
 
 // EffectiveOffsetMs parses `offset` (e.g., "+6h", "-30m") into milliseconds.
@@ -13996,6 +14204,7 @@ type FieldProperty struct {
 	Dims                     int                      `json:"dims,omitempty"`
 	Dimension                int                      `json:"dimension,omitempty"`
 	Similarity               string                   `json:"similarity,omitempty"`
+	ElementType              string                   `json:"element_type,omitempty"`
 	MultiValued              bool                     `json:"multi_valued,omitempty"`
 	UpgradedArray            bool                     `json:"upgraded_array,omitempty"`
 	CopyTo                   any                      `json:"copy_to,omitempty"`
