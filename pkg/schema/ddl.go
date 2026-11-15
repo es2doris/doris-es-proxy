@@ -40,11 +40,13 @@ func GenerateCreateTableDDL(s *IndexSchema) string {
 		"    `_source` STRING NOT NULL COMMENT 'Verbatim raw JSON document for exact _source retrieval'",
 		"    `_doc` VARIANT NOT NULL COMMENT 'Auto-shredded dynamic sub-columns for unmapped fields'",
 		"    `_all_text` STRING NULL COMMENT 'Catch-all text column for wildcard query_string'",
+		"    `_ignored` ARRAY<STRING> NULL COMMENT 'ES _ignored malformed/ignore_above fields'",
 	)
 
 	idxs = append(idxs,
 		"    INDEX `idx_doc_variant` (`_doc`) USING INVERTED PROPERTIES(\"parser\" = \"unicode\", \"support_phrase\" = \"true\")",
 		"    INDEX `idx_all_text` (`_all_text`) USING INVERTED PROPERTIES(\"parser\" = \"standard\", \"support_phrase\" = \"true\", \"lower_case\" = \"true\")",
+		"    INDEX `idx__ignored` (`_ignored`) USING INVERTED",
 	)
 
 	// 2. Promoted Scalar, Array, and Nested Pre-filter Columns (sorted deterministically)
@@ -437,7 +439,7 @@ func isUnpromotableDynamicScope(s *IndexSchema, esFieldPath string) bool {
 	for _, seg := range strings.Split(cleanPath, ".") {
 		prop, ok := props[seg]
 		if !ok {
-			return mode == "false" || mode == "strict" || mode == "runtime"
+			return mode == "false" || mode == "strict"
 		}
 		if strings.EqualFold(prop.Type, "flattened") {
 			return false

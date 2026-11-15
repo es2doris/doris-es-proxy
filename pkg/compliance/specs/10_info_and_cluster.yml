@@ -9,7 +9,7 @@
   - match: { name: "doris-es-proxy" }
   - match: { cluster_name: "apache-doris-search-cluster" }
   - match: { version.number: "7.10.2" }
-  - match: { tagline: "/You Know, for Search/" }
+  - match: { tagline: '/You\ Know,\ for\ Search/' }
   - is_true: version.number
 
 ---
@@ -79,10 +79,12 @@
   - match: { _nodes.total: 1 }
   - match: { cluster_name: "apache-doris-search-cluster" }
   - do:
-      cat.health: {}
+      cat.health:
+        format: "json"
   - length: { $body: 1 }
   - match: { 0.status: "green" }
   - do:
-      cat.nodes: {}
+      cat.nodes:
+        format: "json"
   - length: { $body: 1 }
   - match: { 0.name: "doris-fe-1" }

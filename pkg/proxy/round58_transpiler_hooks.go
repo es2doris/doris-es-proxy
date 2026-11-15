@@ -627,11 +627,22 @@ func applyAndValidateURISearchParamsRound58(r *http.Request, req *esast.SearchRe
 		}
 	}
 
-	if srcVals := q["_source"]; len(srcVals) > 0 && req.Source == nil {
+	hasURISourceOverride := len(q["_source"]) > 0 ||
+		len(q["_source_includes"]) > 0 || len(q["_source_include"]) > 0 ||
+		len(q["_source_excludes"]) > 0 || len(q["_source_exclude"]) > 0
+	if hasURISourceOverride {
+		req.Source = nil
+	}
+	if srcVals := q["_source"]; len(srcVals) > 0 {
 		for _, srcParam := range srcVals {
 			if srcParam == "false" {
 				req.Source = &esast.SourceFilter{Disabled: true}
-			} else if srcParam != "true" && srcParam != "" {
+			} else if srcParam == "true" {
+				if req.Source == nil {
+					req.Source = &esast.SourceFilter{}
+				}
+				req.Source.Disabled = false
+			} else if srcParam != "" {
 				if req.Source == nil {
 					req.Source = &esast.SourceFilter{}
 				}

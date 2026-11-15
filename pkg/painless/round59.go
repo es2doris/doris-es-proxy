@@ -56,10 +56,16 @@ func ensureUniqueBackingSliceRound59(s []any) []any {
 func markSetSliceRound59(budget *evalBudget, s []any) []any {
 	out := ensureUniqueBackingSliceRound59(s)
 	if budget != nil {
-		if budget.setSlices == nil {
-			budget.setSlices = make(map[uintptr]bool)
+		ptr := reflect.ValueOf(out).Pointer()
+		if ptr != 0 {
+			if budget.setSlices == nil {
+				budget.setSlices = make(map[uintptr]bool)
+			}
+			if !budget.setSlices[ptr] {
+				budget.setSlices[ptr] = true
+				budget.pinnedRefs = append(budget.pinnedRefs, out)
+			}
 		}
-		budget.setSlices[reflect.ValueOf(out).Pointer()] = true
 	}
 	return out
 }
@@ -75,10 +81,16 @@ func isSetSliceRound59(budget *evalBudget, v any) bool {
 func markTypedArraySliceRound59(budget *evalBudget, s []any, arrType string) []any {
 	out := ensureUniqueBackingSliceRound59(s)
 	if budget != nil && arrType != "" {
-		if budget.arrayTypes == nil {
-			budget.arrayTypes = make(map[uintptr]string)
+		ptr := reflect.ValueOf(out).Pointer()
+		if ptr != 0 {
+			if budget.arrayTypes == nil {
+				budget.arrayTypes = make(map[uintptr]string)
+			}
+			if _, exists := budget.arrayTypes[ptr]; !exists {
+				budget.pinnedRefs = append(budget.pinnedRefs, out)
+			}
+			budget.arrayTypes[ptr] = arrType
 		}
-		budget.arrayTypes[reflect.ValueOf(out).Pointer()] = arrType
 	}
 	return out
 }
@@ -748,7 +760,12 @@ func isBuiltInScalarOrColCastBaseRound59(base string) bool {
 		"List", "ArrayList", "LinkedList",
 		"Map", "HashMap", "LinkedHashMap", "TreeMap",
 		"Set", "HashSet", "LinkedHashSet", "TreeSet",
-		"Collection":
+		"Collection",
+		"Supplier", "IntSupplier", "LongSupplier", "DoubleSupplier", "BooleanSupplier",
+		"Function", "BiFunction", "IntFunction", "LongFunction", "DoubleFunction",
+		"UnaryOperator", "BinaryOperator", "Predicate", "BiPredicate",
+		"Consumer", "BiConsumer", "Runnable",
+		"Metadata", "GeoPoint", "BytesRef", "ByteBuffer", "DayOfWeekEnum":
 		return true
 	}
 	return false
@@ -779,7 +796,7 @@ func normalizeCastTypeCandidateRound59(cand string, budget *evalBudget) (string,
 		}
 		s = strings.TrimSpace(s[:openAng])
 	}
-	for _, pfx := range []string{"java.math.", "java.lang.", "java.util."} {
+	for _, pfx := range []string{"java.math.", "java.lang.", "java.util.function.", "java.util.", "java.nio."} {
 		if strings.HasPrefix(s, pfx) {
 			s = strings.TrimPrefix(s, pfx)
 			break
@@ -969,6 +986,15 @@ func isJavaArrayTypeAssignableRound59(srcArrType, dstArrType string, budget *eva
 }
 
 func validateArrayCastRound59(castType string, innerExpr string, innerVal any, params map[string]any, budget *evalBudget) (any, error) {
+	if fv, isFV := innerVal.([]float64); isFV {
+		if castType == "float[]" || castType == "double[]" || castType == "Object[]" || castType == "def[]" {
+			return fv, nil
+		}
+		return nil, &painlessExceptionError{
+			exType:  "ClassCastException",
+			message: fmt.Sprintf("Cannot cast float[] to %s", castType),
+		}
+	}
 	arr, ok := innerVal.([]any)
 	if !ok || isSetValueRound59(innerVal, innerExpr, params, budget) {
 		return nil, &painlessExceptionError{
@@ -1162,6 +1188,10 @@ func evalExplicitCastRound59Painless(castType string, innerExpr string, innerVal
 			}
 			return uo, nil
 		}
+	}
+
+	if evalInstanceOfPainless(innerVal, castType) {
+		return innerVal, nil
 	}
 
 	return nil, &painlessExceptionError{
@@ -2017,6 +2047,7 @@ func setSliceElementAtPathRound59(root map[string]any, arrPath []string, idxVal 
 	next[idx] = newVal
 	next = propagateSliceTagsRound59(budget, existing, next)
 	setValueAtPath(root, arrPath, next)
+	syncSliceHeaderAliasesRound60(root, existing, next)
 	return prev, nil
 }
 
@@ -2038,6 +2069,7 @@ func insertIntoSliceAtPathRound59(root map[string]any, path []string, idxVal any
 	next = append(next, existing[idx:]...)
 	next = propagateSliceTagsRound59(budget, existing, next)
 	setValueAtPath(root, path, next)
+	syncSliceHeaderAliasesRound60(root, existing, next)
 	return nil
 }
 
@@ -2076,6 +2108,7 @@ func insertAllIntoSliceAtPathRound59(root map[string]any, path []string, idxVal 
 	next = append(next, existing[idx:]...)
 	next = propagateSliceTagsRound59(budget, existing, next)
 	setValueAtPath(root, path, next)
+	syncSliceHeaderAliasesRound60(root, existing, next)
 	return true, nil
 }
 
@@ -2893,25 +2926,5 @@ func evalURLSameFileRound59(recVal any, argExpr string, sourceMap, params map[st
 }
 
 func evalArraysHashCodeRound59(val any, deep bool, sourceMap, params map[string]any, depth int) int64 {
-	if val == nil {
-		return 0
-	}
-	arr, ok := val.([]any)
-	if !ok {
-		return evalValueHashCodePainless(val, sourceMap, params, depth+1)
-	}
-	var h int32 = 1
-	for _, el := range arr {
-		var eh int32
-		if deep {
-			if sub, isSub := el.([]any); isSub {
-				eh = int32(evalArraysHashCodeRound59(sub, true, sourceMap, params, depth+1)) // #nosec G115 -- 32-bit Java hashCode
-				h = 31*h + eh
-				continue
-			}
-		}
-		eh = int32(evalValueHashCodePainless(el, sourceMap, params, depth+1)) // #nosec G115 -- 32-bit Java hashCode
-		h = 31*h + eh
-	}
-	return int64(h)
+	return evalArraysHashCodeCycleSafeRound60(val, deep, sourceMap, params, depth, nil)
 }

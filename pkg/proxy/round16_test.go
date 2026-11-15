@@ -449,11 +449,11 @@ func TestRound16_PainlessDocValuesAndNestedArrayProjection(t *testing.T) {
 	if fields["has_title"].([]any)[0] != true || fields["has_doris"].([]any)[0] != true {
 		t.Fatalf("expected has_title=true and has_doris=true, got %+v", fields)
 	}
-	if fields["doris_idx"].([]any)[0].(float64) != 1 || fields["second_tag"].([]any)[0] != "doris" {
-		t.Fatalf("expected doris_idx=1 and second_tag='doris', got %+v", fields)
+	if fields["doris_idx"].([]any)[0].(float64) != 0 || fields["second_tag"].([]any)[0] != "es" {
+		t.Fatalf("expected sorted docvalues doris_idx=0 and second_tag='es', got %+v", fields)
 	}
-	if fields["loop_tags"].([]any)[0] != "go,doris,es," {
-		t.Fatalf("expected loop_tags='go,doris,es,', got %v", fields["loop_tags"])
+	if fields["loop_tags"].([]any)[0] != "doris,es,go," {
+		t.Fatalf("expected sorted docvalues loop_tags='doris,es,go,', got %v", fields["loop_tags"])
 	}
 	if fields["items_sum"].([]any)[0].(float64) != 20.0 {
 		t.Fatalf("expected items_sum=20.0, got %v", fields["items_sum"])

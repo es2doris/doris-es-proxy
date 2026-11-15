@@ -23,7 +23,7 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 DORIS_E2E_DSN ?= root:@tcp(127.0.0.1:9030)/?interpolateParams=true&multiStatements=true&timeout=5s&readTimeout=30s&writeTimeout=30s
 DORIS_E2E_HTTP ?= http://127.0.0.1:8030
 
-.PHONY: build test test-e2e bench fuzz demo lint check security scan-vuln scan-sast scan-secrets docker-build compose-up compose-down clean
+.PHONY: build test test-e2e conformance-fetch test-sdk-conformance test-conformance bench fuzz demo lint check security scan-vuln scan-sast scan-secrets docker-build compose-up compose-down clean
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" -o bin/doris-es-proxy ./cmd/doris-es-proxy
@@ -47,6 +47,17 @@ fuzz:
 
 test-e2e:
 	DORIS_E2E_DSN="$(DORIS_E2E_DSN)" DORIS_E2E_HTTP="$(DORIS_E2E_HTTP)" go test -race -count=1 -v ./e2e -run TestLiveApacheDoris_E2E
+
+conformance-fetch:
+	bash scripts/fetch-conformance-specs.sh
+
+test-sdk-conformance:
+	go -C e2e/sdkconformance test -race -count=1 -v ./...
+
+test-conformance:
+	bash scripts/fetch-conformance-specs.sh
+	CONFORMANCE_REQUIRE_UPSTREAM=1 CONFORMANCE_MIN_V7_PASSED=1065 CONFORMANCE_MIN_V8_PASSED=1083 go test -race -count=1 -v ./pkg/compliance -run 'TestUpstream|TestSpecSchemaValidatorLiveUpstreamSchema'
+	go -C e2e/sdkconformance test -race -count=1 -v ./...
 
 lint:
 	gofmt -s -w .

@@ -268,8 +268,8 @@ func TestRound12IngestDropOnFailureAndExtendedProcessors(t *testing.T) {
 	if simSrc["mem_bytes"] != float64(2048) {
 		t.Fatalf("expected bytes 2kb -> 2048, got %v", simSrc["mem_bytes"])
 	}
-	if simSrc["clean_html"] != "Hello World" {
-		t.Fatalf("expected html_strip 'Hello World', got %v", simSrc["clean_html"])
+	if simSrc["clean_html"] != "\nHello World\n" {
+		t.Fatalf("expected html_strip '\\nHello World\\n', got %q", simSrc["clean_html"])
 	}
 	tagsArr, _ := simSrc["tags"].([]any)
 	if len(tagsArr) != 2 || tagsArr[0] != "GO" || tagsArr[1] != "DORIS" {

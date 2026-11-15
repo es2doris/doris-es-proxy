@@ -236,12 +236,13 @@ func TestRound14CollapseSearchAfterPaginationAndInnerHits(t *testing.T) {
 			t.Fatalf("useSQL=%v: expected highlight in collapse.inner_hits, got %v", useSQL, p1TeamHits[0])
 		}
 
-		// Page 2: search_after=[300] MUST return doc 3 (sales, salary 200) and NOT doc 2 (eng, salary 250)!
+		// Page 2: search_after=["eng", 300] MUST return doc 3 (sales, salary 200) and NOT doc 2 (eng, salary 250)!
+		// Note: ES 7.12+ / 8.x mandates sorting on the collapse field ("dept") when combining collapse + search_after.
 		p2 := mustReq(t, ts, http.MethodPost, "/col_page_1,col_page_2/_search", `{
 			"size": 1,
 			"query": {"match": {"bio": "search"}},
-			"sort": [{"salary": "desc"}],
-			"search_after": [300],
+			"sort": [{"dept": "asc"}, {"salary": "desc"}],
+			"search_after": ["eng", 300],
 			"collapse": {
 				"field": "dept",
 				"inner_hits": {
@@ -252,8 +253,29 @@ func TestRound14CollapseSearchAfterPaginationAndInnerHits(t *testing.T) {
 			}
 		}`)
 		p2Hits := p2["hits"].(map[string]any)["hits"].([]any)
+		if len(p2Hits) != 1 || (p2Hits[0].(map[string]any)["_id"] != "3" && p2Hits[0].(map[string]any)["_id"] != "5") {
+			t.Fatalf("useSQL=%v: expected Page 2 hit to be hr/sales and not secondary eng doc 2, got %v", useSQL, p2Hits)
+		}
+		if p2Hits[0].(map[string]any)["_id"] == "5" {
+			// dept asc order: "eng" -> "hr" (doc 5) -> "sales" (doc 3); advance once more to verify sales!
+			p2 = mustReq(t, ts, http.MethodPost, "/col_page_1,col_page_2/_search", `{
+				"size": 1,
+				"query": {"match": {"bio": "search"}},
+				"sort": [{"dept": "asc"}, {"salary": "desc"}],
+				"search_after": ["hr", 100],
+				"collapse": {
+					"field": "dept",
+					"inner_hits": {
+						"name": "team",
+						"size": 5,
+						"sort": [{"salary": "asc"}]
+					}
+				}
+			}`)
+			p2Hits = p2["hits"].(map[string]any)["hits"].([]any)
+		}
 		if len(p2Hits) != 1 || p2Hits[0].(map[string]any)["_id"] != "3" {
-			t.Fatalf("useSQL=%v: expected Page 2 hit to be doc 3 (sales, salary 200) and not secondary eng doc 2, got %v", useSQL, p2Hits)
+			t.Fatalf("useSQL=%v: expected Page 3 hit to be doc 3 (sales, salary 200) and not secondary eng doc 2, got %v", useSQL, p2Hits)
 		}
 		p2IH := p2Hits[0].(map[string]any)["inner_hits"].(map[string]any)["team"].(map[string]any)["hits"].(map[string]any)
 		if p2IH["total"].(map[string]any)["value"] != float64(2) {
@@ -265,8 +287,8 @@ func TestRound14CollapseSearchAfterPaginationAndInnerHits(t *testing.T) {
 		sp2 := mustReq(t, ts, http.MethodPost, "/col_page_1/_search", `{
 			"size": 1,
 			"query": {"match": {"bio": "search"}},
-			"sort": [{"salary": "desc"}],
-			"search_after": [300],
+			"sort": [{"dept": "asc"}, {"salary": "desc"}],
+			"search_after": ["hr", 100],
 			"collapse": {"field": "dept"}
 		}`)
 		sp2Hits := sp2["hits"].(map[string]any)["hits"].([]any)

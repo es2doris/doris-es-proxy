@@ -418,6 +418,7 @@ func TestRound24RuntimeScriptScoringMovingFnAndScriptedMetric(t *testing.T) {
 						"moving_fn": {
 							"buckets_path": "p",
 							"window": 2,
+							"shift": 1,
 							"script": "values.length > 0 ? values[values.length - 1] * 3 : 0"
 						}
 					}

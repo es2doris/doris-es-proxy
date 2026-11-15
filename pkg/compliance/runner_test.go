@@ -9,6 +9,8 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -4868,25 +4870,27 @@ func TestRound58_F1_ExactNumbersNonCoercingStringsAndTruthiness(t *testing.T) {
 		t.Fatalf("execCompare lt on underscore strings should compare lexicographically: %v", err)
 	}
 
-	// 4. Empty collection is_false / is_true
+	// 4. Empty collection is_true / is_false (IsTrueYamlTestSection.java semantics:
+	// only nil, false, numeric 0, and "" are falsy; non-nil empty maps/slices and "false"/"0" are truthy)
 	emptyOM := NewOrderedMap()
 	nonEmptyOM := NewOrderedMap()
 	nonEmptyOM.Set("k", "v")
-	if isTruthy([]any{}) || isTruthy(map[string]any{}) || isTruthy(emptyOM) || isTruthy(*emptyOM) || isTruthy(uint64(0)) {
-		t.Fatalf("expected empty collections and uint64(0) to be falsy")
+	if isTruthy((*OrderedMap)(nil)) || isTruthy(uint64(0)) || isTruthy("") || isTruthy(json.Number("0")) {
+		t.Fatalf("expected nil *OrderedMap, uint64(0), empty string, and json.Number(0) to be falsy")
+	}
+	if !isTruthy([]any{}) || !isTruthy(map[string]any{}) || !isTruthy(emptyOM) || !isTruthy(*emptyOM) {
+		t.Fatalf("expected non-nil empty collections to be truthy per IsTrueYamlTestSection.java")
 	}
 	if !isTruthy([]any{1}) || !isTruthy(map[string]any{"k": 1}) || !isTruthy(nonEmptyOM) || !isTruthy(*nonEmptyOM) || !isTruthy(uint64(1)) {
 		t.Fatalf("expected non-empty collections and uint64(1) to be truthy")
 	}
-	for _, fField := range []string{"empty_arr", "empty_map", "missing_field"} {
-		if err := ctx.execIsFalse(fField); err != nil {
-			t.Fatalf("execIsFalse(%q) failed: %v", fField, err)
-		}
-		if err := ctx.execIsTrue(fField); err == nil {
-			t.Fatalf("execIsTrue(%q) should have failed", fField)
-		}
+	if err := ctx.execIsFalse("missing_field"); err != nil {
+		t.Fatalf("execIsFalse(\"missing_field\") failed: %v", err)
 	}
-	for _, tField := range []string{"full_arr", "full_map"} {
+	if err := ctx.execIsTrue("missing_field"); err == nil {
+		t.Fatalf("execIsTrue(\"missing_field\") should have failed")
+	}
+	for _, tField := range []string{"empty_arr", "empty_map", "full_arr", "full_map"} {
 		if err := ctx.execIsTrue(tField); err != nil {
 			t.Fatalf("execIsTrue(%q) failed: %v", tField, err)
 		}
@@ -4947,7 +4951,324 @@ func TestRound58_F1_ExactNumbersNonCoercingStringsAndTruthiness(t *testing.T) {
 			t.Fatalf("toInt(%T:%v) expected false", badInt, badInt)
 		}
 	}
-	if isTruthy(nil) || isTruthy(false) || !isTruthy(true) || isTruthy(0) || !isTruthy(1) || isTruthy(int64(0)) || !isTruthy(int64(1)) || isTruthy(uint(0)) || !isTruthy(uint(1)) || isTruthy(float64(0)) || !isTruthy(float64(1.5)) || isTruthy("false") || !isTruthy("yes") || !isTruthy(struct{}{}) {
+	if isTruthy(nil) || isTruthy(false) || !isTruthy(true) || isTruthy(0) || !isTruthy(1) || isTruthy(int64(0)) || !isTruthy(int64(1)) || isTruthy(uint(0)) || !isTruthy(uint(1)) || isTruthy(float64(0)) || !isTruthy(float64(1.5)) || isTruthy("") || !isTruthy("false") || !isTruthy("0") || !isTruthy("yes") || !isTruthy(struct{}{}) {
 		t.Fatalf("isTruthy primitive branch check failed")
+	}
+}
+
+func TestRound60_F0_PatternCommentsMatchVsCatchRegexes(t *testing.T) {
+	// 1. match: compiles /.../ with Java Pattern.COMMENTS | Pattern.DOTALL
+	commentedPattern := "/\n" +
+		"  ^health \\  status [ #] index   # header line comment\n" +
+		"  \\n                              # newline\n" +
+		"  green \\s+ open \\s+ orders_1   # data row\n" +
+		"/\n"
+
+	reMatch, isRe, err := compileMatchRegex(commentedPattern)
+	if !isRe || err != nil {
+		t.Fatalf("compileMatchRegex failed: isRe=%v err=%v", isRe, err)
+	}
+	sampleCat := "health status#index\ngreen   open   orders_1\n"
+	if !reMatch.MatchString(sampleCat) {
+		t.Fatalf("expected Pattern.COMMENTS match regex to match %q (compiled=%s)", sampleCat, reMatch.String())
+	}
+	if reMatch.MatchString("healthstatus#index\ngreen open orders_1") {
+		t.Fatalf("escaped space \\  and character-class [ #] must still be required")
+	}
+
+	// Inline (?x) flag works in both compileComplianceRegex and compileMatchRegex
+	reInlineX, isRe, err := compileComplianceRegex("/(?x) foo \\  bar # trailing comment\n baz /")
+	if !isRe || err != nil || !reInlineX.MatchString("foo barbaz") {
+		t.Fatalf("expected (?x) inline comments mode to match 'foo barbaz', isRe=%v err=%v", isRe, err)
+	}
+
+	// 2. catch: compiles /.../ with Pattern.DOTALL ONLY (preserving literal spaces and #)
+	ctx := newRunnerContext(http.DefaultClient, "http://localhost:9200")
+	errBody := `{"error":{"type":"illegal_argument_exception","reason":"no such index [my index] #1"},"status":400}`
+	var parsed any
+	_ = json.Unmarshal([]byte(errBody), &parsed)
+	if err := ctx.verifyCatch(`/no such index \[my index\] #1/`, "search", http.StatusBadRequest, errBody, parsed); err != nil {
+		t.Fatalf("expected catch regex to preserve literal spaces and #, got: %v", err)
+	}
+	if err := ctx.verifyCatch(`/no such index \[myindex\] #1/`, "search", http.StatusBadRequest, errBody, parsed); err == nil {
+		t.Fatalf("expected catch regex with wrong spacing to fail")
+	}
+}
+
+func TestRound60_F1_RequiresCloseToExistsAndIsTruthy(t *testing.T) {
+	ctx := newRunnerContext(http.DefaultClient, "http://localhost:9200")
+	ctx.targetVersion = "8.15.5"
+	ctx.supportedClusterFeatures = DefaultSupportedClusterFeatures()
+	ctx.supportedTestRunnerFeatures = DefaultSupportedTestRunnerFeatures()
+
+	// 1. requires: polarity vs skip: polarity
+	if err := ctx.execRequires(map[string]any{
+		"cluster_features":     []any{"gte_v8.11.0", "lte_v8.99.0", "mapper.source.synthetic"},
+		"test_runner_features": []any{"close_to", "exists", "wait_for_events"},
+		"reason":               "supported in 8.15.5",
+	}); err != nil {
+		t.Fatalf("expected execRequires on satisfied 8.15.5 features not to skip, got: %v", err)
+	}
+	if err := ctx.execRequires(map[string]any{
+		"cluster_features": []any{"gte_v8.16.0"},
+		"reason":           "needs 8.16+",
+	}); err == nil {
+		t.Fatalf("expected execRequires(gte_v8.16.0) on 8.15.5 to skip")
+	}
+	if err := ctx.execRequires(map[string]any{
+		"cluster_features": "downsample",
+		"reason":           "unimplemented commercial/cluster feature",
+	}); err == nil {
+		t.Fatalf("expected execRequires(downsample) to skip")
+	}
+	if err := ctx.execRequires(map[string]any{
+		"test_runner_features": "unsupported_runner_capability",
+	}); err == nil {
+		t.Fatalf("expected execRequires with unsupported test_runner_feature to skip")
+	}
+
+	// skip: with cluster_features skips when ALL listed cluster_features hold, and known_issues skips unconditionally
+	if err := ctx.execSkip(map[string]any{
+		"cluster_features": "gte_v8.0.0",
+		"reason":           "skip on 8.x+",
+	}); err == nil {
+		t.Fatalf("expected execSkip(cluster_features: gte_v8.0.0) on 8.15.5 to skip")
+	}
+	if err := ctx.execSkip(map[string]any{
+		"cluster_features": "lte_v7.17.99",
+		"reason":           "only skip on 7.x",
+	}); err != nil {
+		t.Fatalf("expected execSkip(cluster_features: lte_v7.17.99) on 8.15.5 NOT to skip, got: %v", err)
+	}
+	if err := ctx.execSkip(map[string]any{
+		"known_issues": []any{map[string]any{"cluster_features": "gte_v8.0.0", "fixed_by": "https://github.com/elastic/elasticsearch/pull/1"}},
+	}); err == nil {
+		t.Fatalf("expected execSkip with known_issues to skip cleanly")
+	}
+
+	// 2. close_to (both flat {field, value, error} and upstream {<path>: {value, error}} forms + stash)
+	ctx.lastResponse = map[string]any{
+		"took":  int64(12),
+		"score": float64(3.14159),
+		"aggs": map[string]any{
+			"avg_price": map[string]any{"value": float64(99.95)},
+		},
+		"zero_str":  "0",
+		"false_str": "false",
+		"empty_str": "",
+		"null_val":  nil,
+		"empty_obj": map[string]any{},
+		"empty_arr": []any{},
+	}
+	ctx.lastBodyKind = bodyKindParsed
+	ctx.stash["expected_avg"] = float64(100.0)
+	ctx.stash["tol"] = float64(0.1)
+
+	if err := ctx.execStep(SpecStep{
+		Op:    "close_to",
+		Value: map[string]any{"field": "score", "value": 3.14, "error": 0.01},
+	}, false); err != nil {
+		t.Fatalf("close_to flat form failed: %v", err)
+	}
+	if err := ctx.execStep(SpecStep{
+		Op: "close_to",
+		Value: map[string]any{
+			"aggs.avg_price.value": map[string]any{"value": "$expected_avg", "error": "$tol"},
+		},
+	}, false); err != nil {
+		t.Fatalf("close_to nested path + stash form failed: %v", err)
+	}
+	if err := ctx.execStep(SpecStep{
+		Op:    "close_to",
+		Value: map[string]any{"field": "score", "value": 5.0, "error": 0.01},
+	}, false); err == nil {
+		t.Fatalf("expected close_to out-of-tolerance to fail")
+	}
+
+	// 3. exists & wait_for_events & IsTrueYamlTestSection.java truthiness
+	for _, presentPath := range []string{"took", "empty_str", "empty_obj", "empty_arr", "zero_str", "false_str"} {
+		if err := ctx.execStep(SpecStep{Op: "exists", Value: presentPath}, false); err != nil {
+			t.Fatalf("expected exists(%q) to pass, got: %v", presentPath, err)
+		}
+	}
+	for _, absentOrNil := range []string{"missing_key", "null_val"} {
+		if err := ctx.execStep(SpecStep{Op: "exists", Value: absentOrNil}, false); err == nil {
+			t.Fatalf("expected exists(%q) to fail", absentOrNil)
+		}
+	}
+	if err := ctx.execStep(SpecStep{Op: "wait_for_events", Value: map[string]any{"wait": "green"}}, false); err != nil {
+		t.Fatalf("expected wait_for_events no-op to succeed, got: %v", err)
+	}
+	for _, truthyField := range []string{"zero_str", "false_str", "empty_obj", "empty_arr"} {
+		if err := ctx.execIsTrue(truthyField); err != nil {
+			t.Fatalf("expected is_true(%q) to pass per IsTrueYamlTestSection.java, got: %v", truthyField, err)
+		}
+	}
+	for _, falsyField := range []string{"empty_str", "null_val", "missing_key"} {
+		if err := ctx.execIsFalse(falsyField); err != nil {
+			t.Fatalf("expected is_false(%q) to pass, got: %v", falsyField, err)
+		}
+	}
+}
+
+func TestRound60_F1_SequenceNDJSONPutMappingTypedPathsAndNewActions(t *testing.T) {
+	ctx := newRunnerContext(http.DefaultClient, "http://localhost:9200")
+
+	// 1. Sequence []any body serializes as NDJSON for ALL actions
+	searchSeqReq, err := ctx.buildActionRequest("search", map[string]any{
+		"index": "percolator_idx",
+		"body": []any{
+			map[string]any{"query": map[string]any{"match_all": map[string]any{}}},
+			`{"size":5}`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildActionRequest(search with sequence body) failed: %v", err)
+	}
+	wantNDJSON := "{\"query\":{\"match_all\":{}}}\n{\"size\":5}\n"
+	if string(searchSeqReq.body) != wantNDJSON {
+		t.Fatalf("NDJSON body = %q, want %q", string(searchSeqReq.body), wantNDJSON)
+	}
+
+	// 2. indices.put_mapping with empty index -> PUT /_mapping
+	putMapRoot, err := ctx.buildActionRequest("indices.put_mapping", map[string]any{
+		"body": map[string]any{"properties": map[string]any{"f": map[string]any{"type": "keyword"}}},
+	})
+	if err != nil {
+		t.Fatalf("indices.put_mapping without index failed: %v", err)
+	}
+	if putMapRoot.method != http.MethodPut || putMapRoot.path != "/_mapping" {
+		t.Fatalf("got %s %s, want PUT /_mapping", putMapRoot.method, putMapRoot.path)
+	}
+
+	// 3. New actions: indices.upgrade, indices.get_upgrade, scripts_painless_context, _internal.*
+	newActions := []struct {
+		action     string
+		params     map[string]any
+		wantMethod string
+		wantPath   string
+	}{
+		{"indices.upgrade", map[string]any{}, http.MethodPost, "/_upgrade"},
+		{"indices.upgrade", map[string]any{"index": "idx1"}, http.MethodPost, "/idx1/_upgrade"},
+		{"indices.get_upgrade", map[string]any{}, http.MethodGet, "/_upgrade"},
+		{"indices.get_upgrade", map[string]any{"index": "idx1"}, http.MethodGet, "/idx1/_upgrade"},
+		{"scripts_painless_context", map[string]any{"context": "score"}, http.MethodGet, "/_scripts/painless/_context"},
+		{"_internal.update_desired_nodes", map[string]any{"history_id": "h1", "version": "2"}, http.MethodPut, "/_internal/desired_nodes/h1/2"},
+		{"_internal.get_desired_nodes", map[string]any{}, http.MethodGet, "/_internal/desired_nodes"},
+		{"_internal.custom_check", map[string]any{}, http.MethodGet, "/_internal/custom_check"},
+	}
+	for _, tc := range newActions {
+		req, buildErr := ctx.buildActionRequest(tc.action, tc.params)
+		if buildErr != nil {
+			t.Fatalf("buildActionRequest(%s) failed: %v", tc.action, buildErr)
+		}
+		if req.method != tc.wantMethod || req.path != tc.wantPath {
+			t.Fatalf("buildActionRequest(%s) = %s %s, want %s %s", tc.action, req.method, req.path, tc.wantMethod, tc.wantPath)
+		}
+	}
+
+	// 4. Typed v7 URL paths across all 19/20 typed actions with zero ?type= query string leakage
+	typedCases := []struct {
+		action   string
+		params   map[string]any
+		wantPath string
+	}{
+		{"index", map[string]any{"index": "i", "type": "t", "id": "1"}, "/i/t/1"},
+		{"index", map[string]any{"index": "i", "type": "t"}, "/i/t"},
+		{"create", map[string]any{"index": "i", "type": "t", "id": "1"}, "/i/t/1/_create"},
+		{"get", map[string]any{"index": "i", "type": "t", "id": "1"}, "/i/t/1"},
+		{"exists", map[string]any{"index": "i", "type": "t", "id": "1"}, "/i/t/1"},
+		{"delete", map[string]any{"index": "i", "type": "t", "id": "1"}, "/i/t/1"},
+		{"get_source", map[string]any{"index": "i", "type": "t", "id": "1"}, "/i/t/1/_source"},
+		{"exists_source", map[string]any{"index": "i", "type": "t", "id": "1"}, "/i/t/1/_source"},
+		{"update", map[string]any{"index": "i", "type": "t", "id": "1"}, "/i/t/1/_update"},
+		{"explain", map[string]any{"index": "i", "type": "t", "id": "1"}, "/i/t/1/_explain"},
+		{"search", map[string]any{"index": "i", "type": "t"}, "/i/t/_search"},
+		{"count", map[string]any{"index": "i", "type": "t"}, "/i/t/_count"},
+		{"mget", map[string]any{"index": "i", "type": "t"}, "/i/t/_mget"},
+		{"msearch", map[string]any{"index": "i", "type": "t"}, "/i/t/_msearch"},
+		{"bulk", map[string]any{"index": "i", "type": "t"}, "/i/t/_bulk"},
+		{"indices.put_mapping", map[string]any{"index": "i", "type": "t", "body": map[string]any{}}, "/i/_mapping/t"},
+		{"indices.get_mapping", map[string]any{"index": "i", "type": "t"}, "/i/_mapping/t"},
+		{"indices.get_field_mapping", map[string]any{"index": "i", "type": "t", "fields": "f1"}, "/i/_mapping/t/field/f1"},
+		{"termvectors", map[string]any{"index": "i", "type": "t", "id": "1"}, "/i/t/1/_termvectors"},
+		{"mtermvectors", map[string]any{"index": "i", "type": "t"}, "/i/t/_mtermvectors"},
+	}
+	for _, tc := range typedCases {
+		req, buildErr := ctx.buildActionRequest(tc.action, tc.params)
+		if buildErr != nil {
+			t.Fatalf("buildActionRequest(%s with type) failed: %v", tc.action, buildErr)
+		}
+		if req.path != tc.wantPath {
+			t.Errorf("%s path = %q, want %q", tc.action, req.path, tc.wantPath)
+		}
+		if req.query.Has("type") {
+			t.Errorf("%s leaked ?type= into query string: %v", tc.action, req.query)
+		}
+	}
+}
+
+func TestRound60_F1_ScorecardPanicRecoveryMarkdownAndWriteJSON(t *testing.T) {
+	fsys := fstest.MapFS{
+		"search/10_pass_and_panic.yml": &fstest.MapFile{
+			Data: []byte(`---
+"Passing section":
+  - do:
+      info: {}
+  - match: { ok: true }
+---
+"Panicking handler section":
+  - do:
+      search:
+        index: trigger_panic
+---
+"Skipped section":
+  - requires:
+      cluster_features: ["gte_v9.0.0"]
+      reason: "future version"
+  - do:
+      info: {}
+`),
+		},
+	}
+
+	card, err := ScoreSuiteFS(SuiteOptions{
+		CorpusName:    "unit-scorecard",
+		TargetVersion: "8.15.5",
+		NewHandler: func() http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "trigger_panic") {
+					panic("simulated handler panic")
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"ok":true}`))
+			})
+		},
+	}, fsys)
+	if err != nil {
+		t.Fatalf("ScoreSuiteFS failed: %v", err)
+	}
+	if card.TotalFiles != 1 || card.ParseErrors != 0 {
+		t.Fatalf("unexpected file counts: %+v", card)
+	}
+	if card.SectionsTotal != 3 || card.SectionsPassed != 1 || card.SectionsFailed != 1 || card.SectionsSkipped != 1 {
+		t.Fatalf("unexpected section counts: %+v", card)
+	}
+	if len(card.FailureSamples) != 1 || !strings.Contains(card.FailureSamples[0].Error, "panic:") {
+		t.Fatalf("expected panic to be captured in FailureSamples, got: %+v", card.FailureSamples)
+	}
+
+	md := card.FormatMarkdown()
+	if !strings.Contains(md, "unit-scorecard") || !strings.Contains(md, "search") {
+		t.Fatalf("unexpected FormatMarkdown output:\n%s", md)
+	}
+
+	outPath := filepath.Join(t.TempDir(), "nested", "scorecard.json")
+	if err := card.WriteJSON(outPath); err != nil {
+		t.Fatalf("WriteJSON failed: %v", err)
+	}
+	rawJSON, err := os.ReadFile(outPath)
+	if err != nil || !strings.Contains(string(rawJSON), `"corpus": "unit-scorecard"`) {
+		t.Fatalf("unexpected WriteJSON file content (err=%v): %s", err, string(rawJSON))
 	}
 }

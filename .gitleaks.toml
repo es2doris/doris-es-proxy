@@ -1,0 +1,10 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Ignore gitignored local conformance cache and AST graph directories"
+paths = [
+  '''(^|/)\.cache/''',
+  '''(^|/)graphify-out/''',
+  '''(^|/)openwiki/''',
+]

@@ -31,6 +31,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -346,6 +347,10 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if !s.validateWireAcceptAndCompatHeadersRound60(w, r) {
 			return
 		}
 
@@ -944,74 +949,6 @@ func extractDataStreamBackingIndexNames(ds map[string]any) []string {
 	return backing
 }
 
-// handleIndexStats implements `GET /_stats` and `GET /{index}/_stats` for Elasticvue, Cerebro, and monitoring clients.
-func (s *Server) handleIndexStats(w http.ResponseWriter, r *http.Request) {
-	rawIndex := r.PathValue("index")
-	var targets []string
-	var aliasFilters map[string]*esast.Query
-	if rawIndex == "" {
-		targets, aliasFilters = s.resolveTargetIndicesWithFilters("")
-	} else {
-		var ok bool
-		targets, aliasFilters, ok = s.resolveValidatedReadTargets(w, r, rawIndex)
-		if !ok {
-			return
-		}
-		if !s.ensureNoExplicitClosedTargetRound59(w, r, rawIndex) {
-			return
-		}
-	}
-
-	indicesMap := make(map[string]any, len(targets))
-	var totalDocs int64
-
-	for _, idxName := range targets {
-		zero := 0
-		resp, _, errType, _ := s.executeSearchRequest(r.Context(), idxName, &esast.SearchRequest{
-			Size:        &zero,
-			AliasFilter: aliasFilters[idxName],
-		})
-		var docCount int64
-		if errType == "" {
-			docCount, _ = extractTotalAndHitIDs(resp)
-		}
-		totalDocs += docCount
-		statsObj := map[string]any{
-			"docs": map[string]any{
-				"count":   docCount,
-				"deleted": 0,
-			},
-			"store": map[string]any{
-				"size_in_bytes": docCount * 512,
-			},
-		}
-		indicesMap[idxName] = map[string]any{
-			"uuid":      "doris-" + schema.SanitizeDorisIdentifier(idxName),
-			"primaries": statsObj,
-			"total":     statsObj,
-		}
-	}
-
-	aggStats := map[string]any{
-		"docs": map[string]any{
-			"count":   totalDocs,
-			"deleted": 0,
-		},
-		"store": map[string]any{
-			"size_in_bytes": totalDocs * 512,
-		},
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"_shards": map[string]any{"total": len(targets), "successful": len(targets), "failed": 0},
-		"_all": map[string]any{
-			"primaries": aggStats,
-			"total":     aggStats,
-		},
-		"indices": indicesMap,
-	})
-}
-
 // handleSearchShards implements `GET /{index}/_search_shards` for Spark-ES / Hadoop-ES / Kibana clients.
 func (s *Server) handleSearchShards(w http.ResponseWriter, r *http.Request) {
 	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodHead {
@@ -1081,11 +1018,15 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if body == nil {
-			writeESError(w, http.StatusBadRequest, "parse_exception", "[processors] required property is missing")
+			writeIngestConfigErrorRound60(w, r, &ingestConfigErrorRound60{
+				errType:  "parse_exception",
+				reason:   "[processors] required property is missing",
+				propName: "processors",
+			})
 			return
 		}
-		if err := validateIngestPipelineSpec(body); err != nil {
-			writeESError(w, http.StatusBadRequest, ingestSpecValidationErrorType(err), err.Error())
+		if err := validateIngestPipelineSpecWithIDRound60(id, body); err != nil {
+			writeIngestConfigErrorRound60(w, r, err)
 			return
 		}
 		_ = s.syncCatalogFromBackend(r.Context())
@@ -1101,7 +1042,7 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 		s.pipelines[id] = body
 		s.mu.Unlock()
 		s.persistIngestPipeline(r.Context(), id, body)
-		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"acknowledged": true})
 	case http.MethodDelete:
 		if id == "" {
 			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: pipeline id is missing;")
@@ -1263,56 +1204,512 @@ func isEmptyIngestSetValue(v any) bool {
 	return false
 }
 
+type ingestConfigErrorRound60 struct {
+	errType  string
+	reason   string
+	procType string
+	procTag  string
+	propName string
+	status   int
+}
+
+func (e *ingestConfigErrorRound60) Error() string {
+	return e.reason
+}
+
+func cleanIngestErrorReasonRound60(raw string) string {
+	for _, pfx := range []string{"illegal_argument_exception: ", "parse_exception: ", "illegal_state_exception: "} {
+		if strings.HasPrefix(raw, pfx) {
+			return strings.TrimPrefix(raw, pfx)
+		}
+	}
+	return raw
+}
+
+func wrapIngestProcErrRound60(procType, procTag, propName string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ce, ok := err.(*ingestConfigErrorRound60); ok {
+		if ce.procType == "" {
+			ce.procType = procType
+		}
+		if ce.procTag == "" {
+			ce.procTag = procTag
+		}
+		if ce.propName == "" {
+			ce.propName = propName
+		}
+		return ce
+	}
+	raw := err.Error()
+	errType := ingestSpecValidationErrorType(err)
+	if propName == "" {
+		if strings.HasPrefix(raw, "[") {
+			if closeIdx := strings.IndexByte(raw, ']'); closeIdx > 1 {
+				cand := raw[1:closeIdx]
+				if cand != procType {
+					propName = cand
+				}
+			}
+		}
+	}
+	return &ingestConfigErrorRound60{
+		errType:  errType,
+		reason:   cleanIngestErrorReasonRound60(raw),
+		procType: procType,
+		procTag:  procTag,
+		propName: propName,
+	}
+}
+
+func writeIngestConfigErrorRound60(w http.ResponseWriter, r *http.Request, err error) {
+	status := http.StatusBadRequest
+	errType := ingestSpecValidationErrorType(err)
+	reason := ""
+	var procType, procTag, propName string
+	if err != nil {
+		reason = cleanIngestErrorReasonRound60(err.Error())
+		if ce, ok := err.(*ingestConfigErrorRound60); ok {
+			if ce.status != 0 {
+				status = ce.status
+			}
+			if ce.errType != "" {
+				errType = ce.errType
+			}
+			if ce.reason != "" {
+				reason = cleanIngestErrorReasonRound60(ce.reason)
+			}
+			procType = ce.procType
+			procTag = ce.procTag
+			propName = ce.propName
+		}
+	}
+	rcItem := map[string]any{
+		"type":   errType,
+		"reason": reason,
+	}
+	errObj := map[string]any{
+		"type":   errType,
+		"reason": reason,
+	}
+	hdr := map[string]any{}
+	if procType != "" {
+		rcItem["processor_type"] = procType
+		errObj["processor_type"] = procType
+		hdr["processor_type"] = procType
+	}
+	if procTag != "" {
+		rcItem["processor_tag"] = procTag
+		errObj["processor_tag"] = procTag
+		hdr["processor_tag"] = procTag
+	}
+	if propName != "" {
+		rcItem["property_name"] = propName
+		errObj["property_name"] = propName
+		hdr["property_name"] = propName
+	}
+	if len(hdr) > 0 {
+		errObj["header"] = hdr
+	}
+	errObj["root_cause"] = []map[string]any{rcItem}
+	writeJSONWithRequest(w, r, status, map[string]any{
+		"error":  errObj,
+		"status": status,
+	})
+}
+
+func isAllowedIngestProcessorPropertyRound60(procType, prop string) bool {
+	switch prop {
+	case "if", "tag", "description", "ignore_failure", "on_failure":
+		return true
+	}
+	switch procType {
+	case "drop", "terminate":
+		return false
+	case "fail":
+		return prop == "message"
+	case "pipeline":
+		return prop == "name" || prop == "ignore_missing_pipeline"
+	case "set", "default":
+		switch prop {
+		case "field", "value", "copy_from", "override", "ignore_empty_value", "ignore_missing", "media_type":
+			return true
+		}
+	case "append":
+		switch prop {
+		case "field", "value", "allow_duplicates", "media_type":
+			return true
+		}
+	case "remove":
+		switch prop {
+		case "field", "keep", "ignore_missing":
+			return true
+		}
+	case "rename", "copy":
+		switch prop {
+		case "field", "target_field", "ignore_missing", "override":
+			return true
+		}
+	case "lowercase", "uppercase", "trim", "bytes",
+		"urlencode", "url_encode", "URLEncode",
+		"urldecode", "url_decode", "URLDecode",
+		"compact":
+		switch prop {
+		case "field", "target_field", "ignore_missing":
+			return true
+		}
+	case "dedup", "dedupe":
+		switch prop {
+		case "field", "target_field", "ignore_missing", "ignore_empty":
+			return true
+		}
+	case "html_strip":
+		switch prop {
+		case "field", "target_field", "escaped_tags", "ignore_missing":
+			return true
+		}
+	case "dot_expander":
+		switch prop {
+		case "field", "path", "override", "ignore_missing":
+			return true
+		}
+	case "sort":
+		switch prop {
+		case "field", "target_field", "order", "ignore_missing":
+			return true
+		}
+	case "split":
+		switch prop {
+		case "field", "target_field", "separator", "preserve_trailing", "ignore_missing":
+			return true
+		}
+	case "join":
+		switch prop {
+		case "field", "target_field", "separator", "ignore_missing":
+			return true
+		}
+	case "convert":
+		switch prop {
+		case "field", "target_field", "type", "ignore_missing":
+			return true
+		}
+	case "gsub":
+		switch prop {
+		case "field", "target_field", "pattern", "replacement", "ignore_missing":
+			return true
+		}
+	case "json":
+		switch prop {
+		case "field", "target_field", "add_to_root", "add_to_root_conflict_strategy",
+			"allow_duplicate_keys", "strict_json_parsing", "ignore_missing":
+			return true
+		}
+	case "kv":
+		switch prop {
+		case "field", "field_split", "value_split", "target_field", "include_keys",
+			"exclude_keys", "ignore_missing", "strip_brackets", "prefix", "trim_key",
+			"trim_value", "transform_key":
+			return true
+		}
+	case "csv":
+		switch prop {
+		case "field", "target_fields", "separator", "quote", "trim", "ignore_missing", "empty_value":
+			return true
+		}
+	case "date":
+		switch prop {
+		case "field", "target_field", "formats", "timezone", "locale", "output_format", "ignore_missing":
+			return true
+		}
+	case "date_index_name":
+		switch prop {
+		case "field", "index_name_prefix", "date_rounding", "date_formats", "formats",
+			"timezone", "locale", "index_name_format", "target_field", "ignore_missing":
+			return true
+		}
+	case "dissect":
+		switch prop {
+		case "field", "pattern", "append_separator", "target_field", "ignore_missing":
+			return true
+		}
+	case "grok":
+		switch prop {
+		case "field", "target_field", "patterns", "pattern_definitions", "ignore_missing",
+			"ecs_compatibility", "keep_empty_captures", "trace_match", "warn_on_match":
+			return true
+		}
+	case "redact":
+		switch prop {
+		case "field", "target_field", "patterns", "pattern_definitions", "prefix", "suffix",
+			"ignore_missing", "ecs_compatibility", "warn_on_match", "keep_empty_captures", "trace_match":
+			return true
+		}
+	case "fingerprint":
+		switch prop {
+		case "fields", "exclude_fields", "target_field", "salt", "method", "ignore_missing":
+			return true
+		}
+	case "attachment":
+		switch prop {
+		case "field", "target_field", "properties", "ignore_missing", "indexed_chars",
+			"indexed_chars_field", "remove_binary", "resource_name":
+			return true
+		}
+	case "user_agent":
+		switch prop {
+		case "field", "target_field", "regex_file", "properties", "extract_device_type", "ignore_missing":
+			return true
+		}
+	case "uri_parts":
+		switch prop {
+		case "field", "target_field", "keep_original", "remove_if_successful", "ignore_missing":
+			return true
+		}
+	case "registered_domain":
+		switch prop {
+		case "field", "target_field", "ignore_missing", "ignore_unsupported":
+			return true
+		}
+	case "geoip":
+		switch prop {
+		case "field", "target_field", "database_file", "properties", "ignore_missing",
+			"first_only", "download_database_on_node":
+			return true
+		}
+	case "enrich":
+		switch prop {
+		case "policy_name", "policy_type", "match_field", "enrich_fields", "field", "target_field", "max_matches", "ignore_missing", "override", "shape_relation", "entries":
+			return true
+		}
+	case "foreach":
+		switch prop {
+		case "field", "processor", "processors", "ignore_missing":
+			return true
+		}
+	case "script":
+		switch prop {
+		case "lang", "id", "source", "inline", "params", "options":
+			return true
+		}
+	case "inference":
+		switch prop {
+		case "model_id", "target_field", "field_map", "inference_config", "ignore_missing":
+			return true
+		}
+	case "set_security_user":
+		switch prop {
+		case "field", "properties", "ignore_missing":
+			return true
+		}
+	case "circle":
+		switch prop {
+		case "field", "target_field", "error_distance", "shape_type", "ignore_missing":
+			return true
+		}
+	case "reroute":
+		switch prop {
+		case "destination", "dataset", "namespace", "ignore_missing", "remove_fields":
+			return true
+		}
+	case "community_id":
+		switch prop {
+		case "source_ip", "source_port", "destination_ip", "destination_port",
+			"iana_number", "icmp_type", "icmp_code", "transport", "target_field",
+			"seed", "use_base64", "ignore_missing":
+			return true
+		}
+	case "network_direction":
+		switch prop {
+		case "source_ip", "destination_ip", "target_field", "internal_networks",
+			"internal_networks_field", "ignore_missing":
+			return true
+		}
+	}
+	return false
+}
+
+func validateCommonIngestProcessorOptionsRound60(procType, effTag string, m map[string]any) error {
+	for _, sKey := range []string{"tag", "description", "if"} {
+		if rawV, exists := m[sKey]; exists && rawV != nil {
+			if _, ok := rawV.(string); !ok {
+				return &ingestConfigErrorRound60{
+					errType:  "parse_exception",
+					reason:   fmt.Sprintf("[%s] property isn't a string, but of type [%T]", sKey, rawV),
+					procType: procType,
+					procTag:  effTag,
+					propName: sKey,
+				}
+			}
+		}
+	}
+	if rawIF, exists := m["ignore_failure"]; exists && rawIF != nil {
+		if _, ok := rawIF.(bool); !ok {
+			return &ingestConfigErrorRound60{
+				errType:  "parse_exception",
+				reason:   fmt.Sprintf("[ignore_failure] property isn't a boolean, but of type [%T]", rawIF),
+				procType: procType,
+				procTag:  effTag,
+				propName: "ignore_failure",
+			}
+		}
+	}
+	return nil
+}
+
 func validateIngestPipelineProcessors(procs []any) error {
 	for _, p := range procs {
 		pm, ok := p.(map[string]any)
 		if !ok {
-			return fmt.Errorf("processor must be a map")
+			return &ingestConfigErrorRound60{
+				errType:  "parse_exception",
+				reason:   "processor must be a map",
+				propName: "processors",
+			}
 		}
-		if rawTopOnFail, hasTopOnFail := pm["on_failure"]; hasTopOnFail && rawTopOnFail != nil {
+		outerTag, _ := pm["tag"].(string)
+		var detectedProcType string
+		procCount := 0
+		for k := range pm {
+			switch k {
+			case "tag", "ignore_failure", "on_failure", "if", "description":
+				continue
+			default:
+				procCount++
+				detectedProcType = k
+			}
+		}
+		if procCount == 0 {
+			return &ingestConfigErrorRound60{
+				errType: "parse_exception",
+				reason:  "processor doesn't specify type",
+				procTag: outerTag,
+			}
+		}
+		if procCount > 1 {
+			return &ingestConfigErrorRound60{
+				errType: "parse_exception",
+				reason:  "processor cannot specify more than one type",
+				procTag: outerTag,
+			}
+		}
+		if !isSupportedIngestProcessorType(detectedProcType) {
+			return &ingestConfigErrorRound60{
+				errType:  "parse_exception",
+				reason:   fmt.Sprintf("No processor type exists with name [%s]", detectedProcType),
+				procType: detectedProcType,
+				procTag:  outerTag,
+			}
+		}
+		specMap, ok := pm[detectedProcType].(map[string]any)
+		if !ok || specMap == nil {
+			return &ingestConfigErrorRound60{
+				errType:  "parse_exception",
+				reason:   fmt.Sprintf("[%s] property isn't a map", detectedProcType),
+				procType: detectedProcType,
+				procTag:  outerTag,
+			}
+		}
+		effTag := outerTag
+		if innerTag, okT := specMap["tag"].(string); okT && innerTag != "" {
+			effTag = innerTag
+		}
+		if err := validateCommonIngestProcessorOptionsRound60(detectedProcType, effTag, pm); err != nil {
+			return err
+		}
+		if err := validateCommonIngestProcessorOptionsRound60(detectedProcType, effTag, specMap); err != nil {
+			return err
+		}
+		if rawTopOnFail, hasTopOnFail := pm["on_failure"]; hasTopOnFail {
 			topOnFail, ok := rawTopOnFail.([]any)
 			if !ok {
-				return fmt.Errorf("[on_failure] property isn't a list")
+				return &ingestConfigErrorRound60{
+					errType:  "parse_exception",
+					reason:   "[on_failure] property isn't a list",
+					procType: detectedProcType,
+					procTag:  effTag,
+					propName: "on_failure",
+				}
+			}
+			if len(topOnFail) == 0 {
+				return &ingestConfigErrorRound60{
+					errType:  "parse_exception",
+					reason:   "[on_failure] processors list cannot be empty",
+					procType: detectedProcType,
+					procTag:  effTag,
+					propName: "on_failure",
+				}
 			}
 			if err := validateIngestPipelineProcessors(topOnFail); err != nil {
 				return err
 			}
 		}
-		procCount := 0
+		var unknownProps []string
+		for k := range specMap {
+			if !isAllowedIngestProcessorPropertyRound60(detectedProcType, k) {
+				unknownProps = append(unknownProps, k)
+			}
+		}
+		if len(unknownProps) > 0 {
+			sort.Strings(unknownProps)
+			return &ingestConfigErrorRound60{
+				errType:  "parse_exception",
+				reason:   fmt.Sprintf("[%s] property [%s] isn't a configuration property", detectedProcType, unknownProps[0]),
+				procType: detectedProcType,
+				procTag:  effTag,
+				propName: unknownProps[0],
+			}
+		}
+
 		for procType, rawSpec := range pm {
 			switch procType {
 			case "tag", "ignore_failure", "on_failure", "if", "description":
 				continue
 			}
-			procCount++
-			if !isSupportedIngestProcessorType(procType) {
-				return fmt.Errorf("no processor type exists with name [%s]", procType)
-			}
-			specMap, ok := rawSpec.(map[string]any)
-			if !ok || specMap == nil {
-				return fmt.Errorf("[%s] config isn't a map", procType)
-			}
+			specMap, _ := rawSpec.(map[string]any)
 			reqStr := func(prop string) (string, error) {
 				val, ok := specMap[prop].(string)
 				if !ok || strings.TrimSpace(val) == "" {
-					return "", fmt.Errorf("[%s] required property is missing", prop)
+					if rawVal, exists := specMap[prop]; exists && rawVal != nil {
+						if _, isStr := rawVal.(string); !isStr {
+							return "", &ingestConfigErrorRound60{
+								errType:  "parse_exception",
+								reason:   fmt.Sprintf("[%s] property isn't a string, but of type [%T]", prop, rawVal),
+								procType: procType,
+								procTag:  effTag,
+								propName: prop,
+							}
+						}
+					}
+					return "", &ingestConfigErrorRound60{
+						errType:  "parse_exception",
+						reason:   fmt.Sprintf("[%s] required property is missing", prop),
+						procType: procType,
+						procTag:  effTag,
+						propName: prop,
+					}
 				}
 				return val, nil
 			}
+			var procValidationErr error
 			switch procType {
 			case "set":
 				if _, err := reqStr("field"); err != nil {
 					return err
 				}
-				if err := validateIngestSetSpecRound59(specMap); err != nil {
-					return err
-				}
+				procValidationErr = validateIngestSetSpecRound59(specMap)
 			case "default", "append":
 				if _, err := reqStr("field"); err != nil {
 					return err
 				}
 				if _, hasVal := specMap["value"]; !hasVal {
-					return fmt.Errorf("[value] required property is missing")
+					return &ingestConfigErrorRound60{
+						errType:  "parse_exception",
+						reason:   "[value] required property is missing",
+						procType: procType,
+						procTag:  effTag,
+						propName: "value",
+					}
 				}
 			case "remove":
 				isValidFieldOrSlice := func(raw any) bool {
@@ -1336,13 +1733,13 @@ func validateIngestPipelineProcessors(procs []any) error {
 				rawField, hasField := specMap["field"]
 				rawKeep, hasKeep := specMap["keep"]
 				if (!hasField || rawField == nil) && (!hasKeep || rawKeep == nil) {
-					return fmt.Errorf("[field] required property is missing")
+					return wrapIngestProcErrRound60(procType, effTag, "field", fmt.Errorf("[field] required property is missing"))
 				}
 				if hasField && rawField != nil && !isValidFieldOrSlice(rawField) {
-					return fmt.Errorf("[field] required property is missing")
+					return wrapIngestProcErrRound60(procType, effTag, "field", fmt.Errorf("[field] required property is missing"))
 				}
 				if hasKeep && rawKeep != nil && !isValidFieldOrSlice(rawKeep) {
-					return fmt.Errorf("[keep] required property is invalid")
+					return wrapIngestProcErrRound60(procType, effTag, "keep", fmt.Errorf("[keep] required property is invalid"))
 				}
 			case "rename", "copy":
 				f, err := reqStr("field")
@@ -1354,10 +1751,10 @@ func validateIngestPipelineProcessors(procs []any) error {
 					return err
 				}
 				if err := validateIngestRenameOrCopySpecRound59(procType, specMap); err != nil {
-					return err
+					return wrapIngestProcErrRound60(procType, effTag, "", err)
 				}
 				if f == tf && pm["on_failure"] == nil && specMap["on_failure"] == nil {
-					return fmt.Errorf("illegal_argument_exception: source and target_field are the same: [%s]", f)
+					return wrapIngestProcErrRound60(procType, effTag, "target_field", fmt.Errorf("illegal_argument_exception: source and target_field are the same: [%s]", f))
 				}
 			case "lowercase", "uppercase", "trim", "bytes", "html_strip", "dot_expander",
 				"urlencode", "url_encode", "URLEncode", "urldecode", "url_decode", "URLDecode",
@@ -1368,7 +1765,7 @@ func validateIngestPipelineProcessors(procs []any) error {
 				}
 				if rawIM, hasIM := specMap["ignore_missing"]; hasIM && rawIM != nil {
 					if _, ok := rawIM.(bool); !ok {
-						return fmt.Errorf("illegal_argument_exception: [ignore_missing] must be a boolean")
+						return wrapIngestProcErrRound60(procType, effTag, "ignore_missing", fmt.Errorf("[ignore_missing] property isn't a boolean"))
 					}
 				}
 			case "sort":
@@ -1378,7 +1775,7 @@ func validateIngestPipelineProcessors(procs []any) error {
 				if rawOrd, hasOrd := specMap["order"]; hasOrd && rawOrd != nil {
 					ordStr, ok := rawOrd.(string)
 					if !ok || (!strings.EqualFold(ordStr, "asc") && !strings.EqualFold(ordStr, "desc")) {
-						return fmt.Errorf("illegal_argument_exception: sort order [%v] is invalid, must be [asc] or [desc]", rawOrd)
+						return wrapIngestProcErrRound60(procType, effTag, "order", fmt.Errorf("illegal_argument_exception: sort order [%v] is invalid, must be [asc] or [desc]", rawOrd))
 					}
 				}
 			case "split":
@@ -1387,16 +1784,16 @@ func validateIngestPipelineProcessors(procs []any) error {
 				}
 				sep, ok := specMap["separator"].(string)
 				if !ok || sep == "" {
-					return fmt.Errorf("[separator] required property is missing")
+					return wrapIngestProcErrRound60(procType, effTag, "separator", fmt.Errorf("[separator] required property is missing"))
 				}
 				if sep != "|" && sep != "." && !strings.Contains(sep, "{{") {
 					if _, err := compileIngestJavaRegex(sep); err != nil {
-						return fmt.Errorf("illegal_argument_exception: invalid separator [%s]: %v", sep, err)
+						return wrapIngestProcErrRound60(procType, effTag, "separator", fmt.Errorf("illegal_argument_exception: invalid separator [%s]: %v", sep, err))
 					}
 				}
 				if rawPT, hasPT := specMap["preserve_trailing"]; hasPT && rawPT != nil {
 					if _, ok := rawPT.(bool); !ok {
-						return fmt.Errorf("illegal_argument_exception: [preserve_trailing] must be a boolean")
+						return wrapIngestProcErrRound60(procType, effTag, "preserve_trailing", fmt.Errorf("[preserve_trailing] property isn't a boolean"))
 					}
 				}
 			case "join":
@@ -1404,7 +1801,7 @@ func validateIngestPipelineProcessors(procs []any) error {
 					return err
 				}
 				if _, ok := specMap["separator"].(string); !ok {
-					return fmt.Errorf("[separator] required property is missing")
+					return wrapIngestProcErrRound60(procType, effTag, "separator", fmt.Errorf("[separator] required property is missing"))
 				}
 			case "convert":
 				if _, err := reqStr("field"); err != nil {
@@ -1419,7 +1816,7 @@ func validateIngestPipelineProcessors(procs []any) error {
 					"float", "double", "half_float", "scaled_float", "string",
 					"boolean", "bool", "ip", "auto":
 				default:
-					return fmt.Errorf("illegal_argument_exception: type [%s] not supported", convType)
+					return wrapIngestProcErrRound60(procType, effTag, "type", fmt.Errorf("illegal_argument_exception: type [%s] not supported", convType))
 				}
 			case "gsub":
 				if _, err := reqStr("field"); err != nil {
@@ -1430,45 +1827,36 @@ func validateIngestPipelineProcessors(procs []any) error {
 					return err
 				}
 				if _, ok := specMap["replacement"].(string); !ok {
-					return fmt.Errorf("[replacement] required property is missing")
+					return wrapIngestProcErrRound60(procType, effTag, "replacement", fmt.Errorf("[replacement] required property is missing"))
 				}
 				if !strings.Contains(pat, "{{") {
 					if _, err := compileIngestJavaRegex(pat); err != nil {
-						return fmt.Errorf("illegal_argument_exception: invalid pattern [%s]: %v", pat, err)
+						return wrapIngestProcErrRound60(procType, effTag, "pattern", fmt.Errorf("illegal_argument_exception: invalid pattern [%s]: %v", pat, err))
 					}
 				}
 			case "json":
-				for k := range specMap {
-					switch k {
-					case "field", "target_field", "add_to_root", "add_to_root_conflict_strategy",
-						"allow_duplicate_keys", "strict_json_parsing", "ignore_missing",
-						"if", "tag", "description", "ignore_failure", "on_failure":
-					default:
-						return fmt.Errorf("[json] property [%s] isn't a configuration property", k)
-					}
-				}
 				if _, err := reqStr("field"); err != nil {
 					return err
 				}
 				for _, bKey := range []string{"add_to_root", "allow_duplicate_keys", "strict_json_parsing", "ignore_missing"} {
 					if rawB, hasB := specMap[bKey]; hasB && rawB != nil {
 						if _, ok := rawB.(bool); !ok {
-							return fmt.Errorf("illegal_argument_exception: [%s] must be a boolean", bKey)
+							return wrapIngestProcErrRound60(procType, effTag, bKey, fmt.Errorf("[%s] property isn't a boolean", bKey))
 						}
 					}
 				}
 				addToRoot, _ := specMap["add_to_root"].(bool)
 				tf, _ := specMap["target_field"].(string)
 				if addToRoot && strings.TrimSpace(tf) != "" {
-					return fmt.Errorf("cannot specify both [target_field] and [add_to_root]")
+					return wrapIngestProcErrRound60(procType, effTag, "target_field", fmt.Errorf("cannot specify both [target_field] and [add_to_root]"))
 				}
 				if rawStrat, hasStrat := specMap["add_to_root_conflict_strategy"]; hasStrat && rawStrat != nil {
 					if !addToRoot {
-						return fmt.Errorf("illegal_argument_exception: cannot specify [add_to_root_conflict_strategy] when [add_to_root] is false")
+						return wrapIngestProcErrRound60(procType, effTag, "add_to_root_conflict_strategy", fmt.Errorf("illegal_argument_exception: cannot specify [add_to_root_conflict_strategy] when [add_to_root] is false"))
 					}
 					stratStr, ok := rawStrat.(string)
 					if !ok || (stratStr != "replace" && stratStr != "merge") {
-						return fmt.Errorf("illegal_argument_exception: [add_to_root_conflict_strategy] must be [replace] or [merge], got [%v]", rawStrat)
+						return wrapIngestProcErrRound60(procType, effTag, "add_to_root_conflict_strategy", fmt.Errorf("illegal_argument_exception: [add_to_root_conflict_strategy] must be [replace] or [merge], got [%v]", rawStrat))
 					}
 				}
 			case "kv":
@@ -1477,53 +1865,53 @@ func validateIngestPipelineProcessors(procs []any) error {
 				}
 				fs, okFS := specMap["field_split"].(string)
 				if !okFS || fs == "" {
-					return fmt.Errorf("[field_split] required property is missing")
+					return wrapIngestProcErrRound60(procType, effTag, "field_split", fmt.Errorf("[field_split] required property is missing"))
 				}
 				vs, okVS := specMap["value_split"].(string)
 				if !okVS || vs == "" {
-					return fmt.Errorf("[value_split] required property is missing")
+					return wrapIngestProcErrRound60(procType, effTag, "value_split", fmt.Errorf("[value_split] required property is missing"))
 				}
 				if fs != "|" && fs != "." && fs != " " && fs != "," && fs != ";" && fs != "&" && !strings.Contains(fs, "{{") {
 					if _, err := compileIngestJavaRegex(fs); err != nil {
-						return fmt.Errorf("illegal_argument_exception: invalid field_split [%s]: %v", fs, err)
+						return wrapIngestProcErrRound60(procType, effTag, "field_split", fmt.Errorf("illegal_argument_exception: invalid field_split [%s]: %v", fs, err))
 					}
 				}
 				if vs != "=" && vs != ":" && vs != "|" && vs != "." && !strings.Contains(vs, "{{") {
 					if _, err := compileIngestJavaRegex(vs); err != nil {
-						return fmt.Errorf("illegal_argument_exception: invalid value_split [%s]: %v", vs, err)
+						return wrapIngestProcErrRound60(procType, effTag, "value_split", fmt.Errorf("illegal_argument_exception: invalid value_split [%s]: %v", vs, err))
 					}
 				}
 				rawInc, hasInc := specMap["include_keys"]
 				rawExc, hasExc := specMap["exclude_keys"]
 				if hasInc && rawInc != nil && hasExc && rawExc != nil {
-					return fmt.Errorf("illegal_argument_exception: cannot specify both [include_keys] and [exclude_keys]")
+					return wrapIngestProcErrRound60(procType, effTag, "exclude_keys", fmt.Errorf("illegal_argument_exception: cannot specify both [include_keys] and [exclude_keys]"))
 				}
 				if hasInc && rawInc != nil {
 					incArr, ok := rawInc.([]any)
 					if !ok {
-						return fmt.Errorf("illegal_argument_exception: [include_keys] must be a list of strings")
+						return wrapIngestProcErrRound60(procType, effTag, "include_keys", fmt.Errorf("illegal_argument_exception: [include_keys] must be a list of strings"))
 					}
 					for _, el := range incArr {
 						if s, ok := el.(string); !ok || s == "" {
-							return fmt.Errorf("illegal_argument_exception: [include_keys] must contain only non-empty strings")
+							return wrapIngestProcErrRound60(procType, effTag, "include_keys", fmt.Errorf("illegal_argument_exception: [include_keys] must contain only non-empty strings"))
 						}
 					}
 				}
 				if hasExc && rawExc != nil {
 					excArr, ok := rawExc.([]any)
 					if !ok {
-						return fmt.Errorf("illegal_argument_exception: [exclude_keys] must be a list of strings")
+						return wrapIngestProcErrRound60(procType, effTag, "exclude_keys", fmt.Errorf("illegal_argument_exception: [exclude_keys] must be a list of strings"))
 					}
 					for _, el := range excArr {
 						if s, ok := el.(string); !ok || s == "" {
-							return fmt.Errorf("illegal_argument_exception: [exclude_keys] must contain only non-empty strings")
+							return wrapIngestProcErrRound60(procType, effTag, "exclude_keys", fmt.Errorf("illegal_argument_exception: [exclude_keys] must contain only non-empty strings"))
 						}
 					}
 				}
 				if rawTK, hasTK := specMap["transform_key"]; hasTK && rawTK != nil {
 					tkStr, ok := rawTK.(string)
 					if !ok || (tkStr != "lowercase" && tkStr != "uppercase") {
-						return fmt.Errorf("illegal_argument_exception: [transform_key] must be [lowercase] or [uppercase], got [%v]", rawTK)
+						return wrapIngestProcErrRound60(procType, effTag, "transform_key", fmt.Errorf("illegal_argument_exception: [transform_key] must be [lowercase] or [uppercase], got [%v]", rawTK))
 					}
 				}
 			case "csv":
@@ -1532,16 +1920,16 @@ func validateIngestPipelineProcessors(procs []any) error {
 				}
 				tfs, ok := specMap["target_fields"].([]any)
 				if !ok || len(tfs) == 0 {
-					return fmt.Errorf("[target_fields] required property is missing")
+					return wrapIngestProcErrRound60(procType, effTag, "target_fields", fmt.Errorf("[target_fields] required property is missing"))
 				}
 				seenTF := make(map[string]bool, len(tfs))
 				for _, tfAny := range tfs {
 					tfStr, ok := tfAny.(string)
 					if !ok || strings.TrimSpace(tfStr) == "" {
-						return fmt.Errorf("illegal_argument_exception: [target_fields] must contain only non-empty strings")
+						return wrapIngestProcErrRound60(procType, effTag, "target_fields", fmt.Errorf("illegal_argument_exception: [target_fields] must contain only non-empty strings"))
 					}
 					if seenTF[tfStr] {
-						return fmt.Errorf("illegal_argument_exception: duplicate target_field [%s] in csv processor", tfStr)
+						return wrapIngestProcErrRound60(procType, effTag, "target_fields", fmt.Errorf("illegal_argument_exception: duplicate target_field [%s] in csv processor", tfStr))
 					}
 					seenTF[tfStr] = true
 				}
@@ -1549,7 +1937,7 @@ func validateIngestPipelineProcessors(procs []any) error {
 				if rawSep, hasSep := specMap["separator"]; hasSep && rawSep != nil {
 					sep, ok := rawSep.(string)
 					if !ok || utf8.RuneCountInString(sep) != 1 {
-						return fmt.Errorf("illegal_argument_exception: separator must be a single character")
+						return wrapIngestProcErrRound60(procType, effTag, "separator", fmt.Errorf("illegal_argument_exception: separator must be a single character"))
 					}
 					effSep = sep
 				}
@@ -1557,12 +1945,12 @@ func validateIngestPipelineProcessors(procs []any) error {
 				if rawQ, hasQ := specMap["quote"]; hasQ && rawQ != nil {
 					q, ok := rawQ.(string)
 					if !ok || utf8.RuneCountInString(q) != 1 {
-						return fmt.Errorf("illegal_argument_exception: quote must be a single character")
+						return wrapIngestProcErrRound60(procType, effTag, "quote", fmt.Errorf("illegal_argument_exception: quote must be a single character"))
 					}
 					effQuote = q
 				}
 				if effSep == effQuote {
-					return fmt.Errorf("illegal_argument_exception: separator and quote character cannot be the same [%s]", effSep)
+					return wrapIngestProcErrRound60(procType, effTag, "quote", fmt.Errorf("illegal_argument_exception: separator and quote character cannot be the same [%s]", effSep))
 				}
 			case "date":
 				if _, err := reqStr("field"); err != nil {
@@ -1570,27 +1958,25 @@ func validateIngestPipelineProcessors(procs []any) error {
 				}
 				fmts, ok := specMap["formats"].([]any)
 				if !ok || len(fmts) == 0 {
-					return fmt.Errorf("[formats] required property is missing")
+					return wrapIngestProcErrRound60(procType, effTag, "formats", fmt.Errorf("[formats] required property is missing"))
 				}
 				for _, fAny := range fmts {
 					fStr, ok := fAny.(string)
 					if !ok || strings.TrimSpace(fStr) == "" {
-						return fmt.Errorf("illegal_argument_exception: [formats] must contain only non-empty strings")
+						return wrapIngestProcErrRound60(procType, effTag, "formats", fmt.Errorf("illegal_argument_exception: [formats] must contain only non-empty strings"))
 					}
 					if !strings.Contains(fStr, "{{") {
 						if err := validateESDateFormatPatternRound59(fStr); err != nil {
-							return err
+							return wrapIngestProcErrRound60(procType, effTag, "formats", err)
 						}
 					}
 				}
 				if tz, ok := specMap["timezone"].(string); ok && tz != "" && !strings.Contains(tz, "{{") {
 					if _, err := parseIngestTimezone(tz); err != nil {
-						return err
+						return wrapIngestProcErrRound60(procType, effTag, "timezone", err)
 					}
 				}
-				if err := validateIngestDateCommonOptionsRound59(specMap, "output_format"); err != nil {
-					return err
-				}
+				procValidationErr = validateIngestDateCommonOptionsRound59(specMap, "output_format")
 			case "date_index_name":
 				if _, err := reqStr("field"); err != nil {
 					return err
@@ -1602,22 +1988,22 @@ func validateIngestPipelineProcessors(procs []any) error {
 				switch rounding {
 				case "y", "M", "w", "d", "h", "m", "s":
 				default:
-					return fmt.Errorf("invalid date rounding [%s], valid values are [y, M, w, d, h, m, s]", rounding)
+					return wrapIngestProcErrRound60(procType, effTag, "date_rounding", fmt.Errorf("invalid date rounding [%s], valid values are [y, M, w, d, h, m, s]", rounding))
 				}
 				for _, fmtKey := range []string{"date_formats", "formats"} {
 					if rawDF, hasDF := specMap[fmtKey]; hasDF && rawDF != nil {
 						dfArr, ok := rawDF.([]any)
 						if !ok || len(dfArr) == 0 {
-							return fmt.Errorf("illegal_argument_exception: [%s] must be a non-empty list of strings", fmtKey)
+							return wrapIngestProcErrRound60(procType, effTag, fmtKey, fmt.Errorf("illegal_argument_exception: [%s] must be a non-empty list of strings", fmtKey))
 						}
 						for _, fAny := range dfArr {
 							fStr, ok := fAny.(string)
 							if !ok || strings.TrimSpace(fStr) == "" {
-								return fmt.Errorf("illegal_argument_exception: [%s] must contain only non-empty strings", fmtKey)
+								return wrapIngestProcErrRound60(procType, effTag, fmtKey, fmt.Errorf("illegal_argument_exception: [%s] must contain only non-empty strings", fmtKey))
 							}
 							if !strings.Contains(fStr, "{{") {
 								if err := validateESDateFormatPatternRound59(fStr); err != nil {
-									return err
+									return wrapIngestProcErrRound60(procType, effTag, fmtKey, err)
 								}
 							}
 						}
@@ -1625,12 +2011,10 @@ func validateIngestPipelineProcessors(procs []any) error {
 				}
 				if tz, ok := specMap["timezone"].(string); ok && tz != "" && !strings.Contains(tz, "{{") {
 					if _, err := parseIngestTimezone(tz); err != nil {
-						return err
+						return wrapIngestProcErrRound60(procType, effTag, "timezone", err)
 					}
 				}
-				if err := validateIngestDateCommonOptionsRound59(specMap, "index_name_format"); err != nil {
-					return err
-				}
+				procValidationErr = validateIngestDateCommonOptionsRound59(specMap, "index_name_format")
 			case "dissect":
 				if _, err := reqStr("field"); err != nil {
 					return err
@@ -1640,11 +2024,11 @@ func validateIngestPipelineProcessors(procs []any) error {
 					return err
 				}
 				if err := validateDissectPatternGrammar(pat); err != nil {
-					return err
+					return wrapIngestProcErrRound60(procType, effTag, "pattern", err)
 				}
 				if rawSep, hasSep := specMap["append_separator"]; hasSep && rawSep != nil {
 					if _, ok := rawSep.(string); !ok {
-						return fmt.Errorf("illegal_argument_exception: [append_separator] must be a string")
+						return wrapIngestProcErrRound60(procType, effTag, "append_separator", fmt.Errorf("illegal_argument_exception: [append_separator] must be a string"))
 					}
 				}
 			case "grok", "redact":
@@ -1653,19 +2037,19 @@ func validateIngestPipelineProcessors(procs []any) error {
 				}
 				pats, ok := specMap["patterns"].([]any)
 				if !ok || len(pats) == 0 {
-					return fmt.Errorf("[patterns] required property is missing")
+					return wrapIngestProcErrRound60(procType, effTag, "patterns", fmt.Errorf("[patterns] required property is missing"))
 				}
 				effectiveDefs, defsErr := buildEffectiveGrokDefs(procType, specMap)
 				if defsErr != nil {
-					return defsErr
+					return wrapIngestProcErrRound60(procType, effTag, "", defsErr)
 				}
 				for _, patAny := range pats {
 					patStr, ok := patAny.(string)
 					if !ok || patStr == "" {
-						return fmt.Errorf("illegal_argument_exception: pattern must be a non-empty string")
+						return wrapIngestProcErrRound60(procType, effTag, "patterns", fmt.Errorf("illegal_argument_exception: pattern must be a non-empty string"))
 					}
 					if _, _, _, err := compileGrokRegex(patStr, effectiveDefs); err != nil {
-						return fmt.Errorf("illegal_argument_exception: %v", err)
+						return wrapIngestProcErrRound60(procType, effTag, "patterns", fmt.Errorf("illegal_argument_exception: %v", err))
 					}
 				}
 			case "fingerprint":
@@ -1676,11 +2060,11 @@ func validateIngestPipelineProcessors(procs []any) error {
 					var ok bool
 					fieldsAny, ok = rawFields.([]any)
 					if !ok || len(fieldsAny) == 0 {
-						return fmt.Errorf("illegal_argument_exception: [fields] must not be empty")
+						return wrapIngestProcErrRound60(procType, effTag, "fields", fmt.Errorf("illegal_argument_exception: [fields] must not be empty"))
 					}
 					for _, el := range fieldsAny {
 						if s, ok := el.(string); !ok || strings.TrimSpace(s) == "" {
-							return fmt.Errorf("illegal_argument_exception: [fields] must contain only non-empty strings")
+							return wrapIngestProcErrRound60(procType, effTag, "fields", fmt.Errorf("illegal_argument_exception: [fields] must contain only non-empty strings"))
 						}
 					}
 				}
@@ -1688,28 +2072,28 @@ func validateIngestPipelineProcessors(procs []any) error {
 					var ok bool
 					exclAny, ok = rawExcl.([]any)
 					if !ok {
-						return fmt.Errorf("illegal_argument_exception: [exclude_fields] must be a list of strings")
+						return wrapIngestProcErrRound60(procType, effTag, "exclude_fields", fmt.Errorf("illegal_argument_exception: [exclude_fields] must be a list of strings"))
 					}
 					for _, el := range exclAny {
 						if s, ok := el.(string); !ok || strings.TrimSpace(s) == "" {
-							return fmt.Errorf("illegal_argument_exception: [exclude_fields] must contain only non-empty strings")
+							return wrapIngestProcErrRound60(procType, effTag, "exclude_fields", fmt.Errorf("illegal_argument_exception: [exclude_fields] must contain only non-empty strings"))
 						}
 					}
 				}
 				if (hasFields && rawFields != nil && hasExcl && rawExcl != nil) && (len(fieldsAny) > 0 || len(exclAny) > 0) {
-					return fmt.Errorf("cannot specify both [fields] and [exclude_fields]")
+					return wrapIngestProcErrRound60(procType, effTag, "exclude_fields", fmt.Errorf("cannot specify both [fields] and [exclude_fields]"))
 				}
 				if rawMethod, ok := specMap["method"].(string); ok && strings.TrimSpace(rawMethod) != "" {
 					normMethod := normalizeFingerprintMethod(rawMethod)
 					switch normMethod {
 					case "MD5", "SHA-1", "SHA-256", "SHA-384", "SHA-512", "MURMUR3":
 					default:
-						return fmt.Errorf("illegal_argument_exception: unsupported fingerprint method [%s]", rawMethod)
+						return wrapIngestProcErrRound60(procType, effTag, "method", fmt.Errorf("illegal_argument_exception: unsupported fingerprint method [%s]", rawMethod))
 					}
 				}
 			case "fail":
 				if _, ok := specMap["message"].(string); !ok {
-					return fmt.Errorf("[message] required property is missing")
+					return wrapIngestProcErrRound60(procType, effTag, "message", fmt.Errorf("[message] required property is missing"))
 				}
 			case "pipeline":
 				if _, err := reqStr("name"); err != nil {
@@ -1720,7 +2104,18 @@ func validateIngestPipelineProcessors(procs []any) error {
 				inl, _ := specMap["inline"].(string)
 				id, _ := specMap["id"].(string)
 				if strings.TrimSpace(src) == "" && strings.TrimSpace(inl) == "" && strings.TrimSpace(id) == "" {
-					return fmt.Errorf("must specify either [source] or [id]")
+					return wrapIngestProcErrRound60(procType, effTag, "source", fmt.Errorf("must specify either [source] or [id]"))
+				}
+				langStr, _ := specMap["lang"].(string)
+				langStr = strings.ToLower(strings.TrimSpace(langStr))
+				effSrc := src
+				if strings.TrimSpace(effSrc) == "" {
+					effSrc = inl
+				}
+				if strings.TrimSpace(effSrc) != "" && (langStr == "" || langStr == "painless") {
+					if err := painless.CompileValidate(rewriteIngestCtxReferencesWithOp(effSrc, true)); err != nil {
+						return wrapIngestProcErrRound60(procType, effTag, "source", fmt.Errorf("script_exception: %v", err))
+					}
 				}
 			case "enrich":
 				if _, err := reqStr("policy_name"); err != nil {
@@ -1735,16 +2130,16 @@ func validateIngestPipelineProcessors(procs []any) error {
 				if rawMM, hasMM := specMap["max_matches"]; hasMM && rawMM != nil {
 					mm, ok := toInt64(rawMM)
 					if !ok || mm < 1 || mm > 128 {
-						return fmt.Errorf("[max_matches] must be between 1 and 128")
+						return wrapIngestProcErrRound60(procType, effTag, "max_matches", fmt.Errorf("[max_matches] must be between 1 and 128"))
 					}
 				}
 				if rawSR, hasSR := specMap["shape_relation"]; hasSR && rawSR != nil {
 					srStr, ok := rawSR.(string)
 					if !ok {
-						return fmt.Errorf("illegal_argument_exception: [shape_relation] must be a string")
+						return wrapIngestProcErrRound60(procType, effTag, "shape_relation", fmt.Errorf("illegal_argument_exception: [shape_relation] must be a string"))
 					}
 					if err := validateEnrichShapeRelationRound59(srStr); err != nil {
-						return err
+						return wrapIngestProcErrRound60(procType, effTag, "shape_relation", err)
 					}
 				}
 			case "foreach":
@@ -1754,7 +2149,7 @@ func validateIngestPipelineProcessors(procs []any) error {
 				subProc, hasSubProc := specMap["processor"].(map[string]any)
 				subProcs, hasSubProcs := specMap["processors"].([]any)
 				if (!hasSubProc || subProc == nil) && (!hasSubProcs || len(subProcs) == 0) {
-					return fmt.Errorf("[processor] required property is missing")
+					return wrapIngestProcErrRound60(procType, effTag, "processor", fmt.Errorf("[processor] required property is missing"))
 				}
 				if hasSubProc && subProc != nil {
 					if err := validateIngestPipelineProcessors([]any{subProc}); err != nil {
@@ -1776,63 +2171,55 @@ func validateIngestPipelineProcessors(procs []any) error {
 				}
 				rawED, hasED := specMap["error_distance"]
 				if !hasED || rawED == nil {
-					return fmt.Errorf("[error_distance] required property is missing")
+					return wrapIngestProcErrRound60(procType, effTag, "error_distance", fmt.Errorf("[error_distance] required property is missing"))
 				}
 				edVal, ok := toFloat64(rawED)
 				if !ok || edVal <= 0 {
-					return fmt.Errorf("illegal_argument_exception: [error_distance] must be a positive number")
+					return wrapIngestProcErrRound60(procType, effTag, "error_distance", fmt.Errorf("illegal_argument_exception: [error_distance] must be a positive number"))
 				}
 				st, err := reqStr("shape_type")
 				if err != nil {
 					return err
 				}
 				if st != "geo_shape" && st != "shape" {
-					return fmt.Errorf("illegal_argument_exception: invalid shape_type [%s], must be [geo_shape] or [shape]", st)
+					return wrapIngestProcErrRound60(procType, effTag, "shape_type", fmt.Errorf("illegal_argument_exception: invalid shape_type [%s], must be [geo_shape] or [shape]", st))
 				}
 			case "terminate":
 				// Optional if/tag/description/ignore_failure/on_failure
 			case "reroute":
-				for k := range specMap {
-					switch k {
-					case "destination", "dataset", "namespace", "ignore_missing", "remove_fields",
-						"if", "tag", "description", "ignore_failure", "on_failure":
-					default:
-						return fmt.Errorf("[reroute] property [%s] isn't a configuration property", k)
-					}
-				}
 				rawDest, hasDest := specMap["destination"]
 				rawDS, hasDS := specMap["dataset"]
 				rawNS, hasNS := specMap["namespace"]
 				if hasDest && rawDest != nil {
 					destStr, ok := rawDest.(string)
 					if !ok || strings.TrimSpace(destStr) == "" {
-						return fmt.Errorf("illegal_argument_exception: [destination] must be a non-empty string")
+						return wrapIngestProcErrRound60(procType, effTag, "destination", fmt.Errorf("illegal_argument_exception: [destination] must be a non-empty string"))
 					}
 					if (hasDS && rawDS != nil) || (hasNS && rawNS != nil) {
-						return fmt.Errorf("illegal_argument_exception: cannot specify both [destination] and [dataset]/[namespace]")
+						return wrapIngestProcErrRound60(procType, effTag, "destination", fmt.Errorf("illegal_argument_exception: cannot specify both [destination] and [dataset]/[namespace]"))
 					}
 				}
 				validateReroutePartSpec := func(propName string, raw any) error {
 					switch v := raw.(type) {
 					case string:
 						if !strings.Contains(v, "{{") && strings.Contains(v, "-") {
-							return fmt.Errorf("illegal_argument_exception: [%s] cannot contain '-'", propName)
+							return wrapIngestProcErrRound60(procType, effTag, propName, fmt.Errorf("illegal_argument_exception: [%s] cannot contain '-'", propName))
 						}
 					case []any:
 						if len(v) == 0 {
-							return fmt.Errorf("illegal_argument_exception: [%s] cannot be an empty list", propName)
+							return wrapIngestProcErrRound60(procType, effTag, propName, fmt.Errorf("illegal_argument_exception: [%s] cannot be an empty list", propName))
 						}
 						for _, item := range v {
 							sItem, ok := item.(string)
 							if !ok || strings.TrimSpace(sItem) == "" {
-								return fmt.Errorf("illegal_argument_exception: [%s] entries must be non-empty strings", propName)
+								return wrapIngestProcErrRound60(procType, effTag, propName, fmt.Errorf("illegal_argument_exception: [%s] entries must be non-empty strings", propName))
 							}
 							if !strings.Contains(sItem, "{{") && strings.Contains(sItem, "-") {
-								return fmt.Errorf("illegal_argument_exception: [%s] cannot contain '-'", propName)
+								return wrapIngestProcErrRound60(procType, effTag, propName, fmt.Errorf("illegal_argument_exception: [%s] cannot contain '-'", propName))
 							}
 						}
 					default:
-						return fmt.Errorf("illegal_argument_exception: [%s] must be a string or list of strings", propName)
+						return wrapIngestProcErrRound60(procType, effTag, propName, fmt.Errorf("illegal_argument_exception: [%s] must be a string or list of strings", propName))
 					}
 					return nil
 				}
@@ -1849,7 +2236,7 @@ func validateIngestPipelineProcessors(procs []any) error {
 				for _, bKey := range []string{"ignore_missing", "remove_fields"} {
 					if rawB, hasB := specMap[bKey]; hasB && rawB != nil {
 						if _, ok := rawB.(bool); !ok {
-							return fmt.Errorf("illegal_argument_exception: [%s] must be a boolean", bKey)
+							return wrapIngestProcErrRound60(procType, effTag, bKey, fmt.Errorf("illegal_argument_exception: [%s] must be a boolean", bKey))
 						}
 					}
 				}
@@ -1871,19 +2258,19 @@ func validateIngestPipelineProcessors(procs []any) error {
 						}
 					}
 					if !validSeed || seedInt < 0 || seedInt > 65535 {
-						return fmt.Errorf("illegal_argument_exception: [seed] must be an integer between 0 and 65535, got [%v]", rawSeed)
+						return wrapIngestProcErrRound60(procType, effTag, "seed", fmt.Errorf("illegal_argument_exception: [seed] must be an integer between 0 and 65535, got [%v]", rawSeed))
 					}
 				}
 			case "network_direction":
 				if rawNets, hasNets := specMap["internal_networks"]; hasNets && rawNets != nil {
 					netsArr, ok := rawNets.([]any)
 					if !ok || len(netsArr) == 0 {
-						return fmt.Errorf("illegal_argument_exception: [internal_networks] must be a non-empty list of network ranges or CIDRs")
+						return wrapIngestProcErrRound60(procType, effTag, "internal_networks", fmt.Errorf("illegal_argument_exception: [internal_networks] must be a non-empty list of network ranges or CIDRs"))
 					}
 					for _, el := range netsArr {
 						ns, ok := el.(string)
 						if !ok || strings.TrimSpace(ns) == "" {
-							return fmt.Errorf("illegal_argument_exception: [internal_networks] entries must be non-empty strings")
+							return wrapIngestProcErrRound60(procType, effTag, "internal_networks", fmt.Errorf("illegal_argument_exception: [internal_networks] entries must be non-empty strings"))
 						}
 						norm := strings.ToLower(strings.TrimSpace(ns))
 						switch norm {
@@ -1899,47 +2286,116 @@ func validateIngestPipelineProcessors(procs []any) error {
 							if ip := net.ParseIP(norm); ip != nil {
 								continue
 							}
-							return fmt.Errorf("illegal_argument_exception: invalid network range or CIDR [%s] in [internal_networks]", ns)
+							return wrapIngestProcErrRound60(procType, effTag, "internal_networks", fmt.Errorf("illegal_argument_exception: invalid network range or CIDR [%s] in [internal_networks]", ns))
 						}
 					}
 				}
 			}
-			if rawOnFail, hasOnFail := specMap["on_failure"]; hasOnFail && rawOnFail != nil {
+			if procValidationErr != nil {
+				return wrapIngestProcErrRound60(procType, effTag, "", procValidationErr)
+			}
+			if rawOnFail, hasOnFail := specMap["on_failure"]; hasOnFail {
 				onFail, ok := rawOnFail.([]any)
 				if !ok {
-					return fmt.Errorf("[on_failure] property isn't a list")
+					return &ingestConfigErrorRound60{
+						errType:  "parse_exception",
+						reason:   "[on_failure] property isn't a list",
+						procType: procType,
+						procTag:  effTag,
+						propName: "on_failure",
+					}
+				}
+				if len(onFail) == 0 {
+					return &ingestConfigErrorRound60{
+						errType:  "parse_exception",
+						reason:   "[on_failure] processors list cannot be empty",
+						procType: procType,
+						procTag:  effTag,
+						propName: "on_failure",
+					}
 				}
 				if err := validateIngestPipelineProcessors(onFail); err != nil {
 					return err
 				}
 			}
 		}
-		if procCount == 0 {
-			return fmt.Errorf("processor doesn't specify type")
-		}
-		if procCount > 1 {
-			return fmt.Errorf("processor cannot specify more than one type")
-		}
 	}
 	return nil
 }
 
-func validateIngestPipelineSpec(body map[string]any) error {
+func validateIngestPipelineSpecWithIDRound60(id string, body map[string]any) error {
+	dispID := strings.TrimSpace(id)
+	if dispID == "" {
+		dispID = "_simulate_pipeline"
+	}
+	var unknownKeys []string
+	for k := range body {
+		switch k {
+		case "description", "processors", "on_failure", "version", "_meta", "deprecated":
+		default:
+			unknownKeys = append(unknownKeys, k)
+		}
+	}
+	if len(unknownKeys) > 0 {
+		sort.Strings(unknownKeys)
+		return &ingestConfigErrorRound60{
+			errType:  "parse_exception",
+			reason:   fmt.Sprintf("pipeline [%s] doesn't support one or more provided configuration parameters [%s]", dispID, strings.Join(unknownKeys, ", ")),
+			propName: unknownKeys[0],
+		}
+	}
+	if rawDesc, hasDesc := body["description"]; hasDesc && rawDesc != nil {
+		if _, ok := rawDesc.(string); !ok {
+			return &ingestConfigErrorRound60{
+				errType:  "parse_exception",
+				reason:   fmt.Sprintf("[description] property isn't a string, but of type [%T]", rawDesc),
+				propName: "description",
+			}
+		}
+	}
+	if rawVer, hasVer := body["version"]; hasVer && rawVer != nil {
+		if _, ok := toInt64(rawVer); !ok {
+			return &ingestConfigErrorRound60{
+				errType:  "parse_exception",
+				reason:   fmt.Sprintf("[version] property isn't an integer, but of type [%T]", rawVer),
+				propName: "version",
+			}
+		}
+	}
 	rawProcs, hasProcs := body["processors"]
 	if !hasProcs {
-		return fmt.Errorf("[processors] required property is missing")
+		return &ingestConfigErrorRound60{
+			errType:  "parse_exception",
+			reason:   "[processors] required property is missing",
+			propName: "processors",
+		}
 	}
 	procs, ok := rawProcs.([]any)
 	if !ok {
-		return fmt.Errorf("[processors] property isn't a list")
+		return &ingestConfigErrorRound60{
+			errType:  "parse_exception",
+			reason:   "[processors] property isn't a list",
+			propName: "processors",
+		}
 	}
 	if err := validateIngestPipelineProcessors(procs); err != nil {
 		return err
 	}
-	if rawOnFail, hasOnFail := body["on_failure"]; hasOnFail && rawOnFail != nil {
+	if rawOnFail, hasOnFail := body["on_failure"]; hasOnFail {
 		onFail, ok := rawOnFail.([]any)
 		if !ok {
-			return fmt.Errorf("[on_failure] property isn't a list")
+			return &ingestConfigErrorRound60{
+				errType:  "parse_exception",
+				reason:   "[on_failure] property isn't a list",
+				propName: "on_failure",
+			}
+		}
+		if len(onFail) == 0 {
+			return &ingestConfigErrorRound60{
+				errType:  "parse_exception",
+				reason:   fmt.Sprintf("pipeline [%s] cannot have an empty on_failure option defined", dispID),
+				propName: "on_failure",
+			}
 		}
 		if err := validateIngestPipelineProcessors(onFail); err != nil {
 			return err
@@ -1950,7 +2406,13 @@ func validateIngestPipelineSpec(body map[string]any) error {
 
 func ingestSpecValidationErrorType(err error) string {
 	if err != nil {
+		if ce, ok := err.(*ingestConfigErrorRound60); ok && ce.errType != "" {
+			return ce.errType
+		}
 		msg := err.Error()
+		if strings.Contains(msg, "illegal_state_exception") || strings.Contains(msg, "Cycle detected for pipeline:") {
+			return "illegal_state_exception"
+		}
 		if strings.Contains(msg, "must be between") || strings.Contains(msg, "invalid date rounding") || strings.Contains(msg, "illegal_argument_exception") {
 			return "illegal_argument_exception"
 		}
@@ -1959,10 +2421,40 @@ func ingestSpecValidationErrorType(err error) string {
 }
 
 func ingestErrorType(err error) string {
-	if err != nil && (strings.Contains(err.Error(), "does not exist") || strings.Contains(err.Error(), "must be between") || strings.Contains(err.Error(), "illegal_argument_exception")) {
-		return "illegal_argument_exception"
+	if err != nil {
+		msg := err.Error()
+		if strings.Contains(msg, "illegal_state_exception") || strings.Contains(msg, "Cycle detected for pipeline:") || strings.Contains(msg, "Pipeline processor configured for non-existent pipeline") {
+			return "illegal_state_exception"
+		}
+		if strings.Contains(msg, "does not exist") || strings.Contains(msg, "doesn't exist") || strings.Contains(msg, "not present as part of path") || strings.Contains(msg, "must be between") || strings.Contains(msg, "illegal_argument_exception") {
+			return "illegal_argument_exception"
+		}
 	}
 	return "ingest_processor_exception"
+}
+
+func appendUniqueExecutedPipeline(ingestMeta map[string]any, pipelineID string) map[string]any {
+	if pipelineID == "" || pipelineID == "_none" {
+		return ingestMeta
+	}
+	if ingestMeta == nil {
+		ingestMeta = make(map[string]any)
+	}
+	list, _ := ingestMeta["__executed_pipelines"].([]string)
+	list = append(list, pipelineID)
+	ingestMeta["__executed_pipelines"] = list
+	return ingestMeta
+}
+
+func extractExecutedPipelines(ingestMeta map[string]any) []string {
+	if ingestMeta == nil {
+		return nil
+	}
+	list, _ := ingestMeta["__executed_pipelines"].([]string)
+	if len(list) == 0 {
+		return nil
+	}
+	return append([]string(nil), list...)
 }
 
 func (s *Server) applyIngestPipelineForWriteWithRoutingAndIngestMeta(pipelineID, indexName, docID, initialRouting string, raw json.RawMessage, initialIngestMeta map[string]any) (json.RawMessage, string, string, string, bool, map[string]any, error) {
@@ -1981,11 +2473,17 @@ func (s *Server) applyIngestPipelineForWriteWithRoutingAndIngestMeta(pipelineID,
 	if !ok || pipe == nil {
 		return raw, indexName, docID, initialRouting, false, initialIngestMeta, fmt.Errorf("pipeline with id [%s] does not exist", pipelineID)
 	}
+	initialIngestMeta = appendUniqueExecutedPipeline(initialIngestMeta, pipelineID)
 	out, outIdx, outID, _, outRouting, dropped, _, outIngestMeta, err := applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s, pipe, pipelineID, indexName, docID, initialRouting, raw, false, initialIngestMeta)
 	return out, outIdx, outID, outRouting, dropped, outIngestMeta, err
 }
 
 func (s *Server) applyEffectiveAndFinalPipelinesWithRouting(indexName, docID, reqPipeline, defaultPipeline, initialRouting string, raw json.RawMessage) (json.RawMessage, string, string, string, bool, error) {
+	cur, curIndex, curID, curRouting, dropped, _, err := s.applyEffectiveAndFinalPipelinesWithRoutingAndExecuted(indexName, docID, reqPipeline, defaultPipeline, initialRouting, raw)
+	return cur, curIndex, curID, curRouting, dropped, err
+}
+
+func (s *Server) applyEffectiveAndFinalPipelinesWithRoutingAndExecuted(indexName, docID, reqPipeline, defaultPipeline, initialRouting string, raw json.RawMessage) (json.RawMessage, string, string, string, bool, []string, error) {
 	effPipeline := s.resolveEffectivePipeline(indexName, reqPipeline, defaultPipeline)
 	if effPipeline == "" && s != nil {
 		if resolved, _, wErr := s.resolveWriteIndexWithFilter(indexName); wErr == nil && resolved != "" && resolved != indexName {
@@ -2000,7 +2498,7 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithRouting(indexName, docID, re
 	if effPipeline != "" {
 		next, nextIdx, nextID, nextRouting, dropped, nextIngestMeta, err := s.applyIngestPipelineForWriteWithRoutingAndIngestMeta(effPipeline, curIndex, curID, curRouting, cur, nil)
 		if err != nil || dropped {
-			return next, nextIdx, nextID, nextRouting, dropped, err
+			return next, nextIdx, nextID, nextRouting, dropped, extractExecutedPipelines(nextIngestMeta), err
 		}
 		cur = next
 		if nextIdx != "" {
@@ -2027,7 +2525,7 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithRouting(indexName, docID, re
 		if destDef != "" && destDef != effPipeline {
 			next, nextIdx, nextID, nextRouting, dropped, nextIngestMeta, err := s.applyIngestPipelineForWriteWithRoutingAndIngestMeta(destDef, curIndex, curID, curRouting, cur, curIngestMeta)
 			if err != nil || dropped {
-				return next, nextIdx, nextID, nextRouting, dropped, err
+				return next, nextIdx, nextID, nextRouting, dropped, extractExecutedPipelines(nextIngestMeta), err
 			}
 			cur = next
 			if nextIdx != "" {
@@ -2052,9 +2550,9 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithRouting(indexName, docID, re
 		}
 	}
 	if finalPipeline != "" {
-		next, nextIdx, nextID, nextRouting, dropped, _, err := s.applyIngestPipelineForWriteWithRoutingAndIngestMeta(finalPipeline, curIndex, curID, curRouting, cur, curIngestMeta)
+		next, nextIdx, nextID, nextRouting, dropped, nextIngestMeta, err := s.applyIngestPipelineForWriteWithRoutingAndIngestMeta(finalPipeline, curIndex, curID, curRouting, cur, curIngestMeta)
 		if err != nil || dropped {
-			return next, nextIdx, nextID, nextRouting, dropped, err
+			return next, nextIdx, nextID, nextRouting, dropped, extractExecutedPipelines(nextIngestMeta), err
 		}
 		cur = next
 		if nextIdx != "" {
@@ -2064,8 +2562,9 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithRouting(indexName, docID, re
 			curID = nextID
 		}
 		curRouting = nextRouting
+		curIngestMeta = nextIngestMeta
 	}
-	return cur, curIndex, curID, curRouting, false, nil
+	return cur, curIndex, curID, curRouting, false, extractExecutedPipelines(curIngestMeta), nil
 }
 
 func isIngestIdentByte(c byte) bool {
@@ -2543,7 +3042,7 @@ var defaultGrokPatterns = map[string]string{
 	"URIPATH":           `(?:/[A-Za-z0-9$.+!*'(){},~:;=@#%&_\-]*)+`,
 	"UNIXPATH":          `(?:/[\w_%!$@:.,+~-]+|\\.)+`,
 	"WINPATH":           `(?:[A-Za-z]+:|\\)(?:\\[^\\?*]*)+`,
-	"PATH":              `(?:(?:/[\w_%!$@:.,+~-]+|\\.)+|(?:[A-Za-z]+:|\\)(?:\\[^\\?*]*)+)`,
+	"PATH":              `(?:%{UNIXPATH}|%{WINPATH})`,
 	"HOSTPORT":          `%{IPORHOST}:%{POSINT}`,
 	"TTY":               `(?:/dev/(?:pts|tty(?:[pq])?)(?:\w+)?/?(?:[0-9]+))`,
 	"BASE16NUM":         `\b0[xX][0-9a-fA-F]+\b`,
@@ -2754,22 +3253,10 @@ func applyIngestGsubReplacement(re *regexp.Regexp, src, repl string) (string, er
 }
 
 func deepCloneIngestValue(val any) any {
-	switch tv := val.(type) {
-	case map[string]any:
-		cp := make(map[string]any, len(tv))
-		for k, v := range tv {
-			cp[k] = deepCloneIngestValue(v)
-		}
-		return cp
-	case []any:
-		cp := make([]any, len(tv))
-		for i, v := range tv {
-			cp[i] = deepCloneIngestValue(v)
-		}
-		return cp
-	default:
-		return val
+	if cloned, err := painless.CloneValueCycleSafe(val); err == nil {
+		return cloned
 	}
+	return nil
 }
 
 func normalizeGrokFieldName(fieldName string) string {
@@ -2981,6 +3468,10 @@ func convertESDateFormatToGoLayouts(esFmt string) []string {
 		"yyy", "2006",
 		"yy", "06",
 		"y", "2006",
+		"YYYY", "2006",
+		"YYY", "2006",
+		"YY", "06",
+		"Y", "2006",
 		"MMMM", "January",
 		"MMM", "Jan",
 		"MM", "01",
@@ -2995,7 +3486,9 @@ func convertESDateFormatToGoLayouts(esFmt string) []string {
 		"hh", "03",
 		"h", "3",
 		"mm", "04",
+		"m", "4",
 		"ss", "05",
+		"s", "5",
 		"SSSSSSSSS", "000000000",
 		"SSSSSS", "000000",
 		"SSS", "000",
@@ -3009,6 +3502,8 @@ func convertESDateFormatToGoLayouts(esFmt string) []string {
 		"XXX", "Z07:00",
 		"XX", "Z0700",
 		"X", "Z07",
+		"ZZZ", "Z07:00",
+		"ZZ", "Z07:00",
 		"Z", "Z0700",
 		"zzz", "MST",
 		"z", "MST",
@@ -3152,7 +3647,99 @@ func parseIngestTimezone(tzName string) (*time.Location, error) {
 	return nil, fmt.Errorf("illegal_argument_exception: timezone [%s] is not supported", tzName)
 }
 
+var reWeekYearInputRound60 = regexp.MustCompile(`^(\d{4})-(?:W)?(\d{1,2})(?:-([1-7]))?$`)
+var reSingleDigitHourRound60 = regexp.MustCompile(`([: T])(\d):`)
+
+func hasUnquotedTokenCharRound60(esFmt string, target byte) bool {
+	inQuote := false
+	for i := 0; i < len(esFmt); i++ {
+		if esFmt[i] == '\'' {
+			if i+1 < len(esFmt) && esFmt[i+1] == '\'' {
+				i++
+				continue
+			}
+			inQuote = !inQuote
+			continue
+		}
+		if !inQuote && esFmt[i] == target {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSingleUnquotedHRound60(esFmt string) bool {
+	inQuote := false
+	for i := 0; i < len(esFmt); i++ {
+		if esFmt[i] == '\'' {
+			if i+1 < len(esFmt) && esFmt[i+1] == '\'' {
+				i++
+				continue
+			}
+			inQuote = !inQuote
+			continue
+		}
+		if !inQuote && esFmt[i] == 'H' {
+			if i+1 < len(esFmt) && esFmt[i+1] == 'H' {
+				i++
+				continue
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func isUSWeekLocaleRound60(rawLocale string) bool {
+	norm := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(rawLocale), "_", "-"))
+	for _, part := range strings.Split(norm, "-") {
+		if part == "US" {
+			return true
+		}
+	}
+	return false
+}
+
+func parseWeekYearDateRound60(raw, fStr string, loc *time.Location, rawLocale string) (time.Time, bool) {
+	if fStr != "week_date" && fStr != "strict_week_date" && fStr != "weekyear_week" && fStr != "strict_weekyear_week" &&
+		fStr != "weekyear_week_day" && fStr != "strict_weekyear_week_day" && !hasUnquotedTokenCharRound60(fStr, 'w') {
+		return time.Time{}, false
+	}
+	m := reWeekYearInputRound60.FindStringSubmatch(strings.TrimSpace(raw))
+	if m == nil {
+		return time.Time{}, false
+	}
+	wy, err1 := strconv.Atoi(m[1])
+	wk, err2 := strconv.Atoi(m[2])
+	if err1 != nil || err2 != nil || wk < 1 || wk > 53 {
+		return time.Time{}, false
+	}
+	dayIdx := 1
+	if m[3] != "" {
+		if d, err := strconv.Atoi(m[3]); err == nil && d >= 1 && d <= 7 {
+			dayIdx = d
+		}
+	}
+	if isUSWeekLocaleRound60(rawLocale) {
+		jan1 := time.Date(wy, time.January, 1, 0, 0, 0, 0, loc)
+		sunOffset := int(jan1.Weekday()) // Sunday = 0
+		week1Start := jan1.AddDate(0, 0, -sunOffset)
+		return week1Start.AddDate(0, 0, (wk-1)*7+(dayIdx-1)), true
+	}
+	jan4 := time.Date(wy, time.January, 4, 0, 0, 0, 0, loc)
+	isoDay := int(jan4.Weekday())
+	if isoDay == 0 {
+		isoDay = 7
+	}
+	week1Mon := jan4.AddDate(0, 0, -(isoDay - 1))
+	return week1Mon.AddDate(0, 0, (wk-1)*7+(dayIdx-1)), true
+}
+
 func parseIngestDateValue(raw string, formats []any, tzName string) (time.Time, error) {
+	return parseIngestDateValueWithRawLocaleRound60(raw, formats, tzName, "")
+}
+
+func parseIngestDateValueWithRawLocaleRound60(raw string, formats []any, tzName, rawLocale string) (time.Time, error) {
 	loc, err := parseIngestTimezone(tzName)
 	if err != nil {
 		return time.Time{}, err
@@ -3160,15 +3747,20 @@ func parseIngestDateValue(raw string, formats []any, tzName string) (time.Time, 
 	if len(formats) == 0 {
 		formats = []any{"ISO8601"}
 	}
+	trimmedRaw := strings.TrimSpace(raw)
 	for _, fAny := range formats {
 		fStr, ok := fAny.(string)
 		if !ok || fStr == "" {
 			continue
 		}
+		if wt, okW := parseWeekYearDateRound60(trimmedRaw, fStr, loc, rawLocale); okW {
+			return wt.In(loc), nil
+		}
+		singleH := hasSingleUnquotedHRound60(fStr)
 		for _, layout := range convertESDateFormatToGoLayouts(fStr) {
 			switch layout {
 			case "TAI64N":
-				s := strings.TrimPrefix(strings.TrimSpace(raw), "@")
+				s := strings.TrimPrefix(trimmedRaw, "@")
 				if len(s) == 24 {
 					hi, err1 := strconv.ParseUint(s[:16], 16, 64)
 					lo, err2 := strconv.ParseUint(s[16:24], 16, 32)
@@ -3188,23 +3780,33 @@ func parseIngestDateValue(raw string, formats []any, tzName string) (time.Time, 
 					}
 				}
 			case "UNIX":
-				trimmed := strings.TrimSpace(raw)
-				if fv, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv >= -1e14 && fv <= 1e14 {
+				if fv, err := strconv.ParseFloat(trimmedRaw, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv >= -1e14 && fv <= 1e14 {
 					sec := int64(fv)
 					nsec := int64(math.Round((fv - float64(sec)) * 1e9))
 					return time.Unix(sec, nsec).In(loc), nil
 				}
 			case "UNIX_MS":
-				trimmed := strings.TrimSpace(raw)
-				if iv, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+				if iv, err := strconv.ParseInt(trimmedRaw, 10, 64); err == nil {
 					return time.UnixMilli(iv).In(loc), nil
 				}
-				if fv, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv >= -9e18 && fv <= 9e18 {
+				if fv, err := strconv.ParseFloat(trimmedRaw, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv >= -9e18 && fv <= 9e18 {
 					return time.UnixMilli(int64(fv)).In(loc), nil
 				}
 			default:
-				if t, err := time.ParseInLocation(layout, strings.TrimSpace(raw), loc); err == nil {
+				if t, err := time.ParseInLocation(layout, trimmedRaw, loc); err == nil {
 					return t.In(loc), nil
+				}
+				if singleH {
+					padded := reSingleDigitHourRound60.ReplaceAllString(trimmedRaw, "${1}0${2}:")
+					if padded != trimmedRaw {
+						if t, err := time.ParseInLocation(layout, padded, loc); err == nil {
+							return t.In(loc), nil
+						}
+					} else if len(trimmedRaw) >= 2 && trimmedRaw[0] >= '0' && trimmedRaw[0] <= '9' && trimmedRaw[1] == ':' {
+						if t, err := time.ParseInLocation(layout, "0"+trimmedRaw, loc); err == nil {
+							return t.In(loc), nil
+						}
+					}
 				}
 			}
 		}
@@ -3365,6 +3967,44 @@ func unescapeKVQuotedString(s string) string {
 
 var reHTMLTags = regexp.MustCompile(`<[^>]*>`)
 
+func isHTMLBlockTagRound60(tagLower string) bool {
+	switch tagLower {
+	case "p", "div", "br", "h1", "h2", "h3", "h4", "h5", "h6",
+		"li", "tr", "blockquote", "title", "ul", "ol", "table",
+		"thead", "tbody", "tfoot", "hr", "pre", "section", "article",
+		"header", "footer":
+		return true
+	}
+	return false
+}
+
+func stripIngestHTMLRound60(s string, escapedTags map[string]bool) string {
+	stripped := reHTMLTags.ReplaceAllStringFunc(s, func(tag string) string {
+		inner := strings.TrimSpace(tag)
+		inner = strings.TrimPrefix(inner, "<")
+		inner = strings.TrimSuffix(inner, ">")
+		inner = strings.TrimSpace(inner)
+		if strings.HasPrefix(inner, "!") || strings.HasPrefix(inner, "?") {
+			return ""
+		}
+		inner = strings.TrimPrefix(inner, "/")
+		inner = strings.TrimSuffix(inner, "/")
+		inner = strings.TrimSpace(inner)
+		if spIdx := strings.IndexAny(inner, " \t\r\n"); spIdx >= 0 {
+			inner = inner[:spIdx]
+		}
+		tLower := strings.ToLower(inner)
+		if len(escapedTags) > 0 && escapedTags[tLower] {
+			return tag
+		}
+		if isHTMLBlockTagRound60(tLower) {
+			return "\n"
+		}
+		return ""
+	})
+	return html.UnescapeString(stripped)
+}
+
 func parseIngestByteSize(s string) (int64, error) {
 	s = strings.ToLower(strings.TrimSpace(s))
 	type unitSpec struct {
@@ -3486,7 +4126,7 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 	firstIdx := strings.Index(rem, "%{")
 	if firstIdx < 0 {
 		if input != pattern {
-			return nil, fmt.Errorf("unable to dissect [%s] with pattern [%s]", input, pattern)
+			return nil, fmt.Errorf("Unable to find match for dissect pattern: %s against source: %s", pattern, input) //nolint:staticcheck // ES exact dissect error string //nolint:staticcheck // ES exact dissect error string
 		}
 		return map[string]any{}, nil
 	}
@@ -3496,7 +4136,7 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 	for strings.HasPrefix(rem, "%{") {
 		endBrace := strings.IndexByte(rem, '}')
 		if endBrace < 0 {
-			return nil, fmt.Errorf("invalid dissect pattern [%s]: unclosed token", pattern)
+			return nil, fmt.Errorf("parse_exception: Unable to parse pattern [%s]", pattern)
 		}
 		inner := rem[2:endBrace]
 		rem = rem[endBrace+1:]
@@ -3549,7 +4189,7 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 	}
 
 	if !strings.HasPrefix(input, prefixLit) {
-		return nil, fmt.Errorf("unable to dissect [%s] with pattern [%s]", input, pattern)
+		return nil, fmt.Errorf("Unable to find match for dissect pattern: %s against source: %s", pattern, input) //nolint:staticcheck // ES exact dissect error string
 	}
 	cur := input[len(prefixLit):]
 	out := make(map[string]any)
@@ -3577,7 +4217,7 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 			}
 		} else if isLast {
 			if !strings.HasSuffix(cur, tok.nextLit) {
-				return nil, fmt.Errorf("unable to dissect [%s] with pattern [%s]: missing delimiter [%s]", input, pattern, tok.nextLit)
+				return nil, fmt.Errorf("Unable to find match for dissect pattern: %s against source: %s", pattern, input) //nolint:staticcheck // ES exact dissect error string
 			}
 			val = cur[:len(cur)-len(tok.nextLit)]
 			if tok.padRight && tok.nextLit != "" {
@@ -3587,7 +4227,7 @@ func evalDissectPattern(pattern, input, appendSep string) (map[string]any, error
 		} else {
 			idx := strings.Index(cur, tok.nextLit)
 			if idx < 0 {
-				return nil, fmt.Errorf("unable to dissect [%s] with pattern [%s]: missing delimiter [%s]", input, pattern, tok.nextLit)
+				return nil, fmt.Errorf("Unable to find match for dissect pattern: %s against source: %s", pattern, input) //nolint:staticcheck // ES exact dissect error string
 			}
 			val = cur[:idx]
 			cur = cur[idx+len(tok.nextLit):]
@@ -3738,10 +4378,54 @@ func expandIngestFieldName(raw string, doc map[string]any) string {
 	return raw
 }
 
-func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string]any, depth int, trace *[]map[string]any) (mutated bool, dropped bool, procType string, procTag string, specMap map[string]any, procErr error) {
-	if topIf, ok := pMap["if"].(string); ok && !evalIngestIfCondition(topIf, doc) {
-		return false, false, "", "", nil, nil
+func (s *Server) ingestErrorTypeForReqRound60(r *http.Request, err error) string {
+	if err != nil && strings.Contains(err.Error(), "Cycle detected for pipeline:") {
+		if s != nil && s.isES8Mode(r) {
+			return "graph_structure_exception"
+		}
+		return "illegal_state_exception"
 	}
+	return ingestErrorType(err)
+}
+
+func missingIngestPathErrorRound60(doc map[string]any, fullPath string) error {
+	parts := strings.Split(fullPath, ".")
+	cur := doc
+	for _, seg := range parts {
+		if cur == nil {
+			return fmt.Errorf("field [%s] not present as part of path [%s]", seg, fullPath)
+		}
+		v, exists := cur[seg]
+		if !exists {
+			return fmt.Errorf("field [%s] not present as part of path [%s]", seg, fullPath)
+		}
+		if nm, ok := v.(map[string]any); ok {
+			cur = nm
+		} else {
+			cur = nil
+		}
+	}
+	return fmt.Errorf("field [%s] not present as part of path [%s]", fullPath, fullPath)
+}
+
+func checkIngestFieldMissingOrNullRound60(doc map[string]any, field string, val any, exists bool, specMap map[string]any) (bool, error) {
+	ignoreMissing, _ := specMap["ignore_missing"].(bool)
+	if !exists {
+		if ignoreMissing {
+			return true, nil
+		}
+		return true, missingIngestPathErrorRound60(doc, field)
+	}
+	if val == nil {
+		if ignoreMissing {
+			return true, nil
+		}
+		return true, fmt.Errorf("field [%s] is null, cannot operate on null value", field)
+	}
+	return false, nil
+}
+
+func extractIngestProcessorSpecRound60(pMap map[string]any) (procType, procTag, procDesc, ifCond string, hasIf bool, specMap map[string]any) {
 	for k, v := range pMap {
 		switch k {
 		case "if", "ignore_failure", "on_failure", "tag", "description":
@@ -3754,13 +4438,203 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	}
 	if procType == "" || specMap == nil {
-		return false, false, "", "", nil, nil
+		return "", "", "", "", false, nil
 	}
 	procTag, _ = specMap["tag"].(string)
 	if procTag == "" {
 		procTag, _ = pMap["tag"].(string)
 	}
-	if cond, ok := specMap["if"].(string); ok && !evalIngestIfCondition(cond, doc) {
+	procDesc, _ = specMap["description"].(string)
+	if procDesc == "" {
+		procDesc, _ = pMap["description"].(string)
+	}
+	if sIf, ok := specMap["if"].(string); ok {
+		ifCond = sIf
+		hasIf = true
+	} else if tIf, ok := pMap["if"].(string); ok {
+		ifCond = tIf
+		hasIf = true
+	}
+	return procType, procTag, procDesc, ifCond, hasIf, specMap
+}
+
+func collectStaticSubPipelineRefsRound60(procs []any) []string {
+	var refs []string
+	for _, p := range procs {
+		pm, ok := p.(map[string]any)
+		if !ok {
+			continue
+		}
+		for k, v := range pm {
+			switch k {
+			case "on_failure":
+				if sub, ok := v.([]any); ok {
+					refs = append(refs, collectStaticSubPipelineRefsRound60(sub)...)
+				}
+			case "if", "ignore_failure", "tag", "description":
+				continue
+			case "pipeline":
+				if sm, ok := v.(map[string]any); ok {
+					if nm, _ := sm["name"].(string); strings.TrimSpace(nm) != "" && !strings.Contains(nm, "{{") {
+						refs = append(refs, strings.TrimSpace(nm))
+					}
+					if sub, ok := sm["on_failure"].([]any); ok {
+						refs = append(refs, collectStaticSubPipelineRefsRound60(sub)...)
+					}
+				}
+			case "foreach":
+				if sm, ok := v.(map[string]any); ok {
+					if sp, ok := sm["processor"].(map[string]any); ok {
+						refs = append(refs, collectStaticSubPipelineRefsRound60([]any{sp})...)
+					}
+					if sps, ok := sm["processors"].([]any); ok {
+						refs = append(refs, collectStaticSubPipelineRefsRound60(sps)...)
+					}
+					if sub, ok := sm["on_failure"].([]any); ok {
+						refs = append(refs, collectStaticSubPipelineRefsRound60(sub)...)
+					}
+				}
+			default:
+				if sm, ok := v.(map[string]any); ok {
+					if sub, ok := sm["on_failure"].([]any); ok {
+						refs = append(refs, collectStaticSubPipelineRefsRound60(sub)...)
+					}
+				}
+			}
+		}
+	}
+	return refs
+}
+
+func lookupRuntimeIngestPipelineRound60(s *Server, name string, substPipes map[string]map[string]any) map[string]any {
+	if name == "" {
+		return nil
+	}
+	if substPipes != nil {
+		if sp, ok := substPipes[name]; ok && sp != nil {
+			return sp
+		}
+	}
+	if s != nil {
+		s.mu.RLock()
+		subPipe := s.pipelines[name]
+		s.mu.RUnlock()
+		if subPipe == nil {
+			_ = s.syncCatalogFromBackend(context.Background())
+			s.mu.RLock()
+			subPipe = s.pipelines[name]
+			s.mu.RUnlock()
+		}
+		return subPipe
+	}
+	return nil
+}
+
+func detectRuntimePipelineCycleRound60(s *Server, subName string, subPipe map[string]any, stack []string, substPipes map[string]map[string]any) string {
+	for _, st := range stack {
+		if st == subName {
+			return subName
+		}
+	}
+	path := append(append([]string(nil), stack...), subName)
+	visited := make(map[string]bool)
+	var dfs func(curName string, curPipe map[string]any, curPath []string) string
+	dfs = func(curName string, curPipe map[string]any, curPath []string) string {
+		if curPipe == nil {
+			return ""
+		}
+		var allProcs []any
+		if ps, ok := curPipe["processors"].([]any); ok {
+			allProcs = append(allProcs, ps...)
+		}
+		if of, ok := curPipe["on_failure"].([]any); ok {
+			allProcs = append(allProcs, of...)
+		}
+		for _, ref := range collectStaticSubPipelineRefsRound60(allProcs) {
+			for _, anc := range curPath {
+				if anc == ref {
+					return ref
+				}
+			}
+			if visited[ref] {
+				continue
+			}
+			nextPipe := lookupRuntimeIngestPipelineRound60(s, ref, substPipes)
+			if nextPipe == nil {
+				continue
+			}
+			if cyc := dfs(ref, nextPipe, append(curPath, ref)); cyc != "" {
+				return cyc
+			}
+			visited[ref] = true
+		}
+		return ""
+	}
+	return dfs(subName, subPipe, path)
+}
+
+func buildVerboseTraceEntryDocRound60(doc map[string]any) map[string]any {
+	stepIdx := "_index"
+	if v, ok := doc["_index"].(string); ok && v != "" {
+		stepIdx = v
+	}
+	stepID := "0"
+	if v, ok := doc["_id"]; ok && v != nil {
+		if sv := fmt.Sprintf("%v", v); sv != "" {
+			stepID = sv
+		}
+	}
+	stepTS := ""
+	if ingMap, ok := doc["_ingest"].(map[string]any); ok {
+		if ts, ok := ingMap["timestamp"].(string); ok {
+			stepTS = ts
+		} else if tsAny, ok := ingMap["timestamp"]; ok && tsAny != nil {
+			stepTS = fmt.Sprintf("%v", tsAny)
+		}
+	}
+	entryDoc := map[string]any{
+		"_index":   stepIdx,
+		"_version": "-3",
+		"_id":      stepID,
+		"_source":  snapshotIngestDoc(doc),
+	}
+	if ingMap, ok := doc["_ingest"].(map[string]any); ok && len(ingMap) > 0 {
+		stepIngest := make(map[string]any, len(ingMap))
+		for k, v := range ingMap {
+			if strings.HasPrefix(k, "__") {
+				continue
+			}
+			stepIngest[k] = v
+		}
+		if stepTS != "" {
+			stepIngest["timestamp"] = stepTS
+		}
+		if _, hasPipe := stepIngest["pipeline"]; !hasPipe {
+			if om, ok := doc["__internal_ingest_orig"].(map[string]any); ok && om != nil {
+				if ap, _ := om["_active_pipeline"].(string); ap != "" {
+					stepIngest["pipeline"] = ap
+				}
+			}
+		}
+		entryDoc["_ingest"] = stepIngest
+	} else if stepTS != "" {
+		stepIngest := map[string]any{"timestamp": stepTS}
+		if om, ok := doc["__internal_ingest_orig"].(map[string]any); ok && om != nil {
+			if ap, _ := om["_active_pipeline"].(string); ap != "" {
+				stepIngest["pipeline"] = ap
+			}
+		}
+		entryDoc["_ingest"] = stepIngest
+	}
+	return entryDoc
+}
+
+func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string]any, depth int, trace *[]map[string]any) (mutated bool, dropped bool, procType string, procTag string, specMap map[string]any, procErr error) {
+	procType, procTag, procDesc, ifCond, hasIf, specMap := extractIngestProcessorSpecRound60(pMap)
+	if procType == "" || specMap == nil {
+		return false, false, "", "", nil, nil
+	}
+	if hasIf && trace == nil && !evalIngestIfCondition(ifCond, doc) {
 		return false, false, "", procTag, specMap, nil
 	}
 
@@ -3780,40 +4654,94 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 		subName, _ := specMap["name"].(string)
 		subName = strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(subName, doc)))
-		var subPipe map[string]any
-		if s != nil && subName != "" {
-			s.mu.RLock()
-			subPipe = s.pipelines[subName]
-			s.mu.RUnlock()
-			if subPipe == nil {
-				_ = s.syncCatalogFromBackend(context.Background())
-				s.mu.RLock()
-				subPipe = s.pipelines[subName]
-				s.mu.RUnlock()
-			}
+		origMeta, _ := doc["__internal_ingest_orig"].(map[string]any)
+		var substPipes map[string]map[string]any
+		var stack []string
+		if origMeta != nil {
+			substPipes, _ = origMeta["_subst_pipes"].(map[string]map[string]any)
+			stack, _ = origMeta["_pipeline_stack"].([]string)
 		}
+		subPipe := lookupRuntimeIngestPipelineRound60(s, subName, substPipes)
 		if subPipe == nil {
+			missingReason := fmt.Sprintf("Pipeline processor configured for non-existent pipeline [%s]", subName)
 			if ignoreMissing, _ := specMap["ignore_missing_pipeline"].(bool); ignoreMissing {
+				if trace != nil {
+					igEntry := map[string]any{
+						"processor_type": "pipeline",
+						"status":         "error_ignored",
+						"doc":            buildVerboseTraceEntryDocRound60(doc),
+						"ignored_error": map[string]any{
+							"error": map[string]any{
+								"root_cause": []map[string]any{
+									{"type": "illegal_argument_exception", "reason": missingReason},
+								},
+								"type":   "illegal_argument_exception",
+								"reason": missingReason,
+							},
+						},
+					}
+					if procTag != "" {
+						igEntry["tag"] = procTag
+					}
+					if procDesc != "" {
+						igEntry["description"] = procDesc
+					}
+					if hasIf {
+						igEntry["if"] = map[string]any{"condition": ifCond, "result": true}
+					}
+					*trace = append(*trace, igEntry)
+				}
 				return false, false, procType, procTag, specMap, nil
 			}
-			return false, false, procType, procTag, specMap, fmt.Errorf("pipeline [%s] is missing", subName)
+			return false, false, procType, procTag, specMap, errors.New(missingReason)
 		}
-		var prevMsg, prevType, prevTag, prevPipe any
-		var hadPrevMsg, hadPrevType, hadPrevTag, hadPrevPipe bool
+		if cycPipe := detectRuntimePipelineCycleRound60(s, subName, subPipe, stack, substPipes); cycPipe != "" {
+			return false, false, procType, procTag, specMap, fmt.Errorf("Cycle detected for pipeline: %s", cycPipe) //nolint:staticcheck // ES exact error message
+		}
+		if trace != nil {
+			pipeEntry := map[string]any{
+				"processor_type": "pipeline",
+				"status":         "success",
+				"doc":            nil,
+			}
+			if procTag != "" {
+				pipeEntry["tag"] = procTag
+			}
+			if procDesc != "" {
+				pipeEntry["description"] = procDesc
+			}
+			if hasIf {
+				pipeEntry["if"] = map[string]any{"condition": ifCond, "result": true}
+			}
+			*trace = append(*trace, pipeEntry)
+		}
+		var prevMsg, prevType, prevTag, prevPipe, prevIngestPipe any
+		var hadPrevMsg, hadPrevType, hadPrevTag, hadPrevPipe, hadPrevIngestPipe bool
 		if preIngest, ok := doc["_ingest"].(map[string]any); ok && preIngest != nil {
 			prevMsg, hadPrevMsg = preIngest["on_failure_message"]
 			prevType, hadPrevType = preIngest["on_failure_processor_type"]
 			prevTag, hadPrevTag = preIngest["on_failure_processor_tag"]
 			prevPipe, hadPrevPipe = preIngest["on_failure_pipeline"]
+			prevIngestPipe, hadPrevIngestPipe = preIngest["pipeline"]
+			preIngest["pipeline"] = subName
+		} else {
+			doc["_ingest"] = map[string]any{"pipeline": subName}
 		}
-		origMeta, _ := doc["__internal_ingest_orig"].(map[string]any)
 		var savedActivePipe any
 		var hadSavedActivePipe bool
+		savedStack := append([]string(nil), stack...)
 		if origMeta != nil {
 			savedActivePipe, hadSavedActivePipe = origMeta["_active_pipeline"]
 			origMeta["_active_pipeline"] = subName
+			origMeta["_pipeline_stack"] = append(append([]string(nil), stack...), subName)
+			execList, _ := origMeta["_executed_pipelines"].([]string)
+			origMeta["_executed_pipelines"] = append(execList, subName)
 		} else {
-			origMeta = map[string]any{"_active_pipeline": subName}
+			origMeta = map[string]any{
+				"_active_pipeline":    subName,
+				"_pipeline_stack":     []string{subName},
+				"_executed_pipelines": []string{subName},
+			}
 			doc["__internal_ingest_orig"] = origMeta
 		}
 		restoreActivePipe := func() {
@@ -3822,6 +4750,14 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					om["_active_pipeline"] = savedActivePipe
 				} else {
 					delete(om, "_active_pipeline")
+				}
+				om["_pipeline_stack"] = savedStack
+			}
+			if curIngest, ok := doc["_ingest"].(map[string]any); ok && curIngest != nil {
+				if hadPrevIngestPipe {
+					curIngest["pipeline"] = prevIngestPipe
+				} else {
+					delete(curIngest, "pipeline")
 				}
 			}
 		}
@@ -3883,12 +4819,8 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		appendSep, _ := specMap["append_separator"].(string)
 		if field != "" && pattern != "" {
 			val, exists := getIngestPath(doc, field)
-			if !exists || val == nil {
-				ignoreMissing, _ := specMap["ignore_missing"].(bool)
-				if !ignoreMissing {
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
-				}
-				return false, false, procType, procTag, specMap, nil
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
 			}
 			var extracted map[string]any
 			switch v := val.(type) {
@@ -3947,7 +4879,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				val, exists := getIngestPath(doc, copyFrom)
 				if !exists {
 					if isExplicitIgnoreMissingFalse(specMap) {
-						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", copyFrom)
+						return false, false, procType, procTag, specMap, missingIngestPathErrorRound60(doc, copyFrom)
 					}
 					return false, false, procType, procTag, specMap, nil
 				}
@@ -4001,8 +4933,9 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			}
 			val, exists := getIngestPath(doc, srcField)
 			if !exists {
-				if isExplicitIgnoreMissingFalse(specMap) {
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", srcField)
+				ignoreMissing, _ := specMap["ignore_missing"].(bool)
+				if !ignoreMissing {
+					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] doesn't exist", srcField)
 				}
 				return false, false, procType, procTag, specMap, nil
 			}
@@ -4032,7 +4965,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			val, exists := getIngestPath(doc, srcField)
 			if !exists {
 				if isExplicitIgnoreMissingFalse(specMap) {
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", srcField)
+					return false, false, procType, procTag, specMap, missingIngestPathErrorRound60(doc, srcField)
 				}
 				return false, false, procType, procTag, specMap, nil
 			}
@@ -4087,10 +5020,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				}
 			}
 		}
+		ignoreMissing, _ := specMap["ignore_missing"].(bool)
 		for _, f := range fieldsToRemove {
 			if _, exists := getIngestPath(doc, f); !exists {
-				if isExplicitIgnoreMissingFalse(specMap) {
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", f)
+				if !ignoreMissing {
+					return false, false, procType, procTag, specMap, missingIngestPathErrorRound60(doc, f)
 				}
 			} else {
 				deleteIngestPath(doc, f)
@@ -4112,11 +5046,9 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				}
 			}
 			for _, kp := range fieldsToKeep {
-				foundAny := false
 				if !isInternalIngestKey(kp) {
 					if val, exists := getIngestPath(doc, kp); exists {
 						setIngestPath(kept, kp, deepCloneIngestValue(val))
-						foundAny = true
 					}
 				}
 				prefix := kp + "."
@@ -4126,16 +5058,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					}
 					if strings.HasPrefix(k, prefix) || (strings.Contains(kp, "*") && matchWildcardPattern(kp, k)) {
 						setIngestPath(kept, k, deepCloneIngestValue(v))
-						foundAny = true
 					}
 				}
 				if strings.Contains(kp, "*") {
-					if keepMatchingIngestPaths(doc, kept, strings.Split(kp, "."), isInternalIngestKey) {
-						foundAny = true
-					}
-				}
-				if !foundAny && isExplicitIgnoreMissingFalse(specMap) {
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", kp)
+					_ = keepMatchingIngestPaths(doc, kept, strings.Split(kp, "."), isInternalIngestKey)
 				}
 			}
 			for k := range doc {
@@ -4153,27 +5079,27 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			if tf, _ := specMap["target_field"].(string); tf != "" {
 				target = expandIngestFieldName(tf, doc)
 			}
-			if val, ok := getIngestPath(doc, field); ok && val != nil {
-				switch v := val.(type) {
-				case string:
-					setIngestPath(doc, target, strings.ToLower(v))
-					mutated = true
-				case []any:
-					out := make([]any, len(v))
-					for i, el := range v {
-						if s, ok := el.(string); ok {
-							out[i] = strings.ToLower(s)
-						} else {
-							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
-						}
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
+			}
+			switch v := val.(type) {
+			case string:
+				setIngestPath(doc, target, strings.ToLower(v))
+				mutated = true
+			case []any:
+				out := make([]any, len(v))
+				for i, el := range v {
+					if s, ok := el.(string); ok {
+						out[i] = strings.ToLower(s)
+					} else {
+						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
 					}
-					setIngestPath(doc, target, out)
-					mutated = true
-				default:
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 				}
-			} else if isExplicitIgnoreMissingFalse(specMap) {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+				setIngestPath(doc, target, out)
+				mutated = true
+			default:
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 			}
 		}
 	case "uppercase":
@@ -4183,27 +5109,27 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			if tf, _ := specMap["target_field"].(string); tf != "" {
 				target = expandIngestFieldName(tf, doc)
 			}
-			if val, ok := getIngestPath(doc, field); ok && val != nil {
-				switch v := val.(type) {
-				case string:
-					setIngestPath(doc, target, strings.ToUpper(v))
-					mutated = true
-				case []any:
-					out := make([]any, len(v))
-					for i, el := range v {
-						if s, ok := el.(string); ok {
-							out[i] = strings.ToUpper(s)
-						} else {
-							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
-						}
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
+			}
+			switch v := val.(type) {
+			case string:
+				setIngestPath(doc, target, strings.ToUpper(v))
+				mutated = true
+			case []any:
+				out := make([]any, len(v))
+				for i, el := range v {
+					if s, ok := el.(string); ok {
+						out[i] = strings.ToUpper(s)
+					} else {
+						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
 					}
-					setIngestPath(doc, target, out)
-					mutated = true
-				default:
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 				}
-			} else if isExplicitIgnoreMissingFalse(specMap) {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+				setIngestPath(doc, target, out)
+				mutated = true
+			default:
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 			}
 		}
 	case "trim":
@@ -4213,27 +5139,27 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			if tf, _ := specMap["target_field"].(string); tf != "" {
 				target = expandIngestFieldName(tf, doc)
 			}
-			if val, ok := getIngestPath(doc, field); ok && val != nil {
-				switch v := val.(type) {
-				case string:
-					setIngestPath(doc, target, strings.TrimSpace(v))
-					mutated = true
-				case []any:
-					out := make([]any, len(v))
-					for i, el := range v {
-						if s, ok := el.(string); ok {
-							out[i] = strings.TrimSpace(s)
-						} else {
-							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
-						}
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
+			}
+			switch v := val.(type) {
+			case string:
+				setIngestPath(doc, target, strings.TrimSpace(v))
+				mutated = true
+			case []any:
+				out := make([]any, len(v))
+				for i, el := range v {
+					if s, ok := el.(string); ok {
+						out[i] = strings.TrimSpace(s)
+					} else {
+						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
 					}
-					setIngestPath(doc, target, out)
-					mutated = true
-				default:
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 				}
-			} else if isExplicitIgnoreMissingFalse(specMap) {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+				setIngestPath(doc, target, out)
+				mutated = true
+			default:
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 			}
 		}
 	case "split":
@@ -4257,48 +5183,48 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					return false, false, procType, procTag, specMap, fmt.Errorf("illegal_argument_exception: invalid separator [%s]: %v", sep, err)
 				}
 			}
-			if val, ok := getIngestPath(doc, field); ok && val != nil {
-				splitOne := func(strVal string) []any {
-					var parts []string
-					if splitRe != nil {
-						parts = splitRe.Split(strVal, -1)
-					} else {
-						parts = strings.Split(strVal, sep)
-					}
-					if !preserveTrailing && strVal != "" {
-						for len(parts) > 0 && parts[len(parts)-1] == "" {
-							parts = parts[:len(parts)-1]
-						}
-					}
-					out := make([]any, len(parts))
-					for i, pt := range parts {
-						out[i] = pt
-					}
-					return out
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
+			}
+			splitOne := func(strVal string) []any {
+				var parts []string
+				if splitRe != nil {
+					parts = splitRe.Split(strVal, -1)
+				} else {
+					parts = strings.Split(strVal, sep)
 				}
-				switch v := val.(type) {
-				case string:
-					setIngestPath(doc, target, splitOne(v))
-					mutated = true
-				case []any:
-					var out []any
-					for _, elem := range v {
-						strElem, isStr := elem.(string)
-						if !isStr {
-							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
-						}
-						out = append(out, splitOne(strElem)...)
+				if !preserveTrailing && strVal != "" {
+					for len(parts) > 0 && parts[len(parts)-1] == "" {
+						parts = parts[:len(parts)-1]
 					}
-					if out == nil {
-						out = []any{}
-					}
-					setIngestPath(doc, target, out)
-					mutated = true
-				default:
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 				}
-			} else if isExplicitIgnoreMissingFalse(specMap) {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+				out := make([]any, len(parts))
+				for i, pt := range parts {
+					out[i] = pt
+				}
+				return out
+			}
+			switch v := val.(type) {
+			case string:
+				setIngestPath(doc, target, splitOne(v))
+				mutated = true
+			case []any:
+				var out []any
+				for _, elem := range v {
+					strElem, isStr := elem.(string)
+					if !isStr {
+						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
+					}
+					out = append(out, splitOne(strElem)...)
+				}
+				if out == nil {
+					out = []any{}
+				}
+				setIngestPath(doc, target, out)
+				mutated = true
+			default:
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 			}
 		}
 	case "join":
@@ -4310,19 +5236,19 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			target = expandIngestFieldName(tf, doc)
 		}
 		if field != "" {
-			if val, ok := getIngestPath(doc, field); ok && val != nil {
-				if arr, ok := val.([]any); ok {
-					strs := make([]string, len(arr))
-					for i, el := range arr {
-						strs[i] = fmt.Sprintf("%v", el)
-					}
-					setIngestPath(doc, target, strings.Join(strs, sep))
-					mutated = true
-				} else {
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not an array, cannot join", field)
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
+			}
+			if arr, ok := val.([]any); ok {
+				strs := make([]string, len(arr))
+				for i, el := range arr {
+					strs[i] = fmt.Sprintf("%v", el)
 				}
-			} else if isExplicitIgnoreMissingFalse(specMap) {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+				setIngestPath(doc, target, strings.Join(strs, sep))
+				mutated = true
+			} else {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not an array, cannot join", field)
 			}
 		}
 	case "append":
@@ -4392,11 +5318,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 		if field != "" && convType != "" {
 			val, exists := getIngestPath(doc, field)
-			if !exists || val == nil {
-				if isExplicitIgnoreMissingFalse(specMap) {
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing and cannot be converted to [%s]", field, convType)
-				}
-			} else if arr, isArr := val.([]any); isArr {
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
+			}
+			if arr, isArr := val.([]any); isArr {
 				outArr := make([]any, len(arr))
 				for idx, elem := range arr {
 					if elem == nil {
@@ -4442,34 +5367,34 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			if err != nil {
 				return false, false, procType, procTag, specMap, err
 			}
-			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				if strVal, ok := val.(string); ok {
-					replaced, err := applyIngestGsubReplacement(re, strVal, repl)
-					if err != nil {
-						return false, false, procType, procTag, specMap, err
-					}
-					setIngestPath(doc, target, replaced)
-					mutated = true
-				} else if arr, isArr := val.([]any); isArr {
-					outArr := make([]any, len(arr))
-					for idx, elem := range arr {
-						if sElem, ok := elem.(string); ok {
-							replaced, err := applyIngestGsubReplacement(re, sElem, repl)
-							if err != nil {
-								return false, false, procType, procTag, specMap, err
-							}
-							outArr[idx] = replaced
-						} else {
-							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
-						}
-					}
-					setIngestPath(doc, target, outArr)
-					mutated = true
-				} else {
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
+			}
+			if strVal, ok := val.(string); ok {
+				replaced, err := applyIngestGsubReplacement(re, strVal, repl)
+				if err != nil {
+					return false, false, procType, procTag, specMap, err
 				}
-			} else if isExplicitIgnoreMissingFalse(specMap) {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+				setIngestPath(doc, target, replaced)
+				mutated = true
+			} else if arr, isArr := val.([]any); isArr {
+				outArr := make([]any, len(arr))
+				for idx, elem := range arr {
+					if sElem, ok := elem.(string); ok {
+						replaced, err := applyIngestGsubReplacement(re, sElem, repl)
+						if err != nil {
+							return false, false, procType, procTag, specMap, err
+						}
+						outArr[idx] = replaced
+					} else {
+						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
+					}
+				}
+				setIngestPath(doc, target, outArr)
+				mutated = true
+			} else {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 			}
 		}
 	case "json":
@@ -4491,61 +5416,80 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			strictParsing = sp
 		}
 		if field != "" {
-			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				switch v := val.(type) {
-				case string:
-					if !allowDup {
-						if err := validateJSONNoDuplicateKeys(v, strictParsing); err != nil {
-							return false, false, procType, procTag, specMap, err
-						}
+			val, exists := getIngestPath(doc, field)
+			if !exists {
+				ignoreMissing, _ := specMap["ignore_missing"].(bool)
+				if !ignoreMissing {
+					return false, false, procType, procTag, specMap, missingIngestPathErrorRound60(doc, field)
+				}
+				return false, false, procType, procTag, specMap, nil
+			}
+			if val == nil {
+				return false, false, procType, procTag, specMap, nil
+			}
+			applyAddToRootMap := func(m map[string]any) {
+				cleanM := make(map[string]any, len(m))
+				for k, mv := range m {
+					switch k {
+					case "_ingest", "__internal_ingest_orig", "__internal_ingest_terminated", "__internal_ingest_rerouted", "_index", "_id", "_routing", "_version":
+						continue
 					}
-					dec := json.NewDecoder(strings.NewReader(v))
-					dec.UseNumber()
-					var parsed any
-					if err := dec.Decode(&parsed); err != nil {
+					cleanM[k] = mv
+				}
+				if strings.EqualFold(strings.TrimSpace(conflictStrategy), "merge") {
+					deepMergeIngestMap(doc, cleanM)
+				} else {
+					for k, mv := range cleanM {
+						doc[k] = mv
+					}
+				}
+				mutated = true
+			}
+			switch v := val.(type) {
+			case string:
+				if !allowDup {
+					if err := validateJSONNoDuplicateKeys(v, strictParsing); err != nil {
 						return false, false, procType, procTag, specMap, err
 					}
-					if strictParsing {
-						var extra any
-						if err := dec.Decode(&extra); err != io.EOF {
-							return false, false, procType, procTag, specMap, fmt.Errorf("unexpected trailing token in json field [%s]", field)
-						}
+				}
+				dec := json.NewDecoder(strings.NewReader(v))
+				dec.UseNumber()
+				var parsed any
+				if err := dec.Decode(&parsed); err != nil {
+					return false, false, procType, procTag, specMap, err
+				}
+				if strictParsing {
+					var extra any
+					if err := dec.Decode(&extra); err != io.EOF {
+						return false, false, procType, procTag, specMap, fmt.Errorf("unexpected trailing token in json field [%s]", field)
 					}
-					if addToRoot {
-						m, ok := parsed.(map[string]any)
-						if !ok {
-							return false, false, procType, procTag, specMap, fmt.Errorf("json must be an object when [add_to_root] is true")
-						}
-						cleanM := make(map[string]any, len(m))
-						for k, mv := range m {
-							switch k {
-							case "_ingest", "__internal_ingest_orig", "__internal_ingest_terminated", "__internal_ingest_rerouted", "_index", "_id", "_routing", "_version":
-								continue
-							}
-							cleanM[k] = mv
-						}
-						if strings.EqualFold(strings.TrimSpace(conflictStrategy), "merge") {
-							deepMergeIngestMap(doc, cleanM)
-						} else {
-							for k, mv := range cleanM {
-								doc[k] = mv
-							}
-						}
-						mutated = true
-					} else {
-						setIngestPath(doc, target, parsed)
-						mutated = true
+				}
+				parsed = normalizeJSONNumbersForIngestRound59(parsed)
+				if addToRoot {
+					m, ok := parsed.(map[string]any)
+					if !ok {
+						return false, false, procType, procTag, specMap, fmt.Errorf("json must be an object when [add_to_root] is true")
 					}
-				case []any:
-					if addToRoot {
-						return false, false, procType, procTag, specMap, fmt.Errorf("cannot use [add_to_root] when field [%s] is an array", field)
+					applyAddToRootMap(m)
+				} else {
+					setIngestPath(doc, target, parsed)
+					mutated = true
+				}
+			case []any:
+				if addToRoot {
+					return false, false, procType, procTag, specMap, fmt.Errorf("cannot use [add_to_root] when field [%s] is an array", field)
+				}
+				allStrings := len(v) > 0
+				for _, elem := range v {
+					if _, ok := elem.(string); !ok {
+						allStrings = false
+						break
 					}
+				}
+				if allStrings {
 					outArr := make([]any, len(v))
 					for i, elem := range v {
-						sElem, ok := elem.(string)
-						if !ok {
-							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
-						}
+						sElem := elem.(string)
 						if !allowDup {
 							if err := validateJSONNoDuplicateKeys(sElem, strictParsing); err != nil {
 								return false, false, procType, procTag, specMap, err
@@ -4563,15 +5507,26 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 								return false, false, procType, procTag, specMap, fmt.Errorf("unexpected trailing token in json field [%s]", field)
 							}
 						}
-						outArr[i] = parsed
+						outArr[i] = normalizeJSONNumbersForIngestRound59(parsed)
 					}
 					setIngestPath(doc, target, outArr)
 					mutated = true
-				default:
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
+				} else {
+					setIngestPath(doc, target, normalizeJSONNumbersForIngestRound59(deepCloneIngestValue(v)))
+					mutated = true
 				}
-			} else if isExplicitIgnoreMissingFalse(specMap) {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+			default:
+				normVal := normalizeJSONNumbersForIngestRound59(deepCloneIngestValue(val))
+				if addToRoot {
+					m, ok := normVal.(map[string]any)
+					if !ok {
+						return false, false, procType, procTag, specMap, fmt.Errorf("json must be an object when [add_to_root] is true")
+					}
+					applyAddToRootMap(m)
+				} else {
+					setIngestPath(doc, target, normVal)
+					mutated = true
+				}
 			}
 		}
 	case "kv":
@@ -4601,172 +5556,172 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			}
 		}
 		if field != "" && fieldSplit != "" && valueSplit != "" {
-			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				var strInputs []string
-				switch v := val.(type) {
-				case string:
-					strInputs = []string{v}
-				case []any:
-					for _, elem := range v {
-						strElem, isStr := elem.(string)
-						if !isStr {
-							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
-						}
-						strInputs = append(strInputs, strElem)
-					}
-				default:
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
-				}
-				var valSplitRe *regexp.Regexp
-				if valueSplit != "=" && valueSplit != ":" && valueSplit != "|" && valueSplit != "." {
-					var err error
-					valSplitRe, err = compileIngestJavaRegex(valueSplit)
-					if err != nil {
-						return false, false, procType, procTag, specMap, fmt.Errorf("illegal_argument_exception: invalid value_split [%s]: %v", valueSplit, err)
-					}
-				}
-				hasMatchingOuterKVBrackets := func(s string, openB, closeB byte) bool {
-					depth := 0
-					inQuote := byte(0)
-					escaped := false
-					for i := 0; i < len(s); i++ {
-						ch := s[i]
-						if escaped {
-							escaped = false
-							continue
-						}
-						if ch == '\\' && inQuote != 0 {
-							escaped = true
-							continue
-						}
-						if inQuote != 0 {
-							if ch == inQuote {
-								inQuote = 0
-							}
-							continue
-						}
-						if ch == '"' || ch == '\'' {
-							inQuote = ch
-							continue
-						}
-						switch ch {
-						case openB:
-							depth++
-						case closeB:
-							depth--
-							if depth == 0 {
-								return i == len(s)-1
-							}
-						}
-					}
-					return false
-				}
-				stripKVEnclosingBrackets := func(s string) string {
-					for len(s) >= 2 {
-						first, last := s[0], s[len(s)-1]
-						if ((first == '[' && last == ']') || (first == '(' && last == ')') || (first == '<' && last == '>') || (first == '{' && last == '}')) &&
-							hasMatchingOuterKVBrackets(s, first, last) {
-							s = s[1 : len(s)-1]
-						} else {
-							break
-						}
-					}
-					return s
-				}
-				kvMap := make(map[string]any)
-				for _, strVal := range strInputs {
-					if stripBrackets {
-						strVal = stripKVEnclosingBrackets(strings.TrimSpace(strVal))
-					}
-					pairs, splitErr := splitIngestKVPairs(strVal, fieldSplit)
-					if splitErr != nil {
-						return false, false, procType, procTag, specMap, splitErr
-					}
-					for _, pair := range pairs {
-						pair = strings.TrimSpace(pair)
-						if stripBrackets {
-							pair = stripKVEnclosingBrackets(pair)
-						}
-						if pair == "" {
-							continue
-						}
-						var k, v string
-						if valSplitRe != nil {
-							loc := valSplitRe.FindStringIndex(pair)
-							if loc == nil || loc[0] <= 0 {
-								continue
-							}
-							k = pair[:loc[0]]
-							v = pair[loc[1]:]
-						} else {
-							idx := strings.Index(pair, valueSplit)
-							if idx <= 0 {
-								continue
-							}
-							k = pair[:idx]
-							v = pair[idx+len(valueSplit):]
-						}
-						k = strings.TrimSpace(k)
-						if stripBrackets {
-							k = stripKVEnclosingBrackets(k)
-						}
-						if trimKey != "" {
-							k = strings.Trim(k, trimKey)
-						}
-						switch transformKey {
-						case "lowercase":
-							k = strings.ToLower(k)
-						case "uppercase":
-							k = strings.ToUpper(k)
-						}
-						if includeSet != nil && !includeSet[k] {
-							continue
-						}
-						if excludeSet != nil && excludeSet[k] {
-							continue
-						}
-						v = strings.TrimSpace(v)
-						if len(v) >= 2 {
-							first, last := v[0], v[len(v)-1]
-							if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
-								v = unescapeKVQuotedString(v[1 : len(v)-1])
-							} else if stripBrackets {
-								v = stripKVEnclosingBrackets(v)
-							}
-						}
-						if trimVal != "" {
-							v = strings.Trim(v, trimVal)
-						}
-						fullKey := prefix + k
-						if prev, hasPrev := kvMap[fullKey]; hasPrev {
-							if prevArr, isArr := prev.([]any); isArr {
-								kvMap[fullKey] = append(prevArr, v)
-							} else {
-								kvMap[fullKey] = []any{prev, v}
-							}
-						} else {
-							kvMap[fullKey] = v
-						}
-					}
-				}
-				if targetField != "" {
-					if existing, ok := getIngestPath(doc, targetField); !ok || existing == nil {
-						setIngestPath(doc, targetField, map[string]any{})
-					} else if _, isMap := existing.(map[string]any); !isMap {
-						setIngestPath(doc, targetField, map[string]any{})
-					}
-					for k, v := range kvMap {
-						setIngestPath(doc, targetField+"."+k, v)
-					}
-				} else {
-					for k, v := range kvMap {
-						setIngestPath(doc, k, v)
-					}
-				}
-				mutated = true
-			} else if isExplicitIgnoreMissingFalse(specMap) {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
 			}
+			var strInputs []string
+			switch v := val.(type) {
+			case string:
+				strInputs = []string{v}
+			case []any:
+				for _, elem := range v {
+					strElem, isStr := elem.(string)
+					if !isStr {
+						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
+					}
+					strInputs = append(strInputs, strElem)
+				}
+			default:
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
+			}
+			var valSplitRe *regexp.Regexp
+			if valueSplit != "=" && valueSplit != ":" && valueSplit != "|" && valueSplit != "." {
+				var err error
+				valSplitRe, err = compileIngestJavaRegex(valueSplit)
+				if err != nil {
+					return false, false, procType, procTag, specMap, fmt.Errorf("illegal_argument_exception: invalid value_split [%s]: %v", valueSplit, err)
+				}
+			}
+			hasMatchingOuterKVBrackets := func(s string, openB, closeB byte) bool {
+				depth := 0
+				inQuote := byte(0)
+				escaped := false
+				for i := 0; i < len(s); i++ {
+					ch := s[i]
+					if escaped {
+						escaped = false
+						continue
+					}
+					if ch == '\\' && inQuote != 0 {
+						escaped = true
+						continue
+					}
+					if inQuote != 0 {
+						if ch == inQuote {
+							inQuote = 0
+						}
+						continue
+					}
+					if ch == '"' || ch == '\'' {
+						inQuote = ch
+						continue
+					}
+					switch ch {
+					case openB:
+						depth++
+					case closeB:
+						depth--
+						if depth == 0 {
+							return i == len(s)-1
+						}
+					}
+				}
+				return false
+			}
+			stripKVEnclosingBrackets := func(s string) string {
+				for len(s) >= 2 {
+					first, last := s[0], s[len(s)-1]
+					if ((first == '[' && last == ']') || (first == '(' && last == ')') || (first == '<' && last == '>') || (first == '{' && last == '}')) &&
+						hasMatchingOuterKVBrackets(s, first, last) {
+						s = s[1 : len(s)-1]
+					} else {
+						break
+					}
+				}
+				return s
+			}
+			kvMap := make(map[string]any)
+			for _, strVal := range strInputs {
+				if stripBrackets {
+					strVal = stripKVEnclosingBrackets(strings.TrimSpace(strVal))
+				}
+				pairs, splitErr := splitIngestKVPairs(strVal, fieldSplit)
+				if splitErr != nil {
+					return false, false, procType, procTag, specMap, splitErr
+				}
+				for _, pair := range pairs {
+					pair = strings.TrimSpace(pair)
+					if stripBrackets {
+						pair = stripKVEnclosingBrackets(pair)
+					}
+					if pair == "" {
+						continue
+					}
+					var k, v string
+					if valSplitRe != nil {
+						loc := valSplitRe.FindStringIndex(pair)
+						if loc == nil || loc[0] <= 0 {
+							continue
+						}
+						k = pair[:loc[0]]
+						v = pair[loc[1]:]
+					} else {
+						idx := strings.Index(pair, valueSplit)
+						if idx <= 0 {
+							continue
+						}
+						k = pair[:idx]
+						v = pair[idx+len(valueSplit):]
+					}
+					k = strings.TrimSpace(k)
+					if stripBrackets {
+						k = stripKVEnclosingBrackets(k)
+					}
+					if trimKey != "" {
+						k = strings.Trim(k, trimKey)
+					}
+					switch transformKey {
+					case "lowercase":
+						k = strings.ToLower(k)
+					case "uppercase":
+						k = strings.ToUpper(k)
+					}
+					if includeSet != nil && !includeSet[k] {
+						continue
+					}
+					if excludeSet != nil && excludeSet[k] {
+						continue
+					}
+					v = strings.TrimSpace(v)
+					if len(v) >= 2 {
+						first, last := v[0], v[len(v)-1]
+						if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+							v = unescapeKVQuotedString(v[1 : len(v)-1])
+						} else if stripBrackets {
+							v = stripKVEnclosingBrackets(v)
+						}
+					}
+					if trimVal != "" {
+						v = strings.Trim(v, trimVal)
+					}
+					fullKey := prefix + k
+					if prev, hasPrev := kvMap[fullKey]; hasPrev {
+						if prevArr, isArr := prev.([]any); isArr {
+							kvMap[fullKey] = append(prevArr, v)
+						} else {
+							kvMap[fullKey] = []any{prev, v}
+						}
+					} else {
+						kvMap[fullKey] = v
+					}
+				}
+			}
+			if targetField != "" {
+				if existing, ok := getIngestPath(doc, targetField); !ok || existing == nil {
+					setIngestPath(doc, targetField, map[string]any{})
+				} else if _, isMap := existing.(map[string]any); !isMap {
+					setIngestPath(doc, targetField, map[string]any{})
+				}
+				for k, v := range kvMap {
+					setIngestPath(doc, targetField+"."+k, v)
+				}
+			} else {
+				for k, v := range kvMap {
+					setIngestPath(doc, k, v)
+				}
+			}
+			mutated = true
 		}
 	case "dot_expander":
 		field, _ := specMap["field"].(string)
@@ -4896,27 +5851,27 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			target = expandIngestFieldName(tf, doc)
 		}
 		if field != "" {
-			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				switch v := val.(type) {
-				case string:
-					setIngestPath(doc, target, url.QueryEscape(v))
-					mutated = true
-				case []any:
-					outArr := make([]any, len(v))
-					for idx, el := range v {
-						if sEl, ok := el.(string); ok {
-							outArr[idx] = url.QueryEscape(sEl)
-						} else {
-							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
-						}
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
+			}
+			switch v := val.(type) {
+			case string:
+				setIngestPath(doc, target, url.QueryEscape(v))
+				mutated = true
+			case []any:
+				outArr := make([]any, len(v))
+				for idx, el := range v {
+					if sEl, ok := el.(string); ok {
+						outArr[idx] = url.QueryEscape(sEl)
+					} else {
+						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
 					}
-					setIngestPath(doc, target, outArr)
-					mutated = true
-				default:
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 				}
-			} else if isExplicitIgnoreMissingFalse(specMap) {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+				setIngestPath(doc, target, outArr)
+				mutated = true
+			default:
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 			}
 		}
 	case "urldecode", "url_decode", "URLDecode":
@@ -4927,35 +5882,35 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			target = expandIngestFieldName(tf, doc)
 		}
 		if field != "" {
-			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				switch v := val.(type) {
-				case string:
-					decoded, err := url.QueryUnescape(v)
-					if err != nil {
-						return false, false, procType, procTag, specMap, err
-					}
-					setIngestPath(doc, target, decoded)
-					mutated = true
-				case []any:
-					outArr := make([]any, len(v))
-					for idx, el := range v {
-						if sEl, ok := el.(string); ok {
-							decoded, err := url.QueryUnescape(sEl)
-							if err != nil {
-								return false, false, procType, procTag, specMap, err
-							}
-							outArr[idx] = decoded
-						} else {
-							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
-						}
-					}
-					setIngestPath(doc, target, outArr)
-					mutated = true
-				default:
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
+			}
+			switch v := val.(type) {
+			case string:
+				decoded, err := url.QueryUnescape(v)
+				if err != nil {
+					return false, false, procType, procTag, specMap, err
 				}
-			} else if isExplicitIgnoreMissingFalse(specMap) {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+				setIngestPath(doc, target, decoded)
+				mutated = true
+			case []any:
+				outArr := make([]any, len(v))
+				for idx, el := range v {
+					if sEl, ok := el.(string); ok {
+						decoded, err := url.QueryUnescape(sEl)
+						if err != nil {
+							return false, false, procType, procTag, specMap, err
+						}
+						outArr[idx] = decoded
+					} else {
+						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
+					}
+				}
+				setIngestPath(doc, target, outArr)
+				mutated = true
+			default:
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 			}
 		}
 	case "bytes":
@@ -4966,29 +5921,29 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			target = expandIngestFieldName(tf, doc)
 		}
 		if field != "" {
-			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				switch v := val.(type) {
-				case []any:
-					outArr := make([]any, len(v))
-					for idx, el := range v {
-						bVal, err := parseStrictIngestBytesElementRound59(field, el)
-						if err != nil {
-							return false, false, procType, procTag, specMap, err
-						}
-						outArr[idx] = bVal
-					}
-					setIngestPath(doc, target, outArr)
-					mutated = true
-				default:
-					bVal, err := parseStrictIngestBytesElementRound59(field, v)
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
+			}
+			switch v := val.(type) {
+			case []any:
+				outArr := make([]any, len(v))
+				for idx, el := range v {
+					bVal, err := parseStrictIngestBytesElementRound59(field, el)
 					if err != nil {
 						return false, false, procType, procTag, specMap, err
 					}
-					setIngestPath(doc, target, bVal)
-					mutated = true
+					outArr[idx] = bVal
 				}
-			} else if isExplicitIgnoreMissingFalse(specMap) {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+				setIngestPath(doc, target, outArr)
+				mutated = true
+			default:
+				bVal, err := parseStrictIngestBytesElementRound59(field, v)
+				if err != nil {
+					return false, false, procType, procTag, specMap, err
+				}
+				setIngestPath(doc, target, bVal)
+				mutated = true
 			}
 		}
 	case "html_strip":
@@ -5006,50 +5961,28 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				}
 			}
 		}
-		stripHTMLStr := func(s string) string {
-			if len(escapedTags) == 0 {
-				return html.UnescapeString(reHTMLTags.ReplaceAllString(s, ""))
-			}
-			stripped := reHTMLTags.ReplaceAllStringFunc(s, func(tag string) string {
-				inner := strings.TrimSpace(tag)
-				inner = strings.TrimPrefix(inner, "<")
-				inner = strings.TrimSuffix(inner, ">")
-				inner = strings.TrimSpace(inner)
-				inner = strings.TrimPrefix(inner, "/")
-				inner = strings.TrimSuffix(inner, "/")
-				inner = strings.TrimSpace(inner)
-				if spIdx := strings.IndexAny(inner, " \t\r\n"); spIdx >= 0 {
-					inner = inner[:spIdx]
-				}
-				if escapedTags[strings.ToLower(inner)] {
-					return tag
-				}
-				return ""
-			})
-			return html.UnescapeString(stripped)
-		}
 		if field != "" {
-			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				switch v := val.(type) {
-				case string:
-					setIngestPath(doc, target, stripHTMLStr(v))
-					mutated = true
-				case []any:
-					outArr := make([]any, len(v))
-					for idx, el := range v {
-						if sEl, ok := el.(string); ok {
-							outArr[idx] = stripHTMLStr(sEl)
-						} else {
-							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
-						}
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
+			}
+			switch v := val.(type) {
+			case string:
+				setIngestPath(doc, target, stripIngestHTMLRound60(v, escapedTags))
+				mutated = true
+			case []any:
+				outArr := make([]any, len(v))
+				for idx, el := range v {
+					if sEl, ok := el.(string); ok {
+						outArr[idx] = stripIngestHTMLRound60(sEl, escapedTags)
+					} else {
+						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
 					}
-					setIngestPath(doc, target, outArr)
-					mutated = true
-				default:
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 				}
-			} else if isExplicitIgnoreMissingFalse(specMap) {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+				setIngestPath(doc, target, outArr)
+				mutated = true
+			default:
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 			}
 		}
 	case "date":
@@ -5091,32 +6024,32 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					return localizeFormattedDateOutputRound59(parsedTime.Format(layouts[0]), outFmt, lang, parsedTime), nil
 				}
 			}
-			return parsedTime.Format(time.RFC3339Nano), nil
+			return parsedTime.Format("2006-01-02T15:04:05.000Z07:00"), nil
 		}
 		if field != "" {
-			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				switch v := val.(type) {
-				case []any:
-					outArr := make([]any, len(v))
-					for idx, el := range v {
-						formatted, err := formatOneDate(el)
-						if err != nil {
-							return false, false, procType, procTag, specMap, err
-						}
-						outArr[idx] = formatted
-					}
-					setIngestPath(doc, target, outArr)
-					mutated = true
-				default:
-					formatted, err := formatOneDate(v)
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
+			}
+			switch v := val.(type) {
+			case []any:
+				outArr := make([]any, len(v))
+				for idx, el := range v {
+					formatted, err := formatOneDate(el)
 					if err != nil {
 						return false, false, procType, procTag, specMap, err
 					}
-					setIngestPath(doc, target, formatted)
-					mutated = true
+					outArr[idx] = formatted
 				}
-			} else if isExplicitIgnoreMissingFalse(specMap) {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+				setIngestPath(doc, target, outArr)
+				mutated = true
+			default:
+				formatted, err := formatOneDate(v)
+				if err != nil {
+					return false, false, procType, procTag, specMap, err
+				}
+				setIngestPath(doc, target, formatted)
+				mutated = true
 			}
 		}
 	case "date_index_name":
@@ -5151,54 +6084,54 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 		if field != "" {
 			field = fmt.Sprintf("%v", expandIngestTemplate(field, doc))
-			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				effFormats := formats
-				if len(effFormats) == 0 && isNumericIngestDateValue(val) {
-					effFormats = []any{"ISO8601", "UNIX_MS", "UNIX"}
-				}
-				parsedTime, lang, err := parseIngestDateValueWithLocaleRound59(formatIngestDateInput(val), effFormats, tzName, rawLocale)
-				if err != nil {
-					return false, false, procType, procTag, specMap, err
-				}
-				switch dateRounding {
-				case "y":
-					parsedTime = time.Date(parsedTime.Year(), 1, 1, 0, 0, 0, 0, parsedTime.Location())
-				case "M":
-					parsedTime = time.Date(parsedTime.Year(), parsedTime.Month(), 1, 0, 0, 0, 0, parsedTime.Location())
-				case "w":
-					wd := int(parsedTime.Weekday())
-					if wd == 0 {
-						wd = 7
-					}
-					parsedTime = time.Date(parsedTime.Year(), parsedTime.Month(), parsedTime.Day()-(wd-1), 0, 0, 0, 0, parsedTime.Location())
-				case "d":
-					parsedTime = time.Date(parsedTime.Year(), parsedTime.Month(), parsedTime.Day(), 0, 0, 0, 0, parsedTime.Location())
-				case "h":
-					parsedTime = time.Date(parsedTime.Year(), parsedTime.Month(), parsedTime.Day(), parsedTime.Hour(), 0, 0, 0, parsedTime.Location())
-				case "m":
-					parsedTime = time.Date(parsedTime.Year(), parsedTime.Month(), parsedTime.Day(), parsedTime.Hour(), parsedTime.Minute(), 0, 0, parsedTime.Location())
-				case "s":
-					parsedTime = time.Date(parsedTime.Year(), parsedTime.Month(), parsedTime.Day(), parsedTime.Hour(), parsedTime.Minute(), parsedTime.Second(), 0, parsedTime.Location())
-				}
-				layouts := convertESDateFormatToGoLayouts(idxFmt)
-				var formattedDate string
-				switch layouts[0] {
-				case "UNIX_MS":
-					formattedDate = strconv.FormatInt(parsedTime.UnixMilli(), 10)
-				case "UNIX":
-					formattedDate = strconv.FormatInt(parsedTime.Unix(), 10)
-				default:
-					formattedDate = localizeFormattedDateOutputRound59(parsedTime.Format(layouts[0]), idxFmt, lang, parsedTime)
-				}
-				target := "_index"
-				if tf, _ := specMap["target_field"].(string); tf != "" {
-					target = expandIngestFieldName(tf, doc)
-				}
-				setIngestPath(doc, target, prefix+formattedDate)
-				mutated = true
-			} else if isExplicitIgnoreMissingFalse(specMap) {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
 			}
+			effFormats := formats
+			if len(effFormats) == 0 && isNumericIngestDateValue(val) {
+				effFormats = []any{"ISO8601", "UNIX_MS", "UNIX"}
+			}
+			parsedTime, lang, err := parseIngestDateValueWithLocaleRound59(formatIngestDateInput(val), effFormats, tzName, rawLocale)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
+			switch dateRounding {
+			case "y":
+				parsedTime = time.Date(parsedTime.Year(), 1, 1, 0, 0, 0, 0, parsedTime.Location())
+			case "M":
+				parsedTime = time.Date(parsedTime.Year(), parsedTime.Month(), 1, 0, 0, 0, 0, parsedTime.Location())
+			case "w":
+				wd := int(parsedTime.Weekday())
+				if wd == 0 {
+					wd = 7
+				}
+				parsedTime = time.Date(parsedTime.Year(), parsedTime.Month(), parsedTime.Day()-(wd-1), 0, 0, 0, 0, parsedTime.Location())
+			case "d":
+				parsedTime = time.Date(parsedTime.Year(), parsedTime.Month(), parsedTime.Day(), 0, 0, 0, 0, parsedTime.Location())
+			case "h":
+				parsedTime = time.Date(parsedTime.Year(), parsedTime.Month(), parsedTime.Day(), parsedTime.Hour(), 0, 0, 0, parsedTime.Location())
+			case "m":
+				parsedTime = time.Date(parsedTime.Year(), parsedTime.Month(), parsedTime.Day(), parsedTime.Hour(), parsedTime.Minute(), 0, 0, parsedTime.Location())
+			case "s":
+				parsedTime = time.Date(parsedTime.Year(), parsedTime.Month(), parsedTime.Day(), parsedTime.Hour(), parsedTime.Minute(), parsedTime.Second(), 0, parsedTime.Location())
+			}
+			layouts := convertESDateFormatToGoLayouts(idxFmt)
+			var formattedDate string
+			switch layouts[0] {
+			case "UNIX_MS":
+				formattedDate = strconv.FormatInt(parsedTime.UnixMilli(), 10)
+			case "UNIX":
+				formattedDate = strconv.FormatInt(parsedTime.Unix(), 10)
+			default:
+				formattedDate = localizeFormattedDateOutputRound59(parsedTime.Format(layouts[0]), idxFmt, lang, parsedTime)
+			}
+			target := "_index"
+			if tf, _ := specMap["target_field"].(string); tf != "" {
+				target = expandIngestFieldName(tf, doc)
+			}
+			setIngestPath(doc, target, prefix+formattedDate)
+			mutated = true
 		}
 	case "grok":
 		field, _ := specMap["field"].(string)
@@ -5213,12 +6146,8 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		targetField = expandIngestFieldName(targetField, doc)
 		if field != "" && len(patterns) > 0 {
 			val, exists := getIngestPath(doc, field)
-			if !exists || val == nil {
-				ignoreMissing, _ := specMap["ignore_missing"].(bool)
-				if !ignoreMissing {
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
-				}
-				return false, false, procType, procTag, specMap, nil
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
 			}
 			var strInputs []string
 			switch v := val.(type) {
@@ -5261,8 +6190,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 							ingestMeta = make(map[string]any)
 							doc["_ingest"] = ingestMeta
 						}
-						ingestMeta["_grok_match_index"] = patIdx
-						ingestMeta["_grok_match_pattern"] = patStr
+						ingestMeta["_grok_match_index"] = strconv.Itoa(patIdx)
 					}
 					names := re.SubexpNames()
 					for i, grpID := range names {
@@ -5328,25 +6256,25 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		order, _ := specMap["order"].(string)
 		desc := strings.EqualFold(order, "desc")
 		if field != "" {
-			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				arr, ok := val.([]any)
-				if !ok {
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not an array", field)
-				}
-				sorted := make([]any, len(arr))
-				copy(sorted, arr)
-				sort.SliceStable(sorted, func(i, j int) bool {
-					cmp := compareAny(sorted[i], sorted[j])
-					if desc {
-						return cmp > 0
-					}
-					return cmp < 0
-				})
-				setIngestPath(doc, target, sorted)
-				mutated = true
-			} else if isExplicitIgnoreMissingFalse(specMap) {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
 			}
+			arr, ok := val.([]any)
+			if !ok {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not an array", field)
+			}
+			sorted := make([]any, len(arr))
+			copy(sorted, arr)
+			sort.SliceStable(sorted, func(i, j int) bool {
+				cmp := compareAny(sorted[i], sorted[j])
+				if desc {
+					return cmp > 0
+				}
+				return cmp < 0
+			})
+			setIngestPath(doc, target, sorted)
+			mutated = true
 		}
 	case "compact":
 		field, _ := specMap["field"].(string)
@@ -5355,21 +6283,20 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		if tf, _ := specMap["target_field"].(string); tf != "" {
 			target = expandIngestFieldName(tf, doc)
 		}
-		ignoreMissing, _ := specMap["ignore_missing"].(bool)
 		if field != "" {
-			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				switch v := val.(type) {
-				case []any:
-					setIngestPath(doc, target, compactIngestSlice(v))
-					mutated = true
-				case map[string]any:
-					setIngestPath(doc, target, compactIngestMap(v))
-					mutated = true
-				default:
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is neither an array nor an object", field)
-				}
-			} else if !ignoreMissing {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
+			}
+			switch v := val.(type) {
+			case []any:
+				setIngestPath(doc, target, compactIngestSlice(v))
+				mutated = true
+			case map[string]any:
+				setIngestPath(doc, target, compactIngestMap(v))
+				mutated = true
+			default:
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is neither an array nor an object", field)
 			}
 		}
 	case "dedup", "dedupe":
@@ -5379,35 +6306,34 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		if tf, _ := specMap["target_field"].(string); tf != "" {
 			target = expandIngestFieldName(tf, doc)
 		}
-		ignoreMissing, _ := specMap["ignore_missing"].(bool)
 		ignoreEmpty, _ := specMap["ignore_empty"].(bool)
 		if field != "" {
-			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				arr, ok := val.([]any)
-				if !ok {
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not an array", field)
-				}
-				deduped := make([]any, 0, len(arr))
-				for _, el := range arr {
-					if ignoreEmpty && (el == nil || el == "") {
-						continue
-					}
-					seen := false
-					for _, prev := range deduped {
-						if ingestValuesEqual(prev, el) {
-							seen = true
-							break
-						}
-					}
-					if !seen {
-						deduped = append(deduped, el)
-					}
-				}
-				setIngestPath(doc, target, deduped)
-				mutated = true
-			} else if !ignoreMissing {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
 			}
+			arr, ok := val.([]any)
+			if !ok {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not an array", field)
+			}
+			deduped := make([]any, 0, len(arr))
+			for _, el := range arr {
+				if ignoreEmpty && (el == nil || el == "") {
+					continue
+				}
+				seen := false
+				for _, prev := range deduped {
+					if ingestValuesEqual(prev, el) {
+						seen = true
+						break
+					}
+				}
+				if !seen {
+					deduped = append(deduped, el)
+				}
+			}
+			setIngestPath(doc, target, deduped)
+			mutated = true
 		}
 	case "fingerprint":
 		fieldsAny, hasFields := specMap["fields"].([]any)
@@ -5489,7 +6415,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					buf.WriteString("|")
 					_, _ = fmt.Fprintf(&buf, "%v", val)
 				} else if isExplicitIgnoreMissingFalse(specMap) {
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", f)
+					return false, false, procType, procTag, specMap, missingIngestPathErrorRound60(doc, f)
 				}
 			}
 			if hasAny {
@@ -5544,96 +6470,96 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			suffix = sfx
 		}
 		if field != "" && len(patterns) > 0 {
-			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				redactOneString := func(strVal string) (string, error) {
-					for _, patAny := range patterns {
-						patStr, ok := patAny.(string)
-						if !ok || patStr == "" {
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
+			}
+			redactOneString := func(strVal string) (string, error) {
+				for _, patAny := range patterns {
+					patStr, ok := patAny.(string)
+					if !ok || patStr == "" {
+						continue
+					}
+					re, grpMap, _, err := compileGrokRegex(patStr, customDefs)
+					if err != nil {
+						return "", err
+					}
+					subexpNames := re.SubexpNames()
+					locs := re.FindAllStringSubmatchIndex(strVal, -1)
+					if len(locs) == 0 {
+						continue
+					}
+					var b strings.Builder
+					lastPos := 0
+					for _, loc := range locs {
+						if loc[0] < lastPos {
 							continue
 						}
-						re, grpMap, _, err := compileGrokRegex(patStr, customDefs)
-						if err != nil {
-							return "", err
+						b.WriteString(strVal[lastPos:loc[0]])
+						type subSpan struct {
+							start int
+							end   int
+							label string
 						}
-						subexpNames := re.SubexpNames()
-						locs := re.FindAllStringSubmatchIndex(strVal, -1)
-						if len(locs) == 0 {
-							continue
-						}
-						var b strings.Builder
-						lastPos := 0
-						for _, loc := range locs {
-							if loc[0] < lastPos {
+						var spans []subSpan
+						for si := 1; si < len(subexpNames) && 2*si+1 < len(loc); si++ {
+							gID := subexpNames[si]
+							lbl := grpMap[gID]
+							if lbl == "" || loc[2*si] < 0 || loc[2*si+1] < loc[2*si] {
 								continue
 							}
-							b.WriteString(strVal[lastPos:loc[0]])
-							type subSpan struct {
-								start int
-								end   int
-								label string
+							if len(spans) > 0 && loc[2*si] < spans[len(spans)-1].end {
+								continue
 							}
-							var spans []subSpan
-							for si := 1; si < len(subexpNames) && 2*si+1 < len(loc); si++ {
-								gID := subexpNames[si]
-								lbl := grpMap[gID]
-								if lbl == "" || loc[2*si] < 0 || loc[2*si+1] < loc[2*si] {
-									continue
-								}
-								if len(spans) > 0 && loc[2*si] < spans[len(spans)-1].end {
-									continue
-								}
-								spans = append(spans, subSpan{start: loc[2*si], end: loc[2*si+1], label: lbl})
-							}
-							if len(spans) == 0 {
-								b.WriteString(prefix + "REDACTED" + suffix)
-							} else {
-								cur := loc[0]
-								for _, sp := range spans {
-									if sp.start > cur {
-										b.WriteString(strVal[cur:sp.start])
-									}
-									b.WriteString(prefix + sp.label + suffix)
-									cur = sp.end
-								}
-								if cur < loc[1] {
-									b.WriteString(strVal[cur:loc[1]])
-								}
-							}
-							lastPos = loc[1]
+							spans = append(spans, subSpan{start: loc[2*si], end: loc[2*si+1], label: lbl})
 						}
-						b.WriteString(strVal[lastPos:])
-						strVal = b.String()
+						if len(spans) == 0 {
+							b.WriteString(prefix + "REDACTED" + suffix)
+						} else {
+							cur := loc[0]
+							for _, sp := range spans {
+								if sp.start > cur {
+									b.WriteString(strVal[cur:sp.start])
+								}
+								b.WriteString(prefix + sp.label + suffix)
+								cur = sp.end
+							}
+							if cur < loc[1] {
+								b.WriteString(strVal[cur:loc[1]])
+							}
+						}
+						lastPos = loc[1]
 					}
-					return strVal, nil
+					b.WriteString(strVal[lastPos:])
+					strVal = b.String()
 				}
-				switch tv := val.(type) {
-				case string:
-					redacted, err := redactOneString(tv)
+				return strVal, nil
+			}
+			switch tv := val.(type) {
+			case string:
+				redacted, err := redactOneString(tv)
+				if err != nil {
+					return false, false, procType, procTag, specMap, err
+				}
+				setIngestPath(doc, target, redacted)
+				mutated = true
+			case []any:
+				outSlice := make([]any, len(tv))
+				for idx, elem := range tv {
+					elemStr, ok := elem.(string)
+					if !ok {
+						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] element at index [%d] is not a string", field, idx)
+					}
+					redacted, err := redactOneString(elemStr)
 					if err != nil {
 						return false, false, procType, procTag, specMap, err
 					}
-					setIngestPath(doc, target, redacted)
-					mutated = true
-				case []any:
-					outSlice := make([]any, len(tv))
-					for idx, elem := range tv {
-						elemStr, ok := elem.(string)
-						if !ok {
-							return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] element at index [%d] is not a string", field, idx)
-						}
-						redacted, err := redactOneString(elemStr)
-						if err != nil {
-							return false, false, procType, procTag, specMap, err
-						}
-						outSlice[idx] = redacted
-					}
-					setIngestPath(doc, target, outSlice)
-					mutated = true
-				default:
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] of type [%T] is not supported for redact processor", field, val)
+					outSlice[idx] = redacted
 				}
-			} else if ignoreMissing, _ := specMap["ignore_missing"].(bool); !ignoreMissing {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+				setIngestPath(doc, target, outSlice)
+				mutated = true
+			default:
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] of type [%T] is not supported for redact processor", field, val)
 			}
 		}
 	case "attachment":
@@ -5665,47 +6591,47 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			}
 		}
 		if field != "" {
-			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				rawB64 := strings.TrimSpace(fmt.Sprintf("%v", val))
-				decoded, err := base64.StdEncoding.DecodeString(rawB64)
-				if err != nil {
-					decoded, err = base64.RawStdEncoding.DecodeString(rawB64)
-				}
-				if err != nil {
-					decoded, err = base64.URLEncoding.DecodeString(rawB64)
-				}
-				if err != nil {
-					decoded, err = base64.RawURLEncoding.DecodeString(rawB64)
-				}
-				if err != nil {
-					return false, false, procType, procTag, specMap, fmt.Errorf("failed to base64-decode attachment field [%s]: %w", field, err)
-				}
-				content := string(decoded)
-				runes := []rune(content)
-				origRuneLen := len(runes)
-				if indexedChars >= 0 && len(runes) > indexedChars {
-					content = string(runes[:indexedChars])
-				}
-				attMap := map[string]any{
-					"content":        content,
-					"content_length": origRuneLen,
-					"content_type":   http.DetectContentType(decoded),
-				}
-				if allowedProps != nil {
-					for k := range attMap {
-						if !allowedProps[k] {
-							delete(attMap, k)
-						}
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
+			}
+			rawB64 := strings.TrimSpace(fmt.Sprintf("%v", val))
+			decoded, err := base64.StdEncoding.DecodeString(rawB64)
+			if err != nil {
+				decoded, err = base64.RawStdEncoding.DecodeString(rawB64)
+			}
+			if err != nil {
+				decoded, err = base64.URLEncoding.DecodeString(rawB64)
+			}
+			if err != nil {
+				decoded, err = base64.RawURLEncoding.DecodeString(rawB64)
+			}
+			if err != nil {
+				return false, false, procType, procTag, specMap, fmt.Errorf("failed to base64-decode attachment field [%s]: %w", field, err)
+			}
+			content := string(decoded)
+			runes := []rune(content)
+			origRuneLen := len(runes)
+			if indexedChars >= 0 && len(runes) > indexedChars {
+				content = string(runes[:indexedChars])
+			}
+			attMap := map[string]any{
+				"content":        content,
+				"content_length": origRuneLen,
+				"content_type":   http.DetectContentType(decoded),
+			}
+			if allowedProps != nil {
+				for k := range attMap {
+					if !allowedProps[k] {
+						delete(attMap, k)
 					}
 				}
-				setIngestPath(doc, target, attMap)
-				if removeBinary && field != target {
-					deleteIngestPath(doc, field)
-				}
-				mutated = true
-			} else if isExplicitIgnoreMissingFalse(specMap) {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
 			}
+			setIngestPath(doc, target, attMap)
+			if removeBinary && field != target {
+				deleteIngestPath(doc, field)
+			}
+			mutated = true
 		}
 	case "csv":
 		field, _ := specMap["field"].(string)
@@ -5714,73 +6640,72 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		sepStr, _ := specMap["separator"].(string)
 		quoteStr, _ := specMap["quote"].(string)
 		trimFlag, _ := specMap["trim"].(bool)
-		ignoreMissing, _ := specMap["ignore_missing"].(bool)
 		emptyVal, hasEmptyVal := specMap["empty_value"]
 		if field != "" && len(targetFields) > 0 {
-			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				strVal, isStr := val.(string)
-				if !isStr {
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
-				}
-				if strVal == "\n" || strVal == "\r\n" {
-					return false, false, procType, procTag, specMap, nil
-				}
-				if strVal == "" {
-					if hasEmptyVal {
-						for _, tf := range targetFields {
-							if tfName, ok := tf.(string); ok && tfName != "" {
-								setIngestPath(doc, expandIngestFieldName(tfName, doc), emptyVal)
-							}
-						}
-						return true, false, procType, procTag, specMap, nil
-					}
-					return false, false, procType, procTag, specMap, nil
-				}
-				comma := ','
-				if len(sepStr) > 0 {
-					if r, sz := utf8.DecodeRuneInString(sepStr); sz > 0 && r != utf8.RuneError {
-						comma = r
-					} else {
-						comma = rune(sepStr[0])
-					}
-				}
-				quoteChar := '"'
-				if len(quoteStr) > 0 {
-					if r, sz := utf8.DecodeRuneInString(quoteStr); sz > 0 && r != utf8.RuneError {
-						quoteChar = r
-					} else {
-						quoteChar = rune(quoteStr[0])
-					}
-				}
-				record, quotedFlags, err := parseIngestCSVLine(strVal, comma, quoteChar, trimFlag)
-				if err != nil {
-					return false, false, procType, procTag, specMap, err
-				}
-				for idx := 0; idx < len(targetFields) && idx < len(record); idx++ {
-					tfName, ok := targetFields[idx].(string)
-					if !ok || tfName == "" {
-						continue
-					}
-					tfName = expandIngestFieldName(tfName, doc)
-					cell := record[idx]
-					isQuoted := quotedFlags[idx]
-					if trimFlag && !isQuoted {
-						cell = strings.TrimSpace(cell)
-					}
-					if cell == "" {
-						if hasEmptyVal {
-							setIngestPath(doc, tfName, emptyVal)
-						} else if isQuoted {
-							setIngestPath(doc, tfName, "")
-						}
-						continue
-					}
-					setIngestPath(doc, tfName, cell)
-				}
-				mutated = true
-			} else if !ignoreMissing {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
 			}
+			strVal, isStr := val.(string)
+			if !isStr {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
+			}
+			if strVal == "\n" || strVal == "\r\n" {
+				return false, false, procType, procTag, specMap, nil
+			}
+			if strVal == "" {
+				if hasEmptyVal {
+					for _, tf := range targetFields {
+						if tfName, ok := tf.(string); ok && tfName != "" {
+							setIngestPath(doc, expandIngestFieldName(tfName, doc), emptyVal)
+						}
+					}
+					return true, false, procType, procTag, specMap, nil
+				}
+				return false, false, procType, procTag, specMap, nil
+			}
+			comma := ','
+			if len(sepStr) > 0 {
+				if r, sz := utf8.DecodeRuneInString(sepStr); sz > 0 && r != utf8.RuneError {
+					comma = r
+				} else {
+					comma = rune(sepStr[0])
+				}
+			}
+			quoteChar := '"'
+			if len(quoteStr) > 0 {
+				if r, sz := utf8.DecodeRuneInString(quoteStr); sz > 0 && r != utf8.RuneError {
+					quoteChar = r
+				} else {
+					quoteChar = rune(quoteStr[0])
+				}
+			}
+			record, quotedFlags, err := parseIngestCSVLine(strVal, comma, quoteChar, trimFlag)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
+			for idx := 0; idx < len(targetFields) && idx < len(record); idx++ {
+				tfName, ok := targetFields[idx].(string)
+				if !ok || tfName == "" {
+					continue
+				}
+				tfName = expandIngestFieldName(tfName, doc)
+				cell := record[idx]
+				isQuoted := quotedFlags[idx]
+				if trimFlag && !isQuoted {
+					cell = strings.TrimSpace(cell)
+				}
+				if cell == "" {
+					if hasEmptyVal {
+						setIngestPath(doc, tfName, emptyVal)
+					} else if isQuoted {
+						setIngestPath(doc, tfName, "")
+					}
+					continue
+				}
+				setIngestPath(doc, tfName, cell)
+			}
+			mutated = true
 		}
 	case "user_agent":
 		field, _ := specMap["field"].(string)
@@ -5790,168 +6715,168 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			target = expandIngestFieldName(tf, doc)
 		}
 		if field != "" {
-			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				uaStr := fmt.Sprintf("%v", val)
-				extractUATokenVersion := func(s, prefix string) string {
-					idx := strings.Index(s, prefix)
-					if idx < 0 {
-						return ""
-					}
-					rem := s[idx+len(prefix):]
-					end := 0
-					for end < len(rem) && ((rem[end] >= '0' && rem[end] <= '9') || rem[end] == '.' || rem[end] == '_') {
-						end++
-					}
-					return strings.Trim(strings.ReplaceAll(rem[:end], "_", "."), ".")
-				}
-				uaMap := map[string]any{
-					"original": uaStr,
-					"name":     "Other",
-					"os":       map[string]any{"name": "Other"},
-					"device":   map[string]any{"name": "Other"},
-				}
-				var browserVer string
-				switch {
-				case strings.Contains(uaStr, "Edg/"):
-					uaMap["name"] = "Edge"
-					browserVer = extractUATokenVersion(uaStr, "Edg/")
-				case strings.Contains(uaStr, "Chrome/"):
-					uaMap["name"] = "Chrome"
-					browserVer = extractUATokenVersion(uaStr, "Chrome/")
-				case strings.Contains(uaStr, "Firefox/"):
-					uaMap["name"] = "Firefox"
-					browserVer = extractUATokenVersion(uaStr, "Firefox/")
-				case strings.Contains(uaStr, "Safari/") && !strings.Contains(uaStr, "Chrome/"):
-					uaMap["name"] = "Safari"
-					browserVer = extractUATokenVersion(uaStr, "Version/")
-					if browserVer == "" {
-						browserVer = extractUATokenVersion(uaStr, "Safari/")
-					}
-				case strings.Contains(uaStr, "curl/"):
-					uaMap["name"] = "curl"
-					browserVer = extractUATokenVersion(uaStr, "curl/")
-				}
-				if browserVer != "" {
-					uaMap["version"] = browserVer
-					vParts := strings.Split(browserVer, ".")
-					if len(vParts) >= 1 && vParts[0] != "" {
-						uaMap["major"] = vParts[0]
-					}
-					if len(vParts) >= 2 && vParts[1] != "" {
-						uaMap["minor"] = vParts[1]
-					}
-					if len(vParts) >= 3 && vParts[2] != "" {
-						uaMap["patch"] = vParts[2]
-					}
-				}
-				osMap := map[string]any{"name": "Other"}
-				var osVer string
-				switch {
-				case strings.Contains(uaStr, "iPhone") || strings.Contains(uaStr, "iPad") || strings.Contains(uaStr, "iPod"):
-					osMap["name"] = "iOS"
-					if ver := extractUATokenVersion(uaStr, "OS "); ver != "" {
-						osVer = ver
-						osMap["version"] = ver
-						osMap["full"] = "iOS " + ver
-					}
-				case strings.Contains(uaStr, "Android"):
-					osMap["name"] = "Android"
-					if ver := extractUATokenVersion(uaStr, "Android "); ver != "" {
-						osVer = ver
-						osMap["version"] = ver
-						osMap["full"] = "Android " + ver
-					}
-				case strings.Contains(uaStr, "Mac OS X"):
-					osMap["name"] = "Mac OS X"
-					if ver := extractUATokenVersion(uaStr, "Mac OS X "); ver != "" {
-						osVer = ver
-						osMap["version"] = ver
-						osMap["full"] = "Mac OS X " + ver
-					}
-				case strings.Contains(uaStr, "Windows"):
-					osMap["name"] = "Windows"
-					if ver := extractUATokenVersion(uaStr, "Windows NT "); ver != "" {
-						osVer = ver
-						osMap["version"] = ver
-						osMap["full"] = "Windows " + ver
-					}
-				case strings.Contains(uaStr, "Linux"):
-					osMap["name"] = "Linux"
-				}
-				if osVer != "" {
-					osParts := strings.Split(osVer, ".")
-					if len(osParts) >= 1 && osParts[0] != "" {
-						osMap["major"] = osParts[0]
-					}
-					if len(osParts) >= 2 && osParts[1] != "" {
-						osMap["minor"] = osParts[1]
-					}
-					if len(osParts) >= 3 && osParts[2] != "" {
-						osMap["patch"] = osParts[2]
-					}
-				}
-				uaMap["os"] = osMap
-				switch {
-				case strings.Contains(uaStr, "iPhone"):
-					uaMap["device"] = map[string]any{"name": "iPhone"}
-				case strings.Contains(uaStr, "iPad"):
-					uaMap["device"] = map[string]any{"name": "iPad"}
-				case strings.Contains(uaStr, "Macintosh"):
-					uaMap["device"] = map[string]any{"name": "Mac"}
-				}
-				if propsAny, ok := specMap["properties"].([]any); ok && len(propsAny) > 0 {
-					allowed := make(map[string]bool, len(propsAny))
-					for _, p := range propsAny {
-						if ps, ok := p.(string); ok && strings.TrimSpace(ps) != "" {
-							allowed[strings.ToLower(strings.TrimSpace(ps))] = true
-						}
-					}
-					filtered := make(map[string]any)
-					if allowed["original"] {
-						filtered["original"] = uaMap["original"]
-					}
-					if allowed["name"] {
-						filtered["name"] = uaMap["name"]
-					}
-					if allowed["version"] && uaMap["version"] != nil {
-						filtered["version"] = uaMap["version"]
-					}
-					if allowed["major"] && uaMap["major"] != nil {
-						filtered["major"] = uaMap["major"]
-					}
-					if allowed["minor"] && uaMap["minor"] != nil {
-						filtered["minor"] = uaMap["minor"]
-					}
-					if allowed["patch"] && uaMap["patch"] != nil {
-						filtered["patch"] = uaMap["patch"]
-					}
-					if allowed["device"] {
-						filtered["device"] = uaMap["device"]
-					}
-					if allowed["os"] {
-						filtered["os"] = osMap
-					} else if allowed["os_name"] || allowed["os_major"] || allowed["os_minor"] {
-						subOS := make(map[string]any)
-						if allowed["os_name"] && osMap["name"] != nil {
-							subOS["name"] = osMap["name"]
-						}
-						if allowed["os_major"] && osMap["major"] != nil {
-							subOS["major"] = osMap["major"]
-						}
-						if allowed["os_minor"] && osMap["minor"] != nil {
-							subOS["minor"] = osMap["minor"]
-						}
-						if len(subOS) > 0 {
-							filtered["os"] = subOS
-						}
-					}
-					uaMap = filtered
-				}
-				setIngestPath(doc, target, uaMap)
-				mutated = true
-			} else if isExplicitIgnoreMissingFalse(specMap) {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
 			}
+			uaStr := fmt.Sprintf("%v", val)
+			extractUATokenVersion := func(s, prefix string) string {
+				idx := strings.Index(s, prefix)
+				if idx < 0 {
+					return ""
+				}
+				rem := s[idx+len(prefix):]
+				end := 0
+				for end < len(rem) && ((rem[end] >= '0' && rem[end] <= '9') || rem[end] == '.' || rem[end] == '_') {
+					end++
+				}
+				return strings.Trim(strings.ReplaceAll(rem[:end], "_", "."), ".")
+			}
+			uaMap := map[string]any{
+				"original": uaStr,
+				"name":     "Other",
+				"os":       map[string]any{"name": "Other"},
+				"device":   map[string]any{"name": "Other"},
+			}
+			var browserVer string
+			switch {
+			case strings.Contains(uaStr, "Edg/"):
+				uaMap["name"] = "Edge"
+				browserVer = extractUATokenVersion(uaStr, "Edg/")
+			case strings.Contains(uaStr, "Chrome/"):
+				uaMap["name"] = "Chrome"
+				browserVer = extractUATokenVersion(uaStr, "Chrome/")
+			case strings.Contains(uaStr, "Firefox/"):
+				uaMap["name"] = "Firefox"
+				browserVer = extractUATokenVersion(uaStr, "Firefox/")
+			case strings.Contains(uaStr, "Safari/") && !strings.Contains(uaStr, "Chrome/"):
+				uaMap["name"] = "Safari"
+				browserVer = extractUATokenVersion(uaStr, "Version/")
+				if browserVer == "" {
+					browserVer = extractUATokenVersion(uaStr, "Safari/")
+				}
+			case strings.Contains(uaStr, "curl/"):
+				uaMap["name"] = "curl"
+				browserVer = extractUATokenVersion(uaStr, "curl/")
+			}
+			if browserVer != "" {
+				uaMap["version"] = browserVer
+				vParts := strings.Split(browserVer, ".")
+				if len(vParts) >= 1 && vParts[0] != "" {
+					uaMap["major"] = vParts[0]
+				}
+				if len(vParts) >= 2 && vParts[1] != "" {
+					uaMap["minor"] = vParts[1]
+				}
+				if len(vParts) >= 3 && vParts[2] != "" {
+					uaMap["patch"] = vParts[2]
+				}
+			}
+			osMap := map[string]any{"name": "Other"}
+			var osVer string
+			switch {
+			case strings.Contains(uaStr, "iPhone") || strings.Contains(uaStr, "iPad") || strings.Contains(uaStr, "iPod"):
+				osMap["name"] = "iOS"
+				if ver := extractUATokenVersion(uaStr, "OS "); ver != "" {
+					osVer = ver
+					osMap["version"] = ver
+					osMap["full"] = "iOS " + ver
+				}
+			case strings.Contains(uaStr, "Android"):
+				osMap["name"] = "Android"
+				if ver := extractUATokenVersion(uaStr, "Android "); ver != "" {
+					osVer = ver
+					osMap["version"] = ver
+					osMap["full"] = "Android " + ver
+				}
+			case strings.Contains(uaStr, "Mac OS X"):
+				osMap["name"] = "Mac OS X"
+				if ver := extractUATokenVersion(uaStr, "Mac OS X "); ver != "" {
+					osVer = ver
+					osMap["version"] = ver
+					osMap["full"] = "Mac OS X " + ver
+				}
+			case strings.Contains(uaStr, "Windows"):
+				osMap["name"] = "Windows"
+				if ver := extractUATokenVersion(uaStr, "Windows NT "); ver != "" {
+					osVer = ver
+					osMap["version"] = ver
+					osMap["full"] = "Windows " + ver
+				}
+			case strings.Contains(uaStr, "Linux"):
+				osMap["name"] = "Linux"
+			}
+			if osVer != "" {
+				osParts := strings.Split(osVer, ".")
+				if len(osParts) >= 1 && osParts[0] != "" {
+					osMap["major"] = osParts[0]
+				}
+				if len(osParts) >= 2 && osParts[1] != "" {
+					osMap["minor"] = osParts[1]
+				}
+				if len(osParts) >= 3 && osParts[2] != "" {
+					osMap["patch"] = osParts[2]
+				}
+			}
+			uaMap["os"] = osMap
+			switch {
+			case strings.Contains(uaStr, "iPhone"):
+				uaMap["device"] = map[string]any{"name": "iPhone"}
+			case strings.Contains(uaStr, "iPad"):
+				uaMap["device"] = map[string]any{"name": "iPad"}
+			case strings.Contains(uaStr, "Macintosh"):
+				uaMap["device"] = map[string]any{"name": "Mac"}
+			}
+			if propsAny, ok := specMap["properties"].([]any); ok && len(propsAny) > 0 {
+				allowed := make(map[string]bool, len(propsAny))
+				for _, p := range propsAny {
+					if ps, ok := p.(string); ok && strings.TrimSpace(ps) != "" {
+						allowed[strings.ToLower(strings.TrimSpace(ps))] = true
+					}
+				}
+				filtered := make(map[string]any)
+				if allowed["original"] {
+					filtered["original"] = uaMap["original"]
+				}
+				if allowed["name"] {
+					filtered["name"] = uaMap["name"]
+				}
+				if allowed["version"] && uaMap["version"] != nil {
+					filtered["version"] = uaMap["version"]
+				}
+				if allowed["major"] && uaMap["major"] != nil {
+					filtered["major"] = uaMap["major"]
+				}
+				if allowed["minor"] && uaMap["minor"] != nil {
+					filtered["minor"] = uaMap["minor"]
+				}
+				if allowed["patch"] && uaMap["patch"] != nil {
+					filtered["patch"] = uaMap["patch"]
+				}
+				if allowed["device"] {
+					filtered["device"] = uaMap["device"]
+				}
+				if allowed["os"] {
+					filtered["os"] = osMap
+				} else if allowed["os_name"] || allowed["os_major"] || allowed["os_minor"] {
+					subOS := make(map[string]any)
+					if allowed["os_name"] && osMap["name"] != nil {
+						subOS["name"] = osMap["name"]
+					}
+					if allowed["os_major"] && osMap["major"] != nil {
+						subOS["major"] = osMap["major"]
+					}
+					if allowed["os_minor"] && osMap["minor"] != nil {
+						subOS["minor"] = osMap["minor"]
+					}
+					if len(subOS) > 0 {
+						filtered["os"] = subOS
+					}
+				}
+				uaMap = filtered
+			}
+			setIngestPath(doc, target, uaMap)
+			mutated = true
 		}
 	case "uri_parts":
 		field, _ := specMap["field"].(string)
@@ -5965,108 +6890,110 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			keepOrig = ko
 		}
 		removeIfSuccess, _ := specMap["remove_if_successful"].(bool)
-		ignoreMissing, _ := specMap["ignore_missing"].(bool)
 		if field != "" {
-			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				rawURI, isStr := val.(string)
-				if !isStr {
-					return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
+			}
+			rawURI, isStr := val.(string)
+			if !isStr {
+				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
+			}
+			parseInput := rawURI
+			syntheticScheme := false
+			if !strings.Contains(rawURI, "://") {
+				slashIdx := strings.IndexByte(rawURI, '/')
+				authority := rawURI
+				if slashIdx >= 0 {
+					authority = rawURI[:slashIdx]
 				}
-				parseInput := rawURI
-				syntheticScheme := false
-				if !strings.Contains(rawURI, "://") {
-					slashIdx := strings.IndexByte(rawURI, '/')
-					authority := rawURI
-					if slashIdx >= 0 {
-						authority = rawURI[:slashIdx]
-					}
-					opaqueScheme := false
-					if cIdx := strings.IndexByte(rawURI, ':'); cIdx > 0 {
-						switch strings.ToLower(rawURI[:cIdx]) {
-						case "mailto", "urn", "tel", "data", "sip", "sips", "xmpp", "news", "about", "javascript", "magnet", "geo", "sms", "blob":
-							opaqueScheme = true
-						}
-					}
-					if !opaqueScheme {
-						if strings.Contains(authority, "@") {
-							parseInput = "http://" + rawURI
-							syntheticScheme = true
-						} else if colonIdx := strings.IndexByte(authority, ':'); colonIdx > 0 && colonIdx+1 < len(authority) && authority[colonIdx+1] >= '0' && authority[colonIdx+1] <= '9' {
-							parseInput = "http://" + rawURI
-							syntheticScheme = true
-						}
+				opaqueScheme := false
+				if cIdx := strings.IndexByte(rawURI, ':'); cIdx > 0 {
+					switch strings.ToLower(rawURI[:cIdx]) {
+					case "mailto", "urn", "tel", "data", "sip", "sips", "xmpp", "news", "about", "javascript", "magnet", "geo", "sms", "blob":
+						opaqueScheme = true
 					}
 				}
-				u, err := url.Parse(parseInput)
-				if err != nil {
-					return false, false, procType, procTag, specMap, err
-				}
-				if syntheticScheme {
-					u.Scheme = ""
-				}
-				parts := map[string]any{}
-				if keepOrig {
-					parts["original"] = rawURI
-				}
-				if u.Scheme != "" {
-					parts["scheme"] = u.Scheme
-				}
-				if h := u.Hostname(); h != "" {
-					parts["domain"] = h
-				}
-				if p := u.Port(); p != "" {
-					if pInt, err := strconv.Atoi(p); err == nil {
-						parts["port"] = pInt
+				if !opaqueScheme {
+					if strings.Contains(authority, "@") {
+						parseInput = "http://" + rawURI
+						syntheticScheme = true
+					} else if colonIdx := strings.IndexByte(authority, ':'); colonIdx > 0 && colonIdx+1 < len(authority) && authority[colonIdx+1] >= '0' && authority[colonIdx+1] <= '9' {
+						parseInput = "http://" + rawURI
+						syntheticScheme = true
 					}
 				}
-				if u.Path != "" {
-					parts["path"] = u.Path
-					lastSlash := strings.LastIndexByte(u.Path, '/')
-					if dotIdx := strings.LastIndexByte(u.Path, '.'); dotIdx > lastSlash+1 && dotIdx+1 < len(u.Path) {
-						parts["extension"] = u.Path[dotIdx+1:]
-					}
-				} else if u.Opaque != "" {
-					parts["path"] = u.Opaque
-					if strings.EqualFold(u.Scheme, "mailto") {
-						if atIdx := strings.IndexByte(u.Opaque, '@'); atIdx > 0 && atIdx+1 < len(u.Opaque) {
-							parts["username"] = u.Opaque[:atIdx]
-							parts["domain"] = u.Opaque[atIdx+1:]
-						}
+			}
+			u, err := url.Parse(parseInput)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
+			if syntheticScheme {
+				u.Scheme = ""
+			}
+			parts := map[string]any{}
+			if keepOrig {
+				parts["original"] = rawURI
+			}
+			if u.Scheme != "" {
+				parts["scheme"] = u.Scheme
+			}
+			if h := u.Hostname(); h != "" {
+				parts["domain"] = h
+			}
+			if p := u.Port(); p != "" {
+				if pInt, err := strconv.Atoi(p); err == nil {
+					parts["port"] = pInt
+				}
+			}
+			if u.Path != "" {
+				parts["path"] = u.Path
+				lastSlash := strings.LastIndexByte(u.Path, '/')
+				if dotIdx := strings.LastIndexByte(u.Path, '.'); dotIdx > lastSlash+1 && dotIdx+1 < len(u.Path) {
+					parts["extension"] = u.Path[dotIdx+1:]
+				}
+			} else if u.Opaque != "" {
+				parts["path"] = u.Opaque
+				if strings.EqualFold(u.Scheme, "mailto") {
+					if atIdx := strings.IndexByte(u.Opaque, '@'); atIdx > 0 && atIdx+1 < len(u.Opaque) {
+						parts["username"] = u.Opaque[:atIdx]
+						parts["domain"] = u.Opaque[atIdx+1:]
 					}
 				}
-				if u.RawQuery != "" {
-					parts["query"] = u.RawQuery
+			}
+			if u.RawQuery != "" {
+				parts["query"] = u.RawQuery
+			}
+			if u.Fragment != "" {
+				parts["fragment"] = u.Fragment
+			}
+			if u.User != nil {
+				if ui := u.User.String(); ui != "" {
+					parts["user_info"] = ui
 				}
-				if u.Fragment != "" {
-					parts["fragment"] = u.Fragment
+				if un := u.User.Username(); un != "" {
+					parts["username"] = un
 				}
-				if u.User != nil {
-					if un := u.User.Username(); un != "" {
-						parts["username"] = un
+				if pw, ok := u.User.Password(); ok {
+					parts["password"] = pw
+				}
+			}
+			if removeIfSuccess && field != target {
+				deleteIngestPath(doc, field)
+			}
+			if existingVal, hasExisting := getIngestPath(doc, target); hasExisting {
+				if existingMap, ok := existingVal.(map[string]any); ok && existingMap != nil {
+					for k, v := range parts {
+						existingMap[k] = v
 					}
-					if pw, ok := u.User.Password(); ok {
-						parts["password"] = pw
-					}
-				}
-				if removeIfSuccess && field != target {
-					deleteIngestPath(doc, field)
-				}
-				if existingVal, hasExisting := getIngestPath(doc, target); hasExisting {
-					if existingMap, ok := existingVal.(map[string]any); ok && existingMap != nil {
-						for k, v := range parts {
-							existingMap[k] = v
-						}
-						setIngestPath(doc, target, existingMap)
-					} else {
-						setIngestPath(doc, target, parts)
-					}
+					setIngestPath(doc, target, existingMap)
 				} else {
 					setIngestPath(doc, target, parts)
 				}
-				mutated = true
-			} else if !ignoreMissing {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+			} else {
+				setIngestPath(doc, target, parts)
 			}
+			mutated = true
 		}
 	case "registered_domain":
 		field, _ := specMap["field"].(string)
@@ -6075,47 +7002,46 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		if tf, _ := specMap["target_field"].(string); tf != "" {
 			target = expandIngestFieldName(tf, doc)
 		}
-		ignoreMissing, _ := specMap["ignore_missing"].(bool)
 		if field != "" {
-			if val, exists := getIngestPath(doc, field); exists && val != nil {
-				fqdn := strings.TrimRight(strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", val))), ".")
-				labels := strings.Split(fqdn, ".")
-				out := map[string]any{"domain": fqdn}
-				isIP := net.ParseIP(strings.Trim(fqdn, "[]")) != nil
-				isSecondLevelPublicSuffix := func(sld string) bool {
-					switch sld {
-					case "co", "com", "org", "gov", "govt", "ac", "net", "edu", "mil",
-						"or", "ne", "go", "ed", "gr", "lg", "gob", "nom", "ind",
-						"res", "ernet", "nic", "gen", "biz", "info", "per", "id", "asn", "me",
-						"sch", "nhs", "police", "mod", "ltd", "plc", "geek", "kiwi", "maori", "iwi", "cri", "health":
-						return true
-					}
-					return false
-				}
-				if !isIP && len(labels) >= 2 && labels[0] != "" && labels[len(labels)-1] != "" {
-					tld := labels[len(labels)-1]
-					if len(labels) == 2 && len(tld) == 2 && len(labels[0]) <= 5 && isSecondLevelPublicSuffix(labels[0]) {
-						out["top_level_domain"] = labels[0] + "." + tld
-					} else {
-						regDom := labels[len(labels)-2] + "." + tld
-						if len(labels) >= 3 && len(tld) == 2 && len(labels[len(labels)-2]) <= 5 && isSecondLevelPublicSuffix(labels[len(labels)-2]) {
-							tld = labels[len(labels)-2] + "." + labels[len(labels)-1]
-							regDom = labels[len(labels)-3] + "." + tld
-							if len(labels) > 3 {
-								out["subdomain"] = strings.Join(labels[:len(labels)-3], ".")
-							}
-						} else if len(labels) > 2 {
-							out["subdomain"] = strings.Join(labels[:len(labels)-2], ".")
-						}
-						out["top_level_domain"] = tld
-						out["registered_domain"] = regDom
-					}
-				}
-				setIngestPath(doc, target, out)
-				mutated = true
-			} else if !ignoreMissing {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
+			val, exists := getIngestPath(doc, field)
+			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+				return false, false, procType, procTag, specMap, err
 			}
+			fqdn := strings.TrimRight(strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", val))), ".")
+			labels := strings.Split(fqdn, ".")
+			out := map[string]any{"domain": fqdn}
+			isIP := net.ParseIP(strings.Trim(fqdn, "[]")) != nil
+			isSecondLevelPublicSuffix := func(sld string) bool {
+				switch sld {
+				case "co", "com", "org", "gov", "govt", "ac", "net", "edu", "mil",
+					"or", "ne", "go", "ed", "gr", "lg", "gob", "nom", "ind",
+					"res", "ernet", "nic", "gen", "biz", "info", "per", "id", "asn", "me",
+					"sch", "nhs", "police", "mod", "ltd", "plc", "geek", "kiwi", "maori", "iwi", "cri", "health":
+					return true
+				}
+				return false
+			}
+			if !isIP && len(labels) >= 2 && labels[0] != "" && labels[len(labels)-1] != "" {
+				tld := labels[len(labels)-1]
+				if len(labels) == 2 && len(tld) == 2 && len(labels[0]) <= 5 && isSecondLevelPublicSuffix(labels[0]) {
+					out["top_level_domain"] = labels[0] + "." + tld
+				} else {
+					regDom := labels[len(labels)-2] + "." + tld
+					if len(labels) >= 3 && len(tld) == 2 && len(labels[len(labels)-2]) <= 5 && isSecondLevelPublicSuffix(labels[len(labels)-2]) {
+						tld = labels[len(labels)-2] + "." + labels[len(labels)-1]
+						regDom = labels[len(labels)-3] + "." + tld
+						if len(labels) > 3 {
+							out["subdomain"] = strings.Join(labels[:len(labels)-3], ".")
+						}
+					} else if len(labels) > 2 {
+						out["subdomain"] = strings.Join(labels[:len(labels)-2], ".")
+					}
+					out["top_level_domain"] = tld
+					out["registered_domain"] = regDom
+				}
+			}
+			setIngestPath(doc, target, out)
+			mutated = true
 		}
 	case "network_direction":
 		m, err := executeNetworkDirectionProcessor(doc, specMap)
@@ -6371,6 +7297,17 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					if !hadUserRouting {
 						continue
 					}
+				case "_ingest":
+					if ingMap, ok := v.(map[string]any); ok {
+						ingCopy := make(map[string]any, len(ingMap))
+						for ik, iv := range ingMap {
+							if ik != "pipeline" {
+								ingCopy[ik] = iv
+							}
+						}
+						cleanDoc[k] = ingCopy
+						continue
+					}
 				}
 				cleanDoc[k] = v
 			}
@@ -6440,6 +7377,12 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					}
 					if target["_ingest"] == nil && savedIngestMeta != nil {
 						target["_ingest"] = savedIngestMeta
+					} else if savedMap, ok := savedIngestMeta.(map[string]any); ok {
+						if curMap, ok2 := target["_ingest"].(map[string]any); ok2 {
+							if pipeName, hasPipe := savedMap["pipeline"]; hasPipe {
+								curMap["pipeline"] = pipeName
+							}
+						}
 					}
 					return metaChanged
 				}
@@ -6556,12 +7499,8 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			errorDist = 10.0
 		}
 		val, exists := getIngestPath(doc, field)
-		if !exists || val == nil {
-			ignoreMissing, _ := specMap["ignore_missing"].(bool)
-			if !ignoreMissing {
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is missing", field)
-			}
-			return false, false, procType, procTag, specMap, nil
+		if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
+			return false, false, procType, procTag, specMap, err
 		}
 		polyVal, err := convertIngestCircleToPolygon(val, shapeType, errorDist)
 		if err != nil {
@@ -6881,12 +7820,75 @@ func snapshotIngestDoc(doc map[string]any) map[string]any {
 	return cp
 }
 
+func ingestProcessorStepErrorTypeRound60(s *Server, procType string, procErr error, doc map[string]any, depth int) string {
+	if procErr == nil {
+		return ""
+	}
+	msg := procErr.Error()
+	if strings.Contains(msg, "Cycle detected for pipeline:") {
+		if om, ok := doc["__internal_ingest_orig"].(map[string]any); ok && om != nil {
+			if isES8, okB := om["_is_es8_mode"].(bool); okB {
+				if isES8 {
+					return "graph_structure_exception"
+				}
+				return "illegal_state_exception"
+			}
+		}
+		if s != nil && s.isES8Mode(nil) {
+			return "graph_structure_exception"
+		}
+		return "illegal_state_exception"
+	}
+	if strings.HasPrefix(msg, "Pipeline processor configured for non-existent pipeline [") {
+		if om, ok := doc["__internal_ingest_orig"].(map[string]any); ok && om != nil {
+			if inlineSim, _ := om["_inline_sim_pipeline"].(bool); inlineSim && depth == 0 {
+				return "illegal_argument_exception"
+			}
+		}
+		return "illegal_state_exception"
+	}
+	if procType == "fail" {
+		return "fail_processor_exception"
+	}
+	if strings.Contains(msg, "illegal_state_exception") {
+		return "illegal_state_exception"
+	}
+	return "illegal_argument_exception"
+}
+
 func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth int, trace *[]map[string]any) (bool, bool, error) {
 	mutated := false
 	for _, p := range procs {
 		pMap, ok := p.(map[string]any)
 		if !ok {
 			continue
+		}
+		procType, procTag, procDesc, ifCond, hasIf, specMap := extractIngestProcessorSpecRound60(pMap)
+		if procType == "" || specMap == nil {
+			continue
+		}
+		if hasIf {
+			condRes := evalIngestIfCondition(ifCond, doc)
+			if !condRes {
+				if trace != nil {
+					skipEntry := map[string]any{
+						"processor_type": procType,
+						"status":         "skipped",
+						"if": map[string]any{
+							"condition": ifCond,
+							"result":    false,
+						},
+					}
+					if procTag != "" {
+						skipEntry["tag"] = procTag
+					}
+					if procDesc != "" {
+						skipEntry["description"] = procDesc
+					}
+					*trace = append(*trace, skipEntry)
+				}
+				continue
+			}
 		}
 		var prevMsg, prevType, prevTag, prevPipe any
 		var hadPrevMsg, hadPrevType, hadPrevTag, hadPrevPipe bool
@@ -6915,68 +7917,62 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 				delete(curIngest, "_key")
 			}
 		}
+		ignoreFail, _ := specMap["ignore_failure"].(bool)
+		if !ignoreFail {
+			ignoreFail, _ = pMap["ignore_failure"].(bool)
+		}
 		traceLenBefore := 0
 		if trace != nil {
 			traceLenBefore = len(*trace)
 		}
-		m, dropped, procType, procTag, specMap, procErr := executeSingleIngestProcessor(s, doc, pMap, depth, trace)
+		m, dropped, _, _, _, procErr := executeSingleIngestProcessor(s, doc, pMap, depth, trace)
 		if m {
 			mutated = true
 		}
-		if trace != nil && procType != "" && (procType != "pipeline" || (procErr != nil && len(*trace) == traceLenBefore)) {
+		if trace != nil && procType != "" && (procType != "pipeline" || len(*trace) == traceLenBefore) {
 			entry := map[string]any{
 				"processor_type": procType,
 			}
 			if procTag != "" {
 				entry["tag"] = procTag
 			}
+			if procDesc != "" {
+				entry["description"] = procDesc
+			}
+			if hasIf {
+				entry["if"] = map[string]any{
+					"condition": ifCond,
+					"result":    true,
+				}
+			}
 			if procErr != nil {
-				entry["status"] = "error"
-				entry["error"] = map[string]any{
-					"type":   "illegal_argument_exception",
-					"reason": procErr.Error(),
+				stepErrType := ingestProcessorStepErrorTypeRound60(s, procType, procErr, doc, depth)
+				errReason := cleanIngestErrorReasonRound60(procErr.Error())
+				errObj := map[string]any{
+					"root_cause": []map[string]any{
+						{
+							"type":   stepErrType,
+							"reason": errReason,
+						},
+					},
+					"type":   stepErrType,
+					"reason": errReason,
+				}
+				if ignoreFail {
+					entry["status"] = "error_ignored"
+					entry["doc"] = buildVerboseTraceEntryDocRound60(doc)
+					entry["ignored_error"] = map[string]any{
+						"error": errObj,
+					}
+				} else {
+					entry["status"] = "error"
+					entry["error"] = errObj
 				}
 			} else if dropped {
 				entry["status"] = "dropped"
 			} else {
-				stepIdx := "_index"
-				if v, ok := doc["_index"].(string); ok && v != "" {
-					stepIdx = v
-				}
-				stepID := "0"
-				if v, ok := doc["_id"]; ok && v != nil {
-					if sv := fmt.Sprintf("%v", v); sv != "" {
-						stepID = sv
-					}
-				}
-				stepTS := ""
-				if ingMap, ok := doc["_ingest"].(map[string]any); ok {
-					if ts, ok := ingMap["timestamp"].(string); ok {
-						stepTS = ts
-					} else if tsAny, ok := ingMap["timestamp"]; ok && tsAny != nil {
-						stepTS = fmt.Sprintf("%v", tsAny)
-					}
-				}
 				entry["status"] = "success"
-				entryDoc := map[string]any{
-					"_index":   stepIdx,
-					"_version": "-3",
-					"_id":      stepID,
-					"_source":  snapshotIngestDoc(doc),
-				}
-				if ingMap, ok := doc["_ingest"].(map[string]any); ok && len(ingMap) > 0 {
-					stepIngest := make(map[string]any, len(ingMap))
-					for k, v := range ingMap {
-						stepIngest[k] = v
-					}
-					if stepTS != "" {
-						stepIngest["timestamp"] = stepTS
-					}
-					entryDoc["_ingest"] = stepIngest
-				} else if stepTS != "" {
-					entryDoc["_ingest"] = map[string]any{"timestamp": stepTS}
-				}
-				entry["doc"] = entryDoc
+				entry["doc"] = buildVerboseTraceEntryDocRound60(doc)
 			}
 			*trace = append(*trace, entry)
 		}
@@ -6999,10 +7995,6 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 			activePipeName := ""
 			if om, ok := doc["__internal_ingest_orig"].(map[string]any); ok && om != nil {
 				activePipeName, _ = om["_active_pipeline"].(string)
-			}
-			ignoreFail, _ := specMap["ignore_failure"].(bool)
-			if !ignoreFail {
-				ignoreFail, _ = pMap["ignore_failure"].(bool)
 			}
 			if ignoreFail {
 				if curIngest, ok := doc["_ingest"].(map[string]any); ok {
@@ -7044,7 +8036,7 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 				curType, hasCurType := ingestMeta["on_failure_processor_type"]
 				curTag := ingestMeta["on_failure_processor_tag"]
 				innerUpdated := hasCurType && (!hadPrevType || curType != prevType || curTag != prevTag)
-				ingestMeta["on_failure_message"] = procErr.Error()
+				ingestMeta["on_failure_message"] = cleanIngestErrorReasonRound60(procErr.Error())
 				if (procType != "pipeline" && procType != "foreach") || !innerUpdated {
 					ingestMeta["on_failure_processor_type"] = procType
 					ingestMeta["on_failure_processor_tag"] = procTag
@@ -7117,7 +8109,7 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 			curType, hasCurType := ingestMeta["on_failure_processor_type"]
 			curTag := ingestMeta["on_failure_processor_tag"]
 			innerUpdated := hasCurType && (!hadPrevType || curType != prevType || curTag != prevTag)
-			ingestMeta["on_failure_message"] = procErr.Error()
+			ingestMeta["on_failure_message"] = cleanIngestErrorReasonRound60(procErr.Error())
 			if (procType != "pipeline" && procType != "foreach") || !innerUpdated {
 				if procType != "" {
 					ingestMeta["on_failure_processor_type"] = procType
@@ -7135,21 +8127,41 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 }
 
 func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[string]any, pipelineName, indexName, docID, initialRouting string, raw json.RawMessage, verbose bool, initialIngestMeta map[string]any) (json.RawMessage, string, string, string, string, bool, []map[string]any, map[string]any, error) {
+	cloneInitialMeta := func() map[string]any {
+		if len(initialIngestMeta) == 0 {
+			return nil
+		}
+		out := make(map[string]any, len(initialIngestMeta))
+		for k, v := range initialIngestMeta {
+			if k == "_subst_pipes" || k == "_inline_sim_pipeline" || k == "_is_es8_mode" || k == "pipeline" {
+				continue
+			}
+			out[k] = v
+		}
+		return out
+	}
 	if pipe == nil || len(bytes.TrimSpace(raw)) == 0 {
-		return raw, indexName, docID, "", initialRouting, false, nil, initialIngestMeta, nil
+		return raw, indexName, docID, "", initialRouting, false, nil, cloneInitialMeta(), nil
 	}
 	procs, _ := pipe["processors"].([]any)
 	if len(procs) == 0 {
-		if verbose {
-			return raw, indexName, docID, "", initialRouting, false, []map[string]any{}, initialIngestMeta, nil
+		outMeta := cloneInitialMeta()
+		if outMeta == nil {
+			outMeta = map[string]any{"timestamp": time.Now().UTC().Format(time.RFC3339Nano)}
+		} else if _, hasTS := outMeta["timestamp"]; !hasTS {
+			outMeta["timestamp"] = time.Now().UTC().Format(time.RFC3339Nano)
 		}
-		return raw, indexName, docID, "", initialRouting, false, nil, initialIngestMeta, nil
+		tsStr, _ := outMeta["timestamp"].(string)
+		if verbose {
+			return raw, indexName, docID, tsStr, initialRouting, false, []map[string]any{}, outMeta, nil
+		}
+		return raw, indexName, docID, tsStr, initialRouting, false, nil, outMeta, nil
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	var doc map[string]any
 	if err := dec.Decode(&doc); err != nil || doc == nil {
-		return raw, indexName, docID, "", initialRouting, false, nil, initialIngestMeta, err
+		return raw, indexName, docID, "", initialRouting, false, nil, cloneInitialMeta(), err
 	}
 	origIndexVal, hadOrigIndex := doc["_index"]
 	origIDVal, hadOrigID := doc["_id"]
@@ -7174,25 +8186,86 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 	if ingestMeta == nil {
 		ingestMeta = make(map[string]any)
 	}
+	var seedExecPipes []string
+	var seedSubstPipes map[string]map[string]any
+	var seedInlineSim bool
+	var seedHasES8 bool
+	var seedES8Mode bool
 	for k, v := range initialIngestMeta {
-		if _, exists := ingestMeta[k]; !exists {
-			ingestMeta[k] = v
+		switch k {
+		case "__executed_pipelines":
+			if sp, ok := v.([]string); ok {
+				seedExecPipes = append([]string(nil), sp...)
+			}
+		case "_subst_pipes":
+			seedSubstPipes, _ = v.(map[string]map[string]any)
+		case "_inline_sim_pipeline":
+			seedInlineSim, _ = v.(bool)
+		case "_is_es8_mode":
+			seedES8Mode, seedHasES8 = v.(bool)
+		default:
+			if _, exists := ingestMeta[k]; !exists {
+				ingestMeta[k] = v
+			}
 		}
 	}
+	delete(ingestMeta, "__executed_pipelines")
+	delete(ingestMeta, "_subst_pipes")
+	delete(ingestMeta, "_inline_sim_pipeline")
+	delete(ingestMeta, "_is_es8_mode")
 	if _, hasTS := ingestMeta["timestamp"]; !hasTS {
 		ingestMeta["timestamp"] = time.Now().UTC().Format(time.RFC3339Nano)
 	}
+	if pipelineName != "" {
+		ingestMeta["pipeline"] = pipelineName
+	}
 	doc["_ingest"] = ingestMeta
-	doc["__internal_ingest_orig"] = map[string]any{
-		"_had_orig_index":   hadOrigIndex,
-		"_orig_index_val":   origIndexVal,
-		"_had_orig_id":      hadOrigID,
-		"_orig_id_val":      origIDVal,
-		"_had_orig_routing": hadOrigRouting,
-		"_orig_routing_val": origRoutingVal,
-		"_had_orig_version": hadOrigVersion,
-		"_orig_version_val": origVersionVal,
-		"_active_pipeline":  pipelineName,
+	var initStack []string
+	if pipelineName != "" {
+		initStack = []string{pipelineName}
+	}
+	origMeta := map[string]any{
+		"_had_orig_index":      hadOrigIndex,
+		"_orig_index_val":      origIndexVal,
+		"_had_orig_id":         hadOrigID,
+		"_orig_id_val":         origIDVal,
+		"_had_orig_routing":    hadOrigRouting,
+		"_orig_routing_val":    origRoutingVal,
+		"_had_orig_version":    hadOrigVersion,
+		"_orig_version_val":    origVersionVal,
+		"_active_pipeline":     pipelineName,
+		"_pipeline_stack":      initStack,
+		"_executed_pipelines":  seedExecPipes,
+		"_subst_pipes":         seedSubstPipes,
+		"_inline_sim_pipeline": seedInlineSim,
+	}
+	if seedHasES8 {
+		origMeta["_is_es8_mode"] = seedES8Mode
+	}
+	doc["__internal_ingest_orig"] = origMeta
+
+	buildOutMeta := func() (map[string]any, string) {
+		outIngestMeta := make(map[string]any)
+		outIngestTS := ""
+		if curIngest, ok := doc["_ingest"].(map[string]any); ok {
+			for k, v := range curIngest {
+				if k == "pipeline" || k == "_subst_pipes" || k == "_inline_sim_pipeline" || k == "_is_es8_mode" {
+					continue
+				}
+				outIngestMeta[k] = v
+			}
+			if ts, ok := curIngest["timestamp"].(string); ok {
+				outIngestTS = ts
+			} else if tsAny, ok := curIngest["timestamp"]; ok && tsAny != nil {
+				outIngestTS = fmt.Sprintf("%v", tsAny)
+			}
+		}
+		if om, ok := doc["__internal_ingest_orig"].(map[string]any); ok && om != nil {
+			if ep, okE := om["_executed_pipelines"].([]string); okE && len(ep) > 0 {
+				outIngestMeta["__executed_pipelines"] = append([]string(nil), ep...)
+			}
+		}
+		return outIngestMeta, outIngestTS
 	}
 
 	var trace []map[string]any
@@ -7204,7 +8277,9 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 	mutated, dropped, procErr := runIngestProcessorList(s, doc, procs, 0, tracePtr)
 	delete(doc, "__internal_ingest_rerouted")
 	if dropped {
-		return json.RawMessage(`{}`), indexName, docID, "", initialRouting, true, trace, nil, nil
+		outMeta, outTS := buildOutMeta()
+		delete(doc, "__internal_ingest_orig")
+		return json.RawMessage(`{}`), indexName, docID, outTS, initialRouting, true, trace, outMeta, nil
 	}
 	if procErr != nil {
 		if pipeOnFail, ok := pipe["on_failure"].([]any); ok && len(pipeOnFail) > 0 {
@@ -7212,21 +8287,17 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 			if ingestMeta == nil {
 				ingestMeta = make(map[string]any)
 			}
-			ingestMeta["on_failure_message"] = procErr.Error()
+			ingestMeta["on_failure_message"] = cleanIngestErrorReasonRound60(procErr.Error())
 			if _, hasFP := ingestMeta["on_failure_pipeline"]; !hasFP && pipelineName != "" {
 				ingestMeta["on_failure_pipeline"] = pipelineName
 			}
+			if pipelineName != "" {
+				ingestMeta["pipeline"] = pipelineName
+			}
 			doc["_ingest"] = ingestMeta
-			doc["__internal_ingest_orig"] = map[string]any{
-				"_had_orig_index":   hadOrigIndex,
-				"_orig_index_val":   origIndexVal,
-				"_had_orig_id":      hadOrigID,
-				"_orig_id_val":      origIDVal,
-				"_had_orig_routing": hadOrigRouting,
-				"_orig_routing_val": origRoutingVal,
-				"_had_orig_version": hadOrigVersion,
-				"_orig_version_val": origVersionVal,
-				"_active_pipeline":  pipelineName,
+			if om, ok := doc["__internal_ingest_orig"].(map[string]any); ok && om != nil {
+				om["_active_pipeline"] = pipelineName
+				om["_pipeline_stack"] = initStack
 			}
 			mutated = true
 			subMut, subDropped, subErr := runIngestProcessorList(s, doc, pipeOnFail, 1, tracePtr)
@@ -7236,7 +8307,9 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 				mutated = true
 			}
 			if subDropped {
-				return json.RawMessage(`{}`), indexName, docID, "", initialRouting, true, trace, nil, nil
+				outMeta, outTS := buildOutMeta()
+				delete(doc, "__internal_ingest_orig")
+				return json.RawMessage(`{}`), indexName, docID, outTS, initialRouting, true, trace, outMeta, nil
 			}
 			if subErr == nil {
 				if curIngest, ok := doc["_ingest"].(map[string]any); ok {
@@ -7249,8 +8322,9 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 			procErr = subErr
 		}
 		if procErr != nil {
+			outMeta, outTS := buildOutMeta()
 			delete(doc, "__internal_ingest_orig")
-			return raw, indexName, docID, "", initialRouting, false, trace, nil, procErr
+			return raw, indexName, docID, outTS, initialRouting, false, trace, outMeta, procErr
 		}
 	}
 	outIndex := indexName
@@ -7271,19 +8345,7 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 	if v, ok := doc["_routing"]; ok && v != nil {
 		outRouting = fmt.Sprintf("%v", v)
 	}
-	outIngestTS := ""
-	var outIngestMeta map[string]any
-	if curIngest, ok := doc["_ingest"].(map[string]any); ok {
-		outIngestMeta = make(map[string]any, len(curIngest))
-		for k, v := range curIngest {
-			outIngestMeta[k] = v
-		}
-		if ts, ok := curIngest["timestamp"].(string); ok {
-			outIngestTS = ts
-		} else if tsAny, ok := curIngest["timestamp"]; ok && tsAny != nil {
-			outIngestTS = fmt.Sprintf("%v", tsAny)
-		}
-	}
+	outIngestMeta, outIngestTS := buildOutMeta()
 	if hadOrigIndex {
 		doc["_index"] = origIndexVal
 	} else {
@@ -7306,6 +8368,9 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 	}
 	delete(doc, "__internal_ingest_orig")
 	delete(doc, "_ingest")
+	if err := painless.ValidateAcyclicValue(doc); err != nil {
+		return raw, outIndex, outID, outIngestTS, outRouting, false, trace, outIngestMeta, fmt.Errorf("illegal_argument_exception: %s", err.Error())
+	}
 	if !mutated {
 		return raw, outIndex, outID, outIngestTS, outRouting, false, trace, outIngestMeta, nil
 	}
@@ -7314,6 +8379,87 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 		return raw, outIndex, outID, outIngestTS, outRouting, false, trace, outIngestMeta, err
 	}
 	return json.RawMessage(out), outIndex, outID, outIngestTS, outRouting, false, trace, outIngestMeta, nil
+}
+
+func findMissingStaticSubPipelineForES7SimulateRound60(s *Server, pipe map[string]any, substPipes map[string]map[string]any) string {
+	var checkProcs func(procs []any) string
+	checkProcs = func(procs []any) string {
+		for _, p := range procs {
+			pm, ok := p.(map[string]any)
+			if !ok {
+				continue
+			}
+			for k, v := range pm {
+				switch k {
+				case "on_failure":
+					if sub, ok := v.([]any); ok {
+						if m := checkProcs(sub); m != "" {
+							return m
+						}
+					}
+				case "if", "ignore_failure", "tag", "description":
+					continue
+				case "pipeline":
+					if sm, ok := v.(map[string]any); ok {
+						ignoreMissing, _ := sm["ignore_missing_pipeline"].(bool)
+						nm, _ := sm["name"].(string)
+						nm = strings.TrimSpace(nm)
+						if !ignoreMissing && nm != "" && !strings.Contains(nm, "{{") {
+							if lookupRuntimeIngestPipelineRound60(s, nm, substPipes) == nil {
+								return nm
+							}
+						}
+						if sub, ok := sm["on_failure"].([]any); ok {
+							if m := checkProcs(sub); m != "" {
+								return m
+							}
+						}
+					}
+				case "foreach":
+					if sm, ok := v.(map[string]any); ok {
+						if sp, ok := sm["processor"].(map[string]any); ok {
+							if m := checkProcs([]any{sp}); m != "" {
+								return m
+							}
+						}
+						if sps, ok := sm["processors"].([]any); ok {
+							if m := checkProcs(sps); m != "" {
+								return m
+							}
+						}
+						if sub, ok := sm["on_failure"].([]any); ok {
+							if m := checkProcs(sub); m != "" {
+								return m
+							}
+						}
+					}
+				default:
+					if sm, ok := v.(map[string]any); ok {
+						if sub, ok := sm["on_failure"].([]any); ok {
+							if m := checkProcs(sub); m != "" {
+								return m
+							}
+						}
+					}
+				}
+			}
+		}
+		return ""
+	}
+	if pipe == nil {
+		return ""
+	}
+	if ps, ok := pipe["processors"].([]any); ok {
+		if m := checkProcs(ps); m != "" {
+			return m
+		}
+	}
+	if of, ok := pipe["on_failure"].([]any); ok {
+		if m := checkProcs(of); m != "" {
+			return m
+		}
+	}
+	return ""
 }
 
 // handleSimulateIngestPipeline implements `POST /_ingest/pipeline/_simulate` and `POST /_ingest/pipeline/{id}/_simulate`.
@@ -7326,44 +8472,181 @@ func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Req
 	if !ok {
 		return
 	}
-	var req struct {
-		Pipeline map[string]any   `json:"pipeline,omitempty"`
-		Docs     []map[string]any `json:"docs"`
-	}
+	var rawTop map[string]any
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
-		if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		dec := json.NewDecoder(bytes.NewReader(bodyBytes))
+		dec.UseNumber()
+		if err := dec.Decode(&rawTop); err != nil {
 			writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
 			return
 		}
 	}
-	pipe := req.Pipeline
-	if pipe != nil {
-		if err := validateIngestPipelineSpec(pipe); err != nil {
-			writeESError(w, http.StatusBadRequest, ingestSpecValidationErrorType(err), err.Error())
+	if rawTop == nil {
+		writeIngestConfigErrorRound60(w, r, &ingestConfigErrorRound60{
+			errType:  "parse_exception",
+			reason:   "[docs] required property is missing",
+			propName: "docs",
+		})
+		return
+	}
+	var unknownTop []string
+	for k := range rawTop {
+		switch k {
+		case "pipeline", "docs", "pipeline_substitutions":
+		default:
+			unknownTop = append(unknownTop, k)
+		}
+	}
+	if len(unknownTop) > 0 {
+		sort.Strings(unknownTop)
+		writeIngestConfigErrorRound60(w, r, &ingestConfigErrorRound60{
+			errType:  "parse_exception",
+			reason:   fmt.Sprintf("[%s] property isn't a configuration property", unknownTop[0]),
+			propName: unknownTop[0],
+		})
+		return
+	}
+	rawDocsVal, hasDocs := rawTop["docs"]
+	if !hasDocs || rawDocsVal == nil {
+		writeIngestConfigErrorRound60(w, r, &ingestConfigErrorRound60{
+			errType:  "parse_exception",
+			reason:   "[docs] required property is missing",
+			propName: "docs",
+		})
+		return
+	}
+	rawDocsArr, okDocs := rawDocsVal.([]any)
+	if !okDocs {
+		writeIngestConfigErrorRound60(w, r, &ingestConfigErrorRound60{
+			errType:  "parse_exception",
+			reason:   "[docs] property isn't a list",
+			propName: "docs",
+		})
+		return
+	}
+	docsInput := make([]map[string]any, 0, len(rawDocsArr))
+	for _, el := range rawDocsArr {
+		dm, okM := el.(map[string]any)
+		if !okM || dm == nil {
+			writeIngestConfigErrorRound60(w, r, &ingestConfigErrorRound60{
+				errType:  "parse_exception",
+				reason:   "doc must be a map",
+				propName: "docs",
+			})
 			return
 		}
-	} else {
-		if id := r.PathValue("id"); id != "" {
-			_ = s.syncCatalogFromBackend(r.Context())
-			s.mu.RLock()
-			pipe = s.pipelines[id]
-			s.mu.RUnlock()
-			if pipe == nil {
-				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "pipeline ["+id+"] is missing")
+		docsInput = append(docsInput, dm)
+	}
+
+	var substPipes map[string]map[string]any
+	if rawSubst, hasSubst := rawTop["pipeline_substitutions"]; hasSubst && rawSubst != nil {
+		sm, okS := rawSubst.(map[string]any)
+		if !okS {
+			writeIngestConfigErrorRound60(w, r, &ingestConfigErrorRound60{
+				errType:  "parse_exception",
+				reason:   "[pipeline_substitutions] property isn't a map",
+				propName: "pipeline_substitutions",
+			})
+			return
+		}
+		substPipes = make(map[string]map[string]any, len(sm))
+		for spID, spRaw := range sm {
+			spMap, okP := spRaw.(map[string]any)
+			if !okP || spMap == nil {
+				writeIngestConfigErrorRound60(w, r, &ingestConfigErrorRound60{
+					errType:  "parse_exception",
+					reason:   fmt.Sprintf("[%s] property isn't a map", spID),
+					propName: spID,
+				})
 				return
 			}
+			if err := validateIngestPipelineSpecWithIDRound60(spID, spMap); err != nil {
+				writeIngestConfigErrorRound60(w, r, err)
+				return
+			}
+			substPipes[spID] = spMap
+		}
+	}
+
+	var inlinePipe map[string]any
+	hasInlinePipe := false
+	if rawPipe, exists := rawTop["pipeline"]; exists && rawPipe != nil {
+		pm, okP := rawPipe.(map[string]any)
+		if !okP {
+			writeIngestConfigErrorRound60(w, r, &ingestConfigErrorRound60{
+				errType:  "parse_exception",
+				reason:   "[pipeline] property isn't a map",
+				propName: "pipeline",
+			})
+			return
+		}
+		if err := validateIngestPipelineSpecWithIDRound60("_simulate_pipeline", pm); err != nil {
+			writeIngestConfigErrorRound60(w, r, err)
+			return
+		}
+		inlinePipe = pm
+		hasInlinePipe = true
+	}
+
+	pathID := strings.TrimSpace(r.PathValue("id"))
+	pipe := inlinePipe
+	if pipe == nil && pathID != "" {
+		if substPipes != nil {
+			pipe = substPipes[pathID]
+		}
+		if pipe == nil {
+			_ = s.syncCatalogFromBackend(r.Context())
+			s.mu.RLock()
+			pipe = s.pipelines[pathID]
+			s.mu.RUnlock()
+		}
+		if pipe == nil {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "pipeline ["+pathID+"] is missing")
+			return
 		}
 	}
 	if pipe == nil {
-		writeESError(w, http.StatusBadRequest, "parse_exception", "[pipeline] required property is missing")
-		return
+		// Allow per-doc _pipeline if every doc specifies _pipeline; otherwise require pipeline.
+		allDocsHavePipeline := len(docsInput) > 0
+		for _, item := range docsInput {
+			docObj := item
+			if nested, ok := item["doc"].(map[string]any); ok {
+				docObj = nested
+			}
+			dp, _ := docObj["_pipeline"].(string)
+			if dp == "" {
+				dp, _ = item["_pipeline"].(string)
+			}
+			if strings.TrimSpace(dp) == "" {
+				allDocsHavePipeline = false
+				break
+			}
+		}
+		if !allDocsHavePipeline {
+			writeIngestConfigErrorRound60(w, r, &ingestConfigErrorRound60{
+				errType:  "parse_exception",
+				reason:   "[pipeline] required property is missing",
+				propName: "pipeline",
+			})
+			return
+		}
 	}
 
 	vParam := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("verbose")))
 	verbose := vParam == "true" || vParam == "1"
-	docsOut := make([]map[string]any, 0, len(req.Docs))
+
+	if hasInlinePipe && !verbose && !s.isES8Mode(r) {
+		if missingSub := findMissingStaticSubPipelineForES7SimulateRound60(s, inlinePipe, substPipes); missingSub != "" {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				fmt.Sprintf("Pipeline processor configured for non-existent pipeline [%s]", missingSub))
+			return
+		}
+	}
+
+	isES8 := s.isES8Mode(r)
+	docsOut := make([]map[string]any, 0, len(docsInput))
 	nowISO := time.Now().UTC().Format(time.RFC3339Nano)
-	for i, item := range req.Docs {
+	for i, item := range docsInput {
 		docObj := item
 		if nested, ok := item["doc"].(map[string]any); ok {
 			docObj = nested
@@ -7372,17 +8655,45 @@ func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Req
 		if idx == "" {
 			idx = "_index"
 		}
-		id, _ := docObj["_id"].(string)
+		var id string
+		if rawID, hasID := docObj["_id"]; hasID && rawID != nil {
+			id = fmt.Sprintf("%v", rawID)
+		}
 		if id == "" {
 			id = fmt.Sprintf("%d", i)
 		}
-		inRouting, _ := docObj["_routing"].(string)
+		inType, _ := docObj["_type"].(string)
+		inRouting := ""
+		if rawR, hasR := docObj["_routing"]; hasR && rawR != nil {
+			inRouting = fmt.Sprintf("%v", rawR)
+		}
+
+		effPipe := pipe
+		effPipeName := pathID
+		effIsInline := hasInlinePipe
+		if effPipeName == "" || hasInlinePipe {
+			effPipeName = "_simulate_pipeline"
+		}
+		docPipeOverride, _ := docObj["_pipeline"].(string)
+		if docPipeOverride == "" {
+			docPipeOverride, _ = item["_pipeline"].(string)
+		}
+		if strings.TrimSpace(docPipeOverride) != "" {
+			effPipeName = strings.TrimSpace(docPipeOverride)
+			effIsInline = false
+			effPipe = lookupRuntimeIngestPipelineRound60(s, effPipeName, substPipes)
+			if effPipe == nil {
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "pipeline ["+effPipeName+"] is missing")
+				return
+			}
+		}
+
 		srcAny, hasSrc := docObj["_source"]
 		var srcMap map[string]any
 		if !hasSrc {
 			srcMap = make(map[string]any, len(docObj))
 			for k, v := range docObj {
-				if k == "_index" || k == "_id" || k == "_routing" {
+				if k == "_index" || k == "_id" || k == "_type" || k == "_routing" || k == "_pipeline" || k == "_version" {
 					continue
 				}
 				srcMap[k] = v
@@ -7424,11 +8735,12 @@ func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Req
 		if err != nil {
 			rawSrc = []byte(`{}`)
 		}
-		simPipeName := strings.TrimSpace(r.PathValue("id"))
-		if simPipeName == "" {
-			simPipeName = "_simulate"
+		initMeta := map[string]any{
+			"_subst_pipes":         substPipes,
+			"_inline_sim_pipeline": effIsInline,
+			"_is_es8_mode":         isES8,
 		}
-		outBytes, outIdx, outID, outIngestTS, outRouting, dropped, trace, outIngestMeta, procErr := applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s, pipe, simPipeName, idx, id, inRouting, rawSrc, verbose, nil)
+		outBytes, outIdx, outID, outIngestTS, outRouting, dropped, trace, outIngestMeta, procErr := applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s, effPipe, effPipeName, idx, id, inRouting, rawSrc, verbose, initMeta)
 		if outIngestTS != "" {
 			docIngestTS = outIngestTS
 		}
@@ -7438,22 +8750,39 @@ func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Req
 					if curIdx, _ := dMap["_index"].(string); curIdx == "" || curIdx == "_index" {
 						dMap["_index"] = idx
 					}
-					if curID, _ := dMap["_id"].(string); curID == "" || curID == "0" {
+					if curID, _ := dMap["_id"].(string); curID == "" {
 						dMap["_id"] = id
 					}
 					if dMap["_ingest"] == nil {
-						dMap["_ingest"] = map[string]any{"timestamp": docIngestTS}
+						dMap["_ingest"] = map[string]any{
+							"timestamp": docIngestTS,
+							"pipeline":  effPipeName,
+						}
 					}
+					s.applyDocTypeFieldRound60(dMap, r, inType)
 				}
 			}
 			docsOut = append(docsOut, map[string]any{"processor_results": trace})
 			continue
 		}
 		if procErr != nil {
+			errType := ingestProcessorStepErrorTypeRound60(s, "", procErr, map[string]any{
+				"__internal_ingest_orig": map[string]any{
+					"_inline_sim_pipeline": effIsInline,
+					"_is_es8_mode":         isES8,
+				},
+			}, 0)
+			errReason := cleanIngestErrorReasonRound60(procErr.Error())
 			docsOut = append(docsOut, map[string]any{
 				"error": map[string]any{
-					"type":   "illegal_argument_exception",
-					"reason": procErr.Error(),
+					"root_cause": []map[string]any{
+						{
+							"type":   errType,
+							"reason": errReason,
+						},
+					},
+					"type":   errType,
+					"reason": errReason,
 				},
 			})
 			continue
@@ -7474,6 +8803,9 @@ func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Req
 			"timestamp": docIngestTS,
 		}
 		for k, v := range outIngestMeta {
+			if k == "pipeline" || k == "__executed_pipelines" || k == "_subst_pipes" || k == "_inline_sim_pipeline" || k == "_is_es8_mode" {
+				continue
+			}
 			simIngest[k] = v
 		}
 		simIngest["timestamp"] = docIngestTS
@@ -7484,6 +8816,7 @@ func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Req
 			"_source":  outSrc,
 			"_ingest":  simIngest,
 		}
+		s.applyDocTypeFieldRound60(simDoc, r, inType)
 		if outRouting != "" {
 			simDoc["_routing"] = outRouting
 		}
@@ -7491,7 +8824,7 @@ func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Req
 			"doc": simDoc,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"docs": docsOut})
+	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"docs": docsOut})
 }
 
 func convertSingleIngestValue(val any, convType string) (any, error) {
@@ -8095,17 +9428,105 @@ func (s *Server) handleCatNodes(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
-	rows := []map[string]any{
-		{
-			"ip":           "127.0.0.1",
-			"heap.percent": "15",
-			"ram.percent":  "30",
-			"cpu":          "5",
-			"node.role":    "cdfhilmrstw",
-			"master":       "*",
-			"name":         "doris-fe-1",
-		},
+	fullID := isTruthyBoolQueryParam(r, "full_id")
+	nodeIDVal := "doris"
+	if fullID {
+		nodeIDVal = "doris-fe-1"
 	}
+	verStr := s.effectiveClusterESVersionNumber(r)
+	row := map[string]any{
+		"id":                           nodeIDVal,
+		"pid":                          "1",
+		"ip":                           "127.0.0.1",
+		"port":                         "9300",
+		"http_address":                 "127.0.0.1:9200",
+		"version":                      verStr,
+		"flavor":                       "default",
+		"type":                         "docker",
+		"build":                        "a761f7f",
+		"jdk":                          "21.0.2",
+		"disk.total":                   "100gb",
+		"disk.used":                    "10gb",
+		"disk.avail":                   "90gb",
+		"disk.used_percent":            "10.00",
+		"heap.current":                 "150mb",
+		"heap.percent":                 "15",
+		"heap.max":                     "1gb",
+		"ram.current":                  "2.4gb",
+		"ram.percent":                  "30",
+		"ram.max":                      "8gb",
+		"file_desc.current":            "256",
+		"file_desc.percent":            "1",
+		"file_desc.max":                "65535",
+		"cpu":                          "5",
+		"load_1m":                      "0.10",
+		"load_5m":                      "0.10",
+		"load_15m":                     "0.10",
+		"uptime":                       "1h",
+		"node.role":                    "cdfhilmrstw",
+		"master":                       "*",
+		"name":                         "doris-fe-1",
+		"completion.size":              "0b",
+		"fielddata.memory_size":        "0b",
+		"fielddata.evictions":          "0",
+		"query_cache.memory_size":      "0b",
+		"query_cache.evictions":        "0",
+		"query_cache.hit_count":        "0",
+		"query_cache.miss_count":       "0",
+		"request_cache.memory_size":    "0b",
+		"request_cache.evictions":      "0",
+		"request_cache.hit_count":      "0",
+		"request_cache.miss_count":     "0",
+		"flush.total":                  "0",
+		"flush.total_time":             "0s",
+		"get.current":                  "0",
+		"get.time":                     "0s",
+		"get.total":                    "0",
+		"get.exists_time":              "0s",
+		"get.exists_total":             "0",
+		"get.missing_time":             "0s",
+		"get.missing_total":            "0",
+		"indexing.delete_current":      "0",
+		"indexing.delete_time":         "0s",
+		"indexing.delete_total":        "0",
+		"indexing.index_current":       "0",
+		"indexing.index_time":          "0s",
+		"indexing.index_total":         "0",
+		"indexing.index_failed":        "0",
+		"merges.current":               "0",
+		"merges.current_docs":          "0",
+		"merges.current_size":          "0b",
+		"merges.total":                 "0",
+		"merges.total_docs":            "0",
+		"merges.total_size":            "0b",
+		"merges.total_time":            "0s",
+		"refresh.total":                "0",
+		"refresh.time":                 "0s",
+		"refresh.external_total":       "0",
+		"refresh.external_time":        "0s",
+		"refresh.listeners":            "0",
+		"script.compilations":          "0",
+		"script.cache_evictions":       "0",
+		"search.fetch_current":         "0",
+		"search.fetch_time":            "0s",
+		"search.fetch_total":           "0",
+		"search.open_contexts":         "0",
+		"search.query_current":         "0",
+		"search.query_time":            "0s",
+		"search.query_total":           "0",
+		"search.scroll_current":        "0",
+		"search.scroll_time":           "0s",
+		"search.scroll_total":          "0",
+		"segments.count":               "0",
+		"segments.memory":              "0b",
+		"segments.index_writer_memory": "0b",
+		"segments.version_map_memory":  "0b",
+		"segments.fixed_bitset_memory": "0b",
+		"suggest.current":              "0",
+		"suggest.time":                 "0s",
+		"suggest.total":                "0",
+	}
+	rows := []map[string]any{row}
 	nodePat := strings.TrimSpace(r.PathValue("node_id"))
 	if nodePat == "" {
 		nodePat = strings.TrimSpace(r.PathValue("name"))
@@ -8119,7 +9540,31 @@ func (s *Server) handleCatNodes(w http.ResponseWriter, r *http.Request) {
 			rows = []map[string]any{}
 		}
 	}
-	writeCatResponse(w, r, []string{"ip", "heap.percent", "ram.percent", "cpu", "node.role", "master", "name"}, rows)
+	defaultHeaders := []string{"ip", "heap.percent", "ram.percent", "cpu", "load_1m", "load_5m", "load_15m", "node.role", "master", "name"}
+	helpCols := []string{
+		"id", "pid", "ip", "port", "http_address", "version", "flavor", "type", "build", "jdk",
+		"disk.total", "disk.used", "disk.avail", "disk.used_percent",
+		"heap.current", "heap.percent", "heap.max",
+		"ram.current", "ram.percent", "ram.max",
+		"file_desc.current", "file_desc.percent", "file_desc.max",
+		"cpu", "load_1m", "load_5m", "load_15m", "uptime", "node.role", "master", "name",
+		"completion.size", "fielddata.memory_size", "fielddata.evictions",
+		"query_cache.memory_size", "query_cache.evictions", "query_cache.hit_count", "query_cache.miss_count",
+		"request_cache.memory_size", "request_cache.evictions", "request_cache.hit_count", "request_cache.miss_count",
+		"flush.total", "flush.total_time",
+		"get.current", "get.time", "get.total", "get.exists_time", "get.exists_total", "get.missing_time", "get.missing_total",
+		"indexing.delete_current", "indexing.delete_time", "indexing.delete_total",
+		"indexing.index_current", "indexing.index_time", "indexing.index_total", "indexing.index_failed",
+		"merges.current", "merges.current_docs", "merges.current_size", "merges.total", "merges.total_docs", "merges.total_size", "merges.total_time",
+		"refresh.total", "refresh.time", "refresh.external_total", "refresh.external_time", "refresh.listeners",
+		"script.compilations", "script.cache_evictions",
+		"search.fetch_current", "search.fetch_time", "search.fetch_total", "search.open_contexts",
+		"search.query_current", "search.query_time", "search.query_total",
+		"search.scroll_current", "search.scroll_time", "search.scroll_total",
+		"segments.count", "segments.memory", "segments.index_writer_memory", "segments.version_map_memory", "segments.fixed_bitset_memory",
+		"suggest.current", "suggest.time", "suggest.total",
+	}
+	writeCatResponseWithHelpCols(w, r, defaultHeaders, helpCols, rows)
 }
 
 // handleResolveCluster implements `GET /_resolve/cluster` and `GET /_resolve/cluster/{name}` (Round 56 F9).
@@ -8255,6 +9700,33 @@ func (s *Server) handleCatHealth(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
+	includeTS := true
+	if r != nil && r.URL != nil {
+		q := r.URL.Query()
+		if q.Has("health") {
+			hv := strings.ToLower(strings.TrimSpace(q.Get("health")))
+			switch hv {
+			case "green", "yellow", "red":
+			default:
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("invalid health status [%s]", q.Get("health")))
+				return
+			}
+		}
+		if q.Has("ts") {
+			tv := strings.ToLower(strings.TrimSpace(q.Get("ts")))
+			switch tv {
+			case "", "true", "1":
+				includeTS = true
+			case "false", "0":
+				includeTS = false
+			default:
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("Failed to parse value [%s] as only [true] or [false] are allowed.", q.Get("ts")))
+				return
+			}
+		}
+	}
 	s.mu.RLock()
 	numIndices := len(s.indices)
 	s.mu.RUnlock()
@@ -8265,11 +9737,20 @@ func (s *Server) handleCatHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC()
-	headers := []string{
+	allHelpHeaders := []string{
 		"epoch", "timestamp", "cluster", "status",
 		"node.total", "node.data", "shards", "pri",
 		"relo", "init", "unassign", "pending_tasks",
 		"max_task_wait_time", "active_shards_percent",
+	}
+	headers := allHelpHeaders
+	if !includeTS {
+		headers = []string{
+			"cluster", "status",
+			"node.total", "node.data", "shards", "pri",
+			"relo", "init", "unassign", "pending_tasks",
+			"max_task_wait_time", "active_shards_percent",
+		}
 	}
 	rows := []map[string]any{
 		{
@@ -8289,7 +9770,7 @@ func (s *Server) handleCatHealth(w http.ResponseWriter, r *http.Request) {
 			"active_shards_percent": "100.0%",
 		},
 	}
-	writeCatResponse(w, r, headers, rows)
+	writeCatResponseWithHelpCols(w, r, headers, allHelpHeaders, rows)
 }
 
 func writeCatResponse(w http.ResponseWriter, r *http.Request, headers []string, rows []map[string]any) {
@@ -8307,11 +9788,16 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	rps, slicesCount, waitForCompletion, pfStatus, pfErrType, pfErrReason := s.validateReindexPreflightRound60(r, bodyBytes)
+	if pfStatus != 0 {
+		writeESError(w, pfStatus, pfErrType, pfErrReason)
+		return
+	}
 	var body struct {
 		MaxDocs           *int       `json:"max_docs,omitempty"`
 		Size              *int       `json:"size,omitempty"`
 		Conflicts         string     `json:"conflicts,omitempty"`
-		RequestsPerSecond *float64   `json:"requests_per_second,omitempty"`
+		RequestsPerSecond any        `json:"requests_per_second,omitempty"`
 		Slices            any        `json:"slices,omitempty"`
 		Slice             *sliceSpec `json:"slice,omitempty"`
 		Source            struct {
@@ -8389,17 +9875,6 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("invalid routing mode [%s] for reindex dest", body.Dest.Routing))
 		return
 	}
-	rps := -1.0
-	if body.RequestsPerSecond != nil {
-		rps = *body.RequestsPerSecond
-	}
-	if qRPS := strings.TrimSpace(r.URL.Query().Get("requests_per_second")); qRPS != "" {
-		if strings.EqualFold(qRPS, "unlimited") {
-			rps = -1.0
-		} else if parsed, err := strconv.ParseFloat(qRPS, 64); err == nil {
-			rps = parsed
-		}
-	}
 	var srcRoutingFilter string
 	switch rv := body.Source.Routing.(type) {
 	case string:
@@ -8461,26 +9936,57 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if stCode, stType, stReason := s.prepareAutoCreateTargetRound58(r.Context(), body.Dest.Index, destOpType == "create"); stCode != 0 {
-		writeESError(w, stCode, stType, stReason)
+	if body.Script != nil && strings.TrimSpace(body.Script.Source) != "" && (strings.TrimSpace(body.Script.Lang) == "" || strings.EqualFold(strings.TrimSpace(body.Script.Lang), "painless")) {
+		if err := painless.CompileValidate(body.Script.Source); err != nil {
+			writePainlessScriptErrorRound60(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	if !waitForCompletion {
+		desc := fmt.Sprintf("reindex from [%s] to [%s]", srcPattern, body.Dest.Index)
+		s.launchAsyncTaskRound60(w, r, bodyBytes, "indices:data/write/reindex", desc, rps, s.handleReindex)
 		return
 	}
-	if s.isDataStream(strings.TrimSpace(body.Dest.Index)) && destOpType != "create" {
-		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "only write ops with an op_type of create are allowed in data streams")
-		return
-	}
-	destIndex, destAliasFilter, writeErr := s.resolveWriteIndexWithFilter(body.Dest.Index)
-	if writeErr != nil {
-		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", writeErr.Error())
-		return
-	}
-	if s.isIndexClosed(destIndex) {
-		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", destIndex))
-		return
-	}
-	if blocked, reason := s.isIndexWriteBlocked(destIndex); blocked {
-		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
-		return
+	destRawTarget := strings.TrimSpace(body.Dest.Index)
+	_ = s.syncCatalogFromBackend(r.Context())
+	s.mu.RLock()
+	_, destIsIdx := s.indices[destRawTarget]
+	_, destIsAlias := s.aliases[destRawTarget]
+	_, destIsDS := s.dataStreams[destRawTarget]
+	s.mu.RUnlock()
+	destAlreadyExisted := destIsIdx || destIsAlias || destIsDS
+
+	var destIndex string
+	var destAliasFilter *esast.Query
+	if destAlreadyExisted {
+		if stCode, stType, stReason := s.prepareAutoCreateTargetRound58(r.Context(), body.Dest.Index, destOpType == "create"); stCode != 0 {
+			writeESError(w, stCode, stType, stReason)
+			return
+		}
+		if s.isDataStream(destRawTarget) && destOpType != "create" {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "only write ops with an op_type of create are allowed in data streams")
+			return
+		}
+		var writeErr error
+		destIndex, destAliasFilter, writeErr = s.resolveWriteIndexWithFilter(body.Dest.Index)
+		if writeErr != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", writeErr.Error())
+			return
+		}
+		if s.isIndexClosed(destIndex) {
+			writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", destIndex))
+			return
+		}
+		if blocked, reason := s.isIndexWriteBlocked(destIndex); blocked {
+			writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+			return
+		}
+	} else {
+		if reason, valid := validateESIndexName(destRawTarget); !valid {
+			writeESError(w, http.StatusBadRequest, "invalid_index_name_exception", reason)
+			return
+		}
+		destIndex = destRawTarget
 	}
 
 	maxDocs := 0
@@ -8814,7 +10320,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				}
 				pipedDoc, nextDestIdx, nextDocID, pipeRouting, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithRouting(docDestRawIdx, docID, body.Dest.Pipeline, "", prePipeRouting, docSource)
 				if pipeErr != nil {
-					writeESError(w, http.StatusBadRequest, ingestErrorType(pipeErr), pipeErr.Error())
+					writeESError(w, http.StatusBadRequest, s.ingestErrorTypeForReqRound60(r, pipeErr), pipeErr.Error())
 					return
 				}
 				if dropped {
@@ -8858,6 +10364,10 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				candIDsByIdx[docDestIdx] = append(candIDsByIdx[docDestIdx], docID)
 				sampleDocsByIdx[docDestIdx] = append(sampleDocsByIdx[docDestIdx], docSource)
 			}
+			if throttleErr := applyTaskThrottleAndProgressRound60(r.Context(), len(hits), rps); throttleErr != nil {
+				writeESError(w, http.StatusInternalServerError, "task_cancelled_exception", "Task cancelled by user request")
+				return
+			}
 			if len(prepared) == 0 {
 				if !useGlobalSort {
 					nextSA := extractHitSortValues(hits[len(hits)-1], effSort, srcSchema)
@@ -8873,7 +10383,54 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 			}
 			schemasByIdx := make(map[string]*schema.IndexSchema, len(sampleDocsByIdx))
 			existingByIdx := make(map[string]map[string]HitRow, len(sampleDocsByIdx))
+			if !destAlreadyExisted && len(sampleDocsByIdx[destIndex]) > 0 {
+				if st, et, er := s.prepareAutoCreateTargetRound58(r.Context(), body.Dest.Index, destOpType == "create"); st != 0 {
+					writeESError(w, st, et, er)
+					return
+				}
+				if s.isDataStream(destRawTarget) && destOpType != "create" {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "only write ops with an op_type of create are allowed in data streams")
+					return
+				}
+				resolvedDest, resolvedAliasFilter, writeErr := s.resolveWriteIndexWithFilter(body.Dest.Index)
+				if writeErr != nil {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", writeErr.Error())
+					return
+				}
+				if destAliasFilter == nil && resolvedAliasFilter != nil {
+					destAliasFilter = resolvedAliasFilter
+				}
+				if resolvedDest != destIndex {
+					if sDocs := sampleDocsByIdx[destIndex]; len(sDocs) > 0 {
+						sampleDocsByIdx[resolvedDest] = append(sampleDocsByIdx[resolvedDest], sDocs...)
+						delete(sampleDocsByIdx, destIndex)
+					}
+					if cIDs := candIDsByIdx[destIndex]; len(cIDs) > 0 {
+						candIDsByIdx[resolvedDest] = append(candIDsByIdx[resolvedDest], cIDs...)
+						delete(candIDsByIdx, destIndex)
+					}
+					for pi := range prepared {
+						if prepared[pi].destIndex == destIndex {
+							prepared[pi].destIndex = resolvedDest
+						}
+					}
+					destIndex = resolvedDest
+				}
+				if s.isIndexClosed(destIndex) {
+					writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", destIndex))
+					return
+				}
+				if blocked, reason := s.isIndexWriteBlocked(destIndex); blocked {
+					writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+					return
+				}
+				destAlreadyExisted = true
+			}
 			for idxName, sDocs := range sampleDocsByIdx {
+				if !destAlreadyExisted && idxName == destIndex && len(sDocs) == 0 {
+					existingByIdx[idxName] = make(map[string]HitRow)
+					continue
+				}
 				sch := s.ensureWritableIndexSchemaWithDocs(r.Context(), idxName, sDocs)
 				if idxName == destIndex {
 					destSchema = sch
@@ -8895,27 +10452,23 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					existingByIdx[idxName] = make(map[string]HitRow)
 				}
 			}
-			batchBufByTable := make(map[string]*bytes.Buffer, len(schemasByIdx))
-			var tableOrder []string
+			pendingPhysDelByIdx := make(map[string]map[string]bool)
+			pendingWriteLinesByIdx := make(map[string]map[string][]byte)
+			pendingWriteOrderByIdx := make(map[string][]string)
+			var idxFlushOrder []string
+			seenIdxFlush := make(map[string]bool)
+			noteIdxFlush := func(idxName string) {
+				if !seenIdxFlush[idxName] {
+					seenIdxFlush[idxName] = true
+					idxFlushOrder = append(idxFlushOrder, idxName)
+				}
+			}
+			isExternalDestVT := destVerType == "external" || destVerType == "external_gt" || destVerType == "external_gte"
 			for _, pd := range prepared {
 				isCreate := pd.isCreate
 				sch := schemasByIdx[pd.destIndex]
 				existingDocs := existingByIdx[pd.destIndex]
-				var minVer int64
-				if delMap := deletedVerByIdx[pd.destIndex]; delMap != nil {
-					if delVer, okDel := delMap[pd.id]; okDel && delVer+1 > minVer {
-						minVer = delVer + 1
-					}
-				}
-				if lastVer := s.getDocVersion(pd.destIndex, pd.id); lastVer > 0 && lastVer < 1_000_000_000_000 && lastVer+1 > minVer {
-					minVer = lastVer + 1
-				}
 				existing, exists := existingDocs[pd.id]
-				if !exists && minVer == 0 {
-					if destHit, found, _ := s.backend.GetDocByID(r.Context(), sch.DorisDB, sch.DorisTable, pd.id); !found && destHit != nil && destHit.Version > 0 && destHit.Version < 1_000_000_000_000 {
-						minVer = destHit.Version + 1
-					}
-				}
 				if pd.isDelete {
 					if s.isRoutingRequired(sch) && pd.routing == "" {
 						writeESError(w, http.StatusBadRequest, "routing_missing_exception", fmt.Sprintf("routing is required for [%s]/[%s]/[%s]", pd.destIndex, "_doc", pd.id))
@@ -8938,26 +10491,19 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 							fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", pd.id))
 						return
 					}
-					if existing.Version+1 > minVer {
-						minVer = existing.Version + 1
+					delVer := existing.Version + 1
+					if delVer <= 0 {
+						delVer = 1
 					}
-					nextVer := s.allocVersion(minVer)
-					if minVer > 0 && minVer < 1_000_000_000_000 {
-						nextVer = minVer
+					seqNo := s.allocIndexSeqNo(r.Context(), pd.destIndex)
+					noteIdxFlush(pd.destIndex)
+					if pendingPhysDelByIdx[pd.destIndex] == nil {
+						pendingPhysDelByIdx[pd.destIndex] = make(map[string]bool)
 					}
-					shredded, err := schema.ShredDocument(sch, pd.id, nextVer, true, nil)
-					if err != nil {
-						writeESError(w, http.StatusBadRequest, shredErrorType(err), err.Error())
-						return
+					pendingPhysDelByIdx[pd.destIndex][pd.id] = true
+					if pendingWriteLinesByIdx[pd.destIndex] != nil {
+						delete(pendingWriteLinesByIdx[pd.destIndex], pd.id)
 					}
-					buf, hasBuf := batchBufByTable[sch.DorisTable]
-					if !hasBuf {
-						buf = &bytes.Buffer{}
-						batchBufByTable[sch.DorisTable] = buf
-						tableOrder = append(tableOrder, sch.DorisTable)
-					}
-					buf.Write(shredded)
-					buf.WriteByte('\n')
 					delete(existingDocs, pd.id)
 					if writtenDocsByIdx[pd.destIndex] != nil {
 						delete(writtenDocsByIdx[pd.destIndex], pd.id)
@@ -8965,13 +10511,17 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					if deletedVerByIdx[pd.destIndex] == nil {
 						deletedVerByIdx[pd.destIndex] = make(map[string]int64)
 					}
-					deletedVerByIdx[pd.destIndex][pd.id] = nextVer
+					if isExternalDestVT {
+						deletedVerByIdx[pd.destIndex][pd.id] = delVer
+					} else {
+						delete(deletedVerByIdx[pd.destIndex], pd.id)
+					}
 					s.setDocRouting(pd.destIndex, pd.id, "")
-					s.setDocVersion(pd.destIndex, pd.id, nextVer)
+					s.recordDocDeleteMetaRound60(pd.destIndex, pd.id, delVer, seqNo, isExternalDestVT)
 					totalDeleted++
 					continue
 				}
-				useExternalVer := (destVerType == "external" || destVerType == "external_gt" || destVerType == "external_gte") && pd.srcVer > 0
+				useExternalVer := isExternalDestVT && pd.srcVer >= 0 && (pd.srcVer > 0 || pd.scriptVerSet)
 				if exists {
 					verConflict := false
 					if useExternalVer {
@@ -8993,20 +10543,16 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 							fmt.Sprintf("[%s]: version conflict, document already exists or belongs to another alias partition", pd.id))
 						return
 					}
-					if existing.Version+1 > minVer {
-						minVer = existing.Version + 1
-					}
 				} else if useExternalVer {
 					var delVer int64
+					var hasDelVer bool
 					if delMap := deletedVerByIdx[pd.destIndex]; delMap != nil {
-						delVer = delMap[pd.id]
+						delVer, hasDelVer = delMap[pd.id]
 					}
-					if delVer == 0 {
-						if lastVer := s.getDocVersion(pd.destIndex, pd.id); lastVer > 0 && lastVer < 1_000_000_000_000 {
-							delVer = lastVer
-						}
+					if !hasDelVer {
+						delVer, hasDelVer = s.getDocExternalTombstone(pd.destIndex, pd.id)
 					}
-					if delVer > 0 {
+					if hasDelVer {
 						extConflict := delVer >= pd.srcVer
 						if destVerType == "external_gte" {
 							extConflict = delVer > pd.srcVer
@@ -9029,30 +10575,34 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				var nextVer int64
 				if useExternalVer || (!exists && pd.scriptVerSet && pd.srcVer > 0) {
 					nextVer = pd.srcVer
-					_ = s.allocVersion(nextVer)
-				} else if exists && pd.scriptVerSet && pd.srcVer > 0 {
+				} else if exists {
 					nextVer = existing.Version + 1
-					_ = s.allocVersion(nextVer)
-				} else if !exists && minVer == 0 {
-					nextVer = 1
-				} else if minVer > 0 && minVer < 1_000_000_000_000 {
-					nextVer = minVer
+					if nextVer <= 0 {
+						nextVer = 1
+					}
 				} else {
-					nextVer = s.allocVersion(minVer)
+					nextVer = 1
 				}
 				shredded, err := schema.ShredDocument(sch, pd.id, nextVer, false, pd.source)
 				if err != nil {
 					writeESError(w, http.StatusBadRequest, shredErrorType(err), err.Error())
 					return
 				}
-				buf, hasBuf := batchBufByTable[sch.DorisTable]
-				if !hasBuf {
-					buf = &bytes.Buffer{}
-					batchBufByTable[sch.DorisTable] = buf
-					tableOrder = append(tableOrder, sch.DorisTable)
+				seqNo := s.allocIndexSeqNo(r.Context(), pd.destIndex)
+				noteIdxFlush(pd.destIndex)
+				if (exists && nextVer < existing.Version) || (!exists && s.wasDocDeletedRound60(pd.destIndex, pd.id)) {
+					if pendingPhysDelByIdx[pd.destIndex] == nil {
+						pendingPhysDelByIdx[pd.destIndex] = make(map[string]bool)
+					}
+					pendingPhysDelByIdx[pd.destIndex][pd.id] = true
 				}
-				buf.Write(shredded)
-				buf.WriteByte('\n')
+				if pendingWriteLinesByIdx[pd.destIndex] == nil {
+					pendingWriteLinesByIdx[pd.destIndex] = make(map[string][]byte)
+				}
+				if _, alreadyQueued := pendingWriteLinesByIdx[pd.destIndex][pd.id]; !alreadyQueued {
+					pendingWriteOrderByIdx[pd.destIndex] = append(pendingWriteOrderByIdx[pd.destIndex], pd.id)
+				}
+				pendingWriteLinesByIdx[pd.destIndex][pd.id] = shredded
 				existingDocs[pd.id] = HitRow{ID: pd.id, Version: nextVer, Source: pd.source}
 				if writtenDocsByIdx[pd.destIndex] == nil {
 					writtenDocsByIdx[pd.destIndex] = make(map[string]HitRow)
@@ -9062,17 +10612,57 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					delete(deletedVerByIdx[pd.destIndex], pd.id)
 				}
 				s.setDocRouting(pd.destIndex, pd.id, pd.routing)
-				s.setDocVersion(pd.destIndex, pd.id, nextVer)
+				s.recordDocWriteMetaRound60(pd.destIndex, pd.id, nextVer, seqNo)
 				if exists {
 					totalUpdated++
 				} else {
 					totalCreated++
 				}
 			}
-			for _, tbl := range tableOrder {
-				buf := batchBufByTable[tbl]
+			for _, idxName := range idxFlushOrder {
+				sch := schemasByIdx[idxName]
+				var usedPhys bool
+				if delSet := pendingPhysDelByIdx[idxName]; len(delSet) > 0 {
+					delIDs := make([]string, 0, len(delSet))
+					for id := range delSet {
+						delIDs = append(delIDs, id)
+					}
+					sort.Strings(delIDs)
+					var err error
+					usedPhys, err = s.physicalDeleteDocs(r.Context(), sch, delIDs)
+					if err != nil {
+						writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
+						return
+					}
+				}
+				var buf bytes.Buffer
+				if !usedPhys {
+					for id := range pendingPhysDelByIdx[idxName] {
+						if pendingWriteLinesByIdx[idxName] != nil {
+							if _, overwritten := pendingWriteLinesByIdx[idxName][id]; overwritten {
+								continue
+							}
+						}
+						tombVer := int64(2)
+						if delMap := deletedVerByIdx[idxName]; delMap != nil && delMap[id] > 0 {
+							tombVer = delMap[id]
+						}
+						if tombLine, tErr := schema.ShredDocument(sch, id, tombVer, true, nil); tErr == nil {
+							buf.Write(tombLine)
+							buf.WriteByte('\n')
+						}
+					}
+				}
+				if writeMap := pendingWriteLinesByIdx[idxName]; len(writeMap) > 0 {
+					for _, id := range pendingWriteOrderByIdx[idxName] {
+						if line, okL := writeMap[id]; okL {
+							buf.Write(line)
+							buf.WriteByte('\n')
+						}
+					}
+				}
 				if buf.Len() > 0 {
-					if err := s.streamLoad(r.Context(), tbl, buf.Bytes(), true); err != nil {
+					if err := s.streamLoad(r.Context(), sch.DorisTable, buf.Bytes(), true); err != nil {
 						writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
 						return
 					}
@@ -9098,7 +10688,16 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	if tookMs <= 0 {
 		tookMs = 1
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	throttledMs := int64(0)
+	if te := taskFromContextRound60(r.Context()); te != nil {
+		te.mu.Lock()
+		throttledMs = te.throttledMillis
+		if te.requestsPerSec != 0 {
+			rps = te.requestsPerSec
+		}
+		te.mu.Unlock()
+	}
+	respMap := map[string]any{
 		"took":                   tookMs,
 		"timed_out":              false,
 		"total":                  totalMatched,
@@ -9109,11 +10708,15 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		"version_conflicts":      versionConflicts,
 		"noops":                  totalNoops,
 		"retries":                map[string]any{"bulk": 0, "search": 0},
-		"throttled_millis":       0,
+		"throttled_millis":       throttledMs,
 		"requests_per_second":    rps,
 		"throttled_until_millis": 0,
 		"failures":               failures,
-	})
+	}
+	if slicesCount > 1 {
+		respMap["slices"] = buildByQuerySlicesBreakdown(slicesCount, totalMatched, totalUpdated, totalCreated, totalDeleted, versionConflicts, totalNoops, batches, rps)
+	}
+	writeJSONWithRequest(w, r, http.StatusOK, respMap)
 }
 
 // handleDorisPromoteField implements `POST /{index}/_doris/promote` to atomically promote an unindexed `_doc[...]`
@@ -9227,6 +10830,19 @@ func (s *Server) promoteFieldInternal(ctx context.Context, idxName, field, esTyp
 		oldRaw = cur.RawMapping
 	}
 	mergedSpec := schema.MergeMappingSpecs(oldRaw, patchSpec)
+	if mergedSpec != nil && len(mergedSpec.Runtime) > 0 {
+		rtCopy := make(map[string]esast.FieldProperty, len(mergedSpec.Runtime))
+		for k, v := range mergedSpec.Runtime {
+			if k != cleanField {
+				rtCopy[k] = v
+			}
+		}
+		if len(rtCopy) == 0 {
+			mergedSpec.Runtime = nil
+		} else {
+			mergedSpec.Runtime = rtCopy
+		}
+	}
 	compiled := schema.CompileIndexSchema(s.dorisDB, idxName, mergedSpec)
 	s.indices[idxName] = compiled
 	s.mu.Unlock()
@@ -9257,7 +10873,7 @@ func (s *Server) backfillIndexSchema(ctx context.Context, newSchema *schema.Inde
 	}
 	_ = s.coalescer.FlushTable(ctx, newSchema.DorisTable)
 	opts := s.transpileOpts
-	opts.MaxResultWindow = 0
+	opts.MaxResultWindow = 1_000_000
 	tr := transpiler.NewTranspiler(newSchema, opts)
 	batchSize := 1000
 	var searchAfter []any
@@ -10331,7 +11947,7 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
 		return
 	}
-	if found && hit != nil && effRouting != "" && !s.docMatchesRequestRouting(indexName, docID, effRouting) {
+	if found && hit != nil && !s.docMatchesRequestRouting(indexName, docID, effRouting) {
 		found = false
 		hit = nil
 	}
@@ -10341,9 +11957,8 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 		*hit = hitSlice[0]
 	}
 	if !found || hit == nil || (aliasFilter != nil && !s.docMatchesAliasFilterWithSchema(r.Context(), indexName, idxSchema, docID, hit.EffectiveSource(), aliasFilter)) {
-		writeJSON(w, http.StatusNotFound, map[string]any{
+		nfResp := map[string]any{
 			"_index":  indexName,
-			"_type":   "_doc",
 			"_id":     docID,
 			"matched": false,
 			"explanation": map[string]any{
@@ -10351,7 +11966,9 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 				"description": "Failure to meet condition(s) of document/etti: no such document [" + docID + "]",
 				"details":     []any{},
 			},
-		})
+		}
+		s.applyDocTypeFieldRound60(nfResp, r, "")
+		writeJSONWithRequest(w, r, http.StatusNotFound, nfResp)
 		return
 	}
 
@@ -10428,21 +12045,37 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 			desc = "weight(" + cq.WhereSQL + ") [DorisInvertedIndex], result of: " + cq.ScoreSQL
 		}
 	}
+	explainDetails := []any{}
+	if matched {
+		if boostVal, hasBoost := extractExplainTopBoostRound60(effQuery); hasBoost {
+			explainDetails = append(explainDetails, map[string]any{
+				"value":       boostVal,
+				"description": "boost",
+				"details":     []any{},
+			})
+		} else if boostVal, hasBoost := extractExplainTopBoostRound60(resolvedReq.Query); hasBoost {
+			explainDetails = append(explainDetails, map[string]any{
+				"value":       boostVal,
+				"description": "boost",
+				"details":     []any{},
+			})
+		}
+	}
 	outResp := map[string]any{
 		"_index":  indexName,
-		"_type":   "_doc",
 		"_id":     docID,
 		"matched": matched,
 		"explanation": map[string]any{
 			"value":       scoreVal,
 			"description": desc,
-			"details":     []any{},
+			"details":     explainDetails,
 		},
 	}
+	s.applyDocTypeFieldRound60(outResp, r, "")
 	if r.URL.Query().Has("_source") || r.URL.Query().Has("_source_includes") || r.URL.Query().Has("_source_excludes") || r.URL.Query().Has("stored_fields") {
 		getObj := map[string]any{
 			"found":         true,
-			"_seq_no":       hit.Version,
+			"_seq_no":       s.getDocSeqNo(indexName, docID, hit.Version),
 			"_primary_term": 1,
 			"_version":      hit.Version,
 		}
@@ -10485,7 +12118,7 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 		}
 		outResp["get"] = getObj
 	}
-	writeJSON(w, http.StatusOK, outResp)
+	writeJSONWithRequest(w, r, http.StatusOK, outResp)
 }
 
 func parseIngestCSVLine(line string, sep, quote rune, trim bool) ([]string, []bool, error) {
@@ -12049,7 +13682,7 @@ func (s *Server) handleResizeOrCloneIndex(w http.ResponseWriter, r *http.Request
 
 	_ = s.coalescer.FlushTable(r.Context(), srcSchema.DorisTable)
 	opts := s.transpileOpts
-	opts.MaxResultWindow = 0
+	opts.MaxResultWindow = 1_000_000
 	tr := transpiler.NewTranspiler(srcSchema, opts)
 	batchSize := 1000
 	var searchAfter []any

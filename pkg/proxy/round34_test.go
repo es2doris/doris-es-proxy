@@ -228,8 +228,8 @@ func TestRound34_AggTypedKeysCompositeAliasTermsLookupAndMSearch(t *testing.T) {
 	if aggsMap["significant_text#sig_words"] == nil {
 		t.Fatalf("expected typed key 'significant_text#sig_words', got keys: %+v", aggsMap)
 	}
-	if aggsMap["sterms#sig_bg"] == nil {
-		t.Fatalf("expected typed key 'sterms#sig_bg', got keys: %+v", aggsMap)
+	if aggsMap["sigsterms#sig_bg"] == nil {
+		t.Fatalf("expected typed key 'sigsterms#sig_bg', got keys: %+v", aggsMap)
 	}
 	compBuckets := aggsMap["composite#comp_alias"].(map[string]any)["buckets"].([]any)
 	if len(compBuckets) == 0 {

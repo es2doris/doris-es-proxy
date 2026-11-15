@@ -154,7 +154,7 @@ func (m *MemoryBackend) StreamLoad(_ context.Context, table string, ndjson []byt
 		id := fmt.Sprintf("%v", row["_id"])
 		newVer, _ := toInt64(row["_version"])
 		if existing, ok := m.tables[table][id]; ok {
-			if curVer, ok := toInt64(existing["_version"]); ok && newVer > 0 && newVer < curVer {
+			if curVer, ok := toInt64(existing["_version"]); ok && newVer < curVer {
 				continue
 			}
 		}
@@ -174,6 +174,24 @@ func isTombstoneRow(row map[string]any) bool {
 	}
 	delSign, _ := toInt64(row["__DORIS_DELETE_SIGN__"])
 	return delSign != 0
+}
+
+// DeleteDocsByIDs removes rows by _id from MemoryBackend so re-creating a deleted document
+// with _version = 1 succeeds without colliding against a higher tombstone _version.
+func (m *MemoryBackend) DeleteDocsByIDs(_ context.Context, _, table string, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	tbl := m.tables[table]
+	if tbl == nil {
+		return nil
+	}
+	for _, id := range ids {
+		delete(tbl, id)
+	}
+	return nil
 }
 
 func (m *MemoryBackend) Ping(_ context.Context) error {

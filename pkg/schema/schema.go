@@ -119,6 +119,8 @@ type FieldBinding struct {
 	MaxShingleSize           int
 	DepthLimit               int
 	Relations                map[string]any
+	Meta                     map[string]string
+	Contexts                 []esast.CompletionContextDef
 	NotIndexed               bool
 	EnabledFalse             bool
 	DocValuesFalse           bool
@@ -187,25 +189,32 @@ type NestedRootSpec struct {
 
 // IndexSchema holds the compiled schema registry for an Elasticsearch index.
 type IndexSchema struct {
-	IndexName              string
-	DorisDB                string
-	DorisTable             string
-	Buckets                int
-	Fields                 map[string]FieldBinding
-	OrderedFields          []FieldBinding
-	NestedRoots            map[string]string // Maps ES nested path (e.g. "columns") -> Doris column ("n__columns")
-	nestedRootPaths        map[string][]string
-	NestedRootSpecs        []NestedRootSpec
-	RawMapping             *esast.MappingSpec
-	MaxTotalFields         int
-	MaxNestedFields        int
-	HasExplicitNestedLimit bool
-	MaxNestedObjects       int
-	MaxDepth               int
-	MaxFieldNameLength     int
-	MaxTermsCount          int
-	DefaultCoerce          *bool
-	DefaultIgnoreMalformed *bool
+	IndexName               string
+	DorisDB                 string
+	DorisTable              string
+	Buckets                 int
+	Fields                  map[string]FieldBinding
+	OrderedFields           []FieldBinding
+	NestedRoots             map[string]string // Maps ES nested path (e.g. "columns") -> Doris column ("n__columns")
+	nestedRootPaths         map[string][]string
+	NestedRootSpecs         []NestedRootSpec
+	RawMapping              *esast.MappingSpec
+	MaxTotalFields          int
+	MaxNestedFields         int
+	HasExplicitNestedLimit  bool
+	MaxNestedObjects        int
+	MaxDepth                int
+	MaxFieldNameLength      int
+	MaxTermsCount           int
+	MaxResultWindow         int
+	MaxDocvalueFieldsSearch int
+	MaxScriptFields         int
+	MaxRegexLength          int
+	DefaultCoerce           *bool
+	DefaultIgnoreMalformed  *bool
+	SourceMode              string
+	SyntheticSource         bool
+	SourceConfig            *SourceConfig
 }
 
 // CopyIndexMappingSettingsFrom copies index-level mapping/search limits and defaults from src into s.
@@ -232,6 +241,18 @@ func (s *IndexSchema) CopyIndexMappingSettingsFrom(src *IndexSchema) {
 	if src.MaxTermsCount > 0 {
 		s.MaxTermsCount = src.MaxTermsCount
 	}
+	if src.MaxResultWindow > 0 {
+		s.MaxResultWindow = src.MaxResultWindow
+	}
+	if src.MaxDocvalueFieldsSearch > 0 {
+		s.MaxDocvalueFieldsSearch = src.MaxDocvalueFieldsSearch
+	}
+	if src.MaxScriptFields > 0 {
+		s.MaxScriptFields = src.MaxScriptFields
+	}
+	if src.MaxRegexLength > 0 {
+		s.MaxRegexLength = src.MaxRegexLength
+	}
 	if src.DefaultCoerce != nil {
 		v := *src.DefaultCoerce
 		s.DefaultCoerce = &v
@@ -239,6 +260,16 @@ func (s *IndexSchema) CopyIndexMappingSettingsFrom(src *IndexSchema) {
 	if src.DefaultIgnoreMalformed != nil {
 		v := *src.DefaultIgnoreMalformed
 		s.DefaultIgnoreMalformed = &v
+	}
+	if src.SourceMode != "" && s.SourceMode == "" {
+		s.SourceMode = src.SourceMode
+	}
+	if src.SyntheticSource {
+		s.SyntheticSource = true
+	}
+	if src.SourceConfig != nil && s.SourceConfig == nil {
+		cp := *src.SourceConfig
+		s.SourceConfig = &cp
 	}
 }
 
@@ -272,10 +303,22 @@ func (s *IndexSchema) withEffectiveDefaults(b FieldBinding) FieldBinding {
 	return b
 }
 
-// SourceDisabled reports whether the mapping `_source` meta-field explicitly sets `"enabled": false`.
+// SourceDisabled reports whether the mapping `_source` meta-field explicitly disables `_source` (`"enabled": false` or `"mode": "disabled"`).
 func (s *IndexSchema) SourceDisabled() bool {
-	if s == nil || s.RawMapping == nil || len(s.RawMapping.Source) == 0 {
+	if s == nil {
 		return false
+	}
+	if s.SourceMode == "disabled" {
+		return true
+	}
+	if s.SourceConfig != nil && s.SourceConfig.Enabled != nil && !*s.SourceConfig.Enabled {
+		return true
+	}
+	if s.RawMapping == nil || len(s.RawMapping.Source) == 0 {
+		return false
+	}
+	if rawMode, ok := s.RawMapping.Source["mode"].(string); ok && strings.EqualFold(strings.TrimSpace(rawMode), "disabled") {
+		return true
 	}
 	if rawEnabled, ok := s.RawMapping.Source["enabled"]; ok {
 		if b, isBool := rawEnabled.(bool); isBool {
@@ -337,8 +380,20 @@ func CompileIndexSchema(dorisDB, indexName string, mapping *esast.MappingSpec) *
 		DefaultCoerce:          &defaultCoerce,
 		DefaultIgnoreMalformed: &defaultIgnoreMalformed,
 	}
-	if mapping != nil && len(mapping.Properties) > 0 {
-		s.compileProperties(nil, nil, "", 0, mapping.Properties)
+	if mapping != nil {
+		if mapping.Source != nil {
+			if cfg, err := ParseSourceConfig(mapping.Source); err == nil {
+				s.SourceConfig = cfg
+				s.SourceMode = cfg.Mode
+				s.SyntheticSource = cfg.Mode == "synthetic"
+			}
+		}
+		if len(mapping.Properties) > 0 {
+			if expanded, err := ExpandDottedPropertiesWithSubobjects(mapping.Properties, mapping.Subobjects != nil && !*mapping.Subobjects); err == nil {
+				mapping.Properties = expanded
+			}
+			s.compileProperties(nil, nil, "", 0, mapping.Properties)
+		}
 	}
 	s.finalizeCompiledSlices()
 	return s
@@ -544,6 +599,7 @@ func MergeMappingSpecs(oldSpec, newSpec *esast.MappingSpec) *esast.MappingSpec {
 		return &esast.MappingSpec{Properties: make(map[string]esast.FieldProperty)}
 	}
 	if oldSpec == nil {
+		subFalse := newSpec.Subobjects != nil && !*newSpec.Subobjects
 		return &esast.MappingSpec{
 			Dynamic:            newSpec.Dynamic,
 			Subobjects:         newSpec.Subobjects,
@@ -554,11 +610,12 @@ func MergeMappingSpecs(oldSpec, newSpec *esast.MappingSpec) *esast.MappingSpec {
 			DateDetection:      newSpec.DateDetection,
 			NumericDetection:   newSpec.NumericDetection,
 			DynamicDateFormats: newSpec.DynamicDateFormats,
-			Runtime:            DeepMergeMappingProperties(nil, newSpec.Runtime),
-			Properties:         DeepMergeMappingProperties(nil, newSpec.Properties),
+			Runtime:            deepMergeMappingPropertiesWithSubobjects(nil, newSpec.Runtime, true),
+			Properties:         deepMergeMappingPropertiesWithSubobjects(nil, newSpec.Properties, subFalse),
 		}
 	}
 	if newSpec == nil {
+		subFalse := oldSpec.Subobjects != nil && !*oldSpec.Subobjects
 		return &esast.MappingSpec{
 			Dynamic:            oldSpec.Dynamic,
 			Subobjects:         oldSpec.Subobjects,
@@ -569,8 +626,8 @@ func MergeMappingSpecs(oldSpec, newSpec *esast.MappingSpec) *esast.MappingSpec {
 			DateDetection:      oldSpec.DateDetection,
 			NumericDetection:   oldSpec.NumericDetection,
 			DynamicDateFormats: oldSpec.DynamicDateFormats,
-			Runtime:            DeepMergeMappingProperties(nil, oldSpec.Runtime),
-			Properties:         DeepMergeMappingProperties(nil, oldSpec.Properties),
+			Runtime:            deepMergeMappingPropertiesWithSubobjects(nil, oldSpec.Runtime, true),
+			Properties:         deepMergeMappingPropertiesWithSubobjects(nil, oldSpec.Properties, subFalse),
 		}
 	}
 	dyn := oldSpec.Dynamic
@@ -609,6 +666,7 @@ func MergeMappingSpecs(oldSpec, newSpec *esast.MappingSpec) *esast.MappingSpec {
 	if newSpec.DynamicDateFormats != nil {
 		dynDateFormats = newSpec.DynamicDateFormats
 	}
+	subFalse := subobj != nil && !*subobj
 	return &esast.MappingSpec{
 		Dynamic:            dyn,
 		Subobjects:         subobj,
@@ -619,8 +677,8 @@ func MergeMappingSpecs(oldSpec, newSpec *esast.MappingSpec) *esast.MappingSpec {
 		DateDetection:      dateDet,
 		NumericDetection:   numDet,
 		DynamicDateFormats: dynDateFormats,
-		Runtime:            DeepMergeMappingProperties(oldSpec.Runtime, newSpec.Runtime),
-		Properties:         DeepMergeMappingProperties(oldSpec.Properties, newSpec.Properties),
+		Runtime:            deepMergeMappingPropertiesWithSubobjects(oldSpec.Runtime, newSpec.Runtime, true),
+		Properties:         deepMergeMappingPropertiesWithSubobjects(oldSpec.Properties, newSpec.Properties, subFalse),
 	}
 }
 
@@ -970,6 +1028,14 @@ func validateNullValueForField(fullPath, fType string, prop esast.FieldProperty)
 func validateSingleFieldProperty(fullPath, fType string, prop esast.FieldProperty) error {
 	if fType != "" && !knownESFieldTypes[fType] {
 		return fmt.Errorf("mapper_parsing_exception: No handler for type [%s] declared on field [%s]", prop.Type, fullPath)
+	}
+	if len(prop.Meta) > 0 {
+		if err := esast.ValidateFieldMetaStringMap(prop.Meta); err != nil {
+			return err
+		}
+	}
+	if err := validateCompletionContextsMapping(fullPath, fType, prop.Contexts); err != nil {
+		return err
 	}
 	if fType == "alias" {
 		if len(prop.Properties) > 0 || len(prop.Fields) > 0 {
@@ -1378,10 +1444,8 @@ func validateDynamicTemplatesSpec(templates []map[string]any) error {
 			if err != nil {
 				return fmt.Errorf("mapper_parsing_exception: invalid mapping in dynamic template [%s]: %w", tmplName, err)
 			}
-			var fp esast.FieldProperty
-			dec := json.NewDecoder(bytes.NewReader(b))
-			dec.DisallowUnknownFields()
-			if err := dec.Decode(&fp); err != nil {
+			fp, err := esast.UnmarshalFieldPropertyStrict(b)
+			if err != nil {
 				return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] has unsupported or invalid mapping parameter: %w", tmplName, err)
 			}
 			substituteDynamicTemplatePlaceholders(&fp, tmplName, repType)
@@ -1420,27 +1484,55 @@ func parseMappingSourcePatternSlice(raw any, fieldName string) ([]string, error)
 }
 
 type normalizedMappingSource struct {
-	enabled           bool
-	includes          []string
-	excludes          []string
-	hasCompress       bool
-	compress          bool
-	compressThreshold string
+	mode               string
+	synthetic          bool
+	hasExplicitMode    bool
+	hasExplicitEnabled bool
+	enabled            bool
+	includes           []string
+	excludes           []string
+	hasCompress        bool
+	compress           bool
+	compressThreshold  string
+}
+
+func (n normalizedMappingSource) effectiveMode() string {
+	if !n.enabled {
+		return "disabled"
+	}
+	if n.mode != "" {
+		return n.mode
+	}
+	return "stored"
 }
 
 func validateAndNormalizeMappingSourceSpec(src map[string]any) (normalizedMappingSource, error) {
-	norm := normalizedMappingSource{enabled: true}
+	norm := normalizedMappingSource{mode: "stored", enabled: true}
 	if src == nil {
 		return norm, nil
 	}
 	for k, v := range src {
 		switch k {
+		case "mode":
+			s, ok := v.(string)
+			if !ok {
+				return norm, fmt.Errorf("mapper_parsing_exception: [_source.mode] must be a string, got %T", v)
+			}
+			modeLower := strings.ToLower(strings.TrimSpace(s))
+			switch modeLower {
+			case "synthetic", "stored", "disabled":
+				norm.mode = modeLower
+				norm.hasExplicitMode = true
+			default:
+				return norm, fmt.Errorf("mapper_parsing_exception: illegal [_source] mode [%s]; must be one of [disabled, stored, synthetic]", s)
+			}
 		case "enabled":
 			b, ok := v.(bool)
 			if !ok {
 				return norm, fmt.Errorf("mapper_parsing_exception: [_source.enabled] must be a boolean, got %T", v)
 			}
 			norm.enabled = b
+			norm.hasExplicitEnabled = true
 		case "includes":
 			inc, err := parseMappingSourcePatternSlice(v, "includes")
 			if err != nil {
@@ -1469,6 +1561,24 @@ func validateAndNormalizeMappingSourceSpec(src map[string]any) (normalizedMappin
 		default:
 			return norm, fmt.Errorf("mapper_parsing_exception: Root mapping definition has unsupported parameters in [_source]: [%s]", k)
 		}
+	}
+	if norm.hasExplicitMode {
+		if norm.mode == "disabled" {
+			if norm.hasExplicitEnabled && norm.enabled {
+				return norm, fmt.Errorf("mapper_parsing_exception: [_source] cannot set [enabled: true] when [mode] is [disabled]")
+			}
+			norm.enabled = false
+		} else {
+			if norm.hasExplicitEnabled && !norm.enabled {
+				return norm, fmt.Errorf("mapper_parsing_exception: [_source] cannot set [enabled: false] when [mode] is [%s]", norm.mode)
+			}
+			norm.enabled = true
+			if norm.mode == "synthetic" {
+				norm.synthetic = true
+			}
+		}
+	} else if !norm.enabled {
+		norm.mode = "disabled"
 	}
 	if !norm.enabled && (len(norm.includes) > 0 || len(norm.excludes) > 0) {
 		return norm, fmt.Errorf("mapper_parsing_exception: [_source] cannot specify [includes] or [excludes] when [enabled] is false")
@@ -1515,16 +1625,19 @@ func ValidateMappingLimits(s *IndexSchema, spec *esast.MappingSpec) error {
 	totalFields := 0
 	nestedFields := 0
 	checkFieldName := func(name string) error {
-		if maxFieldNameLen <= 0 {
-			return nil
-		}
-		if len(name) > maxFieldNameLen {
-			return fmt.Errorf("illegal_argument_exception: Field name [%s] is longer than the limit of [%d] characters", name, maxFieldNameLen)
+		if name == "" || strings.TrimSpace(name) == "" {
+			return fmt.Errorf("mapper_parsing_exception: Field name cannot be an empty string")
 		}
 		for _, seg := range strings.Split(name, ".") {
-			if len(seg) > maxFieldNameLen {
+			if seg == "" {
+				return fmt.Errorf("mapper_parsing_exception: Field name cannot be an empty string")
+			}
+			if maxFieldNameLen > 0 && len(seg) > maxFieldNameLen {
 				return fmt.Errorf("illegal_argument_exception: Field name [%s] is longer than the limit of [%d] characters", seg, maxFieldNameLen)
 			}
+		}
+		if maxFieldNameLen > 0 && len(name) > maxFieldNameLen {
+			return fmt.Errorf("illegal_argument_exception: Field name [%s] is longer than the limit of [%d] characters", name, maxFieldNameLen)
 		}
 		return nil
 	}
@@ -1623,6 +1736,11 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 	if len(m.Properties) == 0 {
 		return nil
 	}
+	expandedProps, err := ExpandDottedPropertiesWithSubobjects(m.Properties, m.Subobjects != nil && !*m.Subobjects)
+	if err != nil {
+		return err
+	}
+	m.Properties = expandedProps
 	allTypes := make(map[string]string)
 	for rtName, rtProp := range m.Runtime {
 		allTypes[rtName] = strings.ToLower(strings.TrimSpace(rtProp.Type))
@@ -1791,6 +1909,7 @@ func ValidateMappingUpdateCompatibility(oldSpec, newSpec *esast.MappingSpec) err
 		}
 		oldSrcNorm, _ := validateAndNormalizeMappingSourceSpec(oldSpec.Source)
 		if newSrcNorm.enabled != oldSrcNorm.enabled ||
+			newSrcNorm.effectiveMode() != oldSrcNorm.effectiveMode() ||
 			!stringSlicesEqualExact(newSrcNorm.includes, oldSrcNorm.includes) ||
 			!stringSlicesEqualExact(newSrcNorm.excludes, oldSrcNorm.excludes) ||
 			(newSrcNorm.hasCompress && newSrcNorm.compress != oldSrcNorm.compress) ||
@@ -1807,16 +1926,31 @@ func ValidateMappingUpdateCompatibility(oldSpec, newSpec *esast.MappingSpec) err
 			return fmt.Errorf("illegal_argument_exception: Mapper for [_doc] conflicts with existing mapper: Cannot update parameter [subobjects] from [%v] to [%v]", oldEffectiveSub, *newSpec.Subobjects)
 		}
 	}
-	if err := validatePropertiesCompatibility(oldSpec.Properties, newSpec.Properties, ""); err != nil {
+	mergedSubobjects := newSpec.Subobjects
+	if mergedSubobjects == nil {
+		mergedSubobjects = oldSpec.Subobjects
+	}
+	rootSubFalse := mergedSubobjects != nil && !*mergedSubobjects
+	oldProps := oldSpec.Properties
+	if len(oldProps) > 0 {
+		if expOld, err := ExpandDottedPropertiesWithSubobjects(oldProps, rootSubFalse); err == nil {
+			oldProps = expOld
+		}
+	}
+	newProps := newSpec.Properties
+	if len(newProps) > 0 {
+		expNew, err := expandDottedPropertiesWithBase(newProps, oldProps, rootSubFalse)
+		if err != nil {
+			return err
+		}
+		newProps = expNew
+	}
+	if err := validatePropertiesCompatibility(oldProps, newProps, ""); err != nil {
 		return err
 	}
 	mergedDynamic := newSpec.Dynamic
 	if mergedDynamic == nil {
 		mergedDynamic = oldSpec.Dynamic
-	}
-	mergedSubobjects := newSpec.Subobjects
-	if mergedSubobjects == nil {
-		mergedSubobjects = oldSpec.Subobjects
 	}
 	mergedDynTemplates := newSpec.DynamicTemplates
 	if mergedDynTemplates == nil {
@@ -1830,9 +1964,9 @@ func ValidateMappingUpdateCompatibility(oldSpec, newSpec *esast.MappingSpec) err
 		Dynamic:          mergedDynamic,
 		Subobjects:       mergedSubobjects,
 		Source:           mergedSource,
-		Runtime:          DeepMergeMappingProperties(oldSpec.Runtime, newSpec.Runtime),
+		Runtime:          deepMergeMappingPropertiesWithSubobjects(oldSpec.Runtime, newSpec.Runtime, true),
 		DynamicTemplates: mergedDynTemplates,
-		Properties:       DeepMergeMappingProperties(oldSpec.Properties, newSpec.Properties),
+		Properties:       deepMergeMappingPropertiesWithSubobjects(oldProps, newProps, rootSubFalse),
 	}
 	return ValidateMappingSpec(merged)
 }
@@ -1976,6 +2110,9 @@ func validatePropertiesCompatibility(oldProps, newProps map[string]esast.FieldPr
 				return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: Cannot update parameter [depth_limit] from [%d] to [%d]", fullPath, oldDL, *newProp.DepthLimit)
 			}
 		}
+		if oldType == "completion" && len(newProp.Contexts) > 0 && !completionContextsEqual(oldProp.Contexts, newProp.Contexts) {
+			return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: Cannot update parameter [contexts]", fullPath)
+		}
 		if len(oldProp.Fields) > 0 && len(newProp.Fields) > 0 {
 			if err := validatePropertiesCompatibility(oldProp.Fields, newProp.Fields, fullPath); err != nil {
 				return err
@@ -2041,14 +2178,38 @@ func (s *IndexSchema) IsDynamicFalseUnmappedField(esFieldPath string) bool {
 func DeepMergeMappingProperties(
 	dst, src map[string]esast.FieldProperty,
 ) map[string]esast.FieldProperty {
+	return deepMergeMappingPropertiesWithSubobjects(dst, src, false)
+}
+
+func deepMergeMappingPropertiesWithSubobjects(
+	dst, src map[string]esast.FieldProperty,
+	subobjectsFalse bool,
+) map[string]esast.FieldProperty {
+	if len(dst) > 0 {
+		if expDst, err := expandDottedPropertiesWithBase(dst, nil, subobjectsFalse); err == nil {
+			dst = expDst
+		}
+	}
+	if len(src) > 0 {
+		if expSrc, err := expandDottedPropertiesWithBase(src, dst, subobjectsFalse); err == nil {
+			src = expSrc
+		}
+	}
 	out := make(map[string]esast.FieldProperty, len(dst)+len(src))
 	for k, v := range dst {
 		copied := v
+		if len(v.Meta) > 0 {
+			copied.Meta = cloneStringMap(v.Meta)
+		}
+		if len(v.Contexts) > 0 {
+			copied.Contexts = cloneCompletionContexts(v.Contexts)
+		}
 		if len(v.Properties) > 0 {
-			copied.Properties = DeepMergeMappingProperties(nil, v.Properties)
+			childSubFalse := subobjectsFalse || (v.Subobjects != nil && !*v.Subobjects)
+			copied.Properties = deepMergeMappingPropertiesWithSubobjects(nil, v.Properties, childSubFalse)
 		}
 		if len(v.Fields) > 0 {
-			copied.Fields = DeepMergeMappingProperties(nil, v.Fields)
+			copied.Fields = deepMergeMappingPropertiesWithSubobjects(nil, v.Fields, true)
 		}
 		out[k] = copied
 	}
@@ -2134,7 +2295,10 @@ func DeepMergeMappingProperties(
 				merged.Script = v.Script
 			}
 			if v.Meta != nil {
-				merged.Meta = v.Meta
+				merged.Meta = cloneStringMap(v.Meta)
+			}
+			if len(v.Contexts) > 0 {
+				merged.Contexts = cloneCompletionContexts(v.Contexts)
 			}
 			if v.IndexPrefixes != nil {
 				merged.IndexPrefixes = v.IndexPrefixes
@@ -2191,14 +2355,21 @@ func DeepMergeMappingProperties(
 				merged.Relations = v.Relations
 			}
 			if len(v.Properties) > 0 {
-				merged.Properties = DeepMergeMappingProperties(existing.Properties, v.Properties)
+				mergedSubFalse := subobjectsFalse || (merged.Subobjects != nil && !*merged.Subobjects)
+				merged.Properties = deepMergeMappingPropertiesWithSubobjects(existing.Properties, v.Properties, mergedSubFalse)
 			}
 			if len(v.Fields) > 0 {
-				merged.Fields = DeepMergeMappingProperties(existing.Fields, v.Fields)
+				merged.Fields = deepMergeMappingPropertiesWithSubobjects(existing.Fields, v.Fields, true)
 			}
 			out[k] = merged
 		} else {
 			copied := v
+			if len(v.Meta) > 0 {
+				copied.Meta = cloneStringMap(v.Meta)
+			}
+			if len(v.Contexts) > 0 {
+				copied.Contexts = cloneCompletionContexts(v.Contexts)
+			}
 			if v.Store != nil {
 				b := *v.Store
 				copied.Store = &b
@@ -2216,10 +2387,11 @@ func DeepMergeMappingProperties(
 				copied.DepthLimit = &dl
 			}
 			if len(v.Properties) > 0 {
-				copied.Properties = DeepMergeMappingProperties(nil, v.Properties)
+				childSubFalse := subobjectsFalse || (v.Subobjects != nil && !*v.Subobjects)
+				copied.Properties = deepMergeMappingPropertiesWithSubobjects(nil, v.Properties, childSubFalse)
 			}
 			if len(v.Fields) > 0 {
-				copied.Fields = DeepMergeMappingProperties(nil, v.Fields)
+				copied.Fields = deepMergeMappingPropertiesWithSubobjects(nil, v.Fields, true)
 			}
 			out[k] = copied
 		}
@@ -2390,6 +2562,9 @@ func (s *IndexSchema) registerLeafField(
 		}
 	}
 
+	metaMap := cloneStringMap(prop.Meta)
+	ctxSlice := cloneCompletionContexts(prop.Contexts)
+
 	if IsRangeFieldType(esType) || esType == "histogram" || esType == "flattened" || esType == "sparse_vector" || esType == "rank_features" || esType == "percolator" || esType == "geo_shape" {
 		s.Fields[dotPath] = FieldBinding{
 			ESFieldPath:              dotPath,
@@ -2415,6 +2590,8 @@ func (s *IndexSchema) registerLeafField(
 			MaxShingleSize:           maxShingle,
 			DepthLimit:               depthLimit,
 			Relations:                prop.Relations,
+			Meta:                     metaMap,
+			Contexts:                 ctxSlice,
 			NotIndexed:               notIndexed,
 			DocValuesFalse:           docValuesFalse,
 		}
@@ -2458,6 +2635,8 @@ func (s *IndexSchema) registerLeafField(
 			MaxShingleSize:           maxShingle,
 			DepthLimit:               depthLimit,
 			Relations:                prop.Relations,
+			Meta:                     metaMap,
+			Contexts:                 ctxSlice,
 			NotIndexed:               notIndexed,
 			DocValuesFalse:           docValuesFalse,
 		}
@@ -2489,6 +2668,7 @@ func (s *IndexSchema) registerLeafField(
 			VectorMetric:      metric,
 			VectorElementType: elemType,
 			IgnoreMalformed:   prop.IgnoreMalformed,
+			Meta:              metaMap,
 			NotIndexed:        notIndexed,
 			DocValuesFalse:    docValuesFalse,
 		}
@@ -2524,6 +2704,8 @@ func (s *IndexSchema) registerLeafField(
 			MaxShingleSize:           maxShingle,
 			DepthLimit:               depthLimit,
 			Relations:                prop.Relations,
+			Meta:                     metaMap,
+			Contexts:                 ctxSlice,
 			NotIndexed:               notIndexed,
 			DocValuesFalse:           docValuesFalse,
 		}
@@ -2554,6 +2736,8 @@ func (s *IndexSchema) registerLeafField(
 		MaxShingleSize:           maxShingle,
 		DepthLimit:               depthLimit,
 		Relations:                prop.Relations,
+		Meta:                     metaMap,
+		Contexts:                 ctxSlice,
 		NotIndexed:               notIndexed,
 		DocValuesFalse:           docValuesFalse,
 	}
@@ -3070,7 +3254,14 @@ func inferScalarRuntimeProperty(val any, opts inferOptions) (esast.FieldProperty
 	case bool:
 		return esast.FieldProperty{Type: "boolean"}, true
 	case json.Number:
-		if strings.ContainsAny(v.String(), ".eE") {
+		s := v.String()
+		if strings.ContainsAny(s, ".eE") {
+			return esast.FieldProperty{Type: "double"}, true
+		}
+		if _, err := strconv.ParseInt(s, 10, 64); err != nil {
+			if _, errU := strconv.ParseUint(s, 10, 64); errU == nil {
+				return esast.FieldProperty{Type: "unsigned_long"}, true
+			}
 			return esast.FieldProperty{Type: "double"}, true
 		}
 		return esast.FieldProperty{Type: "long"}, true
@@ -3478,6 +3669,12 @@ func inferValuePropertyWithOpts(val any, fieldName, fullPath string, depth int, 
 		if strings.ContainsAny(s, ".eE") {
 			return esast.FieldProperty{Type: "double"}, true
 		}
+		if _, err := strconv.ParseInt(s, 10, 64); err != nil {
+			if _, errU := strconv.ParseUint(s, 10, 64); errU == nil {
+				return esast.FieldProperty{Type: "unsigned_long"}, true
+			}
+			return esast.FieldProperty{Type: "double"}, true
+		}
 		return esast.FieldProperty{Type: "long"}, true
 	case float64:
 		return esast.FieldProperty{Type: "double"}, true
@@ -3667,9 +3864,12 @@ func mergeFieldProperty(existing, incoming esast.FieldProperty) esast.FieldPrope
 		existing.MultiValued = mv
 		return existing
 	}
-	// Widening rules: long + double -> double; dense_vector + numeric -> multi-valued double; keyword + text -> text (with .keyword); incompatible scalars -> keyword/text
+	// Widening rules: long + unsigned_long -> unsigned_long; long/unsigned_long + double -> double; dense_vector + numeric -> multi-valued double; keyword + text -> text (with .keyword); incompatible scalars -> keyword/text
+	if (existing.Type == "long" && incoming.Type == "unsigned_long") || (existing.Type == "unsigned_long" && incoming.Type == "long") {
+		return esast.FieldProperty{Type: "unsigned_long", MultiValued: mv}
+	}
 	isNumericOrVec := func(t string) bool {
-		return t == "long" || t == "double" || t == "dense_vector" || t == "knn_vector"
+		return t == "long" || t == "unsigned_long" || t == "double" || t == "dense_vector" || t == "knn_vector"
 	}
 	if isNumericOrVec(existing.Type) && isNumericOrVec(incoming.Type) {
 		if existing.Type == "dense_vector" || existing.Type == "knn_vector" || incoming.Type == "dense_vector" || incoming.Type == "knn_vector" {

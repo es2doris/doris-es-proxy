@@ -33,24 +33,61 @@ var supportedRunnerFeatures = map[string]bool{
 	"allowed_warnings":       true,
 	"allowed_warnings_regex": true,
 	"contains":               true,
+	"not_contains":           true,
 	"transform_and_set":      true,
 	"arbitrary_key":          true,
 	"regex":                  true,
+	"regex_flags":            true,
 	"gt":                     true,
 	"gte":                    true,
 	"lt":                     true,
 	"lte":                    true,
+	"close_to":               true,
+	"length":                 true,
+	"is_true":                true,
+	"is_false":               true,
+	"is_unset":               true,
+	"is_empty":               true,
+	"exists":                 true,
+	"yaml":                   true,
 	"catch_param":            true,
 	"stash_in_key":           true,
 	"stash_in_path":          true,
 	"node_selector":          true,
+	"wait_for_events":        true,
 	"default_shards":         true,
 	"painless":               true,
 	"mustache":               true,
 	"clean_text":             true,
-	"is_empty":               true,
-	"is_unset":               true,
-	"not_contains":           true,
+}
+
+var defaultSupportedClusterFeatures = map[string]bool{
+	"mapper.boolean_simpler_mapping":             true,
+	"mapper.keyword_normalizer_synthetic_source": true,
+	"mapper.source.synthetic":                    true,
+	"mapper.source.synthetic_source_fallback":    true,
+	"mapper.subobjects":                          true,
+	"mapper.track_ignored_source":                true,
+	"scripting.emit_api":                         true,
+	"ingest.processors.script_fields":            true,
+}
+
+// DefaultSupportedTestRunnerFeatures returns a copy of the default test-runner feature set.
+func DefaultSupportedTestRunnerFeatures() map[string]bool {
+	out := make(map[string]bool, len(supportedRunnerFeatures))
+	for k, v := range supportedRunnerFeatures {
+		out[k] = v
+	}
+	return out
+}
+
+// DefaultSupportedClusterFeatures returns a copy of the default supported cluster capabilities.
+func DefaultSupportedClusterFeatures() map[string]bool {
+	out := make(map[string]bool, len(defaultSupportedClusterFeatures))
+	for k, v := range defaultSupportedClusterFeatures {
+		out[k] = v
+	}
+	return out
 }
 
 type errSkipSection struct {
@@ -141,13 +178,16 @@ func runSpecDocument(t *testing.T, client *http.Client, baseURL, fileName string
 	fileRep := FileReport{File: fileName}
 	trimmedBase := strings.TrimRight(baseURL, "/")
 	t.Run(fileName, func(t *testing.T) {
-		if reason, skip := shouldSkipSection(specDoc.Skip); skip {
+		probeCtx := newRunnerContext(client, trimmedBase)
+		if reason, skip := probeCtx.evalSkipSpec(specDoc.Skip, false); skip {
+			t.Skipf("file skipped: %s", reason)
+		}
+		if reason, skip := probeCtx.evalSkipSpec(specDoc.Requires, true); skip {
 			t.Skipf("file skipped: %s", reason)
 		}
 
-		probeCtx := newRunnerContext(client, trimmedBase)
 		for _, step := range specDoc.Setup {
-			if step.Op == "skip" {
+			if step.Op == "skip" || step.Op == "requires" {
 				fileRep.StepsRun++
 				report.StepsRun++
 				if err := probeCtx.execStep(step, false); err != nil {
@@ -155,7 +195,7 @@ func runSpecDocument(t *testing.T, client *http.Client, baseURL, fileName string
 					if errors.As(err, &skipErr) {
 						t.Skipf("setup skipped: %s", skipErr.reason)
 					}
-					t.Fatalf("[setup skip] %v", err)
+					t.Fatalf("[setup %s] %v", step.Op, err)
 				}
 			}
 		}
@@ -230,6 +270,9 @@ const (
 type runnerContext struct {
 	client                       *http.Client
 	baseURL                      string
+	targetVersion                string
+	supportedClusterFeatures     map[string]bool
+	supportedTestRunnerFeatures  map[string]bool
 	stash                        map[string]any
 	lastStatus                   int
 	lastMethod                   string
@@ -295,12 +338,16 @@ type runnerContext struct {
 	createdPITs                  map[string]bool
 	createdScrolls               map[string]bool
 	createdCCRFollowers          map[string]bool
+	startedBackgroundTasks       bool
 }
 
 func newRunnerContext(client *http.Client, baseURL string) *runnerContext {
 	return &runnerContext{
 		client:                       client,
 		baseURL:                      baseURL,
+		targetVersion:                proxyTargetVersion,
+		supportedClusterFeatures:     DefaultSupportedClusterFeatures(),
+		supportedTestRunnerFeatures:  DefaultSupportedTestRunnerFeatures(),
 		stash:                        make(map[string]any),
 		lastHeaders:                  make(map[string]any),
 		createdIndices:               make(map[string]bool),
@@ -361,6 +408,17 @@ func newRunnerContext(client *http.Client, baseURL string) *runnerContext {
 }
 
 func (c *runnerContext) cleanupAll() {
+	// 0. Cancel and drain any background async tasks (e.g. wait_for_completion=false reindex / update_by_query / delete_by_query)
+	if c.startedBackgroundTasks {
+		c.startedBackgroundTasks = false
+		_, _, _ = c.rawHTTP(http.MethodPost, "/_tasks/_cancel", nil, nil, nil)
+		_, _, _ = c.rawHTTP(http.MethodGet, "/_tasks", url.Values{
+			"actions":             []string{"*byquery*,*reindex*"},
+			"wait_for_completion": []string{"true"},
+			"timeout":             []string{"2s"},
+		}, nil, nil)
+	}
+
 	// 1. Stop & delete ML jobs/datafeeds/analytics/models, transforms, rollups, sync jobs & connectors, watches, async searches, SLM policies
 	for dfID := range c.createdMLDatafeeds {
 		if dfID != "" {
@@ -718,6 +776,8 @@ func (c *runnerContext) execStep(step SpecStep, isTeardown bool) error {
 	switch step.Op {
 	case "skip":
 		return c.execSkip(step.Value)
+	case "requires":
+		return c.execRequires(step.Value)
 	case "do":
 		return c.execDo(step.Value, isTeardown)
 	case "set":
@@ -736,10 +796,14 @@ func (c *runnerContext) execStep(step SpecStep, isTeardown bool) error {
 		return c.execIsFalse(step.Value)
 	case "is_unset":
 		return c.execIsUnset(step.Value)
+	case "exists":
+		return c.execExists(step.Value)
 	case "is_empty":
 		return c.execIsEmpty(step.Value)
 	case "length":
 		return c.execLength(step.Value)
+	case "close_to":
+		return c.execCloseTo(step.Value)
 	case "gt":
 		return c.execCompare("gt", step.Value)
 	case "gte":
@@ -748,6 +812,8 @@ func (c *runnerContext) execStep(step SpecStep, isTeardown bool) error {
 		return c.execCompare("lt", step.Value)
 	case "lte":
 		return c.execCompare("lte", step.Value)
+	case "wait_for_events":
+		return nil
 	default:
 		return fmt.Errorf("unsupported spec step operation %q", step.Op)
 	}
@@ -807,6 +873,9 @@ func (c *runnerContext) execDo(rawVal any, isTeardown bool) error {
 
 	if actionName == "" {
 		return fmt.Errorf("do step is missing API action name")
+	}
+	if strings.HasPrefix(actionName, "_internal.") && !c.hasClusterFeature(actionName) && !c.hasClusterFeature("_internal") {
+		return &errSkipSection{reason: fmt.Sprintf("unsupported internal plugin action %s", actionName)}
 	}
 
 	expandedParams := ToNative(c.expandStash(actionParams))
@@ -2038,31 +2107,55 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "indices.get_mapping":
 		method = http.MethodGet
-		if idx := popPath("index"); idx != "" {
+		idx := popPath("index")
+		docType := popString("type")
+		switch {
+		case idx != "" && docType != "":
+			reqPath = "/" + idx + "/_mapping/" + escapeCommaIDSegs(docType)
+		case idx != "":
 			reqPath = "/" + idx + "/_mapping"
-		} else {
+		case docType != "":
+			reqPath = "/_mapping/" + escapeCommaIDSegs(docType)
+		default:
 			reqPath = "/_mapping"
 		}
 
 	case "indices.put_mapping":
 		method = http.MethodPut
+		_, hasExplicitIndex := remaining["index"]
 		idx := popPath("index")
-		if idx == "" {
+		docType := popString("type")
+		if idx == "" && !hasBody && !hasExplicitIndex {
 			return nil, fmt.Errorf("indices.put_mapping requires index parameter")
 		}
-		reqPath = "/" + idx + "/_mapping"
+		switch {
+		case idx != "" && docType != "":
+			reqPath = "/" + idx + "/_mapping/" + escapeIDSeg(docType)
+		case idx != "":
+			reqPath = "/" + idx + "/_mapping"
+		case docType != "":
+			reqPath = "/_mapping/" + escapeIDSeg(docType)
+		default:
+			reqPath = "/_mapping"
+		}
 
 	case "indices.get_field_mapping":
 		method = http.MethodGet
 		idx := popPath("index")
+		docType := popString("type")
 		fields := popString("fields", "field")
 		if fields == "" {
 			return nil, fmt.Errorf("indices.get_field_mapping requires fields parameter")
 		}
 		fields = escapeCommaIDSegs(fields)
-		if idx != "" {
+		switch {
+		case idx != "" && docType != "":
+			reqPath = "/" + idx + "/_mapping/" + escapeCommaIDSegs(docType) + "/field/" + fields
+		case idx != "":
 			reqPath = "/" + idx + "/_mapping/field/" + fields
-		} else {
+		case docType != "":
+			reqPath = "/_mapping/" + escapeCommaIDSegs(docType) + "/field/" + fields
+		default:
 			reqPath = "/_mapping/field/" + fields
 		}
 
@@ -2294,112 +2387,176 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "index":
 		idx := popPath("index")
+		docType := popString("type")
 		id := popString("id")
 		if idx == "" {
 			return nil, fmt.Errorf("index requires index parameter")
 		}
+		if docType == "" {
+			docType = "_doc"
+		}
 		if id != "" {
 			method = http.MethodPut
-			reqPath = "/" + idx + "/_doc/" + escapeIDSeg(id)
+			reqPath = "/" + idx + "/" + escapeIDSeg(docType) + "/" + escapeIDSeg(id)
 		} else {
 			method = http.MethodPost
-			reqPath = "/" + idx + "/_doc"
+			reqPath = "/" + idx + "/" + escapeIDSeg(docType)
 		}
 
 	case "create":
 		method = http.MethodPut
 		idx := popPath("index")
+		docType := popString("type")
 		id := popString("id")
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("create requires index and id parameters")
 		}
-		reqPath = "/" + idx + "/_create/" + escapeIDSeg(id)
+		if docType != "" {
+			reqPath = "/" + idx + "/" + escapeIDSeg(docType) + "/" + escapeIDSeg(id) + "/_create"
+		} else {
+			reqPath = "/" + idx + "/_create/" + escapeIDSeg(id)
+		}
 
 	case "get":
 		method = http.MethodGet
 		idx := popPath("index")
+		docType := popString("type")
 		id := popString("id")
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("get requires index and id parameters")
 		}
-		reqPath = "/" + idx + "/_doc/" + escapeIDSeg(id)
+		if docType == "" {
+			docType = "_doc"
+		}
+		reqPath = "/" + idx + "/" + escapeIDSeg(docType) + "/" + escapeIDSeg(id)
 
 	case "get_source":
 		method = http.MethodGet
 		idx := popPath("index")
+		docType := popString("type")
 		id := popString("id")
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("get_source requires index and id parameters")
 		}
-		reqPath = "/" + idx + "/_source/" + escapeIDSeg(id)
+		if docType != "" {
+			reqPath = "/" + idx + "/" + escapeIDSeg(docType) + "/" + escapeIDSeg(id) + "/_source"
+		} else {
+			reqPath = "/" + idx + "/_source/" + escapeIDSeg(id)
+		}
 
 	case "exists":
 		method = http.MethodHead
 		idx := popPath("index")
+		docType := popString("type")
 		id := popString("id")
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("exists requires index and id parameters")
 		}
-		reqPath = "/" + idx + "/_doc/" + escapeIDSeg(id)
+		if docType == "" {
+			docType = "_doc"
+		}
+		reqPath = "/" + idx + "/" + escapeIDSeg(docType) + "/" + escapeIDSeg(id)
 
 	case "exists_source":
 		method = http.MethodHead
 		idx := popPath("index")
+		docType := popString("type")
 		id := popString("id")
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("exists_source requires index and id parameters")
 		}
-		reqPath = "/" + idx + "/_source/" + escapeIDSeg(id)
+		if docType != "" {
+			reqPath = "/" + idx + "/" + escapeIDSeg(docType) + "/" + escapeIDSeg(id) + "/_source"
+		} else {
+			reqPath = "/" + idx + "/_source/" + escapeIDSeg(id)
+		}
 
 	case "delete":
 		method = http.MethodDelete
 		idx := popPath("index")
+		docType := popString("type")
 		id := popString("id")
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("delete requires index and id parameters")
 		}
-		reqPath = "/" + idx + "/_doc/" + escapeIDSeg(id)
+		if docType == "" {
+			docType = "_doc"
+		}
+		reqPath = "/" + idx + "/" + escapeIDSeg(docType) + "/" + escapeIDSeg(id)
 
 	case "update":
 		method = http.MethodPost
 		idx := popPath("index")
+		docType := popString("type")
 		id := popString("id")
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("update requires index and id parameters")
 		}
-		reqPath = "/" + idx + "/_update/" + escapeIDSeg(id)
+		if docType != "" {
+			reqPath = "/" + idx + "/" + escapeIDSeg(docType) + "/" + escapeIDSeg(id) + "/_update"
+		} else {
+			reqPath = "/" + idx + "/_update/" + escapeIDSeg(id)
+		}
 
 	case "mget":
 		method = http.MethodPost
-		if idx := popPath("index"); idx != "" {
+		idx := popPath("index")
+		docType := popString("type")
+		switch {
+		case idx != "" && docType != "":
+			reqPath = "/" + idx + "/" + escapeIDSeg(docType) + "/_mget"
+		case idx != "":
 			reqPath = "/" + idx + "/_mget"
-		} else {
+		case docType != "":
+			reqPath = "/_all/" + escapeIDSeg(docType) + "/_mget"
+		default:
 			reqPath = "/_mget"
 		}
 
 	case "bulk":
 		method = http.MethodPost
 		isNDJSON = true
-		if idx := popPath("index"); idx != "" {
+		idx := popPath("index")
+		docType := popString("type")
+		switch {
+		case idx != "" && docType != "":
+			reqPath = "/" + idx + "/" + escapeIDSeg(docType) + "/_bulk"
+		case idx != "":
 			reqPath = "/" + idx + "/_bulk"
-		} else {
+		case docType != "":
+			reqPath = "/_all/" + escapeIDSeg(docType) + "/_bulk"
+		default:
 			reqPath = "/_bulk"
 		}
 
 	case "search":
 		method = http.MethodPost
-		if idx := popPath("index"); idx != "" {
+		idx := popPath("index")
+		docType := popString("type")
+		switch {
+		case idx != "" && docType != "":
+			reqPath = "/" + idx + "/" + escapeCommaIDSegs(docType) + "/_search"
+		case idx != "":
 			reqPath = "/" + idx + "/_search"
-		} else {
+		case docType != "":
+			reqPath = "/_all/" + escapeCommaIDSegs(docType) + "/_search"
+		default:
 			reqPath = "/_search"
 		}
 
 	case "msearch":
 		method = http.MethodPost
 		isNDJSON = true
-		if idx := popPath("index"); idx != "" {
+		idx := popPath("index")
+		docType := popString("type")
+		switch {
+		case idx != "" && docType != "":
+			reqPath = "/" + idx + "/" + escapeCommaIDSegs(docType) + "/_msearch"
+		case idx != "":
 			reqPath = "/" + idx + "/_msearch"
-		} else {
+		case docType != "":
+			reqPath = "/_all/" + escapeCommaIDSegs(docType) + "/_msearch"
+		default:
 			reqPath = "/_msearch"
 		}
 
@@ -2414,20 +2571,32 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "count":
 		method = http.MethodPost
-		if idx := popPath("index"); idx != "" {
+		idx := popPath("index")
+		docType := popString("type")
+		switch {
+		case idx != "" && docType != "":
+			reqPath = "/" + idx + "/" + escapeCommaIDSegs(docType) + "/_count"
+		case idx != "":
 			reqPath = "/" + idx + "/_count"
-		} else {
+		case docType != "":
+			reqPath = "/_all/" + escapeCommaIDSegs(docType) + "/_count"
+		default:
 			reqPath = "/_count"
 		}
 
 	case "explain":
 		method = http.MethodPost
 		idx := popPath("index")
+		docType := popString("type")
 		id := popString("id")
 		if idx == "" || id == "" {
 			return nil, fmt.Errorf("explain requires index and id parameters")
 		}
-		reqPath = "/" + idx + "/_explain/" + escapeIDSeg(id)
+		if docType != "" {
+			reqPath = "/" + idx + "/" + escapeIDSeg(docType) + "/" + escapeIDSeg(id) + "/_explain"
+		} else {
+			reqPath = "/" + idx + "/_explain/" + escapeIDSeg(id)
+		}
 
 	case "field_caps":
 		if hasBody {
@@ -3001,20 +3170,34 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			method = http.MethodGet
 		}
 		idx := popPath("index")
+		docType := popString("type")
 		if idx == "" {
 			return nil, fmt.Errorf("%s requires index parameter", action)
 		}
-		if id := popString("id"); id != "" {
+		id := popString("id")
+		switch {
+		case docType != "" && id != "":
+			reqPath = "/" + idx + "/" + escapeIDSeg(docType) + "/" + escapeIDSeg(id) + "/_termvectors"
+		case docType != "":
+			reqPath = "/" + idx + "/" + escapeIDSeg(docType) + "/_termvectors"
+		case id != "":
 			reqPath = "/" + idx + "/_termvectors/" + escapeIDSeg(id)
-		} else {
+		default:
 			reqPath = "/" + idx + "/_termvectors"
 		}
 
 	case "mtermvectors":
 		method = http.MethodPost
-		if idx := popPath("index"); idx != "" {
+		idx := popPath("index")
+		docType := popString("type")
+		switch {
+		case idx != "" && docType != "":
+			reqPath = "/" + idx + "/" + escapeIDSeg(docType) + "/_mtermvectors"
+		case idx != "":
 			reqPath = "/" + idx + "/_mtermvectors"
-		} else {
+		case docType != "":
+			reqPath = "/_all/" + escapeIDSeg(docType) + "/_mtermvectors"
+		default:
 			reqPath = "/_mtermvectors"
 		}
 
@@ -5943,8 +6126,67 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		}
 		reqPath = "/_capabilities"
 
+	case "indices.upgrade":
+		method = http.MethodPost
+		if idx := popPath("index"); idx != "" {
+			reqPath = "/" + idx + "/_upgrade"
+		} else {
+			reqPath = "/_upgrade"
+		}
+
+	case "indices.get_upgrade":
+		method = http.MethodGet
+		if idx := popPath("index"); idx != "" {
+			reqPath = "/" + idx + "/_upgrade"
+		} else {
+			reqPath = "/_upgrade"
+		}
+
+	case "scripts_painless_context":
+		method = http.MethodGet
+		reqPath = "/_scripts/painless/_context"
+
+	case "_internal.update_desired_nodes":
+		method = http.MethodPut
+		historyID := popString("history_id")
+		ver := popString("version")
+		if historyID != "" && ver != "" {
+			reqPath = "/_internal/desired_nodes/" + escapeIDSeg(historyID) + "/" + escapeIDSeg(ver)
+		} else {
+			reqPath = "/_internal/desired_nodes"
+		}
+
+	case "_internal.get_desired_nodes":
+		method = http.MethodGet
+		reqPath = "/_internal/desired_nodes"
+
+	case "_internal.delete_desired_nodes":
+		method = http.MethodDelete
+		reqPath = "/_internal/desired_nodes"
+
+	case "_internal.get_desired_balance":
+		method = http.MethodGet
+		reqPath = "/_internal/desired_balance"
+
+	case "_internal.delete_desired_balance":
+		method = http.MethodDelete
+		reqPath = "/_internal/desired_balance"
+
+	case "_internal.prevalidate_node_removal":
+		method = http.MethodPost
+		reqPath = "/_internal/prevalidate_node_removal"
+
 	default:
-		return nil, fmt.Errorf("unsupported rest-api-spec action %q", action)
+		if strings.HasPrefix(action, "_internal.") {
+			if hasBody && rawBody != nil {
+				method = http.MethodPost
+			} else {
+				method = http.MethodGet
+			}
+			reqPath = "/_internal/" + strings.TrimPrefix(action, "_internal.")
+		} else {
+			return nil, fmt.Errorf("unsupported rest-api-spec action %q", action)
+		}
 	}
 
 	query := url.Values{}
@@ -5964,6 +6206,8 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			switch b := rawBody.(type) {
 			case string:
 				bodyBytes = []byte(b)
+			case []any:
+				bodyBytes, err = serializeNDJSON(b)
 			default:
 				bodyBytes, err = json.Marshal(b)
 			}
@@ -6175,6 +6419,14 @@ func (c *runnerContext) rawHTTP(method, reqPath string, query url.Values, body [
 }
 
 func (c *runnerContext) rawHTTPWithContentType(method, reqPath string, query url.Values, body []byte, headers map[string]string, isNDJSON bool) (int, string, error) {
+	if query != nil {
+		if wfc := strings.ToLower(strings.TrimSpace(query.Get("wait_for_completion"))); wfc == "false" || wfc == "0" {
+			c.startedBackgroundTasks = true
+		}
+	}
+	if strings.Contains(reqPath, "wait_for_completion=false") || strings.Contains(reqPath, "wait_for_completion=0") {
+		c.startedBackgroundTasks = true
+	}
 	fullURL := c.baseURL + sanitizeRawReqPath(reqPath)
 	if len(query) > 0 {
 		fullURL += "?" + query.Encode()
@@ -6412,62 +6664,168 @@ func (c *runnerContext) expandStashPath(s string) string {
 	})
 }
 
-func shouldSkipSection(skip *SkipSpec) (string, bool) {
+func (c *runnerContext) effectiveTargetVersion() string {
+	if c != nil && c.targetVersion != "" {
+		return c.targetVersion
+	}
+	return proxyTargetVersion
+}
+
+func (c *runnerContext) hasTestRunnerFeature(feat string) bool {
+	if c != nil && c.supportedTestRunnerFeatures != nil {
+		return c.supportedTestRunnerFeatures[feat]
+	}
+	return supportedRunnerFeatures[feat]
+}
+
+func (c *runnerContext) hasClusterFeature(feat string) bool {
+	if c != nil && c.supportedClusterFeatures != nil {
+		return c.supportedClusterFeatures[feat]
+	}
+	return defaultSupportedClusterFeatures[feat]
+}
+
+func (c *runnerContext) evalClusterFeature(feat string) bool {
+	feat = strings.TrimSpace(feat)
+	if feat == "" {
+		return true
+	}
+	targetVer := c.effectiveTargetVersion()
+	if ver, ok := strings.CutPrefix(feat, "gte_v"); ok {
+		return compareSemver(targetVer, ver) >= 0
+	}
+	if ver, ok := strings.CutPrefix(feat, "lte_v"); ok {
+		return compareSemver(targetVer, ver) <= 0
+	}
+	if ver, ok := strings.CutPrefix(feat, "gt_v"); ok {
+		return compareSemver(targetVer, ver) > 0
+	}
+	if ver, ok := strings.CutPrefix(feat, "lt_v"); ok {
+		return compareSemver(targetVer, ver) < 0
+	}
+	return c.hasClusterFeature(feat)
+}
+
+func (c *runnerContext) evalSkipSpec(skip *SkipSpec, isRequires bool) (string, bool) {
 	if skip == nil {
 		return "", false
 	}
+	reasonOr := func(fallback string) string {
+		if skip.Reason != "" {
+			return skip.Reason
+		}
+		return fallback
+	}
+	if skip.KnownIssues {
+		return reasonOr("known_issues"), true
+	}
 	for _, feat := range skip.Features {
-		if !supportedRunnerFeatures[feat] {
-			r := skip.Reason
-			if r == "" {
-				r = fmt.Sprintf("unsupported feature %s", feat)
-			}
-			return r, true
+		if !c.hasTestRunnerFeature(feat) {
+			return reasonOr(fmt.Sprintf("unsupported feature %s", feat)), true
 		}
 	}
-	if skip.Version != "" && versionInRange(proxyTargetVersion, skip.Version) {
-		r := skip.Reason
-		if r == "" {
-			r = fmt.Sprintf("version %s in skip range %s", proxyTargetVersion, skip.Version)
+	for _, feat := range skip.TestRunnerFeatures {
+		if !c.hasTestRunnerFeature(feat) {
+			return reasonOr(fmt.Sprintf("unsupported test_runner_feature %s", feat)), true
 		}
-		return r, true
+	}
+	targetVer := c.effectiveTargetVersion()
+	if isRequires {
+		for _, cf := range skip.ClusterFeatures {
+			if !c.evalClusterFeature(cf) {
+				return reasonOr(fmt.Sprintf("unsupported cluster_feature %s", cf)), true
+			}
+		}
+		if skip.Version != "" && !versionInRange(targetVer, skip.Version) {
+			return reasonOr(fmt.Sprintf("version %s not in required range %s", targetVer, skip.Version)), true
+		}
+		return "", false
+	}
+
+	if len(skip.ClusterFeatures) > 0 {
+		allMatch := true
+		for _, cf := range skip.ClusterFeatures {
+			if !c.evalClusterFeature(cf) {
+				allMatch = false
+				break
+			}
+		}
+		if allMatch {
+			return reasonOr(fmt.Sprintf("cluster_features matched skip %v", skip.ClusterFeatures)), true
+		}
+	}
+	if skip.Version != "" && versionInRange(targetVer, skip.Version) {
+		return reasonOr(fmt.Sprintf("version %s in skip range %s", targetVer, skip.Version)), true
 	}
 	return "", false
 }
 
-func (c *runnerContext) execSkip(rawVal any) error {
-	pairs, err := extractFieldPairs("skip", rawVal)
+func (c *runnerContext) parseRuntimeSkipSpec(op string, rawVal any) (*SkipSpec, error) {
+	pairs, err := extractFieldPairs(op, rawVal)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	var versionSpec string
-	var reason string
-	var features []string
+	out := &SkipSpec{}
 	for _, p := range pairs {
 		switch p.Key {
 		case "version":
 			if p.Value != nil {
-				versionSpec = strings.TrimSpace(fmt.Sprintf("%v", c.expandStash(p.Value)))
+				out.Version = strings.TrimSpace(fmt.Sprintf("%v", c.expandStash(p.Value)))
 			}
 		case "reason":
 			if p.Value != nil {
-				reason = strings.TrimSpace(fmt.Sprintf("%v", c.expandStash(p.Value)))
+				out.Reason = strings.TrimSpace(fmt.Sprintf("%v", c.expandStash(p.Value)))
 			}
 		case "features":
 			for _, f := range extractStringSlice(c.expandStash(p.Value)) {
 				for _, part := range strings.Split(f, ",") {
 					if trimmed := strings.TrimSpace(part); trimmed != "" {
-						features = append(features, trimmed)
+						out.Features = append(out.Features, trimmed)
 					}
 				}
 			}
+		case "test_runner_features":
+			for _, f := range extractStringSlice(c.expandStash(p.Value)) {
+				for _, part := range strings.Split(f, ",") {
+					if trimmed := strings.TrimSpace(part); trimmed != "" {
+						out.TestRunnerFeatures = append(out.TestRunnerFeatures, trimmed)
+					}
+				}
+			}
+		case "cluster_features":
+			for _, f := range extractStringSlice(c.expandStash(p.Value)) {
+				for _, part := range strings.Split(f, ",") {
+					if trimmed := strings.TrimSpace(part); trimmed != "" {
+						out.ClusterFeatures = append(out.ClusterFeatures, trimmed)
+					}
+				}
+			}
+		case "known_issues":
+			if p.Value != nil {
+				out.KnownIssues = true
+			}
 		}
 	}
-	if r, skipped := shouldSkipSection(&SkipSpec{
-		Version:  versionSpec,
-		Reason:   reason,
-		Features: features,
-	}); skipped {
+	return out, nil
+}
+
+func (c *runnerContext) execSkip(rawVal any) error {
+	spec, err := c.parseRuntimeSkipSpec("skip", rawVal)
+	if err != nil {
+		return err
+	}
+	if r, skipped := c.evalSkipSpec(spec, false); skipped {
+		return &errSkipSection{reason: r}
+	}
+	return nil
+}
+
+func (c *runnerContext) execRequires(rawVal any) error {
+	spec, err := c.parseRuntimeSkipSpec("requires", rawVal)
+	if err != nil {
+		return err
+	}
+	if r, skipped := c.evalSkipSpec(spec, true); skipped {
 		return &errSkipSection{reason: r}
 	}
 	return nil
@@ -7126,10 +7484,200 @@ func (c *runnerContext) execMatch(rawVal any) error {
 	return nil
 }
 
-func compileComplianceRegex(spec string) (*regexp.Regexp, bool, error) {
-	if len(spec) < 2 || spec[0] != '/' {
+// stripESCommentsMode implements Java Pattern.COMMENTS ((?x)) free-spacing and
+// '#'-to-end-of-line comment stripping outside [...] character classes and \Q...\E quotes.
+func stripESCommentsMode(pattern string) string {
+	var sb strings.Builder
+	sb.Grow(len(pattern))
+	inCharClass := false
+	charClassStart := -1
+
+	for i := 0; i < len(pattern); i++ {
+		ch := pattern[i]
+		if inCharClass {
+			if ch == '\\' && i+1 < len(pattern) {
+				sb.WriteByte(ch)
+				i++
+				sb.WriteByte(pattern[i])
+				continue
+			}
+			if ch == '[' && i+1 < len(pattern) && (pattern[i+1] == ':' || pattern[i+1] == '=' || pattern[i+1] == '.') {
+				delim := pattern[i+1]
+				sb.WriteByte('[')
+				sb.WriteByte(delim)
+				i += 2
+				for i < len(pattern) {
+					if pattern[i] == delim && i+1 < len(pattern) && pattern[i+1] == ']' {
+						sb.WriteByte(delim)
+						sb.WriteByte(']')
+						i++
+						break
+					}
+					sb.WriteByte(pattern[i])
+					i++
+				}
+				continue
+			}
+			if ch == ']' {
+				isInitialLiteral := (i == charClassStart+1) || (i == charClassStart+2 && pattern[charClassStart+1] == '^')
+				if !isInitialLiteral {
+					inCharClass = false
+				}
+				sb.WriteByte(']')
+				continue
+			}
+			sb.WriteByte(ch)
+			continue
+		}
+
+		if ch == '\\' {
+			if i+1 >= len(pattern) {
+				sb.WriteByte('\\')
+				break
+			}
+			next := pattern[i+1]
+			if next == 'Q' {
+				sb.WriteString(`\Q`)
+				i += 2
+				for i < len(pattern) {
+					if pattern[i] == '\\' && i+1 < len(pattern) && pattern[i+1] == 'E' {
+						sb.WriteString(`\E`)
+						i++
+						break
+					}
+					sb.WriteByte(pattern[i])
+					i++
+				}
+				continue
+			}
+			i++
+			switch next {
+			case ' ', '#', '\t', '\r', '\n':
+				sb.WriteByte(next)
+			default:
+				sb.WriteByte('\\')
+				sb.WriteByte(next)
+			}
+			continue
+		}
+
+		if ch == '[' {
+			inCharClass = true
+			charClassStart = i
+			sb.WriteByte('[')
+			continue
+		}
+
+		if ch == '#' {
+			for i+1 < len(pattern) && pattern[i+1] != '\n' {
+				i++
+			}
+			continue
+		}
+
+		switch ch {
+		case ' ', '\t', '\r', '\n', '\f', '\v':
+			continue
+		default:
+			sb.WriteByte(ch)
+		}
+	}
+	return sb.String()
+}
+
+func isInlineRegexFlagByte(b byte) bool {
+	switch b {
+	case 'i', 'm', 's', 'x', 'U', '-':
+		return true
+	default:
+		return false
+	}
+}
+
+func extractInlineCommentsFlag(pattern string) (string, bool) {
+	if !strings.Contains(pattern, "(?") {
+		return pattern, false
+	}
+	var sb strings.Builder
+	sb.Grow(len(pattern))
+	inCharClass := false
+	charClassStart := -1
+	enabledX := false
+
+	for i := 0; i < len(pattern); i++ {
+		ch := pattern[i]
+		if ch == '\\' && i+1 < len(pattern) {
+			sb.WriteByte(ch)
+			i++
+			sb.WriteByte(pattern[i])
+			continue
+		}
+		if inCharClass {
+			if ch == ']' {
+				isInitialLiteral := (i == charClassStart+1) || (i == charClassStart+2 && pattern[charClassStart+1] == '^')
+				if !isInitialLiteral {
+					inCharClass = false
+				}
+			}
+			sb.WriteByte(ch)
+			continue
+		}
+		if ch == '[' {
+			inCharClass = true
+			charClassStart = i
+			sb.WriteByte('[')
+			continue
+		}
+		if ch == '(' && i+2 < len(pattern) && pattern[i+1] == '?' {
+			j := i + 2
+			for j < len(pattern) && isInlineRegexFlagByte(pattern[j]) {
+				j++
+			}
+			if j > i+2 && j < len(pattern) && (pattern[j] == ')' || pattern[j] == ':') {
+				rawFlags := pattern[i+2 : j]
+				if strings.ContainsRune(rawFlags, 'x') {
+					negIdx := strings.IndexByte(rawFlags, '-')
+					xIdx := strings.IndexByte(rawFlags, 'x')
+					if negIdx < 0 || xIdx < negIdx {
+						enabledX = true
+					}
+					cleanedFlags := strings.ReplaceAll(rawFlags, "x", "")
+					cleanedFlags = strings.TrimSuffix(cleanedFlags, "-")
+					if cleanedFlags == "-" {
+						cleanedFlags = ""
+					}
+					if pattern[j] == ')' {
+						if cleanedFlags != "" {
+							sb.WriteString("(?")
+							sb.WriteString(cleanedFlags)
+							sb.WriteByte(')')
+						}
+					} else {
+						sb.WriteString("(?")
+						sb.WriteString(cleanedFlags)
+						sb.WriteByte(':')
+					}
+					i = j
+					continue
+				}
+			}
+		}
+		sb.WriteByte(ch)
+	}
+	return sb.String(), enabledX
+}
+
+func compileRegexWithMode(spec string, defaultComments bool) (*regexp.Regexp, bool, error) {
+	trimmed := strings.TrimSpace(spec)
+	if len(trimmed) < 2 || trimmed[0] != '/' {
 		return nil, false, nil
 	}
+	// Only accept surrounding whitespace when the raw spec itself starts with '/'
+	// or is a multiline block scalar starting with '/'.
+	if spec[0] != '/' && !strings.Contains(spec, "\n") {
+		return nil, false, nil
+	}
+	spec = trimmed
 	lastSlash := strings.LastIndexByte(spec, '/')
 	if lastSlash <= 0 {
 		return nil, false, nil
@@ -7144,6 +7692,7 @@ func compileComplianceRegex(spec string) (*regexp.Regexp, bool, error) {
 	rawFlags := spec[lastSlash+1:]
 	hasI := false
 	hasM := false
+	hasX := false
 	for i := 0; i < len(rawFlags); i++ {
 		switch rawFlags[i] {
 		case 'i':
@@ -7152,11 +7701,18 @@ func compileComplianceRegex(spec string) (*regexp.Regexp, bool, error) {
 			hasM = true
 		case 's':
 			// DOTALL is enabled by default in rest-api-spec regexes.
+		case 'x':
+			hasX = true
 		default:
 			return nil, false, nil
 		}
 	}
 	pattern := spec[1:lastSlash]
+	cleanedPattern, hadInlineX := extractInlineCommentsFlag(pattern)
+	pattern = cleanedPattern
+	if defaultComments || hasX || hadInlineX {
+		pattern = stripESCommentsMode(pattern)
+	}
 	var flagBuf strings.Builder
 	flagBuf.WriteString("(?s")
 	if hasI {
@@ -7173,9 +7729,21 @@ func compileComplianceRegex(spec string) (*regexp.Regexp, bool, error) {
 	return re, true, nil
 }
 
+// compileComplianceRegex compiles a rest-api-spec regex with Pattern.DOTALL only
+// (matching CatchYamlTestSection.java and warnings_regex), unless /.../x or (?x) is specified.
+func compileComplianceRegex(spec string) (*regexp.Regexp, bool, error) {
+	return compileRegexWithMode(spec, false)
+}
+
+// compileMatchRegex compiles a rest-api-spec match regex with Pattern.COMMENTS | Pattern.DOTALL
+// (matching MatchYamlTestSection.java).
+func compileMatchRegex(spec string) (*regexp.Regexp, bool, error) {
+	return compileRegexWithMode(spec, true)
+}
+
 func matchValues(fieldPath string, actual, expected any) error {
 	if expStr, ok := expected.(string); ok {
-		if re, isRegex, err := compileComplianceRegex(expStr); isRegex {
+		if re, isRegex, err := compileMatchRegex(expStr); isRegex {
 			if err != nil {
 				return fmt.Errorf("match %q: invalid regex %q: %w", fieldPath, expStr, err)
 			}
@@ -7338,7 +7906,7 @@ func valuesEqual(a, b any) bool {
 		return false
 	}
 	if bs, ok := b.(string); ok {
-		if re, isRegex, err := compileComplianceRegex(bs); isRegex {
+		if re, isRegex, err := compileMatchRegex(bs); isRegex {
 			if err != nil {
 				return false
 			}
@@ -7524,6 +8092,139 @@ func (c *runnerContext) execIsUnset(rawVal any) error {
 	return nil
 }
 
+func (c *runnerContext) execExists(rawVal any) error {
+	fieldPath := ""
+	if rawVal != nil {
+		fieldPath = c.expandStashPath(fmt.Sprintf("%v", rawVal))
+	}
+	if fieldPath == "" || fieldPath == "$body" {
+		if c.lastMethod == http.MethodHead {
+			if c.lastStatus == http.StatusOK {
+				return nil
+			}
+			return fmt.Errorf("exists %q: expected HEAD HTTP 200, got %d", fieldPath, c.lastStatus)
+		}
+		if c.lastBodyKind == bodyKindNone ||
+			c.lastBodyKind == bodyKindJSONNull ||
+			(c.lastBodyKind == bodyKindUnset && c.lastResponse == nil) {
+			return fmt.Errorf("exists %q: response body is unset or null (HTTP %d)", fieldPath, c.lastStatus)
+		}
+		return nil
+	}
+	if strings.Contains(fieldPath, "_arbitrary_key_") {
+		for _, cand := range c.lookupAllResponsePaths(fieldPath) {
+			if cand != nil {
+				return nil
+			}
+		}
+		return fmt.Errorf("exists %q failed: path unset or null in response: %s", fieldPath, c.lastBodyRaw)
+	}
+	val, exists := c.lookupResponsePath(fieldPath)
+	if !exists || val == nil {
+		return fmt.Errorf("exists %q failed: exists=%v, val=%v (response: %s)", fieldPath, exists, val, c.lastBodyRaw)
+	}
+	return nil
+}
+
+func checkSingleCloseTo(fieldPath string, actual any, expFloat, errFloat float64) error {
+	actFloat, ok := toFloat64(actual)
+	if !ok {
+		return fmt.Errorf("close_to %q: actual value %v (%T) is not a finite number", fieldPath, actual, actual)
+	}
+	if math.Abs(actFloat-expFloat) > errFloat {
+		return fmt.Errorf("close_to %q failed: actual %v is not within %v of %v", fieldPath, actFloat, errFloat, expFloat)
+	}
+	return nil
+}
+
+func (c *runnerContext) evalCloseToField(fieldPath string, expRaw, errRaw any) error {
+	expFloat, ok := toFloat64(c.expandStash(expRaw))
+	if !ok {
+		return fmt.Errorf("close_to %q: invalid expected value %v", fieldPath, expRaw)
+	}
+	errFloat, ok := toFloat64(c.expandStash(errRaw))
+	if !ok || errFloat < 0 {
+		return fmt.Errorf("close_to %q: invalid error tolerance %v", fieldPath, errRaw)
+	}
+	if strings.Contains(fieldPath, "_arbitrary_key_") {
+		cands := c.lookupAllResponsePaths(fieldPath)
+		if len(cands) == 0 {
+			return fmt.Errorf("close_to: path %q not found in response: %s", fieldPath, c.lastBodyRaw)
+		}
+		var lastErr error
+		for _, cand := range cands {
+			if err := checkSingleCloseTo(fieldPath, cand, expFloat, errFloat); err == nil {
+				return nil
+			} else {
+				lastErr = err
+			}
+		}
+		return lastErr
+	}
+	actual, found := c.lookupResponsePath(fieldPath)
+	if !found {
+		return fmt.Errorf("close_to: path %q not found in response: %s", fieldPath, c.lastBodyRaw)
+	}
+	return checkSingleCloseTo(fieldPath, actual, expFloat, errFloat)
+}
+
+func (c *runnerContext) execCloseTo(rawVal any) error {
+	pairs, err := extractFieldPairs("close_to", rawVal)
+	if err != nil {
+		return err
+	}
+	var fieldVal, valueVal, errorVal any
+	hasField := false
+	hasValue := false
+	hasError := false
+	for _, p := range pairs {
+		switch p.Key {
+		case "field":
+			fieldVal = p.Value
+			hasField = true
+		case "value":
+			valueVal = p.Value
+			hasValue = true
+		case "error":
+			errorVal = p.Value
+			hasError = true
+		}
+	}
+	if hasField && hasValue && hasError {
+		if _, isMap := ToNative(valueVal).(map[string]any); !isMap {
+			fieldPath := c.expandStashPath(fmt.Sprintf("%v", c.expandStash(fieldVal)))
+			return c.evalCloseToField(fieldPath, valueVal, errorVal)
+		}
+	}
+	for _, p := range pairs {
+		fieldPath := c.expandStashPath(p.Key)
+		subPairs, subErr := extractFieldPairs("close_to", p.Value)
+		if subErr != nil {
+			return fmt.Errorf("close_to %q: %w", fieldPath, subErr)
+		}
+		var subVal, subTolerance any
+		hasSubVal := false
+		hasSubTol := false
+		for _, sp := range subPairs {
+			switch sp.Key {
+			case "value":
+				subVal = sp.Value
+				hasSubVal = true
+			case "error":
+				subTolerance = sp.Value
+				hasSubTol = true
+			}
+		}
+		if !hasSubVal || !hasSubTol {
+			return fmt.Errorf("close_to %q requires both value and error fields", fieldPath)
+		}
+		if err := c.evalCloseToField(fieldPath, subVal, subTolerance); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (c *runnerContext) checkPathIsEmpty(fieldPath string) error {
 	if strings.Contains(fieldPath, "_arbitrary_key_") {
 		for _, cand := range c.lookupAllResponsePaths(fieldPath) {
@@ -7588,6 +8289,9 @@ func isEmptyValue(v any) bool {
 	}
 }
 
+// isTruthy matches Elasticsearch's IsTrueYamlTestSection.java:
+// returns false ONLY for nil, bool(false), numeric 0, and empty string "".
+// Non-nil maps (even {}), non-nil slices (even []), and non-empty strings (including "false" and "0") return true.
 func isTruthy(v any) bool {
 	if v == nil {
 		return false
@@ -7597,24 +8301,49 @@ func isTruthy(v any) bool {
 		return val
 	case int:
 		return val != 0
+	case int8:
+		return val != 0
+	case int16:
+		return val != 0
+	case int32:
+		return val != 0
 	case int64:
 		return val != 0
 	case uint:
 		return val != 0
+	case uint8:
+		return val != 0
+	case uint16:
+		return val != 0
+	case uint32:
+		return val != 0
 	case uint64:
 		return val != 0
+	case float32:
+		return val != 0 && !math.IsNaN(float64(val))
 	case float64:
 		return val != 0 && !math.IsNaN(val)
+	case json.Number:
+		if iv, err := val.Int64(); err == nil {
+			return iv != 0
+		}
+		if uv, err := strconv.ParseUint(val.String(), 10, 64); err == nil {
+			return uv != 0
+		}
+		if fv, err := val.Float64(); err == nil {
+			return fv != 0 && !math.IsNaN(fv)
+		}
+		return val.String() != ""
 	case string:
-		return val != "" && val != "false" && val != "0"
+		return val != ""
 	case []any:
-		return len(val) > 0
+		return true
 	case map[string]any:
-		return len(val) > 0
+		return true
 	case *OrderedMap:
-		return val != nil && len(val.Fields) > 0
+		return val != nil
 	case OrderedMap:
-		return len(val.Fields) > 0
+		return true
 	default:
 		return true
 	}

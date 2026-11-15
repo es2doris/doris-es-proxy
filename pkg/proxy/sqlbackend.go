@@ -743,3 +743,47 @@ func (b *DorisSQLBackend) LoadCatalogEntries(ctx context.Context, dbName string)
 	}
 	return out, rows.Err()
 }
+
+// DeleteDocsByIDs physically deletes rows by _id from a Doris UNIQUE KEY MoW table
+// so sequence_col (_version) floor is reset when a deleted document is later re-created with _version = 1.
+func (b *DorisSQLBackend) DeleteDocsByIDs(ctx context.Context, dbName, table string, ids []string) error {
+	if b.db == nil || len(ids) == 0 {
+		return nil
+	}
+	safeDB := schema.SanitizeDorisIdentifier(dbName)
+	safeTable := schema.SanitizeDorisIdentifier(table)
+	if len(ids) == 1 {
+		// #nosec G201 -- safeDB and safeTable are strictly sanitized via schema.SanitizeDorisIdentifier
+		q := prependSQLTraceComment(ctx, fmt.Sprintf("DELETE FROM `%s`.`%s` WHERE `_id` = ?", safeDB, safeTable))
+		if b.logSQL.Load() {
+			// #nosec G706 -- sanitized identifier logged only when --log-sql is enabled
+			log.Printf("[Doris SQL Delete] %s (id=%q)", q, ids[0])
+		}
+		_, err := b.db.ExecContext(ctx, q, ids[0]) // #nosec G701 -- safeDB and safeTable are strictly sanitized via schema.SanitizeDorisIdentifier
+		return err
+	}
+	const chunkSize = 256
+	for start := 0; start < len(ids); start += chunkSize {
+		end := start + chunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[start:end]
+		placeholders := strings.Repeat("?,", len(chunk))
+		placeholders = placeholders[:len(placeholders)-1]
+		// #nosec G201 -- safeDB and safeTable are strictly sanitized via schema.SanitizeDorisIdentifier
+		q := prependSQLTraceComment(ctx, fmt.Sprintf("DELETE FROM `%s`.`%s` WHERE `_id` IN (%s)", safeDB, safeTable, placeholders))
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		if b.logSQL.Load() {
+			// #nosec G706 -- sanitized identifier logged only when --log-sql is enabled
+			log.Printf("[Doris SQL Delete] %s (count=%d)", q, len(chunk))
+		}
+		if _, err := b.db.ExecContext(ctx, q, args...); err != nil { // #nosec G701 -- safeDB and safeTable are strictly sanitized via schema.SanitizeDorisIdentifier
+			return err
+		}
+	}
+	return nil
+}

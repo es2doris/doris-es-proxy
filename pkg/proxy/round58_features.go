@@ -35,6 +35,16 @@ func ensureESCompatHeaders(w http.ResponseWriter, r *http.Request) {
 		if tp := r.Header.Get("traceparent"); tp != "" {
 			w.Header().Set("traceparent", tp)
 		}
+		if w.Header().Get("Content-Type") == "" {
+			accept := r.Header.Get("Accept")
+			reqCT := r.Header.Get("Content-Type")
+			switch {
+			case strings.Contains(accept, "compatible-with=8") || strings.Contains(reqCT, "compatible-with=8"):
+				w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=8")
+			case strings.Contains(accept, "compatible-with=7") || strings.Contains(reqCT, "compatible-with=7"):
+				w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=7")
+			}
+		}
 	}
 }
 
@@ -692,16 +702,149 @@ func matchesTemplateIndexPatterns(indexName string, patterns []string) bool {
 	return matchedPositive
 }
 
-func formatComposableTemplateOutput(name string, tpl esast.IndexTemplateRequest, lifecycle map[string]any) map[string]any {
+func stringifyTemplateSettingValue(v any) any {
+	switch tv := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(tv))
+		for k, sv := range tv {
+			out[k] = stringifyTemplateSettingValue(sv)
+		}
+		return out
+	case []any:
+		out := make([]any, len(tv))
+		for i, elem := range tv {
+			out[i] = stringifyTemplateSettingValue(elem)
+		}
+		return out
+	case string:
+		return tv
+	case json.Number:
+		return tv.String()
+	case float64:
+		if tv == math.Trunc(tv) {
+			return strconv.FormatInt(int64(tv), 10)
+		}
+		return strconv.FormatFloat(tv, 'f', -1, 64)
+	case int:
+		return strconv.Itoa(tv)
+	case int64:
+		return strconv.FormatInt(tv, 10)
+	case bool:
+		if tv {
+			return "true"
+		}
+		return "false"
+	default:
+		if v == nil {
+			return nil
+		}
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func flattenTemplateSettingsMap(prefix string, m map[string]any, dst map[string]any) {
+	for k, v := range m {
+		fullKey := k
+		if prefix != "" {
+			fullKey = prefix + "." + k
+		}
+		if sub, ok := v.(map[string]any); ok {
+			flattenTemplateSettingsMap(fullKey, sub, dst)
+			continue
+		}
+		if !strings.HasPrefix(fullKey, "index.") {
+			fullKey = "index." + fullKey
+		}
+		dst[fullKey] = stringifyTemplateSettingValue(v)
+	}
+}
+
+func setNestedDottedSetting(dst map[string]any, key string, val any) {
+	parts := strings.Split(key, ".")
+	cur := dst
+	for i := 0; i < len(parts)-1; i++ {
+		p := parts[i]
+		next, ok := cur[p].(map[string]any)
+		if !ok {
+			next = make(map[string]any)
+			cur[p] = next
+		}
+		cur = next
+	}
+	cur[parts[len(parts)-1]] = stringifyTemplateSettingValue(val)
+}
+
+func formatCanonicalTemplateSettings(st map[string]any, flat bool) map[string]any {
+	if len(st) == 0 {
+		return map[string]any{}
+	}
+	if flat {
+		out := make(map[string]any)
+		flattenTemplateSettingsMap("", st, out)
+		return out
+	}
+	idxMap := make(map[string]any)
+	for k, v := range st {
+		if k == "index" {
+			if sub, ok := v.(map[string]any); ok {
+				for sk, sv := range sub {
+					setNestedDottedSetting(idxMap, sk, sv)
+				}
+				continue
+			}
+		}
+		cleanKey := strings.TrimPrefix(k, "index.")
+		setNestedDottedSetting(idxMap, cleanKey, v)
+	}
+	return map[string]any{"index": idxMap}
+}
+
+func normalizeTemplateAliasesOutput(al map[string]map[string]any) map[string]map[string]any {
+	if len(al) == 0 {
+		return map[string]map[string]any{}
+	}
+	out := make(map[string]map[string]any, len(al))
+	for name, meta := range al {
+		if meta == nil {
+			out[name] = map[string]any{}
+			continue
+		}
+		cp := make(map[string]any, len(meta)+2)
+		for k, v := range meta {
+			if k == "routing" {
+				if sv, ok := stringifyScalarIDOrRouting(v); ok && sv != "" {
+					if _, hasIR := meta["index_routing"]; !hasIR {
+						cp["index_routing"] = sv
+					}
+					if _, hasSR := meta["search_routing"]; !hasSR {
+						cp["search_routing"] = sv
+					}
+				}
+				continue
+			}
+			if (k == "index_routing" || k == "search_routing") && v != nil {
+				if sv, ok := stringifyScalarIDOrRouting(v); ok {
+					cp[k] = sv
+					continue
+				}
+			}
+			cp[k] = v
+		}
+		out[name] = cp
+	}
+	return out
+}
+
+func formatComposableTemplateOutput(name string, tpl esast.IndexTemplateRequest, lifecycle map[string]any, flatSettings bool) map[string]any {
 	tObj := map[string]any{}
 	if m := tpl.EffectiveMappings(); m != nil {
 		tObj["mappings"] = m
 	}
 	if st := tpl.EffectiveSettings(); len(st) > 0 {
-		tObj["settings"] = st
+		tObj["settings"] = formatCanonicalTemplateSettings(st, flatSettings)
 	}
 	if al := tpl.EffectiveAliases(); len(al) > 0 {
-		tObj["aliases"] = al
+		tObj["aliases"] = normalizeTemplateAliasesOutput(al)
 	}
 	if len(lifecycle) > 0 {
 		tObj["lifecycle"] = lifecycle
@@ -730,7 +873,7 @@ func formatComposableTemplateOutput(name string, tpl esast.IndexTemplateRequest,
 	}
 }
 
-func formatLegacyTemplateOutput(tpl esast.IndexTemplateRequest) map[string]any {
+func formatLegacyTemplateOutput(tpl esast.IndexTemplateRequest, flatSettings bool) map[string]any {
 	orderVal := 0
 	if tpl.Order != nil {
 		orderVal = *tpl.Order
@@ -743,11 +886,11 @@ func formatLegacyTemplateOutput(tpl esast.IndexTemplateRequest) map[string]any {
 	}
 	settingsOut := map[string]any{}
 	if st := tpl.EffectiveSettings(); len(st) > 0 {
-		settingsOut = st
+		settingsOut = formatCanonicalTemplateSettings(st, flatSettings)
 	}
 	aliasesOut := map[string]map[string]any{}
 	if al := tpl.EffectiveAliases(); len(al) > 0 {
-		aliasesOut = al
+		aliasesOut = normalizeTemplateAliasesOutput(al)
 	}
 	out := map[string]any{
 		"order":          orderVal,
@@ -830,13 +973,35 @@ func (s *Server) handleComposableOrLegacyTemplateRound58(w http.ResponseWriter, 
 		if !ok {
 			return
 		}
+		bodyBytes = normalizeTemplateBodyIndexPatternsRound60(bodyBytes)
 		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			var rawTplMap map[string]any
+			if err := json.Unmarshal(bodyBytes, &rawTplMap); err == nil && isLegacyEndpoint {
+				if rawMap, okM := rawTplMap["mappings"].(map[string]any); okM && len(rawMap) == 1 {
+					for typeKey, typeVal := range rawMap {
+						if _, isObj := typeVal.(map[string]any); isObj &&
+							typeKey != "properties" && typeKey != "dynamic" && typeKey != "dynamic_templates" &&
+							typeKey != "_source" && typeKey != "_meta" && typeKey != "_routing" && typeKey != "runtime" &&
+							typeKey != "date_detection" && typeKey != "numeric_detection" && typeKey != "dynamic_date_formats" && typeKey != "subobjects" {
+							if isTruthyBoolQueryParam(r, "include_type_name") {
+								rawTplMap["mappings"] = typeVal
+								if rewritten, mErr := json.Marshal(rawTplMap); mErr == nil {
+									bodyBytes = rewritten
+								}
+							} else {
+								writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+									fmt.Sprintf("The mapping definition cannot be nested under a type [%s] unless include_type_name is set to true.", typeKey))
+								return
+							}
+						}
+					}
+				}
+			}
 			if err := json.Unmarshal(bodyBytes, &tpl); err != nil {
 				writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 				return
 			}
-			var rawTplMap map[string]any
-			if err := json.Unmarshal(bodyBytes, &rawTplMap); err == nil {
+			if rawTplMap != nil {
 				if innerTpl, okT := rawTplMap["template"].(map[string]any); okT {
 					if lcRaw, okLC := innerTpl["lifecycle"].(map[string]any); okLC {
 						lcNorm, err := normalizeAndValidateDataStreamLifecycle(lcRaw)
@@ -852,7 +1017,7 @@ func (s *Server) handleComposableOrLegacyTemplateRound58(w http.ResponseWriter, 
 		tpl.Legacy = isLegacyEndpoint
 		patterns := tpl.EffectivePatterns()
 		if len(patterns) == 0 {
-			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: index_patterns must not be empty;")
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: index patterns are missing;")
 			return
 		}
 		for _, p := range patterns {
@@ -928,8 +1093,8 @@ func (s *Server) handleComposableOrLegacyTemplateRound58(w http.ResponseWriter, 
 						if wildcardPatternsOverlap(p1, p2) {
 							s.mu.Unlock()
 							writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
-								fmt.Sprintf("index template [%s] has index patterns %v matching patterns from existing templates [%s] with patterns (%v) that have the same priority [%d], multiple index templates may not match during index creation, please use a different priority",
-									name, patterns, otherName, otherTpl.EffectivePatterns(), effPrio))
+								fmt.Sprintf("index template [%s] has index patterns [%s] matching patterns from existing templates [%s] with patterns (%s => [%s]) that have the same priority [%d], multiple index templates may not match during index creation, please use a different priority",
+									name, strings.Join(patterns, ", "), otherName, otherName, strings.Join(otherTpl.EffectivePatterns(), ", "), effPrio))
 							return
 						}
 					}
@@ -996,10 +1161,11 @@ func (s *Server) handleComposableOrLegacyTemplateRound58(w http.ResponseWriter, 
 			names = []string{name}
 		}
 		sort.Strings(names)
+		flatSettings := isTruthyBoolQueryParam(r, "flat_settings")
 		if isLegacyEndpoint {
 			legacyResp := make(map[string]any, len(names))
 			for _, k := range names {
-				legacyResp[k] = formatLegacyTemplateOutput(store[k])
+				legacyResp[k] = formatLegacyTemplateOutput(store[k], flatSettings)
 			}
 			s.mu.RUnlock()
 			writeJSONWithRequest(w, r, http.StatusOK, legacyResp)
@@ -1007,7 +1173,7 @@ func (s *Server) handleComposableOrLegacyTemplateRound58(w http.ResponseWriter, 
 		}
 		list := make([]any, 0, len(names))
 		for _, k := range names {
-			list = append(list, formatComposableTemplateOutput(k, store[k], s.templateLifecycles[k]))
+			list = append(list, formatComposableTemplateOutput(k, store[k], s.templateLifecycles[k], flatSettings))
 		}
 		s.mu.RUnlock()
 		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"index_templates": list})
@@ -1192,6 +1358,11 @@ func (s *Server) prepareAutoCreateTargetRound58(ctx context.Context, rawTarget s
 			return http.StatusBadRequest, "illegal_argument_exception", "only write ops with an op_type of create are allowed in data streams"
 		}
 		return 0, "", ""
+	}
+	if !isIdx && !isAlias {
+		if stCode, errType, errReason := s.checkAutoCreateIndexClusterSettingRound60(target); stCode != 0 {
+			return stCode, errType, errReason
+		}
 	}
 	if isIdx || isAlias || winComp == nil {
 		return 0, "", ""
@@ -1437,13 +1608,17 @@ func (s *Server) handleResolveIndexRound58(w http.ResponseWriter, r *http.Reques
 		stateStr := "open"
 		isOpen := true
 		if isClosed {
-			attrs = []string{"close"}
-			stateStr = "close"
+			attrs = []string{"closed"}
+			stateStr = "closed"
 			isOpen = false
 		}
 		if isHidden {
 			attrs = append(attrs, "hidden")
 		}
+		if strings.HasPrefix(name, ".") && !strings.HasPrefix(name, ".ds-") && !s.isIndexExplicitlyHiddenLocked(name) {
+			attrs = append(attrs, "system")
+		}
+		sort.Strings(attrs)
 		entry := map[string]any{
 			"name":       name,
 			"attributes": attrs,
@@ -1861,32 +2036,92 @@ func advanceArrayFilterPatterns(patterns [][]string, idx int) (elemPatterns [][]
 }
 
 var catColumnShortAliases = map[string][]string{
-	"i":    {"index", "id"},
-	"idx":  {"index"},
-	"s":    {"status", "state", "shard"},
-	"st":   {"store", "state", "status"},
-	"h":    {"health", "host"},
-	"p":    {"pri", "prirep"},
-	"r":    {"rep", "node.role"},
-	"role": {"node.role", "role"},
-	"d":    {"docs"},
-	"dc":   {"docs.count"},
-	"dd":   {"docs.deleted"},
-	"ss":   {"store.size"},
-	"pss":  {"pri.store.size"},
-	"u":    {"uuid", "unassign"},
-	"n":    {"name", "node"},
-	"nt":   {"node.total"},
-	"nd":   {"node.data"},
-	"m":    {"master"},
-	"hp":   {"heap.percent"},
-	"rp":   {"ram.percent"},
-	"dt":   {"disk.total"},
-	"du":   {"disk.used"},
-	"c":    {"cpu", "count", "cluster"},
-	"a":    {"alias"},
-	"is":   {"is_write_index"},
-	"ip":   {"ip", "index_patterns"},
+	"i":               {"index", "id"},
+	"idx":             {"index"},
+	"s":               {"status", "state", "shard"},
+	"st":              {"store", "stage", "state", "status"},
+	"h":               {"health", "host"},
+	"p":               {"pri", "prirep", "pid"},
+	"r":               {"rep", "node.role"},
+	"role":            {"node.role", "role"},
+	"d":               {"docs", "description"},
+	"dc":              {"docs.count"},
+	"dd":              {"docs.deleted"},
+	"ss":              {"store.size"},
+	"pss":             {"pri.store.size"},
+	"u":               {"uuid", "unassign", "uptime"},
+	"n":               {"name", "node"},
+	"nt":              {"node.total"},
+	"nd":              {"node.data"},
+	"m":               {"master"},
+	"hp":              {"heap.percent"},
+	"hc":              {"heap.current"},
+	"hm":              {"heap.max"},
+	"rp":              {"ram.percent"},
+	"rc":              {"ram.current"},
+	"rm":              {"ram.max"},
+	"dt":              {"disk.total"},
+	"du":              {"disk.used"},
+	"da":              {"disk.avail"},
+	"disk":            {"disk.avail"},
+	"dup":             {"disk.used_percent"},
+	"diskAvail":       {"disk.avail"},
+	"diskTotal":       {"disk.total"},
+	"diskUsed":        {"disk.used"},
+	"diskUsedPercent": {"disk.used_percent"},
+	"fdc":             {"file_desc.current"},
+	"fdp":             {"file_desc.percent"},
+	"fdm":             {"file_desc.max"},
+	"l":               {"load_1m"},
+	"v":               {"version", "value"},
+	"j":               {"jdk"},
+	"po":              {"port"},
+	"http":            {"http_address", "http"},
+	"c":               {"cpu", "count", "cluster", "component"},
+	"a":               {"alias", "attr", "active"},
+	"is":              {"is_write_index", "index.search"},
+	"ip":              {"ip", "index_patterns"},
+	"cd":              {"creation.date"},
+	"cds":             {"creation.date.string"},
+	"ty":              {"type"},
+	"t":               {"time", "timestamp", "type"},
+	"shost":           {"source_host"},
+	"thost":           {"target_host"},
+	"sn":              {"source_node"},
+	"tn":              {"target_node"},
+	"rep":             {"repository", "rep"},
+	"snap":            {"snapshot"},
+	"f":               {"files", "filter"},
+	"fr":              {"files_recovered"},
+	"fp":              {"files_percent"},
+	"tf":              {"files_total"},
+	"b":               {"bytes"},
+	"br":              {"bytes_recovered"},
+	"bp":              {"bytes_percent"},
+	"tb":              {"bytes_total"},
+	"to":              {"translog_ops"},
+	"tor":             {"translog_ops_recovered"},
+	"top":             {"translog_ops_percent"},
+	"ico":             {"is_compound", "compound"},
+	"ic":              {"is_compound", "compound"},
+	"si":              {"size"},
+	"sm":              {"size.memory"},
+	"g":               {"generation"},
+	"gen":             {"generation"},
+	"seg":             {"segment"},
+}
+
+func catWildcardColumnRank(col string) int {
+	switch {
+	case strings.HasSuffix(col, ".current"):
+		return 1
+	case strings.HasSuffix(col, ".percent"):
+		return 2
+	case strings.HasSuffix(col, ".max"):
+		return 3
+	default:
+		return 10
+	}
 }
 
 func resolveCatColumnToken(tok string, headers []string, knownCols map[string]bool) ([]string, bool) {
@@ -1901,11 +2136,36 @@ func resolveCatColumnToken(tok string, headers []string, knownCols map[string]bo
 		}
 	}
 	if strings.ContainsAny(tok, "*?") {
+		seen := make(map[string]bool)
 		var matched []string
 		for _, hdr := range headers {
-			if matchWildcardPattern(tok, hdr) {
+			if matchWildcardPattern(tok, hdr) && !seen[hdr] {
+				seen[hdr] = true
 				matched = append(matched, hdr)
 			}
+		}
+		var extras []string
+		for col := range knownCols {
+			if !seen[col] && matchWildcardPattern(tok, col) {
+				seen[col] = true
+				extras = append(extras, col)
+			}
+		}
+		if len(extras) > 0 {
+			matched = append(matched, extras...)
+			// Ensure *.current, *.percent, *.max follow ES canonical metric order (e.g. heap.*).
+			sort.SliceStable(matched, func(i, j int) bool {
+				pi := strings.SplitN(matched[i], ".", 2)[0]
+				pj := strings.SplitN(matched[j], ".", 2)[0]
+				if pi == pj {
+					ri, rj := catWildcardColumnRank(matched[i]), catWildcardColumnRank(matched[j])
+					if ri != rj {
+						return ri < rj
+					}
+					return matched[i] < matched[j]
+				}
+				return false
+			})
 		}
 		return matched, true
 	}
@@ -1979,19 +2239,19 @@ func compareCatValues(a, b string) int {
 
 func negotiateCatFormat(r *http.Request) (string, error) {
 	if r == nil {
-		return "json", nil
+		return "text", nil
 	}
 	rawFmt := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
 	switch rawFmt {
 	case "":
 		accept := strings.ToLower(r.Header.Get("Accept"))
-		if strings.Contains(accept, "application/yaml") || strings.Contains(accept, "text/yaml") {
+		if strings.Contains(accept, "application/yaml") || strings.Contains(accept, "text/yaml") || strings.Contains(accept, "application/vnd.elasticsearch+yaml") {
 			return "yaml", nil
 		}
-		if strings.Contains(accept, "text/plain") && !strings.Contains(accept, "application/json") {
-			return "text", nil
+		if strings.Contains(accept, "application/json") || strings.Contains(accept, "application/vnd.elasticsearch+json") {
+			return "json", nil
 		}
-		return "json", nil
+		return "text", nil
 	case "json":
 		return "json", nil
 	case "text", "txt":
@@ -2040,11 +2300,45 @@ func marshalCatYAML(headers []string, rows []map[string]any) []byte {
 }
 
 func writeCatResponseRound58(w http.ResponseWriter, r *http.Request, headers []string, rows []map[string]any) {
+	writeCatResponseWithHelpCols(w, r, headers, nil, rows)
+}
+
+func writeCatResponseWithHelpCols(w http.ResponseWriter, r *http.Request, headers []string, helpHeaders []string, rows []map[string]any) {
 	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
 	ensureESCompatHeaders(w, r)
+
+	knownCols := make(map[string]bool, len(headers)+len(helpHeaders)+16)
+	allHelpCols := make([]string, 0, len(headers)+len(helpHeaders)+16)
+	seedHelp := helpHeaders
+	if len(seedHelp) == 0 {
+		seedHelp = headers
+	}
+	for _, h := range seedHelp {
+		if !knownCols[h] {
+			knownCols[h] = true
+			allHelpCols = append(allHelpCols, h)
+		}
+	}
+	for _, h := range headers {
+		if !knownCols[h] {
+			knownCols[h] = true
+			allHelpCols = append(allHelpCols, h)
+		}
+	}
+	var extraHelpCols []string
+	for _, row := range rows {
+		for k := range row {
+			if !knownCols[k] {
+				knownCols[k] = true
+				extraHelpCols = append(extraHelpCols, k)
+			}
+		}
+	}
+	sort.Strings(extraHelpCols)
+	allHelpCols = append(allHelpCols, extraHelpCols...)
 
 	if isTruthyBoolQueryParam(r, "help") {
 		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
@@ -2053,9 +2347,35 @@ func writeCatResponseRound58(w http.ResponseWriter, r *http.Request, headers []s
 		if r != nil && r.Method == http.MethodHead {
 			return
 		}
-		for _, hdr := range headers {
+		maxColW := 0
+		maxShortW := 0
+		shortByCol := make(map[string]string, len(allHelpCols))
+		for shortTok, cands := range catColumnShortAliases {
+			if len(shortTok) > 4 {
+				continue // skip camelCase aliases like diskAvail in short column list
+			}
+			for _, c := range cands {
+				if knownCols[c] {
+					if existing := shortByCol[c]; existing == "" {
+						shortByCol[c] = shortTok
+					} else if !strings.Contains(","+existing+",", ","+shortTok+",") {
+						shortByCol[c] = existing + "," + shortTok
+					}
+					break
+				}
+			}
+		}
+		for _, hdr := range allHelpCols {
+			if len(hdr) > maxColW {
+				maxColW = len(hdr)
+			}
+			if len(shortByCol[hdr]) > maxShortW {
+				maxShortW = len(shortByCol[hdr])
+			}
+		}
+		for _, hdr := range allHelpCols {
 			// #nosec G705 -- Content-Type is text/plain with X-Content-Type-Options: nosniff
-			_, _ = fmt.Fprintf(w, "%-20s |   | %s\n", hdr, hdr)
+			_, _ = fmt.Fprintf(w, "%-*s | %-*s | %s\n", maxColW, hdr, maxShortW, shortByCol[hdr], hdr)
 		}
 		return
 	}
@@ -2066,20 +2386,14 @@ func writeCatResponseRound58(w http.ResponseWriter, r *http.Request, headers []s
 		return
 	}
 
-	knownCols := make(map[string]bool, len(headers)+8)
-	for _, h := range headers {
-		knownCols[h] = true
-	}
-	for _, row := range rows {
-		for k := range row {
-			knownCols[k] = true
-		}
-	}
-
 	selectedHeaders := headers
+	displayTextHeaders := headers
+	explicitH := false
 	if r != nil {
 		if rawH := strings.TrimSpace(r.URL.Query().Get("h")); rawH != "" {
+			explicitH = true
 			var filtered []string
+			var dispFiltered []string
 			for _, part := range strings.Split(rawH, ",") {
 				part = strings.TrimSpace(part)
 				if part == "" {
@@ -2087,12 +2401,18 @@ func writeCatResponseRound58(w http.ResponseWriter, r *http.Request, headers []s
 				}
 				resolvedCols, ok := resolveCatColumnToken(part, headers, knownCols)
 				if !ok {
-					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("unable tokes/header [%s] not recognized; valid headers: %v", part, headers))
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("unable to parse header [%s]; valid headers: %v", part, allHelpCols))
 					return
 				}
 				filtered = append(filtered, resolvedCols...)
+				if len(resolvedCols) == 1 && !strings.ContainsAny(part, "*?") {
+					dispFiltered = append(dispFiltered, part)
+				} else {
+					dispFiltered = append(dispFiltered, resolvedCols...)
+				}
 			}
 			selectedHeaders = filtered
+			displayTextHeaders = dispFiltered
 		}
 	}
 
@@ -2155,7 +2475,7 @@ func writeCatResponseRound58(w http.ResponseWriter, r *http.Request, headers []s
 	}
 
 	var projectedRows []map[string]any
-	if len(selectedHeaders) > 0 && len(selectedHeaders) != len(headers) {
+	if len(selectedHeaders) > 0 && (explicitH || len(extraHelpCols) > 0) {
 		projectedRows = make([]map[string]any, len(rows))
 		for i, row := range rows {
 			m := make(map[string]any, len(selectedHeaders))
@@ -2183,22 +2503,67 @@ func writeCatResponseRound58(w http.ResponseWriter, r *http.Request, headers []s
 		if r != nil && r.Method == http.MethodHead {
 			return
 		}
-		if isTruthyBoolQueryParam(r, "v") {
-			// #nosec G705 -- Content-Type is text/plain with X-Content-Type-Options: nosniff
-			_, _ = fmt.Fprintln(w, strings.Join(selectedHeaders, "\t"))
+		verbose := isTruthyBoolQueryParam(r, "v")
+		if len(projectedRows) == 0 && !verbose {
+			return
 		}
-		for _, row := range projectedRows {
-			vals := make([]string, 0, len(selectedHeaders))
-			for _, col := range selectedHeaders {
+		numCols := len(selectedHeaders)
+		widths := make([]int, numCols)
+		if verbose {
+			for ci := 0; ci < numCols; ci++ {
+				lbl := selectedHeaders[ci]
+				if ci < len(displayTextHeaders) {
+					lbl = displayTextHeaders[ci]
+				}
+				if len(lbl) > widths[ci] {
+					widths[ci] = len(lbl)
+				}
+			}
+		}
+		cellGrid := make([][]string, len(projectedRows))
+		for ri, row := range projectedRows {
+			vals := make([]string, numCols)
+			for ci, col := range selectedHeaders {
 				v, exists := row[col]
 				if !exists || v == nil {
-					vals = append(vals, "")
+					vals[ci] = ""
 				} else {
-					vals = append(vals, fmt.Sprintf("%v", v))
+					vals[ci] = fmt.Sprintf("%v", v)
+				}
+				if len(vals[ci]) > widths[ci] {
+					widths[ci] = len(vals[ci])
+				}
+			}
+			cellGrid[ri] = vals
+		}
+		writePaddedCatRow := func(cells []string) {
+			var line strings.Builder
+			for ci, cell := range cells {
+				if ci > 0 {
+					line.WriteByte(' ')
+				}
+				if ci == len(cells)-1 {
+					line.WriteString(cell)
+				} else {
+					fmt.Fprintf(&line, "%-*s", widths[ci], cell)
 				}
 			}
 			// #nosec G705 -- Content-Type is text/plain with X-Content-Type-Options: nosniff
-			_, _ = fmt.Fprintln(w, strings.Join(vals, "\t"))
+			_, _ = fmt.Fprintln(w, strings.TrimRight(line.String(), " "))
+		}
+		if verbose && numCols > 0 {
+			hdrCells := make([]string, numCols)
+			for ci := 0; ci < numCols; ci++ {
+				if ci < len(displayTextHeaders) {
+					hdrCells[ci] = displayTextHeaders[ci]
+				} else {
+					hdrCells[ci] = selectedHeaders[ci]
+				}
+			}
+			writePaddedCatRow(hdrCells)
+		}
+		for _, vals := range cellGrid {
+			writePaddedCatRow(vals)
 		}
 
 	case "yaml":
@@ -2214,7 +2579,9 @@ func writeCatResponseRound58(w http.ResponseWriter, r *http.Request, headers []s
 
 	default:
 		if r != nil && r.Method == http.MethodHead {
-			w.Header().Set("Content-Type", "application/json")
+			if w.Header().Get("Content-Type") == "" {
+				w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+			}
 			w.Header().Set("X-Content-Type-Options", "nosniff")
 			w.WriteHeader(http.StatusOK)
 			return
@@ -2227,100 +2594,19 @@ func writeCatResponseRound58(w http.ResponseWriter, r *http.Request, headers []s
 // Round 58 F27, F28, F29: Ingest Pipeline Cycle Detection, Dissect & Reroute
 // ---------------------------------------------------------------------------
 
-func collectReferencedIngestPipelines(procs []any) []string {
-	var refs []string
-	var walkProcMap func(pMap map[string]any)
-	walkProcMap = func(pMap map[string]any) {
-		for pType, rawSpec := range pMap {
-			if pType == "tag" || pType == "description" || pType == "if" || pType == "ignore_failure" || pType == "on_failure" {
-				continue
-			}
-			specMap, ok := rawSpec.(map[string]any)
-			if !ok {
-				continue
-			}
-			switch pType {
-			case "pipeline":
-				if target, ok := specMap["name"].(string); ok && strings.TrimSpace(target) != "" {
-					refs = append(refs, strings.TrimSpace(target))
-				}
-			case "foreach":
-				if inner, ok := specMap["processor"].(map[string]any); ok {
-					walkProcMap(inner)
-				}
-			}
-			if onFail, ok := specMap["on_failure"].([]any); ok {
-				refs = append(refs, collectReferencedIngestPipelines(onFail)...)
-			}
-		}
-	}
-	for _, p := range procs {
-		if pMap, ok := p.(map[string]any); ok {
-			walkProcMap(pMap)
-		}
-	}
-	return refs
-}
-
-func validateNoIngestPipelineCycleLocked(newID string, newBody map[string]any, existing map[string]map[string]any) error {
-	if newID == "" || newBody == nil {
-		return nil
-	}
-	edgesOf := func(id string) []string {
-		var body map[string]any
-		if id == newID {
-			body = newBody
-		} else if existing != nil {
-			body = existing[id]
-		}
-		if body == nil {
-			return nil
-		}
-		var out []string
-		if procs, ok := body["processors"].([]any); ok {
-			out = append(out, collectReferencedIngestPipelines(procs)...)
-		}
-		if onFail, ok := body["on_failure"].([]any); ok {
-			out = append(out, collectReferencedIngestPipelines(onFail)...)
-		}
-		return out
-	}
-
-	const (
-		stateUnvisited = 0
-		stateVisiting  = 1
-		stateVisited   = 2
-	)
-	state := make(map[string]int)
-	var dfs func(cur string) error
-	dfs = func(cur string) error {
-		state[cur] = stateVisiting
-		for _, next := range edgesOf(cur) {
-			if strings.Contains(next, "{{") {
-				continue
-			}
-			if state[next] == stateVisiting {
-				return fmt.Errorf("illegal_argument_exception: cycle detected in pipeline [%s] referencing [%s]", cur, next)
-			}
-			if state[next] == stateUnvisited {
-				if err := dfs(next); err != nil {
-					return err
-				}
-			}
-		}
-		state[cur] = stateVisited
-		return nil
-	}
-	return dfs(newID)
+func validateNoIngestPipelineCycleLocked(_ string, _ map[string]any, _ map[string]map[string]any) error {
+	// ES allows cyclic pipeline references at PUT /_ingest/pipeline time and detects cycles
+	// dynamically at execution time (`400 illegal_state_exception: Cycle detected for pipeline: <name>`).
+	return nil
 }
 
 func validateDissectPatternGrammar(pattern string) error {
 	if strings.TrimSpace(pattern) == "" {
-		return fmt.Errorf("illegal_argument_exception: dissect pattern must not be empty")
+		return fmt.Errorf("parse_exception: Unable to parse pattern [%s]: dissect pattern must not be empty", pattern)
 	}
 	firstIdx := strings.Index(pattern, "%{")
 	if firstIdx < 0 {
-		return fmt.Errorf("illegal_argument_exception: invalid dissect pattern [%s]: no tokens found", pattern)
+		return fmt.Errorf("parse_exception: Unable to parse pattern [%s]: no tokens found", pattern)
 	}
 
 	type tokInfo struct {
@@ -2338,11 +2624,11 @@ func validateDissectPatternGrammar(pattern string) error {
 		}
 		endBrace := strings.IndexByte(rem, '}')
 		if endBrace < 0 {
-			return fmt.Errorf("illegal_argument_exception: invalid dissect pattern [%s]: unclosed token", pattern)
+			return fmt.Errorf("parse_exception: Unable to parse pattern [%s]: unclosed token", pattern)
 		}
 		inner := rem[2:endBrace]
 		if strings.Contains(inner, "%{") {
-			return fmt.Errorf("illegal_argument_exception: invalid dissect pattern [%s]: nested token", pattern)
+			return fmt.Errorf("parse_exception: Unable to parse pattern [%s]: nested token", pattern)
 		}
 		rem = rem[endBrace+1:]
 
@@ -2355,7 +2641,7 @@ func validateDissectPatternGrammar(pattern string) error {
 			rem = ""
 		}
 		if strings.Contains(nextLit, "%{") {
-			return fmt.Errorf("illegal_argument_exception: invalid dissect pattern [%s]: unclosed token", pattern)
+			return fmt.Errorf("parse_exception: Unable to parse pattern [%s]: unclosed token", pattern)
 		}
 
 		padRight := false
@@ -2372,7 +2658,7 @@ func validateDissectPatternGrammar(pattern string) error {
 		case strings.HasPrefix(inner, "?"):
 			rk := strings.TrimSpace(strings.TrimPrefix(inner, "?"))
 			if strings.Contains(rk, "/") {
-				return fmt.Errorf("illegal_argument_exception: invalid dissect order modifier on skip key [%s]", inner)
+				return fmt.Errorf("parse_exception: Unable to parse pattern [%s]: invalid dissect order modifier on skip key [%s]", pattern, inner)
 			}
 			if rk != "" {
 				definedRefKeys[rk] = true
@@ -2380,10 +2666,10 @@ func validateDissectPatternGrammar(pattern string) error {
 		case strings.HasPrefix(inner, "*"):
 			rk := strings.TrimSpace(strings.TrimPrefix(inner, "*"))
 			if rk == "" {
-				return fmt.Errorf("illegal_argument_exception: empty dissect reference key in pattern [%s]", pattern)
+				return fmt.Errorf("parse_exception: Unable to parse pattern [%s]: empty dissect reference key", pattern)
 			}
 			if strings.Contains(rk, "/") {
-				return fmt.Errorf("illegal_argument_exception: invalid dissect order modifier on reference key [%s]", inner)
+				return fmt.Errorf("parse_exception: Unable to parse pattern [%s]: invalid dissect order modifier on reference key [%s]", pattern, inner)
 			}
 			definedRefKeys[rk] = true
 		case strings.HasPrefix(inner, "+") || strings.HasPrefix(inner, "&"):
@@ -2402,17 +2688,17 @@ func validateDissectPatternGrammar(pattern string) error {
 			}
 			rest = strings.TrimSpace(rest)
 			if rest == "" {
-				return fmt.Errorf("illegal_argument_exception: empty dissect modifier key in pattern [%s]", pattern)
+				return fmt.Errorf("parse_exception: Unable to parse pattern [%s]: empty dissect modifier key", pattern)
 			}
 			if slashIdx := strings.IndexByte(rest, '/'); slashIdx >= 0 {
 				if !hasAppend {
-					return fmt.Errorf("illegal_argument_exception: dissect order modifier requires '+' in [%s]", inner)
+					return fmt.Errorf("parse_exception: Unable to parse pattern [%s]: dissect order modifier requires '+' in [%s]", pattern, inner)
 				}
 				keyPart := strings.TrimSpace(rest[:slashIdx])
 				ordPart := rest[slashIdx+1:]
 				ord, err := strconv.Atoi(ordPart)
 				if keyPart == "" || err != nil || ord <= 0 {
-					return fmt.Errorf("illegal_argument_exception: invalid dissect append order in [%s]", inner)
+					return fmt.Errorf("parse_exception: Unable to parse pattern [%s]: invalid dissect append order in [%s]", pattern, inner)
 				}
 				rest = keyPart
 			}
@@ -2423,7 +2709,7 @@ func validateDissectPatternGrammar(pattern string) error {
 			}
 		default:
 			if strings.Contains(inner, "/") {
-				return fmt.Errorf("illegal_argument_exception: dissect append order requires '+' modifier in [%s]", inner)
+				return fmt.Errorf("parse_exception: Unable to parse pattern [%s]: dissect append order requires '+' modifier in [%s]", pattern, inner)
 			}
 			if inner != "" {
 				definedRefKeys[inner] = true
@@ -2435,12 +2721,12 @@ func validateDissectPatternGrammar(pattern string) error {
 
 	for i := 0; i < len(tokens)-1; i++ {
 		if tokens[i].nextLit == "" && !tokens[i].padRight {
-			return fmt.Errorf("illegal_argument_exception: invalid dissect pattern [%s]: consecutive tokens without delimiter or ->", pattern)
+			return fmt.Errorf("parse_exception: Unable to parse pattern [%s]: consecutive tokens without delimiter or ->", pattern)
 		}
 	}
 	for _, rk := range referencedKeys {
 		if !definedRefKeys[rk] {
-			return fmt.Errorf("illegal_argument_exception: invalid dissect pattern [%s]: reference key [%s] is missing matching *%s or ?%s", pattern, rk, rk, rk)
+			return fmt.Errorf("parse_exception: Unable to parse pattern [%s]: reference key [%s] is missing matching *%s or ?%s", pattern, rk, rk, rk)
 		}
 	}
 	return nil

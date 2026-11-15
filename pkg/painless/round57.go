@@ -436,7 +436,8 @@ func isLongExprPainless(expr string, val any, params map[string]any) bool {
 		case "Long.bitCount", "Long.numberOfLeadingZeros", "Long.numberOfTrailingZeros",
 			"Long.signum", "Long.hashCode", "Long.compare", "Long.compareUnsigned":
 			return false
-		case "Integer.toUnsignedLong", "Short.toUnsignedLong", "Byte.toUnsignedLong":
+		case "Integer.toUnsignedLong", "Short.toUnsignedLong", "Byte.toUnsignedLong",
+			"System.currentTimeMillis", "System.nanoTime", "Processors.bytes":
 			return true
 		case "Math.toIntExact":
 			return false
@@ -1477,34 +1478,41 @@ func painlessJavaObjectEquals(a, b any) bool {
 	}
 	if sa, okA := a.([]any); okA {
 		sb, okB := b.([]any)
-		if !okB || len(sa) != len(sb) {
+		if !okB {
 			return false
 		}
-		for i := range sa {
-			if !painlessJavaObjectEquals(sa[i], sb[i]) {
-				return false
+		var walk func(x, y any, seen map[cyclePairKeyRound60]bool, depth int) bool
+		walk = func(x, y any, seen map[cyclePairKeyRound60]bool, depth int) bool {
+			if sx, ox := x.([]any); ox {
+				sy, oy := y.([]any)
+				return oy && slicesEqualCycleSafeRound60(sx, sy, walk, seen, depth)
 			}
+			if mx, ox := x.(map[string]any); ox {
+				my, oy := y.(map[string]any)
+				return oy && mapsEqualCycleSafeRound60(mx, my, walk, seen, depth)
+			}
+			return painlessJavaObjectEquals(x, y)
 		}
-		return true
+		return slicesEqualCycleSafeRound60(sa, sb, walk, nil, 0)
 	}
 	if ma, okA := a.(map[string]any); okA {
 		mb, okB := b.(map[string]any)
 		if !okB {
 			return false
 		}
-		if visiblePainlessMapLen(ma) != visiblePainlessMapLen(mb) {
-			return false
-		}
-		for k, va := range ma {
-			if isInternalPainlessMapKey(ma, k) {
-				continue
+		var walk func(x, y any, seen map[cyclePairKeyRound60]bool, depth int) bool
+		walk = func(x, y any, seen map[cyclePairKeyRound60]bool, depth int) bool {
+			if sx, ox := x.([]any); ox {
+				sy, oy := y.([]any)
+				return oy && slicesEqualCycleSafeRound60(sx, sy, walk, seen, depth)
 			}
-			vb, exists := mb[k]
-			if !exists || !painlessJavaObjectEquals(va, vb) {
-				return false
+			if mx, ox := x.(map[string]any); ox {
+				my, oy := y.(map[string]any)
+				return oy && mapsEqualCycleSafeRound60(mx, my, walk, seen, depth)
 			}
+			return painlessJavaObjectEquals(x, y)
 		}
-		return true
+		return mapsEqualCycleSafeRound60(ma, mb, walk, nil, 0)
 	}
 	return painlessValuesEqual(a, b)
 }

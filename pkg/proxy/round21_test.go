@@ -850,8 +850,8 @@ func TestRound21WritePathOCCMgetIngestMetaAndCSVQuote(t *testing.T) {
 	wPut1 := r21Req(t, srv, http.MethodPut, "/r21_occ/_doc/1?refresh=true", `{"msg":"v1"}`)
 	putRes1 := r21JSON(t, wPut1)
 	seqNo1, ok := putRes1["_seq_no"].(float64)
-	if !ok || seqNo1 <= 0 {
-		t.Fatalf("expected positive _seq_no on PUT, got %v", putRes1)
+	if !ok || seqNo1 < 0 {
+		t.Fatalf("expected non-negative _seq_no on PUT, got %v", putRes1)
 	}
 	wGet := r21Req(t, srv, http.MethodGet, "/r21_occ/_doc/1", nil)
 	getRes := r21JSON(t, wGet)

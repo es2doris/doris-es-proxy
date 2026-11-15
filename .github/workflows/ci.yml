@@ -148,4 +148,39 @@ jobs:
         run: |
           jq empty deploy/grafana/doris-es-proxy-dashboard.json
           docker build -t es2doris/doris-es-proxy:ci .
-          docker run --rm es2doris/doris-es-proxy:ci version | grep -q "v0.15.0"
+          docker run --rm es2doris/doris-es-proxy:ci version | grep -q "v0.16.0"
+
+  elastic-conformance:
+    name: Upstream Elastic Conformance & Go SDK v8
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache-dependency-path: |
+            go.sum
+            e2e/sdkconformance/go.sum
+
+      - name: Fetch upstream Elastic rest-api-spec & elasticsearch-specification
+        run: bash scripts/fetch-conformance-specs.sh
+
+      - name: Run upstream Elastic rest-api-spec & wire-schema conformance
+        run: |
+          CONFORMANCE_REQUIRE_UPSTREAM=1 \
+          CONFORMANCE_MIN_V7_PASSED=1065 \
+          CONFORMANCE_MIN_V8_PASSED=1083 \
+          CONFORMANCE_SUMMARY_MD="$GITHUB_STEP_SUMMARY" \
+          CONFORMANCE_OUT_JSON="/tmp/conformance-scorecard.json" \
+            go test -race -count=1 -v ./pkg/compliance -run 'TestUpstream|TestSpecSchemaValidatorLiveUpstreamSchema'
+
+      - name: Vet official Go SDK v8 conformance module
+        run: go -C e2e/sdkconformance vet ./...
+
+      - name: Run official elastic/go-elasticsearch/v8 conformance suite
+        run: go -C e2e/sdkconformance test -race -count=1 -v ./...

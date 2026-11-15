@@ -1559,6 +1559,7 @@ func TestRound31BugFixesAndUntestedSubsystems(t *testing.T) {
 			"inner_hits": {"name": "top_by_lat", "size": 3, "sort": [{"latency": "desc"}]}
 		},
 		"sort": [
+			{"status": "asc"},
 			{"_script": {"type": "number", "script": {"source": "doc['req_count'].value * 2"}, "order": "desc", "missing": 0}},
 			{"_script": {"type": "string", "script": {"source": "doc['status'].value + '_x'"}, "order": "asc", "missing": "_first"}},
 			{"scores": {"order": "desc", "mode": "avg"}},
@@ -1568,7 +1569,7 @@ func TestRound31BugFixesAndUntestedSubsystems(t *testing.T) {
 			{"ts_nanos": {"order": "desc", "missing": "2026-01-01T00:00:00Z"}},
 			{"events.ms": {"order": "desc", "mode": "max", "nested": {"path": "events", "filter": {"term": {"events.flag": true}}}}}
 		],
-		"search_after": [100, "ok_x", 50.5, 25.0, 150.0, "10.0.0.1", "2026-01-02T00:00:00Z", 200, "doc_1"]
+		"search_after": ["ok", 100, "ok_x", 50.5, 25.0, 150.0, "10.0.0.1", "2026-01-02T00:00:00Z", 200, "doc_1"]
 	}`), &reqCov1); err != nil {
 		t.Fatalf("unmarshal reqCov1 failed: %v", err)
 	}
@@ -2045,14 +2046,14 @@ func TestRound33TranspilerDateFormatsNestedNullsMultiTermsMsmAndLucene(t *testin
 					"code_terms": {"terms": {"field": "items.code"}},
 					"kw_terms": {"terms": {"field": "items.name.keyword"}},
 					"code_card": {"cardinality": {"field": "items.code"}},
-					"script_sum": {"sum": {"script": "doc['val'].value"}},
-					"nested_comp": {
-						"composite": {
-							"sources": [
-								{"c": {"terms": {"field": "code"}}}
-							]
-						}
-					}
+					"script_sum": {"sum": {"script": "doc['val'].value"}}
+				}
+			},
+			"nested_comp": {
+				"composite": {
+					"sources": [
+						{"c": {"terms": {"field": "status"}}}
+					]
 				}
 			}
 		}
@@ -3099,8 +3100,8 @@ func TestRound47TranspilerSpecCompliance(t *testing.T) {
 	var sqsQ esast.Query
 	_ = json.Unmarshal([]byte(`{"simple_query_string": {"fields": ["title"], "query": "\"quick fox\" foo*bar baz*"}}`), &sqsQ)
 	cqSQS := tr.CompileQuery(&sqsQ, false, nil)
-	if !strings.Contains(cqSQS.WhereSQL, "MATCH_PHRASE") || strings.Contains(cqSQS.WhereSQL, "foo%bar") || !strings.Contains(cqSQS.WhereSQL, "baz%") {
-		t.Fatalf("F14 expected MATCH_PHRASE for quoted phrase, no mid-word LIKE foo%%bar, and prefix LIKE baz%%, got %s", cqSQS.WhereSQL)
+	if !strings.Contains(cqSQS.WhereSQL, "MATCH_PHRASE") || strings.Contains(cqSQS.WhereSQL, "foo%bar") || !strings.Contains(cqSQS.WhereSQL, "baz[[:alnum:]_]*") {
+		t.Fatalf("F14 expected MATCH_PHRASE for quoted phrase, no mid-word LIKE foo%%bar, and token-bounded prefix regex baz[[:alnum:]_]*, got %s", cqSQS.WhereSQL)
 	}
 
 	// F15: nested -> terms -> top_hits and terms -> nested -> avg sub-aggregations

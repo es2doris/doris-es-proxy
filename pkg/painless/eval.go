@@ -2616,10 +2616,10 @@ var (
 	reLocalArrayRemoveIf   = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\.removeIf\(\s*\(?\s*(?:[a-zA-Z_$][a-zA-Z0-9_$<>[\]]*\s+)?([a-zA-Z0-9_$]+)\s*\)?\s*->\s*(.+)\s*\)$`)
 	reLocalCompoundAssign  = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*\??(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\s*(\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>>=|>>=)\s*(.+)$`)
 	reLocalPropAssign      = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*)\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)\s*=\s*(.+)$`)
-	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?Predicate|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
-	reNullVarDecl          = regexp.MustCompile(`^(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?Predicate|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
-	reVarTypeDeclPrefix    = regexp.MustCompile(`(?s)^((?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?Predicate|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*)\s+(.+)$`)
-	reUserFuncHeaderPrefix = regexp.MustCompile(`^(void|def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?Predicate|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics|[a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*<[^>]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
+	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|GeoPoint|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
+	reNullVarDecl          = regexp.MustCompile(`^(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|GeoPoint|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
+	reVarTypeDeclPrefix    = regexp.MustCompile(`(?s)^((?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|GeoPoint|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*)\s+(.+)$`)
+	reUserFuncHeaderPrefix = regexp.MustCompile(`^(void|def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|GeoPoint|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics|[a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*<[^>]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
 	reIdentAssign          = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
 	reIdentOnly            = regexp.MustCompile(`^[a-zA-Z_$][a-zA-Z0-9_$]*$`)
 	reSimpleFieldPath      = regexp.MustCompile(`^[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+$`)
@@ -2706,6 +2706,7 @@ func ApplyUpdateWithResult(rawSource json.RawMessage, req *UpdateRequest, docExi
 		}
 		if !req.AllowMetaMutation {
 			scriptParams["__readonly_ctx_meta"] = true
+			scriptParams["__is_update_doc"] = true
 		}
 		ctxOp, err := EvalPainlessWithOp(doc, req.Script.Source, scriptParams)
 		if err != nil {
@@ -2756,12 +2757,18 @@ func ApplyUpdateWithResult(rawSource json.RawMessage, req *UpdateRequest, docExi
 		case "delete", "drop":
 			opResult = "deleted"
 		case "create":
+			if disallowCreate, _ := scriptParams["__disallow_update_create_op"].(bool); disallowCreate && docExisted && !req.AllowMetaMutation {
+				return nil, "", fmt.Errorf("illegal_argument_exception: Operation [create] is not supported, only [index, delete, noop, none] are allowed")
+			}
 			opResult = "created"
 		default:
 			return nil, "", fmt.Errorf("illegal_argument_exception: Operation [%s] is not supported, only [index, create, update, delete, noop, none] are allowed", ctxOp)
 		}
 	}
 
+	if err := ValidateAcyclicValue(doc); err != nil {
+		return nil, "", err
+	}
 	out, err := json.Marshal(doc)
 	if err != nil {
 		return nil, "", err
@@ -2839,6 +2846,9 @@ type evalBudget struct {
 	unmodMaps         map[uintptr]bool
 	setSlices         map[uintptr]bool
 	arrayTypes        map[uintptr]string
+	pinnedRefs        []any
+	metadataMap       map[string]any
+	emitContext       string
 }
 
 func latchCtxMetaOnBudget(budget *evalBudget, path []string, val any) {
@@ -3108,8 +3118,11 @@ func Eval(sourceMap map[string]any, scriptSource string, params map[string]any) 
 	if budget.hasCtxVersion {
 		evalParams["_ctx_version"] = budget.ctxVersion
 	}
+	if metaErr := syncMetadataMapToParamsRound60(budget, evalParams, params); metaErr != nil && err == nil {
+		err = metaErr
+	}
 	if params != nil {
-		for _, metaKey := range []string{"_ctx_id", "_ctx_index", "_ctx_routing", "_ctx_version", "_ctx_op"} {
+		for _, metaKey := range []string{"_ctx_id", "_ctx_index", "_ctx_routing", "_ctx_version", "_ctx_version_type", "_ctx_op"} {
 			if v, exists := evalParams[metaKey]; exists {
 				params[metaKey] = v
 			}
@@ -3308,8 +3321,14 @@ func EvalPainlessWithOp(sourceMap map[string]any, scriptSource string, params ma
 	if budget.hasCtxVersion {
 		evalParams["_ctx_version"] = budget.ctxVersion
 	}
+	if metaErr := syncMetadataMapToParamsRound60(budget, evalParams, params); metaErr != nil && err == nil {
+		err = metaErr
+	}
+	if budget.hasCtxOp {
+		ctxOp = budget.ctxOp
+	}
 	if params != nil {
-		for _, metaKey := range []string{"_ctx_id", "_ctx_index", "_ctx_routing", "_ctx_version", "_ctx_op"} {
+		for _, metaKey := range []string{"_ctx_id", "_ctx_index", "_ctx_routing", "_ctx_version", "_ctx_version_type", "_ctx_op"} {
 			if v, exists := evalParams[metaKey]; exists {
 				params[metaKey] = v
 			}
@@ -4294,7 +4313,11 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 	if (strings.HasPrefix(expIter, "doc.") || strings.HasPrefix(expIter, "doc?.")) &&
 		!strings.HasSuffix(expIter, ".value") && !strings.Contains(expIter, ".value.") && !strings.Contains(expIter, ".values.") && !strings.Contains(expIter, "(") {
 		docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(expIter, "doc?."), "doc."), ".values")
-		iterVal = resolveDocValuesSlice(sourceMap, docPath)
+		dv, dvErr := resolveDocValuesSliceWithParamsRound60(sourceMap, params, docPath)
+		if dvErr != nil {
+			return dvErr
+		}
+		iterVal = dv
 	} else {
 		var err error
 		iterVal, err = evalRHSExpr(sourceMap, iterExpr, params)
@@ -4304,7 +4327,14 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 	}
 	slice, ok := iterVal.([]any)
 	if !ok {
-		if mVal, isMap := iterVal.(map[string]any); isMap {
+		if fv, isFV := iterVal.(*FieldVal); isFV && fv != nil {
+			slice = fv.Values
+		} else if fSlice, isFS := iterVal.([]float64); isFS {
+			slice = make([]any, len(fSlice))
+			for i, f := range fSlice {
+				slice[i] = f
+			}
+		} else if mVal, isMap := iterVal.(map[string]any); isMap {
 			keys := visiblePainlessMapKeys(mVal)
 			slice = make([]any, len(keys))
 			for i, k := range keys {
@@ -4874,6 +4904,10 @@ func expandDynamicBrackets(s string, sourceMap map[string]any, params map[string
 			continue
 		}
 		recvToken := res[recvStart:recvEnd]
+		if shouldSkipDynamicGetRewriteRound60(res, recvStart, getIdx, recvToken, params) {
+			searchFrom = closeParen + 1
+			continue
+		}
 		if recvToken == "ctx" && (params == nil || params["ctx"] == nil) {
 			switch keyStr {
 			case "_index", "_id", "_routing", "_version", "op", "_now", "_ingest":
@@ -4985,7 +5019,10 @@ func checkCtxMetaLHS(rawPath []string, sourceMap, params map[string]any) (string
 		metaField := decodeBracketSeg(rawPath[1])
 		if metaField == "_id" || metaField == "_index" || metaField == "_routing" || metaField == "_version" {
 			if readonly, ok := params["__readonly_ctx_meta"].(bool); ok && readonly && metaField != "_routing" {
-				return "", fmt.Errorf("cannot modify read-only metadata field [ctx.%s]", metaField)
+				if metaField == "_id" {
+					return "", fmt.Errorf("illegal_argument_exception: Cannot modify _id in update script")
+				}
+				return "", fmt.Errorf("illegal_argument_exception: cannot modify read-only metadata field [ctx.%s]", metaField)
 			}
 			metaKey := "_ctx" + metaField
 			if params != nil {
@@ -5951,7 +5988,10 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 				_, isBI := targetVal.(*painlessBigInteger)
 				_, isSJ := targetVal.(*painlessStringJoiner)
 				_, isUO := targetVal.(*painlessUserObject)
-				if !isBD && !isBI && !isSJ && !isUO {
+				_, isFV := targetVal.(*FieldVal)
+				_, isFD := targetVal.(*FieldDocVal)
+				_, isPL := targetVal.(*PainlessLambda)
+				if !isBD && !isBI && !isSJ && !isUO && !isFV && !isFD && !isPL {
 					if err := checkMutableContainerPainless(budget, targetVal); err != nil {
 						return err
 					}
@@ -6002,7 +6042,10 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 					}
 					_, isBS := targetVal.(*painlessBitSet)
 					_, isUO := targetVal.(*painlessUserObject)
-					if !isBS && !isUO {
+					_, isFV := targetVal.(*FieldVal)
+					_, isFD := targetVal.(*FieldDocVal)
+					_, isPL := targetVal.(*PainlessLambda)
+					if !isBS && !isUO && !isFV && !isFD && !isPL {
 						if err := checkMutableContainerPainless(budget, targetVal); err != nil {
 							return err
 						}
@@ -6243,6 +6286,9 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		}
 	}
 	if !isTopLevelAssignmentStmt(stmt) && !strings.HasPrefix(stmt, "return ") && !strings.HasPrefix(stmt, "return(") {
+		if handled, err := execRound60StatementCall(sourceMap, stmt, params); handled {
+			return err
+		}
 		if handled, err := execRound54StatementCallPainless(sourceMap, stmt, params, budget); handled {
 			return err
 		}
@@ -6342,6 +6388,36 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 		if _, err := checkCtxMetaLHS(rawPath, sourceMap, params); err != nil {
 			return err
 		}
+		if len(rawPath) >= 2 && decodeBracketSeg(rawPath[0]) == "ctx" && params["ctx"] == nil {
+			firstSeg := decodeBracketSeg(rawPath[1])
+			if firstSeg != "_id" && firstSeg != "_index" && firstSeg != "_routing" && firstSeg != "_version" && firstSeg != "op" {
+				targetPath := rawPath[1:]
+				if firstSeg == "_source" {
+					targetPath = rawPath[2:]
+				} else if isUpdateDoc, _ := params["__is_update_doc"].(bool); isUpdateDoc {
+					return fmt.Errorf("illegal_argument_exception: Operation [ctx.%s] is not supported", firstSeg)
+				}
+				if sourceMap != nil && len(targetPath) > 0 {
+					if err := checkMutableParentAtPathPainless(budget, sourceMap, targetPath); err != nil {
+						return err
+					}
+					curVal := resolveParamPath(sourceMap, targetPath)
+					rhsExpr := strings.TrimSpace(m[3])
+					rhsVal, err := evalRHSExpr(sourceMap, rhsExpr, params)
+					if err != nil {
+						return err
+					}
+					nextVal, err := evalCompoundAssignRound57Painless(curVal, rhsVal, op, lhs, rhsExpr, "", params)
+					if err != nil {
+						return err
+					}
+					setValueAtPath(sourceMap, targetPath, nextVal)
+					syncSourceAliasToLocalVars(sourceMap, params, strings.Join(targetPath, "."))
+					params["_last_expr_val"] = nextVal
+					return nil
+				}
+			}
+		}
 		path := normalizeLocalLHSPath(rawPath, params)
 		if len(path) == 0 {
 			return nil
@@ -6425,6 +6501,26 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 			}
 			params["_last_expr_val"] = sourceMap
 			return nil
+		}
+		if decodeBracketSeg(varName) == "ctx" && len(propPath) >= 1 && params["ctx"] == nil {
+			firstSeg := decodeBracketSeg(propPath[0])
+			if firstSeg != "_id" && firstSeg != "_index" && firstSeg != "_routing" && firstSeg != "_version" && firstSeg != "op" {
+				targetPath := propPath
+				if firstSeg == "_source" {
+					targetPath = propPath[1:]
+				} else if isUpdateDoc, _ := params["__is_update_doc"].(bool); isUpdateDoc {
+					return fmt.Errorf("illegal_argument_exception: Operation [ctx.%s] is not supported", firstSeg)
+				}
+				if sourceMap != nil && len(targetPath) > 0 {
+					if err := checkMutableParentAtPathPainless(budget, sourceMap, targetPath); err != nil {
+						return err
+					}
+					setValueAtPath(sourceMap, targetPath, val)
+					syncSourceAliasToLocalVars(sourceMap, params, strings.Join(targetPath, "."))
+					params["_last_expr_val"] = val
+					return nil
+				}
+			}
 		}
 		fullPath := normalizeLocalLHSPath(append([]string{varName}, propPath...), params)
 		if len(fullPath) > 0 {
@@ -7213,6 +7309,47 @@ func painlessValuesEqual(a, b any) bool {
 		bsb, okB := b.(*painlessBitSet)
 		return okB && bsa.equals(bsb)
 	}
+	if eq, handled := round60WrapperEquals(a, b); handled {
+		return eq
+	}
+	if sa, okA := a.([]any); okA {
+		sb, okB := b.([]any)
+		if !okB {
+			return false
+		}
+		var walk func(x, y any, seen map[cyclePairKeyRound60]bool, depth int) bool
+		walk = func(x, y any, seen map[cyclePairKeyRound60]bool, depth int) bool {
+			if sx, ox := x.([]any); ox {
+				sy, oy := y.([]any)
+				return oy && slicesEqualCycleSafeRound60(sx, sy, walk, seen, depth)
+			}
+			if mx, ox := x.(map[string]any); ox {
+				my, oy := y.(map[string]any)
+				return oy && mapsEqualCycleSafeRound60(mx, my, walk, seen, depth)
+			}
+			return painlessValuesEqual(x, y)
+		}
+		return slicesEqualCycleSafeRound60(sa, sb, walk, nil, 0)
+	}
+	if ma, okA := a.(map[string]any); okA {
+		mb, okB := b.(map[string]any)
+		if !okB {
+			return false
+		}
+		var walk func(x, y any, seen map[cyclePairKeyRound60]bool, depth int) bool
+		walk = func(x, y any, seen map[cyclePairKeyRound60]bool, depth int) bool {
+			if sx, ox := x.([]any); ox {
+				sy, oy := y.([]any)
+				return oy && slicesEqualCycleSafeRound60(sx, sy, walk, seen, depth)
+			}
+			if mx, ox := x.(map[string]any); ox {
+				my, oy := y.(map[string]any)
+				return oy && mapsEqualCycleSafeRound60(mx, my, walk, seen, depth)
+			}
+			return painlessValuesEqual(x, y)
+		}
+		return mapsEqualCycleSafeRound60(ma, mb, walk, nil, 0)
+	}
 	if isNumericValuePainless(a) || isNumericValuePainless(b) {
 		if !isNumericValuePainless(a) || !isNumericValuePainless(b) {
 			return false
@@ -7275,15 +7412,18 @@ func painlessDeepEquals(a, b any) bool {
 	}
 	if sa, okA := a.([]any); okA {
 		sb, okB := b.([]any)
-		if !okB || len(sa) != len(sb) {
+		if !okB {
 			return false
 		}
-		for i := range sa {
-			if !painlessDeepEquals(sa[i], sb[i]) {
-				return false
+		var walk func(x, y any, seen map[cyclePairKeyRound60]bool, depth int) bool
+		walk = func(x, y any, seen map[cyclePairKeyRound60]bool, depth int) bool {
+			if sx, ox := x.([]any); ox {
+				sy, oy := y.([]any)
+				return oy && slicesEqualCycleSafeRound60(sx, sy, walk, seen, depth)
 			}
+			return painlessJavaObjectEquals(x, y)
 		}
-		return true
+		return slicesEqualCycleSafeRound60(sa, sb, walk, nil, 0)
 	}
 	return painlessJavaObjectEquals(a, b)
 }
@@ -7320,6 +7460,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 
 	if swVal, swOk, swErr := evalSwitchExprPainless(sourceMap, rhs, params, depth+1); swOk || swErr != nil {
 		return swVal, swErr
+	}
+	if r60Val, r60Ok, r60Err := evalRound60PreOpExpr(sourceMap, rhs, params, depth+1); r60Ok || r60Err != nil {
+		return r60Val, r60Err
 	}
 
 	// Lowest-precedence tier (JLS §15.26): right-associative `=` and compound assignments (`+=`, `-=`, `*=`, etc.)
@@ -7541,6 +7684,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		".withUpperCase()", ".withLowerCase()", ".translateEscapes()",
 		".firstKey()", ".lastKey()", ".firstEntry()", ".lastEntry()", ".pollFirstEntry()", ".pollLastEntry()", ".descendingKeySet()", ".navigableKeySet()", ".descendingMap()",
 		".first()", ".last()", ".getFirst()", ".getLast()", ".peekFirst()", ".peekLast()", ".peek()", ".element()", ".pollFirst()", ".pollLast()", ".poll()", ".removeFirst()", ".removeLast()", ".pop()", ".descendingSet()",
+		".utf8ToString()", ".limit()", ".position()", ".remaining()", ".hasRemaining()",
+		".getLat()", ".getLon()", ".getCentroid()",
+		".exists()", ".remove()", ".deduplicate()", ".asDate()", ".asGeoPoint()", ".asString()", ".asStrings()", ".doc()", ".docs()",
+		".getAsBoolean()", ".run()",
 	} {
 		if strings.HasSuffix(rhs, mSuffix) {
 			rawRecBeforeSuffix := strings.TrimSpace(rhs[:len(rhs)-len(mSuffix)])
@@ -7549,7 +7696,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			if (mSuffix == ".length()" || mSuffix == ".size()") && (strings.HasPrefix(recExpr, "doc.") || strings.HasPrefix(recExpr, "doc?.")) &&
 				!strings.HasSuffix(recExpr, ".value") && !strings.Contains(recExpr, ".values.") {
 				docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(recExpr, "doc?."), "doc."), ".values")
-				return int64(len(resolveDocValuesSlice(sourceMap, docPath))), nil
+				dv, dvErr := resolveDocValuesSliceWithParamsRound60(sourceMap, params, docPath)
+				if dvErr != nil {
+					return nil, dvErr
+				}
+				return int64(len(dv)), nil
 			}
 			if isKnownStaticClassIdentifierRound58(recExpr, params) {
 				continue
@@ -8578,7 +8729,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		if (strings.HasPrefix(recExpr, "doc.") || strings.HasPrefix(recExpr, "doc?.")) &&
 			!strings.HasSuffix(recExpr, ".value") && !strings.Contains(recExpr, ".values.") {
 			docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(recExpr, "doc?."), "doc."), ".values")
-			return len(resolveDocValuesSlice(sourceMap, docPath)) == 0, nil
+			vals, err := resolveDocValuesSliceWithParamsRound60(sourceMap, params, docPath)
+			if err != nil {
+				return nil, err
+			}
+			return len(vals) == 0, nil
 		}
 		var recVal any
 		var err error
@@ -8617,6 +8772,14 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			return len(tv) == 0, nil
 		case []any:
 			return len(tv) == 0, nil
+		case []float64:
+			return len(tv) == 0, nil
+		case *FieldVal:
+			return tv == nil || tv.IsEmpty(), nil
+		case *BytesRefVal:
+			return tv == nil || tv.Length == 0, nil
+		case *ByteBufferVal:
+			return tv == nil || tv.Remaining() == 0, nil
 		case map[string]any:
 			return visiblePainlessMapLen(tv) == 0, nil
 		}
@@ -12138,34 +12301,19 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 	}
 	if strings.HasPrefix(rhs, "emit(") && findMatchingDelimiter(rhs, 4, '(', ')') == len(rhs)-1 {
 		argInner := strings.TrimSpace(rhs[5 : len(rhs)-1])
+		if argInner == "" {
+			return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "emit requires at least 1 argument"}
+		}
 		args := splitTopLevelCommaPainless(argInner)
-		if len(args) == 1 {
-			v, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
+		evalArgs := make([]any, len(args))
+		for i, aExpr := range args {
+			v, err := evalRHSExprDepth(sourceMap, strings.TrimSpace(aExpr), params, depth+1)
 			if err != nil {
 				return nil, err
 			}
-			if v != nil {
-				b := getOrInitEvalBudget(params)
-				b.emittedVals = append(b.emittedVals, v)
-			}
-			return v, nil
-		} else if len(args) == 2 {
-			v1, err1 := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[0]), params, depth+1)
-			if err1 != nil {
-				return nil, err1
-			}
-			v2, err2 := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
-			if err2 != nil {
-				return nil, err2
-			}
-			if v1 != nil && v2 != nil {
-				combined := fmt.Sprintf("%v,%v", v1, v2)
-				b := getOrInitEvalBudget(params)
-				b.emittedVals = append(b.emittedVals, combined)
-				return combined, nil
-			}
+			evalArgs[i] = v
 		}
-		return nil, nil
+		return coerceAndRecordEmitRound60(getOrInitEvalBudget(params), evalArgs)
 	}
 	if rhs == "ctx._source" || rhs == "ctx?._source" || rhs == "ctx._source?" || rhs == "ctx?._source?" {
 		return sourceMap, nil
@@ -12193,6 +12341,18 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		}
 		return resolveParamPath(sourceMap, path), nil
 	}
+	for _, wProp := range []string{".lat", ".lon", ".bytes", ".offset", ".value", ".values"} {
+		if strings.HasSuffix(rhs, wProp) && ((wProp != ".value" && wProp != ".values") || (!strings.HasPrefix(rhs, "doc.") && !strings.HasPrefix(rhs, "doc?."))) {
+			recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:len(rhs)-len(wProp)], "?"))
+			if recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1); err == nil && recVal != nil {
+				if _, isMap := recVal.(map[string]any); !isMap {
+					if wVal, wOk := resolveWrapperPropertyRound60(recVal, strings.TrimPrefix(wProp, ".")); wOk {
+						return wVal, nil
+					}
+				}
+			}
+		}
+	}
 	for _, dProp := range []string{
 		".year", ".monthValue", ".monthOfYear", ".month", ".dayOfMonth", ".dayOfYear", ".date",
 		".hour", ".hourOfDay", ".minute", ".minuteOfHour", ".second", ".secondOfMinute",
@@ -12201,6 +12361,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		if strings.HasSuffix(rhs, dProp) {
 			recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:len(rhs)-len(dProp)], "?"))
 			if recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1); err == nil && recVal != nil {
+				if _, isMap := recVal.(map[string]any); !isMap {
+					if wVal, wOk := resolveWrapperPropertyRound60(recVal, strings.TrimPrefix(dProp, ".")); wOk {
+						return wVal, nil
+					}
+				}
 				if tm, ok := parsePainlessDateTime(recVal); ok {
 					switch dProp {
 					case ".year":
@@ -12238,6 +12403,12 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 	}
 	if strings.HasPrefix(rhs, "doc.") || strings.HasPrefix(rhs, "doc?.") {
 		trimmed := strings.TrimPrefix(strings.TrimPrefix(rhs, "doc?."), "doc.")
+		if strings.HasSuffix(trimmed, ".vectorValue") {
+			return docVectorValueAndMagnitudeRound60(sourceMap, params, strings.TrimSuffix(trimmed, ".vectorValue"), false)
+		}
+		if strings.HasSuffix(trimmed, ".magnitude") {
+			return docVectorValueAndMagnitudeRound60(sourceMap, params, strings.TrimSuffix(trimmed, ".magnitude"), true)
+		}
 		if strings.HasSuffix(trimmed, ".empty") {
 			base := strings.TrimSuffix(trimmed, ".empty")
 			if strings.HasSuffix(base, ".value") {
@@ -12247,7 +12418,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				}
 				return fmt.Sprintf("%v", val) == "", nil
 			}
-			dv := resolveDocValuesSlice(sourceMap, strings.TrimSuffix(base, ".values"))
+			dv, err := resolveDocValuesSliceWithParamsRound60(sourceMap, params, strings.TrimSuffix(base, ".values"))
+			if err != nil {
+				return nil, err
+			}
 			return len(dv) == 0, nil
 		}
 		if strings.HasSuffix(trimmed, ".length") {
@@ -12257,17 +12431,29 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				if err != nil || val == nil {
 					return int64(0), err
 				}
+				if br, isBR := val.(*BytesRefVal); isBR && br != nil {
+					return int64(br.Length), nil
+				}
+				if bb, isBB := val.(*ByteBufferVal); isBB && bb != nil {
+					return bb.Limit(), nil
+				}
 				return int64(utf8.RuneCountInString(fmt.Sprintf("%v", val))), nil
 			}
-			dv := resolveDocValuesSlice(sourceMap, strings.TrimSuffix(base, ".values"))
+			dv, err := resolveDocValuesSliceWithParamsRound60(sourceMap, params, strings.TrimSuffix(base, ".values"))
+			if err != nil {
+				return nil, err
+			}
 			return int64(len(dv)), nil
 		}
 		if strings.HasSuffix(trimmed, ".values") {
-			return resolveDocValuesSlice(sourceMap, strings.TrimSuffix(trimmed, ".values")), nil
+			return resolveDocValuesSliceWithParamsRound60(sourceMap, params, strings.TrimSuffix(trimmed, ".values"))
 		}
 		// Check `.values.<idx>` or `.<idx>` after bracket expansion (`doc['tags'].values[0]` or `doc['tags'][0]`)
 		if idx := strings.LastIndex(trimmed, ".values."); idx > 0 {
-			dv := resolveDocValuesSlice(sourceMap, trimmed[:idx])
+			dv, err := resolveDocValuesSliceWithParamsRound60(sourceMap, params, trimmed[:idx])
+			if err != nil {
+				return nil, err
+			}
 			tailSeg := decodeBracketSeg(trimmed[idx+len(".values."):])
 			if sIdx, ok := parseSliceIndex(tailSeg, len(dv)); ok {
 				return dv[sIdx], nil
@@ -12277,14 +12463,20 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		if lastDot := strings.LastIndexByte(trimmed, '.'); lastDot > 0 {
 			tailSeg := decodeBracketSeg(trimmed[lastDot+1:])
 			if isIntegerLiteral(tailSeg) {
-				dv := resolveDocValuesSlice(sourceMap, strings.TrimSuffix(trimmed[:lastDot], ".values"))
+				dv, err := resolveDocValuesSliceWithParamsRound60(sourceMap, params, strings.TrimSuffix(trimmed[:lastDot], ".values"))
+				if err != nil {
+					return nil, err
+				}
 				if sIdx, ok := parseSliceIndex(tailSeg, len(dv)); ok {
 					return dv[sIdx], nil
 				}
 				return nil, nil
 			}
 		}
-		dv := resolveDocValuesSlice(sourceMap, strings.TrimSuffix(trimmed, ".value"))
+		dv, err := resolveDocValuesSliceWithParamsRound60(sourceMap, params, strings.TrimSuffix(trimmed, ".value"))
+		if err != nil {
+			return nil, err
+		}
 		if len(dv) == 0 {
 			return nil, nil
 		}
@@ -12316,6 +12508,32 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					return int64(len(tv)), nil
 				}
 				return len(tv) == 0, nil
+			case []float64:
+				if isLen {
+					return int64(len(tv)), nil
+				}
+				return len(tv) == 0, nil
+			case *BytesRefVal:
+				if tv != nil {
+					if isLen {
+						return int64(tv.Length), nil
+					}
+					return tv.Length == 0, nil
+				}
+			case *ByteBufferVal:
+				if tv != nil {
+					if isLen {
+						return tv.Limit(), nil
+					}
+					return tv.Limit() == 0, nil
+				}
+			case *FieldVal:
+				if tv != nil {
+					if isLen {
+						return tv.Size(), nil
+					}
+					return tv.IsEmpty(), nil
+				}
 			case map[string]any:
 				if _, hasProp := tv[strings.TrimPrefix(suf, ".")]; !hasProp {
 					if isLen {
@@ -12622,6 +12840,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		inner := strings.TrimSpace(rhs[1 : len(rhs)-1])
 		if inner == ":" {
 			return map[string]any{}, nil
+		}
+		if inner == "" {
+			return newEmptyPainlessSlice(), nil
 		}
 		if inner != "" {
 			items := splitTopLevelCommaPainless(inner)
@@ -13832,10 +14053,18 @@ func toFloat64(v any) (float64, bool) {
 		f, ok = val.float64Value(), true
 	case int:
 		f, ok = float64(val), true
+	case int32:
+		f, ok = float64(val), true
 	case int64:
+		f, ok = float64(val), true
+	case float32:
 		f, ok = float64(val), true
 	case float64:
 		f, ok = val, true
+	case *ZonedDateTimeVal:
+		if val != nil {
+			f, ok = float64(val.ToEpochMilli()), true
+		}
 	case json.Number:
 		parsed, err := val.Float64()
 		f, ok = parsed, err == nil
@@ -14227,6 +14456,18 @@ func resolveParamPath(params map[string]any, path []string) any {
 			curr = uo.fields[seg]
 			continue
 		}
+		if fd, isFD := curr.(*FieldDocVal); isFD {
+			if fd == nil {
+				return nil
+			}
+			curr = fd.Doc
+		}
+		if _, isMap := curr.(map[string]any); !isMap {
+			if wVal, wOk := resolveWrapperPropertyRound60(curr, seg); wOk {
+				curr = wVal
+				continue
+			}
+		}
 		m, ok := curr.(map[string]any)
 		if !ok {
 			return nil
@@ -14417,8 +14658,13 @@ func evalInstanceOfPainless(val any, typeName string) bool {
 		return typeName == "Optional" || typeName == "Object" || typeName == "def"
 	}
 	if strings.HasSuffix(typeName, "]") {
-		_, ok := val.([]any)
-		return ok
+		if _, ok := val.([]any); ok {
+			return true
+		}
+		if _, ok := val.([]float64); ok {
+			return typeName == "float[]" || typeName == "double[]" || typeName == "Object[]" || typeName == "def[]"
+		}
+		return false
 	}
 	switch typeName {
 	case "List", "ArrayList", "LinkedList", "Set", "HashSet", "LinkedHashSet", "TreeSet", "NavigableSet", "SortedSet", "Deque", "ArrayDeque", "Queue", "PriorityQueue", "Collection":
@@ -14474,8 +14720,39 @@ func evalInstanceOfPainless(val any, typeName string) bool {
 		_, ok := val.(*painlessURL)
 		return ok
 	case "Predicate":
-		_, ok := val.(*painlessPredicate)
+		if _, ok := val.(*painlessPredicate); ok {
+			return true
+		}
+		_, ok := val.(*PainlessLambda)
 		return ok
+	case "BiPredicate", "Supplier", "IntSupplier", "LongSupplier", "DoubleSupplier", "BooleanSupplier",
+		"Function", "BiFunction", "IntFunction", "LongFunction", "DoubleFunction",
+		"UnaryOperator", "BinaryOperator", "Consumer", "BiConsumer", "Runnable":
+		_, ok := val.(*PainlessLambda)
+		return ok
+	case "Metadata":
+		_, ok := val.(map[string]any)
+		return ok
+	case "GeoPoint":
+		_, ok := val.(*GeoPointVal)
+		return ok
+	case "BytesRef":
+		_, ok := val.(*BytesRefVal)
+		return ok
+	case "ByteBuffer":
+		_, ok := val.(*ByteBufferVal)
+		return ok
+	case "DayOfWeek", "DayOfWeekEnum":
+		if _, ok := val.(DayOfWeekEnum); ok {
+			return true
+		}
+		if _, ok := val.(*DayOfWeekEnum); ok {
+			return true
+		}
+		if s, ok := val.(string); ok {
+			return parseDayOfWeekIndexPainless(s) > 0
+		}
+		return false
 	case "String", "CharSequence":
 		_, ok := val.(string)
 		return ok
@@ -14559,6 +14836,12 @@ func evalInstanceOfPainless(val any, typeName string) bool {
 		_, ok := parsePainlessDateTime(s)
 		return ok && classifyTemporalStringKindPainless(s) == "LocalDateTime"
 	case "ZonedDateTime", "OffsetDateTime", "Instant":
+		if _, isZ := val.(*ZonedDateTimeVal); isZ && typeName != "Instant" {
+			return true
+		}
+		if _, isI := val.(*InstantVal); isI && typeName == "Instant" {
+			return true
+		}
 		if _, isT := val.(time.Time); isT {
 			return true
 		}
@@ -14708,6 +14991,7 @@ func removeKeyOrIndexAtPath(root map[string]any, parentPath []string, keyOrIdx a
 			next = append(next, target[:idx]...)
 			next = append(next, target[idx+1:]...)
 			setValueAtPath(root, parentPath, next)
+			syncSliceHeaderAliasesRound60(root, target, next)
 			return old
 		}
 		if _, isStr := keyOrIdx.(string); !isStr {
@@ -14751,6 +15035,7 @@ func appendToSlice(root map[string]any, path []string, val any) error {
 	}
 	next = propagateSliceTagsRound59(getOrInitEvalBudget(root), existing, next)
 	setValueAtPath(root, path, next)
+	syncSliceHeaderAliasesRound60(root, existing, next)
 	return nil
 }
 
@@ -14875,6 +15160,16 @@ func parsePainlessDateTime(v any) (time.Time, bool) {
 	switch tv := v.(type) {
 	case time.Time:
 		return tv, true
+	case *ZonedDateTimeVal:
+		if tv != nil {
+			return tv.Time, true
+		}
+	case ZonedDateTimeVal:
+		return tv.Time, true
+	case *InstantVal:
+		if tv != nil {
+			return tv.Time, true
+		}
 	case string:
 		s := strings.TrimSpace(tv)
 		body, zid, hasZone := extractBracketedZoneIDPainless(s)
@@ -14896,6 +15191,9 @@ func parsePainlessDateTime(v any) (time.Time, bool) {
 			"2006-01-02 15:04:05",
 			"2006-01-02T15:04",
 			"2006-01-02",
+			"2006/01/02T15:04:05Z07:00",
+			"2006/01/02 15:04:05",
+			"2006/01/02",
 			"20060102",
 			"2006-01",
 			"15:04:05.999999999",
@@ -15077,6 +15375,9 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 	}
 	argStr := strings.TrimSpace(rhs[openParen+1 : len(rhs)-1])
 	args := splitTopLevelCommaPainless(argStr)
+	if res, handled, err := evalRound60StaticOrBuiltinCall(fnName, args, argStr, sourceMap, params, depth+1); handled {
+		return res, true, err
+	}
 	if res, handled, err := evalJavaTimeFactoryRound58(fnName, args, sourceMap, params, depth+1); handled {
 		return res, true, err
 	}
@@ -15986,6 +16287,9 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 				return "", true, err
 			}
 			if arr, ok := v.([]any); ok {
+				if ValidateAcyclicValue(arr) != nil {
+					return FormatValueSafe(arr), true, nil
+				}
 				chars := make([]rune, 0, len(arr))
 				for _, el := range arr {
 					if s, okS := el.(string); okS {
@@ -21509,22 +21813,7 @@ func findSubmatchIndexFromPosPainless(re *regexp.Regexp, input string, pos int) 
 }
 
 func formatArraysToStringPainless(arr []any, deep bool) string {
-	if arr == nil {
-		return "null"
-	}
-	parts := make([]string, len(arr))
-	for i, el := range arr {
-		if el == nil {
-			parts[i] = "null"
-			continue
-		}
-		if sub, ok := el.([]any); ok && deep {
-			parts[i] = formatArraysToStringPainless(sub, true)
-			continue
-		}
-		parts[i] = formatValueForStringPainless(el)
-	}
-	return "[" + strings.Join(parts, ", ") + "]"
+	return formatArraysToStringCycleSafeRound60(arr, deep)
 }
 
 func parsePainlessPeriod(v any) (painlessPeriod, bool) {
@@ -24964,6 +25253,9 @@ func evalTrailingUserObjectMethodCallPainless(sourceMap map[string]any, rhs stri
 			}
 		}
 		return nil, false, nil
+	}
+	if r60Res, r60Handled, r60Err := evalRound60ReceiverMethod(recVal, methodName, strings.TrimSpace(rhs[openIdx+1:len(rhs)-1]), sourceMap, params, depth+1); r60Handled {
+		return r60Res, true, r60Err
 	}
 	uo, ok := recVal.(*painlessUserObject)
 	if !ok || uo == nil || uo.class == nil {

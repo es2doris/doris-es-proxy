@@ -522,7 +522,7 @@ func (s *Server) handleDownsampleIndex(w http.ResponseWriter, r *http.Request, r
 
 	_ = s.coalescer.FlushTable(r.Context(), srcSchema.DorisTable)
 	opts := s.transpileOpts
-	opts.MaxResultWindow = 0
+	opts.MaxResultWindow = 1_000_000
 	tr := transpiler.NewTranspiler(srcSchema, opts)
 	batchSize := 1000
 	var searchAfter []any

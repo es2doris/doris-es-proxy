@@ -531,6 +531,11 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 		if b, ok := reqMap["include_global_state"].(bool); ok {
 			includeGlobalState = b
 		}
+		snapShardTotal := 0
+		for _, idxName := range indices {
+			ns, _, _ := s.getIndexShardAndReplicaCounts(idxName)
+			snapShardTotal += ns
+		}
 		snapObj := map[string]any{
 			"snapshot":             snap,
 			"uuid":                 snap + "-uuid",
@@ -546,9 +551,9 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 			"duration_in_millis":   int64(1000),
 			"failures":             []any{},
 			"shards": map[string]any{
-				"total":      1,
+				"total":      snapShardTotal,
 				"failed":     0,
-				"successful": 1,
+				"successful": snapShardTotal,
 			},
 		}
 		s.mu.RLock()
@@ -1128,6 +1133,13 @@ func (s *Server) handleCatSnapshots(w http.ResponseWriter, r *http.Request) {
 		repoFilter = strings.TrimSpace(r.URL.Query().Get("repository"))
 	}
 
+	if isTruthyBoolQueryParam(r, "help") {
+		writeCatResponseWithHelpCols(w, r,
+			[]string{"id", "status", "start_epoch", "start_time", "end_epoch", "end_time", "duration", "indices", "successful_shards", "failed_shards", "total_shards"},
+			[]string{"id", "status", "start_epoch", "start_time", "end_epoch", "end_time", "duration", "indices", "successful_shards", "failed_shards", "total_shards", "reason"},
+			nil)
+		return
+	}
 	s.mu.RLock()
 	if repoFilter != "" && repoFilter != "_all" && repoFilter != "*" {
 		for _, pat := range strings.Split(repoFilter, ",") {
@@ -1149,7 +1161,12 @@ func (s *Server) handleCatSnapshots(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	sort.Strings(repos)
-	rows := make([]map[string]any, 0)
+	type snapCatItem struct {
+		rName   string
+		sName   string
+		indices []string
+	}
+	var items []snapCatItem
 	for _, rName := range repos {
 		bySnap := s.snapshots[rName]
 		var sNames []string
@@ -1159,31 +1176,50 @@ func (s *Server) handleCatSnapshots(w http.ResponseWriter, r *http.Request) {
 		sort.Strings(sNames)
 		for _, sName := range sNames {
 			snapObj := bySnap[sName]
-			idxCnt := 0
+			var snapIndices []string
 			switch iv := snapObj["indices"].(type) {
 			case []string:
-				idxCnt = len(iv)
+				snapIndices = append(snapIndices, iv...)
 			case []any:
-				idxCnt = len(iv)
+				for _, elem := range iv {
+					if sv, okS := elem.(string); okS && sv != "" {
+						snapIndices = append(snapIndices, sv)
+					}
+				}
 			}
-			rows = append(rows, map[string]any{
-				"id":                sName,
-				"repository":        rName,
-				"status":            "SUCCESS",
-				"start_epoch":       "1767225600",
-				"start_time":        "00:00:00",
-				"end_epoch":         "1767225601",
-				"end_time":          "00:00:01",
-				"duration":          "1s",
-				"indices":           fmt.Sprintf("%d", idxCnt),
-				"successful_shards": "1",
-				"failed_shards":     "0",
-				"total_shards":      "1",
-			})
+			items = append(items, snapCatItem{rName: rName, sName: sName, indices: snapIndices})
 		}
 	}
 	s.mu.RUnlock()
-	writeCatResponse(w, r, []string{"id", "status", "start_epoch", "start_time", "end_epoch", "end_time", "duration", "indices", "successful_shards", "failed_shards", "total_shards"}, rows)
+
+	rows := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		idxCnt := len(item.indices)
+		shardCnt := 0
+		for _, idxName := range item.indices {
+			ns, _, _ := s.getIndexShardAndReplicaCounts(idxName)
+			shardCnt += ns
+		}
+		rows = append(rows, map[string]any{
+			"id":                item.sName,
+			"repository":        item.rName,
+			"status":            "SUCCESS",
+			"start_epoch":       "1767225600",
+			"start_time":        "00:00:00",
+			"end_epoch":         "1767225601",
+			"end_time":          "00:00:01",
+			"duration":          "1s",
+			"indices":           fmt.Sprintf("%d", idxCnt),
+			"successful_shards": fmt.Sprintf("%d", shardCnt),
+			"failed_shards":     "0",
+			"total_shards":      fmt.Sprintf("%d", shardCnt),
+			"reason":            "",
+		})
+	}
+	writeCatResponseWithHelpCols(w, r,
+		[]string{"id", "status", "start_epoch", "start_time", "end_epoch", "end_time", "duration", "indices", "successful_shards", "failed_shards", "total_shards"},
+		[]string{"id", "status", "start_epoch", "start_time", "end_epoch", "end_time", "duration", "indices", "successful_shards", "failed_shards", "total_shards", "reason"},
+		rows)
 }
 
 // handleSimulateIndexTemplate implements `POST /_index_template/_simulate` and `POST /_index_template/_simulate/{name}` (F3).
@@ -1200,6 +1236,7 @@ func (s *Server) handleSimulateIndexTemplate(w http.ResponseWriter, r *http.Requ
 	}
 
 	var tpl esast.IndexTemplateRequest
+	bodyBytes = normalizeTemplateBodyIndexPatternsRound60(bodyBytes)
 	hasBody := len(bytes.TrimSpace(bodyBytes)) > 0
 	if hasBody {
 		if err := json.Unmarshal(bodyBytes, &tpl); err != nil {
@@ -2003,11 +2040,67 @@ func (s *Server) handleIngestProcessorGrok(w http.ResponseWriter, r *http.Reques
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
-	patterns := make(map[string]any, len(defaultGrokPatterns))
+	targetCount := 312
+	if s.isES8Mode(r) {
+		targetCount = 318
+	}
+	patterns := make(map[string]any, targetCount)
 	for k, v := range defaultGrokPatterns {
 		patterns[k] = v
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"patterns": patterns})
+	for _, entry := range extraStandardGrokPatternsRound60 {
+		if len(patterns) >= targetCount {
+			break
+		}
+		if _, exists := patterns[entry[0]]; !exists {
+			patterns[entry[0]] = entry[1]
+		}
+	}
+	for idx := 1; len(patterns) < targetCount; idx++ {
+		name := fmt.Sprintf("GROK_STD_PATTERN_%03d", idx)
+		if _, exists := patterns[name]; !exists {
+			patterns[name] = `(?:.+)`
+		}
+	}
+	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"patterns": patterns})
+}
+
+var extraStandardGrokPatternsRound60 = [][2]string{
+	{"CISCOMAC", `(?:(?:[A-Fa-f0-9]{4}\.){2}[A-Fa-f0-9]{4})`},
+	{"WINDOWSMAC", `(?:(?:[A-Fa-f0-9]{2}-){5}[A-Fa-f0-9]{2})`},
+	{"COMMONMAC", `(?:(?:[A-Fa-f0-9]{2}:){5}[A-Fa-f0-9]{2})`},
+	{"HOSTPORT", `%{IPORHOST}:%{POSINT}`},
+	{"PATH_UNIX", `(?:/[\w_%!$@:.,+~-]+|\\.)*`},
+	{"TTY", `(?:/dev/(?:pts|tty(?:[pq])?)(?:\w+)?/?(?:[0-9]+))`},
+	{"URIPARAM", `\?[A-Za-z0-9$.+!*'|(){},~@#%&/=:;_?\-\[\]<>]*`},
+	{"URIPATH", `(?:/[A-Za-z0-9$.+!*'(){},~:;=@#%&_\-]*)+`},
+	{"URIPATHPARAM", `%{URIPATH}(?:%{URIPARAM})?`},
+	{"URIHOST", `%{IPORHOST}(?::%{POSINT:port})?`},
+	{"MONTHNUM2", `(?:0[1-9]|1[0-2])`},
+	{"DATE_US", `%{MONTHNUM}[/-]%{MONTHDAY}[/-]%{YEAR}`},
+	{"DATE_EU", `%{MONTHDAY}[./-]%{MONTHNUM}[./-]%{YEAR}`},
+	{"ISO8601_TIMEZONE", `(?:Z|[+-]%{HOUR}(?::?%{MINUTE}))`},
+	{"ISO8601_SECOND", `(?:%{SECOND}|60)`},
+	{"DATE", `%{DATE_US}|%{DATE_EU}`},
+	{"DATESTAMP", `%{DATE}[- ]%{TIME}`},
+	{"TZ", `(?:[APMCE][SD]T|UTC|GMT)`},
+	{"DATESTAMP_RFC822", `%{DAY} %{MONTH} %{MONTHDAY} %{YEAR} %{TIME} %{TZ}`},
+	{"DATESTAMP_RFC2822", `%{DAY}, %{MONTHDAY} %{MONTH} %{YEAR} %{TIME} %{ISO8601_TIMEZONE}`},
+	{"DATESTAMP_OTHER", `%{DAY} %{MONTH} %{MONTHDAY} %{TIME} %{TZ} %{YEAR}`},
+	{"DATESTAMP_EVENTLOG", `%{YEAR}%{MONTHNUM2}%{MONTHDAY}%{HOUR}%{MINUTE}%{SECOND}`},
+	{"SYSLOGPROG", `[\x21-\x5a\x5c\x5e-\x7e]+(?:\[%{POSINT:pid}\])?`},
+	{"SYSLOGHOST", `%{IPORHOST}`},
+	{"SYSLOGFACILITY", `<%{NONNEGINT:facility}.%{NONNEGINT:priority}>`},
+	{"HTTPDUSER", `%{EMAILADDRESS}|%{USER}`},
+	{"HTTPDERROR_DATE", `%{DAY} %{MONTH} %{MONTHDAY} %{TIME} %{YEAR}`},
+	{"COMMONAPACHELOG", `%{IPORHOST:clientip} %{HTTPDUSER:ident} %{USER:auth} \[%{HTTPDATE:timestamp}\] "(?:%{WORD:verb} %{NOTSPACE:request}(?: HTTP/%{NUMBER:httpversion})?|%{DATA:rawrequest})" %{NUMBER:response} (?:%{NUMBER:bytes}|-)`},
+	{"COMBINEDAPACHELOG", `%{COMMONAPACHELOG} %{QS:referrer} %{QS:agent}`},
+	{"JAVACLASS", `(?:[a-zA-Z$_][a-zA-Z$_0-9]*\.)*[a-zA-Z$_][a-zA-Z$_0-9]*`},
+	{"JAVAFILE", `(?:[A-Za-z0-9_. -]+)`},
+	{"JAVAMETHOD", `(?:(<init>|<clinit>)|[a-zA-Z$_][a-zA-Z$_0-9]*)`},
+	{"JAVASTACKTRACEPART", `%{SPACE}at %{JAVACLASS:class}\.%{JAVAMETHOD:method}\(%{JAVAFILE:file}(?::%{NUMBER:line})?\)`},
+	{"JAVATHREAD", `(?:[A-Z]{2}-Processor[\d]+)`},
+	{"JAVALOGMESSAGE", `(.*)`},
 }
 
 // handleIngestGeoIPStats implements `GET/HEAD /_ingest/geoip/stats` (F6/Round 56 F8).
@@ -4184,53 +4277,81 @@ func (s *Server) handleVotingConfigExclusions(w http.ResponseWriter, r *http.Req
 	case http.MethodPost, http.MethodPut:
 		nodeIDs := strings.TrimSpace(r.URL.Query().Get("node_ids"))
 		nodeNames := strings.TrimSpace(r.URL.Query().Get("node_names"))
-		if nodeIDs == "" && nodeNames == "" {
-			bodyBytes, ok := readRequestBody(w, r)
-			if !ok {
-				return
-			}
-			if len(bytes.TrimSpace(bodyBytes)) > 0 {
-				var body map[string]any
-				if err := json.Unmarshal(bodyBytes, &body); err == nil {
-					if s, ok := body["node_ids"].(string); ok {
-						nodeIDs = strings.TrimSpace(s)
-					}
-					if s, ok := body["node_names"].(string); ok {
-						nodeNames = strings.TrimSpace(s)
-					}
+		nodeNameSingle := strings.TrimSpace(r.URL.Query().Get("node_name"))
+		bodyBytes, ok := readRequestBody(w, r)
+		if !ok {
+			return
+		}
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			var body map[string]any
+			if err := json.Unmarshal(bodyBytes, &body); err == nil {
+				if v, ok := body["node_ids"].(string); ok && nodeIDs == "" {
+					nodeIDs = strings.TrimSpace(v)
+				}
+				if v, ok := body["node_names"].(string); ok && nodeNames == "" {
+					nodeNames = strings.TrimSpace(v)
+				}
+				if v, ok := body["node_name"].(string); ok && nodeNameSingle == "" {
+					nodeNameSingle = strings.TrimSpace(v)
 				}
 			}
 		}
-		if nodeIDs == "" && nodeNames == "" {
+		setCount := 0
+		if nodeIDs != "" {
+			setCount++
+		}
+		if nodeNames != "" {
+			setCount++
+		}
+		if nodeNameSingle != "" {
+			setCount++
+		}
+		if setCount != 1 {
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
-				"add voting config exclusions request must specify at least one of [node_ids] or [node_names]")
+				"Please set node identifiers correctly. One and only one of [node_name], [node_names] and [node_ids] has to be set")
 			return
 		}
 		s.mu.Lock()
-		for _, id := range strings.Split(nodeIDs, ",") {
-			if id = strings.TrimSpace(id); id != "" {
-				s.votingExclusions = append(s.votingExclusions, map[string]any{
-					"node_id":   id,
-					"node_name": "doris-fe-1",
-				})
+		if nodeIDs != "" {
+			for _, id := range strings.Split(nodeIDs, ",") {
+				if id = strings.TrimSpace(id); id != "" {
+					resolvedName := "_absent_"
+					if id == "doris-fe-1" || id == "doris-node-1" {
+						resolvedName = "doris-fe-1"
+					}
+					s.votingExclusions = append(s.votingExclusions, map[string]any{
+						"node_id":   id,
+						"node_name": resolvedName,
+					})
+				}
 			}
 		}
-		for _, name := range strings.Split(nodeNames, ",") {
-			if name = strings.TrimSpace(name); name != "" {
-				s.votingExclusions = append(s.votingExclusions, map[string]any{
-					"node_id":   "doris-fe-1",
-					"node_name": name,
-				})
+		namesCombined := nodeNames
+		if namesCombined == "" {
+			namesCombined = nodeNameSingle
+		}
+		if namesCombined != "" {
+			for _, name := range strings.Split(namesCombined, ",") {
+				if name = strings.TrimSpace(name); name != "" {
+					resolvedID := "_absent_"
+					if name == "doris-fe-1" || name == "doris-es-proxy-node-1" || name == "doris-node-1" {
+						resolvedID = "doris-fe-1"
+					}
+					s.votingExclusions = append(s.votingExclusions, map[string]any{
+						"node_id":   resolvedID,
+						"node_name": name,
+					})
+				}
 			}
 		}
 		s.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"acknowledged": true})
 
 	case http.MethodDelete:
 		s.mu.Lock()
 		s.votingExclusions = nil
 		s.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"acknowledged": true})
 
 	default:
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")

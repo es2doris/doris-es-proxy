@@ -268,17 +268,17 @@ func TestRound32_SortCoercionHighlightPostFilterKeyedPipelineAndClone(t *testing
 		t.Fatalf("expected non-nil max_score when post_filter is present, got %+v", res16["hits"])
 	}
 	aggs16 := res16["aggregations"].(map[string]any)
-	maxStep, ok := aggs16["max_bucket#max_step_cnt"].(map[string]any)
+	maxStep, ok := aggs16["bucket_metric_value#max_step_cnt"].(map[string]any)
 	if !ok {
-		t.Fatalf("expected max_bucket#max_step_cnt in aggs: %+v", aggs16)
+		t.Fatalf("expected bucket_metric_value#max_step_cnt in aggs: %+v", aggs16)
 	}
 	if maxStep["value"] != float64(1) {
 		t.Fatalf("expected max_bucket over keyed histogram to be 1, got %+v", maxStep)
 	}
 	stepBuckets := aggs16["histogram#by_step"].(map[string]any)["buckets"].(map[string]any)
 	b10 := stepBuckets["10"].(map[string]any)
-	if b10["cumulative_cardinality#cum_card"] == nil || b10["moving_avg#mov_avg"] == nil {
-		t.Fatalf("expected cumulative_cardinality#cum_card and moving_avg#mov_avg typed keys in bucket, got %+v", b10)
+	if b10["simple_value#cum_card"] == nil || b10["simple_value#mov_avg"] == nil {
+		t.Fatalf("expected simple_value#cum_card and simple_value#mov_avg typed keys in bucket, got %+v", b10)
 	}
 	fltBuckets := aggs16["filters#by_flt"].(map[string]any)["buckets"].([]any)
 	if len(fltBuckets) != 2 || fltBuckets[0].(map[string]any)["doc_count"] != float64(1) || fltBuckets[1].(map[string]any)["doc_count"] != float64(2) {

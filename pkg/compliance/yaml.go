@@ -101,16 +101,20 @@ type SpecSection struct {
 	Steps []SpecStep
 }
 
-// SkipSpec represents a rest-api-spec skip directive (file-level or section-level).
+// SkipSpec represents a rest-api-spec skip or requires directive (file-level or section-level).
 type SkipSpec struct {
-	Version  string
-	Reason   string
-	Features []string
+	Version            string
+	Reason             string
+	Features           []string
+	TestRunnerFeatures []string
+	ClusterFeatures    []string
+	KnownIssues        bool
 }
 
 // SpecDocument represents a parsed multi-document rest-api-spec YAML file.
 type SpecDocument struct {
 	Skip     *SkipSpec
+	Requires *SkipSpec
 	Setup    []SpecStep
 	Teardown []SpecStep
 	Sections []SpecSection
@@ -144,6 +148,16 @@ func ParseSpecFile(content string) (*SpecDocument, error) {
 						return nil, err
 					}
 					spec.Skip = skipSpec
+					continue
+				}
+			}
+			if docIdx == 0 && field.Key == "requires" {
+				if _, isSeq := field.Value.([]any); !isSeq {
+					reqSpec, err := parseSkipSpec(field.Value)
+					if err != nil {
+						return nil, err
+					}
+					spec.Requires = reqSpec
 					continue
 				}
 			}
@@ -203,6 +217,26 @@ func parseSkipSpec(raw any) (*SkipSpec, error) {
 					}
 				}
 			}
+		case "test_runner_features":
+			for _, item := range extractStringSlice(f.Value) {
+				for _, part := range strings.Split(item, ",") {
+					if trimmed := strings.TrimSpace(part); trimmed != "" {
+						out.TestRunnerFeatures = append(out.TestRunnerFeatures, trimmed)
+					}
+				}
+			}
+		case "cluster_features":
+			for _, item := range extractStringSlice(f.Value) {
+				for _, part := range strings.Split(item, ",") {
+					if trimmed := strings.TrimSpace(part); trimmed != "" {
+						out.ClusterFeatures = append(out.ClusterFeatures, trimmed)
+					}
+				}
+			}
+		case "known_issues":
+			if f.Value != nil {
+				out.KnownIssues = true
+			}
 		}
 	}
 	return out, nil
@@ -260,15 +294,31 @@ func ParseYAMLDocuments(content string) ([]any, error) {
 			}
 		}
 
-		if (trimmed == "---" || strings.HasPrefix(trimmed, "--- ")) && indent == 0 {
+		stripped := stripComment(line)
+		trimmedStripped := strings.TrimSpace(stripped)
+
+		if (trimmedStripped == "---" || strings.HasPrefix(trimmedStripped, "--- ") || strings.HasPrefix(trimmedStripped, "---\t")) && indent == 0 && flowDepth == 0 {
 			if len(current) > 0 {
 				docChunks = append(docChunks, current)
 				current = nil
 			}
 			flowDepth = 0
+			if len(trimmedStripped) > 3 {
+				afterMarker := strings.TrimSpace(trimmedStripped[3:])
+				if afterMarker != "" {
+					inlineLine := "    " + afterMarker
+					if isBlockScalarHeaderLine(afterMarker) {
+						inBlockScalar = true
+						blockIndent = 0
+					} else {
+						openQuote, _, flowDepth = scanLineForUnclosedQuote(inlineLine, 0, true, false, flowDepth)
+					}
+					current = append(current, inlineLine)
+				}
+			}
 			continue
 		}
-		if trimmed == "..." && indent == 0 {
+		if (trimmedStripped == "..." || strings.HasPrefix(trimmedStripped, "... ") || strings.HasPrefix(trimmedStripped, "...\t")) && indent == 0 && flowDepth == 0 {
 			if len(current) > 0 {
 				docChunks = append(docChunks, current)
 				current = nil
@@ -278,8 +328,6 @@ func ParseYAMLDocuments(content string) ([]any, error) {
 		}
 
 		// Detect if this line starts a block scalar (`|` or `>`)
-		stripped := stripComment(line)
-		trimmedStripped := strings.TrimSpace(stripped)
 		if isBlockScalarHeaderLine(trimmedStripped) {
 			inBlockScalar = true
 			blockIndent = indent
@@ -560,7 +608,15 @@ func (p *yamlParser) parseDocument() (any, error) {
 		return nil, nil
 	}
 	indent := countLeadingSpaces(p.rawLines[p.pos])
-	return p.parseNode(indent)
+	val, err := p.parseNode(indent)
+	if err != nil {
+		return nil, err
+	}
+	p.skipBlankAndComments()
+	if p.pos < len(p.rawLines) {
+		return nil, fmt.Errorf("line %d: unexpected trailing content %q", p.pos+1, strings.TrimSpace(p.rawLines[p.pos]))
+	}
+	return val, nil
 }
 
 func (p *yamlParser) skipBlankAndComments() {
@@ -630,7 +686,63 @@ func (p *yamlParser) parseNode(minIndent int) (any, error) {
 		return p.parseBlockScalar(trimmed, indent-1)
 	}
 	p.pos++
-	return p.parseScalarOrAlias(trimmed)
+	folded := p.foldPlainContinuation(trimmed, line, indent)
+	return p.parseScalarOrAlias(folded)
+}
+
+func (p *yamlParser) foldPlainContinuation(first, firstRawLine string, minContIndent int) string {
+	if first == "" || first[0] == '\'' || first[0] == '"' || first[0] == '*' {
+		return first
+	}
+	if stripComment(firstRawLine) != firstRawLine {
+		return first
+	}
+	var sb strings.Builder
+	sb.WriteString(first)
+	for p.pos < len(p.rawLines) {
+		j := p.pos
+		for j < len(p.rawLines) && strings.TrimSpace(p.rawLines[j]) == "" {
+			j++
+		}
+		if j >= len(p.rawLines) {
+			break
+		}
+		candRaw := p.rawLines[j]
+		candTrimmedRaw := strings.TrimSpace(candRaw)
+		if strings.HasPrefix(candTrimmedRaw, "#") {
+			break
+		}
+		candIndent := countLeadingSpaces(candRaw)
+		if candIndent < minContIndent {
+			break
+		}
+		candStrippedRaw := stripComment(candRaw)
+		candStripped := strings.TrimSpace(candStrippedRaw)
+		if candStripped == "" {
+			break
+		}
+		if candIndent == 0 && (candStripped == "---" || strings.HasPrefix(candStripped, "--- ") || candStripped == "..." || strings.HasPrefix(candStripped, "... ")) {
+			break
+		}
+		if candStripped == "-" || strings.HasPrefix(candStripped, "- ") {
+			break
+		}
+		if _, _, isKV := splitKeyValue(candStripped); isKV {
+			break
+		}
+		emptyLines := j - p.pos
+		if emptyLines > 0 {
+			sb.WriteString(strings.Repeat("\n", emptyLines))
+		} else {
+			sb.WriteByte(' ')
+		}
+		sb.WriteString(candStripped)
+		p.pos = j + 1
+		if candStrippedRaw != candRaw {
+			break
+		}
+	}
+	return sb.String()
 }
 
 func (p *yamlParser) collectFlowLines() (string, error) {
@@ -660,16 +772,28 @@ func (p *yamlParser) collectFlowLines() (string, error) {
 				continue
 			}
 			if ch == '\'' && !inDouble {
-				if inSingle && i+1 < len(line) && line[i+1] == '\'' {
-					i++
+				if inSingle {
+					if i+1 < len(line) && line[i+1] == '\'' {
+						i++
+						continue
+					}
+					inSingle = false
 					continue
 				}
-				inSingle = !inSingle
-				continue
+				if isQuoteTokenBoundary(line, i) {
+					inSingle = true
+					continue
+				}
 			}
 			if ch == '"' && !inSingle {
-				inDouble = !inDouble
-				continue
+				if inDouble {
+					inDouble = false
+					continue
+				}
+				if isQuoteTokenBoundary(line, i) {
+					inDouble = true
+					continue
+				}
 			}
 			if inSingle || inDouble {
 				continue
@@ -810,7 +934,8 @@ func (p *yamlParser) parseSequence(seqIndent int) ([]any, error) {
 		}
 
 		p.pos++
-		val, err := p.parseScalarOrAlias(rest)
+		folded := p.foldPlainContinuation(rest, line, seqIndent+1)
+		val, err := p.parseScalarOrAlias(folded)
 		if err != nil {
 			return nil, err
 		}
@@ -927,10 +1052,12 @@ func (p *yamlParser) parseMapping(mapIndent int) (*OrderedMap, error) {
 			continue
 		}
 
+		lineNum := p.pos + 1
 		p.pos++
-		val, err := p.parseScalarOrAlias(valTrimmed)
+		folded := p.foldPlainContinuation(valTrimmed, line, mapIndent+1)
+		val, err := p.parseScalarOrAlias(folded)
 		if err != nil {
-			return nil, fmt.Errorf("line %d: %w", p.pos, err)
+			return nil, fmt.Errorf("line %d: %w", lineNum, err)
 		}
 		recordEntry(val)
 	}
@@ -1034,6 +1161,18 @@ func countLeadingSpaces(s string) int {
 	return n
 }
 
+func isQuoteTokenBoundary(s string, idx int) bool {
+	if idx <= 0 {
+		return true
+	}
+	switch s[idx-1] {
+	case ' ', '\t', '\r', '\n', ':', ',', '[', '{', '-', '?':
+		return true
+	default:
+		return false
+	}
+}
+
 func stripComment(line string) string {
 	inSingle := false
 	inDouble := false
@@ -1049,16 +1188,28 @@ func stripComment(line string) string {
 			continue
 		}
 		if ch == '\'' && !inDouble {
-			if inSingle && i+1 < len(line) && line[i+1] == '\'' {
-				i++
+			if inSingle {
+				if i+1 < len(line) && line[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
 				continue
 			}
-			inSingle = !inSingle
-			continue
+			if isQuoteTokenBoundary(line, i) {
+				inSingle = true
+				continue
+			}
 		}
 		if ch == '"' && !inSingle {
-			inDouble = !inDouble
-			continue
+			if inDouble {
+				inDouble = false
+				continue
+			}
+			if isQuoteTokenBoundary(line, i) {
+				inDouble = true
+				continue
+			}
 		}
 		if !inSingle && !inDouble && ch == '#' {
 			if i == 0 || line[i-1] == ' ' || line[i-1] == '\t' {
@@ -1091,24 +1242,36 @@ func splitKeyValue(s string) (string, string, bool) {
 			continue
 		}
 		if ch == '\'' && !inDouble {
-			if inSingle && i+1 < len(s) && s[i+1] == '\'' {
-				i++
+			if inSingle {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+				if startsQuoted && depthBrace == 0 && depthBracket == 0 {
+					afterQuotedKey = true
+					startsQuoted = false
+				}
 				continue
 			}
-			inSingle = !inSingle
-			if !inSingle && startsQuoted && depthBrace == 0 && depthBracket == 0 {
-				afterQuotedKey = true
-				startsQuoted = false
+			if isQuoteTokenBoundary(s, i) {
+				inSingle = true
+				continue
 			}
-			continue
 		}
 		if ch == '"' && !inSingle {
-			inDouble = !inDouble
-			if !inDouble && startsQuoted && depthBrace == 0 && depthBracket == 0 {
-				afterQuotedKey = true
-				startsQuoted = false
+			if inDouble {
+				inDouble = false
+				if startsQuoted && depthBrace == 0 && depthBracket == 0 {
+					afterQuotedKey = true
+					startsQuoted = false
+				}
+				continue
 			}
-			continue
+			if isQuoteTokenBoundary(s, i) {
+				inDouble = true
+				continue
+			}
 		}
 		if inSingle || inDouble {
 			continue
@@ -1365,6 +1528,36 @@ func (p *yamlParser) parseFlowValue(s string) (any, error) {
 			if part == "" {
 				continue
 			}
+			elemAnchor, elemAfterAnc, elemHasAnc, ancErr := extractLeadingAnchor(part)
+			if ancErr != nil {
+				return nil, ancErr
+			}
+			cand := part
+			if elemHasAnc {
+				cand = elemAfterAnc
+			}
+			if !strings.HasPrefix(cand, "{") && !strings.HasPrefix(cand, "[") {
+				if rawK, rawV, ok := splitFlowKeyValue(cand); ok {
+					k, kErr := parseKey(rawK)
+					if kErr != nil {
+						return nil, kErr
+					}
+					var kvVal any
+					if strings.TrimSpace(rawV) != "" {
+						kvVal, err = p.parseFlowElement(strings.TrimSpace(rawV))
+						if err != nil {
+							return nil, err
+						}
+					}
+					pairMap := NewOrderedMap()
+					pairMap.Set(k, kvVal)
+					if elemHasAnc {
+						p.setAnchor(elemAnchor, pairMap)
+					}
+					out = append(out, pairMap)
+					continue
+				}
+			}
 			v, err := p.parseFlowElement(part)
 			if err != nil {
 				return nil, err
@@ -1419,16 +1612,28 @@ func splitTopLevelFlow(s string, sep byte) ([]string, error) {
 			continue
 		}
 		if ch == '\'' && !inDouble {
-			if inSingle && i+1 < len(s) && s[i+1] == '\'' {
-				i++
+			if inSingle {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
 				continue
 			}
-			inSingle = !inSingle
-			continue
+			if isQuoteTokenBoundary(s, i) {
+				inSingle = true
+				continue
+			}
 		}
 		if ch == '"' && !inSingle {
-			inDouble = !inDouble
-			continue
+			if inDouble {
+				inDouble = false
+				continue
+			}
+			if isQuoteTokenBoundary(s, i) {
+				inDouble = true
+				continue
+			}
 		}
 		if inSingle || inDouble {
 			continue
@@ -1478,24 +1683,36 @@ func splitFlowKeyValue(s string) (string, string, bool) {
 			continue
 		}
 		if ch == '\'' && !inDouble {
-			if inSingle && i+1 < len(s) && s[i+1] == '\'' {
-				i++
+			if inSingle {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+				if startsQuoted && depthBrace == 0 && depthBracket == 0 {
+					afterQuotedKey = true
+					startsQuoted = false
+				}
 				continue
 			}
-			inSingle = !inSingle
-			if !inSingle && startsQuoted && depthBrace == 0 && depthBracket == 0 {
-				afterQuotedKey = true
-				startsQuoted = false
+			if isQuoteTokenBoundary(s, i) {
+				inSingle = true
+				continue
 			}
-			continue
 		}
 		if ch == '"' && !inSingle {
-			inDouble = !inDouble
-			if !inDouble && startsQuoted && depthBrace == 0 && depthBracket == 0 {
-				afterQuotedKey = true
-				startsQuoted = false
+			if inDouble {
+				inDouble = false
+				if startsQuoted && depthBrace == 0 && depthBracket == 0 {
+					afterQuotedKey = true
+					startsQuoted = false
+				}
+				continue
 			}
-			continue
+			if isQuoteTokenBoundary(s, i) {
+				inDouble = true
+				continue
+			}
 		}
 		if inSingle || inDouble {
 			continue
@@ -1514,7 +1731,7 @@ func splitFlowKeyValue(s string) (string, string, bool) {
 			depthBracket--
 		case ':':
 			if depthBrace == 0 && depthBracket == 0 {
-				if afterQuotedKey || i+1 == len(s) || s[i+1] == ' ' || s[i+1] == '\t' || s[i+1] == ',' || s[i+1] == '}' {
+				if afterQuotedKey || i+1 == len(s) || s[i+1] == ' ' || s[i+1] == '\t' || s[i+1] == ',' || s[i+1] == '}' || s[i+1] == ']' {
 					return strings.TrimSpace(s[:i]), strings.TrimSpace(s[i+1:]), true
 				}
 			}
@@ -1625,8 +1842,10 @@ func scanLineForUnclosedQuote(line string, startIdx int, nodeStart, justClosedQu
 
 		switch ch {
 		case '{', '[':
-			flowDepth++
-			nodeStart = true
+			if flowDepth > 0 {
+				flowDepth++
+				nodeStart = true
+			}
 			justClosedQuote = false
 		case '}', ']':
 			if flowDepth > 0 {

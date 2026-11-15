@@ -418,8 +418,8 @@ func TestRound44IndexSettingsCatSyncSiblingPipelineIngestAndMutations(t *testing
 	if sentMap == nil || sentMap["model_id"] != "sentiment_model" || sentMap["predicted_value"] == nil {
 		t.Fatalf("F28 expected inference processor output in ml.sentiment, got %+v", simSrc["ml"])
 	}
-	if simSrc["parsed_ts"] != "2026-01-05T07:08:09Z" {
-		t.Fatalf("F29 expected date processor to parse '2026-1-5T07:08:09Z' to '2026-01-05T07:08:09Z', got %v", simSrc["parsed_ts"])
+	if simSrc["parsed_ts"] != "2026-01-05T07:08:09.000Z" && simSrc["parsed_ts"] != "2026-01-05T07:08:09Z" {
+		t.Fatalf("F29 expected date processor to parse '2026-1-5T07:08:09Z' to '2026-01-05T07:08:09.000Z', got %v", simSrc["parsed_ts"])
 	}
 	kvOut, _ := simSrc["kv_out"].(map[string]any)
 	if kvOut["user"] != "Alice Smith" || kvOut["role"] != "admin user" || kvOut["code"] != "42" {

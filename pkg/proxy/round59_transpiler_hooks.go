@@ -127,47 +127,7 @@ func formatUnsignedLongOrNumericTermsKeyRound59(
 // `date_detection`, `numeric_detection`, `dynamic_date_formats`, `subobjects`) for `GET _mapping`
 // and `GET /{index}` (`F11`).
 func buildMappingResponseMapRound59(idxSchema *schema.IndexSchema) map[string]any {
-	out := make(map[string]any)
-	if idxSchema == nil || idxSchema.RawMapping == nil {
-		return out
-	}
-	rm := idxSchema.RawMapping
-	if rm.Properties != nil {
-		out["properties"] = rm.Properties
-	} else {
-		out["properties"] = map[string]esast.FieldProperty{}
-	}
-	if len(rm.Runtime) > 0 {
-		out["runtime"] = rm.Runtime
-	}
-	if rm.Dynamic != nil {
-		out["dynamic"] = rm.Dynamic
-	}
-	if rm.Routing != nil && rm.Routing.Required {
-		out["_routing"] = map[string]any{"required": true}
-	}
-	if len(rm.Meta) > 0 {
-		out["_meta"] = rm.Meta
-	}
-	if len(rm.Source) > 0 {
-		out["_source"] = rm.Source
-	}
-	if len(rm.DynamicTemplates) > 0 {
-		out["dynamic_templates"] = rm.DynamicTemplates
-	}
-	if rm.DateDetection != nil {
-		out["date_detection"] = *rm.DateDetection
-	}
-	if rm.NumericDetection != nil {
-		out["numeric_detection"] = *rm.NumericDetection
-	}
-	if len(rm.DynamicDateFormats) > 0 {
-		out["dynamic_date_formats"] = rm.DynamicDateFormats
-	}
-	if rm.Subobjects != nil {
-		out["subobjects"] = *rm.Subobjects
-	}
-	return out
+	return schema.SerializeMappings(idxSchema)
 }
 
 // isIndexSourceDisabledRound59 reports whether the index mapping disables `_source` (`_source.enabled: false`) (`F11`).
@@ -175,8 +135,8 @@ func isIndexSourceDisabledRound59(idxSchema *schema.IndexSchema) bool {
 	return idxSchema != nil && idxSchema.SourceDisabled()
 }
 
-// filterDocumentSourceRound59 enforces index-level mapping `_source` (`enabled: false` and
-// `includes`/`excludes`) followed by per-request `_source` filtering (`F11`).
+// filterDocumentSourceRound59 enforces index-level mapping `_source` (`enabled: false`,
+// `mode: "synthetic"`, and `includes`/`excludes`) followed by per-request `_source` filtering (`F11`).
 // Returns `(filteredSource, includeSourceKey)`.
 func filterDocumentSourceRound59(
 	rawSrc json.RawMessage,
@@ -193,7 +153,17 @@ func filterDocumentSourceRound59(
 		return nil, false
 	}
 	cur := rawSrc
-	if idxSchema != nil {
+	if idxSchema != nil && idxSchema.SyntheticSource {
+		var rawDoc map[string]any
+		dec := json.NewDecoder(bytes.NewReader(cur))
+		dec.UseNumber()
+		if err := dec.Decode(&rawDoc); err == nil && rawDoc != nil {
+			reconstructed := schema.ReconstructSyntheticSource(idxSchema, rawDoc, nil)
+			if b, mErr := json.Marshal(reconstructed); mErr == nil {
+				cur = b
+			}
+		}
+	} else if idxSchema != nil {
 		inc, exc := idxSchema.SourceIncludesExcludes()
 		if len(inc) > 0 || len(exc) > 0 {
 			cur = filterSourceJSON(cur, &esast.SourceFilter{
@@ -331,6 +301,16 @@ func parseAndApplyIndexMappingSettingsRound59(settings map[string]any, idxSchema
 		ignoreMalVal    bool
 		hasMaxTerms     bool
 		maxTermsLim     int
+		hasMaxResWin    bool
+		maxResWinLim    int
+		hasMaxDVFields  bool
+		maxDVFieldsLim  int
+		hasMaxScrFields bool
+		maxScrFieldsLim int
+		hasMaxRegexLen  bool
+		maxRegexLenLim  int
+		hasSourceMode   bool
+		sourceModeVal   string
 	)
 
 	if raw, ok := extractIndexSettingValueRound59(settings, "index.mapping.total_fields.limit"); ok {
@@ -389,6 +369,43 @@ func parseAndApplyIndexMappingSettingsRound59(settings map[string]any, idxSchema
 		}
 		hasMaxTerms, maxTermsLim = true, v
 	}
+	if raw, ok := extractIndexSettingValueRound59(settings, "index.max_result_window"); ok {
+		v, err := parseSettingStrictIntRound59(raw, "index.max_result_window", 1)
+		if err != nil {
+			return err
+		}
+		hasMaxResWin, maxResWinLim = true, v
+	}
+	if raw, ok := extractIndexSettingValueRound59(settings, "index.max_docvalue_fields_search"); ok {
+		v, err := parseSettingStrictIntRound59(raw, "index.max_docvalue_fields_search", 0)
+		if err != nil {
+			return err
+		}
+		hasMaxDVFields, maxDVFieldsLim = true, v
+	}
+	if raw, ok := extractIndexSettingValueRound59(settings, "index.max_script_fields"); ok {
+		v, err := parseSettingStrictIntRound59(raw, "index.max_script_fields", 0)
+		if err != nil {
+			return err
+		}
+		hasMaxScrFields, maxScrFieldsLim = true, v
+	}
+	if raw, ok := extractIndexSettingValueRound59(settings, "index.max_regex_length"); ok {
+		v, err := parseSettingStrictIntRound59(raw, "index.max_regex_length", 1)
+		if err != nil {
+			return err
+		}
+		hasMaxRegexLen, maxRegexLenLim = true, v
+	}
+	if raw, ok := extractIndexSettingValueRound59(settings, "index.mapping.source.mode"); ok {
+		sm := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", raw)))
+		switch sm {
+		case "stored", "synthetic", "disabled":
+			hasSourceMode, sourceModeVal = true, sm
+		default:
+			return fmt.Errorf("illegal_argument_exception: unknown [index.mapping.source.mode] [%v]", raw)
+		}
+	}
 
 	if idxSchema == nil {
 		return nil
@@ -422,6 +439,22 @@ func parseAndApplyIndexMappingSettingsRound59(settings map[string]any, idxSchema
 	}
 	if hasMaxTerms {
 		cand.MaxTermsCount = maxTermsLim
+	}
+	if hasMaxResWin {
+		cand.MaxResultWindow = maxResWinLim
+	}
+	if hasMaxDVFields {
+		cand.MaxDocvalueFieldsSearch = maxDVFieldsLim
+	}
+	if hasMaxScrFields {
+		cand.MaxScriptFields = maxScrFieldsLim
+	}
+	if hasMaxRegexLen {
+		cand.MaxRegexLength = maxRegexLenLim
+	}
+	if hasSourceMode {
+		cand.SourceMode = sourceModeVal
+		cand.SyntheticSource = sourceModeVal == "synthetic"
 	}
 	if cand.RawMapping != nil {
 		if err := schema.ValidateMappingLimits(&cand, cand.RawMapping); err != nil {
@@ -773,8 +806,11 @@ func queryProducesCustomScoreRound59(q *esast.Query) bool {
 // `±Inf` score returns a `400 search_phase_execution_exception` error (`F18`).
 func validateNonNegativeFiniteSearchScoreRound59(hasCustomScoreQuery bool, score float64) (float64, error) {
 	if hasCustomScoreQuery {
-		if math.IsNaN(score) || math.IsInf(score, 0) || score < 0 {
-			return 0, fmt.Errorf("search_phase_execution_exception: script_score / function_score query produced an invalid score [%v]; scores must be non-negative finite numbers", score)
+		if score < 0 {
+			return 0, fmt.Errorf("all_shards_failed|illegal_argument_exception|script score function must not produce negative scores, but got: [%s]", formatJavaDoubleRound60(score))
+		}
+		if math.IsNaN(score) || math.IsInf(score, 0) {
+			return 0, fmt.Errorf("all_shards_failed|illegal_argument_exception|script score function must not produce NaN or Infinite scores, but got: [%s]", formatJavaDoubleRound60(score))
 		}
 		return score, nil
 	}
@@ -1417,11 +1453,25 @@ func (s *Server) validateAndEvolveExistingIndexRound59(
 		s.queryCache.InvalidateAll()
 		idx = cand
 	} else if idx.RawMapping == nil || idx.RawMapping.Dynamic == nil || idx.RawMapping.Dynamic == true || idx.RawMapping.Dynamic == "true" {
-		// F12: enforce index.mapping.* limits against dynamically introduced fields
+		// F10 & F12: enforce index.mapping.* limits and evolve dynamic schema on existing indices
 		inferred := schema.InferMappingFromSampleDocs(sampleDocs, idx.RawMapping)
 		mergedPreview := schema.MergeMappingSpecs(inferred, idx.RawMapping)
 		if err := schema.ValidateMappingLimits(idx, mergedPreview); err != nil {
 			return nil, err
+		}
+		cand := schema.CompileIndexSchema(s.dorisDB, indexName, mergedPreview)
+		cand.CopyIndexMappingSettingsFrom(idx)
+		alterStmts := schema.GenerateAlterTableDDL(idx, cand)
+		if len(cand.Fields) > len(idx.Fields) || len(alterStmts) > 0 {
+			for _, stmt := range alterStmts {
+				_ = s.backend.ExecDDL(ctx, stmt)
+			}
+			s.mu.Lock()
+			s.indices[indexName] = cand
+			s.mu.Unlock()
+			s.persistIndex(ctx, indexName, cand)
+			s.queryCache.InvalidateAll()
+			idx = cand
 		}
 	}
 	// F13: adopt first non-null value for unconfigured constant_keyword fields

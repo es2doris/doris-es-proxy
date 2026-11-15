@@ -413,8 +413,8 @@
                 max_len: 5
                 ua: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.1.2"
                 kv_str: "[env]=\"prod\\\"1\" (tier)=[backend]"
-  - match: { docs.0.doc._source.parsed_epoch: "2024-01-01T00:00:00Z" }
-  - match: { docs.0.doc._source.parsed_uuuu: "2024-01-01T00:00:00Z" }
+  - match: { docs.0.doc._source.parsed_epoch: "2024-01-01T00:00:00.000Z" }
+  - match: { docs.0.doc._source.parsed_uuuu: "2024-01-01T00:00:00.000Z" }
   - is_true: docs.0.doc._source.fp_murmur
   - match: { docs.0.doc._source.attachment.content: "hello" }
   - is_false: docs.0.doc._source.attachment.content_type
@@ -463,7 +463,7 @@
   - match: { docs.0.doc._source.path: "/var/log/syslog" }
   - is_false: docs.0.doc._source.opt
   - is_false: docs.0.doc._source.after_terminate
-  - match: { docs.0.doc._source.area_poly: /^POLYGON \(\(.+\)\)$/ }
+  - match: { docs.0.doc._source.area_poly: '/^POLYGON\ \(\(.+\)\)$/' }
 
 ---
 "Round 55 dissect suffix matching, community_id ICMP equivalence, csv quoted trim preservation, and uri_parts opaque URI":
@@ -875,15 +875,32 @@
 
 ---
 "Round 58 Ingest Pipeline Cycles, Terminate Scope, Nested Foreach, CSV, Dissect & Reroute":
-  # F27: Direct & indirect pipeline cycle detection at PUT time
+  # F27: Direct & indirect pipeline cycle detection at execution/simulate time (PUT succeeds per ES spec)
   - do:
-      catch: bad_request
       ingest.put_pipeline:
         id: r58_pipe_self
         body:
           processors:
             - pipeline:
                 name: "r58_pipe_self"
+  - match: { acknowledged: true }
+
+  - do:
+      ingest.simulate:
+        id: r58_pipe_self
+        body:
+          docs:
+            - _source: { x: 1 }
+  - match: { docs.0.error.type: illegal_state_exception }
+  - match: { docs.0.error.reason: "Cycle detected for pipeline: r58_pipe_self" }
+
+  - do:
+      catch: /Cycle detected for pipeline/
+      index:
+        index: r58_ingest_cycle_idx
+        id: "1"
+        pipeline: r58_pipe_self
+        body: { x: 1 }
 
   - do:
       ingest.put_pipeline:
@@ -895,13 +912,30 @@
   - match: { acknowledged: true }
 
   - do:
-      catch: bad_request
       ingest.put_pipeline:
         id: r58_pipe_cycle_a
         body:
           processors:
             - pipeline:
                 name: "r58_pipe_cycle_b"
+  - match: { acknowledged: true }
+
+  - do:
+      ingest.simulate:
+        id: r58_pipe_cycle_a
+        body:
+          docs:
+            - _source: { x: 1 }
+  - match: { docs.0.error.type: illegal_state_exception }
+  - match: { docs.0.error.reason: /Cycle\s+detected\s+for\s+pipeline.*/ }
+
+  - do:
+      catch: /Cycle detected for pipeline/
+      index:
+        index: r58_ingest_cycle_idx
+        id: "2"
+        pipeline: r58_pipe_cycle_a
+        body: { x: 1 }
 
   # F27: Sub-pipeline terminate halts outer pipeline while index.final_pipeline still runs
   - do:

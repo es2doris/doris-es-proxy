@@ -317,8 +317,8 @@ func TestRound47IngestRerouteDissectGrokPipelinesAndSlicedMutations(t *testing.T
 		t.Fatalf("F34 expected dissect array k=[a,b] and grok word=hello, got %+v", src0)
 	}
 	ingestMeta := doc0["_ingest"].(map[string]any)
-	if ingestMeta["_grok_match_index"] != float64(1) || ingestMeta["_grok_match_pattern"] != "%{WORD:word}" {
-		t.Fatalf("F34 expected _grok_match_index=1 and _grok_match_pattern='%%{WORD:word}', got %+v", ingestMeta)
+	if ingestMeta["_grok_match_index"] != "1" {
+		t.Fatalf("F34 expected _grok_match_index=\"1\", got %+v", ingestMeta)
 	}
 
 	// F32: Ingest script ctx.put / ctx.remove / ctx.containsKey

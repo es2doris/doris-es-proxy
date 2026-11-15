@@ -320,12 +320,12 @@ func TestRound43_F24_F25_F26_F27_F28_F29_F30_MutationPathsIngestAndReindex(t *te
 	}`)
 	doRound39JSON(t, srv, http.MethodPut, "/r43_mut/_doc/1?routing=r-init&refresh=true", `{"count": 10, "tag": "v1"}`)
 
-	// F24: ctx.op = "create" on existing doc returns 409 Conflict, and invalid ctx.op returns 400
+	// F24: ctx.op = "create" on _update returns 400 Bad Request per ES UpdateHelper, and invalid ctx.op returns 400
 	wConflict, _ := doRound39JSON(t, srv, http.MethodPost, "/r43_mut/_update/1", `{
 		"script": {"source": "ctx.op = 'create'; ctx._source.count = 20;"}
 	}`)
-	if wConflict.Code != http.StatusConflict {
-		t.Fatalf("F24 expected 409 Conflict when ctx.op='create' on existing document, got %d %s", wConflict.Code, wConflict.Body.String())
+	if wConflict.Code != http.StatusBadRequest {
+		t.Fatalf("F24 expected 400 Bad Request when ctx.op='create' in _update, got %d %s", wConflict.Code, wConflict.Body.String())
 	}
 	wBadOp, _ := doRound39JSON(t, srv, http.MethodPost, "/r43_mut/_update/1", `{
 		"script": {"source": "ctx.op = 'invalid_op';"}

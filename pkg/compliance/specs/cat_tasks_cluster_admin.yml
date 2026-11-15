@@ -70,15 +70,14 @@
   - is_true: nodes
 
   - do:
+      catch: missing
       tasks.get:
         task_id: "node-1:1"
-  - match: { completed: true }
-  - match: { task.node: "node-1" }
 
   - do:
+      catch: missing
       tasks.cancel:
         task_id: "node-1:1"
-  - match: { nodes: {} }
 
   - do:
       cluster.allocation_explain: {}

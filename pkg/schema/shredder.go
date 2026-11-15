@@ -379,7 +379,7 @@ func ShredDocumentWithNow(
 				var strs []string
 				if b.ESType == "completion" {
 					var compErr error
-					strs, compErr = extractCompletionStringsWithNull(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer, b.NullValue)
+					strs, compErr = validateCompletionValueWithContexts(parsedDoc, parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer, b.NullValue, b)
 					if compErr != nil {
 						if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
 							recordIgnored(b.ESFieldPath)
@@ -641,7 +641,23 @@ func ShredDocumentWithNow(
 				}
 				continue
 			}
-			vals := extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer, b.NullValue)
+			var vals []string
+			if b.ESType == "completion" {
+				var compErr error
+				vals, compErr = validateCompletionValueWithContexts(parsedDoc, parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer, b.NullValue, b)
+				if compErr != nil {
+					if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+						recordIgnored(b.ESFieldPath)
+						if isPrimaryFieldBinding(b) {
+							deferDeletePath(b.SourceJSONPath)
+						}
+						continue
+					}
+					return nil, compErr
+				}
+			} else {
+				vals = extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer, b.NullValue)
+			}
 			if b.IgnoreAbove > 0 && len(vals) > 0 {
 				filtered := vals[:0]
 				for _, v := range vals {
@@ -1057,6 +1073,12 @@ func ShredDocumentWithNow(
 	collectAllTextWithSchema(parsedDoc, s, nil, &allTextBuilder)
 	row["_all_text"] = allTextBuilder.String()
 	row["_doc"] = buildVariantDocPayload(trimmed, parsedDoc, prunedDynamic, s)
+	if s.SyntheticSource && !s.SourceDisabled() {
+		reconstructed := ReconstructSyntheticSource(s, parsedDoc, row)
+		if synthBytes, err := json.Marshal(reconstructed); err == nil {
+			row["_source"] = string(synthBytes)
+		}
+	}
 
 	return json.Marshal(row)
 }
@@ -4849,109 +4871,6 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 		}
 	}
 	return val
-}
-
-func extractCompletionStringsWithNull(node any, path []string, lowercase bool, nullVal any) ([]string, error) {
-	var out []string
-	if err := collectCompletionStringsAtPath(node, path, lowercase, nullVal, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func collectCompletionStringsAtPath(node any, path []string, lowercase bool, nullVal any, out *[]string) error {
-	if len(path) == 0 {
-		if node == nil {
-			if nullVal != nil {
-				s := fmt.Sprintf("%v", nullVal)
-				if lowercase {
-					s = strings.ToLower(s)
-				}
-				*out = append(*out, s)
-			}
-			return nil
-		}
-		switch v := node.(type) {
-		case string:
-			if lowercase {
-				v = strings.ToLower(v)
-			}
-			*out = append(*out, v)
-		case []any:
-			for _, item := range v {
-				if err := collectCompletionStringsAtPath(item, nil, lowercase, nullVal, out); err != nil {
-					return err
-				}
-			}
-		case map[string]any:
-			inp, hasInput := v["input"]
-			if !hasInput || inp == nil {
-				return fmt.Errorf("mapper_parsing_exception: [completion] field object missing required [input]")
-			}
-			for k := range v {
-				switch k {
-				case "input", "weight", "contexts":
-				default:
-					return fmt.Errorf("mapper_parsing_exception: [completion] unknown field [%s]", k)
-				}
-			}
-			switch iv := inp.(type) {
-			case string:
-				if lowercase {
-					iv = strings.ToLower(iv)
-				}
-				*out = append(*out, iv)
-			case []any:
-				for _, elem := range iv {
-					if elem == nil {
-						continue
-					}
-					if _, isMap := elem.(map[string]any); isMap {
-						return fmt.Errorf("mapper_parsing_exception: [completion] input cannot contain objects")
-					}
-					s := fmt.Sprintf("%v", elem)
-					if lowercase {
-						s = strings.ToLower(s)
-					}
-					*out = append(*out, s)
-				}
-			default:
-				return fmt.Errorf("mapper_parsing_exception: [completion] invalid input value")
-			}
-		default:
-			s := fmt.Sprintf("%v", v)
-			if lowercase {
-				s = strings.ToLower(s)
-			}
-			*out = append(*out, s)
-		}
-		return nil
-	}
-	if node == nil {
-		return nil
-	}
-	switch curr := node.(type) {
-	case map[string]any:
-		if next, ok := curr[path[0]]; ok {
-			if err := collectCompletionStringsAtPath(next, path[1:], lowercase, nullVal, out); err != nil {
-				return err
-			}
-		}
-		for i := 2; i <= len(path); i++ {
-			if next, ok := curr[strings.Join(path[:i], ".")]; ok {
-				if err := collectCompletionStringsAtPath(next, path[i:], lowercase, nullVal, out); err != nil {
-					return err
-				}
-			}
-		}
-	case []any:
-		for _, elem := range curr {
-			if err := collectCompletionStringsAtPath(elem, path, lowercase, nullVal, out); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
 
 // CanonicalIPToUpperHex16 converts an IPv4 or IPv6 address string into its canonical 32-char

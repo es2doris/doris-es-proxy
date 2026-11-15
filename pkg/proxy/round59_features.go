@@ -778,7 +778,7 @@ func (s *Server) computeLiveIndexDocCountAndStoreBytesRound59(ctx context.Contex
 		_ = s.coalescer.FlushTable(ctx, idxSchema.DorisTable)
 	}
 	opts := s.transpileOpts
-	opts.MaxResultWindow = 0
+	opts.MaxResultWindow = 1_000_000
 	tr := transpiler.NewTranspiler(idxSchema, opts)
 	batchSize := 1000
 	var searchAfter []any
@@ -2476,7 +2476,7 @@ func parseIngestDateValueWithLocaleRound59(rawVal string, formats []any, tzName,
 		return time.Time{}, "", err
 	}
 	normInput := normalizeLocalizedDateInputToEnglishRound59(rawVal, lang)
-	t, pErr := parseIngestDateValue(normInput, formats, tzName)
+	t, pErr := parseIngestDateValueWithRawLocaleRound60(normInput, formats, tzName, rawLocale)
 	return t, lang, pErr
 }
 
