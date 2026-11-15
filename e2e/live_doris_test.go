@@ -727,8 +727,8 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	//   - `dissect` `/N` append ordering & reference-only keys (`%{*r1}=%{&r1}`) + array `convert`/`gsub`
 	collapsePage2Resp, err := http.Post(ts.URL+"/live_auto_index/_search", "application/json", strings.NewReader(`{
 		"size": 1,
-		"sort": [{"latency_ms": "desc"}],
-		"search_after": [999999],
+		"sort": [{"service": "asc"}, {"latency_ms": "desc"}],
+		"search_after": ["billing-api", 0],
 		"collapse": {
 			"field": "service",
 			"inner_hits": {
