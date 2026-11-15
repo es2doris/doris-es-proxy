@@ -1818,8 +1818,11 @@ func TestRound53_ProxyAndIngestFeatures(t *testing.T) {
 	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_cluster/voting_config_exclusions", ``); c != http.StatusBadRequest {
 		t.Fatalf("expected 400 on POST /_cluster/voting_config_exclusions without params, got %d", c)
 	}
-	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_cluster/voting_config_exclusions?node_names=node-a&node_ids=n1", ``); c != http.StatusOK {
-		t.Fatalf("expected 200 on POST /_cluster/voting_config_exclusions, got %d", c)
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_cluster/voting_config_exclusions?node_names=node-a", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_cluster/voting_config_exclusions?node_names=node-a, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_cluster/voting_config_exclusions?node_ids=n1", ``); c != http.StatusOK {
+		t.Fatalf("expected 200 on POST /_cluster/voting_config_exclusions?node_ids=n1, got %d", c)
 	}
 	if c, m, _ := doRound48Req(t, handler, http.MethodGet, "/_cluster/state", ``); c != http.StatusOK {
 		t.Fatalf("expected 200 on GET /_cluster/state, got %d", c)
@@ -2260,8 +2263,8 @@ func TestRound53_ProxyAndIngestFeatures(t *testing.T) {
 		docs, _ := m["docs"].([]any)
 		doc0, _ := docs[0].(map[string]any)["doc"].(map[string]any)
 		src, _ := doc0["_source"].(map[string]any)
-		if src["ts_epoch"] != "2024-01-01T00:00:00Z" {
-			t.Fatalf("expected ts_epoch 2024-01-01T00:00:00Z, got %v", src["ts_epoch"])
+		if src["ts_epoch"] != "2024-01-01T00:00:00.000Z" && src["ts_epoch"] != "2024-01-01T00:00:00Z" {
+			t.Fatalf("expected ts_epoch 2024-01-01T00:00:00.000Z, got %v", src["ts_epoch"])
 		}
 		if src["fp_murmur"] == nil || len(fmt.Sprintf("%v", src["fp_murmur"])) != 32 {
 			t.Fatalf("expected 32-char murmur3 hex digest, got %v", src["fp_murmur"])

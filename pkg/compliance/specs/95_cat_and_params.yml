@@ -38,23 +38,27 @@ setup:
   - do:
       cat.indices:
         index: comp_cat_idx
+        format: "json"
   - length: { $body: 1 }
   - match: { 0.index: "comp_cat_idx" }
   - match: { 0.health: "green" }
   - do:
       cat.aliases:
         name: comp_cat_alias
+        format: "json"
   - length: { $body: 1 }
   - match: { 0.alias: "comp_cat_alias" }
   - match: { 0.index: "comp_cat_idx" }
   - do:
       cat.count:
         index: comp_cat_idx
+        format: "json"
   - length: { $body: 1 }
   - match: { 0.count: "2" }
   - do:
       cat.shards:
         index: comp_cat_idx
+        format: "json"
   - length: { $body: 1 }
   - match: { 0.index: "comp_cat_idx" }
   - match: { 0.state: "STARTED" }

@@ -135,52 +135,7 @@ func formatJavaFloatingPainless(f float64, bits int) string {
 // formatValueForStringPainless formats any Painless value for String.valueOf,
 // Objects.toString, .toString(), and string '+' concatenation.
 func formatValueForStringPainless(v any) string {
-	if v == nil || v == painlessEmptyOptional {
-		return "null"
-	}
-	switch tv := v.(type) {
-	case string:
-		return tv
-	case float64:
-		if math.IsNaN(tv) {
-			return "NaN"
-		}
-		if math.IsInf(tv, 1) {
-			return "Infinity"
-		}
-		if math.IsInf(tv, -1) {
-			return "-Infinity"
-		}
-		return fmt.Sprintf("%v", tv)
-	case float32:
-		fv := float64(tv)
-		if math.IsNaN(fv) {
-			return "NaN"
-		}
-		if math.IsInf(fv, 1) {
-			return "Infinity"
-		}
-		if math.IsInf(fv, -1) {
-			return "-Infinity"
-		}
-		return fmt.Sprintf("%v", tv)
-	case time.Duration:
-		return formatDurationISO8601Painless(tv)
-	case map[string]any:
-		if _, isStats := isSummaryStatisticsMapPainless(tv); isStats {
-			return formatSummaryStatisticsToStringPainless(tv)
-		}
-		if excType, hasExc := tv["__exc_type"].(string); hasExc && excType != "" {
-			msg, _ := tv["message"].(string)
-			if msg != "" {
-				return excType + ": " + msg
-			}
-			return excType
-		}
-		return fmt.Sprintf("%v", tv)
-	default:
-		return fmt.Sprintf("%v", v)
-	}
+	return FormatValueSafe(v)
 }
 
 // compareJavaDoubleTotalOrderPainless implements Java Double.compare / Float.compare
@@ -1381,7 +1336,10 @@ func markUnmodSlicePainless(budget *evalBudget, s []any) []any {
 			if budget.unmodSlices == nil {
 				budget.unmodSlices = make(map[uintptr]bool)
 			}
-			budget.unmodSlices[ptr] = true
+			if !budget.unmodSlices[ptr] {
+				budget.unmodSlices[ptr] = true
+				budget.pinnedRefs = append(budget.pinnedRefs, s)
+			}
 		}
 	}
 	return s
@@ -1397,7 +1355,10 @@ func markUnmodMapPainless(budget *evalBudget, m map[string]any) map[string]any {
 			if budget.unmodMaps == nil {
 				budget.unmodMaps = make(map[uintptr]bool)
 			}
-			budget.unmodMaps[ptr] = true
+			if !budget.unmodMaps[ptr] {
+				budget.unmodMaps[ptr] = true
+				budget.pinnedRefs = append(budget.pinnedRefs, m)
+			}
 		}
 	}
 	return m

@@ -42,6 +42,9 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
+          cache-dependency-path: |
+            go.sum
+            e2e/sdkconformance/go.sum
 
       - name: Build doris-es-proxy
         run: make build
@@ -65,6 +68,38 @@ jobs:
       - name: Run Live Apache Doris E2E Test Suite
         run: make test-e2e
 
+      - name: Run Official Go SDK v8 Conformance against Live Apache Doris
+        run: |
+          ./bin/doris-es-proxy \
+            --listen 127.0.0.1:9200 \
+            --doris-dsn "root:@tcp(127.0.0.1:9030)/?interpolateParams=true&multiStatements=true&timeout=5s&readTimeout=30s&writeTimeout=30s" \
+            --doris-http "http://127.0.0.1:8030" \
+            --doris-db "es_sdk_e2e" \
+            --log-sql >/tmp/doris-es-proxy.log 2>&1 &
+          PROXY_PID=$!
+          trap 'kill "$PROXY_PID" 2>/dev/null || true; wait "$PROXY_PID" 2>/dev/null || true' EXIT
+          READY=0
+          for _ in $(seq 1 30); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:9200/healthz || true)
+            if [ "$STATUS" = "200" ]; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "doris-es-proxy failed to become ready on /healthz:"
+            cat /tmp/doris-es-proxy.log || true
+            exit 1
+          fi
+          bash scripts/fetch-conformance-specs.sh
+          DORIS_ES_PROXY_URL=http://127.0.0.1:9200 go -C e2e/sdkconformance test -race -count=1 -v ./...
+
       - name: Dump Doris logs on failure
         if: failure()
-        run: docker logs doris-fe-be --tail 200
+        run: |
+          docker logs doris-fe-be --tail 200
+          if [ -f /tmp/doris-es-proxy.log ]; then
+            echo "=== doris-es-proxy.log ==="
+            tail -n 200 /tmp/doris-es-proxy.log
+          fi

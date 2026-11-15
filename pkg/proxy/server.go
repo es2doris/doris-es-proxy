@@ -53,6 +53,8 @@ type HitRow struct {
 	ID        string
 	Routing   string
 	Version   int64
+	SeqNo     int64
+	HasSeqNo  bool
 	Source    json.RawMessage
 	RawSource json.RawMessage
 	Score     float64
@@ -149,14 +151,19 @@ func (m AliasMetadata) toMap() map[string]any {
 	if m.IsHidden != nil {
 		out["is_hidden"] = *m.IsHidden
 	}
-	if m.Routing != "" {
-		out["routing"] = m.Routing
+	idxRt := m.IndexRouting
+	if idxRt == "" && m.Routing != "" {
+		idxRt = m.Routing
 	}
-	if m.IndexRouting != "" {
-		out["index_routing"] = m.IndexRouting
+	srchRt := m.SearchRouting
+	if srchRt == "" && m.Routing != "" {
+		srchRt = m.Routing
 	}
-	if m.SearchRouting != "" {
-		out["search_routing"] = m.SearchRouting
+	if idxRt != "" {
+		out["index_routing"] = idxRt
+	}
+	if srchRt != "" {
+		out["search_routing"] = srchRt
 	}
 	return out
 }
@@ -260,6 +267,14 @@ type Server struct {
 	scrollContexts            map[string]*scrollContextEntry
 	invalidatedScrollSessions map[string]bool
 	scrollSeq                 int64
+	taskReg                   *taskRegistry
+	targetESVersion           string
+	indexNextSeqNo            map[string]int64
+	docSeqNos                 map[string]map[string]int64
+	docDeleted                map[string]map[string]bool
+	docExtTombstones          map[string]map[string]int64
+	unrefreshedDocs           map[string]map[int]map[string]unrefreshedDocState
+	indexStats                map[string]*indexLiveStats
 }
 
 func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerOptions) *Server {
@@ -349,6 +364,14 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		pits:                      make(map[string]*pitContextEntry),
 		scrollContexts:            make(map[string]*scrollContextEntry),
 		invalidatedScrollSessions: make(map[string]bool),
+		taskReg:                   newTaskRegistry(),
+		targetESVersion:           "7.10.2",
+		indexNextSeqNo:            make(map[string]int64),
+		docSeqNos:                 make(map[string]map[string]int64),
+		docDeleted:                make(map[string]map[string]bool),
+		docExtTombstones:          make(map[string]map[string]int64),
+		unrefreshedDocs:           make(map[string]map[int]map[string]unrefreshedDocState),
+		indexStats:                make(map[string]*indexLiveStats),
 	}
 	s.coalescer = newStreamLoadCoalescer(func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
 		err := s.backend.StreamLoad(ctx, table, ndjson, syncRefresh)
@@ -517,15 +540,29 @@ func (s *Server) resolveEffectiveReadRouting(rawIndex, targetIndex, reqRouting s
 
 func (s *Server) docMatchesRequestRouting(indexName, docID, reqRouting string) bool {
 	reqRouting = strings.TrimSpace(reqRouting)
+	numShards, _, routingShards := s.getIndexShardAndReplicaCounts(indexName)
+	if numShards > 1 {
+		docShard := s.shardForDocRoutingRound60(indexName, docID, s.getDocRouting(indexName, docID))
+		if reqRouting == "" {
+			return esMurmur3Shard(docID, numShards, routingShards) == docShard
+		}
+		for _, part := range strings.Split(reqRouting, ",") {
+			p := strings.TrimSpace(part)
+			if p != "" && esMurmur3Shard(p, numShards, routingShards) == docShard {
+				return true
+			}
+		}
+		return false
+	}
 	if reqRouting == "" {
 		return true
 	}
-	effDocRouting := s.getDocRouting(indexName, docID)
-	if effDocRouting == "" {
-		effDocRouting = docID
+	storedRouting := s.getDocRouting(indexName, docID)
+	if storedRouting == "" {
+		return true
 	}
 	for _, part := range strings.Split(reqRouting, ",") {
-		if strings.TrimSpace(part) == effDocRouting {
+		if strings.TrimSpace(part) == storedRouting {
 			return true
 		}
 	}
@@ -604,6 +641,12 @@ func (s *Server) syncCatalogFromBackend(ctx context.Context) error {
 				delete(s.indexFinalPipelines, e.EntityKey)
 				delete(s.indexCustomSettings, e.EntityKey)
 				delete(s.closedIndices, e.EntityKey)
+				delete(s.indexNextSeqNo, e.EntityKey)
+				delete(s.docSeqNos, e.EntityKey)
+				delete(s.docDeleted, e.EntityKey)
+				delete(s.docExtTombstones, e.EntityKey)
+				delete(s.unrefreshedDocs, e.EntityKey)
+				delete(s.indexStats, e.EntityKey)
 				continue
 			}
 			var spec esast.MappingSpec
@@ -744,6 +787,20 @@ func (s *Server) syncCatalogFromBackend(ctx context.Context) error {
 					s.scripts = make(map[string]map[string]any)
 				}
 				s.scripts[e.EntityKey] = sc
+			}
+		case "index_seq_state":
+			if isDeleted {
+				delete(s.indexNextSeqNo, e.EntityKey)
+				continue
+			}
+			var st persistedIndexSeqState
+			if err := json.Unmarshal([]byte(e.PayloadJSON), &st); err == nil {
+				if s.indexNextSeqNo == nil {
+					s.indexNextSeqNo = make(map[string]int64)
+				}
+				if st.NextSeqNo > s.indexNextSeqNo[e.EntityKey] {
+					s.indexNextSeqNo[e.EntityKey] = st.NextSeqNo
+				}
 			}
 		}
 	}
@@ -1170,11 +1227,15 @@ func (s *Server) Handler() http.Handler {
 			case "_count":
 				s.handleCount(w, r)
 			case "_stats":
-				s.handleIndexStats(w, r)
+				s.handleIndexStatsRound60(w, r)
 			case "_search_shards":
 				s.handleSearchShards(w, r)
 			case "_reindex":
 				s.handleReindex(w, r)
+			case "_update_by_query":
+				s.handleUpdateByQuery(w, r)
+			case "_delete_by_query":
+				s.handleDeleteByQuery(w, r)
 			case "_aliases":
 				if r.Method == http.MethodPost {
 					s.handleUpdateAliases(w, r)
@@ -1190,7 +1251,7 @@ func (s *Server) Handler() http.Handler {
 			case "_cat":
 				s.handleCatRoot(w, r)
 			case "_nodes":
-				s.handleNodes(w, r)
+				s.handleNodesRound60(w, r, segs)
 			case "_mapping", "_mappings":
 				if r.Method != http.MethodGet {
 					writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
@@ -1257,14 +1318,17 @@ func (s *Server) Handler() http.Handler {
 
 		case 2:
 			switch {
+			case segs[0] == "_stats":
+				r.SetPathValue("metric", segs[1])
+				s.handleIndexStatsRound60(w, r)
 			case segs[0] == "_cluster" && segs[1] == "health":
 				s.handleClusterHealth(w, r)
 			case segs[0] == "_cluster" && segs[1] == "settings":
 				s.handleClusterSettings(w, r)
 			case segs[0] == "_cluster" && segs[1] == "state":
-				s.handleClusterState(w, r)
+				s.handleClusterStateRound60(w, r, segs)
 			case segs[0] == "_cluster" && segs[1] == "stats":
-				s.handleClusterStats(w, r)
+				s.handleClusterStatsRound60(w, r, segs)
 			case segs[0] == "_cluster" && segs[1] == "allocation":
 				s.handleClusterAllocationExplain(w, r)
 			case segs[0] == "_cluster" && segs[1] == "pending_tasks":
@@ -1276,7 +1340,7 @@ func (s *Server) Handler() http.Handler {
 			case segs[0] == "_nodes" && segs[1] == "reload_secure_settings":
 				s.handleReloadSecureSettings(w, r)
 			case segs[0] == "_nodes":
-				s.handleNodes(w, r)
+				s.handleNodesRound60(w, r, segs)
 			case segs[0] == "_snapshot":
 				r.SetPathValue("repository", segs[1])
 				s.handleSnapshotRepo(w, r)
@@ -1444,7 +1508,7 @@ func (s *Server) Handler() http.Handler {
 				case "_count":
 					s.handleCount(w, r)
 				case "_stats":
-					s.handleIndexStats(w, r)
+					s.handleIndexStatsRound60(w, r)
 				case "_search_shards":
 					s.handleSearchShards(w, r)
 				case "_bulk":
@@ -1499,7 +1563,11 @@ func (s *Server) Handler() http.Handler {
 				case "_clone", "_shrink", "_split", "_downsample":
 					writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: target index is missing;")
 				default:
-					writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+					if !isReservedActionEndpointSegment(segs[1]) && r.Method == http.MethodPost {
+						s.handlePutDoc(w, withLegacyDocType(r, segs[1]))
+					} else {
+						writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+					}
 				}
 			}
 
@@ -1527,7 +1595,11 @@ func (s *Server) Handler() http.Handler {
 				return
 			}
 			if segs[0] == "_cluster" && segs[1] == "state" {
-				s.handleClusterState(w, r)
+				s.handleClusterStateRound60(w, r, segs)
+				return
+			}
+			if segs[0] == "_cluster" && segs[1] == "stats" {
+				s.handleClusterStatsRound60(w, r, segs)
 				return
 			}
 			if segs[0] == "_cluster" && segs[1] == "allocation" && segs[2] == "explain" {
@@ -1539,7 +1611,7 @@ func (s *Server) Handler() http.Handler {
 				return
 			}
 			if segs[0] == "_nodes" {
-				s.handleNodes(w, r)
+				s.handleNodesRound60(w, r, segs)
 				return
 			}
 			if segs[0] == "_snapshot" {
@@ -1760,6 +1832,15 @@ func (s *Server) Handler() http.Handler {
 				return
 			}
 			r.SetPathValue("index", segs[0])
+			if segs[1] == "_ingest" && segs[2] == "_simulate" {
+				s.handleSimulateIndexIngestRound57(w, r)
+				return
+			}
+			if segs[1] == "_stats" {
+				r.SetPathValue("metric", segs[2])
+				s.handleIndexStatsRound60(w, r)
+				return
+			}
 			if segs[1] == "_alias" || segs[1] == "_aliases" {
 				r.SetPathValue("name", segs[2])
 				s.handleIndexAliasByName(w, r)
@@ -1809,6 +1890,7 @@ func (s *Server) Handler() http.Handler {
 				return
 			}
 			if segs[1] == "_mapping" || segs[1] == "_mappings" {
+				r.SetPathValue("type", segs[2])
 				switch r.Method {
 				case http.MethodGet:
 					s.handleGetMapping(w, r)
@@ -1819,12 +1901,20 @@ func (s *Server) Handler() http.Handler {
 				}
 				return
 			}
-			if segs[1] == "_doc" && segs[2] == "_search" {
-				s.handleSearch(w, r)
-				return
-			}
-			if segs[1] == "_doc" && segs[2] == "_count" {
-				s.handleCount(w, r)
+			if (segs[1] == "_doc" || !isReservedActionEndpointSegment(segs[1])) && (segs[2] == "_search" || segs[2] == "_msearch" || segs[2] == "_mget" || segs[2] == "_bulk" || segs[2] == "_count") {
+				r2 := withLegacyDocType(r, segs[1])
+				switch segs[2] {
+				case "_search":
+					s.handleSearch(w, r2)
+				case "_msearch":
+					s.handleMSearch(w, r2)
+				case "_mget":
+					s.handleMGet(w, r2)
+				case "_bulk":
+					s.handleBulk(w, r2)
+				case "_count":
+					s.handleCount(w, r2)
+				}
 				return
 			}
 			if segs[1] == "_block" {
@@ -1878,6 +1968,22 @@ func (s *Server) Handler() http.Handler {
 					writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
 				}
 			default:
+				if !isReservedActionEndpointSegment(segs[1]) {
+					r2 := withLegacyDocType(r, segs[1])
+					switch r.Method {
+					case http.MethodPut, http.MethodPost:
+						s.handlePutDoc(w, r2)
+					case http.MethodGet:
+						s.handleGetDoc(w, r2)
+					case http.MethodHead:
+						s.handleHeadDoc(w, r2)
+					case http.MethodDelete:
+						s.handleDeleteDoc(w, r2)
+					default:
+						writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
+					}
+					return
+				}
 				writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
 			}
 
@@ -1901,11 +2007,15 @@ func (s *Server) Handler() http.Handler {
 				return
 			}
 			if segs[0] == "_cluster" && segs[1] == "state" {
-				s.handleClusterState(w, r)
+				s.handleClusterStateRound60(w, r, segs)
+				return
+			}
+			if segs[0] == "_cluster" && segs[1] == "stats" {
+				s.handleClusterStatsRound60(w, r, segs)
 				return
 			}
 			if segs[0] == "_nodes" {
-				s.handleNodes(w, r)
+				s.handleNodesRound60(w, r, segs)
 				return
 			}
 			if (segs[1] == "_mapping" || segs[1] == "_mappings") && segs[2] == "field" {
@@ -1925,21 +2035,53 @@ func (s *Server) Handler() http.Handler {
 				s.handleEnrichAPI(w, r)
 				return
 			}
-			if (segs[1] == "_doc" || segs[1] == "_explain") && segs[3] == "_explain" {
+			if segs[1] == "_explain" && segs[3] == "_explain" {
 				r.SetPathValue("index", segs[0])
 				r.SetPathValue("id", segs[2])
 				s.handleExplainDoc(w, r)
 				return
 			}
-			if segs[1] == "_doc" && (segs[3] == "_termvectors" || segs[3] == "_termvector") {
-				r.SetPathValue("index", segs[0])
-				r.SetPathValue("id", segs[2])
-				s.handleTermVectors(w, r)
-				return
+			if segs[1] == "_doc" || !isReservedActionEndpointSegment(segs[1]) {
+				r2 := withLegacyDocType(r, segs[1])
+				r2.SetPathValue("index", segs[0])
+				r2.SetPathValue("id", segs[2])
+				switch segs[3] {
+				case "_update":
+					if r.Method == http.MethodPost {
+						s.handleUpdateDoc(w, r2)
+					} else {
+						writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
+					}
+					return
+				case "_source":
+					if r.Method == http.MethodGet || r.Method == http.MethodHead {
+						s.handleGetSource(w, r2)
+					} else {
+						writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
+					}
+					return
+				case "_create":
+					if r.Method == http.MethodPut || r.Method == http.MethodPost {
+						s.handlePutDoc(w, r2)
+					} else {
+						writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
+					}
+					return
+				case "_explain":
+					s.handleExplainDoc(w, r2)
+					return
+				case "_termvectors", "_termvector":
+					s.handleTermVectors(w, r2)
+					return
+				}
 			}
 			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
 
 		case 5:
+			if segs[0] == "_nodes" {
+				s.handleNodesRound60(w, r, segs)
+				return
+			}
 			if segs[0] == "_watcher" && segs[1] == "watch" && segs[3] == "_ack" {
 				r.SetPathValue("id", segs[2])
 				r.SetPathValue("action", "_ack")
@@ -1967,23 +2109,31 @@ func (s *Server) Handler() http.Handler {
 	}))
 }
 
-func (s *Server) handleRootHandshake(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleRootHandshake(w http.ResponseWriter, r *http.Request) {
+	verNum := s.effectiveClusterESVersionNumber(r)
+	minWire := "6.8.0"
+	minIdx := "6.0.0-beta1"
+	if s.isES8Mode(r) {
+		verNum = "8.15.5"
+		minWire = "7.17.0"
+		minIdx = "7.0.0"
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name":         "doris-es-proxy",
 		"cluster_name": "apache-doris-search-cluster",
 		"cluster_uuid": "doris-es-0000-0000-0000-000000000001",
 		"version": map[string]any{
-			"number":                              "7.10.2",
+			"number":                              verNum,
 			"build_flavor":                        "default",
 			"build_type":                          "tar",
 			"build_hash":                          "doris4x",
 			"build_date":                          "2021-01-13T00:42:12.435326Z",
 			"build_snapshot":                      false,
 			"lucene_version":                      "9.10.0",
-			"minimum_wire_compatibility_version":  "6.8.0",
-			"minimum_index_compatibility_version": "6.0.0-beta1",
+			"minimum_wire_compatibility_version":  minWire,
+			"minimum_index_compatibility_version": minIdx,
 		},
-		"tagline": "You Know, for Search (Backed by Apache Doris)",
+		"tagline": "You Know, for Search",
 	})
 }
 
@@ -2006,19 +2156,21 @@ func (s *Server) handleClusterHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, httpCode, map[string]any{
-		"cluster_name":                    "apache-doris-search-cluster",
-		"status":                          status,
-		"timed_out":                       false,
-		"number_of_nodes":                 1,
-		"number_of_data_nodes":            1,
-		"active_primary_shards":           numIndices,
-		"active_shards":                   numIndices,
-		"relocating_shards":               0,
-		"initializing_shards":             0,
-		"unassigned_shards":               0,
-		"delayed_unassigned_shards":       0,
-		"number_of_pending_tasks":         0,
-		"active_shards_percent_as_number": 100.0,
+		"cluster_name":                     "apache-doris-search-cluster",
+		"status":                           status,
+		"timed_out":                        false,
+		"number_of_nodes":                  1,
+		"number_of_data_nodes":             1,
+		"active_primary_shards":            numIndices,
+		"active_shards":                    numIndices,
+		"relocating_shards":                0,
+		"initializing_shards":              0,
+		"unassigned_shards":                0,
+		"delayed_unassigned_shards":        0,
+		"number_of_pending_tasks":          0,
+		"number_of_in_flight_fetch":        0,
+		"task_max_waiting_in_queue_millis": 0,
+		"active_shards_percent_as_number":  100.0,
 	})
 }
 
@@ -2419,18 +2571,22 @@ func (s *Server) handleIndexSettings(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 				idxSchema := s.indices[indexName]
+				var updatedSchema *schema.IndexSchema
 				if idxSchema != nil {
 					var resetSpec *esast.MappingSpec
 					if idxSchema.RawMapping != nil {
 						resetSpec = idxSchema.RawMapping
 					}
 					freshDefaults := schema.CompileIndexSchema(s.dorisDB, indexName, resetSpec)
-					idxSchema.CopyIndexMappingSettingsFrom(freshDefaults)
-					_ = parseAndApplyIndexMappingSettingsRound59(s.indexCustomSettings[indexName], idxSchema)
+					cloned := *idxSchema
+					cloned.CopyIndexMappingSettingsFrom(freshDefaults)
+					_ = parseAndApplyIndexMappingSettingsRound59(s.indexCustomSettings[indexName], &cloned)
+					updatedSchema = &cloned
+					s.indices[indexName] = updatedSchema
 				}
 				s.mu.Unlock()
-				if idxSchema != nil {
-					s.persistIndex(r.Context(), indexName, idxSchema)
+				if updatedSchema != nil {
+					s.persistIndex(r.Context(), indexName, updatedSchema)
 				}
 			}
 		}
@@ -2504,43 +2660,6 @@ func (s *Server) handleIndexSettings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
-	if r != nil {
-		p := strings.Trim(r.URL.Path, "/")
-		if strings.HasSuffix(p, "/hot_threads") {
-			s.handleNodesHotThreads(w, r)
-			return
-		}
-		if strings.HasSuffix(p, "/usage") || strings.Contains(p, "/usage/") {
-			s.handleNodesUsage(w, r)
-			return
-		}
-		if r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
-			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
-			return
-		}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
-		"cluster_name": "apache-doris-search-cluster",
-		"nodes": map[string]any{
-			"doris-fe-1": map[string]any{
-				"name":              "doris-fe-1",
-				"transport_address": "127.0.0.1:9300",
-				"host":              "127.0.0.1",
-				"ip":                "127.0.0.1",
-				"version":           "7.10.2",
-				"roles":             []string{"master", "data", "ingest"},
-				"http": map[string]any{
-					"bound_address":               []string{"0.0.0.0:9200"},
-					"publish_address":             "127.0.0.1:9200",
-					"max_content_length_in_bytes": DefaultMaxRequestBodyBytes,
-				},
-			},
-		},
-	})
-}
-
 func (s *Server) handleSecurityAuthenticate(w http.ResponseWriter, r *http.Request) {
 	s.authMu.RLock()
 	basicUser := s.basicAuthUser
@@ -2584,90 +2703,6 @@ func readRequestBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 		return nil, false
 	}
 	return bodyBytes, true
-}
-
-func (s *Server) handleClusterState(w http.ResponseWriter, r *http.Request) {
-	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
-		return
-	}
-	_ = s.syncCatalogFromBackend(r.Context())
-	s.mu.RLock()
-	indicesMeta := make(map[string]any, len(s.indices))
-	for name, idx := range s.indices {
-		var aliases []string
-		for al, targets := range s.aliases {
-			for _, t := range targets {
-				if t == name {
-					aliases = append(aliases, al)
-				}
-			}
-		}
-		mappings := map[string]any{}
-		if idx.RawMapping != nil {
-			docMap := map[string]any{"properties": idx.RawMapping.Properties}
-			if idx.RawMapping.Dynamic != nil {
-				docMap["dynamic"] = idx.RawMapping.Dynamic
-			}
-			mappings["_doc"] = docMap
-		}
-		indicesMeta[name] = map[string]any{
-			"state":    "open",
-			"settings": map[string]any{"index": map[string]any{"number_of_shards": "1", "number_of_replicas": "0"}},
-			"mappings": mappings,
-			"aliases":  aliases,
-		}
-	}
-	votingExcl := make([]any, 0, len(s.votingExclusions))
-	for _, ve := range s.votingExclusions {
-		votingExcl = append(votingExcl, deepCloneDocMap(ve))
-	}
-	s.mu.RUnlock()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"cluster_name": "apache-doris-search-cluster",
-		"cluster_uuid": "doris-es-0000-0000-0000-000000000001",
-		"master_node":  "doris-fe-1",
-		"nodes": map[string]any{
-			"doris-fe-1": map[string]any{
-				"name":              "doris-fe-1",
-				"transport_address": "127.0.0.1:9300",
-				"roles":             []string{"master", "data", "ingest"},
-			},
-		},
-		"metadata": map[string]any{
-			"indices": indicesMeta,
-			"cluster_coordination": map[string]any{
-				"voting_config_exclusions": votingExcl,
-			},
-		},
-		"cluster_coordination": map[string]any{
-			"voting_config_exclusions": votingExcl,
-		},
-	})
-}
-
-func (s *Server) handleClusterStats(w http.ResponseWriter, r *http.Request) {
-	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
-		return
-	}
-	s.mu.RLock()
-	numIndices := len(s.indices)
-	s.mu.RUnlock()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
-		"cluster_name": "apache-doris-search-cluster",
-		"cluster_uuid": "doris-es-0000-0000-0000-000000000001",
-		"status":       "green",
-		"indices": map[string]any{
-			"count":  numIndices,
-			"shards": map[string]any{"total": numIndices, "primaries": numIndices},
-		},
-		"nodes": map[string]any{
-			"count":    map[string]any{"total": 1, "data": 1, "master": 1, "ingest": 1},
-			"versions": []string{"7.10.2"},
-		},
-	})
 }
 
 func (s *Server) handleILMPolicy(w http.ResponseWriter, r *http.Request) {
@@ -3051,11 +3086,69 @@ func (s *Server) handleCatIndices(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
+	healthFilter := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("health")))
+	if healthFilter != "" && healthFilter != "green" && healthFilter != "yellow" && healthFilter != "red" {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+			fmt.Sprintf("No enum constant org.elasticsearch.cluster.health.ClusterHealthStatus.%s", strings.ToUpper(healthFilter)))
+		return
+	}
+	rawEW := r.URL.Query().Get("expand_wildcards")
+	ewOpen, ewClosed, ewHidden, ewNone, ewErr := parseExpandWildcardsFlags(rawEW)
+	if ewErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", ewErr.Error())
+		return
+	}
+	if strings.TrimSpace(rawEW) == "" {
+		// _cat/indices defaults to open,closed (excluding hidden unless requested)
+		ewOpen = true
+		ewClosed = true
+		ewHidden = false
+	}
+
+	_ = s.syncCatalogFromBackend(r.Context())
+	pat := strings.TrimSpace(r.PathValue("index"))
+	explicitDotPattern := false
+	for _, tok := range strings.Split(pat, ",") {
+		tok = strings.TrimSpace(tok)
+		if strings.HasPrefix(tok, ".") {
+			explicitDotPattern = true
+			break
+		}
+	}
 	var names []string
-	if pat := r.PathValue("index"); pat != "" {
-		names = s.resolveTargetIndices(pat)
-	} else {
-		_ = s.syncCatalogFromBackend(r.Context())
+	if pat != "" && pat != "_all" && pat != "*" {
+		if ewNone && strings.ContainsAny(pat, "*?") {
+			if !r.URL.Query().Has("allow_no_indices") || isTruthyBoolQueryParam(r, "allow_no_indices") {
+				names = nil
+			} else {
+				writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+pat+"]")
+				return
+			}
+		} else {
+			ignoreUnavail := isTruthyBoolQueryParam(r, "ignore_unavailable")
+			s.mu.RLock()
+			var missingConcrete string
+			for _, tok := range strings.Split(pat, ",") {
+				tok = strings.TrimSpace(tok)
+				if tok == "" || strings.HasPrefix(tok, "-") || strings.ContainsAny(tok, "*?") || tok == "_all" {
+					continue
+				}
+				_, isIdx := s.indices[tok]
+				_, isAlias := s.aliases[tok]
+				_, isDS := s.dataStreams[tok]
+				if !isIdx && !isAlias && !isDS && missingConcrete == "" {
+					missingConcrete = tok
+				}
+			}
+			s.mu.RUnlock()
+			if missingConcrete != "" && !ignoreUnavail {
+				writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+missingConcrete+"]")
+				return
+			}
+			resolved, _ := s.resolveTargetIndicesWithOptions(pat, ewHidden || explicitDotPattern)
+			names = resolved
+		}
+	} else if !ewNone {
 		s.mu.RLock()
 		names = make([]string, 0, len(s.indices))
 		for name := range s.indices {
@@ -3063,32 +3156,82 @@ func (s *Server) handleCatIndices(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.RUnlock()
 	}
+
 	sort.Strings(names)
 	list := make([]map[string]any, 0, len(names))
 	for _, name := range names {
+		isClosed := s.isIndexClosed(name)
+		if isClosed && !ewClosed && pat != name {
+			continue
+		}
+		if !isClosed && !ewOpen && pat != name {
+			continue
+		}
+		s.mu.RLock()
+		isHidden := s.isIndexExplicitlyHiddenLocked(name) || strings.HasPrefix(name, ".")
+		creationMs := s.getIndexCreationDateMsLocked(name, 1700000000000)
+		s.mu.RUnlock()
+		if isHidden && !ewHidden && !explicitDotPattern && pat != name {
+			continue
+		}
+
+		numShards, numReplicas, _ := s.getIndexShardAndReplicaCounts(name)
+		idxHealth := "green"
+		if numReplicas > 0 {
+			idxHealth = "yellow"
+		}
+		if healthFilter != "" && idxHealth != healthFilter {
+			continue
+		}
+
 		idxStatus := "open"
-		if s.isIndexClosed(name) {
+		if isClosed {
 			idxStatus = "close"
 		}
+		cdStr := strconv.FormatInt(creationMs, 10)
+		cdsStr := time.UnixMilli(creationMs).UTC().Format("2006-01-02T15:04:05.000Z")
+		uuidStr := catIndexUUID22(name)
+
+		if isClosed {
+			list = append(list, map[string]any{
+				"health":               idxHealth,
+				"status":               idxStatus,
+				"index":                name,
+				"uuid":                 uuidStr,
+				"pri":                  strconv.Itoa(numShards),
+				"rep":                  strconv.Itoa(numReplicas),
+				"docs.count":           nil,
+				"docs.deleted":         nil,
+				"store.size":           nil,
+				"pri.store.size":       nil,
+				"creation.date":        cdStr,
+				"creation.date.string": cdsStr,
+			})
+			continue
+		}
+
 		docsCount := "0"
-		if r != nil && r.Method != http.MethodHead && !isTruthyBoolQueryParam(r, "help") && idxStatus == "open" {
-			zero := 0
-			if resp, status, _, _ := s.executeSearchRequest(r.Context(), name, &esast.SearchRequest{Size: &zero}); status == http.StatusOK {
-				total, _ := extractTotalAndHitIDs(resp)
-				docsCount = strconv.FormatInt(total, 10)
+		storeSize := "0b"
+		if r != nil && r.Method != http.MethodHead && !isTruthyBoolQueryParam(r, "help") {
+			cnt, bytesEst := s.computeLiveIndexDocCountAndStoreBytesRound59(r.Context(), name, true)
+			docsCount = strconv.FormatInt(cnt, 10)
+			if bytesEst > 0 {
+				storeSize = fmt.Sprintf("%db", bytesEst)
 			}
 		}
 		list = append(list, map[string]any{
-			"health":         "green",
-			"status":         idxStatus,
-			"index":          name,
-			"uuid":           name,
-			"pri":            "1",
-			"rep":            "0",
-			"docs.count":     docsCount,
-			"docs.deleted":   "0",
-			"store.size":     "0b",
-			"pri.store.size": "0b",
+			"health":               idxHealth,
+			"status":               idxStatus,
+			"index":                name,
+			"uuid":                 uuidStr,
+			"pri":                  strconv.Itoa(numShards),
+			"rep":                  strconv.Itoa(numReplicas),
+			"docs.count":           docsCount,
+			"docs.deleted":         "0",
+			"store.size":           storeSize,
+			"pri.store.size":       storeSize,
+			"creation.date":        cdStr,
+			"creation.date.string": cdsStr,
 		})
 	}
 	writeCatResponse(w, r, []string{"health", "status", "index", "uuid", "pri", "rep", "docs.count", "docs.deleted", "store.size", "pri.store.size"}, list)
@@ -3099,8 +3242,26 @@ func (s *Server) handleCatAliases(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
+	rawEW := r.URL.Query().Get("expand_wildcards")
+	ewOpen, ewClosed, ewHidden, ewNone, ewErr := parseExpandWildcardsFlags(rawEW)
+	if ewErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", ewErr.Error())
+		return
+	}
+	if strings.TrimSpace(rawEW) == "" {
+		ewOpen = true
+		ewClosed = true
+		ewHidden = false
+	}
 	_ = s.syncCatalogFromBackend(r.Context())
-	namePattern := r.PathValue("name")
+	namePattern := strings.TrimSpace(r.PathValue("name"))
+	explicitDotAlias := false
+	for _, tok := range strings.Split(namePattern, ",") {
+		if strings.HasPrefix(strings.TrimSpace(tok), ".") {
+			explicitDotAlias = true
+			break
+		}
+	}
 	s.mu.RLock()
 	list := make([]map[string]any, 0)
 	aliasNames := make([]string, 0, len(s.aliases))
@@ -3109,12 +3270,28 @@ func (s *Server) handleCatAliases(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(aliasNames)
 	for _, alias := range aliasNames {
+		if ewNone && (namePattern == "" || strings.ContainsAny(namePattern, "*?") || namePattern == "_all") {
+			continue
+		}
 		if namePattern != "" && namePattern != "*" && namePattern != "_all" && !matchMultiWildcardWithExclusions(namePattern, alias) {
+			continue
+		}
+		if strings.HasPrefix(alias, ".") && !ewHidden && !explicitDotAlias && namePattern != alias {
 			continue
 		}
 		targets := s.aliases[alias]
 		metaByIdx := s.aliasMeta[alias]
 		for _, idx := range targets {
+			isClosed := s.closedIndices[idx]
+			if isClosed && !ewClosed {
+				continue
+			}
+			if !isClosed && !ewOpen {
+				continue
+			}
+			if (s.isIndexExplicitlyHiddenLocked(idx) || strings.HasPrefix(idx, ".")) && !ewHidden && !explicitDotAlias && namePattern != alias {
+				continue
+			}
 			filterMark := "-"
 			writeMark := "-"
 			indexRouting := "-"
@@ -3202,27 +3379,62 @@ func (s *Server) handleCatRoot(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	rawIndex := strings.TrimSpace(r.PathValue("index"))
+	isFlush := strings.HasSuffix(strings.Trim(r.URL.Path, "/"), "_flush") || strings.Contains(r.URL.Path, "/_flush/")
+	var targets []string
 	if rawIndex != "" {
-		if _, _, ok := s.resolveValidatedReadTargets(w, r, rawIndex); !ok {
+		var ok bool
+		targets, _, ok = s.resolveValidatedReadTargets(w, r, rawIndex)
+		if !ok {
 			return
 		}
 		if !s.ensureNoExplicitClosedTargetRound59(w, r, rawIndex) {
 			return
 		}
+	} else {
+		_ = s.syncCatalogFromBackend(r.Context())
+		s.mu.RLock()
+		for name := range s.indices {
+			if !s.closedIndices[name] {
+				targets = append(targets, name)
+			}
+		}
+		s.mu.RUnlock()
 	}
 	_ = s.coalescer.FlushAll(r.Context())
 	s.queryCache.InvalidateAll()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0},
+	totalShards := 0
+	successfulShards := 0
+	for _, t := range targets {
+		if s.isIndexClosed(t) {
+			continue
+		}
+		s.refreshAllIndexShardsRound60(t)
+		if st := s.getOrCreateIndexLiveStats(t); st != nil {
+			st.refreshTotal.Add(1)
+			if isFlush {
+				st.flushTotal.Add(1)
+			}
+		}
+		numShards, numReplicas, _ := s.getIndexShardAndReplicaCounts(t)
+		totalShards += numShards * (1 + numReplicas)
+		successfulShards += numShards
+	}
+	if totalShards == 0 && !s.hasAuthoritativeIndexCatalog() {
+		totalShards = 1
+		successfulShards = 1
+	}
+	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
+		"_shards": map[string]any{"total": totalShards, "successful": successfulShards, "failed": 0},
 	})
 }
 
 type scrollCursor struct {
-	Index     string              `json:"idx"`
-	Req       esast.SearchRequest `json:"req"`
-	LastSort  []any               `json:"after,omitempty"`
-	Total     int64               `json:"tot,omitempty"`
-	Exhausted bool                `json:"eof,omitempty"`
+	Index        string              `json:"idx"`
+	Req          esast.SearchRequest `json:"req"`
+	LastSort     []any               `json:"after,omitempty"`
+	Total        int64               `json:"tot,omitempty"`
+	FetchedCount int64               `json:"fetched,omitempty"`
+	Exhausted    bool                `json:"eof,omitempty"`
 }
 
 func extractRespTotalHits(resp map[string]any) int64 {
@@ -3244,17 +3456,55 @@ func extractRespTotalHits(resp map[string]any) int64 {
 	return 0
 }
 
-func encodeScrollCursorWithState(indexName string, req *esast.SearchRequest, lastSort []any, total int64, exhausted bool) string {
+func extractRespReturnedHitsCount(resp map[string]any) int {
+	if resp == nil {
+		return 0
+	}
+	hitsWrapper, ok := resp["hits"].(map[string]any)
+	if !ok {
+		return 0
+	}
+	switch hs := hitsWrapper["hits"].(type) {
+	case []map[string]any:
+		return len(hs)
+	case []any:
+		return len(hs)
+	}
+	return 0
+}
+
+func trimRespHitsToMax(resp map[string]any, maxHits int) {
+	if resp == nil || maxHits < 0 {
+		return
+	}
+	hitsWrapper, ok := resp["hits"].(map[string]any)
+	if !ok {
+		return
+	}
+	switch hs := hitsWrapper["hits"].(type) {
+	case []map[string]any:
+		if len(hs) > maxHits {
+			hitsWrapper["hits"] = hs[:maxHits]
+		}
+	case []any:
+		if len(hs) > maxHits {
+			hitsWrapper["hits"] = hs[:maxHits]
+		}
+	}
+}
+
+func encodeScrollCursorWithFetched(indexName string, req *esast.SearchRequest, lastSort []any, total, fetched int64, exhausted bool) string {
 	var r esast.SearchRequest
 	if req != nil {
 		r = *req
 	}
 	c := scrollCursor{
-		Index:     indexName,
-		Req:       r,
-		LastSort:  lastSort,
-		Total:     total,
-		Exhausted: exhausted,
+		Index:        indexName,
+		Req:          r,
+		LastSort:     lastSort,
+		Total:        total,
+		FetchedCount: fetched,
+		Exhausted:    exhausted,
 	}
 	raw, err := json.Marshal(c)
 	if err != nil {
@@ -3293,7 +3543,7 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodDelete {
 		pathScrollID := strings.TrimSpace(r.PathValue("scroll_id"))
 		queryScrollID := strings.TrimSpace(r.URL.Query().Get("scroll_id"))
-		clearAll := pathScrollID == "_all" || queryScrollID == "_all"
+		clearAll := false
 		var ids []string
 		appendSplitIDs := func(raw string) {
 			for _, p := range strings.Split(raw, ",") {
@@ -3305,12 +3555,7 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		if pathScrollID != "" && pathScrollID != "_all" {
-			appendSplitIDs(pathScrollID)
-		}
-		if queryScrollID != "" && queryScrollID != "_all" {
-			appendSplitIDs(queryScrollID)
-		}
+		hasBodyScrollID := false
 		if trimmedBody := bytes.TrimSpace(bodyBytes); len(trimmedBody) > 0 {
 			switch trimmedBody[0] {
 			case '{':
@@ -3323,8 +3568,10 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 				}
 				switch sid := body.ScrollID.(type) {
 				case string:
+					hasBodyScrollID = true
 					appendSplitIDs(sid)
 				case []any:
+					hasBodyScrollID = true
 					for _, elem := range sid {
 						sVal, okS := elem.(string)
 						if !okS {
@@ -3339,6 +3586,7 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			case '[':
+				hasBodyScrollID = true
 				var arr []string
 				if err := json.Unmarshal(trimmedBody, &arr); err != nil {
 					writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
@@ -3348,6 +3596,7 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 					appendSplitIDs(elem)
 				}
 			default:
+				hasBodyScrollID = true
 				var rawStr string
 				if err := json.Unmarshal(trimmedBody, &rawStr); err == nil {
 					appendSplitIDs(rawStr)
@@ -3356,11 +3605,40 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		if !hasBodyScrollID {
+			if pathScrollID == "_all" || queryScrollID == "_all" {
+				clearAll = true
+			}
+			if pathScrollID != "" && pathScrollID != "_all" {
+				appendSplitIDs(pathScrollID)
+			}
+			if queryScrollID != "" && queryScrollID != "_all" {
+				appendSplitIDs(queryScrollID)
+			}
+		}
 		if !clearAll && len(ids) == 0 {
 			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: no scroll ids specified;")
 			return
 		}
 		succeeded, numFreed := s.clearScrollTokens(ids, clearAll)
+		if !clearAll && !succeeded {
+			missingID := ids[0]
+			reason := "No search context found for id [" + missingID + "]"
+			writeJSONWithRequest(w, r, http.StatusNotFound, map[string]any{
+				"succeeded": false,
+				"num_freed": numFreed,
+				"error": map[string]any{
+					"root_cause": []map[string]any{{
+						"type":   "search_context_missing_exception",
+						"reason": reason,
+					}},
+					"type":   "search_context_missing_exception",
+					"reason": reason,
+				},
+				"status": http.StatusNotFound,
+			})
+			return
+		}
 		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"succeeded": succeeded, "num_freed": numFreed})
 		return
 	}
@@ -3381,7 +3659,7 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 				writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
 				return
 			}
-			if strings.TrimSpace(body.Scroll) != "" && rawScrollTTL == "" {
+			if strings.TrimSpace(body.Scroll) != "" {
 				rawScrollTTL = strings.TrimSpace(body.Scroll)
 			}
 			switch v := body.ScrollID.(type) {
@@ -3417,6 +3695,19 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("failed to parse [scroll] value [%s]: %v", rawScrollTTL, err))
 			return
 		}
+		maxKeepAlive := 24 * time.Hour
+		s.mu.RLock()
+		if rawMax, okM := s.getClusterSettingStringLocked("search.max_keep_alive"); okM && strings.TrimSpace(rawMax) != "" {
+			if parsedMax, mErr := parseESPositiveDuration(rawMax); mErr == nil && parsedMax > 0 {
+				maxKeepAlive = parsedMax
+			}
+		}
+		s.mu.RUnlock()
+		if ttl > maxKeepAlive {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				fmt.Sprintf("Keep alive for scroll (%s) cannot be larger than (%s)", rawScrollTTL, maxKeepAlive))
+			return
+		}
 		extendTTL = ttl
 	}
 	if scrollID == "" {
@@ -3429,7 +3720,7 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cursor.Exhausted || len(cursor.LastSort) == 0 {
-		eofScrollID := encodeScrollCursorWithState(cursor.Index, &cursor.Req, nil, cursor.Total, true)
+		eofScrollID := encodeScrollCursorWithFetched(cursor.Index, &cursor.Req, nil, cursor.Total, cursor.FetchedCount, true)
 		if !s.validateAndAdvanceScrollToken(scrollID, eofScrollID, extendTTL) {
 			writeESError(w, http.StatusNotFound, "search_context_missing_exception", "No search context found for id ["+scrollID+"]")
 			return
@@ -3482,24 +3773,36 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	total := cursor.Total
-	if respTot := extractRespTotalHits(resp); respTot > total {
-		total = respTot
-	} else if total > 0 && req.ShouldTrackTotalHits() {
+	if req.ShouldTrackTotalHits() {
+		remaining := total - cursor.FetchedCount
+		if remaining < 0 {
+			remaining = 0
+		}
+		if int64(extractRespReturnedHitsCount(resp)) > remaining {
+			trimRespHitsToMax(resp, int(remaining))
+		}
 		if hitsMap, okH := resp["hits"].(map[string]any); okH {
 			rel := "eq"
 			if thresh, okT := trackTotalHitsThreshold(&req); okT && thresh > 0 && total >= thresh {
 				rel = "gte"
 			}
 			hitsMap["total"] = map[string]any{"value": total, "relation": rel}
+			if extractRespReturnedHitsCount(resp) == 0 {
+				hitsMap["max_score"] = nil
+			}
 		}
 	}
+	returnedNow := int64(extractRespReturnedHitsCount(resp))
+	nextFetched := cursor.FetchedCount + returnedNow
 	lastSort := extractLastHitSort(resp)
-	nextScrollID := encodeScrollCursorWithState(cursor.Index, &req, lastSort, total, len(lastSort) == 0)
+	exhausted := len(lastSort) == 0 || (req.ShouldTrackTotalHits() && nextFetched >= total)
+	nextScrollID := encodeScrollCursorWithFetched(cursor.Index, &req, lastSort, total, nextFetched, exhausted)
 	_ = s.validateAndAdvanceScrollToken(scrollID, nextScrollID, extendTTL)
 	resp["_scroll_id"] = nextScrollID
+	s.applyDocTypeToSearchResponseRound60(resp, r)
 	if isTruthyBoolQueryParam(r, "typed_keys") {
 		if aggsMap, ok := resp["aggregations"].(map[string]any); ok {
-			applyTypedKeysToAggregations(aggsMap, req.EffectiveAggs())
+			applyTypedKeysToAggregationsWithSchemaRound60(aggsMap, req.EffectiveAggs(), s.resolvePrimarySchemaForTypedKeysRound60(r.Context(), cursor.Index))
 		}
 		if sugMap, ok := resp["suggest"].(map[string]any); ok {
 			applyTypedKeysToSuggestions(sugMap, req.Suggest)
@@ -3717,15 +4020,21 @@ func (s *Server) handleIndexTemplate(w http.ResponseWriter, r *http.Request) {
 				toDelete = []string{name}
 			}
 			for _, k := range toDelete {
-				for _, tpl := range s.templates {
+				var usingTemplates []string
+				for tplName, tpl := range s.templates {
 					for _, comp := range tpl.ComposedOf {
 						if comp == k {
-							s.mu.Unlock()
-							writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
-								fmt.Sprintf("component_template [%s] is in use by index templates", k))
-							return
+							usingTemplates = append(usingTemplates, tplName)
+							break
 						}
 					}
+				}
+				if len(usingTemplates) > 0 {
+					sort.Strings(usingTemplates)
+					s.mu.Unlock()
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+						fmt.Sprintf("unable to remove component templates [%s] as they are in use by a index templates [%s]", k, strings.Join(usingTemplates, ", ")))
+					return
 				}
 			}
 			for _, k := range toDelete {
@@ -4387,6 +4696,12 @@ func (s *Server) handleDeleteIndex(w http.ResponseWriter, r *http.Request) {
 		delete(s.indexFinalPipelines, indexName)
 		delete(s.closedIndices, indexName)
 		delete(s.indexCustomSettings, indexName)
+		delete(s.indexNextSeqNo, indexName)
+		delete(s.docSeqNos, indexName)
+		delete(s.docDeleted, indexName)
+		delete(s.docExtTombstones, indexName)
+		delete(s.unrefreshedDocs, indexName)
+		delete(s.indexStats, indexName)
 		for alias := range s.aliases {
 			s.removeAliasTargetLocked(alias, indexName)
 			modifiedAliases[alias] = append([]string(nil), s.aliases[alias]...)
@@ -4395,6 +4710,7 @@ func (s *Server) handleDeleteIndex(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	for _, indexName := range targets {
 		s.deleteCatalogEntity(r.Context(), "index", indexName)
+		s.deleteCatalogEntity(r.Context(), "index_seq_state", indexName)
 	}
 	for alias, aliasTargets := range modifiedAliases {
 		s.persistAlias(r.Context(), alias, aliasTargets)
@@ -4435,9 +4751,6 @@ func (s *Server) handleGetAllMappings(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		mappings := buildMappingResponseMapRound59(idx)
-		if _, hasProps := mappings["properties"]; !hasProps {
-			mappings["properties"] = map[string]esast.FieldProperty{}
-		}
 		out[indexName] = map[string]any{
 			"mappings": mappings,
 		}
@@ -4463,9 +4776,6 @@ func (s *Server) handleGetMapping(w http.ResponseWriter, r *http.Request) {
 		}
 		if exists {
 			mappings := buildMappingResponseMapRound59(idx)
-			if _, hasProps := mappings["properties"]; !hasProps {
-				mappings["properties"] = map[string]esast.FieldProperty{}
-			}
 			out[indexName] = map[string]any{
 				"mappings": mappings,
 			}
@@ -4493,6 +4803,7 @@ func (s *Server) handleGetFieldMapping(w http.ResponseWriter, r *http.Request) {
 		rawFields = "*"
 	}
 	fieldPatterns := strings.Split(rawFields, ",")
+	includeDefaults := isTruthyBoolQueryParam(r, "include_defaults")
 
 	s.mu.RLock()
 	out := make(map[string]any, len(targets))
@@ -4534,6 +4845,7 @@ func (s *Server) handleGetFieldMapping(w http.ResponseWriter, r *http.Request) {
 					fieldDef["type"] = "alias"
 					fieldDef["path"] = fb.AliasTarget
 				}
+				applyFieldMappingEntryRound60(fieldDef, fb, includeDefaults)
 				mappingsOut[esPath] = map[string]any{
 					"full_name": esPath,
 					"mapping": map[string]any{
@@ -4544,10 +4856,12 @@ func (s *Server) handleGetFieldMapping(w http.ResponseWriter, r *http.Request) {
 			if fb.KeywordCompanion != "" && fb.AliasTarget == "" {
 				kwPath := esPath + ".keyword"
 				if _, explicitKW := augSchema.Fields[kwPath]; !explicitKW && matchesFieldCapsPatterns(kwPath, fieldPatterns) {
+					kwDef := map[string]any{"type": "keyword"}
+					applyFieldMappingEntryRound60(kwDef, schema.FieldBinding{ESType: "keyword", IgnoreAbove: 256}, includeDefaults)
 					mappingsOut[kwPath] = map[string]any{
 						"full_name": kwPath,
 						"mapping": map[string]any{
-							"keyword": map[string]any{"type": "keyword"},
+							"keyword": kwDef,
 						},
 					}
 				}
@@ -4557,10 +4871,12 @@ func (s *Server) handleGetFieldMapping(w http.ResponseWriter, r *http.Request) {
 					subPath := esPath + suffix
 					subName := strings.TrimPrefix(suffix, ".")
 					if _, explicitSub := augSchema.Fields[subPath]; !explicitSub && matchesFieldCapsPatterns(subPath, fieldPatterns) {
+						subDef := map[string]any{"type": "search_as_you_type"}
+						applyFieldMappingEntryRound60(subDef, schema.FieldBinding{ESType: "search_as_you_type"}, includeDefaults)
 						mappingsOut[subPath] = map[string]any{
 							"full_name": subPath,
 							"mapping": map[string]any{
-								subName: map[string]any{"type": "search_as_you_type"},
+								subName: subDef,
 							},
 						}
 					}
@@ -4568,10 +4884,12 @@ func (s *Server) handleGetFieldMapping(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if matchesFieldCapsPatterns("@timestamp", fieldPatterns) && mappingsOut["@timestamp"] == nil && s.isDataStreamOrBackingIndexLocked(idxName) {
+			tsDef := map[string]any{"type": "date"}
+			applyFieldMappingEntryRound60(tsDef, schema.FieldBinding{ESType: "date"}, includeDefaults)
 			mappingsOut["@timestamp"] = map[string]any{
 				"full_name": "@timestamp",
 				"mapping": map[string]any{
-					"@timestamp": map[string]any{"type": "date"},
+					"@timestamp": tsDef,
 				},
 			}
 		}
@@ -4864,10 +5182,16 @@ func (s *Server) handleIndexAliasByName(w http.ResponseWriter, r *http.Request) 
 	aliasName := r.PathValue("name")
 	switch r.Method {
 	case http.MethodPut, http.MethodPost:
+		if reason, ok := validateESIndexName(aliasName); !ok {
+			writeESError(w, http.StatusBadRequest, "invalid_alias_name_exception",
+				strings.Replace(reason, "Invalid index name", "Invalid alias name", 1))
+			return
+		}
 		bodyBytes, ok := readRequestBody(w, r)
 		if !ok {
 			return
 		}
+		bodyBytes = normalizeAliasActionsBodyRound60(bodyBytes)
 		var meta AliasMetadata
 		if len(bytes.TrimSpace(bodyBytes)) > 0 {
 			if err := json.Unmarshal(bodyBytes, &meta); err != nil {
@@ -5041,6 +5365,7 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	bodyBytes = normalizeAliasActionsBodyRound60(bodyBytes)
 	var payload struct {
 		Actions []map[string]struct {
 			Index         string       `json:"index"`
@@ -5098,6 +5423,23 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 		}
 		simulatedAliases[al] = m
 	}
+	indicesRemovedInTx := make(map[string]bool)
+	for _, action := range payload.Actions {
+		if remIdx, ok := action["remove_index"]; ok {
+			if remIdx.MustExist != nil {
+				s.mu.Unlock()
+				writeESError(w, http.StatusBadRequest, "parsing_exception", "Failed to parse [must_exist]: unsupported parameter for [remove_index]")
+				return
+			}
+			rawIndices := append([]string(nil), remIdx.Indices...)
+			if remIdx.Index != "" {
+				rawIndices = append(rawIndices, remIdx.Index)
+			}
+			for _, idxName := range expandIndexListFromSet(splitCommaTrimmedTokens(rawIndices), simulatedIndices) {
+				indicesRemovedInTx[idxName] = true
+			}
+		}
+	}
 	writeIndexSetForAlias := make(map[string]string)
 	for _, action := range payload.Actions {
 		if len(action) == 0 {
@@ -5113,6 +5455,11 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if add, ok := action["add"]; ok {
+			if add.MustExist != nil {
+				s.mu.Unlock()
+				writeESError(w, http.StatusBadRequest, "parsing_exception", "Failed to parse [must_exist]: unsupported parameter for [add]")
+				return
+			}
 			rawIndices := append([]string(nil), add.Indices...)
 			if add.Index != "" {
 				rawIndices = append(rawIndices, add.Index)
@@ -5152,7 +5499,13 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 				if strings.HasPrefix(al, "-") {
 					continue
 				}
-				if simulatedIndices[al] {
+				if reason, validName := validateESIndexName(al); !validName {
+					s.mu.Unlock()
+					writeESError(w, http.StatusBadRequest, "invalid_alias_name_exception",
+						strings.Replace(reason, "Invalid index name", "Invalid alias name", 1))
+					return
+				}
+				if simulatedIndices[al] && !indicesRemovedInTx[al] {
 					s.mu.Unlock()
 					writeESError(w, http.StatusBadRequest, "invalid_alias_name_exception", fmt.Sprintf("Invalid alias name [%s], an index exists with the same name as the alias", al))
 					return
@@ -5298,6 +5651,11 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if remIdx, ok := action["remove_index"]; ok {
+			if remIdx.MustExist != nil {
+				s.mu.Unlock()
+				writeESError(w, http.StatusBadRequest, "parsing_exception", "Failed to parse [must_exist]: unsupported parameter for [remove_index]")
+				return
+			}
 			rawIndices := append([]string(nil), remIdx.Indices...)
 			if remIdx.Index != "" {
 				rawIndices = append(rawIndices, remIdx.Index)
@@ -5384,6 +5742,11 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if remIdx, ok := action["remove_index"]; ok {
+			if remIdx.MustExist != nil {
+				s.mu.Unlock()
+				writeESError(w, http.StatusBadRequest, "parsing_exception", "Failed to parse [must_exist]: unsupported parameter for [remove_index]")
+				return
+			}
 			rawIndices := append([]string(nil), remIdx.Indices...)
 			if remIdx.Index != "" {
 				rawIndices = append(rawIndices, remIdx.Index)
@@ -5399,6 +5762,12 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 				delete(s.indexFinalPipelines, indexName)
 				delete(s.closedIndices, indexName)
 				delete(s.indexCustomSettings, indexName)
+				delete(s.indexNextSeqNo, indexName)
+				delete(s.docSeqNos, indexName)
+				delete(s.docDeleted, indexName)
+				delete(s.docExtTombstones, indexName)
+				delete(s.unrefreshedDocs, indexName)
+				delete(s.indexStats, indexName)
 				removedIndices = append(removedIndices, indexName)
 				for alias := range s.aliases {
 					s.removeAliasTargetLocked(alias, indexName)
@@ -5410,6 +5779,7 @@ func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	for _, indexName := range removedIndices {
 		s.deleteCatalogEntity(r.Context(), "index", indexName)
+		s.deleteCatalogEntity(r.Context(), "index_seq_state", indexName)
 	}
 	for al, targets := range modifiedAliases {
 		s.persistAlias(r.Context(), al, targets)
@@ -5559,35 +5929,42 @@ func parseOCCParamsFromRequest(r *http.Request) (ifSeqNo *int64, ifPrimaryTerm *
 	if (ifSeqNo != nil) != (ifPrimaryTerm != nil) {
 		return nil, nil, nil, "", "Validation Failed: 1: both if_seq_no and if_primary_term must be provided;"
 	}
+	versionType = strings.ToLower(strings.TrimSpace(q.Get("version_type")))
 	if q.Has("version") {
 		raw := strings.TrimSpace(q.Get("version"))
 		if raw != "" {
 			v, err := strconv.ParseInt(raw, 10, 64)
-			if err != nil || v <= 0 {
+			if err != nil {
+				return nil, nil, nil, "", fmt.Sprintf("invalid version [%s]", raw)
+			}
+			if versionType == "" || versionType == "internal" {
+				if v <= 0 {
+					return nil, nil, nil, "", fmt.Sprintf("invalid version [%s]", raw)
+				}
+			} else if v < 0 {
 				return nil, nil, nil, "", fmt.Sprintf("invalid version [%s]", raw)
 			}
 			version = &v
 		}
 	}
-	versionType = strings.ToLower(strings.TrimSpace(q.Get("version_type")))
 	return ifSeqNo, ifPrimaryTerm, version, versionType, ""
 }
 
-func validateOCC(docID string, found bool, currentVer int64, ifSeqNo, ifPrimaryTerm, reqVersion *int64, versionType string) (assignedVersion int64, status int, errType string, errReason string) {
+func validateOCCWithSeqNo(docID string, found bool, currentVer, currentSeqNo int64, ifSeqNo, ifPrimaryTerm, reqVersion *int64, versionType string) (assignedVersion int64, hasAssigned bool, status int, errType string, errReason string) {
 	if (ifSeqNo != nil) != (ifPrimaryTerm != nil) {
-		return 0, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: both if_seq_no and if_primary_term must be provided;"
+		return 0, false, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: both if_seq_no and if_primary_term must be provided;"
 	}
 	if (ifSeqNo != nil || ifPrimaryTerm != nil) && (reqVersion != nil || strings.TrimSpace(versionType) != "") {
-		return 0, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: can't provide both seq_no/primary_term and version/version_type;"
+		return 0, false, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: can't provide both seq_no/primary_term and version/version_type;"
 	}
 	if ifSeqNo != nil && ifPrimaryTerm != nil {
 		if !found {
-			return 0, http.StatusConflict, "version_conflict_engine_exception",
+			return 0, false, http.StatusConflict, "version_conflict_engine_exception",
 				fmt.Sprintf("[%s]: version conflict, required seqNo [%d], primary term [%d]. but no document was found", docID, *ifSeqNo, *ifPrimaryTerm)
 		}
-		if *ifPrimaryTerm != 1 || currentVer != *ifSeqNo {
-			return 0, http.StatusConflict, "version_conflict_engine_exception",
-				fmt.Sprintf("[%s]: version conflict, required seqNo [%d], primary term [%d]. current document has seqNo [%d] and primary term [1]", docID, *ifSeqNo, *ifPrimaryTerm, currentVer)
+		if *ifPrimaryTerm != 1 || currentSeqNo != *ifSeqNo {
+			return 0, false, http.StatusConflict, "version_conflict_engine_exception",
+				fmt.Sprintf("[%s]: version conflict, required seqNo [%d], primary term [%d]. current document has seqNo [%d] and primary term [1]", docID, *ifSeqNo, *ifPrimaryTerm, currentSeqNo)
 		}
 	}
 	vt := strings.ToLower(strings.TrimSpace(versionType))
@@ -5595,42 +5972,45 @@ func validateOCC(docID string, found bool, currentVer int64, ifSeqNo, ifPrimaryT
 		switch vt {
 		case "internal":
 		case "external", "external_gt", "external_gte":
-			return 0, http.StatusBadRequest, "action_request_validation_exception",
+			return 0, false, http.StatusBadRequest, "action_request_validation_exception",
 				fmt.Sprintf("Validation Failed: 1: version must be set when version_type is [%s];", vt)
 		default:
-			return 0, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("unknown version_type [%s]", versionType)
+			return 0, false, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("unknown version_type [%s]", versionType)
 		}
 	}
 	if reqVersion != nil {
 		switch vt {
 		case "", "internal":
+			if *reqVersion <= 0 {
+				return 0, false, http.StatusBadRequest, "action_request_validation_exception", "version must be > 0 for internal version_type"
+			}
 			if !found || currentVer != *reqVersion {
-				return 0, http.StatusConflict, "version_conflict_engine_exception",
+				return 0, false, http.StatusConflict, "version_conflict_engine_exception",
 					fmt.Sprintf("[%s]: version conflict, current version [%d] is different than the one provided [%d]", docID, currentVer, *reqVersion)
 			}
 		case "external", "external_gt":
-			if *reqVersion <= 0 {
-				return 0, http.StatusBadRequest, "action_request_validation_exception", "version must be > 0 for external version_type"
+			if *reqVersion < 0 {
+				return 0, false, http.StatusBadRequest, "action_request_validation_exception", "version must be >= 0 for external version_type"
 			}
 			if found && currentVer >= *reqVersion {
-				return 0, http.StatusConflict, "version_conflict_engine_exception",
+				return 0, false, http.StatusConflict, "version_conflict_engine_exception",
 					fmt.Sprintf("[%s]: version conflict, current version [%d] is higher or equal to the one provided [%d]", docID, currentVer, *reqVersion)
 			}
-			return *reqVersion, 0, "", ""
+			return *reqVersion, true, 0, "", ""
 		case "external_gte":
-			if *reqVersion <= 0 {
-				return 0, http.StatusBadRequest, "action_request_validation_exception", "version must be > 0 for external_gte version_type"
+			if *reqVersion < 0 {
+				return 0, false, http.StatusBadRequest, "action_request_validation_exception", "version must be >= 0 for external_gte version_type"
 			}
 			if found && currentVer > *reqVersion {
-				return 0, http.StatusConflict, "version_conflict_engine_exception",
+				return 0, false, http.StatusConflict, "version_conflict_engine_exception",
 					fmt.Sprintf("[%s]: version conflict, current version [%d] is higher than the one provided [%d]", docID, currentVer, *reqVersion)
 			}
-			return *reqVersion, 0, "", ""
+			return *reqVersion, true, 0, "", ""
 		default:
-			return 0, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("unknown version_type [%s]", versionType)
+			return 0, false, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("unknown version_type [%s]", versionType)
 		}
 	}
-	return 0, 0, "", ""
+	return 0, false, 0, "", ""
 }
 
 func (s *Server) isTargetAliasOrDataStream(rawName string) bool {
@@ -5694,14 +6074,31 @@ func validateReadDocVersionParams(rawVer, rawVerType, docID string, found bool, 
 }
 
 func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
-	rawReqIndex := r.PathValue("index")
-	if isTruthyBoolQueryParam(r, "require_alias") && !s.isTargetAliasOrDataStream(rawReqIndex) {
-		writeESError(w, http.StatusNotFound, "index_not_found_exception", fmt.Sprintf("no such alias [%s] (require_alias=true)", rawReqIndex))
+	syncRefresh, immediateForced, refreshErr := parseAndValidateRefreshParamRound60(r)
+	if refreshErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", refreshErr.Error())
 		return
+	}
+	rawReqIndex := r.PathValue("index")
+	if isTruthyBoolQueryParam(r, "require_alias") {
+		if st, et, er := s.validateRequireAliasForWriteRound60(r.Context(), rawReqIndex); st != 0 {
+			writeESError(w, st, et, er)
+			return
+		}
 	}
 	docID := r.PathValue("id")
 	isCreate, isExplicitIndexOp, validPutOp := validatePutDocRound59(w, r, docID)
 	if !validPutOp {
+		return
+	}
+	ifSeqNo, ifPrimaryTerm, reqVer, verType, occParseErr := parseOCCParamsFromRequest(r)
+	if occParseErr != "" {
+		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", occParseErr)
+		return
+	}
+	if isCreate && (verType == "external" || verType == "external_gt" || verType == "external_gte") {
+		writeESError(w, http.StatusBadRequest, "action_request_validation_exception",
+			fmt.Sprintf("Validation Failed: 1: cannot use version_type [%s] with op_type [create];", verType))
 		return
 	}
 	isCreateForTarget := isCreate || (docID == "" && !isExplicitIndexOp)
@@ -5720,11 +6117,6 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 	}
 	if blocked, reason := s.isIndexWriteBlocked(indexName); blocked {
 		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
-		return
-	}
-	ifSeqNo, ifPrimaryTerm, reqVer, verType, occParseErr := parseOCCParamsFromRequest(r)
-	if occParseErr != "" {
-		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", occParseErr)
 		return
 	}
 	if s.isDataStream(rawReqIndex) && !isCreate && docID != "" {
@@ -5749,7 +6141,7 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception", pipeErr.Error())
 			return
 		}
-		writeESError(w, http.StatusBadRequest, ingestErrorType(pipeErr), pipeErr.Error())
+		writeESError(w, http.StatusBadRequest, s.ingestErrorTypeForReqRound60(r, pipeErr), pipeErr.Error())
 		return
 	}
 	if nextDocID != "" {
@@ -5759,16 +6151,19 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		docID = esast.NextAutoID()
 	}
 	if dropped {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"_index":        indexName,
-			"_type":         "_doc",
-			"_id":           docID,
-			"_version":      -1,
-			"result":        "noop",
-			"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
-			"_seq_no":       -1,
-			"_primary_term": 1,
-		})
+		_, numReplicas, _ := s.getIndexShardAndReplicaCounts(indexName)
+		dropResp := map[string]any{
+			"_index":         indexName,
+			"_id":            docID,
+			"_version":       -1,
+			"result":         "noop",
+			"forced_refresh": false,
+			"_shards":        map[string]any{"total": 1 + numReplicas, "successful": 1, "failed": 0},
+			"_seq_no":        -1,
+			"_primary_term":  1,
+		}
+		s.applyDocTypeFieldRound60(dropResp, r, "")
+		writeJSON(w, http.StatusOK, dropResp)
 		return
 	}
 	effRawIndex := rawReqIndex
@@ -5802,9 +6197,9 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "routing_missing_exception", fmt.Sprintf("routing is required for [%s]/[_doc]/[%s]", indexName, docID))
 		return
 	}
-	var minVer int64
 	var curVer int64
-	var tombVer int64
+	var curSeqNo int64
+	var existingHit *HitRow
 	wasExisting := false
 	_ = s.coalescer.FlushTable(r.Context(), roSchema.DorisTable)
 	if existing, found, err := s.backend.GetDocByID(r.Context(), roSchema.DorisDB, roSchema.DorisTable, docID); err == nil && found {
@@ -5817,25 +6212,27 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		wasExisting = true
+		existingHit = existing
 		if existing != nil {
 			curVer = existing.Version
-			minVer = existing.Version + 1
+			curSeqNo = s.getDocSeqNo(indexName, docID, existing.Version)
 		}
 	} else if existing != nil {
-		tombVer = existing.Version
-		minVer = existing.Version + 1
+		existingHit = existing
 	}
 	occFound := wasExisting
-	if !occFound && strings.HasPrefix(strings.ToLower(strings.TrimSpace(verType)), "external") {
-		if tombVer > 0 && tombVer < 1_000_000_000_000 {
+	if !occFound && strings.HasPrefix(verType, "external") {
+		if extTomb, hasTomb := s.getDocExternalTombstone(indexName, docID); hasTomb {
 			occFound = true
-			curVer = tombVer
-		} else if lastVer := s.getDocVersion(indexName, docID); lastVer > 0 && lastVer < 1_000_000_000_000 {
+			curVer = extTomb
+			curSeqNo = s.getDocSeqNo(indexName, docID, extTomb)
+		} else if existingHit != nil && existingHit.Version > 0 && existingHit.Version < 1_000_000_000_000 {
 			occFound = true
-			curVer = lastVer
+			curVer = existingHit.Version
+			curSeqNo = s.getDocSeqNo(indexName, docID, existingHit.Version)
 		}
 	}
-	assignedVer, occStatus, occType, occReason := validateOCC(docID, occFound, curVer, ifSeqNo, ifPrimaryTerm, reqVer, verType)
+	assignedVer, hasAssignedVer, occStatus, occType, occReason := validateOCCWithSeqNo(docID, occFound, curVer, curSeqNo, ifSeqNo, ifPrimaryTerm, reqVer, verType)
 	if occType != "" {
 		writeESError(w, occStatus, occType, occReason)
 		return
@@ -5851,51 +6248,72 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, mappingOrShredErrorTypeRound59(mErr), mErr.Error())
 		return
 	}
-	nextVer := s.allocVersion(minVer)
-	if minVer > 0 && minVer < 1_000_000_000_000 {
-		nextVer = minVer
-	}
-	if assignedVer > 0 {
+
+	var nextVer int64
+	if hasAssignedVer {
 		nextVer = assignedVer
-		_ = s.allocVersion(assignedVer)
+		if !wasExisting {
+			_, _ = s.physicalDeleteDocs(r.Context(), idxSchema, []string{docID})
+		}
+	} else if wasExisting {
+		if curVer < 0 {
+			nextVer = 1
+		} else {
+			nextVer = curVer + 1
+		}
+	} else {
+		if usedPhys, _ := s.physicalDeleteDocs(r.Context(), idxSchema, []string{docID}); usedPhys || existingHit == nil {
+			nextVer = 1
+		} else if existingHit.Version > 0 {
+			nextVer = existingHit.Version + 1
+		} else {
+			nextVer = 1
+		}
 	}
+
+	docShard := s.shardForDocRoutingRound60(indexName, docID, effRouting)
+	s.recordPreMutationUnrefreshedState(indexName, docShard, docID, wasExisting, existingHit, syncRefresh)
+
 	shredded, err := schema.ShredDocument(idxSchema, docID, nextVer, false, docPayload)
 	if err != nil {
 		writeESError(w, http.StatusBadRequest, shredErrorType(err), err.Error())
 		return
 	}
 
-	syncRefresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh") == "wait_for"
 	if err := s.streamLoad(r.Context(), idxSchema.DorisTable, append(shredded, '\n'), syncRefresh); err != nil {
 		s.queryCache.InvalidateAll()
 		writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
 		return
 	}
+	seqNo := s.allocIndexSeqNo(r.Context(), indexName)
 	s.setDocRouting(indexName, docID, effRouting)
-	s.setDocVersion(indexName, docID, nextVer)
+	s.recordDocWriteMetaRound60(indexName, docID, nextVer, seqNo)
 	s.queryCache.InvalidateAll()
+	if st := s.getOrCreateIndexLiveStats(indexName); st != nil {
+		st.indexTotal.Add(1)
+		if immediateForced {
+			st.refreshTotal.Add(1)
+		}
+	}
 
 	status := http.StatusCreated
 	result := "created"
-	reportedVer := nextVer
-	if assignedVer > 0 {
-		reportedVer = assignedVer
-	}
 	if wasExisting {
 		status = http.StatusOK
 		result = "updated"
-		reportedVer = nextVer
 	}
+	_, numReplicas, _ := s.getIndexShardAndReplicaCounts(indexName)
 	respPayload := map[string]any{
-		"_index":        indexName,
-		"_type":         "_doc",
-		"_id":           docID,
-		"_version":      reportedVer,
-		"result":        result,
-		"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
-		"_seq_no":       nextVer,
-		"_primary_term": 1,
+		"_index":         indexName,
+		"_id":            docID,
+		"_version":       nextVer,
+		"result":         result,
+		"forced_refresh": immediateForced,
+		"_shards":        map[string]any{"total": 1 + numReplicas, "successful": 1, "failed": 0},
+		"_seq_no":        seqNo,
+		"_primary_term":  1,
 	}
+	s.applyDocTypeFieldRound60(respPayload, r, "")
 	if effRouting != "" {
 		respPayload["_routing"] = effRouting
 	}
@@ -5937,12 +6355,20 @@ func (s *Server) handleHeadDoc(w http.ResponseWriter, r *http.Request) {
 
 	hit, found, err := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, docID)
 	if err != nil || !found || !s.docMatchesRequestRouting(indexName, docID, effRouting) || (hit != nil && !s.docMatchesAliasFilter(r.Context(), indexName, docID, hit.EffectiveSource(), aliasFilter)) {
+		if st := s.getOrCreateIndexLiveStats(indexName); st != nil {
+			st.getTotal.Add(1)
+			st.getMissingTotal.Add(1)
+		}
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 	if status, _, _ := validateReadDocVersionParams(r.URL.Query().Get("version"), r.URL.Query().Get("version_type"), docID, true, hit.Version); status != 0 {
 		w.WriteHeader(status)
 		return
+	}
+	if st := s.getOrCreateIndexLiveStats(indexName); st != nil {
+		st.getTotal.Add(1)
+		st.getExistsTotal.Add(1)
 	}
 	w.WriteHeader(http.StatusOK)
 }
@@ -5990,14 +6416,6 @@ func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	idxSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
-	if isIndexSourceDisabledRound59(idxSchema) {
-		if r.Method == http.MethodHead {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("unable to fetch _source as _source is disabled in the mappings for index [%s]", indexName))
-		return
-	}
 	reqRouting := strings.TrimSpace(r.URL.Query().Get("routing"))
 	effRouting := s.resolveEffectiveReadRouting(rawReqIndex, indexName, reqRouting)
 	if s.isRoutingRequired(idxSchema) && effRouting == "" {
@@ -6019,11 +6437,23 @@ func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request) {
 		found = false
 	}
 	if !found {
+		if st := s.getOrCreateIndexLiveStats(indexName); st != nil {
+			st.getTotal.Add(1)
+			st.getMissingTotal.Add(1)
+		}
 		if r.Method == http.MethodHead {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		writeESError(w, http.StatusNotFound, "resource_not_found_exception", "document missing")
+		return
+	}
+	if isIndexSourceDisabledRound59(idxSchema) {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("unable to fetch _source as _source is disabled in the mappings for index [%s]", indexName))
 		return
 	}
 	if status, errType, errReason := validateReadDocVersionParams(r.URL.Query().Get("version"), r.URL.Query().Get("version_type"), docID, true, hit.Version); status != 0 {
@@ -6033,6 +6463,10 @@ func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request) {
 		}
 		writeESError(w, status, errType, errReason)
 		return
+	}
+	if st := s.getOrCreateIndexLiveStats(indexName); st != nil {
+		st.getTotal.Add(1)
+		st.getExistsTotal.Add(1)
 	}
 	if r.Method == http.MethodHead {
 		w.WriteHeader(http.StatusOK)
@@ -6103,12 +6537,17 @@ func (s *Server) handleGetDoc(w http.ResponseWriter, r *http.Request) {
 		found = false
 	}
 	if !found {
-		writeJSON(w, http.StatusNotFound, map[string]any{
+		if st := s.getOrCreateIndexLiveStats(indexName); st != nil {
+			st.getTotal.Add(1)
+			st.getMissingTotal.Add(1)
+		}
+		notFoundResp := map[string]any{
 			"_index": indexName,
-			"_type":  "_doc",
 			"_id":    docID,
 			"found":  false,
-		})
+		}
+		s.applyDocTypeFieldRound60(notFoundResp, r, "")
+		writeJSON(w, http.StatusNotFound, notFoundResp)
 		return
 	}
 	if status, errType, errReason := validateReadDocVersionParams(r.URL.Query().Get("version"), r.URL.Query().Get("version_type"), docID, true, hit.Version); status != 0 {
@@ -6120,6 +6559,10 @@ func (s *Server) handleGetDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
 			fmt.Sprintf("unable to fetch fields from _source field: _source is disabled in the mappings for index [%s]", indexName))
 		return
+	}
+	if st := s.getOrCreateIndexLiveStats(indexName); st != nil {
+		st.getTotal.Add(1)
+		st.getExistsTotal.Add(1)
 	}
 	urlStoredFields := esast.StoredFieldsSlice(strings.Join(r.URL.Query()["stored_fields"], ","))
 	hasStoredNone := false
@@ -6133,13 +6576,13 @@ func (s *Server) handleGetDoc(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := map[string]any{
 		"_index":        indexName,
-		"_type":         "_doc",
 		"_id":           hit.ID,
 		"_version":      hit.Version,
-		"_seq_no":       hit.Version,
+		"_seq_no":       s.getDocSeqNo(indexName, hit.ID, hit.Version),
 		"_primary_term": 1,
 		"found":         true,
 	}
+	s.applyDocTypeFieldRound60(resp, r, "")
 	if rt := s.getDocRouting(indexName, hit.ID); rt != "" {
 		resp["_routing"] = rt
 		hit.Routing = rt
@@ -6191,8 +6634,15 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	normBody, normSt, normET, normER := normalizeMGetBodyRound60(bodyBytes)
+	if normSt != 0 {
+		writeESError(w, normSt, normET, normER)
+		return
+	}
+	bodyBytes = normBody
 	type mgetDocSpec struct {
 		Index           string              `json:"_index"`
+		Type            string              `json:"_type,omitempty"`
 		ID              string              `json:"_id"`
 		Routing         string              `json:"routing,omitempty"`
 		MetaRouting     string              `json:"_routing,omitempty"`
@@ -6282,9 +6732,8 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 		}
 		idxName, aliasFilter, readErr := s.resolveReadDocIndexWithFilter(rawIdx)
 		if readErr != nil {
-			docsOut = append(docsOut, map[string]any{
+			errItem := map[string]any{
 				"_index": rawIdx,
-				"_type":  "_doc",
 				"_id":    spec.ID,
 				"error": map[string]any{
 					"root_cause": []map[string]any{
@@ -6293,17 +6742,18 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 					"type":   "illegal_argument_exception",
 					"reason": readErr.Error(),
 				},
-			})
+			}
+			s.applyDocTypeFieldRound60(errItem, r, spec.Type)
+			docsOut = append(docsOut, errItem)
 			continue
 		}
 		s.mu.RLock()
 		_, indexKnown := s.indices[idxName]
 		s.mu.RUnlock()
-		if !indexKnown && len(prefetched[idxName]) == 0 {
+		if !indexKnown && (s.hasAuthoritativeIndexCatalog() || len(prefetched[idxName]) == 0) {
 			errReason := "no such index [" + idxName + "]"
-			docsOut = append(docsOut, map[string]any{
+			errItem := map[string]any{
 				"_index": idxName,
-				"_type":  "_doc",
 				"_id":    spec.ID,
 				"error": map[string]any{
 					"root_cause": []map[string]any{
@@ -6313,14 +6763,15 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 					"reason": errReason,
 					"index":  idxName,
 				},
-			})
+			}
+			s.applyDocTypeFieldRound60(errItem, r, spec.Type)
+			docsOut = append(docsOut, errItem)
 			continue
 		}
 		if s.isIndexClosed(idxName) {
 			errReason := fmt.Sprintf("closed [%s]", idxName)
-			docsOut = append(docsOut, map[string]any{
+			errItem := map[string]any{
 				"_index": idxName,
-				"_type":  "_doc",
 				"_id":    spec.ID,
 				"error": map[string]any{
 					"root_cause": []map[string]any{
@@ -6330,13 +6781,14 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 					"reason": errReason,
 					"index":  idxName,
 				},
-			})
+			}
+			s.applyDocTypeFieldRound60(errItem, r, spec.Type)
+			docsOut = append(docsOut, errItem)
 			continue
 		}
 		if blocked, blockReason := s.isIndexReadBlocked(idxName); blocked {
-			docsOut = append(docsOut, map[string]any{
+			errItem := map[string]any{
 				"_index": idxName,
-				"_type":  "_doc",
 				"_id":    spec.ID,
 				"error": map[string]any{
 					"root_cause": []map[string]any{
@@ -6346,7 +6798,9 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 					"reason": blockReason,
 					"index":  idxName,
 				},
-			})
+			}
+			s.applyDocTypeFieldRound60(errItem, r, spec.Type)
+			docsOut = append(docsOut, errItem)
 			continue
 		}
 		specRouting := strings.TrimSpace(spec.Routing)
@@ -6360,9 +6814,8 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 		idxSchema := s.getOrCompileReadOnlySchema(r.Context(), idxName)
 		if s.isRoutingRequired(idxSchema) && effRouting == "" {
 			errReason := fmt.Sprintf("routing is required for [%s]/[_doc]/[%s]", idxName, spec.ID)
-			docsOut = append(docsOut, map[string]any{
+			errItem := map[string]any{
 				"_index": idxName,
-				"_type":  "_doc",
 				"_id":    spec.ID,
 				"error": map[string]any{
 					"root_cause": []map[string]any{
@@ -6372,7 +6825,9 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 					"reason": errReason,
 					"index":  idxName,
 				},
-			})
+			}
+			s.applyDocTypeFieldRound60(errItem, r, spec.Type)
+			docsOut = append(docsOut, errItem)
 			continue
 		}
 		hit, found := prefetched[idxName][spec.ID]
@@ -6392,9 +6847,8 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 			rawSpecVT = spec.MetaVersionType
 		}
 		if vStatus, vErrType, vErrReason := validateReadDocVersionParams(rawSpecVer, rawSpecVT, spec.ID, found, hit.Version); vStatus != 0 {
-			docsOut = append(docsOut, map[string]any{
+			errItem := map[string]any{
 				"_index": idxName,
-				"_type":  "_doc",
 				"_id":    spec.ID,
 				"error": map[string]any{
 					"root_cause": []map[string]any{
@@ -6404,27 +6858,34 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 					"reason": vErrReason,
 					"index":  idxName,
 				},
-			})
+			}
+			s.applyDocTypeFieldRound60(errItem, r, spec.Type)
+			docsOut = append(docsOut, errItem)
 			continue
 		}
 		if !found {
-			docsOut = append(docsOut, map[string]any{
+			if st := s.getOrCreateIndexLiveStats(idxName); st != nil {
+				st.getTotal.Add(1)
+				st.getMissingTotal.Add(1)
+			}
+			nfItem := map[string]any{
 				"_index": idxName,
-				"_type":  "_doc",
 				"_id":    spec.ID,
 				"found":  false,
-			})
+			}
+			s.applyDocTypeFieldRound60(nfItem, r, spec.Type)
+			docsOut = append(docsOut, nfItem)
 			continue
 		}
 		docItem := map[string]any{
 			"_index":        idxName,
-			"_type":         "_doc",
 			"_id":           hit.ID,
 			"_version":      hit.Version,
-			"_seq_no":       hit.Version,
+			"_seq_no":       s.getDocSeqNo(idxName, hit.ID, hit.Version),
 			"_primary_term": 1,
 			"found":         true,
 		}
+		s.applyDocTypeFieldRound60(docItem, r, spec.Type)
 		if rt := s.getDocRouting(idxName, hit.ID); rt != "" {
 			docItem["_routing"] = rt
 			hit.Routing = rt
@@ -6460,9 +6921,8 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 		}
 		if isIndexSourceDisabledRound59(idxSchema) && effSF != nil && !effSF.Disabled {
 			errReason := fmt.Sprintf("unable to fetch fields from _source field: _source is disabled in the mappings for index [%s]", idxName)
-			docsOut = append(docsOut, map[string]any{
+			errItem := map[string]any{
 				"_index": idxName,
-				"_type":  "_doc",
 				"_id":    spec.ID,
 				"error": map[string]any{
 					"root_cause": []map[string]any{
@@ -6472,8 +6932,14 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 					"reason": errReason,
 					"index":  idxName,
 				},
-			})
+			}
+			s.applyDocTypeFieldRound60(errItem, r, spec.Type)
+			docsOut = append(docsOut, errItem)
 			continue
+		}
+		if st := s.getOrCreateIndexLiveStats(idxName); st != nil {
+			st.getTotal.Add(1)
+			st.getExistsTotal.Add(1)
 		}
 		if (effSF == nil || !effSF.Disabled) && (!hasStoredNone || effSF != nil) {
 			if filteredSrc, ok := filterDocumentSourceRound59(hit.Source, idxSchema, effSF); ok {
@@ -6491,7 +6957,18 @@ func (s *Server) handleMGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
+	syncRefresh, immediateForced, refreshErr := parseAndValidateRefreshParamRound60(r)
+	if refreshErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", refreshErr.Error())
+		return
+	}
 	rawReqIndex := r.PathValue("index")
+	if isTruthyBoolQueryParam(r, "require_alias") {
+		if st, et, er := s.validateRequireAliasForWriteRound60(r.Context(), rawReqIndex); st != 0 {
+			writeESError(w, st, et, er)
+			return
+		}
+	}
 	if s.isDataStream(rawReqIndex) {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "only write ops with an op_type of create are allowed in data streams")
 		return
@@ -6541,40 +7018,46 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 		s.docMatchesRequestRouting(indexName, docID, effRouting) &&
 		(aliasFilter == nil || s.docMatchesAliasFilter(r.Context(), indexName, docID, existingHit.EffectiveSource(), aliasFilter))
 	var curVer int64
+	var curSeqNo int64
 	occFound := docFound
 	if docFound {
 		curVer = existingHit.Version
-	} else if strings.HasPrefix(strings.ToLower(strings.TrimSpace(verType)), "external") {
-		if existingHit != nil && existingHit.Version > 0 && existingHit.Version < 1_000_000_000_000 {
+		curSeqNo = s.getDocSeqNo(indexName, docID, existingHit.Version)
+	} else if strings.HasPrefix(verType, "external") {
+		if extTomb, hasTomb := s.getDocExternalTombstone(indexName, docID); hasTomb {
+			occFound = true
+			curVer = extTomb
+			curSeqNo = s.getDocSeqNo(indexName, docID, extTomb)
+		} else if existingHit != nil && existingHit.Version > 0 && existingHit.Version < 1_000_000_000_000 {
 			occFound = true
 			curVer = existingHit.Version
-		} else if lastVer := s.getDocVersion(indexName, docID); lastVer > 0 && lastVer < 1_000_000_000_000 {
-			occFound = true
-			curVer = lastVer
+			curSeqNo = s.getDocSeqNo(indexName, docID, existingHit.Version)
 		}
 	}
-	assignedVer, occStatus, occType, occReason := validateOCC(docID, occFound, curVer, ifSeqNo, ifPrimaryTerm, reqVer, verType)
+	assignedVer, hasAssignedVer, occStatus, occType, occReason := validateOCCWithSeqNo(docID, occFound, curVer, curSeqNo, ifSeqNo, ifPrimaryTerm, reqVer, verType)
 	if occType != "" {
 		writeESError(w, occStatus, occType, occReason)
 		return
 	}
+	_, numReplicas, _ := s.getIndexShardAndReplicaCounts(indexName)
 	if !docFound {
+		seqNo := s.allocIndexSeqNo(r.Context(), indexName)
 		notFoundVer := int64(1)
-		if assignedVer > 0 {
+		if hasAssignedVer {
 			notFoundVer = assignedVer
-			_ = s.allocVersion(assignedVer)
-			s.setDocVersion(indexName, docID, assignedVer)
+			s.recordDocDeleteMetaRound60(indexName, docID, assignedVer, seqNo, true)
 		}
 		notFoundResp := map[string]any{
-			"_index":        indexName,
-			"_type":         "_doc",
-			"_id":           docID,
-			"_version":      notFoundVer,
-			"result":        "not_found",
-			"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
-			"_seq_no":       0,
-			"_primary_term": 1,
+			"_index":         indexName,
+			"_id":            docID,
+			"_version":       notFoundVer,
+			"result":         "not_found",
+			"forced_refresh": false,
+			"_shards":        map[string]any{"total": 1 + numReplicas, "successful": 1, "failed": 0},
+			"_seq_no":        seqNo,
+			"_primary_term":  1,
 		}
+		s.applyDocTypeFieldRound60(notFoundResp, r, "")
 		if effRouting != "" {
 			notFoundResp["_routing"] = effRouting
 		}
@@ -6583,38 +7066,53 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 	}
 
 	idxSchema := s.ensureIndexSchema(r.Context(), indexName)
-	nextVer := s.allocVersion(existingHit.Version + 1)
-	if existingHit.Version > 0 && existingHit.Version < 1_000_000_000_000 {
-		nextVer = existingHit.Version + 1
+	nextVer := existingHit.Version + 1
+	if existingHit.Version < 0 {
+		nextVer = 1
 	}
-	if assignedVer > 0 && assignedVer >= existingHit.Version {
+	if hasAssignedVer {
 		nextVer = assignedVer
-		_ = s.allocVersion(assignedVer)
 	}
-	tombstoneVer := nextVer
-	tombstone, err := schema.ShredDocument(idxSchema, docID, tombstoneVer, true, nil)
-	if err != nil {
-		writeESError(w, http.StatusInternalServerError, "internal_exception", err.Error())
+	docShard := s.shardForDocRoutingRound60(indexName, docID, s.getDocRouting(indexName, docID))
+	s.recordPreMutationUnrefreshedState(indexName, docShard, docID, true, existingHit, syncRefresh)
+
+	usedPhysical, pErr := s.physicalDeleteDocs(r.Context(), idxSchema, []string{docID})
+	if pErr != nil {
+		writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", pErr.Error())
 		return
 	}
-	syncRefresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh") == "wait_for"
-	if err := s.streamLoad(r.Context(), idxSchema.DorisTable, append(tombstone, '\n'), syncRefresh); err != nil {
-		writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
-		return
+	if !usedPhysical {
+		tombstone, err := schema.ShredDocument(idxSchema, docID, nextVer, true, nil)
+		if err != nil {
+			writeESError(w, http.StatusInternalServerError, "internal_exception", err.Error())
+			return
+		}
+		if err := s.streamLoad(r.Context(), idxSchema.DorisTable, append(tombstone, '\n'), syncRefresh); err != nil {
+			writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
+			return
+		}
 	}
+	seqNo := s.allocIndexSeqNo(r.Context(), indexName)
 	s.setDocRouting(indexName, docID, "")
-	s.setDocVersion(indexName, docID, tombstoneVer)
+	s.recordDocDeleteMetaRound60(indexName, docID, nextVer, seqNo, strings.HasPrefix(verType, "external"))
 	s.queryCache.InvalidateAll()
-	delResp := map[string]any{
-		"_index":        indexName,
-		"_type":         "_doc",
-		"_id":           docID,
-		"_version":      nextVer,
-		"result":        "deleted",
-		"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
-		"_seq_no":       nextVer,
-		"_primary_term": 1,
+	if st := s.getOrCreateIndexLiveStats(indexName); st != nil {
+		st.deleteTotal.Add(1)
+		if immediateForced {
+			st.refreshTotal.Add(1)
+		}
 	}
+	delResp := map[string]any{
+		"_index":         indexName,
+		"_id":            docID,
+		"_version":       nextVer,
+		"result":         "deleted",
+		"forced_refresh": immediateForced,
+		"_shards":        map[string]any{"total": 1 + numReplicas, "successful": 1, "failed": 0},
+		"_seq_no":        seqNo,
+		"_primary_term":  1,
+	}
+	s.applyDocTypeFieldRound60(delResp, r, "")
 	if effRouting != "" {
 		delResp["_routing"] = effRouting
 	}
@@ -6624,7 +7122,7 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 func updateScriptErrorType(err error) string {
 	if err != nil {
 		msg := err.Error()
-		if strings.Contains(msg, "illegal_argument_exception") || (strings.Contains(msg, "Operation [") && strings.Contains(msg, "is not supported")) {
+		if strings.Contains(msg, "Operation [") && strings.Contains(msg, "is not supported") {
 			return "illegal_argument_exception"
 		}
 	}
@@ -6632,10 +7130,17 @@ func updateScriptErrorType(err error) string {
 }
 
 func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
-	rawReqIndex := r.PathValue("index")
-	if isTruthyBoolQueryParam(r, "require_alias") && !s.isTargetAliasOrDataStream(rawReqIndex) {
-		writeESError(w, http.StatusNotFound, "index_not_found_exception", fmt.Sprintf("no such alias [%s] (require_alias=true)", rawReqIndex))
+	syncRefresh, immediateForced, refreshErr := parseAndValidateRefreshParamRound60(r)
+	if refreshErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", refreshErr.Error())
 		return
+	}
+	rawReqIndex := r.PathValue("index")
+	if isTruthyBoolQueryParam(r, "require_alias") {
+		if st, et, er := s.validateRequireAliasForWriteRound60(r.Context(), rawReqIndex); st != 0 {
+			writeESError(w, st, et, er)
+			return
+		}
 	}
 	if s.isDataStream(rawReqIndex) {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "only write ops with an op_type of create are allowed in data streams")
@@ -6685,6 +7190,12 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: script or doc is missing;")
 		return
 	}
+	if updReq.Script != nil && (updReq.Script.Lang == "" || strings.EqualFold(strings.TrimSpace(updReq.Script.Lang), "painless")) && strings.TrimSpace(updReq.Script.Source) != "" {
+		if err := painless.CompileValidate(updReq.Script.Source); err != nil {
+			writePainlessScriptErrorRound60(w, http.StatusBadRequest, err)
+			return
+		}
+	}
 	var updBodyMeta struct {
 		Source         *esast.SourceFilter `json:"_source,omitempty"`
 		SourceIncludes any                 `json:"_source_includes,omitempty"`
@@ -6697,11 +7208,15 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	}
 	effUpdateSF = mergeMGetSourceFilter(effUpdateSF, updBodyMeta.SourceIncludes, updBodyMeta.SourceExcludes)
 
-	roSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
-	if isIndexSourceDisabledRound59(roSchema) {
-		writeESError(w, http.StatusBadRequest, "document_source_missing_exception", fmt.Sprintf("_source is disabled for [%s]", indexName))
-		return
+	hasUpsert := (updReq.DocAsUpsert && updReq.Doc != nil) || updReq.Upsert != nil || updReq.ScriptedUpsert
+	if hasUpsert {
+		if st, et, er := s.prepareAutoCreateTargetRound58(r.Context(), rawReqIndex, false); st != 0 {
+			writeESError(w, st, et, er)
+			return
+		}
 	}
+
+	roSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
 	initEffRouting := s.resolveEffectiveWriteRouting(rawReqIndex, indexName, reqRouting, "")
 	if s.isRoutingRequired(roSchema) && initEffRouting == "" && (updReq.Script == nil || !strings.Contains(updReq.Script.Source, "_routing")) {
 		writeESError(w, http.StatusBadRequest, "routing_missing_exception", fmt.Sprintf("routing is required for [%s]/[_doc]/[%s]", indexName, docID))
@@ -6718,43 +7233,40 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if found && initEffRouting != "" && !s.docMatchesRequestRouting(indexName, docID, initEffRouting) {
+	if found && !s.docMatchesRequestRouting(indexName, docID, initEffRouting) {
 		found = false
 	}
 	if found && aliasFilter != nil && (existingHit == nil || !s.docMatchesAliasFilter(r.Context(), indexName, docID, existingHit.Source, aliasFilter)) {
-		if updReq.DocAsUpsert || updReq.Upsert != nil || updReq.ScriptedUpsert {
+		if hasUpsert {
 			writeESError(w, http.StatusConflict, "version_conflict_engine_exception", fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", docID))
 			return
 		}
 		writeESError(w, http.StatusNotFound, "document_missing_exception", fmt.Sprintf("[%s]: document missing", docID))
 		return
 	}
+	if !found && !hasUpsert {
+		writeESError(w, http.StatusNotFound, "document_missing_exception", fmt.Sprintf("[%s]: document missing", docID))
+		return
+	}
+	if isIndexSourceDisabledRound59(roSchema) {
+		writeESError(w, http.StatusBadRequest, "document_source_missing_exception", fmt.Sprintf("_source is disabled for [%s]", indexName))
+		return
+	}
 	var curVer int64
+	var curSeqNo int64
 	if found && existingHit != nil {
 		curVer = existingHit.Version
+		curSeqNo = s.getDocSeqNo(indexName, docID, existingHit.Version)
 	}
-	assignedVer, occStatus, occType, occReason := validateOCC(docID, found, curVer, ifSeqNo, ifPrimaryTerm, reqVer, verType)
+	assignedVer, hasAssignedVer, occStatus, occType, occReason := validateOCCWithSeqNo(docID, found, curVer, curSeqNo, ifSeqNo, ifPrimaryTerm, reqVer, verType)
 	if occType != "" {
 		writeESError(w, occStatus, occType, occReason)
 		return
 	}
-	if !found && (!updReq.DocAsUpsert || updReq.Doc == nil) && updReq.Upsert == nil && !updReq.ScriptedUpsert {
-		writeESError(w, http.StatusNotFound, "document_missing_exception", fmt.Sprintf("[%s]: document missing", docID))
-		return
-	}
 
 	var baseSource json.RawMessage
-	var minFloor int64
 	if found {
 		baseSource = existingHit.Source
-		minFloor = existingHit.Version + 1
-	} else {
-		if existingHit != nil && existingHit.Version+1 > minFloor {
-			minFloor = existingHit.Version + 1
-		}
-		if delVer := s.getDocVersion(indexName, docID); delVer > 0 && delVer < 1_000_000_000_000 && delVer+1 > minFloor {
-			minFloor = delVer + 1
-		}
 	}
 	updReq.MetaID = docID
 	updReq.MetaIndex = indexName
@@ -6767,8 +7279,22 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	} else {
 		updReq.MetaVersion = 1
 	}
+	if found && updReq.Script != nil {
+		scCopy := *updReq.Script
+		nextParams := make(map[string]any, len(scCopy.Params)+1)
+		for k, v := range scCopy.Params {
+			nextParams[k] = v
+		}
+		nextParams["__disallow_update_create_op"] = true
+		scCopy.Params = nextParams
+		updReq.Script = &scCopy
+	}
 	mutatedSource, opResult, err := painless.ApplyUpdateWithResult(baseSource, &updReq, found)
 	if err != nil {
+		if errors.Is(err, painless.ErrSelfReferencingIterable) {
+			writePainlessScriptErrorRound60(w, http.StatusBadRequest, err)
+			return
+		}
 		writeESError(w, http.StatusBadRequest, updateScriptErrorType(err), err.Error())
 		return
 	}
@@ -6782,6 +7308,7 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var nextVersion int64
+	var opSeqNo int64
 	var pipeRouting string
 	scriptRouting := strings.TrimSpace(updReq.MetaRouting)
 	effRouting := s.resolveEffectiveWriteRouting(rawReqIndex, indexName, scriptRouting, "")
@@ -6822,6 +7349,8 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 		origDocID := docID
 		effRawIndex := rawReqIndex
 		hadPipeRouting := false
+		var destExisting *HitRow
+		var destWasExisting bool
 		if !isDelete && len(mutatedSource) > 0 {
 			hadPipeRouting = true
 			pipeInputIdx := rawReqIndex
@@ -6843,19 +7372,23 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 			}
 			if dropped {
 				dropVer := int64(1)
-				if found && existingHit.Version > 0 {
+				dropSeq := int64(0)
+				if found && existingHit != nil && existingHit.Version > 0 {
 					dropVer = existingHit.Version
+					dropSeq = s.getDocSeqNo(indexName, docID, existingHit.Version)
 				}
+				_, numReplicas, _ := s.getIndexShardAndReplicaCounts(indexName)
 				dropResp := map[string]any{
-					"_index":        indexName,
-					"_type":         "_doc",
-					"_id":           docID,
-					"_version":      dropVer,
-					"result":        "noop",
-					"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
-					"_seq_no":       dropVer,
-					"_primary_term": 1,
+					"_index":         indexName,
+					"_id":            docID,
+					"_version":       dropVer,
+					"result":         "noop",
+					"forced_refresh": false,
+					"_shards":        map[string]any{"total": 1 + numReplicas, "successful": 1, "failed": 0},
+					"_seq_no":        dropSeq,
+					"_primary_term":  1,
 				}
+				s.applyDocTypeFieldRound60(dropResp, r, "")
 				var dropSrc json.RawMessage
 				if found && existingHit != nil {
 					dropSrc = existingHit.Source
@@ -6887,12 +7420,8 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 						writeESError(w, http.StatusConflict, "version_conflict_engine_exception", fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", docID))
 						return
 					}
-					if destHit.Version+1 > minFloor {
-						minFloor = destHit.Version + 1
-					}
-				}
-				if delVer := s.getDocVersion(indexName, docID); delVer > 0 && delVer < 1_000_000_000_000 && delVer+1 > minFloor {
-					minFloor = delVer + 1
+					destExisting = destHit
+					destWasExisting = destFound
 				}
 			}
 			mutatedSource = pipedDoc
@@ -6906,14 +7435,6 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
 				fmt.Sprintf("updated document [%s] does not match alias filter for [%s]", docID, r.PathValue("index")))
 			return
-		}
-		nextVersion = s.allocVersion(minFloor)
-		if minFloor > 0 && minFloor < 1_000_000_000_000 {
-			nextVersion = minFloor
-		}
-		if assignedVer > 0 {
-			nextVersion = assignedVer
-			_ = s.allocVersion(assignedVer)
 		}
 		var sampleDocs []json.RawMessage
 		if !isDelete && len(mutatedSource) > 0 {
@@ -6931,47 +7452,107 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 		if effRouting == "" && found && updReq.Script == nil && !hadPipeRouting {
 			effRouting = s.getDocRouting(origIndex, origDocID)
 		}
-		shredded, err := schema.ShredDocument(idxSchema, docID, nextVersion, isDelete, mutatedSource)
-		if err != nil {
-			writeESError(w, http.StatusBadRequest, shredErrorType(err), err.Error())
-			return
-		}
-		syncRefresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh") == "wait_for"
-		payload := append(shredded, '\n')
-		var clearOrigRouting bool
-		var origTombVer int64
-		if found && !isDelete && (docID != origDocID || indexName != origIndex) {
-			origSchema := s.ensureIndexSchema(r.Context(), origIndex)
-			origTombVer = s.allocVersion(existingHit.Version + 1)
-			if existingHit.Version > 0 && existingHit.Version < 1_000_000_000_000 {
-				origTombVer = existingHit.Version + 1
+
+		rerouted := docID != origDocID || indexName != origIndex
+		if hasAssignedVer {
+			nextVersion = assignedVer
+		} else if rerouted {
+			if destWasExisting && destExisting != nil {
+				nextVersion = destExisting.Version + 1
+			} else {
+				_, _ = s.physicalDeleteDocs(r.Context(), idxSchema, []string{docID})
+				nextVersion = 1
 			}
-			if tombShredded, tErr := schema.ShredDocument(origSchema, origDocID, origTombVer, true, nil); tErr == nil {
-				if origSchema.DorisTable == idxSchema.DorisTable {
-					payload = append(append(tombShredded, '\n'), payload...)
-				} else if err := s.streamLoad(r.Context(), origSchema.DorisTable, append(tombShredded, '\n'), syncRefresh); err != nil {
+		} else if found && existingHit != nil {
+			if existingHit.Version < 0 {
+				nextVersion = 1
+			} else {
+				nextVersion = existingHit.Version + 1
+			}
+		} else {
+			if usedPhys, _ := s.physicalDeleteDocs(r.Context(), idxSchema, []string{docID}); usedPhys || existingHit == nil {
+				nextVersion = 1
+			} else if existingHit.Version > 0 {
+				nextVersion = existingHit.Version + 1
+			} else {
+				nextVersion = 1
+			}
+		}
+
+		docShard := s.shardForDocRoutingRound60(indexName, docID, effRouting)
+		if rerouted {
+			s.recordPreMutationUnrefreshedState(indexName, docShard, docID, destWasExisting, destExisting, syncRefresh)
+		} else {
+			s.recordPreMutationUnrefreshedState(indexName, docShard, docID, found, existingHit, syncRefresh)
+		}
+
+		if found && !isDelete && rerouted {
+			origSchema := s.ensureIndexSchema(r.Context(), origIndex)
+			origShard := s.shardForDocRoutingRound60(origIndex, origDocID, s.getDocRouting(origIndex, origDocID))
+			s.recordPreMutationUnrefreshedState(origIndex, origShard, origDocID, true, existingHit, syncRefresh)
+			origTombVer := existingHit.Version + 1
+			origSeq := s.allocIndexSeqNo(r.Context(), origIndex)
+			if usedOrigPhys, _ := s.physicalDeleteDocs(r.Context(), origSchema, []string{origDocID}); !usedOrigPhys {
+				if tombShredded, tErr := schema.ShredDocument(origSchema, origDocID, origTombVer, true, nil); tErr == nil {
+					if err := s.streamLoad(r.Context(), origSchema.DorisTable, append(tombShredded, '\n'), syncRefresh); err != nil {
+						s.queryCache.InvalidateAll()
+						writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
+						return
+					}
+				}
+			}
+			s.setDocRouting(origIndex, origDocID, "")
+			s.recordDocDeleteMetaRound60(origIndex, origDocID, origTombVer, origSeq, false)
+		}
+
+		if isDelete {
+			usedPhys, pErr := s.physicalDeleteDocs(r.Context(), idxSchema, []string{docID})
+			if pErr != nil {
+				writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", pErr.Error())
+				return
+			}
+			if !usedPhys {
+				shredded, err := schema.ShredDocument(idxSchema, docID, nextVersion, true, nil)
+				if err != nil {
+					writeESError(w, http.StatusBadRequest, shredErrorType(err), err.Error())
+					return
+				}
+				if err := s.streamLoad(r.Context(), idxSchema.DorisTable, append(shredded, '\n'), syncRefresh); err != nil {
 					s.queryCache.InvalidateAll()
 					writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
 					return
 				}
 			}
-			clearOrigRouting = true
-		}
-		if err := s.streamLoad(r.Context(), idxSchema.DorisTable, payload, syncRefresh); err != nil {
-			s.queryCache.InvalidateAll()
-			writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
-			return
-		}
-		if clearOrigRouting {
-			s.setDocRouting(origIndex, origDocID, "")
-			s.setDocVersion(origIndex, origDocID, origTombVer)
-		}
-		if isDelete {
+			opSeqNo = s.allocIndexSeqNo(r.Context(), indexName)
 			s.setDocRouting(indexName, docID, "")
+			s.recordDocDeleteMetaRound60(indexName, docID, nextVersion, opSeqNo, false)
+			if st := s.getOrCreateIndexLiveStats(indexName); st != nil {
+				st.deleteTotal.Add(1)
+				if immediateForced {
+					st.refreshTotal.Add(1)
+				}
+			}
 		} else {
+			shredded, err := schema.ShredDocument(idxSchema, docID, nextVersion, false, mutatedSource)
+			if err != nil {
+				writeESError(w, http.StatusBadRequest, shredErrorType(err), err.Error())
+				return
+			}
+			if err := s.streamLoad(r.Context(), idxSchema.DorisTable, append(shredded, '\n'), syncRefresh); err != nil {
+				s.queryCache.InvalidateAll()
+				writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
+				return
+			}
+			opSeqNo = s.allocIndexSeqNo(r.Context(), indexName)
 			s.setDocRouting(indexName, docID, effRouting)
+			s.recordDocWriteMetaRound60(indexName, docID, nextVersion, opSeqNo)
+			if st := s.getOrCreateIndexLiveStats(indexName); st != nil {
+				st.indexTotal.Add(1)
+				if immediateForced {
+					st.refreshTotal.Add(1)
+				}
+			}
 		}
-		s.setDocVersion(indexName, docID, nextVersion)
 		s.queryCache.InvalidateAll()
 	} else {
 		if s.isRoutingRequired(roSchema) && effRouting == "" {
@@ -6981,6 +7562,9 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 		if effRouting == "" && found {
 			effRouting = s.getDocRouting(indexName, docID)
 		}
+		if st := s.getOrCreateIndexLiveStats(indexName); st != nil {
+			st.noopUpdateTotal.Add(1)
+		}
 	}
 
 	status := http.StatusOK
@@ -6988,23 +7572,28 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusCreated
 	}
 	reportedVer := nextVersion
+	reportedSeq := opSeqNo
 	if opResult == "noop" {
 		if found && existingHit != nil && existingHit.Version > 0 {
 			reportedVer = existingHit.Version
+			reportedSeq = s.getDocSeqNo(indexName, docID, existingHit.Version)
 		} else {
 			reportedVer = 1
+			reportedSeq = 0
 		}
 	}
+	_, numReplicas, _ := s.getIndexShardAndReplicaCounts(indexName)
 	respPayload := map[string]any{
-		"_index":        indexName,
-		"_type":         "_doc",
-		"_id":           docID,
-		"_version":      reportedVer,
-		"result":        opResult,
-		"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
-		"_seq_no":       reportedVer,
-		"_primary_term": 1,
+		"_index":         indexName,
+		"_id":            docID,
+		"_version":       reportedVer,
+		"result":         opResult,
+		"forced_refresh": immediateForced && opResult != "noop",
+		"_shards":        map[string]any{"total": 1 + numReplicas, "successful": 1, "failed": 0},
+		"_seq_no":        reportedSeq,
+		"_primary_term":  1,
 	}
+	s.applyDocTypeFieldRound60(respPayload, r, "")
 	if effRouting != "" {
 		respPayload["_routing"] = effRouting
 	}
@@ -7012,6 +7601,10 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
 		hasDoc := (found || opResult == "created" || opResult == "updated") && len(mutatedSource) > 0
 		if hasDoc || (!found && opResult == "noop") {
 			if getObj := s.buildUpdateGetResultRound59(r.Context(), indexName, docID, effRouting, reportedVer, mutatedSource, hasDoc, effUpdateSF, updFieldSpecs); getObj != nil {
+				s.applyDocTypeFieldRound60(getObj, r, "")
+				if found || opResult == "created" || opResult == "updated" {
+					getObj["_seq_no"] = reportedSeq
+				}
 				respPayload["get"] = getObj
 			}
 		}
@@ -7031,7 +7624,7 @@ func parseAndValidateSliceParams(r *http.Request, bodySlices any, bodySlice *sli
 			n, err := strconv.Atoi(slicesQuery)
 			if err != nil || n <= 0 {
 				return 0, 0, false, http.StatusBadRequest, "illegal_argument_exception",
-					fmt.Sprintf("slices must be a positive integer or \"auto\" but was [%s]", slicesQuery)
+					fmt.Sprintf("[slices] must be a positive integer or the string \"auto\" but was [%s]", slicesQuery)
 			}
 		}
 	} else if bodySlices != nil {
@@ -7042,14 +7635,14 @@ func parseAndValidateSliceParams(r *http.Request, bodySlices any, bodySlice *sli
 				n, err := strconv.Atoi(s)
 				if err != nil || n <= 0 {
 					return 0, 0, false, http.StatusBadRequest, "illegal_argument_exception",
-						fmt.Sprintf("slices must be a positive integer or \"auto\" but was [%s]", s)
+						fmt.Sprintf("[slices] must be a positive integer or the string \"auto\" but was [%s]", s)
 				}
 			}
 		default:
 			fv, ok := toFloat64(v)
 			if !ok || fv <= 0 || fv != math.Trunc(fv) {
 				return 0, 0, false, http.StatusBadRequest, "illegal_argument_exception",
-					fmt.Sprintf("slices must be a positive integer or \"auto\" but was [%v]", v)
+					fmt.Sprintf("[slices] must be a positive integer or the string \"auto\" but was [%v]", v)
 			}
 		}
 	}
@@ -7098,46 +7691,18 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	start := time.Now()
-	rawIndex := r.PathValue("index")
-	ew := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("expand_wildcards")))
-	if (ew == "none" || ew == "closed") && (strings.ContainsAny(rawIndex, "*?") || rawIndex == "_all") {
-		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
+	origBodyBytes, ok := readRequestBody(w, r)
+	if !ok {
 		return
 	}
-	if closedIdx := s.findClosedTargetIndex(r, rawIndex); closedIdx != "" {
-		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
+	syncRefresh, _, refreshErr := parseAndValidateRefreshParamRound60(r)
+	if refreshErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", refreshErr.Error())
 		return
 	}
-	var targets []string
-	var aliasFilters map[string]*esast.Query
-	if s.hasAuthoritativeIndexCatalog() {
-		var ok bool
-		targets, aliasFilters, ok = s.resolveValidatedReadTargets(w, r, rawIndex)
-		if !ok {
-			return
-		}
-	} else {
-		targets, aliasFilters = s.resolveTargetIndicesWithFilters(rawIndex)
-		if len(targets) == 0 && strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("allow_no_indices")), "false") {
-			writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
-			return
-		}
-		if len(targets) == 0 && !hasExclusionOrWildcard(rawIndex) {
-			targets = []string{s.resolveIndexName(rawIndex)}
-		}
-	}
-	for _, idx := range targets {
-		if s.isIndexClosed(idx) {
-			writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", idx))
-			return
-		}
-	}
-	if _, reason := s.findReadBlockedTargetIndex(r, rawIndex); reason != "" {
-		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
-		return
-	}
-	if _, reason := s.findWriteBlockedTargetIndex(targets); reason != "" {
-		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+	reqsPerSec, slicesCount, waitForCompletion, pfSt, pfET, pfER := validateByQueryPreflightRound60(r, origBodyBytes, false)
+	if pfSt != 0 {
+		writeESError(w, pfSt, pfET, pfER)
 		return
 	}
 
@@ -7152,27 +7717,12 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 		Query             *esast.Query         `json:"query,omitempty"`
 		Script            *painless.ScriptSpec `json:"script,omitempty"`
 	}
-	bodyBytes, ok := readRequestBody(w, r)
-	if !ok {
-		return
-	}
-	bodyBytes = s.rewriteSearchBodyQueryRules(bodyBytes)
+	bodyBytes := s.rewriteSearchBodyQueryRules(origBodyBytes)
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
 		if err := json.Unmarshal(bodyBytes, &body); err != nil {
 			writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
 			return
 		}
-		if missingID := s.findMissingStoredScriptInRawBody(bodyBytes); missingID != "" {
-			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("cannot execute stored script [%s] because it does not exist", missingID))
-			return
-		}
-		if body.Query != nil {
-			if missingID := s.validateStoredScriptsInQuery(body.Query); missingID != "" {
-				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("cannot execute stored script [%s] because it does not exist", missingID))
-				return
-			}
-		}
-		s.resolvePainlessScriptSpecFromRaw(&body.Script, bodyBytes)
 	}
 	sliceID, sliceMax, hasSlice, sliceErrStatus, sliceErrType, sliceErrReason := parseAndValidateSliceParams(r, body.Slices, body.Slice)
 	if sliceErrStatus != 0 {
@@ -7191,7 +7741,6 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 		}
 		body.Query = tmpReq.Query
 	}
-
 	effConflicts := strings.TrimSpace(r.URL.Query().Get("conflicts"))
 	if effConflicts == "" {
 		effConflicts = strings.TrimSpace(body.Conflicts)
@@ -7201,25 +7750,89 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("Invalid conflicts value [%s], must be [abort] or [proceed]", effConflicts))
 		return
 	}
-	reqsPerSec := float64(-1)
-	if rpsQuery := strings.TrimSpace(r.URL.Query().Get("requests_per_second")); rpsQuery != "" {
-		if !strings.EqualFold(rpsQuery, "infinity") {
-			if v, err := strconv.ParseFloat(rpsQuery, 64); err == nil {
-				if v == 0 {
-					reqsPerSec = -1
-				} else {
-					reqsPerSec = v
-				}
+
+	rawIndex := r.PathValue("index")
+	lookupIndex := rawIndex
+	if lookupIndex == "" {
+		lookupIndex = "*"
+	}
+	ew := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("expand_wildcards")))
+	if (ew == "none" || ew == "closed") && (strings.ContainsAny(lookupIndex, "*?") || lookupIndex == "_all") {
+		allowNoIndices := !r.URL.Query().Has("allow_no_indices") || isTruthyBoolQueryParam(r, "allow_no_indices")
+		if !allowNoIndices {
+			writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
+			return
+		}
+	}
+	if closedIdx := s.findClosedTargetIndex(r, lookupIndex); closedIdx != "" {
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
+		return
+	}
+	var targets []string
+	var aliasFilters map[string]*esast.Query
+	if s.hasAuthoritativeIndexCatalog() {
+		var resolvedOK bool
+		targets, aliasFilters, resolvedOK = s.resolveValidatedReadTargets(w, r, lookupIndex)
+		if !resolvedOK {
+			return
+		}
+	} else {
+		targets, aliasFilters = s.resolveTargetIndicesWithFilters(lookupIndex)
+		if len(targets) == 0 && strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("allow_no_indices")), "false") {
+			writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
+			return
+		}
+		if len(targets) == 0 && !hasExclusionOrWildcard(lookupIndex) {
+			targets = []string{s.resolveIndexName(lookupIndex)}
+		}
+	}
+	for _, idx := range targets {
+		if s.isIndexClosed(idx) {
+			writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", idx))
+			return
+		}
+	}
+	if _, reason := s.findReadBlockedTargetIndex(r, lookupIndex); reason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
+	if _, reason := s.findWriteBlockedTargetIndex(targets); reason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
+	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		if missingID := s.findMissingStoredScriptInRawBody(bodyBytes); missingID != "" {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("cannot execute stored script [%s] because it does not exist", missingID))
+			return
+		}
+		if body.Query != nil {
+			if missingID := s.validateStoredScriptsInQuery(body.Query); missingID != "" {
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("cannot execute stored script [%s] because it does not exist", missingID))
+				return
 			}
 		}
-	} else if body.RequestsPerSecond != nil {
-		if fv, ok := toFloat64(body.RequestsPerSecond); ok {
-			if fv == 0 {
-				reqsPerSec = -1
-			} else {
-				reqsPerSec = fv
+		s.resolvePainlessScriptSpecFromRaw(&body.Script, bodyBytes)
+		if body.Script != nil && (body.Script.Lang == "" || strings.EqualFold(strings.TrimSpace(body.Script.Lang), "painless")) && strings.TrimSpace(body.Script.Source) != "" {
+			if err := painless.CompileValidate(body.Script.Source); err != nil {
+				writePainlessScriptErrorRound60(w, http.StatusBadRequest, err)
+				return
 			}
 		}
+		if body.Query != nil {
+			if err := validateQueryScriptsCompileRound60(body.Query); err != nil {
+				writeESError(w, http.StatusBadRequest, "search_phase_execution_exception", err.Error())
+				return
+			}
+		}
+	}
+
+	if !waitForCompletion {
+		descIdx := rawIndex
+		if descIdx == "" {
+			descIdx = "_all"
+		}
+		s.launchAsyncTaskRound60(w, r, origBodyBytes, "indices:data/write/update/byquery", fmt.Sprintf("update-by-query [%s]", descIdx), reqsPerSec, s.handleUpdateByQuery)
+		return
 	}
 
 	maxDocs := 0
@@ -7245,6 +7858,9 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 	versionConflicts := 0
 	batches := 0
 	conflictsProceed := strings.EqualFold(effConflicts, "proceed")
+	_, hasPhysDel := s.backend.(DorisPhysicalDeleteBackend)
+	touchedIndices := make(map[string]bool)
+
 	if body.Query != nil {
 		if missingID := s.validateStoredScriptsInQuery(body.Query); missingID != "" {
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("cannot execute stored script [%s] because it does not exist", missingID))
@@ -7314,6 +7930,10 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			batches++
+			if err := applyTaskThrottleAndProgressRound60(r.Context(), len(hits), reqsPerSec); err != nil {
+				writeESError(w, http.StatusInternalServerError, "task_cancelled_exception", err.Error())
+				return
+			}
 
 			type pendingUpdate struct {
 				id                string
@@ -7325,6 +7945,7 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 				isDel             bool
 				source            json.RawMessage
 				routing           string
+				origHit           HitRow
 			}
 			var pending []pendingUpdate
 			sampleDocsByIdx := make(map[string][]json.RawMessage)
@@ -7359,6 +7980,7 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 				if docInitRouting == "" && !strings.Contains(urlRouting, ",") {
 					docInitRouting = urlRouting
 				}
+				h.Routing = docInitRouting
 				updItem := &painless.UpdateRequest{
 					Script:      body.Script,
 					MetaID:      h.ID,
@@ -7401,6 +8023,9 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 						}
 						if dropped {
 							totalNoops++
+							if st := s.getOrCreateIndexLiveStats(indexName); st != nil {
+								st.noopUpdateTotal.Add(1)
+							}
 							continue
 						}
 						hadPipe = true
@@ -7430,6 +8055,9 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 				}
 				if opRes == "noop" {
 					totalNoops++
+					if st := s.getOrCreateIndexLiveStats(indexName); st != nil {
+						st.noopUpdateTotal.Add(1)
+					}
 					continue
 				}
 				effRouting := s.resolveEffectiveWriteRouting(effRawIdx, targetIdx, "", pipeRouting)
@@ -7465,6 +8093,7 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 					isDel:             isDel,
 					source:            mutated,
 					routing:           effRouting,
+					origHit:           h,
 				})
 			}
 
@@ -7500,36 +8129,52 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 					}
 					return buf
 				}
+				physDelByIdx := make(map[string][]string)
 				writtenInBatch := make(map[string]bool, len(pending))
 				lastVerInBatch := make(map[string]int64, len(pending))
 				for _, pu := range pending {
+					destExisted := pu.oldID == ""
+					var destPrevHit *HitRow
 					minVer := pu.version + 1
-					targetKey := pu.targetIndex + "\x00" + pu.id
-					if prevBatchVer, okBV := lastVerInBatch[targetKey]; okBV && prevBatchVer+1 > minVer {
-						minVer = prevBatchVer + 1
+					if pu.oldID != "" {
+						minVer = 1
 					}
-					if exMap := existingByIdx[pu.targetIndex]; exMap != nil {
-						if exDoc, exists := exMap[pu.id]; exists {
-							if pu.oldID != "" && pu.targetAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), pu.targetIndex, pu.id, exDoc.Source, pu.targetAliasFilter) {
-								if conflictsProceed {
-									versionConflicts++
-									continue
+					targetKey := pu.targetIndex + "\x00" + pu.id
+					if prevBatchVer, okBV := lastVerInBatch[targetKey]; okBV {
+						destExisted = writtenInBatch[targetKey]
+						if destExisted && prevBatchVer+1 > minVer {
+							minVer = prevBatchVer + 1
+						}
+					} else if pu.oldID != "" {
+						if exMap := existingByIdx[pu.targetIndex]; exMap != nil {
+							if exDoc, exists := exMap[pu.id]; exists {
+								if pu.targetAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), pu.targetIndex, pu.id, exDoc.Source, pu.targetAliasFilter) {
+									if conflictsProceed {
+										versionConflicts++
+										continue
+									}
+									writeESError(w, http.StatusConflict, "version_conflict_engine_exception",
+										fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", pu.id))
+									return
 								}
-								writeESError(w, http.StatusConflict, "version_conflict_engine_exception",
-									fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", pu.id))
-								return
-							}
-							if exDoc.Version+1 > minVer {
+								destExisted = true
+								cp := exDoc
+								destPrevHit = &cp
 								minVer = exDoc.Version + 1
-							}
-						} else if destSch := schemasByIdx[pu.targetIndex]; destSch != nil {
-							if destHit, _, dErr := s.backend.GetDocByID(r.Context(), destSch.DorisDB, destSch.DorisTable, pu.id); dErr == nil && destHit != nil && destHit.Version+1 > minVer {
-								minVer = destHit.Version + 1
+							} else if destSch := schemasByIdx[pu.targetIndex]; destSch != nil {
+								if destHit, dFound, dErr := s.backend.GetDocByID(r.Context(), destSch.DorisDB, destSch.DorisTable, pu.id); dErr == nil && dFound && destHit != nil {
+									destExisted = true
+									destPrevHit = destHit
+									minVer = destHit.Version + 1
+								}
 							}
 						}
+					} else {
+						cp := pu.origHit
+						destPrevHit = &cp
 					}
-					if delVer := s.getDocVersion(pu.targetIndex, pu.id); delVer > 0 && delVer < 1_000_000_000_000 && delVer+1 > minVer {
-						minVer = delVer + 1
+					if minVer <= 0 {
+						minVer = 1
 					}
 					if pu.oldID != "" {
 						oldKey := pu.oldIndex + "\x00" + pu.oldID
@@ -7538,21 +8183,33 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 							if oldSch == nil {
 								oldSch = idxSchema
 							}
-							tombVer := s.allocVersion(pu.version + 1)
-							if pu.version > 0 && pu.version < 1_000_000_000_000 {
-								tombVer = pu.version + 1
+							tombVer := pu.version + 1
+							if tombVer <= 0 {
+								tombVer = 1
 							}
-							tombShredded, err := schema.ShredDocument(oldSch, pu.oldID, tombVer, true, nil)
-							if err != nil {
-								writeESError(w, http.StatusBadRequest, shredErrorType(err), err.Error())
-								return
+							oldShard := s.shardForDocRoutingRound60(pu.oldIndex, pu.oldID, pu.origHit.Routing)
+							origCopy := pu.origHit
+							s.recordPreMutationUnrefreshedState(pu.oldIndex, oldShard, pu.oldID, true, &origCopy, syncRefresh)
+							if hasPhysDel {
+								physDelByIdx[pu.oldIndex] = append(physDelByIdx[pu.oldIndex], pu.oldID)
+							} else {
+								tombShredded, err := schema.ShredDocument(oldSch, pu.oldID, tombVer, true, nil)
+								if err != nil {
+									writeESError(w, http.StatusBadRequest, shredErrorType(err), err.Error())
+									return
+								}
+								tBuf := getTableBuf(oldSch.DorisTable)
+								tBuf.Write(tombShredded)
+								tBuf.WriteByte('\n')
 							}
-							tBuf := getTableBuf(oldSch.DorisTable)
-							tBuf.Write(tombShredded)
-							tBuf.WriteByte('\n')
-							lastVerInBatch[oldKey] = tombVer
+							tombSeq := s.allocIndexSeqNo(r.Context(), pu.oldIndex)
 							s.setDocRouting(pu.oldIndex, pu.oldID, "")
-							s.setDocVersion(pu.oldIndex, pu.oldID, tombVer)
+							s.recordDocDeleteMetaRound60(pu.oldIndex, pu.oldID, tombVer, tombSeq, false)
+							if st := s.getOrCreateIndexLiveStats(pu.oldIndex); st != nil {
+								st.deleteTotal.Add(1)
+							}
+							touchedIndices[pu.oldIndex] = true
+							delete(lastVerInBatch, oldKey)
 							if exMap := existingByIdx[pu.oldIndex]; exMap != nil {
 								delete(exMap, pu.oldID)
 							}
@@ -7568,38 +8225,82 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 							fmt.Sprintf("routing is required for [%s]/[%s]", pu.targetIndex, pu.id))
 						return
 					}
-					nextVer := s.allocVersion(minVer)
-					if minVer > 0 && minVer < 1_000_000_000_000 {
-						nextVer = minVer
-					}
-					shredded, err := schema.ShredDocument(tSch, pu.id, nextVer, pu.isDel, pu.source)
-					if err != nil {
-						writeESError(w, http.StatusBadRequest, shredErrorType(err), err.Error())
-						return
-					}
-					buf := getTableBuf(tSch.DorisTable)
-					buf.Write(shredded)
-					buf.WriteByte('\n')
-					lastVerInBatch[targetKey] = nextVer
-					s.setDocVersion(pu.targetIndex, pu.id, nextVer)
+					nextVer := minVer
+					targetShard := s.shardForDocRoutingRound60(pu.targetIndex, pu.id, pu.routing)
+					s.recordPreMutationUnrefreshedState(pu.targetIndex, targetShard, pu.id, destExisted, destPrevHit, syncRefresh)
+					touchedIndices[pu.targetIndex] = true
+					seqNo := s.allocIndexSeqNo(r.Context(), pu.targetIndex)
 					if pu.isDel {
+						if hasPhysDel {
+							physDelByIdx[pu.targetIndex] = append(physDelByIdx[pu.targetIndex], pu.id)
+						} else {
+							shredded, err := schema.ShredDocument(tSch, pu.id, nextVer, true, nil)
+							if err != nil {
+								writeESError(w, http.StatusBadRequest, shredErrorType(err), err.Error())
+								return
+							}
+							buf := getTableBuf(tSch.DorisTable)
+							buf.Write(shredded)
+							buf.WriteByte('\n')
+						}
 						writtenInBatch[targetKey] = false
+						delete(lastVerInBatch, targetKey)
 						s.setDocRouting(pu.targetIndex, pu.id, "")
+						s.recordDocDeleteMetaRound60(pu.targetIndex, pu.id, nextVer, seqNo, false)
+						if st := s.getOrCreateIndexLiveStats(pu.targetIndex); st != nil {
+							st.deleteTotal.Add(1)
+						}
 						if exMap := existingByIdx[pu.targetIndex]; exMap != nil {
 							delete(exMap, pu.id)
 						}
 						totalDeleted++
 					} else {
+						shredded, err := schema.ShredDocument(tSch, pu.id, nextVer, false, pu.source)
+						if err != nil {
+							writeESError(w, http.StatusBadRequest, shredErrorType(err), err.Error())
+							return
+						}
+						buf := getTableBuf(tSch.DorisTable)
+						buf.Write(shredded)
+						buf.WriteByte('\n')
+						lastVerInBatch[targetKey] = nextVer
 						writtenInBatch[targetKey] = true
 						s.setDocRouting(pu.targetIndex, pu.id, pu.routing)
+						s.recordDocWriteMetaRound60(pu.targetIndex, pu.id, nextVer, seqNo)
+						if st := s.getOrCreateIndexLiveStats(pu.targetIndex); st != nil {
+							st.indexTotal.Add(1)
+						}
 						if existingByIdx[pu.targetIndex] == nil {
 							existingByIdx[pu.targetIndex] = make(map[string]HitRow)
 						}
-						existingByIdx[pu.targetIndex][pu.id] = HitRow{ID: pu.id, Version: nextVer, Source: pu.source, Routing: pu.routing}
+						existingByIdx[pu.targetIndex][pu.id] = HitRow{ID: pu.id, Version: nextVer, SeqNo: seqNo, HasSeqNo: true, Source: pu.source, Routing: pu.routing}
 						totalUpdated++
 					}
 				}
 
+				for delIdx, delIDs := range physDelByIdx {
+					if len(delIDs) == 0 {
+						continue
+					}
+					dSch := schemasByIdx[delIdx]
+					if dSch == nil {
+						dSch = s.ensureIndexSchema(r.Context(), delIdx)
+					}
+					var finalDelIDs []string
+					for _, id := range delIDs {
+						if !writtenInBatch[delIdx+"\x00"+id] {
+							finalDelIDs = append(finalDelIDs, id)
+						} else {
+							_, _ = s.physicalDeleteDocs(r.Context(), dSch, []string{id})
+						}
+					}
+					if len(finalDelIDs) > 0 {
+						if _, err := s.physicalDeleteDocs(r.Context(), dSch, finalDelIDs); err != nil {
+							writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
+							return
+						}
+					}
+				}
 				for _, tbl := range tableOrder {
 					buf := batchBufByTable[tbl]
 					if buf != nil && buf.Len() > 0 {
@@ -7610,6 +8311,17 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
+			if entry := taskFromContextRound60(r.Context()); entry != nil {
+				entry.mu.Lock()
+				entry.total = totalMatched
+				entry.updated = totalUpdated
+				entry.deleted = totalDeleted
+				entry.batches = batches
+				entry.versionConflicts = versionConflicts
+				entry.noops = totalNoops
+				reqsPerSec = entry.requestsPerSec
+				entry.mu.Unlock()
+			}
 			searchAfter = []any{hits[len(hits)-1].ID}
 			if len(hits) < fetchSize || (maxDocs > 0 && totalMatched >= maxDocs) {
 				break
@@ -7617,11 +8329,18 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if syncRefresh {
+		for idx := range touchedIndices {
+			s.refreshAllIndexShardsRound60(idx)
+		}
+	}
+	s.queryCache.InvalidateAll()
+
 	tookMs := time.Since(start).Milliseconds()
 	if tookMs <= 0 {
 		tookMs = 1
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"took":                   tookMs,
 		"timed_out":              false,
 		"total":                  totalMatched,
@@ -7635,7 +8354,11 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 		"requests_per_second":    reqsPerSec,
 		"throttled_until_millis": 0,
 		"failures":               []any{},
-	})
+	}
+	if slicesCount > 1 {
+		resp["slices"] = buildByQuerySlicesBreakdown(slicesCount, totalMatched, totalUpdated, 0, totalDeleted, versionConflicts, totalNoops, batches, reqsPerSec)
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
@@ -7644,46 +8367,18 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	start := time.Now()
-	rawIndex := r.PathValue("index")
-	ew := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("expand_wildcards")))
-	if (ew == "none" || ew == "closed") && (strings.ContainsAny(rawIndex, "*?") || rawIndex == "_all") {
-		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
+	origBodyBytes, ok := readRequestBody(w, r)
+	if !ok {
 		return
 	}
-	if closedIdx := s.findClosedTargetIndex(r, rawIndex); closedIdx != "" {
-		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
+	syncRefresh, _, refreshErr := parseAndValidateRefreshParamRound60(r)
+	if refreshErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", refreshErr.Error())
 		return
 	}
-	var targets []string
-	var aliasFilters map[string]*esast.Query
-	if s.hasAuthoritativeIndexCatalog() {
-		var ok bool
-		targets, aliasFilters, ok = s.resolveValidatedReadTargets(w, r, rawIndex)
-		if !ok {
-			return
-		}
-	} else {
-		targets, aliasFilters = s.resolveTargetIndicesWithFilters(rawIndex)
-		if len(targets) == 0 && strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("allow_no_indices")), "false") {
-			writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
-			return
-		}
-		if len(targets) == 0 && !hasExclusionOrWildcard(rawIndex) {
-			targets = []string{s.resolveIndexName(rawIndex)}
-		}
-	}
-	for _, idx := range targets {
-		if s.isIndexClosed(idx) {
-			writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", idx))
-			return
-		}
-	}
-	if _, reason := s.findReadBlockedTargetIndex(r, rawIndex); reason != "" {
-		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
-		return
-	}
-	if _, reason := s.findWriteBlockedTargetIndex(targets); reason != "" {
-		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+	reqsPerSec, slicesCount, waitForCompletion, pfSt, pfET, pfER := validateByQueryPreflightRound60(r, origBodyBytes, true)
+	if pfSt != 0 {
+		writeESError(w, pfSt, pfET, pfER)
 		return
 	}
 
@@ -7696,11 +8391,7 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 		Slice             *sliceSpec   `json:"slice,omitempty"`
 		Query             *esast.Query `json:"query,omitempty"`
 	}
-	bodyBytes, ok := readRequestBody(w, r)
-	if !ok {
-		return
-	}
-	bodyBytes = s.rewriteSearchBodyQueryRules(bodyBytes)
+	bodyBytes := s.rewriteSearchBodyQueryRules(origBodyBytes)
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
 		if err := json.Unmarshal(bodyBytes, &body); err != nil {
 			writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
@@ -7724,7 +8415,6 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 		}
 		body.Query = tmpReq.Query
 	}
-
 	effConflicts := strings.TrimSpace(r.URL.Query().Get("conflicts"))
 	if effConflicts == "" {
 		effConflicts = strings.TrimSpace(body.Conflicts)
@@ -7734,25 +8424,70 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("Invalid conflicts value [%s], must be [abort] or [proceed]", effConflicts))
 		return
 	}
-	reqsPerSec := float64(-1)
-	if rpsQuery := strings.TrimSpace(r.URL.Query().Get("requests_per_second")); rpsQuery != "" {
-		if !strings.EqualFold(rpsQuery, "infinity") {
-			if v, err := strconv.ParseFloat(rpsQuery, 64); err == nil {
-				if v == 0 {
-					reqsPerSec = -1
-				} else {
-					reqsPerSec = v
-				}
-			}
+
+	rawIndex := r.PathValue("index")
+	lookupIndex := rawIndex
+	if lookupIndex == "" {
+		lookupIndex = "*"
+	}
+	ew := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("expand_wildcards")))
+	if (ew == "none" || ew == "closed") && (strings.ContainsAny(lookupIndex, "*?") || lookupIndex == "_all") {
+		allowNoIndices := !r.URL.Query().Has("allow_no_indices") || isTruthyBoolQueryParam(r, "allow_no_indices")
+		if !allowNoIndices {
+			writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
+			return
 		}
-	} else if body.RequestsPerSecond != nil {
-		if fv, ok := toFloat64(body.RequestsPerSecond); ok {
-			if fv == 0 {
-				reqsPerSec = -1
-			} else {
-				reqsPerSec = fv
-			}
+	}
+	if closedIdx := s.findClosedTargetIndex(r, lookupIndex); closedIdx != "" {
+		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
+		return
+	}
+	var targets []string
+	var aliasFilters map[string]*esast.Query
+	if s.hasAuthoritativeIndexCatalog() {
+		var resolvedOK bool
+		targets, aliasFilters, resolvedOK = s.resolveValidatedReadTargets(w, r, lookupIndex)
+		if !resolvedOK {
+			return
 		}
+	} else {
+		targets, aliasFilters = s.resolveTargetIndicesWithFilters(lookupIndex)
+		if len(targets) == 0 && strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("allow_no_indices")), "false") {
+			writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
+			return
+		}
+		if len(targets) == 0 && !hasExclusionOrWildcard(lookupIndex) {
+			targets = []string{s.resolveIndexName(lookupIndex)}
+		}
+	}
+	for _, idx := range targets {
+		if s.isIndexClosed(idx) {
+			writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", idx))
+			return
+		}
+	}
+	if _, reason := s.findReadBlockedTargetIndex(r, lookupIndex); reason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
+	if _, reason := s.findWriteBlockedTargetIndex(targets); reason != "" {
+		writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
+		return
+	}
+	if body.Query != nil {
+		if missingID := s.validateStoredScriptsInQuery(body.Query); missingID != "" {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("cannot execute stored script [%s] because it does not exist", missingID))
+			return
+		}
+	}
+
+	if !waitForCompletion {
+		descIdx := rawIndex
+		if descIdx == "" {
+			descIdx = "_all"
+		}
+		s.launchAsyncTaskRound60(w, r, origBodyBytes, "indices:data/write/delete/byquery", fmt.Sprintf("delete-by-query [%s]", descIdx), reqsPerSec, s.handleDeleteByQuery)
+		return
 	}
 
 	maxDocs := 0
@@ -7773,11 +8508,10 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 
 	totalDeleted := 0
 	batches := 0
+	_, hasPhysDel := s.backend.(DorisPhysicalDeleteBackend)
+	touchedIndices := make(map[string]bool)
+
 	if body.Query != nil {
-		if missingID := s.validateStoredScriptsInQuery(body.Query); missingID != "" {
-			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("cannot execute stored script [%s] because it does not exist", missingID))
-			return
-		}
 		s.resolveStoredScriptsInQuery(body.Query)
 		if hasTermsLookupInQuery(body.Query) {
 			s.resolveTermsLookupsInQuery(r.Context(), body.Query)
@@ -7840,8 +8574,13 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			batches++
+			if err := applyTaskThrottleAndProgressRound60(r.Context(), len(hits), reqsPerSec); err != nil {
+				writeESError(w, http.StatusInternalServerError, "task_cancelled_exception", err.Error())
+				return
+			}
 
 			var batchBuf bytes.Buffer
+			var physDelIDs []string
 			schemaEnsured := false
 			for _, h := range hits {
 				if maxDocs > 0 && totalDeleted >= maxDocs {
@@ -7872,25 +8611,53 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 					idxSchema = s.ensureIndexSchema(r.Context(), indexName)
 					schemaEnsured = true
 				}
-				nextVer := s.allocVersion(h.Version + 1)
-				if h.Version > 0 && h.Version < 1_000_000_000_000 {
-					nextVer = h.Version + 1
+				docRt := s.getDocRouting(indexName, h.ID)
+				h.Routing = docRt
+				shard := s.shardForDocRoutingRound60(indexName, h.ID, docRt)
+				hCopy := h
+				s.recordPreMutationUnrefreshedState(indexName, shard, h.ID, true, &hCopy, syncRefresh)
+				touchedIndices[indexName] = true
+				nextVer := h.Version + 1
+				if nextVer <= 0 {
+					nextVer = 1
 				}
-				tombstone, err := schema.ShredDocument(idxSchema, h.ID, nextVer, true, nil)
-				if err != nil {
-					continue
+				if hasPhysDel {
+					physDelIDs = append(physDelIDs, h.ID)
+				} else {
+					tombstone, err := schema.ShredDocument(idxSchema, h.ID, nextVer, true, nil)
+					if err != nil {
+						continue
+					}
+					batchBuf.Write(tombstone)
+					batchBuf.WriteByte('\n')
 				}
-				batchBuf.Write(tombstone)
-				batchBuf.WriteByte('\n')
+				seqNo := s.allocIndexSeqNo(r.Context(), indexName)
 				s.setDocRouting(indexName, h.ID, "")
-				s.setDocVersion(indexName, h.ID, nextVer)
+				s.recordDocDeleteMetaRound60(indexName, h.ID, nextVer, seqNo, false)
+				if st := s.getOrCreateIndexLiveStats(indexName); st != nil {
+					st.deleteTotal.Add(1)
+				}
 				totalDeleted++
+			}
+			if len(physDelIDs) > 0 {
+				if _, err := s.physicalDeleteDocs(r.Context(), idxSchema, physDelIDs); err != nil {
+					writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
+					return
+				}
 			}
 			if batchBuf.Len() > 0 {
 				if err := s.streamLoad(r.Context(), idxSchema.DorisTable, batchBuf.Bytes(), true); err != nil {
 					writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
 					return
 				}
+			}
+			if entry := taskFromContextRound60(r.Context()); entry != nil {
+				entry.mu.Lock()
+				entry.total = totalDeleted
+				entry.deleted = totalDeleted
+				entry.batches = batches
+				reqsPerSec = entry.requestsPerSec
+				entry.mu.Unlock()
 			}
 			searchAfter = []any{hits[len(hits)-1].ID}
 			if len(hits) < fetchSize || (maxDocs > 0 && totalDeleted >= maxDocs) {
@@ -7899,11 +8666,18 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if syncRefresh {
+		for idx := range touchedIndices {
+			s.refreshAllIndexShardsRound60(idx)
+		}
+	}
+	s.queryCache.InvalidateAll()
+
 	tookMs := time.Since(start).Milliseconds()
 	if tookMs <= 0 {
 		tookMs = 1
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"took":                   tookMs,
 		"timed_out":              false,
 		"total":                  totalDeleted,
@@ -7916,13 +8690,41 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 		"requests_per_second":    reqsPerSec,
 		"throttled_until_millis": 0,
 		"failures":               []any{},
-	})
+	}
+	if slicesCount > 1 {
+		resp["slices"] = buildByQuerySlicesBreakdown(slicesCount, totalDeleted, 0, 0, totalDeleted, 0, 0, batches, reqsPerSec)
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	syncRefresh, immediateForced, refreshErr := parseAndValidateRefreshParamRound60(r)
+	if refreshErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", refreshErr.Error())
+		return
+	}
 	rawDefaultIndex := r.PathValue("index")
-	ops, err := esast.ParseBulkNDJSON(r.Body, rawDefaultIndex)
+	var rawBulkBytes []byte
+	if r.Body != nil {
+		var rErr error
+		rawBulkBytes, rErr = io.ReadAll(r.Body)
+		if rErr != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(rErr, &maxBytesErr) {
+				writeESError(w, http.StatusRequestEntityTooLarge, "circuit_breaking_exception", "bulk request body exceeded max allowed size: "+rErr.Error())
+				return
+			}
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", rErr.Error())
+			return
+		}
+	}
+	normBulkBytes, metaInfos, bStatus, bErrType, bErrReason := preprocessBulkNDJSONRound60(rawBulkBytes)
+	if bStatus != 0 {
+		writeESError(w, bStatus, bErrType, bErrReason)
+		return
+	}
+	ops, err := esast.ParseBulkNDJSON(bytes.NewReader(normBulkBytes), rawDefaultIndex)
 	if err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
@@ -7932,19 +8734,10 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", err.Error())
 		return
 	}
-	if rawDefaultIndex != "" {
-		usesDefaultIndex := len(ops) == 0
-		for _, op := range ops {
-			if op.Index == rawDefaultIndex {
-				usesDefaultIndex = true
-				break
-			}
-		}
-		if usesDefaultIndex {
-			if _, err := s.resolveWriteIndex(rawDefaultIndex); err != nil {
-				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
-				return
-			}
+	if len(ops) == 0 && rawDefaultIndex != "" {
+		if _, err := s.resolveWriteIndex(rawDefaultIndex); err != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+			return
 		}
 	}
 	for _, op := range ops {
@@ -7956,6 +8749,11 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 
 	defaultPipeline := r.URL.Query().Get("pipeline")
 	urlRouting := r.URL.Query().Get("routing")
+	listExecutedPipelines := isTruthyBoolQueryParam(r, "list_executed_pipelines")
+	var ingestDur time.Duration
+	hasAnyIngestPipeline := false
+	executedPipelinesByOp := make([][]string, len(ops))
+
 	droppedOps := make([]bool, len(ops))
 	pipeErrs := make([]string, len(ops))
 	opErrStatus := make([]int, len(ops))
@@ -7970,6 +8768,9 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 	for idx := range ops {
 		op := &ops[idx]
 		origOpIndices[idx] = op.Index
+		if idx < len(metaInfos) && (metaInfos[idx].missingID || metaInfos[idx].explicitEmptyID) {
+			continue
+		}
 		if op.ParseErr != "" {
 			continue
 		}
@@ -8005,7 +8806,13 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			if op.AutoGeneratedID {
 				pipeInputID = ""
 			}
-			piped, nextIdx, nextID, nextRouting, dropped, pipeErr := s.applyEffectiveAndFinalPipelinesWithRouting(origOpIndex, pipeInputID, op.Pipeline, defaultPipeline, initOpRouting, op.Source)
+			pStart := time.Now()
+			piped, nextIdx, nextID, nextRouting, dropped, execPipes, pipeErr := s.applyEffectiveAndFinalPipelinesWithRoutingAndExecuted(origOpIndex, pipeInputID, op.Pipeline, defaultPipeline, initOpRouting, op.Source)
+			if len(execPipes) > 0 || pipeErr != nil {
+				ingestDur += time.Since(pStart)
+				hasAnyIngestPipeline = true
+			}
+			executedPipelinesByOp[idx] = execPipes
 			if pipeErr != nil {
 				pipeErrs[idx] = pipeErr.Error()
 				continue
@@ -8065,27 +8872,28 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 	}
 	existingByIndex := make(map[string]map[string]HitRow, len(idsToFetchByIndex))
 	initialExistingByIndex := make(map[string]map[string]HitRow, len(idsToFetchByIndex))
-	lastVerByIndex := make(map[string]map[string]int64, len(idsToFetchByIndex))
+	extTombstoneByIndex := make(map[string]map[string]int64, len(idsToFetchByIndex))
 	for idxName, ids := range idsToFetchByIndex {
 		idxSchema := s.getOrCompileReadOnlySchema(r.Context(), idxName)
 		_ = s.coalescer.FlushTable(r.Context(), idxSchema.DorisTable)
+		tombMap := make(map[string]int64)
+		for _, id := range ids {
+			if extVer, hasExt := s.getDocExternalTombstone(idxName, id); hasExt {
+				tombMap[id] = extVer
+			}
+		}
+		extTombstoneByIndex[idxName] = tombMap
 		if m, err := s.backend.GetDocsByIDs(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, ids); err == nil {
-			existingByIndex[idxName] = m
 			initCopy := make(map[string]HitRow, len(m))
-			verMap := make(map[string]int64, len(ids))
 			for id, hr := range m {
+				hr.Routing = s.getDocRouting(idxName, id)
+				hr.SeqNo = s.getDocSeqNo(idxName, id, hr.Version)
+				hr.HasSeqNo = true
+				m[id] = hr
 				initCopy[id] = hr
-				verMap[id] = hr.Version
 			}
-			for _, id := range ids {
-				if _, ok := verMap[id]; !ok {
-					if delVer := s.getDocVersion(idxName, id); delVer > 0 && delVer < 1_000_000_000_000 {
-						verMap[id] = delVer
-					}
-				}
-			}
+			existingByIndex[idxName] = m
 			initialExistingByIndex[idxName] = initCopy
-			lastVerByIndex[idxName] = verMap
 		}
 	}
 
@@ -8095,8 +8903,37 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		deleted bool
 		source  json.RawMessage
 	}
-	byIndex := make(map[string]*bytes.Buffer)
-	pendingRowsByTable := make(map[string][]pendingBulkRow)
+	type pendingDocMetaOp struct {
+		indexName  string
+		docID      string
+		ver        int64
+		seqNo      int64
+		deleted    bool
+		isExternal bool
+	}
+	schemaByTable := make(map[string]*schema.IndexSchema)
+	finalRowByTableAndID := make(map[string]map[string]pendingBulkRow)
+	rowOrderByTable := make(map[string][]string)
+	physDeleteByTable := make(map[string]map[string]bool)
+	var pendingMetaOps []pendingDocMetaOp
+	recordTableRow := func(sc *schema.IndexSchema, row pendingBulkRow, needsPhysDel bool) {
+		tbl := sc.DorisTable
+		schemaByTable[tbl] = sc
+		if finalRowByTableAndID[tbl] == nil {
+			finalRowByTableAndID[tbl] = make(map[string]pendingBulkRow)
+		}
+		if _, seen := finalRowByTableAndID[tbl][row.id]; !seen {
+			rowOrderByTable[tbl] = append(rowOrderByTable[tbl], row.id)
+		}
+		finalRowByTableAndID[tbl][row.id] = row
+		if needsPhysDel || row.deleted {
+			if physDeleteByTable[tbl] == nil {
+				physDeleteByTable[tbl] = make(map[string]bool)
+			}
+			physDeleteByTable[tbl][row.id] = true
+		}
+	}
+
 	pendingRouting := make(map[string]map[string]string)
 	setPendingRouting := func(idxName, docID, rVal string) {
 		if idxName == "" || docID == "" {
@@ -8116,11 +8953,25 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		return s.getDocRouting(idxName, docID)
 	}
 	docMatchesBulkRouting := func(idxName, docID, reqRt string) bool {
+		numShards, _, _ := s.getIndexShardAndReplicaCounts(idxName)
+		storedRt := getPendingOrStoredRouting(idxName, docID)
+		if numShards > 1 {
+			docShard := s.shardForDocRoutingRound60(idxName, docID, storedRt)
+			reqTrim := strings.TrimSpace(reqRt)
+			if reqTrim == "" {
+				return s.shardForDocRoutingRound60(idxName, docID, "") == docShard
+			}
+			for _, part := range strings.Split(reqTrim, ",") {
+				if s.shardForDocRoutingRound60(idxName, docID, strings.TrimSpace(part)) == docShard {
+					return true
+				}
+			}
+			return false
+		}
 		reqRt = strings.TrimSpace(reqRt)
 		if reqRt == "" {
 			return true
 		}
-		storedRt := getPendingOrStoredRouting(idxName, docID)
 		if storedRt == "" {
 			storedRt = docID
 		}
@@ -8132,48 +8983,75 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		return false
 	}
 	urlRequireAlias := isTruthyBoolQueryParam(r, "require_alias")
-	writtenInBatch := make(map[string]bool, len(ops))
+	deletedInBatch := make(map[string]bool, len(ops))
 	reroutedToInBatch := make(map[string]bool, len(ops))
+	refreshedIndicesInBatch := make(map[string]bool)
 	var items []map[string]any
 	hasErrors := false
 
 	for opIdx, op := range ops {
+		docType := ""
+		if opIdx < len(metaInfos) {
+			docType = metaInfos[opIdx].docType
+		}
+		appendBulkErrItem := func(idxStr string, idVal any, status int, eType, eReason string) {
+			hasErrors = true
+			itemMap := map[string]any{
+				"_index": idxStr,
+				"_id":    idVal,
+				"status": status,
+				"error": map[string]any{
+					"type":   eType,
+					"reason": eReason,
+				},
+			}
+			s.applyDocTypeFieldRound60(itemMap, r, docType)
+			items = append(items, map[string]any{op.Action: itemMap})
+		}
+		appendBulkSuccessItem := func(itemMap map[string]any, isDelete bool) {
+			s.applyDocTypeFieldRound60(itemMap, r, docType)
+			if listExecutedPipelines && !isDelete {
+				execList := executedPipelinesByOp[opIdx]
+				if execList == nil {
+					execList = []string{}
+				}
+				itemMap["executed_pipelines"] = execList
+			}
+			items = append(items, map[string]any{op.Action: itemMap})
+		}
+
 		origOpIdx := origOpIndices[opIdx]
 		if origOpIdx == "" {
 			origOpIdx = op.Index
+		}
+		if opIdx < len(metaInfos) {
+			if metaInfos[opIdx].missingID {
+				appendBulkErrItem(origOpIdx, nil, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: id is missing;")
+				continue
+			}
+			if metaInfos[opIdx].explicitEmptyID {
+				appendBulkErrItem(origOpIdx, "", http.StatusBadRequest, "illegal_argument_exception", "if _id is specified it must not be empty")
+				continue
+			}
 		}
 		reqAlias := urlRequireAlias
 		if op.RequireAlias != nil {
 			reqAlias = *op.RequireAlias
 		}
-		if reqAlias && !s.isTargetAliasOrDataStream(origOpIdx) {
-			hasErrors = true
-			items = append(items, map[string]any{
-				op.Action: map[string]any{
-					"_index": origOpIdx,
-					"_id":    op.ID,
-					"status": http.StatusNotFound,
-					"error": map[string]any{
-						"type":   "index_not_found_exception",
-						"reason": fmt.Sprintf("no such alias [%s] (require_alias=true)", origOpIdx),
-					},
-				},
-			})
-			continue
+		if reqAlias {
+			if st, et, er := s.validateRequireAliasForWriteRound60(r.Context(), origOpIdx); st != 0 {
+				appendBulkErrItem(origOpIdx, op.ID, st, et, er)
+				continue
+			}
 		}
 		if opErrStatus[opIdx] != 0 {
-			hasErrors = true
-			items = append(items, map[string]any{
-				op.Action: map[string]any{
-					"_index": op.Index,
-					"_id":    op.ID,
-					"status": opErrStatus[opIdx],
-					"error": map[string]any{
-						"type":   opErrType[opIdx],
-						"reason": opErrReason[opIdx],
-					},
-				},
-			})
+			appendBulkErrItem(op.Index, op.ID, opErrStatus[opIdx], opErrType[opIdx], opErrReason[opIdx])
+			continue
+		}
+		vtLower := strings.ToLower(strings.TrimSpace(op.VersionType))
+		if op.Action == "create" && strings.HasPrefix(vtLower, "external") {
+			appendBulkErrItem(op.Index, op.ID, http.StatusBadRequest, "action_request_validation_exception",
+				fmt.Sprintf("Validation Failed: 1: cannot use version_type [%s] with op_type [create];", op.VersionType))
 			continue
 		}
 		targetIndex, opAliasFilter, writeErr := s.resolveWriteIndexWithFilter(op.Index)
@@ -8181,36 +9059,17 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			targetIndex = op.Index
 		} else {
 			if s.isIndexClosed(targetIndex) {
-				hasErrors = true
-				items = append(items, map[string]any{
-					op.Action: map[string]any{
-						"_index": targetIndex,
-						"_id":    op.ID,
-						"status": http.StatusBadRequest,
-						"error": map[string]any{
-							"type":   "index_closed_exception",
-							"reason": fmt.Sprintf("closed [%s]", targetIndex),
-						},
-					},
-				})
+				appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", targetIndex))
 				continue
 			}
 			if blocked, reason := s.isIndexWriteBlocked(targetIndex); blocked {
-				hasErrors = true
-				items = append(items, map[string]any{
-					op.Action: map[string]any{
-						"_index": targetIndex,
-						"_id":    op.ID,
-						"status": http.StatusForbidden,
-						"error": map[string]any{
-							"type":   "cluster_block_exception",
-							"reason": reason,
-						},
-					},
-				})
+				appendBulkErrItem(targetIndex, op.ID, http.StatusForbidden, "cluster_block_exception", reason)
 				continue
 			}
 		}
+		_, numReplicas, _ := s.getIndexShardAndReplicaCounts(targetIndex)
+		shardsMeta := map[string]any{"total": 1 + numReplicas, "successful": 1, "failed": 0}
+
 		reqRouting := op.Routing
 		if reqRouting == "" {
 			reqRouting = urlRouting
@@ -8226,52 +9085,38 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			effRouting = s.resolveEffectiveWriteRouting(origOpIdx, targetIndex, reqRouting, pipeRoutings[opIdx])
 		}
 		if pipeErrs[opIdx] != "" {
-			hasErrors = true
-			items = append(items, map[string]any{
-				op.Action: map[string]any{
-					"_index": targetIndex,
-					"_id":    op.ID,
-					"status": http.StatusBadRequest,
-					"error":  map[string]any{"type": ingestErrorType(errors.New(pipeErrs[opIdx])), "reason": pipeErrs[opIdx]},
-				},
-			})
+			appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, ingestErrorType(errors.New(pipeErrs[opIdx])), pipeErrs[opIdx])
 			continue
 		}
 		if op.ParseErr != "" {
-			hasErrors = true
 			errType := "mapper_parsing_exception"
 			if writeErr != nil {
 				errType = "illegal_argument_exception"
 			}
-			items = append(items, map[string]any{
-				op.Action: map[string]any{
-					"_index": targetIndex,
-					"_id":    op.ID,
-					"status": http.StatusBadRequest,
-					"error":  map[string]any{"type": errType, "reason": op.ParseErr},
-				},
-			})
+			appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, errType, op.ParseErr)
+			continue
+		}
+		if writeErr != nil {
+			appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, "illegal_argument_exception", writeErr.Error())
 			continue
 		}
 
 		if droppedOps[opIdx] {
 			dropItem := map[string]any{
-				"_index":        targetIndex,
-				"_type":         "_doc",
-				"_id":           op.ID,
-				"_version":      -1,
-				"result":        "noop",
-				"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
-				"_seq_no":       -1,
-				"_primary_term": 1,
-				"status":        http.StatusOK,
+				"_index":         targetIndex,
+				"_id":            op.ID,
+				"_version":       -1,
+				"result":         "noop",
+				"forced_refresh": false,
+				"_shards":        shardsMeta,
+				"_seq_no":        -1,
+				"_primary_term":  1,
+				"status":         http.StatusOK,
 			}
 			if effRouting != "" {
 				dropItem["_routing"] = effRouting
 			}
-			items = append(items, map[string]any{
-				op.Action: dropItem,
-			})
+			appendBulkSuccessItem(dropItem, false)
 			continue
 		}
 
@@ -8284,104 +9129,68 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if s.isRoutingRequired(roSchema) && effRouting == "" && !canDeferUpdateRouting {
-			hasErrors = true
-			items = append(items, map[string]any{
-				op.Action: map[string]any{
-					"_index": targetIndex,
-					"_id":    op.ID,
-					"status": http.StatusBadRequest,
-					"error": map[string]any{
-						"type":   "routing_missing_exception",
-						"reason": fmt.Sprintf("routing is required for [%s]/[_doc]/[%s]", targetIndex, op.ID),
-					},
-				},
-			})
+			appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, "routing_missing_exception", fmt.Sprintf("routing is required for [%s]/[_doc]/[%s]", targetIndex, op.ID))
 			continue
 		}
 
 		if op.Action == "create" {
 			if _, exists := existingByIndex[targetIndex][op.ID]; exists {
-				hasErrors = true
-				items = append(items, map[string]any{
-					op.Action: map[string]any{
-						"_index": targetIndex,
-						"_id":    op.ID,
-						"status": http.StatusConflict,
-						"error":  map[string]any{"type": "version_conflict_engine_exception", "reason": fmt.Sprintf("[%s]: version conflict, document already exists", op.ID)},
-					},
-				})
+				appendBulkErrItem(targetIndex, op.ID, http.StatusConflict, "version_conflict_engine_exception", fmt.Sprintf("[%s]: version conflict, document already exists", op.ID))
 				continue
 			}
 		}
 
 		existingBeforeOp, wasExistingBeforeOp := existingByIndex[targetIndex][op.ID]
-		if (op.Action == "delete" || op.Action == "update") && wasExistingBeforeOp && effRouting != "" && !docMatchesBulkRouting(targetIndex, op.ID, effRouting) {
+		if (op.Action == "delete" || op.Action == "update") && wasExistingBeforeOp && !docMatchesBulkRouting(targetIndex, op.ID, effRouting) {
 			wasExistingBeforeOp = false
+		}
+		// On update without upsert, check document existence (404) BEFORE OCC (409).
+		if op.Action == "update" && len(op.Source) > 0 && !wasExistingBeforeOp {
+			var updPre painless.UpdateRequest
+			if json.Unmarshal(op.Source, &updPre) == nil {
+				docAsUpsert := updPre.DocAsUpsert
+				if op.DocAsUpsert != nil && !docAsUpsert {
+					docAsUpsert = *op.DocAsUpsert
+				}
+				if (!docAsUpsert || updPre.Doc == nil) && updPre.Upsert == nil && !updPre.ScriptedUpsert &&
+					(updPre.Doc != nil || (updPre.Script != nil && strings.TrimSpace(updPre.Script.Source) != "")) {
+					appendBulkErrItem(targetIndex, op.ID, http.StatusNotFound, "document_missing_exception", fmt.Sprintf("[%s]: document missing", op.ID))
+					continue
+				}
+			}
 		}
 		docFoundForOCC := wasExistingBeforeOp && (opAliasFilter == nil || s.docMatchesAliasFilter(r.Context(), targetIndex, op.ID, existingBeforeOp.Source, opAliasFilter))
 		var curVerForOCC int64
+		var curSeqForOCC int64
 		if docFoundForOCC {
 			curVerForOCC = existingBeforeOp.Version
-		} else if !wasExistingBeforeOp && strings.HasPrefix(strings.ToLower(strings.TrimSpace(op.VersionType)), "external") {
-			if lastVer, ok := lastVerByIndex[targetIndex][op.ID]; ok && lastVer > 0 {
+			curSeqForOCC = existingBeforeOp.SeqNo
+		} else if !wasExistingBeforeOp && strings.HasPrefix(vtLower, "external") {
+			if extVer, hasExt := extTombstoneByIndex[targetIndex][op.ID]; hasExt {
 				docFoundForOCC = true
-				curVerForOCC = lastVer
+				curVerForOCC = extVer
 			}
 		}
-		if op.Action == "update" && strings.HasPrefix(strings.ToLower(strings.TrimSpace(op.VersionType)), "external") {
-			hasErrors = true
-			items = append(items, map[string]any{
-				op.Action: map[string]any{
-					"_index": targetIndex,
-					"_id":    op.ID,
-					"status": http.StatusBadRequest,
-					"error": map[string]any{
-						"type":   "action_request_validation_exception",
-						"reason": fmt.Sprintf("Validation Failed: 1: version types [external, external_gt, external_gte] are not supported by update, got [%s];", op.VersionType),
-					},
-				},
-			})
+		if op.Action == "update" && strings.HasPrefix(vtLower, "external") {
+			appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, "action_request_validation_exception",
+				fmt.Sprintf("Validation Failed: 1: version types [external, external_gt, external_gte] are not supported by update, got [%s];", op.VersionType))
 			continue
 		}
-		assignedVer, occStatus, occType, occReason := validateOCC(op.ID, docFoundForOCC, curVerForOCC, op.IfSeqNo, op.IfPrimaryTerm, op.Version, op.VersionType)
+		assignedVer, hasAssignedVer, occStatus, occType, occReason := validateOCCWithSeqNo(op.ID, docFoundForOCC, curVerForOCC, curSeqForOCC, op.IfSeqNo, op.IfPrimaryTerm, op.Version, op.VersionType)
 		if occType != "" {
-			hasErrors = true
-			items = append(items, map[string]any{
-				op.Action: map[string]any{
-					"_index": targetIndex,
-					"_id":    op.ID,
-					"status": occStatus,
-					"error":  map[string]any{"type": occType, "reason": occReason},
-				},
-			})
+			appendBulkErrItem(targetIndex, op.ID, occStatus, occType, occReason)
 			continue
 		}
 
 		if (op.Action == "index" || op.Action == "create") && opAliasFilter != nil {
 			if op.Action == "index" {
 				if existingHit, exists := existingByIndex[targetIndex][op.ID]; exists && !s.docMatchesAliasFilter(r.Context(), targetIndex, op.ID, existingHit.Source, opAliasFilter) {
-					hasErrors = true
-					items = append(items, map[string]any{
-						op.Action: map[string]any{
-							"_index": targetIndex,
-							"_id":    op.ID,
-							"status": http.StatusConflict,
-							"error":  map[string]any{"type": "version_conflict_engine_exception", "reason": fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", op.ID)},
-						},
-					})
+					appendBulkErrItem(targetIndex, op.ID, http.StatusConflict, "version_conflict_engine_exception", fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", op.ID))
 					continue
 				}
 			}
 			if !s.docMatchesAliasFilter(r.Context(), targetIndex, op.ID, op.Source, opAliasFilter) {
-				hasErrors = true
-				items = append(items, map[string]any{
-					op.Action: map[string]any{
-						"_index": targetIndex,
-						"_id":    op.ID,
-						"status": http.StatusBadRequest,
-						"error":  map[string]any{"type": "illegal_argument_exception", "reason": fmt.Sprintf("document [%s] does not match alias filter for write alias [%s]", op.ID, op.Index)},
-					},
-				})
+				appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("document [%s] does not match alias filter for write alias [%s]", op.ID, op.Index))
 				continue
 			}
 		}
@@ -8395,75 +9204,60 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 					found = true
 				}
 			}
-			if found && effRouting != "" && !docMatchesBulkRouting(targetIndex, op.ID, effRouting) {
+			if found && !docMatchesBulkRouting(targetIndex, op.ID, effRouting) {
 				found = false
 			}
 			if !found || (opAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), targetIndex, op.ID, existingHit.Source, opAliasFilter)) {
 				nfVer := int64(1)
-				if assignedVer > 0 {
+				nfSeq := int64(0)
+				if hasAssignedVer {
 					nfVer = assignedVer
-					_ = s.allocVersion(assignedVer)
-					if lastVerByIndex[targetIndex] == nil {
-						lastVerByIndex[targetIndex] = make(map[string]int64)
+					nfSeq = s.allocIndexSeqNo(r.Context(), targetIndex)
+					if extTombstoneByIndex[targetIndex] == nil {
+						extTombstoneByIndex[targetIndex] = make(map[string]int64)
 					}
-					lastVerByIndex[targetIndex][op.ID] = assignedVer
-					s.setDocVersion(targetIndex, op.ID, assignedVer)
+					extTombstoneByIndex[targetIndex][op.ID] = assignedVer
+					pendingMetaOps = append(pendingMetaOps, pendingDocMetaOp{
+						indexName:  targetIndex,
+						docID:      op.ID,
+						ver:        assignedVer,
+						seqNo:      nfSeq,
+						deleted:    true,
+						isExternal: true,
+					})
 				}
 				nfItem := map[string]any{
-					"_index":        targetIndex,
-					"_type":         "_doc",
-					"_id":           op.ID,
-					"_version":      nfVer,
-					"result":        "not_found",
-					"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
-					"_seq_no":       0,
-					"_primary_term": 1,
-					"status":        http.StatusNotFound,
+					"_index":         targetIndex,
+					"_id":            op.ID,
+					"_version":       nfVer,
+					"result":         "not_found",
+					"forced_refresh": false,
+					"_shards":        shardsMeta,
+					"_seq_no":        nfSeq,
+					"_primary_term":  1,
+					"status":         http.StatusNotFound,
 				}
 				if effRouting != "" {
 					nfItem["_routing"] = effRouting
 				}
-				items = append(items, map[string]any{
-					op.Action: nfItem,
-				})
+				appendBulkSuccessItem(nfItem, true)
 				continue
 			}
+			existingBeforeOp = existingHit
+			wasExistingBeforeOp = true
 		}
 		sourceToShred := op.Source
-		var minFloor int64
-		if wasExistingBeforeOp {
-			minFloor = existingBeforeOp.Version + 1
-		}
-		if lastVer, ok := lastVerByIndex[targetIndex][op.ID]; ok && lastVer+1 > minFloor {
-			minFloor = lastVer + 1
-		}
 		updateResult := ""
 		var bulkUpdateSF *esast.SourceFilter
 
 		if op.Action == "update" {
 			if isIndexSourceDisabledRound59(roSchema) {
-				hasErrors = true
-				items = append(items, map[string]any{
-					op.Action: map[string]any{
-						"_index": targetIndex,
-						"_id":    op.ID,
-						"status": http.StatusBadRequest,
-						"error":  map[string]any{"type": "document_source_missing_exception", "reason": fmt.Sprintf("_source is disabled for [%s]", targetIndex)},
-					},
-				})
+				appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, "document_source_missing_exception", fmt.Sprintf("_source is disabled for [%s]", targetIndex))
 				continue
 			}
 			var upd painless.UpdateRequest
 			if err := json.Unmarshal(op.Source, &upd); err != nil {
-				hasErrors = true
-				items = append(items, map[string]any{
-					op.Action: map[string]any{
-						"_index": targetIndex,
-						"_id":    op.ID,
-						"status": http.StatusBadRequest,
-						"error":  map[string]any{"type": "mapper_parsing_exception", "reason": err.Error()},
-					},
-				})
+				appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 				continue
 			}
 			if op.DocAsUpsert != nil && !upd.DocAsUpsert {
@@ -8474,15 +9268,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			}
 			s.resolvePainlessScriptSpecFromRaw(&upd.Script, op.Source)
 			if upd.Doc == nil && (upd.Script == nil || strings.TrimSpace(upd.Script.Source) == "") {
-				hasErrors = true
-				items = append(items, map[string]any{
-					op.Action: map[string]any{
-						"_index": targetIndex,
-						"_id":    op.ID,
-						"status": http.StatusBadRequest,
-						"error":  map[string]any{"type": "action_request_validation_exception", "reason": "Validation Failed: 1: script or doc is missing;"},
-					},
-				})
+				appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: script or doc is missing;")
 				continue
 			}
 			var updMeta struct {
@@ -8507,42 +9293,19 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 					found = true
 				}
 			}
-			if found && effRouting != "" && !docMatchesBulkRouting(targetIndex, op.ID, effRouting) {
+			if found && !docMatchesBulkRouting(targetIndex, op.ID, effRouting) {
 				found = false
 			}
 			if found && opAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), targetIndex, op.ID, existingHit.Source, opAliasFilter) {
-				hasErrors = true
 				if upd.DocAsUpsert || upd.Upsert != nil || upd.ScriptedUpsert {
-					items = append(items, map[string]any{
-						op.Action: map[string]any{
-							"_index": targetIndex,
-							"_id":    op.ID,
-							"status": http.StatusConflict,
-							"error":  map[string]any{"type": "version_conflict_engine_exception", "reason": fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", op.ID)},
-						},
-					})
+					appendBulkErrItem(targetIndex, op.ID, http.StatusConflict, "version_conflict_engine_exception", fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", op.ID))
 					continue
 				}
-				items = append(items, map[string]any{
-					op.Action: map[string]any{
-						"_index": targetIndex,
-						"_id":    op.ID,
-						"status": http.StatusNotFound,
-						"error":  map[string]any{"type": "document_missing_exception", "reason": fmt.Sprintf("[%s]: document missing", op.ID)},
-					},
-				})
+				appendBulkErrItem(targetIndex, op.ID, http.StatusNotFound, "document_missing_exception", fmt.Sprintf("[%s]: document missing", op.ID))
 				continue
 			}
 			if !found && (!upd.DocAsUpsert || upd.Doc == nil) && upd.Upsert == nil && !upd.ScriptedUpsert {
-				hasErrors = true
-				items = append(items, map[string]any{
-					op.Action: map[string]any{
-						"_index": targetIndex,
-						"_id":    op.ID,
-						"status": http.StatusNotFound,
-						"error":  map[string]any{"type": "document_missing_exception", "reason": fmt.Sprintf("[%s]: document missing", op.ID)},
-					},
-				})
+				appendBulkErrItem(targetIndex, op.ID, http.StatusNotFound, "document_missing_exception", fmt.Sprintf("[%s]: document missing", op.ID))
 				continue
 			}
 			if effRouting == "" && found {
@@ -8560,31 +9323,12 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			}
 			merged, opRes, err := painless.ApplyUpdateWithResult(baseSrc, &upd, found)
 			if err != nil {
-				hasErrors = true
-				items = append(items, map[string]any{
-					op.Action: map[string]any{
-						"_index": targetIndex,
-						"_id":    op.ID,
-						"status": http.StatusBadRequest,
-						"error":  map[string]any{"type": updateScriptErrorType(err), "reason": err.Error()},
-					},
-				})
+				appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, updateScriptErrorType(err), err.Error())
 				continue
 			}
 			effRouting = strings.TrimSpace(upd.MetaRouting)
 			if s.isRoutingRequired(roSchema) && effRouting == "" {
-				hasErrors = true
-				items = append(items, map[string]any{
-					op.Action: map[string]any{
-						"_index": targetIndex,
-						"_id":    op.ID,
-						"status": http.StatusBadRequest,
-						"error": map[string]any{
-							"type":   "routing_missing_exception",
-							"reason": fmt.Sprintf("routing is required for [%s]/[_doc]/[%s]", targetIndex, op.ID),
-						},
-					},
-				})
+				appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, "routing_missing_exception", fmt.Sprintf("routing is required for [%s]/[_doc]/[%s]", targetIndex, op.ID))
 				continue
 			}
 			if !found && opRes == "deleted" {
@@ -8592,15 +9336,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 				merged = nil
 			}
 			if found && opRes == "created" {
-				hasErrors = true
-				items = append(items, map[string]any{
-					op.Action: map[string]any{
-						"_index": targetIndex,
-						"_id":    op.ID,
-						"status": http.StatusConflict,
-						"error":  map[string]any{"type": "version_conflict_engine_exception", "reason": fmt.Sprintf("[%s]: version conflict, document already exists", op.ID)},
-					},
-				})
+				appendBulkErrItem(targetIndex, op.ID, http.StatusConflict, "version_conflict_engine_exception", fmt.Sprintf("[%s]: version conflict, document already exists", op.ID))
 				continue
 			}
 			var prePiped bool
@@ -8613,18 +9349,15 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 					pipeInputIdx = targetIndex
 				}
 				if s.resolveEffectivePipeline(pipeInputIdx, op.Pipeline, defaultPipeline) != "" || s.resolveFinalPipeline(pipeInputIdx) != "" {
+					pStart := time.Now()
 					var pipeErr error
-					prePipedDoc, preNextIdx, preNextID, preUpdPipeRouting, preDropped, pipeErr = s.applyEffectiveAndFinalPipelinesWithRouting(pipeInputIdx, op.ID, op.Pipeline, defaultPipeline, effRouting, merged)
+					var execPipes []string
+					prePipedDoc, preNextIdx, preNextID, preUpdPipeRouting, preDropped, execPipes, pipeErr = s.applyEffectiveAndFinalPipelinesWithRoutingAndExecuted(pipeInputIdx, op.ID, op.Pipeline, defaultPipeline, effRouting, merged)
+					ingestDur += time.Since(pStart)
+					hasAnyIngestPipeline = true
+					executedPipelinesByOp[opIdx] = execPipes
 					if pipeErr != nil {
-						hasErrors = true
-						items = append(items, map[string]any{
-							op.Action: map[string]any{
-								"_index": targetIndex,
-								"_id":    op.ID,
-								"status": http.StatusBadRequest,
-								"error":  map[string]any{"type": ingestErrorType(pipeErr), "reason": pipeErr.Error()},
-							},
-						})
+						appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, ingestErrorType(pipeErr), pipeErr.Error())
 						continue
 					}
 					prePiped = true
@@ -8645,17 +9378,24 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			if noopVer <= 0 {
 				noopVer = 1
 			}
+			noopSeq := existingHit.SeqNo
+			if !found {
+				noopSeq = -1
+			}
 			if opRes == "noop" {
+				if st := s.getOrCreateIndexLiveStats(targetIndex); st != nil {
+					st.noopUpdateTotal.Add(1)
+				}
 				noopEntry := map[string]any{
-					"_index":        targetIndex,
-					"_type":         "_doc",
-					"_id":           op.ID,
-					"_version":      noopVer,
-					"result":        "noop",
-					"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
-					"_seq_no":       noopVer,
-					"_primary_term": 1,
-					"status":        http.StatusOK,
+					"_index":         targetIndex,
+					"_id":            op.ID,
+					"_version":       noopVer,
+					"result":         "noop",
+					"forced_refresh": false,
+					"_shards":        shardsMeta,
+					"_seq_no":        noopSeq,
+					"_primary_term":  1,
+					"status":         http.StatusOK,
 				}
 				if effRouting != "" {
 					noopEntry["_routing"] = effRouting
@@ -8673,14 +9413,14 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 				}
-				items = append(items, map[string]any{
-					op.Action: noopEntry,
-				})
+				appendBulkSuccessItem(noopEntry, false)
 				continue
 			}
 			updateResult = opRes
 			origTargetIndex := targetIndex
 			origOpID := op.ID
+			wasExistingBeforeOp = found
+			existingBeforeOp = existingHit
 			if opRes == "deleted" {
 				deleted = true
 				sourceToShred = merged
@@ -8696,32 +9436,31 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 					if prePiped {
 						piped, nextIdx, nextID, updPipeRouting, dropped = prePipedDoc, preNextIdx, preNextID, preUpdPipeRouting, preDropped
 					} else {
+						pStart := time.Now()
 						var pipeErr error
-						piped, nextIdx, nextID, updPipeRouting, dropped, pipeErr = s.applyEffectiveAndFinalPipelinesWithRouting(pipeInputIdx, op.ID, op.Pipeline, defaultPipeline, effRouting, merged)
+						var execPipes []string
+						piped, nextIdx, nextID, updPipeRouting, dropped, execPipes, pipeErr = s.applyEffectiveAndFinalPipelinesWithRoutingAndExecuted(pipeInputIdx, op.ID, op.Pipeline, defaultPipeline, effRouting, merged)
+						if len(execPipes) > 0 || pipeErr != nil {
+							ingestDur += time.Since(pStart)
+							hasAnyIngestPipeline = true
+						}
+						executedPipelinesByOp[opIdx] = execPipes
 						if pipeErr != nil {
-							hasErrors = true
-							items = append(items, map[string]any{
-								op.Action: map[string]any{
-									"_index": targetIndex,
-									"_id":    op.ID,
-									"status": http.StatusBadRequest,
-									"error":  map[string]any{"type": ingestErrorType(pipeErr), "reason": pipeErr.Error()},
-								},
-							})
+							appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, ingestErrorType(pipeErr), pipeErr.Error())
 							continue
 						}
 					}
 					if dropped {
 						dropEntry := map[string]any{
-							"_index":        targetIndex,
-							"_type":         "_doc",
-							"_id":           op.ID,
-							"_version":      noopVer,
-							"result":        "noop",
-							"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
-							"_seq_no":       noopVer,
-							"_primary_term": 1,
-							"status":        http.StatusOK,
+							"_index":         targetIndex,
+							"_id":            op.ID,
+							"_version":       noopVer,
+							"result":         "noop",
+							"forced_refresh": false,
+							"_shards":        shardsMeta,
+							"_seq_no":        noopSeq,
+							"_primary_term":  1,
+							"status":         http.StatusOK,
 						}
 						if effRouting != "" {
 							dropEntry["_routing"] = effRouting
@@ -8739,9 +9478,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 								}
 							}
 						}
-						items = append(items, map[string]any{
-							op.Action: dropEntry,
-						})
+						appendBulkSuccessItem(dropEntry, false)
 						continue
 					}
 					if nextID != "" {
@@ -8751,20 +9488,14 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 					if nextIdx != "" && nextIdx != pipeInputIdx {
 						resolvedIdx, resolvedFilter, rErr := s.resolveWriteIndexWithFilter(nextIdx)
 						if rErr != nil {
-							hasErrors = true
-							items = append(items, map[string]any{
-								op.Action: map[string]any{
-									"_index": nextIdx,
-									"_id":    op.ID,
-									"status": http.StatusBadRequest,
-									"error":  map[string]any{"type": "illegal_argument_exception", "reason": rErr.Error()},
-								},
-							})
+							appendBulkErrItem(nextIdx, op.ID, http.StatusBadRequest, "illegal_argument_exception", rErr.Error())
 							continue
 						}
 						targetIndex = resolvedIdx
 						opAliasFilter = resolvedFilter
 						effRawUpdIdx = nextIdx
+						_, numReplicas, _ = s.getIndexShardAndReplicaCounts(targetIndex)
+						shardsMeta = map[string]any{"total": 1 + numReplicas, "successful": 1, "failed": 0}
 					}
 					effRouting = s.resolveEffectiveWriteRouting(effRawUpdIdx, targetIndex, "", updPipeRouting)
 					if op.ID != origOpID || targetIndex != origTargetIndex {
@@ -8774,50 +9505,26 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 						if destExisting, destOK := existingByIndex[targetIndex][op.ID]; destOK {
 							hasDest = true
 							destSrc = destExisting.Source
-							if destExisting.Version+1 > minFloor {
-								minFloor = destExisting.Version + 1
-							}
-						} else if destHit, destFound, dErr := s.backend.GetDocByID(r.Context(), roDestSchema.DorisDB, roDestSchema.DorisTable, op.ID); dErr == nil && destHit != nil {
-							if destFound {
-								hasDest = true
-								destSrc = destHit.Source
-							}
-							if destHit.Version+1 > minFloor {
-								minFloor = destHit.Version + 1
-							}
-						}
-						if delVer := s.getDocVersion(targetIndex, op.ID); delVer > 0 && delVer < 1_000_000_000_000 && delVer+1 > minFloor {
-							minFloor = delVer + 1
+							existingBeforeOp = destExisting
+							wasExistingBeforeOp = true
+						} else if destHit, destFound, dErr := s.backend.GetDocByID(r.Context(), roDestSchema.DorisDB, roDestSchema.DorisTable, op.ID); dErr == nil && destFound && destHit != nil {
+							hasDest = true
+							destSrc = destHit.Source
+							existingBeforeOp = *destHit
+							wasExistingBeforeOp = true
+						} else {
+							wasExistingBeforeOp = false
 						}
 						if hasDest && opAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), targetIndex, op.ID, destSrc, opAliasFilter) {
-							hasErrors = true
-							items = append(items, map[string]any{
-								op.Action: map[string]any{
-									"_index": targetIndex,
-									"_id":    op.ID,
-									"status": http.StatusConflict,
-									"error":  map[string]any{"type": "version_conflict_engine_exception", "reason": fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", op.ID)},
-								},
-							})
+							appendBulkErrItem(targetIndex, op.ID, http.StatusConflict, "version_conflict_engine_exception", fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", op.ID))
 							continue
-						}
-						if lastVer, okLV := lastVerByIndex[targetIndex][op.ID]; okLV && lastVer+1 > minFloor {
-							minFloor = lastVer + 1
 						}
 					}
 					merged = piped
 				}
 				sourceToShred = merged
 				if opAliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), targetIndex, op.ID, merged, opAliasFilter) {
-					hasErrors = true
-					items = append(items, map[string]any{
-						op.Action: map[string]any{
-							"_index": targetIndex,
-							"_id":    op.ID,
-							"status": http.StatusBadRequest,
-							"error":  map[string]any{"type": "illegal_argument_exception", "reason": fmt.Sprintf("updated document [%s] does not match alias filter for [%s]", op.ID, op.Index)},
-						},
-					})
+					appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("updated document [%s] does not match alias filter for [%s]", op.ID, op.Index))
 					continue
 				}
 				if found && (op.ID != origOpID || targetIndex != origTargetIndex) {
@@ -8826,42 +9533,31 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 					if !reroutedToInBatch[origTargetIndex+"\x00"+origOpID] || !existedInitially {
 						delete(reroutedToInBatch, origTargetIndex+"\x00"+origOpID)
 						origSchema := s.ensureIndexSchema(r.Context(), origTargetIndex)
-						origBuf, okOrig := byIndex[origSchema.DorisTable]
-						if !okOrig {
-							origBuf = &bytes.Buffer{}
-							byIndex[origSchema.DorisTable] = origBuf
+						tombVer := existingHit.Version + 1
+						if tombVer <= 1 {
+							tombVer = 2
 						}
-						tombFloor := existingHit.Version + 1
-						if lv, okLV := lastVerByIndex[origTargetIndex][origOpID]; okLV && lv+1 > tombFloor {
-							tombFloor = lv + 1
-						}
-						tombVer := s.allocVersion(tombFloor)
-						if tombFloor > 0 && tombFloor < 1_000_000_000_000 {
-							tombVer = tombFloor
-						}
-						if tombShredded, tErr := schema.ShredDocument(origSchema, origOpID, tombVer, true, nil); tErr == nil {
-							origBuf.Write(tombShredded)
-							origBuf.WriteByte('\n')
-							pendingRowsByTable[origSchema.DorisTable] = append(pendingRowsByTable[origSchema.DorisTable], pendingBulkRow{
-								id:      origOpID,
-								ver:     tombVer,
-								deleted: true,
-							})
-						}
+						tombSeq := s.allocIndexSeqNo(r.Context(), origTargetIndex)
+						recordTableRow(origSchema, pendingBulkRow{
+							id:      origOpID,
+							ver:     tombVer,
+							deleted: true,
+						}, true)
+						pendingMetaOps = append(pendingMetaOps, pendingDocMetaOp{
+							indexName: origTargetIndex,
+							docID:     origOpID,
+							ver:       tombVer,
+							seqNo:     tombSeq,
+							deleted:   true,
+						})
 						setPendingRouting(origTargetIndex, origOpID, "")
 						delete(existingByIndex[origTargetIndex], origOpID)
-						if lastVerByIndex[origTargetIndex] == nil {
-							lastVerByIndex[origTargetIndex] = make(map[string]int64)
-						}
-						lastVerByIndex[origTargetIndex][origOpID] = tombVer
+						deletedInBatch[origTargetIndex+"\x00"+origOpID] = true
 					}
 				}
 			}
 		}
 
-		s.mu.RLock()
-		prevSchema := s.indices[targetIndex]
-		s.mu.RUnlock()
 		var idxSchema *schema.IndexSchema
 		if !deleted && len(sourceToShred) > 0 {
 			samples := append(append([]json.RawMessage(nil), sampleDocsByIndex[targetIndex]...), sourceToShred)
@@ -8871,107 +9567,114 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 				idxSchema, mErr = s.ensureWritableIndexSchemaWithDocsErr(r.Context(), targetIndex, []json.RawMessage{sourceToShred})
 			}
 			if mErr != nil {
-				hasErrors = true
-				items = append(items, map[string]any{
-					op.Action: map[string]any{
-						"_index": targetIndex,
-						"_id":    op.ID,
-						"status": http.StatusBadRequest,
-						"error":  map[string]any{"type": mappingOrShredErrorTypeRound59(mErr), "reason": mErr.Error()},
-					},
-				})
+				appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, mappingOrShredErrorTypeRound59(mErr), mErr.Error())
 				continue
 			}
 		} else {
 			idxSchema = s.ensureIndexSchema(r.Context(), targetIndex)
 		}
 		if effRouting == "" && s.isRoutingRequired(idxSchema) {
-			hasErrors = true
-			items = append(items, map[string]any{
-				op.Action: map[string]any{
-					"_index": targetIndex,
-					"_id":    op.ID,
-					"status": http.StatusBadRequest,
-					"error":  map[string]any{"type": "routing_missing_exception", "reason": fmt.Sprintf("routing is required for [%s]/[%s]", origOpIdx, op.ID)},
-				},
-			})
+			appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, "routing_missing_exception", fmt.Sprintf("routing is required for [%s]/[%s]", origOpIdx, op.ID))
 			continue
-		}
-		buf, ok := byIndex[idxSchema.DorisTable]
-		if !ok {
-			buf = &bytes.Buffer{}
-			byIndex[idxSchema.DorisTable] = buf
-		}
-		if prevSchema != nil && idxSchema != prevSchema && len(pendingRowsByTable[idxSchema.DorisTable]) > 0 {
-			buf.Reset()
-			for _, prevRow := range pendingRowsByTable[idxSchema.DorisTable] {
-				if reShredded, reErr := schema.ShredDocument(idxSchema, prevRow.id, prevRow.ver, prevRow.deleted, prevRow.source); reErr == nil {
-					buf.Write(reShredded)
-					buf.WriteByte('\n')
-				}
-			}
 		}
 
-		nextVer := s.allocVersion(minFloor)
-		if minFloor > 0 && minFloor < 1_000_000_000_000 {
-			nextVer = minFloor
-		}
-		if assignedVer > 0 {
+		var nextVer int64
+		if hasAssignedVer {
 			nextVer = assignedVer
-			_ = s.allocVersion(assignedVer)
+		} else if deleted {
+			if existingBeforeOp.Version > 0 {
+				nextVer = existingBeforeOp.Version + 1
+			} else {
+				nextVer = 2
+			}
+		} else if wasExistingBeforeOp {
+			if existingBeforeOp.Version > 0 {
+				nextVer = existingBeforeOp.Version + 1
+			} else {
+				nextVer = 2
+			}
+		} else {
+			nextVer = 1
 		}
-		shredVer := nextVer
-		shredded, err := schema.ShredDocument(idxSchema, op.ID, shredVer, deleted, sourceToShred)
-		if err != nil {
-			hasErrors = true
-			items = append(items, map[string]any{
-				op.Action: map[string]any{
-					"_index": targetIndex,
-					"_id":    op.ID,
-					"status": http.StatusBadRequest,
-					"error":  map[string]any{"type": shredErrorType(err), "reason": err.Error()},
-				},
-			})
+
+		// Validate ShredDocument early so per-item shred errors are caught before committing state.
+		if _, err := schema.ShredDocument(idxSchema, op.ID, nextVer, deleted, sourceToShred); err != nil {
+			appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, shredErrorType(err), err.Error())
 			continue
 		}
-		buf.Write(shredded)
-		buf.WriteByte('\n')
-		pendingRowsByTable[idxSchema.DorisTable] = append(pendingRowsByTable[idxSchema.DorisTable], pendingBulkRow{
+
+		opSeqNo := s.allocIndexSeqNo(r.Context(), targetIndex)
+		initHit, wasInitialLive := initialExistingByIndex[targetIndex][op.ID]
+		rtForShard := effRouting
+		if deleted && rtForShard == "" {
+			rtForShard = initHit.Routing
+		}
+		docShard := s.shardForDocRoutingRound60(targetIndex, op.ID, rtForShard)
+		s.recordPreMutationUnrefreshedState(targetIndex, docShard, op.ID, wasInitialLive, &initHit, syncRefresh)
+		if syncRefresh {
+			refreshedIndicesInBatch[targetIndex] = true
+		}
+
+		needsPhysDel := deleted || deletedInBatch[targetIndex+"\x00"+op.ID] || s.wasDocDeletedRound60(targetIndex, op.ID)
+		recordTableRow(idxSchema, pendingBulkRow{
 			id:      op.ID,
-			ver:     shredVer,
+			ver:     nextVer,
 			deleted: deleted,
 			source:  sourceToShred,
+		}, needsPhysDel)
+
+		pendingMetaOps = append(pendingMetaOps, pendingDocMetaOp{
+			indexName:  targetIndex,
+			docID:      op.ID,
+			ver:        nextVer,
+			seqNo:      opSeqNo,
+			deleted:    deleted,
+			isExternal: strings.HasPrefix(vtLower, "external"),
 		})
 
 		if existingByIndex[targetIndex] == nil {
 			existingByIndex[targetIndex] = make(map[string]HitRow)
 		}
-		if lastVerByIndex[targetIndex] == nil {
-			lastVerByIndex[targetIndex] = make(map[string]int64)
+		if st := s.getOrCreateIndexLiveStats(targetIndex); st != nil {
+			if deleted {
+				st.deleteTotal.Add(1)
+			} else {
+				st.indexTotal.Add(1)
+			}
 		}
-		lastVerByIndex[targetIndex][op.ID] = nextVer
 		if deleted {
-			writtenInBatch[targetIndex+"\x00"+op.ID] = false
+			deletedInBatch[targetIndex+"\x00"+op.ID] = true
 			setPendingRouting(targetIndex, op.ID, "")
 			delete(existingByIndex[targetIndex], op.ID)
+			if strings.HasPrefix(vtLower, "external") {
+				if extTombstoneByIndex[targetIndex] == nil {
+					extTombstoneByIndex[targetIndex] = make(map[string]int64)
+				}
+				extTombstoneByIndex[targetIndex][op.ID] = nextVer
+			} else if extTombstoneByIndex[targetIndex] != nil {
+				delete(extTombstoneByIndex[targetIndex], op.ID)
+			}
 		} else {
-			writtenInBatch[targetIndex+"\x00"+op.ID] = true
 			setPendingRouting(targetIndex, op.ID, effRouting)
-			existingByIndex[targetIndex][op.ID] = HitRow{ID: op.ID, Version: nextVer, Source: sourceToShred, Routing: effRouting}
+			existingByIndex[targetIndex][op.ID] = HitRow{
+				ID:       op.ID,
+				Version:  nextVer,
+				SeqNo:    opSeqNo,
+				HasSeqNo: true,
+				Source:   sourceToShred,
+				Routing:  effRouting,
+			}
+			if extTombstoneByIndex[targetIndex] != nil {
+				delete(extTombstoneByIndex[targetIndex], op.ID)
+			}
 		}
 
 		status := http.StatusCreated
 		result := "created"
 		reportedVer := nextVer
-		if assignedVer > 0 {
-			reportedVer = assignedVer
-		}
 		if deleted {
 			status = http.StatusOK
 			result = "deleted"
-			if !wasExistingBeforeOp {
-				reportedVer = 1
-			}
 		} else if op.Action == "update" {
 			if updateResult == "created" {
 				status = http.StatusCreated
@@ -8979,23 +9682,21 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			} else {
 				status = http.StatusOK
 				result = "updated"
-				reportedVer = nextVer
 			}
 		} else if op.Action == "index" && wasExistingBeforeOp {
 			status = http.StatusOK
 			result = "updated"
-			reportedVer = nextVer
 		}
 		itemMap := map[string]any{
-			"_index":        targetIndex,
-			"_type":         "_doc",
-			"_id":           op.ID,
-			"_version":      reportedVer,
-			"result":        result,
-			"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
-			"_seq_no":       nextVer,
-			"_primary_term": 1,
-			"status":        status,
+			"_index":         targetIndex,
+			"_id":            op.ID,
+			"_version":       reportedVer,
+			"result":         result,
+			"forced_refresh": immediateForced,
+			"_shards":        shardsMeta,
+			"_seq_no":        opSeqNo,
+			"_primary_term":  1,
+			"status":         status,
 		}
 		if effRouting != "" {
 			itemMap["_routing"] = effRouting
@@ -9007,20 +9708,54 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			}
 			itemMap["get"] = updGet
 		}
-		items = append(items, map[string]any{
-			op.Action: itemMap,
-		})
+		appendBulkSuccessItem(itemMap, deleted)
 	}
 
-	syncRefresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh") == "wait_for"
-	for dorisTable, buf := range byIndex {
-		if buf.Len() == 0 {
-			continue
+	for dorisTable, rowMap := range finalRowByTableAndID {
+		tblSchema := schemaByTable[dorisTable]
+		// Always load latest schema in case later ops in the batch widened columns on the same table.
+		if tblSchema != nil {
+			s.mu.RLock()
+			for _, sc := range s.indices {
+				if sc != nil && sc.DorisTable == dorisTable {
+					tblSchema = sc
+					break
+				}
+			}
+			s.mu.RUnlock()
 		}
-		if err := s.streamLoad(r.Context(), dorisTable, buf.Bytes(), syncRefresh); err != nil {
-			s.queryCache.InvalidateAll()
-			writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
-			return
+		physHandled := false
+		if delSet := physDeleteByTable[dorisTable]; len(delSet) > 0 && tblSchema != nil {
+			delIDs := make([]string, 0, len(delSet))
+			for id := range delSet {
+				delIDs = append(delIDs, id)
+			}
+			sort.Strings(delIDs)
+			var pErr error
+			physHandled, pErr = s.physicalDeleteDocs(r.Context(), tblSchema, delIDs)
+			if pErr != nil {
+				s.queryCache.InvalidateAll()
+				writeESError(w, http.StatusInternalServerError, "doris_delete_exception", pErr.Error())
+				return
+			}
+		}
+		var buf bytes.Buffer
+		for _, id := range rowOrderByTable[dorisTable] {
+			row := rowMap[id]
+			if row.deleted && physHandled {
+				continue
+			}
+			if shredded, sErr := schema.ShredDocument(tblSchema, row.id, row.ver, row.deleted, row.source); sErr == nil {
+				buf.Write(shredded)
+				buf.WriteByte('\n')
+			}
+		}
+		if buf.Len() > 0 {
+			if err := s.streamLoad(r.Context(), dorisTable, buf.Bytes(), syncRefresh); err != nil {
+				s.queryCache.InvalidateAll()
+				writeESError(w, http.StatusInternalServerError, "doris_stream_load_exception", err.Error())
+				return
+			}
 		}
 	}
 	for idxName, docMap := range pendingRouting {
@@ -9028,9 +9763,16 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			s.setDocRouting(idxName, docID, rVal)
 		}
 	}
-	for idxName, verMap := range lastVerByIndex {
-		for docID, ver := range verMap {
-			s.setDocVersion(idxName, docID, ver)
+	for _, mo := range pendingMetaOps {
+		if mo.deleted {
+			s.recordDocDeleteMetaRound60(mo.indexName, mo.docID, mo.ver, mo.seqNo, mo.isExternal)
+		} else {
+			s.recordDocWriteMetaRound60(mo.indexName, mo.docID, mo.ver, mo.seqNo)
+		}
+	}
+	for idxName := range refreshedIndicesInBatch {
+		if st := s.getOrCreateIndexLiveStats(idxName); st != nil {
+			st.refreshTotal.Add(1)
 		}
 	}
 	s.queryCache.InvalidateAll()
@@ -9039,11 +9781,15 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 	if tookMs <= 0 {
 		tookMs = 1
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	bulkResp := map[string]any{
 		"took":   tookMs,
 		"errors": hasErrors,
 		"items":  items,
-	})
+	}
+	if hasAnyIngestPipeline {
+		bulkResp["ingest_took"] = ingestDur.Milliseconds()
+	}
+	writeJSONWithRequest(w, r, http.StatusOK, bulkResp)
 }
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
@@ -9052,9 +9798,20 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	bodyBytes = normalizeMLTDocIDsInRawJSONRound60(bodyBytes)
 	bodyBytes = s.rewriteSearchBodyQueryRules(bodyBytes)
 	bodyBytes, ok = s.preprocessSearchBodyRound57(w, r.PathValue("index"), bodyBytes)
 	if !ok {
+		return
+	}
+	isNegOneAccurate, tthErr := validateRestTotalHitsAsIntWithRawBody(r, bodyBytes, false)
+	if tthErr != "" {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", tthErr)
+		return
+	}
+	hasScroll, scrollTTL, scrollErr := s.extractAndValidateScrollParamRound60(r, bodyBytes)
+	if scrollErr != "" {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", scrollErr)
 		return
 	}
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
@@ -9067,27 +9824,34 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
 		return
 	}
+	if isNegOneAccurate {
+		req.TrackTotalHits = true
+	}
 	rawEW := r.URL.Query().Get("expand_wildcards")
 	ewOpen, ewClosed, ewHidden, ewNone, ewErr := parseExpandWildcardsFlags(rawEW)
 	if ewErr != nil {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", ewErr.Error())
 		return
 	}
-	hasScroll := r.URL.Query().Has("scroll")
-	var scrollTTL time.Duration
 	if hasScroll {
-		var sErr error
-		scrollTTL, sErr = parseESPositiveDuration(r.URL.Query().Get("scroll"))
-		if sErr != nil {
-			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("failed to parse scroll duration [%s]: %v", r.URL.Query().Get("scroll"), sErr))
-			return
-		}
 		if req.From != nil && *req.From > 0 {
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Cannot use `from` parameter in conjunction with `scroll`")
 			return
 		}
+		if req.Size != nil && *req.Size == 0 {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[size] cannot be [0] in a scroll context")
+			return
+		}
+		if isTruthyBoolQueryParam(r, "request_cache") {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[request_cache] cannot be used in a scroll context")
+			return
+		}
 		if req.PIT != nil {
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[scroll] cannot be used in conjunction with [pit]")
+			return
+		}
+		if req.Collapse != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "cannot use [collapse] in conjunction with [scroll]")
 			return
 		}
 		if len(req.Sort) == 0 {
@@ -9113,46 +9877,62 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rawIndex = pitIdx
-	} else if rawEW != "" && (rawIndex == "" || hasExclusionOrWildcard(rawIndex) || rawIndex == "_all") {
-		allowNoIndices := !r.URL.Query().Has("allow_no_indices") || isTruthyBoolQueryParam(r, "allow_no_indices")
-		if ewNone {
-			if !allowNoIndices {
-				writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
-				return
-			}
-			resp := buildESResponse(rawIndex, nil, &req, nil, nil, 1, nil)
-			if hasScroll {
-				tok := encodeScrollCursorWithState(rawIndex, &req, nil, 0, true)
-				resp["_scroll_id"] = tok
-				s.registerInitialScrollContext(tok, scrollTTL)
-			}
-			writeJSON(w, http.StatusOK, resp)
+	} else {
+		if missingIdx := s.findMissingConcreteSearchIndexRound60(r.Context(), r, rawIndex, nil); missingIdx != "" {
+			writeESError(w, http.StatusNotFound, "index_not_found_exception", fmt.Sprintf("no such index [%s]", missingIdx))
 			return
 		}
-		expTargets, expFilters := s.resolveTargetIndicesWithOptions(rawIndex, ewHidden)
-		var stateFiltered []string
-		for _, t := range expTargets {
-			isClosed := s.isIndexClosed(t)
-			if (isClosed && ewClosed) || (!isClosed && ewOpen) {
-				stateFiltered = append(stateFiltered, t)
-			}
-		}
-		if len(stateFiltered) == 0 {
-			if !allowNoIndices {
-				writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
+		if rawEW != "" && (rawIndex == "" || hasExclusionOrWildcard(rawIndex) || rawIndex == "_all") {
+			allowNoIndices := !r.URL.Query().Has("allow_no_indices") || isTruthyBoolQueryParam(r, "allow_no_indices")
+			if ewNone {
+				if !allowNoIndices {
+					writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
+					return
+				}
+				resp := buildESResponse(rawIndex, nil, &req, nil, nil, 1, nil)
+				resp["_shards"] = map[string]any{"total": 0, "successful": 0, "skipped": 0, "failed": 0}
+				if hasScroll {
+					tok := encodeScrollCursorWithFetched(rawIndex, &req, nil, 0, 0, true)
+					resp["_scroll_id"] = tok
+					s.registerInitialScrollContext(tok, scrollTTL)
+				}
+				s.applyDocTypeToSearchResponseRound60(resp, r)
+				if isTruthyBoolQueryParam(r, "rest_total_hits_as_int") {
+					applyRestTotalHitsAsInt(resp, &req)
+				}
+				writeJSONWithRequest(w, r, http.StatusOK, resp)
 				return
 			}
-			resp := buildESResponse(rawIndex, nil, &req, nil, nil, 1, nil)
-			if hasScroll {
-				tok := encodeScrollCursorWithState(rawIndex, &req, nil, 0, true)
-				resp["_scroll_id"] = tok
-				s.registerInitialScrollContext(tok, scrollTTL)
+			expTargets, expFilters := s.resolveTargetIndicesWithOptions(rawIndex, ewHidden)
+			var stateFiltered []string
+			for _, t := range expTargets {
+				isClosed := s.isIndexClosed(t)
+				if (isClosed && ewClosed) || (!isClosed && ewOpen) {
+					stateFiltered = append(stateFiltered, t)
+				}
 			}
-			writeJSON(w, http.StatusOK, resp)
-			return
-		}
-		if ewHidden && len(expFilters) == 0 {
-			rawIndex = strings.Join(stateFiltered, ",")
+			if len(stateFiltered) == 0 {
+				if !allowNoIndices {
+					writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIndex+"]")
+					return
+				}
+				resp := buildESResponse(rawIndex, nil, &req, nil, nil, 1, nil)
+				resp["_shards"] = map[string]any{"total": 0, "successful": 0, "skipped": 0, "failed": 0}
+				if hasScroll {
+					tok := encodeScrollCursorWithFetched(rawIndex, &req, nil, 0, 0, true)
+					resp["_scroll_id"] = tok
+					s.registerInitialScrollContext(tok, scrollTTL)
+				}
+				s.applyDocTypeToSearchResponseRound60(resp, r)
+				if isTruthyBoolQueryParam(r, "rest_total_hits_as_int") {
+					applyRestTotalHitsAsInt(resp, &req)
+				}
+				writeJSONWithRequest(w, r, http.StatusOK, resp)
+				return
+			}
+			if ewHidden && len(expFilters) == 0 {
+				rawIndex = strings.Join(stateFiltered, ",")
+			}
 		}
 	}
 	if closedIdx := s.findClosedTargetIndex(r, rawIndex); closedIdx != "" {
@@ -9175,17 +9955,20 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	if hasScroll {
 		lastSort := extractLastHitSort(resp)
 		total := extractRespTotalHits(resp)
-		tok := encodeScrollCursorWithState(rawIndex, &req, lastSort, total, len(lastSort) == 0)
+		returnedNow := int64(extractRespReturnedHitsCount(resp))
+		exhausted := len(lastSort) == 0 || (req.ShouldTrackTotalHits() && returnedNow >= total)
+		tok := encodeScrollCursorWithFetched(rawIndex, &req, lastSort, total, returnedNow, exhausted)
 		resp["_scroll_id"] = tok
 		s.registerInitialScrollContext(tok, scrollTTL)
 	}
+	s.applyDocTypeToSearchResponseRound60(resp, r)
 	if r.URL.Query().Get("doris_explain") == "true" || r.URL.Query().Get("doris_explain") == "1" ||
 		r.URL.Query().Get("_doris_explain") == "true" || r.URL.Query().Get("_doris_explain") == "1" {
 		resp["_doris_explain"] = s.buildDorisExplainObject(r.Context(), rawIndex, &req)
 	}
 	if isTruthyBoolQueryParam(r, "typed_keys") {
 		if aggsMap, ok := resp["aggregations"].(map[string]any); ok {
-			applyTypedKeysToAggregations(aggsMap, req.EffectiveAggs())
+			applyTypedKeysToAggregationsWithSchemaRound60(aggsMap, req.EffectiveAggs(), s.resolvePrimarySchemaForTypedKeysRound60(r.Context(), rawIndex))
 		}
 		if sugMap, ok := resp["suggest"].(map[string]any); ok {
 			applyTypedKeysToSuggestions(sugMap, req.Suggest)
@@ -9198,7 +9981,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	syncShadow := r.URL.Query().Get("shadow_sync") == "true" || r.URL.Query().Get("shadow_sync") == "1"
 	s.maybeRunShadowSearch(rawIndex, bodyBytes, resp, tookMs, syncShadow)
 
-	writeJSON(w, http.StatusOK, resp)
+	writeJSONWithRequest(w, r, http.StatusOK, resp)
 }
 
 func isTableNotFoundError(err error) bool {
@@ -9535,6 +10318,31 @@ func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 	indicesByFieldType := make(map[string]map[string][]string)
 	nonSearchableByFieldType := make(map[string]map[string][]string)
 	nonAggregatableByFieldType := make(map[string]map[string][]string)
+	metaByFieldType := make(map[string]map[string]map[string][]string)
+	addFieldMeta := func(field, esType string, meta map[string]string) {
+		if len(meta) == 0 {
+			return
+		}
+		if metaByFieldType[field] == nil {
+			metaByFieldType[field] = make(map[string]map[string][]string)
+		}
+		if metaByFieldType[field][esType] == nil {
+			metaByFieldType[field][esType] = make(map[string][]string)
+		}
+		mm := metaByFieldType[field][esType]
+		for mk, mv := range meta {
+			exists := false
+			for _, cur := range mm[mk] {
+				if cur == mv {
+					exists = true
+					break
+				}
+			}
+			if !exists {
+				mm[mk] = append(mm[mk], mv)
+			}
+		}
+	}
 	appendUniqueIdx := func(m map[string]map[string][]string, field, esType, idxName string) {
 		if idxName == "" {
 			return
@@ -9691,6 +10499,7 @@ func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case fb.ESType != "":
 				addCap(idxName, esPath, fb.ESType, isSearchable, isAggregatableForType(fb.ESType), isMeta, isMulti, isNested, isParent)
+				addFieldMeta(esPath, fb.ESType, fb.Meta)
 				if fb.KeywordCompanion != "" && fb.AliasTarget == "" {
 					kwSearchable := !fb.EnabledFalse
 					kwAggregatable := !fb.EnabledFalse
@@ -9754,6 +10563,7 @@ func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 					"type":         "unmapped",
 					"searchable":   false,
 					"aggregatable": false,
+					"indices":      targets,
 				},
 			}
 		}
@@ -9765,6 +10575,9 @@ func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 				if idxList := indicesByFieldType[field][esType]; len(idxList) > 0 {
 					entry["indices"] = idxList
 				}
+			}
+			if mm := metaByFieldType[field][esType]; len(mm) > 0 {
+				entry["meta"] = mm
 			}
 			if sFlag, _ := entry["searchable"].(bool); sFlag {
 				if nonS := nonSearchableByFieldType[field][esType]; len(nonS) > 0 {
@@ -9788,11 +10601,22 @@ func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 	defaultIndex := r.PathValue("index")
 	if r.Body == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"took": 1, "responses": []any{}})
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"took": 1, "responses": []any{}})
 		return
 	}
 	scanner := bufio.NewScanner(r.Body)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024)
+
+	buildMSearchErrItem := func(status int, eType, eReason string) map[string]any {
+		return map[string]any{
+			"status": status,
+			"error": map[string]any{
+				"root_cause": []map[string]any{{"type": eType, "reason": eReason}},
+				"type":       eType,
+				"reason":     eReason,
+			},
+		}
+	}
 
 	responses := make([]map[string]any, 0)
 	for {
@@ -9831,6 +10655,7 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 			TypedKeys          any    `json:"typed_keys"`
 			FilterPath         string `json:"filter_path"`
 			TerminateAfter     *int   `json:"terminate_after"`
+			IgnoreUnavailable  any    `json:"ignore_unavailable"`
 		}
 		if err := json.Unmarshal(headerLine, &hdr); err != nil {
 			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
@@ -9856,28 +10681,38 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		hdrRestTotalHits, hasHdrRestTotalHits := parseOptionalBoolAny(hdr.RestTotalHitsAsInt)
+		effRestTotalHits := (hasHdrRestTotalHits && hdrRestTotalHits) || (!hasHdrRestTotalHits && isTruthyBoolQueryParam(r, "rest_total_hits_as_int"))
+
 		var req esast.SearchRequest
+		bodyLine = normalizeMLTDocIDsInRawJSONRound60(bodyLine)
 		bodyLine = s.rewriteSearchBodyQueryRules(bodyLine)
+		isNegOneAccurate, tthErr := validateRestTotalHitsAsIntWithRawBody(r, bodyLine, effRestTotalHits)
+		if tthErr != "" {
+			responses = append(responses, buildMSearchErrItem(http.StatusBadRequest, "illegal_argument_exception", tthErr))
+			continue
+		}
 		if len(bodyLine) > 0 {
 			if err := json.Unmarshal(bodyLine, &req); err != nil {
-				responses = append(responses, map[string]any{
-					"status": http.StatusBadRequest,
-					"error":  map[string]any{"type": "parsing_exception", "reason": err.Error()},
-				})
+				responses = append(responses, buildMSearchErrItem(http.StatusBadRequest, "parsing_exception", err.Error()))
 				continue
 			}
 		}
 		if err := applyAndValidateURISearchParamsRound58(r, &req); err != nil {
-			responses = append(responses, map[string]any{
-				"status": http.StatusBadRequest,
-				"error":  map[string]any{"type": "illegal_argument_exception", "reason": err.Error()},
-			})
+			responses = append(responses, buildMSearchErrItem(http.StatusBadRequest, "illegal_argument_exception", err.Error()))
 			continue
+		}
+		if isNegOneAccurate {
+			req.TrackTotalHits = true
 		}
 		switch rv := hdr.Routing.(type) {
 		case string:
 			if strings.TrimSpace(rv) != "" {
 				req.Routing = strings.TrimSpace(rv)
+			}
+		case float64, json.Number, bool:
+			if sv, okS := stringifyScalarIDOrRouting(rv); okS && strings.TrimSpace(sv) != "" {
+				req.Routing = strings.TrimSpace(sv)
 			}
 		case []any:
 			var rParts []string
@@ -9899,10 +10734,7 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 		}
 		if hdr.TerminateAfter != nil {
 			if *hdr.TerminateAfter <= 0 {
-				responses = append(responses, map[string]any{
-					"status": http.StatusBadRequest,
-					"error":  map[string]any{"type": "illegal_argument_exception", "reason": fmt.Sprintf("[terminate_after] must be greater than 0, got [%d]", *hdr.TerminateAfter)},
-				})
+				responses = append(responses, buildMSearchErrItem(http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("[terminate_after] must be greater than 0, got [%d]", *hdr.TerminateAfter)))
 				continue
 			}
 			req.TerminateAfter = hdr.TerminateAfter
@@ -9911,51 +10743,48 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 		if req.PIT != nil {
 			pitIdx, pStatus, pType, pReason := s.validateAndResolvePITRequest(targetIdx, &req)
 			if pStatus != 0 {
-				responses = append(responses, map[string]any{
-					"status": pStatus,
-					"error":  map[string]any{"type": pType, "reason": pReason},
-				})
+				responses = append(responses, buildMSearchErrItem(pStatus, pType, pReason))
 				continue
 			}
 			targetIdx = pitIdx
+		} else {
+			var ignOverride *bool
+			if b, okB := parseOptionalBoolAny(hdr.IgnoreUnavailable); okB {
+				ignOverride = &b
+			}
+			if missingIdx := s.findMissingConcreteSearchIndexRound60(r.Context(), r, targetIdx, ignOverride); missingIdx != "" {
+				responses = append(responses, buildMSearchErrItem(http.StatusNotFound, "index_not_found_exception", fmt.Sprintf("no such index [%s]", missingIdx)))
+				continue
+			}
 		}
 		if closedIdx := s.findClosedTargetIndex(r, targetIdx); closedIdx != "" {
-			responses = append(responses, map[string]any{
-				"status": http.StatusBadRequest,
-				"error":  map[string]any{"type": "index_closed_exception", "reason": fmt.Sprintf("closed [%s]", closedIdx)},
-			})
+			responses = append(responses, buildMSearchErrItem(http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx)))
 			continue
 		}
 		if _, blockReason := s.findReadBlockedTargetIndex(r, targetIdx); blockReason != "" {
-			responses = append(responses, map[string]any{
-				"status": http.StatusForbidden,
-				"error":  map[string]any{"type": "cluster_block_exception", "reason": blockReason},
-			})
+			responses = append(responses, buildMSearchErrItem(http.StatusForbidden, "cluster_block_exception", blockReason))
 			continue
 		}
 		resp, status, errType, errReason := s.executeSearchRequest(r.Context(), targetIdx, &req)
 		if errType != "" {
-			responses = append(responses, map[string]any{
-				"status": status,
-				"error":  map[string]any{"type": errType, "reason": errReason},
-			})
+			responses = append(responses, buildMSearchErrItem(status, errType, errReason))
 			continue
 		}
 		if req.PIT != nil && req.PIT.ID != "" {
 			resp["pit_id"] = req.PIT.ID
 		}
 		resp["status"] = http.StatusOK
+		s.applyDocTypeToSearchResponseRound60(resp, r)
 		hdrTypedKeys, hasHdrTypedKeys := parseOptionalBoolAny(hdr.TypedKeys)
 		if (hasHdrTypedKeys && hdrTypedKeys) || (!hasHdrTypedKeys && isTruthyBoolQueryParam(r, "typed_keys")) {
 			if aggsMap, ok := resp["aggregations"].(map[string]any); ok {
-				applyTypedKeysToAggregations(aggsMap, req.EffectiveAggs())
+				applyTypedKeysToAggregationsWithSchemaRound60(aggsMap, req.EffectiveAggs(), s.resolvePrimarySchemaForTypedKeysRound60(r.Context(), targetIdx))
 			}
 			if sugMap, ok := resp["suggest"].(map[string]any); ok {
 				applyTypedKeysToSuggestions(sugMap, req.Suggest)
 			}
 		}
-		hdrRestTotalHits, hasHdrRestTotalHits := parseOptionalBoolAny(hdr.RestTotalHitsAsInt)
-		if (hasHdrRestTotalHits && hdrRestTotalHits) || (!hasHdrRestTotalHits && isTruthyBoolQueryParam(r, "rest_total_hits_as_int")) {
+		if effRestTotalHits {
 			applyRestTotalHitsAsInt(resp, &req)
 		}
 		if fp := strings.TrimSpace(hdr.FilterPath); fp != "" {
@@ -9981,7 +10810,7 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 		"took":      4,
 		"responses": responses,
 	})
@@ -9997,10 +10826,21 @@ func (s *Server) executeSearchRequest(
 		rawIndexPattern = extractPITIndex(rawIndexPattern, req.PIT)
 	}
 	targets, aliasFilters := s.resolveTargetIndicesWithFilters(rawIndexPattern)
+	if len(targets) > 0 && (rawIndexPattern == "" || rawIndexPattern == "_all" || rawIndexPattern == "*" || hasExclusionOrWildcard(rawIndexPattern)) {
+		openTargets := make([]string, 0, len(targets))
+		for _, t := range targets {
+			if !s.isIndexClosed(t) {
+				openTargets = append(openTargets, t)
+			}
+		}
+		targets = openTargets
+	}
 	if len(targets) == 0 {
-		// If wildcard or exclusion pattern matched nothing, return empty 200 search response (like ES with allow_no_indices=true)
-		if hasExclusionOrWildcard(rawIndexPattern) {
-			return buildESResponse(rawIndexPattern, nil, req, nil, nil, 1, nil), http.StatusOK, "", ""
+		// If wildcard/all/empty pattern matched nothing (or authoritative catalog has no matching indices), return empty 200 search response with 0 shards.
+		if hasExclusionOrWildcard(rawIndexPattern) || rawIndexPattern == "" || rawIndexPattern == "_all" || s.hasAuthoritativeIndexCatalog() {
+			emptyResp := buildESResponse(rawIndexPattern, nil, req, nil, nil, 1, nil)
+			emptyResp["_shards"] = map[string]any{"total": 0, "successful": 0, "skipped": 0, "failed": 0}
+			return emptyResp, http.StatusOK, "", ""
 		}
 		targets = []string{s.resolveIndexName(rawIndexPattern)}
 	}
@@ -10022,6 +10862,9 @@ func (s *Server) executeSearchRequest(
 			return nil, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("cannot execute stored script [%s] because it does not exist", missingID)
 		}
 		s.resolveStoredScriptsInSearchRequest(req)
+		if err := validateSearchRequestScriptsRound60(req); err != nil {
+			return nil, http.StatusBadRequest, "search_phase_execution_exception", err.Error()
+		}
 		if hasTermsLookupInSearchRequest(req) {
 			req = s.resolveTermsLookupsInSearchRequest(ctx, req)
 		}
@@ -10094,7 +10937,7 @@ func (s *Server) executeSearchRequest(
 			}
 		}
 	}
-	needsRuntimeScriptEval := req.Slice != nil || reqHasRuntimeMappings || queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasRuntimeScript(req.PostFilter) || sortsHaveScript(req.Sort) || aggsHaveRuntimeScript(req.EffectiveAggs()) || queryHasMinScore(req.Query) || aliasFiltersHaveMinScore(aliasFilters) || (req.MinScore != nil && (queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasNestedScoring(req.Query) || len(req.IndicesBoost) > 0)) || (queryHasNestedScoring(req.Query) && (req.Collapse != nil || len(req.SearchAfter) > 0))
+	needsRuntimeScriptEval := req.Slice != nil || reqHasRuntimeMappings || queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasRuntimeScript(req.PostFilter) || sortsHaveScript(req.Sort) || aggsHaveRuntimeScript(req.EffectiveAggs()) || aggsHaveHDRPercentilesRound60(req.EffectiveAggs()) || queryHasMinScore(req.Query) || aliasFiltersHaveMinScore(aliasFilters) || (req.MinScore != nil && (queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasNestedScoring(req.Query) || len(req.IndicesBoost) > 0)) || (queryHasNestedScoring(req.Query) && (req.Collapse != nil || len(req.SearchAfter) > 0))
 
 	var allHits []HitRow
 	var allFetchedHits []HitRow
@@ -10120,6 +10963,21 @@ func (s *Server) executeSearchRequest(
 		schemasByIndex[indexName] = idxSchema
 		if primarySchema == nil {
 			primarySchema = idxSchema
+		}
+		effWinSize := size
+		if effWinSize < 0 {
+			effWinSize = 0
+		}
+		maxWin := transpiler.DefaultMaxResultWindow
+		if s.transpileOpts.MaxResultWindow > 0 {
+			maxWin = s.transpileOpts.MaxResultWindow
+		}
+		if idxSchema != nil && idxSchema.MaxResultWindow > 0 {
+			maxWin = idxSchema.MaxResultWindow
+		}
+		if len(req.SearchAfter) == 0 && from+effWinSize > maxWin {
+			return nil, http.StatusBadRequest, "search_phase_execution_exception",
+				fmt.Sprintf("illegal_argument_exception: Result window is too large, from + size must be less than or equal to: [%d] but was [%d]. See the scroll api for a more efficient way to request large data sets. This limit can be set by changing the [index.max_result_window] index level setting.", maxWin, from+effWinSize)
 		}
 		subReq := *req
 		if needsRuntimeScriptEval {
@@ -10201,12 +11059,54 @@ func (s *Server) executeSearchRequest(
 		if hasRuntimeMappings {
 			sqlSchema = rawIdxSchema
 		}
-		tr := transpiler.NewTranspiler(sqlSchema, s.transpileOpts)
+		trOpts := s.transpileOpts
+		if subReqPtr != nil && subReqPtr.Size != nil && *subReqPtr.Size > maxWin {
+			if sqlSchema != nil && sqlSchema.MaxResultWindow > 0 {
+				schemaCopy := *sqlSchema
+				schemaCopy.MaxResultWindow = 0
+				sqlSchema = &schemaCopy
+			}
+			if *subReqPtr.Size > trOpts.MaxResultWindow {
+				trOpts.MaxResultWindow = *subReqPtr.Size
+			}
+		}
+		tr := transpiler.NewTranspiler(sqlSchema, trOpts)
 		plan, err := tr.BuildSearchPlan(subReqPtr)
 		if err != nil {
 			return nil, http.StatusBadRequest, "search_phase_execution_exception", err.Error()
 		}
-		for _, uf := range plan.UnindexedVariantFields {
+		unindexedFieldsForPlan := plan.UnindexedVariantFields
+		if hasRuntimeMappings && req != nil {
+			origReq := *req
+			zeroFrom := 0
+			smallSize := 10
+			origReq.From = &zeroFrom
+			origReq.Size = &smallSize
+			if rawPlan, rawErr := transpiler.NewTranspiler(rawIdxSchema, trOpts).BuildSearchPlan(&origReq); rawErr == nil {
+				seenPlanUF := make(map[string]struct{}, len(unindexedFieldsForPlan))
+				for _, uf := range unindexedFieldsForPlan {
+					seenPlanUF[uf] = struct{}{}
+				}
+				for _, uf := range rawPlan.UnindexedVariantFields {
+					cleanUF := strings.TrimSuffix(uf, ".keyword")
+					if req.RuntimeMappings != nil {
+						if _, isEphemeral := req.RuntimeMappings[cleanUF]; isEphemeral {
+							continue
+						}
+					}
+					if rawIdxSchema != nil && rawIdxSchema.RawMapping != nil && rawIdxSchema.RawMapping.Runtime != nil {
+						if rtProp, isRt := rawIdxSchema.RawMapping.Runtime[cleanUF]; isRt && rtProp.Script != nil {
+							continue
+						}
+					}
+					if _, dup := seenPlanUF[uf]; !dup {
+						seenPlanUF[uf] = struct{}{}
+						unindexedFieldsForPlan = append(unindexedFieldsForPlan, uf)
+					}
+				}
+			}
+		}
+		for _, uf := range unindexedFieldsForPlan {
 			if _, ok := seenUnindexed[uf]; !ok {
 				seenUnindexed[uf] = struct{}{}
 				allUnindexedFields = append(allUnindexedFields, uf)
@@ -10248,6 +11148,8 @@ func (s *Server) executeSearchRequest(
 		for i := range hits {
 			hits[i].Index = indexName
 			hits[i].Routing = s.getDocRouting(indexName, hits[i].ID)
+			hits[i].SeqNo = s.getDocSeqNo(indexName, hits[i].ID, hits[i].Version)
+			hits[i].HasSeqNo = true
 			if len(req.SearchAfter) == 0 && hits[i].TotalHits > idxTotal {
 				idxTotal = hits[i].TotalHits
 			}
@@ -10269,6 +11171,13 @@ func (s *Server) executeSearchRequest(
 						}
 					}
 				}
+			}
+		}
+		hits, aggRows, idxTotal = s.overlayUnrefreshedDocsOnHitsRound60(ctx, indexName, rawIdxSchema, subReqPtr.Query, size, hits, aggRows, idxTotal)
+		if st := s.getOrCreateIndexLiveStats(indexName); st != nil {
+			st.searchQueryTotal.Add(1)
+			if size > 0 {
+				st.searchFetchTotal.Add(1)
 			}
 		}
 		if needsRuntimeScriptEval {
@@ -10339,6 +11248,9 @@ func (s *Server) executeSearchRequest(
 			if err := validateCustomSearchScoresOnRuntimeHitsRound59(idxSchema, evalReq.Query, hits); err != nil {
 				return nil, http.StatusBadRequest, "search_phase_execution_exception", err.Error()
 			}
+			if err := validateRuntimeSearchScriptsOnHitsRound60(idxSchema, evalReq, hits); err != nil {
+				return nil, http.StatusBadRequest, "search_phase_execution_exception", err.Error()
+			}
 			hits, aggRows, idxTotal, matchedQueryHits, postFilteredHits = applyRuntimeSearchScriptsWithMatchedAndGlobal(hits, globalHits, aggRows, idxTotal, evalReq, idxSchema, len(targets) > 1)
 			allFetchedHits = append(allFetchedHits, matchedQueryHits...)
 			allPostFilterHits = append(allPostFilterHits, postFilteredHits...)
@@ -10371,6 +11283,11 @@ func (s *Server) executeSearchRequest(
 				}
 			}
 		} else {
+			if req != nil && len(req.ScriptFields) > 0 {
+				if err := validateRuntimeSearchScriptsOnHitsRound60(idxSchema, req, hits); err != nil {
+					return nil, http.StatusBadRequest, "search_phase_execution_exception", err.Error()
+				}
+			}
 			if queryProducesCustomScoreRound59(subReqPtr.Query) {
 				if len(hits) == 0 && size == 0 {
 					zero := 0
@@ -10618,7 +11535,7 @@ func (s *Server) executeSearchRequest(
 			TotalHits:              idxTotal,
 			HitsSQL:                plan.HitsSQL,
 			AggsSQL:                plan.AggsSQL,
-			UnindexedVariantFields: plan.UnindexedVariantFields,
+			UnindexedVariantFields: unindexedFieldsForPlan,
 		}, threshold)
 		for _, fieldToPromote := range toPromote {
 			_, _ = s.promoteFieldInternal(ctx, indexName, fieldToPromote, "keyword")
@@ -10866,7 +11783,27 @@ func (s *Server) executeSearchRequest(
 		return nil
 	}
 	resp := buildESResponseWithSchemas(primaryIndex, primarySchema, schemasByIndex, req, allHits, allAggRows, tookMs, docLookup)
-	if size > 0 && req != nil {
+	if req != nil && aggsHaveHDRPercentilesRound60(req.EffectiveAggs()) {
+		if err := applyHDRPercentilesToResponseRound60(resp, req.EffectiveAggs(), allFetchedHits, schemasByIndex, primarySchema); err != nil {
+			return nil, http.StatusBadRequest, "search_phase_execution_exception", err.Error()
+		}
+	}
+	if req != nil && len(req.EffectiveAggs()) > 0 {
+		if err := s.validateSearchMaxBucketsRound60(resp, req.EffectiveAggs()); err != nil {
+			return nil, http.StatusBadRequest, "search_phase_execution_exception", err.Error()
+		}
+	}
+	totalTargetShards := 0
+	for _, tName := range targets {
+		nShards, _, _ := s.getIndexShardAndReplicaCounts(tName)
+		totalTargetShards += nShards
+	}
+	if totalTargetShards > 0 {
+		resp["_shards"] = map[string]any{"total": totalTargetShards, "successful": totalTargetShards, "skipped": 0, "failed": 0}
+	}
+	trackScores := req != nil && req.TrackScores != nil && *req.TrackScores
+	omitScores := len(effSorts) > 0 && !sortSpecsUseScore(effSorts) && !trackScores
+	if size > 0 && req != nil && !omitScores && len(allPostFilterHits) > 0 {
 		var maxFetchedScore float64
 		for _, fh := range allPostFilterHits {
 			if fh.Score > maxFetchedScore {
@@ -12007,6 +12944,7 @@ func (s *Server) handleCount(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	bodyBytes = normalizeMLTDocIDsInRawJSONRound60(bodyBytes)
 	bodyBytes = s.rewriteSearchBodyQueryRules(bodyBytes)
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
 		var rawTop map[string]json.RawMessage
@@ -12044,6 +12982,9 @@ func (s *Server) handleCount(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Sort = nil
 		countIdx = pitIdx
+	} else if missingIdx := s.findMissingConcreteSearchIndexRound60(r.Context(), r, countIdx, nil); missingIdx != "" {
+		writeESError(w, http.StatusNotFound, "index_not_found_exception", fmt.Sprintf("no such index [%s]", missingIdx))
+		return
 	}
 
 	if closedIdx := s.findClosedTargetIndex(r, countIdx); closedIdx != "" {
@@ -12067,14 +13008,18 @@ func (s *Server) handleCount(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	shardsMap := map[string]any{"total": 1, "successful": 1, "skipped": 0, "failed": 0}
+	if respShards, ok := resp["_shards"].(map[string]any); ok {
+		shardsMap = respShards
+	}
 	countResp := map[string]any{
 		"count":   count,
-		"_shards": map[string]any{"total": 1, "successful": 1, "skipped": 0, "failed": 0},
+		"_shards": shardsMap,
 	}
 	if termEarly, ok := resp["terminated_early"].(bool); ok {
 		countResp["terminated_early"] = termEarly
 	}
-	writeJSON(w, http.StatusOK, countResp)
+	writeJSONWithRequest(w, r, http.StatusOK, countResp)
 }
 
 func (s *Server) resolveIndexBoostFactor(indexName string, boosts map[string]float64) (float64, bool) {
@@ -12238,44 +13183,6 @@ func aggTypePrefix(spec esast.AggSpec) string {
 		return "t_test"
 	default:
 		return "agg"
-	}
-}
-
-func applyTypedKeysToAggregations(aggsOut map[string]any, aggs map[string]esast.AggSpec) {
-	if len(aggsOut) == 0 || len(aggs) == 0 {
-		return
-	}
-	for aggName, spec := range aggs {
-		val, exists := aggsOut[aggName]
-		if !exists {
-			continue
-		}
-		if subAggs := spec.SubAggs(); len(subAggs) > 0 {
-			if aggObj, ok := val.(map[string]any); ok {
-				if buckets, ok := aggObj["buckets"].([]map[string]any); ok {
-					for _, b := range buckets {
-						applyTypedKeysToAggregations(b, subAggs)
-					}
-				} else if bucketsAny, ok := aggObj["buckets"].([]any); ok {
-					for _, item := range bucketsAny {
-						if b, ok := item.(map[string]any); ok {
-							applyTypedKeysToAggregations(b, subAggs)
-						}
-					}
-				} else if bucketsMap, ok := aggObj["buckets"].(map[string]any); ok {
-					for _, bv := range bucketsMap {
-						if bm, ok := bv.(map[string]any); ok {
-							applyTypedKeysToAggregations(bm, subAggs)
-						}
-					}
-				} else {
-					applyTypedKeysToAggregations(aggObj, subAggs)
-				}
-			}
-		}
-		prefix := aggTypePrefix(spec)
-		delete(aggsOut, aggName)
-		aggsOut[prefix+"#"+aggName] = val
 	}
 }
 
@@ -12737,6 +13644,9 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 	if tookMs <= 0 {
 		tookMs = 1
 	}
+	effSorts := transpiler.EffectiveSortsForRequest(req)
+	trackScores := req != nil && req.TrackScores != nil && *req.TrackScores
+	omitScoresForCustomSort := len(effSorts) > 0 && !sortSpecsUseScore(effSorts) && !trackScores
 
 	for _, h := range hits {
 		if h.TotalHits > totalHits {
@@ -12755,11 +13665,15 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 				hitSchema = s
 			}
 		}
+		var hitScore any = h.Score
+		if omitScoresForCustomSort {
+			hitScore = nil
+		}
 		hitMap := map[string]any{
 			"_index": hitIdx,
 			"_type":  "_doc",
 			"_id":    h.ID,
-			"_score": h.Score,
+			"_score": hitScore,
 		}
 		if h.Routing != "" {
 			hitMap["_routing"] = h.Routing
@@ -12772,11 +13686,15 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 			hitMap["_version"] = ver
 		}
 		if req != nil && req.SeqNoPrimaryTerm {
-			ver := h.Version
-			if ver <= 0 {
-				ver = 1
+			seqNo := h.SeqNo
+			if !h.HasSeqNo {
+				if h.Version > 0 {
+					seqNo = h.Version - 1
+				} else {
+					seqNo = 0
+				}
 			}
-			hitMap["_seq_no"] = ver
+			hitMap["_seq_no"] = seqNo
 			hitMap["_primary_term"] = 1
 		}
 		if req != nil && req.Explain {
@@ -13014,8 +13932,13 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 
 	aggsOut := buildAggsMapWithSchema(indexName, "", req.EffectiveAggs(), bucketsByAgg, aggTotalHits, docLookup, idxSchema)
 
+	reqSizeZero := req != nil && req.Size != nil && *req.Size == 0
+	var envelopeMaxScore any = maxScore
+	if omitScoresForCustomSort || reqSizeZero || (len(esHits) == 0 && totalHits == 0) {
+		envelopeMaxScore = nil
+	}
 	hitsEnvelope := map[string]any{
-		"max_score": maxScore,
+		"max_score": envelopeMaxScore,
 		"hits":      esHits,
 	}
 	if req.ShouldTrackTotalHits() {
@@ -14925,6 +15848,7 @@ func buildAggsMapWithSchema(
 	}
 	evaluateSiblingPipelineAggs(aggs, aggsOut)
 	_ = evaluateChildPipelineAggs([]map[string]any{aggsOut}, aggs)
+	attachAllAggMetasRound60(aggsOut, aggs)
 	return aggsOut
 }
 
@@ -15695,16 +16619,17 @@ func filterAndSortTermsRowsWithSubAggs(
 		excRe, _ = regexp.Compile("^(?:" + s + ")$")
 	}
 	if spec.Include != nil || spec.Exclude != nil || minDocCount > 0 {
+		tFieldType := termsFieldTypeRound60(spec, idxSchema)
 		filtered := make([]AggRow, 0, len(cpRows))
 		for _, r := range cpRows {
 			if minDocCount > 0 && r.effectiveCount() < minDocCount {
 				continue
 			}
 			if r.BucketKey != "__ES_MISSING_BUCKET__" {
-				if spec.Include != nil && !matchesTermsFilterPrecompiled(r.BucketKey, spec.Include, incRe) {
+				if spec.Include != nil && !matchesTermsFilterPrecompiledWithSchemaRound60(r.BucketKey, spec.Include, incRe, tFieldType) {
 					continue
 				}
-				if spec.Exclude != nil && matchesTermsFilterPrecompiled(r.BucketKey, spec.Exclude, excRe) {
+				if spec.Exclude != nil && matchesTermsFilterPrecompiledWithSchemaRound60(r.BucketKey, spec.Exclude, excRe, tFieldType) {
 					continue
 				}
 			}
@@ -16771,6 +17696,7 @@ func evaluateChildPipelineAggsWithoutBucketSort(buckets []map[string]any, subAgg
 				}
 			case spec.EffectiveMovingAvg() != nil:
 				maSpec := spec.EffectiveMovingAvg()
+				isMovingFn := spec.MovingFn != nil
 				pathStr := maSpec.EffectivePath()
 				insertZeros := strings.EqualFold(maSpec.GapPolicy, "insert_zeros")
 				win := maSpec.EffectiveWindow()
@@ -16781,6 +17707,9 @@ func evaluateChildPipelineAggsWithoutBucketSort(buckets []map[string]any, subAgg
 						if insertZeros {
 							curr = 0
 						} else {
+							if isMovingFn {
+								b[subName] = map[string]any{"value": nil}
+							}
 							continue
 						}
 					}
@@ -16788,18 +17717,28 @@ func evaluateChildPipelineAggsWithoutBucketSort(buckets []map[string]any, subAgg
 					endIdx := len(history) - 1
 					if maSpec.Shift != nil {
 						endIdx = len(history) - 2 + *maSpec.Shift
+					} else if isMovingFn {
+						endIdx = len(history) - 2
 					}
-					if endIdx < 0 {
+					var slice []float64
+					if endIdx >= 0 {
+						if endIdx >= len(history) {
+							endIdx = len(history) - 1
+						}
+						start := 0
+						if endIdx+1 > win {
+							start = endIdx + 1 - win
+						}
+						slice = history[start : endIdx+1]
+					}
+					if isMovingFn {
+						if val, okVal := evalMovingFnWindowNullableRound60(slice, maSpec); okVal {
+							b[subName] = makePipelineMetricObj(val, maSpec.Format)
+						} else {
+							b[subName] = map[string]any{"value": nil}
+						}
 						continue
 					}
-					if endIdx >= len(history) {
-						endIdx = len(history) - 1
-					}
-					start := 0
-					if endIdx+1 > win {
-						start = endIdx + 1 - win
-					}
-					slice := history[start : endIdx+1]
 					if len(slice) == 0 {
 						continue
 					}
@@ -18140,6 +19079,14 @@ func extractScriptSourceAndParams(script any) (string, map[string]any) {
 	var src string
 	var params map[string]any
 	switch sv := script.(type) {
+	case *esast.ScriptSpec:
+		if sv != nil {
+			src = sv.Source
+			params = sv.Params
+		}
+	case esast.ScriptSpec:
+		src = sv.Source
+		params = sv.Params
 	case string:
 		src = sv
 	case map[string]any:
@@ -19652,11 +20599,15 @@ func extractHitFieldsMap(h HitRow, hitIdx string, req *esast.SearchRequest, idxS
 			}
 			continue
 		case "_seq_no":
-			if h.Version > 0 {
-				out["_seq_no"] = []any{h.Version}
-			} else {
-				out["_seq_no"] = []any{int64(1)}
+			seqNo := h.SeqNo
+			if !h.HasSeqNo {
+				if h.Version > 0 {
+					seqNo = h.Version - 1
+				} else {
+					seqNo = 0
+				}
 			}
+			out["_seq_no"] = []any{seqNo}
 			continue
 		case "_primary_term":
 			out["_primary_term"] = []any{int64(1)}
@@ -20080,10 +21031,31 @@ func prepareDocForRuntimeScript(idxSchema *schema.IndexSchema, doc map[string]an
 		}
 	}
 	if idxSchema == nil || len(idxSchema.Fields) == 0 {
+		if idxSchema != nil && idxSchema.RawMapping != nil {
+			dynStr := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", idxSchema.RawMapping.Dynamic)))
+			if dynStr == "false" || dynStr == "strict" {
+				ensureCopy()
+				cp["__strict_doc_fields"] = map[string]bool{}
+			}
+		}
 		if cp != nil {
 			return cp
 		}
 		return doc
+	}
+	ensureCopy()
+	if ftMap := extractSchemaFieldTypesMapRound60(idxSchema); len(ftMap) > 0 {
+		cp["__field_types"] = ftMap
+		if idxSchema.RawMapping != nil {
+			dynStr := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", idxSchema.RawMapping.Dynamic)))
+			if dynStr == "false" || dynStr == "strict" {
+				strictSet := make(map[string]bool, len(ftMap))
+				for k := range ftMap {
+					strictSet[k] = true
+				}
+				cp["__strict_doc_fields"] = strictSet
+			}
+		}
 	}
 	for fieldName, fb := range idxSchema.Fields {
 		cleanField := strings.TrimSuffix(strings.TrimSuffix(fieldName, ".keyword"), ".ngram")
@@ -20624,64 +21596,7 @@ func matchesAnyGlob(path string, patterns []string) bool {
 }
 
 func formatDateHistogramKeyAsString(epochMs int64, spec *esast.DateHistogramAggSpec) string {
-	var tzOffsetMs int64
-	var formatStr string
-	if spec != nil {
-		tzOffsetMs = spec.EffectiveTimeZoneOffsetMs()
-		formatStr = strings.TrimSpace(spec.Format)
-		if idx := strings.Index(formatStr, "||"); idx > 0 {
-			formatStr = strings.TrimSpace(formatStr[:idx])
-		}
-	}
-	loc := time.UTC
-	if tzOffsetMs != 0 {
-		loc = time.FixedZone("ES_TZ", int(tzOffsetMs/1000))
-	}
-	t := time.UnixMilli(epochMs).In(loc)
-	switch strings.ToLower(formatStr) {
-	case "":
-		if tzOffsetMs != 0 {
-			return t.Format("2006-01-02T15:04:05.000-07:00")
-		}
-		return t.UTC().Format("2006-01-02T15:04:05.000Z")
-	case "epoch_millis":
-		return strconv.FormatInt(epochMs, 10)
-	case "epoch_second":
-		return strconv.FormatInt(int64(math.Floor(float64(epochMs)/1000.0)), 10)
-	case "strict_date_optional_time", "date_optional_time", "date_time":
-		if tzOffsetMs != 0 {
-			return t.Format("2006-01-02T15:04:05.000-07:00")
-		}
-		return t.UTC().Format("2006-01-02T15:04:05.000Z")
-	case "strict_date", "date", "year_month_day":
-		return t.Format("2006-01-02")
-	default:
-		goFmt := strings.ReplaceAll(formatStr, "''", "\x00")
-		goFmt = strings.ReplaceAll(goFmt, "'T'", "T")
-		goFmt = strings.ReplaceAll(goFmt, "'Z'", "\x01")
-		replacements := []struct{ from, to string }{
-			{"yyyy", "2006"},
-			{"YYYY", "2006"},
-			{"uuuu", "2006"},
-			{"yy", "06"},
-			{"YY", "06"},
-			{"MM", "01"},
-			{"dd", "02"},
-			{"HH", "15"},
-			{"mm", "04"},
-			{"ss", "05"},
-			{"SSS", "000"},
-			{"XXX", "-07:00"},
-			{"Z", "-0700"},
-		}
-		for _, r := range replacements {
-			goFmt = strings.ReplaceAll(goFmt, r.from, r.to)
-		}
-		goFmt = strings.ReplaceAll(goFmt, "\x01", "Z")
-		goFmt = strings.ReplaceAll(goFmt, "'", "")
-		goFmt = strings.ReplaceAll(goFmt, "\x00", "'")
-		return t.Format(goFmt)
-	}
+	return formatDateHistogramKeyAsStringRound60(epochMs, spec)
 }
 
 func sortedOrderMapKeys(m map[string]any) []string {
@@ -21909,24 +22824,84 @@ func (s *Server) applySearchRoutingToAliasFilters(rawIndexPattern string, target
 	}
 
 	for idxName, allowedSet := range routingRestrictions {
+		numShards := 1
+		routingNumShards := 1
+		if cs := s.indexCustomSettings[idxName]; cs != nil {
+			for _, k := range []string{"number_of_shards", "index.number_of_shards"} {
+				if raw, ok := cs[k]; ok && raw != nil {
+					if n, err := strconv.Atoi(strings.TrimSpace(fmt.Sprintf("%v", raw))); err == nil && n > 0 {
+						numShards = n
+						break
+					}
+				}
+			}
+			for _, k := range []string{"number_of_routing_shards", "index.number_of_routing_shards"} {
+				if raw, ok := cs[k]; ok && raw != nil {
+					if n, err := strconv.Atoi(strings.TrimSpace(fmt.Sprintf("%v", raw))); err == nil && n > 0 {
+						routingNumShards = n
+						break
+					}
+				}
+			}
+		}
+		if routingNumShards <= 1 {
+			routingNumShards = defaultESRoutingNumShards(numShards)
+		}
+
 		allowedIDsMap := make(map[string]bool)
 		excludedDefaultIDs := make(map[string]bool)
-		if docMap := s.docRouting[idxName]; len(docMap) > 0 {
-			for docID, rt := range docMap {
-				effRt := strings.TrimSpace(rt)
+		if numShards > 1 {
+			allowedShards := make(map[int]bool, len(allowedSet))
+			for rv := range allowedSet {
+				allowedShards[esMurmur3Shard(rv, numShards, routingNumShards)] = true
+			}
+			seenCandidates := make(map[string]bool)
+			docRtMap := s.docRouting[idxName]
+			for docID := range docRtMap {
+				seenCandidates[docID] = true
+			}
+			for docID := range s.docVersions[idxName] {
+				seenCandidates[docID] = true
+			}
+			for docID := range s.docSeqNos[idxName] {
+				if s.docDeleted == nil || !s.docDeleted[idxName][docID] {
+					seenCandidates[docID] = true
+				}
+			}
+			for docID := range seenCandidates {
+				effRt := strings.TrimSpace(docRtMap[docID])
 				if effRt == "" {
 					effRt = docID
 				}
-				if allowedSet[effRt] {
+				if allowedShards[esMurmur3Shard(effRt, numShards, routingNumShards)] {
 					allowedIDsMap[docID] = true
 				} else {
 					excludedDefaultIDs[docID] = true
 				}
 			}
-		}
-		for rv := range allowedSet {
-			if !excludedDefaultIDs[rv] {
-				allowedIDsMap[rv] = true
+			for rv := range allowedSet {
+				if !excludedDefaultIDs[rv] {
+					allowedIDsMap[rv] = true
+				}
+			}
+		} else {
+			if docMap := s.docRouting[idxName]; len(docMap) > 0 {
+				for docID, rt := range docMap {
+					effRt := strings.TrimSpace(rt)
+					if effRt == "" {
+						effRt = docID
+					}
+					if allowedSet[effRt] {
+						allowedIDsMap[docID] = true
+					} else {
+						excludedDefaultIDs[docID] = true
+					}
+				}
+			}
+			for rv := range allowedSet {
+				if !excludedDefaultIDs[rv] {
+					allowedIDsMap[rv] = true
+				}
 			}
 		}
 		allowedIDs := make([]string, 0, len(allowedIDsMap))
@@ -21934,6 +22909,9 @@ func (s *Server) applySearchRoutingToAliasFilters(rawIndexPattern string, target
 			allowedIDs = append(allowedIDs, id)
 		}
 		sort.Strings(allowedIDs)
+		if len(allowedIDs) == 0 {
+			allowedIDs = []string{"__NO_MATCHING_ROUTING_SHARD_DOCS__"}
+		}
 		idsQuery := esast.Query{
 			Ids: &esast.IdsQuery{Values: allowedIDs},
 		}
@@ -22300,7 +23278,7 @@ func (s *Server) resolveWriteIndexWithFilter(nameOrAlias string) (string, *esast
 				}
 				return writeTargets[0], f, true, nil
 			}
-			return "", nil, true, fmt.Errorf("alias [%s] has more than one index associated with it %v, cannot execute a single index op without is_write_index=true", nameOrAlias, targets)
+			return "", nil, true, fmt.Errorf("no write index is defined for alias [%s]. The write index may be explicitly disabled using is_write_index=false or the alias points to multiple indices without one being designated as a write index", nameOrAlias)
 		}
 		if ds, ok := s.dataStreams[nameOrAlias]; ok {
 			if rawIndices, okI := ds["indices"].([]any); okI && len(rawIndices) > 0 {
@@ -22521,15 +23499,22 @@ func (s *Server) evalRuntimeMappingsOnHitRows(idxSchema *schema.IndexSchema, req
 				p[k] = v
 			}
 			p["_source"] = doc
-			res, err := painless.Eval(evalDoc, scriptSrc, p)
 			var rawVals []any
-			if emitted, ok := p["__emitted_vals"].([]any); ok && len(emitted) > 0 {
-				rawVals = emitted
-			} else if err == nil && res != nil {
-				if arr, ok := res.([]any); ok {
-					rawVals = arr
-				} else {
-					rawVals = []any{res}
+			if emitCtx, okCtx := runtimeFieldTypeToEmitContextRound60(prop.Type); okCtx && strings.Contains(scriptSrc, "emit(") {
+				emitted, errEmit := painless.EvalEmitContext(scriptSrc, emitCtx, evalDoc, doc, p, extractSchemaFieldTypesMapRound60(idxSchema))
+				if errEmit == nil && len(emitted) > 0 {
+					rawVals = emitted
+				}
+			} else {
+				res, err := painless.Eval(evalDoc, scriptSrc, p)
+				if emitted, ok := p["__emitted_vals"].([]any); ok && len(emitted) > 0 {
+					rawVals = emitted
+				} else if err == nil && res != nil {
+					if arr, ok := res.([]any); ok {
+						rawVals = arr
+					} else {
+						rawVals = []any{res}
+					}
 				}
 			}
 			if len(rawVals) == 0 {
@@ -22632,7 +23617,7 @@ func (s *Server) evalRuntimeMappingsOnHitRows(idxSchema *schema.IndexSchema, req
 						}
 					}
 				default:
-					coercedVals = append(coercedVals, fmt.Sprintf("%v", rv))
+					coercedVals = append(coercedVals, painless.FormatValueSafe(rv))
 				}
 			}
 			if len(coercedVals) == 0 {
@@ -23069,8 +24054,6 @@ func setESCompatHeaders(w http.ResponseWriter, r *http.Request) {
 	accept := r.Header.Get("Accept")
 	reqCT := r.Header.Get("Content-Type")
 	switch {
-	case strings.Contains(accept, "compatible-with=9") || strings.Contains(reqCT, "compatible-with=9"):
-		w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=9")
 	case strings.Contains(accept, "compatible-with=8") || strings.Contains(reqCT, "compatible-with=8"):
 		w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=8")
 	case strings.Contains(accept, "compatible-with=7") || strings.Contains(reqCT, "compatible-with=7"):
@@ -23089,16 +24072,53 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	if len(opts.filterPaths) > 0 {
 		v = applyESFilterPath(v, opts.filterPaths)
 	}
-	w.WriteHeader(status)
-	enc := json.NewEncoder(w)
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
 	if opts.pretty {
 		enc.SetIndent("", "  ")
 	}
-	_ = enc.Encode(v)
+	if err := enc.Encode(v); err != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+		return
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(buf.Bytes())
 }
 
 func writeESError(w http.ResponseWriter, status int, errType, reason string) {
 	opts, _ := extractESResponseFormatOptions(w)
+	if strings.HasPrefix(reason, "all_shards_failed|") {
+		parts := strings.SplitN(reason, "|", 3)
+		if len(parts) == 3 {
+			rootType := parts[1]
+			rootReason := parts[2]
+			rootCause := map[string]any{"type": rootType, "reason": rootReason}
+			errObj := map[string]any{
+				"root_cause": []map[string]any{rootCause},
+				"type":       errType,
+				"reason":     "all shards failed",
+				"phase":      "query",
+				"grouped":    true,
+				"caused_by":  map[string]any{"type": rootType, "reason": rootReason},
+				"failed_shards": []map[string]any{
+					{
+						"shard":  0,
+						"reason": map[string]any{"type": rootType, "reason": rootReason},
+					},
+				},
+			}
+			if opts.errorTrace {
+				trace := fmt.Sprintf("org.elasticsearch.ElasticsearchException$1: %s\n\tat org.elasticsearch.rest.BytesRestResponse.build(BytesRestResponse.java:140)", rootReason)
+				rootCause["stack_trace"] = trace
+				errObj["stack_trace"] = trace
+			}
+			writeJSON(w, status, map[string]any{
+				"error":  errObj,
+				"status": status,
+			})
+			return
+		}
+	}
 	rootCause := map[string]any{"type": errType, "reason": reason}
 	errObj := map[string]any{
 		"root_cause": []map[string]any{rootCause},
@@ -23120,7 +24140,7 @@ func queryHasRuntimeScript(q *esast.Query) bool {
 	if q == nil {
 		return false
 	}
-	if q.Script != nil || q.ScriptScore != nil || q.ParentID != nil || q.MoreLikeThis != nil || q.Percolate != nil {
+	if q.Script != nil || q.ScriptScore != nil || q.ParentID != nil || q.MoreLikeThis != nil || q.Percolate != nil || transpiler.QueryHasIntervalsScript(q) {
 		return true
 	}
 	if q.Wrapper != nil && q.Wrapper.Decoded != nil && queryHasRuntimeScript(q.Wrapper.Decoded) {
@@ -23588,7 +24608,7 @@ func sampleDocsForSampler(docs []runtimeMatchedDoc, spec esast.AggSpec, idxSchem
 		exceeded := false
 		strKeys := make([]string, 0, len(vals))
 		for _, v := range vals {
-			k := fmt.Sprintf("%v", v)
+			k := painless.FormatValueSafe(v)
 			strKeys = append(strKeys, k)
 			if seenPerVal[k] >= maxPerVal {
 				exceeded = true
@@ -23976,6 +24996,9 @@ func evalQueryScriptFilterOnDocWithScore(idxSchema *schema.IndexSchema, doc map[
 				return false
 			}
 		}
+	}
+	if len(q.Intervals) > 0 && !evalIntervalsRuleFilterOnDocRound60(idxSchema, doc, q.Intervals) {
+		return false
 	}
 	if q.Bool != nil {
 		for i := range q.Bool.Must {
@@ -24740,7 +25763,7 @@ func computeRuntimeTermsScriptBucketDocsWithSchema(idxSchema *schema.IndexSchema
 	src, _ := extractScriptSourceAndParams(tSpec.Script)
 	missingStr := ""
 	if tSpec.Missing != nil {
-		missingStr = fmt.Sprintf("%v", tSpec.Missing)
+		missingStr = painless.FormatValueSafe(tSpec.Missing)
 	}
 	for _, md := range docs {
 		effSchema := md.EffectiveSchema(idxSchema)
@@ -24759,7 +25782,7 @@ func computeRuntimeTermsScriptBucketDocsWithSchema(idxSchema *schema.IndexSchema
 			})
 			for _, el := range rawVals {
 				if el != nil {
-					s := fmt.Sprintf("%v", el)
+					s := formatTermsScriptScalarKeyRound60(el, tSpec, hasFieldBinding, fieldBinding)
 					if s != "" {
 						vals = append(vals, s)
 					}
@@ -24774,7 +25797,7 @@ func computeRuntimeTermsScriptBucketDocsWithSchema(idxSchema *schema.IndexSchema
 			nowUTC := time.Now().UTC()
 			for _, rv := range collectSchemaAwareScalarValues(md.doc, tSpec.Field, pathSegs, effSchema) {
 				if rv != nil {
-					s := fmt.Sprintf("%v", rv)
+					s := painless.FormatValueSafe(rv)
 					if s != "" {
 						if hasFieldBinding {
 							if fieldBinding.ESType == "date" || fieldBinding.ESType == "date_nanos" {

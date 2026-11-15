@@ -737,23 +737,23 @@ func TestRound11TermsEnumCaseInsensitiveAndExplainAndSimulateIngest(t *testing.T
 	simRes := mustReq(t, ts, http.MethodPost, "/_ingest/pipeline/_simulate", `{
 		"pipeline": {
 			"processors": [
+				{"drop": {"if": "ctx.should_drop == true"}},
 				{"set": {"field": "env", "value": "prod", "override": false}},
 				{"set": {"field": "env_copy", "copy_from": "env"}},
 				{"set": {"field": "banner", "value": "welcome-{{env}}-{{{msg}}}"}},
 				{"default": {"field": "region", "value": "us-east-1"}},
-				{"split": {"field": "csv", "separator": ","}},
+				{"split": {"field": "csv", "separator": ",", "ignore_missing": true}},
 				{"append": {"field": "csv", "value": ["d"], "if": "ctx.env == 'prod' && ctx.env != 'dev'"}},
 				{"append": {"field": "csv", "value": ["e"], "if": "ctx.csv.contains('a') && !ctx.missing_flag"}},
-				{"join": {"field": "csv", "separator": "|", "target_field": "joined"}},
-				{"convert": {"field": "port_str", "type": "integer", "target_field": "port"}},
+				{"join": {"field": "csv", "separator": "|", "target_field": "joined", "ignore_missing": true}},
+				{"convert": {"field": "port_str", "type": "integer", "target_field": "port", "ignore_missing": true}},
 				{"convert": {"field": "ratio_str", "type": "float", "target_field": "ratio", "if": "ctx.port >= 8000"}},
 				{"convert": {"field": "active_str", "type": "boolean", "target_field": "active", "if": "ctx.port <= 9000"}},
 				{"convert": {"field": "port", "type": "string", "target_field": "port_back", "if": "ctx.port > 80 && ctx.port < 9000"}},
-				{"gsub": {"field": "msg", "pattern": "foo", "replacement": "bar"}},
-				{"json": {"field": "raw_json", "target_field": "parsed"}},
-				{"json": {"field": "root_json", "add_to_root": true}},
-				{"script": {"source": "ctx.port += 1"}},
-				{"drop": {"if": "ctx.should_drop == true"}}
+				{"gsub": {"field": "msg", "pattern": "foo", "replacement": "bar", "ignore_missing": true}},
+				{"json": {"field": "raw_json", "target_field": "parsed", "ignore_missing": true}},
+				{"json": {"field": "root_json", "add_to_root": true, "ignore_missing": true}},
+				{"script": {"source": "ctx.port += 1"}}
 			]
 		},
 		"docs": [

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -71,6 +72,156 @@ func isValidESScriptContext(ctx string) bool {
 		return true
 	}
 	return false
+}
+
+func isEmitFieldExecuteContextRound60(ctx string) bool {
+	switch strings.ToLower(strings.TrimSpace(ctx)) {
+	case "boolean_field", "long_field", "double_field", "keyword_field",
+		"date_field", "ip_field", "geo_point_field":
+		return true
+	}
+	return false
+}
+
+func extractSchemaFieldTypesMapRound60(idxSchema *schema.IndexSchema) map[string]string {
+	if idxSchema == nil || len(idxSchema.Fields) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(idxSchema.Fields))
+	for k, fb := range idxSchema.Fields {
+		if fb.ESType != "" {
+			out[k] = fb.ESType
+			clean := strings.TrimSuffix(strings.TrimSuffix(k, ".keyword"), ".ngram")
+			if clean != "" && out[clean] == "" {
+				out[clean] = fb.ESType
+			}
+		}
+	}
+	return out
+}
+
+func normalizeJSONNumbersPreservingFloatDotRound60(v any) any {
+	switch tv := v.(type) {
+	case json.Number:
+		s := tv.String()
+		if strings.ContainsAny(s, ".eE") {
+			if fv, err := strconv.ParseFloat(s, 64); err == nil {
+				return fv
+			}
+		}
+		if iv, err := tv.Int64(); err == nil {
+			return iv
+		}
+		if fv, err := strconv.ParseFloat(s, 64); err == nil {
+			return fv
+		}
+		return tv
+	case map[string]any:
+		out := make(map[string]any, len(tv))
+		for k, elem := range tv {
+			out[k] = normalizeJSONNumbersPreservingFloatDotRound60(elem)
+		}
+		return out
+	case []any:
+		out := make([]any, len(tv))
+		for i, elem := range tv {
+			out[i] = normalizeJSONNumbersPreservingFloatDotRound60(elem)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func classifyInnerScriptExceptionRound60(msg string) (string, string) {
+	prefixes := []string{
+		"illegal_argument_exception",
+		"arithmetic_exception",
+		"null_pointer_exception",
+		"class_cast_exception",
+		"index_out_of_bounds_exception",
+		"array_index_out_of_bounds_exception",
+		"string_index_out_of_bounds_exception",
+		"number_format_exception",
+		"unsupported_operation_exception",
+		"illegal_state_exception",
+		"pattern_syntax_exception",
+		"date_time_parse_exception",
+	}
+	lower := strings.ToLower(msg)
+	for _, p := range prefixes {
+		if idx := strings.Index(lower, p+":"); idx >= 0 {
+			reason := strings.TrimSpace(msg[idx+len(p)+1:])
+			return p, reason
+		}
+	}
+	return "illegal_argument_exception", msg
+}
+
+func writePainlessScriptErrorRound60(w http.ResponseWriter, status int, err error) {
+	if err == nil {
+		return
+	}
+	if errors.Is(err, painless.ErrSelfReferencingIterable) {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+		return
+	}
+	var compErr *painless.ScriptCompileError
+	if errors.As(err, &compErr) && compErr != nil {
+		innerType, innerReason := classifyInnerScriptExceptionRound60(compErr.Message)
+		errObj := map[string]any{
+			"root_cause": []any{
+				map[string]any{
+					"type":   "script_exception",
+					"reason": "compile error",
+				},
+			},
+			"type":   "script_exception",
+			"reason": "compile error",
+			"caused_by": map[string]any{
+				"type":   innerType,
+				"reason": innerReason,
+			},
+		}
+		if compErr.Position != nil {
+			posMap := map[string]any{
+				"offset": compErr.Position.Offset,
+				"start":  compErr.Position.Start,
+				"end":    compErr.Position.End,
+			}
+			errObj["position"] = posMap
+			if rc, ok := errObj["root_cause"].([]any); ok && len(rc) > 0 {
+				if rc0, okM := rc[0].(map[string]any); okM {
+					rc0["position"] = posMap
+				}
+			}
+		}
+		writeJSON(w, status, map[string]any{
+			"error":  errObj,
+			"status": status,
+		})
+		return
+	}
+	msg := err.Error()
+	innerType, innerReason := classifyInnerScriptExceptionRound60(msg)
+	errObj := map[string]any{
+		"root_cause": []any{
+			map[string]any{
+				"type":   "script_exception",
+				"reason": "runtime error",
+			},
+		},
+		"type":   "script_exception",
+		"reason": msg,
+		"caused_by": map[string]any{
+			"type":   innerType,
+			"reason": innerReason,
+		},
+	}
+	writeJSON(w, status, map[string]any{
+		"error":  errObj,
+		"status": status,
+	})
 }
 
 func (s *Server) handleScriptsAPI(w http.ResponseWriter, r *http.Request) {
@@ -152,6 +303,18 @@ func (s *Server) handleScriptsAPI(w http.ResponseWriter, r *http.Request) {
 		default:
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("script_lang not supported [%s]", lang))
 			return
+		}
+		switch lang {
+		case "mustache":
+			if err := validateMustacheTemplateSyntax(src); err != nil {
+				writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
+				return
+			}
+		case "painless":
+			if err := painless.CompileValidate(src); err != nil {
+				writePainlessScriptErrorRound60(w, http.StatusBadRequest, err)
+				return
+			}
 		}
 		stored := map[string]any{
 			"lang":   lang,
@@ -253,6 +416,21 @@ func (s *Server) handlePainlessExecute(w http.ResponseWriter, r *http.Request) {
 	ctxName, _ := payload["context"].(string)
 	ctxName = strings.ToLower(strings.TrimSpace(ctxName))
 
+	if isEmitFieldExecuteContextRound60(ctxName) {
+		if m, okM := rawScript.(map[string]any); okM {
+			if idStr, _ := m["id"].(string); strings.TrimSpace(idStr) != "" {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("context [%s] does not support stored scripts", ctxName))
+				return
+			}
+		}
+	}
+
+	if err := painless.CompileValidate(src); err != nil {
+		writePainlessScriptErrorRound60(w, http.StatusBadRequest, err)
+		return
+	}
+
 	docMap := make(map[string]any)
 	var indexName string
 	if cs, okCS := payload["context_setup"].(map[string]any); okCS {
@@ -260,19 +438,43 @@ func (s *Server) handlePainlessExecute(w http.ResponseWriter, r *http.Request) {
 			indexName = strings.TrimSpace(idx)
 		}
 		if d, okD := cs["document"].(map[string]any); okD {
-			docMap = deepCloneDocMap(d)
+			if normD, okND := normalizeJSONNumbersPreservingFloatDotRound60(deepCloneDocMap(d)).(map[string]any); okND {
+				docMap = normD
+			} else {
+				docMap = deepCloneDocMap(d)
+			}
 		}
 	}
 	var idxSchema *schema.IndexSchema
 	if indexName != "" {
 		idxSchema = s.getOrCompileReadOnlySchema(r.Context(), indexName)
 	}
+	fieldTypes := extractSchemaFieldTypesMapRound60(idxSchema)
 	evalDoc := prepareDocForRuntimeScript(idxSchema, docMap)
 	if params == nil {
 		params = make(map[string]any)
+	} else if normP, okNP := normalizeJSONNumbersPreservingFloatDotRound60(params).(map[string]any); okNP {
+		params = normP
 	}
 	if _, hasSrc := params["_source"]; !hasSrc {
-		params["_source"] = evalDoc
+		params["_source"] = docMap
+	}
+
+	if isEmitFieldExecuteContextRound60(ctxName) {
+		vals, err := painless.EvalEmitContext(src, ctxName, evalDoc, docMap, params, fieldTypes)
+		if err != nil {
+			writePainlessScriptErrorRound60(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := painless.ValidateAcyclicValue(vals); err != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+			return
+		}
+		if vals == nil {
+			vals = []any{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"result": vals})
+		return
 	}
 
 	switch ctxName {
@@ -282,7 +484,7 @@ func (s *Server) handlePainlessExecute(w http.ResponseWriter, r *http.Request) {
 		}
 		score, okScore, err := painless.EvalNumber(evalDoc, src, params)
 		if err != nil {
-			writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
+			writePainlessScriptErrorRound60(w, http.StatusBadRequest, err)
 			return
 		}
 		if !okScore {
@@ -292,7 +494,7 @@ func (s *Server) handlePainlessExecute(w http.ResponseWriter, r *http.Request) {
 	case "filter":
 		matched, err := painless.EvalFilter(evalDoc, src, params)
 		if err != nil {
-			writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
+			writePainlessScriptErrorRound60(w, http.StatusBadRequest, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"result": matched})
@@ -302,7 +504,11 @@ func (s *Server) handlePainlessExecute(w http.ResponseWriter, r *http.Request) {
 		}
 		val, err := painless.Eval(evalDoc, src, params)
 		if err != nil {
-			writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
+			writePainlessScriptErrorRound60(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := painless.ValidateAcyclicValue(val); err != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
 			return
 		}
 		if _, hadExplicitReturn := params["__had_explicit_return"]; hadExplicitReturn {
@@ -313,8 +519,13 @@ func (s *Server) handlePainlessExecute(w http.ResponseWriter, r *http.Request) {
 				delete(m, "__meta_index")
 				delete(m, "__meta_version")
 				delete(m, "__raw_source")
+				delete(m, "__strict_doc_fields")
 				delete(m, "_ingest")
 				delete(m, "__internal_ingest_orig")
+				if err := painless.ValidateAcyclicValue(m); err != nil {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+					return
+				}
 				writeJSON(w, http.StatusOK, map[string]any{"result": m})
 				return
 			}
@@ -326,16 +537,48 @@ func (s *Server) handlePainlessExecute(w http.ResponseWriter, r *http.Request) {
 		cleaned := make(map[string]any, len(evalDoc))
 		for k, v := range evalDoc {
 			switch k {
-			case "__doc_values", "__fields", "__meta_id", "__meta_index", "__meta_version", "__raw_source", "_ingest", "__internal_ingest_orig":
+			case "__doc_values", "__fields", "__meta_id", "__meta_index", "__meta_version", "__raw_source", "__strict_doc_fields", "_ingest", "__internal_ingest_orig":
 				continue
 			}
 			cleaned[k] = v
+		}
+		if err := painless.ValidateAcyclicValue(cleaned); err != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"result": cleaned})
 	default:
 		val, err := painless.Eval(evalDoc, src, params)
 		if err != nil {
-			writeESError(w, http.StatusBadRequest, "script_exception", err.Error())
+			writePainlessScriptErrorRound60(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := painless.ValidateAcyclicValue(val); err != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+			return
+		}
+		if ctxName == "" || ctxName == "painless_test" {
+			switch tv := val.(type) {
+			case nil:
+				writeJSON(w, http.StatusOK, map[string]any{"result": "null"})
+			case string:
+				writeJSON(w, http.StatusOK, map[string]any{"result": tv})
+			case bool, int, int64, uint64, float64, json.Number:
+				writeJSON(w, http.StatusOK, map[string]any{"result": painless.FormatValueSafe(tv)})
+			default:
+				if b, errM := json.Marshal(val); errM == nil {
+					var decoded any
+					dec := json.NewDecoder(bytes.NewReader(b))
+					dec.UseNumber()
+					if errU := dec.Decode(&decoded); errU == nil {
+						if strVal, isStr := decoded.(string); isStr {
+							writeJSON(w, http.StatusOK, map[string]any{"result": strVal})
+							return
+						}
+					}
+				}
+				writeJSON(w, http.StatusOK, map[string]any{"result": painless.FormatValueSafe(val)})
+			}
 			return
 		}
 		switch val.(type) {
@@ -354,7 +597,7 @@ func (s *Server) handlePainlessExecute(w http.ResponseWriter, r *http.Request) {
 				}
 				writeJSON(w, http.StatusOK, map[string]any{"result": string(b)})
 			} else {
-				writeJSON(w, http.StatusOK, map[string]any{"result": fmt.Sprintf("%v", val)})
+				writeJSON(w, http.StatusOK, map[string]any{"result": painless.FormatValueSafe(val)})
 			}
 		}
 	}
@@ -944,6 +1187,151 @@ func (s *Server) validateStoredScriptsInAggs(aggs map[string]esast.AggSpec) stri
 // F4: Mustache Search Templates (`/_search/template`, `/_render/template`, `/_msearch/template`)
 // ============================================================================
 
+type mustacheTemplateError struct {
+	errType string
+	reason  string
+}
+
+func (e *mustacheTemplateError) Error() string {
+	return e.reason
+}
+
+func validateMustacheTemplateSyntax(tpl string) error {
+	var stack []string
+	i := 0
+	n := len(tpl)
+	for i < n {
+		openIdx := strings.Index(tpl[i:], "{{")
+		if openIdx < 0 {
+			break
+		}
+		tagStart := i + openIdx
+		if tagStart+3 <= n && tpl[tagStart:tagStart+3] == "{{{" {
+			closeDouble := strings.Index(tpl[tagStart+3:], "}}")
+			if closeDouble < 0 {
+				return &mustacheTemplateError{errType: "script_exception", reason: "Improperly closed variable in query-template:1"}
+			}
+			absClose := tagStart + 3 + closeDouble
+			if absClose+2 >= n || tpl[absClose+2] != '}' {
+				return &mustacheTemplateError{errType: "script_exception", reason: "Improperly closed variable in query-template:1"}
+			}
+			inner := strings.TrimSpace(tpl[tagStart+3 : absClose])
+			if inner == "" || strings.Contains(inner, "{{") {
+				return &mustacheTemplateError{errType: "script_exception", reason: "Improperly closed variable in query-template:1"}
+			}
+			i = absClose + 3
+			continue
+		}
+		closeIdx := strings.Index(tpl[tagStart+2:], "}}")
+		if closeIdx < 0 {
+			return &mustacheTemplateError{errType: "script_exception", reason: "Improperly closed variable in query-template:1"}
+		}
+		rawInner := tpl[tagStart+2 : tagStart+2+closeIdx]
+		if strings.Contains(rawInner, "{{") {
+			return &mustacheTemplateError{errType: "script_exception", reason: "Improperly closed variable in query-template:1"}
+		}
+		rawTag := strings.TrimSpace(rawInner)
+		afterOpenTag := tagStart + 2 + closeIdx + 2
+		if rawTag == "" {
+			return &mustacheTemplateError{errType: "script_exception", reason: "Empty tag in query-template:1"}
+		}
+		switch rawTag[0] {
+		case '!':
+			// Comment
+		case '#', '^':
+			secBody := strings.TrimSpace(rawTag[1:])
+			if secBody == "" {
+				return &mustacheTemplateError{errType: "script_exception", reason: "Empty section name in query-template:1"}
+			}
+			secName := secBody
+			switch {
+			case secBody == "toJson" || strings.HasPrefix(secBody, "toJson "):
+				secName = "toJson"
+			case secBody == "join" || strings.HasPrefix(secBody, "join "):
+				secName = "join"
+			case secBody == "url":
+				secName = "url"
+			}
+			stack = append(stack, secName)
+		case '/':
+			closeName := strings.TrimSpace(rawTag[1:])
+			if len(stack) == 0 {
+				return &mustacheTemplateError{errType: "script_exception", reason: fmt.Sprintf("Closed section %s with no open section", closeName)}
+			}
+			top := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			if top != closeName {
+				return &mustacheTemplateError{errType: "script_exception", reason: fmt.Sprintf("Closed %s when %s was open", closeName, top)}
+			}
+		}
+		i = afterOpenTag
+	}
+	if len(stack) > 0 {
+		return &mustacheTemplateError{errType: "script_exception", reason: fmt.Sprintf("Unclosed %s section", stack[len(stack)-1])}
+	}
+	return nil
+}
+
+var knownMustacheSearchQueryTypes = map[string]bool{
+	"match": true, "match_all": true, "match_none": true, "match_phrase": true, "match_phrase_prefix": true,
+	"match_bool_prefix": true, "multi_match": true, "common": true, "query_string": true, "simple_query_string": true,
+	"term": true, "terms": true, "terms_set": true, "range": true, "exists": true, "prefix": true, "wildcard": true,
+	"regexp": true, "fuzzy": true, "ids": true, "bool": true, "boosting": true, "constant_score": true,
+	"dis_max": true, "function_score": true, "script_score": true, "nested": true, "has_child": true, "has_parent": true,
+	"parent_id": true, "geo_bounding_box": true, "geo_distance": true, "geo_polygon": true, "geo_shape": true,
+	"percolate": true, "more_like_this": true, "script": true, "wrapper": true, "pinned": true, "intervals": true,
+	"span_term": true, "span_multi": true, "span_first": true, "span_near": true, "span_or": true, "span_not": true,
+	"span_containing": true, "span_within": true, "span_field_masking": true, "distance_feature": true, "rank_feature": true,
+	"combined_fields": true, "knn": true,
+}
+
+func classifyRenderedTemplateJSONError(trimmed string, err error) error {
+	// Streaming XContentParser reports unknown query [<name>] before trailing brace EOF if `"query": {"<unknown>":` appears first.
+	if qIdx := strings.Index(trimmed, `"query"`); qIdx >= 0 {
+		rest := trimmed[qIdx+len(`"query"`):]
+		if colon := strings.IndexByte(rest, ':'); colon >= 0 {
+			rest = strings.TrimSpace(rest[colon+1:])
+			if strings.HasPrefix(rest, "{") {
+				rest = strings.TrimSpace(rest[1:])
+				if strings.HasPrefix(rest, `"`) {
+					endQ := strings.IndexByte(rest[1:], '"')
+					if endQ > 0 {
+						qName := rest[1 : 1+endQ]
+						afterQ := strings.TrimSpace(rest[1+endQ+1:])
+						if strings.HasPrefix(afterQ, ":") && !knownMustacheSearchQueryTypes[qName] {
+							return &mustacheTemplateError{
+								errType: "parsing_exception",
+								reason:  fmt.Sprintf("unknown query [%s]", qName),
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	errMsg := err.Error()
+	if strings.Contains(errMsg, "unexpected end of JSON input") || strings.Contains(errMsg, "EOF") {
+		return &mustacheTemplateError{
+			errType: "json_e_o_f_exception",
+			reason:  "Unexpected end of input: " + errMsg,
+		}
+	}
+	return &mustacheTemplateError{
+		errType: "parsing_exception",
+		reason:  fmt.Sprintf("rendered mustache template is not valid JSON: %v (rendered: %s)", err, trimmed),
+	}
+}
+
+func mustacheErrTypeAndReason(err error) (string, string) {
+	if err == nil {
+		return "", ""
+	}
+	if me, ok := err.(*mustacheTemplateError); ok {
+		return me.errType, me.reason
+	}
+	return "parsing_exception", err.Error()
+}
+
 func renderMustacheSearchTemplate(tplSource any, params map[string]any) (json.RawMessage, error) {
 	if params == nil {
 		params = map[string]any{}
@@ -968,15 +1356,17 @@ func renderMustacheSearchTemplate(tplSource any, params map[string]any) (json.Ra
 		}
 		tplStr = string(b)
 	}
+	if synErr := validateMustacheTemplateSyntax(tplStr); synErr != nil {
+		return nil, synErr
+	}
 	rendered := evalMustacheBlock(tplStr, params, nil)
 	trimmed := strings.TrimSpace(rendered)
 	if trimmed == "" {
 		return json.RawMessage(`{}`), nil
 	}
-	// Validate JSON or normalize if needed
 	var check any
 	if err := json.Unmarshal([]byte(trimmed), &check); err != nil {
-		return nil, fmt.Errorf("rendered mustache template is not valid JSON: %w (rendered: %s)", err, trimmed)
+		return nil, classifyRenderedTemplateJSONError(trimmed, err)
 	}
 	return json.RawMessage(trimmed), nil
 }
@@ -1325,6 +1715,11 @@ func (s *Server) resolveTemplateSourceAndParams(r *http.Request, pathID string, 
 	if tplID == "" {
 		tplID = pathID
 	}
+	if tplSource != nil {
+		if sv, isStr := tplSource.(string); isStr && strings.TrimSpace(sv) == "" {
+			return nil, nil, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: template is missing;"
+		}
+	}
 	if tplSource == nil && tplID != "" {
 		stored, ok := s.lookupStoredScript(tplID)
 		if !ok {
@@ -1343,7 +1738,7 @@ func (s *Server) resolveTemplateSourceAndParams(r *http.Request, pathID string, 
 		}
 	}
 	if tplSource == nil {
-		return nil, nil, http.StatusBadRequest, "illegal_argument_exception", "search template must specify either [source] or [id]"
+		return nil, nil, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: template is missing;"
 	}
 	return tplSource, params, http.StatusOK, "", ""
 }
@@ -1373,7 +1768,8 @@ func (s *Server) handleRenderSearchTemplate(w http.ResponseWriter, r *http.Reque
 	}
 	renderedJSON, err := renderMustacheSearchTemplate(tplSource, params)
 	if err != nil {
-		writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+		et, er := mustacheErrTypeAndReason(err)
+		writeESError(w, http.StatusBadRequest, et, er)
 		return
 	}
 	renderedJSON = coerceSearchTemplateNumericFields(renderedJSON)
@@ -1384,7 +1780,7 @@ func (s *Server) handleRenderSearchTemplate(w http.ResponseWriter, r *http.Reque
 		writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 		"template_output": parsed,
 	})
 }
@@ -1585,7 +1981,8 @@ func (s *Server) handleSearchTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 	renderedJSON, err := renderMustacheSearchTemplate(tplSource, params)
 	if err != nil {
-		writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+		et, er := mustacheErrTypeAndReason(err)
+		writeESError(w, http.StatusBadRequest, et, er)
 		return
 	}
 	renderedJSON = coerceSearchTemplateNumericFields(renderedJSON)
@@ -1664,23 +2061,40 @@ func (s *Server) handleMSearchTemplate(w http.ResponseWriter, r *http.Request) {
 		if err := dec.Decode(&body); err != nil {
 			perItemErrors[idx] = map[string]any{
 				"status": http.StatusBadRequest,
-				"error":  map[string]any{"type": "parsing_exception", "reason": err.Error()},
+				"error": map[string]any{
+					"root_cause": []map[string]any{{"type": "parsing_exception", "reason": err.Error()}},
+					"type":       "parsing_exception",
+					"reason":     err.Error(),
+				},
 			}
 			continue
 		}
 		tplSource, params, status, errType, errReason := s.resolveTemplateSourceAndParams(r, "", body)
 		if errType != "" {
+			if status == http.StatusBadRequest && errType == "action_request_validation_exception" {
+				writeESError(w, status, errType, errReason)
+				return
+			}
 			perItemErrors[idx] = map[string]any{
 				"status": status,
-				"error":  map[string]any{"type": errType, "reason": errReason},
+				"error": map[string]any{
+					"root_cause": []map[string]any{{"type": errType, "reason": errReason}},
+					"type":       errType,
+					"reason":     errReason,
+				},
 			}
 			continue
 		}
 		renderedJSON, err := renderMustacheSearchTemplate(tplSource, params)
 		if err != nil {
+			et, er := mustacheErrTypeAndReason(err)
 			perItemErrors[idx] = map[string]any{
 				"status": http.StatusBadRequest,
-				"error":  map[string]any{"type": "parsing_exception", "reason": err.Error()},
+				"error": map[string]any{
+					"root_cause": []map[string]any{{"type": et, "reason": er}},
+					"type":       et,
+					"reason":     er,
+				},
 			}
 			continue
 		}
@@ -1731,7 +2145,7 @@ func (s *Server) handleMSearchTemplate(w http.ResponseWriter, r *http.Request) {
 			finalResponses = append(finalResponses, map[string]any{})
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 		"took":      4,
 		"responses": finalResponses,
 	})
@@ -2760,16 +3174,26 @@ func (s *Server) handleCatNodeattrs(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
+	nodeID := "doris"
+	if isTruthyBoolQueryParam(r, "full_id") {
+		nodeID = "doris-fe-1"
+	}
 	list := []map[string]any{
 		{
 			"node":  "doris-fe-1",
+			"id":    nodeID,
+			"pid":   "1",
 			"host":  "127.0.0.1",
 			"ip":    "127.0.0.1",
+			"port":  "9300",
 			"attr":  "ml.machine_memory",
 			"value": "8589934592",
 		},
 	}
-	writeCatResponse(w, r, []string{"node", "host", "ip", "attr", "value"}, list)
+	writeCatResponseWithHelpCols(w, r,
+		[]string{"node", "host", "ip", "attr", "value"},
+		[]string{"node", "id", "pid", "host", "ip", "port", "attr", "value"},
+		list)
 }
 
 func (s *Server) handleCatPendingTasks(w http.ResponseWriter, r *http.Request) {
@@ -2787,7 +3211,7 @@ func (s *Server) handleCatPlugins(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	list := []map[string]any{}
-	writeCatResponse(w, r, []string{"name", "component", "version", "description"}, list)
+	writeCatResponse(w, r, []string{"id", "name", "component", "version", "description"}, list)
 }
 
 func (s *Server) handleCatRecovery(w http.ResponseWriter, r *http.Request) {
@@ -2795,35 +3219,42 @@ func (s *Server) handleCatRecovery(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
+	_ = s.syncCatalogFromBackend(r.Context())
 	targets := s.resolveTargetIndices(r.PathValue("index"))
 	list := make([]map[string]any, 0, len(targets))
 	for _, idx := range targets {
-		list = append(list, map[string]any{
-			"index":                  idx,
-			"shard":                  "0",
-			"time":                   "1ms",
-			"type":                   "existing_store",
-			"stage":                  "done",
-			"source_host":            "n/a",
-			"source_node":            "n/a",
-			"target_host":            "127.0.0.1",
-			"target_node":            "doris-fe-1",
-			"repository":             "n/a",
-			"snapshot":               "n/a",
-			"files":                  "0",
-			"files_recovered":        "0",
-			"files_percent":          "100.0%",
-			"files_total":            "0",
-			"bytes":                  "0",
-			"bytes_recovered":        "0",
-			"bytes_percent":          "100.0%",
-			"bytes_total":            "0",
-			"translog_ops":           "0",
-			"translog_ops_recovered": "0",
-			"translog_ops_percent":   "100.0%",
-		})
+		numShards, _, _ := s.getIndexShardAndReplicaCounts(idx)
+		for sh := 0; sh < numShards; sh++ {
+			list = append(list, map[string]any{
+				"index":                  idx,
+				"shard":                  strconv.Itoa(sh),
+				"time":                   "1ms",
+				"type":                   "existing_store",
+				"stage":                  "done",
+				"source_host":            "n/a",
+				"source_node":            "n/a",
+				"target_host":            "127.0.0.1",
+				"target_node":            "doris-fe-1",
+				"repository":             "n/a",
+				"snapshot":               "n/a",
+				"files":                  "0",
+				"files_recovered":        "0",
+				"files_percent":          "100.0%",
+				"files_total":            "0",
+				"bytes":                  "0",
+				"bytes_recovered":        "0",
+				"bytes_percent":          "100.0%",
+				"bytes_total":            "0",
+				"translog_ops":           "0",
+				"translog_ops_recovered": "0",
+				"translog_ops_percent":   "100.0%",
+			})
+		}
 	}
-	writeCatResponse(w, r, []string{"index", "shard", "time", "type", "stage", "source_host", "source_node", "target_host", "target_node", "repository", "snapshot", "files", "files_recovered", "files_percent", "files_total", "bytes", "bytes_recovered", "bytes_percent", "bytes_total", "translog_ops", "translog_ops_recovered", "translog_ops_percent"}, list)
+	writeCatResponseWithHelpCols(w, r,
+		[]string{"index", "shard", "time", "type", "stage", "source_host", "target_host", "repository", "snapshot", "files", "files_recovered", "files_percent", "files_total", "bytes", "bytes_recovered", "bytes_percent", "bytes_total", "translog_ops", "translog_ops_recovered", "translog_ops_percent"},
+		[]string{"index", "shard", "time", "type", "stage", "source_host", "source_node", "target_host", "target_node", "repository", "snapshot", "files", "files_recovered", "files_percent", "files_total", "bytes", "bytes_recovered", "bytes_percent", "bytes_total", "translog_ops", "translog_ops_recovered", "translog_ops_percent"},
+		list)
 }
 
 func (s *Server) handleCatRepositories(w http.ResponseWriter, r *http.Request) {
@@ -2858,17 +3289,69 @@ func (s *Server) handleCatSegments(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
-	targets := s.resolveTargetIndices(r.PathValue("index"))
+	segDefaultCols := []string{"index", "shard", "prirep", "ip", "segment", "generation", "docs.count", "docs.deleted", "size", "size.memory", "committed", "searchable", "version", "compound"}
+	segHelpCols := []string{"index", "shard", "prirep", "ip", "id", "segment", "generation", "docs.count", "docs.deleted", "size", "size.memory", "committed", "searchable", "version", "compound"}
+	if isTruthyBoolQueryParam(r, "help") {
+		writeCatResponseWithHelpCols(w, r, segDefaultCols, segHelpCols, nil)
+		return
+	}
+	_ = s.syncCatalogFromBackend(r.Context())
+	rawIndex := strings.TrimSpace(r.PathValue("index"))
+	if rawIndex != "" {
+		if closedIdx := s.findClosedTargetIndex(r, rawIndex); closedIdx != "" && !isTruthyBoolQueryParam(r, "ignore_unavailable") {
+			writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
+			return
+		}
+	}
+	targets, _, ok := s.resolveValidatedReadTargets(w, r, rawIndex)
+	if !ok {
+		return
+	}
+	nodeID := "doris"
+	if isTruthyBoolQueryParam(r, "full_id") {
+		nodeID = "doris-fe-1"
+	}
+	hasAuthCatalog := s.hasAuthoritativeIndexCatalog()
 	list := make([]map[string]any, 0, len(targets))
 	for _, idx := range targets {
+		if s.isIndexClosed(idx) {
+			if !isTruthyBoolQueryParam(r, "ignore_unavailable") && rawIndex != "" {
+				writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", idx))
+				return
+			}
+			continue
+		}
+		var docCount int64 = 1
+		s.mu.RLock()
+		sch := s.indices[idx]
+		s.mu.RUnlock()
+		if sch != nil && s.backend != nil {
+			_ = s.coalescer.FlushTable(r.Context(), sch.DorisTable)
+			cntSQL := fmt.Sprintf("SELECT '' AS agg_name, 'all' AS bucket_key, COUNT(*) AS doc_count, 0.0 AS metric_value FROM `%s`.`%s` WHERE _deleted = 0", sch.DorisDB, sch.DorisTable)
+			if rows, err := s.backend.QueryAggs(r.Context(), cntSQL); err == nil {
+				if len(rows) > 0 {
+					docCount = rows[0].DocCount
+				} else {
+					docCount = 0
+				}
+			} else if hasAuthCatalog {
+				docCount = 0
+			}
+		} else if hasAuthCatalog {
+			docCount = 0
+		}
+		if hasAuthCatalog && docCount <= 0 {
+			continue
+		}
 		list = append(list, map[string]any{
 			"index":        idx,
 			"shard":        "0",
 			"prirep":       "p",
 			"ip":           "127.0.0.1",
+			"id":           nodeID,
 			"segment":      "_0",
 			"generation":   "0",
-			"docs.count":   "0",
+			"docs.count":   strconv.FormatInt(docCount, 10),
 			"docs.deleted": "0",
 			"size":         "1kb",
 			"size.memory":  "0",
@@ -2878,7 +3361,7 @@ func (s *Server) handleCatSegments(w http.ResponseWriter, r *http.Request) {
 			"compound":     "true",
 		})
 	}
-	writeCatResponse(w, r, []string{"index", "shard", "prirep", "ip", "segment", "generation", "docs.count", "docs.deleted", "size", "size.memory", "committed", "searchable", "version", "compound"}, list)
+	writeCatResponseWithHelpCols(w, r, segDefaultCols, segHelpCols, list)
 }
 
 func (s *Server) handleCatTasks(w http.ResponseWriter, r *http.Request) {
@@ -2889,7 +3372,7 @@ func (s *Server) handleCatTasks(w http.ResponseWriter, r *http.Request) {
 	list := []map[string]any{
 		{
 			"action":         "cluster:monitor/tasks/lists",
-			"task_id":        "doris-node-1:1",
+			"task_id":        "doris-fe-1:1",
 			"parent_task_id": "-",
 			"type":           "transport",
 			"start_time":     "1700000000000",
@@ -2898,6 +3381,23 @@ func (s *Server) handleCatTasks(w http.ResponseWriter, r *http.Request) {
 			"ip":             "127.0.0.1",
 			"node":           "doris-fe-1",
 		},
+	}
+	for _, e := range s.getTaskRegistry().activeEntries() {
+		parent := e.parentTaskID
+		if parent == "" {
+			parent = "-"
+		}
+		list = append(list, map[string]any{
+			"action":         e.action,
+			"task_id":        e.fullID,
+			"parent_task_id": parent,
+			"type":           e.taskType,
+			"start_time":     strconv.FormatInt(e.startTimeMs, 10),
+			"timestamp":      e.startTime.UTC().Format("15:04:05"),
+			"running_time":   "1ms",
+			"ip":             "127.0.0.1",
+			"node":           e.node,
+		})
 	}
 	writeCatResponse(w, r, []string{"action", "task_id", "parent_task_id", "type", "start_time", "timestamp", "running_time", "ip", "node"}, list)
 }
@@ -2928,7 +3428,10 @@ func (s *Server) handleCatThreadPool(w http.ResponseWriter, r *http.Request) {
 			"completed": "1",
 		})
 	}
-	writeCatResponse(w, r, []string{"node_name", "name", "active", "queue", "rejected", "completed"}, list)
+	writeCatResponseWithHelpCols(w, r,
+		[]string{"node_name", "name", "active", "queue", "rejected"},
+		[]string{"node_name", "name", "active", "queue", "rejected", "completed"},
+		list)
 }
 
 func (s *Server) handleCatTemplates(w http.ResponseWriter, r *http.Request) {
@@ -2964,95 +3467,6 @@ func (s *Server) handleCatTemplates(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.RUnlock()
 	writeCatResponse(w, r, []string{"name", "index_patterns", "order", "version", "composed_of"}, list)
-}
-
-func (s *Server) handleTasksList(w http.ResponseWriter, r *http.Request) {
-	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"nodes": map[string]any{
-			"doris-node-1": map[string]any{
-				"name":              "doris-fe-1",
-				"transport_address": "127.0.0.1:9030",
-				"host":              "127.0.0.1",
-				"ip":                "127.0.0.1:9030",
-				"roles":             []string{"master", "data", "ingest"},
-				"tasks": map[string]any{
-					"doris-node-1:1": map[string]any{
-						"node":                  "doris-node-1",
-						"id":                    1,
-						"type":                  "transport",
-						"action":                "cluster:monitor/tasks/lists",
-						"start_time_in_millis":  1700000000000,
-						"running_time_in_nanos": 1000,
-						"cancellable":           false,
-					},
-				},
-			},
-		},
-	})
-}
-
-func (s *Server) handleTasksGet(w http.ResponseWriter, r *http.Request) {
-	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
-		return
-	}
-	taskID := strings.TrimSpace(r.PathValue("task_id"))
-	colonIdx := strings.IndexByte(taskID, ':')
-	if colonIdx <= 0 || colonIdx == len(taskID)-1 {
-		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("malformed task id %s", taskID))
-		return
-	}
-	nodeID := taskID[:colonIdx]
-	numID, err := strconv.ParseInt(taskID[colonIdx+1:], 10, 64)
-	if err != nil {
-		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("malformed task id %s", taskID))
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"completed": true,
-		"task": map[string]any{
-			"node":                  nodeID,
-			"id":                    numID,
-			"type":                  "transport",
-			"action":                "indices:data/write/reindex",
-			"start_time_in_millis":  1700000000000,
-			"running_time_in_nanos": 1000,
-			"cancellable":           true,
-		},
-		"response": map[string]any{
-			"took":      1,
-			"timed_out": false,
-			"total":     0,
-			"updated":   0,
-			"created":   0,
-			"deleted":   0,
-		},
-	})
-}
-
-func (s *Server) handleTasksCancel(w http.ResponseWriter, r *http.Request) {
-	if r != nil && r.Method != "" && r.Method != http.MethodPost {
-		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
-		return
-	}
-	if taskID := strings.TrimSpace(r.PathValue("task_id")); taskID != "" {
-		colonIdx := strings.IndexByte(taskID, ':')
-		if colonIdx <= 0 || colonIdx == len(taskID)-1 {
-			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("malformed task id %s", taskID))
-			return
-		}
-		if _, err := strconv.ParseInt(taskID[colonIdx+1:], 10, 64); err != nil {
-			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("malformed task id %s", taskID))
-			return
-		}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"nodes": map[string]any{},
-	})
 }
 
 func (s *Server) handleClusterAllocationExplain(w http.ResponseWriter, r *http.Request) {
@@ -3133,35 +3547,6 @@ func (s *Server) handleClusterReroute(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"acknowledged": true,
 		"state":        map[string]any{},
-	})
-}
-
-func (s *Server) handleNodesHotThreads(w http.ResponseWriter, r *http.Request) {
-	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
-		return
-	}
-	w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("::: {doris-fe-1}{doris-node-1}{127.0.0.1}{127.0.0.1:9030}\n   Hot threads at 2026-01-01T00:00:00Z:\n"))
-}
-
-func (s *Server) handleNodesUsage(w http.ResponseWriter, r *http.Request) {
-	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
-		"cluster_name": "doris-es-cluster",
-		"nodes": map[string]any{
-			"doris-node-1": map[string]any{
-				"timestamp":    1700000000000,
-				"since":        1700000000000,
-				"rest_actions": map[string]any{},
-				"aggregations": map[string]any{},
-			},
-		},
 	})
 }
 

@@ -226,47 +226,7 @@ func (o *painlessOptional) hashCode() int64 {
 }
 
 func computeJavaHashCodePainless(v any) int64 {
-	if v == nil || v == painlessEmptyOptional {
-		return 0
-	}
-	switch tv := v.(type) {
-	case *painlessOptional:
-		return tv.hashCode()
-	case *painlessOffsetTime:
-		return tv.hashCode()
-	case *painlessClock:
-		return tv.hashCode()
-	case *painlessURI:
-		return tv.hashCode()
-	case *painlessURL:
-		return tv.hashCode()
-	case bool:
-		if tv {
-			return 1231
-		}
-		return 1237
-	case int:
-		return int64(int32(tv)) // #nosec G115 -- Java Integer.hashCode
-	case int32:
-		return int64(tv)
-	case int64:
-		return int64(int32(tv ^ (tv >> 32))) // #nosec G115 -- Java Long.hashCode
-	case float64:
-		bits := math.Float64bits(tv)
-		return int64(int32(bits ^ (bits >> 32))) // #nosec G115 -- Java Double.hashCode
-	case string:
-		var h int32
-		for _, r := range tv {
-			h = 31*h + r
-		}
-		return int64(h)
-	default:
-		var h int32
-		for _, r := range fmt.Sprintf("%v", v) {
-			h = 31*h + r
-		}
-		return int64(h)
-	}
+	return computeJavaHashCodeCycleSafeRound60(v, nil, 0)
 }
 
 // ============================================================================
@@ -1666,7 +1626,7 @@ func evalUserClassMethodWithArgsPainless(uo *painlessUserObject, targetCls *pain
 }
 
 func evalValueHashCodePainless(v any, sourceMap, params map[string]any, depth int) int64 {
-	if v == nil || v == painlessEmptyOptional {
+	if v == nil || v == painlessEmptyOptional || depth > 64 {
 		return 0
 	}
 	switch tv := v.(type) {
@@ -1689,7 +1649,7 @@ func evalValueHashCodePainless(v any, sourceMap, params map[string]any, depth in
 			}
 		}
 	}
-	return computeJavaHashCodePainless(v)
+	return computeJavaHashCodeCycleSafeRound60(v, nil, depth)
 }
 
 // ============================================================================
@@ -2124,6 +2084,9 @@ func (u *painlessURL) hashCode() int64 {
 // ============================================================================
 
 func evalRound54ZeroArgMethodPainless(mSuffix, recExpr string, recVal any, sourceMap, params map[string]any, depth int) (any, bool, error) {
+	if r60Res, r60Handled, r60Err := evalRound60ZeroArgMethod(mSuffix, recVal, sourceMap, params, depth); r60Handled {
+		return r60Res, true, r60Err
+	}
 	// Check user object overrides for toString() and hashCode()
 	if uo, isUO := recVal.(*painlessUserObject); isUO && uo != nil && uo.class != nil {
 		switch mSuffix {

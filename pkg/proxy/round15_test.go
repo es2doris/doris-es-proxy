@@ -459,6 +459,7 @@ func TestRound15_PainlessDocValuesAndSearchAggScripts(t *testing.T) {
 	doJSON(t, srv, http.MethodPut, "/r15_script_idx/_doc/3", `{"name": "item3", "price": 5.0, "qty": 1}`)
 
 	res := doJSON(t, srv, http.MethodPost, "/r15_script_idx/_search", `{
+		"track_scores": true,
 		"query": {
 			"script_score": {
 				"query": {

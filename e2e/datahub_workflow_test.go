@@ -369,6 +369,7 @@ func TestV03SecurityGzipSubAggsShadowSlowlogAndEcosystem_E2E(t *testing.T) {
 	createJSON := `{
 		"aliases": {"logs_alias": {}},
 		"mappings": {
+			"dynamic": "runtime",
 			"properties": {
 				"service": {"type": "keyword"},
 				"level": {"type": "keyword"},

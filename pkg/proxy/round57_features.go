@@ -4895,7 +4895,7 @@ func (s *Server) exportSnapshotIndexData(ctx context.Context, indices []string) 
 	opts := s.transpileOpts
 	s.mu.RUnlock()
 
-	opts.MaxResultWindow = 0
+	opts.MaxResultWindow = 1_000_000
 	for _, m := range metas {
 		if s.coalescer != nil {
 			_ = s.coalescer.FlushTable(ctx, m.sch.DorisTable)
@@ -8334,7 +8334,7 @@ func (s *Server) handleCapabilitiesRound57(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// handleSimulateIndexIngestRound57 implements `POST /_ingest/_simulate` (`simulate.ingest`) (F9.3).
+// handleSimulateIndexIngestRound57 implements `POST /_ingest/_simulate` and `POST /{index}/_ingest/_simulate` (`simulate.ingest`) (F9.3).
 func (s *Server) handleSimulateIndexIngestRound57(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
@@ -8344,16 +8344,30 @@ func (s *Server) handleSimulateIndexIngestRound57(w http.ResponseWriter, r *http
 	if !ok {
 		return
 	}
-	indexName, _ := body["index"].(string)
-	indexName = strings.TrimSpace(indexName)
-	if indexName == "" {
-		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: index is missing;")
-		return
+	topIndexName := strings.TrimSpace(r.PathValue("index"))
+	if topIndexName == "" {
+		if bIdx, okIdx := body["index"].(string); okIdx {
+			topIndexName = strings.TrimSpace(bIdx)
+		}
 	}
 	rawDocs, okDocs := body["docs"].([]any)
 	if !okDocs || len(rawDocs) == 0 {
 		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: docs is missing;")
 		return
+	}
+	if topIndexName == "" {
+		for _, rawDocItem := range rawDocs {
+			dm, okM := rawDocItem.(map[string]any)
+			if !okM || dm == nil {
+				writeESError(w, http.StatusBadRequest, "parse_exception", "each entry in [docs] must be an object")
+				return
+			}
+			dIdx, _ := dm["_index"].(string)
+			if strings.TrimSpace(dIdx) == "" {
+				writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: index is missing;")
+				return
+			}
+		}
 	}
 
 	verbose := isTruthyBoolQueryParam(r, "verbose")
@@ -8373,33 +8387,37 @@ func (s *Server) handleSimulateIndexIngestRound57(w http.ResponseWriter, r *http
 				writeESError(w, http.StatusBadRequest, "parse_exception", fmt.Sprintf("pipeline_substitution [%s] must be an object", pName))
 				return
 			}
-			if vErr := validateIngestPipelineSpec(pm); vErr != nil {
-				writeESError(w, http.StatusBadRequest, ingestSpecValidationErrorType(vErr), vErr.Error())
+			if vErr := validateIngestPipelineSpecWithIDRound60(pName, pm); vErr != nil {
+				writeESError(w, http.StatusInternalServerError, ingestSpecValidationErrorType(vErr), vErr.Error())
 				return
 			}
 			substPipes[pName] = pm
 		}
 	}
 
-	// Resolve effective base mapping, default_pipeline, and final_pipeline from index or matching templates
-	s.mu.RLock()
-	var baseMapping *esast.MappingSpec
-	var defaultPipe, finalPipe string
-	if idxSchema := s.indices[indexName]; idxSchema != nil {
-		baseMapping = idxSchema.RawMapping
-		defaultPipe = s.indexDefaultPipelines[indexName]
-		finalPipe = s.indexFinalPipelines[indexName]
-	} else {
-		tplMap, tplDef, hasDef, tplFin, hasFin, _ := s.matchingTemplateConfigLocked(indexName)
-		baseMapping = tplMap
-		if hasDef {
-			defaultPipe = tplDef
+	_ = s.syncCatalogFromBackend(r.Context())
+
+	resolveIndexIngestConfig := func(targetIdx string) (*esast.MappingSpec, string, string) {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		var bm *esast.MappingSpec
+		var defPipe, finPipe string
+		if idxSchema := s.indices[targetIdx]; idxSchema != nil {
+			bm = idxSchema.RawMapping
+			defPipe = s.indexDefaultPipelines[targetIdx]
+			finPipe = s.indexFinalPipelines[targetIdx]
+		} else {
+			tplMap, tplDef, hasDef, tplFin, hasFin, _ := s.matchingTemplateConfigLocked(targetIdx)
+			bm = tplMap
+			if hasDef {
+				defPipe = tplDef
+			}
+			if hasFin {
+				finPipe = tplFin
+			}
 		}
-		if hasFin {
-			finalPipe = tplFin
-		}
+		return bm, defPipe, finPipe
 	}
-	s.mu.RUnlock()
 
 	lookupPipe := func(pipeID string) (map[string]any, bool) {
 		if sub, ok := substPipes[pipeID]; ok {
@@ -8409,14 +8427,6 @@ func (s *Server) handleSimulateIndexIngestRound57(w http.ResponseWriter, r *http
 		p, ok := s.pipelines[pipeID]
 		s.mu.RUnlock()
 		return p, ok
-	}
-
-	compiledSchema := schema.CompileIndexSchema(s.dorisDB, indexName, baseMapping)
-	existingDeclaredProps := make(map[string]esast.FieldProperty)
-	if baseMapping != nil && baseMapping.Properties != nil {
-		for k, v := range baseMapping.Properties {
-			existingDeclaredProps[k] = v
-		}
 	}
 
 	mappingAdditions := make(map[string]any)
@@ -8429,7 +8439,7 @@ func (s *Server) handleSimulateIndexIngestRound57(w http.ResponseWriter, r *http
 			return
 		}
 		docID := fmt.Sprintf("auto-sim-%d", idx+1)
-		docIndex := indexName
+		docIndex := topIndexName
 		docRouting := ""
 		docPipeOverride := reqPipeline
 		var sourceMap map[string]any
@@ -8449,11 +8459,28 @@ func (s *Server) handleSimulateIndexIngestRound57(w http.ResponseWriter, r *http
 				docPipeOverride = dpStr
 			}
 		} else {
+			if idStr, okI := docMap["_id"].(string); okI && idStr != "" {
+				docID = idStr
+			}
+			if idxStr, okIx := docMap["_index"].(string); okIx && idxStr != "" {
+				docIndex = idxStr
+			}
 			sourceMap = deepCloneDocMap(docMap)
+			delete(sourceMap, "_index")
+			delete(sourceMap, "_id")
+		}
+
+		baseMapping, defaultPipe, finalPipe := resolveIndexIngestConfig(docIndex)
+		compiledSchema := schema.CompileIndexSchema(s.dorisDB, docIndex, baseMapping)
+		existingDeclaredProps := make(map[string]esast.FieldProperty)
+		if baseMapping != nil && baseMapping.Properties != nil {
+			for k, v := range baseMapping.Properties {
+				existingDeclaredProps[k] = v
+			}
 		}
 
 		curBytes, _ := json.Marshal(sourceMap)
-		var executedPipelines []string
+		executedPipelines := make([]string, 0)
 		var allProcResults []map[string]any
 		var ingestMeta map[string]any
 		var docErr error
@@ -8479,8 +8506,10 @@ func (s *Server) handleSimulateIndexIngestRound57(w http.ResponseWriter, r *http
 					docErr = pErr
 				} else {
 					curBytes = out
-					if outIdx != "" {
+					if outIdx != "" && outIdx != docIndex {
 						docIndex = outIdx
+						baseMapping, _, finalPipe = resolveIndexIngestConfig(docIndex)
+						compiledSchema = schema.CompileIndexSchema(s.dorisDB, docIndex, baseMapping)
 					}
 					if outID != "" {
 						docID = outID
@@ -8526,11 +8555,13 @@ func (s *Server) handleSimulateIndexIngestRound57(w http.ResponseWriter, r *http
 		}
 
 		if docErr != nil {
+			errType := ingestSpecValidationErrorType(docErr)
 			simResults = append(simResults, map[string]any{
 				"pipelines": executedPipelines,
 				"error": map[string]any{
-					"type":   ingestSpecValidationErrorType(docErr),
-					"reason": docErr.Error(),
+					"root_cause": []map[string]any{{"type": errType, "reason": docErr.Error()}},
+					"type":       errType,
+					"reason":     docErr.Error(),
 				},
 			})
 			continue
@@ -8544,7 +8575,9 @@ func (s *Server) handleSimulateIndexIngestRound57(w http.ResponseWriter, r *http
 		}
 
 		var finalSource map[string]any
-		_ = json.Unmarshal(curBytes, &finalSource)
+		dec := json.NewDecoder(bytes.NewReader(curBytes))
+		dec.UseNumber()
+		_ = dec.Decode(&finalSource)
 		if finalSource == nil {
 			finalSource = map[string]any{}
 		}
@@ -8552,14 +8585,12 @@ func (s *Server) handleSimulateIndexIngestRound57(w http.ResponseWriter, r *http
 		// Accumulate dynamic mapping additions for fields not in existingDeclaredProps
 		inferSimulateMappingAdditions(finalSource, existingDeclaredProps, mappingAdditions)
 
-		if executedPipelines == nil {
-			executedPipelines = []string{}
-		}
 		docOut := map[string]any{
-			"_index":   docIndex,
-			"_id":      docID,
-			"_version": "-3",
-			"_source":  finalSource,
+			"_index":             docIndex,
+			"_id":                docID,
+			"_version":           "-3",
+			"_source":            finalSource,
+			"executed_pipelines": executedPipelines,
 			"_ingest": map[string]any{
 				"timestamp": time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
 			},
@@ -8577,7 +8608,8 @@ func (s *Server) handleSimulateIndexIngestRound57(w http.ResponseWriter, r *http
 		simResults = append(simResults, entry)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
+		"docs":                simResults,
 		"pipeline_simulation": simResults,
 		"mapping_addition": map[string]any{
 			"properties": mappingAdditions,
@@ -8683,14 +8715,19 @@ func (s *Server) handleScriptsContextRound57(w http.ResponseWriter, r *http.Requ
 			makeCtx("update", "void"),
 			makeCtx("ingest", "void"),
 			makeCtx("field", "void"),
-			makeCtx("boolean_field", "boolean"),
-			makeCtx("double_field", "double"),
-			makeCtx("long_field", "long"),
+			makeCtx("boolean_field", "void"),
+			makeCtx("double_field", "void"),
+			makeCtx("long_field", "void"),
+			makeCtx("keyword_field", "void"),
+			makeCtx("date_field", "void"),
+			makeCtx("ip_field", "void"),
+			makeCtx("geo_point_field", "void"),
 			makeCtx("string_field", "String"),
 			makeCtx("number_sort", "double"),
 			makeCtx("string_sort", "String"),
 			makeCtx("bucket_aggregation", "Object"),
 			makeCtx("aggs_combine", "Object"),
+			makeCtx("painless_test", "String"),
 			makeCtx("template", "BytesReference"),
 		},
 	})
@@ -8812,57 +8849,9 @@ func (s *Server) handleFreezeIndexRound57(w http.ResponseWriter, r *http.Request
 	})
 }
 
-// handleTaskRethrottleRound57 implements `POST /_reindex/{task_id}/_rethrottle`,
-// `POST /[index/]_update_by_query/{task_id}/_rethrottle`, and `POST /[index/]_delete_by_query/{task_id}/_rethrottle` (F9.5).
+// handleTaskRethrottleRound57 delegates to handleTaskRethrottleRound60.
 func (s *Server) handleTaskRethrottleRound57(w http.ResponseWriter, r *http.Request, rawIndex, taskID string) {
-	if r.Method != http.MethodPost {
-		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
-		return
-	}
-	taskID = strings.TrimSpace(taskID)
-	if taskID == "" || !strings.Contains(taskID, ":") {
-		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("malformed task id [%s]", taskID))
-		return
-	}
-	if rawIndex != "" && rawIndex != "*" && rawIndex != "_all" {
-		if _, ok := s.resolveMaintenanceTargetIndices(w, rawIndex); !ok {
-			return
-		}
-	}
-	rps := float64(-1)
-	if rawRPS := strings.TrimSpace(r.URL.Query().Get("requests_per_second")); rawRPS != "" && rawRPS != "unlimited" {
-		parsed, err := strconv.ParseFloat(rawRPS, 64)
-		if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || (parsed <= 0 && parsed != -1) {
-			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("invalid [requests_per_second] value [%s]", rawRPS))
-			return
-		}
-		rps = parsed
-	}
-	parts := strings.SplitN(taskID, ":", 2)
-	nodeID := parts[0]
-	idNum, _ := strconv.ParseInt(parts[1], 10, 64)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"nodes": map[string]any{
-			nodeID: map[string]any{
-				"name":              nodeID,
-				"transport_address": "127.0.0.1:9300",
-				"host":              "127.0.0.1",
-				"ip":                "127.0.0.1:9300",
-				"roles":             []string{"data", "ingest", "master"},
-				"tasks": map[string]any{
-					taskID: map[string]any{
-						"node":   nodeID,
-						"id":     idNum,
-						"type":   "transport",
-						"action": "indices:data/write/bulk[s]",
-						"status": map[string]any{
-							"requests_per_second": rps,
-						},
-					},
-				},
-			},
-		},
-	})
+	s.handleTaskRethrottleRound60(w, r, rawIndex, taskID)
 }
 
 // handleMigrationSystemFeaturesRound57 implements `GET/POST /_migration/system_features` (F9.5).

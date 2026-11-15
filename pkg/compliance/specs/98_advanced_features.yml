@@ -1708,22 +1708,22 @@
   - match: { acknowledged: true }
 
   - do:
+      catch: missing
       reindex_rethrottle:
         task_id: "nodeA:301"
         requests_per_second: 100
-  - is_true: nodes
 
   - do:
+      catch: missing
       update_by_query_rethrottle:
         task_id: "nodeA:302"
         requests_per_second: 100
-  - is_true: nodes
 
   - do:
+      catch: missing
       delete_by_query_rethrottle:
         task_id: "nodeA:303"
         requests_per_second: -1
-  - is_true: nodes
 
   - do:
       logstash.put_pipeline:

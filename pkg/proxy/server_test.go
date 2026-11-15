@@ -899,8 +899,11 @@ func TestServer_DeepEvalProtocolAndMultiIndexFixes(t *testing.T) {
 	if code, body := doReq(http.MethodGet, "/m_idx_*/_mapping", ""); code != http.StatusOK || !strings.Contains(body, `"m_idx_1"`) || !strings.Contains(body, `"m_idx_2"`) {
 		t.Fatalf("expected wildcard _mapping to return both m_idx_1 and m_idx_2, got %d %s", code, body)
 	}
-	if code, body := doReq(http.MethodGet, "/_cat/indices/m_idx_*", ""); code != http.StatusOK || !strings.Contains(body, `"m_idx_1"`) || strings.Contains(body, `"create_idx"`) {
-		t.Fatalf("expected /_cat/indices/m_idx_* to filter indices, got %d %s", code, body)
+	if code, body := doReq(http.MethodGet, "/_cat/indices/m_idx_*?format=json", ""); code != http.StatusOK || !strings.Contains(body, `"m_idx_1"`) || strings.Contains(body, `"create_idx"`) {
+		t.Fatalf("expected /_cat/indices/m_idx_*?format=json to filter indices, got %d %s", code, body)
+	}
+	if code, body := doReq(http.MethodGet, "/_cat/indices/m_idx_*", ""); code != http.StatusOK || !strings.Contains(body, "m_idx_1") || strings.Contains(body, "create_idx") {
+		t.Fatalf("expected /_cat/indices/m_idx_* default text/plain to filter indices, got %d %s", code, body)
 	}
 
 	// 7. Auto-created destination index on _update (doc_as_upsert) and _reindex infers schema

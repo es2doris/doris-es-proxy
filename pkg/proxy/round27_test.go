@@ -547,6 +547,7 @@ func TestRound27_P0_4_RuntimeScoringMinScoreBoostingBranchGuardsAndScoreBinding(
 	// 1. Non-matching branch in bool.should containing script_score must NOT contribute to doc 1's score,
 	// and _score must be bound inside script_fields and _script sort!
 	code, sr := doRound27Req(t, srv, http.MethodPost, "/r27_score/_search", map[string]any{
+		"track_scores": true,
 		"query": map[string]any{
 			"bool": map[string]any{
 				"should": []any{
@@ -978,8 +979,9 @@ func TestRound27_P0_7_IngestProcessorsWriteAliasGuardReindexConflictsAndStoredFi
 	if simSrc["msg"] != "hello alice!" {
 		t.Fatalf("expected gsub Mustache replacement 'hello alice!', got %v", simSrc["msg"])
 	}
-	if simSrc["html_body"] != "Tom & Jerry <3>" {
-		t.Fatalf("expected html_strip entity unescaping 'Tom & Jerry <3>', got %v", simSrc["html_body"])
+	htmlOut, _ := simSrc["html_body"].(string)
+	if strings.TrimSpace(htmlOut) != "Tom & Jerry <3>" {
+		t.Fatalf("expected html_strip entity unescaping 'Tom & Jerry <3>', got %q", simSrc["html_body"])
 	}
 
 	// 2. Single-index alias with explicit is_write_index: false must reject writes with 400

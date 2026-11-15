@@ -1339,20 +1339,28 @@ func TestRound57F9_FleetCapabilitiesIngestSimulateScriptsMLAndOps(t *testing.T) 
 		t.Fatalf("_freeze/_unfreeze failed: %d / %d / %d", cFrz, cUnfrz, cFrzMiss)
 	}
 
+	cAsync, _, resAsync, _ := doRound57Req(t, srv, http.MethodPost, "/_reindex?wait_for_completion=false", `{"source":{"index":"r57_fleet_idx"},"dest":{"index":"r57_fleet_reidx_dst"}}`)
+	asyncTaskID, _ := resAsync["task"].(string)
+	if cAsync != http.StatusOK || asyncTaskID == "" {
+		t.Fatalf("expected async _reindex task, got %d %+v", cAsync, resAsync)
+	}
 	for _, rtPath := range []string{
-		"/_reindex/nodeA:101/_rethrottle?requests_per_second=250",
-		"/_update_by_query/nodeA:102/_rethrottle?requests_per_second=unlimited",
-		"/r57_fleet_idx/_update_by_query/nodeA:103/_rethrottle?requests_per_second=50",
-		"/_delete_by_query/nodeA:104/_rethrottle?requests_per_second=-1",
-		"/r57_fleet_idx/_delete_by_query/nodeA:105/_rethrottle?requests_per_second=10",
+		"/_reindex/" + asyncTaskID + "/_rethrottle?requests_per_second=250",
+		"/_update_by_query/" + asyncTaskID + "/_rethrottle?requests_per_second=unlimited",
+		"/r57_fleet_idx/_update_by_query/" + asyncTaskID + "/_rethrottle?requests_per_second=50",
+		"/_delete_by_query/" + asyncTaskID + "/_rethrottle?requests_per_second=-1",
+		"/r57_fleet_idx/_delete_by_query/" + asyncTaskID + "/_rethrottle?requests_per_second=10",
 	} {
 		cRT, _, resRT, _ := doRound57Req(t, srv, http.MethodPost, rtPath, "")
 		if cRT != http.StatusOK || resRT["nodes"] == nil {
 			t.Fatalf("expected 200 on %s, got %d %+v", rtPath, cRT, resRT)
 		}
 	}
+	if cRTMiss, _, _, _ := doRound57Req(t, srv, http.MethodPost, "/_reindex/nodeA:999999/_rethrottle?requests_per_second=250", ""); cRTMiss != http.StatusNotFound {
+		t.Fatalf("expected 404 on unknown task _rethrottle, got %d", cRTMiss)
+	}
 	cRTBadTask, _, _, _ := doRound57Req(t, srv, http.MethodPost, "/_reindex/not_a_task_id/_rethrottle", "")
-	cRTBadRPS, _, _, _ := doRound57Req(t, srv, http.MethodPost, "/_reindex/nodeA:101/_rethrottle?requests_per_second=0", "")
+	cRTBadRPS, _, _, _ := doRound57Req(t, srv, http.MethodPost, "/_reindex/"+asyncTaskID+"/_rethrottle?requests_per_second=0", "")
 	if cRTBadTask != http.StatusBadRequest || cRTBadRPS != http.StatusBadRequest {
 		t.Fatalf("expected 400 on invalid _rethrottle task_id or rps, got %d / %d", cRTBadTask, cRTBadRPS)
 	}

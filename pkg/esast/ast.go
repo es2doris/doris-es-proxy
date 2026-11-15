@@ -1389,11 +1389,15 @@ func (cr *CompletionRegexSpec) UnmarshalJSON(data []byte) error {
 
 // CompletionSuggestSpec models a `completion` suggester configuration.
 type CompletionSuggestSpec struct {
-	Field          string         `json:"field"`
-	Size           int            `json:"size,omitempty"`
-	SkipDuplicates bool           `json:"skip_duplicates,omitempty"`
-	Fuzzy          map[string]any `json:"fuzzy,omitempty"`
-	Regex          map[string]any `json:"regex,omitempty"`
+	Field             string                              `json:"field"`
+	Size              int                                 `json:"size,omitempty"`
+	SkipDuplicates    bool                                `json:"skip_duplicates,omitempty"`
+	SkipDuplicatesPtr *bool                               `json:"-"`
+	Fuzzy             map[string]any                      `json:"fuzzy,omitempty"`
+	Regex             map[string]any                      `json:"regex,omitempty"`
+	Contexts          map[string][]CompletionQueryContext `json:"contexts,omitempty"`
+	Analyzer          string                              `json:"analyzer,omitempty"`
+	Prefix            string                              `json:"prefix,omitempty"`
 }
 
 func (cs *CompletionSuggestSpec) UnmarshalJSON(data []byte) error {
@@ -1423,6 +1427,8 @@ func (cs *CompletionSuggestSpec) UnmarshalJSON(data []byte) error {
 		Field          string `json:"field"`
 		Size           *int   `json:"size"`
 		SkipDuplicates any    `json:"skip_duplicates"`
+		Analyzer       string `json:"analyzer"`
+		Prefix         string `json:"prefix"`
 	}
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
@@ -1432,18 +1438,31 @@ func (cs *CompletionSuggestSpec) UnmarshalJSON(data []byte) error {
 	}
 	var p CompletionSuggestSpec
 	p.Field = raw.Field
+	p.Analyzer = raw.Analyzer
+	p.Prefix = raw.Prefix
 	if raw.Size != nil {
 		if *raw.Size <= 0 {
 			return fmt.Errorf("illegal_argument_exception: [completion] [size] must be > 0")
 		}
 		p.Size = *raw.Size
 	}
-	if raw.SkipDuplicates != nil {
+	if _, hasSD := rawMap["skip_duplicates"]; hasSD {
+		if raw.SkipDuplicates == nil {
+			return fmt.Errorf("parsing_exception: [completion] [skip_duplicates] cannot be null")
+		}
 		sd, err := parseFlexibleBool(raw.SkipDuplicates)
 		if err != nil {
 			return fmt.Errorf("parsing_exception: [completion] [skip_duplicates] %w", err)
 		}
 		p.SkipDuplicates = sd
+		p.SkipDuplicatesPtr = &sd
+	}
+	if rawCtx, hasCtx := rawMap["contexts"]; hasCtx {
+		ctxs, err := parseCompletionQueryContextsMap(rawCtx)
+		if err != nil {
+			return err
+		}
+		p.Contexts = ctxs
 	}
 	if hasFuzzyVal {
 		var cf CompletionFuzzySpec
@@ -2052,6 +2071,9 @@ func (ih *InnerHitsSpec) UnmarshalJSON(data []byte) error {
 	}
 	if err := validateScriptFieldsMap(p.ScriptFields, "inner_hits"); err != nil {
 		return err
+	}
+	if p.Collapse != nil && len(p.Collapse.InnerHits) > 0 {
+		return fmt.Errorf("illegal_argument_exception: [collapse] second level of collapsing does not allow [inner_hits]")
 	}
 	*ih = InnerHitsSpec(p)
 	return nil
@@ -3191,6 +3213,11 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 		raw["rule"] = rawRuleQ
 		delete(raw, "rule_query")
 		rawModified = true
+	}
+	if rawMBP, ok := raw["match_bool_prefix"]; ok {
+		if err := validateMatchBoolPrefixRaw(rawMBP); err != nil {
+			return err
+		}
 	}
 	for _, svAlias := range []string{"text_expansion", "weighted_tokens"} {
 		if rawSV, ok := raw[svAlias]; ok {
@@ -4597,13 +4624,21 @@ func validateMoreLikeThisDocMap(m map[string]any, fieldName string) error {
 	hasDoc := false
 	for k, v := range m {
 		switch k {
-		case "_index", "_type", "fields", "_routing", "per_field_analyzer":
-		case "_id":
+		case "_index", "_type", "fields", "per_field_analyzer":
+		case "_routing", "routing":
 			if v != nil {
-				s, ok := v.(string)
-				if !ok {
-					return fmt.Errorf("parsing_exception: [more_like_this] [%s] [_id] must be a string", fieldName)
+				if isNonScalarOrNullValue(v) {
+					return fmt.Errorf("parsing_exception: [more_like_this] [%s] [%s] must be a scalar", fieldName, k)
 				}
+				m[k] = formatFlexibleScalarString(v)
+			}
+		case "_id", "id":
+			if v != nil {
+				if isNonScalarOrNullValue(v) {
+					return fmt.Errorf("parsing_exception: [more_like_this] [%s] [%s] must be a string", fieldName, k)
+				}
+				s := formatFlexibleScalarString(v)
+				m["_id"] = s
 				if strings.TrimSpace(s) != "" {
 					hasID = true
 				}
@@ -4698,7 +4733,7 @@ func (mlt *MoreLikeThisQuery) UnmarshalJSON(data []byte) error {
 		FailOnUnsupportedField any             `json:"fail_on_unsupported_field"`
 		Boost                  json.RawMessage `json:"boost"`
 	}
-	if err := json.Unmarshal(trimmed, &raw); err != nil {
+	if err := unmarshalPreservingLargeInts(trimmed, &raw); err != nil {
 		return err
 	}
 	*mlt = MoreLikeThisQuery(raw.plain)
@@ -4747,7 +4782,7 @@ func (mlt *MoreLikeThisQuery) UnmarshalJSON(data []byte) error {
 		mlt.Fields = fields
 	}
 	if raw.Ids != nil {
-		ids, err := parseFlexibleStringSlice(raw.Ids)
+		ids, err := parseFlexibleScalarIDSlice(raw.Ids, "[more_like_this] [ids]")
 		if err != nil {
 			return err
 		}
@@ -4850,9 +4885,10 @@ func (im *IntervalsMatch) UnmarshalJSON(data []byte) error {
 }
 
 type IntervalsPrefix struct {
-	Prefix   string `json:"prefix"`
-	Analyzer string `json:"analyzer,omitempty"`
-	UseField string `json:"use_field,omitempty"`
+	Prefix   string           `json:"prefix"`
+	Analyzer string           `json:"analyzer,omitempty"`
+	Filter   *IntervalsFilter `json:"filter,omitempty"`
+	UseField string           `json:"use_field,omitempty"`
 }
 
 func (ip *IntervalsPrefix) UnmarshalJSON(data []byte) error {
@@ -4866,7 +4902,7 @@ func (ip *IntervalsPrefix) UnmarshalJSON(data []byte) error {
 	}
 	for k := range rawMap {
 		switch k {
-		case "prefix", "analyzer", "use_field":
+		case "prefix", "analyzer", "filter", "use_field":
 		default:
 			return fmt.Errorf("parsing_exception: [intervals.prefix] unknown field [%s]", k)
 		}
@@ -4884,9 +4920,10 @@ func (ip *IntervalsPrefix) UnmarshalJSON(data []byte) error {
 }
 
 type IntervalsWildcard struct {
-	Pattern  string `json:"pattern"`
-	Analyzer string `json:"analyzer,omitempty"`
-	UseField string `json:"use_field,omitempty"`
+	Pattern  string           `json:"pattern"`
+	Analyzer string           `json:"analyzer,omitempty"`
+	Filter   *IntervalsFilter `json:"filter,omitempty"`
+	UseField string           `json:"use_field,omitempty"`
 }
 
 func (iw *IntervalsWildcard) UnmarshalJSON(data []byte) error {
@@ -4900,7 +4937,7 @@ func (iw *IntervalsWildcard) UnmarshalJSON(data []byte) error {
 	}
 	for k := range rawMap {
 		switch k {
-		case "pattern", "analyzer", "use_field":
+		case "pattern", "analyzer", "filter", "use_field":
 		default:
 			return fmt.Errorf("parsing_exception: [intervals.wildcard] unknown field [%s]", k)
 		}
@@ -4918,12 +4955,13 @@ func (iw *IntervalsWildcard) UnmarshalJSON(data []byte) error {
 }
 
 type IntervalsFuzzy struct {
-	Term           string `json:"term"`
-	PrefixLength   int    `json:"prefix_length,omitempty"`
-	Transpositions *bool  `json:"transpositions,omitempty"`
-	Fuzziness      any    `json:"fuzziness,omitempty"`
-	Analyzer       string `json:"analyzer,omitempty"`
-	UseField       string `json:"use_field,omitempty"`
+	Term           string           `json:"term"`
+	PrefixLength   int              `json:"prefix_length,omitempty"`
+	Transpositions *bool            `json:"transpositions,omitempty"`
+	Fuzziness      any              `json:"fuzziness,omitempty"`
+	Analyzer       string           `json:"analyzer,omitempty"`
+	Filter         *IntervalsFilter `json:"filter,omitempty"`
+	UseField       string           `json:"use_field,omitempty"`
 }
 
 func (ifz *IntervalsFuzzy) UnmarshalJSON(data []byte) error {
@@ -4937,7 +4975,7 @@ func (ifz *IntervalsFuzzy) UnmarshalJSON(data []byte) error {
 	}
 	for k := range rawMap {
 		switch k {
-		case "term", "prefix_length", "transpositions", "fuzziness", "analyzer", "use_field":
+		case "term", "prefix_length", "transpositions", "fuzziness", "analyzer", "filter", "use_field":
 		default:
 			return fmt.Errorf("parsing_exception: [intervals.fuzzy] unknown field [%s]", k)
 		}
@@ -5031,6 +5069,8 @@ func (iao *IntervalsAnyOf) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+type IntervalsFilterSpec = IntervalsFilter
+
 type IntervalsFilter struct {
 	After          *IntervalsRule `json:"after,omitempty"`
 	Before         *IntervalsRule `json:"before,omitempty"`
@@ -5040,7 +5080,7 @@ type IntervalsFilter struct {
 	NotContaining  *IntervalsRule `json:"not_containing,omitempty"`
 	NotOverlapping *IntervalsRule `json:"not_overlapping,omitempty"`
 	Overlapping    *IntervalsRule `json:"overlapping,omitempty"`
-	Script         any            `json:"script,omitempty"`
+	Script         *ScriptSpec    `json:"script,omitempty"`
 }
 
 func (ifl *IntervalsFilter) UnmarshalJSON(data []byte) error {
@@ -5065,18 +5105,16 @@ func (ifl *IntervalsFilter) UnmarshalJSON(data []byte) error {
 	if ruleCount == 0 {
 		return fmt.Errorf("parsing_exception: [intervals.filter] requires a filter rule or [script]")
 	}
+	if rawScript, hasScript := rawMap["script"]; hasScript {
+		st := bytes.TrimSpace(rawScript)
+		if len(st) == 0 || bytes.Equal(st, []byte("null")) {
+			return fmt.Errorf("parsing_exception: [intervals.filter] [script] cannot be null")
+		}
+	}
 	type plain IntervalsFilter
 	var p plain
 	if err := json.Unmarshal(trimmed, &p); err != nil {
 		return err
-	}
-	if _, hasScript := rawMap["script"]; hasScript && p.Script == nil {
-		return fmt.Errorf("parsing_exception: [intervals.filter] [script] cannot be null")
-	}
-	if p.Script != nil {
-		if err := validateScriptValue(p.Script); err != nil {
-			return err
-		}
 	}
 	*ifl = IntervalsFilter(p)
 	return nil
@@ -9511,6 +9549,7 @@ type AggSpec struct {
 	BucketSelector          *BucketSelectorAggSpec         `json:"bucket_selector,omitempty"`
 	BucketScript            *BucketSelectorAggSpec         `json:"bucket_script,omitempty"`
 	ScriptedMetric          *ScriptedMetricAggSpec         `json:"scripted_metric,omitempty"`
+	Meta                    map[string]any                 `json:"meta,omitempty"`
 	Aggs                    map[string]AggSpec             `json:"aggs,omitempty"`
 	Aggregations            map[string]AggSpec             `json:"aggregations,omitempty"`
 }
@@ -10616,6 +10655,14 @@ func (a *AggSpec) UnmarshalJSON(data []byte) error {
 	if typeCount > 1 {
 		return fmt.Errorf("parsing_exception: aggregation definition cannot specify multiple aggregation types")
 	}
+	if rawMeta, hasMeta := rawMap["meta"]; hasMeta {
+		mTrim := bytes.TrimSpace(rawMeta)
+		if len(mTrim) > 0 && !bytes.Equal(mTrim, []byte("null")) {
+			if mTrim[0] != '{' {
+				return fmt.Errorf("parsing_exception: [meta] must be an object")
+			}
+		}
+	}
 	type plain AggSpec
 	var p plain
 	if err := json.Unmarshal(trimmed, &p); err != nil {
@@ -10801,9 +10848,13 @@ func validateTDigestAndHDR(rawMap map[string]json.RawMessage, aggName string) er
 			}
 		}
 	}
-	if hasHDR && len(bytes.TrimSpace(rawHDR)) > 0 && !bytes.Equal(bytes.TrimSpace(rawHDR), []byte("null")) {
+	if hasHDR {
+		hdrTrim := bytes.TrimSpace(rawHDR)
+		if len(hdrTrim) == 0 || bytes.Equal(hdrTrim, []byte("null")) {
+			return fmt.Errorf("parsing_exception: [%s] [hdr] must be an object", aggName)
+		}
 		var hdrMap map[string]json.RawMessage
-		if err := json.Unmarshal(rawHDR, &hdrMap); err != nil {
+		if err := json.Unmarshal(hdrTrim, &hdrMap); err != nil {
 			return fmt.Errorf("parsing_exception: [%s] [hdr] must be an object", aggName)
 		}
 		for k := range hdrMap {
@@ -10812,9 +10863,13 @@ func validateTDigestAndHDR(rawMap map[string]json.RawMessage, aggName string) er
 			}
 		}
 		if rawDigits, ok := hdrMap["number_of_significant_value_digits"]; ok {
+			dTrim := bytes.TrimSpace(rawDigits)
+			if len(dTrim) == 0 || bytes.Equal(dTrim, []byte("null")) {
+				return fmt.Errorf("illegal_argument_exception: numberOfSignificantValueDigits must be between 0 and 5")
+			}
 			var digits int
-			if err := json.Unmarshal(rawDigits, &digits); err != nil || digits < 1 || digits > 5 {
-				return fmt.Errorf("illegal_argument_exception: [%s.hdr] [number_of_significant_value_digits] must be between 1 and 5", aggName)
+			if err := json.Unmarshal(dTrim, &digits); err != nil || digits < 0 || digits > 5 {
+				return fmt.Errorf("illegal_argument_exception: numberOfSignificantValueDigits must be between 0 and 5")
 			}
 		}
 	}
@@ -10823,11 +10878,14 @@ func validateTDigestAndHDR(rawMap map[string]json.RawMessage, aggName string) er
 
 // PercentileRanksAggSpec models a `percentile_ranks` metric aggregation.
 type PercentileRanksAggSpec struct {
-	Field   string    `json:"field"`
-	Values  []float64 `json:"values"`
-	Keyed   *bool     `json:"keyed,omitempty"`
-	Missing any       `json:"missing,omitempty"`
-	Script  any       `json:"script,omitempty"`
+	Field   string         `json:"field"`
+	Values  []float64      `json:"values"`
+	Keyed   *bool          `json:"keyed,omitempty"`
+	Missing any            `json:"missing,omitempty"`
+	Script  any            `json:"script,omitempty"`
+	TDigest *TDigestConfig `json:"tdigest,omitempty"`
+	HDR     *HDRConfig     `json:"hdr,omitempty"`
+	Format  string         `json:"format,omitempty"`
 }
 
 func (pr *PercentileRanksAggSpec) UnmarshalJSON(data []byte) error {
@@ -11913,11 +11971,14 @@ func (f *FiltersAggSpec) EffectiveKeyed() bool {
 }
 
 type PercentilesAggSpec struct {
-	Field    string    `json:"field"`
-	Percents []float64 `json:"percents,omitempty"`
-	Keyed    *bool     `json:"keyed,omitempty"`
-	Missing  any       `json:"missing,omitempty"`
-	Script   any       `json:"script,omitempty"`
+	Field    string         `json:"field"`
+	Percents []float64      `json:"percents,omitempty"`
+	Keyed    *bool          `json:"keyed,omitempty"`
+	Missing  any            `json:"missing,omitempty"`
+	Script   any            `json:"script,omitempty"`
+	TDigest  *TDigestConfig `json:"tdigest,omitempty"`
+	HDR      *HDRConfig     `json:"hdr,omitempty"`
+	Format   string         `json:"format,omitempty"`
 }
 
 func (p *PercentilesAggSpec) UnmarshalJSON(data []byte) error {
@@ -14109,6 +14170,9 @@ type IndexCreateRequest struct {
 	Aliases  map[string]map[string]any `json:"aliases,omitempty"`
 }
 
+// LegacyTemplateSpec is an alias for IndexTemplateRequest supporting legacy PUT /_template/<name>.
+type LegacyTemplateSpec = IndexTemplateRequest
+
 // IndexTemplateRequest models `PUT /_index_template/<name>` and `PUT /_template/<name>`.
 type IndexTemplateRequest struct {
 	IndexPatterns   []string                  `json:"index_patterns,omitempty"`
@@ -14125,6 +14189,10 @@ type IndexTemplateRequest struct {
 	DataStream      map[string]any            `json:"data_stream,omitempty"`
 	AllowAutoCreate *bool                     `json:"allow_auto_create,omitempty"`
 	Legacy          bool                      `json:"-"`
+}
+
+func (t *IndexTemplateRequest) UnmarshalJSON(data []byte) error {
+	return unmarshalIndexTemplateRequest(t, data)
 }
 
 func (t *IndexTemplateRequest) EffectivePatterns() []string {
@@ -14213,7 +14281,8 @@ type FieldProperty struct {
 	IgnoreMalformed          *bool                    `json:"ignore_malformed,omitempty"`
 	Coerce                   *bool                    `json:"coerce,omitempty"`
 	ScalingFactor            float64                  `json:"scaling_factor,omitempty"`
-	Meta                     map[string]any           `json:"meta,omitempty"`
+	Meta                     map[string]string        `json:"meta,omitempty"`
+	Contexts                 []CompletionContextDef   `json:"contexts,omitempty"`
 	IndexPrefixes            map[string]any           `json:"index_prefixes,omitempty"`
 	IndexPhrases             *bool                    `json:"index_phrases,omitempty"`
 	IndexOptions             any                      `json:"index_options,omitempty"`
@@ -14229,6 +14298,10 @@ type FieldProperty struct {
 	Relations                map[string]any           `json:"relations,omitempty"`
 	Fields                   map[string]FieldProperty `json:"fields,omitempty"`
 	Properties               map[string]FieldProperty `json:"properties,omitempty"`
+}
+
+func (fp *FieldProperty) UnmarshalJSON(data []byte) error {
+	return unmarshalFieldPropertyRound60(fp, data)
 }
 
 func (fp FieldProperty) EffectiveDims() int {
@@ -14262,8 +14335,10 @@ func (fp FieldProperty) CopyToSlice() []string {
 // BulkOperation represents a single parsed action from an Elasticsearch `/_bulk` NDJSON stream.
 type BulkOperation struct {
 	Action          string          // "index", "create", "update", "delete"
+	OpType          string          `json:"op_type,omitempty"`
 	Index           string          // Target index name
 	ID              string          // Document _id
+	HasID           bool            `json:"-"` // True when "_id" was explicitly specified in bulk metadata
 	AutoGeneratedID bool            `json:"-"` // True when _id was omitted and generated via NextAutoID()
 	Pipeline        string          // Optional per-item ingest pipeline override
 	Routing         string          // Optional per-item routing value
@@ -14282,9 +14357,12 @@ type BulkOperation struct {
 	ParseErr        string          // Per-item validation or JSON error (isolated to this bulk item)
 }
 
-type bulkActionMeta struct {
+// BulkActionMeta models the metadata object inside an Elasticsearch `/_bulk` action line.
+type BulkActionMeta struct {
 	Index             string        `json:"_index"`
-	ID                any           `json:"_id"`
+	ID                string        `json:"_id,omitempty"`
+	HasID             bool          `json:"-"`
+	OpType            string        `json:"op_type,omitempty"`
 	Pipeline          string        `json:"pipeline,omitempty"`
 	Routing           string        `json:"routing,omitempty"`
 	UnderscoreRouting string        `json:"_routing,omitempty"`
@@ -14304,6 +14382,12 @@ type bulkActionMeta struct {
 	SourceFilter      *SourceFilter `json:"_source,omitempty"`
 	SourceIncludes    any           `json:"_source_includes,omitempty"`
 	SourceExcludes    any           `json:"_source_excludes,omitempty"`
+}
+
+type bulkActionMeta = BulkActionMeta
+
+func (m *BulkActionMeta) UnmarshalJSON(data []byte) error {
+	return unmarshalBulkActionMeta(m, data)
 }
 
 func parseBulkSourcePatternList(raw any) []string {
@@ -14348,16 +14432,26 @@ func ParseBulkNDJSON(r io.Reader, defaultIndex string) ([]BulkOperation, error) 
 	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
 
 	var ops []BulkOperation
+	lineNum := 0
 	for scanner.Scan() {
+		lineNum++
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {
 			continue
 		}
-		var actionLine bulkActionLine
-		dec := json.NewDecoder(bytes.NewReader(line))
-		dec.UseNumber()
-		if err := dec.Decode(&actionLine); err != nil {
+		var rawActionObj map[string]json.RawMessage
+		if err := json.Unmarshal(line, &rawActionObj); err != nil {
 			return nil, fmt.Errorf("invalid bulk action metadata line: %w", err)
+		}
+		if len(rawActionObj) == 0 {
+			return nil, fmt.Errorf("Malformed action/metadata line [%d], expected FIELD_NAME but found [END_OBJECT]", lineNum) //nolint:staticcheck // ES exact bulk error string
+		}
+		if len(rawActionObj) > 1 {
+			return nil, fmt.Errorf("Malformed action/metadata line [%d], expected END_OBJECT but found [FIELD_NAME]", lineNum) //nolint:staticcheck // ES exact bulk error string
+		}
+		var actionLine bulkActionLine
+		if err := json.Unmarshal(line, &actionLine); err != nil {
+			return nil, err
 		}
 		var op BulkOperation
 		var meta *bulkActionMeta
@@ -14377,13 +14471,26 @@ func ParseBulkNDJSON(r io.Reader, defaultIndex string) ([]BulkOperation, error) 
 		default:
 			return nil, fmt.Errorf("invalid bulk action metadata line: missing index/create/update/delete action")
 		}
+		if meta.OpType != "" {
+			if op.Action != "index" {
+				return nil, fmt.Errorf("illegal_argument_exception: Action/metadata line [%d] contains an unknown parameter [op_type]", lineNum)
+			}
+			switch strings.ToLower(strings.TrimSpace(meta.OpType)) {
+			case "create":
+				op.Action = "create"
+				op.OpType = "create"
+			case "index":
+				op.OpType = "index"
+			default:
+				return nil, fmt.Errorf("illegal_argument_exception: invalid op_type [%s], must be [index] or [create]", meta.OpType)
+			}
+		}
 		op.Index = meta.Index
 		if op.Index == "" {
 			op.Index = defaultIndex
 		}
-		if meta.ID != nil {
-			op.ID = fmt.Sprintf("%v", meta.ID)
-		}
+		op.ID = meta.ID
+		op.HasID = meta.HasID
 		op.Pipeline = meta.Pipeline
 		op.Routing = meta.Routing
 		if op.Routing == "" {
@@ -14448,6 +14555,7 @@ func ParseBulkNDJSON(r io.Reader, defaultIndex string) ([]BulkOperation, error) 
 			if !scanner.Scan() {
 				return nil, fmt.Errorf("unexpected EOF waiting for bulk source line after %q action", op.Action)
 			}
+			lineNum++
 			srcLine := bytes.TrimSpace(scanner.Bytes())
 			if !json.Valid(srcLine) {
 				op.ParseErr = "failed to parse bulk document source: invalid JSON"

@@ -146,37 +146,50 @@ func valuesEqualRound58(a, b any) bool {
 	}
 	if sa, okA := a.([]any); okA {
 		sb, okB := b.([]any)
-		if !okB || len(sa) != len(sb) {
+		if !okB {
 			return false
 		}
-		for i := range sa {
-			if !valuesEqualRound58(sa[i], sb[i]) {
-				return false
+		var walk func(x, y any, seen map[cyclePairKeyRound60]bool, depth int) bool
+		walk = func(x, y any, seen map[cyclePairKeyRound60]bool, depth int) bool {
+			if sx, ox := x.([]any); ox {
+				sy, oy := y.([]any)
+				return oy && slicesEqualCycleSafeRound60(sx, sy, walk, seen, depth)
 			}
+			if mx, ox := x.(map[string]any); ox {
+				my, oy := y.(map[string]any)
+				return oy && mapsEqualCycleSafeRound60(mx, my, walk, seen, depth)
+			}
+			return valuesEqualRound58(x, y)
 		}
-		return true
+		return slicesEqualCycleSafeRound60(sa, sb, walk, nil, 0)
 	}
 	if _, okB := b.([]any); okB {
 		return false
 	}
 	if ma, okA := a.(map[string]any); okA {
 		mb, okB := b.(map[string]any)
-		if !okB || visiblePainlessMapLen(ma) != visiblePainlessMapLen(mb) {
+		if !okB {
 			return false
 		}
-		for k, va := range ma {
-			if isInternalPainlessMapKey(ma, k) {
-				continue
+		var walk func(x, y any, seen map[cyclePairKeyRound60]bool, depth int) bool
+		walk = func(x, y any, seen map[cyclePairKeyRound60]bool, depth int) bool {
+			if sx, ox := x.([]any); ox {
+				sy, oy := y.([]any)
+				return oy && slicesEqualCycleSafeRound60(sx, sy, walk, seen, depth)
 			}
-			vb, exists := mb[k]
-			if !exists || !valuesEqualRound58(va, vb) {
-				return false
+			if mx, ox := x.(map[string]any); ox {
+				my, oy := y.(map[string]any)
+				return oy && mapsEqualCycleSafeRound60(mx, my, walk, seen, depth)
 			}
+			return valuesEqualRound58(x, y)
 		}
-		return true
+		return mapsEqualCycleSafeRound60(ma, mb, walk, nil, 0)
 	}
 	if _, okB := b.(map[string]any); okB {
 		return false
+	}
+	if eq, handled := round60WrapperEquals(a, b); handled {
+		return eq
 	}
 	if otA, okA := a.(*painlessOffsetTime); okA {
 		return otA.equals(b)
@@ -983,6 +996,7 @@ var knownStaticClassIdentifiersRound58 = map[string]bool{
 	"BitSet": true, "URI": true, "URL": true, "URLEncoder": true, "URLDecoder": true,
 	"Charset": true, "StandardCharsets": true, "System": true, "Digest": true,
 	"Encoding": true, "Hex": true,
+	"MovingFunctions": true, "Processors": true,
 }
 
 func isKnownStaticClassIdentifierRound58(recExpr string, params map[string]any) bool {
@@ -1019,11 +1033,20 @@ func evalInstanceReceiverOnceRound58(recExpr, mName, mBare, argExpr string, isNu
 		if strings.HasPrefix(cleanRec, "doc[") {
 			expDocRec = strings.TrimSpace(expandDynamicBrackets(cleanRec, sourceMap, params, depth+1))
 		}
-		if (mBare == "forEach" || mBare == "containsAll" || mBare == "contains" || mBare == "indexOf" || mBare == "lastIndexOf" || mBare == "get" || mBare == "subList" || mBare == "join" || mBare == "length" || mBare == "size" || mBare == "isEmpty") &&
+		if (mBare == "forEach" || mBare == "containsAll" || mBare == "contains" || mBare == "indexOf" || mBare == "lastIndexOf" || mBare == "get" || mBare == "subList" || mBare == "join" || mBare == "length" || mBare == "size" || mBare == "isEmpty" || mBare == "arcDistance" || mBare == "planeDistance" || mBare == "geohashDistance") &&
 			(strings.HasPrefix(expDocRec, "doc.") || strings.HasPrefix(expDocRec, "doc?.")) &&
 			!strings.HasSuffix(expDocRec, ".value") && !strings.Contains(expDocRec, ".value.") && !strings.Contains(expDocRec, ".values.") && !strings.Contains(expDocRec, "(") {
 			docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(expDocRec, "doc?."), "doc."), ".values")
-			return resolveDocValuesSlice(sourceMap, docPath), nil, false, nil
+			dv, dvErr := resolveDocValuesSliceWithParamsRound60(sourceMap, params, docPath)
+			if dvErr != nil {
+				return nil, nil, true, dvErr
+			}
+			if mBare == "arcDistance" || mBare == "planeDistance" || mBare == "geohashDistance" {
+				if r60Res, r60Handled, r60Err := evalRound60ReceiverMethod(dv, mBare, argExpr, sourceMap, params, depth+1); r60Handled {
+					return r60Res, nil, true, r60Err
+				}
+			}
+			return dv, nil, false, nil
 		}
 	}
 	if (cleanRec == "ctx" || cleanRec == "ctx._source" || cleanRec == "ctx?._source") && (params == nil || params["ctx"] == nil) {
@@ -1056,6 +1079,9 @@ func evalInstanceReceiverOnceRound58(recExpr, mName, mBare, argExpr string, isNu
 	if uo, isUO := recVal.(*painlessUserObject); isUO && uo != nil && uo.class != nil && len(uo.class.findMethod(mBare)) > 0 {
 		uRes, uErr := evalUserObjectMethodPainless(uo, mBare, argExpr, sourceMap, params, depth+1)
 		return uRes, nil, true, uErr
+	}
+	if r60Res, r60Handled, r60Err := evalRound60ReceiverMethod(recVal, mBare, argExpr, sourceMap, params, depth+1); r60Handled {
+		return r60Res, nil, true, r60Err
 	}
 	return recVal, writeBack, false, nil
 }

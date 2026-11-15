@@ -479,7 +479,7 @@ func TestRound9PipelineAggsMovingFnRateAndExtendedStats(t *testing.T) {
 				"aggs": map[string]any{
 					"sum_val":      map[string]any{"sum": map[string]any{"field": "val"}},
 					"per_min_rate": map[string]any{"rate": map[string]any{"field": "val", "unit": "minute"}},
-					"mov_max":      map[string]any{"moving_fn": map[string]any{"buckets_path": "sum_val", "window": 2, "script": "MovingFunctions.max(values)"}},
+					"mov_max":      map[string]any{"moving_fn": map[string]any{"buckets_path": "sum_val", "window": 2, "shift": 1, "script": "MovingFunctions.max(values)"}},
 					"mov_shift0":   map[string]any{"moving_fn": map[string]any{"buckets_path": "sum_val", "window": 2, "shift": 0, "script": "MovingFunctions.sum(values)"}},
 					"mov_linear":   map[string]any{"moving_avg": map[string]any{"buckets_path": "sum_val", "window": 2, "model": "linear"}},
 				},

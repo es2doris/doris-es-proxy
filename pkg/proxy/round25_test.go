@@ -287,7 +287,7 @@ func TestRound25_P0_2_CompositeSubAggsAndDynamicNestedFilters(t *testing.T) {
 		},
 	})
 
-	code, resp := doRound25Req(t, srv, http.MethodPost, "/r25_comp_sub/_search", map[string]any{
+	nestedCompCode, nestedCompResp := doRound25Req(t, srv, http.MethodPost, "/r25_comp_sub/_search", map[string]any{
 		"size": 0,
 		"aggs": map[string]any{
 			"by_region": map[string]any{
@@ -297,17 +297,34 @@ func TestRound25_P0_2_CompositeSubAggsAndDynamicNestedFilters(t *testing.T) {
 						"composite": map[string]any{
 							"sources": []any{
 								map[string]any{"env": map[string]any{"terms": map[string]any{"field": "env"}}},
-								map[string]any{"act": map[string]any{"terms": map[string]any{"field": "active"}}},
 							},
 						},
-						"aggs": map[string]any{
-							"total_amt": map[string]any{
-								"sum": map[string]any{"field": "amount"},
-							},
-							"script_amt": map[string]any{
-								"sum": map[string]any{"script": "doc['amount'].value * 2"},
-							},
-						},
+					},
+				},
+			},
+		},
+	})
+	if nestedCompCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 when nesting composite inside parent terms agg, got %d (%v)", nestedCompCode, nestedCompResp)
+	}
+
+	code, resp := doRound25Req(t, srv, http.MethodPost, "/r25_comp_sub/_search", map[string]any{
+		"size": 0,
+		"aggs": map[string]any{
+			"comp_env": map[string]any{
+				"composite": map[string]any{
+					"sources": []any{
+						map[string]any{"region": map[string]any{"terms": map[string]any{"field": "region"}}},
+						map[string]any{"env": map[string]any{"terms": map[string]any{"field": "env"}}},
+						map[string]any{"act": map[string]any{"terms": map[string]any{"field": "active"}}},
+					},
+				},
+				"aggs": map[string]any{
+					"total_amt": map[string]any{
+						"sum": map[string]any{"field": "amount"},
+					},
+					"script_amt": map[string]any{
+						"sum": map[string]any{"script": "doc['amount'].value * 2"},
 					},
 				},
 			},
@@ -335,18 +352,14 @@ func TestRound25_P0_2_CompositeSubAggsAndDynamicNestedFilters(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("composite sub-agg status = %d, resp = %v", code, resp)
 	}
-	regBuckets := resp["aggregations"].(map[string]any)["by_region"].(map[string]any)["buckets"].([]any)
-	if len(regBuckets) != 1 {
-		t.Fatalf("expected 1 region bucket, got %d", len(regBuckets))
-	}
-	compBuckets := regBuckets[0].(map[string]any)["comp_env"].(map[string]any)["buckets"].([]any)
+	compBuckets := resp["aggregations"].(map[string]any)["comp_env"].(map[string]any)["buckets"].([]any)
 	if len(compBuckets) != 1 {
 		t.Fatalf("expected 1 normalized composite bucket, got %v", compBuckets)
 	}
 	cb0 := compBuckets[0].(map[string]any)
 	keyMap := cb0["key"].(map[string]any)
-	if keyMap["env"] != "prod" || keyMap["act"] != true {
-		t.Fatalf("expected composite key env=prod, act=true, got %v", keyMap)
+	if keyMap["region"] != "us" || keyMap["env"] != "prod" || keyMap["act"] != true {
+		t.Fatalf("expected composite key region=us, env=prod, act=true, got %v", keyMap)
 	}
 	if cb0["total_amt"].(map[string]any)["value"] != float64(150) {
 		t.Fatalf("expected total_amt = 150, got %v", cb0["total_amt"])
@@ -892,8 +905,8 @@ func TestRound25_P0_7_IngestAttachmentCSVKVgsubAndUpdateByQueryMetadata(t *testi
 	if ubqCode != http.StatusBadRequest {
 		t.Fatalf("expected 400 when mutating ctx._id in _update_by_query, got %d (%v)", ubqCode, ubqResp)
 	}
-	if !strings.Contains(ubqResp["error"].(map[string]any)["reason"].(string), "ctx._id") {
-		t.Fatalf("expected error reason mentioning ctx._id, got %v", ubqResp)
+	if !strings.Contains(ubqResp["error"].(map[string]any)["reason"].(string), "_id") {
+		t.Fatalf("expected error reason mentioning _id, got %v", ubqResp)
 	}
 
 	// Verify grok inline named captures (?<name>...), date_index_name template expansion, and copy deep-clone

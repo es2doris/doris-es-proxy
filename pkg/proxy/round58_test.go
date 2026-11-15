@@ -202,8 +202,8 @@ func TestRound58_F2_PITAndScrollLifecycle(t *testing.T) {
 		t.Fatalf("expected 404 search_context_missing_exception after clearing scroll, got %d %s", code, rawScErr)
 	}
 	code, _, scDelUnknown, _ := doRound58Req(t, handler, http.MethodDelete, "/_search/scroll", `{"scroll_id":"nonexistent_scroll_tok"}`, nil)
-	if code != http.StatusOK || scDelUnknown["succeeded"] != false || scDelUnknown["num_freed"] != float64(0) {
-		t.Fatalf("expected succeeded=false, num_freed=0 for unknown scroll_id, got %d %v", code, scDelUnknown)
+	if code != http.StatusNotFound || scDelUnknown["succeeded"] != false || scDelUnknown["num_freed"] != float64(0) {
+		t.Fatalf("expected 404 with succeeded=false, num_freed=0 for unknown scroll_id, got %d %v", code, scDelUnknown)
 	}
 
 	// Scroll _all & TTL expiry
@@ -934,7 +934,7 @@ func TestRound58_F8_ReindexUpdateDeleteByQueryCompliance(t *testing.T) {
 	if c, _, _, _ := doRound58Req(t, handler, http.MethodPost, "/r58_no_such_src/_update_by_query", `{}`, nil); c != http.StatusNotFound {
 		t.Fatalf("expected 404 on _update_by_query missing index, got %d", c)
 	}
-	if c, _, _, _ := doRound58Req(t, handler, http.MethodPost, "/r58_no_such_src/_delete_by_query", `{}`, nil); c != http.StatusNotFound {
+	if c, _, _, _ := doRound58Req(t, handler, http.MethodPost, "/r58_no_such_src/_delete_by_query", `{"query":{"match_all":{}}}`, nil); c != http.StatusNotFound {
 		t.Fatalf("expected 404 on _delete_by_query missing index, got %d", c)
 	}
 
@@ -1072,29 +1072,42 @@ func TestRound58_F27_IngestCycleDetectionTerminateAndForeachRestore(t *testing.T
 	_, handler := newTestServerWithMock(t)
 
 	// 1. Direct & transitive cycle detection across processors, on_failure, and foreach
+	// ES allows PUT of cyclic pipelines (200) and detects cycles at index/execution time (400).
 	if c, _, _, _ := doRound58Req(t, handler, http.MethodPut, "/_ingest/pipeline/p_self", `{
 		"processors": [{"pipeline": {"name": "p_self"}}]
-	}`, nil); c != http.StatusBadRequest {
-		t.Fatalf("expected 400 on direct self-referencing pipeline cycle, got %d", c)
+	}`, nil); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT self-referencing pipeline, got %d", c)
+	}
+	if c, _, _, raw := doRound58Req(t, handler, http.MethodPost, "/r58_cyc/_doc?pipeline=p_self", `{"x":1}`, nil); c != http.StatusBadRequest || !strings.Contains(raw, "Cycle detected for pipeline:") {
+		t.Fatalf("expected 400 Cycle detected on indexing with p_self, got %d: %s", c, raw)
 	}
 
 	doRound58Req(t, handler, http.MethodPut, "/_ingest/pipeline/p_a", `{"processors":[{"set":{"field":"x","value":1}}]}`, nil)
 	doRound58Req(t, handler, http.MethodPut, "/_ingest/pipeline/p_b", `{"processors":[{"pipeline":{"name":"p_a"}}]}`, nil)
 	if c, _, _, _ := doRound58Req(t, handler, http.MethodPut, "/_ingest/pipeline/p_a", `{
 		"processors": [{"pipeline": {"name": "p_b"}}]
-	}`, nil); c != http.StatusBadRequest {
-		t.Fatalf("expected 400 on 2-node pipeline cycle p_a -> p_b -> p_a, got %d", c)
+	}`, nil); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT 2-node pipeline cycle p_a -> p_b -> p_a, got %d", c)
+	}
+	if c, _, _, raw := doRound58Req(t, handler, http.MethodPost, "/r58_cyc/_doc?pipeline=p_a", `{"x":1}`, nil); c != http.StatusBadRequest || !strings.Contains(raw, "Cycle detected for pipeline:") {
+		t.Fatalf("expected 400 on indexing with 2-node pipeline cycle, got %d: %s", c, raw)
 	}
 	if c, _, _, _ := doRound58Req(t, handler, http.MethodPut, "/_ingest/pipeline/p_a", `{
 		"processors": [{"fail": {"message": "boom"}}],
 		"on_failure": [{"pipeline": {"name": "p_b"}}]
-	}`, nil); c != http.StatusBadRequest {
-		t.Fatalf("expected 400 on on_failure pipeline cycle, got %d", c)
+	}`, nil); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT on_failure pipeline cycle, got %d", c)
+	}
+	if c, _, _, raw := doRound58Req(t, handler, http.MethodPost, "/r58_cyc/_doc?pipeline=p_a", `{"x":1}`, nil); c != http.StatusBadRequest || !strings.Contains(raw, "Cycle detected for pipeline:") {
+		t.Fatalf("expected 400 on indexing with on_failure pipeline cycle, got %d: %s", c, raw)
 	}
 	if c, _, _, _ := doRound58Req(t, handler, http.MethodPut, "/_ingest/pipeline/p_a", `{
 		"processors": [{"foreach": {"field": "arr", "processor": {"pipeline": {"name": "p_b"}}}}]
-	}`, nil); c != http.StatusBadRequest {
-		t.Fatalf("expected 400 on foreach pipeline cycle, got %d", c)
+	}`, nil); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT foreach pipeline cycle, got %d", c)
+	}
+	if c, _, _, raw := doRound58Req(t, handler, http.MethodPost, "/r58_cyc/_doc?pipeline=p_a", `{"arr":[1]}`, nil); c != http.StatusBadRequest || !strings.Contains(raw, "Cycle detected for pipeline:") {
+		t.Fatalf("expected 400 on indexing with foreach pipeline cycle, got %d: %s", c, raw)
 	}
 
 	// 2. Sub-pipeline terminate halts outer pipeline AND foreach, while index final_pipeline still runs!

@@ -584,17 +584,6 @@ func TestRound41_F25_F26_F27_F28_F29_F30_PipelinesUpdateReindexAndValidation(t *
 			"script_terms": {
 				"terms": {"script": {"source": "doc['k'].value"}},
 				"aggs": {
-					"sub_comp": {
-						"composite": {
-							"sources": [
-								{"s_k": {"terms": {"field": "k"}}},
-								{"s_v": {"histogram": {"field": "v", "interval": 10}}}
-							]
-						},
-						"aggs": {
-							"sc_script": {"sum": {"script": {"source": "doc['v'].value"}}}
-						}
-					},
 					"sub_filters": {
 						"filters": {
 							"other_bucket": true,

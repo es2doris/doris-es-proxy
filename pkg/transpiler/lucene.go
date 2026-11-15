@@ -140,6 +140,9 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 	flags.quoteAnalyzer = strings.TrimSpace(qsq.QuoteAnalyzer)
 	flags.zeroTermsQuery = strings.TrimSpace(qsq.ZeroTermsQuery)
 	flags.lenient = qsq.Lenient
+	flags.checkRegexLen = func(pat string) {
+		t.checkRegexLengthLimit(pat)
+	}
 	if t.Schema != nil {
 		flags.isTextField = func(fname string) bool {
 			if fname == "_all_text" {
@@ -147,6 +150,16 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 			}
 			_, b := t.resolveFieldInNestedCtx(fname, false, nctx)
 			return schema.IsTextLikeESType(b.ESType)
+		}
+		flags.isWhitespaceField = func(fname string) bool {
+			if strings.EqualFold(flags.analyzer, "whitespace") {
+				return true
+			}
+			if strings.HasSuffix(fname, ".keyword") {
+				return false
+			}
+			_, b := t.resolveFieldInNestedCtx(fname, false, nctx)
+			return strings.EqualFold(effectiveFieldSearchAnalyzer(b), "whitespace")
 		}
 		flags.expandFields = func(pat string) []string {
 			exp := t.expandFieldPatternForContext(pat, nctx)
@@ -205,7 +218,7 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 		compiled.ScoreSQL = fmt.Sprintf("((%s) * %.4f)", compiled.ScoreSQL, *qsq.Boost)
 	}
 	if !isSimple && flags.whitespace && (flags.queryType == "" || flags.queryType == "best_fields" || flags.queryType == "most_fields") && flags.quoteFieldSuffix == "" && flags.timeZone == "" && flags.phraseSlop == 0 && flags.fuzziness == nil && flags.fuzzyPrefixLength == 0 && flags.fuzzyMaxExpansions == 0 && flags.analyzer == "" && flags.quoteAnalyzer == "" && flags.zeroTermsQuery == "" && flags.escape && (flags.lenient == nil || !*flags.lenient) && compiled.WhereSQL != "FALSE" {
-		if rewrittenRaw, ok := t.rewriteDoris4SearchQuery(raw); ok && t.Opts.UseDoris4SearchFunc && nctx == nil && qsq.MinimumShouldMatch == nil && defaultField != "__unmatched_wildcard__" && !strings.ContainsAny(raw, "[{><~/^\\") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, "`n__") && !strings.Contains(compiled.WhereSQL, " IS NOT NULL") && !strings.Contains(compiled.WhereSQL, "array_size(") {
+		if rewrittenRaw, ok := t.rewriteDoris4SearchQuery(raw); ok && t.Opts.UseDoris4SearchFunc && nctx == nil && qsq.MinimumShouldMatch == nil && defaultField != "__unmatched_wildcard__" && !strings.ContainsAny(raw, "[{><~/^\\") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, " REGEXP ") && !strings.Contains(compiled.WhereSQL, "`n__") && !strings.Contains(compiled.WhereSQL, " IS NOT NULL") && !strings.Contains(compiled.WhereSQL, "array_size(") {
 			if len(expandedFields) > 1 {
 				if canEmitMultiFieldDoris4SearchDisjunction(rewrittenRaw, defaultOp) {
 					var searchPreds []string
@@ -467,6 +480,8 @@ type simpleQueryFlags struct {
 	lenient              *bool
 	expandFields         func(string) []string
 	isTextField          func(string) bool
+	isWhitespaceField    func(string) bool
+	checkRegexLen        func(string)
 }
 
 func allSimpleQueryFlags() simpleQueryFlags {
@@ -1279,6 +1294,9 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 		}
 		if strings.HasPrefix(val, "/") && strings.HasSuffix(val, "/") && len(val) > 2 {
 			pat := strings.ReplaceAll(val[1:len(val)-1], `\/`, `/`)
+			if flags.checkRegexLen != nil {
+				flags.checkRegexLen(pat)
+			}
 			if strings.ContainsAny(field, "*?") && flags.expandFields != nil {
 				expFields := flags.expandFields(field)
 				if len(expFields) == 0 {
@@ -1446,9 +1464,10 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 				var shoulds []esast.Query
 				for _, ef := range expFields {
 					fname, fBoost := splitLuceneBoost(ef)
+					ci := flags.isWhitespaceField == nil || !flags.isWhitespaceField(fname)
 					shoulds = append(shoulds, esast.Query{
 						Wildcard: map[string]esast.WildcardEntry{
-							fname: {Value: rawWild, CaseInsensitive: true, Boost: boost * fBoost, HasBoost: true},
+							fname: {Value: rawWild, CaseInsensitive: ci, Boost: boost * fBoost, HasBoost: true},
 						},
 					})
 				}
@@ -1457,9 +1476,10 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 				}
 				return esast.Query{Bool: &esast.BoolQuery{Should: shoulds}}
 			}
+			ci := flags.isWhitespaceField == nil || !flags.isWhitespaceField(field)
 			return esast.Query{
 				Wildcard: map[string]esast.WildcardEntry{
-					field: {Value: rawWild, CaseInsensitive: true, Boost: boost, HasBoost: true},
+					field: {Value: rawWild, CaseInsensitive: ci, Boost: boost, HasBoost: true},
 				},
 			}
 		}
@@ -1620,6 +1640,9 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 		}
 		if strings.HasPrefix(token, "/") && strings.HasSuffix(token, "/") && len(token) > 2 {
 			pat := strings.ReplaceAll(token[1:len(token)-1], `\/`, `/`)
+			if flags.checkRegexLen != nil {
+				flags.checkRegexLen(pat)
+			}
 			if len(fields) > 0 {
 				var shoulds []esast.Query
 				for _, fpat := range fields {
@@ -1705,9 +1728,10 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 					}
 					continue
 				}
+				ci := flags.isWhitespaceField == nil || !flags.isWhitespaceField(fname)
 				shoulds = append(shoulds, esast.Query{
 					Wildcard: map[string]esast.WildcardEntry{
-						fname: {Value: rawWild, CaseInsensitive: true, Boost: boost * fBoost, HasBoost: true},
+						fname: {Value: rawWild, CaseInsensitive: ci, Boost: boost * fBoost, HasBoost: true},
 					},
 				})
 			}
@@ -1725,9 +1749,10 @@ func buildLuceneAtomQueryWithFlags(token, defaultField string, fields []string, 
 			}
 			return esast.Query{Exists: &esast.ExistsQuery{Field: defaultField}}
 		}
+		ci := flags.isWhitespaceField == nil || !flags.isWhitespaceField(defaultField)
 		return esast.Query{
 			Wildcard: map[string]esast.WildcardEntry{
-				defaultField: {Value: rawWild, CaseInsensitive: true, Boost: boost, HasBoost: true},
+				defaultField: {Value: rawWild, CaseInsensitive: ci, Boost: boost, HasBoost: true},
 			},
 		}
 	}

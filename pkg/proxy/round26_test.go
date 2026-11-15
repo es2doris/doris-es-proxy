@@ -1297,6 +1297,13 @@ func TestRound26_P0_8_AdditionalBranchesAndRuntimeMetricsCoverage(t *testing.T) 
 	}
 
 	// 7. Nested score_mode min/max/none in script_score, rescore array, anonymous filters terms lookup, and query_string fuzziness=0
+	_, _ = doRound26Req(t, srv, http.MethodPut, "/r26_cov_nested", map[string]any{
+		"mappings": map[string]any{
+			"properties": map[string]any{
+				"items": map[string]any{"type": "nested"},
+			},
+		},
+	})
 	code, resp = doRound26Req(t, srv, http.MethodPost, "/r26_cov_nested/_search", map[string]any{
 		"query": map[string]any{
 			"script_score": map[string]any{

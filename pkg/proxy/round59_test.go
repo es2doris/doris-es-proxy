@@ -1507,6 +1507,7 @@ func TestRound59_TranspilerHooksUnitCoverage(t *testing.T) {
 	fullMapSpec.NumericDetection = &tBool
 	fullMapSpec.Subobjects = &fBool
 	fullMapSpec.Runtime = map[string]esast.FieldProperty{"rt_f": {Type: "keyword"}}
+	fullMapSpec.Properties = map[string]esast.FieldProperty{"ab": {Type: "integer"}}
 	fullCompiled := schema.CompileIndexSchema("es_db", "r59_unit_map", &fullMapSpec)
 	respMap := buildMappingResponseMapRound59(fullCompiled)
 	for _, reqKey := range []string{"properties", "runtime", "dynamic", "_routing", "_meta", "_source", "dynamic_templates", "date_detection", "numeric_detection", "dynamic_date_formats", "subobjects"} {
