@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestRound61Painless_F21_ScriptSpecStringShorthandAndCtxGuards(t *testing.T) {
@@ -380,5 +381,374 @@ func TestRound61Painless_F29_DoSHardeningPinnedCapsAndBoundedRegexCache(t *testi
 	`, nil)
 	if err == nil || !strings.Contains(err.Error(), "PainlessError") {
 		t.Fatalf("expected uncatchable PainlessError exceeding MaxPinnedRefs, got %v", err)
+	}
+}
+
+func TestRound61Painless_CoverageAnalyzersGeoIPTimeAndVectors(t *testing.T) {
+	// 1. AnalyzeStandardFielddataTokens & CountStandardAnalyzerTokens across nil, []any, []string, numeric, scalar
+	if got := AnalyzeStandardFielddataTokens(nil); len(got) != 0 {
+		t.Fatalf("expected empty tokens for nil, got %v", got)
+	}
+	if got := AnalyzeStandardFielddataTokens("   ...   "); len(got) != 0 {
+		t.Fatalf("expected empty tokens for punctuation, got %v", got)
+	}
+	toks := AnalyzeStandardFielddataTokens([]any{nil, []string{"Beta Alpha", "alpha"}, 42})
+	if len(toks) != 3 || toks[0] != "42" || toks[1] != "alpha" || toks[2] != "beta" {
+		t.Fatalf("unexpected AnalyzeStandardFielddataTokens: %v", toks)
+	}
+	if c, ok := CountStandardAnalyzerTokens(nil); ok || c != 0 {
+		t.Fatalf("expected (0,false) on nil CountStandardAnalyzerTokens")
+	}
+	if c, ok := CountStandardAnalyzerTokens([]any{nil, []string{"one two", "three"}, int64(4), "five"}); !ok || c != 8 {
+		t.Fatalf("expected CountStandardAnalyzerTokens=8, got %d (ok=%v)", c, ok)
+	}
+
+	// 2. formatFlattenedScalarRound61 & ExtractFlattenedLeafStrings & resolveMappedFlattenedBaseRound61
+	if len(ExtractFlattenedLeafStrings(nil, "")) != 0 {
+		t.Fatalf("expected empty leaves on nil flattened root")
+	}
+	flatRoot := map[string]any{
+		"str":     "hello",
+		"b_true":  true,
+		"b_false": false,
+		"jnum":    json.Number("99"),
+		"i":       int(7),
+		"i64":     int64(8),
+		"i32":     int32(9),
+		"f64_int": float64(12.0),
+		"f64_dec": float64(12.5),
+		"f32_int": float32(3.0),
+		"f32_dec": float32(3.25),
+		"arr":     []any{map[string]any{"nested": "val"}, nil},
+		"a.b":     "dotted_val",
+	}
+	allLeaves := ExtractFlattenedLeafStrings(flatRoot, "")
+	if len(allLeaves) < 10 {
+		t.Fatalf("unexpected flattened root leaves: %v", allLeaves)
+	}
+	subLeaves := ExtractFlattenedLeafStrings(flatRoot, "a.b")
+	if len(subLeaves) != 1 || subLeaves[0] != "dotted_val" {
+		t.Fatalf("unexpected flattened subPath leaves: %v", subLeaves)
+	}
+	arrSub := ExtractFlattenedLeafStrings([]any{map[string]any{"k": "v1"}, map[string]any{"k": "v2"}}, "k")
+	if len(arrSub) != 2 {
+		t.Fatalf("unexpected array flattened leaves: %v", arrSub)
+	}
+	rf, sp, ok := resolveMappedFlattenedBaseRound61(map[string]any{"__field_types": map[string]string{"meta": "flattened"}}, "meta.env.region")
+	if !ok || rf != "meta" || sp != "env.region" {
+		t.Fatalf("unexpected resolveMappedFlattenedBaseRound61: rf=%q sp=%q ok=%v", rf, sp, ok)
+	}
+	if _, _, ok := resolveMappedFlattenedBaseRound61(nil, ""); ok {
+		t.Fatalf("expected false on nil params")
+	}
+
+	// 3. QuantizeLuceneGeoPoint, GeoBoundingBoxVal, computeGeoSliceBoundsRound61, evalDocFieldSliceGeoMethodRound61
+	latHi, lonHi := QuantizeLuceneGeoPoint(90.0, 180.0)
+	latLo, lonLo := QuantizeLuceneGeoPoint(-90.0, -180.0)
+	if latHi <= 89.9 || lonHi <= 179.9 || latLo > -90.0 || lonLo > -180.0 {
+		t.Fatalf("unexpected boundary quantized geo_point: (%v,%v) (%v,%v)", latHi, lonHi, latLo, lonLo)
+	}
+	var nilBox *GeoBoundingBoxVal
+	if b, err := nilBox.MarshalJSON(); err != nil || string(b) != "null" || nilBox.String() != "null" {
+		t.Fatalf("unexpected nil GeoBoundingBoxVal format")
+	}
+	if _, ok, _ := evalGeoBoundingBoxMethodRound61(nilBox, "top"); ok {
+		t.Fatalf("expected nil GeoBoundingBoxVal method not handled")
+	}
+	box := &GeoBoundingBoxVal{
+		TopLeft:     &GeoPointVal{Lat: 52.5, Lon: 4.0},
+		BottomRight: &GeoPointVal{Lat: 50.0, Lon: 6.5},
+	}
+	if b, err := json.Marshal(box); err != nil || !strings.Contains(string(b), "top_left") || !strings.Contains(box.String(), "GeoBoundingBox") {
+		t.Fatalf("unexpected GeoBoundingBoxVal json/string: %s / %s", string(b), box.String())
+	}
+	for _, m := range []string{"topLeft", "bottomRight", "top", "bottom", "left", "right", "toString"} {
+		if _, ok, err := evalGeoBoundingBoxMethodRound61(box, m); !ok || err != nil {
+			t.Fatalf("evalGeoBoundingBoxMethodRound61(%q) failed: ok=%v err=%v", m, ok, err)
+		}
+	}
+	emptyBox := &GeoBoundingBoxVal{}
+	for _, m := range []string{"top", "bottom", "left", "right"} {
+		if v, ok, _ := evalGeoBoundingBoxMethodRound61(emptyBox, m); !ok || v != 0.0 {
+			t.Fatalf("emptyBox %s expected 0.0, got %v", m, v)
+		}
+	}
+	if _, _, _, mw0, mh0 := computeGeoSliceBoundsRound61(nil); mw0 != 0 || mh0 != 0 {
+		t.Fatalf("expected zero bounds for empty slice")
+	}
+	if _, ok, _ := evalDocFieldSliceGeoMethodRound61(nil, "unknownMethod"); ok {
+		t.Fatalf("expected unknown geo slice method to return ok=false")
+	}
+	if _, ok, err := evalDocFieldSliceGeoMethodRound61([]any{}, "getCentroid"); !ok || err == nil {
+		t.Fatalf("expected empty geo slice getCentroid error")
+	}
+	if _, ok, err := evalDocFieldSliceGeoMethodRound61([]any{"not_a_geo_point"}, "getCentroid"); !ok || err == nil {
+		t.Fatalf("expected invalid geo slice getCentroid error")
+	}
+	multiGeo := []any{"52.0,4.0", "50.0,6.0"}
+	for _, m := range []string{"getCentroid", "getLabelPosition", "getBoundingBox", "getDimensionalType", "getMercatorWidth", "getMercatorHeight"} {
+		if v, ok, err := evalDocFieldSliceGeoMethodRound61(multiGeo, m); !ok || err != nil || v == nil {
+			t.Fatalf("evalDocFieldSliceGeoMethodRound61(%q) failed: v=%v ok=%v err=%v", m, v, ok, err)
+		}
+	}
+
+	// 4. IPAddressVal parsing, methods, comparison, JSON
+	var nilIP *IPAddressVal
+	if b, _ := nilIP.MarshalJSON(); string(b) != "null" || nilIP.String() != "null" || !nilIP.Equals(nil) || nilIP.CompareTo(nil) != 0 {
+		t.Fatalf("unexpected nil IPAddressVal behavior")
+	}
+	if _, err := ParseIPAddressVal("not-an-ip"); err == nil {
+		t.Fatalf("expected error on invalid IP")
+	}
+	ip4, err := ParseIPAddressVal("127.0.0.1")
+	if err != nil {
+		t.Fatalf("ParseIPAddressVal v4: %v", err)
+	}
+	ip6, err := ParseIPAddressVal("fe80::1")
+	if err != nil {
+		t.Fatalf("ParseIPAddressVal v6: %v", err)
+	}
+	if nilIP.CompareTo(ip4) >= 0 || ip4.CompareTo(nilIP) <= 0 || ip4.Equals("127.0.0.1") || !ip4.Equals(ip4) {
+		t.Fatalf("unexpected IPAddressVal CompareTo/Equals")
+	}
+	if b, err := json.Marshal(ip4); err != nil || string(b) != `"127.0.0.1"` {
+		t.Fatalf("unexpected IPAddressVal MarshalJSON: %s (%v)", string(b), err)
+	}
+	for _, m := range []string{
+		"toString", "getHostAddress", "toCanonicalString", "isIPv4", "isIPv6",
+		"isLoopbackAddress", "isMulticastAddress", "isSiteLocalAddress", "isPrivate",
+		"isLinkLocalAddress", "getAddress", "hashCode",
+	} {
+		if _, ok, err := evalIPAddressMethodRound61(ip4, m, nil, nil, nil, 0); !ok || err != nil {
+			t.Fatalf("ip4 method %s failed: ok=%v err=%v", m, ok, err)
+		}
+		if _, ok, err := evalIPAddressMethodRound61(ip6, m, nil, nil, nil, 0); !ok || err != nil {
+			t.Fatalf("ip6 method %s failed: ok=%v err=%v", m, ok, err)
+		}
+	}
+	pMap := map[string]any{"other": ip6, "strIP": "127.0.0.1", "bad": 123}
+	if eq, ok, err := evalIPAddressMethodRound61(ip4, "equals", []string{"params.other"}, nil, pMap, 0); !ok || err != nil || eq != false {
+		t.Fatalf("unexpected ip4.equals(ip6): %v %v", eq, err)
+	}
+	if cmp, ok, err := evalIPAddressMethodRound61(ip4, "compareTo", []string{"params.strIP"}, nil, pMap, 0); !ok || err != nil || cmp != int64(0) {
+		t.Fatalf("unexpected ip4.compareTo('127.0.0.1'): %v %v", cmp, err)
+	}
+	if _, _, err := evalIPAddressMethodRound61(ip4, "compareTo", []string{"null"}, nil, pMap, 0); err == nil {
+		t.Fatalf("expected NullPointerException comparing IPAddress to null")
+	}
+	if _, _, err := evalIPAddressMethodRound61(ip4, "compareTo", []string{"params.bad"}, nil, pMap, 0); err == nil {
+		t.Fatalf("expected ClassCastException comparing IPAddress to int")
+	}
+
+	// 5. Custom date pattern conversion, parseDocDateWithMappingFormatRound61, evalChronoOrIsoFieldOnTimeRound61
+	_ = convertJavaSimpleDatePatternRound61("yy-M-d'T'h:mm:ss.SSSa ZZZZ X XX XXX ''lit'' MMM MMMM")
+	for _, tc := range []struct {
+		val any
+		fmt string
+	}{
+		{"1700000000000", "epoch_millis"},
+		{int64(1700000000000), "epoch_millis"},
+		{"1700000000.5", "epoch_second"},
+		{1700000000.5, "epoch_second"},
+		{"20231114", "basic_date"},
+		{"20231114T221320.000Z", "basic_date_time"},
+		{"14-11-2023 22:13:20", "dd-MM-yyyy HH:mm:ss||epoch_millis"},
+	} {
+		if zdt, ok := parseDocDateWithMappingFormatRound61(tc.val, tc.fmt, false); !ok || zdt == nil {
+			t.Fatalf("parseDocDateWithMappingFormatRound61(%v, %q) failed", tc.val, tc.fmt)
+		}
+	}
+	refTm := time.Date(2024, 5, 15, 14, 30, 45, 123456789, time.UTC)
+	for _, cf := range []string{
+		"WEEK_OF_WEEK_BASED_YEAR", "WEEK_BASED_YEAR", "QUARTER_OF_YEAR", "DAY_OF_QUARTER",
+		"YEAR_OF_ERA", "ERA", "MILLI_OF_DAY", "MILLI_OF_SECOND", "MICRO_OF_SECOND", "MICRO_OF_DAY",
+		"NANO_OF_SECOND", "NANO_OF_DAY", "MINUTE_OF_DAY", "MINUTE_OF_HOUR", "SECOND_OF_DAY",
+		"SECOND_OF_MINUTE", "HOUR_OF_DAY", "HOUR_OF_AMPM", "AMPM_OF_DAY", "DAY_OF_WEEK",
+		"DAY_OF_MONTH", "DAY_OF_YEAR", "MONTH_OF_YEAR", "PROLEPTIC_MONTH", "EPOCH_DAY",
+		"INSTANT_SECONDS", "OFFSET_SECONDS", "YEAR",
+	} {
+		if _, ok := evalChronoOrIsoFieldOnTimeRound61(refTm, cf); !ok {
+			t.Fatalf("evalChronoOrIsoFieldOnTimeRound61(%q) returned ok=false", cf)
+		}
+	}
+	bceTm := time.Date(0, 1, 2, 0, 0, 0, 0, time.UTC) // Sunday & year <= 0
+	_, _ = evalChronoOrIsoFieldOnTimeRound61(bceTm, "YEAR_OF_ERA")
+	_, _ = evalChronoOrIsoFieldOnTimeRound61(bceTm, "ERA")
+	_, _ = evalChronoOrIsoFieldOnTimeRound61(bceTm, "AMPM_OF_DAY")
+	_, _ = evalChronoOrIsoFieldOnTimeRound61(bceTm, "DAY_OF_WEEK")
+	if _, ok := evalChronoOrIsoFieldOnTimeRound61(refTm, "NOT_A_FIELD"); ok {
+		t.Fatalf("expected false for unknown chrono field")
+	}
+
+	// 6. DenseVectorVal, DenseVectorFieldVal, bit/byte/float vector metrics & error branches
+	if _, _, err := DecodeHexSignedByteVector("abc"); err == nil {
+		t.Fatalf("expected odd-length hex error")
+	}
+	if _, _, err := DecodeHexSignedByteVector("zzzz"); err == nil {
+		t.Fatalf("expected invalid hex error")
+	}
+	_, _, _ = parseVectorValueRound61([]float32{1, 2}, "byte")
+	_, _, _ = parseVectorValueRound61([]float64{1, 2}, "bit")
+	if _, _, err := parseVectorValueRound61([]any{200}, "byte"); err == nil {
+		t.Fatalf("expected out-of-range byte vector error")
+	}
+	var nilDVV *DenseVectorVal
+	if b, _ := nilDVV.MarshalJSON(); string(b) != "null" || nilDVV.String() != "null" {
+		t.Fatalf("unexpected nil DenseVectorVal format")
+	}
+	bitDVV := &DenseVectorVal{Name: "bv", ElemType: "bit", Floats: []float32{3, -1}, Bytes: []int8{3, -1}}
+	if s := bitDVV.String(); s != "[3,-1]" {
+		t.Fatalf("unexpected bit DenseVectorVal string: %s", s)
+	}
+	floatDVV := &DenseVectorVal{Name: "fv", ElemType: "float", Floats: []float32{3, 4}}
+	if !strings.Contains(floatDVV.String(), "3") {
+		t.Fatalf("unexpected float DenseVectorVal string: %s", floatDVV.String())
+	}
+	emptyDVF := &DenseVectorFieldVal{Name: "fv", ElemType: "float", Present: false}
+	if !emptyDVF.IsEmpty() || emptyDVF.String() != "[]" {
+		t.Fatalf("unexpected empty DenseVectorFieldVal")
+	}
+	if _, err := emptyDVF.GetValue(); err == nil {
+		t.Fatalf("expected error on empty DenseVectorFieldVal.GetValue()")
+	}
+	if def, err := emptyDVF.GetWithDefault("fallback"); err != nil || def != "fallback" {
+		t.Fatalf("unexpected GetWithDefault on empty: %v (%v)", def, err)
+	}
+	fullDVF := &DenseVectorFieldVal{Name: "fv", ElemType: "float", Present: true, Vec: floatDVV}
+	if fullDVF.IsEmpty() {
+		t.Fatalf("expected non-empty fullDVF")
+	}
+	if gv, err := fullDVF.GetValue(); err != nil || gv != floatDVV {
+		t.Fatalf("unexpected fullDVF.GetValue(): %v %v", gv, err)
+	}
+	if gd, err := fullDVF.GetWithDefault(nil); err != nil || gd != floatDVV {
+		t.Fatalf("unexpected fullDVF.GetWithDefault(): %v %v", gd, err)
+	}
+
+	vecParams := map[string]any{"q": []any{3.0, 4.0}, "qBit": []any{1, -1}, "defVec": []any{9.0, 9.0}}
+	for _, m := range []string{"isEmpty", "size", "getDims", "getValue", "getMagnitude", "l1Norm", "l2Norm"} {
+		if _, ok, err := evalDenseVectorMethodRound61(fullDVF, m, nil, nil, vecParams, 0); !ok || err != nil {
+			t.Fatalf("fullDVF.%s() failed: ok=%v err=%v", m, ok, err)
+		}
+	}
+	if _, ok, err := evalDenseVectorMethodRound61(bitDVV, "l1Norm", nil, nil, vecParams, 0); !ok || err != nil {
+		t.Fatalf("bitDVV.l1Norm() failed: ok=%v err=%v", ok, err)
+	}
+	for _, m := range []string{"l1Norm", "l2Norm", "dotProduct", "cosineSimilarity"} {
+		if _, ok, err := evalDenseVectorMethodRound61(fullDVF, m, []string{"params.q"}, nil, vecParams, 0); !ok || err != nil {
+			t.Fatalf("fullDVF.%s(params.q) failed: ok=%v err=%v", m, ok, err)
+		}
+	}
+	for _, m := range []string{"hamming", "l1Norm", "l2Norm"} {
+		if _, ok, err := evalDenseVectorMethodRound61(bitDVV, m, []string{"params.qBit"}, nil, vecParams, 0); !ok || err != nil {
+			t.Fatalf("bitDVV.%s(params.qBit) failed: ok=%v err=%v", m, ok, err)
+		}
+	}
+	if _, _, err := evalDenseVectorMethodRound61(bitDVV, "cosineSimilarity", []string{"params.qBit"}, nil, vecParams, 0); err == nil {
+		t.Fatalf("expected cosineSimilarity on bit vector to fail")
+	}
+	if _, _, err := evalDenseVectorMethodRound61(fullDVF, "hamming", []string{"params.q"}, nil, vecParams, 0); err == nil {
+		t.Fatalf("expected hamming on float vector to fail")
+	}
+	_, _, _ = evalDenseVectorMethodRound61(fullDVF, "get", nil, nil, vecParams, 0)
+	_, _, _ = evalDenseVectorMethodRound61(fullDVF, "get", []string{"1"}, nil, vecParams, 0)
+	_, _, _ = evalDenseVectorMethodRound61(emptyDVF, "get", []string{"params.defVec"}, nil, vecParams, 0)
+	_, _, _ = evalDenseVectorMethodRound61(fullDVF, "get", []string{"0", "0.0"}, nil, vecParams, 0)
+	_, _, _ = evalDenseVectorMethodRound61(fullDVF, "get", []string{"9", "-1.0"}, nil, vecParams, 0)
+	_, _, _ = evalDenseVectorMethodRound61(emptyDVF, "get", []string{"0", "params.defVec"}, nil, vecParams, 0)
+	if _, _, err := evalDenseVectorMethodRound61(fullDVF, "get", []string{"99"}, nil, vecParams, 0); err == nil {
+		t.Fatalf("expected IndexOutOfBoundsException on fullDVF.get(99)")
+	}
+
+	// 7. isMutableFieldsContextRound61, UpdateMetadataVal getField/setField, CheckUpsertRoutingGuardRound61
+	if isMutableFieldsContextRound61(nil) {
+		t.Fatalf("expected false on nil params")
+	}
+	if !isMutableFieldsContextRound61(map[string]any{"__mutable_fields_api": true}) ||
+		!isMutableFieldsContextRound61(map[string]any{"__is_ubq": true}) ||
+		!isMutableFieldsContextRound61(map[string]any{"_ctx_op": "index"}) ||
+		!isMutableFieldsContextRound61(map[string]any{"_ingest": map[string]any{}}) ||
+		isMutableFieldsContextRound61(map[string]any{"__strict_doc_mapping": true}) {
+		t.Fatalf("unexpected isMutableFieldsContextRound61 truth table")
+	}
+	meta := &UpdateMetadataVal{
+		Params: map[string]any{
+			"_ctx_id":      "1",
+			"_ctx_index":   "idx",
+			"_ctx_version": int64(2),
+			"_ctx_op":      "index",
+			"_ctx_now":     int64(1000),
+			"_ctx_routing": "r1",
+		},
+	}
+	for _, prop := range []string{"id", "index", "version", "op", "now", "routing"} {
+		if _, ok, err := meta.getField(prop); !ok || err != nil {
+			t.Fatalf("meta.getField(%q) failed: ok=%v err=%v", prop, ok, err)
+		}
+	}
+	meta.Params["__upsert_insert_mode"] = true
+	meta.Params["__upsert_forbid_routing"] = true
+	if _, _, err := meta.getField("routing"); err == nil {
+		t.Fatalf("expected routing unavailable for insert error")
+	}
+	if err := meta.setField("op", "delete"); err != nil {
+		t.Fatalf("expected valid op=delete, got %v", err)
+	}
+	for _, badProp := range []string{"routing", "id", "index", "version", "unknown_prop"} {
+		if err := meta.setField(badProp, "x"); err == nil {
+			t.Fatalf("expected meta.setField(%q) to fail", badProp)
+		}
+	}
+	if err := meta.setField("op", "invalid_op"); err == nil {
+		t.Fatalf("expected invalid op to fail")
+	}
+	meta.Params["__is_ubq"] = true
+	meta.Params["__is_es8"] = true
+	if err := meta.setField("op", "none"); err == nil {
+		t.Fatalf("expected UBQ ES8 op=none to fail via metadata()")
+	}
+	if err := CheckUpsertRoutingGuardRound61(false, "r1", "r1", "r2", true); err == nil {
+		t.Fatalf("expected existing doc routing mutation error")
+	}
+	if err := CheckUpsertRoutingGuardRound61(true, "r1", "r1", "r1", true); err != nil {
+		t.Fatalf("expected matching routing to pass, got %v", err)
+	}
+
+	// 8. Round 60/eval vector array similarity, Duration.parse, Period.parse, HalfFloat edge cases, and Stream pipelines
+	for _, fn := range []string{"dotProduct", "cosineSimilarity", "l1norm", "l2norm"} {
+		if sc, err := evalVectorSimilarityRound60(fn, []float64{3, 4}, []any{3.0, 4.0}, nil, nil); err != nil || math.IsNaN(sc) {
+			t.Fatalf("evalVectorSimilarityRound60(%s) failed: sc=%v err=%v", fn, sc, err)
+		}
+	}
+	for _, bitsVal := range []uint16{0x0000, 0x8000, 0x0001, 0x7c00, 0xfc00, 0x7e00, 0x3c00} {
+		_ = HalfFloatFromBits(bitsVal)
+	}
+	for _, fVal := range []float64{0, math.Copysign(0, -1), math.NaN(), math.Inf(1), math.Inf(-1), 1e-8, 1e6, 3.5} {
+		_ = HalfFloatToBits(fVal)
+	}
+	if v, err := Eval(map[string]any{}, `
+		Duration d = Duration.parse('P2DT3H4M5.5S');
+		Period p = Period.parse('P1Y2M3W4D');
+		List nums = [1, 2, 3, 4, 5];
+		int sum = nums.stream().filter(x -> x > 1).mapToInt(x -> x * 2).sum();
+		return d.toSeconds() + ':' + p.getDays() + ':' + sum;
+	`, nil); err != nil || !strings.HasSuffix(fmt.Sprintf("%v", v), ":25:28") {
+		t.Fatalf("Duration/Period/Stream eval failed: v=%v err=%v", v, err)
+	}
+	_ = normalizeSingleFieldDocValuesRound60([]any{3, 1, 2}, "long", false, false)
+	_ = normalizeSingleFieldDocValuesRound60([]any{1.5, 2.5}, "float", false, true)
+	fvRoot := map[string]any{"x": int64(10)}
+	fv := &FieldVal{Name: "x", Root: fvRoot}
+	if _, err := evalFieldValTransformRound61(fv, "v -> v + 5", fvRoot, map[string]any{}, 0); err != nil || fvRoot["x"] != int64(15) {
+		t.Fatalf("evalFieldValTransformRound61 failed: err=%v root=%v", err, fvRoot)
+	}
+	if _, err := evalFieldValTransformRound61(fv, "not_a_lambda", fvRoot, map[string]any{}, 0); err == nil {
+		t.Fatalf("expected non-lambda error on evalFieldValTransformRound61")
+	}
+	if v, err := Eval(map[string]any{}, `
+		BigInteger bi = new BigInteger('12345');
+		return bi.intValue() + ':' + bi.shortValue() + ':' + bi.byteValue() + ':' + bi.bitLength() + ':' + bi.toString();
+	`, nil); err != nil || !strings.HasPrefix(fmt.Sprintf("%v", v), "12345:12345:") {
+		t.Fatalf("BigInteger methods failed: v=%v err=%v", v, err)
 	}
 }

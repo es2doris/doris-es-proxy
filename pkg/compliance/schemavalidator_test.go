@@ -402,3 +402,147 @@ func TestSpecSchemaValidatorLiveUpstreamSchema(t *testing.T) {
 		}
 	}
 }
+
+func TestSpecSchemaValidatorMatchEndpointAndHTTPResponse(t *testing.T) {
+	t.Parallel()
+
+	const rawSpec = `{
+		"endpoints": [
+			{
+				"name": "info",
+				"urls": [{"methods": ["GET"], "path": "/"}],
+				"response": {"name": "InfoResp", "namespace": "core"},
+				"responseMediaType": ["application/json"]
+			},
+			{
+				"name": "get",
+				"urls": [{"methods": ["GET", "HEAD"], "path": "/{index}/_doc/{id}"}],
+				"response": {"name": "GetResp", "namespace": "core"},
+				"responseMediaType": ["application/json"]
+			},
+			{
+				"name": "cluster.health",
+				"urls": [
+					{"methods": ["GET"], "path": "/_cluster/health"},
+					{"methods": ["GET"], "path": "/_cluster/health/{index}"}
+				],
+				"response": {"name": "HealthResp", "namespace": "cluster"},
+				"responseMediaType": ["application/json"]
+			}
+		],
+		"types": [
+			{
+				"kind": "response",
+				"name": {"name": "InfoResp", "namespace": "core"},
+				"body": {
+					"kind": "properties",
+					"properties": [
+						{"name": "tagline", "required": true, "type": {"kind": "instance_of", "type": {"name": "string", "namespace": "_builtins"}}}
+					]
+				}
+			},
+			{
+				"kind": "response",
+				"name": {"name": "GetResp", "namespace": "core"},
+				"body": {
+					"kind": "properties",
+					"properties": [
+						{"name": "found", "required": true, "type": {"kind": "instance_of", "type": {"name": "boolean", "namespace": "_builtins"}}}
+					]
+				},
+				"exceptions": [
+					{
+						"statusCodes": [404],
+						"body": {
+							"kind": "properties",
+							"properties": [
+								{"name": "found", "required": true, "type": {"kind": "instance_of", "type": {"name": "boolean", "namespace": "_builtins"}}}
+							]
+						}
+					},
+					{
+						"statusCodes": [304],
+						"body": {"kind": "no_body"}
+					}
+				]
+			},
+			{
+				"kind": "response",
+				"name": {"name": "HealthResp", "namespace": "cluster"},
+				"body": {
+					"kind": "properties",
+					"properties": [
+						{"name": "status", "required": true, "type": {"kind": "instance_of", "type": {"name": "string", "namespace": "_builtins"}}}
+					]
+				},
+				"exceptions": [
+					{
+						"statusCodes": [408],
+						"body": {"kind": "no_body"}
+					}
+				]
+			}
+		]
+	}`
+
+	var nilVal *SpecSchemaValidator
+	if nilVal.MatchEndpoint("GET", "/") != "" || nilVal.EndpointCount() != 0 || nilVal.TypeCount() != 0 || nilVal.HasEndpoint("info") {
+		t.Fatalf("unexpected non-empty behavior on nil SpecSchemaValidator")
+	}
+	if err := nilVal.ValidateHTTPResponse("info", 200, []byte(`{}`)); err == nil {
+		t.Fatalf("expected error on nil ValidateHTTPResponse")
+	}
+
+	v, err := ParseSpecSchemaValidator([]byte(rawSpec))
+	if err != nil {
+		t.Fatalf("ParseSpecSchemaValidator: %v", err)
+	}
+	if v.EndpointCount() != 3 || v.TypeCount() != 3 || !v.HasEndpoint("get") {
+		t.Fatalf("unexpected validator counts")
+	}
+	if got := v.MatchEndpoint("GET", ""); got != "info" {
+		t.Fatalf("expected info on empty/root path, got %q", got)
+	}
+	if got := v.MatchEndpoint("GET", "/orders/_doc/42"); got != "get" {
+		t.Fatalf("expected get on /orders/_doc/42, got %q", got)
+	}
+	if got := v.MatchEndpoint("GET", "/_hidden/_doc/42"); got != "" {
+		t.Fatalf("expected underscore-prefixed param segment not to match {index}, got %q", got)
+	}
+	if got := v.MatchEndpoint("GET", "/_cluster/health", "get", "cluster.health"); got != "cluster.health" {
+		t.Fatalf("expected cluster.health with candidates, got %q", got)
+	}
+	if got := v.MatchEndpoint("DELETE", "/orders/_doc/42"); got != "" {
+		t.Fatalf("expected no match on DELETE, got %q", got)
+	}
+
+	// ValidateHTTPResponse 200, 404 declared exception, 408 no_body exception, 400 standard ES error, and negative cases
+	if err := v.ValidateHTTPResponse("info", 200, []byte(`{"tagline":"You Know, for Search"}`)); err != nil {
+		t.Fatalf("unexpected 200 error: %v", err)
+	}
+	if err := v.ValidateHTTPResponse("get", 404, []byte(`{"found":false}`)); err != nil {
+		t.Fatalf("unexpected 404 declared exception error: %v", err)
+	}
+	if err := v.ValidateHTTPResponse("cluster.health", 408, nil); err != nil {
+		t.Fatalf("unexpected 408 no_body error: %v", err)
+	}
+	if err := v.ValidateHTTPResponse("info", 400, []byte(`{"error":{"type":"illegal_argument_exception","reason":"bad"},"status":400}`)); err != nil {
+		t.Fatalf("unexpected 400 ES error envelope failure: %v", err)
+	}
+	for _, bad := range []struct {
+		ep   string
+		code int
+		body string
+	}{
+		{"unknown.ep", 200, `{}`},
+		{"info", 500, ``},
+		{"info", 500, `{invalid`},
+		{"info", 500, `[]`},
+		{"info", 500, `{"status":500}`},
+		{"get", 404, `{"found":"not_a_bool"}`},
+	} {
+		if err := v.ValidateHTTPResponse(bad.ep, bad.code, []byte(bad.body)); err == nil {
+			t.Fatalf("expected ValidateHTTPResponse(%q, %d, %q) to fail", bad.ep, bad.code, bad.body)
+		}
+	}
+}

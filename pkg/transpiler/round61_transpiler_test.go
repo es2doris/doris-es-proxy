@@ -497,3 +497,188 @@ func TestRound61_F17_F19_RangeOutOfBoundsDateUUUUIntervalsAndMLT(t *testing.T) {
 		t.Fatalf("unlike must subtract 'brown' while keeping 'quick':\n%s", mltPlan.HitsSQL)
 	}
 }
+
+func TestRound61_CoverageJSONNumQuantilesPartitionsVectorsIntervalsAndMLT(t *testing.T) {
+	// 1. IsSafeJSONNumberLiteral
+	for _, valid := range []string{"0", "-42", "3.14159", "-0.5e+10", "1E-5", "1234567890"} {
+		if !IsSafeJSONNumberLiteral(valid) {
+			t.Fatalf("expected IsSafeJSONNumberLiteral(%q) == true", valid)
+		}
+	}
+	for _, invalid := range []string{"", "-", ".5", "5.", "1e", "1e+", "12a", strings.Repeat("1", 130), "1 OR 1=1"} {
+		if IsSafeJSONNumberLiteral(invalid) {
+			t.Fatalf("expected IsSafeJSONNumberLiteral(%q) == false", invalid)
+		}
+	}
+
+	// 2. ComputeESBoxplot & ComputeESMedianAbsoluteDeviation (ES7 wrappers + empty cases) + ParseCollectedFloatValues
+	if bpEmpty := ComputeESBoxplot(nil, 100); bpEmpty.Min != nil {
+		t.Fatalf("expected nil Min on empty ComputeESBoxplot")
+	}
+	if bp := ComputeESBoxplot([]float64{-100, 10, 12, 14, 16, 200}, 100); bp.Lower == nil || *bp.Lower != 10 || bp.Upper == nil || *bp.Upper != 16 {
+		t.Fatalf("unexpected ComputeESBoxplot: %+v", bp)
+	}
+	if ComputeESMedianAbsoluteDeviation(nil, 100) != nil {
+		t.Fatalf("expected nil MAD on empty slice")
+	}
+	if mad := ComputeESMedianAbsoluteDeviation([]float64{2, 4, 6, 8}, 100); mad == nil || *mad <= 0 {
+		t.Fatalf("unexpected ComputeESMedianAbsoluteDeviation: %v", mad)
+	}
+	if pk, vals, ok := ParseCollectedFloatValues("_vals:1.5, 2.5"); !ok || pk != "" || len(vals) != 2 {
+		t.Fatalf("unexpected top-level ParseCollectedFloatValues: pk=%q vals=%v ok=%v", pk, vals, ok)
+	}
+	if _, _, ok := ParseCollectedFloatValues("unrelated"); ok {
+		t.Fatalf("expected ParseCollectedFloatValues('unrelated') == false")
+	}
+
+	// 3. TermsPartitionBucketMatch (numeric & bounds) + ParseTermsIncludePartition
+	if TermsPartitionBucketMatch("10", true, -1, 4) || TermsPartitionBucketMatch("10", true, 0, 0) {
+		t.Fatalf("expected out-of-range partition to return false")
+	}
+	numMatched := 0
+	for p := 0; p < 4; p++ {
+		if TermsPartitionBucketMatch("9876543210", true, p, 4) {
+			numMatched++
+		}
+	}
+	if numMatched != 1 {
+		t.Fatalf("numeric term matched %d partitions, want 1", numMatched)
+	}
+
+	p0, np0, isP0, err := ParseTermsIncludePartition(nil)
+	if err != nil || isP0 || p0 != 0 || np0 != 0 {
+		t.Fatalf("unexpected nil ParseTermsIncludePartition")
+	}
+	var nilPtr *esast.TermsIncludePartition
+	if _, _, isP, err := ParseTermsIncludePartition(nilPtr); err != nil || isP {
+		t.Fatalf("unexpected nil *TermsIncludePartition")
+	}
+	p1 := 1
+	np4 := 4
+	if p, np, isP, err := ParseTermsIncludePartition(&esast.TermsIncludeExclude{Partition: &p1, NumPartitions: &np4}); err != nil || !isP || p != 1 || np != 4 {
+		t.Fatalf("unexpected *TermsIncludeExclude: p=%d np=%d isP=%v err=%v", p, np, isP, err)
+	}
+	if _, _, _, err := ParseTermsIncludePartition(esast.TermsIncludeExclude{Partition: &p1}); err == nil {
+		t.Fatalf("expected missing num_partitions error")
+	}
+	if p, np, isP, err := ParseTermsIncludePartition(map[string]any{"partition": float64(2), "num_partitions": int64(5)}); err != nil || !isP || p != 2 || np != 5 {
+		t.Fatalf("unexpected map ParseTermsIncludePartition: p=%d np=%d isP=%v err=%v", p, np, isP, err)
+	}
+	for _, badInc := range []any{
+		esast.TermsIncludePartition{Partition: 0, NumPartitions: 0},
+		esast.TermsIncludePartition{Partition: 4, NumPartitions: 4},
+		map[string]any{"partition": 1},
+		map[string]any{"partition": "bad", "num_partitions": 4},
+	} {
+		if _, _, _, err := ParseTermsIncludePartition(badInc); err == nil {
+			t.Fatalf("expected error for bad include partition %+v", badInc)
+		}
+	}
+
+	// 4. EncodeGeotileKey & EncodeGeotileSQL edge cases
+	if _, ok := EncodeGeotileKey(math.NaN(), 0, 5); ok {
+		t.Fatalf("expected NaN lat to fail EncodeGeotileKey")
+	}
+	if _, ok := EncodeGeotileKey(95, 0, 5); ok {
+		t.Fatalf("expected lat>90 to fail EncodeGeotileKey")
+	}
+	if k, ok := EncodeGeotileKey(89.9, 180.0, 35); !ok || !strings.HasPrefix(k, "29/") {
+		t.Fatalf("expected clamped zoom 29 tile, got %q (%v)", k, ok)
+	}
+	if k, ok := EncodeGeotileKey(-89.9, -180.0, -1); !ok || !strings.HasPrefix(k, "7/") {
+		t.Fatalf("expected default zoom 7 tile, got %q (%v)", k, ok)
+	}
+	if sql0 := EncodeGeotileSQL("lat", "lon", 0); !strings.Contains(sql0, "'0/0/0'") {
+		t.Fatalf("unexpected zoom 0 SQL: %s", sql0)
+	}
+	if sqlDef := EncodeGeotileSQL("lat", "lon", -1); !strings.Contains(sqlDef, "'7/'") {
+		t.Fatalf("unexpected default zoom SQL: %s", sqlDef)
+	}
+
+	// 5. Vector cosine & bit similarity + PassesESVectorSimilarity
+	scCos, ok := ComputeESVectorScore([]float64{1, 0}, []float64{1, 0}, "cosine", "float")
+	if !ok || math.Abs(scCos-1.0) > 1e-9 {
+		t.Fatalf("expected cosine score 1.0, got %v", scCos)
+	}
+	if !PassesESVectorSimilarity([]float64{1, 0}, []float64{1, 0}, "cosine", "float", 0.9) ||
+		!PassesESVectorSimilarity([]float64{1, 0}, []float64{3, 0}, "max_inner_product", "float", 2.5) ||
+		!PassesESVectorSimilarity([]float64{1, 0}, []float64{1, 0}, "dot_product", "float", 0.9) {
+		t.Fatalf("unexpected PassesESVectorSimilarity failure")
+	}
+	scBit, ok := ComputeESVectorScore([]float64{3, -1}, []float64{3, -1}, "l2_norm", "bit")
+	if !ok || scBit <= 0 {
+		t.Fatalf("unexpected bit vector score: %v (%v)", scBit, ok)
+	}
+
+	// 6. Intervals rules: prefix, wildcard, fuzzy, all filters (containing, not_containing, contained_by, not_contained_by, overlapping, not_overlapping, after, before, script)
+	evalRuleJSON := func(rawJSON string) bool {
+		var r esast.IntervalsRule
+		if err := json.Unmarshal([]byte(rawJSON), &r); err != nil {
+			t.Fatalf("unmarshal rule %s: %v", rawJSON, err)
+		}
+		_, matched, err := EvaluateIntervalsRule(&r, "alpha beta gamma delta epsilon", "standard", func(_ *esast.ScriptSpec, span IntervalsSpan) (bool, error) {
+			return span.Start == 0 && span.End == 2 && span.Gaps == 1, nil
+		})
+		if err != nil {
+			t.Fatalf("EvaluateIntervalsRule(%s) error: %v", rawJSON, err)
+		}
+		return matched
+	}
+	if !evalRuleJSON(`{"prefix":{"prefix":"alp"}}`) ||
+		!evalRuleJSON(`{"wildcard":{"pattern":"g*ma"}}`) ||
+		!evalRuleJSON(`{"fuzzy":{"term":"betx","fuzziness":1}}`) {
+		t.Fatalf("expected prefix, wildcard, and fuzzy interval rules to match")
+	}
+	for _, fltRule := range []string{
+		`{"all_of":{"intervals":[{"match":{"query":"alpha"}},{"match":{"query":"delta"}}],"filter":{"containing":{"match":{"query":"beta"}}}}}`,
+		`{"all_of":{"intervals":[{"match":{"query":"alpha"}},{"match":{"query":"gamma"}}],"filter":{"not_containing":{"match":{"query":"epsilon"}}}}}`,
+		`{"match":{"query":"beta","filter":{"contained_by":{"all_of":{"intervals":[{"match":{"query":"alpha"}},{"match":{"query":"delta"}}]}}}}}`,
+		`{"match":{"query":"epsilon","filter":{"not_contained_by":{"all_of":{"intervals":[{"match":{"query":"alpha"}},{"match":{"query":"gamma"}}]}}}}}`,
+		`{"all_of":{"intervals":[{"match":{"query":"beta"}},{"match":{"query":"delta"}}],"filter":{"overlapping":{"all_of":{"intervals":[{"match":{"query":"alpha"}},{"match":{"query":"gamma"}}]}}}}}`,
+		`{"match":{"query":"epsilon","filter":{"not_overlapping":{"all_of":{"intervals":[{"match":{"query":"alpha"}},{"match":{"query":"gamma"}}]}}}}}`,
+		`{"match":{"query":"delta","filter":{"after":{"match":{"query":"alpha"}}}}}`,
+		`{"match":{"query":"alpha","filter":{"before":{"match":{"query":"delta"}}}}}`,
+		`{"all_of":{"intervals":[{"match":{"query":"alpha"}},{"match":{"query":"gamma"}}],"filter":{"script":{"source":"interval.start == 0 && interval.end == 2 && interval.gaps == 1"}}}}`,
+	} {
+		if !evalRuleJSON(fltRule) {
+			t.Fatalf("expected interval filter rule to match: %s", fltRule)
+		}
+	}
+
+	// 7. MoreLikeThis wildcard fields, stop_words, minimum_should_match, include:true same-index exclusion
+	idx := buildRound61TestSchema(t)
+	tr := NewTranspiler(idx, TranspilerOptions{ES8Compat: true})
+	var mltFull esast.SearchRequest
+	if err := json.Unmarshal([]byte(`{
+		"query": {
+			"more_like_this": {
+				"fields": ["*title*"],
+				"like": ["alpha beta gamma delta", {"_index": "round61_idx", "_id": "same1"}],
+				"stop_words": ["beta"],
+				"min_term_freq": 1,
+				"minimum_should_match": "2",
+				"include": false
+			}
+		}
+	}`), &mltFull); err != nil {
+		t.Fatal(err)
+	}
+	mltPlan, err := tr.BuildSearchPlan(&mltFull)
+	if err != nil || strings.Contains(mltPlan.HitsSQL, "beta") || !strings.Contains(mltPlan.HitsSQL, "same1") {
+		t.Fatalf("unexpected mltFull plan (err=%v): %s", err, mltPlan.HitsSQL)
+	}
+
+	// 8. LowerRetrieverToSearchRequest, FormatSemverSortKey, CompareSemverStrings, isMappedField
+	var retReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"retriever":{"standard":{"query":{"term":{"category":"news"}}}}}`), &retReq)
+	LowerRetrieverToSearchRequest(&retReq)
+	if retReq.Query == nil {
+		t.Fatalf("expected LowerRetrieverToSearchRequest to populate Query")
+	}
+	if FormatSemverSortKey("1.0.0-alpha.1+build123") >= FormatSemverSortKey("1.0.0") || CompareSemverStrings("1.0.0-alpha", "1.0.0") >= 0 {
+		t.Fatalf("unexpected SemVer comparison")
+	}
+	if !tr.isMappedField("title") || !tr.isMappedField("title.keyword") || tr.isMappedField("totally_unmapped_xyz") {
+		t.Fatalf("unexpected isMappedField results")
+	}
+}

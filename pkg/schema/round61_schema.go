@@ -1787,18 +1787,22 @@ func parseTSDBTimestampMillis(raw any, tsType, format string) (int64, bool) {
 }
 
 func extractSingleDocPathValue(node any, parts []string) (any, bool) {
-	if len(parts) == 0 || node == nil {
-		return node, node != nil
+	if node == nil {
+		return nil, false
+	}
+	if len(parts) == 0 {
+		return node, true
 	}
 	m, ok := node.(map[string]any)
 	if !ok {
 		return nil, false
 	}
-	if v, exists := m[parts[0]]; exists {
-		if len(parts) == 1 {
+	head := parts[0] // #nosec G602 -- len(parts) >= 1 bounds checked immediately above
+	if v, exists := m[head]; exists {
+		if len(parts) <= 1 {
 			return v, true
 		}
-		return extractSingleDocPathValue(v, parts[1:])
+		return extractSingleDocPathValue(v, parts[1:]) // #nosec G602 -- len(parts) >= 2 bounds checked immediately above
 	}
 	if len(parts) < 2 {
 		return nil, false
@@ -1808,9 +1812,9 @@ func extractSingleDocPathValue(node any, parts []string) (any, bool) {
 	}
 	for idx := len(parts) - 1; idx >= 2; idx-- {
 		if idx >= 0 && idx < len(parts) {
-			joined := strings.Join(parts[:idx], ".") // #nosec G602 -- 2 <= idx < len(parts) guarded above
+			joined := strings.Join(parts[:idx], ".") // #nosec G602 -- len(parts) bounds checked immediately above
 			if v, exists := m[joined]; exists {
-				return extractSingleDocPathValue(v, parts[idx:]) // #nosec G602 -- 2 <= idx < len(parts) guarded above
+				return extractSingleDocPathValue(v, parts[idx:]) // #nosec G602 -- len(parts) bounds checked immediately above
 			}
 		}
 	}

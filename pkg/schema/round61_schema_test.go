@@ -19,6 +19,7 @@ package schema
 
 import (
 	"encoding/json"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -336,5 +337,173 @@ func TestRound61_F12_F13_F14_DocValuesSyntheticSourceAndTSDB(t *testing.T) {
 	}
 	if _, err := ShredDocument(tsIdx, id1, 1, false, []byte(`{"@timestamp":"2023-01-01T12:00:00Z","city":"A","name":"B","location":[{"lat":13,"lon":34},{"lat":14,"lon":35}]}`)); err == nil || !strings.Contains(err.Error(), "does not accept more than single value") {
 		t.Fatalf("expected multi-valued position geo_point to fail, got %v", err)
+	}
+}
+
+func TestRound61_CoverageSyntheticRangesTSDBScalarsAndPathHelpers(t *testing.T) {
+	// 1. setNestedRawProperty & synthetic source validation edge cases
+	props := make(map[string]esast.FieldProperty)
+	setNestedRawProperty(nil, []string{"a"}, esast.FieldProperty{Type: "keyword"})
+	setNestedRawProperty(props, nil, esast.FieldProperty{Type: "keyword"})
+	setNestedRawProperty(props, []string{"lvl1", "lvl2", "leaf"}, esast.FieldProperty{Type: "keyword"})
+	if props["lvl1"].Properties["lvl2"].Properties["leaf"].Type != "keyword" {
+		t.Fatalf("unexpected setNestedRawProperty result: %+v", props)
+	}
+
+	fTrue := true
+	fFalse := false
+	for _, tc := range []struct {
+		prop    esast.FieldProperty
+		wantErr bool
+	}{
+		{esast.FieldProperty{Type: "text", SyntheticSourceKeep: "bogus"}, true},
+		{esast.FieldProperty{Type: "keyword", SyntheticSourceKeep: "all"}, true},
+		{esast.FieldProperty{Type: "token_count", Store: &fTrue}, false},
+		{esast.FieldProperty{Type: "token_count", Fields: map[string]esast.FieldProperty{"kw": {Type: "keyword"}}}, false},
+		{esast.FieldProperty{Type: "flattened", DocValues: &fFalse}, true},
+		{esast.FieldProperty{Type: "flattened", DocValues: &fFalse, Store: &fTrue}, false},
+		{esast.FieldProperty{Type: "text", SyntheticSourceKeep: "none", Fields: map[string]esast.FieldProperty{"raw": {Type: "text", SyntheticSourceKeep: "arrays"}}}, false},
+	} {
+		err := validateSingleSyntheticSourceProp("fld", tc.prop)
+		if (err != nil) != tc.wantErr {
+			t.Fatalf("validateSingleSyntheticSourceProp(%+v): err=%v wantErr=%v", tc.prop, err, tc.wantErr)
+		}
+	}
+
+	// 2. reconstructSyntheticPositionGeoPoint & expandDottedKeysForSyntheticObject / mergeSyntheticExpandedMaps
+	if pos, ok := reconstructSyntheticPositionGeoPoint([]any{4.9, 52.3}); !ok || pos == nil {
+		t.Fatalf("expected numeric [lon,lat] position geo_point reconstruction")
+	}
+	if pos, ok := reconstructSyntheticPositionGeoPoint([]any{"52.3,4.9"}); !ok || pos == nil {
+		t.Fatalf("expected single-element array position geo_point reconstruction")
+	}
+	if _, ok := reconstructSyntheticPositionGeoPoint("not-a-point"); ok {
+		t.Fatalf("expected invalid geo_point to fail reconstruction")
+	}
+	merged := expandDottedKeysForSyntheticObject(nil, map[string]any{
+		"a":     map[string]any{"x": 1, "sub": map[string]any{"p": 1}},
+		"a.y":   2,
+		"a.sub": map[string]any{"q": 2},
+	}, "")
+	aMap, _ := merged["a"].(map[string]any)
+	subMap, _ := aMap["sub"].(map[string]any)
+	if aMap["x"] != 1 || aMap["y"] != 2 || subMap["p"] != 1 || subMap["q"] != 2 {
+		t.Fatalf("unexpected merged synthetic object: %+v", merged)
+	}
+
+	// 3. Synthetic ranges: integer_range, long_range, float_range, double_range, date_range, ip_range (IPv4 & IPv6)
+	if formatWholeSyntheticFloatNumber(5.0, true) != json.Number("5.0") || formatWholeSyntheticFloatNumber(5.25, false) != json.Number("5.25") {
+		t.Fatalf("unexpected formatWholeSyntheticFloatNumber")
+	}
+	bDate := FieldBinding{ESType: "date_range", Format: "strict_date_optional_time||epoch_millis"}
+	for _, tc := range []struct {
+		esType string
+		b      FieldBinding
+		raw    any
+	}{
+		{"long_range", FieldBinding{ESType: "long_range"}, []any{map[string]any{"gt": "10", "lt": json.Number("20")}, map[string]any{"gte": 1.0, "lte": 5}}},
+		{"float_range", FieldBinding{ESType: "float_range"}, map[string]any{"gt": 1.5, "lt": 3.5}},
+		{"double_range", FieldBinding{ESType: "double_range"}, map[string]any{"gte": 2.0, "lte": 4.0}},
+		{"date_range", bDate, []any{map[string]any{"gt": "2023-01-01T00:00:00Z", "lt": "2023-01-02T00:00:00Z"}, map[string]any{"gte": int64(1000), "lte": float64(2000)}}},
+		{"ip_range", FieldBinding{ESType: "ip_range"}, []any{"2001:db8::/120", map[string]any{"gt": "10.0.0.1", "lt": "10.0.0.10"}, map[string]any{"gte": "10.0.0.20"}, map[string]any{"lte": "10.0.0.5"}}},
+	} {
+		out, ok := reconstructSyntheticRangeValue(nil, tc.raw, "rng", tc.b, tc.esType, nil)
+		if !ok || out == nil {
+			t.Fatalf("reconstructSyntheticRangeValue(%s) failed for %+v", tc.esType, tc.raw)
+		}
+	}
+	// Inverted / conflicting bounds return ok=false
+	if _, ok := canonicalizeSingleSyntheticRange(map[string]any{"gte": 10, "gt": 5}, FieldBinding{}, "integer_range"); ok {
+		t.Fatalf("expected conflicting gte+gt to fail")
+	}
+	if _, ok := canonicalizeSingleSyntheticRange(map[string]any{"gte": 20, "lte": 10}, FieldBinding{}, "integer_range"); ok {
+		t.Fatalf("expected inverted integer_range to fail")
+	}
+	if compareIP128(netip.MustParseAddr("10.0.0.1"), netip.MustParseAddr("10.0.0.2")) >= 0 {
+		t.Fatalf("unexpected compareIP128 order")
+	}
+
+	// 4. extractSingleDocPathValue, parseTSDBTimestampMillis, canonicalizeTSDBDimensionScalar, extractTSDBDimensionsFromDoc, extractTSDBRoutingPairs, ValidateTSDBDocID
+	nestedDoc := map[string]any{
+		"a":     map[string]any{"b": map[string]any{"c": "deep"}},
+		"x.y.z": "literal_three",
+		"p.q":   map[string]any{"r": "joined_prefix"},
+	}
+	if v, ok := extractSingleDocPathValue(nil, []string{"a"}); ok || v != nil {
+		t.Fatalf("expected nil node to return false")
+	}
+	if v, ok := extractSingleDocPathValue("root_scalar", nil); !ok || v != "root_scalar" {
+		t.Fatalf("expected empty parts to return node")
+	}
+	if v, ok := extractSingleDocPathValue(nestedDoc, []string{"a", "b", "c"}); !ok || v != "deep" {
+		t.Fatalf("expected deep value, got %v (%v)", v, ok)
+	}
+	if v, ok := extractSingleDocPathValue(nestedDoc, []string{"x", "y", "z"}); !ok || v != "literal_three" {
+		t.Fatalf("expected literal_three, got %v (%v)", v, ok)
+	}
+	if v, ok := extractSingleDocPathValue(nestedDoc, []string{"p", "q", "r"}); !ok || v != "joined_prefix" {
+		t.Fatalf("expected joined_prefix, got %v (%v)", v, ok)
+	}
+
+	for _, tsRaw := range []any{int(1700000000000), int64(1700000000000), float64(1700000000000), json.Number("1700000000000"), "2023-11-14T22:13:20.123456789Z"} {
+		if _, ok := parseTSDBTimestampMillis(tsRaw, "date_nanos", ""); !ok {
+			t.Fatalf("parseTSDBTimestampMillis failed on %T %v", tsRaw, tsRaw)
+		}
+	}
+
+	for _, tc := range []struct {
+		b    FieldBinding
+		raw  any
+		want string
+	}{
+		{FieldBinding{ESType: "long"}, []any{json.Number("42")}, "42"},
+		{FieldBinding{ESType: "integer"}, "100", "100"},
+		{FieldBinding{ESType: "integer"}, float64(7), "7"},
+		{FieldBinding{ESType: "unsigned_long"}, "18446744073709551615", "18446744073709551615"},
+		{FieldBinding{ESType: "ip"}, "::ffff:10.0.0.1", "10.0.0.1"},
+		{FieldBinding{ESType: "boolean"}, true, "true"},
+		{FieldBinding{ESType: "boolean"}, "FALSE", "false"},
+		{FieldBinding{ESType: "date"}, "1970-01-01T00:00:01Z", "1000"},
+		{FieldBinding{ESType: "keyword", LowercaseNormalizer: true}, "HeLLo", "hello"},
+	} {
+		got, err := canonicalizeTSDBDimensionScalar("dim", tc.b, tc.raw)
+		if err != nil || got != tc.want {
+			t.Fatalf("canonicalizeTSDBDimensionScalar(%s, %v) = %q, %v (want %q)", tc.b.ESType, tc.raw, got, err, tc.want)
+		}
+	}
+	if _, err := canonicalizeTSDBDimensionScalar("dim", FieldBinding{ESType: "keyword"}, []any{"a", "b"}); err == nil {
+		t.Fatalf("expected multi-value array dimension error")
+	}
+	if _, err := canonicalizeTSDBDimensionScalar("dim", FieldBinding{ESType: "keyword"}, map[string]any{"k": "v"}); err == nil {
+		t.Fatalf("expected object dimension error")
+	}
+
+	var advTSSpec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"properties": {
+			"@timestamp": {"type": "date"},
+			"env": {"type": "constant_keyword", "value": "prod", "time_series_dimension": true},
+			"labels": {"type": "flattened", "time_series_dimensions": ["region", "zone"]},
+			"host": {"type": "keyword", "time_series_dimension": true}
+		}
+	}`), &advTSSpec); err != nil {
+		t.Fatal(err)
+	}
+	advTSIdx := CompileIndexSchema("es_db", "ts_adv", &advTSSpec)
+	advTSIdx.IndexMode = "time_series"
+	advTSIdx.RoutingPath = []string{"host", "env"}
+	dims, err := extractTSDBDimensionsFromDoc(advTSIdx, map[string]any{
+		"labels": map[string]any{"region": "us-east", "zone": "1a"},
+		"host":   "web-01",
+	})
+	if err != nil || len(dims) != 4 {
+		t.Fatalf("expected 4 extracted TSDB dims (including constant_keyword + flattened), got %+v (err=%v)", dims, err)
+	}
+	var rPairs []string
+	if err := extractTSDBRoutingPairs(advTSIdx, map[string]any{"host": []any{"a", "b"}}, []string{"host"}, &rPairs); err == nil {
+		t.Fatalf("expected array routing value error")
+	}
+	if err := ValidateTSDBDocID("short", "ts_adv"); err == nil {
+		t.Fatalf("expected short TSDB _id to fail validation")
 	}
 }
