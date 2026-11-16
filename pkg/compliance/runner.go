@@ -13,6 +13,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"regexp"
 	"sort"
@@ -59,6 +60,7 @@ var supportedRunnerFeatures = map[string]bool{
 	"painless":               true,
 	"mustache":               true,
 	"clean_text":             true,
+	"capabilities":           true,
 }
 
 var defaultSupportedClusterFeatures = map[string]bool{
@@ -125,6 +127,13 @@ func RunEmbeddedSuite(t *testing.T, baseURL string) {
 // RunSuiteFS discovers and runs all *.yml files in fsys (both root and specs/*.yml) against baseURL.
 func RunSuiteFS(t *testing.T, fsys fs.FS, baseURL string) SuiteReport {
 	t.Helper()
+	return RunSuiteFSWithVersion(t, fsys, baseURL, "")
+}
+
+// RunSuiteFSWithVersion discovers and runs all *.yml files in fsys against baseURL using explicitTargetVersion
+// (falling back to CONFORMANCE_TARGET_ES_VERSION or proxyTargetVersion when explicitTargetVersion is empty).
+func RunSuiteFSWithVersion(t *testing.T, fsys fs.FS, baseURL, explicitTargetVersion string) SuiteReport {
+	t.Helper()
 	var files []string
 	err := fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -141,6 +150,7 @@ func RunSuiteFS(t *testing.T, fsys fs.FS, baseURL string) SuiteReport {
 	sort.Strings(files)
 
 	client := &http.Client{Timeout: 30 * time.Second}
+	resolvedTarget := resolveRunnerTargetVersion(explicitTargetVersion)
 	var report SuiteReport
 
 	for _, file := range files {
@@ -153,7 +163,7 @@ func RunSuiteFS(t *testing.T, fsys fs.FS, baseURL string) SuiteReport {
 			t.Fatalf("failed parsing spec file %s: %v", file, parseErr)
 		}
 
-		fileRep := runSpecDocument(t, client, baseURL, path.Base(file), specDoc, &report)
+		fileRep := runSpecDocumentWithVersion(t, client, baseURL, path.Base(file), specDoc, &report, resolvedTarget)
 		report.FilesRun++
 		report.FileReports = append(report.FileReports, fileRep)
 	}
@@ -164,21 +174,48 @@ func RunSuiteFS(t *testing.T, fsys fs.FS, baseURL string) SuiteReport {
 // RunSpecFile parses and executes a single rest-api-spec YAML file against baseURL.
 func RunSpecFile(t *testing.T, name, content, baseURL string) FileReport {
 	t.Helper()
+	return RunSpecFileWithVersion(t, name, content, baseURL, "")
+}
+
+// RunSpecFileWithVersion parses and executes a single rest-api-spec YAML file against baseURL
+// using explicitTargetVersion (falling back to CONFORMANCE_TARGET_ES_VERSION or proxyTargetVersion when empty).
+func RunSpecFileWithVersion(t *testing.T, name, content, baseURL, explicitTargetVersion string) FileReport {
+	t.Helper()
 	specDoc, err := ParseSpecFile(content)
 	if err != nil {
 		t.Fatalf("failed parsing spec file %s: %v", name, err)
 	}
 	client := &http.Client{Timeout: 30 * time.Second}
+	resolvedTarget := resolveRunnerTargetVersion(explicitTargetVersion)
 	var dummy SuiteReport
-	return runSpecDocument(t, client, baseURL, name, specDoc, &dummy)
+	return runSpecDocumentWithVersion(t, client, baseURL, name, specDoc, &dummy, resolvedTarget)
+}
+
+func resolveRunnerTargetVersion(explicitTargetVersion string) string {
+	if v := strings.TrimSpace(explicitTargetVersion); v != "" {
+		return v
+	}
+	if envVer := strings.TrimSpace(os.Getenv("CONFORMANCE_TARGET_ES_VERSION")); envVer != "" {
+		return envVer
+	}
+	return proxyTargetVersion
 }
 
 func runSpecDocument(t *testing.T, client *http.Client, baseURL, fileName string, specDoc *SpecDocument, report *SuiteReport) FileReport {
 	t.Helper()
+	return runSpecDocumentWithVersion(t, client, baseURL, fileName, specDoc, report, resolveRunnerTargetVersion(""))
+}
+
+func runSpecDocumentWithVersion(t *testing.T, client *http.Client, baseURL, fileName string, specDoc *SpecDocument, report *SuiteReport, targetVersion string) FileReport {
+	t.Helper()
 	fileRep := FileReport{File: fileName}
 	trimmedBase := strings.TrimRight(baseURL, "/")
+	if strings.TrimSpace(targetVersion) == "" {
+		targetVersion = resolveRunnerTargetVersion("")
+	}
 	t.Run(fileName, func(t *testing.T) {
 		probeCtx := newRunnerContext(client, trimmedBase)
+		probeCtx.targetVersion = targetVersion
 		if reason, skip := probeCtx.evalSkipSpec(specDoc.Skip, false); skip {
 			t.Skipf("file skipped: %s", reason)
 		}
@@ -206,6 +243,7 @@ func runSpecDocument(t *testing.T, client *http.Client, baseURL, fileName string
 			report.SectionsRun++
 			t.Run(sec.Name, func(t *testing.T) {
 				ctx := newRunnerContext(client, trimmedBase)
+				ctx.targetVersion = targetVersion
 				defer ctx.cleanupAll()
 
 				for i, step := range specDoc.Setup {
@@ -342,10 +380,14 @@ type runnerContext struct {
 }
 
 func newRunnerContext(client *http.Client, baseURL string) *runnerContext {
+	targetVer := proxyTargetVersion
+	if envVer := strings.TrimSpace(os.Getenv("CONFORMANCE_TARGET_ES_VERSION")); envVer != "" {
+		targetVer = envVer
+	}
 	return &runnerContext{
 		client:                       client,
 		baseURL:                      baseURL,
-		targetVersion:                proxyTargetVersion,
+		targetVersion:                targetVer,
 		supportedClusterFeatures:     DefaultSupportedClusterFeatures(),
 		supportedTestRunnerFeatures:  DefaultSupportedTestRunnerFeatures(),
 		stash:                        make(map[string]any),
@@ -5001,8 +5043,8 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "health_report":
 		method = http.MethodGet
-		if indicator := popString("indicator"); indicator != "" {
-			reqPath = "/_health_report/" + indicator
+		if indicator := popString("indicator", "feature"); indicator != "" {
+			reqPath = "/_health_report/" + escapeCommaIDSegs(indicator)
 		} else {
 			reqPath = "/_health_report"
 		}
@@ -5526,10 +5568,10 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "cluster.info":
 		method = http.MethodGet
-		if target := popPath("target"); target != "" {
-			reqPath = "/_cluster/info/" + target
+		if target := popPath("target", "targets"); target != "" {
+			reqPath = "/_info/" + target
 		} else {
-			reqPath = "/_cluster/info"
+			reqPath = "/_info"
 		}
 
 	case "nodes.get_repositories_metering_info":
@@ -6601,6 +6643,15 @@ func (c *runnerContext) lookupStashVar(key string) (any, bool) {
 	if sv, ok := c.stash[key]; ok {
 		return sv, true
 	}
+	if key == "remote_cluster" && c != nil && strings.TrimSpace(c.baseURL) != "" {
+		if u, err := url.Parse(strings.TrimRight(strings.TrimSpace(c.baseURL), "/")); err == nil && u.Hostname() != "" {
+			if u.Port() == "" {
+				u.Host = u.Hostname() + ":9200"
+			}
+			return u.String(), true
+		}
+		return "http://conformance.local:9200", true
+	}
 	if strings.Contains(key, ".") {
 		segs := splitEscapedPath(key)
 		if len(segs) >= 2 {
@@ -6706,6 +6757,52 @@ func (c *runnerContext) evalClusterFeature(feat string) bool {
 	return c.hasClusterFeature(feat)
 }
 
+func (c *runnerContext) probeServerCapability(capReq CapabilityRequirement) bool {
+	if c == nil || c.client == nil || c.baseURL == "" {
+		return false
+	}
+	q := url.Values{}
+	if capReq.Method != "" {
+		q.Set("method", capReq.Method)
+	}
+	if capReq.Path != "" {
+		q.Set("path", capReq.Path)
+	}
+	if len(capReq.Parameters) > 0 {
+		q.Set("parameters", strings.Join(capReq.Parameters, ","))
+	}
+	if len(capReq.Capabilities) > 0 {
+		q.Set("capabilities", strings.Join(capReq.Capabilities, ","))
+	}
+	fullURL := strings.TrimRight(c.baseURL, "/") + "/_capabilities"
+	if enc := q.Encode(); enc != "" {
+		fullURL += "?" + enc
+	}
+	req, err := http.NewRequest(http.MethodGet, fullURL, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false
+	}
+	var payload struct {
+		Supported bool `json:"supported"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return false
+	}
+	return payload.Supported
+}
+
 func (c *runnerContext) evalSkipSpec(skip *SkipSpec, isRequires bool) (string, bool) {
 	if skip == nil {
 		return "", false
@@ -6739,6 +6836,11 @@ func (c *runnerContext) evalSkipSpec(skip *SkipSpec, isRequires bool) (string, b
 		if skip.Version != "" && !versionInRange(targetVer, skip.Version) {
 			return reasonOr(fmt.Sprintf("version %s not in required range %s", targetVer, skip.Version)), true
 		}
+		for _, capReq := range skip.Capabilities {
+			if !c.probeServerCapability(capReq) {
+				return reasonOr(fmt.Sprintf("unsupported server capability %s %s", capReq.Method, capReq.Path)), true
+			}
+		}
 		return "", false
 	}
 
@@ -6752,6 +6854,18 @@ func (c *runnerContext) evalSkipSpec(skip *SkipSpec, isRequires bool) (string, b
 		}
 		if allMatch {
 			return reasonOr(fmt.Sprintf("cluster_features matched skip %v", skip.ClusterFeatures)), true
+		}
+	}
+	if len(skip.Capabilities) > 0 {
+		allSupported := true
+		for _, capReq := range skip.Capabilities {
+			if !c.probeServerCapability(capReq) {
+				allSupported = false
+				break
+			}
+		}
+		if allSupported {
+			return reasonOr("server capabilities matched skip"), true
 		}
 	}
 	if skip.Version != "" && versionInRange(targetVer, skip.Version) {
@@ -6800,6 +6914,8 @@ func (c *runnerContext) parseRuntimeSkipSpec(op string, rawVal any) (*SkipSpec, 
 					}
 				}
 			}
+		case "capabilities":
+			out.Capabilities = append(out.Capabilities, parseCapabilityRequirements(c.expandStash(p.Value))...)
 		case "known_issues":
 			if p.Value != nil {
 				out.KnownIssues = true

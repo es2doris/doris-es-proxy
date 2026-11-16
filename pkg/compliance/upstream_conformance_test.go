@@ -33,9 +33,9 @@ import (
 )
 
 const (
-	expectedUpstreamV7YAMLCount = 522
-	expectedUpstreamV8YAMLCount = 545
-	defaultES8AcceptHeader      = "application/vnd.elasticsearch+json; compatible-with=8"
+	expectedUpstreamV7YAMLCount          = 522
+	expectedUpstreamV8YAMLCount          = 735
+	defaultRemoteReindexWhitelistForTest = "127.0.0.1:*,[::1]:*,localhost:*,conformance.local:*"
 )
 
 func conformanceCacheBaseDir() string {
@@ -110,16 +110,6 @@ func collectYAMLFilesInDirs(dirs []string) ([]string, error) {
 	return files, nil
 }
 
-func withDefaultES8AcceptHeader(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Accept") == "" {
-			r = r.Clone(r.Context())
-			r.Header.Set("Accept", defaultES8AcceptHeader)
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
 func newConformanceProxyHandler(targetESVersion string) http.Handler {
 	srv := proxy.NewServer("es_compat", proxy.NewMemoryBackend(false), transpiler.TranspilerOptions{})
 	if targetESVersion != "" {
@@ -128,8 +118,12 @@ func newConformanceProxyHandler(targetESVersion string) http.Handler {
 		}
 	}
 	h := srv.Handler()
-	if strings.HasPrefix(targetESVersion, "8.") {
-		return withDefaultES8AcceptHeader(h)
+	transport := inProcessHandlerTransport{handler: h}
+	if rtSetter, ok := any(srv).(interface{ SetRemoteReindexTransport(http.RoundTripper) }); ok {
+		rtSetter.SetRemoteReindexTransport(transport)
+	}
+	if wlSetter, ok := any(srv).(interface{ SetRemoteReindexWhitelistForTest(string) }); ok {
+		wlSetter.SetRemoteReindexWhitelistForTest(defaultRemoteReindexWhitelistForTest)
 	}
 	return h
 }

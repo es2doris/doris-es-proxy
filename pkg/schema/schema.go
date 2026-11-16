@@ -96,8 +96,10 @@ type FieldBinding struct {
 	KeywordCompanion    string // Optional untokenized `.keyword` column for `text` fields
 	KeywordNormalizer   bool   // Whether `KeywordCompanion` has a lowercase normalizer
 	VectorDims          int
+	AutoDims            bool
 	VectorMetric        string
 	VectorElementType   string
+	VectorIndexOptions  map[string]any
 
 	// For `StorageNestedSubfield` (`nested` arrays of objects):
 	NestedPath               string   // Root nested path, e.g. "columns"
@@ -124,6 +126,11 @@ type FieldBinding struct {
 	NotIndexed               bool
 	EnabledFalse             bool
 	DocValuesFalse           bool
+	StoreArraySource         *bool
+	SyntheticSourceKeep      string
+	TimeSeriesDimension      *bool
+	TimeSeriesDimensions     []string
+	TimeSeriesMetric         string
 }
 
 // EffectivePositiveScoreImpact returns true unless `positive_score_impact` was explicitly set to false.
@@ -189,32 +196,40 @@ type NestedRootSpec struct {
 
 // IndexSchema holds the compiled schema registry for an Elasticsearch index.
 type IndexSchema struct {
-	IndexName               string
-	DorisDB                 string
-	DorisTable              string
-	Buckets                 int
-	Fields                  map[string]FieldBinding
-	OrderedFields           []FieldBinding
-	NestedRoots             map[string]string // Maps ES nested path (e.g. "columns") -> Doris column ("n__columns")
-	nestedRootPaths         map[string][]string
-	NestedRootSpecs         []NestedRootSpec
-	RawMapping              *esast.MappingSpec
-	MaxTotalFields          int
-	MaxNestedFields         int
-	HasExplicitNestedLimit  bool
-	MaxNestedObjects        int
-	MaxDepth                int
-	MaxFieldNameLength      int
-	MaxTermsCount           int
-	MaxResultWindow         int
-	MaxDocvalueFieldsSearch int
-	MaxScriptFields         int
-	MaxRegexLength          int
-	DefaultCoerce           *bool
-	DefaultIgnoreMalformed  *bool
-	SourceMode              string
-	SyntheticSource         bool
-	SourceConfig            *SourceConfig
+	IndexName                string
+	DorisDB                  string
+	DorisTable               string
+	Buckets                  int
+	Fields                   map[string]FieldBinding
+	OrderedFields            []FieldBinding
+	NestedRoots              map[string]string // Maps ES nested path (e.g. "columns") -> Doris column ("n__columns")
+	nestedRootPaths          map[string][]string
+	NestedRootSpecs          []NestedRootSpec
+	RawMapping               *esast.MappingSpec
+	MaxTotalFields           int
+	MaxNestedFields          int
+	HasExplicitNestedLimit   bool
+	MaxNestedObjects         int
+	MaxDepth                 int
+	MaxFieldNameLength       int
+	MaxTermsCount            int
+	MaxResultWindow          int
+	MaxDocvalueFieldsSearch  int
+	MaxScriptFields          int
+	MaxRegexLength           int
+	DefaultCoerce            *bool
+	DefaultIgnoreMalformed   *bool
+	SourceMode               string
+	SyntheticSource          bool
+	SourceConfig             *SourceConfig
+	LegacyTypeName           string
+	FieldAddedAtSeqNo        map[string]int64
+	ES8Mode                  bool
+	IndexMode                string
+	RoutingPath              []string
+	TimeSeriesStartTime      string
+	TimeSeriesEndTime        string
+	IgnoreDynamicBeyondLimit bool
 }
 
 // CopyIndexMappingSettingsFrom copies index-level mapping/search limits and defaults from src into s.
@@ -270,6 +285,37 @@ func (s *IndexSchema) CopyIndexMappingSettingsFrom(src *IndexSchema) {
 	if src.SourceConfig != nil && s.SourceConfig == nil {
 		cp := *src.SourceConfig
 		s.SourceConfig = &cp
+	}
+	if src.LegacyTypeName != "" && s.LegacyTypeName == "" {
+		s.LegacyTypeName = src.LegacyTypeName
+	}
+	if len(src.FieldAddedAtSeqNo) > 0 {
+		if s.FieldAddedAtSeqNo == nil {
+			s.FieldAddedAtSeqNo = make(map[string]int64, len(src.FieldAddedAtSeqNo))
+		}
+		for k, v := range src.FieldAddedAtSeqNo {
+			if _, exists := s.FieldAddedAtSeqNo[k]; !exists {
+				s.FieldAddedAtSeqNo[k] = v
+			}
+		}
+	}
+	if src.ES8Mode {
+		s.ES8Mode = true
+	}
+	if src.IndexMode != "" && s.IndexMode == "" {
+		s.IndexMode = src.IndexMode
+	}
+	if len(src.RoutingPath) > 0 && len(s.RoutingPath) == 0 {
+		s.RoutingPath = append([]string(nil), src.RoutingPath...)
+	}
+	if src.TimeSeriesStartTime != "" && s.TimeSeriesStartTime == "" {
+		s.TimeSeriesStartTime = src.TimeSeriesStartTime
+	}
+	if src.TimeSeriesEndTime != "" && s.TimeSeriesEndTime == "" {
+		s.TimeSeriesEndTime = src.TimeSeriesEndTime
+	}
+	if src.IgnoreDynamicBeyondLimit {
+		s.IgnoreDynamicBeyondLimit = true
 	}
 }
 
@@ -1062,7 +1108,7 @@ func validateSingleFieldProperty(fullPath, fType string, prop esast.FieldPropert
 			return fmt.Errorf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters", fullPath)
 		}
 	}
-	if prop.PositiveScoreImpact != nil && fType != "rank_feature" {
+	if prop.PositiveScoreImpact != nil && fType != "rank_feature" && fType != "rank_features" {
 		return fmt.Errorf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters: [positive_score_impact : %v]", fullPath, *prop.PositiveScoreImpact)
 	}
 	if prop.MaxShingleSize != nil {
@@ -1109,6 +1155,9 @@ func validateSingleFieldProperty(fullPath, fType string, prop esast.FieldPropert
 		if prop.Dims < 0 || prop.Dimension < 0 {
 			return fmt.Errorf("mapper_parsing_exception: [%s] field [%s] [dims] cannot be negative", fType, fullPath)
 		}
+		if prop.ExplicitDims && prop.EffectiveDims() <= 0 {
+			return fmt.Errorf("mapper_parsing_exception: [%s] field [%s] requires [dims] in [1, 4096], got [%d]", fType, fullPath, prop.EffectiveDims())
+		}
 		elemType := strings.ToLower(strings.TrimSpace(prop.ElementType))
 		switch elemType {
 		case "", "float", "byte", "bit":
@@ -1124,7 +1173,10 @@ func validateSingleFieldProperty(fullPath, fType string, prop esast.FieldPropert
 		sim := strings.ToLower(strings.TrimSpace(prop.Similarity))
 		if isNotIndexed {
 			if sim != "" {
-				return fmt.Errorf("mapper_parsing_exception: Cannot set [similarity] when [index] is false on [%s] field [%s]", fType, fullPath)
+				return fmt.Errorf("mapper_parsing_exception: Field [similarity] can only be specified for a field of type [%s] when it is indexed", fType)
+			}
+			if prop.IndexOptions != nil {
+				return fmt.Errorf("mapper_parsing_exception: Field [index_options] can only be specified for a field of type [%s] when it is indexed", fType)
 			}
 			if dims != 0 && (dims < 1 || dims > 4096) {
 				return fmt.Errorf("mapper_parsing_exception: [%s] field [%s] requires [dims] in [1, 4096], got [%d]", fType, fullPath, dims)
@@ -1133,10 +1185,10 @@ func validateSingleFieldProperty(fullPath, fType string, prop esast.FieldPropert
 				return fmt.Errorf("mapper_parsing_exception: [bit] vectors require [dims] to be a multiple of 8 on field [%s], got [%d]", fullPath, dims)
 			}
 		} else {
-			if dims < 1 || dims > 4096 {
+			if dims != 0 && (dims < 1 || dims > 4096) {
 				return fmt.Errorf("mapper_parsing_exception: [%s] field [%s] requires [dims] in [1, 4096], got [%d]", fType, fullPath, dims)
 			}
-			if effElemType == "bit" && dims%8 != 0 {
+			if effElemType == "bit" && dims != 0 && dims%8 != 0 {
 				return fmt.Errorf("mapper_parsing_exception: [bit] vectors require [dims] to be a multiple of 8 on field [%s], got [%d]", fullPath, dims)
 			}
 			switch sim {
@@ -1144,12 +1196,28 @@ func validateSingleFieldProperty(fullPath, fType string, prop esast.FieldPropert
 			default:
 				return fmt.Errorf("mapper_parsing_exception: unknown [similarity] [%s] on [%s] field [%s]", prop.Similarity, fType, fullPath)
 			}
-			if sim == "dot_product" && effElemType != "float" {
-				return fmt.Errorf("mapper_parsing_exception: [dot_product] similarity can only be used with [float] element_type on field [%s]", fullPath)
+			if sim == "dot_product" && effElemType == "bit" {
+				return fmt.Errorf("mapper_parsing_exception: [dot_product] similarity cannot be used with [bit] element_type on field [%s]", fullPath)
 			}
 			if effElemType == "bit" && (sim == "cosine" || sim == "max_inner_product") {
 				return fmt.Errorf("mapper_parsing_exception: [%s] similarity cannot be used with [bit] element_type on field [%s]", prop.Similarity, fullPath)
 			}
+			if _, err := ValidateDenseVectorIndexOptions(fullPath, fType, effElemType, dims, prop.IndexOptions); err != nil {
+				return err
+			}
+		}
+	}
+	if err := ValidateTSDBFieldParams(fullPath, fType, prop); err != nil {
+		return err
+	}
+	if prop.SyntheticSourceKeep != "" {
+		switch prop.SyntheticSourceKeep {
+		case "none", "all", "arrays":
+		default:
+			return fmt.Errorf("mapper_parsing_exception: Invalid [synthetic_source_keep] value [%s] for field [%s]", prop.SyntheticSourceKeep, fullPath)
+		}
+		if fType != "text" && fType != "annotated-text" && fType != "annotated_text" {
+			return fmt.Errorf("mapper_parsing_exception: [synthetic_source_keep] is not supported for [%s] field [%s]", fType, fullPath)
 		}
 	}
 	if prop.NullValue != nil {
@@ -1713,6 +1781,15 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 		if !validRuntimeFieldTypes[rtType] {
 			return fmt.Errorf("mapper_parsing_exception: No handler for runtime type [%s] declared on field [%s]", rtProp.Type, rtName)
 		}
+		if rtProp.TimeSeriesDimension != nil {
+			return fmt.Errorf("mapper_parsing_exception: unknown parameter [time_series_dimension] on runtime field [%s] of type [%s]", rtName, rtProp.Type)
+		}
+		if rtProp.TimeSeriesDimensions != nil {
+			return fmt.Errorf("mapper_parsing_exception: unknown parameter [time_series_dimensions] on runtime field [%s] of type [%s]", rtName, rtProp.Type)
+		}
+		if rtProp.TimeSeriesMetric != "" {
+			return fmt.Errorf("mapper_parsing_exception: unknown parameter [time_series_metric] on runtime field [%s] of type [%s]", rtName, rtProp.Type)
+		}
 		if rtProp.Script != nil {
 			switch sv := rtProp.Script.(type) {
 			case string:
@@ -1741,6 +1818,9 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 		return err
 	}
 	m.Properties = expandedProps
+	if err := ValidateSyntheticSourceMapping(m); err != nil {
+		return err
+	}
 	allTypes := make(map[string]string)
 	for rtName, rtProp := range m.Runtime {
 		allTypes[rtName] = strings.ToLower(strings.TrimSpace(rtProp.Type))
@@ -2060,8 +2140,22 @@ func validatePropertiesCompatibility(oldProps, newProps map[string]esast.FieldPr
 		}
 		oldDims := oldProp.EffectiveDims()
 		newDims := newProp.EffectiveDims()
-		if newDims > 0 && oldDims != newDims && (oldType == "dense_vector" || oldType == "knn_vector" || oldDims > 0) {
+		if newDims > 0 && oldDims > 0 && oldDims != newDims {
 			return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: cannot update parameter [dims] from [%d] to [%d] for field [%s]", fullPath, oldDims, newDims, fullPath)
+		}
+		if oldType == "dense_vector" || oldType == "knn_vector" {
+			if err := ValidateDenseVectorUpdate(fullPath, oldProp, newProp); err != nil {
+				return err
+			}
+		}
+		if newProp.TimeSeriesDimension != nil {
+			oldTSD := oldProp.TimeSeriesDimension != nil && *oldProp.TimeSeriesDimension
+			if *newProp.TimeSeriesDimension != oldTSD {
+				return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: Cannot update parameter [time_series_dimension] from [%v] to [%v]", fullPath, oldTSD, *newProp.TimeSeriesDimension)
+			}
+		}
+		if newProp.TimeSeriesMetric != "" && !strings.EqualFold(newProp.TimeSeriesMetric, oldProp.TimeSeriesMetric) {
+			return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: Cannot update parameter [time_series_metric] from [%s] to [%s]", fullPath, oldProp.TimeSeriesMetric, newProp.TimeSeriesMetric)
 		}
 		if newProp.ElementType != "" && (oldType == "dense_vector" || oldType == "knn_vector") {
 			oldET := strings.ToLower(strings.TrimSpace(oldProp.ElementType))
@@ -2086,7 +2180,7 @@ func validatePropertiesCompatibility(oldProps, newProps map[string]esast.FieldPr
 				return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: Cannot update parameter [similarity] from [%s] to [%s]", fullPath, oldSim, newProp.Similarity)
 			}
 		}
-		if newProp.PositiveScoreImpact != nil && oldType == "rank_feature" {
+		if newProp.PositiveScoreImpact != nil && (oldType == "rank_feature" || oldType == "rank_features") {
 			oldPSI := oldProp.PositiveScoreImpact == nil || *oldProp.PositiveScoreImpact
 			if *newProp.PositiveScoreImpact != oldPSI {
 				return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: Cannot update parameter [positive_score_impact] from [%v] to [%v]", fullPath, oldPSI, *newProp.PositiveScoreImpact)
@@ -2354,6 +2448,26 @@ func deepMergeMappingPropertiesWithSubobjects(
 			if v.Relations != nil {
 				merged.Relations = v.Relations
 			}
+			if v.ExplicitDims {
+				merged.ExplicitDims = true
+			}
+			if v.StoreArraySource != nil {
+				b := *v.StoreArraySource
+				merged.StoreArraySource = &b
+			}
+			if v.SyntheticSourceKeep != "" {
+				merged.SyntheticSourceKeep = v.SyntheticSourceKeep
+			}
+			if v.TimeSeriesDimension != nil {
+				b := *v.TimeSeriesDimension
+				merged.TimeSeriesDimension = &b
+			}
+			if v.TimeSeriesDimensions != nil {
+				merged.TimeSeriesDimensions = append([]string(nil), v.TimeSeriesDimensions...)
+			}
+			if v.TimeSeriesMetric != "" {
+				merged.TimeSeriesMetric = v.TimeSeriesMetric
+			}
 			if len(v.Properties) > 0 {
 				mergedSubFalse := subobjectsFalse || (merged.Subobjects != nil && !*merged.Subobjects)
 				merged.Properties = deepMergeMappingPropertiesWithSubobjects(existing.Properties, v.Properties, mergedSubFalse)
@@ -2373,6 +2487,17 @@ func deepMergeMappingPropertiesWithSubobjects(
 			if v.Store != nil {
 				b := *v.Store
 				copied.Store = &b
+			}
+			if v.StoreArraySource != nil {
+				b := *v.StoreArraySource
+				copied.StoreArraySource = &b
+			}
+			if v.TimeSeriesDimension != nil {
+				b := *v.TimeSeriesDimension
+				copied.TimeSeriesDimension = &b
+			}
+			if v.TimeSeriesDimensions != nil {
+				copied.TimeSeriesDimensions = append([]string(nil), v.TimeSeriesDimensions...)
 			}
 			if v.PositiveScoreImpact != nil {
 				b := *v.PositiveScoreImpact
@@ -2564,6 +2689,20 @@ func (s *IndexSchema) registerLeafField(
 
 	metaMap := cloneStringMap(prop.Meta)
 	ctxSlice := cloneCompletionContexts(prop.Contexts)
+	var tsDimCopy *bool
+	if prop.TimeSeriesDimension != nil {
+		v := *prop.TimeSeriesDimension
+		tsDimCopy = &v
+	}
+	var tsDimsCopy []string
+	if len(prop.TimeSeriesDimensions) > 0 {
+		tsDimsCopy = append([]string(nil), prop.TimeSeriesDimensions...)
+	}
+	var storeArrCopy *bool
+	if prop.StoreArraySource != nil {
+		v := *prop.StoreArraySource
+		storeArrCopy = &v
+	}
 
 	if IsRangeFieldType(esType) || esType == "histogram" || esType == "flattened" || esType == "sparse_vector" || esType == "rank_features" || esType == "percolator" || esType == "geo_shape" {
 		s.Fields[dotPath] = FieldBinding{
@@ -2594,6 +2733,11 @@ func (s *IndexSchema) registerLeafField(
 			Contexts:                 ctxSlice,
 			NotIndexed:               notIndexed,
 			DocValuesFalse:           docValuesFalse,
+			StoreArraySource:         storeArrCopy,
+			SyntheticSourceKeep:      prop.SyntheticSourceKeep,
+			TimeSeriesDimension:      tsDimCopy,
+			TimeSeriesDimensions:     tsDimsCopy,
+			TimeSeriesMetric:         prop.TimeSeriesMetric,
 		}
 		return
 	}
@@ -2606,6 +2750,30 @@ func (s *IndexSchema) registerLeafField(
 		}
 		relJSONPath := sourceJSONPath[relPrefixLen:]
 		prefilterCol := "n__" + SanitizeDorisIdentifier(dotPath)
+		var nVecDims int
+		var nAutoDims bool
+		var nVecMetric string
+		var nVecElemType string
+		var nVecIdxOpts map[string]any
+		if esType == "dense_vector" || esType == "knn_vector" {
+			nVecElemType = strings.ToLower(strings.TrimSpace(prop.ElementType))
+			if nVecElemType == "" {
+				nVecElemType = "float"
+			}
+			nVecDims = prop.EffectiveDims()
+			nAutoDims = !notIndexed && nVecDims == 0
+			nVecMetric = strings.ToLower(strings.TrimSpace(prop.Similarity))
+			if nVecMetric == "" && !notIndexed {
+				if nVecElemType == "bit" {
+					nVecMetric = "l2_norm"
+				} else {
+					nVecMetric = "cosine"
+				}
+			}
+			if !notIndexed {
+				nVecIdxOpts = MaterializeDenseVectorIndexOptions(nVecElemType, prop.IndexOptions)
+			}
+		}
 		s.Fields[dotPath] = FieldBinding{
 			ESFieldPath:              dotPath,
 			SourceJSONPath:           sourceJSONPath,
@@ -2617,11 +2785,16 @@ func (s *IndexSchema) registerLeafField(
 			Analyzer:                 prop.Analyzer,
 			SearchAnalyzer:           prop.SearchAnalyzer,
 			LowercaseNormalizer:      lowerNorm,
+			VectorDims:               nVecDims,
+			AutoDims:                 nAutoDims,
+			VectorMetric:             nVecMetric,
+			VectorElementType:        nVecElemType,
+			VectorIndexOptions:       nVecIdxOpts,
 			NestedPath:               activeNestedRoot,
 			CorrelatedArrayCol:       corrCol,
 			RelativeJSONPath:         relJSONPath,
 			PrefilterArrayCol:        prefilterCol,
-			IsMultiValued:            (prop.MultiValued || len(relJSONPath) > 1 || DefaultMultiValuedPaths[dotPath]) && esType != "rank_feature",
+			IsMultiValued:            (prop.MultiValued || len(relJSONPath) > 1 || DefaultMultiValuedPaths[dotPath]) && esType != "rank_feature" && esType != "dense_vector" && esType != "knn_vector",
 			CopyTo:                   copyTo,
 			NullValue:                prop.NullValue,
 			ConstantValue:            prop.Value,
@@ -2639,6 +2812,11 @@ func (s *IndexSchema) registerLeafField(
 			Contexts:                 ctxSlice,
 			NotIndexed:               notIndexed,
 			DocValuesFalse:           docValuesFalse,
+			StoreArraySource:         storeArrCopy,
+			SyntheticSourceKeep:      prop.SyntheticSourceKeep,
+			TimeSeriesDimension:      tsDimCopy,
+			TimeSeriesDimensions:     tsDimsCopy,
+			TimeSeriesMetric:         prop.TimeSeriesMetric,
 		}
 		return
 	}
@@ -2657,20 +2835,27 @@ func (s *IndexSchema) registerLeafField(
 				metric = "cosine"
 			}
 		}
+		var vecIdxOpts map[string]any
+		if !notIndexed {
+			vecIdxOpts = MaterializeDenseVectorIndexOptions(elemType, prop.IndexOptions)
+		}
+		dims := prop.EffectiveDims()
 		s.Fields[dotPath] = FieldBinding{
-			ESFieldPath:       dotPath,
-			SourceJSONPath:    sourceJSONPath,
-			Kind:              StoragePromotedVector,
-			ColumnName:        colName,
-			DorisType:         DorisFloatArray,
-			ESType:            esType,
-			VectorDims:        prop.EffectiveDims(),
-			VectorMetric:      metric,
-			VectorElementType: elemType,
-			IgnoreMalformed:   prop.IgnoreMalformed,
-			Meta:              metaMap,
-			NotIndexed:        notIndexed,
-			DocValuesFalse:    docValuesFalse,
+			ESFieldPath:        dotPath,
+			SourceJSONPath:     sourceJSONPath,
+			Kind:               StoragePromotedVector,
+			ColumnName:         colName,
+			DorisType:          DorisFloatArray,
+			ESType:             esType,
+			VectorDims:         dims,
+			AutoDims:           !notIndexed && dims == 0,
+			VectorMetric:       metric,
+			VectorElementType:  elemType,
+			VectorIndexOptions: vecIdxOpts,
+			IgnoreMalformed:    prop.IgnoreMalformed,
+			Meta:               metaMap,
+			NotIndexed:         notIndexed,
+			DocValuesFalse:     docValuesFalse,
 		}
 		return
 	}
@@ -2708,6 +2893,11 @@ func (s *IndexSchema) registerLeafField(
 			Contexts:                 ctxSlice,
 			NotIndexed:               notIndexed,
 			DocValuesFalse:           docValuesFalse,
+			StoreArraySource:         storeArrCopy,
+			SyntheticSourceKeep:      prop.SyntheticSourceKeep,
+			TimeSeriesDimension:      tsDimCopy,
+			TimeSeriesDimensions:     tsDimsCopy,
+			TimeSeriesMetric:         prop.TimeSeriesMetric,
 		}
 		return
 	}
@@ -2740,6 +2930,11 @@ func (s *IndexSchema) registerLeafField(
 		Contexts:                 ctxSlice,
 		NotIndexed:               notIndexed,
 		DocValuesFalse:           docValuesFalse,
+		StoreArraySource:         storeArrCopy,
+		SyntheticSourceKeep:      prop.SyntheticSourceKeep,
+		TimeSeriesDimension:      tsDimCopy,
+		TimeSeriesDimensions:     tsDimsCopy,
+		TimeSeriesMetric:         prop.TimeSeriesMetric,
 	}
 }
 
@@ -2905,7 +3100,10 @@ func (s *IndexSchema) ExpandFieldPattern(patternWithBoost string) []BoostedField
 	var matched []BoostedField
 	matchedSet := make(map[string]bool)
 	for k, b := range s.Fields {
-		if b.Kind == StoragePromotedVector || b.NotIndexed || b.EnabledFalse {
+		if b.Kind == StoragePromotedVector || b.EnabledFalse {
+			continue
+		}
+		if b.NotIndexed && (!s.ES8Mode || !SupportsDocValuesQueriesInES8(b)) {
 			continue
 		}
 		if b.ESType == "histogram" || b.ESType == "rank_feature" || b.ESType == "rank_features" || b.ESType == "sparse_vector" || b.ESType == "percolator" {
@@ -3005,6 +3203,9 @@ type inferOptions struct {
 	dynamicDateFormats []string
 	dynamicTemplates   []map[string]any
 	dynamicMode        string
+	es8Mode            bool
+	inArray            bool
+	copyToTargets      map[string]bool
 }
 
 func newInferOptions(existing *esast.MappingSpec) inferOptions {
@@ -3406,6 +3607,9 @@ func inferObjectPropertiesWithOpts(obj map[string]any, dst map[string]esast.Fiel
 			continue
 		}
 		if exists {
+			if opts.es8Mode && (existing.Type == "dense_vector" || existing.Type == "knn_vector" || existing.Type == "float") && len(existing.Properties) == 0 {
+				continue
+			}
 			dst[k] = mergeFieldProperty(existing, inferred)
 		} else {
 			*totalFields++
@@ -3667,16 +3871,25 @@ func inferValuePropertyWithOpts(val any, fieldName, fullPath string, depth int, 
 	case json.Number:
 		s := v.String()
 		if strings.ContainsAny(s, ".eE") {
+			if opts.es8Mode {
+				return esast.FieldProperty{Type: "float"}, true
+			}
 			return esast.FieldProperty{Type: "double"}, true
 		}
 		if _, err := strconv.ParseInt(s, 10, 64); err != nil {
 			if _, errU := strconv.ParseUint(s, 10, 64); errU == nil {
 				return esast.FieldProperty{Type: "unsigned_long"}, true
 			}
+			if opts.es8Mode {
+				return esast.FieldProperty{Type: "float"}, true
+			}
 			return esast.FieldProperty{Type: "double"}, true
 		}
 		return esast.FieldProperty{Type: "long"}, true
 	case float64:
+		if opts.es8Mode {
+			return esast.FieldProperty{Type: "float"}, true
+		}
 		return esast.FieldProperty{Type: "double"}, true
 	case string:
 		trimmed := strings.TrimSpace(v)
@@ -3732,9 +3945,14 @@ func inferValuePropertyWithOpts(val any, fieldName, fullPath string, depth int, 
 		}
 		return esast.FieldProperty{Properties: childProps}, true
 	case []any:
+		elemOpts := opts
+		elemOpts.inArray = true
 		var merged esast.FieldProperty
 		hasElem := false
-		allNumeric := len(v) >= 2
+		allNumeric := len(v) >= 2 && !opts.inArray
+		if opts.es8Mode {
+			allNumeric = len(v) >= 128 && len(v) <= 2048 && !opts.inArray && !opts.copyToTargets[fullPath]
+		}
 		hasFloat := false
 		for _, elem := range v {
 			if elem == nil {
@@ -3758,13 +3976,15 @@ func inferValuePropertyWithOpts(val any, fieldName, fullPath string, depth int, 
 				if merged.Properties == nil {
 					merged.Properties = make(map[string]esast.FieldProperty)
 				}
-				inferObjectPropertiesWithOpts(elemMap, merged.Properties, fullPath, depth+1, totalFields, opts)
+				objElemOpts := opts
+				objElemOpts.inArray = false
+				inferObjectPropertiesWithOpts(elemMap, merged.Properties, fullPath, depth+1, totalFields, objElemOpts)
 				if len(merged.Properties) > 0 {
 					hasElem = true
 				}
 				continue
 			}
-			elemProp, ok := inferValuePropertyWithOpts(elem, fieldName, fullPath, depth, totalFields, opts)
+			elemProp, ok := inferValuePropertyWithOpts(elem, fieldName, fullPath, depth, totalFields, elemOpts)
 			if !ok {
 				continue
 			}
@@ -3794,6 +4014,9 @@ func inferValuePropertyWithOpts(val any, fieldName, fullPath string, depth int, 
 					Similarity: "cosine",
 				}, true
 			}
+		}
+		if (merged.Type == "dense_vector" || merged.Type == "knn_vector") && merged.EffectiveDims() == 0 && !opts.inArray && len(v) > 0 {
+			merged.Dims = len(v)
 		}
 		markPropertyMultiValued(&merged)
 		return merged, true
@@ -3869,13 +4092,19 @@ func mergeFieldProperty(existing, incoming esast.FieldProperty) esast.FieldPrope
 		return esast.FieldProperty{Type: "unsigned_long", MultiValued: mv}
 	}
 	isNumericOrVec := func(t string) bool {
-		return t == "long" || t == "unsigned_long" || t == "double" || t == "dense_vector" || t == "knn_vector"
+		return t == "long" || t == "unsigned_long" || t == "double" || t == "float" || t == "dense_vector" || t == "knn_vector"
 	}
 	if isNumericOrVec(existing.Type) && isNumericOrVec(incoming.Type) {
-		if existing.Type == "dense_vector" || existing.Type == "knn_vector" || incoming.Type == "dense_vector" || incoming.Type == "knn_vector" {
-			return esast.FieldProperty{Type: "double", MultiValued: true}
+		widenFloatType := "double"
+		if existing.Type == "float" || incoming.Type == "float" {
+			if existing.Type != "double" && incoming.Type != "double" {
+				widenFloatType = "float"
+			}
 		}
-		return esast.FieldProperty{Type: "double", MultiValued: mv}
+		if existing.Type == "dense_vector" || existing.Type == "knn_vector" || incoming.Type == "dense_vector" || incoming.Type == "knn_vector" {
+			return esast.FieldProperty{Type: widenFloatType, MultiValued: true}
+		}
+		return esast.FieldProperty{Type: widenFloatType, MultiValued: mv}
 	}
 	isStringType := func(t string) bool {
 		return t == "keyword" || t == "text"

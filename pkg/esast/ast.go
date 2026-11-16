@@ -67,6 +67,7 @@ type SearchRequest struct {
 	Version           bool                     `json:"version,omitempty"`
 	SeqNoPrimaryTerm  bool                     `json:"seq_no_primary_term,omitempty"`
 	Explain           bool                     `json:"explain,omitempty"`
+	Profile           bool                     `json:"profile,omitempty"`
 	IndicesBoost      map[string]float64       `json:"-"`
 	Highlight         *HighlightSpec           `json:"highlight,omitempty"`
 	Collapse          *CollapseSpec            `json:"collapse,omitempty"`
@@ -79,6 +80,7 @@ type SearchRequest struct {
 	ScriptFields      map[string]any           `json:"script_fields,omitempty"`
 	RuntimeMappings   map[string]FieldProperty `json:"runtime_mappings,omitempty"`
 	Suggest           map[string]SuggestSpec   `json:"suggest,omitempty"`
+	Stats             []string                 `json:"stats,omitempty"`
 }
 
 // SubSearchSpec models an entry in `sub_searches`.
@@ -225,6 +227,9 @@ type StandardRetrieverSpec struct {
 	Query          *Query        `json:"query,omitempty"`
 	Filter         QuerySlice    `json:"filter,omitempty"`
 	Collapse       *CollapseSpec `json:"collapse,omitempty"`
+	Sort           SortSlice     `json:"sort,omitempty"`
+	SearchAfter    []any         `json:"search_after,omitempty"`
+	TerminateAfter *int          `json:"terminate_after,omitempty"`
 	MinScore       *float64      `json:"min_score,omitempty"`
 	RankWindowSize *int          `json:"rank_window_size,omitempty"`
 }
@@ -232,13 +237,17 @@ type StandardRetrieverSpec struct {
 type KNNRetrieverSpec struct {
 	Field              string         `json:"field"`
 	QueryVector        []float64      `json:"query_vector,omitempty"`
+	QueryVectorHex     string         `json:"-"`
 	QueryVectorFromHex bool           `json:"-"`
 	QueryVectorBuilder map[string]any `json:"query_vector_builder,omitempty"`
 	K                  int            `json:"k,omitempty"`
+	HasK               bool           `json:"-"`
 	NumCandidates      int            `json:"num_candidates,omitempty"`
+	HasNumCandidates   bool           `json:"-"`
 	Filter             QuerySlice     `json:"filter,omitempty"`
 	Similarity         *float64       `json:"similarity,omitempty"`
 	Boost              *float64       `json:"boost,omitempty"`
+	InnerHits          *InnerHitsSpec `json:"inner_hits,omitempty"`
 	Name               string         `json:"_name,omitempty"`
 }
 
@@ -287,14 +296,38 @@ func (r *RetrieverSpec) UnmarshalJSON(data []byte) error {
 			}
 			for sk := range subMap {
 				switch sk {
-				case "query", "filter", "collapse", "min_score", "rank_window_size":
+				case "query", "filter", "collapse", "sort", "search_after", "terminate_after", "min_score", "rank_window_size":
 				default:
 					return fmt.Errorf("parsing_exception: [standard] retriever unknown field [%s]", sk)
 				}
 			}
-			var std StandardRetrieverSpec
-			if err := json.Unmarshal(v, &std); err != nil {
+			type plainStd StandardRetrieverSpec
+			var rawStd struct {
+				plainStd
+				TerminateAfter json.RawMessage `json:"terminate_after"`
+			}
+			if err := json.Unmarshal(v, &rawStd); err != nil {
 				return err
+			}
+			std := StandardRetrieverSpec(rawStd.plainStd)
+			if len(rawStd.TerminateAfter) > 0 {
+				ta, err := parseStrictSearchIntJSON(rawStd.TerminateAfter, "terminate_after")
+				if err != nil {
+					return err
+				}
+				if ta != nil && *ta <= 0 {
+					return fmt.Errorf("illegal_argument_exception: [terminate_after] must be greater than 0, found [%d]", *ta)
+				}
+				std.TerminateAfter = ta
+			}
+			if rawSA, hasSA := subMap["search_after"]; hasSA {
+				saTrim := bytes.TrimSpace(rawSA)
+				if len(saTrim) > 0 && !bytes.Equal(saTrim, []byte("null")) {
+					var saVals []any
+					if err := unmarshalPreservingLargeInts(saTrim, &saVals); err == nil {
+						std.SearchAfter = normalizeDecodedNumbersPreservingLargeInts(saVals).([]any)
+					}
+				}
 			}
 			if std.MinScore != nil && (math.IsNaN(*std.MinScore) || math.IsInf(*std.MinScore, 0)) {
 				return fmt.Errorf("parsing_exception: [standard] retriever [min_score] must be finite")
@@ -310,7 +343,7 @@ func (r *RetrieverSpec) UnmarshalJSON(data []byte) error {
 			}
 			for sk := range subMap {
 				switch sk {
-				case "field", "query_vector", "query_vector_builder", "k", "num_candidates", "filter", "similarity", "boost", "_name":
+				case "field", "query_vector", "query_vector_builder", "k", "num_candidates", "filter", "similarity", "boost", "inner_hits", "_name":
 				default:
 					return fmt.Errorf("parsing_exception: [knn] retriever unknown field [%s]", sk)
 				}
@@ -324,6 +357,7 @@ func (r *RetrieverSpec) UnmarshalJSON(data []byte) error {
 				Filter             QuerySlice      `json:"filter,omitempty"`
 				Similarity         *float64        `json:"similarity,omitempty"`
 				Boost              json.RawMessage `json:"boost"`
+				InnerHits          *InnerHitsSpec  `json:"inner_hits,omitempty"`
 				Name               string          `json:"_name,omitempty"`
 			}
 			if err := json.Unmarshal(v, &rawKNN); err != nil {
@@ -334,13 +368,15 @@ func (r *RetrieverSpec) UnmarshalJSON(data []byte) error {
 			knn.QueryVectorBuilder = rawKNN.QueryVectorBuilder
 			knn.Filter = rawKNN.Filter
 			knn.Similarity = rawKNN.Similarity
+			knn.InnerHits = rawKNN.InnerHits
 			knn.Name = rawKNN.Name
 			if len(bytes.TrimSpace(rawKNN.QueryVectorRaw)) > 0 && !bytes.Equal(bytes.TrimSpace(rawKNN.QueryVectorRaw), []byte("null")) {
-				qv, fromHex, err := parseKNNQueryVectorRaw(rawKNN.QueryVectorRaw)
+				qv, qvHex, fromHex, err := parseKNNQueryVectorRawV2(rawKNN.QueryVectorRaw)
 				if err != nil {
 					return err
 				}
 				knn.QueryVector = qv
+				knn.QueryVectorHex = qvHex
 				knn.QueryVectorFromHex = fromHex
 			}
 			if strings.TrimSpace(knn.Field) == "" {
@@ -359,22 +395,17 @@ func (r *RetrieverSpec) UnmarshalJSON(data []byte) error {
 					return fmt.Errorf("illegal_argument_exception: [k] cannot be greater than [10000]")
 				}
 				knn.K = *rawKNN.K
-			} else {
-				knn.K = 10
+				knn.HasK = true
 			}
 			if rawKNN.NumCandidates != nil {
 				if *rawKNN.NumCandidates > 10000 {
 					return fmt.Errorf("illegal_argument_exception: [num_candidates] cannot be greater than [10000]")
 				}
-				if *rawKNN.NumCandidates <= 0 || *rawKNN.NumCandidates < knn.K {
+				if *rawKNN.NumCandidates <= 0 || (knn.HasK && *rawKNN.NumCandidates < knn.K) {
 					return fmt.Errorf("illegal_argument_exception: [knn] retriever [num_candidates] must be >= [k]")
 				}
 				knn.NumCandidates = *rawKNN.NumCandidates
-			} else {
-				knn.NumCandidates = knn.K
-				if knn.NumCandidates < 10 {
-					knn.NumCandidates = 10
-				}
+				knn.HasNumCandidates = true
 			}
 			if len(rawKNN.Boost) > 0 {
 				b, err := parseOptionalNonNegativeBoost(rawKNN.Boost)
@@ -505,6 +536,15 @@ func lowerRetrieverNode(ret *RetrieverSpec, req *SearchRequest) {
 		if std.Collapse != nil && req.Collapse == nil {
 			req.Collapse = std.Collapse
 		}
+		if len(std.Sort) > 0 && len(req.Sort) == 0 {
+			req.Sort = std.Sort
+		}
+		if len(std.SearchAfter) > 0 && len(req.SearchAfter) == 0 {
+			req.SearchAfter = std.SearchAfter
+		}
+		if std.TerminateAfter != nil && req.TerminateAfter == nil {
+			req.TerminateAfter = std.TerminateAfter
+		}
 		if std.MinScore != nil && req.MinScore == nil {
 			req.MinScore = std.MinScore
 		}
@@ -526,13 +566,17 @@ func lowerRetrieverNode(ret *RetrieverSpec, req *SearchRequest) {
 		knnSpec := KNNQuery{
 			Field:              k.Field,
 			QueryVector:        k.QueryVector,
+			QueryVectorHex:     k.QueryVectorHex,
 			QueryVectorFromHex: k.QueryVectorFromHex,
 			QueryVectorBuilder: k.QueryVectorBuilder,
 			K:                  k.K,
+			HasK:               k.HasK,
 			NumCandidates:      k.NumCandidates,
+			HasNumCandidates:   k.HasNumCandidates,
 			Filter:             k.Filter,
 			Similarity:         k.Similarity,
 			Boost:              k.Boost,
+			InnerHits:          k.InnerHits,
 			Name:               k.Name,
 		}
 		req.KNN = append(req.KNN, knnSpec)
@@ -579,44 +623,45 @@ func lowerRetrieverNode(ret *RetrieverSpec, req *SearchRequest) {
 }
 
 var knownSearchRequestKeys = map[string]bool{
-	"query":               true,
-	"retriever":           true,
-	"knn":                 true,
-	"post_filter":         true,
-	"from":                true,
-	"size":                true,
-	"terminate_after":     true,
-	"batched_reduce_size": true,
-	"min_score":           true,
-	"aggs":                true,
-	"aggregations":        true,
-	"sort":                true,
-	"search_after":        true,
-	"_source":             true,
-	"track_total_hits":    true,
-	"track_scores":        true,
-	"version":             true,
-	"seq_no_primary_term": true,
-	"explain":             true,
-	"indices_boost":       true,
-	"highlight":           true,
-	"collapse":            true,
-	"rescore":             true,
-	"pit":                 true,
-	"point_in_time":       true,
-	"fields":              true,
-	"docvalue_fields":     true,
-	"stored_fields":       true,
-	"script_fields":       true,
-	"runtime_mappings":    true,
-	"suggest":             true,
-	"timeout":             true,
-	"slice":               true,
-	"profile":             true,
-	"stats":               true,
-	"ext":                 true,
-	"sub_searches":        true,
-	"rank":                true,
+	"query":                 true,
+	"retriever":             true,
+	"knn":                   true,
+	"post_filter":           true,
+	"from":                  true,
+	"size":                  true,
+	"terminate_after":       true,
+	"batched_reduce_size":   true,
+	"min_score":             true,
+	"aggs":                  true,
+	"aggregations":          true,
+	"sort":                  true,
+	"search_after":          true,
+	"_source":               true,
+	"track_total_hits":      true,
+	"track_scores":          true,
+	"version":               true,
+	"seq_no_primary_term":   true,
+	"explain":               true,
+	"indices_boost":         true,
+	"highlight":             true,
+	"collapse":              true,
+	"rescore":               true,
+	"pit":                   true,
+	"point_in_time":         true,
+	"fields":                true,
+	"docvalue_fields":       true,
+	"stored_fields":         true,
+	"script_fields":         true,
+	"runtime_mappings":      true,
+	"suggest":               true,
+	"timeout":               true,
+	"slice":                 true,
+	"profile":               true,
+	"stats":                 true,
+	"ext":                   true,
+	"sub_searches":          true,
+	"rank":                  true,
+	"pre_filter_shard_size": true,
 }
 
 func parseIndicesBoost(raw json.RawMessage) (map[string]float64, error) {
@@ -723,11 +768,35 @@ func (r *SearchRequest) UnmarshalJSON(data []byte) error {
 		SeqNoPrimaryTerm  any             `json:"seq_no_primary_term"`
 		Explain           any             `json:"explain"`
 		IndicesBoost      json.RawMessage `json:"indices_boost"`
+		Stats             json.RawMessage `json:"stats"`
+		Aggs              json.RawMessage `json:"aggs"`
+		Aggregations      json.RawMessage `json:"aggregations"`
 	}
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
 	*r = SearchRequest(raw.plain)
+	if len(raw.Aggs) > 0 {
+		m, err := unmarshalAggMapWithContext(raw.Aggs)
+		if err != nil {
+			return err
+		}
+		r.Aggs = m
+	}
+	if len(raw.Aggregations) > 0 {
+		m, err := unmarshalAggMapWithContext(raw.Aggregations)
+		if err != nil {
+			return err
+		}
+		r.Aggregations = m
+	}
+	if len(raw.Stats) > 0 {
+		stats, err := parseStringOrStringArrayStrict(raw.Stats, "stats")
+		if err != nil {
+			return err
+		}
+		r.Stats = stats
+	}
 	if len(raw.From) > 0 {
 		fr, err := parseStrictSearchIntJSON(raw.From, "from")
 		if err != nil {
@@ -763,10 +832,19 @@ func (r *SearchRequest) UnmarshalJSON(data []byte) error {
 		if err != nil {
 			return err
 		}
-		if brs != nil && *brs <= 0 {
-			return fmt.Errorf("illegal_argument_exception: [batched_reduce_size] must be >= 1, found [%d]", *brs)
+		if brs != nil && *brs < 2 {
+			return fmt.Errorf("illegal_argument_exception: batchedReduceSize must be >= 2 (batched_reduce_size)")
 		}
 		r.BatchedReduceSize = brs
+	}
+	if rawPF, hasPF := rawMap["pre_filter_shard_size"]; hasPF && len(bytes.TrimSpace(rawPF)) > 0 {
+		pf, err := parseStrictSearchIntJSON(rawPF, "pre_filter_shard_size")
+		if err != nil {
+			return err
+		}
+		if pf != nil && *pf < 1 {
+			return fmt.Errorf("illegal_argument_exception: preFilterShardSize must be >= 1")
+		}
 	}
 	if len(raw.MinScore) > 0 {
 		ms, err := parseStrictSearchFloatJSON(raw.MinScore, "min_score")
@@ -990,7 +1068,7 @@ func validateScriptFieldsMap(sf map[string]any, ctx string) error {
 func validateSearchRequestAggMap(aggs map[string]AggSpec) error {
 	for _, agg := range aggs {
 		if agg.Filters != nil && len(agg.Filters.Filters) == 0 && len(agg.Filters.AnonymousFilters) == 0 && !agg.Filters.OtherBucket {
-			return fmt.Errorf("parsing_exception: [filters] aggregation requires non-empty [filters]")
+			return fmt.Errorf("parsing_exception: [filters] cannot be empty")
 		}
 		if agg.ScriptedMetric != nil && agg.ScriptedMetric.MapScript == nil {
 			return fmt.Errorf("parsing_exception: [scripted_metric] requires [map_script]")
@@ -1683,45 +1761,21 @@ func ExpandHexBitVector(hexStr string) ([]float64, error) {
 	return out, nil
 }
 
-func parseKNNQueryVectorRaw(raw json.RawMessage) ([]float64, bool, error) {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
-		return nil, false, nil
-	}
-	if trimmed[0] == '"' {
-		var hexStr string
-		if err := json.Unmarshal(trimmed, &hexStr); err != nil {
-			return nil, false, err
-		}
-		bits, err := ExpandHexBitVector(hexStr)
-		if err != nil {
-			return nil, false, err
-		}
-		return bits, true, nil
-	}
-	var vec []float64
-	if err := json.Unmarshal(trimmed, &vec); err != nil {
-		return nil, false, err
-	}
-	for _, v := range vec {
-		if math.IsNaN(v) || math.IsInf(v, 0) {
-			return nil, false, fmt.Errorf("illegal_argument_exception: [knn] [query_vector] cannot contain NaN or Infinity")
-		}
-	}
-	return vec, false, nil
-}
-
 // KNNQuery represents an Elasticsearch 8/9 or OpenSearch `knn` vector search clause.
 type KNNQuery struct {
 	Field              string         `json:"field,omitempty"`
 	QueryVector        []float64      `json:"query_vector,omitempty"`
+	QueryVectorHex     string         `json:"-"`
 	QueryVectorFromHex bool           `json:"-"`
 	QueryVectorBuilder map[string]any `json:"query_vector_builder,omitempty"`
 	K                  int            `json:"k,omitempty"`
+	HasK               bool           `json:"-"`
 	NumCandidates      int            `json:"num_candidates,omitempty"`
+	HasNumCandidates   bool           `json:"-"`
 	Similarity         *float64       `json:"similarity,omitempty"`
 	Boost              *float64       `json:"boost,omitempty"`
 	Filter             QuerySlice     `json:"filter,omitempty"`
+	InnerHits          *InnerHitsSpec `json:"inner_hits,omitempty"`
 	Name               string         `json:"_name,omitempty"`
 }
 
@@ -1736,15 +1790,17 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 	}
 	_, hasField := rawMap["field"]
 	_, hasQV := rawMap["query_vector"]
+	_, hasQVB := rawMap["query_vector_builder"]
 	_, hasVec := rawMap["vector"]
 	_, hasK := rawMap["k"]
 	_, hasNC := rawMap["num_candidates"]
 	_, hasSim := rawMap["similarity"]
 	_, hasFilter := rawMap["filter"]
-	if hasField || hasQV || hasVec || hasK || hasNC || hasSim || hasFilter {
+	_, hasInnerHits := rawMap["inner_hits"]
+	if hasField || hasQV || hasQVB || hasVec || hasK || hasNC || hasSim || hasFilter || hasInnerHits {
 		for k := range rawMap {
 			switch k {
-			case "field", "query_vector", "vector", "k", "num_candidates", "filter", "similarity", "boost", "_name":
+			case "field", "query_vector", "query_vector_builder", "vector", "k", "num_candidates", "filter", "similarity", "boost", "inner_hits", "_name":
 			default:
 				return fmt.Errorf("parsing_exception: [knn] unknown field [%s]", k)
 			}
@@ -1759,6 +1815,7 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 			Similarity         *float64        `json:"similarity,omitempty"`
 			Boost              json.RawMessage `json:"boost,omitempty"`
 			Filter             QuerySlice      `json:"filter,omitempty"`
+			InnerHits          *InnerHitsSpec  `json:"inner_hits,omitempty"`
 			Name               string          `json:"_name,omitempty"`
 		}
 		if err := json.Unmarshal(trimmed, &std); err != nil {
@@ -1768,19 +1825,23 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 		if len(bytes.TrimSpace(vecRaw)) == 0 {
 			vecRaw = std.VectorRaw
 		}
-		qv, fromHex, err := parseKNNQueryVectorRaw(vecRaw)
+		qv, qvHex, fromHex, err := parseKNNQueryVectorRawV2(vecRaw)
 		if err != nil {
 			return err
 		}
 		*kq = KNNQuery{
 			Field:              std.Field,
 			QueryVector:        qv,
+			QueryVectorHex:     qvHex,
 			QueryVectorFromHex: fromHex,
 			QueryVectorBuilder: std.QueryVectorBuilder,
 			K:                  std.K,
+			HasK:               hasK,
 			NumCandidates:      std.NumCandidates,
+			HasNumCandidates:   hasNC,
 			Similarity:         std.Similarity,
 			Filter:             std.Filter,
+			InnerHits:          std.InnerHits,
 			Name:               std.Name,
 		}
 		if len(std.Boost) > 0 {
@@ -1791,14 +1852,14 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 			kq.Boost = b
 		}
 		if strings.TrimSpace(kq.Field) == "" {
-			return fmt.Errorf("parsing_exception: [knn] requires non-empty [field]")
+			return fmt.Errorf("x_content_parse_exception: [knn] requires non-empty [field]")
 		}
-		if len(kq.QueryVector) == 0 {
-			return fmt.Errorf("parsing_exception: [knn] requires non-empty [query_vector]")
+		if len(kq.QueryVector) == 0 && len(kq.QueryVectorBuilder) == 0 {
+			return fmt.Errorf("x_content_parse_exception: [knn] requires non-empty [query_vector]")
 		}
 		if hasK {
 			if kq.K <= 0 {
-				return fmt.Errorf("parsing_exception: [knn] [k] must be greater than 0")
+				return fmt.Errorf("x_content_parse_exception: [knn] failed to parse: %w", fmt.Errorf("illegal_argument_exception: [k] must be greater than 0"))
 			}
 			if kq.K > 10000 {
 				return fmt.Errorf("illegal_argument_exception: [k] cannot be greater than [10000]")
@@ -1808,8 +1869,11 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 			if kq.NumCandidates > 10000 {
 				return fmt.Errorf("illegal_argument_exception: [num_candidates] cannot be greater than [10000]")
 			}
-			if kq.NumCandidates <= 0 || (kq.K > 0 && kq.NumCandidates < kq.K) {
-				return fmt.Errorf("parsing_exception: [knn] [num_candidates] must be >= [k] and > 0")
+			if kq.NumCandidates <= 0 {
+				return fmt.Errorf("x_content_parse_exception: [knn] failed to parse: %w", fmt.Errorf("illegal_argument_exception: [num_candidates] must be greater than 0"))
+			}
+			if hasK && kq.NumCandidates < kq.K {
+				return fmt.Errorf("x_content_parse_exception: [knn] failed to parse: %w", fmt.Errorf("illegal_argument_exception: [num_candidates] cannot be less than [k]"))
 			}
 		}
 		return nil
@@ -1834,19 +1898,21 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 		}
 		for k := range specMap {
 			switch k {
-			case "vector", "query_vector", "k", "num_candidates", "similarity", "boost", "filter", "_name":
+			case "vector", "query_vector", "query_vector_builder", "k", "num_candidates", "similarity", "boost", "filter", "inner_hits", "_name":
 			default:
 				return fmt.Errorf("parsing_exception: [knn] unknown field [%s]", k)
 			}
 		}
 		var spec struct {
-			VectorRaw      json.RawMessage `json:"vector"`
-			QueryVectorRaw json.RawMessage `json:"query_vector"`
-			K              int             `json:"k"`
-			NumCandidates  int             `json:"num_candidates"`
-			Similarity     *float64        `json:"similarity"`
-			Boost          json.RawMessage `json:"boost"`
-			Filter         QuerySlice      `json:"filter"`
+			VectorRaw          json.RawMessage `json:"vector"`
+			QueryVectorRaw     json.RawMessage `json:"query_vector"`
+			QueryVectorBuilder map[string]any  `json:"query_vector_builder"`
+			K                  int             `json:"k"`
+			NumCandidates      int             `json:"num_candidates"`
+			Similarity         *float64        `json:"similarity"`
+			Boost              json.RawMessage `json:"boost"`
+			Filter             QuerySlice      `json:"filter"`
+			InnerHits          *InnerHitsSpec  `json:"inner_hits"`
 		}
 		if err := json.Unmarshal(rawSpec, &spec); err != nil {
 			return err
@@ -1855,16 +1921,23 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 		if len(bytes.TrimSpace(vecRaw)) == 0 {
 			vecRaw = spec.QueryVectorRaw
 		}
-		vec, fromHex, err := parseKNNQueryVectorRaw(vecRaw)
+		vec, qvHex, fromHex, err := parseKNNQueryVectorRawV2(vecRaw)
 		if err != nil {
 			return err
 		}
+		_, okK := specMap["k"]
+		_, okNC := specMap["num_candidates"]
 		kq.Field = field
 		kq.QueryVector = vec
+		kq.QueryVectorHex = qvHex
 		kq.QueryVectorFromHex = fromHex
+		kq.QueryVectorBuilder = spec.QueryVectorBuilder
 		kq.K = spec.K
+		kq.HasK = okK
 		kq.NumCandidates = spec.NumCandidates
+		kq.HasNumCandidates = okNC
 		kq.Similarity = spec.Similarity
+		kq.InnerHits = spec.InnerHits
 		if len(spec.Boost) > 0 {
 			b, err := parseOptionalNonNegativeBoost(spec.Boost)
 			if err != nil {
@@ -1875,27 +1948,27 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 			kq.Boost = mapBoost
 		}
 		kq.Filter = spec.Filter
-		if _, okK := specMap["k"]; okK {
+		if okK {
 			if kq.K <= 0 {
-				return fmt.Errorf("parsing_exception: [knn] [k] must be greater than 0")
+				return fmt.Errorf("x_content_parse_exception: [knn] [k] must be greater than 0")
 			}
 			if kq.K > 10000 {
 				return fmt.Errorf("illegal_argument_exception: [k] cannot be greater than [10000]")
 			}
 		}
-		if _, okNC := specMap["num_candidates"]; okNC {
+		if okNC {
 			if kq.NumCandidates > 10000 {
 				return fmt.Errorf("illegal_argument_exception: [num_candidates] cannot be greater than [10000]")
 			}
-			if kq.NumCandidates <= 0 || (kq.K > 0 && kq.NumCandidates < kq.K) {
-				return fmt.Errorf("parsing_exception: [knn] [num_candidates] must be >= [k] and > 0")
+			if kq.NumCandidates <= 0 || (okK && kq.NumCandidates < kq.K) {
+				return fmt.Errorf("x_content_parse_exception: [knn] [num_candidates] must be >= [k] and > 0")
 			}
 		}
 		foundField = true
 		break
 	}
-	if !foundField || strings.TrimSpace(kq.Field) == "" || len(kq.QueryVector) == 0 {
-		return fmt.Errorf("parsing_exception: [knn] requires non-empty [field] and [query_vector]")
+	if !foundField || strings.TrimSpace(kq.Field) == "" || (len(kq.QueryVector) == 0 && len(kq.QueryVectorBuilder) == 0) {
+		return fmt.Errorf("x_content_parse_exception: [knn] requires non-empty [field] and [query_vector]")
 	}
 	return nil
 }
@@ -2010,18 +2083,31 @@ func (s *SliceSpec) UnmarshalJSON(data []byte) error {
 	if !hasMax || len(bytes.TrimSpace(rawMax)) == 0 || bytes.Equal(bytes.TrimSpace(rawMax), []byte("null")) {
 		return fmt.Errorf("parsing_exception: [slice] requires [max]")
 	}
-	type plain SliceSpec
-	var raw plain
-	if err := json.Unmarshal(trimmed, &raw); err != nil {
-		return err
+	parsedID, err := parseStrictSearchIntJSON(rawID, "id")
+	if err != nil || parsedID == nil {
+		return fmt.Errorf("parsing_exception: [slice] invalid [id]: %w", err)
 	}
-	if raw.Max <= 1 {
-		return fmt.Errorf("parsing_exception: [slice] max must be greater than 1, got [%d]", raw.Max)
+	parsedMax, err := parseStrictSearchIntJSON(rawMax, "max")
+	if err != nil || parsedMax == nil {
+		return fmt.Errorf("parsing_exception: [slice] invalid [max]: %w", err)
 	}
-	if raw.ID < 0 || raw.ID >= raw.Max {
-		return fmt.Errorf("parsing_exception: [slice] id must be >= 0 and < max [%d], got [%d]", raw.Max, raw.ID)
+	var fieldName string
+	if rawField, hasField := rawMap["field"]; hasField {
+		if err := json.Unmarshal(rawField, &fieldName); err != nil {
+			return err
+		}
 	}
-	*s = SliceSpec(raw)
+	if *parsedMax <= 1 {
+		return fmt.Errorf("parsing_exception: [slice] max must be greater than 1, got [%d]", *parsedMax)
+	}
+	if *parsedID < 0 || *parsedID >= *parsedMax {
+		return fmt.Errorf("parsing_exception: [slice] id must be >= 0 and < max [%d], got [%d]", *parsedMax, *parsedID)
+	}
+	*s = SliceSpec{
+		ID:    *parsedID,
+		Max:   *parsedMax,
+		Field: fieldName,
+	}
 	return nil
 }
 
@@ -2389,7 +2475,7 @@ func validateHighlightCommonFields(
 		return fmt.Errorf("parsing_exception: [highlight] [fragment_offset] must be >= 0")
 	}
 	if maxAnalyzedOffset != nil && *maxAnalyzedOffset < 0 {
-		return fmt.Errorf("parsing_exception: [highlight] [max_analyzed_offset] must be >= 0")
+		return fmt.Errorf("x_content_parse_exception: illegal_argument_exception: [max_analyzed_offset] must be a positive integer")
 	}
 	if phraseLimit != nil && *phraseLimit < 0 {
 		return fmt.Errorf("parsing_exception: [highlight] [phrase_limit] must be >= 0")
@@ -2516,6 +2602,14 @@ func (hfs *HighlightFieldSpec) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
 		return err
 	}
+	flexInts, cleanedMap, err := extractHighlightFlexibleInts(rawMap)
+	if err != nil {
+		return err
+	}
+	cleanedBytes, err := json.Marshal(cleanedMap)
+	if err != nil {
+		return err
+	}
 	type plain HighlightFieldSpec
 	var raw struct {
 		plain
@@ -2523,10 +2617,18 @@ func (hfs *HighlightFieldSpec) UnmarshalJSON(data []byte) error {
 		PostTags      any `json:"post_tags"`
 		MatchedFields any `json:"matched_fields"`
 	}
-	if err := json.Unmarshal(trimmed, &raw); err != nil {
+	if err := json.Unmarshal(cleanedBytes, &raw); err != nil {
 		return err
 	}
 	*hfs = HighlightFieldSpec(raw.plain)
+	hfs.FragmentSize = flexInts.FragmentSize
+	hfs.NumberOfFragments = flexInts.NumberOfFragments
+	hfs.NoMatchSize = flexInts.NoMatchSize
+	hfs.BoundaryMaxScan = flexInts.BoundaryMaxScan
+	hfs.FragmentOffset = flexInts.FragmentOffset
+	hfs.MaxAnalyzedOffset = flexInts.MaxAnalyzedOffset
+	hfs.PhraseLimit = flexInts.PhraseLimit
+	hfs.MaxFragmentLength = flexInts.MaxFragmentLength
 	if hfs.TagSchema == "" && hfs.TagsSchema != "" {
 		hfs.TagSchema = hfs.TagsSchema
 	}
@@ -2595,16 +2697,32 @@ func (h *HighlightSpec) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
 		return err
 	}
+	flexInts, cleanedMap, err := extractHighlightFlexibleInts(rawMap)
+	if err != nil {
+		return err
+	}
+	cleanedBytes, err := json.Marshal(cleanedMap)
+	if err != nil {
+		return err
+	}
 	type plain HighlightSpec
 	var raw struct {
 		plain
 		PreTags  any `json:"pre_tags"`
 		PostTags any `json:"post_tags"`
 	}
-	if err := json.Unmarshal(trimmed, &raw); err != nil {
+	if err := json.Unmarshal(cleanedBytes, &raw); err != nil {
 		return err
 	}
 	*h = HighlightSpec(raw.plain)
+	h.FragmentSize = flexInts.FragmentSize
+	h.NumberOfFragments = flexInts.NumberOfFragments
+	h.NoMatchSize = flexInts.NoMatchSize
+	h.BoundaryMaxScan = flexInts.BoundaryMaxScan
+	h.FragmentOffset = flexInts.FragmentOffset
+	h.MaxAnalyzedOffset = flexInts.MaxAnalyzedOffset
+	h.PhraseLimit = flexInts.PhraseLimit
+	h.MaxFragmentLength = flexInts.MaxFragmentLength
 	if h.TagSchema == "" && h.TagsSchema != "" {
 		h.TagSchema = h.TagsSchema
 	}
@@ -7497,9 +7615,11 @@ func (iq *IdsQuery) UnmarshalJSON(data []byte) error {
 }
 
 type ExistsQuery struct {
-	Field string   `json:"field"`
-	Boost *float64 `json:"boost,omitempty"`
-	Name  string   `json:"_name,omitempty"`
+	Field   string   `json:"field,omitempty"`
+	Boost   *float64 `json:"boost,omitempty"`
+	Name    string   `json:"_name,omitempty"`
+	Script  any      `json:"script,omitempty"`
+	Missing any      `json:"missing,omitempty"`
 }
 
 func (eq *ExistsQuery) UnmarshalJSON(data []byte) error {
@@ -8499,6 +8619,14 @@ func (mmq *MultiMatchQuery) UnmarshalJSON(data []byte) error {
 	default:
 		return fmt.Errorf("parsing_exception: [multi_match] unsupported type [%s]", mmq.Type)
 	}
+	if mmq.Type == "bool_prefix" {
+		if _, hasSlop := rawMap["slop"]; hasSlop {
+			return fmt.Errorf("parsing_exception: [slop] not allowed for type [bool_prefix]")
+		}
+		if _, hasCF := rawMap["cutoff_frequency"]; hasCF {
+			return fmt.Errorf("parsing_exception: [cutoff_frequency] not allowed for type [bool_prefix]")
+		}
+	}
 	if err := validateQueryOperator(mmq.Operator, "multi_match"); err != nil {
 		return err
 	}
@@ -8787,6 +8915,9 @@ func (qsq *QueryStringQuery) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	qsq.Query = formatFlexibleScalarString(raw.Query)
+	if err := ValidateQueryStringDepth(qsq.Query); err != nil {
+		return err
+	}
 	if raw.Fields != nil {
 		fields, err := parseFlexibleStringSlice(raw.Fields)
 		if err != nil {
@@ -10151,12 +10282,21 @@ func (gd *GeoDistanceAggSpec) UnmarshalJSON(data []byte) error {
 	type plain GeoDistanceAggSpec
 	var raw struct {
 		plain
-		Keyed any `json:"keyed"`
+		Ranges json.RawMessage `json:"ranges"`
+		Keyed  any             `json:"keyed"`
 	}
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
 	p := raw.plain
+	parsedRanges, wasMap, err := parseFlexibleRangesArrayOrMap(raw.Ranges)
+	if err != nil {
+		return err
+	}
+	p.Ranges = parsedRanges
+	if wasMap && raw.Keyed == nil {
+		p.Keyed = true
+	}
 	if strings.TrimSpace(p.Field) == "" {
 		return fmt.Errorf("parsing_exception: [geo_distance] requires [field]")
 	}
@@ -10249,6 +10389,9 @@ type GeoGridAggSpec struct {
 	Size                   int            `json:"size,omitempty"`
 	ShardSize              int            `json:"shard_size,omitempty"`
 	Bounds                 map[string]any `json:"bounds,omitempty"`
+	Order                  any            `json:"order,omitempty"`
+	MissingBucket          bool           `json:"missing_bucket,omitempty"`
+	MissingOrder           string         `json:"missing_order,omitempty"`
 }
 
 func (gg *GeoGridAggSpec) UnmarshalJSON(data []byte) error {
@@ -10262,17 +10405,20 @@ func (gg *GeoGridAggSpec) UnmarshalJSON(data []byte) error {
 	}
 	for k := range rawMap {
 		switch k {
-		case "field", "precision", "bounds", "size", "shard_size", "aggs", "aggregations", "meta":
+		case "field", "precision", "bounds", "size", "shard_size", "order", "missing_bucket", "missing_order", "aggs", "aggregations", "meta":
 		default:
 			return fmt.Errorf("parsing_exception: [geo_grid] unknown field [%s]", k)
 		}
 	}
 	var raw struct {
-		Field     string          `json:"field"`
-		Precision json.RawMessage `json:"precision"`
-		Size      *int            `json:"size"`
-		ShardSize *int            `json:"shard_size"`
-		Bounds    map[string]any  `json:"bounds"`
+		Field         string          `json:"field"`
+		Precision     json.RawMessage `json:"precision"`
+		Size          *int            `json:"size"`
+		ShardSize     *int            `json:"shard_size"`
+		Bounds        map[string]any  `json:"bounds"`
+		Order         any             `json:"order"`
+		MissingBucket bool            `json:"missing_bucket"`
+		MissingOrder  string          `json:"missing_order"`
 	}
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
@@ -10282,6 +10428,9 @@ func (gg *GeoGridAggSpec) UnmarshalJSON(data []byte) error {
 	}
 	var p GeoGridAggSpec
 	p.Field = raw.Field
+	p.Order = raw.Order
+	p.MissingBucket = raw.MissingBucket
+	p.MissingOrder = raw.MissingOrder
 	if raw.Size != nil {
 		if *raw.Size <= 0 {
 			return fmt.Errorf("illegal_argument_exception: [geo_grid] [size] must be > 0")
@@ -10657,16 +10806,46 @@ func (a *AggSpec) UnmarshalJSON(data []byte) error {
 	}
 	if rawMeta, hasMeta := rawMap["meta"]; hasMeta {
 		mTrim := bytes.TrimSpace(rawMeta)
-		if len(mTrim) > 0 && !bytes.Equal(mTrim, []byte("null")) {
-			if mTrim[0] != '{' {
-				return fmt.Errorf("parsing_exception: [meta] must be an object")
-			}
+		if len(mTrim) > 0 && !bytes.Equal(mTrim, []byte("null")) && mTrim[0] != '{' {
+			return fmt.Errorf("parsing_exception: [meta] must be an object")
+		}
+	}
+	if rawFilter, hasFilter := rawMap["filter"]; hasFilter {
+		if isEmptyOrNullJSONQueryObject(rawFilter) {
+			return fmt.Errorf("parsing_exception: Aggregation [filter] requires a filter query; cannot be empty")
 		}
 	}
 	type plain AggSpec
-	var p plain
-	if err := json.Unmarshal(trimmed, &p); err != nil {
+	var rawSub struct {
+		plain
+		Missing      json.RawMessage `json:"missing"`
+		Aggs         json.RawMessage `json:"aggs"`
+		Aggregations json.RawMessage `json:"aggregations"`
+	}
+	if err := json.Unmarshal(trimmed, &rawSub); err != nil {
 		return err
+	}
+	p := rawSub.plain
+	if rawMissing, hasMissing := rawMap["missing"]; hasMissing {
+		ms, err := unmarshalMissingAggSpec(rawMissing)
+		if err != nil {
+			return err
+		}
+		p.Missing = ms
+	}
+	if len(rawSub.Aggs) > 0 {
+		m, err := unmarshalAggMapWithContext(rawSub.Aggs)
+		if err != nil {
+			return err
+		}
+		p.Aggs = m
+	}
+	if len(rawSub.Aggregations) > 0 {
+		m, err := unmarshalAggMapWithContext(rawSub.Aggregations)
+		if err != nil {
+			return err
+		}
+		p.Aggregations = m
 	}
 	if p.GeoCentroid != nil && strings.TrimSpace(p.GeoCentroid.Field) == "" {
 		return fmt.Errorf("parsing_exception: [geo_centroid] requires non-empty [field]")
@@ -10813,6 +10992,8 @@ func (s *SamplerAggSpec) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: [sampler] [max_docs_per_value] must be > 0")
 		}
 		p.MaxDocsPerValue = *raw.MaxDocsPerValue
+	} else {
+		p.MaxDocsPerValue = 1
 	}
 	switch strings.ToLower(strings.TrimSpace(raw.ExecutionHint)) {
 	case "", "map", "global_ordinals", "bytes_hash":
@@ -10843,8 +11024,25 @@ func validateTDigestAndHDR(rawMap map[string]json.RawMessage, aggName string) er
 		}
 		if rawComp, ok := tdMap["compression"]; ok {
 			var comp float64
-			if err := json.Unmarshal(rawComp, &comp); err != nil || comp <= 0 || math.IsNaN(comp) || math.IsInf(comp, 0) {
-				return fmt.Errorf("illegal_argument_exception: [%s.tdigest] [compression] must be > 0", aggName)
+			if err := json.Unmarshal(rawComp, &comp); err != nil || math.IsNaN(comp) || math.IsInf(comp, 0) {
+				return fmt.Errorf("illegal_argument_exception: [compression] must be greater than 0")
+			}
+			if comp < 0 {
+				return fmt.Errorf("illegal_argument_exception: [compression] must be greater than or equal to 0. Found [%.1f]", comp)
+			}
+			if comp == 0 {
+				return fmt.Errorf("illegal_argument_exception: [compression] must be greater than 0. Found [0.0]")
+			}
+		}
+		if rawHint, ok := tdMap["execution_hint"]; ok {
+			var hint string
+			if err := json.Unmarshal(rawHint, &hint); err != nil {
+				return fmt.Errorf("parsing_exception: [%s.tdigest] [execution_hint] must be a string", aggName)
+			}
+			switch strings.ToLower(strings.TrimSpace(hint)) {
+			case "", "default", "high_accuracy":
+			default:
+				return fmt.Errorf("illegal_argument_exception: Invalid execution_hint [%s], valid values are [default, high_accuracy]", hint)
 			}
 		}
 	}
@@ -10868,8 +11066,11 @@ func validateTDigestAndHDR(rawMap map[string]json.RawMessage, aggName string) er
 				return fmt.Errorf("illegal_argument_exception: numberOfSignificantValueDigits must be between 0 and 5")
 			}
 			var digits int
-			if err := json.Unmarshal(dTrim, &digits); err != nil || digits < 0 || digits > 5 {
+			if err := json.Unmarshal(dTrim, &digits); err != nil {
 				return fmt.Errorf("illegal_argument_exception: numberOfSignificantValueDigits must be between 0 and 5")
+			}
+			if digits < 0 || digits > 5 {
+				return fmt.Errorf("illegal_argument_exception: numberOfSignificantValueDigits must be between 0 and 5. Found [%d]", digits)
 			}
 		}
 	}
@@ -11231,7 +11432,7 @@ func (m *MovingAvgAggSpec) UnmarshalJSON(data []byte) error {
 	}
 	if raw.Window != nil {
 		if *raw.Window <= 0 {
-			return fmt.Errorf("parsing_exception: [moving_fn] [window] must be > 0")
+			return esWireError("parsing_exception: [moving_fn] [window] must be a positive, non-zero integer.")
 		}
 		p.Window = *raw.Window
 	}
@@ -11690,12 +11891,20 @@ func (c *CompositeAggSpec) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: [composite] unknown field [%s]", k)
 		}
 	}
+	rawSourcesVal, hasSources := rawMap["sources"]
+	if !hasSources {
+		return fmt.Errorf("parsing_exception: Required [sources]")
+	}
+	srcValTrim := bytes.TrimSpace(rawSourcesVal)
+	if len(srcValTrim) == 0 || bytes.Equal(srcValTrim, []byte("null")) {
+		return fmt.Errorf("parsing_exception: Composite [sources] cannot be null or empty")
+	}
 	var rawSources []map[string]json.RawMessage
-	if err := json.Unmarshal(rawMap["sources"], &rawSources); err != nil {
+	if err := json.Unmarshal(rawSourcesVal, &rawSources); err != nil {
 		return fmt.Errorf("parsing_exception: [composite] invalid [sources]: %w", err)
 	}
 	if len(rawSources) == 0 {
-		return fmt.Errorf("parsing_exception: [composite] aggregation requires at least one source in [sources]")
+		return fmt.Errorf("parsing_exception: Composite [sources] cannot be null or empty")
 	}
 	type sourceOrderRestore struct {
 		idx     int
@@ -11714,7 +11923,7 @@ func (c *CompositeAggSpec) UnmarshalJSON(data []byte) error {
 				return fmt.Errorf("parsing_exception: [composite] source name cannot be empty")
 			}
 			if seenSourceNames[srcName] {
-				return fmt.Errorf("parsing_exception: [composite] duplicate source name [%s]", srcName)
+				return fmt.Errorf("parsing_exception: Composite source names must be unique, found duplicates: [%s] (duplicate source name)", srcName)
 			}
 			seenSourceNames[srcName] = true
 			var srcTypeMap map[string]json.RawMessage
@@ -11840,6 +12049,10 @@ func (c *CompositeAggSpec) UnmarshalJSON(data []byte) error {
 					if spec.Histogram != nil {
 						spec.Histogram.Order = r.order
 					}
+				case "geotile_grid":
+					if spec.GeotileGrid != nil {
+						spec.GeotileGrid.Order = r.order
+					}
 				}
 				alias.Sources[r.idx][r.srcName] = spec
 			}
@@ -11874,6 +12087,9 @@ func (f *FiltersAggSpec) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: [filters] unknown field [%s]", k)
 		}
 	}
+	if err := validateInnerAggMeta(rawMap); err != nil {
+		return err
+	}
 	var raw struct {
 		Filters        json.RawMessage `json:"filters"`
 		Buckets        json.RawMessage `json:"buckets"`
@@ -11906,6 +12122,9 @@ func (f *FiltersAggSpec) UnmarshalJSON(data []byte) error {
 	}
 	trimmed := bytes.TrimSpace(raw.Filters)
 	if len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null")) {
+		if err := validateFiltersAggRawClauses(trimmed); err != nil {
+			return err
+		}
 		switch trimmed[0] {
 		case '[':
 			var list []Query
@@ -11929,7 +12148,7 @@ func (f *FiltersAggSpec) UnmarshalJSON(data []byte) error {
 		}
 	}
 	if len(f.Filters) == 0 && len(f.AnonymousFilters) == 0 && !f.OtherBucket {
-		return fmt.Errorf("parsing_exception: [filters] requires non-empty [filters]")
+		return fmt.Errorf("parsing_exception: [filters] cannot be empty")
 	}
 	return nil
 }
@@ -12179,6 +12398,9 @@ func (tie *TermsIncludeExclude) UnmarshalJSON(data []byte) error {
 		if err := json.Unmarshal(trimmed, &pat); err != nil {
 			return err
 		}
+		if err := validateTermsIncludeRegex(pat); err != nil {
+			return err
+		}
 		tie.Pattern = pat
 		return nil
 	case '[':
@@ -12232,24 +12454,29 @@ func (tie *TermsIncludeExclude) UnmarshalJSON(data []byte) error {
 }
 
 type TermsAggSpec struct {
-	Field                 string `json:"field"`
-	Script                any    `json:"script,omitempty"`
-	Size                  int    `json:"size,omitempty"`
-	ShardSize             *int   `json:"shard_size,omitempty"`
-	Format                string `json:"format,omitempty"`
-	Missing               any    `json:"missing,omitempty"`
-	MissingBucket         bool   `json:"missing_bucket,omitempty"`
-	MissingOrder          string `json:"missing_order,omitempty"`
-	Order                 any    `json:"order,omitempty"`
-	MinDocCount           *int   `json:"min_doc_count,omitempty"`
-	ShardMinDocCount      *int   `json:"shard_min_doc_count,omitempty"`
-	ShowTermDocCountError *bool  `json:"show_term_doc_count_error,omitempty"`
-	CollectMode           string `json:"collect_mode,omitempty"`
-	ExecutionHint         string `json:"execution_hint,omitempty"`
-	Include               any    `json:"include,omitempty"`
-	Exclude               any    `json:"exclude,omitempty"`
-	ValueType             string `json:"value_type,omitempty"`
-	BackgroundFilter      *Query `json:"background_filter,omitempty"`
+	Field                 string               `json:"field"`
+	Script                any                  `json:"script,omitempty"`
+	Size                  int                  `json:"size,omitempty"`
+	ShardSize             *int                 `json:"shard_size,omitempty"`
+	Format                string               `json:"format,omitempty"`
+	Missing               any                  `json:"missing,omitempty"`
+	MissingBucket         bool                 `json:"missing_bucket,omitempty"`
+	MissingOrder          string               `json:"missing_order,omitempty"`
+	Order                 any                  `json:"order,omitempty"`
+	MinDocCount           *int                 `json:"min_doc_count,omitempty"`
+	ShardMinDocCount      *int                 `json:"shard_min_doc_count,omitempty"`
+	ShowTermDocCountError *bool                `json:"show_term_doc_count_error,omitempty"`
+	CollectMode           string               `json:"collect_mode,omitempty"`
+	ExecutionHint         string               `json:"execution_hint,omitempty"`
+	Include               any                  `json:"include,omitempty"`
+	Exclude               any                  `json:"exclude,omitempty"`
+	ParsedInclude         *TermsIncludeExclude `json:"-"`
+	ParsedExclude         *TermsIncludeExclude `json:"-"`
+	ValueType             string               `json:"value_type,omitempty"`
+	BackgroundFilter      *Query               `json:"background_filter,omitempty"`
+	FilterDuplicateText   *bool                `json:"filter_duplicate_text,omitempty"`
+	SourceFields          []string             `json:"source_fields,omitempty"`
+	ScriptHeuristic       any                  `json:"script_heuristic,omitempty"`
 }
 
 func validateBucketAggOrderSpec(order any, aggType string) error {
@@ -12330,6 +12557,7 @@ func (t *TermsAggSpec) UnmarshalJSON(data []byte) error {
 		case "field", "script", "size", "shard_size", "format", "missing", "missing_bucket", "missing_order",
 			"order", "min_doc_count", "shard_min_doc_count", "show_term_doc_count_error", "collect_mode",
 			"execution_hint", "include", "exclude", "value_type", "background_filter",
+			"filter_duplicate_text", "source_fields", "script_heuristic",
 			"chi_square", "gnd", "jlh", "mutual_information", "percentage":
 		default:
 			return fmt.Errorf("parsing_exception: [terms] unknown field [%s]", k)
@@ -12341,7 +12569,7 @@ func (t *TermsAggSpec) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	if strings.TrimSpace(p.Field) == "" && p.Script == nil {
-		return fmt.Errorf("parsing_exception: [terms] requires either [field] or [script]")
+		return fmt.Errorf("parsing_exception: Required one of fields [field, script], but none were specified")
 	}
 	if p.Script != nil {
 		if err := validateScriptValue(p.Script); err != nil {
@@ -12385,12 +12613,14 @@ func (t *TermsAggSpec) UnmarshalJSON(data []byte) error {
 		if err := json.Unmarshal(rawInc, &tie); err != nil {
 			return err
 		}
+		p.ParsedInclude = &tie
 	}
 	if rawExc, hasExc := rawMap["exclude"]; hasExc {
 		var tie TermsIncludeExclude
 		if err := json.Unmarshal(rawExc, &tie); err != nil {
 			return err
 		}
+		p.ParsedExclude = &tie
 	}
 	*t = TermsAggSpec(p)
 	return nil
@@ -12894,11 +13124,37 @@ func (h *HistogramAggSpec) UnmarshalJSON(data []byte) error {
 	if _, hasInterval := rawMap["interval"]; !hasInterval {
 		return fmt.Errorf("parsing_exception: [histogram] requires [interval]")
 	}
-	type plain HistogramAggSpec
-	var p plain
-	if err := json.Unmarshal(trimmed, &p); err != nil {
+	parsedInterval, err := parseStrictSearchFloatJSON(rawMap["interval"], "interval")
+	if err != nil || parsedInterval == nil {
+		return fmt.Errorf("parsing_exception: [histogram] invalid [interval]: %w", err)
+	}
+	var parsedOffset float64
+	if rawOffset, hasOffset := rawMap["offset"]; hasOffset {
+		offPtr, err := parseStrictSearchFloatJSON(rawOffset, "offset")
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [histogram] invalid [offset]: %w", err)
+		}
+		if offPtr != nil {
+			parsedOffset = *offPtr
+		}
+	}
+	cleanedHist := make(map[string]json.RawMessage, len(rawMap))
+	for k, v := range rawMap {
+		if k != "interval" && k != "offset" {
+			cleanedHist[k] = v
+		}
+	}
+	cleanedBytes, err := json.Marshal(cleanedHist)
+	if err != nil {
 		return err
 	}
+	type plain HistogramAggSpec
+	var p plain
+	if err := json.Unmarshal(cleanedBytes, &p); err != nil {
+		return err
+	}
+	p.Interval = *parsedInterval
+	p.Offset = parsedOffset
 	if strings.TrimSpace(p.Field) == "" && p.Script == nil {
 		return fmt.Errorf("parsing_exception: [histogram] requires either [field] or [script]")
 	}
@@ -12954,9 +13210,28 @@ func (r *RangeAggSpec) UnmarshalJSON(data []byte) error {
 		}
 	}
 	type plain RangeAggSpec
-	var p plain
-	if err := json.Unmarshal(trimmed, &p); err != nil {
+	var raw struct {
+		plain
+		Ranges json.RawMessage `json:"ranges"`
+		Keyed  any             `json:"keyed"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
+	}
+	p := raw.plain
+	parsedRanges, wasMap, err := parseFlexibleRangesArrayOrMap(raw.Ranges)
+	if err != nil {
+		return err
+	}
+	p.Ranges = parsedRanges
+	if raw.Keyed != nil {
+		b, err := parseFlexibleBool(raw.Keyed)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [range] [keyed] %w", err)
+		}
+		p.Keyed = b
+	} else if wasMap {
+		p.Keyed = true
 	}
 	if strings.TrimSpace(p.Field) == "" && p.Script == nil {
 		return fmt.Errorf("parsing_exception: [range] requires either [field] or [script]")
@@ -13032,11 +13307,11 @@ func (b RangeAggBucket) EffectiveKey() string {
 	}
 	fromStr := "*"
 	if b.From != nil {
-		fromStr = fmt.Sprintf("%v", b.From)
+		fromStr = formatRangeBoundKey(b.From)
 	}
 	toStr := "*"
 	if b.To != nil {
-		toStr = fmt.Sprintf("%v", b.To)
+		toStr = formatRangeBoundKey(b.To)
 	}
 	return fromStr + "-" + toStr
 }
@@ -13075,10 +13350,13 @@ func (n *NestedAggSpec) UnmarshalJSON(data []byte) error {
 }
 
 type MetricAggSpec struct {
-	Field   string   `json:"field"`
-	Sigma   *float64 `json:"sigma,omitempty"`
-	Missing any      `json:"missing,omitempty"`
-	Script  any      `json:"script,omitempty"`
+	Field         string   `json:"field"`
+	Sigma         *float64 `json:"sigma,omitempty"`
+	Compression   *float64 `json:"compression,omitempty"`
+	ExecutionHint string   `json:"execution_hint,omitempty"`
+	Format        string   `json:"format,omitempty"`
+	Missing       any      `json:"missing,omitempty"`
+	Script        any      `json:"script,omitempty"`
 }
 
 func (m *MetricAggSpec) UnmarshalJSON(data []byte) error {
@@ -13105,11 +13383,15 @@ func (m *MetricAggSpec) UnmarshalJSON(data []byte) error {
 		Rehash             any      `json:"rehash"`
 		ShowDistribution   any      `json:"show_distribution"`
 		ExecutionHint      string   `json:"execution_hint"`
+		Format             string   `json:"format"`
 	}
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
 	p := raw.plain
+	p.Compression = raw.Compression
+	p.ExecutionHint = raw.ExecutionHint
+	p.Format = raw.Format
 	if strings.TrimSpace(p.Field) == "" && p.Script == nil {
 		return fmt.Errorf("parsing_exception: metric aggregation requires either [field] or [script]")
 	}
@@ -13124,8 +13406,13 @@ func (m *MetricAggSpec) UnmarshalJSON(data []byte) error {
 	if raw.PrecisionThreshold != nil && (*raw.PrecisionThreshold < 0 || *raw.PrecisionThreshold > 40000) {
 		return fmt.Errorf("illegal_argument_exception: [precision_threshold] must be in [0, 40000]")
 	}
-	if raw.Compression != nil && (*raw.Compression <= 0 || math.IsNaN(*raw.Compression) || math.IsInf(*raw.Compression, 0)) {
-		return fmt.Errorf("illegal_argument_exception: [compression] must be > 0")
+	if raw.Compression != nil {
+		if math.IsNaN(*raw.Compression) || math.IsInf(*raw.Compression, 0) {
+			return fmt.Errorf("illegal_argument_exception: [compression] must be greater than 0")
+		}
+		if *raw.Compression <= 0 {
+			return fmt.Errorf("illegal_argument_exception: [compression] must be greater than 0. Found [%.1f]", *raw.Compression)
+		}
 	}
 	if raw.Rehash != nil {
 		if _, err := parseFlexibleBool(raw.Rehash); err != nil {
@@ -13138,9 +13425,9 @@ func (m *MetricAggSpec) UnmarshalJSON(data []byte) error {
 		}
 	}
 	switch strings.ToLower(strings.TrimSpace(raw.ExecutionHint)) {
-	case "", "map", "global_ordinals", "bytes_hash", "ordinals", "direct":
+	case "", "default", "high_accuracy", "map", "global_ordinals", "bytes_hash", "ordinals", "direct", "save_memory_heuristic", "save_time_heuristic":
 	default:
-		return fmt.Errorf("parsing_exception: unknown [execution_hint] [%s]", raw.ExecutionHint)
+		return fmt.Errorf("illegal_argument_exception: Invalid execution_hint [%s], valid values are [default, high_accuracy]", raw.ExecutionHint)
 	}
 	*m = MetricAggSpec(p)
 	return nil
@@ -14240,17 +14527,18 @@ type RoutingMetaSpec struct {
 
 // MappingSpec models an Elasticsearch `_mapping` payload.
 type MappingSpec struct {
-	Dynamic            any                      `json:"dynamic,omitempty"`
-	Subobjects         *bool                    `json:"subobjects,omitempty"`
-	Routing            *RoutingMetaSpec         `json:"_routing,omitempty"`
-	Meta               map[string]any           `json:"_meta,omitempty"`
-	Source             map[string]any           `json:"_source,omitempty"`
-	DynamicTemplates   []map[string]any         `json:"dynamic_templates,omitempty"`
-	DateDetection      *bool                    `json:"date_detection,omitempty"`
-	NumericDetection   *bool                    `json:"numeric_detection,omitempty"`
-	DynamicDateFormats []string                 `json:"dynamic_date_formats,omitempty"`
-	Runtime            map[string]FieldProperty `json:"runtime,omitempty"`
-	Properties         map[string]FieldProperty `json:"properties,omitempty"`
+	Dynamic             any                      `json:"dynamic,omitempty"`
+	Subobjects          *bool                    `json:"subobjects,omitempty"`
+	Routing             *RoutingMetaSpec         `json:"_routing,omitempty"`
+	Meta                map[string]any           `json:"_meta,omitempty"`
+	Source              map[string]any           `json:"_source,omitempty"`
+	DataStreamTimestamp any                      `json:"_data_stream_timestamp,omitempty"`
+	DynamicTemplates    []map[string]any         `json:"dynamic_templates,omitempty"`
+	DateDetection       *bool                    `json:"date_detection,omitempty"`
+	NumericDetection    *bool                    `json:"numeric_detection,omitempty"`
+	DynamicDateFormats  []string                 `json:"dynamic_date_formats,omitempty"`
+	Runtime             map[string]FieldProperty `json:"runtime,omitempty"`
+	Properties          map[string]FieldProperty `json:"properties,omitempty"`
 }
 
 type FieldProperty struct {
@@ -14261,6 +14549,11 @@ type FieldProperty struct {
 	Index                    *bool                    `json:"index,omitempty"`
 	DocValues                *bool                    `json:"doc_values,omitempty"`
 	Store                    *bool                    `json:"store,omitempty"`
+	StoreArraySource         *bool                    `json:"store_array_source,omitempty"`
+	SyntheticSourceKeep      string                   `json:"synthetic_source_keep,omitempty"`
+	TimeSeriesDimension      *bool                    `json:"time_series_dimension,omitempty"`
+	TimeSeriesDimensions     []string                 `json:"time_series_dimensions,omitempty"`
+	TimeSeriesMetric         string                   `json:"time_series_metric,omitempty"`
 	Path                     string                   `json:"path,omitempty"`
 	Value                    any                      `json:"value,omitempty"`
 	Script                   any                      `json:"script,omitempty"`
@@ -14271,6 +14564,7 @@ type FieldProperty struct {
 	TimeZone                 string                   `json:"time_zone,omitempty"`
 	Dims                     int                      `json:"dims,omitempty"`
 	Dimension                int                      `json:"dimension,omitempty"`
+	ExplicitDims             bool                     `json:"-"`
 	Similarity               string                   `json:"similarity,omitempty"`
 	ElementType              string                   `json:"element_type,omitempty"`
 	MultiValued              bool                     `json:"multi_valued,omitempty"`
@@ -14295,6 +14589,7 @@ type FieldProperty struct {
 	PositiveScoreImpact      *bool                    `json:"positive_score_impact,omitempty"`
 	MaxShingleSize           *int                     `json:"max_shingle_size,omitempty"`
 	DepthLimit               *int                     `json:"depth_limit,omitempty"`
+	TermVector               string                   `json:"term_vector,omitempty"`
 	Relations                map[string]any           `json:"relations,omitempty"`
 	Fields                   map[string]FieldProperty `json:"fields,omitempty"`
 	Properties               map[string]FieldProperty `json:"properties,omitempty"`

@@ -281,7 +281,7 @@ func (m *MemoryBackend) GetDocsByIDs(_ context.Context, _, table string, ids []s
 var (
 	reHitsSQL            = regexp.MustCompile(`(?s)^SELECT ` + "`_id`, `_version`, `_source`, CAST\\((.+) AS DOUBLE\\) AS `_score`, (COUNT\\(\\*\\) OVER\\(\\)|CAST\\(-1 AS BIGINT\\)) AS `_total_hits` FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0 AND (.+) ORDER BY (.+) LIMIT (\\d+) OFFSET (\\d+)$")
 	reSearchAfterHitsSQL = regexp.MustCompile(`(?s)^SELECT ` + "`_id`, `_version`, `_source`, `_score`, `_total_hits` FROM \\(SELECT \\*, CAST\\((.+) AS DOUBLE\\) AS `_score`, (COUNT\\(\\*\\) OVER\\(\\)|CAST\\(-1 AS BIGINT\\)) AS `_total_hits` FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0 AND (.+)\\) `_scored` WHERE (.+) ORDER BY (.+) LIMIT (\\d+) OFFSET (\\d+)$")
-	reCollapsedHitsSQL   = regexp.MustCompile(`(?s)^SELECT ` + "`_id`, `_version`, `_source`, `_score`, `_total_hits` FROM \\(SELECT \\*, ROW_NUMBER\\(\\) OVER \\(PARTITION BY (.+?) ORDER BY .+\\) AS `_collapse_rn` FROM \\(SELECT \\*, CAST\\((.+) AS DOUBLE\\) AS `_score`, (COUNT\\(\\*\\) OVER\\(\\)|CAST\\(-1 AS BIGINT\\)) AS `_total_hits` FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0 AND (.+)\\) `_scored`\\) `_collapsed` WHERE (?:\\()?`_collapse_rn` = 1(?: OR .+? IS NULL)?(?:\\) AND \\((.+)\\))? ORDER BY (.+) LIMIT (\\d+) OFFSET (\\d+)$")
+	reCollapsedHitsSQL   = regexp.MustCompile(`(?s)^SELECT ` + "`_id`, `_version`, `_source`, `_score`, `_total_hits` FROM \\(SELECT \\*, ROW_NUMBER\\(\\) OVER \\(PARTITION BY (.+?) ORDER BY .+?\\) AS `_collapse_rn` FROM \\(SELECT \\*, CAST\\((.+) AS DOUBLE\\) AS `_score`, (COUNT\\(\\*\\) OVER\\(\\)|CAST\\(-1 AS BIGINT\\)) AS `_total_hits` FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0 AND (.+)\\) `_scored`\\) `_collapsed` WHERE (?:\\()?`_collapse_rn` = 1(?: OR .+? IS NULL)?(?:\\) AND \\((.+)\\))? ORDER BY (.+) LIMIT (\\d+) OFFSET (\\d+)$")
 	reCTEBase            = regexp.MustCompile(`(?s)^WITH ` + "`base_matched` AS \\(SELECT \\* FROM `[^`]+`\\.`([^`]+)` WHERE `__DORIS_DELETE_SIGN__` = 0(?: AND \\((.+?)\\))?\\)\n(.+)$")
 )
 
@@ -377,6 +377,12 @@ func (m *MemoryBackend) QueryHits(_ context.Context, sqlStr string) ([]HitRow, e
 	}
 
 	tbl := m.tables[tableName]
+	if strings.Contains(mainWhere, "ROW_NUMBER() OVER (ORDER BY ") || strings.Contains(scoreExpr, "ROW_NUMBER() OVER (ORDER BY ") || strings.Contains(postWhere, "ROW_NUMBER() OVER (ORDER BY ") || strings.Contains(collapseSearchAfterWhere, "ROW_NUMBER() OVER (ORDER BY ") {
+		mainWhere = resolveKNNTopKSubqueries(tbl, mainWhere)
+		postWhere = resolveKNNTopKSubqueries(tbl, postWhere)
+		scoreExpr = resolveKNNTopKSubqueries(tbl, scoreExpr)
+		collapseSearchAfterWhere = resolveKNNTopKSubqueries(tbl, collapseSearchAfterWhere)
+	}
 	var matchedRows []map[string]any
 	var hits []HitRow
 
@@ -524,6 +530,9 @@ func (m *MemoryBackend) QueryAggs(_ context.Context, sqlStr string) ([]AggRow, e
 	unionBranches := strings.Split(sub[3], "\nUNION ALL\n")
 
 	tbl := m.tables[tableName]
+	if strings.Contains(baseWhere, "ROW_NUMBER() OVER (ORDER BY ") {
+		baseWhere = resolveKNNTopKSubqueries(tbl, baseWhere)
+	}
 	var baseRows []map[string]any
 	for _, row := range tbl {
 		if isTombstoneRow(row) {
@@ -537,6 +546,9 @@ func (m *MemoryBackend) QueryAggs(_ context.Context, sqlStr string) ([]AggRow, e
 	var out []AggRow
 	for _, branch := range unionBranches {
 		branch = strings.TrimSpace(branch)
+		if strings.Contains(branch, "ROW_NUMBER() OVER (ORDER BY ") {
+			branch = resolveKNNTopKSubqueries(tbl, branch)
+		}
 		rows := evalAggBranch(baseRows, branch)
 		out = append(out, rows...)
 	}
@@ -570,7 +582,9 @@ var (
 	reAggPercentileRank         = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(AVG\\(CASE WHEN (.+?) <= ([0-9.eE+-]+) THEN 100\\.0 ELSE 0\\.0 END\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:nt|t)` AS `_(?:nel|elem)`)?)(?: WHERE (.+))?$")
 	reAggDateHist               = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(CAST\\(FLOOR\\((?:\\((.+?) \\+ (-?\\d+)\\)|(.+?)) / (\\d+)\\) \\* \\d+(?: - -?\\d+)? AS BIGINT\\) AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\((?:CASE WHEN .+ END|`[^`]+`)\\) `_t` AS `_elem`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|CAST\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS BIGINT\\) ASC")
 	reAggDateHistGeneric        = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+?) WHERE (.+?) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS BIGINT\\) ASC")
-	reAggHist                   = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(FLOOR\\(\\((.+?) - ([^)]+)\\) / ([^)]+)\\) \\* [^)]+ \\+ [^)]+ AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)|COALESCE\\(SUM\\((.+?)\\), 0\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:t|ht)` AS `_(?:elem|helem)`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|CAST\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS DOUBLE\\) ASC")
+	reAggHist                   = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(FLOOR\\(\\((.+?) - ([^)]+)\\) / ([^)]+)\\) \\* [^)]+ \\+ [^)]+ AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)|COALESCE\\(SUM\\((.+?)\\), 0\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:t|ht|rng_t)` AS `_(?:elem|helem|bidx)`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|CAST\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS DOUBLE\\) ASC")
+	reAggRawValues              = regexp.MustCompile(`^SELECT '(__raw_vals__(?:''|[^'])*)' AS ` + "`_agg_name`, CONCAT\\('_vals:', COALESCE\\(ARRAY_JOIN\\(COLLECT_LIST\\(CAST\\((.+?) AS DOUBLE\\)\\), ','\\), ''\\)\\) AS `_bucket_key`, CAST\\(COUNT\\(.+?\\) AS DOUBLE\\) AS `_doc_count` FROM (.+)$")
+	reAggSubRawValues           = regexp.MustCompile(`^SELECT '(__raw_vals__(?:''|[^'])*)' AS ` + "`_agg_name`, CONCAT\\(CAST\\((.+?) AS STRING\\), '\\\\x1f_vals:', COALESCE\\(ARRAY_JOIN\\(COLLECT_LIST\\(CAST\\((.+?) AS DOUBLE\\)\\), ','\\), ''\\)\\) AS `_bucket_key`, CAST\\(COUNT\\(.+?\\) AS DOUBLE\\) AS `_doc_count` FROM (.+)$")
 	reAggRange                  = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(`[^`]+`\\) `_t` AS `_elem`)?) WHERE (.+)$")
 	reAggSubMetric              = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\((?:COALESCE\\((AVG|SUM|MIN|MAX|COUNT|STDDEV_POP)\\((.+?)\\), 0\\)|(COUNT)\\((DISTINCT )?(.+?)\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key`$")
 	reAggSubPercentile          = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\(COALESCE\\(PERCENTILE_APPROX\\((.+?), ([0-9.]+)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key`$")
@@ -721,6 +735,85 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 			cnt = int64(len(baseRows))
 		}
 		return []AggRow{{AggName: metaName, BucketKey: "_count", DocCount: cnt, Value: float64(cnt)}}
+	}
+
+	if m := reAggSubRawValues.FindStringSubmatch(branch); m != nil {
+		aggName := strings.ReplaceAll(m[1], "''", "'")
+		parentBucketExpr := m[2]
+		valExpr := m[3]
+		tail := strings.TrimSpace(m[4])
+		groupSuffix := " GROUP BY " + parentBucketExpr
+		if strings.HasSuffix(tail, groupSuffix) {
+			tail = strings.TrimSpace(tail[:len(tail)-len(groupSuffix)])
+		} else if gIdx := strings.LastIndex(tail, " GROUP BY "); gIdx > 0 {
+			tail = strings.TrimSpace(tail[:gIdx])
+		}
+		fromClause, whereClause := splitTopLevelFromAndWhere(tail)
+		expanded := expandFromClauseRows(baseRows, fromClause, whereClause)
+		byBucket := make(map[string][]string)
+		var bucketOrder []string
+		for _, row := range expanded {
+			for _, bKey := range evalBucketKeyExprs(row, parentBucketExpr) {
+				if bKey == "" {
+					continue
+				}
+				if _, exists := byBucket[bKey]; !exists {
+					bucketOrder = append(bucketOrder, bKey)
+				}
+				if val := resolveColumnValue(row, valExpr); val != nil {
+					for _, elem := range asSliceOrSingle(val) {
+						if f, ok := toFloat(elem); ok && !math.IsNaN(f) && !math.IsInf(f, 0) {
+							byBucket[bKey] = append(byBucket[bKey], strconv.FormatFloat(f, 'f', -1, 64))
+						}
+					}
+				}
+			}
+		}
+		sort.Strings(bucketOrder)
+		rows := make([]AggRow, 0, len(bucketOrder))
+		for _, bKey := range bucketOrder {
+			parts := byBucket[bKey]
+			if len(parts) == 0 && hasHavingCountGtZero {
+				continue
+			}
+			cnt := int64(len(parts))
+			rows = append(rows, AggRow{
+				AggName:   aggName,
+				BucketKey: bKey + "\x1f_vals:" + strings.Join(parts, ","),
+				DocCount:  cnt,
+				Value:     float64(cnt),
+				Weight:    cnt,
+			})
+		}
+		return filterHaving(rows)
+	}
+
+	if m := reAggRawValues.FindStringSubmatch(branch); m != nil {
+		aggName := strings.ReplaceAll(m[1], "''", "'")
+		valExpr := m[2]
+		fromClause, whereClause := splitTopLevelFromAndWhere(strings.TrimSpace(m[3]))
+		expanded := expandFromClauseRows(baseRows, fromClause, whereClause)
+		var parts []string
+		for _, row := range expanded {
+			if val := resolveColumnValue(row, valExpr); val != nil {
+				for _, elem := range asSliceOrSingle(val) {
+					if f, ok := toFloat(elem); ok && !math.IsNaN(f) && !math.IsInf(f, 0) {
+						parts = append(parts, strconv.FormatFloat(f, 'f', -1, 64))
+					}
+				}
+			}
+		}
+		cnt := int64(len(parts))
+		if cnt == 0 && hasHavingCountGtZero {
+			return nil
+		}
+		return filterHaving([]AggRow{{
+			AggName:   aggName,
+			BucketKey: "_vals:" + strings.Join(parts, ","),
+			DocCount:  cnt,
+			Value:     float64(cnt),
+			Weight:    cnt,
+		}})
 	}
 
 	if m := reAggArrayExplode.FindStringSubmatch(branch); m != nil {
@@ -2823,6 +2916,9 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 		if arr, ok := val.([]string); ok {
 			return len(arr) > 0
 		}
+		if arr, ok := val.([]float64); ok {
+			return len(arr) > 0
+		}
 		return val != nil
 	}
 	if strings.HasSuffix(expr, " IS NULL") {
@@ -2832,6 +2928,9 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 			return len(arr) == 0
 		}
 		if arr, ok := val.([]string); ok {
+			return len(arr) == 0
+		}
+		if arr, ok := val.([]float64); ok {
 			return len(arr) == 0
 		}
 		return val == nil
@@ -3390,8 +3489,25 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 		}
 	}
 
-	for _, fn := range []string{"GREATEST", "LEAST", "COALESCE", "POW", "LOG10", "LN", "SQRT", "FLOOR", "CEIL", "ROUND", "TRUNCATE", "ABS", "UNIX_TIMESTAMP", "TIMESTAMPDIFF"} {
-		if strings.HasPrefix(expr, fn+"(") && strings.HasSuffix(expr, ")") {
+	if strings.EqualFold(expr, "PI()") {
+		return math.Pi
+	}
+	if (strings.HasPrefix(expr, "IF(") || strings.HasPrefix(expr, "if(")) && strings.HasSuffix(expr, ")") && hasMatchingOuterParens(expr, 2) {
+		args := splitTopLevelArgs(expr[3 : len(expr)-1])
+		if len(args) == 3 {
+			chosen := strings.TrimSpace(args[2])
+			if evalWhereExpr(row, strings.TrimSpace(args[0])) {
+				chosen = strings.TrimSpace(args[1])
+			}
+			if strings.EqualFold(chosen, "NULL") {
+				return 0
+			}
+			return evalNumericExpr(row, chosen)
+		}
+	}
+
+	for _, fn := range []string{"GREATEST", "LEAST", "COALESCE", "POW", "LOG10", "LN", "EXP", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN2", "ATAN", "FLOOR", "CEIL", "ROUND", "TRUNCATE", "ABS", "UNIX_TIMESTAMP", "TIMESTAMPDIFF"} {
+		if strings.HasPrefix(expr, fn+"(") && strings.HasSuffix(expr, ")") && hasMatchingOuterParens(expr, len(fn)) {
 			inner := expr[len(fn)+1 : len(expr)-1]
 			args := splitTopLevelArgs(inner)
 			switch fn {
@@ -3416,6 +3532,10 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 			case "POW":
 				if len(args) == 2 {
 					return math.Pow(evalNumericExpr(row, args[0]), evalNumericExpr(row, args[1]))
+				}
+			case "ATAN2":
+				if len(args) == 2 {
+					return math.Atan2(evalNumericExpr(row, args[0]), evalNumericExpr(row, args[1]))
 				}
 			case "TRUNCATE":
 				if len(args) >= 1 {
@@ -3476,8 +3596,22 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 				return math.Log10(evalNumericExpr(row, inner))
 			case "LN":
 				return math.Log(evalNumericExpr(row, inner))
+			case "EXP":
+				return math.Exp(evalNumericExpr(row, inner))
 			case "SQRT":
 				return math.Sqrt(evalNumericExpr(row, inner))
+			case "SIN":
+				return math.Sin(evalNumericExpr(row, inner))
+			case "COS":
+				return math.Cos(evalNumericExpr(row, inner))
+			case "TAN":
+				return math.Tan(evalNumericExpr(row, inner))
+			case "ASIN":
+				return math.Asin(evalNumericExpr(row, inner))
+			case "ACOS":
+				return math.Acos(evalNumericExpr(row, inner))
+			case "ATAN":
+				return math.Atan(evalNumericExpr(row, inner))
 			case "FLOOR":
 				return math.Floor(evalNumericExpr(row, inner))
 			case "CEIL":
@@ -3577,22 +3711,50 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			}
 		}
 	}
-	if strings.HasPrefix(colExpr, "array_filter(_el -> ") && strings.HasSuffix(colExpr, ")") {
-		args := splitTopLevelArgs(colExpr[len("array_filter(") : len(colExpr)-1])
+	if (strings.HasPrefix(colExpr, "ARRAY_RANGE(") || strings.HasPrefix(colExpr, "array_range(")) && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("ARRAY_RANGE")) {
+		args := splitTopLevelArgs(colExpr[len("ARRAY_RANGE(") : len(colExpr)-1])
 		if len(args) == 2 {
-			condSQL := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(args[0]), "_el ->"))
-			var out []string
-			for _, elemJSON := range toStringSlice(resolveColumnValue(row, strings.TrimSpace(args[1]))) {
-				cp := make(map[string]any, len(row)+1)
-				for k, v := range row {
-					cp[k] = v
-				}
-				cp["_el"] = elemJSON
-				if evalWhereExpr(cp, condSQL) {
-					out = append(out, elemJSON)
-				}
+			fLo := evalNumericExpr(row, strings.TrimSpace(args[0]))
+			fHi := evalNumericExpr(row, strings.TrimSpace(args[1]))
+			if math.IsNaN(fLo) || math.IsNaN(fHi) || math.IsInf(fLo, 0) || math.IsInf(fHi, 0) || math.Abs(fLo) > 4e18 {
+				return nil
+			}
+			if fHi <= fLo {
+				return []any{}
+			}
+			lo := int64(math.Trunc(fLo))
+			count := int64(math.Trunc(fHi - fLo))
+			if count > 10001 {
+				count = 10001
+			}
+			out := make([]any, 0, int(count))
+			for i := int64(0); i < count; i++ {
+				out = append(out, lo+i)
 			}
 			return out
+		}
+		return nil
+	}
+	if strings.HasPrefix(colExpr, "array_filter(") && strings.HasSuffix(colExpr, ")") {
+		args := splitTopLevelArgs(colExpr[len("array_filter(") : len(colExpr)-1])
+		if len(args) == 2 {
+			lambda := strings.TrimSpace(args[0])
+			if arrowIdx := strings.Index(lambda, "->"); arrowIdx > 0 {
+				varName := strings.TrimSpace(lambda[:arrowIdx])
+				condSQL := strings.TrimSpace(lambda[arrowIdx+2:])
+				var out []string
+				for _, elemJSON := range toStringSlice(resolveColumnValue(row, strings.TrimSpace(args[1]))) {
+					cp := make(map[string]any, len(row)+1)
+					for k, v := range row {
+						cp[k] = v
+					}
+					cp[varName] = elemJSON
+					if evalWhereExpr(cp, condSQL) {
+						out = append(out, elemJSON)
+					}
+				}
+				return out
+			}
 		}
 	}
 	if strings.HasPrefix(colExpr, "array_map(_x -> IPV4_STRING_TO_NUM_OR_NULL(_x), ") && strings.HasSuffix(colExpr, ")") {
@@ -3608,25 +3770,29 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 		return out
 	}
-	if strings.HasPrefix(colExpr, "array_map(_x -> ") && strings.HasSuffix(colExpr, ")") {
+	if strings.HasPrefix(colExpr, "array_map(") && strings.HasSuffix(colExpr, ")") {
 		args := splitTopLevelArgs(colExpr[len("array_map(") : len(colExpr)-1])
 		if len(args) == 2 {
-			bodyExpr := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(args[0]), "_x ->"))
-			var out []any
-			for _, elem := range toStringSlice(resolveColumnValue(row, strings.TrimSpace(args[1]))) {
-				cp := make(map[string]any, len(row)+1)
-				for k, v := range row {
-					cp[k] = v
+			lambda := strings.TrimSpace(args[0])
+			if arrowIdx := strings.Index(lambda, "->"); arrowIdx > 0 {
+				varName := strings.TrimSpace(lambda[:arrowIdx])
+				bodyExpr := strings.TrimSpace(lambda[arrowIdx+2:])
+				var out []any
+				for _, elem := range toStringSlice(resolveColumnValue(row, strings.TrimSpace(args[1]))) {
+					cp := make(map[string]any, len(row)+1)
+					for k, v := range row {
+						cp[k] = v
+					}
+					cp[varName] = elem
+					if mv := resolveColumnValue(cp, bodyExpr); mv != nil {
+						out = append(out, mv)
+					}
 				}
-				cp["_x"] = elem
-				if mv := resolveColumnValue(cp, bodyExpr); mv != nil {
-					out = append(out, mv)
+				if len(out) == 0 {
+					return nil
 				}
+				return out
 			}
-			if len(out) == 0 {
-				return nil
-			}
-			return out
 		}
 	}
 	if strings.HasPrefix(colExpr, "array_median(") && strings.HasSuffix(colExpr, ")") {
@@ -3689,10 +3855,11 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 		return nil
 	}
-	if (strings.HasPrefix(colExpr, "array_min(") || strings.HasPrefix(colExpr, "array_max(") || strings.HasPrefix(colExpr, "array_avg(") || strings.HasPrefix(colExpr, "array_sum(")) && strings.HasSuffix(colExpr, ")") {
-		fn := colExpr[:len("array_min")]
+	if lowerExpr := strings.ToLower(colExpr); (strings.HasPrefix(lowerExpr, "array_min(") || strings.HasPrefix(lowerExpr, "array_max(") || strings.HasPrefix(lowerExpr, "array_avg(") || strings.HasPrefix(lowerExpr, "array_sum(")) && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("array_min")) {
+		fn := lowerExpr[:len("array_min")]
 		inner := strings.TrimSpace(colExpr[len("array_min(") : len(colExpr)-1])
-		elems := toStringSlice(resolveColumnValue(row, inner))
+		rawResolved := resolveColumnValue(row, inner)
+		elems := toStringSlice(rawResolved)
 		if len(elems) == 0 {
 			return nil
 		}
@@ -3714,6 +3881,34 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			return sum
 		}
 		isMax := fn == "array_max"
+		if fSlice, okF := rawResolved.([]float64); okF && len(fSlice) > 0 {
+			bestF := fSlice[0]
+			for _, v := range fSlice[1:] {
+				if (!isMax && v < bestF) || (isMax && v > bestF) {
+					bestF = v
+				}
+			}
+			return bestF
+		}
+		if aSlice, okA := rawResolved.([]any); okA && len(aSlice) > 0 && !strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS ") {
+			allFloat := true
+			var bestF float64
+			hasF := false
+			for _, el := range aSlice {
+				fv, isF := el.(float64)
+				if !isF {
+					allFloat = false
+					break
+				}
+				if !hasF || (!isMax && fv < bestF) || (isMax && fv > bestF) {
+					bestF = fv
+					hasF = true
+				}
+			}
+			if allFloat && hasF {
+				return bestF
+			}
+		}
 		best := elems[0]
 		for _, e := range elems[1:] {
 			var cmp int
@@ -3909,6 +4104,30 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			return res
 		}
 	}
+	if strings.HasPrefix(colExpr, "json_extract(") && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("json_extract")) {
+		inner := colExpr[len("json_extract(") : len(colExpr)-1]
+		args := splitTopLevelArgs(inner)
+		if len(args) == 2 {
+			varExpr := strings.TrimSpace(args[0])
+			varName := strings.Trim(varExpr, "`")
+			jsonPath := strings.TrimPrefix(unquoteSQLLiteral(strings.TrimSpace(args[1])), "$.")
+			var elemJSON string
+			if rawElem, ok := row[varName]; ok && rawElem != nil {
+				if s, okS := rawElem.(string); okS {
+					elemJSON = s
+				} else if jb, err := json.Marshal(rawElem); err == nil {
+					elemJSON = string(jb)
+				}
+			} else if resolved := resolveColumnValue(row, varExpr); resolved != nil {
+				if s, okS := resolved.(string); okS {
+					elemJSON = s
+				} else if jb, err := json.Marshal(resolved); err == nil {
+					elemJSON = string(jb)
+				}
+			}
+			return extractJSONPathFromStr(elemJSON, strings.Split(jsonPath, "."))
+		}
+	}
 	if strings.HasPrefix(colExpr, "CAST(`_doc`") && hasMatchingOuterParens(colExpr, 4) {
 		asIdx := strings.LastIndex(colExpr, " AS ")
 		if asIdx > 0 {
@@ -3954,6 +4173,8 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 					return memCoerceVariantToArrayOfString(res)
 				} else if strings.HasSuffix(colExpr, " AS ARRAY<LARGEINT>)") {
 					return toStringSlice(memCoerceSQLLargeInt(res))
+				} else if strings.HasSuffix(colExpr, " AS ARRAY<FLOAT>)") || strings.HasSuffix(colExpr, " AS ARRAY<DOUBLE>)") {
+					return memCoerceArrayOfFloat(res)
 				} else if strings.HasSuffix(colExpr, " AS BOOLEAN)") {
 					switch res.(type) {
 					case []any, []string:
@@ -4587,6 +4808,20 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS ARRAY<LARGEINT>)")])
 			return toStringSlice(memCoerceSQLLargeInt(resolveColumnValue(row, inner)))
 		}
+		if strings.HasSuffix(colExpr, " AS ARRAY<FLOAT>)") || strings.HasSuffix(colExpr, " AS ARRAY<DOUBLE>)") {
+			suffix := " AS ARRAY<FLOAT>)"
+			if strings.HasSuffix(colExpr, " AS ARRAY<DOUBLE>)") {
+				suffix = " AS ARRAY<DOUBLE>)"
+			}
+			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(suffix)])
+			if strings.HasPrefix(inner, "[") && strings.HasSuffix(inner, "]") {
+				if vec := parseVectorLiteral(inner); len(vec) > 0 {
+					return vec
+				}
+				return nil
+			}
+			return memCoerceArrayOfFloat(resolveColumnValue(row, inner))
+		}
 		if strings.HasSuffix(colExpr, " AS BOOLEAN)") {
 			inner := colExpr[len("CAST(") : len(colExpr)-len(" AS BOOLEAN)")]
 			if v := resolveColumnValue(row, inner); v != nil {
@@ -4716,7 +4951,7 @@ func hasUnwrappedNullColumnRef(row map[string]any, expr string) bool {
 	if strings.Contains(expr, "CASE ") {
 		return false
 	}
-	if strings.Contains(expr, "_el ->") || strings.Contains(expr, "_x ->") {
+	if strings.Contains(expr, "_el ->") || strings.Contains(expr, "_x ->") || strings.Contains(expr, "_nel ->") {
 		return resolveColumnValue(row, expr) == nil
 	}
 	stripped := stripCoalesceSubexprs(expr)
@@ -4788,7 +5023,10 @@ func hasUnwrappedNullColumnRef(row map[string]any, expr string) bool {
 
 func isArithmeticSQLExpr(expr string) bool {
 	trimmed := trimOuterParens(strings.TrimSpace(expr))
-	for _, fn := range []string{"CASE ", "ST_Distance_Sphere(", "GREATEST(", "LEAST(", "POW(", "LOG10(", "LN(", "SQRT(", "FLOOR(", "CEIL(", "ROUND(", "TRUNCATE(", "ABS(", "UNIX_TIMESTAMP(", "TIMESTAMPDIFF("} {
+	if strings.EqualFold(trimmed, "PI()") {
+		return true
+	}
+	for _, fn := range []string{"CASE ", "ST_Distance_Sphere(", "GREATEST(", "LEAST(", "POW(", "LOG10(", "LN(", "EXP(", "SQRT(", "SIN(", "COS(", "TAN(", "ASIN(", "ACOS(", "ATAN2(", "ATAN(", "FLOOR(", "CEIL(", "ROUND(", "TRUNCATE(", "ABS(", "UNIX_TIMESTAMP(", "TIMESTAMPDIFF("} {
 		if strings.HasPrefix(trimmed, fn) {
 			return true
 		}
@@ -5276,11 +5514,18 @@ func toStringSlice(v any) []string {
 
 func resolveVectorValue(row map[string]any, expr string) []float64 {
 	expr = strings.TrimSpace(expr)
-	if strings.HasPrefix(expr, "IF(") && strings.HasSuffix(expr, ")") {
+	if strings.HasPrefix(expr, "IF(") && strings.HasSuffix(expr, ")") && hasMatchingOuterParens(expr, 2) {
 		args := splitTopLevelArgs(expr[3 : len(expr)-1])
 		if len(args) == 3 {
-			expr = strings.TrimSpace(args[1])
+			if evalWhereExpr(row, strings.TrimSpace(args[0])) {
+				expr = strings.TrimSpace(args[1])
+			} else {
+				expr = strings.TrimSpace(args[2])
+			}
 		}
+	}
+	if strings.HasPrefix(expr, "CAST([") || (strings.HasPrefix(expr, "[") && strings.HasSuffix(expr, "]")) {
+		return parseVectorLiteral(expr)
 	}
 	val := resolveColumnValue(row, expr)
 	switch s := val.(type) {
@@ -5934,4 +6179,245 @@ func memEvalTimestampDiff(row map[string]any, unitExpr, startExpr, endExpr strin
 	default:
 		return nil
 	}
+}
+
+func memCoerceArrayOfFloat(v any) []float64 {
+	if v == nil {
+		return nil
+	}
+	switch s := v.(type) {
+	case []float64:
+		if len(s) == 0 {
+			return nil
+		}
+		return s
+	case []any:
+		out := make([]float64, 0, len(s))
+		for _, el := range s {
+			f, ok := toFloat(el)
+			if !ok || math.IsNaN(f) || math.IsInf(f, 0) {
+				return nil
+			}
+			out = append(out, f)
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	case []string:
+		out := make([]float64, 0, len(s))
+		for _, el := range s {
+			f, err := strconv.ParseFloat(strings.TrimSpace(el), 64)
+			if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+				return nil
+			}
+			out = append(out, f)
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	case string:
+		trimmed := strings.TrimSpace(s)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			if vec := parseVectorLiteral(trimmed); len(vec) > 0 {
+				return vec
+			}
+		}
+	}
+	return nil
+}
+
+func splitTopLevelFromAndWhere(fromAndWhere string) (fromClause, whereClause string) {
+	depth := 0
+	inSingleQuote := false
+	inBacktick := false
+	wherePos := -1
+	for i := 0; i <= len(fromAndWhere)-7; i++ {
+		ch := fromAndWhere[i]
+		if ch == '\\' && inSingleQuote && i+1 < len(fromAndWhere) {
+			i++
+			continue
+		}
+		if ch == '\'' && !inBacktick {
+			if inSingleQuote && i+1 < len(fromAndWhere) && fromAndWhere[i+1] == '\'' {
+				i++
+				continue
+			}
+			inSingleQuote = !inSingleQuote
+			continue
+		}
+		if ch == '`' && !inSingleQuote {
+			inBacktick = !inBacktick
+			continue
+		}
+		if inSingleQuote || inBacktick {
+			continue
+		}
+		switch ch {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 && fromAndWhere[i:i+7] == " WHERE " {
+				wherePos = i
+			}
+		}
+	}
+	if wherePos < 0 {
+		return strings.TrimSpace(fromAndWhere), ""
+	}
+	return strings.TrimSpace(fromAndWhere[:wherePos]), strings.TrimSpace(fromAndWhere[wherePos+7:])
+}
+
+func memFindMatchingParen(s string, openIdx int) int {
+	if openIdx < 0 || openIdx >= len(s) || s[openIdx] != '(' {
+		return -1
+	}
+	depth := 0
+	inSingleQuote := false
+	inBacktick := false
+	for i := openIdx; i < len(s); i++ {
+		ch := s[i]
+		if ch == '\\' && inSingleQuote && i+1 < len(s) {
+			i++
+			continue
+		}
+		if ch == '\'' && !inBacktick {
+			if inSingleQuote && i+1 < len(s) && s[i+1] == '\'' {
+				i++
+				continue
+			}
+			inSingleQuote = !inSingleQuote
+			continue
+		}
+		if ch == '`' && !inSingleQuote {
+			inBacktick = !inBacktick
+			continue
+		}
+		if inSingleQuote || inBacktick {
+			continue
+		}
+		switch ch {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func memEscapeSQLString(s string) string {
+	clean := strings.ReplaceAll(s, "\x00", "")
+	clean = strings.ReplaceAll(clean, `\`, `\\`)
+	clean = strings.ReplaceAll(clean, `'`, `''`)
+	return clean
+}
+
+// resolveKNNTopKSubqueries evaluates Doris 4.1.3 top-k kNN window subqueries:
+//
+//	`_id` IN (SELECT `_id` FROM (SELECT `_id`, ROW_NUMBER() OVER (ORDER BY <scoreExpr> DESC, `_id` ASC) AS `_rn` FROM `<db>`.`<tbl>` WHERE `__DORIS_DELETE_SIGN__` = 0 AND <preFilter>) `_knn_top` WHERE `_rn` <= <topLimit>)
+//
+// against the in-memory table `tbl`, rewriting each subquery into a deterministic `_id IN (...)` list (or `FALSE`).
+func resolveKNNTopKSubqueries(tbl map[string]map[string]any, sqlExpr string) string {
+	const prefix = "`_id` IN (SELECT `_id` FROM (SELECT `_id`, ROW_NUMBER() OVER (ORDER BY "
+	const overOffset = len("`_id` IN (SELECT `_id` FROM (SELECT `_id`, ROW_NUMBER() OVER ")
+	const innerSelectOffset = len("`_id` IN (SELECT `_id` FROM ")
+	const inParenOffset = len("`_id` IN ")
+	const orderSuffix = " DESC, `_id` ASC"
+	const deleteSignMarker = " WHERE `__DORIS_DELETE_SIGN__` = 0 AND "
+	const rnLimitMarker = " WHERE `_rn` <= "
+
+	for guard := 0; guard < 64; guard++ {
+		idx := strings.Index(sqlExpr, prefix)
+		if idx < 0 {
+			break
+		}
+		closeIn := memFindMatchingParen(sqlExpr, idx+inParenOffset)
+		closeInner := memFindMatchingParen(sqlExpr, idx+innerSelectOffset)
+		closeOver := memFindMatchingParen(sqlExpr, idx+overOffset)
+		if closeIn < 0 || closeInner < 0 || closeOver < 0 || closeOver >= closeInner || closeInner >= closeIn {
+			break
+		}
+		orderBody := sqlExpr[idx+len(prefix) : closeOver]
+		if !strings.HasSuffix(orderBody, orderSuffix) {
+			break
+		}
+		scoreExpr := strings.TrimSpace(orderBody[:len(orderBody)-len(orderSuffix)])
+
+		afterOver := sqlExpr[closeOver+1 : closeInner]
+		delIdx := strings.Index(afterOver, deleteSignMarker)
+		if delIdx < 0 {
+			break
+		}
+		preFilter := strings.TrimSpace(afterOver[delIdx+len(deleteSignMarker):])
+
+		tail := sqlExpr[closeInner+1 : closeIn]
+		rnIdx := strings.LastIndex(tail, rnLimitMarker)
+		if rnIdx < 0 {
+			break
+		}
+		topLimit, err := strconv.Atoi(strings.TrimSpace(tail[rnIdx+len(rnLimitMarker):]))
+		if err != nil || topLimit <= 0 {
+			sqlExpr = sqlExpr[:idx] + "FALSE" + sqlExpr[closeIn+1:]
+			continue
+		}
+
+		if strings.Contains(preFilter, prefix) {
+			preFilter = resolveKNNTopKSubqueries(tbl, preFilter)
+		}
+		if strings.Contains(scoreExpr, prefix) {
+			scoreExpr = resolveKNNTopKSubqueries(tbl, scoreExpr)
+		}
+
+		type knnCand struct {
+			id    string
+			score float64
+		}
+		var cands []knnCand
+		for _, row := range tbl {
+			if isTombstoneRow(row) {
+				continue
+			}
+			if !evalWhereExpr(row, preFilter) {
+				continue
+			}
+			sc := evalNumericExpr(row, scoreExpr)
+			if math.IsNaN(sc) || math.IsInf(sc, 0) {
+				sc = 0
+			}
+			cands = append(cands, knnCand{
+				id:    fmt.Sprintf("%v", row["_id"]),
+				score: sc,
+			})
+		}
+		sort.Slice(cands, func(i, j int) bool {
+			if cands[i].score != cands[j].score {
+				return cands[i].score > cands[j].score
+			}
+			return cands[i].id < cands[j].id
+		})
+		if len(cands) > topLimit {
+			cands = cands[:topLimit]
+		}
+		var replacement string
+		if len(cands) == 0 {
+			replacement = "FALSE"
+		} else {
+			quoted := make([]string, len(cands))
+			for i, c := range cands {
+				quoted[i] = "'" + memEscapeSQLString(c.id) + "'"
+			}
+			replacement = "`_id` IN (" + strings.Join(quoted, ", ") + ")"
+		}
+		sqlExpr = sqlExpr[:idx] + replacement + sqlExpr[closeIn+1:]
+	}
+	return sqlExpr
 }

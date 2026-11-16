@@ -3603,7 +3603,7 @@ func TestRound59_SchemaDDLShredderCompliance(t *testing.T) {
 	for _, badVec := range []string{
 		`{"properties":{"v":{"type":"dense_vector","index":false,"similarity":"cosine"}}}`,
 		`{"properties":{"v":{"type":"dense_vector","dims":8,"element_type":"bit","similarity":"cosine"}}}`,
-		`{"properties":{"v":{"type":"dense_vector","dims":4,"element_type":"byte","similarity":"dot_product"}}}`,
+		`{"properties":{"v":{"type":"dense_vector","dims":8,"element_type":"bit","similarity":"dot_product"}}}`,
 		`{"properties":{"v":{"type":"dense_vector","dims":10,"element_type":"bit"}}}`,
 		`{"properties":{"v":{"type":"dense_vector","dims":4,"element_type":"uint16"}}}`,
 	} {

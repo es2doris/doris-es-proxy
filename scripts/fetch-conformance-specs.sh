@@ -47,6 +47,17 @@ COMMON_ES_MODULE_TEST_PATHS=(
   "modules/reindex/src/yamlRestTest"
 )
 
+ES8_EXTRA_MODULE_TEST_PATHS=(
+  "modules/rest-root/src/yamlRestTest"
+  "modules/aggregations/src/yamlRestTest"
+  "modules/data-streams/src/yamlRestTest"
+  "modules/runtime-fields-common/src/yamlRestTest"
+  "modules/analysis-common/src/yamlRestTest"
+  "modules/mapper-extras/src/yamlRestTest"
+  "modules/parent-join/src/yamlRestTest"
+  "modules/lang-expression/src/yamlRestTest"
+)
+
 sparse_clone_or_reuse() {
   local name="$1"
   local repo_url="$2"
@@ -57,8 +68,20 @@ sparse_clone_or_reuse() {
   local target_dir="${CACHE_DIR}/${name}"
 
   if [[ -d "${target_dir}/.git" && -e "${target_dir}/${sentinel_rel}" ]]; then
-    echo "[fetch-conformance-specs] Reusing cached ${name} (${branch}) at ${target_dir}"
-    return 0
+    local existing_sparse=""
+    existing_sparse="$(git -C "${target_dir}" sparse-checkout list 2>/dev/null || true)"
+    local all_present=1
+    local sp=""
+    for sp in "${sparse_paths[@]}"; do
+      if ! printf '%s\n' "${existing_sparse}" | sed 's:/*$::' | grep -Fxq "${sp%/}"; then
+        all_present=0
+        break
+      fi
+    done
+    if [[ "${all_present}" -eq 1 ]]; then
+      echo "[fetch-conformance-specs] Reusing cached ${name} (${branch}) at ${target_dir}"
+      return 0
+    fi
   fi
 
   if [[ -d "${target_dir}" && ! -d "${target_dir}/.git" ]]; then
@@ -95,14 +118,15 @@ main() {
     "rest-api-spec/src/main/resources/rest-api-spec/test" \
     "${COMMON_ES_MODULE_TEST_PATHS[@]}"
 
-  # 2. Elasticsearch v8.15.5 YAML REST test corpus (fetched strictly out-of-tree into gitignored .cache/, 545 YAML files)
+  # 2. Elasticsearch v8.15.5 YAML REST test corpus (fetched strictly out-of-tree into gitignored .cache/)
   sparse_clone_or_reuse \
     "es-v8.15.5" \
     "${ES_REPO_URL}" \
     "v8.15.5" \
     "rest-api-spec/src/yamlRestTest/resources/rest-api-spec/test" \
     "rest-api-spec/src/yamlRestTest/resources/rest-api-spec/test" \
-    "${COMMON_ES_MODULE_TEST_PATHS[@]}"
+    "${COMMON_ES_MODULE_TEST_PATHS[@]}" \
+    "${ES8_EXTRA_MODULE_TEST_PATHS[@]}"
 
   # 3. Elasticsearch Specification 8.15 compiled schema.json + OpenAPI (Apache-2.0)
   sparse_clone_or_reuse \

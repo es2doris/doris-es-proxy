@@ -115,11 +115,23 @@ func formatSearchShardScriptFailureReasonRound60(err error) string {
 	if errors.Is(err, painless.ErrSelfReferencingIterable) {
 		return "all_shards_failed|illegal_argument_exception|Iterable object is self-referencing itself (ScriptBytesValues value)"
 	}
+	if strings.HasPrefix(msg, "illegal_argument_exception: script score function must") {
+		return "all_shards_failed|illegal_argument_exception|" + strings.TrimPrefix(msg, "illegal_argument_exception: ")
+	}
 	var compErr *painless.ScriptCompileError
 	if errors.As(err, &compErr) && compErr != nil {
 		return "all_shards_failed|script_exception|compile error"
 	}
 	return "all_shards_failed|script_exception|" + msg
+}
+
+func resolveDocES8ModeRound61(doc map[string]any) bool {
+	if doc != nil {
+		if b, ok := doc["__keep_boolean_dups"].(bool); ok {
+			return b
+		}
+	}
+	return true
 }
 
 func extractPainlessSourceIfApplicableRound60(raw any) (string, bool) {
@@ -254,13 +266,6 @@ func validateQueryScriptsCompileRound60(q *esast.Query) error {
 		}
 	}
 	if q.FunctionScore != nil {
-		if q.FunctionScore.ScriptScore != nil {
-			if src, ok := extractPainlessSourceIfApplicableRound60(q.FunctionScore.ScriptScore.Script); ok {
-				if err := painless.CompileValidate(src); err != nil {
-					return fmt.Errorf("%s", formatSearchShardScriptFailureReasonRound60(err))
-				}
-			}
-		}
 		for i := range q.FunctionScore.Functions {
 			fn := &q.FunctionScore.Functions[i]
 			if fn.ScriptScore != nil {
@@ -493,18 +498,17 @@ func validateSearchRequestScriptsRound60(req *esast.SearchRequest) error {
 	if err := validateQueryScriptsCompileRound60(req.PostFilter); err != nil {
 		return err
 	}
-	for _, sf := range req.ScriptFields {
-		if src, ok := extractPainlessSourceIfApplicableRound60(sf); ok {
-			if err := painless.CompileValidate(src); err != nil {
-				return fmt.Errorf("%s", formatSearchShardScriptFailureReasonRound60(err))
-			}
-		}
-	}
 	for _, rm := range req.RuntimeMappings {
 		if src, ok := extractPainlessSourceIfApplicableRound60(rm.Script); ok {
 			if err := painless.CompileValidate(src); err != nil {
 				return fmt.Errorf("%s", formatSearchShardScriptFailureReasonRound60(err))
 			}
+		}
+	}
+	if len(req.RuntimeMappings) > 0 {
+		if _, err := TopoSortRuntimeMappingsRound61(req.RuntimeMappings); err != nil {
+			clean := strings.TrimPrefix(err.Error(), "illegal_argument_exception: ")
+			return fmt.Errorf("all_shards_failed|illegal_argument_exception|%s", clean)
 		}
 	}
 	for _, s := range req.Sort {
@@ -563,7 +567,7 @@ func checkRuntimeQueryScriptsOnDocRound60(idxSchema *schema.IndexSchema, doc map
 	if q.Script != nil && q.Script.Script != nil {
 		if src, ok := extractPainlessSourceIfApplicableRound60(q.Script.Script); ok {
 			_, params := extractScriptSourceAndParams(q.Script.Script)
-			evalDoc := prepareDocForRuntimeScript(idxSchema, doc)
+			evalDoc := PrepareDocForRuntimeScriptRound61(idxSchema, doc, resolveDocES8ModeRound61(doc))
 			cp := make(map[string]any, len(params)+1)
 			for k, v := range params {
 				cp[k] = v
@@ -599,7 +603,7 @@ func checkRuntimeQueryScriptsOnDocRound60(idxSchema *schema.IndexSchema, doc map
 				if src == "" {
 					return true, nil
 				}
-				evalDoc := prepareDocForRuntimeScript(idxSchema, doc)
+				evalDoc := PrepareDocForRuntimeScriptRound61(idxSchema, doc, resolveDocES8ModeRound61(doc))
 				cp := make(map[string]any, len(params)+2)
 				for k, v := range params {
 					cp[k] = v
@@ -658,14 +662,26 @@ func checkRuntimeQueryScriptsOnDocRound60(idxSchema *schema.IndexSchema, doc map
 			}
 		}
 	}
-	if q.FunctionScore != nil && q.FunctionScore.Query != nil {
-		if err := checkRuntimeQueryScriptsOnDocRound60(idxSchema, doc, q.FunctionScore.Query, baseScore); err != nil {
-			return err
+	if q.FunctionScore != nil {
+		if q.FunctionScore.Query != nil {
+			if err := checkRuntimeQueryScriptsOnDocRound60(idxSchema, doc, q.FunctionScore.Query, baseScore); err != nil {
+				return err
+			}
+		}
+		for i := range q.FunctionScore.Functions {
+			fn := &q.FunctionScore.Functions[i]
+			if fn.Filter != nil {
+				if err := checkRuntimeQueryScriptsOnDocRound60(idxSchema, doc, fn.Filter, baseScore); err != nil {
+					return err
+				}
+			}
 		}
 	}
-	if q.ScriptScore != nil && q.ScriptScore.Query != nil {
-		if err := checkRuntimeQueryScriptsOnDocRound60(idxSchema, doc, q.ScriptScore.Query, baseScore); err != nil {
-			return err
+	if q.ScriptScore != nil {
+		if q.ScriptScore.Query != nil {
+			if err := checkRuntimeQueryScriptsOnDocRound60(idxSchema, doc, q.ScriptScore.Query, baseScore); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -678,7 +694,7 @@ func checkRuntimeAggScriptsOnDocRound60(idxSchema *schema.IndexSchema, doc map[s
 			return nil
 		}
 		_, params := extractScriptSourceAndParams(rawScript)
-		evalDoc := prepareDocForRuntimeScript(idxSchema, doc)
+		evalDoc := PrepareDocForRuntimeScriptRound61(idxSchema, doc, resolveDocES8ModeRound61(doc))
 		cp := make(map[string]any, len(params)+3)
 		for k, v := range params {
 			cp[k] = v
@@ -773,7 +789,7 @@ func checkRuntimeAggScriptsOnDocRound60(idxSchema *schema.IndexSchema, doc map[s
 			}
 			if src, ok := extractPainlessSourceIfApplicableRound60(sm.MapScript); ok {
 				_, p := extractScriptSourceAndParams(sm.MapScript)
-				evalDoc := prepareDocForRuntimeScript(idxSchema, doc)
+				evalDoc := PrepareDocForRuntimeScriptRound61(idxSchema, doc, resolveDocES8ModeRound61(doc))
 				val, err := painless.Eval(evalDoc, src, mkP(p))
 				if err != nil {
 					return fmt.Errorf("%s", formatSearchShardScriptFailureReasonRound60(err))
@@ -838,7 +854,8 @@ func validateRuntimeSearchScriptsOnHitsRound60(idxSchema *schema.IndexSchema, re
 	}
 	hasWork := queryHasRuntimeScript(req.Query) ||
 		queryHasRuntimeScript(req.PostFilter) ||
-		len(req.ScriptFields) > 0 ||
+		len(req.RuntimeMappings) > 0 ||
+		(idxSchema != nil && idxSchema.RawMapping != nil && len(idxSchema.RawMapping.Runtime) > 0) ||
 		aggsHaveRuntimeScript(req.EffectiveAggs())
 	if !hasWork {
 		for _, s := range req.Sort {
@@ -858,6 +875,14 @@ func validateRuntimeSearchScriptsOnHitsRound60(idxSchema *schema.IndexSchema, re
 			effSch = h.Schema
 		}
 		doc := decodeHitDocMapRound60(h)
+		isES8 := resolveDocES8ModeRound61(doc)
+		rtEvalDoc, _, rtErr := EvalRuntimeMappingsOnDocTopologicalRound61(effSch, req.RuntimeMappings, doc, isES8)
+		if rtErr != nil {
+			if strings.HasPrefix(rtErr.Error(), "illegal_argument_exception: ") {
+				return fmt.Errorf("all_shards_failed|illegal_argument_exception|%s", strings.TrimPrefix(rtErr.Error(), "illegal_argument_exception: "))
+			}
+			return fmt.Errorf("%s", formatSearchShardScriptFailureReasonRound60(rtErr))
+		}
 		if err := checkRuntimeQueryScriptsOnDocRound60(effSch, doc, req.Query, h.Score); err != nil {
 			return err
 		}
@@ -867,41 +892,14 @@ func validateRuntimeSearchScriptsOnHitsRound60(idxSchema *schema.IndexSchema, re
 		if err := checkRuntimeQueryScriptsOnDocRound60(effSch, doc, req.PostFilter, h.Score); err != nil {
 			return err
 		}
-		for _, sf := range req.ScriptFields {
-			ignoreFail := false
-			if sfMap, okM := sf.(map[string]any); okM {
-				if ig, okB := sfMap["ignore_failure"].(bool); okB && ig {
-					ignoreFail = true
-				}
-			}
-			if src, ok := extractPainlessSourceIfApplicableRound60(sf); ok {
-				_, params := extractScriptSourceAndParams(sf)
-				evalDoc := prepareDocForRuntimeScript(effSch, doc)
-				cp := make(map[string]any, len(params)+1)
-				for k, v := range params {
-					cp[k] = v
-				}
-				cp["_score"] = h.Score
-				val, err := painless.Eval(evalDoc, src, cp)
-				if err != nil {
-					if ignoreFail {
-						continue
-					}
-					return fmt.Errorf("%s", formatSearchShardScriptFailureReasonRound60(err))
-				}
-				if err := painless.ValidateAcyclicValue(val); err != nil {
-					if ignoreFail {
-						continue
-					}
-					return fmt.Errorf("%s", formatSearchShardScriptFailureReasonRound60(err))
-				}
-			}
-		}
 		for _, s := range req.Sort {
 			if s.Entry.Field == "_script" && s.Entry.Script != nil {
 				if src, ok := extractPainlessSourceIfApplicableRound60(s.Entry.Script); ok {
 					_, params := extractScriptSourceAndParams(s.Entry.Script)
-					evalDoc := prepareDocForRuntimeScript(effSch, doc)
+					evalDoc := rtEvalDoc
+					if evalDoc == nil {
+						evalDoc = PrepareDocForRuntimeScriptRound61(effSch, doc, isES8)
+					}
 					cp := make(map[string]any, len(params)+1)
 					for k, v := range params {
 						cp[k] = v
@@ -924,63 +922,6 @@ func validateRuntimeSearchScriptsOnHitsRound60(idxSchema *schema.IndexSchema, re
 		}
 	}
 	return nil
-}
-
-// evalIntervalsRuleFilterOnDocRound60 evaluates any `intervals` query rules that contain
-// `filter.script` predicates against `doc`.
-func evalIntervalsRuleFilterOnDocRound60(idxSchema *schema.IndexSchema, doc map[string]any, intervals map[string]esast.IntervalsRule) bool {
-	for fieldName, rule := range intervals {
-		rc := rule
-		if !transpiler.RuleHasIntervalsScript(&rc) {
-			continue
-		}
-		analyzer := "standard"
-		if idxSchema != nil {
-			b := idxSchema.ResolveField(fieldName)
-			if b.SearchAnalyzer != "" {
-				analyzer = b.SearchAnalyzer
-			} else if b.Analyzer != "" {
-				analyzer = b.Analyzer
-			}
-		}
-		clean := strings.TrimSuffix(strings.TrimSuffix(fieldName, ".keyword"), ".ngram")
-		rawVals := collectSchemaAwareScalarValues(doc, fieldName, strings.Split(clean, "."), idxSchema)
-		if len(rawVals) == 0 {
-			return false
-		}
-		fieldMatched := false
-		for _, rv := range rawVals {
-			txt := painless.FormatValueSafe(rv)
-			_, matched, err := transpiler.EvaluateIntervalsRule(&rc, txt, analyzer, func(sc *esast.ScriptSpec, span transpiler.IntervalsSpan) (bool, error) {
-				if sc == nil {
-					return true, nil
-				}
-				src, params := extractScriptSourceAndParams(sc)
-				if src == "" {
-					return true, nil
-				}
-				evalDoc := prepareDocForRuntimeScript(idxSchema, doc)
-				cp := make(map[string]any, len(params)+2)
-				for k, v := range params {
-					cp[k] = v
-				}
-				cp["interval"] = map[string]any{
-					"start": int64(span.Start),
-					"end":   int64(span.End),
-					"gaps":  int64(span.Gaps),
-				}
-				return painless.EvalFilter(evalDoc, src, cp)
-			})
-			if err == nil && matched {
-				fieldMatched = true
-				break
-			}
-		}
-		if !fieldMatched {
-			return false
-		}
-	}
-	return true
 }
 
 // evalMovingFnWindowNullableRound60 evaluates Elasticsearch `moving_fn` window scripts (`F25`),

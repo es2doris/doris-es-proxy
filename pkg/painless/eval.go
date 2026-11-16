@@ -2580,10 +2580,14 @@ type UpdateRequest struct {
 	MetaVersionMutated bool           `json:"-"`
 	MetaOp             string         `json:"-"`
 	AllowMetaMutation  bool           `json:"-"`
+	IsUBQ              bool           `json:"-"`
+	IsES8              bool           `json:"-"`
+	UpsertInsertMode   bool           `json:"-"`
 }
 
 type ScriptSpec struct {
-	Source string         `json:"source"`
+	Source string         `json:"source,omitempty"`
+	ID     string         `json:"id,omitempty"`
 	Lang   string         `json:"lang,omitempty"`
 	Params map[string]any `json:"params,omitempty"`
 }
@@ -2616,10 +2620,10 @@ var (
 	reLocalArrayRemoveIf   = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\.removeIf\(\s*\(?\s*(?:[a-zA-Z_$][a-zA-Z0-9_$<>[\]]*\s+)?([a-zA-Z0-9_$]+)\s*\)?\s*->\s*(.+)\s*\)$`)
 	reLocalCompoundAssign  = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*\??(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\s*(\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>>=|>>=)\s*(.+)$`)
 	reLocalPropAssign      = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*)\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)\s*=\s*(.+)$`)
-	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|GeoPoint|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
-	reNullVarDecl          = regexp.MustCompile(`^(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|GeoPoint|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
-	reVarTypeDeclPrefix    = regexp.MustCompile(`(?s)^((?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|GeoPoint|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*)\s+(.+)$`)
-	reUserFuncHeaderPrefix = regexp.MustCompile(`^(void|def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|GeoPoint|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics|[a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*<[^>]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
+	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?IsoFields|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|UpdateMetadata|GeoPoint|GeoBoundingBox|IPAddress|DenseVector|DenseVectorField|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
+	reNullVarDecl          = regexp.MustCompile(`^(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?IsoFields|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|UpdateMetadata|GeoPoint|GeoBoundingBox|IPAddress|DenseVector|DenseVectorField|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
+	reVarTypeDeclPrefix    = regexp.MustCompile(`(?s)^((?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?IsoFields|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|UpdateMetadata|GeoPoint|GeoBoundingBox|IPAddress|DenseVector|DenseVectorField|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*)\s+(.+)$`)
+	reUserFuncHeaderPrefix = regexp.MustCompile(`^(void|def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?IsoFields|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|UpdateMetadata|GeoPoint|GeoBoundingBox|IPAddress|DenseVector|DenseVectorField|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics|[a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*<[^>]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
 	reIdentAssign          = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
 	reIdentOnly            = regexp.MustCompile(`^[a-zA-Z_$][a-zA-Z0-9_$]*$`)
 	reSimpleFieldPath      = regexp.MustCompile(`^[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+$`)
@@ -2696,6 +2700,8 @@ func ApplyUpdateWithResult(rawSource json.RawMessage, req *UpdateRequest, docExi
 		}
 		if req.MetaVersion != 0 {
 			scriptParams["_ctx_version"] = req.MetaVersion
+		} else if req.IsUBQ && req.IsES8 && !req.MetaVersionMutated {
+			scriptParams["_ctx_version"] = int64(-1)
 		}
 		if req.MetaOp != "" {
 			scriptParams["_ctx_op"] = req.MetaOp
@@ -2703,6 +2709,15 @@ func ApplyUpdateWithResult(rawSource json.RawMessage, req *UpdateRequest, docExi
 			scriptParams["_ctx_op"] = "create"
 		} else {
 			scriptParams["_ctx_op"] = "index"
+		}
+		if req.IsUBQ {
+			scriptParams["__is_ubq"] = true
+		}
+		if req.IsES8 {
+			scriptParams["__is_es8"] = true
+		}
+		if req.UpsertInsertMode || (!docExisted && !req.AllowMetaMutation && (req.Upsert != nil || req.DocAsUpsert || req.ScriptedUpsert)) {
+			scriptParams["__upsert_insert_mode"] = true
 		}
 		if !req.AllowMetaMutation {
 			scriptParams["__readonly_ctx_meta"] = true
@@ -2737,7 +2752,22 @@ func ApplyUpdateWithResult(rawSource json.RawMessage, req *UpdateRequest, docExi
 					req.MetaIndex = s
 				}
 			}
-			if v, exists := scriptParams["_ctx_version"]; exists {
+			if mut, ok := scriptParams["_ctx_version_mutated"].(bool); ok && mut {
+				req.MetaVersionMutated = true
+				if v, exists := scriptParams["_ctx_version"]; exists {
+					if v == nil {
+						req.MetaVersion = 0
+						req.MetaVersionNil = true
+					} else if vf, ok := toFloat64(v); ok {
+						verInt := int64(vf)
+						if err := ValidateCtxVersion(verInt, true, req.IsUBQ, req.IsES8); err != nil {
+							return nil, "", err
+						}
+						req.MetaVersion = verInt
+						req.MetaVersionNil = false
+					}
+				}
+			} else if v, exists := scriptParams["_ctx_version"]; exists && (!req.IsUBQ || !req.IsES8) {
 				if v == nil {
 					req.MetaVersion = 0
 					req.MetaVersionNil = true
@@ -2746,23 +2776,42 @@ func ApplyUpdateWithResult(rawSource json.RawMessage, req *UpdateRequest, docExi
 					req.MetaVersionNil = false
 				}
 			}
-			if mut, ok := scriptParams["_ctx_version_mutated"].(bool); ok && mut {
-				req.MetaVersionMutated = true
+		} else if mut, ok := scriptParams["_ctx_version_mutated"].(bool); ok && mut {
+			if v, exists := scriptParams["_ctx_version"]; exists && v != nil {
+				if vf, ok := toFloat64(v); ok {
+					if err := ValidateCtxVersion(int64(vf), true, req.IsUBQ, req.IsES8); err != nil {
+						return nil, "", err
+					}
+				}
 			}
 		}
-		switch strings.ToLower(ctxOp) {
-		case "", "index", "update":
-		case "noop", "none":
-			return rawSource, "noop", nil
-		case "delete", "drop":
-			opResult = "deleted"
-		case "create":
-			if disallowCreate, _ := scriptParams["__disallow_update_create_op"].(bool); disallowCreate && docExisted && !req.AllowMetaMutation {
-				return nil, "", fmt.Errorf("illegal_argument_exception: Operation [create] is not supported, only [index, delete, noop, none] are allowed")
+		if req.IsUBQ {
+			normOp := strings.ToLower(strings.TrimSpace(ctxOp))
+			if err := ValidateUBQCtxOp(normOp, req.IsES8); err != nil {
+				return nil, "", err
 			}
-			opResult = "created"
-		default:
-			return nil, "", fmt.Errorf("illegal_argument_exception: Operation [%s] is not supported, only [index, create, update, delete, noop, none] are allowed", ctxOp)
+			switch normOp {
+			case "", "index":
+			case "noop":
+				return rawSource, "noop", nil
+			case "delete":
+				opResult = "deleted"
+			}
+		} else {
+			switch strings.ToLower(ctxOp) {
+			case "", "index", "update":
+			case "noop", "none":
+				return rawSource, "noop", nil
+			case "delete", "drop":
+				opResult = "deleted"
+			case "create":
+				if disallowCreate, _ := scriptParams["__disallow_update_create_op"].(bool); disallowCreate && docExisted && !req.AllowMetaMutation {
+					return nil, "", fmt.Errorf("illegal_argument_exception: Operation [create] is not supported, only [index, delete, noop, none] are allowed")
+				}
+				opResult = "created"
+			default:
+				return nil, "", fmt.Errorf("illegal_argument_exception: Operation [%s] is not supported, only [index, create, update, delete, noop, none] are allowed", ctxOp)
+			}
 		}
 	}
 
@@ -2847,6 +2896,8 @@ type evalBudget struct {
 	setSlices         map[uintptr]bool
 	arrayTypes        map[uintptr]string
 	pinnedRefs        []any
+	pinnedElements    int
+	stickyErr         error
 	metadataMap       map[string]any
 	emitContext       string
 }
@@ -3035,6 +3086,9 @@ func parseUserFuncDecl(stmt string) (*painlessUserFunc, bool) {
 }
 
 func (b *evalBudget) step() error {
+	if b.stickyErr != nil {
+		return b.stickyErr
+	}
 	b.steps++
 	if b.steps > MaxPainlessSteps {
 		return fmt.Errorf("painless script exceeded maximum step budget (%d)", MaxPainlessSteps)
@@ -3121,6 +3175,9 @@ func Eval(sourceMap map[string]any, scriptSource string, params map[string]any) 
 	if metaErr := syncMetadataMapToParamsRound60(budget, evalParams, params); metaErr != nil && err == nil {
 		err = metaErr
 	}
+	if err == nil && budget.stickyErr != nil {
+		err = budget.stickyErr
+	}
 	if params != nil {
 		for _, metaKey := range []string{"_ctx_id", "_ctx_index", "_ctx_routing", "_ctx_version", "_ctx_version_type", "_ctx_op"} {
 			if v, exists := evalParams[metaKey]; exists {
@@ -3128,8 +3185,16 @@ func Eval(sourceMap map[string]any, scriptSource string, params map[string]any) 
 			}
 		}
 	}
+	if (err == nil || errors.Is(err, errPainlessReturn)) && budget.stickyErr != nil {
+		err = budget.stickyErr
+	}
 	if err != nil && !errors.Is(err, errPainlessReturn) {
 		return nil, err
+	}
+	if sourceMap != nil && isUpdateOrUBQCtxGuardActiveRound61(evalParams) {
+		if acErr := ValidateAcyclicValue(sourceMap); acErr != nil {
+			return nil, acErr
+		}
 	}
 	if len(budget.emittedVals) > 0 {
 		if params != nil {
@@ -3324,6 +3389,9 @@ func EvalPainlessWithOp(sourceMap map[string]any, scriptSource string, params ma
 	if metaErr := syncMetadataMapToParamsRound60(budget, evalParams, params); metaErr != nil && err == nil {
 		err = metaErr
 	}
+	if err == nil && budget.stickyErr != nil {
+		err = budget.stickyErr
+	}
 	if budget.hasCtxOp {
 		ctxOp = budget.ctxOp
 	}
@@ -3338,6 +3406,9 @@ func EvalPainlessWithOp(sourceMap map[string]any, scriptSource string, params ma
 		} else if curV, hasCur := evalParams["_ctx_version"]; hasCur && (!hadOrigVer || !reflect.DeepEqual(curV, origVer)) {
 			params["_ctx_version_mutated"] = true
 		}
+	}
+	if err == nil && sourceMap != nil {
+		err = ValidateAcyclicValue(sourceMap)
 	}
 	return ctxOp, err
 }
@@ -4072,7 +4143,8 @@ func isUnrecoverableSandboxError(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "exceeded maximum step budget") ||
 		strings.Contains(msg, "exceeded maximum recursion depth") ||
-		strings.Contains(msg, "exceeded maximum size")
+		strings.Contains(msg, "exceeded maximum size") ||
+		strings.Contains(msg, "exceeded maximum pinned container")
 }
 
 func execTryStatement(sourceMap map[string]any, stmt string, params map[string]any, ctxOp *string, budget *evalBudget) error {
@@ -4327,8 +4399,23 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 	}
 	slice, ok := iterVal.([]any)
 	if !ok {
+		if _, isDVF := iterVal.(*DenseVectorFieldVal); isDVF {
+			return &painlessExceptionError{
+				exType:  "UnsupportedOperationException",
+				message: "Cannot iterate over single valued dense_vector field",
+			}
+		}
 		if fv, isFV := iterVal.(*FieldVal); isFV && fv != nil {
 			slice = fv.Values
+		} else if dv, isDV := iterVal.(*DenseVectorVal); isDV && dv != nil {
+			slice = make([]any, len(dv.Floats))
+			for i, f := range dv.Floats {
+				if dv.ElemType == "byte" || dv.ElemType == "bit" {
+					slice[i] = int64(dv.Bytes[i])
+				} else {
+					slice[i] = f
+				}
+			}
 		} else if fSlice, isFS := iterVal.([]float64); isFS {
 			slice = make([]any, len(fSlice))
 			for i, f := range fSlice {
@@ -4936,8 +5023,31 @@ func expandDynamicBrackets(s string, sourceMap map[string]any, params map[string
 	return res
 }
 
+func isUpdateOrUBQCtxGuardActiveRound61(params map[string]any) bool {
+	if params == nil {
+		return false
+	}
+	if b, _ := params["__is_update_doc"].(bool); b {
+		return true
+	}
+	if b, _ := params["__is_ubq"].(bool); b {
+		return true
+	}
+	return false
+}
+
 func mutateCtxDirectMapKey(keyStr string, val any, isRemove, ifAbsentOnly bool, sourceMap, params map[string]any) (any, error) {
 	budget := getOrInitEvalBudget(params)
+	if isUpdateOrUBQCtxGuardActiveRound61(params) {
+		isUBQ, _ := params["__is_ubq"].(bool)
+		isES8, _ := params["__is_es8"].(bool)
+		if !AllowedUpdateCtxKeys(keyStr) {
+			return nil, FormatUnknownCtxKeyError(keyStr, val, isUBQ, isES8)
+		}
+		if keyStr == "_id" {
+			return nil, FormatModifyCtxIDError(isUBQ, isES8)
+		}
+	}
 	switch keyStr {
 	case "_id", "_index", "_routing", "_version":
 		metaKey, err := checkCtxMetaLHS([]string{"ctx", keyStr}, sourceMap, params)
@@ -4947,6 +5057,9 @@ func mutateCtxDirectMapKey(keyStr string, val any, isRemove, ifAbsentOnly bool, 
 		prev := params[metaKey]
 		if isRemove {
 			params[metaKey] = nil
+			if keyStr == "_version" && params != nil {
+				params["_ctx_version_mutated"] = true
+			}
 			latchCtxMetaOnBudget(budget, []string{metaKey}, nil)
 			return prev, nil
 		}
@@ -4954,6 +5067,9 @@ func mutateCtxDirectMapKey(keyStr string, val any, isRemove, ifAbsentOnly bool, 
 			return prev, nil
 		}
 		params[metaKey] = val
+		if keyStr == "_version" && params != nil {
+			params["_ctx_version_mutated"] = true
+		}
 		latchCtxMetaOnBudget(budget, []string{metaKey}, val)
 		return prev, nil
 	case "op":
@@ -5018,14 +5134,30 @@ func checkCtxMetaLHS(rawPath []string, sourceMap, params map[string]any) (string
 	if len(rawPath) == 2 && decodeBracketSeg(rawPath[0]) == "ctx" {
 		metaField := decodeBracketSeg(rawPath[1])
 		if metaField == "_id" || metaField == "_index" || metaField == "_routing" || metaField == "_version" {
+			isUBQ, _ := params["__is_ubq"].(bool)
+			isES8, _ := params["__is_es8"].(bool)
+			if metaField == "_id" && isUpdateOrUBQCtxGuardActiveRound61(params) {
+				return "", FormatModifyCtxIDError(isUBQ, isES8)
+			}
+			if metaField == "_routing" {
+				if upsertMode, _ := params["__upsert_insert_mode"].(bool); upsertMode {
+					return "", &painlessExceptionError{
+						exType:  "IllegalArgumentException",
+						message: "Cannot modify _routing in update script when inserting upsert document",
+					}
+				}
+			}
 			if readonly, ok := params["__readonly_ctx_meta"].(bool); ok && readonly && metaField != "_routing" {
 				if metaField == "_id" {
-					return "", fmt.Errorf("illegal_argument_exception: Cannot modify _id in update script")
+					return "", FormatModifyCtxIDError(isUBQ, isES8)
 				}
 				return "", fmt.Errorf("illegal_argument_exception: cannot modify read-only metadata field [ctx.%s]", metaField)
 			}
 			metaKey := "_ctx" + metaField
 			if params != nil {
+				if metaField == "_version" {
+					params["_ctx_version_mutated"] = true
+				}
 				if _, exists := params[metaKey]; !exists && sourceMap != nil {
 					if v, ok := sourceMap[metaField]; ok {
 						params[metaKey] = v
@@ -6508,8 +6640,10 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 				targetPath := propPath
 				if firstSeg == "_source" {
 					targetPath = propPath[1:]
-				} else if isUpdateDoc, _ := params["__is_update_doc"].(bool); isUpdateDoc {
-					return fmt.Errorf("illegal_argument_exception: Operation [ctx.%s] is not supported", firstSeg)
+				} else if isUpdateOrUBQCtxGuardActiveRound61(params) {
+					isUBQ, _ := params["__is_ubq"].(bool)
+					isES8, _ := params["__is_es8"].(bool)
+					return FormatUnknownCtxKeyError(firstSeg, val, isUBQ, isES8)
 				}
 				if sourceMap != nil && len(targetPath) > 0 {
 					if err := checkMutableParentAtPathPainless(budget, sourceMap, targetPath); err != nil {
@@ -6577,6 +6711,13 @@ func execSimpleStmt(sourceMap map[string]any, stmt string, params map[string]any
 				return err
 			}
 			if callVal != nil {
+				if um, isUM := callVal.(*UpdateMetadataVal); isUM && um != nil {
+					if err := um.setField(tailPath, rhsVal); err != nil {
+						return err
+					}
+					params["_last_expr_val"] = rhsVal
+					return nil
+				}
 				wrapRoot := map[string]any{"_v": callVal}
 				wrapPath := append([]string{"_v"}, strings.Split(tailPath, ".")...)
 				if err := checkMutableParentAtPathPainless(budget, wrapRoot, wrapPath); err != nil {
@@ -7186,6 +7327,28 @@ func compareOrderedValues(a, b any, op string) bool {
 	if a == nil || b == nil {
 		return false
 	}
+	if ipa, ok := a.(*IPAddressVal); ok && ipa != nil {
+		var ipb *IPAddressVal
+		switch tb := b.(type) {
+		case *IPAddressVal:
+			ipb = tb
+		case string:
+			ipb, _ = ParseIPAddressVal(tb)
+		}
+		if ipb != nil {
+			cmp := ipa.CompareTo(ipb)
+			switch op {
+			case ">=":
+				return cmp >= 0
+			case "<=":
+				return cmp <= 0
+			case ">":
+				return cmp > 0
+			case "<":
+				return cmp < 0
+			}
+		}
+	}
 	fa, oka := toFloat64WithRawPainless(a)
 	fb, okb := toFloat64WithRawPainless(b)
 	if oka && okb {
@@ -7685,8 +7848,11 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		".firstKey()", ".lastKey()", ".firstEntry()", ".lastEntry()", ".pollFirstEntry()", ".pollLastEntry()", ".descendingKeySet()", ".navigableKeySet()", ".descendingMap()",
 		".first()", ".last()", ".getFirst()", ".getLast()", ".peekFirst()", ".peekLast()", ".peek()", ".element()", ".pollFirst()", ".pollLast()", ".poll()", ".removeFirst()", ".removeLast()", ".pop()", ".descendingSet()",
 		".utf8ToString()", ".limit()", ".position()", ".remaining()", ".hasRemaining()",
-		".getLat()", ".getLon()", ".getCentroid()",
-		".exists()", ".remove()", ".deduplicate()", ".asDate()", ".asGeoPoint()", ".asString()", ".asStrings()", ".doc()", ".docs()",
+		".getLat()", ".getLon()", ".getCentroid()", ".getBoundingBox()", ".getLabelPosition()", ".getDimensionalType()", ".getMercatorWidth()", ".getMercatorHeight()", ".topLeft()", ".bottomRight()",
+		".getCenturyOfEra()", ".getEra()", ".getMillisOfDay()", ".getMillisOfSecond()", ".getMinuteOfDay()", ".getSecondOfDay()", ".getWeekOfWeekyear()", ".getWeekyear()", ".getYearOfCentury()", ".getYearOfEra()",
+		".l1Norm()", ".l2Norm()", ".l1norm()", ".l2norm()", ".getDims()", ".dims()", ".vectorValue()", ".getMagnitude()", ".magnitude()",
+		".isIPv4()", ".isIPv6()", ".getHostAddress()", ".toCanonicalString()", ".getAddress()", ".isLoopbackAddress()", ".isMulticastAddress()", ".isSiteLocalAddress()", ".isLinkLocalAddress()",
+		".exists()", ".remove()", ".deduplicate()", ".asDate()", ".asGeoPoint()", ".asDouble()", ".asString()", ".asStrings()", ".doc()", ".docs()", ".iterator()",
 		".getAsBoolean()", ".run()",
 	} {
 		if strings.HasSuffix(rhs, mSuffix) {
@@ -7701,6 +7867,20 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					return nil, dvErr
 				}
 				return int64(len(dv)), nil
+			}
+			if (mSuffix == ".getCentroid()" || mSuffix == ".getBoundingBox()" || mSuffix == ".getLabelPosition()" ||
+				mSuffix == ".getDimensionalType()" || mSuffix == ".getMercatorWidth()" || mSuffix == ".getMercatorHeight()") &&
+				(strings.HasPrefix(recExpr, "doc.") || strings.HasPrefix(recExpr, "doc?.")) &&
+				!strings.HasSuffix(recExpr, ".value") && !strings.Contains(recExpr, ".values.") {
+				docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(recExpr, "doc?."), "doc."), ".values")
+				dv, dvErr := resolveDocValuesSliceWithParamsRound60(sourceMap, params, docPath)
+				if dvErr != nil {
+					return nil, dvErr
+				}
+				mBareGeo := strings.TrimSuffix(strings.TrimPrefix(mSuffix, "."), "()")
+				if res, handled, gErr := evalDocFieldSliceGeoMethodRound61(dv, mBareGeo); handled {
+					return res, gErr
+				}
 			}
 			if isKnownStaticClassIdentifierRound58(recExpr, params) {
 				continue
@@ -8581,7 +8761,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 							}
 						}
 					}
-					fullRe, err := regexp.Compile("^(?:" + pm.re.String() + ")$")
+					fullRe, err := compileBoundedWrappedRegexRound61("^(?:", pm.re.String(), ")$")
 					if err != nil {
 						return false, nil
 					}
@@ -8626,7 +8806,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 							return false, nil
 						}
 					}
-					prefixRe, err := regexp.Compile("^(?:" + pm.re.String() + ")")
+					prefixRe, err := compileBoundedWrappedRegexRound61("^(?:", pm.re.String(), ")")
 					if err != nil {
 						return false, nil
 					}
@@ -8776,6 +8956,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			return len(tv) == 0, nil
 		case *FieldVal:
 			return tv == nil || tv.IsEmpty(), nil
+		case *DenseVectorFieldVal:
+			return tv.IsEmpty(), nil
+		case *DenseVectorVal:
+			return tv == nil || len(tv.Floats) == 0, nil
 		case *BytesRefVal:
 			return tv == nil || tv.Length == 0, nil
 		case *ByteBufferVal:
@@ -11436,7 +11620,23 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				if strings.TrimSpace(argExpr) == "" {
 					return recVal, nil
 				}
+				if isoStr, isIso := argVal.(string); isIso && strings.HasPrefix(isoStr, "IsoFields.") {
+					if zdt, isZ := recVal.(*ZonedDateTimeVal); isZ && zdt != nil {
+						if iv, ok := evalChronoOrIsoFieldOnTimeRound61(zdt.Time, isoStr); ok {
+							return iv, nil
+						}
+					} else if tm, ok := parsePainlessDateTime(recVal); ok {
+						if iv, ok := evalChronoOrIsoFieldOnTimeRound61(tm, isoStr); ok {
+							return iv, nil
+						}
+					}
+				}
 				if cf, ok := parseChronoFieldArgPainless(argVal); ok {
+					if zdt, isZ := recVal.(*ZonedDateTimeVal); isZ && zdt != nil {
+						if iv, ok := evalChronoOrIsoFieldOnTimeRound61(zdt.Time, string(cf)); ok {
+							return iv, nil
+						}
+					}
 					val, err := evalGetChronoFieldPainless(recVal, cf)
 					if err != nil {
 						return nil, err
@@ -12341,7 +12541,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		}
 		return resolveParamPath(sourceMap, path), nil
 	}
-	for _, wProp := range []string{".lat", ".lon", ".bytes", ".offset", ".value", ".values"} {
+	for _, wProp := range []string{".lat", ".lon", ".top_left", ".bottom_right", ".topLeft", ".bottomRight", ".bytes", ".offset", ".value", ".values"} {
 		if strings.HasSuffix(rhs, wProp) && ((wProp != ".value" && wProp != ".values") || (!strings.HasPrefix(rhs, "doc.") && !strings.HasPrefix(rhs, "doc?."))) {
 			recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:len(rhs)-len(wProp)], "?"))
 			if recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1); err == nil && recVal != nil {
@@ -12836,6 +13036,18 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 	if strings.HasPrefix(constRhs, "ChronoField.") {
 		return painlessChronoField(strings.TrimPrefix(constRhs, "ChronoField.")), nil
 	}
+	if strings.HasPrefix(constRhs, "IsoFields.") {
+		return constRhs, nil
+	}
+	if strings.HasPrefix(constRhs, "java.time.temporal.IsoFields.") {
+		return "IsoFields." + strings.TrimPrefix(constRhs, "java.time.temporal.IsoFields."), nil
+	}
+	if strings.HasPrefix(constRhs, "TextStyle.") {
+		return strings.TrimPrefix(constRhs, "TextStyle."), nil
+	}
+	if strings.HasPrefix(constRhs, "Locale.") {
+		return strings.TrimPrefix(constRhs, "Locale."), nil
+	}
 	if strings.HasPrefix(rhs, "[") && strings.HasSuffix(rhs, "]") && findMatchingDelimiter(rhs, 0, '[', ']') == len(rhs)-1 {
 		inner := strings.TrimSpace(rhs[1 : len(rhs)-1])
 		if inner == ":" {
@@ -12925,6 +13137,18 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			}
 		}
 		return parsed, nil
+	}
+	if rhs == "ctx" && (params == nil || params["ctx"] == nil) && sourceMap != nil {
+		if isUpdateOrUBQCtxGuardActiveRound61(params) {
+			return map[string]any{"_source": sourceMap}, nil
+		}
+		return sourceMap, nil
+	}
+	if rhs == "_source" && (params == nil || params["_source"] == nil) && sourceMap != nil {
+		if rawSrc, ok := rawSourceFromSourceMapPainless(sourceMap); ok {
+			return rawSrc, nil
+		}
+		return sourceMap, nil
 	}
 	if reIdentOnly.MatchString(rhs) && params != nil && rhs != "params" && rhs != "ctx" && rhs != "doc" && rhs != "_source" {
 		if oos, ok := params["__out_of_scope_vars"].(map[string]bool); ok && oos[rhs] {
@@ -13647,6 +13871,9 @@ func allocMultiDimArrayPainless(dims []int, hasTrailingEmptyDim bool, clsName st
 	}
 	if n > MaxPainlessSliceItems {
 		return nil, fmt.Errorf("painless array size %d exceeds maximum (%d)", n, MaxPainlessSliceItems)
+	}
+	if err := recordAllocatedElementsRound61(budget, n); err != nil {
+		return nil, err
 	}
 	var out []any
 	if n == 0 {
@@ -14391,6 +14618,9 @@ func resolveDocValuesSlice(sourceMap map[string]any, fieldPath string) []any {
 	}
 	if val == nil && fieldPath == "_version" {
 		val = sourceMap["__meta_version"]
+	}
+	if val == nil && fieldPath == "_seq_no" {
+		val = sourceMap["__meta_seq_no"]
 	}
 	if val == nil {
 		return []any{}
@@ -21599,7 +21829,13 @@ func normalizeJavaNamedGroupsPainless(pat string) string {
 }
 
 func compilePainlessRegexp(pat string) (*regexp.Regexp, error) {
-	return regexp.Compile(normalizeJavaNamedGroupsPainless(pat))
+	if len(pat) > MaxRegexPatternLen {
+		return nil, &painlessExceptionError{
+			exType:  "IllegalArgumentException",
+			message: fmt.Sprintf("regex pattern length [%d] exceeds maximum allowed length [%d]", len(pat), MaxRegexPatternLen),
+		}
+	}
+	return CompileBoundedRegex(normalizeJavaNamedGroupsPainless(pat))
 }
 
 func inspectStartAnchorPainless(pat string) (anchorType byte, multiline bool) {

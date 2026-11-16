@@ -1213,8 +1213,8 @@ func TestRound59_SchemaShredderTranspilerEndToEndHTTP(t *testing.T) {
 	if c, _, resp, _ := doRound59Req(t, h, http.MethodPut, "/r59_f11_nosrc/_doc/1?refresh=true", `{"tag":"alpha","cnt":7}`, nil); c != http.StatusCreated {
 		t.Fatalf("F11 index doc failed: %d (%v)", c, resp)
 	}
-	if c, _, resp, _ := doRound59Req(t, h, http.MethodGet, "/r59_f11_nosrc/_source/1", "", nil); c != http.StatusBadRequest {
-		t.Fatalf("F11 expected 400 on GET _source when disabled, got %d (%v)", c, resp)
+	if c, _, resp, _ := doRound59Req(t, h, http.MethodGet, "/r59_f11_nosrc/_source/1", "", nil); c != http.StatusNotFound {
+		t.Fatalf("F11 expected 404 on GET _source when disabled, got %d (%v)", c, resp)
 	}
 	if c, _, resp, _ := doRound59Req(t, h, http.MethodPost, "/r59_f11_nosrc/_update/1", `{"doc":{"cnt":8}}`, nil); c != http.StatusBadRequest {
 		t.Fatalf("F11 expected 400 on _update when _source disabled, got %d (%v)", c, resp)

@@ -247,13 +247,60 @@ func cloneSnapshotWithoutInternal(snapObj map[string]any) map[string]any {
 		return nil
 	}
 	cp := deepCloneDocMap(snapObj)
-	delete(cp, "__schemas")
-	delete(cp, "__docs")
-	delete(cp, "__settings")
-	delete(cp, "__aliases")
-	delete(cp, "__pipelines")
-	delete(cp, "__component_templates")
-	delete(cp, "__scripts")
+	for k := range cp {
+		if strings.HasPrefix(k, "__") {
+			delete(cp, k)
+		}
+	}
+	return cp
+}
+
+func formatSnapshotResponseItemRound61(rawSnap map[string]any, repoName string, verbose, includeIndexNames, includeRepo, includeIndexDetails bool) map[string]any {
+	cp := cloneSnapshotWithoutInternal(rawSnap)
+	if cp == nil {
+		return nil
+	}
+	if includeRepo {
+		cp["repository"] = repoName
+	} else {
+		delete(cp, "repository")
+	}
+	if !verbose {
+		minSnap := map[string]any{
+			"snapshot": cp["snapshot"],
+			"uuid":     cp["uuid"],
+		}
+		if includeRepo {
+			minSnap["repository"] = repoName
+		}
+		if st, ok := cp["state"]; ok {
+			minSnap["state"] = st
+		}
+		return minSnap
+	}
+	if includeIndexDetails {
+		details := make(map[string]any)
+		switch iv := cp["indices"].(type) {
+		case []string:
+			for _, idx := range iv {
+				details[idx] = map[string]any{
+					"shards": []any{map[string]any{"stage": "DONE", "stats": map[string]any{"number_of_files": 1, "processed_files": 1, "total_size_in_bytes": 0, "processed_size_in_bytes": 0}}},
+				}
+			}
+		case []any:
+			for _, item := range iv {
+				if idx, okS := item.(string); okS && idx != "" {
+					details[idx] = map[string]any{
+						"shards": []any{map[string]any{"stage": "DONE", "stats": map[string]any{"number_of_files": 1, "processed_files": 1, "total_size_in_bytes": 0, "processed_size_in_bytes": 0}}},
+					}
+				}
+			}
+		}
+		cp["index_details"] = details
+	}
+	if !includeIndexNames {
+		delete(cp, "indices")
+	}
 	return cp
 }
 
@@ -261,11 +308,12 @@ func cloneSnapshotWithoutInternal(snapObj map[string]any) map[string]any {
 func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 	repo := strings.TrimSpace(r.PathValue("repository"))
 	if repo == "_status" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
-		writeJSON(w, http.StatusOK, map[string]any{"snapshots": []any{}})
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"snapshots": []any{}})
 		return
 	}
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
+		ignoreUnavailable := isTruthyBoolQueryParam(r, "ignore_unavailable")
 		s.mu.RLock()
 		if repo == "" || repo == "_all" || repo == "*" {
 			out := make(map[string]any, len(s.snapshotRepos))
@@ -274,14 +322,14 @@ func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 			}
 			s.mu.RUnlock()
 			if r.Method == http.MethodHead {
-				if len(out) == 0 {
+				if len(out) == 0 && repo != "" {
 					w.WriteHeader(http.StatusNotFound)
 				} else {
 					w.WriteHeader(http.StatusOK)
 				}
 				return
 			}
-			writeJSON(w, http.StatusOK, out)
+			writeJSONWithRequest(w, r, http.StatusOK, out)
 			return
 		}
 		out := make(map[string]any)
@@ -290,15 +338,15 @@ func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 			if pat == "" {
 				continue
 			}
-			if strings.ContainsAny(pat, "*?") {
+			if strings.ContainsAny(pat, "*?") || strings.HasPrefix(pat, "-") {
 				for k, v := range s.snapshotRepos {
-					if matchWildcardPattern(pat, k) {
+					if matchMultiWildcardWithExclusions(repo, k) {
 						out[k] = deepCloneDocMap(v)
 					}
 				}
 			} else if v, exists := s.snapshotRepos[pat]; exists {
 				out[pat] = deepCloneDocMap(v)
-			} else {
+			} else if !ignoreUnavailable {
 				s.mu.RUnlock()
 				if r.Method == http.MethodHead {
 					w.WriteHeader(http.StatusNotFound)
@@ -317,7 +365,7 @@ func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		writeJSON(w, http.StatusOK, out)
+		writeJSONWithRequest(w, r, http.StatusOK, out)
 	case http.MethodPut, http.MethodPost:
 		if repo == "" {
 			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: repository is missing;")
@@ -361,7 +409,7 @@ func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 			s.snapshots[repo] = make(map[string]map[string]any)
 		}
 		s.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"acknowledged": true})
 	case http.MethodDelete:
 		s.mu.Lock()
 		if _, exists := s.snapshotRepos[repo]; !exists {
@@ -372,7 +420,7 @@ func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 		delete(s.snapshotRepos, repo)
 		delete(s.snapshots, repo)
 		s.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"acknowledged": true})
 	default:
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
 	}
@@ -399,9 +447,10 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 			writeESError(w, http.StatusNotFound, "repository_missing_exception", fmt.Sprintf("[%s] missing", repo))
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 			"results": map[string]any{
 				"deleted_bytes": 0,
+				"deleted_blobs": 0,
 				"deleted_keys":  0,
 			},
 		})
@@ -409,6 +458,7 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 	}
 
 	if snap == "_status" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		ignoreUnavailable := isTruthyBoolQueryParam(r, "ignore_unavailable")
 		s.mu.RLock()
 		var targetRepos []string
 		if repo == "_all" || repo == "*" {
@@ -423,7 +473,7 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 					continue
 				}
 				if !strings.ContainsAny(pat, "*?") && !strings.HasPrefix(pat, "-") && pat != "_all" {
-					if _, exists := s.snapshotRepos[pat]; !exists {
+					if _, exists := s.snapshotRepos[pat]; !exists && !ignoreUnavailable {
 						s.mu.RUnlock()
 						writeESError(w, http.StatusNotFound, "repository_missing_exception", fmt.Sprintf("[%s] missing", pat))
 						return
@@ -459,12 +509,152 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 						"failed":       0,
 						"total":        1,
 					},
+					"stats": map[string]any{
+						"incremental":          map[string]any{"file_count": 1, "size_in_bytes": 128},
+						"total":                map[string]any{"file_count": 1, "size_in_bytes": 128},
+						"start_time_in_millis": int64(1767225600000),
+						"time_in_millis":       int64(10),
+					},
 				})
 			}
 		}
 		s.mu.RUnlock()
-		writeJSON(w, http.StatusOK, map[string]any{"snapshots": list})
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"snapshots": list})
 		return
+	}
+
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		if snap != "_verify" {
+			ignoreUnavailable := isTruthyBoolQueryParam(r, "ignore_unavailable")
+			verbose := true
+			if pv, hasV, err := parseStrictQueryBoolParamRound59(r, "verbose"); err != nil {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+				return
+			} else if hasV {
+				verbose = pv
+			}
+			includeIndexNames := true
+			if pin, hasIN, err := parseStrictQueryBoolParamRound59(r, "index_names"); err != nil {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+				return
+			} else if hasIN {
+				includeIndexNames = pin
+			}
+			includeRepo := true
+			if pir, hasIR, err := parseStrictQueryBoolParamRound59(r, "include_repository"); err != nil {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+				return
+			} else if hasIR {
+				includeRepo = pir
+			}
+			includeIndexDetails := isTruthyBoolQueryParam(r, "index_details")
+
+			s.mu.RLock()
+			var targetRepos []string
+			if repo == "_all" || repo == "*" {
+				for rName := range s.snapshotRepos {
+					targetRepos = append(targetRepos, rName)
+				}
+				sort.Strings(targetRepos)
+			} else {
+				for _, pat := range strings.Split(repo, ",") {
+					pat = strings.TrimSpace(pat)
+					if pat == "" {
+						continue
+					}
+					if !strings.ContainsAny(pat, "*?") && !strings.HasPrefix(pat, "-") && pat != "_all" {
+						if _, exists := s.snapshotRepos[pat]; !exists && !ignoreUnavailable {
+							s.mu.RUnlock()
+							if r.Method == http.MethodHead {
+								w.WriteHeader(http.StatusNotFound)
+								return
+							}
+							writeESError(w, http.StatusNotFound, "repository_missing_exception", fmt.Sprintf("[%s] missing", pat))
+							return
+						}
+					}
+				}
+				for rName := range s.snapshotRepos {
+					if matchMultiWildcardWithExclusions(repo, rName) {
+						targetRepos = append(targetRepos, rName)
+					}
+				}
+				sort.Strings(targetRepos)
+			}
+
+			var matched []any
+			if snap == "_all" || snap == "*" {
+				for _, rName := range targetRepos {
+					bySnap := s.snapshots[rName]
+					names := make([]string, 0, len(bySnap))
+					for k := range bySnap {
+						names = append(names, k)
+					}
+					sort.Strings(names)
+					for _, k := range names {
+						matched = append(matched, formatSnapshotResponseItemRound61(bySnap[k], rName, verbose, includeIndexNames, includeRepo, includeIndexDetails))
+					}
+				}
+			} else {
+				// Validate literal snapshot names first unless ignore_unavailable=true:
+				if !ignoreUnavailable {
+					for _, pat := range strings.Split(snap, ",") {
+						pat = strings.TrimSpace(pat)
+						if pat == "" || strings.ContainsAny(pat, "*?") || strings.HasPrefix(pat, "-") || pat == "_all" {
+							continue
+						}
+						foundAny := false
+						for _, rName := range targetRepos {
+							if s.snapshots[rName] != nil && s.snapshots[rName][pat] != nil {
+								foundAny = true
+								break
+							}
+						}
+						if !foundAny {
+							s.mu.RUnlock()
+							if r.Method == http.MethodHead {
+								w.WriteHeader(http.StatusNotFound)
+								return
+							}
+							writeESError(w, http.StatusNotFound, "snapshot_missing_exception", fmt.Sprintf("[%s:%s] is missing", repo, pat))
+							return
+						}
+					}
+				}
+				for _, rName := range targetRepos {
+					bySnap := s.snapshots[rName]
+					names := make([]string, 0, len(bySnap))
+					for k := range bySnap {
+						if matchMultiWildcardWithExclusions(snap, k) {
+							names = append(names, k)
+						}
+					}
+					sort.Strings(names)
+					for _, k := range names {
+						matched = append(matched, formatSnapshotResponseItemRound61(bySnap[k], rName, verbose, includeIndexNames, includeRepo, includeIndexDetails))
+					}
+				}
+			}
+			s.mu.RUnlock()
+
+			if r.Method == http.MethodHead {
+				if len(matched) == 0 {
+					w.WriteHeader(http.StatusNotFound)
+				} else {
+					w.WriteHeader(http.StatusOK)
+				}
+				return
+			}
+			if matched == nil {
+				matched = []any{}
+			}
+			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
+				"snapshots": matched,
+				"total":     len(matched),
+				"remaining": 0,
+			})
+			return
+		}
 	}
 
 	s.mu.RLock()
@@ -476,7 +666,7 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 	}
 
 	if snap == "_verify" && (r.Method == http.MethodPost || r.Method == http.MethodGet) {
-		writeJSON(w, http.StatusOK, map[string]any{
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 			"nodes": map[string]any{
 				"node-1": map[string]any{"name": "doris-es-proxy-node-1"},
 			},
@@ -486,6 +676,15 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 
 	switch r.Method {
 	case http.MethodPut, http.MethodPost:
+		waitForCompletion := false
+		if wfc, hasWFC, err := parseStrictQueryBoolParamRound59(r, "wait_for_completion"); err != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+			return
+		} else if hasWFC {
+			waitForCompletion = wfc
+		}
+		ignoreUnavailable := isTruthyBoolQueryParam(r, "ignore_unavailable")
+
 		bodyBytes, ok := readRequestBody(w, r)
 		if !ok {
 			return
@@ -497,36 +696,109 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 				return
 			}
 		}
-		var indices []string
-		if rawIdx := reqMap["indices"]; rawIdx != nil {
+		if iuBody, okB := reqMap["ignore_unavailable"].(bool); okB {
+			ignoreUnavailable = iuBody
+		}
+		var rawIndices []string
+		hasExplicitIndices := false
+		if rawIdx, exists := reqMap["indices"]; exists && rawIdx != nil {
+			hasExplicitIndices = true
 			switch iv := rawIdx.(type) {
 			case string:
 				for _, p := range strings.Split(iv, ",") {
 					if p = strings.TrimSpace(p); p != "" {
-						indices = append(indices, p)
+						rawIndices = append(rawIndices, p)
 					}
 				}
 			case []any:
 				for _, item := range iv {
 					if str := strings.TrimSpace(fmt.Sprintf("%v", item)); str != "" {
-						indices = append(indices, str)
+						rawIndices = append(rawIndices, str)
 					}
 				}
 			}
 		}
-		if indices == nil {
-			s.mu.RLock()
+
+		var indices []string
+		s.mu.RLock()
+		hasAnyCatalogEntities := len(s.indices) > 0 || len(s.aliases) > 0 || len(s.dataStreams) > 0
+		if !hasExplicitIndices {
 			for idxName := range s.indices {
 				if !strings.HasPrefix(idxName, ".") {
 					indices = append(indices, idxName)
 				}
 			}
-			s.mu.RUnlock()
 			sort.Strings(indices)
 			if indices == nil {
 				indices = []string{}
 			}
+		} else if hasAnyCatalogEntities || waitForCompletion {
+			seen := make(map[string]bool)
+			allIdxNames := make([]string, 0, len(s.indices))
+			for idxName := range s.indices {
+				if !strings.HasPrefix(idxName, ".") {
+					allIdxNames = append(allIdxNames, idxName)
+				}
+			}
+			sort.Strings(allIdxNames)
+			expr := strings.Join(rawIndices, ",")
+			for _, pat := range rawIndices {
+				if strings.HasPrefix(pat, "-") || strings.ContainsAny(pat, "*?") || pat == "_all" {
+					continue
+				}
+				if s.indices[pat] == nil && len(s.aliases[pat]) == 0 && s.dataStreams[pat] == nil {
+					if !ignoreUnavailable {
+						s.mu.RUnlock()
+						writeESError(w, http.StatusNotFound, "index_not_found_exception", fmt.Sprintf("no such index [%s]", pat))
+						return
+					}
+				}
+			}
+			for _, pat := range rawIndices {
+				if !strings.ContainsAny(pat, "*?") && !strings.HasPrefix(pat, "-") && pat != "_all" {
+					if s.indices[pat] != nil && !seen[pat] {
+						seen[pat] = true
+						indices = append(indices, pat)
+					} else if alTargets := s.aliases[pat]; len(alTargets) > 0 {
+						for _, t := range alTargets {
+							if !seen[t] {
+								seen[t] = true
+								indices = append(indices, t)
+							}
+						}
+					}
+				}
+			}
+			for _, idxName := range allIdxNames {
+				if matchMultiWildcardWithExclusions(expr, idxName) && !seen[idxName] {
+					seen[idxName] = true
+					indices = append(indices, idxName)
+				}
+			}
+			// Re-apply negative exclusions across `indices` if any `-pat` was supplied:
+			filtered := make([]string, 0, len(indices))
+			for _, idxName := range indices {
+				excluded := false
+				for _, pat := range rawIndices {
+					if strings.HasPrefix(pat, "-") && matchWildcardPattern(strings.TrimPrefix(pat, "-"), idxName) {
+						excluded = true
+						break
+					}
+				}
+				if !excluded {
+					filtered = append(filtered, idxName)
+				}
+			}
+			indices = filtered
+			sort.Strings(indices)
+		} else {
+			indices = rawIndices
+			if indices == nil {
+				indices = []string{}
+			}
 		}
+		s.mu.RUnlock()
+
 		includeGlobalState := true
 		if b, ok := reqMap["include_global_state"].(bool); ok {
 			includeGlobalState = b
@@ -536,10 +808,16 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 			ns, _, _ := s.getIndexShardAndReplicaCounts(idxName)
 			snapShardTotal += ns
 		}
+		snapVersionID := int64(8150599)
+		if !s.isES8Mode(r) {
+			snapVersionID = 7100299
+		}
 		snapObj := map[string]any{
 			"snapshot":             snap,
+			"repository":           repo,
 			"uuid":                 snap + "-uuid",
-			"version":              "8.12.0",
+			"version_id":           snapVersionID,
+			"version":              s.effectiveClusterESVersionNumber(r),
 			"indices":              indices,
 			"data_streams":         []any{},
 			"include_global_state": includeGlobalState,
@@ -555,6 +833,9 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 				"failed":     0,
 				"successful": snapShardTotal,
 			},
+		}
+		if meta, okM := reqMap["metadata"].(map[string]any); okM && meta != nil {
+			snapObj["metadata"] = deepCloneDocMap(meta)
 		}
 		s.mu.RLock()
 		dupSnap := s.snapshots != nil && s.snapshots[repo] != nil && s.snapshots[repo][snap] != nil
@@ -609,71 +890,21 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 		s.snapshots[repo][snap] = snapObj
 		respSnap := cloneSnapshotWithoutInternal(snapObj)
 		s.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]any{
-			"accepted": true,
-			"snapshot": respSnap,
-		})
-	case http.MethodGet, http.MethodHead:
-		s.mu.RLock()
-		bySnap := s.snapshots[repo]
-		var matched []any
-		if snap == "_all" || snap == "*" {
-			names := make([]string, 0, len(bySnap))
-			for k := range bySnap {
-				names = append(names, k)
-			}
-			sort.Strings(names)
-			for _, k := range names {
-				matched = append(matched, cloneSnapshotWithoutInternal(bySnap[k]))
-			}
-		} else {
-			for _, pat := range strings.Split(snap, ",") {
-				pat = strings.TrimSpace(pat)
-				if pat == "" {
-					continue
-				}
-				if strings.ContainsAny(pat, "*?") {
-					var names []string
-					for k := range bySnap {
-						if matchWildcardPattern(pat, k) {
-							names = append(names, k)
-						}
-					}
-					sort.Strings(names)
-					for _, k := range names {
-						matched = append(matched, cloneSnapshotWithoutInternal(bySnap[k]))
-					}
-				} else if obj, exists := bySnap[pat]; exists {
-					matched = append(matched, cloneSnapshotWithoutInternal(obj))
-				} else {
-					s.mu.RUnlock()
-					if r.Method == http.MethodHead {
-						w.WriteHeader(http.StatusNotFound)
-						return
-					}
-					writeESError(w, http.StatusNotFound, "snapshot_missing_exception", fmt.Sprintf("[%s:%s] is missing", repo, pat))
-					return
-				}
-			}
-		}
-		s.mu.RUnlock()
-		if r.Method == http.MethodHead {
-			if len(matched) == 0 {
-				w.WriteHeader(http.StatusNotFound)
-			} else {
-				w.WriteHeader(http.StatusOK)
-			}
+		if waitForCompletion {
+			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
+				"snapshot": respSnap,
+			})
 			return
 		}
-		if matched == nil {
-			matched = []any{}
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"snapshots": matched,
-			"total":     len(matched),
-			"remaining": 0,
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
+			"accepted": true,
 		})
 	case http.MethodDelete:
+		if _, _, err := parseStrictQueryBoolParamRound59(r, "wait_for_completion"); err != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+			return
+		}
+		ignoreUnavailable := isTruthyBoolQueryParam(r, "ignore_unavailable")
 		s.mu.Lock()
 		bySnap := s.snapshots[repo]
 		var toDelete []string
@@ -688,7 +919,7 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 					continue
 				}
 				if !strings.ContainsAny(pat, "*?") && !strings.HasPrefix(pat, "-") && pat != "_all" {
-					if _, exists := bySnap[pat]; !exists {
+					if _, exists := bySnap[pat]; !exists && !ignoreUnavailable {
 						s.mu.Unlock()
 						writeESError(w, http.StatusNotFound, "snapshot_missing_exception", fmt.Sprintf("[%s:%s] is missing", repo, pat))
 						return
@@ -701,7 +932,7 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 				}
 			}
 		}
-		if len(toDelete) == 0 {
+		if len(toDelete) == 0 && !ignoreUnavailable {
 			s.mu.Unlock()
 			writeESError(w, http.StatusNotFound, "snapshot_missing_exception", fmt.Sprintf("[%s:%s] is missing", repo, snap))
 			return
@@ -710,7 +941,7 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 			delete(bySnap, sName)
 		}
 		s.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"acknowledged": true})
 	default:
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
 	}
@@ -727,6 +958,7 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
 			return
 		}
+		ignoreUnavailable := isTruthyBoolQueryParam(r, "ignore_unavailable") || isTruthyBoolQueryParam(r, "ignoreUnavailable")
 		s.mu.RLock()
 		var targetRepos []string
 		if repo == "_all" || repo == "*" {
@@ -741,7 +973,7 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 					continue
 				}
 				if !strings.ContainsAny(pat, "*?") && !strings.HasPrefix(pat, "-") && pat != "_all" {
-					if _, exists := s.snapshotRepos[pat]; !exists {
+					if _, exists := s.snapshotRepos[pat]; !exists && !ignoreUnavailable {
 						s.mu.RUnlock()
 						writeESError(w, http.StatusNotFound, "repository_missing_exception", fmt.Sprintf("[%s] missing", pat))
 						return
@@ -755,7 +987,7 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 			}
 			sort.Strings(targetRepos)
 		}
-		if snap != "_all" && snap != "*" {
+		if snap != "_all" && snap != "*" && !ignoreUnavailable {
 			for _, pat := range strings.Split(snap, ",") {
 				pat = strings.TrimSpace(pat)
 				if pat == "" || strings.ContainsAny(pat, "*?") || strings.HasPrefix(pat, "-") || pat == "_all" {
@@ -798,6 +1030,12 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 						"done":         1,
 						"failed":       0,
 						"total":        1,
+					},
+					"stats": map[string]any{
+						"incremental":          map[string]any{"file_count": 1, "size_in_bytes": 128},
+						"total":                map[string]any{"file_count": 1, "size_in_bytes": 128},
+						"start_time_in_millis": int64(1767225600000),
+						"time_in_millis":       int64(10),
 					},
 				})
 			}
@@ -1119,107 +1357,95 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 	}
 }
 
-// handleCatSnapshots implements `GET /_cat/snapshots` and `GET /_cat/snapshots/{repository}` (F1).
-func (s *Server) handleCatSnapshots(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
-		return
+func flattenSimulatedTemplateSettingsRound61(prefix string, src map[string]any, dst map[string]any) {
+	for k, v := range src {
+		full := k
+		if prefix != "" {
+			full = prefix + "." + k
+		}
+		if sub, ok := v.(map[string]any); ok {
+			flattenSimulatedTemplateSettingsRound61(full, sub, dst)
+		} else if v != nil {
+			shortKey := strings.TrimPrefix(full, "index.")
+			dst[shortKey] = fmt.Sprintf("%v", v)
+		}
 	}
-	repoFilter := strings.TrimSpace(r.PathValue("repository"))
-	if repoFilter == "" {
-		repoFilter = strings.TrimSpace(r.PathValue("name"))
-	}
-	if repoFilter == "" {
-		repoFilter = strings.TrimSpace(r.URL.Query().Get("repository"))
-	}
+}
 
-	if isTruthyBoolQueryParam(r, "help") {
-		writeCatResponseWithHelpCols(w, r,
-			[]string{"id", "status", "start_epoch", "start_time", "end_epoch", "end_time", "duration", "indices", "successful_shards", "failed_shards", "total_shards"},
-			[]string{"id", "status", "start_epoch", "start_time", "end_epoch", "end_time", "duration", "indices", "successful_shards", "failed_shards", "total_shards", "reason"},
-			nil)
-		return
+func mergeSimulatedIndexTemplateOverrideRound61(base esast.IndexTemplateRequest, override esast.IndexTemplateRequest, rawBodyMap map[string]any) esast.IndexTemplateRequest {
+	merged := base
+	if _, has := rawBodyMap["index_patterns"]; has {
+		merged.IndexPatterns = override.IndexPatterns
 	}
-	s.mu.RLock()
-	if repoFilter != "" && repoFilter != "_all" && repoFilter != "*" {
-		for _, pat := range strings.Split(repoFilter, ",") {
-			pat = strings.TrimSpace(pat)
-			if pat == "" || strings.ContainsAny(pat, "*?") || pat == "_all" {
-				continue
-			}
-			if _, exists := s.snapshotRepos[pat]; !exists {
-				s.mu.RUnlock()
-				writeESError(w, http.StatusNotFound, "repository_missing_exception", fmt.Sprintf("[%s] missing", pat))
-				return
-			}
-		}
+	if _, has := rawBodyMap["patterns"]; has {
+		merged.Patterns = override.Patterns
 	}
-	var repos []string
-	for rName := range s.snapshotRepos {
-		if repoFilter == "" || repoFilter == "_all" || repoFilter == "*" || matchMultiWildcardWithExclusions(repoFilter, rName) {
-			repos = append(repos, rName)
-		}
+	if _, has := rawBodyMap["priority"]; has {
+		merged.Priority = override.Priority
 	}
-	sort.Strings(repos)
-	type snapCatItem struct {
-		rName   string
-		sName   string
-		indices []string
+	if _, has := rawBodyMap["composed_of"]; has {
+		merged.ComposedOf = override.ComposedOf
 	}
-	var items []snapCatItem
-	for _, rName := range repos {
-		bySnap := s.snapshots[rName]
-		var sNames []string
-		for sName := range bySnap {
-			sNames = append(sNames, sName)
-		}
-		sort.Strings(sNames)
-		for _, sName := range sNames {
-			snapObj := bySnap[sName]
-			var snapIndices []string
-			switch iv := snapObj["indices"].(type) {
-			case []string:
-				snapIndices = append(snapIndices, iv...)
-			case []any:
-				for _, elem := range iv {
-					if sv, okS := elem.(string); okS && sv != "" {
-						snapIndices = append(snapIndices, sv)
+	if _, has := rawBodyMap["version"]; has {
+		merged.Version = override.Version
+	}
+	if _, has := rawBodyMap["_meta"]; has {
+		merged.Meta = override.Meta
+	}
+	if _, has := rawBodyMap["data_stream"]; has {
+		merged.DataStream = override.DataStream
+	}
+	if rawTplBlock, hasTpl := rawBodyMap["template"]; hasTpl {
+		if override.Template == nil {
+			merged.Template = nil
+		} else if merged.Template == nil {
+			cp := *override.Template
+			merged.Template = &cp
+		} else {
+			tplMap, _ := rawTplBlock.(map[string]any)
+			// Note: when full `index_patterns` + `template` replacement is supplied (e.g. `Simulate replacing a template with a newer version`),
+			// `override.Template` replaces `base.Template`; when partial `template` sub-keys are supplied without `index_patterns`, overlay them cleanly!
+			if _, hasFullPats := rawBodyMap["index_patterns"]; hasFullPats {
+				cp := *override.Template
+				merged.Template = &cp
+			} else {
+				cp := *merged.Template
+				if _, hasSet := tplMap["settings"]; hasSet {
+					if cp.Settings == nil {
+						cp.Settings = make(map[string]any)
+					} else {
+						clonedSet := make(map[string]any, len(cp.Settings))
+						for k, v := range cp.Settings {
+							clonedSet[k] = v
+						}
+						cp.Settings = clonedSet
+					}
+					for k, v := range override.Template.Settings {
+						cp.Settings[k] = v
 					}
 				}
+				if _, hasMap := tplMap["mappings"]; hasMap {
+					cp.Mappings = schema.MergeMappingSpecs(cp.Mappings, override.Template.Mappings)
+				}
+				if _, hasAl := tplMap["aliases"]; hasAl {
+					if cp.Aliases == nil {
+						cp.Aliases = make(map[string]map[string]any)
+					} else {
+						clonedAl := make(map[string]map[string]any, len(cp.Aliases))
+						for k, v := range cp.Aliases {
+							clonedAl[k] = v
+						}
+						cp.Aliases = clonedAl
+					}
+					for k, v := range override.Template.Aliases {
+						cp.Aliases[k] = v
+					}
+				}
+				merged.Template = &cp
 			}
-			items = append(items, snapCatItem{rName: rName, sName: sName, indices: snapIndices})
 		}
 	}
-	s.mu.RUnlock()
-
-	rows := make([]map[string]any, 0, len(items))
-	for _, item := range items {
-		idxCnt := len(item.indices)
-		shardCnt := 0
-		for _, idxName := range item.indices {
-			ns, _, _ := s.getIndexShardAndReplicaCounts(idxName)
-			shardCnt += ns
-		}
-		rows = append(rows, map[string]any{
-			"id":                item.sName,
-			"repository":        item.rName,
-			"status":            "SUCCESS",
-			"start_epoch":       "1767225600",
-			"start_time":        "00:00:00",
-			"end_epoch":         "1767225601",
-			"end_time":          "00:00:01",
-			"duration":          "1s",
-			"indices":           fmt.Sprintf("%d", idxCnt),
-			"successful_shards": fmt.Sprintf("%d", shardCnt),
-			"failed_shards":     "0",
-			"total_shards":      fmt.Sprintf("%d", shardCnt),
-			"reason":            "",
-		})
-	}
-	writeCatResponseWithHelpCols(w, r,
-		[]string{"id", "status", "start_epoch", "start_time", "end_epoch", "end_time", "duration", "indices", "successful_shards", "failed_shards", "total_shards"},
-		[]string{"id", "status", "start_epoch", "start_time", "end_epoch", "end_time", "duration", "indices", "successful_shards", "failed_shards", "total_shards", "reason"},
-		rows)
+	return merged
 }
 
 // handleSimulateIndexTemplate implements `POST /_index_template/_simulate` and `POST /_index_template/_simulate/{name}` (F3).
@@ -1236,33 +1462,39 @@ func (s *Server) handleSimulateIndexTemplate(w http.ResponseWriter, r *http.Requ
 	}
 
 	var tpl esast.IndexTemplateRequest
+	var rawBodyMap map[string]any
 	bodyBytes = normalizeTemplateBodyIndexPatternsRound60(bodyBytes)
-	hasBody := len(bytes.TrimSpace(bodyBytes)) > 0
-	if hasBody {
-		if err := json.Unmarshal(bodyBytes, &tpl); err != nil {
+	trimmedBody := bytes.TrimSpace(bodyBytes)
+	hasNonEmptyBody := len(trimmedBody) > 0 && !bytes.Equal(trimmedBody, []byte("{}"))
+	if len(trimmedBody) > 0 {
+		if err := json.Unmarshal(bodyBytes, &rawBodyMap); err != nil {
 			writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 			return
+		}
+		if hasNonEmptyBody {
+			if err := json.Unmarshal(bodyBytes, &tpl); err != nil {
+				writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+				return
+			}
 		}
 	}
 
 	s.mu.RLock()
-	if name != "" && !hasBody {
+	if name != "" {
 		existing, exists := s.templates[name]
-		if !exists {
-			s.mu.RUnlock()
-			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "index_template ["+name+"] missing")
-			return
-		}
-		tpl = existing
-	} else if name != "" && hasBody {
-		if len(tpl.IndexPatterns) == 0 && tpl.Template == nil && len(tpl.ComposedOf) == 0 {
-			if existing, exists := s.templates[name]; exists {
-				tpl = existing
-			} else {
+		if !hasNonEmptyBody {
+			if !exists {
 				s.mu.RUnlock()
 				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "index_template ["+name+"] missing")
 				return
 			}
+			tpl = existing
+		} else if exists {
+			tpl = mergeSimulatedIndexTemplateOverrideRound61(existing, tpl, rawBodyMap)
+		} else if len(tpl.EffectivePatterns()) == 0 {
+			s.mu.RUnlock()
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "index_template ["+name+"] missing")
+			return
 		}
 	}
 	for _, compName := range tpl.ComposedOf {
@@ -1274,9 +1506,23 @@ func (s *Server) handleSimulateIndexTemplate(w http.ResponseWriter, r *http.Requ
 		}
 	}
 	resolvedTpl, overlapping := s.simulateTemplateConfigLocked(name, tpl)
+	if isTruthyBoolQueryParam(r, "include_defaults") {
+		if rawTpl, okT := rawBodyMap["template"].(map[string]any); okT {
+			if lc, okLC := rawTpl["lifecycle"].(map[string]any); okLC {
+				lcCopy := deepCloneDocMap(lc)
+				if _, hasEn := lcCopy["enabled"]; !hasEn {
+					lcCopy["enabled"] = true
+				}
+				if _, hasRO := lcCopy["rollover"]; !hasRO {
+					lcCopy["rollover"] = map[string]any{"max_age": "30d", "max_primary_shard_size": "50gb", "min_docs": 1}
+				}
+				resolvedTpl["lifecycle"] = lcCopy
+			}
+		}
+	}
 	s.mu.RUnlock()
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 		"template":    resolvedTpl,
 		"overlapping": overlapping,
 	})
@@ -1290,45 +1536,105 @@ func (s *Server) handleSimulateIndexTemplateIndex(w http.ResponseWriter, r *http
 	}
 	_ = s.syncCatalogFromBackend(r.Context())
 	indexName := strings.TrimSpace(r.PathValue("name"))
-	_, _ = readRequestBody(w, r)
+	bodyBytes, ok := readRequestBody(w, r)
+	if !ok {
+		return
+	}
+	bodyBytes = normalizeTemplateBodyIndexPatternsRound60(bodyBytes)
+	trimmedBody := bytes.TrimSpace(bodyBytes)
+	var inlineTpl *esast.IndexTemplateRequest
+	if len(trimmedBody) > 0 && !bytes.Equal(trimmedBody, []byte("{}")) {
+		var parsed esast.IndexTemplateRequest
+		if err := json.Unmarshal(bodyBytes, &parsed); err != nil {
+			writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+			return
+		}
+		inlineTpl = &parsed
+	}
+
+	type candidateTpl struct {
+		name     string
+		isInline bool
+		isLegacy bool
+		tpl      esast.IndexTemplateRequest
+	}
 
 	s.mu.RLock()
-	var matchedNames []string
-	for k, tpl := range s.templates {
-		for _, pat := range tpl.EffectivePatterns() {
+	if inlineTpl != nil {
+		for _, compName := range inlineTpl.ComposedOf {
+			if _, exists := s.componentTemplates[compName]; !exists {
+				s.mu.RUnlock()
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("component template [%s] not found", compName))
+				return
+			}
+		}
+	}
+
+	var matched []candidateTpl
+	if inlineTpl != nil {
+		for _, pat := range inlineTpl.EffectivePatterns() {
 			if matchWildcardPattern(pat, indexName) {
-				matchedNames = append(matchedNames, k)
+				matched = append(matched, candidateTpl{name: "__inline__", isInline: true, tpl: *inlineTpl})
 				break
 			}
 		}
 	}
-	if len(matchedNames) == 0 {
+	for k, tpl := range s.templates {
+		for _, pat := range tpl.EffectivePatterns() {
+			if matchWildcardPattern(pat, indexName) {
+				matched = append(matched, candidateTpl{name: k, tpl: tpl})
+				break
+			}
+		}
+	}
+	for k, ltpl := range s.legacyTemplates {
+		for _, pat := range ltpl.EffectivePatterns() {
+			if matchWildcardPattern(pat, indexName) {
+				matched = append(matched, candidateTpl{name: k, isLegacy: true, tpl: ltpl})
+				break
+			}
+		}
+	}
+	if len(matched) == 0 {
 		s.mu.RUnlock()
-		writeJSON(w, http.StatusOK, map[string]any{})
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{})
 		return
 	}
-	sort.Slice(matchedNames, func(i, j int) bool {
-		pi := s.templates[matchedNames[i]].EffectivePriority()
-		pj := s.templates[matchedNames[j]].EffectivePriority()
+	sort.Slice(matched, func(i, j int) bool {
+		// Composable templates always beat legacy v1 templates in ES!
+		if matched[i].isLegacy != matched[j].isLegacy {
+			return !matched[i].isLegacy
+		}
+		pi := matched[i].tpl.EffectivePriority()
+		pj := matched[j].tpl.EffectivePriority()
 		if pi != pj {
 			return pi > pj
 		}
-		return matchedNames[i] < matchedNames[j]
+		if matched[i].isInline != matched[j].isInline {
+			return matched[i].isInline
+		}
+		return matched[i].name < matched[j].name
 	})
-	winnerName := matchedNames[0]
-	winnerTpl := s.templates[winnerName]
-	resolvedTpl, _ := s.simulateTemplateConfigLocked(winnerName, winnerTpl)
-	overlapping := make([]any, 0)
-	for _, otherName := range matchedNames[1:] {
-		otherTpl := s.templates[otherName]
+	winner := matched[0]
+	resolvedTpl, _ := s.simulateTemplateConfigLocked(winner.name, winner.tpl)
+	rest := matched[1:]
+	sort.Slice(rest, func(i, j int) bool {
+		return rest[i].name < rest[j].name
+	})
+	overlapping := make([]any, 0, len(rest))
+	for _, other := range rest {
+		if other.isInline {
+			continue
+		}
 		overlapping = append(overlapping, map[string]any{
-			"name":           otherName,
-			"index_patterns": otherTpl.EffectivePatterns(),
+			"name":           other.name,
+			"index_patterns": other.tpl.EffectivePatterns(),
 		})
 	}
 	s.mu.RUnlock()
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 		"template":    resolvedTpl,
 		"overlapping": overlapping,
 	})
@@ -1336,7 +1642,7 @@ func (s *Server) handleSimulateIndexTemplateIndex(w http.ResponseWriter, r *http
 
 func (s *Server) simulateTemplateConfigLocked(excludeName string, tpl esast.IndexTemplateRequest) (map[string]any, []any) {
 	var mergedMappings *esast.MappingSpec
-	mergedSettings := make(map[string]any)
+	shortFlatSettings := make(map[string]any)
 	mergedAliases := make(map[string]any)
 
 	applyComponentMap := func(compRaw map[string]any) {
@@ -1345,9 +1651,7 @@ func (s *Server) simulateTemplateConfigLocked(excludeName string, tpl esast.Inde
 			tplBlock = compRaw
 		}
 		if rawSet, ok := tplBlock["settings"].(map[string]any); ok {
-			for k, v := range rawSet {
-				mergedSettings[k] = v
-			}
+			flattenSimulatedTemplateSettingsRound61("", rawSet, shortFlatSettings)
 		}
 		if rawAl, ok := tplBlock["aliases"].(map[string]any); ok {
 			for k, v := range rawAl {
@@ -1370,9 +1674,7 @@ func (s *Server) simulateTemplateConfigLocked(excludeName string, tpl esast.Inde
 		}
 	}
 	if ts := tpl.EffectiveSettings(); len(ts) > 0 {
-		for k, v := range ts {
-			mergedSettings[k] = v
-		}
+		flattenSimulatedTemplateSettingsRound61("", ts, shortFlatSettings)
 	}
 	if ta := tpl.EffectiveAliases(); len(ta) > 0 {
 		for k, v := range ta {
@@ -1383,6 +1685,11 @@ func (s *Server) simulateTemplateConfigLocked(excludeName string, tpl esast.Inde
 		mergedMappings = schema.MergeMappingSpecs(mergedMappings, tm)
 	}
 
+	nestedSettings := map[string]any{}
+	if len(shortFlatSettings) > 0 {
+		nestedSettings = formatIndexSettingsOutput(shortFlatSettings, false)
+	}
+
 	mappingsOut := make(map[string]any)
 	if mergedMappings != nil {
 		if b, err := json.Marshal(mergedMappings); err == nil {
@@ -1390,22 +1697,33 @@ func (s *Server) simulateTemplateConfigLocked(excludeName string, tpl esast.Inde
 		}
 	}
 
-	overlapping := make([]any, 0)
-	tplPatterns := tpl.EffectivePatterns()
-	var otherNames []string
-	for k := range s.templates {
+	type namedPats struct {
+		name string
+		pats []string
+	}
+	var allOthers []namedPats
+	for k, other := range s.templates {
 		if k == excludeName {
 			continue
 		}
-		otherNames = append(otherNames, k)
+		allOthers = append(allOthers, namedPats{name: k, pats: other.EffectivePatterns()})
 	}
-	sort.Strings(otherNames)
-	for _, k := range otherNames {
-		other := s.templates[k]
-		otherPats := other.EffectivePatterns()
+	for k, lOther := range s.legacyTemplates {
+		if k == excludeName {
+			continue
+		}
+		allOthers = append(allOthers, namedPats{name: k, pats: lOther.EffectivePatterns()})
+	}
+	sort.Slice(allOthers, func(i, j int) bool {
+		return allOthers[i].name < allOthers[j].name
+	})
+
+	overlapping := make([]any, 0)
+	tplPatterns := tpl.EffectivePatterns()
+	for _, cand := range allOthers {
 		overlaps := false
 		for _, p1 := range tplPatterns {
-			for _, p2 := range otherPats {
+			for _, p2 := range cand.pats {
 				if p1 == p2 || matchWildcardPattern(p1, p2) || matchWildcardPattern(p2, p1) {
 					overlaps = true
 					break
@@ -1417,14 +1735,14 @@ func (s *Server) simulateTemplateConfigLocked(excludeName string, tpl esast.Inde
 		}
 		if overlaps {
 			overlapping = append(overlapping, map[string]any{
-				"name":           k,
-				"index_patterns": otherPats,
+				"name":           cand.name,
+				"index_patterns": cand.pats,
 			})
 		}
 	}
 
 	return map[string]any{
-		"settings": mergedSettings,
+		"settings": nestedSettings,
 		"mappings": mappingsOut,
 		"aliases":  mergedAliases,
 	}, overlapping
@@ -3246,6 +3564,31 @@ func parseFromSizePagination(r *http.Request, defaultSize int) (int, int) {
 	return from, size
 }
 
+func parseStrictSynonymsPaginationRound61(r *http.Request, defaultSize int) (int, int, error) {
+	from := 0
+	size := defaultSize
+	if r != nil && r.URL != nil {
+		q := r.URL.Query()
+		if q.Has("from") {
+			rawFrom := strings.TrimSpace(q.Get("from"))
+			v, err := strconv.Atoi(rawFrom)
+			if err != nil || v < 0 || v > 10000 {
+				return 0, 0, fmt.Errorf("[from] must be an integer between [0] and [10000], got [%s]", rawFrom)
+			}
+			from = v
+		}
+		if q.Has("size") {
+			rawSize := strings.TrimSpace(q.Get("size"))
+			v, err := strconv.Atoi(rawSize)
+			if err != nil || v < 0 || v > 10000 {
+				return 0, 0, fmt.Errorf("[size] must be an integer between [0] and [10000], got [%s]", rawSize)
+			}
+			size = v
+		}
+	}
+	return from, size, nil
+}
+
 // handleSynonyms implements the Elasticsearch 8.x Synonyms Management API (`/_synonyms` and `/_synonyms/{id}/*`) (F2).
 func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []string) {
 	switch len(segs) {
@@ -3254,7 +3597,11 @@ func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []s
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 			return
 		}
-		from, size := parseFromSizePagination(r, 10000)
+		from, size, pErr := parseStrictSynonymsPaginationRound61(r, 10000)
+		if pErr != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", pErr.Error())
+			return
+		}
 		s.mu.RLock()
 		setIDs := make([]string, 0, len(s.synonymSets))
 		for id := range s.synonymSets {
@@ -3272,10 +3619,11 @@ func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []s
 		}
 		s.mu.RUnlock()
 		if r.Method == http.MethodHead {
+			ensureESCompatHeaders(w, r)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 			"count":   total,
 			"results": results,
 		})
@@ -3295,9 +3643,14 @@ func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []s
 					return
 				}
 			}
-			rawRules, ok := body["synonyms_set"].([]any)
-			if !ok || len(rawRules) == 0 {
-				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[synonyms_set] required property is missing or empty")
+			rawVal, hasProp := body["synonyms_set"]
+			if !hasProp || rawVal == nil {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[synonyms_set] required property is missing")
+				return
+			}
+			rawRules, ok := rawVal.([]any)
+			if !ok {
+				writeESError(w, http.StatusBadRequest, "parse_exception", "[synonyms_set] must be an array")
 				return
 			}
 			seenIDs := make(map[string]bool, len(rawRules))
@@ -3308,8 +3661,14 @@ func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []s
 					writeESError(w, http.StatusBadRequest, "parse_exception", "synonym rule must be an object")
 					return
 				}
-				synStr, _ := rm["synonyms"].(string)
-				if strings.TrimSpace(synStr) == "" {
+				for rk := range rm {
+					if rk != "id" && rk != "synonyms" {
+						writeESError(w, http.StatusBadRequest, "parse_exception", fmt.Sprintf("unknown field [%s] in synonym rule", rk))
+						return
+					}
+				}
+				synStr, okSyn := rm["synonyms"].(string)
+				if !okSyn || strings.TrimSpace(synStr) == "" {
 					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "synonym rule [synonyms] is required")
 					return
 				}
@@ -3338,28 +3697,33 @@ func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []s
 			}
 			_, existed := s.synonymSets[setID]
 			s.synonymSets[setID] = rules
-			reloadDetails := s.buildSynonymReloadPayloadLocked(setID)
+			reloadDetails := s.buildSynonymReloadPayloadRound61Locked(setID)
 			s.mu.Unlock()
 			resStr := "created"
 			if existed {
 				resStr = "updated"
 			}
-			writeJSON(w, http.StatusOK, map[string]any{
+			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 				"result":                   resStr,
 				"reload_analyzers_details": reloadDetails,
 			})
 
 		case http.MethodGet, http.MethodHead:
-			from, size := parseFromSizePagination(r, 10000)
+			from, size, pErr := parseStrictSynonymsPaginationRound61(r, 10000)
+			if pErr != nil {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", pErr.Error())
+				return
+			}
 			s.mu.RLock()
 			rules, exists := s.synonymSets[setID]
 			if !exists {
 				s.mu.RUnlock()
 				if r.Method == http.MethodHead {
+					ensureESCompatHeaders(w, r)
 					w.WriteHeader(http.StatusNotFound)
 					return
 				}
-				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonyms_set [%s] not found", setID))
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonyms set [%s] not found", setID))
 				return
 			}
 			total := len(rules)
@@ -3369,10 +3733,11 @@ func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []s
 			}
 			s.mu.RUnlock()
 			if r.Method == http.MethodHead {
+				ensureESCompatHeaders(w, r)
 				w.WriteHeader(http.StatusOK)
 				return
 			}
-			writeJSON(w, http.StatusOK, map[string]any{
+			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 				"count":        total,
 				"synonyms_set": page,
 			})
@@ -3381,17 +3746,24 @@ func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []s
 			s.mu.Lock()
 			if _, exists := s.synonymSets[setID]; !exists {
 				s.mu.Unlock()
-				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonyms_set [%s] not found", setID))
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonyms set [%s] not found", setID))
 				return
 			}
 			if inUse := s.findIndicesUsingSynonymSetLocked(setID); len(inUse) > 0 {
+				usedIdxNames := make([]string, 0, len(inUse))
+				for _, m := range inUse {
+					if idxStr, ok := m["index"].(string); ok && idxStr != "" {
+						usedIdxNames = append(usedIdxNames, idxStr)
+					}
+				}
 				s.mu.Unlock()
-				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("synonyms_set [%s] cannot be deleted as it is in use", setID))
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("synonyms set [%s] cannot be deleted as it is used in the following indices: %s", setID, strings.Join(usedIdxNames, ", ")))
 				return
 			}
 			delete(s.synonymSets, setID)
 			s.mu.Unlock()
-			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"acknowledged": true})
 
 		default:
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
@@ -3409,14 +3781,14 @@ func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []s
 			_, exists := s.synonymSets[setID]
 			var reloadDetails map[string]any
 			if exists {
-				reloadDetails = s.buildSynonymReloadPayloadLocked(setID)
+				reloadDetails = s.buildSynonymReloadPayloadRound61Locked(setID)
 			}
 			s.mu.RUnlock()
 			if !exists {
-				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonyms_set [%s] not found", setID))
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonyms set [%s] not found", setID))
 				return
 			}
-			writeJSON(w, http.StatusOK, map[string]any{
+			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 				"_shards":                  reloadDetails["_shards"],
 				"reload_details":           reloadDetails["reload_details"],
 				"reload_analyzers_details": reloadDetails,
@@ -3437,8 +3809,19 @@ func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []s
 					return
 				}
 			}
-			synStr, _ := body["synonyms"].(string)
-			if strings.TrimSpace(synStr) == "" {
+			for rk := range body {
+				if rk != "id" && rk != "synonyms" {
+					writeESError(w, http.StatusBadRequest, "parse_exception", fmt.Sprintf("unknown field [%s] in synonym rule", rk))
+					return
+				}
+			}
+			if bodyID, hasID := body["id"].(string); hasID && strings.TrimSpace(bodyID) != "" && strings.TrimSpace(bodyID) != ruleID {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("synonym rule id [%s] in body does not match url rule id [%s]", bodyID, ruleID))
+				return
+			}
+			synStr, okSyn := body["synonyms"].(string)
+			if !okSyn || strings.TrimSpace(synStr) == "" {
 				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "synonym rule [synonyms] is required")
 				return
 			}
@@ -3450,7 +3833,7 @@ func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []s
 			rules, exists := s.synonymSets[setID]
 			if !exists {
 				s.mu.Unlock()
-				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonyms_set [%s] not found", setID))
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonyms set [%s] not found", setID))
 				return
 			}
 			resStr := "created"
@@ -3469,9 +3852,9 @@ func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []s
 				rules = append(rules, newRule)
 			}
 			s.synonymSets[setID] = rules
-			reloadDetails := s.buildSynonymReloadPayloadLocked(setID)
+			reloadDetails := s.buildSynonymReloadPayloadRound61Locked(setID)
 			s.mu.Unlock()
-			writeJSON(w, http.StatusOK, map[string]any{
+			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 				"result":                   resStr,
 				"reload_analyzers_details": reloadDetails,
 			})
@@ -3489,26 +3872,37 @@ func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []s
 				}
 			}
 			s.mu.RUnlock()
-			if found == nil {
+			if !exists {
 				if r.Method == http.MethodHead {
+					ensureESCompatHeaders(w, r)
 					w.WriteHeader(http.StatusNotFound)
 					return
 				}
-				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonym rule [%s] not found in set [%s]", ruleID, setID))
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonyms set [%s] not found", setID))
+				return
+			}
+			if found == nil {
+				if r.Method == http.MethodHead {
+					ensureESCompatHeaders(w, r)
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonym rule [%s] not found in synonyms set [%s]", ruleID, setID))
 				return
 			}
 			if r.Method == http.MethodHead {
+				ensureESCompatHeaders(w, r)
 				w.WriteHeader(http.StatusOK)
 				return
 			}
-			writeJSON(w, http.StatusOK, found)
+			writeJSONWithRequest(w, r, http.StatusOK, found)
 
 		case http.MethodDelete:
 			s.mu.Lock()
 			rules, exists := s.synonymSets[setID]
 			if !exists {
 				s.mu.Unlock()
-				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonyms_set [%s] not found", setID))
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonyms set [%s] not found", setID))
 				return
 			}
 			foundIdx := -1
@@ -3520,13 +3914,13 @@ func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []s
 			}
 			if foundIdx < 0 {
 				s.mu.Unlock()
-				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonym rule [%s] not found in set [%s]", ruleID, setID))
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonym rule [%s] not found in synonyms set [%s]", ruleID, setID))
 				return
 			}
 			s.synonymSets[setID] = append(rules[:foundIdx], rules[foundIdx+1:]...)
-			reloadDetails := s.buildSynonymReloadPayloadLocked(setID)
+			reloadDetails := s.buildSynonymReloadPayloadRound61Locked(setID)
 			s.mu.Unlock()
-			writeJSON(w, http.StatusOK, map[string]any{
+			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 				"result":                   "deleted",
 				"reload_analyzers_details": reloadDetails,
 			})
@@ -4151,6 +4545,11 @@ func (s *Server) rewriteSearchBodyQueryRules(bodyBytes []byte) []byte {
 	if len(bytes.TrimSpace(bodyBytes)) == 0 {
 		return bodyBytes
 	}
+	if bytes.Contains(bodyBytes, []byte(`"retriever"`)) {
+		if rewritten, errSt, _, _ := s.validateAndRewriteStandardRetrieverRound61(bodyBytes); errSt == 0 {
+			bodyBytes = rewritten
+		}
+	}
 	if !bytes.Contains(bodyBytes, []byte(`"rule"`)) && !bytes.Contains(bodyBytes, []byte(`"rule_query"`)) {
 		return bodyBytes
 	}
@@ -4198,10 +4597,16 @@ func (s *Server) handleFeatures(w http.ResponseWriter, r *http.Request, segs []s
 		{"transform", "Manages transforms"},
 		{"rollup", "Manages rollup jobs"},
 		{"enrich", "Manages enrich policies"},
+		{"tasks", "Manages task results"},
 	}
 	if len(segs) == 1 {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		if r.Method == http.MethodHead {
+			ensureESCompatHeaders(w, r)
+			w.WriteHeader(http.StatusOK)
 			return
 		}
 		features := make([]any, 0, len(featureNames))
@@ -4211,7 +4616,7 @@ func (s *Server) handleFeatures(w http.ResponseWriter, r *http.Request, segs []s
 				"description": f.desc,
 			})
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"features": features})
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"features": features})
 		return
 	}
 	if len(segs) == 2 && segs[1] == "_reset" {
@@ -4258,6 +4663,7 @@ func (s *Server) handleFeatures(w http.ResponseWriter, r *http.Request, segs []s
 		s.templateLifecycles = make(map[string]map[string]any)
 		s.remoteClusters = make(map[string]map[string]any)
 		s.mu.Unlock()
+		resetRound61AdminState(s)
 		statuses := make([]any, 0, len(featureNames))
 		for _, f := range featureNames {
 			statuses = append(statuses, map[string]any{
@@ -4265,7 +4671,7 @@ func (s *Server) handleFeatures(w http.ResponseWriter, r *http.Request, segs []s
 				"status":       "SUCCESS",
 			})
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"features": statuses})
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"features": statuses})
 		return
 	}
 	writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
@@ -4373,12 +4779,13 @@ func (s *Server) handleMigrationDeprecations(w http.ResponseWriter, r *http.Requ
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 		"cluster_settings": []any{},
 		"node_settings":    []any{},
 		"index_settings":   map[string]any{},
 		"ml_settings":      []any{},
 		"templates":        []any{},
+		"migration_status": "NO_MIGRATION_NEEDED",
 	})
 }
 
@@ -7932,103 +8339,28 @@ func (s *Server) handleSSLCertificates(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleHealthReport implements `GET/HEAD /_health_report` and `/_health_report/{indicator}` (Round 55 F2).
+// handleHealthReport implements `GET/HEAD /_health_report` and `/_health_report/{indicator}` (Round 55 F2 / Round 61 F1).
 func (s *Server) handleHealthReport(w http.ResponseWriter, r *http.Request, segs []string) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
-	mkInd := func(symptom string, details map[string]any) map[string]any {
-		if details == nil {
-			details = map[string]any{}
-		}
-		return map[string]any{
-			"status":    "green",
-			"symptom":   symptom,
-			"details":   details,
-			"impacts":   []any{},
-			"diagnosis": []any{},
-		}
-	}
-	s.mu.RLock()
-	idxCount := len(s.indices)
-	ilmState := s.ilmMode
-	slmState := s.slmMode
-	s.mu.RUnlock()
-	if ilmState == "" {
-		ilmState = "RUNNING"
-	}
-	if slmState == "" {
-		slmState = "RUNNING"
-	}
-	indicators := map[string]any{
-		"master_is_stable": mkInd("The cluster has a stable master node", map[string]any{
-			"current_master": map[string]any{"node_id": "doris-fe-1", "name": "doris-fe-1"},
-			"recent_masters": []any{map[string]any{"node_id": "doris-fe-1", "name": "doris-fe-1"}},
-		}),
-		"repository_integrity": mkInd("No corrupted repositories found.", map[string]any{
-			"total_repositories": 0,
-		}),
-		"shards_availability": mkInd(fmt.Sprintf("This cluster has all shards available for %d indices.", idxCount), map[string]any{
-			"primaries": map[string]any{"started": idxCount, "unassigned": 0, "initializing": 0},
-			"replicas":  map[string]any{"started": 0, "unassigned": 0, "initializing": 0},
-		}),
-		"shards_capacity": mkInd("The cluster has enough room to add new shards.", map[string]any{
-			"data": map[string]any{"max_shards_in_cluster": 1000, "current_used_shards": idxCount},
-		}),
-		"disk": mkInd("The cluster has enough available disk space.", map[string]any{
-			"indices_with_readonly_block": 0,
-			"nodes_with_enough_disk":      1,
-			"nodes_over_high_watermark":   0,
-			"nodes_over_flood_stage":      0,
-		}),
-		"ilm": mkInd("Index Lifecycle Management is running", map[string]any{
-			"policies":       0,
-			"stagnant_steps": 0,
-			"ilm_status":     ilmState,
-		}),
-		"slm": mkInd("Snapshot Lifecycle Management is running", map[string]any{
-			"slm_status": slmState,
-			"policies":   0,
-		}),
-		"data_stream_lifecycle": mkInd("Data stream lifecycle is running", map[string]any{
-			"stagnant_data_streams_count": 0,
-			"total_Error_count":           0,
-		}),
-	}
-	if len(segs) >= 2 && strings.TrimSpace(segs[1]) != "" {
-		indName := strings.TrimSpace(segs[1])
-		indObj, exists := indicators[indName]
-		if !exists {
-			if r.Method == http.MethodHead {
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("unknown health indicator [%s]", indName))
+	status, errType, errReason, payload := s.buildHealthReportResponseRound61(r, segs)
+	if status != http.StatusOK {
+		if r.Method == http.MethodHead && status == http.StatusNotFound {
+			ensureESCompatHeaders(w, r)
+			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		if r.Method == http.MethodHead {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"cluster_name": "apache-doris-search-cluster",
-			"status":       "green",
-			"indicators": map[string]any{
-				indName: indObj,
-			},
-		})
+		writeESError(w, status, errType, errReason)
 		return
 	}
 	if r.Method == http.MethodHead {
+		ensureESCompatHeaders(w, r)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"cluster_name": "apache-doris-search-cluster",
-		"status":       "green",
-		"indicators":   indicators,
-	})
+	writeJSONWithRequest(w, r, http.StatusOK, payload)
 }
 
 // handleSQLAPI implements `/_sql`, `/_sql/translate`, `/_sql/close`, and `/_sql/async/*` (Round 55 F3).
@@ -8206,7 +8538,7 @@ func (s *Server) resolveMaintenanceTargetIndices(w http.ResponseWriter, rawIndex
 	return matched, true
 }
 
-// handleReloadSearchAnalyzers implements `POST/GET /_reload_search_analyzers` and `/{index}/_reload_search_analyzers` (Round 55 F5).
+// handleReloadSearchAnalyzers implements `POST/GET /_reload_search_analyzers` and `/{index}/_reload_search_analyzers` (Round 55 F5 / Round 61 F8).
 func (s *Server) handleReloadSearchAnalyzers(w http.ResponseWriter, r *http.Request, segs []string) {
 	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
@@ -8221,19 +8553,41 @@ func (s *Server) handleReloadSearchAnalyzers(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	s.mu.RLock()
-	details := s.buildIndexReloadAnalyzersDetailsLocked(indices)
+	details, totalShards := s.buildAllIndexReloadAnalyzersDetailsRound61Locked(indices)
 	s.mu.RUnlock()
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 		"_shards": map[string]any{
-			"total":      len(indices),
-			"successful": len(indices),
+			"total":      totalShards,
+			"successful": totalShards,
 			"failed":     0,
 		},
 		"reload_details": details,
 	})
 }
 
-// handleIndexDiskUsage implements `POST/GET /{index}/_disk_usage` and `/_disk_usage` (Round 55 F5).
+func validateRunExpensiveTasksParamRound61(w http.ResponseWriter, r *http.Request, s *Server) bool {
+	if r != nil && r.URL != nil && r.URL.Query().Has("run_expensive_tasks") {
+		val, _, err := parseStrictQueryBoolParamRound59(r, "run_expensive_tasks")
+		if err != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+			return false
+		}
+		if !val {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				"Dedicated parameter [run_expensive_tasks] must be set to [true]")
+			return false
+		}
+		return true
+	}
+	if s != nil && s.isES8Mode(r) {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+			"Dedicated parameter [run_expensive_tasks] must be set to [true]")
+		return false
+	}
+	return true
+}
+
+// handleIndexDiskUsage implements `POST/GET /{index}/_disk_usage` and `/_disk_usage` (Round 55 F5 / Round 61 F3).
 func (s *Server) handleIndexDiskUsage(w http.ResponseWriter, r *http.Request, segs []string) {
 	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
@@ -8247,41 +8601,29 @@ func (s *Server) handleIndexDiskUsage(w http.ResponseWriter, r *http.Request, se
 	if !ok {
 		return
 	}
+	if !validateRunExpensiveTasksParamRound61(w, r, s) {
+		return
+	}
+	human := isTruthyBoolQueryParam(r, "human")
+	totalShards := 0
+	for _, idx := range indices {
+		ns, _, _ := s.getIndexShardAndReplicaCounts(idx)
+		totalShards += ns
+	}
 	resp := map[string]any{
 		"_shards": map[string]any{
-			"total":      len(indices),
-			"successful": len(indices),
+			"total":      totalShards,
+			"successful": totalShards,
 			"failed":     0,
 		},
 	}
 	for _, idx := range indices {
-		resp[idx] = map[string]any{
-			"store_size":          "0b",
-			"store_size_in_bytes": 0,
-			"all_fields": map[string]any{
-				"total":                  "0b",
-				"total_in_bytes":         0,
-				"inverted_index":         map[string]any{"total": "0b", "total_in_bytes": 0},
-				"stored_fields":          "0b",
-				"stored_fields_in_bytes": 0,
-				"doc_values":             "0b",
-				"doc_values_in_bytes":    0,
-				"points":                 "0b",
-				"points_in_bytes":        0,
-				"norms":                  "0b",
-				"norms_in_bytes":         0,
-				"term_vectors":           "0b",
-				"term_vectors_in_bytes":  0,
-				"knn_vectors":            "0b",
-				"knn_vectors_in_bytes":   0,
-			},
-			"fields": map[string]any{},
-		}
+		resp[idx] = s.computeIndexDiskUsageRound61(r.Context(), idx, human)
 	}
-	writeJSON(w, http.StatusOK, resp)
+	writeJSONWithRequest(w, r, http.StatusOK, resp)
 }
 
-// handleIndexFieldUsageStats implements `GET /{index}/_field_usage_stats` and `/_field_usage_stats` (Round 55 F5).
+// handleIndexFieldUsageStats implements `GET /{index}/_field_usage_stats` and `/_field_usage_stats` (Round 55 F5 / Round 61 F3).
 func (s *Server) handleIndexFieldUsageStats(w http.ResponseWriter, r *http.Request, segs []string) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
@@ -8295,28 +8637,30 @@ func (s *Server) handleIndexFieldUsageStats(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
+	if !validateRunExpensiveTasksParamRound61(w, r, s) {
+		return
+	}
 	if r.Method == http.MethodHead {
+		ensureESCompatHeaders(w, r)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	totalShards := 0
+	for _, idx := range indices {
+		ns, _, _ := s.getIndexShardAndReplicaCounts(idx)
+		totalShards += ns
+	}
 	resp := map[string]any{
 		"_shards": map[string]any{
-			"total":      len(indices),
-			"successful": len(indices),
+			"total":      totalShards,
+			"successful": totalShards,
 			"failed":     0,
 		},
 	}
 	for _, idx := range indices {
-		resp[idx] = map[string]any{
-			"shards": []any{
-				map[string]any{
-					"fields":      map[string]any{},
-					"field_usage": map[string]any{},
-				},
-			},
-		}
+		resp[idx] = s.computeIndexFieldUsageStatsRound61(r.Context(), idx)
 	}
-	writeJSON(w, http.StatusOK, resp)
+	writeJSONWithRequest(w, r, http.StatusOK, resp)
 }
 
 // handleSnapshotClone implements `POST/PUT /_snapshot/{repository}/{snapshot}/_clone/{target_snapshot}` (Round 55 F5).

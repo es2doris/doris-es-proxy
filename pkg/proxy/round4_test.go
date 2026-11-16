@@ -221,11 +221,12 @@ func TestRound4_P0_HybridKNN_And_ShadowConcurrency(t *testing.T) {
 
 	// P0-7 & P0-2: Hybrid search (query + top-level knn) + rest_total_hits_as_int=true + _doris_explain with shadow enabled
 	code, body := doReq(http.MethodPost, "/vec_hybrid/_search?rest_total_hits_as_int=true&_doris_explain=true", `{
+		"size": 1,
 		"query": {"term": {"category": "books"}},
 		"knn": {
 			"field": "emb",
 			"query_vector": [1.0, 0.0],
-			"k": 1
+			"k": 2
 		}
 	}`)
 	if code != http.StatusOK {

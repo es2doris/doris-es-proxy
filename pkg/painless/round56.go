@@ -1338,7 +1338,7 @@ func markUnmodSlicePainless(budget *evalBudget, s []any) []any {
 			}
 			if !budget.unmodSlices[ptr] {
 				budget.unmodSlices[ptr] = true
-				budget.pinnedRefs = append(budget.pinnedRefs, s)
+				_ = recordPinnedContainerRound61(budget, s, len(s))
 			}
 		}
 	}
@@ -1357,7 +1357,7 @@ func markUnmodMapPainless(budget *evalBudget, m map[string]any) map[string]any {
 			}
 			if !budget.unmodMaps[ptr] {
 				budget.unmodMaps[ptr] = true
-				budget.pinnedRefs = append(budget.pinnedRefs, m)
+				_ = recordPinnedContainerRound61(budget, m, len(m))
 			}
 		}
 	}

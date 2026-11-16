@@ -609,8 +609,8 @@ func TestRound9SubAggMatrixAndDeepTermsNesting(t *testing.T) {
 		t.Fatalf("expected boxplot sub-agg min=10 max=30, got: %+v", regBucket["lat_box"])
 	}
 	ranksVals := regBucket["lat_ranks"].(map[string]any)["values"].(map[string]any)
-	if ranksVals["15.0"] != float64(50) || ranksVals["50.0"] != float64(100) {
-		t.Fatalf("expected percentile_ranks sub-agg [15->50%%, 50->100%%], got: %+v", ranksVals)
+	if ranksVals["15.0"] != float64(37.5) || ranksVals["50.0"] != float64(100) {
+		t.Fatalf("expected percentile_ranks sub-agg [15->37.5%%, 50->100%%], got: %+v", ranksVals)
 	}
 	if regBucket["svc_str"].(map[string]any)["count"] != float64(2) || regBucket["svc_str"].(map[string]any)["min_length"] != float64(3) {
 		t.Fatalf("expected string_stats sub-agg count=2 min_length=3, got: %+v", regBucket["svc_str"])

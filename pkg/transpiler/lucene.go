@@ -34,6 +34,23 @@ import (
 // function; otherwise, it parses Lucene `field:value`, `AND`/`OR`/`NOT`, `+`/`-`, parenthesized
 // groups, and wildcard clauses into standard Doris `MATCH_ANY` / `LIKE` / `=` predicates.
 func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, scoring bool, nctx *nestedCtx, isSimple bool) CompiledQuery {
+	if errDepth := esast.ValidateQueryStringDepth(qsq.Query); errDepth != nil {
+		if !isSimple && (qsq.Lenient == nil || !*qsq.Lenient) && !t.inLenientQuery {
+			if t.searchErr == nil {
+				t.searchErr = errDepth
+			}
+		}
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
+	if t.luceneDepth >= esast.MaxQueryStringDepth {
+		if !isSimple && (qsq.Lenient == nil || !*qsq.Lenient) && !t.inLenientQuery && t.searchErr == nil {
+			t.searchErr = fmt.Errorf("too_many_nested_clauses: query_string parenthesized group nesting exceeds maximum depth [%d]", esast.MaxQueryStringDepth)
+		}
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+	}
+	t.luceneDepth++
+	defer func() { t.luceneDepth-- }()
+
 	raw := strings.TrimSpace(qsq.Query)
 	allowLeading := isSimple || qsq.AllowLeadingWildcard == nil || *qsq.AllowLeadingWildcard
 	if raw == "" || raw == "*:*" || (allowLeading && raw == "*" && (qsq.DefaultField == "" || qsq.DefaultField == "*" || qsq.DefaultField == "_all_text") && len(qsq.Fields) == 0) {
@@ -296,6 +313,13 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 }
 
 func (t *Transpiler) rewriteDoris4SearchQuery(raw string) (string, bool) {
+	return t.rewriteDoris4SearchQueryDepth(raw, 0)
+}
+
+func (t *Transpiler) rewriteDoris4SearchQueryDepth(raw string, depth int) (string, bool) {
+	if depth > esast.MaxQueryStringDepth {
+		return "", false
+	}
 	if strings.Contains(raw, "_exists_:") || strings.Contains(raw, "&&") || strings.Contains(raw, "||") || strings.Contains(raw, "|") || strings.Contains(raw, "!") || strings.Contains(raw, `\`) {
 		return "", false
 	}
@@ -335,7 +359,7 @@ func (t *Transpiler) rewriteDoris4SearchQuery(raw string) (string, bool) {
 		for _, tok := range tokens {
 			rest := strings.TrimLeft(tok, "+-")
 			if hasMatchingOuterParens(rest) {
-				if _, ok := t.rewriteDoris4SearchQuery(rest[1 : len(rest)-1]); !ok {
+				if _, ok := t.rewriteDoris4SearchQueryDepth(rest[1:len(rest)-1], depth+1); !ok {
 					return "", false
 				}
 			}
@@ -351,7 +375,7 @@ func (t *Transpiler) rewriteDoris4SearchQuery(raw string) (string, bool) {
 			rest = rest[1:]
 		}
 		if hasMatchingOuterParens(rest) {
-			innerRewritten, ok := t.rewriteDoris4SearchQuery(rest[1 : len(rest)-1])
+			innerRewritten, ok := t.rewriteDoris4SearchQueryDepth(rest[1:len(rest)-1], depth+1)
 			if !ok {
 				return "", false
 			}
@@ -386,6 +410,13 @@ func (t *Transpiler) rewriteDoris4SearchQuery(raw string) (string, bool) {
 }
 
 func hasOnlyFieldedDoris4Clauses(rewrittenRaw string) bool {
+	return hasOnlyFieldedDoris4ClausesDepth(rewrittenRaw, 0)
+}
+
+func hasOnlyFieldedDoris4ClausesDepth(rewrittenRaw string, depth int) bool {
+	if depth > esast.MaxQueryStringDepth {
+		return false
+	}
 	tokens := tokenizeLucene(rewrittenRaw)
 	hasClause := false
 	for _, tok := range tokens {
@@ -395,7 +426,7 @@ func hasOnlyFieldedDoris4Clauses(rewrittenRaw string) bool {
 		}
 		rest := strings.TrimLeft(tok, "+-")
 		if hasMatchingOuterParens(rest) {
-			if !hasOnlyFieldedDoris4Clauses(rest[1 : len(rest)-1]) {
+			if !hasOnlyFieldedDoris4ClausesDepth(rest[1:len(rest)-1], depth+1) {
 				return false
 			}
 			hasClause = true
@@ -410,7 +441,11 @@ func hasOnlyFieldedDoris4Clauses(rewrittenRaw string) bool {
 }
 
 func canEmitMultiFieldDoris4SearchDisjunction(rewrittenRaw string, defaultOp string) bool {
-	if strings.Contains(rewrittenRaw, ":") {
+	return canEmitMultiFieldDoris4SearchDisjunctionDepth(rewrittenRaw, defaultOp, 0)
+}
+
+func canEmitMultiFieldDoris4SearchDisjunctionDepth(rewrittenRaw string, defaultOp string, depth int) bool {
+	if depth > esast.MaxQueryStringDepth || strings.Contains(rewrittenRaw, ":") {
 		return false
 	}
 	tokens := tokenizeLucene(rewrittenRaw)
@@ -426,7 +461,7 @@ func canEmitMultiFieldDoris4SearchDisjunction(rewrittenRaw string, defaultOp str
 		if strings.HasPrefix(tok, "+") || strings.HasPrefix(tok, "-") || strings.HasPrefix(tok, "!") {
 			return false
 		}
-		if hasMatchingOuterParens(tok) && !canEmitMultiFieldDoris4SearchDisjunction(tok[1:len(tok)-1], defaultOp) {
+		if hasMatchingOuterParens(tok) && !canEmitMultiFieldDoris4SearchDisjunctionDepth(tok[1:len(tok)-1], defaultOp, depth+1) {
 			return false
 		}
 		clauseCount++
@@ -451,7 +486,7 @@ func (t *Transpiler) isDoris4SearchableField(fname string) bool {
 	return b.Kind == schema.StoragePromotedScalar && (b.DorisType == schema.DorisString || b.DorisType == schema.DorisVarchar)
 }
 
-const maxLuceneDepth = 32
+const maxLuceneDepth = esast.MaxQueryStringDepth
 
 type simpleQueryFlags struct {
 	and                  bool
@@ -554,6 +589,13 @@ func escapeAllLuceneSpecialChars(s string) string {
 }
 
 func hasLeadingLuceneWildcard(s string, flags simpleQueryFlags) bool {
+	return hasLeadingLuceneWildcardDepth(s, flags, 0)
+}
+
+func hasLeadingLuceneWildcardDepth(s string, flags simpleQueryFlags, depth int) bool {
+	if depth > esast.MaxQueryStringDepth {
+		return false
+	}
 	tokens := tokenizeLuceneWithFlags(s, false, flags)
 	for _, tok := range tokens {
 		tok = strings.TrimSpace(tok)
@@ -563,7 +605,7 @@ func hasLeadingLuceneWildcard(s string, flags simpleQueryFlags) bool {
 		tok = strings.TrimLeft(tok, "+-!")
 		tok, _ = splitLuceneBoost(tok)
 		if hasMatchingOuterParens(tok) {
-			if hasLeadingLuceneWildcard(tok[1:len(tok)-1], flags) {
+			if hasLeadingLuceneWildcardDepth(tok[1:len(tok)-1], flags, depth+1) {
 				return true
 			}
 			continue
@@ -574,7 +616,7 @@ func hasLeadingLuceneWildcard(s string, flags simpleQueryFlags) bool {
 			val = strings.TrimLeft(val, "+-!")
 			val, _ = splitLuceneBoost(val)
 			if hasMatchingOuterParens(val) {
-				if hasLeadingLuceneWildcard(val[1:len(val)-1], flags) {
+				if hasLeadingLuceneWildcardDepth(val[1:len(val)-1], flags, depth+1) {
 					return true
 				}
 				continue

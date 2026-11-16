@@ -51,8 +51,18 @@ func ensureESCompatHeaders(w http.ResponseWriter, r *http.Request) {
 func writeJSONWithRequest(w http.ResponseWriter, r *http.Request, status int, v any) {
 	ensureESCompatHeaders(w, r)
 	if r != nil {
-		if _, ok := extractESResponseFormatOptions(w); !ok {
-			if opts, hasOpts := parseESResponseFormatOptions(r); hasOpts {
+		if opts, hasOpts := parseESResponseFormatOptionsRound61(r); hasOpts {
+			if len(opts.filterPaths) > 0 {
+				v = applyFilterPathRound61(v, opts.filterPaths)
+				opts.filterPaths = nil
+			}
+			targetW := w
+			if gw, okG := targetW.(*gzipResponseWriter); okG {
+				targetW = gw.ResponseWriter
+			}
+			if fw, okF := targetW.(*esFormatResponseWriter); okF {
+				fw.opts = opts
+			} else if opts.pretty || opts.errorTrace {
 				w = &esFormatResponseWriter{ResponseWriter: w, opts: opts}
 			}
 		}
@@ -65,6 +75,12 @@ func (s *Server) handleCatTemplatesRound58(w http.ResponseWriter, r *http.Reques
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
+	pat := strings.TrimSpace(r.PathValue("name"))
+	if strings.Contains(pat, ",") {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+			fmt.Sprintf("name cannot contain commas: [%s]", pat))
+		return
+	}
 	_ = s.syncCatalogFromBackend(r.Context())
 	s.mu.RLock()
 	emptyBoth := len(s.templates) == 0 && len(s.legacyTemplates) == 0
@@ -73,7 +89,6 @@ func (s *Server) handleCatTemplatesRound58(w http.ResponseWriter, r *http.Reques
 		s.handleCatTemplates(w, r)
 		return
 	}
-	pat := strings.TrimSpace(r.PathValue("name"))
 	s.mu.RLock()
 	seen := make(map[string]bool, len(s.templates)+len(s.legacyTemplates))
 	names := make([]string, 0, len(s.templates)+len(s.legacyTemplates))
@@ -105,12 +120,16 @@ func (s *Server) handleCatTemplatesRound58(w http.ResponseWriter, r *http.Reques
 				verStr = strconv.Itoa(v)
 			}
 		}
+		composedStr := ""
+		if isComp {
+			composedStr = "[" + strings.Join(tpl.ComposedOf, ", ") + "]"
+		}
 		list = append(list, map[string]any{
 			"name":           k,
 			"index_patterns": patterns,
 			"order":          fmt.Sprintf("%d", tpl.EffectivePriority()),
 			"version":        verStr,
-			"composed_of":    "[" + strings.Join(tpl.ComposedOf, ", ") + "]",
+			"composed_of":    composedStr,
 		})
 	}
 	s.mu.RUnlock()
@@ -122,10 +141,12 @@ func (s *Server) handleCatTemplatesRound58(w http.ResponseWriter, r *http.Reques
 // ---------------------------------------------------------------------------
 
 type pitContextEntry struct {
-	ID        string
-	Targets   []string
-	RawIndex  string
-	ExpiresAt time.Time
+	ID             string
+	Targets        []string
+	RawIndex       string
+	ExpiresAt      time.Time
+	IndexFilter    *esast.Query
+	SnapshotDocIDs map[string]map[string]struct{}
 }
 
 type scrollContextEntry struct {
@@ -379,20 +400,59 @@ func (s *Server) handlePITRound58(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	bodyBytes, okBody := readRequestBody(w, r)
+	if !okBody {
+		return
+	}
+	var pitIndexFilter *esast.Query
+	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		var rawPITBody map[string]json.RawMessage
+		if err := json.Unmarshal(bodyBytes, &rawPITBody); err != nil {
+			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+			return
+		}
+		for k, rawVal := range rawPITBody {
+			switch k {
+			case "index_filter":
+				var iq esast.Query
+				if err := json.Unmarshal(rawVal, &iq); err != nil {
+					writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+					return
+				}
+				pitIndexFilter = &iq
+			default:
+				writeESError(w, http.StatusBadRequest, "parsing_exception", fmt.Sprintf("Unknown key for a START_OBJECT in [open_point_in_time]: [%s].", k))
+				return
+			}
+		}
+	}
+
 	pitPattern := rawIndex
 	if len(aliasFilters) == 0 && len(targets) > 0 {
 		pitPattern = strings.Join(targets, ",")
 	}
 	s.mu.Lock()
 	s.ensurePITStoreLocked()
+	snapDocs := make(map[string]map[string]struct{}, len(targets))
+	for _, t := range targets {
+		set := make(map[string]struct{})
+		if s.docVersions != nil {
+			for docID := range s.docVersions[t] {
+				set[docID] = struct{}{}
+			}
+		}
+		snapDocs[t] = set
+	}
 	s.pitSeq++
 	seq := s.pitSeq
 	pitID := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("pit:%s#%d", pitPattern, seq)))
 	s.pits[pitID] = &pitContextEntry{
-		ID:        pitID,
-		Targets:   append([]string(nil), targets...),
-		RawIndex:  pitPattern,
-		ExpiresAt: time.Now().Add(ttl),
+		ID:             pitID,
+		Targets:        append([]string(nil), targets...),
+		RawIndex:       pitPattern,
+		ExpiresAt:      time.Now().Add(ttl),
+		IndexFilter:    pitIndexFilter,
+		SnapshotDocIDs: snapDocs,
 	}
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"id": pitID})
@@ -402,8 +462,8 @@ func (s *Server) validateAndResolvePITRequest(rawIndex string, req *esast.Search
 	if req == nil || req.PIT == nil {
 		return rawIndex, 0, "", ""
 	}
-	if strings.TrimSpace(rawIndex) != "" {
-		return "", http.StatusBadRequest, "illegal_argument_exception", "[pit] cannot be used together with index"
+	if st, eType, eReason := validatePITWithIndexPathR61Search(rawIndex, req); st != 0 {
+		return "", st, eType, eReason
 	}
 	pitID := strings.TrimSpace(req.PIT.ID)
 	if pitID == "" {
@@ -434,8 +494,67 @@ func (s *Server) validateAndResolvePITRequest(rawIndex string, req *esast.Search
 	pitTarget := entry.RawIndex
 	s.mu.Unlock()
 
-	ensurePITDeterministicSort(req)
+	ensurePITShardDocTieBreakerR61Search(req)
 	return pitTarget, 0, "", ""
+}
+
+func (s *Server) applyPITContextFilters(pitID string, targets []string, aliasFilters map[string]*esast.Query) map[string]*esast.Query {
+	pitID = strings.TrimSpace(pitID)
+	if pitID == "" || len(targets) == 0 {
+		return aliasFilters
+	}
+	s.mu.RLock()
+	var entry *pitContextEntry
+	if s.pits != nil {
+		entry = s.pits[pitID]
+	}
+	if entry == nil {
+		s.mu.RUnlock()
+		return aliasFilters
+	}
+	idxFilter := entry.IndexFilter
+	postPITIDsByIdx := make(map[string][]string)
+	for _, t := range targets {
+		snapSet, hasSnap := entry.SnapshotDocIDs[t]
+		if !hasSnap || s.docVersions == nil {
+			continue
+		}
+		for curID := range s.docVersions[t] {
+			if _, existedAtOpen := snapSet[curID]; !existedAtOpen {
+				postPITIDsByIdx[t] = append(postPITIDsByIdx[t], curID)
+			}
+		}
+	}
+	s.mu.RUnlock()
+
+	if idxFilter == nil && len(postPITIDsByIdx) == 0 {
+		return aliasFilters
+	}
+	out := make(map[string]*esast.Query, len(targets))
+	for k, v := range aliasFilters {
+		out[k] = v
+	}
+	for _, t := range targets {
+		cur := out[t]
+		if idxFilter != nil {
+			cur = combineQueryWithAliasFilter(idxFilter, cur)
+		}
+		if excluded := postPITIDsByIdx[t]; len(excluded) > 0 {
+			sort.Strings(excluded)
+			notNewQ := &esast.Query{
+				Bool: &esast.BoolQuery{
+					MustNot: []esast.Query{
+						{Ids: &esast.IdsQuery{Values: excluded}},
+					},
+				},
+			}
+			cur = combineQueryWithAliasFilter(notNewQ, cur)
+		}
+		if cur != nil {
+			out[t] = cur
+		}
+	}
+	return out
 }
 
 func (s *Server) isPITActive(pitID string) bool {
@@ -451,43 +570,6 @@ func (s *Server) isPITActive(pitID string) bool {
 	}
 	entry, ok := s.pits[pitID]
 	return ok && entry != nil && !now.After(entry.ExpiresAt)
-}
-
-func ensurePITDeterministicSort(req *esast.SearchRequest) {
-	if req == nil || req.PIT == nil {
-		return
-	}
-	hasIDTie := false
-	for i := range req.Sort {
-		if req.Sort[i].Entry.Field == "_shard_doc" {
-			req.Sort[i].Entry.Field = "_id"
-			if req.Sort[i].Entry.Order == "" {
-				req.Sort[i].Entry.Order = "asc"
-			}
-		}
-		if req.Sort[i].Entry.Field == "_id" {
-			hasIDTie = true
-		}
-	}
-	if len(req.Sort) == 0 {
-		isUnscored := req.Query == nil || req.Query.MatchAll != nil
-		if len(req.SearchAfter) == 2 || (!isUnscored && len(req.SearchAfter) != 1) {
-			req.Sort = esast.SortSlice{
-				{Entry: esast.SortFieldSpec{Field: "_score", Order: "desc"}},
-				{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}},
-			}
-		} else {
-			req.Sort = esast.SortSlice{
-				{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}},
-			}
-		}
-		return
-	}
-	if !hasIDTie {
-		req.Sort = append(req.Sort, esast.SortSpec{
-			Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"},
-		})
-	}
 }
 
 func (s *Server) registerInitialScrollContext(token string, ttl time.Duration) {
@@ -1807,11 +1889,52 @@ func matchesFieldCapsPatterns(field string, patterns []string) bool {
 }
 
 type fieldCapsFilterFlags struct {
-	onlyMetadata bool
-	noMetadata   bool
-	noMultifield bool
-	noNested     bool
-	noParent     bool
+	onlyMetadata   bool
+	noMetadata     bool
+	onlyMultifield bool
+	noMultifield   bool
+	onlyNested     bool
+	noNested       bool
+	onlyParent     bool
+	noParent       bool
+	onlyRuntime    bool
+	noRuntime      bool
+	onlyStandard   bool
+	noStandard     bool
+	hasPositive    bool
+}
+
+func (f fieldCapsFilterFlags) allows(isMeta, isMultifield, isNested, isParent, isRuntime, isStandard bool) bool {
+	if f.noMetadata && isMeta {
+		return false
+	}
+	if f.noMultifield && isMultifield {
+		return false
+	}
+	if f.noNested && isNested {
+		return false
+	}
+	if f.noParent && isParent {
+		return false
+	}
+	if f.noRuntime && isRuntime {
+		return false
+	}
+	if f.noStandard && isStandard {
+		return false
+	}
+	if f.hasPositive {
+		matchedPos := (f.onlyMetadata && isMeta) ||
+			(f.onlyMultifield && isMultifield) ||
+			(f.onlyNested && isNested) ||
+			(f.onlyParent && isParent) ||
+			(f.onlyRuntime && isRuntime) ||
+			(f.onlyStandard && isStandard)
+		if !matchedPos {
+			return false
+		}
+	}
+	return true
 }
 
 func parseFieldCapsFilters(tokens []string) (fieldCapsFilterFlags, error) {
@@ -1825,14 +1948,34 @@ func parseFieldCapsFilters(tokens []string) (fieldCapsFilterFlags, error) {
 			switch tok {
 			case "+metadata":
 				f.onlyMetadata = true
+				f.hasPositive = true
 			case "-metadata":
 				f.noMetadata = true
+			case "+multifield":
+				f.onlyMultifield = true
+				f.hasPositive = true
 			case "-multifield":
 				f.noMultifield = true
+			case "+nested":
+				f.onlyNested = true
+				f.hasPositive = true
 			case "-nested":
 				f.noNested = true
+			case "+parent":
+				f.onlyParent = true
+				f.hasPositive = true
 			case "-parent":
 				f.noParent = true
+			case "+runtime":
+				f.onlyRuntime = true
+				f.hasPositive = true
+			case "-runtime":
+				f.noRuntime = true
+			case "+standard":
+				f.onlyStandard = true
+				f.hasPositive = true
+			case "-standard":
+				f.noStandard = true
 			default:
 				return f, fmt.Errorf("unknown field_caps filter [%s]", part)
 			}
@@ -2018,8 +2161,12 @@ func advanceArrayFilterPatterns(patterns [][]string, idx int) (elemPatterns [][]
 			elemPatterns = append(elemPatterns, p)
 			if len(p) == 1 {
 				matchedLeaf = true
-			} else {
-				elemPatterns = append(elemPatterns, p[1:])
+			} else if p[1] == "*" || p[1] == idxStr {
+				if len(p) == 2 {
+					matchedLeaf = true
+				} else {
+					elemPatterns = append(elemPatterns, p[2:])
+				}
 			}
 		case "*", idxStr:
 			if len(p) == 1 {
@@ -2549,7 +2696,7 @@ func writeCatResponseWithHelpCols(w http.ResponseWriter, r *http.Request, header
 				}
 			}
 			// #nosec G705 -- Content-Type is text/plain with X-Content-Type-Options: nosniff
-			_, _ = fmt.Fprintln(w, strings.TrimRight(line.String(), " "))
+			_, _ = fmt.Fprintln(w, line.String())
 		}
 		if verbose && numCols > 0 {
 			hdrCells := make([]string, numCols)

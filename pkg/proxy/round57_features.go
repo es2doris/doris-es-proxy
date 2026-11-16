@@ -324,10 +324,36 @@ func substituteSQLParams(query string, params []any) (string, error) {
 				} else {
 					out.WriteString("FALSE")
 				}
-			case int, int64, int32, float64, float32, json.Number:
+			case int, int64, int32, int16, int8, uint, uint64, uint32, uint16, uint8:
 				_, _ = fmt.Fprintf(&out, "%v", v)
+			case float64:
+				if math.IsNaN(v) || math.IsInf(v, 0) {
+					return "", fmt.Errorf("non-finite float value in SQL parameter [%d]", paramIdx)
+				}
+				out.WriteString(strconv.FormatFloat(v, 'g', -1, 64))
+			case float32:
+				fv := float64(v)
+				if math.IsNaN(fv) || math.IsInf(fv, 0) {
+					return "", fmt.Errorf("non-finite float value in SQL parameter [%d]", paramIdx)
+				}
+				out.WriteString(strconv.FormatFloat(fv, 'g', -1, 32))
+			case json.Number:
+				numStr := strings.TrimSpace(v.String())
+				if iv, err := v.Int64(); err == nil {
+					out.WriteString(strconv.FormatInt(iv, 10))
+				} else if uv, err := strconv.ParseUint(numStr, 10, 64); err == nil {
+					out.WriteString(strconv.FormatUint(uv, 10))
+				} else {
+					fv, err := v.Float64()
+					if err != nil || math.IsNaN(fv) || math.IsInf(fv, 0) {
+						return "", fmt.Errorf("invalid numeric value [%s] in SQL parameter [%d]", numStr, paramIdx)
+					}
+					out.WriteString(strconv.FormatFloat(fv, 'g', -1, 64))
+				}
 			default:
-				escaped := strings.ReplaceAll(fmt.Sprintf("%v", v), "'", "''")
+				escaped := strings.ReplaceAll(fmt.Sprintf("%v", v), "\x00", "")
+				escaped = strings.ReplaceAll(escaped, `\`, `\\`)
+				escaped = strings.ReplaceAll(escaped, `'`, `''`)
 				out.WriteByte('\'')
 				out.WriteString(escaped)
 				out.WriteByte('\'')
@@ -5816,62 +5842,6 @@ func (s *Server) findIndicesUsingSynonymSetLocked(setID string) []map[string]any
 	return details
 }
 
-func (s *Server) buildSynonymReloadPayloadLocked(setID string) map[string]any {
-	matched := s.findIndicesUsingSynonymSetLocked(setID)
-	totalShards := len(matched)
-	if totalShards == 0 {
-		totalShards = 1
-	}
-	reloadDetails := make([]any, 0, len(matched))
-	for _, m := range matched {
-		reloadDetails = append(reloadDetails, m)
-	}
-	return map[string]any{
-		"_shards": map[string]any{
-			"total":      totalShards,
-			"successful": totalShards,
-			"failed":     0,
-		},
-		"reload_details": reloadDetails,
-	}
-}
-
-func (s *Server) buildIndexReloadAnalyzersDetailsLocked(targets []string) []any {
-	sorted := append([]string(nil), targets...)
-	sort.Strings(sorted)
-	reloadDetails := make([]any, 0, len(sorted))
-	for _, idxName := range sorted {
-		analyzers, filters := extractIndexAnalysisMaps(s.indexCustomSettings[idxName])
-		updateableFilters := make(map[string]bool)
-		for fName, fDef := range filters {
-			fType := fmt.Sprintf("%v", fDef["type"])
-			upd, _ := fDef["updateable"].(bool)
-			if upd || fmt.Sprintf("%v", fDef["updateable"]) == "true" || fDef["synonyms_set"] != nil || fType == "synonym" || fType == "synonym_graph" {
-				updateableFilters[fName] = true
-			}
-		}
-		var reloaded []string
-		for aName, aDef := range analyzers {
-			for _, fRef := range extractStringSliceAny(aDef["filter"]) {
-				if updateableFilters[fRef] {
-					reloaded = append(reloaded, aName)
-					break
-				}
-			}
-		}
-		sort.Strings(reloaded)
-		if reloaded == nil {
-			reloaded = []string{}
-		}
-		reloadDetails = append(reloadDetails, map[string]any{
-			"index":              idxName,
-			"reloaded_analyzers": reloaded,
-			"reloaded_node_ids":  []string{"doris-fe-1"},
-		})
-	}
-	return reloadDetails
-}
-
 type parsedSynonymRule struct {
 	explicit bool
 	lhs      []string // lowercased single/multi-word phrases
@@ -8258,82 +8228,6 @@ func (s *Server) handleFleetSecretsRound57(w http.ResponseWriter, r *http.Reques
 	writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
 }
 
-// handleCapabilitiesRound57 implements `GET/POST /_capabilities` (F9.2).
-func (s *Server) handleCapabilitiesRound57(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodHead {
-		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
-		return
-	}
-	var body map[string]any
-	if r.ContentLength != 0 {
-		var ok bool
-		body, ok = parseJSONBody(w, r)
-		if !ok {
-			return
-		}
-	}
-	if r.Method == http.MethodHead {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	defaultCapSpec := func() map[string]any {
-		return map[string]any{
-			"parameters": []string{},
-		}
-	}
-	allCaps := map[string]any{
-		"create_pit":             defaultCapSpec(),
-		"search":                 map[string]any{"parameters": []string{"allow_no_indices", "ccs_minimize_roundtrips", "expand_wildcards", "ignore_throttled", "ignore_unavailable", "preference", "request_cache", "routing", "scroll", "search_type", "track_total_hits", "typed_keys"}},
-		"knn":                    defaultCapSpec(),
-		"sub_searches":           defaultCapSpec(),
-		"retriever":              defaultCapSpec(),
-		"esql":                   defaultCapSpec(),
-		"eql":                    defaultCapSpec(),
-		"sql":                    defaultCapSpec(),
-		"ingest":                 defaultCapSpec(),
-		"synonyms":               defaultCapSpec(),
-		"query_rules":            defaultCapSpec(),
-		"inference":              defaultCapSpec(),
-		"connectors":             defaultCapSpec(),
-		"search_application":     defaultCapSpec(),
-		"security":               defaultCapSpec(),
-		"fleet":                  defaultCapSpec(),
-		"ml":                     defaultCapSpec(),
-		"slm":                    defaultCapSpec(),
-		"searchable_snapshots":   defaultCapSpec(),
-		"rest_capabilities_api":  defaultCapSpec(),
-		"field_capabilities_api": defaultCapSpec(),
-	}
-
-	var requested []string
-	if qCaps := strings.TrimSpace(r.URL.Query().Get("capabilities")); qCaps != "" {
-		for _, c := range strings.Split(qCaps, ",") {
-			if c = strings.TrimSpace(c); c != "" {
-				requested = append(requested, c)
-			}
-		}
-	}
-	if body != nil {
-		requested = append(requested, extractStringSliceAny(body["capabilities"])...)
-	}
-
-	outCaps := make(map[string]any)
-	if len(requested) == 0 {
-		outCaps = allCaps
-	} else {
-		for _, capName := range requested {
-			if spec, ok := allCaps[capName]; ok {
-				outCaps[capName] = spec
-			}
-		}
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"capabilities": outCaps,
-	})
-}
-
 // handleSimulateIndexIngestRound57 implements `POST /_ingest/_simulate` and `POST /{index}/_ingest/_simulate` (`simulate.ingest`) (F9.3).
 func (s *Server) handleSimulateIndexIngestRound57(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost && r.Method != http.MethodGet {
@@ -8863,20 +8757,23 @@ func (s *Server) handleMigrationSystemFeaturesRound57(w http.ResponseWriter, r *
 			return
 		}
 		s.mu.RLock()
-		kibanaState := "MIGRATION_NEEDED"
+		kibanaState := "NONE"
 		securityState := "NONE"
-		if s.migrationSystemFeatures != nil {
-			if s.migrationSystemFeatures["kibana"] {
-				kibanaState = "NONE"
+		if len(s.migrationSystemFeatures) > 0 {
+			if migrated, hasKib := s.migrationSystemFeatures["kibana"]; hasKib && !migrated {
+				kibanaState = "MIGRATION_NEEDED"
 			}
-			if s.migrationSystemFeatures["security"] {
-				securityState = "NONE"
+			if migrated, hasSec := s.migrationSystemFeatures["security"]; hasSec && !migrated {
+				securityState = "MIGRATION_NEEDED"
 			}
-		} else {
-			kibanaState = "NONE"
 		}
 		s.mu.RUnlock()
+		overallMigrationStatus := "NO_MIGRATION_NEEDED"
+		if kibanaState == "MIGRATION_NEEDED" || securityState == "MIGRATION_NEEDED" {
+			overallMigrationStatus = "MIGRATION_NEEDED"
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
+			"migration_status": overallMigrationStatus,
 			"features": []any{
 				map[string]any{
 					"feature_name":          "kibana",

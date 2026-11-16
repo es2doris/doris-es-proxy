@@ -57,24 +57,36 @@ type specSchemaFile struct {
 	Types     []specTypeDef     `json:"types"`
 }
 
+type specURLTemplate struct {
+	Methods []string `json:"methods"`
+	Path    string   `json:"path"`
+}
+
+type specExceptionDef struct {
+	StatusCodes []int            `json:"statusCodes"`
+	Body        specResponseBody `json:"body"`
+}
+
 type specEndpointDef struct {
-	Name              string        `json:"name"`
-	Request           *specTypeName `json:"request"`
-	Response          *specTypeName `json:"response"`
-	ResponseMediaType []string      `json:"responseMediaType"`
+	Name              string            `json:"name"`
+	URLs              []specURLTemplate `json:"urls"`
+	Request           *specTypeName     `json:"request"`
+	Response          *specTypeName     `json:"response"`
+	ResponseMediaType []string          `json:"responseMediaType"`
 }
 
 type specTypeDef struct {
-	Kind       string            `json:"kind"`
-	Name       specTypeName      `json:"name"`
-	Generics   []specTypeName    `json:"generics"`
-	Inherits   *specInheritsSpec `json:"inherits"`
-	Properties []specPropertyDef `json:"properties"`
-	Body       *specResponseBody `json:"body"`
-	Type       *specTypeExpr     `json:"type"`
-	Members    []specEnumMember  `json:"members"`
-	IsOpen     bool              `json:"isOpen"`
-	Behaviors  []specBehaviorDef `json:"behaviors"`
+	Kind       string             `json:"kind"`
+	Name       specTypeName       `json:"name"`
+	Generics   []specTypeName     `json:"generics"`
+	Inherits   *specInheritsSpec  `json:"inherits"`
+	Properties []specPropertyDef  `json:"properties"`
+	Body       *specResponseBody  `json:"body"`
+	Exceptions []specExceptionDef `json:"exceptions"`
+	Type       *specTypeExpr      `json:"type"`
+	Members    []specEnumMember   `json:"members"`
+	IsOpen     bool               `json:"isOpen"`
+	Behaviors  []specBehaviorDef  `json:"behaviors"`
 }
 
 type specInheritsSpec struct {
@@ -168,6 +180,7 @@ func (e *specTypeExpr) UnmarshalJSON(data []byte) error {
 // elastic/elasticsearch-specification output/schema/schema.json model.
 type SpecSchemaValidator struct {
 	endpoints     map[string]specEndpointDef
+	endpointNames []string
 	types         map[specTypeKey]specTypeDef
 	endpointCount int
 	typeCount     int
@@ -190,12 +203,17 @@ func ParseSpecSchemaValidator(raw []byte) (*SpecSchemaValidator, error) {
 	}
 
 	endpoints := make(map[string]specEndpointDef, len(parsed.Endpoints))
+	endpointNames := make([]string, 0, len(parsed.Endpoints))
 	for _, ep := range parsed.Endpoints {
 		if ep.Name == "" {
 			continue
 		}
+		if _, exists := endpoints[ep.Name]; !exists {
+			endpointNames = append(endpointNames, ep.Name)
+		}
 		endpoints[ep.Name] = ep
 	}
+	sort.Strings(endpointNames)
 
 	types := make(map[specTypeKey]specTypeDef, len(parsed.Types))
 	for _, td := range parsed.Types {
@@ -207,6 +225,7 @@ func ParseSpecSchemaValidator(raw []byte) (*SpecSchemaValidator, error) {
 
 	return &SpecSchemaValidator{
 		endpoints:     endpoints,
+		endpointNames: endpointNames,
 		types:         types,
 		endpointCount: len(parsed.Endpoints),
 		typeCount:     len(parsed.Types),
@@ -236,6 +255,145 @@ func (v *SpecSchemaValidator) HasEndpoint(endpoint string) bool {
 	}
 	_, ok := v.endpoints[strings.TrimSpace(endpoint)]
 	return ok
+}
+
+func matchSpecURLTemplate(method, cleanPath string, tmpl specURLTemplate) (bool, int) {
+	methodOK := false
+	for _, m := range tmpl.Methods {
+		if strings.EqualFold(m, method) {
+			methodOK = true
+			break
+		}
+	}
+	if !methodOK {
+		return false, 0
+	}
+	if tmpl.Path == "/" && cleanPath == "/" {
+		return true, 100
+	}
+	tSegs := strings.Split(strings.Trim(tmpl.Path, "/"), "/")
+	pSegs := strings.Split(strings.Trim(cleanPath, "/"), "/")
+	if tmpl.Path == "/" || cleanPath == "/" || len(tSegs) != len(pSegs) {
+		return false, 0
+	}
+	literalScore := 0
+	for i := range tSegs {
+		if strings.HasPrefix(tSegs[i], "{") && strings.HasSuffix(tSegs[i], "}") {
+			if pSegs[i] == "" || strings.HasPrefix(pSegs[i], "_") {
+				return false, 0
+			}
+			literalScore += 1
+			continue
+		}
+		if tSegs[i] != pSegs[i] {
+			return false, 0
+		}
+		literalScore += 10
+	}
+	return true, literalScore
+}
+
+// MatchEndpoint matches an HTTP method and URL path against endpoint URL templates in schema.json.
+// If candidates are provided, only those endpoint names are considered; otherwise all endpoints are searched.
+func (v *SpecSchemaValidator) MatchEndpoint(method, urlPath string, candidates ...string) string {
+	if v == nil {
+		return ""
+	}
+	cleanPath := urlPath
+	if cleanPath == "" {
+		cleanPath = "/"
+	}
+	names := candidates
+	if len(names) == 0 {
+		names = v.endpointNames
+	}
+	bestName := ""
+	bestScore := -1
+	for _, epName := range names {
+		ep, ok := v.endpoints[epName]
+		if !ok {
+			continue
+		}
+		for _, u := range ep.URLs {
+			if matched, score := matchSpecURLTemplate(method, cleanPath, u); matched && score > bestScore {
+				bestScore = score
+				bestName = epName
+			}
+		}
+	}
+	return bestName
+}
+
+// ValidateHTTPResponse validates an HTTP response payload given its HTTP status code and endpoint name.
+// For 2xx/3xx responses it delegates to ValidateEndpointResponse. For 4xx/5xx responses it validates
+// against declared endpoint exception schemas (e.g. get 404, cluster.health 408) or the standard
+// Elasticsearch structured {"error": ...} response envelope.
+func (v *SpecSchemaValidator) ValidateHTTPResponse(endpoint string, statusCode int, payload []byte) error {
+	if v == nil {
+		return fmt.Errorf("nil SpecSchemaValidator")
+	}
+	epName := strings.TrimSpace(endpoint)
+	ep, ok := v.endpoints[epName]
+	if !ok {
+		return fmt.Errorf("unknown specification endpoint %q", endpoint)
+	}
+	if statusCode < 400 {
+		return v.ValidateEndpointResponse(epName, payload)
+	}
+
+	trimmedPayload := bytes.TrimSpace(payload)
+	if len(trimmedPayload) == 0 {
+		if ep.Response != nil {
+			if respDef, exists := v.types[ep.Response.key()]; exists {
+				for _, exc := range respDef.Exceptions {
+					for _, code := range exc.StatusCodes {
+						if code == statusCode && exc.Body.Kind == "no_body" {
+							return nil
+						}
+					}
+				}
+			}
+		}
+		return fmt.Errorf("endpoint %q ($): empty error payload on HTTP %d", epName, statusCode)
+	}
+
+	root, err := decodeStrictJSONPayload(trimmedPayload)
+	if err != nil {
+		return fmt.Errorf("endpoint %q ($): invalid JSON error response on HTTP %d: %w", epName, statusCode, err)
+	}
+
+	if ep.Response != nil {
+		if respDef, exists := v.types[ep.Response.key()]; exists {
+			bindings := unboundGenericBindings(respDef.Generics)
+			for _, exc := range respDef.Exceptions {
+				for _, code := range exc.StatusCodes {
+					if code == statusCode {
+						excDef := specTypeDef{
+							Kind: "response",
+							Name: specTypeName{
+								Namespace: respDef.Name.Namespace,
+								Name:      respDef.Name.Name + ".Exception",
+							},
+							Body: &exc.Body,
+						}
+						if err := v.validateNamedType("$", root, excDef, bindings, 0); err != nil {
+							return fmt.Errorf("endpoint %q (HTTP %d): %w", epName, statusCode, err)
+						}
+						return nil
+					}
+				}
+			}
+		}
+	}
+
+	obj, ok := root.(map[string]any)
+	if !ok {
+		return fmt.Errorf("endpoint %q ($): expected JSON object error envelope on HTTP %d, got %s", epName, statusCode, describeJSONKind(root))
+	}
+	if _, hasErr := obj["error"]; !hasErr {
+		return fmt.Errorf("endpoint %q ($): expected \"error\" field in HTTP %d response", epName, statusCode)
+	}
+	return nil
 }
 
 // ValidateEndpointResponse validates a serialized JSON response payload against the
