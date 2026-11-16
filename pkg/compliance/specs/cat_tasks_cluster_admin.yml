@@ -272,9 +272,9 @@
       snapshot.create:
         repository: "repo_spec_fs"
         snapshot: "snap_1"
+        wait_for_completion: true
         body:
-          indices: "admin_spec_idx"
-  - match: { accepted: true }
+          indices: "knn_spec_idx"
   - match: { snapshot.snapshot: "snap_1" }
   - match: { snapshot.state: "SUCCESS" }
 
@@ -298,6 +298,11 @@
         format: "json"
   - length: { $body: 1 }
   - match: { 0.id: "snap_1" }
+
+  - do:
+      indices.delete:
+        index: "knn_spec_idx"
+  - match: { acknowledged: true }
 
   - do:
       snapshot.restore:

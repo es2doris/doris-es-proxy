@@ -86,7 +86,7 @@ func (s *Server) ensureConcreteIndexExists(w http.ResponseWriter, r *http.Reques
 
 // validatePutDocRound59 validates op_type and auto-ID OCC/version constraints on handlePutDoc.
 func validatePutDocRound59(w http.ResponseWriter, r *http.Request, docID string) (isCreate bool, isExplicitIndexOp bool, ok bool) {
-	isCreateEndpoint := r != nil && strings.Contains(r.URL.Path, "/_create/")
+	isCreateEndpoint := r != nil && (strings.Contains(r.URL.Path, "/_create/") || strings.HasSuffix(r.URL.Path, "/_create"))
 	var rawOpType string
 	if r != nil && r.URL != nil && r.URL.Query().Has("op_type") {
 		rawOpType = strings.TrimSpace(r.URL.Query().Get("op_type"))

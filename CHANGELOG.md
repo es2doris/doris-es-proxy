@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-16
+
+### Added
+- **Round-61 Upstream Elastic Conformance Expansion (`F0`–`F29`), Unified Wire-Schema Validator & 22-Suite Official Go SDK v8 Verification:** Expanded `scripts/fetch-conformance-specs.sh` and `pkg/compliance` to sparse-fetch and run **`1,257` upstream YAML files** (`522` `v7.10.2` Apache-2.0 + `735` out-of-tree `v8.15.5` core & 8 ES 8 module suites: `painless`, `ingest-common`, `reindex`, `mapper-annotated-text`, `lang-mustache`, `repository-url`, `analysis-common`, `aggs-matrix-stats`) with **100% YAML 1.2 parse rate (`0` errors)**, raising `v7.10.2` conformance from `1,075 / 1,658` (`64.84%`) to **`1,468 / 1,658` (`88.54%`)** and `v8.15.5` conformance from `1,093 / 2,066` (`52.90%`) to **`2,218 / 3,334` (`66.53%`)** (ratcheted in CI at `CONFORMANCE_MIN_V7_PASSED=1460`, `CONFORMANCE_MIN_V8_PASSED=2200`); unified `compliance.SpecSchemaValidator` across `pkg/compliance` and `e2e/sdkconformance` validating **`50` endpoints** (including unskipped `cluster.health`) against `elastic/elasticsearch-specification` `8.15` `schema.json` (`518` endpoints / `3,025` types); and expanded `e2e/sdkconformance` to **`22` end-to-end `github.com/elastic/go-elasticsearch/v8` suites** covering `TypedClient`, `Client`, `BulkIndexer`, templates, PIT, scroll, stored scripts, `explain`, `reindex`, `ingest`, and aggregations.
+- **Live Apache Doris 4.1.3 `TelemetryBackend` (`SHOW BACKENDS` / `SHOW DATA`):** Implemented `TelemetryBackend` in `DorisSQLBackend` (`QueryBackendNodes`, `QueryTableDataSizes`, `ParseDorisByteSize`, `ParseDorisPercent`) to populate `/_nodes`, `/_nodes/stats`, `/_cluster/stats`, `/_stats`, and `/_cat/{nodes,shards,allocation,indices}` from live Apache Doris FE/BE cluster state with bounded TTL caching and graceful fallback.
+- **ES 8 TSDB, Dense Vector (`bit`/`byte`/hex/auto-dims), Painless Contexts & Admin/Stats Parity:** Added Time-Series Data Stream (`index.mode: "time_series"`) dimension routing-path validation and deterministic 20-byte base64url `_id` synthesis; `dense_vector` `bit` and `byte` element types, hex-encoded vectors, `auto` dimension locking on first write, and nested kNN `inner_hits`; topological `runtime_mappings` dependency sorting and cycle detection, Painless `/_scripts/painless/_execute` `context` & `/_scripts/painless/_context` APIs, `half_float` IEEE-754 binary16 quantization, Lucene 32-bit Morton `geo_point` quantization, and vector similarity helpers (`cosineSimilarity`, `dotProduct`, `l1norm`, `l2norm`, `hamming`, `magnitude`); and `/_info`, `/_field_usage_stats`, `/_resolve/index`, `/_data_stream`, `/_cat/*`, and live ingest pipeline byte/processor telemetry.
+
+### Fixed
+- **Exact SQL Companion Quantiles (`__raw_vals__*`), Pipeline Aggregations, Query DSL & CRUD/Index Semantics:** Emitted companion `__raw_vals__<agg>` `COLLECT_LIST` SQL branches in `pkg/transpiler` and `stripAndApplyExactQuantilesR61Search` in `pkg/proxy` for exact TDigest/HDR `percentiles`, `percentile_ranks`, `boxplot`, and `median_absolute_deviation` across top-level and grouped bucket sub-aggregations; preserved Auto-Indexing Advisor (`GET /_doris/slowlog`) unindexed `VARIANT` detection on scriptless `dynamic: "runtime"` fields; enforced ES pipeline aggregation parent/path validation, `moving_fn` `MovingFunctions.*` evaluation, `terms` MurmurHash3/Java `Long.hashCode` partitioning, `search_after` + `pit` `_shard_doc` tie-breakers, `force_synthetic_source`, highlight `max_analyzed_offset` guards, unified `fields` / `docvalue_fields` formatting, IPv6 CIDR/prefix canonicalization, and ES 7 vs ES 8 `_type` / `include_type_name` / `_bulk` deprecation parity.
+
+### Security
+- **Red-Team SQLi, SSRF & DoS Hardening (`F29`):** Eliminated Doris MySQL backslash-quote (`\'`) SQL injection via `EscapeDorisSQLString` (`\` $\rightarrow$ `\\`, `'` $\rightarrow$ `''`, NUL stripping) and `IsSafeJSONNumberLiteral`; capped Lucene `query_string` parenthesis/field-group recursion depth (`maxQueryStringNestingDepth = 64`); hardened `_reindex` `source.remote` against SSRF with an empty default host whitelist (`reindex.remote.whitelist`), private/loopback/link-local IPv4/IPv6 dial validation when non-explicitly whitelisted, HTTP redirect rejection (`CheckRedirect`), and response body size caps; added bounded TTL/LRU eviction (`maxCompletedTasks = 1024`) and instant `_rethrottle` channel wakeup in `taskRegistry`; and capped Painless `pinnedRefs` allocation budgets and compiled regex LRU caches (`maxRegexPatternLen = 4096`, `maxCompiledRegexCacheEntries = 1024`).
+
 ## [0.16.0] - 2026-11-14
 
 ### Added
@@ -67,7 +80,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Round-5 Production Hardening:** Added `StreamLoadCoalescer` (`--bulk-coalesce-ms`), `QueryResultCache` (`--query-cache-ttl`) with automatic write invalidation and `now` date-math bypass, inbound HTTP `Basic` / `ApiKey` / `Bearer` authentication, native HTTPS/TLS (`--tls-cert` / `--tls-key`), and `migrate-schema --out-dir`.
 - **Packaging:** Added Helm chart (`deploy/helm/doris-es-proxy`), Prometheus `ServiceMonitor`, Grafana dashboard (`deploy/grafana/doris-es-proxy-dashboard.json`), and GitHub Actions release pipeline (`.github/workflows/release.yml`).
 
-[Unreleased]: https://github.com/es2doris/doris-es-proxy/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/es2doris/doris-es-proxy/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/es2doris/doris-es-proxy/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/es2doris/doris-es-proxy/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/es2doris/doris-es-proxy/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/es2doris/doris-es-proxy/releases/tag/v0.14.0

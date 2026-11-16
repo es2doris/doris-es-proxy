@@ -3215,7 +3215,7 @@ func TestRound48TranspilerSpecCompliance(t *testing.T) {
 		t.Fatalf("F8 expected WrapperQuery.Decoded to compile script condition on f__age, got %s", cqWrap.WhereSQL)
 	}
 
-	// F11: MoreLikeThisQuery array/nested doc fields, minimum_should_match, unlike, and include=false _id exclusion
+	// F11: MoreLikeThisQuery array/nested doc fields, minimum_should_match, unlike term subtraction, and include=false _id exclusion
 	var mltQ esast.Query
 	if err := json.Unmarshal([]byte(`{
 		"more_like_this": {
@@ -3223,7 +3223,7 @@ func TestRound48TranspilerSpecCompliance(t *testing.T) {
 			"like": [
 				{"_id": "doc-1", "doc": {"body": ["alpha beta", "gamma"], "meta": {"tags": ["delta"]}}}
 			],
-			"unlike": ["poison"],
+			"unlike": ["gamma"],
 			"minimum_should_match": 2,
 			"include": false
 		}
@@ -3231,8 +3231,8 @@ func TestRound48TranspilerSpecCompliance(t *testing.T) {
 		t.Fatalf("F11 MLT unmarshal failed: %v", err)
 	}
 	cqMLT := tr.CompileQuery(&mltQ, true, nil)
-	if !strings.Contains(cqMLT.WhereSQL, ">= 2") || !strings.Contains(cqMLT.WhereSQL, "NOT COALESCE") || !strings.Contains(cqMLT.WhereSQL, "`_id` NOT IN ('doc-1')") {
-		t.Fatalf("F11 expected MSM >= 2, NOT COALESCE for unlike, and _id NOT IN ('doc-1'), got %s", cqMLT.WhereSQL)
+	if !strings.Contains(cqMLT.WhereSQL, ">= 2") || strings.Contains(cqMLT.WhereSQL, "gamma") || !strings.Contains(cqMLT.WhereSQL, "`_id` NOT IN ('doc-1')") {
+		t.Fatalf("F11 expected MSM >= 2, unlike term 'gamma' subtracted, and _id NOT IN ('doc-1'), got %s", cqMLT.WhereSQL)
 	}
 
 	// F12: GeoShapeQuery circle radius, polygon ray-casting, geometrycollection, CONTAINS on geo_point, and _doc geo_shape evaluation

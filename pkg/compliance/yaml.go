@@ -101,6 +101,14 @@ type SpecSection struct {
 	Steps []SpecStep
 }
 
+// CapabilityRequirement represents an Elasticsearch REST capability probe in a skip or requires directive.
+type CapabilityRequirement struct {
+	Method       string
+	Path         string
+	Parameters   []string
+	Capabilities []string
+}
+
 // SkipSpec represents a rest-api-spec skip or requires directive (file-level or section-level).
 type SkipSpec struct {
 	Version            string
@@ -108,6 +116,7 @@ type SkipSpec struct {
 	Features           []string
 	TestRunnerFeatures []string
 	ClusterFeatures    []string
+	Capabilities       []CapabilityRequirement
 	KnownIssues        bool
 }
 
@@ -233,6 +242,8 @@ func parseSkipSpec(raw any) (*SkipSpec, error) {
 					}
 				}
 			}
+		case "capabilities":
+			out.Capabilities = append(out.Capabilities, parseCapabilityRequirements(f.Value)...)
 		case "known_issues":
 			if f.Value != nil {
 				out.KnownIssues = true
@@ -240,6 +251,74 @@ func parseSkipSpec(raw any) (*SkipSpec, error) {
 		}
 	}
 	return out, nil
+}
+
+func parseCapabilityRequirements(raw any) []CapabilityRequirement {
+	if raw == nil {
+		return nil
+	}
+	parseOne := func(item any) (CapabilityRequirement, bool) {
+		var fields []YAMLField
+		switch val := item.(type) {
+		case *OrderedMap:
+			if val == nil {
+				return CapabilityRequirement{}, false
+			}
+			fields = val.Fields
+		case OrderedMap:
+			fields = val.Fields
+		case map[string]any:
+			for k, v := range val {
+				fields = append(fields, YAMLField{Key: k, Value: v})
+			}
+		default:
+			return CapabilityRequirement{}, false
+		}
+		var req CapabilityRequirement
+		for _, f := range fields {
+			switch f.Key {
+			case "method":
+				if f.Value != nil {
+					req.Method = strings.ToUpper(strings.TrimSpace(fmt.Sprintf("%v", f.Value)))
+				}
+			case "path":
+				if f.Value != nil {
+					req.Path = strings.TrimSpace(fmt.Sprintf("%v", f.Value))
+				}
+			case "parameters":
+				for _, s := range extractStringSlice(f.Value) {
+					for _, part := range strings.Split(s, ",") {
+						if trimmed := strings.TrimSpace(part); trimmed != "" {
+							req.Parameters = append(req.Parameters, trimmed)
+						}
+					}
+				}
+			case "capabilities":
+				for _, s := range extractStringSlice(f.Value) {
+					for _, part := range strings.Split(s, ",") {
+						if trimmed := strings.TrimSpace(part); trimmed != "" {
+							req.Capabilities = append(req.Capabilities, trimmed)
+						}
+					}
+				}
+			}
+		}
+		return req, true
+	}
+
+	if seq, ok := raw.([]any); ok {
+		var out []CapabilityRequirement
+		for _, item := range seq {
+			if req, ok := parseOne(item); ok {
+				out = append(out, req)
+			}
+		}
+		return out
+	}
+	if req, ok := parseOne(raw); ok {
+		return []CapabilityRequirement{req}
+	}
+	return nil
 }
 
 func extractSteps(sectionName string, raw any) ([]SpecStep, error) {

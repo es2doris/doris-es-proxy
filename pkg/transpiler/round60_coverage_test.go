@@ -372,7 +372,7 @@ func TestRound60Coverage_TypedAggKeyPrefix(t *testing.T) {
 		{&esast.AggSpec{MaxBucket: &esast.PipelineAggSpec{}}, "bucket_metric_value"},
 		{&esast.AggSpec{AvgBucket: &esast.PipelineAggSpec{}}, "simple_value"},
 		{&esast.AggSpec{SumBucket: &esast.PipelineAggSpec{}}, "simple_value"},
-		{&esast.AggSpec{Derivative: &esast.PipelineAggSpec{}}, "simple_value"},
+		{&esast.AggSpec{Derivative: &esast.PipelineAggSpec{}}, "derivative"},
 		{&esast.AggSpec{CumulativeSum: &esast.PipelineAggSpec{}}, "simple_value"},
 		{&esast.AggSpec{MovingAvg: &esast.MovingAvgAggSpec{}}, "simple_value"},
 		{&esast.AggSpec{MovingFn: &esast.MovingAvgAggSpec{}}, "simple_value"},
@@ -1010,8 +1010,11 @@ func TestRound60Coverage_LuceneAutomatonAndTranspilerHelpers(t *testing.T) {
 		}
 		trPlan := NewTranspiler(idx, TranspilerOptions{})
 		plan, err := trPlan.BuildSearchPlan(&req)
-		if err != nil || plan.HitsSQL == "" || plan.AggsSQL == "" {
-			t.Fatalf("BuildSearchPlan failed: err=%v hits=%q aggs=%q", err, plan.HitsSQL, plan.AggsSQL)
+		if err != nil {
+			t.Fatalf("BuildSearchPlan failed: %v", err)
+		}
+		if plan.HitsSQL == "" || plan.AggsSQL == "" {
+			t.Fatalf("BuildSearchPlan empty SQL: hits=%q aggs=%q", plan.HitsSQL, plan.AggsSQL)
 		}
 	}
 }

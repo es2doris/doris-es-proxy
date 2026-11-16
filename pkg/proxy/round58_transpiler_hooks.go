@@ -540,7 +540,7 @@ func applyAndValidateURISearchParamsRound58(r *http.Request, req *esast.SearchRe
 			return fmt.Errorf("illegal_argument_exception: Failed to parse int parameter [size] with value [%s]", q.Get("size"))
 		}
 		if sz < 0 {
-			return fmt.Errorf("illegal_argument_exception: [size] must be greater than or equal to 0, got [%d]", sz)
+			return fmt.Errorf("illegal_argument_exception: [size] parameter cannot be negative, found [%d]", sz)
 		}
 		req.Size = &sz
 	}
@@ -552,7 +552,7 @@ func applyAndValidateURISearchParamsRound58(r *http.Request, req *esast.SearchRe
 			return fmt.Errorf("illegal_argument_exception: Failed to parse int parameter [from] with value [%s]", q.Get("from"))
 		}
 		if fr < 0 {
-			return fmt.Errorf("illegal_argument_exception: [from] must be greater than or equal to 0, got [%d]", fr)
+			return fmt.Errorf("illegal_argument_exception: [from] parameter cannot be negative, found [%d]", fr)
 		}
 		req.From = &fr
 	}
@@ -577,11 +577,29 @@ func applyAndValidateURISearchParamsRound58(r *http.Request, req *esast.SearchRe
 		if err != nil {
 			return fmt.Errorf("illegal_argument_exception: Failed to parse int parameter [batched_reduce_size] with value [%s]", q.Get("batched_reduce_size"))
 		}
-		if brs <= 0 {
-			return fmt.Errorf("illegal_argument_exception: [batched_reduce_size] must be greater than 0, got [%d]", brs)
+		if brs < 2 {
+			return fmt.Errorf("illegal_argument_exception: batchedReduceSize must be >= 2 (batched_reduce_size)")
 		}
 		if req.BatchedReduceSize == nil {
 			req.BatchedReduceSize = &brs
+		}
+	}
+
+	if q.Has("pre_filter_shard_size") {
+		pfStr := strings.TrimSpace(q.Get("pre_filter_shard_size"))
+		pf, err := strconv.Atoi(pfStr)
+		if err != nil {
+			return fmt.Errorf("illegal_argument_exception: Failed to parse int parameter [pre_filter_shard_size] with value [%s]", q.Get("pre_filter_shard_size"))
+		}
+		if pf < 1 {
+			return fmt.Errorf("illegal_argument_exception: preFilterShardSize must be >= 1")
+		}
+	}
+
+	if q.Has("search_type") {
+		st := strings.TrimSpace(q.Get("search_type"))
+		if strings.EqualFold(st, "query_and_fetch") || strings.EqualFold(st, "dfs_query_and_fetch") {
+			return fmt.Errorf("illegal_argument_exception: No search type for [%s]", st)
 		}
 	}
 

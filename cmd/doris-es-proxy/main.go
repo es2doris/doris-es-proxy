@@ -46,7 +46,7 @@ import (
 	"github.com/es2doris/doris-es-proxy/pkg/transpiler"
 )
 
-var version = "v0.16.0"
+var version = "v0.17.0"
 
 func envOrDefault(key, fallback string) string {
 	if val := strings.TrimSpace(os.Getenv(key)); val != "" {

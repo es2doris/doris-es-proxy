@@ -29,14 +29,25 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
 const (
-	defaultScorecardTargetVersion = "7.17.0"
-	maxRecordedFailureSamples     = 250
-	maxMarkdownFailureSamples     = 25
+	defaultScorecardTargetVersion   = "7.17.0"
+	defaultScorecardRemoteWhitelist = "127.0.0.1:*,[::1]:*,localhost:*,conformance.local:*"
+	maxRecordedFailureSamples       = 250
+	maxMarkdownFailureSamples       = 25
 )
+
+func effectiveMaxRecordedFailureSamples() int {
+	if raw := strings.TrimSpace(os.Getenv("CONFORMANCE_MAX_FAILURE_SAMPLES")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v >= 0 {
+			return v
+		}
+	}
+	return maxRecordedFailureSamples
+}
 
 // SuiteOptions configures non-aborting conformance scorecard execution across a YAML spec corpus.
 type SuiteOptions struct {
@@ -93,6 +104,12 @@ type inProcessHandlerTransport struct {
 }
 
 func (t inProcessHandlerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req != nil && req.URL != nil && req.URL.Port() == "0" {
+		return nil, fmt.Errorf("connect_exception: dial tcp %s: connect: connection refused", req.URL.Host)
+	}
+	if t.handler == nil {
+		return nil, fmt.Errorf("connect_exception: nil in-process handler")
+	}
 	clone := req.Clone(req.Context())
 	if clone.Body == nil {
 		clone.Body = http.NoBody
@@ -107,6 +124,18 @@ func (t inProcessHandlerTransport) RoundTrip(req *http.Request) (*http.Response,
 		resp.Body = io.NopCloser(strings.NewReader(""))
 	}
 	return resp, nil
+}
+
+func configureHandlerRemoteReindex(handler http.Handler, transport http.RoundTripper) {
+	if handler == nil {
+		return
+	}
+	if rtSetter, ok := any(handler).(interface{ SetRemoteReindexTransport(http.RoundTripper) }); ok {
+		rtSetter.SetRemoteReindexTransport(transport)
+	}
+	if wlSetter, ok := any(handler).(interface{ SetRemoteReindexWhitelistForTest(string) }); ok {
+		wlSetter.SetRemoteReindexWhitelistForTest(defaultScorecardRemoteWhitelist)
+	}
 }
 
 // ScoreDirectories executes all rest-api-spec YAML files across dirs without aborting on failures or panics.
@@ -296,8 +325,9 @@ func scoreEntries(opts SuiteOptions, entries []scoredSpecEntry) *SuiteScorecard 
 		}
 		return cs
 	}
+	maxFailureSamples := effectiveMaxRecordedFailureSamples()
 	recordFailure := func(file, cat, section, errMsg string) {
-		if len(sc.FailureSamples) < maxRecordedFailureSamples {
+		if len(sc.FailureSamples) < maxFailureSamples {
 			sc.FailureSamples = append(sc.FailureSamples, SectionFailure{
 				File:     file,
 				Category: cat,
@@ -307,7 +337,14 @@ func scoreEntries(opts SuiteOptions, entries []scoredSpecEntry) *SuiteScorecard 
 		}
 	}
 
-	probeCtx := newConfiguredRunnerContext(http.DefaultClient, "http://conformance.local", targetVer, clusterFeats, runnerFeats)
+	probeClient := http.DefaultClient
+	if opts.NewHandler != nil {
+		probeHandler := opts.NewHandler()
+		probeTransport := inProcessHandlerTransport{handler: probeHandler}
+		configureHandlerRemoteReindex(probeHandler, probeTransport)
+		probeClient = &http.Client{Transport: probeTransport}
+	}
+	probeCtx := newConfiguredRunnerContext(probeClient, "http://conformance.local", targetVer, clusterFeats, runnerFeats)
 
 	for _, entry := range entries {
 		if categoryFilter != nil && !categoryFilter[entry.category] {
@@ -423,8 +460,10 @@ func executeScoredSection(
 	}()
 
 	handler := newHandler()
+	transport := inProcessHandlerTransport{handler: handler}
+	configureHandlerRemoteReindex(handler, transport)
 	client := &http.Client{
-		Transport: inProcessHandlerTransport{handler: handler},
+		Transport: transport,
 	}
 	ctx := newConfiguredRunnerContext(client, "http://conformance.local", targetVer, clusterFeats, runnerFeats)
 	defer safeCleanupRunnerContext(ctx)

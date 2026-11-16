@@ -63,7 +63,7 @@ func markSetSliceRound59(budget *evalBudget, s []any) []any {
 			}
 			if !budget.setSlices[ptr] {
 				budget.setSlices[ptr] = true
-				budget.pinnedRefs = append(budget.pinnedRefs, out)
+				_ = recordPinnedContainerRound61(budget, out, len(out))
 			}
 		}
 	}
@@ -87,7 +87,7 @@ func markTypedArraySliceRound59(budget *evalBudget, s []any, arrType string) []a
 				budget.arrayTypes = make(map[uintptr]string)
 			}
 			if _, exists := budget.arrayTypes[ptr]; !exists {
-				budget.pinnedRefs = append(budget.pinnedRefs, out)
+				_ = recordPinnedContainerRound61(budget, out, len(out))
 			}
 			budget.arrayTypes[ptr] = arrType
 		}

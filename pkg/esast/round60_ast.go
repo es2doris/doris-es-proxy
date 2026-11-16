@@ -941,6 +941,8 @@ func unmarshalFieldPropertyRound60Internal(fp *FieldProperty, data []byte, stric
 	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
 		return err
 	}
+	_, hasDims := rawMap["dims"]
+	_, hasDim := rawMap["dimension"]
 	var parsedMeta map[string]string
 	if rawMeta, hasMeta := rawMap["meta"]; hasMeta {
 		m, err := ValidateAndNormalizeFieldMeta(rawMeta)
@@ -987,6 +989,7 @@ func unmarshalFieldPropertyRound60Internal(fp *FieldProperty, data []byte, stric
 	}
 	p.Meta = parsedMeta
 	p.Contexts = parsedContexts
+	p.ExplicitDims = hasDims || hasDim
 	*fp = FieldProperty(p)
 	return nil
 }

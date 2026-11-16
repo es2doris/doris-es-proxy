@@ -67,8 +67,11 @@ type taskEntry struct {
 	throttledMillis  int64
 	response         map[string]any
 	errObj           map[string]any
+	slices           []any
+	activeWaiters    int
 	cancelFn         context.CancelFunc
 	rethrottleCh     chan struct{}
+	rethrottleNotify chan struct{}
 	doneCh           chan struct{}
 }
 
@@ -76,9 +79,16 @@ func (t *taskEntry) notifyRethrottle(newRPS float64) {
 	t.mu.Lock()
 	t.requestsPerSec = newRPS
 	ch := t.rethrottleCh
-	t.rethrottleCh = make(chan struct{})
+	nch := t.rethrottleNotify
+	nextCh := make(chan struct{})
+	t.rethrottleCh = nextCh
+	t.rethrottleNotify = nextCh
 	t.mu.Unlock()
-	close(ch)
+	if ch != nil {
+		close(ch)
+	} else if nch != nil {
+		close(nch)
+	}
 }
 
 func (t *taskEntry) cancel() bool {
@@ -169,7 +179,7 @@ func (t *taskEntry) toTaskInfoMap(detailed bool) map[string]any {
 	}
 	if detailed {
 		m["description"] = t.description
-		m["status"] = map[string]any{
+		statusMap := map[string]any{
 			"total":                  t.total,
 			"updated":                t.updated,
 			"created":                t.created,
@@ -183,6 +193,12 @@ func (t *taskEntry) toTaskInfoMap(detailed bool) map[string]any {
 			"throttled_until_millis": 0,
 			"canceled":               boolReasonString(t.cancelled),
 		}
+		if len(t.slices) > 0 {
+			cp := make([]any, len(t.slices))
+			copy(cp, t.slices)
+			statusMap["slices"] = cp
+		}
+		m["status"] = statusMap
 	}
 	return m
 }
@@ -193,6 +209,11 @@ func boolReasonString(cancelled bool) string {
 	}
 	return ""
 }
+
+const (
+	maxCompletedTasks = 4096
+	completedTaskTTL  = 30 * time.Minute
+)
 
 type taskRegistry struct {
 	mu     sync.RWMutex
@@ -223,37 +244,109 @@ func (s *Server) getTaskRegistry() *taskRegistry {
 	return s.taskReg
 }
 
+func (tr *taskRegistry) evictCompletedLocked(now time.Time) {
+	type completedCandidate struct {
+		fullID  string
+		endTime time.Time
+		id      int64
+	}
+	var keep []completedCandidate
+	for fullID, e := range tr.tasks {
+		e.mu.Lock()
+		done := e.completed
+		waiters := e.activeWaiters
+		endT := e.endTime
+		id := e.id
+		e.mu.Unlock()
+		if !done || waiters > 0 {
+			continue
+		}
+		if !endT.IsZero() && now.Sub(endT) > completedTaskTTL {
+			delete(tr.tasks, fullID)
+			continue
+		}
+		keep = append(keep, completedCandidate{fullID: fullID, endTime: endT, id: id})
+	}
+	if len(keep) > maxCompletedTasks {
+		sort.Slice(keep, func(i, j int) bool {
+			if keep[i].endTime.Equal(keep[j].endTime) {
+				return keep[i].id < keep[j].id
+			}
+			return keep[i].endTime.Before(keep[j].endTime)
+		})
+		excess := len(keep) - maxCompletedTasks
+		for i := 0; i < excess; i++ {
+			delete(tr.tasks, keep[i].fullID)
+		}
+	}
+}
+
+func (tr *taskRegistry) pruneCompletedTasks() {
+	tr.mu.Lock()
+	tr.evictCompletedLocked(time.Now())
+	tr.mu.Unlock()
+}
+
+func (tr *taskRegistry) unregisterSyncCompleted(fullID string) {
+	tr.mu.Lock()
+	if e, ok := tr.tasks[fullID]; ok {
+		e.mu.Lock()
+		waiters := e.activeWaiters
+		e.mu.Unlock()
+		if waiters == 0 {
+			delete(tr.tasks, fullID)
+		}
+	}
+	tr.mu.Unlock()
+}
+
 func (tr *taskRegistry) register(action, description string, rps float64, headers map[string]string, cancelFn context.CancelFunc) *taskEntry {
 	id := tr.nextID.Add(1)
 	now := time.Now()
 	fullID := fmt.Sprintf("%s:%d", taskLocalNodeID, id)
+	rch := make(chan struct{})
 	entry := &taskEntry{
-		id:             id,
-		fullID:         fullID,
-		node:           taskLocalNodeID,
-		taskType:       "transport",
-		action:         action,
-		description:    description,
-		startTime:      now,
-		startTimeMs:    now.UnixMilli(),
-		cancellable:    true,
-		headers:        headers,
-		requestsPerSec: rps,
-		cancelFn:       cancelFn,
-		rethrottleCh:   make(chan struct{}),
-		doneCh:         make(chan struct{}),
+		id:               id,
+		fullID:           fullID,
+		node:             taskLocalNodeID,
+		taskType:         "transport",
+		action:           action,
+		description:      description,
+		startTime:        now,
+		startTimeMs:      now.UnixMilli(),
+		cancellable:      true,
+		headers:          headers,
+		requestsPerSec:   rps,
+		cancelFn:         cancelFn,
+		rethrottleCh:     rch,
+		rethrottleNotify: rch,
+		doneCh:           make(chan struct{}),
 	}
 	tr.mu.Lock()
+	tr.evictCompletedLocked(now)
 	tr.tasks[fullID] = entry
 	tr.mu.Unlock()
 	return entry
 }
 
 func (tr *taskRegistry) lookup(taskID string) (*taskEntry, bool) {
+	now := time.Now()
 	tr.mu.RLock()
-	defer tr.mu.RUnlock()
 	e, ok := tr.tasks[taskID]
-	return e, ok
+	tr.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	e.mu.Lock()
+	expired := e.completed && e.activeWaiters == 0 && !e.endTime.IsZero() && now.Sub(e.endTime) > completedTaskTTL
+	e.mu.Unlock()
+	if expired {
+		tr.mu.Lock()
+		tr.evictCompletedLocked(now)
+		tr.mu.Unlock()
+		return nil, false
+	}
+	return e, true
 }
 
 func (tr *taskRegistry) activeEntries() []*taskEntry {
@@ -295,11 +388,15 @@ func applyTaskThrottleAndProgressRound60(ctx context.Context, batchDocs int, rps
 	if entry == nil {
 		return nil
 	}
+	entry.mu.Lock()
+	entry.batches++
+	entry.mu.Unlock()
+
+	var alreadySlept time.Duration
 	for {
 		entry.mu.Lock()
 		rps := entry.requestsPerSec
 		rethrottleCh := entry.rethrottleCh
-		entry.batches++
 		entry.mu.Unlock()
 		if rps == 0 {
 			rps = rpsFallback
@@ -314,17 +411,27 @@ func applyTaskThrottleAndProgressRound60(ctx context.Context, batchDocs int, rps
 		if secNeeded > 30 {
 			secNeeded = 30
 		}
-		waitDur := time.Duration(secNeeded * float64(time.Second))
+		neededDur := time.Duration(secNeeded * float64(time.Second))
+		waitDur := neededDur - alreadySlept
+		if waitDur <= 0 {
+			return nil
+		}
 		waitStart := time.Now()
 		timer := time.NewTimer(waitDur)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+			slept := time.Since(waitStart)
+			entry.mu.Lock()
+			entry.throttledMillis += slept.Milliseconds()
+			entry.mu.Unlock()
 			return ctx.Err()
 		case <-rethrottleCh:
 			timer.Stop()
+			slept := time.Since(waitStart)
+			alreadySlept += slept
 			entry.mu.Lock()
-			entry.throttledMillis += time.Since(waitStart).Milliseconds()
+			entry.throttledMillis += slept.Milliseconds()
 			newRPS := entry.requestsPerSec
 			entry.mu.Unlock()
 			if newRPS <= 0 {
@@ -609,12 +716,18 @@ func (s *Server) handleTasksGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if waitForCompletion {
+		entry.mu.Lock()
+		entry.activeWaiters++
+		entry.mu.Unlock()
 		timer := time.NewTimer(timeoutDur)
 		select {
 		case <-entry.doneCh:
 			timer.Stop()
 		case <-timer.C:
 		}
+		entry.mu.Lock()
+		entry.activeWaiters--
+		entry.mu.Unlock()
 	}
 
 	entry.mu.Lock()
@@ -1108,6 +1221,15 @@ func (s *Server) validateReindexRemoteWhitelistRound60(remoteObj map[string]any)
 	s.mu.RLock()
 	wlRaw, hasWL := s.getClusterSettingStringLocked("reindex.remote.whitelist")
 	s.mu.RUnlock()
+	if !hasWL || strings.TrimSpace(wlRaw) == "" {
+		st := getOrCreateServerStateR61CRUD(s)
+		st.mu.RLock()
+		if st.testRemoteWhitelist != "" {
+			wlRaw = st.testRemoteWhitelist
+			hasWL = true
+		}
+		st.mu.RUnlock()
+	}
 
 	allowed := false
 	if hasWL && strings.TrimSpace(wlRaw) != "" {
@@ -1127,78 +1249,6 @@ func (s *Server) validateReindexRemoteWhitelistRound60(remoteObj map[string]any)
 			fmt.Sprintf("[%s] not whitelisted in reindex.remote.whitelist", hostPort)
 	}
 	return 0, "", ""
-}
-
-// validateReindexPreflightRound60 validates 400 request/body constraints BEFORE 404 index lookup on _reindex.
-func (s *Server) validateReindexPreflightRound60(r *http.Request, bodyBytes []byte) (rps float64, slicesCount int, waitForCompletion bool, status int, errType, errReason string) {
-	waitForCompletion = true
-	rps = -1
-
-	var rawMap map[string]any
-	dec := json.NewDecoder(bytes.NewReader(bodyBytes))
-	dec.UseNumber()
-	if err := dec.Decode(&rawMap); err != nil {
-		return 0, 0, true, http.StatusBadRequest, "parsing_exception", err.Error()
-	}
-
-	if r != nil && r.URL != nil {
-		q := r.URL.Query()
-		if wv, present, err := parseStrictQueryBoolParamRound59(r, "wait_for_completion"); present {
-			if err != nil {
-				return 0, 0, true, http.StatusBadRequest, "illegal_argument_exception", err.Error()
-			}
-			waitForCompletion = wv
-		}
-		if q.Has("scroll_size") {
-			ssStr := strings.TrimSpace(q.Get("scroll_size"))
-			ssVal, err := strconv.Atoi(ssStr)
-			if err != nil || ssVal <= 0 {
-				return 0, 0, true, http.StatusBadRequest, "action_request_validation_exception",
-					fmt.Sprintf("Validation Failed: 1: scroll_size must be greater than 0 but was [%s];", ssStr)
-			}
-		}
-		if q.Has("requests_per_second") {
-			parsedRPS, err := parseStrictRequestsPerSecondRound60(q.Get("requests_per_second"), true)
-			if err != nil {
-				return 0, 0, true, http.StatusBadRequest, "illegal_argument_exception", err.Error()
-			}
-			rps = parsedRPS
-		}
-	}
-
-	if rawMap != nil {
-		if bodyRPS, hasRPS := rawMap["requests_per_second"]; hasRPS && (r == nil || r.URL == nil || !r.URL.Query().Has("requests_per_second")) {
-			parsedRPS, err := parseStrictRequestsPerSecondRound60(bodyRPS, true)
-			if err != nil {
-				return 0, 0, true, http.StatusBadRequest, "illegal_argument_exception", err.Error()
-			}
-			rps = parsedRPS
-		}
-		if srcMap, okS := rawMap["source"].(map[string]any); okS && srcMap != nil {
-			if szRaw, hasSz := srcMap["size"]; hasSz {
-				if szN, okN := toInt64(szRaw); !okN || szN <= 0 {
-					return 0, 0, true, http.StatusBadRequest, "action_request_validation_exception",
-						fmt.Sprintf("Validation Failed: 1: source.size must be greater than 0 but was [%v];", szRaw)
-				}
-			}
-			if remMap, okR := srcMap["remote"].(map[string]any); okR && remMap != nil {
-				if st, et, er := s.validateReindexRemoteWhitelistRound60(remMap); st != 0 {
-					return 0, 0, true, st, et, er
-				}
-			}
-		}
-	}
-
-	var bodySlices any
-	if rawMap != nil {
-		bodySlices = rawMap["slices"]
-	}
-	sc, sErr := parseSlicesCountRound60(r, bodySlices)
-	if sErr != nil {
-		return 0, 0, true, http.StatusBadRequest, "illegal_argument_exception", sErr.Error()
-	}
-	slicesCount = sc
-	return rps, slicesCount, waitForCompletion, 0, "", ""
 }
 
 // launchAsyncTaskRound60 spawns a background task for wait_for_completion=false on _reindex,
@@ -1242,9 +1292,10 @@ func (s *Server) launchAsyncTaskRound60(w http.ResponseWriter, r *http.Request, 
 				"type":   "task_cancelled_exception",
 				"reason": "Task cancelled by user request",
 			})
+			s.getTaskRegistry().pruneCompletedTasks()
 			return
 		}
-		if rec.status >= 400 {
+		if rec.status >= 400 && parsed["failures"] == nil {
 			var errObj map[string]any
 			if parsed != nil {
 				errObj, _ = parsed["error"].(map[string]any)
@@ -1256,9 +1307,11 @@ func (s *Server) launchAsyncTaskRound60(w http.ResponseWriter, r *http.Request, 
 				}
 			}
 			entry.markDone(nil, errObj)
+			s.getTaskRegistry().pruneCompletedTasks()
 			return
 		}
 		entry.markDone(parsed, nil)
+		s.getTaskRegistry().pruneCompletedTasks()
 	}()
 
 	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{

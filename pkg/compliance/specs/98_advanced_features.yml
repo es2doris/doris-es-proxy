@@ -2034,7 +2034,7 @@
         wait_for_completion: true
         body:
           indices: "r57_snap_src"
-  - match: { accepted: true }
+  - match: { snapshot.state: "SUCCESS" }
 
   - do:
       indices.delete:
@@ -4329,7 +4329,7 @@
   - match: { aggregations.ul_comp.buckets.0.key.u: 18446744073709551600 }
   - match: { aggregations.ul_comp.buckets.1.key.u: 18446744073709551615 }
 
-  # F11: _source disabled (get_source & update 400, docvalue_fields 200) + _source includes/excludes & GET _mapping root metadata
+  # F11: _source disabled (get_source 404 & update 400, docvalue_fields 200) + _source includes/excludes & GET _mapping root metadata
   - do:
       indices.create:
         index: r59_nosrc_idx
@@ -4351,7 +4351,7 @@
           cnt: 7
 
   - do:
-      catch: bad_request
+      catch: missing
       get_source:
         index: r59_nosrc_idx
         id: "1"

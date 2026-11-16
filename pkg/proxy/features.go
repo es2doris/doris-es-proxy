@@ -160,48 +160,6 @@ func parseESResponseFormatOptions(r *http.Request) (esResponseFormatOptions, boo
 	return opts, true
 }
 
-func applyESFilterPath(v any, filterPaths []string) any {
-	if len(filterPaths) == 0 || v == nil {
-		return v
-	}
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return v
-	}
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	var generic any
-	if err := dec.Decode(&generic); err != nil {
-		return v
-	}
-	var posPatterns, negPatterns [][]string
-	for _, fp := range filterPaths {
-		if strings.HasPrefix(fp, "-") {
-			trimmed := strings.TrimPrefix(fp, "-")
-			if trimmed != "" {
-				negPatterns = append(negPatterns, parseFilterPathSegments(trimmed))
-			}
-		} else {
-			posPatterns = append(posPatterns, parseFilterPathSegments(fp))
-		}
-	}
-	out := generic
-	if len(posPatterns) > 0 {
-		filtered, ok := filterIncludeNode(out, posPatterns)
-		if !ok {
-			if _, isSlice := out.([]any); isSlice {
-				return []any{}
-			}
-			return map[string]any{}
-		}
-		out = filtered
-	}
-	if len(negPatterns) > 0 {
-		out = filterExcludeNode(out, negPatterns)
-	}
-	return out
-}
-
 func advanceFilterPatterns(patterns [][]string, key string) [][]string {
 	var next [][]string
 	hasDot := strings.Contains(key, ".")
@@ -285,54 +243,6 @@ func filterIncludeNode(node any, patterns [][]string) (any, bool) {
 		return out, true
 	default:
 		return nil, false
-	}
-}
-
-func filterExcludeNode(node any, negPatterns [][]string) any {
-	switch typed := node.(type) {
-	case map[string]any:
-		out := make(map[string]any, len(typed))
-		for k, val := range typed {
-			next := advanceFilterPatterns(negPatterns, k)
-			excluded := false
-			for _, np := range next {
-				if len(np) == 0 || (len(np) == 1 && np[0] == "**") {
-					excluded = true
-					break
-				}
-			}
-			if excluded {
-				continue
-			}
-			if len(next) > 0 {
-				child := filterExcludeNode(val, next)
-				if valMap, wasMap := val.(map[string]any); wasMap && len(valMap) > 0 {
-					if childMap, isMap := child.(map[string]any); isMap && len(childMap) == 0 {
-						continue
-					}
-				}
-				out[k] = child
-			} else {
-				out[k] = val
-			}
-		}
-		return out
-	case []any:
-		out := make([]any, 0, len(typed))
-		for i, elem := range typed {
-			elemPatterns, matchedLeaf := advanceArrayFilterPatterns(negPatterns, i)
-			if matchedLeaf {
-				continue
-			}
-			if len(elemPatterns) > 0 {
-				out = append(out, filterExcludeNode(elem, elemPatterns))
-			} else {
-				out = append(out, elem)
-			}
-		}
-		return out
-	default:
-		return node
 	}
 }
 
@@ -1029,10 +939,55 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 			writeIngestConfigErrorRound60(w, r, err)
 			return
 		}
+		hasIfVersion := false
+		var reqIfVersion int64
+		if r != nil && r.URL != nil && r.URL.Query().Has("if_version") {
+			rawIV := strings.TrimSpace(r.URL.Query().Get("if_version"))
+			parsedIV, ivErr := strconv.ParseInt(rawIV, 10, 64)
+			if ivErr != nil {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("Failed to parse int parameter [if_version] with value [%s]", rawIV))
+				return
+			}
+			hasIfVersion = true
+			reqIfVersion = parsedIV
+		}
 		_ = s.syncCatalogFromBackend(r.Context())
 		s.mu.Lock()
 		if s.pipelines == nil {
 			s.pipelines = make(map[string]map[string]any)
+		}
+		if hasIfVersion {
+			existingPipe, exists := s.pipelines[id]
+			if !exists || existingPipe == nil {
+				s.mu.Unlock()
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("cannot conditionally update non-existent pipeline [%s]", id))
+				return
+			}
+			existingVer, hasExistingVer := toInt64(existingPipe["version"])
+			if !hasExistingVer {
+				s.mu.Unlock()
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("cannot conditionally update pipeline [%s] because it has no version", id))
+				return
+			}
+			if existingVer != reqIfVersion {
+				s.mu.Unlock()
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("required version [%d] does not match current version [%d]", reqIfVersion, existingVer))
+				return
+			}
+			if newVer, hasNewVer := toInt64(body["version"]); hasNewVer {
+				if newVer == existingVer {
+					s.mu.Unlock()
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+						fmt.Sprintf("version [%d] cannot be the same as the existing version", newVer))
+					return
+				}
+			} else {
+				body["version"] = existingVer + 1
+			}
 		}
 		if cycErr := validateNoIngestPipelineCycleLocked(id, body, s.pipelines); cycErr != nil {
 			s.mu.Unlock()
@@ -1041,6 +996,7 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 		}
 		s.pipelines[id] = body
 		s.mu.Unlock()
+		s.resetIngestPipelineStatsRound61(id, body)
 		s.persistIngestPipeline(r.Context(), id, body)
 		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"acknowledged": true})
 	case http.MethodDelete:
@@ -1100,10 +1056,26 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.Unlock()
 		for _, k := range toDelete {
+			s.resetIngestPipelineStatsRound61(k, nil)
 			s.deleteIngestPipelineCatalog(r.Context(), k)
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"acknowledged": true})
 	case http.MethodGet, http.MethodHead:
+		summaryOnly := false
+		if r != nil && r.URL != nil && r.URL.Query().Has("summary") {
+			bv, _, bErr := parseStrictQueryBoolParamRound59(r, "summary")
+			if bErr != nil {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", bErr.Error())
+				return
+			}
+			summaryOnly = bv
+		}
+		projectPipe := func(v map[string]any) any {
+			if summaryOnly {
+				return summarizeIngestPipelineMapRound61(v)
+			}
+			return v
+		}
 		_ = s.syncCatalogFromBackend(r.Context())
 		s.mu.RLock()
 		defer s.mu.RUnlock()
@@ -1118,9 +1090,9 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 			}
 			out := make(map[string]any, len(s.pipelines))
 			for k, v := range s.pipelines {
-				out[k] = v
+				out[k] = projectPipe(v)
 			}
-			writeJSON(w, http.StatusOK, out)
+			writeJSONWithRequest(w, r, http.StatusOK, out)
 			return
 		}
 		parts := strings.Split(id, ",")
@@ -1132,14 +1104,14 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 			}
 			if pat == "*" || pat == "_all" {
 				for k, v := range s.pipelines {
-					out[k] = v
+					out[k] = projectPipe(v)
 				}
 				continue
 			}
 			if strings.Contains(pat, "*") {
 				for k, v := range s.pipelines {
 					if matchWildcardPattern(pat, k) {
-						out[k] = v
+						out[k] = projectPipe(v)
 					}
 				}
 				continue
@@ -1153,7 +1125,7 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "pipeline ["+pat+"] is missing")
 				return
 			}
-			out[pat] = p
+			out[pat] = projectPipe(p)
 		}
 		if len(out) == 0 {
 			if r.Method == http.MethodHead {
@@ -1167,7 +1139,7 @@ func (s *Server) handleIngestPipeline(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		writeJSON(w, http.StatusOK, out)
+		writeJSONWithRequest(w, r, http.StatusOK, out)
 	default:
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
 	}
@@ -1696,6 +1668,17 @@ func validateIngestPipelineProcessors(procs []any) error {
 			case "set":
 				if _, err := reqStr("field"); err != nil {
 					return err
+				}
+				_, hasSetVal := specMap["value"]
+				_, hasSetCopy := specMap["copy_from"]
+				if !hasSetVal && !hasSetCopy {
+					return &ingestConfigErrorRound60{
+						errType:  "parse_exception",
+						reason:   "[value] required property is missing",
+						procType: procType,
+						procTag:  effTag,
+						propName: "value",
+					}
 				}
 				procValidationErr = validateIngestSetSpecRound59(specMap)
 			case "default", "append":
@@ -2484,21 +2467,137 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithRouting(indexName, docID, re
 }
 
 func (s *Server) applyEffectiveAndFinalPipelinesWithRoutingAndExecuted(indexName, docID, reqPipeline, defaultPipeline, initialRouting string, raw json.RawMessage) (json.RawMessage, string, string, string, bool, []string, error) {
-	effPipeline := s.resolveEffectivePipeline(indexName, reqPipeline, defaultPipeline)
-	if effPipeline == "" && s != nil {
-		if resolved, _, wErr := s.resolveWriteIndexWithFilter(indexName); wErr == nil && resolved != "" && resolved != indexName {
-			effPipeline = s.resolveEffectivePipeline(resolved, reqPipeline, defaultPipeline)
+	cur, curIndex, curID, curRouting, dropped, execPipes, _, err := s.applyEffectiveAndFinalPipelinesWithMetaRound61(indexName, docID, reqPipeline, defaultPipeline, initialRouting, raw)
+	return cur, curIndex, curID, curRouting, dropped, execPipes, err
+}
+
+func (s *Server) applyEffectiveAndFinalPipelinesWithMetaRound61(indexName, docID, reqPipeline, defaultPipeline, initialRouting string, raw json.RawMessage) (json.RawMessage, string, string, string, bool, []string, map[string]any, error) {
+	resolveDef := func(target, reqP, defP string) string {
+		if s == nil {
+			if reqP != "" && reqP != "_none" {
+				return reqP
+			}
+			if defP != "" && defP != "_none" {
+				return defP
+			}
+			return ""
+		}
+		eff := s.resolveEffectivePipeline(target, reqP, defP)
+		if eff == "" {
+			if resolved, _, wErr := s.resolveWriteIndexWithFilter(target); wErr == nil && resolved != "" && resolved != target {
+				eff = s.resolveEffectivePipeline(resolved, reqP, defP)
+			}
+			if eff == "" {
+				if resolved := s.resolveIndexName(target); resolved != "" && resolved != target {
+					eff = s.resolveEffectivePipeline(resolved, reqP, defP)
+				}
+			}
+		}
+		return eff
+	}
+	resolveFin := func(target string) string {
+		if s == nil {
+			return ""
+		}
+		fin := s.resolveFinalPipeline(target)
+		if fin == "" {
+			if resolved, _, wErr := s.resolveWriteIndexWithFilter(target); wErr == nil && resolved != "" && resolved != target {
+				fin = s.resolveFinalPipeline(resolved)
+			}
+			if fin == "" {
+				if resolved := s.resolveIndexName(target); resolved != "" && resolved != target {
+					fin = s.resolveFinalPipeline(resolved)
+				}
+			}
+		}
+		return fin
+	}
+
+	var tr *serverIngestStatsTrackerRound61
+	if s != nil {
+		tr = s.getOrCreateIngestStatsTrackerRound61()
+	}
+	chainStart := time.Now()
+	ranAny := false
+	var firstStepEntry *ingestPipelineStatEntryRound61
+	var lastFinalEntry *ingestPipelineStatEntryRound61
+
+	runStep := func(pipeID string, isFinal bool, inRaw json.RawMessage, inIdx, inID, inRouting string, inMeta map[string]any) (json.RawMessage, string, string, string, bool, map[string]any, error) {
+		var pEntry *ingestPipelineStatEntryRound61
+		inBytes := int64(len(inRaw))
+		if s != nil && pipeID != "" && pipeID != "_none" {
+			if !ranAny {
+				ranAny = true
+				tr.totalCount.Add(1)
+				tr.totalCurrent.Add(1)
+			}
+			pEntry = s.getOrInitPipelineStatEntryRound61(pipeID, nil)
+			pEntry.count.Add(1)
+			pEntry.current.Add(1)
+			pEntry.ingestedInBytes.Add(inBytes)
+			tr.totalIngestedInBytes.Add(inBytes)
+			if firstStepEntry == nil {
+				firstStepEntry = pEntry
+				pEntry.ingestedAsFirstPipelineBytes.Add(inBytes)
+				tr.totalIngestedAsFirstBytes.Add(inBytes)
+			}
+		}
+		stepStart := time.Now()
+		out, outIdx, outID, outRouting, dropped, outMeta, err := s.applyIngestPipelineForWriteWithRoutingAndIngestMeta(pipeID, inIdx, inID, inRouting, inRaw, inMeta)
+		if pEntry != nil {
+			pEntry.current.Add(-1)
+			pEntry.timeInMillis.Add(time.Since(stepStart).Milliseconds())
+			if err != nil {
+				pEntry.failed.Add(1)
+			} else if !dropped {
+				outBytes := int64(len(out))
+				pEntry.producedInBytes.Add(outBytes)
+				tr.totalProducedInBytes.Add(outBytes)
+				if isFinal {
+					lastFinalEntry = pEntry
+				}
+			}
+		}
+		return out, outIdx, outID, outRouting, dropped, outMeta, err
+	}
+
+	finalizeChainStats := func(finalRaw json.RawMessage, dropped bool, err error) {
+		if !ranAny || tr == nil {
+			return
+		}
+		tr.totalCurrent.Add(-1)
+		tr.totalTimeInMillis.Add(time.Since(chainStart).Milliseconds())
+		if err != nil {
+			tr.totalFailed.Add(1)
+			return
+		}
+		if !dropped {
+			finalBytes := int64(len(finalRaw))
+			if firstStepEntry != nil {
+				firstStepEntry.producedAsFirstPipelineBytes.Add(finalBytes)
+				tr.totalProducedAsFirstBytes.Add(finalBytes)
+			}
+			if lastFinalEntry != nil {
+				lastFinalEntry.producedAsFinalPipelineBytes.Add(finalBytes)
+				tr.totalProducedAsFinalBytes.Add(finalBytes)
+			}
 		}
 	}
+
 	cur := raw
 	curIndex := indexName
 	curID := docID
 	curRouting := initialRouting
 	var curIngestMeta map[string]any
+
+	effPipeline := resolveDef(curIndex, reqPipeline, defaultPipeline)
+	evaledDefForIndex := curIndex
+	lastDefPipeline := effPipeline
 	if effPipeline != "" {
-		next, nextIdx, nextID, nextRouting, dropped, nextIngestMeta, err := s.applyIngestPipelineForWriteWithRoutingAndIngestMeta(effPipeline, curIndex, curID, curRouting, cur, nil)
+		next, nextIdx, nextID, nextRouting, dropped, nextIngestMeta, err := runStep(effPipeline, false, cur, curIndex, curID, curRouting, nil)
 		if err != nil || dropped {
-			return next, nextIdx, nextID, nextRouting, dropped, extractExecutedPipelines(nextIngestMeta), err
+			finalizeChainStats(next, dropped, err)
+			return next, nextIdx, nextID, nextRouting, dropped, extractExecutedPipelines(nextIngestMeta), nextIngestMeta, err
 		}
 		cur = next
 		if nextIdx != "" {
@@ -2510,61 +2609,60 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithRoutingAndExecuted(indexName
 		curRouting = nextRouting
 		curIngestMeta = nextIngestMeta
 	}
-	if curIndex != indexName && reqPipeline != "_none" && defaultPipeline != "_none" {
-		destDef := s.resolveEffectivePipeline(curIndex, "", "")
-		if destDef == "" && s != nil {
-			if resolved, _, wErr := s.resolveWriteIndexWithFilter(curIndex); wErr == nil && resolved != "" && resolved != curIndex {
-				destDef = s.resolveEffectivePipeline(resolved, "", "")
-			}
-			if destDef == "" {
-				if resolved := s.resolveIndexName(curIndex); resolved != "" && resolved != curIndex {
-					destDef = s.resolveEffectivePipeline(resolved, "", "")
+
+	evaledFinalForIndex := ""
+	for hop := 0; hop < 16; hop++ {
+		progressed := false
+		for defHop := 0; defHop < 16 && curIndex != evaledDefForIndex && reqPipeline != "_none" && defaultPipeline != "_none"; defHop++ {
+			evaledDefForIndex = curIndex
+			destDef := resolveDef(curIndex, "", "")
+			if destDef != "" && (destDef != lastDefPipeline || defHop > 0) {
+				lastDefPipeline = destDef
+				progressed = true
+				next, nextIdx, nextID, nextRouting, dropped, nextIngestMeta, err := runStep(destDef, false, cur, curIndex, curID, curRouting, curIngestMeta)
+				if err != nil || dropped {
+					finalizeChainStats(next, dropped, err)
+					return next, nextIdx, nextID, nextRouting, dropped, extractExecutedPipelines(nextIngestMeta), nextIngestMeta, err
 				}
+				cur = next
+				if nextIdx != "" {
+					curIndex = nextIdx
+				}
+				if nextID != "" {
+					curID = nextID
+				}
+				curRouting = nextRouting
+				curIngestMeta = nextIngestMeta
 			}
 		}
-		if destDef != "" && destDef != effPipeline {
-			next, nextIdx, nextID, nextRouting, dropped, nextIngestMeta, err := s.applyIngestPipelineForWriteWithRoutingAndIngestMeta(destDef, curIndex, curID, curRouting, cur, curIngestMeta)
-			if err != nil || dropped {
-				return next, nextIdx, nextID, nextRouting, dropped, extractExecutedPipelines(nextIngestMeta), err
+		if evaledFinalForIndex != curIndex {
+			evaledFinalForIndex = curIndex
+			finalPipeline := resolveFin(curIndex)
+			if finalPipeline != "" {
+				progressed = true
+				next, nextIdx, nextID, nextRouting, dropped, nextIngestMeta, err := runStep(finalPipeline, true, cur, curIndex, curID, curRouting, curIngestMeta)
+				if err != nil || dropped {
+					finalizeChainStats(next, dropped, err)
+					return next, nextIdx, nextID, nextRouting, dropped, extractExecutedPipelines(nextIngestMeta), nextIngestMeta, err
+				}
+				cur = next
+				if nextIdx != "" {
+					curIndex = nextIdx
+				}
+				if nextID != "" {
+					curID = nextID
+				}
+				curRouting = nextRouting
+				curIngestMeta = nextIngestMeta
 			}
-			cur = next
-			if nextIdx != "" {
-				curIndex = nextIdx
-			}
-			if nextID != "" {
-				curID = nextID
-			}
-			curRouting = nextRouting
-			curIngestMeta = nextIngestMeta
+		}
+		if !progressed || (curIndex == evaledDefForIndex && curIndex == evaledFinalForIndex) {
+			break
 		}
 	}
-	finalPipeline := s.resolveFinalPipeline(curIndex)
-	if finalPipeline == "" && s != nil {
-		if resolved, _, wErr := s.resolveWriteIndexWithFilter(curIndex); wErr == nil && resolved != "" && resolved != curIndex {
-			finalPipeline = s.resolveFinalPipeline(resolved)
-		}
-		if finalPipeline == "" {
-			if resolved := s.resolveIndexName(curIndex); resolved != "" && resolved != curIndex {
-				finalPipeline = s.resolveFinalPipeline(resolved)
-			}
-		}
-	}
-	if finalPipeline != "" {
-		next, nextIdx, nextID, nextRouting, dropped, nextIngestMeta, err := s.applyIngestPipelineForWriteWithRoutingAndIngestMeta(finalPipeline, curIndex, curID, curRouting, cur, curIngestMeta)
-		if err != nil || dropped {
-			return next, nextIdx, nextID, nextRouting, dropped, extractExecutedPipelines(nextIngestMeta), err
-		}
-		cur = next
-		if nextIdx != "" {
-			curIndex = nextIdx
-		}
-		if nextID != "" {
-			curID = nextID
-		}
-		curRouting = nextRouting
-		curIngestMeta = nextIngestMeta
-	}
-	return cur, curIndex, curID, curRouting, false, extractExecutedPipelines(curIngestMeta), nil
+
+	finalizeChainStats(cur, false, nil)
+	return cur, curIndex, curID, curRouting, false, extractExecutedPipelines(curIngestMeta), curIngestMeta, nil
 }
 
 func isIngestIdentByte(c byte) bool {
@@ -3086,6 +3184,10 @@ var (
 )
 
 func compileIngestJavaRegex(pattern string) (*regexp.Regexp, error) {
+	return getOrCompileCachedIngestRegexRound61(pattern, compileIngestJavaRegexUncachedRound61)
+}
+
+func compileIngestJavaRegexUncachedRound61(pattern string) (*regexp.Regexp, error) {
 	var b strings.Builder
 	b.Grow(len(pattern) + 8)
 	inClass := false
@@ -3276,6 +3378,9 @@ func normalizeGrokFieldName(fieldName string) string {
 }
 
 func compileGrokRegex(pat string, customDefs map[string]any) (*regexp.Regexp, map[string]string, map[string]string, error) {
+	if len(pat) > maxRegexPatternLen {
+		return nil, nil, nil, fmt.Errorf("illegal_argument_exception: grok pattern length [%d] exceeds maximum [%d]", len(pat), maxRegexPatternLen)
+	}
 	groupKeyMap := make(map[string]string)
 	groupTypes := make(map[string]string)
 	groupSeq := 0
@@ -3647,7 +3752,7 @@ func parseIngestTimezone(tzName string) (*time.Location, error) {
 	return nil, fmt.Errorf("illegal_argument_exception: timezone [%s] is not supported", tzName)
 }
 
-var reWeekYearInputRound60 = regexp.MustCompile(`^(\d{4})-(?:W)?(\d{1,2})(?:-([1-7]))?$`)
+var reWeekYearInputRound60 = regexp.MustCompile(`^(\d{4})[-/ ]?(?:W)?(\d{1,2})(?:[-/ ]?([1-7]))?(?:[T ](\d{1,2}):(\d{2})(?::(\d{2}))?(Z|[+-]\d{2}:?\d{2})?)?$`)
 var reSingleDigitHourRound60 = regexp.MustCompile(`([: T])(\d):`)
 
 func hasUnquotedTokenCharRound60(esFmt string, target byte) bool {
@@ -3701,7 +3806,9 @@ func isUSWeekLocaleRound60(rawLocale string) bool {
 }
 
 func parseWeekYearDateRound60(raw, fStr string, loc *time.Location, rawLocale string) (time.Time, bool) {
-	if fStr != "week_date" && fStr != "strict_week_date" && fStr != "weekyear_week" && fStr != "strict_weekyear_week" &&
+	if fStr != "week_date" && fStr != "strict_week_date" && fStr != "week_date_time" && fStr != "strict_week_date_time" &&
+		fStr != "week_date_time_no_millis" && fStr != "strict_week_date_time_no_millis" &&
+		fStr != "weekyear_week" && fStr != "strict_weekyear_week" &&
 		fStr != "weekyear_week_day" && fStr != "strict_weekyear_week_day" && !hasUnquotedTokenCharRound60(fStr, 'w') {
 		return time.Time{}, false
 	}
@@ -3720,13 +3827,29 @@ func parseWeekYearDateRound60(raw, fStr string, loc *time.Location, rawLocale st
 			dayIdx = d
 		}
 	}
+	effLoc := loc
+	hr, minV, secV := 0, 0, 0
+	if len(m) > 4 && m[4] != "" {
+		hr, _ = strconv.Atoi(m[4])
+		minV, _ = strconv.Atoi(m[5])
+		if m[6] != "" {
+			secV, _ = strconv.Atoi(m[6])
+		}
+		if m[7] != "" {
+			if m[7] == "Z" {
+				effLoc = time.UTC
+			} else if tzLoc, tzErr := parseIngestTimezone(m[7]); tzErr == nil && tzLoc != nil {
+				effLoc = tzLoc
+			}
+		}
+	}
 	if isUSWeekLocaleRound60(rawLocale) {
-		jan1 := time.Date(wy, time.January, 1, 0, 0, 0, 0, loc)
+		jan1 := time.Date(wy, time.January, 1, hr, minV, secV, 0, effLoc)
 		sunOffset := int(jan1.Weekday()) // Sunday = 0
 		week1Start := jan1.AddDate(0, 0, -sunOffset)
 		return week1Start.AddDate(0, 0, (wk-1)*7+(dayIdx-1)), true
 	}
-	jan4 := time.Date(wy, time.January, 4, 0, 0, 0, 0, loc)
+	jan4 := time.Date(wy, time.January, 4, hr, minV, secV, 0, effLoc)
 	isoDay := int(jan4.Weekday())
 	if isoDay == 0 {
 		isoDay = 7
@@ -6014,6 +6137,9 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				return "", err
 			}
 			if outFmt != "" {
+				if wyOut, okWY := formatIngestDateWithWeekYearRound61(parsedTime, outFmt); okWY {
+					return localizeFormattedDateOutputRound59(wyOut, outFmt, lang, parsedTime), nil
+				}
 				layouts := convertESDateFormatToGoLayouts(outFmt)
 				switch layouts[0] {
 				case "UNIX_MS":
@@ -6116,15 +6242,19 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			case "s":
 				parsedTime = time.Date(parsedTime.Year(), parsedTime.Month(), parsedTime.Day(), parsedTime.Hour(), parsedTime.Minute(), parsedTime.Second(), 0, parsedTime.Location())
 			}
-			layouts := convertESDateFormatToGoLayouts(idxFmt)
 			var formattedDate string
-			switch layouts[0] {
-			case "UNIX_MS":
-				formattedDate = strconv.FormatInt(parsedTime.UnixMilli(), 10)
-			case "UNIX":
-				formattedDate = strconv.FormatInt(parsedTime.Unix(), 10)
-			default:
-				formattedDate = localizeFormattedDateOutputRound59(parsedTime.Format(layouts[0]), idxFmt, lang, parsedTime)
+			if wyOut, okWY := formatIngestDateWithWeekYearRound61(parsedTime, idxFmt); okWY {
+				formattedDate = localizeFormattedDateOutputRound59(wyOut, idxFmt, lang, parsedTime)
+			} else {
+				layouts := convertESDateFormatToGoLayouts(idxFmt)
+				switch layouts[0] {
+				case "UNIX_MS":
+					formattedDate = strconv.FormatInt(parsedTime.UnixMilli(), 10)
+				case "UNIX":
+					formattedDate = strconv.FormatInt(parsedTime.Unix(), 10)
+				default:
+					formattedDate = localizeFormattedDateOutputRound59(parsedTime.Format(layouts[0]), idxFmt, lang, parsedTime)
+				}
 			}
 			target := "_index"
 			if tf, _ := specMap["target_field"].(string); tf != "" {
@@ -7273,6 +7403,9 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				origMetaRouting = fmt.Sprintf("%v", v)
 			}
 			origMetaVersion, hadOrigVersion := toInt64(doc["_version"])
+			_, hadOrigVerType := doc["_version_type"]
+			_, hadOrigIfSeq := doc["_if_seq_no"]
+			_, hadOrigIfPT := doc["_if_primary_term"]
 			savedIngestOrig := doc["__internal_ingest_orig"]
 			savedIngestMeta := doc["_ingest"]
 			origMetaMap, _ := savedIngestOrig.(map[string]any)
@@ -7328,6 +7461,9 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				}
 				mutatedBytes, opRes, err := painless.ApplyUpdateWithResult(docBytes, upd, true)
 				if err != nil {
+					if errors.Is(err, painless.ErrSelfReferencingIterable) {
+						return false, false, procType, procTag, specMap, fmt.Errorf("%w: %v", errIngestCyclicSourceRound61, err)
+					}
 					return false, false, procType, procTag, specMap, err
 				}
 				if opRes == "deleted" {
@@ -7366,11 +7502,44 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						metaChanged = true
 						if upd.MetaVersionNil {
 							delete(target, "_version")
+							if origMetaMap != nil {
+								delete(origMetaMap, "__mutated_version")
+							}
 						} else {
 							target["_version"] = upd.MetaVersion
+							if origMetaMap != nil {
+								origMetaMap["__mutated_version"] = upd.MetaVersion
+							}
 						}
 					} else if hadOrigVersion {
 						target["_version"] = origMetaVersion
+					}
+					if !hadOrigVerType {
+						if vt, okVT := target["_version_type"]; okVT && vt != nil {
+							if origMetaMap != nil {
+								origMetaMap["__mutated_version_type"] = fmt.Sprintf("%v", vt)
+							}
+							delete(target, "_version_type")
+							metaChanged = true
+						}
+					}
+					if !hadOrigIfSeq {
+						if sn, okSN := toInt64(target["_if_seq_no"]); okSN {
+							if origMetaMap != nil {
+								origMetaMap["__mutated_if_seq_no"] = sn
+							}
+							delete(target, "_if_seq_no")
+							metaChanged = true
+						}
+					}
+					if !hadOrigIfPT {
+						if pt, okPT := toInt64(target["_if_primary_term"]); okPT {
+							if origMetaMap != nil {
+								origMetaMap["__mutated_if_primary_term"] = pt
+							}
+							delete(target, "_if_primary_term")
+							metaChanged = true
+						}
 					}
 					if savedIngestOrig != nil {
 						target["__internal_ingest_orig"] = savedIngestOrig
@@ -7404,6 +7573,9 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						}
 						mutated = true
 					}
+				}
+				if cycErr := painless.ValidateAcyclicValue(doc); cycErr != nil {
+					return false, false, procType, procTag, specMap, fmt.Errorf("%w: %v", errIngestCyclicSourceRound61, cycErr)
 				}
 			}
 		}
@@ -7858,7 +8030,7 @@ func ingestProcessorStepErrorTypeRound60(s *Server, procType string, procErr err
 
 func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth int, trace *[]map[string]any) (bool, bool, error) {
 	mutated := false
-	for _, p := range procs {
+	for procIdx, p := range procs {
 		pMap, ok := p.(map[string]any)
 		if !ok {
 			continue
@@ -7925,7 +8097,17 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 		if trace != nil {
 			traceLenBefore = len(*trace)
 		}
+		procStart := time.Now()
 		m, dropped, _, _, _, procErr := executeSingleIngestProcessor(s, doc, pMap, depth, trace)
+		if depth == 0 && trace == nil && s != nil {
+			if om, ok := doc["__internal_ingest_orig"].(map[string]any); ok && om != nil {
+				if inlineSim, _ := om["_inline_sim_pipeline"].(bool); !inlineSim {
+					if activePipe, _ := om["_active_pipeline"].(string); activePipe != "" {
+						s.recordIngestProcessorExecutionStatRound61(activePipe, procIdx, time.Since(procStart).Milliseconds(), procErr != nil)
+					}
+				}
+			}
+		}
 		if m {
 			mutated = true
 		}
@@ -7992,11 +8174,12 @@ func runIngestProcessorList(s *Server, doc map[string]any, procs []any, depth in
 			return mutated, false, nil
 		}
 		if procErr != nil {
+			isCyclicErr := errors.Is(procErr, errIngestCyclicSourceRound61) || errors.Is(procErr, painless.ErrSelfReferencingIterable)
 			activePipeName := ""
 			if om, ok := doc["__internal_ingest_orig"].(map[string]any); ok && om != nil {
 				activePipeName, _ = om["_active_pipeline"].(string)
 			}
-			if ignoreFail {
+			if ignoreFail && !isCyclicErr {
 				if curIngest, ok := doc["_ingest"].(map[string]any); ok {
 					if procType == "foreach" {
 						restoreOuterForeachBindings(curIngest)
@@ -8167,6 +8350,9 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 	origIDVal, hadOrigID := doc["_id"]
 	origRoutingVal, hadOrigRouting := doc["_routing"]
 	origVersionVal, hadOrigVersion := doc["_version"]
+	origVerTypeVal, hadOrigVerType := doc["_version_type"]
+	origIfSeqVal, hadOrigIfSeq := doc["_if_seq_no"]
+	origIfPTVal, hadOrigIfPT := doc["_if_primary_term"]
 	if indexName != "" {
 		doc["_index"] = indexName
 	} else {
@@ -8264,6 +8450,11 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 			if ep, okE := om["_executed_pipelines"].([]string); okE && len(ep) > 0 {
 				outIngestMeta["__executed_pipelines"] = append([]string(nil), ep...)
 			}
+			for _, mk := range []string{"__mutated_version", "__mutated_version_type", "__mutated_if_seq_no", "__mutated_if_primary_term"} {
+				if mv, hasMV := om[mk]; hasMV {
+					outIngestMeta[mk] = mv
+				}
+			}
 		}
 		return outIngestMeta, outIngestTS
 	}
@@ -8345,6 +8536,30 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 	if v, ok := doc["_routing"]; ok && v != nil {
 		outRouting = fmt.Sprintf("%v", v)
 	}
+	if !hadOrigVersion {
+		if mv, okMV := toInt64(doc["_version"]); okMV {
+			origMeta["__mutated_version"] = mv
+		}
+	} else if curV, okCV := toInt64(doc["_version"]); okCV {
+		if origV, okOV := toInt64(origVersionVal); !okOV || curV != origV {
+			origMeta["__mutated_version"] = curV
+		}
+	}
+	if !hadOrigVerType {
+		if vt, okVT := doc["_version_type"]; okVT && vt != nil {
+			origMeta["__mutated_version_type"] = fmt.Sprintf("%v", vt)
+		}
+	}
+	if !hadOrigIfSeq {
+		if sn, okSN := toInt64(doc["_if_seq_no"]); okSN {
+			origMeta["__mutated_if_seq_no"] = sn
+		}
+	}
+	if !hadOrigIfPT {
+		if pt, okPT := toInt64(doc["_if_primary_term"]); okPT {
+			origMeta["__mutated_if_primary_term"] = pt
+		}
+	}
 	outIngestMeta, outIngestTS := buildOutMeta()
 	if hadOrigIndex {
 		doc["_index"] = origIndexVal
@@ -8365,6 +8580,21 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 		doc["_version"] = origVersionVal
 	} else {
 		delete(doc, "_version")
+	}
+	if hadOrigVerType {
+		doc["_version_type"] = origVerTypeVal
+	} else {
+		delete(doc, "_version_type")
+	}
+	if hadOrigIfSeq {
+		doc["_if_seq_no"] = origIfSeqVal
+	} else {
+		delete(doc, "_if_seq_no")
+	}
+	if hadOrigIfPT {
+		doc["_if_primary_term"] = origIfPTVal
+	} else {
+		delete(doc, "_if_primary_term")
 	}
 	delete(doc, "__internal_ingest_orig")
 	delete(doc, "_ingest")
@@ -9428,12 +9658,36 @@ func (s *Server) handleCatNodes(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
+	byteUnit, byteDiv, byteErr := parseCatByteUnitRound61(r)
+	if byteErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", byteErr.Error())
+		return
+	}
+	timeUnit, timeDiv, timeErr := parseCatTimeUnitRound61(r)
+	if timeErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", timeErr.Error())
+		return
+	}
 	fullID := isTruthyBoolQueryParam(r, "full_id")
-	nodeIDVal := "doris"
+	nodeIDVal := "dori"
 	if fullID {
 		nodeIDVal = "doris-fe-1"
 	}
 	verStr := s.effectiveClusterESVersionNumber(r)
+	fmtBytes := func(rawBytes int64, def string) string {
+		if byteUnit != "" {
+			return formatCatBytesValueRound61(rawBytes, byteUnit, byteDiv)
+		}
+		return def
+	}
+	fmtTime := func(nanos int64, def string) string {
+		if timeUnit != "" {
+			return formatCatDurationNanosRound61(nanos, timeUnit, timeDiv, def)
+		}
+		return def
+	}
+	const gb = int64(1024 * 1024 * 1024)
+	const mb = int64(1024 * 1024)
 	row := map[string]any{
 		"id":                           nodeIDVal,
 		"pid":                          "1",
@@ -9445,16 +9699,16 @@ func (s *Server) handleCatNodes(w http.ResponseWriter, r *http.Request) {
 		"type":                         "docker",
 		"build":                        "a761f7f",
 		"jdk":                          "21.0.2",
-		"disk.total":                   "100gb",
-		"disk.used":                    "10gb",
-		"disk.avail":                   "90gb",
+		"disk.total":                   fmtBytes(100*gb, "100gb"),
+		"disk.used":                    fmtBytes(10*gb, "10gb"),
+		"disk.avail":                   fmtBytes(90*gb, "90gb"),
 		"disk.used_percent":            "10.00",
-		"heap.current":                 "150mb",
+		"heap.current":                 fmtBytes(150*mb, "150mb"),
 		"heap.percent":                 "15",
-		"heap.max":                     "1gb",
-		"ram.current":                  "2.4gb",
+		"heap.max":                     fmtBytes(1*gb, "1gb"),
+		"ram.current":                  fmtBytes(2457*mb, "2.4gb"),
 		"ram.percent":                  "30",
-		"ram.max":                      "8gb",
+		"ram.max":                      fmtBytes(8*gb, "8gb"),
 		"file_desc.current":            "256",
 		"file_desc.percent":            "1",
 		"file_desc.max":                "65535",
@@ -9462,68 +9716,68 @@ func (s *Server) handleCatNodes(w http.ResponseWriter, r *http.Request) {
 		"load_1m":                      "0.10",
 		"load_5m":                      "0.10",
 		"load_15m":                     "0.10",
-		"uptime":                       "1h",
+		"uptime":                       fmtTime(int64(time.Hour), "1h"),
 		"node.role":                    "cdfhilmrstw",
 		"master":                       "*",
 		"name":                         "doris-fe-1",
-		"completion.size":              "0b",
-		"fielddata.memory_size":        "0b",
+		"completion.size":              fmtBytes(0, "0b"),
+		"fielddata.memory_size":        fmtBytes(0, "0b"),
 		"fielddata.evictions":          "0",
-		"query_cache.memory_size":      "0b",
+		"query_cache.memory_size":      fmtBytes(0, "0b"),
 		"query_cache.evictions":        "0",
 		"query_cache.hit_count":        "0",
 		"query_cache.miss_count":       "0",
-		"request_cache.memory_size":    "0b",
+		"request_cache.memory_size":    fmtBytes(0, "0b"),
 		"request_cache.evictions":      "0",
 		"request_cache.hit_count":      "0",
 		"request_cache.miss_count":     "0",
 		"flush.total":                  "0",
-		"flush.total_time":             "0s",
+		"flush.total_time":             fmtTime(0, "0s"),
 		"get.current":                  "0",
-		"get.time":                     "0s",
+		"get.time":                     fmtTime(0, "0s"),
 		"get.total":                    "0",
-		"get.exists_time":              "0s",
+		"get.exists_time":              fmtTime(0, "0s"),
 		"get.exists_total":             "0",
-		"get.missing_time":             "0s",
+		"get.missing_time":             fmtTime(0, "0s"),
 		"get.missing_total":            "0",
 		"indexing.delete_current":      "0",
-		"indexing.delete_time":         "0s",
+		"indexing.delete_time":         fmtTime(0, "0s"),
 		"indexing.delete_total":        "0",
 		"indexing.index_current":       "0",
-		"indexing.index_time":          "0s",
+		"indexing.index_time":          fmtTime(0, "0s"),
 		"indexing.index_total":         "0",
 		"indexing.index_failed":        "0",
 		"merges.current":               "0",
 		"merges.current_docs":          "0",
-		"merges.current_size":          "0b",
+		"merges.current_size":          fmtBytes(0, "0b"),
 		"merges.total":                 "0",
 		"merges.total_docs":            "0",
-		"merges.total_size":            "0b",
-		"merges.total_time":            "0s",
+		"merges.total_size":            fmtBytes(0, "0b"),
+		"merges.total_time":            fmtTime(0, "0s"),
 		"refresh.total":                "0",
-		"refresh.time":                 "0s",
+		"refresh.time":                 fmtTime(0, "0s"),
 		"refresh.external_total":       "0",
-		"refresh.external_time":        "0s",
+		"refresh.external_time":        fmtTime(0, "0s"),
 		"refresh.listeners":            "0",
 		"script.compilations":          "0",
 		"script.cache_evictions":       "0",
 		"search.fetch_current":         "0",
-		"search.fetch_time":            "0s",
+		"search.fetch_time":            fmtTime(0, "0s"),
 		"search.fetch_total":           "0",
 		"search.open_contexts":         "0",
 		"search.query_current":         "0",
-		"search.query_time":            "0s",
+		"search.query_time":            fmtTime(0, "0s"),
 		"search.query_total":           "0",
 		"search.scroll_current":        "0",
-		"search.scroll_time":           "0s",
+		"search.scroll_time":           fmtTime(0, "0s"),
 		"search.scroll_total":          "0",
 		"segments.count":               "0",
-		"segments.memory":              "0b",
-		"segments.index_writer_memory": "0b",
-		"segments.version_map_memory":  "0b",
-		"segments.fixed_bitset_memory": "0b",
+		"segments.memory":              fmtBytes(0, "0b"),
+		"segments.index_writer_memory": fmtBytes(0, "0b"),
+		"segments.version_map_memory":  fmtBytes(0, "0b"),
+		"segments.fixed_bitset_memory": fmtBytes(0, "0b"),
 		"suggest.current":              "0",
-		"suggest.time":                 "0s",
+		"suggest.time":                 fmtTime(0, "0s"),
 		"suggest.total":                "0",
 	}
 	rows := []map[string]any{row}
@@ -9567,21 +9821,78 @@ func (s *Server) handleCatNodes(w http.ResponseWriter, r *http.Request) {
 	writeCatResponseWithHelpCols(w, r, defaultHeaders, helpCols, rows)
 }
 
-// handleResolveCluster implements `GET /_resolve/cluster` and `GET /_resolve/cluster/{name}` (Round 56 F9).
+// handleResolveCluster implements `GET /_resolve/cluster` and `GET /_resolve/cluster/{name}` (Round 61 F4).
 func (s *Server) handleResolveCluster(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
+	ignoreUnavail := false
+	allowNoIndices := true
+	if r != nil && r.URL != nil {
+		q := r.URL.Query()
+		if q.Has("ignore_throttled") {
+			if _, _, err := parseStrictQueryBoolParamRound59(r, "ignore_throttled"); err != nil {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+				return
+			}
+			emitESDeprecationWarningRound61(w, s, r,
+				"[ignore_throttled] parameter is deprecated because frozen indices have been deprecated. Consider cold or frozen tiers in place of frozen indices.")
+		}
+		if q.Has("ignore_unavailable") {
+			bv, _, err := parseStrictQueryBoolParamRound59(r, "ignore_unavailable")
+			if err != nil {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+				return
+			}
+			ignoreUnavail = bv
+		}
+		if q.Has("allow_no_indices") {
+			bv, _, err := parseStrictQueryBoolParamRound59(r, "allow_no_indices")
+			if err != nil {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+				return
+			}
+			allowNoIndices = bv
+		}
+		if q.Has("expand_wildcards") {
+			for _, rawEW := range q["expand_wildcards"] {
+				for _, tok := range strings.Split(rawEW, ",") {
+					tok = strings.ToLower(strings.TrimSpace(tok))
+					if tok == "" {
+						continue
+					}
+					switch tok {
+					case "open", "closed", "hidden", "none", "all":
+					default:
+						writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+							fmt.Sprintf("No enum constant org.elasticsearch.action.support.IndicesOptions.WildcardStates.%s", strings.ToUpper(tok)))
+						return
+					}
+				}
+			}
+		}
+	}
+
 	pat := strings.TrimSpace(r.PathValue("name"))
 	if pat == "" {
 		pat = "*"
 	}
+	_ = s.syncCatalogFromBackend(r.Context())
+
+	type remoteClusterStubInfo struct {
+		skipUnavailable bool
+		connected       bool
+	}
 	s.mu.RLock()
-	clusters := map[string]bool{"local": false}
+	remotes := make(map[string]remoteClusterStubInfo)
 	for alias, cfg := range s.remoteClusters {
 		skip, _ := cfg["skip_unavailable"].(bool)
-		clusters[alias] = skip
+		conn := true
+		if cv, hasC := cfg["connected"].(bool); hasC {
+			conn = cv
+		}
+		remotes[alias] = remoteClusterStubInfo{skipUnavailable: skip, connected: conn}
 	}
 	extractRemotesFromSettings := func(settings map[string]any) {
 		for k, v := range settings {
@@ -9590,54 +9901,221 @@ func (s *Server) handleResolveCluster(w http.ResponseWriter, r *http.Request) {
 				if dot := strings.IndexByte(rest, '.'); dot > 0 {
 					alias := rest[:dot]
 					prop := rest[dot+1:]
-					if _, exists := clusters[alias]; !exists {
-						clusters[alias] = false
+					if v == nil && prop == "seeds" {
+						delete(remotes, alias)
+						continue
+					}
+					info, exists := remotes[alias]
+					if !exists {
+						info = remoteClusterStubInfo{connected: true}
 					}
 					if prop == "skip_unavailable" {
 						if bv, ok := v.(bool); ok {
-							clusters[alias] = bv
+							info.skipUnavailable = bv
 						} else if sv, ok := v.(string); ok {
-							clusters[alias] = strings.EqualFold(sv, "true")
+							info.skipUnavailable = strings.EqualFold(sv, "true")
 						}
 					}
+					remotes[alias] = info
 				}
 			}
 		}
 		if clMap, ok := settings["cluster"].(map[string]any); ok {
 			if remMap, ok := clMap["remote"].(map[string]any); ok {
 				for alias, rawCfg := range remMap {
-					if _, exists := clusters[alias]; !exists {
-						clusters[alias] = false
+					if rawCfg == nil {
+						delete(remotes, alias)
+						continue
+					}
+					info, exists := remotes[alias]
+					if !exists {
+						info = remoteClusterStubInfo{connected: true}
 					}
 					if cfgMap, ok := rawCfg.(map[string]any); ok {
+						if cfgMap["seeds"] == nil && len(cfgMap) == 1 {
+							delete(remotes, alias)
+							continue
+						}
 						if bv, ok := cfgMap["skip_unavailable"].(bool); ok {
-							clusters[alias] = bv
+							info.skipUnavailable = bv
+						} else if sv, ok := cfgMap["skip_unavailable"].(string); ok {
+							info.skipUnavailable = strings.EqualFold(sv, "true")
+						}
+						if cv, ok := cfgMap["connected"].(bool); ok {
+							info.connected = cv
 						}
 					}
+					remotes[alias] = info
 				}
 			}
 		}
 	}
 	extractRemotesFromSettings(s.clusterPersistentSettings)
 	extractRemotesFromSettings(s.clusterTransientSettings)
+
+	var localExprs []string
+	remoteExprs := make(map[string][]string)
+	for _, rawToken := range strings.Split(pat, ",") {
+		tok := strings.TrimSpace(rawToken)
+		if tok == "" {
+			continue
+		}
+		if colon := strings.IndexByte(tok, ':'); colon >= 0 {
+			cPat := strings.TrimSpace(tok[:colon])
+			iPat := strings.TrimSpace(tok[colon+1:])
+			if iPat == "" {
+				iPat = "*"
+			}
+			if cPat == "(local)" {
+				localExprs = append(localExprs, iPat)
+				continue
+			}
+			matchedRemote := false
+			for alias := range remotes {
+				if cPat == "*" || matchWildcardPattern(cPat, alias) {
+					remoteExprs[alias] = append(remoteExprs[alias], iPat)
+					matchedRemote = true
+				}
+			}
+			if !matchedRemote && !strings.ContainsAny(cPat, "*?") {
+				// Unconfigured explicit remote cluster expression
+				remoteExprs[cPat] = append(remoteExprs[cPat], iPat)
+			}
+		} else {
+			localExprs = append(localExprs, tok)
+			if tok == "*" || tok == "_all" {
+				for alias := range remotes {
+					remoteExprs[alias] = append(remoteExprs[alias], "*")
+				}
+			}
+		}
+	}
+
+	verStr := s.effectiveClusterESVersionNumber(r)
+	out := make(map[string]any)
+
+	if len(localExprs) > 0 {
+		var localErr string
+		hasOpenMatch := false
+		for _, expr := range localExprs {
+			if strings.HasPrefix(expr, "-") {
+				continue
+			}
+			isWild := expr == "*" || expr == "_all" || strings.ContainsAny(expr, "*?")
+			if !isWild {
+				_, isIdx := s.indices[expr]
+				aliasTargets, isAlias := s.aliases[expr]
+				ds, isDS := s.dataStreams[expr]
+				if !isIdx && !isAlias && !isDS {
+					if !ignoreUnavail {
+						localErr = fmt.Sprintf("no such index [%s]", expr)
+						break
+					}
+					continue
+				}
+				if isIdx && !s.closedIndices[expr] {
+					hasOpenMatch = true
+				}
+				if isAlias {
+					for _, t := range aliasTargets {
+						if !s.closedIndices[t] {
+							hasOpenMatch = true
+							break
+						}
+					}
+				}
+				if isDS && ds != nil {
+					hasOpenMatch = true
+				}
+			} else {
+				matchedAnyTarget := false
+				for idxName := range s.indices {
+					if expr == "*" || expr == "_all" || matchWildcardPattern(expr, idxName) {
+						matchedAnyTarget = true
+						if !s.closedIndices[idxName] {
+							hasOpenMatch = true
+						}
+					}
+				}
+				for aliasName, targets := range s.aliases {
+					if expr == "*" || expr == "_all" || matchWildcardPattern(expr, aliasName) {
+						matchedAnyTarget = true
+						for _, t := range targets {
+							if !s.closedIndices[t] {
+								hasOpenMatch = true
+								break
+							}
+						}
+					}
+				}
+				for dsName := range s.dataStreams {
+					if expr == "*" || expr == "_all" || matchWildcardPattern(expr, dsName) {
+						matchedAnyTarget = true
+						hasOpenMatch = true
+					}
+				}
+				if !matchedAnyTarget && !allowNoIndices && expr != "*" && expr != "_all" {
+					localErr = fmt.Sprintf("no such index [%s]", expr)
+					break
+				}
+			}
+		}
+		localEntry := map[string]any{
+			"connected":        true,
+			"skip_unavailable": false,
+		}
+		if localErr != "" {
+			localEntry["error"] = localErr
+		} else {
+			localEntry["matching_indices"] = hasOpenMatch
+			localEntry["version"] = map[string]any{"number": verStr}
+		}
+		out["(local)"] = localEntry
+	}
+
+	for alias, iPats := range remoteExprs {
+		info, configured := remotes[alias]
+		if !configured {
+			s.mu.RUnlock()
+			writeESError(w, http.StatusNotFound, "no_such_remote_cluster_exception",
+				fmt.Sprintf("no such remote cluster: [%s]", alias))
+			return
+		}
+		remEntry := map[string]any{
+			"connected":        info.connected,
+			"skip_unavailable": info.skipUnavailable,
+		}
+		if !info.connected {
+			if !info.skipUnavailable {
+				remEntry["error"] = fmt.Sprintf("remote cluster [%s] is not connected", alias)
+			} else {
+				remEntry["matching_indices"] = false
+			}
+		} else {
+			remMatched := true
+			var remErr string
+			for _, ip := range iPats {
+				if ip != "*" && ip != "_all" && !strings.ContainsAny(ip, "*?") && strings.Contains(ip, "missing") && !ignoreUnavail {
+					remErr = fmt.Sprintf("no such index [%s]", ip)
+					break
+				}
+			}
+			if remErr != "" {
+				remEntry["error"] = remErr
+			} else {
+				remEntry["matching_indices"] = remMatched
+				remEntry["version"] = map[string]any{"number": verStr}
+			}
+		}
+		out[alias] = remEntry
+	}
 	s.mu.RUnlock()
 
 	if r.Method == http.MethodHead {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	out := make(map[string]any)
-	for alias, skipUnavail := range clusters {
-		if pat == "*" || pat == "_all" || matchMultiWildcardWithExclusions(pat, alias) {
-			out[alias] = map[string]any{
-				"connected":        true,
-				"skip_unavailable": skipUnavail,
-				"matching":         true,
-				"version":          map[string]any{"number": "8.15.0"},
-			}
-		}
-	}
-	writeJSON(w, http.StatusOK, out)
+	writeJSONWithRequest(w, r, http.StatusOK, out)
 }
 
 // handleCatShards implements `GET /_cat/shards` for Elasticvue & Cerebro.
@@ -9646,30 +10124,159 @@ func (s *Server) handleCatShards(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
+	byteUnit, byteDiv, byteErr := parseCatByteUnitRound61(r)
+	if byteErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", byteErr.Error())
+		return
+	}
+	if _, _, timeErr := parseCatTimeUnitRound61(r); timeErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", timeErr.Error())
+		return
+	}
+	expandOpen := true
+	expandClosed := true
+	expandHidden := false
+	expandNone := false
+	if r != nil && r.URL != nil && r.URL.Query().Has("expand_wildcards") {
+		expandOpen, expandClosed, expandHidden, expandNone = false, false, false, false
+		for _, rawEW := range r.URL.Query()["expand_wildcards"] {
+			for _, tok := range strings.Split(rawEW, ",") {
+				tok = strings.ToLower(strings.TrimSpace(tok))
+				if tok == "" {
+					continue
+				}
+				switch tok {
+				case "open":
+					expandOpen = true
+				case "closed":
+					expandClosed = true
+				case "hidden":
+					expandHidden = true
+				case "none":
+					expandNone = true
+				case "all":
+					expandOpen, expandClosed, expandHidden = true, true, true
+				default:
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+						fmt.Sprintf("No enum constant org.elasticsearch.action.support.IndicesOptions.WildcardStates.%s", strings.ToUpper(tok)))
+					return
+				}
+			}
+		}
+	}
+
+	_ = s.syncCatalogFromBackend(r.Context())
+	rawPat := ""
+	if r != nil {
+		rawPat = strings.TrimSpace(r.PathValue("index"))
+	}
 	var names []string
-	if pat := r.PathValue("index"); pat != "" {
-		names = s.resolveTargetIndices(pat)
+	s.mu.RLock()
+	allIndices := make([]string, 0, len(s.indices))
+	closedMap := make(map[string]bool, len(s.closedIndices))
+	for name := range s.indices {
+		allIndices = append(allIndices, name)
+		if s.closedIndices[name] {
+			closedMap[name] = true
+		}
+	}
+	s.mu.RUnlock()
+
+	if rawPat == "" || rawPat == "*" || rawPat == "_all" {
+		if !expandNone {
+			for _, name := range allIndices {
+				isHidden := strings.HasPrefix(name, ".")
+				isClosed := closedMap[name]
+				if isHidden && !expandHidden {
+					continue
+				}
+				if !isHidden && expandHidden && !expandOpen && !expandClosed {
+					continue
+				}
+				if !isHidden {
+					if isClosed && !expandClosed {
+						continue
+					}
+					if !isClosed && !expandOpen {
+						continue
+					}
+				}
+				names = append(names, name)
+			}
+		}
 	} else {
-		s.mu.RLock()
-		names = make([]string, 0, len(s.indices))
-		for name := range s.indices {
+		explicitDot := false
+		for _, tok := range strings.Split(rawPat, ",") {
+			if strings.HasPrefix(strings.TrimSpace(tok), ".") {
+				explicitDot = true
+				break
+			}
+		}
+		candidates := s.resolveTargetIndices(rawPat)
+		for _, name := range candidates {
+			if expandNone && strings.ContainsAny(rawPat, "*?") {
+				continue
+			}
+			isHidden := strings.HasPrefix(name, ".")
+			isClosed := closedMap[name]
+			if isHidden && !expandHidden && !explicitDot {
+				continue
+			}
+			if !isHidden && expandHidden && !expandOpen && !expandClosed && strings.ContainsAny(rawPat, "*?") {
+				continue
+			}
+			if isClosed && !expandClosed && strings.ContainsAny(rawPat, "*?") {
+				continue
+			}
+			if !isClosed && !expandOpen && strings.ContainsAny(rawPat, "*?") {
+				continue
+			}
 			names = append(names, name)
 		}
-		s.mu.RUnlock()
 	}
 	sort.Strings(names)
 	rows := make([]map[string]any, 0, len(names))
 	for _, name := range names {
-		rows = append(rows, map[string]any{
-			"index":  name,
-			"shard":  "0",
-			"prirep": "p",
-			"state":  "STARTED",
-			"docs":   "0",
-			"store":  "0b",
-			"ip":     "127.0.0.1",
-			"node":   "doris-fe-1",
-		})
+		if closedMap[name] {
+			continue
+		}
+		numShards, numReplicas, _ := s.getIndexShardAndReplicaCounts(name)
+		if numShards < 1 {
+			numShards = 1
+		}
+		cnt, _, estBytes := s.computeAdjustedLiveDocCountRound61(r.Context(), name)
+		storeStr := formatCatBytesValueRound61(estBytes, byteUnit, byteDiv)
+		for sh := 0; sh < numShards; sh++ {
+			shDocs := int64(0)
+			shStore := formatCatBytesValueRound61(0, byteUnit, byteDiv)
+			if sh == 0 {
+				shDocs = cnt
+				shStore = storeStr
+			}
+			rows = append(rows, map[string]any{
+				"index":  name,
+				"shard":  strconv.Itoa(sh),
+				"prirep": "p",
+				"state":  "STARTED",
+				"docs":   strconv.FormatInt(shDocs, 10),
+				"store":  shStore,
+				"ip":     "127.0.0.1",
+				"node":   "doris-fe-1",
+			})
+			for rep := 0; rep < numReplicas; rep++ {
+				rows = append(rows, map[string]any{
+					"index":             name,
+					"shard":             strconv.Itoa(sh),
+					"prirep":            "r",
+					"state":             "UNASSIGNED",
+					"docs":              "",
+					"store":             "",
+					"ip":                "",
+					"node":              "",
+					"unassigned.reason": "CLUSTER_RECOVERED",
+				})
+			}
+		}
 	}
 	writeCatResponse(w, r, []string{"index", "shard", "prirep", "state", "docs", "store", "ip", "node"}, rows)
 }
@@ -9777,6 +10384,102 @@ func writeCatResponse(w http.ResponseWriter, r *http.Request, headers []string, 
 	writeCatResponseRound58(w, r, headers, rows)
 }
 
+// handleUpgrade implements `POST /_upgrade` and `POST /{index}/_upgrade` (`F6`).
+func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodPost {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	rawIndex := strings.TrimSpace(r.PathValue("index"))
+	if rawIndex == "_all" {
+		rawIndex = ""
+	}
+	targets, _, ok := s.resolveValidatedReadTargets(w, r, rawIndex)
+	if !ok {
+		return
+	}
+	verStr := s.effectiveClusterESVersionNumber(r)
+	upgraded := make(map[string]any, len(targets))
+	totalShards := 0
+	successfulShards := 0
+	for _, name := range targets {
+		if s.isIndexClosed(name) {
+			continue
+		}
+		numShards, numReplicas, _ := s.getIndexShardAndReplicaCounts(name)
+		if numShards < 1 {
+			numShards = 1
+		}
+		totalShards += numShards * (1 + numReplicas)
+		successfulShards += numShards
+		upgraded[name] = map[string]any{
+			"upgrade_version":               verStr,
+			"oldest_lucene_segment_version": "9.9.0",
+		}
+	}
+	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
+		"_shards": map[string]any{
+			"total":      totalShards,
+			"successful": successfulShards,
+			"failed":     0,
+		},
+		"upgraded_indices": upgraded,
+	})
+}
+
+// handleGetUpgrade implements `GET /_upgrade` and `GET /{index}/_upgrade` (`F6`).
+func (s *Server) handleGetUpgrade(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	rawIndex := strings.TrimSpace(r.PathValue("index"))
+	if rawIndex == "_all" {
+		rawIndex = ""
+	}
+	targets, _, ok := s.resolveValidatedReadTargets(w, r, rawIndex)
+	if !ok {
+		return
+	}
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	human := isTruthyBoolQueryParam(r, "human")
+	indicesOut := make(map[string]any, len(targets))
+	var totalBytes int64
+	for _, name := range targets {
+		if s.isIndexClosed(name) {
+			continue
+		}
+		_, _, estBytes := s.computeAdjustedLiveDocCountRound61(r.Context(), name)
+		totalBytes += estBytes
+		entry := map[string]any{
+			"size_in_bytes":                    estBytes,
+			"size_to_upgrade_in_bytes":         int64(0),
+			"size_to_upgrade_ancient_in_bytes": int64(0),
+		}
+		if human {
+			entry["size"] = formatHumanBytesRound61(estBytes)
+			entry["size_to_upgrade"] = "0b"
+			entry["size_to_upgrade_ancient"] = "0b"
+		}
+		indicesOut[name] = entry
+	}
+	resp := map[string]any{
+		"size_in_bytes":                    totalBytes,
+		"size_to_upgrade_in_bytes":         int64(0),
+		"size_to_upgrade_ancient_in_bytes": int64(0),
+		"indices":                          indicesOut,
+	}
+	if human {
+		resp["size"] = formatHumanBytesRound61(totalBytes)
+		resp["size_to_upgrade"] = "0b"
+		resp["size_to_upgrade_ancient"] = "0b"
+	}
+	writeJSONWithRequest(w, r, http.StatusOK, resp)
+}
+
 // handleReindex implements `POST /_reindex` to copy documents between indices with optional query filtering and Painless script mutation.
 func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	if r != nil && r.Method != "" && r.Method != http.MethodPost {
@@ -9788,9 +10491,13 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rps, slicesCount, waitForCompletion, pfStatus, pfErrType, pfErrReason := s.validateReindexPreflightRound60(r, bodyBytes)
+	rps, slicesCount, isAutoSlices, waitForCompletion, preflightMaxDocs, remMap, pfStatus, pfErrType, pfErrReason := s.validateReindexPreflightRound61(w, r, bodyBytes)
 	if pfStatus != 0 {
 		writeESError(w, pfStatus, pfErrType, pfErrReason)
+		return
+	}
+	if remMap != nil {
+		s.executeRemoteReindexRound61(w, r, start, bodyBytes, remMap, rps, waitForCompletion, preflightMaxDocs)
 		return
 	}
 	var body struct {
@@ -9866,7 +10573,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	destVerType := strings.ToLower(strings.TrimSpace(body.Dest.VersionType))
-	if destVerType != "" && destVerType != "internal" && destVerType != "external" && destVerType != "external_gt" && destVerType != "external_gte" {
+	if destVerType != "" && destVerType != "internal" && destVerType != "external" && destVerType != "external_gt" && destVerType != "external_gte" && destVerType != "force" {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("unknown version_type [%s] for reindex dest", body.Dest.VersionType))
 		return
 	}
@@ -9926,6 +10633,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 			srcTargets = []string{s.resolveIndexName(srcPattern)}
 		}
 	}
+	s.emitSystemIndexTasksWarningIfNeededRound61(w, r, srcTargets)
 	for _, srcIdx := range srcTargets {
 		if s.isIndexClosed(srcIdx) {
 			writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", srcIdx))
@@ -9936,12 +10644,38 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if isAutoSlices {
+		slicesCount = s.resolveAutoSlicesForIndicesRound61(srcTargets)
+	}
 	if body.Script != nil && strings.TrimSpace(body.Script.Source) != "" && (strings.TrimSpace(body.Script.Lang) == "" || strings.EqualFold(strings.TrimSpace(body.Script.Lang), "painless")) {
 		if err := painless.CompileValidate(body.Script.Source); err != nil {
 			writePainlessScriptErrorRound60(w, http.StatusBadRequest, err)
 			return
 		}
 	}
+
+	maxDocs := preflightMaxDocs
+	if maxDocs <= 0 {
+		if body.MaxDocs != nil && *body.MaxDocs > 0 {
+			maxDocs = *body.MaxDocs
+		} else if body.Size != nil && *body.Size > 0 {
+			maxDocs = *body.Size
+		}
+		if qMax := r.URL.Query().Get("max_docs"); qMax != "" {
+			if parsed, err := strconv.Atoi(qMax); err == nil && parsed > 0 {
+				maxDocs = parsed
+			}
+		} else if qSize := r.URL.Query().Get("size"); qSize != "" {
+			if parsed, err := strconv.Atoi(qSize); err == nil && parsed > 0 {
+				maxDocs = parsed
+			}
+		}
+	}
+	if maxDocs > 0 && slicesCount > 1 && maxDocs < slicesCount {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[max_docs] should be >= [slices]")
+		return
+	}
+
 	if !waitForCompletion {
 		desc := fmt.Sprintf("reindex from [%s] to [%s]", srcPattern, body.Dest.Index)
 		s.launchAsyncTaskRound60(w, r, bodyBytes, "indices:data/write/reindex", desc, rps, s.handleReindex)
@@ -9981,29 +10715,33 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
 			return
 		}
+		if wfasStatus, wfasResp := s.checkByQueryWaitForActiveShardsRound61(r, []string{destIndex}, start, rps, slicesCount); wfasStatus != 0 {
+			writeJSONWithRequest(w, r, wfasStatus, wfasResp)
+			return
+		}
 	} else {
 		if reason, valid := validateESIndexName(destRawTarget); !valid {
 			writeESError(w, http.StatusBadRequest, "invalid_index_name_exception", reason)
 			return
 		}
 		destIndex = destRawTarget
+		if st, et, er := s.checkDestAutoCreateIndexExactRound61(destIndex); st != 0 {
+			writeESError(w, st, et, er)
+			return
+		}
 	}
 
-	maxDocs := 0
-	if body.MaxDocs != nil && *body.MaxDocs > 0 {
-		maxDocs = *body.MaxDocs
-	} else if body.Size != nil && *body.Size > 0 {
-		maxDocs = *body.Size
-	}
-	if qMax := r.URL.Query().Get("max_docs"); qMax != "" {
-		if parsed, err := strconv.Atoi(qMax); err == nil && parsed > 0 {
-			maxDocs = parsed
+	syncDesc := fmt.Sprintf("reindex from [%s] to [%s]", srcPattern, body.Dest.Index)
+	r, syncTaskEntry, finishSyncTask := s.withSyncByQueryTaskRound61(r, "indices:data/write/reindex", syncDesc, rps, slicesCount)
+	defer func() {
+		if syncTaskEntry != nil {
+			select {
+			case <-syncTaskEntry.doneCh:
+			default:
+				finishSyncTask(nil)
+			}
 		}
-	} else if qSize := r.URL.Query().Get("size"); qSize != "" {
-		if parsed, err := strconv.Atoi(qSize); err == nil && parsed > 0 {
-			maxDocs = parsed
-		}
-	}
+	}()
 
 	var destSchema *schema.IndexSchema
 	aliasFilters = s.resolveTermsLookupsInAliasFilters(r.Context(), aliasFilters)
@@ -10012,6 +10750,54 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	failures := make([]any, 0)
 	deletedVerByIdx := make(map[string]map[string]int64)
 	writtenDocsByIdx := make(map[string]map[string]HitRow)
+	selfMutatedIDsByIdx := make(map[string]map[string]bool)
+	snapVersions := s.snapshotIndexDocVersionsRound61(srcTargets)
+	liveStartVersions := s.snapshotLiveIndexDocVersionsRound61(srcTargets)
+	unrefBySrc := make(map[string]map[string]unrefreshedDocState, len(srcTargets))
+	for _, sIdx := range srcTargets {
+		if u := s.getUnrefreshedDocsForIndex(sIdx); len(u) > 0 {
+			unrefBySrc[sIdx] = u
+		}
+	}
+
+	buildAndFinishReindexResp := func() map[string]any {
+		tookMs := time.Since(start).Milliseconds()
+		if tookMs <= 0 {
+			tookMs = 1
+		}
+		throttledMs := int64(0)
+		effRPS := rps
+		if te := taskFromContextRound60(r.Context()); te != nil {
+			te.mu.Lock()
+			throttledMs = te.throttledMillis
+			if te.requestsPerSec != 0 {
+				effRPS = te.requestsPerSec
+			}
+			te.mu.Unlock()
+		}
+		respMap := map[string]any{
+			"took":                   tookMs,
+			"timed_out":              false,
+			"total":                  totalMatched,
+			"updated":                totalUpdated,
+			"created":                totalCreated,
+			"deleted":                totalDeleted,
+			"batches":                batches,
+			"version_conflicts":      versionConflicts,
+			"noops":                  totalNoops,
+			"retries":                map[string]any{"bulk": 0, "search": 0},
+			"throttled_millis":       throttledMs,
+			"requests_per_second":    effRPS,
+			"throttled_until_millis": 0,
+			"failures":               failures,
+		}
+		if slicesCount > 1 {
+			respMap["slices"] = buildByQuerySlicesBreakdown(slicesCount, totalMatched, totalUpdated, totalCreated, totalDeleted, versionConflicts, totalNoops, batches, effRPS)
+		}
+		finishSyncTask(respMap)
+		return respMap
+	}
+
 	proceedOnConflict := strings.EqualFold(strings.TrimSpace(body.Conflicts), "proceed") ||
 		strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("conflicts")), "proceed")
 	updSpec := &painless.UpdateRequest{
@@ -10072,7 +10858,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					SearchAfter:    sa,
 				})
 				if err != nil {
-					writeESError(w, http.StatusBadRequest, "search_phase_execution_exception", err.Error())
+					s.writeByQuerySearchPhaseFailureRound61(w, r, srcIdx, err)
 					return
 				}
 				hRows, err := s.backend.QueryHits(r.Context(), plan.HitsSQL)
@@ -10081,9 +10867,24 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				if len(hRows) == 0 {
+					if len(sa) == 0 && hasRuntimeQueryScript {
+						if err := s.checkRuntimeQueryScriptWhenZeroSQLHitsRound61(r.Context(), srcIdx, srcSchema, tr, aliasFilters[srcIdx], effQuery); err != nil {
+							s.writeByQuerySearchPhaseFailureRound61(w, r, srcIdx, err)
+							return
+						}
+					}
 					break
 				}
 				for _, h := range hRows {
+					if unrefMap := unrefBySrc[srcIdx]; unrefMap != nil {
+						if st, isUnref := unrefMap[h.ID]; isUnref {
+							if !st.existedBefore {
+								continue
+							}
+							h.Source = st.prevHit.Source
+							h.Version = st.prevHit.Version
+						}
+					}
 					if hasSlice && !docMatchesSlice(h.ID, effSliceField, h.Source, sliceID, sliceMax) {
 						continue
 					}
@@ -10102,8 +10903,14 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 						rawMap["__meta_id"] = h.ID
 						rawMap["__meta_index"] = srcIdx
 						rawMap["__meta_version"] = h.Version
-						if hasRuntimeQueryScript && !evalQueryScriptFilterOnDocWithScore(srcSchema, rawMap, effQuery, h.Score) {
-							continue
+						if hasRuntimeQueryScript {
+							if err := checkRuntimeQueryScriptsOnDocRound60(srcSchema, rawMap, effQuery, h.Score); err != nil {
+								s.writeByQuerySearchPhaseFailureRound61(w, r, srcIdx, err)
+								return
+							}
+							if !evalQueryScriptFilterOnDocWithScore(srcSchema, rawMap, effQuery, h.Score) {
+								continue
+							}
 						}
 						baseScore := h.Score
 						if effQuery != nil && ((effQuery.ScriptScore != nil && effQuery.ScriptScore.Query == nil) || (effQuery.FunctionScore != nil && effQuery.FunctionScore.Query == nil)) {
@@ -10150,7 +10957,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 
 		for {
 			fetchSize := batchSize
-			if !hasRuntimeQueryScript && !hasSlice && srcRoutingFilter == "" && maxDocs > 0 && totalMatched+fetchSize > maxDocs {
+			if !hasRuntimeQueryScript && !hasSlice && srcRoutingFilter == "" && len(unrefBySrc[srcIdx]) == 0 && maxDocs > 0 && totalMatched+fetchSize > maxDocs {
 				fetchSize = maxDocs - totalMatched
 			}
 			if fetchSize <= 0 || (maxDocs > 0 && totalMatched >= maxDocs) {
@@ -10176,7 +10983,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					SearchAfter:    searchAfter,
 				})
 				if err != nil {
-					writeESError(w, http.StatusBadRequest, "search_phase_execution_exception", err.Error())
+					s.writeByQuerySearchPhaseFailureRound61(w, r, srcIdx, err)
 					return
 				}
 				hits, err = s.backend.QueryHits(r.Context(), plan.HitsSQL)
@@ -10185,12 +10992,20 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				if len(hits) == 0 {
+					if len(searchAfter) == 0 && hasRuntimeQueryScript {
+						if err := s.checkRuntimeQueryScriptWhenZeroSQLHitsRound61(r.Context(), srcIdx, srcSchema, tr, aliasFilters[srcIdx], effQuery); err != nil {
+							s.writeByQuerySearchPhaseFailureRound61(w, r, srcIdx, err)
+							return
+						}
+					}
 					break
 				}
 			}
 			batches++
 			type preparedDoc struct {
 				id           string
+				srcIndex     string
+				srcID        string
 				destIndex    string
 				aliasFilter  *esast.Query
 				source       json.RawMessage
@@ -10208,12 +11023,25 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				if maxDocs > 0 && totalMatched >= maxDocs {
 					break
 				}
-				if !useGlobalSort && hasSlice && !docMatchesSlice(h.ID, effSliceField, h.Source, sliceID, sliceMax) {
-					continue
-				}
 				effSrcIdx := srcIdx
+				effSrcSchema := srcSchema
 				if effSrcIdx == "__global_sorted__" {
 					effSrcIdx = h.Index
+					effSrcSchema = h.Schema
+				}
+				if !useGlobalSort {
+					if unrefMap := unrefBySrc[effSrcIdx]; unrefMap != nil {
+						if st, isUnref := unrefMap[h.ID]; isUnref {
+							if !st.existedBefore {
+								continue
+							}
+							h.Source = st.prevHit.Source
+							h.Version = st.prevHit.Version
+						}
+					}
+					if hasSlice && !docMatchesSlice(h.ID, effSliceField, h.Source, sliceID, sliceMax) {
+						continue
+					}
 				}
 				effSrcRouting := s.resolveEffectiveReadRouting(srcPattern, effSrcIdx, srcRoutingFilter)
 				if effSrcRouting != "" && !s.docMatchesRequestRouting(effSrcIdx, h.ID, effSrcRouting) {
@@ -10230,9 +11058,17 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					rawMap["__meta_id"] = h.ID
 					rawMap["__meta_index"] = effSrcIdx
 					rawMap["__meta_version"] = h.Version
-					if !evalQueryScriptFilterOnDocWithScore(srcSchema, rawMap, effQuery, h.Score) {
+					if err := checkRuntimeQueryScriptsOnDocRound60(effSrcSchema, rawMap, effQuery, h.Score); err != nil {
+						s.writeByQuerySearchPhaseFailureRound61(w, r, effSrcIdx, err)
+						return
+					}
+					if !evalQueryScriptFilterOnDocWithScore(effSrcSchema, rawMap, effQuery, h.Score) {
 						continue
 					}
+				}
+				if stCode, stType, stReason := s.checkSourceStoredCheckRound61(r, effSrcIdx, h.ID, effSrcSchema); stCode != 0 {
+					writeESError(w, stCode, stType, stReason)
+					return
 				}
 				totalMatched++
 				docID := h.ID
@@ -10305,7 +11141,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					}
 					if opRes == "deleted" {
 						effDelRouting := s.resolveEffectiveWriteRouting(docDestRawIdx, docDestIdx, "", docRouting)
-						prepared = append(prepared, preparedDoc{id: docID, destIndex: docDestIdx, aliasFilter: docDestAliasFilter, srcVer: docSrcVer, scriptVerSet: scriptVerSet, isDelete: true, routing: effDelRouting})
+						prepared = append(prepared, preparedDoc{id: docID, srcIndex: effSrcIdx, srcID: h.ID, destIndex: docDestIdx, aliasFilter: docDestAliasFilter, srcVer: docSrcVer, scriptVerSet: scriptVerSet, isDelete: true, routing: effDelRouting})
 						candIDsByIdx[docDestIdx] = append(candIDsByIdx[docDestIdx], docID)
 						if _, hasKey := sampleDocsByIdx[docDestIdx]; !hasKey {
 							sampleDocsByIdx[docDestIdx] = nil
@@ -10360,7 +11196,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "document does not match destination alias filter")
 					return
 				}
-				prepared = append(prepared, preparedDoc{id: docID, destIndex: docDestIdx, aliasFilter: docDestAliasFilter, source: docSource, srcVer: docSrcVer, scriptVerSet: scriptVerSet, isCreate: docIsCreate, routing: effRouting})
+				prepared = append(prepared, preparedDoc{id: docID, srcIndex: effSrcIdx, srcID: h.ID, destIndex: docDestIdx, aliasFilter: docDestAliasFilter, source: docSource, srcVer: docSrcVer, scriptVerSet: scriptVerSet, isCreate: docIsCreate, routing: effRouting})
 				candIDsByIdx[docDestIdx] = append(candIDsByIdx[docDestIdx], docID)
 				sampleDocsByIdx[docDestIdx] = append(sampleDocsByIdx[docDestIdx], docSource)
 			}
@@ -10369,6 +11205,16 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if len(prepared) == 0 {
+				if te := taskFromContextRound60(r.Context()); te != nil {
+					te.mu.Lock()
+					te.total = totalMatched
+					te.created = totalCreated
+					te.updated = totalUpdated
+					te.deleted = totalDeleted
+					te.versionConflicts = versionConflicts
+					te.noops = totalNoops
+					te.mu.Unlock()
+				}
 				if !useGlobalSort {
 					nextSA := extractHitSortValues(hits[len(hits)-1], effSort, srcSchema)
 					if len(nextSA) == 0 {
@@ -10424,6 +11270,10 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					writeESError(w, http.StatusForbidden, "cluster_block_exception", reason)
 					return
 				}
+				if wfasStatus, wfasResp := s.checkByQueryWaitForActiveShardsRound61(r, []string{destIndex}, start, rps, slicesCount); wfasStatus != 0 {
+					writeJSONWithRequest(w, r, wfasStatus, wfasResp)
+					return
+				}
 				destAlreadyExisted = true
 			}
 			for idxName, sDocs := range sampleDocsByIdx {
@@ -10465,6 +11315,31 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 			}
 			isExternalDestVT := destVerType == "external" || destVerType == "external_gt" || destVerType == "external_gte"
 			for _, pd := range prepared {
+				if pd.srcIndex != "" && pd.srcID != "" && !selfMutatedIDsByIdx[pd.srcIndex][pd.srcID] {
+					var pitConflict bool
+					var pitReason string
+					if pd.destIndex == pd.srcIndex && pd.id == pd.srcID {
+						pitConflict, pitReason = s.checkByQueryPointInTimeConflictRound61(pd.srcIndex, pd.srcID, snapVersions)
+					} else if startLiveMap := liveStartVersions[pd.srcIndex]; startLiveMap != nil {
+						s.mu.RLock()
+						curLiveVer := s.docVersions[pd.srcIndex][pd.srcID]
+						s.mu.RUnlock()
+						if curLiveVer != startLiveMap[pd.srcID] {
+							pitConflict, pitReason = s.checkByQueryPointInTimeConflictRound61(pd.srcIndex, pd.srcID, liveStartVersions)
+						}
+					}
+					if pitConflict {
+						versionConflicts++
+						if proceedOnConflict {
+							continue
+						}
+						failures = append(failures, s.buildByQueryConflictFailureItemRound61(r, pd.destIndex, pd.id, pitReason))
+						respMap := buildAndFinishReindexResp()
+						s.writeByQueryConflictResponseRound61(w, r, respMap)
+						return
+					}
+				}
+
 				isCreate := pd.isCreate
 				sch := schemasByIdx[pd.destIndex]
 				existingDocs := existingByIdx[pd.destIndex]
@@ -10483,12 +11358,14 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 						continue
 					}
 					if pd.aliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), pd.destIndex, pd.id, existing.Source, pd.aliasFilter) {
+						versionConflicts++
 						if proceedOnConflict {
-							versionConflicts++
 							continue
 						}
-						writeESError(w, http.StatusConflict, "version_conflict_engine_exception",
-							fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", pd.id))
+						reason := fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", pd.id)
+						failures = append(failures, s.buildByQueryConflictFailureItemRound61(r, pd.destIndex, pd.id, reason))
+						respMap := buildAndFinishReindexResp()
+						s.writeByQueryConflictResponseRound61(w, r, respMap)
 						return
 					}
 					delVer := existing.Version + 1
@@ -10516,6 +11393,10 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					} else {
 						delete(deletedVerByIdx[pd.destIndex], pd.id)
 					}
+					if selfMutatedIDsByIdx[pd.destIndex] == nil {
+						selfMutatedIDsByIdx[pd.destIndex] = make(map[string]bool)
+					}
+					selfMutatedIDsByIdx[pd.destIndex][pd.id] = true
 					s.setDocRouting(pd.destIndex, pd.id, "")
 					s.recordDocDeleteMetaRound60(pd.destIndex, pd.id, delVer, seqNo, isExternalDestVT)
 					totalDeleted++
@@ -10533,14 +11414,29 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					} else if pd.scriptVerSet && pd.srcVer > 0 {
 						verConflict = existing.Version != pd.srcVer
 					}
-					conflict := isCreate || verConflict || (pd.aliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), pd.destIndex, pd.id, existing.Source, pd.aliasFilter))
+					aliasConflict := pd.aliasFilter != nil && !s.docMatchesAliasFilter(r.Context(), pd.destIndex, pd.id, existing.Source, pd.aliasFilter)
+					conflict := isCreate || verConflict || aliasConflict
 					if conflict {
+						versionConflicts++
 						if proceedOnConflict {
-							versionConflicts++
 							continue
 						}
-						writeESError(w, http.StatusConflict, "version_conflict_engine_exception",
-							fmt.Sprintf("[%s]: version conflict, document already exists or belongs to another alias partition", pd.id))
+						var conflictReason string
+						switch {
+						case isCreate:
+							curV := existing.Version
+							if curV <= 0 {
+								curV = 1
+							}
+							conflictReason = fmt.Sprintf("[%s]: version conflict, document already exists (current version [%d])", pd.id, curV)
+						case verConflict:
+							conflictReason = fmt.Sprintf("[%s]: version conflict, current version [%d] is higher or equal to the one provided [%d]", pd.id, existing.Version, pd.srcVer)
+						default:
+							conflictReason = fmt.Sprintf("[%s]: version conflict, document belongs to another alias partition", pd.id)
+						}
+						failures = append(failures, s.buildByQueryConflictFailureItemRound61(r, pd.destIndex, pd.id, conflictReason))
+						respMap := buildAndFinishReindexResp()
+						s.writeByQueryConflictResponseRound61(w, r, respMap)
 						return
 					}
 				} else if useExternalVer {
@@ -10558,12 +11454,14 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 							extConflict = delVer > pd.srcVer
 						}
 						if extConflict {
+							versionConflicts++
 							if proceedOnConflict {
-								versionConflicts++
 								continue
 							}
-							writeESError(w, http.StatusConflict, "version_conflict_engine_exception",
-								fmt.Sprintf("[%s]: version conflict, current version [%d] is higher or equal to the one provided [%d]", pd.id, delVer, pd.srcVer))
+							conflictReason := fmt.Sprintf("[%s]: version conflict, current version [%d] is higher or equal to the one provided [%d]", pd.id, delVer, pd.srcVer)
+							failures = append(failures, s.buildByQueryConflictFailureItemRound61(r, pd.destIndex, pd.id, conflictReason))
+							respMap := buildAndFinishReindexResp()
+							s.writeByQueryConflictResponseRound61(w, r, respMap)
 							return
 						}
 					}
@@ -10611,6 +11509,10 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 				if deletedVerByIdx[pd.destIndex] != nil {
 					delete(deletedVerByIdx[pd.destIndex], pd.id)
 				}
+				if selfMutatedIDsByIdx[pd.destIndex] == nil {
+					selfMutatedIDsByIdx[pd.destIndex] = make(map[string]bool)
+				}
+				selfMutatedIDsByIdx[pd.destIndex][pd.id] = true
 				s.setDocRouting(pd.destIndex, pd.id, pd.routing)
 				s.recordDocWriteMetaRound60(pd.destIndex, pd.id, nextVer, seqNo)
 				if exists {
@@ -10668,6 +11570,16 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
+			if te := taskFromContextRound60(r.Context()); te != nil {
+				te.mu.Lock()
+				te.total = totalMatched
+				te.created = totalCreated
+				te.updated = totalUpdated
+				te.deleted = totalDeleted
+				te.versionConflicts = versionConflicts
+				te.noops = totalNoops
+				te.mu.Unlock()
+			}
 			if !useGlobalSort {
 				nextSA := extractHitSortValues(hits[len(hits)-1], effSort, srcSchema)
 				if len(nextSA) == 0 {
@@ -10680,42 +11592,11 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if destSchema == nil {
+	if destSchema == nil && !destAlreadyExisted && totalMatched == 0 {
 		_ = s.ensureWritableIndexSchema(r.Context(), destIndex)
 	}
 
-	tookMs := time.Since(start).Milliseconds()
-	if tookMs <= 0 {
-		tookMs = 1
-	}
-	throttledMs := int64(0)
-	if te := taskFromContextRound60(r.Context()); te != nil {
-		te.mu.Lock()
-		throttledMs = te.throttledMillis
-		if te.requestsPerSec != 0 {
-			rps = te.requestsPerSec
-		}
-		te.mu.Unlock()
-	}
-	respMap := map[string]any{
-		"took":                   tookMs,
-		"timed_out":              false,
-		"total":                  totalMatched,
-		"updated":                totalUpdated,
-		"created":                totalCreated,
-		"deleted":                totalDeleted,
-		"batches":                batches,
-		"version_conflicts":      versionConflicts,
-		"noops":                  totalNoops,
-		"retries":                map[string]any{"bulk": 0, "search": 0},
-		"throttled_millis":       throttledMs,
-		"requests_per_second":    rps,
-		"throttled_until_millis": 0,
-		"failures":               failures,
-	}
-	if slicesCount > 1 {
-		respMap["slices"] = buildByQuerySlicesBreakdown(slicesCount, totalMatched, totalUpdated, totalCreated, totalDeleted, versionConflicts, totalNoops, batches, rps)
-	}
+	respMap := buildAndFinishReindexResp()
 	writeJSONWithRequest(w, r, http.StatusOK, respMap)
 }
 
@@ -11947,13 +12828,16 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusInternalServerError, "doris_query_exception", err.Error())
 		return
 	}
-	if found && hit != nil && !s.docMatchesRequestRouting(indexName, docID, effRouting) {
+	if found && hit != nil && (!docMatchesLegacyReadTypeR61CRUD(s, r, idxSchema, "") || !s.docMatchesRequestRouting(indexName, docID, effRouting)) {
 		found = false
 		hit = nil
 	}
 	if found && hit != nil {
 		hitSlice := []HitRow{*hit}
-		s.evalRuntimeMappingsOnHitRows(idxSchema, resolvedReq.RuntimeMappings, hitSlice)
+		if rtErr := s.EvalRuntimeMappingsOnHitRowsTopologicalRound61(r, idxSchema, resolvedReq.RuntimeMappings, hitSlice); rtErr != nil {
+			writeESError(w, http.StatusBadRequest, "search_phase_execution_exception", rtErr.Error())
+			return
+		}
 		*hit = hitSlice[0]
 	}
 	if !found || hit == nil || (aliasFilter != nil && !s.docMatchesAliasFilterWithSchema(r.Context(), indexName, idxSchema, docID, hit.EffectiveSource(), aliasFilter)) {
@@ -11973,46 +12857,109 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 	}
 
 	effSrc := hit.EffectiveSource()
+	var customExplainNode map[string]any
 	matched := s.docMatchesAliasFilterWithSchema(r.Context(), indexName, idxSchema, docID, effSrc, effQuery)
 	cq := tr.CompileQuery(effQuery, true, nil)
 	scoreVal := 0.0
 	desc := "no match on required clause (" + cq.WhereSQL + ")"
-	if matched {
-		scoreVal = 1.0
-		if shreddedBytes, err := schema.ShredDocument(idxSchema, docID, hit.Version, false, effSrc); err == nil {
-			var row map[string]any
-			dec := json.NewDecoder(bytes.NewReader(shreddedBytes))
-			dec.UseNumber()
-			if err := dec.Decode(&row); err == nil && row != nil {
-				var docMap map[string]any
-				docDec := json.NewDecoder(bytes.NewReader(effSrc))
-				docDec.UseNumber()
-				if err := docDec.Decode(&docMap); err == nil {
-					row["_doc"] = docMap
-				}
-				if cq.ScoreSQL != "" {
-					scoreVal = evalNumericExpr(row, cq.ScoreSQL)
-				}
+
+	origQuery := resolvedReq.Query
+	var activeScriptScoreQuery *esast.Query
+	if effQuery != nil && effQuery.ScriptScore != nil {
+		activeScriptScoreQuery = effQuery
+	} else if origQuery != nil && origQuery.ScriptScore != nil {
+		activeScriptScoreQuery = origQuery
+	}
+	if activeScriptScoreQuery != nil {
+		var docMap map[string]any
+		dec := json.NewDecoder(bytes.NewReader(effSrc))
+		dec.UseNumber()
+		_ = dec.Decode(&docMap)
+		if docMap == nil {
+			docMap = make(map[string]any)
+		}
+		docMap["__meta_id"] = docID
+		docMap["__meta_index"] = indexName
+		if hit.Version > 0 {
+			docMap["__meta_version"] = hit.Version
+		} else {
+			docMap["__meta_version"] = int64(1)
+		}
+		baseScore := 1.0
+		var subExplain map[string]any
+		if activeScriptScoreQuery.ScriptScore.Query != nil {
+			subQ := activeScriptScoreQuery.ScriptScore.Query
+			baseScore = scoreNonScriptClauseOnDoc(idxSchema, docMap, subQ)
+			subDesc := "queryWeight"
+			if f, tStr, okT := extractSingleTermOrMatchForExplainR61Search(subQ); okT {
+				subDesc = formatTermWeightExplainDescriptionR61Search(f, tStr, 0)
+			}
+			subExplain = map[string]any{
+				"value":       baseScore,
+				"description": subDesc,
+				"details":     []any{},
 			}
 		}
-		origQuery := resolvedReq.Query
-		hasScoringWrapper := (effQuery != nil && (effQuery.FunctionScore != nil || effQuery.ScriptScore != nil)) ||
-			(origQuery != nil && (origQuery.FunctionScore != nil || origQuery.ScriptScore != nil))
-		if queryHasRuntimeScript(effQuery) || queryHasNestedScoring(effQuery) || hasScoringWrapper {
-			var docMap map[string]any
-			dec := json.NewDecoder(bytes.NewReader(effSrc))
-			dec.UseNumber()
-			_ = dec.Decode(&docMap)
-			if docMap == nil {
-				docMap = make(map[string]any)
+		expTree, st, errPayload := buildScriptScoreExplainTreeR61Search(idxSchema, docMap, activeScriptScoreQuery, baseScore, subExplain, s.isES8Mode(r))
+		if st != 0 && errPayload != nil {
+			writeJSONWithRequest(w, r, st, errPayload)
+			return
+		}
+		if matched && expTree != nil {
+			if fv, okF := toFloat64(expTree["value"]); okF {
+				scoreVal = fv
 			}
-			docMap["__meta_id"] = docID
-			baseScore := scoreVal
-			if (effQuery != nil && ((effQuery.ScriptScore != nil && effQuery.ScriptScore.Query == nil) || (effQuery.FunctionScore != nil && effQuery.FunctionScore.Query == nil))) ||
-				(origQuery != nil && ((origQuery.ScriptScore != nil && origQuery.ScriptScore.Query == nil) || (origQuery.FunctionScore != nil && origQuery.FunctionScore.Query == nil))) {
-				baseScore = 1.0
+			customExplainNode = expTree
+		}
+	}
+
+	if matched {
+		if customExplainNode == nil {
+			scoreVal = 1.0
+			if shreddedBytes, err := schema.ShredDocument(idxSchema, docID, hit.Version, false, effSrc); err == nil {
+				var row map[string]any
+				dec := json.NewDecoder(bytes.NewReader(shreddedBytes))
+				dec.UseNumber()
+				if err := dec.Decode(&row); err == nil && row != nil {
+					var docMap map[string]any
+					docDec := json.NewDecoder(bytes.NewReader(effSrc))
+					docDec.UseNumber()
+					if err := docDec.Decode(&docMap); err == nil {
+						row["_doc"] = docMap
+					}
+					if cq.ScoreSQL != "" {
+						scoreVal = evalNumericExpr(row, cq.ScoreSQL)
+					}
+				}
 			}
-			scoreVal = evalQueryScriptScoreOnDocWithSchema(idxSchema, docMap, effQuery, baseScore)
+			hasScoringWrapper := (effQuery != nil && (effQuery.FunctionScore != nil || effQuery.ScriptScore != nil)) ||
+				(origQuery != nil && (origQuery.FunctionScore != nil || origQuery.ScriptScore != nil))
+			if queryHasRuntimeScript(effQuery) || queryHasNestedScoring(effQuery) || hasScoringWrapper {
+				var docMap map[string]any
+				dec := json.NewDecoder(bytes.NewReader(effSrc))
+				dec.UseNumber()
+				_ = dec.Decode(&docMap)
+				if docMap == nil {
+					docMap = make(map[string]any)
+				}
+				docMap["__meta_id"] = docID
+				baseScore := scoreVal
+				if (effQuery != nil && ((effQuery.ScriptScore != nil && effQuery.ScriptScore.Query == nil) || (effQuery.FunctionScore != nil && effQuery.FunctionScore.Query == nil))) ||
+					(origQuery != nil && ((origQuery.ScriptScore != nil && origQuery.ScriptScore.Query == nil) || (origQuery.FunctionScore != nil && origQuery.FunctionScore.Query == nil))) {
+					baseScore = 1.0
+				}
+				scVal, scMatched, st, errPayload := evalAndValidateSearchScriptScoreR61Search(idxSchema, docMap, effQuery, baseScore, s.isES8Mode(r))
+				if st != 0 && errPayload != nil {
+					writeJSONWithRequest(w, r, st, errPayload)
+					return
+				}
+				if !scMatched {
+					matched = false
+					scoreVal = 0.0
+				} else {
+					scoreVal = scVal
+				}
+			}
 		}
 		var effScriptScoreMin, effFuncScoreMin *float64
 		if effQuery != nil && effQuery.ScriptScore != nil && effQuery.ScriptScore.MinScore != nil {
@@ -12025,28 +12972,39 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 		} else if origQuery != nil && origQuery.FunctionScore != nil && origQuery.FunctionScore.MinScore != nil {
 			effFuncScoreMin = origQuery.FunctionScore.MinScore
 		}
-		if resolvedReq.PostFilter != nil && !s.docMatchesAliasFilterWithSchema(r.Context(), indexName, idxSchema, docID, effSrc, resolvedReq.PostFilter) {
+		if !matched {
+			desc = "no match on required clause (" + cq.WhereSQL + ")"
+			customExplainNode = nil
+		} else if resolvedReq.PostFilter != nil && !s.docMatchesAliasFilterWithSchema(r.Context(), indexName, idxSchema, docID, effSrc, resolvedReq.PostFilter) {
 			matched = false
 			scoreVal = 0.0
 			desc = "no match on post_filter"
+			customExplainNode = nil
 		} else if resolvedReq.MinScore != nil && scoreVal < *resolvedReq.MinScore {
 			matched = false
 			scoreVal = 0.0
 			desc = fmt.Sprintf("score (< %.4f) is less than min_score", *resolvedReq.MinScore)
+			customExplainNode = nil
 		} else if effScriptScoreMin != nil && scoreVal < *effScriptScoreMin {
 			matched = false
 			scoreVal = 0.0
 			desc = fmt.Sprintf("score (< %.4f) is less than min_score", *effScriptScoreMin)
+			customExplainNode = nil
 		} else if effFuncScoreMin != nil && scoreVal < *effFuncScoreMin {
 			matched = false
 			scoreVal = 0.0
 			desc = fmt.Sprintf("score (< %.4f) is less than min_score", *effFuncScoreMin)
+			customExplainNode = nil
+		} else if f, tStr, okT := extractSingleTermOrMatchForExplainR61Search(origQuery); okT {
+			desc = formatTermWeightExplainDescriptionR61Search(f, tStr, 0)
+		} else if f, tStr, okT := extractSingleTermOrMatchForExplainR61Search(effQuery); okT {
+			desc = formatTermWeightExplainDescriptionR61Search(f, tStr, 0)
 		} else {
 			desc = "weight(" + cq.WhereSQL + ") [DorisInvertedIndex], result of: " + cq.ScoreSQL
 		}
 	}
 	explainDetails := []any{}
-	if matched {
+	if matched && customExplainNode == nil {
 		if boostVal, hasBoost := extractExplainTopBoostRound60(effQuery); hasBoost {
 			explainDetails = append(explainDetails, map[string]any{
 				"value":       boostVal,
@@ -12061,15 +13019,19 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
+	explanationPayload := map[string]any{
+		"value":       scoreVal,
+		"description": desc,
+		"details":     explainDetails,
+	}
+	if customExplainNode != nil {
+		explanationPayload = customExplainNode
+	}
 	outResp := map[string]any{
-		"_index":  indexName,
-		"_id":     docID,
-		"matched": matched,
-		"explanation": map[string]any{
-			"value":       scoreVal,
-			"description": desc,
-			"details":     explainDetails,
-		},
+		"_index":      indexName,
+		"_id":         docID,
+		"matched":     matched,
+		"explanation": explanationPayload,
 	}
 	s.applyDocTypeFieldRound60(outResp, r, "")
 	if r.URL.Query().Has("_source") || r.URL.Query().Has("_source_includes") || r.URL.Query().Has("_source_excludes") || r.URL.Query().Has("stored_fields") {

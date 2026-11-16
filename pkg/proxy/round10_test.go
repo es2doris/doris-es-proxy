@@ -699,9 +699,9 @@ func TestRound10MultiIndexGlobalAndWeightedMetrics(t *testing.T) {
 		t.Fatalf("expected weighted string_stats avg_length=5.0, got %+v", strStats)
 	}
 	pctValues := resp2["aggregations"].(map[string]any)["pcts"].(map[string]any)["values"].(map[string]any)
-	// 1 doc @ 10.0, 3 docs @ 100.0 -> weighted 50th percentile is closer to 100 than 55 ( specifically 10*0.25 + 100*0.75 = 77.5)
-	if math.Abs(pctValues["50.0"].(float64)-77.5) > 1e-6 {
-		t.Fatalf("expected weighted p50=77.5, got %+v", pctValues)
+	// 1 doc @ 10.0, 3 docs @ 100.0 -> exact 50th percentile over [10, 100, 100, 100] is 100.0
+	if math.Abs(pctValues["50.0"].(float64)-100.0) > 1e-6 {
+		t.Fatalf("expected exact p50=100.0, got %+v", pctValues)
 	}
 }
 

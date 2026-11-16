@@ -482,7 +482,23 @@ func SerializeFieldProperty(fp esast.FieldProperty) map[string]any {
 		out["value"] = fp.Value
 	}
 	if fp.Script != nil {
-		out["script"] = fp.Script
+		if sm, ok := fp.Script.(map[string]any); ok {
+			if _, hasLang := sm["lang"]; !hasLang {
+				cp := make(map[string]any, len(sm)+1)
+				for k, v := range sm {
+					cp[k] = v
+				}
+				cp["lang"] = "painless"
+				out["script"] = cp
+			} else {
+				out["script"] = fp.Script
+			}
+		} else {
+			out["script"] = fp.Script
+		}
+	}
+	if fp.TermVector != "" {
+		out["term_vector"] = fp.TermVector
 	}
 	if fp.Analyzer != "" {
 		out["analyzer"] = fp.Analyzer
@@ -499,16 +515,47 @@ func SerializeFieldProperty(fp esast.FieldProperty) map[string]any {
 	if fp.TimeZone != "" {
 		out["time_zone"] = fp.TimeZone
 	}
-	if fp.Dims > 0 {
-		out["dims"] = fp.Dims
-	} else if fp.Dimension > 0 {
-		out["dims"] = fp.Dimension
-	}
-	if fp.Similarity != "" {
-		out["similarity"] = fp.Similarity
-	}
-	if fp.ElementType != "" {
-		out["element_type"] = fp.ElementType
+	if strings.EqualFold(fp.Type, "dense_vector") || strings.EqualFold(fp.Type, "knn_vector") {
+		isNotIdx := fp.Index != nil && !*fp.Index
+		effElem := strings.ToLower(strings.TrimSpace(fp.ElementType))
+		if effElem == "" {
+			effElem = "float"
+		}
+		if fp.EffectiveDims() > 0 {
+			out["dims"] = fp.EffectiveDims()
+		}
+		if fp.ElementType != "" {
+			out["element_type"] = fp.ElementType
+		}
+		if isNotIdx {
+			out["index"] = false
+		} else {
+			out["index"] = true
+			sim := fp.Similarity
+			if sim == "" {
+				if effElem == "bit" {
+					sim = "l2_norm"
+				} else {
+					sim = "cosine"
+				}
+			}
+			out["similarity"] = sim
+			if matOpts := MaterializeDenseVectorIndexOptions(effElem, fp.IndexOptions); len(matOpts) > 0 {
+				out["index_options"] = matOpts
+			}
+		}
+	} else {
+		if fp.Dims > 0 {
+			out["dims"] = fp.Dims
+		} else if fp.Dimension > 0 {
+			out["dims"] = fp.Dimension
+		}
+		if fp.Similarity != "" {
+			out["similarity"] = fp.Similarity
+		}
+		if fp.ElementType != "" {
+			out["element_type"] = fp.ElementType
+		}
 	}
 	if fp.CopyTo != nil {
 		out["copy_to"] = fp.CopyTo
@@ -540,8 +587,23 @@ func SerializeFieldProperty(fp esast.FieldProperty) map[string]any {
 	if fp.IndexPhrases != nil {
 		out["index_phrases"] = *fp.IndexPhrases
 	}
-	if fp.IndexOptions != nil {
+	if fp.IndexOptions != nil && !strings.EqualFold(fp.Type, "dense_vector") && !strings.EqualFold(fp.Type, "knn_vector") {
 		out["index_options"] = fp.IndexOptions
+	}
+	if fp.StoreArraySource != nil {
+		out["store_array_source"] = *fp.StoreArraySource
+	}
+	if fp.SyntheticSourceKeep != "" {
+		out["synthetic_source_keep"] = fp.SyntheticSourceKeep
+	}
+	if fp.TimeSeriesDimension != nil {
+		out["time_series_dimension"] = *fp.TimeSeriesDimension
+	}
+	if len(fp.TimeSeriesDimensions) > 0 {
+		out["time_series_dimensions"] = append([]string(nil), fp.TimeSeriesDimensions...)
+	}
+	if fp.TimeSeriesMetric != "" {
+		out["time_series_metric"] = fp.TimeSeriesMetric
 	}
 	if fp.Norms != nil {
 		out["norms"] = *fp.Norms
@@ -738,7 +800,7 @@ func reconstructSyntheticObject(idxSchema *IndexSchema, obj map[string]any, pref
 	if len(obj) == 0 {
 		return map[string]any{}
 	}
-	// Expand dotted keys in document first if any (e.g. `{"a.b": 1}` -> `{"a": {"b": 1}}`)
+	obj = expandDottedKeysForSyntheticObject(idxSchema, obj, prefix)
 	out := make(map[string]any, len(obj))
 	keys := make([]string, 0, len(obj))
 	for k := range obj {
@@ -749,6 +811,12 @@ func reconstructSyntheticObject(idxSchema *IndexSchema, obj map[string]any, pref
 	for _, k := range keys {
 		rawVal := obj[k]
 		if rawVal == nil {
+			continue
+		}
+		if prefix == "" && k == "_doc_count" {
+			if f, ok := syntheticToFloat64(rawVal); ok && f > 0 && f == math.Trunc(f) {
+				out[k] = int64(f)
+			}
 			continue
 		}
 		fullPath := k
@@ -800,13 +868,15 @@ func reconstructSyntheticValue(
 		if ignoredSet[fullPath] {
 			return nil, false
 		}
+		if esType == "geo_point" && strings.EqualFold(strings.TrimSpace(b.TimeSeriesMetric), "position") {
+			if posObj, ok := reconstructSyntheticPositionGeoPoint(rawVal); ok {
+				return posObj, true
+			}
+		}
 		return rawVal, true
 	}
 	if hasBinding && IsRangeFieldType(esType) {
-		if ignoredSet[fullPath] {
-			return nil, false
-		}
-		return rawVal, true
+		return reconstructSyntheticRangeValue(idxSchema, rawVal, fullPath, b, esType, ignoredSet)
 	}
 
 	switch v := rawVal.(type) {
@@ -873,7 +943,9 @@ func reconstructSyntheticValue(
 		}
 
 		// Scalar array (flatten nested scalar arrays like `[[2, 1], [3]]` -> `[1, 2, 3]`)
+		preserveArrayOrder := hasBinding && ((b.StoreArraySource != nil && *b.StoreArraySource) || strings.EqualFold(b.SyntheticSourceKeep, "arrays"))
 		var scalars []any
+		var ignoredAboveScalars []any
 		var flattenScalars func(items []any)
 		flattenScalars = func(items []any) {
 			for _, item := range items {
@@ -884,6 +956,17 @@ func reconstructSyntheticValue(
 					flattenScalars(subSlice)
 					continue
 				}
+				if hasBinding && b.IgnoreAbove > 0 {
+					s := fmt.Sprintf("%v", item)
+					if len([]rune(s)) > b.IgnoreAbove {
+						if preserveArrayOrder {
+							scalars = append(scalars, s)
+						} else {
+							ignoredAboveScalars = append(ignoredAboveScalars, s)
+						}
+						continue
+					}
+				}
 				normItem, ok := normalizeSyntheticScalar(idxSchema, item, fullPath, b, hasBinding, esType, ignoredSet)
 				if ok {
 					scalars = append(scalars, normItem)
@@ -891,16 +974,30 @@ func reconstructSyntheticValue(
 			}
 		}
 		flattenScalars(v)
+		if !preserveArrayOrder && len(scalars) > 1 {
+			sortSyntheticScalars(scalars, esType)
+		}
+		if len(ignoredAboveScalars) > 0 {
+			scalars = append(scalars, ignoredAboveScalars...)
+		}
 		if len(scalars) == 0 {
 			return nil, false
 		}
-		sortSyntheticScalars(scalars, esType)
+		if preserveArrayOrder {
+			return scalars, true
+		}
 		if len(scalars) == 1 {
 			return scalars[0], true
 		}
 		return scalars, true
 
 	default:
+		if hasBinding && b.IgnoreAbove > 0 {
+			s := fmt.Sprintf("%v", v)
+			if len([]rune(s)) > b.IgnoreAbove {
+				return s, true
+			}
+		}
 		normVal, ok := normalizeSyntheticScalar(idxSchema, v, fullPath, b, hasBinding, esType, ignoredSet)
 		if !ok {
 			return nil, false

@@ -313,10 +313,27 @@ func toIEEEFloat64OperandRound58(v any) (float64, bool) {
 	return toFloat64(v)
 }
 
-func promoteFloatingResultRound58(a, b any, res float64) any {
-	_, aF32 := a.(float32)
-	_, bF32 := b.(float32)
+func toFloat32BinaryPromotionRound61(a, b any) (float32, float32, bool) {
+	a32, aF32 := a.(float32)
+	b32, bF32 := b.(float32)
 	if aF32 && bF32 {
+		return a32, b32, true
+	}
+	if aF32 {
+		if bi, bIsInt := isIntegerValuePainless(b); bIsInt {
+			return a32, float32(bi), true
+		}
+	}
+	if bF32 {
+		if ai, aIsInt := isIntegerValuePainless(a); aIsInt {
+			return float32(ai), b32, true
+		}
+	}
+	return 0, 0, false
+}
+
+func promoteFloatingResultRound58(a, b any, res float64) any {
+	if _, _, ok := toFloat32BinaryPromotionRound61(a, b); ok {
 		return float32(res)
 	}
 	return res
@@ -339,6 +356,28 @@ func applyMulDivRound58(a, b any, op byte) any {
 				panic(&painlessExceptionError{exType: "ArithmeticException", message: "/ by zero"})
 			}
 			return ai % bi
+		}
+	}
+	if a32, b32, ok32 := toFloat32BinaryPromotionRound61(a, b); ok32 {
+		switch op {
+		case '*':
+			return a32 * b32
+		case '/':
+			if b32 == 0 {
+				af, bf := float64(a32), float64(b32)
+				if af == 0 || math.IsNaN(af) {
+					return float32(math.NaN())
+				}
+				sign := math.Copysign(1, af) * math.Copysign(1, bf)
+				return float32(math.Copysign(math.Inf(1), sign))
+			}
+			return a32 / b32
+		case '%':
+			af, bf := float64(a32), float64(b32)
+			if bf == 0 || math.IsInf(af, 0) || math.IsNaN(af) || math.IsNaN(bf) {
+				return float32(math.NaN())
+			}
+			return float32(math.Mod(af, bf))
 		}
 	}
 	af, aOk := toIEEEFloat64OperandRound58(a)
@@ -379,6 +418,12 @@ func applyNumericAddSubRound58(a, b any, isAdd bool) (any, bool) {
 			return ai + bi, true
 		}
 		return ai - bi, true
+	}
+	if a32, b32, ok32 := toFloat32BinaryPromotionRound61(a, b); ok32 {
+		if isAdd {
+			return a32 + b32, true
+		}
+		return a32 - b32, true
 	}
 	af, aOk := toIEEEFloat64OperandRound58(a)
 	bf, bOk := toIEEEFloat64OperandRound58(b)
@@ -1033,7 +1078,7 @@ func evalInstanceReceiverOnceRound58(recExpr, mName, mBare, argExpr string, isNu
 		if strings.HasPrefix(cleanRec, "doc[") {
 			expDocRec = strings.TrimSpace(expandDynamicBrackets(cleanRec, sourceMap, params, depth+1))
 		}
-		if (mBare == "forEach" || mBare == "containsAll" || mBare == "contains" || mBare == "indexOf" || mBare == "lastIndexOf" || mBare == "get" || mBare == "subList" || mBare == "join" || mBare == "length" || mBare == "size" || mBare == "isEmpty" || mBare == "arcDistance" || mBare == "planeDistance" || mBare == "geohashDistance") &&
+		if (mBare == "forEach" || mBare == "containsAll" || mBare == "contains" || mBare == "indexOf" || mBare == "lastIndexOf" || mBare == "get" || mBare == "subList" || mBare == "join" || mBare == "length" || mBare == "size" || mBare == "isEmpty" || mBare == "arcDistance" || mBare == "planeDistance" || mBare == "geohashDistance" || mBare == "getCentroid" || mBare == "getBoundingBox" || mBare == "getLabelPosition" || mBare == "getDimensionalType" || mBare == "getMercatorWidth" || mBare == "getMercatorHeight") &&
 			(strings.HasPrefix(expDocRec, "doc.") || strings.HasPrefix(expDocRec, "doc?.")) &&
 			!strings.HasSuffix(expDocRec, ".value") && !strings.Contains(expDocRec, ".value.") && !strings.Contains(expDocRec, ".values.") && !strings.Contains(expDocRec, "(") {
 			docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(expDocRec, "doc?."), "doc."), ".values")
@@ -1041,7 +1086,7 @@ func evalInstanceReceiverOnceRound58(recExpr, mName, mBare, argExpr string, isNu
 			if dvErr != nil {
 				return nil, nil, true, dvErr
 			}
-			if mBare == "arcDistance" || mBare == "planeDistance" || mBare == "geohashDistance" {
+			if mBare == "arcDistance" || mBare == "planeDistance" || mBare == "geohashDistance" || mBare == "getCentroid" || mBare == "getBoundingBox" || mBare == "getLabelPosition" || mBare == "getDimensionalType" || mBare == "getMercatorWidth" || mBare == "getMercatorHeight" {
 				if r60Res, r60Handled, r60Err := evalRound60ReceiverMethod(dv, mBare, argExpr, sourceMap, params, depth+1); r60Handled {
 					return r60Res, nil, true, r60Err
 				}
@@ -1138,6 +1183,12 @@ func stripRegexCommentsModeRound58(pat string) string {
 }
 
 func compileJavaPatternWithFlagsRound58(rawBody string, flags int, literalRepr string) (*painlessPattern, error) {
+	if len(rawBody) > MaxRegexPatternLen {
+		return nil, &painlessExceptionError{
+			exType:  "IllegalArgumentException",
+			message: fmt.Sprintf("regex pattern length [%d] exceeds maximum allowed length [%d]", len(rawBody), MaxRegexPatternLen),
+		}
+	}
 	patStr := rawBody
 	if flags&16 != 0 { // Pattern.LITERAL
 		patStr = regexp.QuoteMeta(patStr)
@@ -1162,6 +1213,9 @@ func compileJavaPatternWithFlagsRound58(rawBody string, flags int, literalRepr s
 	}
 	re, err := compilePainlessRegexp(patStr)
 	if err != nil {
+		if pe, ok := err.(*painlessExceptionError); ok {
+			return nil, pe
+		}
 		return nil, &painlessExceptionError{
 			exType:  "PatternSyntaxException",
 			message: err.Error(),
@@ -1239,8 +1293,11 @@ func evalRegexMatchPainlessErr(lhsVal, rhsVal any, isRegexLit, fullMatch bool) (
 	lhsStr := fmt.Sprintf("%v", lhsVal)
 	if pp, ok := rhsVal.(*painlessPattern); ok && pp != nil && pp.re != nil {
 		if fullMatch {
-			re, err := compilePainlessRegexp("^(?:" + pp.re.String() + ")$")
+			re, err := compileBoundedWrappedRegexRound61("^(?:", pp.re.String(), ")$")
 			if err != nil {
+				if pe, ok := err.(*painlessExceptionError); ok {
+					return false, pe
+				}
 				return false, &painlessExceptionError{exType: "PatternSyntaxException", message: err.Error()}
 			}
 			return re.MatchString(lhsStr), nil
@@ -1256,12 +1313,24 @@ func evalRegexMatchPainlessErr(lhsVal, rhsVal any, isRegexLit, fullMatch bool) (
 			return evalRegexMatchPainlessErr(lhsStr, pp, false, fullMatch)
 		}
 	}
-	pat = normalizeJavaNamedGroupsPainless(pat)
-	if fullMatch {
-		pat = "^(?:" + pat + ")$"
+	if len(pat) > MaxRegexPatternLen {
+		return false, &painlessExceptionError{
+			exType:  "IllegalArgumentException",
+			message: fmt.Sprintf("regex pattern length [%d] exceeds maximum allowed length [%d]", len(pat), MaxRegexPatternLen),
+		}
 	}
-	re, err := compilePainlessRegexp(pat)
+	pat = normalizeJavaNamedGroupsPainless(pat)
+	var re *regexp.Regexp
+	var err error
+	if fullMatch {
+		re, err = compileBoundedWrappedRegexRound61("^(?:", pat, ")$")
+	} else {
+		re, err = compilePainlessRegexp(pat)
+	}
 	if err != nil {
+		if pe, ok := err.(*painlessExceptionError); ok {
+			return false, pe
+		}
 		return false, &painlessExceptionError{
 			exType:  "PatternSyntaxException",
 			message: err.Error(),
@@ -2122,10 +2191,16 @@ func evalCollectionsNCopiesRound58(args []string, sourceMap, params map[string]a
 		n = MaxPainlessSliceItems
 	}
 	budget := getOrInitEvalBudget(params)
+	if err := recordAllocatedElementsRound61(budget, n); err != nil {
+		return nil, err
+	}
 	out := allocUnmodSlicePainless(n)
 	for i := 0; i < n; i++ {
 		out = append(out, val)
 	}
 	markUnmodSlicePainless(budget, out)
+	if budget != nil && budget.stickyErr != nil {
+		return nil, budget.stickyErr
+	}
 	return out, nil
 }

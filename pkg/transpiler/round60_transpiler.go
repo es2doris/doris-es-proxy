@@ -168,14 +168,14 @@ func (t *Transpiler) validateCollapseRequest(req *esast.SearchRequest) error {
 		return nil
 	}
 	if len(req.Rescore) > 0 {
-		return fmt.Errorf("illegal_argument_exception: cannot use [collapse] in conjunction with [rescore]")
+		return fmt.Errorf("illegal_argument_exception: cannot use `collapse` in conjunction with `rescore`")
 	}
 	if req.Slice != nil {
 		return fmt.Errorf("illegal_argument_exception: cannot use [collapse] in conjunction with [slice]")
 	}
 	if len(req.SearchAfter) > 0 {
 		if len(req.Sort) == 0 || !t.collapseFieldMatchesSortField(req.Collapse.Field, req.Sort[0].Entry.Field) {
-			return fmt.Errorf("illegal_argument_exception: cannot use [collapse] in conjunction with [search_after] unless the sort is on the collapse field")
+			return fmt.Errorf("illegal_argument_exception: cannot use `collapse` in conjunction with `search_after` unless the sort is on the collapse field")
 		}
 	}
 	for _, ih := range req.Collapse.InnerHits {
@@ -223,6 +223,10 @@ func isNumericMetricAggKind(aggKind string) bool {
 }
 
 func validateTermsIncludeExcludeForBinding(field string, b schema.FieldBinding, termsSpec *esast.TermsAggSpec) error {
+	return validateTermsIncludeExcludeForBindingNamed("terms", field, b, termsSpec)
+}
+
+func validateTermsIncludeExcludeForBindingNamed(aggName, field string, b schema.FieldBinding, termsSpec *esast.TermsAggSpec) error {
 	if termsSpec == nil || termsSpec.Script != nil || field == "" {
 		return nil
 	}
@@ -240,11 +244,11 @@ func validateTermsIncludeExcludeForBinding(field string, b schema.FieldBinding, 
 	if !isNonRegexTermsType {
 		return nil
 	}
-	if incStr, isStr := termsSpec.Include.(string); isStr {
-		return fmt.Errorf("illegal_argument_exception: include/exclude pattern [%s] is not supported for aggregation [terms] on field [%s] of type [%s]", incStr, field, b.ESType)
+	if _, isStr := termsSpec.Include.(string); isStr {
+		return fmt.Errorf("illegal_argument_exception: Aggregation [%s] cannot support regular expression style include/exclude settings as they can only be applied to string fields. Use an array of values for include/exclude clauses", aggName)
 	}
-	if excStr, isStr := termsSpec.Exclude.(string); isStr {
-		return fmt.Errorf("illegal_argument_exception: include/exclude pattern [%s] is not supported for aggregation [terms] on field [%s] of type [%s]", excStr, field, b.ESType)
+	if _, isStr := termsSpec.Exclude.(string); isStr {
+		return fmt.Errorf("illegal_argument_exception: Aggregation [%s] cannot support regular expression style include/exclude settings as they can only be applied to string fields. Use an array of values for include/exclude clauses", aggName)
 	}
 	return nil
 }
@@ -397,9 +401,10 @@ func TypedAggKeyPrefix(agg *esast.AggSpec, idxSchema *schema.IndexSchema) string
 		return "geo_line"
 	case agg.MinBucket != nil, agg.MaxBucket != nil:
 		return "bucket_metric_value"
+	case agg.Derivative != nil:
+		return "derivative"
 	case agg.AvgBucket != nil,
 		agg.SumBucket != nil,
-		agg.Derivative != nil,
 		agg.CumulativeSum != nil,
 		agg.MovingAvg != nil,
 		agg.MovingFn != nil,
@@ -913,7 +918,7 @@ type hdrDoubleHistogram struct {
 
 func newHDRDoubleHistogram(sigDigits int, values []float64) (*hdrDoubleHistogram, error) {
 	if sigDigits < 0 || sigDigits > 5 {
-		return nil, fmt.Errorf("illegal_argument_exception: numberOfSignificantValueDigits must be between 0 and 5")
+		return nil, fmt.Errorf("illegal_argument_exception: [numberOfSignificantValueDigits] must be between 0 and 5")
 	}
 	largestSingleUnit := 2.0 * math.Pow10(sigDigits)
 	subBucketCountMag := int(math.Ceil(math.Log2(largestSingleUnit)))
@@ -1084,9 +1089,25 @@ func (h *hdrDoubleHistogram) percentileAtOrBelow(target float64) float64 {
 }
 
 // ComputeESPercentiles computes exact Elasticsearch `percentiles` values in either `TDigest` (`AVLTreeDigest`
-// centroid midpoint interpolation) or `HDR` (`DoubleHistogram(numberOfSignificantValueDigits)`) mode.
+// centroid midpoint interpolation, ES 7.x default) or `HDR` (`DoubleHistogram(numberOfSignificantValueDigits)`) mode.
 // When `values` is empty, every requested percentile maps to `nil` (`null`).
 func ComputeESPercentiles(values []float64, percents []float64, hdr *esast.HDRConfig) (map[string]any, error) {
+	return ComputeESPercentilesMode(values, percents, hdr, false)
+}
+
+// ComputeESPercentilesMode computes exact Elasticsearch `percentiles` values with version-aware TDigest quantile
+// interpolation (`es8Mode == false` uses ES 7.x `q*n - 0.5`; `es8Mode == true` uses ES 8.9+ forked t-digest `q*(n-1)`).
+func ComputeESPercentilesMode(values []float64, percents []float64, hdr *esast.HDRConfig, es8Mode bool) (map[string]any, error) {
+	sigDigits := 3
+	if hdr != nil && hdr.NumberOfSignificantValueDigits != nil {
+		sigDigits = *hdr.NumberOfSignificantValueDigits
+	}
+	return ComputeESPercentilesWithVersion(values, percents, 100.0, hdr != nil, sigDigits, es8Mode)
+}
+
+// ComputeESPercentilesWithVersion computes exact Elasticsearch `percentiles` values in either TDigest or HDR mode,
+// selecting ES 7.x (`q*n - 0.5`) vs ES 8.9+ (`q*(n-1)`) TDigest interpolation via `es8Mode`.
+func ComputeESPercentilesWithVersion(values []float64, percents []float64, _ float64, useHDR bool, hdrSigDigits int, es8Mode bool) (map[string]any, error) {
 	if len(percents) == 0 {
 		percents = []float64{1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0}
 	}
@@ -1098,11 +1119,8 @@ func ComputeESPercentiles(values []float64, percents []float64, hdr *esast.HDRCo
 	}
 	out := make(map[string]any, len(percents))
 	if len(cleanVals) == 0 {
-		if hdr != nil && hdr.NumberOfSignificantValueDigits != nil {
-			sig := *hdr.NumberOfSignificantValueDigits
-			if sig < 0 || sig > 5 {
-				return nil, fmt.Errorf("illegal_argument_exception: numberOfSignificantValueDigits must be between 0 and 5")
-			}
+		if useHDR && (hdrSigDigits < 0 || hdrSigDigits > 5) {
+			return nil, fmt.Errorf("illegal_argument_exception: [numberOfSignificantValueDigits] must be between 0 and 5")
 		}
 		for _, p := range percents {
 			out[formatESPercentKey(p)] = nil
@@ -1110,12 +1128,8 @@ func ComputeESPercentiles(values []float64, percents []float64, hdr *esast.HDRCo
 		return out, nil
 	}
 
-	if hdr != nil {
-		sigDigits := 3
-		if hdr.NumberOfSignificantValueDigits != nil {
-			sigDigits = *hdr.NumberOfSignificantValueDigits
-		}
-		hist, err := newHDRDoubleHistogram(sigDigits, cleanVals)
+	if useHDR {
+		hist, err := newHDRDoubleHistogram(hdrSigDigits, cleanVals)
 		if err != nil {
 			return nil, err
 		}
@@ -1139,7 +1153,12 @@ func ComputeESPercentiles(values []float64, percents []float64, hdr *esast.HDRCo
 			out[formatESPercentKey(p)] = sorted[n-1]
 			continue
 		}
-		idx := q*float64(n) - 0.5
+		var idx float64
+		if es8Mode {
+			idx = q * float64(n-1)
+		} else {
+			idx = q*float64(n) - 0.5
+		}
 		if idx <= 0 {
 			out[formatESPercentKey(p)] = sorted[0]
 		} else if idx >= float64(n-1) {
@@ -1168,7 +1187,7 @@ func ComputeESPercentileRanks(values []float64, targets []float64, hdr *esast.HD
 		if hdr != nil && hdr.NumberOfSignificantValueDigits != nil {
 			sig := *hdr.NumberOfSignificantValueDigits
 			if sig < 0 || sig > 5 {
-				return nil, fmt.Errorf("illegal_argument_exception: numberOfSignificantValueDigits must be between 0 and 5")
+				return nil, fmt.Errorf("illegal_argument_exception: [numberOfSignificantValueDigits] must be between 0 and 5")
 			}
 		}
 		if keyed {
@@ -1977,7 +1996,7 @@ func EvaluateIntervalsRule(
 				}
 				all = append(all, sl...)
 			}
-			spans := minimizeIntervalsSpans(all)
+			spans := dedupIntervalsSpansKeepNonMinimal(all)
 			return applyFilter(spans, r.AnyOf.Filter)
 		}
 		return nil, nil
@@ -1987,5 +2006,6 @@ func EvaluateIntervalsRule(
 	if err != nil {
 		return nil, false, err
 	}
-	return spans, len(spans) > 0, nil
+	minimal := minimizeIntervalsSpans(spans)
+	return minimal, len(minimal) > 0, nil
 }

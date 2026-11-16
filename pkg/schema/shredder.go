@@ -88,6 +88,12 @@ func ShredDocumentWithNow(
 		}
 		return nil, fmt.Errorf("invalid document JSON for _id=%q: %w", id, err)
 	}
+	var origDocForSynthetic map[string]any
+	if (s.SyntheticSource || strings.EqualFold(s.IndexMode, "time_series")) && !s.SourceDisabled() && !strings.EqualFold(s.SourceMode, "stored") {
+		decOrig := json.NewDecoder(bytes.NewReader(trimmed))
+		decOrig.UseNumber()
+		_ = decOrig.Decode(&origDocForSynthetic)
+	}
 	prunedDynamic := false
 	if s.MaxDepth > 0 || s.MaxFieldNameLength > 0 {
 		if err := validateDocumentLimits(parsedDoc, 1, s.MaxDepth, s.MaxFieldNameLength); err != nil {
@@ -493,6 +499,9 @@ func ShredDocumentWithNow(
 				continue
 			}
 			if len(rawLeafs) > 0 || b.ESType == "geo_point" || hasObjAtPath {
+				if b.ESType == "geo_point" && strings.EqualFold(strings.TrimSpace(b.TimeSeriesMetric), "position") && len(rawLeafs) > 1 {
+					return nil, fmt.Errorf("mapper_parsing_exception: failed to parse: field type for [%s] does not accept more than single value", b.ESFieldPath)
+				}
 				var firstVal any
 				var validLeafs []any
 				hadMalformed := hasObjAtPath
@@ -592,10 +601,39 @@ func ShredDocumentWithNow(
 				row[b.ColumnName] = val
 			}
 		case StoragePromotedArray, StorageNestedSubfield:
+			if b.Kind == StorageNestedSubfield && (b.ESType == "dense_vector" || b.ESType == "knn_vector") {
+				var rootParts []string
+				if b.NestedPath != "" {
+					rootParts = strings.Split(b.NestedPath, ".")
+				}
+				rawElems := extractNestedElementMapsWithIDs(parsedDoc, rootParts, "")
+				for _, elem := range rawElems {
+					curB := s.Fields[b.ESFieldPath]
+					vec, present, vecErr := extractAndValidateTypedVectorValues(elem.m, b.RelativeJSONPath, curB)
+					if present {
+						if vecErr != nil {
+							if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+								recordIgnored(b.ESFieldPath)
+								continue
+							}
+							return nil, vecErr
+						}
+						if curB.AutoDims && curB.VectorDims == 0 && len(vec) > 0 {
+							if lockErr := s.LockAutoDims(b.ESFieldPath, len(vec)); lockErr != nil {
+								return nil, lockErr
+							}
+						}
+					}
+				}
+				continue
+			}
 			if isTypedNonStringBinding(b) {
 				var rawLeafs []any
 				if b.ESType == "geo_point" {
 					rawLeafs = extractGeoPointCandidatesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
+					if strings.EqualFold(strings.TrimSpace(b.TimeSeriesMetric), "position") && len(rawLeafs) > 1 {
+						return nil, fmt.Errorf("mapper_parsing_exception: failed to parse: field type for [%s] does not accept more than single value", b.ESFieldPath)
+					}
 				} else {
 					rawLeafs = extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
 				}
@@ -688,20 +726,29 @@ func ShredDocumentWithNow(
 				}
 			}
 		case StoragePromotedVector:
-			vec, present, vecErr := extractAndValidateTypedVectorValues(parsedDoc, b.SourceJSONPath, b)
+			curVecB := b
+			if latestB, okLatest := s.Fields[b.ESFieldPath]; okLatest {
+				curVecB = s.withEffectiveDefaults(latestB)
+			}
+			vec, present, vecErr := extractAndValidateTypedVectorValues(parsedDoc, curVecB.SourceJSONPath, curVecB)
 			if present {
 				if vecErr != nil {
-					if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
-						recordIgnored(b.ESFieldPath)
-						if isPrimaryFieldBinding(b) {
-							deferDeletePath(b.SourceJSONPath)
+					if curVecB.IgnoreMalformed != nil && *curVecB.IgnoreMalformed {
+						recordIgnored(curVecB.ESFieldPath)
+						if isPrimaryFieldBinding(curVecB) {
+							deferDeletePath(curVecB.SourceJSONPath)
 						}
 						continue
 					}
 					return nil, vecErr
 				}
+				if curVecB.AutoDims && curVecB.VectorDims == 0 && len(vec) > 0 {
+					if lockErr := s.LockAutoDims(curVecB.ESFieldPath, len(vec)); lockErr != nil {
+						return nil, lockErr
+					}
+				}
 				if len(vec) > 0 {
-					row[b.ColumnName] = vec
+					row[curVecB.ColumnName] = vec
 				}
 			}
 		}
@@ -1073,8 +1120,12 @@ func ShredDocumentWithNow(
 	collectAllTextWithSchema(parsedDoc, s, nil, &allTextBuilder)
 	row["_all_text"] = allTextBuilder.String()
 	row["_doc"] = buildVariantDocPayload(trimmed, parsedDoc, prunedDynamic, s)
-	if s.SyntheticSource && !s.SourceDisabled() {
-		reconstructed := ReconstructSyntheticSource(s, parsedDoc, row)
+	if (s.SyntheticSource || strings.EqualFold(s.IndexMode, "time_series")) && !s.SourceDisabled() && !strings.EqualFold(s.SourceMode, "stored") {
+		srcInput := origDocForSynthetic
+		if srcInput == nil {
+			srcInput = parsedDoc
+		}
+		reconstructed := ReconstructSyntheticSource(s, srcInput, row)
 		if synthBytes, err := json.Marshal(reconstructed); err == nil {
 			row["_source"] = string(synthBytes)
 		}
@@ -1905,8 +1956,13 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 			return nil
 		}
 	case "float":
-		if fv, ok := coerced.(float64); ok && !math.IsNaN(fv) && !math.IsInf(fv, 0) && math.Abs(fv) > math.MaxFloat32 {
-			return nil
+		if fv, ok := coerced.(float64); ok && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+			if math.IsInf(float64(float32(fv)), 0) {
+				return nil
+			}
+			if math.Abs(fv) > math.MaxFloat32 {
+				coerced = float64(float32(fv))
+			}
 		}
 	case "half_float":
 		if fv, ok := coerced.(float64); ok && !math.IsNaN(fv) && !math.IsInf(fv, 0) && math.Abs(fv) > 65504.0 {
@@ -2482,7 +2538,11 @@ func ESDateFormatToGoLayout(pattern string) string {
 		case "X", "XX", "XXX":
 			b.WriteString("Z07:00")
 		default:
-			b.WriteString(token)
+			if ch == 'S' && len(token) >= 1 && len(token) <= 9 {
+				b.WriteString(strings.Repeat("0", len(token)))
+			} else {
+				b.WriteString(token)
+			}
 		}
 		i = j
 	}
@@ -4020,28 +4080,54 @@ func extractAndValidateTypedVectorValues(node any, path []string, b FieldBinding
 				return nil, true, fmt.Errorf("mapper_parsing_exception: failed to parse bit vector field [%s] of type [%s]", b.ESFieldPath, b.ESType)
 			}
 		case "byte":
-			arr, ok := node.([]any)
-			if !ok || len(arr) == 0 {
-				return nil, true, fmt.Errorf("mapper_parsing_exception: failed to parse byte vector field [%s] of type [%s]", b.ESFieldPath, b.ESType)
-			}
-			if dims > 0 && len(arr) != dims {
-				return nil, true, fmt.Errorf("mapper_parsing_exception: vector field [%s] expected [%d] dimensions, got [%d]", b.ESFieldPath, dims, len(arr))
-			}
-			out = make([]float64, 0, len(arr))
-			for _, elem := range arr {
-				iv, okByte := parseExactVectorSignedByte(elem)
-				if !okByte {
-					return nil, true, fmt.Errorf("mapper_parsing_exception: byte vector field [%s] elements must be integers in [-128, 127]", b.ESFieldPath)
+			if hexStr, isStr := node.(string); isStr {
+				decoded, err := esast.DecodeHexSignedByteVector(hexStr)
+				if err != nil {
+					return nil, true, fmt.Errorf("mapper_parsing_exception: failed to parse byte vector field [%s]: %w", b.ESFieldPath, err)
 				}
-				out = append(out, float64(iv))
+				if dims > 0 && len(decoded) != dims {
+					if len(decoded) > dims {
+						return nil, true, fmt.Errorf("mapper_parsing_exception: Field [%s] of type [dense_vector] has more dimensions than defined in the mapping: [%d] > [%d]", b.ESFieldPath, len(decoded), dims)
+					}
+					return nil, true, fmt.Errorf("mapper_parsing_exception: The [dense_vector] field [%s] has a different number of dimensions [%d] than defined in the mapping [%d]", b.ESFieldPath, len(decoded), dims)
+				}
+				out = decoded
+			} else {
+				arr, ok := node.([]any)
+				if !ok || len(arr) == 0 {
+					return nil, true, fmt.Errorf("mapper_parsing_exception: failed to parse byte vector field [%s] of type [%s]", b.ESFieldPath, b.ESType)
+				}
+				if dims > 0 && len(arr) != dims {
+					if len(arr) > dims {
+						return nil, true, fmt.Errorf("mapper_parsing_exception: Field [%s] of type [dense_vector] has more dimensions than defined in the mapping: [%d] > [%d]", b.ESFieldPath, len(arr), dims)
+					}
+					return nil, true, fmt.Errorf("mapper_parsing_exception: The [dense_vector] field [%s] has a different number of dimensions [%d] than defined in the mapping [%d]", b.ESFieldPath, len(arr), dims)
+				}
+				out = make([]float64, 0, len(arr))
+				for _, elem := range arr {
+					iv, okByte := parseExactVectorSignedByte(elem)
+					if !okByte {
+						return nil, true, fmt.Errorf("mapper_parsing_exception: byte vector field [%s] elements must be integers in [-128, 127]", b.ESFieldPath)
+					}
+					out = append(out, float64(iv))
+				}
 			}
 		default:
-			vec, present, valid := extractAndValidateVectorValues(node, nil, dims)
+			if _, isStr := node.(string); isStr {
+				return nil, true, fmt.Errorf("mapper_parsing_exception: Failed to parse object: expecting token of type [START_ARRAY] but found [VALUE_STRING]")
+			}
+			vec, present, valid := extractAndValidateVectorValues(node, nil, 0)
 			if !present {
 				return nil, false, nil
 			}
 			if !valid {
 				return nil, true, fmt.Errorf("mapper_parsing_exception: failed to parse vector field [%s] of type [%s]", b.ESFieldPath, b.ESType)
+			}
+			if dims > 0 && len(vec) != dims {
+				if len(vec) > dims {
+					return nil, true, fmt.Errorf("mapper_parsing_exception: Field [%s] of type [dense_vector] has more dimensions than defined in the mapping: [%d] > [%d]", b.ESFieldPath, len(vec), dims)
+				}
+				return nil, true, fmt.Errorf("mapper_parsing_exception: The [dense_vector] field [%s] has a different number of dimensions [%d] than defined in the mapping [%d]", b.ESFieldPath, len(vec), dims)
 			}
 			out = vec
 		}

@@ -325,7 +325,7 @@ func TestSpecSchemaValidatorLiveUpstreamSchema(t *testing.T) {
 	if cfg, ok := any(srv).(interface{ SetTargetESVersion(string) }); ok {
 		cfg.SetTargetESVersion("8.15.5")
 	}
-	handler := withDefaultES8AcceptHeader(srv.Handler())
+	handler := srv.Handler()
 
 	doReq := func(method, target, body string) []byte {
 		t.Helper()

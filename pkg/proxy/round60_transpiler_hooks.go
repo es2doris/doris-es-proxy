@@ -18,7 +18,6 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -29,7 +28,6 @@ import (
 	"time"
 
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
-	"github.com/es2doris/doris-es-proxy/pkg/painless"
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
 	"github.com/es2doris/doris-es-proxy/pkg/transpiler"
 )
@@ -324,82 +322,6 @@ func aggsHaveHDRPercentilesRound60(aggs map[string]esast.AggSpec) bool {
 	return false
 }
 
-func collectNumericValuesFromHitsForAggRound60(
-	hits []HitRow,
-	field string,
-	rawScript any,
-	missing any,
-	schemasByIndex map[string]*schema.IndexSchema,
-	primarySchema *schema.IndexSchema,
-) []float64 {
-	var vals []float64
-	srcStr, params := extractScriptSourceAndParams(rawScript)
-	for _, h := range hits {
-		var doc map[string]any
-		if raw := h.EffectiveSource(); len(raw) > 0 {
-			dec := json.NewDecoder(bytes.NewReader(raw))
-			dec.UseNumber()
-			_ = dec.Decode(&doc)
-		}
-		if doc == nil {
-			doc = make(map[string]any)
-		}
-		doc["__meta_id"] = h.ID
-		hSchema := primarySchema
-		if schemasByIndex != nil {
-			if sc, ok := schemasByIndex[h.Index]; ok && sc != nil {
-				hSchema = sc
-			}
-		}
-		if srcStr != "" {
-			evalDoc := prepareDocForRuntimeScript(hSchema, doc)
-			if missingField, isMissing := scriptHasMissingDocValueRef(evalDoc, srcStr); isMissing {
-				if missing == nil {
-					continue
-				}
-				evalDoc = cloneDocWithFieldPath(evalDoc, missingField, missing)
-			}
-			v, err := painless.Eval(evalDoc, srcStr, params)
-			if err != nil || v == nil {
-				continue
-			}
-			switch tv := v.(type) {
-			case []any:
-				for _, item := range tv {
-					if fv, ok := coerceHDRFloatRound60(item, hSchema, field); ok {
-						vals = append(vals, fv)
-					}
-				}
-			default:
-				if fv, ok := coerceHDRFloatRound60(tv, hSchema, field); ok {
-					vals = append(vals, fv)
-				}
-			}
-			continue
-		}
-		if field == "" {
-			continue
-		}
-		cleanField := strings.TrimSuffix(strings.TrimSuffix(field, ".keyword"), ".ngram")
-		segs := strings.Split(cleanField, ".")
-		if hSchema != nil {
-			if b := hSchema.ResolveField(field); len(b.SourceJSONPath) > 0 {
-				segs = b.SourceJSONPath
-			}
-		}
-		rawVals := collectSchemaAwareScalarValues(doc, field, segs, hSchema)
-		if len(rawVals) == 0 && missing != nil {
-			rawVals = []any{missing}
-		}
-		for _, rv := range rawVals {
-			if fv, ok := coerceHDRFloatRound60(rv, hSchema, field); ok {
-				vals = append(vals, fv)
-			}
-		}
-	}
-	return vals
-}
-
 func coerceHDRFloatRound60(v any, idxSchema *schema.IndexSchema, field string) (float64, bool) {
 	if v == nil {
 		return 0, false
@@ -443,103 +365,6 @@ func coerceHDRFloatRound60(v any, idxSchema *schema.IndexSchema, field string) (
 		}
 	}
 	return 0, false
-}
-
-// applyHDRPercentilesToResponseRound60 computes exact HDRHistogram `percentiles` and `percentile_ranks`
-// values (and validates non-negative inputs / `number_of_significant_value_digits` in `[0,5]`) (`F14`).
-func applyHDRPercentilesToResponseRound60(
-	resp map[string]any,
-	aggs map[string]esast.AggSpec,
-	hits []HitRow,
-	schemasByIndex map[string]*schema.IndexSchema,
-	primarySchema *schema.IndexSchema,
-) error {
-	if resp == nil || len(aggs) == 0 {
-		return nil
-	}
-	aggsMap, _ := resp["aggregations"].(map[string]any)
-	return applyHDRPercentilesMapRound60(aggsMap, aggs, hits, schemasByIndex, primarySchema)
-}
-
-func applyHDRPercentilesMapRound60(
-	aggsOut map[string]any,
-	aggs map[string]esast.AggSpec,
-	hits []HitRow,
-	schemasByIndex map[string]*schema.IndexSchema,
-	primarySchema *schema.IndexSchema,
-) error {
-	for aggName, spec := range aggs {
-		if spec.Percentiles != nil && spec.Percentiles.HDR != nil {
-			vals := collectNumericValuesFromHitsForAggRound60(hits, spec.Percentiles.Field, spec.Percentiles.Script, spec.Percentiles.Missing, schemasByIndex, primarySchema)
-			hdrMap, err := transpiler.ComputeESPercentiles(vals, spec.Percentiles.Percents, spec.Percentiles.HDR)
-			if err != nil {
-				return err
-			}
-			keyed := spec.Percentiles.Keyed == nil || *spec.Percentiles.Keyed
-			if aggObj, ok := aggsOut[aggName].(map[string]any); ok && aggObj != nil {
-				if keyed {
-					aggObj["values"] = hdrMap
-				} else {
-					percents := spec.Percentiles.Percents
-					if len(percents) == 0 {
-						percents = []float64{1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0}
-					}
-					arr := make([]map[string]any, 0, len(percents))
-					for _, p := range percents {
-						pk := strconv.FormatFloat(p, 'f', -1, 64)
-						if !strings.Contains(pk, ".") && !strings.ContainsAny(pk, "eE") {
-							pk += ".0"
-						}
-						arr = append(arr, map[string]any{"key": p, "value": hdrMap[pk]})
-					}
-					aggObj["values"] = arr
-				}
-			}
-		}
-		if spec.PercentileRanks != nil && spec.PercentileRanks.HDR != nil {
-			vals := collectNumericValuesFromHitsForAggRound60(hits, spec.PercentileRanks.Field, spec.PercentileRanks.Script, spec.PercentileRanks.Missing, schemasByIndex, primarySchema)
-			keyed := spec.PercentileRanks.Keyed == nil || *spec.PercentileRanks.Keyed
-			hdrVals, err := transpiler.ComputeESPercentileRanks(vals, spec.PercentileRanks.Values, spec.PercentileRanks.HDR, keyed)
-			if err != nil {
-				return err
-			}
-			if aggObj, ok := aggsOut[aggName].(map[string]any); ok && aggObj != nil {
-				aggObj["values"] = hdrVals
-			}
-		}
-		if spec.Filter != nil && len(spec.SubAggs()) > 0 {
-			var filteredHits []HitRow
-			for _, h := range hits {
-				var doc map[string]any
-				if raw := h.EffectiveSource(); len(raw) > 0 {
-					dec := json.NewDecoder(bytes.NewReader(raw))
-					dec.UseNumber()
-					_ = dec.Decode(&doc)
-				}
-				if doc == nil {
-					doc = make(map[string]any)
-				}
-				doc["__meta_id"] = h.ID
-				hSchema := primarySchema
-				if schemasByIndex != nil {
-					if sc, ok := schemasByIndex[h.Index]; ok && sc != nil {
-						hSchema = sc
-					}
-				}
-				if evalBranchMatchesDoc(hSchema, doc, spec.Filter) {
-					filteredHits = append(filteredHits, h)
-				}
-			}
-			var subOut map[string]any
-			if aggObj, ok := aggsOut[aggName].(map[string]any); ok {
-				subOut = aggObj
-			}
-			if err := applyHDRPercentilesMapRound60(subOut, spec.SubAggs(), filteredHits, schemasByIndex, primarySchema); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
 
 func (s *Server) effectiveSearchMaxBucketsRound60() int {

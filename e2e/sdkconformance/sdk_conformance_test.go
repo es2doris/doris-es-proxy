@@ -42,11 +42,13 @@ import (
 	"github.com/elastic/go-elasticsearch/v8/typedapi/types/enums/refresh"
 	"github.com/elastic/go-elasticsearch/v8/typedapi/types/enums/sortorder"
 
+	"github.com/es2doris/doris-es-proxy/pkg/compliance"
 	"github.com/es2doris/doris-es-proxy/pkg/proxy"
 	"github.com/es2doris/doris-es-proxy/pkg/transpiler"
 )
 
 func strPtr(v string) *string { return &v }
+func intPtr(v int) *int       { return &v }
 
 type sdkOrderItem struct {
 	SKU   string  `json:"sku"`
@@ -64,521 +66,73 @@ type sdkOrderDoc struct {
 	Items     []sdkOrderItem `json:"items,omitempty"`
 }
 
-// --- elastic/elasticsearch-specification schema.json Wire Validator ---
-
-type specTypeID struct {
-	Name      string `json:"name"`
-	Namespace string `json:"namespace"`
-}
-
-func (id specTypeID) key() string {
-	if id.Namespace == "" {
-		return id.Name
-	}
-	return id.Namespace + "." + id.Name
-}
-
-type specTypeRef struct {
-	Kind      string        `json:"kind"`
-	Type      *specTypeID   `json:"type,omitempty"`
-	Generics  []specTypeRef `json:"generics,omitempty"`
-	Value     any           `json:"value,omitempty"` // *specTypeRef for array_of/dictionary_of, scalar literal for literal_value
-	Key       *specTypeRef  `json:"key,omitempty"`
-	SingleKey bool          `json:"singleKey,omitempty"`
-	Items     []specTypeRef `json:"items,omitempty"`
-}
-
-func (r specTypeRef) elemRef() (*specTypeRef, bool) {
-	if r.Value == nil {
-		return nil, false
-	}
-	b, err := json.Marshal(r.Value)
-	if err != nil {
-		return nil, false
-	}
-	var out specTypeRef
-	if err := json.Unmarshal(b, &out); err != nil || out.Kind == "" {
-		return nil, false
-	}
-	return &out, true
-}
-
-type specProperty struct {
-	Name     string      `json:"name"`
-	Required bool        `json:"required"`
-	Type     specTypeRef `json:"type"`
-}
-
-type specBody struct {
-	Kind       string         `json:"kind"`
-	Properties []specProperty `json:"properties,omitempty"`
-	Value      *specTypeRef   `json:"value,omitempty"`
-}
-
-type specException struct {
-	StatusCodes []int    `json:"statusCodes"`
-	Body        specBody `json:"body"`
-}
-
-type specInherits struct {
-	Type     specTypeID    `json:"type"`
-	Generics []specTypeRef `json:"generics,omitempty"`
-}
-
-type specEnumMember struct {
-	Name string `json:"name"`
-}
-
-type specTypeDef struct {
-	Kind       string           `json:"kind"`
-	Name       specTypeID       `json:"name"`
-	Generics   []specTypeID     `json:"generics,omitempty"`
-	Inherits   *specInherits    `json:"inherits,omitempty"`
-	Properties []specProperty   `json:"properties,omitempty"`
-	Body       *specBody        `json:"body,omitempty"`
-	Exceptions []specException  `json:"exceptions,omitempty"`
-	Type       *specTypeRef     `json:"type,omitempty"`
-	Members    []specEnumMember `json:"members,omitempty"`
-	Variants   json.RawMessage  `json:"variants,omitempty"`
-}
-
-type specURLTemplate struct {
-	Methods []string `json:"methods"`
-	Path    string   `json:"path"`
-}
-
-type specEndpoint struct {
-	Name     string            `json:"name"`
-	URLs     []specURLTemplate `json:"urls"`
-	Response *specTypeID       `json:"response"`
-}
-
-type esSpecValidator struct {
-	endpoints map[string]specEndpoint
-	types     map[string]specTypeDef
-}
+// --- elastic/elasticsearch-specification schema.json Wire Validator (via compliance.SpecSchemaValidator) ---
 
 var targetValidatedEndpoints = []string{
 	"info",
 	"cluster.health",
+	"cluster.put_settings",
+	"cluster.get_settings",
+	"cluster.put_component_template",
+	"cluster.delete_component_template",
 	"indices.create",
+	"indices.delete",
+	"indices.refresh",
+	"indices.put_settings",
+	"indices.get_settings",
+	"indices.put_mapping",
+	"indices.get_mapping",
+	"indices.get_field_mapping",
+	"indices.put_alias",
+	"indices.get_alias",
+	"indices.update_aliases",
+	"indices.put_index_template",
+	"indices.get_index_template",
+	"indices.delete_index_template",
+	"indices.analyze",
+	"indices.validate_query",
+	"indices.resolve_index",
 	"index",
 	"get",
 	"search",
+	"msearch",
 	"mget",
 	"bulk",
 	"count",
 	"update",
 	"delete",
-}
-
-func loadESSpecValidator(schemaPath string) (*esSpecValidator, error) {
-	raw, err := os.ReadFile(filepath.Clean(schemaPath))
-	if err != nil {
-		return nil, err
-	}
-	var doc struct {
-		Endpoints []specEndpoint `json:"endpoints"`
-		Types     []specTypeDef  `json:"types"`
-	}
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		return nil, fmt.Errorf("unmarshal schema.json: %w", err)
-	}
-	v := &esSpecValidator{
-		endpoints: make(map[string]specEndpoint, len(doc.Endpoints)),
-		types:     make(map[string]specTypeDef, len(doc.Types)),
-	}
-	for _, ep := range doc.Endpoints {
-		v.endpoints[ep.Name] = ep
-	}
-	for _, td := range doc.Types {
-		v.types[td.Name.key()] = td
-	}
-	return v, nil
-}
-
-func matchURLTemplate(method, cleanPath string, tmpl specURLTemplate) (bool, int) {
-	methodOK := false
-	for _, m := range tmpl.Methods {
-		if strings.EqualFold(m, method) {
-			methodOK = true
-			break
-		}
-	}
-	if !methodOK {
-		return false, 0
-	}
-	if tmpl.Path == "/" && cleanPath == "/" {
-		return true, 100
-	}
-	tSegs := strings.Split(strings.Trim(tmpl.Path, "/"), "/")
-	pSegs := strings.Split(strings.Trim(cleanPath, "/"), "/")
-	if tmpl.Path == "/" || cleanPath == "/" || len(tSegs) != len(pSegs) {
-		return false, 0
-	}
-	literalScore := 0
-	for i := range tSegs {
-		if strings.HasPrefix(tSegs[i], "{") && strings.HasSuffix(tSegs[i], "}") {
-			if pSegs[i] == "" || strings.HasPrefix(pSegs[i], "_") {
-				// Avoid matching system action paths like /_bulk against /{index}
-				return false, 0
-			}
-			literalScore += 1
-			continue
-		}
-		if tSegs[i] != pSegs[i] {
-			return false, 0
-		}
-		literalScore += 10
-	}
-	return true, literalScore
-}
-
-func (v *esSpecValidator) matchTargetEndpoint(method, urlPath string) string {
-	cleanPath := urlPath
-	if cleanPath == "" {
-		cleanPath = "/"
-	}
-	bestName := ""
-	bestScore := -1
-	for _, epName := range targetValidatedEndpoints {
-		ep, ok := v.endpoints[epName]
-		if !ok {
-			continue
-		}
-		for _, u := range ep.URLs {
-			if matched, score := matchURLTemplate(method, cleanPath, u); matched && score > bestScore {
-				bestScore = score
-				bestName = epName
-			}
-		}
-	}
-	return bestName
-}
-
-func decodeJSONWithNumbers(raw []byte) (any, error) {
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	var val any
-	if err := dec.Decode(&val); err != nil {
-		return nil, err
-	}
-	return val, nil
-}
-
-func (v *esSpecValidator) validateEndpointResponse(epName string, statusCode int, rawBody []byte) error {
-	ep, ok := v.endpoints[epName]
-	if !ok || ep.Response == nil {
-		return fmt.Errorf("endpoint %q missing response definition", epName)
-	}
-	respDef, ok := v.types[ep.Response.key()]
-	if !ok {
-		return fmt.Errorf("response type %q not found in schema.json", ep.Response.key())
-	}
-	val, err := decodeJSONWithNumbers(rawBody)
-	if err != nil {
-		return fmt.Errorf("decode response JSON: %w", err)
-	}
-
-	if statusCode >= 400 {
-		for _, exc := range respDef.Exceptions {
-			for _, code := range exc.StatusCodes {
-				if code == statusCode {
-					return v.validateBody(epName, exc.Body, val, nil, 0)
-				}
-			}
-		}
-		// Standard Elasticsearch structured error envelope on 4xx/5xx
-		obj, ok := val.(map[string]any)
-		if !ok {
-			return fmt.Errorf("expected JSON object error envelope on status %d", statusCode)
-		}
-		if _, hasErr := obj["error"]; !hasErr {
-			return fmt.Errorf("expected 'error' field in HTTP %d response", statusCode)
-		}
-		return nil
-	}
-
-	if respDef.Body == nil {
-		return nil
-	}
-	return v.validateBody(epName, *respDef.Body, val, nil, 0)
-}
-
-func (v *esSpecValidator) validateBody(path string, body specBody, val any, genBindings map[string]specTypeRef, depth int) error {
-	switch body.Kind {
-	case "properties":
-		obj, ok := val.(map[string]any)
-		if !ok {
-			return fmt.Errorf("%s: expected JSON object, got %T", path, val)
-		}
-		return v.validateProperties(path, body.Properties, obj, genBindings, depth+1)
-	case "value":
-		if body.Value == nil {
-			return nil
-		}
-		return v.validateTypeRef(path, *body.Value, val, genBindings, depth+1)
-	default:
-		return nil
-	}
-}
-
-func (v *esSpecValidator) collectInterfaceProperties(td specTypeDef, genBindings map[string]specTypeRef, visited map[string]bool) ([]specProperty, map[string]specTypeRef) {
-	key := td.Name.key()
-	if visited[key] {
-		return nil, genBindings
-	}
-	visited[key] = true
-
-	var allProps []specProperty
-	if td.Inherits != nil {
-		if parent, ok := v.types[td.Inherits.Type.key()]; ok {
-			parentGen := make(map[string]specTypeRef)
-			for k, gv := range genBindings {
-				parentGen[k] = gv
-			}
-			for i, gp := range parent.Generics {
-				if i < len(td.Inherits.Generics) {
-					parentGen[gp.key()] = td.Inherits.Generics[i]
-				}
-			}
-			inhProps, _ := v.collectInterfaceProperties(parent, parentGen, visited)
-			allProps = append(allProps, inhProps...)
-		}
-	}
-	allProps = append(allProps, td.Properties...)
-	return allProps, genBindings
-}
-
-func (v *esSpecValidator) validateProperties(path string, props []specProperty, obj map[string]any, genBindings map[string]specTypeRef, depth int) error {
-	if depth > 24 {
-		return nil
-	}
-	propByName := make(map[string]specProperty, len(props))
-	for _, p := range props {
-		propByName[p.Name] = p
-	}
-	for _, p := range props {
-		fieldVal, exists := obj[p.Name]
-		if !exists {
-			if p.Required {
-				if path == "cluster.health" && (p.Name == "number_of_in_flight_fetch" || p.Name == "task_max_waiting_in_queue_millis") {
-					continue
-				}
-				return fmt.Errorf("%s: missing required property %q", path, p.Name)
-			}
-			continue
-		}
-		if fieldVal == nil && !p.Required {
-			continue
-		}
-		if err := v.validateTypeRef(path+"."+p.Name, p.Type, fieldVal, genBindings, depth+1); err != nil {
-			return err
-		}
-	}
-	_ = propByName
-	return nil
-}
-
-func isJSONInteger(n json.Number) bool {
-	if _, err := n.Int64(); err == nil {
-		return true
-	}
-	if _, err := n.Float64(); err == nil {
-		f, _ := n.Float64()
-		return !math.IsNaN(f) && !math.IsInf(f, 0) && math.Trunc(f) == f
-	}
-	return false
-}
-
-func (v *esSpecValidator) validateTypeRef(path string, ref specTypeRef, val any, genBindings map[string]specTypeRef, depth int) error {
-	if depth > 24 {
-		return nil
-	}
-	switch ref.Kind {
-	case "user_defined_value":
-		return nil
-	case "literal_value":
-		if fmt.Sprint(val) != fmt.Sprint(ref.Value) {
-			return fmt.Errorf("%s: expected literal %v, got %v", path, ref.Value, val)
-		}
-		return nil
-	case "array_of":
-		arr, ok := val.([]any)
-		if !ok {
-			return fmt.Errorf("%s: expected JSON array, got %T", path, val)
-		}
-		elem, ok := ref.elemRef()
-		if !ok {
-			return nil
-		}
-		for i, item := range arr {
-			if err := v.validateTypeRef(fmt.Sprintf("%s[%d]", path, i), *elem, item, genBindings, depth+1); err != nil {
-				return err
-			}
-		}
-		return nil
-	case "dictionary_of":
-		obj, ok := val.(map[string]any)
-		if !ok {
-			return fmt.Errorf("%s: expected JSON object dictionary, got %T", path, val)
-		}
-		if ref.SingleKey && len(obj) != 1 {
-			return fmt.Errorf("%s: expected single-key dictionary, got %d keys", path, len(obj))
-		}
-		valRef, hasVal := ref.elemRef()
-		for k, elemVal := range obj {
-			if ref.Key != nil {
-				if err := v.validateTypeRef(path+"."+k+"(key)", *ref.Key, k, genBindings, depth+1); err != nil {
-					return err
-				}
-			}
-			if hasVal {
-				if err := v.validateTypeRef(path+"."+k, *valRef, elemVal, genBindings, depth+1); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	case "union_of":
-		var errs []string
-		for _, item := range ref.Items {
-			if err := v.validateTypeRef(path, item, val, genBindings, depth+1); err == nil {
-				return nil
-			} else {
-				errs = append(errs, err.Error())
-			}
-		}
-		return fmt.Errorf("%s: value did not match any union branch (%s)", path, strings.Join(errs, "; "))
-	case "instance_of":
-		if ref.Type == nil {
-			return nil
-		}
-		typeKey := ref.Type.key()
-		if bound, ok := genBindings[typeKey]; ok {
-			return v.validateTypeRef(path, bound, val, genBindings, depth+1)
-		}
-		// Unbound generic parameter such as _global.get.Response.TDocument or _global.search.ResponseBody.TDocument
-		if ref.Type.Name == "TDocument" || strings.HasPrefix(ref.Type.Name, "T") && strings.Contains(ref.Type.Namespace, ".") {
-			if _, exists := v.types[typeKey]; !exists {
-				return nil
-			}
-		}
-		if ref.Type.Namespace == "_builtins" {
-			switch ref.Type.Name {
-			case "string":
-				if _, ok := val.(string); !ok {
-					return fmt.Errorf("%s: expected string, got %T", path, val)
-				}
-			case "boolean":
-				if _, ok := val.(bool); !ok {
-					return fmt.Errorf("%s: expected boolean, got %T", path, val)
-				}
-			case "number":
-				if _, ok := val.(json.Number); !ok {
-					return fmt.Errorf("%s: expected number, got %T", path, val)
-				}
-			case "null":
-				if val != nil {
-					return fmt.Errorf("%s: expected null, got %T", path, val)
-				}
-			}
-			return nil
-		}
-		if ref.Type.Namespace == "_types" {
-			switch ref.Type.Name {
-			case "integer", "long", "uint", "ulong", "short", "byte":
-				num, ok := val.(json.Number)
-				if !ok || !isJSONInteger(num) {
-					return fmt.Errorf("%s: expected integer (%s), got %v (%T)", path, ref.Type.Name, val, val)
-				}
-				return nil
-			case "float", "double", "half_float", "scaled_float", "number":
-				if val == nil {
-					return nil
-				}
-				if _, ok := val.(json.Number); !ok {
-					return fmt.Errorf("%s: expected number (%s), got %v (%T)", path, ref.Type.Name, val, val)
-				}
-				return nil
-			}
-		}
-
-		td, exists := v.types[typeKey]
-		if !exists {
-			return nil
-		}
-
-		childGen := make(map[string]specTypeRef)
-		for k, gv := range genBindings {
-			childGen[k] = gv
-		}
-		for i, gp := range td.Generics {
-			if i < len(ref.Generics) {
-				childGen[gp.key()] = ref.Generics[i]
-			}
-		}
-
-		switch td.Kind {
-		case "type_alias":
-			if td.Type == nil {
-				return nil
-			}
-			return v.validateTypeRef(path, *td.Type, val, childGen, depth+1)
-		case "enum":
-			s, ok := val.(string)
-			if !ok {
-				return fmt.Errorf("%s: expected enum string for %s, got %T", path, typeKey, val)
-			}
-			for _, m := range td.Members {
-				if m.Name == s {
-					return nil
-				}
-			}
-			// Open enums in ES specs occasionally accept additional string tokens; enforce non-empty when isOpen or unknown
-			if s == "" {
-				return fmt.Errorf("%s: empty string for enum %s", path, typeKey)
-			}
-			return fmt.Errorf("%s: value %q not in enum %s", path, s, typeKey)
-		case "interface":
-			if len(td.Variants) > 0 && len(td.Properties) == 0 {
-				var variantSlice []specTypeRef
-				if err := json.Unmarshal(td.Variants, &variantSlice); err == nil && len(variantSlice) > 0 {
-					for _, variant := range variantSlice {
-						if err := v.validateTypeRef(path, variant, val, childGen, depth+1); err == nil {
-							return nil
-						}
-					}
-				}
-				// Tagged/untagged variant container (e.g., Aggregate) must be a JSON object
-				if _, ok := val.(map[string]any); ok {
-					return nil
-				}
-				return fmt.Errorf("%s: expected variant object for %s, got %T", path, typeKey, val)
-			}
-			obj, ok := val.(map[string]any)
-			if !ok {
-				return fmt.Errorf("%s: expected object for %s, got %T", path, typeKey, val)
-			}
-			props, effGen := v.collectInterfaceProperties(td, childGen, make(map[string]bool))
-			return v.validateProperties(path, props, obj, effGen, depth+1)
-		}
-	}
-	return nil
+	"update_by_query",
+	"delete_by_query",
+	"field_caps",
+	"open_point_in_time",
+	"close_point_in_time",
+	"scroll",
+	"clear_scroll",
+	"put_script",
+	"get_script",
+	"delete_script",
+	"explain",
+	"reindex",
+	"ingest.put_pipeline",
+	"ingest.simulate",
+	"cat.health",
+	"cat.indices",
+	"cat.aliases",
+	"cat.count",
 }
 
 // --- Wire-Conformance Recording Transport ---
 
 type wireConformanceTransport struct {
 	base            http.RoundTripper
-	validator       *esSpecValidator
+	validator       *compliance.SpecSchemaValidator
 	mu              sync.Mutex
 	totalResponses  int
 	validatedCounts map[string]int
 	violations      []string
 }
 
-func newWireConformanceTransport(validator *esSpecValidator) *wireConformanceTransport {
+func newWireConformanceTransport(validator *compliance.SpecSchemaValidator) *wireConformanceTransport {
 	return &wireConformanceTransport{
 		base:            http.DefaultTransport,
 		validator:       validator,
@@ -638,10 +192,10 @@ func (wt *wireConformanceTransport) RoundTrip(req *http.Request) (*http.Response
 		}
 	}
 
-	// 3. Upstream elastic/elasticsearch-specification schema.json validation when present
+	// 3. Upstream elastic/elasticsearch-specification schema.json validation via compliance.SpecSchemaValidator
 	if wt.validator != nil && req.Method != http.MethodHead && isJSONBody {
-		if epName := wt.validator.matchTargetEndpoint(req.Method, req.URL.Path); epName != "" {
-			if err := wt.validator.validateEndpointResponse(epName, resp.StatusCode, trimmed); err != nil {
+		if epName := wt.validator.MatchEndpoint(req.Method, req.URL.Path, targetValidatedEndpoints...); epName != "" {
+			if err := wt.validator.ValidateHTTPResponse(epName, resp.StatusCode, trimmed); err != nil {
 				wt.recordViolationf("%s %s -> endpoint %q (HTTP %d) failed schema.json validation: %v",
 					req.Method, req.URL.Path, epName, resp.StatusCode, err)
 			} else {
@@ -670,17 +224,17 @@ func TestOfficialElasticGoSDKv8_Conformance(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	// Load compiled upstream schema.json when available on disk
+	// Load compiled upstream schema.json via unified compliance.SpecSchemaValidator when available on disk
 	schemaPath := filepath.Join("..", "..", ".cache", "es-specification", "output", "schema", "schema.json")
-	var validator *esSpecValidator
+	var validator *compliance.SpecSchemaValidator
 	if _, statErr := os.Stat(schemaPath); statErr == nil {
 		var err error
-		validator, err = loadESSpecValidator(schemaPath)
+		validator, err = compliance.LoadSpecSchemaValidator(schemaPath)
 		if err != nil {
 			t.Fatalf("failed to load upstream schema.json from %s: %v", schemaPath, err)
 		}
-		t.Logf("Loaded elastic/elasticsearch-specification schema.json (%d endpoints, %d types)",
-			len(validator.endpoints), len(validator.types))
+		t.Logf("Loaded elastic/elasticsearch-specification schema.json via compliance.SpecSchemaValidator (%d endpoints, %d types)",
+			validator.EndpointCount(), validator.TypeCount())
 	} else {
 		t.Logf("Upstream schema.json not present at %s (skipping optional wire-schema AST checks; run `make conformance-fetch` to enable)", schemaPath)
 	}
@@ -1257,6 +811,484 @@ func TestOfficialElasticGoSDKv8_Conformance(t *testing.T) {
 	if simRes.IsError() || !strings.Contains(string(simRaw), `"analytics_upper"`) || !strings.Contains(string(simRaw), `"go-es-v8"`) {
 		t.Fatalf("unexpected Ingest.Simulate response (status=%s): %s", simRes.Status(), string(simRaw))
 	}
+
+	// 8. Round 61: +12 Expanded Official Go SDK v8 Conformance Subtests (typedapi + esapi)
+	t.Run("Round61_01_ClusterSettings_Stats_And_NodesTelemetry", func(t *testing.T) {
+		putSetRes, err := esClient.Cluster.PutSettings(
+			strings.NewReader(`{"transient":{"indices.recovery.max_bytes_per_sec":"50mb"}}`),
+			esClient.Cluster.PutSettings.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("Cluster.PutSettings failed: %v", err)
+		}
+		putSetRaw, _ := io.ReadAll(putSetRes.Body)
+		_ = putSetRes.Body.Close()
+		if putSetRes.IsError() || !strings.Contains(string(putSetRaw), `"acknowledged":true`) {
+			t.Fatalf("unexpected Cluster.PutSettings response (%s): %s", putSetRes.Status(), string(putSetRaw))
+		}
+		t.Cleanup(func() {
+			r, rErr := esClient.Cluster.PutSettings(
+				strings.NewReader(`{"transient":{"indices.recovery.max_bytes_per_sec":null}}`),
+				esClient.Cluster.PutSettings.WithContext(context.Background()),
+			)
+			if rErr == nil && r != nil {
+				_ = r.Body.Close()
+			}
+		})
+
+		getSetRes, err := esClient.Cluster.GetSettings(
+			esClient.Cluster.GetSettings.WithContext(ctx),
+			esClient.Cluster.GetSettings.WithIncludeDefaults(true),
+		)
+		if err != nil {
+			t.Fatalf("Cluster.GetSettings failed: %v", err)
+		}
+		getSetRaw, _ := io.ReadAll(getSetRes.Body)
+		_ = getSetRes.Body.Close()
+		if getSetRes.IsError() || !strings.Contains(string(getSetRaw), `"transient"`) {
+			t.Fatalf("unexpected Cluster.GetSettings response (%s): %s", getSetRes.Status(), string(getSetRaw))
+		}
+
+		cStatsRes, err := esClient.Cluster.Stats(esClient.Cluster.Stats.WithContext(ctx))
+		if err != nil {
+			t.Fatalf("Cluster.Stats failed: %v", err)
+		}
+		cStatsRaw, _ := io.ReadAll(cStatsRes.Body)
+		_ = cStatsRes.Body.Close()
+		if cStatsRes.IsError() || !strings.Contains(string(cStatsRaw), `"cluster_name"`) {
+			t.Fatalf("unexpected Cluster.Stats response (%s): %s", cStatsRes.Status(), string(cStatsRaw))
+		}
+
+		nStatsRes, err := esClient.Nodes.Stats(esClient.Nodes.Stats.WithContext(ctx))
+		if err != nil {
+			t.Fatalf("Nodes.Stats failed: %v", err)
+		}
+		nStatsRaw, _ := io.ReadAll(nStatsRes.Body)
+		_ = nStatsRes.Body.Close()
+		if nStatsRes.IsError() || !strings.Contains(string(nStatsRaw), `"nodes"`) {
+			t.Fatalf("unexpected Nodes.Stats response (%s): %s", nStatsRes.Status(), string(nStatsRaw))
+		}
+		wireTransport.assertNoViolations(t, "Round61_01_ClusterSettings_Stats_And_NodesTelemetry")
+	})
+
+	t.Run("Round61_02_IndexSettings_PutMapping_And_GetFieldMapping", func(t *testing.T) {
+		putIdxSetRes, err := esClient.Indices.PutSettings(
+			strings.NewReader(`{"index":{"number_of_replicas":0}}`),
+			esClient.Indices.PutSettings.WithIndex(idx),
+			esClient.Indices.PutSettings.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("Indices.PutSettings failed: %v", err)
+		}
+		_ = putIdxSetRes.Body.Close()
+		if putIdxSetRes.IsError() {
+			t.Fatalf("Indices.PutSettings returned error: %s", putIdxSetRes.Status())
+		}
+
+		getIdxSetRes, err := typedClient.Indices.GetSettings().Index(idx).Do(ctx)
+		if err != nil {
+			t.Fatalf("typedClient.Indices.GetSettings failed: %v", err)
+		}
+		if _, ok := getIdxSetRes[idx]; !ok {
+			t.Fatalf("expected index %q in GetSettings response: %+v", idx, getIdxSetRes)
+		}
+
+		putMapRes, err := typedClient.Indices.PutMapping(idx).
+			Properties(map[string]types.Property{
+				"region": types.NewKeywordProperty(),
+			}).
+			Do(ctx)
+		if err != nil || !putMapRes.Acknowledged {
+			t.Fatalf("typedClient.Indices.PutMapping failed: res=%+v err=%v", putMapRes, err)
+		}
+
+		fieldMapRes, err := typedClient.Indices.GetFieldMapping("region").Index(idx).Do(ctx)
+		if err != nil {
+			t.Fatalf("typedClient.Indices.GetFieldMapping failed: %v", err)
+		}
+		if rec, ok := fieldMapRes[idx]; !ok || len(rec.Mappings) == 0 {
+			t.Fatalf("expected region mapping in GetFieldMapping response: %+v", fieldMapRes)
+		}
+		wireTransport.assertNoViolations(t, "Round61_02_IndexSettings_PutMapping_And_GetFieldMapping")
+	})
+
+	t.Run("Round61_03_ComponentAndComposableIndexTemplates", func(t *testing.T) {
+		compName := fmt.Sprintf("sdk_v8_comp_%d", time.Now().UnixNano())
+		tmplName := fmt.Sprintf("sdk_v8_it_%d", time.Now().UnixNano())
+		t.Cleanup(func() {
+			if r, e := esClient.Indices.DeleteIndexTemplate(tmplName); e == nil && r != nil {
+				_ = r.Body.Close()
+			}
+			if r, e := esClient.Cluster.DeleteComponentTemplate(compName); e == nil && r != nil {
+				_ = r.Body.Close()
+			}
+		})
+
+		putCompRes, err := esClient.Cluster.PutComponentTemplate(
+			compName,
+			strings.NewReader(`{"template":{"settings":{"number_of_shards":1}}}`),
+			esClient.Cluster.PutComponentTemplate.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("PutComponentTemplate failed: %v", err)
+		}
+		_ = putCompRes.Body.Close()
+		if putCompRes.IsError() {
+			t.Fatalf("PutComponentTemplate status: %s", putCompRes.Status())
+		}
+
+		tmplBody := fmt.Sprintf(`{"index_patterns":["%s_tmpl_*"],"composed_of":[%q],"priority":300,"template":{"mappings":{"properties":{"host":{"type":"keyword"}}}}}`, idx, compName)
+		putTmplRes, err := esClient.Indices.PutIndexTemplate(
+			tmplName,
+			strings.NewReader(tmplBody),
+			esClient.Indices.PutIndexTemplate.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("PutIndexTemplate failed: %v", err)
+		}
+		_ = putTmplRes.Body.Close()
+		if putTmplRes.IsError() {
+			t.Fatalf("PutIndexTemplate status: %s", putTmplRes.Status())
+		}
+
+		getTmplRes, err := esClient.Indices.GetIndexTemplate(
+			esClient.Indices.GetIndexTemplate.WithName(tmplName),
+			esClient.Indices.GetIndexTemplate.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("GetIndexTemplate failed: %v", err)
+		}
+		getTmplRaw, _ := io.ReadAll(getTmplRes.Body)
+		_ = getTmplRes.Body.Close()
+		if getTmplRes.IsError() || !strings.Contains(string(getTmplRaw), tmplName) {
+			t.Fatalf("unexpected GetIndexTemplate (%s): %s", getTmplRes.Status(), string(getTmplRaw))
+		}
+		wireTransport.assertNoViolations(t, "Round61_03_ComponentAndComposableIndexTemplates")
+	})
+
+	t.Run("Round61_04_FieldCaps_TypedAPI", func(t *testing.T) {
+		fcRes, err := typedClient.FieldCaps().
+			Index(idx).
+			Fields("title", "category", "amount").
+			Do(ctx)
+		if err != nil {
+			t.Fatalf("typedClient.FieldCaps() failed: %v", err)
+		}
+		if len(fcRes.Fields) < 3 {
+			t.Fatalf("expected >= 3 fields in FieldCaps response, got %+v", fcRes.Fields)
+		}
+		if _, ok := fcRes.Fields["category"]; !ok {
+			t.Fatalf("expected category in FieldCaps response: %+v", fcRes.Fields)
+		}
+		wireTransport.assertNoViolations(t, "Round61_04_FieldCaps_TypedAPI")
+	})
+
+	t.Run("Round61_05_MultiSearch_Msearch", func(t *testing.T) {
+		ndjson := "{}\n" +
+			`{"query":{"term":{"category":"analytics"}}}` + "\n" +
+			"{}\n" +
+			`{"query":{"term":{"active":false}}}` + "\n"
+		msRes, err := esClient.Msearch(
+			strings.NewReader(ndjson),
+			esClient.Msearch.WithIndex(idx),
+			esClient.Msearch.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("esClient.Msearch failed: %v", err)
+		}
+		msRaw, _ := io.ReadAll(msRes.Body)
+		_ = msRes.Body.Close()
+		if msRes.IsError() {
+			t.Fatalf("Msearch returned error (%s): %s", msRes.Status(), string(msRaw))
+		}
+		var parsed struct {
+			Responses []struct {
+				Hits struct {
+					Total struct {
+						Value int64 `json:"value"`
+					} `json:"total"`
+				} `json:"hits"`
+			} `json:"responses"`
+		}
+		if err := json.Unmarshal(msRaw, &parsed); err != nil || len(parsed.Responses) != 2 {
+			t.Fatalf("unexpected Msearch payload (err=%v): %s", err, string(msRaw))
+		}
+		if parsed.Responses[0].Hits.Total.Value != 2 || parsed.Responses[1].Hits.Total.Value != 1 {
+			t.Fatalf("unexpected Msearch hit counts: %+v", parsed.Responses)
+		}
+		wireTransport.assertNoViolations(t, "Round61_05_MultiSearch_Msearch")
+	})
+
+	t.Run("Round61_06_PointInTime_And_SearchAfter_TypedAPI", func(t *testing.T) {
+		pitRes, err := typedClient.OpenPointInTime(idx).KeepAlive("1m").Do(ctx)
+		if err != nil || pitRes.Id == "" {
+			t.Fatalf("OpenPointInTime failed: res=%+v err=%v", pitRes, err)
+		}
+		pitClosed := false
+		t.Cleanup(func() {
+			if !pitClosed {
+				_, _ = typedClient.ClosePointInTime().Id(pitRes.Id).Do(context.Background())
+			}
+		})
+
+		page1, err := typedClient.Search().Request(&search.Request{
+			Size: intPtr(2),
+			Pit:  &types.PointInTimeReference{Id: pitRes.Id},
+			Sort: []types.SortCombinations{
+				types.SortOptions{
+					SortOptions: map[string]types.FieldSort{
+						"amount": {Order: &sortorder.Desc},
+					},
+				},
+			},
+		}).Do(ctx)
+		if err != nil || len(page1.Hits.Hits) != 2 {
+			t.Fatalf("PIT page1 search failed: hits=%d err=%v", len(page1.Hits.Hits), err)
+		}
+		cursor := page1.Hits.Hits[len(page1.Hits.Hits)-1].Sort
+		if len(cursor) == 0 {
+			t.Fatalf("expected non-empty sort cursor on PIT page1 last hit")
+		}
+
+		page2, err := typedClient.Search().Request(&search.Request{
+			Size:        intPtr(2),
+			Pit:         &types.PointInTimeReference{Id: pitRes.Id},
+			SearchAfter: cursor,
+			Sort: []types.SortCombinations{
+				types.SortOptions{
+					SortOptions: map[string]types.FieldSort{
+						"amount": {Order: &sortorder.Desc},
+					},
+				},
+			},
+		}).Do(ctx)
+		if err != nil || len(page2.Hits.Hits) != 2 {
+			t.Fatalf("PIT page2 search_after failed: hits=%d err=%v", len(page2.Hits.Hits), err)
+		}
+
+		closeRes, err := typedClient.ClosePointInTime().Id(pitRes.Id).Do(ctx)
+		if err != nil || !closeRes.Succeeded {
+			t.Fatalf("ClosePointInTime failed: res=%+v err=%v", closeRes, err)
+		}
+		pitClosed = true
+		wireTransport.assertNoViolations(t, "Round61_06_PointInTime_And_SearchAfter_TypedAPI")
+	})
+
+	t.Run("Round61_07_Scroll_And_ClearScroll", func(t *testing.T) {
+		initRes, err := esClient.Search(
+			esClient.Search.WithIndex(idx),
+			esClient.Search.WithScroll(time.Minute),
+			esClient.Search.WithSize(2),
+			esClient.Search.WithBody(strings.NewReader(`{"sort":[{"quantity":"asc"}]}`)),
+			esClient.Search.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("initial Scroll Search failed: %v", err)
+		}
+		initRaw, _ := io.ReadAll(initRes.Body)
+		_ = initRes.Body.Close()
+		if initRes.IsError() {
+			t.Fatalf("initial Scroll Search error (%s): %s", initRes.Status(), string(initRaw))
+		}
+		var page struct {
+			ScrollID string `json:"_scroll_id"`
+			Hits     struct {
+				Hits []json.RawMessage `json:"hits"`
+			} `json:"hits"`
+		}
+		if err := json.Unmarshal(initRaw, &page); err != nil || page.ScrollID == "" || len(page.Hits.Hits) != 2 {
+			t.Fatalf("unexpected initial scroll payload (err=%v): %s", err, string(initRaw))
+		}
+
+		nextRes, err := esClient.Scroll(
+			esClient.Scroll.WithScrollID(page.ScrollID),
+			esClient.Scroll.WithScroll(time.Minute),
+			esClient.Scroll.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("esClient.Scroll failed: %v", err)
+		}
+		nextRaw, _ := io.ReadAll(nextRes.Body)
+		_ = nextRes.Body.Close()
+		if nextRes.IsError() {
+			t.Fatalf("Scroll page2 error (%s): %s", nextRes.Status(), string(nextRaw))
+		}
+
+		clrRes, err := esClient.ClearScroll(
+			esClient.ClearScroll.WithScrollID(page.ScrollID),
+			esClient.ClearScroll.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("esClient.ClearScroll failed: %v", err)
+		}
+		_ = clrRes.Body.Close()
+		if clrRes.IsError() {
+			t.Fatalf("ClearScroll error: %s", clrRes.Status())
+		}
+		wireTransport.assertNoViolations(t, "Round61_07_Scroll_And_ClearScroll")
+	})
+
+	t.Run("Round61_08_StoredScripts_Lifecycle_TypedAPI", func(t *testing.T) {
+		scriptID := fmt.Sprintf("sdk_v8_script_%d", time.Now().UnixNano())
+		t.Cleanup(func() {
+			_, _ = typedClient.DeleteScript(scriptID).Do(context.Background())
+		})
+
+		putScrRes, err := typedClient.PutScript(scriptID).
+			Raw(strings.NewReader(`{"script":{"lang":"painless","source":"doc['amount'].value * params.factor"}}`)).
+			Do(ctx)
+		if err != nil || !putScrRes.Acknowledged {
+			t.Fatalf("typedClient.PutScript failed: res=%+v err=%v", putScrRes, err)
+		}
+
+		getScrRes, err := typedClient.GetScript(scriptID).Do(ctx)
+		if err != nil || !getScrRes.Found || getScrRes.Id_ != scriptID {
+			t.Fatalf("typedClient.GetScript failed: res=%+v err=%v", getScrRes, err)
+		}
+
+		delScrRes, err := typedClient.DeleteScript(scriptID).Do(ctx)
+		if err != nil || !delScrRes.Acknowledged {
+			t.Fatalf("typedClient.DeleteScript failed: res=%+v err=%v", delScrRes, err)
+		}
+		wireTransport.assertNoViolations(t, "Round61_08_StoredScripts_Lifecycle_TypedAPI")
+	})
+
+	t.Run("Round61_09_Analyze_And_ValidateQuery", func(t *testing.T) {
+		anRes, err := typedClient.Indices.Analyze().
+			Raw(strings.NewReader(`{"analyzer":"standard","text":"Apache Doris Search Proxy"}`)).
+			Do(ctx)
+		if err != nil || len(anRes.Tokens) != 4 {
+			t.Fatalf("typedClient.Indices.Analyze failed: tokens=%d err=%v", len(anRes.Tokens), err)
+		}
+		if anRes.Tokens[0].Token != "apache" {
+			t.Fatalf("expected first token \"apache\", got %q", anRes.Tokens[0].Token)
+		}
+
+		valRes, err := esClient.Indices.ValidateQuery(
+			esClient.Indices.ValidateQuery.WithIndex(idx),
+			esClient.Indices.ValidateQuery.WithExplain(true),
+			esClient.Indices.ValidateQuery.WithBody(strings.NewReader(`{"query":{"term":{"category":"analytics"}}}`)),
+			esClient.Indices.ValidateQuery.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("Indices.ValidateQuery failed: %v", err)
+		}
+		valRaw, _ := io.ReadAll(valRes.Body)
+		_ = valRes.Body.Close()
+		if valRes.IsError() || !strings.Contains(string(valRaw), `"valid":true`) {
+			t.Fatalf("unexpected ValidateQuery response (%s): %s", valRes.Status(), string(valRaw))
+		}
+		wireTransport.assertNoViolations(t, "Round61_09_Analyze_And_ValidateQuery")
+	})
+
+	t.Run("Round61_10_Explain_DocumentMatch", func(t *testing.T) {
+		expRes, err := esClient.Explain(
+			idx,
+			"order-1",
+			esClient.Explain.WithBody(strings.NewReader(`{"query":{"term":{"category":"analytics"}}}`)),
+			esClient.Explain.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("esClient.Explain failed: %v", err)
+		}
+		expRaw, _ := io.ReadAll(expRes.Body)
+		_ = expRes.Body.Close()
+		if expRes.IsError() || !strings.Contains(string(expRaw), `"matched":true`) {
+			t.Fatalf("unexpected Explain response (%s): %s", expRes.Status(), string(expRaw))
+		}
+		wireTransport.assertNoViolations(t, "Round61_10_Explain_DocumentMatch")
+	})
+
+	t.Run("Round61_11_Reindex_CopyAndVerify_TypedAPI", func(t *testing.T) {
+		destIdx := idx + "_reindexed"
+		t.Cleanup(func() {
+			_, _ = typedClient.Indices.Delete(destIdx).Do(context.Background())
+		})
+
+		reidxRes, err := typedClient.Reindex().
+			Refresh(true).
+			Raw(strings.NewReader(fmt.Sprintf(`{"source":{"index":%q},"dest":{"index":%q}}`, idx, destIdx))).
+			Do(ctx)
+		if err != nil || reidxRes.Created == nil || *reidxRes.Created != 4 {
+			t.Fatalf("typedClient.Reindex() failed: res=%+v err=%v", reidxRes, err)
+		}
+
+		destCount, err := typedClient.Count().Index(destIdx).Do(ctx)
+		if err != nil || destCount.Count != 4 {
+			t.Fatalf("dest Count() after Reindex = %+v, err=%v (want 4)", destCount, err)
+		}
+
+		delDest, err := typedClient.Indices.Delete(destIdx).Do(ctx)
+		if err != nil || !delDest.Acknowledged {
+			t.Fatalf("Delete(%s) after Reindex failed: res=%+v err=%v", destIdx, delDest, err)
+		}
+		wireTransport.assertNoViolations(t, "Round61_11_Reindex_CopyAndVerify_TypedAPI")
+	})
+
+	t.Run("Round61_12_UpdateAliases_ResolveIndex_And_CatSuite", func(t *testing.T) {
+		swapAlias := idx + "_atomic_swap"
+		updAliasRes, err := esClient.Indices.UpdateAliases(
+			strings.NewReader(fmt.Sprintf(`{"actions":[{"add":{"index":%q,"alias":%q}}]}`, idx, swapAlias)),
+			esClient.Indices.UpdateAliases.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("Indices.UpdateAliases(add) failed: %v", err)
+		}
+		_ = updAliasRes.Body.Close()
+		if updAliasRes.IsError() {
+			t.Fatalf("UpdateAliases(add) error: %s", updAliasRes.Status())
+		}
+
+		resolveRes, err := esClient.Indices.ResolveIndex(
+			[]string{idx + "*"},
+			esClient.Indices.ResolveIndex.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("Indices.ResolveIndex failed: %v", err)
+		}
+		resolveRaw, _ := io.ReadAll(resolveRes.Body)
+		_ = resolveRes.Body.Close()
+		if resolveRes.IsError() || !strings.Contains(string(resolveRaw), idx) {
+			t.Fatalf("unexpected ResolveIndex response (%s): %s", resolveRes.Status(), string(resolveRaw))
+		}
+
+		catAliasesRes, err := esClient.Cat.Aliases(
+			esClient.Cat.Aliases.WithName(swapAlias),
+			esClient.Cat.Aliases.WithFormat("json"),
+			esClient.Cat.Aliases.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("Cat.Aliases failed: %v", err)
+		}
+		catAliasesRaw, _ := io.ReadAll(catAliasesRes.Body)
+		_ = catAliasesRes.Body.Close()
+		if catAliasesRes.IsError() || !strings.Contains(string(catAliasesRaw), swapAlias) {
+			t.Fatalf("unexpected Cat.Aliases (%s): %s", catAliasesRes.Status(), string(catAliasesRaw))
+		}
+
+		catCountRes, err := esClient.Cat.Count(
+			esClient.Cat.Count.WithIndex(idx),
+			esClient.Cat.Count.WithFormat("json"),
+			esClient.Cat.Count.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("Cat.Count failed: %v", err)
+		}
+		catCountRaw, _ := io.ReadAll(catCountRes.Body)
+		_ = catCountRes.Body.Close()
+		if catCountRes.IsError() || !strings.Contains(string(catCountRaw), `"4"`) {
+			t.Fatalf("unexpected Cat.Count (%s): %s", catCountRes.Status(), string(catCountRaw))
+		}
+
+		remAliasRes, err := esClient.Indices.UpdateAliases(
+			strings.NewReader(fmt.Sprintf(`{"actions":[{"remove":{"index":%q,"alias":%q}}]}`, idx, swapAlias)),
+			esClient.Indices.UpdateAliases.WithContext(ctx),
+		)
+		if err == nil && remAliasRes != nil {
+			_ = remAliasRes.Body.Close()
+		}
+		wireTransport.assertNoViolations(t, "Round61_12_UpdateAliases_ResolveIndex_And_CatSuite")
+	})
 
 	ubqBody := `{"query":{"term":{"category":"storage"}},"script":{"source":"ctx._source.quantity = ctx._source.quantity + params.bump","lang":"painless","params":{"bump":6}}}`
 	ubqRes, err := esClient.UpdateByQuery(

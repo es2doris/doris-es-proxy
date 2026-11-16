@@ -6,7 +6,13 @@ insert_final_newline = true
 trim_trailing_whitespace = true
 charset = utf-8
 
-[*.{go,go.tmpl}]
+# Go source indentation is enforced by gofmt; raw backtick multiline strings
+# embed YAML 1.2 fixtures (where tabs are illegal) and HTML/JS UI templates.
+[*.go]
+indent_style = unset
+indent_size = unset
+
+[*.go.tmpl]
 indent_style = tab
 indent_size = 4
 

@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -786,4 +787,361 @@ func (b *DorisSQLBackend) DeleteDocsByIDs(ctx context.Context, dbName, table str
 		}
 	}
 	return nil
+}
+
+// DorisBackendNodeTelemetry captures live per-BE storage, CPU, memory, and tablet telemetry
+// returned by Apache Doris 4.1.3 `SHOW BACKENDS`.
+type DorisBackendNodeTelemetry struct {
+	BackendID             string
+	Host                  string
+	HttpPort              int
+	Alive                 bool
+	TabletNum             int64
+	DataUsedCapacityBytes int64
+	TrashUsedBytes        int64
+	AvailCapacityBytes    int64
+	TotalCapacityBytes    int64
+	UsedPct               float64
+	CpuCores              int
+	MemLimitBytes         int64
+	Version               string
+}
+
+// DorisTableDataTelemetry captures live per-table storage footprint, replica count, and row count
+// returned by Apache Doris 4.1.3 `SHOW DATA FROM <db>`.
+type DorisTableDataTelemetry struct {
+	TableName       string
+	SizeBytes       int64
+	RemoteSizeBytes int64
+	ReplicaCount    int64
+	RowCount        int64
+}
+
+// DorisClusterTelemetry aggregates live Doris 4.1.3 `SHOW BACKENDS` and `SHOW DATA` telemetry
+// for Elasticsearch `/_nodes/stats`, `/_cluster/stats`, `/_cat/nodes`, `/_cat/indices`, and `/_stats`.
+type DorisClusterTelemetry struct {
+	Backends           []DorisBackendNodeTelemetry
+	Tables             map[string]DorisTableDataTelemetry
+	AliveNodes         int
+	TotalNodes         int
+	TotalCapacityBytes int64
+	DataUsedBytes      int64
+	AvailCapacityBytes int64
+	TotalTablets       int64
+}
+
+// TelemetryBackend is an optional extension implemented by *DorisSQLBackend to expose live
+// Apache Doris 4.1.3 `SHOW BACKENDS` and `SHOW DATA` telemetry with graceful fallback.
+type TelemetryBackend interface {
+	ShowBackendsTelemetry(ctx context.Context) ([]DorisBackendNodeTelemetry, error)
+	ShowDataTelemetry(ctx context.Context, dbName string) (map[string]DorisTableDataTelemetry, error)
+	CollectClusterTelemetry(ctx context.Context, dbName string) *DorisClusterTelemetry
+}
+
+// ParseDorisCapacityBytes parses a Doris human-readable byte capacity string (such as
+// "1.250 GB", "512.00 MB", "4.000 KiB", "0.000 ", or raw integer bytes "1048576") into bytes.
+func ParseDorisCapacityBytes(raw string) int64 {
+	s := strings.TrimSpace(raw)
+	if s == "" || s == "-" || strings.EqualFold(s, "null") || strings.EqualFold(s, "n/a") {
+		return 0
+	}
+	if iv, err := strconv.ParseInt(s, 10, 64); err == nil {
+		if iv < 0 {
+			return 0
+		}
+		return iv
+	}
+
+	fields := strings.Fields(s)
+	var numStr, unitStr string
+	if len(fields) >= 2 {
+		numStr = strings.ReplaceAll(fields[0], ",", "")
+		unitStr = strings.ToUpper(strings.TrimSpace(fields[1]))
+	} else {
+		clean := strings.ReplaceAll(s, ",", "")
+		splitIdx := len(clean)
+		for i := 0; i < len(clean); i++ {
+			c := clean[i]
+			if (c < '0' || c > '9') && c != '.' && c != '-' && c != '+' {
+				splitIdx = i
+				break
+			}
+		}
+		numStr = strings.TrimSpace(clean[:splitIdx])
+		unitStr = strings.ToUpper(strings.TrimSpace(clean[splitIdx:]))
+	}
+
+	val, err := strconv.ParseFloat(numStr, 64)
+	if err != nil || math.IsNaN(val) || math.IsInf(val, 0) || val <= 0 {
+		return 0
+	}
+
+	var mult float64
+	switch unitStr {
+	case "", "B", "BYTE", "BYTES":
+		mult = 1
+	case "K", "KB", "KIB":
+		mult = 1024
+	case "M", "MB", "MIB":
+		mult = 1024 * 1024
+	case "G", "GB", "GIB":
+		mult = 1024 * 1024 * 1024
+	case "T", "TB", "TIB":
+		mult = 1024 * 1024 * 1024 * 1024
+	case "P", "PB", "PIB":
+		mult = 1024 * 1024 * 1024 * 1024 * 1024
+	default:
+		return 0
+	}
+
+	res := val * mult
+	if res >= float64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	return int64(math.Round(res))
+}
+
+// ParseDorisPercent parses a Doris percentage column such as "12.34 %" or "12.34%" into a float64 (12.34).
+func ParseDorisPercent(raw string) float64 {
+	s := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(raw), "%"))
+	if s == "" {
+		return 0
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+		return 0
+	}
+	return v
+}
+
+func scanDynamicStringRows(rows *sql.Rows) ([]map[string]string, error) {
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	lowerCols := make([]string, len(cols))
+	for i, c := range cols {
+		lowerCols[i] = strings.ToLower(strings.TrimSpace(c))
+	}
+
+	var result []map[string]string
+	for rows.Next() {
+		cells := make([]sql.NullString, len(cols))
+		dest := make([]any, len(cols))
+		for i := range cells {
+			dest[i] = &cells[i]
+		}
+		if err := rows.Scan(dest...); err != nil {
+			return nil, err
+		}
+		rowMap := make(map[string]string, len(cols))
+		for i, key := range lowerCols {
+			if cells[i].Valid {
+				rowMap[key] = cells[i].String
+			}
+		}
+		result = append(result, rowMap)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func firstNonEmptyCol(row map[string]string, keys ...string) string {
+	for _, k := range keys {
+		if v := strings.TrimSpace(row[k]); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func parseDorisInt64Col(raw string) int64 {
+	s := strings.ReplaceAll(strings.TrimSpace(raw), ",", "")
+	if s == "" {
+		return 0
+	}
+	if iv, err := strconv.ParseInt(s, 10, 64); err == nil && iv >= 0 {
+		return iv
+	}
+	if fv, err := strconv.ParseFloat(s, 64); err == nil && fv >= 0 && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+		return int64(fv)
+	}
+	return 0
+}
+
+// ShowBackendsTelemetry queries `SHOW BACKENDS` on Apache Doris (compatible with Doris 2.1, 3.x, and 4.1.3)
+// using dynamic column-name scanning so version-specific column additions or reorderings never break scanning.
+func (b *DorisSQLBackend) ShowBackendsTelemetry(ctx context.Context) ([]DorisBackendNodeTelemetry, error) {
+	if b == nil || b.db == nil {
+		return nil, nil
+	}
+	q := prependSQLTraceComment(ctx, "SHOW BACKENDS")
+	if b.logSQL.Load() {
+		log.Printf("[Doris SQL Telemetry] %s", q)
+	}
+	rows, err := b.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	rowMaps, err := scanDynamicStringRows(rows)
+	if err != nil {
+		return nil, err
+	}
+
+	nodes := make([]DorisBackendNodeTelemetry, 0, len(rowMaps))
+	for _, m := range rowMaps {
+		aliveStr := firstNonEmptyCol(m, "alive")
+		alive := strings.EqualFold(aliveStr, "true") || aliveStr == "1"
+		httpPort := int(parseDorisInt64Col(firstNonEmptyCol(m, "httpport", "http_port")))
+		cpuCores := int(parseDorisInt64Col(firstNonEmptyCol(m, "cpucores", "cpu_cores")))
+		if cpuCores == 0 {
+			if statusRaw := firstNonEmptyCol(m, "status"); strings.HasPrefix(statusRaw, "{") {
+				var statusObj map[string]any
+				if json.Unmarshal([]byte(statusRaw), &statusObj) == nil {
+					if cVal, ok := statusObj["cpu_cores"]; ok {
+						cpuCores = int(parseDorisInt64Col(fmt.Sprintf("%v", cVal)))
+					}
+				}
+			}
+		}
+
+		dataUsed := ParseDorisCapacityBytes(firstNonEmptyCol(m, "datausedcapacity", "data_used_capacity"))
+		trashUsed := ParseDorisCapacityBytes(firstNonEmptyCol(m, "trashusedcapacity", "trash_used_capacity"))
+		availCap := ParseDorisCapacityBytes(firstNonEmptyCol(m, "availcapacity", "avail_capacity"))
+		totalCap := ParseDorisCapacityBytes(firstNonEmptyCol(m, "totalcapacity", "total_capacity"))
+		if totalCap == 0 && (dataUsed > 0 || availCap > 0) {
+			totalCap = dataUsed + trashUsed + availCap
+		} else if availCap == 0 && totalCap > dataUsed+trashUsed {
+			availCap = totalCap - dataUsed - trashUsed
+		}
+
+		usedPct := ParseDorisPercent(firstNonEmptyCol(m, "usedpct", "used_pct", "maxdiskusedpct"))
+		if usedPct == 0 && totalCap > 0 && dataUsed > 0 {
+			usedPct = (float64(dataUsed) * 100.0) / float64(totalCap)
+		}
+
+		node := DorisBackendNodeTelemetry{
+			BackendID:             firstNonEmptyCol(m, "backendid", "backend_id", "id"),
+			Host:                  firstNonEmptyCol(m, "host", "ip"),
+			HttpPort:              httpPort,
+			Alive:                 alive,
+			TabletNum:             parseDorisInt64Col(firstNonEmptyCol(m, "tabletnum", "tablet_num")),
+			DataUsedCapacityBytes: dataUsed,
+			TrashUsedBytes:        trashUsed,
+			AvailCapacityBytes:    availCap,
+			TotalCapacityBytes:    totalCap,
+			UsedPct:               usedPct,
+			CpuCores:              cpuCores,
+			MemLimitBytes:         ParseDorisCapacityBytes(firstNonEmptyCol(m, "memlimit", "mem_limit")),
+			Version:               firstNonEmptyCol(m, "version"),
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes, nil
+}
+
+func isDorisShowDataSummaryRow(tableName string) bool {
+	switch strings.ToLower(strings.TrimSpace(tableName)) {
+	case "", "total", "quota", "left", "transaction quota":
+		return true
+	default:
+		return false
+	}
+}
+
+// ShowDataTelemetry queries `SHOW DATA FROM <dbName>` (gracefully falling back to `SHOW DATA` when
+// database-scoped syntax is unsupported) and returns per-table byte sizes, replica counts, and row counts.
+func (b *DorisSQLBackend) ShowDataTelemetry(ctx context.Context, dbName string) (map[string]DorisTableDataTelemetry, error) {
+	out := make(map[string]DorisTableDataTelemetry)
+	if b == nil || b.db == nil {
+		return out, nil
+	}
+
+	var queries []string
+	if trimmedDB := strings.TrimSpace(dbName); trimmedDB != "" {
+		safeDB := schema.SanitizeDorisIdentifier(trimmedDB)
+		queries = append(queries, fmt.Sprintf("SHOW DATA FROM `%s`", safeDB))
+	}
+	queries = append(queries, "SHOW DATA")
+
+	var rowMaps []map[string]string
+	var lastErr error
+	for _, rawSQL := range queries {
+		q := prependSQLTraceComment(ctx, rawSQL)
+		if b.logSQL.Load() {
+			// #nosec G706 -- safeDB is sanitized via schema.SanitizeDorisIdentifier
+			log.Printf("[Doris SQL Telemetry] %s", q)
+		}
+		rows, err := b.db.QueryContext(ctx, q) // #nosec G701 -- safeDB is strictly sanitized via schema.SanitizeDorisIdentifier
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		scanned, scanErr := scanDynamicStringRows(rows)
+		_ = rows.Close()
+		if scanErr != nil {
+			lastErr = scanErr
+			continue
+		}
+		rowMaps = scanned
+		lastErr = nil
+		break
+	}
+	if lastErr != nil {
+		return out, lastErr
+	}
+
+	for _, m := range rowMaps {
+		tbl := firstNonEmptyCol(m, "tablename", "table_name", "table")
+		if isDorisShowDataSummaryRow(tbl) {
+			continue
+		}
+		out[tbl] = DorisTableDataTelemetry{
+			TableName:       tbl,
+			SizeBytes:       ParseDorisCapacityBytes(firstNonEmptyCol(m, "size", "datasize", "data_size")),
+			RemoteSizeBytes: ParseDorisCapacityBytes(firstNonEmptyCol(m, "remotesize", "remote_size")),
+			ReplicaCount:    parseDorisInt64Col(firstNonEmptyCol(m, "replicacount", "replica_count")),
+			RowCount:        parseDorisInt64Col(firstNonEmptyCol(m, "rowcount", "row_count")),
+		}
+	}
+	return out, nil
+}
+
+// CollectClusterTelemetry gathers both `SHOW BACKENDS` and `SHOW DATA` telemetry from Apache Doris 4.1.3,
+// degrading gracefully if either query fails due to privilege restrictions or mock SQL environments.
+func (b *DorisSQLBackend) CollectClusterTelemetry(ctx context.Context, dbName string) *DorisClusterTelemetry {
+	summary := &DorisClusterTelemetry{
+		Tables: make(map[string]DorisTableDataTelemetry),
+	}
+	if b == nil || b.db == nil {
+		return summary
+	}
+
+	if backends, err := b.ShowBackendsTelemetry(ctx); err == nil {
+		summary.Backends = backends
+		summary.TotalNodes = len(backends)
+		for _, node := range backends {
+			if node.Alive {
+				summary.AliveNodes++
+			}
+			summary.TotalCapacityBytes += node.TotalCapacityBytes
+			summary.DataUsedBytes += node.DataUsedCapacityBytes
+			summary.AvailCapacityBytes += node.AvailCapacityBytes
+			summary.TotalTablets += node.TabletNum
+		}
+	} else if b.logSQL.Load() {
+		log.Printf("[Doris SQL Telemetry] SHOW BACKENDS fallback: %v", err)
+	}
+
+	if tables, err := b.ShowDataTelemetry(ctx, dbName); err == nil && tables != nil {
+		summary.Tables = tables
+	} else if err != nil && b.logSQL.Load() {
+		log.Printf("[Doris SQL Telemetry] SHOW DATA fallback: %v", err)
+	}
+
+	return summary
 }
